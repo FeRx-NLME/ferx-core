@@ -20,9 +20,7 @@ fn main() {
     use ferx_core::types::{DoseEvent, EventType, ObsRecord, Population};
     use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
 
-    let out = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "ferx_events.csv".into());
+    let out = std::env::args().nth(1).unwrap_or_else(|| "ferx_events.csv".into());
     const N: usize = 500;
     const DOSE: f64 = 100.0;
     const HORIZON: f64 = 24.0;

@@ -58,11 +58,7 @@ fn all_zero_amt_doses_warn() {
     // dose amount is 0 → flat objective. Warn rather than error.
     let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,0\n1,1,5.0,0,.\n");
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    assert!(
-        pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")),
-        "{:?}",
-        pop.warnings
-    );
+    assert!(pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")), "{:?}", pop.warnings);
 }
 
 #[test]
@@ -70,11 +66,7 @@ fn nonzero_amt_doses_do_not_warn_all_zero() {
     // Guard against a false-positive W_ALL_DOSES_ZERO on a normal dataset.
     let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    assert!(
-        !pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")),
-        "{:?}",
-        pop.warnings
-    );
+    assert!(!pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")), "{:?}", pop.warnings);
 }
 
 #[test]
@@ -105,10 +97,7 @@ fn unknown_iov_column_is_rejected() {
     // silent "no occasions" — otherwise an IOV model would quietly collapse.
     let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
     let err = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap_err();
-    assert!(
-        err.contains("iov_column 'OCC'") && err.contains("not found"),
-        "{err}"
-    );
+    assert!(err.contains("iov_column 'OCC'") && err.contains("not found"), "{err}");
 }
 
 #[test]
@@ -153,17 +142,8 @@ fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
                 objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a \
                 comparison, a finite value with no further warning. Impute the column, \
                 exclude the subjects, or guard the relation with `present(WT)`.";
-    let got: Vec<&String> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.contains("covariate WT"))
-        .collect();
-    assert_eq!(
-        got,
-        [want],
-        "the gap must be reported once: {:?}",
-        pop.warnings
-    );
+    let got: Vec<&String> = pop.warnings.iter().filter(|w| w.contains("covariate WT")).collect();
+    assert_eq!(got, [want], "the gap must be reported once: {:?}", pop.warnings);
     assert!(!want.contains("  "), "no run of two spaces: {want:?}");
 }
 
@@ -171,15 +151,9 @@ fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
 #[test]
 fn covariate_missing_warning_lists_five_ids_then_elides() {
     let five = covariate_missing_warning("CRCL", &["1", "2", "3", "4", "5"], 10);
-    assert!(
-        five.contains("has no value for 5 of 10 subjects (1, 2, 3, 4, 5), so"),
-        "{five}"
-    );
+    assert!(five.contains("has no value for 5 of 10 subjects (1, 2, 3, 4, 5), so"), "{five}");
     let six = covariate_missing_warning("CRCL", &["1", "2", "3", "4", "5", "6"], 10);
-    assert!(
-        six.contains("has no value for 6 of 10 subjects (1, 2, 3, 4, 5, ...), so"),
-        "{six}"
-    );
+    assert!(six.contains("has no value for 6 of 10 subjects (1, 2, 3, 4, 5, ...), so"), "{six}");
     assert!(!six.contains("5, 6"), "the sixth ID must be elided: {six}");
 }
 
@@ -195,10 +169,7 @@ fn declared_covariate_non_numeric_value_is_rejected() {
     }];
     let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
     assert!(err.contains(ERR_COV_NON_NUMERIC), "{err}");
-    assert!(
-        err.contains("WT"),
-        "offending covariate should be named: {err}"
-    );
+    assert!(err.contains("WT"), "offending covariate should be named: {err}");
 }
 
 #[test]
@@ -228,11 +199,7 @@ fn test_obs_cmt_dot_defaults_to_compartment_one() {
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let subj = &pop.subjects[0];
-    assert_eq!(
-        subj.obs_cmts,
-        vec![1],
-        "obs CMT='.' must default to compartment 1, not 0"
-    );
+    assert_eq!(subj.obs_cmts, vec![1], "obs CMT='.' must default to compartment 1, not 0");
 }
 
 #[test]
@@ -259,18 +226,12 @@ fn no_evid_column_infers_dose_from_amt() {
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let subj = &pop.subjects[0];
-    assert_eq!(
-        subj.doses.len(),
-        1,
-        "AMT>0 row should be inferred as a dose"
-    );
+    assert_eq!(subj.doses.len(), 1, "AMT>0 row should be inferred as a dose");
     assert_eq!(subj.doses[0].amt, 100.0);
     assert_eq!(subj.observations, vec![9.5, 7.3]);
     // The dataset "just works" — no dose-coverage warnings.
     assert!(
-        !pop.warnings
-            .iter()
-            .any(|w| w.contains("W_AMT_NOT_DOSED") || w.contains("W_NO_DOSES")),
+        !pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED") || w.contains("W_NO_DOSES")),
         "inferred-dose dataset must not warn, got {:?}",
         pop.warnings
     );
@@ -327,11 +288,7 @@ fn evid_present_amt_on_nondose_row_warns_amt_not_dosed() {
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let subj = &pop.subjects[0];
-    assert_eq!(
-        subj.doses.len(),
-        1,
-        "the mistyped AMT=5000 row is not a dose"
-    );
+    assert_eq!(subj.doses.len(), 1, "the mistyped AMT=5000 row is not a dose");
     assert_eq!(subj.doses[0].amt, 100.0);
     assert!(
         pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")),
@@ -354,9 +311,7 @@ fn wellformed_evid_dataset_emits_no_dose_warnings() {
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     assert_eq!(pop.subjects[0].doses.len(), 1);
     assert!(
-        !pop.warnings
-            .iter()
-            .any(|w| w.contains("W_AMT_NOT_DOSED") || w.contains("W_NO_DOSES")),
+        !pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED") || w.contains("W_NO_DOSES")),
         "well-formed EVID data must not warn, got {:?}",
         pop.warnings
     );
@@ -376,11 +331,7 @@ fn no_evid_inference_mirrored_in_covariate_table() {
         kind: CovariateKind::Continuous,
     }];
     let (pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
-    assert_eq!(
-        pop.subjects[0].doses.len(),
-        1,
-        "dose inferred on table path too"
-    );
+    assert_eq!(pop.subjects[0].doses.len(), 1, "dose inferred on table path too");
     assert_eq!(table.rows[0].evid, 1, "AMT>0 row's table EVID should be 1");
     assert_eq!(table.rows[1].evid, 0, "obs row's table EVID should be 0");
 }
@@ -473,14 +424,8 @@ fn validate_dose_rate_classifies_coded_and_malformed_values() {
     // -2 → modeled duration, -1 → modeled rate: both accepted here; the
     // R{cmt}/D{cmt} existence + engine check happens later at the model+data
     // join, where the model is known.
-    assert_eq!(
-        validate_dose_rate(-2.0, "7", 0.0).unwrap(),
-        RateMode::ModeledDuration
-    );
-    assert_eq!(
-        validate_dose_rate(-1.0, "7", 0.0).unwrap(),
-        RateMode::ModeledRate
-    );
+    assert_eq!(validate_dose_rate(-2.0, "7", 0.0).unwrap(), RateMode::ModeledDuration);
+    assert_eq!(validate_dose_rate(-1.0, "7", 0.0).unwrap(), RateMode::ModeledRate);
 
     // Other negatives are not recognised NONMEM codes; the message echoes
     // the offending value so the bad row is identifiable. `-1.5`/`-2.5` are
@@ -489,10 +434,7 @@ fn validate_dose_rate_classifies_coded_and_malformed_values() {
     // modeled duration).
     for r in [-0.5, -1.5, -2.5, -3.0, -100.0] {
         let e = validate_dose_rate(r, "1", 0.0).unwrap_err();
-        assert!(
-            e.contains(&format!("RATE={r}")) && e.contains("negative value"),
-            "r={r}: {e}"
-        );
+        assert!(e.contains(&format!("RATE={r}")) && e.contains("negative value"), "r={r}: {e}");
     }
 
     // Non-finite RATE on a dose row is malformed.
@@ -524,10 +466,7 @@ fn validate_ss_accepts_0_and_1_rejects_others() {
     // not silently collapsed to SS=1. The message names the value, the row,
     // and the tracking issue so the offending record is identifiable.
     let e = validate_ss(2.0, "7", 12.0).unwrap_err();
-    assert!(
-        e.contains("SS=2") && e.contains("#694") && e.contains("subject 7"),
-        "{e}"
-    );
+    assert!(e.contains("SS=2") && e.contains("#694") && e.contains("subject 7"), "{e}");
 
     // Other codes and non-integers are not rounded into 0/1 — a stray SS is
     // malformed, not a silent steady-state regimen.
@@ -559,10 +498,7 @@ fn coded_rate_minus_one_on_dose_row_loads_as_modeled_rate() {
     assert_eq!(dose.rate_mode, RateMode::ModeledRate);
     assert_eq!(dose.amt, 100.0);
     assert_eq!(dose.cmt_raw(), 1);
-    assert!(
-        dose.is_infusion() && !dose.is_fixed(),
-        "modeled, not a bolus"
-    );
+    assert!(dose.is_infusion() && !dose.is_fixed(), "modeled, not a bolus");
 }
 
 #[test]
@@ -589,10 +525,7 @@ fn addl_expansion_preserves_coded_rate_mode() {
             RateMode::ModeledDuration,
             "dose {k} must stay modeled-duration, not Fixed"
         );
-        assert!(
-            d.is_infusion() && !d.is_fixed(),
-            "dose {k} modeled, not a bolus"
-        );
+        assert!(d.is_infusion() && !d.is_fixed(), "dose {k} modeled, not a bolus");
         assert_eq!(d.amt, 100.0);
         assert_eq!(d.cmt_raw(), 1);
     }
@@ -623,10 +556,7 @@ fn addl_expansion_preserves_modeled_rate() {
             RateMode::ModeledRate,
             "dose {k} must stay modeled-rate, not Fixed"
         );
-        assert!(
-            d.is_infusion() && !d.is_fixed(),
-            "dose {k} modeled, not a bolus"
-        );
+        assert!(d.is_infusion() && !d.is_fixed(), "dose {k} modeled, not a bolus");
         assert_eq!(d.amt, 100.0);
         assert_eq!(d.cmt_raw(), 1);
     }
@@ -693,9 +623,7 @@ fn filter_referencing_absent_column_warns() {
     let filter = SelectionFilter::from_opts(&["COMENT == X".to_string()], &[], &[]).unwrap();
     let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
     assert!(
-        pop.warnings
-            .iter()
-            .any(|w| w.contains("W_FILTER_COLUMN_ABSENT") && w.contains("coment")),
+        pop.warnings.iter().any(|w| w.contains("W_FILTER_COLUMN_ABSENT") && w.contains("coment")),
         "absent filter column must warn, got {:?}",
         pop.warnings
     );
@@ -713,9 +641,7 @@ fn filter_on_present_column_does_not_warn_absent() {
     let filter = SelectionFilter::from_opts(&["FLAG == 9".to_string()], &[], &[]).unwrap();
     let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
     assert!(
-        !pop.warnings
-            .iter()
-            .any(|w| w.contains("W_FILTER_COLUMN_ABSENT")),
+        !pop.warnings.iter().any(|w| w.contains("W_FILTER_COLUMN_ABSENT")),
         "a present filter column must not warn, got {:?}",
         pop.warnings
     );
@@ -780,10 +706,7 @@ fn test_filter_on_undeclared_covariate_via_declared_path() {
     let ids: Vec<&str> = pop.subjects.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, vec!["1", "2"], "only STUDY==1 subjects should remain");
     let excl = pop.exclusions.as_ref().expect("exclusions present");
-    assert_eq!(
-        excl.excluded_subject_ids,
-        vec!["3".to_string(), "4".to_string()]
-    );
+    assert_eq!(excl.excluded_subject_ids, vec!["3".to_string(), "4".to_string()]);
     assert!(excl.fired_ignore.iter().any(|s| s.contains("STUDY == 2")));
 }
 
@@ -907,15 +830,8 @@ fn test_trough_after_a_co_timed_reset_moves_with_it() {
     let subj = &pop.subjects[0];
     let below = 30.0_f64.next_down();
     assert_eq!(subj.obs_times, vec![29.0, below, 31.0]);
-    assert_eq!(
-        subj.reset_times,
-        vec![below],
-        "the reset moves with the trough"
-    );
-    assert!(
-        subj.doses.iter().any(|d| d.time == 30.0),
-        "doses are never moved"
-    );
+    assert_eq!(subj.reset_times, vec![below], "the reset moves with the trough");
+    assert!(subj.doses.iter().any(|d| d.time == 30.0), "doses are never moved");
     // Each keeps the TIME it was written at, and the dose at the tie is not read one ULP
     // late through the reset's offset.
     assert_eq!(subj.param_time_at(below), 30.0);
@@ -997,20 +913,13 @@ fn test_obs_after_ss_dose_is_not_nudged() {
 
 /// Read a one-subject CSV with columns `ID,TIME,DV,EVID,MDV,AMT,X` (+ `SS,II` if given).
 fn tie_subject(rows: &str) -> crate::types::Subject {
-    let header = if rows
-        .lines()
-        .next()
-        .is_some_and(|l| l.split(',').count() > 7)
-    {
+    let header = if rows.lines().next().is_some_and(|l| l.split(',').count() > 7) {
         "ID,TIME,DV,EVID,MDV,AMT,X,SS,II\n"
     } else {
         "ID,TIME,DV,EVID,MDV,AMT,X\n"
     };
     let f = write_csv(&format!("{header}{rows}"));
-    read_nonmem_csv(f.path(), None, None)
-        .unwrap()
-        .subjects
-        .remove(0)
+    read_nonmem_csv(f.path(), None, None).unwrap().subjects.remove(0)
 }
 
 #[test]
@@ -1039,10 +948,7 @@ fn test_evid2_before_cotimed_dose_is_nudged_below_it() {
     // row moves. The dose never moves.
     let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n1,8,5,0,0,.,3\n");
     assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()]);
-    assert_eq!(
-        s.doses.iter().map(|d| d.time).collect::<Vec<_>>(),
-        vec![0.0, 4.0]
-    );
+    assert_eq!(s.doses.iter().map(|d| d.time).collect::<Vec<_>>(), vec![0.0, 4.0]);
     assert_eq!(s.obs_times, vec![8.0]);
 }
 
@@ -1153,9 +1059,7 @@ fn test_cotimed_evid2_nudge_holds_at_large_time() {
     assert_eq!(s.obs_times, vec![t.next_down()]);
     assert!(s.obs_times[0] < s.pk_only_times[0]);
     assert_eq!(s.pk_only_times, vec![t, t]);
-    let s = tie_subject(&format!(
-        "1,0,.,1,1,100,1\n1,{t},.,2,1,.,2\n1,{t},.,1,1,50,3\n"
-    ));
+    let s = tie_subject(&format!("1,0,.,1,1,100,1\n1,{t},.,2,1,.,2\n1,{t},.,1,1,50,3\n"));
     assert_eq!(s.pk_only_times, vec![t.next_down()]);
     assert!(s.pk_only_times[0] < s.doses[1].time);
 }
@@ -1167,19 +1071,12 @@ fn test_cotimed_evid2_nudge_holds_at_large_time() {
 /// Read a one-subject CSV with columns `ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X`.
 fn addl_subject(rows: &str) -> crate::types::Subject {
     let f = write_csv(&format!("ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X\n{rows}"));
-    read_nonmem_csv(f.path(), None, None)
-        .unwrap()
-        .subjects
-        .remove(0)
+    read_nonmem_csv(f.path(), None, None).unwrap().subjects.remove(0)
 }
 
 /// `(time, X)` of each dose, in the engines' order.
 fn dose_x(s: &crate::types::Subject) -> Vec<(f64, f64)> {
-    s.doses
-        .iter()
-        .zip(&s.dose_covariates)
-        .map(|(d, c)| (d.time, c["X"]))
-        .collect()
+    s.doses.iter().zip(&s.dose_covariates).map(|(d, c)| (d.time, c["X"])).collect()
 }
 
 #[test]
@@ -1191,10 +1088,7 @@ fn an_implied_dose_takes_the_next_records_snapshot() {
         "1,0,.,1,1,100,3,12,1\n1,6,5,0,0,.,.,.,1\n1,18,5,0,0,.,.,.,2\n1,30,5,0,0,.,.,.,3\n\
          1,40,5,0,0,.,.,.,4\n",
     );
-    assert_eq!(
-        dose_x(&s),
-        vec![(0.0, 1.0), (12.0, 2.0), (24.0, 3.0), (36.0, 4.0)]
-    );
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0), (24.0, 3.0), (36.0, 4.0)]);
 }
 
 #[test]
@@ -1202,9 +1096,7 @@ fn an_implied_dose_co_timed_with_a_record_takes_that_records_snapshot() {
     // Cases 1 and 3: an EVID=2 row, and then an observation, at the implied dose's TIME.
     // The tie is `>=`: a `>` would hand the dose at 12 the snapshot of the record at 18.
     for row12 in ["1,12,.,2,1,.,.,.,2", "1,12,5,0,0,.,.,.,2"] {
-        let s = addl_subject(&format!(
-            "1,0,.,1,1,100,1,12,1\n{row12}\n1,18,5,0,0,.,.,.,3\n"
-        ));
+        let s = addl_subject(&format!("1,0,.,1,1,100,1,12,1\n{row12}\n1,18,5,0,0,.,.,.,3\n"));
         assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0)], "{row12}");
     }
 }
@@ -1242,20 +1134,13 @@ fn an_explicit_dose_or_a_reset_can_govern_an_implied_dose() {
 fn an_implied_dose_after_the_last_record_keeps_its_parents_snapshot() {
     // Nothing at or after 24 or 36, so nothing observes those doses; they keep X=1.
     let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n");
-    assert_eq!(
-        dose_x(&s),
-        vec![(0.0, 1.0), (12.0, 2.0), (24.0, 1.0), (36.0, 1.0)]
-    );
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0), (24.0, 1.0), (36.0, 1.0)]);
 }
 
 /// `(parent, TIME $PK reads)` of each dose; `None` for a dose record. Every parent the
 /// reader writes passes `implied_dose_parent`'s check.
 fn implied(s: &crate::types::Subject) -> Vec<Option<(usize, f64)>> {
-    let out: Vec<_> = s
-        .doses
-        .iter()
-        .map(|d| d.implied.map(|i| (i.parent, i.param_time)))
-        .collect();
+    let out: Vec<_> = s.doses.iter().map(|d| d.implied.map(|i| (i.parent, i.param_time))).collect();
     for (k, i) in out.iter().enumerate() {
         assert_eq!(s.implied_dose_parent(k), i.map(|i| i.0), "dose {k}");
     }
@@ -1271,25 +1156,13 @@ fn an_implied_dose_reads_the_governing_records_time_and_names_its_parent() {
         "1,0,.,1,1,100,2,12,1\n1,18,5,0,0,.,.,.,2\n1,30,5,0,0,.,.,.,3\n\
          1,31,.,1,1,50,1,6,3\n1,40,5,0,0,.,.,.,4\n",
     );
-    assert_eq!(
-        implied(&s),
-        vec![
-            None,
-            Some((0, 18.0)),
-            Some((0, 30.0)),
-            None,
-            Some((3, 40.0))
-        ]
-    );
+    assert_eq!(implied(&s), vec![None, Some((0, 18.0)), Some((0, 30.0)), None, Some((3, 40.0))]);
     for (k, want) in [(0, 0.0), (1, 18.0), (2, 30.0), (3, 31.0), (4, 40.0)] {
         assert_eq!(s.dose_param_time(k), want, "dose {k}");
     }
     // Nothing at or after 36: the TIME is the parent row's, like its covariates.
     let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n");
-    assert_eq!(
-        implied(&s),
-        vec![None, Some((0, 18.0)), Some((0, 0.0)), Some((0, 0.0))]
-    );
+    assert_eq!(implied(&s), vec![None, Some((0, 18.0)), Some((0, 0.0)), Some((0, 0.0))]);
 }
 
 #[test]
@@ -1302,10 +1175,7 @@ fn an_implied_dose_is_marked_without_a_time_varying_covariate() {
 
 /// `ImpliedDose::gov_time` of each dose; `None` for a dose record.
 fn gov_times(s: &crate::types::Subject) -> Vec<Option<f64>> {
-    s.doses
-        .iter()
-        .map(|d| d.implied.map(|i| i.gov_time))
-        .collect()
+    s.doses.iter().map(|d| d.implied.map(|i| i.gov_time)).collect()
 }
 
 #[test]
@@ -1329,23 +1199,14 @@ fn an_implied_dose_records_its_governing_records_engine_time() {
     // (#614 for an observation, #1810 for an EVID=2 row) after the #1909 pass chose it;
     // `gov_time` follows it there rather than keeping the written 18. The straddle is
     // asserted: the record really moved.
-    for (row18, label) in [
-        ("1,18,5,0,0,.,.,.,2", "observation"),
-        ("1,18,.,2,1,.,.,.,2", "EVID=2 row"),
-    ] {
+    for (row18, label) in
+        [("1,18,5,0,0,.,.,.,2", "observation"), ("1,18,.,2,1,.,.,.,2", "EVID=2 row")]
+    {
         let s = addl_subject(&format!(
             "1,0,.,1,1,100,1,12,1\n{row18}\n1,18,.,1,1,50,.,.,2\n1,30,5,0,0,.,.,.,6\n"
         ));
-        let moved = if label == "observation" {
-            s.obs_times[0]
-        } else {
-            s.pk_only_times[0]
-        };
-        assert_eq!(
-            moved,
-            18.0f64.next_down(),
-            "{label}: moved below the dose row"
-        );
+        let moved = if label == "observation" { s.obs_times[0] } else { s.pk_only_times[0] };
+        assert_eq!(moved, 18.0f64.next_down(), "{label}: moved below the dose row");
         assert_eq!(
             s.dose_occasion_time(1).to_bits(),
             moved.to_bits(),
@@ -1359,11 +1220,7 @@ fn an_implied_dose_records_its_governing_records_engine_time() {
     assert_eq!(s.doses[3].time, 36.0);
     let i = s.doses[3].implied.expect("implied");
     assert_eq!(i.param_time, 20.0);
-    assert!(
-        s.reset_times[0] > 36.0,
-        "the shift moved the reset: {:?}",
-        s.reset_times
-    );
+    assert!(s.reset_times[0] > 36.0, "the shift moved the reset: {:?}", s.reset_times);
     assert_eq!(i.gov_time.to_bits(), s.reset_times[0].to_bits());
 }
 
@@ -1376,10 +1233,7 @@ fn an_implied_dose_takes_the_governing_records_occasion() {
         "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,OCC\n1,0,.,1,1,100,3,12,1\n1,6,5,0,0,.,.,.,1\n\
          1,18,5,0,0,.,.,.,2\n1,24,5,0,0,.,.,.,3\n",
     );
-    let s = read_nonmem_csv(f.path(), None, Some("OCC"))
-        .unwrap()
-        .subjects
-        .remove(0);
+    let s = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap().subjects.remove(0);
     // The observation at 24 ties with the implied dose there and governs it.
     assert_eq!(s.dose_occasions, vec![1, 2, 3, 1]);
     // Every other kind of governing record hands over its own OCC, too: an EVID=2 row, an
@@ -1394,10 +1248,7 @@ fn an_implied_dose_takes_the_governing_records_occasion() {
             "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,OCC\n1,0,.,1,1,100,1,12,1\n{row15}\n\
              1,20,5,0,0,.,.,.,3\n"
         ));
-        let s = read_nonmem_csv(f.path(), None, Some("OCC"))
-            .unwrap()
-            .subjects
-            .remove(0);
+        let s = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap().subjects.remove(0);
         assert_eq!(s.dose_occasions, want, "{row15}");
     }
 }
@@ -1491,13 +1342,7 @@ fn test_tte_entry_time_is_raw_not_origin_shifted() {
     .unwrap();
     let recs = &pop.subjects[0].obs_records;
     assert_eq!(recs.len(), 1);
-    let ObsRecord::Event {
-        time,
-        event_type,
-        entry_time,
-        ..
-    } = &recs[0]
-    else {
+    let ObsRecord::Event { time, event_type, entry_time, .. } = &recs[0] else {
         panic!("expected a TTE Event record");
     };
     assert_eq!(*time, 100.0, "event time stays on the raw data clock");
@@ -1519,10 +1364,7 @@ fn test_tte_entry_time_is_raw_not_origin_shifted() {
 #[test]
 fn discrete_state_cmt_routes_integer_dv_into_obs_records() {
     use crate::types::ObsRecord;
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
                    1,0,0,0,0,.,3\n\
                    1,1,2,0,0,.,3\n\
@@ -1538,9 +1380,7 @@ fn discrete_state_cmt_routes_integer_dv_into_obs_records() {
         .obs_records
         .iter()
         .map(|r| match r {
-            ObsRecord::DiscreteState {
-                time, state, cmt, ..
-            } => {
+            ObsRecord::DiscreteState { time, state, cmt, .. } => {
                 assert_eq!(*cmt, 3);
                 (*time, *state)
             }
@@ -1553,10 +1393,7 @@ fn discrete_state_cmt_routes_integer_dv_into_obs_records() {
 #[test]
 fn count_cmt_routes_nonneg_integer_dv_into_obs_records() {
     use crate::types::ObsRecord;
-    let routing = ObsRouting {
-        count: [4].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { count: [4].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
                    1,0,5,0,0,.,4\n\
                    1,1,0,0,0,.,4\n\
@@ -1567,9 +1404,7 @@ fn count_cmt_routes_nonneg_integer_dv_into_obs_records() {
         .obs_records
         .iter()
         .map(|r| match r {
-            ObsRecord::Count {
-                time, count, cmt, ..
-            } => {
+            ObsRecord::Count { time, count, cmt, .. } => {
                 assert_eq!(*cmt, 4);
                 (*time, *count)
             }
@@ -1581,10 +1416,7 @@ fn count_cmt_routes_nonneg_integer_dv_into_obs_records() {
 
 #[test]
 fn discrete_state_endpoint_rejects_noninteger_dv() {
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1.5,0,0,.,3\n";
     let f = write_csv(csv);
     let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
@@ -1594,10 +1426,7 @@ fn discrete_state_endpoint_rejects_noninteger_dv() {
 
 #[test]
 fn discrete_state_endpoint_rejects_negative_dv() {
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,-1,0,0,.,3\n";
     let f = write_csv(csv);
     let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
@@ -1606,10 +1435,7 @@ fn discrete_state_endpoint_rejects_negative_dv() {
 
 #[test]
 fn count_endpoint_rejects_noninteger_dv() {
-    let routing = ObsRouting {
-        count: [4].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { count: [4].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,2.5,0,0,.,4\n";
     let f = write_csv(csv);
     let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
@@ -1619,10 +1445,7 @@ fn count_endpoint_rejects_noninteger_dv() {
 
 #[test]
 fn count_endpoint_rejects_negative_or_overflow_dv() {
-    let routing = ObsRouting {
-        count: [4].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { count: [4].into_iter().collect(), ..Default::default() };
     // Below 0 and above u32::MAX both fail the count range check.
     for bad in ["-3", "5000000000"] {
         let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,4\n");
@@ -1678,14 +1501,10 @@ fn discrete_and_count_endpoints_skip_missing_dv() {
     for set_name in ["discrete", "count"] {
         for missing in [".", "NA", "NaN", "na", "nan"] {
             let routing = match set_name {
-                "discrete" => ObsRouting {
-                    discrete: [3].into_iter().collect(),
-                    ..Default::default()
-                },
-                _ => ObsRouting {
-                    count: [3].into_iter().collect(),
-                    ..Default::default()
-                },
+                "discrete" => {
+                    ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() }
+                }
+                _ => ObsRouting { count: [3].into_iter().collect(), ..Default::default() },
             };
             // Row at t=1 is missing; the t=0 and t=2 rows are valid.
             let csv = format!(
@@ -1715,15 +1534,8 @@ fn discrete_and_count_endpoints_skip_missing_dv() {
                 vec![0.0, 2.0],
                 "{set_name}/{missing}: missing-DV row must be skipped, not a phantom zero"
             );
-            let warns = pop
-                .warnings
-                .iter()
-                .filter(|w| w.starts_with("W_MISSING_DV"))
-                .count();
-            assert_eq!(
-                warns, 1,
-                "{set_name}/{missing}: expected one W_MISSING_DV summary"
-            );
+            let warns = pop.warnings.iter().filter(|w| w.starts_with("W_MISSING_DV")).count();
+            assert_eq!(warns, 1, "{set_name}/{missing}: expected one W_MISSING_DV summary");
         }
     }
 }
@@ -1735,10 +1547,7 @@ fn discrete_state_endpoint_rejects_nonfinite_dv() {
     // integer guard alone misses these because comparisons against a
     // non-finite value are always false. (A literal `NaN`/`NA` cell is a
     // *missing* token — covered by the skip test above, not here.)
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     for bad in ["inf", "-inf", "1e999"] {
         let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,3\n");
         let f = write_csv(&csv);
@@ -1750,10 +1559,7 @@ fn discrete_state_endpoint_rejects_nonfinite_dv() {
 
 #[test]
 fn count_endpoint_rejects_nonfinite_dv() {
-    let routing = ObsRouting {
-        count: [4].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { count: [4].into_iter().collect(), ..Default::default() };
     for bad in ["inf", "-inf", "1e999"] {
         let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,4\n");
         let f = write_csv(&csv);
@@ -1769,10 +1575,7 @@ fn discrete_state_endpoint_rejects_dv_above_usize_range() {
     // usize; without the upper-bound check `1e300 as usize` saturates to
     // usize::MAX silently. Count already had this guard (via `> u32::MAX`);
     // discrete now mirrors it (via the shared exclusive_max bound).
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1e300,0,0,.,3\n";
     let f = write_csv(csv);
     let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
@@ -1785,10 +1588,7 @@ fn count_endpoint_accepts_u32_max() {
     // including `u32::MAX` itself — is accepted, not rejected. (Locks the
     // boundary against a future "tighten `>=`" that would drop `u32::MAX`.)
     use crate::types::ObsRecord;
-    let routing = ObsRouting {
-        count: [4].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { count: [4].into_iter().collect(), ..Default::default() };
     let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{},0,0,.,4\n", u32::MAX);
     let f = write_csv(&csv);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
@@ -1807,10 +1607,7 @@ fn discrete_state_endpoint_accepts_large_valid_index() {
     // A large but in-`usize` state index (`1e18` < 2^64) is a legitimate value
     // and must be recorded exactly, not rejected by the overflow guard.
     use crate::types::ObsRecord;
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1e18,0,0,.,3\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
@@ -1861,19 +1658,12 @@ fn test_evid4_restart_shifts_second_occasion_onto_monotonic_timeline() {
     // boundary (the second occasion's relative spacing is preserved).
     assert_eq!(subj.obs_times.len(), 4);
     for w in subj.obs_times.windows(2) {
-        assert!(
-            w[1] > w[0],
-            "obs times must be monotonic: {:?}",
-            subj.obs_times
-        );
+        assert!(w[1] > w[0], "obs times must be monotonic: {:?}", subj.obs_times);
     }
     // Within-occasion spacing is unchanged: second occasion's two obs are
     // still 6 time units apart (raw t=2 and t=8).
     let gap2 = subj.obs_times[3] - subj.obs_times[2];
-    assert!(
-        (gap2 - 6.0).abs() < 1e-9,
-        "second occasion spacing preserved"
-    );
+    assert!((gap2 - 6.0).abs() < 1e-9, "second occasion spacing preserved");
 }
 
 #[test]
@@ -2292,10 +2082,7 @@ fn test_pk_only_rows_capture_their_own_occasion() {
                    1,6,.,0,1,.,3\n\
                    1,8,5.0,0,0,.,4\n";
     let f = write_csv(csv);
-    let subj = read_nonmem_csv(f.path(), None, Some("OCC"))
-        .unwrap()
-        .subjects
-        .remove(0);
+    let subj = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap().subjects.remove(0);
     assert_eq!(subj.pk_only_times, vec![4.0, 6.0]);
     assert_eq!(subj.pk_only_occasions, vec![2, 3]);
     assert_eq!(subj.occasions, vec![1, 4]);
@@ -2313,10 +2100,7 @@ fn test_a_nudged_pk_only_row_keeps_its_own_occasion() {
                    1,6,.,2,1,.,4\n\
                    1,8,5.0,0,0,.,3\n";
     let f = write_csv(csv);
-    let subj = read_nonmem_csv(f.path(), None, Some("OCC"))
-        .unwrap()
-        .subjects
-        .remove(0);
+    let subj = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap().subjects.remove(0);
     assert_eq!(subj.pk_only_times, vec![4.0_f64.next_down(), 6.0]);
     assert_eq!(subj.pk_only_occasions, vec![2, 4]);
     assert_eq!(subj.dose_occasions, vec![1, 3]);
@@ -2341,11 +2125,8 @@ fn test_missing_dv_obs_skipped_and_warned() {
     assert_eq!(subj.obs_times, vec![1.0, 3.0]);
 
     // Exactly one summary warning, reporting a single skipped row.
-    let warns: Vec<&String> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_MISSING_DV"))
-        .collect();
+    let warns: Vec<&String> =
+        pop.warnings.iter().filter(|w| w.starts_with("W_MISSING_DV")).collect();
     assert_eq!(warns.len(), 1, "expected one W_MISSING_DV summary warning");
     assert!(warns[0].contains("1 observation row"), "got: {}", warns[0]);
 }
@@ -2378,10 +2159,7 @@ fn test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record() {
         .iter()
         .find(|w| w.starts_with("W_MISSING_DV"))
         .expect("the skipped row warns");
-    assert!(
-        warn.contains("they were skipped (not scored as DV=0)"),
-        "{warn}"
-    );
+    assert!(warn.contains("they were skipped (not scored as DV=0)"), "{warn}");
     assert!(warn.contains("Otherwise, check for data errors."), "{warn}");
 
     let kept = read(1);
@@ -2399,10 +2177,7 @@ fn test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record() {
         "{warn}"
     );
     assert_eq!(s.pk_only_times, vec![0.0]);
-    assert!(
-        warn.contains("so it starts the integration clock"),
-        "{warn}"
-    );
+    assert!(warn.contains("so it starts the integration clock"), "{warn}");
     let first_record = s
         .pk_only_times
         .iter()
@@ -2410,10 +2185,7 @@ fn test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record() {
         .chain(s.doses.iter().map(|d| &d.time))
         .copied()
         .fold(f64::INFINITY, f64::min);
-    assert_eq!(
-        first_record, 0.0,
-        "the kept row is the subject's first record"
-    );
+    assert_eq!(first_record, 0.0, "the kept row is the subject's first record");
     assert!(
         warn.contains("its covariates and occasion govern the interval ending at it, as in NONMEM"),
         "{warn}"
@@ -2456,9 +2228,7 @@ fn test_cens_negative_one_preserved_and_missing_defaults_zero() {
     assert_eq!(subj.cens, vec![-1, 0, 1]);
     assert!(subj.has_censored_observation());
     assert!(
-        !pop.warnings
-            .iter()
-            .any(|w| w.starts_with("W_CENS_UNEXPECTED")),
+        !pop.warnings.iter().any(|w| w.starts_with("W_CENS_UNEXPECTED")),
         "valid CENS values (-1/0/1) must not warn"
     );
 }
@@ -2475,11 +2245,7 @@ fn test_cens_unexpected_value_warns_once() {
     // Value is preserved verbatim (no silent coercion in the reader)...
     assert_eq!(pop.subjects[0].cens, vec![2, 3]);
     // ...but the out-of-range flag is reported exactly once per subject.
-    let n = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
-        .count();
+    let n = pop.warnings.iter().filter(|w| w.starts_with("W_CENS_UNEXPECTED")).count();
     assert_eq!(n, 1, "expected one W_CENS_UNEXPECTED per subject");
 }
 
@@ -2502,11 +2268,8 @@ fn test_missing_dv_count_aggregates_across_subjects() {
     assert_eq!(pop.subjects[0].observations, vec![7.0]);
     assert_eq!(pop.subjects[1].observations, vec![5.0]);
 
-    let warns: Vec<&String> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_MISSING_DV"))
-        .collect();
+    let warns: Vec<&String> =
+        pop.warnings.iter().filter(|w| w.starts_with("W_MISSING_DV")).collect();
     assert_eq!(warns.len(), 1, "expected one aggregated W_MISSING_DV");
     assert!(
         warns[0].contains("2 observation row"),
@@ -2534,11 +2297,8 @@ fn test_missing_dv_recognizes_na_nan_and_blank_sentinels() {
     assert_eq!(subj.observations, vec![6.0]);
     assert_eq!(subj.obs_times, vec![4.0]);
 
-    let warns: Vec<&String> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_MISSING_DV"))
-        .collect();
+    let warns: Vec<&String> =
+        pop.warnings.iter().filter(|w| w.starts_with("W_MISSING_DV")).collect();
     assert_eq!(warns.len(), 1);
     assert!(
         warns[0].contains("3 observation row"),
@@ -2568,20 +2328,14 @@ fn test_missing_dv_and_amt_not_dosed_warnings_coexist() {
         pop.warnings
     );
     assert!(
-        pop.warnings
-            .iter()
-            .any(|w| w.starts_with("W_AMT_NOT_DOSED")),
+        pop.warnings.iter().any(|w| w.starts_with("W_AMT_NOT_DOSED")),
         "AMT-not-dosed warning should fire; warnings: {:?}",
         pop.warnings
     );
 }
 
 fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
-    CovariateDecl {
-        levels: None,
-        name: name.to_string(),
-        kind,
-    }
+    CovariateDecl { levels: None, name: name.to_string(), kind }
 }
 
 #[test]
@@ -2592,16 +2346,11 @@ fn test_covariate_table_one_row_per_input_record() {
                    1,1,5.0,0,.,70,1\n\
                    1,2,3.0,0,.,70,1\n";
     let f = write_csv(csv);
-    let decls = vec![
-        decl("WT", CovariateKind::Continuous),
-        decl("SEX", CovariateKind::Categorical),
-    ];
+    let decls =
+        vec![decl("WT", CovariateKind::Continuous), decl("SEX", CovariateKind::Categorical)];
     let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
     assert_eq!(table.names, vec!["WT", "SEX"]);
-    assert_eq!(
-        table.kinds,
-        vec![CovariateKind::Continuous, CovariateKind::Categorical]
-    );
+    assert_eq!(table.kinds, vec![CovariateKind::Continuous, CovariateKind::Categorical]);
     assert_eq!(table.rows.len(), 3);
     // Dose row preserved with EVID=1.
     assert_eq!(table.rows[0].evid, 1);
@@ -2617,10 +2366,8 @@ fn test_covariate_table_missing_value_is_nan() {
                    1,0,.,1,100,70,.\n\
                    1,1,5.0,0,.,,1\n";
     let f = write_csv(csv);
-    let decls = vec![
-        decl("WT", CovariateKind::Continuous),
-        decl("SEX", CovariateKind::Categorical),
-    ];
+    let decls =
+        vec![decl("WT", CovariateKind::Continuous), decl("SEX", CovariateKind::Categorical)];
     let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
     // Row 0: SEX is "." → NaN. Row 1: WT is blank → NaN.
     assert!(table.rows[0].values[1].is_nan());
@@ -2634,10 +2381,8 @@ fn test_covariate_strict_numeric_errors_on_non_numeric() {
                    1,0,.,1,100,70,M\n\
                    1,1,5.0,0,.,70,M\n";
     let f = write_csv(csv);
-    let decls = vec![
-        decl("WT", CovariateKind::Continuous),
-        decl("SEX", CovariateKind::Categorical),
-    ];
+    let decls =
+        vec![decl("WT", CovariateKind::Continuous), decl("SEX", CovariateKind::Categorical)];
     let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
     assert!(err.contains("non-numeric"), "got: {err}");
     assert!(err.contains("SEX"), "got: {err}");
@@ -2648,10 +2393,8 @@ fn test_covariate_declared_column_missing_errors() {
     let csv = "ID,TIME,DV,EVID,AMT,WT\n\
                    1,0,.,1,100,70\n";
     let f = write_csv(csv);
-    let decls = vec![
-        decl("WT", CovariateKind::Continuous),
-        decl("CRCL", CovariateKind::Continuous),
-    ];
+    let decls =
+        vec![decl("WT", CovariateKind::Continuous), decl("CRCL", CovariateKind::Continuous)];
     let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
     assert!(err.contains("not found"), "got: {err}");
     assert!(err.contains("CRCL"), "got: {err}");
@@ -2735,10 +2478,8 @@ fn test_column_map_renames_canonical_roles() {
                    1,1,5.0,0,.,70\n\
                    1,2,3.0,0,.,70\n";
     let f = write_csv(csv);
-    let map = vec![
-        ("time".to_string(), "TAFD".to_string()),
-        ("dv".to_string(), "CONC".to_string()),
-    ];
+    let map =
+        vec![("time".to_string(), "TAFD".to_string()), ("dv".to_string(), "CONC".to_string())];
     let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
     let subj = &pop.subjects[0];
     assert_eq!(subj.obs_times, vec![1.0, 2.0]);
@@ -2815,10 +2556,7 @@ fn test_column_map_frees_renamed_away_column_for_role() {
                    1,0,.,.,1,100\n\
                    1,1,5.0,1.609,0,.\n";
     let f = write_csv(csv);
-    let map = vec![
-        ("ODV".to_string(), "dv".to_string()),
-        ("DV".to_string(), "lndv".to_string()),
-    ];
+    let map = vec![("ODV".to_string(), "dv".to_string()), ("DV".to_string(), "lndv".to_string())];
     let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
     let subj = &pop.subjects[0];
     // DV now carries the log-DV values.
@@ -2895,10 +2633,7 @@ fn test_input_columns_preserves_full_header_order() {
                    1,1,5.0,0,.,1,70\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
-    assert_eq!(
-        pop.input_columns,
-        vec!["ID", "TIME", "DV", "EVID", "AMT", "OCC", "WT"]
-    );
+    assert_eq!(pop.input_columns, vec!["ID", "TIME", "DV", "EVID", "AMT", "OCC", "WT"]);
     // Standard and IOV columns must not appear in covariate_names.
     assert_eq!(pop.covariate_names, vec!["WT"]);
 }
@@ -2936,15 +2671,9 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
         &[],
     )
     .unwrap();
-    assert!(
-        table_none.is_none(),
-        "no [covariates] declaration ⇒ no covariate table"
-    );
+    assert!(table_none.is_none(), "no [covariates] declaration ⇒ no covariate table");
     assert_eq!(
-        pop.subjects
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect::<Vec<_>>(),
+        pop.subjects.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         vec!["1"],
         "STUDY==2 subject should be filtered out via the augmented column"
     );
@@ -2973,16 +2702,10 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
         &[],
     )
     .unwrap();
-    assert!(
-        table.is_some(),
-        "a [covariates] declaration ⇒ a covariate table"
-    );
+    assert!(table.is_some(), "a [covariates] declaration ⇒ a covariate table");
     // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.
     assert_eq!(
-        pop2.subjects
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect::<Vec<_>>(),
+        pop2.subjects.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         vec!["1"],
         "AGE==40 must drop subject 2 — proving AGE was pulled into the read union"
     );
@@ -3037,11 +2760,7 @@ fn keep_as_design_reports_the_rows_it_kept() {
     let f = write_csv(SIM_TEMPLATE_CSV);
     let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
-    let design: Vec<_> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_DESIGN_DV"))
-        .collect();
+    let design: Vec<_> = pop.warnings.iter().filter(|w| w.starts_with("W_DESIGN_DV")).collect();
     assert_eq!(design.len(), 1, "exactly one summary: {:?}", pop.warnings);
     assert!(
         design[0].contains("3 observation row(s)"),
@@ -3069,30 +2788,17 @@ fn keep_as_design_uses_the_registered_placeholder_state_code() {
     let f = write_csv(csv);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
     assert!(
-        matches!(
-            pop.subjects[0].obs_records[0],
-            ObsRecord::DiscreteState {
-                state: 1,
-                cmt: 3,
-                ..
-            }
-        ),
+        matches!(pop.subjects[0].obs_records[0], ObsRecord::DiscreteState { state: 1, cmt: 3, .. }),
         "got {:?}",
         pop.subjects[0].obs_records[0]
     );
 
     // An unregistered CMT keeps the `0` default (Binary is `{0,1}`; counts start
     // at 0), so the builder is opt-in per endpoint.
-    let unregistered = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    }
-    .with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let unregistered = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() }
+        .with_missing_dv(MissingDvPolicy::KeepAsDesign);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &unregistered).unwrap();
-    assert!(matches!(
-        pop.subjects[0].obs_records[0],
-        ObsRecord::DiscreteState { state: 0, .. }
-    ));
+    assert!(matches!(pop.subjects[0].obs_records[0], ObsRecord::DiscreteState { state: 0, .. }));
 }
 
 #[test]
@@ -3100,15 +2806,9 @@ fn skip_policy_still_drops_every_row_of_the_same_template() {
     // The fitting reading of the exact CSV above — unchanged by #957.
     let f = write_csv(SIM_TEMPLATE_CSV);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &ObsRouting::default()).unwrap();
-    assert!(
-        pop.subjects[0].obs_times.is_empty(),
-        "under Skip a DV-less template scores nothing"
-    );
+    assert!(pop.subjects[0].obs_times.is_empty(), "under Skip a DV-less template scores nothing");
     assert_eq!(
-        pop.warnings
-            .iter()
-            .filter(|w| w.starts_with("W_MISSING_DV"))
-            .count(),
+        pop.warnings.iter().filter(|w| w.starts_with("W_MISSING_DV")).count(),
         1,
         "…and says so exactly once: {:?}",
         pop.warnings
@@ -3126,11 +2826,7 @@ fn keep_as_design_still_excludes_mdv1_rows() {
     let f = write_csv(csv);
     let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
     let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
-    assert_eq!(
-        pop.subjects[0].obs_times,
-        vec![1.0],
-        "the MDV=1 sampling time stays excluded"
-    );
+    assert_eq!(pop.subjects[0].obs_times, vec![1.0], "the MDV=1 sampling time stays excluded");
 }
 
 #[test]
@@ -3173,29 +2869,11 @@ fn keep_as_design_places_integer_endpoint_rows_with_a_zero_placeholder() {
     let recs = &pop.subjects[0].obs_records;
     assert_eq!(recs.len(), 2, "both design rows are kept: {recs:?}");
     assert!(
-        matches!(
-            recs[0],
-            ObsRecord::DiscreteState {
-                state: 0,
-                cmt: 3,
-                ..
-            }
-        ),
+        matches!(recs[0], ObsRecord::DiscreteState { state: 0, cmt: 3, .. }),
         "got {:?}",
         recs[0]
     );
-    assert!(
-        matches!(
-            recs[1],
-            ObsRecord::Count {
-                count: 0,
-                cmt: 4,
-                ..
-            }
-        ),
-        "got {:?}",
-        recs[1]
-    );
+    assert!(matches!(recs[1], ObsRecord::Count { count: 0, cmt: 4, .. }), "got {:?}", recs[1]);
 
     // Under the fitting policy the same rows are still skipped and counted.
     let skipped = read_nonmem_csv_filtered_routed(
@@ -3208,10 +2886,7 @@ fn keep_as_design_places_integer_endpoint_rows_with_a_zero_placeholder() {
     )
     .unwrap();
     assert!(skipped.subjects[0].obs_records.is_empty());
-    assert!(skipped
-        .warnings
-        .iter()
-        .any(|w| w.starts_with("W_MISSING_DV")));
+    assert!(skipped.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")));
 }
 
 #[test]
@@ -3220,11 +2895,8 @@ fn keep_as_design_still_rejects_an_out_of_range_integer_dv() {
     // DV is still the user's data error, on either policy.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
                    1,1,-2,0,0,.,4\n";
-    let routing = ObsRouting {
-        count: [4].into_iter().collect(),
-        ..Default::default()
-    }
-    .with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let routing = ObsRouting { count: [4].into_iter().collect(), ..Default::default() }
+        .with_missing_dv(MissingDvPolicy::KeepAsDesign);
     let f = write_csv(csv);
     let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
     assert!(err.contains("out-of-range DV"), "{err}");
@@ -3244,11 +2916,8 @@ fn routed_reader_never_places_an_endpoint_cmt_in_the_gaussian_grid() {
         let (pop, _) = read_nonmem_csv_routed(path, None, None, &[], None, None, routing, &[])
             .expect("fixture reads");
         let events: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
-        let gaussian_on_3: usize = pop
-            .subjects
-            .iter()
-            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
-            .sum();
+        let gaussian_on_3: usize =
+            pop.subjects.iter().map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count()).sum();
         (events, gaussian_on_3)
     };
     let (ev_unrouted, g3_unrouted) = read(&ObsRouting::default());
@@ -3257,10 +2926,7 @@ fn routed_reader_never_places_an_endpoint_cmt_in_the_gaussian_grid() {
 
     assert!(g3_unrouted > 0, "the fixture has event rows on CMT 3");
     assert_eq!(ev_unrouted, 0, "no routing ⇒ no event records");
-    assert_eq!(
-        g3_routed, 0,
-        "routed ⇒ CMT 3 is never a Gaussian observation"
-    );
+    assert_eq!(g3_routed, 0, "routed ⇒ CMT 3 is never a Gaussian observation");
     assert_eq!(
         ev_routed, g3_unrouted,
         "every CMT-3 row moves from the Gaussian grid to obs_records, none is lost"
@@ -3279,11 +2945,8 @@ fn trailing_censored_tte_rows_flush_in_file_row_order() {
     use crate::types::{EventType, ObsRecord};
     use std::collections::HashSet;
     let mut f = NamedTempFile::new().expect("tempfile");
-    write!(
-        f,
-        "ID,TIME,DV,EVID,CMT\n1,5,0,0,3\n1,10,0,0,4\n1,10,0,0,2\n1,10,0,0,3\n"
-    )
-    .expect("write csv");
+    write!(f, "ID,TIME,DV,EVID,CMT\n1,5,0,0,3\n1,10,0,0,4\n1,10,0,0,2\n1,10,0,0,3\n")
+        .expect("write csv");
     let tte: HashSet<usize> = [2, 3, 4].into_iter().collect();
     let routing = ObsRouting::tte_and_discrete(&tte, &HashSet::new());
     for read in 0..30 {
@@ -3293,12 +2956,9 @@ fn trailing_censored_tte_rows_flush_in_file_row_order() {
             .obs_records
             .iter()
             .map(|r| match r {
-                ObsRecord::Event {
-                    cmt,
-                    time,
-                    event_type: EventType::RightCensored,
-                    ..
-                } => (*cmt, *time),
+                ObsRecord::Event { cmt, time, event_type: EventType::RightCensored, .. } => {
+                    (*cmt, *time)
+                }
                 other => panic!("expected a right-censored Event, got {other:?}"),
             })
             .collect();
@@ -3343,11 +3003,8 @@ fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
         let (pop, _) = read_nonmem_csv_routed(path, None, None, &[], None, None, routing, &[])
             .expect("fixture reads");
         let records: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
-        let gaussian_on_3: usize = pop
-            .subjects
-            .iter()
-            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
-            .sum();
+        let gaussian_on_3: usize =
+            pop.subjects.iter().map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count()).sum();
         (records, gaussian_on_3)
     };
     let (rec_unrouted, g3_unrouted) = read(&ObsRouting::default());
@@ -3356,10 +3013,7 @@ fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
 
     assert!(g3_unrouted > 0, "the fixture has binary rows on CMT 3");
     assert_eq!(rec_unrouted, 0, "no routing ⇒ no discrete records");
-    assert_eq!(
-        g3_routed, 0,
-        "routed ⇒ CMT 3 is never a Gaussian observation"
-    );
+    assert_eq!(g3_routed, 0, "routed ⇒ CMT 3 is never a Gaussian observation");
     assert_eq!(
         rec_routed, g3_unrouted,
         "every CMT-3 row moves from the Gaussian grid to obs_records, none is lost"
@@ -3423,11 +3077,7 @@ fn missing_and_unparseable_cmt_cells_default_to_1_and_are_counted() {
     // All six defaulted to compartment 1 — `2.5` included, which a rounding parse
     // would have sent to 2.
     assert_eq!(
-        pop.subjects[0]
-            .doses
-            .iter()
-            .map(|d| d.cmt_1based())
-            .collect::<Vec<_>>(),
+        pop.subjects[0].doses.iter().map(|d| d.cmt_1based()).collect::<Vec<_>>(),
         vec![1; 6]
     );
     let w = pop
@@ -3472,17 +3122,11 @@ fn absent_cmt_column_warns_once_with_dose_and_obs_counts() {
                2,1,6.0,0,.,1,0\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let hits: Vec<&String> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_CMT_DEFAULTED"))
-        .collect();
+    let hits: Vec<&String> =
+        pop.warnings.iter().filter(|w| w.starts_with("W_CMT_DEFAULTED")).collect();
     assert_eq!(hits.len(), 1, "one summary, not one per row: {hits:?}");
     let w = hits[0];
-    assert!(
-        w.contains("the dataset has no CMT column"),
-        "must name the absent column, got: {w}"
-    );
+    assert!(w.contains("the dataset has no CMT column"), "must name the absent column, got: {w}");
     assert!(
         w.contains("2 dose row(s) and 3 observation row(s)"),
         "counts must sum across subjects (2 doses, 3 obs), got: {w}"
@@ -3555,11 +3199,7 @@ fn filter_context_cmt_resolves_like_the_dose_site() {
     let filter = SelectionFilter::from_opts(&["EVID == 1 && CMT == 1".to_string()], &[], &[])
         .unwrap_or_else(|e| panic!("filter: {e}"));
     let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
-    let cmts: Vec<usize> = pop.subjects[0]
-        .doses
-        .iter()
-        .map(|d| d.cmt_1based())
-        .collect();
+    let cmts: Vec<usize> = pop.subjects[0].doses.iter().map(|d| d.cmt_1based()).collect();
     assert_eq!(
         cmts,
         vec![2],
@@ -3568,17 +3208,13 @@ fn filter_context_cmt_resolves_like_the_dose_site() {
     // The surviving dotted *observation* is a defaulted row, so the summary does
     // fire — and because the column is present it must use the cell wording, not
     // the absent-column one. Both halves are now load-bearing.
-    let w = pop
-        .warnings
-        .iter()
-        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
-        .unwrap_or_else(|| {
-            panic!(
-                "the surviving dotted observation must be reported, else the wording \
+    let w = pop.warnings.iter().find(|w| w.starts_with("W_CMT_DEFAULTED")).unwrap_or_else(|| {
+        panic!(
+            "the surviving dotted observation must be reported, else the wording \
                  assertion below is vacuous; got {:?}",
-                pop.warnings
-            )
-        });
+            pop.warnings
+        )
+    });
     assert!(
         w.contains("0 dose row(s) and 1 observation row(s)"),
         "the excluded dose row is not counted, the kept observation is: {w}"
@@ -3656,10 +3292,7 @@ fn addl_expansion_note_is_absent_when_no_row_expands() {
         w.contains("1 dose row(s) and 1 observation row(s)"),
         "unexpanded rows read plainly: {w}"
     );
-    assert!(
-        !w.contains("ADDL"),
-        "no ADDL note when nothing expanded: {w}"
-    );
+    assert!(!w.contains("ADDL"), "no ADDL note when nothing expanded: {w}");
 }
 
 #[test]
@@ -3700,11 +3333,7 @@ fn negative_zero_is_reported_like_every_other_negative() {
         "the authored `0` is NONMEM's default dose compartment, not a guess: {w}"
     );
     assert_eq!(
-        pop.subjects[0]
-            .doses
-            .iter()
-            .map(|d| d.cmt_1based())
-            .collect::<Vec<_>>(),
+        pop.subjects[0].doses.iter().map(|d| d.cmt_1based()).collect::<Vec<_>>(),
         vec![1; 4],
         "all four dose compartment 1 — which is why only the report distinguishes them"
     );
@@ -3742,11 +3371,7 @@ fn a_capped_example_list_says_it_was_capped() {
                 1,3,5.0,0,.,1,0\n";
     let f3 = write_csv(csv3);
     let pop3 = read_nonmem_csv(f3.path(), None, None).unwrap();
-    let w3 = pop3
-        .warnings
-        .iter()
-        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
-        .unwrap();
+    let w3 = pop3.warnings.iter().find(|w| w.starts_with("W_CMT_DEFAULTED")).unwrap();
     assert!(
         w3.contains("\"aa\", \"bb\", \"cc\"") && !w3.contains('…'),
         "a complete list must not claim to be truncated: {w3}"
@@ -3780,18 +3405,12 @@ fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
         .iter()
         .find(|w| w.starts_with("W_CMT_DEFAULTED"))
         .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
-    assert!(
-        !w.contains(&long),
-        "the full 60-char cell must not reach the warning: {w}"
-    );
+    assert!(!w.contains(&long), "the full 60-char cell must not reach the warning: {w}");
     assert!(
         w.contains(&format!("{}…", "x".repeat(24))),
         "truncated at 24 chars with an ellipsis: {w}"
     );
-    assert!(
-        !w.contains("a\"b"),
-        "an embedded quote must not survive verbatim: {w}"
-    );
+    assert!(!w.contains("a\"b"), "an embedded quote must not survive verbatim: {w}");
     // The standalone `!w.contains('\u{2028}')` that used to sit here was deleted: the
     // loop below already rejects that character, and two gates excluding the same
     // input are a test hole rather than belt-and-braces — deleting either left the
@@ -3833,14 +3452,8 @@ fn a_row_shorter_than_its_header_is_a_missing_cell_not_an_absent_column() {
         .iter()
         .find(|w| w.starts_with("W_CMT_DEFAULTED"))
         .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
-    assert!(
-        w.contains("1 row(s) had a missing CMT cell"),
-        "a short row is a missing cell: {w}"
-    );
-    assert!(
-        !w.contains("no CMT column"),
-        "the header does declare CMT: {w}"
-    );
+    assert!(w.contains("1 row(s) had a missing CMT cell"), "a short row is a missing cell: {w}");
+    assert!(!w.contains("no CMT column"), "the header does declare CMT: {w}");
     // The bug this pins is a *malformed* message, so assert its shape directly:
     // no empty cause clause between the code and the counts.
     assert!(!w.contains("W_CMT_DEFAULTED: ,"), "empty cause clause: {w}");
@@ -3873,11 +3486,7 @@ fn emitted_cmt_defaulted_message_classifies_as_data_quality() {
             .find(|w| w.starts_with("W_CMT_DEFAULTED"))
             .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
         let classified = crate::types::classify_warning(w);
-        assert_eq!(
-            classified.severity,
-            crate::types::WarningSeverity::Warning,
-            "message was: {w}"
-        );
+        assert_eq!(classified.severity, crate::types::WarningSeverity::Warning, "message was: {w}");
         assert_eq!(
             classified.category.as_str(),
             "data_quality",
@@ -3998,10 +3607,7 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
 
     // Five rows, one spelling. Nothing was withheld, so nothing may be implied.
     let one_spelling = read(["x"; 5]);
-    assert!(
-        one_spelling.contains("(\"x\")"),
-        "one spelling is listed in full: {one_spelling}"
-    );
+    assert!(one_spelling.contains("(\"x\")"), "one spelling is listed in full: {one_spelling}");
     assert!(
         !one_spelling.contains('…'),
         "five rows of one spelling withhold nothing, so no ellipsis: {one_spelling}"
@@ -4031,15 +3637,7 @@ fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
     // (cell, class, CENS as a `[data_selection]` rule compares it, EVID, OCC,
     // MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
     #[allow(clippy::type_complexity)]
-    let table: &[(
-        &str,
-        WholeCell,
-        i8,
-        u32,
-        Option<u32>,
-        Option<usize>,
-        Option<u16>,
-    )] = &[
+    let table: &[(&str, WholeCell, i8, u32, Option<u32>, Option<usize>, Option<u16>)] = &[
         // Integer spellings: the old parse accepted these, and they read as before.
         ("1", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
         ("+1", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
@@ -4053,15 +3651,7 @@ fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
         ("-0.0", Value(-0.0), 0, 0, None, None, None),
         // Outside `i8`, CENS saturates and keeps its sign — a cast through `i64`
         // wraps 200 to -56 and flips the tail. The unsigned columns read 200.
-        (
-            "200",
-            Value(200.0),
-            127,
-            200,
-            Some(200),
-            Some(200),
-            Some(200),
-        ),
+        ("200", Value(200.0), 127, 200, Some(200), Some(200), Some(200)),
         ("-200", Value(-200.0), -128, 0, None, None, None),
         // Not a whole number: the old fallback at every site. For `CENS` that is
         // now only the `[data_selection]` context; an observation row the fit
@@ -4099,10 +3689,7 @@ fn unsigned_integer_cells_keep_their_type_range_and_exact_literals() {
     assert_eq!(parse_unsigned_cell::<u64>("18446744073709551616"), None);
     // Read by the integer parse, exactly. Through `f64` this rounds to
     // 9007199254740992.
-    assert_eq!(
-        parse_unsigned_cell::<u64>("9007199254740993"),
-        Some(9_007_199_254_740_993)
-    );
+    assert_eq!(parse_unsigned_cell::<u64>("9007199254740993"), Some(9_007_199_254_740_993));
 }
 
 /// A2. The `CENS` observation site. A pandas-shaped export: the dose row's cell is
@@ -4181,23 +3768,10 @@ fn a_float_formatted_evid_column_reads_like_its_integer_twin() {
     };
     let integer = read("1", "0");
     let float = read("1.0", "0.0");
-    let times = |p: &Population| {
-        p.subjects[0]
-            .doses
-            .iter()
-            .map(|d| d.time)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        times(&integer),
-        vec![0.0, 12.0],
-        "the integer leg has two doses"
-    );
+    let times = |p: &Population| p.subjects[0].doses.iter().map(|d| d.time).collect::<Vec<_>>();
+    assert_eq!(times(&integer), vec![0.0, 12.0], "the integer leg has two doses");
     assert_eq!(times(&float), times(&integer), "`1.0` is EVID 1, a dose");
-    assert_eq!(
-        float.subjects[0].observations,
-        integer.subjects[0].observations
-    );
+    assert_eq!(float.subjects[0].observations, integer.subjects[0].observations);
     assert!(
         float.warnings.is_empty(),
         "no dose may be reported as not dosed, got {:?}",
@@ -4248,20 +3822,10 @@ fn a_float_formatted_addl_expands_like_its_integer_twin() {
     };
     let integer = read("2", "0");
     let float = read("2.0", "0.0");
-    let times = |p: &Population| {
-        p.subjects[0]
-            .doses
-            .iter()
-            .map(|d| d.time)
-            .collect::<Vec<_>>()
-    };
+    let times = |p: &Population| p.subjects[0].doses.iter().map(|d| d.time).collect::<Vec<_>>();
     // More doses than dose rows: the expansion is live on the integer leg.
     assert_eq!(times(&integer), vec![0.0, 24.0, 48.0]);
-    assert_eq!(
-        times(&float),
-        times(&integer),
-        "`ADDL=2.0` is two additional doses"
-    );
+    assert_eq!(times(&float), times(&integer), "`ADDL=2.0` is two additional doses");
 }
 
 /// A7. The occasion column. `1.0` / `2.0` are occasions 1 and 2, not two rows of
@@ -4282,15 +3846,9 @@ fn a_float_formatted_occasion_column_reads_like_its_integer_twin() {
     let float = read("1.0", "2.0");
     assert_eq!(integer.subjects[0].occasions, vec![1, 2]);
     assert_eq!(float.subjects[0].occasions, integer.subjects[0].occasions);
-    assert_eq!(
-        float.subjects[0].dose_occasions,
-        integer.subjects[0].dose_occasions
-    );
+    assert_eq!(float.subjects[0].dose_occasions, integer.subjects[0].dose_occasions);
     assert!(
-        !float
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_IOV_OCC_MISSING")),
+        !float.warnings.iter().any(|w| w.contains("W_IOV_OCC_MISSING")),
         "a readable occasion is not a missing one, got {:?}",
         float.warnings
     );
@@ -4315,20 +3873,10 @@ fn an_ss_rule_in_data_selection_removes_the_same_doses_on_both_spellings() {
     };
     let integer = read("1", "0");
     let float = read("1.0", "0.0");
-    let times = |p: &Population| {
-        p.subjects[0]
-            .doses
-            .iter()
-            .map(|d| d.time)
-            .collect::<Vec<_>>()
-    };
+    let times = |p: &Population| p.subjects[0].doses.iter().map(|d| d.time).collect::<Vec<_>>();
     // The integer leg removes the steady-state dose and keeps the other.
     assert_eq!(times(&integer), vec![24.0]);
-    assert_eq!(
-        times(&float),
-        times(&integer),
-        "`ignore = SS == 1` must remove `SS=1.0`"
-    );
+    assert_eq!(times(&float), times(&integer), "`ignore = SS == 1` must remove `SS=1.0`");
 }
 
 /// `FREMTYPE`, the last integer site: `1.0` / `2.0` are FREM covariate types 1
@@ -4399,10 +3947,7 @@ fn a_cens_cell_that_is_not_a_whole_number_is_an_error_on_a_scored_row() {
         assert_eq!(err, cens_not_whole_message("2.5", cell));
         // A cell that holds no flag is scored on no tail, under any method.
         for word in ["tail", "m3", "M3"] {
-            assert!(
-                !err.contains(word),
-                "{cell}: the error says {word:?}: {err}"
-            );
+            assert!(!err.contains(word), "{cell}: the error says {word:?}: {err}");
         }
     }
 
@@ -4428,10 +3973,7 @@ fn a_cens_cell_that_is_not_a_whole_number_is_an_error_on_a_scored_row() {
         "the restart must shift the row, or this leg tests nothing: {:?}",
         shifted.subjects[0].obs_times
     );
-    assert_eq!(
-        read(&restarted("abc")).unwrap_err(),
-        cens_not_whole_message("2.5", "abc")
-    );
+    assert_eq!(read(&restarted("abc")).unwrap_err(), cens_not_whole_message("2.5", "abc"));
 
     // "a blank or "." cell reads as 0".
     for missing in ["", "."] {
@@ -4492,11 +4034,7 @@ fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
         .unwrap_or_else(|e| panic!("filter: {e}"));
     let removed = read_nonmem_csv_filtered(f.path(), None, None, &filter)
         .unwrap_or_else(|e| panic!("removed row: {e}"));
-    assert_eq!(
-        removed.subjects[0].observations,
-        vec![5.0],
-        "the rule removes the row"
-    );
+    assert_eq!(removed.subjects[0].observations, vec![5.0], "the rule removes the row");
 
     // (i) again, under (ii)'s active filter. The filter keeps the dose row at TIME 0,
     // and a kept dose row still never reads the cell. Raising the error on every row
@@ -4504,21 +4042,14 @@ fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
     let f = write_csv(&csv("abc", "4.0", "1", "0"));
     let dose_filtered = read_nonmem_csv_filtered(f.path(), None, None, &filter)
         .unwrap_or_else(|e| panic!("dose row under an active filter: {e}"));
-    assert_eq!(
-        dose_filtered.subjects[0].doses.len(),
-        1,
-        "the filter keeps the dose row"
-    );
+    assert_eq!(dose_filtered.subjects[0].doses.len(), 1, "the filter keeps the dose row");
     assert_eq!(dose_filtered.subjects[0].observations, vec![5.0]);
 
     // (iv) On a row the reader skips because its `DV` is missing (#258).
     let skipped = plain(&csv("0", ".", "1", "abc")).unwrap_or_else(|e| panic!("missing DV: {e}"));
     assert_eq!(skipped.subjects[0].observations, vec![5.0]);
     assert!(
-        skipped
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_MISSING_DV")),
+        skipped.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
         "the row was skipped as a missing DV: {:?}",
         skipped.warnings
     );
@@ -4526,10 +4057,7 @@ fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
     // (v) On a discrete-endpoint row: the non-Gaussian arms never read `CENS`. Under
     // the same routing the row on the Gaussian compartment is an error, so the
     // endpoint is what decides it.
-    let routing = ObsRouting {
-        discrete: [3].into_iter().collect(),
-        ..Default::default()
-    };
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let routed = |cmt: &str| {
         let f = write_csv(&csv("0", "1", cmt, "abc"));
         read_nonmem_csv_filtered_routed(f.path(), &routing)
@@ -4564,15 +4092,8 @@ fn a_cens_cell_holding_no_flag_is_not_read_on_a_simulation_design_row() {
         read_nonmem_csv_filtered_routed(f.path(), &routing)
     };
     let design = read(".").unwrap_or_else(|e| panic!("design row: {e}"));
-    assert_eq!(
-        design.subjects[0].obs_times,
-        vec![1.0, 2.0],
-        "the design row is kept, not skipped"
-    );
-    assert!(
-        design.subjects[0].observations[1].is_nan(),
-        "a design point carries no DV"
-    );
+    assert_eq!(design.subjects[0].obs_times, vec![1.0, 2.0], "the design row is kept, not skipped");
+    assert!(design.subjects[0].observations[1].is_nan(), "a design point carries no DV");
     assert_eq!(design.subjects[0].cens, vec![0, 0]);
     let err = read("4.0").expect_err("the same row with a DV reads the flag");
     assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
@@ -4596,10 +4117,7 @@ fn w_cens_unexpected_is_not_raised_on_a_simulation_design_row() {
         let pop = read_nonmem_csv_filtered_routed(f.path(), &routing)
             .unwrap_or_else(|e| panic!("DV {dv:?}: {e}"));
         assert_eq!(pop.subjects[0].obs_times, vec![1.0, 2.0], "DV {dv:?}");
-        pop.warnings
-            .iter()
-            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
-            .count()
+        pop.warnings.iter().filter(|w| w.starts_with("W_CENS_UNEXPECTED")).count()
     };
     assert_eq!(warnings("."), 0, "a design row is never scored");
     assert_eq!(warnings("4.0"), 1, "the same row with a DV is");
@@ -4624,10 +4142,7 @@ fn a_cens_cell_holding_no_flag_is_not_read_on_a_time_to_event_row() {
     };
     let tte = read("2").unwrap_or_else(|e| panic!("TTE row: {e}"));
     assert!(
-        matches!(
-            tte.subjects[0].obs_records.as_slice(),
-            [ObsRecord::Event { .. }]
-        ),
+        matches!(tte.subjects[0].obs_records.as_slice(), [ObsRecord::Event { .. }]),
         "{:?}",
         tte.subjects[0].obs_records
     );
@@ -4674,11 +4189,8 @@ fn w_cens_unexpected_quotes_the_cell_and_names_the_tail_its_sign_is_scored_on() 
              1,1,5.0,0,0,.,1,{cell}\n"
         ));
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-        let lines: Vec<&String> = pop
-            .warnings
-            .iter()
-            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
-            .collect();
+        let lines: Vec<&String> =
+            pop.warnings.iter().filter(|w| w.starts_with("W_CENS_UNEXPECTED")).collect();
         assert_eq!(lines.len(), 1, "{cell}: {:?}", pop.warnings);
         (pop.subjects[0].cens[0], lines[0].clone())
     };
@@ -4723,11 +4235,8 @@ fn w_cens_unexpected_is_reported_once_per_subject_for_each_sign() {
     );
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     assert_eq!(pop.subjects[0].cens, vec![7, -2, 8, -3]);
-    let lines: Vec<&String> = pop
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
-        .collect();
+    let lines: Vec<&String> =
+        pop.warnings.iter().filter(|w| w.starts_with("W_CENS_UNEXPECTED")).collect();
     assert_eq!(lines.len(), 2, "one line per sign: {lines:?}");
     assert!(
         lines[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 ")
@@ -4790,12 +4299,8 @@ fn a_cens_cell_is_still_read_on_an_observation_row_an_active_filter_keeps() {
     // The warning, on the same pair of clauses.
     let lines = |cell: &str, clause: &str| {
         let pop = read(cell, clause).unwrap_or_else(|e| panic!("{cell} under {clause:?}: {e}"));
-        let lines: Vec<String> = pop
-            .warnings
-            .iter()
-            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
-            .cloned()
-            .collect();
+        let lines: Vec<String> =
+            pop.warnings.iter().filter(|w| w.starts_with("W_CENS_UNEXPECTED")).cloned().collect();
         (pop.subjects[0].cens.clone(), lines)
     };
     let (cens, quiet) = lines("7", "TIME == 2");
@@ -4804,11 +4309,7 @@ fn a_cens_cell_is_still_read_on_an_observation_row_an_active_filter_keeps() {
     let (cens, warned) = lines("7", "TIME == 1");
     assert_eq!(cens, vec![7], "the clause must keep the flagged row");
     assert_eq!(warned.len(), 1, "{warned:?}");
-    assert!(
-        warned[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 "),
-        "{}",
-        warned[0]
-    );
+    assert!(warned[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 "), "{}", warned[0]);
 }
 
 // ── #1501: a present cell that is not a number is an error, where it is read ──
@@ -4833,9 +4334,8 @@ struct UnreadableCase {
     remove: &'static str,
 }
 
-const UNREADABLE_HEADER: [&str; 12] = [
-    "ID", "TIME", "DV", "EVID", "MDV", "AMT", "CMT", "RATE", "II", "SS", "ADDL", "FREMTYPE",
-];
+const UNREADABLE_HEADER: [&str; 12] =
+    ["ID", "TIME", "DV", "EVID", "MDV", "AMT", "CMT", "RATE", "II", "SS", "ADDL", "FREMTYPE"];
 
 /// A dose, then two Gaussian observations, with `cell` written into `(rec, col)`.
 fn unreadable_fixture(col: &str, rec: usize, cell: &str) -> String {
@@ -4977,11 +4477,7 @@ fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
                 "subject 1, {}: the [data_selection] rule \"ignore: {clause}\" decides \
                  this record on {col}=\"{cell}\", which is not {}. Correct the cell.",
                 case.at,
-                if col == "SS" {
-                    NOT_AN_SS_CODE
-                } else {
-                    case.what
-                }
+                if col == "SS" { NOT_AN_SS_CODE } else { case.what }
             ),
             "{tag}"
         );
@@ -5017,15 +4513,9 @@ fn a_data_selection_rule_does_not_decide_a_record_on_an_unreadable_cell() {
     };
 
     // The rule fires on the fallback 0.
-    assert_eq!(
-        read("abc", &["CENS == 0"], &[]).unwrap_err(),
-        refused("ignore: CENS == 0")
-    );
+    assert_eq!(read("abc", &["CENS == 0"], &[]).unwrap_err(), refused("ignore: CENS == 0"));
     // The rule keeps the record on the fallback 0.
-    assert_eq!(
-        read("abc", &[], &["CENS == 0"]).unwrap_err(),
-        refused("accept: CENS == 0")
-    );
+    assert_eq!(read("abc", &[], &["CENS == 0"]).unwrap_err(), refused("accept: CENS == 0"));
     // `1.5` is a number but not a flag: the filter context reads it as 0 too.
     assert_eq!(
         read("1.5", &["CENS == 0"], &[]).unwrap_err(),
@@ -5162,11 +4652,7 @@ fn the_covariate_table_echoes_an_unreadable_time_on_a_removed_record_as_nan() {
             .unwrap_or_else(|e| panic!("TIME={time}: {e}"))
     };
     let (pop, table) = read("abc");
-    assert_eq!(
-        pop.subjects[0].observations,
-        vec![5.0],
-        "STUDY 2 is removed"
-    );
+    assert_eq!(pop.subjects[0].observations, vec![5.0], "STUDY 2 is removed");
     let times: Vec<f64> = table.rows.iter().map(|r| r.time).collect();
     assert_eq!(times.len(), 3, "the table echoes the removed record too");
     assert_eq!(&times[..2], &[0.0, 1.0]);
@@ -5182,21 +4668,11 @@ fn the_covariate_table_echoes_an_unreadable_time_on_a_removed_record_as_nan() {
 fn unsigned_range_phrases_name_the_type_maximum() {
     assert_eq!(NOT_A_U32, format!("a whole number from 0 to {}", u32::MAX));
     assert_eq!(NOT_A_U16, format!("a whole number from 0 to {}", u16::MAX));
-    assert_eq!(
-        NOT_A_USIZE,
-        format!("a whole number from 0 to {}", usize::MAX)
-    );
+    assert_eq!(NOT_A_USIZE, format!("a whole number from 0 to {}", usize::MAX));
     // The largest value in range reads; one past it is unreadable.
-    for (spec, max) in [
-        (&EVID_CELL, u64::from(u32::MAX)),
-        (&FREMTYPE_CELL, u64::from(u16::MAX)),
-    ] {
+    for (spec, max) in [(&EVID_CELL, u64::from(u32::MAX)), (&FREMTYPE_CELL, u64::from(u16::MAX))] {
         assert!((spec.holds)(&max.to_string()), "{} {max}", spec.name);
-        assert!(
-            !(spec.holds)(&(max + 1).to_string()),
-            "{} {max}+1",
-            spec.name
-        );
+        assert!(!(spec.holds)(&(max + 1).to_string()), "{} {max}+1", spec.name);
     }
 }
 
@@ -5262,11 +4738,7 @@ fn the_filter_context_ss_message_names_the_codes_validate_ss_accepts() {
 fn a_removed_record_of_unreadable_type_is_tallied_as_other() {
     let tally = |csv: &str, tag: &str| {
         let pop = read_unreadable(csv, Some("TIME == 1")).unwrap_or_else(|e| panic!("{tag}: {e}"));
-        assert_eq!(
-            pop.subjects[0].observations,
-            vec![4.0],
-            "{tag}: record 2 must be removed"
-        );
+        assert_eq!(pop.subjects[0].observations, vec![4.0], "{tag}: record 2 must be removed");
         let e = pop.exclusions.as_ref().expect(tag);
         (e.n_obs_excluded, e.n_dose_excluded, e.n_other_excluded)
     };
@@ -5279,17 +4751,9 @@ fn a_removed_record_of_unreadable_type_is_tallied_as_other() {
         )
     };
     for (tag, csv, want) in [
-        (
-            "EVID=0 control",
-            unreadable_fixture("EVID", 1, "0"),
-            (1, 0, 0),
-        ),
+        ("EVID=0 control", unreadable_fixture("EVID", 1, "0"), (1, 0, 0)),
         ("EVID=abc", unreadable_fixture("EVID", 1, "abc"), (0, 0, 1)),
-        (
-            "MDV=0 control",
-            unreadable_fixture("MDV", 1, "0"),
-            (1, 0, 0),
-        ),
+        ("MDV=0 control", unreadable_fixture("MDV", 1, "0"), (1, 0, 0)),
         ("MDV=abc", unreadable_fixture("MDV", 1, "abc"), (0, 0, 1)),
         ("no EVID, AMT=. control", no_evid("."), (1, 0, 0)),
         ("no EVID, AMT=abc", no_evid("abc"), (0, 0, 1)),
@@ -5437,10 +4901,7 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
          1,5.2,.,1,1,100,1,.,.\n\
          1,6.9,3,0,0,.,1,.,.\n",
     );
-    let s = read_nonmem_csv(f.path(), None, None)
-        .unwrap()
-        .subjects
-        .remove(0);
+    let s = read_nonmem_csv(f.path(), None, None).unwrap().subjects.remove(0);
     // Both restarts shift: every later row runs past the period before it.
     assert_eq!(s.reset_times.len(), 2);
     assert!(s.reset_times[0] > 72.1 && s.reset_times[1] > s.doses[3].time);
@@ -5450,10 +4911,7 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
     let resets: Vec<f64> = s.reset_times.iter().map(|&t| s.param_time_at(t)).collect();
     assert_eq!(resets, vec![0.1, 2.0]);
     // #1909: the train's implied dose runs under the next record, the reset at written 2.
-    assert_eq!(
-        s.doses[3].implied.map(|i| (i.parent, i.param_time)),
-        Some((2, 2.0))
-    );
+    assert_eq!(s.doses[3].implied.map(|i| (i.parent, i.param_time)), Some((2, 2.0)));
     assert_eq!(s.dose_param_time(3), 2.0);
     assert_eq!(s.pk_only_raw_times, vec![10.7]);
     assert_eq!(s.param_time_pk_only(0), 10.7);
@@ -5462,10 +4920,7 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
     // The table is load-bearing: for at least one row the subtraction is not the written time.
     let offset = s.reset_times[0] - 0.1;
     assert!(
-        s.doses[1..4]
-            .iter()
-            .zip(&doses[1..4])
-            .any(|(d, &w)| d.time - offset != w),
+        s.doses[1..4].iter().zip(&doses[1..4]).any(|(d, &w)| d.time - offset != w),
         "every row round-trips through the subtraction; pick times that do not"
     );
 }
@@ -5483,10 +4938,7 @@ fn endpoint_rows_keep_their_covariate_snapshot() {
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut arms: Vec<(&str, ObsRouting, &str)> = vec![(
         "discrete",
-        ObsRouting {
-            discrete: [3].into_iter().collect(),
-            ..Default::default()
-        },
+        ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() },
         "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
          1,0,.,1,1,100,1,70\n\
          1,1,0,0,0,.,3,70\n\
@@ -5495,10 +4947,7 @@ fn endpoint_rows_keep_their_covariate_snapshot() {
     #[cfg(feature = "survival")]
     arms.push((
         "tte",
-        ObsRouting {
-            tte: [3].into_iter().collect(),
-            ..Default::default()
-        },
+        ObsRouting { tte: [3].into_iter().collect(), ..Default::default() },
         "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
          1,0,.,1,1,100,1,70\n\
          1,1,0,0,0,.,3,70\n\
@@ -5513,11 +4962,7 @@ fn endpoint_rows_keep_their_covariate_snapshot() {
             vec![wt(70.0), wt(90.0)],
             "{name}: one LOCF snapshot per endpoint row"
         );
-        assert_eq!(
-            subj.time_varying_covariate_names(),
-            vec!["WT".to_string()],
-            "{name}"
-        );
+        assert_eq!(subj.time_varying_covariate_names(), vec!["WT".to_string()], "{name}");
         let constant = write_csv(&csv.replace(",90\n", ",70\n"));
         let pop = read_nonmem_csv_filtered_routed(constant.path(), &routing).unwrap();
         assert!(
@@ -5533,21 +4978,14 @@ const TOGGLE_HEAD: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n";
 
 fn toggled(rows: &str) -> crate::types::Subject {
     let f = write_csv(&format!("{TOGGLE_HEAD}{rows}"));
-    read_nonmem_csv(f.path(), None, None)
-        .unwrap()
-        .subjects
-        .remove(0)
+    read_nonmem_csv(f.path(), None, None).unwrap().subjects.remove(0)
 }
 
 #[test]
 fn a_negative_cmt_on_an_evid2_row_is_an_off_record() {
     let s = toggled("1,0,.,1,100,1,1\n1,4,.,2,.,-2,1\n1,6,.,2,.,2,1\n1,8,10,0,.,2,0\n");
     assert_eq!(s.pk_only_times, [4.0, 6.0]);
-    let got: Vec<_> = s
-        .cmt_toggles
-        .iter()
-        .map(|c| (c.pk_only, c.state, c.on))
-        .collect();
+    let got: Vec<_> = s.cmt_toggles.iter().map(|c| (c.pk_only, c.state, c.on)).collect();
     assert_eq!(got, [(0, 1, false), (1, 1, true)]);
     assert!(s.has_cmt_toggles() && s.has_state_events() && !s.has_resets());
 }
@@ -5587,15 +5025,10 @@ fn a_negative_cmt_off_an_evid2_row_is_refused() {
         ("1,4,.,3,.,-2,1", 3),
         ("1,4,.,4,50,-2,1", 4),
     ] {
-        let f = write_csv(&format!(
-            "{TOGGLE_HEAD}1,0,.,1,100,1,1\n{row}\n1,8,10,0,.,1,0\n"
-        ));
+        let f = write_csv(&format!("{TOGGLE_HEAD}1,0,.,1,100,1,1\n{row}\n1,8,10,0,.,1,0\n"));
         let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
         assert!(err.starts_with("E_NEGATIVE_CMT"), "{err}");
-        assert!(
-            err.contains(&format!("`CMT=-2` on an `EVID={evid}` record")),
-            "{err}"
-        );
+        assert!(err.contains(&format!("`CMT=-2` on an `EVID={evid}` record")), "{err}");
         assert!(err.contains("only valid on an `EVID=2` row"), "{err}");
     }
 }
@@ -5645,10 +5078,7 @@ fn an_off_row_stops_the_rest_of_an_addl_train() {
     let f = write_csv(
         "ID,TIME,DV,EVID,AMT,CMT,MDV,II,ADDL\n1,0,.,1,10,2,1,2,3\n1,3,.,2,.,-2,1,0,0\n1,9,1,0,.,1,0,0,0\n",
     );
-    let s = read_nonmem_csv(f.path(), None, None)
-        .unwrap()
-        .subjects
-        .remove(0);
+    let s = read_nonmem_csv(f.path(), None, None).unwrap().subjects.remove(0);
     let cut = s.with_cmt_cutoffs();
     let got: Vec<(f64, f64)> = cut.doses.iter().map(|d| (d.time, d.off_at)).collect();
     assert_eq!(got, [(0.0, 3.0), (2.0, 3.0), (4.0, 3.0), (6.0, 3.0)]);

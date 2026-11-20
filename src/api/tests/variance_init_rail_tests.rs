@@ -112,16 +112,11 @@ fn free_zero_omega_is_rejected_naming_the_eta_and_fix() {
     // The NONMEM refusal is quoted verbatim so a user who has seen NM-TRAN
     // error 76 recognises the same rejection.
     assert!(
-        d.message
-            .contains("INITIAL ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED"),
+        d.message.contains("INITIAL ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED"),
         "{}",
         d.message
     );
-    assert!(
-        d.suggestion.as_deref().unwrap_or_default().contains("FIX"),
-        "{:?}",
-        d.suggestion
-    );
+    assert!(d.suggestion.as_deref().unwrap_or_default().contains("FIX"), "{:?}", d.suggestion);
 }
 
 /// Regression: the `packed_fixed_mask` consult. `compute_bounds` pins a FIX-ed
@@ -150,11 +145,7 @@ fn fixed_zero_omega_is_accepted_even_though_it_sits_on_its_pinned_bound() {
         lower[i]
     );
 
-    assert!(
-        rails_with_default_options(p).is_empty(),
-        "{:#?}",
-        rails_with_default_options(p)
-    );
+    assert!(rails_with_default_options(p).is_empty(), "{:#?}", rails_with_default_options(p));
 }
 
 // ── the rail straddle ───────────────────────────────────────────────────────
@@ -187,16 +178,8 @@ fn tiny_variances_straddle_the_minus_six_rail() {
     // quantity actually compared against the rail. On a *diagonal* Ω that
     // equals the declared variance, which is why this coordinate can be checked
     // against the declaration at all; the block fixture is where they diverge.
-    assert!(
-        rejected[0].message.contains("5.000e-6"),
-        "{}",
-        rejected[0].message
-    );
-    assert!(
-        rejected[0].message.contains("1e-5"),
-        "{}",
-        rejected[0].message
-    );
+    assert!(rejected[0].message.contains("5.000e-6"), "{}", rejected[0].message);
+    assert!(rejected[0].message.contains("1e-5"), "{}", rejected[0].message);
     assert!(
         !rejected[0].message.contains("CANNOT BE ZERO"),
         "a non-zero start must not be reported as NONMEM's zero-variance error: {}",
@@ -252,11 +235,7 @@ fn declared_zero_variance_arrives_at_the_regularisation_floor() {
     let model = model_with_parameters(&params_with_omega("omega ETA_CL ~ 0.0"));
     let om = &model.default_params.omega;
     assert_eq!(om.matrix[(0, 0)], 1e-8, "eigenvalue floor moved");
-    assert_eq!(
-        om.chol[(0, 0)],
-        1e-4,
-        "Cholesky of the floored variance moved"
-    );
+    assert_eq!(om.chol[(0, 0)], 1e-4, "Cholesky of the floored variance moved");
 }
 
 // ── the quoted cliff follows the rail (#1242) ───────────────────────────────
@@ -587,12 +566,9 @@ fn three_eta_params(cl_v_decl: &str) -> String {
 /// same arm agreeing for the wrong reason.
 #[test]
 fn a_diagonal_omega_is_unaffected_by_an_unrelated_block_in_the_model() {
-    let without = three_eta_model(&three_eta_params(
-        "omega ETA_CL ~ 0.09\n   omega ETA_V ~ 0.04",
-    ));
-    let with = three_eta_model(&three_eta_params(
-        "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
-    ));
+    let without = three_eta_model(&three_eta_params("omega ETA_CL ~ 0.09\n   omega ETA_V ~ 0.04"));
+    let with =
+        three_eta_model(&three_eta_params("block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]"));
 
     // The straddle itself: the block half is what used to take the other arm.
     assert!(
@@ -613,10 +589,7 @@ fn a_diagonal_omega_is_unaffected_by_an_unrelated_block_in_the_model() {
     // And the words are the diagonal ones — an equality that would also be
     // satisfied by both halves taking the *block* arm.
     let msg = &d_with[0].message;
-    assert!(
-        msg.contains("`omega ETA_KA ~ 0.0` declares no variability"),
-        "{msg}"
-    );
+    assert!(msg.contains("`omega ETA_KA ~ 0.0` declares no variability"), "{msg}");
     assert!(
         !msg.contains("block_omega") && !msg.contains("correlation"),
         "ETA_KA is in no block and has no covariances to lower: {msg}"
@@ -634,15 +607,10 @@ fn a_diagonal_omega_is_unaffected_by_an_unrelated_block_in_the_model() {
 /// cannot produce these two messages at once, whichever way it decides.
 #[test]
 fn a_mixed_model_reports_the_block_eta_and_the_diagonal_eta_differently() {
-    let model = three_eta_model(&three_eta_params(
-        "block_omega (ETA_CL, ETA_V) = [0.09, 0.089997, 0.09]",
-    ));
+    let model =
+        three_eta_model(&three_eta_params("block_omega (ETA_CL, ETA_V) = [0.09, 0.089997, 0.09]"));
     let diags = rails_with_default_options(&model.default_params);
-    assert_eq!(
-        diags.len(),
-        2,
-        "both coordinates are on the rail: {diags:#?}"
-    );
+    assert_eq!(diags.len(), 2, "both coordinates are on the rail: {diags:#?}");
 
     let block = diags
         .iter()
@@ -661,9 +629,7 @@ fn a_mixed_model_reports_the_block_eta_and_the_diagonal_eta_differently() {
 
     // The diagonal eta gets the repair it can act on, in the same model.
     assert!(
-        diagonal
-            .message
-            .contains("`omega ETA_KA ~ 0.0` declares no variability"),
+        diagonal.message.contains("`omega ETA_KA ~ 0.0` declares no variability"),
         "{}",
         diagonal.message
     );
@@ -700,20 +666,13 @@ fn a_diagonal_kappa_is_unaffected_by_an_unrelated_block_kappa() {
          DV ~ proportional(PROP_ERR)\n";
     let model = crate::parser::model_parser::parse_model_string(model_src)
         .unwrap_or_else(|e| panic!("mixed block_kappa model must parse: {e}"));
-    let iov = model
-        .default_params
-        .omega_iov
-        .as_ref()
-        .expect("model declares IOV");
+    let iov = model.default_params.omega_iov.as_ref().expect("model declares IOV");
     assert!(!iov.diagonal, "premise: the Ω_IOV matrix is a block");
 
     let diags = rails_with_default_options(&model.default_params);
     assert_eq!(diags.len(), 1, "{diags:#?}");
     let msg = &diags[0].message;
-    assert!(
-        msg.contains("`kappa KAPPA_KA ~ 0.0` declares no variability"),
-        "{msg}"
-    );
+    assert!(msg.contains("`kappa KAPPA_KA ~ 0.0` declares no variability"), "{msg}");
     assert!(
         !msg.contains("block_kappa") && !msg.contains("correlation"),
         "KAPPA_KA is in no block: {msg}"
@@ -741,23 +700,16 @@ fn a_diagonal_kappa_is_unaffected_by_an_unrelated_block_kappa() {
 ///   measured on this exact file before the fix.
 #[test]
 fn a_one_eta_block_omega_keeps_its_own_spelling_without_the_correlation_story() {
-    let model = three_eta_model(&three_eta_params(
-        "block_omega (ETA_CL) = [0.0]\n   omega ETA_V ~ 0.04",
-    ));
+    let model =
+        three_eta_model(&three_eta_params("block_omega (ETA_CL) = [0.0]\n   omega ETA_V ~ 0.04"));
     let p = &model.default_params;
 
     // The premise that makes this the disagreement case, asserted so the test
     // cannot quietly become a duplicate of the plain-diagonal one: the matrix is
     // not diagonal (a block exists), ETA_CL is declared in it, and yet it has no
     // free off-diagonal.
-    assert!(
-        !p.omega.diagonal,
-        "a block declaration makes Ω non-diagonal"
-    );
-    assert!(
-        p.omega.block_declared[0],
-        "ETA_CL must be recorded as block-declared"
-    );
+    assert!(!p.omega.diagonal, "a block declaration makes Ω non-diagonal");
+    assert!(p.omega.block_declared[0], "ETA_CL must be recorded as block-declared");
     let n = p.omega.dim();
     assert!(
         !(0..n).any(|k| k != 0 && p.omega.free_mask[(0, k)]),
@@ -773,8 +725,7 @@ fn a_one_eta_block_omega_keeps_its_own_spelling_without_the_correlation_story() 
 
     // Spelled as the user wrote it, value form included — `= [0.0]`, not `~ 0.0`.
     assert!(
-        d.message
-            .contains("`block_omega (ETA_CL) = [0.0]` declares no variability"),
+        d.message.contains("`block_omega (ETA_CL) = [0.0]` declares no variability"),
         "{}",
         d.message
     );
@@ -820,17 +771,13 @@ fn a_one_eta_block_kappa_keeps_its_own_spelling() {
         .unwrap_or_else(|e| panic!("one-eta block_kappa must parse: {e}"));
     let p = &model.default_params;
     let iov = p.omega_iov.as_ref().expect("model declares IOV");
-    assert!(
-        iov.block_declared[0],
-        "KAPPA_CL must be recorded as block-declared"
-    );
+    assert!(iov.block_declared[0], "KAPPA_CL must be recorded as block-declared");
 
     let diags = rails_with_default_options(p);
     assert_eq!(diags.len(), 1, "{diags:#?}");
     let d = &diags[0];
     assert!(
-        d.message
-            .contains("`block_kappa (KAPPA_CL) = [0.0]` declares no variability"),
+        d.message.contains("`block_kappa (KAPPA_CL) = [0.0]` declares no variability"),
         "{}",
         d.message
     );
@@ -890,11 +837,7 @@ fn free_zero_kappa_is_rejected_and_named_as_a_kappa() {
     let diags = rails_with_default_options(&model.default_params);
     assert_eq!(diags.len(), 1, "{diags:#?}");
     assert_eq!(diags[0].code, "E_OMEGA_INIT_AT_RAIL");
-    assert!(
-        diags[0].message.contains("KAPPA_CL"),
-        "{}",
-        diags[0].message
-    );
+    assert!(diags[0].message.contains("KAPPA_CL"), "{}", diags[0].message);
     assert!(
         diags[0].message.contains("`kappa KAPPA_CL"),
         "an Ω_IOV coordinate must be reported as a `kappa` declaration: {}",
@@ -1007,10 +950,7 @@ fn evaluation_only_run_is_not_judged() {
         "a fitting run must still reject it"
     );
 
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
+    let eval_only = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
     assert!(
         check_variance_init_rails(p, &eval_only).is_empty(),
         "nothing searches at outer_maxiter = 0, so no start can be trapped on \
@@ -1056,27 +996,18 @@ fn a_railed_estimate_repacks_exactly_onto_the_rail() {
         "variance → chol → ln(L) must round-trip exactly onto the rail; got \
          {packed:.20}"
     );
-    assert!(
-        packed <= lower,
-        "so a railed replicate satisfies the predicate: {packed} vs {lower}"
-    );
+    assert!(packed <= lower, "so a railed replicate satisfies the predicate: {packed} vs {lower}");
 
     // Which is exactly why `--dofv` must not be judged: it re-enters `fit()`
     // with these estimates at `outer_maxiter = 0`.
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
+    let eval_only = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
     assert!(
         check_variance_init_rails(&p, &eval_only).is_empty(),
         "a railed replicate re-evaluated at maxiter = 0 must not be rejected"
     );
     // …and the same parameters *would* be rejected by a fitting run, so the
     // exemption is the gate and not something about these values.
-    assert_eq!(
-        check_variance_init_rails(&p, &FitOptions::default()).len(),
-        1
-    );
+    assert_eq!(check_variance_init_rails(&p, &FitOptions::default()).len(), 1);
 }
 
 /// The other half of that gate: `outer_maxiter` is not the whole story. SAEM,
@@ -1095,11 +1026,7 @@ fn maxiter_zero_does_not_exempt_estimators_that_ignore_it() {
         EstimationMethod::Impmap,
         EstimationMethod::Bayes,
     ] {
-        let opts = FitOptions {
-            outer_maxiter: 0,
-            method,
-            ..FitOptions::default()
-        };
+        let opts = FitOptions { outer_maxiter: 0, method, ..FitOptions::default() };
         assert_eq!(
             check_variance_init_rails(p, &opts).len(),
             1,
@@ -1110,11 +1037,8 @@ fn maxiter_zero_does_not_exempt_estimators_that_ignore_it() {
 
     // …and a method that *does* honour it stays exempt, so the two arms above
     // are a real discrimination rather than "everything is rejected".
-    let foce_eval = FitOptions {
-        outer_maxiter: 0,
-        method: EstimationMethod::Foce,
-        ..FitOptions::default()
-    };
+    let foce_eval =
+        FitOptions { outer_maxiter: 0, method: EstimationMethod::Foce, ..FitOptions::default() };
     assert!(check_variance_init_rails(p, &foce_eval).is_empty());
 }
 
@@ -1159,11 +1083,7 @@ fn tiny_positive_variance_is_not_reported_as_a_declared_zero() {
 fn exact_floor_on_a_diagonal_omega_still_claims_the_zero() {
     let diags = rails_for_omega("omega ETA_CL ~ 0.0");
     assert_eq!(diags.len(), 1, "{diags:#?}");
-    assert!(
-        diags[0].message.contains("CANNOT BE ZERO"),
-        "{}",
-        diags[0].message
-    );
+    assert!(diags[0].message.contains("CANNOT BE ZERO"), "{}", diags[0].message);
 }
 
 /// `block_kappa` (IOV Option B) is correlated for exactly the same reason
@@ -1262,11 +1182,7 @@ fn free_zero_sigma_is_not_flagged() {
         lower[s]
     );
 
-    assert!(
-        rails_with_default_options(p).is_empty(),
-        "{:#?}",
-        rails_with_default_options(p)
-    );
+    assert!(rails_with_default_options(p).is_empty(), "{:#?}", rails_with_default_options(p));
 }
 
 // ── init_params, not default_params ─────────────────────────────────────────
@@ -1383,14 +1299,6 @@ fn every_offending_coordinate_gets_its_own_diagnostic() {
     assert!(diags[0].message.contains("ETA_CL"), "{}", diags[0].message);
     assert!(diags[1].message.contains("ETA_V"), "{}", diags[1].message);
     // Distinct variants: the zero gets the NONMEM quote, the 5e-6 does not.
-    assert!(
-        diags[0].message.contains("CANNOT BE ZERO"),
-        "{}",
-        diags[0].message
-    );
-    assert!(
-        !diags[1].message.contains("CANNOT BE ZERO"),
-        "{}",
-        diags[1].message
-    );
+    assert!(diags[0].message.contains("CANNOT BE ZERO"), "{}", diags[0].message);
+    assert!(!diags[1].message.contains("CANNOT BE ZERO"), "{}", diags[1].message);
 }

@@ -70,23 +70,12 @@ fn at_nonmem_estimates() -> String {
         assert!(s.contains(from), "{from}");
         s.replace(from, to)
     };
-    let s = swap(
-        MODEL.to_string(),
-        "theta TVCL(1.2, 0.1, 10.0)",
-        "theta TVCL(0.977516, 0.1, 10.0)",
-    );
-    let s = swap(
-        s,
-        "theta TVV(12.0, 1.0, 100.0)",
-        "theta TVV(9.96803, 1.0, 100.0)",
-    );
+    let s =
+        swap(MODEL.to_string(), "theta TVCL(1.2, 0.1, 10.0)", "theta TVCL(0.977516, 0.1, 10.0)");
+    let s = swap(s, "theta TVV(12.0, 1.0, 100.0)", "theta TVV(9.96803, 1.0, 100.0)");
     let s = swap(s, "omega ETA_CL ~ 0.1", "omega ETA_CL ~ 0.110390");
     let s = swap(s, "kappa KAPPA_CL ~ 0.03", "kappa KAPPA_CL ~ 0.0350388");
-    swap(
-        s,
-        "[0.0144, 0.006, 0.0324]",
-        "[0.0119830, 0.006, 0.0445881]",
-    )
+    swap(s, "[0.0144, 0.006, 0.0324]", "[0.0119830, 0.006, 0.0445881]")
 }
 
 /// `fit()` from the twin's declared parameters, with the `block_sigma` ρ replaced by
@@ -138,15 +127,8 @@ fn nonmem_ebes() -> Vec<(String, [f64; 4])> {
 fn block_sigma_with_iov_matches_nonmem_at_its_estimates() {
     let r = run(&at_nonmem_estimates(), 0, Some(nm_rho()));
     let d_ofv = (r.ofv - NM_EVAL_OFV).abs();
-    eprintln!(
-        "ferx OFV {:.14}  NONMEM {NM_EVAL_OFV:.14}  |Δ| {d_ofv:.3e}",
-        r.ofv
-    );
-    assert!(
-        r.ofv.is_finite() && d_ofv < OFV_TOL,
-        "OFV {} vs NONMEM {NM_EVAL_OFV}",
-        r.ofv
-    );
+    eprintln!("ferx OFV {:.14}  NONMEM {NM_EVAL_OFV:.14}  |Δ| {d_ofv:.3e}", r.ofv);
+    assert!(r.ofv.is_finite() && d_ofv < OFV_TOL, "OFV {} vs NONMEM {NM_EVAL_OFV}", r.ofv);
 
     let nm = nonmem_ebes();
     assert_eq!(nm.len(), 40);
@@ -156,20 +138,11 @@ fn block_sigma_with_iov_matches_nonmem_at_its_estimates() {
         assert_eq!(&r.subjects[i].id, id, "subject order");
         let kappas = &r.ebe_kappas[i];
         assert_eq!(kappas.len(), 3, "subject {id}: one κ̂ per occasion");
-        let got = [
-            r.subjects[i].eta[0],
-            kappas[0][0],
-            kappas[1][0],
-            kappas[2][0],
-        ];
+        let got = [r.subjects[i].eta[0], kappas[0][0], kappas[1][0], kappas[2][0]];
         for (k, (&g, &w)) in got.iter().zip(eta).enumerate() {
             assert!(g.is_finite(), "subject {id} ETA{}: {g}", k + 1);
             let d = (g - w).abs();
-            assert!(
-                d < EBE_TOL,
-                "subject {id} ETA{}: ferx {g} vs NONMEM {w}",
-                k + 1
-            );
+            assert!(d < EBE_TOL, "subject {id} ETA{}: ferx {g} vs NONMEM {w}", k + 1);
             worst = worst.max(d);
         }
     }
@@ -178,33 +151,13 @@ fn block_sigma_with_iov_matches_nonmem_at_its_estimates() {
     // The per-subject contributions the sdtab and the fit YAML report are scored at the
     // same live ρ as the objective (`compute_subject_results`), so they sum to it.
     let summed: f64 = r.subjects.iter().map(|s| s.ofv_contribution).sum();
-    eprintln!(
-        "Σ subject contributions {summed:.10}, |Δ| {:.3e}",
-        (summed - r.ofv).abs()
-    );
-    assert!(
-        (summed - r.ofv).abs() < 1e-6,
-        "Σ contributions {summed} vs OFV {}",
-        r.ofv
-    );
+    eprintln!("Σ subject contributions {summed:.10}, |Δ| {:.3e}", (summed - r.ofv).abs());
+    assert!((summed - r.ofv).abs() < 1e-6, "Σ contributions {summed} vs OFV {}", r.ofv);
 
-    eprintln!(
-        "routes: inner {}, outer {}",
-        r.gradient_method_inner, r.gradient_method_outer
-    );
-    assert_eq!(
-        r.gradient_method_inner,
-        GradientMethodKind::Analytic.as_str()
-    );
-    assert_eq!(
-        r.gradient_method_outer,
-        GradientMethodKind::Analytic.as_str()
-    );
-    assert!(
-        !r.warnings.iter().any(|w| w.contains("finite-difference")),
-        "{:?}",
-        r.warnings
-    );
+    eprintln!("routes: inner {}, outer {}", r.gradient_method_inner, r.gradient_method_outer);
+    assert_eq!(r.gradient_method_inner, GradientMethodKind::Analytic.as_str());
+    assert_eq!(r.gradient_method_outer, GradientMethodKind::Analytic.as_str());
+    assert!(!r.warnings.iter().any(|w| w.contains("finite-difference")), "{:?}", r.warnings);
 }
 
 /// The controls: NONMEM's point scored at the *declared* ρ (0.315), and with the pair
@@ -224,10 +177,7 @@ fn block_sigma_with_iov_declared_and_uncorrelated_controls_diverge() {
 /// NONMEM ends at 0.617) reaches NONMEM's optimum: the fit moves ρ through the IOV
 /// marginal and its EBE search.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn block_sigma_with_iov_fit_reaches_the_nonmem_optimum() {
     let r = run(MODEL, 500, None);
     let d_ofv = r.ofv - NM_FIT_OFV;
@@ -236,16 +186,8 @@ fn block_sigma_with_iov_fit_reaches_the_nonmem_optimum() {
         "ferx fit OFV {:.8} (NONMEM {NM_FIT_OFV:.8}, Δ {d_ofv:.3e}), θ {:?}, ρ {rho:.5}",
         r.ofv, r.theta
     );
-    assert!(
-        r.ofv.is_finite() && d_ofv.abs() < FIT_OFV_TOL,
-        "OFV {}",
-        r.ofv
-    );
-    assert!(
-        (rho - nm_rho()).abs() < FIT_RHO_TOL,
-        "ρ {rho} vs NONMEM {}",
-        nm_rho()
-    );
+    assert!(r.ofv.is_finite() && d_ofv.abs() < FIT_OFV_TOL, "OFV {}", r.ofv);
+    assert!((rho - nm_rho()).abs() < FIT_RHO_TOL, "ρ {rho} vs NONMEM {}", nm_rho());
 }
 
 /// A fit to convergence on another platform's libm stops at a different last digit; the

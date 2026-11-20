@@ -10,11 +10,7 @@ use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::io::Write;
 use std::path::Path;
 
-fn warfarin_setup() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-    FitOptions,
-) {
+fn warfarin_setup() -> (ferx_core::types::CompiledModel, ferx_core::types::Population, FitOptions) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -43,24 +39,14 @@ fn impmap_standalone_produces_finite_estimates() {
 
     assert_eq!(result.method, EstimationMethod::Impmap);
     assert_eq!(result.method_chain, vec![EstimationMethod::Impmap]);
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     for (name, v) in result.theta_names.iter().zip(result.theta.iter()) {
-        assert!(
-            v.is_finite() && *v > 0.0,
-            "theta {name} must be finite > 0, got {v}"
-        );
+        assert!(v.is_finite() && *v > 0.0, "theta {name} must be finite > 0, got {v}");
     }
     // Ω diagonals stay positive & finite (the diagonal floor guards this).
     for i in 0..model.n_eta {
         let w = result.omega[(i, i)];
-        assert!(
-            w.is_finite() && w > 0.0,
-            "omega[{i},{i}] must be finite > 0, got {w}"
-        );
+        assert!(w.is_finite() && w > 0.0, "omega[{i},{i}] must be finite > 0, got {w}");
     }
 
     // IMPMAP surfaces the importance-sampling marginal −2 log L (NONMEM #OBJV)
@@ -102,14 +88,8 @@ fn impmap_warns_when_under_sampled_for_dimension() {
             .iter()
             .any(|w| w.contains("importance samples for"))
     };
-    assert!(
-        fires(50),
-        "expected an under-sampling warning at K=50 (< 100·3)"
-    );
-    assert!(
-        !fires(400),
-        "no under-sampling warning expected at K=400 (> 100·3)"
-    );
+    assert!(fires(50), "expected an under-sampling warning at K=50 (< 100·3)");
+    assert!(!fires(400), "no under-sampling warning expected at K=400 (> 100·3)");
 }
 
 /// `impmap_auto` (NONMEM `AUTO`) ramps the per-subject sample count when the
@@ -174,10 +154,7 @@ fn impmap_estimates_mu_ref_param_with_negligible_iiv() {
     );
     let tmp = tempfile::tempdir().unwrap();
     let mpath = tmp.path().join("ka_weak.ferx");
-    std::fs::File::create(&mpath)
-        .unwrap()
-        .write_all(model_src.as_bytes())
-        .unwrap();
+    std::fs::File::create(&mpath).unwrap().write_all(model_src.as_bytes()).unwrap();
     let model = parse_model_file(&mpath).expect("model must parse");
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
 
@@ -192,18 +169,12 @@ fn impmap_estimates_mu_ref_param_with_negligible_iiv() {
 
     // The routing warning must fire and name TVKA.
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("TVKA") && w.contains("negligible variance")),
+        r.warnings.iter().any(|w| w.contains("TVKA") && w.contains("negligible variance")),
         "expected a negligible-IIV routing warning for TVKA, got {:?}",
         r.warnings
     );
     // TVKA must have moved off its frozen init (warfarin's true KA ≈ 1+).
-    let tvka = r.theta[r
-        .theta_names
-        .iter()
-        .position(|n| n == "TVKA")
-        .expect("TVKA present")];
+    let tvka = r.theta[r.theta_names.iter().position(|n| n == "TVKA").expect("TVKA present")];
     assert!(
         (tvka - KA_INIT).abs() > 0.1,
         "TVKA must be estimated off its init {KA_INIT} (was frozen?), got {tvka}"
@@ -252,9 +223,7 @@ fn imp_sobol_changes_the_imp_estimator() {
         opts.imp_sobol = sobol;
         opts.imp_iterations = 3;
         opts.imp_samples = 200;
-        fit(&model, &population, &model.default_params, &opts)
-            .expect("fit must succeed")
-            .theta
+        fit(&model, &population, &model.default_params, &opts).expect("fit must succeed").theta
     };
     assert_ne!(run(true), run(false), "imp_sobol had no effect on IMP");
 }
@@ -279,11 +248,7 @@ fn imp_sobol_leaves_imp_eval_only_unchanged() {
     };
     let (on, off) = (run(true), run(false));
     assert!(on.is_finite());
-    assert_eq!(
-        on.to_bits(),
-        off.to_bits(),
-        "imp_sobol changed an eval-only −2LL: {on} vs {off}"
-    );
+    assert_eq!(on.to_bits(), off.to_bits(), "imp_sobol changed an eval-only −2LL: {on} vs {off}");
 }
 
 #[test]
@@ -296,10 +261,7 @@ fn focei_then_impmap_chain_runs() {
 
     // IMPMAP is an estimator, so it is the final reported method.
     assert_eq!(result.method, EstimationMethod::Impmap);
-    assert_eq!(
-        result.method_chain,
-        vec![EstimationMethod::FoceI, EstimationMethod::Impmap]
-    );
+    assert_eq!(result.method_chain, vec![EstimationMethod::FoceI, EstimationMethod::Impmap]);
     assert!(result.ofv.is_finite());
 }
 
@@ -309,11 +271,7 @@ fn focei_then_impmap_chain_runs() {
 #[test]
 fn focei_impmap_imp_chain_produces_covariance_and_is_result() {
     let (model, population, mut opts) = warfarin_setup();
-    opts.methods = vec![
-        EstimationMethod::FoceI,
-        EstimationMethod::Impmap,
-        EstimationMethod::Imp,
-    ];
+    opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Impmap, EstimationMethod::Imp];
     opts.outer_maxiter = 25;
     opts.run_covariance_step = true;
     opts.imp_samples = 200;
@@ -328,11 +286,7 @@ fn focei_impmap_imp_chain_produces_covariance_and_is_result() {
     assert_eq!(result.method, EstimationMethod::Impmap);
     assert_eq!(
         result.method_chain,
-        vec![
-            EstimationMethod::FoceI,
-            EstimationMethod::Impmap,
-            EstimationMethod::Imp,
-        ]
+        vec![EstimationMethod::FoceI, EstimationMethod::Impmap, EstimationMethod::Imp,]
     );
     assert!(result.ofv.is_finite());
 
@@ -386,15 +340,9 @@ fn impmap_fits_iov_models() {
     let iov = result.omega_iov.as_ref().expect("Ω_IOV in the result");
     assert!(iov[(0, 0)].is_finite() && iov[(0, 0)] > 0.0);
     assert!(result.ofv.is_finite());
-    let is = result
-        .importance_sampling
-        .as_ref()
-        .expect("final IS objective");
+    let is = result.importance_sampling.as_ref().expect("final IS objective");
     assert!(is.minus2_log_likelihood.is_finite());
-    assert!(matches!(
-        is.kappa_treatment,
-        ferx_core::types::KappaTreatment::Marginalized
-    ));
+    assert!(matches!(is.kappa_treatment, ferx_core::types::KappaTreatment::Marginalized));
 }
 
 #[test]
@@ -436,10 +384,8 @@ fn impmap_trace_collected_when_enabled() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("impmap with trace must produce a fit");
 
-    let trace = result
-        .impmap_trace
-        .as_ref()
-        .expect("impmap_trace should be Some when impmap_trace = true");
+    let trace =
+        result.impmap_trace.as_ref().expect("impmap_trace should be Some when impmap_trace = true");
 
     // 12 iteration rows + 1 final row (no covariance → no SE row).
     assert_eq!(
@@ -460,11 +406,7 @@ fn impmap_trace_collected_when_enabled() {
 
     // Every row has the right shape and finite values.
     for row in &trace.rows {
-        assert!(
-            row.ofv.is_finite(),
-            "OFV must be finite at iter {}",
-            row.iteration
-        );
+        assert!(row.ofv.is_finite(), "OFV must be finite at iter {}", row.iteration);
         assert_eq!(row.theta.len(), 3);
         assert_eq!(row.omega_lower_tri.len(), 6);
         assert_eq!(row.sigma.len(), 1);
@@ -479,10 +421,7 @@ fn impmap_trace_absent_when_disabled() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("impmap without trace must produce a fit");
 
-    assert!(
-        result.impmap_trace.is_none(),
-        "impmap_trace should be None when impmap_trace = false"
-    );
+    assert!(result.impmap_trace.is_none(), "impmap_trace should be None when impmap_trace = false");
 }
 
 #[test]
@@ -497,10 +436,7 @@ fn impmap_rejects_invalid_proposal_df() {
         .err()
         .expect("impmap_proposal_df = 0 must be rejected")
         .to_string();
-    assert!(
-        err.contains("impmap_proposal_df"),
-        "expected impmap_proposal_df error, got: {err}"
-    );
+    assert!(err.contains("impmap_proposal_df"), "expected impmap_proposal_df error, got: {err}");
 }
 
 /// Tier 3 — full convergence. IMPMAP should recover the FOCEI solution on
@@ -508,10 +444,7 @@ fn impmap_rejects_invalid_proposal_df() {
 /// so the MCEM marginal and the FOCEI Laplace estimates agree). Gated behind
 /// `slow-tests`; run nightly.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn impmap_converges_to_focei_on_warfarin() {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
@@ -538,27 +471,18 @@ fn impmap_converges_to_focei_on_warfarin() {
         fit(&model, &population, &model.default_params, &imp).expect("IMPMAP fit must succeed");
 
     // Thetas within 10% (MCEM is stochastic; the band absorbs MC noise).
-    for ((name, ti), tf) in r_imp
-        .theta_names
-        .iter()
-        .zip(r_imp.theta.iter())
-        .zip(r_focei.theta.iter())
+    for ((name, ti), tf) in
+        r_imp.theta_names.iter().zip(r_imp.theta.iter()).zip(r_focei.theta.iter())
     {
         let rel = (ti - tf).abs() / tf.abs().max(1e-8);
-        assert!(
-            rel < 0.10,
-            "theta {name}: IMPMAP {ti} vs FOCEI {tf} (rel {rel:.3})"
-        );
+        assert!(rel < 0.10, "theta {name}: IMPMAP {ti} vs FOCEI {tf} (rel {rel:.3})");
     }
     // Ω diagonals within 25% (variance components are noisier).
     for i in 0..model.n_eta {
         let wi = r_imp.omega[(i, i)];
         let wf = r_focei.omega[(i, i)];
         let rel = (wi - wf).abs() / wf.abs().max(1e-8);
-        assert!(
-            rel < 0.25,
-            "omega[{i},{i}]: IMPMAP {wi} vs FOCEI {wf} (rel {rel:.3})"
-        );
+        assert!(rel < 0.25, "omega[{i},{i}]: IMPMAP {wi} vs FOCEI {wf} (rel {rel:.3})");
     }
     // OFV (both Laplace) within a few units.
     assert!(

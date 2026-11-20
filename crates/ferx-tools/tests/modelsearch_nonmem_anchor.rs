@@ -91,10 +91,7 @@ fn structure(peripherals: u32, lagtime: bool) -> Structure {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn modelsearch_ranks_the_warfarin_candidates_as_nonmem_does() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ANCHOR_DIR);
     let config = SearchConfig::load(dir.join("anchor.ferxsearch")).unwrap();
@@ -103,10 +100,7 @@ fn modelsearch_ranks_the_warfarin_candidates_as_nonmem_does() {
     let result = run_modelsearch(
         &config,
         &base,
-        ModelsearchRun {
-            dir: Some(out.path().join("run")),
-            ..ModelsearchRun::default()
-        },
+        ModelsearchRun { dir: Some(out.path().join("run")), ..ModelsearchRun::default() },
     )
     .expect("search");
 
@@ -115,12 +109,7 @@ fn modelsearch_ranks_the_warfarin_candidates_as_nonmem_does() {
         ("base", structure(0, false), NM_BASE, NM_BASE),
         ("PERIPHERALS(1)", structure(1, false), NM_P1_AT_FERX, NM_P1),
         ("LAGTIME(ON)", structure(0, true), NM_LAG_AT_FERX, NM_LAG),
-        (
-            "LAGTIME(ON); PERIPHERALS(1)",
-            structure(1, true),
-            NM_P1_LAG_AT_FERX,
-            NM_P1_LAG,
-        ),
+        ("LAGTIME(ON); PERIPHERALS(1)", structure(1, true), NM_P1_LAG_AT_FERX, NM_P1_LAG),
     ];
     assert_eq!(result.rows.len(), 4, "{:?}", result.rows);
     let mut worst = 0.0f64;
@@ -159,10 +148,7 @@ fn modelsearch_ranks_the_warfarin_candidates_as_nonmem_does() {
     // The same ranking by the mixed BIC under either NONMEM reading, and
     // the same final model.
     let ferx_order: Vec<&str> = result.ranked().iter().map(|r| r.id.as_str()).collect();
-    for (what, mut nm) in [
-        ("at ferx's point", nm_bic_at_ferx),
-        ("own minima", nm_bic_own),
-    ] {
+    for (what, mut nm) in [("at ferx's point", nm_bic_at_ferx), ("own minima", nm_bic_own)] {
         nm.sort_by(|a, b| a.1.total_cmp(&b.1));
         let nm_order: Vec<&str> = nm.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ferx_order, nm_order, "NONMEM {what}");
@@ -180,19 +166,11 @@ fn modelsearch_ranks_the_warfarin_candidates_as_nonmem_does() {
             );
         }
     }
-    assert_eq!(
-        result.final_id, "base",
-        "no candidate earns its extra parameters on 10 subjects"
-    );
+    assert_eq!(result.final_id, "base", "no candidate earns its extra parameters on 10 subjects");
     let order: Vec<Structure> = result.ranked().iter().map(|r| r.structure).collect();
     assert_eq!(
         order,
-        vec![
-            structure(0, false),
-            structure(0, true),
-            structure(1, false),
-            structure(1, true)
-        ]
+        vec![structure(0, false), structure(0, true), structure(1, false), structure(1, true)]
     );
 }
 
@@ -241,10 +219,7 @@ const NM_MM_KM_UPPER: &str = "20.8227";
 /// objective at the stated inits — which is what the budget is for, and not
 /// what an equation anchor can compare.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_michaelis_menten_candidate_evaluates_as_nonmem_does() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(ANCHOR_DIR);
     let config = SearchConfig::load(dir.join("mm_anchor.ferxsearch")).unwrap();
@@ -253,10 +228,7 @@ fn the_michaelis_menten_candidate_evaluates_as_nonmem_does() {
     let result = run_modelsearch(
         &config,
         &base,
-        ModelsearchRun {
-            dir: Some(out.path().join("run")),
-            ..ModelsearchRun::default()
-        },
+        ModelsearchRun { dir: Some(out.path().join("run")), ..ModelsearchRun::default() },
     )
     .expect("search");
 
@@ -293,10 +265,7 @@ fn the_michaelis_menten_candidate_evaluates_as_nonmem_does() {
         (ofv - NM_MM_EVAL).abs(),
         (base_ofv - NM_MM_BASE_EVAL).abs()
     );
-    assert!(
-        (ofv - NM_MM_EVAL).abs() < MM_OFV_TOL,
-        "ferx {ofv} vs NONMEM {NM_MM_EVAL}"
-    );
+    assert!((ofv - NM_MM_EVAL).abs() < MM_OFV_TOL, "ferx {ofv} vs NONMEM {NM_MM_EVAL}");
     assert!(
         (base_ofv - NM_MM_BASE_EVAL).abs() < MM_OFV_TOL,
         "ferx {base_ofv} vs NONMEM {NM_MM_BASE_EVAL}"
@@ -315,12 +284,5 @@ fn evaluate(src: &str, population: &ferx_core::Population) -> f64 {
     let parsed = parse_full_model(src).unwrap_or_else(|e| panic!("{e}\n---\n{src}"));
     let mut options = parsed.fit_options.clone().quiet();
     options.n_starts = 1;
-    fit(
-        &parsed.model,
-        population,
-        &parsed.model.default_params,
-        &options,
-    )
-    .expect("evaluation")
-    .ofv
+    fit(&parsed.model, population, &parsed.model.default_params, &options).expect("evaluation").ofv
 }

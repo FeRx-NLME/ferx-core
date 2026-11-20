@@ -31,9 +31,8 @@
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, FitResult};
 
-const TIMES: [f64; 15] = [
-    0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0,
-];
+const TIMES: [f64; 15] =
+    [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0];
 
 fn conc(cl: f64, v: f64, ka: f64, t: f64) -> f64 {
     let k = cl / v;
@@ -42,9 +41,8 @@ fn conc(cl: f64, v: f64, ka: f64, t: f64) -> f64 {
 
 fn run(inner_restarts: usize) -> FitResult {
     let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV\n");
-    for (id, (cl, v, ka)) in [(1.0, 10.0, 0.02), (1.0, 10.0, 1.0), (1.2, 9.0, 0.8)]
-        .into_iter()
-        .enumerate()
+    for (id, (cl, v, ka)) in
+        [(1.0, 10.0, 0.02), (1.0, 10.0, 1.0), (1.2, 9.0, 0.8)].into_iter().enumerate()
     {
         let id = id + 1;
         csv.push_str(&format!("{id},0,.,1,100,1,1\n"));
@@ -53,17 +51,13 @@ fn run(inner_restarts: usize) -> FitResult {
         }
         csv.push_str(&format!("{id},100,.,3,.,1,1\n"));
     }
-    let path = std::env::temp_dir().join(format!(
-        "ferx_2014_multistart_{}_{inner_restarts}.csv",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir()
+        .join(format!("ferx_2014_multistart_{}_{inner_restarts}.csv", std::process::id()));
     std::fs::write(&path, csv).expect("write the fixture data");
     let pop = read_nonmem_csv(&path, None, None).expect("the fixture data loads");
     let _ = std::fs::remove_file(&path);
     assert!(
-        pop.subjects
-            .iter()
-            .all(|s| s.reset_times.iter().any(|&t| t > s.doses[0].time)),
+        pop.subjects.iter().all(|s| s.reset_times.iter().any(|&t| t > s.doses[0].time)),
         "premise: every subject takes the scan-every-coordinate arm"
     );
 
@@ -104,11 +98,7 @@ fn is_screen_moved(w: &str) -> bool {
 }
 
 fn eta_ka(result: &FitResult, id: &str) -> f64 {
-    let s = result
-        .subjects
-        .iter()
-        .find(|s| s.id == id)
-        .expect("subject present");
+    let s = result.subjects.iter().find(|s| s.id == id).expect("subject present");
     s.eta[2]
 }
 
@@ -117,10 +107,7 @@ fn eta_ka(result: &FitResult, id: &str) -> f64 {
 // and `estimation::outer_optimizer`: `an_all_zero_start_runs_the_guarded_multistart_like_none`
 // and `global_presearch_probes_skip_the_inner_multistart`.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn estimating_fit_multistarts_on_its_first_evaluation() {
     let fixed = run(1);
     let start_dependent: Vec<&String> = fixed
@@ -144,11 +131,7 @@ fn estimating_fit_multistarts_on_its_first_evaluation() {
     // Subject 1's deeper mode is off every axis, the case #2013's screen exists for, so
     // the final cold solve's screen reaches it and descent from η = 0 does not. That
     // warning is correct here, and it names subject 1 alone.
-    let screen_moved: Vec<&String> = fixed
-        .warnings
-        .iter()
-        .filter(|w| is_screen_moved(w))
-        .collect();
+    let screen_moved: Vec<&String> = fixed.warnings.iter().filter(|w| is_screen_moved(w)).collect();
     assert!(
         screen_moved.len() == 1 && screen_moved[0].contains("of 1 subject (1)"),
         "the screen-moved warning should name subject 1 alone: {screen_moved:?}"
@@ -169,11 +152,7 @@ fn estimating_fit_multistarts_on_its_first_evaluation() {
     // check only: the reported OFV is a cold re-solve either way, and the trapped fit's is
     // 7e-6 away. The TVCL bound is what separates the two optima: 1.065939 is 3.3e-4 away,
     // 3.3× the bound.
-    assert!(
-        (fixed.ofv - -235.559336).abs() < 1e-4,
-        "OFV {:.6} vs −235.559336",
-        fixed.ofv
-    );
+    assert!((fixed.ofv - -235.559336).abs() < 1e-4, "OFV {:.6} vs −235.559336", fixed.ofv);
     assert!(
         (fixed.theta[0] - 1.066269).abs() < 1e-4,
         "TVCL {:.6} vs 1.066269 (1.065939 is the optimum of the trapped objective)",

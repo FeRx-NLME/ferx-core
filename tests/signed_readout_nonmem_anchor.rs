@@ -90,11 +90,8 @@ fn ferx_form_c_readout_reproduces_nonmem_including_its_negative_predictions() {
     let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
     let model = parse_full_model(FERX).expect("model parses").model;
 
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
     assert_eq!(preds.len(), NONMEM.len(), "one prediction per observation");
 
     // The two late points are the whole point of the anchor: assert they are
@@ -113,9 +110,6 @@ fn ferx_form_c_readout_reproduces_nonmem_including_its_negative_predictions() {
     // within the reference table's own rounding (worst case 1.4e-5 relative).
     for (i, (&got, &want)) in preds.iter().zip(NONMEM.iter()).enumerate() {
         let rel = (got - want).abs() / want.abs();
-        assert!(
-            rel < 1e-4,
-            "obs {i}: ferx {got:.6} vs NONMEM {want:.6} (rel {rel:.2e})"
-        );
+        assert!(rel < 1e-4, "obs {i}: ferx {got:.6} vs NONMEM {want:.6} (rel {rel:.2e})");
     }
 }

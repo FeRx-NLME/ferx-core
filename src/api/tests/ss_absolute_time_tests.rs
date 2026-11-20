@@ -100,9 +100,7 @@ fn warning(term: &str) -> Option<String> {
 /// Whether the check raised the given code.
 fn raised(model: &crate::types::CompiledModel, pop: &Population, code: &str) -> bool {
     let init = model.default_params.clone();
-    check_model_data_warnings(model, pop, &init)
-        .iter()
-        .any(|d| d.code == code)
+    check_model_data_warnings(model, pop, &init).iter().any(|d| d.code == code)
 }
 
 /// Every absolute-clock spelling fires, and the message says which failure the model has.
@@ -120,14 +118,8 @@ fn every_absolute_clock_spelling_warns_and_names_its_own_consequence() {
             m.contains("`T`/`TIME` therefore return a finite number"),
             "`{term}` must report the finite-but-wrong consequence: {m}"
         );
-        assert!(
-            !m.contains("reads NaN"),
-            "`{term}` must not report `TAFD`'s consequence: {m}"
-        );
-        assert!(
-            m.contains("(`T`/`TIME`)"),
-            "`{term}` names its spelling: {m}"
-        );
+        assert!(!m.contains("reads NaN"), "`{term}` must not report `TAFD`'s consequence: {m}");
+        assert!(m.contains("(`T`/`TIME`)"), "`{term}` names its spelling: {m}");
     }
 
     let m = warning(" + 0.003*TAFD").expect("`TAFD` must warn");
@@ -271,9 +263,7 @@ fn the_finding_is_a_warning_that_counts_subjects() {
     // cannot be a dose count wearing a subject count's label. Without the extra dose both
     // readings give 2 and a `flat_map(|s| &s.doses).filter(...)` mutation survives.
     let mut mixed = population(3, true, 12.0);
-    mixed.subjects[1]
-        .doses
-        .push(DoseEvent::new(492.0, 100.0, 1, 0.0, true, 12.0));
+    mixed.subjects[1].doses.push(DoseEvent::new(492.0, 100.0, 1, 0.0, true, 12.0));
     mixed.subjects[2].doses[0] = DoseEvent::new(480.0, 100.0, 1, 0.0, false, 12.0);
     let msg = warning_for(&m, &mixed).expect("must warn");
     assert!(
@@ -289,10 +279,7 @@ fn the_finding_is_a_warning_that_counts_subjects() {
         .expect("must warn");
     assert!(!d.is_error(), "must be Warning severity, not Error");
     assert_eq!(d.block.as_deref(), Some("odes"));
-    assert!(
-        d.suggestion.is_some(),
-        "must carry a remediation suggestion"
-    );
+    assert!(d.suggestion.is_some(), "must carry a remediation suggestion");
     // And it rides the *warning* bundle, not the fatal one — `fit()` consumes that one
     // through `first_error` and would refuse the model.
     assert!(
@@ -386,11 +373,7 @@ fn a_time_reading_intermediate_used_only_by_the_hazard_does_not_warn() {
         None,
         "an intermediate read only by the hazard leaves the PK block autonomous (#1279)"
     );
-    let m = joint_src(
-        " * (1.0 + 0.003*TT)",
-        "TT = TIME",
-        "H0 * exp(BETA * (central / V))",
-    );
+    let m = joint_src(" * (1.0 + 0.003*TT)", "TT = TIME", "H0 * exp(BETA * (central / V))");
     assert!(
         warning_for(&m, &population(1, true, 12.0)).is_some(),
         "the same intermediate read by the PK RHS is a genuine absolute-clock read"
@@ -446,22 +429,12 @@ fn an_overlapping_steady_state_infusion_reaches_the_run_in() {
     // `AMT = 100, RATE = 5` is a 20-hour infusion into an `II = 12` interval.
     let pop = population_with(5.0, 1);
     let mut pop_d1 = population(1, true, 12.0);
-    pop_d1.subjects[0].doses = vec![DoseEvent::modeled(
-        480.0,
-        100.0,
-        1,
-        true,
-        12.0,
-        RateMode::ModeledDuration,
-    )];
+    pop_d1.subjects[0].doses =
+        vec![DoseEvent::modeled(480.0, 100.0, 1, true, 12.0, RateMode::ModeledDuration)];
     for (label, model, pop) in [
         ("F1 = 1", ode_model_with_f(" + 0.003*TAFD", "1.0"), &pop),
         ("F1 = 0.5", ode_model_with_f(" + 0.003*TAFD", "0.5"), &pop),
-        (
-            "RATE = -2, D1 = 20",
-            ode_model_with_d1(" + 0.003*TAFD", "0.5", "20.0"),
-            &pop_d1,
-        ),
+        ("RATE = -2, D1 = 20", ode_model_with_d1(" + 0.003*TAFD", "0.5", "20.0"), &pop_d1),
     ] {
         let preds = crate::api::predict(&model, pop, &model.default_params.clone()).unwrap();
         assert!(

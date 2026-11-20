@@ -31,9 +31,7 @@ const ODE_TOL: &str = "[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12
 /// `TIME` in the RHS, and exposure read from a data column. `resp` stays positive, so
 /// `clamp_negative_predictions` cannot hide a difference.
 fn time_rhs_model(init: Option<&str>) -> CompiledModel {
-    let init_line = init
-        .map(|e| format!("  init(resp) = {e}\n"))
-        .unwrap_or_default();
+    let init_line = init.map(|e| format!("  init(resp) = {e}\n")).unwrap_or_default();
     let src = format!(
         "[parameters]\n  theta TVKOUT(0.25, 0.01, 5.0)\n  theta TVPLB(6.0, 0.1, 50.0)\n  \
          theta TVTF(0.15, 0.001, 2.0)\n  theta TVEMAX(8.0, 0.1, 50.0)\n  \
@@ -82,12 +80,7 @@ fn preds_with(model: &CompiledModel, csv: &str, prune: bool) -> Vec<Vec<f64>> {
     let rows = predict(model, &pop, &model.default_params).expect("predict");
     pop.subjects
         .iter()
-        .map(|s| {
-            rows.iter()
-                .filter(|r| r.id == s.id)
-                .map(|r| r.pred)
-                .collect()
-        })
+        .map(|s| rows.iter().filter(|r| r.id == s.id).map(|r| r.pred).collect())
         .collect()
 }
 
@@ -104,15 +97,8 @@ fn time_rhs_closed_form(t: f64, y0: f64) -> f64 {
 /// error named in the message so the bound stays a measured one.
 fn assert_matches(label: &str, got: &[f64], want: &[f64], tol: f64) {
     assert_eq!(got.len(), want.len(), "{label}: row count");
-    assert!(
-        got.iter().all(|v| v.is_finite()),
-        "{label}: non-finite PRED {got:?}"
-    );
-    let worst = got
-        .iter()
-        .zip(want)
-        .map(|(g, w)| (g - w).abs())
-        .fold(0.0, f64::max);
+    assert!(got.iter().all(|v| v.is_finite()), "{label}: non-finite PRED {got:?}");
+    let worst = got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
     assert!(
         worst < tol,
         "{label}: PRED {got:?} vs closed form {want:?} (worst |error| {worst:.3e}, tolerance {tol:.0e})"
@@ -142,10 +128,8 @@ fn a_static_evid2_first_record_starts_the_event_driven_clock() {
                1,0,.,2,1,0,1,3\n1,2,1,0,0,0,1,3\n1,4,1,0,0,0,1,3\n1,8,1,0,0,0,1,3\n1,12,1,0,0,0,1,3\n\
                2,0,.,2,1,0,1,0\n2,2,1,0,0,0,1,3\n2,4,1,0,0,0,1,3\n2,8,1,0,0,0,1,3\n2,12,1,0,0,0,1,3\n";
     let p = preds(&model, csv);
-    let want: Vec<f64> = [2.0_f64, 4.0, 8.0, 12.0]
-        .iter()
-        .map(|&t| time_rhs_closed_form(t, 0.0))
-        .collect();
+    let want: Vec<f64> =
+        [2.0_f64, 4.0, 8.0, 12.0].iter().map(|&t| time_rhs_closed_form(t, 0.0)).collect();
     // NONMEM 7.6.0 (#1809 triage): 3.9030 / 5.7482 / 6.6383 for both subjects.
     assert_matches("static EVID=2 subject", &p[0], &want, TOL);
     assert_matches("per-record EVID=2 subject", &p[1], &want, TOL);
@@ -163,10 +147,8 @@ fn a_static_evid2_first_record_starts_the_dense_clock() {
                1,0,.,2,1,0,1,3\n1,2,1,0,0,0,1,3\n1,4,1,0,0,0,1,3\n1,8,1,0,0,0,1,3\n\
                2,0,.,2,1,0,1,0\n2,2,1,0,0,0,1,3\n2,4,1,0,0,0,1,3\n2,8,1,0,0,0,1,3\n";
     let p = preds(&model, csv);
-    let want: Vec<f64> = [2.0_f64, 4.0, 8.0]
-        .iter()
-        .map(|&t| 10.8 * (1.0 - (-0.25 * t).exp()))
-        .collect();
+    let want: Vec<f64> =
+        [2.0_f64, 4.0, 8.0].iter().map(|&t| 10.8 * (1.0 - (-0.25 * t).exp())).collect();
     // NONMEM 7.6.0 (#1809 triage): 4.2495 / 6.8269 / 9.3384.
     assert_matches("static subject, dense route", &p[0], &want, TOL);
     assert_matches("per-record subject, event-driven route", &p[1], &want, TOL);
@@ -183,10 +165,8 @@ fn an_evid0_mdv1_first_record_starts_the_clock_on_both_paths() {
                1,0,.,0,1,0,1,3\n1,2,1,0,0,0,1,3\n1,4,1,0,0,0,1,3\n1,8,1,0,0,0,1,3\n\
                2,0,.,0,1,0,1,0\n2,2,1,0,0,0,1,3\n2,4,1,0,0,0,1,3\n2,8,1,0,0,0,1,3\n";
     let p = preds(&model, csv);
-    let want: Vec<f64> = [2.0_f64, 4.0, 8.0]
-        .iter()
-        .map(|&t| time_rhs_closed_form(t, 0.0))
-        .collect();
+    let want: Vec<f64> =
+        [2.0_f64, 4.0, 8.0].iter().map(|&t| time_rhs_closed_form(t, 0.0)).collect();
     assert_matches("static EVID=0/MDV=1 subject", &p[0], &want, TOL);
     assert_matches("per-record EVID=0/MDV=1 subject", &p[1], &want, TOL);
 }
@@ -219,10 +199,8 @@ fn an_init_baseline_is_seeded_at_the_first_record() {
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,EXPO\n\
                1,0,.,2,1,0,1,3\n1,2,1,0,0,0,1,3\n1,4,1,0,0,0,1,3\n1,8,1,0,0,0,1,3\n";
     let p = preds(&model, csv);
-    let want: Vec<f64> = [2.0_f64, 4.0, 8.0]
-        .iter()
-        .map(|&t| time_rhs_closed_form(t, 5.0))
-        .collect();
+    let want: Vec<f64> =
+        [2.0_f64, 4.0, 8.0].iter().map(|&t| time_rhs_closed_form(t, 5.0)).collect();
     assert_matches("static subject with init()", &p[0], &want, TOL);
 }
 
@@ -264,10 +242,7 @@ fn an_unreferenced_varying_column_does_not_change_any_prediction() {
     ] {
         let a = preds_with(&model, base, true);
         let b = preds_with(&model, with_day, true);
-        assert!(
-            a.iter().flatten().all(|v| v.is_finite()),
-            "{label}: non-finite PRED {a:?}"
-        );
+        assert!(a.iter().flatten().all(|v| v.is_finite()), "{label}: non-finite PRED {a:?}");
         assert_eq!(
             a, b,
             "{label}: an unreferenced, within-subject-varying DAY column changed the \
@@ -275,12 +250,7 @@ fn an_unreferenced_varying_column_does_not_change_any_prediction() {
         );
         let raw = preds(&model, with_day);
         for (s, (want, got)) in a.iter().zip(&raw).enumerate() {
-            assert_matches(
-                &format!("{label}, subject {}, unpruned", s + 1),
-                got,
-                want,
-                TOL,
-            );
+            assert_matches(&format!("{label}, subject {}, unpruned", s + 1), got, want, TOL);
         }
     }
 }

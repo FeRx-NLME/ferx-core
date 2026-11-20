@@ -1,0 +1,86 @@
+# #2993 fixture: one subject (ID 4) of the E7820 transit-absorption + urine model, IOV (`kappa`)
+# on MTT, SS and N over six occasions, at the estimates of its own FOCEI fit. The data are the
+# de-identified `ferx-benchmark` copy (`m9_e7820_keizer`): DV simulated from this model on a
+# cloned design, so no record is patient data. With `maxiter = 0` this subject's cold inner solve
+# used to land where H~ is not positive definite and the evaluation returned the 2e20 sentinel.
+# E7820 PK with urine. Port of NONMEM final.mod, residual reduced to W = PROP / T13.
+[parameters]
+  theta TCL(5.990736, 2.0, 11.0)
+  theta TV(68.12101, 15.0, 120.0)
+  theta TMTT(0.624501, 0.2, 3.0)
+  theta TN(3.315298, 0.2, 12.0)
+  theta TBIOF(1.369878, 0.2, 5.0)
+  theta TMTTF(2.719477, 0.2, 5.0)
+  theta TFREN(0.118581, 0.01, 1.0)
+  theta TSS(0.094641, 0.001, 1.0)
+  theta TPF(0.97727, 0.5, 100.0)
+  theta TRU(2.554287, 0.1, 100.0)   # urine SD / plasma SD
+
+  omega ETA_CL ~ 0.256662
+  omega ETA_V  ~ 0.213469
+
+  kappa KAPPA_MTT ~ 0.399402
+  kappa KAPPA_SS  ~ 1.864884
+  kappa KAPPA_N   ~ 1.533930
+
+  sigma S_PLASMA ~ 0.377618 (sd)
+
+[covariates]
+  PODO continuous
+  TLST continuous
+  ADLEV continuous
+  FOOD continuous
+  SEED continuous
+  EARLY continuous
+  ISUR continuous
+  W1 continuous
+  W2 continuous
+  W3 continuous
+  W4 continuous
+
+[individual_parameters]
+  CL   = TCL * exp(ETA_CL)
+  V    = TV * exp(ETA_V)
+  K20  = CL / V
+  BIO  = TBIOF ^ FOOD
+  MTT  = TMTT * TMTTF ^ FOOD * exp(KAPPA_MTT)
+  NTR  = TN * exp(KAPPA_N)
+  KTR  = (NTR + 1.0) / MTT
+  FREN = TFREN / 1000.0
+  LFAC = log(2.5066) + (NTR + 0.5) * log(NTR) - NTR + log(1.0 + 1.0 / (12.0 * NTR))
+  LDOSE = log(BIO * PODO + 0.0001) + log(KTR + 0.0001) - LFAC
+  A0   = TSS * ADLEV * exp(KAPPA_SS) * SEED
+  TL   = TLST
+  U1   = W1
+  U2   = W2
+  U3   = W3
+  U4   = W4
+  F    = 0.0
+
+[structural_model]
+  ode(states=[depot, central, ur1, ur2, ur3, ur4])
+
+[odes]
+  init(central) = A0
+  d/dt(depot)   = exp(LDOSE + NTR * log(KTR * (0.0001 + 0.5 * (TIME - TL + abs(TIME - TL))) + 0.0001) - KTR * (0.0001 + 0.5 * (TIME - TL + abs(TIME - TL)))) - KTR * depot
+  d/dt(central) = KTR * depot - (1.0 - FREN) * K20 * central
+  d/dt(ur1)     = U1 * FREN * K20 * central
+  d/dt(ur2)     = U2 * FREN * K20 * central
+  d/dt(ur3)     = U3 * FREN * K20 * central
+  d/dt(ur4)     = U4 * FREN * K20 * central
+
+[scaling]
+  y[CMT=2] = log(max(central * 1000.0 / V, 0.01))
+  y[CMT=3] = log(max(ur1 * 1000000.0, 0.01))
+  y[CMT=4] = log(max(ur2 * 1000000.0, 0.01))
+  y[CMT=5] = log(max(ur3 * 1000000.0, 0.01))
+  y[CMT=6] = log(max(ur4 * 1000000.0, 0.01))
+
+[error_model]
+  DV ~ additive(S_PLASMA * ((1.0 + (TPF - 1.0) * EARLY) * (1.0 - ISUR) + TRU * ISUR))
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+  iov_column = OCC6

@@ -54,11 +54,9 @@ pub(crate) use validation::check_survival_time_dependent_pk;
 mod adaptive;
 mod adaptive_inputs;
 mod covariate_stats;
-mod entry_refusals;
 mod fit;
 mod levels;
 mod output_columns;
-mod pool;
 pub(crate) mod postfit;
 mod predict;
 mod run;
@@ -71,6 +69,7 @@ mod vpc_rtte;
 #[cfg(feature = "survival")]
 mod vpc_tte;
 
+pub(crate) use crate::entry_refusals::{adaptive_spec, adaptive_unsupported_diag};
 pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
     simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
@@ -79,15 +78,14 @@ pub use adaptive::{
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
-#[cfg(feature = "survival")]
-pub(crate) use entry_refusals::npde_tte_input;
-pub(crate) use entry_refusals::{
-    adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
-    fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
-    sir_nothing_to_sample, sir_options, theta_length,
-};
 pub use fit::{fit, fit_from_files};
 pub(crate) use validation::check_level_labels;
+// The fit-scoped pools live at the crate root (#3041); `api` keeps their public paths.
+pub(crate) use crate::pool::install_on_fit_pool;
+pub use crate::pool::{
+    configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
+};
+
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
@@ -100,16 +98,6 @@ pub use levels::{
 };
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
-pub use pool::{
-    configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
-};
-pub(crate) use pool::{
-    install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_scope, with_fit_scope_ode,
-};
-// Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
-// private to `api`, so a test elsewhere in the crate needs the re-export.
-#[cfg(test)]
-pub(crate) use pool::{default_fit_pool, fit_scope_pool};
 // The fit path reaches these through `kappa_shrinkages` (#1911); the shrinkage tests
 // call them directly.
 pub(crate) use postfit::{
@@ -125,8 +113,7 @@ pub(crate) use postfit::{
     profiled_bound_report, rebuild_warnings_structured, refresh_held_at_bound_report,
     refresh_profiled_bound_report, report_resolved_levels, resolve_covariance_status,
     resolve_sir_fallback, runaway_guard_warning_for, sir_unavailable_warning, solver_stats_scope,
-    stalled_at_init_warning, step_held, sweep_sensitivity_solver_stats, with_solver_stats,
-    ContributionSource, SolverStatsPhase,
+    stalled_at_init_warning, step_held, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -190,6 +177,12 @@ pub use simulate::{
 // ── test-support re-exports (reached via `super::` from the relocated
 //    #[cfg(test)] test siblings; production code uses these items in place) ──
 #[cfg(test)]
+pub(crate) use crate::pool::{
+    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
+    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
+    ThreadSource,
+};
+#[cfg(test)]
 pub(crate) use adaptive::{
     pk_bits_eq, reject_selected_error_for_adaptive, reject_unsupported_adaptive,
     verify_adaptive_snapshots,
@@ -197,15 +190,9 @@ pub(crate) use adaptive::{
 pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
-    dw_autocorrelation_warning, multistart_prefers, perturb_init, saem_active_covariate_group_etas,
-    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
-    select_start, DwAdvice, SubjectLine,
-};
-#[cfg(test)]
-pub(crate) use pool::{
-    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
-    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
-    ThreadSource,
+    dw_autocorrelation_warning, multistart_prefers, per_start_options, per_start_seed,
+    perturb_init, saem_active_covariate_group_etas, saem_active_mixture_switched_etas,
+    saem_non_mu_referenced_individual_params_warning, select_start, DwAdvice, SubjectLine,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -234,11 +221,7 @@ pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasse
 /// backs the TV-vs-no-TV gap assertions in the regression tests.
 #[cfg(test)]
 pub(crate) fn model_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    pk_params: &PkParams,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, pk_params: &PkParams, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)

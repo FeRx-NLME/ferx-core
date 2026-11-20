@@ -35,10 +35,7 @@ fn check_json_reports_valid_model() {
         .args(["check", "examples/one_cpt_iv.ferx", "--json"])
         .output()
         .expect("run ferx check --json");
-    assert!(
-        out.status.success(),
-        "check should exit 0 for a valid model"
-    );
+    assert!(out.status.success(), "check should exit 0 for a valid model");
     let stdout = String::from_utf8(out.stdout).unwrap();
     // Output is a JSON CheckReport.
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
@@ -47,27 +44,16 @@ fn check_json_reports_valid_model() {
 
 #[test]
 fn check_human_output_runs() {
-    let out = ferx()
-        .args(["check", "examples/one_cpt_iv.ferx"])
-        .output()
-        .expect("run ferx check");
+    let out = ferx().args(["check", "examples/one_cpt_iv.ferx"]).output().expect("run ferx check");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        stdout.contains("ok:"),
-        "human check summary missing: {stdout}"
-    );
+    assert!(stdout.contains("ok:"), "human check summary missing: {stdout}");
 }
 
 #[test]
 fn check_with_data_runs_data_dependent_checks() {
     let out = ferx()
-        .args([
-            "check",
-            "examples/one_cpt_iv.ferx",
-            "--data",
-            "data/one_cpt_iv.csv",
-        ])
+        .args(["check", "examples/one_cpt_iv.ferx", "--data", "data/one_cpt_iv.csv"])
         .output()
         .expect("run ferx check --data");
     // Exit code is 0 (valid) or 1 (warnings/errors) — both exercise the data
@@ -182,10 +168,7 @@ fn fit_with_data_writes_outputs_and_bundle() {
     );
 
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        stdout.contains("Fit completed!"),
-        "summary missing: {stdout}"
-    );
+    assert!(stdout.contains("Fit completed!"), "summary missing: {stdout}");
     assert!(stdout.contains("OFV:"));
     // #1934: the report prints |g|∞ right under the verdict it qualifies. This
     // fit runs a gradient optimizer, so the optimizer's own gradient is reported.
@@ -210,20 +193,14 @@ fn fit_with_data_writes_outputs_and_bundle() {
     assert!(!tmp.path().join("one_cpt_iv-timing.txt").exists());
 
     let yaml = std::fs::read_to_string(tmp.path().join("one_cpt_iv-fit.yaml")).unwrap();
-    assert!(
-        yaml.contains("\nestimation:"),
-        "yaml missing estimation: {yaml}"
-    );
+    assert!(yaml.contains("\nestimation:"), "yaml missing estimation: {yaml}");
     // #713: convergence time is broken out per method-chain stage (this fit
     // is a single-stage FOCEI run), plus the covariance step separately.
     assert!(yaml.contains("  focei_wall_time_secs:"));
     assert!(yaml.contains("  covariance_wall_time_secs:"));
     assert!(yaml.contains("  wall_time_secs:"));
     assert!(yaml.contains("  n_threads_used:"));
-    assert!(
-        yaml.contains("\nenvironment:"),
-        "yaml missing environment: {yaml}"
-    );
+    assert!(yaml.contains("\nenvironment:"), "yaml missing environment: {yaml}");
     assert!(yaml.contains("  os:"));
     assert!(yaml.contains("  arch:"));
     assert!(yaml.contains("  in_docker:"));
@@ -318,10 +295,7 @@ fn simulate_gaussian_horizon_only_errors() {
         "a Gaussian horizon-only [simulation] must fail, not fit on empty data"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("times"),
-        "error must point at the missing `times`: {stderr}"
-    );
+    assert!(stderr.contains("times"), "error must point at the missing `times`: {stderr}");
 }
 
 /// Covers the arg-parsing error exits in `main` (each calls `process::exit(1)`
@@ -329,27 +303,16 @@ fn simulate_gaussian_horizon_only_errors() {
 #[test]
 fn bad_flags_exit_with_error() {
     // --threads with a non-numeric value.
-    let out = ferx()
-        .args(["examples/one_cpt_iv.ferx", "--threads", "notanumber"])
-        .output()
-        .expect("run");
+    let out =
+        ferx().args(["examples/one_cpt_iv.ferx", "--threads", "notanumber"]).output().expect("run");
     assert_eq!(out.status.code(), Some(1), "bad --threads → exit 1");
 
     // --output present but missing its value.
     let out = ferx()
-        .args([
-            "examples/one_cpt_iv.ferx",
-            "--data",
-            "data/one_cpt_iv.csv",
-            "--output",
-        ])
+        .args(["examples/one_cpt_iv.ferx", "--data", "data/one_cpt_iv.csv", "--output"])
         .output()
         .expect("run");
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "--output without value → exit 1"
-    );
+    assert_eq!(out.status.code(), Some(1), "--output without value → exit 1");
 
     // --inits-from-nca with an unknown method.
     let out = ferx()
@@ -409,10 +372,7 @@ fn an_unknown_tool_name_is_named_as_a_tool_not_as_a_missing_file() {
         stderr.contains("Did you mean `covsearch`?"),
         "expected a suggestion for a one-edit typo: {stderr}"
     );
-    assert!(
-        stderr.contains("Available tools:"),
-        "expected the tool list: {stderr}"
-    );
+    assert!(stderr.contains("Available tools:"), "expected the tool list: {stderr}");
 }
 
 /// The other half of #1396: an argument that *is* a path gets a readable
@@ -431,10 +391,7 @@ fn a_missing_model_file_is_reported_by_name() {
         stderr.contains("the model `run1.ferx` was not found at this location"),
         "expected the not-found message: {stderr}"
     );
-    assert!(
-        !stderr.contains("not recognized"),
-        "a path must not be reported as a tool: {stderr}"
-    );
+    assert!(!stderr.contains("not recognized"), "a path must not be reported as a tool: {stderr}");
 }
 
 /// The witness that keeps the unknown-tool test's negative phrase anchor live: a
@@ -546,10 +503,8 @@ fn a_probe_error_keeps_the_os_error_instead_of_claiming_not_found() {
 fn every_listed_tool_still_dispatches() {
     // The list printed by the unknown-tool error — the same table `main`
     // dispatches from, read back out of the binary so the two cannot drift.
-    let out = ferx()
-        .arg("definitely-not-a-tool-name")
-        .output()
-        .expect("run ferx with an unknown tool");
+    let out =
+        ferx().arg("definitely-not-a-tool-name").output().expect("run ferx with an unknown tool");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let listed = stderr
         .lines()
@@ -577,10 +532,7 @@ fn every_listed_tool_still_dispatches() {
 
 #[test]
 fn bootstrap_help_lists_the_psn_options() {
-    let out = ferx()
-        .args(["bootstrap", "--help"])
-        .output()
-        .expect("run ferx bootstrap --help");
+    let out = ferx().args(["bootstrap", "--help"]).output().expect("run ferx bootstrap --help");
     assert!(out.status.success(), "--help should exit 0");
     let stdout = String::from_utf8(out.stdout).unwrap();
     for flag in [
@@ -599,20 +551,15 @@ fn bootstrap_help_lists_the_psn_options() {
 
 #[test]
 fn bootstrap_without_a_model_is_a_usage_error() {
-    let out = ferx()
-        .args(["bootstrap"])
-        .output()
-        .expect("run ferx bootstrap");
+    let out = ferx().args(["bootstrap"]).output().expect("run ferx bootstrap");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx bootstrap"));
 }
 
 #[test]
 fn bootstrap_summarize_needs_a_directory() {
-    let out = ferx()
-        .args(["bootstrap", "--summarize"])
-        .output()
-        .expect("run ferx bootstrap --summarize");
+    let out =
+        ferx().args(["bootstrap", "--summarize"]).output().expect("run ferx bootstrap --summarize");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--directory"));
 }
@@ -645,10 +592,7 @@ fn bootstrap_rejects_a_covstep_filter_without_the_covariance_step() {
 /// model file, and `ferx <model>` is unchanged.
 #[test]
 fn the_bootstrap_subcommand_does_not_shadow_a_plain_fit() {
-    let out = ferx()
-        .args(["check", "examples/one_cpt_iv.ferx"])
-        .output()
-        .expect("run ferx check");
+    let out = ferx().args(["check", "examples/one_cpt_iv.ferx"]).output().expect("run ferx check");
     assert!(out.status.success());
 }
 
@@ -656,10 +600,7 @@ fn the_bootstrap_subcommand_does_not_shadow_a_plain_fit() {
 
 #[test]
 fn covsearch_help_lists_the_search_options() {
-    let out = ferx()
-        .args(["covsearch", "--help"])
-        .output()
-        .expect("run ferx covsearch --help");
+    let out = ferx().args(["covsearch", "--help"]).output().expect("run ferx covsearch --help");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     for word in [
@@ -681,12 +622,7 @@ fn covsearch_without_a_file_is_a_usage_error_and_unknown_flags_are_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx covsearch"));
 
     let out = ferx()
-        .args([
-            "covsearch",
-            "examples/two_cpt_oral_cov.ferxsearch",
-            "--samples",
-            "3",
-        ])
+        .args(["covsearch", "examples/two_cpt_oral_cov.ferxsearch", "--samples", "3"])
         .output()
         .expect("run");
     assert_eq!(out.status.code(), Some(1));
@@ -698,10 +634,8 @@ fn covsearch_refuses_a_file_meant_for_another_tool_before_reading_data() {
     // The shipped example ranks on BIC (a modelsearch file); covsearch
     // refuses it by name — and before loading the dataset, so the refusal
     // is immediate.
-    let out = ferx()
-        .args(["covsearch", "examples/two_cpt_oral_cov.ferxsearch"])
-        .output()
-        .expect("run");
+    let out =
+        ferx().args(["covsearch", "examples/two_cpt_oral_cov.ferxsearch"]).output().expect("run");
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -759,23 +693,14 @@ fn covsearch_runs_a_search_and_writes_its_files() {
     std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
 
     let out = ferx()
-        .args([
-            "covsearch",
-            &dir.path().join("wt.ferxsearch").to_string_lossy(),
-        ])
+        .args(["covsearch", &dir.path().join("wt.ferxsearch").to_string_lossy()])
         .output()
         .expect("run ferx covsearch");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
-    assert!(
-        stderr.contains("Step 1 (forward): fitting 2 candidates"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Step 1 (forward): nothing accepted"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Step 1 (forward): fitting 2 candidates"), "{stderr}");
+    assert!(stderr.contains("Step 1 (forward): nothing accepted"), "{stderr}");
     assert!(stdout.contains("CL-WT-power"), "{stdout}");
     assert!(stdout.contains("not significant"), "{stdout}");
     assert!(stdout.contains("Final model: OFV"), "{stdout}");
@@ -792,19 +717,10 @@ fn covsearch_runs_a_search_and_writes_its_files() {
 
 #[test]
 fn allometry_help_and_usage() {
-    let out = ferx()
-        .args(["allometry", "--help"])
-        .output()
-        .expect("run ferx allometry --help");
+    let out = ferx().args(["allometry", "--help"]).output().expect("run ferx allometry --help");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    for word in [
-        "--covariate",
-        "--reference",
-        "--estimate",
-        "--parameters",
-        "ALLOMETRY(WT, 70)",
-    ] {
+    for word in ["--covariate", "--reference", "--estimate", "--parameters", "ALLOMETRY(WT, 70)"] {
         assert!(stdout.contains(word), "help does not mention {word}");
     }
     let out = ferx().args(["allometry"]).output().expect("run");
@@ -913,14 +829,8 @@ fn allometry_from_a_search_file_estimates_exponents() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
-    assert!(
-        stdout.contains("CL ~ WT power(center = 70, init = -0.5, estimated)"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("estimated exponents: THETA_CL_WT = -0.5000"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("CL ~ WT power(center = 70, init = -0.5, estimated)"), "{stdout}");
+    assert!(stdout.contains("estimated exponents: THETA_CL_WT = -0.5000"), "{stdout}");
     assert!(dir.path().join("wt-allometric.ferx").exists());
 
     // A search file names its own data.
@@ -985,10 +895,7 @@ fn covsearch_accepts_effects_and_resumes_quietly() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
-    assert!(
-        !stderr.contains("Step 1"),
-        "quiet run printed progress: {stderr}"
-    );
+    assert!(!stderr.contains("Step 1"), "quiet run printed progress: {stderr}");
     assert!(stdout.contains("2 relations"), "{stdout}");
 }
 
@@ -996,10 +903,7 @@ fn covsearch_accepts_effects_and_resumes_quietly() {
 
 #[test]
 fn modelsearch_help_usage_and_a_file_meant_for_another_tool() {
-    let out = ferx()
-        .args(["modelsearch", "--help"])
-        .output()
-        .expect("run ferx modelsearch --help");
+    let out = ferx().args(["modelsearch", "--help"]).output().expect("run ferx modelsearch --help");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     for word in [
@@ -1019,10 +923,7 @@ fn modelsearch_help_usage_and_a_file_meant_for_another_tool() {
 
     // A covariate file is refused by name, before the dataset is read.
     let out = ferx()
-        .args([
-            "modelsearch",
-            "crates/ferx-tools/tests/psn/scm_anchor/scm.ferxsearch",
-        ])
+        .args(["modelsearch", "crates/ferx-tools/tests/psn/scm_anchor/scm.ferxsearch"])
         .output()
         .expect("run");
     assert_eq!(out.status.code(), Some(1));
@@ -1050,20 +951,14 @@ fn modelsearch_runs_a_search_and_writes_its_files() {
     std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
 
     let out = ferx()
-        .args([
-            "modelsearch",
-            &dir.path().join("wt.ferxsearch").to_string_lossy(),
-        ])
+        .args(["modelsearch", &dir.path().join("wt.ferxsearch").to_string_lossy()])
         .output()
         .expect("run ferx modelsearch");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
     assert!(stderr.contains("Layer 1: fitting 3 candidates"), "{stderr}");
-    assert!(
-        stderr.contains("Algorithm:  exhaustive, ranked on bic_mixed"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Algorithm:  exhaustive, ranked on bic_mixed"), "{stderr}");
     assert!(stdout.contains("FO, 1 peripheral, lag"), "{stdout}");
     assert!(stdout.contains("SELECTED"), "{stdout}");
     assert!(stdout.contains("Final model:"), "{stdout}");
@@ -1082,10 +977,8 @@ fn modelsearch_runs_a_search_and_writes_its_files() {
 
 #[test]
 fn globalsearch_help_usage_and_a_file_meant_for_another_tool() {
-    let out = ferx()
-        .args(["globalsearch", "--help"])
-        .output()
-        .expect("run ferx globalsearch --help");
+    let out =
+        ferx().args(["globalsearch", "--help"]).output().expect("run ferx globalsearch --help");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     for word in [
@@ -1111,10 +1004,7 @@ fn globalsearch_help_usage_and_a_file_meant_for_another_tool() {
         .expect("run");
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not an axis globalsearch lays out"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("not an axis globalsearch lays out"), "{stderr}");
     assert!(!stderr.contains("Data:"), "{stderr}");
 }
 
@@ -1137,27 +1027,15 @@ fn globalsearch_runs_an_exhaustive_search_and_writes_its_files() {
     std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
 
     let out = ferx()
-        .args([
-            "globalsearch",
-            &dir.path().join("wt.ferxsearch").to_string_lossy(),
-        ])
+        .args(["globalsearch", &dir.path().join("wt.ferxsearch").to_string_lossy()])
         .output()
         .expect("run ferx globalsearch");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
-    assert!(
-        stderr.contains("Grid:       8 points over 3 axes"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Algorithm:  exhaustive, ranked on penalized"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("candidates: fitting 8 new models of 8 proposed"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Grid:       8 points over 3 axes"), "{stderr}");
+    assert!(stderr.contains("Algorithm:  exhaustive, ranked on penalized"), "{stderr}");
+    assert!(stderr.contains("candidates: fitting 8 new models of 8 proposed"), "{stderr}");
     assert!(stdout.contains("CL-WT: none | power"), "{stdout}");
     assert!(stdout.contains("SELECTED"), "{stdout}");
     assert!(stdout.contains("Final model:"), "{stdout}");
@@ -1239,14 +1117,8 @@ fn an_explicit_threads_flag_beats_the_model_files_thread_count() {
         stderr.contains(&format!("on {FILE_THREADS} threads")),
         "the model file's thread count must still be honoured with no flag: {stderr}"
     );
-    assert!(
-        yaml.contains(&format!("n_threads_used: {FILE_THREADS}")),
-        "{yaml}"
-    );
-    assert!(
-        !stderr.contains("thread count overridden"),
-        "no flag, no override warning: {stderr}"
-    );
+    assert!(yaml.contains(&format!("n_threads_used: {FILE_THREADS}")), "{yaml}");
+    assert!(!stderr.contains("thread count overridden"), "no flag, no override warning: {stderr}");
 
     // The bug as reported.
     let (stderr, yaml) = run_pinned(&["--threads", "1"]);
@@ -1295,18 +1167,12 @@ fn an_explicitly_requested_default_also_beats_the_model_files_thread_count() {
 fn live_thread_count(pid: u32) -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let n = std::fs::read_dir(format!("/proc/{pid}/task"))
-            .ok()?
-            .filter(|e| e.is_ok())
-            .count();
+        let n = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.filter(|e| e.is_ok()).count();
         (n > 0).then_some(n)
     }
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("ps")
-            .args(["-M", &pid.to_string()])
-            .output()
-            .ok()?;
+        let out = Command::new("ps").args(["-M", &pid.to_string()]).output().ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         let n = text
             .lines()
@@ -1422,11 +1288,7 @@ fn a_fit_with_output_opens_the_model_file_once() {
     #[cfg(target_os = "macos")]
     const O_NONBLOCK: i32 = 0x0004;
     let nonblocking = |p: &std::path::Path, write: bool| {
-        std::fs::OpenOptions::new()
-            .read(!write)
-            .write(write)
-            .custom_flags(O_NONBLOCK)
-            .open(p)
+        std::fs::OpenOptions::new().read(!write).write(write).custom_flags(O_NONBLOCK).open(p)
     };
 
     let a = std::fs::read_to_string(repo_root().join("examples/one_cpt_iv.ferx")).unwrap();
@@ -1468,10 +1330,7 @@ fn a_fit_with_output_opens_the_model_file_once() {
     stop.store(true, Ordering::SeqCst);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !server.is_finished() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "FIFO server did not stop"
-        );
+        assert!(std::time::Instant::now() < deadline, "FIFO server did not stop");
         drop(nonblocking(&fifo, false));
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -1482,10 +1341,7 @@ fn a_fit_with_output_opens_the_model_file_once() {
         "fit should succeed; stderr=\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        tmp.path().join("run.fitrx").exists(),
-        "the bundle is written"
-    );
+    assert!(tmp.path().join("run.fitrx").exists(), "the bundle is written");
     let n = opens.load(Ordering::SeqCst);
     assert_eq!(n, 1, "the CLI opened the model file {n} times");
 }

@@ -71,10 +71,7 @@ fn rel(a: f64, b: f64) -> f64 {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_imp_matches_nonmem_on_warfarin() {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
@@ -92,72 +89,34 @@ fn ferx_imp_matches_nonmem_on_warfarin() {
     let r = fit(&model, &population, &model.default_params, &opts)
         .expect("FOCEI → estimating IMP fit must succeed");
 
-    assert_eq!(
-        r.method,
-        EstimationMethod::Imp,
-        "estimating IMP is the final stage"
-    );
+    assert_eq!(r.method, EstimationMethod::Imp, "estimating IMP is the final stage");
 
     // Thetas: CL/V well-identified (8%), KA poorly-identified (15%). The 8% CL/V
     // band absorbs the genuine FOCEI-vs-IMP-marginal drift between the engines.
-    assert!(
-        rel(r.theta[0], NM_TVCL) < 0.08,
-        "TVCL {} vs NM {NM_TVCL}",
-        r.theta[0]
-    );
-    assert!(
-        rel(r.theta[1], NM_TVV) < 0.08,
-        "TVV {} vs NM {NM_TVV}",
-        r.theta[1]
-    );
-    assert!(
-        rel(r.theta[2], NM_TVKA) < 0.15,
-        "TVKA {} vs NM {NM_TVKA}",
-        r.theta[2]
-    );
+    assert!(rel(r.theta[0], NM_TVCL) < 0.08, "TVCL {} vs NM {NM_TVCL}", r.theta[0]);
+    assert!(rel(r.theta[1], NM_TVV) < 0.08, "TVV {} vs NM {NM_TVV}", r.theta[1]);
+    assert!(rel(r.theta[2], NM_TVKA) < 0.15, "TVKA {} vs NM {NM_TVKA}", r.theta[2]);
 
     // Variance components (NONMEM prints ~3 sig figs; allow 15%).
-    assert!(
-        rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.15,
-        "omega_CL {}",
-        r.omega[(0, 0)]
-    );
-    assert!(
-        rel(r.omega[(1, 1)], NM_OMEGA_V) < 0.15,
-        "omega_V {}",
-        r.omega[(1, 1)]
-    );
-    assert!(
-        rel(r.omega[(2, 2)], NM_OMEGA_KA) < 0.15,
-        "omega_KA {}",
-        r.omega[(2, 2)]
-    );
+    assert!(rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.15, "omega_CL {}", r.omega[(0, 0)]);
+    assert!(rel(r.omega[(1, 1)], NM_OMEGA_V) < 0.15, "omega_V {}", r.omega[(1, 1)]);
+    assert!(rel(r.omega[(2, 2)], NM_OMEGA_KA) < 0.15, "omega_KA {}", r.omega[(2, 2)]);
 
     // Residual error (ferx reports the proportional SD).
-    assert!(
-        rel(r.sigma[0], NM_SIGMA_SD) < 0.10,
-        "sigma_SD {} vs NM {NM_SIGMA_SD}",
-        r.sigma[0]
-    );
+    assert!(rel(r.sigma[0], NM_SIGMA_SD) < 0.10, "sigma_SD {} vs NM {NM_SIGMA_SD}", r.sigma[0]);
 
     // ferx's reported `ofv` is a final FOCE *Laplace* pass (kept for cross-method
     // AIC/BIC comparability). On this rich extract it lands on NONMEM's COND/FOCE
     // OBJ (−286.004), close to but distinct from the IMP marginal.
-    assert!(
-        (r.ofv - NM_OFV).abs() < 3.0,
-        "Laplace OFV {} vs NONMEM IMP {NM_OFV}",
-        r.ofv
-    );
+    assert!((r.ofv - NM_OFV).abs() < 3.0, "Laplace OFV {} vs NONMEM IMP {NM_OFV}", r.ofv);
 
     // The NONMEM-comparable number is the importance-sampling Monte-Carlo
     // *marginal* −2 log L (NONMEM `METHOD=IMP` #OBJV = −285.685), now surfaced on
     // `importance_sampling`. Evaluated at ferx's final estimates (which sit a
     // little off NONMEM's basin — TVKA 0.811 vs 0.886), so allow the same
     // cross-engine + Monte-Carlo margin.
-    let is = r
-        .importance_sampling
-        .as_ref()
-        .expect("estimating IMP must surface the marginal −2 log L");
+    let is =
+        r.importance_sampling.as_ref().expect("estimating IMP must surface the marginal −2 log L");
     assert!(
         (is.minus2_log_likelihood - NM_OFV).abs() < 3.0,
         "IMP marginal −2 log L {} ± {} vs NONMEM IMP #OBJV {NM_OFV}",

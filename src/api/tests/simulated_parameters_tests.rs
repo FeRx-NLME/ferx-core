@@ -49,8 +49,7 @@ fn read(csv: &str) -> Population {
         .suffix(".csv")
         .tempfile()
         .expect("create #2505 fixture csv");
-    f.write_all(csv.as_bytes())
-        .expect("write #2505 fixture csv");
+    f.write_all(csv.as_bytes()).expect("write #2505 fixture csv");
     f.flush().expect("flush #2505 fixture csv");
     crate::read_nonmem_csv(f.path(), None, None).expect("read #2505 fixture csv")
 }
@@ -70,10 +69,7 @@ fn population(n: usize, times: &[f64], wt: impl Fn(usize, f64) -> f64) -> Popula
 const TIMES: [f64; 6] = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
 
 fn opts(seed: u64) -> SimulateOptions {
-    SimulateOptions {
-        seed: Some(seed),
-        ..SimulateOptions::default()
-    }
+    SimulateOptions { seed: Some(seed), ..SimulateOptions::default() }
 }
 
 fn column(table: &SimulatedParameters, names: &[String], name: &str) -> usize {
@@ -93,12 +89,8 @@ fn assert_keys_match(out: &SimulationOutput) {
             row_keys.push(key);
         }
     }
-    let table_keys: Vec<(usize, usize, String)> = out
-        .parameters
-        .rows
-        .iter()
-        .map(|p| (p.draw, p.sim, p.id.clone()))
-        .collect();
+    let table_keys: Vec<(usize, usize, String)> =
+        out.parameters.rows.iter().map(|p| (p.draw, p.sim, p.id.clone())).collect();
     assert_eq!(table_keys, row_keys);
 }
 
@@ -139,12 +131,7 @@ fn returned_eta_reproduces_the_simulated_ipred_through_predict() {
         let mut params = m.default_params.clone();
         params.theta = folded;
         let subject_pop = Population {
-            subjects: pop
-                .subjects
-                .iter()
-                .filter(|s| s.id == p.id)
-                .cloned()
-                .collect(),
+            subjects: pop.subjects.iter().filter(|s| s.id == p.id).cloned().collect(),
             ..pop.clone()
         };
         let predicted = predict(&m, &subject_pop, &params).expect("predict runs");
@@ -221,10 +208,8 @@ fn derived_columns_are_evaluated_on_the_simulated_draw() {
     let out = simulate_with_options_diag(&m, &pop, &m.default_params, 2, &opts(11))
         .expect("simulation runs");
     let table = &out.parameters;
-    let (cl, v) = (
-        column(table, &table.individual_names, "CL"),
-        column(table, &table.individual_names, "V"),
-    );
+    let (cl, v) =
+        (column(table, &table.individual_names, "CL"), column(table, &table.individual_names, "V"));
     let ke = column(table, &table.derived_names, "KE");
     let cmax = column(table, &table.derived_names, "CMAX");
     let dvmax = column(table, &table.derived_names, "DVMAX");
@@ -236,10 +221,7 @@ fn derived_columns_are_evaluated_on_the_simulated_draw() {
             .filter(|r| r.draw == p.draw && r.sim == p.sim && r.id == p.id)
             .collect();
         let max_ipred = rows.iter().map(|r| r.ipred).fold(f64::MIN, f64::max);
-        let max_dv = rows
-            .iter()
-            .map(|r| r.outcome.continuous_value())
-            .fold(f64::MIN, f64::max);
+        let max_dv = rows.iter().map(|r| r.outcome.continuous_value()).fold(f64::MIN, f64::max);
         assert!(max_ipred.is_finite() && max_dv.is_finite());
         assert_eq!(p.derived[ke], p.individual[cl] / p.individual[v]);
         assert_eq!(p.derived[cmax], max_ipred);
@@ -294,21 +276,15 @@ fn a_mixture_row_reports_its_class_and_that_class_s_parameters() {
     assert_keys_match(&out);
     let table = &out.parameters;
     let cl = column(table, &table.individual_names, "CL");
-    let class_of: HashMap<(usize, usize, String), Option<usize>> = out
-        .results
-        .iter()
-        .map(|r| ((r.draw, r.sim, r.id.clone()), r.mixnum))
-        .collect();
+    let class_of: HashMap<(usize, usize, String), Option<usize>> =
+        out.results.iter().map(|r| ((r.draw, r.sim, r.id.clone()), r.mixnum)).collect();
     let mut seen = [false; 2];
     for p in &table.rows {
         let k = p.mixnum.expect("a mixture row carries its class");
         assert_eq!(Some(k), class_of[&(p.draw, p.sim, p.id.clone())]);
         seen[k - 1] = true;
         let scale = if k == 1 { 1.0 } else { 4.0 };
-        assert_eq!(
-            p.individual[cl],
-            scale * m.default_params.theta[0] * p.eta[0].exp()
-        );
+        assert_eq!(p.individual[cl], scale * m.default_params.theta[0] * p.eta[0].exp());
     }
     assert_eq!(seen, [true, true], "both classes must occur");
 }
@@ -338,11 +314,7 @@ fn uncertainty_rows_carry_each_draws_parameters() {
     for p in &table.rows {
         let (cl, v, ka) = (p.individual[cl], p.individual[v], p.individual[ka]);
         let k = cl / v;
-        for r in out
-            .results
-            .iter()
-            .filter(|r| r.draw == p.draw && r.sim == p.sim && r.id == p.id)
-        {
+        for r in out.results.iter().filter(|r| r.draw == p.draw && r.sim == p.sim && r.id == p.id) {
             let want = 100.0 * ka / (v * (ka - k)) * ((-k * r.time).exp() - (-ka * r.time).exp());
             assert!(r.ipred.is_finite() && want.is_finite());
             worst = worst.max(((r.ipred - want) / want).abs());

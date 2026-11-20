@@ -166,10 +166,7 @@ pub(crate) const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
 /// short-circuit is allowed to exist.
 #[cfg(test)]
 pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u: &[T],
-    params: &[T],
-    t: f64,
+    rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64,
 ) -> Option<f64> {
     let jac = fd_jacobian(rhs, u, params, t)?;
     schur_max_abs_re(jac, u.len())
@@ -181,10 +178,7 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
 /// `fd_jacobian_into`.
 #[cfg(test)]
 fn fd_jacobian<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u: &[T],
-    params: &[T],
-    t: f64,
+    rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64,
 ) -> Option<Vec<f64>> {
     let n = u.len();
     let mut jac = vec![0.0; n * n];
@@ -202,11 +196,7 @@ const PROBE_STACK_N: usize = 8;
 /// it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time)
 /// and returns before this code, except after the recording has already failed.
 fn fd_jacobian_into<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u: &[T],
-    params: &[T],
-    t: f64,
-    jac: &mut [f64],
+    rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64, jac: &mut [f64],
 ) -> bool {
     let n = u.len();
     if n == 0 {
@@ -216,16 +206,7 @@ fn fd_jacobian_into<T: PkNum>(
     if n <= PROBE_STACK_N {
         let (mut f0, mut u_pert, mut f1) =
             ([z; PROBE_STACK_N], [z; PROBE_STACK_N], [z; PROBE_STACK_N]);
-        fd_jacobian_core(
-            rhs,
-            u,
-            params,
-            t,
-            jac,
-            &mut f0[..n],
-            &mut u_pert[..n],
-            &mut f1[..n],
-        )
+        fd_jacobian_core(rhs, u, params, t, jac, &mut f0[..n], &mut u_pert[..n], &mut f1[..n])
     } else {
         let (mut f0, mut u_pert, mut f1) = (vec![z; n], vec![z; n], vec![z; n]);
         fd_jacobian_core(rhs, u, params, t, jac, &mut f0, &mut u_pert, &mut f1)
@@ -240,14 +221,8 @@ fn fd_jacobian_into<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn fd_jacobian_core<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u: &[T],
-    params: &[T],
-    t: f64,
-    jac: &mut [f64],
-    f0: &mut [T],
-    u_pert: &mut [T],
-    f1: &mut [T],
+    rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64, jac: &mut [f64],
+    f0: &mut [T], u_pert: &mut [T], f1: &mut [T],
 ) -> bool {
     let n = u.len();
     f0.fill(T::from_f64(0.0));
@@ -285,10 +260,7 @@ fn fd_jacobian_core<T: PkNum>(
 fn schur_max_abs_re(jac: Vec<f64>, n: usize) -> Option<f64> {
     let m = nalgebra::DMatrix::from_vec(n, n, jac);
     let schur = nalgebra::linalg::Schur::try_new(m, f64::EPSILON, EIGENSOLVE_MAX_ITERATIONS)?;
-    let lambda_max = schur
-        .complex_eigenvalues()
-        .iter()
-        .fold(0.0_f64, |acc, z| acc.max(z.re.abs()));
+    let lambda_max = schur.complex_eigenvalues().iter().fold(0.0_f64, |acc, z| acc.max(z.re.abs()));
     lambda_max.is_finite().then_some(lambda_max)
 }
 
@@ -321,11 +293,7 @@ fn gershgorin_abs_bound(jac: &[f64], n: usize) -> f64 {
 /// stiff system is slow and loud (`min_step_clamped_steps`); a Rosenbrock method on a system
 /// with a singular `W` is fast and wrong.
 pub(crate) fn resolve_method<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u: &[T],
-    params: &[T],
-    t: f64,
-    opts: &OdeSolverOptions,
+    rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64, opts: &OdeSolverOptions,
 ) -> OdeMethod {
     if opts.method != OdeMethod::Auto {
         return opts.method;

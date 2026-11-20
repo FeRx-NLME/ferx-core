@@ -34,7 +34,7 @@ use crate::types::{CompiledModel, CovarianceMethod, EstimationMethod, FitOptions
 /// floor applied to FD Hessian" on both.
 ///
 /// Since #2093 the analytic route is step-free: the adjoint's profile Hessian
-/// (`subject_adjoint_cov_hessian`) is reverse over forward through the recorders, with no finite differences.
+/// (`subject_adjoint_cov_hessian`) is forward over reverse through the recorders, with no finite differences.
 /// (The retired forward provider finite-differenced its `Dual2` jet for the third-order blocks, a
 /// step across a *smooth* sensitivity that #1505 measured biting at a lagged-dose arrival kink.)
 /// What the label asserts is narrower and stays true: this route never second-differences the
@@ -95,9 +95,6 @@ impl CovHessianSource {
 pub(crate) enum CovScopeDecline {
     /// `analytic_cov_hessian = false` in `[fit_options]`.
     Disabled,
-    /// Mixture model under an objective its exact assembly does not serve (Laplace / AGQ:
-    /// `mixture_ofv` scores the classes with FOCE/FOCEI).
-    Mixture,
     /// No recorder serves the model (`sens::ode_provider::adjoint::recorder_in_scope`).
     ModelOutOfScope,
     /// `gradient = fd` — the user's explicit opt-out from analytic sensitivities.
@@ -116,9 +113,8 @@ impl CovScopeDecline {
     /// in production enumerates the enum — without it the lib target reports it dead and
     /// `preflight.sh`'s `-Dunused` turns that into a hard error.
     #[cfg(test)]
-    pub(crate) const ALL: [CovScopeDecline; 6] = [
+    pub(crate) const ALL: [CovScopeDecline; 5] = [
         CovScopeDecline::Disabled,
-        CovScopeDecline::Mixture,
         CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::GradientFd,
         CovScopeDecline::NonGaussianEndpoint,
@@ -129,7 +125,6 @@ impl CovScopeDecline {
     pub(crate) fn clause(self) -> &'static str {
         match self {
             CovScopeDecline::Disabled => "analytic_cov_hessian = false",
-            CovScopeDecline::Mixture => "the model is a mixture model under Laplace/AGQ",
             CovScopeDecline::ModelOutOfScope => {
                 "the model is outside the analytic recorders' scope"
             }
@@ -205,11 +200,7 @@ impl OdeToleranceFacts {
     pub(crate) fn from_route(model: &CompiledModel, population: &Population) -> Option<Self> {
         let opts = |spec: &crate::ode::predictions::OdeSpec, via_twin: bool| {
             let OdeSolverOptions { reltol, abstol, .. } = spec.effective_solver_opts();
-            Self {
-                reltol,
-                abstol,
-                via_twin,
-            }
+            Self { reltol, abstol, via_twin }
         };
         if let Some(spec) = model.ode_spec.as_ref() {
             return Some(opts(spec, false));
@@ -445,22 +436,19 @@ pub(crate) fn grade(neg_ratio: f64, variance_inflation: f64) -> CovGrade {
     // mean the spectrum itself is degenerate — which the caller has already rejected. Compare
     // explicitly rather than folding, so a NaN grades `Minor` by falling through rather than by
     // silently winning a `max`.
-    let (severity, by_neg, by_inflation) =
-        if neg_ratio > SEVERE_NEG_RATIO || variance_inflation > SEVERE_INFLATION {
-            (
-                CovSeverity::Severe,
-                neg_ratio > SEVERE_NEG_RATIO,
-                variance_inflation > SEVERE_INFLATION,
-            )
-        } else if neg_ratio > MODERATE_NEG_RATIO || variance_inflation > MODERATE_INFLATION {
-            (
-                CovSeverity::Moderate,
-                neg_ratio > MODERATE_NEG_RATIO,
-                variance_inflation > MODERATE_INFLATION,
-            )
-        } else {
-            (CovSeverity::Minor, false, false)
-        };
+    let (severity, by_neg, by_inflation) = if neg_ratio > SEVERE_NEG_RATIO
+        || variance_inflation > SEVERE_INFLATION
+    {
+        (CovSeverity::Severe, neg_ratio > SEVERE_NEG_RATIO, variance_inflation > SEVERE_INFLATION)
+    } else if neg_ratio > MODERATE_NEG_RATIO || variance_inflation > MODERATE_INFLATION {
+        (
+            CovSeverity::Moderate,
+            neg_ratio > MODERATE_NEG_RATIO,
+            variance_inflation > MODERATE_INFLATION,
+        )
+    } else {
+        (CovSeverity::Minor, false, false)
+    };
     let cause = match (by_neg, by_inflation) {
         (true, true) => CovSeverityCause::Both,
         (true, false) => CovSeverityCause::Indefiniteness,
@@ -601,11 +589,7 @@ fn decline_sentences(declines: &[CovScopeDecline], source: CovHessianSource) -> 
     if n_unremedied == 0 {
         // Every clause has an action, so clearing all of them does move the fit — and the verb
         // has to say that no single one of them does it alone.
-        let verb = if actions.len() == 1 {
-            "moves"
-        } else {
-            "together move"
-        };
+        let verb = if actions.len() == 1 { "moves" } else { "together move" };
         let moved = if hybrid { "those subjects" } else { "the fit" };
         out.push_str(&format!(
             " {} {verb} {moved} onto the analytic route.",
@@ -616,21 +600,13 @@ fn decline_sentences(declines: &[CovScopeDecline], source: CovHessianSource) -> 
         // the *actions*, the residual noun phrase on the clauses that have none. Keying both
         // on one count is the agreement bug `two_remediable_clauses_next_to_an_unremediable_
         // one_name_the_plural_forms` was written to catch, and did.
-        let cleared = if actions.len() == 1 {
-            "clears that clause"
-        } else {
-            "clear those clauses"
-        };
+        let cleared = if actions.len() == 1 { "clears that clause" } else { "clear those clauses" };
         let remaining = if n_unremedied == 1 {
             "the remaining clause has"
         } else {
             "the remaining clauses have"
         };
-        let stays = if hybrid {
-            "those subjects stay"
-        } else {
-            "the fit stays"
-        };
+        let stays = if hybrid { "those subjects stay" } else { "the fit stays" };
         out.push_str(&format!(
             " {} {cleared}, but {remaining} no one-line remedy, so {stays} on the \
              finite-difference route until all of them are cleared.",
@@ -791,11 +767,7 @@ pub(crate) fn format_salvage_note(ids: &[&str], n_total: usize) -> Option<String
     // The "and N more" tail counts the ids the list did *not* print, so it is keyed off the
     // distinct ids the list is drawn from — not off `n`, which may exceed them.
     let id_list = if seen.len() > listed.len() {
-        format!(
-            "{} and {} more",
-            listed.join(", "),
-            seen.len() - listed.len()
-        )
+        format!("{} and {} more", listed.join(", "), seen.len() - listed.len())
     } else {
         join_and(&listed)
     };
@@ -805,12 +777,7 @@ pub(crate) fn format_salvage_note(ids: &[&str], n_total: usize) -> Option<String
     let (id_label, verb, term, marginal) = if n == 1 {
         ("ID", "is", "its information term was", "its own marginal")
     } else {
-        (
-            "IDs",
-            "are",
-            "their information terms were",
-            "their own marginals",
-        )
+        ("IDs", "are", "their information terms were", "their own marginals")
     };
     let remaining = n_total.saturating_sub(n);
     let rest = if remaining == 1 {
@@ -844,8 +811,7 @@ pub(crate) fn format_salvage_note(ids: &[&str], n_total: usize) -> Option<String
 /// whose subjects reroute to the absorption ODE twin does integrate, and is told so —
 /// [`OdeToleranceFacts::from_route`] is what makes that cell reachable (#1508 review §4).
 pub(crate) fn fd_inner_gradient_tolerance_note(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Option<String> {
     let ode = OdeToleranceFacts::from_route(model, population)?;
     if ode.looser_than_cov_plateau() {
@@ -970,16 +936,10 @@ pub(crate) enum CovObjectiveRoute {
 ///
 /// VI is left on its fitted objective: it targets a variational bound, not the marginal.
 pub(crate) fn cov_objective_route(
-    method: EstimationMethod,
-    has_non_gaussian: bool,
-    n_eta: usize,
-    is_mixture: bool,
-    is_iov: bool,
+    method: EstimationMethod, has_non_gaussian: bool, n_eta: usize, is_mixture: bool, is_iov: bool,
 ) -> CovObjectiveRoute {
-    let sampler = matches!(
-        method,
-        EstimationMethod::Saem | EstimationMethod::Imp | EstimationMethod::Impmap
-    );
+    let sampler =
+        matches!(method, EstimationMethod::Saem | EstimationMethod::Imp | EstimationMethod::Impmap);
     if !sampler || !has_non_gaussian || n_eta == 0 {
         return CovObjectiveRoute::AsFitted;
     }
@@ -993,17 +953,13 @@ pub(crate) fn cov_objective_route(
     if grid > COV_AGQ_MAX_GRID {
         return CovObjectiveRoute::Declined(QuadratureDecline::Grid { n_eta, grid });
     }
-    CovObjectiveRoute::Quadrature {
-        n_agq: COV_AGQ_NODES,
-    }
+    CovObjectiveRoute::Quadrature { n_agq: COV_AGQ_NODES }
 }
 
 /// The informational note for [`CovObjectiveRoute::Quadrature`] (#1781). Every sentence is
 /// pinned by `cov_diagnostics_tests.rs`.
 pub(crate) fn format_quadrature_objective_note(
-    method: EstimationMethod,
-    n_agq: usize,
-    n_eta: usize,
+    method: EstimationMethod, n_agq: usize, n_eta: usize,
 ) -> String {
     let m = method.label();
     let grid = crate::estimation::agq::grid_size(n_agq, n_eta);
@@ -1020,9 +976,7 @@ pub(crate) fn format_quadrature_objective_note(
 /// The warning for [`CovObjectiveRoute::Declined`] (#1781). Every sentence is pinned by
 /// `cov_diagnostics_tests.rs`.
 pub(crate) fn format_quadrature_declined_warning(
-    method: EstimationMethod,
-    objective: EstimationMethod,
-    decline: QuadratureDecline,
+    method: EstimationMethod, objective: EstimationMethod, decline: QuadratureDecline,
 ) -> String {
     let m = method.label();
     let obj = objective.label();
@@ -1061,9 +1015,7 @@ pub(crate) fn format_quadrature_declined_warning(
 /// indefinite direction is information about the objective, and replacing the estimator would
 /// hide it.
 pub(crate) fn r_falls_back_to_s(
-    method: EstimationMethod,
-    n_clipped: usize,
-    requested: CovarianceMethod,
+    method: EstimationMethod, n_clipped: usize, requested: CovarianceMethod,
 ) -> bool {
     n_clipped > 0
         && requested != CovarianceMethod::CrossProduct
@@ -1108,8 +1060,7 @@ pub(crate) const NON_STATIONARY_DECREMENT_OFV: f64 = 1.0;
 /// its gradient on the free packed coordinates, `h_inv` the inverse of its Hessian there (the
 /// covariance step's `inv.inverse`, before the `×2` that makes it `R⁻¹`).
 pub(crate) fn newton_decrement(
-    g_free: &nalgebra::DVector<f64>,
-    h_inv: &nalgebra::DMatrix<f64>,
+    g_free: &nalgebra::DVector<f64>, h_inv: &nalgebra::DMatrix<f64>,
 ) -> f64 {
     0.5 * g_free.dot(&(h_inv * g_free))
 }
@@ -1118,8 +1069,7 @@ pub(crate) fn newton_decrement(
 /// the estimator did not minimise `R`'s objective, and `R` was not already replaced by `S⁻¹`
 /// ([`r_falls_back_to_s`]), whose warning says the estimate is not stationary on its own.
 pub(crate) fn tests_stationarity_by_gradient(
-    method: EstimationMethod,
-    fell_back_to_s: bool,
+    method: EstimationMethod, fell_back_to_s: bool,
 ) -> bool {
     !fell_back_to_s && !estimate_minimises_cov_objective(method)
 }
@@ -1182,9 +1132,7 @@ pub(crate) fn held_at_bound(x: &[f64], g: &[f64], lower: &[f64], upper: &[f64]) 
 /// held this is [`newton_decrement`] exactly. `None` when `(H⁻¹)_BB` cannot be inverted or an
 /// input is not finite — no claim either way.
 pub(crate) fn stationarity_reading(
-    g_free: &nalgebra::DVector<f64>,
-    h_inv: &nalgebra::DMatrix<f64>,
-    held: &[bool],
+    g_free: &nalgebra::DVector<f64>, h_inv: &nalgebra::DMatrix<f64>, held: &[bool],
 ) -> Option<StationarityReading> {
     let n = g_free.len();
     if !g_free.iter().all(|v| v.is_finite()) || !h_inv.iter().all(|v| v.is_finite()) {
@@ -1207,10 +1155,7 @@ pub(crate) fn stationarity_reading(
         let se = (2.0 * m[(k, k)]).sqrt();
         step_se[i] = delta[k] / se;
     }
-    Some(StationarityReading {
-        decrement: 0.5 * g_a.dot(&delta),
-        step_se,
-    })
+    Some(StationarityReading { decrement: 0.5 * g_a.dot(&delta), step_se })
 }
 
 /// The `n` coordinates with the largest Newton step in standard errors, as
@@ -1238,9 +1183,7 @@ pub(crate) fn largest_newton_steps(step_se: &[f64], n: usize) -> Vec<(usize, f64
 ///
 /// Every sentence is pinned by `cov_diagnostics_tests.rs`.
 pub(crate) fn format_non_stationary_optimum_warning(
-    method: EstimationMethod,
-    decrement: f64,
-    largest: &[(String, f64)],
+    method: EstimationMethod, decrement: f64, largest: &[(String, f64)],
 ) -> String {
     let coords = largest
         .iter()
@@ -1372,15 +1315,11 @@ pub(crate) const S_RANK_DEFICIENT_REASON: &str =
 /// minimises `objective`. IMP may only be a chain's final stage, so its route is the reverse
 /// chain with IMP as an evaluator.
 fn non_stationary_remedy(
-    method: EstimationMethod,
-    objective: EstimationMethod,
-    quadrature_nodes: Option<usize>,
+    method: EstimationMethod, objective: EstimationMethod, quadrature_nodes: Option<usize>,
 ) -> String {
     let obj = objective.label().to_ascii_lowercase();
     let name = objective_name(objective, quadrature_nodes);
-    let nodes = quadrature_nodes
-        .map(|n| format!(" and `n_agq = {n}`"))
-        .unwrap_or_default();
+    let nodes = quadrature_nodes.map(|n| format!(" and `n_agq = {n}`")).unwrap_or_default();
     match method {
         EstimationMethod::Imp => format!(
             "fit with `method = [{obj}, imp]`{nodes} and `imp_eval_only = true`, which takes R \
@@ -1434,11 +1373,7 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
     // #2536: the chain moves the estimates, so the SEs it gives are not this fit's — on
     // `mbma_placebo`, one-line before #2544, SAEM's TVE0 43.85 became FOCEI's 48.58.
     // IMP's remedy is a new fit (`method = [focei, imp]`), not a stage after this one.
-    let route = if f.method == EstimationMethod::Imp {
-        "That fit"
-    } else {
-        "That stage"
-    };
+    let route = if f.method == EstimationMethod::Imp { "That fit" } else { "That stage" };
     let remedy = format!(
         "For R-based standard errors, {}. {route} moves the estimates to the {obj} minimum, so \
          the standard errors it reports belong to that estimate, not to this {method} one.",
@@ -1458,11 +1393,7 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
             // from a stationary point, so the claim is made only under strict inequality.
             let by_design = f.n_subjects < f.n_free;
             let design = if by_design {
-                let subjects = if f.n_subjects == 1 {
-                    "subject"
-                } else {
-                    "subjects"
-                };
+                let subjects = if f.n_subjects == 1 { "subject" } else { "subjects" };
                 format!(
                     " With {} {subjects} and {} free parameters S has rank at most {}, so it \
                      is singular on this design at any estimate and covariance_method = s \

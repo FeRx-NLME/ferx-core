@@ -80,10 +80,7 @@ fn assert_float_file_is_the_integer_file_float_spelled() {
             .lines()
             .map(str::to_string)
             .collect();
-    assert_eq!(
-        float_lines[0], int_lines[0],
-        "the two files share one header"
-    );
+    assert_eq!(float_lines[0], int_lines[0], "the two files share one header");
     assert_eq!(float_lines.len(), int_lines.len(), "and the same rows");
     let header: Vec<&str> = int_lines[0].split(',').collect();
     for name in FLOAT_SPELLED {
@@ -145,12 +142,8 @@ fn read_text(csv: &str) -> Population {
 }
 
 fn read_committed(name: &str) -> Population {
-    read_nonmem_csv(
-        Path::new(&repo(&format!("tests/nonmem/{name}"))),
-        None,
-        None,
-    )
-    .unwrap_or_else(|e| panic!("{name} loads: {e}"))
+    read_nonmem_csv(Path::new(&repo(&format!("tests/nonmem/{name}"))), None, None)
+        .unwrap_or_else(|e| panic!("{name} loads: {e}"))
 }
 
 /// FOCEI objective of `examples/warfarin_bloq.ferx` at its initial estimates.
@@ -160,13 +153,8 @@ fn ofv(population: &Population, what: &str) -> f64 {
     let mut opts = parsed.fit_options.clone();
     opts.outer_maxiter = 0;
     opts.run_covariance_step = false;
-    let result = fit(
-        &parsed.model,
-        population,
-        &parsed.model.default_params,
-        &opts,
-    )
-    .unwrap_or_else(|e| panic!("{what}: fit returns Ok: {e}"));
+    let result = fit(&parsed.model, population, &parsed.model.default_params, &opts)
+        .unwrap_or_else(|e| panic!("{what}: fit returns Ok: {e}"));
     assert!(
         result.ofv.is_finite(),
         "{what}: the objective must be finite before it is compared, got {}",
@@ -184,10 +172,7 @@ fn fingerprint(population: &Population) -> Vec<String> {
             format!(
                 "{} doses={:?} obs_times={:?} dv={:?} cens={:?}",
                 s.id,
-                s.doses
-                    .iter()
-                    .map(|d| (d.time, d.amt, d.cmt_1based()))
-                    .collect::<Vec<_>>(),
+                s.doses.iter().map(|d| (d.time, d.amt, d.cmt_1based())).collect::<Vec<_>>(),
                 s.obs_times,
                 s.observations,
                 s.cens,
@@ -207,19 +192,12 @@ fn float_formatted_integer_columns_fit_like_the_integer_spelling() {
 
     let n_doses = |p: &Population| p.subjects.iter().map(|s| s.doses.len()).sum::<usize>();
     let n_cens = |p: &Population| {
-        p.subjects
-            .iter()
-            .map(|s| s.cens.iter().filter(|&&c| c != 0).count())
-            .sum::<usize>()
+        p.subjects.iter().map(|s| s.cens.iter().filter(|&&c| c != 0).count()).sum::<usize>()
     };
     // The integer leg, as NONMEM reads it: 10 dose rows × (1 + ADDL 2), 109 scored
     // observations (110 rows less the MDV=1 one), 10 of them censored.
     assert_eq!(integer.subjects.len(), 10);
-    assert_eq!(
-        n_doses(&integer),
-        30,
-        "ADDL=2 expands each dose row to 3 doses"
-    );
+    assert_eq!(n_doses(&integer), 30, "ADDL=2 expands each dose row to 3 doses");
     assert_eq!(integer.n_obs(), 109, "the MDV=1 observation is excluded");
     assert_eq!(n_cens(&integer), 10);
 
@@ -242,12 +220,7 @@ fn float_formatted_integer_columns_fit_like_the_integer_spelling() {
         let lines = intcols_lines();
         let body: Vec<String> = lines
             .iter()
-            .map(|l| {
-                l.rsplit_once(',')
-                    .expect("ADDL is the last column")
-                    .0
-                    .to_string()
-            })
+            .map(|l| l.rsplit_once(',').expect("ADDL is the last column").0.to_string())
             .collect();
         assert!(body[0].ends_with(",II"), "header without ADDL: {}", body[0]);
         body.join("\n") + "\n"
@@ -261,11 +234,9 @@ fn float_formatted_integer_columns_fit_like_the_integer_spelling() {
             f[7].to_string()
         }
     });
-    for (what, csv) in [
-        ("ADDL removed", no_addl),
-        ("CENS zeroed", zero_cens),
-        ("MDV flag cleared", mdv_cleared),
-    ] {
+    for (what, csv) in
+        [("ADDL removed", no_addl), ("CENS zeroed", zero_cens), ("MDV flag cleared", mdv_cleared)]
+    {
         let other = ofv(&read_text(&csv), what);
         println!("{what}: {other:.10} against the integer file's {ofv_int:.10}");
         assert_ne!(
@@ -298,10 +269,7 @@ fn the_committed_nonmem_runs_read_both_files_alike() {
                 .trim()
                 .to_string()
         };
-        (
-            field("TOT. NO. OF OBS RECS"),
-            field("OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT"),
-        )
+        (field("TOT. NO. OF OBS RECS"), field("OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT"))
     };
     let integer = read("intcols");
     let float = read("floatcols");
@@ -310,10 +278,7 @@ fn the_committed_nonmem_runs_read_both_files_alike() {
     // message.
     let lines = intcols_lines();
     let evid = lines[0].split(',').position(|h| h == "EVID").expect("EVID");
-    let n_evid0 = lines[1..]
-        .iter()
-        .filter(|l| l.split(',').nth(evid) == Some("0"))
-        .count();
+    let n_evid0 = lines[1..].iter().filter(|l| l.split(',').nth(evid) == Some("0")).count();
     assert_eq!(n_evid0, 110, "observation records in the committed dataset");
     assert_eq!(
         integer.0,
@@ -321,8 +286,5 @@ fn the_committed_nonmem_runs_read_both_files_alike() {
         "NONMEM excludes exactly the MDV=1 observation"
     );
     assert_eq!(integer.1, "279.35595553971399");
-    assert_eq!(
-        float, integer,
-        "NONMEM reads the float spelling as the integer"
-    );
+    assert_eq!(float, integer, "NONMEM reads the float spelling as the integer");
 }

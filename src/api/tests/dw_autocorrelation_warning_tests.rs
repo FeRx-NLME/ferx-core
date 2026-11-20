@@ -195,34 +195,13 @@ fn biexponential_subject(id: &str, scale: f64, rate: f64) -> Subject {
         .collect();
     let n = obs_times.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -263,19 +242,9 @@ fn biexponential_subject(id: &str, scale: f64, rate: f64) -> Subject {
 /// The thread notice opens with a machine-dependent count, so its "prefix" is
 /// `classify_warning`'s own key, matched anywhere in the string.
 const ACCOUNTED: &[(&str, &str)] = &[
-    (
-        "No estimation method was specified",
-        "to silence this warning.",
-    ),
-    (
-        "Outer optimization hit the evaluation budget",
-        "increase maxiter for a tighter fit.",
-    ),
+    ("No estimation method was specified", "to silence this warning."),
+    ("Outer optimization hit the evaluation budget", "increase maxiter for a tighter fit."),
     ("Outer optimization did not converge", "did not converge"),
-    (
-        "The outer optimizer stopped without converging (#2713).",
-        "such as `if`, `abs` or `max`.",
-    ),
     ("threads configured", "(no speed benefit beyond n_subjects)"),
     (
         "Stochastic differential equations ([diffusion]",
@@ -310,18 +279,11 @@ fn population(subjects: Vec<Subject>) -> Population {
 /// the helper's for the advice `dw_advice` resolves under those same options
 /// (#2798). Returns that message so a caller can pin which advice reached it.
 fn assert_fit_pushes_only_the_helpers_message_on(
-    model: &CompiledModel,
-    pop: &Population,
-    base: FitOptions,
-    label: &str,
+    model: &CompiledModel, pop: &Population, base: FitOptions, label: &str,
 ) -> String {
     // One outer iteration: the statistic comes from the post-fit residual pass,
     // and the misfit is structural, so there is nothing to gain by converging.
-    let opts = FitOptions {
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..base
-    };
+    let opts = FitOptions { outer_maxiter: 1, run_covariance_step: false, ..base };
 
     let result = fit(model, pop, &model.default_params, &opts).expect("fit should succeed");
     eprintln!("[{label}] DW {:.4}", result.dw_statistic);
@@ -346,9 +308,7 @@ fn assert_fit_pushes_only_the_helpers_message_on(
 
     let accounted = |w: &str| {
         w == expected
-            || ACCOUNTED
-                .iter()
-                .any(|(open, close)| w.contains(open) && w.ends_with(close))
+            || ACCOUNTED.iter().any(|(open, close)| w.contains(open) && w.ends_with(close))
     };
 
     // The gate can fire, in both of the shapes that have slipped past a weaker
@@ -442,10 +402,8 @@ fn line_model() -> CompiledModel {
 
 fn parabola_subject(id: &str, offset: f64) -> Subject {
     let obs_times: Vec<f64> = (0..10).map(|i| 2.0 * f64::from(i)).collect();
-    let observations: Vec<f64> = obs_times
-        .iter()
-        .map(|t| offset + 0.5 * t + 0.1 * (t - 9.0) * (t - 9.0))
-        .collect();
+    let observations: Vec<f64> =
+        obs_times.iter().map(|t| offset + 0.5 * t + 0.1 * (t - 9.0) * (t - 9.0)).collect();
     let n = obs_times.len();
     let mut s = biexponential_subject(id, 1.0, 1.0);
     s.doses = Vec::new();
@@ -505,15 +463,9 @@ fn fit_pushes_the_grouping_its_options_carry() {
     )
     .expect("parse");
     assert_eq!(parsed.fit_options.iov_column.as_deref(), Some("OCC"));
-    assert!(
-        parsed.model.is_algebraic(),
-        "the fixture must be compartment-free"
-    );
-    let mut subjects = vec![
-        parabola_subject("1", 10.0),
-        parabola_subject("2", 14.0),
-        parabola_subject("3", 7.0),
-    ];
+    assert!(parsed.model.is_algebraic(), "the fixture must be compartment-free");
+    let mut subjects =
+        vec![parabola_subject("1", 10.0), parabola_subject("2", 14.0), parabola_subject("3", 7.0)];
     for s in &mut subjects {
         let n = s.obs_times.len();
         s.obs_times = [s.obs_times.clone(), s.obs_times.clone()].concat();
@@ -664,10 +616,7 @@ fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
     ] {
         let within =
             dw_autocorrelation_warning_decorrelated(1.2, line, kind, None).expect("below 1.5");
-        assert!(
-            !within.contains("blocks of this line") && !within.contains("by ID"),
-            "{within}"
-        );
+        assert!(!within.contains("blocks of this line") && !within.contains("by ID"), "{within}");
         let by_id = dw_autocorrelation_warning_decorrelated(
             1.2,
             line,
@@ -709,11 +658,7 @@ fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
                     && !by_id.contains("`cs` over a whole subject"),
                 "{by_id}"
             );
-            assert_eq!(
-                by_col,
-                format!("{within}{ACROSS_BLOCKS_TEXT_ID}"),
-                "{kind:?}"
-            );
+            assert_eq!(by_col, format!("{within}{ACROSS_BLOCKS_TEXT_ID}"), "{kind:?}");
             assert!(
                 by_col.contains("A line `by COL` correlates")
                     && by_col.contains("`ID` is not numeric")
@@ -721,19 +666,13 @@ fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
                 "{by_col}"
             );
         }
-        for across in [
-            Some(SubjectLine::ById("ID".into())),
-            Some(SubjectLine::ByNumericColumn),
-        ] {
+        for across in [Some(SubjectLine::ById("ID".into())), Some(SubjectLine::ByNumericColumn)] {
             assert_eq!(
                 dw_autocorrelation_warning_decorrelated(2.7, line, kind, across.clone()),
                 dw_autocorrelation_warning_decorrelated(2.7, line, kind, None),
                 "{kind:?}: the negative text does not change"
             );
-            assert_eq!(
-                dw_autocorrelation_warning_decorrelated(2.0, line, kind, across),
-                None
-            );
+            assert_eq!(dw_autocorrelation_warning_decorrelated(2.0, line, kind, across), None);
         }
     }
 }
@@ -769,25 +708,16 @@ fn dw_across_blocks_is_some_only_when_blocks_in_time_were_joined() {
     assert_eq!(of(vec![subject("1", &[], &running)]), None);
     // One subject whose blocks were joined is enough, wherever it sits.
     for flip in [false, true] {
-        let mut subjects = vec![
-            subject("1", &[1, 1, 2, 2], &running),
-            subject("2", &[1, 1, 2, 2], &restarting),
-        ];
+        let mut subjects =
+            vec![subject("1", &[1, 1, 2, 2], &running), subject("2", &[1, 1, 2, 2], &restarting)];
         if flip {
             subjects.reverse();
         }
-        assert_eq!(
-            of(subjects),
-            Some(SubjectLine::ById("ID".into())),
-            "flip {flip}"
-        );
+        assert_eq!(of(subjects), Some(SubjectLine::ById("ID".into())), "flip {flip}");
     }
     // A text id anywhere: `by ID` cannot be read.
     assert_eq!(
-        of(vec![
-            subject("1", &[1, 1, 2, 2], &running),
-            subject("S2", &[1, 1, 1, 1], &running),
-        ]),
+        of(vec![subject("1", &[1, 1, 2, 2], &running), subject("S2", &[1, 1, 1, 1], &running),]),
         Some(SubjectLine::ByNumericColumn)
     );
 }
@@ -835,14 +765,9 @@ fn cross_block_warning_text_and_gates() {
         crate::types::WarningCode::DwAutocorrelation,
         "{cs}"
     );
-    let text_id = dw_cross_block_warning(
-        (72, 1.3579),
-        1.9388,
-        LINE,
-        Ar1,
-        &SubjectLine::ByNumericColumn,
-    )
-    .expect("fires");
+    let text_id =
+        dw_cross_block_warning((72, 1.3579), 1.9388, LINE, Ar1, &SubjectLine::ByNumericColumn)
+            .expect("fires");
     assert!(
         text_id.ends_with(
             "A line `by COL` correlates all rows of one subject, with COL a numeric data \
@@ -901,10 +826,7 @@ fn cross_block_dw_is_calibrated_on_white_noise() {
     let at_twenty = rate(20, 2858);
     eprintln!("false-positive rate: {at_floor:.4} at the floor, {at_twenty:.4} at 20 pairs");
     assert!(at_floor < 0.04, "at the floor: {at_floor}");
-    assert!(
-        at_floor > 0.01,
-        "the floor is not far above what 2.5% needs: {at_floor}"
-    );
+    assert!(at_floor > 0.01, "the floor is not far above what 2.5% needs: {at_floor}");
     assert!(at_twenty > 0.08, "without a floor: {at_twenty}");
 }
 
@@ -928,11 +850,7 @@ fn subject_line_names_the_datas_own_id_header() {
         (&[][..], "ID"),
     ] {
         let pop = pop_with(headers);
-        assert_eq!(
-            SubjectLine::of(&pop),
-            SubjectLine::ById(want.into()),
-            "{headers:?}"
-        );
+        assert_eq!(SubjectLine::of(&pop), SubjectLine::ById(want.into()), "{headers:?}");
         let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
         let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
         assert!(
@@ -1011,11 +929,7 @@ fn fit_pushes_the_decorrelated_cs_advice() {
         s.obs_times = times.iter().chain(&times).copied().collect();
         s.observations = offsets
             .iter()
-            .flat_map(|&o| {
-                times
-                    .iter()
-                    .map(move |t| o + 0.5 * t + 0.2 * (t - 7.0) * (t - 7.0))
-            })
+            .flat_map(|&o| times.iter().map(move |t| o + 0.5 * t + 0.2 * (t - 7.0) * (t - 7.0)))
             .collect();
         let n = s.obs_times.len();
         s.obs_cmts = vec![1; n];
@@ -1032,11 +946,7 @@ fn fit_pushes_the_decorrelated_cs_advice() {
         arm_subject("3", [7.0, 9.0]),
     ]);
     pop.covariate_names = vec!["ARM".into()];
-    let opts = FitOptions {
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..parsed.fit_options
-    };
+    let opts = FitOptions { outer_maxiter: 1, run_covariance_step: false, ..parsed.fit_options };
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
     eprintln!("B8 decorrelated cs DW {:.4}", result.dw_statistic);
     assert!(
@@ -1060,10 +970,7 @@ fn fit_pushes_the_decorrelated_cs_advice() {
         })
         .collect();
     assert_eq!(dw_entries, vec![&expected], "{:#?}", result.warnings);
-    assert!(
-        expected.contains("`ar1` models that") && !expected.contains("transit"),
-        "{expected}"
-    );
+    assert!(expected.contains("`ar1` models that") && !expected.contains("transit"), "{expected}");
 }
 
 // ── #2798: the positive advice names only remedies the model can take ─────────────
@@ -1111,9 +1018,7 @@ const ALGEBRAIC_IN_TIME_TEXT_ID: &str = "Positive IWRES autocorrelation detected
      cannot model this: a block never joins rows of two occasions.";
 
 fn in_time_advice() -> DwAdvice {
-    DwAdvice::AlgebraicInTime {
-        by: SubjectLine::ById("ID".into()),
-    }
+    DwAdvice::AlgebraicInTime { by: SubjectLine::ById("ID".into()) }
 }
 
 /// The compartment-free text for group `g`.
@@ -1167,12 +1072,9 @@ fn grouped_model(class: Class, grouping: Grouping) -> crate::types::ParsedModel 
     let (levels, kappas, k, fit_options) = match grouping {
         Grouping::None => ("", "", "", ""),
         Grouping::IovColumn => ("", "  kappa K ~ 0.04\n", " + K", "  iov_column = OCC\n"),
-        Grouping::SingleLevel => (
-            "  level ARM by ARMID in ID\n",
-            "  kappa K ~ 0.04 at ARM\n",
-            " + K",
-            "",
-        ),
+        Grouping::SingleLevel => {
+            ("  level ARM by ARMID in ID\n", "  kappa K ~ 0.04 at ARM\n", " + K", "")
+        }
         Grouping::Nested => (
             "  level STUDY by STUDYID in ID\n  level ARM by ARMID in STUDY\n",
             "  kappa K_ST ~ 0.04 at STUDY\n  kappa K ~ 0.04 at ARM\n",
@@ -1185,24 +1087,17 @@ fn grouped_model(class: Class, grouping: Grouping) -> crate::types::ParsedModel 
             " + K",
             "  iov_column = OCC\n  iov_occasion = time(24, 48)\n",
         ),
-        Grouping::IovDose => (
-            "",
-            "  kappa K ~ 0.04\n",
-            " + K",
-            "  iov_column = OCC\n  iov_occasion = dose\n",
-        ),
-        Grouping::IovTimeNoKappa => (
-            "",
-            "",
-            "",
-            "  iov_column = OCC\n  iov_occasion = time(24, 48)\n",
-        ),
+        Grouping::IovDose => {
+            ("", "  kappa K ~ 0.04\n", " + K", "  iov_column = OCC\n  iov_occasion = dose\n")
+        }
+        Grouping::IovTimeNoKappa => {
+            ("", "", "", "  iov_column = OCC\n  iov_occasion = time(24, 48)\n")
+        }
     };
     let (indiv, structural) = match class {
-        Class::Algebraic => (
-            format!("  A = TVA * exp(ETA{k})\n  B = TVB\n"),
-            "  y = A + B * TIME\n".to_string(),
-        ),
+        Class::Algebraic => {
+            (format!("  A = TVA * exp(ETA{k})\n  B = TVB\n"), "  y = A + B * TIME\n".to_string())
+        }
         Class::PkAnalytic => (
             format!("  CL = TVA * exp(ETA{k})\n  V = TVB\n"),
             "  pk one_cpt_iv(cl=CL, v=V)\n".to_string(),
@@ -1251,10 +1146,8 @@ const LAYOUTS: [Rows; 2] = [Rows::InTime, Rows::Parallel];
 /// three windows.
 fn cell_subject(id: &str, parsed: &crate::types::ParsedModel, rows: Rows) -> Subject {
     let mut s = biexponential_subject(id, 1.0, 1.0);
-    s.doses = [0.0, 24.0, 48.0]
-        .iter()
-        .map(|t| DoseEvent::new(*t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
+    s.doses =
+        [0.0, 24.0, 48.0].iter().map(|t| DoseEvent::new(*t, 100.0, 1, 0.0, false, 0.0)).collect();
     s.obs_times = match rows {
         Rows::InTime => vec![6.0, 30.0, 54.0, 78.0],
         Rows::Parallel => vec![6.0, 30.0, 6.0, 30.0],
@@ -1291,9 +1184,7 @@ fn prepared(parsed: &crate::types::ParsedModel, subjects: Vec<Subject>) -> Popul
 /// Whether every subject's occasions run in time, the predicate the advice and the
 /// statistic share.
 fn all_in_time(pop: &Population) -> bool {
-    pop.subjects
-        .iter()
-        .all(crate::stats::residual_error::occasions_run_in_time)
+    pop.subjects.iter().all(crate::stats::residual_error::occasions_run_in_time)
 }
 
 /// The advice and positive message for one cell, on a one-subject population laid
@@ -1384,20 +1275,9 @@ fn algebraic_without_grouping_names_a_level_and_a_placeholder_column() {
 fn algebraic_with_a_parallel_iov_column_correlates_by_the_column() {
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovColumn, Rows::Parallel);
     assert!(!in_time, "the fixture must be parallel");
-    assert_eq!(
-        advice,
-        DwAdvice::Algebraic {
-            group: Some("OCC".into())
-        }
-    );
+    assert_eq!(advice, DwAdvice::Algebraic { group: Some("OCC".into()) });
     assert_eq!(msg, algebraic_grouped("OCC"));
-    for must in [
-        "by OCC`",
-        "`OCC` group",
-        "ar1(RHO)",
-        "car1(RHO)",
-        "foce or focei",
-    ] {
+    for must in ["by OCC`", "`OCC` group", "ar1(RHO)", "car1(RHO)", "foce or focei"] {
         assert!(msg.contains(must), "missing `{must}`: {msg}");
     }
     for banned in NOT_FOR_ALGEBRAIC.iter().chain(&["COL", "kappa"]) {
@@ -1438,9 +1318,7 @@ fn algebraic_with_an_iov_column_in_time_correlates_the_subject() {
     // Not the column the statistic was taken across, no placeholder, and none of
     // the ungrouped text's "declare a grouping" advice: the model has one.
     for banned in
-        NOT_FOR_ALGEBRAIC
-            .iter()
-            .chain(&["OCC", "COL", "kappa", "`level`", "labels the group"])
+        NOT_FOR_ALGEBRAIC.iter().chain(&["OCC", "COL", "kappa", "`level`", "labels the group"])
     {
         assert!(!msg.contains(banned), "`{banned}` in {msg}");
     }
@@ -1458,10 +1336,7 @@ fn algebraic_with_an_iov_column_in_time_correlates_the_subject() {
 fn algebraic_in_time_names_id_only_when_it_is_numeric() {
     let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
     let message = |ids: &[&str]| {
-        let subjects = ids
-            .iter()
-            .map(|id| cell_subject(id, &parsed, Rows::InTime))
-            .collect();
+        let subjects = ids.iter().map(|id| cell_subject(id, &parsed, Rows::InTime)).collect();
         let pop = prepared(&parsed, subjects);
         assert!(all_in_time(&pop));
         let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
@@ -1469,12 +1344,7 @@ fn algebraic_in_time_names_id_only_when_it_is_numeric() {
         (advice, msg)
     };
     let (advice, msg) = message(&["1", "2"]);
-    assert_eq!(
-        advice,
-        DwAdvice::AlgebraicInTime {
-            by: SubjectLine::ById("ID".into())
-        }
-    );
+    assert_eq!(advice, DwAdvice::AlgebraicInTime { by: SubjectLine::ById("ID".into()) });
     assert_eq!(msg, ALGEBRAIC_IN_TIME);
     assert!(
         msg.contains("by ID` line") && !msg.contains("COL") && !msg.contains("not numeric"),
@@ -1484,9 +1354,7 @@ fn algebraic_in_time_names_id_only_when_it_is_numeric() {
         let (advice, msg) = message(&ids);
         assert_eq!(
             advice,
-            DwAdvice::AlgebraicInTime {
-                by: SubjectLine::ByNumericColumn
-            },
+            DwAdvice::AlgebraicInTime { by: SubjectLine::ByNumericColumn },
             "{ids:?}"
         );
         assert_eq!(msg, ALGEBRAIC_IN_TIME_TEXT_ID, "{ids:?}");
@@ -1518,10 +1386,7 @@ fn algebraic_with_one_occasion_per_subject_keeps_the_ungrouped_text() {
     assert_eq!(advice, DwAdvice::Algebraic { group: None });
     let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
     assert_eq!(msg, ALGEBRAIC_UNGROUPED);
-    assert!(
-        !msg.contains("across its occasions") && !msg.contains("by ID"),
-        "{msg}"
-    );
+    assert!(!msg.contains("across its occasions") && !msg.contains("by ID"), "{msg}");
 }
 
 /// A4 (#2829, plan amendment 1). A population of one subject in time and one
@@ -1532,22 +1397,13 @@ fn algebraic_with_one_occasion_per_subject_keeps_the_ungrouped_text() {
 #[test]
 fn algebraic_iov_column_split_in_some_subjects_correlates_by_the_column() {
     let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
-    for order in [
-        [Rows::InTime, Rows::Parallel],
-        [Rows::Parallel, Rows::InTime],
-    ] {
+    for order in [[Rows::InTime, Rows::Parallel], [Rows::Parallel, Rows::InTime]] {
         let pop = prepared(
             &parsed,
-            vec![
-                cell_subject("1", &parsed, order[0]),
-                cell_subject("2", &parsed, order[1]),
-            ],
+            vec![cell_subject("1", &parsed, order[0]), cell_subject("2", &parsed, order[1])],
         );
-        let in_time: Vec<bool> = pop
-            .subjects
-            .iter()
-            .map(crate::stats::residual_error::occasions_run_in_time)
-            .collect();
+        let in_time: Vec<bool> =
+            pop.subjects.iter().map(crate::stats::residual_error::occasions_run_in_time).collect();
         assert!(
             in_time.contains(&true) && in_time.contains(&false),
             "the population must be mixed: {in_time:?}"
@@ -1555,10 +1411,7 @@ fn algebraic_iov_column_split_in_some_subjects_correlates_by_the_column() {
         let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
         let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
         assert_eq!(msg, algebraic_grouped("OCC"), "{order:?}");
-        assert!(
-            msg.contains("`OCC` group") && msg.contains("by OCC`"),
-            "{order:?}: {msg}"
-        );
+        assert!(msg.contains("`OCC` group") && msg.contains("by OCC`"), "{order:?}: {msg}");
         assert!(!msg.contains("COL any"), "{order:?}: {msg}");
     }
 }
@@ -1574,12 +1427,7 @@ fn algebraic_iov_column_split_in_some_subjects_correlates_by_the_column() {
 fn algebraic_single_level_correlates_by_its_column() {
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::SingleLevel, Rows::Parallel);
     assert!(!in_time);
-    assert_eq!(
-        advice,
-        DwAdvice::Algebraic {
-            group: Some("ARMID".into())
-        }
-    );
+    assert_eq!(advice, DwAdvice::Algebraic { group: Some("ARMID".into()) });
     assert_eq!(msg, algebraic_grouped("ARMID"));
     assert!(msg.contains("by ARMID`"), "{msg}");
     assert!(!msg.contains("by ARM`") && !msg.contains("`ARM`"), "{msg}");
@@ -1604,12 +1452,7 @@ fn algebraic_single_level_correlates_by_its_column() {
 fn algebraic_nested_levels_correlate_by_the_innermost_level_name() {
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::Nested, Rows::Parallel);
     assert!(!in_time);
-    assert_eq!(
-        advice,
-        DwAdvice::Algebraic {
-            group: Some("ARM".into())
-        }
-    );
+    assert_eq!(advice, DwAdvice::Algebraic { group: Some("ARM".into()) });
     assert_eq!(msg, algebraic_grouped("ARM"));
     assert!(msg.contains("by ARM`"), "{msg}");
     for banned in NOT_FOR_ALGEBRAIC.iter().chain(&["ARMID", "STUDY"]) {
@@ -1670,10 +1513,7 @@ fn algebraic_derived_windows_on_a_restarting_clock_name_no_column() {
     let pop = prepared(&parsed, vec![cell_subject("1", &parsed, Rows::Parallel)]);
     assert_eq!(pop.subjects[0].occasions, vec![0, 1, 0, 1]);
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTime, Rows::Parallel);
-    assert!(
-        !in_time,
-        "the straddle: derived labels that do not run in time"
-    );
+    assert!(!in_time, "the straddle: derived labels that do not run in time");
     assert_eq!(advice, DwAdvice::Algebraic { group: None });
     assert_eq!(msg, ALGEBRAIC_UNGROUPED);
     assert!(msg.contains("COL any") && !msg.contains("OCC"), "{msg}");
@@ -1695,10 +1535,7 @@ fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
         crate::types::IovOccasionRule::Column,
         "the straddle: a derived rule is set, and only the missing kappa voids it"
     );
-    assert!(!crate::api::run::occasions_are_derived(
-        &parsed.model,
-        &parsed.fit_options
-    ));
+    assert!(!crate::api::run::occasions_are_derived(&parsed.model, &parsed.fit_options));
     let pop = prepared(&parsed, vec![cell_subject("1", &parsed, Rows::Parallel)]);
     assert_eq!(
         pop.subjects[0].occasions,
@@ -1707,12 +1544,7 @@ fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
     );
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTimeNoKappa, Rows::Parallel);
     assert!(!in_time);
-    assert_eq!(
-        advice,
-        DwAdvice::Algebraic {
-            group: Some("OCC".into())
-        }
-    );
+    assert_eq!(advice, DwAdvice::Algebraic { group: Some("OCC".into()) });
     assert_eq!(msg, algebraic_grouped("OCC"));
     assert!(msg.contains("by OCC`") && !msg.contains("COL"), "{msg}");
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTimeNoKappa, Rows::InTime);
@@ -1729,15 +1561,9 @@ fn negative_text_is_the_same_for_every_advice() {
     for advice in [
         DwAdvice::Compartmental,
         DwAdvice::Algebraic { group: None },
-        DwAdvice::Algebraic {
-            group: Some("ARM".into()),
-        },
-        DwAdvice::AlgebraicInTime {
-            by: SubjectLine::ById("ID".into()),
-        },
-        DwAdvice::AlgebraicInTime {
-            by: SubjectLine::ByNumericColumn,
-        },
+        DwAdvice::Algebraic { group: Some("ARM".into()) },
+        DwAdvice::AlgebraicInTime { by: SubjectLine::ById("ID".into()) },
+        DwAdvice::AlgebraicInTime { by: SubjectLine::ByNumericColumn },
     ] {
         let msg = dw_autocorrelation_warning(2.80, &advice).expect("above 2.5");
         assert_eq!(msg, negative, "{advice:?}");
@@ -1745,11 +1571,7 @@ fn negative_text_is_the_same_for_every_advice() {
             assert!(!msg.contains(banned), "{advice:?}: `{banned}`");
         }
         for dw in [1.5, 2.0, 2.5, f64::NAN] {
-            assert_eq!(
-                dw_autocorrelation_warning(dw, &advice),
-                None,
-                "{advice:?} {dw}"
-            );
+            assert_eq!(dw_autocorrelation_warning(dw, &advice), None, "{advice:?} {dw}");
         }
     }
 }

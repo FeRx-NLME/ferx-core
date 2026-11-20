@@ -99,10 +99,8 @@ fn nonmem_rows() -> Vec<[f64; 6]> {
     text.lines()
         .skip(2) // `TABLE NO.  1` and the column header
         .map(|l| {
-            let v: Vec<f64> = l
-                .split(',')
-                .map(|x| x.trim().parse().expect("numeric table cell"))
-                .collect();
+            let v: Vec<f64> =
+                l.split(',').map(|x| x.trim().parse().expect("numeric table cell")).collect();
             // ID TIME EVID PRED IPRED ETA1 ETA2
             [v[0], v[1], v[2], v[3], v[5], v[6]]
         })
@@ -115,11 +113,7 @@ fn worst_pred_error(tail: &str) -> f64 {
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("the dataset must load");
     let ferx = predict(&parsed.model, &pop, &parsed.model.default_params).unwrap();
     let nm: Vec<[f64; 6]> = nonmem_rows().into_iter().filter(|r| r[2] == 0.0).collect();
-    assert_eq!(
-        ferx.len(),
-        nm.len(),
-        "one prediction per observation record"
-    );
+    assert_eq!(ferx.len(), nm.len(), "one prediction per observation record");
     assert_eq!(nm.len(), 33, "the anchor must compare all 33 observations");
     nm.iter().zip(&ferx).fold(0.0_f64, |worst, (want, got)| {
         assert_eq!(got.id, format!("{}", want[0] as i64));
@@ -140,10 +134,7 @@ fn advan5_pred_matches_nonmem_on_every_record() {
     // Measured worst over all 33 observations: 3.1e-12 — the `$TABLE` print precision
     // (`1PE20.12`). The bound is 30× that.
     let rel = worst_pred_error("");
-    assert!(
-        rel < 1e-10,
-        "PRED vs NONMEM ADVAN5: worst relative error {rel:e}"
-    );
+    assert!(rel < 1e-10, "PRED vs NONMEM ADVAN5: worst relative error {rel:e}");
     // The bound's teeth: the same model integrated (`rk45`, default tolerances) misses NONMEM
     // by 2.6e-5, five orders outside it — so this test cannot pass on a route that silently
     // fell back to the integrator.
@@ -158,12 +149,9 @@ fn advan5_pred_matches_nonmem_on_every_record() {
 fn advan5_focei_objective_and_ebes_match_nonmem() {
     let parsed = parse_full_model(&model("")).expect("the ferx model must parse");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("the dataset must load");
-    let options = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    }
-    .quiet();
+    let options =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() }
+            .quiet();
     let result = fit(&parsed.model, &pop, &parsed.model.default_params, &options)
         .expect("the evaluation must run");
     assert!(
@@ -172,21 +160,14 @@ fn advan5_focei_objective_and_ebes_match_nonmem() {
     );
     // Measured: ferx −340.390273316, NONMEM −340.390273263 — a difference of 5.2e-8. Bound
     // 200× that, and still far inside the 1e-3 the other FOCEI anchors use.
-    assert!(
-        (result.ofv - NM_OFV).abs() < 1e-5,
-        "FOCEI OFV: ferx {}, NONMEM {NM_OFV}",
-        result.ofv
-    );
+    assert!((result.ofv - NM_OFV).abs() < 1e-5, "FOCEI OFV: ferx {}, NONMEM {NM_OFV}", result.ofv);
 
     // NONMEM's POSTHOC η, on each subject's records. Measured worst absolute difference
     // 3.0e-8; bound 300× that.
     let nm = nonmem_rows();
     assert_eq!(result.subjects.len(), 4);
     for s in &result.subjects {
-        let row = nm
-            .iter()
-            .find(|r| format!("{}", r[0] as i64) == s.id)
-            .expect("subject in table");
+        let row = nm.iter().find(|r| format!("{}", r[0] as i64) == s.id).expect("subject in table");
         for (k, want) in [row[4], row[5]].into_iter().enumerate() {
             assert!(
                 (s.eta[k] - want).abs() < 1e-5,

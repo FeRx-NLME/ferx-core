@@ -348,9 +348,7 @@ fn iov_individual_cl_matches_nonmem() {
         }
         let cls: Vec<f64> = occ_cl.values().copied().collect();
         if cls.len() >= 2
-            && cls
-                .windows(2)
-                .any(|w| (w[0] - w[1]).abs() > 1e-6 * w[0].abs().max(1.0))
+            && cls.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-6 * w[0].abs().max(1.0))
         {
             any_cl_varies_by_occ = true;
         }

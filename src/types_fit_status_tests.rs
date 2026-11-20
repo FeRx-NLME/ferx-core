@@ -93,9 +93,7 @@ fn cov() -> StatusReason {
     StatusReason::CovarianceFailed
 }
 fn guard(names: &[&str]) -> StatusReason {
-    StatusReason::CollapsedAtGuard {
-        parameters: names.iter().map(|s| s.to_string()).collect(),
-    }
+    StatusReason::CollapsedAtGuard { parameters: names.iter().map(|s| s.to_string()).collect() }
 }
 
 /// The exact reason list, and both verdicts: `converged = true` gives `Converged` exactly
@@ -110,21 +108,15 @@ fn check_cell(name: &str, base: FitResult, want: Vec<StatusReason>) -> Result<()
     let want_yes = if want.is_empty() {
         FitStatus::Converged
     } else {
-        FitStatus::ConvergedWithIssues {
-            reasons: want.clone(),
-        }
+        FitStatus::ConvergedWithIssues { reasons: want.clone() }
     };
     let want_no = FitStatus::NotConverged { reasons: want };
     let (got_yes, got_no) = (yes.status(), no.status());
     if got_yes != want_yes {
-        return Err(format!(
-            "{name}, converged = true: got {got_yes:?}, want {want_yes:?}"
-        ));
+        return Err(format!("{name}, converged = true: got {got_yes:?}, want {want_yes:?}"));
     }
     if got_no != want_no {
-        return Err(format!(
-            "{name}, converged = false: got {got_no:?}, want {want_no:?}"
-        ));
+        return Err(format!("{name}, converged = false: got {got_no:?}, want {want_no:?}"));
     }
     Ok(())
 }
@@ -194,10 +186,8 @@ fn status_c2_profiled_bound_is_not_an_issue() {
     let mut r = cell(false, Guard::N, false);
     r.covariance_status = CovarianceStatus::Failed;
     r.cov_fixed = Vec::new();
-    r.held_at_bound = vec![HeldAtBound {
-        reason: HeldReason::ProfiledBound,
-        ..collapse("PLACEBO[STUDY=7]", 1)
-    }];
+    r.held_at_bound =
+        vec![HeldAtBound { reason: HeldReason::ProfiledBound, ..collapse("PLACEBO[STUDY=7]", 1) }];
     let r = with_warnings(r, &[COV_FAILED_MSG]);
     assert_cell("C2", r, vec![cov()]);
 }
@@ -228,10 +218,7 @@ fn status_c5_stale_covariance_failed_warning_is_not_counted() {
         &["[FOCE] Covariance step failed: Hessian is not positive definite"],
     );
     assert_eq!(
-        (
-            r.warnings_structured[0].severity.clone(),
-            r.warnings_structured[0].category
-        ),
+        (r.warnings_structured[0].severity.clone(), r.warnings_structured[0].category),
         (WarningSeverity::Critical, WarningCode::CovarianceFailed),
         "C5 fixture: the stale entry must be a Critical covariance_failed, or the cell is vacuous"
     );
@@ -253,11 +240,7 @@ fn status_c6_empty_cov_fixed_reads_not_held() {
 fn status_c7_duplicate_codes_once_and_warning_severity_ignored() {
     let r = with_warnings(
         cell(false, Guard::N, false),
-        &[
-            CRITICAL_MSG,
-            COLLAPSE_WARNING,
-            "[FOCE] Hessian is ill-conditioned",
-        ],
+        &[CRITICAL_MSG, COLLAPSE_WARNING, "[FOCE] Hessian is ill-conditioned"],
     );
     assert_eq!(
         r.warnings_structured[1].severity,
@@ -287,10 +270,8 @@ fn status_c8_only_the_unheld_collapse_is_listed() {
 fn status_c9_multi_start_note_is_not_a_reason() {
     let r = with_warnings(
         cell(false, Guard::N, false),
-        &[
-            "Multi-start: 1 of 4 starts failed: start 3: Outer optimizer did not converge; \
-           Covariance step failed: Hessian is not positive definite",
-        ],
+        &["Multi-start: 1 of 4 starts failed: start 3: Outer optimizer did not converge; \
+           Covariance step failed: Hessian is not positive definite"],
     );
     assert_cell("C9", r, vec![]);
 }
@@ -303,15 +284,8 @@ fn status_c10_earlier_stage_critical_warning_counts() {
         cell(false, Guard::N, false),
         &["[FOCE] Outer optimization did not converge"],
     );
-    assert_eq!(
-        r.warnings_structured[0].source_method.as_deref(),
-        Some("FOCE")
-    );
-    assert_cell(
-        "C10",
-        r,
-        vec![StatusReason::CriticalWarning(WarningCode::Convergence)],
-    );
+    assert_eq!(r.warnings_structured[0].source_method.as_deref(), Some("FOCE"));
+    assert_cell("C10", r, vec![StatusReason::CriticalWarning(WarningCode::Convergence)]);
 }
 
 /// E1: an evaluation-only run with nothing else → `[evaluation_only]`.
@@ -328,23 +302,13 @@ fn status_e1_evaluation_only() {
 fn status_e2_evaluation_only_with_collapse_and_full_order() {
     let mut r = cell(false, Guard::R, false);
     r.evaluation_only = true;
-    assert_cell(
-        "E2",
-        r,
-        vec![StatusReason::EvaluationOnly, guard(&[COLLAPSED])],
-    );
+    assert_cell("E2", r, vec![StatusReason::EvaluationOnly, guard(&[COLLAPSED])]);
     let mut all = cell(true, Guard::F, true);
     all.evaluation_only = true;
     assert_cell(
         "E2 full order",
         all,
-        vec![
-            StatusReason::EvaluationOnly,
-            budget(),
-            crit(),
-            cov(),
-            s_guard(),
-        ],
+        vec![StatusReason::EvaluationOnly, budget(), crit(), cov(), s_guard()],
     );
 }
 
@@ -383,9 +347,7 @@ fn status_reasons_match_todays_critical_categories_as_a_set() {
 /// converged one with a suffix trimmed off).
 #[test]
 fn status_labels_are_pinned() {
-    let with = FitStatus::ConvergedWithIssues {
-        reasons: vec![cov()],
-    };
+    let with = FitStatus::ConvergedWithIssues { reasons: vec![cov()] };
     let not = FitStatus::NotConverged { reasons: vec![] };
     assert_eq!(FitStatus::Converged.label(), "CONVERGED");
     assert_eq!(with.label(), "CONVERGED WITH ISSUES");
@@ -436,10 +398,7 @@ fn json_value_carries_status_and_round_trips() {
     assert_eq!(back.status(), r.status());
     let mut plain = cell(false, Guard::N, false);
     plain.converged = true;
-    assert_eq!(
-        plain.to_json_value()["status"],
-        serde_json::json!("converged")
-    );
+    assert_eq!(plain.to_json_value()["status"], serde_json::json!("converged"));
 }
 
 /// T10 (#2809, audit 1 row 10): a `[mixture]` override collapse follows the same rule as a
@@ -449,10 +408,7 @@ fn json_value_carries_status_and_round_trips() {
 /// Both sides in one test, so a gate stuck on either reddens it.
 #[test]
 fn status_t10_mixture_override_collapse_held_and_not_held() {
-    let override_entry = HeldAtBound {
-        class: Some(2),
-        ..collapse("ETA_CL_MIX2", COLLAPSED_ROW)
-    };
+    let override_entry = HeldAtBound { class: Some(2), ..collapse("ETA_CL_MIX2", COLLAPSED_ROW) };
     let mut held = cell(false, Guard::H, false);
     held.held_at_bound = vec![override_entry.clone()];
     assert_cell("T10 held", held, vec![]);

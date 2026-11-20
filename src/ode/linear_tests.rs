@@ -23,10 +23,7 @@ fn max_rel_err(got: &[f64], want: &[f64]) -> f64 {
     let scale = want.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(1e-300);
     got.iter().zip(want).fold(0.0_f64, |worst, (g, w)| {
         // Both sides: `worst.max(NaN)` keeps `worst`.
-        assert!(
-            g.is_finite() && w.is_finite(),
-            "non-finite entry: got {g}, want {w}"
-        );
+        assert!(g.is_finite() && w.is_finite(), "non-finite entry: got {g}, want {w}");
         worst.max((g - w).abs() / scale)
     })
 }
@@ -115,21 +112,13 @@ fn expm_of_defective_transit_chain_is_erlang() {
     for i in 0..3 {
         let rel = (e[i * 3] - want[i]).abs() / want[i];
         // Measured ≤ 8.7e-16; the bound is a rounding bound, not a convergence one.
-        assert!(
-            rel < 1e-13,
-            "row {i}: {} vs {} (rel {rel:e})",
-            e[i * 3],
-            want[i]
-        );
+        assert!(rel < 1e-13, "row {i}: {} vs {} (rel {rel:e})", e[i * 3], want[i]);
     }
 }
 
 #[test]
 fn expm_exact_on_zero_and_nilpotent() {
-    assert_eq!(
-        expm_g::<f64>(&[0.0; 4], 2).unwrap(),
-        vec![1.0, 0.0, 0.0, 1.0]
-    );
+    assert_eq!(expm_g::<f64>(&[0.0; 4], 2).unwrap(), vec![1.0, 0.0, 0.0, 1.0]);
     // [[0, c], [0, 0]] is nilpotent: exp = I + A exactly. A large `c` forces squarings, which
     // must not lose the exactness (A² = 0 at every scale).
     let c = 1.0e3;
@@ -138,11 +127,7 @@ fn expm_exact_on_zero_and_nilpotent() {
     assert_eq!(e[2], 0.0);
     assert_eq!(e[3], 1.0);
     // Measured exactly 0.
-    assert!(
-        (e[1] - c).abs() / c < 1e-14,
-        "nilpotent off-diagonal {}",
-        e[1]
-    );
+    assert!((e[1] - c).abs() / c < 1e-14, "nilpotent off-diagonal {}", e[1]);
 }
 
 #[test]
@@ -183,10 +168,7 @@ fn expm_dual2_gradient_and_hessian_match_fd() {
     let norm1 = (0..3)
         .map(|j| (0..3).map(|i| a_dual[i * 3 + j].value.abs()).sum::<f64>())
         .fold(0.0_f64, f64::max);
-    assert!(
-        norm1 > THETA13,
-        "fixture must exercise squaring (‖A‖₁ = {norm1})"
-    );
+    assert!(norm1 > THETA13, "fixture must exercise squaring (‖A‖₁ = {norm1})");
     let e = expm_g(&a_dual, 3).expect("finite");
     let f = |q0: f64, q1: f64, k: usize| expm_g::<f64>(&param_generator(q0, q1, h), 3).unwrap()[k];
 
@@ -222,15 +204,9 @@ fn segment_matches_closed_form_infusion() {
     let (t0, t1) = (2.0, 9.0);
     let saveat = [3.0, 4.5, 6.0, 7.5, 9.0];
     let interp = [2.5, 8.25];
-    let (hard, soft) = linear_segment_g::<f64>(
-        &one_cpt_infusion,
-        &[u0],
-        (t0, t1),
-        &[k, r],
-        &saveat,
-        &interp,
-    )
-    .expect("affine, autonomous");
+    let (hard, soft) =
+        linear_segment_g::<f64>(&one_cpt_infusion, &[u0], (t0, t1), &[k, r], &saveat, &interp)
+            .expect("affine, autonomous");
     let exact = |t: f64| {
         let e = (-k * (t - t0)).exp();
         u0 * e + r / k * (1.0 - e)
@@ -239,12 +215,7 @@ fn segment_matches_closed_form_infusion() {
         assert_eq!(pt.t, t);
         let rel = (pt.u[0] - exact(t)).abs() / exact(t);
         // Measured ≤ 1.2e-15 (chained propagation across the grid).
-        assert!(
-            rel < 1e-13,
-            "t={t}: {} vs {} (rel {rel:e})",
-            pt.u[0],
-            exact(t)
-        );
+        assert!(rel < 1e-13, "t={t}: {} vs {} (rel {rel:e})", pt.u[0], exact(t));
     }
 }
 
@@ -263,11 +234,7 @@ fn segment_reads_a_column_the_forcing_dwarfs() {
         let rel = (hard[0].u[0] - exact).abs() / exact;
         assert!(hard[0].u[0].is_finite());
         // Measured ≤ 3.2e-16 across the three.
-        assert!(
-            rel < 1e-14,
-            "k={k}, r={r}: {} vs {exact} (rel {rel:e})",
-            hard[0].u[0]
-        );
+        assert!(rel < 1e-14, "k={k}, r={r}: {} vs {exact} (rel {rel:e})", hard[0].u[0]);
     }
 }
 
@@ -315,10 +282,7 @@ fn segment_reads_jets_the_forcing_sensitivity_dwarfs() {
                 let rel_v = (got.val() - u0 * e).abs() / (u0 * e);
                 let rel_g = (got.grad[0] - grad).abs() / grad.abs();
                 let rel_h = (got.hess[0][0] - hess).abs() / hess.abs();
-                assert!(
-                    got.jets_finite() && got.val().is_finite(),
-                    "{label}: {got:?}"
-                );
+                assert!(got.jets_finite() && got.val().is_finite(), "{label}: {got:?}");
                 // Measured ≤ 1.3e-15 over all eight (value, ∂/∂p and ∂²/∂p²).
                 assert!(
                     rel_v < 1e-14 && rel_g < 1e-14 && rel_h < 1e-14,
@@ -386,10 +350,7 @@ fn segment_agrees_with_a_tight_integrator() {
     }
     // Measured 4.3e-10 against rodas5p at 1e-12: the integrator's own error, not the
     // exponential's (the closed-form tests pin that at ~1e-15).
-    assert!(
-        worst < 1e-8,
-        "linear vs tight rodas5p: worst rel err {worst:e}"
-    );
+    assert!(worst < 1e-8, "linear vs tight rodas5p: worst rel err {worst:e}");
 }
 
 /// One state per way a state can be live or dormant (#2760): a parent `x0` draining at
@@ -420,14 +381,7 @@ fn a_dormant_state_is_left_out_and_every_live_one_kept() {
         method: OdeMethod::Rodas5P,
         ..Default::default()
     };
-    let reference = solve_ode(
-        &dormancy_cases::<f64>,
-        &u0,
-        (0.0, 12.0),
-        &p,
-        &saveat,
-        &tight,
-    );
+    let reference = solve_ode(&dormancy_cases::<f64>, &u0, (0.0, 12.0), &p, &saveat, &tight);
     DORMANT_STATES.with(|c| c.set(0));
     let (hard, _) =
         linear_segment_g::<f64>(&dormancy_cases, &u0, (0.0, 12.0), &p, &saveat, &[]).unwrap();
@@ -440,10 +394,7 @@ fn a_dormant_state_is_left_out_and_every_live_one_kept() {
         // The dormant state holds its entry value bit for bit.
         assert_eq!(got.u[4].to_bits(), u0[4].to_bits(), "x4 at t = {}", got.t);
         for (i, (g, w)) in got.u.iter().zip(&want.u).enumerate() {
-            assert!(
-                g.is_finite() && w.is_finite(),
-                "x{i}: linear {g}, rodas5p {w}"
-            );
+            assert!(g.is_finite() && w.is_finite(), "x{i}: linear {g}, rodas5p {w}");
             worst[i] = worst[i].max((g - w).abs() / w.abs().max(1e-12));
         }
     }
@@ -452,10 +403,7 @@ fn a_dormant_state_is_left_out_and_every_live_one_kept() {
     // off by O(1).
     eprintln!("dormancy cases vs tight rodas5p, worst per state: {worst:?}");
     for (i, w) in worst.iter().enumerate() {
-        assert!(
-            *w < 1e-12,
-            "x{i}: linear vs tight rodas5p, worst rel err {w:e}"
-        );
+        assert!(*w < 1e-12, "x{i}: linear vs tight rodas5p, worst rel err {w:e}");
     }
 }
 
@@ -484,11 +432,7 @@ fn segment_declines_a_nonlinear_rhs() {
     secant_twin(&[1.0], &[], 0.0, &mut at_u0);
     let mut at_probe = [0.0];
     secant_twin(&[s], &[], 0.0, &mut at_probe);
-    assert_eq!(
-        (at_u0[0], at_probe[0]),
-        (1.0, s),
-        "fixture must match its secant at both"
-    );
+    assert_eq!((at_u0[0], at_probe[0]), (1.0, s), "fixture must match its secant at both");
     assert!(linear_segment_g::<f64>(&secant_twin, &[1.0], (0.0, 0.5), &[], &[0.5], &[]).is_none());
 }
 
@@ -510,9 +454,7 @@ fn segment_dual_gradient_matches_fd() {
     let t_end = 10.0;
     let solve = |ka: f64, k10: f64| -> Vec<f64> {
         let p = [ka, k10, base[2], base[3], base[4]];
-        linear_segment_g::<f64>(&two_cpt_depot, &u0, (0.0, t_end), &p, &[t_end], &[])
-            .unwrap()
-            .0[0]
+        linear_segment_g::<f64>(&two_cpt_depot, &u0, (0.0, t_end), &p, &[t_end], &[]).unwrap().0[0]
             .u
             .clone()
     };
@@ -526,31 +468,14 @@ fn segment_dual_gradient_matches_fd() {
         })
         .collect();
     let u0_dual: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
-    let (hard, _) = linear_segment_g(
-        &two_cpt_depot,
-        &u0_dual,
-        (0.0, t_end),
-        &p_dual,
-        &[t_end],
-        &[],
-    )
-    .unwrap();
+    let (hard, _) =
+        linear_segment_g(&two_cpt_depot, &u0_dual, (0.0, t_end), &p_dual, &[t_end], &[]).unwrap();
     let h = 1e-6;
     for i in 0..3 {
         let g0 = (solve(base[0] + h, base[1])[i] - solve(base[0] - h, base[1])[i]) / (2.0 * h);
         let g1 = (solve(base[0], base[1] + h)[i] - solve(base[0], base[1] - h)[i]) / (2.0 * h);
-        approx::assert_relative_eq!(
-            hard[0].u[i].grad[0],
-            g0,
-            max_relative = 1e-6,
-            epsilon = 1e-8
-        );
-        approx::assert_relative_eq!(
-            hard[0].u[i].grad[1],
-            g1,
-            max_relative = 1e-6,
-            epsilon = 1e-8
-        );
+        approx::assert_relative_eq!(hard[0].u[i].grad[0], g0, max_relative = 1e-6, epsilon = 1e-8);
+        approx::assert_relative_eq!(hard[0].u[i].grad[1], g1, max_relative = 1e-6, epsilon = 1e-8);
     }
 }
 
@@ -673,11 +598,7 @@ fn segment_probe_stays_near_the_models_own_magnitudes() {
     let (hard, _) = linear_segment_g::<f64>(&rhs, &[1.0], (0.0, 2.0), &[], &[2.0], &[])
         .expect("certified-linear: must not be declined for an overflowing probe");
     let exact = (-2.0_f64).exp();
-    assert!(
-        (hard[0].u[0] - exact).abs() / exact < 1e-14,
-        "{} vs {exact}",
-        hard[0].u[0]
-    );
+    assert!((hard[0].u[0] - exact).abs() / exact < 1e-14, "{} vs {exact}", hard[0].u[0]);
 }
 
 #[test]
@@ -724,11 +645,7 @@ fn expm_declines_an_overflowed_jet() {
     let e = expm_g(&g, 2).expect("finite jets");
     assert!((e[0].val() - 1.0).abs() < 1e-15 && (e[3].val() - 1.0).abs() < 1e-15);
     assert_eq!(e[1].val(), 0.0);
-    assert!(
-        (e[1].grad[0] - 1e200).abs() / 1e200 < 1e-15,
-        "{:e}",
-        e[1].grad[0]
-    );
+    assert!((e[1].grad[0] - 1e200).abs() / 1e200 < 1e-15, "{:e}", e[1].grad[0]);
 }
 
 #[test]
@@ -741,10 +658,7 @@ fn every_dual_overrides_jet_max_abs() {
         x.jet_max_abs()
     }
     assert_eq!(through_trait(2.5_f64), 0.0);
-    assert_eq!(
-        through_trait(Dual2::<2>::var(1.0, 1) * Dual2::<2>::from_f64(-3.0)),
-        3.0
-    );
+    assert_eq!(through_trait(Dual2::<2>::var(1.0, 1) * Dual2::<2>::from_f64(-3.0)), 3.0);
     let x = Dual2::<1>::var(1.0, 0);
     assert_eq!(through_trait(x * x * x), 6.0); // ∂ = 3x² = 3, ∂² = 6x = 6: the Hessian counts
     assert!(through_trait(Dual2::<1>::var(1.0, 0) * Dual2::<1>::from_f64(f64::NAN)).is_nan());
@@ -762,11 +676,7 @@ fn every_dual_overrides_jet_max_abs() {
     assert_eq!(through_trait(t), 5.0, "DualT");
     let mut h = DualT::<1, DualT<1, f64>>::constant(1.0);
     h.g[0].g = [-6.0];
-    assert_eq!(
-        through_trait(h),
-        6.0,
-        "nested DualT: the base's jet of a tangent counts"
-    );
+    assert_eq!(through_trait(h), 6.0, "nested DualT: the base's jet of a tangent counts");
 }
 
 /// The pre-skip `matmul`: every product taken, structural zeros included.
@@ -788,12 +698,8 @@ fn component_bits(v: &[crate::sens::dual2::Dual2<2>]) -> Vec<u64> {
     let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
     v.iter()
         .flat_map(|d| {
-            std::iter::once(norm(d.value)).chain(
-                d.grad
-                    .iter()
-                    .chain(d.hess.iter().flatten())
-                    .map(|&g| norm(g)),
-            )
+            std::iter::once(norm(d.value))
+                .chain(d.grad.iter().chain(d.hess.iter().flatten()).map(|&g| norm(g)))
         })
         .collect()
 }
@@ -806,25 +712,15 @@ fn sparse_generator() -> Vec<crate::sens::dual2::Dual2<2>> {
     let z = Dual2::<2>::from_f64(0.0);
     let mut a = vec![z; n * n];
     for i in 0..n {
-        a[i * n + i] = Dual2 {
-            value: -0.7 - 0.1 * i as f64,
-            grad: [-1.0, 0.0],
-            ..Dual2::constant(0.0)
-        };
+        a[i * n + i] =
+            Dual2 { value: -0.7 - 0.1 * i as f64, grad: [-1.0, 0.0], ..Dual2::constant(0.0) };
         if i + 1 < n {
-            a[(i + 1) * n + i] = Dual2 {
-                value: 0.7 + 0.1 * i as f64,
-                grad: [1.0, 0.3],
-                ..Dual2::constant(0.0)
-            };
+            a[(i + 1) * n + i] =
+                Dual2 { value: 0.7 + 0.1 * i as f64, grad: [1.0, 0.3], ..Dual2::constant(0.0) };
         }
     }
     // Numerically zero, derivative live: must not be skipped.
-    a[3] = Dual2 {
-        value: 0.0,
-        grad: [0.0, 2.5],
-        ..Dual2::constant(0.0)
-    };
+    a[3] = Dual2 { value: 0.0, grad: [0.0, 2.5], ..Dual2::constant(0.0) };
     a
 }
 
@@ -836,10 +732,7 @@ fn matmul_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
     let n = 4;
     let a = sparse_generator();
     let a2 = matmul(&a, &a, n);
-    assert_eq!(
-        component_bits(&a2),
-        component_bits(&matmul_reference(&a, &a, n))
-    );
+    assert_eq!(component_bits(&a2), component_bits(&matmul_reference(&a, &a, n)));
     // (A·A)[0][3] = a00·a03 + a03·a33, so ∂/∂p₁ = −0.7·2.5 + (−1.0)·2.5 = −4.25 exactly.
     // Skipping the jet-carrying a03 as x (k = 3) leaves −1.75; the bitwise comparison
     // above catches it too, this names the number.
@@ -867,12 +760,7 @@ fn matmul_keeps_a_zero_whose_only_derivative_is_its_hessian() {
             ..Dual2::constant(0.0)
         };
     }
-    a[2] = Dual2 {
-        value: 0.0,
-        grad: [0.0],
-        hess: [[1.5]],
-        ..Dual2::constant(0.0)
-    };
+    a[2] = Dual2 { value: 0.0, grad: [0.0], hess: [[1.5]], ..Dual2::constant(0.0) };
     let got = matmul(&a, &a, n);
     let want = matmul_reference(&a, &a, n);
     let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
@@ -904,16 +792,8 @@ fn matmul_keeps_an_outer_type_zero_whose_only_derivative_is_its_hessian() {
             ..Dual2::constant(0.0)
         };
     }
-    a[2] = Dual2 {
-        value: 0.0,
-        grad: [0.0],
-        hess: [[1.5]],
-        ..Dual2::constant(0.0)
-    };
-    assert!(
-        !a[2].is_constant(),
-        "premise: the payload makes it non-constant"
-    );
+    a[2] = Dual2 { value: 0.0, grad: [0.0], hess: [[1.5]], ..Dual2::constant(0.0) };
+    assert!(!a[2].is_constant(), "premise: the payload makes it non-constant");
     let got = matmul(&a, &a, n);
     let want = matmul_reference(&a, &a, n);
     let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
@@ -981,9 +861,8 @@ mod pre_expm {
         use crate::sens::linsolve::{all_finite, structural_zero};
         // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
         // products to be exactly `±0` (`all_finite`).
-        let row_finite: Vec<bool> = (0..n)
-            .map(|k| y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v)))
-            .collect();
+        let row_finite: Vec<bool> =
+            (0..n).map(|k| y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v))).collect();
         let mut out = vec![T::from_f64(0.0); n * n];
         for i in 0..n {
             for k in 0..n {
@@ -1059,20 +938,12 @@ mod pre_expm {
         // U = A·[A6·(b13·A6 + b11·A4 + b9·A2) + b7·A6 + b5·A4 + b3·A2 + b1·I]
         let u_inner = lincomb(&[(b[13], &a6), (b[11], &a4), (b[9], &a2)], 0.0, n);
         let u_inner = matmul_old(&a6, &u_inner, n);
-        let u_poly = lincomb(
-            &[(1.0, &u_inner), (b[7], &a6), (b[5], &a4), (b[3], &a2)],
-            b[1],
-            n,
-        );
+        let u_poly = lincomb(&[(1.0, &u_inner), (b[7], &a6), (b[5], &a4), (b[3], &a2)], b[1], n);
         let u = matmul_old(&a1, &u_poly, n);
         // V = A6·(b12·A6 + b10·A4 + b8·A2) + b6·A6 + b4·A4 + b2·A2 + b0·I
         let v_inner = lincomb(&[(b[12], &a6), (b[10], &a4), (b[8], &a2)], 0.0, n);
         let v_inner = matmul_old(&a6, &v_inner, n);
-        let v = lincomb(
-            &[(1.0, &v_inner), (b[6], &a6), (b[4], &a4), (b[2], &a2)],
-            b[0],
-            n,
-        );
+        let v = lincomb(&[(1.0, &v_inner), (b[6], &a6), (b[4], &a4), (b[2], &a2)], b[0], n);
 
         // Solve (V − U)·R = (V + U), one column at a time against one factorization.
         let mut q: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi - ui).collect();
@@ -1102,16 +973,10 @@ mod pre_expm {
     }
 
     pub(super) fn linear_segment_old<T: PkNum>(
-        rhs: &dyn Fn(&[T], &[T], T, &mut [T]),
-        u0: &[T],
-        t_span: (f64, f64),
-        params: &[T],
-        saveat: &[f64],
-        interp_at: &[f64],
-    ) -> Option<(
-        Vec<crate::ode::solver::SolPointG<T>>,
-        Vec<crate::ode::solver::SolPointG<T>>,
-    )> {
+        rhs: &dyn Fn(&[T], &[T], T, &mut [T]), u0: &[T], t_span: (f64, f64), params: &[T],
+        saveat: &[f64], interp_at: &[f64],
+    ) -> Option<(Vec<crate::ode::solver::SolPointG<T>>, Vec<crate::ode::solver::SolPointG<T>>)>
+    {
         let n = u0.len();
         let (t0, t1) = t_span;
         let h = t1 - t0;
@@ -1140,10 +1005,8 @@ mod pre_expm {
         let mut probe = vec![zero; n];
         let mut b = vec![zero; n];
         rhs(&probe, params, T::from_f64(t_mid), &mut b);
-        let magnitude = b
-            .iter()
-            .chain(u0)
-            .fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
+        let magnitude =
+            b.iter().chain(u0).fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
         if !magnitude.is_finite() {
             return None;
         }
@@ -1215,9 +1078,7 @@ mod pre_expm {
         // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
         // generator's value at zero (no squarings) while the Padé numerator multiplies that jet by
         // ~3e16 and overflows it.
-        let b_max = b.iter().fold(0.0_f64, |acc, x| {
-            acc.max(x.plain().abs()).max(x.jet_max_abs())
-        });
+        let b_max = b.iter().fold(0.0_f64, |acc, x| acc.max(x.plain().abs()).max(x.jet_max_abs()));
         let c = (b_max / a_max.max(1.0)).max(1.0);
         let inv_c = T::from_f64(1.0 / c);
         let m = n + 1;
@@ -1293,9 +1154,7 @@ mod pre_expm {
             states[i].1.clone()
         };
         let at = |ts: &[f64]| -> Vec<crate::ode::solver::SolPointG<T>> {
-            ts.iter()
-                .map(|&t| crate::ode::solver::SolPointG { t, u: lookup(t) })
-                .collect()
+            ts.iter().map(|&t| crate::ode::solver::SolPointG { t, u: lookup(t) }).collect()
         };
         Some((at(saveat), at(interp_at)))
     }
@@ -1323,9 +1182,7 @@ fn random_rhs_matrix(seed: &mut u64, n: usize) -> (Vec<f64>, Vec<f64>) {
             };
         }
     }
-    let b: Vec<f64> = (0..n)
-        .map(|_| if next() < 0.5 { 0.0 } else { 10.0 * next() })
-        .collect();
+    let b: Vec<f64> = (0..n).map(|_| if next() < 0.5 { 0.0 } else { 10.0 * next() }).collect();
     (a, b)
 }
 
@@ -1335,9 +1192,7 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
     use crate::sens::dual2::Dual2;
     // Gaps at powers of two of each other (shared Padé steps), others that are not, a gap
     // repeated, and the tiny and long ends of a dosing timeline.
-    let gaps = [
-        0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 0.25, 3.0, 1.0, 48.0, 1e-3,
-    ];
+    let gaps = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 0.25, 3.0, 1.0, 48.0, 1e-3];
     let mut seed = 0x2545_F491_4F6C_DD1D_u64;
     let mut reused = 0;
     for case in 0..60 {
@@ -1360,12 +1215,9 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
             let want = pre_expm::expm_old(&ah, n)
                 .map(|r| r.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
             let entries = e64.cache.len();
-            let got = e64.exp(&ah).map(|slot| {
-                e64.get(slot)
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>()
-            });
+            let got = e64
+                .exp(&ah)
+                .map(|slot| e64.get(slot).iter().map(|x| x.to_bits()).collect::<Vec<_>>());
             assert_eq!(want, got, "case {case}, f64, h = {h}");
             // A shared step: no new approximant for a gap that is not an exact repeat of an
             // earlier one (a repeat hits on the same key trivially and proves nothing).
@@ -1387,9 +1239,7 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
                 du[i] = acc;
             }
         };
-        let u0: Vec<_> = (0..n)
-            .map(|i| lift(100.0 * (i == 0) as u8 as f64, i))
-            .collect();
+        let u0: Vec<_> = (0..n).map(|i| lift(100.0 * (i == 0) as u8 as f64, i)).collect();
         let saveat = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 36.0, 48.0];
         let want = pre_expm::linear_segment_old(&rhs, &u0, (0.0, 48.0), &[], &saveat, &[3.0]);
         let got = linear_segment_g(&rhs, &u0, (0.0, 48.0), &[], &saveat, &[3.0]);
@@ -1398,10 +1248,7 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
             Vec<crate::ode::solver::SolPointG<Dual2<2>>>,
         )>| {
             o.as_ref().map(|(h, s)| {
-                h.iter()
-                    .chain(s)
-                    .map(|p| (p.t.to_bits(), component_bits(&p.u)))
-                    .collect::<Vec<_>>()
+                h.iter().chain(s).map(|p| (p.t.to_bits(), component_bits(&p.u))).collect::<Vec<_>>()
             })
         };
         assert_eq!(bits(&want), bits(&got), "case {case}: segment");
@@ -1434,25 +1281,12 @@ fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
         du[0] = a * u[0] + b;
         du[1] = 0.3 * u[0] - 0.1 * u[1];
     };
-    let run = || {
-        linear_segment_g(
-            &rhs,
-            &[1.0, 0.0],
-            (0.0, 24.0),
-            &[],
-            &[1.0, 2.0, 4.0, 8.0],
-            &[],
-        )
-    };
+    let run = || linear_segment_g(&rhs, &[1.0, 0.0], (0.0, 24.0), &[], &[1.0, 2.0, 4.0, 8.0], &[]);
     let bits = |o: Option<(
         Vec<crate::ode::solver::SolPointG<f64>>,
         Vec<crate::ode::solver::SolPointG<f64>>,
     )>| {
-        o.map(|(h, _)| {
-            h.iter()
-                .flat_map(|p| p.u.iter().map(|x| x.to_bits()))
-                .collect::<Vec<_>>()
-        })
+        o.map(|(h, _)| h.iter().flat_map(|p| p.u.iter().map(|x| x.to_bits())).collect::<Vec<_>>())
     };
     let first = bits(run());
     let entries = pooled();
@@ -1484,11 +1318,7 @@ fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
     assert!(pooled_pade_entries::<f64>() > POOL_MAX_ENTRIES);
     // ...and the next segment forgets them all before computing its own.
     run(POOL_MAX_ENTRIES + 5);
-    assert!(
-        pooled_pade_entries::<f64>() <= 2,
-        "{} kept",
-        pooled_pade_entries::<f64>()
-    );
+    assert!(pooled_pade_entries::<f64>() <= 2, "{} kept", pooled_pade_entries::<f64>());
 }
 
 /// Padé only, for the tests of its own machinery (the approximant pool, the workspace): with
@@ -1510,9 +1340,7 @@ impl Drop for PadeOnly {
 /// spectral path served.
 /// The coupling graph of a constant matrix: every nonzero entry ([`spectral`]'s `present`).
 fn nonzero(a: &[f64]) -> u64 {
-    a.iter()
-        .enumerate()
-        .fold(0, |m, (i, &x)| if x != 0.0 { m | (1 << i) } else { m })
+    a.iter().enumerate().fold(0, |m, (i, &x)| if x != 0.0 { m | (1 << i) } else { m })
 }
 
 fn with_spectral<R>(on: bool, f: impl FnOnce() -> R) -> (R, usize) {
@@ -1542,11 +1370,7 @@ fn spectral_segment_equals_pade_in_values_and_jets() {
         })
         .collect();
     let u: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
-    let run = || {
-        linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &saveat, &[])
-            .unwrap()
-            .0
-    };
+    let run = || linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &saveat, &[]).unwrap().0;
     let (sp, hits) = with_spectral(true, run);
     let (pade, pade_hits) = with_spectral(false, run);
     assert!(hits > 0, "the spectral path must have served the segment");
@@ -1583,11 +1407,7 @@ fn spectral_handles_a_zero_eigenvalue() {
     let p = [0.9, 0.25];
     let u0 = [50.0, 0.0, 0.0];
     let saveat = [0.25, 1.0, 4.0, 24.0];
-    let run = || {
-        linear_segment_g::<f64>(&absorbed, &u0, (0.0, 24.0), &p, &saveat, &[])
-            .unwrap()
-            .0
-    };
+    let run = || linear_segment_g::<f64>(&absorbed, &u0, (0.0, 24.0), &p, &saveat, &[]).unwrap().0;
     let (sp, hits) = with_spectral(true, run);
     let (pade, _) = with_spectral(false, run);
     assert!(hits > 0);
@@ -1618,11 +1438,7 @@ fn spectral_declines_repeated_and_complex_spectra() {
         };
         let p = [0.7, 2.0];
         let u0: Vec<f64> = (0..n).map(|i| 10.0 + i as f64).collect();
-        let run = || {
-            linear_segment_g::<f64>(rhs, &u0, (0.0, 5.0), &p, &[1.0, 5.0], &[])
-                .unwrap()
-                .0
-        };
+        let run = || linear_segment_g::<f64>(rhs, &u0, (0.0, 5.0), &p, &[1.0, 5.0], &[]).unwrap().0;
         let (on, hits) = with_spectral(true, run);
         let (off, _) = with_spectral(false, run);
         assert_eq!(hits, 0, "{name}: the spectral path must decline");
@@ -1663,12 +1479,8 @@ fn the_singleton_precheck_sees_only_acyclic_compartments() {
 /// whether the spectral path served it, and the worst relative gap over values, gradients
 /// and Hessians at every saved time.
 fn spectral_vs_pade_dual2(
-    rhs: &dyn Fn(&[Dual2<2>], &[Dual2<2>], Dual2<2>, &mut [Dual2<2>]),
-    p0: &[f64],
-    seed: [usize; 2],
-    u0: &[f64],
-    span: (f64, f64),
-    saveat: &[f64],
+    rhs: &dyn Fn(&[Dual2<2>], &[Dual2<2>], Dual2<2>, &mut [Dual2<2>]), p0: &[f64],
+    seed: [usize; 2], u0: &[f64], span: (f64, f64), saveat: &[f64],
 ) -> (usize, f64) {
     let p: Vec<Dual2<2>> = p0
         .iter()
@@ -1775,26 +1587,17 @@ fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
             a[i * 5 + j] = du[i];
         }
     }
-    assert!(
-        !repeated_singleton_eigenvalue(&a, nonzero(&a), 5),
-        "the precheck must pass it"
-    );
+    assert!(!repeated_singleton_eigenvalue(&a, nonzero(&a), 5), "the precheck must pass it");
     let lam: Vec<f64> = (0..5).map(|i| -p[i]).collect();
     let full = [(0b11111u8, 0b11111u8); 5];
     let pr = projectors(&a, &lam, &full, 5);
     assert!(pr.iter().all(|x| x.is_finite()));
     let kappa = pr.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-    assert!(
-        kappa > SPECTRAL_MAX_KAPPA,
-        "κ = {kappa:e} must exceed the bound"
-    );
+    assert!(kappa > SPECTRAL_MAX_KAPPA, "κ = {kappa:e} must exceed the bound");
     assert!(spectral_f64(&a, 5, nonzero(&a)).is_none());
     let u0 = [100.0, 0.0, 0.0, 0.0, 0.0];
-    let run = || {
-        linear_segment_g::<f64>(&transit, &u0, (0.0, 6.0), &p, &[1.0, 3.0, 6.0], &[])
-            .unwrap()
-            .0
-    };
+    let run =
+        || linear_segment_g::<f64>(&transit, &u0, (0.0, 6.0), &p, &[1.0, 3.0, 6.0], &[]).unwrap().0;
     let (on, hits) = with_spectral(true, run);
     let (off, _) = with_spectral(false, run);
     assert_eq!(hits, 0);
@@ -1811,26 +1614,16 @@ fn spectral_f64_and_dual_values_are_the_same_bits() {
     let u0 = [100.0, 3.0, 1.0];
     let saveat = [0.5, 1.0, 2.0, 6.0, 10.0];
     let (vf, hf) = with_spectral(true, || {
-        linear_segment_g::<f64>(&two_cpt_depot, &u0, (0.0, 10.0), &p, &saveat, &[])
-            .unwrap()
-            .0
+        linear_segment_g::<f64>(&two_cpt_depot, &u0, (0.0, 10.0), &p, &saveat, &[]).unwrap().0
     });
     let pd: Vec<Dual2<2>> = p
         .iter()
         .enumerate()
-        .map(|(i, &v)| {
-            if i < 2 {
-                Dual2::<2>::var(v, i)
-            } else {
-                Dual2::<2>::from_f64(v)
-            }
-        })
+        .map(|(i, &v)| if i < 2 { Dual2::<2>::var(v, i) } else { Dual2::<2>::from_f64(v) })
         .collect();
     let ud: Vec<Dual2<2>> = u0.iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
     let (vd, hd) = with_spectral(true, || {
-        linear_segment_g(&two_cpt_depot, &ud, (0.0, 10.0), &pd, &saveat, &[])
-            .unwrap()
-            .0
+        linear_segment_g(&two_cpt_depot, &ud, (0.0, 10.0), &pd, &saveat, &[]).unwrap().0
     });
     assert!(hf > 0 && hd > 0, "both runs must take the spectral path");
     for (a, b) in vf.iter().zip(&vd) {
@@ -1872,11 +1665,7 @@ fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
     for z in [-1.7, -0.3, 0.0, 1e-9, 0.8, 1.99] {
         let g0 = exprel_derivs(z, 0)[0];
         for orders in 1..=4 {
-            assert_eq!(
-                exprel_derivs(z, orders)[0].to_bits(),
-                g0.to_bits(),
-                "z = {z}"
-            );
+            assert_eq!(exprel_derivs(z, orders)[0].to_bits(), g0.to_bits(), "z = {z}");
         }
     }
     for z in [-2.0, 2.0] {
@@ -1886,10 +1675,7 @@ fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
             let (a, b) = (below[m], above[m]);
             assert!(a.is_finite() && b.is_finite());
             // Measured ≤ 1.1e-13 (g⁗'s closed form, ~2 digits lost); 1e-11 bounds it.
-            assert!(
-                (a - b).abs() <= 1e-11 * b.abs(),
-                "z = {z}, order {m}: {a} vs {b}"
-            );
+            assert!((a - b).abs() <= 1e-11 * b.abs(), "z = {z}, order {m}: {a} vs {b}");
         }
     }
     // g(0) = 1, g′(0) = 1/2, …, g⁽ᵐ⁾(0) = 1/(m + 1).
@@ -1904,16 +1690,10 @@ fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
 /// through it, and must read what the recorder and the dual runs read.
 #[test]
 fn exprel_k_is_exprel_derivs_order_for_order() {
-    for z in [
-        -800.0, -40.0, -2.5, -2.0, -1.7, -0.3, 0.0, 1e-9, 0.8, 1.99, 2.0, 2.01, 7.0,
-    ] {
+    for z in [-800.0, -40.0, -2.5, -2.0, -1.7, -0.3, 0.0, 1e-9, 0.8, 1.99, 2.0, 2.01, 7.0] {
         let all = exprel_derivs(z, 4);
         for (m, want) in all.iter().enumerate() {
-            assert_eq!(
-                exprel_k(z, m).to_bits(),
-                want.to_bits(),
-                "z = {z}, order {m}"
-            );
+            assert_eq!(exprel_k(z, m).to_bits(), want.to_bits(), "z = {z}, order {m}");
         }
         // Order 0 is `expm1(z)/z` past the series, whichever orders are asked for (it reads
         // no `eᶻ`, so asking for it alone computes none): one value for the `f64` run and a
@@ -1941,14 +1721,8 @@ fn a_zero_valued_rate_with_a_derivative_is_a_coupling() {
         du[1] = p[0] * u[0] - p[2] * u[1];
     }
     let saveat = [0.5, 2.0, 6.0];
-    let (hits, worst) = spectral_vs_pade_dual2(
-        &back,
-        &[1.2, 0.0, 0.3],
-        [0, 1],
-        &[100.0, 5.0],
-        (0.0, 6.0),
-        &saveat,
-    );
+    let (hits, worst) =
+        spectral_vs_pade_dual2(&back, &[1.2, 0.0, 0.3], [0, 1], &[100.0, 5.0], (0.0, 6.0), &saveat);
     assert!(hits > 0, "the spectral path must serve the segment");
     // Measured 1.4e-13; 1e-12 keeps ~7× headroom. (With the graph read from values, the
     // gap was 0.998: ∂depot/∂KBACK read 0.)
@@ -1956,21 +1730,10 @@ fn a_zero_valued_rate_with_a_derivative_is_a_coupling() {
     let p: Vec<Dual2<2>> = [1.2, 0.0, 0.3]
         .iter()
         .enumerate()
-        .map(|(i, &v)| {
-            if i < 2 {
-                Dual2::<2>::var(v, i)
-            } else {
-                Dual2::<2>::from_f64(v)
-            }
-        })
+        .map(|(i, &v)| if i < 2 { Dual2::<2>::var(v, i) } else { Dual2::<2>::from_f64(v) })
         .collect();
-    let u: Vec<Dual2<2>> = [100.0, 5.0]
-        .iter()
-        .map(|&v| Dual2::<2>::from_f64(v))
-        .collect();
-    let r = linear_segment_g(&back, &u, (0.0, 6.0), &p, &saveat, &[])
-        .unwrap()
-        .0;
+    let u: Vec<Dual2<2>> = [100.0, 5.0].iter().map(|&v| Dual2::<2>::from_f64(v)).collect();
+    let r = linear_segment_g(&back, &u, (0.0, 6.0), &p, &saveat, &[]).unwrap().0;
     assert!(r[1].u[0].grad[1].abs() > 1.0, "∂depot/∂KBACK must be live");
 }
 
@@ -1985,20 +1748,11 @@ fn spectral_carries_every_jet_order_to_four() {
     let p: Vec<T4> = base
         .iter()
         .enumerate()
-        .map(|(i, &v)| {
-            if i == 2 {
-                T4::var(v, 0)
-            } else {
-                T4::from_f64(v)
-            }
-        })
+        .map(|(i, &v)| if i == 2 { T4::var(v, 0) } else { T4::from_f64(v) })
         .collect();
     let u: Vec<T4> = [100.0, 3.0, 1.0].iter().map(|&v| T4::from_f64(v)).collect();
-    let run = || {
-        linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &[0.5, 2.0, 10.0], &[])
-            .unwrap()
-            .0
-    };
+    let run =
+        || linear_segment_g(&two_cpt_depot, &u, (0.0, 10.0), &p, &[0.5, 2.0, 10.0], &[]).unwrap().0;
     let (sp, hits) = with_spectral(true, run);
     let (pade, _) = with_spectral(false, run);
     assert!(hits > 0, "the spectral path must serve the segment");
@@ -2012,9 +1766,7 @@ fn spectral_carries_every_jet_order_to_four() {
         }
     }
     // The order-4 coefficient must be live, or the comparison says nothing about it.
-    assert!(pade
-        .iter()
-        .any(|pt| pt.u.iter().any(|x| x.c[4].abs() > 1e-6)));
+    assert!(pade.iter().any(|pt| pt.u.iter().any(|x| x.c[4].abs() > 1e-6)));
     // Measured 1.5e-12 (3 chord steps instead of 5: 1.37); 1e-11 keeps ~6.6× headroom.
     assert!(worst < 1e-11, "order-4 Taylor: worst {worst:.2e}");
 }
@@ -2024,21 +1776,11 @@ fn spectral_carries_every_jet_order_to_four() {
 /// the naive sum; a complex pair declines.
 #[test]
 fn eigenvalues_2x2_solve_the_characteristic_polynomial() {
-    for (a, b, c, d) in [
-        (-1.3, 0.4, 0.9, -0.5),
-        (-1e4, 1.0, 1.0, -1e-4),
-        (2.0, 1.0, 3.0, 5.0),
-    ] {
+    for (a, b, c, d) in [(-1.3, 0.4, 0.9, -0.5), (-1e4, 1.0, 1.0, -1e-4), (2.0, 1.0, 3.0, 5.0)] {
         let (l0, l1) = super::eigenvalues_2x2(a, b, c, d).expect("real spectrum");
         let (tr, det) = (a + d, a * d - b * c);
-        assert!(
-            (l0 + l1 - tr).abs() <= 1e-13 * tr.abs().max(1.0),
-            "trace {a} {d}"
-        );
-        assert!(
-            (l0 * l1 - det).abs() <= 1e-13 * det.abs().max(1e-300),
-            "det {a} {d}"
-        );
+        assert!((l0 + l1 - tr).abs() <= 1e-13 * tr.abs().max(1.0), "trace {a} {d}");
+        assert!((l0 * l1 - det).abs() <= 1e-13 * det.abs().max(1e-300), "det {a} {d}");
     }
     assert!(super::eigenvalues_2x2(0.0, 1.0, -1.0, 0.0).is_none());
 }

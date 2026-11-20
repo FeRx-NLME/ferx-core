@@ -114,11 +114,8 @@ fn ferx_core_does_not_depend_on_the_layers_above_it() {
     // Comments are prose, not dependencies. `exclude`/`[features]` are an
     // obvious place to explain why `crates/` needs no entry, and a bare
     // substring match would read that explanation as a forbidden dependency.
-    let package_code = package_section
-        .lines()
-        .map(strip_toml_comment)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let package_code =
+        package_section.lines().map(strip_toml_comment).collect::<Vec<_>>().join("\n");
 
     for forbidden in ["ferx-tools", "ferx-cli"] {
         assert!(
@@ -163,9 +160,7 @@ fn scannable_files(root: &Path) -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(|s| root.join(s))
         .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| SCANNED_EXTENSIONS.contains(&e))
+            p.extension().and_then(|e| e.to_str()).is_some_and(|e| SCANNED_EXTENSIONS.contains(&e))
         })
         .collect()
 }
@@ -297,52 +292,30 @@ fn invocation_classifier_excuses_the_explicit_form() {
     // Broken: the root package no longer has a `ferx` bin, and a package-less
     // run passing arguments through `--` resolves against the root package.
     assert!(is_broken_ferx_invocation(&format!("{build} {bin}")));
-    assert!(is_broken_ferx_invocation(&format!(
-        "{run} -- examples/warfarin.ferx"
-    )));
+    assert!(is_broken_ferx_invocation(&format!("{run} -- examples/warfarin.ferx")));
     // Member-scoped, but the feature belongs to `ferx-core` and is unqualified.
-    assert!(is_broken_ferx_invocation(&format!(
-        "{run} {pkg} --features ci -- model.ferx"
-    )));
+    assert!(is_broken_ferx_invocation(&format!("{run} {pkg} --features ci -- model.ferx")));
 
     // Correct, and must NOT be flagged. Naming the bin alongside the package is
     // redundant but legal, and it is the most explicit form a reader can write.
-    assert!(!is_broken_ferx_invocation(&format!(
-        "{run} {pkg} {bin} -- model.ferx"
-    )));
-    assert!(!is_broken_ferx_invocation(&format!(
-        "{run} {pkg} -- model.ferx"
-    )));
+    assert!(!is_broken_ferx_invocation(&format!("{run} {pkg} {bin} -- model.ferx")));
+    assert!(!is_broken_ferx_invocation(&format!("{run} {pkg} -- model.ferx")));
     // A bin that genuinely stayed in `ferx-core`.
-    assert!(!is_broken_ferx_invocation(&format!(
-        "{run} --bin generate_data -- out.csv"
-    )));
+    assert!(!is_broken_ferx_invocation(&format!("{run} --bin generate_data -- out.csv")));
     // Another workspace member, selected explicitly: correct for the same
     // reason `-p ferx-cli` is, and the guard must not read "not the CLI" as
     // "no package" (#1163).
-    assert!(!is_broken_ferx_invocation(
-        "cargo run -p docs-lint -- --check"
-    ));
-    assert!(!is_broken_ferx_invocation(
-        "cargo run --package docs-lint -- --update-baseline"
-    ));
+    assert!(!is_broken_ferx_invocation("cargo run -p docs-lint -- --check"));
+    assert!(!is_broken_ferx_invocation("cargo run --package docs-lint -- --update-baseline"));
     // A `-p` that belongs to the PROGRAM, not to cargo, selects no package and
     // must stay flagged — otherwise the excusal above swallows exactly the
     // invocation shape this guard exists to catch (#1114).
-    assert!(is_broken_ferx_invocation(&format!(
-        "{run} -- model.ferx -p 8"
-    )));
-    assert!(is_broken_ferx_invocation(&format!(
-        "{run} -- model.ferx --package foo"
-    )));
+    assert!(is_broken_ferx_invocation(&format!("{run} -- model.ferx -p 8")));
+    assert!(is_broken_ferx_invocation(&format!("{run} -- model.ferx --package foo")));
     // Features qualified for a member-scoped build.
-    assert!(!is_broken_ferx_invocation(&format!(
-        "{build} {pkg} --features ferx-core/ci"
-    )));
+    assert!(!is_broken_ferx_invocation(&format!("{build} {pkg} --features ferx-core/ci")));
     // Prose that merely mentions the binary.
-    assert!(!is_broken_ferx_invocation(
-        "the ferx binary reads a .ferx model file"
-    ));
+    assert!(!is_broken_ferx_invocation("the ferx binary reads a .ferx model file"));
 }
 
 #[test]
@@ -426,10 +399,7 @@ fn derive_list_names_default(attrs: &str) -> bool {
             }
         }
         let inner = &after[..end];
-        if inner
-            .split(',')
-            .any(|t| matches!(t.trim(), "Default" | "core::default::Default"))
-        {
+        if inner.split(',').any(|t| matches!(t.trim(), "Default" | "core::default::Default")) {
             return true;
         }
         rest = &after[end.min(after.len())..];
@@ -440,9 +410,7 @@ fn derive_list_names_default(attrs: &str) -> bool {
 /// Identifier starting at the front of `s`, or `None` if `s` does not start
 /// with one.
 fn leading_ident(s: &str) -> Option<&str> {
-    let end = s
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .unwrap_or(s.len());
+    let end = s.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(s.len());
     (end > 0).then(|| &s[..end])
 }
 
@@ -459,9 +427,8 @@ fn scan_options_decls(src: &str) -> Vec<OptionsDecl> {
     let mut out = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        let after_kind = trimmed
-            .strip_prefix("pub struct ")
-            .or_else(|| trimmed.strip_prefix("pub enum "));
+        let after_kind =
+            trimmed.strip_prefix("pub struct ").or_else(|| trimmed.strip_prefix("pub enum "));
         let Some(after_kind) = after_kind else {
             continue;
         };
@@ -540,10 +507,7 @@ fn every_public_options_type_implements_default() {
     let mut sources = Vec::new();
     rust_sources_skipping_target(&root.join("src"), &mut sources);
     rust_sources_skipping_target(&root.join("crates"), &mut sources);
-    assert!(
-        !sources.is_empty(),
-        "found no sources under src/ or crates/"
-    );
+    assert!(!sources.is_empty(), "found no sources under src/ or crates/");
 
     let mut decls: Vec<(PathBuf, OptionsDecl)> = Vec::new();
     let mut manual_impls: Vec<String> = Vec::new();
@@ -574,15 +538,11 @@ fn every_public_options_type_implements_default() {
         assert!(found(anchor), "the scan did not find `{anchor}`");
     }
     assert!(
-        decls
-            .iter()
-            .any(|(_, d)| d.name == "SimulateOptions" && d.derives_default),
+        decls.iter().any(|(_, d)| d.name == "SimulateOptions" && d.derives_default),
         "`SimulateOptions` derives `Default`; the derive arm of the scan is broken"
     );
     assert!(
-        decls
-            .iter()
-            .any(|(_, d)| d.name == "FitOptions" && !d.derives_default),
+        decls.iter().any(|(_, d)| d.name == "FitOptions" && !d.derives_default),
         "`FitOptions` implements `Default` by hand, not by derive; \
          the scan is reading a derive that is not there"
     );
@@ -667,12 +627,7 @@ pub struct Something {
     let names: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(
         names,
-        vec![
-            "ForgottenOptions",
-            "DerivedOptions",
-            "ManualOptions",
-            "SplitDeriveOptions"
-        ],
+        vec!["ForgottenOptions", "DerivedOptions", "ManualOptions", "SplitDeriveOptions"],
         "the scan must find every `pub *Options` declaration and nothing else"
     );
 
@@ -698,10 +653,7 @@ pub struct Something {
         "#[derive(Debug, Clone)]\npub struct ForgottenOptions",
         "#[derive(Debug, Clone, Default)]\npub struct ForgottenOptions",
     );
-    assert_ne!(
-        fixed, FIXTURE,
-        "the mutation must actually change the source"
-    );
+    assert_ne!(fixed, FIXTURE, "the mutation must actually change the source");
     let manual_fixed = scan_manual_default_impls(&fixed);
     let still_flagged: Vec<String> = scan_options_decls(&fixed)
         .into_iter()
@@ -719,9 +671,7 @@ pub struct Something {
 #[test]
 fn derive_list_matches_default_exactly() {
     assert!(derive_list_names_default("#[derive(Debug, Default)]"));
-    assert!(derive_list_names_default(
-        "#[derive(Debug,\n Default,\n Clone)]"
-    ));
+    assert!(derive_list_names_default("#[derive(Debug,\n Default,\n Clone)]"));
     assert!(!derive_list_names_default("#[derive(Debug, Clone)]"));
     // A trait whose name merely starts with `Default`.
     assert!(!derive_list_names_default("#[derive(DefaultDisplay)]"));

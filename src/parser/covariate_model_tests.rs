@@ -51,9 +51,7 @@ fn err(covariates: &str, covariate_model: &str) -> String {
 /// `parse_full_model`'s error, with the `Ok` side dropped — `ParsedModel` holds
 /// closures and so is not `Debug`, which `expect_err` would require.
 fn parse_err(text: &str) -> String {
-    parse_full_model(text)
-        .map(|_| ())
-        .expect_err("model should be rejected")
+    parse_full_model(text).map(|_| ()).expect_err("model should be rejected")
 }
 
 /// The desugared `CL = ...` line.
@@ -75,10 +73,7 @@ fn power_generates_the_classical_allometric_factor() {
         cl_line(&s),
         "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
     );
-    assert_eq!(
-        s.generated_thetas,
-        vec!["  theta THETA_CL_WT(0.001, -100, 1000000)"]
-    );
+    assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_WT(0.001, -100, 1000000)"]);
 }
 
 #[test]
@@ -116,10 +111,7 @@ fn hockey_generates_two_slopes_around_the_breakpoint() {
 
 #[test]
 fn categorical_contrasts_every_non_reference_level() {
-    let s = spec(
-        "  SEX categorical(levels = [0, 1, 2])",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
+    let s = spec("  SEX categorical(levels = [0, 1, 2])", "  CL ~ SEX categorical(ref = 0)");
     assert_eq!(
         cl_line(&s),
         "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + THETA_CL_SEX_1 else \
@@ -128,10 +120,7 @@ fn categorical_contrasts_every_non_reference_level() {
     // PsN's categorical θ is null at zero, so the bounds straddle it.
     assert_eq!(
         s.generated_thetas,
-        vec![
-            "  theta THETA_CL_SEX_1(-0.001, -1, 5)",
-            "  theta THETA_CL_SEX_2(-0.001, -1, 5)",
-        ]
+        vec!["  theta THETA_CL_SEX_1(-0.001, -1, 5)", "  theta THETA_CL_SEX_2(-0.001, -1, 5)",]
     );
 }
 
@@ -139,10 +128,7 @@ fn categorical_contrasts_every_non_reference_level() {
 fn categorical2_is_the_factor_itself_not_an_offset() {
     // #1312: Pharmpy MFL's `cat2`. Same θ count and the same reference branch
     // as `categorical`; the non-reference branch is `θ_k`, not `1 + θ_k`.
-    let s = spec(
-        "  SEX categorical(levels = [0, 1, 2])",
-        "  CL ~ SEX categorical2(ref = 0)",
-    );
+    let s = spec("  SEX categorical(levels = [0, 1, 2])", "  CL ~ SEX categorical2(ref = 0)");
     assert_eq!(
         cl_line(&s),
         "CL = TVCL * (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else \
@@ -150,24 +136,13 @@ fn categorical2_is_the_factor_itself_not_an_offset() {
     );
     // The θ names and level suffixes are the `categorical` scheme unchanged —
     // only the shape moved.
-    let cat = spec(
-        "  SEX categorical(levels = [0, 1, 2])",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
+    let cat = spec("  SEX categorical(levels = [0, 1, 2])", "  CL ~ SEX categorical(ref = 0)");
     let names = |s: &CovariateModelSpec| -> Vec<String> {
-        s.relations[0]
-            .thetas
-            .iter()
-            .map(|t| t.name.clone())
-            .collect()
+        s.relations[0].thetas.iter().map(|t| t.name.clone()).collect()
     };
     assert_eq!(names(&s), names(&cat));
     assert_eq!(
-        s.relations[0]
-            .thetas
-            .iter()
-            .map(|t| t.level)
-            .collect::<Vec<_>>(),
+        s.relations[0].thetas.iter().map(|t| t.level).collect::<Vec<_>>(),
         vec![Some(1.0), Some(2.0)]
     );
 }
@@ -179,34 +154,19 @@ fn categorical2_takes_its_own_init_and_bounds_not_categoricals() {
     // are the image of (−1, 5) under θ₂ = 1 + θ₁, which is also Pharmpy's
     // `cat2` pair verbatim; the init is the image of ferx's own −0.001, so
     // the two forms start at the identical model.
-    let s = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical2(ref = 0)",
-    );
-    assert_eq!(
-        s.generated_thetas,
-        vec!["  theta THETA_CL_SEX_1(0.999, 0, 6)"]
-    );
+    let s = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(ref = 0)");
+    assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_SEX_1(0.999, 0, 6)"]);
     // Explicitly *not* the `categorical` defaults — a fallthrough to that arm
     // would emit these instead.
-    let cat = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
-    assert_eq!(
-        cat.generated_thetas,
-        vec!["  theta THETA_CL_SEX_1(-0.001, -1, 5)"]
-    );
+    let cat = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 0)");
+    assert_eq!(cat.generated_thetas, vec!["  theta THETA_CL_SEX_1(-0.001, -1, 5)"]);
     assert_ne!(s.generated_thetas, cat.generated_thetas);
 }
 
 #[test]
 fn categorical2_answers_to_ref_and_to_the_categorical_kind_check() {
     // `ref`, not `center` — the same keyword `categorical` takes.
-    let e = err(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical2(center = 0)",
-    );
+    let e = err("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(center = 0)");
     assert!(e.contains("centres on `ref`"), "{e}");
 
     // A continuous column refuses it, and names the form that was written.
@@ -214,25 +174,16 @@ fn categorical2_answers_to_ref_and_to_the_categorical_kind_check() {
     assert!(e.contains("`categorical2(...)` on `WT`"), "{e}");
 
     // And a categorical column accepts it where a continuous form is refused.
-    let e = err(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX power(center = 0)",
-    );
+    let e = err("  SEX categorical(levels = [0, 1])", "  CL ~ SEX power(center = 0)");
     assert!(e.contains("continuous form"), "{e}");
 }
 
 #[test]
 fn categorical2_needs_levels_and_reports_its_own_name() {
     let e = err("  SEX categorical", "  CL ~ SEX categorical2(ref = 0)");
-    assert!(
-        e.contains("`categorical2(...)` on `SEX` needs its levels"),
-        "{e}"
-    );
+    assert!(e.contains("`categorical2(...)` on `SEX` needs its levels"), "{e}");
 
-    let e = err(
-        "  SEX categorical(levels = [1])",
-        "  CL ~ SEX categorical2(ref = 1)",
-    );
+    let e = err("  SEX categorical(levels = [1])", "  CL ~ SEX categorical2(ref = 1)");
     assert!(e.contains("`CL ~ SEX categorical2(...)`"), "{e}");
     assert!(e.contains("nothing to estimate"), "{e}");
 }
@@ -261,10 +212,7 @@ fn categorical2_and_categorical_agree_at_the_matching_theta() {
     );
     // 1 + 0.25 == 1.25: the non-reference factor is the same number, and the
     // reference branch is `1` in both.
-    assert_eq!(
-        cat.relations[0].thetas[0].init + 1.0,
-        cat2.relations[0].thetas[0].init
-    );
+    assert_eq!(cat.relations[0].thetas[0].init + 1.0, cat2.relations[0].thetas[0].init);
 }
 
 #[test]
@@ -273,14 +221,8 @@ fn fix_on_categorical2_pins_the_factor_not_the_offset() {
     // `fix = 1` is "no effect" for `categorical2` where `fix = 0` is for
     // `categorical`. Nothing in the block reinterprets the number, and this
     // pins that it does not.
-    let s = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical2(ref = 0, fix = 1)",
-    );
-    assert_eq!(
-        s.generated_thetas,
-        vec!["  theta THETA_CL_SEX_1(1, 0, 6) FIX"]
-    );
+    let s = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(ref = 0, fix = 1)");
+    assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_SEX_1(1, 0, 6) FIX"]);
     assert_eq!(
         cl_line(&s),
         "CL = TVCL * (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else 1) else 1.0) \
@@ -301,19 +243,13 @@ fn none_declares_no_theta_and_leaves_the_expression_alone() {
 #[test]
 fn expr_is_emitted_verbatim() {
     let s = spec("  WT continuous", "  CL ~ WT expr(\"(WT/70)^0.75\")");
-    assert_eq!(
-        cl_line(&s),
-        "CL = TVCL * (if (present(WT)) ((WT/70)^0.75) else 1.0) * exp(ETA_CL)"
-    );
+    assert_eq!(cl_line(&s), "CL = TVCL * (if (present(WT)) ((WT/70)^0.75) else 1.0) * exp(ETA_CL)");
     assert!(s.generated_thetas.is_empty());
 }
 
 #[test]
 fn linear_relative_is_dimensionless_in_theta() {
-    let s = spec(
-        "  WT continuous",
-        "  CL ~ WT linear_relative(center = 70) => T(0.1, -1, 1)",
-    );
+    let s = spec("  WT continuous", "  CL ~ WT linear_relative(center = 70) => T(0.1, -1, 1)");
     assert_eq!(
         cl_line(&s),
         "CL = TVCL * (if (present(WT)) (1 + T * (WT / 70 - 1)) else 1.0) * exp(ETA_CL)"
@@ -322,14 +258,8 @@ fn linear_relative_is_dimensionless_in_theta() {
 
 #[test]
 fn fix_pins_the_theta_and_declares_it_fix() {
-    let s = spec(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70, fix = 0.75)",
-    );
-    assert_eq!(
-        s.generated_thetas,
-        vec!["  theta THETA_CL_WT(0.75, -100, 1000000) FIX"]
-    );
+    let s = spec("  WT continuous", "  CL ~ WT power(center = 70, fix = 0.75)");
+    assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_WT(0.75, -100, 1000000) FIX"]);
 }
 
 // ── The missing-value guard ────────────────────────────────────────────────
@@ -339,11 +269,8 @@ fn a_missing_covariate_contributes_exactly_one() {
     // The guard is `COV == COV`, which is false for NaN. Without it the factor
     // would be `(NaN/70)^θ`, and a division by a missing value underflows to
     // `0.0` here rather than blowing up — a silent zero, not a loud failure.
-    let parsed = parse_full_model(&model_with(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70)",
-    ))
-    .expect("model should parse");
+    let parsed = parse_full_model(&model_with("  WT continuous", "  CL ~ WT power(center = 70)"))
+        .expect("model should parse");
     let theta_idx = parsed
         .model
         .theta_names
@@ -364,10 +291,7 @@ fn a_missing_covariate_contributes_exactly_one() {
     // At the centring weight the factor is 1, so a missing weight must give the
     // same CL — and, crucially, not 0.
     assert_eq!(missing.values[0], at_centre.values[0]);
-    assert!(
-        missing.values[0] > 0.0,
-        "missing covariate must not zero the parameter"
-    );
+    assert!(missing.values[0] > 0.0, "missing covariate must not zero the parameter");
 }
 
 // ── The insertion point ────────────────────────────────────────────────────
@@ -381,10 +305,7 @@ fn the_factor_lands_before_the_first_eta_bearing_factor() {
     let line = cl_line(&s);
     let factor = line.find("(if (present(WT))").expect("factor is present");
     let eta = line.find("exp(ETA_CL)").expect("η factor is present");
-    assert!(
-        factor < eta,
-        "covariate factor must precede exp(ETA_CL): {line}"
-    );
+    assert!(factor < eta, "covariate factor must precede exp(ETA_CL): {line}");
 }
 
 #[test]
@@ -397,10 +318,7 @@ fn a_parameter_with_no_eta_takes_the_factor_at_the_end() {
         .expect("V is assigned")
         .trim()
         .to_string();
-    assert_eq!(
-        v,
-        "V  = TVV * (if (present(WT)) (WT / 70)^THETA_V_WT else 1.0)"
-    );
+    assert_eq!(v, "V  = TVV * (if (present(WT)) (WT / 70)^THETA_V_WT else 1.0)");
 }
 
 #[test]
@@ -422,10 +340,7 @@ fn a_non_product_right_hand_side_is_a_hard_error() {
         .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL + exp(ETA_CL)");
     let e = parse_err(&text);
     assert!(e.contains("not a top-level product"), "{e}");
-    assert!(
-        e.contains("COV_CL"),
-        "the error must name the explicit handle: {e}"
-    );
+    assert!(e.contains("COV_CL"), "the error must name the explicit handle: {e}");
 }
 
 #[test]
@@ -446,10 +361,8 @@ fn a_conditional_factor_in_a_product_is_a_hard_error() {
     // `if (...) a else b * TVCL` parses as one product whose first part is a
     // conditional: appending the covariate factor would attach it to the `else`
     // branch, not to the parameter.
-    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)").replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CL = if (TVV > 1) 1.2 else 1.0 * TVCL * exp(ETA_CL)",
-    );
+    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)")
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = if (TVV > 1) 1.2 else 1.0 * TVCL * exp(ETA_CL)");
     let e = parse_err(&text);
     assert!(e.contains("not a top-level product"), "{e}");
 }
@@ -460,19 +373,14 @@ fn an_eta_reached_through_an_intermediate_still_takes_the_factor_first() {
     // `CLI` would look η-free and the factor would land after it — the #619
     // placement, silently. The transitive closure over block-local assignments
     // is what keeps it in the non-η group.
-    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)").replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CLI = exp(ETA_CL)\n  CL = TVCL * CLI",
-    );
+    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)")
+        .replace("CL = TVCL * exp(ETA_CL)", "CLI = exp(ETA_CL)\n  CL = TVCL * CLI");
     let s = parse_full_model(&text)
         .expect("model should parse")
         .model
         .covariate_model
         .expect("recorded");
-    assert_eq!(
-        cl_line(&s),
-        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * CLI"
-    );
+    assert_eq!(cl_line(&s), "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * CLI");
 }
 
 #[test]
@@ -497,27 +405,18 @@ fn an_undeclared_covariate_is_an_error() {
 #[test]
 fn a_relation_on_an_unknown_parameter_is_an_error() {
     let e = err("  WT continuous", "  KA ~ WT power(center = 70)");
-    assert!(
-        e.contains("not a top-level [individual_parameters] name"),
-        "{e}"
-    );
+    assert!(e.contains("not a top-level [individual_parameters] name"), "{e}");
 }
 
 #[test]
 fn a_duplicate_parameter_covariate_pair_is_an_error() {
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70)\n  CL ~ WT linear(center = 70)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70)\n  CL ~ WT linear(center = 70)");
     assert!(e.contains("declared more than once"), "{e}");
 }
 
 #[test]
 fn an_explicit_theta_name_that_collides_with_parameters_is_an_error() {
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70) => TVCL(0.5, -1, 1)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70) => TVCL(0.5, -1, 1)");
     assert!(e.contains("already declared in [parameters]"), "{e}");
 }
 
@@ -530,15 +429,7 @@ fn an_auto_theta_name_defers_to_an_existing_declaration() {
         "  theta TVV(40.0, 1.0, 500.0)\n  theta THETA_CL_WT(0.75, 0.1, 1.5)",
     );
     let parsed = parse_full_model(&text).expect("model should parse");
-    assert_eq!(
-        parsed
-            .model
-            .theta_names
-            .iter()
-            .filter(|n| *n == "THETA_CL_WT")
-            .count(),
-        1
-    );
+    assert_eq!(parsed.model.theta_names.iter().filter(|n| *n == "THETA_CL_WT").count(), 1);
     let s = parsed.model.covariate_model.expect("recorded");
     assert!(s.generated_thetas.is_empty());
 }
@@ -551,10 +442,7 @@ fn a_categorical_form_on_a_continuous_covariate_is_an_error() {
 
 #[test]
 fn a_continuous_form_on_a_categorical_covariate_is_an_error() {
-    let e = err(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX power(center = 1)",
-    );
+    let e = err("  SEX categorical(levels = [0, 1])", "  CL ~ SEX power(center = 1)");
     assert!(e.contains("categorical"), "{e}");
 }
 
@@ -562,18 +450,12 @@ fn a_continuous_form_on_a_categorical_covariate_is_an_error() {
 fn a_categorical_relation_without_levels_is_an_error() {
     let e = err("  SEX categorical", "  CL ~ SEX categorical(ref = 0)");
     assert!(e.contains("needs its levels"), "{e}");
-    assert!(
-        e.contains("levels = auto"),
-        "the error must offer the data-derived opt-in: {e}"
-    );
+    assert!(e.contains("levels = auto"), "the error must offer the data-derived opt-in: {e}");
 }
 
 #[test]
 fn a_reference_level_outside_the_declared_levels_is_an_error() {
-    let e = err(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 2)",
-    );
+    let e = err("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 2)");
     assert!(e.contains("is not one of the declared levels"), "{e}");
 }
 
@@ -597,10 +479,7 @@ fn the_wrong_centring_keyword_for_the_form_is_an_error() {
 
 #[test]
 fn a_theta_clause_of_the_wrong_arity_is_an_error() {
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT hockey(breakpoint = 70) => T_LO(0.01, -1, 1)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT hockey(breakpoint = 70) => T_LO(0.01, -1, 1)");
     assert!(e.contains("generates 2 θ"), "{e}");
 }
 
@@ -624,18 +503,12 @@ fn declared_levels_are_read_off_the_covariates_block() {
     ))
     .expect("model should parse");
     let decls = parsed.covariate_decls.expect("declared");
-    assert_eq!(
-        decls[0].levels,
-        Some(crate::types::CovariateLevels::Declared(vec![0.0, 1.0]))
-    );
+    assert_eq!(decls[0].levels, Some(crate::types::CovariateLevels::Declared(vec![0.0, 1.0])));
 }
 
 #[test]
 fn auto_levels_leave_the_relation_unresolved() {
-    let s = spec(
-        "  SEX categorical(levels = auto)",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
+    let s = spec("  SEX categorical(levels = auto)", "  CL ~ SEX categorical(ref = 0)");
     assert_eq!(s.unresolved().len(), 1);
     assert!(s.generated_thetas.is_empty());
 }
@@ -644,10 +517,7 @@ fn auto_levels_leave_the_relation_unresolved() {
 fn a_single_level_categorical_says_it_has_no_contrast() {
     // One level spends zero θ, which `needs_data()` would otherwise read as
     // *unresolved* — sending the user to `--data`, which can never help.
-    let e = err(
-        "  SEX categorical(levels = [1])",
-        "  CL ~ SEX categorical(ref = 1)",
-    );
+    let e = err("  SEX categorical(levels = [1])", "  CL ~ SEX categorical(ref = 1)");
     assert!(e.contains("has nothing to estimate"), "{e}");
     assert!(e.contains("`SEX` has 1 level (1)"), "{e}");
     assert!(
@@ -666,14 +536,8 @@ fn fix_on_a_form_that_declares_no_theta_is_an_error() {
 
 #[test]
 fn levels_on_a_continuous_covariate_is_an_error() {
-    let e = err(
-        "  WT continuous(levels = [0, 1])",
-        "  CL ~ WT power(center = 70)",
-    );
-    assert!(
-        e.contains("only meaningful for a categorical covariate"),
-        "{e}"
-    );
+    let e = err("  WT continuous(levels = [0, 1])", "  CL ~ WT power(center = 70)");
+    assert!(e.contains("only meaningful for a categorical covariate"), "{e}");
 }
 
 // ── Text helpers ───────────────────────────────────────────────────────────
@@ -698,10 +562,8 @@ fn a_commented_assignment_desugars_on_its_expression_alone() {
     // split here never carries one. Pinned because that split is
     // parenthesis-aware, not comment-aware: were comments ever preserved, a `#`
     // would silently become part of the last factor.
-    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)").replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CL = TVCL * exp(ETA_CL)   # allometric on purpose",
-    );
+    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)")
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL)   # allometric on purpose");
     let s = parse_full_model(&text)
         .expect("model should parse")
         .model
@@ -722,10 +584,7 @@ fn a_parameter_assigned_only_inside_a_conditional_is_not_addressable() {
         "if (WT > 70) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL\n  }",
     );
     let e = parse_err(&text);
-    assert!(
-        e.contains("not a top-level [individual_parameters] name"),
-        "{e}"
-    );
+    assert!(e.contains("not a top-level [individual_parameters] name"), "{e}");
 }
 
 #[test]
@@ -733,14 +592,8 @@ fn a_kappa_bearing_factor_counts_as_a_random_effect_factor() {
     // IOV κ is a random effect too: the covariate factor belongs before it, for
     // the same mu-referencing reason as η.
     let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)")
-        .replace(
-            "  omega ETA_CL ~ 0.09",
-            "  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.05",
-        )
-        .replace(
-            "CL = TVCL * exp(ETA_CL)",
-            "CL = TVCL * exp(ETA_CL) * exp(KAPPA_CL)",
-        );
+        .replace("  omega ETA_CL ~ 0.09", "  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.05")
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL) * exp(KAPPA_CL)");
     let s = parse_full_model(&text)
         .expect("model should parse")
         .model
@@ -885,20 +738,14 @@ fn a_centring_value_that_is_neither_a_number_nor_a_statistic_is_an_error() {
 
 #[test]
 fn a_repeated_keyword_argument_is_an_error() {
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70, center = 80)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70, center = 80)");
     assert!(e.contains("is given more than once"), "{e}");
 }
 
 #[test]
 fn a_symbolic_fix_value_is_an_error() {
     // `fix` pins θ at a number; a data-derived statistic is not one.
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70, fix = median)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70, fix = median)");
     assert!(e.contains("`fix` takes a number"), "{e}");
 }
 
@@ -920,22 +767,13 @@ fn a_non_finite_literal_centre_is_an_error() {
 
 #[test]
 fn a_malformed_theta_clause_is_an_error() {
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70) => THETA_WT",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70) => THETA_WT");
     assert!(e.contains("expected `=> NAME(init, lower, upper)`"), "{e}");
 
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70) => T(0.75, low, 10)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, low, 10)");
     assert!(e.contains("`low` is not a number"), "{e}");
 
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70) => T(0.75, -10)",
-    );
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, -10)");
     assert!(e.contains("needs exactly (init, lower, upper)"), "{e}");
 
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => ");
@@ -950,19 +788,15 @@ fn pk_values(model_text: &str, thetas: &[(&str, f64)], covariates: &[(&str, f64)
     let parsed = parse_full_model(model_text).expect("model should parse");
     let mut theta = vec![1.0; parsed.model.theta_names.len()];
     for (name, value) in thetas {
-        let i = parsed
-            .model
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("θ `{name}` is declared: {:?}", parsed.model.theta_names));
+        let i =
+            parsed.model.theta_names.iter().position(|n| n == name).unwrap_or_else(|| {
+                panic!("θ `{name}` is declared: {:?}", parsed.model.theta_names)
+            });
         theta[i] = *value;
     }
     let eta = vec![0.0; parsed.model.eta_names.len()];
-    let map: std::collections::HashMap<String, f64> = covariates
-        .iter()
-        .map(|(n, v)| ((*n).to_string(), *v))
-        .collect();
+    let map: std::collections::HashMap<String, f64> =
+        covariates.iter().map(|(n, v)| ((*n).to_string(), *v)).collect();
     (parsed.model.pk_param_fn)(&theta, &eta, &map, 0.0).values[..2].to_vec()
 }
 
@@ -983,14 +817,8 @@ fn the_additive_operator_drops_the_leading_one_from_every_form() {
             "  CL ~ WT linear_relative(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
             "(THETA_CL_WT * (WT / 70 - 1))",
         ),
-        (
-            "  CL ~ WT exponential(center = 70) +",
-            "(exp(THETA_CL_WT * (WT - 70)) - 1)",
-        ),
-        (
-            "  CL ~ WT power(center = 70) +",
-            "((WT / 70)^THETA_CL_WT - 1)",
-        ),
+        ("  CL ~ WT exponential(center = 70) +", "(exp(THETA_CL_WT * (WT - 70)) - 1)"),
+        ("  CL ~ WT power(center = 70) +", "((WT / 70)^THETA_CL_WT - 1)"),
         (
             "  CL ~ WT hockey(breakpoint = 70) + => T_LO(0.01, -1, 1), T_HI(0.02, -1, 1)",
             "(if (WT <= 70) T_LO * (WT - 70) else T_HI * (WT - 70))",
@@ -1013,10 +841,7 @@ fn the_additive_operator_drops_the_leading_one_from_every_form() {
 
 #[test]
 fn an_additive_categorical_contributes_zero_at_the_reference_level() {
-    let s = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 0) +",
-    );
+    let s = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 0) +");
     assert_eq!(
         cl_line(&s),
         "CL = TVCL * exp(ETA_CL) + \
@@ -1024,10 +849,7 @@ fn an_additive_categorical_contributes_zero_at_the_reference_level() {
     );
     // The multiplicative twin on the same form and levels keeps its `1`s: the
     // two templates differ, and one is not the other with a different join.
-    let mul = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
+    let mul = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 0)");
     assert_eq!(
         cl_line(&mul),
         "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + THETA_CL_SEX_1 else 1) else 1.0) \
@@ -1043,19 +865,13 @@ fn an_additive_categorical2_subtracts_its_own_null_not_a_shared_zero() {
     // `1` it carries and lands on a bare `θ_k`. A regression that shares one
     // null across the forms writes the same text for both and turns `cat +`
     // and `cat2 +` into duplicate search candidates.
-    let cat2 = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical2(ref = 0) +",
-    );
+    let cat2 = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(ref = 0) +");
     assert_eq!(
         cl_line(&cat2),
         "CL = TVCL * exp(ETA_CL) + \
          (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 - 1 else 0) else 0.0)"
     );
-    let cat = spec(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 0) +",
-    );
+    let cat = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 0) +");
     assert_ne!(
         cl_line(&cat2),
         cl_line(&cat),
@@ -1065,24 +881,12 @@ fn an_additive_categorical2_subtracts_its_own_null_not_a_shared_zero() {
     // …and `θ_cat2 = 1 + θ_cat` stays an exact reparameterization under `+`,
     // asserted on numbers: the same subject, the same level, one θ apart.
     let tvcl = 4.0;
-    let text2 = model_with(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical2(ref = 0) +",
-    );
-    let text1 = model_with(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 0) +",
-    );
-    let v2 = pk_values(
-        &text2,
-        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)],
-        &[("SEX", 1.0)],
-    );
-    let v1 = pk_values(
-        &text1,
-        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 0.3)],
-        &[("SEX", 1.0)],
-    );
+    let text2 =
+        model_with("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(ref = 0) +");
+    let text1 =
+        model_with("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 0) +");
+    let v2 = pk_values(&text2, &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)], &[("SEX", 1.0)]);
+    let v1 = pk_values(&text1, &[("TVCL", tvcl), ("THETA_CL_SEX_1", 0.3)], &[("SEX", 1.0)]);
     assert!(
         (v2[0] - v1[0]).abs() < 1e-12,
         "θ_cat2 = 1 + θ_cat must give the same CL: {} vs {}",
@@ -1091,24 +895,12 @@ fn an_additive_categorical2_subtracts_its_own_null_not_a_shared_zero() {
     );
     // The effect is live at that level — without this the two agree because
     // both contributed nothing.
-    assert!(
-        (v2[0] - (tvcl + 0.3)).abs() < 1e-12,
-        "expected TVCL + (θ_cat2 - 1), got {}",
-        v2[0]
-    );
+    assert!((v2[0] - (tvcl + 0.3)).abs() < 1e-12, "expected TVCL + (θ_cat2 - 1), got {}", v2[0]);
     // `categorical2`'s null moves with the form: θ = 1, not θ = 0, is "no
     // effect" — and the reference level contributes nothing either way.
-    let null = pk_values(
-        &text2,
-        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.0)],
-        &[("SEX", 1.0)],
-    );
+    let null = pk_values(&text2, &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.0)], &[("SEX", 1.0)]);
     assert_eq!(null[0], tvcl, "θ_cat2 = 1 adds nothing");
-    let reference = pk_values(
-        &text2,
-        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)],
-        &[("SEX", 0.0)],
-    );
+    let reference = pk_values(&text2, &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)], &[("SEX", 0.0)]);
     assert_eq!(reference[0], tvcl, "the reference level adds nothing");
 }
 
@@ -1123,27 +915,15 @@ fn theta_at_zero_and_a_covariate_at_its_centre_are_both_no_effect() {
     );
     let tvcl = 4.0;
 
-    let at_centre = pk_values(
-        &text,
-        &[("TVCL", tvcl), ("THETA_CL_WT", 0.02)],
-        &[("WT", 70.0)],
-    );
+    let at_centre = pk_values(&text, &[("TVCL", tvcl), ("THETA_CL_WT", 0.02)], &[("WT", 70.0)]);
     assert_eq!(at_centre[0], tvcl, "a covariate at its centre adds nothing");
 
-    let theta_zero = pk_values(
-        &text,
-        &[("TVCL", tvcl), ("THETA_CL_WT", 0.0)],
-        &[("WT", 120.0)],
-    );
+    let theta_zero = pk_values(&text, &[("TVCL", tvcl), ("THETA_CL_WT", 0.0)], &[("WT", 120.0)]);
     assert_eq!(theta_zero[0], tvcl, "θ = 0 adds nothing");
 
     // …and the effect is live off-centre, so the two assertions above are not
     // passing because the term was dropped altogether.
-    let off_centre = pk_values(
-        &text,
-        &[("TVCL", tvcl), ("THETA_CL_WT", 0.02)],
-        &[("WT", 120.0)],
-    );
+    let off_centre = pk_values(&text, &[("TVCL", tvcl), ("THETA_CL_WT", 0.02)], &[("WT", 120.0)]);
     assert!(
         (off_centre[0] - (tvcl + 0.02 * 50.0)).abs() < 1e-12,
         "expected TVCL + θ*(120 - 70), got {}",
@@ -1174,21 +954,13 @@ fn the_missing_covariate_guard_is_per_operator_on_one_model() {
         .clone();
     assert!(v.trim().ends_with("else 1.0)"), "{v}");
 
-    let thetas = [
-        ("TVCL", 4.0),
-        ("TVV", 40.0),
-        ("THETA_CL_WT", 0.02),
-        ("THETA_V_WT", 0.75),
-    ];
+    let thetas = [("TVCL", 4.0), ("TVV", 40.0), ("THETA_CL_WT", 0.02), ("THETA_V_WT", 0.75)];
     let missing = pk_values(&text, &thetas, &[("WT", f64::NAN)]);
     // A missing covariate must leave BOTH parameters exactly as they were: a
     // shared `1.0` guard would make CL 5.0 instead of 4.0, and a shared `0.0`
     // guard would zero V.
     assert_eq!(missing[0], 4.0, "additive: a missing covariate must add 0");
-    assert_eq!(
-        missing[1], 40.0,
-        "multiplicative: a missing covariate must multiply by 1"
-    );
+    assert_eq!(missing[1], 40.0, "multiplicative: a missing covariate must multiply by 1");
 }
 
 #[test]
@@ -1269,10 +1041,7 @@ fn a_conditional_right_hand_side_is_parenthesised_before_a_term_is_appended() {
         "  WT continuous",
         "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
     )
-    .replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CL = if (TVV > 1) 1.2 else TVCL * exp(ETA_CL)",
-    );
+    .replace("CL = TVCL * exp(ETA_CL)", "CL = if (TVV > 1) 1.2 else TVCL * exp(ETA_CL)");
     let s = parse_full_model(&text)
         .expect("model should parse")
         .model
@@ -1286,11 +1055,7 @@ fn a_conditional_right_hand_side_is_parenthesised_before_a_term_is_appended() {
 
     // TVV is 40, so the `then` branch is taken and the term must still be
     // added: 1.2 + 0.02*(120 - 70) = 2.2, not 1.2.
-    let v = pk_values(
-        &text,
-        &[("TVV", 40.0), ("THETA_CL_WT", 0.02)],
-        &[("WT", 120.0)],
-    );
+    let v = pk_values(&text, &[("TVV", 40.0), ("THETA_CL_WT", 0.02)], &[("WT", 120.0)]);
     assert!(
         (v[0] - 2.2).abs() < 1e-12,
         "the term must be added to the conditional, not inside its else arm: {}",
@@ -1315,10 +1080,7 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
         mul.model.mu_refs
     );
     assert!(
-        !mul.model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("additive (`+`) [covariate_model]")),
+        !mul.model.parse_warnings.iter().any(|w| w.contains("additive (`+`) [covariate_model]")),
         "no additive warning on a multiplicative model: {:?}",
         mul.model.parse_warnings
     );
@@ -1353,11 +1115,7 @@ fn a_parameter_with_no_eta_gets_no_mu_reference_warning() {
     ))
     .expect("model should parse");
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("additive (`+`) [covariate_model]")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("additive (`+`) [covariate_model]")),
         "{:?}",
         parsed.model.parse_warnings
     );
@@ -1377,10 +1135,7 @@ fn the_operator_token_is_optional_and_explicit_star_is_the_default() {
 
 #[test]
 fn the_operator_is_read_before_the_theta_clause() {
-    let s = spec(
-        "  WT continuous",
-        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.01, -1, 1)",
-    );
+    let s = spec("  WT continuous", "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.01, -1, 1)");
     assert_eq!(s.relations[0].op, CovariateOp::Add);
     assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_WT(0.01, -1, 1)"]);
     assert_eq!(
@@ -1404,9 +1159,7 @@ fn the_two_operators_are_still_one_line_per_pair() {
     // `CL ~ WT linear` and `CL ~ WT linear +` are *competing* models of the
     // same pair, not two effects to be combined — the block's one-line-per-pair
     // rule is what says so, and it must not be read as operator-scoped.
-    let e = err(
-        "  WT continuous",
-        "  CL ~ WT linear(center = 70)\n  CL ~ WT linear(center = 70) +",
-    );
+    let e =
+        err("  WT continuous", "  CL ~ WT linear(center = 70)\n  CL ~ WT linear(center = 70) +");
     assert!(e.contains("declared more than once"), "{e}");
 }

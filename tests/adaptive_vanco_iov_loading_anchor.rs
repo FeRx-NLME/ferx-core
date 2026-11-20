@@ -108,10 +108,7 @@ fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
         "exactly one IOV effect (κ on CL) — the #701/#931 surface under test"
     );
     assert_eq!(parsed.model.n_eta, 1, "one (negligible) BSV η on CL");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 750.0, "empiric maintenance start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
     assert_eq!(
@@ -123,11 +120,7 @@ fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
         spec.auc_target, None,
         "the example declares no auc_target; the window-AUC test adds one (#943)"
     );
-    assert_eq!(
-        spec.at.len(),
-        8,
-        "8 daily maintenance decisions, t = 24..=192 h"
-    );
+    assert_eq!(spec.at.len(), 8, "8 daily maintenance decisions, t = 24..=192 h");
     assert_eq!(spec.levels, None, "continuous (percentage) titration");
     assert_eq!(spec.rules.len(), 2, "increase / decrease rungs");
 
@@ -156,11 +149,7 @@ fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
     )
     .expect("adaptive IOV-loading sim runs and passes the default verifiers");
     assert_eq!(res.decisions.len(), 8, "one decision per day");
-    assert_eq!(
-        res.ledger.len(),
-        8,
-        "every decision issued a maintenance dose"
-    );
+    assert_eq!(res.ledger.len(), 8, "every decision issued a maintenance dose");
     assert!(
         res.ledger.iter().all(|e| e.amt != LOADING_DOSE_MG),
         "the loading dose is a base dose, not a reactive ledger entry"
@@ -171,10 +160,7 @@ fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
 fn vanco_iov_loading_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov_loading.ferx"))
         .expect("vanco IOV-loading model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
     let pop = read_nonmem_csv(
         Path::new("tests/reference/vanco_iov_loading_mrgsolve/vanco_iov_loading_subject.csv"),
         None,
@@ -199,11 +185,7 @@ fn vanco_iov_loading_titration_matches_mrgsolve() {
     // Eight maintenance decisions, each dosed (no hold/stop here). The loading dose is a BASE
     // dose — it drives the trajectory but never enters the reactive ledger.
     assert_eq!(res.decisions.len(), 8, "one decision per day, t = 24..=192");
-    assert_eq!(
-        res.ledger.len(),
-        8,
-        "every decision issued a maintenance dose"
-    );
+    assert_eq!(res.ledger.len(), 8, "every decision issued a maintenance dose");
     assert!(
         res.ledger.iter().all(|e| e.amt != LOADING_DOSE_MG),
         "the loading dose is a base dose, not a reactive ledger entry"
@@ -211,11 +193,8 @@ fn vanco_iov_loading_titration_matches_mrgsolve() {
 
     // The #931 assertion: the day-1 trough is the loading dose decayed under occasion 0's CL, not
     // ~0 and not the baseline-κ value. A dropped or κ=0-frozen base regimen fails this.
-    let first_trough = res.decisions[0]
-        .observed_signals
-        .first()
-        .map(|s| s.value)
-        .unwrap_or(f64::NAN);
+    let first_trough =
+        res.decisions[0].observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
     assert!(
         first_trough > 5.0,
         "day-1 trough {first_trough:.6} must reflect the integrated loading dose (>5 mg/L); \
@@ -228,11 +207,7 @@ fn vanco_iov_loading_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - trough_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
@@ -299,10 +274,7 @@ fn vanco_iov_loading_titration_matches_mrgsolve() {
     );
 
     // The example declares no `auc_target`, so no exposure metric is reported.
-    assert_eq!(
-        m.auc_target_attainment, None,
-        "no auc_target on the IOV-loading example"
-    );
+    assert_eq!(m.auc_target_attainment, None, "no auc_target on the IOV-loading example");
 
     // The per-occasion κ genuinely swings the troughs: the trajectory is not the degenerate
     // constant-CL one, so the anchor actually exercises the IOV mechanism rather than trivially
@@ -323,9 +295,8 @@ fn vanco_iov_loading_titration_matches_mrgsolve() {
 /// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
 /// `tests/reference/vanco_iov_loading_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
 /// start of each window, integrated on the same piecewise-constant CL as the troughs above.
-const REF_AUC24: [f64; 7] = [
-    272.193121, 253.330123, 363.439398, 594.316285, 468.198058, 490.444398, 508.391939,
-];
+const REF_AUC24: [f64; 7] =
+    [272.193121, 253.330123, 363.439398, 594.316285, 468.198058, 490.444398, 508.391939];
 
 /// Relative band of each ferx AUC24 against mrgsolve's (#943), the band the constant-path vanco
 /// anchor used before it moved to η = 0 (#2580). Measured on Linux aarch64
@@ -349,10 +320,7 @@ fn vanco_iov_loading_window_aucs_match_mrgsolve() {
 fn windows_in(band: (f64, f64)) -> usize {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov_loading.ferx"))
         .expect("model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     spec.auc_target = Some(band);
     let pop = read_nonmem_csv(
         Path::new("tests/reference/vanco_iov_loading_mrgsolve/vanco_iov_loading_subject.csv"),

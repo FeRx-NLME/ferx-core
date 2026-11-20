@@ -15,7 +15,6 @@
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
-use std::collections::HashMap;
 
 /// Set in the child process, where this test runs the fit instead of spawning.
 const CHILD_ENV: &str = "FERX_QUIET_FIT_CHILD";
@@ -24,57 +23,20 @@ const CHILD_ENV: &str = "FERX_QUIET_FIT_CHILD";
 const TEST_PATH: &str = "api::quiet_fit_tests::a_quiet_fit_writes_nothing_to_stdout_or_stderr";
 
 fn model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
+    parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse")
 }
 
 fn subject(id: &str, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| scale * 10.0 / (1.0 + t)).collect();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1, 1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -183,14 +145,7 @@ fn a_quiet_fit_writes_nothing_to_stdout_or_stderr() {
 
     // Strictly empty, not `trim().is_empty()`: a bare `eprintln!()` leaking from
     // the engine writes a lone newline, and trimming would hide exactly that.
-    assert!(
-        out.stderr.is_empty(),
-        "a quiet fit wrote to stderr:\n{stderr}"
-    );
+    assert!(out.stderr.is_empty(), "a quiet fit wrote to stderr:\n{stderr}");
     let stray: Vec<&str> = stdout.lines().filter(|l| !is_harness_line(l)).collect();
-    assert!(
-        stray.is_empty(),
-        "a quiet fit wrote to stdout:\n{}",
-        stray.join("\n")
-    );
+    assert!(stray.is_empty(), "a quiet fit wrote to stdout:\n{}", stray.join("\n"));
 }

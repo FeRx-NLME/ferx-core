@@ -13,7 +13,6 @@ use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions};
-use std::collections::HashMap;
 
 const MODEL: &str = r#"
 [parameters]
@@ -38,34 +37,13 @@ fn template_population(n: usize) -> Population {
     let times = [0.5_f64, 1.0, 2.0, 4.0, 8.0, 12.0];
     let subjects: Vec<Subject> = (1..=n)
         .map(|i| Subject {
-            obs_rgroup: Vec::new(),
             id: format!("{i}"),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; times.len()],
             obs_cmts: vec![1; times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: vec![],
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
 
@@ -119,10 +97,8 @@ fn saem_conddist_populates_per_subject_mean_and_sd() {
     let opts = short_saem_opts();
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
 
-    let cd = result
-        .cond_dist
-        .as_ref()
-        .expect("cond_dist must be populated when saem_conddist = true");
+    let cd =
+        result.cond_dist.as_ref().expect("cond_dist must be populated when saem_conddist = true");
 
     let n_subjects = population.subjects.len();
     let n_eta = result.eta_names.len();
@@ -135,10 +111,7 @@ fn saem_conddist_populates_per_subject_mean_and_sd() {
         assert_eq!(cd.cond_mean[i].len(), n_eta);
         assert_eq!(cd.cond_sd[i].len(), n_eta);
         for j in 0..n_eta {
-            assert!(
-                cd.cond_mean[i][j].is_finite(),
-                "subject {i} eta {j}: cond_mean not finite"
-            );
+            assert!(cd.cond_mean[i][j].is_finite(), "subject {i} eta {j}: cond_mean not finite");
             assert!(
                 cd.cond_sd[i][j].is_finite() && cd.cond_sd[i][j] >= 0.0,
                 "subject {i} eta {j}: cond_sd invalid ({})",
@@ -161,10 +134,7 @@ fn saem_conddist_disabled_by_default_is_none() {
     opts.saem_conddist = false; // explicit: the pass must not run
 
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
-    assert!(
-        result.cond_dist.is_none(),
-        "cond_dist must be None when saem_conddist = false"
-    );
+    assert!(result.cond_dist.is_none(), "cond_dist must be None when saem_conddist = false");
 }
 
 #[test]
@@ -196,27 +166,14 @@ fn saem_conddist_roundtrips_through_fitrx_bundle() {
 
     let opts = short_saem_opts();
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
-    assert!(
-        result.cond_dist.is_some(),
-        "fixture fit must have run conddist"
-    );
+    assert!(result.cond_dist.is_some(), "fixture fit must have run conddist");
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conddist_fit.fitrx");
-    save_fit(
-        &result,
-        &population,
-        MODEL,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .unwrap();
+    save_fit(&result, &population, MODEL, &path, SaveFitOptions::default()).unwrap();
 
     let loaded = load_fit(&path).unwrap();
-    let cd = loaded
-        .fit
-        .cond_dist
-        .expect("cond_dist must round-trip through .fitrx");
+    let cd = loaded.fit.cond_dist.expect("cond_dist must round-trip through .fitrx");
     let orig = result.cond_dist.as_ref().unwrap();
 
     assert_eq!(cd.cond_mean.len(), orig.cond_mean.len());
@@ -253,14 +210,7 @@ fn saem_no_conddist_omits_fitrx_entry() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("no_conddist_fit.fitrx");
-    save_fit(
-        &result,
-        &population,
-        MODEL,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .unwrap();
+    save_fit(&result, &population, MODEL, &path, SaveFitOptions::default()).unwrap();
 
     let loaded = load_fit(&path).unwrap();
     assert!(loaded.fit.cond_dist.is_none());

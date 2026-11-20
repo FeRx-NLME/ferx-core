@@ -19,11 +19,7 @@ use ferx_core::{fit, prepare_run, run_covariance, run_sir, FitOptions, InnerOpti
 use nalgebra::{DMatrix, DVector};
 
 fn bits(m: &Option<DMatrix<f64>>) -> Vec<u64> {
-    m.as_ref()
-        .expect("covariance step ran")
-        .iter()
-        .map(|x| x.to_bits())
-        .collect()
+    m.as_ref().expect("covariance step ran").iter().map(|x| x.to_bits()).collect()
 }
 
 #[test]
@@ -34,9 +30,8 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
 
     // ── 1. A direct `run_sir_core` call draws with the solver it records ──────────
     let params = prep.init_params.clone();
-    let etas: Vec<DVector<f64>> = (0..pop.subjects.len())
-        .map(|_| DVector::zeros(model.n_eta))
-        .collect();
+    let etas: Vec<DVector<f64>> =
+        (0..pop.subjects.len()).map(|_| DVector::zeros(model.n_eta)).collect();
     let proposal = DMatrix::from_diagonal(&DVector::from_element(pack_params(&params).len(), 0.01));
     let sir_opts = |mode| FitOptions {
         verbose: false,
@@ -52,10 +47,7 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
     };
     let lbfgs = core(InnerOptimizer::Lbfgs);
     let auto = core(InnerOptimizer::Auto);
-    assert_eq!(
-        lbfgs.settings.scoring.inner_optimizer,
-        InnerOptimizer::Lbfgs
-    );
+    assert_eq!(lbfgs.settings.scoring.inner_optimizer, InnerOptimizer::Lbfgs);
     assert_ne!(
         lbfgs.effective_sample_size.to_bits(),
         auto.effective_sample_size.to_bits(),
@@ -76,13 +68,7 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
         inner_optimizer: mode,
         ..prep.parsed.fit_options.clone()
     };
-    let fitted = fit(
-        model,
-        pop,
-        &prep.init_params,
-        &fit_opts(InnerOptimizer::Auto),
-    )
-    .expect("fit");
+    let fitted = fit(model, pop, &prep.init_params, &fit_opts(InnerOptimizer::Auto)).expect("fit");
     let quiet = |mode| FitOptions {
         verbose: false,
         analytic_cov_hessian: false,
@@ -130,13 +116,8 @@ fn sir_runs_with_its_recorded_inner_solver_and_leaks_nothing() {
         },
         ..Default::default()
     });
-    let err = run_sir(
-        &no_cov,
-        Some(model),
-        Some(pop),
-        &quiet(InnerOptimizer::Auto),
-    )
-    .expect_err("no covariance");
+    let err = run_sir(&no_cov, Some(model), Some(pop), &quiet(InnerOptimizer::Auto))
+        .expect_err("no covariance");
     assert!(err.to_string().contains("covariance_matrix"), "{err}");
     assert_eq!(
         cov(InnerOptimizer::Auto),

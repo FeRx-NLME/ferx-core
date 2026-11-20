@@ -1,49 +1,38 @@
 //! Matrix-exponential primitives for continuous-time Markov models (CTMM).
 //!
-//! Gated behind the `markov` cargo feature. **Zero new dependencies**: the
-//! matrix exponential is nalgebra's built-in Higham (2005) scaling-and-squaring
-//! Padé approximant (`DMatrix::exp`), and the parameter gradient is the exact
-//! Van Loan (1978) block-matrix Fréchet derivative built on top of it. There is
-//! no hand-rolled Padé here — `plans/tte-survival-markov.md` D4 predates the
-//! discovery that nalgebra already ships a correct, well-tested `expm`.
+//! Gated behind the `markov` cargo feature. **Zero new dependencies**: the matrix exponential
+//! is nalgebra's Higham (2005) scaling-and-squaring Padé approximant (`DMatrix::exp`), and
+//! the parameter gradient is the exact Van Loan (1978) block-matrix Fréchet derivative on
+//! top of it.
 //!
-//! This module is a **pure numerical leaf**. It knows nothing about the model
-//! DSL, random effects, covariates, or the outer/inner optimizer. It provides:
+//! A **pure numerical leaf**: it knows nothing about the model DSL, random effects,
+//! covariates, or the optimizers. It provides:
 //!
-//! - [`matrix_exp`] — `P(Δt) = expm(Q·Δt)`, the CTMM transition-probability
-//!   matrix over an interval.
-//! - [`matrix_exp_frechet`] — `L(A, E) = d/dt expm(A + tE)|₀`, the *exact*
-//!   directional derivative of the matrix exponential (§3.4, §8.7, §9.7). This
-//!   is what differentiates the CTMM likelihood w.r.t. rate parameters and
-//!   random effects.
-//! - [`generator_rate_direction`] — the constrained perturbation direction for
-//!   one rate parameter of a generator (see "Why directional" below).
-//! - [`ctmm_data_term`] — the individual CTMM negative log-likelihood
-//!   `−Σ log P(Δtₘ)[sₘ, sₘ₊₁]` for a *prebuilt* generator, with a fail-loud
-//!   guard layer: structural/data problems return [`MarkovError`]; a
-//!   parameter-driven degeneracy returns the finite `1e20` sentinel (matching
-//!   the `survival` module's convention) rather than a silent `−inf`.
+//! - [`matrix_exp`]: `P(Δt) = expm(Q·Δt)`, the CTMM transition-probability matrix.
+//! - [`matrix_exp_frechet`]: `L(A, E) = d/dt expm(A + tE)|₀`, the *exact* directional
+//!   derivative of the matrix exponential (§3.4, §8.7, §9.7), which differentiates the CTMM
+//!   likelihood w.r.t. rate parameters and random effects.
+//! - [`generator_rate_direction`]: the constrained perturbation direction for one rate
+//!   parameter of a generator (see below).
+//! - [`ctmm_data_term`]: the individual CTMM negative log-likelihood
+//!   `−Σ log P(Δtₘ)[sₘ, sₘ₊₁]` for a *prebuilt* generator, with a fail-loud guard layer:
+//!   structural/data problems return [`MarkovError`]; a parameter-driven degeneracy returns
+//!   the finite `1e20` sentinel (as the `survival` module does), not a silent `−inf`.
 //!
-//! Building the generator `Q(η, θ)` from the model, the FOCEI/SAEM wiring, the
-//! `Population → StateObs` data reader, and the `msm`-anchored validation are
-//! **Phase 5** — see the plan. Because this leaf is a pure numerical primitive,
-//! its comparator is not NONMEM/`msm` (there is no fit here to anchor); it is
-//! validated in-repo, license-free, against the Taylor series, the closed-form
-//! 2-state transition matrix, and the *exact* Daleckii–Krein Fréchet reference.
+//! Building `Q(η, θ)` from the model, the FOCEI/SAEM wiring, the `Population → StateObs`
+//! reader and the `msm`-anchored validation are **Phase 5**. This leaf is validated in-repo,
+//! license-free, against the Taylor series, the closed-form 2-state transition matrix, and
+//! the exact Daleckii–Krein Fréchet reference.
 //!
 //! ## Why a directional Fréchet, not per-entry gradients
 //!
-//! A CTMM generator obeys the row-sum-zero constraint: the diagonal is fixed by
-//! the off-diagonals, `q_jj = −Σ_{k≠j} q_jk`. So a free **rate parameter**
-//! `q_jk` (an off-diagonal, `j ≠ k`) perturbs *two* entries of `Q` at once:
-//! `q_jk` up and `q_jj` down. The derivative of `expm(Q·Δt)` w.r.t. that rate is
-//! therefore the Fréchet derivative in the direction `(E_jk − E_jj)·Δt`, **not**
-//! the derivative w.r.t. a single independent matrix entry. An API that returns
-//! "one gradient per `Q` entry" (as an earlier draft of §8.7 proposed) silently
-//! computes the wrong thing for a constrained generator. [`matrix_exp_frechet`]
-//! takes the direction matrix explicitly, and [`generator_rate_direction`]
-//! constructs exactly the constrained direction, so the caller cannot get the
-//! constraint wrong.
+//! A generator obeys the row-sum-zero constraint `q_jj = −Σ_{k≠j} q_jk`, so a free **rate
+//! parameter** `q_jk` (`j ≠ k`) perturbs *two* entries of `Q` at once (`q_jk` up, `q_jj`
+//! down). The derivative of `expm(Q·Δt)` w.r.t. that rate is the Fréchet derivative in the
+//! direction `(E_jk − E_jj)·Δt`, **not** the derivative w.r.t. a single independent entry
+//! ("one gradient per `Q` entry" silently computes the wrong thing for a constrained
+//! generator). [`matrix_exp_frechet`] takes the direction explicitly and
+//! [`generator_rate_direction`] constructs exactly the constrained one.
 
 pub(crate) mod dtmm;
 pub mod endpoint;
@@ -57,20 +46,17 @@ use nalgebra::DMatrix;
 // reported as [`MarkovError`] instead.
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 
-/// Upper bound on the magnitude of any entry of the scaled generator `Q·Δt`
-/// before it is handed to `expm`.
+/// Upper bound on the magnitude of any entry of the scaled generator `Q·Δt` before it is
+/// handed to `expm`.
 ///
-/// nalgebra's `DMatrix::exp` forms internal matrix powers of its argument (up to
-/// `A^8`/`A^10`) to choose a scaling factor. For an argument whose entries exceed
-/// roughly `1e38`, those powers overflow to `+∞` **even though the argument
-/// itself is finite**; the overflow drives nalgebra's internal squaring count to
-/// `u64::MAX`, so `expm` then spins forever in a `for _ in 0..s` loop that never
-/// returns — a **hang**, not a catchable panic, and not something the post-`expm`
-/// finiteness check can rescue. A `Q·Δt` this large is a diverged parameter,
-/// never a real CTMM regime (it is orders of magnitude beyond any physical
-/// rate×time), so it is treated as the degenerate case and repels the optimizer.
-/// The bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and
-/// far above any legitimate argument.
+/// nalgebra's `DMatrix::exp` forms internal matrix powers (up to `A^8`/`A^10`) to choose a
+/// scaling factor. For entries above roughly `1e38` those powers overflow to `+∞` **even
+/// though the argument is finite**, driving the internal squaring count to `u64::MAX`, so
+/// `expm` spins forever in a `for _ in 0..s` loop: a **hang**, not a catchable panic, and not
+/// rescued by the post-`expm` finiteness check. A `Q·Δt` this large is a diverged parameter,
+/// never a real CTMM regime, so it is treated as degenerate and repels the optimizer. The
+/// bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and far above any
+/// legitimate argument.
 pub(crate) const MAX_EXP_ARG_ABS: f64 = 1e18;
 
 /// A single continuous-time Markov state observation: the process was seen in
@@ -120,40 +106,26 @@ pub enum MarkovError {
         "two distinct states ({from} → {to}) at identical time {time} (index {index}); \
          a state transition needs Δt > 0"
     )]
-    ZeroDtStateChange {
-        index: usize,
-        time: f64,
-        from: usize,
-        to: usize,
-    },
+    ZeroDtStateChange { index: usize, time: f64, from: usize, to: usize },
 
     /// A generator *derivative* `∂Q/∂p` passed to [`ctmm_data_term_grad`] does not match
     /// the generator's shape. Checked at runtime, not just in debug: the gradient
     /// contracts `⟨G, ∂Q/∂p⟩` with a zipped iterator, which on a short `∂Q/∂p` would
     /// silently *truncate* and return a confidently wrong gradient.
     #[error("∂Q/∂p at axis {axis} is {rows}×{cols}, but the generator is {n_states}×{n_states}")]
-    DerivativeShapeMismatch {
-        axis: usize,
-        rows: usize,
-        cols: usize,
-        n_states: usize,
-    },
+    DerivativeShapeMismatch { axis: usize, rows: usize, cols: usize, n_states: usize },
 }
 
 /// Transition-probability matrix `P(Δt) = expm(A)` for `A = Q·Δt`.
 ///
-/// Thin, documented wrapper over nalgebra's Higham (2005) scaling-and-squaring
-/// Padé approximant (`DMatrix::exp`). The caller passes the already-scaled
-/// argument `A = Q·Δt`; for a valid generator `Q` (off-diagonals `≥ 0`,
-/// row sums `0`) the result is a stochastic matrix (rows sum to 1, entries in
-/// `[0, 1]`) up to floating round-off. **Round-off is not clamped here** — the
-/// likelihood in [`ctmm_data_term`] inspects only the single selected entry and
-/// treats a non-positive value as the degenerate case, so a global clamp would
-/// add a code path without changing any result.
+/// A thin wrapper over nalgebra's Higham (2005) scaling-and-squaring Padé approximant
+/// (`DMatrix::exp`). For a valid generator (off-diagonals `≥ 0`, row sums `0`) the result is
+/// a stochastic matrix up to round-off. **Round-off is not clamped here**: [`ctmm_data_term`]
+/// reads one entry and treats a non-positive value as degenerate, so a global clamp would
+/// change no result.
 ///
 /// # Panics (debug builds only)
-/// Debug-asserts that `a` is square. `expm` is only defined for square matrices;
-/// nalgebra itself would panic on a non-square input.
+/// Debug-asserts that `a` is square.
 #[must_use]
 pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
     debug_assert!(a.is_square(), "matrix_exp requires a square matrix");
@@ -164,8 +136,8 @@ pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
 /// Fréchet derivative of the matrix exponential in direction `E`:
 /// `L(A, E) = d/dt expm(A + t·E)|_{t=0}`.
 ///
-/// Computed with the Van Loan (1978) block identity — this is **exact** (up to
-/// the exponential's own ~1e-15 round-off), not a finite difference:
+/// Computed with the Van Loan (1978) block identity, **exact** (up to the exponential's own
+/// ~1e-15 round-off), not a finite difference:
 ///
 /// ```text
 ///                 ⎛ ⎡ A  E ⎤ ⎞
@@ -173,23 +145,16 @@ pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
 ///                 ⎝ ⎣ 0  A ⎦ ⎠
 /// ```
 ///
-/// For a generator rate parameter, pass `E = (E_jk − E_jj)·Δt`
-/// (see [`generator_rate_direction`]) and `A = Q·Δt`; then `L(A, E)` is exactly
-/// `∂P(Δt)/∂q_jk`. `L` is linear in `E`, so directions compose:
-/// `L(A, αE₁ + βE₂) = α·L(A, E₁) + β·L(A, E₂)`.
-///
-/// Cost: one `expm` of a `2S×2S` matrix per direction. Negligible for `S ≤ 10`.
+/// For a generator rate parameter pass `E = (E_jk − E_jj)·Δt` (see
+/// [`generator_rate_direction`]) and `A = Q·Δt`; `L(A, E)` is then `∂P(Δt)/∂q_jk`. `L` is
+/// linear in `E`. Cost: one `expm` of a `2S×2S` matrix per direction.
 ///
 /// # Panics (debug builds only)
 /// Debug-asserts that `a` is square and that `e` has the same shape as `a`.
 #[must_use]
 pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
     debug_assert!(a.is_square(), "matrix_exp_frechet requires a square A");
-    debug_assert_eq!(
-        a.shape(),
-        e.shape(),
-        "matrix_exp_frechet requires E to match A's shape"
-    );
+    debug_assert_eq!(a.shape(), e.shape(), "matrix_exp_frechet requires E to match A's shape");
     let s = a.nrows();
     // Build the 2S×2S block matrix [[A, E], [0, A]].
     let mut c = DMatrix::<f64>::zeros(2 * s, 2 * s);
@@ -200,32 +165,20 @@ pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
     matrix_exp(&c).view((0, s), (s, s)).into_owned()
 }
 
-/// The constrained perturbation direction for one **rate parameter** `q_jk` of
-/// an `s`-state generator, scaled by `dt`: `(E_jk − E_jj)·dt`.
+/// The constrained perturbation direction for one **rate parameter** `q_jk` of an `s`-state
+/// generator, scaled by `dt`: `(E_jk − E_jj)·dt`.
 ///
-/// This encodes the row-sum-zero constraint (`q_jj = −Σ_{k≠j} q_jk`): raising
-/// the off-diagonal rate `q_jk` by `δ` lowers the diagonal `q_jj` by `δ` so the
-/// row still sums to zero. Feeding this direction (and `A = Q·dt`) to
-/// [`matrix_exp_frechet`] yields exactly `∂P(dt)/∂q_jk`.
-///
-/// Keeping this as its own function means Phase 5 assembles gradients without
-/// re-deriving — and cannot accidentally differentiate w.r.t. a bare matrix
-/// entry, which would ignore the constraint.
+/// It encodes the row-sum-zero constraint (`q_jj = −Σ_{k≠j} q_jk`): raising `q_jk` by `δ`
+/// lowers `q_jj` by `δ`. With `A = Q·dt`, [`matrix_exp_frechet`] then yields exactly
+/// `∂P(dt)/∂q_jk`, and callers cannot differentiate w.r.t. a bare matrix entry.
 ///
 /// # Panics
-/// Panics if `j == k` (a rate is strictly off-diagonal) or if `j` or `k` is
-/// `≥ s`. These are setup-time programming errors, checked unconditionally
-/// (the function is called `O(#rate params)` times, not in the hot loop).
+/// Panics if `j == k` (a rate is strictly off-diagonal) or if `j` or `k` is `≥ s`
+/// (setup-time programming errors, checked unconditionally: called `O(#rate params)` times).
 #[must_use]
 pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatrix<f64> {
-    assert!(
-        j != k,
-        "a generator rate parameter is off-diagonal; got j == k == {j}"
-    );
-    assert!(
-        j < s && k < s,
-        "rate index ({j},{k}) out of range for {s}-state generator"
-    );
+    assert!(j != k, "a generator rate parameter is off-diagonal; got j == k == {j}");
+    assert!(j < s && k < s, "rate index ({j},{k}) out of range for {s}-state generator");
     let mut e = DMatrix::<f64>::zeros(s, s);
     e[(j, k)] = dt; //  +E_jk·dt
     e[(j, j)] = -dt; //  −E_jj·dt
@@ -237,10 +190,7 @@ pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatri
 /// (fail loud), not the degenerate sentinel.
 fn validate_generator(q: &DMatrix<f64>) -> Result<usize, MarkovError> {
     if !q.is_square() {
-        return Err(MarkovError::NonSquareGenerator {
-            rows: q.nrows(),
-            cols: q.ncols(),
-        });
+        return Err(MarkovError::NonSquareGenerator { rows: q.nrows(), cols: q.ncols() });
     }
     let s = q.nrows();
     if s < 2 {
@@ -255,16 +205,10 @@ fn validate_generator(q: &DMatrix<f64>) -> Result<usize, MarkovError> {
 fn validate_obs(obs: &[StateObs], s: usize) -> Result<(), MarkovError> {
     for (i, o) in obs.iter().enumerate() {
         if o.state >= s {
-            return Err(MarkovError::StateOutOfRange {
-                state: o.state,
-                n_states: s,
-            });
+            return Err(MarkovError::StateOutOfRange { state: o.state, n_states: s });
         }
         if !o.time.is_finite() {
-            return Err(MarkovError::NonFiniteTime {
-                index: i,
-                time: o.time,
-            });
+            return Err(MarkovError::NonFiniteTime { index: i, time: o.time });
         }
     }
     Ok(())
@@ -308,20 +252,12 @@ enum GapOutcome<T> {
 /// (see [`MAX_EXP_ARG_ABS`]); `Expm::exp`'s own guards (squaring count, a singular Padé
 /// denominator, a non-finite jet) are the degenerate case too.
 fn gap_transition<T: crate::sens::num::PkNum>(
-    q: &[T],
-    s: usize,
-    a: StateObs,
-    b: StateObs,
-    i: usize,
+    q: &[T], s: usize, a: StateObs, b: StateObs, i: usize,
 ) -> Result<GapOutcome<T>, MarkovError> {
     let dt = b.time - a.time;
 
     if dt < 0.0 {
-        return Err(MarkovError::TimeDecreased {
-            index: i + 1,
-            prev: a.time,
-            next: b.time,
-        });
+        return Err(MarkovError::TimeDecreased { index: i + 1, prev: a.time, next: b.time });
     }
     if dt == 0.0 {
         if a.state != b.state {
@@ -340,8 +276,7 @@ fn gap_transition<T: crate::sens::num::PkNum>(
     // Through the branch API (#2786): `|x| < ∞` is finite.
     if arg.iter().any(|x| {
         !x.br_abs_lt(f64::INFINITY)
-            || x.abs()
-                .br_cmp_c(crate::sens::num::BranchCmp::Gt, MAX_EXP_ARG_ABS)
+            || x.abs().br_cmp_c(crate::sens::num::BranchCmp::Gt, MAX_EXP_ARG_ABS)
     }) {
         return Ok(GapOutcome::Degenerate);
     }
@@ -363,18 +298,16 @@ fn gap_transition<T: crate::sens::num::PkNum>(
 
 /// Whether any off-diagonal entry of a generator is (past round-off) negative.
 ///
-/// A transition intensity is an unconstrained user expression, so a covariate /
-/// parameter regime (or a diverged η) can drive an off-diagonal rate negative,
-/// which makes `Q` a non-generator (`expm(Q·Δt)` is no longer stochastic and an
-/// observed transition can score `P > 1`). Callers treat that as the degenerate
-/// case and repel the optimizer with their own sentinel / `None`. The `1e-12`
-/// tolerance absorbs floating round-off on a rate that is physically zero.
+/// A transition intensity is an unconstrained user expression, so a covariate / parameter
+/// regime (or a diverged η) can drive an off-diagonal rate negative, making `Q` a
+/// non-generator (`expm(Q·Δt)` is no longer stochastic; an observed transition can score
+/// `P > 1`). Callers treat that as degenerate and repel the optimizer with their own
+/// sentinel / `None`. The `1e-12` tolerance absorbs round-off on a physically zero rate.
 ///
-/// Used by the three homogeneous endpoint sites in `markov/endpoint.rs`
-/// (`ctmm_endpoint_nll`, `ctmm_subject_eta_grad`, and the η-Hessian's `CtmmSubjectNll`
-/// through [`has_negative_offdiagonal_g`]). The inhomogeneous per-sub-node guard stays
-/// inline there because it shares a single pass with the finite/`MAX_EXP_ARG_ABS`
-/// magnitude check.
+/// Used by the three homogeneous endpoint sites in `markov/endpoint.rs` (`ctmm_endpoint_nll`,
+/// `ctmm_subject_eta_grad`, and the η-Hessian's `CtmmSubjectNll` via
+/// [`has_negative_offdiagonal_g`]). The inhomogeneous per-sub-node guard stays inline there
+/// because it shares one pass with the finite/`MAX_EXP_ARG_ABS` magnitude check.
 #[inline]
 pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
     has_negative_offdiagonal_g(q.as_slice(), q.nrows())
@@ -395,41 +328,35 @@ pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s:
 }
 
 /// Exact gradient of [`ctmm_data_term`] w.r.t. an arbitrary parameter vector, given the
-/// generator `q` and its derivatives `dq[a] = ∂Q/∂p_a` (#759).
-///
-/// This is the analytic replacement for finite-differencing the whole matrix-exponential
-/// likelihood. The chain is
+/// generator `q` and its derivatives `dq[a] = ∂Q/∂p_a` (#759): the analytic replacement for
+/// finite-differencing the whole matrix-exponential likelihood. The chain is
 ///
 /// ```text
 ///   ∂/∂p_a [ −log P(Δt)[u,v] ]  =  − L(QΔt, (∂Q/∂p_a)·Δt)[u,v] / P(Δt)[u,v]
 /// ```
 ///
-/// with `L` the Fréchet derivative ([`matrix_exp_frechet`]). Evaluating that literally
-/// would cost one `2S×2S` `expm` **per axis per gap** — which for a handful of axes is
-/// *slower* than the `S×S` FD it replaces. Instead we use the adjoint identity
+/// with `L` the Fréchet derivative ([`matrix_exp_frechet`]). Evaluated literally that costs one
+/// `2S×2S` `expm` **per axis per gap**, slower than the `S×S` FD it replaces. Instead use the
+/// adjoint identity
 ///
 /// ```text
 ///   ⟨C, L(A, E)⟩  =  ⟨L(Aᵀ, C), E⟩          (trace inner product)
 /// ```
 ///
-/// Only one *entry* `[u,v]` of `P` is ever read, so seeding `C = e_u e_vᵀ` gives a single
-/// matrix `G = L((QΔt)ᵀ, e_u e_vᵀ)` with `∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩` for **every**
-/// `a`. That is **one** Fréchet solve per observation gap regardless of the parameter count
-/// — cheaper than the FD path (`2·n_axes` `S×S` `expm`s per gap) as soon as there are a few
-/// axes, and it scales to the full `(θ, η)` width for free. `adjoint_frechet_matches_direct`
-/// pins the identity against the direct per-direction form.
+/// Only one *entry* `[u,v]` of `P` is read, so seeding `C = e_u e_vᵀ` gives a single matrix
+/// `G = L((QΔt)ᵀ, e_u e_vᵀ)` with `∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩` for **every** `a`: one
+/// Fréchet solve per gap regardless of the parameter count (FD needs `2·n_axes` `S×S`
+/// `expm`s per gap). `adjoint_frechet_matches_direct` pins the identity against the direct
+/// per-direction form.
 ///
-/// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
-/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_g`.
+/// `dq[a]` must be a valid generator *direction* (zero row sums), which differentiating the
+/// intensities gives for free (`CtmmGeneratorProgram::eval_generator_g`).
 ///
 /// Returns `Ok(None)` where [`ctmm_data_term`] returns `SUBJECT_SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the
-/// caller falls back to FD for that point rather than being handed a zero (or garbage)
-/// gradient. Errors mirror [`ctmm_data_term`] exactly.
+/// caller falls back to FD there. Errors mirror [`ctmm_data_term`].
 pub fn ctmm_data_term_grad(
-    q: &DMatrix<f64>,
-    dq: &[DMatrix<f64>],
-    obs: &[StateObs],
+    q: &DMatrix<f64>, dq: &[DMatrix<f64>], obs: &[StateObs],
 ) -> Result<Option<(f64, Vec<f64>)>, MarkovError> {
     let s = validate_generator(q)?;
     // Validated at runtime, not merely debug-asserted: the contraction below zips `G` with
@@ -480,12 +407,7 @@ pub fn ctmm_data_term_grad(
         let g = matrix_exp_frechet(&arg.transpose(), &seed);
         for (ax, dq_a) in dq.iter().enumerate() {
             // ∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩; the NLL term is −log P.
-            let dp: f64 = g
-                .iter()
-                .zip(dq_a.iter())
-                .map(|(gi, di)| gi * di)
-                .sum::<f64>()
-                * dt;
+            let dp: f64 = g.iter().zip(dq_a.iter()).map(|(gi, di)| gi * di).sum::<f64>() * dt;
             grad[ax] -= dp / p;
         }
     }
@@ -495,25 +417,21 @@ pub fn ctmm_data_term_grad(
 /// Individual CTMM negative log-likelihood for a **prebuilt** generator `q`:
 /// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]` over consecutive observation pairs.
 ///
-/// The generator is taken as given (Phase 5 builds `Q(η, θ)`); this function is
-/// the pure likelihood kernel plus its guard layer. It never returns `−inf` or
-/// panics on bad input:
+/// The pure likelihood kernel plus its guard layer; it never returns `−inf` or panics on bad
+/// input:
 ///
-/// - **Structural / data errors** → [`MarkovError`] (fail loud): non-square or
-///   too-small generator, a state index out of range, a non-finite time, times
-///   that decrease, or two different states reported at the same instant.
-/// - **Numerically degenerate likelihood** → `Ok(SUBJECT_SENTINEL_NLL)`: a
-///   parameter guess under which an *observed* transition has non-positive
-///   (underflowed) probability. This is a large finite objective that repels the
-///   optimizer, exactly as the `survival` module does with its `1e20` sentinel.
-/// - Fewer than two observations carry no transition, so the term is `0.0`.
-/// - A zero-length interval between two *identical* states contributes `0`
-///   (`P(0) = I`, `log 1 = 0`); the same interval between *different* states is
-///   the [`MarkovError::ZeroDtStateChange`] error above.
+/// - **Structural / data errors** → [`MarkovError`]: non-square or too-small generator, a
+///   state index out of range, a non-finite time, times that decrease, or two different
+///   states at the same instant.
+/// - **Numerically degenerate likelihood** → `Ok(SUBJECT_SENTINEL_NLL)`: an *observed*
+///   transition has non-positive (underflowed) probability; a large finite objective that
+///   repels the optimizer (as `survival` does with its `1e20` sentinel).
+/// - Fewer than two observations carry no transition: `0.0`.
+/// - A zero-length interval between two *identical* states contributes `0` (`P(0) = I`); between
+///   *different* states it is [`MarkovError::ZeroDtStateChange`].
 ///
-/// `q` must be a valid generator; validity of its *entries* (off-diagonals
-/// `≥ 0`, rows summing to `0`) is the model builder's responsibility and is not
-/// re-checked per-evaluation here.
+/// `q` must be a valid generator; validity of its entries (off-diagonals `≥ 0`, row sums `0`)
+/// is the model builder's responsibility and is not re-checked per evaluation.
 pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovError> {
     let s = validate_generator_and_obs(q, obs)?;
     // Underflow / non-positive probability, or a non-finite / enormous `expm` argument
@@ -526,9 +444,7 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 /// path, a dual one seeded on η gives the endpoint's exact η-Hessian (#2437). `Ok(None)`
 /// where the value path returns [`SUBJECT_SENTINEL_NLL`].
 pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
-    q: &[T],
-    s: usize,
-    obs: &[StateObs],
+    q: &[T], s: usize, obs: &[StateObs],
 ) -> Result<Option<T>, MarkovError> {
     let mut nll = T::from_f64(0.0);
     for (i, pair) in obs.windows(2).enumerate() {
@@ -563,9 +479,8 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
     Ok(Some(nll))
 }
 
-/// Time-**inhomogeneous** transition-probability matrix `P(Δt)` for a generator
-/// that varies within the interval — the drug-driven CTMM (`Q(t) = f(C(t))`),
-/// Phase 6, Track D (#817).
+/// Time-**inhomogeneous** transition-probability matrix `P(Δt)` for a generator that varies
+/// within the interval, the drug-driven CTMM (`Q(t) = f(C(t))`), Phase 6, Track D (#817).
 ///
 /// Solves the matrix occupancy ODE (forward Kolmogorov, right multiplication)
 ///
@@ -573,60 +488,40 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
 ///   dP/dτ = P·Q(τ),   P(0) = I,   τ ∈ [0, Δt]
 /// ```
 ///
-/// so `P(Δt)[from, to] = Pr(state = to at Δt | state = from at 0)`, matching the
-/// homogeneous `matrix_exp(Q·Δt)` indexing. (The backward form `Q(τ)·P` gives the
-/// transpose-ordered result and is only equal for a generator that commutes across
-/// time — constant `Q`, or `Q(τ)=g(τ)·Q₀`.)
+/// so `P(Δt)[from, to] = Pr(state = to at Δt | state = from at 0)`, matching the homogeneous
+/// `matrix_exp(Q·Δt)` indexing. (The backward form `Q(τ)·P` gives the transpose-ordered
+/// result, equal only for a generator that commutes across time.)
 ///
-/// on the shared Dormand–Prince RK45 engine ([`crate::ode::solve_ode`]) and
-/// returns `P(Δt)`. `q_at(τ)` supplies the `n_states × n_states` generator at
-/// **elapsed time `τ` within the interval** (`0` at the left endpoint); the
-/// caller maps `τ` to an absolute model time and hence to the PK state / drug
-/// concentration that drives `Q`. `dq_at(τ)` is its derivative `∂Q/∂τ` (the right
-/// derivative at a kink of `Q`), which a stiff method's exact `f_t = P·∂Q/∂τ` reads
-/// (`kolmogorov_jacobian`); `None` leaves the step's `J` and `f_t` to differences.
-/// Unlike the time-homogeneous
-/// [`ctmm_data_term`], there is no closed form here (the matrix exponential
-/// `expm(Q·Δt)` is exact only when `Q` is constant), so the interval transition
-/// is obtained by integration.
+/// Runs on the shared Dormand–Prince RK45 engine ([`crate::ode::solve_ode`]). `q_at(τ)`
+/// supplies the `n_states × n_states` generator at **elapsed time `τ` within the interval**
+/// (`0` at the left endpoint); the caller maps `τ` to an absolute model time and hence to the
+/// PK state / drug concentration that drives `Q`. `dq_at(τ)` is `∂Q/∂τ` (the right derivative
+/// at a kink), which a stiff method's exact `f_t = P·∂Q/∂τ` reads (`kolmogorov_jacobian`);
+/// `None` leaves the step's `J` and `f_t` to differences. Unlike the time-homogeneous
+/// [`ctmm_data_term`] there is no closed form (`expm(Q·Δt)` is exact only for constant `Q`).
 ///
-/// **Reduction to the matrix exponential.** When `q_at` returns a *constant* `Q`,
-/// the time-ordered solution collapses to `P(Δt) = expm(Q·Δt)` — this is the
-/// Tier-1 anchor (`ctmm_inhomogeneous_matches_matrix_exp_for_constant_q`), so the
-/// homogeneous and inhomogeneous paths agree in the limit they share. More
-/// generally, if `Q(τ) = g(τ)·Q₀` for a scalar `g` and a fixed `Q₀` (the family
-/// commutes across time), `P(Δt) = expm(Q₀ · ∫₀^{Δt} g)` — a second closed-form
-/// anchor independent of `expm`'s own definition.
+/// **Reduction to the matrix exponential.** For a *constant* `Q` the solution collapses to
+/// `P(Δt) = expm(Q·Δt)` (the Tier-1 anchor
+/// `ctmm_inhomogeneous_matches_matrix_exp_for_constant_q`). If `Q(τ) = g(τ)·Q₀` (a commuting
+/// family), `P(Δt) = expm(Q₀ · ∫₀^{Δt} g)`, a second anchor independent of `expm`.
 ///
-/// The likelihood term is unchanged: `−Σ_m log P(Δt_m)[s_m, s_{m+1}]`, with each
-/// `P(Δt_m)` from this function instead of `matrix_exp`.
-///
-/// The occupancy matrix is flattened **row-major** into the ODE state vector
-/// (length `n_states²`); the RHS reshapes it, forms `P·Q(τ)`, and flattens back.
-/// A non-positive `delta_t` returns the identity (`P(0) = I`; a zero-length gap
-/// between identical states contributes `log 1 = 0`, exactly as the homogeneous
-/// kernel treats it).
+/// The likelihood term is unchanged (`−Σ_m log P(Δt_m)[s_m, s_{m+1}]`). The occupancy matrix
+/// is flattened **row-major** into the ODE state (length `n_states²`). A non-positive
+/// `delta_t` returns the identity (`P(0) = I`; `log 1 = 0`, as in the homogeneous kernel).
 ///
 /// # Panics (debug builds only)
 /// Debug-asserts that `q_at(0)` is `n_states × n_states`.
 ///
-/// Integrates to near machine precision (`reltol 1e-10`) — the default for the
-/// Tier-1 closed-form anchors. The **fit path** instead uses
-/// [`ctmm_inhomogeneous_transition_with_opts`] with the model's own ODE tolerance
-/// (the same `reltol` the PK/TTE solves use), since integrating the whole
-/// likelihood to `1e-10` on every EBE/FD evaluation is needlessly slow.
+/// Integrates to near machine precision (`reltol 1e-10`), the default for the Tier-1
+/// closed-form anchors. The **fit path** uses [`ctmm_inhomogeneous_transition_with_opts`] with
+/// the model's own ODE tolerance (the same `reltol` as the PK/TTE solves), since `1e-10` on
+/// every EBE/FD evaluation is needlessly slow.
 #[must_use]
 pub fn ctmm_inhomogeneous_transition(
-    q_at: impl Fn(f64) -> DMatrix<f64>,
-    dq_at: impl Fn(f64) -> Option<DMatrix<f64>>,
-    delta_t: f64,
+    q_at: impl Fn(f64) -> DMatrix<f64>, dq_at: impl Fn(f64) -> Option<DMatrix<f64>>, delta_t: f64,
     n_states: usize,
 ) -> DMatrix<f64> {
-    let opts = crate::ode::OdeSolverOptions {
-        abstol: 1e-12,
-        reltol: 1e-10,
-        ..Default::default()
-    };
+    let opts = crate::ode::OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..Default::default() };
     ctmm_inhomogeneous_transition_with_opts(q_at, dq_at, delta_t, n_states, &opts)
 }
 
@@ -636,22 +531,15 @@ pub fn ctmm_inhomogeneous_transition(
 /// per-evaluation cost in line with the rest of the ODE machinery.
 #[must_use]
 pub fn ctmm_inhomogeneous_transition_with_opts(
-    q_at: impl Fn(f64) -> DMatrix<f64>,
-    dq_at: impl Fn(f64) -> Option<DMatrix<f64>>,
-    delta_t: f64,
-    n_states: usize,
-    opts: &crate::ode::OdeSolverOptions,
+    q_at: impl Fn(f64) -> DMatrix<f64>, dq_at: impl Fn(f64) -> Option<DMatrix<f64>>, delta_t: f64,
+    n_states: usize, opts: &crate::ode::OdeSolverOptions,
 ) -> DMatrix<f64> {
     let s = n_states;
     if delta_t <= 0.0 || delta_t.is_nan() {
         // P(0) = I; also the guard for a NaN/negative gap (validated upstream).
         return DMatrix::identity(s, s);
     }
-    debug_assert_eq!(
-        q_at(0.0).shape(),
-        (s, s),
-        "q_at must return an n_states×n_states generator"
-    );
+    debug_assert_eq!(q_at(0.0).shape(), (s, s), "q_at must return an n_states×n_states generator");
 
     // Flattened matrix ODE: u ↔ P row-major (u[i*s + j] = P[i, j]).
     // Forward Kolmogorov `dP/dt = P·Q(t)` (right multiplication), so
@@ -716,12 +604,8 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
 /// `f` is linear in `P` — `∂(P·Q)[i, j]/∂P[i', k] = δ_{ii'}·Q[k, j]`, i.e. `J = I ⊗ Qᵀ` — and
 /// `f_t = P·∂Q/∂τ`. `q` and `dq` read `Q` and `∂Q/∂τ` at `(row, col)`.
 pub(crate) fn kolmogorov_jacobian<T: crate::sens::num::PkNum>(
-    u: &[T],
-    q: impl Fn(usize, usize) -> T,
-    dq: impl Fn(usize, usize) -> T,
-    s: usize,
-    jac: &mut [T],
-    ft: &mut [T],
+    u: &[T], q: impl Fn(usize, usize) -> T, dq: impl Fn(usize, usize) -> T, s: usize,
+    jac: &mut [T], ft: &mut [T],
 ) {
     let n = s * s;
     let zero = T::from_f64(0.0);
@@ -765,12 +649,7 @@ mod tests {
         DMatrix::from_row_slice(
             2,
             2,
-            &[
-                (b + a * e) / lam,
-                (a - a * e) / lam,
-                (b - b * e) / lam,
-                (a + b * e) / lam,
-            ],
+            &[(b + a * e) / lam, (a - a * e) / lam, (b - b * e) / lam, (a + b * e) / lam],
         )
     }
 
@@ -863,10 +742,7 @@ mod tests {
         assert_eq!(reference[(1, 0)], 0.0, "no 1→0 transition");
         assert_eq!(reference[(2, 0)], 0.0, "no 2→0 transition");
         assert_eq!(reference[(2, 1)], 0.0, "no 2→1 transition");
-        assert!(
-            (reference[(2, 2)] - 1.0).abs() < 1e-15,
-            "state 2 is absorbing"
-        );
+        assert!((reference[(2, 2)] - 1.0).abs() < 1e-15, "state 2 is absorbing");
 
         // Now the anchor itself: expm agrees with the independent closed form.
         let p = matrix_exp(&(&q * t));
@@ -937,10 +813,7 @@ mod tests {
     fn expm_of_generator_is_stochastic() {
         let p = matrix_exp(&(generator_3() * 1.5));
         for i in 0..3 {
-            assert!(
-                (p.row(i).sum() - 1.0).abs() < 1e-13,
-                "row {i} must sum to 1"
-            );
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-13, "row {i} must sum to 1");
         }
         assert!(p.iter().all(|&x| x >= 0.0), "entries must be non-negative");
         assert!(p.iter().all(|&x| x <= 1.0 + 1e-13), "entries must be ≤ 1");
@@ -987,10 +860,7 @@ mod tests {
     #[test]
     fn frechet_matches_daleckii_krein_exact() {
         let a = DMatrix::from_row_slice(3, 3, &[0.4, 0.1, -0.2, 0.1, -0.3, 0.05, -0.2, 0.05, 0.6]);
-        assert!(
-            (a.clone() - a.transpose()).abs().max() < 1e-15,
-            "A symmetric"
-        );
+        assert!((a.clone() - a.transpose()).abs().max() < 1e-15, "A symmetric");
         let e = DMatrix::from_row_slice(
             3,
             3,
@@ -1121,22 +991,10 @@ mod tests {
             })
             .collect();
         let obs = vec![
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.3,
-                state: 1,
-            },
-            StateObs {
-                time: 2.1,
-                state: 1,
-            },
-            StateObs {
-                time: 4.0,
-                state: 0,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.3, state: 1 },
+            StateObs { time: 2.1, state: 1 },
+            StateObs { time: 4.0, state: 0 },
         ];
         let q = build(&theta);
         let (v, g) = ctmm_data_term_grad(&q, &dq, &obs)
@@ -1153,11 +1011,7 @@ mod tests {
             let fd = (ctmm_data_term(&build(&tp), &obs).unwrap()
                 - ctmm_data_term(&build(&tm), &obs).unwrap())
                 / (2.0 * h);
-            assert!(
-                (g[a] - fd).abs() < 1e-6,
-                "axis {a}: analytic {}, FD {fd}",
-                g[a]
-            );
+            assert!((g[a] - fd).abs() < 1e-6, "axis {a}: analytic {}, FD {fd}", g[a]);
         }
     }
 
@@ -1169,16 +1023,7 @@ mod tests {
         let big = MAX_EXP_ARG_ABS;
         let q = DMatrix::from_row_slice(2, 2, &[-big, big, big, -big]);
         let dq = vec![DMatrix::<f64>::zeros(2, 2)];
-        let obs = vec![
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 10.0,
-                state: 1,
-            },
-        ];
+        let obs = vec![StateObs { time: 0.0, state: 0 }, StateObs { time: 10.0, state: 1 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
         assert!(ctmm_data_term_grad(&q, &dq, &obs).unwrap().is_none());
     }
@@ -1191,16 +1036,7 @@ mod tests {
     fn data_term_grad_rejects_a_misshapen_derivative() {
         let q = DMatrix::from_row_slice(2, 2, &[-0.5, 0.5, 0.3, -0.3]);
         let dq = vec![DMatrix::<f64>::zeros(3, 3)];
-        let obs = vec![
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-        ];
+        let obs = vec![StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 1 }];
         assert!(matches!(
             ctmm_data_term_grad(&q, &dq, &obs),
             Err(MarkovError::DerivativeShapeMismatch { axis: 0, .. })
@@ -1227,18 +1063,9 @@ mod tests {
         let (a, b) = (0.7, 0.3);
         let q = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
         let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 3.0,
-                state: 1,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 3.0, state: 1 },
         ];
         let p1 = exact_2state(a, b, 1.0)[(0, 1)];
         let p2 = exact_2state(a, b, 2.0)[(1, 1)];
@@ -1255,18 +1082,9 @@ mod tests {
         let (a, b) = (0.6, 0.9);
         let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -b, b, 0.0, 0.0, 0.0]);
         let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 2.5,
-                state: 2,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 2.5, state: 2 },
         ];
         let p01 = exact_seq3(a, b, 1.0)[(0, 1)]; // 0 → 1 over Δt = 1.0
         let p12 = exact_seq3(a, b, 1.5)[(1, 2)]; // 1 → 2 over Δt = 1.5
@@ -1279,17 +1097,7 @@ mod tests {
     fn data_term_fewer_than_two_obs_is_zero() {
         let q = generator_3();
         assert_eq!(ctmm_data_term(&q, &[]).unwrap(), 0.0);
-        assert_eq!(
-            ctmm_data_term(
-                &q,
-                &[StateObs {
-                    time: 0.0,
-                    state: 1
-                }]
-            )
-            .unwrap(),
-            0.0
-        );
+        assert_eq!(ctmm_data_term(&q, &[StateObs { time: 0.0, state: 1 }]).unwrap(), 0.0);
     }
 
     #[test]
@@ -1297,36 +1105,15 @@ mod tests {
         let (a, b) = (0.7, 0.3);
         let q = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
         let with_dup = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            }, // duplicate timestamp, same state
-            StateObs {
-                time: 3.0,
-                state: 1,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 1.0, state: 1 }, // duplicate timestamp, same state
+            StateObs { time: 3.0, state: 1 },
         ];
         let without = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 3.0,
-                state: 1,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 3.0, state: 1 },
         ];
         let a1 = ctmm_data_term(&q, &with_dup).unwrap();
         let a2 = ctmm_data_term(&q, &without).unwrap();
@@ -1340,16 +1127,7 @@ mod tests {
         // State 1 absorbing; P(dt)[0,0] = e^{-1000·dt} underflows to 0. Observing
         // 0 → 0 across dt=1 is a (numerically) impossible transition.
         let q = DMatrix::from_row_slice(2, 2, &[-1000.0, 1000.0, 0.0, 0.0]);
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 0,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 0 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
@@ -1359,16 +1137,7 @@ mod tests {
         // nalgebra's expm — whose internal LU-solve `.unwrap()` can panic on a
         // non-finite input. It is the degenerate case → sentinel, not a panic.
         let q = DMatrix::from_row_slice(2, 2, &[f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0]);
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 1 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
@@ -1384,16 +1153,7 @@ mod tests {
         // Precondition: the argument really is finite, so finiteness alone is not
         // enough to catch it — the magnitude bound is what does.
         assert!((&q * 1.0).iter().all(|x: &f64| x.is_finite()));
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 1 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
@@ -1404,16 +1164,7 @@ mod tests {
         // optimizer toward the malformed input. The `p.min(1.0)` clamp makes the
         // contribution exactly 0, never negative.
         let q = DMatrix::from_row_slice(2, 2, &[5.0, 0.0, 0.0, 5.0]); // P[0,0] = e^5 > 1
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 0,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 0 }];
         let nll = ctmm_data_term(&q, &obs).unwrap();
         assert!(nll >= 0.0, "nll must never be negative, got {nll}");
         assert_eq!(nll, 0.0, "clamped p = 1 ⇒ −log 1 = 0");
@@ -1432,33 +1183,18 @@ mod tests {
     #[test]
     fn data_term_rejects_too_few_states() {
         let q = DMatrix::from_row_slice(1, 1, &[0.0]);
-        assert_eq!(
-            ctmm_data_term(&q, &[]).unwrap_err(),
-            MarkovError::TooFewStates { n: 1 }
-        );
+        assert_eq!(ctmm_data_term(&q, &[]).unwrap_err(), MarkovError::TooFewStates { n: 1 });
     }
 
     #[test]
     fn data_term_rejects_state_out_of_range() {
         let q = generator_3();
         let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 3,
-            }, // valid states are 0..=2
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 3 }, // valid states are 0..=2
         ];
         let err = ctmm_data_term(&q, &obs).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::StateOutOfRange {
-                state: 3,
-                n_states: 3
-            }
-        );
+        assert_eq!(err, MarkovError::StateOutOfRange { state: 3, n_states: 3 });
         assert!(err.to_string().contains("out of range"));
     }
 
@@ -1467,16 +1203,7 @@ mod tests {
         let q = generator_3();
         // NaN: `NaN != NaN`, so match the variant + `is_nan()` rather than
         // `assert_eq!` (which can never hold for a NaN-bearing error).
-        let obs_nan = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: f64::NAN,
-                state: 1,
-            },
-        ];
+        let obs_nan = [StateObs { time: 0.0, state: 0 }, StateObs { time: f64::NAN, state: 1 }];
         match ctmm_data_term(&q, &obs_nan).unwrap_err() {
             MarkovError::NonFiniteTime { index, time } => {
                 assert_eq!(index, 1);
@@ -1485,24 +1212,10 @@ mod tests {
             other => panic!("expected NonFiniteTime, got {other:?}"),
         }
         // +inf is `PartialEq`-comparable and exercises the Display message.
-        let obs_inf = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: f64::INFINITY,
-                state: 1,
-            },
-        ];
+        let obs_inf =
+            [StateObs { time: 0.0, state: 0 }, StateObs { time: f64::INFINITY, state: 1 }];
         let err = ctmm_data_term(&q, &obs_inf).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::NonFiniteTime {
-                index: 1,
-                time: f64::INFINITY
-            }
-        );
+        assert_eq!(err, MarkovError::NonFiniteTime { index: 1, time: f64::INFINITY });
         assert!(err.to_string().contains("not finite"));
     }
 
@@ -1510,24 +1223,11 @@ mod tests {
     fn data_term_rejects_decreasing_time() {
         let q = generator_3();
         let obs = [
-            StateObs {
-                time: 2.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            }, // goes backwards
+            StateObs { time: 2.0, state: 0 },
+            StateObs { time: 1.0, state: 1 }, // goes backwards
         ];
         let err = ctmm_data_term(&q, &obs).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::TimeDecreased {
-                index: 1,
-                prev: 2.0,
-                next: 1.0
-            }
-        );
+        assert_eq!(err, MarkovError::TimeDecreased { index: 1, prev: 2.0, next: 1.0 });
         assert!(err.to_string().contains("non-decreasing"));
     }
 
@@ -1535,25 +1235,11 @@ mod tests {
     fn data_term_rejects_zero_dt_state_change() {
         let q = generator_3();
         let obs = [
-            StateObs {
-                time: 1.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 2,
-            }, // same instant, different state
+            StateObs { time: 1.0, state: 0 },
+            StateObs { time: 1.0, state: 2 }, // same instant, different state
         ];
         let err = ctmm_data_term(&q, &obs).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::ZeroDtStateChange {
-                index: 1,
-                time: 1.0,
-                from: 0,
-                to: 2
-            }
-        );
+        assert_eq!(err, MarkovError::ZeroDtStateChange { index: 1, time: 1.0, from: 0, to: 2 });
         assert!(err.to_string().contains("Δt > 0"));
     }
 
@@ -1697,20 +1383,12 @@ mod tests {
             let pq = p * q_at(t);
             (0..s * s).map(|r| pq[(r / s, r % s)]).collect()
         };
-        let u: Vec<f64> = (0..s * s)
-            .map(|r| 0.3 + 0.17 * r as f64 - 0.05 * (r * r) as f64)
-            .collect();
+        let u: Vec<f64> =
+            (0..s * s).map(|r| 0.3 + 0.17 * r as f64 - 0.05 * (r * r) as f64).collect();
         let t = 0.8;
         let (q, dq) = (q_at(t), dq_at(t));
         let (mut jac, mut ft) = (vec![f64::NAN; s.pow(4)], vec![f64::NAN; s * s]);
-        kolmogorov_jacobian(
-            &u,
-            |a, b| q[(a, b)],
-            |a, b| dq[(a, b)],
-            s,
-            &mut jac,
-            &mut ft,
-        );
+        kolmogorov_jacobian(&u, |a, b| q[(a, b)], |a, b| dq[(a, b)], s, &mut jac, &mut ft);
         let h = 1e-5;
         let (mut worst_j, mut worst_t) = (0.0f64, 0.0f64);
         for c in 0..s * s {
@@ -1751,10 +1429,9 @@ mod tests {
         // (Rosenbrock23), the differenced 7.4e-8 / 2.2e-8; an `f_t` of `P·Q` in place of
         // `P·∂Q/∂τ` misses by 3.2e-6 / 1.3e-7, so the step reads the `f_t` it is handed. (At
         // 1e-6 and 1e-8 every variant sits at the stepper's noise, 1e-12–1e-9.)
-        for (method, bound) in [
-            (crate::ode::OdeMethod::Rodas4, 3e-7),
-            (crate::ode::OdeMethod::Rosenbrock23, 6e-8),
-        ] {
+        for (method, bound) in
+            [(crate::ode::OdeMethod::Rodas4, 3e-7), (crate::ode::OdeMethod::Rosenbrock23, 6e-8)]
+        {
             let opts = crate::ode::OdeSolverOptions {
                 method,
                 reltol: 1e-4,
@@ -1773,15 +1450,9 @@ mod tests {
                 "stiff occupancy {method:?}: exact-J {err:.2e}, FD-J {:.2e}",
                 max_abs_diff(&fd, &want)
             );
-            assert!(
-                err.is_finite() && err < bound,
-                "{method:?}: exact-J {err:.2e}"
-            );
+            assert!(err.is_finite() && err < bound, "{method:?}: exact-J {err:.2e}");
             // The registration is what the step read: differenced, the bits move.
-            assert_ne!(
-                exact, fd,
-                "{method:?}: the stiff step never took the exact J"
-            );
+            assert_ne!(exact, fd, "{method:?}: the stiff step never took the exact J");
         }
     }
 }

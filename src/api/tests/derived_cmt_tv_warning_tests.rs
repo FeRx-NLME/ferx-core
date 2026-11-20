@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
+use std::collections::HashMap;
 
 /// A 1-cpt IV ODE model. `cl` is the CL line, `rhs_factor` multiplies the elimination
 /// rate. The elimination is saturable with a `Km` far above any amount in the data, so
@@ -85,7 +86,6 @@ fn subject(cell: Cell) -> Subject {
     let n = obs_times.len();
     let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -106,25 +106,9 @@ fn subject(cell: Cell) -> Subject {
             Vec::new()
         },
         obs_times,
-        obs_raw_times: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
         reset_times: if cell.reset { vec![26.0] } else { Vec::new() },
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -145,11 +129,7 @@ fn worst_state_vs_ipred(model: &CompiledModel, cell: Cell) -> f64 {
     let s = subject(cell);
     let theta = &model.default_params.theta;
     let (ipred, states) = crate::pk::compute_predictions_with_states(model, &s, theta, &[0.0]);
-    assert_eq!(
-        states.len(),
-        ipred.len(),
-        "one state vector per observation"
-    );
+    assert_eq!(states.len(), ipred.len(), "one state vector per observation");
     let v = theta[1];
     ipred
         .iter()
@@ -184,18 +164,9 @@ fn which_cells_freeze_the_disposition_is_measured() {
     let plain = ode_model(CL_PLAIN, "1");
     let rhs_time = ode_model(CL_PLAIN, "(1 + 0.05 * TIME)");
     let pk_time = ode_model(CL_TIME, "1");
-    let none = Cell {
-        tv_cov: false,
-        reset: false,
-    };
-    let reset = Cell {
-        tv_cov: false,
-        reset: true,
-    };
-    let tv = Cell {
-        tv_cov: true,
-        reset: false,
-    };
+    let none = Cell { tv_cov: false, reset: false };
+    let reset = Cell { tv_cov: false, reset: true };
+    let tv = Cell { tv_cov: true, reset: false };
 
     let exact = [
         ("plain", worst_state_vs_ipred(&plain, none)),
@@ -208,34 +179,16 @@ fn which_cells_freeze_the_disposition_is_measured() {
     ];
     eprintln!("exact cells: {exact:?}\napproximate cells: {approx:?}");
     for (name, gap) in exact {
-        assert!(
-            gap < 1e-3,
-            "{name}: states should be exact, worst gap {gap:e}"
-        );
+        assert!(gap < 1e-3, "{name}: states should be exact, worst gap {gap:e}");
     }
     for (name, gap) in approx {
-        assert!(
-            gap > 0.3,
-            "{name}: states should be approximate, worst gap {gap:e}"
-        );
+        assert!(gap > 0.3, "{name}: states should be approximate, worst gap {gap:e}");
     }
     // The warning's predicate agrees with the measurement, cell by cell.
-    assert!(!crate::pk::ode_cmt_states_approximate(
-        &plain,
-        &subject(none)
-    ));
-    assert!(!crate::pk::ode_cmt_states_approximate(
-        &plain,
-        &subject(reset)
-    ));
-    assert!(!crate::pk::ode_cmt_states_approximate(
-        &rhs_time,
-        &subject(none)
-    ));
-    assert!(crate::pk::ode_cmt_states_approximate(
-        &pk_time,
-        &subject(none)
-    ));
+    assert!(!crate::pk::ode_cmt_states_approximate(&plain, &subject(none)));
+    assert!(!crate::pk::ode_cmt_states_approximate(&plain, &subject(reset)));
+    assert!(!crate::pk::ode_cmt_states_approximate(&rhs_time, &subject(none)));
+    assert!(crate::pk::ode_cmt_states_approximate(&pk_time, &subject(none)));
     assert!(crate::pk::ode_cmt_states_approximate(&plain, &subject(tv)));
 }
 
@@ -251,18 +204,9 @@ fn warnings_for(model: &CompiledModel, cells: &[Cell]) -> Vec<String> {
     )
 }
 
-const NONE: Cell = Cell {
-    tv_cov: false,
-    reset: false,
-};
-const RESET: Cell = Cell {
-    tv_cov: false,
-    reset: true,
-};
-const TV: Cell = Cell {
-    tv_cov: true,
-    reset: false,
-};
+const NONE: Cell = Cell { tv_cov: false, reset: false };
+const RESET: Cell = Cell { tv_cov: false, reset: true };
+const TV: Cell = Cell { tv_cov: true, reset: false };
 
 fn ode_msg(cause: &str) -> String {
     format!(
@@ -297,15 +241,9 @@ fn ode_exact_cells_are_silent() {
 #[test]
 fn ode_time_reading_individual_params_warn() {
     let m = ode_model(CL_TIME, "1");
-    assert_eq!(
-        warnings_for(&m, &[NONE]),
-        vec![ode_msg("individual parameters that read TIME")]
-    );
+    assert_eq!(warnings_for(&m, &[NONE]), vec![ode_msg("individual parameters that read TIME")]);
     // A reset does not change the cause.
-    assert_eq!(
-        warnings_for(&m, &[RESET]),
-        vec![ode_msg("individual parameters that read TIME")]
-    );
+    assert_eq!(warnings_for(&m, &[RESET]), vec![ode_msg("individual parameters that read TIME")]);
 }
 
 /// TV covariates alone name covariates and not `TIME`; with both present, both.
@@ -315,19 +253,11 @@ fn ode_time_reading_individual_params_warn() {
 fn ode_cause_names_what_is_present() {
     let plain = ode_model(CL_PLAIN, "1");
     let time = ode_model(CL_TIME, "1");
-    assert_eq!(
-        warnings_for(&plain, &[TV]),
-        vec![ode_msg("time-varying covariates")]
-    );
-    assert_eq!(
-        warnings_for(&plain, &[NONE, TV, RESET]),
-        vec![ode_msg("time-varying covariates")]
-    );
+    assert_eq!(warnings_for(&plain, &[TV]), vec![ode_msg("time-varying covariates")]);
+    assert_eq!(warnings_for(&plain, &[NONE, TV, RESET]), vec![ode_msg("time-varying covariates")]);
     assert_eq!(
         warnings_for(&time, &[TV]),
-        vec![ode_msg(
-            "time-varying covariates or individual parameters that read TIME"
-        )]
+        vec![ode_msg("time-varying covariates or individual parameters that read TIME")]
     );
 }
 
@@ -339,28 +269,20 @@ fn analytical_cells() {
     let plain = analytical_model(CL_PLAIN);
     let time = analytical_model(CL_TIME);
     assert!(warnings_for(&plain, &[NONE]).is_empty());
-    assert_eq!(
-        warnings_for(&plain, &[TV]),
-        vec![analytical_msg("time-varying covariates")]
-    );
+    assert_eq!(warnings_for(&plain, &[TV]), vec![analytical_msg("time-varying covariates")]);
     assert_eq!(
         warnings_for(&time, &[NONE]),
         vec![analytical_msg("individual parameters that read TIME")]
     );
     assert_eq!(
         warnings_for(&time, &[TV]),
-        vec![analytical_msg(
-            "time-varying covariates or individual parameters that read TIME"
-        )]
+        vec![analytical_msg("time-varying covariates or individual parameters that read TIME")]
     );
     // The analytical NaN claim is the state path's actual behaviour on the TIME cell.
     let s = subject(NONE);
     let (_, states) =
         crate::pk::compute_predictions_with_states(&time, &s, &time.default_params.theta, &[0.0]);
-    assert!(
-        states.is_empty(),
-        "TIME-reading analytical states must be empty"
-    );
+    assert!(states.is_empty(), "TIME-reading analytical states must be empty");
 }
 
 /// An IOV subject is skipped — its states are empty under `W_DERIVED_CMT_IOV_UNSUPPORTED`.
@@ -384,18 +306,11 @@ fn iov_subjects_are_skipped() {
 fn fit_pushes_the_time_warning() {
     let m = ode_model(CL_TIME, "1");
     let pop = population(&[NONE, NONE]);
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..Default::default()
-    }
-    .quiet();
+    let opts =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..Default::default() }.quiet();
     let result = fit(&m, &pop, &m.default_params, &opts).expect("the evaluation must succeed");
-    let hits: Vec<_> = result
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_DERIVED_CMT_TV"))
-        .collect();
+    let hits: Vec<_> =
+        result.warnings.iter().filter(|w| w.starts_with("W_DERIVED_CMT_TV")).collect();
     assert_eq!(
         hits,
         vec![&ode_msg("individual parameters that read TIME")],

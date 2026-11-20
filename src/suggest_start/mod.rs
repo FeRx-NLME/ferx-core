@@ -76,9 +76,7 @@ pub enum NcaInit {
 /// deliver into, is an `Err` carrying the text `fit()` gives for that precondition (#898).
 /// These are the only two it checks.
 pub fn inits_from_nca(
-    model: &CompiledModel,
-    population: &Population,
-    method: NcaInit,
+    model: &CompiledModel, population: &Population, method: NcaInit,
 ) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     // Reached from `fit()` (which validates first) but also a standalone public
     // entrypoint; the Sweep/Ebe strategies predict, so guard the modeled-`RATE`
@@ -117,8 +115,7 @@ fn nca_only(model: &CompiledModel, population: &Population) -> SuggestedStart {
 /// where peeling succeeded, 0–2 thetas remain; for a PD model with 5 free
 /// parameters, ~45 calls (~50 ms on 100 subjects).
 fn nca_with_sweep(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     let mut base = nca_only(model, population);
 
@@ -143,11 +140,8 @@ fn nca_with_sweep(
     // least one of: (a) it is a TV parameter referenced via mu_refs, or (b) it maps
     // to a known PK slot (CL, V, Q, V2, Ka, F, Q3, V3, LAGTIME).
     {
-        let mu_ref_theta_names: std::collections::HashSet<&str> = model
-            .mu_refs
-            .values()
-            .map(|mr| mr.theta_name.as_str())
-            .collect();
+        let mu_ref_theta_names: std::collections::HashSet<&str> =
+            model.mu_refs.values().map(|mr| mr.theta_name.as_str()).collect();
         let pk_slot_indices: std::collections::HashSet<usize> = [
             PK_IDX_CL,
             PK_IDX_V,
@@ -193,16 +187,8 @@ fn nca_with_sweep(
         let idx_b = find_theta_for_slot(model, *slot_b);
         if let (Some(ia), Some(ib)) = (idx_a, idx_b) {
             if ia != ib && remaining.contains(&ia) && remaining.contains(&ib) {
-                let (swept, w) = sweep_slots(
-                    model,
-                    population,
-                    &base.params,
-                    *slot_a,
-                    *slot_b,
-                    9,
-                    10.0,
-                    label,
-                )?;
+                let (swept, w) =
+                    sweep_slots(model, population, &base.params, *slot_a, *slot_b, 9, 10.0, label)?;
                 base.params = swept;
                 base.warnings.extend(w);
                 remaining.retain(|&i| i != ia && i != ib);
@@ -247,8 +233,7 @@ fn nca_with_sweep(
 ///
 /// Typical wall-clock cost on a 30-subject analytical 2-cpt model: 200–500 ms.
 fn nca_with_ebe(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     // ODE fallback: EBE sweeps require per-subject numerical integration per
     // inner iteration — too slow (~minutes) and unreliable from uninformed
@@ -424,18 +409,16 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     // `par_iter` would otherwise land on Rayon's global pool at one worker per logical
     // CPU regardless of the requested thread count (#1460).
     let per_subject: Vec<SubjectNca> =
-        crate::api::install_on_engine_pool(|| match model.pk_model {
+        crate::pool::install_on_engine_pool(|| match model.pk_model {
             PkModel::OneCptOral
             | PkModel::OneCptTransit
             | PkModel::OneCptIg
             | PkModel::TwoCptOral
             | PkModel::TwoCptTransit
             | PkModel::TwoCptIg
-            | PkModel::ThreeCptOral => population
-                .subjects
-                .par_iter()
-                .map(nca_one_cpt_oral)
-                .collect(),
+            | PkModel::ThreeCptOral => {
+                population.subjects.par_iter().map(nca_one_cpt_oral).collect()
+            }
 
             PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv => {
                 population.subjects.par_iter().map(nca_one_cpt_iv).collect()
@@ -481,10 +464,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
 /// We store A, α, B, β back through the existing vss field as a proxy and
 /// handle conversion in `build_params`.
 fn try_biexp_peel(
-    _model: &CompiledModel,
-    population: &Population,
-    pop: &mut PopNca,
-    warnings: &mut Vec<String>,
+    _model: &CompiledModel, population: &Population, pop: &mut PopNca, warnings: &mut Vec<String>,
 ) {
     // Build pooled dose-normalised time-concentration from all subjects.
     let mut all_pairs: Vec<(f64, f64)> = Vec::new();
@@ -747,10 +727,8 @@ fn resolve_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> SlotTheta {
             (eta, anchor, idx)
         })
         .collect();
-    let mut anchors: Vec<(&str, Option<usize>)> = candidates
-        .iter()
-        .map(|(_, a, idx)| (a.as_str(), *idx))
-        .collect();
+    let mut anchors: Vec<(&str, Option<usize>)> =
+        candidates.iter().map(|(_, a, idx)| (a.as_str(), *idx)).collect();
     anchors.sort_unstable();
     anchors.dedup();
     match anchors.as_slice() {
@@ -759,10 +737,7 @@ fn resolve_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> SlotTheta {
         [(anchor, None)] => return SlotTheta::NotATheta(anchor.to_string()),
         _ => {
             return SlotTheta::Ambiguous(
-                candidates
-                    .into_iter()
-                    .map(|(eta, anchor, _)| (eta, anchor))
-                    .collect(),
+                candidates.into_iter().map(|(eta, anchor, _)| (eta, anchor)).collect(),
             )
         }
     }
@@ -837,11 +812,7 @@ fn best_theta_name_match(theta_names: &[String], param: &str) -> NameMatch {
     let Some(best) = ranked.iter().map(|&(r, _)| r).min() else {
         return NameMatch::Missing;
     };
-    let top: Vec<usize> = ranked
-        .into_iter()
-        .filter(|&(r, _)| r == best)
-        .map(|(_, i)| i)
-        .collect();
+    let top: Vec<usize> = ranked.into_iter().filter(|&(r, _)| r == best).map(|(_, i)| i).collect();
     match top.as_slice() {
         [idx] => NameMatch::Found(*idx),
         _ => NameMatch::Tied(top),
@@ -877,12 +848,7 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
     let [(eta, _)] = candidates.as_slice() else {
         return None;
     };
-    model
-        .default_params
-        .omega
-        .eta_names
-        .iter()
-        .position(|n| n == eta)
+    model.default_params.omega.eta_names.iter().position(|n| n == eta)
 }
 
 /// The warning for a slot [`resolve_theta_for_slot`] declined, or `None` for a
@@ -890,10 +856,7 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
 /// `None` there keeps a slot silent that the model need not have at all (Q, V2,
 /// lag time).
 fn slot_routing_warning(
-    model: &CompiledModel,
-    pk_slot: usize,
-    label: &str,
-    fallback: Option<&str>,
+    model: &CompiledModel, pk_slot: usize, label: &str, fallback: Option<&str>,
 ) -> Option<String> {
     match resolve_theta_for_slot(model, pk_slot) {
         SlotTheta::Theta(_) => None,
@@ -963,10 +926,7 @@ struct GuardedSlots {
 impl GuardedSlots {
     /// The θ a role's estimate may be written to.
     fn theta(&self, pk_slot: usize) -> Option<usize> {
-        self.thetas
-            .iter()
-            .find(|&&(slot, _)| slot == pk_slot)
-            .and_then(|&(_, idx)| idx)
+        self.thetas.iter().find(|&&(slot, _)| slot == pk_slot).and_then(|&(_, idx)| idx)
     }
 
     /// Whether θ `idx` is shared by two roles, so keeps its model default — in
@@ -1032,9 +992,7 @@ fn guard_slot_thetas(model: &CompiledModel) -> GuardedSlots {
 
 /// Route pooled NCA estimates to theta slots and return updated ModelParameters.
 fn build_params(
-    model: &CompiledModel,
-    pop: &PopNca,
-    warnings: &mut Vec<String>,
+    model: &CompiledModel, pop: &PopNca, warnings: &mut Vec<String>,
 ) -> ModelParameters {
     let mut params = model.default_params.clone();
 
@@ -1121,13 +1079,7 @@ fn build_params(
     // CL/F; multiply by f_scale (= F_default) to recover the true CL.
     if let Some(cl) = pop.cl_f {
         if let Some(idx) = cl_idx {
-            write_theta(
-                &mut params,
-                idx,
-                cl * f_scale / scale_factor,
-                "CL",
-                warnings,
-            );
+            write_theta(&mut params, idx, cl * f_scale / scale_factor, "CL", warnings);
         } else {
             warnings.extend(slot_routing_warning(
                 model,
@@ -1143,13 +1095,7 @@ fn build_params(
     // Write V / V1.  Same f_scale correction as CL.
     if let Some(v) = pop.v_f {
         if let Some(idx) = v_idx {
-            write_theta(
-                &mut params,
-                idx,
-                v * f_scale / scale_factor,
-                "V/V1",
-                warnings,
-            );
+            write_theta(&mut params, idx, v * f_scale / scale_factor, "V/V1", warnings);
         } else {
             warnings.extend(slot_routing_warning(
                 model,
@@ -1289,10 +1235,7 @@ mod tests {
         // invisible.
         let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).unwrap();
         assert!(
-            matches!(
-                model.pk_model,
-                PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv
-            ),
+            matches!(model.pk_model, PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv),
             "fixture must take the IV arm, got {:?}",
             model.pk_model
         );
@@ -1322,10 +1265,7 @@ mod tests {
         for (i, &theta) in result.params.theta.iter().enumerate() {
             let lo = result.params.theta_lower[i];
             let hi = result.params.theta_upper[i];
-            assert!(
-                theta >= lo && theta <= hi,
-                "theta[{i}] = {theta} outside bounds [{lo}, {hi}]"
-            );
+            assert!(theta >= lo && theta <= hi, "theta[{i}] = {theta} outside bounds [{lo}, {hi}]");
         }
     }
 
@@ -1337,10 +1277,7 @@ mod tests {
         let original_val = model.default_params.theta[0];
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
         let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
-        assert_eq!(
-            result.params.theta[0], original_val,
-            "fixed theta must not be overwritten"
-        );
+        assert_eq!(result.params.theta[0], original_val, "fixed theta must not be overwritten");
     }
 
     // The early returns of `nca_with_sweep` / `nca_with_ebe` below return `Ok` since
@@ -1393,19 +1330,12 @@ mod tests {
     #[test]
     fn nca_ebe_returns_ok_when_every_theta_is_fixed() {
         let mut model = parse_model_file(Path::new("examples/warfarin.ferx")).unwrap();
-        model
-            .default_params
-            .theta_fixed
-            .iter_mut()
-            .for_each(|f| *f = true);
+        model.default_params.theta_fixed.iter_mut().for_each(|f| *f = true);
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
         let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
         assert_eq!(result.params.theta, model.default_params.theta);
         assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|w| w.contains("covariate theta")),
+            !result.warnings.iter().any(|w| w.contains("covariate theta")),
             "no theta reaches the covariate filter, got: {:?}",
             result.warnings
         );
@@ -1417,12 +1347,7 @@ mod tests {
         // EBE sweep. Fixing the lognormal thetas leaves it the only one to sweep, so the
         // fit reaches `nca_with_ebe`'s final `Ok` through that arm alone.
         let mut model = parse_model_file(Path::new("examples/warfarin_logit_f.ferx")).unwrap();
-        let f_idx = model
-            .default_params
-            .theta_names
-            .iter()
-            .position(|n| n == "THETA_F")
-            .unwrap();
+        let f_idx = model.default_params.theta_names.iter().position(|n| n == "THETA_F").unwrap();
         for (i, fixed) in model.default_params.theta_fixed.iter_mut().enumerate() {
             *fixed = i != f_idx;
         }
@@ -1436,10 +1361,7 @@ mod tests {
             result.params.theta_lower[f_idx],
             result.params.theta_upper[f_idx],
         );
-        assert!(
-            f.is_finite() && f >= lo && f <= hi,
-            "THETA_F = {f} outside [{lo}, {hi}]"
-        );
+        assert!(f.is_finite() && f >= lo && f <= hi, "THETA_F = {f} outside [{lo}, {hi}]");
         assert_ne!(
             f, model.default_params.theta[f_idx],
             "the logit sweep must move THETA_F off its default"
@@ -1503,19 +1425,14 @@ mod tests {
         // regression here would be invisible on the fixture above.
         let after =
             allometric_cl_model("  CL = TVCL * exp(ETA_CL)\n  CLWT = exp(CLWT_EXP * log(WT/70))\n");
-        for (label, src) in [
-            ("CLWT first", allometric_cl_intermediate_first()),
-            ("CLWT last", after),
-        ] {
+        for (label, src) in
+            [("CLWT first", allometric_cl_intermediate_first()), ("CLWT last", after)]
+        {
             let m = crate::parser::model_parser::parse_model_string(&src)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             // The precondition: `CLWT` really does carry CL's slot, so the old scan
             // could not tell the two apart.
-            let clwt_pos = m
-                .indiv_param_names
-                .iter()
-                .position(|n| n == "CLWT")
-                .unwrap();
+            let clwt_pos = m.indiv_param_names.iter().position(|n| n == "CLWT").unwrap();
             assert_eq!(
                 m.pk_indices[clwt_pos], PK_IDX_CL,
                 "{label}: CLWT must still carry the placeholder slot"
@@ -1545,11 +1462,7 @@ mod tests {
             let n = idxs.len();
             let mut uniq = idxs.to_vec();
             uniq.dedup();
-            assert_eq!(
-                uniq.len(),
-                n,
-                "{label}: two PK slots share a theta: {idxs:?}"
-            );
+            assert_eq!(uniq.len(), n, "{label}: two PK slots share a theta: {idxs:?}");
         }
     }
 
@@ -1569,11 +1482,7 @@ mod tests {
         );
         // The premise: the first theta containing `V` is `TVCL`.
         assert_eq!(
-            m.default_params
-                .theta_names
-                .iter()
-                .find(|n| n.contains('V'))
-                .map(String::as_str),
+            m.default_params.theta_names.iter().find(|n| n.contains('V')).map(String::as_str),
             Some("TVCL")
         );
         let cl = find_theta_for_slot(&m, PK_IDX_CL).expect("CL theta");
@@ -1595,10 +1504,7 @@ mod tests {
             &allometric_cl_intermediate_first()
                 .replace("theta TVV(", "theta THETA_VOL(")
                 .replace("  omega ETA_V ~ 0.04\n", "  omega ETA_VOL ~ 0.04\n")
-                .replace(
-                    "  V = TVV * exp(ETA_V)\n",
-                    "  V = THETA_VOL * exp(ETA_VOL)\n",
-                ),
+                .replace("  V = TVV * exp(ETA_V)\n", "  V = THETA_VOL * exp(ETA_VOL)\n"),
         )
         .expect("parses");
         assert_eq!(
@@ -1701,8 +1607,7 @@ mod tests {
         ];
         for (label, slot, name) in owners {
             assert_eq!(
-                m.indiv_param_for_pk_slot(slot)
-                    .map(|i| m.indiv_param_names[i].as_str()),
+                m.indiv_param_for_pk_slot(slot).map(|i| m.indiv_param_names[i].as_str()),
                 Some(name),
                 "{label}: slot {slot} must resolve to {name}"
             );
@@ -1710,10 +1615,8 @@ mod tests {
         // The two slots whose parameter carries a matching eta reach their theta
         // through layer 1 only — nothing in `theta_names` contains `LAGTIME` or a
         // bare `F`-like canonical token, so losing the owner route loses the theta.
-        for (label, slot, theta) in [
-            ("LAGTIME", PK_IDX_LAGTIME, "TLAG"),
-            ("F", PK_IDX_F, "THBIO"),
-        ] {
+        for (label, slot, theta) in [("LAGTIME", PK_IDX_LAGTIME, "TLAG"), ("F", PK_IDX_F, "THBIO")]
+        {
             assert_eq!(
                 find_theta_for_slot(&m, slot).map(|i| m.default_params.theta_names[i].as_str()),
                 Some(theta),
@@ -1757,11 +1660,7 @@ mod tests {
             None,
             "a literal-bound role owns no individual parameter"
         );
-        assert!(m
-            .default_params
-            .theta_names
-            .iter()
-            .any(|n| n.contains("CL")));
+        assert!(m.default_params.theta_names.iter().any(|n| n.contains("CL")));
         assert_eq!(resolve_theta_for_slot(&m, PK_IDX_CL), SlotTheta::Unowned);
         assert_eq!(find_theta_for_slot(&m, PK_IDX_CL), None);
         assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_CL), None);
@@ -1775,12 +1674,7 @@ mod tests {
         let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
             .expect("data loads");
         let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
-        let i = out
-            .params
-            .theta_names
-            .iter()
-            .position(|n| n == "THCL_A")
-            .expect("THCL_A");
+        let i = out.params.theta_names.iter().position(|n| n == "THCL_A").expect("THCL_A");
         assert_eq!(
             out.params.theta[i], m.default_params.theta[i],
             "#1930: THCL_A must not receive the pooled clearance when `cl` is a literal"
@@ -1863,25 +1757,15 @@ mod tests {
 
         let mut orders_seen = std::collections::BTreeSet::new();
         for round in 0..64 {
-            let refs: std::collections::HashMap<String, crate::types::MuRef> = m
-                .mu_refs
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let first = refs
-                .keys()
-                .find(|e| e.ends_with("_CL"))
-                .cloned()
-                .expect("a qualifying eta");
+            let refs: std::collections::HashMap<String, crate::types::MuRef> =
+                m.mu_refs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let first =
+                refs.keys().find(|e| e.ends_with("_CL")).cloned().expect("a qualifying eta");
             orders_seen.insert(first);
             m.mu_refs = refs;
             let theta = find_theta_for_slot(&m, PK_IDX_CL)
                 .map(|i| m.default_params.theta_names[i].as_str());
-            assert_eq!(
-                theta,
-                Some("TVCL"),
-                "round {round}: CL must resolve to TVCL"
-            );
+            assert_eq!(theta, Some("TVCL"), "round {round}: CL must resolve to TVCL");
             let omega = find_omega_idx_for_slot(&m, PK_IDX_CL)
                 .map(|i| m.default_params.omega.eta_names[i].as_str());
             assert_eq!(omega, Some("ETA_CL"), "round {round}: CL's omega is ETA_CL");
@@ -1913,10 +1797,7 @@ mod tests {
         )
         .replace("  S = THS * exp(IIV_CL)\n", "");
         let m = crate::parser::model_parser::parse_model_string(&src).expect("parses");
-        assert!(
-            name_rule_may_use(&m, "CL", "IIV_CL"),
-            "premise: CL reads CLS"
-        );
+        assert!(name_rule_may_use(&m, "CL", "IIV_CL"), "premise: CL reads CLS");
         // The other side: CL reads only CLI, so IIV_CL is CLS's alone.
         let reads_one = src.replace("CL = CLI * CLS", "CL = CLI");
         let m1 = crate::parser::model_parser::parse_model_string(&reads_one).expect("parses");
@@ -1933,10 +1814,7 @@ mod tests {
         // The premise: neither eta's mu-reference is owned by CL, and both pass the
         // name rule with different thetas.
         assert!(
-            !m.indiv_param_partials
-                .mu_ref_owners
-                .values()
-                .any(|o| o == "CL"),
+            !m.indiv_param_partials.mu_ref_owners.values().any(|o| o == "CL"),
             "no mu-reference may be detected on CL itself: {:?}",
             m.indiv_param_partials.mu_ref_owners
         );
@@ -1970,12 +1848,7 @@ mod tests {
             .expect("data loads");
         let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
         for name in ["TVCL", "THS"] {
-            let i = out
-                .params
-                .theta_names
-                .iter()
-                .position(|n| n == name)
-                .unwrap();
+            let i = out.params.theta_names.iter().position(|n| n == name).unwrap();
             assert_eq!(
                 out.params.theta[i], m.default_params.theta[i],
                 "{name} must keep its default when CL's theta is ambiguous"
@@ -2029,11 +1902,7 @@ mod tests {
         let owners = &m.indiv_param_partials.mu_ref_owners;
         assert_eq!(owners.get("ETA_CL").map(String::as_str), Some("CL"));
         assert_eq!(m.mu_refs["ETA_CL"].theta_name, "TYPICAL_PK.CL");
-        assert!(!m
-            .default_params
-            .theta_names
-            .iter()
-            .any(|n| n == "TYPICAL_PK.CL"));
+        assert!(!m.default_params.theta_names.iter().any(|n| n == "TYPICAL_PK.CL"));
         assert_eq!(etas_named_for_cl(&m), vec!["ETA_CL", "IIV_CL"]);
         assert_eq!(m.mu_refs["IIV_CL"].theta_name, "THS");
 
@@ -2041,11 +1910,7 @@ mod tests {
             resolve_theta_for_slot(&m, PK_IDX_CL),
             SlotTheta::NotATheta("TYPICAL_PK.CL".into())
         );
-        assert_eq!(
-            find_theta_for_slot(&m, PK_IDX_CL),
-            None,
-            "THS must not be chosen"
-        );
+        assert_eq!(find_theta_for_slot(&m, PK_IDX_CL), None, "THS must not be chosen");
         assert_eq!(
             find_omega_idx_for_slot(&m, PK_IDX_CL)
                 .map(|i| m.default_params.omega.eta_names[i].as_str()),
@@ -2061,10 +1926,7 @@ mod tests {
         let mut w = Vec::new();
         w.extend(slot_routing_warning(&m, PK_IDX_CL, "CL", Some("unmapped")));
         assert_eq!(w.len(), 1);
-        assert!(
-            w[0].contains("CL not written") && w[0].contains("`TYPICAL_PK.CL`"),
-            "{w:?}"
-        );
+        assert!(w[0].contains("CL not written") && w[0].contains("`TYPICAL_PK.CL`"), "{w:?}");
     }
 
     /// Two spellings that resolved before #1922's fix and must keep resolving:
@@ -2101,11 +1963,7 @@ mod tests {
         let m = crate::parser::model_parser::parse_model_string(&renamed).expect("parses");
         // The premise: no theta before `TVV` contains `V`. (`TVKA` does, but later.)
         assert_eq!(
-            m.default_params
-                .theta_names
-                .iter()
-                .find(|n| n.contains('V'))
-                .map(String::as_str),
+            m.default_params.theta_names.iter().find(|n| n.contains('V')).map(String::as_str),
             Some("TVV"),
             "TVV must be the first theta whose name contains `V`, or the workaround \
              is not what is being tested: {:?}",
@@ -2113,10 +1971,7 @@ mod tests {
         );
         let cl = find_theta_for_slot(&m, PK_IDX_CL).expect("CL theta");
         let v = find_theta_for_slot(&m, PK_IDX_V).expect("V theta");
-        assert_eq!(
-            m.default_params.theta_names[cl], "THCL",
-            "CL still resolves"
-        );
+        assert_eq!(m.default_params.theta_names[cl], "THCL", "CL still resolves");
         assert_eq!(
             m.default_params.theta_names[v], "TVV",
             "a non-colliding theta name must let layer 2 reach TVV"
@@ -2145,11 +2000,7 @@ mod tests {
                     .iter()
                     .position(|n| n == name)
                     .unwrap_or_else(|| panic!("no theta {name}"));
-                (
-                    out.params.theta[i],
-                    m.default_params.theta[i],
-                    m.default_params.theta_upper[i],
-                )
+                (out.params.theta[i], m.default_params.theta[i], m.default_params.theta_upper[i])
             };
             (at("TVCL"), at("TVV"))
         };
@@ -2212,20 +2063,11 @@ mod tests {
         );
         // The defect's user-visible signature, both halves: before the fix the
         // clearance estimate went to `CLWT_EXP` and `TVCL` never moved.
-        assert_eq!(
-            exp_got, exp_default,
-            "the allometric exponent must be untouched by NCA"
-        );
+        assert_eq!(exp_got, exp_default, "the allometric exponent must be untouched by NCA");
         // `find_omega_idx_for_slot` returned `None` before the fix, so ETA_CL's
         // variance stayed at the model default; it is updated now (>= 3 subjects
         // have a valid NCA estimate in this dataset).
-        let om_i = out
-            .params
-            .omega
-            .eta_names
-            .iter()
-            .position(|n| n == "ETA_CL")
-            .expect("ETA_CL");
+        let om_i = out.params.omega.eta_names.iter().position(|n| n == "ETA_CL").expect("ETA_CL");
         let om_got = out.params.omega.matrix[(om_i, om_i)];
         let om_default = m.default_params.omega.matrix[(om_i, om_i)];
         assert!(
@@ -2263,27 +2105,17 @@ mod tests {
             ("CLWT_EXP", "CL", None),
             ("TVCL", "", None),
         ] {
-            assert_eq!(
-                theta_name_match_rank(theta, param),
-                want,
-                "{theta} vs {param}"
-            );
+            assert_eq!(theta_name_match_rank(theta, param), want, "{theta} vs {param}");
         }
         let names = |ns: &[&str]| ns.iter().map(|n| n.to_string()).collect::<Vec<_>>();
         // The whole-name match outranks a segment match.
-        assert_eq!(
-            best_theta_name_match(&names(&["CL_WT", "TVCL"]), "CL"),
-            NameMatch::Found(1)
-        );
+        assert_eq!(best_theta_name_match(&names(&["CL_WT", "TVCL"]), "CL"), NameMatch::Found(1));
         // Two at the best rank: ambiguous.
         assert_eq!(
             best_theta_name_match(&names(&["TV_CL", "THCL"]), "CL"),
             NameMatch::Tied(vec![0, 1])
         );
-        assert_eq!(
-            best_theta_name_match(&names(&["TVCL", "TVKA"]), "V"),
-            NameMatch::Missing
-        );
+        assert_eq!(best_theta_name_match(&names(&["TVCL", "TVKA"]), "V"), NameMatch::Missing);
     }
 
     /// An ambiguous layer **stops** the lookup rather than handing it to a weaker
@@ -2302,10 +2134,7 @@ mod tests {
              [error_model]\n  DV ~ proportional(PROP_ERR)\n";
         let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let names = &m.default_params.theta_names;
-        assert!(matches!(
-            best_theta_name_match(names, "VOL"),
-            NameMatch::Tied(_)
-        ));
+        assert!(matches!(best_theta_name_match(names, "VOL"), NameMatch::Tied(_)));
         let tvv = names.iter().position(|n| n == "TVV").unwrap();
         assert_eq!(
             best_theta_name_match(names, "V"),
@@ -2318,10 +2147,7 @@ mod tests {
         );
         assert_eq!(find_theta_for_slot(&m, PK_IDX_V), None);
         let w = slot_routing_warning(&m, PK_IDX_V, "V/V1", None).expect("a warning");
-        assert!(
-            w.contains("V/V1 not written") && w.contains("TVVOL, THVOL"),
-            "{w}"
-        );
+        assert!(w.contains("V/V1 not written") && w.contains("TVVOL, THVOL"), "{w}");
     }
 
     /// The η-name fallback must not borrow an η the parser attributed to another
@@ -2345,10 +2171,7 @@ mod tests {
         // name rule for CL — which does not depend on it.
         assert_eq!(m.mu_refs["ETA_CL"].theta_name, "THS");
         assert_eq!(
-            m.indiv_param_partials
-                .mu_ref_owners
-                .get("ETA_CL")
-                .map(String::as_str),
+            m.indiv_param_partials.mu_ref_owners.get("ETA_CL").map(String::as_str),
             Some("S")
         );
         assert_eq!(etas_named_for_cl(&m), vec!["ETA_CL"]);
@@ -2401,24 +2224,15 @@ mod tests {
              [error_model]\n  DV ~ proportional(PROP_ERR)\n";
         let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let cl = find_theta_for_slot(&m, PK_IDX_CL);
-        assert_eq!(
-            cl,
-            find_theta_for_slot(&m, PK_IDX_V),
-            "premise: shared theta"
-        );
+        assert_eq!(cl, find_theta_for_slot(&m, PK_IDX_V), "premise: shared theta");
         assert!(cl.is_some());
         let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
             .expect("data loads");
         let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
-        assert_eq!(
-            out.params.theta[0], m.default_params.theta[0],
-            "TVX must keep its default"
-        );
+        assert_eq!(out.params.theta[0], m.default_params.theta[0], "TVX must keep its default");
         assert!(
-            out.warnings
-                .iter()
-                .any(|w| w.contains("CL, V/V1 all resolve to theta TVX")
-                    && w.contains("TVX keeps its model default")),
+            out.warnings.iter().any(|w| w.contains("CL, V/V1 all resolve to theta TVX")
+                && w.contains("TVX keeps its model default")),
             "the collision must be reported: {:?}",
             out.warnings
         );
@@ -2448,11 +2262,7 @@ mod tests {
         let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let cl = find_theta_for_slot(&m, PK_IDX_CL);
         assert!(cl.is_some());
-        assert_eq!(
-            cl,
-            find_theta_for_slot(&m, PK_IDX_F),
-            "premise: shared theta"
-        );
+        assert_eq!(cl, find_theta_for_slot(&m, PK_IDX_F), "premise: shared theta");
         let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
             .expect("data loads");
         let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
@@ -2461,9 +2271,7 @@ mod tests {
             "TVX (and so F) must keep its default"
         );
         assert!(
-            out.warnings
-                .iter()
-                .any(|w| w.contains("CL, F all resolve to theta TVX")),
+            out.warnings.iter().any(|w| w.contains("CL, F all resolve to theta TVX")),
             "the collision must be reported: {:?}",
             out.warnings
         );
@@ -2482,12 +2290,7 @@ mod tests {
             "control premise: no collision"
         );
         let oc = inits_from_nca(&mc, &pop, NcaInit::Nca).expect("nca init runs");
-        let tvv_c = mc
-            .default_params
-            .theta_names
-            .iter()
-            .position(|n| n == "TVV")
-            .unwrap();
+        let tvv_c = mc.default_params.theta_names.iter().position(|n| n == "TVV").unwrap();
         assert_eq!(
             out.params.theta[1], oc.params.theta[tvv_c],
             "TVV must be V/F rescaled by F_default whether or not CL collides with F"
@@ -2522,21 +2325,14 @@ mod tests {
         // The premise: CL's last partials row does not read ETA_CL, and ETA_CL
         // is S's and passes the name rule for CL.
         let p = &m.indiv_param_partials;
-        let row = p
-            .names
-            .iter()
-            .rposition(|n| n == "CL")
-            .expect("CL has rows");
+        let row = p.names.iter().rposition(|n| n == "CL").expect("CL has rows");
         let k = m.eta_names.iter().position(|n| n == "ETA_CL").unwrap();
         assert!(matches!(
             p.d_d_eta[row][k],
             crate::parser::model_parser::Expression::Literal(v) if v == 0.0
         ));
         assert_eq!(
-            m.indiv_param_partials
-                .mu_ref_owners
-                .get("ETA_CL")
-                .map(String::as_str),
+            m.indiv_param_partials.mu_ref_owners.get("ETA_CL").map(String::as_str),
             Some("S")
         );
         assert!(!name_rule_may_use(&m, "CL", "ETA_CL"));
@@ -2590,9 +2386,7 @@ mod tests {
             "TVX (and so n) must keep its default"
         );
         assert!(
-            out.warnings
-                .iter()
-                .any(|w| w.contains("CL, N all resolve to theta TVX")),
+            out.warnings.iter().any(|w| w.contains("CL, N all resolve to theta TVX")),
             "the collision must be reported: {:?}",
             out.warnings
         );
@@ -2629,9 +2423,7 @@ mod tests {
                 "{method:?}: TVX must keep its default"
             );
             assert!(
-                out.warnings
-                    .iter()
-                    .any(|w| w.contains("TVX keeps its model default")),
+                out.warnings.iter().any(|w| w.contains("TVX keeps its model default")),
                 "{method:?}: {:?}",
                 out.warnings
             );

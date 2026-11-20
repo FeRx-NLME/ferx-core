@@ -101,31 +101,18 @@ fn the_classifier_sees_reads_and_skips_assignments_and_test_modules() {
                #[cfg(test)]\nmod tests {\n  fn g(model: &M) -> B { model.bloq_method }\n  \
                mod inner {\n    fn h(model: &M) -> B { model.bloq_method }\n  }\n}\n\
                fn k(model: &M) -> B { model.bloq_method }\n";
-    let lines: Vec<usize> = field_reads(&production_part(src))
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
+    let lines: Vec<usize> =
+        field_reads(&production_part(src)).into_iter().map(|(n, _)| n).collect();
     // 1, 3, 9: before any test module. 17: production code *after* an inline test
     // module (with a nested module inside it), which must still be scanned.
-    assert_eq!(
-        lines,
-        vec![1, 3, 9, 17],
-        "reads on lines 1, 3, 9 and 17 only"
-    );
+    assert_eq!(lines, vec![1, 3, 9, 17], "reads on lines 1, 3, 9 and 17 only");
 }
 
 #[test]
 fn no_production_code_reads_the_bloq_method_field() {
     let mut sources = Vec::new();
-    rust_sources(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut sources,
-    );
-    assert!(
-        sources.len() > 50,
-        "found only {} sources under src/",
-        sources.len()
-    );
+    rust_sources(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
+    assert!(sources.len() > 50, "found only {} sources under src/", sources.len());
 
     let mut offenders = Vec::new();
     for path in &sources {

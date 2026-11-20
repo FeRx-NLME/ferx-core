@@ -61,11 +61,7 @@ fn population(iov: bool) -> Population {
             observations: vec![4.0, 3.0, 1.0, 5.0, 3.5, 1.5],
             obs_cmts: vec![1; 6],
             cens: vec![0; 6],
-            occasions: if iov {
-                vec![1, 1, 1, 2, 2, 2]
-            } else {
-                vec![1; 6]
-            },
+            occasions: if iov { vec![1, 1, 1, 2, 2, 2] } else { vec![1; 6] },
             dose_occasions: if iov { vec![1, 2] } else { vec![1, 1] },
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -85,10 +81,7 @@ fn population(iov: bool) -> Population {
 }
 
 fn diag(n: usize, v: f64, prefix: &str) -> OmegaMatrix {
-    OmegaMatrix::from_diagonal(
-        &vec![v; n],
-        (0..n).map(|i| format!("{prefix}{i}")).collect(),
-    )
+    OmegaMatrix::from_diagonal(&vec![v; n], (0..n).map(|i| format!("{prefix}{i}")).collect())
 }
 
 /// One mis-shaped parameter set: its label, the parameters, and the message it must get.
@@ -115,11 +108,7 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
     assert_eq!((p.omega.dim(), p.sigma.values.len()), (1, 1));
     let mut cells = Vec::new();
     let mut push = |label, params, lead: &str, reason: &str| {
-        cells.push(Cell {
-            label,
-            params,
-            message: format!("{lead}; {reason}"),
-        })
+        cells.push(Cell { label, params, message: format!("{lead}; {reason}") })
     };
     for n in [0usize, 2] {
         let mut q = p.clone();
@@ -127,24 +116,14 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
         q.sigma.names.resize(n, "EXTRA".into());
         q.sigma_fixed.resize(n, false);
         let lead = format!("the supplied sigma has {n} values but this model has 1");
-        push(
-            if n == 0 { "σ short" } else { "σ long" },
-            q,
-            &lead,
-            SIGMA_BY_POSITION,
-        );
+        push(if n == 0 { "σ short" } else { "σ long" }, q, &lead, SIGMA_BY_POSITION);
     }
     for n in [0usize, 2] {
         let mut q = p.clone();
         q.omega = diag(n, 0.09, "E");
         q.omega_fixed.resize(n, false);
         let lead = format!("the supplied omega is {n}×{n} but this model has 1 eta");
-        push(
-            if n == 0 { "Ω short" } else { "Ω long" },
-            q,
-            &lead,
-            ETA_BY_POSITION,
-        );
+        push(if n == 0 { "Ω short" } else { "Ω long" }, q, &lead, ETA_BY_POSITION);
     }
     for (r, c) in [(1usize, 2usize), (2, 1)] {
         let mut q = p.clone();
@@ -159,28 +138,14 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
             q.omega_iov = Some(diag(n, 0.04, "K"));
             q.kappa_fixed.resize(n, false);
             let lead = format!("the supplied omega_iov is {n}×{n} but this model has 1 kappa");
-            push(
-                if n == 0 {
-                    "Ω_IOV short"
-                } else {
-                    "Ω_IOV long"
-                },
-                q,
-                &lead,
-                ETA_BY_POSITION,
-            );
+            push(if n == 0 { "Ω_IOV short" } else { "Ω_IOV long" }, q, &lead, ETA_BY_POSITION);
         }
         for (r, c) in [(1usize, 2usize), (2, 1)] {
             let mut q = p.clone();
             q.omega_iov = Some(non_square(iov, (r, c), 0.04));
             q.kappa_fixed.resize(r, false);
             let lead = format!("the supplied omega_iov is {r}×{c}, which is not square");
-            push(
-                if r == 1 { "Ω_IOV 1×2" } else { "Ω_IOV 2×1" },
-                q,
-                &lead,
-                NOT_SQUARE,
-            );
+            push(if r == 1 { "Ω_IOV 1×2" } else { "Ω_IOV 2×1" }, q, &lead, NOT_SQUARE);
         }
         let mut q = p.clone();
         q.omega_iov = None;
@@ -200,21 +165,12 @@ pub(super) fn shape_cells(p: &ModelParameters) -> Vec<Cell> {
 /// `e` is `E_PARAM_SHAPE` with exactly `cell`'s message — lead and reason both, so deleting
 /// either half of any variant's text reddens the cell that produces it.
 pub(super) fn assert_refused(e: &crate::diagnostics::EngineError, cell: &Cell, entry: &str) {
-    assert_eq!(
-        e.code(),
-        Some("E_PARAM_SHAPE"),
-        "{entry}, {}: wrong refusal: {e}",
-        cell.label
-    );
+    assert_eq!(e.code(), Some("E_PARAM_SHAPE"), "{entry}, {}: wrong refusal: {e}", cell.label);
     assert_eq!(e.message(), cell.message, "{entry}, {}", cell.label);
 }
 
 fn short_fit() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 2,
-        run_covariance_step: false,
-        ..Default::default()
-    }
+    FitOptions { outer_maxiter: 2, run_covariance_step: false, ..Default::default() }
 }
 
 /// The fit built from `params`, its Ω_IOV included (`synthetic_fit` leaves it `None`).
@@ -261,23 +217,13 @@ fn every_reader_refuses_a_mis_shaped_omega_sigma_or_omega_iov() {
                 // Documented κ = 0 fallback (#1019), pinned numerically in `stats::npde`.
                 npde.expect("compute_npde_npd, absent Ω_IOV falls back to κ = 0");
             } else {
-                assert_refused(
-                    &npde.expect_err("compute_npde_npd"),
-                    &cell,
-                    "compute_npde_npd",
-                );
+                assert_refused(&npde.expect_err("compute_npde_npd"), &cell, "compute_npde_npd");
             }
 
-            let opts = SimulateOptions {
-                seed: Some(5),
-                ..Default::default()
-            };
+            let opts = SimulateOptions { seed: Some(5), ..Default::default() };
             let sims = [
                 ("simulate", simulate(&model, &pop, p, 1).err()),
-                (
-                    "simulate_with_seed",
-                    simulate_with_seed(&model, &pop, p, 1, 5).err(),
-                ),
+                ("simulate_with_seed", simulate_with_seed(&model, &pop, p, 1, 5).err()),
                 (
                     "simulate_with_options_diag",
                     simulate_with_options_diag(&model, &pop, p, 1, &opts).err(),
@@ -288,9 +234,7 @@ fn every_reader_refuses_a_mis_shaped_omega_sigma_or_omega_iov() {
                 if cell.label == "Ω_IOV absent" {
                     // The shape's code (#1774: the same cause), #1019's message.
                     assert_eq!(e.code(), Some("E_PARAM_SHAPE"), "{entry}: {e}");
-                    assert!(e
-                        .to_string()
-                        .contains("carry no omega_iov; simulation draws"));
+                    assert!(e.to_string().contains("carry no omega_iov; simulation draws"));
                 } else {
                     assert_refused(&e, &cell, entry);
                 }
@@ -389,14 +333,8 @@ fn run_sir_and_run_covariance_refuse_a_fit_with_a_mis_shaped_block() {
             assert_refused(&e, &cell, "run_covariance");
         }
     }
-    assert_eq!(
-        wrong_model, 3,
-        "Ω short, Ω long and Ω 2×1 carry EBEs as wide as Ω"
-    );
-    assert_eq!(
-        n, 14,
-        "11 cells (σ ×2, Ω ×4, Ω_IOV ×5) plus the three wrong-model fits"
-    );
+    assert_eq!(wrong_model, 3, "Ω short, Ω long and Ω 2×1 carry EBEs as wide as Ω");
+    assert_eq!(n, 14, "11 cells (σ ×2, Ω ×4, Ω_IOV ×5) plus the three wrong-model fits");
 }
 
 /// `fitted_params_from_result` refuses a fit whose Ω, σ or Ω_IOV is not the model's
@@ -472,20 +410,14 @@ fn the_gate_admits_parameters_of_the_models_own_shape() {
         let a = model.default_params.clone();
         let mut b = a.clone();
         b.omega = OmegaMatrix::from_diagonal(&[a.omega.matrix[(0, 0)]], a.omega.eta_names.clone());
-        b.sigma = SigmaVector {
-            values: a.sigma.values.clone(),
-            names: a.sigma.names.clone(),
-        };
+        b.sigma = SigmaVector { values: a.sigma.values.clone(), names: a.sigma.names.clone() };
         b.omega_iov = a
             .omega_iov
             .as_ref()
             .map(|m| OmegaMatrix::from_diagonal(&[m.matrix[(0, 0)]], m.eta_names.clone()));
 
-        let opts = FitOptions {
-            outer_maxiter: 2,
-            run_covariance_step: false,
-            ..Default::default()
-        };
+        let opts =
+            FitOptions { outer_maxiter: 2, run_covariance_step: false, ..Default::default() };
         let fa = fit(&model, &pop, &a, &opts).expect("fit, own shape");
         let fb = fit(&model, &pop, &b, &opts).expect("fit, rebuilt");
         assert!(fa.ofv.is_finite(), "{}", fa.ofv);
@@ -508,11 +440,7 @@ fn the_gate_admits_parameters_of_the_models_own_shape() {
         assert_eq!(sa.len(), 48);
         for (x, y) in sa.iter().zip(&sb) {
             assert!(x.ipred.is_finite() && x.ipred > 0.0, "{}", x.ipred);
-            assert_eq!(
-                x.ipred.to_bits(),
-                y.ipred.to_bits(),
-                "simulate, iov = {iov}"
-            );
+            assert_eq!(x.ipred.to_bits(), y.ipred.to_bits(), "simulate, iov = {iov}");
         }
 
         // The post-hoc gate reads the fit's blocks: a fit of the model's own shape passes.

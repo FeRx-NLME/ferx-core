@@ -10,9 +10,7 @@ use super::*;
 use crate::search::mfl::Mfl;
 
 fn template(line: &str) -> PkTemplate {
-    PkTemplate::parse_line(line)
-        .expect("a pk line")
-        .expect("parses")
+    PkTemplate::parse_line(line).expect("a pk line").expect("parses")
 }
 
 fn fo(peripherals: u32) -> Structure {
@@ -34,20 +32,8 @@ fn keys(mfl: &str) -> Vec<FeatureKey> {
 #[test]
 fn structure_is_read_off_the_pk_line() {
     let cases = [
-        (
-            "pk one_cpt_iv(cl=CL, v=V)",
-            Absorption::Inst,
-            0,
-            None,
-            false,
-        ),
-        (
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)",
-            Absorption::Fo,
-            0,
-            None,
-            true,
-        ),
+        ("pk one_cpt_iv(cl=CL, v=V)", Absorption::Inst, 0, None, false),
+        ("pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)", Absorption::Fo, 0, None, true),
         (
             "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, alag=TLAG)",
             Absorption::Fo,
@@ -69,25 +55,13 @@ fn structure_is_read_off_the_pk_line() {
             Some(TransitCount::N),
             false,
         ),
-        (
-            "pk one_compartment_oral(cl=CL, v=V, ka=KA)",
-            Absorption::Fo,
-            0,
-            None,
-            false,
-        ),
+        ("pk one_compartment_oral(cl=CL, v=V, ka=KA)", Absorption::Fo, 0, None, false),
     ];
     for (line, absorption, peripherals, transits, lagtime) in cases {
         let s = Structure::from_template(&template(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
         assert_eq!(
             s,
-            Structure {
-                absorption,
-                elimination: Elimination::Fo,
-                peripherals,
-                transits,
-                lagtime
-            },
+            Structure { absorption, elimination: Elimination::Fo, peripherals, transits, lagtime },
             "{line}"
         );
     }
@@ -135,60 +109,27 @@ fn every_buildable_structure_names_the_parser_template_and_roles() {
     .unwrap();
     assert_eq!(t.name, "two_cpt_iv");
     assert_eq!(t.roles, vec!["cl", "v1", "q", "v2"]);
-    let t = Structure {
-        transits: Some(TransitCount::Count(3)),
-        ..fo(1)
-    }
-    .template()
-    .unwrap();
+    let t = Structure { transits: Some(TransitCount::Count(3)), ..fo(1) }.template().unwrap();
     assert_eq!(t.name, "two_cpt_transit");
     assert_eq!(t.roles, vec!["cl", "v1", "q", "v2", "n", "mtt"]);
-    let t = Structure {
-        lagtime: true,
-        ..fo(0)
-    }
-    .template()
-    .unwrap();
+    let t = Structure { lagtime: true, ..fo(0) }.template().unwrap();
     assert_eq!(t.name, "one_cpt_oral");
     assert_eq!(t.roles, vec!["cl", "v", "ka", "lagtime"]);
 }
 
 #[test]
 fn unbuildable_structures_name_the_reason() {
-    let iv = Structure {
-        absorption: Absorption::Inst,
-        elimination: Elimination::Fo,
-        ..fo(0)
-    };
+    let iv = Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) };
     assert!(iv.unbuildable().is_none());
-    let why = Structure {
-        transits: Some(TransitCount::N),
-        ..iv
-    }
-    .unbuildable()
-    .unwrap();
+    let why = Structure { transits: Some(TransitCount::N), ..iv }.unbuildable().unwrap();
     assert!(why.contains("first-order absorption"), "{why}");
-    let why = Structure {
-        lagtime: true,
-        ..iv
-    }
-    .unbuildable()
-    .unwrap();
+    let why = Structure { lagtime: true, ..iv }.unbuildable().unwrap();
     assert!(why.contains("bolus"), "{why}");
-    let why = Structure {
-        lagtime: true,
-        transits: Some(TransitCount::Count(2)),
-        ..fo(0)
-    }
-    .unbuildable()
-    .unwrap();
+    let why = Structure { lagtime: true, transits: Some(TransitCount::Count(2)), ..fo(0) }
+        .unbuildable()
+        .unwrap();
     assert!(why.contains("lag time and a transit chain"), "{why}");
-    let why = Structure {
-        transits: Some(TransitCount::N),
-        ..fo(2)
-    }
-    .unbuildable()
-    .unwrap();
+    let why = Structure { transits: Some(TransitCount::N), ..fo(2) }.unbuildable().unwrap();
     assert!(why.contains("three_cpt_transit"), "{why}");
     assert!(fo(3).unbuildable().unwrap().contains("three_cpt_*"));
     assert!(fo(3).template().is_err());
@@ -199,22 +140,11 @@ fn apply_moves_one_coordinate_and_features_lists_all_five() {
     let s = fo(0);
     assert_eq!(s.apply(&FeatureKey::Peripherals(2)).peripherals, 2);
     assert!(s.apply(&FeatureKey::Lagtime(true)).lagtime);
-    assert_eq!(
-        s.apply(&FeatureKey::Transits(TransitCount::N)).transits,
-        Some(TransitCount::N)
-    );
+    assert_eq!(s.apply(&FeatureKey::Transits(TransitCount::N)).transits, Some(TransitCount::N));
     // `TRANSITS(0)` is "no transits", the same point as the base.
     assert_eq!(s.apply(&FeatureKey::Transits(TransitCount::Count(0))), s);
-    assert_eq!(
-        s.apply(&FeatureKey::Absorption(Absorption::Inst))
-            .absorption,
-        Absorption::Inst
-    );
-    assert_eq!(
-        s.apply(&FeatureKey::Elimination(Elimination::Mm))
-            .elimination,
-        Elimination::Mm
-    );
+    assert_eq!(s.apply(&FeatureKey::Absorption(Absorption::Inst)).absorption, Absorption::Inst);
+    assert_eq!(s.apply(&FeatureKey::Elimination(Elimination::Mm)).elimination, Elimination::Mm);
     assert_eq!(
         s.features(),
         vec![
@@ -234,19 +164,10 @@ fn apply_moves_one_coordinate_and_features_lists_all_five() {
 #[test]
 fn feature_keys_print_and_sort_as_pharmpy_does() {
     assert_eq!(FeatureKey::Peripherals(1).to_string(), "PERIPHERALS(1)");
-    assert_eq!(
-        FeatureKey::Transits(TransitCount::Count(3)).to_string(),
-        "TRANSITS(3, NODEPOT)"
-    );
-    assert_eq!(
-        FeatureKey::Transits(TransitCount::N).to_string(),
-        "TRANSITS(N, NODEPOT)"
-    );
+    assert_eq!(FeatureKey::Transits(TransitCount::Count(3)).to_string(), "TRANSITS(3, NODEPOT)");
+    assert_eq!(FeatureKey::Transits(TransitCount::N).to_string(), "TRANSITS(N, NODEPOT)");
     assert_eq!(FeatureKey::Lagtime(true).to_string(), "LAGTIME(ON)");
-    assert_eq!(
-        FeatureKey::Absorption(Absorption::Inst).to_string(),
-        "ABSORPTION(INST)"
-    );
+    assert_eq!(FeatureKey::Absorption(Absorption::Inst).to_string(), "ABSORPTION(INST)");
     // Pharmpy sorts its feature dictionary by `(category, str(arg))`, so
     // LAGTIME precedes PERIPHERALS and `N` follows the counts.
     let k = keys(
@@ -276,10 +197,7 @@ fn space_features_reads_elimination_and_refuses_non_structural_statements() {
     // names it can move a saturable candidate back to first-order.
     assert_eq!(
         keys("ELIMINATION(FO); PERIPHERALS(1)"),
-        vec![
-            FeatureKey::Elimination(Elimination::Fo),
-            FeatureKey::Peripherals(1)
-        ]
+        vec![FeatureKey::Elimination(Elimination::Fo), FeatureKey::Peripherals(1)]
     );
     assert_eq!(
         keys("ELIMINATION([MM,MIX-FO-MM,ZO])"),
@@ -304,10 +222,7 @@ fn space_features_reads_elimination_and_refuses_non_structural_statements() {
     // error here if the coverage check is ever bypassed.
     assert_eq!(
         keys("ABSORPTION([ZO,WEIBULL])"),
-        vec![
-            FeatureKey::Absorption(Absorption::Weibull),
-            FeatureKey::Absorption(Absorption::Zo),
-        ]
+        vec![FeatureKey::Absorption(Absorption::Weibull), FeatureKey::Absorption(Absorption::Zo),]
     );
     let err = space_features(&Mfl::parse("ABSORPTION(SEQ-ZO-FO)").unwrap()).unwrap_err();
     assert!(err.contains("SEQ-ZO-FO"), "{err}");
@@ -321,21 +236,11 @@ fn onto_space_is_the_least_number_of_transformations() {
     assert!(onto_space(&fo(0), &keys("PERIPHERALS(0..1); LAGTIME([OFF,ON])")).is_empty());
     // A space that lists only `ON` moves the base onto it — Pharmpy's
     // reading; a category the space does not name is left alone.
-    assert_eq!(
-        onto_space(&fo(0), &keys("LAGTIME(ON)")),
-        vec![FeatureKey::Lagtime(true)]
-    );
+    assert_eq!(onto_space(&fo(0), &keys("LAGTIME(ON)")), vec![FeatureKey::Lagtime(true)]);
     // Peripherals: the smallest count in the space.
-    assert_eq!(
-        onto_space(&fo(0), &keys("PERIPHERALS(1..2)")),
-        vec![FeatureKey::Peripherals(1)]
-    );
+    assert_eq!(onto_space(&fo(0), &keys("PERIPHERALS(1..2)")), vec![FeatureKey::Peripherals(1)]);
     // Absorption: the first listed mode.
-    let iv = Structure {
-        absorption: Absorption::Inst,
-        elimination: Elimination::Fo,
-        ..fo(0)
-    };
+    let iv = Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) };
     assert_eq!(
         onto_space(&iv, &keys("ABSORPTION([FO]); PERIPHERALS(0..1)")),
         vec![FeatureKey::Absorption(Absorption::Fo)]
@@ -343,10 +248,7 @@ fn onto_space_is_the_least_number_of_transformations() {
     // Two categories off at once: one move each.
     assert_eq!(
         onto_space(&iv, &keys("ABSORPTION(FO); TRANSITS([1,3], NODEPOT)")),
-        vec![
-            FeatureKey::Absorption(Absorption::Fo),
-            FeatureKey::Transits(TransitCount::Count(1)),
-        ]
+        vec![FeatureKey::Absorption(Absorption::Fo), FeatureKey::Transits(TransitCount::Count(1)),]
     );
 }
 
@@ -371,10 +273,7 @@ fn peripherals_start_at_the_smallest_count_then_any_other() {
     let p1 = FeatureKey::Peripherals(1);
     let p2 = FeatureKey::Peripherals(2);
     assert!(allowed(&p1, &[], &funcs, &fo(0)));
-    assert!(
-        !allowed(&p2, &[], &funcs, &fo(0)),
-        "the first peripheral move must be the smallest"
-    );
+    assert!(!allowed(&p2, &[], &funcs, &fo(0)), "the first peripheral move must be the smallest");
     assert!(allowed(&p2, &[p1], &funcs, &fo(0)));
     assert!(!allowed(&p1, &[p1], &funcs, &fo(0)));
     // Pharmpy's rule verbatim: after a non-minimal count, any count other
@@ -397,10 +296,7 @@ fn transits_zero_is_a_move_only_off_a_chain() {
     assert!(allowed(&t2, &[], &funcs, &fo(0)));
     // From a chain, dropping it is a real move — one Pharmpy cannot make,
     // since its base never carries a chain into the space.
-    let chain = Structure {
-        transits: Some(TransitCount::Count(3)),
-        ..fo(0)
-    };
+    let chain = Structure { transits: Some(TransitCount::Count(3)), ..fo(0) };
     assert!(allowed(&t0, &[], &funcs, &chain));
     // …and still one move per category: not after another transit step.
     assert!(!allowed(&t0, &[t2], &funcs, &chain));
@@ -427,14 +323,8 @@ fn pharmpys_unsupported_pairs_are_refused_in_either_order() {
     // The exhaustive filter applies the same table to a combination.
     assert!(!combination_allowed(&[inst, lag], &fo(0)));
     assert!(!combination_allowed(&[t3, lag], &fo(0)));
-    assert!(!combination_allowed(
-        &[FeatureKey::Transits(TransitCount::Count(0))],
-        &fo(0)
-    ));
-    assert!(combination_allowed(
-        &[fo_, t3, FeatureKey::Peripherals(1)],
-        &fo(0)
-    ));
+    assert!(!combination_allowed(&[FeatureKey::Transits(TransitCount::Count(0))], &fo(0)));
+    assert!(combination_allowed(&[fo_, t3, FeatureKey::Peripherals(1)], &fo(0)));
 }
 
 // ── from a structure to an edit ─────────────────────────────────────────────
@@ -471,11 +361,8 @@ fn defaults() -> Defaults {
     )
 }
 
-const LINES: &[&str] = &[
-    "CL = TVCL * exp(ETA_CL)",
-    "V = TVV * exp(ETA_V)",
-    "KA = TVKA * exp(ETA_KA)",
-];
+const LINES: &[&str] =
+    &["CL = TVCL * exp(ETA_CL)", "V = TVV * exp(ETA_V)", "KA = TVKA * exp(ETA_KA)"];
 
 fn lines() -> Vec<String> {
     LINES.iter().map(|s| s.to_string()).collect()
@@ -486,13 +373,7 @@ fn defaults_read_the_first_positive_observation_time() {
     assert_eq!(defaults().t_first, 0.5);
     let d = Defaults::new(vec![], vec![], vec![], vec![], &population(&[0.0]));
     assert_eq!(d.t_first, 1.0, "no positive time: Pharmpy's fallback of 1");
-    let d = Defaults::new(
-        vec![],
-        vec![],
-        vec![],
-        vec![],
-        &population(&[f64::NAN, 3.0]),
-    );
+    let d = Defaults::new(vec![], vec![], vec![], vec![], &population(&[f64::NAN, 3.0]));
     assert_eq!(d.t_first, 3.0);
 }
 
@@ -509,32 +390,14 @@ fn widening_keeps_bound_variables_by_slot_and_declares_the_rest_from_pharmpy_rul
     )
     .unwrap();
     assert_eq!(spec.template, "two_cpt_oral");
-    let bindings: Vec<(&str, &str)> = spec
-        .bindings
-        .iter()
-        .map(|(r, v)| (r.as_str(), v.as_str()))
-        .collect();
-    assert_eq!(
-        bindings,
-        vec![
-            ("cl", "CL"),
-            ("v1", "V"),
-            ("q", "Q"),
-            ("v2", "V2"),
-            ("ka", "KA")
-        ]
-    );
-    let by_name: HashMap<&str, &NewParameter> = spec
-        .new_parameters
-        .iter()
-        .map(|p| (p.name.as_str(), p))
-        .collect();
+    let bindings: Vec<(&str, &str)> =
+        spec.bindings.iter().map(|(r, v)| (r.as_str(), v.as_str())).collect();
+    assert_eq!(bindings, vec![("cl", "CL"), ("v1", "V"), ("q", "Q"), ("v2", "V2"), ("ka", "KA")]);
+    let by_name: HashMap<&str, &NewParameter> =
+        spec.new_parameters.iter().map(|p| (p.name.as_str(), p)).collect();
     // Q = CL, V2 = 0.05·Vc; no η on a peripheral under absorption_delay.
     let q = by_name["Q"];
-    assert_eq!(
-        (q.theta.as_str(), q.init, q.lower, q.upper),
-        ("TVQ", 0.2, 0.0, 1e6)
-    );
+    assert_eq!((q.theta.as_str(), q.init, q.lower, q.upper), ("TVQ", 0.2, 0.0, 1e6));
     assert!(q.iiv.is_none() && !q.fixed);
     let v2 = by_name["V2"];
     assert_eq!((v2.theta.as_str(), v2.init), ("TVV2", 0.5));
@@ -542,29 +405,16 @@ fn widening_keeps_bound_variables_by_slot_and_declares_the_rest_from_pharmpy_rul
 
     // Two peripherals at once: the first Q is a tenth of CL, the second
     // nine tenths, both volumes 0.05·Vc.
-    let spec = structural_spec(
-        &fo(2),
-        &fo(0),
-        &parent,
-        &lines(),
-        &defaults(),
-        IivStrategy::NoAdd,
-    )
-    .unwrap();
+    let spec = structural_spec(&fo(2), &fo(0), &parent, &lines(), &defaults(), IivStrategy::NoAdd)
+        .unwrap();
     assert_eq!(spec.template, "three_cpt_oral");
-    let by_name: HashMap<&str, &NewParameter> = spec
-        .new_parameters
-        .iter()
-        .map(|p| (p.name.as_str(), p))
-        .collect();
+    let by_name: HashMap<&str, &NewParameter> =
+        spec.new_parameters.iter().map(|p| (p.name.as_str(), p)).collect();
     assert!((by_name["Q"].init - 0.02).abs() < 1e-12);
     assert!((by_name["Q3"].init - 0.18).abs() < 1e-12);
     assert_eq!(by_name["V3"].init, 0.5);
     assert_eq!(
-        spec.bindings
-            .iter()
-            .map(|(r, _)| r.as_str())
-            .collect::<Vec<_>>(),
+        spec.bindings.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
         vec!["cl", "v1", "q2", "v2", "q3", "v3", "ka"]
     );
 }
@@ -572,20 +422,10 @@ fn widening_keeps_bound_variables_by_slot_and_declares_the_rest_from_pharmpy_rul
 #[test]
 fn a_second_peripheral_on_a_two_compartment_parent_reuses_q_and_v2_by_slot() {
     let parent = template("pk two_cpt_oral(cl=CL, v1=VC, q=QP, v2=VP, ka=KA)");
-    let spec = structural_spec(
-        &fo(2),
-        &fo(0),
-        &parent,
-        &lines(),
-        &defaults(),
-        IivStrategy::NoAdd,
-    )
-    .unwrap();
-    let bindings: Vec<(&str, &str)> = spec
-        .bindings
-        .iter()
-        .map(|(r, v)| (r.as_str(), v.as_str()))
-        .collect();
+    let spec = structural_spec(&fo(2), &fo(0), &parent, &lines(), &defaults(), IivStrategy::NoAdd)
+        .unwrap();
+    let bindings: Vec<(&str, &str)> =
+        spec.bindings.iter().map(|(r, v)| (r.as_str(), v.as_str())).collect();
     assert_eq!(
         bindings,
         vec![
@@ -598,26 +438,15 @@ fn a_second_peripheral_on_a_two_compartment_parent_reuses_q_and_v2_by_slot() {
             ("ka", "KA")
         ]
     );
-    let names: Vec<&str> = spec
-        .new_parameters
-        .iter()
-        .map(|p| p.name.as_str())
-        .collect();
+    let names: Vec<&str> = spec.new_parameters.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, vec!["Q3", "V3"]);
 }
 
 #[test]
 fn narrowing_binds_only_what_the_smaller_template_reads() {
     let parent = template("pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)");
-    let spec = structural_spec(
-        &fo(0),
-        &fo(0),
-        &parent,
-        &lines(),
-        &defaults(),
-        IivStrategy::NoAdd,
-    )
-    .unwrap();
+    let spec = structural_spec(&fo(0), &fo(0), &parent, &lines(), &defaults(), IivStrategy::NoAdd)
+        .unwrap();
     assert_eq!(spec.template, "one_cpt_oral");
     assert_eq!(
         spec.bindings,
@@ -633,32 +462,17 @@ fn narrowing_binds_only_what_the_smaller_template_reads() {
 #[test]
 fn a_lag_time_and_a_transit_chain_take_the_absorption_delay_init_and_eta() {
     let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
-    let lag = Structure {
-        lagtime: true,
-        ..fo(0)
-    };
-    let spec = structural_spec(
-        &lag,
-        &fo(0),
-        &parent,
-        &lines(),
-        &defaults(),
-        IivStrategy::AbsorptionDelay,
-    )
-    .unwrap();
-    assert_eq!(
-        spec.bindings.last().unwrap(),
-        &("lagtime".to_string(), "ALAG".to_string())
-    );
+    let lag = Structure { lagtime: true, ..fo(0) };
+    let spec =
+        structural_spec(&lag, &fo(0), &parent, &lines(), &defaults(), IivStrategy::AbsorptionDelay)
+            .unwrap();
+    assert_eq!(spec.bindings.last().unwrap(), &("lagtime".to_string(), "ALAG".to_string()));
     let alag = &spec.new_parameters[0];
     assert_eq!(alag.name, "ALAG");
     assert_eq!(alag.init, 0.25, "half the first observation time");
     assert_eq!(alag.iiv, Some(("ETA_ALAG".to_string(), NEW_IIV_VARIANCE)));
 
-    let transit = Structure {
-        transits: Some(TransitCount::Count(3)),
-        ..fo(0)
-    };
+    let transit = Structure { transits: Some(TransitCount::Count(3)), ..fo(0) };
     let spec = structural_spec(
         &transit,
         &fo(0),
@@ -669,11 +483,8 @@ fn a_lag_time_and_a_transit_chain_take_the_absorption_delay_init_and_eta() {
     )
     .unwrap();
     assert_eq!(spec.template, "one_cpt_transit");
-    let by_name: HashMap<&str, &NewParameter> = spec
-        .new_parameters
-        .iter()
-        .map(|p| (p.name.as_str(), p))
-        .collect();
+    let by_name: HashMap<&str, &NewParameter> =
+        spec.new_parameters.iter().map(|p| (p.name.as_str(), p)).collect();
     let n = by_name["NTR"];
     assert!(n.fixed, "a counted chain is a FIXed θ");
     assert_eq!((n.init, n.lower, n.upper), (3.0, 0.0, 64.0));
@@ -684,24 +495,11 @@ fn a_lag_time_and_a_transit_chain_take_the_absorption_delay_init_and_eta() {
     // KA is not bound by a transit template: the edit layer prunes it.
     assert!(!spec.bindings.iter().any(|(r, _)| r == "ka"));
 
-    let estimated = Structure {
-        transits: Some(TransitCount::N),
-        ..fo(0)
-    };
-    let spec = structural_spec(
-        &estimated,
-        &fo(0),
-        &parent,
-        &lines(),
-        &defaults(),
-        IivStrategy::NoAdd,
-    )
-    .unwrap();
-    let n = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "NTR")
-        .unwrap();
+    let estimated = Structure { transits: Some(TransitCount::N), ..fo(0) };
+    let spec =
+        structural_spec(&estimated, &fo(0), &parent, &lines(), &defaults(), IivStrategy::NoAdd)
+            .unwrap();
+    let n = spec.new_parameters.iter().find(|p| p.name == "NTR").unwrap();
     assert!(!n.fixed);
     assert_eq!(n.init, 2.0, "Pharmpy's N init");
 }
@@ -716,14 +514,8 @@ fn iiv_strategies_decide_which_new_parameters_get_an_eta() {
         vec!["ETA_CL".into(), "ETA_V".into()],
         &population(&[0.0, 0.5]),
     );
-    let target = Structure {
-        lagtime: true,
-        ..fo(1)
-    };
-    let lines = vec![
-        "CL = TVCL * exp(ETA_CL)".to_string(),
-        "V = TVV * exp(ETA_V)".to_string(),
-    ];
+    let target = Structure { lagtime: true, ..fo(1) };
+    let lines = vec!["CL = TVCL * exp(ETA_CL)".to_string(), "V = TVV * exp(ETA_V)".to_string()];
     let etas = |iiv: IivStrategy| -> Vec<String> {
         structural_spec(&target, &fo(0), &parent, &lines, &d, iiv)
             .unwrap()
@@ -734,10 +526,7 @@ fn iiv_strategies_decide_which_new_parameters_get_an_eta() {
     };
     assert!(etas(IivStrategy::NoAdd).is_empty());
     assert_eq!(etas(IivStrategy::AbsorptionDelay), vec!["ETA_ALAG"]);
-    assert_eq!(
-        etas(IivStrategy::AddDiagonal),
-        vec!["ETA_Q", "ETA_V2", "ETA_KA", "ETA_ALAG"]
-    );
+    assert_eq!(etas(IivStrategy::AddDiagonal), vec!["ETA_Q", "ETA_V2", "ETA_KA", "ETA_ALAG"]);
     let err =
         structural_spec(&target, &fo(0), &parent, &lines, &d, IivStrategy::Fullblock).unwrap_err();
     assert!(err.contains("fullblock"), "{err}");
@@ -759,23 +548,13 @@ fn generated_names_avoid_the_base_models_own() {
         vec!["ETA_CL".into(), "ETA_Q".into()],
         &population(&[0.0, 0.5]),
     );
-    let spec = structural_spec(
-        &fo(1),
-        &fo(0),
-        &parent,
-        &lines(),
-        &d,
-        IivStrategy::AddDiagonal,
-    )
-    .unwrap();
+    let spec =
+        structural_spec(&fo(1), &fo(0), &parent, &lines(), &d, IivStrategy::AddDiagonal).unwrap();
     let q = spec.new_parameters.iter().find(|p| p.name == "Q").unwrap();
     assert_eq!(q.theta, "TVQ_2");
     assert_eq!(q.iiv.as_ref().unwrap().0, "ETA_Q_2");
     // A parameter the base declares but does not bind is reused as is.
-    let d = Defaults {
-        parameters: vec!["CL".into(), "V".into(), "KA".into(), "Q".into()],
-        ..d
-    };
+    let d = Defaults { parameters: vec!["CL".into(), "V".into(), "KA".into(), "Q".into()], ..d };
     let spec = structural_spec(&fo(1), &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
     assert!(spec.new_parameters.iter().all(|p| p.name != "Q"));
     assert!(spec.bindings.contains(&("q".to_string(), "Q".to_string())));
@@ -839,35 +618,23 @@ fn a_transit_bases_count_is_read_off_the_declaration_its_n_binding_points_at() {
     let m = text(
         "[parameters]\n  theta TVMTT(1.0, 0.0, 10.0)\n[individual_parameters]\n  MTT = TVMTT\n",
     );
-    assert_eq!(
-        Structure::from_model(&t, Some(&m)).unwrap().transits,
-        Some(TransitCount::Count(3))
-    );
+    assert_eq!(Structure::from_model(&t, Some(&m)).unwrap().transits, Some(TransitCount::Count(3)));
     // A parameter behind a FIXed θ — what the search itself writes.
     let t = template("pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)");
     let m = text(
         "[parameters]\n  theta TVNTR(3.0, 0.0, 64.0) FIX\n  theta TVMTT(1.0, 0.0, 10.0)\n\
          [individual_parameters]\n  NTR = TVNTR\n  MTT = TVMTT\n",
     );
-    assert_eq!(
-        Structure::from_model(&t, Some(&m)).unwrap().transits,
-        Some(TransitCount::Count(3))
-    );
+    assert_eq!(Structure::from_model(&t, Some(&m)).unwrap().transits, Some(TransitCount::Count(3)));
     // The same parameter behind a free θ.
     let m = text(
         "[parameters]\n  theta TVNTR(3.0, 0.0, 64.0)\n  theta TVMTT(1.0, 0.0, 10.0)\n\
          [individual_parameters]\n  NTR = TVNTR\n  MTT = TVMTT\n",
     );
-    assert_eq!(
-        Structure::from_model(&t, Some(&m)).unwrap().transits,
-        Some(TransitCount::N)
-    );
+    assert_eq!(Structure::from_model(&t, Some(&m)).unwrap().transits, Some(TransitCount::N));
     // A parameter set from a number.
     let m = text("[parameters]\n  theta TVMTT(1.0, 0.0, 10.0)\n[individual_parameters]\n  NTR = 2\n  MTT = TVMTT\n");
-    assert_eq!(
-        Structure::from_model(&t, Some(&m)).unwrap().transits,
-        Some(TransitCount::Count(2))
-    );
+    assert_eq!(Structure::from_model(&t, Some(&m)).unwrap().transits, Some(TransitCount::Count(2)));
     // A non-integral fixed count is refused by name.
     let m = text(
         "[parameters]\n  theta TVNTR(2.5, 0.0, 64.0) FIX\n[individual_parameters]\n  NTR = TVNTR\n",
@@ -875,10 +642,7 @@ fn a_transit_bases_count_is_read_off_the_declaration_its_n_binding_points_at() {
     let err = Structure::from_model(&t, Some(&m)).unwrap_err();
     assert!(err.contains("2.5") && err.contains("whole number"), "{err}");
     // Without the text, a chain reads as estimated.
-    assert_eq!(
-        Structure::from_template(&t).unwrap().transits,
-        Some(TransitCount::N)
-    );
+    assert_eq!(Structure::from_template(&t).unwrap().transits, Some(TransitCount::N));
     // The `pk` line alone is not enough for the tests that only need it.
     assert_eq!(
         Structure::from_model(&template("pk one_cpt_oral(cl=CL, v=V, ka=KA)"), Some(&m)).unwrap(),
@@ -897,17 +661,10 @@ fn a_parents_bioavailability_binding_is_carried_across_a_swap() {
         ..defaults()
     };
     let spec = structural_spec(&fo(1), &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
-    assert_eq!(
-        spec.bindings.last().unwrap(),
-        &("f".to_string(), "F".to_string())
-    );
+    assert_eq!(spec.bindings.last().unwrap(), &("f".to_string(), "F".to_string()));
     assert!(spec.new_parameters.iter().all(|p| p.name != "F"));
     // …and to a bolus, where there is no absorption role at all.
-    let iv = Structure {
-        absorption: Absorption::Inst,
-        elimination: Elimination::Fo,
-        ..fo(0)
-    };
+    let iv = Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) };
     let spec = structural_spec(&iv, &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
     assert_eq!(
         spec.bindings,
@@ -931,74 +688,30 @@ fn a_different_transit_coordinate_rebinds_n_to_a_fresh_parameter() {
         theta_names: vec!["TVCL".into(), "TVV".into(), "TVNTR".into(), "TVMTT".into()],
         ..defaults()
     };
-    let three = Structure {
-        transits: Some(TransitCount::Count(3)),
-        ..fo(0)
-    };
-    let one = Structure {
-        transits: Some(TransitCount::Count(1)),
-        ..fo(0)
-    };
+    let three = Structure { transits: Some(TransitCount::Count(3)), ..fo(0) };
+    let one = Structure { transits: Some(TransitCount::Count(1)), ..fo(0) };
     let spec = structural_spec(&one, &three, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
-    assert!(
-        spec.bindings
-            .contains(&("n".to_string(), "NTR2".to_string())),
-        "{:?}",
-        spec.bindings
-    );
-    assert!(spec
-        .bindings
-        .contains(&("mtt".to_string(), "MTT".to_string())));
-    let n = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "NTR2")
-        .unwrap();
+    assert!(spec.bindings.contains(&("n".to_string(), "NTR2".to_string())), "{:?}", spec.bindings);
+    assert!(spec.bindings.contains(&("mtt".to_string(), "MTT".to_string())));
+    let n = spec.new_parameters.iter().find(|p| p.name == "NTR2").unwrap();
     assert!(n.fixed);
     assert_eq!((n.theta.as_str(), n.init), ("TVNTR2", 1.0));
     // Fixed → estimated: a fresh free θ at Pharmpy's init.
-    let estimated = Structure {
-        transits: Some(TransitCount::N),
-        ..fo(0)
-    };
-    let spec = structural_spec(
-        &estimated,
-        &three,
-        &parent_t,
-        &lines(),
-        &d,
-        IivStrategy::NoAdd,
-    )
-    .unwrap();
-    let n = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "NTR2")
-        .unwrap();
+    let estimated = Structure { transits: Some(TransitCount::N), ..fo(0) };
+    let spec =
+        structural_spec(&estimated, &three, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    let n = spec.new_parameters.iter().find(|p| p.name == "NTR2").unwrap();
     assert!(!n.fixed);
     assert_eq!(n.init, 2.0);
     // Estimated → fixed likewise.
-    let spec = structural_spec(
-        &three,
-        &estimated,
-        &parent_t,
-        &lines(),
-        &d,
-        IivStrategy::NoAdd,
-    )
-    .unwrap();
-    let n = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "NTR2")
-        .unwrap();
+    let spec =
+        structural_spec(&three, &estimated, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    let n = spec.new_parameters.iter().find(|p| p.name == "NTR2").unwrap();
     assert!(n.fixed && n.init == 3.0);
     // The same coordinate keeps the parent's declaration untouched.
     let spec =
         structural_spec(&three, &three, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
-    assert!(spec
-        .bindings
-        .contains(&("n".to_string(), "NTR".to_string())));
+    assert!(spec.bindings.contains(&("n".to_string(), "NTR".to_string())));
     assert!(spec.new_parameters.is_empty());
     // A chain to first-order: no `n`, a new KA; the chain's parameters are
     // the pruner's.
@@ -1030,17 +743,11 @@ fn defaults_of_text_read_the_parents_own_declarations() {
 
 /// `fo(peripherals)` with one coordinate moved off its analytic value.
 fn with_absorption(a: Absorption) -> Structure {
-    Structure {
-        absorption: a,
-        ..fo(0)
-    }
+    Structure { absorption: a, ..fo(0) }
 }
 
 fn with_elimination(e: Elimination) -> Structure {
-    Structure {
-        elimination: e,
-        ..fo(0)
-    }
+    Structure { elimination: e, ..fo(0) }
 }
 
 #[test]
@@ -1057,10 +764,7 @@ fn the_engine_is_ode_exactly_when_a_coordinate_has_no_analytic_template() {
     // The template carries the engine, so a caller reading `template()` alone
     // cannot pick the wrong one.
     assert_eq!(fo(0).template().unwrap().engine, Engine::Pk);
-    assert_eq!(
-        with_elimination(Elimination::Mm).template().unwrap().engine,
-        Engine::Ode
-    );
+    assert_eq!(with_elimination(Elimination::Mm).template().unwrap().engine, Engine::Ode);
 }
 
 #[test]
@@ -1075,12 +779,7 @@ fn an_ode_candidate_carries_its_own_cost_and_start_budget() {
     assert_eq!(fo(0).starts(), None);
     assert_eq!(with_absorption(Absorption::Weibull).starts(), None);
     for e in [Elimination::Zo, Elimination::Mm, Elimination::MixFoMm] {
-        assert_eq!(
-            with_elimination(e).starts(),
-            Some(MM_STARTS),
-            "{}",
-            e.label()
-        );
+        assert_eq!(with_elimination(e).starts(), Some(MM_STARTS), "{}", e.label());
     }
 }
 
@@ -1091,12 +790,7 @@ fn zero_order_and_weibull_absorption_render_the_bolus_template() {
     let t = with_absorption(Absorption::Zo).template().unwrap();
     assert_eq!(t.name, "one_cpt_iv");
     assert_eq!(t.roles, vec!["cl", "v", "dur"]);
-    let t = Structure {
-        absorption: Absorption::Weibull,
-        ..fo(1)
-    }
-    .template()
-    .unwrap();
+    let t = Structure { absorption: Absorption::Weibull, ..fo(1) }.template().unwrap();
     assert_eq!(t.name, "two_cpt_iv");
     assert_eq!(t.roles, vec!["cl", "v1", "q", "v2", "td", "beta"]);
     // …and every one of the added roles is read by the `[odes]` override
@@ -1110,17 +804,9 @@ fn zero_order_and_weibull_absorption_render_the_bolus_template() {
 fn saturable_elimination_adds_its_parameters_to_any_template() {
     // Elimination is orthogonal: it composes with every absorption and every
     // compartment count, because the override replaces only `central`.
-    let mm = Structure {
-        elimination: Elimination::Mm,
-        ..fo(2)
-    }
-    .template()
-    .unwrap();
+    let mm = Structure { elimination: Elimination::Mm, ..fo(2) }.template().unwrap();
     assert_eq!(mm.name, "three_cpt_oral");
-    assert_eq!(
-        mm.roles,
-        vec!["cl", "v1", "q2", "v2", "q3", "v3", "ka", "km"]
-    );
+    assert_eq!(mm.roles, vec!["cl", "v1", "q2", "v2", "q3", "v3", "ka", "km"]);
     // `MIX-FO-MM` keeps `CL` first-order and adds a saturable clearance.
     let mix = with_elimination(Elimination::MixFoMm).template().unwrap();
     assert_eq!(mix.roles, vec!["cl", "v", "ka", "clmm", "km"]);
@@ -1131,13 +817,10 @@ fn saturable_elimination_adds_its_parameters_to_any_template() {
         with_elimination(Elimination::Mm).template().unwrap().roles
     );
     // A transit chain and a saturable elimination are an allowed pair.
-    let transit_mm = Structure {
-        elimination: Elimination::Mm,
-        transits: Some(TransitCount::N),
-        ..fo(0)
-    }
-    .template()
-    .unwrap();
+    let transit_mm =
+        Structure { elimination: Elimination::Mm, transits: Some(TransitCount::N), ..fo(0) }
+            .template()
+            .unwrap();
     assert_eq!(transit_mm.name, "one_cpt_transit");
     assert_eq!(transit_mm.roles, vec!["cl", "v", "n", "mtt", "km"]);
 }
@@ -1148,32 +831,18 @@ fn the_new_absorptions_take_pharmpys_unsupported_pairs() {
     // chain in front of either is refused; WEIBULL additionally refuses a
     // lag time (Pharmpy's `not_supported_combo`), while ZO takes one.
     for a in [Absorption::Zo, Absorption::Weibull] {
-        let why = Structure {
-            absorption: a,
-            transits: Some(TransitCount::N),
-            ..fo(0)
-        }
-        .unbuildable()
-        .unwrap_or_else(|| panic!("{} with transits must be refused", a.label()));
+        let why = Structure { absorption: a, transits: Some(TransitCount::N), ..fo(0) }
+            .unbuildable()
+            .unwrap_or_else(|| panic!("{} with transits must be refused", a.label()));
         assert!(why.contains("transit chain"), "{why}");
         assert!(why.contains(a.label()), "the reason names the mode: {why}");
     }
-    let why = Structure {
-        absorption: Absorption::Weibull,
-        lagtime: true,
-        ..fo(0)
-    }
-    .unbuildable()
-    .expect("Weibull with a lag time is refused");
+    let why = Structure { absorption: Absorption::Weibull, lagtime: true, ..fo(0) }
+        .unbuildable()
+        .expect("Weibull with a lag time is refused");
     assert!(why.contains("lag time"), "{why}");
     assert!(
-        Structure {
-            absorption: Absorption::Zo,
-            lagtime: true,
-            ..fo(0)
-        }
-        .unbuildable()
-        .is_none(),
+        Structure { absorption: Absorption::Zo, lagtime: true, ..fo(0) }.unbuildable().is_none(),
         "Pharmpy lags a zero-order infusion, and so does ferx"
     );
     // The move table agrees with the structure check, in both orders.
@@ -1207,10 +876,7 @@ fn onto_space_moves_elimination_in_pharmpys_position() {
     );
     assert_eq!(
         onto_space(&fo(0), &keys("ABSORPTION(INST); ELIMINATION(MM)")),
-        vec![
-            FeatureKey::Absorption(Absorption::Inst),
-            FeatureKey::Elimination(Elimination::Mm),
-        ]
+        vec![FeatureKey::Absorption(Absorption::Inst), FeatureKey::Elimination(Elimination::Mm),]
     );
     // A space that lists the base's own elimination leaves it alone.
     assert!(onto_space(&fo(0), &keys("ELIMINATION([FO,MM])")).is_empty());
@@ -1274,11 +940,7 @@ fn michaelis_menten_reuses_the_parents_clearance_and_declares_km_from_the_data()
         "`km` is read by the override, not bound on the line: {:?}",
         spec.bindings
     );
-    let km = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "KM")
-        .expect("KM is declared");
+    let km = spec.new_parameters.iter().find(|p| p.name == "KM").expect("KM is declared");
     assert_eq!(km.init, 10.0, "max(DV)/2");
     assert_eq!(km.upper, 30.0, "1.5 * max(DV)");
     assert!(!km.fixed);
@@ -1304,11 +966,7 @@ fn zero_order_elimination_is_michaelis_menten_with_km_fixed_low() {
         IivStrategy::NoAdd,
     )
     .unwrap();
-    let km = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "KM")
-        .expect("KM is declared");
+    let km = spec.new_parameters.iter().find(|p| p.name == "KM").expect("KM is declared");
     assert_eq!(km.init, 0.02, "min(DV)/100");
     assert!(km.fixed, "a free KM here would be Michaelis-Menten, not ZO");
     // The *term* is the same one Michaelis-Menten writes: the two differ by
@@ -1334,21 +992,14 @@ fn mixed_elimination_adds_a_saturable_clearance_at_half_the_first_order_one() {
         IivStrategy::NoAdd,
     )
     .unwrap();
-    let clmm = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "CLMM")
-        .expect("CLMM is declared");
+    let clmm = spec.new_parameters.iter().find(|p| p.name == "CLMM").expect("CLMM is declared");
     // `lines()` puts `CL = TVCL * exp(ETA_CL)` behind `TVCL = 0.2`.
     assert_eq!(clmm.init, 0.1, "CL/2");
     assert_eq!(
         spec.engine,
         StructuralEngine::Ode {
             input: InputForm::Template,
-            elimination: EliminationForm::MixedFoMm {
-                clmm: "CLMM".into(),
-                km: "KM".into(),
-            },
+            elimination: EliminationForm::MixedFoMm { clmm: "CLMM".into(), km: "KM".into() },
         }
     );
 }
@@ -1370,17 +1021,10 @@ fn zero_order_absorption_declares_pharmpys_duration_and_drops_the_depot() {
     assert_eq!(spec.template, "one_cpt_iv");
     assert_eq!(
         spec.bindings,
-        vec![
-            ("cl".to_string(), "CL".to_string()),
-            ("v".to_string(), "V".to_string()),
-        ],
+        vec![("cl".to_string(), "CL".to_string()), ("v".to_string(), "V".to_string()),],
         "`ka` is not a role of the bolus template, so the depot is gone"
     );
-    let dur = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "DUR")
-        .expect("DUR is declared");
+    let dur = spec.new_parameters.iter().find(|p| p.name == "DUR").expect("DUR is declared");
     // Pharmpy: `D1 = 2·MAT`, `MAT = 2·t_first`.
     assert_eq!(dur.init, 2.0 * (2.0 * 0.5));
     assert_eq!(
@@ -1404,25 +1048,14 @@ fn weibull_absorption_declares_the_scale_and_shape() {
         IivStrategy::AbsorptionDelay,
     )
     .unwrap();
-    let td = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "TD")
-        .expect("TD is declared");
-    let beta = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "BETA")
-        .expect("BETA is declared");
+    let td = spec.new_parameters.iter().find(|p| p.name == "TD").expect("TD is declared");
+    let beta = spec.new_parameters.iter().find(|p| p.name == "BETA").expect("BETA is declared");
     assert_eq!(beta.init, WEIBULL_SHAPE_INIT);
     assert_eq!(td.init, 2.0 * 0.5 / GAMMA_1_PLUS_1_OVER_SHAPE);
     assert_eq!(
         spec.engine,
         StructuralEngine::Ode {
-            input: InputForm::Weibull {
-                td: "TD".into(),
-                beta: "BETA".into(),
-            },
+            input: InputForm::Weibull { td: "TD".into(), beta: "BETA".into() },
             elimination: EliminationForm::FirstOrder,
         }
     );
@@ -1457,10 +1090,7 @@ fn an_ode_parameter_the_parent_already_declares_is_reused_not_redeclared() {
         spec.engine,
         StructuralEngine::Ode {
             input: InputForm::Template,
-            elimination: EliminationForm::MixedFoMm {
-                clmm: "CLMM".into(),
-                km: "KM".into(),
-            },
+            elimination: EliminationForm::MixedFoMm { clmm: "CLMM".into(), km: "KM".into() },
         }
     );
 }
@@ -1516,10 +1146,7 @@ fn reserved_bindings_are_recovered_from_an_ode_parents_declarations() {
         "ALAG = TVLAG".to_string(),
         "F = inv_logit(THETA_F)".to_string(),
     ];
-    assert_eq!(
-        reserved_binding(&canonical, &["lagtime", "alag"]),
-        Some("ALAG".to_string())
-    );
+    assert_eq!(reserved_binding(&canonical, &["lagtime", "alag"]), Some("ALAG".to_string()));
     assert_eq!(reserved_binding(&canonical, &["f"]), Some("F".to_string()));
     // Nothing to recover.
     assert_eq!(reserved_binding(&["CL = TVCL".to_string()], &["f"]), None);
@@ -1558,16 +1185,9 @@ fn a_second_step_off_an_ode_parent_carries_f_and_lagtime() {
         ],
         ..dv_defaults()
     };
-    let from = Structure {
-        elimination: Elimination::Mm,
-        lagtime: true,
-        ..fo(0)
-    };
+    let from = Structure { elimination: Elimination::Mm, lagtime: true, ..fo(0) };
     let spec = structural_spec(
-        &Structure {
-            peripherals: 1,
-            ..from
-        },
+        &Structure { peripherals: 1, ..from },
         &from,
         &parent,
         &parent_lines,
@@ -1576,8 +1196,7 @@ fn a_second_step_off_an_ode_parent_carries_f_and_lagtime() {
     )
     .unwrap();
     assert!(
-        spec.bindings
-            .contains(&("lagtime".to_string(), "TLAG".to_string())),
+        spec.bindings.contains(&("lagtime".to_string(), "TLAG".to_string())),
         "the lag time is the parent's, not a fresh ALAG: {:?}",
         spec.bindings
     );
@@ -1678,11 +1297,7 @@ fn a_non_positive_observation_range_falls_back_rather_than_fixing_km_at_zero() {
         IivStrategy::NoAdd,
     )
     .unwrap();
-    let km = spec
-        .new_parameters
-        .iter()
-        .find(|p| p.name == "KM")
-        .expect("KM");
+    let km = spec.new_parameters.iter().find(|p| p.name == "KM").expect("KM");
     assert_eq!(km.init, 0.01, "min(DV)/100 with min(DV) floored to 1.0");
     assert!(km.fixed);
     // The positive part of the range is untouched: `max(DV) = 8` still sizes

@@ -88,10 +88,8 @@ fn estimates(name: &str) -> Estimates {
         .find(|r| r.first().map(String::as_str) == Some("-1000000000"))
         .expect(".ext final-estimate row");
     let col = |label: &str| -> f64 {
-        let i = header
-            .iter()
-            .position(|h| h == label)
-            .unwrap_or_else(|| panic!(".ext has no {label}"));
+        let i =
+            header.iter().position(|h| h == label).unwrap_or_else(|| panic!(".ext has no {label}"));
         last[i].parse().expect(".ext value")
     };
     Estimates {
@@ -116,19 +114,13 @@ fn phi(name: &str) -> HashMap<String, ([f64; 8], f64)> {
     let eta_cols: Vec<usize> = (1..=8).map(|k| at(&format!("ETA({k})"))).collect();
     let (id_col, obj_col) = (at("ID"), at("OBJ"));
     let mut out = HashMap::new();
-    for r in rows
-        .iter()
-        .filter(|r| r.len() == header.len() && r[0] != "SUBJECT_NO")
-    {
+    for r in rows.iter().filter(|r| r.len() == header.len() && r[0] != "SUBJECT_NO") {
         let id: f64 = r[id_col].parse().expect("ID");
         let mut eta = [0.0; 8];
         for (k, &c) in eta_cols.iter().enumerate() {
             eta[k] = r[c].parse().expect("ETA");
         }
-        out.insert(
-            format!("{}", id as i64),
-            (eta, r[obj_col].parse().expect("OBJ")),
-        );
+        out.insert(format!("{}", id as i64), (eta, r[obj_col].parse().expect("OBJ")));
     }
     out
 }
@@ -136,25 +128,18 @@ fn phi(name: &str) -> HashMap<String, ([f64; 8], f64)> {
 /// Per subject, in data order: NONMEM's IPRED at each observation (`MDV = 0`).
 fn table_ipred(name: &str) -> HashMap<String, Vec<f64>> {
     let rows = whitespace_rows(&format!("nonmem_anchor/results/{name}.tab"));
-    let header = rows
-        .iter()
-        .find(|r| r.first().map(String::as_str) == Some("ID"))
-        .expect(".tab header");
+    let header =
+        rows.iter().find(|r| r.first().map(String::as_str) == Some("ID")).expect(".tab header");
     let at = |label: &str| header.iter().position(|h| h == label).expect(label);
     let (id_col, mdv_col, ipred_col) = (at("ID"), at("MDV"), at("IPRED"));
     let mut out: HashMap<String, Vec<f64>> = HashMap::new();
-    for r in rows
-        .iter()
-        .filter(|r| r.len() == header.len() && r[0] != "ID")
-    {
+    for r in rows.iter().filter(|r| r.len() == header.len() && r[0] != "ID") {
         let mdv: f64 = r[mdv_col].parse().expect("MDV");
         if mdv != 0.0 {
             continue;
         }
         let id: f64 = r[id_col].parse().expect("ID");
-        out.entry(format!("{}", id as i64))
-            .or_default()
-            .push(r[ipred_col].parse().expect("IPRED"));
+        out.entry(format!("{}", id as i64)).or_default().push(r[ipred_col].parse().expect("IPRED"));
     }
     out
 }
@@ -206,12 +191,8 @@ fn model_at(anchor: &Anchor, est: &Estimates, twin: bool) -> ferx_core::types::C
 }
 
 fn population(anchor: &Anchor) -> ferx_core::types::Population {
-    read_nonmem_csv(
-        Path::new(&format!("nonmem_anchor/{}.csv", anchor.name)),
-        None,
-        Some("OCC"),
-    )
-    .expect("the anchor data loads")
+    read_nonmem_csv(Path::new(&format!("nonmem_anchor/{}.csv", anchor.name)), None, Some("OCC"))
+        .expect("the anchor data loads")
 }
 
 #[test]
