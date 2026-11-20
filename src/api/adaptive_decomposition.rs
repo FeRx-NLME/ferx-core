@@ -107,10 +107,43 @@ pub struct AdaptiveDecompositionSkip {
     pub n_missing: usize,
 }
 
-/// The balanced `D × S × R` cube of one subject's metric, `y[(d·S + s)·R + r]`.
+/// One outer unit of a subject's `D × S × R` design, summarised once so a delete-one
+/// replicate costs O(units), not O(D·S·R): a draw when `D > 1`, else a sim. `sse` is the
+/// within-cell sum of squares, `sss` the between-sim sum of squares inside the unit
+/// (`R·Σ_s (m_s − m)²`; 0 for a sim unit, which is one cell), `mean` the unit mean.
+#[derive(Clone, Copy)]
+struct Unit {
+    sse: f64,
+    sss: f64,
+    mean: f64,
+}
+
+/// One subject's metric: its outer units, and whether its η was supplied.
 struct Cube {
-    y: Vec<f64>,
+    units: Vec<Unit>,
     supplied: bool,
+}
+
+/// The outer units of `y`, stored `y[(d·S + s)·R + r]`.
+fn units_of(y: &[f64], (d, s, r): (usize, usize, usize)) -> Vec<Unit> {
+    let rf = r as f64;
+    let cell = |di: usize, si: usize| &y[(di * s + si) * r..(di * s + si + 1) * r];
+    let unit = |cells: Vec<&[f64]>| {
+        let means: Vec<f64> = cells.iter().map(|c| c.iter().sum::<f64>() / rf).collect();
+        let sse = cells
+            .iter()
+            .zip(&means)
+            .map(|(c, m)| c.iter().map(|v| (v - m).powi(2)).sum::<f64>())
+            .sum::<f64>();
+        let mean = means.iter().sum::<f64>() / means.len() as f64;
+        let sss = rf * means.iter().map(|m| (m - mean).powi(2)).sum::<f64>();
+        Unit { sse, sss, mean }
+    };
+    if d > 1 {
+        (0..d).map(|di| unit((0..s).map(|si| cell(di, si)).collect())).collect()
+    } else {
+        (0..s).map(|si| unit(vec![cell(0, si)])).collect()
+    }
 }
 
 /// The estimated layers of one cube, or of the population. `None` where the kept design
@@ -123,35 +156,30 @@ struct Layers {
     mean: f64,
 }
 
-/// The balanced nested ANOVA of `y` (`d × s × r`), leaving out outer unit `drop`: a draw
-/// when `d > 1`, else a sim. `(MS_D − MS_S)/(S R)`, `(MS_S − MS_E)/R`, `MS_E`.
-fn layers(y: &[f64], (d, s, r): (usize, usize, usize), drop: Option<usize>) -> Layers {
-    let keep_d = |di: usize| d == 1 || drop != Some(di);
-    let keep_s = |si: usize| d > 1 || drop != Some(si);
-    let draws: Vec<usize> = (0..d).filter(|&di| keep_d(di)).collect();
-    let sims: Vec<usize> = (0..s).filter(|&si| keep_s(si)).collect();
-    let (dk, sk) = (draws.len() as f64, sims.len() as f64);
+/// The balanced nested ANOVA over `units`, leaving out unit `drop`:
+/// `(MS_D − MS_S)/(S R)`, `(MS_S − MS_E)/R`, `MS_E`. With one draw the units are the sims
+/// and there is no parameter layer.
+fn layers(units: &[Unit], (d, s, r): (usize, usize, usize), drop: Option<usize>) -> Layers {
+    let kept: Vec<Unit> =
+        units.iter().enumerate().filter(|&(u, _)| drop != Some(u)).map(|(_, u)| *u).collect();
+    let n = kept.len() as f64;
     let rf = r as f64;
-    let (mut sse, mut sss, mut ssd) = (0.0, 0.0, 0.0);
-    let mut draw_means = Vec::with_capacity(draws.len());
-    for &di in &draws {
-        let mut cell_means = Vec::with_capacity(sims.len());
-        for &si in &sims {
-            let cell = &y[(di * s + si) * r..(di * s + si + 1) * r];
-            let m = cell.iter().sum::<f64>() / rf;
-            sse += cell.iter().map(|v| (v - m).powi(2)).sum::<f64>();
-            cell_means.push(m);
-        }
-        let md = cell_means.iter().sum::<f64>() / sk;
-        sss += rf * cell_means.iter().map(|m| (m - md).powi(2)).sum::<f64>();
-        draw_means.push(md);
-    }
-    let mean = draw_means.iter().sum::<f64>() / dk;
-    ssd += sk * rf * draw_means.iter().map(|m| (m - mean).powi(2)).sum::<f64>();
+    let mean = kept.iter().map(|u| u.mean).sum::<f64>() / n;
+    let sse = kept.iter().map(|u| u.sse).sum::<f64>();
+    let between_units = kept.iter().map(|u| (u.mean - mean).powi(2)).sum::<f64>();
     let ms = |ss: f64, df: f64| (df > 0.0).then(|| ss / df);
-    let mse = ms(sse, dk * sk * (rf - 1.0));
-    let mss = ms(sss, dk * (sk - 1.0));
-    let msd = if d > 1 { ms(ssd, dk - 1.0) } else { None };
+    let (sk, mse, mss, msd) = if d > 1 {
+        let sk = s as f64;
+        let sss = kept.iter().map(|u| u.sss).sum::<f64>();
+        (
+            sk,
+            ms(sse, n * sk * (rf - 1.0)),
+            ms(sss, n * (sk - 1.0)),
+            ms(sk * rf * between_units, n - 1.0),
+        )
+    } else {
+        (n, ms(sse, n * (rf - 1.0)), ms(rf * between_units, n - 1.0), None)
+    };
     Layers {
         param: msd.zip(mss).map(|(a, b)| (a - b) / (sk * rf)),
         bsv: mss.zip(mse).map(|(a, b)| (a - b) / rf),
@@ -298,7 +326,7 @@ pub fn decompose_adaptive(
             let slots = by_subject.get(id).map_or(&[][..], Vec::as_slice);
             let present: Option<Vec<f64>> = slots.iter().copied().collect();
             match present.filter(|y| y.len() == n_runs) {
-                Some(y) => cubes.push((id, Cube { y, supplied })),
+                Some(y) => cubes.push((id, Cube { units: units_of(&y, dims), supplied })),
                 None => out.skipped.push(AdaptiveDecompositionSkip {
                     metric: metric.clone(),
                     subject: id.to_string(),
@@ -334,7 +362,7 @@ fn push_metric(
     // A subject: parameter, BSV, within, and their sum.
     for (id, cube) in cubes {
         let est = |drop: Option<usize>| {
-            let l = layers(&cube.y, dims, drop);
+            let l = layers(&cube.units, dims, drop);
             // A supplied subject's BSV is computed but never reported: the `Supplied`
             // status below and `total_of`'s `reported` flag are the one gate.
             let total = total_of(&[(l.param, d > 1), (l.bsv, !cube.supplied), (l.within, true)]);
@@ -359,7 +387,7 @@ fn push_metric(
     let n_drawn = cubes.iter().filter(|(_, c)| !c.supplied).count();
     let est = |drop: Option<usize>| {
         let ls: Vec<(Layers, bool)> =
-            cubes.iter().map(|(_, c)| (layers(&c.y, dims, drop), c.supplied)).collect();
+            cubes.iter().map(|(_, c)| (layers(&c.units, dims, drop), c.supplied)).collect();
         let avg = |f: &dyn Fn(&(Layers, bool)) -> Option<Option<f64>>| {
             let v: Vec<Option<f64>> = ls.iter().filter_map(f).collect();
             let v: Option<Vec<f64>> = v.into_iter().collect();
