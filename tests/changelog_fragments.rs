@@ -45,11 +45,7 @@ fn tree(slot: &str, fragments: &[(&str, &str)]) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("changelog.d")).unwrap();
     std::fs::write(dir.join("CHANGELOG.md"), format!("{HEAD}{TAIL}")).unwrap();
-    std::fs::write(
-        dir.join("changelog.d").join("README.md"),
-        "not a fragment\n",
-    )
-    .unwrap();
+    std::fs::write(dir.join("changelog.d").join("README.md"), "not a fragment\n").unwrap();
     for (name, body) in fragments {
         std::fs::write(dir.join("changelog.d").join(name), body).unwrap();
     }
@@ -90,12 +86,7 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
         "- **A fix** (#12). More\n  words on a continuation line.\n\n  | a | b |\n  |---|---|\n";
     // (slot, malformed, accepted twin, expected message)
     let cases: &[(&str, Fragment, Fragment, &str)] = &[
-        (
-            "bad-name",
-            ("fix-12.md", good),
-            ("12.fixed.md", good),
-            "name must be <N>.<category>.md",
-        ),
+        ("bad-name", ("fix-12.md", good), ("12.fixed.md", good), "name must be <N>.<category>.md"),
         (
             // A `..`-prefixed name escaped every glob spelling, so `check` never
             // saw it while `require` counted it as a fragment.
@@ -141,12 +132,7 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
             ("12.fixed.md", good),
             "unknown category 'bugfix'",
         ),
-        (
-            "empty",
-            ("12.fixed.md", "\n  \n"),
-            ("12.fixed.md", good),
-            "empty",
-        ),
+        ("empty", ("12.fixed.md", "\n  \n"), ("12.fixed.md", good), "empty"),
         (
             "not-a-bullet",
             ("12.fixed.md", "A fix (#12).\n"),
@@ -170,10 +156,7 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
         (
             "no-reference",
             ("12.fixed.md", "- Fixed the crash.\n"),
-            (
-                "12.fixed.md",
-                "- Fixed the crash ([#12](https://example.org/issues/12)).\n",
-            ),
+            ("12.fixed.md", "- Fixed the crash ([#12](https://example.org/issues/12)).\n"),
             "no issue/PR reference",
         ),
         (
@@ -193,23 +176,14 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
     for (slot, bad, ok, want) in cases {
         let t = tree(&format!("check-{slot}-ok"), &[*ok]);
         let o = run(&t, &["check"]);
-        assert!(
-            o.status.success(),
-            "{slot}: twin {:?} rejected:\n{}",
-            ok.0,
-            stderr(&o)
-        );
+        assert!(o.status.success(), "{slot}: twin {:?} rejected:\n{}", ok.0, stderr(&o));
 
         let t = tree(&format!("check-{slot}-bad"), &[*bad]);
         let o = run(&t, &["check"]);
         let err = stderr(&o);
         assert!(!o.status.success(), "{slot}: {:?} accepted", bad.0);
         assert!(err.contains(want), "{slot}: expected {want:?} in:\n{err}");
-        assert!(
-            err.contains(bad.0),
-            "{slot}: message does not name {:?}:\n{err}",
-            bad.0
-        );
+        assert!(err.contains(bad.0), "{slot}: message does not name {:?}:\n{err}", bad.0);
     }
 }
 
@@ -220,39 +194,22 @@ fn check_rejects_each_malformed_fragment_and_accepts_its_twin() {
 fn check_rejects_directories_and_symlinks() {
     let t = tree("nonregular-dir", &[("1.fixed.md", "- x (#1).\n")]);
     std::fs::create_dir_all(t.join("changelog.d").join(".gitkeep")).unwrap();
-    std::fs::write(
-        t.join("changelog.d").join(".gitkeep").join("2.fixed.md"),
-        "- y (#2).\n",
-    )
-    .unwrap();
+    std::fs::write(t.join("changelog.d").join(".gitkeep").join("2.fixed.md"), "- y (#2).\n")
+        .unwrap();
     let o = run(&t, &["check"]);
     assert!(!o.status.success(), "a .gitkeep/ directory passed");
-    assert!(
-        stderr(&o).contains(".gitkeep: not a regular file"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains(".gitkeep: not a regular file"), "{}", stderr(&o));
 
     let t = tree("nonregular-link", &[]);
     std::fs::write(t.join("target.md"), "- z (#3).\n").unwrap();
-    std::os::unix::fs::symlink(
-        t.join("target.md"),
-        t.join("changelog.d").join("3.fixed.md"),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(t.join("target.md"), t.join("changelog.d").join("3.fixed.md"))
+        .unwrap();
     let o = run(&t, &["check"]);
     assert!(!o.status.success(), "a symlinked fragment passed");
-    assert!(
-        stderr(&o).contains("3.fixed.md: not a regular file"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("3.fixed.md: not a regular file"), "{}", stderr(&o));
 
     // Twin: the same reserved name as a plain file is skipped silently.
-    let t = tree(
-        "nonregular-ok",
-        &[(".gitkeep", ""), ("1.fixed.md", "- x (#1).\n")],
-    );
+    let t = tree("nonregular-ok", &[(".gitkeep", ""), ("1.fixed.md", "- x (#1).\n")]);
     let o = run(&t, &["check"]);
     assert!(o.status.success(), "{}", stderr(&o));
 }
@@ -265,19 +222,13 @@ fn check_rejects_an_entry_written_under_unreleased() {
     assert!(run(&t, &["check"]).status.success());
 
     let t = tree("unreleased-bad", &[]);
-    std::fs::write(
-        t.join("CHANGELOG.md"),
-        format!("{HEAD}### Fixed\n- Habit (#9).\n\n{TAIL}"),
-    )
-    .unwrap();
+    std::fs::write(t.join("CHANGELOG.md"), format!("{HEAD}### Fixed\n- Habit (#9).\n\n{TAIL}"))
+        .unwrap();
     let o = run(&t, &["check"]);
     let err = stderr(&o);
     assert!(!o.status.success(), "an [Unreleased] entry was accepted");
     assert!(err.contains("[Unreleased] must stay empty"), "{err}");
-    assert!(
-        err.contains("- Habit (#9)."),
-        "does not quote the line:\n{err}"
-    );
+    assert!(err.contains("- Habit (#9)."), "does not quote the line:\n{err}");
 }
 
 /// Without exactly one `## [Unreleased]` heading an empty section and a missing one look
@@ -286,10 +237,7 @@ fn check_rejects_an_entry_written_under_unreleased() {
 #[test]
 fn a_missing_or_duplicate_unreleased_heading_is_refused_before_anything_is_deleted() {
     for (slot, changelog) in [
-        (
-            "missing",
-            format!("# Changelog\n\n## [Unreleased-typo]\n\n{TAIL}"),
-        ),
+        ("missing", format!("# Changelog\n\n## [Unreleased-typo]\n\n{TAIL}")),
         ("duplicate", format!("{HEAD}## [Unreleased]\n\n{TAIL}")),
     ] {
         let t = tree(&format!("heading-{slot}"), &[("1.fixed.md", "- x (#1).\n")]);
@@ -342,21 +290,15 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            t.join("CHANGELOG.md"),
-            std::fs::Permissions::from_mode(0o640),
-        )
-        .unwrap();
+        std::fs::set_permissions(t.join("CHANGELOG.md"), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
     }
     let o = run(&t, &["assemble", "v0.2.0", "--date", "2026-10-05"]);
     assert!(o.status.success(), "{}", stderr(&o));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(t.join("CHANGELOG.md"))
-            .unwrap()
-            .permissions()
-            .mode();
+        let mode = std::fs::metadata(t.join("CHANGELOG.md")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o640, "assemble changed CHANGELOG.md's mode");
     }
 
@@ -394,11 +336,7 @@ fn assemble_writes_a_keep_a_changelog_section_and_removes_the_fragments() {
     std::fs::write(t.join("changelog.d").join("1.fixed.md"), "- x (#1).\n").unwrap();
     let o = run(&t, &["assemble", "0.2.0"]);
     assert!(!o.status.success());
-    assert!(
-        stderr(&o).contains("already has a ## [0.2.0]"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("already has a ## [0.2.0]"), "{}", stderr(&o));
 }
 
 #[test]
@@ -427,11 +365,7 @@ fn assemble_refuses_invalid_fragments_and_versions() {
         let t = tree("assemble-version", &[("1.fixed.md", "- x (#1).\n")]);
         let o = run(&t, &["assemble", bad]);
         assert!(!o.status.success(), "{bad} accepted as a version");
-        assert!(
-            stderr(&o).contains("is not a release version"),
-            "{bad}: {}",
-            stderr(&o)
-        );
+        assert!(stderr(&o).contains("is not a release version"), "{bad}: {}", stderr(&o));
         assert!(t.join("changelog.d").join("1.fixed.md").exists());
     }
     // grep matches per line: a line break must not let a valid line vouch for junk.
@@ -442,14 +376,7 @@ fn assemble_refuses_invalid_fragments_and_versions() {
         assert!(stderr(&o).contains("single-line"), "{}", stderr(&o));
         assert!(t.join("changelog.d").join("1.fixed.md").exists());
     }
-    for good in [
-        "0.10.0",
-        "v1.2.3",
-        "1.2.3-rc.1",
-        "1.2.3-alpha-2",
-        "1.2.3-0",
-        "1.2.3-0a",
-    ] {
+    for good in ["0.10.0", "v1.2.3", "1.2.3-rc.1", "1.2.3-alpha-2", "1.2.3-0", "1.2.3-0a"] {
         let t = tree("assemble-version-ok", &[("1.fixed.md", "- x (#1).\n")]);
         let o = run(&t, &["assemble", good, "--date", "2026-10-05"]);
         assert!(o.status.success(), "{good} refused: {}", stderr(&o));
@@ -460,10 +387,7 @@ fn assemble_refuses_invalid_fragments_and_versions() {
 fn preview_renders_the_pending_section() {
     let t = tree(
         "preview",
-        &[
-            ("5.changed.md", "- Changed (#5).\n"),
-            ("4.added.md", "- Added (#4).\n"),
-        ],
+        &[("5.changed.md", "- Changed (#5).\n"), ("4.added.md", "- Added (#4).\n")],
     );
     let o = run(&t, &["preview"]);
     assert!(o.status.success(), "{}", stderr(&o));
@@ -487,14 +411,7 @@ fn git_repo(slot: &str) -> (PathBuf, String) {
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let o = Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@example.org",
-            "-c",
-            "commit.gpgsign=false",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(dir)
         .env_remove("GIT_DIR")
@@ -524,44 +441,24 @@ fn require_fails_a_user_facing_change_without_a_fragment() {
     let o = run(&d, &["require", &base, "--pr", "77"]);
     let err = stderr(&o);
     assert!(!o.status.success(), "src/ change without a fragment passed");
-    assert!(
-        err.contains("Missing: changelog.d/77.<category>.md"),
-        "{err}"
-    );
-    assert!(
-        err.contains("src/lib.rs"),
-        "does not list the changed path:\n{err}"
-    );
-    assert!(
-        err.contains("no-changelog"),
-        "does not name the opt-out label:\n{err}"
-    );
+    assert!(err.contains("Missing: changelog.d/77.<category>.md"), "{err}");
+    assert!(err.contains("src/lib.rs"), "does not list the changed path:\n{err}");
+    assert!(err.contains("no-changelog"), "does not name the opt-out label:\n{err}");
 
     // The opt-out is the boolean the workflow computes from the label; anything but
     // `true`/`false` is a usage error, not a silent pass.
     let o = run(&d, &["require", &base, "--pr", "77", "--opt-out", "false"]);
     assert!(!o.status.success(), "--opt-out false opted out");
-    let o = run(
-        &d,
-        &["require", &base, "--pr", "77", "--opt-out", "no-changelog"],
-    );
+    let o = run(&d, &["require", &base, "--pr", "77", "--opt-out", "no-changelog"]);
     assert!(!o.status.success(), "a non-boolean --opt-out passed");
-    assert!(
-        stderr(&o).contains("must be true or false"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("must be true or false"), "{}", stderr(&o));
     let o = run(&d, &["require", &base, "--pr", "77", "--opt-out", "true"]);
     assert!(o.status.success(), "{}", stderr(&o));
 
     // A README edit does not count as a fragment; a fragment does.
     commit_file(&d, concat!("changelog.d", "/README.md"), "edited\n");
     assert!(!run(&d, &["require", &base, "--pr", "77"]).status.success());
-    commit_file(
-        &d,
-        concat!("changelog.d", "/77.fixed.md"),
-        "- Fixed (#77).\n",
-    );
+    commit_file(&d, concat!("changelog.d", "/77.fixed.md"), "- Fixed (#77).\n");
     let o = run(&d, &["require", &base, "--pr", "77"]);
     assert!(o.status.success(), "{}", stderr(&o));
 }
@@ -572,11 +469,7 @@ fn require_fails_a_user_facing_change_without_a_fragment() {
 fn require_counts_only_an_added_fragment() {
     for (slot, edit) in [("modify", false), ("rename", true)] {
         let (d, _) = git_repo(&format!("only-added-{slot}"));
-        commit_file(
-            &d,
-            concat!("changelog.d", "/10.fixed.md"),
-            "- Someone else's fix (#10).\n",
-        );
+        commit_file(&d, concat!("changelog.d", "/10.fixed.md"), "- Someone else's fix (#10).\n");
         let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
         commit_file(&d, "src/lib.rs", "// v2\n");
         if edit {
@@ -590,17 +483,10 @@ fn require_counts_only_an_added_fragment() {
             );
             git(&d, &["commit", "-q", "-m", "rename"]);
         } else {
-            commit_file(
-                &d,
-                concat!("changelog.d", "/10.fixed.md"),
-                "- Reworded fix (#10).\n",
-            );
+            commit_file(&d, concat!("changelog.d", "/10.fixed.md"), "- Reworded fix (#10).\n");
         }
         let o = run(&d, &["require", &base, "--pr", "11"]);
-        assert!(
-            !o.status.success(),
-            "{slot} of an existing fragment counted as this PR's own"
-        );
+        assert!(!o.status.success(), "{slot} of an existing fragment counted as this PR's own");
     }
 }
 
@@ -612,10 +498,7 @@ fn require_sees_the_source_side_of_a_rename() {
     git(&d, &["mv", "src/lib.rs", "src/lib_tests.rs"]);
     git(&d, &["commit", "-q", "-m", "rename"]);
     let o = run(&d, &["require", &base, "--pr", "5"]);
-    assert!(
-        !o.status.success(),
-        "src/lib.rs -> src/lib_tests.rs passed as test-only"
-    );
+    assert!(!o.status.success(), "src/lib.rs -> src/lib_tests.rs passed as test-only");
     assert!(stderr(&o).contains("src/lib.rs"), "{}", stderr(&o));
 }
 
@@ -631,11 +514,7 @@ fn require_skips_changes_that_are_not_user_facing() {
         let (d, base) = git_repo(&format!("skip-{slot}"));
         commit_file(&d, rel, "x\n");
         let o = run(&d, &["require", &base, "--pr", "5"]);
-        assert!(
-            o.status.success(),
-            "{rel} demanded a fragment:\n{}",
-            stderr(&o)
-        );
+        assert!(o.status.success(), "{rel} demanded a fragment:\n{}", stderr(&o));
     }
     // The twins: production source under EVERY configured prefix is user-facing.
     for (slot, rel) in [
@@ -662,11 +541,7 @@ fn require_skips_changes_that_are_not_user_facing() {
 fn require_ignores_a_path_nested_under_changelog_d() {
     let (d, base) = git_repo("nested-fragment");
     commit_file(&d, "src/lib.rs", "// v2\n");
-    commit_file(
-        &d,
-        concat!("changelog.d", "/.gitkeep/5.fixed.md"),
-        "- x (#5).\n",
-    );
+    commit_file(&d, concat!("changelog.d", "/.gitkeep/5.fixed.md"), "- x (#5).\n");
     let o = run(&d, &["require", &base, "--pr", "5"]);
     assert!(!o.status.success(), "a nested path counted as a fragment");
 }
@@ -677,27 +552,15 @@ fn require_ignores_a_path_nested_under_changelog_d() {
 #[test]
 fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     let (d, _) = git_repo("drop-pending");
-    commit_file(
-        &d,
-        concat!("changelog.d", "/10.fixed.md"),
-        "- Someone else's fix (#10).\n",
-    );
+    commit_file(&d, concat!("changelog.d", "/10.fixed.md"), "- Someone else's fix (#10).\n");
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     git(&d, &["rm", "-q", concat!("changelog.d", "/10.fixed.md")]);
-    commit_file(
-        &d,
-        concat!("changelog.d", "/11.fixed.md"),
-        "- Mine (#11).\n",
-    );
+    commit_file(&d, concat!("changelog.d", "/11.fixed.md"), "- Mine (#11).\n");
     commit_file(&d, "src/lib.rs", "// v2\n");
     for opt_out in ["false", "true"] {
         let o = run(&d, &["require", &base, "--pr", "11", "--opt-out", opt_out]);
         assert!(!o.status.success(), "opt-out {opt_out}: dropped #10 passed");
-        assert!(
-            stderr(&o).contains(concat!("changelog.d", "/10.fixed.md")),
-            "{}",
-            stderr(&o)
-        );
+        assert!(stderr(&o).contains(concat!("changelog.d", "/10.fixed.md")), "{}", stderr(&o));
     }
 
     // Not enough: only the FIRST line of a multi-line fragment copied into the
@@ -711,16 +574,10 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     commit_file(
         &d,
         "CHANGELOG.md",
-        &cl.replace(
-            "- Old fix (#1).\n",
-            "- Old fix (#1).\n- Someone else's fix (#10).\n",
-        ),
+        &cl.replace("- Old fix (#1).\n", "- Old fix (#1).\n- Someone else's fix (#10).\n"),
     );
     let o = run(&d, &["require", &base, "--pr", "12"]);
-    assert!(
-        !o.status.success(),
-        "a partially copied fragment counted as assembled"
-    );
+    assert!(!o.status.success(), "a partially copied fragment counted as assembled");
 
     let (d, _) = git_repo("drop-preexisting");
     let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
@@ -734,24 +591,13 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     git(&d, &["rm", "-q", concat!("changelog.d", "/10.fixed.md")]);
     git(&d, &["commit", "-q", "-m", "drop"]);
     let o = run(&d, &["require", &base, "--pr", "12"]);
-    assert!(
-        !o.status.success(),
-        "text already in the changelog counted as assembled"
-    );
+    assert!(!o.status.success(), "text already in the changelog counted as assembled");
 
     // Nor are the right lines in the wrong order, or a repeated line added once:
     // the fragment must appear as one contiguous run.
     for (slot, frag, added) in [
-        (
-            "reordered",
-            "- A (#10).\n  one.\n  two.\n",
-            "- A (#10).\n  two.\n  one.\n",
-        ),
-        (
-            "deduplicated",
-            "- A (#10).\n  same.\n  same.\n",
-            "- A (#10).\n  same.\n",
-        ),
+        ("reordered", "- A (#10).\n  one.\n  two.\n", "- A (#10).\n  two.\n  one.\n"),
+        ("deduplicated", "- A (#10).\n  same.\n  same.\n", "- A (#10).\n  same.\n"),
         (
             // An interior blank line around a table is Markdown, not padding.
             "blank-dropped",
@@ -781,11 +627,7 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     git(
         &d,
-        &[
-            "mv",
-            concat!("changelog.d", "/10.fixed.md"),
-            concat!("changelog.d", "/11.fixed.md"),
-        ],
+        &["mv", concat!("changelog.d", "/10.fixed.md"), concat!("changelog.d", "/11.fixed.md")],
     );
     let cl = std::fs::read_to_string(d.join("CHANGELOG.md")).unwrap();
     commit_file(
@@ -795,11 +637,7 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     );
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(!o.status.success(), "a rename passed");
-    assert!(
-        stderr(&o).contains("renames pending changelog fragment"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("renames pending changelog fragment"), "{}", stderr(&o));
 
     // The release twin: the same deletion, with the entry now in CHANGELOG.md.
     // A table fragment rides along: its interior blank lines must pass both checks
@@ -817,11 +655,7 @@ fn require_refuses_to_drop_a_pending_fragment_except_into_the_changelog() {
     git(&d, &["add", "-A"]);
     git(&d, &["commit", "-q", "-m", "release"]);
     let o = run(&d, &["require", &base, "--pr", "12"]);
-    assert!(
-        o.status.success(),
-        "a release PR was refused: {}",
-        stderr(&o)
-    );
+    assert!(o.status.success(), "a release PR was refused: {}", stderr(&o));
 }
 
 /// `preflight.sh changelog` must propagate the script's failure, not just print it.
@@ -846,14 +680,8 @@ fn the_preflight_group_fails_when_the_fragments_do() {
         .output()
         .unwrap();
     let err = stderr(&o);
-    assert!(
-        !o.status.success(),
-        "preflight passed over an invalid fragment"
-    );
-    assert!(
-        err.contains("preflight FAILED in group 'changelog'"),
-        "{err}"
-    );
+    assert!(!o.status.success(), "preflight passed over an invalid fragment");
+    assert!(err.contains("preflight FAILED in group 'changelog'"), "{err}");
     assert!(err.contains("CI job:   Changelog"), "{err}");
 }
 
@@ -862,16 +690,9 @@ fn the_preflight_group_fails_when_the_fragments_do() {
 /// checkout) that leaves every test above green and the gate inert or stale.
 #[test]
 fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
-    let p = repo_root()
-        .join(".github")
-        .join("workflows")
-        .join("changelog.yml");
+    let p = repo_root().join(".github").join("workflows").join("changelog.yml");
     let yml = std::fs::read_to_string(&p).unwrap();
-    let lines: Vec<&str> = yml
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with('#'))
-        .collect();
+    let lines: Vec<&str> = yml.lines().map(str::trim).filter(|l| !l.starts_with('#')).collect();
     // Context-bearing, indentation and all: `pull_request_target:` (base-branch code,
     // an empty diff) or another target branch must not keep these lines green.
     for want in [
@@ -888,10 +709,7 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
         "NO_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'no-changelog') }}",
         r#"run: tools/changelog.sh require "$BASE_SHA" --pr "$PR" --opt-out "$NO_CHANGELOG""#,
     ] {
-        assert!(
-            lines.contains(&want),
-            "changelog.yml lost `{want}` — see #1545"
-        );
+        assert!(lines.contains(&want), "changelog.yml lost `{want}` — see #1545");
     }
     // The default checkout is the PR's merge commit. A `ref:` override (e.g. to
     // `base.sha`) makes HEAD the base, the diff empty, and the gate inert.
@@ -901,17 +719,13 @@ fn the_changelog_workflow_is_wired_to_the_pr_base_and_its_labels() {
     );
     // A path filter would skip exactly the source-only PRs the gate exists for.
     assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("paths:") || l.starts_with("paths-ignore:")),
+        !lines.iter().any(|l| l.starts_with("paths:") || l.starts_with("paths-ignore:")),
         "changelog.yml filters its trigger by path"
     );
     // No step may mask the gate.
     assert!(
-        !lines.iter().any(
-            |l| l.trim_start_matches("- ").starts_with("continue-on-error:")
-                || l.trim_start_matches("- ").starts_with("if:")
-        ),
+        !lines.iter().any(|l| l.trim_start_matches("- ").starts_with("continue-on-error:")
+            || l.trim_start_matches("- ").starts_with("if:")),
         "changelog.yml can skip itself or pass while red"
     );
 }
@@ -932,16 +746,10 @@ fn no_loop_in_the_script_reads_a_here_document() {
         .flat_map(str::chars)
         .filter(|c| !c.is_whitespace() && *c != '\\')
         .collect();
-    assert!(
-        !squeezed.contains("done<<"),
-        "a loop in tools/changelog.sh reads a here-document"
-    );
+    assert!(!squeezed.contains("done<<"), "a loop in tools/changelog.sh reads a here-document");
     // The scan itself must see the shapes it claims to.
     for shape in ["done  <<EOF\n", "done \\\n  <<EOF\n", "done <<<\"$x\"\n"] {
-        let s: String = shape
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '\\')
-            .collect();
+        let s: String = shape.chars().filter(|c| !c.is_whitespace() && *c != '\\').collect();
         assert!(s.contains("done<<"), "{shape:?} escapes the scan");
     }
 }
@@ -949,13 +757,7 @@ fn no_loop_in_the_script_reads_a_here_document() {
 /// `--date` is a calendar date, not just a `NNNN-NN-NN` shape.
 #[test]
 fn assemble_refuses_an_impossible_date() {
-    for bad in [
-        "2026-02-31",
-        "2026-13-01",
-        "2026-00-10",
-        "2025-02-29",
-        "2100-02-29",
-    ] {
+    for bad in ["2026-02-31", "2026-13-01", "2026-00-10", "2025-02-29", "2100-02-29"] {
         let t = tree("date-bad", &[("1.fixed.md", "- x (#1).\n")]);
         let o = run(&t, &["assemble", "0.2.0", "--date", bad]);
         assert!(!o.status.success(), "{bad} accepted");
@@ -984,21 +786,10 @@ fn require_fails_a_release_pr_that_leaves_a_fragment_pending() {
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(o.status.success(), "{}", stderr(&o));
 
-    commit_file(
-        &d,
-        concat!("changelog.d", "/20.fixed.md"),
-        "- Later fix (#20).\n",
-    );
+    commit_file(&d, concat!("changelog.d", "/20.fixed.md"), "- Later fix (#20).\n");
     let o = run(&d, &["require", &base, "--pr", "12"]);
-    assert!(
-        !o.status.success(),
-        "a release PR leaving #20 pending passed"
-    );
-    assert!(
-        stderr(&o).contains(concat!("changelog.d", "/20.fixed.md")),
-        "{}",
-        stderr(&o)
-    );
+    assert!(!o.status.success(), "a release PR leaving #20 pending passed");
+    assert!(stderr(&o).contains(concat!("changelog.d", "/20.fixed.md")), "{}", stderr(&o));
 }
 
 /// The tag-time backstop run by `release.yml`.
@@ -1012,34 +803,20 @@ fn released_requires_the_section_and_nothing_pending() {
 
     let o = run(&t, &["released", "v0.2.0"]);
     assert!(!o.status.success(), "a tag with no section passed");
-    assert!(
-        stderr(&o).contains("no '## [0.2.0] - <date>' section"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("no '## [0.2.0] - <date>' section"), "{}", stderr(&o));
     // `.` is literal: 0x1x0 is not 0.1.0.
     assert!(!run(&t, &["released", "v0x1x0"]).status.success());
 
-    let t = tree(
-        "released-pending",
-        &[("20.fixed.md", "- Later fix (#20).\n")],
-    );
+    let t = tree("released-pending", &[("20.fixed.md", "- Later fix (#20).\n")]);
     let o = run(&t, &["released", "v0.1.0"]);
     assert!(!o.status.success(), "a tag with a pending fragment passed");
-    assert!(
-        stderr(&o).contains(concat!("changelog.d", "/20.fixed.md")),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains(concat!("changelog.d", "/20.fixed.md")), "{}", stderr(&o));
 }
 
 /// `release.yml` must run the backstop before it publishes anything.
 #[test]
 fn the_release_workflow_checks_the_changelog_before_publishing() {
-    let p = repo_root()
-        .join(".github")
-        .join("workflows")
-        .join("release.yml");
+    let p = repo_root().join(".github").join("workflows").join("release.yml");
     let yml = std::fs::read_to_string(&p).unwrap();
     let check = yml
         .find(r#"run: tools/changelog.sh released "$TAG""#)
@@ -1063,10 +840,7 @@ fn the_release_workflow_checks_the_changelog_before_publishing() {
         .map(|l| l.trim().trim_start_matches("- "))
         .filter(|l| l.starts_with("if:") || l.starts_with("continue-on-error:"))
         .collect();
-    assert!(
-        masking.is_empty(),
-        "release.yml can skip or ignore the changelog check: {masking:?}"
-    );
+    assert!(masking.is_empty(), "release.yml can skip or ignore the changelog check: {masking:?}");
 }
 
 /// The directory and its README are required: without them an empty tree and a
@@ -1083,11 +857,7 @@ fn check_requires_the_directory_and_its_readme() {
     std::fs::remove_dir_all(t.join("changelog.d")).unwrap();
     let o = run(&t, &["check"]);
     assert!(!o.status.success(), "check passed without changelog.d/");
-    assert!(
-        stderr(&o).contains("no changelog.d/ directory"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("no changelog.d/ directory"), "{}", stderr(&o));
 }
 
 /// `ci.yml`'s `Changelog` job validates the PR's own fragments only on the default
@@ -1098,9 +868,7 @@ fn check_requires_the_directory_and_its_readme() {
 fn the_ci_changelog_job_checks_the_pr_tree() {
     let p = repo_root().join(".github").join("workflows").join("ci.yml");
     let yml = std::fs::read_to_string(&p).unwrap();
-    let start = yml
-        .find("\n  changelog:\n")
-        .expect("ci.yml has no `changelog` job");
+    let start = yml.find("\n  changelog:\n").expect("ci.yml has no `changelog` job");
     // Past the `\n  changelog:\n` header; the job ends at the next key indented by
     // exactly two spaces (the next job).
     let rest = &yml[start + "\n  changelog:\n".len()..];
@@ -1113,10 +881,7 @@ fn the_ci_changelog_job_checks_the_pr_tree() {
         })
         .unwrap_or(rest.len());
     let job = &rest[..end];
-    assert!(
-        job.contains("run: tools/preflight.sh changelog"),
-        "job body mis-sliced:\n{job}"
-    );
+    assert!(job.contains("run: tools/preflight.sh changelog"), "job body mis-sliced:\n{job}");
     assert!(
         !job.lines().any(|l| l.trim_start().starts_with("ref:")),
         "the Changelog job checks out a ref other than the PR:\n{job}"
@@ -1127,13 +892,8 @@ fn the_ci_changelog_job_checks_the_pr_tree() {
 /// valid one here.
 #[test]
 fn check_validates_every_fragment_not_just_the_first() {
-    let t = tree(
-        "mixed",
-        &[
-            ("1.fixed.md", "- Fine (#1).\n"),
-            ("2.fixed.md", "Not a bullet (#2).\n"),
-        ],
-    );
+    let t =
+        tree("mixed", &[("1.fixed.md", "- Fine (#1).\n"), ("2.fixed.md", "Not a bullet (#2).\n")]);
     let o = run(&t, &["check"]);
     assert!(!o.status.success(), "a malformed second fragment passed");
     assert!(stderr(&o).contains("2.fixed.md"), "{}", stderr(&o));
@@ -1148,11 +908,7 @@ fn assemble_refuses_a_duplicate_unreleased_link() {
     std::fs::write(t.join("CHANGELOG.md"), &cl).unwrap();
     let o = run(&t, &["assemble", "0.2.0", "--date", "2026-10-05"]);
     assert!(!o.status.success(), "assembled over two [Unreleased] links");
-    assert!(
-        stderr(&o).contains("exactly one '[Unreleased]:'"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("exactly one '[Unreleased]:'"), "{}", stderr(&o));
     assert_eq!(std::fs::read_to_string(t.join("CHANGELOG.md")).unwrap(), cl);
     assert!(t.join("changelog.d").join("1.fixed.md").exists());
 }
@@ -1163,11 +919,7 @@ fn assemble_refuses_a_duplicate_unreleased_link() {
 fn require_verifies_every_deleted_fragment() {
     let (d, _) = git_repo("two-deletions");
     commit_file(&d, concat!("changelog.d", "/10.fixed.md"), "- Ten (#10).\n");
-    commit_file(
-        &d,
-        concat!("changelog.d", "/20.fixed.md"),
-        "- Twenty (#20).\n",
-    );
+    commit_file(&d, concat!("changelog.d", "/20.fixed.md"), "- Twenty (#20).\n");
     let base = git(&d, &["rev-parse", "HEAD"]).trim().to_string();
     git(
         &d,
@@ -1190,12 +942,6 @@ fn require_verifies_every_deleted_fragment() {
     let o = run(&d, &["require", &base, "--pr", "12"]);
     assert!(!o.status.success(), "#20 was dropped and the PR passed");
     let err = stderr(&o);
-    assert!(
-        err.contains(concat!("changelog.d", "/20.fixed.md")),
-        "{err}"
-    );
-    assert!(
-        !err.contains(concat!("changelog.d", "/10.fixed.md")),
-        "#10 was assembled:\n{err}"
-    );
+    assert!(err.contains(concat!("changelog.d", "/20.fixed.md")), "{err}");
+    assert!(!err.contains(concat!("changelog.d", "/10.fixed.md")), "#10 was assembled:\n{err}");
 }

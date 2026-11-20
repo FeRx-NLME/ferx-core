@@ -59,17 +59,11 @@ fn run_options(base: &FitOptions) -> RunOptions {
 /// dropped).
 fn candidates() -> Vec<Candidate> {
     let base = base_text();
-    let commented = ModelText::parse(&format!(
-        "# a comment the canonical form must ignore\n{}",
-        base.render()
-    ))
-    .expect("parse the commented copy");
+    let commented =
+        ModelText::parse(&format!("# a comment the canonical form must ignore\n{}", base.render()))
+            .expect("parse the commented copy");
     let mut no_ka_iiv = base.clone();
-    no_ka_iiv
-        .apply(ModelEdit::DropIiv {
-            param: "KA".to_string(),
-        })
-        .expect("drop the KA IIV");
+    no_ka_iiv.apply(ModelEdit::DropIiv { param: "KA".to_string() }).expect("drop the KA IIV");
 
     vec![
         Candidate::new("base", base),
@@ -84,18 +78,12 @@ fn candidates() -> Vec<Candidate> {
 fn an_unedited_candidate_reproduces_a_direct_fit_exactly() {
     let p = prepared();
     let options = run_options(&p.parsed.fit_options);
-    let direct = fit(
-        &p.parsed.model,
-        &p.population,
-        &p.init_params,
-        &eval_options(&p.parsed.fit_options),
-    )
-    .expect("direct evaluation");
+    let direct =
+        fit(&p.parsed.model, &p.population, &p.init_params, &eval_options(&p.parsed.fit_options))
+            .expect("direct evaluation");
 
-    let report = Runner::new()
-        .threads(1)
-        .run(&candidates()[..1], &p.population, &options)
-        .expect("run");
+    let report =
+        Runner::new().threads(1).run(&candidates()[..1], &p.population, &options).expect("run");
 
     let base = report.results[0].fit.as_ref().expect("the base fit");
     // Bit-for-bit. "Close" is exactly what a dropped covariate binding or a
@@ -172,10 +160,7 @@ fn a_resumed_run_refits_nothing_and_reports_the_same_numbers() {
         .run(
             &candidates(),
             &p.population,
-            &RunOptions {
-                resume: true,
-                ..run_options(&p.parsed.fit_options)
-            },
+            &RunOptions { resume: true, ..run_options(&p.parsed.fit_options) },
         )
         .expect("resumed run");
 
@@ -230,11 +215,7 @@ fn cancelling_a_run_returns_what_finished() {
     let report = Runner::new()
         .threads(1)
         .cancel(flag)
-        .run(
-            &candidates(),
-            &p.population,
-            &run_options(&p.parsed.fit_options),
-        )
+        .run(&candidates(), &p.population, &run_options(&p.parsed.fit_options))
         .expect("a cancelled run still reports");
     assert!(report.cancelled);
     assert_eq!(report.fitted, 0);
@@ -249,23 +230,14 @@ fn the_candidates_own_fit_options_are_used_when_none_are_given() {
     let p = prepared();
     let mut focei = base_text();
     focei
-        .apply(ModelEdit::SetFitOption {
-            key: "method".to_string(),
-            value: "focei".to_string(),
-        })
+        .apply(ModelEdit::SetFitOption { key: "method".to_string(), value: "focei".to_string() })
         .expect("set the method");
     focei
-        .apply(ModelEdit::SetFitOption {
-            key: "maxiter".to_string(),
-            value: "0".to_string(),
-        })
+        .apply(ModelEdit::SetFitOption { key: "maxiter".to_string(), value: "0".to_string() })
         .expect("cap the iterations");
     let mut foce = base_text();
-    foce.apply(ModelEdit::SetFitOption {
-        key: "maxiter".to_string(),
-        value: "0".to_string(),
-    })
-    .expect("cap the iterations");
+    foce.apply(ModelEdit::SetFitOption { key: "maxiter".to_string(), value: "0".to_string() })
+        .expect("cap the iterations");
 
     let report = Runner::new()
         .threads(1)
@@ -310,10 +282,7 @@ fn an_edit_that_changes_the_random_effects_changes_the_bic_it_is_ranked_on() {
         criterion: Criterion::Bic(ferx_core::BicType::Iiv),
         ..run_options(&p.parsed.fit_options)
     };
-    let report = Runner::new()
-        .threads(1)
-        .run(&list, &p.population, &options)
-        .expect("run");
+    let report = Runner::new().threads(1).run(&list, &p.population, &options).expect("run");
 
     let base = &report.results[0];
     let no_ka = &report.results[2];
@@ -321,11 +290,7 @@ fn an_edit_that_changes_the_random_effects_changes_the_bic_it_is_ranked_on() {
     assert_ne!(base.criterion, no_ka.criterion);
     assert_eq!(
         report.best().map(|r| r.id.as_str()),
-        Some(if base.criterion <= no_ka.criterion {
-            "base"
-        } else {
-            "no-ka-iiv"
-        })
+        Some(if base.criterion <= no_ka.criterion { "base" } else { "no-ka-iiv" })
     );
 }
 
@@ -346,9 +311,7 @@ fn direct_bloq_ofv(bloq: BloqMethod) -> f64 {
     let mut p = prepare_run(BLOQ_MODEL, Some(BLOQ_DATA)).expect("bloq model + data load");
     let options = bloq_options(&p.parsed.fit_options, bloq);
     p.parsed.model.bloq_method = bloq;
-    fit(&p.parsed.model, &p.population, &p.init_params, &options)
-        .expect("censored evaluation")
-        .ofv
+    fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("censored evaluation").ofv
 }
 
 #[test]
@@ -364,10 +327,7 @@ fn a_bloq_override_reaches_the_censored_likelihood_in_both_directions() {
     // Non-degeneracy: on a dataset with no censored rows the two conventions
     // agree and everything below would pass without testing anything.
     assert!(
-        p.population
-            .subjects
-            .iter()
-            .any(|s| s.has_censored_observation()),
+        p.population.subjects.iter().any(|s| s.has_censored_observation()),
         "the fixture carries no censored rows"
     );
     assert_ne!(
@@ -437,11 +397,7 @@ fn caller_options_with_no_bloq_method_replace_the_files_m3_with_drop() {
     );
     let dropped = direct_bloq_ofv(BloqMethod::Drop);
     let m3 = direct_bloq_ofv(BloqMethod::M3);
-    assert_ne!(
-        m3.to_bits(),
-        dropped.to_bits(),
-        "M3 and drop agree on this data"
-    );
+    assert_ne!(m3.to_bits(), dropped.to_bits(), "M3 and drop agree on this data");
 
     // The file's own settings with the key removed, so the drop reference — the
     // same settings with `drop` stamped — differs from this run in nothing else.

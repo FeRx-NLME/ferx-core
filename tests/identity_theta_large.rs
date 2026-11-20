@@ -79,10 +79,7 @@ fn assert_at_min(r: &FitResult, tol: f64, label: &str) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gradient_optimizers_reach_the_minimum_from_a_large_identity_theta() {
     for (opt, scaling) in [
         (Optimizer::Auto, ParameterScaling::Auto),
@@ -100,10 +97,7 @@ fn gradient_optimizers_reach_the_minimum_from_a_large_identity_theta() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bobyqa_reaches_the_minimum_from_a_large_identity_theta() {
     let r = warfarin(Optimizer::Bobyqa, ParameterScaling::Auto);
     assert_at_min(&r, TOL_BOBYQA, "bobyqa");
@@ -112,10 +106,7 @@ fn bobyqa_reaches_the_minimum_from_a_large_identity_theta() {
 /// The control arm: with no scaling the fixture still stops short, so the tests above
 /// are about the scale, not about a fixture any optimizer solves.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn an_explicit_none_still_stops_short_on_the_fixture() {
     for opt in [Optimizer::Auto, Optimizer::Bobyqa] {
         let r = warfarin(opt, ParameterScaling::None);

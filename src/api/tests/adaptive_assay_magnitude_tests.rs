@@ -109,18 +109,12 @@ impl Readings {
             res.decisions
                 .iter()
                 .map(|d| {
-                    d.observed_signals
-                        .iter()
-                        .find(|s| s.name == name)
-                        .expect("monitor read")
-                        .value
+                    d.observed_signals.iter().find(|s| s.name == name).expect("monitor read").value
                 })
                 .collect()
         };
         let (a, l) = (pick("A"), pick("L"));
-        let eps = (0..a.len())
-            .map(|k| assay_standard_normal(base, k, "A"))
-            .collect();
+        let eps = (0..a.len()).map(|k| assay_standard_normal(base, k, "A")).collect();
         Readings { a, l, eps }
     }
 
@@ -148,24 +142,7 @@ fn relerr(got: f64, want: f64) -> f64 {
 
 /// `ODE_NO_IIV` of `adaptive_sim_tests.rs`, verbatim: the fixture the bare bits were
 /// measured on.
-const ODE_NO_IIV: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const ODE_NO_IIV: &str = crate::test_models::ODE_1;
 
 /// The `Dv` readings of a bare model, bit for bit as before the lift: `ODE_NO_IIV`,
 /// observations 2/6/10, decisions 0/4/8, the `dv_threshold` controller, seed 7. Measured
@@ -200,11 +177,7 @@ fn bare_model_readings_keep_their_bits() {
     };
     let res =
         simulate_adaptive(&m, &pop, &m.default_params, 1, dv_threshold, &opts).expect("bare run");
-    let got: Vec<f64> = res
-        .decisions
-        .iter()
-        .map(|d| d.observed_signals[0].value)
-        .collect();
+    let got: Vec<f64> = res.decisions.iter().map(|d| d.observed_signals[0].value).collect();
     let want: [f64; 3] = [1.036675500319689e-6, 57.583656434580604, 35.79057937490115];
     for (k, (g, w)) in got.iter().zip(want).enumerate() {
         assert_eq!(g.to_bits(), w.to_bits(), "decision {k}: {g} vs {w}");
@@ -239,10 +212,7 @@ fn bare_model_readings_keep_their_bits() {
         intervals: None,
         start_interval: None,
     };
-    let spec_opts = AdaptiveSimulateOptions {
-        seed: Some(SEED),
-        ..Default::default()
-    };
+    let spec_opts = AdaptiveSimulateOptions { seed: Some(SEED), ..Default::default() };
     let res = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &spec_opts)
         .expect("bare spec run");
     assert_eq!(res.decisions.len(), DECISIONS.len());
@@ -267,11 +237,7 @@ fn bare_model_readings_keep_their_bits() {
         ..Default::default()
     };
     let prog = simulate_adaptive(&m, &pop, &m.default_params, 1, replay, &opts).expect("replay");
-    assert_eq!(
-        prog.ledger.len(),
-        res.ledger.len(),
-        "the replay doses as the spec did"
-    );
+    assert_eq!(prog.ledger.len(), res.ledger.len(), "the replay doses as the spec did");
     let base = subject_assay_base_seed(SEED, "1", 1);
     for (k, (d, p)) in res.decisions.iter().zip(&prog.decisions).enumerate() {
         let latent = p.observed_signals[1].value;
@@ -283,11 +249,7 @@ fn bare_model_readings_keep_their_bits() {
         ) * 1.0;
         let want = latent + v.sqrt() * assay_standard_normal(base, k, name);
         let got = d.observed_signals[0].value;
-        assert_eq!(
-            got.to_bits(),
-            want.to_bits(),
-            "spec decision {k}: {got} vs {want}"
-        );
+        assert_eq!(got.to_bits(), want.to_bits(), "spec decision {k}: {got} vs {want}");
         let prog_got = p.observed_signals[0].value;
         assert_eq!(prog_got.to_bits(), want.to_bits(), "replay decision {k}");
     }
@@ -303,24 +265,9 @@ fn bare_model_readings_keep_their_bits() {
 /// dies); `mult = None` (the ratio is 1, not 10).
 #[test]
 fn a_magnitude_moves_the_reading_and_nothing_else() {
-    let bare = model(
-        "",
-        "",
-        "  sigma PROP ~ 0.04",
-        "  DV ~ proportional(PROP)",
-        "",
-    );
-    let mag = model(
-        "",
-        "",
-        "  sigma PROP ~ 0.04",
-        "  DV ~ proportional(PROP * MAG)",
-        "",
-    );
-    let pop = read(
-        "",
-        "1,0,1,0,0,1,0,10\n1,4,1,0,0,1,0,10\n1,8,1,0,0,1,0,10\n1,10,1,0,0,1,0,10\n",
-    );
+    let bare = model("", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP)", "");
+    let mag = model("", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP * MAG)", "");
+    let pop = read("", "1,0,1,0,0,1,0,10\n1,4,1,0,0,1,0,10\n1,8,1,0,0,1,0,10\n1,10,1,0,0,1,0,10\n");
     let opts = two_monitors(&DECISIONS);
     let run = |m: &CompiledModel| {
         simulate_adaptive(m, &pop, &m.default_params, 1, fixed_bolus, &opts).expect("runs")
@@ -343,16 +290,9 @@ fn a_magnitude_moves_the_reading_and_nothing_else() {
     assert_eq!(bits(rb.l.clone()), bits(rg.l.clone()), "latent readings");
     // Decision 0 reads an empty system: a proportional variance is the floor on both.
     for k in 1..DECISIONS.len() {
-        assert_ne!(
-            rb.a[k].to_bits(),
-            rg.a[k].to_bits(),
-            "decision {k}: A moved"
-        );
+        assert_ne!(rb.a[k].to_bits(), rg.a[k].to_bits(), "decision {k}: A moved");
         let ratio = rg.dev(k) / rb.dev(k);
-        assert!(
-            relerr(ratio, 10.0) < 1e-12,
-            "decision {k}: ratio {ratio}, want 10"
-        );
+        assert!(relerr(ratio, 10.0) < 1e-12, "decision {k}: ratio {ratio}, want 10");
     }
 }
 
@@ -363,13 +303,7 @@ fn a_magnitude_moves_the_reading_and_nothing_else() {
 /// Regression: the exponent half dropped from the row (the ratio is 1, not `L²`).
 #[test]
 fn a_power_exponent_moves_the_reading_by_the_prediction_power() {
-    let prop = model(
-        "",
-        "",
-        "  sigma PROP ~ 0.04",
-        "  DV ~ proportional(PROP)",
-        "",
-    );
+    let prop = model("", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP)", "");
     let pow = model(
         "  theta POW(3.0, 0.1, 5.0)",
         "",
@@ -390,10 +324,7 @@ fn a_power_exponent_moves_the_reading_by_the_prediction_power() {
         let want = p1.l[k] * p1.l[k];
         assert!(want > 100.0, "decision {k}: the factor {want} is live");
         let ratio = p3.dev(k) / p1.dev(k);
-        assert!(
-            relerr(ratio, want) < 1e-9,
-            "decision {k}: ratio {ratio}, want {want}"
-        );
+        assert!(relerr(ratio, want) < 1e-9, "decision {k}: ratio {ratio}, want {want}");
     }
 }
 
@@ -412,24 +343,12 @@ struct Cell {
 fn cell(name: &'static str, theta: &str, omega: &str, sigma: &str, error: &str) -> Cell {
     let model = model(theta, omega, sigma, error, "");
     let params = model.default_params.clone();
-    Cell {
-        name,
-        model,
-        pop: read("", OBS_AT_DECISIONS),
-        params,
-        etas: None,
-    }
+    Cell { name, model, pop: read("", OBS_AT_DECISIONS), params, etas: None }
 }
 
 fn parity_cells() -> Vec<Cell> {
     let mut cells = vec![
-        cell(
-            "M",
-            "",
-            "",
-            "  sigma PROP ~ 0.04",
-            "  DV ~ proportional(PROP * MAG)",
-        ),
+        cell("M", "", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP * MAG)"),
         cell(
             "W",
             "",
@@ -451,13 +370,7 @@ fn parity_cells() -> Vec<Cell> {
             "  sigma PROP ~ 0.04\n  sigma PROP2 ~ 0.09",
             "  CMT=1: DV ~ proportional(PROP * MAG)\n  CMT=2: DV ~ proportional(PROP2)",
         ),
-        cell(
-            "TAD",
-            "",
-            "",
-            "  sigma PROP ~ 0.04",
-            "  DV ~ proportional(PROP * (1.0 + TAD))",
-        ),
+        cell("TAD", "", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP * (1.0 + TAD))"),
     ];
 
     // M × ruv_scale: a supplied η_RUV makes `ruv_scale = exp(2·0.4)`.
@@ -560,11 +473,7 @@ fn every_magnitude_form_draws_simulates_variance() {
             None => simulate_adaptive(&c.model, &c.pop, &c.params, 1, fixed_bolus, &opts),
         }
         .unwrap_or_else(|e| panic!("{}: {e}", c.name));
-        assert!(
-            c.model.has_custom_ruv_magnitude(),
-            "{}: a magnitude form",
-            c.name
-        );
+        assert!(c.model.has_custom_ruv_magnitude(), "{}: a magnitude form", c.name);
         let r = Readings::of(&res);
 
         // The replayed subject: the data subject plus the realized controller doses.
@@ -588,11 +497,8 @@ fn every_magnitude_form_draws_simulates_variance() {
         let corr = super::simulate::draw_correlations(&c.model, &c.params);
 
         for (k, &t) in DECISIONS.iter().enumerate() {
-            let j = replay
-                .obs_times
-                .iter()
-                .position(|&o| o == t)
-                .expect("a record at the decision");
+            let j =
+                replay.obs_times.iter().position(|&o| o == t).expect("a record at the decision");
             assert_eq!(replay.fremtype.get(j).copied().unwrap_or(0), 0);
             let sim = c.model.sim_residual_variance(
                 &replay,
@@ -626,18 +532,10 @@ fn every_magnitude_form_draws_simulates_variance() {
 /// `1 + TAD`, so `TAD` at the reading is `ratio − 1`. Additive, so a reading at an empty
 /// system (`L = 0`) still carries noise.
 fn tad_at_decisions(
-    rows: &str,
-    decisions: &[f64],
-    dose_at: f64,
+    rows: &str, decisions: &[f64], dose_at: f64,
 ) -> (Vec<f64>, AdaptiveSimulationResult) {
     let bare = model("", "", "  sigma ADD ~ 1.0", "  DV ~ additive(ADD)", "");
-    let tad = model(
-        "",
-        "",
-        "  sigma ADD ~ 1.0",
-        "  DV ~ additive(ADD * (1.0 + TAD))",
-        "",
-    );
+    let tad = model("", "", "  sigma ADD ~ 1.0", "  DV ~ additive(ADD * (1.0 + TAD))", "");
     let pop = read("", rows);
     let opts = two_monitors(decisions);
     let make = || {
@@ -654,9 +552,7 @@ fn tad_at_decisions(
     };
     let (b, t) = (run(&bare), run(&tad));
     let (rb, rt) = (Readings::of(&b), Readings::of(&t));
-    let tads = (0..decisions.len())
-        .map(|k| rt.dev(k) / rb.dev(k) - 1.0)
-        .collect();
+    let tads = (0..decisions.len()).map(|k| rt.dev(k) / rb.dev(k) - 1.0).collect();
     (tads, t)
 }
 
@@ -669,11 +565,8 @@ fn tad_at_decisions(
 /// Regressions: `TAD` taken from the replay convention, or forced to 0 (A reads 0).
 #[test]
 fn tad_before_the_first_dose_is_the_time_since_the_first_record() {
-    let (a, ra) = tad_at_decisions(
-        "1,0,1,0,0,1,0,1\n1,4,1,0,0,1,0,1\n1,8,1,0,0,1,0,1\n",
-        &[0.0, 4.0],
-        4.0,
-    );
+    let (a, ra) =
+        tad_at_decisions("1,0,1,0,0,1,0,1\n1,4,1,0,0,1,0,1\n1,8,1,0,0,1,0,1\n", &[0.0, 4.0], 4.0);
     let (b, _) = tad_at_decisions("1,4,1,0,0,1,0,1\n1,8,1,0,0,1,0,1\n", &[0.0, 4.0], 4.0);
     // The premise: the first dose is the controller's, at 4.
     assert_eq!(ra.ledger.len(), 1);
@@ -681,21 +574,10 @@ fn tad_before_the_first_dose_is_the_time_since_the_first_record() {
     let want_a = [0.0, 4.0];
     let want_b = [0.0, 0.0];
     for k in 0..2 {
-        assert!(
-            (a[k] - want_a[k]).abs() < 1e-9,
-            "A decision {k}: TAD {}",
-            a[k]
-        );
-        assert!(
-            (b[k] - want_b[k]).abs() < 1e-9,
-            "B decision {k}: TAD {}",
-            b[k]
-        );
+        assert!((a[k] - want_a[k]).abs() < 1e-9, "A decision {k}: TAD {}", a[k]);
+        assert!((b[k] - want_b[k]).abs() < 1e-9, "B decision {k}: TAD {}", b[k]);
     }
-    assert!(
-        (a[1] - b[1]).abs() > 1.0,
-        "the straddle: A and B differ at 4"
-    );
+    assert!((a[1] - b[1]).abs() > 1.0, "the straddle: A and B differ at 4");
 }
 
 /// T5: one controller dose, decided at 4 (not at 0), read at 8 → `TAD = 4` on the causal
@@ -722,20 +604,8 @@ fn tad_after_a_controller_dose_reads_that_dose() {
 /// Regression: the assay reading the subject's baseline covariates (1 at every decision).
 #[test]
 fn a_time_varying_magnitude_reads_the_row_in_force() {
-    let bare = model(
-        "",
-        "",
-        "  sigma PROP ~ 0.04",
-        "  DV ~ proportional(PROP)",
-        "",
-    );
-    let mag = model(
-        "",
-        "",
-        "  sigma PROP ~ 0.04",
-        "  DV ~ proportional(PROP * MAG)",
-        "",
-    );
+    let bare = model("", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP)", "");
+    let mag = model("", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP * MAG)", "");
     let pop = read("", "1,0,1,0,0,1,0,1\n1,4,1,0,0,1,0,10\n1,8,1,0,0,1,0,10\n");
     let opts = two_monitors(&DECISIONS);
     let run = |m: &CompiledModel| {
@@ -746,10 +616,7 @@ fn a_time_varying_magnitude_reads_the_row_in_force() {
     // Decision 0 reads an empty system under a proportional error: nothing to compare.
     for (k, want) in [(1, 10.0), (2, 10.0)] {
         let ratio = rm.dev(k) / rb.dev(k);
-        assert!(
-            relerr(ratio, want) < 1e-12,
-            "decision {k}: ratio {ratio}, want {want}"
-        );
+        assert!(relerr(ratio, want) < 1e-12, "decision {k}: ratio {ratio}, want {want}");
     }
     assert_eq!(
         read("", "1,0,1,0,0,1,0,1\n1,4,1,0,0,1,0,10\n").subjects[0].covariates["MAG"],
@@ -805,11 +672,7 @@ fn a_time_magnitude_reads_the_written_time_the_monitor_reads() {
             "decision {k}: the σ read TIME {sigma_time}, the monitor {monitor_time}"
         );
     }
-    assert_eq!(
-        decisions[1] - 6.0,
-        25.0,
-        "the straddle: engine and written differ"
-    );
+    assert_eq!(decisions[1] - 6.0, 25.0, "the straddle: engine and written differ");
 }
 
 // ── T10: a non-positive magnitude at a decision ─────────────────────────────────────────
@@ -831,13 +694,7 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
     let rows = |mag: &str| {
         format!("1,0,1,0,0,1,0,1\n1,4,0,2,0,1,1,{mag}\n1,8,1,0,0,1,0,1\n1,10,1,0,0,1,0,1\n")
     };
-    let single = model(
-        "",
-        "",
-        "  sigma PROP ~ 0.04",
-        "  DV ~ proportional(PROP * MAG)",
-        "",
-    );
+    let single = model("", "", "  sigma PROP ~ 0.04", "  DV ~ proportional(PROP * MAG)", "");
     let cmt = model(
         "",
         "",
@@ -903,11 +760,7 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
         ),
     ] {
         let err = run(m, mag).expect_err(name);
-        assert_eq!(
-            err.code(),
-            Some("E_RUV_MAGNITUDE_NONPOSITIVE"),
-            "{name}: {err}"
-        );
+        assert_eq!(err.code(), Some("E_RUV_MAGNITUDE_NONPOSITIVE"), "{name}: {err}");
         assert_eq!(err.message(), want, "{name}");
         let msg = err.message();
         if name != "CMT line" {
@@ -915,10 +768,7 @@ fn a_non_positive_magnitude_at_a_decision_is_refused() {
         } else {
             assert!(msg.contains("`CMT=1:`") && !msg.contains("CMT=2"), "{name}");
         }
-        assert!(
-            !msg.contains("missing"),
-            "{name}: a decision row is not a data cell"
-        );
+        assert!(!msg.contains("missing"), "{name}: a decision row is not a data cell");
     }
 }
 
@@ -940,22 +790,13 @@ fn bare_model_assay_variance_is_the_legacy_form_bit_for_bit() {
     let (mut n, mut scaled_differs) = (0, 0);
     for i in 0..20_000 {
         let f = 0.001 + (i as f64) * 0.007_31;
-        let row = crate::sim::adaptive::AssayRow {
-            cmt: 1,
-            ipred: f,
-            time: 0.0,
-            tad: 0.0,
-            cov: &cov,
-        };
+        let row =
+            crate::sim::adaptive::AssayRow { cmt: 1, ipred: f, time: 0.0, tad: 0.0, cov: &cov };
         let got = super::adaptive::assay_resid_var(&m, params, &row, 1.0)
             .expect("bare: nothing to refuse")
             .expect("cmt 1 has an error model");
         let legacy = m.error_spec.variance_at_with_correlations(1, f, s, c) * 1.0;
-        assert_eq!(
-            got.to_bits(),
-            legacy.to_bits(),
-            "f = {f}: {got} vs {legacy}"
-        );
+        assert_eq!(got.to_bits(), legacy.to_bits(), "f = {f}: {got} vs {legacy}");
         let scaled = m.error_spec.variance_at_scaled(1, f, s, c, &[1.0]);
         scaled_differs += usize::from(scaled.to_bits() != legacy.to_bits());
         n += 1;

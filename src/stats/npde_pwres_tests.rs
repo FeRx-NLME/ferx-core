@@ -23,9 +23,7 @@ fn analytic(sigma: &DMatrix<f64>, r: &DVector<f64>) -> (DVector<f64>, DVector<f6
     let inv_sqrt = &eig.eigenvectors
         * DMatrix::from_diagonal(&eig.eigenvalues.map(|l| 1.0 / l.sqrt()))
         * eig.eigenvectors.transpose();
-    let l = nalgebra::Cholesky::new(sigma.clone())
-        .expect("the oracle Σ is PD")
-        .l();
+    let l = nalgebra::Cholesky::new(sigma.clone()).expect("the oracle Σ is PD").l();
     let chol = l.solve_lower_triangular(r).expect("PD factor");
     (inv_sqrt * r, chol)
 }
@@ -35,10 +33,7 @@ fn analytic(sigma: &DMatrix<f64>, r: &DVector<f64>) -> (DVector<f64>, DVector<f6
 fn worst(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
     let diffs: Vec<f64> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
-    assert!(
-        diffs.iter().all(|e| e.is_finite()),
-        "non-finite operand in {a:?} / {b:?}"
-    );
+    assert!(diffs.iter().all(|e| e.is_finite()), "non-finite operand in {a:?} / {b:?}");
     diffs.into_iter().fold(0.0, f64::max)
 }
 
@@ -212,9 +207,7 @@ fn end_to_end_model_and_population(observed: &[f64]) -> (CompiledModel, Populati
          [structural_model]\n  y = BASE + SL * TIME\n\
          [error_model]\n  DV ~ additive(ADD)\n"
     );
-    let model = crate::parser::model_parser::parse_full_model(&text)
-        .expect("parse")
-        .model;
+    let model = crate::parser::model_parser::parse_full_model(&text).expect("parse").model;
     let pop = Population {
         subjects: vec![crate::types::Subject {
             id: "1".into(),
@@ -264,15 +257,8 @@ fn epred_and_pwres_match_the_closed_form_moments_end_to_end() {
     let r = DVector::from_iterator(3, observed.iter().zip(mu.iter()).map(|(y, m)| y - m));
     let (sym, chol) = analytic(&sigma, &r);
 
-    let out = compute_npde_npd(
-        &model,
-        &pop,
-        &model.default_params,
-        40_000,
-        Some(2871),
-        None,
-    )
-    .expect("npde");
+    let out = compute_npde_npd(&model, &pop, &model.default_params, 40_000, Some(2871), None)
+        .expect("npde");
     let s = &out[0];
     let epred_gap = worst(&s.epred, mu.as_slice());
     let pwres_gap = worst(&s.pwres, sym.as_slice());

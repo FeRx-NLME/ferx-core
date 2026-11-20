@@ -24,17 +24,12 @@ fn an_overflowing_matrix_exponential_does_not_report_a_failed_plan() {
     let anchor = "  maxiter      = 300\n";
     assert!(text.contains(anchor), "fixture: the fit options line");
     let text = text.replace(anchor, "  maxiter      = 2\n  threads      = 2\n");
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("temp model");
     f.write_all(text.as_bytes()).expect("write model");
     let data = format!("{root}/data/warfarin.csv");
     let (fit, _) = run_model_with_data(f.path().to_str().unwrap(), Some(&data)).expect("fit runs");
     assert!(
-        !fit.warnings
-            .iter()
-            .any(|w| w.contains("W_PLAN_FD_FALLBACK")),
+        !fit.warnings.iter().any(|w| w.contains("W_PLAN_FD_FALLBACK")),
         "no failed plan at an overflowed trial point: {:?}",
         fit.warnings
     );

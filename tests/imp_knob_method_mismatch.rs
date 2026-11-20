@@ -72,11 +72,7 @@ fn tracked_files(root: &Path, extension: &str) -> Vec<PathBuf> {
 /// A copy of `parse_method_token`'s arms, so
 /// `the_method_aliases_are_the_parsers` pins the copy against the parser.
 const IMP_TOKENS: [&str; 3] = ["imp", "importance_sampling", "importance-sampling"];
-const IMPMAP_TOKENS: [&str; 3] = [
-    "impmap",
-    "importance_sampling_map",
-    "importance-sampling-map",
-];
+const IMPMAP_TOKENS: [&str; 3] = ["impmap", "importance_sampling_map", "importance-sampling-map"];
 
 /// Knobs that `own` reads and `other` does not, within the `imp_` / `impmap_`
 /// families. A knob both methods read belongs to neither side of the rule.
@@ -249,10 +245,7 @@ fn the_classifier_flags_the_shape_that_was_found() {
         };
     }
 ";
-    assert_eq!(
-        p.mismatches_in_rust(mirror),
-        flagged("impmap_case", Mismatch::ImpmapWithImpKnobs)
-    );
+    assert_eq!(p.mismatches_in_rust(mirror), flagged("impmap_case", Mismatch::ImpmapWithImpKnobs));
 }
 
 /// The smallest edit that undoes #1476 is **one line**: `imp_iterations` back
@@ -290,9 +283,8 @@ fn a_direct_estimator_call_names_its_method() {
         p.mismatches_in_rust(direct),
         flagged("imp_mixture_short_run", Mismatch::ImpWithImpmapKnobs)
     );
-    let mirror = direct
-        .replace("impmap_iterations", "imp_iterations")
-        .replace("run_imp(", "run_impmap (");
+    let mirror =
+        direct.replace("impmap_iterations", "imp_iterations").replace("run_imp(", "run_impmap (");
     assert_eq!(
         p.mismatches_in_rust(&mirror),
         flagged("imp_mixture_short_run", Mismatch::ImpmapWithImpKnobs)
@@ -300,10 +292,7 @@ fn a_direct_estimator_call_names_its_method() {
     // `run_impmap(` must not read as `run_imp(`, or every direct IMPMAP caller
     // names both methods and is excused.
     assert_eq!(p.names("run_impmap(&m, &p, &i, None, &o)"), (false, true));
-    assert_eq!(
-        p.names("crate::estimation::impmap::run_imp(&m)"),
-        (true, false)
-    );
+    assert_eq!(p.names("crate::estimation::impmap::run_imp(&m)"), (true, false));
 }
 
 /// `imp_defensive_alpha` is one field, read by both estimators and listed
@@ -341,11 +330,7 @@ fn a_correct_neighbour_does_not_excuse_a_mismatch() {
         .replace("imp_shared_anchor", "impmap_neighbour")
         .replace("EstimationMethod::Imp;", "EstimationMethod::Impmap;");
     let file = format!("{correct_impmap}{OLD_SHAPE}{correct_impmap}");
-    assert_eq!(
-        p.classify(&file),
-        None,
-        "premise: as one body it is excused"
-    );
+    assert_eq!(p.classify(&file), None, "premise: as one body it is excused");
     assert_eq!(
         p.mismatches_in_rust(&file),
         flagged("imp_shared_anchor", Mismatch::ImpWithImpmapKnobs)
@@ -359,27 +344,16 @@ fn the_classifier_flags_a_model_string_under_every_alias() {
     let p = Patterns::new();
     for token in IMP_TOKENS {
         let model = format!("[fit_options]\n  method = {token}\n  impmap_iterations = 5\n");
-        assert_eq!(
-            p.classify(&model),
-            Some(Mismatch::ImpWithImpmapKnobs),
-            "{token}"
-        );
+        assert_eq!(p.classify(&model), Some(Mismatch::ImpWithImpmapKnobs), "{token}");
     }
     for token in IMPMAP_TOKENS {
         let model = format!("[fit_options]\n  method = {token}\n  imp_samples = 50\n");
-        assert_eq!(
-            p.classify(&model),
-            Some(Mismatch::ImpmapWithImpKnobs),
-            "{token}"
-        );
+        assert_eq!(p.classify(&model), Some(Mismatch::ImpmapWithImpKnobs), "{token}");
     }
     // As it sits in Rust *source*: one line, with `\n` as two characters.
     let as_source = r#"fn t() { let src = "[fit_options]\n  method = imp\n  impmap_seed = 1\n"; }"#;
     assert!(!as_source.contains('\n'), "premise: no real line break");
-    assert_eq!(
-        p.mismatches_in_rust(as_source),
-        flagged("t", Mismatch::ImpWithImpmapKnobs)
-    );
+    assert_eq!(p.mismatches_in_rust(as_source), flagged("t", Mismatch::ImpWithImpmapKnobs));
 }
 
 /// The token lists above are a copy of a private parser function. Each entry
@@ -396,10 +370,9 @@ fn the_method_aliases_are_the_parsers() {
              [fit_options]\n  method = {token}\n"
         )
     };
-    for (tokens, want) in [
-        (IMP_TOKENS, EstimationMethod::Imp),
-        (IMPMAP_TOKENS, EstimationMethod::Impmap),
-    ] {
+    for (tokens, want) in
+        [(IMP_TOKENS, EstimationMethod::Imp), (IMPMAP_TOKENS, EstimationMethod::Impmap)]
+    {
         for token in tokens {
             let parsed = parse_full_model(&model_with(token))
                 .unwrap_or_else(|e| panic!("`method = {token}` must parse: {e}"));
@@ -451,20 +424,12 @@ fn impmap_does_not_name_imp() {
     let p = Patterns::new();
     assert_eq!(p.names("EstimationMethod::Impmap"), (false, true));
     assert_eq!(p.names("  method = impmap\n"), (false, true));
-    assert_eq!(
-        p.names("  method = importance-sampling-map\n"),
-        (false, true)
-    );
+    assert_eq!(p.names("  method = importance-sampling-map\n"), (false, true));
     assert_eq!(p.names("EstimationMethod::Imp;"), (true, false));
     assert_eq!(p.names("  method   = imp\n"), (true, false));
-    assert_eq!(
-        p.names("  method = IMP  # comment naming impmap\n"),
-        (true, false)
-    );
+    assert_eq!(p.names("  method = IMP  # comment naming impmap\n"), (true, false));
     assert!(!p.sets_imp_only_knob.is_match("opts.impmap_iterations = 2;"));
-    assert!(p
-        .sets_impmap_only_knob
-        .is_match("opts.impmap_iterations = 2;"));
+    assert!(p.sets_impmap_only_knob.is_match("opts.impmap_iterations = 2;"));
 }
 
 /// A knob is a whole identifier. Read as a suffix, `simp_seed = …` counts as an
@@ -486,9 +451,7 @@ fn a_longer_identifier_is_not_a_knob() {
 fn no_tracked_rust_source_tunes_the_other_methods_knobs() {
     let root = repo_root();
     let p = Patterns::new();
-    let this_file = Path::new(file!())
-        .file_name()
-        .expect("this file has a name");
+    let this_file = Path::new(file!()).file_name().expect("this file has a name");
 
     let mut offenders = Vec::new();
     let mut scanned = 0usize;

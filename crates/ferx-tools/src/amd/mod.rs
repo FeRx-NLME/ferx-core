@@ -175,9 +175,9 @@ impl Strategy {
     pub fn order(&self) -> Vec<Step> {
         use Step::*;
         match self {
-            Strategy::Default => vec![
-                Structural, Iivsearch, Residual, Iovsearch, Allometry, Covariates,
-            ],
+            Strategy::Default => {
+                vec![Structural, Iivsearch, Residual, Iovsearch, Allometry, Covariates]
+            }
             Strategy::Reevaluation => vec![
                 Structural, Iivsearch, Residual, Iovsearch, Allometry, Covariates, Iivsearch,
                 Residual,
@@ -235,10 +235,9 @@ impl AmdOptions {
     /// space's every statement belongs to a step this pipeline runs.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
         let options = match config.tools.get("amd") {
-            Some(table) => table
-                .clone()
-                .try_into::<AmdOptions>()
-                .map_err(|e| format!("[amd]: {e}"))?,
+            Some(table) => {
+                table.clone().try_into::<AmdOptions>().map_err(|e| format!("[amd]: {e}"))?
+            }
             None => AmdOptions::default(),
         };
         space::check(&config.mfl)?;
@@ -254,11 +253,7 @@ impl AmdOptions {
                     "[amd] skip = \"{}\" is not a step of the {} strategy, which runs {}",
                     step.label(),
                     self.strategy.label(),
-                    order
-                        .iter()
-                        .map(|s| s.label())
-                        .collect::<Vec<_>>()
-                        .join(" -> ")
+                    order.iter().map(|s| s.label()).collect::<Vec<_>>().join(" -> ")
                 ));
             }
         }
@@ -302,9 +297,7 @@ impl Context {
     /// Read from the model AMD starts on, which is where `iovsearch` reads it
     /// too (Pharmpy's `amd_start_model`).
     pub fn from_base(base: &BaseModel) -> Context {
-        Context {
-            iov_column: base.prepared.parsed.fit_options.iov_column.clone(),
-        }
+        Context { iov_column: base.prepared.parsed.fit_options.iov_column.clone() }
     }
 }
 
@@ -320,36 +313,19 @@ pub fn plan(options: &AmdOptions, mfl: &Mfl, ctx: &Context) -> Result<Vec<Planne
     for (i, step) in order.into_iter().enumerate() {
         let rerun = seen.contains(&step);
         seen.push(step);
-        let dir = format!(
-            "{:02}-{}{}",
-            i + 1,
-            if rerun { "rerun-" } else { "" },
-            step.tool()
-        );
+        let dir = format!("{:02}-{}{}", i + 1, if rerun { "rerun-" } else { "" }, step.tool());
         let skipped = skip_reason(step, options, mfl, ctx)?;
-        plan.push(PlannedStep {
-            index: i + 1,
-            step,
-            rerun,
-            dir,
-            skipped,
-        });
+        plan.push(PlannedStep { index: i + 1, step, rerun, dir, skipped });
     }
     Ok(plan)
 }
 
 /// Why `step` will not run, or `None` when it will.
 fn skip_reason(
-    step: Step,
-    options: &AmdOptions,
-    mfl: &Mfl,
-    ctx: &Context,
+    step: Step, options: &AmdOptions, mfl: &Mfl, ctx: &Context,
 ) -> Result<Option<String>, String> {
     if options.skip.contains(&step) {
-        return Ok(Some(format!(
-            "left out by `[amd] skip = [\"{}\"]`",
-            step.label()
-        )));
+        return Ok(Some(format!("left out by `[amd] skip = [\"{}\"]`", step.label())));
     }
     // The residual step searches the error forms, not a space: it always runs.
     if step == Step::Residual {
@@ -371,10 +347,7 @@ fn skip_reason(
         return Ok(None);
     }
     if space::subspace(mfl, step)?.features().next().is_none() {
-        return Ok(Some(format!(
-            "the search space has no {} statement",
-            step.space_says()
-        )));
+        return Ok(Some(format!("the search space has no {} statement", step.space_says())));
     }
     Ok(None)
 }
@@ -682,24 +655,14 @@ pub(crate) struct StepOutput {
 pub(crate) trait StepRunner {
     /// Run `step` on `model`, journalling under `<dir>/<dir_name>`.
     fn run_step(
-        &self,
-        index: usize,
-        step: Step,
-        dir_name: &str,
-        config: &SearchConfig,
-        model: &ModelText,
+        &self, index: usize, step: Step, dir_name: &str, config: &SearchConfig, model: &ModelText,
     ) -> Result<StepOutput, String>;
 
     /// Fit one model on its own, with `n_starts` starts — the pipeline's start
     /// fit and its perturbed-restart passes.
     fn fit_one(
-        &self,
-        index: usize,
-        tool: &'static str,
-        dir_name: &str,
-        config: &SearchConfig,
-        model: &ModelText,
-        n_starts: usize,
+        &self, index: usize, tool: &'static str, dir_name: &str, config: &SearchConfig,
+        model: &ModelText, n_starts: usize,
     ) -> Result<StepOutput, String>;
 }
 
@@ -754,9 +717,7 @@ impl ToolRunner<'_> {
 /// `base` is the model AMD starts from; every step after the first starts from
 /// the previous step's selection instead.
 pub fn run_amd(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: AmdRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: AmdRun<'_>,
 ) -> Result<AmdResult, String> {
     let options = AmdOptions::from_config(config)?;
     let ctx = Context::from_base(base);
@@ -777,21 +738,15 @@ pub fn run_amd(
 
 /// The pipeline itself, over the seam.
 pub(crate) fn drive(
-    runner: &dyn StepRunner,
-    config: &SearchConfig,
-    options: &AmdOptions,
-    plan: &[PlannedStep],
-    input: &ModelText,
-    progress: Option<ProgressFn<'_>>,
+    runner: &dyn StepRunner, config: &SearchConfig, options: &AmdOptions, plan: &[PlannedStep],
+    input: &ModelText, progress: Option<ProgressFn<'_>>,
 ) -> Result<AmdResult, String> {
     let emit = |event: AmdEvent| {
         if let Some(f) = progress {
             f(event);
         }
     };
-    emit(AmdEvent::Planned {
-        steps: plan.to_vec(),
-    });
+    emit(AmdEvent::Planned { steps: plan.to_vec() });
 
     let mut rows: Vec<CandidateRow> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -801,14 +756,7 @@ pub(crate) fn drive(
     // The starting model, fitted once so every later Δ has a referent and the
     // report can say what the pipeline was worth.
     emit(AmdEvent::StartStarted);
-    let start = runner.fit_one(
-        0,
-        "start",
-        "00-start",
-        config,
-        input,
-        config.run.retries + 1,
-    )?;
+    let start = runner.fit_one(0, "start", "00-start", config, input, config.run.retries + 1)?;
     let input_fit = start.fit.clone();
     let mut current = start.model.clone();
     let mut current_fit = start.fit.clone();
@@ -825,9 +773,7 @@ pub(crate) fn drive(
                 .unwrap_or_else(|| "no reason given".into())
         ));
     }
-    emit(AmdEvent::StartFinished {
-        ofv: current_fit.as_ref().map(|f| f.ofv),
-    });
+    emit(AmdEvent::StartFinished { ofv: current_fit.as_ref().map(|f| f.ofv) });
     if start.fit.is_none() && !start.cancelled {
         return Err(format!(
             "the starting model could not be fitted, so the pipeline has no baseline to \
@@ -1068,9 +1014,7 @@ pub(crate) struct RetriesOutcome {
 /// selected model and its fit are already in hand, so the error is a note and
 /// the run carries on as if the pass had not improved anything.
 fn note_retries_failure(
-    notes: &mut Vec<String>,
-    dir_name: &str,
-    outcome: Result<RetriesOutcome, String>,
+    notes: &mut Vec<String>, dir_name: &str, outcome: Result<RetriesOutcome, String>,
 ) -> RetriesOutcome {
     match outcome {
         Ok(outcome) => outcome,
@@ -1207,14 +1151,8 @@ fn retries_pass(
              {b:.3}); the selected model was kept"
         ));
     }
-    emit(AmdEvent::RetriesFinished {
-        improved,
-        ofv: if improved { after } else { before },
-    });
-    Ok(RetriesOutcome {
-        improved,
-        cancelled,
-    })
+    emit(AmdEvent::RetriesFinished { improved, ofv: if improved { after } else { before } });
+    Ok(RetriesOutcome { improved, cancelled })
 }
 
 /// The config one step is handed: this file, with the space narrowed to the
@@ -1231,9 +1169,7 @@ fn retries_pass(
 pub(crate) fn step_config(config: &SearchConfig, step: Step) -> Result<SearchConfig, String> {
     let mfl = if step == Step::Residual {
         // ruvsearch's candidates are the error forms, not MFL features.
-        Mfl {
-            statements: Vec::new(),
-        }
+        Mfl { statements: Vec::new() }
     } else {
         space::subspace(&config.mfl, step)?
     };

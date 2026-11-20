@@ -144,7 +144,7 @@ impl GaOptions {
         }
         if self.downhill_period > 0 && self.niches == 0 {
             return Err(
-                "[globalsearch] niches must be at least 1 when a downhill search runs".into(),
+                "[globalsearch] niches must be at least 1 when a downhill search runs".into()
             );
         }
         Ok(())
@@ -190,9 +190,7 @@ pub struct GaOutcome {
 /// The size of the space: the product of the allele counts. `None` when it
 /// overflows — no search runs over such a space.
 pub fn space_size(alleles: &[usize]) -> Option<usize> {
-    alleles
-        .iter()
-        .try_fold(1usize, |acc, n| acc.checked_mul(*n))
+    alleles.iter().try_fold(1usize, |acc, n| acc.checked_mul(*n))
 }
 
 /// Run the GA over a space whose axis `i` has `alleles[i]` alleles.
@@ -200,9 +198,7 @@ pub fn space_size(alleles: &[usize]) -> Option<usize> {
 /// Every axis must have at least one allele and the space at least two
 /// points; a one-point space has nothing to search.
 pub fn run(
-    alleles: &[usize],
-    options: &GaOptions,
-    oracle: &mut dyn Oracle,
+    alleles: &[usize], options: &GaOptions, oracle: &mut dyn Oracle,
 ) -> Result<GaOutcome, String> {
     options.validate()?;
     if alleles.contains(&0) {
@@ -249,10 +245,7 @@ pub fn run(
         let last = index == options.generations;
         let due = options.downhill_period > 0 && index > 0 && index % options.downhill_period == 0;
         if !cancelled && (due || (last && options.final_downhill)) {
-            for (k, i) in niche_seeds(&population, &fitness, options)
-                .into_iter()
-                .enumerate()
-            {
+            for (k, i) in niche_seeds(&population, &fitness, options).into_iter().enumerate() {
                 let (g, f, moved) = downhill(
                     alleles,
                     population[i].clone(),
@@ -289,10 +282,8 @@ pub fn run(
         let shared = shared_fitness(&population, &fitness, options);
         let mut order: Vec<usize> = (0..population.len()).collect();
         order.sort_by(|a, b| fitness[*a].total_cmp(&fitness[*b]));
-        let mut next: Vec<Genome> = order[..elites]
-            .iter()
-            .map(|i| population[*i].clone())
-            .collect();
+        let mut next: Vec<Genome> =
+            order[..elites].iter().map(|i| population[*i].clone()).collect();
         let mut stalls = 0usize;
         while next.len() < pop_size {
             let a = tournament(&shared, options.tournament_size, &mut rng);
@@ -328,12 +319,7 @@ pub fn run(
     }
 
     let (best, best_fitness) = best.expect("at least one generation was evaluated");
-    Ok(GaOutcome {
-        best,
-        best_fitness,
-        generations,
-        cancelled,
-    })
+    Ok(GaOutcome { best, best_fitness, generations, cancelled })
 }
 
 fn random_genome(alleles: &[usize], rng: &mut StdRng) -> Genome {
@@ -344,10 +330,7 @@ fn random_genome(alleles: &[usize], rng: &mut StdRng) -> Genome {
 /// random offset, so a space barely larger than the population is still
 /// filled without an unbounded rejection loop.
 fn fill_distinct(
-    alleles: &[usize],
-    mut population: Vec<Genome>,
-    n: usize,
-    rng: &mut StdRng,
+    alleles: &[usize], mut population: Vec<Genome>, n: usize, rng: &mut StdRng,
 ) -> Vec<Genome> {
     let size = space_size(alleles).unwrap_or(usize::MAX);
     let start = rng.random_range(0..size.max(1));
@@ -506,11 +489,7 @@ pub fn neighbours(g: &Genome, alleles: &[usize]) -> Vec<Genome> {
 /// descending from all-ones needs 65 moves, and a cap of 64 returned one
 /// move short of the optimum the documentation promised.
 fn downhill(
-    alleles: &[usize],
-    mut g: Genome,
-    mut f: f64,
-    what: &str,
-    oracle: &mut dyn Oracle,
+    alleles: &[usize], mut g: Genome, mut f: f64, what: &str, oracle: &mut dyn Oracle,
 ) -> Result<(Genome, f64, bool), String> {
     let mut moved = false;
     let rounds = space_size(alleles).unwrap_or(usize::MAX);

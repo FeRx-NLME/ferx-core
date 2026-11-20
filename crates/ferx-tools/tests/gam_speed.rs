@@ -28,18 +28,15 @@ type Covariate = (String, Vec<f64>, CovariateKind);
 fn synthetic_data() -> (Vec<Vec<f64>>, Vec<Covariate>) {
     let eta_data: Vec<Vec<f64>> = (0..N_ETAS)
         .map(|e| {
-            (0..N)
-                .map(|i| ((i as f64 * (e as f64 * 0.7 + 1.1)) * 0.003_141).sin() * 0.35)
-                .collect()
+            (0..N).map(|i| ((i as f64 * (e as f64 * 0.7 + 1.1)) * 0.003_141).sin() * 0.35).collect()
         })
         .collect();
 
     let cov_data: Vec<Covariate> = (0..N_COVS)
         .map(|c| {
             if c % 5 == 0 {
-                let vals: Vec<f64> = (0..N)
-                    .map(|i| if (i + c * 3) % 2 == 0 { 0.0 } else { 1.0 })
-                    .collect();
+                let vals: Vec<f64> =
+                    (0..N).map(|i| if (i + c * 3) % 2 == 0 { 0.0 } else { 1.0 }).collect();
                 (format!("COV_{c:02}"), vals, CovariateKind::Categorical)
             } else {
                 let centre = 30.0 + c as f64 * 5.0;

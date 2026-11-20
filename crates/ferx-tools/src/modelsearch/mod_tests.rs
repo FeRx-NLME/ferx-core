@@ -93,13 +93,7 @@ pub(crate) fn defaults(text: &ModelText) -> Defaults {
         .iter()
         .map(|l| l.split('=').next().unwrap().trim().to_string())
         .collect();
-    Defaults::new(
-        params,
-        names,
-        inits,
-        etas,
-        &crate::search::test_support::population(&["1"]),
-    )
+    Defaults::new(params, names, inits, etas, &crate::search::test_support::population(&["1"]))
 }
 
 fn space_of(base: &str, structure: Structure, mfl: &str) -> Space {
@@ -160,12 +154,7 @@ impl Script {
     }
 
     fn dirs(&self) -> Vec<String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(d, _)| d.clone())
-            .collect()
+        self.calls.lock().unwrap().iter().map(|(d, _)| d.clone()).collect()
     }
 
     fn candidates_in(&self, dir: &str) -> Vec<Candidate> {
@@ -179,12 +168,7 @@ impl Script {
     }
 
     fn n_fits(&self) -> usize {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, c)| c.len())
-            .sum()
+        self.calls.lock().unwrap().iter().map(|(_, c)| c.len()).sum()
     }
 }
 
@@ -274,11 +258,7 @@ impl StepFitter for Script {
 }
 
 fn options(algorithm: Algorithm) -> ModelsearchOptions {
-    ModelsearchOptions {
-        algorithm,
-        rank: RankType::Ofv,
-        ..ModelsearchOptions::default()
-    }
+    ModelsearchOptions { algorithm, rank: RankType::Ofv, ..ModelsearchOptions::default() }
 }
 
 fn run(script: &Script, space: Space, options: &ModelsearchOptions) -> ModelsearchResult {
@@ -292,11 +272,7 @@ fn paths(result: &ModelsearchResult, layer: usize) -> Vec<(String, String, Strin
             (
                 r.id.clone(),
                 r.parent.clone().unwrap_or_default(),
-                r.path
-                    .iter()
-                    .map(|k| k.to_string())
-                    .collect::<Vec<_>>()
-                    .join(";"),
+                r.path.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(";"),
             )
         })
         .collect()
@@ -317,12 +293,7 @@ const FO_BASE: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=0;TR
 
 #[test]
 fn exhaustive_stepwise_applies_one_feature_at_a_time_in_every_order() {
-    let script = Script::new(&[
-        (FO_BASE, 100.0),
-        (FO_LAG, 95.0),
-        (FO_P1, 90.0),
-        (FO_P1_LAG, 80.0),
-    ]);
+    let script = Script::new(&[(FO_BASE, 100.0), (FO_LAG, 95.0), (FO_P1, 90.0), (FO_P1_LAG, 80.0)]);
     let result = run(
         &script,
         space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
@@ -331,10 +302,7 @@ fn exhaustive_stepwise_applies_one_feature_at_a_time_in_every_order() {
     // Pharmpy's dictionary order: LAGTIME before PERIPHERALS.
     assert_eq!(
         paths(&result, 1),
-        vec![
-            triple("run1", "base", "LAGTIME(ON)"),
-            triple("run2", "base", "PERIPHERALS(1)"),
-        ]
+        vec![triple("run1", "base", "LAGTIME(ON)"), triple("run2", "base", "PERIPHERALS(1)"),]
     );
     assert_eq!(
         paths(&result, 2),
@@ -360,35 +328,23 @@ fn exhaustive_stepwise_applies_one_feature_at_a_time_in_every_order() {
 #[test]
 fn the_candidate_text_is_the_edited_model_seeded_from_its_parent() {
     let script = Script::new(&[(FO_BASE, 100.0), (FO_P1, 90.0)]);
-    let _ = run(
-        &script,
-        space("PERIPHERALS(0..1)"),
-        &options(Algorithm::ExhaustiveStepwise),
-    );
+    let _ = run(&script, space("PERIPHERALS(0..1)"), &options(Algorithm::ExhaustiveStepwise));
     let layer1 = script.candidates_in("layer-1");
     assert_eq!(layer1.len(), 1);
     let c = &layer1[0];
     assert_eq!(c.id, "run1");
     assert_eq!(c.parent.as_deref(), Some("base"));
     let structural = c.model.block_lines("structural_model");
-    assert_eq!(
-        structural,
-        vec!["pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)"]
-    );
+    assert_eq!(structural, vec!["pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)"]);
     // The new parameters scale from the parent's *seeded* estimates — the
     // fixture fit round-trips the file's inits through the packing, so the
     // seeded TVV is 10.000000000000002 and V2 follows it, not the file.
     let inits = super::structure::theta_inits_of(&c.model);
     assert_eq!(inits["TVQ"], inits["TVCL"], "{inits:?}");
-    assert!(
-        (inits["TVV2"] - 0.05 * inits["TVV"]).abs() < 1e-15,
-        "{inits:?}"
-    );
+    assert!((inits["TVV2"] - 0.05 * inits["TVV"]).abs() < 1e-15, "{inits:?}");
     let params = c.model.block_lines("parameters");
     assert!(
-        params
-            .iter()
-            .any(|l| l.starts_with("theta TVQ(") && l.ends_with(", 0.0, 1000000.0)")),
+        params.iter().any(|l| l.starts_with("theta TVQ(") && l.ends_with(", 0.0, 1000000.0)")),
         "{params:?}"
     );
     let indiv = c.model.block_lines("individual_parameters");
@@ -425,10 +381,7 @@ fn reduced_stepwise_extends_only_the_best_of_each_feature_set() {
     );
     assert!(!result.row("run3").unwrap().continued);
     assert!(result.row("run4").unwrap().continued);
-    assert!(
-        result.row("run5").unwrap().continued,
-        "a group of one is not collapsed"
-    );
+    assert!(result.row("run5").unwrap().continued, "a group of one is not collapsed");
     assert_eq!(
         paths(&result, 3),
         vec![
@@ -464,15 +417,10 @@ fn reduced_stepwise_prefers_a_model_that_passed_the_gate() {
     // run3 has the lower OFV but failed the gate; run4 continues.
     assert!(!result.row("run3").unwrap().continued);
     assert!(result.row("run4").unwrap().continued);
-    assert_eq!(
-        result.layer_rows(3).next().unwrap().parent.as_deref(),
-        Some("run4")
-    );
+    assert_eq!(result.layer_rows(3).next().unwrap().parent.as_deref(), Some("run4"));
     // When neither passed, the lower OFV continues, as in Pharmpy.
     let mut script = Script::new(&[(FO_BASE, 100.0)]).by_id(&[("run3", 50.0), ("run4", 80.0)]);
-    script
-        .failing
-        .extend(["run3".to_string(), "run4".to_string()]);
+    script.failing.extend(["run3".to_string(), "run4".to_string()]);
     let result = run(
         &script,
         space("PERIPHERALS(0..2); LAGTIME([OFF,ON])"),
@@ -522,49 +470,28 @@ fn exhaustive_skips_pharmpys_unsupported_pairs() {
         &script,
         space_of(
             BASE_IV,
-            Structure {
-                absorption: Absorption::Inst,
-                elimination: Elimination::Fo,
-                ..fo(0)
-            },
+            Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) },
             "ABSORPTION([INST,FO]); LAGTIME([OFF,ON]); TRANSITS([0,3], NODEPOT)",
         ),
         &options(Algorithm::Exhaustive),
     );
     let generated: Vec<String> = result
         .layer_rows(1)
-        .map(|r| {
-            r.path
-                .iter()
-                .map(|k| k.to_string())
-                .collect::<Vec<_>>()
-                .join(";")
-        })
+        .map(|r| r.path.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(";"))
         .collect();
     assert_eq!(
         generated,
-        vec![
-            "ABSORPTION(FO)",
-            "ABSORPTION(FO);TRANSITS(3, NODEPOT)",
-            "ABSORPTION(FO);LAGTIME(ON)",
-        ]
+        vec!["ABSORPTION(FO)", "ABSORPTION(FO);TRANSITS(3, NODEPOT)", "ABSORPTION(FO);LAGTIME(ON)",]
     );
     // What Pharmpy's pair table refuses (`LAGTIME(ON)` with transits) is not
     // generated and not noted — it is the rule, not a gap. A combination
     // Pharmpy would build and ferx cannot (a lag or a chain on the bolus
     // base) is noted by name.
-    let noted: Vec<&String> = result
-        .notes
-        .iter()
-        .filter(|n| n.starts_with("not generated"))
-        .collect();
+    let noted: Vec<&String> =
+        result.notes.iter().filter(|n| n.starts_with("not generated")).collect();
     assert_eq!(noted.len(), 2, "{:?}", result.notes);
     assert!(noted[0].contains("TRANSITS(3, NODEPOT)"), "{}", noted[0]);
-    assert!(
-        noted[1].contains("LAGTIME(ON)") && !noted[1].contains("TRANSITS"),
-        "{}",
-        noted[1]
-    );
+    assert!(noted[1].contains("LAGTIME(ON)") && !noted[1].contains("TRANSITS"), "{}", noted[1]);
 }
 
 #[test]
@@ -577,10 +504,7 @@ fn a_feature_the_base_already_has_is_never_a_move() {
         space("ABSORPTION(FO); LAGTIME([OFF,ON]); PERIPHERALS(0)"),
         &options(Algorithm::ExhaustiveStepwise),
     );
-    assert_eq!(
-        paths(&result, 1),
-        vec![triple("run1", "base", "LAGTIME(ON)")]
-    );
+    assert_eq!(paths(&result, 1), vec![triple("run1", "base", "LAGTIME(ON)")]);
     assert_eq!(result.rows.len(), 2);
 }
 
@@ -608,11 +532,7 @@ fn an_input_outside_the_space_is_fitted_then_moved_onto_it() {
         &script,
         space_of(
             BASE_IV,
-            Structure {
-                absorption: Absorption::Inst,
-                elimination: Elimination::Fo,
-                ..fo(0)
-            },
+            Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) },
             "ABSORPTION(FO); LAGTIME([OFF,ON])",
         ),
         &options(Algorithm::ReducedStepwise),
@@ -632,19 +552,9 @@ fn an_input_outside_the_space_is_fitted_then_moved_onto_it() {
         base_text.block_lines("structural_model"),
         vec!["pk one_cpt_oral(cl=CL, v=V, ka=KA)"]
     );
-    assert!(base_text
-        .block_lines("parameters")
-        .iter()
-        .any(|l| l.starts_with("theta TVKA(")));
-    assert_eq!(
-        paths(&result, 1),
-        vec![triple("run1", "base", "LAGTIME(ON)")]
-    );
-    assert!(
-        result.notes.iter().any(|n| n.contains("outside the space")),
-        "{:?}",
-        result.notes
-    );
+    assert!(base_text.block_lines("parameters").iter().any(|l| l.starts_with("theta TVKA(")));
+    assert_eq!(paths(&result, 1), vec![triple("run1", "base", "LAGTIME(ON)")]);
+    assert!(result.notes.iter().any(|n| n.contains("outside the space")), "{:?}", result.notes);
     assert_eq!(result.final_id, "run1");
     // Δ is against the base, not the input.
     assert_eq!(result.row("run1").unwrap().d_criterion, Some(-10.0));
@@ -662,11 +572,7 @@ fn the_input_is_ranked_but_never_selected() {
         &script,
         space_of(
             BASE_IV,
-            Structure {
-                absorption: Absorption::Inst,
-                elimination: Elimination::Fo,
-                ..fo(0)
-            },
+            Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) },
             "ABSORPTION(FO); LAGTIME([OFF,ON])",
         ),
         &options(Algorithm::ReducedStepwise),
@@ -690,11 +596,7 @@ fn a_derived_base_no_template_can_express_is_an_error_naming_the_fix() {
     let d = defaults(&text);
     let err = Space::build(
         text,
-        Structure {
-            absorption: Absorption::Inst,
-            elimination: Elimination::Fo,
-            ..fo(0)
-        },
+        Structure { absorption: Absorption::Inst, elimination: Elimination::Fo, ..fo(0) },
         &features,
         d,
         Vec::new(),
@@ -769,17 +671,10 @@ fn a_move_no_template_can_express_is_noted_not_generated() {
     let script = Script::new(&[]);
     let result = run(
         &script,
-        space_of(
-            three,
-            fo(2),
-            "TRANSITS(0, NODEPOT); TRANSITS(N); LAGTIME([OFF,ON])",
-        ),
+        space_of(three, fo(2), "TRANSITS(0, NODEPOT); TRANSITS(N); LAGTIME([OFF,ON])"),
         &options(Algorithm::ExhaustiveStepwise),
     );
-    assert_eq!(
-        paths(&result, 1),
-        vec![triple("run1", "base", "LAGTIME(ON)")]
-    );
+    assert_eq!(paths(&result, 1), vec![triple("run1", "base", "LAGTIME(ON)")]);
     assert_eq!(result.n_layers(), 1);
     let note = result
         .notes
@@ -791,11 +686,7 @@ fn a_move_no_template_can_express_is_noted_not_generated() {
     let script = Script::new(&[]);
     let result = run(
         &script,
-        space_of(
-            three,
-            fo(2),
-            "TRANSITS(0, NODEPOT); TRANSITS(N); LAGTIME([OFF,ON])",
-        ),
+        space_of(three, fo(2), "TRANSITS(0, NODEPOT); TRANSITS(N); LAGTIME([OFF,ON])"),
         &options(Algorithm::Exhaustive),
     );
     assert_eq!(result.layer_rows(1).count(), 1);
@@ -809,19 +700,11 @@ fn the_cutoff_keeps_the_base_unless_a_candidate_beats_it_by_enough() {
     let script = Script::new(&[(FO_BASE, 100.0), (FO_LAG, 97.0), (FO_P1, 90.0)]);
     let mut opts = options(Algorithm::Exhaustive);
     opts.cutoff = Some(3.84);
-    let result = run(
-        &script,
-        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
-        &opts,
-    );
+    let result = run(&script, space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"), &opts);
     // run1 (PERIPHERALS(1)) drops 10 > 3.84; it wins.
     assert_eq!(result.final_id, "run1");
     let script = Script::new(&[(FO_BASE, 100.0), (FO_LAG, 97.0), (FO_P1, 97.5)]);
-    let result = run(
-        &script,
-        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
-        &opts,
-    );
+    let result = run(&script, space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"), &opts);
     assert_eq!(result.final_id, "base", "no candidate clears the cutoff");
     assert!(result.row("base").unwrap().selected);
     // Ranks are still assigned: the report shows what came closest.
@@ -844,10 +727,7 @@ fn a_candidate_that_fails_the_gate_or_does_not_fit_is_reported_and_unranked() {
     let lag = result.row("run2").unwrap();
     assert_eq!(lag.path, vec![FeatureKey::Lagtime(true)]);
     assert!(!lag.passed && lag.rank.is_none() && !lag.selected);
-    assert_eq!(
-        lag.failures,
-        vec!["stalled at the initial estimates (#751)"]
-    );
+    assert_eq!(lag.failures, vec!["stalled at the initial estimates (#751)"]);
     assert_eq!(lag.converged, Some(false));
     assert_eq!(lag.ofv, Some(50.0), "the OFV is shown beside the reason");
     let broken = result.row("run3").unwrap();
@@ -865,17 +745,12 @@ fn a_base_that_fails_the_gate_leaves_the_candidates_ranked_among_themselves() {
     let mut opts = options(Algorithm::Exhaustive);
     opts.cutoff = Some(3.84);
     let result = run(&script, space("LAGTIME([OFF,ON])"), &opts);
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("base model fails the strictness gate")));
+    assert!(result.notes.iter().any(|n| n.contains("base model fails the strictness gate")));
     assert_eq!(result.final_id, "run1");
     assert!(result.row("run1").unwrap().d_criterion.is_none());
     // Nothing eligible at all: the base is returned, and the note says so.
     let mut script = Script::new(&[(FO_BASE, 100.0), (FO_LAG, 95.0)]);
-    script
-        .failing
-        .extend(["base".to_string(), FO_LAG.to_string()]);
+    script.failing.extend(["base".to_string(), FO_LAG.to_string()]);
     let result = run(&script, space("LAGTIME([OFF,ON])"), &opts);
     assert_eq!(result.final_id, "base");
     assert!(result.notes.iter().any(|n| n.contains("no model passed")));
@@ -886,13 +761,8 @@ fn a_base_that_fails_the_gate_leaves_the_candidates_ranked_among_themselves() {
 fn the_base_model_that_cannot_be_fitted_is_an_error() {
     let mut script = Script::new(&[]);
     script.erroring.push("base".into());
-    let err = search(
-        &script,
-        space("LAGTIME([OFF,ON])"),
-        &options(Algorithm::Exhaustive),
-        None,
-    )
-    .unwrap_err();
+    let err = search(&script, space("LAGTIME([OFF,ON])"), &options(Algorithm::Exhaustive), None)
+        .unwrap_err();
     assert!(err.contains("base model could not be fitted"), "{err}");
 }
 
@@ -912,11 +782,7 @@ fn cancellation_stops_between_layers_and_returns_what_finished() {
     assert_eq!(result.final_id, "run1");
     let mut script = Script::new(&[(FO_BASE, 100.0)]);
     script.cancel_after = Some(1);
-    let result = run(
-        &script,
-        space("LAGTIME([OFF,ON])"),
-        &options(Algorithm::ExhaustiveStepwise),
-    );
+    let result = run(&script, space("LAGTIME([OFF,ON])"), &options(Algorithm::ExhaustiveStepwise));
     assert!(result.cancelled);
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.final_id, "base");
@@ -938,10 +804,7 @@ fn progress_events_name_the_layers_and_their_best() {
     assert_eq!(events[0], "BaseStarted");
     assert!(events[1].starts_with("BaseFinished { ofv: 100.0"));
     assert_eq!(events[2], "LayerStarted { layer: 1, candidates: 2 }");
-    assert_eq!(
-        events[3],
-        "LayerFinished { layer: 1, best: Some((\"run1\", 90.0)) }"
-    );
+    assert_eq!(events[3], "LayerFinished { layer: 1, best: Some((\"run1\", 90.0)) }");
 }
 
 // ── options ─────────────────────────────────────────────────────────────────
@@ -975,10 +838,7 @@ fn options_come_from_the_modelsearch_and_rank_sections() {
     let err =
         ModelsearchOptions::from_config(&config("[modelsearch]\nalgoritm = \"exhaustive\"\n"))
             .unwrap_err();
-    assert!(
-        err.contains("[modelsearch]") && err.contains("algoritm"),
-        "{err}"
-    );
+    assert!(err.contains("[modelsearch]") && err.contains("algoritm"), "{err}");
     let err = ModelsearchOptions::from_config(&config("[rank]\ncutoff = -1.0\n")).unwrap_err();
     assert!(err.contains("cutoff"), "{err}");
     let err = ModelsearchOptions::from_config(&config("[modelsearch]\nalgorithm = \"stepwise\"\n"))
@@ -1005,22 +865,10 @@ fn the_report_writes_models_csv_and_the_final_model_with_its_estimates() {
     let rows: Vec<&str> = lines.collect();
     assert_eq!(rows.len(), 4);
     assert!(rows[0].starts_with("base,,0,,FO,0,0,OFF,"), "{}", rows[0]);
-    assert!(
-        rows[1].starts_with("run1,base,1,PERIPHERALS(1),FO,1,0,OFF,"),
-        "{}",
-        rows[1]
-    );
-    assert!(
-        rows[1].contains("stalled at the initial estimates (#751)"),
-        "{}",
-        rows[1]
-    );
+    assert!(rows[1].starts_with("run1,base,1,PERIPHERALS(1),FO,1,0,OFF,"), "{}", rows[1]);
+    assert!(rows[1].contains("stalled at the initial estimates (#751)"), "{}", rows[1]);
     assert!(rows[1].ends_with(",false,true,false"), "{}", rows[1]);
-    assert!(
-        rows[2].starts_with("run2,base,1,LAGTIME(ON),FO,0,0,ON,"),
-        "{}",
-        rows[2]
-    );
+    assert!(rows[2].starts_with("run2,base,1,LAGTIME(ON),FO,0,0,ON,"), "{}", rows[2]);
     assert!(
         rows[2].contains(",90.000000,90.000000,-10.000000,1,true,true,,,1.500000,true,true,false"),
         "{}",
@@ -1044,21 +892,12 @@ fn the_report_writes_models_csv_and_the_final_model_with_its_estimates() {
         final_model.contains("pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)"),
         "{final_model}"
     );
-    assert!(
-        final_model.contains("omega ETA_ALAG ~ 0.01"),
-        "{final_model}"
-    );
+    assert!(final_model.contains("omega ETA_ALAG ~ 0.01"), "{final_model}");
 
     let summary = render_summary(&result);
-    assert!(
-        summary.contains("Base model (base): FO, 0 peripherals"),
-        "{summary}"
-    );
+    assert!(summary.contains("Base model (base): FO, 0 peripherals"), "{summary}");
     assert!(summary.contains("SELECTED"), "{summary}");
-    assert!(
-        summary.contains("stalled at the initial estimates"),
-        "{summary}"
-    );
+    assert!(summary.contains("stalled at the initial estimates"), "{summary}");
     assert!(
         summary.contains("Final model: run2 — FO, 0 peripherals, lag (ofv 90.000)"),
         "{summary}"
@@ -1167,24 +1006,15 @@ fn a_narrowed_base_can_be_widened_again_because_declarations_come_from_the_paren
         .block_lines("parameters")
         .iter()
         .any(|l| l.contains("TVV2") || l.contains("TVQ2")));
-    assert_eq!(
-        paths(&result, 1),
-        vec![triple("run1", "base", "PERIPHERALS(1)")]
-    );
+    assert_eq!(paths(&result, 1), vec![triple("run1", "base", "PERIPHERALS(1)")]);
     let child = &result.models["run1"];
     assert_eq!(
         child.block_lines("structural_model"),
         vec!["pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)"]
     );
     let params = child.block_lines("parameters");
-    assert!(
-        params.iter().any(|l| l.starts_with("theta TVQ(")),
-        "{params:?}"
-    );
-    assert!(
-        params.iter().any(|l| l.starts_with("theta TVV2(")),
-        "{params:?}"
-    );
+    assert!(params.iter().any(|l| l.starts_with("theta TVQ(")), "{params:?}");
+    assert!(params.iter().any(|l| l.starts_with("theta TVV2(")), "{params:?}");
 }
 
 #[test]
@@ -1192,10 +1022,7 @@ fn a_fixed_transit_base_moves_to_zero_and_to_another_count_by_rebinding_n() {
     let script = Script::new(&[]);
     let result = run(
         &script,
-        space_from_text(
-            BASE_TRANSIT_FIXED,
-            "ABSORPTION(FO); TRANSITS([0,1,3], NODEPOT)",
-        ),
+        space_from_text(BASE_TRANSIT_FIXED, "ABSORPTION(FO); TRANSITS([0,1,3], NODEPOT)"),
         &options(Algorithm::ExhaustiveStepwise),
     );
     // The base's own TRANSITS(3) is not a move; 0 and 1 are.
@@ -1209,21 +1036,10 @@ fn a_fixed_transit_base_moves_to_zero_and_to_another_count_by_rebinding_n() {
     );
     // TRANSITS(0): first-order absorption, a new KA, the chain gone.
     let zero = &result.models["run1"];
-    assert_eq!(
-        zero.block_lines("structural_model"),
-        vec!["pk one_cpt_oral(cl=CL, v=V, ka=KA)"]
-    );
+    assert_eq!(zero.block_lines("structural_model"), vec!["pk one_cpt_oral(cl=CL, v=V, ka=KA)"]);
     let params = zero.block_lines("parameters");
-    assert!(
-        params.iter().any(|l| l.starts_with("theta TVKA(")),
-        "{params:?}"
-    );
-    assert!(
-        !params
-            .iter()
-            .any(|l| l.contains("TVNTR") || l.contains("TVMTT")),
-        "{params:?}"
-    );
+    assert!(params.iter().any(|l| l.starts_with("theta TVKA(")), "{params:?}");
+    assert!(!params.iter().any(|l| l.contains("TVNTR") || l.contains("TVMTT")), "{params:?}");
     // TRANSITS(1): a fresh FIXed count; the old one pruned, MTT kept.
     let one = &result.models["run2"];
     assert_eq!(
@@ -1231,44 +1047,25 @@ fn a_fixed_transit_base_moves_to_zero_and_to_another_count_by_rebinding_n() {
         vec!["pk one_cpt_transit(cl=CL, v=V, n=NTR2, mtt=MTT)"]
     );
     let params = one.block_lines("parameters");
-    assert!(
-        params.contains(&"theta TVNTR2(1.0, 0.0, 64.0) FIX".to_string()),
-        "{params:?}"
-    );
-    assert!(
-        !params.iter().any(|l| l.starts_with("theta TVNTR(")),
-        "{params:?}"
-    );
-    assert!(
-        params.iter().any(|l| l.starts_with("theta TVMTT(")),
-        "{params:?}"
-    );
+    assert!(params.contains(&"theta TVNTR2(1.0, 0.0, 64.0) FIX".to_string()), "{params:?}");
+    assert!(!params.iter().any(|l| l.starts_with("theta TVNTR(")), "{params:?}");
+    assert!(params.iter().any(|l| l.starts_with("theta TVMTT(")), "{params:?}");
     // Three different models, not one canonical text three times.
-    let hashes: std::collections::HashSet<[u8; 32]> = ["base", "run1", "run2"]
-        .iter()
-        .map(|id| result.models[*id].canonical_hash())
-        .collect();
+    let hashes: std::collections::HashSet<[u8; 32]> =
+        ["base", "run1", "run2"].iter().map(|id| result.models[*id].canonical_hash()).collect();
     assert_eq!(hashes.len(), 3);
     assert_eq!(result.row("run1").unwrap().structure.transits, None);
-    assert_eq!(
-        result.row("run2").unwrap().structure.transits,
-        Some(TransitCount::Count(1))
-    );
+    assert_eq!(result.row("run2").unwrap().structure.transits, Some(TransitCount::Count(1)));
 }
 
 #[test]
 fn an_estimated_transit_base_moves_to_a_fixed_count_and_back() {
-    let free = BASE_TRANSIT_FIXED.replace(
-        "theta TVNTR(3.0, 0.0, 64.0) FIX",
-        "theta TVNTR(3.0, 0.0, 64.0)",
-    );
+    let free = BASE_TRANSIT_FIXED
+        .replace("theta TVNTR(3.0, 0.0, 64.0) FIX", "theta TVNTR(3.0, 0.0, 64.0)");
     let script = Script::new(&[]);
     let result = run(
         &script,
-        space_from_text(
-            &free,
-            "ABSORPTION(FO); TRANSITS(N); TRANSITS([0,3], NODEPOT)",
-        ),
+        space_from_text(&free, "ABSORPTION(FO); TRANSITS(N); TRANSITS([0,3], NODEPOT)"),
         &options(Algorithm::ExhaustiveStepwise),
     );
     assert_eq!(result.base_structure.transits, Some(TransitCount::N));
@@ -1281,33 +1078,18 @@ fn an_estimated_transit_base_moves_to_a_fixed_count_and_back() {
     );
     let three = &result.models["run2"];
     let params = three.block_lines("parameters");
-    assert!(
-        params.contains(&"theta TVNTR2(3.0, 0.0, 64.0) FIX".to_string()),
-        "{params:?}"
-    );
-    assert!(
-        !params.iter().any(|l| l.starts_with("theta TVNTR(")),
-        "{params:?}"
-    );
+    assert!(params.contains(&"theta TVNTR2(3.0, 0.0, 64.0) FIX".to_string()), "{params:?}");
+    assert!(!params.iter().any(|l| l.starts_with("theta TVNTR(")), "{params:?}");
     // The reverse move, from the fixed base, gives a free count at Pharmpy's init.
     let script = Script::new(&[]);
     let result = run(
         &script,
-        space_from_text(
-            BASE_TRANSIT_FIXED,
-            "ABSORPTION(FO); TRANSITS(N); TRANSITS(3, NODEPOT)",
-        ),
+        space_from_text(BASE_TRANSIT_FIXED, "ABSORPTION(FO); TRANSITS(N); TRANSITS(3, NODEPOT)"),
         &options(Algorithm::ExhaustiveStepwise),
     );
-    assert_eq!(
-        paths(&result, 1),
-        vec![triple("run1", "base", "TRANSITS(N, NODEPOT)")]
-    );
+    assert_eq!(paths(&result, 1), vec![triple("run1", "base", "TRANSITS(N, NODEPOT)")]);
     let params = result.models["run1"].block_lines("parameters");
-    assert!(
-        params.contains(&"theta TVNTR2(2.0, 0.0, 64.0)".to_string()),
-        "{params:?}"
-    );
+    assert!(params.contains(&"theta TVNTR2(2.0, 0.0, 64.0)".to_string()), "{params:?}");
 }
 
 #[test]
@@ -1329,10 +1111,7 @@ fn a_duplicates_children_are_seeded_from_its_representatives_fit() {
         .find(|r| r.parent.as_deref() == Some("run2"))
         .expect("run2 was extended");
     let params = result.models[&child.id].block_lines("parameters");
-    assert!(
-        params.iter().any(|l| l.starts_with("theta TVCL(0.777,")),
-        "{params:?}"
-    );
+    assert!(params.iter().any(|l| l.starts_with("theta TVCL(0.777,")), "{params:?}");
     // …and a duplicate that wins carries its representative's fit out.
     let mut script = Script::new(&[(FO_BASE, 100.0)]).by_id(&[("run2", 10.0)]);
     script.duplicates.insert("run2".into(), "run1".into());
@@ -1370,20 +1149,12 @@ fn a_resumed_row_without_its_cached_fit_is_an_error_naming_the_fix() {
     )
     .unwrap_err();
     assert!(err.contains("run1"), "{err}");
-    assert!(
-        err.contains("journal cache") && err.contains("resume"),
-        "{err}"
-    );
+    assert!(err.contains("journal cache") && err.contains("resume"), "{err}");
     // The base too.
     let mut script = Script::new(&[(FO_BASE, 100.0)]);
     script.fitless.push("base".into());
-    let err = search(
-        &script,
-        space("LAGTIME([OFF,ON])"),
-        &options(Algorithm::Exhaustive),
-        None,
-    )
-    .unwrap_err();
+    let err = search(&script, space("LAGTIME([OFF,ON])"), &options(Algorithm::Exhaustive), None)
+        .unwrap_err();
     assert!(err.contains("base") && err.contains("resume"), "{err}");
 }
 
@@ -1404,17 +1175,10 @@ fn a_duplicate_of_a_failed_candidate_is_a_failed_row_not_a_dead_search() {
         space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
         &options(Algorithm::ExhaustiveStepwise),
     );
-    let run2 = result
-        .rows
-        .iter()
-        .find(|r| r.id == "run2")
-        .expect("run2 has a row");
+    let run2 = result.rows.iter().find(|r| r.id == "run2").expect("run2 has a row");
     assert!(run2.rank.is_none(), "a failed duplicate is not ranked");
     assert!(
-        result
-            .rows
-            .iter()
-            .any(|r| r.parent.as_deref() == Some("run2")),
+        result.rows.iter().any(|r| r.parent.as_deref() == Some("run2")),
         "and the search carried on past it: {:?}",
         result.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
     );
@@ -1429,15 +1193,9 @@ fn a_failed_candidates_children_start_unseeded_and_the_notes_say_so() {
         space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
         &options(Algorithm::ExhaustiveStepwise),
     );
-    assert!(result
-        .rows
-        .iter()
-        .any(|r| r.parent.as_deref() == Some("run1")));
+    assert!(result.rows.iter().any(|r| r.parent.as_deref() == Some("run1")));
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.starts_with("run1 produced no fit")),
+        result.notes.iter().any(|n| n.starts_with("run1 produced no fit")),
         "{:?}",
         result.notes
     );
@@ -1504,22 +1262,11 @@ fn ode_candidates_are_written_as_ode_templates_with_their_own_budget() {
 #[test]
 fn the_elimination_coordinate_is_in_the_feature_vector() {
     let script = Script::new(&[]);
-    let result = run(
-        &script,
-        space("ELIMINATION([FO,MM])"),
-        &options(Algorithm::Exhaustive),
-    );
-    let row = result
-        .rows
-        .iter()
-        .find(|r| r.id == "run1")
-        .expect("the candidate is in the table");
+    let result = run(&script, space("ELIMINATION([FO,MM])"), &options(Algorithm::Exhaustive));
+    let row = result.rows.iter().find(|r| r.id == "run1").expect("the candidate is in the table");
     assert_eq!(row.structure.elimination, Elimination::Mm);
     assert!(
-        row.structure
-            .feature_vector()
-            .render()
-            .contains("ELIMINATION=MM"),
+        row.structure.feature_vector().render().contains("ELIMINATION=MM"),
         "{}",
         row.structure.feature_vector().render()
     );
@@ -1563,10 +1310,7 @@ const BASE_F_LAG: &str = "\
 #[test]
 fn a_second_layer_off_an_ode_parent_keeps_bioavailability_and_the_lag_time() {
     let script = Script::new(&[]);
-    let base = Structure {
-        lagtime: true,
-        ..fo(0)
-    };
+    let base = Structure { lagtime: true, ..fo(0) };
     let result = run(
         &script,
         space_of(BASE_F_LAG, base, "ELIMINATION([FO,MM]); PERIPHERALS(0..1)"),
@@ -1589,20 +1333,11 @@ fn a_second_layer_off_an_ode_parent_keeps_bioavailability_and_the_lag_time() {
 
     // Bioavailability: still declared, still under its own name, still on
     // its own θ. `F` routes to the slot by itself, so no bridge is needed.
-    assert!(
-        params.iter().any(|l| l.starts_with("F =")),
-        "bioavailability was dropped: {params:?}"
-    );
-    assert!(
-        thetas.iter().any(|l| l.starts_with("theta THETA_F(")),
-        "{thetas:?}"
-    );
+    assert!(params.iter().any(|l| l.starts_with("F =")), "bioavailability was dropped: {params:?}");
+    assert!(thetas.iter().any(|l| l.starts_with("theta THETA_F(")), "{thetas:?}");
     // The lag time: the base's `TLAG`, bridged by the alias — not a fresh
     // `ALAG` at `t_first / 2`.
-    assert!(
-        params.iter().any(|l| l == "lagtime = TLAG"),
-        "the lag bridge is gone: {params:?}"
-    );
+    assert!(params.iter().any(|l| l == "lagtime = TLAG"), "the lag bridge is gone: {params:?}");
     assert!(params.iter().any(|l| l.starts_with("TLAG =")), "{params:?}");
     assert!(
         thetas.iter().any(|l| l.starts_with("theta TVLAG(0.4")),

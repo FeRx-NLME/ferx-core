@@ -18,10 +18,7 @@
 /// through a path, and the `.ferx` suffix is what `parse_full_model_file` sees.
 fn temp_model(src: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
     f.write_all(src.as_bytes()).expect("write temp model");
     f.flush().expect("flush temp model");
     f
@@ -81,22 +78,14 @@ fn check_rejects_a_prior_on_a_fixed_parameter_without_data() {
         "a prior on a FIXed parameter must invalidate the report: {:?}",
         report.diagnostics
     );
-    assert!(
-        codes(&report).contains(&"E_PRIOR_UNRESOLVED"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(codes(&report).contains(&"E_PRIOR_UNRESOLVED"), "{:?}", report.diagnostics);
 
     // Straddle: identical model, θ free — valid.
     let ok = report_for(&model_src(
         &params_with_tvv("theta TVV(10.0, 0.1, 500.0) prior(10.0, rse = 20%)"),
         "  method = focei\n",
     ));
-    assert!(
-        ok.valid,
-        "a prior on a free theta must still check clean: {:?}",
-        ok.diagnostics
-    );
+    assert!(ok.valid, "a prior on a free theta must still check clean: {:?}", ok.diagnostics);
 }
 
 /// A method that does not apply priors is a `ferx check` error too — this is
@@ -106,11 +95,7 @@ fn check_rejects_a_prior_on_a_fixed_parameter_without_data() {
 fn check_rejects_a_prior_the_final_method_cannot_apply() {
     let priors = params_with_tvv("theta TVV(10.0, 0.1, 500.0) prior(10.0, rse = 20%)");
     let report = report_for(&model_src(&priors, "  method = saem\n"));
-    assert!(
-        codes(&report).contains(&"E_PRIOR_METHOD_UNSUPPORTED"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(codes(&report).contains(&"E_PRIOR_METHOD_UNSUPPORTED"), "{:?}", report.diagnostics);
 
     // Straddle: a chain whose *last* stage applies priors is fine, so the check
     // reads the final method rather than any method.
@@ -118,11 +103,7 @@ fn check_rejects_a_prior_the_final_method_cannot_apply() {
     // No error at all, not just not this one: the fixture was `methods = [...]` until #2536,
     // which the parser rejects as an unknown key, so the absence of the prior error said
     // nothing about the chain.
-    assert!(
-        !codes(&ok).iter().any(|c| c.starts_with("E_")),
-        "{:?}",
-        ok.diagnostics
-    );
+    assert!(!codes(&ok).iter().any(|c| c.starts_with("E_")), "{:?}", ok.diagnostics);
 }
 
 /// `covariance_method = rsr` under a prior is rejected, and so is `s`.
@@ -167,11 +148,7 @@ fn check_rejects_both_s_and_rsr_covariance_under_a_prior() {
         &priors,
         "  method = focei\n  covariance = true\n  covariance_method = r\n",
     ));
-    assert!(
-        !codes(&ok).contains(&"E_PRIOR_COV_METHOD_UNSUPPORTED"),
-        "{:?}",
-        ok.diagnostics
-    );
+    assert!(!codes(&ok).contains(&"E_PRIOR_COV_METHOD_UNSUPPORTED"), "{:?}", ok.diagnostics);
 
     // And with no prior declared, `rsr` is untouched — the rejection is about
     // the prior, not about the estimator.

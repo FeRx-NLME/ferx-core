@@ -48,11 +48,8 @@ fn warfarin_text() -> ModelText {
 #[test]
 fn seed_from_floors_a_collapsed_variance_at_the_smallest_startable_one() {
     let mut fit = fixture_fit();
-    let k = fit
-        .eta_names
-        .iter()
-        .position(|n| n == "ETA_KA")
-        .expect("the warfarin model has ETA_KA");
+    let k =
+        fit.eta_names.iter().position(|n| n == "ETA_KA").expect("the warfarin model has ETA_KA");
     fit.omega[(k, k)] = 6.144_212_353_328_21e-6;
 
     let mut model = warfarin_text();
@@ -66,9 +63,7 @@ fn seed_from_floors_a_collapsed_variance_at_the_smallest_startable_one() {
     // The mutation this pins: without the floor the child is written at the
     // rail, which is exactly what `SeedInits` on its own does.
     let mut verbatim = warfarin_text();
-    verbatim
-        .apply(ModelEdit::SeedInits(&fit))
-        .expect("the unfloored edit");
+    verbatim.apply(ModelEdit::SeedInits(&fit)).expect("the unfloored edit");
     let raw = verbatim.block_lines("parameters");
     assert!(
         raw.contains(&"omega ETA_KA ~ 0.00000614421235332821".to_string()),
@@ -88,9 +83,7 @@ fn seed_from_leaves_a_healthy_variance_alone() {
     let mut floored = warfarin_text();
     seed_from(&mut floored, &fit).expect("seeding a child");
     let mut verbatim = warfarin_text();
-    verbatim
-        .apply(ModelEdit::SeedInits(&fit))
-        .expect("the unfloored edit");
+    verbatim.apply(ModelEdit::SeedInits(&fit)).expect("the unfloored edit");
     assert_eq!(
         floored.block_lines("parameters"),
         verbatim.block_lines("parameters"),
@@ -149,10 +142,8 @@ fn seed_from_regularises_a_block_whose_cholesky_diagonal_is_at_the_rail() {
 
     // A model that blocks the three η, so `SeedInits` writes the block.
     let src = std::fs::read_to_string(MODEL).unwrap();
-    let src = src
-        .replace("  omega ETA_CL ~ 0.09\n", "")
-        .replace("  omega ETA_V  ~ 0.04\n", "")
-        .replace(
+    let src =
+        src.replace("  omega ETA_CL ~ 0.09\n", "").replace("  omega ETA_V  ~ 0.04\n", "").replace(
             "  omega ETA_KA ~ 0.30\n",
             "  block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.0, 0.04, 0.0, 0.0, 0.30]\n",
         );
@@ -252,10 +243,7 @@ fn seed_from_nudges_only_the_failing_block_not_a_healthy_standalone_omega() {
         params.contains(&"omega ETA_KA ~ 0.00002".to_string()),
         "the standalone ω is untouched: {params:?}"
     );
-    let block = params
-        .iter()
-        .find(|l| l.starts_with("block_omega"))
-        .unwrap();
+    let block = params.iter().find(|l| l.starts_with("block_omega")).unwrap();
     let tri: Vec<f64> = block
         .split_once('[')
         .unwrap()
@@ -264,18 +252,9 @@ fn seed_from_nudges_only_the_failing_block_not_a_healthy_standalone_omega() {
         .split(',')
         .map(|s| s.trim().parse().unwrap())
         .collect();
-    assert!(
-        (tri[0] - (a * a + MIN_SEED_VARIANCE)).abs() < 1e-12,
-        "{block}"
-    );
-    assert!(
-        (tri[1] - a * b).abs() < 1e-12,
-        "the covariance is verbatim: {block}"
-    );
-    assert!(
-        (tri[2] - (b * b + c * c + MIN_SEED_VARIANCE)).abs() < 1e-12,
-        "{block}"
-    );
+    assert!((tri[0] - (a * a + MIN_SEED_VARIANCE)).abs() < 1e-12, "{block}");
+    assert!((tri[1] - a * b).abs() < 1e-12, "the covariance is verbatim: {block}");
+    assert!((tri[2] - (b * b + c * c + MIN_SEED_VARIANCE)).abs() < 1e-12, "{block}");
 }
 
 /// A `FIX`ed block is never nudged, and is never a reason to touch anything
@@ -305,10 +284,7 @@ fn seed_from_leaves_a_fixed_block_and_its_neighbours_alone() {
         params.contains(&"block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] FIX".to_string()),
         "{params:?}"
     );
-    assert!(
-        params.contains(&"omega ETA_KA ~ 0.00002".to_string()),
-        "{params:?}"
-    );
+    assert!(params.contains(&"omega ETA_KA ~ 0.00002".to_string()), "{params:?}");
     assert!(super::free_blocks_of(&model, "block_omega", &names).is_empty());
 }
 
@@ -341,10 +317,7 @@ fn seed_from_hands_an_unrepairable_block_through_verbatim() {
     seed_from(&mut model, &fit).expect("seeding a child");
     let mut verbatim = ModelText::parse(&src).unwrap();
     verbatim.apply(ModelEdit::SeedInits(&fit)).unwrap();
-    assert_eq!(
-        model.block_lines("parameters"),
-        verbatim.block_lines("parameters")
-    );
+    assert_eq!(model.block_lines("parameters"), verbatim.block_lines("parameters"));
 }
 
 /// The κ matrix hits the same rail (#1183): a full-IOV parent whose κ
@@ -365,18 +338,9 @@ fn seed_from_floors_a_collapsed_kappa_and_nudges_a_singular_kappa_block() {
 
     let src = std::fs::read_to_string(MODEL).unwrap();
     let src = src
-        .replace(
-            "  CL = TVCL * exp(ETA_CL)",
-            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
-        )
-        .replace(
-            "  V  = TVV  * exp(ETA_V)",
-            "  V  = TVV  * exp(ETA_V + KAPPA_V)",
-        )
-        .replace(
-            "  KA = TVKA * exp(ETA_KA)",
-            "  KA = TVKA * exp(ETA_KA + KAPPA_KA)",
-        )
+        .replace("  CL = TVCL * exp(ETA_CL)", "  CL = TVCL * exp(ETA_CL + KAPPA_CL)")
+        .replace("  V  = TVV  * exp(ETA_V)", "  V  = TVV  * exp(ETA_V + KAPPA_V)")
+        .replace("  KA = TVKA * exp(ETA_KA)", "  KA = TVKA * exp(ETA_KA + KAPPA_KA)")
         .replace(
             "  sigma PROP_ERR",
             "  block_kappa (KAPPA_CL, KAPPA_V) = [0.02, 0.0, 0.01]\n  kappa KAPPA_KA ~ 0.01\n  \
@@ -389,10 +353,8 @@ fn seed_from_floors_a_collapsed_kappa_and_nudges_a_singular_kappa_block() {
         params.contains(&"kappa KAPPA_KA ~ 0.00001".to_string()),
         "the collapsed κ is raised to the floor: {params:?}"
     );
-    let block = params
-        .iter()
-        .find(|l| l.starts_with("block_kappa"))
-        .expect("the κ block is written");
+    let block =
+        params.iter().find(|l| l.starts_with("block_kappa")).expect("the κ block is written");
     let tri: Vec<f64> = block
         .split_once('[')
         .unwrap()

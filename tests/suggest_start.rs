@@ -4,10 +4,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{inits_from_nca, read_nonmem_csv, NcaInit};
 use std::path::Path;
 
-fn warfarin() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn warfarin() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -15,10 +12,7 @@ fn warfarin() -> (
     (model, population)
 }
 
-fn two_cpt_iv() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn two_cpt_iv() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model = parse_model_file(Path::new("examples/two_cpt_iv.ferx"))
         .expect("two_cpt_iv model must parse");
     let population = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None)
@@ -34,12 +28,8 @@ fn test_suggest_start_warfarin_direction() {
     let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
 
     // Find TVCL index.
-    let tvcl_idx = result
-        .params
-        .theta_names
-        .iter()
-        .position(|n| n == "TVCL")
-        .expect("TVCL must be a theta");
+    let tvcl_idx =
+        result.params.theta_names.iter().position(|n| n == "TVCL").expect("TVCL must be a theta");
 
     let suggested = result.params.theta[tvcl_idx];
     let truth = 0.134_f64;
@@ -79,21 +69,11 @@ fn test_suggest_start_two_cpt_iv_sanity() {
     let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
 
     let find = |name: &str| -> f64 {
-        let idx = result
-            .params
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or(0);
+        let idx = result.params.theta_names.iter().position(|n| n == name).unwrap_or(0);
         result.params.theta[idx]
     };
     let find_default = |name: &str| -> f64 {
-        let idx = model
-            .default_params
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or(0);
+        let idx = model.default_params.theta_names.iter().position(|n| n == name).unwrap_or(0);
         model.default_params.theta[idx]
     };
 
@@ -289,10 +269,8 @@ fn test_nca_ebe_ode_fallback_warning() {
     assert!(model.ode_spec.is_some(), "mm_iv model must be an ODE model");
 
     let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
-    let has_ode_warning = result
-        .warnings
-        .iter()
-        .any(|w| w.contains("ODE") && w.contains("Falling back"));
+    let has_ode_warning =
+        result.warnings.iter().any(|w| w.contains("ODE") && w.contains("Falling back"));
     assert!(
         has_ode_warning,
         "nca_ebe on an ODE model must emit the ODE-fallback warning; got: {:?}",
@@ -303,22 +281,14 @@ fn test_nca_ebe_ode_fallback_warning() {
 /// Tier 3 — slow: trust_region should converge from the bad TVCL=0.5 start
 /// when inits_from_nca = nca_sweep corrects the initial values.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn test_trust_region_converges_with_inits_from_nca() {
     use ferx_core::{fit, EstimationMethod, FitOptions, NcaInit, Optimizer};
 
     let (mut model, population) = warfarin();
 
     // Deliberately set TVCL to the bad starting value.
-    let tvcl_idx = model
-        .default_params
-        .theta_names
-        .iter()
-        .position(|n| n == "TVCL")
-        .unwrap();
+    let tvcl_idx = model.default_params.theta_names.iter().position(|n| n == "TVCL").unwrap();
     model.default_params.theta[tvcl_idx] = 0.5;
 
     let mut options = FitOptions::default();

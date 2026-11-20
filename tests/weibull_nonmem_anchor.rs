@@ -96,9 +96,7 @@ fn weibull_marginal_ofv_matches_nonmem_at_their_optimum() {
     const NONMEM_OFV: f64 = -943.833;
     const TOLERANCE: f64 = 1.0;
 
-    let model = parse_full_model(MODEL_AT_NONMEM_OPTIMUM)
-        .expect("Weibull model must parse")
-        .model;
+    let model = parse_full_model(MODEL_AT_NONMEM_OPTIMUM).expect("Weibull model must parse").model;
     let pop = read_nonmem_csv(Path::new("data/igd_oral.csv"), None, None)
         .expect("igd_oral data must load");
 
@@ -117,11 +115,7 @@ fn weibull_marginal_ofv_matches_nonmem_at_their_optimum() {
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("Weibull fit must run");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - NONMEM_OFV).abs() < TOLERANCE,
         "ferx FOCEI objective {:.3} at NONMEM's optimum is outside the NONMEM-anchored \

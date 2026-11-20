@@ -107,11 +107,7 @@ fn corrected_structural_model_matches_nonmem_ofv() {
     let result =
         fit(&model, &pop, &model.default_params, &opts).expect("corrected #154 fit must run");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - EXPECTED_OFV).abs() < TOLERANCE,
         "OFV {:.3} is outside the NONMEM-anchored band {:.2} ± {:.1} (NONMEM #OBJV \

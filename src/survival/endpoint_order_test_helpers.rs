@@ -55,11 +55,7 @@ impl EndpointOrderFixture {
         }
         let mut f = tempfile::NamedTempFile::new().expect("temp csv");
         f.write_all(csv.as_bytes()).expect("write csv");
-        Self {
-            src,
-            csv_path: f.path().to_str().expect("utf-8 path").to_string(),
-            _csv: Some(f),
-        }
+        Self { src, csv_path: f.path().to_str().expect("utf-8 path").to_string(), _csv: Some(f) }
     }
 
     /// The bundled two-cause competing-risks example (CMT 2, 3).

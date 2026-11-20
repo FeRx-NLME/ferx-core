@@ -7,13 +7,7 @@ use crate::sens::num::PkNum;
 
 /// The second-order layout over 2 η: value, `∂_0`, `∂_1`, `∂²_00`, `∂²_10`, `∂²_11`.
 fn l2() -> Layout {
-    Layout {
-        n: 2,
-        m: 3,
-        th: false,
-        wide: false,
-        tan: 0,
-    }
+    Layout { n: 2, m: 3, th: false, wide: false, tan: 0 }
 }
 
 /// Record `f` over 2 η, build its plan, run it at `l2` at `eta`: each output's 6 lanes.
@@ -32,16 +26,11 @@ fn run2(f: impl Fn(&[Tr]) -> Vec<Tr>, record_at: [f64; 2], eta: [f64; 2]) -> Vec
     let mut du = vec![0.0; (y.len() + 1) * l];
     plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
     assert_eq!(du[y.len() * l], 1.0, "the plan's checks hold at {eta:?}");
-    (0..y.len())
-        .map(|j| std::array::from_fn(|c| du[j * l + c]))
-        .collect()
+    (0..y.len()).map(|j| std::array::from_fn(|c| du[j * l + c])).collect()
 }
 
 fn close(got: f64, want: f64, what: &str) {
-    assert!(
-        got.is_finite() && want.is_finite(),
-        "{what}: {got} vs {want}"
-    );
+    assert!(got.is_finite() && want.is_finite(), "{what}: {got} vs {want}");
     let rel = (got - want).abs() / (1.0 + want.abs());
     assert!(rel < 1e-12, "{what}: {got} vs {want} (rel {rel:e})");
 }
@@ -149,20 +138,13 @@ fn a_recorded_fixed_point_has_its_implicit_derivatives_to_second_order() {
         let k = |c: f64| Tr::from_f64(c);
         let c = [e[0] * e[0] + k(2.0) * e[1], e[0] * e[1] - k(0.5)];
         let p = |u: &[Tr]| -> Option<Vec<Tr>> {
-            Some(
-                (0..2)
-                    .map(|i| k(0.3) * (-u[i]).exp() + k(0.1) * u[1 - i] + c[i])
-                    .collect(),
-            )
+            Some((0..2).map(|i| k(0.3) * (-u[i]).exp() + k(0.1) * u[1 - i] + c[i]).collect())
         };
         let solve: Box<SolveFn> = Box::new(|maps| {
             let mut u = vec![0.0; 2];
             for _ in 0..200 {
                 let v = maps[0](&u)?;
-                let done = v
-                    .iter()
-                    .zip(&u)
-                    .all(|(a, b)| (a - b).abs() <= 1e-15 * (1.0 + a.abs()));
+                let done = v.iter().zip(&u).all(|(a, b)| (a - b).abs() <= 1e-15 * (1.0 + a.abs()));
                 u = v;
                 if done {
                     break;
@@ -184,9 +166,8 @@ fn a_recorded_fixed_point_has_its_implicit_derivatives_to_second_order() {
         let g = [0.3 * (-u[0]).exp(), 0.3 * (-u[1]).exp()];
         let fu = nalgebra::Matrix2::new(1.0 + g[0], -0.1, -0.1, 1.0 + g[1]);
         let fi = fu.try_inverse().expect("regular");
-        let du: Vec<nalgebra::Vector2<f64>> = (0..2)
-            .map(|k| fi * nalgebra::Vector2::new(dc[k][0], dc[k][1]))
-            .collect();
+        let du: Vec<nalgebra::Vector2<f64>> =
+            (0..2).map(|k| fi * nalgebra::Vector2::new(dc[k][0], dc[k][1])).collect();
         // F_uu[a, b]_i = −0.3e^{−u_i}·a_i·b_i.
         let ddu = |k: usize, l: usize| {
             let rhs = nalgebra::Vector2::new(
@@ -215,12 +196,7 @@ fn a_recorded_matrix_exponential_squares_as_often_as_the_values_ask() {
     // a = −4η₀² − 6, d = −3η₀η₁ − 5: ‖A‖ ≈ 10–40, two to four squarings.
     let f = |e: &[Tr]| -> Vec<Tr> {
         let k = |c: f64| Tr::from_f64(c);
-        let a = [
-            k(-4.0) * e[0] * e[0] - k(6.0),
-            k(0.0),
-            k(0.0),
-            k(-3.0) * e[0] * e[1] - k(5.0),
-        ];
+        let a = [k(-4.0) * e[0] * e[0] - k(6.0), k(0.0), k(0.0), k(-3.0) * e[0] * e[1] - k(5.0)];
         let mut x = crate::ode::linear::Expm::<Tr>::new(2);
         let slot = x.exp(&a).expect("exponentiates");
         let p = x.get(slot);
@@ -229,11 +205,7 @@ fn a_recorded_matrix_exponential_squares_as_often_as_the_values_ask() {
     for eta in [[0.3, 0.2], [1.5, 1.8]] {
         let got = run2(f, [0.3, 0.2], eta);
         let parts = [
-            (
-                -4.0 * eta[0] * eta[0] - 6.0,
-                [-8.0 * eta[0], 0.0],
-                [[-8.0, 0.0], [0.0, 0.0]],
-            ),
+            (-4.0 * eta[0] * eta[0] - 6.0, [-8.0 * eta[0], 0.0], [[-8.0, 0.0], [0.0, 0.0]]),
             (
                 -3.0 * eta[0] * eta[1] - 5.0,
                 [-3.0 * eta[1], -3.0 * eta[0]],
@@ -245,11 +217,7 @@ fn a_recorded_matrix_exponential_squares_as_often_as_the_values_ask() {
             let what = |s: &str| format!("exp[{i}] {s} at {eta:?}");
             let rel = |g: f64, w: f64, s: &str| {
                 assert!(g.is_finite() && w.is_finite(), "{}", what(s));
-                assert!(
-                    (g - w).abs() <= 1e-13 * w.abs().max(1e-300),
-                    "{}: {g} vs {w}",
-                    what(s)
-                );
+                assert!((g - w).abs() <= 1e-13 * w.abs().max(1e-300), "{}: {g} vs {w}", what(s));
             };
             rel(got[i][0], e, "value");
             rel(got[i][1], d[0] * e, "∂0");
@@ -269,13 +237,7 @@ fn rev_grads(f: impl Fn(&[Tr]) -> Vec<Tr>, record_at: [f64; 2], eta: [f64; 2]) -
     let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, record_at[k])).collect();
     let y = f(&et);
     let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
-    let l1 = Layout {
-        n: 2,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     let plan = rec.plan(l1, 2, 0).expect("plans");
     let l = l1.lanes();
     let mut u = vec![0.0; 2 * l];
@@ -289,10 +251,7 @@ fn rev_grads(f: impl Fn(&[Tr]) -> Vec<Tr>, record_at: [f64; 2], eta: [f64; 2]) -
             let mut du_bar = vec![0.0; y.len() * l];
             du_bar[j * l] = 1.0;
             let mut ub = vec![0.0; 2 * l];
-            assert!(
-                plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar),
-                "reverses"
-            );
+            assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar), "reverses");
             [ub[0], ub[l]]
         })
         .collect()
@@ -301,12 +260,7 @@ fn rev_grads(f: impl Fn(&[Tr]) -> Vec<Tr>, record_at: [f64; 2], eta: [f64; 2]) -
 /// `exp` of a 2×2 matrix in η, large enough to need squarings: the Padé solve and the repeat call.
 fn case_expm(e: &[Tr]) -> Vec<Tr> {
     let k = |c: f64| Tr::from_f64(c);
-    let a = [
-        k(-4.0) * e[0] * e[0] - k(6.0),
-        k(0.5) * e[1],
-        k(0.0),
-        k(-3.0) * e[0] * e[1] - k(5.0),
-    ];
+    let a = [k(-4.0) * e[0] * e[0] - k(6.0), k(0.5) * e[1], k(0.0), k(-3.0) * e[0] * e[1] - k(5.0)];
     let mut x = crate::ode::linear::Expm::<Tr>::new(2);
     let slot = x.exp(&a).expect("exponentiates");
     x.get(slot).to_vec()
@@ -317,11 +271,7 @@ fn case_fixed(e: &[Tr]) -> Vec<Tr> {
     let k = |c: f64| Tr::from_f64(c);
     let c = [e[0] * e[0] + k(2.0) * e[1], e[0] * e[1] - k(0.5)];
     let p = |u: &[Tr]| -> Option<Vec<Tr>> {
-        Some(
-            (0..2)
-                .map(|i| k(0.3) * (-u[i]).exp() + k(0.1) * u[1 - i] + c[i])
-                .collect(),
-        )
+        Some((0..2).map(|i| k(0.3) * (-u[i]).exp() + k(0.1) * u[1 - i] + c[i]).collect())
     };
     let solve: Box<SolveFn> = Box::new(|maps| {
         let mut u = vec![0.0; 2];
@@ -343,11 +293,7 @@ fn case_solve(e: &[Tr]) -> Vec<Tr> {
 }
 
 type Case = (&'static str, fn(&[Tr]) -> Vec<Tr>);
-const CASES: [Case; 3] = [
-    ("expm", case_expm),
-    ("fixed point", case_fixed),
-    ("solve", case_solve),
-];
+const CASES: [Case; 3] = [("expm", case_expm), ("fixed point", case_fixed), ("solve", case_solve)];
 
 /// Every call kind's reverse (the fixed point's transposed steps, the repeat call's walk back,
 /// the recorded solve's refinement) against its own forward's first-order lanes.
@@ -399,10 +345,7 @@ fn every_call_kind_reverses_exactly_from_second_order_lanes() {
                 let mut du_bar = vec![0.0; y.len() * l];
                 du_bar[j * l + h(k, m)] = 1.0;
                 let mut ub = vec![0.0; 2 * l];
-                assert!(
-                    plan.reverse_from(&fwd, l2(), 1, &mut ub, &mut [], &du_bar),
-                    "reverses"
-                );
+                assert!(plan.reverse_from(&fwd, l2(), 1, &mut ub, &mut [], &du_bar), "reverses");
                 [ub[0], ub[l]]
             };
             for d in 0..2 {
@@ -420,27 +363,15 @@ fn every_call_kind_reverses_exactly_from_second_order_lanes() {
                         for m in 0..=k {
                             let want = du[j * lt + l + h(k, m)];
                             let got = third_rev(j, k, m)[d];
-                            close(
-                                got,
-                                want,
-                                &format!("{name} out {j} ∂³/∂{k}∂{m}∂{d} at {eta:?}"),
-                            );
+                            close(got, want, &format!("{name} out {j} ∂³/∂{k}∂{m}∂{d} at {eta:?}"));
                         }
                     }
                 }
             }
             for j in 0..y.len() {
                 // ∂³/∂0∂0∂1 two ways, and ∂³/∂1∂1∂0.
-                close(
-                    third_rev(j, 0, 0)[1],
-                    third_rev(j, 1, 0)[0],
-                    &format!("{name} out {j} 001"),
-                );
-                close(
-                    third_rev(j, 1, 1)[0],
-                    third_rev(j, 1, 0)[1],
-                    &format!("{name} out {j} 110"),
-                );
+                close(third_rev(j, 0, 0)[1], third_rev(j, 1, 0)[0], &format!("{name} out {j} 001"));
+                close(third_rev(j, 1, 1)[0], third_rev(j, 1, 0)[1], &format!("{name} out {j} 110"));
             }
         }
     }
@@ -453,9 +384,8 @@ fn case_fixed_held(e: &[Tr]) -> Vec<Tr> {
     let k = |c: f64| Tr::from_f64(c);
     let c = [e[0] * e[0] + k(2.0) * e[1], e[0] * e[1] - k(0.5)];
     let p = |u: &[Tr]| -> Option<Vec<Tr>> {
-        let mut y: Vec<Tr> = (0..2)
-            .map(|i| k(0.3) * (-u[i]).exp() + k(0.1) * u[1 - i] + c[i])
-            .collect();
+        let mut y: Vec<Tr> =
+            (0..2).map(|i| k(0.3) * (-u[i]).exp() + k(0.1) * u[1 - i] + c[i]).collect();
         y.push(u[2]);
         Some(y)
     };
@@ -480,11 +410,7 @@ fn a_held_coordinate_is_a_constant_of_the_fixed_point() {
         let got = run2(case_fixed_held, [0.3, 0.2], eta);
         for j in 0..2 {
             for c in 0..6 {
-                close(
-                    got[j][c],
-                    want[j][c],
-                    &format!("out {j} lane {c} at {eta:?}"),
-                );
+                close(got[j][c], want[j][c], &format!("out {j} lane {c} at {eta:?}"));
             }
         }
         assert_eq!(got[2], [0.0; 6], "the held coordinate at {eta:?}");
@@ -492,11 +418,7 @@ fn a_held_coordinate_is_a_constant_of_the_fixed_point() {
         let rg = rev_grads(case_fixed_held, [0.3, 0.2], eta);
         for j in 0..2 {
             for k in 0..2 {
-                close(
-                    rg[j][k],
-                    rw[j][k],
-                    &format!("reverse out {j} ∂{k} at {eta:?}"),
-                );
+                close(rg[j][k], rw[j][k], &format!("reverse out {j} ∂{k} at {eta:?}"));
             }
         }
         assert_eq!(rg[2], [0.0; 2], "the held coordinate's reverse at {eta:?}");
@@ -538,13 +460,7 @@ fn the_solver_options_key_a_plan() {
 #[test]
 fn a_recording_over_70_eta_plans_and_has_its_first_order_gradient() {
     const N: usize = 70;
-    let l1 = Layout {
-        n: N as u16,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let l1 = Layout { n: N as u16, m: 0, th: false, wide: false, tan: 0 };
     let eta: Vec<f64> = (0..N).map(|k| 0.1 + 0.01 * k as f64).collect();
     let c: Vec<f64> = (0..N).map(|k| 1.0 + 0.1 * k as f64).collect();
     begin();
@@ -571,11 +487,7 @@ fn a_recording_over_70_eta_plans_and_has_its_first_order_gradient() {
     close(du[l], p, "prod");
     for j in 0..N {
         close(du[1 + j], 2.0 * c[j] * eta[j], &format!("d sum/d eta {j}"));
-        close(
-            du[l + 1 + j],
-            0.01 * p / (1.0 + 0.01 * eta[j]),
-            &format!("d prod/d eta {j}"),
-        );
+        close(du[l + 1 + j], 0.01 * p / (1.0 + 0.01 * eta[j]), &format!("d prod/d eta {j}"));
     }
 }
 
@@ -664,14 +576,8 @@ fn a_full_variant_list_keeps_the_one_that_served_last() {
     v.hit(0);
     v = v.with(square_plan());
     assert_eq!(v.len(), MAX_VARIANTS);
-    assert!(
-        v.iter().any(|p| Arc::ptr_eq(p, &first)),
-        "the touched one stays"
-    );
-    assert!(
-        !v.iter().any(|p| Arc::ptr_eq(p, &second)),
-        "the oldest other one goes"
-    );
+    assert!(v.iter().any(|p| Arc::ptr_eq(p, &first)), "the touched one stays");
+    assert!(!v.iter().any(|p| Arc::ptr_eq(p, &second)), "the oldest other one goes");
     assert_eq!(v.order().next().map(|(i, _)| i), Some(MAX_VARIANTS - 1));
 }
 
@@ -717,10 +623,7 @@ fn a_registered_fit_keys_by_its_fingerprints_and_releases_them() {
     {
         let _scope = register(&model, &subjects);
         let k = SubjectKey::new(&model, &subjects[0], 1, 1);
-        assert_ne!(
-            k.scope, 0,
-            "a registered fit keys its plans in its own scope"
-        );
+        assert_ne!(k.scope, 0, "a registered fit keys its plans in its own scope");
         assert_eq!(prints(k), hashed, "registered = hashed");
     }
     subjects[0].obs_times.push(3.0);
@@ -746,22 +649,12 @@ fn a_fits_plans_survive_resets_and_leave_with_its_scope() {
     let scope = register(&model, &subjects);
     let key =
         SubjectKey::new(&model, &subjects[0], 1, 1).with_variant(Desc::of_value(&0x5c0_9eu64));
-    assert_ne!(
-        key,
-        SubjectKey::new(&model, &subjects[0], 1, 1),
-        "variant keys apart"
-    );
+    assert_ne!(key, SubjectKey::new(&model, &subjects[0], 1, 1), "variant keys apart");
     add(&key, square_plan());
     reset();
-    assert!(
-        matches!(lookup(&key), Lookup::Found(_)),
-        "a reset leaves a registered fit's plans"
-    );
+    assert!(matches!(lookup(&key), Lookup::Found(_)), "a reset leaves a registered fit's plans");
     drop(scope);
-    assert!(
-        matches!(lookup(&key), Lookup::Missing),
-        "the scope's end drops its plans"
-    );
+    assert!(matches!(lookup(&key), Lookup::Missing), "the scope's end drops its plans");
 }
 
 /// `add` hands back the variants it stored, so a caller serves from them and never looks the key
@@ -806,17 +699,9 @@ fn case_ode_interp(method: crate::ode::solver::OdeMethod) -> impl Fn(&[Tr]) -> V
             ..Default::default()
         };
         let mut auto = crate::ode::solver::OdeAutoSwitchState::default();
-        let (hard, soft) = Tr::ode_segment(
-            &rhs,
-            &u0,
-            (0.0, 3.0),
-            &p,
-            &[3.0],
-            &[0.7, 1.3, 2.9],
-            &opts,
-            &mut auto,
-        )
-        .expect("records as a loop call");
+        let (hard, soft) =
+            Tr::ode_segment(&rhs, &u0, (0.0, 3.0), &p, &[3.0], &[0.7, 1.3, 2.9], &opts, &mut auto)
+                .expect("records as a loop call");
         hard.iter().chain(&soft).flat_map(|s| s.u.clone()).collect()
     }
 }
@@ -828,20 +713,9 @@ fn case_ode_interp(method: crate::ode::solver::OdeMethod) -> impl Fn(&[Tr]) -> V
 #[test]
 fn an_interpolated_sample_reverses_like_the_forward_tangent() {
     use crate::ode::solver::OdeMethod;
-    let l1 = Layout {
-        n: 2,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     let l = l1.lanes();
-    for method in [
-        OdeMethod::Rk45,
-        OdeMethod::Vern7,
-        OdeMethod::Rosenbrock23,
-        OdeMethod::Rodas5P,
-    ] {
+    for method in [OdeMethod::Rk45, OdeMethod::Vern7, OdeMethod::Rosenbrock23, OdeMethod::Rodas5P] {
         let f = case_ode_interp(method);
         begin();
         let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [0.1, -0.2][k])).collect();
@@ -872,11 +746,7 @@ fn an_interpolated_sample_reverses_like_the_forward_tangent() {
         // 4.3e-11 (Rosenbrock23), 2.3e-11 (Rodas5P). The stiff pair's gap is the factorization's
         // refinement noise, as large on the hard end point (≤ 8.6e-12) as on the interpolated
         // samples, so it is not the read-out's; the bounds leave ~10× over each family.
-        let tol = if matches!(method, OdeMethod::Rk45 | OdeMethod::Vern7) {
-            1e-13
-        } else {
-            5e-10
-        };
+        let tol = if matches!(method, OdeMethod::Rk45 | OdeMethod::Vern7) { 1e-13 } else { 5e-10 };
         let mut worst = 0.0f64;
         for j in 0..y.len() {
             let mut du_bar = vec![0.0; y.len() * l];
@@ -890,10 +760,7 @@ fn an_interpolated_sample_reverses_like_the_forward_tangent() {
                 let want = du[j * l + 1 + k];
                 let rel = (got - want).abs() / (1.0 + want.abs());
                 assert!(rel.is_finite());
-                assert!(
-                    rel < tol,
-                    "{method:?} out {j} ∂{k}: {got} vs {want} (rel {rel:e})"
-                );
+                assert!(rel < tol, "{method:?} out {j} ∂{k}: {got} vs {want} (rel {rel:e})");
                 worst = worst.max(rel);
             }
         }
@@ -915,16 +782,8 @@ fn zero_tangent_chunk(live: bool) -> (ChunkProgram, Layout) {
         Flat::LoadState { d: 3, i: 3 },
         Flat::DivRaw { d: 4, a: 0, b: 2 },
         Flat::Mul { d: 5, a: 4, b: 3 },
-        Flat::MulK {
-            d: 6,
-            a: 5,
-            c: -1.0,
-        },
-        Flat::Unary {
-            d: 7,
-            op: Unary::Exp,
-            a: 6,
-        },
+        Flat::MulK { d: 6, a: 5, c: -1.0 },
+        Flat::Unary { d: 7, op: Unary::Exp, a: 6 },
         Flat::Deriv { state: 0, a: 7 },
     ];
     let two = DirMask::eta(0) | &DirMask::eta(1);
@@ -935,31 +794,14 @@ fn zero_tangent_chunk(live: bool) -> (ChunkProgram, Layout) {
         // `live`: the same zero tangent, but unknown to the folding (it computes the `-0`).
         (if live { DirMask::ALL } else { DirMask::NONE }, u16::MAX),
     ];
-    let layout = Layout {
-        n: 3,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
-    let cp = ChunkProgram {
-        code,
-        n_regs: 8,
-        spec,
-        n_in: 4,
-        compiled: Mutex::new(HashMap::new()),
-    };
+    let layout = Layout { n: 3, m: 0, th: false, wide: false, tan: 0 };
+    let cp = ChunkProgram { code, n_regs: 8, spec, n_in: 4, compiled: Mutex::new(HashMap::new()) };
     (cp, layout)
 }
 
 /// The inputs' lanes: values `v`, tangents of `a0`/`a2` along η₀, η₁ only, `a1` along all.
 fn zero_tangent_inputs(v: [f64; 4], l: usize) -> Vec<f64> {
-    let t = [
-        [0.0, 0.7, -0.4, 0.0],
-        [0.0, 0.3, 0.9, -0.5],
-        [0.0, -0.6, 0.2, 0.0],
-        [0.0; 4],
-    ];
+    let t = [[0.0, 0.7, -0.4, 0.0], [0.0, 0.3, 0.9, -0.5], [0.0, -0.6, 0.2, 0.0], [0.0; 4]];
     let mut base = vec![0.0; 5 * l];
     for i in 0..4 {
         base[i * l] = v[i];
@@ -1008,12 +850,7 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
             t.promote(quick, opt);
             let mut native = zero_tangent_inputs(v, l);
             unsafe {
-                t.call(
-                    native.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                    idx.as_ptr(),
-                    lits.as_ptr(),
-                )
+                t.call(native.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), lits.as_ptr())
             };
             for c in 0..l {
                 assert_eq!(
@@ -1061,25 +898,11 @@ fn the_reverse_tiers_agree_bit_for_bit_across_seeds() {
     let (mut b0, mut b1) = (zero_tangent_inputs(v, l), zero_tangent_inputs(v, l));
     let (mut a0, mut a1) = (init(), init());
     unsafe {
-        t.interpret(
-            b0.as_mut_ptr(),
-            a0.as_mut_ptr(),
-            idx.as_ptr(),
-            lits.as_ptr(),
-            seeds,
-            stride,
-        )
+        t.interpret(b0.as_mut_ptr(), a0.as_mut_ptr(), idx.as_ptr(), lits.as_ptr(), seeds, stride)
     };
     t.promote(true, "none");
     unsafe {
-        t.call_seeds(
-            b1.as_mut_ptr(),
-            a1.as_mut_ptr(),
-            stride,
-            seeds,
-            idx.as_ptr(),
-            lits.as_ptr(),
-        )
+        t.call_seeds(b1.as_mut_ptr(), a1.as_mut_ptr(), stride, seeds, idx.as_ptr(), lits.as_ptr())
     };
     assert!(a0[..4 * l].iter().any(|&x| x != 0.0), "a live adjoint");
     for k in 0..a0.len() {
@@ -1103,29 +926,15 @@ fn simd_chunk() -> (ChunkProgram, Layout) {
         Flat::LoadState { d: 2, i: 2 },
         Flat::Mul { d: 3, a: 0, b: 1 },
         Flat::Add { d: 4, a: 3, b: 2 },
-        Flat::Unary {
-            d: 5,
-            op: Unary::Sqrt,
-            a: 4,
-        },
+        Flat::Unary { d: 5, op: Unary::Sqrt, a: 4 },
         Flat::Sub { d: 6, a: 1, b: 0 },
         Flat::DivRaw { d: 7, a: 5, b: 6 },
-        Flat::Unary {
-            d: 8,
-            op: Unary::Abs,
-            a: 2,
-        },
+        Flat::Unary { d: 8, op: Unary::Abs, a: 2 },
         Flat::Mul { d: 9, a: 7, b: 8 },
         Flat::Deriv { state: 0, a: 9 },
         Flat::Deriv { state: 1, a: 7 },
     ];
-    let layout = Layout {
-        n: 3,
-        m: 6,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let layout = Layout { n: 3, m: 6, th: false, wide: false, tan: 0 };
     let cp = ChunkProgram {
         code,
         n_regs: 10,
@@ -1158,49 +967,29 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let lits = [0.0f64];
     // The forward.
     let t = cp.get(layout, Sweep::Forward).expect("a kernel");
-    let p = simd::packs(&t.f, l, false, 0).expect("the forward packs");
+    let p = simd::packs(&t.ir().unwrap(), l, false, 0).expect("the forward packs");
     let vec_ops = p
         .members
         .iter()
         .filter(|m| {
-            !matches!(
-                t.f.insts[m[0] as usize],
-                Inst::Load { .. } | Inst::Store { .. }
-            )
+            !matches!(t.ir().unwrap().insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. })
         })
         .count();
     assert!(vec_ops >= 20, "{vec_ops} vector operations");
     let mut interp = simd_inputs(l);
     unsafe {
-        t.interpret(
-            interp.as_mut_ptr(),
-            std::ptr::null_mut(),
-            idx.as_ptr(),
-            lits.as_ptr(),
-            1,
-            0,
-        )
+        t.interpret(interp.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), lits.as_ptr(), 1, 0)
     };
     t.promote(false, "speed");
     let mut native = simd_inputs(l);
-    unsafe {
-        t.call(
-            native.as_mut_ptr(),
-            std::ptr::null_mut(),
-            idx.as_ptr(),
-            lits.as_ptr(),
-        )
-    };
+    unsafe { t.call(native.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), lits.as_ptr()) };
     assert!(interp[3 * l..].iter().all(|x| x.is_finite()));
     for c in 3 * l..5 * l {
         assert_eq!(interp[c].to_bits(), native[c].to_bits(), "forward lane {c}");
     }
     // The reverse, several seeds at once.
     let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
-    assert!(
-        simd::packs(&t.f, l, true, t.prefix).is_some(),
-        "the reverse packs"
-    );
+    assert!(simd::packs(&t.ir().unwrap(), l, true, t.prefix).is_some(), "the reverse packs");
     let (seeds, stride) = (3, 5 * l);
     let init = || {
         let mut adj = vec![0.0; seeds * stride];
@@ -1214,25 +1003,11 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let (mut b0, mut b1) = (simd_inputs(l), simd_inputs(l));
     let (mut a0, mut a1) = (init(), init());
     unsafe {
-        t.interpret(
-            b0.as_mut_ptr(),
-            a0.as_mut_ptr(),
-            idx.as_ptr(),
-            lits.as_ptr(),
-            seeds,
-            stride,
-        )
+        t.interpret(b0.as_mut_ptr(), a0.as_mut_ptr(), idx.as_ptr(), lits.as_ptr(), seeds, stride)
     };
     t.promote(false, "speed");
     unsafe {
-        t.call_seeds(
-            b1.as_mut_ptr(),
-            a1.as_mut_ptr(),
-            stride,
-            seeds,
-            idx.as_ptr(),
-            lits.as_ptr(),
-        )
+        t.call_seeds(b1.as_mut_ptr(), a1.as_mut_ptr(), stride, seeds, idx.as_ptr(), lits.as_ptr())
     };
     assert!(a0.iter().all(|x| x.is_finite()));
     assert!(a0[..3 * l].iter().any(|&x| x != 0.0), "a live adjoint");
@@ -1255,11 +1030,7 @@ fn a_covariate_value_keys_a_plan_by_its_name() {
     let swapped = subject(&[("WT", 40.0), ("AGE", 70.0)]);
     // Same contents built in the other order: a different map, possibly a different iteration.
     let again = subject(&[("AGE", 40.0), ("WT", 70.0)]);
-    assert_ne!(
-        subject_desc(&a),
-        subject_desc(&swapped),
-        "a value belongs to its name"
-    );
+    assert_ne!(subject_desc(&a), subject_desc(&swapped), "a value belongs to its name");
     assert_eq!(
         subject_desc(&a),
         subject_desc(&again),
@@ -1320,13 +1091,7 @@ fn subject_fingerprints_tell_apart_rows_differing_in_two_values() {
         .collect();
     for (a, pa) in prints.iter().enumerate() {
         for (b, pb) in prints.iter().enumerate().skip(a + 1) {
-            assert_ne!(
-                pa,
-                pb,
-                "studies {} and {} share a fingerprint",
-                a + 1,
-                b + 1
-            );
+            assert_ne!(pa, pb, "studies {} and {} share a fingerprint", a + 1, b + 1);
         }
     }
 }
@@ -1351,13 +1116,7 @@ fn whole_number_covariate_values_key_apart() {
     assert!(descs.iter().all(|d| d.hash == 0), "the hashes all collide");
     for i in 0..descs.len() {
         for j in 0..i {
-            assert_ne!(
-                descs[i],
-                descs[j],
-                "levels {} and {} share a plan key",
-                i + 1,
-                j + 1
-            );
+            assert_ne!(descs[i], descs[j], "levels {} and {} share a plan key", i + 1, j + 1);
         }
     }
 }
@@ -1387,10 +1146,7 @@ fn a_model_keys_its_plans_by_identity_and_they_leave_with_it() {
         (k, m.plan_id.get(), &m as *const _ as usize)
     };
     // The first model is gone: its plans went with its identity.
-    assert!(
-        matches!(lookup(&k1), Lookup::Missing),
-        "a dropped model's plans are gone"
-    );
+    assert!(matches!(lookup(&k1), Lookup::Missing), "a dropped model's plans are gone");
     // Build several, some usually at the freed address; the identity differs either way, so the
     // key must.
     let mut keep = Vec::new();
@@ -1399,10 +1155,7 @@ fn a_model_keys_its_plans_by_identity_and_they_leave_with_it() {
         let same = &m as *const _ as usize == addr1;
         let k = SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0x1d_e171u64));
         assert_ne!(m.plan_id.get(), id1);
-        assert_ne!(
-            k, k1,
-            "a model at a freed address keys apart (same address: {same})"
-        );
+        assert_ne!(k, k1, "a model at a freed address keys apart (same address: {same})");
         keep.push(m);
     }
     assert_ne!(
@@ -1439,18 +1192,12 @@ fn colliding_keys_are_told_apart_by_their_content() {
     assert_eq!(bucket(&ka), bucket(&kb), "the stub puts both in one bucket");
     assert_ne!(ka, kb, "different data are different keys");
     add(&ka, square_plan());
-    assert!(
-        matches!(lookup(&kb), Lookup::Missing),
-        "b is not served a's plan"
-    );
+    assert!(matches!(lookup(&kb), Lookup::Missing), "b is not served a's plan");
     assert!(
         matches!(lookup(&key(&a.clone())), Lookup::Found(_)),
         "an equal subject at another address is"
     );
-    assert_ne!(
-        ka.clone().with_observed(&a),
-        ka.clone().with_observed(&a_dv)
-    );
+    assert_ne!(ka.clone().with_observed(&a), ka.clone().with_observed(&a_dv));
     let v = |x: u8| ka.clone().with_variant(Desc::of_value(&x));
     assert_ne!(v(1), v(2));
     assert_eq!(v(1), v(1));
@@ -1481,13 +1228,7 @@ fn resolved_kernels_are_shared_per_key_and_serve_past_the_slots() {
     let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
     let y = vec![et[0] * et[1] + et[0]];
     let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
-    let base = Layout {
-        n: 2,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let base = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     let plan = rec.plan(base, 2, 0).expect("plans");
     let mut shared = 0;
     for tan in 0..(RESOLVED_SLOTS as u8 + 4) {
@@ -1496,22 +1237,13 @@ fn resolved_kernels_are_shared_per_key_and_serve_past_the_slots() {
         let b = plan.fns(lay, Sweep::Forward).expect("resolves");
         assert_eq!(a.len(), b.len());
         if matches!(a, Fns::Shared(_)) {
-            assert!(
-                std::ptr::eq(a.as_ptr(), b.as_ptr()),
-                "tan {tan}: one resolution"
-            );
+            assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()), "tan {tan}: one resolution");
             shared += 1;
         } else {
-            assert!(
-                matches!(b, Fns::Own(_)),
-                "tan {tan}: past the slots, per call"
-            );
+            assert!(matches!(b, Fns::Own(_)), "tan {tan}: past the slots, per call");
         }
     }
-    assert_eq!(
-        shared, RESOLVED_SLOTS,
-        "the slots fill, in order, then stop"
-    );
+    assert_eq!(shared, RESOLVED_SLOTS, "the slots fill, in order, then stop");
 }
 
 // ---- the linear kernels' plan values are the native f64 path's bits (#2786) ---------------
@@ -1520,12 +1252,7 @@ fn k_expm<T: PkNum>(e: &[T], aug: bool, scale: f64) -> Vec<T> {
     let k = |c: f64| T::from_f64(c);
     let a = if aug {
         // The augmented generator of a one-state segment: [[-CL/V·Δ, b/c·Δ], [0, 0]].
-        [
-            -(k(0.31) * e[0].exp()) * k(scale),
-            k(0.7) * e[1].exp() * k(scale),
-            k(0.0),
-            k(0.0),
-        ]
+        [-(k(0.31) * e[0].exp()) * k(scale), k(0.7) * e[1].exp() * k(scale), k(0.0), k(0.0)]
     } else {
         [
             -(k(0.31) * e[0].exp()) * k(scale),
@@ -1570,11 +1297,7 @@ fn the_linear_kernels_plan_values_are_the_native_bits() {
             ));
         }
     }
-    cases.push((
-        "solve".into(),
-        Box::new(k_solve::<Tr>),
-        Box::new(k_solve::<f64>),
-    ));
+    cases.push(("solve".into(), Box::new(k_solve::<Tr>), Box::new(k_solve::<f64>)));
     let mut bad = Vec::new();
     for (name, f, g) in &cases {
         for eta in [[0.0, 0.0], [0.1, -0.05], [-0.2, 0.15], [0.3, 0.2]] {
@@ -1582,10 +1305,7 @@ fn the_linear_kernels_plan_values_are_the_native_bits() {
             let want = g(&eta);
             for (j, (a, b)) in got.iter().zip(&want).enumerate() {
                 if a[0].to_bits() != b.to_bits() {
-                    bad.push(format!(
-                        "{name} at {eta:?} out {j}: plan {} native {b}",
-                        a[0]
-                    ));
+                    bad.push(format!("{name} at {eta:?} out {j}: plan {} native {b}", a[0]));
                 }
             }
         }
@@ -1608,11 +1328,7 @@ fn every_dose_field_a_recording_reads_keys_the_plan() {
         s
     };
     let imp = |parent: usize, param_time: f64, gov_time: f64| {
-        Some(ImpliedDose {
-            parent,
-            param_time,
-            gov_time,
-        })
+        Some(ImpliedDose { parent, param_time, gov_time })
     };
     let with = |f: &dyn Fn(&mut DoseEvent)| {
         let mut s = base();
@@ -1664,18 +1380,12 @@ fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
     };
     let eta = [0.0, 0.0];
     keep(&a);
-    assert!(
-        b.adopt(owner, b.layout, &[], &eta).is_none(),
-        "another plan's forward is refused"
-    );
+    assert!(b.adopt(owner, b.layout, &[], &eta).is_none(), "another plan's forward is refused");
     assert!(
         a.adopt(owner, a.layout, &[], &eta).is_some(),
         "its own is adopted (the refusal above was the identity, not the inputs)"
     );
-    assert!(
-        a.adopt(owner, a.layout, &[], &eta).is_none(),
-        "and taken once"
-    );
+    assert!(a.adopt(owner, a.layout, &[], &eta).is_none(), "and taken once");
 }
 
 /// A dropped model leaves nothing behind in the process-wide caches (#2786 review): the
@@ -1689,9 +1399,8 @@ fn the_caches_shrink_when_a_model_drops() {
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let id = m.plan_id.get();
     // A structure no other test records, so the counts below are this model's alone.
-    let family = SubjectKey::new(&m, &subject, 1, 2)
-        .with_variant(Desc::of_value(&0xcac4_e5u64))
-        .family();
+    let family =
+        SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0xcac4_e5u64)).family();
     let rec = recorded(&family, || {
         let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
         let mut x = et[0];
@@ -1713,12 +1422,7 @@ fn the_caches_shrink_when_a_model_drops() {
         .expect("a chunk call");
     let mine = Arc::downgrade(&prog);
     let held_by_cache = |w: &std::sync::Weak<ChunkProgram>| {
-        chunk_cache()
-            .lock()
-            .unwrap()
-            .values()
-            .flatten()
-            .any(|o| o.ptr_eq(w))
+        chunk_cache().lock().unwrap().values().flatten().any(|o| o.ptr_eq(w))
     };
     assert!(held_by_cache(&mine), "the program is shared by structure");
     // Compile it, so there is native code to free.
@@ -1733,10 +1437,7 @@ fn the_caches_shrink_when_a_model_drops() {
     assert_eq!(templates_of(id), 0, "the dropped model's templates go");
     assert!(mine.upgrade().is_none(), "the program is freed");
     assert!(!held_by_cache(&mine), "no dead entry stays in the cache");
-    assert!(
-        KERNELS_FREED.with(std::cell::Cell::get) > freed0,
-        "its native code is freed with it"
-    );
+    assert!(KERNELS_FREED.with(std::cell::Cell::get) > freed0, "its native code is freed with it");
 }
 
 /// A bad mark is the subject's for every thread and every later caller, not for whichever
@@ -1753,17 +1454,11 @@ fn a_bad_mark_outlives_the_cached_plan_and_a_late_add() {
     add(&key, square_plan());
     assert!(matches!(lookup(&key), Lookup::Found(_)), "fixture: cached");
     mark_bad(&key, "forced");
-    assert!(
-        matches!(lookup(&key), Lookup::Bad),
-        "the thread that cached the plan sees the mark"
-    );
+    assert!(matches!(lookup(&key), Lookup::Bad), "the thread that cached the plan sees the mark");
     // A recording that was in flight when the mark landed serves its caller, and stores nothing.
     let served = add(&key, square_plan());
     assert_eq!(served.len(), 1, "the caller still has a plan to serve from");
-    assert!(
-        matches!(lookup(&key), Lookup::Bad),
-        "a late add leaves the mark"
-    );
+    assert!(matches!(lookup(&key), Lookup::Bad), "a late add leaves the mark");
     std::thread::scope(|s| {
         s.spawn(|| assert!(matches!(lookup(&key), Lookup::Bad), "another thread"))
             .join()
@@ -1781,10 +1476,7 @@ fn a_bad_mark_outlives_the_cached_plan_and_a_late_add() {
 fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let id = m.plan_id.get();
-    let (a, b) = (
-        vec![crate::types::Subject::default()],
-        vec![crate::types::Subject::default()],
-    );
+    let (a, b) = (vec![crate::types::Subject::default()], vec![crate::types::Subject::default()]);
     let guard_b = register(&m, &b);
     let scope_of =
         |s: &[crate::types::Subject]| registered(s.as_ptr() as usize).expect("registered").1;
@@ -1792,13 +1484,7 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
     let keep = |owner: usize, scope: u64| {
         kept_lock().insert(
             owner,
-            Kept {
-                plan: 0,
-                layout: l2(),
-                buf: vec![0.0; 4],
-                scope,
-                model: m.plan_id.get(),
-            },
+            Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope, model: m.plan_id.get() },
         );
     };
     keep(b.as_ptr() as usize, scope_b);
@@ -1808,9 +1494,8 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
         let scope_a = scope_of(&a);
         assert_ne!(scope_a, scope_b, "each fit has a scope of its own");
         // A structure no other test records, so the counts are this model's alone.
-        let family = SubjectKey::new(&m, &a[0], 1, 2)
-            .with_variant(Desc::of_value(&0xf17_0001u64))
-            .family();
+        let family =
+            SubjectKey::new(&m, &a[0], 1, 2).with_variant(Desc::of_value(&0xf17_0001u64)).family();
         assert_eq!(family.scope, scope_a, "the family belongs to the fit");
         let rec = recorded(&family, || {
             let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
@@ -1828,10 +1513,7 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
         drop(guard);
         assert_eq!(templates_of(id), 0, "round {round}: it left with the fit");
         assert_eq!(kept_in(scope_a), 0, "round {round}: so did its forward");
-        assert!(
-            lock_families().keys().all(|k| k.model != id),
-            "round {round}: and its family"
-        );
+        assert!(lock_families().keys().all(|k| k.model != id), "round {round}: and its family");
         // Another model dropping is not this fit's business.
         drop_model(u64::MAX);
         assert_eq!(kept_in(scope_b), 1, "round {round}: B keeps its own");
@@ -1848,16 +1530,7 @@ fn drop_model_clears_only_its_own_kept_forwards() {
     let (ma, mb) = (0x7a_0001u64, 0x7a_0002u64);
     let (oa, ob) = (0x7a_1001usize, 0x7a_1002usize);
     let put = |o: usize, model: u64| {
-        kept_lock().insert(
-            o,
-            Kept {
-                plan: 0,
-                layout: l2(),
-                buf: vec![0.0; 4],
-                scope: 0,
-                model,
-            },
-        );
+        kept_lock().insert(o, Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope: 0, model });
     };
     put(oa, ma);
     put(ob, mb);
@@ -1876,9 +1549,7 @@ fn drop_model_clears_only_its_own_kept_forwards() {
 #[test]
 fn a_poisoned_kept_table_does_not_panic_a_scope_drop() {
     let h = std::thread::spawn(|| {
-        let _g = kept_table()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = kept_table().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         panic!("poison the kept table");
     });
     assert!(h.join().is_err());
@@ -1923,10 +1594,7 @@ fn settling_a_failure_counts_a_point_declines_a_repelled_point_and_marks_a_model
     let k2 = key(&m2, 0x5e_0011);
     settle_failure(&k2, "unsupported", FailScope::Model);
     assert!(matches!(lookup(&k2), Lookup::Bad));
-    assert!(
-        model_bad(&key(&m2, 0x5e_0012)).is_some(),
-        "the model is bad"
-    );
+    assert!(model_bad(&key(&m2, 0x5e_0012)).is_some(), "the model is bad");
     assert!(model_bad(&k).is_none(), "another model is not");
 }
 
@@ -1954,10 +1622,7 @@ fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope
     begin();
     let _ = overflow();
     fail_here("run");
-    assert_eq!(
-        end(Some(vec![])).err().expect("fails").1,
-        FailScope::Repelled
-    );
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Repelled);
     begin();
     let _ = fine();
     fail_here("run");
@@ -1990,9 +1655,8 @@ fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope
 fn a_structure_other_than_the_template_is_recorded_afresh() {
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
-    let family = SubjectKey::new(&m, &subject, 1, 2)
-        .with_variant(Desc::of_value(&0x7e_4411u64))
-        .family();
+    let family =
+        SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0x7e_4411u64)).family();
     let chain = |n: usize| {
         move || {
             let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
@@ -2048,9 +1712,8 @@ fn a_structure_other_than_the_template_is_recorded_afresh() {
 fn an_unstable_family_releases_its_templates() {
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
-    let family = SubjectKey::new(&m, &subject, 1, 2)
-        .with_variant(Desc::of_value(&0x7e_4412u64))
-        .family();
+    let family =
+        SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0x7e_4412u64)).family();
     let owner = Some((family.scope, family.model));
     let kept = || {
         templates()
@@ -2079,10 +1742,7 @@ fn an_unstable_family_releases_its_templates() {
         u[k * l + 1 + k] = 1.0;
     }
     for n in 1..=20 {
-        let plan = recorded(&family, chain(n))
-            .expect("records")
-            .plan(l2(), 2, 0)
-            .expect("plans");
+        let plan = recorded(&family, chain(n)).expect("records").plan(l2(), 2, 0).expect("plans");
         let mut want = e0;
         for _ in 0..n {
             want = want * e1 + e0;
@@ -2094,14 +1754,8 @@ fn an_unstable_family_releases_its_templates() {
             assert_eq!(kept(), 1, "a family's first structure leaves a template");
         }
     }
-    let f = lock_families()
-        .get(&family)
-        .cloned()
-        .expect("the family is known");
-    assert_eq!(
-        f.misses, UNSTABLE_AFTER,
-        "replays stop once the family is unstable"
-    );
+    let f = lock_families().get(&family).cloned().expect("the family is known");
+    assert_eq!(f.misses, UNSTABLE_AFTER, "replays stop once the family is unstable");
     assert!(f.alts.is_empty(), "an unstable family replays nothing");
     assert_eq!(kept(), 0, "an unstable family's templates are released");
 }
@@ -2239,11 +1893,7 @@ fn a_non_affine_system_on_the_linear_method_is_integrated_by_the_plan() {
         p[k] += h;
         q[k] -= h;
         let fd = (f(p[0], p[1]) - f(q[0], q[1])) / (2.0 * h);
-        assert!(
-            (du[1 + k] - fd).abs() < 2e-5 * (1.0 + fd.abs()),
-            "∂{k}: {} vs FD {fd}",
-            du[1 + k]
-        );
+        assert!((du[1 + k] - fd).abs() < 2e-5 * (1.0 + fd.abs()), "∂{k}: {} vs FD {fd}", du[1 + k]);
     }
 }
 
@@ -2261,16 +1911,8 @@ fn the_tangent_of_tetragamma_is_pentagamma() {
     let rhs = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| f[0] = u[0].tetragamma();
     let (mut f, mut jac, mut ft) = (vec![Tr::k(0.0)], vec![Tr::k(0.0)], vec![Tr::k(0.0)]);
     jacobian(&rhs, &[u0], &[], Tr::k(0.0), &mut f, &mut jac, &mut ft);
-    close(
-        f[0].recorded(),
-        tetragamma(record_at),
-        "ψ″ at the recording point",
-    );
-    close(
-        jac[0].recorded(),
-        pentagamma(record_at),
-        "its tangent at the recording point",
-    );
+    close(f[0].recorded(), tetragamma(record_at), "ψ″ at the recording point");
+    close(jac[0].recorded(), pentagamma(record_at), "its tangent at the recording point");
     let rec = end(Some(vec![f[0].reg(), jac[0].reg()])).expect("records: the rule exists");
     let plan = rec.plan(l2(), 2, 0).expect("plans");
     let l = l2().lanes();
@@ -2281,11 +1923,7 @@ fn the_tangent_of_tetragamma_is_pentagamma() {
         let mut du = vec![0.0; 3 * l];
         plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
         close(du[0], tetragamma(x), &format!("ψ″({x}) from the plan"));
-        close(
-            du[l],
-            pentagamma(x),
-            &format!("its tangent at {x} from the plan"),
-        );
+        close(du[l], pentagamma(x), &format!("its tangent at {x} from the plan"));
     }
 }
 
@@ -2385,10 +2023,7 @@ fn every_native_plan_tier_probes_its_stack() {
     for (quick, opt) in [(true, "none"), (true, "speed"), (false, "speed")] {
         let isa = plan_isa(quick, opt).expect("a host target");
         let f = isa.flags();
-        assert!(
-            f.enable_probestack(),
-            "tier ({quick}, {opt}): no stack probes"
-        );
+        assert!(f.enable_probestack(), "tier ({quick}, {opt}): no stack probes");
         assert_eq!(
             f.probestack_strategy(),
             ProbestackStrategy::Inline,
@@ -2407,13 +2042,7 @@ fn every_native_plan_tier_probes_its_stack() {
 /// adjoints' tangents (or read the value lanes for them) shows on the second-order entries.
 #[test]
 fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
-    let l1 = Layout {
-        n: 2,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     const K: usize = 2;
     let lt = Layout { tan: K as u8, ..l1 };
     let (lb, l) = (l1.lanes(), lt.lanes());
@@ -2474,10 +2103,7 @@ fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
                     }
                 }
             }
-            assert!(
-                seen > 1e-3,
-                "{name}: the second derivatives vanish, testing nothing"
-            );
+            assert!(seen > 1e-3, "{name}: the second derivatives vanish, testing nothing");
         }
     }
 }
@@ -2502,17 +2128,10 @@ fn derivs_hessians_match_closed_forms_on_several_live_inputs() {
     let (a, b, c) = (x[0], x[1], x[2]);
     let (e2, e) = (c.exp(), (a * c).exp());
     let want_vals = [a * a * b + a * e2, e + b * b * b];
-    let want_grad = [
-        [2.0 * a * b + e2, a * a, a * e2],
-        [c * e, 3.0 * b * b, a * e],
-    ];
+    let want_grad = [[2.0 * a * b + e2, a * a, a * e2], [c * e, 3.0 * b * b, a * e]];
     // Row-major `[i][j]`, `∂²y/∂x_i∂x_j`.
     let want_hess = [
-        [
-            [2.0 * b, 2.0 * a, e2],
-            [2.0 * a, 0.0, 0.0],
-            [e2, 0.0, a * e2],
-        ],
+        [[2.0 * b, 2.0 * a, e2], [2.0 * a, 0.0, 0.0], [e2, 0.0, a * e2]],
         [
             [c * c * e, 0.0, e * (1.0 + a * c)],
             [0.0, 6.0 * b, 0.0],
@@ -2524,11 +2143,7 @@ fn derivs_hessians_match_closed_forms_on_several_live_inputs() {
         for i in 0..3 {
             close(grad[o][i], want_grad[o][i], &format!("∂y{o}/∂x{i}"));
             for j in 0..3 {
-                close(
-                    hess[o][i * 3 + j],
-                    want_hess[o][i][j],
-                    &format!("∂²y{o}/∂x{i}∂x{j}"),
-                );
+                close(hess[o][i * 3 + j], want_hess[o][i][j], &format!("∂²y{o}/∂x{i}∂x{j}"));
             }
         }
     }
@@ -2561,19 +2176,10 @@ fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
     t.put(ka, stamp(7), None, &a);
     t.put(kb, stamp(7), None, &b);
     let got = |t: &mut HotTable, k: &HotKey, g: usize| t.get(k, stamp(g), None);
-    assert!(
-        Arc::ptr_eq(&got(&mut t, &ka, 7).expect("a"), &a),
-        "subject a still held"
-    );
-    assert!(
-        Arc::ptr_eq(&got(&mut t, &kb, 7).expect("b"), &b),
-        "subject b held beside it"
-    );
+    assert!(Arc::ptr_eq(&got(&mut t, &ka, 7).expect("a"), &a), "subject a still held");
+    assert!(Arc::ptr_eq(&got(&mut t, &kb, 7).expect("b"), &b), "subject b held beside it");
     // A key that maps to a's slot evicts it, and is served as itself.
-    let kc = (1..)
-        .map(|s| key(s * 7919))
-        .find(|k| k.slot() == ka.slot() && *k != ka)
-        .unwrap();
+    let kc = (1..).map(|s| key(s * 7919)).find(|k| k.slot() == ka.slot() && *k != ka).unwrap();
     let c: Kernels = Arc::new(Variants::default());
     t.put(kc, stamp(7), None, &c);
     assert!(got(&mut t, &ka, 7).is_none(), "the collision evicted a");
@@ -2581,11 +2187,7 @@ fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
     // A put under a newer stamp releases what the old one filled.
     assert_eq!(Arc::weak_count(&b), 1, "fixture: the table holds b");
     t.put(kc, stamp(9), None, &c);
-    assert_eq!(
-        Arc::weak_count(&b),
-        0,
-        "the stale entry was dropped, not kept"
-    );
+    assert_eq!(Arc::weak_count(&b), 0, "the stale entry was dropped, not kept");
     assert!(got(&mut t, &kb, 7).is_none() && got(&mut t, &kb, 9).is_none());
 }
 
@@ -2611,21 +2213,13 @@ fn the_variants_of_one_subject_hold_different_hot_slots() {
     assert!(by(&|s| (key(s, 0, 2), key(s, 1, 2))) <= 4, "kind");
     assert!(by(&|s| (key(s, 0, 2), key(s, 0, 3))) <= 4, "n_in");
     let (a, b): (Kernels, Kernels) = (Arc::new(Variants::default()), Arc::new(Variants::default()));
-    let s = (0..)
-        .find(|&s| key(s, 0, 2).slot() != key(s, 1, 2).slot())
-        .unwrap();
+    let s = (0..).find(|&s| key(s, 0, 2).slot() != key(s, 1, 2).slot()).unwrap();
     let stamp = HotStamp { prints: 1, gen: 7 };
     let mut t = HotTable::default();
     t.put(key(s, 0, 2), stamp, None, &a);
     t.put(key(s, 1, 2), stamp, None, &b);
-    assert!(Arc::ptr_eq(
-        &t.get(&key(s, 0, 2), stamp, None).expect("a"),
-        &a
-    ));
-    assert!(Arc::ptr_eq(
-        &t.get(&key(s, 1, 2), stamp, None).expect("b"),
-        &b
-    ));
+    assert!(Arc::ptr_eq(&t.get(&key(s, 0, 2), stamp, None).expect("a"), &a));
+    assert!(Arc::ptr_eq(&t.get(&key(s, 1, 2), stamp, None).expect("b"), &b));
 }
 
 /// The table does not keep a dropped scope's plans alive: it holds the variants weakly, so
@@ -2634,29 +2228,15 @@ fn the_variants_of_one_subject_hold_different_hot_slots() {
 /// final `get` still serves the variants.
 #[test]
 fn the_hot_table_does_not_pin_released_variants() {
-    let key = HotKey {
-        model: 0x1000,
-        subject: 0x40_0000,
-        n: 1,
-        n_in: 2,
-        kind: 0,
-        class: 0,
-    };
+    let key = HotKey { model: 0x1000, subject: 0x40_0000, n: 1, n_in: 2, kind: 0, class: 0 };
     let stamp = HotStamp { prints: 1, gen: 7 };
     let a: Kernels = Arc::new(Variants::default());
     let mut t = HotTable::default();
     t.put(key, stamp, None, &a);
-    assert_eq!(
-        Arc::strong_count(&a),
-        1,
-        "the table holds no strong reference"
-    );
+    assert_eq!(Arc::strong_count(&a), 1, "the table holds no strong reference");
     assert!(t.get(&key, stamp, None).is_some(), "served while owned");
     drop(a);
-    assert!(
-        t.get(&key, stamp, None).is_none(),
-        "an entry whose variants were dropped misses"
-    );
+    assert!(t.get(&key, stamp, None).is_none(), "an entry whose variants were dropped misses");
 }
 
 /// A thread that only looks plans up (no put follows) lets go of a dropped scope's plans: a
@@ -2664,14 +2244,7 @@ fn the_hot_table_does_not_pin_released_variants() {
 /// the stamp. Mutation: drop `release_stale` from `get` → the `weak_count` rows fail.
 #[test]
 fn the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get() {
-    let key = HotKey {
-        model: 0x1000,
-        subject: 0x40_0000,
-        n: 1,
-        n_in: 2,
-        kind: 0,
-        class: 0,
-    };
+    let key = HotKey { model: 0x1000, subject: 0x40_0000, n: 1, n_in: 2, kind: 0, class: 0 };
     for (what, newer) in [
         ("generation", HotStamp { prints: 1, gen: 8 }),
         ("registry", HotStamp { prints: 2, gen: 7 }),
@@ -2700,19 +2273,8 @@ fn the_hot_table_compares_the_layout_structure() {
     let lay = |occ: Vec<u32>| StackedLayout::new(1, 1, &subject_with(occ));
     let (l_a, l_a2, l_b) = (lay(vec![1, 1, 2]), lay(vec![1, 1, 2]), lay(vec![1, 2, 2]));
     let desc = |l: &StackedLayout| Desc::of(|c| l.canon(c));
-    assert_ne!(
-        desc(&l_a).bytes(),
-        desc(&l_b).bytes(),
-        "fixture: layouts differ"
-    );
-    let key = HotKey {
-        model: 0x1000,
-        subject: 0x40_0000,
-        n: 1,
-        n_in: 2,
-        kind: 0,
-        class: 0,
-    };
+    assert_ne!(desc(&l_a).bytes(), desc(&l_b).bytes(), "fixture: layouts differ");
+    let key = HotKey { model: 0x1000, subject: 0x40_0000, n: 1, n_in: 2, kind: 0, class: 0 };
     let stamp = HotStamp { prints: 1, gen: 7 };
     let ks: Kernels = Arc::new(Variants::default());
     let mut t = HotTable::default();
@@ -2736,19 +2298,12 @@ fn the_hot_table_compares_the_layout_structure() {
 #[test]
 fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_scope() {
     use crate::sens::num::RecHooks;
-    let square = |v: &[Tr]| {
-        <Tr as RecHooks>::mat_mul(v, v, 1)
-            .flatten()
-            .expect("records")
-    };
+    let square = |v: &[Tr]| <Tr as RecHooks>::mat_mul(v, v, 1).flatten().expect("records");
     let repeat = |x: f64, count: f64| {
         begin();
         let (x0, n) = (Tr::eta(0, x), Tr::eta(1, count));
         let out = <Tr as RecHooks>::repeat(&[x0], n, &square);
-        assert_eq!(
-            matches!(out, Some(Some(_))),
-            x.abs() < 1e50 && count <= 64.0
-        );
+        assert_eq!(matches!(out, Some(Some(_))), x.abs() < 1e50 && count <= 64.0);
         end(Some(vec![]))
     };
     // The product: finite records, an overflow is repelled.
@@ -2759,17 +2314,11 @@ fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_
     begin();
     let x = Tr::eta(0, 1e200);
     assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_none());
-    assert_eq!(
-        end(Some(vec![])).err().expect("fails").1,
-        FailScope::Repelled
-    );
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Repelled);
     // The repeat: finite records, an overflowing iterate is repelled, a count out of range is
     // the point's.
     assert!(repeat(2.0, 3.0).is_ok(), "a finite repeat records");
-    assert_eq!(
-        repeat(1e100, 3.0).err().expect("fails").1,
-        FailScope::Repelled
-    );
+    assert_eq!(repeat(1e100, 3.0).err().expect("fails").1, FailScope::Repelled);
     assert_eq!(repeat(2.0, 100.0).err().expect("fails").1, FailScope::Point);
     // A body whose inner solve is singular at a later iterate (`x -> (x-1)²/(x-1)`, singular at
     // `x = 1`): a real failure of the point, not an overflow, so it stays the point's. Mutation:
@@ -2777,9 +2326,7 @@ fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_
     // body `None`) -> this row reads `Repelled`.
     let solve_body = |v: &[Tr]| {
         let q = v[0] - Tr::k(1.0);
-        <Tr as RecHooks>::mat_solve(&[q], &[q * q], 1)
-            .flatten()
-            .expect("records")
+        <Tr as RecHooks>::mat_solve(&[q], &[q * q], 1).flatten().expect("records")
     };
     begin();
     let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 3.0), &solve_body);
@@ -2803,13 +2350,7 @@ fn a_plans_kernels_keep_only_what_runs_them() {
     let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
     let y = (et[0] * et[1]).exp() + et[0] * et[0];
     let rec = end(Some(vec![y.reg()])).expect("records");
-    let l1 = Layout {
-        n: 2,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    };
+    let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     let plan = rec.plan(l1, 2, 0).expect("plans");
     let l = l1.lanes();
     let u = [0.3, 1.0, 0.0, 0.3, 0.0, 1.0];
@@ -2825,17 +2366,13 @@ fn a_plans_kernels_keep_only_what_runs_them() {
         let Call::Chunk { prog, .. } = c else {
             continue;
         };
-        assert_eq!(
-            prog.code.capacity(),
-            prog.code.len(),
-            "a chunk program's code"
-        );
+        assert_eq!(prog.code.capacity(), prog.code.len(), "a chunk program's code");
         for t in prog.compiled.lock().unwrap().values().flatten() {
             let what = if t.rev { "reverse" } else { "forward" };
-            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
+            assert!(t.ir().unwrap().live.is_empty(), "the {what} kernel keeps `live`");
             assert_eq!(
-                t.f.insts.capacity(),
-                t.f.insts.len(),
+                t.ir().unwrap().insts.capacity(),
+                t.ir().unwrap().insts.len(),
                 "the {what} kernel's instructions"
             );
             seen[t.rev as usize] += 1;
@@ -2858,10 +2395,7 @@ fn an_unkept_forward_writes_what_the_kept_one_does() {
     let c = th[1] * a + th[0];
     let rec = end(Some(vec![c.reg()])).expect("records");
     let plan = rec.plan(Layout::F64, 0, 2).expect("plans");
-    let layout = Layout {
-        tan: 2,
-        ..Layout::F64
-    };
+    let layout = Layout { tan: 2, ..Layout::F64 };
     let l = layout.lanes();
     for (theta, held) in [([2.0_f64, 1.5], true), ([0.5, 1.5], false)] {
         let mut p = vec![0.0; 2 * l];
@@ -2870,9 +2404,7 @@ fn an_unkept_forward_writes_what_the_kept_one_does() {
             p[j * l + 1 + j] = 1.0;
         }
         let (mut kept, mut unkept) = (vec![0.0; 2 * l], vec![0.0; 2 * l]);
-        let f = plan
-            .forward_layout(layout, &[], &p, &mut kept)
-            .expect("runs");
+        let f = plan.forward_layout(layout, &[], &p, &mut kept).expect("runs");
         assert_eq!(plan.kept_guard(&f), held);
         assert_eq!(
             plan.forward_unkept(layout, &[], &p, &mut unkept),
@@ -2886,6 +2418,153 @@ fn an_unkept_forward_writes_what_the_kept_one_does() {
             close(unkept[0], t1 * t0 * t0 + t0, "value");
             close(unkept[1], 2.0 * t0 * t1 + 1.0, "∂/∂θ₀");
             close(unkept[2], t0 * t0, "∂/∂θ₁");
+        }
+    }
+}
+
+/// #3060: a residual covariance `R` of pairs (`correlation cs(RHO) by PAIR`, `n/2` blocks of
+/// 2) factored and solved on a recording. The dense factorisation records superlinearly many
+/// instructions (here 618 at 16 rows, 2018 at 32: every structural zero below a pivot is a
+/// division, and every product with it a node or a zero-fold guard) — which made the outer
+/// gradient's kernel of a subject with 84 observations take gigabytes and seconds to
+/// compile; the blocked one records `O(n)`. The probe is checked to see the dense growth, so
+/// a blocked factorisation that went back to the dense loops would fail the linear bound.
+#[test]
+fn blocked_cholesky_records_linear_in_the_rows() {
+    use crate::sens::focei_kernel::{chol, chol_blocks, chol_solve, chol_solve_blocks};
+    use crate::stats::residual_error::RBlocks;
+    let count = |n: usize, blocked: bool| -> usize {
+        begin();
+        let x = Tr::eta(0, 0.3);
+        let group: Vec<usize> = (0..n).map(|j| j / 2).collect();
+        let a: Vec<Vec<Tr>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match (i == j, group[i] == group[j]) {
+                        (true, _) => x + Tr::from_f64(2.0),
+                        (false, true) => x * Tr::from_f64(0.5),
+                        (false, false) => Tr::from_f64(0.0),
+                    })
+                    .collect()
+            })
+            .collect();
+        let rhs: Vec<Tr> = (0..n).map(|j| x * Tr::from_f64(1.0 + j as f64)).collect();
+        let z = if blocked {
+            let blk = RBlocks::from_groups(&group);
+            chol_solve_blocks(&chol_blocks(&a, &blk).expect("factors"), &rhs, &blk)
+        } else {
+            chol_solve(&chol(&a).expect("factors"), &rhs)
+        };
+        let s = z.into_iter().fold(Tr::from_f64(0.0), |acc, v| acc + v);
+        end(Some(vec![s.reg()])).expect("records").code.len()
+    };
+    let (d16, d32) = (count(16, false), count(32, false));
+    assert!(d32 > 3 * d16, "the probe sees the dense growth: {d16} → {d32}");
+    let (b16, b32, b64) = (count(16, true), count(32, true), count(64, true));
+    assert!(b32 <= 2 * b16 + 8 && b64 <= 2 * b32 + 8, "blocked: {b16} → {b32} → {b64}");
+}
+
+/// `f`'s plan's reverses at `eta`, as their adjoints' bits: per output, the first-order reverse
+/// from a first-order forward and from a second-order one (a prefix layout: the reverse reads
+/// the leading lanes of a wider log), then the rows forward-over-reverse along both η
+/// (`run_loop_rows`/`run_loop_rev_rows`) where the plan serves it. Also the loop logs' bytes,
+/// kept and as the full log would have held them.
+fn reverse_bits(plan: &Plan, n_out: usize, eta: [f64; 2]) -> (Vec<u64>, usize, usize, bool) {
+    let mut bits = Vec::new();
+    let mut bytes = (0, 0);
+    for lay in [Layout { n: 2, m: 0, th: false, wide: false, tan: 0 }, l2()] {
+        let l = lay.lanes();
+        let mut u = vec![0.0; 2 * l];
+        for k in 0..2 {
+            u[k * l] = eta[k];
+            u[k * l + 1 + k] = 1.0;
+        }
+        let fwd = plan.forward_kept(lay, &u, &[]).expect("runs");
+        for lg in &fwd.logs {
+            if let CallLog::Ode(lg) = lg {
+                bytes.0 += lg.bytes();
+                bytes.1 += lg.full_bytes();
+            }
+        }
+        let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
+        let lr = l1.lanes();
+        for j in 0..n_out {
+            let mut du_bar = vec![0.0; n_out * lr];
+            du_bar[j * lr] = 1.0;
+            du_bar[j * lr + 1] = 0.5;
+            let mut ub = vec![0.0; 2 * lr];
+            assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar), "reverses");
+            assert!(ub.iter().all(|x| x.is_finite()), "finite adjoints");
+            bits.extend(ub.iter().map(|x| x.to_bits()));
+        }
+    }
+    let rows = plan.rows_serve(Layout::F64);
+    if rows {
+        let tu = [1.0, 0.0, 0.0, 1.0];
+        let rf = plan.forward_rows(Layout::F64, &eta, &[], &tu, 2).expect("rows run");
+        let du: Vec<f64> = (0..n_out).map(|j| 1.0 - 0.1 * j as f64).collect();
+        let dut: Vec<f64> = (0..2 * n_out).map(|j| 0.3 + 0.05 * j as f64).collect();
+        let (mut ub, mut ut) = (vec![0.0; 2], vec![0.0; 4]);
+        assert!(plan.reverse_rows(&rf, &du, Some(&dut), &mut ub, &mut [], &mut ut, &mut []));
+        assert!(ub.iter().chain(&ut).all(|x| x.is_finite()), "finite rows adjoints");
+        bits.extend(ub.iter().chain(&ut).map(|x| x.to_bits()));
+    }
+    (bits, bytes.0, bytes.1, rows)
+}
+
+/// #3078: a loop call's log keeps a checkpoint — the lanes a step's bodies read that no body of
+/// the step wrote — instead of every body's inputs, and the reverse regenerates the inputs by
+/// running the step forward again. The reverse must be the full log's **bit for bit**: on every
+/// stepper family (explicit RK45 and Vern7, the Rosenbrock pair carrying a Jacobian), from a
+/// first-order forward, from a second-order one whose leading lanes the reverse reads, and
+/// through the rows forward-over-reverse; and each replayed body input a body reads equals the
+/// forward's, bit for bit (asserted inside every replay of a test build, so the whole suite
+/// checks it). The memory it buys, measured on this two-state fixture, is printed and bounded.
+///
+/// Mutations: the rewind of a rejected step keeping `known` (a slot it wrote is then never
+/// saved), and the clock not restored before a replayed body — each fails the replay's bitwise
+/// check here. (A jump's state copy left out of the replay fails the switch fixture of
+/// `checkpointed_loop_logs_give_the_full_logs_derivatives_bit_for_bit`; this fixture has no
+/// switch.)
+#[test]
+fn a_checkpointed_ode_log_reverses_bit_for_bit_like_the_full_log() {
+    use crate::ode::solver::OdeMethod;
+    use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
+    for method in [OdeMethod::Rk45, OdeMethod::Vern7, OdeMethod::Rosenbrock23, OdeMethod::Rodas5P] {
+        let f = case_ode_interp(method);
+        begin();
+        let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [0.1, -0.2][k])).collect();
+        let y = f(&et);
+        let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
+        let plan = rec.plan(l2(), 2, 0).expect("plans");
+        for eta in [[0.15, -0.1], [0.9, 0.6]] {
+            REPLAYED.with(|c| c.set(0));
+            let (got, kept, full, rows) = reverse_bits(&plan, y.len(), eta);
+            let replayed = REPLAYED.with(std::cell::Cell::get);
+            REPLAY_FROM_FULL.with(|c| c.set(true));
+            let (want, ..) = reverse_bits(&plan, y.len(), eta);
+            REPLAY_FROM_FULL.with(|c| c.set(false));
+            eprintln!(
+                "{method:?} at {eta:?}: log {kept} B vs {full} B full ({:.1}×), {replayed} \
+                 bodies replayed, rows {rows}",
+                full as f64 / kept as f64
+            );
+            assert!(replayed > 0, "{method:?}: the reverse replayed no body");
+            assert!(rows, "{method:?}: the rows path must be exercised");
+            assert_eq!(got.len(), want.len());
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    a,
+                    b,
+                    "{method:?} at {eta:?}: adjoint {i}: {} vs {} from the full log",
+                    f64::from_bits(*a),
+                    f64::from_bits(*b)
+                );
+            }
+            assert!(
+                kept < full,
+                "{method:?}: the checkpoint ({kept} B) is no smaller than {full} B"
+            );
         }
     }
 }

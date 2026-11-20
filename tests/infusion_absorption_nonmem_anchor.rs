@@ -71,32 +71,19 @@ fn predict_matches_nonmem_infusion_into_first_order_absorption() {
     let population = read_nonmem_csv(std::path::Path::new("data/inf_first_order.csv"), None, None)
         .expect("dataset loads");
     assert!(
-        population
-            .subjects
-            .iter()
-            .any(|s| s.doses.iter().any(|d| d.is_infusion())),
+        population.subjects.iter().any(|s| s.doses.iter().any(|d| d.is_infusion())),
         "dataset should contain an infusion (RATE>0) dose"
     );
 
     let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time.
-    let nonmem: &[(f64, f64)] = &[
-        (1.0, 0.30468),
-        (2.0, 1.0071),
-        (4.0, 2.8772),
-        (6.0, 3.8508),
-        (10.0, 3.6059),
-    ];
+    let nonmem: &[(f64, f64)] =
+        &[(1.0, 0.30468), (2.0, 1.0071), (4.0, 2.8772), (6.0, 3.8508), (10.0, 3.6059)];
     assert_eq!(preds.len(), nonmem.len());
 
     for (p, &(t, expected)) in preds.iter().zip(nonmem) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "prediction time {} != expected {}",
-            p.time,
-            t
-        );
+        assert!((p.time - t).abs() < 1e-9, "prediction time {} != expected {}", p.time, t);
         let rel = (p.pred - expected).abs() / expected;
         assert!(
             rel < 1e-4,
@@ -140,18 +127,12 @@ fn gated_engines_match_nonmem_infusion_into_first_order_absorption() {
         "dataset should contain an infusion (RATE>0) dose"
     );
 
-    let ode = model
-        .ode_spec
-        .as_ref()
-        .expect("model compiles to an ODE spec");
+    let ode = model.ode_spec.as_ref().expect("model compiles to an ODE spec");
     let theta = &model.default_params.theta;
     let eta = [0.0_f64]; // population prediction, matching the `predict()` anchor above
     let pk = (model.pk_param_fn)(theta, &eta, &subject.covariates, 0.0);
     let v = pk.values[ferx_core::PK_IDX_V];
-    assert!(
-        v > 0.0,
-        "V must be positive to form the concentration readout"
-    );
+    assert!(v > 0.0, "V must be positive to form the concentration readout");
 
     let (with_states_pred, _states) =
         ferx_core::ode::ode_predictions_with_states(ode, &pk.values, theta, &eta, subject);
@@ -165,13 +146,8 @@ fn gated_engines_match_nonmem_infusion_into_first_order_absorption() {
     );
 
     // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time — the same table as above.
-    let nonmem: &[(f64, f64)] = &[
-        (1.0, 0.30468),
-        (2.0, 1.0071),
-        (4.0, 2.8772),
-        (6.0, 3.8508),
-        (10.0, 3.6059),
-    ];
+    let nonmem: &[(f64, f64)] =
+        &[(1.0, 0.30468), (2.0, 1.0071), (4.0, 2.8772), (6.0, 3.8508), (10.0, 3.6059)];
     assert_eq!(subject.obs_times.len(), nonmem.len());
     assert_eq!(with_states_pred.len(), nonmem.len());
     assert_eq!(dense.len(), nonmem.len());
@@ -224,9 +200,6 @@ fn fit_on_infusion_absorption_runs() {
     let truth = [1.0_f64, 20.0, 0.6];
     for (est, tv) in result.theta.iter().zip(truth) {
         let rel = (est - tv).abs() / tv;
-        assert!(
-            rel < 0.3,
-            "infusion fit drifted a theta: got {est:.4}, truth {tv} (rel {rel:.2})"
-        );
+        assert!(rel < 0.3, "infusion fit drifted a theta: got {est:.4}, truth {tv} (rel {rel:.2})");
     }
 }

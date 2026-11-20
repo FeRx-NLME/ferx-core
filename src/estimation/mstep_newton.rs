@@ -34,9 +34,7 @@ pub(crate) struct ValueGradInfo {
 /// result's is empty. The value and gradient fold is SAEM's [`fold_nll_grad`], the one
 /// subject-ordered reduction of the numerical M-steps (#703).
 pub(crate) fn fold_value_grad_info(
-    per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)>,
-    n: usize,
-    want_info: bool,
+    per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)>, n: usize, want_info: bool,
 ) -> Option<ValueGradInfo> {
     let mut info = vec![0.0; if want_info { n * n } else { 0 }];
     let mut pairs = Vec::with_capacity(per_subj.len());
@@ -104,11 +102,7 @@ fn cholesky_solve(a: &[f64], m: usize, ridge: f64, rhs: &[f64]) -> Option<Vec<f6
         mat[(i, i)] += ridge;
     }
     let chol = Cholesky::new(mat)?;
-    Some(
-        chol.solve(&DVector::from_column_slice(rhs))
-            .as_slice()
-            .to_vec(),
-    )
+    Some(chol.solve(&DVector::from_column_slice(rhs)).as_slice().to_vec())
 }
 
 #[cfg(test)]
@@ -189,12 +183,7 @@ pub(crate) enum NewtonOutcome {
 /// smallest ridge that does — predicts a decrease inside `ftol_rel`, and an accepted step that
 /// was damped never ends the solve on its own small decrease.
 pub(crate) fn fisher_scoring<V, F>(
-    x: &mut [f64],
-    lower: &[f64],
-    upper: &[f64],
-    maxeval: u32,
-    ftol_rel: f64,
-    mut value: V,
+    x: &mut [f64], lower: &[f64], upper: &[f64], maxeval: u32, ftol_rel: f64, mut value: V,
     mut fused: F,
 ) -> (NewtonOutcome, u32)
 where
@@ -249,10 +238,7 @@ where
                 a[p * m + q] = cur.info[i * n + j];
             }
         }
-        let max_diag = (0..m)
-            .map(|p| a[p * m + p])
-            .fold(0.0f64, f64::max)
-            .max(f64::MIN_POSITIVE);
+        let max_diag = (0..m).map(|p| a[p * m + p]).fold(0.0f64, f64::max).max(f64::MIN_POSITIVE);
         let neg_g: Vec<f64> = g.iter().map(|v| -v).collect();
         // The decrease the quadratic model predicts for the undamped step, ½ gᵀA⁻¹g (at the
         // smallest ridge that factors, where A does not), against the tolerance: below it the
@@ -332,11 +318,7 @@ where
             stalled = true;
             break;
         }
-        ridge = if ridge * 0.1 < RIDGE_FLOOR {
-            0.0
-        } else {
-            ridge * 0.1
-        };
+        ridge = if ridge * 0.1 < RIDGE_FLOOR { 0.0 } else { ridge * 0.1 };
         let decrease = cur.val - v;
         stepped = true;
         x.copy_from_slice(&trial);
@@ -439,13 +421,7 @@ pub(crate) struct NewtonSolve {
 /// `tally`: the one place SAEM's and IMP/IMPMAP's solves share.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn newton_solve<V, F>(
-    x: &mut [f64],
-    lower: &[f64],
-    upper: &[f64],
-    maxeval: u32,
-    ftol_rel: f64,
-    value: V,
-    fused: F,
+    x: &mut [f64], lower: &[f64], upper: &[f64], maxeval: u32, ftol_rel: f64, value: V, fused: F,
     tally: Option<&NewtonTally>,
 ) -> NewtonSolve
 where
@@ -463,10 +439,7 @@ where
             t.stalled.set(t.stalled.get() + 1);
         }
     }
-    NewtonSolve {
-        converged: outcome == NewtonOutcome::Converged,
-        evals,
-    }
+    NewtonSolve { converged: outcome == NewtonOutcome::Converged, evals }
 }
 
 #[cfg(test)]
@@ -480,11 +453,7 @@ mod tests {
         let ts = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0];
         let truth = (2.0f64, -0.7f64);
         let (a, b) = (x[0], x[1]);
-        let mut out = ValueGradInfo {
-            val: 0.0,
-            grad: vec![0.0; 2],
-            info: vec![0.0; 4],
-        };
+        let mut out = ValueGradInfo { val: 0.0, grad: vec![0.0; 2], info: vec![0.0; 4] };
         for t in ts {
             let y = truth.0 * (truth.1 * t).exp();
             let f = a * (b * t).exp();
@@ -503,12 +472,7 @@ mod tests {
 
     /// Run the solver, counting evaluations of either kind.
     fn solve<F>(
-        x: &mut [f64],
-        lo: &[f64],
-        hi: &[f64],
-        maxeval: u32,
-        ftol: f64,
-        f: F,
+        x: &mut [f64], lo: &[f64], hi: &[f64], maxeval: u32, ftol: f64, f: F,
     ) -> (NewtonOutcome, u32)
     where
         F: Fn(&[f64]) -> Option<ValueGradInfo>,
@@ -529,11 +493,7 @@ mod tests {
                 f(v)
             },
         );
-        assert_eq!(
-            evals,
-            calls.get(),
-            "the evaluations reported are the passes made"
-        );
+        assert_eq!(evals, calls.get(), "the evaluations reported are the passes made");
         (ok, calls.get())
     }
 
@@ -542,10 +502,7 @@ mod tests {
         let mut x = [1.5, -0.4];
         let (solved, calls) = solve(&mut x, &[-9.0; 2], &[9.0; 2], 100, 1e-12, exp_fit);
         assert_eq!(solved, Converged);
-        assert!(
-            (x[0] - 2.0).abs() < 1e-5 && (x[1] + 0.7).abs() < 1e-5,
-            "{x:?}"
-        );
+        assert!((x[0] - 2.0).abs() < 1e-5 && (x[1] + 0.7).abs() < 1e-5, "{x:?}");
         assert!(calls < 30, "{calls} passes");
     }
 
@@ -553,17 +510,11 @@ mod tests {
     fn fisher_scoring_respects_bounds_and_pinned_coordinates() {
         // Optimum a = 2 lies above the bound 1.8: the solve stops on the bound, b free.
         let mut x = [1.5, -0.4];
-        assert_eq!(
-            solve(&mut x, &[-9.0, -9.0], &[1.8, 9.0], 100, 1e-12, exp_fit).0,
-            Converged
-        );
+        assert_eq!(solve(&mut x, &[-9.0, -9.0], &[1.8, 9.0], 100, 1e-12, exp_fit).0, Converged);
         assert_eq!(x[0], 1.8);
         // A pinned coordinate never moves.
         let mut y = [1.5, -0.4];
-        assert_eq!(
-            solve(&mut y, &[1.5, -9.0], &[1.5, 9.0], 100, 1e-12, exp_fit).0,
-            Converged
-        );
+        assert_eq!(solve(&mut y, &[1.5, -9.0], &[1.5, 9.0], 100, 1e-12, exp_fit).0, Converged);
         assert_eq!(y[0], 1.5);
         assert!(y[1] != -0.4);
     }
@@ -599,18 +550,10 @@ mod tests {
         assert_eq!(x, [1.5, -0.4]);
         // The same flat information at a finite value *is* converged: the sentinel is the
         // discriminator, not the zero gradient.
-        let flat = |_: &[f64]| {
-            Some(ValueGradInfo {
-                val: 5.0,
-                grad: vec![0.0; 2],
-                info: vec![0.0; 4],
-            })
-        };
+        let flat =
+            |_: &[f64]| Some(ValueGradInfo { val: 5.0, grad: vec![0.0; 2], info: vec![0.0; 4] });
         let mut y = [1.5, -0.4];
-        assert_eq!(
-            solve(&mut y, &[-9.0; 2], &[9.0; 2], 100, 1e-9, flat).0,
-            Converged
-        );
+        assert_eq!(solve(&mut y, &[-9.0; 2], &[9.0; 2], 100, 1e-9, flat).0, Converged);
     }
 
     /// The tolerance has an absolute floor: where the objective is near zero a purely relative
@@ -639,11 +582,7 @@ mod tests {
         // The threshold itself: NLopt's `relstop` with `ftol_abs = ftol_rel`.
         assert_eq!(ftol_threshold(1e-7, 0.0, 0.0), 1e-7);
         assert_eq!(ftol_threshold(1e-7, 4e3, 2e3), 1e-7 * 3e3);
-        assert_eq!(
-            ftol_threshold(1e-7, -4e3, 2e3),
-            1e-7 * 3e3,
-            "across zero: sizes, not signs"
-        );
+        assert_eq!(ftol_threshold(1e-7, -4e3, 2e3), 1e-7 * 3e3, "across zero: sizes, not signs");
     }
 
     /// A start the objective has not vouched for is not converged on the model's word alone.
@@ -669,11 +608,7 @@ mod tests {
         assert!((x[0] - 3.0).abs() < 1e-12, "the step was taken: {x:?}");
         let mut at = [3.0];
         let (out, calls) = solve(&mut at, &[-9.0], &[9.0], 100, 1e-7, plateau);
-        assert_eq!(
-            (out, calls, at),
-            (Converged, 1, [3.0]),
-            "stationary: nothing to confirm"
-        );
+        assert_eq!((out, calls, at), (Converged, 1, [3.0]), "stationary: nothing to confirm");
         // The objective disagrees with the model: the step is uphill, the solve stays put.
         let mut y = [2.9];
         let (out, calls) = fisher_scoring(
@@ -683,13 +618,7 @@ mod tests {
             100,
             1e-7,
             |v| 1e13 + 1.0 + (v[0] - 2.9).abs(),
-            |_| {
-                Some(ValueGradInfo {
-                    val: 1e13,
-                    grad: vec![1e-3],
-                    info: vec![1.0],
-                })
-            },
+            |_| Some(ValueGradInfo { val: 1e13, grad: vec![1e-3], info: vec![1.0] }),
         );
         assert_eq!((out, calls, y), (Converged, 2, [2.9]));
     }
@@ -730,11 +659,7 @@ mod tests {
         // brings it back to a decrease.
         let mut x = [10.0];
         let (solved, _) = solve(&mut x, &[-1e3], &[1e3], 200, 1e-12, |v| {
-            Some(ValueGradInfo {
-                val: 0.5 * v[0] * v[0],
-                grad: vec![v[0]],
-                info: vec![0.01],
-            })
+            Some(ValueGradInfo { val: 0.5 * v[0] * v[0], grad: vec![v[0]], info: vec![0.01] })
         });
         assert!(solved == Converged && x[0].abs() < 1e-3, "{x:?}");
     }
@@ -750,10 +675,7 @@ mod tests {
                 info: vec![1.0, 0.0, 0.0, 0.0],
             })
         });
-        assert!(
-            solved == Converged && x[0].abs() < 1e-6 && x[1].abs() < 1.0,
-            "{x:?}"
-        );
+        assert!(solved == Converged && x[0].abs() < 1e-6 && x[1].abs() < 1.0, "{x:?}");
     }
 
     /// A solve that cannot take a step it has not converged for is `Stalled`, never `Converged`,
@@ -813,29 +735,14 @@ mod tests {
     #[test]
     fn a_solve_that_reached_a_stopping_rule_is_converged() {
         let mut at_opt = [2.0, -0.7];
-        assert_eq!(
-            solve(&mut at_opt, &[-9.0; 2], &[9.0; 2], 100, 1e-7, exp_fit).0,
-            Converged
-        );
+        assert_eq!(solve(&mut at_opt, &[-9.0; 2], &[9.0; 2], 100, 1e-7, exp_fit).0, Converged);
         // Held at the lower bound with the gradient pushing outward: no free coordinate.
         let mut held = [1.0];
-        let up = |v: &[f64]| {
-            Some(ValueGradInfo {
-                val: v[0],
-                grad: vec![1.0],
-                info: vec![1.0],
-            })
-        };
-        assert_eq!(
-            solve(&mut held, &[1.0], &[9.0], 100, 1e-12, up).0,
-            Converged
-        );
+        let up = |v: &[f64]| Some(ValueGradInfo { val: v[0], grad: vec![1.0], info: vec![1.0] });
+        assert_eq!(solve(&mut held, &[1.0], &[9.0], 100, 1e-12, up).0, Converged);
         assert_eq!(held, [1.0]);
         let mut budget = [1.5, -0.4];
-        assert_eq!(
-            solve(&mut budget, &[-9.0; 2], &[9.0; 2], 3, 1e-15, exp_fit).0,
-            Converged
-        );
+        assert_eq!(solve(&mut budget, &[-9.0; 2], &[9.0; 2], 3, 1e-15, exp_fit).0, Converged);
     }
 
     /// `f = 1 + ½ a (x - x*)²` with an information `κ` that understates the curvature `a`: the
@@ -862,10 +769,7 @@ mod tests {
         let mut x = [0.0316];
         let (out, _) = solve(&mut x, &[-9.0], &[9.0], 1000, 1e-4, f);
         assert_eq!(out, Converged);
-        assert!(
-            x[0].abs() < 1e-4,
-            "stopped at {x:?}, a point still worth a pass"
-        );
+        assert!(x[0].abs() < 1e-4, "stopped at {x:?}, a point still worth a pass");
         // Non-vacuity: it did take the damped steps (the start was 316x further out).
         assert!(x[0].abs() < 0.0316 / 10.0, "{x:?}");
     }
@@ -896,10 +800,7 @@ mod tests {
             &f,
         );
         assert_eq!(out, Converged);
-        assert!(
-            rejected.get() > 13,
-            "the damped step was taken and not the last"
-        );
+        assert!(rejected.get() > 13, "the damped step was taken and not the last");
         assert!(x[0].abs() < 0.05, "stopped at {x:?}, far from converged");
     }
 
@@ -981,10 +882,7 @@ mod tests {
         };
         assert!(!run(2.9, &nan_info).converged);
         let w = tally.warning("IMP").unwrap();
-        assert!(
-            w.contains("2 of 3") && w.contains("1 lost the expected information"),
-            "{w}"
-        );
+        assert!(w.contains("2 of 3") && w.contains("1 lost the expected information"), "{w}");
         assert!(w.contains("1 found no admissible damped step"), "{w}");
     }
 
@@ -995,24 +893,11 @@ mod tests {
     #[test]
     fn the_tally_names_a_non_finite_start_apart_from_a_declined_recording() {
         let sentinel = |_: &[f64]| {
-            Some(ValueGradInfo {
-                val: SUBJECT_SENTINEL_NLL,
-                grad: vec![0.0],
-                info: vec![1.0],
-            })
+            Some(ValueGradInfo { val: SUBJECT_SENTINEL_NLL, grad: vec![0.0], info: vec![1.0] })
         };
         let run = |tally: &NewtonTally, fused: &dyn Fn(&[f64]) -> Option<ValueGradInfo>| {
             let mut x = [2.9];
-            let s = newton_solve(
-                &mut x,
-                &[-9.0],
-                &[9.0],
-                100,
-                1e-12,
-                |_| 1.0,
-                fused,
-                Some(tally),
-            );
+            let s = newton_solve(&mut x, &[-9.0], &[9.0], 100, 1e-12, |_| 1.0, fused, Some(tally));
             assert!(!s.converged);
             assert_eq!(x, [2.9], "nothing was solved");
         };
@@ -1047,22 +932,11 @@ mod tests {
     #[test]
     fn a_clamped_step_that_is_not_a_descent_direction_is_not_accepted() {
         let fused = |_: &[f64]| {
-            Some(ValueGradInfo {
-                val: 10.0,
-                grad: vec![1.0, 0.5],
-                info: vec![1.0, 0.9, 0.9, 1.0],
-            })
+            Some(ValueGradInfo { val: 10.0, grad: vec![1.0, 0.5], info: vec![1.0, 0.9, 0.9, 1.0] })
         };
         let mut x = [0.1, 0.0];
-        let (out, _) = fisher_scoring(
-            &mut x,
-            &[0.0, -9.0],
-            &[9.0, 9.0],
-            200,
-            1e-9,
-            |_| 10.0 + 5e-5,
-            fused,
-        );
+        let (out, _) =
+            fisher_scoring(&mut x, &[0.0, -9.0], &[9.0, 9.0], 200, 1e-9, |_| 10.0 + 5e-5, fused);
         assert_eq!((out, x), (Stalled, [0.1, 0.0]));
         // A real objective with those derivatives at the start (`f = ½(x − x*)ᵀ I (x − x*)`,
         // `x*` below the bound on the first coordinate): it descends, on the bound, and never
@@ -1092,10 +966,7 @@ mod tests {
             (2.0, vec![3.0, 4.0], Some(vec![2.0, 0.0, 0.0, 2.0])),
         ];
         let f = fold_value_grad_info(ok.clone(), 2, true).unwrap();
-        assert_eq!(
-            (f.val, f.grad, f.info),
-            (3.0, vec![4.0, 6.0], vec![3.0, 0.0, 0.0, 3.0])
-        );
+        assert_eq!((f.val, f.grad, f.info), (3.0, vec![4.0, 6.0], vec![3.0, 0.0, 0.0, 3.0]));
         // Without `want_info` the information is neither required nor summed.
         let v = fold_value_grad_info(ok, 2, false).unwrap();
         assert_eq!((v.val, v.grad, v.info), (3.0, vec![4.0, 6.0], vec![]));

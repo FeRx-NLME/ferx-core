@@ -97,16 +97,8 @@ fn bic_is_nan_when_the_tally_is_missing_or_degenerate() {
     // A pre-#1177 bundle: all-zero tally against a non-zero parameter count.
     let mut r = pheno_like();
     r.bic_inputs = BicInputs::default();
-    for kind in [
-        BicType::Mixed,
-        BicType::Iiv,
-        BicType::Random,
-        BicType::Fixed,
-    ] {
-        assert!(
-            bic(&r, kind).is_nan(),
-            "{kind:?} must be NaN without a tally"
-        );
+    for kind in [BicType::Mixed, BicType::Iiv, BicType::Random, BicType::Fixed] {
+        assert!(bic(&r, kind).is_nan(), "{kind:?} must be NaN without a tally");
     }
     // A tally that does not partition n_parameters is refused too.
     let mut r = pheno_like();
@@ -153,12 +145,7 @@ fn bic_of_a_fit_with_no_free_parameter_is_the_ofv_under_every_convention() {
     r.n_parameters = 0;
     r.bic_inputs = BicInputs::default(); // n_obs = 0
     r.n_subjects = 0;
-    for kind in [
-        BicType::Mixed,
-        BicType::Iiv,
-        BicType::Random,
-        BicType::Fixed,
-    ] {
+    for kind in [BicType::Mixed, BicType::Iiv, BicType::Random, BicType::Fixed] {
         assert_eq!(bic(&r, kind), 42.0, "{kind:?}");
     }
 }
@@ -166,10 +153,7 @@ fn bic_of_a_fit_with_no_free_parameter_is_the_ofv_under_every_convention() {
 #[test]
 fn bic_type_serde_uses_snake_case_tokens() {
     assert_eq!(serde_json::to_string(&BicType::Mixed).unwrap(), "\"mixed\"");
-    assert_eq!(
-        serde_json::from_str::<BicType>("\"iiv\"").unwrap(),
-        BicType::Iiv
-    );
+    assert_eq!(serde_json::from_str::<BicType>("\"iiv\"").unwrap(), BicType::Iiv);
     assert_eq!(BicType::default(), BicType::Mixed);
 }
 
@@ -184,9 +168,7 @@ const WARFARIN_TAIL: &str = r#"
 "#;
 
 fn model_free_dim(model_text: &str) -> usize {
-    parse_model_string(model_text)
-        .expect("model parses")
-        .free_packed_dim()
+    parse_model_string(model_text).expect("model parses").free_packed_dim()
 }
 
 fn tally(model_text: &str, n_obs: usize) -> BicInputs {
@@ -350,10 +332,7 @@ fn strictness_none_passes_everything() {
 fn require_converged_fails_an_unconverged_fit() {
     let mut r = clean_fit();
     r.converged = false;
-    let s = Strictness {
-        require_converged: true,
-        ..Strictness::none()
-    };
+    let s = Strictness { require_converged: true, ..Strictness::none() };
     let v = check_strictness(&r, &s);
     assert!(!v.passed);
     assert_eq!(v.failures.len(), 1);
@@ -364,10 +343,7 @@ fn require_converged_fails_an_unconverged_fit() {
 
 #[test]
 fn require_covariance_names_each_non_computed_status() {
-    let s = Strictness {
-        require_covariance: true,
-        ..Strictness::none()
-    };
+    let s = Strictness { require_covariance: true, ..Strictness::none() };
     let mut r = clean_fit();
     assert!(check_strictness(&r, &s).passed);
 
@@ -399,10 +375,7 @@ fn require_covariance_names_each_non_computed_status() {
 /// zero-width intervals. `require_covariance` reads the ESS it recorded.
 #[test]
 fn require_covariance_rejects_a_collapsed_sir_fallback() {
-    let s = Strictness {
-        require_covariance: true,
-        ..Strictness::none()
-    };
+    let s = Strictness { require_covariance: true, ..Strictness::none() };
     let mut r = clean_fit();
     r.covariance_status = CovarianceStatus::SirFallback;
     r.covariance_matrix = None;
@@ -438,10 +411,7 @@ fn require_covariance_rejects_a_collapsed_sir_fallback() {
 
 #[test]
 fn max_condition_number_fails_above_threshold_and_skips_without_one() {
-    let s = Strictness {
-        max_condition_number: Some(1000.0),
-        ..Strictness::none()
-    };
+    let s = Strictness { max_condition_number: Some(1000.0), ..Strictness::none() };
     let mut r = clean_fit();
     r.cov_condition_number = Some(999.0);
     assert!(check_strictness(&r, &s).passed);
@@ -449,10 +419,7 @@ fn max_condition_number_fails_above_threshold_and_skips_without_one() {
     r.cov_condition_number = Some(1.4e6);
     let v = check_strictness(&r, &s);
     assert!(!v.passed);
-    assert!(
-        v.failures[0].starts_with("condition number 1.4000e6"),
-        "{v:?}"
-    );
+    assert!(v.failures[0].starts_with("condition number 1.4000e6"), "{v:?}");
 
     // Singular correlation matrix → +∞, which exceeds any finite threshold.
     r.cov_condition_number = Some(f64::INFINITY);
@@ -471,11 +438,7 @@ fn max_condition_number_fails_above_threshold_and_skips_without_one() {
 /// 3×3 covariance whose (0,1) correlation is exactly `r01`, the rest 0.
 fn cov_with_corr(r01: f64) -> DMatrix<f64> {
     // var = 4, 9, 1 → sd = 2, 3, 1 → cov01 = r·6
-    DMatrix::from_row_slice(
-        3,
-        3,
-        &[4.0, r01 * 6.0, 0.0, r01 * 6.0, 9.0, 0.0, 0.0, 0.0, 1.0],
-    )
+    DMatrix::from_row_slice(3, 3, &[4.0, r01 * 6.0, 0.0, r01 * 6.0, 9.0, 0.0, 0.0, 0.0, 1.0])
 }
 
 #[test]
@@ -500,10 +463,7 @@ fn max_abs_correlation_reads_the_whole_matrix() {
 
 #[test]
 fn max_correlation_fails_above_threshold_naming_the_pair() {
-    let s = Strictness {
-        max_correlation: Some(0.95),
-        ..Strictness::none()
-    };
+    let s = Strictness { max_correlation: Some(0.95), ..Strictness::none() };
     let mut r = clean_fit();
     r.covariance_matrix = Some(cov_with_corr(0.94));
     assert!(check_strictness(&r, &s).passed);
@@ -511,10 +471,7 @@ fn max_correlation_fails_above_threshold_naming_the_pair() {
     r.covariance_matrix = Some(cov_with_corr(-0.96));
     let v = check_strictness(&r, &s);
     assert!(!v.passed);
-    assert!(
-        v.failures[0].contains("0.9600") && v.failures[0].contains("CL ~ V"),
-        "{v:?}"
-    );
+    assert!(v.failures[0].contains("0.9600") && v.failures[0].contains("CL ~ V"), "{v:?}");
 
     r.covariance_matrix = None;
     let v = check_strictness(&r, &s);
@@ -527,10 +484,7 @@ fn max_correlation_fails_above_threshold_naming_the_pair() {
 /// `theta_names[k]` (which does not exist) or a bare index.
 #[test]
 fn max_correlation_names_an_omega_coordinate_by_its_packed_name() {
-    let s = Strictness {
-        max_correlation: Some(0.95),
-        ..Strictness::none()
-    };
+    let s = Strictness { max_correlation: Some(0.95), ..Strictness::none() };
     let mut r = clean_fit();
     // 3 θ + 2 diagonal Ω + 1 σ = 6 packed coordinates; (0, 3) is CL ~ Ω_CL.
     let mut cov = DMatrix::<f64>::identity(6, 6);
@@ -588,20 +542,13 @@ fn max_correlation_reads_block_omega_on_the_natural_scale() {
     assert!(natural_r < 0.95, "natural |r| = {natural_r}");
     assert!((max_abs_correlation(&r).unwrap() - natural_r).abs() < 1e-12);
 
-    let s = Strictness {
-        max_correlation: Some(0.95),
-        ..Strictness::none()
-    };
+    let s = Strictness { max_correlation: Some(0.95), ..Strictness::none() };
     assert!(check_strictness(&r, &s).passed);
 
     // The transform is the delta method with the same Jacobian `se_omega`
     // uses: the natural variance of ω₁₁ = L₁₁² from x = ln L₁₁ is (2·ω₁₁)²·var(x).
     let want = (2.0 * 0.09_f64).powi(2) * 0.01;
-    assert!(
-        (natural[(3, 3)] - want).abs() < 1e-12,
-        "{}",
-        natural[(3, 3)]
-    );
+    assert!((natural[(3, 3)] - want).abs() < 1e-12, "{}", natural[(3, 3)]);
 }
 
 /// The layout is read from the result, never inferred from the matrix size:
@@ -637,11 +584,7 @@ fn natural_scale_covariance_transforms_a_block_kappa_beside_a_diagonal_omega() {
     r.omega_is_diagonal = Some(true);
     r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
     r.kappa_fixed = vec![false, false];
-    r.omega_iov = Some(DMatrix::from_row_slice(
-        2,
-        2,
-        &[0.09, -0.012, -0.012, 0.0416],
-    ));
+    r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.09, -0.012, -0.012, 0.0416]));
     r.kappa_is_diagonal = Some(false);
     // 3 θ + 2 Ω + 1 σ + 3 κ Cholesky = 9; κ coordinates 6, 7, 8.
     let mut cov = DMatrix::<f64>::identity(9, 9) * 0.01;
@@ -660,13 +603,7 @@ fn natural_scale_covariance_transforms_a_block_kappa_beside_a_diagonal_omega() {
     // The gate names the pair by its κ packed name.
     r.covariance_matrix = Some(cov);
     r.kappa_is_diagonal = None; // unrecorded κ layout: κ left as stored → fails
-    let v = check_strictness(
-        &r,
-        &Strictness {
-            max_correlation: Some(0.95),
-            ..Strictness::none()
-        },
-    );
+    let v = check_strictness(&r, &Strictness { max_correlation: Some(0.95), ..Strictness::none() });
     assert!(!v.passed && v.failures[0].contains("KAPPA_V"), "{v:?}");
 }
 
@@ -689,10 +626,7 @@ fn natural_scale_covariance_is_the_stored_matrix_without_a_block_omega() {
 
 #[test]
 fn reject_on_boundary_is_the_bootstrap_predicate() {
-    let s = Strictness {
-        reject_on_boundary: true,
-        ..Strictness::none()
-    };
+    let s = Strictness { reject_on_boundary: true, ..Strictness::none() };
     let mut r = clean_fit();
     assert!(!estimate_near_boundary(&r));
     assert!(check_strictness(&r, &s).passed);
@@ -707,10 +641,7 @@ fn reject_on_boundary_is_the_bootstrap_predicate() {
     // itself is the reason.
     r.warnings_structured = vec![boundary_warning(false)];
     let v = check_strictness(&r, &s);
-    assert!(
-        v.failures[0].contains("TVKA (50.0000 at upper bound)"),
-        "{v:?}"
-    );
+    assert!(v.failures[0].contains("TVKA (50.0000 at upper bound)"), "{v:?}");
 
     // A runaway-guard hit is not a boundary estimate; `converged` covers it.
     r.warnings_structured = vec![WarningEntry {
@@ -861,18 +792,9 @@ fn stalled_at_init_prefers_the_optimizers_own_verdict() {
     assert_eq!(stalled_at_init(&r), Some(false));
     r.left_init = Some(false);
     assert_eq!(stalled_at_init(&r), Some(true));
-    let v = check_strictness(
-        &r,
-        &Strictness {
-            reject_init_stall: true,
-            ..Strictness::none()
-        },
-    );
+    let v = check_strictness(&r, &Strictness { reject_init_stall: true, ..Strictness::none() });
     assert!(!v.passed);
-    assert!(
-        v.failures[0].starts_with("stalled at the initial estimates"),
-        "{v:?}"
-    );
+    assert!(v.failures[0].starts_with("stalled at the initial estimates"), "{v:?}");
 
     // And the reverse: a sub-1 % natural move the optimizer counted as escape.
     r.theta[1] = r.theta_init[1] * 1.005;
@@ -901,10 +823,7 @@ fn stalled_at_init_is_none_without_comparable_initials() {
 
 #[test]
 fn reject_init_stall_names_the_751_signature() {
-    let s = Strictness {
-        reject_init_stall: true,
-        ..Strictness::none()
-    };
+    let s = Strictness { reject_init_stall: true, ..Strictness::none() };
     // A candidate that never left its initial estimates.
     let mut r = minimal_fit_result();
     r.converged = true; // #751 before the fix: reported converged at init
@@ -940,27 +859,14 @@ fn verdict_lists_every_failed_gate_in_field_order() {
     r.theta_init = r.theta.clone();
     r.omega_init = r.omega.clone();
     r.sigma_init = r.sigma.clone();
-    let s = Strictness {
-        require_covariance: true,
-        ..Strictness::default()
-    };
+    let s = Strictness { require_covariance: true, ..Strictness::default() };
     let v = check_strictness(&r, &s);
     assert!(!v.passed);
-    let heads: Vec<&str> = v
-        .failures
-        .iter()
-        .map(|f| f.split_whitespace().next().unwrap())
-        .collect();
+    let heads: Vec<&str> =
+        v.failures.iter().map(|f| f.split_whitespace().next().unwrap()).collect();
     assert_eq!(
         heads,
-        [
-            "did",
-            "covariance",
-            "condition",
-            "parameter",
-            "estimate",
-            "stalled"
-        ],
+        ["did", "covariance", "condition", "parameter", "estimate", "stalled"],
         "{v:?}"
     );
     assert!(v.skipped.is_empty());
@@ -1030,14 +936,8 @@ const REGULARIZED_FAILURE: &str = "covariance matrix regularized: the Hessian ha
 #[test]
 fn a_regularized_covariance_fails_the_matrix_reading_gates() {
     let mut r = clean_fit();
-    let cond_only = Strictness {
-        max_condition_number: Some(1000.0),
-        ..Strictness::none()
-    };
-    let corr_only = Strictness {
-        max_correlation: Some(0.95),
-        ..Strictness::none()
-    };
+    let cond_only = Strictness { max_condition_number: Some(1000.0), ..Strictness::none() };
+    let corr_only = Strictness { max_correlation: Some(0.95), ..Strictness::none() };
     // The premise: without the warning, both numeric gates pass this matrix.
     assert!(check_strictness(&r, &cond_only).passed);
     assert!(check_strictness(&r, &corr_only).passed);
@@ -1045,27 +945,20 @@ fn a_regularized_covariance_fails_the_matrix_reading_gates() {
 
     // A different covariance-step note is not a floored Hessian — including the non-finite
     // cross-partial note, which shares the `CovarianceRegularized` code but floors nothing.
-    r.warnings_structured.push(WarningEntry {
-        category: WarningCode::CovarianceStep,
-        ..regularized_warning()
-    });
+    r.warnings_structured
+        .push(WarningEntry { category: WarningCode::CovarianceStep, ..regularized_warning() });
     r.warnings_structured.push(WarningEntry {
         message: "Covariance step: off-diagonal FD stencil(s) non-finite for TVCL, TVV. \
                   SE for these parameter(s) may be over-optimistic."
             .into(),
         ..regularized_warning()
     });
-    assert!(
-        check_strictness(&r, &Strictness::default()).passed,
-        "other_category / offdiag_note"
-    );
+    assert!(check_strictness(&r, &Strictness::default()).passed, "other_category / offdiag_note");
 
     r.warnings_structured.push(regularized_warning());
-    for (label, s) in [
-        ("cond_only", &cond_only),
-        ("corr_only", &corr_only),
-        ("default", &Strictness::default()),
-    ] {
+    for (label, s) in
+        [("cond_only", &cond_only), ("corr_only", &corr_only), ("default", &Strictness::default())]
+    {
         let v = check_strictness(&r, s);
         assert!(!v.passed, "{label} enabled: {v:?}");
         assert_eq!(v.failures.len(), 1, "{label}: {v:?}");
@@ -1073,11 +966,8 @@ fn a_regularized_covariance_fails_the_matrix_reading_gates() {
     }
 
     // Neither matrix-reading gate enabled: nothing reads the floored matrix.
-    let others_on = Strictness {
-        max_condition_number: None,
-        max_correlation: None,
-        ..Strictness::default()
-    };
+    let others_on =
+        Strictness { max_condition_number: None, max_correlation: None, ..Strictness::default() };
     assert!(check_strictness(&r, &others_on).passed);
 }
 
@@ -1087,12 +977,7 @@ fn a_regularized_covariance_fails_the_matrix_reading_gates() {
 fn bic_variants_are_nan_without_a_likelihood() {
     let mut r = pheno_like();
     r.bic = None;
-    for kind in [
-        BicType::Mixed,
-        BicType::Iiv,
-        BicType::Random,
-        BicType::Fixed,
-    ] {
+    for kind in [BicType::Mixed, BicType::Iiv, BicType::Random, BicType::Fixed] {
         assert!(bic(&r, kind).is_nan(), "{kind:?}");
     }
     r.bic = Some(100.0);

@@ -23,12 +23,7 @@ use crate::search::{
 
 impl StepRunner for ToolRunner<'_> {
     fn run_step(
-        &self,
-        index: usize,
-        step: Step,
-        dir_name: &str,
-        config: &SearchConfig,
-        model: &ModelText,
+        &self, index: usize, step: Step, dir_name: &str, config: &SearchConfig, model: &ModelText,
     ) -> Result<StepOutput, String> {
         let (dir, base) = self.base_for(dir_name, model)?;
         let threads = self.threads_for(config);
@@ -38,11 +33,7 @@ impl StepRunner for ToolRunner<'_> {
         // under; everything else the tool says is left for `StepFinished`.
         let forward = |candidate: CandidateFinished| {
             if let Some(p) = self.progress {
-                p(AmdEvent::CandidateFinished {
-                    index,
-                    tool,
-                    candidate,
-                });
+                p(AmdEvent::CandidateFinished { index, tool, candidate });
             }
         };
         let on_modelsearch = |e: ModelsearchEvent| {
@@ -136,12 +127,7 @@ impl StepRunner for ToolRunner<'_> {
                 let result = run_allometry_observed(
                     &base,
                     &options,
-                    AllometryRun {
-                        dir: Some(dir),
-                        threads,
-                        cancel,
-                        run_options,
-                    },
+                    AllometryRun { dir: Some(dir), threads, cancel, run_options },
                     &on_allometry,
                 )?;
                 Ok(from_allometry(index, tool, &base.text, result))
@@ -163,13 +149,8 @@ impl StepRunner for ToolRunner<'_> {
     }
 
     fn fit_one(
-        &self,
-        index: usize,
-        tool: &'static str,
-        dir_name: &str,
-        config: &SearchConfig,
-        model: &ModelText,
-        n_starts: usize,
+        &self, index: usize, tool: &'static str, dir_name: &str, config: &SearchConfig,
+        model: &ModelText, n_starts: usize,
     ) -> Result<StepOutput, String> {
         let (dir, base) = self.base_for(dir_name, model)?;
         let mut options = config.run_options();
@@ -204,12 +185,8 @@ impl StepRunner for ToolRunner<'_> {
                 });
             }
         };
-        let report = runner.run_observed(
-            &candidates,
-            &base.prepared.population,
-            &options,
-            &on_finished,
-        )?;
+        let report =
+            runner.run_observed(&candidates, &base.prepared.population, &options, &on_finished)?;
         let Some(result) = report.results.first() else {
             return Ok(StepOutput {
                 model: model.clone(),
@@ -224,11 +201,8 @@ impl StepRunner for ToolRunner<'_> {
             });
         };
         let mut row = candidate_row(index, tool, result, Criterion::Ofv);
-        row.description = format!(
-            "{} start{}",
-            options.n_starts,
-            if options.n_starts == 1 { "" } else { "s" }
-        );
+        row.description =
+            format!("{} start{}", options.n_starts, if options.n_starts == 1 { "" } else { "s" });
         row.selected = true;
         Ok(StepOutput {
             model: model.clone(),
@@ -247,10 +221,7 @@ impl StepRunner for ToolRunner<'_> {
 /// A [`CandidateResult`] as a pipeline row — the shape allometry and the
 /// pipeline's own single-model fits report in.
 fn candidate_row(
-    index: usize,
-    tool: &str,
-    result: &CandidateResult,
-    criterion: Criterion,
+    index: usize, tool: &str, result: &CandidateResult, criterion: Criterion,
 ) -> CandidateRow {
     CandidateRow {
         step: index,
@@ -268,10 +239,7 @@ fn candidate_row(
         passed: result.verdict.passed,
         failures: result.verdict.failures.clone(),
         error: result.error.as_ref().map(|e| e.message.clone()),
-        note: result
-            .duplicate_of
-            .as_ref()
-            .map(|id| format!("same model as `{id}`")),
+        note: result.duplicate_of.as_ref().map(|id| format!("same model as `{id}`")),
         seconds: result.seconds,
         selected: false,
     }
@@ -281,22 +249,10 @@ fn candidate_row(
 /// spells differently.
 #[allow(clippy::too_many_arguments)]
 fn ranked_row(
-    index: usize,
-    tool: &str,
-    id: &str,
-    parent: Option<&String>,
-    description: String,
-    criterion: Criterion,
-    value: f64,
-    d_value: Option<f64>,
-    ofv: Option<f64>,
-    rank: Option<usize>,
-    converged: Option<bool>,
-    passed: bool,
-    failures: &[String],
-    error: Option<String>,
-    seconds: f64,
-    selected: bool,
+    index: usize, tool: &str, id: &str, parent: Option<&String>, description: String,
+    criterion: Criterion, value: f64, d_value: Option<f64>, ofv: Option<f64>, rank: Option<usize>,
+    converged: Option<bool>, passed: bool, failures: &[String], error: Option<String>,
+    seconds: f64, selected: bool,
 ) -> CandidateRow {
     CandidateRow {
         step: index,
@@ -347,20 +303,14 @@ fn from_modelsearch(index: usize, tool: &str, result: ModelsearchResult) -> Step
         })
         .collect();
     let selected = vec![crate::modelsearch::structure_label(
-        &result
-            .row(&result.final_id)
-            .map(|r| r.structure)
-            .unwrap_or(result.base_structure),
+        &result.row(&result.final_id).map(|r| r.structure).unwrap_or(result.base_structure),
     )];
     StepOutput {
         model: result.final_model,
         fit: result.final_fit,
         criterion,
         passed: true,
-        value: result
-            .final_criterion
-            .is_finite()
-            .then_some(result.final_criterion),
+        value: result.final_criterion.is_finite().then_some(result.final_criterion),
         rows,
         selected,
         notes: result.notes,
@@ -403,10 +353,7 @@ fn from_iivsearch(index: usize, tool: &str, result: IivsearchResult) -> StepOutp
         fit: result.final_fit,
         criterion,
         passed: true,
-        value: result
-            .final_criterion
-            .is_finite()
-            .then_some(result.final_criterion),
+        value: result.final_criterion.is_finite().then_some(result.final_criterion),
         rows,
         selected: vec![result.final_structure.description()],
         notes: result.notes,
@@ -449,10 +396,7 @@ fn from_iovsearch(index: usize, tool: &str, result: IovsearchResult) -> StepOutp
         fit: result.final_fit,
         criterion,
         passed: true,
-        value: result
-            .final_criterion
-            .is_finite()
-            .then_some(result.final_criterion),
+        value: result.final_criterion.is_finite().then_some(result.final_criterion),
         rows,
         selected: vec![result.final_structure.description()],
         notes: result.notes,
@@ -477,9 +421,7 @@ fn from_ruvsearch(index: usize, tool: &str, result: RuvsearchResult) -> StepOutp
                 tool,
                 &r.candidate,
                 None,
-                r.feature
-                    .map(|f| f.label())
-                    .unwrap_or_else(|| "base".to_string()),
+                r.feature.map(|f| f.label()).unwrap_or_else(|| "base".to_string()),
                 Criterion::Ofv,
                 r.ofv.unwrap_or(f64::NAN),
                 r.ofv.map(|o| o - r.parent_ofv),
@@ -593,10 +535,7 @@ fn from_covsearch(index: usize, tool: &str, result: CovsearchResult) -> StepOutp
 /// cost. AMD adopts it when it passes the strictness gate — and keeps the
 /// unscaled model, with a note, when it does not.
 fn from_allometry(
-    index: usize,
-    tool: &str,
-    input: &ModelText,
-    result: AllometryResult,
+    index: usize, tool: &str, input: &ModelText, result: AllometryResult,
 ) -> StepOutput {
     let accepted = result.scaled.eligible();
     let mut rows = vec![

@@ -46,20 +46,14 @@ fn anchor(name: &str) -> String {
 }
 
 fn ofv_on(data: &str) -> f64 {
-    let parsed = parse_full_model_file(std::path::Path::new(&anchor(
-        "unit_invariance_prop_fit.ferx",
-    )))
-    .expect("the anchor model parses");
+    let parsed =
+        parse_full_model_file(std::path::Path::new(&anchor("unit_invariance_prop_fit.ferx")))
+            .expect("the anchor model parses");
     let population = read_nonmem_csv(std::path::Path::new(&anchor(data)), None, None)
         .unwrap_or_else(|e| panic!("{data} loads: {e}"));
     assert_eq!(population.subjects.len(), 8, "{data}: 8 subjects");
-    let result = fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &parsed.fit_options,
-    )
-    .unwrap_or_else(|e| panic!("fit on {data} returns Ok: {e}"));
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)
+        .unwrap_or_else(|e| panic!("fit on {data} returns Ok: {e}"));
     assert!(
         result.ofv.is_finite(),
         "{data}: objective must be finite before it is compared, got {}",

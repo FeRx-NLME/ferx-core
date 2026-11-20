@@ -49,10 +49,7 @@ fn rel(a: f64, b: f64) -> f64 {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_impmap_matches_nonmem_impmap_on_warfarin() {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
@@ -70,50 +67,18 @@ fn ferx_impmap_matches_nonmem_impmap_on_warfarin() {
         fit(&model, &population, &model.default_params, &opts).expect("IMPMAP fit must succeed");
 
     // Thetas: CL/V well-identified (5%), KA poorly-identified (15%).
-    assert!(
-        rel(r.theta[0], NM_TVCL) < 0.05,
-        "TVCL {} vs NM {NM_TVCL}",
-        r.theta[0]
-    );
-    assert!(
-        rel(r.theta[1], NM_TVV) < 0.05,
-        "TVV {} vs NM {NM_TVV}",
-        r.theta[1]
-    );
-    assert!(
-        rel(r.theta[2], NM_TVKA) < 0.15,
-        "TVKA {} vs NM {NM_TVKA}",
-        r.theta[2]
-    );
+    assert!(rel(r.theta[0], NM_TVCL) < 0.05, "TVCL {} vs NM {NM_TVCL}", r.theta[0]);
+    assert!(rel(r.theta[1], NM_TVV) < 0.05, "TVV {} vs NM {NM_TVV}", r.theta[1]);
+    assert!(rel(r.theta[2], NM_TVKA) < 0.15, "TVKA {} vs NM {NM_TVKA}", r.theta[2]);
 
     // Variance components (NONMEM prints 3 sig figs; allow 15%).
-    assert!(
-        rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.15,
-        "omega_CL {}",
-        r.omega[(0, 0)]
-    );
-    assert!(
-        rel(r.omega[(1, 1)], NM_OMEGA_V) < 0.15,
-        "omega_V {}",
-        r.omega[(1, 1)]
-    );
-    assert!(
-        rel(r.omega[(2, 2)], NM_OMEGA_KA) < 0.15,
-        "omega_KA {}",
-        r.omega[(2, 2)]
-    );
+    assert!(rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.15, "omega_CL {}", r.omega[(0, 0)]);
+    assert!(rel(r.omega[(1, 1)], NM_OMEGA_V) < 0.15, "omega_V {}", r.omega[(1, 1)]);
+    assert!(rel(r.omega[(2, 2)], NM_OMEGA_KA) < 0.15, "omega_KA {}", r.omega[(2, 2)]);
 
     // Residual error (ferx reports the proportional SD).
-    assert!(
-        rel(r.sigma[0], NM_SIGMA_SD) < 0.10,
-        "sigma_SD {} vs NM {NM_SIGMA_SD}",
-        r.sigma[0]
-    );
+    assert!(rel(r.sigma[0], NM_SIGMA_SD) < 0.10, "sigma_SD {} vs NM {NM_SIGMA_SD}", r.sigma[0]);
 
     // OFV within the cross-engine margin.
-    assert!(
-        (r.ofv - NM_OFV).abs() < 3.0,
-        "OFV {} vs NONMEM {NM_OFV}",
-        r.ofv
-    );
+    assert!((r.ofv - NM_OFV).abs() < 3.0, "OFV {} vs NONMEM {NM_OFV}", r.ofv);
 }

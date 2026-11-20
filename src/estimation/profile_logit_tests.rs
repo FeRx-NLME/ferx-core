@@ -27,10 +27,7 @@ fn b2_slack() -> crate::api::PreparedRun {
     let csv = std::fs::read_to_string(root().join(B2_DATA)).unwrap();
     let mut lines = csv.lines();
     let header = lines.next().unwrap();
-    assert!(
-        header.starts_with("ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT,"),
-        "the data moved"
-    );
+    assert!(header.starts_with("ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT,"), "the data moved");
     let kept: String = std::iter::once(format!("{header}\n"))
         .chain(lines.filter_map(|l| {
             let f: Vec<&str> = l.split(',').collect();
@@ -39,18 +36,11 @@ fn b2_slack() -> crate::api::PreparedRun {
                 .then(|| format!("{},{}\n", 2 * study - 1 + trt, f[1..].join(",")))
         }))
         .collect();
-    assert_eq!(
-        kept.lines().count(),
-        csv.lines().count() - 1,
-        "the data moved"
-    );
+    assert_eq!(kept.lines().count(), csv.lines().count() - 1, "the data moved");
     let data = temp("b2_slack.csv");
     std::fs::write(&data, kept).unwrap();
-    crate::api::prepare_run(
-        root().join(B2).to_str().unwrap(),
-        Some(data.to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("{e}"))
+    crate::api::prepare_run(root().join(B2).to_str().unwrap(), Some(data.to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn laplace(t: String) -> String {
@@ -132,10 +122,7 @@ const NEWTON_MAX_ITER: usize = 4;
 /// counted (the counts), and when either matrix is the wrong function (the levels).
 #[test]
 fn a_logit_linked_block_takes_the_exact_newton_matrix_and_differences_on_a_decline() {
-    for (name, edit) in [
-        ("focei", (|t| t) as fn(String) -> String),
-        ("laplace", laplace),
-    ] {
+    for (name, edit) in [("focei", (|t| t) as fn(String) -> String), ("laplace", laplace)] {
         let p = b2(None, edit);
         let o = options(&p);
         let layout = layout_of(&p);
@@ -153,25 +140,11 @@ fn a_logit_linked_block_takes_the_exact_newton_matrix_and_differences_on_a_decli
             fd.ofv - exact.ofv,
             beta_gap_se(&layout, &exact, &fd)
         );
-        assert!(
-            exact.iterations <= NEWTON_MAX_ITER,
-            "{name}: {}",
-            exact.iterations
-        );
-        assert!(
-            ce.exact_matrices > 0 && ce.fd_matrices == 0,
-            "{name}: {ce:?}"
-        );
+        assert!(exact.iterations <= NEWTON_MAX_ITER, "{name}: {}", exact.iterations);
+        assert!(ce.exact_matrices > 0 && ce.fd_matrices == 0, "{name}: {ce:?}");
         assert_eq!(ce.fd_gradients, 0, "{name}: {ce:?}");
-        assert!(
-            fd.iterations <= NEWTON_MAX_ITER,
-            "{name}: {}",
-            fd.iterations
-        );
-        assert!(
-            cf.exact_matrices == 0 && cf.fd_matrices > 0,
-            "{name}: {cf:?}"
-        );
+        assert!(fd.iterations <= NEWTON_MAX_ITER, "{name}: {}", fd.iterations);
+        assert!(cf.exact_matrices == 0 && cf.fd_matrices > 0, "{name}: {cf:?}");
         assert!((fd.ofv - exact.ofv).abs() < 1e-8, "{name}");
         assert!(beta_gap_se(&layout, &exact, &fd) < 1e-6, "{name}");
     }
@@ -237,12 +210,7 @@ fn the_profile_work_summary_names_the_matrix_counts_only_on_a_linked_block() {
         fd_gradients: 0,
         ..Default::default()
     };
-    let linked = ProfileCounts {
-        exact_matrices: 28,
-        fd_matrices: 2,
-        damped_matrices: 3,
-        ..affine
-    };
+    let linked = ProfileCounts { exact_matrices: 28, fd_matrices: 2, damped_matrices: 3, ..affine };
     let base = "Profile solves of the outer optimizer: 5 evaluations (0 solve failures, their \
                 work counted), 3 Newton steps summed over groups, 40 EBE re-solves, level \
                 gradients 30 adjoint / 0 finite-difference";
@@ -262,10 +230,9 @@ fn the_profile_work_summary_names_the_matrix_counts_only_on_a_linked_block() {
 /// solve would land on the frozen point).
 #[test]
 fn the_linked_solve_is_the_minimum_and_the_frozen_shortcut_is_not() {
-    for (name, edit, straddle) in [
-        ("focei", (|t| t) as fn(String) -> String, 1.7e-4),
-        ("laplace", laplace, 4.7e-7),
-    ] {
+    for (name, edit, straddle) in
+        [("focei", (|t| t) as fn(String) -> String, 1.7e-4), ("laplace", laplace, 4.7e-7)]
+    {
         let p = b2(Some(2), edit);
         let layout = layout_of(&p);
         let o = options(&p);
@@ -314,20 +281,12 @@ fn the_exact_newton_matrix_matches_second_differences_of_the_resolved_objective(
     for (name, build) in arms {
         let p = build();
         let layout = layout_of(&p);
-        let slack = layout
-            .reads
-            .iter()
-            .flatten()
-            .any(|r| r.moves.iter().any(|&(_, c)| c < 0.0));
+        let slack = layout.reads.iter().flatten().any(|r| r.moves.iter().any(|&(_, c)| c < 0.0));
         assert_eq!(slack, name.contains("slack"), "{name}: the fixture moved");
         let o = options(&p);
         let c = ctx(&p, &layout, &o);
-        let sol = c
-            .solve(
-                &p.init_params,
-                &ProfileWarm::from_template(&layout, &p.init_params),
-            )
-            .unwrap();
+        let sol =
+            c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params)).unwrap();
         let zero = DVector::zeros(c.model.n_eta);
         let mut worst = 0.0_f64;
         let mut held_gap = 0.0_f64;
@@ -337,10 +296,8 @@ fn the_exact_newton_matrix_matches_second_differences_of_the_resolved_objective(
             for i in 0..p.population.subjects.len() {
                 let s = c.resolve(i, &params, &zero);
                 let k = layout.reads[i].len();
-                let se: Vec<f64> = layout.reads[i]
-                    .iter()
-                    .map(|r| sol.level_scale[r.level])
-                    .collect();
+                let se: Vec<f64> =
+                    layout.reads[i].iter().map(|r| sol.level_scale[r.level]).collect();
                 let exact = c.exact_hessian(i, &pt, &s).expect("the adjoint serves B2");
                 let st: Vec<f64> = se.iter().map(|v| REF_STEP_SE * v).collect();
                 let fd = c.resolved_hessian(i, &params, &s, &st);
@@ -360,10 +317,7 @@ fn the_exact_newton_matrix_matches_second_differences_of_the_resolved_objective(
         // Measured at REF_STEP_SE 1.2e-5 (FOCEI, Laplace) / 2.7e-5 (slack); held 0.14 / 0.56.
         eprintln!("{name}: exact - FD {worst:.3e}, held - FD {held_gap:.3e} (scaled)");
         assert!(worst < 1e-4, "{name}: {worst:.3e}");
-        assert!(
-            held_gap > 10.0 * worst,
-            "{name}: the fixture cannot tell the two apart"
-        );
+        assert!(held_gap > 10.0 * worst, "{name}: the fixture cannot tell the two apart");
     }
 }
 
@@ -377,12 +331,8 @@ fn the_adjoint_level_gradient_through_the_link_matches_reconverged_differences()
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
-    let sol = c
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
-        .unwrap();
+    let sol =
+        c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params)).unwrap();
     let zero = DVector::zeros(c.model.n_eta);
     let (mut fine, mut coarse) = (0.0_f64, 0.0_f64);
     for params in [p.init_params.clone(), sol.params.clone()] {
@@ -390,10 +340,7 @@ fn the_adjoint_level_gradient_through_the_link_matches_reconverged_differences()
         let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
         for i in 0..p.population.subjects.len() {
             let s = c.resolve(i, &params, &zero);
-            let se: Vec<f64> = layout.reads[i]
-                .iter()
-                .map(|r| sol.level_scale[r.level])
-                .collect();
+            let se: Vec<f64> = layout.reads[i].iter().map(|r| sol.level_scale[r.level]).collect();
             let ga = c.total_gradient_adjoint(i, &pt, &s).expect("served");
             for (step, w) in [(1e-3, &mut fine), (FD_STEP_SE, &mut coarse)] {
                 let st: Vec<f64> = se.iter().map(|v| step * v).collect();
@@ -431,10 +378,7 @@ fn a_linked_block_profiles_under_quadrature() {
             s.ofv - omin
         );
         assert!((s.ofv - omin).abs() < 1e-8, "{name}");
-        assert!(
-            counts.exact_matrices > 0 && counts.fd_matrices == 0,
-            "{name}: {counts:?}"
-        );
+        assert!(counts.exact_matrices > 0 && counts.fd_matrices == 0, "{name}: {counts:?}");
         // The exact matrix under quadrature is that objective's: against the differenced
         // one, which re-solves the quadrature term itself.
         let zero = DVector::zeros(c.model.n_eta);
@@ -443,13 +387,8 @@ fn a_linked_block_profiles_under_quadrature() {
         let mut worst = 0.0_f64;
         for i in 0..p.population.subjects.len() {
             let st = c.resolve(i, &s.params, &zero);
-            let se: Vec<f64> = layout.reads[i]
-                .iter()
-                .map(|r| s.level_scale[r.level])
-                .collect();
-            let exact = c
-                .exact_hessian(i, &pt, &st)
-                .expect("served under quadrature");
+            let se: Vec<f64> = layout.reads[i].iter().map(|r| s.level_scale[r.level]).collect();
+            let exact = c.exact_hessian(i, &pt, &st).expect("served under quadrature");
             let steps: Vec<f64> = se.iter().map(|v| REF_STEP_SE * v).collect();
             let fd = c.resolved_hessian(i, &s.params, &st, &steps);
             for a in 0..se.len() {
@@ -477,10 +416,7 @@ fn a_group_mixing_exact_and_differenced_matrices_solves_to_the_same_levels() {
     let p = b2_slack();
     let layout = layout_of(&p);
     let g0 = &layout.groups[layout.local[layout.reads[0][0].level].0];
-    assert!(
-        g0.subjects.len() >= 2 && g0.subjects.contains(&0),
-        "the fixture moved"
-    );
+    assert!(g0.subjects.len() >= 2 && g0.subjects.contains(&0), "the fixture moved");
     let o = options(&p);
     let (all, _) = solve_b2(&p, &o);
     let (mixed, c) = {
@@ -518,11 +454,7 @@ fn an_indefinite_newton_matrix_is_damped_and_the_solve_still_finds_the_minimum()
     for (name, params, damped) in [("far", &far, true), ("inits", &p.init_params, false)] {
         let mut counts = ProfileCounts::default();
         let s = c
-            .solve_counted(
-                params,
-                &ProfileWarm::from_template(&layout, params),
-                &mut counts,
-            )
+            .solve_counted(params, &ProfileWarm::from_template(&layout, params), &mut counts)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
         let (omin, _) = oracle_min(&c, params, &beta);

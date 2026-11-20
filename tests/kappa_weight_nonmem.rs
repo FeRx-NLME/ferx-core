@@ -65,16 +65,9 @@ const NM_OMEGA_IOV: f64 = 2.00128;
 fn anchor_fit() -> ferx_core::types::FitResult {
     let model = parse_model_file(Path::new("tests/nonmem/kappa_weight_iov.ferx"))
         .expect("weighted-kappa anchor model must parse");
-    assert!(
-        model.has_weighted_kappa(),
-        "the anchor model must carry `weight = NARM`"
-    );
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/kappa_weight_iov.csv"),
-        None,
-        Some("OCC"),
-    )
-    .expect("anchor data must load");
+    assert!(model.has_weighted_kappa(), "the anchor model must carry `weight = NARM`");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/kappa_weight_iov.csv"), None, Some("OCC"))
+        .expect("anchor data must load");
     let opts = FitOptions {
         method: EstimationMethod::Foce,
         iov_column: Some("OCC".to_string()),
@@ -88,10 +81,7 @@ fn anchor_fit() -> ferx_core::types::FitResult {
 /// objective to within the cross-engine FOCE/IOV gap documented above (never
 /// worse than NONMEM's), and the same estimates including the *unweighted* γ².
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn weighted_kappa_matches_the_nonmem_hand_written_twin() {
     let res = anchor_fit();
     assert!(res.converged, "the anchor fit must converge");
@@ -112,19 +102,13 @@ fn weighted_kappa_matches_the_nonmem_hand_written_twin() {
     // `$OMEGA BLOCK(1)` holds. A `/NARM` instead of `/sqrt(NARM)` scaling would
     // land here as a factor of ~20², not a 10% difference.
     let gamma2 = res.omega_iov.as_ref().expect("IOV matrix present")[(0, 0)];
-    assert!(
-        rel(gamma2, NM_OMEGA_IOV) < 0.15,
-        "gamma^2 {gamma2} vs NONMEM {NM_OMEGA_IOV}"
-    );
+    assert!(rel(gamma2, NM_OMEGA_IOV) < 0.15, "gamma^2 {gamma2} vs NONMEM {NM_OMEGA_IOV}");
 }
 
 /// The fit reports the weight and the median arm size next to that γ², so the
 /// effective between-arm SD (`γ/√N`) is readable without a calculator.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_anchor_fit_reports_the_arm_size() {
     let res = anchor_fit();
     assert_eq!(res.kappa_weights, vec![Some("NARM".to_string())]);

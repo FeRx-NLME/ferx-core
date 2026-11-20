@@ -64,12 +64,7 @@ fn ext_last(name: &str) -> HashMap<String, f64> {
 fn fit(model: &str) -> ferx_core::types::FitResult {
     let prep = ferx_core::prepare_run(
         root().join("nonmem_anchor").join(model).to_str().unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/saem_additive_mu.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("nonmem_anchor/saem_additive_mu.csv").to_str().unwrap()),
     )
     .expect("prepare");
     let opts = ferx_core::types::FitOptions {
@@ -79,13 +74,7 @@ fn fit(model: &str) -> ferx_core::types::FitResult {
         saem_ofv: ferx_core::types::SaemOfv::Focei,
         ..prep.parsed.fit_options.clone()
     };
-    ferx_core::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("fit")
+    ferx_core::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("fit")
 }
 
 #[test]
@@ -94,16 +83,8 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     let nm_mu = ext_last("saem_additive_mu.ext");
     let nm_nomu = ext_last("saem_additive_mu_nomu.ext");
     // The oracle itself: NONMEM with MU reaches the MLE, NONMEM without it does not.
-    assert!(
-        (nm_mu["OBJ"] - mle).abs() < 1e-3,
-        "NONMEM MU {} vs MLE {mle}",
-        nm_mu["OBJ"]
-    );
-    assert!(
-        nm_nomu["OBJ"] > mle + 1.0,
-        "NONMEM no-MU {} vs MLE {mle}",
-        nm_nomu["OBJ"]
-    );
+    assert!((nm_mu["OBJ"] - mle).abs() < 1e-3, "NONMEM MU {} vs MLE {mle}", nm_mu["OBJ"]);
+    assert!(nm_nomu["OBJ"] > mle + 1.0, "NONMEM no-MU {} vs MLE {mle}", nm_nomu["OBJ"]);
 
     // NONMEM is spelling-invariant: the inline `MU_1` stream ends bit-identical to the
     // split one, in the SAEM table and the scored one alike.
@@ -168,11 +149,7 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         ("TVE0", inline.theta[0], split.theta[0]),
         ("omega2", inline.omega[(0, 0)], split.omega[(0, 0)]),
     ] {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "inline vs split {what}: {a} vs {b}"
-        );
+        assert_eq!(a.to_bits(), b.to_bits(), "inline vs split {what}: {a} vs {b}");
     }
     let ofv_rel = (inline.ofv - split.ofv).abs() / split.ofv.abs();
     assert!(
@@ -206,10 +183,7 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     // What each spelling is told. Neither mu-referenced one is warned. The control names
     // BASE and says why splitting would not help, since its theta is read elsewhere.
     let not_mu = |f: &ferx_core::types::FitResult| {
-        f.warnings
-            .iter()
-            .find(|w| w.contains("not mu-referenced:"))
-            .cloned()
+        f.warnings.iter().find(|w| w.contains("not mu-referenced:")).cloned()
     };
     assert_eq!(not_mu(&split), None, "split: {:?}", split.warnings);
     assert_eq!(not_mu(&inline), None, "inline: {:?}", inline.warnings);

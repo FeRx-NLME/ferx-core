@@ -126,10 +126,9 @@ fn rewrite_line(code: &str, fit: &FitResult) -> String {
             for b in &names[..=r] {
                 let v = match kind.as_str() {
                     "block_omega" => entry(&fit.omega, &fit.eta_names, a, b),
-                    "block_kappa" => fit
-                        .omega_iov
-                        .as_ref()
-                        .and_then(|m| entry(m, &fit.kappa_names, a, b)),
+                    "block_kappa" => {
+                        fit.omega_iov.as_ref().and_then(|m| entry(m, &fit.kappa_names, a, b))
+                    }
                     _ => sigma_covariance(fit, a, b),
                 };
                 let Some(v) = v else {
@@ -199,9 +198,7 @@ fn close(a: f64, b: f64) -> bool {
 /// Confirm `model` — the export, parsed — declares every estimate of `fit`.
 /// `weights` are the network θ, which a `Literal` export no longer declares.
 pub(super) fn check_fitted_values(
-    model: &CompiledModel,
-    fit: &FitResult,
-    weights: &HashSet<String>,
+    model: &CompiledModel, fit: &FitResult, weights: &HashSet<String>,
 ) -> Result<(), String> {
     let p = &model.default_params;
     let refuse = |what: String| {
@@ -214,16 +211,11 @@ pub(super) fn check_fitted_values(
         match index(&p.theta_names, name) {
             Some(i) if close(p.theta[i], want) => {}
             Some(i) => {
-                return refuse(format!(
-                    "theta {name} = {want:?} (declared {:?})",
-                    p.theta[i]
-                ))
+                return refuse(format!("theta {name} = {want:?} (declared {:?})", p.theta[i]))
             }
             None if weights.contains(name) => {}
             None => {
-                return refuse(format!(
-                    "theta {name}: the model declares no theta of that name"
-                ))
+                return refuse(format!("theta {name}: the model declares no theta of that name"))
             }
         }
     }
@@ -261,21 +253,14 @@ pub(super) fn check_fitted_values(
 }
 
 fn check_matrix(
-    kind: &str,
-    got: &OmegaMatrix,
-    want: &nalgebra::DMatrix<f64>,
-    names: &[String],
+    kind: &str, got: &OmegaMatrix, want: &nalgebra::DMatrix<f64>, names: &[String],
 ) -> Result<(), String> {
     for (i, a) in names.iter().enumerate() {
         for (j, b) in names.iter().enumerate().take(i + 1) {
             let w = want[(i, j)];
             let g = match (index(&got.eta_names, a), index(&got.eta_names, b)) {
                 (Some(gi), Some(gj)) => got.matrix[(gi, gj)],
-                _ => {
-                    return Err(format!(
-                        "{kind} {a}: the model declares no {kind} of that name"
-                    ))
-                }
+                _ => return Err(format!("{kind} {a}: the model declares no {kind} of that name")),
             };
             if !close(g, w) {
                 return Err(if i == j {

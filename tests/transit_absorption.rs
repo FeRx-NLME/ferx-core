@@ -138,21 +138,13 @@ fn pop_single_oral(obs_times: Vec<f64>) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![dose],
-            obs_times,
-            vec![0.0; n],
-            vec![2; n],
-        )],
+        subjects: vec![common::subject("1", vec![dose], obs_times, vec![0.0; n], vec![2; n])],
     }
 }
 
 #[test]
 fn transit_curve_recovers_dose_auc_and_has_delayed_peak() {
-    let model = parse_full_model(TRANSIT_MODEL)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(TRANSIT_MODEL).expect("transit model parses").model;
 
     // 0, 0.25, …, 72.0 — fine enough for trapezoidal AUC, long enough that the
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
@@ -185,28 +177,18 @@ fn transit_curve_recovers_dose_auc_and_has_delayed_peak() {
     // (3) Mass balance via the absorption-independent invariant AUC∞ = Dose/CL.
     //     Catches a missing forcing (AUC → 0) or a double-counted bolus
     //     (AUC → 2·Dose/CL).
-    let auc: f64 = preds
-        .windows(2)
-        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-        .sum();
+    let auc: f64 =
+        preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
     let auc_inf = 100.0 / 5.0; // F·Dose/CL with F = 1, CL = 5
     let rel = (auc - auc_inf).abs() / auc_inf;
-    assert!(
-        rel < 0.02,
-        "transit AUC {:.4} vs Dose/CL {:.4} (rel err {:.2e})",
-        auc,
-        auc_inf,
-        rel
-    );
+    assert!(rel < 0.02, "transit AUC {:.4} vs Dose/CL {:.4} (rel err {:.2e})", auc, auc_inf, rel);
 }
 
 #[test]
 fn transit_normal_dosing_passes_data_checks() {
     // Positive control: ordinary (non-SS) dosing into the transit compartment
     // raises no absorption diagnostic.
-    let model = parse_full_model(TRANSIT_MODEL)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(TRANSIT_MODEL).expect("transit model parses").model;
     let pop = pop_single_oral(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -223,9 +205,7 @@ fn ss_dose_into_transit_compartment_is_supported() {
     // forward R_in), so `check_model_data` must NOT raise E_ABSORPTION_SS, and `predict()`
     // returns finite steady-state values. (The numerical fidelity vs an explicit run-in is
     // pinned by `ode::predictions::tests::ss_into_*_matches_explicit_run_in`.)
-    let model = parse_full_model(TRANSIT_MODEL)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(TRANSIT_MODEL).expect("transit model parses").model;
     let ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0); // SS=1, II=12
     let obs = vec![1.0, 6.0, 11.5];
     let n = obs.len();
@@ -235,13 +215,7 @@ fn ss_dose_into_transit_compartment_is_supported() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![ss_dose],
-            obs,
-            vec![0.0; n],
-            vec![2; n],
-        )],
+        subjects: vec![common::subject("1", vec![ss_dose], obs, vec![0.0; n], vec![2; n])],
     };
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -264,9 +238,7 @@ fn infusion_into_transit_compartment_is_supported() {
     // and the plain `+rate` injection is suppressed — so `check_model_data` must NOT raise
     // E_ABSORPTION_RATE, and `predict()` returns finite values. (The numerical fidelity vs a
     // sub-dose train is pinned by `ode::predictions::tests::infusion_into_*_matches_subdose_train`.)
-    let model = parse_full_model(TRANSIT_MODEL)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(TRANSIT_MODEL).expect("transit model parses").model;
     let inf_dose = DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0); // RATE=10>0 into depot (CMT 1)
     let obs = vec![1.0, 6.0, 12.0];
     let n = obs.len();
@@ -276,13 +248,7 @@ fn infusion_into_transit_compartment_is_supported() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![inf_dose],
-            obs,
-            vec![0.0; n],
-            vec![2; n],
-        )],
+        subjects: vec![common::subject("1", vec![inf_dose], obs, vec![0.0; n], vec![2; n])],
     };
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -303,9 +269,7 @@ fn steady_state_infusion_into_transit_compartment_is_rejected() {
     // SS=1 *and* RATE>0 into a transit compartment: steady-state dosing and infusion-into-kernel
     // are each supported alone, but their combination (a periodic zero-order source feeding the
     // kernel) is a follow-up — rejected with E_ABSORPTION_SS_INFUSION rather than mis-served.
-    let model = parse_full_model(TRANSIT_MODEL)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(TRANSIT_MODEL).expect("transit model parses").model;
     let mut ss_inf = DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0); // SS=1, RATE=25, II=12
     ss_inf.ii = 12.0;
     let pop = Population {
@@ -338,9 +302,7 @@ fn steady_state_infusion_with_zero_ii_into_transit_compartment_is_rejected() {
     // `d.ii > 0.0` and fall to the plain-infusion branch — silently served as a single non-SS
     // infusion (a different model than asked for) while the closed-form path errors on the same
     // dose. The unsupported combination must error on both paths (#719 gap 2 review).
-    let model = parse_full_model(TRANSIT_MODEL)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(TRANSIT_MODEL).expect("transit model parses").model;
     let ss_inf = DoseEvent::new(0.0, 100.0, 1, 25.0, true, 0.0); // SS=1, RATE=25, II=0
     let pop = Population {
         covariate_names: Vec::new(),
@@ -369,9 +331,8 @@ fn steady_state_infusion_with_zero_ii_into_transit_compartment_is_rejected() {
 fn transit_with_diffusion_block_is_rejected() {
     // A built-in input-rate model + a [diffusion] block (SDE/EKF) is rejected:
     // the EKF propagation does not carry the R_in forcing.
-    let model = parse_full_model(TRANSIT_DIFFUSION_MODEL)
-        .expect("transit+diffusion model parses")
-        .model;
+    let model =
+        parse_full_model(TRANSIT_DIFFUSION_MODEL).expect("transit+diffusion model parses").model;
     let pop = pop_single_oral(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -390,10 +351,7 @@ fn transit_model_with_undeclared_param_fails_to_parse() {
     let err = parse_full_model(&bad)
         .err()
         .expect("expected a parse error for an undeclared transit parameter");
-    assert!(
-        err.contains("not a declared individual parameter"),
-        "unexpected parse error: {err}"
-    );
+    assert!(err.contains("not a declared individual parameter"), "unexpected parse error: {err}");
 }
 
 #[test]

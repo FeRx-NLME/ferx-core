@@ -242,10 +242,8 @@ pub const ODE_ONLY_ROLES: &[&str] = &["dur", "td", "beta", "clmm", "km"];
 /// Read in `[individual_parameters]` order, first match wins; `None` when the
 /// model declares no such parameter.
 fn reserved_binding(lines: &[String], spellings: &[&str]) -> Option<String> {
-    let declared: Vec<&str> = lines
-        .iter()
-        .filter_map(|l| l.split_once('=').map(|(lhs, _)| lhs.trim()))
-        .collect();
+    let declared: Vec<&str> =
+        lines.iter().filter_map(|l| l.split_once('=').map(|(lhs, _)| lhs.trim())).collect();
     lines.iter().find_map(|line| {
         let (lhs, rhs) = line.split_once('=')?;
         let (lhs, rhs) = (lhs.trim(), rhs.trim());
@@ -258,11 +256,7 @@ fn reserved_binding(lines: &[String], spellings: &[&str]) -> Option<String> {
             && rhs.chars().all(|c| c.is_alphanumeric() || c == '_')
             && !rhs.is_empty()
             && declared.contains(&rhs);
-        Some(if alias {
-            rhs.to_string()
-        } else {
-            lhs.to_string()
-        })
+        Some(if alias { rhs.to_string() } else { lhs.to_string() })
     })
 }
 
@@ -295,8 +289,7 @@ impl Structure {
     /// elimination in an `[odes]` block this cannot read back, so neither is
     /// a point the search can move from.
     pub fn from_model(
-        template: &PkTemplate,
-        text: Option<&ferx_core::edit::ModelText>,
+        template: &PkTemplate, text: Option<&ferx_core::edit::ModelText>,
     ) -> Result<Structure, String> {
         let name = template.name.as_str();
         if template.keyword != "pk" {
@@ -360,10 +353,7 @@ impl Structure {
                 ))
             }
         };
-        let lagtime = template
-            .bindings
-            .iter()
-            .any(|(role, _)| slot_of(role) == "lagtime");
+        let lagtime = template.bindings.iter().any(|(role, _)| slot_of(role) == "lagtime");
         Ok(Structure {
             absorption,
             // A `pk` line eliminates first-order; there is no other analytic
@@ -451,10 +441,7 @@ impl Structure {
 
     /// The candidate's coordinates for the runner table and the journal.
     pub fn feature_vector(&self) -> FeatureVector {
-        self.features()
-            .iter()
-            .map(|k| (k.category().to_string(), k.argument()))
-            .collect()
+        self.features().iter().map(|k| (k.category().to_string(), k.argument())).collect()
     }
 
     /// Why no template can express this point, when none can.
@@ -571,11 +558,7 @@ impl Structure {
             ("three", "oral") => "three_cpt_oral",
             _ => unreachable!("unbuildable() rejects every other combination"),
         };
-        Ok(Template {
-            name,
-            roles,
-            engine: self.engine(),
-        })
+        Ok(Template { name, roles, engine: self.engine() })
     }
 }
 
@@ -636,10 +619,7 @@ pub fn space_features(mfl: &Mfl) -> Result<Vec<FeatureKey>, String> {
                 }
             }
             Feature::Transits { counts, depot } => {
-                if depot
-                    .as_ref()
-                    .is_some_and(|d| d.expand().contains(&DepotMode::Depot))
-                {
+                if depot.as_ref().is_some_and(|d| d.expand().contains(&DepotMode::Depot)) {
                     return Err(
                         "modelsearch: TRANSITS(n, DEPOT) has no analytic template; the coverage \
                          check should have refused it"
@@ -683,13 +663,7 @@ pub fn onto_space(base: &Structure, space: &[FeatureKey]) -> Vec<FeatureKey> {
     let has = base.features();
     let mut moves = Vec::new();
     // Pharmpy's order: absorption, elimination, transits, peripherals, lagtime.
-    for category in [
-        "ABSORPTION",
-        "ELIMINATION",
-        "TRANSITS",
-        "PERIPHERALS",
-        "LAGTIME",
-    ] {
+    for category in ["ABSORPTION", "ELIMINATION", "TRANSITS", "PERIPHERALS", "LAGTIME"] {
         let listed: Vec<&FeatureKey> = space.iter().filter(|k| k.category() == category).collect();
         if listed.is_empty() || listed.iter().any(|k| has.contains(k)) {
             continue;
@@ -706,10 +680,7 @@ pub fn onto_space(base: &Structure, space: &[FeatureKey]) -> Vec<FeatureKey> {
 /// are `funcs` (the base's own features already removed). `current` is the
 /// structure the path stands on.
 pub fn allowed(
-    key: &FeatureKey,
-    applied: &[FeatureKey],
-    funcs: &[FeatureKey],
-    current: &Structure,
+    key: &FeatureKey, applied: &[FeatureKey], funcs: &[FeatureKey], current: &Structure,
 ) -> bool {
     if applied.contains(key) {
         return false;
@@ -731,9 +702,7 @@ pub fn allowed(
                 _ => None,
             })
             .collect();
-        let previous = applied
-            .iter()
-            .any(|k| matches!(k, FeatureKey::Peripherals(_)));
+        let previous = applied.iter().any(|k| matches!(k, FeatureKey::Peripherals(_)));
         if !previous {
             return all.iter().min() == Some(n);
         }
@@ -766,10 +735,8 @@ pub(crate) fn pharmpy_incompatible(a: &FeatureKey, b: &FeatureKey) -> bool {
     let pair = |x: &FeatureKey, y: &FeatureKey| {
         matches!(
             (x, y),
-            (
-                Absorption(self::Absorption::Fo),
-                Transits(TransitCount::Count(1))
-            ) | (Absorption(self::Absorption::Inst), Lagtime(true))
+            (Absorption(self::Absorption::Fo), Transits(TransitCount::Count(1)))
+                | (Absorption(self::Absorption::Inst), Lagtime(true))
                 | (Absorption(self::Absorption::Inst), Transits(_))
                 | (Absorption(self::Absorption::Zo), Transits(_))
                 | (Absorption(self::Absorption::Weibull), Transits(_))
@@ -875,11 +842,7 @@ pub fn theta_decls_of(text: &ferx_core::edit::ModelText) -> Vec<ThetaDecl> {
             let fixed = args
                 .split(|c: char| !c.is_alphanumeric())
                 .any(|tok| tok.eq_ignore_ascii_case("FIX"));
-            out.push(ThetaDecl {
-                name: name.to_string(),
-                init,
-                fixed,
-            });
+            out.push(ThetaDecl { name: name.to_string(), init, fixed });
         }
     }
     out
@@ -887,10 +850,7 @@ pub fn theta_decls_of(text: &ferx_core::edit::ModelText) -> Vec<ThetaDecl> {
 
 /// The `theta` inits of a model text, by name.
 pub fn theta_inits_of(text: &ferx_core::edit::ModelText) -> HashMap<String, f64> {
-    theta_decls_of(text)
-        .into_iter()
-        .map(|d| (d.name, d.init))
-        .collect()
+    theta_decls_of(text).into_iter().map(|d| (d.name, d.init)).collect()
 }
 
 /// The η names a model text declares, on `omega` lines and inside
@@ -905,11 +865,7 @@ pub fn eta_names_of(text: &ferx_core::edit::ModelText) -> Vec<String> {
         } else if let Some(rest) = line.strip_prefix("block_omega") {
             if let Some(inner) = rest.split_once('(').and_then(|(_, r)| r.split_once(')')) {
                 out.extend(
-                    inner
-                        .0
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
+                    inner.0.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 );
             }
         }
@@ -930,8 +886,7 @@ pub fn parameter_names_of(text: &ferx_core::edit::ModelText) -> Vec<String> {
 /// or a parameter set from a number or from a θ — `FIX`ed θ and literals
 /// are a count, a free θ is `N`.
 fn transit_count_of(
-    template: &PkTemplate,
-    text: &ferx_core::edit::ModelText,
+    template: &PkTemplate, text: &ferx_core::edit::ModelText,
 ) -> Result<TransitCount, String> {
     let var = template
         .bindings
@@ -1005,11 +960,8 @@ impl Defaults {
 
     /// Read the defaults off a base model and its dataset.
     pub fn new(
-        parameters: Vec<String>,
-        theta_names: Vec<String>,
-        theta_init: Vec<f64>,
-        eta_names: Vec<String>,
-        population: &Population,
+        parameters: Vec<String>, theta_names: Vec<String>, theta_init: Vec<f64>,
+        eta_names: Vec<String>, population: &Population,
     ) -> Defaults {
         let t_first = population
             .subjects
@@ -1045,11 +997,7 @@ impl Defaults {
         let positive = |v: f64| if v.is_finite() && v > 0.0 { v } else { 1.0 };
         Defaults {
             parameters,
-            theta_init: theta_names
-                .iter()
-                .cloned()
-                .zip(theta_init.iter().copied())
-                .collect(),
+            theta_init: theta_names.iter().cloned().zip(theta_init.iter().copied()).collect(),
             theta_names,
             eta_names,
             t_first: if t_first.is_finite() { t_first } else { 1.0 },
@@ -1062,10 +1010,8 @@ impl Defaults {
     /// `[individual_parameters]` line mentions. `None` when the line reads
     /// no declared θ (a parameter set from a covariate or a literal).
     fn init_behind(&self, lines: &[String], param: &str) -> Option<f64> {
-        let line = lines.iter().find(|l| {
-            l.split_once('=')
-                .is_some_and(|(lhs, _)| lhs.trim() == param)
-        })?;
+        let line =
+            lines.iter().find(|l| l.split_once('=').is_some_and(|(lhs, _)| lhs.trim() == param))?;
         let rhs = line.split_once('=')?.1;
         rhs.split(|c: char| !(c.is_alphanumeric() || c == '_'))
             .find_map(|tok| self.theta_init.get(tok).copied())
@@ -1188,12 +1134,8 @@ fn default_name(role: &str) -> &'static str {
 /// — a parent that already declares `KM` keeps it, and with it whatever the
 /// seeding step put in its θ.
 pub fn structural_spec(
-    target: &Structure,
-    parent: &Structure,
-    parent_template: &PkTemplate,
-    parent_lines: &[String],
-    defaults: &Defaults,
-    iiv: IivStrategy,
+    target: &Structure, parent: &Structure, parent_template: &PkTemplate, parent_lines: &[String],
+    defaults: &Defaults, iiv: IivStrategy,
 ) -> Result<StructuralSpec, String> {
     let template = target.template()?;
     // A different transit coordinate needs a different `n` declaration —
@@ -1201,11 +1143,8 @@ pub fn structural_spec(
     // existing name as it is. So the count is bound to a *fresh* parameter,
     // and the parent's old one, now unreferenced, is pruned with its θ.
     let rebind_n = target.transits.is_some() && target.transits != parent.transits;
-    let mut bound: HashMap<&str, String> = parent_template
-        .bindings
-        .iter()
-        .map(|(role, var)| (slot_of(role), var.clone()))
-        .collect();
+    let mut bound: HashMap<&str, String> =
+        parent_template.bindings.iter().map(|(role, var)| (slot_of(role), var.clone())).collect();
     // An `ode_template` line takes the disposition roles only, so a parent
     // that is itself an ODE candidate carries its bioavailability and lag
     // time in `[individual_parameters]` instead — as the reserved name
@@ -1222,12 +1161,8 @@ pub fn structural_spec(
         }
     }
 
-    let cl_init = bound
-        .get("cl")
-        .and_then(|p| defaults.init_behind(parent_lines, p));
-    let vc_init = bound
-        .get("v")
-        .and_then(|p| defaults.init_behind(parent_lines, p));
+    let cl_init = bound.get("cl").and_then(|p| defaults.init_behind(parent_lines, p));
+    let vc_init = bound.get("v").and_then(|p| defaults.init_behind(parent_lines, p));
     // Pharmpy's fallback when the model gives no clearance/volume to scale from.
     let cl = cl_init.unwrap_or(0.1);
     let vc = vc_init.unwrap_or(0.1 / 0.05);
@@ -1254,13 +1189,7 @@ pub fn structural_spec(
             // name the parent declares for anything else.
             let old = bound.get("n").map(String::as_str).unwrap_or("");
             (1..)
-                .map(|k| {
-                    if k == 1 {
-                        "NTR".to_string()
-                    } else {
-                        format!("NTR{k}")
-                    }
-                })
+                .map(|k| if k == 1 { "NTR".to_string() } else { format!("NTR{k}") })
                 .find(|n| n != old && !defaults.parameters.contains(n))
                 .expect("an untaken name exists")
         } else {
@@ -1278,15 +1207,7 @@ pub fn structural_spec(
         }
         let (init, lower, upper) = match *role {
             "ka" => (1.0 / (2.0 * defaults.t_first), 0.0, 1e6),
-            "q" | "q2" => (
-                if target.peripherals >= 2 {
-                    0.1 * cl
-                } else {
-                    cl
-                },
-                0.0,
-                1e6,
-            ),
+            "q" | "q2" => (if target.peripherals >= 2 { 0.1 * cl } else { cl }, 0.0, 1e6),
             "q3" => (0.9 * cl, 0.0, 1e6),
             "v2" | "v3" => (0.05 * vc, 0.0, 1e6),
             "lagtime" | "mtt" => (defaults.t_first / 2.0, 0.0, 1e6),
@@ -1333,7 +1254,7 @@ pub fn structural_spec(
             IivStrategy::AbsorptionDelay => delay,
             IivStrategy::Fullblock => {
                 return Err(
-                    "modelsearch: iiv_strategy = \"fullblock\" is not available (#1183)".into(),
+                    "modelsearch: iiv_strategy = \"fullblock\" is not available (#1183)".into()
                 )
             }
         };
@@ -1368,17 +1289,11 @@ pub fn structural_spec(
     // coordinate that reads it, and the loop records every ODE-only role it
     // walks.
     let named = |role: &str| -> String {
-        ode_names
-            .get(role)
-            .cloned()
-            .expect("template() lists the role its variant reads")
+        ode_names.get(role).cloned().expect("template() lists the role its variant reads")
     };
     let input = match target.absorption {
         Absorption::Zo => InputForm::ZeroOrder { dur: named("dur") },
-        Absorption::Weibull => InputForm::Weibull {
-            td: named("td"),
-            beta: named("beta"),
-        },
+        Absorption::Weibull => InputForm::Weibull { td: named("td"), beta: named("beta") },
         Absorption::Inst | Absorption::Fo => InputForm::Template,
     };
     let elimination = match target.elimination {
@@ -1386,10 +1301,7 @@ pub fn structural_spec(
         // Zero-order elimination differs from Michaelis-Menten only in the
         // `FIX` on `KM`, which is a `[parameters]` declaration, not a term.
         Elimination::Zo | Elimination::Mm => EliminationForm::MichaelisMenten { km: named("km") },
-        Elimination::MixFoMm => EliminationForm::MixedFoMm {
-            clmm: named("clmm"),
-            km: named("km"),
-        },
+        Elimination::MixFoMm => EliminationForm::MixedFoMm { clmm: named("clmm"), km: named("km") },
     };
     Ok(spec.ode(input, elimination))
 }

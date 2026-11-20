@@ -49,24 +49,14 @@ fn simulate_samples_inter_occasion_kappa() {
     // inter-occasion variability.
     let mut zero_iov = model.default_params.clone();
     {
-        let om = zero_iov
-            .omega_iov
-            .as_mut()
-            .expect("omega_iov present for an IOV model");
+        let om = zero_iov.omega_iov.as_mut().expect("omega_iov present for an IOV model");
         om.chol.fill(0.0);
         om.matrix.fill(0.0);
     }
     let without_iov = simulate_with_seed(&model, &pop, &zero_iov, n_sim, seed).unwrap();
 
-    assert_eq!(
-        with_iov.len(),
-        without_iov.len(),
-        "same design ⇒ same number of simulated rows"
-    );
-    assert!(
-        ipreds(&with_iov).iter().all(|v| v.is_finite()),
-        "simulated ipreds must be finite"
-    );
+    assert_eq!(with_iov.len(), without_iov.len(), "same design ⇒ same number of simulated rows");
+    assert!(ipreds(&with_iov).iter().all(|v| v.is_finite()), "simulated ipreds must be finite");
 
     // The fitted Omega_IOV must actually move the predictions. Old code: kappa is
     // always zero, so the two runs are byte-identical and this fails.
@@ -120,12 +110,8 @@ fn simulate_iov_recovers_omega_iov_variance() {
     let model = parse_model_file(Path::new("tests/fixtures/iov_anchor.ferx"))
         .expect("iov_anchor model parses");
     assert!(model.n_kappa > 0, "anchor must declare IOV (kappa)");
-    let pop = read_nonmem_csv(
-        Path::new("tests/fixtures/iov_anchor.csv"),
-        None,
-        Some("OCC"),
-    )
-    .expect("iov_anchor data loads");
+    let pop = read_nonmem_csv(Path::new("tests/fixtures/iov_anchor.csv"), None, Some("OCC"))
+        .expect("iov_anchor data loads");
 
     // 20 replicates, fixed seed ⇒ deterministic; df≈12000 so the estimate's
     // SE (~5e-4) is far below the ferx↔NONMEM gap, turning this into a tight
@@ -138,15 +124,9 @@ fn simulate_iov_recovers_omega_iov_variance() {
     // by `id` alone would fold in between-replicate spread. Occasion ↔ time {0,24,48}.
     let mut by_subj: BTreeMap<(usize, String), BTreeMap<u64, f64>> = BTreeMap::new();
     for r in &rows {
-        assert!(
-            r.ipred.is_finite() && r.ipred > 0.0,
-            "ipred must be positive"
-        );
+        assert!(r.ipred.is_finite() && r.ipred > 0.0, "ipred must be positive");
         let occ = (r.time / 24.0).round() as u64;
-        by_subj
-            .entry((r.sim, r.id.clone()))
-            .or_default()
-            .insert(occ, r.ipred.ln());
+        by_subj.entry((r.sim, r.id.clone())).or_default().insert(occ, r.ipred.ln());
     }
 
     // Pooled within-subject between-occasion variance: Σ Σ (x − mean_i)² / Σ (n_i − 1).
@@ -215,10 +195,7 @@ fn simulate_iov_applies_scaling_without_occasion_labels() {
     .unwrap();
 
     assert_eq!(with_occ.len(), no_occ.len(), "same rows ⇒ same row count");
-    assert!(
-        !with_occ.is_empty(),
-        "fixture must produce observation rows"
-    );
+    assert!(!with_occ.is_empty(), "fixture must produce observation rows");
     for (a, b) in with_occ.iter().zip(no_occ.iter()) {
         assert!(
             a.ipred.is_finite() && a.ipred > 0.0 && b.ipred.is_finite() && b.ipred > 0.0,
@@ -266,12 +243,8 @@ fn simulate_iov_scaling_matches_nonmem_occasionless() {
     assert!(model.n_kappa > 0, "anchor must declare IOV (kappa)");
     // Read WITHOUT the occasion column: subjects carry no occasions ⇒ kappa = 0, which
     // exercises the fixed occasion-less scaling path.
-    let pop = read_nonmem_csv(
-        Path::new("tests/fixtures/iov_scaling_anchor.csv"),
-        None,
-        None,
-    )
-    .expect("iov_scaling_anchor data loads");
+    let pop = read_nonmem_csv(Path::new("tests/fixtures/iov_scaling_anchor.csv"), None, None)
+        .expect("iov_scaling_anchor data loads");
     assert!(
         pop.subjects.iter().all(|s| s.occasions.is_empty()),
         "anchor must be read occasion-less (no iov_column)"
@@ -282,10 +255,7 @@ fn simulate_iov_scaling_matches_nonmem_occasionless() {
     let logs: Vec<f64> = rows
         .iter()
         .map(|r| {
-            assert!(
-                r.ipred.is_finite() && r.ipred > 0.0,
-                "ipred must be positive"
-            );
+            assert!(r.ipred.is_finite() && r.ipred > 0.0, "ipred must be positive");
             r.ipred.ln()
         })
         .collect();

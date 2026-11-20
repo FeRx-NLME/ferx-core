@@ -72,9 +72,7 @@ fn ci_yml() -> Value {
 }
 
 fn jobs(yml: &Value) -> &serde_json::Map<String, Value> {
-    yml["jobs"]
-        .as_object()
-        .expect("ci.yml has a `jobs:` mapping")
+    yml["jobs"].as_object().expect("ci.yml has a `jobs:` mapping")
 }
 
 // ---------------------------------------------------------------------------------------
@@ -100,10 +98,7 @@ enum Tok {
 
 fn lex(src: &str) -> Vec<Tok> {
     let s = src.trim();
-    let s = s
-        .strip_prefix("${{")
-        .and_then(|r| r.strip_suffix("}}"))
-        .unwrap_or(s);
+    let s = s.strip_prefix("${{").and_then(|r| r.strip_suffix("}}")).unwrap_or(s);
     let b: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -233,12 +228,7 @@ impl Parser<'_> {
             }
             Tok::LParen => {
                 let v = self.or();
-                assert_eq!(
-                    self.next(),
-                    Tok::RParen,
-                    "unbalanced `(` in `if: {}`",
-                    self.src
-                );
+                assert_eq!(self.next(), Tok::RParen, "unbalanced `(` in `if: {}`", self.src);
                 v
             }
             Tok::Str(s) => Val::Str(s),
@@ -246,11 +236,7 @@ impl Parser<'_> {
                 let call = self.peek() == Some(&Tok::LParen);
                 if call {
                     self.pos += 1;
-                    assert_eq!(
-                        self.next(),
-                        Tok::RParen,
-                        "status functions take no arguments"
-                    );
+                    assert_eq!(self.next(), Tok::RParen, "status functions take no arguments");
                 }
                 match (id.as_str(), call) {
                     ("github.event_name", false) => Val::Str(self.ctx.event.to_string()),
@@ -281,12 +267,7 @@ fn eval_if(expr: Option<&str>, ctx: &Ctx) -> bool {
     let has_status = toks.iter().any(|t| {
         matches!(t, Tok::Ident(id) if ["always", "success", "failure", "cancelled"].contains(&id.as_str()))
     });
-    let mut p = Parser {
-        toks,
-        pos: 0,
-        ctx,
-        src,
-    };
+    let mut p = Parser { toks, pos: 0, ctx, src };
     let v = p.or();
     assert!(p.pos == p.toks.len(), "trailing tokens in `if: {src}`");
     let b = p.bool(v);
@@ -311,9 +292,7 @@ fn running_jobs(yml: &Value, event: &str) -> BTreeSet<String> {
     let jobs = jobs(yml);
     let mut memo = std::collections::BTreeMap::<String, bool>::new();
     fn runs(
-        id: &str,
-        jobs: &serde_json::Map<String, Value>,
-        event: &str,
+        id: &str, jobs: &serde_json::Map<String, Value>, event: &str,
         memo: &mut std::collections::BTreeMap<String, bool>,
     ) -> bool {
         if let Some(&r) = memo.get(id) {
@@ -325,10 +304,7 @@ fn running_jobs(yml: &Value, event: &str) -> BTreeSet<String> {
         memo.insert(id.to_string(), r);
         r
     }
-    jobs.keys()
-        .filter(|id| runs(id, jobs, event, &mut memo))
-        .cloned()
-        .collect()
+    jobs.keys().filter(|id| runs(id, jobs, event, &mut memo)).cloned().collect()
 }
 
 fn job_name(yml: &Value, id: &str) -> String {
@@ -361,12 +337,7 @@ fn ci_runs_on_the_merge_queue() {
     );
     let types = &on["merge_group"]["types"];
     assert!(
-        types.is_null()
-            || types
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|t| t == "checks_requested"),
+        types.is_null() || types.as_array().unwrap().iter().any(|t| t == "checks_requested"),
         "`merge_group:` must include `checks_requested`, the only merge-group activity: {types}"
     );
 }
@@ -386,11 +357,8 @@ fn in_the_queue_the_fast_gates_run_and_the_test_jobs_are_skipped() {
         );
     }
 
-    let expected: BTreeSet<String> = QUEUE_GATES
-        .iter()
-        .map(|s| s.to_string())
-        .chain([job_name(&yml, PATCH_JOB)])
-        .collect();
+    let expected: BTreeSet<String> =
+        QUEUE_GATES.iter().map(|s| s.to_string()).chain([job_name(&yml, PATCH_JOB)]).collect();
     let extra: Vec<_> = running_names.difference(&expected).collect();
     assert!(
         extra.is_empty(),
@@ -405,10 +373,7 @@ fn in_the_queue_the_fast_gates_run_and_the_test_jobs_are_skipped() {
     // (both satisfy it), or — for `codecov/patch` — the patch job posts it.
     for check in REQUIRED_CHECKS {
         if check == "codecov/patch" {
-            assert!(
-                running.contains(PATCH_JOB),
-                "nothing posts `codecov/patch` in the queue"
-            );
+            assert!(running.contains(PATCH_JOB), "nothing posts `codecov/patch` in the queue");
         } else {
             job_named(&yml, check);
         }
@@ -451,28 +416,13 @@ fn codecov_patch_is_posted_on_the_merge_group_commit_and_nowhere_else() {
         "`{PATCH_JOB}` needs `statuses: write` to post a commit status"
     );
     let steps = job["steps"].as_array().expect("steps");
-    let run: String = steps
-        .iter()
-        .filter_map(|s| s["run"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let env: String = steps
-        .iter()
-        .filter_map(|s| s.get("env"))
-        .map(|e| e.to_string())
-        .collect();
+    let run: String = steps.iter().filter_map(|s| s["run"].as_str()).collect::<Vec<_>>().join("\n");
+    let env: String = steps.iter().filter_map(|s| s.get("env")).map(|e| e.to_string()).collect();
     // Whole shell words, not substrings: `context=codecov/patchx` contains the needle
     // and would post a status no ruleset reads.
     let words: Vec<&str> = run.split_whitespace().collect();
-    for needle in [
-        "\"repos/$REPO/statuses/$SHA\"",
-        "state=success",
-        "context=codecov/patch",
-    ] {
-        assert!(
-            words.contains(&needle),
-            "`{PATCH_JOB}` no longer posts `{needle}`:\n{run}"
-        );
+    for needle in ["\"repos/$REPO/statuses/$SHA\"", "state=success", "context=codecov/patch"] {
+        assert!(words.contains(&needle), "`{PATCH_JOB}` no longer posts `{needle}`:\n{run}");
     }
     assert!(
         env.contains("github.event.merge_group.head_sha"),
@@ -516,13 +466,7 @@ fn the_evaluator_reads_the_spellings_ci_yml_uses() {
     assert!(ev(upload, "pull_request", false) && !ev(upload, "merge_group", false));
     assert!(ev("${{ always() }}", "merge_group", false));
     assert!(!ev("github.event_name == 'push'", "push", false));
-    assert!(!eval_if(
-        None,
-        &Ctx {
-            event: "push",
-            needs_ok: false
-        }
-    ));
+    assert!(!eval_if(None, &Ctx { event: "push", needs_ok: false }));
 
     assert!(ev("!(github.event_name == 'push')", "schedule", true));
 }
@@ -530,9 +474,5 @@ fn the_evaluator_reads_the_spellings_ci_yml_uses() {
 #[test]
 #[should_panic(expected = "outside what this guard can evaluate")]
 fn the_evaluator_refuses_a_context_it_does_not_model() {
-    ev(
-        "github.event.pull_request.head.repo.fork == false",
-        "pull_request",
-        true,
-    );
+    ev("github.event.pull_request.head.repo.fork == false", "pull_request", true);
 }

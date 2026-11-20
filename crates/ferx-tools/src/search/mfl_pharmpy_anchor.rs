@@ -106,22 +106,15 @@ fn anchor() -> Value {
 // --- ferx → Pharmpy's JSON shape ------------------------------------------------
 
 fn upper(names: &[String]) -> Value {
-    Value::Array(
-        names
-            .iter()
-            .map(|n| json!(n.to_ascii_uppercase()))
-            .collect(),
-    )
+    Value::Array(names.iter().map(|n| json!(n.to_ascii_uppercase())).collect())
 }
 
 fn modes_json<M: Mode>(m: &Modes<M>) -> Value {
     match m {
         Modes::Wildcard => json!("*"),
-        Modes::List(list) => Value::Array(
-            list.iter()
-                .map(|m| json!(m.label().to_ascii_uppercase()))
-                .collect(),
-        ),
+        Modes::List(list) => {
+            Value::Array(list.iter().map(|m| json!(m.label().to_ascii_uppercase())).collect())
+        }
     }
 }
 
@@ -172,13 +165,7 @@ fn ferx_json(s: &Statement) -> Value {
                 })
             }
             Feature::Lagtime(m) => json!({"type": "LAGTIME", "modes": modes_json(m)}),
-            Feature::Covariate {
-                optional,
-                parameters,
-                covariates,
-                effects,
-                op,
-            } => json!({
+            Feature::Covariate { optional, parameters, covariates, effects, op } => json!({
                 "type": "COVARIATE",
                 "parameter": operand_json(parameters),
                 "covariate": operand_json(covariates),
@@ -186,10 +173,7 @@ fn ferx_json(s: &Statement) -> Value {
                 "op": op.label(),
                 "optional": optional,
             }),
-            Feature::Allometry {
-                covariate,
-                reference,
-            } => json!({
+            Feature::Allometry { covariate, reference } => json!({
                 "type": "ALLOMETRY",
                 "covariate": covariate.to_ascii_uppercase(),
                 "reference": reference.as_ref().map(|r| r.parse::<f64>().expect("numeric")),
@@ -244,10 +228,7 @@ fn dedup_modes(v: &Value) -> Value {
 #[test]
 fn every_corpus_line_agrees_with_pharmpy_or_is_a_named_divergence() {
     let doc = anchor();
-    assert_eq!(
-        doc["pharmpy_version"], "2.0.0",
-        "regenerate: the divergence list is per version"
-    );
+    assert_eq!(doc["pharmpy_version"], "2.0.0", "regenerate: the divergence list is per version");
     let entries = doc["parse"].as_array().expect("parse array");
     assert!(entries.len() >= 70, "corpus shrank to {}", entries.len());
 
@@ -327,10 +308,7 @@ fn twin_context() -> ModelContext {
     let parsed = parse_full_model(TWIN).expect("twin parses");
     let text = ModelText::parse(TWIN).expect("twin is editable");
     let population = Population {
-        subjects: vec![Subject {
-            id: "1".into(),
-            ..Default::default()
-        }],
+        subjects: vec![Subject { id: "1".into(), ..Default::default() }],
         covariate_names: vec!["WT".into(), "CRCL".into(), "SEX".into()],
         dv_column: "DV".into(),
         input_columns: vec![],
@@ -360,11 +338,7 @@ fn set_of(v: &Value) -> BTreeSet<Tuple> {
 }
 
 fn names(v: &Value) -> BTreeSet<String> {
-    v.as_array()
-        .expect("names")
-        .iter()
-        .map(|s| s.as_str().unwrap().to_string())
-        .collect()
+    v.as_array().expect("names").iter().map(|s| s.as_str().unwrap().to_string()).collect()
 }
 
 #[test]
@@ -381,11 +355,7 @@ fn the_builtin_symbols_resolve_to_pharmpys_sets_on_the_twin_model() {
         ("CONTINUOUS", "continuous"),
         ("CATEGORICAL", "categorical"),
     ] {
-        assert_eq!(
-            as_set(ctx.builtin(symbol).unwrap()),
-            names(&model[key]),
-            "@{symbol}"
-        );
+        assert_eq!(as_set(ctx.builtin(symbol).unwrap()), names(&model[key]), "@{symbol}");
     }
     assert!(
         !names(&model["categorical"]).is_empty(),
@@ -422,18 +392,12 @@ fn expand_cases_agree_with_pharmpy_or_are_named_divergences() {
 
         if let Some((_, why)) = EXPAND_DIVERGENCES.iter().find(|(line, _)| *line == mfl) {
             seen.insert(mfl);
-            assert_ne!(
-                ferx, pharmpy,
-                "{mfl:?}: listed divergence ({why}) no longer differs"
-            );
+            assert_ne!(ferx, pharmpy, "{mfl:?}: listed divergence ({why}) no longer differs");
             if let (Ok(f), Ok(p)) = (&ferx, &pharmpy) {
                 // The override divergence is exactly the CL-CRCL tuples Pharmpy
                 // lost: ferx ⊃ Pharmpy, and the surplus is all `CL` on a
                 // covariate other than the explicit `WT`.
-                assert!(
-                    p.is_subset(f),
-                    "{mfl:?}: ferx must keep everything Pharmpy keeps"
-                );
+                assert!(p.is_subset(f), "{mfl:?}: ferx must keep everything Pharmpy keeps");
                 let surplus: Vec<&Tuple> = f.difference(p).collect();
                 assert!(!surplus.is_empty());
                 assert!(
@@ -451,8 +415,5 @@ fn expand_cases_agree_with_pharmpy_or_are_named_divergences() {
         }
     }
     let listed: BTreeSet<&str> = EXPAND_DIVERGENCES.iter().map(|(l, _)| *l).collect();
-    assert_eq!(
-        seen, listed,
-        "every listed divergence must be an expand case (and vice versa)"
-    );
+    assert_eq!(seen, listed, "every listed divergence must be an expand case (and vice versa)");
 }
