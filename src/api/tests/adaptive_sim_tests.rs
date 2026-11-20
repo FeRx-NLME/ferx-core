@@ -4040,7 +4040,7 @@ fn from_spec_observe_t_alias_fold_warns_at_parse_time() {
 fn from_spec_metrics_track_titration_and_window() {
     // End-to-end: the per-subject metrics row is populated from the same run's
     // ledger + decision log, keyed by (subject, draw, sim), and the
-    // `pct_time_in_window` metric reads the spec's `target_window`. Uses the
+    // `pct_readings_in_window` metric reads the spec's `target_window`. Uses the
     // converging titration with the band [8, 13] declared as the target.
     let parsed = parse_full_model(SPEC_TITRATE).expect("parse titrating block");
     let mut spec = parsed.adaptive_dosing.clone().expect("block present");
@@ -4075,7 +4075,7 @@ fn from_spec_metrics_track_titration_and_window() {
     assert_eq!(m.cumulative_dose, ledger_sum);
     assert!(m.signal_min.is_some() && m.signal_max.is_some() && m.signal_mean.is_some());
 
-    // pct_time_in_window re-derives from the decision log's latent troughs (#946; this
+    // pct_readings_in_window re-derives from the decision log's latent troughs (#946; this
     // Ipred block's latent equals its value).
     let n = res.decisions.len();
     let in_band = res
@@ -4083,7 +4083,7 @@ fn from_spec_metrics_track_titration_and_window() {
         .iter()
         .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].latent))
         .count();
-    assert_eq!(m.pct_time_in_window, Some(in_band as f64 / n as f64));
+    assert_eq!(m.pct_readings_in_window, Some(in_band as f64 / n as f64));
     // No `auc_target` on this spec ⇒ the window AUC is skipped and the
     // exposure metric stays unreported.
     assert_eq!(m.auc_target_attainment, None);
@@ -4204,7 +4204,7 @@ fn from_spec_metrics_degenerate_run_has_no_changes() {
     // The metrics half of the degenerate oracle: a block that never titrates
     // re-issues a fixed 100 mg at each of the 3 decisions, so the metrics show no
     // dose changes, no holds, no discontinuation, and — with no `target_window`
-    // declared — `pct_time_in_window` is unreported.
+    // declared — `pct_readings_in_window` is unreported.
     let parsed = parse_full_model(SPEC_DEGENERATE).expect("parse model + block");
     let spec = parsed.adaptive_dosing.as_ref().expect("block present");
     let pop = population(vec![subj("1", vec![6.0, 30.0, 54.0], vec![])]);
@@ -4227,7 +4227,7 @@ fn from_spec_metrics_degenerate_run_has_no_changes() {
     assert_eq!(m.n_holds, 0);
     assert!(!m.discontinued);
     assert_eq!(m.cumulative_dose, 300.0);
-    assert_eq!(m.pct_time_in_window, None, "no target_window in the block");
+    assert_eq!(m.pct_readings_in_window, None, "no target_window in the block");
 }
 
 #[test]
@@ -9287,10 +9287,10 @@ fn dv_monitor_metrics_are_scored_on_latent_signal_946() {
     assert_eq!(md.signal_min.map(f64::to_bits), mi.signal_min.map(f64::to_bits));
     assert_eq!(md.signal_max.map(f64::to_bits), mi.signal_max.map(f64::to_bits));
     assert_eq!(md.signal_mean.map(f64::to_bits), mi.signal_mean.map(f64::to_bits));
-    assert_eq!(md.pct_time_in_window, mi.pct_time_in_window);
+    assert_eq!(md.pct_readings_in_window, mi.pct_readings_in_window);
     assert_eq!(
-        md.pct_time_in_window,
+        md.pct_readings_in_window,
         Some(in_window(&latent) as f64 / latent.len() as f64),
-        "pct_time_in_window counts latent readings in the window"
+        "pct_readings_in_window counts latent readings in the window"
     );
 }

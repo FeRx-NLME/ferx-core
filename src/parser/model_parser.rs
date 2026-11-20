@@ -11021,7 +11021,7 @@ fn parse_adaptive_dosing_block(
                 start_interval = Some(d);
             }
             "target_window" => {
-                // Therapeutic band `[low, high]` for the `pct_time_in_window` metric
+                // Therapeutic band `[low, high]` for the `pct_readings_in_window` metric
                 // only — it does not affect dosing. `low` must be finite; `high` may
                 // be `inf` for a one-sided "at or above low" target. The same check
                 // runs in `AdaptiveDosingSpec::validate`.

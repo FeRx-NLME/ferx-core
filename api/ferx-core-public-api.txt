@@ -2317,7 +2317,7 @@ pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
@@ -4678,7 +4678,7 @@ pub ferx_core::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_core::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_core::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
