@@ -64,7 +64,7 @@ measured. A baseline is only comparable at the thread count it was taken at.
 | `=` | within ±25 % of the baseline | passes |
 | `▲` | more than 25 % above the baseline | **fails** |
 | `▼` | more than 25 % below the baseline: lock it in with `accept` | passes |
-| `!` | the probe drifted: `auto` stopped escalating, the outer gradient is not recorded as analytic (a missing field counts as drift), or a case's covariance status is not the expected one (`NotRequested` for `eval`, `Computed` for `fit`) | **fails** |
+| `!` | the probe drifted: `auto` stopped escalating, the outer gradient is not recorded as analytic (a missing field counts as drift), a compiled plan fell back to finite differences (`W_PLAN_FD_FALLBACK`, including in the covariance step, which still reports `Computed`), or a case's covariance status is not the expected one (`NotRequested` for `eval`, `Computed` for `fit`) | **fails** |
 | `✗` | the case failed, timed out, or was not run | **fails** |
 | `·` | not judged: another platform, thread count or input files than the baseline | passes |
 

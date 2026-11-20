@@ -90,6 +90,12 @@ FIT_OPTION_LINE = re.compile(r"^(  (maxiter|covariance) +=) (\S+)$", re.MULTILIN
 # memory — `report` flags it rather than calling it an improvement.
 ESCALATION_CODE = "W_ODE_SOLVER_ESCALATION_NOTE"
 
+# Any compiled plan that failed at run time and fell back to finite differences, in the
+# outer/inner gradient OR the covariance step. The covariance fallback leaves
+# `gradient_method_outer = analytic` and can still report `Computed`, so this warning is
+# the only evidence that e7070's spike site — the covariance step's plans — was skipped.
+PLAN_FALLBACK_CODE = "W_PLAN_FD_FALLBACK"
+
 # Where a run was measured. The nightly's GitHub-hosted runner is the reference; anything
 # else (a laptop, a container, emulation, a self-hosted runner) reports the same
 # `platform` string while its allocator, kernel and CPU can move peak RSS by more than
@@ -157,6 +163,12 @@ def probe_drift(case: str, rec: dict) -> list[str]:
     # Fail closed: a missing, null or renamed field is no evidence of the plan path.
     if rec.get("gradient_method_outer") != "analytic":
         drift.append(f"outer gradient is `{rec.get('gradient_method_outer')}`, not analytic")
+    # Fail closed: a record without the field was not checked for a fallback.
+    fallback = rec.get("plan_fallback")
+    if fallback != []:
+        drift.append("a compiled plan fell back to finite differences: "
+                     + ("; ".join(fallback) if isinstance(fallback, list) and fallback
+                        else "`plan_fallback` not recorded"))
     want = EXPECTED_COVARIANCE.get(case)
     got = rec.get("covariance_status")
     if want is None:
@@ -229,6 +241,7 @@ def run_case(ferx: str, case: str, timeout: int, rec: dict) -> None:
             covariance_status=covariance_label(fit.get("covariance_status")),
             gradient_method_outer=fit.get("gradient_method_outer"),
             escalated=any(ESCALATION_CODE in w for w in warnings),
+            plan_fallback=[w[:200] for w in warnings if PLAN_FALLBACK_CODE in w],
         )
 
 

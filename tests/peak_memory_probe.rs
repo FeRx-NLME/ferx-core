@@ -88,7 +88,7 @@ fn case(peak: u64, escalated: bool, gradient: &str, cov: &str) -> String {
     format!(
         r#"{{"status": "ok", "peak_rss_bytes": {peak}, "wall_s": 70.0, "ofv": -1212.9,
             "escalated": {escalated}, "gradient_method_outer": "{gradient}",
-            "covariance_status": "{cov}"}}"#
+            "covariance_status": "{cov}", "plan_fallback": []}}"#
     )
 }
 
@@ -318,6 +318,60 @@ fn changed_inputs_are_not_judged_against_the_old_baseline() {
 /// The fake binary checks the case's spelling of `maxiter` / `covariance`, so a rewrite
 /// that measured the eval twice would fail here; it reports a different peak per case,
 /// so a parser that read the wrong number would too.
+/// A covariance step whose compiled plans failed falls back to finite differences: it
+/// still reports `Computed` with `gradient_method_outer = analytic`, so only the
+/// `W_PLAN_FD_FALLBACK` warning shows that the spike site was not measured. Such a `fit`
+/// at a lower peak is drift, not an improvement, and `accept` refuses it; a record that
+/// never checked (`plan_fallback` absent) fails closed. The clean twin at the same peak
+/// is the ordinary `▼`.
+#[test]
+fn a_covariance_plan_fallback_is_drift_not_an_improvement() {
+    let low = 100 * MIB;
+    let msg = "W_PLAN_FD_FALLBACK: 3 of 100 subjects fell back to finite-difference \
+               derivatives (the covariance step)";
+    let fallback = case(low, true, "analytic", COMPUTED)
+        .replace(r#""plan_fallback": []"#, &format!(r#""plan_fallback": ["{msg}"]"#));
+    assert!(fallback.contains("W_PLAN_FD_FALLBACK"), "{fallback}");
+    let out = report("covfallback", "Linux/x86_64", eval_at(1.0), fallback.clone());
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        row(&t, "fit").contains("fell back") && row(&t, "fit").contains("covariance step"),
+        "{t}"
+    );
+    assert!(!row(&t, "fit").contains("improvement"), "{t}");
+
+    let unchecked = case(low, true, "analytic", COMPUTED).replace(r#", "plan_fallback": []"#, "");
+    assert!(!unchecked.contains("plan_fallback"), "{unchecked}");
+    let out = report("covunchecked", "Linux/x86_64", eval_at(1.0), unchecked);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(row(&text(&out), "fit").contains("not recorded"), "{}", text(&out));
+
+    let clean =
+        report("covclean", "Linux/x86_64", eval_at(1.0), case(low, true, "analytic", COMPUTED));
+    assert!(clean.status.success(), "{}", text(&clean));
+    assert!(row(&text(&clean), "fit").contains("improvement"), "{}", text(&clean));
+
+    let dir = scratch("covfallback-accept");
+    let res = write(
+        &dir,
+        "results.json",
+        &results("Linux/x86_64", &[("eval", eval_at(1.0)), ("fit", fallback)]),
+    );
+    let base = dir.join("baseline.json");
+    let acc = peakmem(&[
+        "accept",
+        "--results",
+        &res,
+        "--baseline",
+        base.to_str().unwrap(),
+        "--reason",
+        "r",
+    ]);
+    assert!(!acc.status.success(), "{}", text(&acc));
+    assert!(!base.exists(), "a refused accept must not write the baseline");
+}
+
 /// A baseline measured off the reference runner (a laptop, a container, emulation) is
 /// provisional. The first reference run against it fails, however well its numbers
 /// agree, and says to accept its artifact; a local run against the same baseline, and a
@@ -398,6 +452,22 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
         serde_json::from_str(&std::fs::read_to_string(&res).unwrap()).unwrap();
     assert_eq!(r["runner"], "local", "{r}");
 
+    // `run` lifts a plan-fallback warning out of the fit JSON into `plan_fallback`.
+    let clean_eval = std::fs::read_to_string(&eval_fit).unwrap();
+    let with_fallback = clean_eval.replace(
+        r#""warnings": ["#,
+        r#""warnings": ["W_PLAN_FD_FALLBACK: 2 of 100 subjects fell back (the covariance step)", "#,
+    );
+    assert_ne!(with_fallback, clean_eval);
+    std::fs::write(&eval_fit, &with_fallback).unwrap();
+    let out = peakmem(&[&run_args[..], &["--cases", "eval"]].concat());
+    assert!(out.status.success(), "{}", text(&out));
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&res).unwrap()).unwrap();
+    let fb = r["cases"]["eval"]["plan_fallback"].as_array().unwrap_or_else(|| panic!("{r}"));
+    assert!(fb.len() == 1 && fb[0].as_str().unwrap().contains("covariance step"), "{r}");
+    std::fs::write(&eval_fit, &clean_eval).unwrap();
+
     let out = peakmem_on(Some("github-hosted"), &run_args);
     assert!(out.status.success(), "{}", text(&out));
     let r: serde_json::Value =
@@ -410,6 +480,9 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
     // Recorded as the plain variant name, which is what `report` compares against.
     assert_eq!(r["cases"]["eval"]["covariance_status"], NOT_REQUESTED, "{r}");
     assert_eq!(r["cases"]["fit"]["covariance_status"], COMPUTED, "{r}");
+    for c in ["eval", "fit"] {
+        assert_eq!(r["cases"][c]["plan_fallback"], serde_json::json!([]), "{c}: {r}");
+    }
     let eval = r["cases"]["eval"]["peak_rss_bytes"].as_u64().unwrap();
     let fit_peak = r["cases"]["fit"]["peak_rss_bytes"].as_u64().unwrap();
     // The fit case allocates 152 MiB more than the eval case.
