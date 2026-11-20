@@ -100,11 +100,7 @@ mod self_consistency {
                     obs_records.push(record(t, EventType::Exact));
                 }
                 obs_records.push(record(c, EventType::RightCensored));
-                Subject {
-                    id: i.to_string(),
-                    obs_records,
-                    ..Default::default()
-                }
+                Subject { id: i.to_string(), obs_records, ..Default::default() }
             })
             .collect();
         let pop = Population {
@@ -144,10 +140,8 @@ mod self_consistency {
             let s = &v.strata[0];
             let km2 = &s.absolute[1];
             assert_eq!(km2.order, 2);
-            let curves = [
-                (&s.mcf.obs_on_grid, &s.mcf.lo, &s.mcf.hi),
-                (&km2.obs_on_grid, &km2.lo, &km2.hi),
-            ];
+            let curves =
+                [(&s.mcf.obs_on_grid, &s.mcf.lo, &s.mcf.hi), (&km2.obs_on_grid, &km2.lo, &km2.hi)];
             for (j, (obs, lo, hi)) in curves.into_iter().enumerate() {
                 for k in 0..3 {
                     let obs = obs[k].expect("observed curve defined");
@@ -160,18 +154,13 @@ mod self_consistency {
             }
         }
         let early = early / M as f64;
-        let cov: Vec<Vec<f64>> = inside
-            .iter()
-            .map(|c| c.iter().map(|&n| n as f64 / M as f64).collect())
-            .collect();
+        let cov: Vec<Vec<f64>> =
+            inside.iter().map(|c| c.iter().map(|&n| n as f64 / M as f64).collect()).collect();
         eprintln!(
             "left before H: {early:.3}; coverage at H/4, H/2, 3H/4: MCF {:?}, order-2 KM {:?}",
             cov[0], cov[1]
         );
-        assert!(
-            (0.75..0.85).contains(&early),
-            "dropout design drifted: {early}"
-        );
+        assert!((0.75..0.85).contains(&early), "dropout design drifted: {early}");
         for (name, c) in ["MCF", "order-2 KM"].iter().zip(&cov) {
             for (k, c) in c.iter().enumerate() {
                 assert!(

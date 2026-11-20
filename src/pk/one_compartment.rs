@@ -46,13 +46,7 @@ pub fn one_cpt_oral_f(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64, f_bio:
 /// so only the absorbed-bolus route exists here.
 #[inline]
 pub fn one_cpt_transit_f(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v: f64,
-    n: f64,
-    mtt: f64,
-    f_bio: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v: f64, n: f64, mtt: f64, f_bio: f64,
 ) -> f64 {
     one_cpt_transit_g::<f64>(dose.amt, t, cl, v, n, mtt, f_bio)
 }
@@ -63,11 +57,7 @@ pub fn one_cpt_transit_f(
 /// used for `[derived]` compartment amounts (#386). Returns 0 for invalid params or
 /// infusion doses (which transit rejects at parse).
 pub(crate) fn one_cpt_transit_depot(
-    dose: &DoseEvent,
-    tau: f64,
-    n: f64,
-    mtt: f64,
-    f_bio: f64,
+    dose: &DoseEvent, tau: f64, n: f64, mtt: f64, f_bio: f64,
 ) -> f64 {
     if tau < 0.0 || n < 0.0 || mtt <= 0.0 || dose.is_infusion() {
         return 0.0;
@@ -83,13 +73,7 @@ pub(crate) fn one_cpt_transit_depot(
 /// so only the absorbed-bolus route exists here.
 #[inline]
 pub fn one_cpt_ig_f(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v: f64,
-    mat: f64,
-    cv2: f64,
-    f_bio: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v: f64, mat: f64, cv2: f64, f_bio: f64,
 ) -> f64 {
     one_cpt_ig_g::<f64>(dose.amt, t, cl, v, mat, cv2, f_bio)
 }
@@ -104,23 +88,14 @@ pub(crate) fn one_cpt_ig_depot(dose: &DoseEvent, tau: f64, mat: f64, cv2: f64, f
     if tau < 0.0 || mat <= 0.0 || cv2 <= 0.0 || dose.is_infusion() {
         return 0.0;
     }
-    let absorbed_frac = IgAbsorption {
-        mat,
-        lambda: mat / cv2,
-    }
-    .tilted_cdf(tau, 0.0);
+    let absorbed_frac = IgAbsorption { mat, lambda: mat / cv2 }.tilted_cdf(tau, 0.0);
     f_bio * dose.amt * (1.0 - absorbed_frac)
 }
 
 /// Predict concentration from a single dose at elapsed time t using 1-cmt model.
 /// Parameters are passed as a HashMap-like slice: [cl, v, ka (optional), f (optional)]
 pub fn one_cpt_predict(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v: f64,
-    ka: Option<f64>,
-    f_bio: Option<f64>,
+    dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: Option<f64>, f_bio: Option<f64>,
 ) -> f64 {
     if dose.is_infusion() {
         one_cpt_infusion(dose, t, cl, v)
@@ -222,12 +197,7 @@ mod tests {
         for &t in &[0.0, 0.5, 1.0, 3.0, 8.0] {
             let transit_depot = one_cpt_transit_depot(&dose, t, 0.0, mtt, f);
             let oral_depot = one_cpt_oral_depot(&dose, t, ka, f);
-            assert_relative_eq!(
-                transit_depot,
-                oral_depot,
-                max_relative = 1e-9,
-                epsilon = 1e-12
-            );
+            assert_relative_eq!(transit_depot, oral_depot, max_relative = 1e-9, epsilon = 1e-12);
         }
     }
 
@@ -245,10 +215,7 @@ mod tests {
         assert!(one_cpt_transit_depot(&dose, 1e4, 3.0, 1.5, f) < 1e-6);
         // Invalid params / infusion dose → 0 (transit rejects infusions at parse).
         assert_eq!(one_cpt_transit_depot(&dose, -1.0, 3.0, 1.5, f), 0.0);
-        assert_eq!(
-            one_cpt_transit_depot(&infusion_dose(100.0, 50.0), 1.0, 3.0, 1.5, f),
-            0.0
-        );
+        assert_eq!(one_cpt_transit_depot(&infusion_dose(100.0, 50.0), 1.0, 3.0, 1.5, f), 0.0);
     }
 
     /// `transit_f` central concentration must reduce to the Bateman oral form at

@@ -177,9 +177,7 @@ pub(crate) struct CovariateModelContext<'a> {
 /// Every entry point rejects a model that still carries one, so a symbolic
 /// `center = median` can never silently fit as if the covariate were absent.
 pub(crate) fn apply_covariate_model(
-    block_lines: &[String],
-    parameters: &mut Vec<String>,
-    individual_parameters: &mut [String],
+    block_lines: &[String], parameters: &mut Vec<String>, individual_parameters: &mut [String],
     ctx: &CovariateModelContext<'_>,
 ) -> Result<CovariateModelSpec, String> {
     let indiv_names = top_level_assignments(individual_parameters);
@@ -228,13 +226,7 @@ pub(crate) fn apply_covariate_model(
     // reads one, so a factor is not mistaken for η-free (see below).
     let random_bearing = random_bearing_names(individual_parameters, ctx.eta_kappa_names);
     for e in &effects {
-        insert_effects(
-            individual_parameters,
-            &e.parameter,
-            &e.factors,
-            &e.terms,
-            &random_bearing,
-        )?;
+        insert_effects(individual_parameters, &e.parameter, &e.factors, &e.terms, &random_bearing)?;
     }
 
     Ok(CovariateModelSpec {
@@ -261,9 +253,7 @@ struct ParameterEffects {
 /// Parse every line of the block into a [`CovariateRelation`], resolving the
 /// centering statistic and default θ bounds where the data allows.
 fn parse_relations(
-    lines: &[String],
-    ctx: &CovariateModelContext<'_>,
-    indiv_names: &[String],
+    lines: &[String], ctx: &CovariateModelContext<'_>, indiv_names: &[String],
 ) -> Result<Vec<CovariateRelation>, String> {
     let mut out: Vec<CovariateRelation> = Vec::new();
     let mut seen_theta: HashSet<String> = HashSet::new();
@@ -273,10 +263,7 @@ fn parse_relations(
             continue;
         }
         let rel = parse_relation_line(line, ctx, indiv_names)?;
-        if out
-            .iter()
-            .any(|r| r.parameter == rel.parameter && r.covariate == rel.covariate)
-        {
+        if out.iter().any(|r| r.parameter == rel.parameter && r.covariate == rel.covariate) {
             return Err(format!(
                 "[covariate_model]: relation `{} ~ {}` is declared more than once — one line \
                  per (parameter, covariate) pair",
@@ -303,9 +290,7 @@ fn parse_relations(
 
 /// `PARAM ~ COV form(kwargs) [*|+] [=> THETA(init, lower, upper)[, ...]]`
 fn parse_relation_line(
-    line: &str,
-    ctx: &CovariateModelContext<'_>,
-    indiv_names: &[String],
+    line: &str, ctx: &CovariateModelContext<'_>, indiv_names: &[String],
 ) -> Result<CovariateRelation, String> {
     let (body, theta_clause) = match line.split_once("=>") {
         Some((b, t)) => (b.trim(), Some(t.trim())),
@@ -313,15 +298,11 @@ fn parse_relation_line(
     };
     let (body, op) = split_trailing_op(body, line)?;
     let Some((param, rest)) = body.split_once('~') else {
-        return Err(format!(
-            "[covariate_model]: expected `PARAM ~ COV form(...)`, got `{line}`"
-        ));
+        return Err(format!("[covariate_model]: expected `PARAM ~ COV form(...)`, got `{line}`"));
     };
     let param = param.trim();
     if param.is_empty() {
-        return Err(format!(
-            "[covariate_model]: missing parameter name in `{line}`"
-        ));
+        return Err(format!("[covariate_model]: missing parameter name in `{line}`"));
     }
     if !indiv_names.iter().any(|n| n == param) {
         return Err(format!(
@@ -341,18 +322,14 @@ fn parse_relation_line(
             form_list()
         ));
     }
-    let decl = ctx
-        .decls
-        .iter()
-        .find(|d| d.name == covariate)
-        .ok_or_else(|| {
-            format!(
-                "[covariate_model]: covariate `{covariate}` is not declared in [covariates] \
+    let decl = ctx.decls.iter().find(|d| d.name == covariate).ok_or_else(|| {
+        format!(
+            "[covariate_model]: covariate `{covariate}` is not declared in [covariates] \
                  (declared: {}). The block is authoritative: a relation's form and levels are \
                  read off the declaration, so it must be stated.",
-                join_names(&ctx.decls.iter().map(|d| d.name.clone()).collect::<Vec<_>>())
-            )
-        })?;
+            join_names(&ctx.decls.iter().map(|d| d.name.clone()).collect::<Vec<_>>())
+        )
+    })?;
 
     let (form, kwargs) = parse_form(form_src)?;
     check_kind(&form, decl)?;
@@ -360,10 +337,7 @@ fn parse_relation_line(
     let center = center_argument(&form, &kwargs, param, covariate)?;
     let fix = match kwargs.get("fix") {
         Some(v) => Some(v.literal().ok_or_else(|| {
-            format!(
-                "[covariate_model]: `fix` takes a number, got `{}`",
-                v.label()
-            )
+            format!("[covariate_model]: `fix` takes a number, got `{}`", v.label())
         })?),
         None => None,
     };
@@ -435,10 +409,7 @@ fn split_trailing_op<'a>(body: &'a str, line: &str) -> Result<(&'a str, Covariat
 /// through `(negative)^θ`, which is `NaN` for a non-integer θ. Both are caught
 /// here, at parse time, rather than at the first evaluation.
 fn check_center_domain(
-    form: &CovariateForm,
-    center: f64,
-    param: &str,
-    covariate: &str,
+    form: &CovariateForm, center: f64, param: &str, covariate: &str,
 ) -> Result<(), String> {
     let bad = |why: &str| {
         Err(format!(
@@ -450,16 +421,16 @@ fn check_center_domain(
         return bad("which is not a finite number. State it as a literal (`center = 70`).");
     }
     match form {
-        CovariateForm::Power if center <= 0.0 => bad(
-            "but `power` evaluates `(COV / centre)^θ` — a zero centre divides to `0` (this \
+        CovariateForm::Power if center <= 0.0 => {
+            bad("but `power` evaluates `(COV / centre)^θ` — a zero centre divides to `0` (this \
              engine underflows rather than raising) and a negative one makes the base negative, \
-             which is `NaN` for a non-integer θ. Use a positive centre.",
-        ),
-        CovariateForm::LinearRelative if center == 0.0 => bad(
-            "but `linear_relative` evaluates `1 + θ·(COV / centre − 1)` — dividing by zero \
+             which is `NaN` for a non-integer θ. Use a positive centre.")
+        }
+        CovariateForm::LinearRelative if center == 0.0 => {
+            bad("but `linear_relative` evaluates `1 + θ·(COV / centre − 1)` — dividing by zero \
              underflows to `0` here, so the relation would silently contribute `1 − θ` for \
-             every subject. Use a non-zero centre, or `linear`, which subtracts instead.",
-        ),
+             every subject. Use a non-zero centre, or `linear`, which subtracts instead.")
+        }
         _ => Ok(()),
     }
 }
@@ -469,10 +440,8 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
     let src = src.trim();
     let (head, body) = match src.find('(') {
         Some(i) => {
-            let body = src[i..]
-                .strip_prefix('(')
-                .and_then(|r| r.strip_suffix(')'))
-                .ok_or_else(|| {
+            let body =
+                src[i..].strip_prefix('(').and_then(|r| r.strip_suffix(')')).ok_or_else(|| {
                     format!("[covariate_model]: unbalanced parentheses in form `{src}`")
                 })?;
             (src[..i].trim(), body.trim())
@@ -489,15 +458,13 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
         "categorical" => CovariateForm::Categorical,
         "categorical2" => CovariateForm::Categorical2,
         "expr" => {
-            let text = body
-                .trim()
-                .strip_prefix('"')
-                .and_then(|r| r.strip_suffix('"'))
-                .ok_or_else(|| {
+            let text = body.trim().strip_prefix('"').and_then(|r| r.strip_suffix('"')).ok_or_else(
+                || {
                     "[covariate_model]: `expr` takes a quoted expression, e.g. \
                      `expr(\"(WT/70)^0.75\")`"
                         .to_string()
-                })?;
+                },
+            )?;
             if text.trim().is_empty() {
                 return Err("[covariate_model]: `expr(\"\")` states no expression".to_string());
             }
@@ -562,10 +529,7 @@ fn parse_kwargs(body: &str, form: &str) -> Result<HashMap<String, CovariateStat>
 /// with: `center` for the continuous forms, `breakpoint` for `hockey`, `ref`
 /// for `categorical`.
 fn center_argument(
-    form: &CovariateForm,
-    kwargs: &HashMap<String, CovariateStat>,
-    param: &str,
-    covariate: &str,
+    form: &CovariateForm, kwargs: &HashMap<String, CovariateStat>, param: &str, covariate: &str,
 ) -> Result<Option<CovariateStat>, String> {
     let (keyword, default) = match form {
         CovariateForm::None | CovariateForm::Expr(_) => {
@@ -574,10 +538,7 @@ fn center_argument(
             // `apply_fix` run over an empty θ list — no effect, no diagnostic.
             for key in ["center", "breakpoint", "ref", "fix"] {
                 if kwargs.contains_key(key) {
-                    return Err(format!(
-                        "[covariate_model]: `{}` takes no `{key}`",
-                        form.label()
-                    ));
+                    return Err(format!("[covariate_model]: `{}` takes no `{key}`", form.label()));
                 }
             }
             return Ok(None);
@@ -624,8 +585,7 @@ fn check_kind(form: &CovariateForm, decl: &CovariateDecl) -> Result<(), String> 
 /// `=> NAME(init, lower, upper)[, NAME(...)]` — an explicit θ declaration,
 /// overriding the form's defaults. One entry per θ the form generates.
 fn parse_theta_clause(
-    clause: &str,
-    ctx: &CovariateModelContext<'_>,
+    clause: &str, ctx: &CovariateModelContext<'_>,
 ) -> Result<Vec<CovariateTheta>, String> {
     let mut out = Vec::new();
     for part in split_top_level(clause, ',') {
@@ -643,10 +603,7 @@ fn parse_theta_clause(
             .split(',')
             .map(|t| {
                 t.trim().parse::<f64>().map_err(|_| {
-                    format!(
-                        "[covariate_model]: `{}` is not a number in `{part}`",
-                        t.trim()
-                    )
+                    format!("[covariate_model]: `{}` is not a number in `{part}`", t.trim())
                 })
             })
             .collect::<Result<_, _>>()?;
@@ -686,9 +643,7 @@ fn parse_theta_clause(
 /// needs data-derived statistics that are not bound yet. `none` and `expr(...)`
 /// declare no θ and are never unresolved.
 fn build_thetas(
-    rel: &CovariateRelation,
-    decl: &CovariateDecl,
-    summary: Option<&CovariateSummary>,
+    rel: &CovariateRelation, decl: &CovariateDecl, summary: Option<&CovariateSummary>,
     explicit: Option<&[CovariateTheta]>,
 ) -> Result<Vec<CovariateTheta>, String> {
     // `levels = auto` is the opt-in to data-derived levels: with no population
@@ -748,10 +703,7 @@ fn build_thetas(
         let mut out = explicit.to_vec();
         apply_fix(&mut out, rel);
         if rel.form.is_categorical() {
-            for (theta, level) in out
-                .iter_mut()
-                .zip(non_reference_levels(rel, decl, summary)?)
-            {
+            for (theta, level) in out.iter_mut().zip(non_reference_levels(rel, decl, summary)?) {
                 theta.level = Some(level);
             }
         }
@@ -818,9 +770,7 @@ fn build_thetas(
 /// covariate makes both bounds infinite, so it is rejected here instead of
 /// producing a θ the optimiser cannot move.
 fn linear_family_thetas(
-    rel: &CovariateRelation,
-    summary: &CovariateSummary,
-    center: f64,
+    rel: &CovariateRelation, summary: &CovariateSummary, center: f64,
 ) -> Result<Vec<CovariateTheta>, String> {
     let below = center - summary.min;
     let above = center - summary.max;
@@ -848,11 +798,7 @@ fn linear_family_thetas(
     // so its init and bounds are the linear ones scaled by the centre — the two
     // forms then start the optimiser at the same place and admit the same
     // covariate factors, and differ only in the scale θ reports on.
-    let scale = if matches!(rel.form, CovariateForm::LinearRelative) {
-        center
-    } else {
-        1.0
-    };
+    let scale = if matches!(rel.form, CovariateForm::LinearRelative) { center } else { 1.0 };
     let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
     Ok(match rel.form {
         CovariateForm::Hockey => vec![
@@ -902,9 +848,7 @@ fn ordered(a: f64, b: f64) -> (f64, f64) {
 /// How many θ a relation generates, or an error when the answer is unknowable
 /// from the file alone (a `categorical` with neither declared nor bound levels).
 fn expected_theta_count(
-    rel: &CovariateRelation,
-    decl: &CovariateDecl,
-    summary: Option<&CovariateSummary>,
+    rel: &CovariateRelation, decl: &CovariateDecl, summary: Option<&CovariateSummary>,
 ) -> Result<usize, String> {
     Ok(match rel.form {
         CovariateForm::None | CovariateForm::Expr(_) => 0,
@@ -939,9 +883,7 @@ fn levels_of(decl: &CovariateDecl, summary: Option<&CovariateSummary>) -> Option
 
 /// Every level but the reference one, in declaration order — one θ each.
 fn non_reference_levels(
-    rel: &CovariateRelation,
-    decl: &CovariateDecl,
-    summary: Option<&CovariateSummary>,
+    rel: &CovariateRelation, decl: &CovariateDecl, summary: Option<&CovariateSummary>,
 ) -> Result<Vec<f64>, String> {
     let levels = levels_of(decl, summary).unwrap_or_default();
     let Some(reference) = rel.resolved_center else {
@@ -1092,10 +1034,7 @@ fn relation_effect(rel: &CovariateRelation) -> Option<String> {
     // zero here, it does not blow up). The neutral element is the operator's,
     // not a shared `1.0`: a missing covariate on an additive relation must
     // contribute nothing, and `+ 1.0` is not nothing.
-    Some(format!(
-        "(if (present({cov})) {inner} else {:.1})",
-        rel.op.neutral()
-    ))
+    Some(format!("(if (present({cov})) {inner} else {:.1})", rel.op.neutral()))
 }
 
 /// `eta_kappa`, plus every top-level `[individual_parameters]` variable whose
@@ -1151,19 +1090,14 @@ fn random_bearing_names(lines: &[String], eta_kappa: &HashSet<String>) -> HashSe
 /// multiplicative relation can never be multiplied into one addend of an
 /// additive relation declared before it, whatever order the block lines are in.
 fn insert_effects(
-    lines: &mut [String],
-    param: &str,
-    factors: &[String],
-    terms: &[String],
+    lines: &mut [String], param: &str, factors: &[String], terms: &[String],
     eta_kappa: &HashSet<String>,
 ) -> Result<(), String> {
     let idx = assignment_line(lines, param).ok_or_else(|| {
         format!("[covariate_model]: `{param}` is not assigned in [individual_parameters]")
     })?;
     let line = lines[idx].clone();
-    let (lhs, rhs) = line
-        .split_once('=')
-        .expect("assignment_line matched an `=`");
+    let (lhs, rhs) = line.split_once('=').expect("assignment_line matched an `=`");
     let rhs = rhs.trim();
 
     let mut rebuilt_rhs = if factors.is_empty() {
@@ -1191,18 +1125,13 @@ fn insert_effects(
 /// shape a factor can be inserted into, and the shape a term can be appended
 /// to without parentheses.
 fn is_plain_product(rhs: &str) -> bool {
-    split_top_level(rhs, '*')
-        .iter()
-        .all(|p| is_simple_factor(p))
+    split_top_level(rhs, '*').iter().all(|p| is_simple_factor(p))
 }
 
 /// `factors` multiplied into `rhs` immediately before its first η/κ-bearing
 /// top-level factor (or at the end when it has none).
 fn multiply_in(
-    param: &str,
-    rhs: &str,
-    factors: &[String],
-    eta_kappa: &HashSet<String>,
+    param: &str, rhs: &str, factors: &[String], eta_kappa: &HashSet<String>,
 ) -> Result<String, String> {
     let parts = split_top_level(rhs, '*');
     // *Every* factor has to be a plain multiplicative term, not just the whole
@@ -1214,10 +1143,7 @@ fn multiply_in(
     if parts.iter().any(|p| !is_simple_factor(p)) {
         return Err(non_product_error(param, rhs));
     }
-    let first_random = parts
-        .iter()
-        .position(|p| mentions_any(p, eta_kappa))
-        .unwrap_or(parts.len());
+    let first_random = parts.iter().position(|p| mentions_any(p, eta_kappa)).unwrap_or(parts.len());
     if first_random == 0 && parts.len() == 1 {
         // The whole RHS is one random-effect-bearing term (`exp(TVCL + ETA_CL)`);
         // there is no non-η group to multiply into.
@@ -1414,11 +1340,7 @@ fn join_levels(levels: &[f64]) -> String {
     if levels.is_empty() {
         "none".to_string()
     } else {
-        levels
-            .iter()
-            .map(|v| fmt(*v))
-            .collect::<Vec<_>>()
-            .join(", ")
+        levels.iter().map(|v| fmt(*v)).collect::<Vec<_>>().join(", ")
     }
 }
 

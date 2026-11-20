@@ -69,10 +69,7 @@ const MODEL: &str = r#"
 "#;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn focei_makes_substantial_progress_on_nn_model() {
     let parsed = parse_full_model(MODEL).expect("model parses with --features nn");
     let model = parsed.model;

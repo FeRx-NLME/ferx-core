@@ -38,10 +38,7 @@ use ferx_core::{fit, read_nonmem_csv, FitOptions};
 use std::path::Path;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn npde_is_approximately_standard_normal_on_warfarin() {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
@@ -59,11 +56,7 @@ fn npde_is_approximately_standard_normal_on_warfarin() {
         fit(&model, &population, &model.default_params, &opts).expect("warfarin fit must converge");
     assert!(result.converged, "fit must converge for the NPDE check");
 
-    let npde: Vec<f64> = result
-        .subjects
-        .iter()
-        .flat_map(|s| s.npde.clone())
-        .collect();
+    let npde: Vec<f64> = result.subjects.iter().flat_map(|s| s.npde.clone()).collect();
     let npd: Vec<f64> = result.subjects.iter().flat_map(|s| s.npd.clone()).collect();
     assert!(!npde.is_empty(), "NPDE must be populated");
     assert!(npde.iter().all(|v| v.is_finite()), "NPDE must be finite");
@@ -83,21 +76,9 @@ fn npde_is_approximately_standard_normal_on_warfarin() {
     // generous enough to absorb Monte-Carlo and finite-sample noise (warfarin has
     // ~250 observations) while still failing if decorrelation or the transform is
     // broken.
-    assert!(
-        npde_mean.abs() < 0.2,
-        "NPDE mean should be ≈ 0, got {npde_mean}"
-    );
-    assert!(
-        (0.6..=1.5).contains(&npde_var),
-        "NPDE variance should be ≈ 1, got {npde_var}"
-    );
-    assert!(
-        npd_mean.abs() < 0.2,
-        "NPD mean should be ≈ 0, got {npd_mean}"
-    );
+    assert!(npde_mean.abs() < 0.2, "NPDE mean should be ≈ 0, got {npde_mean}");
+    assert!((0.6..=1.5).contains(&npde_var), "NPDE variance should be ≈ 1, got {npde_var}");
+    assert!(npd_mean.abs() < 0.2, "NPD mean should be ≈ 0, got {npd_mean}");
     // NPD is not decorrelated, so its variance is allowed a slightly wider band.
-    assert!(
-        (0.5..=1.6).contains(&npd_var),
-        "NPD variance should be near 1, got {npd_var}"
-    );
+    assert!((0.5..=1.6).contains(&npd_var), "NPD variance should be near 1, got {npd_var}");
 }

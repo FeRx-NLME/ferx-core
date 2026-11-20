@@ -9,7 +9,6 @@ const N_KAPPA: usize = 3;
 /// pk-only row, which does not create a group of its own.
 fn subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -17,30 +16,13 @@ fn subject() -> Subject {
             DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 2.5, 3.0, 5.0, 6.0],
-        obs_raw_times: Vec::new(),
         observations: vec![50.0, 40.0, 30.0, 45.0, 35.0],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
         pk_only_times: vec![0.5],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![2, 2, 5, 5, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![7, 2, 9],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -94,9 +76,7 @@ fn kappa_chunks_cut_the_tail_and_tolerate_a_malformed_width() {
     // Shorter than η: no κ tail at all.
     assert!(layout.kappa_chunks(&stacked[..N_ETA - 1]).is_empty());
     // No κ declared: nothing to cut, whatever the vector.
-    assert!(StackedLayout::new(N_ETA, 0, &s)
-        .kappa_chunks(&stacked)
-        .is_empty());
+    assert!(StackedLayout::new(N_ETA, 0, &s).kappa_chunks(&stacked).is_empty());
 }
 
 /// #1082 PR1 is a pure refactor: the layout must reproduce, index for index, the stacked
@@ -111,11 +91,7 @@ fn layout_reproduces_the_pre_1082_stacked_convention_index_for_index() {
     // Group order: observation occasions first-seen (2, 5, 1), then dose-only (7, 9).
     let labels: Vec<u32> = layout.groups().iter().map(|(occ, _)| *occ).collect();
     assert_eq!(labels, vec![2, 5, 1, 7, 9]);
-    assert_eq!(
-        layout.groups()[3].1,
-        Vec::<usize>::new(),
-        "dose-only group owns no obs"
-    );
+    assert_eq!(layout.groups()[3].1, Vec::<usize>::new(), "dose-only group owns no obs");
     let k = labels.len();
     assert_eq!(layout.n_groups(), k);
     assert_eq!(group_count(&s), k);
@@ -125,15 +101,8 @@ fn layout_reproduces_the_pre_1082_stacked_convention_index_for_index() {
     for (g, &occ) in labels.iter().enumerate() {
         assert_eq!(layout.group_of(occ), Some(g), "occasion {occ}");
         assert_eq!(layout.kappa_offset(g), N_ETA + g * N_KAPPA, "group {g}");
-        assert_eq!(
-            kappa_offset(N_ETA, N_KAPPA, g),
-            N_ETA + g * N_KAPPA,
-            "group {g}"
-        );
-        assert_eq!(
-            layout.kappa_range(g),
-            N_ETA + g * N_KAPPA..N_ETA + (g + 1) * N_KAPPA
-        );
+        assert_eq!(kappa_offset(N_ETA, N_KAPPA, g), N_ETA + g * N_KAPPA, "group {g}");
+        assert_eq!(layout.kappa_range(g), N_ETA + g * N_KAPPA..N_ETA + (g + 1) * N_KAPPA);
     }
     // An occasion with no group (production asks with `u32::MAX` on a miss), and a label
     // no record carries, both map to no group.

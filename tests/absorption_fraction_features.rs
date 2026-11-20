@@ -15,9 +15,7 @@ use ferx_core::{check_model_data, predict, simulate_with_seed, DoseEvent};
 
 /// Does `check_model_data` raise any absorption diagnostic for this model+pop?
 fn has_absorption_err(model: &ferx_core::CompiledModel, pop: &Population) -> bool {
-    check_model_data(model, pop)
-        .iter()
-        .any(|d| d.code.starts_with("E_ABSORPTION"))
+    check_model_data(model, pop).iter().any(|d| d.code.starts_with("E_ABSORPTION"))
 }
 
 /// Biphasic IG into central (CL=5, V=50), two declared fractions, plus optional
@@ -86,20 +84,12 @@ fn fraction_validation_valid_with_f_and_lagtime() {
         "  theta TVF(0.7, 0.01, 1.0)\n  theta TVLAG(1.5, 0.001, 12.0)",
         "  FR1 = TVFR1\n  FR2 = 1 - TVFR1\n  F1 = TVF\n  LAGTIME1 = TVLAG",
     );
-    let model = parse_full_model(&src)
-        .expect("biphasic igd + F + lag parses")
-        .model;
+    let model = parse_full_model(&src).expect("biphasic igd + F + lag parses").model;
     let pop = pop_plain(vec![]);
-    assert!(
-        !has_absorption_err(&model, &pop),
-        "valid F+lag flagged by fit-check"
-    );
+    assert!(!has_absorption_err(&model, &pop), "valid F+lag flagged by fit-check");
     // Must not panic:
     let preds = predict(&model, &pop, &model.default_params).unwrap();
-    assert!(
-        preds.iter().all(|p| p.pred.is_finite()),
-        "non-finite pred with F+lag"
-    );
+    assert!(preds.iter().all(|p| p.pred.is_finite()), "non-finite pred with F+lag");
     let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 7).unwrap();
 }
 
@@ -113,16 +103,10 @@ fn fraction_error_still_caught_with_f_and_lagtime() {
     );
     let model = parse_full_model(&src).expect("model parses").model;
     let pop = pop_plain(vec![]);
-    assert!(
-        has_absorption_err(&model, &pop),
-        "fit-check should flag Σ≠1 too"
-    );
+    assert!(has_absorption_err(&model, &pop), "fit-check should flag Σ≠1 too");
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("Pathway fractions on compartment"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("Pathway fractions on compartment"), "unexpected Err: {err}");
 }
 
 #[test]
@@ -133,9 +117,7 @@ fn fraction_validation_valid_with_time_varying_covariate() {
     // as fit() sees. This is the transit+TV-cov class (#663): the guard must handle a
     // `has_tv_covariates()==true` subject without choking.
     let src = biphasic("", "  FR1 = COVF\n  FR2 = 1 - COVF");
-    let model = parse_full_model(&src)
-        .expect("biphasic igd + covariate fraction parses")
-        .model;
+    let model = parse_full_model(&src).expect("biphasic igd + covariate fraction parses").model;
 
     let mut pop = pop_plain(vec!["COVF".into()]);
     let subj = &mut pop.subjects[0];
@@ -151,20 +133,11 @@ fn fraction_validation_valid_with_time_varying_covariate() {
             m
         })
         .collect();
-    assert!(
-        subj.has_tv_covariates(),
-        "probe must exercise the TV-cov path"
-    );
+    assert!(subj.has_tv_covariates(), "probe must exercise the TV-cov path");
 
-    assert!(
-        !has_absorption_err(&model, &pop),
-        "valid TV-cov fraction flagged"
-    );
+    assert!(!has_absorption_err(&model, &pop), "valid TV-cov fraction flagged");
     let preds = predict(&model, &pop, &model.default_params).unwrap();
-    assert!(
-        preds.iter().all(|p| p.pred.is_finite()),
-        "non-finite pred with TV-cov"
-    );
+    assert!(preds.iter().all(|p| p.pred.is_finite()), "non-finite pred with TV-cov");
     let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 7).unwrap();
 }
 
@@ -210,9 +183,7 @@ fn fraction_validation_valid_with_iov() {
   method = focei
 "#
     );
-    let model = parse_full_model(&src)
-        .expect("biphasic igd + IOV parses")
-        .model;
+    let model = parse_full_model(&src).expect("biphasic igd + IOV parses").model;
     assert!(model.n_kappa > 0, "probe must have IOV");
 
     let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
@@ -230,13 +201,7 @@ fn fraction_validation_valid_with_iov() {
         warnings: vec![],
         subjects: vec![subj],
     };
-    assert!(
-        !has_absorption_err(&model, &pop),
-        "valid IOV fraction flagged"
-    );
+    assert!(!has_absorption_err(&model, &pop), "valid IOV fraction flagged");
     let preds = predict(&model, &pop, &model.default_params).unwrap();
-    assert!(
-        preds.iter().all(|p| p.pred.is_finite()),
-        "non-finite pred with IOV"
-    );
+    assert!(preds.iter().all(|p| p.pred.is_finite()), "non-finite pred with IOV");
 }

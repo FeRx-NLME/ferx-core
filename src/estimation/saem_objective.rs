@@ -69,13 +69,7 @@ pub(crate) struct SaemObjAccumulator {
 impl SaemObjAccumulator {
     pub(crate) fn new(n_subjects: usize, enabled: bool, last_only: bool) -> Self {
         let n = if enabled { n_subjects } else { 0 };
-        Self {
-            enabled,
-            last_only,
-            max: vec![f64::NEG_INFINITY; n],
-            sum: vec![0.0; n],
-            n: 0,
-        }
+        Self { enabled, last_only, max: vec![f64::NEG_INFINITY; n], sum: vec![0.0; n], n: 0 }
     }
 
     /// One draw per subject: `nll[i]` is `−log p(y_i, η_i)` (no constants), the joint NLL.

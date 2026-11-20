@@ -15,11 +15,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, KappaTreatment};
 use std::path::Path;
 
-fn warfarin_setup() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-    FitOptions,
-) {
+fn warfarin_setup() -> (ferx_core::types::CompiledModel, ferx_core::types::Population, FitOptions) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -71,17 +67,11 @@ fn iscale_and_imp_auto_do_not_reach_an_evaluation_and_warn_through_fit() {
         }
         let result =
             fit(&model, &population, &model.default_params, &opts).expect("the evaluation runs");
-        let imp = result
-            .importance_sampling
-            .clone()
-            .expect("an evaluation reports its marginal");
+        let imp = result.importance_sampling.clone().expect("an evaluation reports its marginal");
         (imp, result.warnings)
     };
     let notes = |warnings: &[String]| {
-        warnings
-            .iter()
-            .filter(|w| w.contains("`imp_eval_only` runs an evaluation"))
-            .count()
+        warnings.iter().filter(|w| w.contains("`imp_eval_only` runs an evaluation")).count()
     };
 
     let (plain, plain_warnings) = run(&[]);
@@ -89,17 +79,11 @@ fn iscale_and_imp_auto_do_not_reach_an_evaluation_and_warn_through_fit() {
     assert_eq!(notes(&plain_warnings), 0, "{plain_warnings:?}");
 
     let (scaled, scaled_warnings) = run(&[("iscale_min", "5"), ("iscale_max", "5")]);
-    assert_eq!(
-        scaled.minus2_log_likelihood.to_bits(),
-        plain.minus2_log_likelihood.to_bits()
-    );
+    assert_eq!(scaled.minus2_log_likelihood.to_bits(), plain.minus2_log_likelihood.to_bits());
     assert_eq!(notes(&scaled_warnings), 2, "{scaled_warnings:?}");
 
     let (pinned, pinned_warnings) = run(&[("imp_auto", "false")]);
-    assert_eq!(
-        pinned.minus2_log_likelihood.to_bits(),
-        plain.minus2_log_likelihood.to_bits()
-    );
+    assert_eq!(pinned.minus2_log_likelihood.to_bits(), plain.minus2_log_likelihood.to_bits());
     assert_eq!(notes(&pinned_warnings), 1, "{pinned_warnings:?}");
 
     let (unadapted, _) = run(&[("imp_adapt_passes", "0")]);
@@ -119,46 +103,29 @@ fn imp_before_estimator_is_rejected() {
         .err()
         .expect("method = [imp, focei] must be rejected")
         .to_string();
-    assert!(
-        err.contains("final stage"),
-        "expected `final stage` in error, got: {err}"
-    );
+    assert!(err.contains("final stage"), "expected `final stage` in error, got: {err}");
 }
 
 #[test]
 fn imp_non_terminal_in_chain_is_rejected() {
     let (model, population, mut opts) = warfarin_setup();
-    opts.methods = vec![
-        EstimationMethod::FoceI,
-        EstimationMethod::Imp,
-        EstimationMethod::FoceI,
-    ];
+    opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp, EstimationMethod::FoceI];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
         .expect("non-terminal `imp` must be rejected")
         .to_string();
-    assert!(
-        err.contains("final stage"),
-        "expected `final stage` in error, got: {err}"
-    );
+    assert!(err.contains("final stage"), "expected `final stage` in error, got: {err}");
 }
 
 #[test]
 fn imp_duplicated_in_chain_is_rejected() {
     let (model, population, mut opts) = warfarin_setup();
-    opts.methods = vec![
-        EstimationMethod::FoceI,
-        EstimationMethod::Imp,
-        EstimationMethod::Imp,
-    ];
+    opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp, EstimationMethod::Imp];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
         .expect("duplicated `imp` must be rejected")
         .to_string();
-    assert!(
-        err.contains("at most once"),
-        "expected `at most once` in error, got: {err}"
-    );
+    assert!(err.contains("at most once"), "expected `at most once` in error, got: {err}");
 }
 
 /// #2651: every subject used to come back with ESS 0 and −2 log L = inf.
@@ -169,10 +136,8 @@ fn imp_eval_only_evaluates_a_normal_proposal() {
     opts.imp_proposal_df = f64::INFINITY;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("method = [imp] with a normal proposal must produce a fit");
-    let imp = result
-        .importance_sampling
-        .as_ref()
-        .expect("importance_sampling field should be populated");
+    let imp =
+        result.importance_sampling.as_ref().expect("importance_sampling field should be populated");
     assert!(
         imp.minus2_log_likelihood.is_finite(),
         "-2 LL must be finite, got {}",
@@ -206,22 +171,11 @@ fn imp_after_focei_populates_field() {
     assert_eq!(imp.proposal_df, 5.0);
     assert!(matches!(imp.kappa_treatment, KappaTreatment::NotApplicable));
     // ESS is reported as a fraction of K — must lie in [0, 1].
-    assert!(
-        (0.0..=1.0).contains(&imp.ess_min),
-        "ess_min out of range: {}",
-        imp.ess_min
-    );
-    assert!(
-        (0.0..=1.0).contains(&imp.ess_median),
-        "ess_median out of range: {}",
-        imp.ess_median
-    );
+    assert!((0.0..=1.0).contains(&imp.ess_min), "ess_min out of range: {}", imp.ess_min);
+    assert!((0.0..=1.0).contains(&imp.ess_median), "ess_median out of range: {}", imp.ess_median);
     // method_chain preserves the full chain; `method` (the final *estimating*
     // stage) drops the IMP suffix per design.
-    assert_eq!(
-        result.method_chain,
-        vec![EstimationMethod::FoceI, EstimationMethod::Imp]
-    );
+    assert_eq!(result.method_chain, vec![EstimationMethod::FoceI, EstimationMethod::Imp]);
     assert_eq!(result.method, EstimationMethod::FoceI);
 }
 
@@ -246,10 +200,8 @@ fn imp_after_focei_handles_fixed_theta_omega_sigma() {
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("FIX-model focei → imp must produce a fit");
-    let imp = result
-        .importance_sampling
-        .as_ref()
-        .expect("importance_sampling field should be populated");
+    let imp =
+        result.importance_sampling.as_ref().expect("importance_sampling field should be populated");
     assert!(
         imp.minus2_log_likelihood.is_finite(),
         "−2 log L on a FIX model must be finite, got {}",
@@ -305,17 +257,10 @@ fn imp_after_saem_populates_field() {
         imp.mc_standard_error
     );
     assert_eq!(imp.n_samples, 200);
-    assert!(
-        (0.0..=1.0).contains(&imp.ess_min),
-        "ess_min out of range: {}",
-        imp.ess_min
-    );
+    assert!((0.0..=1.0).contains(&imp.ess_min), "ess_min out of range: {}", imp.ess_min);
     // `method_chain` keeps the IMP terminal stage; `method` drops it so the
     // canonical reported method is the last estimating stage (SAEM here).
-    assert_eq!(
-        result.method_chain,
-        vec![EstimationMethod::Saem, EstimationMethod::Imp]
-    );
+    assert_eq!(result.method_chain, vec![EstimationMethod::Saem, EstimationMethod::Imp]);
     assert_eq!(result.method, EstimationMethod::Saem);
 }
 

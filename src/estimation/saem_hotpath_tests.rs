@@ -108,11 +108,7 @@ fn lagtime_model() -> CompiledModel {
 }
 
 fn covmap(wt: f64, ht: f64, age: f64) -> HashMap<String, f64> {
-    HashMap::from([
-        ("WT".to_string(), wt),
-        ("HT".to_string(), ht),
-        ("AGE".to_string(), age),
-    ])
+    HashMap::from([("WT".to_string(), wt), ("HT".to_string(), ht), ("AGE".to_string(), age)])
 }
 
 /// Six subjects, all carrying **time-varying** covariates (that is what routes
@@ -130,11 +126,7 @@ fn tv_population(with_occasions: bool) -> Population {
                     DoseEvent::new(0.0, 100.0 + 10.0 * f, 1, 0.0, false, 0.0),
                     DoseEvent::new(24.0, 100.0 + 10.0 * f, 1, 0.0, false, 0.0),
                 ],
-                dose_occasions: if with_occasions {
-                    vec![1, 2]
-                } else {
-                    Vec::new()
-                },
+                dose_occasions: if with_occasions { vec![1, 2] } else { Vec::new() },
                 dose_covariates: vec![
                     covmap(wt0, 160.0 + f, 4.0 + f),
                     covmap(wt0 + 3.0, 160.0 + f, 4.0 + f),
@@ -142,11 +134,7 @@ fn tv_population(with_occasions: bool) -> Population {
                 obs_times: vec![1.0, 6.0, 25.0, 30.0],
                 observations: vec![9.0 + f, 6.0 + 0.5 * f, 11.0 + f, 7.5 + 0.5 * f],
                 obs_cmts: vec![1; 4],
-                occasions: if with_occasions {
-                    vec![1, 1, 2, 2]
-                } else {
-                    Vec::new()
-                },
+                occasions: if with_occasions { vec![1, 1, 2, 2] } else { Vec::new() },
                 obs_covariates: vec![
                     covmap(wt0, 160.0 + f, 4.0 + f),
                     covmap(wt0 + 1.0, 160.0 + f, 4.0 + f),
@@ -211,10 +199,7 @@ fn run_bits_with(model: &CompiledModel, pop: &Population, opts: &FitOptions) -> 
 /// this is zero cannot observe anything about the cache, which is the fast-path
 /// trap `AGENTS.md` names: the code short-circuits before the thing under test.
 fn n_cached(model: &CompiledModel, pop: &Population) -> usize {
-    build_schedule_cache(model, pop)
-        .iter()
-        .filter(|s| s.is_some())
-        .count()
+    build_schedule_cache(model, pop).iter().filter(|s| s.is_some()).count()
 }
 
 // ─── The `EventSchedule` cache ────────────────────────────────────────────
@@ -321,18 +306,8 @@ fn schedule_cache_declines_an_eta_dependent_lagtime() {
 #[test]
 fn saem_individual_parameter_hoist_is_bit_identical() {
     for (name, hoisted, unhoisted, pop) in [
-        (
-            "analytic",
-            analytic_model(),
-            analytic_model_unhoisted(),
-            tv_population(false),
-        ),
-        (
-            "iov",
-            iov_model(),
-            iov_model_unhoisted(),
-            tv_population(true),
-        ),
+        ("analytic", analytic_model(), analytic_model_unhoisted(), tv_population(false)),
+        ("iov", iov_model(), iov_model_unhoisted(), tv_population(true)),
     ] {
         assert!(
             closure_hoists(&hoisted),
@@ -469,15 +444,10 @@ fn mh_scratch_reuse_across_subjects_is_bit_identical() {
     );
 
     for (i, (a, b)) in reused.iter().zip(fresh_out.iter()).enumerate() {
-        assert_eq!(
-            a.2, b.2,
-            "subject {i}: reused-scratch NLL differs from the fresh-scratch one"
-        );
+        assert_eq!(a.2, b.2, "subject {i}: reused-scratch NLL differs from the fresh-scratch one");
         assert_eq!(a.1, b.1, "subject {i}: acceptance count differs");
-        let (ab, bb): (Vec<u64>, Vec<u64>) = (
-            a.0.iter().map(|v| v.to_bits()).collect(),
-            b.0.iter().map(|v| v.to_bits()).collect(),
-        );
+        let (ab, bb): (Vec<u64>, Vec<u64>) =
+            (a.0.iter().map(|v| v.to_bits()).collect(), b.0.iter().map(|v| v.to_bits()).collect());
         assert_eq!(ab, bb, "subject {i}: final η differs");
     }
 }
@@ -576,11 +546,7 @@ fn individual_nll_prepared_matches_the_wrapper_it_replaced() {
 
     let arms: Vec<(&str, CompiledModel, Population)> = vec![
         ("magnitude", analytic_model(), tv_population(false)),
-        (
-            "selected",
-            selected_error_model(),
-            tv_population_with_assay(),
-        ),
+        ("selected", selected_error_model(), tv_population_with_assay()),
     ];
 
     for (arm, model, pop) in arms {
@@ -784,10 +750,7 @@ fn mh_steps_consumes_the_cached_schedule_on_both_arms() {
         let n_eta = model.n_eta;
         let schedules = build_schedule_cache(&model, &pop);
         let subject = &pop.subjects[0];
-        assert!(
-            schedules[0].is_some(),
-            "{arm}: no schedule for the fixture subject"
-        );
+        assert!(schedules[0].is_some(), "{arm}: no schedule for the fixture subject");
         // IOV kernels need a κ per occasion group.
         let kappas: Vec<Vec<f64>> = if model.n_kappa > 0 {
             crate::stats::likelihood::iov_occasion_groups(subject)
@@ -798,10 +761,8 @@ fn mh_steps_consumes_the_cached_schedule_on_both_arms() {
             Vec::new()
         };
         let omega_iov = params.omega_iov.clone();
-        let kappas_opt = omega_iov
-            .as_ref()
-            .filter(|_| model.n_kappa > 0)
-            .map(|oi| (kappas.as_slice(), oi));
+        let kappas_opt =
+            omega_iov.as_ref().filter(|_| model.n_kappa > 0).map(|oi| (kappas.as_slice(), oi));
 
         const N_STEPS: usize = 20;
         // Computed outside the counted region: it is the same call on both arms
@@ -830,11 +791,7 @@ fn mh_steps_consumes_the_cached_schedule_on_both_arms() {
                 sched,
                 kappas_opt,
             );
-            (
-                eta.iter().map(|v| v.to_bits()).collect::<Vec<u64>>(),
-                acc,
-                nll.to_bits(),
-            )
+            (eta.iter().map(|v| v.to_bits()).collect::<Vec<u64>>(), acc, nll.to_bits())
         };
 
         let (cached, builds_cached) = with_build_count(|| run(schedules[0].as_ref()));
@@ -855,10 +812,7 @@ fn mh_steps_consumes_the_cached_schedule_on_both_arms() {
             cached, uncached,
             "{arm}: the cached sweep diverged from the rebuild-per-call sweep"
         );
-        assert!(
-            cached.1 > 0,
-            "{arm}: no proposal accepted; the sweep is inert"
-        );
+        assert!(cached.1 > 0, "{arm}: no proposal accepted; the sweep is inert");
     }
     crate::stats::likelihood::PLAN_VALUES_OFF.with(|c| c.set(false));
 }
@@ -1072,10 +1026,8 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
 fn the_score_sa_mstep_rebuilds_the_event_schedule() {
     let (model, pop) = (time_only_model(), baseline_cov_population());
     let n = pop.subjects.len() as u64;
-    let short = FitOptions {
-        saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa,
-        ..saem_opts()
-    };
+    let short =
+        FitOptions { saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa, ..saem_opts() };
     let long = FitOptions {
         saem_n_exploration: short.saem_n_exploration * 3,
         saem_n_convergence: short.saem_n_convergence * 3,
@@ -1141,16 +1093,11 @@ fn schedule_cache_covers_a_time_only_baseline_covariate_subject() {
     let model = time_only_model();
     let pop = baseline_cov_population();
     assert!(
-        pop.subjects
-            .iter()
-            .all(|s| !s.has_tv_covariates() && !s.has_resets()),
+        pop.subjects.iter().all(|s| !s.has_tv_covariates() && !s.has_resets()),
         "the fixture must have baseline covariates only, or it is the ordinary \
          TV case already covered above"
     );
-    assert!(
-        crate::pk::model_uses_time_anywhere(&model),
-        "the fixture must read the TIME built-in"
-    );
+    assert!(crate::pk::model_uses_time_anywhere(&model), "the fixture must read the TIME built-in");
     assert_eq!(
         n_cached(&model, &pop),
         pop.subjects.len(),

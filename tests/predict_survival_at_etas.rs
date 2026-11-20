@@ -52,11 +52,7 @@ fn individual_curves_from_a_fit_are_at_each_subjects_ebe() {
     let lambda = params.theta[0];
     let mut distinct = std::collections::HashSet::new();
     for (id, t) in &times {
-        let s = r
-            .subjects
-            .iter()
-            .find(|s| &s.id == id)
-            .expect("fitted subject");
+        let s = r.subjects.iter().find(|s| &s.id == id).expect("fitted subject");
         let eta = s.eta[0];
         assert!(eta.is_finite() && eta != 0.0, "subject {id}: η̂ {eta}");
         distinct.insert(eta.to_bits());
@@ -66,11 +62,7 @@ fn individual_curves_from_a_fit_are_at_each_subjects_ebe() {
             .iter()
             .find(|row| &row.id == id && row.time == *t)
             .expect("record time on the grid");
-        assert!(
-            row.cum_hazard.is_finite(),
-            "subject {id}: H {}",
-            row.cum_hazard
-        );
+        assert!(row.cum_hazard.is_finite(), "subject {id}: H {}", row.cum_hazard);
         let rel = ((row.cum_hazard - want) / want).abs();
         assert!(
             rel <= 4.0 * f64::EPSILON,

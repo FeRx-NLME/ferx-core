@@ -129,9 +129,7 @@ fn write_steps(path: &Path, steps: &[StepOutcome]) -> Result<(), String> {
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 fn write_candidates(path: &Path, rows: &[CandidateRow]) -> Result<(), String> {
@@ -164,9 +162,7 @@ fn write_candidates(path: &Path, rows: &[CandidateRow]) -> Result<(), String> {
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// The human-readable report: the pipeline, then every step's candidates, then
@@ -186,11 +182,7 @@ pub fn render_summary(result: &AmdResult) -> String {
     let _ = writeln!(
         out,
         "Start model: OFV {}",
-        result
-            .input_fit
-            .as_ref()
-            .map(|f| format!("{:.3}", f.ofv))
-            .unwrap_or_else(|| "-".into())
+        result.input_fit.as_ref().map(|f| format!("{:.3}", f.ofv)).unwrap_or_else(|| "-".into())
     );
 
     let _ = writeln!(
@@ -270,11 +262,8 @@ pub fn render_summary(result: &AmdResult) -> String {
         write_candidate_rows(&mut out, &final_retries);
     }
 
-    let notes: Vec<&String> = result
-        .notes
-        .iter()
-        .chain(result.steps.iter().flat_map(|s| s.notes.iter()))
-        .collect();
+    let notes: Vec<&String> =
+        result.notes.iter().chain(result.steps.iter().flat_map(|s| s.notes.iter())).collect();
     if !notes.is_empty() {
         let _ = writeln!(out, "\nNotes:");
         for n in notes {
@@ -285,15 +274,8 @@ pub fn render_summary(result: &AmdResult) -> String {
     let _ = writeln!(
         out,
         "\nFinal model: OFV {}{}",
-        result
-            .final_fit
-            .as_ref()
-            .map(|f| format!("{:.3}", f.ofv))
-            .unwrap_or_else(|| "-".into()),
-        result
-            .d_ofv()
-            .map(|d| format!(" ({d:+.3} against the start model)"))
-            .unwrap_or_default()
+        result.final_fit.as_ref().map(|f| format!("{:.3}", f.ofv)).unwrap_or_else(|| "-".into()),
+        result.d_ofv().map(|d| format!(" ({d:+.3} against the start model)")).unwrap_or_default()
     );
     if result.cancelled {
         let _ = writeln!(out, "The run was cancelled; the steps after it never ran.");
@@ -359,15 +341,11 @@ fn status(r: &CandidateRow) -> String {
 }
 
 fn dash(v: Option<f64>) -> String {
-    v.filter(|v| v.is_finite())
-        .map(|v| format!("{v:.3}"))
-        .unwrap_or_else(|| "-".into())
+    v.filter(|v| v.is_finite()).map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into())
 }
 
 fn signed(v: Option<f64>) -> String {
-    v.filter(|v| v.is_finite())
-        .map(|v| format!("{v:+.3}"))
-        .unwrap_or_else(|| "-".into())
+    v.filter(|v| v.is_finite()).map(|v| format!("{v:+.3}")).unwrap_or_else(|| "-".into())
 }
 
 fn truncate(s: &str, n: usize) -> String {

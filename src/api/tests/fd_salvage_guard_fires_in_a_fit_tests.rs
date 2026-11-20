@@ -38,18 +38,12 @@ fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() 
     // subject forced to fail (`fail_plans_of`).
     let src = std::fs::read_to_string("examples/warfarin_if.ferx").expect("bundled example");
     let src = src
-        .replace(
-            "  KA = TVKA * exp(ETA_KA)\n",
-            "  KA = TVKA * exp(ETA_KA)\n  ALAG = 0.3\n",
-        )
+        .replace("  KA = TVKA * exp(ETA_KA)\n", "  KA = TVKA * exp(ETA_KA)\n  ALAG = 0.3\n")
         .replace(
             "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
             "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, lagtime=ALAG)",
         );
-    assert!(
-        src.contains("lagtime=ALAG") && src.contains("ALAG = 0.3"),
-        "every edit must take"
-    );
+    assert!(src.contains("lagtime=ALAG") && src.contains("ALAG = 0.3"), "every edit must take");
     let model = crate::parser::model_parser::parse_model_string(&src).expect("edited example");
     let mut pop =
         read_nonmem_csv(Path::new("data/warfarin_if.csv"), None, None).expect("bundled data");

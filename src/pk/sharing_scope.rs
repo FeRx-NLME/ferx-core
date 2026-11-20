@@ -106,24 +106,14 @@ impl<'a> SharingScope<'a> {
         let (model, subject) = (model as *const _, subject as *const _);
         let installed = SCOPE.with(|s| {
             let mut s = s.borrow_mut();
-            if s.as_ref()
-                .is_some_and(|sc| sc.model == model && sc.subject == subject)
-            {
+            if s.as_ref().is_some_and(|sc| sc.model == model && sc.subject == subject) {
                 return None;
             }
             let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
-            let prev = s.replace(Scope {
-                id,
-                model,
-                subject,
-                slots: Default::default(),
-            });
+            let prev = s.replace(Scope { id, model, subject, slots: Default::default() });
             Some((id, prev))
         });
-        Self {
-            installed,
-            _borrow: PhantomData,
-        }
+        Self { installed, _borrow: PhantomData }
     }
 }
 
@@ -155,9 +145,7 @@ impl Drop for SharingScope<'_> {
 /// subject and groups, otherwise a new one, kept for the scope when the scope is for this
 /// model and subject.
 pub(crate) fn first_record_with_same_pk_inputs<'r>(
-    model: &CompiledModel,
-    subject: &Subject,
-    site: ShareSite,
+    model: &CompiledModel, subject: &Subject, site: ShareSite,
     records: impl Iterator<Item = (Option<usize>, &'r HashMap<String, f64>)> + Clone,
 ) -> Option<Rc<[usize]>> {
     let (m, s) = (model as *const CompiledModel, subject as *const Subject);
@@ -167,12 +155,7 @@ pub(crate) fn first_record_with_same_pk_inputs<'r>(
             return Lookup::Unscoped;
         };
         match &sc.slots[site.slot()] {
-            Some(slot)
-                if records
-                    .clone()
-                    .map(|(g, _)| g)
-                    .eq(slot.groups.iter().copied()) =>
-            {
+            Some(slot) if records.clone().map(|(g, _)| g).eq(slot.groups.iter().copied()) => {
                 Lookup::Hit(slot.first.clone())
             }
             _ => Lookup::Miss,
@@ -190,10 +173,8 @@ pub(crate) fn first_record_with_same_pk_inputs<'r>(
             let mut sc = sc.borrow_mut();
             // The build opens no scope, so the one the lookup found is still open.
             let sc = sc.as_mut().expect("the scope a miss found is still open");
-            sc.slots[site.slot()] = Some(Slot {
-                groups: records.map(|(g, _)| g).collect(),
-                first: first.clone(),
-            });
+            sc.slots[site.slot()] =
+                Some(Slot { groups: records.map(|(g, _)| g).collect(), first: first.clone() });
         });
     }
     first

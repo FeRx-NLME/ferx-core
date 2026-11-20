@@ -62,10 +62,7 @@ const NM_IMP_OFV: f64 = 310.18;
 /// so we assert IS-2LL ≈ FOCEI OFV ± 3 units. We also record the value
 /// relative to NONMEM's FOCEI OFV (308.83) for cross-engine documentation.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn imp_at_nonmem_focei_mle_is_close_to_focei_at_same_point() {
     let fixed = format!(
         r"
@@ -112,10 +109,8 @@ fn imp_at_nonmem_focei_mle_is_close_to_focei_at_same_point() {
     let result = fit(&model, &pop, &model.default_params, &opts)
         .expect("fixed-param FOCEI → IMP must succeed");
 
-    let imp = result
-        .importance_sampling
-        .as_ref()
-        .expect("IMP stage must populate importance_sampling");
+    let imp =
+        result.importance_sampling.as_ref().expect("IMP stage must populate importance_sampling");
 
     assert!(
         imp.minus2_log_likelihood.is_finite(),
@@ -159,10 +154,7 @@ fn imp_at_nonmem_focei_mle_is_close_to_focei_at_same_point() {
 /// The 1.18-unit gap is within the expected cross-engine spread for IOV
 /// (compare the FOCEI gap: ferx 307.84 vs NONMEM 308.83 = 1.0 unit).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn imp_free_fit_matches_nonmem_reference() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
         .expect("warfarin_iov model must parse");
@@ -172,11 +164,7 @@ fn imp_free_fit_matches_nonmem_reference() {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
-    opts.methods = vec![
-        EstimationMethod::Saem,
-        EstimationMethod::FoceI,
-        EstimationMethod::Imp,
-    ];
+    opts.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI, EstimationMethod::Imp];
     opts.imp_samples = 3000;
     opts.imp_seed = Some(2026);
     opts.imp_eval_only = true; // IS IOV scoring path: score the fixed point, estimate nothing
@@ -184,10 +172,8 @@ fn imp_free_fit_matches_nonmem_reference() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("warfarin_iov SAEM → FOCEI → IMP must succeed");
 
-    let imp = result
-        .importance_sampling
-        .as_ref()
-        .expect("IMP stage must populate importance_sampling");
+    let imp =
+        result.importance_sampling.as_ref().expect("IMP stage must populate importance_sampling");
 
     assert!(
         matches!(imp.kappa_treatment, KappaTreatment::Marginalized),

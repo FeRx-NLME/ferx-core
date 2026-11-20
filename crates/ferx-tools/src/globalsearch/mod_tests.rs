@@ -67,20 +67,11 @@ fn defaults(text: &ModelText) -> Defaults {
         .map(|l| l.split('~').next().unwrap().trim().to_string())
         .collect();
     let params = parameter_names_of(text);
-    Defaults::new(
-        params,
-        names,
-        inits,
-        etas,
-        &crate::search::test_support::population(&["1"]),
-    )
+    Defaults::new(params, names, inits, etas, &crate::search::test_support::population(&["1"]))
 }
 
 fn effect(
-    parameter: &str,
-    covariate: &str,
-    effect: CovariateEffect,
-    optional: bool,
+    parameter: &str, covariate: &str, effect: CovariateEffect, optional: bool,
 ) -> CovariateEffectSpec {
     CovariateEffectSpec {
         parameter: parameter.into(),
@@ -110,10 +101,8 @@ fn space_with(mfl: &str, effects: &[CovariateEffectSpec], existing: &[(&str, &st
     } else {
         structure::space_features(&Mfl::parse(mfl).unwrap()).unwrap()
     };
-    let existing: Vec<(String, String)> = existing
-        .iter()
-        .map(|(p, c)| ((*p).to_string(), (*c).to_string()))
-        .collect();
+    let existing: Vec<(String, String)> =
+        existing.iter().map(|(p, c)| ((*p).to_string(), (*c).to_string())).collect();
     Space::build(text, structural, &keys, effects, &existing, Vec::new()).expect("a space")
 }
 
@@ -151,11 +140,7 @@ fn key(c: &Candidate) -> String {
 }
 
 fn options(algorithm: Algorithm) -> GlobalsearchOptions {
-    GlobalsearchOptions {
-        algorithm,
-        rank: RankType::Ofv,
-        ..GlobalsearchOptions::default()
-    }
+    GlobalsearchOptions { algorithm, rank: RankType::Ofv, ..GlobalsearchOptions::default() }
 }
 
 fn run(script: &ScriptedFitter, space: Space, options: &GlobalsearchOptions) -> GlobalsearchResult {
@@ -163,11 +148,7 @@ fn run(script: &ScriptedFitter, space: Space, options: &GlobalsearchOptions) -> 
 }
 
 fn ids_by_description(result: &GlobalsearchResult) -> Vec<(String, String)> {
-    result
-        .rows
-        .iter()
-        .map(|r| (r.id.clone(), r.description.clone()))
-        .collect()
+    result.rows.iter().map(|r| (r.id.clone(), r.description.clone())).collect()
 }
 
 // ── the grid ────────────────────────────────────────────────────────────────
@@ -188,34 +169,18 @@ fn the_grid_is_one_axis_per_category_and_per_covariate_pair() {
     assert_eq!(
         axes,
         vec![
-            (
-                "LAGTIME".to_string(),
-                vec!["OFF".to_string(), "ON".to_string()]
-            ),
-            (
-                "PERIPHERALS".to_string(),
-                vec!["0".to_string(), "1".to_string(), "2".to_string()]
-            ),
+            ("LAGTIME".to_string(), vec!["OFF".to_string(), "ON".to_string()]),
+            ("PERIPHERALS".to_string(), vec!["0".to_string(), "1".to_string(), "2".to_string()]),
             (
                 "CL-WT".to_string(),
-                vec![
-                    "none".to_string(),
-                    "power".to_string(),
-                    "exponential".to_string()
-                ]
+                vec!["none".to_string(), "power".to_string(), "exponential".to_string()]
             ),
-            (
-                "V-WT".to_string(),
-                vec!["none".to_string(), "power".to_string()]
-            ),
+            ("V-WT".to_string(), vec!["none".to_string(), "power".to_string()]),
         ]
     );
     assert_eq!(space.alleles(), vec![2, 3, 3, 2]);
     assert_eq!(space.size(), Some(36));
-    assert_eq!(
-        space.describe(&vec![1, 2, 1, 0]),
-        "LAGTIME=ON;PERIPHERALS=2;CL-WT=power;V-WT=none"
-    );
+    assert_eq!(space.describe(&vec![1, 2, 1, 0]), "LAGTIME=ON;PERIPHERALS=2;CL-WT=power;V-WT=none");
 }
 
 #[test]
@@ -231,10 +196,7 @@ fn a_pair_the_base_declares_is_not_an_axis_and_a_forced_effect_is_not_either() {
     assert_eq!(space.axes.len(), 1);
     assert_eq!(space.forced.len(), 1);
     assert!(
-        space
-            .notes
-            .iter()
-            .any(|n| n.contains("not explored: CL-WT-power")),
+        space.notes.iter().any(|n| n.contains("not explored: CL-WT-power")),
         "{:?}",
         space.notes
     );
@@ -300,14 +262,8 @@ fn exhaustive_evaluates_every_grid_point_and_selects_the_best() {
         ids_by_description(&result)[..3],
         [
             ("input".to_string(), "the input model".to_string()),
-            (
-                "run1".to_string(),
-                "LAGTIME=OFF;PERIPHERALS=0;CL-WT=none".to_string()
-            ),
-            (
-                "run2".to_string(),
-                "LAGTIME=OFF;PERIPHERALS=0;CL-WT=power".to_string()
-            ),
+            ("run1".to_string(), "LAGTIME=OFF;PERIPHERALS=0;CL-WT=none".to_string()),
+            ("run2".to_string(), "LAGTIME=OFF;PERIPHERALS=0;CL-WT=power".to_string()),
         ]
     );
     let winner = result.row(&result.final_id).unwrap();
@@ -340,19 +296,10 @@ fn exhaustive_evaluates_every_grid_point_and_selects_the_best() {
 fn exhaustive_refuses_a_grid_above_max_models() {
     let space = space("PERIPHERALS(0..2); LAGTIME([OFF,ON])");
     let script = ScriptedFitter::new(key, &[]);
-    let options = GlobalsearchOptions {
-        max_models: 5,
-        ..options(Algorithm::Exhaustive)
-    };
+    let options = GlobalsearchOptions { max_models: 5, ..options(Algorithm::Exhaustive) };
     let e = search(&script, space, &options, None).unwrap_err();
-    assert!(
-        e.contains("6 points, above [globalsearch] max_models = 5"),
-        "{e}"
-    );
-    assert!(
-        script.dirs().is_empty(),
-        "refused before the input was fitted"
-    );
+    assert!(e.contains("6 points, above [globalsearch] max_models = 5"), "{e}");
+    assert!(script.dirs().is_empty(), "refused before the input was fitted");
 }
 
 // ── the GA on the model layer ───────────────────────────────────────────────
@@ -395,11 +342,8 @@ fn landscape_fitter(space: &Space) -> ScriptedFitter {
     // decoder the search uses — the key is what `key()` renders.
     let mut table: Vec<(String, f64)> = vec![("input".into(), 500.0)];
     for g in ga::enumerate(&space.alleles()) {
-        let features: FeatureVector = space
-            .describe(&g)
-            .split(';')
-            .map(|part| part.split_once('=').unwrap())
-            .collect();
+        let features: FeatureVector =
+            space.describe(&g).split(';').map(|part| part.split_once('=').unwrap()).collect();
         let k = key(&Candidate::new("x", space.input_model.clone()).features(features));
         table.push((k.clone(), landscape(&k)));
     }
@@ -428,37 +372,23 @@ fn the_ga_finds_the_same_optimum_as_exhaustive_enumeration() {
     };
     assert_eq!(exhaustive.space_size, 36);
     let best = exhaustive.row(&exhaustive.final_id).unwrap();
-    assert_eq!(
-        best.description,
-        "LAGTIME=ON;PERIPHERALS=1;CL-WT=exponential;V-WT=power"
-    );
+    assert_eq!(best.description, "LAGTIME=ON;PERIPHERALS=1;CL-WT=exponential;V-WT=power");
     assert_eq!(best.fitness, 500.0 - 20.0 - 15.0 - 6.0 - 5.0 - 10.0);
 
     for seed in [1u64, 2, 3, 1185] {
         let space = ga_space();
         let script = landscape_fitter(&space);
         let options = GlobalsearchOptions {
-            ga: GaOptions {
-                population_size: 8,
-                generations: 6,
-                seed,
-                ..GaOptions::default()
-            },
+            ga: GaOptions { population_size: 8, generations: 6, seed, ..GaOptions::default() },
             ..options(Algorithm::Ga)
         };
         let result = run(&script, space, &options);
         let winner = result.row(&result.final_id).unwrap();
         assert_eq!(winner.description, best.description, "seed {seed}");
         assert_eq!(winner.fitness, best.fitness, "seed {seed}");
-        assert!(
-            result.n_fitted() < 36,
-            "seed {seed}: the GA fitted the whole grid"
-        );
+        assert!(result.n_fitted() < 36, "seed {seed}: the GA fitted the whole grid");
         assert_eq!(result.generations.len(), 7, "seed {seed}");
-        assert_eq!(
-            result.generations.last().unwrap().best_fitness,
-            best.fitness
-        );
+        assert_eq!(result.generations.last().unwrap().best_fitness, best.fitness);
         // The steps are journalled per generation and per downhill round.
         let dirs = script.dirs();
         assert_eq!(dirs[0], "input");
@@ -474,11 +404,7 @@ fn the_ga_finds_the_same_optimum_as_exhaustive_enumeration() {
         described.sort();
         let n = described.len();
         described.dedup();
-        assert_eq!(
-            described.len(),
-            n,
-            "seed {seed}: a grid point was fitted twice"
-        );
+        assert_eq!(described.len(), n, "seed {seed}: a grid point was fitted twice");
     }
 }
 
@@ -487,19 +413,11 @@ fn the_ga_finds_the_same_optimum_as_exhaustive_enumeration() {
 #[test]
 fn a_gene_on_a_parameter_the_structure_removed_is_non_influential() {
     // `KA` exists on FO only: on INST the covariate gene changes nothing.
-    let space = space_with(
-        "ABSORPTION([INST,FO])",
-        &[effect("KA", "WT", CovariateEffect::Pow, true)],
-        &[],
-    );
+    let space =
+        space_with("ABSORPTION([INST,FO])", &[effect("KA", "WT", CovariateEffect::Pow, true)], &[]);
     let script = ScriptedFitter::new(
         key,
-        &[
-            ("input", 500.0),
-            ("INST;P0", 490.0),
-            ("P0", 495.0),
-            ("P0;KA-WT=power", 485.0),
-        ],
+        &[("input", 500.0), ("INST;P0", 490.0), ("P0", 495.0), ("P0;KA-WT=power", 485.0)],
     );
     let result = run(&script, space, &options(Algorithm::Exhaustive));
     let p = Penalties::default();
@@ -513,10 +431,7 @@ fn a_gene_on_a_parameter_the_structure_removed_is_non_influential() {
     assert_eq!(inst_power.non_influential, 1);
     assert_eq!(inst_none.fitness, 490.0);
     assert_eq!(inst_power.fitness, 490.0 + p.non_influential);
-    assert!(
-        inst_power.effects.is_empty(),
-        "the relation was not written"
-    );
+    assert!(inst_power.effects.is_empty(), "the relation was not written");
     assert!(
         !result.models["run4"].render().contains("KA ~ WT"),
         "a relation on a parameter the model does not declare"
@@ -543,12 +458,7 @@ fn an_unbuildable_point_is_a_row_with_the_crash_fitness_and_is_never_fitted() {
     let bolus_lag = &result.rows[4];
     assert_eq!(bolus_lag.description, "ABSORPTION=INST;LAGTIME=ON");
     assert_eq!(bolus_lag.fitness, Penalties::default().crash);
-    assert!(bolus_lag
-        .error
-        .as_ref()
-        .unwrap()
-        .message
-        .contains("not generated"));
+    assert!(bolus_lag.error.as_ref().unwrap().message.contains("not generated"));
     assert!(bolus_lag.rank.is_none());
     assert_eq!(
         script.candidates_in("candidates").len(),
@@ -559,56 +469,25 @@ fn an_unbuildable_point_is_a_row_with_the_crash_fitness_and_is_never_fitted() {
     let space = self::space("TRANSITS([0,1], NODEPOT)");
     let script = ScriptedFitter::new(key, &[("input", 500.0)]);
     let result = run(&script, space, &options(Algorithm::Exhaustive));
-    let one = result
-        .rows
-        .iter()
-        .find(|r| r.description == "TRANSITS=1")
-        .unwrap();
-    assert!(
-        one.error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("does not combine"),
-        "{:?}",
-        one.error
-    );
+    let one = result.rows.iter().find(|r| r.description == "TRANSITS=1").unwrap();
+    assert!(one.error.as_ref().unwrap().message.contains("does not combine"), "{:?}", one.error);
 }
 
 #[test]
 fn a_failed_gate_is_charged_and_never_selected_and_a_crash_is_the_crash_value() {
     let space = space("PERIPHERALS(0..2)");
-    let mut script = ScriptedFitter::new(
-        key,
-        &[
-            ("input", 500.0),
-            ("P0", 500.0),
-            ("P1", 470.0),
-            ("P2", 480.0),
-        ],
-    );
+    let mut script =
+        ScriptedFitter::new(key, &[("input", 500.0), ("P0", 500.0), ("P1", 470.0), ("P2", 480.0)]);
     script.failing = vec!["P1".into()];
     script.erroring = vec!["run3".into()];
     let result = run(&script, space, &options(Algorithm::Exhaustive));
     let p = Penalties::default();
-    let p1 = result
-        .rows
-        .iter()
-        .find(|r| r.description == "PERIPHERALS=1")
-        .unwrap();
+    let p1 = result.rows.iter().find(|r| r.description == "PERIPHERALS=1").unwrap();
     assert!(!p1.passed);
     assert_eq!(p1.criterion, 470.0);
-    assert_eq!(
-        p1.fitness,
-        470.0 + p.gate,
-        "the gate charge, on top of the criterion"
-    );
+    assert_eq!(p1.fitness, 470.0 + p.gate, "the gate charge, on top of the criterion");
     assert!(p1.rank.is_none());
-    let p2 = result
-        .rows
-        .iter()
-        .find(|r| r.description == "PERIPHERALS=2")
-        .unwrap();
+    let p2 = result.rows.iter().find(|r| r.description == "PERIPHERALS=2").unwrap();
     assert!(p2.error.is_some());
     assert_eq!(p2.fitness, p.crash);
     assert!(p2.criterion.is_nan());
@@ -628,14 +507,7 @@ fn a_failed_gate_is_charged_and_never_selected_and_a_crash_is_the_crash_value() 
     let result = run(&script, space, &options(Algorithm::Exhaustive));
     assert_eq!(result.final_id, "input");
     assert!(result.row("input").unwrap().selected);
-    assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("no candidate passed")),
-        "{:?}",
-        result.notes
-    );
+    assert!(result.notes.iter().any(|n| n.contains("no candidate passed")), "{:?}", result.notes);
 }
 
 #[test]
@@ -643,17 +515,11 @@ fn the_penalized_criterion_ranks_and_the_gate_charge_stacks_on_it() {
     let space = space("PERIPHERALS(0..1)");
     let mut script = ScriptedFitter::new(key, &[("input", 500.0), ("P0", 500.0), ("P1", 470.0)]);
     script.failing = vec!["P1".into()];
-    let options = GlobalsearchOptions {
-        rank: RankType::Penalized,
-        ..GlobalsearchOptions::default()
-    };
+    let options =
+        GlobalsearchOptions { rank: RankType::Penalized, ..GlobalsearchOptions::default() };
     let result = run(&script, space, &options);
     let p = Penalties::default();
-    let p1 = result
-        .rows
-        .iter()
-        .find(|r| r.description == "PERIPHERALS=1")
-        .unwrap();
+    let p1 = result.rows.iter().find(|r| r.description == "PERIPHERALS=1").unwrap();
     // The scripted fit carries the warfarin fixture's tally and no
     // covariance step, so the criterion is OFV + parameter charges +
     // covariance; the gate charge then comes on top. The fixture's own
@@ -670,11 +536,8 @@ fn the_penalized_criterion_ranks_and_the_gate_charge_stacks_on_it() {
 fn a_point_rendering_to_a_model_already_fitted_is_a_duplicate_across_batches() {
     // Drive the evaluator directly: INST genomes with and without the dead
     // KA gene, in two batches.
-    let space = space_with(
-        "ABSORPTION([INST,FO])",
-        &[effect("KA", "WT", CovariateEffect::Pow, true)],
-        &[],
-    );
+    let space =
+        space_with("ABSORPTION([INST,FO])", &[effect("KA", "WT", CovariateEffect::Pow, true)], &[]);
     let script = ScriptedFitter::new(key, &[("INST;P0", 490.0)]);
     let options = options(Algorithm::Ga);
     let mut evaluator = Evaluator {
@@ -699,18 +562,11 @@ fn a_point_rendering_to_a_model_already_fitted_is_a_duplicate_across_batches() {
     let second =
         ga::Oracle::evaluate(&mut evaluator, "generation-1", &[vec![1, 1], vec![1, 0]]).unwrap();
     assert_eq!(first, vec![490.0]);
-    assert_eq!(
-        second,
-        vec![490.0 + Penalties::default().non_influential, 490.0]
-    );
+    assert_eq!(second, vec![490.0 + Penalties::default().non_influential, 490.0]);
     assert_eq!(evaluator.rows.len(), 2);
     assert_eq!(evaluator.rows[1].duplicate_of.as_deref(), Some("run1"));
     assert_eq!(evaluator.rows[1].non_influential, 1);
-    assert_eq!(
-        script.dirs(),
-        vec!["generation-0"],
-        "the second batch needed no fit at all"
-    );
+    assert_eq!(script.dirs(), vec!["generation-0"], "the second batch needed no fit at all");
     // A batch repeating a genome asks once and answers twice.
     let third =
         ga::Oracle::evaluate(&mut evaluator, "generation-2", &[vec![0, 0], vec![0, 0]]).unwrap();
@@ -732,12 +588,7 @@ fn a_cancellation_returns_the_rows_so_far() {
     let mut script = landscape_fitter(&space);
     script.cancel_after = Some(2);
     let options = GlobalsearchOptions {
-        ga: GaOptions {
-            population_size: 6,
-            generations: 5,
-            seed: 9,
-            ..GaOptions::default()
-        },
+        ga: GaOptions { population_size: 6, generations: 5, seed: 9, ..GaOptions::default() },
         ..options(Algorithm::Ga)
     };
     let result = run(&script, space, &options);
@@ -749,11 +600,8 @@ fn a_cancellation_returns_the_rows_so_far() {
 
 #[test]
 fn the_input_seeds_every_candidate_and_forced_effects_reach_every_one() {
-    let space = space_with(
-        "PERIPHERALS(0..1)",
-        &[effect("V", "WT", CovariateEffect::Pow, false)],
-        &[],
-    );
+    let space =
+        space_with("PERIPHERALS(0..1)", &[effect("V", "WT", CovariateEffect::Pow, false)], &[]);
     assert_eq!(space.forced.len(), 1);
     let script = ScriptedFitter::new(key, &[("input", 500.0)]);
     let result = run(&script, space, &options(Algorithm::Exhaustive));
@@ -777,11 +625,7 @@ fn the_section_is_read_with_its_defaults_and_refuses_what_it_cannot_honour() {
     let cfg = load("base = \"m.ferx\"\n[space]\nmfl = \"PERIPHERALS(0..1)\"\n");
     let o = GlobalsearchOptions::from_config(&cfg).unwrap();
     assert_eq!(o, GlobalsearchOptions::default());
-    assert_eq!(
-        o.rank,
-        RankType::Penalized,
-        "the file's silence is pyDarwin's ranking"
-    );
+    assert_eq!(o.rank, RankType::Penalized, "the file's silence is pyDarwin's ranking");
     assert_eq!(o.criterion(), Criterion::Penalized(Penalties::default()));
 
     let cfg = load(
@@ -801,26 +645,11 @@ fn the_section_is_read_with_its_defaults_and_refuses_what_it_cannot_honour() {
     assert_eq!(o.criterion().label(), "bic_mixed");
 
     for (text, msg) in [
-        (
-            "[globalsearch]\niiv_strategy = \"fullblock\"\n",
-            "iiv_strategy = \"fullblock\"",
-        ),
-        (
-            "[globalsearch]\nmax_models = 0\n",
-            "max_models must be at least 1",
-        ),
-        (
-            "[globalsearch]\npopulation = 3\n",
-            "unknown field `population`",
-        ),
-        (
-            "[globalsearch.ga]\npopulation_size = 1\n",
-            "population_size must be at least 2",
-        ),
-        (
-            "[rank.penalties]\ncrash = -1\n",
-            "[rank.penalties] crash = -1",
-        ),
+        ("[globalsearch]\niiv_strategy = \"fullblock\"\n", "iiv_strategy = \"fullblock\""),
+        ("[globalsearch]\nmax_models = 0\n", "max_models must be at least 1"),
+        ("[globalsearch]\npopulation = 3\n", "unknown field `population`"),
+        ("[globalsearch.ga]\npopulation_size = 1\n", "population_size must be at least 2"),
+        ("[rank.penalties]\ncrash = -1\n", "[rank.penalties] crash = -1"),
     ] {
         let text = format!("base = \"m.ferx\"\n[space]\nmfl = \"PERIPHERALS(0..1)\"\n{text}");
         let e = SearchConfig::from_str(&text, std::path::Path::new("."))
@@ -845,12 +674,7 @@ fn the_report_writes_the_table_the_trajectory_and_the_final_model() {
     let space = ga_space();
     let script = landscape_fitter(&space);
     let options = GlobalsearchOptions {
-        ga: GaOptions {
-            population_size: 8,
-            generations: 3,
-            seed: 1,
-            ..GaOptions::default()
-        },
+        ga: GaOptions { population_size: 8, generations: 3, seed: 1, ..GaOptions::default() },
         ..options(Algorithm::Ga)
     };
     let result = run(&script, space, &options);
@@ -861,41 +685,26 @@ fn the_report_writes_the_table_the_trajectory_and_the_final_model() {
     let header = table.lines().next().unwrap();
     assert_eq!(header, MODEL_COLUMNS.join(","));
     assert_eq!(table.lines().count(), result.rows.len() + 1);
-    let selected: Vec<&str> = table
-        .lines()
-        .skip(1)
-        .filter(|l| l.split(',').nth(20) == Some("true"))
-        .collect();
+    let selected: Vec<&str> =
+        table.lines().skip(1).filter(|l| l.split(',').nth(20) == Some("true")).collect();
     assert_eq!(selected.len(), 1);
     assert!(selected[0].starts_with(&format!("{},input,", result.final_id)));
 
     let generations = std::fs::read_to_string(report::generations_path(dir.path())).unwrap();
-    assert_eq!(
-        generations.lines().count(),
-        5,
-        "a header and four generations"
-    );
+    assert_eq!(generations.lines().count(), 5, "a header and four generations");
     assert!(generations.lines().nth(1).unwrap().starts_with("0,"));
 
     let final_text = std::fs::read_to_string(final_model_path(dir.path())).unwrap();
     assert!(final_text.contains("[covariate_model]"), "{final_text}");
     assert!(models_dir(dir.path()).join("input.ferx").exists());
-    assert!(models_dir(dir.path())
-        .join(format!("{}.ferx", result.final_id))
-        .exists());
+    assert!(models_dir(dir.path()).join(format!("{}.ferx", result.final_id)).exists());
 
     let summary = render_summary(&result);
     assert!(summary.contains("Grid: 36 points over 4 axes"), "{summary}");
-    assert!(
-        summary.contains("CL-WT: none | power | exponential"),
-        "{summary}"
-    );
+    assert!(summary.contains("CL-WT: none | power | exponential"), "{summary}");
     assert!(summary.contains("SELECTED"), "{summary}");
     assert!(summary.contains("generation"), "{summary}");
-    assert!(
-        summary.contains(&format!("Final model: {}", result.final_id)),
-        "{summary}"
-    );
+    assert!(summary.contains(&format!("Final model: {}", result.final_id)), "{summary}");
 }
 
 #[test]
@@ -920,18 +729,10 @@ fn a_forced_effect_on_a_parameter_the_structure_removed_makes_the_point_unbuilda
     );
     let script = ScriptedFitter::new(key, &[("input", 500.0), ("INST;P0", 400.0), ("P0", 490.0)]);
     let result = run(&script, space, &options(Algorithm::Exhaustive));
-    let inst = result
-        .rows
-        .iter()
-        .find(|r| r.description == "ABSORPTION=INST")
-        .unwrap();
+    let inst = result.rows.iter().find(|r| r.description == "ABSORPTION=INST").unwrap();
     assert!(inst.error.is_some(), "{inst:?}");
     assert!(
-        inst.error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("forced effect KA-WT-power"),
+        inst.error.as_ref().unwrap().message.contains("forced effect KA-WT-power"),
         "{:?}",
         inst.error
     );
@@ -986,10 +787,7 @@ fn a_run_whose_winner_is_a_cross_batch_duplicate_hands_back_the_fit() {
             continue; // a within-batch duplicate: the runner's report has the fit
         }
         reached = true;
-        assert_eq!(
-            winner.description, "ABSORPTION=INST;KA-WT=none",
-            "seed {seed}"
-        );
+        assert_eq!(winner.description, "ABSORPTION=INST;KA-WT=none", "seed {seed}");
         assert_eq!(rep_row.non_influential, 1, "seed {seed}");
         assert_eq!(
             result.final_fit.as_ref().map(|f| f.ofv),
@@ -998,10 +796,7 @@ fn a_run_whose_winner_is_a_cross_batch_duplicate_hands_back_the_fit() {
             winner.id
         );
         assert!(
-            !result
-                .notes
-                .iter()
-                .any(|n| n.contains("not in the journal cache")),
+            !result.notes.iter().any(|n| n.contains("not in the journal cache")),
             "seed {seed}: {:?}",
             result.notes
         );
@@ -1059,11 +854,8 @@ fn a_covariate_edit_the_layer_refuses_costs_one_point_not_the_run() {
     let script = ScriptedFitter::new(key, &[("input", 500.0), ("V-WT=power", 480.0)]);
     let result = run(&script, space, &options(Algorithm::Exhaustive));
     assert_eq!(result.rows.len(), 5);
-    let refused: Vec<&ModelRow> = result
-        .rows
-        .iter()
-        .filter(|r| r.description.contains("CL-WT=exponential"))
-        .collect();
+    let refused: Vec<&ModelRow> =
+        result.rows.iter().filter(|r| r.description.contains("CL-WT=exponential")).collect();
     assert_eq!(refused.len(), 2);
     for r in refused {
         let e = r.error.as_ref().expect("a refused point");
@@ -1072,10 +864,7 @@ fn a_covariate_edit_the_layer_refuses_costs_one_point_not_the_run() {
         assert!(r.rank.is_none());
     }
     assert_eq!(script.candidates_in("candidates").len(), 2);
-    assert_eq!(
-        result.row(&result.final_id).unwrap().description,
-        "CL-WT=none;V-WT=power"
-    );
+    assert_eq!(result.row(&result.final_id).unwrap().description, "CL-WT=none;V-WT=power");
 }
 
 #[test]
@@ -1096,11 +885,7 @@ fn a_runner_warning_that_recurs_per_batch_is_one_note() {
     let result = run(&script, space, &options);
     assert!(script.dirs().len() >= 3, "{:?}", script.dirs());
     assert_eq!(
-        result
-            .notes
-            .iter()
-            .filter(|n| n.contains("no search directory"))
-            .count(),
+        result.notes.iter().filter(|n| n.contains("no search directory")).count(),
         1,
         "{:?}",
         result.notes
@@ -1109,57 +894,32 @@ fn a_runner_warning_that_recurs_per_batch_is_one_note() {
 
 #[test]
 fn a_cutoff_keeps_the_input_unless_a_candidate_beats_it_by_that_much() {
-    let table = [
-        ("input", 500.0),
-        ("P0", 500.0),
-        ("P1", 497.0),
-        ("P2", 496.0),
-    ];
-    let with = |cutoff: Option<f64>| GlobalsearchOptions {
-        cutoff,
-        ..options(Algorithm::Exhaustive)
-    };
+    let table = [("input", 500.0), ("P0", 500.0), ("P1", 497.0), ("P2", 496.0)];
+    let with =
+        |cutoff: Option<f64>| GlobalsearchOptions { cutoff, ..options(Algorithm::Exhaustive) };
     // The best candidate is 4 better than the input: a cutoff of 5 keeps
     // the input, a cutoff of 4 selects it.
-    let result = run(
-        &ScriptedFitter::new(key, &table),
-        space("PERIPHERALS(0..2)"),
-        &with(Some(5.0)),
-    );
+    let result =
+        run(&ScriptedFitter::new(key, &table), space("PERIPHERALS(0..2)"), &with(Some(5.0)));
     assert_eq!(result.final_id, "input");
     assert!(result.row("input").unwrap().selected);
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("beat the input by [rank] cutoff = 5")),
+        result.notes.iter().any(|n| n.contains("beat the input by [rank] cutoff = 5")),
         "{:?}",
         result.notes
     );
     assert_eq!(result.final_fit.as_ref().map(|f| f.ofv), Some(500.0));
-    let result = run(
-        &ScriptedFitter::new(key, &table),
-        space("PERIPHERALS(0..2)"),
-        &with(Some(4.0)),
-    );
-    assert_eq!(
-        result.row(&result.final_id).unwrap().description,
-        "PERIPHERALS=2"
-    );
+    let result =
+        run(&ScriptedFitter::new(key, &table), space("PERIPHERALS(0..2)"), &with(Some(4.0)));
+    assert_eq!(result.row(&result.final_id).unwrap().description, "PERIPHERALS=2");
     // The input failing the gate: the cutoff has no reference, the best
     // candidate is selected and the notes say why.
     let mut script = ScriptedFitter::new(key, &table);
     script.failing = vec!["input".into()];
     let result = run(&script, space("PERIPHERALS(0..2)"), &with(Some(50.0)));
-    assert_eq!(
-        result.row(&result.final_id).unwrap().description,
-        "PERIPHERALS=2"
-    );
+    assert_eq!(result.row(&result.final_id).unwrap().description, "PERIPHERALS=2");
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("cutoff cannot be applied")),
+        result.notes.iter().any(|n| n.contains("cutoff cannot be applied")),
         "{:?}",
         result.notes
     );
@@ -1168,8 +928,5 @@ fn a_cutoff_keeps_the_input_unless_a_candidate_beats_it_by_that_much() {
     assert!(e.contains("[rank] cutoff = -1"), "{e}");
     let cfg =
         load("base = \"m.ferx\"\n[space]\nmfl = \"PERIPHERALS(0..1)\"\n[rank]\ncutoff = 3.84\n");
-    assert_eq!(
-        GlobalsearchOptions::from_config(&cfg).unwrap().cutoff,
-        Some(3.84)
-    );
+    assert_eq!(GlobalsearchOptions::from_config(&cfg).unwrap().cutoff, Some(3.84));
 }

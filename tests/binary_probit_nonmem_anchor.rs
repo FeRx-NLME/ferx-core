@@ -66,11 +66,8 @@ fn prep(edit: impl Fn(String) -> String) -> ferx_core::PreparedRun {
 }
 
 fn evaluate_at(
-    p: &ferx_core::PreparedRun,
-    params: &ModelParameters,
-    method: EstimationMethod,
-    interaction: bool,
-    covariance: bool,
+    p: &ferx_core::PreparedRun, params: &ModelParameters, method: EstimationMethod,
+    interaction: bool, covariance: bool,
 ) -> FitResult {
     let options = FitOptions {
         verbose: false,
@@ -97,10 +94,7 @@ fn assert_no_fd(what: &str, f: &FitResult) {
 
 /// B1-probit, unprofiled, at the parameters of NONMEM's `name` run.
 fn unprofiled_at(
-    name: &str,
-    method: EstimationMethod,
-    interaction: bool,
-    edit: impl Fn(String) -> String,
+    name: &str, method: EstimationMethod, interaction: bool, edit: impl Fn(String) -> String,
 ) -> (FitResult, f64) {
     let p = prep(edit);
     assert_eq!(p.parsed.model.theta_names.len(), 32);
@@ -118,10 +112,8 @@ fn unprofiled_at(
 /// `math.erfc` (correct to about an ulp). On the logit twin B1 the same script reproduces
 /// NONMEM to −1.41e-9 (ferx: −1.42e-9), so it is the same objective; on probit it is the
 /// reference that sees the link exactly.
-const EXACT_PHI_OFV: [(&str, f64); 2] = [
-    ("probit_b1_laplace", 3019.7507340385255),
-    ("probit_b1_tail", 3882.8338559211643),
-];
+const EXACT_PHI_OFV: [(&str, f64); 2] =
+    [("probit_b1_laplace", 3019.7507340385255), ("probit_b1_tail", 3882.8338559211643)];
 
 /// |ΔOFV| bound against the exact-`Φ` reference. Measured 1.36e-12 at NONMEM's optimum and
 /// 2.27e-12 at the tail point, every method, macOS arm64 (Linux aarch64: 1.36e-12 / 2.73e-12);
@@ -150,14 +142,8 @@ fn assert_reproduces(method: EstimationMethod, interaction: bool) {
             f.ofv
         );
         assert!(f.ofv.is_finite(), "{name} {method:?}: OFV {}", f.ofv);
-        assert!(
-            de.abs() <= EXACT_OFV,
-            "{name} {method:?}: vs exact Φ {de:.3e}"
-        );
-        assert!(
-            dn.abs() <= NONMEM_OFV,
-            "{name} {method:?}: vs NONMEM {dn:.3e}"
-        );
+        assert!(de.abs() <= EXACT_OFV, "{name} {method:?}: vs exact Φ {de:.3e}");
+        assert!(dn.abs() <= NONMEM_OFV, "{name} {method:?}: vs NONMEM {dn:.3e}");
         assert_no_fd(name, &f);
     }
 }
@@ -183,18 +169,10 @@ fn probit_binary_reproduces_nonmem_under_foce() {
 #[test]
 fn the_anchor_tells_probit_from_logit() {
     let to_logit = |t: String| {
-        assert!(
-            t.contains("  link   = probit\n  probit = "),
-            "the fixture moved"
-        );
+        assert!(t.contains("  link   = probit\n  probit = "), "the fixture moved");
         t.replace("  link   = probit\n  probit = ", "  logit = ")
     };
-    let (f, obj) = unprofiled_at(
-        "probit_b1_laplace",
-        EstimationMethod::Laplace,
-        true,
-        to_logit,
-    );
+    let (f, obj) = unprofiled_at("probit_b1_laplace", EstimationMethod::Laplace, true, to_logit);
     eprintln!("B1-probit scored under logit: ΔOFV {:.3}", f.ofv - obj);
     assert!((f.ofv - obj).abs() > 1.0, "{} vs {obj}", f.ofv);
 }
@@ -240,10 +218,7 @@ fn assert_profiled_reproduces(method: EstimationMethod, interaction: bool) {
          NONMEM's levels {below:.3e}, levels {level:.3e}",
         f.ofv
     );
-    assert!(
-        below <= 1e-9 && below > -1e-6,
-        "{method:?}: vs exact Φ {below:.3e}"
-    );
+    assert!(below <= 1e-9 && below > -1e-6, "{method:?}: vs exact Φ {below:.3e}");
     assert!(d.abs() <= NONMEM_OFV, "{method:?}: vs NONMEM {d:.3e}");
     assert!(level < 1e-4, "{method:?}: levels {level:.3e}");
 }
@@ -280,14 +255,10 @@ fn the_profiled_probit_covariance_is_the_unprofiled_one_at_the_same_point() {
     params.theta.clone_from(&fp.theta);
     params.omega = OmegaMatrix::from_diagonal(&[omega], vec!["ETA_S".into()]);
     let fu = evaluate_at(&pu, &params, EstimationMethod::Laplace, true, true);
-    let sp = fp
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("profiled covariance: {:?}", fp.warnings));
-    let su = fu
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("unprofiled covariance: {:?}", fu.warnings));
+    let sp =
+        fp.se_theta.as_ref().unwrap_or_else(|| panic!("profiled covariance: {:?}", fp.warnings));
+    let su =
+        fu.se_theta.as_ref().unwrap_or_else(|| panic!("unprofiled covariance: {:?}", fu.warnings));
     assert_eq!(sp.len(), su.len());
     let mut worst = 0.0_f64;
     for (a, b) in sp.iter().zip(su) {
@@ -295,10 +266,7 @@ fn the_profiled_probit_covariance_is_the_unprofiled_one_at_the_same_point() {
         assert!(rel.is_finite(), "{a} vs {b}");
         worst = worst.max(rel);
     }
-    eprintln!(
-        "C1-probit: ΔOFV {:.3e}, worst SE {worst:.3e}",
-        fu.ofv - fp.ofv
-    );
+    eprintln!("C1-probit: ΔOFV {:.3e}, worst SE {worst:.3e}", fu.ofv - fp.ofv);
     assert!((fu.ofv - fp.ofv).abs() < 1e-7);
     assert!(worst < 1e-9, "{worst:.3e}");
 }
@@ -321,12 +289,7 @@ fn b2_pnorm(profiled: bool) -> ferx_core::PreparedRun {
     std::fs::write(&path, text).unwrap();
     let p = ferx_core::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/profile_logit_b2.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("nonmem_anchor/profile_logit_b2.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("B2-pnorm loads: {e}"));
     let _ = std::fs::remove_file(&path);
@@ -342,10 +305,9 @@ fn b2_pnorm(profiled: bool) -> ferx_core::PreparedRun {
 /// 2.0e-11 (`laplace`), macOS arm64.
 #[test]
 fn a_block_read_through_pnorm_profiles_to_the_unprofiled_objective() {
-    for (method, interaction) in [
-        (EstimationMethod::FoceI, true),
-        (EstimationMethod::Laplace, true),
-    ] {
+    for (method, interaction) in
+        [(EstimationMethod::FoceI, true), (EstimationMethod::Laplace, true)]
+    {
         let pp = b2_pnorm(true);
         let fp = evaluate_at(&pp, &pp.init_params, method, interaction, false);
         assert_eq!(fp.profiled_blocks, ["PLACEBO"], "{method:?}");

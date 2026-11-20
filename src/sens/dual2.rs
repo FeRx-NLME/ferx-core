@@ -18,11 +18,7 @@ pub struct Dual2<const N: usize> {
 
 impl<const N: usize> Dual2<N> {
     pub fn constant(value: f64) -> Self {
-        Dual2 {
-            value,
-            grad: [0.0; N],
-            hess: [[0.0; N]; N],
-        }
+        Dual2 { value, grad: [0.0; N], hess: [[0.0; N]; N] }
     }
 
     /// Seed input `i`: `value` with `∂/∂xᵢ = 1`.
@@ -80,10 +76,7 @@ impl<const N: usize> Dual2<N> {
 
     pub fn ln_gamma(self) -> Self {
         let x = self.value;
-        let (d1, d2) = (
-            crate::stats::special::digamma(x),
-            crate::stats::special::trigamma(x),
-        );
+        let (d1, d2) = (crate::stats::special::digamma(x), crate::stats::special::trigamma(x));
         self.lift2(crate::stats::special::ln_gamma(x), d1, d2)
     }
 
@@ -99,11 +92,7 @@ impl<const N: usize> Dual2<N> {
         if a == 0.0 {
             return Self::constant(a.powf(n));
         }
-        self.lift2(
-            a.powf(n),
-            n * a.powf(n - 1.0),
-            n * (n - 1.0) * a.powf(n - 2.0),
-        )
+        self.lift2(a.powf(n), n * a.powf(n - 1.0), n * (n - 1.0) * a.powf(n - 2.0))
     }
 
     pub fn abs(self) -> Self {
@@ -130,11 +119,7 @@ impl<const N: usize> Dual2<N> {
     /// Bit-for-bit equality of the value and every jet entry.
     pub(crate) fn same_bits(&self, o: &Self) -> bool {
         self.value.to_bits() == o.value.to_bits()
-            && self
-                .grad
-                .iter()
-                .zip(&o.grad)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && self.grad.iter().zip(&o.grad).all(|(a, b)| a.to_bits() == b.to_bits())
             && self
                 .hess
                 .iter()
@@ -146,24 +131,18 @@ impl<const N: usize> Dual2<N> {
     /// Whether every gradient and Hessian entry is finite (the value is checked apart:
     /// an overflow reaches the Hessian first, #1204).
     pub fn jets_finite(self) -> bool {
-        self.grad
-            .iter()
-            .chain(self.hess.iter().flatten())
-            .all(|x| x.is_finite())
+        self.grad.iter().chain(self.hess.iter().flatten()).all(|x| x.is_finite())
     }
 
     /// The largest absolute gradient or Hessian entry; `NaN` if any entry is `NaN`.
     pub fn jet_max_abs(self) -> f64 {
-        self.grad
-            .iter()
-            .chain(self.hess.iter().flatten())
-            .fold(0.0_f64, |m, g| {
-                if g.is_nan() || m.is_nan() {
-                    f64::NAN
-                } else {
-                    m.max(g.abs())
-                }
-            })
+        self.grad.iter().chain(self.hess.iter().flatten()).fold(0.0_f64, |m, g| {
+            if g.is_nan() || m.is_nan() {
+                f64::NAN
+            } else {
+                m.max(g.abs())
+            }
+        })
     }
 }
 
@@ -240,15 +219,13 @@ impl<const N: usize> Mul<f64> for Dual2<N> {
 impl<const N: usize> Add<f64> for Dual2<N> {
     type Output = Self;
     fn add(self, s: f64) -> Self {
-        Dual2 {
-            value: self.value + s,
-            ..self
-        }
+        Dual2 { value: self.value + s, ..self }
     }
 }
 
 /// `s / dual` (scalar numerator).
-pub fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
+#[cfg(test)]
+pub(crate) fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
     d.recip() * s
 }
 
@@ -327,21 +304,9 @@ mod tests {
     #[test]
     fn pow_constant_exponent_matches_fd() {
         // aⁿ power rule, including a non-integer exponent (positive base).
-        fd_check(
-            |x, y| x.powd(Dual2::constant(2.5)) * y,
-            1.7,
-            0.9,
-            1e-6,
-            1e-3,
-        );
+        fd_check(|x, y| x.powd(Dual2::constant(2.5)) * y, 1.7, 0.9, 1e-6, 1e-3);
         // Integer exponent works for a negative base.
-        fd_check(
-            |x, y| (x - y).powd(Dual2::constant(3.0)),
-            1.0,
-            2.5,
-            1e-6,
-            1e-3,
-        );
+        fd_check(|x, y| (x - y).powd(Dual2::constant(3.0)), 1.0, 2.5, 1e-6, 1e-3);
     }
 
     #[test]

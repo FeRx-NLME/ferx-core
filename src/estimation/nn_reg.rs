@@ -41,8 +41,7 @@ pub(crate) struct NnRegularizer;
 #[cfg(not(feature = "nn"))]
 impl NnRegularizer {
     pub(crate) fn build(
-        _model: &crate::types::CompiledModel,
-        _population: &crate::types::Population,
+        _model: &crate::types::CompiledModel, _population: &crate::types::Population,
         _options: &crate::types::FitOptions,
     ) -> Self {
         Self
@@ -67,16 +66,12 @@ impl NnRegularizer {
     }
 
     pub(crate) fn add_packed_hessian(
-        &self,
-        _theta: &[f64],
-        _add: &mut dyn FnMut(usize, usize, f64),
+        &self, _theta: &[f64], _add: &mut dyn FnMut(usize, usize, f64),
     ) {
     }
 
     pub(crate) fn add_exact_packed_hessian(
-        &self,
-        _theta: &[f64],
-        _add: &mut dyn FnMut(usize, usize, f64),
+        &self, _theta: &[f64], _add: &mut dyn FnMut(usize, usize, f64),
     ) {
     }
 }

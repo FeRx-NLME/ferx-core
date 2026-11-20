@@ -66,25 +66,21 @@ fn flag(args: &[String], name: &str) -> bool {
 }
 
 fn value<'a>(args: &'a [String], name: &str) -> Option<&'a String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
 }
 
 fn parse<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>, String> {
     match value(args, name) {
         None => Ok(None),
-        Some(raw) => raw
-            .parse::<T>()
-            .map(Some)
-            .map_err(|_| format!("{name}: `{raw}` is not a valid value")),
+        Some(raw) => {
+            raw.parse::<T>().map(Some).map_err(|_| format!("{name}: `{raw}` is not a valid value"))
+        }
     }
 }
 
 /// Build [`BootstrapOptions`] from the command line.
 pub fn parse_options(
-    args: &[String],
-    model_path: Option<&str>,
+    args: &[String], model_path: Option<&str>,
 ) -> Result<BootstrapOptions, String> {
     let mut o = BootstrapOptions::default();
     if let Some(n) = parse::<usize>(args, "--samples")? {
@@ -177,10 +173,7 @@ fn run_summarize(args: &[String]) -> Result<i32, String> {
         "Re-summarized {dir}: {} of {} completed samples included",
         summary.n_included, summary.n_completed
     );
-    print!(
-        "{}",
-        render_table(&summary.parameters, summary.confidence_level)
-    );
+    print!("{}", render_table(&summary.parameters, summary.confidence_level));
     Ok(0)
 }
 
@@ -203,21 +196,13 @@ fn run_bootstrap_command(args: &[String], model_path: &str) -> Result<i32, Strin
         "Bootstrap: {} samples, seed {}{}",
         options.samples,
         options.seed,
-        options
-            .stratify_on
-            .as_deref()
-            .map(|c| format!(", stratified on {c}"))
-            .unwrap_or_default()
+        options.stratify_on.as_deref().map(|c| format!(", stratified on {c}")).unwrap_or_default()
     );
 
     if options.resume {
         eprintln!(
             "Resuming the run in {}",
-            options
-                .directory
-                .as_ref()
-                .map(|d| d.display().to_string())
-                .unwrap_or_default()
+            options.directory.as_ref().map(|d| d.display().to_string()).unwrap_or_default()
         );
     }
 
@@ -280,12 +265,7 @@ fn render_table(parameters: &[ferx_tools::bootstrap::ParameterSummary], level: f
         Some(v) if v.is_finite() => format!("{v:>12.5}"),
         _ => format!("{:>12}", "-"),
     };
-    let width = parameters
-        .iter()
-        .map(|p| p.name.len())
-        .max()
-        .unwrap_or(9)
-        .max(9);
+    let width = parameters.iter().map(|p| p.name.len()).max().unwrap_or(9).max(9);
     let mut out = format!(
         "\n{:<width$} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}\n",
         "parameter",
@@ -376,11 +356,8 @@ mod tests {
 
     #[test]
     fn the_recovery_flags_are_parsed() {
-        let o = parse_options(
-            &args(&["m.ferx", "--resume", "--retry-failed"]),
-            Some("m.ferx"),
-        )
-        .unwrap();
+        let o = parse_options(&args(&["m.ferx", "--resume", "--retry-failed"]), Some("m.ferx"))
+            .unwrap();
         assert!(o.resume);
         assert!(o.retry_failed);
     }
@@ -416,13 +393,7 @@ mod tests {
         assert_eq!(flat.sample_size, SampleSize::Total(32));
 
         let per = parse_options(
-            &args(&[
-                "m.ferx",
-                "--stratify-on",
-                "STUD",
-                "--sample-size",
-                "1001=>12,1002=>24",
-            ]),
+            &args(&["m.ferx", "--stratify-on", "STUD", "--sample-size", "1001=>12,1002=>24"]),
             None,
         )
         .unwrap();
@@ -475,10 +446,7 @@ mod tests {
         assert!(lines[0].contains("95% lo") && lines[0].contains("95% hi"));
         // Every row is the same width, including the one that set it.
         let widths: Vec<usize> = lines.iter().map(|l| l.len()).collect();
-        assert!(
-            widths.windows(2).all(|w| w[0] == w[1]),
-            "ragged table: {widths:?}"
-        );
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged table: {widths:?}");
         assert!(lines[2].starts_with("OMEGA(ETA_CL,ETA_CL)"));
     }
 
@@ -514,8 +482,7 @@ mod tests {
     }
 
     fn summary_of(
-        parameters: Vec<ParameterSummary>,
-        excluded: Vec<(String, usize)>,
+        parameters: Vec<ParameterSummary>, excluded: Vec<(String, usize)>,
     ) -> BootstrapResult {
         BootstrapResult {
             parameter_names: parameters.iter().map(|p| p.name.clone()).collect(),
@@ -547,14 +514,8 @@ mod tests {
             ..BootstrapOptions::default()
         };
         let text = report(&result, &options);
-        assert!(
-            text.contains("4 of 0 samples completed; 3 included"),
-            "{text}"
-        );
-        assert!(
-            text.contains("excluded 1: minimization terminated"),
-            "{text}"
-        );
+        assert!(text.contains("4 of 0 samples completed; 3 included"), "{text}");
+        assert!(text.contains("excluded 1: minimization terminated"), "{text}");
         assert!(text.contains("Wrote bootstrap results to out"), "{text}");
         // A resolvable percentile interval means no "too few samples" note.
         assert!(!text.contains("cannot resolve"), "{text}");
@@ -563,17 +524,9 @@ mod tests {
     #[test]
     fn the_report_says_when_there_were_too_few_samples_for_a_percentile_interval() {
         let result = summary_of(vec![parameter("CL", None)], Vec::new());
-        let text = report(
-            &result,
-            &BootstrapOptions {
-                directory: None,
-                ..BootstrapOptions::default()
-            },
-        );
-        assert!(
-            text.contains("cannot resolve a 95% percentile interval"),
-            "{text}"
-        );
+        let text =
+            report(&result, &BootstrapOptions { directory: None, ..BootstrapOptions::default() });
+        assert!(text.contains("cannot resolve a 95% percentile interval"), "{text}");
         assert!(!text.contains("Wrote bootstrap results"), "{text}");
     }
 
@@ -606,14 +559,7 @@ mod tests {
         assert_eq!(run(&args(&["--summarize"])), 1);
         // A directory that exists but holds no raw_results.csv.
         let dir = tempfile::tempdir().expect("temp dir");
-        assert_eq!(
-            run(&args(&[
-                "--summarize",
-                "--directory",
-                dir.path().to_str().unwrap()
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["--summarize", "--directory", dir.path().to_str().unwrap()])), 1);
     }
 
     /// One real end-to-end pass through `run`, on the smallest useful model.
@@ -644,14 +590,7 @@ mod tests {
         assert!(dir.path().join("bootstrap_results.csv").exists());
 
         // And `--summarize` over what it just wrote.
-        assert_eq!(
-            run(&args(&[
-                "--summarize",
-                "--directory",
-                dir.path().to_str().unwrap()
-            ])),
-            0
-        );
+        assert_eq!(run(&args(&["--summarize", "--directory", dir.path().to_str().unwrap()])), 0);
     }
 
     /// `--resume` end to end through the CLI, including the "nothing to do"

@@ -81,16 +81,8 @@ fn swap(s: &str, from: &str, to: &str) -> String {
 /// The `block_sigma` twin at `rho` and `omega_ruv`.
 fn pair(rho: f64, omega_ruv: f64) -> String {
     let cov = rho * 0.12 * 0.20;
-    let s = swap(
-        PAIR,
-        "[0.0144, 0.0144, 0.04]",
-        &format!("[0.0144, {cov}, 0.04]"),
-    );
-    swap(
-        &s,
-        "omega ETA_RUV ~ 0.25 FIX",
-        &format!("omega ETA_RUV ~ {omega_ruv} FIX"),
-    )
+    let s = swap(PAIR, "[0.0144, 0.0144, 0.04]", &format!("[0.0144, {cov}, 0.04]"));
+    swap(&s, "omega ETA_RUV ~ 0.25 FIX", &format!("omega ETA_RUV ~ {omega_ruv} FIX"))
 }
 
 /// The `correlation` twin with `kind` at `rho`.
@@ -100,32 +92,20 @@ fn triple(kind: &str, rho: f64) -> String {
         "theta RHO(0.5, -0.9, 0.99) FIX",
         &format!("theta RHO({rho}, -0.9, 0.99) FIX"),
     );
-    swap(
-        &s,
-        "correlation cs(RHO)",
-        &format!("correlation {kind}(RHO)"),
-    )
+    swap(&s, "correlation cs(RHO)", &format!("correlation {kind}(RHO)"))
 }
 
 /// The twin with its residual random effect taken out altogether.
 fn without_ruv(src: &str) -> String {
     let s = swap(src, "  iiv_on_ruv = ETA_RUV\n", "");
-    let line = s
-        .lines()
-        .find(|l| l.contains("omega ETA_RUV"))
-        .expect("omega line")
-        .to_string();
+    let line = s.lines().find(|l| l.contains("omega ETA_RUV")).expect("omega line").to_string();
     swap(&s, &format!("{line}\n"), "")
 }
 
 /// The `cs` twin at a free ρ of 0: the line is kept and the dense path scores it (a `FIX` 0
 /// is dropped by the parser).
 fn triple_free_rho_at_zero() -> String {
-    swap(
-        &triple("cs", 0.0),
-        "theta RHO(0, -0.9, 0.99) FIX",
-        "theta RHO(0.0, -0.4, 0.99)",
-    )
+    swap(&triple("cs", 0.0), "theta RHO(0, -0.9, 0.99) FIX", "theta RHO(0.0, -0.4, 0.99)")
 }
 
 fn run(src: &str, data: &str) -> FitResult {
@@ -243,10 +223,7 @@ fn iiv_on_ruv_with_a_dense_r_matches_nonmem_at_fixed_parameters() {
         );
         assert!(d_ofv < OFV_TOL, "{probe}: |ΔOFV| {d_ofv:.3e}");
         assert!(worst < EBE_TOL, "{probe}: worst |Δη̂| {worst:.3e}");
-        assert!(
-            worst_cwres < CWRES_TOL,
-            "{probe}: |ΔCWRES| {worst_cwres:.3e}"
-        );
+        assert!(worst_cwres < CWRES_TOL, "{probe}: |ΔCWRES| {worst_cwres:.3e}");
         assert!(reach > 0.5, "{probe}: η̂_ruv must be live, reached {reach}");
         let analytic = GradientMethodKind::Analytic.as_str();
         assert_eq!(r.gradient_method_inner, analytic, "{probe}");
@@ -286,17 +263,10 @@ fn rho_zero_recovers_plain_iiv_on_ruv() {
     let plain = run(&triple("cs", 0.0), "triple.csv").ofv;
     let gap = (dense - plain).abs();
     eprintln!("correlation: dense {dense:.10} diagonal {plain:.10} |Δ| {gap:.3e}");
-    assert!(
-        dense.is_finite() && gap < REDUCTION_TOL,
-        "{dense} vs {plain}"
-    );
+    assert!(dense.is_finite() && gap < REDUCTION_TOL, "{dense} vs {plain}");
 
     // A `block_sigma` with a zero off-diagonal against two independent sigmas.
-    let dense_src = swap(
-        &pair(0.0, 0.25),
-        "[0.0144, 0, 0.04] FIX",
-        "[0.0144, 0.0, 0.04]",
-    );
+    let dense_src = swap(&pair(0.0, 0.25), "[0.0144, 0, 0.04] FIX", "[0.0144, 0.0, 0.04]");
     let plain_src = swap(
         &pair(0.0, 0.25),
         "block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.0144, 0, 0.04] FIX",
@@ -306,10 +276,7 @@ fn rho_zero_recovers_plain_iiv_on_ruv() {
     let plain = run(&plain_src, "pair.csv").ofv;
     let gap = (dense - plain).abs();
     eprintln!("block_sigma: dense {dense:.10} diagonal {plain:.10} |Δ| {gap:.3e}");
-    assert!(
-        dense.is_finite() && gap < REDUCTION_TOL,
-        "{dense} vs {plain}"
-    );
+    assert!(dense.is_finite() && gap < REDUCTION_TOL, "{dense} vs {plain}");
 }
 
 /// ω_RUV → 0 recovers the plain correlated model. Expanding at ω = 0, with `q_i = rᵀR⁻¹r`
@@ -318,22 +285,11 @@ fn rho_zero_recovers_plain_iiv_on_ruv() {
 #[test]
 fn omega_ruv_to_zero_recovers_the_plain_correlation() {
     for (name, data, src_at, plain) in [
-        (
-            "block_sigma",
-            "pair.csv",
-            pair as fn(f64, f64) -> String,
-            without_ruv(&pair(0.6, 0.25)),
-        ),
+        ("block_sigma", "pair.csv", pair as fn(f64, f64) -> String, without_ruv(&pair(0.6, 0.25))),
         (
             "correlation",
             "triple.csv",
-            |_, om| {
-                swap(
-                    &triple("cs", 0.5),
-                    "ETA_RUV ~ 0.25",
-                    &format!("ETA_RUV ~ {om}"),
-                )
-            },
+            |_, om| swap(&triple("cs", 0.5), "ETA_RUV ~ 0.25", &format!("ETA_RUV ~ {om}")),
             without_ruv(&triple("cs", 0.5)),
         ),
     ] {
@@ -354,10 +310,7 @@ fn omega_ruv_to_zero_recovers_the_plain_correlation() {
 /// `npde_oracle.py`'s scores for `name`, one per observation row.
 fn oracle_npde(name: &str) -> Vec<f64> {
     let text = std::fs::read_to_string(format!("{DIR}/results/{name}.csv")).unwrap();
-    text.lines()
-        .skip(1)
-        .map(|l| l.split(',').nth(1).unwrap().parse().unwrap())
-        .collect()
+    text.lines().skip(1).map(|l| l.split(',').nth(1).unwrap().parse().unwrap()).collect()
 }
 
 fn rms_gap(a: &[f64], b: &[f64]) -> f64 {
@@ -371,19 +324,15 @@ fn rms_gap(a: &[f64], b: &[f64]) -> f64 {
 /// they sit further than `NPDE_TOL` from ferx, so a draw that lost the scale fails here.
 #[test]
 fn npde_reference_distribution_matches_the_oracle() {
-    for (probe, src, data) in [
-        ("bs_p06", pair(0.6, 0.25), "pair.csv"),
-        ("cs_p05", triple("cs", 0.5), "triple.csv"),
-    ] {
+    for (probe, src, data) in
+        [("bs_p06", pair(0.6, 0.25), "pair.csv"), ("cs_p05", triple("cs", 0.5), "triple.csv")]
+    {
         let r = run_with(&src, data, |o| {
             o.npde_nsim = 2000;
             o.npde_seed = Some(2656);
         });
         let got: Vec<f64> = r.subjects.iter().flat_map(|s| s.npde.clone()).collect();
-        assert!(
-            got.iter().all(|v| v.is_finite()),
-            "{probe}: NPDE not finite"
-        );
+        assert!(got.iter().all(|v| v.is_finite()), "{probe}: NPDE not finite");
         let want = oracle_npde(&format!("npde_{probe}"));
         let control = oracle_npde(&format!("npde_{probe}_noruv"));
         let (on, off) = (rms_gap(&got, &want), rms_gap(&got, &control));
@@ -400,10 +349,7 @@ fn npde_reference_distribution_matches_the_oracle() {
 
 /// Full FOCEI fits from the control streams' starts reach NONMEM's objective.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn fits_reach_nonmem_objective() {
     let free = |s: &str| s.replace(" FIX", "");
     let pair_src = swap(&free(PAIR), "[0.0144, 0.0144, 0.04]", "[0.02, 0.005, 0.03]")
@@ -420,17 +366,12 @@ fn fits_reach_nonmem_objective() {
         .replace("~ 0.08", "~ 0.1")
         .replace("~ 0.05", "~ 0.1")
         .replace("~ 0.25", "~ 0.1");
-    for (probe, src, data) in [
-        ("bs_est", pair_src, "pair.csv"),
-        ("cs_est", triple_src, "triple.csv"),
-    ] {
+    for (probe, src, data) in
+        [("bs_est", pair_src, "pair.csv"), ("cs_est", triple_src, "triple.csv")]
+    {
         let r = run_with(&src, data, |o| o.outer_maxiter = 500);
         let nm = nm_ofv(probe);
         eprintln!("{probe}: ferx {:.8} NONMEM {nm:.8}", r.ofv);
-        assert!(
-            r.ofv.is_finite() && (r.ofv - nm).abs() < FIT_TOL,
-            "{probe}: {}",
-            r.ofv
-        );
+        assert!(r.ofv.is_finite() && (r.ofv - nm).abs() < FIT_TOL, "{probe}: {}", r.ofv);
     }
 }

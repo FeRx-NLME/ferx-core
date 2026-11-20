@@ -6,11 +6,7 @@ use crate::parser::model_parser::parse_model_string;
 
 fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
     let kappa = if iov { "kappa KAPPA_CL ~ 0.03" } else { "" };
-    let cl = if iov {
-        "TVCL * exp(ETA_CL + KAPPA_CL)"
-    } else {
-        "TVCL * exp(ETA_CL)"
-    };
+    let cl = if iov { "TVCL * exp(ETA_CL + KAPPA_CL)" } else { "TVCL * exp(ETA_CL)" };
     let model = parse_model_string(&format!(
         "[parameters]\n theta TVCL(5, 0.1, 50)\n theta TVV(50, 5, 500)\n omega ETA_CL ~ 0.04\n {kappa}\n sigma PROP ~ 0.01\n[individual_parameters]\n CL = {cl}\n V = TVV\n F = 0.7\n ALAG = 0.3\n[structural_model]\n pk one_cpt_iv(cl=CL, v=V, f=F, lagtime=ALAG)\n[error_model]\n DV ~ proportional(PROP)"
     )).unwrap();
@@ -164,12 +160,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
     let (model, pop) = fixture(false, false);
     let params = &model.default_params;
     for (method, n_agq) in [(EstimationMethod::Laplace, 1), (EstimationMethod::FoceI, 3)] {
-        let opts = FitOptions {
-            method,
-            n_agq,
-            inner_maxiter: 3,
-            ..Default::default()
-        };
+        let opts = FitOptions { method, n_agq, inner_maxiter: 3, ..Default::default() };
         // Same seed as the fused pass (exact for one-node Laplace, Gauss–Newton for AGQ), so
         // the comparison isolates the fused dispatch — including, for Laplace, the reuse of
         // the retained terminal Hessian against `pop_nll_opts`'s from-scratch anchor.
@@ -187,15 +178,8 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             &opts,
             PrevEtas::Placeholder,
         );
-        let expected = pop_nll_opts(
-            &model,
-            &pop,
-            params,
-            &separate.0,
-            &separate.1,
-            &separate.3,
-            &opts,
-        );
+        let expected =
+            pop_nll_opts(&model, &pop, params, &separate.0, &separate.1, &separate.3, &opts);
         let fused = run_inner_loop_and_nll(
             &model,
             &pop,
@@ -220,11 +204,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
             let x = pack_params(params);
             let bounds = compute_bounds(params);
             for interaction in [false, true] {
-                let opts = FitOptions {
-                    interaction,
-                    inner_maxiter: 4,
-                    ..Default::default()
-                };
+                let opts = FitOptions { interaction, inner_maxiter: 4, ..Default::default() };
                 let (etas, hms, _, kappas) =
                     run_inner_loop_warm(&model, &pop, params, 4, opts.inner_tol, None, None, 0, 0);
                 let per_subject = if iov {
@@ -249,14 +229,8 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     )
                 };
                 if mixed {
-                    assert!(
-                        per_subject[0].is_none(),
-                        "infusion must exercise FD fallback"
-                    );
-                    assert!(
-                        per_subject[1].is_some(),
-                        "bolus must keep analytic gradient"
-                    );
+                    assert!(per_subject[0].is_none(), "infusion must exercise FD fallback");
+                    assert!(per_subject[1].is_some(), "bolus must keep analytic gradient");
                 }
                 let mut expected = vec![0.0; x.len()];
                 for (i, g) in per_subject.clone().into_iter().enumerate() {
@@ -354,11 +328,8 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     let contribs = vec![0.0; n];
                     let mut best = vec![0.0; n];
                     best[0] = -1e6;
-                    let blown = OuterTrial {
-                        ofv: 1e6,
-                        contribs: &contribs,
-                        incumbent: Some((0.0, &best)),
-                    };
+                    let blown =
+                        OuterTrial { ofv: 1e6, contribs: &contribs, incumbent: Some((0.0, &best)) };
                     let declines = OuterFdDeclineLog::new(n);
                     let guarded = if iov {
                         population_gradient_sens_iov_mixed(
@@ -423,25 +394,13 @@ fn inner_map_completes_each_subject_before_returning_its_buffers() {
         InnerSolvePolicy::default(),
         None,
         |subject, ebe| {
-            (
-                subject.id.clone(),
-                ebe.eta.as_ptr() as usize,
-                ebe.h_matrix.as_ptr() as usize,
-            )
+            (subject.id.clone(), ebe.eta.as_ptr() as usize, ebe.h_matrix.as_ptr() as usize)
         },
     );
     for (i, (id, eta_ptr, h_ptr)) in result.4.iter().enumerate() {
         assert_eq!(id, &pop.subjects[i].id);
-        assert_eq!(
-            *eta_ptr,
-            result.0[i].as_ptr() as usize,
-            "eta buffer was copied after EBE"
-        );
-        assert_eq!(
-            *h_ptr,
-            result.1[i].as_ptr() as usize,
-            "Jacobian buffer was copied after EBE"
-        );
+        assert_eq!(*eta_ptr, result.0[i].as_ptr() as usize, "eta buffer was copied after EBE");
+        assert_eq!(*h_ptr, result.1[i].as_ptr() as usize, "Jacobian buffer was copied after EBE");
     }
 }
 
@@ -464,11 +423,7 @@ fn cancel_fixture(iov: bool) -> (CompiledModel, Population) {
         "[parameters]\n theta TVCL(5, 0.1, 50)\n theta TVV(50, 5, 500)\n omega ETA_CL ~ 0.04\n omega ETA_V ~ 0.04\n kappa KAPPA_CL ~ 0.03\n sigma PROP ~ 0.01\n[individual_parameters]\n CL = TVCL * exp(ETA_CL + KAPPA_CL)\n V = TVV * exp(ETA_V)\n F = 0.7\n[structural_model]\n pk one_cpt_iv(cl=CL, v=V, f=F)\n[error_model]\n DV ~ proportional(PROP)",
     )
     .unwrap();
-    assert_eq!(
-        (model.n_eta, model.n_kappa),
-        (2, 1),
-        "fixture: η and κ widths differ"
-    );
+    assert_eq!((model.n_eta, model.n_kappa), (2, 1), "fixture: η and κ widths differ");
     (model, pop)
 }
 
@@ -500,21 +455,13 @@ fn a_cancelled_cold_round_solve_starts_nothing_and_seeds_no_leg() {
     let params = &model.default_params;
     let mu_k = compute_mu_k(&model, &params.theta, true);
     let flag = crate::cancel::CancelFlag::new();
-    let options = FitOptions {
-        cancel: Some(flag.clone()),
-        ..FitOptions::default()
-    };
+    let options = FitOptions { cancel: Some(flag.clone()), ..FitOptions::default() };
     let solve = || {
-        let (cold, solves) = solves_during(&pool, || {
-            cold_modes_solve(&model, &pop, params, &mu_k, &options)
-        });
+        let (cold, solves) =
+            solves_during(&pool, || cold_modes_solve(&model, &pop, params, &mu_k, &options));
         (cold.is_some(), solves)
     };
-    assert_eq!(
-        solve(),
-        (true, pop.subjects.len()),
-        "the uncancelled control"
-    );
+    assert_eq!(solve(), (true, pop.subjects.len()), "the uncancelled control");
     flag.cancel();
     assert_eq!(solve(), (false, 0));
 }
@@ -531,9 +478,8 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
         let n = pop.subjects.len();
         let params = &model.default_params;
         // A non-zero warm start, so the placeholder's η is distinguishable from zeros.
-        let warm: Vec<DVector<f64>> = (0..n)
-            .map(|i| DVector::from_element(model.n_eta, 0.01 * (i + 1) as f64))
-            .collect();
+        let warm: Vec<DVector<f64>> =
+            (0..n).map(|i| DVector::from_element(model.n_eta, 0.01 * (i + 1) as f64)).collect();
         let run = |flip: bool| {
             let flag = crate::cancel::CancelFlag::new();
             solves_during(&pool, || {
@@ -560,27 +506,15 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
         };
 
         let (control, control_solves) = run(false);
-        assert_eq!(
-            control_solves, n,
-            "iov={iov}: control must solve every subject"
-        );
-        assert_eq!(
-            control.2.n_start_rejected, 0,
-            "iov={iov}: control rejected a subject"
-        );
+        assert_eq!(control_solves, n, "iov={iov}: control must solve every subject");
+        assert_eq!(control.2.n_start_rejected, 0, "iov={iov}: control rejected a subject");
         assert!(control.4.iter().all(|v| v.is_finite()), "iov={iov}");
         if iov {
-            assert!(
-                !control.3[1].is_empty(),
-                "fixture: IOV subjects must carry κ"
-            );
+            assert!(!control.3[1].is_empty(), "fixture: IOV subjects must carry κ");
         }
 
         let (cancelled, cancelled_solves) = run(true);
-        assert_eq!(
-            cancelled_solves, 1,
-            "iov={iov}: subjects after the cancel must not be solved"
-        );
+        assert_eq!(cancelled_solves, 1, "iov={iov}: subjects after the cancel must not be solved");
         assert_eq!(
             cancelled.2.n_start_rejected,
             n - 1,
@@ -588,39 +522,17 @@ fn a_cancel_during_the_inner_pass_skips_every_subject_not_yet_started() {
         );
         // The solved subject is untouched; the skipped ones are placeholders with the
         // shapes of a real result, so nothing downstream indexes out of bounds.
-        assert_eq!(
-            cancelled.0[0].as_slice(),
-            control.0[0].as_slice(),
-            "iov={iov}"
-        );
+        assert_eq!(cancelled.0[0].as_slice(), control.0[0].as_slice(), "iov={iov}");
         for i in 1..n {
-            assert_eq!(
-                cancelled.0[i].as_slice(),
-                warm[i].as_slice(),
-                "iov={iov} subj {i}"
-            );
-            assert_eq!(
-                cancelled.1[i].shape(),
-                control.1[i].shape(),
-                "iov={iov} subj {i}"
-            );
-            assert!(
-                cancelled.1[i].iter().all(|&v| v == 0.0),
-                "iov={iov} subj {i}"
-            );
-            assert_eq!(
-                cancelled.3[i].len(),
-                control.3[i].len(),
-                "iov={iov} subj {i}"
-            );
+            assert_eq!(cancelled.0[i].as_slice(), warm[i].as_slice(), "iov={iov} subj {i}");
+            assert_eq!(cancelled.1[i].shape(), control.1[i].shape(), "iov={iov} subj {i}");
+            assert!(cancelled.1[i].iter().all(|&v| v == 0.0), "iov={iov} subj {i}");
+            assert_eq!(cancelled.3[i].len(), control.3[i].len(), "iov={iov} subj {i}");
             for (k, (got, want)) in cancelled.3[i].iter().zip(&control.3[i]).enumerate() {
                 assert_eq!(got.len(), want.len(), "iov={iov} subj {i} κ {k}: width");
                 assert!(got.iter().all(|&v| v == 0.0), "iov={iov} subj {i} κ {k}");
             }
-            assert_eq!(
-                cancelled.4[i], 0.0,
-                "iov={iov}: skipped subject ran its finish"
-            );
+            assert_eq!(cancelled.4[i], 0.0, "iov={iov}: skipped subject ran its finish");
         }
     }
 }
@@ -635,11 +547,7 @@ fn the_stage_seeded_inner_pass_ignores_a_cancel() {
     let params = &model.default_params;
     let flag = crate::cancel::CancelFlag::new();
     flag.cancel();
-    let stage = FitOptions {
-        inner_maxiter: 20,
-        cancel: Some(flag),
-        ..Default::default()
-    };
+    let stage = FitOptions { inner_maxiter: 20, cancel: Some(flag), ..Default::default() };
     let (stats, solves) = solves_during(&pool, || {
         run_inner_loop_warm_seeded(
             &model,
@@ -684,11 +592,7 @@ fn a_cancelled_inner_pass_scores_no_objective() {
             cancel: Some(flag.clone()),
             ..Default::default()
         };
-        assert_eq!(
-            opts.agq_nodes().is_some(),
-            agq,
-            "fixture: one arm per branch"
-        );
+        assert_eq!(opts.agq_nodes().is_some(), agq, "fixture: one arm per branch");
         let gradient_inputs = agq.then_some((params, x.as_slice(), &bounds, false, None));
         let run = |cancel| {
             run_inner_loop_and_nll_prepared(
@@ -708,25 +612,15 @@ fn a_cancelled_inner_pass_scores_no_objective() {
         };
 
         let (_, _, stats, _, nll, evaluation, _) = run(None);
-        assert!(
-            nll.is_finite(),
-            "{method:?}: an uncancellable pass must score"
-        );
+        assert!(nll.is_finite(), "{method:?}: an uncancellable pass must score");
         assert_eq!(stats.n_start_rejected, 0, "{method:?}");
         assert_eq!(evaluation.is_some(), agq, "{method:?}: control evaluation");
 
         let (etas, _, stats, _, nll, evaluation, _) = run(Some(&flag));
-        assert_eq!(
-            nll,
-            f64::INFINITY,
-            "{method:?}: a cancelled pass scored {nll}"
-        );
+        assert_eq!(nll, f64::INFINITY, "{method:?}: a cancelled pass scored {nll}");
         assert_eq!(stats.n_start_rejected, pop.subjects.len(), "{method:?}");
         assert_eq!(etas.len(), pop.subjects.len(), "{method:?}");
-        assert!(
-            evaluation.is_none(),
-            "{method:?}: quadrature ran on placeholders"
-        );
+        assert!(evaluation.is_none(), "{method:?}: quadrature ran on placeholders");
     }
 }
 
@@ -751,9 +645,7 @@ fn a_cancel_inside_the_first_nlopt_evaluation_solves_nothing_more() {
                 cancel: Some(flag),
                 ..Default::default()
             };
-            solves_during(&pool, || {
-                optimize_population(&model, &pop, &model.default_params, &opts)
-            })
+            solves_during(&pool, || optimize_population(&model, &pop, &model.default_params, &opts))
         };
         let (_, pre_cancelled) = run(crate::cancel::CancelFlag::trip_after(0));
         let (mid_result, mid_eval) = run(crate::cancel::CancelFlag::trip_after(1));
@@ -802,17 +694,11 @@ fn a_cancel_inside_the_global_pre_search_solves_nothing_more() {
             cancel: Some(flag),
             ..Default::default()
         };
-        solves_during(&pool, || {
-            optimize_population(&model, &pop, &model.default_params, &opts)
-        })
-        .1
+        solves_during(&pool, || optimize_population(&model, &pop, &model.default_params, &opts)).1
     };
     let baseline = run(false, crate::cancel::CancelFlag::trip_after(0));
     let control = run(true, crate::cancel::CancelFlag::new());
-    assert!(
-        control > baseline + 2 * n,
-        "fixture: the pre-search must run ({control})"
-    );
+    assert!(control > baseline + 2 * n, "fixture: the pre-search must run ({control})");
     assert_eq!(
         run(true, crate::cancel::CancelFlag::trip_after(0)),
         baseline,
@@ -893,17 +779,10 @@ fn iov_salvage_probes_start_at_the_subject_mode() {
         })
         .1
     });
-    assert_eq!(
-        declines.declined_indices(),
-        vec![0],
-        "fixture: subject 0 is salvaged"
-    );
+    assert_eq!(declines.declined_indices(), vec![0], "fixture: subject 0 is salvaged");
     // #2713: the IOV assembly records the cause too: a recorder decline.
     assert_eq!(
-        (
-            declines.n_cause(DeclineCause::ModeSystem),
-            declines.n_cause(DeclineCause::Recording)
-        ),
+        (declines.n_cause(DeclineCause::ModeSystem), declines.n_cause(DeclineCause::Recording)),
         (0, 1),
         "the IOV route must record why subject 0 declined"
     );
@@ -918,10 +797,7 @@ fn iov_salvage_probes_start_at_the_subject_mode() {
         rec.starts.iter().all(|s| s.subject == pop.subjects[0].id),
         "only the declined subject is re-solved"
     );
-    assert!(
-        n >= 2,
-        "a central difference has two probes per free coordinate, got {n}"
-    );
+    assert!(n >= 2, "a central difference has two probes per free coordinate, got {n}");
 }
 
 /// #2261: the covariance step's per-subject salvage (#1514) reconverges the subject the
@@ -936,10 +812,7 @@ fn covariance_salvage_points_start_at_the_subject_mode() {
     let params = &model.default_params;
     let x = pack_params(params);
     let opts = FitOptions::default();
-    assert!(
-        opts.analytic_cov_hessian,
-        "the exact R-matrix routes the salvage"
-    );
+    assert!(opts.analytic_cov_hessian, "the exact R-matrix routes the salvage");
     let (etas, hms, _, kappas) =
         run_inner_loop_warm(&model, &pop, params, 200, 1e-8, None, None, 0, 0);
     let rec = on_one_thread(|| {
@@ -952,17 +825,9 @@ fn covariance_salvage_points_start_at_the_subject_mode() {
     });
     let starts_of = |id: &str| rec.starts.iter().filter(|s| s.subject == id).count();
     for s in &pop.subjects[1..] {
-        assert_eq!(
-            starts_of(&s.id),
-            1,
-            "exact subject {} solves at the base only",
-            s.id
-        );
+        assert_eq!(starts_of(&s.id), 1, "exact subject {} solves at the base only", s.id);
     }
-    assert!(
-        starts_of(&pop.subjects[0].id) > 1,
-        "fixture: subject 0 must take the subset stencil"
-    );
+    assert!(starts_of(&pop.subjects[0].id) > 1, "fixture: subject 0 must take the subset stencil");
     assert_starts_at_modes("covariance salvage", &rec, |_| true, &pop, &etas, &kappas);
 }
 
@@ -1002,10 +867,6 @@ fn non_iov_salvage_probes_resolve_at_the_stencil_tol() {
         })
         .1
     });
-    assert_eq!(
-        declines.declined_indices(),
-        vec![0],
-        "fixture: subject 0 is salvaged"
-    );
+    assert_eq!(declines.declined_indices(), vec![0], "fixture: subject 0 is salvaged");
     assert_solves_at_stencil_tol("non-IOV salvage", &rec, |_| true, opts.inner_tol);
 }

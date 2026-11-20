@@ -39,10 +39,7 @@ fn catalogue_rows(readme: &str) -> Vec<&str> {
         .skip_while(|l| !l.starts_with('|'))
         .take_while(|l| l.starts_with('|'))
         .collect();
-    assert!(
-        rows.len() > 2,
-        "nonmem_anchor/README.md has no catalogue table"
-    );
+    assert!(rows.len() > 2, "nonmem_anchor/README.md has no catalogue table");
     rows[2..].to_vec()
 }
 
@@ -119,11 +116,7 @@ fn control_streams() -> Vec<String> {
             let entry = entry.expect("dir entry");
             let name = entry.file_name().into_string().expect("utf-8 file name");
             let path = entry.path();
-            let rel_name = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
+            let rel_name = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
             if path.is_dir() {
                 if name != "results" {
                     walk(&path, &rel_name, out);
@@ -162,10 +155,8 @@ fn every_catalogue_row_has_four_cells() {
 #[test]
 fn every_control_stream_has_a_catalogue_row() {
     let pats = catalogue_patterns(&readme());
-    let missing: Vec<String> = control_streams()
-        .into_iter()
-        .filter(|f| !pats.iter().any(|p| glob_match(p, f)))
-        .collect();
+    let missing: Vec<String> =
+        control_streams().into_iter().filter(|f| !pats.iter().any(|p| glob_match(p, f))).collect();
     assert!(
         missing.is_empty(),
         "control streams under nonmem_anchor/ that no catalogue row names — add a row to the \
@@ -203,20 +194,11 @@ fn pattern_helpers_match_only_what_they_spell() {
             "ss_lag_infusion_flatwt.ctl"
         ]
     );
-    assert!(glob_match(
-        "dose_cmt_*.ctl",
-        "dose_cmt_advan2_bolus_cmt2.ctl"
-    ));
-    assert!(glob_match(
-        "residual_correlation/*.ctl",
-        "residual_correlation/cs_r0.ctl"
-    ));
+    assert!(glob_match("dose_cmt_*.ctl", "dose_cmt_advan2_bolus_cmt2.ctl"));
+    assert!(glob_match("residual_correlation/*.ctl", "residual_correlation/cs_r0.ctl"));
     assert!(!glob_match("dose_cmt_*.ctl", "dose_attr_double_use_A.ctl"));
     assert!(!glob_match("*.ctl", "residual_correlation/cs_r0.ctl"));
     assert!(!glob_match("residual_correlation/*.ctl", "cs_r0.ctl"));
     assert!(!glob_match("ss_mm.ctl", "ss_mm.ctl.bak"));
-    assert_eq!(
-        cells(r"| a | `x \| y` | c.ctl | d |"),
-        [" a ", r" `x \| y` ", " c.ctl ", " d "]
-    );
+    assert_eq!(cells(r"| a | `x \| y` | c.ctl | d |"), [" a ", r" `x \| y` ", " c.ctl ", " d "]);
 }

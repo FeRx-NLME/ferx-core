@@ -19,10 +19,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
-fn warfarin() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn warfarin() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -47,10 +44,7 @@ fn downsample(population: &mut ferx_core::types::Population, keep_per_subject: u
         subj.obs_times = idx.iter().map(|&i| subj.obs_times[i]).collect();
         subj.observations = idx.iter().map(|&i| subj.observations[i]).collect();
         subj.obs_cmts = idx.iter().map(|&i| subj.obs_cmts[i]).collect();
-        subj.cens = idx
-            .iter()
-            .map(|&i| subj.cens.get(i).copied().unwrap_or(0))
-            .collect();
+        subj.cens = idx.iter().map(|&i| subj.cens.get(i).copied().unwrap_or(0)).collect();
     }
 }
 
@@ -83,11 +77,7 @@ fn imp_standalone_is_an_estimator_and_moves_parameters() {
     // stage, which is dropped from `method`).
     assert_eq!(result.method, EstimationMethod::Imp);
     assert_eq!(result.method_chain, vec![EstimationMethod::Imp]);
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 
     // At least one θ must move off its initial value — the defining contrast
     // with the evaluation-only path, which leaves every parameter fixed.
@@ -96,22 +86,13 @@ fn imp_standalone_is_an_estimator_and_moves_parameters() {
         .iter()
         .zip(model.default_params.theta.iter())
         .any(|(t, t0)| (t - t0).abs() > 1e-4);
-    assert!(
-        moved,
-        "estimating imp must update at least one θ off its initial value"
-    );
+    assert!(moved, "estimating imp must update at least one θ off its initial value");
     for (name, v) in result.theta_names.iter().zip(result.theta.iter()) {
-        assert!(
-            v.is_finite() && *v > 0.0,
-            "theta {name} must be finite > 0, got {v}"
-        );
+        assert!(v.is_finite() && *v > 0.0, "theta {name} must be finite > 0, got {v}");
     }
     for i in 0..model.n_eta {
         let w = result.omega[(i, i)];
-        assert!(
-            w.is_finite() && w > 0.0,
-            "omega[{i},{i}] must be finite > 0, got {w}"
-        );
+        assert!(w.is_finite() && w > 0.0, "omega[{i},{i}] must be finite > 0, got {w}");
     }
 
     // Estimating IMP now surfaces the importance-sampling Monte-Carlo marginal
@@ -161,10 +142,8 @@ fn imp_cold_start_on_rich_data_does_not_collapse() {
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("cold-start imp on warfarin must produce a fit");
-    let is = result
-        .importance_sampling
-        .as_ref()
-        .expect("estimating imp surfaces the marginal −2 log L");
+    let is =
+        result.importance_sampling.as_ref().expect("estimating imp surfaces the marginal −2 log L");
     // `< -250` is `false` for NaN, so a non-finite collapse fails here too.
     assert!(
         is.minus2_log_likelihood < -250.0,
@@ -191,12 +170,7 @@ fn imp_eval_only_leaves_parameters_unchanged() {
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("eval-only imp must produce a fit");
-    for (i, (t, t0)) in result
-        .theta
-        .iter()
-        .zip(model.default_params.theta.iter())
-        .enumerate()
-    {
+    for (i, (t, t0)) in result.theta.iter().zip(model.default_params.theta.iter()).enumerate() {
         assert_eq!(t, t0, "eval-only imp must not move theta[{i}]");
     }
     assert!(
@@ -216,10 +190,7 @@ fn imp_estimator_may_lead_a_chain() {
     opts.outer_maxiter = 25;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("method = [imp, focei] must be allowed for estimating imp");
-    assert_eq!(
-        result.method_chain,
-        vec![EstimationMethod::Imp, EstimationMethod::FoceI]
-    );
+    assert_eq!(result.method_chain, vec![EstimationMethod::Imp, EstimationMethod::FoceI]);
     assert_eq!(result.method, EstimationMethod::FoceI);
     assert!(result.ofv.is_finite());
 }
@@ -237,10 +208,7 @@ fn saem_then_imp_chain_runs() {
         .expect("saem → imp chain must produce a fit");
     // Estimating IMP is the final estimating stage.
     assert_eq!(result.method, EstimationMethod::Imp);
-    assert_eq!(
-        result.method_chain,
-        vec![EstimationMethod::Saem, EstimationMethod::Imp]
-    );
+    assert_eq!(result.method_chain, vec![EstimationMethod::Saem, EstimationMethod::Imp]);
     assert!(result.ofv.is_finite());
 }
 
@@ -305,10 +273,7 @@ fn imp_estimator_rejects_invalid_proposal_df() {
         .err()
         .expect("imp_proposal_df = 0 must be rejected")
         .to_string();
-    assert!(
-        err.contains("proposal_df"),
-        "expected proposal_df error, got: {err}"
-    );
+    assert!(err.contains("proposal_df"), "expected proposal_df error, got: {err}");
 }
 
 /// Tier 3 — warm-started convergence on rich data. `[focei, imp]` starts IMP at
@@ -316,10 +281,7 @@ fn imp_estimator_rejects_invalid_proposal_df() {
 /// proposal stays overlapped and the estimator is stable even on rich warfarin.
 /// It must hold (refine) the FOCEI solution. Gated behind `slow-tests`.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn imp_estimator_refines_focei_on_warfarin() {
     let (model, population) = warfarin();
 
@@ -351,34 +313,21 @@ fn imp_estimator_refines_focei_on_warfarin() {
     let r_imp = fit(&model, &population, &model.default_params, &imp)
         .expect("FOCEI → estimating IMP fit must succeed");
 
-    assert_eq!(
-        r_imp.method,
-        EstimationMethod::Imp,
-        "IMP is the final estimating stage"
-    );
+    assert_eq!(r_imp.method, EstimationMethod::Imp, "IMP is the final estimating stage");
 
     // Thetas within 5% of FOCEI (IMP refines, not relocates).
-    for ((name, ti), tf) in r_imp
-        .theta_names
-        .iter()
-        .zip(r_imp.theta.iter())
-        .zip(r_focei.theta.iter())
+    for ((name, ti), tf) in
+        r_imp.theta_names.iter().zip(r_imp.theta.iter()).zip(r_focei.theta.iter())
     {
         let rel = (ti - tf).abs() / tf.abs().max(1e-8);
-        assert!(
-            rel < 0.05,
-            "theta {name}: IMP {ti} vs FOCEI {tf} (rel {rel:.3})"
-        );
+        assert!(rel < 0.05, "theta {name}: IMP {ti} vs FOCEI {tf} (rel {rel:.3})");
     }
     // Ω diagonals within 20% (variance components are noisier).
     for i in 0..model.n_eta {
         let wi = r_imp.omega[(i, i)];
         let wf = r_focei.omega[(i, i)];
         let rel = (wi - wf).abs() / wf.abs().max(1e-8);
-        assert!(
-            rel < 0.20,
-            "omega[{i},{i}]: IMP {wi} vs FOCEI {wf} (rel {rel:.3})"
-        );
+        assert!(rel < 0.20, "omega[{i},{i}]: IMP {wi} vs FOCEI {wf} (rel {rel:.3})");
     }
     // OFV (both Laplace) within a couple of units.
     assert!(

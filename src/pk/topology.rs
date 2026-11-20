@@ -89,9 +89,7 @@ impl PkTopology {
     /// `check_dose_compartments`.
     #[inline]
     pub(crate) fn dose_channel(&self, cmt_1based: usize) -> Option<Channel> {
-        cmt_1based
-            .checked_sub(1)
-            .and_then(|i| self.channels.get(i).copied().flatten())
+        cmt_1based.checked_sub(1).and_then(|i| self.channels.get(i).copied().flatten())
     }
 
     /// 1-based compartments a modeled infusion may target.
@@ -256,18 +254,11 @@ mod tests {
             assert_eq!(t.n_states, t.compartment_names.len(), "{m:?} n_states");
             assert_eq!(
                 t.central_slot,
-                t.compartment_names
-                    .iter()
-                    .position(|n| *n == "central")
-                    .unwrap(),
+                t.compartment_names.iter().position(|n| *n == "central").unwrap(),
                 "{m:?} central_slot"
             );
-            let channel_set: Vec<usize> = t
-                .channels
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| c.map(|_| i + 1))
-                .collect();
+            let channel_set: Vec<usize> =
+                t.channels.iter().enumerate().filter_map(|(i, c)| c.map(|_| i + 1)).collect();
             // The live channels must form a PREFIX of the table — no interior
             // `None`. `addressable_dose_compartments` counts live entries, and
             // `api::validation` reads that count as "how far a dose's CMT can

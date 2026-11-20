@@ -88,9 +88,7 @@ fn evaluate(m: &ferx_core::types::CompiledModel) -> f64 {
         threads: Some(2),
         ..FitOptions::default()
     };
-    fit(m, &pop, &m.default_params, &opts)
-        .expect("evaluation")
-        .ofv
+    fit(m, &pop, &m.default_params, &opts).expect("evaluation").ofv
 }
 
 /// The objective function at the initial estimates: the same model, the same
@@ -103,10 +101,7 @@ fn power_objective_matches_nonmem_at_the_initial_estimates() {
         "power anchor, initial estimates: ferx {ofv:.12} vs NONMEM {NM_EVAL_OBJ:.12}, diff {:e}",
         ofv - NM_EVAL_OBJ
     );
-    assert!(
-        (ofv - NM_EVAL_OBJ).abs() < OFV_TOL,
-        "ferx {ofv} vs NONMEM {NM_EVAL_OBJ}"
-    );
+    assert!((ofv - NM_EVAL_OBJ).abs() < OFV_TOL, "ferx {ofv} vs NONMEM {NM_EVAL_OBJ}");
 }
 
 /// The objective function at NONMEM's optimum — a second point, with the
@@ -115,28 +110,19 @@ fn power_objective_matches_nonmem_at_the_initial_estimates() {
 /// two points.
 #[test]
 fn power_objective_matches_nonmem_at_its_final_estimates() {
-    let m = model(
-        [NM_TVCL, NM_TVV, NM_TVKA, NM_POW],
-        [NM_OM_CL, NM_OM_V, NM_OM_KA],
-        NM_SIGMA2.sqrt(),
-    );
+    let m =
+        model([NM_TVCL, NM_TVV, NM_TVKA, NM_POW], [NM_OM_CL, NM_OM_V, NM_OM_KA], NM_SIGMA2.sqrt());
     let ofv = evaluate(&m);
     eprintln!(
         "power anchor, NONMEM optimum: ferx {ofv:.12} vs NONMEM {NM_FIT_OBJ:.12}, diff {:e}",
         ofv - NM_FIT_OBJ
     );
-    assert!(
-        (ofv - NM_FIT_OBJ).abs() < OFV_TOL,
-        "ferx {ofv} vs NONMEM {NM_FIT_OBJ}"
-    );
+    assert!((ofv - NM_FIT_OBJ).abs() < OFV_TOL, "ferx {ofv} vs NONMEM {NM_FIT_OBJ}");
 }
 
 /// The full FOCEI fit lands where NONMEM's did.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn power_fit_matches_nonmem() {
     let m = model([0.13, 8.0, 1.0, 1.3], [0.09, 0.04, 0.30], 0.1);
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
@@ -148,21 +134,9 @@ fn power_fit_matches_nonmem() {
         ..FitOptions::default()
     };
     let r = fit(&m, &pop, &m.default_params, &opts).expect("fit");
-    assert!(
-        r.ofv <= NM_FIT_OBJ + 0.5,
-        "ferx OFV {} is worse than NONMEM's {NM_FIT_OBJ}",
-        r.ofv
-    );
+    assert!(r.ofv <= NM_FIT_OBJ + 0.5, "ferx OFV {} is worse than NONMEM's {NM_FIT_OBJ}", r.ofv);
     let p = r.theta[3];
     assert!((p - NM_POW).abs() < 0.05, "exponent {p} vs NONMEM {NM_POW}");
-    assert!(
-        (r.theta[0] - NM_TVCL).abs() / NM_TVCL < 0.05,
-        "TVCL {}",
-        r.theta[0]
-    );
-    assert!(
-        (r.theta[1] - NM_TVV).abs() / NM_TVV < 0.05,
-        "TVV {}",
-        r.theta[1]
-    );
+    assert!((r.theta[0] - NM_TVCL).abs() / NM_TVCL < 0.05, "TVCL {}", r.theta[0]);
+    assert!((r.theta[1] - NM_TVV).abs() / NM_TVV < 0.05, "TVV {}", r.theta[1]);
 }

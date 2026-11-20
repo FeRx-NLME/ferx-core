@@ -175,10 +175,7 @@ fn nonmem_obs(path: &str) -> Vec<(String, f64, f64)> {
     text.lines()
         .skip(2)
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
             (c[0], c[1], c[2], c[3])
         })
         .filter(|&(_, _, evid, _)| evid == 0.0)
@@ -207,26 +204,15 @@ fn assert_matches(label: &str, got: &[(String, f64, f64)], table: &str, bound: f
         assert!(g.is_finite(), "{label}: ID {id} t={t} non-finite ({g})");
         let rel = (g - w).abs() / w.abs();
         if !(rel < bound) {
-            bad.push(format!(
-                "ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {rel:+.3e})"
-            ));
+            bad.push(format!("ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {rel:+.3e})"));
         }
         worst = worst.max(rel);
     }
-    assert_eq!(
-        skipped.len(),
-        skip.len(),
-        "{label}: a skipped ID is not in the data"
-    );
+    assert_eq!(skipped.len(), skip.len(), "{label}: a skipped ID is not in the data");
     println!(
         "#1588 {label}: worst rel vs NONMEM {worst:.3e} (bound {bound:.0e}, skipped {skip:?})"
     );
-    assert!(
-        bad.is_empty(),
-        "{label}: {} rows off:\n{}",
-        bad.len(),
-        bad.join("\n")
-    );
+    assert!(bad.is_empty(), "{label}: {} rows off:\n{}", bad.len(), bad.join("\n"));
 }
 
 fn via_predict(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
@@ -289,10 +275,7 @@ fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f6
     )
     .expect("adaptive sim runs and passes the frozen-replay verifier");
     assert!(res.ledger.is_empty(), "the no-op controller dosed");
-    res.trajectories
-        .into_iter()
-        .map(|r| (r.id, r.time, r.ipred))
-        .collect()
+    res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)).collect()
 }
 
 // ODE f64 and dual: measured worst 2.2e-12 (probe at fc1d1404 on untouched IDs; see the
@@ -337,13 +320,7 @@ fn ode_with_states_resets_a_co_timed_dose_by_row_order() {
     for (lag, table) in [(0.0, TABLE_LAG0), (2.0, TABLE_LAG2)] {
         let m = ode_depot(lag);
         let got = via_with_states(&m, &static_pop());
-        assert_matches(
-            &format!("ODE with_states, lag {lag}"),
-            &got,
-            table,
-            ODE_BOUND,
-            &[],
-        );
+        assert_matches(&format!("ODE with_states, lag {lag}"), &got, table, ODE_BOUND, &[]);
         let got = via_with_states(&m, &event_driven_pop());
         assert_matches(
             &format!("ODE event-driven with_states, lag {lag}"),
@@ -395,39 +372,15 @@ fn dual_ode_walk_value_resets_a_co_timed_dose_by_row_order() {
 #[test]
 fn analytic_superposition_resets_a_co_timed_dose_by_row_order() {
     let got = via_predict(&analytic(0.0), &static_pop());
-    assert_matches(
-        "analytic superposition, lag 0",
-        &got,
-        TABLE_LAG0,
-        ANALYTIC_BOUND,
-        &[],
-    );
+    assert_matches("analytic superposition, lag 0", &got, TABLE_LAG0, ANALYTIC_BOUND, &[]);
     let got = via_predict(&analytic(2.0), &static_pop());
-    assert_matches(
-        "analytic superposition, lag 2",
-        &got,
-        TABLE_LAG2,
-        ANALYTIC_BOUND,
-        CENTRAL_DOSE,
-    );
+    assert_matches("analytic superposition, lag 2", &got, TABLE_LAG2, ANALYTIC_BOUND, CENTRAL_DOSE);
 }
 
 #[test]
 fn analytic_event_driven_walk_resets_a_co_timed_dose_by_row_order() {
     let got = via_predict(&analytic(0.0), &event_driven_pop());
-    assert_matches(
-        "analytic event-driven, lag 0",
-        &got,
-        TABLE_LAG0,
-        ANALYTIC_BOUND,
-        &[],
-    );
+    assert_matches("analytic event-driven, lag 0", &got, TABLE_LAG0, ANALYTIC_BOUND, &[]);
     let got = via_predict(&analytic(2.0), &event_driven_pop());
-    assert_matches(
-        "analytic event-driven, lag 2",
-        &got,
-        TABLE_LAG2,
-        ANALYTIC_BOUND,
-        CENTRAL_DOSE,
-    );
+    assert_matches("analytic event-driven, lag 2", &got, TABLE_LAG2, ANALYTIC_BOUND, CENTRAL_DOSE);
 }
