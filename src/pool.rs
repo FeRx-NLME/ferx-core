@@ -358,8 +358,18 @@ pub(crate) fn with_fit_scope_ode<R: Send>(
     options: &FitOptions, ode: crate::ode::solver::OdeSolverOverride, f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
     let scope = FitScope { ode, ..FitScope::of(options) };
-    with_scope(scope, options.threads, f)
+    // The tighter scope's pool outlives the call (idle pools are cached), and its workers'
+    // buffers and plan handles serve nothing at the fit's own tolerance: they hold the plans a
+    // phase boundary prunes from the shared maps (`release_fit_plans`), which it can only
+    // reach on the pool it runs on. Drop them here, on that pool, before returning (#3077).
+    with_scope(scope, options.threads, move || {
+        let out = f();
+        release_pool_thread_caches();
+        out
+    })
 }
+
+pub(crate) use crate::parser::model_parser::rhs_regcode::kernel_jit::release_pool_thread_caches;
 
 fn with_scope<R: Send>(
     scope: FitScope, threads: Option<usize>, f: impl FnOnce() -> R + Send,

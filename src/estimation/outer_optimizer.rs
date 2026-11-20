@@ -1315,7 +1315,7 @@ fn skip_duplicate_laplace_terminal_capture() -> bool {
     })
 }
 
-fn agq_inner_solve_policy(
+pub(crate) fn agq_inner_solve_policy(
     model: &CompiledModel, options: &FitOptions, fused_gradient: bool,
 ) -> InnerSolvePolicy {
     InnerSolvePolicy {
@@ -2825,6 +2825,9 @@ struct IncumbentSolve {
     etas: Vec<DVector<f64>>,
     h_mats: Vec<DMatrix<f64>>,
     kappas: Vec<Vec<DVector<f64>>>,
+    /// A mixture's every class's modes at `xs`, `[class][subject]` (empty for a single
+    /// population): the warm start of the remaining-gain solve.
+    class_etas: Vec<Vec<DVector<f64>>>,
     /// Under the quadrature, each subject's packed score at `xs`, when this evaluation formed
     /// its gradient: the BHHH decrement a tolerance stop reads (#2549).
     scores: Option<Vec<Vec<f64>>>,
@@ -3807,6 +3810,7 @@ fn per_subject_outer_gradients(
         kappas,
         options,
         false,
+        None,
     )
 }
 
@@ -3820,6 +3824,14 @@ fn integration_backs_a_decrement(st: &crate::ode::solver::OdeSolverStats) -> boo
     kept_unfinished == 0 && st.diverged_segments == 0 && st.linear_declined_segments == 0
 }
 
+/// What a mixture's per-subject gradients start from: the incumbent's class modes
+/// (`[class][subject]`, solved at this very `x`) and the fit's schedule cache.
+#[derive(Clone, Copy)]
+struct MixtureStart<'a> {
+    class_etas: &'a [Vec<DVector<f64>>],
+    schedules: Option<&'a crate::estimation::mixture::ScheduleCache>,
+}
+
 /// [`per_subject_outer_gradients`], and with `require_complete` also `None` when any
 /// subject's integration stopped short of its horizon (#2143): the driver pads an exhausted
 /// segment with its last state (#603), giving a finite gradient of a trajectory never
@@ -3828,7 +3840,7 @@ fn integration_backs_a_decrement(st: &crate::ode::solver::OdeSolverStats) -> boo
 fn per_subject_outer_gradients_checked(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters, x: &[f64],
     ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], options: &FitOptions,
-    require_complete: bool,
+    require_complete: bool, mixture_start: Option<MixtureStart<'_>>,
 ) -> Option<Vec<Vec<f64>>> {
     if !crate::sens::provider::analytic_outer_gradient_available(model) {
         return None;
@@ -3844,11 +3856,22 @@ fn per_subject_outer_gradients_checked(
     };
     if init_params.mixture.is_some() {
         // A mixture's rows take every class's mode, which `ehs` (the MIXEST class's) does
-        // not carry: one evaluation at `x` solves them.
+        // not carry: one evaluation at `x` solves them, warm from the incumbent's class modes
+        // when it has them (`mixture_start`), else cold.
         let params = unpack_params(x, init_params);
-        let (eval, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-            model, population, &params, options, None,
-        );
+        let (eval, modes) = match mixture_start {
+            Some(start) => crate::estimation::mixture::mixture_ofv_cached(
+                model,
+                population,
+                &params,
+                &FitOptions { inner_restarts: 0, ..options.clone() },
+                Some(start.class_etas),
+                start.schedules,
+            ),
+            None => crate::estimation::mixture::mixture_ofv_with_modes(
+                model, population, &params, options, None,
+            ),
+        };
         if eval.ebe_stats.n_unconverged > 0 || eval.ebe_stats.n_start_rejected > 0 {
             return None;
         }
@@ -3863,7 +3886,7 @@ fn per_subject_outer_gradients_checked(
             checked,
         );
     }
-    let objective = crate::estimation::covariance::cov_objective(model, options);
+    let objective = crate::estimation::covariance::cov_objective(options);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
     crate::par::map(population.subjects.len(), |i| {
@@ -4123,6 +4146,7 @@ fn predicted_newton_step(
                 kappas,
                 options,
                 checked,
+                None,
             )?
         }
         Some(ode) => {
@@ -4166,29 +4190,52 @@ fn predicted_newton_step(
 fn quadrature_predicted_remaining_gain(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters, x: &[f64],
     ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], scores: Option<&[Vec<f64>]>,
+    class_etas: &[Vec<DVector<f64>>], schedules: &crate::estimation::mixture::ScheduleCache,
     bounds: &PackedBounds, options: &FitOptions, nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
     let formed: Vec<Vec<f64>>;
-    let per_subject: &[Vec<f64>] = match scores.filter(|s| s.len() == population.subjects.len()) {
-        Some(s) => s,
-        None => {
-            let context = crate::estimation::agq::SubjectScoreContext::new(
-                model,
-                init_params,
-                x,
-                options,
-                bounds,
-                false,
-            );
-            let subjects = &population.subjects;
-            formed = crate::par::map(subjects.len(), |i| {
-                let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                context.score_routed(&subjects[i], ehs.get(i)?.as_slice(), k, false).map(|(g, _)| g)
-            })
-            .into_iter()
-            .collect::<Option<_>>()?;
-            &formed
+    // A mixture's rows are its class log-sum-exp gradients at every class's own mode, not the
+    // single-population score at the MIXEST class's `ehs` (which, read as one, predicts a
+    // phantom gain at the mixture's own optimum, #3025).
+    let mixture_rows;
+    let per_subject: &[Vec<f64>] = if init_params.mixture.is_some() {
+        mixture_rows = per_subject_outer_gradients_checked(
+            model,
+            population,
+            init_params,
+            x,
+            ehs,
+            kappas,
+            options,
+            false,
+            (!class_etas.is_empty())
+                .then_some(MixtureStart { class_etas, schedules: Some(schedules) }),
+        )?;
+        &mixture_rows
+    } else {
+        match scores.filter(|s| s.len() == population.subjects.len()) {
+            Some(s) => s,
+            None => {
+                let context = crate::estimation::agq::SubjectScoreContext::new(
+                    model,
+                    init_params,
+                    x,
+                    options,
+                    bounds,
+                    false,
+                );
+                let subjects = &population.subjects;
+                formed = crate::par::map(subjects.len(), |i| {
+                    let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    context
+                        .score_routed(&subjects[i], ehs.get(i)?.as_slice(), k, false)
+                        .map(|(g, _)| g)
+                })
+                .into_iter()
+                .collect::<Option<_>>()?;
+                &formed
+            }
         }
     };
     let n = x.len();
@@ -4231,6 +4278,7 @@ fn tight_per_subject_gradients(
                 kappas,
                 options,
                 true,
+                None,
             );
         }
         let params = unpack_params(x, init_params);
@@ -4265,6 +4313,7 @@ fn tight_per_subject_gradients(
             &kappas,
             options,
             true,
+            None,
         )
     })
     .ok()?
@@ -5941,15 +5990,26 @@ fn optimize_nlopt_attempt_probed(
                     .then_some(state.cached_etas_by_class.as_slice());
                 let mut m =
                     if grad.is_some() && crate::estimation::mixture::needs_class_modes(&params) {
-                        let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                            model, population, &params, options, warm,
+                        let (m, modes) = crate::estimation::mixture::mixture_ofv_cached(
+                            model,
+                            population,
+                            &params,
+                            options,
+                            warm,
+                            Some(&schedule_cache),
                         );
                         mixmodes = Some(modes);
                         m
                     } else {
-                        crate::estimation::mixture::mixture_ofv(
-                            model, population, &params, options, warm,
+                        crate::estimation::mixture::mixture_ofv_cached(
+                            model,
+                            population,
+                            &params,
+                            options,
+                            warm,
+                            Some(&schedule_cache),
                         )
+                        .0
                     };
                 let stats = InnerLoopStats {
                     n_unconverged: m.ebe_stats.n_unconverged,
@@ -6237,14 +6297,16 @@ fn optimize_nlopt_attempt_probed(
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
-                    crate::estimation::mixture::mixture_gradient_salvaged(
+                    crate::estimation::mixture::mixture_outer_gradient(
                         model,
                         population,
-                        &params,
+                        init_params,
+                        &x,
                         options,
                         mev,
                         mixmodes.as_ref(),
                         declines,
+                        Some(&schedule_cache),
                     )
                 } else {
                     population_gradient_with_agq_evaluation(
@@ -6380,6 +6442,11 @@ fn optimize_nlopt_attempt_probed(
                 etas: ehs,
                 h_mats: hms.clone(),
                 kappas: kappas.clone(),
+                class_etas: if params.mixture.is_some() {
+                    state.cached_etas_by_class.clone()
+                } else {
+                    Vec::new()
+                },
                 scores: eta_dx.scores.take(),
             });
             state.cached_h_mats = hms;
@@ -6640,6 +6707,7 @@ fn optimize_nlopt_attempt_probed(
                                     etas: ehs,
                                     h_mats: hms,
                                     kappas,
+                                    class_etas: Vec::new(),
                                     scores: None,
                                 };
                                 let mut leg_tracker = leg_best.borrow_mut();
@@ -7156,6 +7224,8 @@ fn optimize_nlopt_attempt_probed(
                     &inc.etas,
                     &inc.kappas,
                     inc.scores.as_deref(),
+                    &inc.class_etas,
+                    &schedule_cache,
                     &bounds,
                     options,
                     &nn_reg,
@@ -7164,7 +7234,10 @@ fn optimize_nlopt_attempt_probed(
                 if verbose {
                     eprintln!(
                         "Quadrature tolerance stop: a Newton step from the best point is \
-                         predicted to gain {gain:?} (polished above {polish_min_gain:e})."
+                         predicted to gain {} (polished above {polish_min_gain:e}).",
+                        gain.map_or("an amount that cannot be formed".to_string(), |g| format!(
+                            "{g:.3e}"
+                        ))
                     );
                 }
                 let polish = gain.is_none_or(|g| g > polish_min_gain);

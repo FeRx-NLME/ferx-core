@@ -158,7 +158,7 @@ pub fn gradient_method_outer(
         }
         EstimationMethod::Foce | EstimationMethod::FoceI => {
             // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
-            // model's `auto` → BOBYQA downgrade reports "no outer gradient" here too.
+            // model's replaced / resolved optimizer is the one reported here too.
             let analytic = crate::sens::provider::analytic_outer_gradient_available(model);
             let (resolved, _) = crate::estimation::outer_policy::resolve_outer_optimizer(
                 optimizer,
@@ -345,17 +345,16 @@ mod tests {
         );
     }
 
-    /// A mixture model left on `auto` runs derivative-free BOBYQA
-    /// (`resolve_outer_optimizer`'s mixture arm), so it has no outer gradient to
-    /// report (#1540). The non-mixture twin — same structural model, in analytic
-    /// scope — must still report `Analytic` under `auto`, or the pair does not
-    /// straddle the gate. An explicit NLopt gradient optimizer is honoured under a
-    /// mixture; an explicit built-in BFGS is replaced by BOBYQA.
+    /// A mixture model left on `auto` runs NLopt L-BFGS on the exact mixture gradient
+    /// (`resolve_outer_optimizer`'s mixture arm, #3025; BOBYQA before), so it reports
+    /// the analytic outer gradient like its non-mixture twin. An explicit NLopt
+    /// gradient optimizer is honoured, an explicit built-in BFGS is replaced by NLopt
+    /// L-BFGS (analytic), and an explicit `bobyqa` is the one derivative-free choice.
     ///
-    /// Mutation that must redden this: resolving through `Optimizer::resolve_auto`
-    /// again (the pre-#1540 code), which reports the mixture `auto` arm `Analytic`.
+    /// Mutation that must redden this: resolving a mixture's `auto` / built-in BFGS to
+    /// BOBYQA again (the pre-#3025 rule), which reports `N/A` here.
     #[test]
-    fn outer_mixture_auto_reports_no_outer_gradient() {
+    fn outer_mixture_auto_reports_the_analytic_outer_gradient() {
         let params = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  omega ETA_CL ~ 0.1\n  sigma EPS ~ 0.01\n";
         let body = "[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n";
         let parse = |s: &str| crate::parser::model_parser::parse_model_string(s).expect("parse");
@@ -372,8 +371,13 @@ mod tests {
         );
         assert_eq!(
             outer(Optimizer::Auto, &mix),
+            GradientMethodKind::Analytic,
+            "mixture + `auto` runs L-BFGS on the exact mixture gradient"
+        );
+        assert_eq!(
+            outer(Optimizer::Bobyqa, &mix),
             GradientMethodKind::NotApplicable,
-            "mixture + `auto` runs BOBYQA: no outer gradient"
+            "an explicit bobyqa is honoured under a mixture: no outer gradient"
         );
         assert_eq!(
             outer(Optimizer::NloptLbfgs, &mix),
@@ -382,8 +386,8 @@ mod tests {
         );
         assert_eq!(
             outer(Optimizer::Bfgs, &mix),
-            GradientMethodKind::NotApplicable,
-            "an explicit built-in BFGS is replaced by BOBYQA under a mixture"
+            GradientMethodKind::Analytic,
+            "an explicit built-in BFGS is replaced by NLopt L-BFGS under a mixture"
         );
     }
 }

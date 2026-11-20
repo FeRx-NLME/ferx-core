@@ -3,14 +3,14 @@
 //! `auto (<resolved>)` is a claim about which outer optimizer ran. Before #1540 the
 //! label was built from `Optimizer::resolve_auto`, which has no `[mixture]` branch,
 //! while the outer loop dispatches on
-//! `estimation::outer_optimizer::resolve_outer_optimizer`, which sends every mixture
-//! model left on `auto` to BOBYQA. A mixture model in analytic scope therefore ran
-//! BOBYQA and reported `auto (nlopt_lbfgs)`.
+//! `estimation::outer_optimizer::resolve_outer_optimizer`, which had a mixture arm of
+//! its own (BOBYQA for `auto`; since #3025 NLopt L-BFGS on the exact mixture gradient,
+//! the same pick as a single population). What still differs under a mixture is an
+//! explicit built-in optimizer, which cannot carry the mixture objective and is replaced
+//! by NLopt L-BFGS, so the pairs below straddle the mixture gate with that choice.
 //!
 //! Every test here is a pair straddling the mixture gate on one analytic-scope model,
-//! and asserts the analytic scope itself: without it the non-mixture arm also resolves
-//! to BOBYQA, both arms read `auto (bobyqa)`, and the mixture assertion passes against
-//! the pre-#1540 code.
+//! and asserts the analytic scope itself.
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -85,7 +85,7 @@ fn assert_analytic_scope(model: &CompiledModel) {
 /// `options.optimizer.resolve_auto(model)` again (the pre-#1540
 /// code) — the mixture arm then reads `auto (nlopt_lbfgs)`.
 #[test]
-fn auto_label_follows_the_mixture_downgrade() {
+fn auto_label_is_nlopt_lbfgs_for_a_mixture_too() {
     let model = parse(MIXTURE);
     assert!(model.mixture.is_some());
     for (method, interaction) in [(EstimationMethod::Foce, false), (EstimationMethod::FoceI, true)]
@@ -95,8 +95,8 @@ fn auto_label_follows_the_mixture_downgrade() {
             FitOptions { method, interaction, optimizer: Optimizer::Auto, ..Default::default() };
         assert_eq!(
             reported_optimizer_label(method, &opts, &model, true),
-            "auto (bobyqa)",
-            "{method:?}: a mixture fit left on `auto` runs BOBYQA"
+            "auto (nlopt_lbfgs)",
+            "{method:?}: a mixture fit left on `auto` runs L-BFGS on the exact mixture gradient (#3025)"
         );
         assert_eq!(
             reported_optimizer_label(method, &opts, &model, false),
@@ -108,12 +108,12 @@ fn auto_label_follows_the_mixture_downgrade() {
 
 /// An explicit optimizer is reported as the one that ran. Under a mixture an NLopt
 /// gradient optimizer is honoured, while one that cannot carry the mixture objective
-/// is replaced by BOBYQA and must be reported as `bobyqa`. Each replaced choice is
+/// is replaced by NLopt L-BFGS and must be reported as `nlopt_lbfgs`. Each replaced choice is
 /// paired with the same choice on the non-mixture side of the gate, where it runs as
 /// requested.
 ///
 /// Mutation that must redden this: reporting `options.optimizer.label()` for an
-/// explicit choice (the pre-#1540 code), which reads `bfgs` for a fit that ran BOBYQA.
+/// explicit choice (the pre-#1540 code), which reads `bfgs` for a fit that ran NLopt L-BFGS.
 #[test]
 fn explicit_optimizer_label_reports_the_mixture_replacement() {
     let model = parse(MIXTURE);
@@ -126,7 +126,7 @@ fn explicit_optimizer_label_reports_the_mixture_replacement() {
         (Optimizer::Lbfgs, "lbfgs"),
         (Optimizer::TrustRegion, "trust_region"),
     ] {
-        assert_eq!(label(optimizer, true), "bobyqa", "{optimizer:?} under a mixture");
+        assert_eq!(label(optimizer, true), "nlopt_lbfgs", "{optimizer:?} under a mixture");
         assert_eq!(label(optimizer, false), own, "{optimizer:?} without a mixture");
     }
     for (optimizer, own) in [
@@ -161,7 +161,7 @@ fn subject(id: &str, cl: f64) -> Subject {
 /// `model.mixture.is_none()`) for `has_mixture` inside `fit_inner` leaves it green.
 /// One outer iteration — the label does not depend on convergence.
 #[test]
-fn fit_reports_auto_bobyqa_for_a_mixture_model() {
+fn fit_reports_the_mixture_rule_for_a_mixture_model() {
     let pop = Population {
         subjects: vec![subject("1", 1.0), subject("2", 1.2), subject("3", 3.0), subject("4", 2.8)],
         covariate_names: Vec::new(),
@@ -170,18 +170,25 @@ fn fit_reports_auto_bobyqa_for_a_mixture_model() {
         exclusions: None,
         warnings: Vec::new(),
     };
-    let opts = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        optimizer: Optimizer::Auto,
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..Default::default()
-    };
-    for (src, want) in [(MIXTURE, "auto (bobyqa)"), (NO_MIXTURE, "auto (nlopt_lbfgs)")] {
+    // `auto` is L-BFGS on both sides of the gate; an explicit built-in BFGS straddles it
+    // (replaced by NLopt L-BFGS under a mixture, run as asked without one).
+    for (optimizer, src, want) in [
+        (Optimizer::Auto, MIXTURE, "auto (nlopt_lbfgs)"),
+        (Optimizer::Auto, NO_MIXTURE, "auto (nlopt_lbfgs)"),
+        (Optimizer::Bfgs, MIXTURE, "nlopt_lbfgs"),
+        (Optimizer::Bfgs, NO_MIXTURE, "bfgs"),
+    ] {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..Default::default()
+        };
         let model = parse(src);
         assert_analytic_scope(&model);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
-        assert_eq!(result.optimizer, want, "mixture = {}", model.mixture.is_some());
+        assert_eq!(result.optimizer, want, "{optimizer:?}, mixture = {}", model.mixture.is_some());
     }
 }

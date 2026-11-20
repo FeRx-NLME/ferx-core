@@ -22,6 +22,7 @@ pub mod mixture;
 pub(crate) mod mstep_newton;
 pub(crate) mod nn_reg;
 pub(crate) use ferx_model::estimation::nn_theta_gradient;
+pub(crate) mod ode_tolerance_check;
 pub mod outer_optimizer;
 pub(crate) use ferx_model::estimation::outer_policy;
 pub mod parameterization {

@@ -443,6 +443,18 @@ fn adjoint_matches_reconverged_finite_differences_of_the_objective() {
     assert!(worst < 5e-6, "worst relative difference {worst:.2e}");
 }
 
+/// The cells of a reconverged-FD case table that run: all of them under `slow-tests`, and per
+/// PR only `per_pr` (indices into `cases`). Every cell is a full oracle (four EBE re-solves per
+/// packed coordinate), so a nine-cell table cost minutes of the per-PR coverage shard; the
+/// per-PR cells are the ones whose comment names the defect they caught.
+pub(super) fn oracle_cells<T>(cases: Vec<T>, per_pr: &[usize]) -> Vec<T> {
+    if cfg!(feature = "slow-tests") {
+        return cases;
+    }
+    assert!(per_pr.iter().all(|&i| i < cases.len()), "per-PR cell out of range");
+    cases.into_iter().enumerate().filter(|(i, _)| per_pr.contains(i)).map(|(_, c)| c).collect()
+}
+
 thread_local! {
     /// The oracle's EBE tolerance (the base point's and every re-solve's).
     static ORACLE_EBE_TOL: std::cell::Cell<f64> = const { std::cell::Cell::new(1e-12) };
@@ -9237,14 +9249,18 @@ fn sde_steady_state_dose_matches_reconverged_finite_differences() {
     let with = crate::pk::compute_predictions_with_tv(&model, &s, theta, &eta);
     assert!(with[0] > 2.0 * without[0], "the steady state is not live: {with:?}");
     assert!(in_scope(&model, &s), "the exact gradient must serve it");
-    for interaction in [true, false] {
+    // Measured locally, one thread: each oracle 60-120 s (FOCEI 62, FOCE 61, Laplace 78, AGQ
+    // n = 3 121 and 102), 429 s in all. Per PR: FOCEI, plus the AGQ routing check below (the
+    // steady state reaching every node without a decline); the other oracles under
+    // `slow-tests`.
+    for interaction in oracle_cells(vec![true, false], &[0]) {
         let worst = fd_oracle(&model, &s, interaction);
         eprintln!("sde SS interaction={interaction} worst {worst:.3e}");
         // Measured on Linux: 4.9e-8 (FOCEI) and 5.5e-8 (FOCE); about 18x headroom.
         assert!(worst < 1e-6, "interaction={interaction}: {worst:.2e}");
     }
     // Laplace and AGQ through the same plans: the steady state reaches every node.
-    for (n_agq, exact) in [(1, true), (3, true), (3, false)] {
+    for (n_agq, exact) in oracle_cells(vec![(1, true), (3, true), (3, false)], &[]) {
         let worst = fd_oracle_agq(&model, &s, n_agq, exact);
         eprintln!("sde SS n_agq={n_agq} exact={exact}: worst {worst:.3e}");
         assert!(worst < SDE_PARITY_BOUND, "n_agq={n_agq} exact={exact}: {worst:.2e}");
@@ -9419,7 +9435,16 @@ fn sde_rate_defined_infusion_under_f_matches_reconverged_finite_differences() {
 /// difference quotient (measured: 6.0e-4 at 2.47, 1.1e-8 at 2.3, 2.5e-8 at 2.62).
 #[test]
 fn sde_steady_state_moving_windows_match_reconverged_finite_differences() {
-    for case in ["D1", "R1", "F1"] {
+    // The longest unit test in the crate: 497 s for the six cells locally (one thread, 60-100 s
+    // each), a floor under its coverage shard. Per PR: the modeled duration (the kink-adjusted
+    // start) under FOCEI; every
+    // window is pinned without SS per PR by the three `sde_*_matches_reconverged_*` tests above,
+    // and the full table runs under `slow-tests`.
+    let cells = oracle_cells(
+        ["D1", "R1", "F1"].into_iter().flat_map(|c| [(c, true), (c, false)]).collect(),
+        &[0],
+    );
+    for (case, interaction) in cells {
         let (mut model, s, k) = sde_window_case(case, true);
         if case == "D1" {
             model.default_params.theta[k] = 2.3;
@@ -9427,11 +9452,9 @@ fn sde_steady_state_moving_windows_match_reconverged_finite_differences() {
         assert!(s.doses[0].ss && s.doses[0].ii == 12.0);
         assert_window_moves_p_obs(&model, &s, k);
         assert!(in_scope(&model, &s), "{case}: the exact gradient must serve it");
-        for interaction in [true, false] {
-            let w = fd_oracle(&model, &s, interaction);
-            eprintln!("sde SS moving window {case} interaction={interaction}: worst {w:.3e}");
-            assert!(w < 5e-7, "{case} interaction={interaction}: {w:.2e}");
-        }
+        let w = fd_oracle(&model, &s, interaction);
+        eprintln!("sde SS moving window {case} interaction={interaction}: worst {w:.3e}");
+        assert!(w < 5e-7, "{case} interaction={interaction}: {w:.2e}");
     }
 }
 
@@ -11686,4 +11709,167 @@ fn the_tangent_jacobian_patches_a_frem_row_like_the_reverse_one() {
     }
     assert_eq!(by_tangents.grad[ti], weights[0], "TV_WT's score is the FREM row's weight");
     assert!((1..4).any(|j| jt[j * n_theta] != 0.0), "fixture: the PK rows depend on θ");
+}
+
+// ---- a rejected trial step whose stages are not finite (#3065) --------------------------
+
+/// A fast-decaying `central` drives `eff` through `central^GAM`, the exponent a θ: once
+/// `central` has decayed to the order of `abstol` the adaptive step grows until a trial
+/// stage overshoots it below zero, where `powf` of a negative base at a non-integer exponent
+/// is `NaN`. The driver rejects that attempt on its `NaN` error norm and retries, as the
+/// `f64` predictor does, so the predictions are finite; the pemetrexed neutropenia model's
+/// Hill term `(C/IC50)^GAMMA` (`GAMMA` fixed at 20, unpacked as `19.999999999999996`) hit
+/// this on every subject.
+const REJECTED_NAN_STAGE: &str = r#"
+[parameters]
+  theta TVK(3.0, 0.1, 50.0)
+  theta TVE(0.5, 0.01, 10.0)
+  theta TVKOUT(0.2, 0.01, 10.0)
+  theta GAM(1.7, 0.5, 5.0)
+  omega ETA_K ~ 0.09
+  omega ETA_E ~ 0.1
+  sigma ADD_ERR ~ 0.05 (sd)
+[individual_parameters]
+  K = TVK * exp(ETA_K)
+  E = TVE * exp(ETA_E)
+  KOUT = TVKOUT
+  G = GAM
+[structural_model]
+  ode(obs_cmt=eff, states=[central, eff])
+[odes]
+  d/dt(central) = -K * central
+  d/dt(eff) = E * central^G - KOUT * eff
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  ode_method = rk45
+"#;
+
+fn rejected_nan_stage_fixture() -> (CompiledModel, Subject) {
+    let model = parse_model_string(REJECTED_NAN_STAGE).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0)],
+        &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 48.0],
+        &[0.1, -0.1],
+    );
+    (model, s)
+}
+
+/// The rejected attempt leaves the reverse's log: kept, its body's vector–Jacobian product
+/// carried the passed-through slots' adjoints back as `0 · NaN`, so every derivative of the
+/// subject was `NaN`, the outer gradient declined every subject to the reconverged
+/// finite-difference salvage, and a FOCEI fit stalled (#3065).
+#[test]
+fn a_rejected_step_with_non_finite_stages_leaves_the_derivatives_finite() {
+    let (model, s) = rejected_nan_stage_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, eta.as_slice());
+    assert!(preds.iter().all(|p| p.is_finite()), "predictions {preds:?}");
+    let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true)
+        .expect("subject must be in adjoint scope");
+    assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    let h = exact_inner_hessian(&model, &s, &params, eta.as_slice()).expect("an exact H");
+    assert!(h.iter().all(|v| v.is_finite()), "H {h}");
+}
+
+/// The same fixture's gradient against the reconverged-FD oracle at tight tolerances, where
+/// the integrator's error sits below the oracle's: the trial steps still overshoot `central`
+/// below zero and are rejected on their `NaN` stages, and the derivative the plan's reverse
+/// carries past them is the trajectory's own (#3065).
+#[test]
+fn a_rejected_step_with_non_finite_stages_matches_reconverged_fd() {
+    let (model, s) = rejected_nan_stage_fixture();
+    let worst = parity(&tight(model), &s);
+    // Measured 1.4e-8 vs reconverged FD (Richardson, EBE re-solved per point); 7× headroom.
+    // With the rejected attempt kept in the log every adjoint component is `NaN` and the
+    // oracle's finiteness assert fails first.
+    assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
+}
+
+/// #3078: the step loop's log is a checkpoint its reverse runs forward again from, and the exact
+/// derivatives must be those of the full log **bit for bit** — the outer gradient (one-seed
+/// reverses) and the covariance Hessian (its bases through the rows loop, every seed's tangents
+/// in one checkpoint) — on a non-stiff and a stiff integration of a nonlinear system, and
+/// across a moving switch whose arms jump (#2649: located crossings, forced steps, recorded
+/// jumps, rejected trial steps). `REPLAY_FROM_FULL` reverses from the full log test builds keep
+/// beside the checkpoint; every replay in a test build also checks each body input it
+/// regenerates that the body reads against that log.
+///
+/// Regression caught: a replay that regenerates a read input wrongly (a save skipped, the
+/// clock or a jump's state copy not replayed) — the replay's own bitwise check fails, and an
+/// input it only passes through but that some later body reads would part the adjoints here.
+#[test]
+fn checkpointed_loop_logs_give_the_full_logs_derivatives_bit_for_bit() {
+    use crate::ode::solver::OdeMethod;
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::{
+        REPLAYED, REPLAY_FROM_FULL, ROWS_RUNS,
+    };
+    let mm = |method: OdeMethod| {
+        let mut model = parse_model_string(MM_ODE).unwrap();
+        model.ode_spec.as_mut().unwrap().solver_opts.method = method;
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &TIMES,
+            &[0.1, -0.05, 0.2],
+        );
+        (model, s)
+    };
+    let (rk, rk_s) = mm(OdeMethod::Rk45);
+    let (ro, ro_s) = mm(OdeMethod::Rodas5P);
+    let (sw, sw_s) = moving_jump_fixture(3.0);
+    for (name, model, s) in
+        [("mm rk45", &rk, &rk_s), ("mm rodas5p", &ro, &ro_s), ("jump", &sw, &sw_s)]
+    {
+        assert!(in_scope(model, s), "{name}: the exact derivatives must serve it");
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-10, true);
+        let run = |from_full: bool| {
+            with_fit_stack(|| {
+                REPLAY_FROM_FULL.with(|c| c.set(from_full));
+                REPLAYED.with(|c| c.set(0));
+                ROWS_RUNS.with(|c| c.set([0; 3]));
+                let g =
+                    subject_adjoint_packed_gradient(model, s, &params, &x, eta.as_slice(), true)
+                        .expect("in scope");
+                let h = subject_adjoint_cov_hessian(
+                    model,
+                    s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Focei,
+                )
+                .expect("in scope");
+                REPLAY_FROM_FULL.with(|c| c.set(false));
+                let counts =
+                    (REPLAYED.with(std::cell::Cell::get), ROWS_RUNS.with(std::cell::Cell::get)[2]);
+                let bits: Vec<u64> = g.iter().chain(h.iter()).map(|v| v.to_bits()).collect();
+                (bits, counts)
+            })
+        };
+        let (got, (replayed, rows)) = run(false);
+        let (want, _) = run(true);
+        eprintln!("{name}: {replayed} bodies replayed, {rows} rows loop runs");
+        assert!(replayed > 0, "{name}: no body was replayed");
+        assert!(rows > 0, "{name}: the covariance bases must take the rows loop");
+        assert!(got.iter().all(|&b| f64::from_bits(b).is_finite()), "{name}: finite");
+        assert_eq!(got.len(), want.len());
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                a,
+                b,
+                "{name}: entry {i}: {} vs {} from the full log",
+                f64::from_bits(*a),
+                f64::from_bits(*b)
+            );
+        }
+    }
 }

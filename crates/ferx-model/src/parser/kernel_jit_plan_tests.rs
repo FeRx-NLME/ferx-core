@@ -1002,11 +1002,13 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let lits = [0.0f64];
     // The forward.
     let t = cp.get(layout, Sweep::Forward).expect("a kernel");
-    let p = simd::packs(&t.f, l, false, 0).expect("the forward packs");
+    let p = simd::packs(&t.ir().unwrap(), l, false, 0).expect("the forward packs");
     let vec_ops = p
         .members
         .iter()
-        .filter(|m| !matches!(t.f.insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. }))
+        .filter(|m| {
+            !matches!(t.ir().unwrap().insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. })
+        })
         .count();
     assert!(vec_ops >= 20, "{vec_ops} vector operations");
     let mut interp = simd_inputs(l);
@@ -1022,7 +1024,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     }
     // The reverse, several seeds at once.
     let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
-    assert!(simd::packs(&t.f, l, true, t.prefix).is_some(), "the reverse packs");
+    assert!(simd::packs(&t.ir().unwrap(), l, true, t.prefix).is_some(), "the reverse packs");
     let (seeds, stride) = (3, 5 * l);
     let init = || {
         let mut adj = vec![0.0; seeds * stride];
@@ -2448,8 +2450,12 @@ fn a_plans_kernels_keep_only_what_runs_them() {
         assert_eq!(prog.code.capacity(), prog.code.len(), "a chunk program's code");
         for t in prog.compiled.lock().unwrap().values().flatten() {
             let what = if t.rev { "reverse" } else { "forward" };
-            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
-            assert_eq!(t.f.insts.capacity(), t.f.insts.len(), "the {what} kernel's instructions");
+            assert!(t.ir().unwrap().live.is_empty(), "the {what} kernel keeps `live`");
+            assert_eq!(
+                t.ir().unwrap().insts.capacity(),
+                t.ir().unwrap().insts.len(),
+                "the {what} kernel's instructions"
+            );
             seen[t.rev as usize] += 1;
         }
     }
@@ -2496,4 +2502,318 @@ fn an_unkept_forward_writes_what_the_kept_one_does() {
             close(unkept[2], t0 * t0, "∂/∂θ₁");
         }
     }
+}
+
+/// #3060: a residual covariance `R` of pairs (`correlation cs(RHO) by PAIR`, `n/2` blocks of
+/// 2) factored and solved on a recording. The dense factorisation records superlinearly many
+/// instructions (here 618 at 16 rows, 2018 at 32: every structural zero below a pivot is a
+/// division, and every product with it a node or a zero-fold guard) — which made the outer
+/// gradient's kernel of a subject with 84 observations take gigabytes and seconds to
+/// compile; the blocked one records `O(n)`. The probe is checked to see the dense growth, so
+/// a blocked factorisation that went back to the dense loops would fail the linear bound.
+#[test]
+fn blocked_cholesky_records_linear_in_the_rows() {
+    let _resets = resets_shared();
+    use crate::sens::focei_kernel::{chol, chol_blocks, chol_solve, chol_solve_blocks};
+    use crate::stats::residual_error::RBlocks;
+    let count = |n: usize, blocked: bool| -> usize {
+        begin();
+        let x = Tr::eta(0, 0.3);
+        let group: Vec<usize> = (0..n).map(|j| j / 2).collect();
+        let a: Vec<Vec<Tr>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match (i == j, group[i] == group[j]) {
+                        (true, _) => x + Tr::from_f64(2.0),
+                        (false, true) => x * Tr::from_f64(0.5),
+                        (false, false) => Tr::from_f64(0.0),
+                    })
+                    .collect()
+            })
+            .collect();
+        let rhs: Vec<Tr> = (0..n).map(|j| x * Tr::from_f64(1.0 + j as f64)).collect();
+        let z = if blocked {
+            let blk = RBlocks::from_groups(&group);
+            chol_solve_blocks(&chol_blocks(&a, &blk).expect("factors"), &rhs, &blk)
+        } else {
+            chol_solve(&chol(&a).expect("factors"), &rhs)
+        };
+        let s = z.into_iter().fold(Tr::from_f64(0.0), |acc, v| acc + v);
+        end(Some(vec![s.reg()])).expect("records").code.len()
+    };
+    let (d16, d32) = (count(16, false), count(32, false));
+    assert!(d32 > 3 * d16, "the probe sees the dense growth: {d16} → {d32}");
+    let (b16, b32, b64) = (count(16, true), count(32, true), count(64, true));
+    assert!(b32 <= 2 * b16 + 8 && b64 <= 2 * b32 + 8, "blocked: {b16} → {b32} → {b64}");
+}
+
+/// A phase boundary (#3077) releases the plans, templates and kept forwards of the fit the
+/// thread runs and nothing else: the fit's bad marks and failure records stay (the subject does
+/// not re-try a failed plan, and the fit still reports it at its end), another fit's plans,
+/// templates and forwards stay, and a thread that runs no fit releases nothing.
+/// Mutations: drop `|| v.is_none()` from the retain -> the bad mark is gone (`Missing`); retain
+/// on anything but the scope -> B's plan / template / forward go; release under scope `0`
+/// instead of returning -> the unregistered plan goes; skip `clear_kept` -> A's forward stays;
+/// skip `lock_families().retain` / `prune_caches` -> A's template stays.
+#[test]
+fn a_phase_boundary_releases_only_the_running_fits_plans_and_keeps_its_bad_marks() {
+    let _resets = resets_shared();
+    let ma = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let mb = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let (ida, idb) = (ma.plan_id.get(), mb.plan_id.get());
+    let (a, b) = (vec![crate::types::Subject::default()], vec![crate::types::Subject::default()]);
+    let guard_a = super::in_fit(0, || register(&ma, &a));
+    let guard_b = super::in_fit(0, || register(&mb, &b));
+    let scope_of =
+        |s: &[crate::types::Subject]| registered(s.as_ptr() as usize).expect("registered").1;
+    let (scope_a, scope_b) =
+        (super::in_fit(guard_a.fit, || scope_of(&a)), super::in_fit(guard_b.fit, || scope_of(&b)));
+    assert_ne!(scope_a, scope_b, "fixture: two fits");
+    let variant = |v: u64| Desc::of_value(&v);
+    // Per fit: a plan, a bad-marked plan, a template and a kept forward.
+    // A structure per fit (`depth`): another fit's recording of the same one would replay its
+    // template instead of planning one of its own.
+    let fill = |m: &crate::types::CompiledModel,
+                s: &[crate::types::Subject],
+                scope: u64,
+                depth: usize| {
+        super::in_fit(scope, || {
+            let key = SubjectKey::new(m, &s[0], 1, 2).with_variant(variant(0x3077_0001));
+            add(&key, square_plan());
+            let bad = SubjectKey::new(m, &s[0], 1, 2).with_variant(variant(0x3077_0002));
+            mark_bad(&bad, "forced");
+            let family =
+                SubjectKey::new(m, &s[0], 1, 2).with_variant(variant(0x3077_0003)).family();
+            let rec = recorded(&family, || {
+                let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+                let mut x = et[0];
+                for _ in 0..depth {
+                    x = x * et[1] + et[0];
+                }
+                Some(vec![x.reg()])
+            })
+            .expect("records");
+            rec.plan(l2(), 2, 0).expect("plans");
+            kept_lock().insert(
+                s.as_ptr() as usize,
+                Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope, model: m.plan_id.get() },
+            );
+            (key, bad)
+        })
+    };
+    let (key_a, bad_a) = fill(&ma, &a, scope_a, 13);
+    let (key_b, _) = fill(&mb, &b, scope_b, 14);
+    // An unregistered plan (scope `0`), which a thread running no fit must leave alone.
+    let mc = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let loose = crate::types::Subject::default();
+    let key_0 = super::in_fit(0, || {
+        let k = SubjectKey::new(&mc, &loose, 1, 2).with_variant(variant(0x3077_0004));
+        add(&k, square_plan());
+        k
+    });
+    assert_eq!(key_0.scope, 0, "fixture: unregistered");
+    assert_eq!((templates_of(ida), templates_of(idb)), (1, 1), "fixture: a template each");
+    assert_eq!((kept_in(scope_a), kept_in(scope_b)), (1, 1), "fixture: a forward each");
+
+    super::in_fit(0, release_fit_plans);
+    assert!(matches!(lookup(&key_0), Lookup::Found(_)), "no fit, nothing released");
+    assert_eq!(kept_in(scope_a), 1, "no fit, no forward released");
+
+    super::in_fit(scope_a, release_fit_plans);
+    assert!(matches!(lookup(&key_a), Lookup::Missing), "A's plan is released");
+    assert!(matches!(lookup(&bad_a), Lookup::Bad), "A's bad mark stays");
+    assert_eq!(templates_of(ida), 0, "A's template is released");
+    assert!(lock_families().keys().all(|k| k.scope != scope_a), "and its family");
+    assert_eq!(kept_in(scope_a), 0, "A's forward is released");
+    let reported = super::in_fit(scope_a, || plan_failures(&ma, &a));
+    assert_eq!(reported, Some((1, "forced".to_string())), "its failure is still reported");
+    assert!(matches!(lookup(&key_b), Lookup::Found(_)), "B's plan stays");
+    assert_eq!(templates_of(idb), 1, "B's template stays");
+    assert_eq!(kept_in(scope_b), 1, "B's forward stays");
+    assert!(matches!(lookup(&key_0), Lookup::Found(_)), "the unregistered plan stays");
+    drop((guard_a, guard_b));
+    drop_model(ida);
+}
+
+/// A phase boundary frees every pool worker's thread-local buffers, not only the calling
+/// thread's (#3077): each keeps the largest a pass ever needed. Mutations: release only the
+/// calling thread (drop the `rayon::broadcast`) -> the other worker still holds its buffers;
+/// leave one pool out of `ode_loop::release_thread_buffers` (`IDX`) -> its table stays.
+#[test]
+fn a_phase_boundary_frees_every_workers_pooled_buffers() {
+    let _resets = resets_shared();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("a pool");
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let subs = vec![crate::types::Subject::default()];
+    let pooled = || {
+        POOL.with(|p| p.borrow().len())
+            + LAST.with(|l| usize::from(l.borrow().is_some()))
+            + super::ode_loop::pooled_buffers()
+    };
+    let counts = pool.install(|| {
+        let guard = register(&m, &subs);
+        let key = SubjectKey::new(&m, &subs[0], 1, 2).with_variant(Desc::of_value(&0x3077_0005u64));
+        add(&key, square_plan());
+        let fit = guard.fit;
+        // Every worker pools a buffer and caches the plan it looked up last.
+        rayon::broadcast(|_| {
+            give(vec![0.0; 1 << 12]);
+            super::in_fit(fit, || assert!(matches!(lookup(&key), Lookup::Found(_))));
+            super::ode_loop::Log::default().give();
+            super::ode_loop::pool_an_offset_table();
+        });
+        let before = rayon::broadcast(|_| pooled());
+        release_fit_plans();
+        let after = rayon::broadcast(|_| pooled());
+        drop(guard);
+        (before, after)
+    });
+    assert!(counts.0.iter().all(|&n| n >= 4), "fixture: each worker holds some: {:?}", counts.0);
+    assert_eq!(counts.1, vec![0, 0], "each worker's are freed");
+    drop(m);
+}
+
+/// `f`'s plan's reverses at `eta`, as their adjoints' bits: per output, the first-order reverse
+/// from a first-order forward and from a second-order one (a prefix layout: the reverse reads
+/// the leading lanes of a wider log), then the rows forward-over-reverse along both η
+/// (`run_loop_rows`/`run_loop_rev_rows`) where the plan serves it. Also the loop logs' bytes,
+/// kept and as the full log would have held them.
+fn reverse_bits(plan: &Plan, n_out: usize, eta: [f64; 2]) -> (Vec<u64>, usize, usize, bool) {
+    let mut bits = Vec::new();
+    let mut bytes = (0, 0);
+    for lay in [Layout { n: 2, m: 0, th: false, wide: false, tan: 0 }, l2()] {
+        let l = lay.lanes();
+        let mut u = vec![0.0; 2 * l];
+        for k in 0..2 {
+            u[k * l] = eta[k];
+            u[k * l + 1 + k] = 1.0;
+        }
+        let fwd = plan.forward_kept(lay, &u, &[]).expect("runs");
+        for lg in &fwd.logs {
+            if let CallLog::Ode(lg) = lg {
+                bytes.0 += lg.bytes();
+                bytes.1 += lg.full_bytes();
+            }
+        }
+        let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
+        let lr = l1.lanes();
+        for j in 0..n_out {
+            let mut du_bar = vec![0.0; n_out * lr];
+            du_bar[j * lr] = 1.0;
+            du_bar[j * lr + 1] = 0.5;
+            let mut ub = vec![0.0; 2 * lr];
+            assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar), "reverses");
+            assert!(ub.iter().all(|x| x.is_finite()), "finite adjoints");
+            bits.extend(ub.iter().map(|x| x.to_bits()));
+        }
+    }
+    let rows = plan.rows_serve(Layout::F64);
+    if rows {
+        let tu = [1.0, 0.0, 0.0, 1.0];
+        let rf = plan.forward_rows(Layout::F64, &eta, &[], &tu, 2).expect("rows run");
+        let du: Vec<f64> = (0..n_out).map(|j| 1.0 - 0.1 * j as f64).collect();
+        let dut: Vec<f64> = (0..2 * n_out).map(|j| 0.3 + 0.05 * j as f64).collect();
+        let (mut ub, mut ut) = (vec![0.0; 2], vec![0.0; 4]);
+        assert!(plan.reverse_rows(&rf, &du, Some(&dut), &mut ub, &mut [], &mut ut, &mut []));
+        assert!(ub.iter().chain(&ut).all(|x| x.is_finite()), "finite rows adjoints");
+        bits.extend(ub.iter().chain(&ut).map(|x| x.to_bits()));
+    }
+    (bits, bytes.0, bytes.1, rows)
+}
+
+/// #3078: a loop call's log keeps a checkpoint — the lanes a step's bodies read that no body of
+/// the step wrote — instead of every body's inputs, and the reverse regenerates the inputs by
+/// running the step forward again. The reverse must be the full log's **bit for bit**: on every
+/// stepper family (explicit RK45 and Vern7, the Rosenbrock pair carrying a Jacobian), from a
+/// first-order forward, from a second-order one whose leading lanes the reverse reads, and
+/// through the rows forward-over-reverse; and each replayed body input a body reads equals the
+/// forward's, bit for bit (asserted inside every replay of a test build, so the whole suite
+/// checks it). The memory it buys, measured on this two-state fixture, is printed and bounded.
+///
+/// Mutations: the rewind of a rejected step keeping `known` (a slot it wrote is then never
+/// saved), and the clock not restored before a replayed body — each fails the replay's bitwise
+/// check here. (A jump's state copy left out of the replay fails the switch fixture of
+/// `checkpointed_loop_logs_give_the_full_logs_derivatives_bit_for_bit`; this fixture has no
+/// switch.)
+#[test]
+fn a_checkpointed_ode_log_reverses_bit_for_bit_like_the_full_log() {
+    let _resets = resets_shared();
+    use crate::ode::solver::OdeMethod;
+    use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
+    for method in [OdeMethod::Rk45, OdeMethod::Vern7, OdeMethod::Rosenbrock23, OdeMethod::Rodas5P] {
+        let f = case_ode_interp(method);
+        begin();
+        let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [0.1, -0.2][k])).collect();
+        let y = f(&et);
+        let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
+        let plan = rec.plan(l2(), 2, 0).expect("plans");
+        for eta in [[0.15, -0.1], [0.9, 0.6]] {
+            REPLAYED.with(|c| c.set(0));
+            let (got, kept, full, rows) = reverse_bits(&plan, y.len(), eta);
+            let replayed = REPLAYED.with(std::cell::Cell::get);
+            REPLAY_FROM_FULL.with(|c| c.set(true));
+            let (want, ..) = reverse_bits(&plan, y.len(), eta);
+            REPLAY_FROM_FULL.with(|c| c.set(false));
+            eprintln!(
+                "{method:?} at {eta:?}: log {kept} B vs {full} B full ({:.1}×), {replayed} \
+                 bodies replayed, rows {rows}",
+                full as f64 / kept as f64
+            );
+            assert!(replayed > 0, "{method:?}: the reverse replayed no body");
+            assert!(rows, "{method:?}: the rows path must be exercised");
+            assert_eq!(got.len(), want.len());
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    a,
+                    b,
+                    "{method:?} at {eta:?}: adjoint {i}: {} vs {} from the full log",
+                    f64::from_bits(*a),
+                    f64::from_bits(*b)
+                );
+            }
+            assert!(
+                kept < full,
+                "{method:?}: the checkpoint ({kept} B) is no smaller than {full} B"
+            );
+        }
+    }
+}
+
+/// [`release_pool_thread_caches`] run on a pool leaves every one of its workers holding no plan
+/// handle or buffer (#3077). The tighter ODE scope's pool (the covariance step's stencil, the
+/// settle check, the stagnation guard's decrement) is cached for the next caller, and a phase
+/// boundary on the fit's pool cannot reach it, so a worker's `LAST` would keep the plans the
+/// boundary pruned alive. That `pool::with_fit_scope_ode` calls this is pinned in ferx-core
+/// (`a_tighter_ode_scope_leaves_its_pools_workers_empty`, #3041).
+/// Mutation: make `release_pool_thread_caches` release this thread only -> the other worker
+/// keeps its buffers and plan handle.
+#[test]
+fn releasing_on_a_pool_leaves_every_worker_empty() {
+    let _resets = resets_shared();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let subs = vec![crate::types::Subject::default()];
+    let pooled = || {
+        POOL.with(|p| p.borrow().len())
+            + LAST.with(|l| usize::from(l.borrow().is_some()))
+            + super::ode_loop::pooled_buffers()
+    };
+    let guard = register(&m, &subs);
+    let fit = guard.fit;
+    let key = SubjectKey::new(&m, &subs[0], 1, 2).with_variant(Desc::of_value(&0x3077_0006u64));
+    add(&key, square_plan());
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("a 2-worker pool");
+    let filled = pool.install(|| {
+        rayon::broadcast(|_| {
+            give(vec![0.0; 1 << 12]);
+            super::in_fit(fit, || assert!(matches!(lookup(&key), Lookup::Found(_))));
+            super::ode_loop::Log::default().give();
+            super::ode_loop::pool_an_offset_table();
+        });
+        rayon::broadcast(|_| pooled())
+    });
+    assert!(filled.iter().all(|&n| n >= 4), "fixture: each worker holds some: {filled:?}");
+    pool.install(release_pool_thread_caches);
+    let after = pool.install(|| rayon::broadcast(|_| pooled()));
+    assert_eq!(after, vec![0, 0], "every worker was left empty");
+    drop(guard);
 }

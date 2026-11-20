@@ -1533,6 +1533,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
             &bounds,
             &options,
             &free_idx,
+            None,
         )
         .expect("S assembles");
         super::combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s, &units)
@@ -2023,46 +2024,4 @@ fn the_analytic_r_matrix_skips_held_axes_and_keeps_the_free_block_bit_identical(
             );
         }
     }
-}
-
-/// A mixture's objective is FOCE/FOCEI whatever `n_agq` says (`mixture_ofv` never evaluates a
-/// quadrature grid; Laplace/AGQ mixtures are #3025), so a caller-supplied quadrature `n_agq`
-/// through `run_covariance` must not move the R-matrix onto an objective the fit never
-/// minimised: `cov_objective` gives the mixture FOCEI and the exact mixture assembly serves it
-/// (#3004 review r2). The same options on a non-mixture model keep the quadrature objective, so
-/// the rule is the mixture's, not the options'.
-#[test]
-fn a_mixture_differentiates_the_objective_its_fit_scored_whatever_n_agq_says() {
-    use crate::estimation::covariance::PredictedRRoute;
-    use crate::sens::ode_provider::adjoint::Objective;
-    use crate::types::{EstimationMethod, FitOptions};
-    let mixture = parse_model_string(
-        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
-         theta MIXL(0.2, -10.0, 10.0)\n  omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
-         [mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.15\n\
-         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
-         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
-    )
-    .unwrap();
-    let plain = parse_model_string(
-        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
-         omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
-         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
-         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
-    )
-    .unwrap();
-    let focei_agq =
-        FitOptions { method: EstimationMethod::FoceI, n_agq: 3, ..FitOptions::default() };
-    assert!(focei_agq.agq_nodes().is_some(), "premise: a quadrature objective");
-    assert_eq!(
-        super::cov_objective(&mixture, &focei_agq),
-        Objective::Focei,
-        "the mixture keeps the objective its fit scored"
-    );
-    assert!(
-        matches!(super::cov_objective(&plain, &focei_agq), Objective::Agq { n_agq: 3, .. }),
-        "a single population keeps the quadrature objective"
-    );
-    assert!(super::analytic_cov_model_declines(&mixture, &focei_agq).is_empty());
-    assert_eq!(super::predicted_r_route(&mixture, &focei_agq), PredictedRRoute::Analytic);
 }

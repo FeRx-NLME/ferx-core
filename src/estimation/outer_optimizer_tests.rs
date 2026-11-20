@@ -727,6 +727,7 @@ fn test_assemble_score_cross_product_cancelled() {
         &bounds,
         &options,
         &free_idx,
+        None,
     )
     .expect("cancelled score assembly returns a discarded zero matrix");
     assert!(s.iter().all(|v| v.is_finite()), "cancelled S must be finite");
@@ -5581,6 +5582,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
         &x,
         template,
         &options,
+        None,
     );
 
     for (k, (got, want)) in ours.iter().zip(&independent).enumerate() {
@@ -8873,7 +8875,8 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
             PrevEtas::Solved,
         );
         let gradients = |strict| {
-            per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict).is_some()
+            per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict, None)
+                .is_some()
         };
         (stats.n_unconverged == 0 && stats.n_start_rejected == 0, gradients(false), gradients(true))
     })
@@ -9852,6 +9855,7 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
         etas: vec![DVector::from_element(2, v); 2],
         h_mats: vec![DMatrix::identity(2, 2); 2],
         kappas: vec![Vec::new(); 2],
+        class_etas: Vec::new(),
         scores: None,
     };
     let mut held = Some(warm(1.0));
@@ -13167,8 +13171,10 @@ fn the_fit_population_gradients_unpack_the_packed_point_once() {
     assert!(log.declined_indices().is_empty(), "every subject exact");
     assert_eq!(n, 1, "population_gradient_sens_mixed: one unpack, not one per subject");
     let n = watch_packed_points(params, &|| {
-        per_subject_outer_gradients_checked(&model, &pop, params, &x, &ehs, &kappas, &opts, true)
-            .expect("every subject served");
+        per_subject_outer_gradients_checked(
+            &model, &pop, params, &x, &ehs, &kappas, &opts, true, None,
+        )
+        .expect("every subject served");
     });
     assert_eq!(n, 1, "per_subject_outer_gradients_checked: one unpack");
     // IOV loop.
@@ -15086,7 +15092,8 @@ fn cold_mode_pair(
 
 /// #2645, the one fit a PR runs: both rounds open and run legs of their own, on the simulated
 /// dataset that did so most steadily of twelve tried on both platforms (20 subjects, six legs
-/// and 196.7247 on Linux aarch64 and macOS arm64, ~0.5 s). What the rounds gain, and what a
+/// and 196.7247 on Linux aarch64 and macOS arm64; ~22 s one-threaded on x86_64, measured
+/// 2026-11-19, the same before #2939). What the rounds gain, and what a
 /// losing round leaves, is pinned by the `slow-tests` pairs below.
 ///
 /// The fixture's subjects have second EBE modes, so which trajectory a start takes is
@@ -16411,4 +16418,90 @@ fn a_structural_decline_is_asked_every_evaluation() {
         assert!(log.is_structural(0, || true));
         assert_eq!(log.structural_probes.load(Ordering::Relaxed), k);
     }
+}
+
+/// #3025: the quadrature tolerance stop's predicted remaining gain, formed on a Laplace
+/// mixture, must read the mixture's own per-subject gradients. It used to form the
+/// single-population quadrature score of each subject at the MIXEST class's mode and
+/// predicted a gain of 5.43 OFV at the anchor optimum (`nonmem_anchor/mixture_laplace.ferx`,
+/// OFV 301.7730, which BOBYQA, L-BFGS and a 2000-evaluation BOBYQA all reach), sending an
+/// already-converged fit through polish legs. At the optimum (estimates to 5 digits) the
+/// decrement is the size of the rounding of those digits.
+///
+/// Mutation that must redden this: dropping the mixture branch of
+/// `quadrature_predicted_remaining_gain` (the single-population `score_routed` rows).
+#[test]
+fn quadrature_remaining_gain_of_a_laplace_mixture_is_zero_at_its_optimum() {
+    let (model, pop) = mixture_iv_fixture();
+    let opts = FitOptions { method: EstimationMethod::Laplace, ..Default::default() };
+    let gain_at = |theta: [f64; 4]| {
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+        let x = crate::estimation::parameterization::pack_params(&params);
+        // The incumbent's class modes at `x` and the fit's schedule cache: the warm solve.
+        let class_etas =
+            crate::estimation::mixture::mixture_ofv(&model, &pop, &params, &opts, None)
+                .etas_by_class;
+        let schedules = crate::estimation::mixture::hoisted_schedules(&model, &pop, &opts)
+            .expect("a quadrature objective");
+        quadrature_predicted_remaining_gain(
+            &model,
+            &pop,
+            &params,
+            &x,
+            &[],
+            &[],
+            None,
+            &class_etas,
+            &schedules,
+            &compute_bounds(&params),
+            &opts,
+            &crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts),
+            &build_prior_set(&model, &params),
+        )
+        .expect("the mixture's exact per-subject gradients form")
+    };
+    let gain = gain_at([0.94985, 2.81959, 10.01103, -0.11795]);
+    assert!(gain < 0.05, "predicted gain {gain} at the optimum");
+    // Moved off the optimum the same call predicts a real gain, so the number is live.
+    let gain_off = gain_at([1.2, 2.81959, 10.01103, -0.11795]);
+    assert!(gain_off > 1.0, "off-optimum gain {gain_off}");
+}
+
+/// A built-in optimizer that does not carry the mixture objective (`bfgs`, `lbfgs`,
+/// `trust_region`) is replaced by what `auto` resolves to (#3034 review r2): NLopt L-BFGS on
+/// the exact mixture gradient, BOBYQA where the loop has no analytic outer gradient
+/// (`gradient = fd`, out of scope) — never a gradient-based optimizer on a gradient the loop
+/// does not form. Both sides in one test, and the warning names what ran. Mutation: replace the
+/// built-ins with `NloptLbfgs` unconditionally -> the no-gradient row reads L-BFGS.
+#[test]
+fn a_replaced_mixture_optimizer_follows_the_gradient_the_loop_forms() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
+         omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .expect("model parses");
+    for requested in [Optimizer::Bfgs, Optimizer::Lbfgs, Optimizer::TrustRegion] {
+        let (with, w_with) = resolve_outer_optimizer(requested, &model, true, true);
+        assert_eq!(with, Optimizer::NloptLbfgs, "{requested:?} with the exact gradient");
+        let w_with = w_with.expect("an explicit replaced choice warns");
+        assert!(
+            w_with.contains("replaced by NLopt L-BFGS") && !w_with.contains("BOBYQA ("),
+            "{w_with}"
+        );
+        let (without, w_without) = resolve_outer_optimizer(requested, &model, true, false);
+        assert_eq!(without, Optimizer::Bobyqa, "{requested:?} without an analytic gradient");
+        let w_without = w_without.expect("an explicit replaced choice warns");
+        assert!(
+            w_without.contains("replaced by BOBYQA") && !w_without.contains("replaced by NLopt"),
+            "{w_without}"
+        );
+    }
+    assert_eq!(
+        resolve_outer_optimizer(Optimizer::Auto, &model, true, false),
+        (Optimizer::Bobyqa, None),
+        "auto without a gradient: BOBYQA, silently"
+    );
 }

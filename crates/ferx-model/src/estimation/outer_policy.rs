@@ -10,10 +10,15 @@ use crate::types::*;
 pub fn resolve_outer_optimizer(
     requested: Optimizer, model: &CompiledModel, has_mixture: bool, analytic_outer_gradient: bool,
 ) -> (Optimizer, Option<String>) {
-    // Mixture models (#977): BOBYQA is the default (robust to label switching). An
-    // explicit NLopt gradient optimizer is honoured (its closure branches to the mixture
-    // gradient), as is explicit `bobyqa` with no warning (#2852); everything else,
-    // including `auto` and BFGS / trust region, falls back to BOBYQA.
+    // Mixture models (#977, #3025). An analytic posterior-weighted outer gradient exists
+    // for the mixture objective, so `auto` resolves exactly as for a single population
+    // (NLopt L-BFGS on the exact gradient where it is available, BOBYQA where it is
+    // not), and an explicit NLopt optimizer -- gradient-based or BOBYQA -- is honoured
+    // without a warning (#2852): those route through `optimize_nlopt`, whose objective
+    // closure branches to `mixture_gradient`. The built-in BFGS / L-BFGS and
+    // trust-region paths do not carry the mixture objective and fall back to what
+    // `auto` resolves to (L-BFGS on the exact gradient, BOBYQA without one: never a
+    // gradient-based optimizer on a gradient the loop does not form), with a warning.
     if has_mixture {
         // Exhaustive, no wildcard: a new variant must say here whether it carries
         // the mixture objective.
@@ -21,10 +26,8 @@ pub fn resolve_outer_optimizer(
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 requested
             }
-            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
-            // trust-region paths do not carry the mixture objective.
             Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
-                Optimizer::Bobyqa
+                Optimizer::Auto.resolve_auto_given_analytic(model, analytic_outer_gradient)
             }
         };
         // The warning is owed exactly when an *explicit* choice did not run — keyed
@@ -34,10 +37,15 @@ pub fn resolve_outer_optimizer(
         let replaced = requested != Optimizer::Auto && resolved != requested;
         let warning = replaced.then(|| {
             format!(
-                "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                 (SLSQP / L-BFGS / MMA); the requested `{}` optimizer does not carry \
-                 the mixture objective and was replaced by BOBYQA.",
-                requested.label()
+                "Mixture models are optimized with an NLopt method (L-BFGS / SLSQP / MMA / \
+                 BOBYQA); the requested `{}` optimizer does not carry the mixture \
+                 objective and was replaced by {}.",
+                requested.label(),
+                if resolved == Optimizer::NloptLbfgs {
+                    "NLopt L-BFGS"
+                } else {
+                    "BOBYQA (no analytic outer gradient)"
+                }
             )
         });
         return (resolved, warning);

@@ -734,3 +734,37 @@ fn a_job_stolen_during_a_nested_scoped_call_reads_its_own_pools_scope() {
         "(install_on_fit_pool, with_fit_scope, fit): a stolen job read the nested call's ODE settings"
     );
 }
+
+/// A phase run on the tighter ODE scope's own pool — the covariance step's stencil, the settle
+/// check, the stagnation guard's decrement — leaves that pool's workers holding no buffer
+/// (#3077): the pool is cached for the next caller, and a phase boundary on the fit's pool
+/// cannot reach it. What the release clears, plan handles included, is pinned in ferx-model
+/// (`releasing_on_a_pool_leaves_every_worker_empty`, #3041); this pins that the scope runs it.
+/// Mutation: drop the `release_pool_thread_caches` call from `with_fit_scope_ode` -> the second
+/// visit finds the first one's buffers on both workers.
+#[test]
+fn a_tighter_ode_scope_leaves_its_pools_workers_empty() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::{give, thread_cache_count};
+    let options = crate::types::FitOptions { threads: Some(2), ..Default::default() };
+    // An override no other test arms, so the cached pool this leases is this test's alone.
+    let tight = crate::ode::solver::OdeSolverOverride {
+        reltol: Some(3.077e-9),
+        abstol: Some(3.077e-11),
+        ..Default::default()
+    };
+    let (filled, before) = crate::pool::with_fit_scope_ode(&options, tight, || {
+        assert_eq!(rayon::current_num_threads(), 2, "fixture: the scope's own pool");
+        rayon::broadcast(|_| give(vec![0.0; 1 << 12]));
+        (rayon::broadcast(|_| thread_cache_count()), std::thread::current().id())
+    })
+    .expect("the tighter scope");
+    assert!(filled.iter().all(|&n| n >= 1), "fixture: each worker holds some: {filled:?}");
+    // The next caller of the same scope leases the same idle pool.
+    let (after, again) = crate::pool::with_fit_scope_ode(&options, tight, || {
+        let ids = rayon::broadcast(|_| std::thread::current().id());
+        (rayon::broadcast(|_| thread_cache_count()), ids)
+    })
+    .expect("the tighter scope");
+    assert!(again.contains(&before), "fixture: the cached pool is the one leased again");
+    assert_eq!(after, vec![0, 0], "the scope's workers were left empty");
+}
