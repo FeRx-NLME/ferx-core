@@ -73,6 +73,15 @@ CASES: dict[str, dict[str, str]] = {
     "fit": {"maxiter": "1", "covariance": "true"},
 }
 
+# The `covariance_status` each case must report. The covariance step is where e7070's
+# post-fit spike lived, so a `fit` case whose step was skipped, or failed before it
+# assembled anything, measures a lower peak for a reason that is not a memory win —
+# probe drift, not an improvement. `eval` must not run it, or it is a second `fit`.
+EXPECTED_COVARIANCE: dict[str, str] = {
+    "eval": "NotRequested",
+    "fit": "Computed",
+}
+
 # The lines `case_model` rewrites, exactly as stiff_pkpd.ferx spells them.
 FIT_OPTION_LINE = re.compile(r"^(  (maxiter|covariance) +=) (\S+)$", re.MULTILINE)
 
@@ -116,6 +125,29 @@ def case_model(text: str, case: str) -> str:
 # ---------------------------------------------------------------------------------
 # /usr/bin/time
 # ---------------------------------------------------------------------------------
+
+
+def covariance_label(status) -> str:
+    """`covariance_status` as one string: the variant name of a unit status
+    (`"Computed"`), the sorted JSON of a status that carries data."""
+    return status if isinstance(status, str) else json.dumps(status, sort_keys=True)
+
+
+def probe_drift(case: str, rec: dict) -> list[str]:
+    """What, in one ok case record, says the probe no longer measures the shape it
+    exists for. Empty when the case is a probe."""
+    drift = []
+    if not rec.get("escalated"):
+        drift.append("`auto` no longer escalates")
+    if rec.get("gradient_method_outer") not in (None, "analytic"):
+        drift.append(f"outer gradient is `{rec.get('gradient_method_outer')}`, not analytic")
+    want = EXPECTED_COVARIANCE.get(case)
+    got = rec.get("covariance_status")
+    if want is None:
+        drift.append(f"no expected covariance status for case `{case}`")
+    elif got != want:
+        drift.append(f"covariance status is `{got}`, not `{want}`")
+    return drift
 
 
 def time_cmd() -> list[str]:
@@ -178,7 +210,7 @@ def run_case(ferx: str, case: str, timeout: int, rec: dict) -> None:
             peak_rss_bytes=peak,
             ofv=fit.get("ofv"),
             n_iterations=fit.get("n_iterations"),
-            covariance_status=json.dumps(fit.get("covariance_status"), sort_keys=True),
+            covariance_status=covariance_label(fit.get("covariance_status")),
             gradient_method_outer=fit.get("gradient_method_outer"),
             escalated=any(ESCALATION_CODE in w for w in warnings),
         )
@@ -225,7 +257,7 @@ def load(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def verdict(head: dict, base: dict | None, judged: bool) -> tuple[str, str, bool]:
+def verdict(case: str, head: dict, base: dict | None, judged: bool) -> tuple[str, str, bool]:
     """(glyph, note, failed) for one case. `judged` is False on a platform or input
     mismatch: the numbers are shown, never failed on."""
     if head.get("status") != "ok":
@@ -239,19 +271,16 @@ def verdict(head: dict, base: dict | None, judged: bool) -> tuple[str, str, bool
     ratio = peak / base["peak_rss_bytes"]
     if not math.isfinite(ratio):
         return "✗", "non-finite ratio", True
-    probe = []
-    if not head.get("escalated"):
-        probe.append("`auto` no longer escalates")
-    if head.get("gradient_method_outer") not in (None, "analytic"):
-        probe.append(f"outer gradient is `{head.get('gradient_method_outer')}`, not analytic")
+    probe = probe_drift(case, head)
     probe_note = ("; probe drifted: " + ", ".join(probe)) if probe else ""
     if not judged:
         return "·", "not judged (see above)" + probe_note, False
     if ratio > 1 + TOLERANCE:
         return "▲", f"regression: more than {TOLERANCE:.0%} above baseline" + probe_note, True
     if probe:
-        # A model that left the stiff / plan path measures something else; a lower peak
-        # from that is not a win, and a higher one is caught above regardless.
+        # A model that left the stiff / plan path, or a case whose covariance step did
+        # not run as expected, measures something else; a lower peak from that is not
+        # a win, and a higher one is caught above regardless.
         return "!", probe_note[2:], True
     if ratio < 1 - TOLERANCE:
         return "▼", (f"improvement: more than {TOLERANCE:.0%} below baseline — "
@@ -297,7 +326,7 @@ def cmd_report(a) -> int:
     for case in sorted(set(head.get("cases", {})) | set(bcases)):
         h = head.get("cases", {}).get(case, {"status": "missing", "error": "not run"})
         b = bcases.get(case)
-        glyph, note, bad = verdict(h, b, judged)
+        glyph, note, bad = verdict(case, h, b, judged)
         hp, bp = h.get("peak_rss_bytes"), (b or {}).get("peak_rss_bytes")
         delta = f"{hp / bp - 1:+.1%}" if isinstance(hp, int) and isinstance(bp, int) and bp else "—"
         wall = f"{h['wall_s']:.0f} s" if isinstance(h.get("wall_s"), (int, float)) else "—"
@@ -327,10 +356,10 @@ def cmd_accept(a) -> int:
     bad = [c for c, r in head.get("cases", {}).items() if r.get("status") != "ok"]
     if bad or not head.get("cases"):
         raise SystemExit(f"refusing to accept a run with failed or no cases: {bad}")
-    drift = [c for c, r in head["cases"].items() if not r.get("escalated")]
+    drift = {c: d for c, r in head["cases"].items() if (d := probe_drift(c, r))}
     if drift:
-        raise SystemExit(f"refusing to accept: {drift} did not escalate to a stiff stepper, "
-                         "so the probe is no longer measuring the shape it exists for")
+        raise SystemExit(f"refusing to accept: the probe drifted, so it is no longer "
+                         f"measuring the shape it exists for: {drift}")
     out = {
         "schema": SCHEMA,
         "platform": head["platform"],

@@ -64,7 +64,7 @@ measured. A baseline is only comparable at the thread count it was taken at.
 | `=` | within ±25 % of the baseline | passes |
 | `▲` | more than 25 % above the baseline | **fails** |
 | `▼` | more than 25 % below the baseline: lock it in with `accept` | passes |
-| `!` | the probe drifted: `auto` stopped escalating, or the outer gradient is no longer analytic | **fails** |
+| `!` | the probe drifted: `auto` stopped escalating, the outer gradient is no longer analytic, or a case's covariance status is not the expected one (`NotRequested` for `eval`, `Computed` for `fit`) | **fails** |
 | `✗` | the case failed, timed out, or was not run | **fails** |
 | `·` | not judged: another platform, thread count or input files than the baseline | passes |
 
@@ -72,7 +72,8 @@ The tolerance is `TOLERANCE` in `peakmem.py`. The regression this exists for
 was 10–40×, so the band only has to clear run-to-run noise.
 
 A drifted probe fails even when its peak is lower. If a change routes the model
-off the compiled plans, or stops the stiff escalation, the peak can drop for a
+off the compiled plans, stops the stiff escalation, or skips or breaks the `fit`
+case's covariance step (where e7070's post-fit spike lived), the peak can drop for a
 reason that has nothing to do with memory. That is a different measurement, not
 a win, and the probe has to be repaired before its numbers mean anything.
 
@@ -121,8 +122,8 @@ python3 tools/peak-memory/peakmem.py accept --results pm/results.json \
   --reason "#1234: plan logs checkpointed; eval 610 → 140 MB"
 ```
 
-`accept` refuses a run with a failed case, a run where `auto` did not escalate,
-and an empty reason. `tests/peak_memory_probe.rs` fails when the committed
+`accept` refuses a run with a failed case, a drifted probe (including a `fit`
+whose covariance step did not report `Computed`), and an empty reason. `tests/peak_memory_probe.rs` fails when the committed
 baseline's hashes do not match the committed model and data, or when it was not
 taken on Linux.
 

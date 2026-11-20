@@ -71,12 +71,18 @@ fn constant(name: &str) -> String {
 const MIB: u64 = 1 << 20;
 
 /// One case record as `run` writes it.
-fn case(peak: u64, escalated: bool, gradient: &str) -> String {
+/// `cov` is the `covariance_status` the record carries: `NOT_REQUESTED` is the `eval`
+/// case's expected value, `COMPUTED` the `fit` case's.
+fn case(peak: u64, escalated: bool, gradient: &str, cov: &str) -> String {
     format!(
         r#"{{"status": "ok", "peak_rss_bytes": {peak}, "wall_s": 70.0, "ofv": -1212.9,
-            "escalated": {escalated}, "gradient_method_outer": "{gradient}"}}"#
+            "escalated": {escalated}, "gradient_method_outer": "{gradient}",
+            "covariance_status": "{cov}"}}"#
     )
 }
+
+const NOT_REQUESTED: &str = "NotRequested";
+const COMPUTED: &str = "Computed";
 
 fn results(platform: &str, cases: &[(&str, String)]) -> String {
     let cs: Vec<String> = cases.iter().map(|(n, c)| format!(r#""{n}": {c}"#)).collect();
@@ -115,11 +121,11 @@ fn tolerance() -> f64 {
 
 /// Peak at `factor` × the 100 MB eval baseline.
 fn eval_at(factor: f64) -> String {
-    case((100.0 * factor * MIB as f64) as u64, true, "analytic")
+    case((100.0 * factor * MIB as f64) as u64, true, "analytic", NOT_REQUESTED)
 }
 
 fn fit_ok() -> String {
-    case(400 * MIB, true, "analytic")
+    case(400 * MIB, true, "analytic", COMPUTED)
 }
 
 // -------------------------------------------------------------------------------------
@@ -206,18 +212,64 @@ fn a_failed_or_missing_case_fails() {
 #[test]
 fn a_drifted_probe_fails_even_with_a_lower_peak() {
     let low = (100 * MIB) / 2;
-    let out = report("noescalate", "Linux/x86_64", case(low, false, "analytic"), fit_ok());
+    let out =
+        report("noescalate", "Linux/x86_64", case(low, false, "analytic", NOT_REQUESTED), fit_ok());
     let t = text(&out);
     assert!(!out.status.success(), "{t}");
     assert!(row(&t, "eval").contains("no longer escalates"), "{t}");
     assert!(!row(&t, "eval").contains("improvement"), "{t}");
 
-    let fd = report("fd", "Linux/x86_64", case(100 * MIB, true, "finite_difference"), fit_ok());
+    let fd = report(
+        "fd",
+        "Linux/x86_64",
+        case(100 * MIB, true, "finite_difference", NOT_REQUESTED),
+        fit_ok(),
+    );
     assert!(!fd.status.success(), "{}", text(&fd));
     assert!(row(&text(&fd), "eval").contains("not analytic"), "{}", text(&fd));
 
-    let ok = report("escalates", "Linux/x86_64", case(100 * MIB, true, "analytic"), fit_ok());
+    let ok = report(
+        "escalates",
+        "Linux/x86_64",
+        case(100 * MIB, true, "analytic", NOT_REQUESTED),
+        fit_ok(),
+    );
     assert!(ok.status.success(), "{}", text(&ok));
+}
+
+/// The `fit` case exists for the covariance step (e7070's post-fit spike). A fit whose
+/// step was skipped (`NotRequested`) or failed (anything but `Computed`) at a *lower*
+/// peak is drift, not an improvement — while its twin that reports `Computed` at the
+/// same peak is the ordinary `▼`. The mirror for `eval`: a covariance step that runs
+/// there is drift too. Each assertion names the case and the status it saw.
+#[test]
+fn a_fit_without_its_covariance_step_is_drift_not_an_improvement() {
+    let low = 400 * MIB / 2;
+    for status in [NOT_REQUESTED, "Failed"] {
+        let out = report(
+            &format!("nocov-{status}"),
+            "Linux/x86_64",
+            eval_at(1.0),
+            case(low, true, "analytic", status),
+        );
+        let t = text(&out);
+        assert!(!out.status.success(), "{status}: a fit without its covariance step passed:\n{t}");
+        let fit = row(&t, "fit");
+        assert!(fit.contains(&format!("covariance status is `{status}`, not `Computed`")), "{t}");
+        assert!(!fit.contains("improvement"), "{t}");
+        assert!(row(&t, "eval").contains("within tolerance"), "{t}");
+    }
+    let twin =
+        report("withcov", "Linux/x86_64", eval_at(1.0), case(low, true, "analytic", COMPUTED));
+    let t = text(&twin);
+    assert!(twin.status.success(), "{t}");
+    assert!(row(&t, "fit").contains("improvement"), "{t}");
+
+    let evalcov =
+        report("evalcov", "Linux/x86_64", case(100 * MIB, true, "analytic", COMPUTED), fit_ok());
+    let t = text(&evalcov);
+    assert!(!evalcov.status.success(), "{t}");
+    assert!(row(&t, "eval").contains("not `NotRequested`"), "{t}");
 }
 
 /// Changing the model or the data invalidates the baseline: shown, not judged, with the
@@ -253,10 +305,15 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
         return;
     }
     let dir = scratch("run");
-    let fit = r#"{"ofv": -1212.9, "n_iterations": 0, "covariance_status": "NotRequested",
-        "gradient_method_outer": "analytic", "n_threads_used": 4,
-        "warnings": ["W_ODE_SOLVER_ESCALATION_NOTE: ode_method = auto escalated 3000"]}"#;
-    let fit_path = write(&dir, "fit.json", fit);
+    let fit_json = |cov: &str| {
+        format!(
+            r#"{{"ofv": -1212.9, "n_iterations": 0, "covariance_status": "{cov}",
+            "gradient_method_outer": "analytic", "n_threads_used": 4,
+            "warnings": ["W_ODE_SOLVER_ESCALATION_NOTE: ode_method = auto escalated 3000"]}}"#
+        )
+    };
+    let eval_fit = write(&dir, "eval-fit.json", &fit_json(NOT_REQUESTED));
+    let fit_fit = write(&dir, "fit-fit.json", &fit_json(COMPUTED));
     // Allocates per case (eval small, fit large) so /usr/bin/time sees two different
     // peaks: python holding a bytearray of the given size.
     let fake = dir.join("ferx");
@@ -267,12 +324,12 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
              case \"$*\" in *'--threads 4'*) ;; *) echo 'no --threads 4' >&2; exit 8;; esac\n\
              case \"$*\" in *'--output-format json'*) ;; *) echo 'no json' >&2; exit 9;; esac\n\
              if grep -q '^  maxiter    = 0$' \"$1\" && grep -q '^  covariance = false$' \"$1\"; then\n\
-               mb=8\n\
+               mb=8; out='{eval_fit}'\n\
              elif grep -q '^  maxiter    = 1$' \"$1\" && grep -q '^  covariance = true$' \"$1\"; then\n\
-               mb=160\n\
+               mb=160; out='{fit_fit}'\n\
              else echo 'unexpected fit options' >&2; exit 7; fi\n\
              python3 -c \"import time; b = bytearray($mb << 20); b[::4096] = b'x' * len(b[::4096]); time.sleep(0.2)\"\n\
-             cp '{fit_path}' ./stiff_pkpd-fit.json\n"
+             cp \"$out\" ./stiff_pkpd-fit.json\n"
         ),
     )
     .unwrap();
@@ -287,6 +344,9 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
         assert_eq!(r["cases"][c]["status"], "ok", "{c}: {r}");
         assert_eq!(r["cases"][c]["escalated"], true, "{c}: {r}");
     }
+    // Recorded as the plain variant name, which is what `report` compares against.
+    assert_eq!(r["cases"]["eval"]["covariance_status"], NOT_REQUESTED, "{r}");
+    assert_eq!(r["cases"]["fit"]["covariance_status"], COMPUTED, "{r}");
     let eval = r["cases"]["eval"]["peak_rss_bytes"].as_u64().unwrap();
     let fit_peak = r["cases"]["fit"]["peak_rss_bytes"].as_u64().unwrap();
     // The fit case allocates 152 MiB more than the eval case.
@@ -320,7 +380,7 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
 }
 
 /// `accept` refuses what would make a meaningless baseline: no reason, a failed case,
-/// or a run where `auto` did not escalate.
+/// a run where `auto` did not escalate, or a fit whose covariance step did not run.
 #[test]
 fn accept_refuses_a_failed_or_drifted_run() {
     let dir = scratch("accept");
@@ -344,9 +404,16 @@ fn accept_refuses_a_failed_or_drifted_run() {
         &[("eval", r#"{"status": "failed", "error": "x"}"#.to_string()), ("fit", fit_ok())],
     );
     assert!(!try_accept("failed.json", failed, "r").status.success());
-    let drift =
-        results("Linux/x86_64", &[("eval", case(MIB, false, "analytic")), ("fit", fit_ok())]);
+    let drift = results(
+        "Linux/x86_64",
+        &[("eval", case(MIB, false, "analytic", NOT_REQUESTED)), ("fit", fit_ok())],
+    );
     assert!(!try_accept("drift.json", drift, "r").status.success());
+    let nocov = results(
+        "Linux/x86_64",
+        &[("eval", eval_at(1.0)), ("fit", case(400 * MIB, true, "analytic", NOT_REQUESTED))],
+    );
+    assert!(!try_accept("nocov.json", nocov, "r").status.success());
     assert!(!base.exists(), "a refused accept must not write the baseline");
     let ok = try_accept("good.json", good, "r");
     assert!(ok.status.success(), "{}", text(&ok));
