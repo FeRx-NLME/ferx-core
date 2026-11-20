@@ -893,13 +893,18 @@ fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
     (if lo > 0.0 { kl.max(1.0) } else { kl }, snapped_integer(qh).unwrap_or_else(|| qh.floor()))
 }
 
-/// How far, in units of `ε·|q|` (at least one ulp of `q`), the quotient `q = x / s` may miss
-/// a tie `k + 0.5` and still count as one (#2927). Measured on a sweep of 22 decimal steps
-/// (0.1, 0.25, 0.05, 1e-3, 1e-6, 1e-9, 2.5, 250, ...): a tie written as a decimal
-/// (`0.35 / 0.1 = 3.4999999999999996`) misses by at most 1 ulp of `q`, a tie reached by a
-/// percent step (`d · (1 ± p/100)`, 19 percentages, 7.1 million ties) by at most 3 ulps
-/// (`s = 0.0001`, `decrease 33%` from 2.405); an exact multiple misses `k` by at most 1 ulp.
-/// 8 is 2.7× the worst tie.
+/// How far, in units of `ε·|q|` (one to two ulps of `q`), the quotient `q = x / s` may miss
+/// a tie `k + 0.5` and still count as one (#2927). Measured on sweeps of 22 to 26 decimal
+/// steps (0.1, 0.25, 0.05, 1e-3, 1e-4, 1e-6, 1e-9, 2.5, 250, ...): a tie written as a decimal
+/// (`0.35 / 0.1 = 3.4999999999999996`) misses by at most 1 `ε·|q|`, and an exact multiple
+/// misses `k` by at most 1. A tie reached by a percent step (`d · (1 ± p/100)`, every integer
+/// `p` from 1 to 99 plus 0.001 to 33.3) misses by at most 4.41 on 11.8 million ties and 4.45
+/// on the review's 3.4 million, which sample larger indices; the worst come from a large
+/// decrease, where `1 − p/100` cancels: `decrease 93%` from 28.65 at `s = 0.001` is
+/// `2.0054999999999983`, 8 ulps (4.08 `ε·|q|`) short of `2.0055` (review r1 of #3106; the
+/// first sweep had no `p` above 75 and reported 3). 8 is 1.8× the worst. A decrease of more
+/// than about 95% at a non-integer `p` misses by more, without bound as `p → 100`: `p`'s own
+/// decimal error grows through the cancellation, so no constant here covers it.
 const TIE_ULPS: f64 = 8.0;
 
 /// `x` rounded to the nearest multiple of `s`, ties up. `x / s` misses a tie by a few ulps
@@ -911,6 +916,10 @@ const TIE_ULPS: f64 = 8.0;
 /// and from `q ≈ 3.4e14` (measured, the first decimal tie lost on the sweep) a tie that
 /// misses can go down: there a few ulps are a sizeable part of a step, and a missed tie and
 /// a multiple can no longer both be told apart. The floor at 0 keeps an exact tie going up.
+///
+/// A tie reached by a decrease of more than about 95% at a non-integer percentage can miss by
+/// more than the tolerance and go down ([`TIE_ULPS`]): `decrease 96.2%` from 250 at
+/// `round_to = 1` gives `9.49999999999998`, placed at 9.
 pub(crate) fn round_to_grid(x: f64, s: f64) -> f64 {
     let q = x / s;
     // Exact: `k <= q < k + 1 <= 2k` (Sterbenz) for `k >= 1`, and `q - 0` for `k = 0`.
@@ -1827,11 +1836,14 @@ mod tests {
     /// around `5e8`, and the largest where `k · s` is exact (`2^53` at `s = 1` and
     /// `s = 0.25`, `floor(2^53 / 125)` at `s = 250`). A decimal step is never exact; its
     /// multiples are checked up to `1e15`, where `x / s` still rounds to `k`, which is asserted
-    /// first. An exact tie keeps going up where it is representable (`2^52 − 0.5` at `s = 1`),
-    /// past the index where the cap takes the tolerance to 0.
+    /// first, and at `s = 1e-6` also at `2^50 + 2`, where `q` is one ulp (0.25) above `k`: the
+    /// cap has taken the tolerance to 0 there, so the threshold is the half itself. An exact
+    /// tie keeps going up where it is representable (`2^52 − 0.5` at `s = 1`), past the index
+    /// where the cap takes the tolerance to 0.
     ///
     /// Mutations: the old nudge moves `5e8` at every step; the cap at the half
-    /// (`w.min(0.5)`) moves every multiple from `q ≈ 2.8e14`, so `2^53`; the tolerance
+    /// (`w.min(0.5)`) moves every multiple from `q ≈ 2.8e14`, so `2^53`; a constant cap
+    /// (`w.min(0.25)`) moves the multiple at `2^50 + 2` (review r1 of #3106); the tolerance
     /// without its floor at 0 sends the exact tie at `2^51 + 0.5` down.
     #[test]
     fn a_dose_on_the_grid_is_a_fixed_point_of_place_at_every_index() {
@@ -1857,6 +1869,10 @@ mod tests {
                 assert_eq!(open(s).place(placed).to_bits(), x.to_bits(), "s = {s}, k = {k}");
             }
         }
+        let k = 2f64.powi(50) + 2.0;
+        let x = grid_point(k, 1e-6);
+        assert_eq!(x / 1e-6 - k, 0.25, "premise: q is one ulp above k = {k}");
+        assert_eq!(open(1e-6).place(x).to_bits(), x.to_bits(), "s = 1e-6, k = {k}");
         for k in [5e8, 2f64.powi(49), 2f64.powi(51), TWO_53 / 2.0 - 1.0] {
             let tie = k + 0.5;
             assert_eq!(tie - k, 0.5, "premise: {tie} is an exact tie");
@@ -1864,17 +1880,20 @@ mod tests {
         }
     }
 
-    /// A tie reached by a percent step goes up though `q` misses it by 3 ulps: the worst of
-    /// the sweep behind [`TIE_ULPS`] (#2927), `decrease 33%` from 2.405 at `s = 0.0001`, is
-    /// `1.6113499999999996`, `q = 16113.499999999995`. Just below a tie by more than the
-    /// tolerance still goes down.
+    /// A tie reached by a percent step goes up though `q` misses it: `decrease 33%` from 2.405
+    /// at `s = 0.0001` is `1.6113499999999996`, 3 ulps short of 16113.5, and `decrease 93%`
+    /// from 28.65 at `s = 0.001` is `2.0054999999999983`, 8 ulps (4.08 `ε·|q|`) short of
+    /// 2005.5, the large-decrease case behind [`TIE_ULPS`] (#2927, review r1 of #3106). Just
+    /// below a tie by more than the tolerance still goes down. Past the tolerance, the
+    /// documented limit: `decrease 96.2%` from 250 at `s = 1` (`9.49999999999998`, a tie in
+    /// decimal) goes down to 9.
     ///
-    /// Mutations: `TIE_ULPS` at 1 sends it down (here `ε · |q|` is 1.97 ulps of `q`, so 2
-    /// still covers the 3; at 2 only the 1e-6% start in
-    /// `lowest_raised_by_is_the_first_multiple_the_step_moves` moves); at 0 the decimal tie
-    /// goes down too (`round_to_grid_sends_ties_up_on_a_decimal_grid`).
+    /// Mutations: `TIE_ULPS` at 4 sends the 93% tie down (this test; before the review only
+    /// the 1e-6% start in `lowest_raised_by_is_the_first_multiple_the_step_moves` died); at 1
+    /// also the 33% tie; at 0 the decimal tie goes down too
+    /// (`round_to_grid_sends_ties_up_on_a_decimal_grid`).
     #[test]
-    fn a_percent_step_tie_three_ulps_short_goes_up() {
+    fn a_percent_step_tie_short_by_the_measured_miss_goes_up() {
         let x = percent_step(2.405, 33.0, false);
         assert_eq!(x, 1.6113499999999996, "premise: the step misses the tie");
         let q = x / 0.0001;
@@ -1883,6 +1902,18 @@ mod tests {
         assert!((round_to_grid(x, 0.0001) - 1.6114).abs() < 1e-15, "{}", round_to_grid(x, 0.0001));
         // 1e-4 of a step short (8e7 ulps of `q`) is not a tie.
         assert!((round_to_grid(1.61134999, 0.0001) - 1.6113).abs() < 1e-15);
+
+        let open = DoseGrid { step: 0.001, low: 0.0, high: f64::INFINITY };
+        let x = percent_step(28.65, 93.0, false);
+        assert_eq!(x, 2.0054999999999983, "premise: the 93% step misses the tie");
+        let q = x / 0.001;
+        let ulps = (2005.5 - q) / (q.next_up() - q);
+        assert!((7.5..=8.0).contains(&ulps), "premise: 8 ulps short, got {ulps}");
+        assert_eq!(open.place(x).to_bits(), 2.006f64.to_bits(), "{}", open.place(x));
+
+        let x = percent_step(250.0, 96.2, false);
+        assert_eq!(x, 9.49999999999998, "premise: the 96.2% step misses the tie by 2e-14");
+        assert_eq!(round_to_grid(x, 1.0).to_bits(), 9.0f64.to_bits(), "the documented limit");
     }
 
     /// A step that divides 1 gives the decimal multiple, not `k * s`: `7 * 0.1` is
@@ -2063,9 +2094,13 @@ mod tests {
     ///
     /// Small percentages (#2890 review r1 rows 1 and 2, #2927). At `s = 1`, 0.003% starts
     /// at 16667 and 0.001% at 50000, a half step exactly (the relative nudge before #2927
-    /// gave 49996). 1e-6% starts at 49999992, not 50000000: `49999999 · (1 + 1e-8)` misses
-    /// the half by 1e-8, 1.3 ulps of `q`, which is inside the tie tolerance (percent-step ties
-    /// miss by up to 3 ulps, [`TIE_ULPS`]); the old nudge gave 45454546. `1e-310%` raises
+    /// gave 49996). 1e-6% starts at 49999992, not 50000000 (the old nudge gave 45454546).
+    /// There the step misses the half by 8.2e-8, 7.4 `ε·|q|`, inside the tolerance of 8; at
+    /// 49999991 it misses by 8.05 and is not raised. Only 49999999 (1.34 `ε·|q|`) is within
+    /// the measured tie miss (4.45, [`TIE_ULPS`]) and so cannot be told from a tie; 49999992 to
+    /// 49999998 are raised by the tolerance's headroom over that miss (review r1 of #3106).
+    /// Exactly 50000000 would need a tolerance under 1 `ε·|q|`, which sends the measured
+    /// percent-step ties down. `1e-310%` raises
     /// nothing up to index 2^52, since `1 + 1e-312` is 1 (the old nudge raised every
     /// multiple from `5e8` up, so it returned there), and it must return: `50 / p` is
     /// infinite.
