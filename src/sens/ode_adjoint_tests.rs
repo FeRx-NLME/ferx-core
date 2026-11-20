@@ -1087,9 +1087,11 @@ const ODE_MOVING_JUMP_SWITCH: &str = r#"
 /// 4.0000000001, where central FD averages two one-sided slopes.
 fn moving_jump_fixture(ct: f64) -> (CompiledModel, Subject) {
     let src = ODE_MOVING_JUMP_SWITCH.replace("TVCT(3.0,", &format!("TVCT({ct},"));
-    // At reltol 1e-12: the oracle's gap measured 5.9e-4, 1.9e-5 and 3.2e-7 at reltol 1e-8,
-    // 1e-10 and 1e-12, the integrator's error, falling with its tolerance to the FD floor.
-    let model = with_tol(parse_model_string(&src).unwrap(), 1e-12, 1e-14);
+    // At reltol 1e-13: the oracle's gap measured 5.9e-4, 1.9e-5 and 3.2e-7 at reltol 1e-8,
+    // 1e-10 and 1e-12 (Linux), the integrator's error, falling with its tolerance to the FD
+    // floor. At 1e-12 it is 1.1e-6 on macOS arm64; 3.4e-8 at 1e-13, 2.4e-8 at 1e-14, the
+    // adjoint the same to 11 digits at each (#3043).
+    let model = with_tol(parse_model_string(&src).unwrap(), 1e-13, 1e-15);
     let s = subject(
         &model,
         vec![
@@ -1134,7 +1136,7 @@ fn ode_jumping_moving_switch_on_an_observed_state_matches_reconverged_fd() {
     assert!(in_scope(&model, &s), "the exact gradient must serve it");
     let worst = fd_oracle(&model, &s, true);
     eprintln!("jumping switch, crossing: worst {worst:.3e}");
-    // Measured 1.2e-7 on Linux x86_64, at the Richardson floor; about 8× headroom. Mutations:
+    // Measured 3.4e-8 on macOS arm64 (1.2e-7 on Linux x86_64 at reltol 1e-12). Mutations:
     // no jump 2.9e2, no event location 1.15, one chord step 3.1e-3, the forced arm dropped from
     // the locating steps 1.7e-4.
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
@@ -1143,7 +1145,7 @@ fn ode_jumping_moving_switch_on_an_observed_state_matches_reconverged_fd() {
     assert_eq!(threshold_crossings(&control, &cs), 0, "the control crosses");
     let worst = fd_oracle(&control, &cs, true);
     eprintln!("jumping switch, control: worst {worst:.3e}");
-    // Measured 1.5e-8.
+    // Measured 1.1e-8 (macOS arm64).
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
 }
 
