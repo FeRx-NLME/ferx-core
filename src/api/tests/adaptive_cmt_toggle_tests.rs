@@ -576,11 +576,15 @@ fn adaptive_dead_lagged_dose_does_not_turn_its_compartment_on() {
 /// feeds, an on and an off compartment read the same 0, so the gate could not be seen.)
 ///
 /// A lagged infusion into `urine` (10 at rate 20) is recorded at 1 (ALAG3 = 4, so it would run
-/// from 5 to 5.5); the `EVID=3` row at 2 kills it; `urine` goes off at 3. A monitor at 6 reads
-/// 0. The straddle: the same subject with an on row at the arrival (5) reads what a turn-on
-/// there gives, elimination from 5 to 6, and is asserted well away from 0, so the fixture can
-/// tell on from off. The on row is added beside the dead infusion, not instead of it, so the
-/// two runs share every break.
+/// from 5 to 5.5); `urine` goes off at 3. It is dead twice: recorded before the `EVID=3` reset
+/// at 2, and still pending at the off row at 3 (`off_at`). Deleting either conjunct of
+/// `ResetGate::live` leaves it dead, so this pins the arrival gate's call, not which conjunct
+/// (the geometry cannot split them: a reset turns `urine` back on, so the off row has to come
+/// after it and before the arrival). A monitor at 6 reads 0. The straddle: the same subject
+/// with an on row at the arrival (5) reads what a turn-on there gives, elimination from 5 to 6,
+/// and is asserted well away from 0 and below the infusion's 10, so the fixture can tell on
+/// from off and a turn-on from a delivered infusion. The on row is added beside the dead
+/// infusion, not instead of it, so the two runs share every break.
 ///
 /// The infusion ends at 1.5, before the reset. One still running at 2 would make the reader
 /// shift the reset past its end (`RESET_SEGMENT_GAP`), and with it every later row: the
@@ -588,13 +592,17 @@ fn adaptive_dead_lagged_dose_does_not_turn_its_compartment_on() {
 /// the gate does. The premise is asserted.
 ///
 /// The live side is asserted too: recorded after the off row, the same infusion turns `urine`
-/// on at its arrival and its 10 lands there. No other test reaches an infusion's turn-on
+/// on at its arrival (7.5), not at its record (3.5), and its 10 lands there. `urine` is a sink,
+/// so the reading is elimination from 7.5 (an on-row twin without the infusion) plus exactly
+/// 10; a turn-on at the record reads 42.5 instead. No other test reaches an infusion's turn-on
 /// (measured below).
 ///
 /// Mutations measured: `gate.live` forced true in `apply_prescheduled_boluses_at` reads the
-/// twin's value at the dead arrival (bit for bit), so this test dies; the rate gate in
-/// `active_infusions` forced true alone leaves it green (`urine` is still off and held at 0),
-/// so it isolates the turn-on, not the rate; no turn-on for an infusion in
+/// twin's value at the dead arrival (bit for bit), so this test dies at the monitor; the rate
+/// gate in `active_infusions` forced true alone leaves the monitor at 0 (`urine` is still off
+/// and held there), so that assertion isolates the turn-on, not the rate, and the mutation dies
+/// at the twin's upper bound instead (it delivers the dead 10 once `urine` is on, 14.08); no
+/// turn-on for an infusion in
 /// `turn_on_at_live_arrival` kills the live side here and no other test in `--lib`.
 #[test]
 fn adaptive_dead_lagged_infusion_does_not_turn_its_compartment_on() {
@@ -636,30 +644,44 @@ fn adaptive_dead_lagged_infusion_does_not_turn_its_compartment_on() {
     assert_eq!(u, 0.0, "urine stays off: the dead infusion's arrival at 5 turns nothing on");
 
     let (turned_on, _) = monitor_at_6(&rows(true));
-    // Measured on macOS arm64: 4.0822. A wrongly turned-on `urine` reads this value.
-    assert!(turned_on.is_finite() && turned_on > 1.0, "the straddle: a turn-on at 5, {turned_on}");
+    // Measured on macOS arm64: 4.0822. A wrongly turned-on `urine` reads this value. Below 10:
+    // the dead infusion's 10 must not reach an on `urine` either (its rate gate).
+    assert!(
+        turned_on.is_finite() && turned_on > 1.0 && turned_on < 10.0,
+        "the straddle: a turn-on at 5 and no dead infusion mass, {turned_on}"
+    );
 
     // The live side: the same infusion recorded after the off row (at 3.5; one recorded
     // before it, still pending at 3, is killed by that row) turns `urine` on at its arrival
-    // (7.5) and delivers its 10 there by 8, so a monitor at 8 reads more than the infusion
-    // (measured on macOS arm64: 13.906).
-    let live_rows = [
-        bolus(0.0, 100.0, 1),
-        bolus(2.5, 100.0, 1),
-        off(3.0, 3),
-        (3.5, 1, 10.0, 3, 20.0),
-        obs(4.0, 2),
-        obs(8.0, 2),
-    ];
-    let (live, _) = monitor_at(8.0, &live_rows);
-    assert!(live.is_finite() && live > 10.0, "a live infusion turns urine on at 7.5: {live}");
+    // (7.5) and delivers its 10 there by 8. Its reference: an on row at 7.5 and no infusion,
+    // elimination alone. `urine` is a sink, so the two differ by exactly the 10.
+    let live_rows = |infusion: bool| {
+        let mut r = vec![bolus(0.0, 100.0, 1), bolus(2.5, 100.0, 1), off(3.0, 3)];
+        r.push(if infusion { (3.5, 1, 10.0, 3, 20.0) } else { on(7.5, 3) });
+        r.extend([obs(4.0, 2), obs(8.0, 2)]);
+        r.sort_by(|a, b| a.0.total_cmp(&b.0));
+        r
+    };
+    let (live, _) = monitor_at(8.0, &live_rows(true));
+    let (elimination, _) = monitor_at(8.0, &live_rows(false));
+    let delivered = live - elimination;
+    // Measured on macOS arm64: live 13.906, elimination 3.906, a gap of 3.6e-15 from 10 (the
+    // two runs share every break). 1e-9 is 3e5× that; a turn-on at the record (3.5) adds the
+    // elimination from 3.5 to 7.5, +28.6.
+    assert!(
+        elimination.is_finite() && elimination > 1.0 && (delivered - 10.0).abs() < 1e-9,
+        "a live infusion turns urine on at its arrival (7.5): {live} = {elimination} + {delivered}"
+    );
 
     // `central` against `predict()`, with the band of the bolus twin above (same lagged,
     // saturating geometry).
     let want = static_preds(&m, &base, &res);
     let got = ipreds(&res);
     let worst = worst_rel(&got, &want);
-    eprintln!("dead lagged infusion: on-twin {turned_on:?}, live {live:?}, worst rel {worst:e}");
+    eprintln!(
+        "dead lagged infusion: on-twin {turned_on:?}, live {live:?}, delivered {delivered:?}, \
+         worst rel {worst:e}"
+    );
     assert!(worst < 1e-4, "worst rel {worst:e}: {got:?} vs {want:?}");
 }
 
