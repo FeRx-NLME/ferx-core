@@ -1120,7 +1120,13 @@ fn no_library_code_re_raises_a_precondition_err_as_a_panic() {
         // Stop at an inline `mod tests {` — test code may unwrap freely.
         for (n, line) in text
             .lines()
-            .take_while(|l| !(l.starts_with("mod ") && l.contains("test") && l.ends_with('{')))
+            .take_while(|l| {
+                !(l.trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ")
+                    .starts_with("mod ")
+                    && l.contains("test")
+                    && l.ends_with('{'))
+            })
             .enumerate()
         {
             let code = line.trim_start();

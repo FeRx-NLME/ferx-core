@@ -869,7 +869,9 @@ fn every_published_convergence_verdict_is_gated_on_its_objective() {
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
+    // Both engine trees: half the engine lives in `crates/ferx-model` since #3041.
     rust_sources(&root.join("src"), &mut files);
+    rust_sources(&root.join("crates/ferx-model/src"), &mut files);
     files.sort();
     assert!(
         files.len() > 100,
@@ -899,7 +901,11 @@ fn every_published_convergence_verdict_is_gated_on_its_objective() {
         let lines: Vec<&str> = text.lines().collect();
         let end = lines
             .iter()
-            .position(|l| l.starts_with("mod ") && l.contains("test") && l.ends_with('{'))
+            .position(|l| {
+                l.trim_start_matches("pub(crate) ").trim_start_matches("pub ").starts_with("mod ")
+                    && l.contains("test")
+                    && l.ends_with('{')
+            })
             .unwrap_or(lines.len());
         let lines = &lines[..end];
 
