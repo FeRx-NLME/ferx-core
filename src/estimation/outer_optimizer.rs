@@ -3665,6 +3665,47 @@ fn perturbed_start(x: &[f64], fixed: &[bool], lower: &[f64], upper: &[f64]) -> O
 /// attempt, not by the attempt itself.
 type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) + 'a;
 
+/// Whose chain a restart leg is on (#2707): the fit's, which is handed the start probe and
+/// announces its restart, or a start probe's own, which neither probes nor announces.
+enum RestartLegOwner<'a> {
+    Fit(&'a StartProbe<'a>),
+    Probe { spent_before: usize },
+}
+
+/// When an NLopt attempt hands its unmoved start to the #2506 [`StartProbe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeWhen {
+    /// Whenever the attempt did not leave its start: the first attempt, whose start is the
+    /// user's, and may be a warm start at an optimum as well as a #751 stall.
+    Unmoved,
+    /// Only when not leaving its start is the one thing that keeps the attempt from being
+    /// reported converged (#2707): a `Failure`-class or verified stop that its acceptance
+    /// rule takes with displacement and rejects without it, with no basin shift to restart
+    /// on. A #1277 / #1565 restart leg. It starts at the previous leg's estimates, so a
+    /// basin-shift restart whose gain is the EBE modes a cold re-solve found, not a step in
+    /// θ, does not leave *its* start, and without the probe was reported unconverged however
+    /// sound its stop. A restart that is converged, or rejected on any other ground, costs
+    /// no probe.
+    DisplacementAloneRejects,
+}
+
+/// Does an attempt that did not leave its start hand it to the probe, under `when`?
+/// `decided_here` is whether the attempt's `converged` is decided by its own acceptance rule
+/// (a `Failure`-class, latched or verified stop), `accepted(left)` that rule as a function
+/// of displacement, and `basin_shift` whether the cold re-solve beat the best seen (#1565),
+/// which restarts the leg instead. Pure, so each condition of the restart gate (#2707) is
+/// testable without a fit.
+fn start_probe_due(
+    when: ProbeWhen, decided_here: bool, accepted: impl Fn(bool) -> bool, basin_shift: bool,
+) -> bool {
+    match when {
+        ProbeWhen::Unmoved => true,
+        ProbeWhen::DisplacementAloneRejects => {
+            decided_here && !accepted(false) && accepted(true) && !basin_shift
+        }
+    }
+}
+
 /// What [`optimize_nlopt`] carries out of its first attempt once the start probe (#2506)
 /// answered: the attempt to report, its restart cause, and whether to skip the #751 stall
 /// retry ([`resolve_stall_retry`]).
@@ -3692,8 +3733,9 @@ fn settle_start_probe(
             ((first, first_cause), first_left_init)
         }
         Some((found, found_cause, Some(true))) => {
-            let left = found.left_init != Some(false);
             let start_wins = penalized(&first) <= penalized(&found);
+            // A start that wins is the user's own, never left.
+            let left = found.left_init != Some(false) && !start_wins;
             ((verified_start_result(found, left, first, start_wins), found_cause), true)
         }
         Some((spent, _, None)) => {
@@ -3704,20 +3746,101 @@ fn settle_start_probe(
     }
 }
 
-/// The result for a start the probe verified (#2506): the probe's `converged` and warnings
-/// at the **lower** of the two points. `start_wins` says the unmoved run's penalized
-/// objective is at or below the probe's (the probe's `ftol` can end ~1e-3 above an optimal
-/// start, `two_cpt_iv`), and a fit must not publish a point worse than one it already
-/// evaluated. When `start_wins`, everything tied to the point (estimates, objective, EBEs,
-/// covariance, final gradient) is the unmoved run's. `left`: whether the estimates moved by
-/// [`INIT_ESCAPE_STEP_S`] (never, when the start wins); if not, published
-/// `left_init = Some(false)`, `stationary_start = true` (a warm start for
-/// `model_selection::stalled_at_init`). The unmoved run's evaluations count and its
-/// `start_eval` is published (#2461).
+/// What a restart leg reports once its start probe (#2707, [`ProbeWhen::DisplacementAloneRejects`])
+/// has answered, with the restart cause to carry on and whether the reported point is the
+/// probe's (for the restart's warning, which names where the estimates come from).
+///
+/// - `Some(true)` — the probe's result, through [`verified_start_result`] as for the first
+///   attempt ([`settle_start_probe`]): the restart's point is an optimum an independent run
+///   came back to, and the probe's own verdict, warnings and restart cause stand, at the
+///   restart's point when that is at or below the probe's. One difference: the published
+///   `left_init` is the reported point's own, measured from the user's start, and
+///   `stationary_start` its negation, whichever point wins.
+/// - `Some(false)` — the probe's result as it is, verdict, warnings and displacement its own:
+///   the probe ended more than [`START_PROBE_TOL`] below the restart, so the restart was not
+///   finished and the probe's is the better fit. Unlike the first attempt's (#2506), this is
+///   no stall to keep flagged: the restart's start is the previous leg's estimates, not the
+///   user's, and a fit does not publish a point worse than one it already reached.
+/// - `None` — the restart, unconverged as its own rule left it. A probe the budget cut before
+///   its verdict hands on the spent budget and its advice.
+///
+/// Every probe's evaluations count in `n_iterations`, whichever result is kept. No probe ran
+/// (`probed` is `None`) unless the restart did not leave its start and displacement was all
+/// its acceptance rule rejected it on. Returns the result, the restart cause, whether the
+/// reported point is the probe's, and whether the probe verified the point (`Some(true)`),
+/// which lets a mid-descent restart that ties its stalled leg be adopted.
+fn settle_restart_probe(
+    restarted: (OuterResult, Option<RestartCause>), probed: Option<ProbedAttempt>,
+    penalized: impl Fn(&OuterResult) -> f64,
+) -> (OuterResult, Option<RestartCause>, bool, bool) {
+    let (mut restarted, cause) = restarted;
+    match probed {
+        Some((found, found_cause, Some(true))) => {
+            let start_wins = penalized(&restarted) <= penalized(&found);
+            // The displacement published is the reported point's own, from the user's start
+            // (both legs measure it against `escape_from`): a restart's start is the previous
+            // leg's estimates, so a restart whose point wins is not, as on the first attempt,
+            // a start the fit never left.
+            let left = if start_wins { &restarted } else { &found }.left_init != Some(false);
+            (
+                verified_start_result(found, left, restarted, start_wins),
+                found_cause,
+                !start_wins,
+                true,
+            )
+        }
+        Some((mut found, found_cause, Some(false))) => {
+            found.start_eval = restarted.start_eval;
+            found.n_iterations += restarted.n_iterations;
+            (found, found_cause, true, false)
+        }
+        Some((spent, _, None)) => {
+            restarted.n_iterations += spent.n_iterations;
+            // A probe cut by the budget before its verdict spent the rest of this fit's: the
+            // restart's own leg stopped short of it, so the spent budget and the advice the
+            // probe was given are the fit's (#2821 review r1).
+            if spent.eval_budget_spent && !restarted.eval_budget_spent {
+                restarted.eval_budget_spent = true;
+                restarted.warnings.extend(
+                    spent.warnings.into_iter().filter(|w| w.starts_with(EVAL_BUDGET_WARNING_HEAD)),
+                );
+            }
+            (restarted, cause, false, false)
+        }
+        None => (restarted, cause, false, false),
+    }
+}
+
+/// The opening of [`eval_budget_warning`], which a result's warnings are matched on.
+const EVAL_BUDGET_WARNING_HEAD: &str = "Outer optimization hit the evaluation budget";
+
+/// The warning an NLopt run that spent its evaluation budget unconverged carries.
+fn eval_budget_warning(outer_maxiter: usize) -> String {
+    format!(
+        "{EVAL_BUDGET_WARNING_HEAD} (maxiter = {outer_maxiter}) before converging; increase \
+         maxiter for a tighter fit."
+    )
+}
+
+/// The result reported for a start the probe verified (#2506): the probe's `converged`
+/// verdict and warnings, as the probe produced them, at the **lower** of the two points.
+/// `start_wins` says the unmoved run's penalized objective is at or below the probe's;
+/// the probe stops on its own `ftol`, which on an OFV near 1000 lets it end ~1e-3 above
+/// a start that was already the optimum (measured on `two_cpt_iv`, Linux), and a fit
+/// must not publish a point worse than one it already evaluated. When the start wins,
+/// everything tied to the point — estimates, objective, EBEs, covariance, final gradient
+/// — is the unmoved run's. `left` is whether the **reported** estimates are off the user's
+/// start by [`INIT_ESCAPE_STEP_S`], decided by the caller for the point that wins: on the
+/// first attempt the start that wins is the user's own, so never; on a restart leg it is the
+/// previous leg's estimates, so the restart's own displacement ([`settle_restart_probe`]).
+/// Within it the result is published `left_init = Some(false)` with
+/// `stationary_start = true`, which `model_selection::stalled_at_init` reads as a warm
+/// start rather than a stall. The
+/// unmoved run's evaluations count in `n_iterations`, and its `start_eval` — the fit's
+/// first evaluation, at the user's start — is the one published (#2461).
 fn verified_start_result(
     mut probe: OuterResult, left: bool, unmoved: OuterResult, start_wins: bool,
 ) -> OuterResult {
-    let left = left && !start_wins;
     probe.start_eval = unmoved.start_eval;
     probe.left_init = Some(left);
     probe.stationary_start = !left;
@@ -3838,8 +3961,9 @@ pub(crate) fn verify_unmoved_start(
             stalled
         }
         Some(true) => {
-            let left = off_start(&probe);
-            verified_start_result(probe, left, result, start_ofv <= probe_ofv)
+            let start_wins = start_ofv <= probe_ofv;
+            let left = off_start(&probe) && !start_wins;
+            verified_start_result(probe, left, result, start_wins)
         }
         None => OuterResult { n_iterations: result.n_iterations + probe.n_iterations, ..result },
     }
@@ -4594,50 +4718,154 @@ pub(crate) fn optimize_nlopt(
             first_eval_etas,
             identity_scales,
             true,
-            probe,
+            probe.map(|p| (p, ProbeWhen::Unmoved)),
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
     // #2506: a first attempt that never leaves its start is probed — restarted from a
     // perturbation of that start, on what is left of the budget — to tell a warm start at
     // an optimum from a #751 stall. The probe's result is held here, so a probe that found
-    // a lower objective can be reported in place of the stall.
-    let probed = std::cell::RefCell::new(None);
-    let probe = |start: &ModelParameters, start_ofv: f64, spent_evals: usize| {
-        // Its covariance step is deferred like every attempt's: `optimize_nlopt` runs it
-        // once, on the attempt it reports. `start_eval` is the unmoved attempt's, set by
-        // `verified_start_result` if the probe is reported.
-        let (result, outcome) = optimize_nlopt_attempt(
+    // a lower objective can be reported in place of the stall. Each restart leg below hands
+    // it the same way when displacement alone rejects the leg (#2707); every leg takes what
+    // its own call left, so a result never reaches the wrong leg.
+    let probed: std::cell::RefCell<Option<ProbedAttempt>> = std::cell::RefCell::new(None);
+    // One #1277 / #1565 restart leg, from `stalled`'s estimates: run, settled against its
+    // start probe when it was handed one (#2707), with the legs' evaluations summed and the
+    // restart's warning pushed. `owner` says whose chain the leg is on. The fit's own leg is
+    // handed the probe and announces its restart. A probe's own leg never probes, and does
+    // not announce: a verified probe's warnings are reported as the fit's
+    // (`verified_start_result`), and a notice that a run the user never asked for "was
+    // resumed" — with that run's evaluation counts — describes nothing they fitted. Its
+    // `spent_before` is what was spent before the probe began, which `stalled`'s own
+    // `n_iterations` does not count; on the fit's chain every leg already counts the ones
+    // before it.
+    let restart_leg = |stalled: &OuterResult, cause: RestartCause, owner: RestartLegOwner| {
+        let (spent_before, probe) = match owner {
+            RestartLegOwner::Fit(probe) => (0, Some(probe)),
+            RestartLegOwner::Probe { spent_before } => (spent_before, None),
+        };
+        let announce = probe.is_some();
+        // `escape_from = init_params`, not the point this leg starts at. The
+        // restart begins at the stalled estimates, so measuring the published
+        // escape verdict against *its own* start would report a fit that
+        // recovered thousands of OFV units as having never moved whenever the
+        // restart's own step is small — and `model_selection::stalled_at_init`
+        // prefers that flag over its `theta_init` comparison, so the recovered
+        // fit would carry `W_STALLED_AT_INIT` and be thrown out by the default
+        // `Strictness::reject_init_stall`. The question the published flag
+        // answers is "are the reported estimates still on top of the values the
+        // user supplied", and that reference does not move when the optimizer
+        // is restarted (#1277 review).
+        //
+        // The leg's own stop rules keep measuring displacement from its own start, so
+        // one that cannot leave the stalled point is still caught. Where that is all
+        // that rejects it, the #2506 probe settles it instead (#2707): a basin-shift
+        // restart's gain is mostly the EBE modes the cold re-solve found, not a θ step.
+        let mut leg = RestartLeg::continuing(init_params, stalled);
+        leg.spent_evals += spent_before;
+        let (restarted, restarted_outcome) = optimize_nlopt_attempt_probed(
             model,
             population,
-            start,
+            &stalled.params,
             options,
             false,
             declines,
-            Some(RestartLeg { escape_from: init_params, spent_evals, start_eval: None }),
+            Some(leg),
             None,
             identity_scales,
             true,
+            probe.map(|p| (p, ProbeWhen::DisplacementAloneRejects)),
         );
-        let verdict = start_probe_verdict(start_ofv, penalized(&result), result.converged);
-        if options.verbose {
-            eprintln!(
-                "Start probe: the fit did not leave its start (OFV = {start_ofv:.6}); a restart \
-                 from a perturbation of it reached OFV = {:.6} (converged = {}) → stationary \
-                 start = {verdict:?}",
-                penalized(&result),
-                result.converged,
-            );
+        let (mut restarted, restarted_cause, from_probe, verified) = settle_restart_probe(
+            (restarted, restarted_outcome.restart_cause()),
+            probe.and_then(|_| probed.take()),
+            &penalized,
+        );
+        // `n_iterations` reports the evaluations the fit spent, and the
+        // restart is a continuation of the same fit rather than a fresh one,
+        // so the two legs add up — and the second leg ran on what the first
+        // left of the budget (`RestartLeg::spent_evals`), so the sum is
+        // bounded by `outer_maxiter` like any other fit's.
+        restarted.n_iterations += stalled.n_iterations;
+        // Pushed on the restart's own result, so it reaches `FitResult` only
+        // if the restart is adopted — a rejected restart is dropped whole.
+        // `classify_warning` files both under `optimizer_health` on the phrase
+        // "resumed from the best point seen".
+        if announce {
+            restarted.warnings.push(match cause {
+                RestartCause::MidDescent => mid_descent_restart_warning(
+                    options.optimizer,
+                    stalled.ofv,
+                    stalled.n_iterations,
+                    from_probe,
+                ),
+                RestartCause::BasinShift => {
+                    basin_shift_restart_warning(stalled.ofv, stalled.n_iterations, from_probe)
+                }
+            });
         }
-        *probed.borrow_mut() = Some((result, outcome, verdict));
+        (restarted, restarted_cause, verified)
     };
-    let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&probe));
-    let first_attempt = settle_start_probe(
-        (first, first_cause),
-        first_left_init,
-        probed.take().map(|(found, outcome, verdict)| (found, outcome.restart_cause(), verdict)),
-        &penalized,
-    );
+    // The probe. With `chain`, its leg runs the fit's own restart chain
+    // ([`resolve_restart_chain`]) before its verdict is read (#2707): from a perturbation of
+    // a restart's point, on a multimodal inner problem, the probe's warm EBEs can be trapped
+    // as the fit's were, and a probe stopped at a basin shift has not finished — it would
+    // return no verdict on a start that is an optimum. The chain's last restart cause is not
+    // carried on: the probe has had its restarts. The first attempt's probe keeps #2506's
+    // single leg.
+    let probe_for = |chain: bool| {
+        let (restart_leg, probed, penalized) = (&restart_leg, &probed, &penalized);
+        move |start: &ModelParameters, start_ofv: f64, spent_evals: usize| {
+            // Its covariance step is deferred like every attempt's: `optimize_nlopt` runs it
+            // once, on the attempt it reports. `start_eval` is the unmoved attempt's, set by
+            // `verified_start_result` if the probe is reported.
+            let (result, outcome) = optimize_nlopt_attempt(
+                model,
+                population,
+                start,
+                options,
+                false,
+                declines,
+                Some(RestartLeg { escape_from: init_params, spent_evals, start_eval: None }),
+                None,
+                identity_scales,
+                true,
+            );
+            let (result, cause) = if chain {
+                let finished = resolve_restart_chain(
+                    options.verbose,
+                    crate::cancel::is_cancelled(&options.cancel),
+                    (result, outcome.restart_cause()),
+                    |stalled, cause| {
+                        restart_leg(
+                            stalled,
+                            cause,
+                            RestartLegOwner::Probe { spent_before: spent_evals },
+                        )
+                    },
+                    penalized,
+                );
+                (finished, None)
+            } else {
+                (result, outcome.restart_cause())
+            };
+            let verdict = start_probe_verdict(start_ofv, penalized(&result), result.converged);
+            if options.verbose {
+                eprintln!(
+                    "Start probe: the leg did not leave its start (OFV = {start_ofv:.6}); a \
+                     restart from a perturbation of it reached OFV = {:.6} (converged = {}) → \
+                     stationary start = {verdict:?}",
+                    penalized(&result),
+                    result.converged,
+                );
+            }
+            *probed.borrow_mut() = Some((result, cause, verdict));
+        }
+    };
+    let (first_probe, restart_probe) = (probe_for(false), probe_for(true));
+    let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&first_probe));
+    let first_attempt =
+        settle_start_probe((first, first_cause), first_left_init, probed.take(), &penalized);
     let (first, restart_cause) = resolve_stall_retry(
         options.optimizer,
         options.verbose,
@@ -4654,45 +4882,8 @@ pub(crate) fn optimize_nlopt(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
-        |stalled, cause| {
-            // `escape_from = init_params`, not this leg's start: "are the estimates still on the
-            // user's values" does not move on a restart, and measuring against the restart point
-            // would flag a recovered fit `W_STALLED_AT_INIT` (#1277).
-            let (mut restarted, restarted_outcome) = optimize_nlopt_attempt(
-                model,
-                population,
-                &stalled.params,
-                options,
-                false,
-                declines,
-                Some(RestartLeg::continuing(init_params, stalled)),
-                None,
-                identity_scales,
-                true,
-            );
-            // `n_iterations` reports the evaluations the fit spent, and the
-            // restart is a continuation of the same fit rather than a fresh one,
-            // so the two legs add up — and the second leg ran on what the first
-            // left of the budget (`RestartLeg::spent_evals`), so the sum is
-            // bounded by `outer_maxiter` like any other fit's.
-            restarted.n_iterations += stalled.n_iterations;
-            // Pushed on the restart's own result, so it reaches `FitResult` only
-            // if the restart is adopted — a rejected restart is dropped whole.
-            // `classify_warning` files both under `optimizer_health` on the phrase
-            // "resumed from the best point seen".
-            restarted.warnings.push(match cause {
-                RestartCause::MidDescent => mid_descent_restart_warning(
-                    options.optimizer,
-                    stalled.ofv,
-                    stalled.n_iterations,
-                ),
-                RestartCause::BasinShift => {
-                    basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
-                }
-            });
-            (restarted, restarted_outcome.restart_cause())
-        },
-        penalized,
+        |stalled, cause| restart_leg(stalled, cause, RestartLegOwner::Fit(&restart_probe)),
+        &penalized,
     );
     // The covariance step, once, on the attempt reported, at the exact packed vector it
     // ended on (`packed_estimate`, which every NLopt attempt sets).
@@ -4734,14 +4925,18 @@ pub(crate) fn optimize_nlopt(
     result
 }
 
-/// The restart chain behind [`optimize_nlopt`] (#2093):
-/// [`resolve_mid_descent_restart_adopting`], then further basin-shift restarts while each is
-/// adopted and ends in a basin shift, at most [`MAX_BASIN_RESTARTS`] more. The legs share one
-/// budget (`RestartLeg::spent_evals`), bounded by `outer_maxiter`. A mid-descent stall
-/// restarts once. Pure, so every branch is unit-testable.
+/// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
+/// while each restart is adopted and itself ends in a basin shift, another basin-shift restart,
+/// at most [`MAX_BASIN_RESTARTS`] more. A restarted leg can trap again as θ moves on; the legs
+/// share one evaluation budget (`RestartLeg::spent_evals`), and a restarted leg's own
+/// `basin_shift` already requires budget left, so the total stays bounded by `outer_maxiter`.
+/// A mid-descent stall keeps its single restart: a second stall reports as a stall. `restart`
+/// returns the restarted result, the restart cause *its* leg ended with, and whether its start
+/// probe verified it (a tie then adopts it). Pure, like
+/// [`resolve_mid_descent_restart_adopting`], so every branch is unit-testable without NLopt.
 fn resolve_restart_chain<T>(
     verbose: bool, cancelled: bool, first: (T, Option<RestartCause>),
-    mut restart: impl FnMut(&T, RestartCause) -> (T, Option<RestartCause>),
+    mut restart: impl FnMut(&T, RestartCause) -> (T, Option<RestartCause>, bool),
     ofv_of: impl Fn(&T) -> f64,
 ) -> T {
     let (mut current, mut cause) = first;
@@ -4753,9 +4948,9 @@ fn resolve_restart_chain<T>(
             cancelled,
             (current, cause),
             |stalled, c| {
-                let (restarted, its_cause) = restart(stalled, c);
+                let (restarted, its_cause, verified) = restart(stalled, c);
                 next_cause = its_cause;
-                restarted
+                (restarted, verified)
             },
             &ofv_of,
         );
@@ -4805,41 +5000,93 @@ pub(crate) mod forced_stop_at_start {
 /// on a fit whose warm EBEs keep re-trapping.
 const MAX_BASIN_RESTARTS: usize = 3;
 
-/// Restart a run that stopped mid-descent from the best point it reached, and report
-/// whichever attempt ended lower (#1277).
+/// Restart a run that stopped mid-descent from the best point it reached, and
+/// report whichever attempt ended lower (#1277).
 ///
-/// Acts on the genuine-stall half of [`failure_is_converged_plateau`]. Measured on the #1277
-/// fixture (`tests/fixtures/two_cpt_dcm_regularized.ferx`, `nn_l2 = 0`, no `init`): L-BFGS
-/// quit at eval 12 still falling ~2600 OFV/eval; the restart reached 3886 lower
-/// (3209.81 → −676.77). Luksan's `plis` line search caps reductions and extrapolations at
-/// ten and returns a bare `Failure` on a fresh iteration (#1411): here the extrapolation cap
-/// after [`should_cap_gradient`] shrank the gradient 1.7e5×, and later the reduction cap
-/// after an EBE mode switch degenerated the curvature pair.
+/// NLopt's `Failure` is ambiguous, and [`failure_is_converged_plateau`] already
+/// splits it: a flat tail plus a self-consistent cold re-solve is a finished
+/// fit, anything else is a genuine stall. This acts on the second half, which
+/// until now was only *reported* ("Outer optimization did not converge") and
+/// never acted on. Measured on the #1277 fixture — the two-cpt DCM in
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0`, started without
+/// the `init` line it has carried since #1561 — L-BFGS quit at
+/// eval 12 with the trace still falling ~2600 OFV per eval; restarting from that
+/// point ran to convergence 3886 OFV units lower (3209.81 → −676.77; 7902 →
+/// −540 by eval 44 on Linux, where the abort sits at a different OFV). The
+/// mechanism is not NN-specific, and it is not one mechanism. Luksan's `plis`
+/// line search is capped at ten step reductions and ten extrapolations, and a
+/// cap hit on an iteration where the algorithm has just restarted — which the
+/// first iteration always is — returns a bare `Failure` that discards every
+/// point it accepted (#1411, `plis.c` instrumented). The eval-12 abort is the
+/// *extrapolation* cap inside the first line search: the identity-Hessian
+/// overshoot cap ([`should_cap_gradient`]) shrank the opening gradient 1.7e5×,
+/// so every trial point showed a huge real decrease next to a tiny predicted
+/// slope and the search extrapolated eleven times — before any `(s, y)` pair
+/// exists. A fresh run from the best point works there because it re-arms that
+/// cap around a gradient that is now O(1). The other shape is the *reduction*
+/// cap later in the same fixture, where a subject's EBE mode switch degenerates
+/// the curvature pair and the next direction is ~1e17 long; there the fresh
+/// `(s, y)` memory is what helps.
 ///
-/// Safeguards:
-/// - runs **only** on `mid_descent_stall` (a converged fit, a plateaued `Failure` and a
-///   `MaxEvalReached` success are untouched), on what the stalled leg left of the budget
-///   ([`RestartLeg::spent_evals`], #1428), so both legs are bounded by `outer_maxiter`
-///   (L-BFGS may overshoot by a few evals);
-/// - adopted only on a **strictly lower** penalized objective;
-/// - `cancelled` short-circuits: a cancelled run stops through the objective's 1e20 short-
-///   circuit, not at a minimum, and would look like a stall.
+/// Three things keep it from making any fit worse:
 ///
-/// One restart per stall (a second stall reports as a stall); a basin-shift restart may
-/// repeat (`MAX_BASIN_RESTARTS`, #2093) on the same budget. The ceiling for the whole of
-/// [`optimize_nlopt`] is three, since the `left_init` retry can fire first. Not gated on the optimizer (SLSQP and derivative-free methods can stall
-/// too). An adopted restart is named by [`mid_descent_restart_warning`].
+/// - it runs **only** on `mid_descent_stall`, so a converged fit, a plateaued
+///   `Failure`, and a run that spent its `maxiter` budget (a `MaxEvalReached`
+///   *success* state, not a `Failure`) are all untouched — and the restart runs
+///   on what the stalled leg left of the budget ([`RestartLeg::spent_evals`]),
+///   so it never hands a fit a second one (#1428; the first version did, and
+///   said here that it could not). The two legs together are bounded by
+///   `outer_maxiter` the way any single run is — `maxeval` is a soft bound for
+///   L-BFGS, checked between line searches, so a few evals of overshoot are
+///   possible on either leg;
+/// - the restart is adopted only on a **strictly lower** penalized objective
+///   (a tie only in the two cases below). Unlike the `left_init` retry above there is no second condition to check:
+///   this attempt starts *at* the reported point, so anywhere it ends is
+///   somewhere the fit genuinely reached; and
+/// - `cancelled` short-circuits it, because a cancelled run stops through the
+///   objective's 1e20 short-circuit rather than at a minimum and would look like
+///   a stall to every test here.
 ///
-/// **Basin shift** ([`RestartCause::BasinShift`], #1565): the cold re-solve beat the
-/// minimised objective, so the restart (cold first solve) optimizes the reported objective.
-/// It still never reports a higher objective. Ties go to the **restart**: its verdict is the honest one, as the stalled run's
-/// `converged` was demoted ([`ebe_basin_shift_warning`]).
+/// There is exactly one restart for a stall — a second stall reports as a stall, which
+/// is the honest signal and caps what this adds at one extra optimization. A basin-shift
+/// restart may repeat ([`optimize_nlopt`], `MAX_BASIN_RESTARTS`, #2093), on the same
+/// shared budget. (The
+/// ceiling for the whole of [`optimize_nlopt`] is three, since the `left_init`
+/// retry can fire first and hand its own result here.)
 ///
-/// Pure (`restart` maps the stalled result to its successor). Returns the reported result
-/// and whether it is the restart's.
+/// Deliberately **not** gated on the optimizer, unlike the `left_init` retry.
+/// The line-search caps above are L-BFGS's, but the predicate here is not "did
+/// Luksan abort" — it is "did NLopt return a bare `Failure` while the trace was
+/// still descending, at a point a cold re-solve does not call a plateau", which
+/// SLSQP (its own line search, `positive directional derivative`) and the
+/// derivative-free methods can also produce; and the adoption rule (strictly
+/// lower, or the stalled result stands) makes a pointless restart cost one
+/// optimization and change nothing. An adopted restart is named in
+/// `FitResult.warnings` ([`mid_descent_restart_warning`], `optimizer_health`).
+///
+/// **Basin shift** ([`RestartCause::BasinShift`], #1565) is the second reason to run
+/// the same restart: the run finished, but the cold re-solve at its restored point beat
+/// the objective it had minimised there, because some subjects' warm-started EBEs sat
+/// in a higher individual mode for the whole trajectory. The restart's first inner
+/// solve is cold, so it optimizes the objective the fit reports. Every guard above
+/// applies unchanged, with one difference in the adoption rule: a tie goes to the
+/// **restart**. The stalled run's own `converged` was demoted for the gap (see
+/// [`ebe_basin_shift_warning`]), and a restart that starts at that point and cannot
+/// improve on it is the evidence that the point is a minimum of the reported objective
+/// after all — so its own verdict is the honest one to report. It still never reports a
+/// higher objective, for the same reason as the stall case. A mid-descent restart its start
+/// probe verified (#2707) takes a tie the same way: the probe came back to its point, which
+/// is the same evidence, and dropping it would discard that verdict and the probe's
+/// evaluations with it.
+///
+/// Pulled out as a pure fn — `restart` is handed the stalled result and returns
+/// its successor, and whether its probe verified it — so every branch is unit-testable
+/// without driving two NLopt fits.
+///
+/// Returns the reported result and whether it is the restart's (adopted).
 fn resolve_mid_descent_restart_adopting<T>(
     verbose: bool, cancelled: bool, first: (T, Option<RestartCause>),
-    restart: impl FnOnce(&T, RestartCause) -> T, ofv_of: impl Fn(&T) -> f64,
+    restart: impl FnOnce(&T, RestartCause) -> (T, bool), ofv_of: impl Fn(&T) -> f64,
 ) -> (T, bool) {
     let (first, cause) = first;
     let Some(cause) = cause else {
@@ -4848,16 +5095,20 @@ fn resolve_mid_descent_restart_adopting<T>(
     if cancelled {
         return (first, false);
     }
-    let second = restart(&first, cause);
-    // `ofv_is_valid` before comparing: a strict `<` adopts `−inf`, and a restart can return a
-    // non-finite objective like any run (#1277).
+    let (second, verified) = restart(&first, cause);
+    // `ofv_is_valid` before the comparison, not `<` alone. A strict `<` rejects
+    // `NaN` and `+inf` for free but **adopts `−inf`**, and a restart can return a
+    // non-finite objective the same way any run can — `gate_converged_on_objective`
+    // exists precisely because the final cold solve can hand back a `NaN` after a
+    // trace that looked fine. Demoting that run's `converged` does not stop it
+    // being ranked here, so without this guard a `−inf` successor would replace a
+    // finite incumbent and take its usable estimates and diagnostics with it
+    // (#1277 review).
     let second_ofv = ofv_of(&second);
     let first_ofv = ofv_of(&first);
+    let ties_go_to_the_restart = verified || cause == RestartCause::BasinShift;
     let adopt = ofv_is_valid(second_ofv)
-        && match cause {
-            RestartCause::MidDescent => second_ofv < first_ofv,
-            RestartCause::BasinShift => second_ofv <= first_ofv,
-        };
+        && if ties_go_to_the_restart { second_ofv <= first_ofv } else { second_ofv < first_ofv };
     if !adopt {
         return (first, false);
     }
@@ -4874,13 +5125,21 @@ fn resolve_mid_descent_restart_adopting<T>(
     (second, true)
 }
 
-/// [`resolve_mid_descent_restart_adopting`] without the flag: the form the unit tests read.
+/// [`resolve_mid_descent_restart_adopting`] without the flags, for an unprobed restart: the
+/// form the unit tests read.
 #[cfg(test)]
 fn resolve_mid_descent_restart<T>(
     verbose: bool, cancelled: bool, first: (T, Option<RestartCause>),
     restart: impl FnOnce(&T, RestartCause) -> T, ofv_of: impl Fn(&T) -> f64,
 ) -> T {
-    resolve_mid_descent_restart_adopting(verbose, cancelled, first, restart, ofv_of).0
+    resolve_mid_descent_restart_adopting(
+        verbose,
+        cancelled,
+        first,
+        |stalled, cause| (restart(stalled, cause), false),
+        ofv_of,
+    )
+    .0
 }
 
 /// The stall-retry decision behind [`optimize_nlopt`], pure for unit tests. `first` is
@@ -5700,14 +5959,16 @@ fn optimize_nlopt_attempt(
 /// leaving its start, `start_probe` is run from a perturbation of that start
 /// ([`perturbed_start`]) on what is left of the budget, and its verdict
 /// ([`start_probe_verdict`]) decides whether the unmoved start is a warm start at an
-/// optimum. [`optimize_nlopt`] passes one on the first attempt only; every other leg —
-/// the held-cap retry, a restart, the probe itself — passes `None`.
+/// optimum. [`optimize_nlopt`] passes one on the first attempt ([`ProbeWhen::Unmoved`]) and
+/// on each restart leg ([`ProbeWhen::DisplacementAloneRejects`], #2707); the held-cap retry
+/// and the probe itself pass `None`.
 #[allow(clippy::too_many_arguments)]
 fn optimize_nlopt_attempt_probed(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions, hold_cap_at_init: bool, declines: &OuterFdDeclineLog,
     restart: Option<RestartLeg<'_>>, first_eval_etas: Option<&[DVector<f64>]>,
-    identity_scales: &[(usize, f64)], defer_covariance: bool, start_probe: Option<&StartProbe<'_>>,
+    identity_scales: &[(usize, f64)], defer_covariance: bool,
+    start_probe: Option<(&StartProbe<'_>, ProbeWhen)>,
 ) -> (OuterResult, AttemptOutcome) {
     #[cfg(test)]
     NLOPT_ATTEMPTS.with(|c| c.set(c.get() + 1));
@@ -7513,11 +7774,7 @@ fn optimize_nlopt_attempt_probed(
     // warning below. There is no automatic second optimization — a user who wants
     // SLSQP sets `optimizer = slsqp` as the primary (issue #657).
     if max_eval_reached && budget_advice_applies {
-        warnings.push(format!(
-            "Outer optimization hit the evaluation budget (maxiter = {}) before \
-             converging; increase maxiter for a tighter fit.",
-            options.outer_maxiter,
-        ));
+        warnings.push(eval_budget_warning(options.outer_maxiter));
         if options.verbose {
             eprintln!(
                 "NLopt hit the evaluation budget (maxiter = {}) without converging — \
@@ -7808,6 +8065,32 @@ fn optimize_nlopt_attempt_probed(
     // best-seen objective against a re-run of itself (`consistent` would then be
     // true by construction and the check would stop rejecting warm-start artifacts).
     let consistency_ofv = cold_ofv.unwrap_or(final_ofv);
+    // #1565, read here rather than with its warning below because a restart leg's probe
+    // (#2707) is not run on a leg that will be restarted on a basin shift anyway.
+    let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
+    let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
+    // The acceptance rule of a stop whose `converged` is decided here (a bare `Failure` /
+    // `ForcedStop`, a latched stop, or a verified one — `stationarity_check_pending`), as a
+    // function of whether the leg left its start: the #2462 verified-stop branch, else
+    // [`failure_is_converged_plateau`]. Read twice on a restart leg, with and without the
+    // displacement, to decide whether displacement alone rejects it.
+    let stop_accepted = |left: bool| {
+        if verified_stop {
+            cold_solve_is_consistent(best_seen_ofv, consistency_ofv)
+                && (left || !verified_needs_left_init)
+        } else {
+            failure_is_converged_plateau(
+                feasible_evals,
+                last_sig_feasible_eval,
+                best_seen_ofv,
+                consistency_ofv,
+                left,
+            )
+        }
+    };
+    let probe_due = |when: ProbeWhen| {
+        start_probe_due(when, stationarity_check_pending, &stop_accepted, basin_gap.is_some())
+    };
     // #2506: a fit that never left its start may have *started* at an optimum — a
     // bootstrap sample or a refit warm-started from a previous fit's estimates.
     // Displacement cannot tell that from a #751 stall, so the optimizer is asked instead:
@@ -7815,9 +8098,11 @@ fn optimize_nlopt_attempt_probed(
     // back ([`start_probe_verdict`]). Run only when this attempt did not move, scored the
     // real objective at least once (with no feasible evaluation the start's objective is no
     // reference to compare against, and #1617 reports the run as it is), was not cancelled,
-    // and has budget left — the probe continues the same fit, on its budget.
-    if let Some(probe) = start_probe.filter(|_| {
+    // and has budget left — the probe continues the same fit, on its budget. On a restart leg,
+    // only when displacement is all that rejects it (`ProbeWhen::DisplacementAloneRejects`).
+    if let Some((probe, _)) = start_probe.filter(|&(_, when)| {
         !left_init
+            && probe_due(when)
             && !feasibility.no_feasible()
             && !crate::cancel::is_cancelled(&options.cancel)
             && spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize
@@ -7838,20 +8123,7 @@ fn optimize_nlopt_attempt_probed(
         }
     }
     if stationarity_check_pending {
-        let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
-        let accepted = if verified_stop {
-            cold_solve_is_consistent(best_seen_ofv, consistency_ofv)
-                && (left_init || !verified_needs_left_init)
-        } else {
-            failure_is_converged_plateau(
-                feasible_evals,
-                last_sig_feasible_eval,
-                best_seen_ofv,
-                consistency_ofv,
-                left_init,
-            )
-        };
-        if accepted {
+        if stop_accepted(left_init) {
             converged = true;
         }
         if options.verbose {
@@ -7906,7 +8178,7 @@ fn optimize_nlopt_attempt_probed(
     // `optimize_nlopt` restarts such a run ([`RestartCause::BasinShift`], repeated up to
     // `MAX_BASIN_RESTARTS` times since #2093); this
     // warning reaches the user only if that restart is not adopted or not possible.
-    let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
+    // (`basin_gap` is read above, before the start probe.)
     if let (Some(gap), Some(cold), Some(best)) = (basin_gap, cold_ofv, best_seen_ofv) {
         converged = false;
         warnings.push(ebe_basin_shift_warning(
@@ -8177,16 +8449,29 @@ fn worth_restarting_mid_descent(
 /// PR-time regression test (`nn::regularizer_fit_tests::first_line_search_abort_is_avoided_or_resumed_not_reported`)
 /// looks for; keep it if the wording changes.
 fn mid_descent_restart_warning(
-    optimizer: Optimizer, stalled_ofv: f64, stalled_evals: usize,
+    optimizer: Optimizer, stalled_ofv: f64, stalled_evals: usize, from_probe: bool,
 ) -> String {
     format!(
         "Outer optimizer ({}) stopped mid-descent (bare Failure at OFV = {:.6} after {} \
          evaluations) and was resumed from the best point seen on the remaining maxiter \
-         budget; the reported estimates are from the resumed run.",
+         budget; {}",
         optimizer.label(),
         stalled_ofv,
         stalled_evals,
+        restart_provenance(from_probe),
     )
+}
+
+/// The closing clause of a restart's warning: where the reported estimates come from. When
+/// the resumed run did not leave its start and its #2707 start probe reported a lower point
+/// ([`settle_restart_probe`]), they are the probe's, not the resumed run's.
+fn restart_provenance(from_probe: bool) -> &'static str {
+    if from_probe {
+        "the resumed run did not leave its start, and the reported estimates are from a \
+         restart from a perturbation of that point, which reached a lower objective."
+    } else {
+        "the reported estimates are from the resumed run."
+    }
 }
 
 /// The `FitResult` warning a fit carries when it was restarted for a basin shift
@@ -8194,13 +8479,16 @@ fn mid_descent_restart_warning(
 /// files it under `optimizer_health` with the #1277 notice: the gap itself was
 /// resolved (had it survived, the restart's own `W_EBE_START_DEPENDENT` would say so),
 /// so what remains to report is that the fit took a second leg, and why.
-fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
+fn basin_shift_restart_warning(
+    first_cold_ofv: f64, first_evals: usize, from_probe: bool,
+) -> String {
     format!(
         "Outer optimization had minimised against empirical Bayes estimates that some \
          subjects held in a higher individual mode than a cold re-solve finds (cold OFV = \
          {first_cold_ofv:.6} after {first_evals} evaluations, below the objective the \
          optimizer saw there), and was resumed from the best point seen with cold EBEs on \
-         the remaining maxiter budget; the reported estimates are from the resumed run."
+         the remaining maxiter budget; {}",
+        restart_provenance(from_probe),
     )
 }
 
