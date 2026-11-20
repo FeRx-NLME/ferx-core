@@ -384,10 +384,13 @@ impl McfCurve {
 impl KmCurve {
     /// `S(t)`: `1` before the first time, the step value at or after it up to and
     /// including the last time, and `None` past the last time, also when the curve
-    /// has reached zero: the estimate is undefined once nobody is under follow-up, as
-    /// for [`McfCurve::at`]. Reading a curve that reached zero as `Some(0.0)` there
-    /// would put a point mass at 0 into a band past the replicates' follow-up (#2930).
-    /// `None` for an empty curve and for a `t` that is not a number.
+    /// has reached zero, as for [`McfCurve::at`]. For a curve ending on an event the
+    /// estimate itself is 0 from then on (R's `survfit` extends it so); `None` is a
+    /// convention, R's `summary(fit, times =, extend = FALSE)`, chosen so a VPC
+    /// conditions the observed curve and every replicate alike on follow-up: reading a
+    /// curve that reached zero as `Some(0.0)` there would put a point mass at 0 into a
+    /// band past the replicates' follow-up (#2930). `None` for an empty curve and for
+    /// a `t` that is not a number.
     pub fn at(&self, t: f64) -> Option<f64> {
         let &last_t = self.time.last()?;
         if t.is_nan() || t > last_t {
