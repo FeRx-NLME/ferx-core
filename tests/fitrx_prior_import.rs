@@ -59,3 +59,59 @@ fn a_fitrx_named_in_from_fit_imports_on_the_first_parse_of_a_process() {
     let cl = model.priors.iter().find(|p| p.name == "TVCL").expect("a TVCL prior");
     assert_eq!(cl.value, parent_fit.theta[i], "the prior is centred on the bundle's estimate");
 }
+
+/// The same import when the process's FIRST parse is a model FILE (#3041): `prepare_run`,
+/// `fit_from_files` and the CLI all parse through `ModelSource::load`, a different entry point
+/// from `parse_model_string`. The test above cannot see that path — its own parent parse goes
+/// through `parse_model_string` and installs the reader for the whole process — so this one
+/// builds the bundle, then re-runs this test binary as a child process, filtered to
+/// [`child_prepare_run_imports_from_fit`], whose only engine call is `prepare_run`.
+#[test]
+fn a_fitrx_named_in_from_fit_imports_when_a_model_file_is_the_first_parse_of_a_process() {
+    let source = format!("{PARAMS}{BODY}");
+    let parent = parse_model_string(&source).expect("parent model parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin");
+    let mut opts = FitOptions { method: EstimationMethod::FoceI, ..FitOptions::default() };
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+    let mut parent_fit = fit(&parent, &pop, &parent.default_params, &opts).expect("short fit runs");
+    parent_fit.se_theta = Some(parent_fit.theta.iter().map(|t| 0.01 * t).collect());
+    parent_fit.se_omega = Some(vec![1e-3; parent.n_eta]);
+    parent_fit.se_sigma = Some(vec![1e-3; parent_fit.sigma.len()]);
+    let dir = tempfile::tempdir().unwrap();
+    save_fit(
+        &parent_fit,
+        &pop,
+        &source,
+        &dir.path().join("parent.fitrx"),
+        SaveFitOptions::default(),
+    )
+    .expect("save");
+    // Relative, so it resolves against the model file's directory, as a user's would.
+    let child = format!("{PARAMS}[priors]\n  from_fit = \"parent.fitrx\"\n\n{BODY}");
+    let model = dir.path().join("child.ferx");
+    std::fs::write(&model, child).unwrap();
+
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["child_prepare_run_imports_from_fit", "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD_MODEL, &model)
+        .output()
+        .expect("re-run this test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "prepare_run on a `from_fit` model as the first parse of a process failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+const CHILD_MODEL: &str = "FERX_FITRX_PRIOR_IMPORT_CHILD_MODEL";
+
+/// The child half of the test above; a no-op unless that test spawned this process.
+#[test]
+fn child_prepare_run_imports_from_fit() {
+    let Ok(model) = std::env::var(CHILD_MODEL) else { return };
+    let run = ferx_core::prepare_run(&model, Some("data/warfarin.csv"))
+        .unwrap_or_else(|e| panic!("a `.fitrx` in `from_fit` must import via prepare_run: {e}"));
+    assert_eq!(run.parsed.model.priors.len(), 6, "{:?}", run.parsed.model.priors);
+}

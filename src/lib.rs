@@ -193,6 +193,16 @@ pub mod parser {
             crate::io::fitrx::install_fit_estimates_reader();
             ferx_model::parser::model_parser::parse_full_model_file(path)
         }
+        /// `parse_full_model_file` on text already read from `path`: relative paths
+        /// resolve against `path`'s directory as they would from the file. What
+        /// `ModelSource::load` parses with — the path behind `prepare_run`,
+        /// `fit_from_files` and the CLI — so it must install the reader too (#3041).
+        pub(crate) fn parse_full_model_source(
+            content: &str, path: &std::path::Path,
+        ) -> Result<ferx_model::types::ParsedModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_full_model_source(content, path)
+        }
         /// Read `model.prior_from_fit` and turn it into ordinary
         /// [`crate::types::ParameterPrior`]s on `model.priors` (#254 phase 2).
         ///
