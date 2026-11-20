@@ -335,9 +335,10 @@ fn push_metric(
     for (id, cube) in cubes {
         let est = |drop: Option<usize>| {
             let l = layers(&cube.y, dims, drop);
-            let bsv = if cube.supplied { None } else { l.bsv };
-            let total = total_of(&[(l.param, d > 1), (bsv, !cube.supplied), (l.within, true)]);
-            vec![l.param, bsv, l.within, total]
+            // A supplied subject's BSV is computed but never reported: the `Supplied`
+            // status below and `total_of`'s `reported` flag are the one gate.
+            let total = total_of(&[(l.param, d > 1), (l.bsv, !cube.supplied), (l.within, true)]);
+            vec![l.param, l.bsv, l.within, total]
         };
         let (full, se) = (est(None), jackknife(n_units, est));
         let scope = || AdaptiveVarianceScope::Subject(id.to_string());

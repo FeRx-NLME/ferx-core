@@ -594,3 +594,96 @@ fn the_layers_match_the_conditional_quadrature_at_the_runs_own_draws() {
         assert!(gap.is_finite() && gap.abs() < tol, "{layer:?}: {got} vs {want} ({gap:+.4})");
     }
 }
+
+/// The jackknife over three sims (D = 1), where `(n − 1)/n` and `1/n` differ (with two
+/// units they coincide, so the 2 × 2 × 2 cube above cannot see that factor). Sims
+/// [1, 3], [4, 8], [2, 2]: SSE per sim 2, 8, 0, so within = 10/6·2 = 10/3. Delete-one
+/// within: (8 + 0)/2 = 4, (2 + 0)/2 = 1, (2 + 8)/2 = 5; mean 10/3, squared deviations
+/// sum 78/9, SE = √(2/3 · 78/9) = √52 / 3.
+///
+/// Mutation: the jackknife's `(n − 1)/n` replaced by `1/n` (SE √78 / 9).
+#[test]
+fn the_jackknife_over_three_units_carries_the_n_minus_one_factor() {
+    let y: [[[f64; 2]; 3]; 1] = [[[1.0, 3.0], [4.0, 8.0], [2.0, 2.0]]];
+    let mut metrics = Vec::new();
+    for (s, reps) in y[0].iter().enumerate() {
+        for (r, &v) in reps.iter().enumerate() {
+            metrics.push(metrics_row("1", (1, s + 1, r + 1), v));
+        }
+    }
+    let res = AdaptiveSimulationResult { metrics, ..result_of(&[("1", &[CUBE[0]])], false) };
+    let d = decompose_adaptive(&res).expect("decomposes");
+    let (within, se) = est(&d, &subject("1"), L::Within);
+    assert!((within - 10.0 / 3.0).abs() < 1e-12, "{within}");
+    let se = se.expect("three sims form every delete-one replicate");
+    assert!((se - 52f64.sqrt() / 3.0).abs() < 1e-12, "{se}");
+}
+
+// ── replicate labels in messages ───────────────────────────────────────────────────────
+
+/// The rep is named only with replicates (`n_reps > 1`), after the draw and sim, so every
+/// message of a run without replicates keeps its text.
+///
+/// Mutations: always printing the rep (the `None` side reddens); dropping it; printing it
+/// before the sim.
+#[test]
+fn replicate_tag_names_the_rep_only_with_replicates() {
+    use crate::sim::adaptive::ReplicateTag;
+    let t = |draw, rep| ReplicateTag { draw, sim: 3, rep };
+    assert_eq!(t(None, None).sim_label(), "sim 3");
+    assert_eq!(t(None, Some(2)).sim_label(), "sim 3, rep 2");
+    assert_eq!(t(Some(4), Some(2)).sim_label(), "draw 4, sim 3, rep 2");
+    assert_eq!(t(None, Some(2)).replicate_label(), "replicate 3, rep 2");
+    assert_eq!(t(Some(4), Some(2)).replicate_label(), "draw 4, replicate 3, rep 2");
+}
+
+/// `W_ADAPTIVE_STEP_ABSORBED` with replicates and no uncertainty names the first
+/// replicate by its sim **and rep** (a bare sim number would not say which rep), and
+/// counts over `n_sim × n_reps`.
+///
+/// Mutation: keeping the bare-sim branch for `(draw: None, rep: Some)` ("first in 1").
+#[test]
+fn absorbed_step_warning_names_the_rep_of_the_first_replicate() {
+    use super::adaptive::{absorbed_step_warning, AbsorbedPlan};
+    use crate::sim::adaptive::{AbsorbedIncrease::FromStart, ReplicateTag};
+    let p = crate::parser::model_parser::parse_full_model(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central / V
+  at = [0, 24]
+  start_dose = 500
+  route = bolus(cmt=1)
+  dose_bounds = [250, 4000]
+  round_to = 250
+  when signal < 0 : increase 10%
+"#,
+    )
+    .expect("parse");
+    let spec = p.adaptive_dosing.as_ref().expect("block present");
+    let plan = |sim, rep| AbsorbedPlan {
+        subject: 0,
+        replicate: Some(ReplicateTag { draw: None, sim, rep: Some(rep) }),
+        found: FromStart(500.0),
+    };
+    let w = absorbed_step_warning(spec, &pop(1), 4, vec![plan(2, 1), plan(1, 2)]).expect("a line");
+    assert!(
+        w.contains(
+            "From the start dose on: '1' in 2 of 4 replicate(s), first in sim 1, rep 2 at 500."
+        ),
+        "{w}"
+    );
+}

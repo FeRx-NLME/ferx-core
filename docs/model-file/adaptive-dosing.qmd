@@ -909,7 +909,7 @@ held-at-bound parameters stay at their estimates.
 |---|---|
 | Parameter draws | A stream of their own, rooted at the run seed. Asking for more draws leaves the earlier ones, and every row simulated under them, unchanged. |
 | η | The one η stream continues from draw to draw, so each draw simulates new virtual patients. Draw 1 uses the standard normals the same seed gives without uncertainty, scaled by draw 1's Ω. |
-| κ, `Dv` assay | Keyed by subject, draw and sim. Draw 1 keeps the keys of a run without uncertainty. |
+| κ, `Dv` assay | Keyed by subject, draw, sim and assay replicate (`rep`, see [Assay replicates](#assay-replicates)). Draw 1, rep 1 keeps the keys of a run without uncertainty. |
 | Mixture class | Keyed by subject, draw and sim (never an assay replicate), under the draw's mixing probabilities. |
 
 So a draw at the point estimate reproduces the run without uncertainty, row for row.
@@ -920,7 +920,7 @@ The draw loop is the outermost. Each draw's κ, assay, σ and class follow that 
 parameters. A failure in any draw stops the run, as a failure in any replicate does
 today: dropping a draw would bias the uncertainty distribution. Messages then name the
 draw as well as the replicate, `subject '7' (draw 3, sim 2): …`. Without uncertainty they
-keep `(sim 2)`.
+keep `(sim 2)`. With assay replicates they add the rep, `(sim 2, rep 3)`.
 
 ### Dose knowledge under a drawn θ
 
@@ -970,8 +970,8 @@ default. The mean of `Discontinued` is the fraction discontinued.
 
 #### How runs are pooled
 
-- A draw's statistic is over all its runs, `n_sim × subjects`, each run weighted the
-  same. Supplied-η subjects (`with_etas`, without uncertainty) count like any other.
+- A draw's statistic is over all its runs, `n_sim × n_reps × subjects`, each run weighted
+  the same: assay replicates only lengthen the run count. Supplied-η subjects (`with_etas`, without uncertainty) count like any other.
 - A run that carries no value for a metric, such as `pct_readings_in_window` without a
   `target_window` or the signal at a decision after a `Stop`, is skipped and counted in
   `n_missing`, never imputed. A metric no run carries has `value = None`.
@@ -999,6 +999,81 @@ probability of success are computed from `metrics` grouped by `(draw, sim)`.
 The band is checked against a conditional oracle. With Ω fixed at 0 and a fixed regimen,
 every run of a draw is the same patient, so each draw's statistic is a closed form of
 that draw's θ. The band equals the type-7 quantiles of those closed forms to 1e-13.
+
+### Variance decomposition
+
+`decompose_adaptive(&result)` splits the variance of each outcome metric into the layers
+of randomness it comes from ([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)).
+For a metric `Y` of subject `i`:
+
+```
+Var(Y | i) = Var_Θ E[Y|Θ]  +  E_Θ Var_η E[Y|Θ,η]  +  E_{Θ,η} Var_W(Y|Θ,η)
+             parameter        BSV                    within
+```
+
+Θ is the parameter draw, η the between-subject random effects (and the mixture class),
+and W the within-subject randomness: IOV κ and the `Dv` assay noise. Interactions go to
+the inner layer, so a Θ × η interaction counts as BSV. The metrics are the ones
+[`summarize_adaptive`](#population-summary-and-bands) reads, with the same rule for
+missing values.
+
+`components` holds one row per metric, scope and layer. The scope is a subject or the
+`Population`. A population row averages that layer over the subjects. Two lines exist only
+at population scope: `BetweenRow`, the variance of the subject means (covariates and
+design), and `Total`, the sum of the population lines. Each estimate carries a Monte
+Carlo standard error (`mc_se`).
+
+#### Assay replicates
+
+The within layer can only be told apart from BSV if the same patient is run more than
+once. `AdaptiveSimulateOptions::n_reps = R` does that. Each subject's η and mixture class
+are drawn once per `(draw, sim)`. κ and the assay noise are then redrawn `R` times, and
+the controller runs again on each. This costs `R` times the runs. `ledger`, `decisions`
+and `metrics` carry each row's `rep`. `trajectories` holds rep 1 only, since its row type
+has no `rep` field. `R = 1`, the default, gives exactly the run without replicates, and
+rep 1 of any run is that run.
+
+The metrics are scored on the latent signal ([Outcome metrics read the latent
+signal](#outcome-metrics-read-the-latent-signal)). So with a fixed regimen and no IOV the
+within layer is exactly 0: assay noise reaches an outcome only through the doses a
+controller reading a `Dv` monitor chooses.
+
+#### What each layer needs
+
+| Design | Outcome |
+|---|---|
+| `n_reps = 1` | Refused (`E_ADAPTIVE_OPTIONS`): within is confounded with BSV |
+| `n_sim = 1` | Refused: BSV is confounded with the parameter layer |
+| Uncertainty with `n_draws = 1` | Refused: one draw cannot estimate the parameter layer |
+| No uncertainty | `Parameter` is `NotDrawn`, not 0 |
+| Supplied η (`with_etas`) | That subject's `Bsv` is `Supplied`. The population BSV averages the drawn subjects. Within and `BetweenRow` average all of them. |
+| A metric missing in a run | Skipped for that subject and counted in `skipped`, never imputed |
+
+#### Estimator and standard error
+
+The estimator is the balanced nested ANOVA over `D` draws × `S` sims × `R` reps:
+`(MS_D − MS_S)/(SR)`, `(MS_S − MS_E)/R` and `MS_E`. It is unbiased. A small layer can come
+out **negative**, and it is reported as it is, never cut to 0. Cutting it would bias the
+estimate upwards.
+
+`mc_se` is a delete-one jackknife over draws, or over sims when there is one draw. On the
+analytic fixture below and on two 0/1 metrics, over 300 seeds, its mean was 0.90 to 1.08
+of the empirical SD in all 30 cells (four designs, three layers). The normal-theory
+formula, `Var(MS) = 2 MS²/df`, gave 0.51 to 1.67: the metrics are skewed or discrete, so
+it is not used. `mc_se` is `None` when a delete-one replicate cannot form the layer
+(`Parameter` with two draws, `Bsv` with two sims and no uncertainty).
+
+The parameter layer's error is about `2/√D`: draws, not sims, buy its precision.
+
+#### How it is checked
+
+There is no NONMEM run: NONMEM has no feedback dosing. On a one-compartment model with
+log-normal θ, BSV and IOV on clearance and a fixed regimen, each layer is compared with
+its quadrature at the run's own draws: parameter, BSV and within come out within 0.6 SD of
+the Monte Carlo error. IOV reaches the readings through
+[the record convention](#window-kappa), so that quadrature integrates three κ, not two.
+Two cases need no tolerance. With no IOV and an `Ipred` monitor, within is exactly 0.
+With Ω = 0 as well, BSV is exactly 0. Each is paired with a live case.
 
 ## Verification (on by default)
 
