@@ -11308,7 +11308,7 @@ impl FitOptions {
     /// Silence this fit's per-iteration console output (`verbose = false`, #1115). Every
     /// non-fatal message is still collected into `FitResult::warnings`.
     /// ```
-    /// use ferx_core::FitOptions;
+    /// use ferx_model::types::FitOptions;
     /// assert!(!FitOptions::default().quiet().verbose);
     /// ```
     pub fn quiet(mut self) -> Self {
