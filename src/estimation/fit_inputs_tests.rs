@@ -280,7 +280,7 @@ fn bound_on_its_own(c: &Case, relabel: fn(f64) -> f64) -> Population {
             }
         }
     }
-    crate::api::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
+    crate::levels::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
     pop
 }
 
@@ -303,8 +303,11 @@ fn never_bound_is_decided_from_the_subjects_not_the_listed_names() {
                  its records carry no index into the block's levels. Bind the population with \
                  `bind_from_fit(";
     let message_of = |pop: &Population| -> Vec<(&str, String)> {
-        let check =
-            crate::api::check_level_index_columns(model, pop, crate::api::LevelDataEntry::Run);
+        let check = crate::model_checks::check_level_index_columns(
+            model,
+            pop,
+            crate::model_checks::LevelDataEntry::Run,
+        );
         assert_eq!(check.len(), 1, "{check:?}");
         let e = |r: Result<(), EngineError>| r.expect_err("refused").message().to_string();
         vec![
@@ -357,8 +360,11 @@ fn never_bound_is_decided_from_the_subjects_not_the_listed_names() {
         if listed {
             empty.covariate_names.push("__level_SHIFT".to_string());
         }
-        let d =
-            crate::api::check_level_index_columns(model, &empty, crate::api::LevelDataEntry::Run);
+        let d = crate::model_checks::check_level_index_columns(
+            model,
+            &empty,
+            crate::model_checks::LevelDataEntry::Run,
+        );
         assert_eq!(d.len(), 1, "empty, listed = {listed}: {d:?}");
         assert!(d[0].message.starts_with(never), "empty, listed = {listed}");
     }
@@ -545,13 +551,16 @@ fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
             }
         }
     }
-    crate::api::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
+    crate::levels::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
     let model = &c.prep.parsed.model;
-    let codes: Vec<_> =
-        crate::api::check_level_index_columns(model, &other, crate::api::LevelDataEntry::Run)
-            .into_iter()
-            .map(|d| d.code)
-            .collect();
+    let codes: Vec<_> = crate::model_checks::check_level_index_columns(
+        model,
+        &other,
+        crate::model_checks::LevelDataEntry::Run,
+    )
+    .into_iter()
+    .map(|d| d.code)
+    .collect();
     assert_eq!(codes, ["E_THETA_LEVELS_DATA_MISMATCH"], "the straddle");
 
     for entry in ["run_covariance", "run_sir"] {
@@ -1086,7 +1095,7 @@ mod fitted_population_1783 {
         // fixture differently.
         let derive = |rule: &IovOccasionRule| {
             let mut p = f.prep.population.clone();
-            crate::api::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
+            crate::occasions::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
             p.subjects[0].occasions.clone()
         };
         assert_ne!(

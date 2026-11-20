@@ -639,6 +639,7 @@ pub(crate) fn assemble_score_cross_product(
     x_hat: &[f64], template: &ModelParameters, model: &CompiledModel, population: &Population,
     eta_hats: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], bounds: &PackedBounds,
     options: &FitOptions, free_idx: &[usize],
+    schedules: Option<&crate::estimation::mixture::ScheduleCache>,
 ) -> Result<DMatrix<f64>, String> {
     let n_free = free_idx.len();
     let n_subj = population.subjects.len();
@@ -668,7 +669,7 @@ pub(crate) fn assemble_score_cross_product(
     // `kappas` (the MIXEST class's) are not read for it.
     let mixture = model.mixture.as_ref().map(|_| {
         crate::estimation::mixture::MixtureScoreContext::new(
-            model, population, template, x_hat, options,
+            model, population, template, x_hat, options, schedules,
         )
     });
 
@@ -687,7 +688,7 @@ pub(crate) fn assemble_score_cross_product(
         inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
         ..options.clone()
     };
-    let mixture_points = mixture.as_ref().map(|c| c.class_points());
+    let mixture_scorers = mixture.as_ref().map(|c| c.class_scorers(model));
     let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Result<Vec<f64>, String>> = crate::par::map(n_subj, |i| {
         // Cooperative cancel: skip the per-subject gradient and return a
@@ -701,9 +702,9 @@ pub(crate) fn assemble_score_cross_product(
         let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
         if let Some(context) = &mixture {
             let score =
-                context.score(model, population, i, mixture_points.as_deref().unwrap_or(&[]));
+                context.score(model, population, i, mixture_scorers.as_deref().unwrap_or(&[]));
             report();
-            return Ok(score);
+            return score.ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
         }
         if let Some(context) = &quadrature {
             // The subject score has NLL units already and cannot contain the
@@ -828,19 +829,26 @@ pub(super) mod forced_cov_decline {
     }
 }
 
+/// Why `exact_candidate_hessian` gave no Hessian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactDecline {
+    /// The exact derivatives do not cover the model or a subject (or the user turned them off
+    /// with `analytic_cov_hessian = false`): the finite-difference twin
+    /// (`fd_candidate_hessian`) is the same quantity at FD precision.
+    OutOfScope,
+    /// In scope, but not resolved at this point: a subject's EBE did not re-converge, a result
+    /// was non-finite, or the run was cancelled. A property of the point, not of the model.
+    NotResolved,
+}
+
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
 /// `analytic_cov_hessian`), and whose per-subject gradients the BHHH decrement reads.
 ///
-/// A mixture model's objective is FOCE/FOCEI whatever `n_agq` says: `mixture_ofv` scores every
-/// class with the FOCE/FOCEI subject objective and never evaluates a quadrature grid (fitting a
-/// mixture under Laplace/AGQ is #3025). So a caller that hands `run_covariance` a quadrature
-/// `n_agq` for a mixture fit still gets the R-matrix of the objective that fit minimised.
-pub(crate) fn cov_objective(
-    model: &CompiledModel, options: &FitOptions,
-) -> crate::sens::ode_provider::adjoint::Objective {
+/// A mixture's class objective is the same one (`mixture_ofv` scores each class with FOCE,
+/// FOCEI or the Laplace/AGQ quadrature, #3025), so a mixture takes no separate rule.
+pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
     use crate::sens::ode_provider::adjoint::Objective;
-    let quadrature = options.agq_nodes().filter(|_| model.mixture.is_none());
-    match quadrature {
+    match options.agq_nodes() {
         Some(n_agq) => {
             Objective::Agq { n_agq, exact: options.hessian_anchor() != HessianAnchor::GaussNewton }
         }
@@ -995,7 +1003,7 @@ pub(crate) fn analytic_r_expected(model: &CompiledModel, options: &FitOptions) -
 
 /// The clauses of [`analytic_cov_declines`] — every one that sends the whole population to
 /// the stencil, whatever the subjects look like. Empty when none fires.
-fn analytic_cov_model_declines(
+pub(crate) fn analytic_cov_model_declines(
     model: &CompiledModel, options: &FitOptions,
 ) -> Vec<CovScopeDecline> {
     let mut out: Vec<CovScopeDecline> = Vec::new();
@@ -1003,10 +1011,10 @@ fn analytic_cov_model_declines(
         out.push(CovScopeDecline::Disabled);
     }
     // The adjoint's profile Hessian serves every estimator and anchor, and a mixture through
-    // its own exact assembly (`mixture::mixture_cov_hessian`, over the FOCE/FOCEI objective
-    // `cov_objective` gives a mixture); what it declines is the model (a shape no recorder
-    // serves, a non-Gaussian endpoint outside FOCE/FOCEI's exact term) or the user's
-    // `gradient = fd` opt-out from analytic derivatives.
+    // its own exact assembly (`mixture::mixture_cov_hessian`, over the class objective
+    // `mixture_ofv` scores: FOCE, FOCEI, Laplace or AGQ); what it declines is the model (a
+    // shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's exact term) or
+    // the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
     }
@@ -1016,7 +1024,7 @@ fn analytic_cov_model_declines(
     if model.has_non_gaussian()
         && !crate::sens::ode_provider::adjoint::cov_non_gaussian_served(
             model,
-            cov_objective(model, options),
+            cov_objective(options),
         )
     {
         out.push(CovScopeDecline::NonGaussianEndpoint);
@@ -1174,7 +1182,7 @@ fn per_subject_adjoint<R: Send>(
     // differentiates every one of these objectives — FOCE (its frozen-variance mode
     // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
     // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    let objective = cov_objective(model, options);
+    let objective = cov_objective(options);
     // One unpack for the population: every subject is at `x`.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
     Some(crate::par::map(population.subjects.len().min(eta_hats.len()), |i| {
@@ -2018,7 +2026,7 @@ fn tightened_covariance_step(
         let out = (out, FD_OBJECTIVE_EVALS.with(|c| c.replace(evals_before)) - evals_before);
         out
     };
-    match crate::api::with_fit_scope_ode(options, tight, run) {
+    match crate::pool::with_fit_scope_ode(options, tight, run) {
         #[cfg(test)]
         Ok((out, evals)) => {
             FD_OBJECTIVE_EVALS.with(|c| c.set(c.get() + evals));
@@ -2094,6 +2102,12 @@ fn covariance_step(
     // objective and skip the single-population reconvergence / analytic R-matrix
     // (both single-population-only). Gated on `template.mixture`.
     let is_mixture = template.mixture.is_some();
+    // One schedule cache for the whole step: every mixture evaluation below (the stencil, the
+    // score context, the exact R) re-solves the same subjects' schedules, which depend only on
+    // the model and the data.
+    let mixture_schedules = is_mixture
+        .then(|| crate::estimation::mixture::hoisted_schedules(model, population, options))
+        .flatten();
     // #1352: the covariate-NN regularizer, when the estimator that produced `x_hat` minimised
     // it (`None` for an unregularized fit, and for SAEM / IMP / IMPMAP / Bayes, which never
     // apply the penalty, so their SEs are the curvature of what they fitted).
@@ -2174,13 +2188,15 @@ fn covariance_step(
     let cov_ofv = |xv: &[f64]| -> f64 {
         if is_mixture {
             let params = unpack_params(xv, template);
-            return crate::estimation::mixture::mixture_ofv(
+            return crate::estimation::mixture::mixture_ofv_cached(
                 model,
                 population,
                 &params,
                 mixture_cov_options,
                 None,
+                mixture_schedules.as_deref(),
             )
+            .0
             .ofv;
         }
         subset_cov_ofv(xv, population, &warm, false)
@@ -2285,7 +2301,16 @@ fn covariance_step(
     // whose placeholder rows are then never trusted.
     let score_cross_product = || {
         let s = assemble_score_cross_product(
-            x_hat, template, model, population, eta_hats, kappas, &bounds, options, &free_idx,
+            x_hat,
+            template,
+            model,
+            population,
+            eta_hats,
+            kappas,
+            &bounds,
+            options,
+            &free_idx,
+            mixture_schedules.as_deref(),
         );
         (!crate::cancel::is_cancelled(&options.cancel)).then_some(s)
     };
@@ -2366,7 +2391,7 @@ fn covariance_step(
                 template,
                 x_hat,
                 options,
-                cov_objective(model, options),
+                mixture_schedules.as_deref(),
             ) {
                 Some(h) => AnalyticCovAssembly::Full(h),
                 None => AnalyticCovAssembly::Unavailable,
@@ -2538,13 +2563,15 @@ fn covariance_step(
             fd_evals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match scope {
                 FdScope::Whole if is_mixture => {
-                    let m = crate::estimation::mixture::mixture_ofv(
+                    let m = crate::estimation::mixture::mixture_ofv_cached(
                         model,
                         population,
                         &unpack_params(xv, template),
                         &tight_mixture_options,
                         None,
-                    );
+                        mixture_schedules.as_deref(),
+                    )
+                    .0;
                     crate::estimation::fd_resolution::inner_resolved(&m.ebe_stats).then_some(m.ofv)
                 }
                 FdScope::Whole => subset_tight_ofv(xv, population, &warm),
@@ -3907,9 +3934,15 @@ pub(crate) fn run_covariance_step(
     if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
         #[cfg(test)]
         COVARIANCE_STEPS_RUN.lock().unwrap().push(population as *const Population as usize);
-        run_covariance_step_inner(
+        // The step records plans of its own (third-order layouts) and keeps none of the
+        // estimation's: release those before it and its own after it, so its peak replaces
+        // the estimation plateau instead of stacking on it (#3077).
+        crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
+        let out = run_covariance_step_inner(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, options, pre_msg,
-        )
+        );
+        crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
+        out
     } else {
         CovStepOutcome {
             matrix: None,
@@ -4057,7 +4090,7 @@ mod tests {
             threads: Some(1),
             ..FitOptions::default()
         };
-        let posthoc = crate::api::with_fit_scope(&fd_opts, has_fd).expect("scope");
+        let posthoc = crate::pool::with_fit_scope(&fd_opts, has_fd).expect("scope");
         assert!(posthoc, "run_covariance's scope must carry gradient = fd");
         assert!(!has_fd(), "the guard and the scope disarm on exit");
     }
@@ -4102,6 +4135,14 @@ mod tests {
         )
         .unwrap();
         assert!(super::analytic_r_expected(&m, &defaulted));
+        // A mixture has its own exact R (`mixture::mixture_cov_hessian`) under every class
+        // objective, Laplace and AGQ included (#3025): the route is the model's, not the method's.
+        for method in
+            [crate::types::EstimationMethod::FoceI, crate::types::EstimationMethod::Laplace]
+        {
+            let o = FitOptions { method, ..defaulted.clone() };
+            assert!(super::analytic_r_expected(&m, &o), "{method:?}");
+        }
         let disabled = FitOptions { analytic_cov_hessian: false, ..defaulted };
         assert!(!super::analytic_r_expected(&m, &disabled));
     }
@@ -6031,7 +6072,7 @@ mod tests {
         let free_idx: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
         assert_eq!(free_idx.len(), 1, "fixture: ω² alone is free");
         let s = super::assemble_score_cross_product(
-            &x, &p, &model, &pop, &etas, &kappas, &bounds, &opts, &free_idx,
+            &x, &p, &model, &pop, &etas, &kappas, &bounds, &opts, &free_idx, None,
         )
         .expect("S");
         let want = super::embed_free(
@@ -6755,7 +6796,7 @@ mod tests {
         let rec = on_one_thread(|| {
             record_inner_solves(|| {
                 super::assemble_score_cross_product(
-                    &x, p, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
+                    &x, p, &model, &pop, &etas, &kappas, &bounds, &opts, &free, None,
                 )
                 .expect("the S matrix")
             })

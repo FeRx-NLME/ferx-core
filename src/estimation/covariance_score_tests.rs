@@ -184,7 +184,7 @@ fn the_fd_fallback_rows_of_s_use_the_covariance_inner_tolerance() {
     let (etas, _, kappas) = modes(&model, &pop, &opts, 1e-12);
     let free: Vec<usize> = (0..x.len()).filter(|&j| !fixed[j]).collect();
     let s = assemble_score_cross_product(
-        &x, template, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
+        &x, template, &model, &pop, &etas, &kappas, &bounds, &opts, &free, None,
     )
     .expect("S assembles");
     let cross = |inner_tol: f64| {
@@ -279,7 +279,7 @@ fn iov_s_matrix_is_the_adjoint_rows_over_the_stacked_mode() {
     let (etas, _, kappas) = modes(&model, &pop, &opts, 1e-10);
     assert!(kappas.iter().any(|k| !k.is_empty()), "fixture: some subject carries κ̂");
     let s = assemble_score_cross_product(
-        &x, template, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
+        &x, template, &model, &pop, &etas, &kappas, &bounds, &opts, &free, None,
     )
     .expect("S");
     let pt = PackedPoint::new(template, &x).expect("packed point");

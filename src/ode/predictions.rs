@@ -5149,7 +5149,7 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
 }
 
 /// What a refusal of the reactive adaptive driver is about (#1983). The API layer
-/// gives each kind its code (`api/entry_refusals.rs`); `src/ode` names no code.
+/// gives each kind its code (`entry_refusals.rs`); `src/ode` names no code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdaptiveRefusalKind {
     /// The schedule meets the subject's own records in a way the driver cannot key
@@ -6733,7 +6733,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         }
                     };
                     signals.insert(m.name.clone(), value);
-                    observed.push(ObservedSignal { name: m.name.clone(), value, mode: m.mode });
+                    observed.push(ObservedSignal {
+                        name: m.name.clone(),
+                        value,
+                        latent,
+                        mode: m.mode,
+                    });
                 }
 
                 // #945: at a grid point that is not yet due under the dosing interval the

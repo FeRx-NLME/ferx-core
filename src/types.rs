@@ -651,7 +651,7 @@ pub enum DoseAttrConsumption {
     /// (modeled duration), `R{n}` on `RATE=-1` (modeled rate). On an ordinary
     /// dataset the parameter is inert, so `R1` as a plain rate constant is a
     /// perfectly correct model; the collision can only be judged with the data, in
-    /// `crate::api::check_modeled_dose_rates`.
+    /// `crate::model_checks::check_modeled_dose_rates`.
     CodedRateOnly,
 }
 
@@ -1556,7 +1556,7 @@ impl Subject {
     /// discrete-state or count row yields exactly one record and one snapshot, so the two
     /// lists are parallel, unless the subject also carries time-to-event rows, which can
     /// yield zero or two records per row. Those subjects, and an in-memory subject whose
-    /// snapshot length does not match, return `None`. `crate::api::check_survival_tv_covariates`
+    /// snapshot length does not match, return `None`. `crate::model_checks::check_survival_tv_covariates`
     /// refuses such a subject when a predictor covariate varies, so `None` only ever stands
     /// for "the baseline is exact". Shared by the binary predictor (#2562) and the DTMM
     /// probabilities (#2473).
@@ -2078,7 +2078,7 @@ pub struct CovariateDecl {
 /// make the generated θ vector — its length, its names, its order — a property
 /// of the data rather than of the model file. [`CovariateLevels::Auto`] is the
 /// opt-in to exactly that, and like a symbolic centering statistic it leaves
-/// the relation unresolved until [`crate::api::bind_covariate_stats`] has seen
+/// the relation unresolved until [`crate::covariate_stats::bind_covariate_stats`] has seen
 /// the population.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2258,7 +2258,7 @@ impl CovariateOp {
 /// Requiring a literal would make every generated covariate model
 /// dataset-specific, which defeats the automation this block exists for; so
 /// PsN's data-derived statistics are spelled out symbolically here and resolved
-/// by [`crate::api::bind_covariate_stats`]. Recommendation for users: literals
+/// by [`crate::covariate_stats::bind_covariate_stats`]. Recommendation for users: literals
 /// for a final model (reproducible from the file alone), symbolic for an
 /// automated search.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2334,7 +2334,7 @@ pub struct CovariateRelation {
     /// `none` and `expr(...)`, which take no constant.
     pub center: Option<CovariateStat>,
     /// The value `center` resolved to. Equal to the literal when one was
-    /// written; filled from the data by [`crate::api::bind_covariate_stats`]
+    /// written; filled from the data by [`crate::covariate_stats::bind_covariate_stats`]
     /// when the statistic was symbolic; `None` while still unresolved.
     pub resolved_center: Option<f64>,
     /// `fix = v`, when given.
@@ -2381,7 +2381,7 @@ pub struct CovariateModelSpec {
 impl CovariateModelSpec {
     /// The relations that could not be desugared for want of data-derived
     /// statistics. Non-empty means the model must be run through
-    /// [`crate::api::bind_covariate_stats`] before it can fit.
+    /// [`crate::covariate_stats::bind_covariate_stats`] before it can fit.
     pub fn unresolved(&self) -> Vec<&CovariateRelation> {
         self.relations.iter().filter(|r| r.needs_data()).collect()
     }
@@ -4621,7 +4621,7 @@ pub enum EndpointLikelihood {
         /// (analytic families — scale/shape/alpha/gamma/loghr). The analytic hazard
         /// is evaluated once per record with a *baseline* covariate snapshot (the
         /// [`HazardParamFn`] takes no time argument), so a time-varying covariate
-        /// here would be silently frozen; `crate::api::check_survival_tv_covariates`
+        /// here would be silently frozen; `crate::model_checks::check_survival_tv_covariates`
         /// rejects that up front (#741). Empty for [`HazardSpec::OdeAccumulated`],
         /// whose covariate dependencies flow through the ODE system and are guarded
         /// by the whole-subject time-varying-covariate check instead.
@@ -4657,7 +4657,7 @@ pub enum EndpointLikelihood {
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
         /// snapshot (the [`LinearPredictorFn`] takes no time argument), so a covariate
         /// listed here that turns out to be time-varying in the data is rejected at fit
-        /// setup by `crate::api::check_survival_tv_covariates` — the categorical
+        /// setup by `crate::model_checks::check_survival_tv_covariates` — the categorical
         /// analogue of [`Self::Tte`]'s `hazard_covariates` (#741).
         lp_covariates: Vec<String>,
     },
@@ -4694,7 +4694,7 @@ pub enum EndpointLikelihood {
         /// reached transitively through `[individual_parameters]`). Evaluated at a
         /// baseline snapshot, so a covariate listed here that is time-varying in
         /// the data is rejected at fit setup by
-        /// `crate::api::check_survival_tv_covariates` — the CTMM analogue of
+        /// `crate::model_checks::check_survival_tv_covariates` — the CTMM analogue of
         /// [`Self::Tte`]'s `hazard_covariates` and [`Self::Binary`]'s
         /// `lp_covariates` (#741).
         generator_covariates: Vec<String>,
@@ -4744,7 +4744,7 @@ pub enum EndpointLikelihood {
         /// reached through `[individual_parameters]`). Read at the **record being scored**,
         /// from the reader's per-row snapshot (`Subject::endpoint_covariates`); a subject
         /// whose snapshot cannot be aligned with its records while one of these varies is
-        /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
+        /// refused at fit setup by `crate::model_checks::check_survival_tv_covariates` (#741).
         prob_covariates: Vec<String>,
     },
     /// Count endpoint (#2877): a non-negative integer DV observed via
@@ -5143,7 +5143,7 @@ pub struct CompiledModel {
     /// `Some` here means the expansion has not run.
     ///
     /// Once per *parse*, not once per fit — and a model needing data-derived
-    /// bindings (`api::covariate_stats`, `api::levels`) is parsed twice, so it
+    /// bindings (`covariate_stats`, `levels`) is parsed twice, so it
     /// reads the file twice. Both reads precede any estimation, which is what
     /// the guarantee below is about.
     ///
@@ -5568,7 +5568,7 @@ pub(crate) fn install_worker_forced_fd(fd: bool) {
 
 /// Arms this call's `gradient = fd` on this thread until the guard drops, restoring whatever
 /// was in force before on every exit path. Arming reaches this thread only; the fan-out is
-/// carried by `api::pool::FitScope`, exactly as for the inner settings.
+/// carried by `pool::FitScope`, exactly as for the inner settings.
 #[must_use = "the forced-FD flag is disarmed as soon as this guard drops"]
 pub(crate) struct ForcedFdGuard {
     prev: Option<bool>,
@@ -7966,6 +7966,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // #2701: a finite-difference `H` at the final estimates ran at the fit's tolerance
         // because the Jacobian's tighter solve could not finish. Its own token, ahead of the
         // prose arms: the message says "finite-difference" and "objective".
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_ode_ofv_not_settled")
+        || lower.contains("w_ode_ofv_settlement_unchecked")
+    {
+        // #2994: re-solving at one decade tighter ODE tolerance moved the OFV, or could not be
+        // set up. Own tokens, ahead of the prose arms: the messages say "objective" and
+        // "non-finite".
         (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("w_nonfinite_objective") {
         // #1303: the convergence verdict was demoted because the objective at
@@ -10759,7 +10766,7 @@ pub(crate) fn install_worker_bloq_override(bloq: Option<BloqMethod>) {
 }
 
 /// Arms this call's `bloq_method` override on this thread until dropped (fan-out via
-/// `api::pool::FitScope`).
+/// `pool::FitScope`).
 #[must_use = "the bloq_method override is disarmed as soon as this guard drops"]
 pub(crate) struct BloqOverrideGuard {
     prev: Option<BloqMethod>,

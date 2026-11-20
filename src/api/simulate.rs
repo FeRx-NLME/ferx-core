@@ -155,7 +155,7 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
         return Ok(());
     };
     if !h.is_finite() || h <= 0.0 {
-        return Err(super::entry_refusals::simulate_horizon(format!(
+        return Err(crate::entry_refusals::simulate_horizon(format!(
             "{option_name} must be finite and > 0 (got {h})"
         )));
     }
@@ -170,7 +170,7 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
                 continue;
             };
             if *entry_time > h {
-                return Err(super::entry_refusals::simulate_horizon(format!(
+                return Err(crate::entry_refusals::simulate_horizon(format!(
                     "{option_name} ({h}) is below subject '{}' entry_time \
                      ({entry_time}); the administrative horizon must be ≥ every \
                      subject's entry time",
@@ -228,7 +228,7 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
 pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel, population: &Population, horizon: TteHorizon,
 ) -> Result<(), EngineError> {
-    use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
+    use crate::entry_refusals::{simulate_horizon, tte_not_simulatable};
     // The refusal for a required horizon that is missing or not finite and positive.
     // `what` names the endpoint kind, `why` the reason it needs one.
     let set_it = horizon.how_to_set();
@@ -395,7 +395,7 @@ pub(crate) fn validate_iov_simulatable(
              with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
             model.n_kappa
         );
-        return Err(super::entry_refusals::param_shape(message));
+        return Err(crate::entry_refusals::param_shape(message));
     }
     if let Some(omega_iov) = &params.omega_iov {
         crate::stats::nested_levels::check_cross_level_omega_iov(model, &omega_iov.matrix)?;
@@ -437,7 +437,7 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
             blocks.iter().map(|b| format!("`{b}`")).collect::<Vec<_>>().join(", ")
         ));
     }
-    Err(super::entry_refusals::theta_length(message))
+    Err(crate::entry_refusals::theta_length(message))
 }
 
 /// The shape of one random-effect or residual block a caller supplied, for
@@ -536,7 +536,7 @@ pub(crate) fn check_param_shape(
             }
             _ => continue,
         };
-        return Err(super::entry_refusals::param_shape(message));
+        return Err(crate::entry_refusals::param_shape(message));
     }
     Ok(())
 }
@@ -721,7 +721,7 @@ pub(crate) fn simulate_with_options_tallied(
     // refusal `fit()` gives the same rule.
     if let Some(levels) = model.nested_levels() {
         if opts.iov_occasion.as_ref().is_some_and(|r| *r != IovOccasionRule::Column) {
-            return Err(super::entry_refusals::level_mixed_with_iov_rule(&levels.levels[0].name));
+            return Err(crate::entry_refusals::level_mixed_with_iov_rule(&levels.levels[0].name));
         }
     }
     // A model-side occasion rule's labels come first (#1955), so every step below sees
@@ -851,7 +851,7 @@ pub(crate) fn simulate_with_options_tallied(
     // model both belong to a class: the posthoc pass below estimates every subject under
     // class 1, and the pool is drawn from one Ω (#2163).
     if model.mixture.is_some() {
-        return Err(super::entry_refusals::propensity_input(
+        return Err(crate::entry_refusals::propensity_input(
             "propensity-score matching is not supported on a [mixture] model: each \
              subject's posthoc eta would be estimated under class 1 rather than its own \
              class. Simulate without `match_method`; each subject then draws its class from \
@@ -859,12 +859,12 @@ pub(crate) fn simulate_with_options_tallied(
         ));
     }
     if population.subjects.is_empty() {
-        return Err(super::entry_refusals::propensity_input(
+        return Err(crate::entry_refusals::propensity_input(
             "propensity-score matching requires a non-empty observed population",
         ));
     }
     if let Some(s) = population.subjects.iter().find(|s| s.observations.is_empty()) {
-        return Err(super::entry_refusals::propensity_input(format!(
+        return Err(crate::entry_refusals::propensity_input(format!(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
             s.id
@@ -880,7 +880,7 @@ pub(crate) fn simulate_with_options_tallied(
     if let Some(s) =
         population.subjects.iter().find(|s| s.observations.iter().any(|v| !v.is_finite()))
     {
-        return Err(super::entry_refusals::propensity_input(format!(
+        return Err(crate::entry_refusals::propensity_input(format!(
             "propensity-score matching requires finite observations for every subject \
              (to compute posthoc etas); subject '{}' has non-finite DV values. A `DV = .` \
              design template carries NaN placeholders — match against the observed dataset \
@@ -1409,7 +1409,7 @@ pub(crate) fn check_mixture_param_shape(
 ) -> Result<(), EngineError> {
     let k = spec.n_classes;
     let Some(mp) = params.mixture.as_ref() else {
-        return Err(super::entry_refusals::param_shape(format!(
+        return Err(crate::entry_refusals::param_shape(format!(
             "this model declares a [mixture] of {k} classes, but the supplied parameters carry \
              no per-class omega/sigma (`mixture: None`); every class would be simulated at the \
              base omega and sigma, dropping any omega(k)/sigma(k) override. Pass the parsed \
@@ -1448,7 +1448,7 @@ pub(crate) fn check_mixture_param_shape(
         })
     };
     match message {
-        Some(m) => Err(super::entry_refusals::param_shape(m)),
+        Some(m) => Err(crate::entry_refusals::param_shape(m)),
         None => Ok(()),
     }
 }
@@ -1619,7 +1619,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // visits, so a simulation would silently drop them.
     #[cfg(feature = "markov")]
     if model.has_dtmm() {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "simulate()/predict() does not support a [markov_model] `type = dtmm` endpoint yet \
              — its discrete-time state chain has no simulation path, so its records would be \
              silently dropped. DTMM simulation is a later slice.",
@@ -1627,7 +1627,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     }
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
              discrete-state trajectory has no simulation path, so the Gaussian emitter would \
              produce meaningless all-zero observations. CTMM simulation is a later slice.",

@@ -1,5 +1,5 @@
 //! #1774 part b: every input refusal of `run_sir` / `run_covariance` carries a code,
-//! one per cause. The post-hoc codes are assigned in `api/entry_refusals.rs`; the
+//! one per cause. The post-hoc codes are assigned in `entry_refusals.rs`; the
 //! re-reads of `fit.model_path` and `fit.data_path` are coded by `ferx check`'s own
 //! read classifiers (`model_source_diagnostic`, `data_read_diagnostic`,
 //! `selection_filter_diagnostic` in `validation.rs`), so a failure both can reach gets

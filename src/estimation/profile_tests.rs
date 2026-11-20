@@ -1919,7 +1919,7 @@ fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
     let model = &p.parsed.model;
     let decl =
         model.indiv_param_partials.theta_blocks.decls.iter().find(|d| d.name == "PLACEBO").unwrap();
-    let al = crate::api::active_levels(model, &p.population);
+    let al = crate::levels::active_levels(model, &p.population);
     let per_subject = &al.iter().find(|a| a.block == "PLACEBO").unwrap().per_subject;
     assert_eq!(layout.groups.len(), 1, "the global contrast ties every level");
     assert_eq!(layout.borders.len(), 1, "one dependent level");
@@ -3886,8 +3886,9 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
     // A pinned level's study keeps its sum-to-zero dependent, whose delta-method SE is
     // over the study's free levels alone.
     let c = with_cov.covariance_matrix.as_ref().unwrap();
-    let levels = &crate::api::theta_level_values(&p.parsed.model, &with_cov.theta, Some(c), None)
-        .unwrap()["PLACEBO"];
+    let levels =
+        &crate::levels::theta_level_values(&p.parsed.model, &with_cov.theta, Some(c), None)
+            .unwrap()["PLACEBO"];
     let dep = levels
         .iter()
         .find(|l| l.theta_index.is_none() && l.label.contains("STUDY=3"))
@@ -5014,7 +5015,7 @@ fn the_profile_solve_counts_its_own_moved_states() {
     let params = &p.init_params;
     let counts = |mode| {
         let scoped = FitOptions { inner_optimizer: mode, ..o.clone() };
-        crate::api::with_fit_scope(&scoped, || {
+        crate::pool::with_fit_scope(&scoped, || {
             let warm = ProfileWarm::from_template(&layout, params);
             let mut ps = params.clone();
             for (pos, (&k, &b)) in layout.coords.iter().zip(&warm.beta).enumerate() {
@@ -5132,7 +5133,7 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
     assert!(moved > 0, "no NM stop needed the certificate");
     let solve_moved = |mode| {
         let o = FitOptions { inner_optimizer: mode, ..o.clone() };
-        crate::api::with_fit_scope(&o, || {
+        crate::pool::with_fit_scope(&o, || {
             cf.solve(params, &ProfileWarm::from_template(&layout, params))
                 .expect("the solve converges")
                 .ebe

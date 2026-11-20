@@ -155,13 +155,25 @@ pub(crate) struct ControllerDecision {
 }
 
 /// The value a monitored signal presented to the controller at a decision and its mode,
-/// recorded on each [`DoseLedgerEntry`] for decision-audit replay (#391 Part E).
+/// recorded on each [`DoseLedgerEntry`] for decision-audit replay (#391 Part E), next to
+/// the latent value it was read from (#946).
+///
+/// `#[non_exhaustive]`: built only by the engine, so a field added later is not a
+/// breaking change for readers.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ObservedSignal {
     /// Matches the [`MonitorSpec::name`] that produced it.
     pub name: String,
-    /// The resolved value (latent or assay-noised per the monitor's mode).
+    /// The value the controller saw: the latent readout under [`ObserveMode::Ipred`],
+    /// the assay-noised reading (clamped at 0 where the readout cannot be negative) under
+    /// [`ObserveMode::Dv`]. Kept for decision audit; the outcome metrics do not read it.
     pub value: f64,
+    /// The latent (noise-free) readout at the decision, before any assay draw or clamp.
+    /// Equal to `value` bit-for-bit under [`ObserveMode::Ipred`]. The outcome metrics
+    /// ([`AdaptiveSubjectMetrics::signal_min`] … `pct_readings_in_window`) are scored on it,
+    /// since assay error is not part of the patient's outcome (#946).
+    pub latent: f64,
     /// The mode it was resolved under.
     pub mode: ObserveMode,
 }
@@ -227,7 +239,8 @@ pub struct DoseLedgerEntry {
     /// Human-readable tag for the action/rule that fired (e.g. `"bolus"`, or a
     /// named ladder rule once S2 lands).
     pub rule_fired: String,
-    /// What the controller observed at this decision (per-analyte value + mode).
+    /// The signals at this decision, per analyte: the value the controller saw, its
+    /// latent readout (which the controller did not see, #946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// State immediately before / after the dose discontinuity, for the mass-balance
     /// checks (S6). `None` when snapshots are not retained.
@@ -284,8 +297,8 @@ impl DecisionOutcome {
 
 /// One decision the controller made, recorded for every decision time (holds included):
 /// the Part-D decision log and the input to the Part-E audit replay (S1.6). It pins what
-/// the controller saw (`observed_signals`, which under `Dv` holds the realized assay
-/// draw) and what it did. `state`, covariates and history are re-derivable from the
+/// the controller saw (`observed_signals`, whose `value` under `Dv` holds the realized
+/// assay draw, next to the `latent` readout the controller did not see) and what it did. `state`, covariates and history are re-derivable from the
 /// frozen inputs, so they are not stored. Nothing is logged after a `Stop`.
 /// `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -301,8 +314,8 @@ pub struct DecisionLogEntry {
     pub decision_idx: usize,
     /// Decision time on the subject's clock.
     pub time: f64,
-    /// What the controller observed at this decision (per-analyte value + mode) —
-    /// the exact inputs to reproduce the decision.
+    /// The signals at this decision, per analyte: the value the controller saw (the
+    /// exact input to reproduce the decision), its latent readout (#946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// What the controller did (dose / hold / stop), or `NotDue`.
     pub outcome: DecisionOutcome,
@@ -364,17 +377,23 @@ pub struct AdaptiveSubjectMetrics {
     pub discontinued: bool,
     /// Time of the `Stop` decision, or `None` if the run never discontinued.
     pub time_to_discontinuation: Option<f64>,
-    /// Lowest observed signal across the decisions that recorded one (the deepest
-    /// trough the monitor saw), or `None` if no decision recorded a signal.
+    /// Lowest latent signal ([`ObservedSignal::latent`] of the first monitor) across the
+    /// decisions that recorded one, or `None` if no decision recorded a signal. Scored on
+    /// the latent value, not the assay-noised reading, so a `Dv` monitor's noise moves
+    /// it only through the doses it changed (#946).
     pub signal_min: Option<f64>,
-    /// Highest observed signal across the decisions that recorded one.
+    /// Highest latent signal across the decisions that recorded one (see `signal_min`).
     pub signal_max: Option<f64>,
-    /// Mean observed signal across the decisions that recorded one.
+    /// Mean latent signal across the decisions that recorded one (see `signal_min`).
     pub signal_mean: Option<f64>,
-    /// Fraction of the signal-bearing decisions whose observed value fell within
-    /// `target_window` `[lo, hi]` (inclusive). Decisions without a signal are excluded.
-    /// `None` when no `target_window` is declared or no signal was recorded (#584).
-    pub pct_time_in_window: Option<f64>,
+    /// Fraction of the signal-bearing **decision readings** whose latent value
+    /// ([`ObservedSignal::latent`] of the first monitor) fell within `target_window`
+    /// `[lo, hi]` (inclusive), a fraction in `[0, 1]`. It counts readings, not elapsed
+    /// time: on an uneven grid each reading weighs the same. Decisions without a signal
+    /// are excluded. `None` when no `target_window` is declared or no signal was recorded
+    /// (#584). Latent, like `auc_target_attainment`, since #946, which also renamed it
+    /// from `pct_time_in_window`.
+    pub pct_readings_in_window: Option<f64>,
     /// Fraction of the closed inter-decision windows whose exposure (AUC of the latent
     /// signal) fell within `auc_target` `[lo, hi]` (inclusive), e.g. vancomycin AUC₂₄
     /// (#391 S2.5b). The denominator is `realized_decisions − 1`; `None` with fewer than
@@ -431,18 +450,27 @@ pub(crate) fn compute_subject_metrics(
     let discontinued = stop.is_some();
     let time_to_discontinuation = stop.map(|d| d.time);
 
-    // Over the first monitor's observed values; decisions without one are skipped.
+    // Over the first monitor's latent values (#946): the outcome is the patient's, and
+    // assay error is not part of it. Decisions without a signal are skipped.
     let signal_vals: Vec<f64> =
-        decisions.iter().filter_map(|d| d.observed_signals.first().map(|s| s.value)).collect();
+        decisions.iter().filter_map(|d| d.observed_signals.first().map(|s| s.latent)).collect();
     let (signal_min, signal_max, signal_mean) = if signal_vals.is_empty() {
         (None, None, None)
     } else {
-        let min = signal_vals.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = signal_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // NaN-propagating, unlike `f64::min`/`f64::max`, which drop a NaN. Unreachable
+        // through the engine (the monitor loop refuses a non-finite readout, #1578), but a
+        // NaN must surface here rather than vanish if that guard ever moves.
+        let nan_min = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) };
+        let nan_max = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) };
+        let min = signal_vals.iter().copied().fold(f64::INFINITY, nan_min);
+        let max = signal_vals.iter().copied().fold(f64::NEG_INFINITY, nan_max);
         let mean = signal_vals.iter().sum::<f64>() / signal_vals.len() as f64;
         (Some(min), Some(max), Some(mean))
     };
-    let pct_time_in_window = match target_window {
+    let pct_readings_in_window = match target_window {
+        // A NaN reading fails both comparisons and would count as a miss; surface it
+        // instead, as the min/max fold above does (same unreachable-today guard, #1578).
+        Some(_) if signal_vals.iter().any(|v| v.is_nan()) => Some(f64::NAN),
         Some((lo, hi)) if !signal_vals.is_empty() => {
             let n_in = signal_vals.iter().filter(|&&v| v >= lo && v <= hi).count();
             Some(n_in as f64 / signal_vals.len() as f64)
@@ -474,7 +502,7 @@ pub(crate) fn compute_subject_metrics(
         signal_min,
         signal_max,
         signal_mean,
-        pct_time_in_window,
+        pct_readings_in_window,
         auc_target_attainment,
         // The caller knows where the η came from; the ledger does not.
         eta_supplied: false,
@@ -701,7 +729,8 @@ pub struct AdaptiveDosingSpec {
     /// the LOCF row either way.
     pub decision_covariates: DecisionCovariates,
     /// Optional target band `[low, high]` (inclusive, `high` may be `+∞`) for the signal.
-    /// Feeds only `pct_time_in_window`, never dosing; `None` leaves it unreported. See
+    /// Feeds only `pct_readings_in_window` (scored on the latent signal, #946), never dosing;
+    /// `None` leaves it unreported. See
     /// [`crate::AdaptiveSubjectMetrics`].
     pub target_window: Option<(f64, f64)>,
     /// Optional exposure band `[low, high]` (inclusive; `low` finite `≥ 0`, `high` may be
@@ -2296,7 +2325,12 @@ mod tests {
 
     #[test]
     fn ledger_entry_and_observed_signal_round_trip() {
-        let obs = ObservedSignal { name: "CONC".to_string(), value: 12.5, mode: ObserveMode::Dv };
+        let obs = ObservedSignal {
+            name: "CONC".to_string(),
+            value: 12.5,
+            latent: 11.0,
+            mode: ObserveMode::Dv,
+        };
         let entry = DoseLedgerEntry {
             subject: "1".to_string(),
             draw: 0,
@@ -2322,7 +2356,12 @@ mod tests {
 
     #[test]
     fn decision_log_entry_round_trips_and_outcomes_are_distinct() {
-        let obs = ObservedSignal { name: "A".to_string(), value: 0.0, mode: ObserveMode::Ipred };
+        let obs = ObservedSignal {
+            name: "A".to_string(),
+            value: 0.0,
+            latent: 0.0,
+            mode: ObserveMode::Ipred,
+        };
         let entry = DecisionLogEntry {
             subject: "1".to_string(),
             draw: 0,
@@ -2545,12 +2584,80 @@ mod tests {
                     vec![ObservedSignal {
                         name: "signal".to_string(),
                         value: v,
+                        latent: v,
                         mode: ObserveMode::Ipred,
                     }]
                 })
                 .unwrap_or_default(),
             outcome,
             interval: None,
+        }
+    }
+
+    /// A `Dv` decision whose controller saw `value` while the latent readout was `latent`.
+    fn dv_decision(time: f64, value: f64, latent: f64) -> DecisionLogEntry {
+        DecisionLogEntry {
+            observed_signals: vec![ObservedSignal {
+                name: "signal".to_string(),
+                value,
+                latent,
+                mode: ObserveMode::Dv,
+            }],
+            ..decision(time, None, DecisionOutcome::Dosed { n: 1 })
+        }
+    }
+
+    #[test]
+    fn metrics_are_scored_on_latent_not_on_the_noised_value_946() {
+        // The noised values (8, 30, 15) and the latent ones (12, 18, 25) give different
+        // answers on every metric, so scoring on `value` again reddens each line.
+        let ledger = vec![ledger_entry(100.0)];
+        let decisions = vec![
+            dv_decision(0.0, 8.0, 12.0),
+            dv_decision(24.0, 30.0, 18.0),
+            dv_decision(48.0, 15.0, 25.0),
+        ];
+        let m =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
+        assert_eq!(m.signal_min, Some(12.0), "latent min, not the noised 8");
+        assert_eq!(m.signal_max, Some(25.0), "latent max, not the noised 30");
+        assert_eq!(m.signal_mean, Some(55.0 / 3.0), "latent mean, not the noised 53/3");
+        // Latent 12 and 18 are in [10, 20]; the noised values would put only 15 there.
+        assert_eq!(m.pct_readings_in_window, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn metrics_signal_summary_and_window_propagate_nan_946() {
+        // Unreachable through the engine (#1578 refuses a non-finite readout), so the
+        // signal is hand-built. `f64::min`/`f64::max` would drop the NaN and report the
+        // finite readings' 5 and 9 as if nothing happened; the window count would score
+        // it as a miss (2/3, since the band [5, 9] holds every finite reading).
+        let ledger = vec![ledger_entry(100.0)];
+        for nan_at in 0..3 {
+            let mut latents = [5.0, 7.0, 9.0];
+            latents[nan_at] = f64::NAN;
+            let decisions: Vec<_> = latents
+                .iter()
+                .enumerate()
+                .map(|(k, &l)| dv_decision(24.0 * k as f64, 1.0, l))
+                .collect();
+            let m = compute_subject_metrics(
+                "S",
+                1,
+                1,
+                &ledger,
+                &decisions,
+                Some((5.0, 9.0)),
+                None,
+                &[],
+            );
+            assert!(
+                m.pct_readings_in_window.is_some_and(f64::is_nan),
+                "NaN at {nan_at}: window {m:?}"
+            );
+            assert!(m.signal_min.is_some_and(f64::is_nan), "NaN at {nan_at}: min {m:?}");
+            assert!(m.signal_max.is_some_and(f64::is_nan), "NaN at {nan_at}: max {m:?}");
+            assert!(m.signal_mean.is_some_and(f64::is_nan), "NaN at {nan_at}: mean");
         }
     }
 
@@ -2586,12 +2693,12 @@ mod tests {
         assert_eq!(m.signal_min, Some(5.0));
         assert_eq!(m.signal_max, Some(45.0));
         assert_eq!(m.signal_mean, Some(19.0)); // (8+5+22+15+45)/5
-        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.pct_readings_in_window, None, "no target_window declared");
         assert_eq!(m.auc_target_attainment, None, "no auc_target declared");
     }
 
     #[test]
-    fn metrics_pct_time_in_window_counts_signals_in_band() {
+    fn metrics_pct_readings_in_window_counts_signals_in_band() {
         let ledger = vec![ledger_entry(100.0)];
         let decisions = vec![
             decision(0.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }),
@@ -2603,7 +2710,7 @@ mod tests {
         // Two-sided band [10, 20]: only 15 is in band ⇒ 1/5.
         let band =
             compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
-        assert_eq!(band.pct_time_in_window, Some(0.2));
+        assert_eq!(band.pct_readings_in_window, Some(0.2));
         // One-sided "at or above 10" ([10, +∞]): 22, 15, 45 ⇒ 3/5.
         let one_sided = compute_subject_metrics(
             "S",
@@ -2615,7 +2722,7 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(one_sided.pct_time_in_window, Some(0.6));
+        assert_eq!(one_sided.pct_readings_in_window, Some(0.6));
     }
 
     #[test]
@@ -2653,7 +2760,7 @@ mod tests {
         assert_eq!(m.signal_min, None);
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
-        assert_eq!(m.pct_time_in_window, None);
+        assert_eq!(m.pct_readings_in_window, None);
         // An `auc_target` was set, but the driver integrated no windows (no run), so
         // the exposure metric is `None` rather than a 0/0 NaN.
         assert_eq!(m.auc_target_attainment, None);
@@ -2661,7 +2768,7 @@ mod tests {
 
     #[test]
     fn metrics_signalless_decisions_are_excluded_not_counted_as_misses() {
-        // A mixed decision log: the signal summary and `pct_time_in_window` are over the
+        // A mixed decision log: the signal summary and `pct_readings_in_window` are over the
         // signal-bearing decisions only.
         let ledger = vec![ledger_entry(100.0), ledger_entry(100.0)];
         let decisions = vec![
@@ -2680,7 +2787,7 @@ mod tests {
         assert_eq!(m.signal_mean, Some(10.0));
         // Denominator = 2 signal-bearing decisions, of which one (12) is in band:
         // 1/2 = 0.5 — not 1/4 (raw decision count) and not 1/3.
-        assert_eq!(m.pct_time_in_window, Some(0.5));
+        assert_eq!(m.pct_readings_in_window, Some(0.5));
         // Holds are counted over all decisions, independent of whether a signal
         // was recorded, so the signal-less Hold still registers.
         assert_eq!(m.n_holds, 1);
@@ -2705,7 +2812,7 @@ mod tests {
             &window_aucs,
         );
         assert_eq!(m.auc_target_attainment, Some(0.5));
-        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.pct_readings_in_window, None, "no target_window declared");
 
         // One-sided "at or above 400" ([400, +∞]): 450, 520, 610 ⇒ 3/4.
         let one_sided = compute_subject_metrics(

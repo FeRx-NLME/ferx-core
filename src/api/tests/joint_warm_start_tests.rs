@@ -39,7 +39,7 @@ fn fit_recorded(
 /// `f` on the one-thread pool `fit()` would lease for `opts`, so the fit runs on this thread
 /// rather than installing a pool of its own, and the recorder sees its solves.
 fn on_fit_thread<R: Send>(opts: &FitOptions, f: impl FnOnce() -> R + Send) -> R {
-    crate::api::pool::fit_scope_pool(crate::api::pool::FitScope::of(opts), 1)
+    crate::pool::fit_scope_pool(crate::pool::FitScope::of(opts), 1)
         .expect("a one-thread fit pool")
         .install(f)
 }
