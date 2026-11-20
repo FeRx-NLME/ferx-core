@@ -2612,6 +2612,7 @@ fn preconditioned_hmc_step(
     if n == 0 || (0..n).any(|j| !(l[(j, j)] > 0.0)) || !(eps > 0.0) {
         return None;
     }
+    let mut eps_eff = eps;
     let g0 = match grad_at.take().filter(|g| g.len() == n) {
         Some(g) => g,
         None => pot.grad(eta, false)?.0,
@@ -2623,9 +2624,16 @@ fn preconditioned_hmc_step(
         Some(s) => s.max(1),
         None => {
             let t = HMC_TIME * (0.8 + 0.4 * rng.random::<f64>());
-            ((t / eps).ceil() as usize).clamp(1, max_leapfrog.max(1))
+            let n = ((t / eps).ceil() as usize).clamp(1, max_leapfrog.max(1));
+            // Integrate for exactly `t`: `ε = t/n`, no more than the adapted step. Measured
+            // (pk2_big stand-in, 10 seeds): the same −2LL, 1.97 against 2.18 leapfrog steps
+            // per transition and ~7 % less CPU than `n` steps of the adapted `ε` (which
+            // overshoot `t` by up to one step).
+            eps_eff = t / n as f64;
+            n
         }
     };
+    let eps = eps_eff;
     let mut g_end: Vec<f64> = Vec::new();
     let mut q = eta.to_vec();
     let mut p = p0.clone();
@@ -3194,11 +3202,15 @@ pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Optio
 ///
 /// `sigma_only_bobyqa` is where `auto` keeps `bobyqa` for a solve with no free θ: SAEM's, whose
 /// σ-only BOBYQA evaluations are *all* served by the prediction memo (one prediction pass per
-/// M-step, then residual arithmetic), so Newton's fused pass — a recording and its sweep — is
-/// extra work for no fewer evaluations (0–5% more instructions measured on the σ-only SAEM
-/// set). IMP/IMPMAP pass `false`: there BOBYQA keeps no memo (it is `subjects × K × n_obs`
-/// numbers at `imp_samples` per subject) and recomputes every σ-only evaluation, so Newton's
-/// memo is the gain (σ-only Newton is 0.39–0.54× BOBYQA's instructions).
+/// M-step, then residual arithmetic). Newton's σ-only pass needs no recording either (every θ
+/// pinned), and costs the same per iteration (pk2_big stand-in, 30 seeds: 7.21 against
+/// 7.28 ms), but its exact σ follows each draw's noise where the warm-started BOBYQA, stopping
+/// at its tolerance, smooths it, and the automatic exploration stop then fires later: K1
+/// median 2110 against 1805 (longer on 18 seeds, shorter on 8), ~10 % more CPU at the same
+/// −2LL (#2986). IMP/IMPMAP pass `false`: there BOBYQA keeps no memo (it is
+/// `subjects × K × n_obs` numbers at `imp_samples` per subject) and recomputes every σ-only
+/// evaluation, so Newton's memo is the gain (σ-only Newton is 0.39–0.54× BOBYQA's
+/// instructions).
 pub(crate) fn resolve_mstep_optimizer(
     model: &CompiledModel, requested: MstepOptimizer, score_sa_active: bool, is_mixture: bool,
     theta_free: bool, sigma_only_bobyqa: bool, label: &str,
@@ -6594,7 +6606,6 @@ pub fn run_saem(
                         ));
                         let kappas_mh_opt =
                             omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
-
                         // ---- Mixture E-step: draw the latent class ----
                         // Sample z_i ~ Categorical(PMIX_i) from the current
                         // posterior at this subject's η (and κ), then run the η

@@ -82,7 +82,7 @@ So `saem_kernel = hmc` with `isample_m3 = 1` adds a componentwise sweep after HM
 
 `hmc`, `nuts` and `mala` move a chain along the exact gradient of its subject's conditional log-density, `−log p(y_i, η_i)` (the same function every other kernel scores with), from the AD engine: the subject's compiled plan, the value from the same pass. Under IOV the move is joint over η and every occasion's κ. A chain the engine gives no gradient for runs two `m2` and two `m3` moves in their place that iteration; if it gives none at all, the fit says so.
 
-Both are preconditioned: the mass matrix is the inverse of the chain's running conditional covariance (its moments from the tenth draw after the Ω burn-in; under IOV the stacked `[η, κ]` moments), so in the integrator's coordinates a near-Gaussian posterior is close to N(0, I). Before a chain has those draws the metric is Ω's own factor. That is deliberate: a metric fitted to the posterior from the start (the Fisher information at η = 0) measured *worse* — the chains settle at once, the exploration stop fires early (two_cpt_oral_cov K1 295 against 455), and that model's V1–KA trap returned on 4 of 20 seeds. HMC integrates for about π/2 in those coordinates (jittered ±20 %), a nearly independent draw in two or three leapfrog steps; NUTS is Stan's multinomial No-U-Turn sampler to depth 5. The step size is adapted per chain towards an acceptance of 0.8 during exploration and frozen for the averaging phase. MALA is one leapfrog step from a fresh momentum — the Langevin proposal η′ = η − ½ε²·M⁻¹∇U(η) + ε·Lξ under the same metric, accepted with its Metropolis–Hastings ratio — with a step size of its own, adapted towards 0.574 (the optimal MALA acceptance, Roberts & Rosenthal 1998). Consecutive HMC and MALA transitions carry the gradient at the chain's state from one to the next, and the proposal's value comes from its gradient's pass (with IOV too, for a plain Gaussian residual), so a MALA transition costs one AD pass. Unit tests check all three kernels against the exact conditional moments, by quadrature, on a nonlinear model and on the joint IOV posterior, under the exact and a mis-scaled metric.
+Both are preconditioned: the mass matrix is the inverse of the chain's running conditional covariance (its moments from the tenth draw after the Ω burn-in; under IOV the stacked `[η, κ]` moments), so in the integrator's coordinates a near-Gaussian posterior is close to N(0, I). Before a chain has those draws the metric is Ω's own factor. That is deliberate: a metric fitted to the posterior from the start (the Fisher information at η = 0) measured *worse* — the chains settle at once, the exploration stop fires early (two_cpt_oral_cov K1 295 against 455), and that model's V1–KA trap returned on 4 of 20 seeds. HMC integrates for about π/2 in those coordinates (jittered ±20 %), exactly: `n = ⌈T/ε⌉` steps of `T/n`, a nearly independent draw in two or three leapfrog steps (stepping the adapted ε instead overshoots T by up to a step: measured 2.18 against 1.97 steps per transition and ~7 % more CPU on pk2s at the same −2LL); NUTS is Stan's multinomial No-U-Turn sampler to depth 5. The step size is adapted per chain towards an acceptance of 0.8 during exploration and frozen for the averaging phase. MALA is one leapfrog step from a fresh momentum — the Langevin proposal η′ = η − ½ε²·M⁻¹∇U(η) + ε·Lξ under the same metric, accepted with its Metropolis–Hastings ratio — with a step size of its own, adapted towards 0.574 (the optimal MALA acceptance, Roberts & Rosenthal 1998). Consecutive HMC and MALA transitions carry the gradient at the chain's state from one to the next, and the proposal's value comes from its gradient's pass (with IOV too, for a plain Gaussian residual), so a MALA transition costs one AD pass. Unit tests check all three kernels against the exact conditional moments, by quadrature, on a nonlinear model and on the joint IOV posterior, under the exact and a mis-scaled metric.
 
 `FitResult::saem_gradient_kernel` (and `-fit.yaml`) reports the transitions run and declined, the divergences in the averaging phase, the mean leapfrog steps, the averaging phase's mean acceptance and the median step size; a warning names more than 1 % divergences there, a mean acceptance below 0.6, or a step size at its floor.
 
@@ -757,12 +757,17 @@ The gain on the multi-θ models is mostly BOBYQA's old budget, not Newton: BOBYQ
 `2n + 1` evaluations on its first design, so on nine numerical θ nearly every M-step stopped
 on the budget far from the maximiser. Run to its tolerance (explicit `bobyqa` now) it
 reaches the same −2 log L (−3501 against Newton's −3502 on a nine-θ model); Newton gets there in 0.5 to 0.7 times the instructions. Where
-the M-step is σ only, BOBYQA's solve is already served by the prediction memo and Newton's
-fused value-score-information pass is the extra work (0 to 7 percent more instructions on 14
-SAEM models, two seeds each), so SAEM's `auto` keeps `bobyqa` there and the fit is the
-BOBYQA fit: identical estimates and instructions to `mstep_optimizer = bobyqa`. IMP and
-IMPMAP keep `newton` for σ-only solves, where BOBYQA has no memo and Newton's is the gain
-(0.39 to 0.54 times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
+the M-step is σ only (a combined error with every θ mu-referenced), both solves are served by
+the prediction memo — one prediction pass per M-step — and Newton's σ score and information
+are residual arithmetic on it, no recording: the same cost per iteration (0 to 7 percent more
+instructions on 14 SAEM models; 7.21 against 7.28 ms per iteration on the pk2_big stand-in).
+But Newton's exact σ follows each draw's noise, where the warm-started BOBYQA, stopping at its
+tolerance, smooths it, and the automatic exploration stop then fires later: on 30 pk2_big
+seeds K1 had a median of 2110 against 1805 (longer on 18 seeds, shorter on 8), about 10 percent
+more CPU at the same −2 log L. So SAEM's `auto` keeps `bobyqa` there and the fit is the BOBYQA
+fit: identical estimates and instructions to `mstep_optimizer = bobyqa`. IMP and IMPMAP keep
+`newton` for σ-only solves, where BOBYQA has no memo and Newton's is the gain (0.39 to 0.54
+times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
 with two θ that have no η, costs 1.14 times BOBYQA's instructions there.
 
 Newton's M-step is as exact as BOBYQA's at the same tolerance. On `pk1_nomu`, `pk2_big`,
