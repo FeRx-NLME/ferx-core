@@ -2426,6 +2426,29 @@ pub ferx_core::sim::adaptive::ObservedSignal::name: alloc::string::String
 pub ferx_core::sim::adaptive::ObservedSignal::value: f64
 pub mod ferx_core::sim::adaptive_control
 pub mod ferx_core::stats
+pub mod ferx_core::stats::cif
+pub enum ferx_core::stats::cif::CifInputError
+pub ferx_core::stats::cif::CifInputError::BadCause
+pub ferx_core::stats::cif::CifInputError::BadCause::index: usize
+pub ferx_core::stats::cif::CifInputError::BadCause::n_causes: usize
+pub ferx_core::stats::cif::CifInputError::BadCause::value: usize
+pub ferx_core::stats::cif::CifInputError::BadTime
+pub ferx_core::stats::cif::CifInputError::BadTime::index: usize
+pub ferx_core::stats::cif::CifInputError::BadTime::value: f64
+pub ferx_core::stats::cif::CifInputError::LengthMismatch
+pub ferx_core::stats::cif::CifInputError::LengthMismatch::causes: usize
+pub ferx_core::stats::cif::CifInputError::LengthMismatch::times: usize
+impl core::error::Error for ferx_core::stats::cif::CifInputError
+impl core::fmt::Display for ferx_core::stats::cif::CifInputError
+pub fn ferx_core::stats::cif::CifInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::stats::cif::CifCurve
+pub ferx_core::stats::cif::CifCurve::all_cause: ferx_core::stats::km::KmCurve
+pub ferx_core::stats::cif::CifCurve::cif: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::stats::cif::CifCurve::n_event: alloc::vec::Vec<alloc::vec::Vec<usize>>
+impl ferx_core::stats::cif::CifCurve
+pub fn ferx_core::stats::cif::CifCurve::at(&self, k: usize, t: f64) -> core::option::Option<f64>
+pub fn ferx_core::stats::cif::CifCurve::n_causes(&self) -> usize
+pub fn ferx_core::stats::cif::aalen_johansen(times: &[f64], causes: &[usize], n_causes: usize) -> core::result::Result<ferx_core::stats::cif::CifCurve, ferx_core::stats::cif::CifInputError>
 pub mod ferx_core::stats::convergence
 pub fn ferx_core::stats::convergence::effective_sample_size(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) -> f64
