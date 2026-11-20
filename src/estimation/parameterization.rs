@@ -2188,6 +2188,16 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
     col_offset + (i - j)
 }
 
+/// A θ's standard error on its own scale from its packed-scale variance `var`: the
+/// packed SE (`0.0` for a non-positive variance, as every `se_*` vector reports it)
+/// times the packing Jacobian. The one rule behind `se_theta` and a free level's
+/// standard error in `theta_level_values` (#1890), so the two are equal by
+/// construction rather than by a second formula.
+pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
+    let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
+    theta_packing_jacobian(theta, theta_lower) * se_packed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

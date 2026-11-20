@@ -221,24 +221,34 @@ fn run_sir_scoped(
     // Re-runs the inner loop (EBEs → the prediction walk), so it needs the same
     // dose-compartment precondition `fit()` enforces (#375) — a `Result`-returning
     // API must not abort the process from inside the walk. Mirrors `run_covariance`.
-    crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_dose_compartments(
+        model_ref, pop_ref,
+    ))?;
     // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: SIR on
     // a population read model-blind would resample the Gaussian half of a joint
     // likelihood. The re-read above is routed; this covers a supplied population.
-    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(model_ref, pop_ref, true))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_endpoint_routing(
+        model_ref, pop_ref, true,
+    ))?;
     // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
-    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
-        .map_err(|e| e.in_context("run_sir"))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_ode_method_linear(
+        model_ref, options,
+    ))
+    .map_err(|e| e.in_context("run_sir"))?;
     // A drug-driven CTMM generator reading a TIME-dependent disposition is scored under a
     // frozen TIME=0 `[odes]` solve (#1918). `fit()` refuses it; a fit from before that
     // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
     #[cfg(feature = "markov")]
-    crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_ctmm_time_dependent_pk_diags(
+        model_ref,
+    ))?;
     // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
     // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
     // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
     #[cfg(feature = "survival")]
-    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(model_ref, pop_ref))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a

@@ -3999,7 +3999,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 /// NAME[COL, ...]` block supplied (#1064).
 ///
 /// A level block's level count is a property of the *data*, which the first
-/// parse has not seen — so `api::levels::bind` reads the population, discovers
+/// parse has not seen — so `levels::bind` reads the population, discovers
 /// the observed combinations, and calls this. Re-parsing (milliseconds) is what
 /// lets the compiled closures be built once, with the real θ count, instead of
 /// being rebuilt in place after the fact.
@@ -6198,7 +6198,7 @@ pub fn parse_full_model_with(
     }
 
     // #1064: the columns a level block indexes on are read from the data
-    // by `api::levels::bind_theta_levels`, so they must be in the CSV read set
+    // by `levels::bind_theta_levels`, so they must be in the CSV read set
     // for the same reason as the mixing covariates above — otherwise a
     // `[covariates]`-declared model never loads `STUDY` and every row lands in
     // one level. `TIME` is the record time, not a covariate.
@@ -23389,7 +23389,7 @@ impl LevelContrast {
 /// A `theta NAME[COL, ...]` declaration, before its levels are known.
 ///
 /// The level count is a property of the *data*, so this is what the first parse
-/// produces; `api::levels::bind` discovers the observed combinations and
+/// produces; `levels::bind` discovers the observed combinations and
 /// re-parses with a [`LevelBinding`] in hand.
 #[derive(Debug, Clone)]
 pub struct LevelBlockDecl {
@@ -23573,7 +23573,7 @@ pub struct ThetaBlocks {
     /// Per θ block (#1065, #2108 follow-up B): the plain data column every read of it is
     /// indexed by, or `None` when some read indexes it by anything else
     /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
-    /// `api::levels::levels_read`: the profile solve's per-subject levels and the
+    /// `levels::levels_read`: the profile solve's per-subject levels and the
     /// `W_COV_RSR_ONE_SUBJECT_LEVELS` count.
     pub(crate) read_index: Vec<(String, Option<String>)>,
 }

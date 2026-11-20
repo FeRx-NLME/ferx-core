@@ -9,11 +9,13 @@ use rand::RngExt;
 use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
-mod validation;
+pub(crate) mod validation;
 // `check_covariates` / `check_kappa_weights` / `check_residual_magnitude` are the
 // *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
 // the parts are re-exported for the unit tests that pin each one's message
 // individually — hence the allow, which would otherwise fire on a non-test build.
+#[allow(unused_imports)]
+pub(crate) use crate::occasions::apply_iov_occasion_rule;
 #[cfg(feature = "markov")]
 pub(crate) use validation::check_ctmm_time_dependent_pk_diags;
 pub(crate) use validation::{
@@ -24,15 +26,14 @@ pub(crate) use validation::{
 };
 #[allow(unused_imports)]
 pub(crate) use validation::{
-    apply_iov_occasion_rule, check_absorption_closed_form_support,
-    check_absorption_closed_form_support_diags, check_absorption_dosing,
-    check_absorption_flip_flop_no_twin, check_absorption_flip_flop_no_twin_diags,
-    check_analytic_readout_support, check_covariate_levels, check_covariate_model_bound,
-    check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
-    check_level_index_columns, check_modeled_dose_rates, check_ode_method_linear,
-    check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
-    check_unbound_theta_levels, check_variance_init_rails, unbound_level_refusal, LevelDataEntry,
-    UnboundLevelsEntry,
+    check_absorption_closed_form_support, check_absorption_closed_form_support_diags,
+    check_absorption_dosing, check_absorption_flip_flop_no_twin,
+    check_absorption_flip_flop_no_twin_diags, check_analytic_readout_support,
+    check_covariate_levels, check_covariate_model_bound, check_covariates, check_dose_compartments,
+    check_endpoint_routing, check_kappa_weights, check_level_index_columns,
+    check_modeled_dose_rates, check_ode_method_linear, check_packed_start_in_box,
+    check_residual_magnitude, check_simulation_data, check_unbound_theta_levels,
+    check_variance_init_rails, unbound_level_refusal, LevelDataEntry, UnboundLevelsEntry,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
@@ -53,9 +54,7 @@ pub(crate) use validation::check_survival_time_dependent_pk;
 // ── production submodules (peeled from this file) ──
 mod adaptive;
 mod adaptive_inputs;
-mod covariate_stats;
 mod fit;
-mod levels;
 mod output_columns;
 pub(crate) mod postfit;
 mod predict;
@@ -69,6 +68,7 @@ mod vpc_rtte;
 #[cfg(feature = "survival")]
 mod vpc_tte;
 
+pub use crate::covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub(crate) use crate::entry_refusals::{adaptive_spec, adaptive_unsupported_diag};
 pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
@@ -76,10 +76,7 @@ pub use adaptive::{
     DrawnParameters,
 };
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
-pub(crate) use covariate_stats::check_stats_on;
-pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
-pub(crate) use validation::check_level_labels;
 // The fit-scoped pools live at the crate root (#3041); `api` keeps their public paths.
 pub(crate) use crate::pool::install_on_fit_pool;
 pub use crate::pool::{
@@ -88,14 +85,12 @@ pub use crate::pool::{
 
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
-pub use levels::bind_theta_levels_from_fit;
-pub(crate) use levels::{
-    active_levels, bind_from_fit_on, rsr_one_subject_levels_warning, write_fitted_level_columns,
-};
-pub use levels::{
+pub use crate::levels::bind_theta_levels_from_fit;
+pub use crate::levels::{
     bind_from_fit, bind_theta_levels, layout_from_fit, level_map as theta_level_map,
     theta_level_values, ThetaLevelValue,
 };
+pub(crate) use crate::levels::{bind_from_fit_on, rsr_one_subject_levels_warning};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 // The fit path reaches these through `kappa_shrinkages` (#1911); the shrinkage tests
@@ -247,12 +242,7 @@ pub(crate) fn model_preds(
 
 // ── Step 7: [output] validation and TAFD/TAD helpers ────────────────────────
 
-/// Mandatory sdtab column names that are always written — declaring them in
-/// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
-const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
-    "EPRED", "PWRES", "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
-];
+use crate::model_checks::OUTPUT_MANDATORY;
 
 // ── Step 8: post-fit extra column computation ────────────────────────────────
 
