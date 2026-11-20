@@ -1950,6 +1950,7 @@ pub fn run_bayes(
             }
             m
         }),
+        vine_dist: None,
     };
 
     // Final EBEs + sensitivity (H) matrices at the posterior mean, warm-started

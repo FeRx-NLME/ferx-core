@@ -52,6 +52,7 @@ fn template(diagonal: bool) -> ModelParameters {
         sigma_fixed: vec![false],
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     }
 }
 

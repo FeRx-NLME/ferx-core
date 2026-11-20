@@ -600,6 +600,7 @@ pub fn ferx_core::estimation::impmap::run_impmap(model: &ferx_core::CompiledMode
 pub mod ferx_core::estimation::importance_sampling
 pub fn ferx_core::estimation::importance_sampling::run_importance_sampling(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::ImportanceSamplingResult, alloc::string::String>
 pub fn ferx_core::estimation::importance_sampling::run_importance_sampling_mixture(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::ImportanceSamplingResult, alloc::string::String>
+pub fn ferx_core::estimation::importance_sampling::run_importance_sampling_vine(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::ImportanceSamplingResult, alloc::string::String>
 pub mod ferx_core::estimation::inner_optimizer
 pub struct ferx_core::estimation::inner_optimizer::EbeResult
 pub ferx_core::estimation::inner_optimizer::EbeResult::converged: bool
@@ -675,6 +676,8 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::stationary_start: bool
 pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_fallbacks: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_nm_polished: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::vi: core::option::Option<ferx_core::ViResult>
+pub ferx_core::estimation::outer_optimizer::OuterResult::vine_corrected_ofv: core::option::Option<f64>
+pub ferx_core::estimation::outer_optimizer::OuterResult::vine_params: core::option::Option<ferx_core::stats::vine_copula::VineFitParams>
 pub ferx_core::estimation::outer_optimizer::OuterResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub fn ferx_core::estimation::outer_optimizer::optimize_population(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> ferx_core::estimation::outer_optimizer::OuterResult
 pub fn ferx_core::estimation::outer_optimizer::optimize_population_warm(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions, warm_etas: &[nalgebra::base::alias::DVector<f64>], warm_h_mats: &[nalgebra::base::alias::DMatrix<f64>]) -> ferx_core::estimation::outer_optimizer::OuterResult
@@ -2377,6 +2380,60 @@ pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) 
 pub fn ferx_core::stats::convergence::ess_tail(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::quantile_sorted(sorted: &[f64], q: f64) -> f64
 pub fn ferx_core::stats::convergence::split_rhat(chains: &[alloc::vec::Vec<f64>]) -> f64
+pub mod ferx_core::stats::copula
+pub enum ferx_core::stats::copula::CopulaFamily
+pub ferx_core::stats::copula::CopulaFamily::Clayton
+pub ferx_core::stats::copula::CopulaFamily::Clayton::rotation: ferx_core::stats::copula::CopulaRotation
+pub ferx_core::stats::copula::CopulaFamily::Clayton::theta: f64
+pub ferx_core::stats::copula::CopulaFamily::Frank
+pub ferx_core::stats::copula::CopulaFamily::Frank::theta: f64
+pub ferx_core::stats::copula::CopulaFamily::Gaussian
+pub ferx_core::stats::copula::CopulaFamily::Gaussian::rho: f64
+pub ferx_core::stats::copula::CopulaFamily::Gumbel
+pub ferx_core::stats::copula::CopulaFamily::Gumbel::rotation: ferx_core::stats::copula::CopulaRotation
+pub ferx_core::stats::copula::CopulaFamily::Gumbel::theta: f64
+pub ferx_core::stats::copula::CopulaFamily::Independence
+pub ferx_core::stats::copula::CopulaFamily::StudentT
+pub ferx_core::stats::copula::CopulaFamily::StudentT::nu: f64
+pub ferx_core::stats::copula::CopulaFamily::StudentT::rho: f64
+impl ferx_core::stats::copula::CopulaFamily
+pub fn ferx_core::stats::copula::CopulaFamily::base_family_name(&self) -> &'static str
+pub fn ferx_core::stats::copula::CopulaFamily::clayton(theta: f64, rotation: ferx_core::stats::copula::CopulaRotation) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::family_name(&self) -> &'static str
+pub fn ferx_core::stats::copula::CopulaFamily::fit_mle(&self, u: &[f64], v: &[f64]) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::frank(theta: f64) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::from_psi(&self, psi: &[f64]) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::gaussian(rho: f64) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::gumbel(theta: f64, rotation: ferx_core::stats::copula::CopulaRotation) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::h1(&self, u: f64, v: f64) -> f64
+pub fn ferx_core::stats::copula::CopulaFamily::h1_inv(&self, p: f64, v: f64) -> f64
+pub fn ferx_core::stats::copula::CopulaFamily::h2(&self, v: f64, u: f64) -> f64
+pub fn ferx_core::stats::copula::CopulaFamily::h2_inv(&self, p: f64, u: f64) -> f64
+pub fn ferx_core::stats::copula::CopulaFamily::kendall_tau(&self) -> f64
+pub fn ferx_core::stats::copula::CopulaFamily::log_density(&self, u: f64, v: f64) -> f64
+pub fn ferx_core::stats::copula::CopulaFamily::n_params(&self) -> usize
+pub fn ferx_core::stats::copula::CopulaFamily::named_params(&self) -> alloc::vec::Vec<(alloc::string::String, f64)>
+pub fn ferx_core::stats::copula::CopulaFamily::observed_se(&self, u: &[f64], v: &[f64], weight: f64) -> alloc::vec::Vec<(alloc::string::String, f64)>
+pub fn ferx_core::stats::copula::CopulaFamily::pack_psi(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::copula::CopulaFamily::rotation_degrees(&self) -> u16
+pub fn ferx_core::stats::copula::CopulaFamily::score_and_obs_info(&self, u: &[f64], v: &[f64], weight: f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
+pub fn ferx_core::stats::copula::CopulaFamily::select_bic(u: &[f64], v: &[f64], weight: f64, n_subjects: usize) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::student_t(rho: f64, nu: f64) -> Self
+pub fn ferx_core::stats::copula::CopulaFamily::tail_dependence(&self) -> (f64, f64)
+pub fn ferx_core::stats::copula::CopulaFamily::weighted_log_lik(&self, u: &[f64], v: &[f64], weight: f64) -> f64
+pub enum ferx_core::stats::copula::CopulaRotation
+pub ferx_core::stats::copula::CopulaRotation::R0
+pub ferx_core::stats::copula::CopulaRotation::R180
+pub ferx_core::stats::copula::CopulaRotation::R270
+pub ferx_core::stats::copula::CopulaRotation::R90
+impl ferx_core::stats::copula::CopulaRotation
+pub fn ferx_core::stats::copula::CopulaRotation::degrees(self) -> u16
+pub fn ferx_core::stats::copula::CopulaRotation::from_degrees(deg: u16) -> Self
+pub struct ferx_core::stats::copula::CopulaSaState
+impl ferx_core::stats::copula::CopulaSaState
+pub fn ferx_core::stats::copula::CopulaSaState::reset(&mut self)
+pub fn ferx_core::stats::copula::CopulaSaState::step(&mut self, cop: &mut ferx_core::stats::copula::CopulaFamily, u: &[f64], v: &[f64], gamma: f64)
+pub fn ferx_core::stats::copula::empirical_kendall_tau(u: &[f64], v: &[f64]) -> f64
 pub mod ferx_core::stats::km
 pub enum ferx_core::stats::km::KmInputError
 pub ferx_core::stats::km::KmInputError::BadProbs
@@ -2465,6 +2522,61 @@ pub fn ferx_core::stats::likelihood::iov_combined_pk_only(stacked_eta: &[f64], n
 pub fn ferx_core::stats::likelihood::iov_occ_to_k(occ_groups: &[(u32, alloc::vec::Vec<usize>)]) -> std::collections::hash::map::HashMap<u32, usize>
 pub fn ferx_core::stats::likelihood::iov_occasion_groups(subject: &ferx_core::Subject) -> alloc::vec::Vec<(u32, alloc::vec::Vec<usize>)>
 pub fn ferx_core::stats::likelihood::split_obs_by_occasion(subject: &ferx_core::Subject) -> alloc::vec::Vec<(u32, alloc::vec::Vec<usize>)>
+pub mod ferx_core::stats::marginals
+pub enum ferx_core::stats::marginals::MarginalDist
+pub ferx_core::stats::marginals::MarginalDist::Normal
+pub ferx_core::stats::marginals::MarginalDist::Normal::sd: f64
+pub ferx_core::stats::marginals::MarginalDist::SkewNormal
+pub ferx_core::stats::marginals::MarginalDist::SkewNormal::alpha: f64
+pub ferx_core::stats::marginals::MarginalDist::SkewNormal::omega: f64
+pub ferx_core::stats::marginals::MarginalDist::SkewT
+pub ferx_core::stats::marginals::MarginalDist::SkewT::alpha: f64
+pub ferx_core::stats::marginals::MarginalDist::SkewT::nu: f64
+pub ferx_core::stats::marginals::MarginalDist::SkewT::omega: f64
+pub ferx_core::stats::marginals::MarginalDist::StudentT
+pub ferx_core::stats::marginals::MarginalDist::StudentT::nu: f64
+pub ferx_core::stats::marginals::MarginalDist::StudentT::scale: f64
+impl ferx_core::stats::marginals::MarginalDist
+pub fn ferx_core::stats::marginals::MarginalDist::cdf(&self, eta: f64) -> f64
+pub fn ferx_core::stats::marginals::MarginalDist::d_log_pdf_d_eta(&self, eta: f64) -> f64
+pub fn ferx_core::stats::marginals::MarginalDist::excess_kurtosis(&self) -> core::option::Option<f64>
+pub fn ferx_core::stats::marginals::MarginalDist::family_name(&self) -> &'static str
+pub fn ferx_core::stats::marginals::MarginalDist::from_psi(&self, psi: &[f64]) -> Self
+pub fn ferx_core::stats::marginals::MarginalDist::from_summary(summary: &ferx_core::stats::marginals::MarginalSummary) -> Self
+pub fn ferx_core::stats::marginals::MarginalDist::log_pdf(&self, eta: f64) -> f64
+pub fn ferx_core::stats::marginals::MarginalDist::n_params(&self) -> usize
+pub fn ferx_core::stats::marginals::MarginalDist::named_params(&self) -> alloc::vec::Vec<(alloc::string::String, f64)>
+pub fn ferx_core::stats::marginals::MarginalDist::normal(sd: f64) -> Self
+pub fn ferx_core::stats::marginals::MarginalDist::observed_se(&self, samples: &[f64], weight: f64) -> alloc::vec::Vec<(alloc::string::String, f64)>
+pub fn ferx_core::stats::marginals::MarginalDist::pack_psi(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::marginals::MarginalDist::pdf(&self, eta: f64) -> f64
+pub fn ferx_core::stats::marginals::MarginalDist::quantile(&self, u: f64) -> f64
+pub fn ferx_core::stats::marginals::MarginalDist::score_and_obs_info(&self, samples: &[f64], weight: f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
+pub fn ferx_core::stats::marginals::MarginalDist::sd(&self) -> f64
+pub fn ferx_core::stats::marginals::MarginalDist::skew_normal(omega: f64, alpha: f64) -> Self
+pub fn ferx_core::stats::marginals::MarginalDist::skew_t(omega: f64, alpha: f64, nu: f64) -> Self
+pub fn ferx_core::stats::marginals::MarginalDist::skewness(&self) -> core::option::Option<f64>
+pub fn ferx_core::stats::marginals::MarginalDist::student_t(scale: f64, nu: f64) -> Self
+pub fn ferx_core::stats::marginals::MarginalDist::to_summary(&self, eta_name: &str, samples: &[f64], sample_weight: f64) -> ferx_core::stats::marginals::MarginalSummary
+pub fn ferx_core::stats::marginals::MarginalDist::weighted_log_lik(&self, samples: &[f64], weight: f64) -> f64
+pub struct ferx_core::stats::marginals::MarginalSaState
+impl ferx_core::stats::marginals::MarginalSaState
+pub fn ferx_core::stats::marginals::MarginalSaState::new() -> Self
+pub fn ferx_core::stats::marginals::MarginalSaState::reset(&mut self)
+pub fn ferx_core::stats::marginals::MarginalSaState::step(&mut self, dist: &mut ferx_core::stats::marginals::MarginalDist, samples: &[f64], gamma: f64)
+impl core::default::Default for ferx_core::stats::marginals::MarginalSaState
+pub fn ferx_core::stats::marginals::MarginalSaState::default() -> Self
+pub struct ferx_core::stats::marginals::MarginalSummary
+pub ferx_core::stats::marginals::MarginalSummary::eta: alloc::string::String
+pub ferx_core::stats::marginals::MarginalSummary::excess_kurtosis: core::option::Option<f64>
+pub ferx_core::stats::marginals::MarginalSummary::family: alloc::string::String
+pub ferx_core::stats::marginals::MarginalSummary::mean: f64
+pub ferx_core::stats::marginals::MarginalSummary::params: alloc::vec::Vec<(alloc::string::String, f64)>
+pub ferx_core::stats::marginals::MarginalSummary::sd: f64
+pub ferx_core::stats::marginals::MarginalSummary::se: alloc::vec::Vec<(alloc::string::String, f64)>
+pub ferx_core::stats::marginals::MarginalSummary::skewness: core::option::Option<f64>
+pub fn ferx_core::stats::marginals::fit_marginal_weighted(template: ferx_core::stats::marginals::MarginalDist, samples: &[f64], weight: f64) -> ferx_core::stats::marginals::MarginalDist
+pub fn ferx_core::stats::marginals::select_marginal_bic(samples: &[f64], weight: f64, n_subjects: usize, allow_flexible: bool) -> ferx_core::stats::marginals::MarginalDist
 pub mod ferx_core::stats::npde
 pub struct ferx_core::stats::npde::SubjectNpde
 pub ferx_core::stats::npde::SubjectNpde::epred: alloc::vec::Vec<f64>
@@ -2481,6 +2593,50 @@ pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel
 pub fn ferx_core::stats::npde::compute_npde_npd_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::compute_tte_npde(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<alloc::vec::Vec<ferx_core::stats::npde::TteNpde>>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::effective_seed(seed: core::option::Option<u64>) -> u64
+pub mod ferx_core::stats::random_effects
+pub struct ferx_core::stats::random_effects::GaussianOmega
+impl ferx_core::stats::random_effects::GaussianOmega
+pub fn ferx_core::stats::random_effects::GaussianOmega::from_init_params(init_params: &ferx_core::ModelParameters) -> Self
+impl ferx_core::stats::random_effects::RandomEffectDistribution for ferx_core::stats::random_effects::GaussianOmega
+pub fn ferx_core::stats::random_effects::GaussianOmega::dim(&self) -> usize
+pub fn ferx_core::stats::random_effects::GaussianOmega::log_density(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::random_effects::GaussianOmega::marginal_sds(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::random_effects::GaussianOmega::mstep_update(&mut self, sampled_etas: &[alloc::vec::Vec<f64>], gamma: f64)
+pub fn ferx_core::stats::random_effects::GaussianOmega::prior_nll(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::random_effects::GaussianOmega::prior_nll_grad(&self, eta: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::random_effects::GaussianOmega::proposal_chol(&self) -> &nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::stats::random_effects::GaussianOmega::sample(&self, n: usize, rng: &mut impl rand_core::Rng) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub fn ferx_core::stats::random_effects::GaussianOmega::to_omega_matrix(&self) -> &ferx_core::OmegaMatrix
+pub trait ferx_core::stats::random_effects::RandomEffectDistribution: core::marker::Send + core::marker::Sync
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::dim(&self) -> usize
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::log_density(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::marginal_sds(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::mstep_update(&mut self, sampled_etas: &[alloc::vec::Vec<f64>], gamma: f64)
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::prior_nll(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::prior_nll_grad(&self, eta: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::proposal_chol(&self) -> &nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::sample(&self, n: usize, rng: &mut impl rand_core::Rng) -> alloc::vec::Vec<alloc::vec::Vec<f64>> where Self: core::marker::Sized
+pub fn ferx_core::stats::random_effects::RandomEffectDistribution::to_omega_matrix(&self) -> &ferx_core::OmegaMatrix
+impl ferx_core::stats::random_effects::RandomEffectDistribution for ferx_core::stats::random_effects::GaussianOmega
+pub fn ferx_core::stats::random_effects::GaussianOmega::dim(&self) -> usize
+pub fn ferx_core::stats::random_effects::GaussianOmega::log_density(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::random_effects::GaussianOmega::marginal_sds(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::random_effects::GaussianOmega::mstep_update(&mut self, sampled_etas: &[alloc::vec::Vec<f64>], gamma: f64)
+pub fn ferx_core::stats::random_effects::GaussianOmega::prior_nll(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::random_effects::GaussianOmega::prior_nll_grad(&self, eta: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::random_effects::GaussianOmega::proposal_chol(&self) -> &nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::stats::random_effects::GaussianOmega::sample(&self, n: usize, rng: &mut impl rand_core::Rng) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub fn ferx_core::stats::random_effects::GaussianOmega::to_omega_matrix(&self) -> &ferx_core::OmegaMatrix
+impl ferx_core::stats::random_effects::RandomEffectDistribution for ferx_core::stats::vine_copula::VineCopulaOmega
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::dim(&self) -> usize
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::log_density(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::marginal_sds(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::mstep_update(&mut self, sampled_etas: &[alloc::vec::Vec<f64>], gamma: f64)
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::prior_nll(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::prior_nll_grad(&self, eta: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::proposal_chol(&self) -> &nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::sample(&self, n: usize, rng: &mut impl rand_core::Rng) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::to_omega_matrix(&self) -> &ferx_core::OmegaMatrix
 pub mod ferx_core::stats::residual_error
 pub fn ferx_core::stats::residual_error::compute_d2r_df2_matrices(error_spec: &ferx_core::ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64], obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64], correlations: &[ferx_core::ResidualCorrelation], mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>>
 pub fn ferx_core::stats::residual_error::compute_dr_df_matrices(error_spec: &ferx_core::ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64], obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64], correlations: &[ferx_core::ResidualCorrelation], mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>
@@ -2514,6 +2670,69 @@ pub fn ferx_core::stats::special::normal_inv_cdf(p: f64) -> f64
 pub fn ferx_core::stats::special::regularized_gamma_p<T: ferx_core::sens::num::PkNum>(a: T, x: T) -> T
 pub fn ferx_core::stats::special::regularized_gamma_q<T: ferx_core::sens::num::PkNum>(a: T, x: T) -> T
 pub fn ferx_core::stats::special::trigamma(x: f64) -> f64
+pub mod ferx_core::stats::vine_copula
+pub struct ferx_core::stats::vine_copula::PairCopulaSummary
+pub ferx_core::stats::vine_copula::PairCopulaSummary::family: alloc::string::String
+pub ferx_core::stats::vine_copula::PairCopulaSummary::kendall_tau: f64
+pub ferx_core::stats::vine_copula::PairCopulaSummary::params: alloc::vec::Vec<(alloc::string::String, f64)>
+pub ferx_core::stats::vine_copula::PairCopulaSummary::rotation: u16
+pub ferx_core::stats::vine_copula::PairCopulaSummary::se: alloc::vec::Vec<(alloc::string::String, f64)>
+pub ferx_core::stats::vine_copula::PairCopulaSummary::tail_dep_lower: f64
+pub ferx_core::stats::vine_copula::PairCopulaSummary::tail_dep_upper: f64
+pub struct ferx_core::stats::vine_copula::RVine
+pub ferx_core::stats::vine_copula::RVine::d: usize
+pub ferx_core::stats::vine_copula::RVine::inv_perm: alloc::vec::Vec<usize>
+pub ferx_core::stats::vine_copula::RVine::perm: alloc::vec::Vec<usize>
+impl ferx_core::stats::vine_copula::RVine
+pub fn ferx_core::stats::vine_copula::RVine::independence_dvine(d: usize) -> Self
+pub fn ferx_core::stats::vine_copula::RVine::log_density(&self, u_orig: &[f64]) -> f64
+pub fn ferx_core::stats::vine_copula::RVine::n_free_params(&self) -> usize
+pub fn ferx_core::stats::vine_copula::RVine::rosenblatt_forward(&self, u_orig: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::RVine::rosenblatt_inverse(&self, w: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::RVine::set_edge_copula(&mut self, col_int: usize, tree: usize, copula: ferx_core::stats::copula::CopulaFamily)
+pub struct ferx_core::stats::vine_copula::VineCopulaOmega
+pub ferx_core::stats::vine_copula::VineCopulaOmega::allow_flexible_marginals: bool
+pub ferx_core::stats::vine_copula::VineCopulaOmega::d: usize
+pub ferx_core::stats::vine_copula::VineCopulaOmega::marginals: alloc::vec::Vec<ferx_core::stats::marginals::MarginalDist>
+pub ferx_core::stats::vine_copula::VineCopulaOmega::rvine: ferx_core::stats::vine_copula::RVine
+pub ferx_core::stats::vine_copula::VineCopulaOmega::selected: bool
+impl ferx_core::stats::vine_copula::VineCopulaOmega
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::density(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::draw_eta<R: rand_core::Rng + ?core::marker::Sized>(&self, rng: &mut R) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::draw_eta_from_uniforms(&self, w: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::from_fit_params(params: &ferx_core::stats::vine_copula::VineFitParams) -> Self
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::from_init_params(init_params: &ferx_core::ModelParameters, allow_flexible_marginals: bool) -> Self
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::is_selected(&self) -> bool
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::is_zero_fixed(&self, j: usize) -> bool
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::n_free_params(&self) -> usize
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::pit_samples(&self, etas: &[alloc::vec::Vec<f64>]) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::select_structure_and_families(&mut self, pooled_etas: &[alloc::vec::Vec<f64>], n_subjects: usize, weight: f64)
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::to_fit_params(&self, eta_names: &[alloc::string::String]) -> ferx_core::stats::vine_copula::VineFitParams
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::warmup_gaussian_update(&mut self, sampled_etas: &[alloc::vec::Vec<f64>], gamma: f64)
+impl ferx_core::stats::random_effects::RandomEffectDistribution for ferx_core::stats::vine_copula::VineCopulaOmega
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::dim(&self) -> usize
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::log_density(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::marginal_sds(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::mstep_update(&mut self, sampled_etas: &[alloc::vec::Vec<f64>], gamma: f64)
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::prior_nll(&self, eta: &[f64]) -> f64
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::prior_nll_grad(&self, eta: &[f64]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::proposal_chol(&self) -> &nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::sample(&self, n: usize, rng: &mut impl rand_core::Rng) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::to_omega_matrix(&self) -> &ferx_core::OmegaMatrix
+pub struct ferx_core::stats::vine_copula::VineFitParams
+pub ferx_core::stats::vine_copula::VineFitParams::marginals: alloc::vec::Vec<ferx_core::stats::marginals::MarginalSummary>
+pub ferx_core::stats::vine_copula::VineFitParams::rvine: ferx_core::stats::vine_copula::RVine
+pub ferx_core::stats::vine_copula::VineFitParams::trees: alloc::vec::Vec<ferx_core::stats::vine_copula::VineTreeSummary>
+impl ferx_core::stats::vine_copula::VineFitParams
+pub fn ferx_core::stats::vine_copula::VineFitParams::n_free_params(&self) -> usize
+pub struct ferx_core::stats::vine_copula::VinePairEntry
+pub ferx_core::stats::vine_copula::VinePairEntry::copula: ferx_core::stats::vine_copula::PairCopulaSummary
+pub ferx_core::stats::vine_copula::VinePairEntry::edge_coord: (usize, usize)
+pub ferx_core::stats::vine_copula::VinePairEntry::label: alloc::string::String
+pub struct ferx_core::stats::vine_copula::VineTreeSummary
+pub ferx_core::stats::vine_copula::VineTreeSummary::pairs: alloc::vec::Vec<ferx_core::stats::vine_copula::VinePairEntry>
+pub ferx_core::stats::vine_copula::VineTreeSummary::tree: usize
+pub fn ferx_core::stats::vine_copula::select_rvine_dissmann(u_samples: &[alloc::vec::Vec<f64>], weight: f64, n_subjects: usize, zero_fixed: &[bool], gaussian_only: bool) -> (ferx_core::stats::vine_copula::RVine, alloc::vec::Vec<alloc::vec::Vec<(alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)>>)
 pub mod ferx_core::suggest_start
 pub enum ferx_core::suggest_start::NcaInit
 pub ferx_core::suggest_start::NcaInit::Ebe
@@ -2837,6 +3056,11 @@ pub ferx_core::types::ObsRecord::Event::cmt: usize
 pub ferx_core::types::ObsRecord::Event::entry_time: f64
 pub ferx_core::types::ObsRecord::Event::event_type: ferx_core::EventType
 pub ferx_core::types::ObsRecord::Event::time: f64
+pub enum ferx_core::types::OmegaDist
+pub ferx_core::types::OmegaDist::Gaussian
+pub ferx_core::types::OmegaDist::VineCopula
+impl ferx_core::OmegaDist
+pub fn ferx_core::OmegaDist::label(self) -> &'static str
 pub enum ferx_core::types::Optimizer
 pub ferx_core::types::Optimizer::Auto
 pub ferx_core::types::Optimizer::Bfgs
@@ -2982,6 +3206,11 @@ pub ferx_core::types::ViOmegaUpdate::ClosedForm
 pub enum ferx_core::types::ViSigmaUpdate
 pub ferx_core::types::ViSigmaUpdate::Adam
 pub ferx_core::types::ViSigmaUpdate::ClosedForm
+pub enum ferx_core::types::VineMarginals
+pub ferx_core::types::VineMarginals::Auto
+pub ferx_core::types::VineMarginals::Gaussian
+impl ferx_core::VineMarginals
+pub fn ferx_core::VineMarginals::label(self) -> &'static str
 #[non_exhaustive] pub enum ferx_core::types::WarningCode
 pub ferx_core::types::WarningCode::AbsorptionTwinDeclined
 pub ferx_core::types::WarningCode::BloqMethod
@@ -3446,6 +3675,7 @@ pub ferx_core::types::FitOptions::saem_ofv_nodes: usize
 pub ferx_core::types::FitOptions::saem_ofv_pilot_samples: usize
 pub ferx_core::types::FitOptions::saem_ofv_samples: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
+pub ferx_core::types::FitOptions::saem_omega_dist: ferx_core::OmegaDist
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::types::FitOptions::saem_seed: core::option::Option<u64>
@@ -3475,6 +3705,7 @@ pub ferx_core::types::FitOptions::vi_mc_samples: usize
 pub ferx_core::types::FitOptions::vi_omega_update: ferx_core::ViOmegaUpdate
 pub ferx_core::types::FitOptions::vi_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::vi_sigma_update: ferx_core::ViSigmaUpdate
+pub ferx_core::types::FitOptions::vine_marginals: ferx_core::VineMarginals
 impl ferx_core::FitOptions
 pub const ferx_core::FitOptions::LTBS_COV_INNER_TOL: f64
 pub const ferx_core::FitOptions::LTBS_FIT_INNER_TOL: f64
@@ -3640,6 +3871,8 @@ pub ferx_core::types::FitResult::trace_path: core::option::Option<alloc::string:
 pub ferx_core::types::FitResult::uses_ode_solver: bool
 pub ferx_core::types::FitResult::uses_sde: bool
 pub ferx_core::types::FitResult::vi: core::option::Option<ferx_core::ViResult>
+pub ferx_core::types::FitResult::vine_corrected_ofv: core::option::Option<f64>
+pub ferx_core::types::FitResult::vine_params: core::option::Option<ferx_core::stats::vine_copula::VineFitParams>
 pub ferx_core::types::FitResult::wall_time_secs: f64
 pub ferx_core::types::FitResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::warnings_structured: alloc::vec::Vec<ferx_core::WarningEntry>
@@ -3745,6 +3978,7 @@ pub ferx_core::types::ModelParameters::theta_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::ModelParameters::theta_lower: alloc::vec::Vec<f64>
 pub ferx_core::types::ModelParameters::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::ModelParameters::theta_upper: alloc::vec::Vec<f64>
+pub ferx_core::types::ModelParameters::vine_dist: core::option::Option<alloc::sync::Arc<ferx_core::stats::vine_copula::VineCopulaOmega>>
 pub struct ferx_core::types::MuRef
 pub ferx_core::types::MuRef::theta_name: alloc::string::String
 pub ferx_core::types::MuRef::transform: ferx_core::MuTransform
@@ -4398,6 +4632,11 @@ pub ferx_core::ObsRecord::Event::time: f64
 pub enum ferx_core::ObserveMode
 pub ferx_core::ObserveMode::Dv
 pub ferx_core::ObserveMode::Ipred
+pub enum ferx_core::OmegaDist
+pub ferx_core::OmegaDist::Gaussian
+pub ferx_core::OmegaDist::VineCopula
+impl ferx_core::OmegaDist
+pub fn ferx_core::OmegaDist::label(self) -> &'static str
 pub enum ferx_core::Optimizer
 pub ferx_core::Optimizer::Auto
 pub ferx_core::Optimizer::Bfgs
@@ -4553,6 +4792,11 @@ pub ferx_core::ViOmegaUpdate::ClosedForm
 pub enum ferx_core::ViSigmaUpdate
 pub ferx_core::ViSigmaUpdate::Adam
 pub ferx_core::ViSigmaUpdate::ClosedForm
+pub enum ferx_core::VineMarginals
+pub ferx_core::VineMarginals::Auto
+pub ferx_core::VineMarginals::Gaussian
+impl ferx_core::VineMarginals
+pub fn ferx_core::VineMarginals::label(self) -> &'static str
 pub enum ferx_core::VpcCensoring
 pub ferx_core::VpcCensoring::Horizon
 pub ferx_core::VpcCensoring::Observed
@@ -5193,6 +5437,7 @@ pub ferx_core::FitOptions::saem_ofv_nodes: usize
 pub ferx_core::FitOptions::saem_ofv_pilot_samples: usize
 pub ferx_core::FitOptions::saem_ofv_samples: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
+pub ferx_core::FitOptions::saem_omega_dist: ferx_core::OmegaDist
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::FitOptions::saem_seed: core::option::Option<u64>
@@ -5222,6 +5467,7 @@ pub ferx_core::FitOptions::vi_mc_samples: usize
 pub ferx_core::FitOptions::vi_omega_update: ferx_core::ViOmegaUpdate
 pub ferx_core::FitOptions::vi_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::vi_sigma_update: ferx_core::ViSigmaUpdate
+pub ferx_core::FitOptions::vine_marginals: ferx_core::VineMarginals
 impl ferx_core::FitOptions
 pub const ferx_core::FitOptions::LTBS_COV_INNER_TOL: f64
 pub const ferx_core::FitOptions::LTBS_FIT_INNER_TOL: f64
@@ -5387,6 +5633,8 @@ pub ferx_core::FitResult::trace_path: core::option::Option<alloc::string::String
 pub ferx_core::FitResult::uses_ode_solver: bool
 pub ferx_core::FitResult::uses_sde: bool
 pub ferx_core::FitResult::vi: core::option::Option<ferx_core::ViResult>
+pub ferx_core::FitResult::vine_corrected_ofv: core::option::Option<f64>
+pub ferx_core::FitResult::vine_params: core::option::Option<ferx_core::stats::vine_copula::VineFitParams>
 pub ferx_core::FitResult::wall_time_secs: f64
 pub ferx_core::FitResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::warnings_structured: alloc::vec::Vec<ferx_core::WarningEntry>
@@ -5532,6 +5780,7 @@ pub ferx_core::ModelParameters::theta_fixed: alloc::vec::Vec<bool>
 pub ferx_core::ModelParameters::theta_lower: alloc::vec::Vec<f64>
 pub ferx_core::ModelParameters::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::ModelParameters::theta_upper: alloc::vec::Vec<f64>
+pub ferx_core::ModelParameters::vine_dist: core::option::Option<alloc::sync::Arc<ferx_core::stats::vine_copula::VineCopulaOmega>>
 #[non_exhaustive] pub struct ferx_core::ModelSource
 pub ferx_core::ModelSource::hash: alloc::string::String
 pub ferx_core::ModelSource::parsed: ferx_core::ParsedModel

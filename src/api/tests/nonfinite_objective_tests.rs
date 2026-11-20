@@ -950,6 +950,7 @@ fn every_published_convergence_verdict_is_gated_on_its_objective() {
         // `converged: false`.
         ("src/estimation/profile.rs", (1, 1)),
         ("src/estimation/saem.rs", (1, 1)),
+        ("src/estimation/saem_vine.rs", (1, 1)),
         ("src/estimation/trust_region.rs", (1, 1)),
         ("src/estimation/vi/run.rs", (1, 1)),
         // Two synthetic evaluation-only `OuterResult`s (the AGQ readout and

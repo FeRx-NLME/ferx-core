@@ -1,0 +1,45 @@
+# Scenario A — Regular-Vine Copula (`omega_dist = vine`).
+#
+# Same 1-cpt IV model and data (`data/vine_tail_iv.csv`) as
+# `examples/vine_tail_iv_gaussian.ferx`. The data carry ASYMMETRIC lower-tail
+# dependence between ETA_CL and ETA_V (Clayton copula: Kendall tau ~ 0.40,
+# lambda_L ~ 0.59, lambda_U = 0): low-clearance subjects also have low volume far
+# more often than the upper tail is concordant.
+#
+# `omega_dist = vine` estimates zero-mean marginals (pinned to Gaussian here via
+# `vine_marginals = gaussian` to isolate pure copula tail dependence, or selected
+# among Normal / Student-t / Skew-Normal / Skew-t when `vine_marginals = auto`)
+# jointly with a Dissmann regular-vine copula over rotated pair-copula families.
+# Compare the QMC importance-sampled `ofv` / `aic` / `bic` against
+# `examples/vine_tail_iv_gaussian.ferx` (`saem_ofv = imp`).
+
+[data]
+  path = ../data/vine_tail_iv.csv
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method         = saem
+  omega_dist     = vine
+  vine_marginals = gaussian
+  n_exploration  = 300
+  n_convergence  = 400
+  seed           = 12345
+  covariance     = true

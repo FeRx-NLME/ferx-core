@@ -5472,6 +5472,7 @@ pub fn parse_full_model_with(
         omega_iov,
         kappa_fixed,
         mixture: None,
+        vine_dist: None,
     };
 
     // Auto-generate tv_fn: evaluate individual parameters with eta=0
@@ -12258,7 +12259,31 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.saem_imh_min_obs_per_eta = v;
         }
-        "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
+        "omega_burnin" | "saem_omega_burnin" => {
+            opts.saem_omega_burnin = parse_usize(key)?;
+        }
+        "omega_dist" | "saem_omega_dist" => {
+            opts.saem_omega_dist = match value.trim().to_lowercase().as_str() {
+                "gaussian" | "normal" => crate::types::OmegaDist::Gaussian,
+                "vine" | "vine_copula" => crate::types::OmegaDist::VineCopula,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}` must be `gaussian` or `vine`, got `{other}`"
+                    ))
+                }
+            };
+        }
+        "vine_marginals" => {
+            opts.vine_marginals = match value.trim().to_lowercase().as_str() {
+                "auto" => crate::types::VineMarginals::Auto,
+                "gaussian" | "normal" => crate::types::VineMarginals::Gaussian,
+                other => {
+                    return Err(format!(
+                        "fit option `vine_marginals` must be `auto` or `gaussian`, got `{other}`"
+                    ))
+                }
+            };
+        }
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
         "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,
         "conddist_burnin" => opts.saem_conddist_burnin = parse_usize("conddist_burnin")?,

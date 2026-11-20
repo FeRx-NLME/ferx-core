@@ -141,6 +141,17 @@ pub fn run_sir(
     fit: &FitResult, model: Option<&CompiledModel>, population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
+    if fit.vine_params.is_some() || options.saem_omega_dist == crate::types::OmegaDist::VineCopula {
+        return Err(crate::diagnostics::EngineError::from_diagnostic(
+            crate::diagnostics::Diagnostic::error(
+                "E_OMEGA_DIST_SIR",
+                "`omega_dist = vine` fits cannot run SIR (`run_sir`): SIR resamples \
+                 Cholesky-packed Gaussian `Omega` parameters rather than vine marginal and \
+                 copula parameters.",
+            )
+            .with_block("fit_options"),
+        ));
+    }
     // #1758: the fit's recorded SIR settings, wherever the caller left the default. Resolved
     // first, so every reader below sees them: this fit scope and the one `run_sir_core` opens
     // itself (#1212, #426), which is the one the draws' solves run under — the resolved ODE

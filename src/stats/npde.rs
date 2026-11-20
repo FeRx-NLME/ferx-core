@@ -318,10 +318,14 @@ pub fn compute_npde_npd_diag(
                 let params = class.params;
                 let ruv_mult = ruv_mult_by_class[class.index]
                     .get_or_insert_with(|| model.ruv_obs_mult(subject, &params.theta));
-                // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
-                let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
-                let eta = class.eta_factor * DVector::from_column_slice(&z);
-                let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                // η ~ fitted vine (when present) or N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
+                let mut eta_slice: Vec<f64> = if let Some(vine) = &params.vine_dist {
+                    vine.draw_eta(&mut rng)
+                } else {
+                    let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
+                    let eta = class.eta_factor * DVector::from_column_slice(&z);
+                    eta.iter().copied().collect()
+                };
                 eta_slice.resize(n_eta + model.n_kappa, 0.0);
                 flip_flop.observe(model, subject, &params.theta, &eta_slice);
 

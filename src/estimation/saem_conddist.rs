@@ -82,14 +82,21 @@ pub fn run_conditional_distribution(
     let n_cw_sweeps = crate::estimation::saem::componentwise_sweeps(n_mh_steps, n_eta);
 
     let omega = &params.omega;
+    let vine_opt = params.vine_dist.as_deref();
+    let flat_omega_opt =
+        vine_opt.map(|_| crate::estimation::saem_vine::flat_eta_omega(n_eta, &omega.eta_names));
     let omega_iov_opt = params.omega_iov.as_ref();
     let theta = &params.theta;
     let sigma = &params.sigma.values;
 
     // Per-coordinate componentwise proposal SDs (√marginal variance), shared
     // across subjects and floored to match the Ω diagonal floor.
-    let cw_sd: Vec<f64> =
-        (0..n_eta).map(|j| omega.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt()).collect();
+    let cw_sd: Vec<f64> = if let Some(vine) = vine_opt {
+        use crate::stats::random_effects::RandomEffectDistribution;
+        vine.marginal_sds().into_iter().map(|s| s.max(SAEM_OMEGA_DIAG_FLOOR.sqrt())).collect()
+    } else {
+        (0..n_eta).map(|j| omega.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt()).collect()
+    };
 
     /// One subject's accumulated conditional distribution.
     struct SubjResult {
@@ -123,7 +130,20 @@ pub fn run_conditional_distribution(
 
             // Initial posterior NLL at the warm start (prior + observation
             // likelihood) — the baseline the MH acceptance ratio differences.
-            let mut nll = if n_kappa > 0 {
+            let mut nll = if let (Some(vine), Some(flat_om)) = (vine_opt, flat_omega_opt.as_ref()) {
+                crate::estimation::saem_vine::score_subject_vine(
+                    mh_scratch,
+                    model,
+                    subject,
+                    theta,
+                    &eta,
+                    flat_om,
+                    vine,
+                    sigma,
+                    schedule.as_ref(),
+                    omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
+                )
+            } else if n_kappa > 0 {
                 individual_nll_iov(
                     model,
                     subject,
@@ -168,22 +188,42 @@ pub fn run_conditional_distribution(
                 // Kernel 1: block random-walk move (η | κ for IOV). The
                 // kappas tuple is rebuilt inline so the immutable borrow of
                 // `kappas` ends before the kappa kernel mutates it below.
-                let (nb, nll_b) = mh_steps(
-                    &mut eta,
-                    nll,
-                    subject,
-                    model,
-                    theta,
-                    omega,
-                    sigma,
-                    step_block,
-                    None,
-                    &mut rng,
-                    n_mh_steps,
-                    mh_scratch,
-                    schedule.as_ref(),
-                    omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
-                );
+                let (nb, nll_b) =
+                    if let (Some(vine), Some(flat_om)) = (vine_opt, flat_omega_opt.as_ref()) {
+                        crate::estimation::saem_vine::mh_steps_vine(
+                            &mut eta,
+                            nll,
+                            subject,
+                            model,
+                            theta,
+                            flat_om,
+                            vine,
+                            sigma,
+                            step_block,
+                            &mut rng,
+                            n_mh_steps,
+                            mh_scratch,
+                            schedule.as_ref(),
+                            omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
+                        )
+                    } else {
+                        mh_steps(
+                            &mut eta,
+                            nll,
+                            subject,
+                            model,
+                            theta,
+                            omega,
+                            sigma,
+                            step_block,
+                            None,
+                            &mut rng,
+                            n_mh_steps,
+                            mh_scratch,
+                            schedule.as_ref(),
+                            omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
+                        )
+                    };
                 nll = nll_b;
                 acc_b += nb;
                 prop_b += n_mh_steps;
@@ -192,22 +232,43 @@ pub fn run_conditional_distribution(
                 // acceptance counts; the total-proposal count is ignored in favour
                 // of the per-eta `n_cw_sweeps` so each eta adapts on its own rate.
                 if n_cw_sweeps > 0 {
-                    let (per_eta_nc, _n_prop_cw, nll_c) = mh_steps_componentwise(
-                        &mut eta,
-                        nll,
-                        subject,
-                        model,
-                        theta,
-                        omega,
-                        sigma,
-                        &step_cw,
-                        &cw_sd,
-                        &mut rng,
-                        n_cw_sweeps,
-                        mh_scratch,
-                        schedule.as_ref(),
-                        omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
-                    );
+                    let (per_eta_nc, _n_prop_cw, nll_c) =
+                        if let (Some(vine), Some(flat_om)) = (vine_opt, flat_omega_opt.as_ref()) {
+                            crate::estimation::saem_vine::mh_steps_componentwise_vine(
+                                &mut eta,
+                                nll,
+                                subject,
+                                model,
+                                theta,
+                                flat_om,
+                                vine,
+                                sigma,
+                                &step_cw,
+                                &cw_sd,
+                                &mut rng,
+                                n_cw_sweeps,
+                                mh_scratch,
+                                schedule.as_ref(),
+                                omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
+                            )
+                        } else {
+                            mh_steps_componentwise(
+                                &mut eta,
+                                nll,
+                                subject,
+                                model,
+                                theta,
+                                omega,
+                                sigma,
+                                &step_cw,
+                                &cw_sd,
+                                &mut rng,
+                                n_cw_sweeps,
+                                mh_scratch,
+                                schedule.as_ref(),
+                                omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
+                            )
+                        };
                     nll = nll_c;
                     for j in 0..n_eta {
                         acc_c[j] += per_eta_nc[j];
@@ -218,21 +279,44 @@ pub fn run_conditional_distribution(
                 // Kernel 3: per-occasion kappa move (IOV only).
                 if n_kappa > 0 {
                     if let Some(iov) = omega_iov_opt {
-                        let (nk, pk, nll_k) = mh_kappa_steps(
-                            &mut kappas,
-                            nll,
-                            subject,
-                            model,
-                            theta,
-                            &eta,
-                            omega,
-                            iov,
-                            sigma,
-                            step_kappa,
-                            &mut rng,
-                            schedule.as_ref(),
-                            mh_scratch.pk(),
-                        );
+                        let (nk, pk, nll_k) = if let (Some(vine), Some(flat_om)) =
+                            (vine_opt, flat_omega_opt.as_ref())
+                        {
+                            use crate::stats::random_effects::RandomEffectDistribution;
+                            let vp = vine.prior_nll(&eta);
+                            crate::estimation::saem_vine::mh_kappa_steps_vine(
+                                &mut kappas,
+                                nll,
+                                subject,
+                                model,
+                                theta,
+                                &eta,
+                                flat_om,
+                                vp,
+                                iov,
+                                sigma,
+                                step_kappa,
+                                &mut rng,
+                                schedule.as_ref(),
+                                mh_scratch.pk(),
+                            )
+                        } else {
+                            mh_kappa_steps(
+                                &mut kappas,
+                                nll,
+                                subject,
+                                model,
+                                theta,
+                                &eta,
+                                omega,
+                                iov,
+                                sigma,
+                                step_kappa,
+                                &mut rng,
+                                schedule.as_ref(),
+                                mh_scratch.pk(),
+                            )
+                        };
                         nll = nll_k;
                         acc_k += nk;
                         prop_k += pk;

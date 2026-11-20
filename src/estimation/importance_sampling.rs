@@ -40,6 +40,7 @@ use crate::estimation::impmap::draw_obs_nll;
 use crate::pk::event_driven::EventSchedule;
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
 use crate::stats::likelihood::{obs_nll_subject_into, obs_nll_subject_into_with_schedule};
+use crate::stats::random_effects::RandomEffectDistribution;
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -2632,6 +2633,642 @@ fn add_ruv_posterior_curvature(
         curv += 2.0 * res * res / rj;
     }
     h_post[(k, k)] += curv;
+}
+
+// ---------------------------------------------------------------------------
+// Vine-copula adaptive QMC Importance Sampling (#225)
+// ---------------------------------------------------------------------------
+
+/// Make a symmetric matrix strictly positive-definite with minimum eigenvalue `floor`.
+fn rectify_spd(mat: &DMatrix<f64>, floor: f64) -> DMatrix<f64> {
+    let n = mat.nrows();
+    if n == 0 {
+        return DMatrix::zeros(0, 0);
+    }
+    let mut sym = DMatrix::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            let v = 0.5 * (mat[(i, j)] + mat[(j, i)]);
+            sym[(i, j)] = if v.is_finite() {
+                v
+            } else if i == j {
+                1.0
+            } else {
+                0.0
+            };
+        }
+    }
+    let eig = sym.symmetric_eigen();
+    let mut out = DMatrix::zeros(n, n);
+    for k in 0..n {
+        let lam = if eig.eigenvalues[k].is_finite() {
+            eig.eigenvalues[k].max(floor)
+        } else {
+            floor.max(1.0)
+        };
+        let col = eig.eigenvectors.column(k);
+        out += lam * (&col * col.transpose());
+    }
+    out
+}
+
+/// True when `subject` carries zero scored observations across all endpoint channels.
+#[inline]
+fn subject_has_no_observations(subject: &Subject) -> bool {
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        return false;
+    }
+    subject.observations.is_empty()
+}
+
+/// Core vine importance-weight sampler on active coordinates `b = [eta_act, kappa_1..kappa_K]`.
+///
+/// Narrow component (`1 - alpha`): Student-t (`nu`) or MVN around `center` with precision `h`.
+/// Broad component (`alpha`): exact draw from `p_vine(eta) * prod_m N(kappa_m; 0, Omega_IOV)`
+/// via inverse-Rosenblatt transform of `Phi(z)` (preserving Owen-scrambled Sobol stratification!).
+#[allow(clippy::too_many_arguments)]
+fn vine_is_log_weights(
+    obs_nll: &SampleObsNll<'_>, vine: &crate::stats::vine_copula::VineCopulaOmega,
+    active_eta: &[usize], n_eta: usize, iov: Option<(&OmegaMatrix, usize)>, center: &DVector<f64>,
+    h: &DMatrix<f64>, fallback_inv: &DMatrix<f64>, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, use_sobol: bool, mixture: Option<&DefensiveMixture>,
+    mut keep: Option<&mut Vec<f64>>,
+) -> Option<Vec<f64>> {
+    let d_act = active_eta.len();
+    let (n_iov, n_occ) = iov.map_or((0, 0), |(om, occ)| (om.dim(), occ));
+    let d = d_act + n_occ * n_iov;
+    if d == 0 {
+        return None;
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let proposal = build_proposal(h, fallback_inv, d)?;
+    let chi_sq = proposal_chi_sq(nu);
+
+    let half_d = 0.5 * d as f64;
+    let log_q_const = if nu.is_finite() {
+        student_t_gamma_ratio(nu, d) + 0.5 * proposal.log_det_inv_scale
+            - half_d * (nu * std::f64::consts::PI).ln()
+    } else {
+        mvn_log_q_const(d, proposal.log_det_inv_scale, 0.0)
+    };
+
+    let iov_log_const = iov.map_or(0.0, |(om, occ)| {
+        -(0.5 * (occ * n_iov) as f64) * TWO_PI.ln() - 0.5 * (occ as f64) * om.log_det
+    });
+
+    let mut log_w = Vec::with_capacity(k_samples);
+    let mut b_sample = vec![0.0_f64; d];
+    let mut z = vec![0.0_f64; d];
+    let mut diff = vec![0.0_f64; d];
+    let mut u_full = vec![0.5_f64; n_eta];
+    let mut full_vec = vec![0.0_f64; n_eta + n_occ * n_iov];
+
+    let qmc = use_sobol
+        && d <= SOBOL_MAX_DIMS
+        && (!nu.is_finite() || d + 1 + usize::from(mixture.is_some()) <= SOBOL_MAX_DIMS);
+    let qmc_draws = qmc.then(|| sobol_qmc_draws(d, k_samples, seed, nu, mixture.is_some()));
+
+    for sample_idx in 0..k_samples {
+        match draw_inputs(
+            sample_idx,
+            qmc_draws.as_ref(),
+            mixture,
+            chi_sq.as_ref(),
+            nu,
+            &mut rng,
+            &mut z,
+        ) {
+            DrawInputs::Broad => {
+                u_full.fill(0.5);
+                for (m, &j) in active_eta.iter().enumerate() {
+                    u_full[j] = crate::stats::special::pnorm(z[m]).clamp(1e-12, 1.0 - 1e-12);
+                }
+                let eta_drawn = vine.draw_eta_from_uniforms(&u_full);
+                for (m, &j) in active_eta.iter().enumerate() {
+                    b_sample[m] = eta_drawn[j];
+                }
+                if let Some((om, occ)) = iov {
+                    for o in 0..occ {
+                        let base = d_act + o * n_iov;
+                        let z_occ = DVector::from_column_slice(&z[base..base + n_iov]);
+                        let k_occ = &om.chol * z_occ;
+                        for ki in 0..n_iov {
+                            b_sample[base + ki] = k_occ[ki];
+                        }
+                    }
+                }
+            }
+            DrawInputs::Narrow { t_scale } => {
+                proposal.apply_l_sigma(&z, &mut b_sample, t_scale);
+                for (m, slot) in b_sample.iter_mut().enumerate() {
+                    *slot += center[m];
+                }
+            }
+        }
+
+        full_vec.fill(0.0);
+        for (m, &j) in active_eta.iter().enumerate() {
+            full_vec[j] = b_sample[m];
+        }
+        if n_occ * n_iov > 0 {
+            full_vec[n_eta..n_eta + n_occ * n_iov]
+                .copy_from_slice(&b_sample[d_act..d_act + n_occ * n_iov]);
+        }
+
+        let log_p_y = -obs_nll(&full_vec, scratch);
+
+        let mut log_p_prior = vine.log_density(&full_vec[..n_eta]);
+        if let Some((om, occ)) = iov {
+            let mut quad_k = 0.0_f64;
+            for o in 0..occ {
+                let base = d_act + o * n_iov;
+                for r in 0..n_iov {
+                    let mut row = 0.0;
+                    for c in 0..n_iov {
+                        row += om.inv[(r, c)] * b_sample[base + c];
+                    }
+                    quad_k += row * b_sample[base + r];
+                }
+            }
+            log_p_prior += iov_log_const - 0.5 * quad_k;
+        }
+
+        for m in 0..d {
+            diff[m] = b_sample[m] - center[m];
+        }
+        let mahal = proposal.mahalanobis(&diff);
+        let log_q_narrow = narrow_log_q(log_q_const, mahal, nu, d);
+        let log_q = match mixture {
+            Some(m) => m.log_q(log_q_narrow, log_p_prior),
+            None => log_q_narrow,
+        };
+
+        log_w.push(log_p_y + log_p_prior - log_q);
+        if let Some(buf) = keep.as_deref_mut() {
+            buf.extend_from_slice(&full_vec);
+        }
+    }
+
+    Some(log_w)
+}
+
+/// Build the rectified SPD posterior Hessian on `[eta_act, kappa_1..kappa_K]` around the Vine MAP mode.
+#[allow(clippy::too_many_arguments)]
+fn build_vine_posterior_hessian(
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters,
+    vine: &crate::stats::vine_copula::VineCopulaOmega, active_eta: &[usize],
+    eta_hat: &DVector<f64>, jacobian: &DMatrix<f64>, kap: &[DVector<f64>], n_occ: usize,
+    scratch: &mut EventPkParams,
+) -> (DVector<f64>, DMatrix<f64>, DMatrix<f64>) {
+    use crate::stats::random_effects::RandomEffectDistribution;
+    let n_eta = model.n_eta;
+    let d_act = active_eta.len();
+    let n_iov = if n_occ > 0 { model.n_kappa } else { 0 };
+    let d = d_act + n_occ * n_iov;
+
+    // 1. Prior Hessian of `-log p_vine(eta)` at `eta_hat` via central FD of `prior_nll_grad`.
+    let mut h_prior_full = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let step = 1e-4_f64;
+    let mut eta_work: Vec<f64> = eta_hat.iter().copied().collect();
+    for &j in active_eta {
+        let orig = eta_work[j];
+        let h_j = step * (1.0 + orig.abs());
+        eta_work[j] = orig + h_j;
+        let gp = vine.prior_nll_grad(&eta_work);
+        eta_work[j] = orig - h_j;
+        let gm = vine.prior_nll_grad(&eta_work);
+        eta_work[j] = orig;
+        for &i in active_eta {
+            let entry = (gp[i] - gm[i]) / (2.0 * h_j);
+            h_prior_full[(i, j)] = if entry.is_finite() { entry } else { 0.0 };
+        }
+    }
+    let omega_equiv_inv = &vine.to_omega_matrix().inv;
+    let omega_sub =
+        DMatrix::from_fn(d_act, d_act, |a, b| omega_equiv_inv[(active_eta[a], active_eta[b])]);
+    let omega_sub_spd = rectify_spd(&omega_sub, 1e-4);
+
+    if n_occ > 0 {
+        let iov = params
+            .omega_iov
+            .as_ref()
+            .expect("omega_iov checked before build_vine_posterior_hessian");
+        let n_b = stacked_width(n_eta, n_iov, n_occ);
+        let mut zero_inv = DMatrix::zeros(n_b, n_b);
+        for a in 0..n_eta {
+            for b in 0..n_eta {
+                zero_inv[(a, b)] = h_prior_full[(a, b)];
+            }
+        }
+        for o in 0..n_occ {
+            let off = kappa_offset(n_eta, n_iov, o);
+            for r in 0..n_iov {
+                for c in 0..n_iov {
+                    zero_inv[(off + r, off + c)] = iov.inv[(r, c)];
+                }
+            }
+        }
+        let h_joint_full = compute_joint_posterior_hessian(
+            model,
+            subject,
+            &params.theta,
+            eta_hat,
+            kap,
+            &params.sigma.values,
+            jacobian,
+            &zero_inv,
+            n_eta,
+            n_iov,
+            n_occ,
+            scratch,
+        );
+        let mut idx_map = Vec::with_capacity(d);
+        idx_map.extend_from_slice(active_eta);
+        for k in n_eta..n_b {
+            idx_map.push(k);
+        }
+        let h_sub = DMatrix::from_fn(d, d, |a, b| h_joint_full[(idx_map[a], idx_map[b])]);
+        let mut fallback = DMatrix::zeros(d, d);
+        for a in 0..d_act {
+            for b in 0..d_act {
+                fallback[(a, b)] = omega_sub_spd[(a, b)];
+            }
+        }
+        for o in 0..n_occ {
+            let base = d_act + o * n_iov;
+            for r in 0..n_iov {
+                for c in 0..n_iov {
+                    fallback[(base + r, base + c)] = iov.inv[(r, c)];
+                }
+            }
+        }
+        let mut center = DVector::zeros(d);
+        for (m, &j) in active_eta.iter().enumerate() {
+            center[m] = eta_hat[j];
+        }
+        for (o, ko) in kap.iter().enumerate() {
+            for ki in 0..n_iov {
+                center[d_act + o * n_iov + ki] = ko[ki];
+            }
+        }
+        (center, rectify_spd(&h_sub, 1e-4), rectify_spd(&fallback, 1e-4))
+    } else {
+        let zero_omega_inv = DMatrix::zeros(n_eta, n_eta);
+        let h_data_full = compute_posterior_hessian(
+            model,
+            subject,
+            &params.theta,
+            eta_hat,
+            &params.sigma.values,
+            jacobian,
+            &zero_omega_inv,
+            n_eta,
+            scratch,
+        );
+        let h_full = h_data_full + h_prior_full;
+        let h_sub = DMatrix::from_fn(d_act, d_act, |a, b| h_full[(active_eta[a], active_eta[b])]);
+        let center = DVector::from_fn(d_act, |m, _| eta_hat[active_eta[m]]);
+        (center, rectify_spd(&h_sub, 1e-4), omega_sub_spd)
+    }
+}
+
+/// Adaptive Owen-scrambled Sobol QMC Importance Sampling for `omega_dist = vine` (#225).
+///
+/// Integrates the true fitted vine-copula + zero-mean marginal density `p_vine(eta)` over
+/// active random effects, using adaptive pilot re-centring and a defensive mixture
+/// `(1 - alpha) * q_narrow + alpha * p_vine` so importance weights are bounded by `p(y|eta)/alpha`
+/// and observation-free subjects contribute identically `0.0` to `-2 log L`.
+pub fn run_importance_sampling_vine(
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], h_matrices: &[DMatrix<f64>], kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Result<ImportanceSamplingResult, String> {
+    let vine =
+        params.vine_dist.as_ref().ok_or_else(|| "Vine IS: params.vine_dist is None".to_string())?;
+    let n_subjects = population.subjects.len();
+    if eta_hats.len() != n_subjects || h_matrices.len() != n_subjects {
+        return Err(format!(
+            "Vine IS: eta_hats ({}) / h_matrices ({}) length must match n_subjects ({})",
+            eta_hats.len(),
+            h_matrices.len(),
+            n_subjects
+        ));
+    }
+    if model.n_eta == 0 {
+        return Err("Vine IS requires at least one random effect (n_eta = 0).".to_string());
+    }
+    if model.is_sde() {
+        return Err("Vine IS is not supported for SDE / [diffusion] models.".to_string());
+    }
+    for (i, j) in h_matrices.iter().enumerate() {
+        let expected_rows = population.subjects[i].observations.len();
+        if j.ncols() != model.n_eta || j.nrows() != expected_rows {
+            return Err(format!(
+                "Vine IS: subject {} has Jacobian shape ({}×{}); expected ({}×{}).",
+                population.subjects[i].id,
+                j.nrows(),
+                j.ncols(),
+                expected_rows,
+                model.n_eta,
+            ));
+        }
+    }
+    if model.n_kappa > 0 && params.omega_iov.is_none() {
+        return Err("Vine IS: model declares kappa (IOV) but params.omega_iov is None.".to_string());
+    }
+
+    let n_eta = model.n_eta;
+    let vine_ref: &crate::stats::vine_copula::VineCopulaOmega = vine.as_ref();
+    let active_eta: Vec<usize> = (0..n_eta).filter(|&j| !vine_ref.is_zero_fixed(j)).collect();
+    let k_samples = options.imp_samples;
+    if k_samples < 2 {
+        return Err(format!("Vine IS: imp_samples must be >= 2, got {k_samples}"));
+    }
+    let pilot_k = if options.imp_adapt_samples == 0 {
+        k_samples
+    } else {
+        options.imp_adapt_samples.clamp(2, k_samples)
+    };
+    let nu = options.imp_proposal_df;
+    if nu.is_nan() || nu < 1.0 {
+        return Err(format!("Vine IS: imp_proposal_df must be >= 1.0 or `normal`, got {nu}"));
+    }
+    let seed = options.imp_seed.unwrap_or(42);
+    let threshold = options.imp_low_ess_threshold;
+    let defensive_alpha = eval_defensive_alpha(options);
+    let adapt_passes = options.imp_adapt_passes;
+    let use_sobol = options.imp_sobol;
+    let cancel = &options.cancel;
+    let kappa_treatment = if model.n_kappa > 0 {
+        KappaTreatment::Marginalized
+    } else {
+        KappaTreatment::NotApplicable
+    };
+
+    let per_subject: Vec<SubjectIsOutput> =
+        crate::par::map_init(n_subjects, EventPkParams::default, |scratch, i| {
+            let subject = &population.subjects[i];
+            if crate::cancel::is_cancelled(cancel) {
+                return SubjectIsOutput::cancelled(subject.id.clone());
+            }
+            if subject_has_no_observations(subject) {
+                // Exact analytical identity: \int p(y = empty | eta) p_vine(eta) d_eta = 1.
+                return SubjectIsOutput {
+                    log_marginal: 0.0,
+                    var_log_marginal: 0.0,
+                    ess_fraction: 1.0,
+                };
+            }
+            let kap = kappas.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+            let n_occ = if model.n_kappa > 0 && !kap.is_empty() {
+                crate::stats::stacked_layout::group_count(subject)
+            } else {
+                0
+            };
+            let iov_arg =
+                (n_occ > 0).then(|| (params.omega_iov.as_ref().expect("checked above"), n_occ));
+
+            // If every random effect is fixed at zero, obs_nll is deterministic.
+            if active_eta.is_empty() && n_occ == 0 {
+                let zeros = vec![0.0_f64; n_eta];
+                let schedule =
+                    crate::estimation::inner_optimizer::cacheable_schedule(model, subject);
+                let nll = obs_nll_subject_into_with_schedule(
+                    model,
+                    subject,
+                    &params.theta,
+                    &params.sigma.values,
+                    model.residual_cov_theta(&params.theta),
+                    &zeros,
+                    scratch,
+                    schedule.as_ref(),
+                );
+                return SubjectIsOutput {
+                    log_marginal: -nll,
+                    var_log_marginal: 0.0,
+                    ess_fraction: 1.0,
+                };
+            }
+
+            let subj_seed = crate::rng::stream_seed(seed, &[i as u64]);
+            let schedule = if n_occ == 0 {
+                crate::estimation::inner_optimizer::cacheable_schedule(model, subject)
+            } else {
+                None
+            };
+            let (mut center, mut h_prop, fallback_inv) = build_vine_posterior_hessian(
+                model,
+                subject,
+                params,
+                vine,
+                &active_eta,
+                &eta_hats[i],
+                &h_matrices[i],
+                kap,
+                n_occ,
+                scratch,
+            );
+            let d = center.len();
+            let mixture = DefensiveMixture::new(&fallback_inv, d, defensive_alpha);
+
+            let obs_nll = |full_b: &[f64], sc: &mut EventPkParams| -> f64 {
+                if n_occ > 0 {
+                    draw_obs_nll(
+                        model,
+                        subject,
+                        &params.theta,
+                        &params.sigma.values,
+                        full_b,
+                        None,
+                        sc,
+                    )
+                } else {
+                    obs_nll_subject_into_with_schedule(
+                        model,
+                        subject,
+                        &params.theta,
+                        &params.sigma.values,
+                        model.residual_cov_theta(&params.theta),
+                        &full_b[..n_eta],
+                        sc,
+                        schedule.as_ref(),
+                    )
+                }
+            };
+
+            // Adaptive pilot passes to centre and scale the Student-t proposal onto the true vine posterior.
+            let full_len = n_eta + n_occ * model.n_kappa;
+            let mut idx_in_full = Vec::with_capacity(d);
+            idx_in_full.extend_from_slice(&active_eta);
+            for k in n_eta..full_len {
+                idx_in_full.push(k);
+            }
+            for pass in 0..adapt_passes {
+                if crate::cancel::is_cancelled(cancel) {
+                    break;
+                }
+                let mut flat_full = Vec::with_capacity(pilot_k * full_len);
+                let Some(lw) = vine_is_log_weights(
+                    &obs_nll,
+                    vine,
+                    &active_eta,
+                    n_eta,
+                    iov_arg,
+                    &center,
+                    &h_prop,
+                    &fallback_inv,
+                    pilot_k,
+                    nu,
+                    pilot_seed(subj_seed, pass),
+                    scratch,
+                    false,
+                    mixture.as_ref(),
+                    Some(&mut flat_full),
+                ) else {
+                    break;
+                };
+                let (_, weights) = logsumexp_with_normalised(&lw);
+                let ess_fraction = ess_from_weights(&weights) / (pilot_k as f64);
+                let mut flat_act = Vec::with_capacity(pilot_k * d);
+                for chunk in flat_full.chunks_exact(full_len) {
+                    for &pos in &idx_in_full {
+                        flat_act.push(chunk[pos]);
+                    }
+                }
+                let (mean, second_moment) = weighted_moments(&weights, &flat_act, d);
+                let pm = PilotMoments { ess_fraction, mean, second_moment };
+                match proposal_from_moments(&pm, pilot_k) {
+                    Some((m, p)) => {
+                        center = m;
+                        h_prop = p;
+                    }
+                    None => break,
+                }
+            }
+
+            let Some(log_w) = vine_is_log_weights(
+                &obs_nll,
+                vine,
+                &active_eta,
+                n_eta,
+                iov_arg,
+                &center,
+                &h_prop,
+                &fallback_inv,
+                k_samples,
+                nu,
+                subj_seed,
+                scratch,
+                use_sobol,
+                mixture.as_ref(),
+                None,
+            ) else {
+                return SubjectIsOutput::new(0.0, 0.0, k_samples);
+            };
+            let (lse, weights) = logsumexp_with_normalised(&log_w);
+            SubjectIsOutput::new(
+                lse - (k_samples as f64).ln(),
+                ess_from_weights(&weights) / (k_samples as f64),
+                k_samples,
+            )
+        });
+
+    if crate::cancel::is_cancelled(cancel) {
+        return Err("cancelled by user".to_string());
+    }
+
+    Ok(reduce_subjects(
+        "IS (vine)",
+        &per_subject,
+        population,
+        threshold,
+        options.verbose,
+        k_samples,
+        nu,
+        kappa_treatment,
+        adapt_passes,
+    ))
+}
+
+/// Draw `k_samples` Owen-scrambled Sobol QMC posterior samples and normalized weights
+/// for subject `i` under the fitted vine prior (used by Louis empirical score covariance).
+pub(crate) fn vine_posterior_weighted_draws(
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta_hat: &DVector<f64>,
+    jacobian: &DMatrix<f64>, kap: &[DVector<f64>], k_samples: usize, seed: u64,
+    scratch: &mut EventPkParams,
+) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
+    let vine = params.vine_dist.as_ref()?;
+    let n_eta = model.n_eta;
+    let vine_ref: &crate::stats::vine_copula::VineCopulaOmega = vine.as_ref();
+    let active_eta: Vec<usize> = (0..n_eta).filter(|&j| !vine_ref.is_zero_fixed(j)).collect();
+    let n_occ = if model.n_kappa > 0 && !kap.is_empty() {
+        crate::stats::stacked_layout::group_count(subject)
+    } else {
+        0
+    };
+    let iov_arg = if n_occ > 0 { Some((params.omega_iov.as_ref()?, n_occ)) } else { None };
+    if active_eta.is_empty() && n_occ == 0 {
+        return Some((vec![vec![0.0; n_eta]], vec![1.0]));
+    }
+    let (center, h_prop, fallback_inv) = build_vine_posterior_hessian(
+        model,
+        subject,
+        params,
+        vine,
+        &active_eta,
+        eta_hat,
+        jacobian,
+        kap,
+        n_occ,
+        scratch,
+    );
+    let d = center.len();
+    let mixture = DefensiveMixture::new(&fallback_inv, d, 0.10);
+    let schedule = if n_occ == 0 {
+        crate::estimation::inner_optimizer::cacheable_schedule(model, subject)
+    } else {
+        None
+    };
+    let obs_nll = |full_b: &[f64], sc: &mut EventPkParams| -> f64 {
+        if n_occ > 0 {
+            draw_obs_nll(model, subject, &params.theta, &params.sigma.values, full_b, None, sc)
+        } else {
+            obs_nll_subject_into_with_schedule(
+                model,
+                subject,
+                &params.theta,
+                &params.sigma.values,
+                model.residual_cov_theta(&params.theta),
+                &full_b[..n_eta],
+                sc,
+                schedule.as_ref(),
+            )
+        }
+    };
+    let full_len = n_eta + n_occ * model.n_kappa;
+    let mut flat_full = Vec::with_capacity(k_samples * full_len);
+    let lw = vine_is_log_weights(
+        &obs_nll,
+        vine,
+        &active_eta,
+        n_eta,
+        iov_arg,
+        &center,
+        &h_prop,
+        &fallback_inv,
+        k_samples,
+        4.0,
+        seed,
+        scratch,
+        true,
+        mixture.as_ref(),
+        Some(&mut flat_full),
+    )?;
+    let (_, weights) = logsumexp_with_normalised(&lw);
+    let draws: Vec<Vec<f64>> = flat_full.chunks_exact(full_len).map(<[f64]>::to_vec).collect();
+    Some((draws, weights))
 }
 
 // ---------------------------------------------------------------------------

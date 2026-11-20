@@ -1,0 +1,38 @@
+# Scenario A — GAUSSIAN baseline (the fair competitor for `omega_dist = vine`).
+#
+# 1-cpt IV bolus. The data (`data/vine_tail_iv.csv`) were simulated with a Clayton
+# copula between ETA_CL and ETA_V: moderate overall correlation (Kendall tau ~ 0.40)
+# with asymmetric lower-tail dependence (lambda_L ~ 0.59, lambda_U = 0).
+#
+# Full 2x2 `block_omega` models linear CL-V correlation, and `saem_ofv = imp`
+# evaluates the exact importance-sampled marginal `-2 log L` on the same scale as
+# `examples/vine_tail_iv.ferx`.
+
+[data]
+  path = ../data/vine_tail_iv.csv
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.04, 0.09]
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method        = saem
+  saem_ofv      = imp
+  n_exploration = 300
+  n_convergence = 400
+  seed          = 12345
+  covariance    = true

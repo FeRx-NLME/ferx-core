@@ -878,6 +878,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
         mixture,
+        vine_dist: template.vine_dist.clone(),
     }
 }
 
@@ -1123,6 +1124,9 @@ pub(crate) fn cov_fixed_mask(
         return Vec::new();
     };
     let mut held = template.clone();
+    if held.vine_dist.is_some() {
+        held.omega_fixed.fill(true);
+    }
     if fit.theta_fixed.len() == held.theta_fixed.len() {
         for (f, &frozen) in held.theta_fixed.iter_mut().zip(&fit.theta_fixed) {
             *f |= frozen;
@@ -2553,6 +2557,7 @@ mod tests {
             }),
             residual_correlations: vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.42 }],
             residual_correlation_fixed: vec![false],
+            vine_dist: None,
         }
     }
 

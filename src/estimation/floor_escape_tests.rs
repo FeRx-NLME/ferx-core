@@ -1079,6 +1079,7 @@ fn rail_template() -> ModelParameters {
             sigma_override_addr: Vec::new(),
             sigma_override_fixed: Vec::new(),
         }),
+        vine_dist: None,
     };
     let names = coordinate_names(&base);
     let at = |n: &str| {

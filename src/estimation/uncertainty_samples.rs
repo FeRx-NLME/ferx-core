@@ -144,6 +144,9 @@ pub fn fitted_params_from_result(
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
         mixture,
+        vine_dist: fit_result.vine_params.as_ref().map(|vp| {
+            std::sync::Arc::new(crate::stats::vine_copula::VineCopulaOmega::from_fit_params(vp))
+        }),
     })
 }
 
@@ -1060,6 +1063,8 @@ mod tests {
             optimizer_stop: None,
             eval_budget_spent: false,
             evaluation_only: false,
+            vine_params: None,
+            vine_corrected_ofv: None,
         }
     }
 
@@ -2021,6 +2026,7 @@ mod tests {
             omega_iov: Some(OmegaMatrix::from_matrix(iov, names("KAPPA", 2), false)),
             kappa_fixed: vec![false, false],
             mixture: None,
+            vine_dist: None,
         }
     }
 

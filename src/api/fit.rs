@@ -2772,6 +2772,60 @@ fn fit_inner(
         if method == EstimationMethod::Saem
             && is_last_estimating
             && stage_idx + 1 == chain.len()
+            && result.as_ref().is_some_and(|r| r.params.vine_dist.is_some())
+        {
+            let prev = result.as_mut().expect("stage result was just set");
+            let mut o = stage_opts.clone();
+            o.imp_samples = stage_opts.saem_ofv_samples;
+            o.imp_adapt_samples = stage_opts.saem_ofv_pilot_samples;
+            o.imp_sobol = true;
+            match crate::estimation::importance_sampling::run_importance_sampling_vine(
+                model,
+                population,
+                &prev.params,
+                &prev.eta_hats,
+                &prev.h_matrices,
+                &prev.kappas,
+                &o,
+            ) {
+                Ok(is) if is.minus2_log_likelihood.is_finite() => {
+                    if let Some(msg) =
+                        crate::estimation::importance_sampling::marginal_reliability_warning(&is)
+                    {
+                        accumulated_warnings.push(msg);
+                    }
+                    let foce_ofv = prev.ofv;
+                    let vine_ll = is.minus2_log_likelihood;
+                    prev.vine_corrected_ofv = Some(vine_ll);
+                    if stage_opts.saem_ofv != SaemOfv::Focei {
+                        prev.ofv = vine_ll;
+                        saem_objective = Some(SaemObjective {
+                            kind: SaemOfv::Imp,
+                            mc_standard_error: Some(is.mc_standard_error),
+                            n_samples: Some(is.n_samples),
+                            n_nodes: None,
+                            foce_ofv,
+                        });
+                    }
+                    is_result = Some(is);
+                }
+                Ok(is) => {
+                    accumulated_warnings.push(format!(
+                        "SAEM vine objective: importance-sampled −2 log L was not finite ({}); \
+                         reporting the Gaussian-equivalent FOCE/Laplace OFV.",
+                        is.minus2_log_likelihood
+                    ));
+                }
+                Err(e) => {
+                    accumulated_warnings.push(format!(
+                        "SAEM vine objective: importance-sampled −2 log L skipped ({e}); \
+                         reporting the Gaussian-equivalent FOCE/Laplace OFV."
+                    ));
+                }
+            }
+        } else if method == EstimationMethod::Saem
+            && is_last_estimating
+            && stage_idx + 1 == chain.len()
             && stage_opts.saem_ofv != SaemOfv::Focei
         {
             let prev = result.as_mut().expect("stage result was just set");
@@ -3065,7 +3119,22 @@ fn fit_inner(
     // the data, so they count — the profiled and unprofiled fits of one model report one
     // `n_parameters` and one BIC.
     let counted_mask = crate::model_selection::counted_held_mask(model, init_params, &held_mask);
-    let n_params = counted_mask.iter().filter(|&&b| !b).count();
+    #[cfg(feature = "survival")]
+    let n_for_bic: usize =
+        n_obs + population.subjects.iter().map(|s| s.obs_records.len()).sum::<usize>();
+    #[cfg(not(feature = "survival"))]
+    let n_for_bic: usize = n_obs;
+    // Delattre class tally behind the BIC variants (#1177): the same packed
+    // held mask `n_params` was counted from, split by segment. Under `omega_dist = vine`
+    // (#225), `bic_inputs.omega` counts the free marginal + pair-copula parameters.
+    let mut bic_inputs =
+        crate::model_selection::bic_inputs_for(model, init_params, &counted_mask, n_for_bic);
+    let n_params = if let Some(vine) = &result.params.vine_dist {
+        bic_inputs.omega = vine.n_free_params();
+        bic_inputs.n_free()
+    } else {
+        counted_mask.iter().filter(|&&b| !b).count()
+    };
 
     // Parameter priors (#254). `result.ofv` is the clean −2LL that every
     // optimizer reports (the penalty is excluded from it by construction), so
@@ -3100,19 +3169,10 @@ fn fit_inner(
     let aic = ic_ofv.map(|o| o + 2.0 * n_params as f64).filter(|v| v.is_finite());
     // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
     // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
-    #[cfg(feature = "survival")]
-    let n_for_bic: usize =
-        n_obs + population.subjects.iter().map(|s| s.obs_records.len()).sum::<usize>();
-    #[cfg(not(feature = "survival"))]
-    let n_for_bic: usize = n_obs;
     let bic = ic_ofv
         .filter(|_| n_for_bic > 0)
         .map(|o| o + n_params as f64 * (n_for_bic as f64).ln())
         .filter(|v| v.is_finite());
-    // Delattre class tally behind the BIC variants (#1177): the same packed
-    // held mask `n_params` was counted from, split by segment.
-    let bic_inputs =
-        crate::model_selection::bic_inputs_for(model, init_params, &counted_mask, n_for_bic);
     debug_assert_eq!(
         bic_inputs.n_free(),
         n_params,
@@ -3120,8 +3180,11 @@ fn fit_inner(
     );
 
     // Extract SEs from covariance matrix using converged parameter values
-    let (se_theta, se_omega, se_sigma, se_kappa) =
+    let (se_theta, mut se_omega, se_sigma, se_kappa) =
         extract_standard_errors(&result.covariance_matrix, &result.params);
+    if result.params.vine_dist.is_some() {
+        se_omega = None;
+    }
     let se_residual_correlations =
         extract_residual_correlation_se(&result.covariance_matrix, &result.params);
     let se_mixture_overrides =
@@ -3821,6 +3884,8 @@ fn fit_inner(
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
         vi: vi_result.clone(),
+        vine_params: result.vine_params.clone(),
+        vine_corrected_ofv: result.vine_corrected_ofv,
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
