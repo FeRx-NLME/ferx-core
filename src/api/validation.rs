@@ -1941,7 +1941,7 @@ pub(crate) fn check_level_labels(
                 RecordKind::Observation => ("observation", subj.obs_cov(i), subj.param_time_obs(i)),
                 RecordKind::Dose => ("dose", subj.dose_cov(i), subj.dose_param_time(i)),
                 RecordKind::PkOnly => (
-                    "non-observation (EVID=2 or MDV=1)",
+                    "EVID=2, MDV=1, missing-DV or endpoint (TTE, count or discrete-state)",
                     subj.pk_only_cov(i),
                     subj.param_time_pk_only(i),
                 ),

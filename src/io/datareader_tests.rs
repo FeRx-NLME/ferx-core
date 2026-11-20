@@ -1163,6 +1163,15 @@ fn an_endpoint_row_is_a_record_that_can_govern_an_implied_dose() {
         let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
         assert!(s.subjects[0].pk_only_times.is_empty(), "{routing:?}");
     }
+    // A TTE row is never skipped for its DV, so a leading one with DV `.` is no record either:
+    // its clock would start at the event, where `H = 0` (#2943 review r1).
+    #[cfg(feature = "survival")]
+    {
+        let routing = ObsRouting { tte: [3].into_iter().collect(), ..Default::default() };
+        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,.,0,0,.,3\n1,4,5,0,0,.,1\n");
+        let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(s.subjects[0].pk_only_times.is_empty());
+    }
 }
 
 /// `(parent, TIME $PK reads)` of each dose; `None` for a dose record. Every parent the

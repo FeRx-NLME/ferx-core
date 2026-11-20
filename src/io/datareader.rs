@@ -2794,9 +2794,10 @@ fn parse_subject(
                         parse_warnings.push(format!(
                             "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
                              — entry time after the event/censoring time yields a negative \
-                             effective cumulative hazard; row skipped"
+                             effective cumulative hazard; the row is not scored, and stays a \
+                             record of the PK model, as in NONMEM"
                         ));
-                        // Skip this malformed row rather than producing an invalid NLL.
+                        // Not scored rather than an invalid NLL; still the record pushed above.
                         continue;
                     }
                     let entry_time = raw_entry;
@@ -2989,7 +2990,7 @@ fn parse_subject(
 
             // Count the defaulted compartment **last** (#1009): reaching here means
             // the row became an observation (missing-DV and malformed TTE rows
-            // `continue`d above).
+            // `continue`d above, as unscored records).
             if let Some(cause) = &cmt_default_cause {
                 cmt_defaults.record_obs(cause);
             }
