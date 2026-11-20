@@ -5,6 +5,8 @@
 use super::fit_inner;
 use crate::parser::model_parser::rhs_regcode::kernel_jit::thread_cache_count;
 use crate::types::{EstimationMethod, FitOptions};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use std::path::Path;
 
 /// A closed-form model, where the settle check does not apply, with SIR as the fit's last plan

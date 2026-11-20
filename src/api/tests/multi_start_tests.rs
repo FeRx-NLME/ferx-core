@@ -1,6 +1,8 @@
 use super::perturb_init;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) -> ModelParameters {
     let n = theta.len();

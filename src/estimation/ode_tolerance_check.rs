@@ -27,6 +27,8 @@
 
 use crate::estimation::parameterization::compute_mu_k;
 use crate::types::{CompiledModel, EstimationMethod, FitOptions, ModelParameters, Population};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 
 /// The factor `reltol` and `abstol` are multiplied by for the re-solve: one decade, as the

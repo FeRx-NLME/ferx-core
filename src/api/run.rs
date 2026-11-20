@@ -6,12 +6,16 @@ use crate::io::data_source::DataSource;
 use crate::io::datareader::{
     read_nonmem_csv_routed, read_nonmem_csv_routed_from, CsvInput, MissingDvPolicy, SelectionFilter,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use std::collections::HashMap;
 use std::path::Path;
 
 pub(crate) use crate::model_checks::{
     model_routes_rows_by_cmt, obs_routing_for, referenced_columns,
 };
+
+pub use ferx_model::types::ReaderSettings;
 
 /// Log-transform every observation (including M3 LLOQ values carried on CENS
 /// rows — they live in the same `observations` vector) in place, for LTBS case 2
@@ -156,8 +160,7 @@ pub fn prepare_run(model_path: &str, data_path: Option<&str>) -> Result<Prepared
 /// [`prepare_run`] with the CLI's `--inits-from-nca` override, which has to be
 /// applied before `build_init_params` reads the parsed model.
 pub fn prepare_run_with_inits(
-    model_path: &str, data_path: Option<&str>,
-    inits_override: Option<crate::suggest_start::NcaInit>,
+    model_path: &str, data_path: Option<&str>, inits_override: Option<crate::types::NcaInit>,
 ) -> Result<PreparedRun, EngineError> {
     // One read of the model file (#1752): the parse, the binders, `model_hash` and
     // the stored `model_text` are all this read, never a later version of the file.
@@ -235,7 +238,7 @@ pub fn prepare_run_with_inits(
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunOverrides {
     /// Overrides `[fit_options] inits_from_nca` (the CLI's `--inits-from-nca`).
-    pub inits_from_nca: Option<crate::suggest_start::NcaInit>,
+    pub inits_from_nca: Option<crate::types::NcaInit>,
     /// Overrides `[fit_options] threads` (the CLI's `--threads`). `Some(0)` means
     /// the engine default was asked for by name; see [`FitOptions::threads`].
     pub threads: Option<usize>,
@@ -274,8 +277,7 @@ pub(crate) fn apply_threads_override(
 /// option. When `inits_override` is `None` the model-file value is used as-is;
 /// when `Some(method)` it forces that NCA strategy regardless of the file.
 pub fn run_model_with_data_inits(
-    model_path: &str, data_path: Option<&str>,
-    inits_override: Option<crate::suggest_start::NcaInit>,
+    model_path: &str, data_path: Option<&str>, inits_override: Option<crate::types::NcaInit>,
 ) -> Result<(FitResult, Population), EngineError> {
     run_model_with_overrides(
         model_path,
@@ -1121,94 +1123,6 @@ pub(crate) fn read_population_as_fitted(
     read_population_with_diag(&parsed.model, &ReaderSettings::from_parsed(parsed), data_path)
 }
 
-/// Everything the dataset reader reads a file with besides the model's endpoint
-/// routing: the `[data]` column renames, the covariate declarations (or, without
-/// them, the explicit covariate columns), the IOV column and the `[data_selection]`
-/// clauses, the model file's merged with any a caller added (#1685).
-///
-/// A file entry point builds one, reads with it through [`read_population_with`],
-/// and records it on [`FitResult::reader_settings`], so the recorded settings are
-/// the ones the data were read with by construction. `run_sir`, `run_covariance`
-/// and `load_fit` re-read `fit.data_path` with them: a row filter the model file
-/// does not state (a `fit_from_files` option, `ferx_fit(settings = list(ignore =
-/// ...))` in R) is then applied again, where re-reading with the model file's
-/// settings dropped it.
-///
-/// Build one with [`ReaderSettings::from_parsed`] and adjust its fields; it is
-/// `#[non_exhaustive]`, so a struct literal outside ferx-core does not compile.
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-#[non_exhaustive]
-pub struct ReaderSettings {
-    /// `[data]` renames, `(model name, CSV column)`.
-    #[serde(default)]
-    pub column_map: Vec<(String, String)>,
-    /// The `[covariates]` block. When `Some`, it decides which columns are read as
-    /// covariates and `fallback_columns` is not read.
-    #[serde(default)]
-    pub covariate_decls: Option<Vec<CovariateDecl>>,
-    /// Covariate columns for a model with no `[covariates]` block (the
-    /// `covariate_columns` argument of [`fit_from_files`](crate::fit_from_files));
-    /// `None` auto-detects.
-    #[serde(default)]
-    pub fallback_columns: Option<Vec<String>>,
-    /// The occasion column for an IOV model.
-    #[serde(default)]
-    pub iov_column: Option<String>,
-    /// `[data_selection] ignore` clauses, OR'd.
-    #[serde(default)]
-    pub ignore_exprs: Vec<String>,
-    /// `[data_selection] accept` clauses, AND'd.
-    #[serde(default)]
-    pub accept_exprs: Vec<String>,
-    /// `[data_selection] ignore_subjects`.
-    #[serde(default)]
-    pub ignore_subjects: Vec<String>,
-}
-
-impl ReaderSettings {
-    /// The settings a fit of the model file reads its data with: its `[data]`
-    /// renames, `[covariates]`, `[fit_options] iov_column` and `[data_selection]`.
-    pub fn from_parsed(parsed: &ParsedModel) -> Self {
-        ReaderSettings {
-            column_map: parsed.column_map.clone(),
-            covariate_decls: parsed.covariate_decls.clone(),
-            fallback_columns: None,
-            iov_column: parsed.fit_options.iov_column.clone(),
-            ignore_exprs: parsed.fit_options.ignore_exprs.clone(),
-            accept_exprs: parsed.fit_options.accept_exprs.clone(),
-            ignore_subjects: parsed.fit_options.ignore_subjects.clone(),
-        }
-    }
-
-    /// These settings with the caller's `[data_selection]` clauses merged in, the
-    /// way [`fit_from_files`](crate::fit_from_files) merges its options with the
-    /// model file's: de-duplicated, ignore OR'd and accept AND'd.
-    pub(crate) fn with_call_selection(mut self, call: &FitOptions) -> Self {
-        let own = FitOptions {
-            ignore_exprs: std::mem::take(&mut self.ignore_exprs),
-            accept_exprs: std::mem::take(&mut self.accept_exprs),
-            ignore_subjects: std::mem::take(&mut self.ignore_subjects),
-            ..FitOptions::default()
-        };
-        let (ignore, accept, subjects) = merge_selection_exprs(&own, call);
-        self.ignore_exprs = ignore;
-        self.accept_exprs = accept;
-        self.ignore_subjects = subjects;
-        self
-    }
-
-    fn selection_filter(&self) -> Result<Option<SelectionFilter>, String> {
-        if self.ignore_exprs.is_empty()
-            && self.accept_exprs.is_empty()
-            && self.ignore_subjects.is_empty()
-        {
-            return Ok(None);
-        }
-        SelectionFilter::from_opts(&self.ignore_exprs, &self.accept_exprs, &self.ignore_subjects)
-            .map(Some)
-    }
-}
-
 /// Read `data_path` for `model` with `settings`: [`read_population_for`] with every
 /// argument taken from one [`ReaderSettings`] (#1685). The file entry points read
 /// through this, so the settings they record on the fit are the ones they used.
@@ -1277,7 +1191,7 @@ pub(crate) fn read_population_hashed_diag(
 /// The `[data_selection]` filter `settings` read with, coded as `ferx check` codes
 /// a clause that does not compile.
 fn reader_filter(settings: &ReaderSettings) -> Result<Option<SelectionFilter>, crate::Diagnostic> {
-    settings.selection_filter().map_err(super::validation::selection_filter_diagnostic)
+    reader_selection_filter(settings).map_err(super::validation::selection_filter_diagnostic)
 }
 
 /// The one body behind every [`ReaderSettings`] read: [`read_population_for`] with
@@ -1419,4 +1333,39 @@ fn read_population_for_policy(
         &routing,
         column_map,
     )
+}
+
+/// `settings` with the caller's `[data_selection]` clauses merged in, the
+/// way [`fit_from_files`](crate::fit_from_files) merges its options with the
+/// model file's: de-duplicated, ignore OR'd and accept AND'd.
+pub(crate) fn with_call_selection(
+    mut settings: ReaderSettings, call: &FitOptions,
+) -> ReaderSettings {
+    let own = FitOptions {
+        ignore_exprs: std::mem::take(&mut settings.ignore_exprs),
+        accept_exprs: std::mem::take(&mut settings.accept_exprs),
+        ignore_subjects: std::mem::take(&mut settings.ignore_subjects),
+        ..FitOptions::default()
+    };
+    let (ignore, accept, subjects) = merge_selection_exprs(&own, call);
+    settings.ignore_exprs = ignore;
+    settings.accept_exprs = accept;
+    settings.ignore_subjects = subjects;
+    settings
+}
+
+/// The `[data_selection]` filter `settings` describe, if any.
+fn reader_selection_filter(settings: &ReaderSettings) -> Result<Option<SelectionFilter>, String> {
+    if settings.ignore_exprs.is_empty()
+        && settings.accept_exprs.is_empty()
+        && settings.ignore_subjects.is_empty()
+    {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(
+        &settings.ignore_exprs,
+        &settings.accept_exprs,
+        &settings.ignore_subjects,
+    )
+    .map(Some)
 }

@@ -20,6 +20,8 @@
 //! Both entry points return `(nll, grad)` so the caller gets the objective for
 //! free alongside its gradient. `lower[i] == upper[i]` marks a pinned coordinate:
 //! it contributes 0 and skips its evaluation.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::estimation::nn_theta_gradient::NnGradPlan;
 use crate::estimation::pred_memo::{memoized, MemoSlot};
@@ -325,7 +327,7 @@ fn exact_theta_score(
 thread_local! {
     /// Test counter: the scores [`exact_theta_score`] served, so a parity test can assert the
     /// exact path ran rather than the per-θ fallback it would otherwise compare against.
-    pub(super) static EXACT_THETA_SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static EXACT_THETA_SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Gradient of the IOV observation NLL w.r.t. the SAEM packed vector

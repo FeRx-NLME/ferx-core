@@ -7,6 +7,8 @@
 //! in `f64`, so the mixture run must reproduce the twin bit for bit. That equality also
 //! pins that the class draw consumes nothing from the η stream: the twin draws no class,
 //! so a draw taken from the η stream would shift every η after it.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::parser::model_parser::{current_mixture_class, parse_model_string};
@@ -176,7 +178,7 @@ fn a_fit_carried_class_zero_is_recovered_from_the_class_declaration() {
         let names = p.omega.eta_names.clone();
         let carried = DMatrix::from_row_slice(1, 1, &[1e-8]);
         p.mixture.as_mut().unwrap().omega[1] = OmegaMatrix::from_matrix(carried, names, true);
-        assert!(p.mixture.as_ref().unwrap().omega[1].sim_chol.is_none());
+        assert!(p.mixture.as_ref().unwrap().omega[1].sim_chol().is_none());
         p
     };
     let sim = |m: &CompiledModel, p: &ModelParameters| {

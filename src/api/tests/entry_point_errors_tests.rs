@@ -21,6 +21,8 @@
 //! # Tiering
 //!
 //! Tier 1. `fit()` is called, but only on inputs it refuses before its first iteration.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::parser::model_parser::{parse_full_model, parse_model_string};
@@ -521,7 +523,7 @@ fn fit_carries_the_options_check_code() {
 fn fit_refuses_recorded_settings_outside_the_fit_options_domain() {
     let model = parse_model_string(ONE_CPT_IV).expect("parse");
     let pop = accepted_population();
-    let max = crate::estimation::agq::MAX_AGQ_NODES;
+    let max = crate::estimation::gauss_hermite::MAX_AGQ_NODES;
     let foce = |set: &dyn Fn(&mut FitOptions)| {
         let mut o = FitOptions { method: EstimationMethod::Foce, ..FitOptions::default() };
         set(&mut o);
@@ -1096,6 +1098,8 @@ fn no_library_code_re_raises_a_precondition_err_as_a_panic() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rust_sources(&root.join("src"), &mut files);
+    // The model layer moved to its own crate in #3041; it is scanned as before.
+    rust_sources(&root.join("crates/ferx-model/src"), &mut files);
 
     let unwrapped_call =
         regex::Regex::new(r"(^|[^\w.])(predict|simulate|simulate_with_seed)\(.*\)\.unwrap\(\)")
@@ -1116,7 +1120,13 @@ fn no_library_code_re_raises_a_precondition_err_as_a_panic() {
         // Stop at an inline `mod tests {` — test code may unwrap freely.
         for (n, line) in text
             .lines()
-            .take_while(|l| !(l.starts_with("mod ") && l.contains("test") && l.ends_with('{')))
+            .take_while(|l| {
+                !(l.trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ")
+                    .starts_with("mod ")
+                    && l.contains("test")
+                    && l.ends_with('{'))
+            })
             .enumerate()
         {
             let code = line.trim_start();

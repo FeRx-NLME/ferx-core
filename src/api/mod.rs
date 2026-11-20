@@ -2,6 +2,8 @@ use crate::diagnostics::{CheckReport, Diagnostic};
 use crate::io::datareader::{ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC};
 use crate::pk;
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 #[cfg(test)]
 use nalgebra::{DMatrix, DVector};
 #[cfg(test)]
@@ -97,8 +99,8 @@ pub use crate::levels::{
     theta_level_values, ThetaLevelValue,
 };
 pub(crate) use crate::levels::{bind_from_fit_on, rsr_one_subject_levels_warning};
+pub(crate) use output_columns::compute_extra_output_columns;
 pub use output_columns::tafd_tad_for_subject;
-pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 // The fit path reaches these through `kappa_shrinkages` (#1911); the shrinkage tests
 // call them directly.
 pub(crate) use postfit::{
@@ -114,7 +116,7 @@ pub(crate) use postfit::{
     profiled_bound_report, rebuild_warnings_structured, refresh_held_at_bound_report,
     refresh_profiled_bound_report, report_resolved_levels, resolve_covariance_status,
     resolve_sir_fallback, runaway_guard_warning_for, sir_unavailable_warning, solver_stats_scope,
-    stalled_at_init_warning, step_held, with_solver_stats, ContributionSource, SolverStatsPhase,
+    stalled_at_init_warning, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
 pub(crate) use postfit::{

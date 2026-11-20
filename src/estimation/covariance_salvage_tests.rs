@@ -18,6 +18,8 @@ use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{CompiledModel, DoseEvent, ModelParameters, Subject};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 

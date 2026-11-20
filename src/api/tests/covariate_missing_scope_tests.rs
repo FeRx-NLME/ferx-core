@@ -28,6 +28,8 @@
 //! warns); matching `referenced_columns` ignoring case (`wt` warns); matching
 //! `[derived]` reads ignoring case (`mX` warns) or verbatim only (`ALB` goes silent); dropping the `[derived]`
 //! shadow from `output_echo_columns` (`LAB_RATIO` warns); re-adding the declared / `covariate_columns` widening (the last two tests).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::read_population_for;
 use crate::io::datareader::SelectionFilter;
@@ -185,7 +187,7 @@ fn a_derived_expression_records_the_names_it_reads() {
         !parsed.model.referenced_covariates.iter().any(|c| c == "LAB"),
         "a [derived]-only read is not a required column, so the reader needs `derived_reads`"
     );
-    assert!(crate::types::IndivParamPartials::empty().derived_reads.is_empty());
+    assert!(crate::types::IndivParamPartials::empty().derived_reads().is_empty());
 }
 
 /// Listing an unread column in `covariate_columns` does not make a relation read it,

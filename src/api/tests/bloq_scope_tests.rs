@@ -15,6 +15,8 @@
 //! Every case reads **which method the fit reports** (`FitResult::bloq_method`, built from
 //! `bloq_in_force`) and the objective, against a reference run where the model itself carries
 //! the method and the options set no override — the pre-#1824 stamped path.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::types::BloqMethod;

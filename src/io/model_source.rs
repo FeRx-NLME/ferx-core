@@ -6,6 +6,8 @@
 //! the old parse, and stamp `model_hash` / `model_text` from a file that was never
 //! fitted. [`ModelSource`] is that one read: the bytes are hashed, decoded and
 //! parsed, and every later use takes them from here.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use std::path::{Path, PathBuf};
 

@@ -5,6 +5,8 @@
 //! corresponding NLL evaluator in the same packed `[log_theta | log_sigma]` space.
 //! These functions are shared by SAEM's M-step and variational inference, so a
 //! wrong entry here is silently wrong in two estimators at once.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 // The FD reference for the population-level checks: SAEM's M-step objective,

@@ -12,6 +12,10 @@
 //! - [`NcaInit::Ebe`] — like `Sweep` but evaluates the grid with empirical
 //!   Bayes estimates (etas ≠ 0); more accurate under large IIV. Falls back to
 //!   `Sweep` for ODE models.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
+
+pub use ferx_model::types::NcaInit;
 
 mod nca;
 mod pooling;
@@ -42,22 +46,6 @@ pub struct SuggestedStart {
     pub params: ModelParameters,
     /// Per-theta (and per-omega) notes about what was and wasn't estimated.
     pub warnings: Vec<String>,
-}
-
-/// Which NCA-based starting-value strategy [`inits_from_nca`] should run.
-///
-/// User-facing names (fit option, CLI flag, R argument): `nca`, `nca_sweep`,
-/// `nca_ebe`. A boolean `true` maps to [`NcaInit::Sweep`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NcaInit {
-    /// Non-compartmental analysis arithmetic only (fastest).
-    Nca,
-    /// NCA, then an etas = 0 rRMSE grid sweep for parameters NCA can't estimate.
-    #[default]
-    Sweep,
-    /// NCA, then an EBE-based (etas ≠ 0) rRMSE grid sweep; falls back to
-    /// `Sweep` for ODE models.
-    Ebe,
 }
 
 /// Derive NCA-based starting values from the data, using the strategy selected
@@ -598,7 +586,7 @@ fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String
     };
     let owned: Vec<(String, Option<usize>)> = model
         .indiv_param_partials
-        .mu_ref_owners
+        .mu_ref_owners()
         .iter()
         .filter(|(_, owner)| owner.as_str() == indiv_name)
         .filter_map(|(eta, _)| candidate(eta))
@@ -637,18 +625,18 @@ fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String
 /// way (#1922 review r5).
 fn name_rule_may_use(model: &CompiledModel, param: &str, eta: &str) -> bool {
     let partials = &model.indiv_param_partials;
-    match partials.mu_ref_owners.get(eta) {
+    match partials.mu_ref_owners().get(eta) {
         None => return true,
         Some(owner) if owner == param => return true,
         Some(_) => {}
     }
-    let Some(row) = partials.names.iter().rposition(|n| n == param) else {
+    let Some(row) = partials.names().iter().rposition(|n| n == param) else {
         return false;
     };
     let Some(k) = model.eta_names.iter().position(|n| n == eta) else {
         return false;
     };
-    match partials.d_d_eta.get(row).and_then(|r| r.get(k)) {
+    match partials.d_d_eta().get(row).and_then(|r| r.get(k)) {
         Some(crate::parser::model_parser::Expression::Literal(v)) => *v != 0.0,
         Some(_) => true,
         None => false,
@@ -1751,7 +1739,7 @@ mod tests {
         assert_eq!(m.mu_refs["ETA_CL"].theta_name, "TVCL");
         assert_eq!(m.mu_refs["IIV_CL"].theta_name, "THS");
         // The association the fix reads.
-        let owners = &m.indiv_param_partials.mu_ref_owners;
+        let owners = &m.indiv_param_partials.mu_ref_owners();
         assert_eq!(owners.get("ETA_CL").map(String::as_str), Some("CL"));
         assert_eq!(owners.get("IIV_CL").map(String::as_str), Some("S"));
 
@@ -1814,9 +1802,9 @@ mod tests {
         // The premise: neither eta's mu-reference is owned by CL, and both pass the
         // name rule with different thetas.
         assert!(
-            !m.indiv_param_partials.mu_ref_owners.values().any(|o| o == "CL"),
+            !m.indiv_param_partials.mu_ref_owners().values().any(|o| o == "CL"),
             "no mu-reference may be detected on CL itself: {:?}",
-            m.indiv_param_partials.mu_ref_owners
+            m.indiv_param_partials.mu_ref_owners()
         );
         assert_eq!(etas_named_for_cl(&m), vec!["ETA_CL", "IIV_CL"]);
         assert_eq!(
@@ -1899,7 +1887,7 @@ mod tests {
         let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
         // The premise: ETA_CL is owned by CL and anchored to the NN output, which
         // is not a theta; IIV_CL passes the name rule with a writable theta.
-        let owners = &m.indiv_param_partials.mu_ref_owners;
+        let owners = &m.indiv_param_partials.mu_ref_owners();
         assert_eq!(owners.get("ETA_CL").map(String::as_str), Some("CL"));
         assert_eq!(m.mu_refs["ETA_CL"].theta_name, "TYPICAL_PK.CL");
         assert!(!m.default_params.theta_names.iter().any(|n| n == "TYPICAL_PK.CL"));
@@ -2171,7 +2159,7 @@ mod tests {
         // name rule for CL — which does not depend on it.
         assert_eq!(m.mu_refs["ETA_CL"].theta_name, "THS");
         assert_eq!(
-            m.indiv_param_partials.mu_ref_owners.get("ETA_CL").map(String::as_str),
+            m.indiv_param_partials.mu_ref_owners().get("ETA_CL").map(String::as_str),
             Some("S")
         );
         assert_eq!(etas_named_for_cl(&m), vec!["ETA_CL"]);
@@ -2325,14 +2313,14 @@ mod tests {
         // The premise: CL's last partials row does not read ETA_CL, and ETA_CL
         // is S's and passes the name rule for CL.
         let p = &m.indiv_param_partials;
-        let row = p.names.iter().rposition(|n| n == "CL").expect("CL has rows");
+        let row = p.names().iter().rposition(|n| n == "CL").expect("CL has rows");
         let k = m.eta_names.iter().position(|n| n == "ETA_CL").unwrap();
         assert!(matches!(
-            p.d_d_eta[row][k],
+            p.d_d_eta()[row][k],
             crate::parser::model_parser::Expression::Literal(v) if v == 0.0
         ));
         assert_eq!(
-            m.indiv_param_partials.mu_ref_owners.get("ETA_CL").map(String::as_str),
+            m.indiv_param_partials.mu_ref_owners().get("ETA_CL").map(String::as_str),
             Some("S")
         );
         assert!(!name_rule_may_use(&m, "CL", "ETA_CL"));

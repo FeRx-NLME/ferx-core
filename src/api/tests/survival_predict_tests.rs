@@ -586,7 +586,7 @@ fn supplied_eta_survival_without_etas_is_the_population_curve() {
 
 // ── endpoint order (#2531) ───────────────────────────────────────────────────
 
-use crate::survival::endpoint_order_test_helpers::{EndpointOrderFixture, COMPILES};
+use crate::model_tests::survival::endpoint_order_test_helpers::{EndpointOrderFixture, COMPILES};
 
 /// Each subject's CMT blocks, in the order `predict_survival` emitted them.
 fn cmt_blocks(rows: &[SurvivalPredictionResult]) -> Vec<(String, Vec<usize>)> {
@@ -655,7 +655,7 @@ fn predict_survival_rows_are_in_ascending_cmt_order_on_every_compile() {
 /// Mutation: as for the row-order test, at the same site.
 #[test]
 fn predict_survival_cif_bits_are_the_same_on_every_compile() {
-    use crate::survival::endpoint_order_test_helpers::permutations;
+    use crate::model_tests::survival::endpoint_order_test_helpers::permutations;
     const CIF_GRID: [f64; 4] = [0.7, 1.3, 5.0, 14.0];
     let bits = |r: &SurvivalPredictionResult| {
         (r.id.clone(), r.cmt, r.survival_all.to_bits(), r.cif.to_bits())
@@ -720,8 +720,8 @@ fn predict_survival_cif_bits_are_the_same_on_every_compile() {
 /// for every subject, the reason its objective was already reproducible before #2531.
 #[test]
 fn focei_objective_of_a_three_cause_model_is_the_same_bits_on_every_compile() {
+    use crate::model_tests::survival::endpoint_order_test_helpers::order_sensitive;
     use crate::stats::likelihood::accumulate_non_gaussian_nll;
-    use crate::survival::endpoint_order_test_helpers::order_sensitive;
     use crate::types::{EstimationMethod, FitOptions};
     let opts = FitOptions {
         method: EstimationMethod::FoceI,

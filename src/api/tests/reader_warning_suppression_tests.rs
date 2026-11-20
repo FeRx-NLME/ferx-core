@@ -23,6 +23,8 @@
 use crate::api::validation::{reader_warning_suppressed, CmtConsumer};
 use crate::types::test_helpers::{analytical_model, ode_model};
 use crate::types::{CompiledModel, FitOptions, GradientMethod, PkModel};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 /// The exact shape the reader emits, so these tests break if the prefix moves.
 const MSG: &str = "W_CMT_DEFAULTED: the dataset has no CMT column, so 10 dose row(s) and 110 \

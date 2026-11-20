@@ -11,6 +11,8 @@
 //! 2. [`transform_dataset_for_frem`] — augment dataset with covariate pseudo-observations
 //! 3. [`generate_frem_model`] — write a new `.ferx` model file with extended parameters
 //! 4. Fit the resulting FREM model normally
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::types::{CompiledModel, Population, RateMode};
 use nalgebra::DMatrix;

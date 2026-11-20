@@ -16,7 +16,8 @@
 # even `ferx-core`), and nothing depends on it. See #1163. `crates/patterns-lint`
 # (#2634) is the same kind of member: source-pattern lints over test code, which
 # depends on no workspace crate (only `syn`) and which nothing depends on.
-members = ["crates/ferx-tools", "crates/ferx-cli", "crates/docs-lint", "crates/patterns-lint"]
+members = [
+    "crates/ferx-model","crates/ferx-tools", "crates/ferx-cli", "crates/docs-lint", "crates/patterns-lint"]
 # Required to PRESERVE existing behaviour, not to change it: a standalone
 # edition-2021 package gets resolver v2 implicitly, but inside a workspace the
 # root package's edition no longer implies it — cargo would warn and fall back
@@ -84,15 +85,15 @@ default = []
 # The Enzyme autodiff sensitivity path was retired in favour of the hand-rolled
 # `Dual2` analytic sensitivities (`sens/`) for FOCE/FOCEI; `ci` remains as a no-op
 # so existing `--features ci` invocations keep working.
-ci = []
+ci = ["ferx-model/ci"]
 # Opt-in support for neural-network-based covariate models (DCM) and
 # dynamics (low-dim NODE). See `plans/dcm-and-low-dim-node.md`. No new
 # runtime deps — the MLP runs on top of `nalgebra`.
-nn = []
+nn = ["ferx-model/nn"]
 # TTE/survival/categorical non-Gaussian endpoint support.
 # Default-off while Phase 1 is in development; promoted to default-on after
 # nlmixr2/NONMEM validation (see plans/tte-survival-markov.md Phase 1).
-survival = []
+survival = ["ferx-model/survival"]
 # Continuous-time Markov models (CTMM). Matrix-exponential transition
 # probabilities + exact Van Loan gradients on top of nalgebra's `expm`; no new
 # runtime deps. Default-off while maturing; promote after CAV-dataset / `msm`
@@ -102,12 +103,19 @@ survival = []
 # the shared non-Gaussian endpoint machinery (the `EndpointLikelihood` enum,
 # per-CMT dispatch, discrete-state datareader routing), which lives behind the
 # `survival` gate (D8). Turning on `markov` therefore turns on that trunk.
-markov = ["survival"]
+markov = ["survival", "ferx-model/markov"]
 # Heavy fit-based tests (5–60 min wall each on a 2-core CI runner).
 # Default `cargo test` `#[ignore]`s them; a nightly/manual job opts in.
-slow-tests = []
+slow-tests = ["ferx-model/slow-tests"]
 
 [dependencies]
+# `version` is what the published crate depends on: cargo drops `path` when it packages
+# `ferx-core`, so `ferx-model` is published too, at the same version, ahead of it (#3041).
+# EXACT (`=`), not caret: ferx-core reaches ferx-model internals (`ferx_model::internal`,
+# widened members) that carry no semver promise, so a published ferx-core must never
+# resolve against a later ferx-model. Bump it with the package version; pinned by
+# `tests/public_api_boundary.rs`.
+ferx-model = { path = "crates/ferx-model", version = "=0.4.0" }
 nalgebra = "0.35"
 csv = "1.3"
 serde = { version = "1", features = ["derive"] }
@@ -147,6 +155,7 @@ cranelift-module = "0.137"
 cranelift-native = "0.137"
 
 [dev-dependencies]
+ferx-model = { path = "crates/ferx-model", features = ["test-support"] }
 approx = "0.5"
 # Parses the whole fit YAML in tests, so a writer that breaks the document fails (#2268).
 # serde-saphyr, not serde_yaml: the latter is deprecated and pulls in the

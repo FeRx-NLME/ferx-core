@@ -80,6 +80,8 @@
 //! inner-loop centring, `suggest_start` and reporting; only the SAEM / IMP
 //! M-steps prefer the group. FOCE / FOCEI / Laplace fits are byte-identical with
 //! and without a group.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::parser::model_parser::{eval_typical_value, CovariateSnapshot};
 use crate::types::{CompiledModel, CovariateMuRef, MuTransform, Population, Subject};
@@ -109,13 +111,13 @@ impl GroupMember<'_> {
     /// scale). `NaN` when the lognormal typical value is not positive — the
     /// caller treats a `NaN` mu as "this θ is not admissible".
     pub fn mu(&self, theta: &[f64], subject: &Subject) -> f64 {
-        let a = eval_typical_value(&self.spec.typical, theta, &subject.covariates);
+        let a = eval_typical_value(&self.spec.typical(), theta, &subject.covariates);
         self.link(a)
     }
 
     /// [`Self::mu`] over a subject's covariates read once ([`Self::snapshots`]).
     fn mu_snapshot(&self, theta: &[f64], snapshot: &CovariateSnapshot<'_>) -> f64 {
-        self.link(self.spec.typical.eval_snapshot(theta, snapshot))
+        self.link(self.spec.typical().eval_snapshot(theta, snapshot))
     }
 
     /// Each subject's covariates this member's typical value reads, looked up once for a solve
@@ -142,7 +144,7 @@ impl GroupMember<'_> {
 
     /// The eta-free typical value `A(θ, covariates)`, locals resolved.
     pub(crate) fn typical(&self) -> &crate::parser::model_parser::TypicalProgram {
-        &self.spec.typical
+        &self.spec.typical()
     }
 
     /// The thetas this member's typical value reads, by name.
@@ -266,7 +268,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
     // anchor's eta must clear the IIV floor a group's own eta must clear.
     let anchor_of =
         |spec: &'m CovariateMuRef, t: usize, e: usize| -> Result<&'m CovariateMuRef, String> {
-            let found = spec.colliding_anchors.iter().find(|a| {
+            let found = spec.colliding_anchors().iter().find(|a| {
                 a.eta_name == eta_name(e)
                     && a.theta_names.len() == 1
                     && a.theta_names[0] == theta_name(t)
@@ -509,7 +511,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         // its one theta, so stopping at it hides no other theta's route.
         let unabsorbed_anchor_thetas: Vec<&str> = members
             .iter()
-            .flat_map(|m| m.spec.colliding_anchors.iter())
+            .flat_map(|m| m.spec.colliding_anchors().iter())
             .filter(|a| !members.iter().any(|m| m.spec.eta_name == a.eta_name))
             .map(|a| a.theta_names[0].as_str())
             .collect();
@@ -521,7 +523,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
                 unabsorbed_anchor_thetas.contains(n)
                     || members
                         .iter()
-                        .any(|m| m.spec.read_outside_groups_and_anchors.iter().any(|r| r == n))
+                        .any(|m| m.spec.read_outside_groups_and_anchors().iter().any(|r| r == n))
             })
             .collect();
         if !outside.is_empty() {
@@ -572,7 +574,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         // `η_ik`, so a second typical value reading that eta has its
         // prediction moved while `φ_i` stays put, and the data term is live in
         // the group's thetas after all (#918 review).
-        for m in members.iter().filter(|m| m.spec.eta_shared) {
+        for m in members.iter().filter(|m| m.spec.eta_shared()) {
             let (what, reads) = if m.absorbed_anchor {
                 ("mu-reference", "anchored on")
             } else {
@@ -587,7 +589,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
                 m.spec.eta_name
             ));
         }
-        let eta_shared = members.iter().any(|m| m.spec.eta_shared);
+        let eta_shared = members.iter().any(|m| m.spec.eta_shared());
         groups.push(CovariateMuGroup {
             members: members
                 .iter()
@@ -909,7 +911,7 @@ impl CovariateMuGroup<'_> {
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
         let names: Vec<Vec<String>> =
-            self.members.iter().map(|m| m.spec.typical.covariate_names()).collect();
+            self.members.iter().map(|m| m.spec.typical().covariate_names()).collect();
         let snaps: Vec<Vec<CovariateSnapshot<'_>>> =
             self.members.iter().zip(&names).map(|(m, n)| m.snapshots(n, population)).collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
@@ -1089,7 +1091,7 @@ fn solve_exact_single(
             t
         })
         .collect();
-    let names = member.spec.typical.covariate_names();
+    let names = member.spec.typical().covariate_names();
     let snaps = member.snapshots(&names, population);
     let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
         let mut r = Vec::with_capacity(n);

@@ -4,6 +4,8 @@
 //! The numerical oracles live in `tests/`: the NONMEM anchor and nesting-by-key (O1,
 //! O3, `nested_levels_nonmem_anchor.rs`) and the one-level degenerate oracle (O2,
 //! `nested_levels_degenerate_oracle.rs`).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::validation::{check_model_data, check_model_options, validate_model_file};
 use crate::parser::model_parser::{parse_full_model, parse_model_string};
@@ -740,7 +742,7 @@ fn a_nested_model_reports_the_analytic_walks_on_every_class() {
     for (label, m) in [("algebraic", model()), ("transit", transit)] {
         assert!(m.has_nested_levels(), "{label}");
         assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(&m), "{label}");
-        assert!(crate::estimation::inner_optimizer::inner_reports_analytic_model(&m), "{label}");
+        assert!(crate::estimation::inner_settings::inner_reports_analytic_model(&m), "{label}");
         assert!(crate::sens::provider::analytic_outer_gradient_in_scope(&m), "{label}");
     }
 }

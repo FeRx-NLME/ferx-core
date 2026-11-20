@@ -28,6 +28,8 @@
 //! initial estimates is ranked on an OFV that says nothing about the model.
 //! [`check_strictness`] evaluates the pyDarwin-style gates and returns the
 //! *reasons*, so a search report can say why a candidate was excluded.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
@@ -54,24 +56,6 @@ pub enum BicType {
     Random,
     /// Every free parameter on `ln(n_obs)` — identical to `FitResult::bic`.
     Fixed,
-}
-
-impl BicInputs {
-    /// Total free parameters in the tally; equals `FitResult::n_parameters`
-    /// for a result produced by `fit()`.
-    pub fn n_free(&self) -> usize {
-        self.theta_random + self.theta_fixed + self.omega + self.kappa + self.sigma
-    }
-
-    /// Free parameters penalised on `ln(n_subjects)` by the mixed BIC.
-    pub fn n_random_class(&self) -> usize {
-        self.theta_random + self.omega + self.kappa + if self.sigma_random { self.sigma } else { 0 }
-    }
-
-    /// Free parameters penalised on `ln(n_obs)` by the mixed BIC.
-    pub fn n_fixed_class(&self) -> usize {
-        self.theta_fixed + if self.sigma_random { 0 } else { self.sigma }
-    }
 }
 
 /// The BIC of a fit under one of the four penalty conventions.
@@ -152,7 +136,7 @@ pub(crate) fn counted_held_mask(
     model: &CompiledModel, template: &ModelParameters, held_mask: &[bool],
 ) -> Vec<bool> {
     let mut out = held_mask.to_vec();
-    for i in model.indiv_param_partials.theta_blocks.profiled_theta_indices() {
+    for i in model.indiv_param_partials.theta_blocks().profiled_theta_indices() {
         if !template.theta_fixed.get(i).copied().unwrap_or(false) {
             if let Some(h) = out.get_mut(i) {
                 *h = false;

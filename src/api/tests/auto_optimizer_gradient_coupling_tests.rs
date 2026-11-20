@@ -10,6 +10,8 @@
 //! gates in the check reject overlapping inputs and a green suite is not evidence
 //! any of them is load-bearing. Every one was mutated in turn; the test named in
 //! each doc comment is the one that went red.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::diagnostics::Severity;
@@ -383,7 +385,7 @@ fn a_mixture_fit_warns_like_its_single_population_twin() {
         sigma_override_fixed: Vec::new(),
     });
     assert_eq!(
-        crate::estimation::outer_optimizer::resolve_outer_optimizer(
+        crate::estimation::outer_policy::resolve_outer_optimizer(
             Optimizer::Auto,
             &model,
             true,

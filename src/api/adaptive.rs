@@ -6,6 +6,8 @@ use crate::sim::adaptive::{
     AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
     DoseLedgerEntry, MonitorSpec,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::DVector;
 use rand::RngExt;
 use rand_distr::Normal;
@@ -872,7 +874,7 @@ fn decisions_before_moved_reset_warnings(
                 .chain(
                     s.doses
                         .iter()
-                        .filter(|d| d.implied.is_none() && d.time < engine)
+                        .filter(|d| d.implied().is_none() && d.time < engine)
                         .map(|d| s.param_time_at(d.time)),
                 )
                 .chain(s.reset_times.iter().filter(|&&t| t < engine).map(|&t| s.param_time_at(t)));
@@ -1363,7 +1365,7 @@ where
                     needs_tad: model
                         .ruv_magnitude
                         .as_ref()
-                        .is_some_and(|rm| rm.is_active() && rm.uses_tad),
+                        .is_some_and(|rm| rm.is_active() && rm.uses_tad()),
                     base_seed: crate::sim::adaptive::subject_assay_base_seed(
                         assay_root,
                         &subject.id,
@@ -2006,7 +2008,7 @@ pub(super) fn decision_covs_by_scan<'a>(
     );
     rows.extend(
         (0..subject.doses.len())
-            .filter(|&k| subject.doses[k].implied.is_none())
+            .filter(|&k| subject.doses[k].implied().is_none())
             .map(|k| (subject.doses[k].time, subject.dose_cov(k))),
     );
     rows.extend(
@@ -2102,6 +2104,10 @@ pub(crate) fn verify_decision_records(
             Some(decision_nocb_covs_by_scan(subject, decision_times))
         }
         crate::sim::adaptive::DecisionCovariates::Locf => None,
+        // `DecisionCovariates` is `#[non_exhaustive]` and lives in ferx-model (#3041), so this
+        // match can no longer be exhaustive: an unknown rule refuses rather than defaults. A new
+        // variant breaks the tripwire next to `AdaptiveAction` in ferx-model, which points here.
+        _ => return Err("a decision-covariate rule this check does not know".to_string()),
     };
     for (g, &t) in decision_times.iter().enumerate() {
         let row = nocb.as_ref().and_then(|v| v[g]).unwrap_or(locf[g]);
@@ -2195,7 +2201,7 @@ fn check_event_pk_records(
             let d = &subject.doses[k];
             (model.pk_param_fn)(
                 theta,
-                eta_at(d.implied.map_or(d.time, |i| i.gov_time)),
+                eta_at(d.implied().map_or(d.time, |i| i.gov_time)),
                 subject.dose_cov(k),
                 subject.dose_param_time(k),
             )

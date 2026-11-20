@@ -1,0 +1,3618 @@
+//! Closed-form modified-release absorption (#860).
+//!
+//! Multi-route / modified-release absorption (parallel and mixed pathways #505, per-route
+//! lag #856/#859) is authored as an `[odes]` model whose central compartment receives a
+//! superposition of built-in input-rate forcings (`first_order`/`transit`/`igd`/
+//! `zero_order`, each optionally `FR*…` split and `lag=…` shifted). Such models were
+//! ODE-integrated: the fixed closed-form PK layout has a single `KA` slot.
+//!
+//! The disposition (central [+ peripheral]) is linear time-invariant, so its inputs
+//! **superpose**:
+//!
+//! ```text
+//!   y(t) = Σ_k  FR_k · single_route_closed_form_k( t − LAG_k )
+//! ```
+//!
+//! each term an existing single-route kernel (`sens/one_cpt.rs`, `sens/two_cpt.rs`),
+//! scaled by its pathway fraction and shifted by its onset. Generic over [`PkNum`]:
+//! `T = f64` gives the value, `T = Dual2<N>` the value and the exact
+//! `∂y/∂{ka, frac, lag, cl, v, …}` FOCE/FOCEI consume.
+//!
+//! ## Identification (no AST / name matching)
+//!
+//! The disposition is recovered from the compiled `OdeSpec` **by behaviour, not by
+//! spelling** (matching `-CL/V*central` false-positives on nonlinear or reparameterised
+//! RHSs). [`identify_disposition`] probes the compiled RHS program (evaluated without the
+//! input-rate forcings) at basis states to extract the constant Jacobian `A`, verifies
+//! linearity + time-invariance + a canonical 1-/2-cpt sign pattern, and reads the
+//! observable's central slope `m = ∂y/∂central` off the readout program. Volumes cancel:
+//! for `y = central / V` the observable equals `Σ mass·kernel_conc` when the kernel is
+//! evaluated with `v = 1/m`, `cl = ke/m` (see [`recover_disp_params_g`]).
+//!
+//! Identification is deliberately **conservative** (declines on any nonlinearity,
+//! time-variance, non-canonical sign pattern, or non-central/nonlinear readout); the ODE
+//! path is always a correct fallback, so an un-admitted model is only slower, never wrong.
+//! The remaining risk (identified but parameters recovered wrongly) is closed by the
+//! **reduction-to-ODE test anchor**: the closed form is asserted against its own integrated
+//! `OdeSpec` twin across a model zoo. [`mr_predictions`] is the routing entry; it returns
+//! `None` (→ ODE) outside scope.
+
+use crate::ode::predictions::OdeSpec;
+use crate::pk::absorption::{InputRateForcing, InputRateKind};
+use crate::sens::num::BranchCmp;
+use crate::sens::num::PkNum;
+use crate::sens::one_cpt::{one_cpt_ig_g, one_cpt_oral_g, one_cpt_transit_g, one_cpt_zero_order_g};
+use crate::sens::two_cpt::{two_cpt_ig_g, two_cpt_oral_g, two_cpt_transit_g, two_cpt_zero_order_g};
+use crate::types::DoseEvent;
+
+/// Linear disposition shape recovered from an [`OdeSpec`] by numeric probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MrDispositionKind {
+    /// Single central compartment (`d central/dt = R_in − ke·central`).
+    OneCpt,
+    /// Central + one peripheral (`k12`/`k21` reversible coupling).
+    TwoCpt,
+}
+
+/// The identified disposition: its shape plus the state indices of central and
+/// (for two-compartment) peripheral. Produced by [`identify_disposition`] from
+/// the immutable [`OdeSpec`] structure, so it is **model-invariant** (independent
+/// of subject, `θ`, `η`). It is currently recovered afresh on each [`mr_scope`]
+/// call rather than cached on the model — a memoisation opportunity, since the
+/// numeric Jacobian probing repeats every value / gradient evaluation (tracked as
+/// a follow-up; the fast path still avoids all ODE integration, so the probing is
+/// a second-order cost). The per-subject rates are recovered separately over `T`
+/// by [`recover_disp_params_g`] so `T = Dual2` carries their sensitivities.
+#[derive(Debug, Clone, Copy)]
+pub struct MrDisposition {
+    pub kind: MrDispositionKind,
+    /// State index of the central compartment (the forcings' target).
+    pub central: usize,
+    /// State index of the peripheral compartment (two-compartment only).
+    pub periph: Option<usize>,
+}
+
+/// Disposition parameters synthesised at a parameter point, over `T` so a
+/// `Dual2` carries `∂/∂p`. Parameterised in the `cl`/`v`(/`q`/`v2`) form the
+/// existing kernels expect; `v = 1/m` and `cl = ke/m` fold the observable slope
+/// in so `Σ mass·kernel_conc` *is* the observable (volumes cancel — see module
+/// docs).
+#[derive(Debug, Clone, Copy)]
+pub struct DispParams<T: PkNum> {
+    pub cl: T,
+    pub v: T,
+    /// `(q, v2)` for two-compartment; `None` for one-compartment.
+    pub periph: Option<(T, T)>,
+}
+
+/// Tolerances for the numeric structure checks. Loose enough to admit honest
+/// floating-point noise in the Jacobian probes, tight enough that a genuinely
+/// nonlinear or non-canonical RHS fails. These only pick *which* closed form to
+/// try; what makes admitting one safe is the scope gate in [`mr_scope`] (which
+/// rejects, statically, the classes these numeric probes cannot decide) plus
+/// [`verify_against_ode_twin`], which re-checks every admitted subject against
+/// its integrated twin in debug builds.
+///
+/// Until #1124 this comment named a "runtime verify-gate" as the real safety
+/// net. There was no such gate — three comments referred to it and nothing
+/// implemented it, which is how a `TAD`-reading RHS reached production 8× wrong.
+/// It exists now; keep it that way, and do not loosen these tolerances on the
+/// strength of a release-build guarantee it does not provide.
+const LINEARITY_TOL: f64 = 1e-7;
+/// A cross-coupling rate below this is treated as "absent" (distinguishes a
+/// two-compartment `k12`/`k21` pair from a one-way depot→central drain).
+const COUPLING_EPS: f64 = 1e-9;
+
+/// State amplitudes for [`identify_disposition`]'s off-axis residual check (#1149). Spans
+/// six decades because a state-triggered branch fires at whatever amount the model author
+/// wrote and identification has no dose scale. A linear RHS satisfies `f(u) = A·u` at every
+/// amplitude, so extra rungs cost RHS evaluations (`3n + 1` → `3n + 5`, ~57% more probing
+/// for 2-cpt; repeated per evaluation until memoised, see [`MrDisposition`]) but cannot
+/// cause a false decline.
+const OFF_AXIS_PROBE_SCALES: [f64; 4] = [1.0, 1e2, 1e4, 1e6];
+
+/// Probe the forcing-free disposition RHS `du = f(u, p, t)` in `f64` at state
+/// `u`. Returns `None` when the spec has no compiled RHS program (hand-built
+/// specs / out of analytic scope). The forcings are applied by a separate
+/// integrator wrapper, so the program yields the pure linear disposition.
+fn probe_rhs_f64(spec: &OdeSpec, u: &[f64], p: &[f64], t: f64) -> Option<Vec<f64>> {
+    let prog = spec.rhs_program.as_ref()?;
+    let mut du = vec![0.0; spec.n_states];
+    let mut vars: Vec<f64> = Vec::new();
+    let mut stack: Vec<f64> = Vec::new();
+    // `tad` is pinned to `0.0`, and that is NOT safe on its own: pinning made a `TAD`-reading
+    // RHS evaluate identically at both probe times, so it was admitted as time-invariant and
+    // its `TAD` term vanished (#1124). Varying `tad` does not fix it (passing `t` for both
+    // `tafd` and `tad` lets `TAFD − TAD` cancel to a constant, flipping a correctly declined
+    // RHS to admitted; a `TAD` read from an untaken `if` branch still slips past). The
+    // behavioural probe cannot decide this; `mr_scope` settles it statically by declining any
+    // RHS that reads model time before identification is attempted, so the pin is inert.
+    prog.eval_rhs_g::<f64>(
+        u,
+        p,
+        t,
+        t,
+        0.0,
+        crate::sens::num::PkNum::from_f64(0.0),
+        &mut du,
+        &mut vars,
+        &mut stack,
+    );
+    Some(du)
+}
+
+/// Identify the linear disposition of `spec` by numeric probing — its shape and
+/// the central/peripheral state indices — or `None` if it is not a canonical
+/// linear 1-/2-cpt system with all input-rate forcings into one central
+/// compartment. Structure only; per-subject rates come from
+/// [`recover_disp_params_g`]. `p` is a representative (positive) parameter point
+/// and `t` a probe time; the checks are parameter-point-agnostic in structure,
+/// and `verify_against_ode_twin` re-validates numerically in debug builds.
+///
+/// The probe is behavioural by design, but it cannot decide **model-time
+/// dependence**: it samples two times with `tad` pinned, so a `TAD` term is
+/// invisible and any time variable inside an untaken `if` branch is unreachable.
+/// [`mr_scope`] rejects those statically before calling this (#1124).
+pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDisposition> {
+    // Must have a differentiable RHS + a dual-evaluable readout (else no analytic
+    // path exists anyway).
+    spec.rhs_program.as_ref()?;
+    let ro = spec.readout_program.as_ref()?;
+    if ro.reads_leaves() {
+        return None;
+    }
+    let n = spec.n_states;
+    if n == 0 || n > 2 {
+        return None;
+    }
+
+    // All forcings must target the same compartment — that is "central".
+    let mut cmts = spec.input_rate.iter().map(|f| f.cmt);
+    let central = cmts.next()?;
+    if !cmts.all(|c| c == central) || central >= n {
+        return None;
+    }
+
+    // No autonomous term: f(0, p, t) ≈ 0. The `!is_finite()` guard is load-bearing:
+    // a `NaN` probe (a pathological mid-fit param excursion, e.g. `V → 0`) would
+    // slip past a bare `d.abs() > TOL` because `NaN > TOL` is false — decline it so
+    // the fast path never serves NaN where the sign/linearity checks below (also
+    // `.abs() > …` comparisons) would silently admit it.
+    let du0 = probe_rhs_f64(spec, &vec![0.0; n], p, t)?;
+    if du0.iter().any(|d| !d.is_finite() || d.abs() > LINEARITY_TOL) {
+        return None;
+    }
+
+    // Linear + time-invariant: f(2·e_i) = 2·f(e_i), and equal at two times.
+    let t2 = t + 1.0;
+    let mut basis = vec![0.0; n];
+    let mut jac = vec![vec![0.0; n]; n]; // jac[i] = ∂f/∂u_i column (= A·e_i)
+    for i in 0..n {
+        basis[i] = 1.0;
+        let ei = probe_rhs_f64(spec, &basis, p, t)?;
+        basis[i] = 2.0;
+        let two_ei = probe_rhs_f64(spec, &basis, p, t)?;
+        basis[i] = 1.0;
+        let ei_t2 = probe_rhs_f64(spec, &basis, p, t2)?;
+        basis[i] = 0.0;
+        for j in 0..n {
+            if !ei[j].is_finite() || !two_ei[j].is_finite() || !ei_t2[j].is_finite() {
+                return None; // NaN/Inf probe — see the `du0` guard above
+            }
+            if (two_ei[j] - 2.0 * ei[j]).abs() > LINEARITY_TOL * (1.0 + two_ei[j].abs()) {
+                return None; // nonlinear in u_i
+            }
+            if (ei_t2[j] - ei[j]).abs() > LINEARITY_TOL * (1.0 + ei[j].abs()) {
+                return None; // time-varying
+            }
+            jac[i][j] = ei[j];
+        }
+    }
+
+    // **Off-axis residual.** The axis probes fix `A` but say nothing about terms that only
+    // switch on away from the axes; two classes slip through, both reproducing #1124's shape
+    // (a term silently absent, `converged: true`) with no time variable:
+    //   - a **product of two distinct states** (`- KON*central*periph`, TMDD/binding) is
+    //     exactly zero at `0`, `eᵢ`, `2eᵢ`, so a clean 2-cpt is identified with the term dropped;
+    //   - a branch on the **state** (`if (central > 10) { KE = 3*CL/V }`) is never entered
+    //     (largest probed state is `2.0`).
+    // **Mixed states** (`n ≥ 2`, every amount non-zero) reach the first class; **amplitude**
+    // reaches anything that changes with the amount (state threshold, saturation; the whole
+    // mechanism at `n = 1`, and what declines a Michaelis–Menten elimination with a large `KM`).
+    // Both are one question: does `f` equal `A·u` away from where `A` was measured? It compares
+    // two evaluations of the same RHS (no integration), so `LINEARITY_TOL` governs it exactly as
+    // on-axis; it is not calibrated against solver error (cf. `verify_against_ode_twin`, which
+    // compares integrations and scales with `reltol`). The ladder spans six decades (no dose
+    // scale to derive a threshold from); extra rungs cost four RHS evaluations and no false
+    // declines; per-state multipliers are distinct so a term antisymmetric in two states cannot
+    // cancel. Declining is the safe direction (ODE engine: slower, correct).
+    for &scale in &OFF_AXIS_PROBE_SCALES {
+        let u: Vec<f64> = (0..n).map(|i| scale * (1.0 + 0.5 * i as f64)).collect();
+        let f_u = probe_rhs_f64(spec, &u, p, t)?;
+        for j in 0..n {
+            // (A·u)_j = Σ_i jac[i][j]·u_i — `jac[i]` is the response to `eᵢ`, i.e.
+            // column `i` of `A`, so the sum runs over the *first* index.
+            let au: f64 = (0..n).map(|i| jac[i][j] * u[i]).sum();
+            if !f_u[j].is_finite() {
+                return None; // NaN/Inf probe — see the `du0` guard above
+            }
+            if (f_u[j] - au).abs() > LINEARITY_TOL * (1.0 + au.abs()) {
+                return None; // nonlinear or state-switched away from the axes
+            }
+        }
+    }
+
+    // Readout must depend on central only, linearly.
+    for s in 0..n {
+        if s != central && ro.references_state(s) {
+            return None;
+        }
+    }
+    if !ro.references_state(central) {
+        return None;
+    }
+
+    match n {
+        1 => {
+            // central self-rate must be elimination (< 0).
+            if jac[central][central] >= -COUPLING_EPS {
+                return None;
+            }
+            Some(MrDisposition { kind: MrDispositionKind::OneCpt, central, periph: None })
+        }
+        2 => {
+            let periph = (0..n).find(|&s| s != central)?;
+            // A (amounts):  dA_c = −(k10+k12)·A_c + k21·A_p ;  dA_p = k12·A_c − k21·A_p
+            let k12 = jac[central][periph]; // central → periph
+            let k21 = jac[periph][central]; // periph → central
+            let c_self = jac[central][central]; // −(k10+k12)
+            let p_self = jac[periph][periph]; // −k21
+                                              // Canonical reversible two-compartment sign pattern, with *both*
+                                              // cross-couplings present (a one-way depot→central drain, k21≈0, is
+                                              // NOT two-compartment — it is an oral depot-state model with its own
+                                              // analytic path, and must be declined here).
+            if k12 <= COUPLING_EPS || k21 <= COUPLING_EPS {
+                return None;
+            }
+            if c_self >= 0.0 || p_self >= 0.0 {
+                return None;
+            }
+            // Peripheral self-rate must be −k21 (mass-conserving coupling).
+            if (p_self + k21).abs() > LINEARITY_TOL * (1.0 + k21.abs()) {
+                return None;
+            }
+            // Implied elimination k10 = −(c_self) − k12 must be non-negative.
+            if -c_self - k12 < -COUPLING_EPS {
+                return None;
+            }
+            Some(MrDisposition { kind: MrDispositionKind::TwoCpt, central, periph: Some(periph) })
+        }
+        _ => None,
+    }
+}
+
+/// Recover the disposition parameters at parameter point `p` over `T`, so a
+/// `Dual2` carries their `∂/∂(θ,η)`. Uses the compiled RHS program (disposition
+/// rates from the Jacobian) and readout program (central slope `m`), then folds
+/// the volume in as `v = 1/m`, `cl = ke/m` (`q = k12/m`, `v2 = q/k21` for
+/// two-compartment). Returns `None` if the readout slope is non-positive
+/// (degenerate) — the caller ([`mr_scope`]) then declines to the ODE path.
+pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
+    spec: &OdeSpec, disp: &MrDisposition, p: &[T], cov: &std::collections::HashMap<String, f64>,
+) -> Option<DispParams<T>> {
+    let prog = spec.rhs_program.as_ref()?;
+    let ro = spec.readout_program.as_ref()?;
+    // A `TIME`-reading readout (`y = central/V + BETA*TIME/(TIME+T50)`, now that
+    // #1028 makes `TIME` resolve per observation) is not a function of the state
+    // alone, so the linearity probe below cannot characterise it: the probe
+    // evaluates the readout under whatever the *ambient* model-time thread-local
+    // holds — `0.0` at this gate — which makes an additive time term vanish, passes
+    // `y0 ≈ 0`, and would let `mr_observable_g`'s `m·amount` silently drop the term
+    // for every MR-scoped subject. It would also make scope membership depend on
+    // ambient thread-local state (a non-zero ambient time flips the same model from
+    // admitted to declined). Decline outright and take the ODE path, which enters
+    // the per-observation guard (#1028).
+    if ro.reads_time_builtin() {
+        return None;
+    }
+    let n = spec.n_states;
+    let mut vars: Vec<T> = Vec::new();
+    let mut stack: Vec<T> = Vec::new();
+
+    let probe = |u: &[T], vars: &mut Vec<T>, stack: &mut Vec<T>| -> Vec<T> {
+        let mut du = vec![T::from_f64(0.0); n];
+        prog.eval_rhs_g::<T>(
+            u,
+            p,
+            0.0,
+            0.0,
+            T::from_f64(0.0),
+            crate::sens::num::PkNum::from_f64(0.0),
+            &mut du,
+            vars,
+            stack,
+        );
+        du
+    };
+
+    // Central slope m = readout(e_central) − readout(0), over T.
+    let zero_state = vec![T::from_f64(0.0); n];
+    let mut e_c = vec![T::from_f64(0.0); n];
+    e_c[disp.central] = T::from_f64(1.0);
+    let mut e_c2 = vec![T::from_f64(0.0); n];
+    e_c2[disp.central] = T::from_f64(2.0);
+    let y0 = ro.eval_output_g::<T>(&zero_state, p, &[], &[], cov, &mut vars, &mut stack);
+    let y1 = ro.eval_output_g::<T>(&e_c, p, &[], &[], cov, &mut vars, &mut stack);
+    let y2 = ro.eval_output_g::<T>(&e_c2, p, &[], &[], cov, &mut vars, &mut stack);
+    // The observable must be **linear through the origin** in the central amount:
+    // `mr_observable_g` sums `mass·kernel_conc = m·amount`, so a readout with a
+    // non-zero intercept (a baseline `y = central/V + BASE`) or any curvature in
+    // central (`y = central²/V`) would be silently mispredicted — the `identify`
+    // readout check only pins *which* state is read, not that it is read linearly.
+    // Require `readout(0) ≈ 0` and `readout(2) ≈ 2·readout(1)`, else decline.
+    // Branches through the branch API: a recording type guards them, never reads the values.
+    let (one, tol) = (T::from_f64(1.0), T::from_f64(LINEARITY_TOL));
+    if y0.abs().br_cmp(BranchCmp::Gt, tol * (one + y1.abs())) {
+        return None;
+    }
+    if (y2 - T::from_f64(2.0) * y1).abs().br_cmp(BranchCmp::Gt, tol * (one + y2.abs())) {
+        return None;
+    }
+    let m = y1 - y0;
+    if m.br_cmp_c(BranchCmp::Le, 0.0) {
+        return None;
+    }
+    let v = T::from_f64(1.0) / m;
+
+    let du_ec = probe(&e_c, &mut vars, &mut stack);
+    match disp.kind {
+        MrDispositionKind::OneCpt => {
+            let ke = -du_ec[disp.central]; // du = −ke·1
+            if ke.br_cmp_c(BranchCmp::Le, 0.0) {
+                return None;
+            }
+            Some(DispParams { cl: ke * v, v, periph: None })
+        }
+        MrDispositionKind::TwoCpt => {
+            let periph = disp.periph?;
+            let mut e_p = vec![T::from_f64(0.0); n];
+            e_p[periph] = T::from_f64(1.0);
+            let du_ep = probe(&e_p, &mut vars, &mut stack);
+            let k12 = du_ec[periph]; // central → periph
+            let k21 = du_ep[disp.central]; // periph → central
+            let k10 = -du_ec[disp.central] - k12; // −(c_self) − k12
+            if k10.br_cmp_c(BranchCmp::Le, 0.0)
+                || k12.br_cmp_c(BranchCmp::Le, 0.0)
+                || k21.br_cmp_c(BranchCmp::Le, 0.0)
+            {
+                return None;
+            }
+            let v1 = v;
+            let cl = k10 * v1;
+            let q = k12 * v1;
+            let v2 = q / k21;
+            Some(DispParams { cl, v: v1, periph: Some((q, v2)) })
+        }
+    }
+}
+
+/// Read forcing argument `i` from the flat individual-parameter vector, over `T`.
+/// Mirrors the private `InputRateForcing::arg` (kept local so this module does
+/// not widen that visibility).
+#[inline]
+fn forcing_arg<T: PkNum>(f: &InputRateForcing, p: &[T], i: usize, dflt: f64) -> T {
+    f.arg_slots.get(i).and_then(|&s| p.get(s)).copied().unwrap_or_else(|| T::from_f64(dflt))
+}
+
+/// One route's contribution to the observable: `mass · kernel_conc(τ)`.
+///
+/// The kernel is evaluated at unit amount / unit `F` (its response is linear in
+/// dose mass) and multiplied by `mass = FR·F·D` outside — so a `Dual2` `mass`
+/// threads the exact `∂/∂FR` (and `∂/∂F`) via the product rule, and the kernel's
+/// own `τ.val() < 0 → 0` guard supplies the pre-onset gate. Covers the smooth
+/// kernels (`first_order`/`transit`/`igd`) and the box-car `zero_order` kernel
+/// (`∂/∂dur` exact on whichever side of the `t == dur` boundary is selected,
+/// see [`crate::sens::one_cpt::one_cpt_zero_order_g`]); `weibull` has no
+/// elementary closed form and is excluded by the support gate, returning `0`
+/// here as a defensive no-op.
+#[inline(always)]
+fn route_conc_g<T: PkNum>(
+    kind: InputRateKind, f: &InputRateForcing, p: &[T], dp: &DispParams<T>, tau: T, mass: T,
+) -> T {
+    let one = T::from_f64(1.0);
+    let unit = match dp.periph {
+        None => match kind {
+            InputRateKind::FirstOrder => {
+                let ka = forcing_arg(f, p, 0, 1.0);
+                one_cpt_oral_g(1.0, tau, dp.cl, dp.v, ka, one)
+            }
+            InputRateKind::Transit => {
+                let n = forcing_arg(f, p, 0, 0.0);
+                let mtt = forcing_arg(f, p, 1, 1.0);
+                one_cpt_transit_g(1.0, tau, dp.cl, dp.v, n, mtt, one)
+            }
+            InputRateKind::InverseGaussian => {
+                let mat = forcing_arg(f, p, 0, 1.0);
+                let cv2 = forcing_arg(f, p, 1, 1.0);
+                one_cpt_ig_g(1.0, tau, dp.cl, dp.v, mat, cv2, one)
+            }
+            InputRateKind::ZeroOrder => {
+                let dur = forcing_arg(f, p, 0, 1.0);
+                one_cpt_zero_order_g(1.0, tau, dp.cl, dp.v, dur, one)
+            }
+            InputRateKind::Weibull => T::from_f64(0.0),
+        },
+        Some((q, v2)) => match kind {
+            InputRateKind::FirstOrder => {
+                let ka = forcing_arg(f, p, 0, 1.0);
+                two_cpt_oral_g(1.0, tau, dp.cl, dp.v, q, v2, ka, one)
+            }
+            InputRateKind::Transit => {
+                let n = forcing_arg(f, p, 0, 0.0);
+                let mtt = forcing_arg(f, p, 1, 1.0);
+                two_cpt_transit_g(1.0, tau, dp.cl, dp.v, q, v2, n, mtt, one)
+            }
+            InputRateKind::InverseGaussian => {
+                let mat = forcing_arg(f, p, 0, 1.0);
+                let cv2 = forcing_arg(f, p, 1, 1.0);
+                two_cpt_ig_g(1.0, tau, dp.cl, dp.v, q, v2, mat, cv2, one)
+            }
+            InputRateKind::ZeroOrder => {
+                let dur = forcing_arg(f, p, 0, 1.0);
+                two_cpt_zero_order_g(1.0, tau, dp.cl, dp.v, q, v2, dur, one)
+            }
+            InputRateKind::Weibull => T::from_f64(0.0),
+        },
+    };
+    mass * unit
+}
+
+/// The closed-form modified-release observable at time `t`, over `T`.
+///
+/// Superposes every route of every past dose: `Σ_dose Σ_route FR·F·D ·
+/// kernel_conc(t − dose − lag_cmt − lag_route)`. `lag_cmt` is the (already
+/// resolved) shared compartment lag for the central compartment; `f_bio` the
+/// overall bioavailability `F` (one dose record → `F` scales the whole dose
+/// before the `FR` split). Clamped at `0` like the analytic superposition. Pure
+/// superposition — the disposition parameters `dp` are recovered by the caller,
+/// which keeps this testable in isolation against manual kernel sums.
+// `inline(always)` here and on `route_conc_g`: the `f64` instance was inlined into
+// `mr_predictions` (its one caller) until the adjoint recorder became a second one, and the
+// out-of-line copy lost the compiler's sharing of equal-argument `expm1` terms across the
+// routes' loop -- 34 % more `expm1` calls, +12 % instructions on an SAEM fit whose every
+// evaluation is this function.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn mr_observable_g<T: PkNum>(
+    dp: &DispParams<T>, forcings: &[InputRateForcing], doses: &[DoseEvent], t: T, params: &[T],
+    lag_cmt: T, f_bio: T,
+) -> T {
+    let mut c = T::from_f64(0.0);
+    for dose in doses {
+        let base = T::from_f64(dose.time) + lag_cmt;
+        for f in forcings {
+            let onset = base + f.route_lag(params);
+            let tau = t - onset;
+            let mass = f.frac(params) * f_bio * T::from_f64(dose.amt);
+            c = c + route_conc_g::<T>(f.kind, f, params, dp, tau, mass);
+        }
+    }
+    c.guard_floor(0.0)
+}
+
+/// Whether this input-rate kind has an elementary closed-form central response
+/// that can be superposed. `first_order`/`transit`/`igd` (smooth kernels) and
+/// `zero_order` (box-car convolution, #860 Phase B) do; `weibull` has no
+/// elementary convolution with an exponential disposition and stays on the ODE
+/// path permanently. Exhaustive so a new kind forces a decision here.
+pub fn is_closed_form_kind(kind: InputRateKind) -> bool {
+    match kind {
+        InputRateKind::FirstOrder
+        | InputRateKind::Transit
+        | InputRateKind::InverseGaussian
+        | InputRateKind::ZeroOrder => true,
+        InputRateKind::Weibull => false,
+    }
+}
+
+/// Whether a `transit`/`igd` route is in its flip-flop domain, where the
+/// exponential-tilting closed form does not converge and the kernel returns `0`.
+/// Such a subject must integrate (the ODE forcing is valid for any params), so
+/// its presence declines the whole model from the closed-form path — mirroring
+/// the single-route flip-flop reroute (`absorption_flip_flop_at`). `first_order`
+/// never flips (the `ka ≈ ke` limit is handled inside the kernel).
+// `!(ke < bound)` is deliberate (not `ke >= bound`): it declines a transient `NaN`
+// `ke`/`bound` too (`NaN < x` is false → `!false` = true → decline), matching the
+// kernels' own `!(ke < ktr)` NaN-safe guards. Suppress the partial-ord lint that
+// would "simplify" it to the NaN-unsafe `>=` form.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
+    match dp.periph {
+        None => {
+            // One-compartment: the convergence bound is on `ke = CL/V`, matching
+            // `one_cpt_transit_amt_g` / `one_cpt_ig_amt_g` exactly.
+            let ke = dp.cl / dp.v;
+            match f.kind {
+                InputRateKind::Transit => {
+                    let n = forcing_arg(f, p, 0, 0.0);
+                    let mtt = forcing_arg(f, p, 1, 1.0);
+                    mtt <= 0.0 || !(ke < (n + 1.0) / mtt)
+                }
+                InputRateKind::InverseGaussian => {
+                    let mat = forcing_arg(f, p, 0, 1.0);
+                    let cv2 = forcing_arg(f, p, 1, 1.0);
+                    mat <= 0.0 || cv2 <= 0.0 || !(ke < 1.0 / (2.0 * mat * cv2))
+                }
+                _ => false,
+            }
+        }
+        Some((q, v2)) => {
+            // Two-compartment: the tilting converges on the **fast macro-rate α**
+            // (an eigenvalue, α > k10 = CL/V1) and needs distinct eigenvalues —
+            // NOT `ke = CL/V1`. Reuse the 2-cpt kernel's OWN domain predicate so
+            // `route_flips` can never disagree with what the kernel actually does
+            // (a route that fails it would otherwise return a silent 0).
+            match f.kind {
+                InputRateKind::Transit => {
+                    let n = forcing_arg(f, p, 0, 0.0);
+                    let mtt = forcing_arg(f, p, 1, 1.0);
+                    crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(dp.cl, dp.v, q, v2, n, mtt)
+                        .is_none()
+                }
+                InputRateKind::InverseGaussian => {
+                    let mat = forcing_arg(f, p, 0, 1.0);
+                    let cv2 = forcing_arg(f, p, 1, 1.0);
+                    crate::sens::two_cpt::ig_2cpt_domain_ok::<f64>(dp.cl, dp.v, q, v2, mat, cv2)
+                        .is_none()
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Everything the closed-form MR path needs once a subject is admitted: the
+/// compiled ODE spec, the identified disposition, its recovered `f64` rates
+/// (used for the `route_flips` domain check both the value and gradient path
+/// share), and the `f64` PK-parameter snapshot at `(θ, η, t=0)`.
+pub struct MrScope<'a> {
+    pub spec: &'a OdeSpec,
+    pub disp: MrDisposition,
+    pub dp: DispParams<f64>,
+    pub pk: crate::types::PkParams,
+}
+
+/// The single closed-form MR scope gate for the value path ([`mr_predictions`]). It was
+/// shared with the closed-form gradient path (since deleted, #2093) so value and gradient
+/// could never admit different subjects (the silent-wrong class the reduction-to-ODE tests
+/// guard against).
+///
+/// Scope (all must hold): an `[odes]` model with ≥1 input-rate forcing, every one of a
+/// closed-form-able kind ([`is_closed_form_kind`]); a canonical linear 1-/2-cpt disposition
+/// ([`identify_disposition`]); no IOV, time-varying covariates, resets, `init(...)`,
+/// steady-state or infusion doses, or compartment-indexed `F{c}`/`ALAG{c}` (the
+/// `dose_attr_map`); and no route in its flip-flop domain (`route_flips`). Returns `None`
+/// when out of scope, and the caller falls back to the ODE path (always correct).
+pub fn mr_scope<'a>(
+    model: &'a crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+    eta: &[f64],
+) -> Option<MrScope<'a>> {
+    let spec = model.ode_spec.as_ref()?;
+    if model.n_kappa > 0 || subject.has_tv_covariates() || subject.has_resets() {
+        return None;
+    }
+    // Any model-time dependence (a `TIME`-reading individual parameter, or a non-autonomous
+    // `[odes]` RHS reading `TAD`/`TAFD`/`T`/`TIME`) is out of scope, decided **statically**
+    // before `identify_disposition`, because the behavioural probe provably cannot decide it.
+    // A `TIME`-dependent parameter cannot be represented by the single `t = 0` snapshot below
+    // and is invisible to the probe's fixed-`p` Jacobian. A non-autonomous RHS such as
+    // `-CL/V*central*(1 + k*TAD)` is linear in the state but not time-invariant, so
+    // `Σ FR_k·kernel_k(t − LAG_k)` cannot represent it; the probe pins `tad = 0.0`, so it was
+    // admitted (bit-identical to the model without the term, 8× wrong by 12 h, #1124), and any
+    // of the four spellings in an untaken `if` branch slips past too (measured 4.0e-1 each); see
+    // `probe_rhs_f64`.
+    //
+    // One predicate, not hand-paired flags: `model_uses_time_anywhere` is what the value path's
+    // routing site uses and wraps `OdeRhsProgram::reads_model_time` (also used by the SS gates),
+    // so a fifth spelling is wired in one place. Over-declines only where a time variable
+    // provably cancels (`T − TAFD`): correct, just slower.
+    if crate::pk::model_uses_time_anywhere(model) {
+        return None;
+    }
+    // …and the same for `TIME` in the Form C *readout*, which
+    // `model_uses_time_builtin` does not see (it inspects the individual-parameter
+    // program only). `mr_observable_g` reads the observable as `m·amount`, with `m`
+    // recovered by a state-space linearity probe that evaluates the readout at the
+    // ambient model time — so a time term would be silently dropped rather than
+    // rejected. Mirrors the same decline inside `recover_disp_params_g`, kept here
+    // too so scope membership never depends on the ambient thread-local (#1028).
+    if spec.readout_program.as_ref().is_some_and(|ro| ro.reads_time_builtin()) {
+        return None;
+    }
+    if spec.init_fn.is_some() || !spec.dose_attr_map.is_empty() {
+        return None;
+    }
+    // An SDE (`[diffusion]` block): `identify_disposition` reads only `rhs_program` (the drift),
+    // so it is blind to a diffusion term. The value would be correct (the SDE mean prediction is
+    // the drift solution), but the analytic jet of the drift omits `∂p_obs/∂θ`, which the FD
+    // gradient of the full OFV carries, so an SDE must take FD, as `ode_walk_model_scope`
+    // enforces. Higher gates already route SDE to FD; this is a defensive re-check (fail
+    // loudly to FD, #637) in the shared gate so value and gradient stay on one scope.
+    if !spec.diffusion_var.is_empty() {
+        return None;
+    }
+    if spec.input_rate.is_empty() || !spec.input_rate.iter().all(|f| is_closed_form_kind(f.kind)) {
+        return None;
+    }
+    if subject.doses.iter().any(|d| d.ss || d.is_infusion()) {
+        return None;
+    }
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let disp = identify_disposition(spec, &pk.values, 1.0)?;
+    // Every dose must feed the central compartment (the forcings' shared target).
+    // `mr_observable_g` splits each dose across all forcings, mirroring the ODE
+    // forcing seam — which applies each forcing only to doses into *its own*
+    // compartment (`predictions.rs`: `d.cmt-1 != forcing.cmt → continue`). A dose
+    // into any other compartment is a bolus the superposition does not represent,
+    // so decline it. (`dose.cmt` is 1-based; `disp.central` is a 0-based state.)
+    if subject.doses.iter().any(|d| d.cmt_idx() != disp.central) {
+        return None;
+    }
+    let dp = recover_disp_params_g::<f64>(spec, &disp, &pk.values, &subject.covariates)?;
+    if spec.input_rate.iter().any(|f| route_flips(f, &dp, &pk.values)) {
+        return None;
+    }
+    Some(MrScope { spec, disp, dp, pk })
+}
+
+/// Verify-gate memo key (#1150): what the twin comparison depends on, by **content**, never
+/// by address.
+///
+///   - `spec`: [`spec_fingerprint`], the `OdeSpec`'s structure, compiled RHS and readout
+///     programs, input-rate forcings, and the effective `solver_opts`.
+///   - `subject`: [`subject_fingerprint`], the id **and** the dose and observation schedule,
+///     so a single-dose verdict is never reused for a multi-dose regimen.
+///   - `point`: [`param_bucket`], a coarse bucket over the **whole** `pk.values` slice (what
+///     `route_flips` and `mr_observable_g` read: `KA`, `DUR`, `FR_k`, per-route `LAG`, `F`,
+///     transit/IG shape parameters, the disposition).
+///
+/// The key was once `(OdeSpec address, subject.id, bucket over CL/V/Q/V2)`; an address is
+/// reused by an ordinary parse → use → drop loop (measured 8/8), `reltol` is mutated in
+/// place on it, and neither schedule nor absorption parameters were keyed, so the gate
+/// skipped checks it must make (#1124 *was* a missed check). Two identical models parsed
+/// separately now share a key, which is correct.
+///
+/// The parameter point is in the key because admission depends on it (`mr_scope` evaluates
+/// `pk_param_fn(θ, η)`, probes numerically, declines on a non-positive slope, and runs the
+/// parameter-dependent `route_flips` check). Bucketing on `round(10 · log₁₀ |p|)`
+/// re-verifies when any parameter moves by more than ~26%, while collapsing the thousands of
+/// near-identical evaluations within one optimiser step; [`MR_TWIN_BUDGET_PER_SUBJECT`]
+/// bounds the distinct points one `(spec, subject)` pays for.
+///
+/// The gate is `#[cfg(debug_assertions)]`; the per-PR coverage jobs build `[profile.ci-cov]`
+/// (release-optimised, guards live, #1248), so it runs in CI (`--workspace --tests`: 133 s
+/// with the gate on or off). Do not read the 577 s figure below as its cost in CI: that was
+/// the unoptimised `dev` profile. It does not run in a user's fit, so it is a development aid
+/// rather than the reason admitting a closed form is safe.
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct MrVerifyKey {
+    spec: u64,
+    subject: u64,
+    point: Vec<i32>,
+}
+
+/// Content fingerprint of everything on the `OdeSpec` side of the twin comparison.
+///
+/// The RHS and readout are fingerprinted by their **compiled programs** (`hash_structure`:
+/// statements, bytecode, constants, slot plans), not by evaluating them: a probe at a finite
+/// set of points cannot separate `y = central/V` from `y = central/V +
+/// central·(central−1)·(central−2)`, which agree on `central ∈ {0, 1, 2}`. Two parses of the
+/// same source share a key; any edit to the program does not. `mr_scope` admits only specs
+/// with both programs, so the `None` arms only keep the function total. Independent of
+/// `(θ, η)` (that is [`param_bucket`]'s job), so it stays fixed across a fit and can key the
+/// per-subject budget.
+#[cfg(debug_assertions)]
+fn spec_fingerprint(spec: &OdeSpec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    spec.n_states.hash(&mut h);
+    spec.state_names.hash(&mut h);
+    spec.chz_state_slots.hash(&mut h);
+    for v in &spec.diffusion_var {
+        v.to_bits().hash(&mut h);
+    }
+    format!("{:?}", spec.input_rate).hash(&mut h);
+    // The effective options (#1212) — what the twin integrates at and `verify_tol`
+    // is derived from. They are the baked field merged under any fit-scoped override,
+    // so an in-place `sync_ode_solver_opts` change still reaches the key, while a
+    // baked value the override replaces correctly does not.
+    format!("{:?}", spec.effective_solver_opts()).hash(&mut h);
+    match &spec.rhs_program {
+        Some(prog) => {
+            1u8.hash(&mut h);
+            prog.hash_structure(&mut h);
+        }
+        None => 0u8.hash(&mut h),
+    }
+    match &spec.readout_program {
+        Some(ro) => {
+            1u8.hash(&mut h);
+            ro.hash_structure(&mut h);
+        }
+        None => 0u8.hash(&mut h),
+    }
+    match &spec.readout {
+        crate::ode::OdeReadout::ObsCmt(idx) => (0u8, *idx).hash(&mut h),
+        crate::ode::OdeReadout::Single(_) => 1u8.hash(&mut h),
+        crate::ode::OdeReadout::PerCmt(map) => {
+            2u8.hash(&mut h);
+            let mut cmts: Vec<_> = map.iter().collect();
+            cmts.sort_unstable_by_key(|(c, _)| **c);
+            for (c, r) in cmts {
+                c.hash(&mut h);
+                match &r.program {
+                    Some(ro) => ro.hash_structure(&mut h),
+                    None => u64::MAX.hash(&mut h),
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+/// Content fingerprint of the subject side: id, dose schedule, observation times and
+/// compartments, the pk-only records that can set the integration start (#1809), and
+/// the representative covariates. Time-varying covariates are declined by `mr_scope`,
+/// so the per-record snapshots never reach here.
+#[cfg(debug_assertions)]
+fn subject_fingerprint(subject: &crate::types::Subject) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    subject.id.hash(&mut h);
+    for d in &subject.doses {
+        (
+            d.time.to_bits(),
+            d.amt.to_bits(),
+            d.cmt_raw(),
+            d.rate.to_bits(),
+            d.duration.to_bits(),
+            d.ss,
+            d.ii.to_bits(),
+        )
+            .hash(&mut h);
+        format!("{:?}", d.rate_mode).hash(&mut h);
+    }
+    u64::MAX.hash(&mut h);
+    for t in &subject.obs_times {
+        t.to_bits().hash(&mut h);
+    }
+    subject.obs_cmts.hash(&mut h);
+    for t in &subject.pk_only_times {
+        t.to_bits().hash(&mut h);
+    }
+    // A `HashMap` iterates in no fixed order, so combine per-entry hashes
+    // commutatively rather than hashing the iteration.
+    let cov = subject.covariates.iter().fold(0u64, |acc, (k, v)| {
+        let mut e = std::collections::hash_map::DefaultHasher::new();
+        (k, v.to_bits()).hash(&mut e);
+        acc.wrapping_add(e.finish())
+    });
+    cov.hash(&mut h);
+    h.finish()
+}
+
+/// The coarse parameter-point bucket of [`MrVerifyKey`], one `i32` per `pk.values`
+/// slot: `round(10 · log₁₀ |p|)`, with the sign in the low bit so `p` and `−p` differ.
+/// Zero and non-finite slots get their own sentinels, so a degenerate point is
+/// verified rather than silently folded in with a valid one. Unused slots are constant
+/// across a fit and cost nothing but a few bytes.
+#[cfg(debug_assertions)]
+fn param_bucket(values: &[f64]) -> Vec<i32> {
+    values
+        .iter()
+        .map(|&p| {
+            if !p.is_finite() {
+                i32::MIN
+            } else if p == 0.0 {
+                i32::MAX
+            } else {
+                let b = (p.abs().log10() * 10.0).round() as i32;
+                2 * b + i32::from(p < 0.0)
+            }
+        })
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Keys the verify-gate has already checked on this thread — see
+    /// [`MrVerifyKey`] for what the key covers.
+    ///
+    /// Measured on `cargo test --lib --features ci`: **577 s unmemoized**, against
+    /// 281–470 s memoized over three runs and a single 296 s run with no gate at
+    /// all. Wall-clock on this machine is too noisy to separate the memoized gate
+    /// from no gate; the unmemoized ~2× penalty is well outside that spread, and
+    /// is what this exists to avoid.
+    ///
+    /// A key is retired here only by a call that **compared every observation**.
+    /// A vacuous or partial call and a panicking assert both release it again
+    /// ([`MrVerifyClaim`]), so neither can make the gate report success it never
+    /// earned.
+    static MR_TWIN_VERIFIED: std::cell::RefCell<std::collections::HashSet<MrVerifyKey>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// How many distinct parameter points have been verified for each `(spec, subject)`
+    /// fingerprint pair. The dedupe set bounds repeats of the *same* point; this bounds the
+    /// number of *different* ones: a fit walks θ and η continuously, so `param_bucket` yields a
+    /// fresh key whenever the inner loop crosses a bin edge, each costing a full `ode_predictions`.
+    /// Measured on `dose_form_lag_nonmem_anchor` (17 full FOCEI fits): 574.7 s with the gate off,
+    /// unfinished past 4600 s unbudgeted (≥8×). The gate is a structural check, which does not
+    /// change with the parameter regime, so a few regimes per subject suffice.
+    static MR_TWIN_BUDGET: std::cell::RefCell<
+        std::collections::HashMap<(u64, u64), u32>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Distinct parameter points verified per `(spec, subject)` before the gate stops
+/// spending solves on that subject.
+#[cfg(debug_assertions)]
+const MR_TWIN_BUDGET_PER_SUBJECT: u32 = 4;
+
+/// A verify-gate key held in [`MR_TWIN_VERIFIED`] while its check runs. Dropping the
+/// claim without [`keep`](Self::keep) releases the key, and on **unwind** also refunds
+/// the budget it charged.
+///
+/// A guard rather than a manual `remove`, because a panicking `debug_assert!` unwinds
+/// past every manual release. Rayon `catch_unwind`s each job and re-raises on the
+/// caller, so the worker thread — and its thread-local memo — survives; a host that
+/// catches the re-raised panic (an R/extendr boundary must) would otherwise find that
+/// key permanently retired, and re-running the same fit would report nothing.
+#[cfg(debug_assertions)]
+struct MrVerifyClaim {
+    key: Option<MrVerifyKey>,
+    budget_charged: bool,
+}
+
+#[cfg(debug_assertions)]
+impl MrVerifyClaim {
+    /// Retire the key: this call settled it (verified, or out of budget).
+    fn keep(mut self) {
+        self.key = None;
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for MrVerifyClaim {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else { return };
+        if self.budget_charged && std::thread::panicking() {
+            MR_TWIN_BUDGET.with(|b| {
+                if let Some(n) = b.borrow_mut().get_mut(&(key.spec, key.subject)) {
+                    *n = n.saturating_sub(1);
+                }
+            });
+        }
+        MR_TWIN_VERIFIED.with(|seen| seen.borrow_mut().remove(&key));
+    }
+}
+
+/// Runtime verify-gate (#1124): re-validate an admitted closed form against its own
+/// integrated `OdeSpec` twin, in debug builds only.
+///
+/// [`identify_disposition`]'s structural checks only pick which closed form to try; this
+/// makes admitting one safe. (#1124 shipped because it did not exist: a `TAD`-reading RHS
+/// passed every structural check, the fast path dropped the term, predictions were 8× wrong.
+/// The `reduces_to_ode_*` zoo covers only fixtures somebody wrote, none read `TAD`.)
+///
+/// It **asserts**; it never declines, since a gate that changed the route in debug would
+/// make debug and release disagree about what ferx predicts. Release compiles it out.
+///
+/// Non-finite twin entries are skipped (a twin that fails to integrate is its own defect,
+/// `ode/predictions.rs`, not evidence against the closed form; panicking here would
+/// misattribute it). A skip can make a call **vacuous or partial**, so only a call that
+/// compared *every* observation retires its memo key; otherwise a twin diverging to `NaN`
+/// after obs 3 of 30 would retire the key with 27 observations never compared.
+#[cfg(debug_assertions)]
+fn verify_against_ode_twin(
+    s: &MrScope<'_>, subject: &crate::types::Subject, theta: &[f64], eta: &[f64], mr: &[f64],
+) {
+    verify_against_twin(s, subject, mr, || {
+        crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject)
+    });
+}
+
+/// [`verify_against_ode_twin`] with the twin integration injected, so a test can hand
+/// the memo a twin no real integration produces on demand — a finite prefix followed
+/// by `NaN` — and pin that such a partial comparison does not retire the key (#1150).
+/// `twin` runs only once the key is claimed and the budget and tolerance gates pass.
+#[cfg(debug_assertions)]
+fn verify_against_twin(
+    s: &MrScope<'_>, subject: &crate::types::Subject, mr: &[f64], twin: impl FnOnce() -> Vec<f64>,
+) {
+    // The bound scales with the model's *own* solver accuracy: the twin is integrated at
+    // `spec.solver_opts`, so it cannot be tighter than the user asked for. A fixed `1e-4` was
+    // measurably wrong (zoo fixtures pin `reltol = 1e-10`; a default-`1e-4` model's twin
+    // honestly differs by far more).
+    //
+    // Measured over the `reduces_to_ode_*` zoo with pinned tolerances stripped (`reltol = 1e-4`),
+    // worst `|closed form − twin|` relative:
+    //
+    // | model                | 1 dose  | 3 doses     |
+    // |----------------------|---------|-------------|
+    // | 1-cpt parallel       | 9.4e-7  | 3.4e-3      |
+    // | 1-cpt parallel, η≠0  | 1.0e-6  | 2.0e-3      |
+    // | 1-cpt per-route lag  | 2.9e-3  | **6.4e-3**  |
+    // | 2-cpt parallel       | 1.3e-6  | 3.0e-3      |
+    //
+    // Worst 6.4e-3 (64× `reltol`, growing with dose count). `500 × reltol` leaves ~8× headroom
+    // while still catching #1124 (5.8e-1) by ~12×; a false positive panics a debug build, so
+    // headroom is deliberately on that side. The floor keeps the bound meaningful for a model
+    // that pins tolerances very tight. At the default `reltol = 1e-4` the bound is `0.05`, so
+    // only gross disagreement is caught: #1124 was 1.4e-1 at `t = 4.4` and 2.2e-4 at `t = 0.5`,
+    // i.e. under the default bound at the early times. A backstop against a structurally wrong
+    // closed form, not an accuracy guarantee.
+    //
+    // Once per key (see `MrVerifyKey`), claimed *before* the integration; the claim releases
+    // itself (including on unwind) unless the comparison below settles it.
+    let key = MrVerifyKey {
+        spec: spec_fingerprint(s.spec),
+        subject: subject_fingerprint(subject),
+        point: param_bucket(&s.pk.values),
+    };
+    if !MR_TWIN_VERIFIED.with(|seen| seen.borrow_mut().insert(key.clone())) {
+        return;
+    }
+    let budget_key = (key.spec, key.subject);
+    let mut claim = MrVerifyClaim { key: Some(key), budget_charged: false };
+    // Budget check before anything expensive: a new point is only worth a solve
+    // while this subject still has budget left. A vacuous call still spends budget,
+    // so a twin that never integrates costs at most the budget in solves.
+    let spent = MR_TWIN_BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        let n = b.entry(budget_key).or_insert(0);
+        *n += 1;
+        *n
+    });
+    claim.budget_charged = true;
+    if spent > MR_TWIN_BUDGET_PER_SUBJECT {
+        claim.keep();
+        return;
+    }
+    /// A twin looser than this cannot out-resolve `verify_tol`, so it is not an oracle.
+    const MR_TWIN_MAX_RELTOL: f64 = 1e-8;
+    /// Companion bound on the absolute floor, which is what actually bit (#1124 review).
+    const MR_TWIN_MAX_ABSTOL: f64 = 1e-10;
+    // The effective options, not the baked field: the twin below integrates at the
+    // fit-scoped ones (#1212), so the bound and the admission gate have to be derived
+    // from what the twin actually ran at.
+    let solver = s.spec.effective_solver_opts();
+    let verify_tol = (500.0 * solver.reltol).max(1e-4);
+    // Only a twin tight enough to out-resolve `verify_tol` may arbitrate. The integrator
+    // controls local error as `abstol + reltol·|y|`, so relative accuracy is `abstol/|y| +
+    // reltol`; once the trajectory decays toward `abstol` the twin has no significant figures and
+    // asserting against it measures the solver. `abstol` bounds the STATE while this compares
+    // the readout, so there is no sound per-observation conversion: decline the whole comparison.
+    //
+    // Measured: on `nonmem_anchor/per_route_lag` (default `reltol = 1e-4`, `abstol = 1e-6`) an
+    // inner-loop excursion to `V = 5.2e-8` decays `central` to 1.3e-6 by t = 24; the twin gave
+    // 29.484 against the closed form's 24.574829 (the exact Bateman superposition), so the twin
+    // was 20% wrong and the check aborted a correct fit in debug. The `reduces_to_ode_*` models
+    // pin `1e-10`/`1e-12`, so they still verify. Declining releases the key (the claim drops).
+    if solver.reltol > MR_TWIN_MAX_RELTOL || solver.abstol > MR_TWIN_MAX_ABSTOL {
+        return;
+    }
+    let twin = twin();
+    if twin.len() != mr.len() {
+        return;
+    }
+    let mut compared = 0usize;
+    for (i, (&a, &b)) in mr.iter().zip(&twin).enumerate() {
+        if !b.is_finite() {
+            continue;
+        }
+        compared += 1;
+        debug_assert!(
+            (a - b).abs() <= verify_tol * (1.0 + b.abs()),
+            "modified-release closed form disagrees with its ODE twin at obs {i} \
+             (t = {}): closed form {a}, twin {b}. The subject was admitted by \
+             `mr_scope` but the two do not reduce to each other — the identified \
+             disposition does not represent this model.",
+            subject.obs_times.get(i).copied().unwrap_or(f64::NAN),
+        );
+    }
+    // A partial (or empty) comparison is treated as vacuous: the key is released so
+    // the observations that were skipped get another chance at a later call.
+    if compared > 0 && compared == mr.len() {
+        claim.keep();
+    }
+}
+
+/// Closed-form modified-release predictions for `subject` at its observation
+/// times, or `None` when out of scope ([`mr_scope`]). This is the **value**
+/// path: `predict` / `simulate` and the FOCE/FOCEI marginal-objective value
+/// ([`crate::stats`]'s `model_predictions` →
+/// [`crate::pk::compute_predictions_with_tv`]). For an FD-method fit the
+/// gradient finite-differences these same values, so it is fully
+/// self-consistent. For an analytic-gradient fit the adjoint records this same
+/// kernel (`mr_observable_g` over the recording type, `ode_adjoint::record_modified_release`)
+/// under the identical `mr_scope`, so the plan's values are these bits and its derivatives
+/// are the exact derivatives of this value; only a point `mr_scope` declines is recorded on
+/// the ODE twin.
+pub fn mr_predictions(
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    let s = mr_scope(model, subject, theta, eta)?;
+    let lag_cmt = s.pk.lagtime();
+    let f_bio = s.pk.f_bio();
+    let preds: Vec<f64> = subject
+        .obs_times
+        .iter()
+        .map(|&t| {
+            mr_observable_g(
+                &s.dp,
+                &s.spec.input_rate,
+                &subject.doses,
+                t,
+                &s.pk.values,
+                lag_cmt,
+                f_bio,
+            )
+        })
+        .collect();
+    #[cfg(debug_assertions)]
+    verify_against_ode_twin(&s, subject, theta, eta, &preds);
+    Some(preds)
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    fn forcing(
+        kind: InputRateKind, arg_slots: Vec<usize>, frac: Option<usize>, lag: Option<usize>,
+    ) -> InputRateForcing {
+        InputRateForcing { cmt: 0, kind, arg_slots, frac_slot: frac, lag_slot: lag }
+    }
+
+    fn dose(time: f64, amt: f64) -> DoseEvent {
+        DoseEvent::new(time, amt, 1, 0.0, false, 0.0)
+    }
+
+    // ── Layer 1: bit-reduction — a single unlagged, full-fraction route equals
+    //    the single-route closed form directly. ──────────────────────────────
+    #[test]
+    fn single_first_order_route_reduces_to_bateman() {
+        // params: [ka] at slot 0.
+        let p = vec![1.3_f64];
+        let dp = DispParams { cl: 5.0, v: 50.0, periph: None };
+        let f = vec![forcing(InputRateKind::FirstOrder, vec![0], None, None)];
+        let doses = vec![dose(0.0, 100.0)];
+        for &t in &[0.5, 1.0, 2.0, 4.0, 8.0, 12.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, 1.0);
+            let want = one_cpt_oral_g(100.0, t, dp.cl, dp.v, p[0], 1.0);
+            assert!((got - want).abs() < 1e-12, "t={t}: {got} vs {want}");
+        }
+    }
+
+    // ── Layer 2: superposition oracle — parallel first_order routes equal the
+    //    independent sum of per-route single-route closed forms, split by frac
+    //    and shifted by per-route lag. ────────────────────────────────────────
+    #[test]
+    fn parallel_routes_equal_independent_superposition() {
+        // params: [ka1, ka2, fr1, fr2, lag2] slots 0..4.
+        let ka1 = 1.5;
+        let ka2 = 0.4;
+        let fr1 = 0.6;
+        let fr2 = 0.4;
+        let lag2 = 2.0;
+        let p = vec![ka1, ka2, fr1, fr2, lag2];
+        let dp = DispParams { cl: 4.0, v: 40.0, periph: None };
+        let f = vec![
+            forcing(InputRateKind::FirstOrder, vec![0], Some(2), None),
+            forcing(InputRateKind::FirstOrder, vec![1], Some(3), Some(4)),
+        ];
+        let d = 100.0;
+        let doses = vec![dose(0.0, d)];
+        for &t in &[0.5, 1.0, 3.0, 6.0, 10.0, 16.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, 1.0);
+            // Independent oracle: FR1·oral(ka1)(t) + FR2·oral(ka2)(t − lag2).
+            let term1 = fr1 * one_cpt_oral_g(d, t, dp.cl, dp.v, ka1, 1.0);
+            let term2 = fr2 * one_cpt_oral_g(d, t - lag2, dp.cl, dp.v, ka2, 1.0);
+            let want = (term1 + term2).max(0.0);
+            assert!((got - want).abs() < 1e-12, "t={t}: {got} vs {want}");
+        }
+    }
+
+    // Mixed kinds (transit + igd) also superpose additively.
+    #[test]
+    fn mixed_transit_igd_routes_superpose() {
+        // params: [n, mtt, mat, cv2, fr1, fr2] slots 0..6.
+        let p = vec![3.0, 1.5, 1.2, 0.3, 0.5, 0.5];
+        let dp = DispParams { cl: 3.0, v: 30.0, periph: None };
+        let f = vec![
+            forcing(InputRateKind::Transit, vec![0, 1], Some(4), None),
+            forcing(InputRateKind::InverseGaussian, vec![2, 3], Some(5), None),
+        ];
+        let d = 100.0;
+        let doses = vec![dose(0.0, d)];
+        for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, 1.0);
+            let want = (0.5 * one_cpt_transit_g(d, t, dp.cl, dp.v, p[0], p[1], 1.0)
+                + 0.5 * one_cpt_ig_g(d, t, dp.cl, dp.v, p[2], p[3], 1.0))
+            .max(0.0);
+            assert!((got - want).abs() < 1e-12, "t={t}: {got} vs {want}");
+        }
+    }
+
+    // Multi-dose superposition: two doses add by linearity.
+    #[test]
+    fn multi_dose_superposes() {
+        let p = vec![1.0];
+        let dp = DispParams { cl: 5.0, v: 50.0, periph: None };
+        let f = vec![forcing(InputRateKind::FirstOrder, vec![0], None, None)];
+        let doses = vec![dose(0.0, 100.0), dose(12.0, 100.0)];
+        for &t in &[1.0, 6.0, 13.0, 18.0, 24.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, 1.0);
+            let want = (one_cpt_oral_g(100.0, t, dp.cl, dp.v, p[0], 1.0)
+                + one_cpt_oral_g(100.0, t - 12.0, dp.cl, dp.v, p[0], 1.0))
+            .max(0.0);
+            assert!((got - want).abs() < 1e-12, "t={t}: {got} vs {want}");
+        }
+    }
+
+    // f_bio scales the whole dose before the frac split (one dose record → F).
+    #[test]
+    fn f_bio_scales_whole_dose() {
+        let p = vec![1.2, 0.6, 0.4];
+        let dp = DispParams { cl: 4.0, v: 40.0, periph: None };
+        let f = vec![
+            forcing(InputRateKind::FirstOrder, vec![0], Some(1), None),
+            forcing(InputRateKind::FirstOrder, vec![0], Some(2), None),
+        ];
+        let doses = vec![dose(0.0, 100.0)];
+        let f_bio = 0.7;
+        for &t in &[1.0, 4.0, 8.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, f_bio);
+            let want =
+                ((0.6 + 0.4) * f_bio * one_cpt_oral_g(100.0, t, dp.cl, dp.v, p[0], 1.0)).max(0.0);
+            assert!((got - want).abs() < 1e-12, "t={t}: {got} vs {want}");
+        }
+    }
+
+    // ── Layer A1: behavioural disposition identification on *compiled* models —
+    //    the numeric probe must recover CL/V(/Q/V2) from the RHS/readout alone,
+    //    with no name or AST matching. ────────────────────────────────────────
+    const PARALLEL_1CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    const PARALLEL_2CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    fn flat_params(model: &crate::types::CompiledModel, theta: &[f64], eta: &[f64]) -> Vec<f64> {
+        let cov = std::collections::HashMap::new();
+        (model.pk_param_fn)(theta, eta, &cov, 0.0).values.to_vec()
+    }
+
+    #[test]
+    fn identifies_one_cpt_and_recovers_cl_v() {
+        let model = crate::parser::model_parser::parse_model_string(PARALLEL_1CPT).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let p = flat_params(&model, &theta, &eta);
+        let disp = identify_disposition(spec, &p, 1.0).expect("identifies 1-cpt");
+        assert_eq!(disp.kind, MrDispositionKind::OneCpt);
+        let cov = std::collections::HashMap::new();
+        let dp = recover_disp_params_g::<f64>(spec, &disp, &p, &cov).expect("recovers");
+        assert!((dp.cl - 5.0).abs() < 1e-9, "cl={}", dp.cl);
+        assert!((dp.v - 50.0).abs() < 1e-9, "v={}", dp.v);
+        assert!(dp.periph.is_none());
+    }
+
+    #[test]
+    fn identifies_two_cpt_and_recovers_cl_v1_q_v2() {
+        let model = crate::parser::model_parser::parse_model_string(PARALLEL_2CPT).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let theta = [5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3];
+        let eta = [0.0];
+        let p = flat_params(&model, &theta, &eta);
+        let disp = identify_disposition(spec, &p, 1.0).expect("identifies 2-cpt");
+        assert_eq!(disp.kind, MrDispositionKind::TwoCpt);
+        let cov = std::collections::HashMap::new();
+        let dp = recover_disp_params_g::<f64>(spec, &disp, &p, &cov).expect("recovers");
+        let (q, v2) = dp.periph.expect("two-cpt periph");
+        assert!((dp.cl - 5.0).abs() < 1e-9, "cl={}", dp.cl);
+        assert!((dp.v - 50.0).abs() < 1e-9, "v1={}", dp.v);
+        assert!((q - 10.0).abs() < 1e-9, "q={q}");
+        assert!((v2 - 100.0).abs() < 1e-9, "v2={v2}");
+    }
+
+    // A nonlinear (Michaelis–Menten) elimination must be DECLINED — the numeric
+    // linearity probe is what protects the fast path from a silent wrong value.
+    const MM_1CPT: &str = r#"
+[parameters]
+  theta TVVMAX(10.0, 0.1, 100.0)
+  theta TVKM(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 24.0)
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  VMAX = TVVMAX
+  KM = TVKM
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - VMAX*central/(KM + central)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn declines_nonlinear_michaelis_menten() {
+        let model = crate::parser::model_parser::parse_model_string(MM_1CPT).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let theta = [10.0, 5.0, 50.0, 1.5];
+        let eta = [0.0];
+        let p = flat_params(&model, &theta, &eta);
+        assert!(
+            identify_disposition(spec, &p, 1.0).is_none(),
+            "MM elimination must be declined (nonlinear)"
+        );
+    }
+
+    /// Saturable elimination with a **`KM` far above the probe amplitude** must be declined
+    /// (#1149). `KM = 5` fails the on-axis `f(2eᵢ) = 2f(eᵢ)` check outright; for `KM = 1e5` the
+    /// on-axis residual is `2·VMAX/((KM+1)(KM+2)) ≈ 2e-9`, inside `LINEARITY_TOL`, though the
+    /// model is saturated at real dose amounts. Hence a ladder of decades, not one off-axis
+    /// point (and the same model in ng instead of mg flipped from declined to admitted on a
+    /// change of units alone).
+    #[test]
+    fn declines_saturable_elimination_that_is_linear_at_the_axis_amplitudes() {
+        let src = r#"
+[parameters]
+  theta TVVMAX(10.0, 0.01, 1000.0)
+  theta TVKM(100000.0, 1.0, 1e9)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  VMAX = TVVMAX
+  KM = TVKM
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - VMAX*central/(KM + central)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let theta = [10.0, 1.0e5, 20.0, 1.5];
+        let eta = [0.0];
+        let p = flat_params(&model, &theta, &eta);
+
+        // Non-vacuity: the on-axis homogeneity check must actually pass here,
+        // otherwise this is just another copy of the KM = 5 test.
+        let e1 = probe_rhs_f64(spec, &[1.0], &p, 1.0).expect("probe");
+        let two_e1 = probe_rhs_f64(spec, &[2.0], &p, 1.0).expect("probe");
+        let on_axis_residual = (two_e1[0] - 2.0 * e1[0]).abs();
+        assert!(
+            on_axis_residual <= LINEARITY_TOL * (1.0 + two_e1[0].abs()),
+            "precondition: this model must LOOK linear on the axes (residual \
+             {on_axis_residual:e}), else the off-axis ladder is not what declines it"
+        );
+        assert!(
+            identify_disposition(spec, &p, 1.0).is_none(),
+            "saturable elimination must be declined even when it is linear at \
+             amounts of 1-2"
+        );
+    }
+
+    /// A 2-cpt model with a **binding term that is a product of two distinct states** must be
+    /// declined (#1149). `KON*central*periph` is exactly zero at `u = 0`, `eᵢ`, `2eᵢ`, so every
+    /// on-axis check passed and the term was dropped from the predictions (#1124's shape without
+    /// a time variable). The paired control (identical model, `KON = 0`) must still be
+    /// **admitted**, so the test pins the term, not the model's shape.
+    #[test]
+    fn declines_a_bilinear_binding_term_but_keeps_its_linear_control() {
+        let src = |kon: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.01, 100.0)
+  theta TVV2(30.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central - (Q/V)*central + (Q/V2)*periph - {kon}*central*periph
+  d/dt(periph)  = (Q/V)*central - (Q/V2)*periph
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 0.5, 30.0, 1.5];
+        let eta = [0.0];
+
+        let control = crate::parser::model_parser::parse_model_string(&src("0.0")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: with KON = 0 this is an ordinary linear 2-cpt and must \
+             still be admitted — otherwise the decline below proves nothing about \
+             the binding term"
+        );
+
+        let bound = crate::parser::model_parser::parse_model_string(&src("0.002")).unwrap();
+        let bspec = bound.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&bound, &theta, &eta);
+        // The term really is invisible on the axes: assert that, so a future
+        // change that made it visible there would surface here rather than
+        // silently turning this into a test of something else.
+        let on_axis_probe = probe_rhs_f64(bspec, &[1.0, 0.0], &bp, 1.0).expect("probe");
+        let control_probe = probe_rhs_f64(cspec, &[1.0, 0.0], &cp, 1.0).expect("probe");
+        assert_eq!(
+            on_axis_probe[0].to_bits(),
+            control_probe[0].to_bits(),
+            "the binding term must be exactly invisible at u = e_central — that \
+             is why the axis probes cannot decide it"
+        );
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "a bilinear central*periph term must be declined"
+        );
+    }
+
+    /// A branch on the **state** must be declined (#1149).
+    ///
+    /// The largest state any axis probe reaches is `2.0`, so a threshold above
+    /// that is never entered and the `else` arm is identified as if it were the
+    /// whole model — here a 1-cpt with `ke = CL/V`, under-predicting elimination
+    /// threefold over the whole range above the threshold.
+    ///
+    /// Note `mr_scope_declines_every_model_time_spelling` already exercises this
+    /// exact branch shape, but only with a *time* variable inside it; the state
+    /// version was a one-token edit away from the tests we shipped.
+    #[test]
+    fn declines_a_state_triggered_branch_but_keeps_its_unbranched_control() {
+        let src = |cond: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{cond}  d/dt(central) = first_order(ka=KA) - KE*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 1.5];
+        let eta = [0.0];
+
+        let control =
+            crate::parser::model_parser::parse_model_string(&src("  KE = CL/V\n")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: the unbranched model must still be admitted"
+        );
+
+        let branched = crate::parser::model_parser::parse_model_string(&src(
+            "  if (central > 10.0) {\n    KE = 3.0*CL/V\n  } else {\n    KE = CL/V\n  }\n",
+        ))
+        .unwrap();
+        let bspec = branched.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&branched, &theta, &eta);
+        // Non-vacuity: every on-axis probe takes the `else` arm, so on the axes
+        // the branched model is bit-identical to the control.
+        for u in [vec![1.0], vec![2.0]] {
+            let b = probe_rhs_f64(bspec, &u, &bp, 1.0).expect("probe");
+            let c = probe_rhs_f64(cspec, &u, &cp, 1.0).expect("probe");
+            assert_eq!(
+                b[0].to_bits(),
+                c[0].to_bits(),
+                "at u = {u:?} the branch must be untaken, matching the control"
+            );
+        }
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "a state-triggered branch must be declined"
+        );
+    }
+
+    /// An off-axis probe that returns **NaN** must decline (#1149): `NaN > TOL` is false, so
+    /// without the `is_finite` check the residual would admit the model and serve NaN
+    /// predictions. (For ±`Inf` the residual declines on its own, so an `Inf` fixture would cover
+    /// the line while proving nothing.) The model is exactly linear on every on-axis sample and
+    /// is declined only at the top rung.
+    ///
+    /// Getting a NaN out of the DSL takes work: `BinOp::Div` returns `0.0` when `|denominator| <
+    /// 1e-30`, `log`/`ln` clamp with `v.max(1e-30)`, `sqrt` with `v.max(0.0)`; `exp` is not
+    /// clamped and overflows to `+inf` above ~709, so `exp(central) - exp(central)` becomes
+    /// `inf - inf = NaN`. It sits behind the state branch: bare, `exp(100)` is `2.7e43`, which
+    /// absorbs `-CL/V*central` and the model is declined one rung early; gated above `1e5`, the
+    /// first three rungs are untouched and the top rung is NaN.
+    #[test]
+    fn declines_an_off_axis_probe_that_returns_nan() {
+        let src = |branch: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{branch}  d/dt(central) = first_order(ka=KA) - CL/V*central + EXTRA
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 1.5];
+        let eta = [0.0];
+
+        // Control: no branch, so the disposition is an ordinary linear 1-cpt and
+        // must still be admitted. Without this the decline below would not pin the
+        // NaN branch as the cause.
+        let control =
+            crate::parser::model_parser::parse_model_string(&src("  EXTRA = 0.0\n")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: the unbranched control must stay admitted"
+        );
+
+        // The branch fires only above 1e5, i.e. only at the ladder's top rung
+        // (`OFF_AXIS_PROBE_SCALES` = 1, 1e2, 1e4, 1e6).
+        let nan_src = src(
+            "  if (central > 1.0e5) {\n    EXTRA = exp(central) - exp(central)\n  } else {\n    EXTRA = 0.0\n  }\n",
+        );
+        let bad = crate::parser::model_parser::parse_model_string(&nan_src).unwrap();
+        let bspec = bad.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&bad, &theta, &eta);
+
+        // Non-vacuity 1: every on-axis sample is finite AND matches the control, so
+        // the model reaches the off-axis loop rather than being declined earlier.
+        for u in [vec![0.0], vec![1.0], vec![2.0]] {
+            let f_bad = probe_rhs_f64(bspec, &u, &bp, 1.0).expect("probe");
+            let f_ctl = probe_rhs_f64(cspec, &u, &cp, 1.0).expect("probe");
+            assert!(f_bad[0].is_finite(), "on-axis probe at {u:?} must be finite, got {f_bad:?}");
+            assert!(
+                (f_bad[0] - f_ctl[0]).abs() < LINEARITY_TOL,
+                "on-axis probe at {u:?} must be bit-comparable to the control: \
+                 {f_bad:?} vs {f_ctl:?}"
+            );
+        }
+
+        // Non-vacuity 2: the top rung really is NaN, not Inf. An Inf probe would be
+        // declined by the residual comparison below the guard, so this test would
+        // pass with the guard removed and prove nothing.
+        let top = probe_rhs_f64(bspec, &[1.0e6], &bp, 1.0).expect("probe");
+        assert!(
+            top[0].is_nan(),
+            "the top rung must be NaN — Inf is caught by the residual check instead \
+             and would make this test vacuous: got {top:?}"
+        );
+
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "an off-axis probe returning NaN must be declined"
+        );
+    }
+
+    // ── Layer 3 (the anchor): the admitted closed form must reduce to its own
+    //    integrated OdeSpec twin, to solver tolerance. This is what ties the
+    //    fast path to the (NONMEM-anchored) ODE path. Tight solver tol so the
+    //    integrator's own onset-kink error (~1e-3 at default reltol) does not
+    //    mask a real discrepancy. ───────────────────────────────────────────
+    fn mk_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> crate::types::Subject {
+        let n = obs_times.len();
+        let nd = doses.len();
+        crate::types::Subject {
+            id: "R".into(),
+            doses,
+            obs_times,
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: vec![1; nd],
+            ..Default::default()
+        }
+    }
+
+    /// The `[odes]` source for the EVID=2 abort routes: an autonomous one-compartment
+    /// elimination, with `elim` appended so a caller can make the RHS read model time.
+    fn evid2_model_src(elim: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central{elim}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        )
+    }
+
+    /// A subject shaped exactly as `prune_irrelevant_tv_covariates` leaves one that
+    /// carries EVID=2 rows alongside a varying but model-unreferenced column: the
+    /// times survive, the snapshots are cleared. Asserts the fixture really is
+    /// parameter-static, else it takes the per-event arm and proves nothing.
+    fn evid2_static_subject(model: &crate::types::CompiledModel) -> crate::types::Subject {
+        let mut s =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 6.0]);
+        s.pk_only_times = vec![3.0];
+        s.pk_only_covariates = Vec::new();
+        assert!(
+            !crate::pk::subject_needs_per_event_pk(model, &s),
+            "fixture must be parameter-static, else it takes the per-event arm \
+             and proves nothing"
+        );
+        s
+    }
+
+    const EVID2_THETA: [f64; 2] = [1.0, 20.0];
+    const EVID2_ETA: [f64; 1] = [0.0];
+
+    /// An EVID=2 record must not abort a *parameter-static* subject on any route into an
+    /// event-driven walker. End-to-end companion to
+    /// `pk::tests::event_pk_params_fills_pk_only_on_the_parameter_static_arm`: these arms reach
+    /// `ode_predictions_event_driven`'s unconditional
+    /// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())`, which aborts a release
+    /// fit. Deliberately three tests, not three arms of one function: sequential arms are
+    /// unreachable once an earlier one panics, so each route must fail only for its own reason.
+    ///
+    /// Route 1 — model time in the RHS, which is #1124's widened predicate.
+    #[test]
+    fn an_evid2_record_does_not_abort_a_model_time_subject() {
+        let tad =
+            crate::parser::model_parser::parse_model_string(&evid2_model_src(" * (1.0 + 0.3*TAD)"))
+                .unwrap();
+        assert!(crate::pk::model_uses_time_anywhere(&tad));
+        let s = evid2_static_subject(&tad);
+        let out = crate::pk::compute_predictions_with_tv(&tad, &s, &EVID2_THETA, &EVID2_ETA);
+        assert_eq!(out.len(), s.obs_times.len());
+        assert!(out.iter().all(|p| p.is_finite() && *p > 0.0), "TAD route returned {out:?}");
+    }
+
+    /// Route 2 — an EVID 3/4 reset on an AUTONOMOUS RHS. `model_uses_time_anywhere`
+    /// is false here, so this arm is independent of #1124 and reproduces on `main`
+    /// unchanged. Asserting that is what stops the set being read as a regression
+    /// this PR introduced — the PR widened the door, it did not build the hole.
+    #[test]
+    fn an_evid2_record_does_not_abort_a_reset_subject_on_an_autonomous_rhs() {
+        let plain = crate::parser::model_parser::parse_model_string(&evid2_model_src("")).unwrap();
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&plain),
+            "the reset arm must not depend on the model-time predicate"
+        );
+        let mut s = evid2_static_subject(&plain);
+        s.reset_times = vec![4.0];
+        assert!(s.has_resets());
+        let out = crate::pk::compute_predictions_with_tv(&plain, &s, &EVID2_THETA, &EVID2_ETA);
+        assert_eq!(out.len(), s.obs_times.len());
+        assert!(out.iter().all(|p| p.is_finite()), "reset route returned {out:?}");
+    }
+
+    /// Route 3 — the **analytical** event-driven walker, which carries its own copy
+    /// of the same length asserts (`pk/event_driven.rs`) and which the CHANGELOG
+    /// claims was affected. Routes 1 and 2 are both `ode(...)` models, so without
+    /// this arm that claim rests on the shared materialiser fix alone.
+    ///
+    /// Reached via `compute_predictions_with_tv_into_with_schedule`'s third branch:
+    /// `has_resets() && supports_event_driven(pk_model)` with `ode_spec == None`.
+    /// For such a model `model_uses_time_anywhere` degenerates to
+    /// `model_uses_time_builtin`, so the subject stays parameter-static and takes
+    /// the arm the fix repaired.
+    #[test]
+    fn an_evid2_record_does_not_abort_the_analytical_event_driven_walker() {
+        const ANALYTICAL_SRC: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let analytical = crate::parser::model_parser::parse_model_string(ANALYTICAL_SRC).unwrap();
+        assert!(
+            analytical.ode_spec.is_none(),
+            "route 3 must be the analytical engine, not an ODE model"
+        );
+        let mut s = evid2_static_subject(&analytical);
+        s.reset_times = vec![4.0];
+        // A second dose after the reset, so the later record lands with drug
+        // present rather than on a zero state (AGENTS.md's non-degeneracy rule).
+        s.doses.push(DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0));
+        let out = crate::pk::compute_predictions_with_tv(&analytical, &s, &EVID2_THETA, &EVID2_ETA);
+        assert_eq!(out.len(), s.obs_times.len());
+        assert!(out.iter().all(|p| p.is_finite()), "analytical route returned {out:?}");
+        assert!(
+            out.last().is_some_and(|p| *p > 0.0),
+            "the post-reset observation must see the second dose, else the arm is \
+             degenerate and would pass on an all-zero state: {out:?}"
+        );
+    }
+
+    fn assert_reduces_to_ode(model_src: &str, theta: &[f64], eta: &[f64], doses: Vec<DoseEvent>) {
+        let model = crate::parser::model_parser::parse_model_string(model_src).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let obs: Vec<f64> = (1..=60).map(|i| i as f64 * 0.4).collect(); // 0.4 .. 24 h
+        let subject = mk_subject(doses, obs.clone());
+        let mr = mr_predictions(&model, &subject, theta, eta).expect("MR-supported");
+        let p = flat_params(&model, theta, eta);
+        let ode = crate::ode::ode_predictions(spec, &p, theta, eta, &subject);
+        assert_eq!(mr.len(), ode.len());
+        for (i, (&a, &b)) in mr.iter().zip(&ode).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+                "obs {i} t={}: MR {a} vs ODE {b}",
+                obs[i]
+            );
+        }
+    }
+
+    const REDUCE_1CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    // IR + delayed-release: a per-route lag on the second pathway (the classic
+    // modified-release picture, #856). The closed form shifts τ; the twin lags
+    // the forcing onset — they must agree.
+    const REDUCE_1CPT_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.5, 0.05, 0.95)
+  theta TVKA1(1.2, 0.05, 24.0)
+  theta TVKA2(0.8, 0.05, 24.0)
+  theta TVLAG2(3.0, 0.001, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+  LAG2 = TVLAG2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    const REDUCE_2CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn reduces_to_ode_1cpt_parallel() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT,
+            &[5.0, 50.0, 0.6, 1.5, 0.3],
+            &[0.0, 0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_parallel_nonzero_eta() {
+        // η ≠ 0 exercises the recovered ke/V carrying the individual shift.
+        assert_reduces_to_ode(
+            REDUCE_1CPT,
+            &[5.0, 50.0, 0.6, 1.5, 0.3],
+            &[0.3, -0.2],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_per_route_lag() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT_LAG,
+            &[5.0, 50.0, 0.5, 1.2, 0.8, 3.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    /// `verify_mr_twin` must not judge the closed form against a twin that has run out of
+    /// significant figures (inner-loop extreme η; trajectory near the spec's `abstol`). Real
+    /// parameters from an inner-loop excursion on `nonmem_anchor/per_route_lag` (`V = 5.2e-8`,
+    /// `central` down to 1.3e-6 by t = 24, `abstol = 1e-6`): the twin answered 29.48, the closed
+    /// form and the exact Bateman superposition 24.574829. Asserts the value too, so a gate that
+    /// skipped every observation (making the check vacuous) fails.
+    #[test]
+    fn mr_twin_check_ignores_a_twin_that_decayed_into_its_own_abstol() {
+        // Default solver tolerances, not `REDUCE_1CPT_LAG`'s pinned `1e-10`/`1e-12`: the
+        // whole point is a twin loose enough for `abstol` to reach the decayed state, which
+        // is what a user's model has. A first draft kept the tight ones and passed with the
+        // gate disabled.
+        let src = REDUCE_1CPT_LAG
+            .replace("  ode_reltol = 1e-10\n", "")
+            .replace("  ode_abstol = 1e-12\n", "");
+        assert!(
+            !src.contains("ode_reltol") && !src.contains("ode_abstol"),
+            "the tolerance lines must actually be stripped, else this test cannot reproduce"
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        // The excursion's realized `CL`/`V` exactly as the probe recorded them. Set through
+        // θ rather than η because `REDUCE_1CPT_LAG` carries no `ETA_V`, so an η-only route
+        // leaves `V` at 49.2 and the state never reaches `abstol` — a first draft did that
+        // and passed with the gate disabled, i.e. proved nothing.
+        let theta =
+            [1.1197394031099207e-7, 5.219077731731729e-8, 0.500693, 1.22062, 0.811426, 3.07375];
+        let eta = [0.0];
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![0.25, 0.5, 1.0, 1.5, 2.0, 2.9, 3.1, 3.5, 4.0, 5.0, 6.0, 8.0, 12.0, 16.0, 24.0],
+        );
+        let out = mr_predictions(&model, &subject, &theta, &eta).expect("MR-supported");
+        assert_eq!(out.len(), subject.obs_times.len());
+        assert!(
+            out.iter().all(|p| p.is_finite()),
+            "decayed-tail predictions must stay finite: {out:?}"
+        );
+        // The exact `Σ FRₖ·(kaₖ/(kaₖ−ke))·(e^{−ke·t'} − e^{−kaₖ·t'}) · D / V` at t = 24 for
+        // these parameters, computed independently of ferx. Pins the closed form as the
+        // correct side of the disagreement — the twin's 29.48 is 20% high.
+        let last = *out.last().unwrap();
+        assert!(
+            (last - 24.574829).abs() < 1e-5,
+            "closed form at t=24 should be the exact 24.574829, got {last}"
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_multi_dose() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT,
+            &[5.0, 50.0, 0.6, 1.5, 0.3],
+            &[0.0, 0.0],
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_2cpt_parallel() {
+        assert_reduces_to_ode(
+            REDUCE_2CPT,
+            &[5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    // #860 Phase B, 2-cpt: a zero_order route mixed with first_order into a
+    // two-compartment disposition — exercises `two_cpt_zero_order_g`'s macro-rate
+    // (α/β) form, not just the 1-cpt kernel.
+    const MIXED_ZERO_ORDER_2CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn reduces_to_ode_2cpt_zero_order_mixed() {
+        assert_reduces_to_ode(
+            MIXED_ZERO_ORDER_2CPT,
+            &[5.0, 50.0, 10.0, 100.0, 0.4, 1.5, 2.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    // A *static* covariate (WT on CL) is baked into the parameters at the single
+    // `t = 0` snapshot — valid because it does not vary in time — and the recovered
+    // `ke` must carry it, matching the twin which reads the same covariate.
+    const REDUCE_1CPT_COV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * WT / 70
+  V = TVV
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    // Bioavailability F (< 1) scales the whole dose before the FR split, in both
+    // the closed form (`mass = FR·F·D`) and the twin (`dose_f_bio`).
+    const REDUCE_1CPT_F: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+  F = TVF
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn reduces_to_ode_1cpt_static_covariate() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT_COV).unwrap();
+        let spec = model.ode_spec.as_ref().unwrap();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.1];
+        let obs: Vec<f64> = (1..=60).map(|i| i as f64 * 0.4).collect();
+        let mut subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], obs.clone());
+        subject.covariates = std::collections::HashMap::from([("WT".to_string(), 140.0)]);
+        let mr = mr_predictions(&model, &subject, &theta, &eta).expect("MR-supported");
+        // Flat params WITH the covariate baked in, for the ODE reference.
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+        let ode = crate::ode::ode_predictions(spec, &pk.values, &theta, &eta, &subject);
+        for (i, (&a, &b)) in mr.iter().zip(&ode).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+                "cov obs {i} t={}: MR {a} vs ODE {b}",
+                obs[i]
+            );
+        }
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_bioavailability() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT_F,
+            &[5.0, 50.0, 0.6, 1.5, 0.3, 0.7],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    // ── Decline branches (the "no happy paths" safety): a subject/model outside
+    //    scope must return None so the caller integrates. A gate that silently
+    //    fails to fire is exactly the bug these guard against. ─────────────────
+    const MIXED_ZERO_ORDER: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // TIME in the RHS makes the disposition non-autonomous — must decline.
+    const TIME_DEPENDENT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central*(1 + 0.01*TIME)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // Single transit route whose ke = CL/V has crossed the flip-flop bound
+    // KTR = (n+1)/mtt — the closed form does not converge, must decline.
+    const TRANSIT_FLIPFLOP: &str = r#"
+[parameters]
+  theta TVCL(60.0, 0.1, 200.0)
+  theta TVV(10.0, 1.0, 500.0)
+  theta TVN(2.0, 0.1, 20.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  N = TVN
+  MTT = TVMTT
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    fn parse(src: &str) -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_model_string(src).unwrap()
+    }
+
+    #[test]
+    fn admits_zero_order_pathway_and_reduces_to_ode() {
+        // #860 Phase B: a mixed first_order + zero_order model no longer declines —
+        // it must both admit the closed form AND reduce to the ODE twin.
+        assert_reduces_to_ode(
+            MIXED_ZERO_ORDER,
+            &[5.0, 50.0, 0.4, 1.5, 2.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn declines_time_dependent_disposition() {
+        let model = parse(TIME_DEPENDENT);
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
+        assert!(
+            mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
+            "a TIME-dependent disposition must decline"
+        );
+    }
+
+    #[test]
+    fn declines_flip_flop_transit_route() {
+        let model = parse(TRANSIT_FLIPFLOP);
+        // ke = CL/V = 60/10 = 6 ≥ KTR = (2+1)/1 = 3 → flip-flop, no closed form.
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![0.5, 1.0, 2.0]);
+        assert!(
+            mr_predictions(&model, &subject, &[60.0, 10.0, 2.0, 1.0], &[0.0]).is_none(),
+            "a transit route past its flip-flop bound must decline"
+        );
+    }
+
+    #[test]
+    fn declines_steady_state_and_infusion_doses() {
+        let model = parse(REDUCE_1CPT);
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let obs = vec![1.0, 4.0, 8.0];
+        // Steady-state dose.
+        let ss = mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)], obs.clone());
+        assert!(mr_predictions(&model, &ss, &theta, &[0.0, 0.0]).is_none(), "SS dose declines");
+        // Infusion dose (RATE > 0).
+        let inf = mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)], obs);
+        assert!(
+            mr_predictions(&model, &inf, &theta, &[0.0, 0.0]).is_none(),
+            "infusion dose declines"
+        );
+    }
+
+    #[test]
+    fn route_conc_g_weibull_is_inert() {
+        // The defensive arm in `route_conc_g` (the gate excludes this kind, so it
+        // is never reached in production) returns 0 for both dispositions.
+        let p = vec![2.0_f64];
+        let one = DispParams { cl: 5.0, v: 50.0, periph: None };
+        let two = DispParams { cl: 5.0, v: 50.0, periph: Some((10.0, 100.0)) };
+        for dp in [one, two] {
+            let f = forcing(InputRateKind::Weibull, vec![0], None, None);
+            let got = route_conc_g::<f64>(InputRateKind::Weibull, &f, &p, &dp, 2.0, 100.0);
+            assert_eq!(got, 0.0, "Weibull must be inert in route_conc_g");
+        }
+    }
+
+    // ── #860 Phase B: zero_order box-car kernel. ──────────────────────────────
+
+    #[test]
+    fn single_zero_order_route_matches_infusion_kernel() {
+        // A single, unlagged, full-fraction zero_order route must match the
+        // fixed-duration infusion kernel exactly (same box-car-into-1cpt physics,
+        // `dur` generic here vs `f64` there) — the bit-reduction anchor for the
+        // new kernel, mirroring `single_first_order_route_reduces_to_bateman`.
+        let dur = 2.5_f64;
+        let p = vec![dur];
+        let dp = DispParams { cl: 5.0, v: 50.0, periph: None };
+        let f = vec![forcing(InputRateKind::ZeroOrder, vec![0], None, None)];
+        let doses = vec![dose(0.0, 100.0)];
+        let rate = 100.0 / dur;
+        for &t in &[0.5, 1.0, dur, 2.0 * dur, 8.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, 1.0);
+            let want = crate::sens::one_cpt::one_cpt_infusion_g(rate, dur, 100.0, t, dp.cl, dp.v);
+            assert!((got - want).abs() < 1e-9, "t={t}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn zero_order_dual2_matches_fd_near_dur_boundary() {
+        // The real risk in #860 Phase B: `∂/∂dur` near the moving t == dur
+        // boundary. Central-FD the f64 kernel against the analytic Dual2 kernel
+        // at observation times straddling `dur` (just below/just above), 1-cpt
+        // and 2-cpt. `t == dur` exactly is deliberately excluded: there, central
+        // FD perturbs `dur` past the *fixed* `t`, so the finite difference mixes
+        // the during- and after-window branches (a genuine secant across a kink,
+        // not a one-sided derivative) — no analytic one-sided derivative can
+        // match it, and no real observation time lands there exactly.
+        use crate::sens::dual2::Dual2;
+        let h = 1e-5;
+        let cl = 5.0_f64;
+        let v = 50.0_f64;
+        let q = 3.0_f64;
+        let v2 = 80.0_f64;
+        let dur0 = 3.0_f64;
+        for &t in &[1.0, 2.999, 3.001, 6.0] {
+            // 1-cpt.
+            let plus = one_cpt_zero_order_g(1.0, t, cl, v, dur0 + h, 1.0);
+            let minus = one_cpt_zero_order_g(1.0, t, cl, v, dur0 - h, 1.0);
+            let fd = (plus - minus) / (2.0 * h);
+            let dur_d = Dual2::<1>::var(dur0, 0);
+            let got = one_cpt_zero_order_g(
+                1.0,
+                Dual2::<1>::constant(t),
+                Dual2::constant(cl),
+                Dual2::constant(v),
+                dur_d,
+                Dual2::constant(1.0),
+            );
+            assert!(
+                (got.grad[0] - fd).abs() < 1e-4 * (1.0 + fd.abs()),
+                "1cpt t={t}: analytic {} vs FD {fd}",
+                got.grad[0]
+            );
+            // 2-cpt.
+            let plus2 = two_cpt_zero_order_g(1.0, t, cl, v, q, v2, dur0 + h, 1.0);
+            let minus2 = two_cpt_zero_order_g(1.0, t, cl, v, q, v2, dur0 - h, 1.0);
+            let fd2 = (plus2 - minus2) / (2.0 * h);
+            let got2 = two_cpt_zero_order_g(
+                1.0,
+                Dual2::<1>::constant(t),
+                Dual2::constant(cl),
+                Dual2::constant(v),
+                Dual2::constant(q),
+                Dual2::constant(v2),
+                dur_d,
+                Dual2::constant(1.0),
+            );
+            assert!(
+                (got2.grad[0] - fd2).abs() < 1e-4 * (1.0 + fd2.abs()),
+                "2cpt t={t}: analytic {} vs FD {fd2}",
+                got2.grad[0]
+            );
+        }
+    }
+
+    // ── Review regressions (PR #889): each of these was silently mispredicted
+    //    before the fix, and is outside the #505/#856 shape the other tests use. ─
+
+    // H1: a readout with a non-zero intercept (baseline) — `Σ mass·kernel` drops
+    // the baseline, so it must decline (the readout is not linear-through-origin).
+    const BASELINE_READOUT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V + 5
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn declines_baseline_readout() {
+        let model = parse(BASELINE_READOUT);
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
+        assert!(
+            mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
+            "a readout with a baseline (non-zero intercept) must decline"
+        );
+    }
+
+    // H2: a dose into a non-central compartment is a bolus the superposition does
+    // not represent — must decline (2-cpt model so cmt 2 is a real state).
+    #[test]
+    fn declines_dose_into_noncentral_compartment() {
+        let model = parse(REDUCE_2CPT);
+        let theta = [5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3];
+        let central_ok =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 4.0]);
+        assert!(
+            mr_predictions(&model, &central_ok, &theta, &[0.0]).is_some(),
+            "sanity: a central dose is served"
+        );
+        let periph_dose =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)], vec![1.0, 4.0]);
+        assert!(
+            mr_predictions(&model, &periph_dose, &theta, &[0.0]).is_none(),
+            "a dose into the peripheral compartment must decline"
+        );
+    }
+
+    // H3: a 2-cpt transit route whose ke = CL/V1 is inside the (1-cpt) bound but
+    // whose fast macro-rate α is NOT — the kernel would return a silent 0, so the
+    // 2-cpt domain check must decline it. Positive twin: an in-domain 2-cpt
+    // transit reduces to ODE.
+    const TWOCPT_TRANSIT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVN(3.0, 0.1, 20.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  N = TVN
+  MTT = TVMTT
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn reduces_to_ode_2cpt_transit_in_domain() {
+        // k10=0.1, k12=0.2, k21=0.1 → α≈0.37 < KTR=(3+1)/1=4: in domain.
+        assert_reduces_to_ode(
+            TWOCPT_TRANSIT,
+            &[5.0, 50.0, 10.0, 100.0, 3.0, 1.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn declines_2cpt_transit_when_macro_rate_out_of_domain() {
+        let model = parse(TWOCPT_TRANSIT);
+        // CL=5,V1=50 → k10=0.1; Q=100,V2=10 → k12=2, k21=10 → α≈12.
+        // KTR=(1+1)/0.5=4. So ke=k10=0.1 < 4 (the OLD 1-cpt check WRONGLY passes),
+        // but α≈12 ≥ 4 (the kernel returns 0) → the 2-cpt check must decline.
+        let theta = [5.0, 50.0, 100.0, 10.0, 1.0, 0.5];
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![0.5, 1.0, 2.0]);
+        assert!(
+            mr_predictions(&model, &subject, &theta, &[0.0]).is_none(),
+            "a 2-cpt transit route past its macro-rate domain (α≥KTR while k10<KTR) must decline"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1124: a model-time-reading `[odes]` RHS must never reach the closed form.
+    //
+    // Every fixture here is **multi-dose**. With a single dose `TAD == TAFD`, so
+    // a one-dose subject cannot distinguish a `TAD` defect from a `TAFD` one and
+    // would pass against the wrong anchor (`nonmem_anchor/tad_lag_A.ctl` is
+    // deliberately single-dose for the opposite reason — it wants no `MTIME`).
+    // ---------------------------------------------------------------------
+
+    /// MR-shaped base model — mixed `first_order` + `zero_order` absorption into
+    /// one central compartment, the shape `mr_scope` admits. `elim_factor` is
+    /// spliced onto the elimination term and `pre` in front of the derivative
+    /// statement, so a case differs from the control by exactly one edit.
+    fn tad_model(pre: &str, elim_factor: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(4.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central])
+[odes]
+{pre}  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central{elim_factor}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#
+        )
+    }
+
+    const TAD_THETA: [f64; 5] = [5.0, 50.0, 0.4, 1.0, 4.0];
+
+    /// Two doses, so the `TAD` anchor genuinely switches mid-record-interval.
+    fn tad_subject() -> crate::types::Subject {
+        mk_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            (1..=30).map(|i| i as f64 * 0.4).collect(),
+        )
+    }
+
+    /// The event-driven ODE walk — the reference for every case here. It places
+    /// each dose on its timeline at `d.time + lag`, so its `TAD` anchor is the
+    /// arrival; it is the engine the NONMEM `TAD`-in-`$DES` anchors validate
+    /// (`nonmem_anchor/tad_lag_{A,B}`), and the one production routes to.
+    fn event_twin(
+        model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+        eta: &[f64],
+    ) -> Vec<f64> {
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let mut sc = crate::pk::EventPkParams::with_capacity_for(subject);
+        crate::pk::compute_event_pk_params_into(model, subject, theta, eta, &mut sc);
+        crate::ode::ode_predictions_event_driven(
+            spec,
+            subject,
+            theta,
+            eta,
+            &sc.dose,
+            &sc.obs,
+            &sc.pk_only,
+            &sc.reset,
+        )
+    }
+
+    /// The plain **dense** ODE driver: a second engine, not the one production
+    /// takes. It walks one timeline from the first record and anchors `TAD` on
+    /// doses that have already arrived, so it is an independent reference for the
+    /// same quantity. Since #1073 that holds under a lagtime too — it used to
+    /// return `NaN` for every observation there (#1110), which is why the callers
+    /// below that predate it use [`event_twin`] instead and say so.
+    fn dense_twin(
+        model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+        eta: &[f64],
+    ) -> Vec<f64> {
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        crate::ode::ode_predictions(spec, &pk.values, theta, eta, subject)
+    }
+
+    /// The whole point of #1124: production must integrate the `TAD` term, not
+    /// drop it. Before the fix the closed form served this subject and returned
+    /// numbers 8× the truth at 12 h.
+    ///
+    /// Checked against [`dense_twin`], **not** [`event_twin`]. Post-fix production
+    /// *is* the event-driven walk for this model — same `EventPkParams`, same
+    /// `ode_predictions_event_driven` call, and every post-walk step is a no-op
+    /// here (Form-C ODE readout ⇒ `model.scaling == None`, no analytical init, no
+    /// LTBS) — so an `event_twin` comparison is exactly `0.0` by construction and
+    /// its tolerance is never exercised. That is the same by-construction
+    /// agreement that hid #1124 inside the closed form (`mr_vs_prod` was likewise
+    /// exactly `0.0`), one layer up. `tad_model` carries no lagtime, so the dense
+    /// driver is a genuinely separate engine here.
+    #[test]
+    fn tad_reading_rhs_reduces_to_its_ode_twin() {
+        let model =
+            crate::parser::model_parser::parse_model_string(&tad_model("", "*(1.0 + 0.3*TAD)"))
+                .unwrap();
+        let subject = tad_subject();
+        let eta = [0.0];
+        let prod = crate::pk::compute_predictions_with_tv(&model, &subject, &TAD_THETA, &eta);
+        let twin = dense_twin(&model, &subject, &TAD_THETA, &eta);
+        // The two engines must differ *somewhere* in the last bits, else this has
+        // silently become a self-comparison again (the failure mode above).
+        let mut any_difference = false;
+        for (i, (&a, &b)) in prod.iter().zip(&twin).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "obs {i} (t={}): production {a}, dense twin {b} — both engines must \
+                 serve a no-lagtime `TAD` model",
+                subject.obs_times[i],
+            );
+            assert!(
+                (a - b).abs() < 1e-6 * (1.0 + b.abs()),
+                "obs {i} (t={}): production {a} vs dense twin {b}",
+                subject.obs_times[i],
+            );
+            any_difference |= a.to_bits() != b.to_bits();
+        }
+        assert!(
+            any_difference,
+            "production and the dense twin agreed bit-for-bit at every observation — \
+             the comparison has collapsed onto one engine and proves nothing"
+        );
+    }
+
+    /// The sharp form of the same claim, and the one that actually localises the
+    /// defect: the closed form returned values **bit-identical** to the model
+    /// with the `TAD` factor deleted, which is what "the term is dropped, not
+    /// approximated" means. A tolerance check against the twin can be satisfied
+    /// by a merely-close wrong answer; this cannot.
+    #[test]
+    fn the_tad_term_is_live_in_the_predictions() {
+        let with_tad =
+            crate::parser::model_parser::parse_model_string(&tad_model("", "*(1.0 + 0.3*TAD)"))
+                .unwrap();
+        let without = crate::parser::model_parser::parse_model_string(&tad_model("", "")).unwrap();
+        let subject = tad_subject();
+        let eta = [0.0];
+        let a = crate::pk::compute_predictions_with_tv(&with_tad, &subject, &TAD_THETA, &eta);
+        let b = crate::pk::compute_predictions_with_tv(&without, &subject, &TAD_THETA, &eta);
+        let worst =
+            a.iter().zip(&b).map(|(x, y)| (x - y).abs() / (1.0 + y.abs())).fold(0.0f64, f64::max);
+        assert!(
+            worst > 1e-2,
+            "predictions are within {worst:.3e} of the same model with the `TAD` \
+             factor deleted — the term is being dropped, not integrated"
+        );
+    }
+
+    /// **Invariant tripwire, not a regression test**: a joint PK-TTE model must never reach the
+    /// closed form, and since #1166 nothing in `mr_scope` itself enforces that (the model-time
+    /// decline did it as a side effect; `model_uses_time_anywhere` now asks the PK block only).
+    /// The decline rests on `identify_disposition`: a single PK state plus the injected
+    /// `d/dt(__chz_2)` accumulator is exactly two states, so it reaches the probe, and is
+    /// declined because the accumulator makes the disposition **triangular** (the hazard row
+    /// reads central, nothing returns). That is emergent, so it can be relaxed by someone who
+    /// has no reason to think about joint models; if this goes red, `mr_scope` needs an explicit
+    /// `HazardSpec::OdeAccumulated` decline. Not shipped as a guard today (no mutation can kill
+    /// it, #1209). The hazard is linear in the state and zero at zero on purpose: a constant
+    /// baseline would be declined by the "no autonomous term" probe instead.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn a_joint_pk_tte_model_never_reaches_the_closed_form() {
+        let subject = tad_subject();
+        let eta = [0.0];
+
+        // Control: without the `[event_model]` this exact model IS served by the
+        // closed form, so the decline below cannot be passing for a trivial reason.
+        let control = crate::parser::model_parser::parse_model_string(&tad_model("", "")).unwrap();
+        assert!(
+            mr_scope(&control, &subject, &TAD_THETA, &eta).is_some(),
+            "the control (no [event_model]) must stay in scope"
+        );
+
+        let joint_src = tad_model("", "").replace(
+            "[scaling]",
+            "[event_model]\n  cmt    = 2\n  hazard = 0.01 * (central / V)\n\n[scaling]",
+        );
+        let joint = crate::parser::model_parser::parse_model_string(&joint_src).unwrap();
+        let spec = joint.ode_spec.as_ref().expect("ode spec");
+        assert_eq!(
+            spec.n_states, 2,
+            "one PK state + the accumulator — exactly the count `identify_disposition`'s \
+             `n_states > 2` bail does NOT catch"
+        );
+        // The precondition #1166 changed: the routing predicate no longer declines
+        // this model, so `identify_disposition` is the only remaining gate.
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&joint),
+            "since #1166 the predicate reads the PK block only, so it admits this model"
+        );
+        let p = (joint.pk_param_fn)(&TAD_THETA, &eta, &std::collections::HashMap::new(), 0.0);
+        assert!(
+            identify_disposition(spec, &p.values, 0.0).is_none(),
+            "the gate that actually declines a joint model has stopped declining it — \
+             `mr_scope` now needs an explicit `HazardSpec::OdeAccumulated` guard (#1166)"
+        );
+        assert!(
+            mr_scope(&joint, &subject, &TAD_THETA, &eta).is_none(),
+            "a model carrying an ODE-accumulated hazard must never reach the closed form"
+        );
+    }
+
+    /// `mr_scope` must decline model time in **every** spelling, including from
+    /// inside an `if` condition. The behavioural probe in `identify_disposition`
+    /// samples two times with `tad` pinned, so it sees none of these: bare `TAD`
+    /// is constant across both probes, and a branch that neither probe time
+    /// enters is unreachable regardless of which variable it tests.
+    #[test]
+    fn mr_scope_declines_every_model_time_spelling() {
+        let subject = tad_subject();
+        let eta = [0.0];
+
+        // Control: no model time anywhere — must still be served by the fast path,
+        // else this test would pass for the trivial reason that nothing is admitted.
+        let control = crate::parser::model_parser::parse_model_string(&tad_model("", "")).unwrap();
+        assert!(
+            mr_scope(&control, &subject, &TAD_THETA, &eta).is_some(),
+            "the control model must stay in scope — otherwise the declines below \
+             prove nothing"
+        );
+
+        // Read directly in the derivative. Only `TAD` was wrongly admitted before
+        // the fix — the other three already failed the two-time probe — but all
+        // four are pinned so a future narrowing of this gate (to a `TAD`-only
+        // flag, say) cannot quietly reopen them.
+        // `TAFD - TAD` is here because it is what breaks if the probe is "fixed"
+        // by passing a varying `tad`: the two anchors cancel to a constant.
+        for factor in [
+            "*(1.0 + 0.3*TAD)",
+            "*(1.0 + 0.3*TAFD)",
+            "*(1.0 + 0.3*T)",
+            "*(1.0 + 0.3*TIME)",
+            "*(1.0 + 0.3*(TAFD - TAD))",
+        ] {
+            let m =
+                crate::parser::model_parser::parse_model_string(&tad_model("", factor)).unwrap();
+            assert!(
+                mr_scope(&m, &subject, &TAD_THETA, &eta).is_none(),
+                "must decline a RHS reading model time: {factor}"
+            );
+        }
+
+        // Threshold inside the observation window, so each branch really fires.
+        for var in ["TAD", "TAFD", "T", "TIME"] {
+            let pre =
+                format!("  if ({var} > 6.0) {{\n    KE = 3.0\n  }} else {{\n    KE = 1.0\n  }}\n");
+            let m =
+                crate::parser::model_parser::parse_model_string(&tad_model(&pre, "*KE")).unwrap();
+            assert!(
+                mr_scope(&m, &subject, &TAD_THETA, &eta).is_none(),
+                "must decline `{var}` read from an `if` condition"
+            );
+        }
+    }
+
+    /// #1110: the dense predictor anchors `TAD` on doses that have already
+    /// *arrived*, and with a lagtime none has at the first segment's start — so it
+    /// folded to `NEG_INFINITY` and poisoned the trajectory with `NaN`. Routing a
+    /// model-time-reading RHS to the event-driven walk, which starts at the
+    /// arrival, makes that unreachable from production.
+    #[test]
+    fn a_tad_rhs_under_a_lagtime_predicts_finite_values() {
+        let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  theta THETA_TAD(0.3, 0.0, 10.0)
+  theta TVLAG(0.5, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.02
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KTAD    = THETA_TAD
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + KTAD * TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let subject = mk_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            vec![2.0, 4.0, 8.0, 24.0],
+        );
+        let theta = [1.0, 20.0, 0.3, 0.5];
+        let eta = [0.0, 0.0];
+        let prod = crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &eta);
+        assert!(
+            prod.iter().all(|p| p.is_finite() && *p > 0.0),
+            "predictions must be finite and positive, got {prod:?}"
+        );
+        // The finite/positive assert above is the load-bearing half — that is the
+        // #1110 symptom. The twin check below pins the *route* only: production is
+        // the event-driven walk for this model, so this difference is exactly
+        // `0.0` by construction and its tolerance is never exercised. Kept as a
+        // route pin rather than swapped for `dense_twin`, because the dense engine
+        // is what #1110 broke on this exact shape; the independent references for
+        // this cell are the NONMEM `tad_lag_{A,B}` anchors, and — since #1073 gave
+        // the dense path a pre-arrival anchor — the engine comparison in
+        // `model_uses_time_anywhere`'s table (5.8e-12 under a lagtime).
+        let twin = event_twin(&model, &subject, &theta, &eta);
+        for (i, (&a, &b)) in prod.iter().zip(&twin).enumerate() {
+            assert!((a - b).abs() < 1e-6 * (1.0 + b.abs()), "obs {i}: {a} vs {b}");
+        }
+    }
+
+    /// A pre-arrival observation on a `TAD`-reading RHS: finite, and it must not perturb anything
+    /// after it (the open half of #1110 until #1073). `tad_anchor` returns `NaN` when no
+    /// effective prior dose exists (right for the sdtab column, wrong as an RHS input: it
+    /// multiplied into the state and lost that row and every later one). Before #1073:
+    ///
+    /// | case | before #1073 | now |
+    /// |---|---|---|
+    /// | lag 0.5, obs 2/4/8/24 (all post-arrival) | finite | finite |
+    /// | lag 0.5, obs at 0.4 added | `[0.0, NaN, NaN, ...]` | finite |
+    /// | **no lagtime**, dose at 1.0, obs at 0.4 | `[0.0, NaN, NaN, ...]` | finite |
+    /// | autonomous RHS, lag 0.5, obs at 0.4 | finite | finite |
+    ///
+    /// Both ODE predictors now anchor the pre-arrival window at the subject's first arrival. The
+    /// weight is on the **bit-identity** below: adding a row before the first dose must not move
+    /// any later prediction.
+    #[test]
+    fn a_pre_arrival_observation_does_not_disturb_a_tad_reading_rhs() {
+        // No lagtime at all — the trigger was the pre-arrival window, not the lag.
+        let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.3*TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let theta = [1.0, 20.0];
+        let eta = [0.0];
+        let doses = || {
+            vec![
+                DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ]
+        };
+        let after = mk_subject(doses(), vec![2.0, 4.0, 8.0, 24.0]);
+        let base = crate::pk::compute_predictions_with_tv(&model, &after, &theta, &eta);
+        assert!(
+            base.iter().all(|p| p.is_finite() && *p > 0.0),
+            "post-arrival observations must be finite, got {base:?}"
+        );
+        // Add one observation before the dose at t = 1.0.
+        let before = mk_subject(doses(), vec![0.4, 2.0, 4.0, 8.0, 24.0]);
+        let with_pre = crate::pk::compute_predictions_with_tv(&model, &before, &theta, &eta);
+        assert_eq!(with_pre[0], 0.0, "a pre-arrival observation carries no drug, got {with_pre:?}");
+        for (i, (&a, &b)) in with_pre[1..].iter().zip(&base).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "obs {i}: adding a pre-arrival row moved a later prediction, \
+                 {a} vs {b} without it"
+            );
+        }
+        // …and the dense predictor agrees, so the two engines answer the
+        // pre-arrival window the same way (they did not before #1073).
+        let spec = model.ode_spec.as_ref().unwrap();
+        let dense = crate::ode::ode_predictions(
+            spec,
+            &flat_params(&model, &theta, &eta),
+            &theta,
+            &eta,
+            &before,
+        );
+        for (i, (&a, &b)) in with_pre.iter().zip(&dense).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite() && (a - b).abs() < 1e-8 * (1.0 + b.abs()),
+                "obs {i}: event-driven {a} vs dense {b}"
+            );
+        }
+    }
+
+    /// The routing widening also moves models that were **already correct** — a
+    /// `TAFD`-reading RHS with no lagtime was served fine by the dense path. That
+    /// must be a pure re-route, not a change in what ferx predicts.
+    #[test]
+    fn rerouting_a_bare_tafd_rhs_does_not_move_the_predictions() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central*(1.0 + 0.05*TAFD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let spec = model.ode_spec.as_ref().unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 1.0];
+        let eta = [0.0];
+        let dense = crate::ode::ode_predictions(
+            spec,
+            &flat_params(&model, &theta, &eta),
+            &theta,
+            &eta,
+            &subject,
+        );
+        let prod = crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &eta);
+        for (i, (&a, &b)) in prod.iter().zip(&dense).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-9 * (1.0 + b.abs()),
+                "obs {i}: rerouted {a} vs the dense path it used to take {b}"
+            );
+        }
+    }
+
+    /// The same claim for models the closed form declined for reasons of its **own** (`init(...)`,
+    /// a `dose_attr_map`, `ss || is_infusion`, rejected before model time is looked at), which
+    /// the widened routing predicate moves from the dense to the event-driven predictor. The two
+    /// engines seed `init` from different snapshots (`initial_state(pk_params_flat)` at `t = 0`
+    /// versus `initial_state(&init_pk.values)` at the first record), so the plain-bolus case
+    /// above does not cover this.
+    ///
+    /// Steady state is deliberately not here: `TAD` under `SS=1` is now the periodic steady state
+    /// on both engines (NONMEM-anchored), but `T`/`TIME` sits 67% from its own explicit dose
+    /// train and `TAFD` reads `NaN`, so an engine-vs-engine assert would pin agreement on a wrong
+    /// answer (#1139).
+    #[test]
+    fn rerouting_an_init_seeded_rhs_does_not_move_the_predictions() {
+        let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  theta TVB(7.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVB
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.3*TAFD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let spec = model.ode_spec.as_ref().unwrap();
+        // Doses at 1 and 12 with the baseline live from the first record, so the
+        // `init` seed is a real quantity on both sides rather than a zero state.
+        let subject = mk_subject(
+            vec![
+                DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            vec![2.0, 4.0, 8.0, 24.0],
+        );
+        let theta = [1.0, 20.0, 7.0];
+        let eta = [0.0];
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "precondition: `init(...)` is out of closed-form scope, so this subject \
+             was on the dense path before the routing widened"
+        );
+        // …and the reroute must actually be happening. Without this the test is
+        // satisfied by a *narrowed* predicate too: production would then also take
+        // the dense path and `prod == dense` would hold trivially, proving nothing
+        // about the engine this model was moved to.
+        assert!(
+            crate::pk::model_uses_time_anywhere(&model),
+            "precondition: the widened predicate must route this model off the dense \
+             path — otherwise the comparison below is production against itself"
+        );
+        assert!(
+            !crate::pk::model_uses_time_builtin(&model),
+            "…and it must be the `[odes]` RHS doing it, not a `TIME`-reading \
+             individual parameter, which the narrow predicate already caught"
+        );
+        let dense = crate::ode::ode_predictions(
+            spec,
+            &flat_params(&model, &theta, &eta),
+            &theta,
+            &eta,
+            &subject,
+        );
+        let prod = crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &eta);
+        assert!(
+            prod.iter().all(|p| p.is_finite()) && dense.iter().all(|p| p.is_finite()),
+            "both engines must serve this model: rerouted {prod:?}, dense {dense:?}"
+        );
+        for (i, (&a, &b)) in prod.iter().zip(&dense).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-8 * (1.0 + b.abs()),
+                "obs {i}: rerouted {a} vs the dense path it used to take {b}"
+            );
+        }
+    }
+
+    /// The cross-entry-point invariant, and the oracle #1124 needed.
+    ///
+    /// `compute_predictions_with_tv` may take the closed form;
+    /// `compute_predictions_with_states` has **no** modified-release branch and
+    /// always integrates. That asymmetry is deliberate and load-bearing: it makes
+    /// the two entry points genuinely independent, so comparing them tests the
+    /// reduction rather than confirming it by construction (the routing site
+    /// itself cannot — it *is* the closed form there). Do not "fix" the
+    /// inconsistency by giving the states path an MR branch; that would make both
+    /// sides wrong together, which is exactly how the 8× error stayed invisible.
+    #[test]
+    fn mr_matches_the_states_entry_point() {
+        let zoo: &[(&str, &[f64], &[f64])] = &[
+            (REDUCE_1CPT, &[5.0, 50.0, 0.6, 1.5, 0.3], &[0.0, 0.0]),
+            (REDUCE_1CPT, &[5.0, 50.0, 0.6, 1.5, 0.3], &[0.3, -0.2]),
+            (REDUCE_1CPT_LAG, &[5.0, 50.0, 0.5, 1.2, 0.8, 3.0], &[0.0]),
+            (REDUCE_2CPT, &[5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3], &[0.0]),
+        ];
+        for (i, (src, theta, eta)) in zoo.iter().enumerate() {
+            let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+            let subject = tad_subject();
+            // Non-degeneracy: this only tests anything while the fast path is live.
+            assert!(
+                mr_predictions(&model, &subject, theta, eta).is_some(),
+                "zoo model {i} left `mr_scope` — the comparison below is vacuous"
+            );
+            let via_tv = crate::pk::compute_predictions_with_tv(&model, &subject, theta, eta);
+            let (via_states, _) =
+                crate::pk::compute_predictions_with_states(&model, &subject, theta, eta);
+            for (j, (&a, &b)) in via_tv.iter().zip(&via_states).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+                    "zoo model {i}, obs {j}: `with_tv` {a} vs `with_states` {b}"
+                );
+            }
+        }
+    }
+
+    /// The verify-gate must actually reject a closed form that disagrees with its
+    /// twin. Asserted by handing it a perturbed vector rather than a real defect,
+    /// because a model that is admitted *and* wrong is precisely what no longer
+    /// exists — this pins the mechanism (tolerance, message, which side is which)
+    /// so the gate cannot rot into a no-op.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn the_verify_gate_rejects_a_closed_form_that_misses_its_twin() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        // Built from the twin rather than from `mr_predictions`, which would run
+        // the gate itself and consume this subject's memo entry — leaving the call
+        // below a no-op and the test green for the wrong reason.
+        let mut preds = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        // A 1 % error at one observation — far under the defect this guards
+        // against (1e-1) and far over the tolerance (1e-4).
+        preds[10] *= 1.01;
+        verify_against_ode_twin(&s, &subject, &theta, &eta, &preds);
+    }
+
+    /// The memo must **not** retire a key on a call that
+    /// compared nothing.
+    ///
+    /// Every non-finite twin entry is skipped, so a twin that fails to integrate
+    /// can make a whole call vacuous. With the key recorded up front, that one
+    /// call would silently retire the pair forever and every later parameter point
+    /// in the same bucket would go unchecked — a gate that reports success without
+    /// ever having run. Asserted by making the vacuous call first and then showing
+    /// the gate is still live: the perturbed vector must still panic.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn a_vacuous_verify_gate_call_does_not_retire_its_memo_key() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        // A length mismatch: nothing is compared, so nothing was verified. This is
+        // the vacuity path reachable through the public seam; the partial one (some
+        // twin entries non-finite) is pinned through the injected twin by
+        // `a_partial_verify_gate_call_does_not_retire_its_memo_key`.
+        verify_against_ode_twin(&s, &subject, &theta, &eta, &[]);
+        // Same key. If the vacuous call had kept the key, this
+        // would return early and the test would fail by *not* panicking.
+        let mut preds = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        preds[10] *= 1.01;
+        verify_against_ode_twin(&s, &subject, &theta, &eta, &preds);
+    }
+
+    /// The memo must re-verify once the **parameter point** moves materially.
+    ///
+    /// Admission is not purely a property of the model and subject shape:
+    /// `mr_scope` probes `identify_disposition` numerically at `(θ, η)` and runs
+    /// the parameter-dependent `route_flips` domain check. Keyed on
+    /// `(spec, subject)` alone the gate would validate only the first point a fit
+    /// visits — the initial estimates — and never re-check a closed form degrading
+    /// as the optimiser walks. The parameter bucket in the key is what prevents
+    /// that; this pins it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn the_verify_gate_rechecks_after_the_disposition_moves() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let eta = [0.0, 0.0];
+        // Point 1: verified clean, which records the memo key for its bucket.
+        let theta_a = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let s_a = mr_scope(&model, &subject, &theta_a, &eta).expect("in scope");
+        let twin_a =
+            crate::ode::ode_predictions(s_a.spec, &s_a.pk.values, &theta_a, &eta, &subject);
+        verify_against_ode_twin(&s_a, &subject, &theta_a, &eta, &twin_a);
+
+        // Point 2: CL moved 5 → 15, a different parameter bucket on the same
+        // spec and subject. The gate must run again here.
+        let theta_b = [15.0, 50.0, 0.6, 1.5, 0.3];
+        let s_b = mr_scope(&model, &subject, &theta_b, &eta).expect("in scope");
+        assert_ne!(
+            param_bucket(&s_a.pk.values),
+            param_bucket(&s_b.pk.values),
+            "precondition: the two parameter points must land in different buckets, \
+             else this test would pass for the trivial reason that nothing moved"
+        );
+        let mut preds =
+            crate::ode::ode_predictions(s_b.spec, &s_b.pk.values, &theta_b, &eta, &subject);
+        preds[10] *= 1.01;
+        verify_against_ode_twin(&s_b, &subject, &theta_b, &eta, &preds);
+    }
+
+    /// …and the bucket must be **coarse**: an ordinary optimiser step that barely
+    /// moves the disposition must still hit the memo, or the gate degrades to the
+    /// unmemoized ~2× cost it was written to avoid.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_parameter_bucket_is_coarse_enough_to_memoize() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let eta = [0.0, 0.0];
+        let base = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let s_base = mr_scope(&model, &subject, &base, &eta).expect("in scope");
+        // A 0.1 % nudge in CL — the scale of an FD probe or a late optimiser step.
+        let nudged = [5.005, 50.0, 0.6, 1.5, 0.3];
+        let s_nudged = mr_scope(&model, &subject, &nudged, &eta).expect("in scope");
+        assert_eq!(
+            param_bucket(&s_base.pk.values),
+            param_bucket(&s_nudged.pk.values),
+            "a 0.1% parameter nudge must stay in one bucket"
+        );
+        // A decade apart must not.
+        let far = [50.0, 50.0, 0.6, 1.5, 0.3];
+        let s_far = mr_scope(&model, &subject, &far, &eta).expect("in scope");
+        assert_ne!(
+            param_bucket(&s_base.pk.values),
+            param_bucket(&s_far.pk.values),
+            "a 10× parameter move must land in a different bucket"
+        );
+    }
+
+    /// Verify `(theta, eta)` clean, then hand the gate a 1 %-perturbed closed form at
+    /// `(theta_b, subject_b)` on `model_b`. Panics iff the gate ran the second check,
+    /// i.e. iff the memo did **not** treat the two calls as one key (#1150).
+    #[cfg(debug_assertions)]
+    fn verify_clean_then_perturbed(
+        model_a: &crate::types::CompiledModel, subject_a: &crate::types::Subject, theta_a: &[f64],
+        model_b: &crate::types::CompiledModel, subject_b: &crate::types::Subject, theta_b: &[f64],
+    ) {
+        let eta = [0.0, 0.0];
+        let s_a = mr_scope(model_a, subject_a, theta_a, &eta).expect("point a in scope");
+        let twin_a =
+            crate::ode::ode_predictions(s_a.spec, &s_a.pk.values, theta_a, &eta, subject_a);
+        verify_against_ode_twin(&s_a, subject_a, theta_a, &eta, &twin_a);
+        let s_b = mr_scope(model_b, subject_b, theta_b, &eta).expect("point b in scope");
+        let mut preds =
+            crate::ode::ode_predictions(s_b.spec, &s_b.pk.values, theta_b, &eta, subject_b);
+        preds[10] *= 1.01;
+        verify_against_ode_twin(&s_b, subject_b, theta_b, &eta, &preds);
+    }
+
+    /// The parameter bucket must cover **absorption**, not just disposition (#1150 §1).
+    /// `CL`/`V` held fixed and only `KA1` moving 1.5 → 4.5 — a fit with θ-only
+    /// disposition and estimated absorption — must re-verify. Under the old
+    /// `DispParams` bucket this point hit the memo, so the gate ran once at the initial
+    /// estimates and never again, straight through a `ka ≈ ke` confluence.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn the_verify_gate_rechecks_after_an_absorption_parameter_moves() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let eta = [0.0, 0.0];
+        let theta_a = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let theta_b = [5.0, 50.0, 0.6, 4.5, 0.3];
+        let s_a = mr_scope(&model, &subject, &theta_a, &eta).expect("in scope");
+        let s_b = mr_scope(&model, &subject, &theta_b, &eta).expect("in scope");
+        // Precondition: the disposition did not move, so only an absorption-aware
+        // bucket can tell the two points apart.
+        assert_eq!((s_a.dp.cl, s_a.dp.v), (s_b.dp.cl, s_b.dp.v));
+        assert_ne!(param_bucket(&s_a.pk.values), param_bucket(&s_b.pk.values));
+        verify_clean_then_perturbed(&model, &subject, &theta_a, &model, &subject, &theta_b);
+    }
+
+    /// `reltol` must be in the key (#1150 §3). `sync_ode_solver_opts` tightens it in
+    /// place on the **same** spec — the pinned ferx-r `ferx_fit` reuse pattern — and
+    /// `verify_tol` is derived from it, so a verdict reached at one tolerance must not
+    /// stand in for a check at another.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn the_verify_gate_rechecks_after_reltol_changes_in_place() {
+        let mut model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        {
+            let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+            let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+            verify_against_ode_twin(&s, &subject, &theta, &eta, &twin);
+        }
+        let spec = model.ode_spec.as_mut().expect("ode model");
+        assert_eq!(spec.solver_opts.reltol, 1e-10, "precondition: the fixture's pin");
+        spec.solver_opts.reltol = 1e-11;
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        let mut preds = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        preds[10] *= 1.01;
+        verify_against_ode_twin(&s, &subject, &theta, &eta, &preds);
+    }
+
+    /// The subject must be keyed by its **schedule**, not its id (#1150 §4). A
+    /// single-dose verdict must not be reused for a multi-dose regimen on the same id
+    /// — the incoming side of a later dose is exactly what a single dose cannot test.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn the_verify_gate_rechecks_a_new_dose_schedule_for_the_same_id() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let single = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            (1..=30).map(|i| i as f64 * 0.4).collect(),
+        );
+        let multi = tad_subject();
+        assert_eq!(single.id, multi.id, "precondition: same id, different doses");
+        assert_eq!(single.obs_times, multi.obs_times);
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        verify_clean_then_perturbed(&model, &single, &theta, &model, &multi, &theta);
+    }
+
+    /// The spec is keyed by **content**, not by address (#1150 §2). A parse → use →
+    /// drop loop routinely hands the next model the same address, so a second model
+    /// differing only in its RHS — here an elimination constant, with every
+    /// `pk.values` slot identical — must still be checked. And two parses of the same
+    /// source must agree, so the memo still works across such a loop.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_verify_gate_keys_the_spec_by_content() {
+        let parse = crate::parser::model_parser::parse_model_string;
+        let src_b = REDUCE_1CPT.replace("- CL/V*central", "- 1.3*CL/V*central");
+        assert_ne!(src_b, REDUCE_1CPT, "precondition: the replacement applied");
+        let (a1, a2, b) =
+            (parse(REDUCE_1CPT).unwrap(), parse(REDUCE_1CPT).unwrap(), parse(&src_b).unwrap());
+        let subject = tad_subject();
+        let fp = |m: &crate::types::CompiledModel| spec_fingerprint(m.ode_spec.as_ref().unwrap());
+        assert_eq!(fp(&a1), fp(&a2), "two parses of one source must share a key");
+        assert_ne!(fp(&a1), fp(&b), "an RHS change must change the key");
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s_a = mr_scope(&a1, &subject, &theta, &eta).expect("in scope");
+        let s_b = mr_scope(&b, &subject, &theta, &eta).expect("in scope");
+        assert_eq!(
+            param_bucket(&s_a.pk.values),
+            param_bucket(&s_b.pk.values),
+            "precondition: only the RHS differs, so the parameter bucket cannot help"
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_clean_then_perturbed(&a1, &subject, &theta, &b, &subject, &theta)
+        }));
+        assert!(caught.is_err(), "the second model's closed form was never checked");
+    }
+
+    /// A **partial** comparison must not retire the key either (#1150 §5): a twin that
+    /// is finite for the first observations and `NaN` after leaves most of them never
+    /// compared. Retiring the key on `compared > 0` would let that call stand in for a
+    /// full check. The twin is injected (no real integration produces this on demand);
+    /// the closed form agrees with it on every finite entry, so the first call cannot
+    /// panic, and the follow-up perturbed call proves the key is still live.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "disagrees with its ODE twin")]
+    fn a_partial_verify_gate_call_does_not_retire_its_memo_key() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        let real = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        let mut partial = real.clone();
+        partial[3..].iter_mut().for_each(|v| *v = f64::NAN);
+        assert!(partial[..3].iter().all(|v| v.is_finite()), "precondition: finite prefix");
+        verify_against_twin(&s, &subject, &real, || partial);
+        let mut preds = real.clone();
+        preds[10] *= 1.01;
+        verify_against_twin(&s, &subject, &preds, || real);
+    }
+
+    /// The readout is keyed by its **compiled program**, not by a behavioural probe
+    /// (#1150 review). `central / V` and `central / V + central·(central−1)·(central−2)`
+    /// agree at `central ∈ {0, 1, 2}` — the linearity probe's own points, so both are
+    /// admitted — and differ on every real trajectory. With the same RHS, subject and
+    /// parameters, the first model's verdict must not suppress the second's check.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_verify_gate_keys_the_readout_by_its_program() {
+        let parse = crate::parser::model_parser::parse_model_string;
+        let src_b = REDUCE_1CPT.replace(
+            "  y = central / V\n",
+            "  y = central / V + central*(central - 1)*(central - 2)\n",
+        );
+        assert_ne!(src_b, REDUCE_1CPT, "precondition: the replacement applied");
+        let (a, b) = (parse(REDUCE_1CPT).unwrap(), parse(&src_b).unwrap());
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        assert!(
+            mr_scope(&b, &subject, &theta, &eta).is_some(),
+            "precondition: the polynomial readout must be admitted, else nothing collides"
+        );
+        assert_ne!(
+            spec_fingerprint(a.ode_spec.as_ref().unwrap()),
+            spec_fingerprint(b.ode_spec.as_ref().unwrap()),
+            "a readout change must change the key"
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_clean_then_perturbed(&a, &subject, &theta, &b, &subject, &theta)
+        }));
+        assert!(caught.is_err(), "the second model's closed form was never checked");
+    }
+
+    /// A panicking check must release its key **and** refund its budget (#1150 §5).
+    /// Rayon re-raises a worker's panic on the caller and the worker's thread-local
+    /// memo survives, so a host that catches it (an R/extendr boundary must) and
+    /// re-runs the same fit must see the same failure again — every time, not only
+    /// until the per-subject budget runs out.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_panicking_verify_gate_call_releases_its_memo_key() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        let mut preds = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        preds[10] *= 1.01;
+        for attempt in 0..=MR_TWIN_BUDGET_PER_SUBJECT + 1 {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                verify_against_ode_twin(&s, &subject, &theta, &eta, &preds)
+            }));
+            assert!(
+                caught.is_err(),
+                "attempt {attempt}: a re-run after a caught panic reported nothing"
+            );
+        }
+    }
+
+    /// The other direction: a closed form that *does* agree must pass cleanly.
+    /// Without this, a gate that panicked unconditionally would satisfy the
+    /// rejection test above and quietly break every admitted model in debug.
+    ///
+    /// Note what this is and is not. It feeds the twin vector back in as the
+    /// closed form, so the comparison is `twin == twin` and it holds for **any**
+    /// tolerance down to `0.0` — including a `verify_tol = 0.0` that would panic
+    /// on every real admitted model in a debug build. Catching an
+    /// unconditionally-panicking gate is its whole job; the tolerance is pinned by
+    /// `the_verify_gate_stays_quiet_at_default_solver_tolerances`, which goes
+    /// through `mr_predictions` with a real closed form on the other side.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_verify_gate_accepts_an_agreeing_closed_form() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT).unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
+        let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
+        verify_against_ode_twin(&s, &subject, &theta, &eta, &twin);
+    }
+
+    /// …and it must stay quiet at the **default** solver tolerances, over enough
+    /// doses for the twin's own integration error to accumulate.
+    ///
+    /// That is the regime a fixed `1e-4` bound got wrong. The zoo fixtures pin
+    /// `reltol = 1e-10`, so they never exercised it; a model that leaves the
+    /// default `1e-4` produces a twin honestly differing from the exact closed
+    /// form by up to 6.4e-3 — 64× `reltol`, and growing with dose count. The first
+    /// version of this gate panicked on an ordinary multi-dose oral model for
+    /// exactly that reason, and it was the NONMEM anchor that caught it, not any
+    /// unit test. This is that missing unit test.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_verify_gate_stays_quiet_at_default_solver_tolerances() {
+        let strip = |s: &str| -> String {
+            s.replace("  ode_reltol = 1e-10\n", "").replace("  ode_abstol = 1e-12\n", "")
+        };
+        let zoo: Vec<(String, Vec<f64>, Vec<f64>)> = vec![
+            (strip(REDUCE_1CPT), vec![5.0, 50.0, 0.6, 1.5, 0.3], vec![0.3, -0.2]),
+            (strip(REDUCE_1CPT_LAG), vec![5.0, 50.0, 0.5, 1.2, 0.8, 3.0], vec![0.0]),
+            (strip(REDUCE_2CPT), vec![5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3], vec![0.0]),
+        ];
+        for (src, theta, eta) in &zoo {
+            let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+            let spec = model.ode_spec.as_ref().unwrap();
+            assert!(
+                (spec.solver_opts.reltol - 1e-4).abs() < 1e-12,
+                "this test is only meaningful at the DEFAULT reltol; got {}",
+                spec.solver_opts.reltol
+            );
+            let subject = mk_subject(
+                vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+                ],
+                (1..=90).map(|i| i as f64 * 0.4).collect(),
+            );
+            // Through `mr_predictions`, so the gate runs exactly as production
+            // reaches it rather than via a hand-assembled call.
+            let preds =
+                mr_predictions(&model, &subject, theta, eta).expect("zoo model must stay in scope");
+            assert!(preds.iter().all(|p| p.is_finite()));
+        }
+    }
+
+    #[test]
+    fn declines_sde_diffusion() {
+        // A parsed SDE model always uses an `ObsCmt` readout (Form-C `y = <expr>`
+        // is rejected on SDE at parse), and `ObsCmt` has no `readout_program`, so
+        // `identify_disposition` already declines it at its `readout_program.as_ref()?`
+        // — the `diffusion_var` guard can't be reached through the normal parse path
+        // *today*. It is forward-defensive: were `ObsCmt` (or a future readout) ever
+        // made MR-identifiable, an SDE's linear *drift* would identify and the guard
+        // is the only thing keeping the stochastic model off the deterministic closed
+        // form. Exercise it directly by injecting a diffusion term into a model
+        // `mr_scope` otherwise admits, proving the guard is load-bearing.
+        let mut model = parse(REDUCE_1CPT);
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        // Baseline: this model IS admitted (sanity — else the test proves nothing).
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_some(),
+            "REDUCE_1CPT must be MR-admitted before the diffusion injection"
+        );
+        // Inject a state diffusion term without touching the (still canonical-linear)
+        // drift RHS the disposition probe reads. The guard keys on `diffusion_var` (not
+        // `is_sde()`'s `diffusion_theta_start`), so setting this one field is what
+        // exercises the guard.
+        let spec = model.ode_spec.as_mut().unwrap();
+        spec.diffusion_var = vec![0.01; spec.n_states];
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "an SDE (diffusion term) must decline the closed-form MR scope"
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &eta).is_none(),
+            "an SDE must decline the MR value path"
+        );
+    }
+
+    #[test]
+    fn declines_time_dependent_readout() {
+        // #1028: the Form C readout resolves `TIME` per observation, so a readout with
+        // an additive time term is no longer a function of the state alone. The MR fast
+        // path reads the observable as `m·amount`, with `m` recovered by a linearity
+        // probe (`readout(0) ≈ 0`, `readout(2·e_c) ≈ 2·readout(e_c)`) evaluated under
+        // the *ambient* model-time thread-local — `0.0` here — so the time term
+        // evaluates to zero at the probe, `y0 == 0` passes, and the closed form would
+        // then silently serve predictions with the whole term missing. Decline instead.
+        let src = REDUCE_1CPT.replace("y = central / V", "y = central / V + 0.5 * TIME");
+        let model = parse(&src);
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+
+        // Baseline: the same model *without* the time term is MR-admitted, so the
+        // decline below is attributable to the readout and nothing else.
+        assert!(
+            mr_scope(&parse(REDUCE_1CPT), &subject, &theta, &eta).is_some(),
+            "REDUCE_1CPT must be MR-admitted before the TIME term is added"
+        );
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "a TIME-reading Form C readout must decline the closed-form MR scope"
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &eta).is_none(),
+            "…and the MR value path with it"
+        );
+
+        // The term is real on the path that now serves this model: the ODE readout
+        // (which enters the per-observation guard) differs from the time-free twin by
+        // exactly `0.5·t`. Had the fast path stayed in scope it would have returned the
+        // time-free values — which is the silent-wrong this decline prevents.
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let p = flat_params(&model, &theta, &eta);
+        let with_time = crate::ode::ode_predictions(spec, &p, &theta, &eta, &subject);
+        let base_model = parse(REDUCE_1CPT);
+        let base_spec = base_model.ode_spec.as_ref().expect("ode model");
+        let base_p = flat_params(&base_model, &theta, &eta);
+        let without_time = crate::ode::ode_predictions(base_spec, &base_p, &theta, &eta, &subject);
+        for (i, t) in subject.obs_times.iter().enumerate() {
+            let delta = with_time[i] - without_time[i];
+            assert!(
+                (delta - 0.5 * t).abs() < 1e-6,
+                "obs {i} t={t}: readout time term is {delta}, expected {}",
+                0.5 * t
+            );
+        }
+    }
+
+    /// All four closed-form entry points share `mr_scope`, so none may serve a
+    /// `TAD`-reading `[odes]` RHS the closed form cannot evaluate (#1124). The
+    /// spelling matters: an *indexed* `ALAG1` populates `dose_attr_map`, which
+    /// `mr_scope` rejects for an unrelated reason, so it cannot demonstrate this.
+    /// A bare `ALAG` leaves that map empty and reaches the closed form — which is
+    /// how the fast path originally bypassed #1070's FD gate.
+    ///
+    /// That bypass framing is now historical: #1136 deleted the FD gate in favour
+    /// of a real dual, so there is no upstream decline left to inherit and
+    /// `mr_scope` must refuse this model on `model_uses_time_anywhere` alone. Both
+    /// premises are asserted below so the test cannot pass for the old reason.
+    #[test]
+    fn mr_declines_what_the_ode_analytic_gate_declines() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(4.0, 0.1, 24.0)
+  theta TVLAG(0.5, 0.001, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+  ALAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central*(1.0 + 0.3*TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let spec = model.ode_spec.as_ref().unwrap();
+        let subject = tad_subject();
+        let theta = [5.0, 50.0, 0.4, 1.0, 4.0, 0.5];
+        let eta = [0.0];
+
+        // Pin the premise: this really is the bypass shape, not an unrelated decline.
+        assert!(model.has_lagtime());
+        assert!(
+            spec.dose_attr_map.is_empty(),
+            "a bare `ALAG` must leave `dose_attr_map` empty — otherwise `mr_scope` \
+             declines for that reason and the gate bypass is not exercised"
+        );
+        // The ODE gate now *admits* this model: #1136 replaced #1070's FD gate with
+        // a real `∂TAD/∂ALAG = −1` dual, so `TAD` + an estimated lagtime is analytic
+        // there. That makes this case sharper than when it was written — the closed
+        // form must decline on its own predicate, with no upstream gate behind it.
+        assert!(
+            crate::sens::ode_provider::adjoint::model_in_scope(&model),
+            "premise: the adjoint's ODE recorder serves this model, so the decline below \
+             cannot be inherited from it"
+        );
+        assert!(
+            crate::pk::model_uses_time_anywhere(&model),
+            "premise: the RHS reads `TAD`, which is the predicate #1124 made `mr_scope` ask"
+        );
+
+        assert!(mr_scope(&model, &subject, &theta, &eta).is_none());
+        assert!(mr_predictions(&model, &subject, &theta, &eta).is_none());
+    }
+}

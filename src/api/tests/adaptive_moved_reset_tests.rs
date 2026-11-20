@@ -9,6 +9,8 @@
 use super::*;
 use crate::parser::model_parser::{parse_full_model, parse_model_string};
 use crate::sim::adaptive::{ControllerCtx, DoseAction};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 const CODE: &str = "W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET";
 

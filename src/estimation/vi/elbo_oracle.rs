@@ -37,6 +37,8 @@
 //! The tolerances below are therefore MC tolerances, tightened by raising
 //! `n_mc_samples`, not exactness tolerances. The *moment* assertions (`μ`, `S`) are
 //! unaffected by this and are checked tightly.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::estimation::parameterization::pack_params;

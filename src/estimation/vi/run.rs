@@ -39,7 +39,7 @@ use crate::estimation::parameterization::{
 };
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
-    ViResult, ViSigmaUpdate,
+    ViSigmaUpdate,
 };
 
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};
@@ -1126,7 +1126,7 @@ pub fn run_vi(
     } = cov_out;
     warnings.extend(cov_warnings);
 
-    let vi_result = ViResult {
+    let vi_result = ferx_model::construct::vi_result(ferx_model::construct::ViResultParts {
         neg_two_elbo: 2.0 * final_eval.neg_elbo,
         data_term: final_eval.data_term,
         kl_term: final_eval.kl_term,
@@ -1158,7 +1158,7 @@ pub fn run_vi(
         // Set by `fit_inner`, which is the only place that can see the rest of the chain;
         // `run_vi` has been handed a blanked per-stage option set and knows nothing of it.
         superseded_by: None,
-    };
+    });
 
     // #1303. Gated like every other estimator, *except* under the default
     // `vi_final_ofv = none`, where the `NaN` above is VI declaring that it

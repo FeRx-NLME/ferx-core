@@ -5,6 +5,8 @@
 //! central finite differences of it are exact rather than noisy. That is the
 //! `Dual2`-vs-FD parity rule applied to the one new gradient path this module
 //! introduces.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::estimation::parameterization::pack_params;

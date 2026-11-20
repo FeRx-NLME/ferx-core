@@ -1,6 +1,8 @@
 use super::*;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::types::{WarningCode, WarningSeverity};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 fn shift(fit_ofv: f64, tight_ofv: f64) -> OdeToleranceShift {
     OdeToleranceShift {

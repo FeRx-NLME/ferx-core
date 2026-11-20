@@ -111,8 +111,12 @@ fn the_classifier_sees_reads_and_skips_assignments_and_test_modules() {
 #[test]
 fn no_production_code_reads_the_bloq_method_field() {
     let mut sources = Vec::new();
-    rust_sources(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
-    assert!(sources.len() > 50, "found only {} sources under src/", sources.len());
+    // Both engine crates (#3041): `CompiledModel` itself lives in `crates/ferx-model`.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for dir in ["src", "crates/ferx-model/src"] {
+        rust_sources(&root.join(dir), &mut sources);
+    }
+    assert!(sources.len() > 50, "found only {} engine sources", sources.len());
 
     let mut offenders = Vec::new();
     for path in &sources {

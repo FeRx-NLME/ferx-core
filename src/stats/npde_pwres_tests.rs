@@ -13,6 +13,8 @@
 //!   centred on `PRED` instead of `EPRED` is visible, and the `η_S·t` term makes
 //!   the within-subject correlation unequal across pairs, so the decorrelation is
 //!   not a scalar.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use approx::assert_relative_eq;

@@ -15,6 +15,8 @@
 //!
 //! Each draw is unpacked via [`unpack_params`] so theta, Omega, and Sigma are
 //! perturbed coherently (they share one packed vector).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::ParamBlock;
 use crate::diagnostics::EngineError;
@@ -749,7 +751,7 @@ fn draw_asymptotic(
         if matches!(
             h.reason,
             crate::types::HeldReason::CollapsedAtGuard | crate::types::HeldReason::Unknown
-        ) && crate::api::step_held(Some(cov), h.packed_index)
+        ) && crate::estimation::parameterization::step_held(Some(cov), h.packed_index)
         {
             if let Some(f) = fixed_mask.get_mut(h.packed_index) {
                 *f = true;

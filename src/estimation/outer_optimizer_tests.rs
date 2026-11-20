@@ -4,6 +4,8 @@ use crate::estimation::inner_optimizer::test_helpers::{
     kappa_correlation_fixture, load_iov_fixture, nested_levels_fixture, on_one_thread,
     warfarin_iov_fixture, warfarin_iov_ode_fixture,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
 use crate::estimation::covariance::covariance_steps_run_on;
@@ -8983,7 +8985,7 @@ fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment()
         FORCE_LINEAR_DECLINE.set(true);
         // The seam is no value a compiled plan's guard reads (#2786): the plans recorded on
         // the exact path go, so the declined pass records its own.
-        crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
+        crate::parser::model_parser::rhs_regcode::kernel_jit::reset_model(&m);
         let declined = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
         FORCE_LINEAR_DECLINE.set(false);
         (exact, declined)

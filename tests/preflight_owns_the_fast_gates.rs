@@ -1112,10 +1112,10 @@ fn preflight_is_executable_and_lists_every_group() {
         ("changelog", 1),  // tools/changelog.sh check (#1545)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
-        ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
-        ("rustdoc", 2),    // ferx-core rustdoc · members
-        ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
-        ("patterns", 2),   // cargo test -p patterns-lint · cargo clippy -p patterns-lint (#2634)
+        ("clippy", 4), // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · ci,markov,nn --lib (#3041) · members
+        ("rustdoc", 2), // ferx-core rustdoc · members
+        ("docs", 2),   // cargo test -p docs-lint · cargo clippy -p docs-lint
+        ("patterns", 2), // cargo test -p patterns-lint · cargo clippy -p patterns-lint (#2634)
         ("public-api", 1), // tools/update-public-api.sh --check
         // #344: `--features ci` · `--features ci,markov,nn`. The second line is
         // not padding — `ci` compiles neither `src/survival`, `src/markov`,
@@ -1411,4 +1411,40 @@ fn no_crate_level_allow_switches_a_rustdoc_lint_off() {
          internal target, a resolvable path for a public one.\n  {}",
         offenders.join("\n  ")
     );
+}
+
+/// Since #3041 the engine is two packages, and the workspace root selects only `ferx-core`:
+/// a bare `cargo test --lib` builds `ferx-model` as a dependency but never compiles or runs
+/// its unit tests, with every line still green. So in each group that compiles the engine,
+/// a command that builds `ferx-core` (by naming it, or by naming no package) must also
+/// select `ferx-model`. That includes the guards-on and guards-off lanes, which hold moved
+/// `debug_assert!` checks such as the modified-release ODE twin.
+#[test]
+fn every_engine_gate_selects_both_engine_crates() {
+    for group in ["check", "clippy", "rustdoc", "debug-assertions", "release-semantics"] {
+        let cmds = listed_commands(group);
+        let engine: Vec<&String> = cmds
+            .iter()
+            .filter(|c| {
+                let words: Vec<&str> = c.split_whitespace().collect();
+                let named: Vec<&str> = words
+                    .windows(2)
+                    .filter(|w| w[0] == "-p" || w[0] == "--package")
+                    .map(|w| w[1])
+                    .collect();
+                named.is_empty() || named.contains(&"ferx-core")
+            })
+            .collect();
+        assert!(!engine.is_empty(), "the `{group}` group builds no engine command");
+        for cmd in engine {
+            let selects_both = cmd.contains("--workspace")
+                || (cmd.contains("-p ferx-core") && cmd.contains("-p ferx-model"));
+            assert!(
+                selects_both,
+                "`{cmd}` (group `{group}`) builds `ferx-core` without selecting \
+                 `ferx-model`, so the moved unit tests and lints never run there (#3041). \
+                 Add `-p ferx-core -p ferx-model`."
+            );
+        }
+    }
 }

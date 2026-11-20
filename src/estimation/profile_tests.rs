@@ -13,6 +13,8 @@
 //! once on the population objective, with every EBE re-solved cold at each point and
 //! finite differences for both derivatives — the M3 probe of #1065, in Rust. It shares
 //! nothing with the solve but the objective.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, PrevEtas};
@@ -1917,8 +1919,13 @@ fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
     let p = global_prep(3);
     let layout = layout_of(&p);
     let model = &p.parsed.model;
-    let decl =
-        model.indiv_param_partials.theta_blocks.decls.iter().find(|d| d.name == "PLACEBO").unwrap();
+    let decl = model
+        .indiv_param_partials
+        .theta_blocks()
+        .decls()
+        .iter()
+        .find(|d| d.name == "PLACEBO")
+        .unwrap();
     let al = crate::levels::active_levels(model, &p.population);
     let per_subject = &al.iter().find(|a| a.block == "PLACEBO").unwrap().per_subject;
     assert_eq!(layout.groups.len(), 1, "the global contrast ties every level");
@@ -5392,7 +5399,7 @@ fn the_envelope_gradient_is_the_profile_gradient_under_laplace() {
         assert_eq!(o.agq_nodes(), Some(1));
         assert_eq!(
             profile_gradient_is_analytic(&p.parsed.model),
-            crate::estimation::agq::analytic_score_supported(&p.parsed.model),
+            crate::estimation::gauss_hermite::analytic_score_supported(&p.parsed.model),
             "fd={fd}: one predicate"
         );
         assert_eq!(profile_gradient_is_analytic(&p.parsed.model), !fd);
@@ -5647,7 +5654,7 @@ fn the_envelope_gradient_is_the_profile_gradient_under_quadrature() {
             assert_agq3(name, &p, anchor);
             assert_eq!(
                 profile_gradient_is_analytic(&p.parsed.model),
-                crate::estimation::agq::analytic_score_supported(&p.parsed.model) && !fd,
+                crate::estimation::gauss_hermite::analytic_score_supported(&p.parsed.model) && !fd,
                 "{name} fd={fd}: one predicate"
             );
             envelope_matches_fd(arm, !fd);

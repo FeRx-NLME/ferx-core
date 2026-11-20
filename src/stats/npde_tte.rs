@@ -32,6 +32,8 @@
 //! [`BATCH`] replicates whose rows are reduced to integer counts before the next batch
 //! runs. A `W_TTE_DEGENERATE_HAZARD` is counted over every batch and reported once per
 //! subject and CMT, as one simulation of all the replicates would report it (#1648).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::npde::{clamp_prob, effective_seed};
 use crate::api::{simulate_with_options_tallied, SimulateOptions};

@@ -6,12 +6,15 @@
 //! Dual2 inner gradient, 30 subjects × 10 observations, 3 outer iterations. Every
 //! oracle is a bit-identity at the fitted point or a refusal text, so no fit number
 //! enters and the platform does not either.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::test_fixtures::{case, case_with_call_ignore, unbound, Case, Kind};
 use super::*;
 use crate::estimation::run_covariance::run_covariance;
 use crate::estimation::run_sir::run_sir;
 use crate::types::CovarianceStatus;
+use crate::types::{GradientMethod, InnerOptimizer};
 
 // #1813: the source sentences say how the population was obtained and nothing
 // else; the remedy is the suggestion, the same in every cell.
@@ -1613,7 +1616,7 @@ fn gradient_method_record_is_the_union_with_the_caller() {
 fn a_fit_result_without_gradient_method_deserialises_as_auto() {
     let mut fit = crate::types::test_helpers::minimal_fit_result();
     fit.scoring_settings = Some(off_default_scoring());
-    fit.sir_settings = Some(crate::estimation::sir::SirSettings {
+    fit.sir_settings = Some(crate::estimation::sir_settings::SirSettings {
         scoring: off_default_scoring(),
         ..Default::default()
     });
@@ -1745,7 +1748,7 @@ fn resolve_scoring_options_prefers_the_fits_record_then_the_sir_records() {
     let sir_rec = ScoringSettings { inner_maxiter: 99, ..off_default_scoring() };
     let mut fit = crate::types::test_helpers::minimal_fit_result();
     fit.scoring_settings = Some(fit_rec.clone());
-    fit.sir_settings = Some(crate::estimation::sir::SirSettings {
+    fit.sir_settings = Some(crate::estimation::sir_settings::SirSettings {
         scoring: sir_rec.clone(),
         ..Default::default()
     });
@@ -2192,7 +2195,7 @@ fn unrecorded_fd_route_note_clauses() {
     let auto = crate::types::test_helpers::parsed_analytical_model(GradientMethod::Auto);
     let stamped = crate::types::test_helpers::parsed_analytical_model(GradientMethod::Fd);
     assert!(
-        crate::estimation::inner_optimizer::inner_reports_analytic_model(&auto),
+        crate::estimation::inner_settings::inner_reports_analytic_model(&auto),
         "premise: the fixture is in analytic inner scope"
     );
 

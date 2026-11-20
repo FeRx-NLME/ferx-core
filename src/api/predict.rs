@@ -3,6 +3,8 @@
 use super::*;
 use crate::diagnostics::{first_error, EngineError};
 use crate::pk;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 /// Predict concentrations for a population using given parameters (no random effects).
 ///

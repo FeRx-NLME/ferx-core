@@ -6,6 +6,8 @@
 //!
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::cold_sort::ColdSort;
 use crate::diagnostics::EngineError;
@@ -25,6 +27,9 @@ use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{weighted::WeightedIndex, ChiSquared, Distribution, StandardNormal};
+
+pub(crate) use crate::estimation::sir_settings::percentile_ci;
+pub use crate::estimation::sir_settings::SirSettings;
 
 /// Results from the SIR procedure.
 #[derive(Debug, Clone)]
@@ -52,76 +57,6 @@ pub struct SirResult {
     /// `run_sir_core` was handed — so it records what ran, including a value
     /// the caller tightened on the way in (an LTBS fit's `inner_tol`) (#1758).
     pub settings: SirSettings,
-}
-
-/// Every [`FitOptions`] setting that changes a SIR result, as one SIR run used
-/// it (#1758). Carried on [`FitResult::sir_settings`] so a later
-/// [`run_sir`](crate::run_sir) on that fit re-scores under the same settings by
-/// default, and so a reader can tell which scale, degrees of freedom and seed
-/// produced the reported intervals.
-///
-/// Recorded inside `run_sir_core` from the options it scored with, never by a
-/// caller, so the record cannot disagree with the draws.
-///
-/// `method` and `interaction` are not here: they already ride on the
-/// [`FitResult`] (`method`, `interaction`), and which of them SIR scores is
-/// [`run_sir`](crate::run_sir)'s business (#1710).
-///
-/// `Default` is `SirSettings::from_options(&FitOptions::default())`, the
-/// settings of a SIR run that changed nothing.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SirSettings {
-    /// `sir_samples`: proposal draws.
-    pub samples: usize,
-    /// `sir_resamples`: draws kept by the resampling step.
-    pub resamples: usize,
-    /// The seed the draws used, resolved: `sir_seed`, or the built-in default
-    /// when that was unset. So the run is reproducible from this field alone.
-    pub seed: u64,
-    /// `sir_df`: Student-t proposal degrees of freedom.
-    pub df: f64,
-    /// `sir_scale`: the scale SIR's flat prior is flat on (#1723).
-    pub scale: SirScale,
-    /// `sir_keep_samples`: whether the resampled vectors were retained.
-    pub keep_samples: bool,
-    /// The inner-loop and ODE settings each draw's EBE re-solve and objective ran
-    /// under (#426). The same record a fit carries on
-    /// [`FitResult::scoring_settings`](crate::FitResult::scoring_settings), taken here
-    /// from the options SIR was handed. `inner_restarts` is recorded for completeness:
-    /// the draws are warm-started and run no inner multi-start.
-    pub scoring: crate::ScoringSettings,
-}
-
-/// The SIR seed when `sir_seed` is unset.
-const DEFAULT_SIR_SEED: u64 = 12345;
-
-impl SirSettings {
-    /// The settings a SIR run under `options` uses: each field copied, the seed
-    /// resolved to the built-in default when `options.sir_seed` is `None`.
-    pub fn from_options(options: &FitOptions) -> Self {
-        Self {
-            samples: options.sir_samples,
-            resamples: options.sir_resamples,
-            seed: options.sir_seed.unwrap_or(DEFAULT_SIR_SEED),
-            df: options.sir_df,
-            scale: options.sir_scale,
-            keep_samples: options.sir_keep_samples,
-            scoring: crate::ScoringSettings::from_options(options),
-        }
-    }
-
-    /// The first field outside the `[fit_options]` domain, if any (#1770): `df`, then the
-    /// scoring half. Fields are named as the record names them (`df`, not `sir_df`).
-    pub(crate) fn check_domain(&self) -> Result<(), crate::estimation::fit_inputs::OutOfDomain> {
-        crate::estimation::fit_inputs::sir_df_in_domain("df", self.df)?;
-        self.scoring.check_domain()
-    }
-}
-
-impl Default for SirSettings {
-    fn default() -> Self {
-        Self::from_options(&FitOptions::default())
-    }
 }
 
 impl SirResult {
@@ -1037,7 +972,7 @@ fn run_sir_in_box(
     }
     // `[fit_options]`' domain, not `ChiSquared`'s (`nu > 0`): a df in (0, 1) would run, and
     // be recorded in a `sir.settings` the `.fitrx` reader refuses (#1770).
-    crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df)
+    crate::estimation::population_check::sir_df_in_domain("sir_df", options.sir_df)
         .map_err(|e| crate::entry_refusals::sir_options(e.to_string()))?;
 
     // Pack ML estimates as the proposal center. The FIX mask and the box come
@@ -1105,7 +1040,7 @@ fn run_sir_in_box(
     // there, so a collapse that step did not hold stays sampled. It reads the proposal's
     // diagonal, so it runs after the shape check above (#2830 review r1 #1).
     for p in crate::api::held_guard_coordinates(params) {
-        if crate::api::step_held(Some(proposal_cov), p) {
+        if crate::estimation::parameterization::step_held(Some(proposal_cov), p) {
             fixed_mask[p] = true;
         }
     }
@@ -1659,21 +1594,6 @@ fn lgamma(x: f64) -> f64 {
     }
     let t = xm1 + G + 0.5;
     0.5 * (2.0 * std::f64::consts::PI).ln() + (xm1 + 0.5) * t.ln() - t + sum.ln()
-}
-
-/// Compute 2.5th and 97.5th percentiles from a sample.
-pub(crate) fn percentile_ci(values: &[f64]) -> (f64, f64) {
-    if values.is_empty() {
-        return (f64::NAN, f64::NAN);
-    }
-    let mut sorted = values.to_vec();
-    sorted.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = sorted.len();
-    let lo_idx = ((n as f64) * 0.025).floor() as usize;
-    let hi_idx = ((n as f64) * 0.975).ceil() as usize;
-    let lo = sorted[lo_idx.min(n - 1)];
-    let hi = sorted[hi_idx.min(n - 1)];
-    (lo, hi)
 }
 
 #[cfg(test)]

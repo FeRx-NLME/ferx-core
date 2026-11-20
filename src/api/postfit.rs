@@ -12,7 +12,13 @@ use crate::stats::likelihood::{
     foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
 use crate::stats::residual_error::compute_iwres_with_correlations;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
+
+pub(crate) use crate::types::is_last_estimating_stage;
+
+pub(crate) use crate::estimation::parameterization::step_held;
 
 /// Rebuild `warnings_structured` from the current `warnings` vec.
 ///
@@ -317,28 +323,6 @@ pub(crate) fn compute_param_corr(
         }
     }
     Some(corr)
-}
-
-/// Whether `stage_idx` is the last *estimating* stage of `chain` — the single
-/// stage that owns the covariance / SIR step. Running it on every stage is
-/// wasteful and not expected (#615); only the final estimate needs SEs.
-///
-/// An evaluation-only IMP (`imp_eval_only`, NONMEM `IMP EONLY=1`) is a likelihood
-/// evaluation, not an estimator, so trailing eval-only IMP stages cede the
-/// covariance step to the preceding estimator. A default (estimating) IMP is a
-/// real estimator that owns the step itself, so it must not be skipped. Split out
-/// of `fit()` so the per-stage gating is unit-testable.
-pub(crate) fn is_last_estimating_stage(
-    chain: &[EstimationMethod], stage_idx: usize, eval_only: &[EstimationMethod],
-) -> bool {
-    let is_last = stage_idx + 1 == chain.len();
-    // Every remaining stage is a pure evaluator, so *this* one is the last that estimates.
-    // `eval_only` is the set of methods running in evaluation-only mode for this fit —
-    // `imp` under `imp_eval_only`, `laplace` under `agq_eval_only`. An empty slice means
-    // nothing is an evaluator, so only the literal last stage qualifies.
-    let trailing_all_eval_only = !chain[stage_idx + 1..].is_empty()
-        && chain[stage_idx + 1..].iter().all(|m| eval_only.contains(m));
-    is_last || trailing_all_eval_only
 }
 
 /// Whether a Gauss-Newton stage's warning survives into `FitResult.warnings`.
@@ -2131,7 +2115,7 @@ pub(crate) fn nonfinite_objective_warning(
     let details = serde_json::json!({
         "ofv": json_value(ofv),
         "reason": crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv),
-        "divergence_cutoff": crate::estimation::outer_optimizer::DIVERGENCE_OFV,
+        "divergence_cutoff": crate::estimation::outer_policy::DIVERGENCE_OFV,
         "method": method.label(),
     });
     let entry = warning_entry_with_severity(
@@ -2612,7 +2596,7 @@ pub(crate) fn name_nonfinite_subjects(
     model: &CompiledModel, params: &ModelParameters, mixest: Option<&[usize]>,
     source: &ContributionSource, terms: &TermScorer<'_>,
 ) -> String {
-    use crate::estimation::outer_optimizer::ofv_is_valid;
+    use crate::estimation::outer_policy::ofv_is_valid;
     // A term's `nll` is raw; the contribution it sits in is `2·nll`-scaled.
     let term_failed = |t: &ContributionTerm| !ofv_is_valid(2.0 * t.nll);
     let prior_failed = !ofv_is_valid(source.prior);
@@ -2946,14 +2930,6 @@ pub(crate) fn name_nonfinite_subjects(
 /// rail is a runaway too.
 /// The opening of the guard warning's text, by which a refresh finds the copy it replaces.
 const RUNAWAY_GUARD_PREFIX: &str = "Internal optimizer parameter guard reached by estimate(s):";
-
-/// Whether the covariance step held packed coordinate `p` (#2797): it produced a matrix
-/// and `p`'s row is the zero row [`crate::estimation::covariance::condition_on_held`]
-/// embeds. Read only for a coordinate [`held_guard_coordinates`] lists: a free coordinate
-/// the step did not hold has the positive diagonal of a positive-definite inverse.
-pub(crate) fn step_held(cov: Option<&DMatrix<f64>>, p: usize) -> bool {
-    cov.is_some_and(|m| p < m.nrows() && m[(p, p)] == 0.0)
-}
 
 /// The guard warning, given the covariance matrix the step produced (`None`: no
 /// matrix). A collapse is a [`HeldReason::CollapsedAtGuard`] coordinate, whose SE is not

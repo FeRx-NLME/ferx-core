@@ -129,6 +129,8 @@
 //! VI's Monte-Carlo estimator does not notice, because with `vi_mc_samples = 8` it never
 //! draws a `4σ` tail — which is worth knowing as a variance hazard, and is a separate
 //! question from the bound.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::estimation::agq::{agq_population_nll, gauss_hermite};

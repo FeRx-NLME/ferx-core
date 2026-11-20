@@ -1,6 +1,8 @@
 //! #2701: the FD Jacobian `H` of an integrated model, which the FOCE/FOCEI determinant term
 //! reads. Fixtures are a small Friberg-style myelosuppression chain with feedback, nonlinear
 //! enough that the integrator's step sequence moves with η.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::ode::solver::{arm_ode_solver_override, OdeSolverOverride};

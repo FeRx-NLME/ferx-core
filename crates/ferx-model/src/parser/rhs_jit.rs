@@ -1,0 +1,637 @@
+//! Native code for the register program (Cranelift).
+//!
+//! [`super::RhsRegProgram`]'s dispatch loop costs ~1.4 ns per instruction; the same
+//! operations as machine code cost a fraction of that, and the RHS is most of an ODE fit's
+//! time. So a compiled program is compiled once more, per number type's lane layout
+//! ([`Layout`]), to native functions over the same inputs: `f64` (every solve of the
+//! objective), the first-order duals of the inner gradient, and the second-order duals of
+//! the exact inner Hessian — every type whose parts are all `f64`s.
+//!
+//! **It is the register code's translation, lane for lane.** The program over a layout is
+//! first written out as scalar straight-line code (`super::ir`), each dual operation as
+//! the IEEE operations of that type's own body in its own order (an inline `if` as both arms
+//! and a select), and that is lowered here one instruction each. Cranelift never contracts a
+//! multiply and an add into a fused one and never folds `x·0`, so the arithmetic is IEEE's. `exp`, `ln`, `powf` and `round`
+//! call the Rust functions the interpreter calls, through `extern "C"` shims; `floor`,
+//! `ceil`, `abs` and `neg` are exact IEEE operations either way. The one thing not pinned is
+//! a `NaN`'s payload, which LLVM leaves unspecified for the Rust side too.
+//!
+//! Three functions can be built per layout, each on first use:
+//!
+//! - the **whole RHS**, `fn(u, params, seeds, du)`;
+//! - the **hoisted pair** ([`HoistPlan`]): `prep` computes the parameter-only values once,
+//!   `main` is the RHS reading them, for a caller that keeps them across an integration;
+//! - the **reverse pass** (`super::ir::reverse`): `fn(u, params, seeds, du, ū, p̄, s̄, dū)`
+//!   adds `dūᵀ·∂du/∂(u, params, seeds)` into the three input adjoints, the RHS's
+//!   vector-Jacobian product for a tape that records one node per call.
+//!
+//! A native function reads its operands without bounds checks, so it runs only when every
+//! slot the program reads or writes is inside the slices it is handed ([`Extent`]); the
+//! register code covers the rest (it reads a missing state or parameter as `0`, as the
+//! binding does).
+use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
+use super::Flat;
+use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{default_libcall_names, Linkage, Module};
+use std::sync::{Arc, OnceLock};
+
+/// `fn(u, params, seeds, du)`; every pointer is to elements of one layout's lanes.
+pub(super) type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
+/// The hoisted pair ([`HoistPlan`]): `prep(params, seeds, cache)` writes the
+/// parameter-only values, `main(u, params, seeds, du, cache)` is the RHS reading them.
+pub(super) type PrepFn = unsafe extern "C" fn(*const f64, *const f64, *mut f64);
+pub(super) type MainFn =
+    unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64, *const f64);
+extern "C" fn shim_powf(x: f64, e: f64) -> f64 {
+    x.powf(e)
+}
+
+/// The highest state, parameter and derivative index the program touches (+1), so a call
+/// can check its slices once instead of the native code checking every access.
+#[derive(Clone, Copy, Debug, Default)]
+struct Extent {
+    u: usize,
+    params: usize,
+    du: usize,
+    /// Every derivative below `du` is written, so a call's output never depends on what
+    /// `du` held before it.
+    du_dense: bool,
+}
+
+fn extent(code: &[Flat]) -> Extent {
+    let mut e = Extent::default();
+    let mut written = Vec::new();
+    for f in code {
+        match *f {
+            Flat::LoadState { i, .. } => e.u = e.u.max(i as usize + 1),
+            Flat::LoadParam { slot, .. } => e.params = e.params.max(slot as usize + 1),
+            Flat::Deriv { state, .. } => {
+                let s = state as usize;
+                e.du = e.du.max(s + 1);
+                if written.len() <= s {
+                    written.resize(s + 1, false);
+                }
+                written[s] = true;
+            }
+            _ => {}
+        }
+    }
+    e.du_dense = written.iter().all(|&w| w);
+    e
+}
+
+/// The instructions whose value depends only on parameters, literals and `MACHEPS` — fixed
+/// for a whole integration — and which of them the rest of the program reads.
+///
+/// A caller that keeps a cache runs `prep` once and `main` per call: `main` loads those
+/// values instead of recomputing them. The operations and their inputs are the same, so
+/// the values are bit for bit the full function's.
+///
+/// Nothing inside an `if` is hoisted, nor the `if` itself: `prep` is straight-line code
+/// with no arms to select between. What an arm reads from before it still can be.
+#[derive(Debug, Default)]
+struct HoistPlan {
+    /// Per instruction: computed by `prep` rather than `main`.
+    invariant: Vec<bool>,
+    /// Per instruction: its cache slot, when `main` reads its value.
+    slot: Vec<Option<u32>>,
+    n_slots: usize,
+    /// The parameter slots `prep` reads, ascending: the cache's key.
+    param_slots: Vec<u32>,
+}
+
+fn hoist_plan(code: &[Flat]) -> HoistPlan {
+    let n_regs = code
+        .iter()
+        .flat_map(|f| {
+            let mut g = *f;
+            let (d, uses) = super::regs_of(&mut g);
+            let mut v: Vec<usize> = uses.into_iter().flatten().map(|r| *r as usize).collect();
+            v.extend(d.map(|r| *r as usize));
+            v
+        })
+        .max()
+        .map_or(0, |m| m + 1);
+    let mut producer = vec![usize::MAX; n_regs];
+    let mut invariant = vec![false; code.len()];
+    // Every instruction from an `if`'s `Branch` to its end.
+    let mut in_if = vec![false; code.len()];
+    for (i, f) in code.iter().enumerate() {
+        if let Flat::Branch { to, .. } = *f {
+            if let Some(&Flat::Jump { to: end }) = code.get((to as usize).wrapping_sub(1)) {
+                in_if[i..end as usize].fill(true);
+            }
+        }
+    }
+    let mut read_by_main = vec![false; code.len()];
+    let mut param_slots = Vec::new();
+    for (i, f) in code.iter().enumerate() {
+        let mut g = *f;
+        let (d, uses) = super::regs_of(&mut g);
+        let from: Vec<usize> = uses.into_iter().flatten().map(|r| producer[*r as usize]).collect();
+        invariant[i] = match *f {
+            _ if in_if[i] => false,
+            Flat::LoadParam { slot, .. } => {
+                param_slots.push(slot);
+                true
+            }
+            Flat::LoadK { .. } => true,
+            // `MACHEPS`; the clock seeds move with `t`.
+            Flat::LoadSeed { k, .. } => k == 3,
+            Flat::LoadState { .. } | Flat::Deriv { .. } => false,
+            _ => from.iter().all(|&p| invariant[p]),
+        };
+        if !invariant[i] {
+            for p in from {
+                if invariant[p] {
+                    read_by_main[p] = true;
+                }
+            }
+        }
+        if let Some(d) = d {
+            producer[*d as usize] = i;
+        }
+    }
+    let mut n_slots = 0;
+    let slot = read_by_main
+        .iter()
+        .map(|&r| {
+            r.then(|| {
+                n_slots += 1;
+                (n_slots - 1) as u32
+            })
+        })
+        .collect();
+    param_slots.sort_unstable();
+    param_slots.dedup();
+    HoistPlan { invariant, slot, n_slots, param_slots }
+}
+
+/// Which function [`emit`] writes from the program.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    /// The whole RHS (`RhsFn`).
+    Full,
+    /// The parameter-only instructions, storing what `Main` reads (`PrepFn`).
+    Prep(&'a HoistPlan),
+    /// The rest, loading the parameter-only values from the cache (`MainFn`).
+    Main(&'a HoistPlan),
+}
+
+/// The program over `layout` as scalar code, whole or one half of the hoisted pair.
+fn emit(code: &[Flat], n_regs: usize, layout: Layout, part: Part<'_>) -> Func {
+    match part {
+        Part::Full if layout.tan > 0 => {
+            // Forward tangents along the inputs, the seeds' included (the clock).
+            let base = layout.base();
+            ir::tangent_packed(
+                &ir::forward(code, n_regs, base),
+                layout.tan as usize,
+                base.lanes(),
+                true,
+            )
+        }
+        Part::Full => ir::forward(code, n_regs, layout),
+        // `prep(params, seeds, cache)`: no instruction it runs reads `u` or writes `du`.
+        Part::Prep(plan) => {
+            let mut f = Func::new(3);
+            let mut l = ir::Lower::new(&mut f, layout, n_regs);
+            for (i, x) in code.iter().enumerate() {
+                if !plan.invariant[i] {
+                    continue;
+                }
+                l.flat(i, x, [0, 0, 1, 2]);
+                if let (Some(slot), Some(d)) = (plan.slot[i], def_of(x)) {
+                    let lanes = l.reg(d);
+                    l.store(2, slot as usize, &lanes);
+                }
+            }
+            f
+        }
+        Part::Main(plan) => {
+            let mut f = Func::new(5);
+            let mut l = ir::Lower::new(&mut f, layout, n_regs);
+            for (i, x) in code.iter().enumerate() {
+                if !plan.invariant[i] {
+                    l.flat(i, x, [0, 1, 2, 3]);
+                } else {
+                    // An `if` ending here closes before the cached value lands.
+                    l.reach(i);
+                    if let (Some(slot), Some(d)) = (plan.slot[i], def_of(x)) {
+                        let lanes = l.load(4, slot as usize);
+                        l.set(d, lanes);
+                    }
+                }
+            }
+            l.reach(code.len());
+            f
+        }
+    }
+}
+
+/// The register an instruction writes.
+fn def_of(f: &Flat) -> Option<u32> {
+    let mut g = *f;
+    let (d, _) = super::regs_of(&mut g);
+    d.map(|r| *r)
+}
+
+/// The most scalar instructions one compile takes: past it a function is not built and its
+/// type keeps the register code (or the per-operation tape). Register allocation grows
+/// faster than linearly in a straight-line function's length; a wide second-order dual
+/// writes an RHS out as tens of thousands of instructions, which takes seconds to
+/// allocate.
+const MAX_INSTS: usize = 24_000;
+
+/// From this many scalar instructions a function is allocated with Cranelift's single-pass
+/// allocator: quick to compile, its code a little slower, which a function this long (run
+/// once per call of a wide dual) does not notice beside the compile.
+const FAST_ALLOC_INSTS: usize = 4_000;
+
+/// `FERX_NO_RHS_JIT=1` keeps the register code, for a host where the native code is
+/// unavailable or suspected (a W^X-hardened process, a code generator defect).
+fn jit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enabled_by(std::env::var("FERX_NO_RHS_JIT").ok().as_deref()))
+}
+
+pub(super) fn enabled_by(no_jit: Option<&str>) -> bool {
+    no_jit != Some("1")
+}
+
+/// Why this process has no native function for a program (#2681): see
+/// [`super::NativeCause::of`].
+pub(super) fn native_cause() -> super::NativeCause {
+    super::NativeCause::of(jit_enabled(), cranelift_native::builder().is_ok())
+}
+
+/// A JIT module for the host, or `None` when Cranelift cannot target it (or the native code
+/// is switched off, [`jit_enabled`]).
+/// The Cranelift flags every native module this crate builds starts from — this file's RHS
+/// programs and `kernel_jit`'s derivative plans alike, so the two cannot drift apart again.
+///
+/// Stack probes are the load-bearing one. A wide program keeps many values live and spills a
+/// frame past a page. Windows commits a thread's stack one guard page at a time: a store
+/// beyond the guard page without a probe is an access violation, not a stack extension
+/// (Linux maps the stack without that requirement, so a missing probe never shows there).
+/// The derivative plans once built their own flags without probes, and the covariance
+/// R-matrix plan of a two-state ODE model crashed on Windows as soon as it reached the native
+/// tier (#2786 review).
+pub(super) fn host_flags() -> Option<settings::Builder> {
+    let mut flags = settings::builder();
+    flags.set("use_colocated_libcalls", "false").ok()?;
+    flags.set("is_pic", "false").ok()?;
+    flags.set("enable_probestack", "true").ok()?;
+    flags.set("probestack_strategy", "inline").ok()?;
+    Some(flags)
+}
+
+fn new_module(fast_alloc: bool) -> Option<JITModule> {
+    if !jit_enabled() {
+        return None;
+    }
+    let mut flags = host_flags()?;
+    flags.set("opt_level", "speed").ok()?;
+    if fast_alloc {
+        flags.set("regalloc_algorithm", "single_pass").ok()?;
+    }
+    let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
+    Some(JITModule::new(JITBuilder::with_isa(isa, default_libcall_names())))
+}
+
+/// Native functions and the module that owns their memory.
+struct Compiled<F> {
+    f: F,
+    module: Option<JITModule>,
+}
+
+impl<F> Drop for Compiled<F> {
+    fn drop(&mut self) {
+        if let Some(m) = self.module.take() {
+            // SAFETY: every function pointer in `f` points into this module's memory and
+            // dies with this value; `JitCode` hands out no copy that could outlive the `Arc`.
+            unsafe { m.free_memory() };
+        }
+    }
+}
+
+/// Lower `funcs` into one module and finalize it; the addresses in `funcs`' order.
+fn compile(funcs: &[(&str, &Func)]) -> Option<(JITModule, Vec<*const u8>)> {
+    compile_with(funcs, MAX_INSTS, FAST_ALLOC_INSTS)
+}
+
+/// [`compile`] with its own size limits (a whole subject's plan, #2786).
+pub(super) fn compile_with(
+    funcs: &[(&str, &Func)], max_insts: usize, fast_alloc_insts: usize,
+) -> Option<(JITModule, Vec<*const u8>)> {
+    let insts: usize = funcs.iter().map(|(_, f)| f.insts.len()).sum();
+    if insts > max_insts {
+        return None;
+    }
+    let mut module = new_module(insts > fast_alloc_insts)?;
+    // A failure past this point must free what `module` mapped: it has no `Drop` that does.
+    let ids: Option<Vec<_>> = funcs.iter().map(|(name, f)| lower(&mut module, name, f)).collect();
+    let Some(ids) = ids.filter(|_| module.finalize_definitions().is_ok()) else {
+        // SAFETY: nothing was handed out from this module.
+        unsafe { module.free_memory() };
+        return None;
+    };
+    let addrs = ids.into_iter().map(|id| module.get_finalized_function(id)).collect();
+    Some((module, addrs))
+}
+
+/// Define one [`Func`] in `module`, one Cranelift instruction per scalar instruction.
+fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_module::FuncId> {
+    let target = module.target_config();
+    let ptr = target.pointer_type();
+    let call_conv = target.default_call_conv;
+    let mut sig = module.make_signature();
+    for _ in 0..f.n_args {
+        sig.params.push(AbiParam::new(ptr));
+    }
+    let id = module.declare_function(name, Linkage::Local, &sig).ok()?;
+    let mut ctx = module.make_context();
+    ctx.func.signature = sig;
+    let mut fctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let block = b.create_block();
+        b.append_block_params_for_function_params(block);
+        b.switch_to_block(block);
+        let args = b.block_params(block).to_vec();
+        let mut unary_sig = Signature::new(call_conv);
+        unary_sig.params.push(AbiParam::new(types::F64));
+        unary_sig.returns.push(AbiParam::new(types::F64));
+        let mut binary_sig = unary_sig.clone();
+        binary_sig.params.push(AbiParam::new(types::F64));
+        let unary_ref = b.import_signature(unary_sig);
+        let binary_ref = b.import_signature(binary_sig);
+        let flags = MemFlagsData::trusted();
+        let mut v: Vec<Value> = Vec::with_capacity(f.insts.len());
+        for inst in &f.insts {
+            let r = |x: ir::V| v[x as usize];
+            let out = match *inst {
+                Inst::Load { arg, off } => {
+                    b.ins().load(types::F64, flags, args[arg as usize], (off * 8) as i32)
+                }
+                Inst::Store { arg, off, v: x } => {
+                    b.ins().store(flags, r(x), args[arg as usize], (off * 8) as i32);
+                    // A store has no value; nothing reads this slot.
+                    r(x)
+                }
+                _ => lower_value_inst(&mut b, inst, &r, ptr, unary_ref, binary_ref)?,
+            };
+            v.push(out);
+        }
+        b.ins().return_(&[]);
+        b.seal_all_blocks();
+        b.finalize(target);
+    }
+    module.define_function(id, &mut ctx).ok()?;
+    module.clear_context(&mut ctx);
+    Some(id)
+}
+
+/// Lower one `Inst` that neither reads nor writes memory — arithmetic, the shims, a
+/// compare, a select, the host hooks — from its operands' values (`r`): `None` for
+/// `Load` / `Store`, whose addressing each JIT owns. Shared by this RHS JIT and the
+/// kernel JIT, so the two lower the instruction set identically.
+pub(super) fn lower_value_inst(
+    b: &mut FunctionBuilder, inst: &Inst, r: impl Fn(ir::V) -> Value,
+    ptr: cranelift_codegen::ir::Type, unary: cranelift_codegen::ir::SigRef,
+    binary: cranelift_codegen::ir::SigRef,
+) -> Option<Value> {
+    type F1 = extern "C" fn(f64) -> f64;
+    type F2 = extern "C" fn(f64, f64) -> f64;
+    let call = |b: &mut FunctionBuilder, sig, fp: usize, args: &[Value]| {
+        let callee = b.ins().iconst(ptr, fp as i64);
+        let call = b.ins().call_indirect(sig, callee, args);
+        b.inst_results(call)[0]
+    };
+    Some(match *inst {
+        Inst::Load { .. } | Inst::Store { .. } => return None,
+        Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
+        Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
+        Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
+        Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
+        Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
+        Inst::Neg(x) => b.ins().fneg(r(x)),
+        Inst::Abs(x) => b.ins().fabs(r(x)),
+        Inst::Floor(x) => b.ins().floor(r(x)),
+        Inst::Ceil(x) => b.ins().ceil(r(x)),
+        Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
+        Inst::Call1(s, x) => call(b, unary, s.f() as usize, &[r(x)]),
+        Inst::Powf(x, y) => call(b, binary, shim_powf as F2 as usize, &[r(x), r(y)]),
+        Inst::Gamma { upper, i, j, a: x, x: y } => {
+            call(b, binary, ir::gamma_shim(upper, i, j) as usize, &[r(x), r(y)])
+        }
+        Inst::Cmp(cc, x, y) => {
+            let cc = match cc {
+                Cc::Lt => FloatCC::LessThan,
+                Cc::Le => FloatCC::LessThanOrEqual,
+                Cc::Gt => FloatCC::GreaterThan,
+                Cc::Ge => FloatCC::GreaterThanOrEqual,
+                Cc::Eq => FloatCC::Equal,
+                // `UN | LT | GT`: Rust's `!=`, true when either side is `NaN`.
+                Cc::Ne => FloatCC::NotEqual,
+            };
+            b.ins().fcmp(cc, r(x), r(y))
+        }
+        Inst::And(x, y) => b.ins().band(r(x), r(y)),
+        Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
+        Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
+        Inst::StopGrad(x) => r(x),
+        Inst::HostArg(x) => call(b, unary, ir::host::arg_native as F1 as usize, &[r(x)]),
+        Inst::Host(f) => {
+            let arg = b.ins().f64const(f.index() as f64);
+            call(b, unary, ir::host::call_native as F1 as usize, &[arg])
+        }
+        Inst::HostOut(k) => {
+            let arg = b.ins().f64const(k as f64);
+            call(b, unary, ir::host::out_native as F1 as usize, &[arg])
+        }
+    })
+}
+
+/// The native functions of one register program, built on first use per layout and shared
+/// by every clone of the program.
+#[derive(Clone)]
+pub(super) struct JitCode {
+    inner: Arc<JitInner>,
+}
+
+struct JitInner {
+    code: Vec<Flat>,
+    n_regs: usize,
+    extent: Extent,
+    plan: HoistPlan,
+    full: Box<[OnceLock<Option<Compiled<RhsFn>>>]>,
+    pairs: Box<[OnceLock<Option<Compiled<(PrepFn, MainFn)>>>]>,
+}
+
+// SAFETY: the native code is immutable once finalized and reentrant (it touches only its
+// arguments and the stack); the module that owns it is never touched again until it is
+// freed, by the last owner.
+unsafe impl Send for JitInner {}
+unsafe impl Sync for JitInner {}
+
+impl std::fmt::Debug for JitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitCode").field("instructions", &self.inner.code.len()).finish()
+    }
+}
+
+fn slots<F>() -> Box<[OnceLock<Option<Compiled<F>>>]> {
+    (0..ir::N_SLOTS).map(|_| OnceLock::new()).collect()
+}
+
+impl JitCode {
+    pub fn new(code: &[Flat], n_regs: usize) -> Self {
+        let inner = Arc::new(JitInner {
+            code: code.to_vec(),
+            n_regs,
+            extent: extent(code),
+            plan: hoist_plan(code),
+            full: slots(),
+            pairs: slots(),
+        });
+        JitCode { inner }
+    }
+
+    /// Whether a native function exists (or can be built) for `layout`.
+    pub(super) fn has(&self, layout: Layout) -> bool {
+        self.resolve(layout).is_some()
+    }
+
+    /// The whole RHS over `layout`, built on first use; `None` for a layout without a slot
+    /// or a host Cranelift cannot target.
+    pub(super) fn resolve(&self, layout: Layout) -> Option<Resolved<'_, RhsFn>> {
+        self.inner.resolve(layout)
+    }
+
+    /// The hoisted pair over `layout` ([`HoistPlan`]), built on first use.
+    pub(super) fn resolve_hoisted(&self, layout: Layout) -> Option<Resolved<'_, (PrepFn, MainFn)>> {
+        self.inner.resolve_hoisted(layout)
+    }
+}
+
+impl JitInner {
+    fn resolve(&self, layout: Layout) -> Option<Resolved<'_, RhsFn>> {
+        let s = ir::slot(layout)?;
+        let inner = self;
+        let c = inner.full[s]
+            .get_or_init(|| {
+                let f = emit(&inner.code, inner.n_regs, layout, Part::Full);
+                let (module, a) = compile(&[("rhs", &f)])?;
+                // SAFETY: defined with exactly `RhsFn`'s signature.
+                let f = unsafe { std::mem::transmute::<*const u8, RhsFn>(a[0]) };
+                Some(Compiled { f, module: Some(module) })
+            })
+            .as_ref()?;
+        Some(self.resolved(c.f, layout))
+    }
+
+    fn resolve_hoisted(&self, layout: Layout) -> Option<Resolved<'_, (PrepFn, MainFn)>> {
+        let s = ir::slot(layout)?;
+        let inner = self;
+        let c = inner.pairs[s]
+            .get_or_init(|| {
+                let prep = emit(&inner.code, inner.n_regs, layout, Part::Prep(&inner.plan));
+                let main = emit(&inner.code, inner.n_regs, layout, Part::Main(&inner.plan));
+                let (module, a) = compile(&[("rhs_prep", &prep), ("rhs_main", &main)])?;
+                // SAFETY: each defined with exactly its type's signature.
+                let f = unsafe {
+                    (
+                        std::mem::transmute::<*const u8, PrepFn>(a[0]),
+                        std::mem::transmute::<*const u8, MainFn>(a[1]),
+                    )
+                };
+                Some(Compiled { f, module: Some(module) })
+            })
+            .as_ref()?;
+        Some(self.resolved(c.f, layout))
+    }
+
+    fn resolved<F: Copy>(&self, f: F, layout: Layout) -> Resolved<'_, F> {
+        Resolved { f, extent: self.extent, lanes: layout.lanes(), plan: &self.plan }
+    }
+}
+
+/// One native function (or the hoisted pair) of a [`JitCode`], resolved for one layout: a
+/// call is the extent check and the call itself. It borrows the code, so it cannot outlive
+/// it.
+#[derive(Clone, Copy)]
+pub(super) struct Resolved<'a, F> {
+    f: F,
+    extent: Extent,
+    lanes: usize,
+    plan: &'a HoistPlan,
+}
+
+impl<F> Resolved<'_, F> {
+    /// Whether `nu`, `np` and `ndu` elements cover what the program reads and writes.
+    #[inline(always)]
+    pub(super) fn fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
+        let e = self.extent;
+        nu >= e.u && np >= e.params && ndu >= e.du
+    }
+    /// How many elements of `u`, `params` and `du` the program touches.
+    pub(super) fn extent(&self) -> (usize, usize, usize) {
+        (self.extent.u, self.extent.params, self.extent.du)
+    }
+}
+
+impl Resolved<'_, RhsFn> {
+    /// The RHS.
+    ///
+    /// # Safety
+    /// [`Self::fits`] holds for the slices behind `u`, `params` and `du`; `seeds` holds 4
+    /// elements; every element is [`Self::lanes`] contiguous `f64`s, and `du` does not
+    /// overlap the inputs.
+    #[inline(always)]
+    pub(super) unsafe fn call(
+        &self, u: *const f64, params: *const f64, seeds: *const f64, du: *mut f64,
+    ) {
+        (self.f)(u, params, seeds, du)
+    }
+}
+
+impl Resolved<'_, (PrepFn, MainFn)> {
+    /// `f64`s of cache the pair needs.
+    pub(super) fn cache_len(&self) -> usize {
+        self.plan.n_slots * self.lanes
+    }
+    /// The parameter slots whose values the cache depends on (with `seeds[3]`).
+    pub(super) fn param_slots(&self) -> &[u32] {
+        &self.plan.param_slots
+    }
+    /// Fill `cache` from `params` and `seeds`.
+    ///
+    /// # Safety
+    /// `params` covers the program's extent, `seeds` holds 4 elements and `cache`
+    /// [`Self::cache_len`] `f64`s.
+    #[inline(always)]
+    pub(super) unsafe fn prep(&self, params: *const f64, seeds: *const f64, cache: *mut f64) {
+        (self.f.0)(params, seeds, cache)
+    }
+    /// [`Self::main`]'s native function, for a caller that makes the calls itself.
+    pub(super) fn main_fn(&self) -> MainFn {
+        self.f.1
+    }
+    /// The RHS from a filled `cache`.
+    ///
+    /// # Safety
+    /// As [`Resolved::call`], and `cache` filled by [`Self::prep`] from the same `params`
+    /// and `seeds[3]`.
+    #[inline(always)]
+    pub(super) unsafe fn main(
+        &self, u: *const f64, params: *const f64, seeds: *const f64, du: *mut f64,
+        cache: *const f64,
+    ) {
+        (self.f.1)(u, params, seeds, du, cache)
+    }
+}

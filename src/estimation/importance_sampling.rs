@@ -34,6 +34,8 @@
 //! from the full (n_eta + n_kappa × n_occasions) posterior Hessian, and the
 //! IS weights include both the η and κ priors. This makes the IS -2LL directly
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::cold_sort::ColdSort;
 use crate::estimation::impmap::draw_obs_nll;

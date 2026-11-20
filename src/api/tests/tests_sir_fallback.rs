@@ -212,7 +212,7 @@ fn resolve_sir_fallback_fires_and_yields_finite_cis() {
 /// A synthetic `SirResult` whose every reported field is distinguishable by
 /// `tag`, so a field copied from the wrong run (or not copied) shows up.
 fn tagged_sir(tag: f64) -> crate::estimation::sir::SirResult {
-    let settings = crate::estimation::sir::SirSettings {
+    let settings = crate::estimation::sir_settings::SirSettings {
         samples: 100 + tag as usize,
         seed: 1000 + tag as u64,
         df: 2.0 + tag,
@@ -352,10 +352,10 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
     assert_eq!(sir.ci_kappa.len(), 1, "one κ interval: {:?}", sir.ci_kappa);
     let (lo, hi) = sir.ci_kappa[0];
     assert!(lo.is_finite() && hi.is_finite() && lo <= hi, "κ [{lo}, {hi}]");
-    let want = crate::estimation::sir::SirSettings::from_options(&opts);
+    let want = crate::estimation::sir_settings::SirSettings::from_options(&opts);
     assert_ne!(
         want,
-        crate::estimation::sir::SirSettings::default(),
+        crate::estimation::sir_settings::SirSettings::default(),
         "the fixture must be off-default, or the stamp check is a tautology"
     );
     assert_eq!(sir.settings, want);

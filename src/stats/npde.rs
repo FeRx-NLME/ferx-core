@@ -66,6 +66,8 @@
 //! (`FitResult::iov_occasion`) and the labels are derived here, as `fit()` derives
 //! them (#1980). A subject still carrying no label is scored at κ = 0, which
 //! [`compute_npde_npd_diag`] reports as `W_IOV_NO_OCCASIONS`.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::stats::special::normal_inv_cdf;
 use crate::types::{BloqMethod, CompiledModel, IovOccasionRule, ModelParameters, Population};

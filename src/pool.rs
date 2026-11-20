@@ -1,6 +1,8 @@
 //! The fit-scoped Rayon pools and thread-count policy. A crate-level module (not under `api`)
 //! so the estimators below `api` can open a fit scope without depending on it (#3041).
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 /// Worker-stack size for ferx-managed Rayon pools.
 ///
@@ -149,7 +151,7 @@ use cache::{FitPoolLease, PoolCache, SharedPoolCache};
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct FitScope {
     pub(crate) ode: crate::ode::solver::OdeSolverOverride,
-    pub(crate) inner: crate::estimation::inner_optimizer::InnerSettings,
+    pub(crate) inner: crate::estimation::inner_settings::InnerSettings,
     /// Beside `inner` rather than inside it: it gates the outer gradient, the `auto` optimizer
     /// pick and the covariance R-matrix scope too, not only the EBE solve.
     pub(crate) fd: bool,
@@ -367,16 +369,7 @@ pub(crate) fn with_fit_scope_ode<R: Send>(
     })
 }
 
-/// Every worker of the pool this thread runs on drops its thread-local plan caches and buffers
-/// (`kernel_jit::release_thread_caches`); off a pool, this thread alone.
-pub(crate) fn release_pool_thread_caches() {
-    use crate::parser::model_parser::rhs_regcode::kernel_jit::release_thread_caches;
-    if rayon::current_thread_index().is_some() {
-        rayon::broadcast(|_| release_thread_caches());
-    } else {
-        release_thread_caches();
-    }
-}
+pub(crate) use crate::parser::model_parser::rhs_regcode::kernel_jit::release_pool_thread_caches;
 
 fn with_scope<R: Send>(
     scope: FitScope, threads: Option<usize>, f: impl FnOnce() -> R + Send,

@@ -18,6 +18,8 @@
 //!   - inverse-gamma via `1 / Gamma` ([`inverse_gamma_draw`]);
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::cold_sort::ColdSort;
 use crate::estimation::bayes_mu_design::{within_bounds, DrawOutcome, MuDesign};

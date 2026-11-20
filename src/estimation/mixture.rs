@@ -20,6 +20,8 @@
 //!
 //! Cost is ≈ K× the inner loop (K EBE searches per subject per outer iteration).
 //! Parallelising across (subject × class) is a later optimisation (#977 risks).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use nalgebra::{DMatrix, DVector};
 
@@ -1427,6 +1429,8 @@ pub(crate) fn mixture_gradient_fd(
 #[cfg(test)]
 mod tests {
     use super::{any_contributing, combine_subject};
+    #[allow(unused_imports)]
+    use ferx_model::internal::*;
 
     mod merged_classes {
         use super::super::{
@@ -3013,7 +3017,7 @@ mod tests {
             // No recorder serves a model whose individual-parameter program is gone.
             let mut no_recorder =
                 crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
-            no_recorder.indiv_param_partials.indiv_param_program = None;
+            *no_recorder.indiv_param_partials.indiv_param_program_mut() = None;
             assert!(!crate::sens::ode_provider::adjoint::recorder_in_scope(&no_recorder));
             assert_eq!(
                 call(&no_recorder, &warm, &opts).err(),
@@ -3426,7 +3430,7 @@ mod tests {
 
     #[test]
     fn mixture_replacement_warning_covers_every_optimizer() {
-        use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+        use crate::estimation::outer_policy::resolve_outer_optimizer;
         use crate::types::Optimizer;
         const ALL_OPTIMIZERS: [Optimizer; 8] = [
             Optimizer::Auto,

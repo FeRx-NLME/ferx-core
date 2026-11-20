@@ -6,6 +6,8 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::pk;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -200,7 +202,8 @@ pub fn fit_from_files(
     // caller's selection clauses merged in. The file's `[fit_options]` are ignored
     // here by design — its `iov_column` included, so none is read — but its
     // `[data_selection]` is not.
-    let mut reader_settings = ReaderSettings::from_parsed(&parsed).with_call_selection(&opts);
+    let mut reader_settings =
+        super::run::with_call_selection(ReaderSettings::from_parsed(&parsed), &opts);
     reader_settings.fallback_columns =
         covariate_columns.map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<String>>());
     reader_settings.iov_column = None;
@@ -281,7 +284,7 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
-            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            let (resolved, _) = crate::estimation::outer_policy::resolve_outer_optimizer(
                 options.optimizer,
                 model,
                 has_mixture,
@@ -777,7 +780,7 @@ pub(crate) fn per_start_options(options: &FitOptions, k: usize) -> FitOptions {
 /// OFV is non-finite and therefore also invalid, so it can never block a finite
 /// valid candidate. See `estimation::outer_optimizer::ofv_is_valid`.
 pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    let valid = crate::estimation::outer_optimizer::ofv_is_valid;
+    let valid = crate::estimation::outer_policy::ofv_is_valid;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
@@ -1612,10 +1615,10 @@ fn saem_reported_objective(
             }
             // The model-file parser checks this range; a `FitOptions` built in code does not
             // pass through it, and `gauss_hermite` asserts it.
-            if !(2..=crate::estimation::agq::MAX_AGQ_NODES).contains(&n_nodes) {
+            if !(2..=crate::estimation::gauss_hermite::MAX_AGQ_NODES).contains(&n_nodes) {
                 return Err(format!(
                     "saem_ofv_nodes must be in 2..={}, got {n_nodes}",
-                    crate::estimation::agq::MAX_AGQ_NODES
+                    crate::estimation::gauss_hermite::MAX_AGQ_NODES
                 ));
             }
             // IOV stacks every occasion's κ into the grid (d = n_η + n_occ·n_κ), which the
@@ -1947,7 +1950,7 @@ fn fit_inner(
     // What the covariance step differentiates: a `profile`d block's levels (#1065) are
     // re-profiled inside its stencil, not stenciled, so its cost and its scale routing
     // read the structural count.
-    let profiled = model.indiv_param_partials.theta_blocks.profiled_theta_indices();
+    let profiled = model.indiv_param_partials.theta_blocks().profiled_theta_indices();
     let n_params_pre = held_mask
         .iter()
         .enumerate()
@@ -2726,7 +2729,7 @@ fn fit_inner(
             // parameters; `check_profiled_levels` has refused every method but foce, focei
             // and laplace at one node. A run that did not leave its start is probed
             // (#2591), as on every other outer optimizer.
-            _ if !model.indiv_param_partials.theta_blocks.profiled_names().is_empty() => {
+            _ if !model.indiv_param_partials.theta_blocks().profiled_names().is_empty() => {
                 floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
                     crate::estimation::profile::optimize_profiled_probed(model, population, p, o)
                 })
@@ -3889,7 +3892,7 @@ fn fit_inner(
         cov_eigenvalues,
         cov_condition_number,
         bic_inputs,
-        profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
+        profiled_blocks: model.indiv_param_partials.theta_blocks().profiled_names(),
         profiled_levels_at_bound,
         held_at_bound: Vec::new(),
         eta_log_transformed,
@@ -3936,7 +3939,7 @@ fn fit_inner(
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
         inits_from_nca: options.inits_from_nca.map(|m| {
-            use crate::suggest_start::NcaInit;
+            use crate::types::NcaInit;
             match m {
                 NcaInit::Nca => "nca",
                 NcaInit::Sweep => "nca_sweep",

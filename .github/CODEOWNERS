@@ -10,8 +10,11 @@
 # `tests/codeowners.rs` fails if a path below stops existing, so a rename cannot
 # silently drop ownership.
 
-/src/estimation/ @roninsightrx @TeunP @hiddevandebeek
-/src/sens/       @roninsightrx @TeunP @hiddevandebeek
-/src/stats/      @roninsightrx @TeunP @hiddevandebeek
-/src/pk/         @roninsightrx @TeunP @hiddevandebeek
-/src/ode/        @roninsightrx @TeunP @hiddevandebeek
+# The numerical layer below estimation lives in the `ferx-model` crate (#3041).
+/src/estimation/                   @roninsightrx @TeunP @hiddevandebeek
+/src/stats/                        @roninsightrx @TeunP @hiddevandebeek
+/crates/ferx-model/src/estimation/ @roninsightrx @TeunP @hiddevandebeek
+/crates/ferx-model/src/sens/       @roninsightrx @TeunP @hiddevandebeek
+/crates/ferx-model/src/stats/      @roninsightrx @TeunP @hiddevandebeek
+/crates/ferx-model/src/pk/         @roninsightrx @TeunP @hiddevandebeek
+/crates/ferx-model/src/ode/        @roninsightrx @TeunP @hiddevandebeek

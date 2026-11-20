@@ -272,7 +272,10 @@ group_fmt() {
 group_check() {
   CI_JOB="Check"
 
-  run cargo check --tests --no-default-features --features ci
+  # Both engine crates (#3041): `ferx-model` is a dependency of `ferx-core`, so a root-only
+  # `cargo check --tests` would compile its library but never its own unit tests. The two
+  # share feature names (ferx-core forwards each to ferx-model), so one feature list fits both.
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci
 
   # `tests/tte_convergence.rs` is gated on BOTH `survival` and `slow-tests`, and no
   # other per-PR job sets both — so those Tier-3 TTE tests compile in *neither*.
@@ -280,14 +283,14 @@ group_check() {
   # only breaks the nightly slow-tests run, decoupled from the offending PR.
   # Compile-only: the tests themselves stay nightly per the tier rules.
   # (#441 review finding #3.)
-  run cargo check --tests --no-default-features --features ci,survival,slow-tests
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci,survival,slow-tests
 
   # This is also what COMPILE-GATES the whole feature-gated surface. The
   # `Tests + coverage (TTE/CTMM endpoints)` job builds only the handful of endpoint
   # test binaries, so a break in any *other* file under `--features ci,markov`
   # (which implies `survival`) is caught here in ~1 min, rather than by an 18-min
   # instrumented build.
-  run cargo check --tests --no-default-features --features ci,markov
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci,markov
 
   # Same rationale for `nn`, with `slow-tests` folded in for the same reason as the
   # survival line — but the double-gated bodies are in `src/`, not `tests/`.
@@ -302,7 +305,7 @@ group_check() {
   # One cheap check covers the whole `nn` surface — `src/nn`, the `[covariate_nn]`
   # parser, the θ-gradient module, and every nn-gated test file. This is the exact
   # line that would have caught #1133's E0063, and #1446's E0425, before the push.
-  run cargo check --tests --no-default-features --features ci,nn,slow-tests
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci,nn,slow-tests
 
   # The workspace members (#1114). `-p` rather than `--workspace` so the `ferx-core`
   # targets above are not rebuilt, and the feature is package-qualified
@@ -387,7 +390,7 @@ group_clippy() {
   # local toolchain unless you have updated recently — one of those 6
   # (`EULER_GAMMA`, `src/stats/special.rs`) is invisible to an old clippy. Run
   # `rustup update nightly` before trusting a green result here.
-  run cargo clippy --no-default-features --features ci,markov,nn --all-targets -- -Dunused
+  run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci,markov,nn --all-targets -- -Dunused
 
   # The same gate on the feature set ferx-core SHIPS with (`default = []`, which is what
   # ferx-r builds). The line above cannot see it: `markov` implies `survival`, so an item
@@ -404,7 +407,18 @@ group_clippy() {
   # production helper that only a test calls still warns in ferx-r's build while this
   # line passes. ferx-r compiles the lib alone; so does this. Test code is linted by
   # the feature-rich `--all-targets` line above.
-  run cargo clippy --no-default-features --features ci --lib -- -Dunused
+  run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci --lib -- -Dunused
+
+  # The same no-dev-dependency `--lib` build on every feature ferx-core ships (#3041).
+  # ferx-core dev-depends on `ferx-model` with `test-support`, and cargo unifies that
+  # feature into any build that compiles a test target — every `check --tests` line, the
+  # `--all-targets` line above, every `cargo test`. Several ferx-model types are
+  # `#[non_exhaustive]` only when `test-support` is OFF (`WarningCode`, `AdaptiveRule`,
+  # `MixtureSpec`, …), so those builds all see them exhaustive: a wildcard-less match or a
+  # struct literal in ferx-core compiles there and fails with E0004/E0639 in ferx-r's
+  # build. The line above builds without dev-deps but on `ci` alone, so `markov`/`nn`-gated
+  # code would slip past it; this line is the one that sees it as ferx-r does.
+  run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci,markov,nn --lib -- -Dunused
 
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
@@ -486,7 +500,7 @@ group_rustdoc() {
   # `cargo doc` documents the library only — `#[cfg(test)]` modules and sibling
   # `*_tests.rs` files are not rustdoc'd, so a doc link in test code is not
   # gated. That is fine: it renders nowhere.
-  run env RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --no-default-features \
+  run env RUSTDOCFLAGS=-Dwarnings cargo doc -p ferx-core -p ferx-model --no-deps --no-default-features \
     --features ci,markov,nn
 
   # The members, for the same reason clippy checks them separately (#1114):
@@ -556,7 +570,7 @@ group_debug_assertions() {
   # `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS`, or a `--profile` that quietly reverted
   # to `ci-fast` would neuter it with every test still green. The canary is opt-in
   # precisely because every OTHER job legitimately runs with the guards off.
-  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib -p ferx-core -p ferx-model --profile ci-cov \
     --no-default-features --features ci
 
   # The feature-gated surface, for the same non-nesting reason `check` is a matrix
@@ -566,7 +580,7 @@ group_debug_assertions() {
   # were in every job before #1248. `markov` implies `survival`, so `ci,markov,nn`
   # is the union of the production cfgs — the same set `clippy` and `rustdoc` take,
   # and for the same reason. In CI this half is the endpoints coverage job.
-  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib -p ferx-core -p ferx-model --profile ci-cov \
     --no-default-features --features ci,markov,nn
 }
 
@@ -599,7 +613,7 @@ group_release_semantics() {
   # (`src/lib_tests.rs`). Without it the lane's value rests on `ci-fast` never
   # acquiring `debug-assertions`, and if it did this job would quietly become a
   # second copy of the coverage jobs with every test still green.
-  run env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-fast \
+  run env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo test --lib -p ferx-core -p ferx-model --profile ci-fast \
     --no-default-features --features ci,markov,nn
 }
 

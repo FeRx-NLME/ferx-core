@@ -17,13 +17,15 @@
 //!
 //! Wired to the public file-driven entry point [`crate::simulate_adaptive_from_spec`]
 //! in S2.3 (#391).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     dose_plan_violation, percent_step, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute,
-    AdaptiveRule, Comparison, ControllerCtx, ControllerDecision, DoseAction, DoseGrid,
-    DosePlanViolation, DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
+    AdaptiveRule, ControllerCtx, ControllerDecision, DoseAction, DoseGrid, DosePlanViolation,
+    DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
 };
 use crate::types::CompiledModel;
 
@@ -31,24 +33,6 @@ use crate::types::CompiledModel;
 /// `when signal <op> <value>` rules compare. The engine-side half declares its
 /// `observe` monitor under this same name so the two always agree.
 pub(crate) const ADAPTIVE_SIGNAL: &str = "signal";
-
-impl AdaptiveRule {
-    /// Does the observed `signal` satisfy this rule's comparison?
-    ///
-    /// `Eq` uses exact `f64` equality deliberately — it is the user-written
-    /// `signal == <value>` semantics; titrating on an exact equality is unusual
-    /// but it is what the rule says, not a tolerance we get to invent.
-    #[allow(clippy::float_cmp)]
-    fn matches(&self, signal: f64) -> bool {
-        match self.op {
-            Comparison::Lt => signal < self.threshold,
-            Comparison::Le => signal <= self.threshold,
-            Comparison::Gt => signal > self.threshold,
-            Comparison::Ge => signal >= self.threshold,
-            Comparison::Eq => signal == self.threshold,
-        }
-    }
-}
 
 /// A compiled, stateful controller for one `(subject, replicate)`.
 ///
@@ -189,6 +173,9 @@ impl AdaptiveController {
                 self.emit_dose(self.dose)
             }
             AdaptiveAction::Maintain => self.emit_dose(self.dose),
+            // `AdaptiveAction` is `#[non_exhaustive]` and defined in ferx-model (#3041); a new
+            // variant breaks the tripwire next to its definition, which points here.
+            _ => unreachable!("an `AdaptiveAction` this controller does not know"),
         }
     }
 
@@ -200,6 +187,8 @@ impl AdaptiveController {
         let rung = match step {
             IntervalStep::Lengthen => (self.rung + 1).min(ladder.len() - 1),
             IntervalStep::Shorten => self.rung.saturating_sub(1),
+            // Same tripwire as `apply` (ferx-model `sim::adaptive`, #3041).
+            _ => unreachable!("an `IntervalStep` this controller does not know"),
         };
         if rung == self.rung {
             return None;
@@ -609,6 +598,7 @@ pub(crate) fn compile_adaptive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::adaptive::Comparison;
     use crate::sim::adaptive::DoseStep;
     use std::collections::HashMap;
 

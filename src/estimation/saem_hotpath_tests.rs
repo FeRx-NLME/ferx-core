@@ -17,6 +17,8 @@
 //! prefix served for inputs it was not built at — and each one is mutation-
 //! tested against exactly that, by widening the soundness gate that currently
 //! keeps the unsound case out. The transcripts are in each test's doc comment.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::{cholesky_perturbation_into, mh_steps, run_saem, MhScratch, ScheduleCacheOff};
 use crate::estimation::inner_optimizer::build_schedule_cache;

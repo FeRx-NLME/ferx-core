@@ -9,6 +9,8 @@
 //! the CL in force in the first occasion backed out of the next decision's trough.
 //!
 //! Each test names the regression it exists to catch.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::diagnostics::EngineError;

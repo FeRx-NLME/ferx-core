@@ -43,6 +43,8 @@
 //! The levels are held through a **driver-local** template whose `theta_fixed` marks
 //! them, never through the fit's: `n_parameters`, BIC and `fixed:` in the output read the
 //! fit's template, where the levels are estimated parameters (#2103 review #9).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -565,7 +567,7 @@ impl ProfileLayout {
     pub(crate) fn build(
         model: &CompiledModel, population: &Population, template: &ModelParameters,
     ) -> Option<Self> {
-        let blocks = &model.indiv_param_partials.theta_blocks;
+        let blocks = &model.indiv_param_partials.theta_blocks();
         let active_levels = crate::levels::active_levels(model, population);
         if active_levels.is_empty() {
             return None;
@@ -583,7 +585,7 @@ impl ProfileLayout {
         let mut theta_sets: Vec<Vec<usize>> = vec![Vec::new(); n_subj];
         let mut raw: Vec<Vec<Raw>> = (0..n_subj).map(|_| Vec::new()).collect();
         for al in &active_levels {
-            let (di, decl) = blocks.decls.iter().enumerate().find(|(_, d)| d.name == al.block)?;
+            let (di, decl) = blocks.decls().iter().enumerate().find(|(_, d)| d.name == al.block)?;
             for (i, levels) in al.per_subject.iter().enumerate() {
                 let direct: Vec<usize> = levels
                     .iter()
@@ -637,7 +639,7 @@ impl ProfileLayout {
 
         // The θ of every block read through a logit link (#2111).
         let linked_theta: std::collections::HashSet<usize> = blocks
-            .decls
+            .decls()
             .iter()
             .filter(|d| d.linked)
             .flat_map(|d| d.spec.levels.iter())
@@ -714,7 +716,7 @@ impl ProfileLayout {
             })
             .collect();
         let mut boxes: std::collections::HashMap<usize, (f64, f64)> = Default::default();
-        for d in &blocks.decls {
+        for d in blocks.decls() {
             let Some(b) = d.profile_box else { continue };
             for r in &d.spec.levels {
                 if let LevelRule::Free(k) = *r {

@@ -5,6 +5,8 @@
 //!   * an identifier that *reads* like a random effect but was never declared is
 //!     still caught — the safety net that the removed parse-time
 //!     `No omega parameters defined` rejection used to provide.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 
