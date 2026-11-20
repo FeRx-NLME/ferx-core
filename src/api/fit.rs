@@ -145,6 +145,10 @@ fn tte_npde_skipped_warning(why: &EngineError) -> String {
 }
 
 #[cfg(test)]
+#[path = "tests/phase_release_tests.rs"]
+mod phase_release_tests;
+
+#[cfg(test)]
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
 mod dw_autocorrelation_warning_tests;
 
@@ -1688,6 +1692,10 @@ fn fit_inner(
     // The plans' keys read this fit's fingerprints instead of hashing per lookup.
     let _prints =
         crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
+    // The fit's last phase boundary (#3077): whatever the last plan consumer is — the settle
+    // check applies to integrated models only — the plans and every worker's caches go here,
+    // before the registration above ends the scope.
+    let _release_last_phase = crate::parser::model_parser::rhs_regcode::kernel_jit::ReleaseOnDrop;
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and

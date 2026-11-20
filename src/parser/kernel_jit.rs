@@ -2954,6 +2954,34 @@ pub(crate) fn release_fit_plans() {
     crate::pool::release_pool_thread_caches();
 }
 
+/// [`release_fit_plans`] when dropped: the fit's last phase boundary, whatever its last plan
+/// consumer was and on every return path. Declared after the fit's registration ([`register`]),
+/// so it drops first, while the thread still runs the fit. Ending the scope ([`drop_scope`])
+/// prunes the shared maps but reaches no worker, whose `LAST` entry and buffers would otherwise
+/// outlive the fit on a cached pool. Not while unwinding: a panic leaves the caches to the
+/// scope's end.
+pub(crate) struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            release_fit_plans();
+        }
+    }
+}
+
+/// How many cached buffers and plan handles this thread holds (test seam): the pass pool,
+/// `LAST`, the hot table's entries and the ODE loop's pools.
+#[cfg(test)]
+pub(crate) fn thread_cache_count() -> usize {
+    POOL.with(|p| p.borrow().len())
+        + LAST.with(|l| usize::from(l.borrow().is_some()))
+        + HOT.with(|h| h.borrow().filled.len())
+        + BUF.with(|b| usize::from(!b.borrow().is_empty()))
+        + VBUF.with(|b| usize::from(!b.borrow().is_empty()))
+        + ode_loop::pooled_buffers()
+}
+
 /// Drop this thread's cached buffers and plan handles: the pass buffers (`BUF`, `VBUF`, `ADJ`,
 /// the pool [`take`] serves), the ODE loop's slot buffers and run logs, and the last-subject and
 /// hot lookup entries, which hold plans. Each is a cache its next user refills. A cell borrowed
