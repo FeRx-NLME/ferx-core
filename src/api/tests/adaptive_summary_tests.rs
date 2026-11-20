@@ -289,6 +289,126 @@ fn bad_probabilities_and_thresholds_are_refused() {
     );
 }
 
+/// Review r1 row 2: the signal rows read `latent`, not the assay-noised `value` the
+/// controller saw (#946 PR1.5).
+///
+/// Mutation: the producer pushing `s.value`.
+#[test]
+fn the_signal_rows_read_the_latent_value_not_the_noised_reading() {
+    let mut d = decision(1, 1, "1", 0, 4.0);
+    d.observed_signals[0].value = 9.0;
+    d.observed_signals[0].mode = ObserveMode::Dv;
+    let s = summary(&result_of(vec![metrics_row(1, 1, "1", 0.0)], vec![d]), &Default::default());
+    let at = M::Signal { analyte: "A".into(), decision_idx: 0 };
+    assert_eq!(row(&s, &at, S::Mean, 1).value, Some(4.0));
+}
+
+/// Review r1 row 3: non-default probabilities reach both the band and the interval, and
+/// are reported with them. At `[0.1, 0.5, 0.9]` the outer levels need 9 values.
+///
+/// Mutation: `opts.probs` replaced by the default.
+#[test]
+fn non_default_probabilities_reach_the_band_and_the_interval() {
+    let probs = [0.1, 0.5, 0.9];
+    let opts = AdaptiveSummaryOptions { probs, ..Default::default() };
+    let rows = (1..=9).map(|d| metrics_row(d, 1, "1", d as f64)).collect();
+    let s = summary(&result_of(rows, vec![]), &opts);
+    let v: Vec<f64> = (1..=9).map(f64::from).collect();
+    let want = probs.map(|p| Some(type7(&v, p)));
+    match band(&s, &M::CumulativeDose, S::Mean).status {
+        AdaptiveBandStatus::Quantiles(q) => assert_eq!((q.probs, q.values), (probs, want)),
+        AdaptiveBandStatus::NotDrawn => panic!("nine draws"),
+    }
+    let q = pi(&s, &M::CumulativeDose).quantiles;
+    assert_eq!((q.probs, q.values), (probs, want));
+}
+
+/// Review r1 rows 4 and 9: a draw in which no run carries the metric is counted in
+/// `n_draws_missing`, and a band over a run with several draws is `Quantiles` even when
+/// only one draw carries the metric: `NotDrawn` describes the run, not the metric.
+///
+/// Mutations: `n_draws_missing` fixed at 0; the status gated on draws present.
+#[test]
+fn a_draw_without_the_metric_is_counted_and_the_band_follows_the_run() {
+    let mut rows = vec![metrics_row(1, 1, "1", 0.0), metrics_row(2, 1, "1", 0.0)];
+    rows[0].signal_mean = Some(5.0);
+    let s = summary(&result_of(rows, vec![]), &Default::default());
+    let b = band(&s, &M::SignalMean, S::Mean);
+    assert_eq!((b.n_draws_present, b.n_draws_missing), (1, 1));
+    assert_eq!(band_values(b), [None, Some(5.0), None]);
+    assert_eq!(row(&s, &M::SignalMean, S::Mean, 2).value, None);
+}
+
+/// Review r1 row 5: each metric reads its own field. One row with a distinct value in all
+/// twelve, so a swapped arm shows. `Signal` is not a field of the metrics row.
+///
+/// Mutations: any two arms of `AdaptiveSummaryMetric::value` swapped or misread.
+#[test]
+fn each_metric_reads_its_own_field() {
+    let mut m = metrics_row(1, 1, "1", 1.0);
+    m.n_doses = 2;
+    m.n_increases = 3;
+    m.n_decreases = 4;
+    m.n_holds = 5;
+    m.n_not_due = 6;
+    m.discontinued = true;
+    m.signal_min = Some(8.0);
+    m.signal_max = Some(9.0);
+    m.signal_mean = Some(10.0);
+    m.pct_readings_in_window = Some(0.11);
+    m.auc_target_attainment = Some(0.12);
+    let s = summary(&result_of(vec![m.clone()], vec![]), &Default::default());
+    let want = [
+        (M::CumulativeDose, 1.0),
+        (M::NDoses, 2.0),
+        (M::NIncreases, 3.0),
+        (M::NDecreases, 4.0),
+        (M::NHolds, 5.0),
+        (M::NNotDue, 6.0),
+        (M::Discontinued, 1.0),
+        (M::SignalMin, 8.0),
+        (M::SignalMax, 9.0),
+        (M::SignalMean, 10.0),
+        (M::PctReadingsInWindow, 0.11),
+        (M::AucTargetAttainment, 0.12),
+    ];
+    for (metric, v) in want {
+        assert_eq!(row(&s, &metric, S::Mean, 1).value, Some(v), "{metric:?}");
+    }
+    assert_eq!(M::Signal { analyte: "A".into(), decision_idx: 0 }.value(&m), None);
+}
+
+/// Review r1 rows 6 and 10: a threshold on a `Signal` no decision recorded (a misspelt
+/// analyte, a `decision_idx` past the schedule) still gives rows, with `value = None`; and a
+/// repeated threshold gives one set of rows, so a pivot on `(metric, statistic, draw)` keys
+/// stays unique.
+///
+/// Mutations: the threshold metrics not seeded (no rows); the dedup removed (two rows).
+#[test]
+fn signal_thresholds_with_no_reading_give_rows_and_repeats_give_one() {
+    let typo = M::Signal { analyte: "a".into(), decision_idx: 0 };
+    let opts = AdaptiveSummaryOptions {
+        thresholds: vec![(typo.clone(), 1.0), (M::NDoses, 1.0), (M::NDoses, 1.0)],
+        ..Default::default()
+    };
+    let r = result_of(vec![metrics_row(1, 1, "1", 0.0)], vec![decision(1, 1, "1", 0, 4.0)]);
+    let s = summary(&r, &opts);
+    let t = row(&s, &typo, S::FractionAtLeast(1.0), 1);
+    assert_eq!((t.value, t.n_runs, t.n_missing), (None, 1, 1));
+    let n = s
+        .rows
+        .iter()
+        .filter(|r| r.metric == M::NDoses && r.statistic == S::FractionAtLeast(1.0))
+        .count();
+    assert_eq!(n, 1);
+    let n = s
+        .bands
+        .iter()
+        .filter(|b| b.metric == M::NDoses && b.statistic == S::FractionAtLeast(1.0))
+        .count();
+    assert_eq!(n, 1);
+}
+
 // ── engine fixtures ────────────────────────────────────────────────────────────────────
 
 /// A 1-cpt IV ODE; the cmt-1 monitor reads the central **amount**.
@@ -357,6 +477,39 @@ fn run(model: &CompiledModel, n_sub: usize, n_sim: usize) -> AdaptiveSimulationR
     .expect("runs")
 }
 
+/// Review r1 row 1: two monitors with one name are refused by the run, whole text. Signals
+/// are keyed by name, so the controller would read only the last, and the summary would
+/// count each run twice (`n_runs − present` underflows). The straddle: two names run, and
+/// each analyte is summarised once per run.
+///
+/// Mutation: the driver's check deleted (the run succeeds and the summary panics).
+#[test]
+fn two_monitors_with_one_name_are_refused_and_two_names_summarise_once() {
+    let m = model("omega ETA_CL ~ 0.09");
+    let pop = population(vec![subj("1", vec![6.0], vec![])]);
+    let run = |names: [&str; 2]| {
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(946),
+            decision_times: DECISIONS.to_vec(),
+            monitors: names.map(|n| MonitorSpec::new(n, 1, ObserveMode::Ipred)).to_vec(),
+            ..Default::default()
+        };
+        simulate_adaptive(&m, &pop, &m.default_params, 1, fixed_bolus, &opts)
+    };
+    let e = run(["A", "A"]).expect_err("refused");
+    assert_eq!(e.diagnostic().map(|d| d.code.as_str()), Some("E_ADAPTIVE_OPTIONS"));
+    assert!(
+        e.to_string().contains("two monitors are named 'A'; give each monitor its own name"),
+        "{e}"
+    );
+    let s = summary(&run(["A", "B"]).expect("runs"), &Default::default());
+    for analyte in ["A", "B"] {
+        let at = M::Signal { analyte: analyte.into(), decision_idx: 1 };
+        let r = row(&s, &at, S::Mean, 1);
+        assert_eq!((r.n_runs, r.n_missing), (1, 0), "{analyte}");
+    }
+}
+
 /// The pre-dose amounts at t = 0, 24, 48 of 100 every 24 h with `k = CL / V`.
 fn readings(k: f64) -> [f64; 3] {
     let e = (-24.0 * k).exp();
@@ -409,7 +562,7 @@ fn band_equals_type7_quantiles_of_the_per_draw_closed_forms() {
             per_draw.push(want);
         }
         let b = band(&s, metric, S::Mean);
-        assert_eq!((b.n_draws, b.n_draws_missing), (N_DRAWS, 0));
+        assert_eq!((b.n_draws_present, b.n_draws_missing), (N_DRAWS, 0));
         let got = band_values(b);
         for (k, p) in [0.05, 0.5, 0.95].into_iter().enumerate() {
             let want = type7(&per_draw, p);
@@ -467,10 +620,11 @@ fn band_and_prediction_interval_differ_when_patients_vary() {
     assert!(pi_w > 1.5 * band_w, "interval width {pi_w} vs band width {band_w}");
 }
 
-/// Without uncertainty (D = 1) the band is `NotDrawn` and rows and intervals are present;
-/// summarising leaves the result untouched, so no trajectory, ledger row or decision moves.
+/// Without uncertainty (D = 1) the band is `NotDrawn` and rows and intervals are present.
+/// The result is only borrowed, so the type system already forbids writing back; the
+/// `Debug` comparison below records that, it cannot fail on its own.
 ///
-/// Mutations: a band at D = 1; the summary writing back into the result.
+/// Mutation: a band at D = 1.
 #[test]
 fn without_uncertainty_there_is_no_band_and_the_run_is_unchanged() {
     let m = model("omega ETA_CL ~ 0.09");

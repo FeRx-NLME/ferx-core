@@ -950,8 +950,9 @@ the bit).
 
 `summarize_adaptive(&result, &AdaptiveSummaryOptions::default())` turns a run's
 `metrics` and `decisions` rows into three tables
-([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)). It reads the result and
-changes nothing in it, so the same run can be summarised again with other options.
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)). It only borrows the
+result, so it cannot change it, and the same run can be summarised again with other
+options.
 
 | Table | One entry per | What it holds |
 |---|---|---|
@@ -964,8 +965,8 @@ the latent signal of every monitored analyte at each `decision_idx`.
 `time_to_discontinuation` is left out: it is censored, and `discontinued` covers it.
 Every metric gets a `Mean` and a `Median`. `AdaptiveSummaryOptions::thresholds` adds a
 `FractionAtLeast(a)` row, e.g. `(PctReadingsInWindow, 0.8)` for the fraction of
-patients in the window at least 80 % of the time; there is none by default. The mean of
-`Discontinued` is the fraction discontinued.
+patients with at least 80 % of their decision readings in the window; there is none by
+default. The mean of `Discontinued` is the fraction discontinued.
 
 #### How runs are pooled
 
@@ -974,6 +975,9 @@ patients in the window at least 80 % of the time; there is none by default. The 
 - A run that carries no value for a metric, such as `pct_readings_in_window` without a
   `target_window` or the signal at a decision after a `Stop`, is skipped and counted in
   `n_missing`, never imputed. A metric no run carries has `value = None`.
+- Every statistic, `FractionAtLeast` included, is over the runs that carry the value
+  (`n_runs − n_missing`). For the signal at a decision after some runs stopped, it is a
+  statistic of the runs still going at that decision.
 - A non-finite value makes every statistic, band and interval it enters `NaN`.
 
 #### Band versus prediction interval

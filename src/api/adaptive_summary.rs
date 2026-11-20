@@ -91,7 +91,7 @@ const SCALAR_METRICS: [AdaptiveSummaryMetric; 12] = [
 impl AdaptiveSummaryMetric {
     /// This metric's value in one run's metrics row; `None` where the run carries none.
     /// The only mapping from a metric to its field. `Signal` is not a field of the row.
-    fn value(&self, m: &AdaptiveSubjectMetrics) -> Option<f64> {
+    pub(crate) fn value(&self, m: &AdaptiveSubjectMetrics) -> Option<f64> {
         use AdaptiveSummaryMetric::*;
         match self {
             CumulativeDose => Some(m.cumulative_dose),
@@ -134,8 +134,9 @@ pub struct AdaptiveSummaryOptions {
     pub probs: [f64; 3],
     /// `(metric, a)`: add a `FractionAtLeast(a)` row for `metric`, e.g.
     /// `(PctReadingsInWindow, 0.8)`. Empty by default: a threshold has no meaning without
-    /// the target the run was scored against. A threshold on a metric no run carries gives
-    /// rows with `value = None`, not an error.
+    /// the target the run was scored against. A threshold on a metric no run carries,
+    /// including a `Signal` at an analyte or `decision_idx` no decision recorded, gives rows
+    /// with `value = None`, not an error. A repeated `(metric, a)` gives one set of rows.
     pub thresholds: Vec<(AdaptiveSummaryMetric, f64)>,
 }
 
@@ -180,7 +181,9 @@ pub struct AdaptiveSummaryRow {
 #[non_exhaustive]
 pub enum AdaptiveBandStatus {
     /// The run has one parameter draw (no uncertainty, or `n_draws = 1`): there is no
-    /// spread across draws to describe. Never reported as a zero-width band.
+    /// spread across draws to describe. Never reported as a zero-width band. It describes the
+    /// run, not the metric: in a run with several draws a metric present in only one of them
+    /// gets `Quantiles`, whose levels follow the per-level count rule on that one value.
     NotDrawn,
     /// The quantiles across draws of the per-draw statistic.
     Quantiles(AdaptiveQuantiles),
@@ -197,9 +200,10 @@ pub struct AdaptiveSummaryBand {
     pub metric: AdaptiveSummaryMetric,
     /// The per-draw statistic the band is over.
     pub statistic: AdaptiveSummaryStatistic,
-    /// Draws whose statistic has a value (the band's sample size).
-    pub n_draws: usize,
-    /// Draws in which no run carries the metric (skipped, never imputed).
+    /// Draws whose statistic has a value: the band's sample size.
+    pub n_draws_present: usize,
+    /// Draws in which no run carries the metric (skipped, never imputed). With
+    /// `n_draws_present` it sums to [`AdaptivePopulationSummary::n_draws`].
     pub n_draws_missing: usize,
     /// The band, or why there is none.
     pub status: AdaptiveBandStatus,
@@ -244,7 +248,9 @@ pub struct AdaptivePopulationSummary {
 /// Every metric of [`AdaptiveSummaryMetric`] gets a `Mean` and a `Median` row per draw,
 /// and a `FractionAtLeast` row per requested threshold; every analyte the decisions
 /// recorded gets the same at each `decision_idx`. A supplied-η subject
-/// ([`super::AdaptiveInputs::with_etas`]) is summarised like any other run.
+/// ([`super::AdaptiveInputs::with_etas`]) is summarised like any other run. The result is
+/// only borrowed (`&`), so summarising cannot change a trajectory, a ledger row or a
+/// decision.
 ///
 /// # Errors
 ///
@@ -288,6 +294,16 @@ pub fn summarize_adaptive(
         }
     }
 
+    for (m, _) in &opts.thresholds {
+        values.entry(m.clone()).or_default();
+    }
+    let mut thresholds: Vec<(&AdaptiveSummaryMetric, f64)> = Vec::new();
+    for (m, a) in &opts.thresholds {
+        if !thresholds.iter().any(|(tm, ta)| *tm == m && ta.to_bits() == a.to_bits()) {
+            thresholds.push((m, *a));
+        }
+    }
+
     let probs = opts.probs;
     let need = probs.map(min_n_for_prob);
     let quantiles = |vals: &mut Vec<f64>| AdaptiveQuantiles {
@@ -305,9 +321,9 @@ pub fn summarize_adaptive(
     for (metric, by_draw) in &values {
         let mut stats = vec![AdaptiveSummaryStatistic::Mean, AdaptiveSummaryStatistic::Median];
         stats.extend(
-            opts.thresholds
+            thresholds
                 .iter()
-                .filter(|(m, _)| m == metric)
+                .filter(|(m, _)| *m == metric)
                 .map(|&(_, a)| AdaptiveSummaryStatistic::FractionAtLeast(a)),
         );
         for &statistic in &stats {
@@ -322,14 +338,14 @@ pub fn summarize_adaptive(
                     statistic,
                     value,
                     n_runs,
-                    n_missing: n_runs - vals.len(),
+                    n_missing: missing(n_runs, vals.len()),
                 });
             }
             let n_draws_present = across.len();
             out.bands.push(AdaptiveSummaryBand {
                 metric: metric.clone(),
                 statistic,
-                n_draws: n_draws_present,
+                n_draws_present,
                 n_draws_missing: n_draws - n_draws_present,
                 status: if n_draws > 1 {
                     AdaptiveBandStatus::Quantiles(quantiles(&mut across))
@@ -344,10 +360,17 @@ pub fn summarize_adaptive(
             metric: metric.clone(),
             quantiles: quantiles(&mut pooled),
             n_runs: total_runs,
-            n_missing: total_runs - n_present,
+            n_missing: missing(total_runs, n_present),
         });
     }
     Ok(out)
+}
+
+/// Runs that carry no value. At most one value per run is an engine invariant (one
+/// metrics row per run, and the driver refuses two monitors with one name), so a larger
+/// count is a defect: it panics in release too, rather than wrapping into a huge count.
+fn missing(n_runs: usize, present: usize) -> usize {
+    n_runs.checked_sub(present).expect("more values than runs: one analyte recorded twice")
 }
 
 /// One statistic over the values one draw's runs carry; `None` if there are none. A

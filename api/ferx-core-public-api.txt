@@ -78,8 +78,8 @@ pub ferx_core::api::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx
 pub ferx_core::api::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSummaryBand
 pub ferx_core::api::AdaptiveSummaryBand::metric: ferx_core::AdaptiveSummaryMetric
-pub ferx_core::api::AdaptiveSummaryBand::n_draws: usize
 pub ferx_core::api::AdaptiveSummaryBand::n_draws_missing: usize
+pub ferx_core::api::AdaptiveSummaryBand::n_draws_present: usize
 pub ferx_core::api::AdaptiveSummaryBand::statistic: ferx_core::AdaptiveSummaryStatistic
 pub ferx_core::api::AdaptiveSummaryBand::status: ferx_core::AdaptiveBandStatus
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSummaryOptions
@@ -4778,8 +4778,8 @@ pub ferx_core::AdaptiveSubjectMetrics::subject: alloc::string::String
 pub ferx_core::AdaptiveSubjectMetrics::time_to_discontinuation: core::option::Option<f64>
 #[non_exhaustive] pub struct ferx_core::AdaptiveSummaryBand
 pub ferx_core::AdaptiveSummaryBand::metric: ferx_core::AdaptiveSummaryMetric
-pub ferx_core::AdaptiveSummaryBand::n_draws: usize
 pub ferx_core::AdaptiveSummaryBand::n_draws_missing: usize
+pub ferx_core::AdaptiveSummaryBand::n_draws_present: usize
 pub ferx_core::AdaptiveSummaryBand::statistic: ferx_core::AdaptiveSummaryStatistic
 pub ferx_core::AdaptiveSummaryBand::status: ferx_core::AdaptiveBandStatus
 #[non_exhaustive] pub struct ferx_core::AdaptiveSummaryOptions

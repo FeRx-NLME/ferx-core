@@ -174,8 +174,9 @@ impl Default for AdaptiveSimulateOptions {
 /// returned as one verified unit so a caller can never pair a trajectory with
 /// the wrong ledger. All three are long-form rows tagged by `(draw, sim, id)`.
 ///
-/// `#[non_exhaustive]`: the remaining Part-D artifacts (population summary, run
-/// manifest) land as added fields without breaking callers who receive this struct.
+/// `#[non_exhaustive]`: the remaining Part-D artifacts (a run manifest) land as added
+/// fields without breaking callers who receive this struct. The population summary is
+/// not a field: [`super::summarize_adaptive`] computes it from this result.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AdaptiveSimulationResult {
@@ -193,8 +194,8 @@ pub struct AdaptiveSimulationResult {
     /// draw, sim)` run — cumulative dose, dose-change / hold / discontinuation
     /// counts, the signal summary (on the latent signal, #946), and `pct_readings_in_window` when the block
     /// declares a `target_window`. Derived from `ledger` + `decisions` alone (no
-    /// re-integration). The population summary *with bands* rides with the
-    /// uncertainty slice (S5), where bands carry meaning.
+    /// re-integration). The population summary with bands across parameter draws is
+    /// [`super::summarize_adaptive`].
     pub metrics: Vec<AdaptiveSubjectMetrics>,
     /// The parameter sets of a run with parameter uncertainty
     /// ([`AdaptiveInputs::with_uncertainty`], #946): one per draw, in draw order, the θ,
@@ -1088,8 +1089,16 @@ where
     if let Some(d) = opts.start_interval {
         check_start_interval(decision_times, d).map_err(crate::entry_refusals::adaptive_options)?;
     }
-    for am in monitors {
+    for (k, am) in monitors.iter().enumerate() {
         let m = am.spec;
+        // Signals are keyed by name: with two monitors of one name the controller reads only
+        // the last (`ControllerCtx::signals` is a map), and the summary counts each run twice.
+        if monitors[..k].iter().any(|o| o.spec.name == m.name) {
+            return Err(crate::entry_refusals::adaptive_options(format!(
+                "two monitors are named '{}'; give each monitor its own name",
+                m.name
+            )));
+        }
         if m.cmt == 0 || m.cmt > ode.n_states {
             return Err(crate::entry_refusals::adaptive_options(format!(
                 "monitor '{}' observes compartment {} but the model has {} state(s)",
