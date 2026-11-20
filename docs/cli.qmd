@@ -362,7 +362,17 @@ command-line order:
 - **Estimates** — `estimates`, the name-keyed layout of the fit YAML / JSON
   (`estimates.theta.CL.estimate`, with `se` and `rse_pct`; Ω `variance`,
   `cv_pct` and off-diagonal `correlation`; `omega_iov` for κ; σ), with
-  `fixed: true` on a FIX parameter; and `error_model`.
+  `fixed: true` on a FIX parameter; and `error_model`. Like the text table,
+  `estimates.theta` leaves out the coefficients of a compact θ block (20 or more
+  levels) and `[covariate_nn]` weights, so every θ is also given by position in
+  `theta`, `theta_names`, `theta_fixed` and `se_theta`, with `held_at_bound`
+  naming coordinates held on a bound (no SE) and `profiled_blocks` the blocks
+  declared `profile`.
+- **θ blocks** — `theta_blocks`, keyed by block name, the `--- THETA BLOCKS ---`
+  rows: `n_free_coefficients`, `n_fixed_coefficients`, `profiled`, `min`,
+  `median`, `max` (over every coefficient, FIX included), and `theta_start` /
+  `theta_end`, the half-open index range of the block's coefficients in `theta`.
+  `{}` for a fit without one.
 - **Diagnostics** — `covariance_status`, `covariance_method`,
   `cov_condition_number`, and `shrinkage_eta`, `shrinkage_kappa`,
   `shrinkage_kappa_by_occ`, `shrinkage_eps` as **fractions** (not percent),

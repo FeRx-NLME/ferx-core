@@ -40,6 +40,17 @@ pub(crate) const RUN_KEYS: &[&str] = &[
     // Parameter estimates (θ with SE / %RSE, Ω with CV% and correlations, κ, σ;
     // FIX flagged), in the fit YAML/JSON's name-keyed layout.
     "estimates",
+    // Every θ, by position: `estimates.theta` leaves out the coefficients of a
+    // compact θ block (20+ levels, summarized under `theta_blocks`) and
+    // `[covariate_nn]` weights, as the text table does; these vectors carry them.
+    "theta",
+    "theta_names",
+    "theta_fixed",
+    "se_theta",
+    // Coordinates the covariance step held on a bound (no SE although `se_theta`
+    // may carry a number for them), and the θ blocks declared `profile`.
+    "held_at_bound",
+    "profiled_blocks",
     "error_model",
     // Diagnostics. Shrinkages are fractions, indexed like `eta_names` /
     // `kappa_names`.
@@ -80,12 +91,49 @@ fn run_object(entry: &SummaryEntry<'_>) -> Map<String, Value> {
                 // here, so every run object carries the same keys.
                 run.insert((*key).into(), full.get(*key).cloned().unwrap_or(Value::Null));
             }
+            run.insert("theta_blocks".into(), theta_blocks(fit));
         }
         Err(e) => {
             run.insert("error".into(), json!(e));
         }
     }
     run
+}
+
+/// A finite float as JSON, else `null` (the fit JSON's convention).
+fn num(v: f64) -> Value {
+    serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number)
+}
+
+/// The compact θ blocks (`ferx_core::io::output::compact_theta_blocks`, 20+
+/// coefficients) the text summary reports under `--- THETA BLOCKS ---` instead of
+/// row by row, keyed by block name: the same free / FIX counts, `profiled` flag
+/// and min / median / max (`block_summary`, over every coefficient, FIX included),
+/// plus `theta_start` / `theta_end` — the half-open index range of the block's
+/// coefficients in `theta` / `theta_names` / `theta_fixed` / `se_theta`, so every
+/// coefficient is reachable. `{}` when the fit has none.
+fn theta_blocks(fit: &ferx_core::FitResult) -> Value {
+    let mut blocks = Map::new();
+    for (block, range) in ferx_core::io::output::compact_theta_blocks(&fit.theta_names) {
+        let n_fixed =
+            range.clone().filter(|&i| fit.theta_fixed.get(i).copied().unwrap_or(false)).count();
+        let (min, median, max) = ferx_core::io::output::block_summary(&fit.theta[range.clone()]);
+        let profiled = fit.profiled_blocks.contains(&block);
+        blocks.insert(
+            block,
+            json!({
+                "n_free_coefficients": range.len() - n_fixed,
+                "n_fixed_coefficients": n_fixed,
+                "profiled": profiled,
+                "min": num(min),
+                "median": num(median),
+                "max": num(max),
+                "theta_start": range.start,
+                "theta_end": range.end,
+            }),
+        );
+    }
+    Value::Object(blocks)
 }
 
 /// The whole document: `schema_version`, `fit_schema_version` (the fit JSON
@@ -251,6 +299,59 @@ mod tests {
         let last_name = fit.theta_names.last().unwrap();
         assert!(text.contains(&format!("{last_name} [FIX]")), "{text}");
         assert_eq!(est["theta"][last_name]["fixed"], true);
+    }
+
+    /// A compact θ block (20+ levels) is summarized, not listed, by the text and by
+    /// `estimates.theta`; the JSON must still carry its summary row and every
+    /// coefficient (review of #3074).
+    #[test]
+    fn compact_theta_blocks_are_summarized_and_every_coefficient_is_reachable() {
+        let mut fit = populated_fit();
+        let n_scalar = fit.theta.len();
+        let n_block = ferx_core::io::output::THETA_BLOCK_COMPACT_MIN + 1;
+        for k in 0..n_block {
+            fit.theta_names.push(format!("PBO[{}]", k + 1));
+            fit.theta.push(0.5 + k as f64);
+            fit.theta_fixed.push(k == 0);
+            fit.se_theta.as_mut().unwrap().push(0.01);
+        }
+        fit.profiled_blocks = vec!["PBO".to_string()];
+        let text = ferx_core::io::output::format_summary(&fit);
+        assert!(text.contains("--- THETA BLOCKS ---") && text.contains("PBO"), "{text}");
+        let doc = one(&fit);
+        let run = &doc["runs"][0];
+        // Not row by row in `estimates.theta`, as in the text table …
+        assert!(run["estimates"]["theta"].get("PBO[1]").is_none());
+        // … but the block's summary row, with the text's counts and statistics.
+        let b = &run["theta_blocks"]["PBO"];
+        assert_eq!(b["n_free_coefficients"], n_block - 1, "{b}");
+        assert_eq!(b["n_fixed_coefficients"], 1);
+        assert_eq!(b["profiled"], true);
+        assert!(text.contains(&format!("{} free, 1 FIX coefficients", n_block - 1)), "{text}");
+        assert!(text.contains("profiled (not searched)"), "{text}");
+        assert_eq!(b["min"].as_f64(), Some(0.5));
+        assert_eq!(b["median"].as_f64(), Some(0.5 + ((n_block - 1) / 2) as f64));
+        assert_eq!(b["max"].as_f64(), Some(0.5 + (n_block - 1) as f64));
+        // Every coefficient, through the block's index range into the θ vectors.
+        let (start, end) = (b["theta_start"].as_u64().unwrap(), b["theta_end"].as_u64().unwrap());
+        assert_eq!((start as usize, end as usize), (n_scalar, n_scalar + n_block));
+        let names = run["theta_names"].as_array().unwrap();
+        let theta = run["theta"].as_array().unwrap();
+        for (k, i) in (start as usize..end as usize).enumerate() {
+            assert_eq!(names[i], format!("PBO[{}]", k + 1));
+            assert_eq!(theta[i].as_f64(), Some(0.5 + k as f64));
+        }
+        assert_eq!(run["theta_fixed"][n_scalar], true);
+        assert_eq!(run["se_theta"][n_scalar + 1].as_f64(), Some(0.01));
+        assert_eq!(run["profiled_blocks"][0], "PBO");
+    }
+
+    #[test]
+    fn a_fit_without_compact_blocks_has_an_empty_theta_blocks_object() {
+        let fit = populated_fit();
+        let run = &one(&fit)["runs"][0];
+        assert_eq!(run["theta_blocks"], serde_json::json!({}));
+        assert_eq!(run["theta"].as_array().unwrap().len(), fit.theta.len());
     }
 
     #[test]
