@@ -1107,6 +1107,8 @@ fn information_scope_gap(model: &CompiledModel) -> Option<&'static str> {
     None
 }
 
+/// Returns the realised change, so a caller can re-centre other η sets with it.
+///
 /// One mu-referenced θ's closed-form SAEM shift: moves the packed θ by `γ·mean(η)` on its
 /// mu scale, clamped to its packed `bounds`, then re-centres every η — the current draw and
 /// the extra draws — by the change it **realised**. Not by `γ·mean(η)`: when the clamp bites
@@ -1118,7 +1120,7 @@ fn information_scope_gap(model: &CompiledModel) -> Option<&'static str> {
 fn closed_form_mu_shift(
     packed: &mut f64, bounds: (f64, f64), packs_log: bool, additive: bool, gamma: f64,
     etas: &mut [Vec<f64>], extra_eta_draws: &mut [Vec<Vec<f64>>], eta_idx: usize,
-) {
+) -> f64 {
     let (lo, hi) = bounds;
     let mean_eta: f64 = etas.iter().map(|e| e[eta_idx]).sum::<f64>() / etas.len() as f64;
     let before_packed = *packed;
@@ -1137,6 +1139,7 @@ fn closed_form_mu_shift(
         e[eta_idx] -= delta;
     }
     recentre_eta_draws(extra_eta_draws, eta_idx, delta);
+    delta
 }
 
 /// Apply the same re-centring a closed-form mu-reference shift makes to
@@ -6330,6 +6333,11 @@ pub fn run_saem(
     // (see `recentre_eta_draws`), or a stored draw stops describing the same
     // individual parameters it was drawn for.
     let mut extra_eta_draws: Vec<Vec<Vec<f64>>> = Vec::new();
+    // The covariate mu-reference groups' sufficient statistic (#2986): each chain-subject's
+    // η averaged with the SA step, re-centred with the draws whenever a mu-referenced θ moves,
+    // so `φ̄ = μ(θ) + η̄` is the SA-averaged individual parameter at every θ. An exact group
+    // solves on it, the textbook SAEM M-step, instead of blending per-draw solutions.
+    let mut eta_bar: Vec<Vec<f64>> = Vec::new();
 
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
@@ -7424,6 +7432,19 @@ pub fn run_saem(
         }
         state.steps_since_adapt += 1;
 
+        // ---- Step 1c: the covariate mu-reference statistic η̄ (#2986) ----
+        if !cov_mu_groups.is_empty() {
+            if eta_bar.len() != state.etas.len() {
+                eta_bar = state.etas.clone();
+            } else {
+                for (b, e) in eta_bar.iter_mut().zip(&state.etas) {
+                    for (bj, ej) in b.iter_mut().zip(e) {
+                        *bj += gamma * (ej - *bj);
+                    }
+                }
+            }
+        }
+
         // ---- Step 2: SA update of sufficient statistic for Omega ----
         // #904: re-center the iiv_on_ruv η to zero mean, absorbing the shift into
         // the residual σ. `Y = f + EPS·exp(η_RUV)` has no typical-value θ, so —
@@ -7673,7 +7694,7 @@ pub fn run_saem(
                     if init_params.theta_fixed.get(theta_idx).copied().unwrap_or(false) {
                         continue;
                     }
-                    closed_form_mu_shift(
+                    let delta = closed_form_mu_shift(
                         &mut log_theta[theta_idx],
                         (log_theta_lower[theta_idx], log_theta_upper[theta_idx]),
                         theta_packs_log_mask[theta_idx],
@@ -7683,6 +7704,10 @@ pub fn run_saem(
                         &mut extra_eta_draws,
                         eta_idx,
                     );
+                    // The covariate groups' η̄ follows the same re-centring.
+                    for e in eta_bar.iter_mut() {
+                        e[eta_idx] -= delta;
+                    }
 
                     // Pin so NLopt leaves the closed-form value unchanged.
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
@@ -7692,8 +7717,11 @@ pub fn run_saem(
                 // ---- Covariate mu-reference groups (#619): φ-frozen M-step ----
                 // Exact (Gauss–Newton on the prior term) when the group's
                 // covariates are time-constant, prior + data (BOBYQA) when one
-                // varies within a subject. The result is blended with the same
-                // SA step `gamma` as the shift above, then each subject's eta is
+                // varies within a subject. An exact group solves on the SA-averaged
+                // η̄ (#2986) and takes the solution as is — the SA step is in the
+                // statistic, as for every other one; a numerical group (its data term
+                // reads this draw) blends its solution with the same SA step `gamma`
+                // as the shift above. Then each subject's eta, the draws and η̄ are
                 // re-centred by the realised change in its own mu so that
                 // `φ_i = g(A_i(θ)) + η_i` is unchanged — the per-subject twin of
                 // the `e[eta_idx] -= delta` above.
@@ -7721,7 +7749,11 @@ pub fn run_saem(
                                 theta_fixed: &init_params.theta_fixed,
                                 theta_packs_log: &theta_packs_log_mask,
                                 omega: &state.omega_mat,
-                                etas: &state.etas,
+                                etas: if group.needs_data_term || eta_bar.is_empty() {
+                                    &state.etas
+                                } else {
+                                    &eta_bar
+                                },
                             };
                             if group.needs_data_term {
                                 let etas_now = &state.etas;
@@ -7763,7 +7795,8 @@ pub fn run_saem(
                                 continue;
                             }
                             let target = pack_one(t, theta_star[t]);
-                            log_theta[t] = (log_theta[t] + gamma * (target - log_theta[t]))
+                            let step = if group.needs_data_term { gamma } else { 1.0 };
+                            log_theta[t] = (log_theta[t] + step * (target - log_theta[t]))
                                 .clamp(log_theta_lower[t], log_theta_upper[t]);
                             temp_theta_lower[t] = log_theta[t];
                             temp_theta_upper[t] = log_theta[t];
@@ -7774,8 +7807,9 @@ pub fn run_saem(
                         // and in every extra draw.
                         let theta_new = unpack_all(&log_theta);
                         let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
-                        for draw in
-                            std::iter::once(&mut state.etas).chain(extra_eta_draws.iter_mut())
+                        for draw in std::iter::once(&mut state.etas)
+                            .chain(extra_eta_draws.iter_mut())
+                            .chain(std::iter::once(&mut eta_bar))
                         {
                             for (i, e) in draw.iter_mut().enumerate() {
                                 group.recentre_eta(e, &deltas, i);

@@ -3141,3 +3141,86 @@ fn the_solve_entry_withholds_a_differenced_information_where_score_sa_takes_it()
     assert!(score_sa.2.is_some(), "score_sa takes the differenced rows");
     assert_eq!((solve.0, &solve.1), (score_sa.0, &score_sa.1));
 }
+
+/// The lean σ-only score (#2986) is the general path's, bit for bit: value, gradient and
+/// information with every θ pinned, one σ pinned or both free, with and without the
+/// information.
+#[test]
+fn the_sigma_only_score_is_the_general_path_bit_for_bit() {
+    use crate::types::DoseEvent;
+    let model = combined_error_two_cpt_model();
+    let theta = vec![1.4f64, 11.0, 2.1, 23.0];
+    let sigma_values = vec![0.15f64, 0.40];
+    let n_theta = theta.len();
+    let n_sigma = sigma_values.len();
+    let n = n_theta + n_sigma;
+    let eta = vec![0.13f64];
+    let subject = paired_residual_subject(
+        &model,
+        "1",
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[0.5, 2.0, 6.0, 12.0],
+        &theta,
+        &[0.2, 0.3],
+        &eta,
+    );
+    let mask = vec![true; n_theta];
+    for pin_add in [false, true] {
+        let mut lo = vec![-1e30f64; n];
+        let mut hi = vec![1e30f64; n];
+        for t in 0..n_theta {
+            lo[t] = theta[t].ln();
+            hi[t] = theta[t].ln();
+        }
+        if pin_add {
+            lo[n_theta + 1] = sigma_values[1].ln();
+            hi[n_theta + 1] = sigma_values[1].ln();
+        }
+        let run = |off: bool| {
+            SIGMA_ONLY_OFF.with(|c| c.set(off));
+            let mut scratch = EventPkParams::default();
+            let fisher = obs_nll_subject_grad_fisher(
+                &model,
+                &subject,
+                &theta,
+                &sigma_values,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            let plain = obs_nll_subject_grad(
+                &model,
+                &subject,
+                &theta,
+                &sigma_values,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            SIGMA_ONLY_OFF.with(|c| c.set(false));
+            (fisher, plain)
+        };
+        let (lean, lean_plain) = run(false);
+        let (general, general_plain) = run(true);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(lean.0.to_bits(), general.0.to_bits(), "value, pin_add {pin_add}");
+        assert_eq!(bits(&lean.1), bits(&general.1), "gradient, pin_add {pin_add}");
+        let (lf, gf) = (lean.2.expect("information"), general.2.expect("information"));
+        assert_eq!(bits(&lf), bits(&gf), "information, pin_add {pin_add}");
+        assert!(lf[n_theta * n + n_theta] > 0.0, "the free σ carries information");
+        assert_eq!(lean_plain.0.to_bits(), general_plain.0.to_bits());
+        assert_eq!(
+            bits(&lean_plain.1),
+            bits(&general_plain.1),
+            "plain gradient, pin_add {pin_add}"
+        );
+    }
+}

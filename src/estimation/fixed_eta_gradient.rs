@@ -905,6 +905,96 @@ fn assemble_fisher(
     fisher
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the general path where [`sigma_only_score`] would serve, for the test
+    /// pinning the two bit for bit.
+    pub(crate) static SIGMA_ONLY_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The most free σ the lean σ-only score ([`sigma_only_score`]) carries on the stack.
+const SIGMA_ONLY_MAX: usize = 8;
+
+/// The σ-only score of [`obs_nll_subject_grad_impl`] (#2986): with every θ pinned, the value,
+/// the σ gradient and the σ×σ information are residual arithmetic on the predictions. The
+/// same operations in the same order as the general path — each σ's gradient and each
+/// information entry summed over the observations in turn — so the same bits, without its
+/// per-θ rows, its per-call vectors or the `n×n` assembly. A σ-only SAEM M-step evaluates it
+/// at every Newton step on the memoized predictions. `None` (the general path runs) under a
+/// residual magnitude (the general path withholds the information there), a `[covariate_nn]`
+/// θ plan, or more than [`SIGMA_ONLY_MAX`] free σ.
+#[allow(clippy::too_many_arguments)]
+fn sigma_only_score(
+    model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
+    eta: &[f64], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize, want_fisher: bool,
+) -> Option<(f64, Vec<f64>, Option<Vec<f64>>)> {
+    let n = n_theta + n_sigma;
+    let free: Vec<usize> =
+        (0..n_sigma).filter(|&k| lower[n_theta + k] != upper[n_theta + k]).collect();
+    let m = free.len();
+    if m > SIGMA_ONLY_MAX || model.ruv_obs_mult(subject, theta).is_some() {
+        return None;
+    }
+    if NnGradPlan::build(model, subject, theta, n_theta).is_some() {
+        return None;
+    }
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
+    let ruv_scale = model.residual_var_scale(eta);
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut nll = 0.0f64;
+    let mut g = [0.0f64; SIGMA_ONLY_MAX];
+    let mut info = [[0.0f64; SIGMA_ONLY_MAX]; SIGMA_ONLY_MAX];
+    let mut dv = [0.0f64; SIGMA_ONLY_MAX];
+    for (j, &f) in preds.iter().enumerate().take(subject.observations.len()) {
+        let cmt = err_keys[j];
+        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        let v = match frem_vj {
+            Some(vv) => vv.max(1e-12),
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(cmt, f, sigma_values, None) * s,
+            ),
+        };
+        let resid = subject.observations[j] - f;
+        nll += 0.5 * (v.ln() + resid * resid / v);
+        for (a, &k) in free.iter().enumerate() {
+            let ratio = obs_dvar_dlogsigma(model, cmt, k, f, sigma_values, None, frem_vj) * s;
+            dv[a] = ratio;
+            g[a] += 0.5 * ratio * (1.0 / v - resid * resid / (v * v));
+        }
+        if want_fisher {
+            for a in 0..m {
+                for b in a..m {
+                    info[a][b] += 0.0 + 0.5 * dv[a] * dv[b] / (v * v);
+                }
+            }
+        }
+    }
+    if !nll.is_finite() {
+        return Some((SUBJECT_SENTINEL_NLL, vec![0.0; n], None));
+    }
+    let mut grad = vec![0.0f64; n];
+    for (a, &k) in free.iter().enumerate() {
+        grad[n_theta + k] = g[a];
+    }
+    let fisher = want_fisher.then(|| {
+        let mut fi = vec![0.0f64; n * n];
+        for (a, &ka) in free.iter().enumerate() {
+            for (b, &kb) in free.iter().enumerate().skip(a) {
+                let (ia, ib) = (n_theta + ka, n_theta + kb);
+                fi[ia * n + ib] = info[a][b];
+                fi[ib * n + ia] = info[a][b];
+            }
+        }
+        fi
+    });
+    Some((nll, grad, fisher))
+}
+
 /// The one body behind [`obs_nll_subject_grad`] and
 /// [`obs_nll_subject_grad_fisher`]. `want_fisher` only *adds* the information
 /// block; with it `false` the returned `(nll, grad)` is bit-identical to what
@@ -1038,6 +1128,29 @@ fn obs_nll_subject_grad_impl(
             model, subject, theta, eta, pk_scratch, schedule,
         )
     });
+    // σ only (every θ pinned): the score and information are residual arithmetic on these
+    // predictions — the lean twin of the general path below (#2986).
+    #[cfg(test)]
+    let lean = !SIGMA_ONLY_OFF.with(|c| c.get());
+    #[cfg(not(test))]
+    let lean = true;
+    if lean && (0..n_theta).all(|i| lower[i] == upper[i]) {
+        if let Some(out) = sigma_only_score(
+            model,
+            subject,
+            &preds_base,
+            theta,
+            sigma_values,
+            eta,
+            lower,
+            upper,
+            n_theta,
+            n_sigma,
+            want_fisher,
+        ) {
+            return out;
+        }
+    }
 
     let mut nll_base = 0.0f64;
     let n_obs = subject.observations.len();

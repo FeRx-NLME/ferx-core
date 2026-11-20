@@ -1660,3 +1660,49 @@ fn the_exact_mu_gradient_matches_central_differences() {
         assert!(member.mu_grad(&wide_theta, &slots, &wide).is_none());
     }
 }
+
+/// The closed form of an affine mu (#2986): a power covariate model,
+/// `log(TVCL·(CRCL/90)^TH_CRCL)` = `log TVCL + TH_CRCL·log(CRCL/90)`, is detected as affine in
+/// `(log TVCL, TH_CRCL)` and solved in one least-squares step to the planted truth; the
+/// additive model's `log(TVCL + (CRCL − 90)·TH_CRCL)` is not, and keeps Levenberg–Marquardt.
+#[test]
+fn a_power_covariate_mu_takes_the_closed_form_and_an_additive_one_does_not() {
+    let src = ADDITIVE_MODEL
+        .replace("theta TH_CRCL(2.0, 0.0, 50.0)", "theta TH_CRCL(0.5, -5.0, 5.0)")
+        .replace(
+            "CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)",
+            "CL = TVCL * (CRCL / 90.0)^TH_CRCL * exp(ETA_CL)",
+        );
+    let m = model(&src);
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let omega = diag_omega(&[0.2, 0.1]);
+    let g = only_group(&m, &pop, &omega);
+    let start = [150.0, 0.5, 10.0];
+    let truth = [120.0, 1.4, 10.0];
+    let etas = planted_etas(&g, &pop, &start, &truth);
+    let slots = g.members[0].distinct_slots(&pop);
+    let lf = g.members[0].linear_form(&start, &slots, &[0, 1]).expect("affine in (log TVCL, TH)");
+    assert_eq!(lf.roles, vec![LinRole::Log, LinRole::Lin]);
+    let fixed = [false; 3];
+    let input = GroupStepInput {
+        theta: &start,
+        theta_lower: &m.default_params.theta_lower,
+        theta_upper: &m.default_params.theta_upper,
+        theta_fixed: &fixed,
+        theta_packs_log: &[true, false, true],
+        omega: &omega,
+        etas: &etas,
+    };
+    let out = g.solve_exact(&pop, &input).expect("solvable");
+    assert!((out[0] / 120.0 - 1.0).abs() < 1e-10, "TVCL = {}", out[0]);
+    assert!((out[1] - 1.4).abs() < 1e-10, "TH_CRCL = {}", out[1]);
+    assert_eq!(out[2], 10.0);
+
+    let add = model(ADDITIVE_MODEL);
+    let ga = only_group(&add, &pop, &omega);
+    let slots = ga.members[0].distinct_slots(&pop);
+    assert!(
+        ga.members[0].linear_form(&[150.0, 2.0, 10.0], &slots, &[0, 1]).is_none(),
+        "log(TVCL + (CRCL − 90)·TH) is not affine in either coordinate"
+    );
+}
