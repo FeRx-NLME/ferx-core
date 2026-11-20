@@ -97,6 +97,19 @@ impl LoopSpec {
     }
 }
 
+#[cfg(test)]
+impl LoopSpec {
+    /// Each method's step body (`[u, carried, t, dt] → carried`), for the lane-loop prototype's
+    /// measurements (#3080).
+    pub(super) fn step_programs(&self) -> Vec<(OdeMethod, Arc<ChunkProgram>)> {
+        self.methods.iter().map(|m| (m.method, m.step.prog.clone())).collect()
+    }
+    /// The right-hand side body, `[u, t] → f(u, t)`.
+    pub(super) fn rhs_program(&self) -> Arc<ChunkProgram> {
+        self.rhs.prog.clone()
+    }
+}
+
 /// The methods the driver may ask for under `opts`.
 fn methods_for(opts: &OdeSolverOptions) -> Vec<OdeMethod> {
     let mut m = vec![OdeMethod::EXPLICIT_FALLBACK];
