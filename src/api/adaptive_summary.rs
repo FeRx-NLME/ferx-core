@@ -278,20 +278,9 @@ pub fn summarize_adaptive(
         SCALAR_METRICS.iter().map(|m| (m.clone(), BTreeMap::new())).collect();
     for row in &result.metrics {
         *runs.entry(row.draw).or_default() += 1;
-        for metric in &SCALAR_METRICS {
-            if let Some(v) = metric.value(row) {
-                values.get_mut(metric).expect("seeded").entry(row.draw).or_default().push(v);
-            }
-        }
     }
-    for d in &result.decisions {
-        for s in &d.observed_signals {
-            let metric = AdaptiveSummaryMetric::Signal {
-                analyte: s.name.clone(),
-                decision_idx: d.decision_idx,
-            };
-            values.entry(metric).or_default().entry(d.draw).or_default().push(s.latent);
-        }
+    for (run, metric, v) in run_values(result) {
+        values.entry(metric).or_default().entry(run.draw).or_default().push(v);
     }
 
     for (m, _) in &opts.thresholds {
@@ -369,6 +358,39 @@ pub fn summarize_adaptive(
 /// Runs that carry no value. At most one value per run is an engine invariant (one
 /// metrics row per run, and the driver refuses two monitors with one name), so a larger
 /// count is a defect: it panics in release too, rather than wrapping into a huge count.
+/// The run a value came from: `(subject, draw, sim, rep)`, the key of a metrics row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct RunKey<'a> {
+    pub(super) subject: &'a str,
+    pub(super) draw: usize,
+    pub(super) sim: usize,
+    pub(super) rep: usize,
+}
+
+/// Every value a run carries, with its run and metric: the scalar metrics of each metrics
+/// row (those it carries), then each analyte's latent signal at each decision. The one
+/// producer behind [`summarize_adaptive`] and [`super::decompose_adaptive`], so both read
+/// the same values and count the same values as missing.
+pub(super) fn run_values(
+    result: &AdaptiveSimulationResult,
+) -> impl Iterator<Item = (RunKey<'_>, AdaptiveSummaryMetric, f64)> {
+    let scalars = result.metrics.iter().flat_map(|row| {
+        let run = RunKey { subject: &row.subject, draw: row.draw, sim: row.sim, rep: row.rep };
+        SCALAR_METRICS.iter().filter_map(move |m| m.value(row).map(|v| (run, m.clone(), v)))
+    });
+    let signals = result.decisions.iter().flat_map(|d| {
+        let run = RunKey { subject: &d.subject, draw: d.draw, sim: d.sim, rep: d.rep };
+        d.observed_signals.iter().map(move |s| {
+            let metric = AdaptiveSummaryMetric::Signal {
+                analyte: s.name.clone(),
+                decision_idx: d.decision_idx,
+            };
+            (run, metric, s.latent)
+        })
+    });
+    scalars.chain(signals)
+}
+
 fn missing(n_runs: usize, present: usize) -> usize {
     n_runs.checked_sub(present).expect("more values than runs: one analyte recorded twice")
 }

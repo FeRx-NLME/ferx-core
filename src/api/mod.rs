@@ -53,6 +53,7 @@ pub(crate) use validation::check_survival_time_dependent_pk;
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
+mod adaptive_decomposition;
 mod adaptive_inputs;
 mod adaptive_summary;
 mod fit;
@@ -75,6 +76,10 @@ pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
     simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
     DrawnParameters,
+};
+pub use adaptive_decomposition::{
+    decompose_adaptive, AdaptiveComponentStatus, AdaptiveDecomposition, AdaptiveDecompositionSkip,
+    AdaptiveVarianceComponent, AdaptiveVarianceLayer, AdaptiveVarianceScope,
 };
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
 pub use adaptive_summary::{
