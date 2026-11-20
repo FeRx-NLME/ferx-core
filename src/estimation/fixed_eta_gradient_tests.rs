@@ -3322,6 +3322,8 @@ fn fisher_information_is_exact_under_a_theta_free_magnitude() {
         }
     }
     let href = fd_packed_hessian(&model, &population, &theta, &sigma_values, &etas, 1e-4);
+    assert!(href.iter().all(|v| v.is_finite()), "non-finite reference Hessian");
+    assert!(info.iter().all(|v| v.is_finite()), "non-finite information");
     let scale = href.iter().fold(0.0f64, |m, v| m.max(v.abs()));
     assert!(scale > 1.0, "reference Hessian is degenerate: max {scale:.3e}");
     let mut worst = 0.0f64;
@@ -3330,7 +3332,9 @@ fn fisher_information_is_exact_under_a_theta_free_magnitude() {
         for b in 0..n {
             let (got, want) = (info[a * n + b], href[a * n + b]);
             assert!(got.is_finite() && want.is_finite(), "({a},{b}): {got} vs {want}");
-            worst = worst.max((got - want).abs() / want.abs().max(1e-3 * scale));
+            let rel = (got - want).abs() / want.abs().max(1e-3 * scale);
+            assert!(rel.is_finite(), "({a},{b}): relative error {rel}");
+            worst = worst.max(rel);
         }
     }
     eprintln!(

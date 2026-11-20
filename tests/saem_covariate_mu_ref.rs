@@ -525,10 +525,12 @@ fn assert_mstep_arm_recovers_th_wt(name: &str, opts: FitOptions) {
 /// closed form does not hold there. Fast: the fit is cut to a handful of
 /// iterations, and what is asserted is the warning, not the estimate.
 ///
-/// The out-of-scope shape used here is a **residual magnitude** (`weight = …`),
-/// which is the case closest to in-scope — θ reaches the residual variance
-/// through a second channel the expected-information closed form does not carry
-/// — and which runs on the same data as the in-scope control.
+/// The out-of-scope shape used here is a **residual magnitude that reads a θ**
+/// (`ADD_ERR * (1 + TVCL/100·WT)`), which is the case closest to in-scope — θ
+/// reaches the residual variance through a second channel the expected-information
+/// closed form does not carry — and which runs on the same data as the in-scope
+/// control. A θ-free magnitude (`weight = WT` alone) is in scope since #3064: it is
+/// a per-observation constant.
 ///
 /// It takes **three** edits, not one: the parser refuses `weight =` on a purely
 /// proportional error ("a common scale factor cancels out of a proportional
@@ -570,7 +572,7 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
         .replace("  sigma PROP_ERR ~ 0.02", "  sigma PROP_ERR ~ 0.02\n  sigma ADD_ERR  ~ 0.50 (sd)")
         .replace(
             "DV ~ proportional(PROP_ERR)",
-            "DV ~ combined(PROP_ERR, ADD_ERR) weight = WT
+            "DV ~ combined(PROP_ERR, ADD_ERR * (1.0 + TVCL / 100.0 * WT)) weight = WT
 
 [covariates]
   WT continuous",
