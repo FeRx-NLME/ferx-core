@@ -1558,17 +1558,24 @@ where
                     // by the subject's observation grid, exactly like `emit_subject_rows`.
                     // The driver (and the replay that verified it) return the bare readout;
                     // `adaptive_rows_to_model_scale` puts it on the scale `simulate()` reports
-                    // (`[scaling]`, #2129; the FREM covariate rows, #2156).
+                    // (`[scaling]`, #2129; the FREM covariate rows, #2156). Rep 1 only:
+                    // `SimulationResult` carries no rep tag (#946), so later reps' rows could
+                    // not be told apart; their outcomes are in the metrics, ledger and
+                    // decisions.
                     let mut predictions = run.predictions;
-                    adaptive_rows_to_model_scale(
-                        model,
-                        subject,
-                        &params.theta,
-                        &eta_slice,
-                        eta_occ.as_deref(),
-                        decision_times,
-                        &mut predictions,
-                    );
+                    if rep > 1 {
+                        predictions.clear();
+                    } else {
+                        adaptive_rows_to_model_scale(
+                            model,
+                            subject,
+                            &params.theta,
+                            &eta_slice,
+                            eta_occ.as_deref(),
+                            decision_times,
+                            &mut predictions,
+                        );
+                    }
                     for (j, &pred) in predictions.iter().enumerate() {
                         trajectories.push(SimulationResult {
                             draw,

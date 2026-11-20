@@ -177,6 +177,13 @@ fn jackknife(n: usize, est: impl Fn(Option<usize>) -> Vec<Option<f64>>) -> Vec<O
         .collect()
 }
 
+/// The sum of the lines a scope reports, `(estimate, reported)`: `None` when a reported
+/// line is missing (a delete-one replicate that cannot form it), so a jackknife replicate
+/// of the total is never the sum of fewer lines than the total itself.
+fn total_of(lines: &[(Option<f64>, bool)]) -> Option<f64> {
+    lines.iter().filter(|(_, reported)| *reported).map(|(v, _)| *v).sum()
+}
+
 /// Which layers a run of this design identifies; `Err` names the one it cannot.
 fn identifiability(d: usize, s: usize, r: usize, uncertain: bool) -> Result<(), String> {
     if r < 2 {
@@ -329,8 +336,8 @@ fn push_metric(
         let est = |drop: Option<usize>| {
             let l = layers(&cube.y, dims, drop);
             let bsv = if cube.supplied { None } else { l.bsv };
-            let total = [l.param, bsv, l.within].iter().flatten().sum::<f64>();
-            vec![l.param, bsv, l.within, Some(total)]
+            let total = total_of(&[(l.param, d > 1), (bsv, !cube.supplied), (l.within, true)]);
+            vec![l.param, bsv, l.within, total]
         };
         let (full, se) = (est(None), jackknife(n_units, est));
         let scope = || AdaptiveVarianceScope::Subject(id.to_string());
@@ -363,8 +370,9 @@ fn push_metric(
         let n = ls.len() as f64;
         let grand = ls.iter().map(|(l, _)| l.mean).sum::<f64>() / n;
         let between = ls.iter().map(|(l, _)| (l.mean - grand).powi(2)).sum::<f64>() / n;
-        let total = [param, bsv, within, Some(between)].iter().flatten().sum::<f64>();
-        vec![param, bsv, within, Some(between), Some(total)]
+        let total =
+            total_of(&[(param, d > 1), (bsv, n_drawn > 0), (within, true), (Some(between), true)]);
+        vec![param, bsv, within, Some(between), total]
     };
     let (full, se) = (est(None), jackknife(n_units, est));
     let pop = || AdaptiveVarianceScope::Population;

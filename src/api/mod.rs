@@ -560,6 +560,9 @@ mod adaptive_sim_tests;
 
 // ── Tests: the population summary, bands and prediction interval (#946 PR2) ──
 #[cfg(test)]
+#[path = "tests/adaptive_decomposition_tests.rs"]
+mod adaptive_decomposition_tests;
+#[cfg(test)]
 #[path = "tests/adaptive_summary_tests.rs"]
 mod adaptive_summary_tests;
 
