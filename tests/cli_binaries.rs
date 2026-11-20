@@ -41,3 +41,20 @@ fn generate_data_writes_all_datasets() {
         );
     }
 }
+
+/// A bare run is the four `data/` datasets only: the opt-in `peak_memory` generator
+/// (#3081) reads repository paths and must not run from a temp directory. A name that
+/// is neither set is refused with exit 2, listing both sets.
+#[test]
+fn generate_data_keeps_peak_memory_opt_in_and_refuses_an_unknown_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_generate_data"))
+        .arg("no_such_dataset")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run generate_data");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("\"mm_oral\"") && err.contains("\"peak_memory\""), "{err}");
+    assert!(!tmp.path().join("tools").exists(), "an unknown name wrote files");
+}
