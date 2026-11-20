@@ -1412,3 +1412,39 @@ fn no_crate_level_allow_switches_a_rustdoc_lint_off() {
         offenders.join("\n  ")
     );
 }
+
+/// Since #3041 the engine is two packages, and the workspace root selects only `ferx-core`:
+/// a bare `cargo test --lib` builds `ferx-model` as a dependency but never compiles or runs
+/// its unit tests, with every line still green. So in each group that compiles the engine,
+/// a command that builds `ferx-core` (by naming it, or by naming no package) must also
+/// select `ferx-model`. That includes the guards-on and guards-off lanes, which hold moved
+/// `debug_assert!` checks such as the modified-release ODE twin.
+#[test]
+fn every_engine_gate_selects_both_engine_crates() {
+    for group in ["check", "clippy", "rustdoc", "debug-assertions", "release-semantics"] {
+        let cmds = listed_commands(group);
+        let engine: Vec<&String> = cmds
+            .iter()
+            .filter(|c| {
+                let words: Vec<&str> = c.split_whitespace().collect();
+                let named: Vec<&str> = words
+                    .windows(2)
+                    .filter(|w| w[0] == "-p" || w[0] == "--package")
+                    .map(|w| w[1])
+                    .collect();
+                named.is_empty() || named.contains(&"ferx-core")
+            })
+            .collect();
+        assert!(!engine.is_empty(), "the `{group}` group builds no engine command");
+        for cmd in engine {
+            let selects_both = cmd.contains("--workspace")
+                || (cmd.contains("-p ferx-core") && cmd.contains("-p ferx-model"));
+            assert!(
+                selects_both,
+                "`{cmd}` (group `{group}`) builds `ferx-core` without selecting \
+                 `ferx-model`, so the moved unit tests and lints never run there (#3041). \
+                 Add `-p ferx-core -p ferx-model`."
+            );
+        }
+    }
+}

@@ -106,7 +106,9 @@ markov = ["survival", "ferx-model/markov"]
 slow-tests = ["ferx-model/slow-tests"]
 
 [dependencies]
-ferx-model = { path = "crates/ferx-model" }
+# `version` is what the published crate depends on: cargo drops `path` when it packages
+# `ferx-core`, so `ferx-model` is published too, at the same version, ahead of it (#3041).
+ferx-model = { path = "crates/ferx-model", version = "0.4.0" }
 nalgebra = "0.35"
 csv = "1.3"
 serde = { version = "1", features = ["derive"] }

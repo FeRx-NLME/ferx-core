@@ -16,11 +16,16 @@ import os
 import re
 import sys
 
+# The listings and sources are UTF-8 (`→`, `σ` in doc text); the platform default encoding
+# (CP1252 on Windows) cannot read them, and the baseline is redirected from stdout.
+sys.stdout.reconfigure(encoding='utf-8', newline='\n')
+sys.stderr.reconfigure(encoding='utf-8')
+
 root, core_listing, model_listing = sys.argv[1:4]
 
 # ferx-model's public modules, from its own listing.
 model_mods = {m.group(1) for m in (re.match(r'^pub mod ferx_model::([\w:]+)$', l.strip())
-                                   for l in open(model_listing)) if m}
+                                   for l in open(model_listing, encoding='utf-8')) if m}
 
 # 1. Every ferx_model item ferx-core re-exports publicly: `pub use ferx_model::…` in the facade,
 #    and `pub use crate::<m>::…` where `<m>` is a module ferx-core takes from ferx-model (the
@@ -31,7 +36,7 @@ for d, _, fs in os.walk(os.path.join(root, 'src')):
     for f in fs:
         if not f.endswith('.rs'):
             continue
-        text = open(os.path.join(d, f)).read()
+        text = open(os.path.join(d, f), encoding='utf-8').read()
         for m in re.finditer(r'^\s*pub use (ferx_model|crate)::((?:\w+::)*)(\{[^}]*\}|\w+(?: as \w+)?);',
                              text, re.M | re.S):
             origin, prefix, tail = m.group(1), m.group(2), m.group(3)
@@ -49,7 +54,7 @@ for d, _, fs in os.walk(os.path.join(root, 'src')):
 # 2. Each `pub use ferx_core::X` of ferx-core's listing must have a facade source named X.
 names = {s.rsplit('::', 1)[1] for s in sources} | aliases
 missing = []
-for line in open(core_listing):
+for line in open(core_listing, encoding='utf-8'):
     m = re.match(r'^pub use ferx_core::(?:\w+::)*(\w+)$', line.strip())
     if m and m.group(1) not in names:
         missing.append(line.strip())
@@ -78,7 +83,7 @@ PRIMITIVE_MEMBER = re.compile(r'^pub (?:[a-z ]+ )?(?:f64|f32|usize|u64|u32|i64|i
 # An item ferx-model itself re-exports (`pub use activation::Activation` in `nn`) is listed at
 # the re-export path, but its impls and methods at its definition path: add the definition
 # path of every re-exported item by name, from the item lines of the listing.
-lines = open(model_listing).read().split('\n')
+lines = open(model_listing, encoding='utf-8').read().split('\n')
 defined = collections.defaultdict(set)
 for l in lines:
     m = re.match(r'^(?:#\[[^\]]*\]\s*)*pub (?:struct|enum|trait|union|type) (ferx_model::\w+(?:::\w+)*)', l)

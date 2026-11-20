@@ -559,7 +559,7 @@ group_debug_assertions() {
   # `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS`, or a `--profile` that quietly reverted
   # to `ci-fast` would neuter it with every test still green. The canary is opt-in
   # precisely because every OTHER job legitimately runs with the guards off.
-  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib -p ferx-core -p ferx-model --profile ci-cov \
     --no-default-features --features ci
 
   # The feature-gated surface, for the same non-nesting reason `check` is a matrix
@@ -569,7 +569,7 @@ group_debug_assertions() {
   # were in every job before #1248. `markov` implies `survival`, so `ci,markov,nn`
   # is the union of the production cfgs — the same set `clippy` and `rustdoc` take,
   # and for the same reason. In CI this half is the endpoints coverage job.
-  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib -p ferx-core -p ferx-model --profile ci-cov \
     --no-default-features --features ci,markov,nn
 }
 
@@ -602,7 +602,7 @@ group_release_semantics() {
   # (`src/lib_tests.rs`). Without it the lane's value rests on `ci-fast` never
   # acquiring `debug-assertions`, and if it did this job would quietly become a
   # second copy of the coverage jobs with every test still green.
-  run env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-fast \
+  run env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo test --lib -p ferx-core -p ferx-model --profile ci-fast \
     --no-default-features --features ci,markov,nn
 }
 
