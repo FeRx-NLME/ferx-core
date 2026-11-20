@@ -3316,6 +3316,11 @@ pub(crate) fn report() {
         );
         let c = chunk_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         eprintln!("kjit: {} distinct chunk kernels", c.values().map(Vec::len).sum::<usize>());
+        let (sets, bytes) = ode_loop::table_stats();
+        eprintln!(
+            "kjit: {sets} distinct ODE loop slot-table sets ({:.1} KiB)",
+            bytes as f64 / 1024.0
+        );
     }
 }
 

@@ -85,6 +85,8 @@ pub(crate) struct LoopSpec {
     sw_g: Option<LoopBody>,
     /// Per switch `k` and side, at `2k + pos`, the jump `[u, t] → u⁺` ([`jump_tr`]).
     jumps: Vec<LoopBody>,
+    /// The bodies' index tables, built at the first layout resolved ([`LoopKernels::resolve`]).
+    tables: OnceLock<Arc<LoopTables>>,
 }
 
 impl LoopSpec {
@@ -479,6 +481,7 @@ pub(super) fn record_segment(
         ov: sol::current_ode_override(),
         sw_g,
         jumps,
+        tables: OnceLock::new(),
     });
     // The record-time values: a run at the value-only layout.
     let vals = rec(|r| r.vals.clone());
@@ -547,22 +550,128 @@ pub(super) fn record_segment(
 /// own probes), and each method's start and step. Resolved once per plan and layout.
 pub(crate) struct LoopKernels {
     rhs_f64: Arc<Tiered>,
+    /// Per method: start, step, accept.
+    methods: Vec<[Arc<Tiered>; 3]>,
+    /// Per method, per forced step (`MethodBodies::forced`): its kernel.
+    forced: Vec<Vec<Arc<Tiered>>>,
+    /// The switch functions at the value layout (#2649).
+    sw_f64: Option<Arc<Tiered>>,
+    /// Per jump its kernel.
+    jumps: Vec<Arc<Tiered>>,
+    sl: Slots,
+    /// The bodies' index tables, shared by every call of the same shape (#3079).
+    t: Arc<LoopTables>,
+}
+
+/// A loop call's index tables: where each body reads and writes in the run's slots
+/// ([`Slots`]). They follow from the call's shape alone — the state's length, the methods'
+/// carried lengths, each body's captures and outputs — and not from the layout or the
+/// subject, so one copy serves every plan, layout and segment of that shape ([`interned`]).
+#[derive(PartialEq, Eq, Hash)]
+struct LoopTables {
     /// The right-hand side's index table: its slots in order.
     rhs_idx: Vec<u32>,
     /// `0, 1, …` over the widest body's slots: a reverse body's index table.
     iota: Vec<u32>,
-    /// Per method: start, step, accept.
-    methods: Vec<[Arc<Tiered>; 3]>,
-    /// Per method, per forced step (`MethodBodies::forced`): its kernel and its index tables
-    /// per current carried region.
-    forced: Vec<Vec<(Arc<Tiered>, [Vec<u32>; 2])>>,
-    /// The switch functions at the value layout, with their index table (#2649).
-    sw_f64: Option<(Arc<Tiered>, Vec<u32>)>,
-    /// Per jump its kernel and index table.
-    jumps: Vec<(Arc<Tiered>, Vec<u32>)>,
-    sl: Slots,
     /// Per method, per current carried region: the start's, step's and accept's index tables.
-    tables: Vec<[[Vec<u32>; 3]; 2]>,
+    methods: Vec<[[Vec<u32>; 3]; 2]>,
+    /// Per method, per forced step, its index tables per current carried region.
+    forced: Vec<Vec<[Vec<u32>; 2]>>,
+    /// The switch functions' index table.
+    sw: Option<Vec<u32>>,
+    /// Per jump its index table.
+    jumps: Vec<Vec<u32>>,
+}
+
+impl LoopTables {
+    fn of(spec: &LoopSpec, sl: Slots) -> LoopTables {
+        let slots = |b: &LoopBody| b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
+        let widest = spec
+            .methods
+            .iter()
+            .flat_map(|m| [&m.start, &m.step, &m.accept].into_iter().chain(&m.forced))
+            .chain(&spec.jumps)
+            .map(slots)
+            .max()
+            .unwrap_or(0);
+        // A jump reads the state and the clock, and writes the new state into the first
+        // carried region, dead until the fresh stepper that follows it.
+        let mut vars: Vec<usize> = (0..spec.n).map(|j| sl.u + j).collect();
+        vars.push(sl.t);
+        let outs: Vec<usize> = (0..spec.n).map(|j| sl.carried[0] + j).collect();
+        LoopTables {
+            rhs_idx: (0..slots(&spec.rhs) as u32).collect(),
+            iota: (0..widest as u32).collect(),
+            methods: spec.methods.iter().map(|mb| tables(spec, mb, sl)).collect(),
+            forced: spec
+                .methods
+                .iter()
+                .map(|mb| mb.forced.iter().map(|b| step_tables(spec, mb, b, sl)).collect())
+                .collect(),
+            sw: spec.sw_g.as_ref().map(|b| (0..slots(b) as u32).collect()),
+            jumps: spec.jumps.iter().map(|b| table(b, sl, &vars, &outs)).collect(),
+        }
+    }
+}
+
+/// The interned tables ([`interned`]), and the set's size at which it next drops the copies no
+/// call holds any longer.
+type TableSet = Mutex<(std::collections::HashSet<Arc<LoopTables>>, usize)>;
+
+fn table_set() -> std::sync::MutexGuard<'static, (std::collections::HashSet<Arc<LoopTables>>, usize)>
+{
+    static SET: OnceLock<TableSet> = OnceLock::new();
+    SET.get_or_init(TableSet::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The one shared copy of `t`. A call's tables are the same at every layout and for every
+/// subject whose segment has the same shape: on e7070 the per-plan, per-layout copies peaked at
+/// 658 MB against 0.34 MB distinct (#3079). Copies no live call holds are dropped as the set
+/// grows.
+fn interned(t: LoopTables) -> Arc<LoopTables> {
+    let mut g = table_set();
+    let (set, prune_at) = &mut *g;
+    intern_into(set, prune_at, t)
+}
+
+/// [`interned`] on a given set: the copy of `t` in `set`, inserted if absent. When the set has
+/// reached `prune_at`, the copies only the set holds go first and the mark moves to twice what
+/// is left (at least 64), so pruning stays amortised.
+fn intern_into(
+    set: &mut std::collections::HashSet<Arc<LoopTables>>, prune_at: &mut usize, t: LoopTables,
+) -> Arc<LoopTables> {
+    if let Some(a) = set.get(&t) {
+        return a.clone();
+    }
+    if set.len() >= *prune_at {
+        set.retain(|a| Arc::strong_count(a) > 1);
+        *prune_at = (2 * set.len()).max(64);
+    }
+    let a = Arc::new(t);
+    set.insert(a.clone());
+    a
+}
+
+/// The distinct slot-table sets held (`FERX_KJIT_DEBUG`'s report), and their bytes.
+pub(crate) fn table_stats() -> (usize, usize) {
+    stats_of(&table_set().0)
+}
+
+/// The number of table sets in `set`, and the bytes of their tables.
+fn stats_of(set: &std::collections::HashSet<Arc<LoopTables>>) -> (usize, usize) {
+    let v = |v: &Vec<u32>| v.len() * 4;
+    let bytes = set
+        .iter()
+        .map(|t| {
+            v(&t.rhs_idx)
+                + v(&t.iota)
+                + t.methods.iter().flatten().flatten().map(v).sum::<usize>()
+                + t.forced.iter().flatten().flatten().map(v).sum::<usize>()
+                + t.sw.as_ref().map_or(0, v)
+                + t.jumps.iter().map(v).sum::<usize>()
+        })
+        .sum();
+    (set.len(), bytes)
 }
 
 /// A body's output slots in its index table.
@@ -580,12 +689,16 @@ impl LoopKernels {
         match kind {
             0..=2 => {
                 let (mb, k) = (&spec.methods[m], kind as usize);
-                ([&mb.start, &mb.step, &mb.accept][k], &self.methods[m][k], &self.tables[m][r][k])
+                (
+                    [&mb.start, &mb.step, &mb.accept][k],
+                    &self.methods[m][k],
+                    &self.t.methods[m][r][k],
+                )
             }
-            3 => (&spec.jumps[m], &self.jumps[m].0, &self.jumps[m].1),
+            3 => (&spec.jumps[m], &self.jumps[m], &self.t.jumps[m]),
             j => {
-                let (k, t) = &self.forced[m][j as usize - 4];
-                (&spec.methods[m].forced[j as usize - 4], k, &t[r])
+                let j = j as usize - 4;
+                (&spec.methods[m].forced[j], &self.forced[m][j], &self.t.forced[m][j][r])
             }
         }
     }
@@ -602,55 +715,19 @@ impl LoopKernels {
             .iter()
             .map(|m| Some([get(&m.start)?, get(&m.step)?, get(&m.accept)?]))
             .collect::<Option<Vec<_>>>()?;
-        let sl = Slots::of(spec);
-        let tables = spec.methods.iter().map(|mb| tables(spec, mb, sl)).collect();
-        let slots = |b: &LoopBody| b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
-        let rb = &spec.rhs;
-        let widest = spec
-            .methods
-            .iter()
-            .flat_map(|m| [&m.start, &m.step, &m.accept].into_iter().chain(&m.forced))
-            .chain(&spec.jumps)
-            .map(slots)
-            .max()
-            .unwrap_or(0);
         let forced = spec
             .methods
             .iter()
-            .map(|mb| {
-                mb.forced
-                    .iter()
-                    .map(|b| Some((get(b)?, step_tables(spec, mb, b, sl))))
-                    .collect::<Option<Vec<_>>>()
-            })
+            .map(|mb| mb.forced.iter().map(get).collect::<Option<Vec<_>>>())
             .collect::<Option<Vec<_>>>()?;
         let sw_f64 = match &spec.sw_g {
-            Some(b) => {
-                Some((b.prog.get(Layout::F64, Sweep::Forward)?, (0..slots(b) as u32).collect()))
-            }
+            Some(b) => Some(b.prog.get(Layout::F64, Sweep::Forward)?),
             None => None,
         };
-        // A jump reads the state and the clock, and writes the new state into the first
-        // carried region, dead until the fresh stepper that follows it.
-        let mut vars: Vec<usize> = (0..spec.n).map(|j| sl.u + j).collect();
-        vars.push(sl.t);
-        let outs: Vec<usize> = (0..spec.n).map(|j| sl.carried[0] + j).collect();
-        let jumps = spec
-            .jumps
-            .iter()
-            .map(|b| Some((get(b)?, table(b, sl, &vars, &outs))))
-            .collect::<Option<Vec<_>>>()?;
-        Some(Arc::new(LoopKernels {
-            rhs_f64,
-            rhs_idx: (0..slots(rb) as u32).collect(),
-            iota: (0..widest as u32).collect(),
-            methods,
-            forced,
-            sw_f64,
-            jumps,
-            sl,
-            tables,
-        }))
+        let jumps = spec.jumps.iter().map(get).collect::<Option<Vec<_>>>()?;
+        let sl = Slots::of(spec);
+        let t = spec.tables.get_or_init(|| interned(LoopTables::of(spec, sl))).clone();
+        Some(Arc::new(LoopKernels { rhs_f64, methods, forced, sw_f64, jumps, sl, t }))
     }
 }
 
@@ -1387,7 +1464,8 @@ impl sol::LaneHook for Hook {
     }
     fn switch_g(&self, u: &[f64], t: f64, out: &mut [f64]) {
         let run = &self.0;
-        let (Some(b), Some((k, idx))) = (&run.spec.sw_g, &run.kern.sw_f64) else {
+        let (Some(b), Some(k), Some(idx)) = (&run.spec.sw_g, &run.kern.sw_f64, &run.kern.t.sw)
+        else {
             return;
         };
         let (n, l) = (run.spec.n, run.l);
@@ -1412,7 +1490,7 @@ impl sol::LaneHook for Hook {
         let m = 2 * k + usize::from(pos);
         let (n, l, sl) = (run.spec.n, run.l, run.sl);
         run.buf.borrow_mut()[sl.t * l] = t;
-        let (kern, table) = &run.kern.jumps[m];
+        let (kern, table) = (&run.kern.jumps[m], &run.kern.t.jumps[m]);
         if !run.run(&run.spec.jumps[m], kern, table, m, 3, 0) {
             run.fail();
         }
@@ -1634,7 +1712,7 @@ fn run_loop_g(
             r.kern.rhs_f64.call(
                 buf.as_mut_ptr(),
                 std::ptr::null_mut(),
-                r.kern.rhs_idx.as_ptr(),
+                r.kern.t.rhs_idx.as_ptr(),
                 b.lits.as_ptr(),
             )
         };
@@ -1984,7 +2062,7 @@ pub(crate) fn run_loop_rev(
             // A jump (#2649): its new state's adjoint is the state's; its inputs' come back.
             Entry::Body { m, kind: 3, .. } => {
                 let b = &spec.jumps[*m];
-                let k = &rev.jumps[*m].0;
+                let k = &rev.jumps[*m];
                 let n_in = b.n_vars + b.caps.len();
                 let n_slots = n_in + b.n_out + b.guarded as usize;
                 let w = n_slots * l;
@@ -2012,7 +2090,7 @@ pub(crate) fn run_loop_rev(
                         adj.as_mut_ptr(),
                         w,
                         seeds,
-                        rev.iota.as_ptr(),
+                        rev.t.iota.as_ptr(),
                         b.lits.as_ptr(),
                     )
                 };
@@ -2051,7 +2129,7 @@ pub(crate) fn run_loop_rev(
                     1 => (&mb.step, &rev.methods[*m][1]),
                     2 => (&mb.accept, &rev.methods[*m][2]),
                     // A forced step (#2649) is a step.
-                    j => (&mb.forced[*j as usize - 4], &rev.forced[*m][*j as usize - 4].0),
+                    j => (&mb.forced[*j as usize - 4], &rev.forced[*m][*j as usize - 4]),
                 };
                 let n_in = b.n_vars + b.caps.len();
                 let n_slots = n_in + b.n_out + b.guarded as usize;
@@ -2086,7 +2164,7 @@ pub(crate) fn run_loop_rev(
                         adj.as_mut_ptr(),
                         w,
                         seeds,
-                        rev.iota.as_ptr(),
+                        rev.t.iota.as_ptr(),
                         b.lits.as_ptr(),
                     )
                 };
@@ -2173,7 +2251,7 @@ pub(crate) fn run_loop_rev_rows(
             Entry::Ckpt => {}
             Entry::Body { m, kind: 3, .. } => {
                 let b = &spec.jumps[*m];
-                let k = &rev.jumps[*m].0;
+                let k = &rev.jumps[*m];
                 let n_in = b.n_vars + b.caps.len();
                 let at = rg.at(spec, log, i);
                 let w = rows_body_inputs(
@@ -2226,7 +2304,7 @@ pub(crate) fn run_loop_rev_rows(
                     0 => (&mb.start, &rev.methods[*m][0]),
                     1 => (&mb.step, &rev.methods[*m][1]),
                     2 => (&mb.accept, &rev.methods[*m][2]),
-                    j => (&mb.forced[*j as usize - 4], &rev.forced[*m][*j as usize - 4].0),
+                    j => (&mb.forced[*j as usize - 4], &rev.forced[*m][*j as usize - 4]),
                 };
                 let n_in = b.n_vars + b.caps.len();
                 let accept = *kind == 2;
@@ -2351,4 +2429,115 @@ fn rows_body_call(
             b.lits.as_ptr(),
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ode::solver::{OdeAutoSwitchState, OdeSolverOptions};
+
+    /// The loop call one ODE segment records: `states` decaying states, sampled at the span's
+    /// end and at `soft`.
+    fn segment(states: usize, rate: f64, span: f64, soft: &[f64]) -> Arc<LoopSpec> {
+        begin();
+        let eta = Tr::eta(0, 0.1);
+        let k = |c: f64| Tr::from_f64(c);
+        let p = [k(rate) * eta.exp()];
+        let u0: Vec<Tr> = (0..states).map(|j| k(1.0 + j as f64) + k(0.2) * eta).collect();
+        let rhs = |u: &[Tr], p: &[Tr], _t: Tr, du: &mut [Tr]| {
+            for j in 0..u.len() {
+                du[j] = -p[0] * u[j];
+            }
+        };
+        let opts = OdeSolverOptions { reltol: 1e-3, abstol: 1e-5, ..Default::default() };
+        let mut auto = OdeAutoSwitchState::default();
+        let (hard, sof) =
+            Tr::ode_segment(&rhs, &u0, (0.0, span), &p, &[span], soft, &opts, &mut auto)
+                .expect("records as a loop call");
+        let y: Vec<u32> =
+            hard.iter().chain(&sof).flat_map(|s| s.u.iter().map(|v| v.reg())).collect();
+        let rec = end(Some(y)).expect("records");
+        rec.loops
+            .iter()
+            .find_map(|c| match c {
+                CallKind::Ode(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("one loop call")
+    }
+
+    /// A call's slot tables follow from its shape alone, so every layout of a plan and every
+    /// subject whose segment has the same shape share one copy (#3079: on e7070 the per-plan,
+    /// per-layout copies peaked at 658 MB against 0.34 MB distinct). Dies when `resolve` builds
+    /// its own tables again (the layouts or the two segments stop sharing), and when the shared
+    /// copy is not the one the call's own shape gives (a key coarser than the content: the
+    /// three-state segment would get the two-state tables).
+    #[test]
+    fn segments_of_one_shape_share_their_slot_tables_across_layouts() {
+        let a = segment(2, 0.8, 3.0, &[0.7, 1.3]);
+        let b = segment(2, 0.3, 5.0, &[1.0, 4.0]);
+        let c = segment(3, 0.8, 3.0, &[0.7, 1.3]);
+        let tan = Layout { n: 1, m: 0, th: false, wide: false, tan: 0 };
+        let r =
+            |s: &LoopSpec, l: Layout, sw: Sweep| LoopKernels::resolve(s, l, sw).expect("resolves");
+        let a_val = r(&a, Layout::F64, Sweep::Forward);
+        let a_tan = r(&a, tan, Sweep::Forward);
+        let a_rev = r(&a, tan, Sweep::Reverse);
+        let b_val = r(&b, Layout::F64, Sweep::Forward);
+        let c_val = r(&c, Layout::F64, Sweep::Forward);
+        assert!(Arc::ptr_eq(&a_val.t, &a_tan.t), "one plan's layouts share the tables");
+        assert!(Arc::ptr_eq(&a_val.t, &a_rev.t), "its reverse shares them too");
+        assert!(Arc::ptr_eq(&a_val.t, &b_val.t), "a second subject's segment of the shape shares");
+        for (s, k) in [(&a, &a_val), (&b, &b_val), (&c, &c_val)] {
+            assert!(
+                *k.t == LoopTables::of(s, Slots::of(s)),
+                "the shared copy is the call's own tables"
+            );
+        }
+        assert!(!Arc::ptr_eq(&a_val.t, &c_val.t), "another shape has its own");
+        assert!(*a_val.t != *c_val.t, "and they differ");
+        let (sets, bytes) = table_stats();
+        assert!(sets >= 2 && bytes > 0, "the global set holds both shapes while calls hold them");
+    }
+
+    /// The set hands back the copy it holds for equal content, and drops only the copies no
+    /// call holds once it reaches its mark. Dies when pruning stops (the set would grow without
+    /// bound over a fit), when it drops a copy a call still holds (the next equal call would get
+    /// a second copy), and when the debug report's byte count leaves out the fixture's tables.
+    #[test]
+    fn the_table_set_dedups_prunes_unheld_copies_and_counts_bytes() {
+        let tables = |n| {
+            let s = segment(n, 0.8, 3.0, &[0.7, 1.3]);
+            LoopTables::of(&s, Slots::of(&s))
+        };
+        let (mut set, mut prune_at) = (std::collections::HashSet::new(), 0);
+        let held = intern_into(&mut set, &mut prune_at, tables(2));
+        assert_eq!(prune_at, 64, "the first insert sets the mark");
+        let again = intern_into(&mut set, &mut prune_at, tables(2));
+        assert!(Arc::ptr_eq(&held, &again), "equal content gets the held copy");
+        drop(again);
+
+        let one = tables(2);
+        let words = |t: &LoopTables| {
+            let n = |v: &Vec<u32>| v.len();
+            n(&t.rhs_idx)
+                + n(&t.iota)
+                + t.methods.iter().flatten().flatten().map(n).sum::<usize>()
+                + t.forced.iter().flatten().flatten().map(n).sum::<usize>()
+                + t.sw.as_ref().map_or(0, n)
+                + t.jumps.iter().map(n).sum::<usize>()
+        };
+        assert!(!one.methods.is_empty(), "the fixture has stepper bodies");
+        assert_eq!(stats_of(&set), (1, 4 * words(&one)));
+
+        drop(intern_into(&mut set, &mut prune_at, tables(3)));
+        assert_eq!(set.len(), 2, "below the mark nothing is dropped");
+        prune_at = 2;
+        let four = intern_into(&mut set, &mut prune_at, tables(4));
+        assert_eq!(set.len(), 2, "the unheld three-state copy went, the four-state one came");
+        assert!(set.contains(&tables(2)) && set.contains(&tables(4)) && !set.contains(&tables(3)));
+        assert_eq!(prune_at, 64, "the mark moves to twice what is left, at least 64");
+        assert!(Arc::ptr_eq(&held, &intern_into(&mut set, &mut prune_at, tables(2))));
+        assert_eq!(stats_of(&set), (2, 4 * (words(&held) + words(&four))));
+    }
 }
