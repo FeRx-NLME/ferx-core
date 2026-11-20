@@ -1037,9 +1037,10 @@ it is not counted as 0 or 1. Counting it as 0 would put a point mass at 0 into t
 once enough replicates had reached zero the lower edge would sit at 0, the observed curve
 could never fall below it and the misses would all fall above (#2930). The observed curve
 follows the same rule: past its last time it is undefined. A band point with fewer
-replicates than `⌈1 / min(p, 1 − p)⌉ − 1` (19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one
-curve, so its quantile is only an interpolation between the two most extreme values. So
-`n_sim` must be at least one more than that, 20 for the default band.
+replicates than `⌈1 / min(p, 1 − p)⌉ − 1` (19 for 5 %/95 %) is empty: with fewer than
+about 1/p curves the p-tail holds less than one curve, so its quantile is only an
+interpolation between the two most extreme values. So `n_sim` must be at least one more
+than that, 20 for the default band.
 
 The automatic grid is 0, the stratum's observed times and 101 evenly spaced points up to the
 horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of
