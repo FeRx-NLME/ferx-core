@@ -8985,7 +8985,7 @@ fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment()
         FORCE_LINEAR_DECLINE.set(true);
         // The seam is no value a compiled plan's guard reads (#2786): the plans recorded on
         // the exact path go, so the declined pass records its own.
-        crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
+        crate::parser::model_parser::rhs_regcode::kernel_jit::reset_model(&m);
         let declined = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
         FORCE_LINEAR_DECLINE.set(false);
         (exact, declined)

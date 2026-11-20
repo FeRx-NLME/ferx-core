@@ -1601,6 +1601,46 @@ fn drop_model_clears_only_its_own_kept_forwards() {
     assert!(!kept_lock().contains_key(&ob));
 }
 
+/// `reset_model` is `reset` for one model: it forgets that model's unregistered (scope `0`)
+/// kept forwards and bad marks, and leaves both another model's and its own under a fit's
+/// scope. The ferx-core tests that need a fresh recording call it, so they no longer empty the
+/// tables under every test beside them. Mutations: drop `scope == 0` from its predicate -> the
+/// fit-scoped entry goes; drop the model test -> the other model's entries go.
+#[test]
+fn reset_model_forgets_only_its_own_unregistered_state() {
+    let _resets = resets_shared();
+    let parse = || {
+        crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  \
+             ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n\
+             [scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP)\n",
+        )
+        .expect("parses")
+    };
+    let (a, b) = (parse(), parse());
+    let (ma, mb) = (a.plan_id.get(), b.plan_id.get());
+    assert_ne!(ma, mb, "two parses are two models");
+    let fit_scope = 0x7a_5c0f_u64;
+    // (forward address, scope, model): A's unregistered, A's under a fit, B's unregistered.
+    let entries = [(0x7a_2001usize, 0, ma), (0x7a_2002, fit_scope, ma), (0x7a_2003, 0, mb)];
+    for &(o, scope, model) in &entries {
+        kept_lock().insert(o, Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope, model });
+        bad_models().write().unwrap().insert((scope, model), "test".into());
+    }
+    reset_model(&a);
+    let kept: Vec<bool> = entries.iter().map(|e| kept_lock().contains_key(&e.0)).collect();
+    let bad: Vec<bool> =
+        entries.iter().map(|e| bad_models().read().unwrap().contains_key(&(e.1, e.2))).collect();
+    assert_eq!(kept, [false, true, true], "kept forwards: A's unregistered one only");
+    assert_eq!(bad, [false, true, true], "bad marks: A's unregistered one only");
+    drop(a);
+    drop(b);
+    drop_scope(fit_scope);
+    assert!(entries.iter().all(|e| !kept_lock().contains_key(&e.0)), "cleaned up");
+}
+
 /// The kept table's lock is taken from `Drop` (`drop_scope`, `Prints::drop`): one poisoned by a
 /// panic elsewhere must not turn a drop into a second panic (#2786 round 2, finding 9).
 /// Mutation: `.lock().unwrap()` in `kept_lock` -> the drop panics.

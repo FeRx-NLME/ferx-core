@@ -3045,6 +3045,27 @@ pub fn reset() {
     drop_scope(0);
 }
 
+/// [`reset`] for one model (and its absorption ODE twin): forget its unregistered plans, kept
+/// forwards, bad marks and failure records, and nothing of any other model's. A test that needs
+/// a fresh recording of its own subjects calls this: [`reset`] empties those tables under every
+/// test running beside it, so a concurrent test lost the plan it had just recorded ("the subject
+/// has no plan" — 6 runs in 6 beside the ferx-core callers, 0 in 6 without them).
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_model(model: &crate::types::CompiledModel) {
+    use std::sync::PoisonError;
+    let ids: Vec<u64> = std::iter::once(model.plan_id.get())
+        .chain(model.absorption_ode_equivalent.as_ref().map(|t| t.built().plan_id.get()))
+        .collect();
+    let mine = |scope: u64, m: u64| scope == 0 && ids.contains(&m);
+    clear_kept(|k| mine(k.scope, k.model));
+    let mut s = subjects().write().unwrap_or_else(PoisonError::into_inner);
+    s.retain(|k, _| !mine(k.scope, k.model));
+    GENERATION.fetch_add(1, Relaxed);
+    drop(s);
+    bad_models().write().unwrap_or_else(PoisonError::into_inner).retain(|&(sc, m), _| !mine(sc, m));
+    failures().lock().unwrap_or_else(PoisonError::into_inner).retain(|&(sc, m), _| !mine(sc, m));
+}
+
 pub enum Lookup {
     Missing,
     Bad,

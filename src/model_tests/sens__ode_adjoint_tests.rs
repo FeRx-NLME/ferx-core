@@ -1942,7 +1942,7 @@ fn dormant_accumulators_match_reconverged_fd(
         let x = pack_params(&params);
         let eta = ebe_for(&model, &s, &params, 1e-10, true);
         // A fresh recording: the reduction is decided where the plan is recorded.
-        crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
+        crate::parser::model_parser::rhs_regcode::kernel_jit::reset_model(&model);
         crate::sens::linsolve::RECORDED_ZEROS_KEPT.with(|c| c.set(keep));
         DORMANT_STATES.with(|c| c.set(0));
         let scope = SolverStatsScope::enter();
@@ -1989,7 +1989,7 @@ fn dormant_accumulators_match_reconverged_fd(
             .stack_size(crate::FIT_RAYON_STACK_SIZE)
             .spawn_scoped(scope, || {
                 use crate::ode::linear::DORMANT_STATES as DORMANT_STATES_COV;
-                crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
+                crate::parser::model_parser::rhs_regcode::kernel_jit::reset_model(&model);
                 DORMANT_STATES_COV.with(|c| c.set(0));
                 subject_adjoint_cov_hessian(
                     &model,
@@ -2112,7 +2112,7 @@ fn taped_graphs_match_the_objective(src: &str) {
     let (_, objective) = take();
     let taped = |keep: bool| {
         // A fresh recording: a cached plan would not run the recorder again.
-        crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
+        crate::parser::model_parser::rhs_regcode::kernel_jit::reset_model(&model);
         crate::sens::linsolve::RECORDED_ZEROS_KEPT.with(|c| c.set(keep));
         let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true);
         crate::sens::linsolve::RECORDED_ZEROS_KEPT.with(|c| c.set(false));
@@ -9477,11 +9477,11 @@ pub(super) fn templated_twin(model: &CompiledModel, a: &Subject, b: &Subject) ->
     let eta = eta.as_slice();
     // `b` leaves no template of its own: what serves it below is `a`'s.
     probe(true);
-    kj::reset();
+    kj::reset_model(model);
     let fresh = grad(b, eta);
     probe(false);
     grad(a, eta);
-    kj::reset();
+    kj::reset_model(model);
     probe(false);
     replays();
     let served = grad(b, eta);
@@ -9922,7 +9922,7 @@ fn linear_ode_plan_values_are_bit_equal_to_the_native_predictor() {
     for pade in [false, true] {
         SPECTRAL_OFF.with(|c| c.set(pade));
         // A plan recorded under the other propagation would serve this one's points.
-        kj::reset();
+        cases.iter().for_each(|(_, m, _, _)| kj::reset_model(m));
         for (label, m, s, ne) in &cases {
             let theta = moved_params(m).theta;
             let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(m, s, &theta, e);
@@ -9947,7 +9947,7 @@ fn linear_ode_plan_values_are_bit_equal_to_the_native_predictor() {
     // KA = CL/V exactly and within the spectral gap bound (1e-4): the native path takes Padé
     // there, so a plan recorded on the spectral path must decline (its guard on the analysis's
     // verdict fails) rather than serve a spectral value; where it serves, it is the native bits.
-    kj::reset();
+    cases.iter().for_each(|(_, m, _, _)| kj::reset_model(m));
     let (_, m, s, _) = &cases[1];
     let theta = moved_params(m).theta;
     let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(m, s, &theta, e);

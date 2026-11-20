@@ -8725,7 +8725,7 @@ mod tests {
             pool.install(|| {
                 // Each count from an empty plan cache: the second run would otherwise reuse
                 // the first's recordings (the same model and subjects) and build fewer.
-                crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
+                crate::parser::model_parser::rhs_regcode::kernel_jit::reset_model(&model);
                 reset_schedule_build_count();
                 let opts = tv_imp_options(iterations);
                 run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
