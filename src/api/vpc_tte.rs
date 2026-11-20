@@ -143,7 +143,7 @@ pub struct TteVpcStratum {
     /// The observed Kaplan–Meier curve with its Nelson–Aalen cumulative hazard.
     pub observed: KmCurve,
     pub grid: Vec<f64>,
-    /// The observed curve on the grid (`None` past its last time unless it reached 0).
+    /// The observed curve on the grid (`None` past its last time, also where it reached 0).
     pub obs_on_grid: Vec<Option<f64>>,
     pub lo: Vec<Option<f64>>,
     pub med: Vec<Option<f64>>,
