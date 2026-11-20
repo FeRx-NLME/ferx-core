@@ -1393,7 +1393,8 @@ survfit's. At every time the observed `F_1 + … + F_K + S = 1`.
 
 This is not `1 − KM` of one cause with the other causes treated as censorings. That curve
 estimates the incidence in a world without the other causes and overstates it: on the survfit
-fixture below it reaches 0.776 for a cause whose cumulative incidence is 0.527. It is also why
+fixture below (stratum B, the first cause) it ends at 0.750 where the cumulative incidence ends
+at 0.375. It is also why
 `vpc_tte()` and `vpc_kmmc()` refuse several TTE endpoints without a `cmt`.
 
 The bands are pointwise, cause by cause. A band's median or limits at a time need not add up
