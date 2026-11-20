@@ -199,7 +199,10 @@ mod self_consistency {
                 swap[0][g] < 0.5 && swap[1][g] < 0.5,
                 "swapped causes covered at {t}: {swap:?}"
             );
-            assert!(swap[2][g] >= LO, "swapped causes broke the survival band at {t}: {swap:?}");
+            assert!(
+                swap[2][g] >= LO_SWAP,
+                "swapped causes broke the survival band at {t}: {swap:?}"
+            );
         }
     }
 
@@ -208,4 +211,8 @@ mod self_consistency {
     /// `qbinom(c(.005, .995), 200, 0.891) / 200` in R.
     const LO: f64 = 0.83;
     const HI: f64 = 0.945;
+    /// The same interval's lower end for the `M_SWAP = 100` datasets of the swapped-rates
+    /// half: `qbinom(.005, 100, 0.891) / 100` in R. The survival band there measured
+    /// 0.898 at its lowest.
+    const LO_SWAP: f64 = 0.80;
 }
