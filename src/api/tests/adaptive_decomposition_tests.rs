@@ -461,3 +461,136 @@ fn zero_reps_are_refused() {
                 run without replicates";
     assert!(e.to_string().contains(want), "{e}");
 }
+
+// ── the analytic conditional oracle ────────────────────────────────────────────────────
+
+/// Probabilists' Gauss–Hermite nodes and normalised weights (Golub–Welsch).
+fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut j = nalgebra::DMatrix::<f64>::zeros(n, n);
+    for k in 1..n {
+        j[(k - 1, k)] = (k as f64).sqrt();
+        j[(k, k - 1)] = (k as f64).sqrt();
+    }
+    let e = j.symmetric_eigen();
+    let w: Vec<f64> = (0..n).map(|k| e.eigenvectors[(0, k)].powi(2)).collect();
+    let total: f64 = w.iter().sum();
+    (e.eigenvalues.iter().copied().collect(), w.iter().map(|v| v / total).collect())
+}
+
+/// `E[Y | θ]`, `Var_η E[Y | θ, η]` and `E_η Var_κ(Y | θ, η)` of `Y = signal_mean` on the
+/// fixture, by quadrature outside the engine: three pre-dose amount readings 0, `A₁`, `A₂`.
+/// The interval ending at a record runs under that record's η (#2895), so the observation
+/// at t = 6 (occasion 0) closes `[0, 6]` under κ₀ and the decision at 24 closes `[6, 24]`
+/// under κ₁: `A₁ = 100·e^{−(6 r₀ + 18 r₁)}`, `A₂ = (A₁ + 100)·e^{−(6 r₁ + 18 r₂)}`,
+/// `r_g = TVCL·e^{η + κ_g}/V`, η ~ N(0, ω²), κ₀..κ₂ ~ N(0, ω²_IOV) independent. (Measured:
+/// the κ implied by the decision-1 reading has variance 0.0258, against
+/// (6² + 18²)/24² · 0.04 = 0.025 for this split and 0.04 for a single κ per interval.)
+fn conditional_moments(tvcl: f64, v: f64, omega2: f64, iov2: f64) -> [f64; 3] {
+    let (xe, we) = gauss_hermite(40);
+    let (xk, wk) = gauss_hermite(12);
+    let sk = iov2.sqrt();
+    let y = |l: f64, k: [f64; 3]| {
+        let r = |kg: f64| (l + kg).exp() / v;
+        let a1 = 100.0 * (-(6.0 * r(k[0]) + 18.0 * r(k[1]))).exp();
+        let a2 = (a1 + 100.0) * (-(6.0 * r(k[1]) + 18.0 * r(k[2]))).exp();
+        (a1 + a2) / 3.0
+    };
+    let (mut m, mut m2, mut w) = (0.0, 0.0, 0.0);
+    for (&xa, &wa) in xe.iter().zip(&we) {
+        let l = tvcl.ln() + omega2.sqrt() * xa;
+        let (mut me, mut me2) = (0.0, 0.0);
+        for (&x0, &w0) in xk.iter().zip(&wk) {
+            for (&x1, &w1) in xk.iter().zip(&wk) {
+                for (&x2, &w2) in xk.iter().zip(&wk) {
+                    let v = y(l, [sk * x0, sk * x1, sk * x2]);
+                    me += w0 * w1 * w2 * v;
+                    me2 += w0 * w1 * w2 * v * v;
+                }
+            }
+        }
+        m += wa * me;
+        m2 += wa * me * me;
+        w += wa * (me2 - me * me);
+    }
+    [m, m2 - m * m, w]
+}
+
+/// The fixture's fit: packed variance 0.04 on ln TVCL only (log-normal θ); every other
+/// coordinate gets the sampler's floor, and the oracle reads each draw's θ, ω and ω_IOV
+/// back from `result.parameters`, so the floor's movements are accounted for.
+fn iov_fit(m: &CompiledModel) -> FitResult {
+    let mut fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
+    fit.omega_iov = m.default_params.omega_iov.as_ref().map(|o| o.matrix.clone());
+    fit.kappa_names = m.default_params.omega_iov.as_ref().map_or(vec![], |o| o.eta_names.clone());
+    fit.kappa_fixed = m.default_params.kappa_fixed.clone();
+    let cov = fit.covariance_matrix.as_mut().expect("synthetic fit has a matrix");
+    cov.fill(0.0);
+    cov[(0, 0)] = 0.04;
+    fit
+}
+
+/// The plan's analytic decomposition, re-derived after PR1.5: metrics are scored on the
+/// latent signal, so with a fixed controller the assay ε cannot reach `signal_mean` and the
+/// within layer comes from the IOV κ alone (`~/ferx-probes/946/pr3/decomp_oracle_iov.R`:
+/// param 10.60 (25.1%), BSV 26.48 (62.7%), within 5.16 (12.2%) amount², averaged over θ;
+/// without κ the within layer is exactly 0, which is the exact-zero test above).
+///
+/// Conditional oracle: each layer is compared with its quadrature at the run's **own**
+/// draws θ_d (`result.parameters`) — `Var_d E[Y|θ_d]` (sample variance), `mean_d Var_η`
+/// and `mean_d E_η Var_κ` — which cancels the D-sampling error of the parameter layer.
+/// D 100 × S 20 × R 2 on one subject. Tolerances are 4 SD of the gap, measured over 300
+/// seeds in `cond_gap_sd.R`: SD 8.65% (param), 5.15% (BSV), 4.51% (within).
+/// Realised gaps (macOS arm64): param −4.1% (0.48 SD), BSV +0.46% (0.09 SD), within −2.6%
+/// (0.57 SD); 4000 runs in 0.7 s (debug).
+///
+/// Mutations: swap two layers (≥ 150% gaps); drop R from the BSV divisor (BSV ×2); η keyed
+/// by rep (BSV → ~0, within absorbs it).
+#[test]
+fn the_layers_match_the_conditional_quadrature_at_the_runs_own_draws() {
+    let m = model("omega ETA_CL ~ 0.09", "kappa KAPPA_CL ~ 0.04");
+    let fit = iov_fit(&m);
+    let params = fitted_params_from_result(&fit, &m).expect("template");
+    let start = std::time::Instant::now();
+    let r = simulate_adaptive_with_inputs(
+        &m,
+        &pop(1),
+        &AdaptiveInputs::new(&params).with_uncertainty(
+            &fit,
+            UncertaintySpec { method: UncertaintyMethod::Asymptotic, n_draws: 100 },
+        ),
+        20,
+        fixed_bolus,
+        &opts(ObserveMode::Ipred, 2),
+    )
+    .expect("runs");
+    eprintln!("4000 runs: {:.2} s", start.elapsed().as_secs_f64());
+    let d = decompose_adaptive(&r).expect("decomposes");
+    assert_eq!((d.n_draws, d.n_sims, d.n_reps), (100, 20, 2));
+
+    let moments: Vec<[f64; 3]> = r
+        .parameters
+        .iter()
+        .map(|p| {
+            let q = &p.parameters;
+            let iov = q.omega_iov.as_ref().expect("Ω_IOV").matrix[(0, 0)];
+            conditional_moments(q.theta[0], q.theta[1], q.omega.matrix[(0, 0)], iov)
+        })
+        .collect();
+    let n = moments.len() as f64;
+    let mean_of = |k: usize| moments.iter().map(|q| q[k]).sum::<f64>() / n;
+    let m0 = mean_of(0);
+    let want = [
+        moments.iter().map(|q| (q[0] - m0).powi(2)).sum::<f64>() / (n - 1.0),
+        mean_of(1),
+        mean_of(2),
+    ];
+    let s = subject("1");
+    for ((layer, want), tol) in
+        [L::Parameter, L::Bsv, L::Within].into_iter().zip(want).zip([0.35, 0.21, 0.18])
+    {
+        let (got, _) = est(&d, &s, layer);
+        let gap = (got - want) / want;
+        eprintln!("{layer:?}: engine {got:.5} quadrature {want:.5} gap {gap:+.4}");
+        assert!(gap.is_finite() && gap.abs() < tol, "{layer:?}: {got} vs {want} ({gap:+.4})");
+    }
+}
