@@ -35,9 +35,20 @@ fn scratch(slot: &str) -> PathBuf {
     dir
 }
 
+/// peakmem.py, with the GitHub Actions variables that name the runner removed, so a
+/// guard run inside CI records `runner: local` like a run anywhere else.
 fn peakmem(args: &[&str]) -> Output {
-    Command::new("python3")
-        .arg("-I")
+    peakmem_on(None, args)
+}
+
+/// peakmem.py as if on a GitHub Actions runner of `runner` kind (`None`: outside CI).
+fn peakmem_on(runner: Option<&str>, args: &[&str]) -> Output {
+    let mut cmd = Command::new("python3");
+    cmd.env_remove("GITHUB_ACTIONS").env_remove("RUNNER_ENVIRONMENT");
+    if let Some(r) = runner {
+        cmd.env("GITHUB_ACTIONS", "true").env("RUNNER_ENVIRONMENT", r);
+    }
+    cmd.arg("-I")
         .arg(script())
         .args(args)
         .output()
@@ -88,6 +99,7 @@ fn results(platform: &str, cases: &[(&str, String)]) -> String {
     let cs: Vec<String> = cases.iter().map(|(n, c)| format!(r#""{n}": {c}"#)).collect();
     format!(
         r#"{{"schema": 1, "label": "main@abc", "platform": "{platform}", "threads": 4,
+            "runner": "github-hosted",
             "model_sha256": "m", "data_sha256": "d", "cases": {{{}}}}}"#,
         cs.join(", ")
     )
@@ -96,6 +108,7 @@ fn results(platform: &str, cases: &[(&str, String)]) -> String {
 fn baseline(platform: &str, eval: u64, fit: u64) -> String {
     format!(
         r#"{{"schema": 1, "platform": "{platform}", "threads": 4, "model_sha256": "m",
+            "runner": "github-hosted",
             "data_sha256": "d", "reason": "t", "cases": {{
             "eval": {{"peak_rss_bytes": {eval}}}, "fit": {{"peak_rss_bytes": {fit}}}}}}}"#
     )
@@ -228,6 +241,15 @@ fn a_drifted_probe_fails_even_with_a_lower_peak() {
     assert!(!fd.status.success(), "{}", text(&fd));
     assert!(row(&text(&fd), "eval").contains("not analytic"), "{}", text(&fd));
 
+    // Fail closed: a record with no `gradient_method_outer` (renamed, dropped, null) is
+    // no evidence of the analytic plan path.
+    let missing = case(100 * MIB, true, "analytic", NOT_REQUESTED)
+        .replace(r#""gradient_method_outer": "analytic","#, "");
+    assert!(!missing.contains("gradient_method_outer"), "{missing}");
+    let gone = report("nogradient", "Linux/x86_64", missing, fit_ok());
+    assert!(!gone.status.success(), "{}", text(&gone));
+    assert!(row(&text(&gone), "eval").contains("not analytic"), "{}", text(&gone));
+
     let ok = report(
         "escalates",
         "Linux/x86_64",
@@ -296,6 +318,38 @@ fn changed_inputs_are_not_judged_against_the_old_baseline() {
 /// The fake binary checks the case's spelling of `maxiter` / `covariance`, so a rewrite
 /// that measured the eval twice would fail here; it reports a different peak per case,
 /// so a parser that read the wrong number would too.
+/// A baseline measured off the reference runner (a laptop, a container, emulation) is
+/// provisional. The first reference run against it fails, however well its numbers
+/// agree, and says to accept its artifact; a local run against the same baseline, and a
+/// reference run against a reference baseline, are judged as usual. Each twin differs
+/// from the failing one in exactly one runner field.
+#[test]
+fn a_provisional_baseline_fails_the_first_reference_run() {
+    let dir = scratch("provisional");
+    let local = |body: String| body.replace(r#""runner": "github-hosted""#, r#""runner": "local""#);
+    let head = results("Linux/x86_64", &[("eval", eval_at(1.0)), ("fit", fit_ok())]);
+    let base = baseline("Linux/x86_64", 100 * MIB, 400 * MIB);
+    let go = |name: &str, head: String, base: String| {
+        let res = write(&dir, &format!("{name}-results.json"), &head);
+        let b = write(&dir, &format!("{name}-baseline.json"), &base);
+        peakmem(&["report", "--results", &res, "--baseline", &b])
+    };
+
+    let first = go("first", head.clone(), local(base.clone()));
+    let t = text(&first);
+    assert!(!first.status.success(), "{t}");
+    assert!(t.contains("provisional") && t.contains("accept"), "{t}");
+    assert!(row(&t, "eval").contains("within tolerance"), "{t}");
+
+    let both_local = go("bothlocal", local(head.clone()), local(base.clone()));
+    assert!(both_local.status.success(), "{}", text(&both_local));
+    assert!(!text(&both_local).contains("provisional"), "{}", text(&both_local));
+
+    let reference = go("reference", head, base);
+    assert!(reference.status.success(), "{}", text(&reference));
+    assert!(!text(&reference).contains("provisional"), "{}", text(&reference));
+}
+
 #[cfg(unix)]
 #[test]
 fn run_measures_each_case_and_accept_writes_the_baseline() {
@@ -336,10 +390,19 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let res = dir.join("results.json");
-    let out = peakmem(&["run", "--ferx", fake.to_str().unwrap(), "--out", res.to_str().unwrap()]);
+    let run_args = ["run", "--ferx", fake.to_str().unwrap(), "--out", res.to_str().unwrap()];
+    // Outside GitHub Actions the run is `local`, whatever the platform says.
+    let out = peakmem(&[&run_args[..], &["--cases", "eval"]].concat());
     assert!(out.status.success(), "{}", text(&out));
     let r: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&res).unwrap()).unwrap();
+    assert_eq!(r["runner"], "local", "{r}");
+
+    let out = peakmem_on(Some("github-hosted"), &run_args);
+    assert!(out.status.success(), "{}", text(&out));
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&res).unwrap()).unwrap();
+    assert_eq!(r["runner"], "github-hosted", "{r}");
     for c in ["eval", "fit"] {
         assert_eq!(r["cases"][c]["status"], "ok", "{c}: {r}");
         assert_eq!(r["cases"][c]["escalated"], true, "{c}: {r}");
@@ -368,6 +431,7 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
         serde_json::from_str(&std::fs::read_to_string(&base).unwrap()).unwrap();
     assert_eq!(b["cases"]["fit"]["peak_rss_bytes"].as_u64(), Some(fit_peak));
     assert_eq!(b["reason"], "test");
+    assert_eq!(b["runner"], "github-hosted", "accept carries the run's provenance: {b}");
     // The accepted baseline judges its own run green.
     let again = peakmem(&[
         "report",
@@ -463,6 +527,7 @@ fn the_committed_baseline_matches_the_committed_probe() {
         "Linux is the reference (#1688)"
     );
     assert!(!base["reason"].as_str().unwrap().trim().is_empty());
+    assert!(base["runner"].is_string(), "the baseline names the runner it was measured on");
     for c in ["eval", "fit"] {
         let p = base["cases"][c]["peak_rss_bytes"].as_u64().unwrap_or(0);
         assert!(p > 10 * MIB, "{c} baseline {p} bytes is not a plausible peak");

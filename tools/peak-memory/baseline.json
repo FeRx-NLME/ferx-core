@@ -14,7 +14,8 @@
  "measured": "64b3afd7+3081 Linux/x86_64 (OrbStack Rosetta)",
  "model_sha256": "301923c139dab077979cdae4a98a23fa7a7d06652a99f02fba8e46905c7c3c3a",
  "platform": "Linux/x86_64",
- "reason": "#3081: first baseline, release build of 64b3afd7 + this branch, 4 threads, Linux/x86_64 under OrbStack (Rosetta) on Apple silicon, not a CI runner: re-baseline from the first nightly's peak-memory-results. A repeat eval run read 189 MB (-8%). model_sha256 later re-pointed for a comment-only edit of stiff_pkpd.ferx (its regeneration command), not re-measured.",
+ "runner": "local",
+ "reason": "#3081: first baseline, release build of 64b3afd7 + this branch, 4 threads, Linux/x86_64 under OrbStack (Rosetta) on Apple silicon, not a CI runner: provisional (runner `local`): the first nightly fails until its peak-memory-results are accepted. A repeat eval run read 189 MB (-8%). model_sha256 later re-pointed for a comment-only edit of stiff_pkpd.ferx (its regeneration command), not re-measured.",
  "schema": 1,
  "threads": 4
 }

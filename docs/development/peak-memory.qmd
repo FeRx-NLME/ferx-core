@@ -64,7 +64,7 @@ measured. A baseline is only comparable at the thread count it was taken at.
 | `=` | within ±25 % of the baseline | passes |
 | `▲` | more than 25 % above the baseline | **fails** |
 | `▼` | more than 25 % below the baseline: lock it in with `accept` | passes |
-| `!` | the probe drifted: `auto` stopped escalating, the outer gradient is no longer analytic, or a case's covariance status is not the expected one (`NotRequested` for `eval`, `Computed` for `fit`) | **fails** |
+| `!` | the probe drifted: `auto` stopped escalating, the outer gradient is not recorded as analytic (a missing field counts as drift), or a case's covariance status is not the expected one (`NotRequested` for `eval`, `Computed` for `fit`) | **fails** |
 | `✗` | the case failed, timed out, or was not run | **fails** |
 | `·` | not judged: another platform, thread count or input files than the baseline | passes |
 
@@ -76,6 +76,14 @@ off the compiled plans, stops the stiff escalation, or skips or breaks the `fit`
 case's covariance step (where e7070's post-fit spike lived), the peak can drop for a
 reason that has nothing to do with memory. That is a different measurement, not
 a win, and the probe has to be repaired before its numbers mean anything.
+
+A baseline records the **runner** it was measured on: `github-hosted` for the
+nightly, `local` for anything outside GitHub Actions. A baseline from anywhere
+but `github-hosted` is **provisional**. A laptop, a container or emulation can
+report the same `Linux/x86_64` platform string while moving peak RSS by more
+than the tolerance, so the first `github-hosted` run against a provisional
+baseline fails the job, whatever its verdicts, until its artifact is accepted.
+A local run against it is judged as usual.
 
 A baseline taken on another platform is shown but not judged. Linux is the
 reference platform (see
@@ -139,11 +147,11 @@ Rosetta on Apple silicon, image `rustlang/rust:nightly`, glibc 2.41):
 | `eval` | 205 MB (a repeat run: 189 MB, −8 %) | 94 s |
 | `fit` | 962 MB | 24 min |
 
-The platform string matches the runner's, so the first nightly judges against
-these numbers. Emulation can move peak RSS by itself. If the first nightly reads
-`▲` or `▼` and no change explains it, re-baseline from that night's
-`peak-memory-results` artifact with `accept`. Do the same if it reads `=`, so the
-baseline names a real runner measurement.
+It records `runner: local`, so it is provisional: the first nightly shows its
+verdicts against these numbers and then fails, by design, until that night's
+`peak-memory-results` artifact is accepted. A `▲` there is still worth reading
+before accepting, since emulation can move peak RSS by itself but a 10× jump is
+not emulation.
 
 ## Running it locally
 

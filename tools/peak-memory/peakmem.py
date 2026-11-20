@@ -90,6 +90,21 @@ FIT_OPTION_LINE = re.compile(r"^(  (maxiter|covariance) +=) (\S+)$", re.MULTILIN
 # memory — `report` flags it rather than calling it an improvement.
 ESCALATION_CODE = "W_ODE_SOLVER_ESCALATION_NOTE"
 
+# Where a run was measured. The nightly's GitHub-hosted runner is the reference; anything
+# else (a laptop, a container, emulation, a self-hosted runner) reports the same
+# `platform` string while its allocator, kernel and CPU can move peak RSS by more than
+# TOLERANCE. A baseline taken anywhere else is PROVISIONAL: the first reference run
+# against it fails until its artifact is accepted, so a stand-in number cannot stay
+# the guard by default.
+REFERENCE_RUNNER = "github-hosted"
+
+
+def runner() -> str:
+    """`github-hosted` / `self-hosted` inside GitHub Actions, `local` elsewhere."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return "local"
+    return os.environ.get("RUNNER_ENVIRONMENT") or "unknown"
+
 
 def sha256(path: Path) -> str | None:
     try:
@@ -139,7 +154,8 @@ def probe_drift(case: str, rec: dict) -> list[str]:
     drift = []
     if not rec.get("escalated"):
         drift.append("`auto` no longer escalates")
-    if rec.get("gradient_method_outer") not in (None, "analytic"):
+    # Fail closed: a missing, null or renamed field is no evidence of the plan path.
+    if rec.get("gradient_method_outer") != "analytic":
         drift.append(f"outer gradient is `{rec.get('gradient_method_outer')}`, not analytic")
     want = EXPECTED_COVARIANCE.get(case)
     got = rec.get("covariance_status")
@@ -227,6 +243,7 @@ def cmd_run(a) -> int:
         "label": a.label,
         "created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "platform": platform(),
+        "runner": runner(),
         "threads": FERX_THREADS,
         "model_sha256": sha256(MODEL),
         "data_sha256": sha256(DATA),
@@ -316,7 +333,16 @@ def cmd_report(a) -> int:
                              "changed, so the baseline measured a different thing. "
                              "Re-measure and `accept` in the same PR.")
                 judged = False
-    lines += [f"Run `{head.get('label')}` on `{head.get('platform')}`, "
+    provisional = False
+    if judged and head.get("runner") == REFERENCE_RUNNER \
+            and base.get("runner") != REFERENCE_RUNNER:
+        notes.append(f"The baseline is provisional: measured on runner "
+                     f"`{base.get('runner', 'local')}`, not `{REFERENCE_RUNNER}`. This run "
+                     "is a reference measurement, so the job fails until it is accepted: "
+                     "download this run's `peak-memory-results` and `peakmem.py accept` it.")
+        provisional = True
+    lines += [f"Run `{head.get('label')}` on `{head.get('platform')}` "
+              f"(runner `{head.get('runner', 'local')}`), "
               f"{head.get('threads')} threads; tolerance ±{TOLERANCE:.0%}.", ""]
     lines += [f"> {n}" for n in notes] + ([""] if notes else [])
     lines += ["| case | baseline | head | Δ | wall | | note |",
@@ -333,6 +359,8 @@ def cmd_report(a) -> int:
         lines.append(f"| {case} | {mb(bp)} | {mb(hp)} | {delta} | {wall} | {glyph} | {note} |")
         if bad:
             failed.append(case)
+    if provisional:
+        failed.append("provisional baseline")
     text = "\n".join(lines) + "\n"
     print(text)
     if a.summary:
@@ -363,6 +391,7 @@ def cmd_accept(a) -> int:
     out = {
         "schema": SCHEMA,
         "platform": head["platform"],
+        "runner": head.get("runner", "local"),
         "threads": head["threads"],
         "model_sha256": head["model_sha256"],
         "data_sha256": head["data_sha256"],
@@ -376,6 +405,9 @@ def cmd_accept(a) -> int:
                                 encoding="utf-8")
     for c, r in out["cases"].items():
         print(f"[peakmem] baseline {c}: {mb(r['peak_rss_bytes'])}")
+    if out["runner"] != REFERENCE_RUNNER:
+        print(f"[peakmem] runner `{out['runner']}` is not `{REFERENCE_RUNNER}`: this baseline "
+              "is provisional, and the next nightly fails until its artifact is accepted")
     return 0
 
 
