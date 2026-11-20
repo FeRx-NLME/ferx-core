@@ -2096,11 +2096,11 @@ mod tests {
     /// at 16667 and 0.001% at 50000, a half step exactly (the relative nudge before #2927
     /// gave 49996). 1e-6% starts at 49999992, not 50000000 (the old nudge gave 45454546).
     /// There the step misses the half by 8.2e-8, 7.4 `ε·|q|`, inside the tolerance of 8; at
-    /// 49999991 it misses by 8.05 and is not raised. Only 49999999 (1.34 `ε·|q|`) is within
-    /// the measured tie miss (4.45, [`TIE_ULPS`]) and so cannot be told from a tie; 49999992 to
-    /// 49999998 are raised by the tolerance's headroom over that miss (review r1 of #3106).
-    /// Exactly 50000000 would need a tolerance under 1 `ε·|q|`, which sends the measured
-    /// percent-step ties down. `1e-310%` raises
+    /// 49999991 it misses by 8.05 and is not raised. 49999996 to 49999999 (4.03, 2.68, 2.01,
+    /// 1.34 `ε·|q|`) lie within the measured tie miss (4.45, [`TIE_ULPS`]) and cannot be told
+    /// from a tie; 49999992 to 49999995 (7.38, 6.71, 5.37, 4.70) are raised by the tolerance's
+    /// headroom over that miss alone (review r1 and r2 of #3106). Exactly 50000000 would need a
+    /// tolerance under 1.34 `ε·|q|`, which sends the measured percent-step ties down. `1e-310%` raises
     /// nothing up to index 2^52, since `1 + 1e-312` is 1 (the old nudge raised every
     /// multiple from `5e8` up, so it returned there), and it must return: `50 / p` is
     /// infinite.
