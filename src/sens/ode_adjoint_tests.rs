@@ -489,6 +489,18 @@ thread_local! {
 /// Richardson-extrapolated central difference of the objective with the EBE re-found at
 /// every point: an oracle that shares no derivative code with either provider.
 pub(super) fn fd_oracle(model: &CompiledModel, s: &Subject, interaction: bool) -> f64 {
+    fd_oracle_on(model, model, s, interaction)
+}
+
+/// [`fd_oracle`] with the reconverged difference taken on `oracle`, the same model at a tighter
+/// integrator tolerance, so the oracle's own integration error stays below the bound while the
+/// adjoint under test keeps `model`'s (#3043).
+pub(super) fn fd_oracle_on(
+    model: &CompiledModel,
+    oracle: &CompiledModel,
+    s: &Subject,
+    interaction: bool,
+) -> f64 {
     let params = moved_params(model);
     let x = pack_params(&params);
     let eta = ebe_for(model, s, &params, ORACLE_EBE_TOL.get(), interaction);
@@ -501,8 +513,8 @@ pub(super) fn fd_oracle(model: &CompiledModel, s: &Subject, interaction: bool) -
             xp[k] += h;
             let mut xm = x.clone();
             xm[k] -= h;
-            (reconverged_f_for(model, s, &params, &xp, interaction)
-                - reconverged_f_for(model, s, &params, &xm, interaction))
+            (reconverged_f_for(oracle, s, &params, &xp, interaction)
+                - reconverged_f_for(oracle, s, &params, &xm, interaction))
                 / (2.0 * h)
         };
         let rich = (4.0 * fd(1e-3) - fd(2e-3)) / 3.0;
@@ -516,10 +528,10 @@ pub(super) fn fd_oracle(model: &CompiledModel, s: &Subject, interaction: bool) -
             "x[{k}] adjoint={:.10e} reconverged-FD={rich:.10e} rel={rel:.2e}",
             adj[k]
         );
-        worst = worst.max(rel);
+        worst = worst.max(rel); // nan-ok: `rich` and `adj[k]` are asserted finite above
     }
     assert!(
-        adj.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2,
+        adj.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2, // nan-ok: each `adj[k]` asserted finite in the loop
         "gradient too small to test"
     );
     worst
@@ -1231,12 +1243,15 @@ const ODE_MOVING_JUMP_SWITCH: &str = r#"
 /// earlier fixture with a record at 4 h had its EBE settle on that kink, crossing at
 /// 4.0000000001, where central FD averages two one-sided slopes.
 fn moving_jump_fixture(ct: f64) -> (CompiledModel, Subject) {
+    // At reltol 1e-12: the oracle's gap measured 5.9e-4, 1.9e-5 and 3.2e-7 at reltol 1e-8,
+    // 1e-10 and 1e-12, the integrator's error, falling with its tolerance to the FD floor.
+    moving_jump_fixture_at(ct, 1e-12, 1e-14)
+}
+
+/// [`moving_jump_fixture`] at the integrator tolerance `(reltol, abstol)`.
+fn moving_jump_fixture_at(ct: f64, reltol: f64, abstol: f64) -> (CompiledModel, Subject) {
     let src = ODE_MOVING_JUMP_SWITCH.replace("TVCT(3.0,", &format!("TVCT({ct},"));
-    // At reltol 1e-13: the oracle's gap measured 5.9e-4, 1.9e-5 and 3.2e-7 at reltol 1e-8,
-    // 1e-10 and 1e-12 (Linux), the integrator's error, falling with its tolerance to the FD
-    // floor. At 1e-12 it is 1.1e-6 on macOS arm64; 3.4e-8 at 1e-13, 2.4e-8 at 1e-14, the
-    // adjoint the same to 11 digits at each (#3043).
-    let model = with_tol(parse_model_string(&src).unwrap(), 1e-13, 1e-15);
+    let model = with_tol(parse_model_string(&src).unwrap(), reltol, abstol);
     let s = subject(
         &model,
         vec![
@@ -1290,18 +1305,23 @@ fn ode_jumping_moving_switch_on_an_observed_state_matches_reconverged_fd() {
         "the switch is not live"
     );
     assert!(in_scope(&model, &s), "the exact gradient must serve it");
-    let worst = fd_oracle(&model, &s, true);
+    // The adjoint at the fixture's reltol 1e-12; the oracle's reconverged difference at 1e-13,
+    // where its own integration error is below the bound (#3043). At 1e-12 that error alone read
+    // 1.14e-6 on macOS arm64 against 1.2e-7 on Linux x86_64, while the adjoint is the same to 11
+    // digits from reltol 1e-10 to 1e-14.
+    let oracle = |ct| moving_jump_fixture_at(ct, 1e-13, 1e-15).0;
+    let worst = fd_oracle_on(&model, &oracle(3.0), &s, true);
     eprintln!("jumping switch, crossing: worst {worst:.3e}");
-    // Measured 3.4e-8 on macOS arm64 (1.2e-7 on Linux x86_64 at reltol 1e-12). Mutations:
-    // no jump 2.9e2, no event location 1.15, one chord step 3.1e-3, the forced arm dropped from
-    // the locating steps 1.7e-4.
+    // Measured 3.3e-8 on macOS arm64, about 30x headroom. Mutations, measured with both at
+    // reltol 1e-12 on Linux x86_64: no jump 2.9e2, no event location 1.15, one chord step 3.1e-3
+    // (3.1e-3 again at this oracle, macOS), the forced arm dropped from the locating steps 1.7e-4.
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
 
     let (control, cs) = moving_jump_fixture(0.001);
     assert_eq!(threshold_crossings(&control, &cs), 0, "the control crosses");
-    let worst = fd_oracle(&control, &cs, true);
+    let worst = fd_oracle_on(&control, &oracle(0.001), &cs, true);
     eprintln!("jumping switch, control: worst {worst:.3e}");
-    // Measured 1.1e-8 (macOS arm64).
+    // Measured 2.4e-8 on macOS arm64.
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
 }
 
