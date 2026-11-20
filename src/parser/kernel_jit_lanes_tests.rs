@@ -327,6 +327,12 @@ fn lane_loop_prototype_numbers() {
         assert!(t.promote(true, "speed"));
         let comp_s = t1.elapsed().as_secs_f64();
         let (bytes, clif) = (NATIVE_BYTES.with(|c| c.get()), NATIVE_CLIF.with(|c| c.get()));
+        // `promote` installs the tier-2 entry point but leaves the call count at 0, so call 128
+        // would cross `TIER1_CALLS` and compile the "none" tier inside the timed loop, replacing
+        // the optimized entry point (review of #3086). Park the count past the last promotion
+        // point: `count` then never promotes, and the loop times tier 2 alone.
+        t.calls.store(TIER3_CALLS, Relaxed);
+        let entry = t.native.load(Relaxed);
         let mut want = init.clone();
         let reps = 200;
         let t2 = std::time::Instant::now();
@@ -334,6 +340,11 @@ fn lane_loop_prototype_numbers() {
             unsafe { t.call(want.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), lits.as_ptr()) };
         }
         let call_us = t2.elapsed().as_secs_f64() / reps as f64 * 1e6;
+        assert_eq!(
+            (t.native.load(Relaxed), NATIVE_CLIF.with(|c| c.get())),
+            (entry, clif),
+            "{name}: the timed calls ran the tier-2 entry point and compiled nothing"
+        );
         eprintln!(
             "{name}: {} flat instructions, {n_o} outputs, {l} lanes\n  unrolled: {ir_insts} IR insts, {clif} clif insts, {:.1} KiB native, IR build {:.2} s, compile {:.2} s, {call_us:.1} µs/call",
             cp.code.len(),

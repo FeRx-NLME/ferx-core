@@ -32,19 +32,31 @@
 //!
 //! | body | | Cranelift insts | native | compile | per call |
 //! |---|---|---|---|---|---|
-//! | Rodas5P step (17,285 flat) | unrolled | 1,672,932 | 17.2 MB | 0.76 s | 5.6 ms |
-//! | | looped, `loop_min` 8 | 378,995 | 3.0 MB | 1.36 s | 2.0 ms |
-//! | | looped, `loop_min` 16 | 428,199 | 3.9 MB | 0.94 s | 1.9 ms |
-//! | RK45 step (773 flat) | unrolled | 111,200 | 681 KiB | 0.04 s | 144 µs |
-//! | | looped, `loop_min` 8 | 36,501 | 192 KiB | 0.03 s | 126 µs |
+//! | Rodas5P step (17,285 flat) | unrolled | 1,672,932 | 17.2 MB | 0.59 s | 1.02 ms |
+//! | | looped, `loop_min` 8 | 378,995 | 3.0 MB | 0.94 s | 1.58 ms |
+//! | | looped, `loop_min` 16 | 428,199 | 3.9 MB | 0.66 s | 1.49 ms |
+//! | RK45 step (773 flat) | unrolled | 111,200 | 681 KiB | 0.03 s | 15 µs |
+//! | | looped, `loop_min` 8 | 36,501 | 192 KiB | 0.02 s | 118 µs |
+//! | RHS (56 flat) | unrolled | 3,621 | 26 KiB | — | 0.4 µs |
+//! | | looped, `loop_min` 8 | 2,734 | 12 KiB | — | 5.9 µs |
 //!
-//! So native code shrinks 4–6×, and the call gets *faster* (the unrolled kernel streams its own
-//! code through the instruction cache). The production unrolled IR (920k scalar instructions for
-//! that step) is never built. Compile time is not yet a win: the looped kernel is one function,
-//! where the production one above 24,576 instructions is cut into segments. What a call needs
-//! besides the code — the gather tables (8.2 MB here) and one scratch block per register with a
-//! live lane (4.7 MB, no reuse) — is the next lever: a payload's `(k, l)` is affine in a nested
-//! loop and needs no table, and a register's scratch can be reused once it is dead.
+//! The unrolled per-call times are tier 2 alone: the benchmark parks the kernel's call count
+//! past its last promotion point, so no tier compiles inside the timed loop (an earlier run
+//! that did not reported 5.6 ms for the Rodas step, a tier-1 compile and unoptimized calls
+//! included). Two runs agreed to within 3%.
+//!
+//! So native code shrinks 4–6× and the production unrolled IR (920k scalar instructions for
+//! that step) is never built, but every call is **slower**: 1.5× on the Rodas step, 8× on
+//! the RK45 step, 15× on the RHS. The loops pay a table load per operand lane and a scratch
+//! round trip per register that the unrolled kernel keeps in registers or folds away; the
+//! gap narrows only as the unrolled code outgrows the instruction cache. Compile time is not a
+//! win either: the looped kernel is one function, where the production one above 24,576
+//! instructions is cut into segments. As measured, the prototype buys memory (native code,
+//! IR) at the cost of per-call time. Going further needs the per-lane overhead removed
+//! first: a payload's `(k, l)` is affine in a nested loop and needs no table (8.2 MB here),
+//! a register's scratch (4.7 MB, no reuse) can be reused once it is dead, and the loops can
+//! use the f64x2 path. A lane threshold well above 78 lanes, or looping only the reverse
+//! kernels (where the memory is), are the other ways to keep the hot calls unrolled.
 use super::super::Arith;
 use super::ir::{Cc, Shim1};
 use super::*;
