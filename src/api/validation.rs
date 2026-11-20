@@ -499,16 +499,18 @@ fn reader_warning_code(w: &str) -> &str {
     }
 }
 
-/// Per-CMT scaling needs every observed CMT to have an entry in the
-/// `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. Wraps the existing
-/// `pk::validate_per_cmt_scaling` (which the parser can't run — it doesn't see
-/// the data), preserving its message verbatim.
+/// Per-CMT scaling needs every observed CMT to have an entry in the `ScalingSpec::PerCmt` map
+/// or the per-CMT `y[CMT=N]` readout, of an `[odes]`, analytical or compartment-free model
+/// (#1457). Wraps `pk::validate_per_cmt_scaling` (which the parser can't run — it doesn't see
+/// the data), preserving its message verbatim; the diagnostic's block is the one the message
+/// opens with, so the two cannot disagree.
 fn check_per_cmt_scaling(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     match pk::validate_per_cmt_scaling(model, &population.subjects) {
         Ok(()) => Vec::new(),
         Err(msg) => {
-            let block = if model.is_algebraic() { "structural_model" } else { "scaling" };
-            vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block(block)]
+            let block = msg.strip_prefix('[').and_then(|m| m.split_once(']')).map(|(b, _)| b);
+            let block = block.unwrap_or("scaling").to_string();
+            vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block(&block)]
         }
     }
 }

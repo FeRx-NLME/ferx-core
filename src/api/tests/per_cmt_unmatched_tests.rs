@@ -553,7 +553,8 @@ fn a_compartmental_readout_finding_keeps_the_scaling_label() {
 /// entry is `E_PER_CMT_SCALING` on an analytical and a compartment-free model too, as on
 /// `[odes]`, named in the block the entries are written in. Before, only `ode_spec`'s readout
 /// was checked, so both validated clean and the fit ran to the divergence sentinel.
-/// Mutation: drop the `analytic_readout` leg -> no error on either model.
+/// Observations on the declared CMTs only are the control. Mutations: drop the `analytic_readout`
+/// leg -> no error on either model; flag every observed CMT -> the control is refused.
 #[test]
 fn an_observed_cmt_with_no_readout_entry_is_an_error_on_every_readout() {
     let pop = population(OBS_CMT_1_2_3);
@@ -562,14 +563,19 @@ fn an_observed_cmt_with_no_readout_entry_is_an_error_on_every_readout() {
     for (m, block) in
         [(analytic, "scaling"), (compartment_free_readout_model(), "structural_model")]
     {
-        let errs: Vec<Diagnostic> = crate::api::check_model_data(&m, &pop)
-            .into_iter()
-            .filter(|d| d.code == "E_PER_CMT_SCALING")
-            .collect();
-        assert_eq!(errs.len(), 1, "{block}: {errs:?}");
-        assert_eq!(errs[0].block.as_deref(), Some(block), "{:?}", errs[0]);
-        assert!(errs[0].message.starts_with(&format!("[{block}]:")), "{}", errs[0].message);
-        assert!(errs[0].message.contains("[3]"), "{}", errs[0].message);
+        let errs = |pop: &Population| -> Vec<Diagnostic> {
+            crate::api::check_model_data(&m, pop)
+                .into_iter()
+                .filter(|d| d.code == "E_PER_CMT_SCALING")
+                .collect()
+        };
+        let got = errs(&pop);
+        assert_eq!(got.len(), 1, "{block}: {got:?}");
+        assert_eq!(got[0].block.as_deref(), Some(block), "{:?}", got[0]);
+        assert!(got[0].message.starts_with(&format!("[{block}]:")), "{}", got[0].message);
+        assert!(got[0].message.contains("[3]"), "{}", got[0].message);
+        // The control: observations on the declared CMTs only are not refused.
+        assert!(errs(&population(OBS_BOTH_CMTS)).is_empty(), "{block}: covered CMTs refused");
     }
 }
 
