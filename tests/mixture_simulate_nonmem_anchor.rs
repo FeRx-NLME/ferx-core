@@ -132,17 +132,8 @@ fn ferx_simulates_the_nonmem_mixture_distribution() {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(
-            values.len() as f64,
-            l.n,
-            "stratum {} at t = {}",
-            l.stratum,
-            l.time
-        );
-        assert!(
-            values.iter().all(|v| v.is_finite()),
-            "a non-finite ferx sample"
-        );
+        assert_eq!(values.len() as f64, l.n, "stratum {} at t = {}", l.stratum, l.time);
+        assert!(values.iter().all(|v| v.is_finite()), "a non-finite ferx sample");
         let below = values.iter().filter(|&&v| v < l.value).count() as f64 / l.n;
         let z = (below - l.p) / (2.0 * l.p * (1.0 - l.p) / l.n).sqrt();
         let at = format!(

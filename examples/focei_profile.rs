@@ -78,18 +78,11 @@ fn fixture(case: &str) -> (CompiledModel, Population) {
                 "data/warfarin.csv",
                 None,
             ),
-            "iov" => (
-                "examples/warfarin_iov.ferx",
-                "data/warfarin_iov.csv",
-                Some("OCC"),
-            ),
+            "iov" => ("examples/warfarin_iov.ferx", "data/warfarin_iov.csv", Some("OCC")),
             _ => panic!("unknown case: {case}"),
         };
         let model = parse_model_string(&std::fs::read_to_string(model_file).unwrap()).unwrap();
-        return (
-            model,
-            read_nonmem_csv(Path::new(data_file), None, occ).unwrap(),
-        );
+        return (model, read_nonmem_csv(Path::new(data_file), None, occ).unwrap());
     }
     let model = parse_model_string(
         r"
@@ -176,19 +169,11 @@ fn main() {
     };
     let outer_maxiter = std::env::var("FERX_PROFILE_OUTER_MAXITER")
         .ok()
-        .map(|value| {
-            value
-                .parse()
-                .expect("FERX_PROFILE_OUTER_MAXITER must be usize")
-        })
+        .map(|value| value.parse().expect("FERX_PROFILE_OUTER_MAXITER must be usize"))
         .unwrap_or(5);
     let inner_maxiter = std::env::var("FERX_PROFILE_INNER_MAXITER")
         .ok()
-        .map(|value| {
-            value
-                .parse()
-                .expect("FERX_PROFILE_INNER_MAXITER must be usize")
-        })
+        .map(|value| value.parse().expect("FERX_PROFILE_INNER_MAXITER must be usize"))
         .unwrap_or(30);
     let inner_tol = std::env::var("FERX_PROFILE_INNER_TOL")
         .ok()
@@ -197,11 +182,7 @@ fn main() {
     let opts = FitOptions {
         method,
         interaction: method == EstimationMethod::FoceI,
-        n_agq: if case == "agq" || case == "agq_block" {
-            3
-        } else {
-            1
-        },
+        n_agq: if case == "agq" || case == "agq_block" { 3 } else { 1 },
         threads: Some(threads),
         outer_maxiter,
         inner_maxiter,
@@ -216,21 +197,12 @@ fn main() {
     let mut measurements = Vec::new();
     let mut stride = 0;
     for _ in 0..repeats {
-        let (result, row) = measure("full_fit", stride, || {
-            fit(&model, &pop, params, &opts).unwrap()
-        });
-        assert_eq!(
-            signature(&result),
-            expected,
-            "repeated fit changed numerically"
-        );
+        let (result, row) =
+            measure("full_fit", stride, || fit(&model, &pop, params, &opts).unwrap());
+        assert_eq!(signature(&result), expected, "repeated fit changed numerically");
         assert_eq!(result.n_threads_used, threads);
         if mode == "stacks" || mode == "byte_stacks" {
-            let metric = if mode == "byte_stacks" {
-                "requested_bytes"
-            } else {
-                "allocation_calls"
-            };
+            let metric = if mode == "byte_stacks" { "requested_bytes" } else { "allocation_calls" };
             stride = (row["allocations"][metric].as_u64().unwrap() / 128).max(1);
         }
         measurements.push(row);

@@ -47,19 +47,11 @@ mod tests;
 /// is a term of order `1e6·σ²` per covariate row in a score whose objective does
 /// not contain it (#1421).
 fn obs_dvar_dlogsigma(
-    model: &CompiledModel,
-    err_key: usize,
-    k: usize,
-    f: f64,
-    sigma_values: &[f64],
-    mult_j: Option<&[f64]>,
-    frem_vj: Option<f64>,
+    model: &CompiledModel, err_key: usize, k: usize, f: f64, sigma_values: &[f64],
+    mult_j: Option<&[f64]>, frem_vj: Option<f64>,
 ) -> f64 {
     if let Some(v) = frem_vj {
-        let cov_k = model
-            .frem_config
-            .as_ref()
-            .map(|fc| fc.covariate_sigma_index);
+        let cov_k = model.frem_config.as_ref().map(|fc| fc.covariate_sigma_index);
         // `d(σ²)/d(log σ) = 2σ²`, and zero on the floor, which does not move.
         return if Some(k) == cov_k && v > crate::stats::likelihood::FREM_VARIANCE_FLOOR {
             2.0 * v
@@ -68,9 +60,7 @@ fn obs_dvar_dlogsigma(
         };
     }
     match mult_j {
-        Some(m) => model
-            .error_spec
-            .dvar_dlogsigma_scaled(err_key, k, f, sigma_values, m),
+        Some(m) => model.error_spec.dvar_dlogsigma_scaled(err_key, k, f, sigma_values, m),
         None => model.error_spec.dvar_dlogsigma(err_key, k, f, sigma_values),
     }
 }
@@ -87,13 +77,8 @@ fn obs_dvar_dlogsigma(
 /// prior terms are included — those are handled by the SA sufficient-statistic
 /// update for Ω_bsv and Ω_iov separately.
 pub(crate) fn obs_nll_subject_into_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    pk_scratch: &mut crate::pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    kappas: &[Vec<f64>], pk_scratch: &mut crate::pk::EventPkParams,
 ) -> f64 {
     obs_nll_subject_into_iov_with_schedule(
         model,
@@ -123,13 +108,8 @@ pub(crate) fn obs_nll_subject_into_iov(
 /// property `pk::iov_scratch_tests` already pins for that entry point.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into_iov_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    pk_scratch: &mut crate::pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    kappas: &[Vec<f64>], pk_scratch: &mut crate::pk::EventPkParams,
     schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> f64 {
     obs_nll_subject_into_iov_memo(
@@ -150,15 +130,9 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
 /// throughout); the scoring is the same code on the same values either way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into_iov_memo(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    pk_scratch: &mut crate::pk::EventPkParams,
-    schedule: Option<&crate::pk::event_driven::EventSchedule>,
-    memo: Option<MemoSlot<'_>>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    kappas: &[Vec<f64>], pk_scratch: &mut crate::pk::EventPkParams,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>, memo: Option<MemoSlot<'_>>,
 ) -> f64 {
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
@@ -173,11 +147,7 @@ pub(crate) fn obs_nll_subject_into_iov_memo(
 
 /// The scoring half of [`obs_nll_subject_into_iov_with_schedule`], from the predictions.
 fn obs_nll_subject_iov_from_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    preds: &[f64],
-    theta: &[f64],
-    sigma_values: &[f64],
+    model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
     eta: &[f64],
 ) -> f64 {
     use crate::stats::likelihood::m3_logcdf;
@@ -296,17 +266,9 @@ fn sigma_fd_step(h: f64, s: f64) -> f64 {
 /// rows. `false` on a decline or a non-finite result: the caller's per-θ path runs instead.
 #[allow(clippy::too_many_arguments)]
 fn exact_theta_score(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    d_nll_d_f: &[f64],
-    magnitude_sigma: Option<&[f64]>,
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    grad: &mut [f64],
-    df_packed: Option<&mut [Vec<f64>]>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], d_nll_d_f: &[f64],
+    magnitude_sigma: Option<&[f64]>, theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64],
+    grad: &mut [f64], df_packed: Option<&mut [Vec<f64>]>,
 ) -> bool {
     let n_theta = grad.len();
     // Under a residual magnitude θ also moves `V` directly: the kernel's data score carries
@@ -318,11 +280,7 @@ fn exact_theta_score(
         };
         for i in 0..n_theta {
             if lower[i] != upper[i] {
-                let pack = if theta_packs_log_mask[i] {
-                    theta[i]
-                } else {
-                    1.0
-                };
+                let pack = if theta_packs_log_mask[i] { theta[i] } else { 1.0 };
                 grad[i] = pack * d_theta[i];
             }
         }
@@ -342,9 +300,7 @@ fn exact_theta_score(
     .filter(|x| {
         x.grad.len() == n_theta
             && x.grad.iter().all(|g| g.is_finite())
-            && x.jac
-                .as_ref()
-                .is_none_or(|j| j.iter().all(|v| v.is_finite()))
+            && x.jac.as_ref().is_none_or(|j| j.iter().all(|v| v.is_finite()))
     }) else {
         return false;
     };
@@ -354,11 +310,7 @@ fn exact_theta_score(
         if lower[i] == upper[i] {
             continue;
         }
-        let pack = if theta_packs_log_mask[i] {
-            theta[i]
-        } else {
-            1.0
-        };
+        let pack = if theta_packs_log_mask[i] { theta[i] } else { 1.0 };
         grad[i] = pack * x.grad[i];
         if let (Some(rows), Some(jac)) = (df_packed.as_deref_mut(), x.jac.as_ref()) {
             rows[i] = (0..n_obs).map(|j| pack * jac[j * n_theta + i]).collect();
@@ -384,18 +336,9 @@ thread_local! {
 /// per-occasion predictions, chain-rule'd through the per-observation obs_nll.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_grad_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut crate::pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    kappas: &[Vec<f64>], theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64],
+    n_theta: usize, n_sigma: usize, pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
     let (nll, grad, _) = obs_nll_subject_score_iov(
         model,
@@ -429,21 +372,10 @@ pub(crate) fn obs_nll_subject_grad_iov(
 /// holds the same numbers whichever of the two filled it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_score_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut crate::pk::EventPkParams,
-    want_fisher: bool,
-    memo: Option<MemoSlot<'_>>,
-    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    kappas: &[Vec<f64>], theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64],
+    n_theta: usize, n_sigma: usize, pk_scratch: &mut crate::pk::EventPkParams, want_fisher: bool,
+    memo: Option<MemoSlot<'_>>, schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     // IOV + block_sigma is fitted by FOCE/FOCEI only (#979); the estimators that reach
@@ -512,11 +444,7 @@ pub(crate) fn obs_nll_subject_score_iov(
                     continue;
                 }
                 let raw = signed_theta_deriv(i, 1.0, pk_scratch);
-                grad[i] = if theta_packs_log_mask[i] {
-                    theta[i] * raw
-                } else {
-                    raw
-                };
+                grad[i] = if theta_packs_log_mask[i] { theta[i] * raw } else { raw };
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
@@ -686,11 +614,7 @@ pub(crate) fn obs_nll_subject_score_iov(
             continue;
         }
         let d_obs_nll = signed_theta_deriv(i, 1.0);
-        grad[i] = if theta_packs_log_mask[i] {
-            theta[i] * d_obs_nll
-        } else {
-            d_obs_nll
-        };
+        grad[i] = if theta_packs_log_mask[i] { theta[i] * d_obs_nll } else { d_obs_nll };
     }
     if let (false, Some(plan)) = (exact, nn_plan.as_ref()) {
         plan.accumulate(
@@ -760,14 +684,7 @@ pub(crate) fn obs_nll_subject_score_iov(
             })
             .collect();
     }
-    let fisher = assemble_fisher(
-        n,
-        n_theta,
-        &variances,
-        &dv_df_obs,
-        &df_packed,
-        &dv_dlogsigma,
-    );
+    let fisher = assemble_fisher(n, n_theta, &variances, &dv_df_obs, &df_packed, &dv_dlogsigma);
     (nll_base, grad, Some(fisher))
 }
 
@@ -785,16 +702,8 @@ pub(crate) fn obs_nll_subject_score_iov(
 /// skip their FD call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize,
     pk_scratch: &mut EventPkParams,
 ) -> (f64, Vec<f64>) {
     let (nll, grad, _) = obs_nll_subject_grad_impl(
@@ -824,19 +733,9 @@ pub(crate) fn obs_nll_subject_grad(
 /// objective uses, so one memo slot holds the same numbers whichever of the two filled it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_score(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut EventPkParams,
-    want_fisher: bool,
-    memo: Option<MemoSlot<'_>>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize,
+    pk_scratch: &mut EventPkParams, want_fisher: bool, memo: Option<MemoSlot<'_>>,
     schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     obs_nll_subject_grad_impl(
@@ -893,16 +792,8 @@ pub(crate) fn obs_nll_subject_score(
 /// fallback to the derivative-free M-step rather than a silently wrong step.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_grad_fisher(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize,
     pk_scratch: &mut EventPkParams,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     obs_nll_subject_grad_impl(
@@ -935,11 +826,7 @@ thread_local! {
 /// it serves — Gaussian and M3 rows by the kernel, TTE, binary and CTMM records by their own
 /// exact term: `None` on a decline, a θ/σ count it does not return, or under the test switch.
 fn exact_data_score(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>, Vec<f64>)> {
     #[cfg(test)]
     if DATA_SCORE_FD_FORCE.with(|c| c.get()) {
@@ -961,11 +848,7 @@ fn exact_data_score(
 /// empty for a pinned coordinate) and `∂V_j/∂(log σ_k)` (`dv_dlogsigma`, indexed by packed
 /// coordinate). Shared by the non-IOV and IOV scores so the two cannot drift.
 fn assemble_fisher(
-    n: usize,
-    n_theta: usize,
-    variances: &[f64],
-    dv_df_obs: &[f64],
-    df_packed: &[Vec<f64>],
+    n: usize, n_theta: usize, variances: &[f64], dv_df_obs: &[f64], df_packed: &[Vec<f64>],
     dv_dlogsigma: &[Vec<f64>],
 ) -> Vec<f64> {
     let n_obs = variances.len();
@@ -1028,21 +911,10 @@ fn assemble_fisher(
 /// method and takes none, while `score_sa`'s averaged information accepts them.
 #[allow(clippy::too_many_arguments)]
 fn obs_nll_subject_grad_impl(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut EventPkParams,
-    want_fisher: bool,
-    exact_info_only: bool,
-    memo: Option<MemoSlot<'_>>,
-    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize,
+    pk_scratch: &mut EventPkParams, want_fisher: bool, exact_info_only: bool,
+    memo: Option<MemoSlot<'_>>, schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
@@ -1123,11 +995,7 @@ fn obs_nll_subject_grad_impl(
                     continue;
                 }
                 let raw = signed_theta_deriv(i, 1.0, pk_scratch);
-                grad[i] = if theta_packs_log_mask[i] {
-                    theta[i] * raw
-                } else {
-                    raw
-                };
+                grad[i] = if theta_packs_log_mask[i] { theta[i] * raw } else { raw };
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
@@ -1344,11 +1212,7 @@ fn obs_nll_subject_grad_impl(
             let preds_p = crate::pk::compute_predictions_with_tv_into(
                 model, subject, &theta_p, eta, pk_scratch,
             );
-            let pack = if theta_packs_log_mask[i] {
-                theta[i]
-            } else {
-                1.0
-            };
+            let pack = if theta_packs_log_mask[i] { theta[i] } else { 1.0 };
             let mut dfi = vec![0.0f64; n_obs];
             let mut g = 0.0f64;
             for j in 0..n_obs {
@@ -1361,11 +1225,7 @@ fn obs_nll_subject_grad_impl(
             continue;
         }
         let d_obs_nll = signed_theta_deriv(i, 1.0, pk_scratch);
-        grad[i] = if theta_packs_log_mask[i] {
-            theta[i] * d_obs_nll
-        } else {
-            d_obs_nll
-        };
+        grad[i] = if theta_packs_log_mask[i] { theta[i] * d_obs_nll } else { d_obs_nll };
     }
 
     if let (false, Some(plan)) = (exact, nn_plan.as_ref()) {
@@ -1435,13 +1295,6 @@ fn obs_nll_subject_grad_impl(
         return (nll_base, grad, None);
     }
 
-    let fisher = assemble_fisher(
-        n,
-        n_theta,
-        &variances,
-        &dv_df_obs,
-        &df_packed,
-        &dv_dlogsigma,
-    );
+    let fisher = assemble_fisher(n, n_theta, &variances, &dv_df_obs, &df_packed, &dv_dlogsigma);
     (nll_base, grad, Some(fisher))
 }

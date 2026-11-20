@@ -233,12 +233,7 @@ mod survival_smoke {
         let model = parse_model_string(RTTE_EXP_MODEL).expect("RTTE_EXP_MODEL must parse");
         match model.endpoints.get(&2) {
             Some(EndpointLikelihood::Tte { recurrence, .. }) => {
-                assert_eq!(
-                    *recurrence,
-                    TteRecurrence::Repeated {
-                        clock: RtteClock::Forward
-                    }
-                );
+                assert_eq!(*recurrence, TteRecurrence::Repeated { clock: RtteClock::Forward });
             }
             other => panic!("expected a Repeated(Forward) Tte endpoint, got: {other:?}"),
         }
@@ -253,9 +248,7 @@ mod survival_smoke {
         assert!(matches!(
             model.endpoints.get(&2),
             Some(EndpointLikelihood::Tte {
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Forward
-                },
+                recurrence: TteRecurrence::Repeated { clock: RtteClock::Forward },
                 ..
             })
         ));
@@ -270,9 +263,7 @@ mod survival_smoke {
         assert!(matches!(
             model.endpoints.get(&2),
             Some(EndpointLikelihood::Tte {
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Reset
-                },
+                recurrence: TteRecurrence::Repeated { clock: RtteClock::Reset },
                 ..
             })
         ));
@@ -351,11 +342,7 @@ mod survival_smoke {
                 .iter()
                 .map(|&(t, dv)| ObsRecord::Event {
                     time: t,
-                    event_type: if dv == 1 {
-                        EventType::Exact
-                    } else {
-                        EventType::RightCensored
-                    },
+                    event_type: if dv == 1 { EventType::Exact } else { EventType::RightCensored },
                     entry_time: 0.0,
                     cmt: 2,
                 })
@@ -514,9 +501,7 @@ mod survival_smoke {
         let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
             .expect("a degenerate RTTE stream must not abort the whole run");
         assert!(
-            out.warnings
-                .iter()
-                .any(|w| w.contains("W_RTTE_DEGENERATE") && w.contains("#762")),
+            out.warnings.iter().any(|w| w.contains("W_RTTE_DEGENERATE") && w.contains("#762")),
             "a degenerate RTTE stream must warn: {:?}",
             out.warnings
         );
@@ -537,16 +522,9 @@ mod survival_smoke {
         let opts = FitOptions::default();
         let result =
             fit(&model, &pop, &model.default_params, &opts).expect("RTTE fit must not error");
+        assert!(result.ofv.is_finite(), "RTTE OFV must be finite; got {}", result.ofv);
         assert!(
-            result.ofv.is_finite(),
-            "RTTE OFV must be finite; got {}",
-            result.ofv
-        );
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            result.warnings.iter().any(|w| w.contains("RTTE") && w.contains("ω²")),
             "expected an RTTE-under-Laplace ω² warning; got: {:?}",
             result.warnings
         );
@@ -565,10 +543,7 @@ mod survival_smoke {
         let result =
             fit(&model, &pop, &model.default_params, &opts).expect("fixed RTTE fit must not error");
         assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            !result.warnings.iter().any(|w| w.contains("RTTE") && w.contains("ω²")),
             "fixed-effects RTTE must not emit the ω² warning; got: {:?}",
             result.warnings
         );
@@ -583,18 +558,8 @@ mod survival_smoke {
         let mut pop = rtte_pop();
         // Subject 0's first two event times go backwards (11.8 then 4.2).
         pop.subjects[0].obs_records = vec![
-            ObsRecord::Event {
-                time: 11.8,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
-            ObsRecord::Event {
-                time: 4.2,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 11.8, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
+            ObsRecord::Event { time: 4.2, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -633,24 +598,14 @@ mod survival_smoke {
         model.endpoints.insert(
             2,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::Analytic {
-                    family: HazardFamily::Exponential,
-                    param_fn,
-                },
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Reset,
-                },
+                hazard: HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn },
+                recurrence: TteRecurrence::Repeated { clock: RtteClock::Reset },
                 hazard_covariates: Vec::new(),
                 hazard_program: None,
             },
         );
-        let result = fit(
-            &model,
-            &rtte_pop(),
-            &model.default_params,
-            &FitOptions::default(),
-        )
-        .expect("a hand-built hazard must fit");
+        let result = fit(&model, &rtte_pop(), &model.default_params, &FitOptions::default())
+            .expect("a hand-built hazard must fit");
         // Not the sentinel: a repelled fit sums 1e20 per subject.
         assert!(
             result.ofv.is_finite() && result.ofv < 1e6,
@@ -663,10 +618,7 @@ mod survival_smoke {
         for subject in &pop.subjects {
             let mut last = 0.0_f64;
             for r in &subject.obs_records {
-                if let ObsRecord::Event {
-                    time, event_type, ..
-                } = r
-                {
+                if let ObsRecord::Event { time, event_type, .. } = r {
                     events += f64::from(u8::from(matches!(event_type, EventType::Exact)));
                     last = last.max(*time); // nan-ok: fixture times are literal finite values
                 }
@@ -727,10 +679,7 @@ mod survival_smoke {
         pop.subjects[0].obs_records = vec![
             ObsRecord::Event {
                 time: 5.0,
-                event_type: EventType::IntervalCensored {
-                    left: 3.0,
-                    right: 5.0,
-                },
+                event_type: EventType::IntervalCensored { left: 3.0, right: 5.0 },
                 entry_time: 0.0,
                 cmt: 2,
             },
@@ -792,12 +741,7 @@ mod survival_smoke {
         let mut pop = rtte_pop();
         // First record's entry (12.0) is after its event TIME (5.0).
         pop.subjects[0].obs_records = vec![
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 12.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 12.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -829,13 +773,8 @@ mod survival_smoke {
         model.endpoints.insert(
             2,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::Analytic {
-                    family: HazardFamily::Exponential,
-                    param_fn,
-                },
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Reset,
-                },
+                hazard: HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn },
+                recurrence: TteRecurrence::Repeated { clock: RtteClock::Reset },
                 hazard_covariates: Vec::new(),
                 hazard_program: None,
             },
@@ -843,24 +782,14 @@ mod survival_smoke {
         let mut pop = rtte_pop();
         // Right-censored row at t=8 sits BEFORE a later event at t=12 (mid-stream censor).
         pop.subjects[0].obs_records = vec![
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 8.0,
                 event_type: EventType::RightCensored,
                 entry_time: 0.0,
                 cmt: 2,
             },
-            ObsRecord::Event {
-                time: 12.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 12.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -890,13 +819,8 @@ mod survival_smoke {
         model.endpoints.insert(
             2,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::Analytic {
-                    family: HazardFamily::Exponential,
-                    param_fn,
-                },
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Reset,
-                },
+                hazard: HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn },
+                recurrence: TteRecurrence::Repeated { clock: RtteClock::Reset },
                 hazard_covariates: Vec::new(),
                 hazard_program: None,
             },
@@ -904,18 +828,8 @@ mod survival_smoke {
         let mut pop = rtte_pop();
         // Two events at the identical TIME=5 (zero inter-event gap).
         pop.subjects[0].obs_records = vec![
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -948,13 +862,8 @@ mod survival_smoke {
         model.endpoints.insert(
             2,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::Analytic {
-                    family: HazardFamily::Exponential,
-                    param_fn,
-                },
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Reset,
-                },
+                hazard: HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn },
+                recurrence: TteRecurrence::Repeated { clock: RtteClock::Reset },
                 hazard_covariates: Vec::new(),
                 hazard_program: None,
             },
@@ -962,12 +871,7 @@ mod survival_smoke {
         let mut pop = rtte_pop();
         // First record's entry (12.0) is after its event TIME (5.0), under clock=reset.
         pop.subjects[0].obs_records = vec![
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 12.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 12.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -1004,12 +908,7 @@ mod survival_smoke {
         let mut pop = rtte_pop();
         // Subject enters the risk set at t=4 (delayed entry, entry_time > 0) on both rows.
         pop.subjects[0].obs_records = vec![
-            ObsRecord::Event {
-                time: 6.0,
-                event_type: EventType::Exact,
-                entry_time: 4.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 6.0, event_type: EventType::Exact, entry_time: 4.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -1055,10 +954,7 @@ mod survival_smoke {
             match r.outcome {
                 SimOutcome::Event { time, observed } => {
                     assert_eq!(r.cmt, 2, "RTTE rows stay on the endpoint CMT");
-                    by_id
-                        .entry(r.id.clone())
-                        .or_default()
-                        .push((time, observed));
+                    by_id.entry(r.id.clone()).or_default().push((time, observed));
                 }
                 ref o => panic!("expected an Event outcome, got {o:?}"),
             }
@@ -1136,11 +1032,7 @@ mod survival_smoke {
             .expect("left-truncated RTTE simulation must now succeed (#740)");
         let mut observed = 0usize;
         for r in &sims {
-            if let SimOutcome::Event {
-                time,
-                observed: obs,
-            } = r.outcome
-            {
+            if let SimOutcome::Event { time, observed: obs } = r.outcome {
                 if obs {
                     assert!(
                         time >= entry,
@@ -1300,10 +1192,7 @@ mod survival_smoke {
         let result =
             fit(&model, &pop, &model.default_params, &opts).expect("warm-start RTTE fit must run");
         assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            !result.warnings.iter().any(|w| w.contains("RTTE") && w.contains("ω²")),
             "a terminal-SAEM chain must not emit the ω² warning; got: {:?}",
             result.warnings
         );
@@ -1339,18 +1228,12 @@ mod survival_smoke {
   shape  = TVSHAPE
 ";
         let model = parse_model_string(src).expect("Weibull TTE model must parse");
-        assert!(
-            model.endpoints.contains_key(&2),
-            "endpoints must contain CMT=2 for Weibull model"
-        );
+        assert!(model.endpoints.contains_key(&2), "endpoints must contain CMT=2 for Weibull model");
         match model.endpoints.get(&2) {
             Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Weibull), got: {other:?}"),
         }
-        assert_eq!(
-            model.n_theta, 4,
-            "n_theta should be 4 (TVSCALE, TVSHAPE, CL, V)"
-        );
+        assert_eq!(model.n_theta, 4, "n_theta should be 4 (TVSCALE, TVSHAPE, CL, V)");
     }
 
     /// Parser must recognise [event_model] with family=gompertz (alpha + gamma).
@@ -1391,10 +1274,7 @@ mod survival_smoke {
             Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
         }
-        assert_eq!(
-            model.n_theta, 4,
-            "n_theta should be 4 (TVALPHA, TVGAMMA, CL, V)"
-        );
+        assert_eq!(model.n_theta, 4, "n_theta should be 4 (TVALPHA, TVGAMMA, CL, V)");
     }
 
     /// Fixed-effects (no omega) model with CMT 2 TTE endpoint must parse.
@@ -1420,11 +1300,7 @@ mod survival_smoke {
         let result = fit(&model, &pop, &model.default_params, &opts);
         match result {
             Ok(r) => {
-                assert!(
-                    r.ofv.is_finite(),
-                    "OFV must be finite after 3 iterations; got {}",
-                    r.ofv
-                );
+                assert!(r.ofv.is_finite(), "OFV must be finite after 3 iterations; got {}", r.ofv);
             }
             Err(e) => panic!("fit() must not error within 3 iterations: {e}"),
         }
@@ -1452,10 +1328,7 @@ mod survival_smoke {
                 SimOutcome::Event { time, observed } => {
                     assert!(time <= TAU, "no outcome may exceed the window: {time}");
                     if observed {
-                        assert!(
-                            time < TAU,
-                            "an observed event must precede the window: {time}"
-                        );
+                        assert!(time < TAU, "an observed event must precede the window: {time}");
                         events += 1;
                     } else {
                         assert_eq!(time, TAU, "a censored outcome sits exactly at the window");
@@ -1466,10 +1339,7 @@ mod survival_smoke {
             }
         }
         assert!(events > 0, "expected some observed events (got {events})");
-        assert!(
-            censored > 0,
-            "expected some administratively censored subjects (got {censored})"
-        );
+        assert!(censored > 0, "expected some administratively censored subjects (got {censored})");
     }
 
     /// An **exact-event** template (`dv = 1`) carries no administrative horizon —
@@ -1553,14 +1423,9 @@ mod survival_smoke {
         assert!(!preds.is_empty(), "predict_survival must return rows");
         let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
         for p in &preds {
-            assert!(
-                (0.0..=1.0).contains(&p.cif),
-                "CIF must be in [0,1]: {}",
-                p.cif
-            );
-            let entry = by_key
-                .entry((p.id.clone(), p.time.to_bits()))
-                .or_insert((0.0, p.survival_all));
+            assert!((0.0..=1.0).contains(&p.cif), "CIF must be in [0,1]: {}", p.cif);
+            let entry =
+                by_key.entry((p.id.clone(), p.time.to_bits())).or_insert((0.0, p.survival_all));
             entry.0 += p.cif;
         }
         for (_, (sum_cif, s_all)) in by_key {
@@ -1604,20 +1469,14 @@ mod survival_smoke {
                     SimOutcome::Event { time, observed } => (*time, *observed),
                     _ => panic!("expected an Event outcome"),
                 };
-                assert!(
-                    (time - t0).abs() < 1e-12,
-                    "both rows share the outcome time"
-                );
+                assert!((time - t0).abs() < 1e-12, "both rows share the outcome time");
                 assert!(time <= TAU + 1e-12, "outcome time within the window");
                 if observed {
                     observed_count += 1;
                     observed_cmt = s.cmt;
                 }
             }
-            assert!(
-                observed_count <= 1,
-                "at most one cause observed per subject"
-            );
+            assert!(observed_count <= 1, "at most one cause observed per subject");
             match observed_cmt {
                 2 => ev2 += 1,
                 3 => ev3 += 1,
@@ -1695,11 +1554,7 @@ mod survival_smoke {
                     .obs_records
                     .iter()
                     .map(|r| match r {
-                        ObsRecord::Event {
-                            cmt,
-                            event_type: EventType::RightCensored,
-                            ..
-                        } => *cmt,
+                        ObsRecord::Event { cmt, event_type: EventType::RightCensored, .. } => *cmt,
                         other => panic!("expected a right-censored Event, got {other:?}"),
                     })
                     .collect();
@@ -1812,10 +1667,7 @@ mod survival_smoke {
                 // (b) the horizon is a hard cap: no outcome can exceed the planned end.
                 assert!(time <= H + 1e-9, "outcome {time} exceeds horizon {H}");
                 let prev = *t0.get_or_insert(time);
-                assert!(
-                    (time - prev).abs() < 1e-12,
-                    "both rows share the outcome time"
-                );
+                assert!((time - prev).abs() < 1e-12, "both rows share the outcome time");
                 observed_any |= observed;
             }
             let t0 = t0.unwrap();
@@ -1884,11 +1736,7 @@ mod survival_smoke {
 
         let (_fit, pop) =
             ferx_core::run_model_simulate(path.to_str().unwrap()).expect("simulate+fit succeeds");
-        assert_eq!(
-            pop.subjects.len(),
-            40,
-            "one synthetic subject per n_subjects"
-        );
+        assert_eq!(pop.subjects.len(), 40, "one synthetic subject per n_subjects");
 
         let (mut events, mut censored_at_h) = (0usize, 0usize);
         for subj in &pop.subjects {
@@ -1898,19 +1746,10 @@ mod survival_smoke {
                 .obs_records
                 .iter()
                 .map(|r| {
-                    let ObsRecord::Event {
-                        cmt,
-                        entry_time,
-                        time,
-                        ..
-                    } = r
-                    else {
+                    let ObsRecord::Event { cmt, entry_time, time, .. } = r else {
                         panic!("expected a TTE Event record");
                     };
-                    assert_eq!(
-                        *entry_time, 0.0,
-                        "synthetic subjects have no left truncation"
-                    );
+                    assert_eq!(*entry_time, 0.0, "synthetic subjects have no left truncation");
                     assert!(*time <= H + 1e-9, "row time {time} exceeds horizon {H}");
                     *cmt
                 })
@@ -1934,10 +1773,7 @@ mod survival_smoke {
             } else {
                 // No cause fired ⇒ both rows right-censored at the horizon.
                 for r in &subj.obs_records {
-                    let ObsRecord::Event {
-                        time, event_type, ..
-                    } = r
-                    else {
+                    let ObsRecord::Event { time, event_type, .. } = r else {
                         panic!("expected a TTE Event record");
                     };
                     assert!(matches!(event_type, EventType::RightCensored));
@@ -1949,10 +1785,7 @@ mod survival_smoke {
                 censored_at_h += 1;
             }
         }
-        assert!(
-            events > 0,
-            "synthetic competing data must contain observed events"
-        );
+        assert!(events > 0, "synthetic competing data must contain observed events");
         assert!(
             censored_at_h > 0,
             "with horizon {H} some subjects survive every cause and censor at it"
@@ -1992,29 +1825,17 @@ mod survival_smoke {
 
         let (_fit, pop) =
             ferx_core::run_model_simulate(path.to_str().unwrap()).expect("simulate+fit succeeds");
-        assert_eq!(
-            pop.subjects.len(),
-            60,
-            "one synthetic subject per n_subjects"
-        );
+        assert_eq!(pop.subjects.len(), 60, "one synthetic subject per n_subjects");
 
         let (mut events, mut censored_at_h) = (0usize, 0usize);
         for subj in &pop.subjects {
             assert_eq!(subj.obs_records.len(), 1, "single cause ⇒ one TTE row");
-            let ObsRecord::Event {
-                time,
-                event_type,
-                entry_time,
-                cmt,
-            } = &subj.obs_records[0]
+            let ObsRecord::Event { time, event_type, entry_time, cmt } = &subj.obs_records[0]
             else {
                 panic!("expected a TTE Event record");
             };
             assert_eq!(*cmt, 2, "row on the cause CMT");
-            assert_eq!(
-                *entry_time, 0.0,
-                "synthetic subjects have no left truncation"
-            );
+            assert_eq!(*entry_time, 0.0, "synthetic subjects have no left truncation");
             assert!(*time <= H + 1e-9, "row time {time} exceeds horizon {H}");
             match event_type {
                 EventType::Exact => events += 1,
@@ -2028,10 +1849,7 @@ mod survival_smoke {
                 other => panic!("unexpected event_type {other:?}"),
             }
         }
-        assert!(
-            events > 0,
-            "synthetic single-cause data must contain observed events"
-        );
+        assert!(events > 0, "synthetic single-cause data must contain observed events");
         assert!(
             censored_at_h > 0,
             "with horizon {H} some subjects survive past it and censor there"
@@ -2303,10 +2121,7 @@ mod survival_smoke {
                         assert!(time < H, "an observed event precedes the horizon: {time}");
                         events += 1;
                     } else {
-                        assert!(
-                            (time - H).abs() < 1e-9,
-                            "a censor sits at the horizon: {time}"
-                        );
+                        assert!((time - H).abs() < 1e-9, "a censor sits at the horizon: {time}");
                         censored += 1;
                     }
                 }
@@ -2314,14 +2129,8 @@ mod survival_smoke {
             }
         }
         assert_eq!(events + censored, 200, "one TTE outcome per subject");
-        assert!(
-            events > 0,
-            "the ODE root-finder must produce drug-driven events (got {events})"
-        );
-        assert!(
-            censored > 0,
-            "some subjects must survive to the horizon (got {censored})"
-        );
+        assert!(events > 0, "the ODE root-finder must produce drug-driven events (got {events})");
+        assert!(censored > 0, "some subjects must survive to the horizon (got {censored})");
     }
 
     // ── Phase 4.0 coexistence: TTE code paths skip non-Event records ─────────
@@ -2336,26 +2145,16 @@ mod survival_smoke {
     fn rtte_fit_tolerates_interleaved_non_event_records() {
         let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let opts = FitOptions::default();
-        let baseline = fit(&model, &rtte_pop(), &model.default_params, &opts)
-            .expect("baseline RTTE fit")
-            .ofv;
+        let baseline =
+            fit(&model, &rtte_pop(), &model.default_params, &opts).expect("baseline RTTE fit").ofv;
         let mut pop = rtte_pop();
-        pop.subjects[0].obs_records.insert(
-            1,
-            ObsRecord::DiscreteState {
-                time: 7.0,
-                raw_time: 7.0,
-                state: 1,
-                cmt: 3,
-            },
-        );
+        pop.subjects[0]
+            .obs_records
+            .insert(1, ObsRecord::DiscreteState { time: 7.0, raw_time: 7.0, state: 1, cmt: 3 });
         let mixed = fit(&model, &pop, &model.default_params, &opts)
             .expect("RTTE fit must tolerate a non-TTE record")
             .ofv;
-        assert_eq!(
-            baseline, mixed,
-            "a discrete-state record must not change the RTTE OFV"
-        );
+        assert_eq!(baseline, mixed, "a discrete-state record must not change the RTTE OFV");
     }
 
     /// ODE-accumulated-hazard fit path (`tte_ode_nll`).
@@ -2380,22 +2179,13 @@ mod survival_smoke {
             .expect("baseline ODE-TTE fit")
             .ofv;
         let mut pop = build_pop();
-        pop.subjects[0].obs_records.insert(
-            0,
-            ObsRecord::DiscreteState {
-                time: 5.0,
-                raw_time: 5.0,
-                state: 0,
-                cmt: 4,
-            },
-        );
+        pop.subjects[0]
+            .obs_records
+            .insert(0, ObsRecord::DiscreteState { time: 5.0, raw_time: 5.0, state: 0, cmt: 4 });
         let mixed = fit(&model, &pop, &model.default_params, &opts)
             .expect("ODE-TTE fit must tolerate a non-TTE record")
             .ofv;
-        assert_eq!(
-            baseline, mixed,
-            "a discrete-state record must not change the ODE-TTE OFV"
-        );
+        assert_eq!(baseline, mixed, "a discrete-state record must not change the ODE-TTE OFV");
     }
 
     /// ODE-hazard simulation path (`simulate_tte`, `draw_ode_tte_latent`,
@@ -2427,15 +2217,9 @@ mod survival_smoke {
         let baseline = simulate_with_options(&model, &build_pop(), &model.default_params, 1, &opts)
             .expect("baseline ODE-TTE sim");
         let mut pop = build_pop();
-        pop.subjects[0].obs_records.insert(
-            0,
-            ObsRecord::Count {
-                time: 12.0,
-                raw_time: 12.0,
-                count: 2,
-                cmt: 4,
-            },
-        );
+        pop.subjects[0]
+            .obs_records
+            .insert(0, ObsRecord::Count { time: 12.0, raw_time: 12.0, count: 2, cmt: 4 });
         let mixed = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("ODE-TTE sim must tolerate a non-TTE record");
         // Same seed + same TTE design ⇒ bit-identical simulated events on CMT 3.
@@ -2484,10 +2268,7 @@ mod survival_smoke {
         };
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect_err("ODE-accumulated TTE simulation with resets must error");
-        assert!(
-            err.to_string().contains("reset"),
-            "error must name the unsupported resets: {err}"
-        );
+        assert!(err.to_string().contains("reset"), "error must name the unsupported resets: {err}");
     }
 
     /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
@@ -2506,14 +2287,9 @@ mod survival_smoke {
         assert!(!preds.is_empty(), "predict_survival must return rows");
         let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
         for p in &preds {
-            assert!(
-                (0.0..=1.0).contains(&p.cif),
-                "CIF must be in [0,1]: {}",
-                p.cif
-            );
-            let entry = by_key
-                .entry((p.id.clone(), p.time.to_bits()))
-                .or_insert((0.0, p.survival_all));
+            assert!((0.0..=1.0).contains(&p.cif), "CIF must be in [0,1]: {}", p.cif);
+            let entry =
+                by_key.entry((p.id.clone(), p.time.to_bits())).or_insert((0.0, p.survival_all));
             entry.0 += p.cif;
         }
         for (_, (sum_cif, s_all)) in by_key {
@@ -2671,9 +2447,7 @@ mod survival_smoke {
   scale  = TVLAMBDA
   shape  = 2.0
 ";
-        let err = parse_model_string(src)
-            .err()
-            .expect("shape with exponential must be rejected");
+        let err = parse_model_string(src).err().expect("shape with exponential must be rejected");
         assert!(
             err.contains("shape") || err.contains("exponential"),
             "error must mention the incompatible key: {err}"
@@ -2709,9 +2483,7 @@ mod survival_smoke {
   scale  = TVLAMBDA
   gamma  = GAMMA
 ";
-        let err = parse_model_string(src)
-            .err()
-            .expect("scale with gompertz must be rejected");
+        let err = parse_model_string(src).err().expect("scale with gompertz must be rejected");
         assert!(
             err.contains("scale") || err.contains("gompertz"),
             "error must mention the incompatible key: {err}"
@@ -2749,9 +2521,7 @@ mod survival_smoke {
   family = exponential
   scale  = TVLAMBDA
 ";
-        let err = parse_model_string(src)
-            .err()
-            .expect("duplicate CMT must be rejected");
+        let err = parse_model_string(src).err().expect("duplicate CMT must be rejected");
         assert!(
             err.contains("CMT=2") || err.contains("more than once"),
             "error must mention duplicate CMT: {err}"
@@ -2874,10 +2644,7 @@ mod survival_smoke {
 ";
         let model =
             parse_model_string(src).expect("model referencing individual params must parse");
-        let ep = model
-            .endpoints
-            .get(&2)
-            .expect("CMT=2 must be a TTE endpoint");
+        let ep = model.endpoints.get(&2).expect("CMT=2 must be a TTE endpoint");
         let EndpointLikelihood::Tte { hazard, .. } = ep else {
             panic!("expected Tte endpoint");
         };
@@ -2946,14 +2713,8 @@ mod survival_smoke {
   scale  = SCALE_I
 ";
         let model = parse_model_string(src).expect("model must parse");
-        let ep = model
-            .endpoints
-            .get(&2)
-            .expect("CMT=2 must be a TTE endpoint");
-        let EndpointLikelihood::Tte {
-            hazard_covariates, ..
-        } = ep
-        else {
+        let ep = model.endpoints.get(&2).expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte { hazard_covariates, .. } = ep else {
             panic!("expected Tte endpoint");
         };
         assert!(
@@ -3083,10 +2844,7 @@ mod survival_smoke {
 ";
         let model = parse_model_string(src)
             .expect("hazard referencing a conditionally-defined individual parameter must parse");
-        let ep = model
-            .endpoints
-            .get(&2)
-            .expect("CMT=2 must be a TTE endpoint");
+        let ep = model.endpoints.get(&2).expect("CMT=2 must be a TTE endpoint");
         let EndpointLikelihood::Tte { hazard, .. } = ep else {
             panic!("expected Tte endpoint");
         };
@@ -3173,10 +2931,7 @@ mod survival_smoke {
         let pop = common::tte_pop_from_pairs(&TTE_DATA[..3]);
         let grid = vec![1.0, 5.0, 10.0, 20.0];
         let rows = predict_survival(&model, &pop, &model.default_params, &grid).unwrap();
-        assert!(
-            !rows.is_empty(),
-            "predict_survival must return rows for TTE model"
-        );
+        assert!(!rows.is_empty(), "predict_survival must return rows for TTE model");
         for row in &rows {
             assert!(
                 row.median_survival.is_finite() && row.median_survival > 0.0,
@@ -3202,14 +2957,8 @@ mod survival_smoke {
         let first_median = rows[0].median_survival;
         let first_mean = rows[0].mean_survival;
         for row in rows.iter().filter(|r| r.id == rows[0].id) {
-            assert_eq!(
-                row.median_survival, first_median,
-                "median should be constant per subject"
-            );
-            assert_eq!(
-                row.mean_survival, first_mean,
-                "mean should be constant per subject"
-            );
+            assert_eq!(row.median_survival, first_median, "median should be constant per subject");
+            assert_eq!(row.mean_survival, first_mean, "mean should be constant per subject");
         }
     }
 
@@ -3221,10 +2970,7 @@ mod survival_smoke {
     fn tte_weibull_example_file_parses() {
         let src = include_str!("../examples/tte_weibull.ferx");
         let model = parse_model_string(src).expect("tte_weibull.ferx must parse");
-        assert!(
-            model.endpoints.contains_key(&2),
-            "CMT=2 must be registered as a TTE endpoint"
-        );
+        assert!(model.endpoints.contains_key(&2), "CMT=2 must be registered as a TTE endpoint");
         match model.endpoints.get(&2) {
             Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Weibull), got: {other:?}"),
@@ -3238,10 +2984,7 @@ mod survival_smoke {
     fn tte_gompertz_example_file_parses() {
         let src = include_str!("../examples/tte_gompertz.ferx");
         let model = parse_model_string(src).expect("tte_gompertz.ferx must parse");
-        assert!(
-            model.endpoints.contains_key(&2),
-            "CMT=2 must be registered as a TTE endpoint"
-        );
+        assert!(model.endpoints.contains_key(&2), "CMT=2 must be registered as a TTE endpoint");
         match model.endpoints.get(&2) {
             Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
@@ -3266,10 +3009,7 @@ mod survival_smoke {
             }
             other => panic!("expected OdeAccumulated TTE endpoint on CMT=3, got: {other:?}"),
         }
-        let ode = model
-            .ode_spec
-            .as_ref()
-            .expect("joint PK-TTE is an ODE model");
+        let ode = model.ode_spec.as_ref().expect("joint PK-TTE is an ODE model");
         assert!(
             ode.state_names.iter().any(|s| s == "__chz_3"),
             "ODE system must carry the appended accumulator; got {:?}",
@@ -3289,18 +3029,8 @@ mod survival_smoke {
             .expect("pktte_joint.csv must load");
         assert_eq!(pop.subjects.len(), 6, "6 subjects");
         for s in &pop.subjects {
-            assert_eq!(
-                s.observations.len(),
-                2,
-                "subject {} has 2 PK obs (CMT 2)",
-                s.id
-            );
-            assert_eq!(
-                s.obs_records.len(),
-                1,
-                "subject {} has 1 TTE record (CMT 3)",
-                s.id
-            );
+            assert_eq!(s.observations.len(), 2, "subject {} has 2 PK obs (CMT 2)", s.id);
+            assert_eq!(s.obs_records.len(), 1, "subject {} has 1 TTE record (CMT 3)", s.id);
             let ObsRecord::Event { cmt, .. } = &s.obs_records[0] else {
                 panic!("expected a TTE Event record");
             };
@@ -3466,11 +3196,7 @@ mod survival_smoke {
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
-            Ok(r) => assert!(
-                r.ofv.is_finite(),
-                "Weibull OFV must be finite; got {}",
-                r.ofv
-            ),
+            Ok(r) => assert!(r.ofv.is_finite(), "Weibull OFV must be finite; got {}", r.ofv),
             Err(e) => panic!("Weibull TTE fit must not error: {e}"),
         }
     }
@@ -3483,11 +3209,7 @@ mod survival_smoke {
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
-            Ok(r) => assert!(
-                r.ofv.is_finite(),
-                "Gompertz OFV must be finite; got {}",
-                r.ofv
-            ),
+            Ok(r) => assert!(r.ofv.is_finite(), "Gompertz OFV must be finite; got {}", r.ofv),
             Err(e) => panic!("Gompertz TTE fit must not error: {e}"),
         }
     }
@@ -3501,11 +3223,7 @@ mod survival_smoke {
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
-            Ok(r) => assert!(
-                r.ofv.is_finite(),
-                "SAEM TTE OFV must be finite; got {}",
-                r.ofv
-            ),
+            Ok(r) => assert!(r.ofv.is_finite(), "SAEM TTE OFV must be finite; got {}", r.ofv),
             Err(e) => panic!("SAEM TTE fit must not error: {e}"),
         }
     }
@@ -3609,11 +3327,7 @@ mod survival_smoke {
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
-            Ok(r) => assert!(
-                r.ofv.is_finite(),
-                "IOV+TTE FOCEI OFV must be finite; got {}",
-                r.ofv
-            ),
+            Ok(r) => assert!(r.ofv.is_finite(), "IOV+TTE FOCEI OFV must be finite; got {}", r.ofv),
             Err(e) => panic!("IOV+TTE FOCEI fit must not error: {e}"),
         }
     }
@@ -3667,19 +3381,13 @@ mod survival_smoke {
 
         // CMT=2 is an ODE-accumulated TTE endpoint pointing at the appended
         // accumulator. PK states depot=0, central=1, so __chz lands at index 2.
-        let ep = model
-            .endpoints
-            .get(&2)
-            .expect("CMT=2 must be a TTE endpoint");
+        let ep = model.endpoints.get(&2).expect("CMT=2 must be a TTE endpoint");
         let EndpointLikelihood::Tte { hazard, .. } = ep else {
             panic!("expected Tte endpoint, got {ep:?}");
         };
         match hazard {
             ferx_core::HazardSpec::OdeAccumulated { chz_state } => {
-                assert_eq!(
-                    *chz_state, 2,
-                    "accumulator state index follows depot(0), central(1)"
-                );
+                assert_eq!(*chz_state, 2, "accumulator state index follows depot(0), central(1)");
             }
             other => panic!("expected OdeAccumulated hazard, got {other:?}"),
         }
@@ -3690,17 +3398,10 @@ mod survival_smoke {
         );
 
         // The ODE system gained the synthetic accumulator as its trailing state.
-        let ode = model
-            .ode_spec
-            .as_ref()
-            .expect("joint PK-TTE is an ODE model");
+        let ode = model.ode_spec.as_ref().expect("joint PK-TTE is an ODE model");
         assert_eq!(
             ode.state_names,
-            vec![
-                "depot".to_string(),
-                "central".to_string(),
-                "__chz_2".to_string()
-            ],
+            vec!["depot".to_string(), "central".to_string(), "__chz_2".to_string()],
             "parser must append __chz_<cmt> as the trailing ODE state"
         );
     }
@@ -3780,10 +3481,7 @@ mod survival_smoke {
   method = focei
 ";
         let err = parse_model_string(src).expect_err("hazard= plus family= must error");
-        assert!(
-            err.contains("mixes"),
-            "error should flag the hazard/family conflict; got: {err}"
-        );
+        assert!(err.contains("mixes"), "error should flag the hazard/family conflict; got: {err}");
     }
 
     #[test]
@@ -3849,10 +3547,7 @@ mod survival_smoke {
   method = focei
 ";
         let err = parse_model_string(src).expect_err("hazard= with IOV must error");
-        assert!(
-            err.contains("IOV"),
-            "error should flag the IOV limitation; got: {err}"
-        );
+        assert!(err.contains("IOV"), "error should flag the IOV limitation; got: {err}");
     }
 
     #[test]
@@ -3924,30 +3619,15 @@ mod survival_smoke {
         let grid = [0.0, 4.0, 8.0, 16.0, 24.0];
         let preds = predict_survival(&model, &pop, &model.default_params, &grid).unwrap();
 
-        assert_eq!(
-            preds.len(),
-            grid.len(),
-            "one row per grid point (single TTE CMT)"
-        );
-        assert!(
-            preds[0].cum_hazard.abs() < 1e-9,
-            "H(0)=0; got {}",
-            preds[0].cum_hazard
-        );
-        assert!(
-            (preds[0].survival - 1.0).abs() < 1e-9,
-            "S(0)=1; got {}",
-            preds[0].survival
-        );
+        assert_eq!(preds.len(), grid.len(), "one row per grid point (single TTE CMT)");
+        assert!(preds[0].cum_hazard.abs() < 1e-9, "H(0)=0; got {}", preds[0].cum_hazard);
+        assert!((preds[0].survival - 1.0).abs() < 1e-9, "S(0)=1; got {}", preds[0].survival);
         for w in preds.windows(2) {
             assert!(
                 w[1].cum_hazard >= w[0].cum_hazard - 1e-9,
                 "cumulative hazard must be non-decreasing"
             );
-            assert!(
-                w[1].survival <= w[0].survival + 1e-9,
-                "survival must be non-increasing"
-            );
+            assert!(w[1].survival <= w[0].survival + 1e-9, "survival must be non-increasing");
             assert!(
                 w[1].hazard.is_finite() && w[1].hazard >= 0.0,
                 "instantaneous hazard must be finite ≥ 0; got {}",
@@ -3993,8 +3673,7 @@ mod survival_smoke {
         let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("ODE-accumulated TTE simulation with a horizon must succeed");
         assert!(
-            sims.iter()
-                .any(|r| matches!(r.outcome, SimOutcome::Event { .. })),
+            sims.iter().any(|r| matches!(r.outcome, SimOutcome::Event { .. })),
             "must produce TTE event/censor outcomes"
         );
     }

@@ -69,15 +69,8 @@ fn wide_pop() -> Population {
             let cl = (5.0_f64.ln() + 0.75 * lwt - 0.25 * sex).exp();
             let v1 = (30.0_f64.ln() + 0.9 * lwt).exp();
             let c = two_cpt_oral_conc(*t, cl, v1, 8.0, 60.0, 1.2);
-            let bump = if (id + j) % 2 == 0 {
-                1.0 + prop
-            } else {
-                1.0 - prop
-            };
-            csv.push_str(&format!(
-                "{id},{t},{:.6},0,0,1,{lwt},{sex},{assay}\n",
-                c * bump
-            ));
+            let bump = if (id + j) % 2 == 0 { 1.0 + prop } else { 1.0 - prop };
+            csv.push_str(&format!("{id},{t},{:.6},0,0,1,{lwt},{sex},{assay}\n", c * bump));
         }
     }
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -116,16 +109,7 @@ impl WideSolve {
         let log_sigma = params.sigma.values.iter().map(|s| s.ln()).collect();
         let schedules = vec![None; pop.subjects.len()];
         let (theta_lower, theta_upper) = (params.theta_lower.clone(), params.theta_upper.clone());
-        WideSolve {
-            model,
-            pop,
-            draws,
-            schedules,
-            theta,
-            log_sigma,
-            theta_lower,
-            theta_upper,
-        }
+        WideSolve { model, pop, draws, schedules, theta, log_sigma, theta_lower, theta_upper }
     }
 
     fn solve(&self, maxiter: u32) -> WeightedMstep {
@@ -170,10 +154,7 @@ impl WideSolve {
     fn moved(&self, step: &WeightedMstep) -> usize {
         let start = self.theta.iter().chain(&self.log_sigma);
         let end = step.log_theta.iter().chain(&step.log_sigma);
-        start
-            .zip(end)
-            .filter(|(a, b)| (*a - *b).abs() > MSTEP_MOVED_TOL)
-            .count()
+        start.zip(end).filter(|(a, b)| (*a - *b).abs() > MSTEP_MOVED_TOL).count()
     }
 }
 
@@ -328,12 +309,7 @@ fn motion_is_measured_from_the_start() {
 
     let mut m = MstepMotion::new(1);
     let (lo, hi) = (&lo[..1], &hi[..1]);
-    m.record(
-        &[1.0],
-        lo,
-        hi,
-        &step_to(&[1.0 + 0.5 * MSTEP_MOVED_TOL], None),
-    );
+    m.record(&[1.0], lo, hi, &step_to(&[1.0 + 0.5 * MSTEP_MOVED_TOL], None));
     assert_eq!(m.frozen(), vec![0], "below the tolerance is not a move");
 }
 
@@ -376,16 +352,10 @@ fn improvable_reads_only_what_a_step_would_gain() {
     // At its optimum, off it, and a coordinate that moved in the solve.
     let start = [0.0, 2.0, 5.0];
     let x = [0.0, 2.0, 1.0];
-    assert_eq!(
-        improvable_coordinates(&bowl, &start, &x, &lo, &hi),
-        vec![false, true, false]
-    );
+    assert_eq!(improvable_coordinates(&bowl, &start, &x, &lo, &hi), vec![false, true, false]);
     // Within half a step of the optimum a step overshoots, so it reads as there.
     let x = [0.04, 0.0, 0.0];
-    assert_eq!(
-        improvable_coordinates(&bowl, &x, &x, &lo, &hi),
-        vec![false; 3]
-    );
+    assert_eq!(improvable_coordinates(&bowl, &x, &x, &lo, &hi), vec![false; 3]);
     // Off its optimum, but pinned.
     let x = [3.0, 0.0, 0.0];
     assert_eq!(
@@ -410,10 +380,7 @@ fn improvable_is_false_on_a_flat_objective() {
     let flat = |_: &[f64], _: Option<&mut [f64]>, _: &mut ()| 5.0;
     let x = [1.0, 2.0];
     let (lo, hi) = WIDE;
-    assert_eq!(
-        improvable_coordinates(&flat, &x, &x, &lo, &hi),
-        vec![false; 2]
-    );
+    assert_eq!(improvable_coordinates(&flat, &x, &x, &lo, &hi), vec![false; 2]);
 }
 
 /// The bar is one likelihood-ratio step on −2 log L, so 1.92 on −log L, either side of it.
@@ -423,14 +390,8 @@ fn improvable_needs_a_likelihood_ratio_step() {
     // A step of 0.1 down this slope gains `slope / 10` on −log L.
     let slope = |g: f64| move |x: &[f64], _: Option<&mut [f64]>, _: &mut ()| g * x[0];
     let x = [1.0];
-    assert_eq!(
-        improvable_coordinates(&slope(19.0), &x, &x, lo, hi),
-        vec![false]
-    );
-    assert_eq!(
-        improvable_coordinates(&slope(20.0), &x, &x, lo, hi),
-        vec![true]
-    );
+    assert_eq!(improvable_coordinates(&slope(19.0), &x, &x, lo, hi), vec![false]);
+    assert_eq!(improvable_coordinates(&slope(20.0), &x, &x, lo, hi), vec![true]);
 }
 
 #[test]
@@ -441,10 +402,7 @@ fn motion_counts_failed_solves() {
     let rejected = Some(nlopt::FailState::InvalidArgs);
     m.record(&[1.5, 2.5], &lo, &hi, &step_to(&[1.5, 2.5], rejected));
     assert_eq!((m.solves, m.failed), (2, 1));
-    assert!(matches!(
-        m.last_failure,
-        Some(nlopt::FailState::InvalidArgs)
-    ));
+    assert!(matches!(m.last_failure, Some(nlopt::FailState::InvalidArgs)));
 }
 
 #[test]
@@ -456,10 +414,7 @@ fn roundoff_is_not_a_failed_solve() {
         mstep_failure(&Err((FailState::InvalidArgs, 0.0))),
         Some(FailState::InvalidArgs)
     ));
-    assert!(matches!(
-        mstep_failure(&Err((FailState::Failure, 0.0))),
-        Some(FailState::Failure)
-    ));
+    assert!(matches!(mstep_failure(&Err((FailState::Failure, 0.0))), Some(FailState::Failure)));
 }
 
 /// Every clause of the message, and a σ's name as well as a θ's: the index runs across
@@ -479,10 +434,7 @@ fn the_gate_demotes_and_names_what_froze() {
     let mut converged = true;
     let w = gate_converged_on_mstep_motion(&mut converged, "IMPMAP", &m, &model).unwrap();
     assert!(!converged);
-    assert!(
-        w.starts_with("W_MCEM_MSTEP_FROZEN: IMPMAP: [LOG_V1, A1] never left"),
-        "{w}"
-    );
+    assert!(w.starts_with("W_MCEM_MSTEP_FROZEN: IMPMAP: [LOG_V1, A1] never left"), "{w}");
     assert!(w.contains("in 2 weighted M-step(s)"), "{w}");
     assert!(w.contains("still lowers −2 log L by more than 3.84"), "{w}");
     assert!(w.contains("reported converged: false"), "{w}");
@@ -510,10 +462,7 @@ fn a_failure_demotes_a_run_whose_coordinates_all_moved() {
         let w = mstep_warnings(&mut converged, "IMP", &m, &model, stopped);
         assert!(!converged);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(
-            w[0].starts_with("W_MCEM_MSTEP_FAILED: IMP: NLopt failed 2 of 3"),
-            "{w:?}"
-        );
+        assert!(w[0].starts_with("W_MCEM_MSTEP_FAILED: IMP: NLopt failed 2 of 3"), "{w:?}");
         assert!(w[0].contains("(InvalidArgs)"), "{w:?}");
         assert!(w[0].contains("reported converged: false"), "{w:?}");
         assert!(w[0].contains("leave θ and σ where they were"), "{w:?}");
@@ -708,16 +657,10 @@ fn a_run_reports_a_parameter_its_mstep_never_moved() {
     opts.imp_seed = Some(11);
     opts.run_covariance_step = false;
     let frozen = |r: &OuterResult| {
-        r.warnings
-            .iter()
-            .find(|w| w.starts_with(MCEM_MSTEP_FROZEN_TOKEN))
-            .cloned()
+        r.warnings.iter().find(|w| w.starts_with(MCEM_MSTEP_FROZEN_TOKEN)).cloned()
     };
     let failed = |r: &OuterResult| {
-        r.warnings
-            .iter()
-            .find(|w| w.starts_with(MCEM_MSTEP_FAILED_TOKEN))
-            .cloned()
+        r.warnings.iter().find(|w| w.starts_with(MCEM_MSTEP_FAILED_TOKEN)).cloned()
     };
     for (source, label) in [(ONE_CPT, "plain"), (MIX_ONE_CPT, "mixture")] {
         let model = parse_model_string(source).unwrap();
@@ -769,11 +712,8 @@ fn sampled_draws(model: &CompiledModel, pop: &Population, scale: f64) -> Vec<Sub
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let n_occ = if model.n_kappa > 0 {
-                crate::stats::stacked_layout::group_count(s)
-            } else {
-                0
-            };
+            let n_occ =
+                if model.n_kappa > 0 { crate::stats::stacked_layout::group_count(s) } else { 0 };
             let width = n_eta + n_occ * model.n_kappa;
             let mut d = SubjectDraws::cancelled(n_eta);
             d.etas = (0..3)
@@ -820,9 +760,7 @@ fn weighted_gradient_gap(model: &CompiledModel, pop: &Population, scale: f64, h:
     let schedules = vec![None; pop.subjects.len()];
     let (x, mask, lower, upper, n_theta, n_sigma) = shifted_start(model);
     let natural = |x: &[f64]| -> (Vec<f64>, Vec<f64>) {
-        let th = (0..n_theta)
-            .map(|i| if mask[i] { x[i].exp() } else { x[i] })
-            .collect();
+        let th = (0..n_theta).map(|i| if mask[i] { x[i].exp() } else { x[i] }).collect();
         (th, x[n_theta..].iter().map(|v| v.exp()).collect())
     };
     let value = |x: &[f64]| {
@@ -849,21 +787,13 @@ fn weighted_gradient_gap(model: &CompiledModel, pop: &Population, scale: f64, h:
         xp[i] += h;
         xm[i] -= h;
         let fd = (value(&xp) - value(&xm)) / (2.0 * h);
-        assert!(
-            g[i].is_finite() && fd.is_finite(),
-            "coordinate {i}: {} vs {fd}",
-            g[i]
-        );
+        assert!(g[i].is_finite() && fd.is_finite(), "coordinate {i}: {} vs {fd}", g[i]);
         let gap = (g[i] - fd).abs() / g[i].abs().max(1.0);
         eprintln!("  coord {i}: grad {:.6e}  fd {fd:.6e}  gap {gap:.2e}", g[i]);
         live += usize::from(g[i].abs() > 1e-3);
         worst = worst.max(gap); // nan-ok: g[i] and fd asserted finite above
     }
-    assert!(
-        live >= x.len() / 2,
-        "fixture: only {live} of {} scores are live",
-        x.len()
-    );
+    assert!(live >= x.len() / 2, "fixture: only {live} of {} scores are live", x.len());
     worst
 }
 
@@ -901,12 +831,9 @@ fn the_weighted_gradient_matches_central_fd_of_the_objective() {
     ))
     .expect("parses")
     .model;
-    let pop = crate::read_nonmem_csv(
-        std::path::Path::new("data/warfarin_iov.csv"),
-        None,
-        Some("OCC"),
-    )
-    .expect("reads");
+    let pop =
+        crate::read_nonmem_csv(std::path::Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+            .expect("reads");
     assert!(model.n_kappa > 0);
     let g = weighted_gradient_gap(&model, &pop, 0.3, 1e-5);
     eprintln!("warfarin IOV (kappa samples): {g:.3e}");
@@ -971,10 +898,7 @@ fn the_mixture_gradient_is_the_single_population_gradient() {
         )
     };
     let single = w.solve_with(8, Lbfgs);
-    let one = solve(
-        std::slice::from_ref(&w.draws),
-        &vec![vec![1.0]; w.pop.subjects.len()],
-    );
+    let one = solve(std::slice::from_ref(&w.draws), &vec![vec![1.0]; w.pop.subjects.len()]);
     assert_eq!(one.log_theta, single.log_theta);
     assert_eq!(one.log_sigma, single.log_sigma);
 
@@ -1007,10 +931,7 @@ fn newton_reaches_the_bobyqa_optimum_of_the_weighted_objective() {
     eprintln!("converged: newton {f:.6} vs bobyqa {f_ref:.6} (start {f_start:.2})");
     assert!(got.failure.is_none(), "{:?}", got.failure);
     assert!(f < f_ref + 1e-3, "newton {f} vs bobyqa {f_ref}");
-    assert!(
-        f < f_start - 0.5 * (f_start - f_ref),
-        "must move toward the optimum"
-    );
+    assert!(f < f_start - 0.5 * (f_start - f_ref), "must move toward the optimum");
     assert_eq!(w.moved(&got), 14);
 }
 
@@ -1056,9 +977,7 @@ fn the_memoised_weighted_objective_is_the_plain_one_bit_for_bit() {
     // The score and its information through a memo are the memo-free ones, at one θ twice
     // (the value pass, then the fused pass at the accepted point).
     let (x, mask, lower, upper, n_theta, n_sigma) = shifted_start(&w.model);
-    let th: Vec<f64> = (0..n_theta)
-        .map(|i| if mask[i] { x[i].exp() } else { x[i] })
-        .collect();
+    let th: Vec<f64> = (0..n_theta).map(|i| if mask[i] { x[i].exp() } else { x[i] }).collect();
     let sg: Vec<f64> = x[n_theta..].iter().map(|v| v.exp()).collect();
     let score = |want_fisher: bool, memo: Option<EvalMemo<'_>>| {
         weighted_mstep_score(
@@ -1089,10 +1008,7 @@ fn the_memoised_weighted_objective_is_the_plain_one_bit_for_bit() {
         fresh.begin(&th),
     );
     let (plain, memoised) = (score(true, None), score(true, fresh.begin(&th)));
-    assert_eq!(
-        value_pass, plain.val,
-        "the value pass is the fused pass's value"
-    );
+    assert_eq!(value_pass, plain.val, "the value pass is the fused pass's value");
     assert_eq!(
         (plain.val, &plain.grad, &plain.info),
         (memoised.val, &memoised.grad, &memoised.info)
@@ -1120,18 +1036,8 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
     let n = n_theta + n_sigma;
     let budget = 4 * (n as u32 + 1);
     let x0: Vec<f64> = w.theta.iter().chain(&w.log_sigma).copied().collect();
-    let lower: Vec<f64> = w
-        .theta_lower
-        .iter()
-        .copied()
-        .chain(vec![-8.0; n_sigma])
-        .collect();
-    let upper: Vec<f64> = w
-        .theta_upper
-        .iter()
-        .copied()
-        .chain(vec![5.0; n_sigma])
-        .collect();
+    let lower: Vec<f64> = w.theta_lower.iter().copied().chain(vec![-8.0; n_sigma]).collect();
+    let upper: Vec<f64> = w.theta_upper.iter().copied().chain(vec![5.0; n_sigma]).collect();
     let obj = |xv: &[f64], _g: Option<&mut [f64]>, _: &mut ()| {
         w.objective(&xv[..n_theta], &xv[n_theta..])
     };
@@ -1185,23 +1091,12 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
     // Declined at the start (no fused pass): BOBYQA from `x0`, exactly, with the whole budget
     // (a declined pass spent none).
     let (route, declined) = solve(&x0, Newton, Some(0), budget);
-    assert_eq!(
-        handovers.get(),
-        1,
-        "the memo is told BOBYQA takes over, once"
-    );
+    assert_eq!(handovers.get(), 1, "the memo is told BOBYQA takes over, once");
     let (_, bobyqa0) = solve(&x0, Bobyqa, None, budget);
-    assert_eq!(
-        handovers.get(),
-        0,
-        "an explicit bobyqa solve is not a hand-over"
-    );
+    assert_eq!(handovers.get(), 0, "an explicit bobyqa solve is not a hand-over");
     assert_eq!(route, [1, 0, 0]);
     assert_eq!(packed(&declined), packed(&bobyqa0));
-    assert!(
-        packed(&declined) != packed(&newton),
-        "fixture: the routes must differ"
-    );
+    assert!(packed(&declined) != packed(&newton), "fixture: the routes must differ");
     // Stalled after one accepted step: BOBYQA from the point Newton reached, with the
     // evaluations it did not spend.
     let mut x1 = x0.clone();
@@ -1218,10 +1113,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
     FUSED_PASSES_ALLOWED.set(None);
     assert_eq!(outcome, NewtonOutcome::Lost);
     assert!(x1 != x0, "Newton took a step before it stalled");
-    assert!(
-        spent > 0 && spent < budget,
-        "fixture: Newton spent {spent} of {budget}"
-    );
+    assert!(spent > 0 && spent < budget, "fixture: Newton spent {spent} of {budget}");
     let (route, stalled) = solve(&x0, Newton, Some(1), budget);
     assert_eq!(handovers.get(), 1, "a stall after one step hands over too");
     let (_, bobyqa1) = solve(&x1, Bobyqa, None, budget - spent);
@@ -1231,10 +1123,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
         packed(&bobyqa1),
         "BOBYQA continued from Newton's point with the remainder of the budget"
     );
-    assert!(
-        packed(&stalled) != packed(&bobyqa0),
-        "and not from the start"
-    );
+    assert!(packed(&stalled) != packed(&bobyqa0), "and not from the start");
     // Non-vacuity of the budget: a fresh budget from the same point is another solve (BOBYQA
     // is far from converged at this size), so the remainder is what was used.
     let (_, fresh) = solve(&x1, Bobyqa, None, budget);
@@ -1246,11 +1135,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
     // ends at Newton's point, whatever it is.
     let (route, spent_all) = solve(&x0, Newton, Some(1), spent);
     assert_eq!(route, [1, 0, 0]);
-    assert_eq!(
-        packed(&spent_all),
-        x1,
-        "no budget left: Newton's point stands"
-    );
+    assert_eq!(packed(&spent_all), x1, "no budget left: Newton's point stands");
 }
 
 /// What a weighted M-step keeps in memory is decided by the optimizer, not only by the solve's
@@ -1295,10 +1180,7 @@ fn a_solve_consumes_one_forced_failure_count() {
         let first = w.solve_with(4, optimizer);
         let second = w.solve_with(4, optimizer);
         FAIL_MSTEP_SOLVES_AFTER.set(None);
-        assert!(
-            first.failure.is_none(),
-            "{optimizer:?}: the first solve works"
-        );
+        assert!(first.failure.is_none(), "{optimizer:?}: the first solve works");
         assert!(
             matches!(second.failure, Some(nlopt::FailState::Failure)),
             "{optimizer:?}: the second fails"
@@ -1339,10 +1221,7 @@ fn newton_runs_where_its_scope_holds_and_says_so_where_it_does_not() {
                 run_impmap(&model, &pop, p, None, &opts).expect("impmap")
             };
             let route = MSTEP_ROUTE.with(|c| c.get());
-            let warning = res
-                .warnings
-                .iter()
-                .find(|w| w.contains("`mstep_optimizer = newton`"));
+            let warning = res.warnings.iter().find(|w| w.contains("`mstep_optimizer = newton`"));
             let what = format!("in_scope = {in_scope}, imp = {imp}, route {route:?}");
             if in_scope {
                 assert_eq!(warning, None, "{what}");

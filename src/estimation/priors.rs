@@ -212,11 +212,7 @@ impl PriorSet {
                          priors on per-class `[mixture]` overrides are not supported.",
                         prior.name,
                         matches.len(),
-                        matches
-                            .iter()
-                            .map(|c| c.kind.keyword())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        matches.iter().map(|c| c.kind.keyword()).collect::<Vec<_>>().join(", ")
                     ))
                 }
             };
@@ -265,10 +261,7 @@ impl PriorSet {
         // densities, which is never what a duplicated line means.
         terms.sort_by_key(|t| t.coord);
         if let Some(w) = terms.windows(2).find(|w| w[0].coord == w[1].coord) {
-            return Err(format!(
-                "prior on `{}`: declared more than once.",
-                w[0].name
-            ));
+            return Err(format!("prior on `{}`: declared more than once.", w[0].name));
         }
         Ok(Self { terms })
     }
@@ -363,10 +356,7 @@ impl PriorSet {
 
 /// Convert a declared spread to a packed-scale SD.
 fn packed_sd(
-    name: &str,
-    value: f64,
-    spread: PriorSpread,
-    scale: PriorScale,
+    name: &str, value: f64, spread: PriorSpread, scale: PriorScale,
 ) -> Result<f64, String> {
     // An absolute SD on a log-packed coordinate is read as the relative spread
     // it implies, so `sd = 0.03` on a value of 0.15 lands in exactly the same
@@ -375,9 +365,7 @@ fn packed_sd(
         PriorSpread::Rse(r) => r,
         PriorSpread::Sd(s) => {
             if !(s > 0.0) || !s.is_finite() {
-                return Err(format!(
-                    "prior on `{name}`: `sd` must be > 0 and finite, got {s}."
-                ));
+                return Err(format!("prior on `{name}`: `sd` must be > 0 and finite, got {s}."));
             }
             if matches!(scale, PriorScale::Identity) {
                 // No log scale to relate to — the absolute SD *is* the packed SD.
@@ -387,9 +375,7 @@ fn packed_sd(
         }
     };
     if !(rse > 0.0) || !rse.is_finite() {
-        return Err(format!(
-            "prior on `{name}`: `rse` must be > 0 and finite, got {rse}."
-        ));
+        return Err(format!("prior on `{name}`: `rse` must be > 0 and finite, got {rse}."));
     }
     let sd = match scale {
         // Normal prior on the natural scale: SD = |m| · RSE.
@@ -489,10 +475,7 @@ pub(crate) fn expand_prior_from_fit(model: &mut CompiledModel) -> Result<(), Str
 /// The body of [`expand_prior_from_fit`], against an already-built coordinate
 /// table.
 fn import_from_fit(
-    path: &str,
-    model: &CompiledModel,
-    coords: &[CoordInfo],
-    fixed: &[bool],
+    path: &str, model: &CompiledModel, coords: &[CoordInfo], fixed: &[bool],
     notes: &mut Vec<String>,
 ) -> Result<Vec<ParameterPrior>, String> {
     let source = crate::io::fit_estimates::read_fit_estimates(std::path::Path::new(path))
@@ -631,9 +614,7 @@ fn import_from_fit(
         } else {
             format!("every candidate was skipped:\n  - {}", notes.join("\n  - "))
         };
-        return Err(format!(
-            "[priors] from_fit = `{path}`: no prior could be imported — {why}."
-        ));
+        return Err(format!("[priors] from_fit = `{path}`: no prior could be imported — {why}."));
     }
     Ok(out)
 }
@@ -759,12 +740,8 @@ fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<Co
 /// `free_mask` is what encodes the real structure: a diagonal `(e, e)` is inside
 /// a block iff some off-diagonal in its row or column is a *free* parameter.
 fn push_omega_coords(
-    out: &mut Vec<CoordInfo>,
-    om: &crate::types::OmegaMatrix,
-    init_as_sd: &[bool],
-    kind: EstimateKind,
-    block_keyword: &str,
-    name_at: &dyn Fn(usize) -> String,
+    out: &mut Vec<CoordInfo>, om: &crate::types::OmegaMatrix, init_as_sd: &[bool],
+    kind: EstimateKind, block_keyword: &str, name_at: &dyn Fn(usize) -> String,
 ) {
     let n = om.dim();
     for (r, c) in lower_tri_iter(n, om.diagonal) {
@@ -803,13 +780,7 @@ fn push_omega_coords(
                 ),
             )
         };
-        out.push(CoordInfo {
-            coord: i,
-            name: name_at(i),
-            kind,
-            scale,
-            rejection,
-        });
+        out.push(CoordInfo { coord: i, name: name_at(i), kind, scale, rejection });
     }
 }
 

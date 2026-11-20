@@ -69,9 +69,5 @@ fn positive_rate_reads_as_infusion_via_public_reader() {
     let pop = read_nonmem_csv(f.path(), None, None).expect("positive RATE must read");
     let dose = &pop.subjects[0].doses[0];
     assert!(dose.is_infusion(), "positive RATE should be an infusion");
-    assert!(
-        (dose.duration - 2.0).abs() < 1e-9,
-        "duration = {}",
-        dose.duration
-    );
+    assert!((dose.duration - 2.0).abs() < 1e-9, "duration = {}", dose.duration);
 }

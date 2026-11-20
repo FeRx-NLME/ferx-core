@@ -1,34 +1,20 @@
-//! Vocabulary for state-reactive ("adaptive" / feedback) dosing simulation (#391).
-//!
-//! The *types* the reactive driver (`crate::ode::predictions::ode_predictions_adaptive`)
-//! and the public [`crate::api::simulate_adaptive`] entry point are built on. The
-//! shapes here are deliberately the public API surface:
-//!
-//! - a controller is `FnMut(&ControllerCtx) -> Vec<DoseAction>`;
-//! - it reads a set of declared [`MonitorSpec`] signals, **each on its own**
-//!   [`ObserveMode`] (so PK can be observed latent while a safety marker is
-//!   observed with assay noise — see [`ObserveMode`]);
-//! - every realized dose is recorded as a [`DoseLedgerEntry`] for the Part-D
-//!   output and the Part-E frozen-replay verifier.
-//!
-//! The engine — not the controller — resolves each monitored signal and draws any
-//! assay noise, so draw order stays reproducible for the verifier (#391 S1.5).
+//! Vocabulary for state-reactive ("adaptive" / feedback) dosing simulation (#391): the
+//! types the reactive driver (`crate::ode::predictions::ode_predictions_adaptive`) and
+//! [`crate::api::simulate_adaptive`] are built on. A controller is
+//! `FnMut(&ControllerCtx) -> Vec<DoseAction>` reading declared [`MonitorSpec`] signals,
+//! each on its own [`ObserveMode`]; every realized dose is a [`DoseLedgerEntry`]. The
+//! engine, not the controller, resolves signals and draws assay noise, so draw order
+//! stays reproducible for the verifier (#391 S1.5).
 
 use crate::types::DoseEvent;
 use std::collections::HashMap;
 
 /// A dosing action a controller can take at a decision time.
 ///
-/// `Hold` and `Stop` carry no payload: `Hold` skips *this* decision (the regimen
-/// continues), while `Stop` discontinues all future dosing for the subject.
-/// `SetInterval` changes the dosing interval from this decision on (#945). Only
-/// `Bolus`/`Infuse` map to a [`DoseEvent`] — see [`DoseAction::to_dose_event`].
-///
-/// `#[non_exhaustive]`: new actions (e.g. the infusion-truncating safety-halt of
-/// #391/#495) land additively without a breaking change. Within `ferx-core` the
-/// driver still matches exhaustively — the attribute only forces a wildcard arm
-/// in downstream crates (`ferx-r`), so adding a variant here can never silently
-/// skip a code path the compiler should have flagged.
+/// `Hold` skips this decision; `Stop` discontinues all future dosing; `SetInterval`
+/// changes the dosing interval from this decision on (#945). Only `Bolus`/`Infuse`
+/// inject a [`DoseEvent`]. `#[non_exhaustive]` only forces a wildcard arm downstream;
+/// ferx-core still matches exhaustively.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DoseAction {
@@ -39,31 +25,22 @@ pub enum DoseAction {
     Infuse { amt: f64, cmt: usize, rate: f64 },
     /// Skip this decision — no dose now, the regimen continues.
     Hold,
-    /// Discontinue all *future* dosing for this subject. An infusion already in
-    /// flight at the `Stop` decision **runs to its scheduled end** — `Stop` halts
-    /// the schedule, it does not retract an active infusion. Truncating an
-    /// in-flight infusion is a distinct action tracked in #495.
+    /// Discontinue all future dosing. An infusion in flight runs to its scheduled end
+    /// (truncating it is #495).
     Stop,
-    /// Set the dosing interval to `interval` from this decision on (#945). The
-    /// decision schedule stays a fixed review grid; a grid point is *due* once
-    /// `interval` has passed since the last decision the controller was consulted
-    /// at, and the controller is consulted only at due points (the others are
-    /// logged as [`DecisionOutcome::NotDue`]). The next due time must land on a
-    /// grid point or past the last one. At most one per decision, never together
-    /// with `Stop`; it composes with one dose (or `Hold`).
+    /// Set the dosing interval from this decision on (#945). The decision schedule stays
+    /// a fixed review grid: a point is due once `interval` has passed since the last
+    /// consulted decision, others log [`DecisionOutcome::NotDue`]. The next due time must
+    /// land on a grid point or past the last. At most one per decision, never with `Stop`.
     SetInterval { interval: f64 },
 }
 
 impl DoseAction {
-    /// Convert an action issued at `time` into a concrete [`DoseEvent`], or
-    /// `None` for [`DoseAction::Hold`] / [`DoseAction::Stop`] (which inject
-    /// nothing). Bioavailability and lag are applied downstream by the
-    /// integrator, exactly as for any `subject.doses` entry — never here.
-    ///
-    /// Assumes a well-formed action — call [`DoseAction::validate`] first; a
-    /// malformed `Infuse`/`Bolus` (e.g. `cmt = 0`, `rate ≤ 0`) is not the
-    /// concern of this pure mapping.
-    pub fn to_dose_event(&self, time: f64) -> Option<DoseEvent> {
+    /// The [`DoseEvent`] for an action issued at `time`, or `None` for `Hold` / `Stop`.
+    /// Bioavailability and lag are applied downstream. Assumes [`DoseAction::validate`]
+    /// passed.
+    #[cfg(test)]
+    pub(crate) fn to_dose_event(&self, time: f64) -> Option<DoseEvent> {
         match *self {
             DoseAction::Bolus { amt, cmt } => Some(DoseEvent::new(time, amt, cmt, 0.0, false, 0.0)),
             DoseAction::Infuse { amt, cmt, rate } => {
@@ -79,14 +56,10 @@ impl DoseAction {
         matches!(self, DoseAction::Stop)
     }
 
-    /// Reject the malformed actions a controller can produce, with a typed error,
-    /// before any are applied. Guards the cases that would otherwise corrupt the
-    /// integrator: compartment `0` (CMT is 1-based — `cmt - 1` would underflow a
-    /// `usize`), a non-positive or non-finite infusion `rate` (which
-    /// [`DoseEvent::new`] would silently turn into a zero-duration "infusion",
-    /// i.e. a degenerate bolus), a non-finite / negative `amt`, and a
-    /// `SetInterval` that is not positive and finite. `Hold`/`Stop` are always valid. The driver (S1.3a) calls this and surfaces the error
-    /// rather than letting a bad action reach the integrator.
+    /// Reject malformed actions with a typed error before any are applied: `cmt = 0`
+    /// (CMT is 1-based), a non-positive or non-finite infusion `rate` (would become a
+    /// degenerate bolus), a non-finite / negative `amt`, and a `SetInterval` that is not
+    /// positive and finite. `Hold`/`Stop` are always valid.
     pub fn validate(&self) -> Result<(), String> {
         let (amt, cmt, rate) = match *self {
             DoseAction::Bolus { amt, cmt } => (amt, cmt, None),
@@ -105,29 +78,20 @@ impl DoseAction {
             return Err("dose target compartment is 0, but CMT is 1-based".to_string());
         }
         if !amt.is_finite() || amt < 0.0 {
-            return Err(format!(
-                "dose amount must be finite and non-negative; got {amt}"
-            ));
+            return Err(format!("dose amount must be finite and non-negative; got {amt}"));
         }
         if let Some(rate) = rate {
             if !(rate.is_finite() && rate > 0.0) {
-                return Err(format!(
-                    "Infuse requires a positive, finite rate; got {rate}"
-                ));
+                return Err(format!("Infuse requires a positive, finite rate; got {rate}"));
             }
         }
         Ok(())
     }
 }
 
-/// How a monitored signal is observed at a decision time.
-///
-/// Generalizes "clean prediction vs noisy measurement" to **latent vs realized**,
-/// so it extends to non-Gaussian endpoints later (#391 Part F): for a continuous
-/// endpoint `Dv` adds the endpoint's residual draw; for an ordinal/TTE endpoint it
-/// becomes a *sampled* outcome rather than a Gaussian perturbation. The mode is
-/// chosen **per analyte** (see [`MonitorSpec`]), e.g. PK on `Ipred`, a neutrophil
-/// count driving CTCAE grading on `Dv` (the grade is defined on the measured lab).
+/// How a monitored signal is observed at a decision time: latent (`Ipred`) or realized
+/// (`Dv`, adding the endpoint's residual draw). Chosen per analyte (see [`MonitorSpec`]),
+/// e.g. PK on `Ipred` and a lab driving CTCAE grading on `Dv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObserveMode {
     /// Latent individual prediction — the model's value, no measurement noise.
@@ -138,12 +102,9 @@ pub enum ObserveMode {
     Dv,
 }
 
-/// One declared monitored signal the controller can read by `name`.
-///
-/// `cmt` is the 1-based endpoint/compartment whose error model supplies the
-/// residual when `mode == ObserveMode::Dv`; under `Ipred` it selects the latent
-/// readout. Each monitor carries its **own** [`ObserveMode`], so a PK signal can
-/// run on `Ipred` while a safety marker runs on `Dv` in the same simulation.
+/// One declared monitored signal the controller can read by `name`. `cmt` is the
+/// 1-based endpoint whose readout (and, under `Dv`, residual error) is used. Each
+/// monitor carries its own [`ObserveMode`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorSpec {
     /// Label the controller reads this signal by ([`ControllerCtx::signal`]).
@@ -157,31 +118,19 @@ pub struct MonitorSpec {
 impl MonitorSpec {
     /// Declare a monitored signal `name` reading endpoint `cmt` under `mode`.
     pub fn new(name: impl Into<String>, cmt: usize, mode: ObserveMode) -> Self {
-        Self {
-            name: name.into(),
-            cmt,
-            mode,
-        }
+        Self { name: name.into(), cmt, mode }
     }
 }
 
-/// A monitor paired with its optional compiled `observe` expression — the
-/// driver's per-signal input.
-///
-/// Pairing the expression *with* its [`MonitorSpec`] (rather than carrying a
-/// parallel `observe_exprs` slice the driver indexes by position) makes a
-/// monitor/expression desync unrepresentable. `observe == None` ⇒ read the
-/// model's `cmt` readout (the programmatic path); `Some(f)` ⇒ the declarative
+/// A monitor paired with its optional compiled `observe` expression, so the two cannot
+/// desync. `observe == None` reads the model's `cmt` readout; `Some(f)` is the
 /// `[adaptive_dosing]` block's compiled signal expression (#391 S2).
 pub(crate) struct AdaptiveMonitor<'a> {
     pub spec: &'a MonitorSpec,
     pub observe: Option<&'a crate::ode::OdeOutputFn>,
-    /// The `[scaling]` Form A/B divisor of the model readout this monitor reads, as
-    /// a function of the η in force (the decision window's `[η | κ]` under IOV) —
-    /// the divisor `predict()` / `simulate()` apply to an observation on `spec.cmt`
-    /// (#2129). `None` when nothing divides the readout: no `[scaling]`, a Form C
-    /// `y = <expr>` readout (already in observation units), or an `observe`
-    /// expression, which names its own signal.
+    /// The `[scaling]` Form A/B divisor of this monitor's readout as a function of the η
+    /// in force (#2129). `None` when nothing divides it: no `[scaling]`, a Form C readout,
+    /// or an `observe` expression.
     pub obs_scale: Option<&'a dyn Fn(&[f64]) -> f64>,
 }
 
@@ -197,56 +146,52 @@ impl AdaptiveMonitor<'_> {
     }
 }
 
-/// What a controller returns at one decision: the dose [`DoseAction`]s to apply,
-/// plus optional provenance — the label of the declarative `when` rule that
-/// fired, so the dose ledger can record *why* a dose changed. `rule == None` for
-/// a programmatic controller or a no-rule re-issue (the driver then records the
-/// dose by its route), so the field never fabricates a rule that did not fire.
+/// What a controller returns at one decision: its [`DoseAction`]s plus the label of the
+/// declarative `when` rule that fired (`None` for a programmatic controller or a no-rule
+/// re-issue), recorded in the dose ledger.
 pub(crate) struct ControllerDecision {
     pub actions: Vec<DoseAction>,
     pub rule: Option<String>,
 }
 
-/// The value a monitored signal actually presented to the controller at a
-/// decision, plus the mode it was resolved under — recorded on each
-/// [`DoseLedgerEntry`] so decision-audit replay (#391 Part E) can reproduce the
-/// exact inputs the controller saw.
+/// The value a monitored signal presented to the controller at a decision and its mode,
+/// recorded on each [`DoseLedgerEntry`] for decision-audit replay (#391 Part E), next to
+/// the latent value it was read from (#946).
+///
+/// `#[non_exhaustive]`: built only by the engine, so a field added later is not a
+/// breaking change for readers.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ObservedSignal {
     /// Matches the [`MonitorSpec::name`] that produced it.
     pub name: String,
-    /// The resolved value (latent or assay-noised per the monitor's mode).
+    /// The value the controller saw: the latent readout under [`ObserveMode::Ipred`],
+    /// the assay-noised reading (clamped at 0 where the readout cannot be negative) under
+    /// [`ObserveMode::Dv`]. Kept for decision audit; the outcome metrics do not read it.
     pub value: f64,
+    /// The latent (noise-free) readout at the decision, before any assay draw or clamp.
+    /// Equal to `value` bit-for-bit under [`ObserveMode::Ipred`]. The outcome metrics
+    /// ([`AdaptiveSubjectMetrics::signal_min`] … `pct_readings_in_window`) are scored on it,
+    /// since assay error is not part of the patient's outcome (#946).
+    pub latent: f64,
     /// The mode it was resolved under.
     pub mode: ObserveMode,
 }
 
-/// Read-only context handed to a controller at each decision time.
-///
-/// The controller inspects this and returns the [`DoseAction`]s to apply. It
-/// borrows the live integration state, so it is valid only for the duration of
-/// the call — the driver (S1.3+) owns the timeline. `signals` holds the
-/// engine-resolved value of every declared [`MonitorSpec`], each already on its
-/// own [`ObserveMode`], so the controller never draws assay noise itself
-/// (reproducibility is the engine's responsibility, #391 S1.5).
+/// Read-only context handed to a controller at each decision time, valid only for the
+/// call. `signals` holds the engine-resolved value of every declared [`MonitorSpec`], so
+/// the controller never draws assay noise itself (#391 S1.5).
 pub struct ControllerCtx<'a> {
-    /// Decision time on the subject's **engine** clock: the clock `decision_times`, the
-    /// decision log and the dose ledger are given on. After a reset that restarts `TIME`,
-    /// the reader shifts the period onto this monotonic clock (#1969), so `t` can then run
-    /// ahead of the `TIME` written in the data. A monitor reading `TIME` (an `observe`
-    /// expression or a `[scaling]` readout) reads the written value instead, as an
-    /// observation record there does (#2756). So in such a period, `signals` and `t` are
-    /// on different clocks.
+    /// Decision time on the subject's monotonic engine clock (#1969), which can run ahead
+    /// of the written `TIME` after a reset; a monitor reading `TIME` reads the written
+    /// value (#2756), so `signals` and `t` may be on different clocks.
     pub t: f64,
     /// Current ODE state vector (0-based compartments). The controller may
     /// compute any expression over this directly.
     pub state: &'a [f64],
-    /// Subject covariates in force at the decision, as the model sees them: the row of
-    /// the latest data record at or before `t` — a dose, EVID=2, observation or EVID=3/4
-    /// reset row; of several at the same time, the observation, then EVID=2, then dose,
-    /// then reset. Before the first record, the subject's baseline covariates. The PK
-    /// behind every monitored signal, and the `F` of a dose issued here, come from the
-    /// same record.
+    /// Covariates in force at the decision: the row of the latest record at or before `t`
+    /// (at ties: observation, then EVID=2, then dose, then reset), else the baseline.
+    /// Every monitored signal and the `F` of a dose issued here use the same row.
     pub covariates: &'a HashMap<String, f64>,
     /// Doses issued so far this simulation (the realized history).
     pub history: &'a [DoseEvent],
@@ -255,16 +200,14 @@ pub struct ControllerCtx<'a> {
     /// Resolved monitored signals keyed by [`MonitorSpec::name`] (latent or
     /// assay-noised per each monitor's mode).
     pub signals: &'a HashMap<String, f64>,
-    /// The dosing interval in force before this decision (#945): the last
-    /// [`DoseAction::SetInterval`], else the run's starting interval. `None` while
-    /// no interval is set, i.e. every grid point is due.
+    /// The dosing interval in force before this decision (#945); `None` when unset
+    /// (every grid point due).
     pub interval: Option<f64>,
 }
 
 impl ControllerCtx<'_> {
-    /// Value of the monitored signal `name`, or `None` if no such monitor was
-    /// declared — `None` rather than a silent `0.0`, so a typo surfaces instead
-    /// of quietly driving a wrong decision.
+    /// Value of the monitored signal `name`, or `None` if undeclared (not `0.0`, so a
+    /// typo surfaces).
     pub fn signal(&self, name: &str) -> Option<f64> {
         self.signals.get(name).copied()
     }
@@ -296,12 +239,11 @@ pub struct DoseLedgerEntry {
     /// Human-readable tag for the action/rule that fired (e.g. `"bolus"`, or a
     /// named ladder rule once S2 lands).
     pub rule_fired: String,
-    /// What the controller observed at this decision (per-analyte value + mode).
+    /// The signals at this decision, per analyte: the value the controller saw, its
+    /// latent readout (which the controller did not see, #946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
-    /// State immediately before / after the dose discontinuity — the inputs to
-    /// the double-entry / mass-balance checks (S6). `None` when state snapshots
-    /// are not retained (verification disabled), so a large run isn't charged two
-    /// heap allocations per dose for data nothing consumes.
+    /// State immediately before / after the dose discontinuity, for the mass-balance
+    /// checks (S6). `None` when snapshots are not retained.
     pub pre_state: Option<Vec<f64>>,
     /// See [`DoseLedgerEntry::pre_state`].
     pub post_state: Option<Vec<f64>>,
@@ -309,47 +251,29 @@ pub struct DoseLedgerEntry {
     pub f_applied: f64,
 }
 
-/// What a controller did at one decision — the audit summary the decision log
-/// records alongside the signals it observed.
-///
-/// The realized doses themselves live in the [`DoseLedgerEntry`] rows tagged with
-/// the same `decision_idx`; this only categorizes the decision so a held / no-dose
-/// decision (invisible in the dose ledger) is still on the record. `Stop` carries
-/// `dosed` so a "give a final dose, then discontinue" action list (`[Bolus, Stop]`)
-/// is logged faithfully rather than as a bare stop.
-///
-/// `#[non_exhaustive]`: downstream, read it through [`DecisionOutcome::label`] and
-/// [`DecisionOutcome::n_dosed`] rather than a wildcard match, whose catch-all arm
-/// would guess both for a variant added later.
+/// What a controller did at one decision, logged alongside the signals it observed so a
+/// hold (invisible in the dose ledger) is on record. `Stop` carries `dosed` for a
+/// `[Bolus, Stop]` list. `#[non_exhaustive]`: read it downstream through
+/// [`DecisionOutcome::label`] and [`DecisionOutcome::n_dosed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DecisionOutcome {
-    /// The controller issued `n` realized dose(s) (bolus/infusion with `amt > 0`).
-    /// Always `n >= 1`: a decision whose actions are all `Hold` or zero-amount is
-    /// [`DecisionOutcome::Hold`], not `Dosed { n: 0 }`.
+    /// The controller issued `n >= 1` realized doses (all-`Hold`/zero-amount is `Hold`).
     Dosed { n: usize },
     /// No dose this decision — every action was `Hold`, an empty action list, or a
     /// zero-amount dose.
     Hold,
-    /// The controller discontinued; `dosed` counts any dose(s) issued *before* the
-    /// `Stop` in the same action list (`0` for a bare stop). `Stop` must be the
-    /// final action — the driver rejects any action after it — so `dosed` is a
-    /// faithful count, never an undercount from a silently-dropped trailing dose.
+    /// The controller discontinued; `dosed` counts doses issued before the `Stop` in the
+    /// same list. `Stop` must be the final action.
     Stop { dosed: usize },
-    /// The grid point was not due under the current dosing interval (#945): the
-    /// controller was not consulted and no dose was given. The monitors were still
-    /// read, so the entry carries its `observed_signals`. Distinct from `Hold`,
-    /// which is a consulted decision that chose not to dose.
+    /// The grid point was not due under the current interval (#945): not consulted, no
+    /// dose, but its monitors were read. Distinct from a consulted `Hold`.
     NotDue,
 }
 
 impl DecisionOutcome {
-    /// The outcome's stable output label: `"dosed"`, `"hold"`, `"stop"` or
-    /// `"not_due"` (ferx-r's `decisions$OUTCOME`).
-    ///
-    /// It lives here so a downstream crate needs no wildcard arm on this
-    /// `#[non_exhaustive]` enum (#2581). The match is exhaustive inside ferx-core, so
-    /// a new variant does not compile until it is given a label.
+    /// The stable output label: `"dosed"`, `"hold"`, `"stop"` or `"not_due"` (ferx-r's
+    /// `decisions$OUTCOME`). Exhaustive here so downstream needs no wildcard (#2581).
     pub fn label(&self) -> &'static str {
         match *self {
             DecisionOutcome::Dosed { .. } => "dosed",
@@ -359,12 +283,8 @@ impl DecisionOutcome {
         }
     }
 
-    /// The number of realized doses this decision issued: `n` for `Dosed`, `dosed`
-    /// for `Stop`, `0` for `Hold` and `NotDue`.
-    ///
-    /// Like [`DecisionOutcome::label`], an exhaustive match inside ferx-core (#2581).
-    /// A downstream wildcard arm would report `0` for a future variant that doses, and
-    /// nothing would flag it; here such a variant does not compile until it is counted.
+    /// The number of realized doses: `n` for `Dosed`, `dosed` for `Stop`, `0` otherwise.
+    /// Exhaustive here, like [`DecisionOutcome::label`] (#2581).
     pub fn n_dosed(&self) -> usize {
         match *self {
             DecisionOutcome::Dosed { n } => n,
@@ -375,25 +295,12 @@ impl DecisionOutcome {
     }
 }
 
-/// One decision the controller made, recorded for **every** decision time —
-/// including holds and no-change, which leave no [`DoseLedgerEntry`]. This is the
-/// Part-D decision log and the input to the Part-E decision-audit replay (S1.6):
-/// it pins exactly what the controller saw (`observed_signals`) and what it did
-/// (`outcome`) at each decision, so the run can be reproduced and audited.
-///
-/// Reproducibility assumes the controller decides from its declared
-/// `observed_signals`. [`ControllerCtx`] also exposes the raw `state`,
-/// `covariates`, and dose `history`, but those are deterministically re-derivable
-/// from the frozen inputs + ledger + schedule, so they are not re-stored here. The
-/// signals *are* stored: under S1.3a (`Ipred` only) they are likewise re-derivable
-/// and serve as a self-contained, directly-auditable record, and under S1.5's `Dv`
-/// mode they pin the realized assay-noise draw, so the audit can verify what the
-/// controller saw without re-running the stochastic observation.
-///
-/// A decision reached *after* a `Stop` is not logged — once discontinued the
-/// driver issues no further decisions, so the `Stop` entry is the last record.
-///
-/// `#[non_exhaustive]`: new audit fields land additively.
+/// One decision the controller made, recorded for every decision time (holds included):
+/// the Part-D decision log and the input to the Part-E audit replay (S1.6). It pins what
+/// the controller saw (`observed_signals`, whose `value` under `Dv` holds the realized
+/// assay draw, next to the `latent` readout the controller did not see) and what it did. `state`, covariates and history are re-derivable from the
+/// frozen inputs, so they are not stored. Nothing is logged after a `Stop`.
+/// `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DecisionLogEntry {
@@ -407,8 +314,8 @@ pub struct DecisionLogEntry {
     pub decision_idx: usize,
     /// Decision time on the subject's clock.
     pub time: f64,
-    /// What the controller observed at this decision (per-analyte value + mode) —
-    /// the exact inputs to reproduce the decision.
+    /// The signals at this decision, per analyte: the value the controller saw (the
+    /// exact input to reproduce the decision), its latent readout (#946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// What the controller did (dose / hold / stop), or `NotDue`.
     pub outcome: DecisionOutcome,
@@ -418,9 +325,8 @@ pub struct DecisionLogEntry {
 }
 
 /// Result of one reactive-dosing run over a single subject: the observation-time
-/// predictions (same layout as [`crate::ode::predictions::ode_predictions`]), the
-/// realized-dose ledger, and the per-decision log. S1.4 wraps this with the
-/// per-subject/replicate orchestration and the public output schema.
+/// predictions (as [`crate::ode::predictions::ode_predictions`]), the dose ledger, and
+/// the per-decision log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdaptiveRun {
     /// Predictions at the subject's observation times (NaN where unrecorded;
@@ -435,25 +341,11 @@ pub struct AdaptiveRun {
 
 /// Per-subject outcome metrics for one realized adaptive-dosing run (#391 S2.4).
 ///
-/// One row per `(subject, draw, sim)` — the same key as the trajectory, ledger,
-/// and decision-log rows in [`crate::AdaptiveSimulationResult`], so a metrics row
-/// joins to exactly the run it summarizes. Every field is computed by
-/// `compute_subject_metrics` from that run's realized dose ledger and decision
-/// log **alone** — no re-integration — so each number is a direct, auditable
-/// function of the recorded artifacts (the same "reproduce it from the artifacts"
-/// contract as the decision log).
-///
-/// The signal summary (`signal_min`/`max`/`mean`, `pct_time_in_window`) is over the
-/// values the controller actually observed at the decision times — the troughs/peaks
-/// the monitor saw, which for TDM is the clinically reported quantity. It is a
-/// **decision-grid** summary, not a dense-trajectory extremum, and (when several
-/// monitors are declared) summarizes the first one. When the run recorded no signal
-/// at any decision, the summary fields are `None`.
-///
-/// `#[non_exhaustive]`: new outcome metrics (#391 S2.x) land additively without a
-/// breaking change. Within `ferx-core` it is still constructed normally (only
-/// `compute_subject_metrics` builds it); the attribute forces downstream crates
-/// (`ferx-r`) to read fields rather than rely on an exhaustive struct literal.
+/// One row per `(subject, draw, sim)`, the key of the other rows in
+/// [`crate::AdaptiveSimulationResult`]. Every field is computed by
+/// `compute_subject_metrics` from that run's dose ledger and decision log alone. The
+/// signal summary is over the values observed at decision times (the first monitor), a
+/// decision-grid summary, `None` when no signal was recorded. `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AdaptiveSubjectMetrics {
@@ -469,11 +361,8 @@ pub struct AdaptiveSubjectMetrics {
     /// Number of realized doses (ledger rows). Holds and a bare `Stop` leave no
     /// ledger row, so this counts doses actually given, not decisions.
     pub n_doses: usize,
-    /// Times the realized dose stepped **up** relative to the previous realized
-    /// dose. By dose-delta (not which rule fired), so it counts dose changes that
-    /// actually happened — a `decrease` rule clamped at the lower bound re-issues
-    /// the same dose and is not counted. `rule_fired` on the ledger remains for
-    /// finer audit.
+    /// Times the realized dose stepped up relative to the previous realized dose (by
+    /// dose delta, so a re-issued clamped dose is not counted).
     pub n_increases: usize,
     /// Times the realized dose stepped **down** relative to the previous realized
     /// dose (see [`AdaptiveSubjectMetrics::n_increases`]).
@@ -488,108 +377,60 @@ pub struct AdaptiveSubjectMetrics {
     pub discontinued: bool,
     /// Time of the `Stop` decision, or `None` if the run never discontinued.
     pub time_to_discontinuation: Option<f64>,
-    /// Lowest observed signal across the decisions that recorded one (the deepest
-    /// trough the monitor saw), or `None` if no decision recorded a signal.
+    /// Lowest latent signal ([`ObservedSignal::latent`] of the first monitor) across the
+    /// decisions that recorded one, or `None` if no decision recorded a signal. Scored on
+    /// the latent value, not the assay-noised reading, so a `Dv` monitor's noise moves
+    /// it only through the doses it changed (#946).
     pub signal_min: Option<f64>,
-    /// Highest observed signal across the decisions that recorded one.
+    /// Highest latent signal across the decisions that recorded one (see `signal_min`).
     pub signal_max: Option<f64>,
-    /// Mean observed signal across the decisions that recorded one.
+    /// Mean latent signal across the decisions that recorded one (see `signal_min`).
     pub signal_mean: Option<f64>,
-    /// Fraction of the **signal-bearing** decisions whose observed value fell
-    /// within the spec's `target_window` `[lo, hi]` (inclusive), in `[0, 1]`. The
-    /// denominator is the count of decisions that recorded a signal — the same
-    /// basis as the signal summary above — not the raw decision count: a decision
-    /// with no recorded signal is neither in nor out of band, so it is excluded
-    /// rather than counted as a miss. `None` when no `target_window` is declared
-    /// (or no signal was recorded) — never a band guessed from the rule
-    /// thresholds (#584).
-    pub pct_time_in_window: Option<f64>,
-    /// Fraction of the **closed inter-decision windows** whose exposure (the area
-    /// under the latent monitored signal over the window) fell within the spec's
-    /// `auc_target` band `[lo, hi]` (inclusive), in `[0, 1]` — e.g. the share of
-    /// daily windows whose vancomycin AUC₂₄ is on target (#391 S2.5b). The
-    /// denominator is the number of windows between consecutive **realized**
-    /// decisions (`realized_decisions − 1`), so a run with fewer than two decisions
-    /// has no window and the metric is `None`. `None` also when no `auc_target` is
-    /// declared (the window AUC is then skipped). Unlike the point summary above,
-    /// this is an **integrated-exposure** quantity: the reactive driver integrates the
-    /// signal over each window on the run's own trajectory, with a node on each side of
-    /// every dose, reset or infusion end inside it (#943; requesting it leaves the run
-    /// bit-identical), not reduced from the decision-grid signals.
-    ///
-    /// **Scored over realized decisions only.** If the controller `Stop`s, the later
-    /// *scheduled* decisions never happen, and their dose-free, washed-out windows are
-    /// **not** counted — discontinuation is already a first-class outcome
-    /// ([`Self::discontinued`] / [`Self::time_to_discontinuation`]), so folding it in
-    /// here too would double-count one event into two metrics and silently drag the
-    /// attainment down. So this stays a clean "of the windows we actually dosed, how
-    /// many hit the exposure target", on the same realized basis as the point metric
-    /// [`Self::pct_time_in_window`]. For a run that never discontinues, realized and
-    /// scheduled decisions coincide (the common case, and what the bundled example
-    /// exercises).
+    /// Fraction of the signal-bearing **decision readings** whose latent value
+    /// ([`ObservedSignal::latent`] of the first monitor) fell within `target_window`
+    /// `[lo, hi]` (inclusive), a fraction in `[0, 1]`. It counts readings, not elapsed
+    /// time: on an uneven grid each reading weighs the same. Decisions without a signal
+    /// are excluded. `None` when no `target_window` is declared or no signal was recorded
+    /// (#584). Latent, like `auc_target_attainment`, since #946, which also renamed it
+    /// from `pct_time_in_window`.
+    pub pct_readings_in_window: Option<f64>,
+    /// Fraction of the closed inter-decision windows whose exposure (AUC of the latent
+    /// signal) fell within `auc_target` `[lo, hi]` (inclusive), e.g. vancomycin AUC₂₄
+    /// (#391 S2.5b). The denominator is `realized_decisions − 1`; `None` with fewer than
+    /// two decisions or no `auc_target`. Integrated on the run's own trajectory with a
+    /// node on each side of every discontinuity (#943; the run stays bit-identical).
+    /// Scored over realized decisions only: windows after a `Stop` are not counted, since
+    /// discontinuation is already its own outcome.
     pub auc_target_attainment: Option<f64>,
-    /// Whether this subject's η was supplied (`AdaptiveInputs::with_etas`, #1594)
-    /// rather than drawn from Ω. Its between-subject variability is then conditioned
-    /// on, not simulated: across replicates it varies by κ and a `Dv` monitor's assay
-    /// only (adaptive trajectories carry no residual error).
+    /// Whether this subject's η was supplied (`AdaptiveInputs::with_etas`, #1594) rather
+    /// than drawn: replicates then vary by κ and a `Dv` monitor's assay only.
     pub eta_supplied: bool,
-    /// Whether this run's dose expressions read the subject's **drawn** individual
-    /// parameters, random effects or mixture class (`dose_knowledge = oracle`, #944): a
-    /// perfect-information dose that no prescriber could compute. `false` for a supplied
-    /// subject, whose values are known input, and whenever no dose expression reads one.
+    /// Whether a dose expression read the subject's drawn individual parameters, random
+    /// effects or mixture class (`dose_knowledge = oracle`, #944).
     pub dose_oracle: bool,
 }
 
-/// `true` if any logged decision is a `Stop` that *also* issued a dose — the
-/// `[dose, Stop]` shape (`DecisionOutcome::Stop { dosed > 0 }`).
-///
-/// The realized-window AUC (`auc_target_attainment`) relies on this
-/// being **false**: it scores only the windows between realized decisions, so a
-/// dose issued *at* a stop has no following decision to bound its window and would
-/// be silently dropped. That case is currently unreachable on the AUC path — a
-/// declarative `Stop` is dose-free, and the only controller that can dose-then-stop
-/// (the programmatic API) runs with `auc_target = None` — so the call site
-/// `debug_assert!`s on this predicate rather than handling the window. If a future
-/// change lets a dose-on-stop reach the window AUC, the assert trips in debug/test
-/// builds instead of quietly under-reporting exposure.
+/// `true` if any logged decision is a `Stop` that also issued a dose. The realized-window
+/// AUC relies on this being false (a dose at a stop has no window to score); it is
+/// currently unreachable there, so the call site `debug_assert!`s it.
 pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
-    decisions
-        .iter()
-        .any(|d| matches!(d.outcome, DecisionOutcome::Stop { dosed } if dosed > 0))
+    decisions.iter().any(|d| matches!(d.outcome, DecisionOutcome::Stop { dosed } if dosed > 0))
 }
 
-/// Compute the [`AdaptiveSubjectMetrics`] for one realized run from its dose
-/// `ledger` and decision log alone (#391 S2.4).
-///
-/// `ledger` and `decisions` are the artifacts of a **single** `(subject, draw,
-/// sim)` run (the rows the per-subject driver emits), in emission order: `ledger`
-/// in dose order and `decisions` in schedule order. `window_aucs` is that run's
-/// per-(inter-decision)-window signal AUC series (one entry per closed window,
-/// `decisions − 1` long), supplied by the driver's window AUC — `&[]` when
-/// no `auc_target` is declared (the pass is skipped). The function is **pure**: it
-/// re-integrates nothing, treating `window_aucs` as just another input artifact, so
-/// it stays unit-testable on hand-built rows. `target_window` / `auc_target` come
-/// from the [`AdaptiveDosingSpec`] (the file-driven path); the programmatic path
-/// passes `None` / `&[]`, leaving `pct_time_in_window` / `auc_target_attainment`
-/// unreported.
+/// Compute the [`AdaptiveSubjectMetrics`] of one `(subject, draw, sim)` run from its dose
+/// `ledger` and decision log alone (#391 S2.4); pure, re-integrates nothing.
+/// `window_aucs` is the per-window signal AUC series (`decisions − 1` long, `&[]` with no
+/// `auc_target`). The programmatic path passes `None` / `&[]`.
 pub(crate) fn compute_subject_metrics(
-    subject: &str,
-    draw: usize,
-    sim: usize,
-    ledger: &[DoseLedgerEntry],
-    decisions: &[DecisionLogEntry],
-    target_window: Option<(f64, f64)>,
-    auc_target: Option<(f64, f64)>,
-    window_aucs: &[f64],
+    subject: &str, draw: usize, sim: usize, ledger: &[DoseLedgerEntry],
+    decisions: &[DecisionLogEntry], target_window: Option<(f64, f64)>,
+    auc_target: Option<(f64, f64)>, window_aucs: &[f64],
 ) -> AdaptiveSubjectMetrics {
     let cumulative_dose: f64 = ledger.iter().map(|e| e.amt).sum();
     let n_doses = ledger.len();
 
-    // Dose changes between consecutive *realized* doses. A re-issued dose
-    // (unchanged, or clamped to the same bound) is bit-identical; a genuine step
-    // differs by the titration increment, so a small relative tolerance separates
-    // "no change" from a real step without miscounting float noise in compounded
-    // percentage steps.
+    // A re-issued dose is bit-identical; a small relative tolerance separates a real
+    // step from float noise in compounded percentage steps.
     let mut n_increases = 0usize;
     let mut n_decreases = 0usize;
     for w in ledger.windows(2) {
@@ -602,39 +443,34 @@ pub(crate) fn compute_subject_metrics(
         }
     }
 
-    let n_holds = decisions
-        .iter()
-        .filter(|d| matches!(d.outcome, DecisionOutcome::Hold))
-        .count();
-    let n_not_due = decisions
-        .iter()
-        .filter(|d| matches!(d.outcome, DecisionOutcome::NotDue))
-        .count();
-    let stop = decisions
-        .iter()
-        .find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
+    let n_holds = decisions.iter().filter(|d| matches!(d.outcome, DecisionOutcome::Hold)).count();
+    let n_not_due =
+        decisions.iter().filter(|d| matches!(d.outcome, DecisionOutcome::NotDue)).count();
+    let stop = decisions.iter().find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
     let discontinued = stop.is_some();
     let time_to_discontinuation = stop.map(|d| d.time);
 
-    // Signal summary over the value the controller observed at each decision (the
-    // first monitor when several are declared). Decisions with no recorded signal
-    // are skipped, so an empty list yields `None` rather than a NaN.
-    let signal_vals: Vec<f64> = decisions
-        .iter()
-        .filter_map(|d| d.observed_signals.first().map(|s| s.value))
-        .collect();
+    // Over the first monitor's latent values (#946): the outcome is the patient's, and
+    // assay error is not part of it. Decisions without a signal are skipped.
+    let signal_vals: Vec<f64> =
+        decisions.iter().filter_map(|d| d.observed_signals.first().map(|s| s.latent)).collect();
     let (signal_min, signal_max, signal_mean) = if signal_vals.is_empty() {
         (None, None, None)
     } else {
-        let min = signal_vals.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = signal_vals
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        // NaN-propagating, unlike `f64::min`/`f64::max`, which drop a NaN. Unreachable
+        // through the engine (the monitor loop refuses a non-finite readout, #1578), but a
+        // NaN must surface here rather than vanish if that guard ever moves.
+        let nan_min = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) };
+        let nan_max = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) };
+        let min = signal_vals.iter().copied().fold(f64::INFINITY, nan_min);
+        let max = signal_vals.iter().copied().fold(f64::NEG_INFINITY, nan_max);
         let mean = signal_vals.iter().sum::<f64>() / signal_vals.len() as f64;
         (Some(min), Some(max), Some(mean))
     };
-    let pct_time_in_window = match target_window {
+    let pct_readings_in_window = match target_window {
+        // A NaN reading fails both comparisons and would count as a miss; surface it
+        // instead, as the min/max fold above does (same unreachable-today guard, #1578).
+        Some(_) if signal_vals.iter().any(|v| v.is_nan()) => Some(f64::NAN),
         Some((lo, hi)) if !signal_vals.is_empty() => {
             let n_in = signal_vals.iter().filter(|&&v| v >= lo && v <= hi).count();
             Some(n_in as f64 / signal_vals.len() as f64)
@@ -642,10 +478,7 @@ pub(crate) fn compute_subject_metrics(
         _ => None,
     };
 
-    // Exposure attainment: the fraction of inter-decision windows whose signal AUC
-    // is in band. The denominator is the number of windows the driver integrated
-    // (`decisions − 1`); `window_aucs` is empty when no `auc_target` is declared (or
-    // there is fewer than one window), so both leave the metric `None`.
+    // Fraction of the integrated windows in band; empty `window_aucs` leaves `None`.
     let auc_target_attainment = match auc_target {
         Some((lo, hi)) if !window_aucs.is_empty() => {
             let n_in = window_aucs.iter().filter(|&&a| a >= lo && a <= hi).count();
@@ -669,7 +502,7 @@ pub(crate) fn compute_subject_metrics(
         signal_min,
         signal_max,
         signal_mean,
-        pct_time_in_window,
+        pct_readings_in_window,
         auc_target_attainment,
         // The caller knows where the η came from; the ledger does not.
         eta_supplied: false,
@@ -679,37 +512,25 @@ pub(crate) fn compute_subject_metrics(
 
 // ── Controller-assay RNG substream (#391 S1.5) ──────────────────────────────
 //
-// A DV-mode monitor observes a *realized* measurement = IPRED + ε·√(residual
-// variance). Those ε draws live on their **own** per-purpose substream, separate
-// from the η draws and the (currently latent) output trajectory, and each draw is
-// independently keyed by `(subject, replicate, decision_index, analyte)`. Keying
-// by identity rather than draw order makes the assay noise:
-//   * **deterministic** — a pure function of the run seed and the key;
-//   * **permutation-invariant** — subject iteration order cannot change a
-//     subject's draws (Part E);
-//   * **non-perturbing** — adding a monitor (a new analyte) or a decision never
-//     shifts any other monitor's draws, because no draw consumes a shared stream
-//     position.
-// The controller-less frozen-replay verifier therefore reproduces the trajectory
-// regardless of these draws (it replays realized doses, not decisions).
+// A `Dv` monitor reads IPRED + ε·√(residual variance). Each ε is drawn from its own
+// substream keyed by `(subject, replicate, decision_index, analyte)`, so the noise is
+// deterministic, independent of subject order, and adding a monitor or decision never
+// shifts another draw.
 
 /// Purpose tag folded into the assay seed so the controller-assay stream is
 /// disjoint from any other stream derived from the same run seed (η, output).
 const ASSAY_PURPOSE_SALT: u64 = 0xA55A_E155_0DE0_0001;
 
-/// Purpose tag folded into the IOV-kappa seed so the per-occasion κ draw stream
-/// is disjoint from the assay stream, the η stream, and the output stream derived
-/// from the same run seed (#701). A distinct salt is what guarantees enabling a
-/// `Dv` monitor never shifts the κ draws, and vice versa.
+/// Purpose salt keeping the IOV-κ stream disjoint from the assay, η and output streams
+/// of the same run seed (#701).
 const KAPPA_PURPOSE_SALT: u64 = 0xCA99_0CCA_5104_0001;
 
 /// 64-bit golden-ratio odd constant for seed mixing (same family as the
 /// per-chain seeding in `estimation/bayes.rs`).
 const GOLDEN64: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// FNV-1a 64-bit hash of a string — a *stable* (cross-platform, cross-run) hash
-/// for keying substreams by subject id / analyte name. `DefaultHasher` is
-/// deliberately avoided because its output is not guaranteed stable across builds.
+/// FNV-1a 64-bit hash of a string: stable across platforms and builds (unlike
+/// `DefaultHasher`), for keying substreams.
 pub(crate) fn stable_hash_str(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -733,15 +554,10 @@ pub(crate) fn combine_seed(seed: u64, component: u64) -> u64 {
 /// with a key any other substream derives from the same components.
 const REPLICATE_KEY_SALT: u64 = 0x5EED_D2A3_0E9E_0001;
 
-/// The replicate component of the κ and assay substream keys of the cell
-/// `(sim, draw, rep)` (#946): `sim` itself at `(draw, rep) = (1, 1)`, so a run without
-/// parameter uncertainty keeps the keys it always had, and otherwise all three indices
-/// folded into one key, so no two cells share a draw. `rep` is the within-`(draw, sim)`
-/// assay replicate, `1` until the variance decomposition draws more than one.
-///
-/// The build loop and the snapshot verifier both call this one function. The mixture
-/// class is keyed by `(draw, sim)` and never by `rep`: the class is a between-subject
-/// draw, fixed across a subject's assay replicates.
+/// The replicate component of the κ and assay substream keys of cell `(sim, draw, rep)`
+/// (#946): `sim` itself at `(draw, rep) = (1, 1)`, so a run without uncertainty keeps
+/// its keys, else all three folded. Shared by the build loop and the snapshot verifier.
+/// The mixture class is keyed by `(draw, sim)`, never `rep`.
 pub(crate) fn replicate_key(sim: usize, draw: usize, rep: usize) -> usize {
     if draw == 1 && rep == 1 {
         return sim;
@@ -754,9 +570,8 @@ pub(crate) fn replicate_key(sim: usize, draw: usize, rep: usize) -> usize {
     k as usize
 }
 
-/// Which replicate a message names (#946): the replicate `sim` and, only when the run
-/// draws parameter uncertainty, the parameter draw. Without uncertainty every message
-/// keeps its old wording ("sim 3"); with it the draw comes first ("draw 2, sim 3").
+/// Which replicate a message names (#946): `sim`, and the draw first only when the run
+/// draws parameter uncertainty ("draw 2, sim 3").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ReplicateTag {
     /// The parameter draw, `None` when the run draws no parameter uncertainty.
@@ -782,47 +597,33 @@ impl ReplicateTag {
     }
 }
 
-/// Per-(subject, replicate) base seed for the controller-assay substream, rooted
-/// at the run-level `root` seed. Keyed by the subject *id* (not its loop
-/// position), so the stream is permutation-invariant.
+/// Per-(subject, replicate) base seed for the assay substream, keyed by subject id.
 pub(crate) fn subject_assay_base_seed(root: u64, subject_id: &str, replicate: usize) -> u64 {
     let s = combine_seed(root ^ ASSAY_PURPOSE_SALT, stable_hash_str(subject_id));
     combine_seed(s, replicate as u64)
 }
 
-/// One standard-normal assay draw for monitor `analyte` at decision
-/// `decision_index`, on the substream rooted at `base_seed`. A fresh RNG is seeded
-/// per draw from the full key, so the draw depends on nothing else in the run
-/// (the non-perturbing property).
+/// One standard-normal assay draw for `analyte` at `decision_index`, from a fresh RNG
+/// seeded by the full key.
 pub(crate) fn assay_standard_normal(base_seed: u64, decision_index: usize, analyte: &str) -> f64 {
     use rand::SeedableRng;
     use rand_distr::{Distribution, Normal};
-    let key = combine_seed(
-        combine_seed(base_seed, decision_index as u64),
-        stable_hash_str(analyte),
-    );
+    let key =
+        combine_seed(combine_seed(base_seed, decision_index as u64), stable_hash_str(analyte));
     let mut rng = rand::rngs::StdRng::seed_from_u64(key);
     Normal::new(0.0, 1.0).unwrap().sample(&mut rng)
 }
 
-/// Per-(subject, replicate) base seed for the IOV-kappa substream (#701), rooted
-/// at the run-level `root` seed and keyed by the subject *id* (permutation-
-/// invariant, like the assay stream). The [`KAPPA_PURPOSE_SALT`] keeps it disjoint
-/// from the assay substream that shares this root, so enabling a `Dv` monitor never
-/// perturbs the κ draws (and the reverse). A model with no IOV never calls this, so
-/// the η stream stays byte-identical whether or not κ is present.
+/// Per-(subject, replicate) base seed for the IOV-κ substream (#701), keyed by subject
+/// id and salted apart from the assay stream. A model without IOV never calls it.
 pub(crate) fn subject_kappa_base_seed(root: u64, subject_id: &str, replicate: usize) -> u64 {
     let s = combine_seed(root ^ KAPPA_PURPOSE_SALT, stable_hash_str(subject_id));
     combine_seed(s, replicate as u64)
 }
 
-/// One standard-normal draw for kappa `component` on `occasion`, on the substream
-/// rooted at `base_seed` ([`subject_kappa_base_seed`]). A fresh RNG is seeded per
-/// draw from the full `(occasion, component)` key, so — exactly like
-/// [`assay_standard_normal`] — the draw depends on nothing else in the run: adding
-/// an occasion, a monitor, or another κ component never shifts any other draw. The
-/// caller assembles `n_kappa` such draws into a z-vector and applies the IOV
-/// Cholesky factor to obtain the correlated κ for that occasion.
+/// One standard-normal draw for κ `component` on `occasion`, from a fresh RNG seeded by
+/// the full key (as [`assay_standard_normal`]); the caller applies the IOV Cholesky
+/// factor.
 pub(crate) fn kappa_standard_normal(base_seed: u64, occasion: usize, component: usize) -> f64 {
     use rand::SeedableRng;
     use rand_distr::{Distribution, Normal};
@@ -831,21 +632,13 @@ pub(crate) fn kappa_standard_normal(base_seed: u64, occasion: usize, component: 
     Normal::new(0.0, 1.0).unwrap().sample(&mut rng)
 }
 
-/// Assay-noise capability threaded into
-/// [`crate::ode::predictions::ode_predictions_adaptive`] so it can resolve
-/// DV-mode monitors (#391 S1.5). Bundles the residual-variance resolver (already
-/// folded with the subject's `ruv_scale`) and the per-(subject, replicate) base
-/// seed that keys the controller-assay substream.
-///
-/// `resid_var(row)` returns `Ok(Some(variance))` for a compartment that has a
-/// residual error model and `Ok(None)` when none is defined — the driver turns the
-/// `None` into a typed error rather than fabricating a σ (S1.5 edge a). `Err` is a
-/// residual-error magnitude that is not positive and finite at the decision (#2741),
-/// worded for the user; the driver adds the decision and the monitor.
+/// Assay-noise capability for `ode_predictions_adaptive` (#391 S1.5): the residual
+/// variance resolver (with `ruv_scale` folded in) and the assay base seed.
+/// `resid_var(row)` is `Ok(None)` without a residual error model (the driver turns it
+/// into a typed error) and `Err` on a magnitude that is not positive and finite (#2741).
 pub(crate) struct AssayNoise<'a> {
-    /// `row -> Ok(Some(residual variance incl. ruv_scale and any magnitude))`,
-    /// `Ok(None)` when no residual error model covers `row.cmt`, `Err` on a
-    /// magnitude that is not positive and finite.
+    /// `row -> Ok(Some(residual variance))`, `Ok(None)` without an error model on
+    /// `row.cmt`, `Err` on a bad magnitude.
     pub resid_var: &'a dyn Fn(&AssayRow) -> Result<Option<f64>, String>,
     /// Whether the variance reads `TAD` (an `[error_model]` magnitude that names it).
     /// The driver computes [`AssayRow::tad`] only then, as `tad_for` does for a data row.
@@ -854,10 +647,8 @@ pub(crate) struct AssayNoise<'a> {
     pub base_seed: u64,
 }
 
-/// One `Dv` reading as the assay's residual variance sees it (#2741): what
-/// `simulate()` reads from an observation row, read at a decision instead. A
-/// residual-error magnitude is a function of `(θ, covariates, TIME, TAD)`, so this
-/// is all it needs; θ is the resolver's own.
+/// One `Dv` reading as the residual variance sees it (#2741): `(covariates, TIME, TAD)`
+/// at a decision.
 pub(crate) struct AssayRow<'a> {
     /// The monitored compartment: the endpoint key of a `CMT=N:` block.
     pub cmt: usize,
@@ -876,13 +667,8 @@ pub(crate) struct AssayRow<'a> {
 
 // ── Declarative `[adaptive_dosing]` block (#391 S2) ─────────────────────────
 //
-// The *parsed* form of the file-driven reactive controller. This is pure syntax
-// (an AST): it carries no binding to the model's parameters and no runtime. The
-// `observe` expression is kept as source text and compiled against the model's
-// parameter context when the controller is built (S2.2) — holding the spec as
-// data keeps the parser independent of the integration engine. The parser
-// (`parse_adaptive_dosing_block` in `parser::model_parser`) is the single place
-// that establishes the field invariants documented below.
+// The parsed AST of the file-driven controller; `observe` stays source text, compiled
+// when the controller is built. `parse_adaptive_dosing_block` establishes the invariants.
 
 /// A parsed `[adaptive_dosing]` block: a declarative, file-driven reactive
 /// controller (#391 S2).
@@ -901,33 +687,17 @@ pub(crate) struct AssayRow<'a> {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AdaptiveDosingSpec {
-    /// The latent (Ipred) monitored signal — a free-form expression over states +
-    /// individual parameters (e.g. `central / V`), compiled against the model in
-    /// S2.2. `Some` for an un-noised signal; `None` when `with_assay_error` is set
-    /// (the signal is then the noised model output named by `assay_cmt`, not a
-    /// re-typed expression). The `when` rules compare the keyword `signal` to it.
+    /// The latent (Ipred) signal expression over states and individual parameters, e.g.
+    /// `central / V`; `None` under `with_assay_error`. Rules compare `signal` to it.
     pub observe: Option<String>,
-    /// Covariate names the model's `[covariates]` block declares, captured at parse
-    /// time (empty when the block is absent).
-    ///
-    /// `observe` is stored as a raw string and compiled only at simulate time, by
-    /// `sim::adaptive_control::compile_observe`, through the very same
-    /// `build_y_output_fn` a `[scaling]` Form C readout uses. That compiler needs the
-    /// declarations to apply the `T` / `t` name precedence — a declared `T` is a data
-    /// column, not the model-time built-in (#1028) — and they are not otherwise
-    /// reachable from a `CompiledModel` (`referenced_covariates` holds names the model
-    /// *reads*, which is a declared-and-unreferenced `T` short). Carried here so
-    /// `observe` and `[scaling]` resolve the name identically, rather than the same
-    /// model reading the column in one block and the clock in the other.
+    /// Covariate names the model's `[covariates]` block declares (empty without one).
+    /// `compile_observe` needs them for the `T` / `t` precedence (#1028), as a
+    /// `[scaling]` Form C readout does, and they are not reachable from a `CompiledModel`.
     pub observe_declared_covariates: Vec<String>,
-    /// Titrate on the assay-noised measurement of a model output (`true`) rather
-    /// than a latent expression (`false`, the default). When set, the signal's
-    /// value *and* its σ both come from the output named by `assay_cmt`, so they
-    /// can never be on different scales.
+    /// Titrate on the assay-noised measurement of the output `assay_cmt` (value and σ
+    /// from the same output) rather than a latent expression.
     pub with_assay_error: bool,
-    /// 1-based compartment of the model output to measure under `with_assay_error`
-    /// — its `[scaling]` readout is the signal value and its `[error_model]` σ the
-    /// noise. Required iff `with_assay_error`; `None` otherwise.
+    /// 1-based compartment measured under `with_assay_error`; required iff it is set.
     pub assay_cmt: Option<usize>,
     /// Decision schedule (subject clock), expanded to explicit times at parse
     /// time — the times the controller is consulted.
@@ -948,67 +718,41 @@ pub struct AdaptiveDosingSpec {
     /// one level; mutually exclusive with percentage steps. Each rung is a number
     /// or a per-subject expression, like `start_dose` (#944).
     pub levels: Option<Vec<DoseValue>>,
-    /// The dose grid step (`round_to`, #944): when set, every dose the controller
-    /// sets — the start dose and each percentage step — is rounded to the nearest
-    /// multiple of it (ties up), then clamped to the multiples inside `dose_bounds`,
-    /// and that rounded dose is carried to the next decision. A finite number `> 0`;
-    /// never combined with `levels`, which is already discrete.
+    /// The dose grid step (`round_to`, #944): every dose set is rounded to the nearest
+    /// multiple (ties up), clamped to the multiples inside `dose_bounds`, and carried on.
+    /// Finite and `> 0`; never with `levels`.
     pub round_to: Option<f64>,
-    /// What a dose expression may know about the subject (#944): with
-    /// [`DoseKnowledge::Known`] (the default) it may read a subject's individual
-    /// parameters and random effects only when that subject's η are supplied
-    /// (`AdaptiveInputs::with_etas`); with [`DoseKnowledge::Oracle`] it may also read
-    /// the values the simulation draws, and each subject dosed from them is flagged.
+    /// What a dose expression may know (#944): with [`DoseKnowledge::Known`] individual
+    /// parameters only for supplied η; with [`DoseKnowledge::Oracle`] also drawn values.
     pub dose_knowledge: DoseKnowledge,
-    /// Which covariate row a decision carries as a record (#2895). Every decision is a
-    /// record of the run: a piece of the walk that ends at decision `g`, with no data
-    /// record at or before it, runs under that decision's parameters — κ of occasion `g`
-    /// and `TIME` at the decision — and under the covariate row this setting names. What
-    /// the controller reads at the decision is the LOCF row either way.
+    /// Which covariate row a decision carries as a record (#2895). The controller reads
+    /// the LOCF row either way.
     pub decision_covariates: DecisionCovariates,
-    /// Optional therapeutic target band `[low, high]` (inclusive) for the
-    /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
-    /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
-    /// be `+∞` for a one-sided "at or above `low`" target. `None` leaves
-    /// `pct_time_in_window` unreported rather than guessing a band from the rule
-    /// thresholds (which conflates the control law with the clinical target). See
+    /// Optional target band `[low, high]` (inclusive, `high` may be `+∞`) for the signal.
+    /// Feeds only `pct_readings_in_window` (scored on the latent signal, #946), never dosing;
+    /// `None` leaves it unreported. See
     /// [`crate::AdaptiveSubjectMetrics`].
     pub target_window: Option<(f64, f64)>,
-    /// Optional target band `[low, high]` (inclusive) for the **exposure** — the
-    /// area under the latent monitored signal over each inter-decision window
-    /// (e.g. vancomycin AUC₂₄ when decisions are daily). Like
-    /// [`AdaptiveDosingSpec::target_window`] it feeds **only** an outcome metric
-    /// ([`AdaptiveSubjectMetrics::auc_target_attainment`], #391 S2.5b) and never
-    /// influences dosing. `low` must be finite and `≥ 0` (an AUC of a non-negative
-    /// signal cannot be negative); `high` may be `+∞` for a one-sided "at or above
-    /// `low`" target. `None` leaves the metric unreported (the window AUC is
-    /// then skipped entirely — it is the metric's only consumer). See
-    /// [`AdaptiveSubjectMetrics::auc_target_attainment`].
+    /// Optional exposure band `[low, high]` (inclusive; `low` finite `≥ 0`, `high` may be
+    /// `+∞`) for the per-window AUC. Feeds only
+    /// [`AdaptiveSubjectMetrics::auc_target_attainment`] (#391 S2.5b); `None` skips the
+    /// window AUC entirely.
     pub auc_target: Option<(f64, f64)>,
     /// The dosing-interval ladder (#945), strictly increasing and positive, like
     /// `levels` for the dose. A rule's `lengthen` / `shorten` steps one rung and
     /// saturates at both ends. Set together with `start_interval`, or neither.
     pub intervals: Option<Vec<f64>>,
-    /// The dosing interval in force from the first decision (#945): one of
-    /// `intervals`. A grid point of `at` is then due only once this long has passed
-    /// since the last consulted decision; the other points log `not_due`. `None`
-    /// (without `intervals`) consults every point, as before.
+    /// The dosing interval in force from the first decision (#945), one of `intervals`.
+    /// `None` consults every grid point.
     pub start_interval: Option<f64>,
     /// The first-matching-rule ladder, in file order.
     pub rules: Vec<AdaptiveRule>,
 }
 
-/// One dose value of an `[adaptive_dosing]` block (#944): `start_dose`, a side of
-/// `dose_bounds`, or a rung of `levels`.
-///
-/// A value written as a number is a [`Literal`](DoseValue::Literal), checked when the
-/// block is parsed, exactly as before #944. Anything else is an
-/// [`Expr`](DoseValue::Expr): source text over θ and data covariates (e.g.
-/// `15 * WT`, `min(30 * WT, 4000)`), evaluated once per subject at the first decision
-/// (`at[0]`), with the covariates in force there. Its values are checked per subject
-/// before any subject is simulated.
-///
-/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+/// One dose value of an `[adaptive_dosing]` block (#944): a number
+/// ([`Literal`](DoseValue::Literal), checked at parse time) or an
+/// [`Expr`](DoseValue::Expr) over θ and data covariates (e.g. `min(30 * WT, 4000)`),
+/// evaluated per subject at the first decision. `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DoseValue {
@@ -1018,15 +762,9 @@ pub enum DoseValue {
     Expr(String),
 }
 
-/// What an `[adaptive_dosing]` dose expression may know about a subject
-/// (`dose_knowledge`, #944).
-///
-/// A dose expression may always read θ and data covariates. A subject's individual
-/// parameters, random effects and mixture class are known at dosing time only when
-/// they come from input — η supplied from a previous fit — not when the simulation
-/// draws them.
-///
-/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+/// What a dose expression may know about a subject (`dose_knowledge`, #944): always θ
+/// and data covariates; individual parameters, random effects and mixture class only
+/// when they come from input. `#[non_exhaustive]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum DoseKnowledge {
@@ -1042,14 +780,9 @@ pub enum DoseKnowledge {
     Oracle,
 }
 
-/// The covariate row a decision carries as a record (`decision_covariates`, #2895).
-///
-/// A decision ends the interval before it, as a dose row or an `EVID=2` row would in a
-/// static dataset, so that interval runs under the decision's own occasion κ and its
-/// `TIME`. The static equivalent of a run is its realized doses plus an `EVID=2` record
-/// at every decision, with blank covariate cells filled by this rule.
-///
-/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+/// The covariate row a decision carries as a record (`decision_covariates`, #2895): the
+/// interval ending at a decision runs under its occasion κ and `TIME`, as if an `EVID=2`
+/// record sat there. `#[non_exhaustive]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum DecisionCovariates {
@@ -1118,11 +851,9 @@ pub(crate) struct SubjectDosePlan {
     pub levels: Option<Vec<f64>>,
 }
 
-/// The first dose invariant a [`SubjectDosePlan`] breaks, in the order
-/// [`AdaptiveDosingSpec::validate`] has always checked them. One check serves the
-/// parse-time literal block and the per-subject plan, so the two cannot drift; only
-/// the wording differs ([`DosePlanViolation::literal_message`] keeps the pre-#944
-/// text, [`DosePlanViolation::subject_message`] names the subject).
+/// The first dose invariant a [`SubjectDosePlan`] breaks, in
+/// [`AdaptiveDosingSpec::validate`]'s order; shared by the parse-time block and the
+/// per-subject plan.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DosePlanViolation {
     Bounds,
@@ -1152,39 +883,25 @@ fn snapped_integer(q: f64) -> Option<f64> {
     ((q - r).abs() <= GRID_SNAP * r.abs().max(1.0)).then_some(r)
 }
 
-/// The grid indices of the lowest and highest multiples of `s` inside `[lo, hi]`:
-/// `ceil(lo / s)` and `floor(hi / s)`, each after snapping a quotient within
-/// [`GRID_SNAP`] of an integer onto it, so `0.3 / 0.1` floors to 3, not 2 (#944 audit 1
-/// row 12). The interval holds no multiple when the first exceeds the second.
-///
-/// A positive low never snaps to index 0: 0 is not inside `[lo, hi]`, however small
-/// `lo / s` is, so the lowest multiple is at least one step (`lo = 1e-6` at `s = 1000`
-/// aligns to 1000; #2805 review r1 row 1). Only a low of exactly 0 has index 0.
+/// The grid indices `ceil(lo / s)` and `floor(hi / s)` of the lowest and highest
+/// multiples in `[lo, hi]`, snapping quotients within [`GRID_SNAP`] of an integer
+/// (`0.3 / 0.1` floors to 3). A positive low never maps to index 0 (#2805). Empty when
+/// the first exceeds the second.
 fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
     let (ql, qh) = (lo / s, hi / s);
     let kl = snapped_integer(ql).unwrap_or_else(|| ql.ceil());
-    (
-        if lo > 0.0 { kl.max(1.0) } else { kl },
-        snapped_integer(qh).unwrap_or_else(|| qh.floor()),
-    )
+    (if lo > 0.0 { kl.max(1.0) } else { kl }, snapped_integer(qh).unwrap_or_else(|| qh.floor()))
 }
 
-/// `x` rounded to the nearest multiple of `s`, ties up (#944). A tie sits at
-/// `k + 0.5`, which an integer snap never touches, and `x / s` misses it by an ulp
-/// either way (`0.35 / 0.1` is `3.4999999999999996`), so the half is nudged up by
-/// [`GRID_SNAP`] (relative) before the floor (#944 audit 1 row 12): plain
-/// `f64::round` sends such ties down.
+/// `x` rounded to the nearest multiple of `s`, ties up: the half is nudged up by
+/// [`GRID_SNAP`] (relative), since `x / s` misses a tie by an ulp (`0.35 / 0.1`).
 pub(crate) fn round_to_grid(x: f64, s: f64) -> f64 {
     let q = x / s;
     grid_point((q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor(), s)
 }
 
-/// The `k`-th multiple of `s`. For a step that divides 1 (`0.1`, `0.25`, `0.5`, … —
-/// `1 / s` within [`GRID_SNAP`] of an integer `n >= 2`) it is `k / n`, the correctly
-/// rounded decimal, where `k * s` carries the step's own representation error into
-/// the ledger (`7 * 0.1` is `0.7000000000000001`, `7 / 10` is `0.7`; #2805 review r1
-/// row 7). Any other step, every integer step included, is `k * s`, bit for bit as
-/// before; a step such as `0.3` keeps that ulp noise.
+/// The `k`-th multiple of `s`: `k / n` when `1 / s` is within [`GRID_SNAP`] of an integer
+/// `n >= 2` (so `7 · 0.1` is `0.7`, not `0.7000000000000001`, #2805), else `k * s`.
 fn grid_point(k: f64, s: f64) -> f64 {
     match snapped_integer(1.0 / s) {
         Some(n) if n >= 2.0 => k / n,
@@ -1218,10 +935,8 @@ impl DoseGrid {
         Some(Self { step, low, high })
     }
 
-    /// `x` on the grid: rounded to the nearest multiple (ties up), **then** clamped to
-    /// the aligned bounds. The order matters: with `hi = 1150, s = 250`, clamping first
-    /// gives 1150, which rounds to 1250, above the bound; rounding first gives 1250,
-    /// which clamps to 1000.
+    /// `x` rounded to the grid, then clamped (`hi = 1150, s = 250`: 1150 → 1250 → 1000;
+    /// clamping first would give 1250).
     pub(crate) fn place(&self, x: f64) -> f64 {
         round_to_grid(x, self.step).clamp(self.low, self.high)
     }
@@ -1233,21 +948,12 @@ impl DoseGrid {
         self.place(percent_step(d, p, up))
     }
 
-    /// The lowest multiple of the step that `increase p%` raises, on a grid with no
-    /// upper bound (#2810): every multiple below it is absorbed. `None` when the step
-    /// raises no finite multiple up to index 2^52.
-    ///
-    /// Found by bisection on [`Self::step_percent`] itself, not from `50 / p`: the tie
-    /// nudge in `round_to_grid` is relative, so for a small percentage the engine raises
-    /// a dose somewhat below `50 * step / p` (#2890 review r1 rows 1 and 2), and `50 / p`
-    /// is infinite for a percentage near the smallest `f64`.
+    /// The lowest multiple of `step` that `increase p%` raises on an unbounded grid
+    /// (#2810); `None` if none up to index 2^52. Found by bisection on
+    /// [`Self::step_percent`], since the relative tie nudge makes `50 / p` inexact (#2890).
     pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
         const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
-        let open = Self {
-            step,
-            low: 0.0,
-            high: f64::INFINITY,
-        };
+        let open = Self { step, low: 0.0, high: f64::INFINITY };
         let raised = |k: f64| {
             let d = grid_point(k, step);
             d.is_finite() && open.step_percent(d, p, true) > d
@@ -1310,13 +1016,10 @@ pub(crate) fn round_to_message(val: &str) -> String {
 
 /// The first dose invariant `plan` breaks, if any, under `spec`'s `round_to` and rules.
 pub(crate) fn dose_plan_violation(
-    spec: &AdaptiveDosingSpec,
-    plan: &SubjectDosePlan,
+    spec: &AdaptiveDosingSpec, plan: &SubjectDosePlan,
 ) -> Option<DosePlanViolation> {
-    let levels: Option<Vec<Option<f64>>> = plan
-        .levels
-        .as_ref()
-        .map(|l| l.iter().copied().map(Some).collect());
+    let levels: Option<Vec<Option<f64>>> =
+        plan.levels.as_ref().map(|l| l.iter().copied().map(Some).collect());
     known_dose_violation(
         Some(plan.start_dose),
         Some(plan.dose_bounds.0),
@@ -1326,18 +1029,12 @@ pub(crate) fn dose_plan_violation(
     )
 }
 
-/// The first dose invariant broken by the values that are **known** (`None` is an
-/// expression, not yet evaluated), in the order [`AdaptiveDosingSpec::validate`] has
-/// always checked them. Each check runs only when every value it compares is known, so
-/// a block that mixes numbers and expressions is checked among its numbers when it is
-/// parsed (#2667 review r1 row 1), and a subject's plan — every value known — gets
-/// exactly the full check. The one implementation of each dose invariant.
+/// The first dose invariant broken among the known values (`None` = an unevaluated
+/// expression), in [`AdaptiveDosingSpec::validate`]'s order. A check runs only when all
+/// its values are known (#2667). The one implementation of each dose invariant.
 #[allow(clippy::float_cmp)] // `start_dose ∈ levels` is exact membership
 fn known_dose_violation(
-    d: Option<f64>,
-    lo: Option<f64>,
-    hi: Option<f64>,
-    levels: Option<&[Option<f64>]>,
+    d: Option<f64>, lo: Option<f64>, hi: Option<f64>, levels: Option<&[Option<f64>]>,
     grid: Option<GridRule>,
 ) -> Option<DosePlanViolation> {
     // `low >= 0` and `low <= high` make a negative `high` invalid on its own.
@@ -1365,11 +1062,8 @@ fn known_dose_violation(
                 return Some(DosePlanViolation::LevelsOrder(e));
             }
         }
-        // The start dose must be a rung. A known start that is no known rung can still be
-        // an expression rung, but only one strictly between its known neighbours (±∞ at
-        // the ends): the ladder increases, which the order check above has established
-        // among the known rungs (#2667 review r2 N3). With every rung known that leaves
-        // plain membership.
+        // A known start that is no known rung may still be an expression rung strictly
+        // between its known neighbours (±∞ at the ends) (#2667).
         if let Some(d) = d {
             let expression_rung_can_be_d = (0..l.len()).any(|i| {
                 l[i].is_none()
@@ -1388,11 +1082,8 @@ fn known_dose_violation(
             return Some(DosePlanViolation::LevelOutsideBounds(i, bad));
         }
     }
-    // The dose grid (`round_to`, #944), after every check above, so a block that breaks
-    // one of those names the same invariant it did before. No multiple within the
-    // bounds needs both of them (V7); a lower bound that aligns to 0 needs only the low
-    // one (V8), so a literal low is refused when the block is parsed even when the high
-    // is an expression.
+    // The dose grid (#944), checked last. V7: no multiple within the bounds (needs both);
+    // V8: a low bound aligning to 0 (needs only the low).
     if let Some(g) = grid {
         if let (Some(l), Some(h)) = (lo, hi) {
             if DoseGrid::new(g.step, (l, h)).is_none() {
@@ -1418,10 +1109,8 @@ pub(crate) struct GridRule {
 }
 
 impl DosePlanViolation {
-    /// The parse-time text, from the spec as written: the pre-#944 text, byte for byte,
-    /// for a block whose dose values are all numbers (a literal's source is its
-    /// `Display`), and the same sentence with the expression in place of an unknown
-    /// value otherwise. Only the checks whose values are all known reach here.
+    /// The parse-time text: the pre-#944 text byte for byte for an all-numeric block,
+    /// else the same sentence with the expression in place of an unknown value.
     fn literal_message(&self, spec: &AdaptiveDosingSpec) -> String {
         let d = spec.start_dose.source();
         let (lo, hi) = (spec.dose_bounds.0.source(), spec.dose_bounds.1.source());
@@ -1444,11 +1133,8 @@ impl DosePlanViolation {
                     Some(n) => format!(
                         "[adaptive_dosing]: start_dose {d} must be one of the declared levels {n:?}"
                     ),
-                    // A mixed ladder (#2667 review r2 N3): the rungs as written, and why
-                    // no expression rung can take the value, naming the numbers around the
-                    // start dose (review N3 M2). Reached only with a numeric start that is
-                    // none of the numbers, and with at least one number: with none, every
-                    // expression rung could take it.
+                    // A mixed ladder (#2667): the rungs as written and the numbers around
+                    // the start dose that no expression rung can sit between.
                     None => {
                         let start = spec.start_dose.as_literal().unwrap_or(f64::NAN);
                         let nums = rungs.iter().filter_map(DoseValue::as_literal);
@@ -1466,11 +1152,7 @@ impl DosePlanViolation {
                             "[adaptive_dosing]: start_dose {d} must be one of the declared \
                              levels [{}]. It is none of the numbers, and the ladder increases, \
                              so no expression rung can equal it: none lies {gap}.",
-                            rungs
-                                .iter()
-                                .map(DoseValue::source)
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            rungs.iter().map(DoseValue::source).collect::<Vec<_>>().join(", ")
                         )
                     }
                 }
@@ -1494,42 +1176,23 @@ impl DosePlanViolation {
         }
     }
 
-    /// The per-subject text (#944): the subject (and, for an oracle subject, the
-    /// replicate whose drawn values it read), each value involved as written and as
-    /// evaluated, and — when the expressions read any — the covariate and subject values
-    /// they read.
+    /// The per-subject text (#944): the subject (and oracle replicate), each value as
+    /// written and evaluated, and the covariate / subject values the expressions read.
     pub(crate) fn subject_message(
-        &self,
-        spec: &AdaptiveDosingSpec,
-        plan: &SubjectDosePlan,
-        subject_id: &str,
-        replicate: Option<ReplicateTag>,
-        reads: &[(String, f64)],
+        &self, spec: &AdaptiveDosingSpec, plan: &SubjectDosePlan, subject_id: &str,
+        replicate: Option<ReplicateTag>, reads: &[(String, f64)],
     ) -> String {
         let (lo, hi) = plan.dose_bounds;
         let d = plan.start_dose;
         let head = match replicate {
             None => format!("[adaptive_dosing] subject {subject_id}:"),
-            Some(k) => format!(
-                "[adaptive_dosing] subject {subject_id}, {}:",
-                k.replicate_label()
-            ),
+            Some(k) => format!("[adaptive_dosing] subject {subject_id}, {}:", k.replicate_label()),
         };
         let start = spec.start_dose.source();
-        let bounds = format!(
-            "[{}, {}]",
-            spec.dose_bounds.0.source(),
-            spec.dose_bounds.1.source()
-        );
+        let bounds = format!("[{}, {}]", spec.dose_bounds.0.source(), spec.dose_bounds.1.source());
         let rungs = spec.levels.as_deref().unwrap_or(&[]);
-        let ladder = format!(
-            "[{}]",
-            rungs
-                .iter()
-                .map(DoseValue::source)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let ladder =
+            format!("[{}]", rungs.iter().map(DoseValue::source).collect::<Vec<_>>().join(", "));
         let values = plan.levels.as_deref().unwrap_or(&[]);
         let body = match self {
             DosePlanViolation::Bounds => format!(
@@ -1554,9 +1217,7 @@ impl DosePlanViolation {
             DosePlanViolation::LevelOutsideBounds(i, bad) => format!(
                 "level {} evaluates to {bad}, outside dose_bounds = {bounds}, which evaluate \
                  to [{lo}, {hi}].",
-                rungs
-                    .get(*i)
-                    .map_or_else(|| bad.to_string(), DoseValue::source)
+                rungs.get(*i).map_or_else(|| bad.to_string(), DoseValue::source)
             ),
             DosePlanViolation::NoGridPoint => format!(
                 "no multiple of round_to = {} lies within dose_bounds = {bounds}, which \
@@ -1576,11 +1237,7 @@ impl DosePlanViolation {
         if reads.is_empty() {
             return format!("{head} {body}");
         }
-        let read = reads
-            .iter()
-            .map(|(n, v)| format!("{n} = {v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let read = reads.iter().map(|(n, v)| format!("{n} = {v}")).collect::<Vec<_>>().join(", ");
         format!(
             "{head} {body} The dose expressions read {read}, at the first decision (t = {}).",
             spec.at[0]
@@ -1588,25 +1245,17 @@ impl DosePlanViolation {
     }
 }
 
-/// Validate a `[adaptive_dosing]` float list is non-empty, all-finite, and
-/// strictly increasing — the shared contract of the `levels` ladder and an
-/// explicit `at` decision list. Called from BOTH the block parser and
-/// [`AdaptiveDosingSpec::validate`] so the file-driven and programmatic paths
-/// enforce it identically (a single source of truth, not two that can drift).
-/// `what` names the list in the error (e.g. `"levels"`, `` "`at` times" ``).
+/// Validate a float list is non-empty, finite and strictly increasing (`levels`, `at`),
+/// shared by the block parser and [`AdaptiveDosingSpec::validate`]. `what` names it.
 pub(crate) fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> {
     if xs.is_empty() {
-        return Err(format!(
-            "[adaptive_dosing]: {what} must be a non-empty list"
-        ));
+        return Err(format!("[adaptive_dosing]: {what} must be a non-empty list"));
     }
     if !xs.iter().all(|x| x.is_finite()) {
         return Err(format!("[adaptive_dosing]: {what} must all be finite"));
     }
     if xs.windows(2).any(|w| w[1] <= w[0]) {
-        return Err(format!(
-            "[adaptive_dosing]: {what} must be strictly increasing"
-        ));
+        return Err(format!("[adaptive_dosing]: {what} must be strictly increasing"));
     }
     Ok(())
 }
@@ -1617,10 +1266,7 @@ impl AdaptiveDosingSpec {
     pub(crate) fn literal_dose_plan(&self) -> Option<SubjectDosePlan> {
         Some(SubjectDosePlan {
             start_dose: self.start_dose.as_literal()?,
-            dose_bounds: (
-                self.dose_bounds.0.as_literal()?,
-                self.dose_bounds.1.as_literal()?,
-            ),
+            dose_bounds: (self.dose_bounds.0.as_literal()?, self.dose_bounds.1.as_literal()?),
             levels: match &self.levels {
                 Some(l) => Some(l.iter().map(DoseValue::as_literal).collect::<Option<_>>()?),
                 None => None,
@@ -1632,10 +1278,7 @@ impl AdaptiveDosingSpec {
     /// invalid one, which `validate` refuses first (P3).
     pub(crate) fn grid_rule(&self) -> Option<GridRule> {
         let step = self.round_to.filter(|s| s.is_finite() && *s > 0.0)?;
-        Some(GridRule {
-            step,
-            percent_steps: self.has_percent_steps(),
-        })
+        Some(GridRule { step, percent_steps: self.has_percent_steps() })
     }
 
     /// Whether a rule takes a percentage dose step (`increase N%` / `decrease N%`).
@@ -1681,16 +1324,9 @@ impl AdaptiveDosingSpec {
     }
 
     /// Whether the dose grid absorbs the smallest increase step at a dose this subject
-    /// can be at (#2810). `None` without `round_to`, without an `increase N%` rule, or
-    /// when the step moves every such dose.
-    ///
-    /// The doses a `p%` increase cannot raise are the lowest of the grid, since
-    /// `d * p / 100` grows with `d`. So the lowest dose the subject can reach decides:
-    /// the placed start dose when no decrease moves it, and otherwise the dose the
-    /// largest `decrease N%` brings it to when applied until it stops moving (a smaller
-    /// decrease never goes lower). The aligned low bound is not used: a decrease can be
-    /// absorbed above it, and then it is never reached. A dose at the aligned high bound
-    /// is not reported: an increase absorbed there is the bound, not the grid.
+    /// can reach (#2810); `None` without `round_to`, an increase rule, or absorption. The
+    /// lowest reachable dose decides (`d * p / 100` grows with `d`): the placed start, or
+    /// where the largest decrease stops. A dose at the aligned high bound is not reported.
     #[allow(clippy::float_cmp)] // grid doses: "unchanged" is the same multiple, bit for bit
     pub(crate) fn absorbed_increase(&self, plan: &SubjectDosePlan) -> Option<AbsorbedIncrease> {
         let grid = self.dose_grid(plan.dose_bounds)?;
@@ -1727,34 +1363,17 @@ impl AdaptiveDosingSpec {
         .collect()
     }
 
-    /// Enforce every invariant the block parser checks, in one place.
-    ///
-    /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
-    /// reach the controller without going through the parser. The parser calls
-    /// this on the spec it assembles, and
-    /// `compile_adaptive` calls
-    /// it again as the safety net for hand-built specs — so neither path can drive
-    /// the controller with a contradiction (a `Level` step without a `levels`
-    /// ladder, a `start_dose` outside `dose_bounds`, a rung outside `dose_bounds`,
-    /// an empty or unsorted `at`/`levels`, a `confirm` of 0, …) the other would
-    /// have rejected.
+    /// Enforce every invariant the block parser checks. Called by the parser and again
+    /// by `compile_adaptive` as the safety net for a hand-built `pub` spec.
     pub fn validate(&self) -> Result<(), String> {
         if self.rules.is_empty() {
-            return Err(
-                "[adaptive_dosing]: at least one `when … : …` rule is required".to_string(),
-            );
+            return Err("[adaptive_dosing]: at least one `when … : …` rule is required".to_string());
         }
-        // The dose invariants among the values written as numbers (#944): all of them
-        // on a block of numbers, and every check whose values are all numbers on a block
-        // that mixes in expressions (#2667 review r1 row 1). The checks that involve an
-        // expression run per subject, before any subject runs (`resolve_dose_plans`).
-        // The violation is found once, here, and reported at the position each check has
-        // always had in this function, so a block breaking several invariants names the
-        // same one it did before #944.
-        let levels: Option<Vec<Option<f64>>> = self
-            .levels
-            .as_ref()
-            .map(|l| l.iter().map(DoseValue::as_literal).collect());
+        // Dose invariants among the numeric values (#944, #2667); those involving an
+        // expression run per subject in `resolve_dose_plans`. Reported at each check's
+        // historical position so the same invariant is named as before #944.
+        let levels: Option<Vec<Option<f64>>> =
+            self.levels.as_ref().map(|l| l.iter().map(DoseValue::as_literal).collect());
         let violation = known_dose_violation(
             self.start_dose.as_literal(),
             self.dose_bounds.0.as_literal(),
@@ -1771,10 +1390,7 @@ impl AdaptiveDosingSpec {
         {
             return Err(literal_err(v));
         }
-        // `target_window` (metrics only): low must be finite and low <= high; high
-        // may be +∞ (a one-sided "at or above low" target). Checked here too, not
-        // just in the parser, so a hand-built spec can't reach metrics with an
-        // inverted/NaN band.
+        // `target_window`: low finite, low <= high, high may be +∞.
         if let Some((wlo, whi)) = self.target_window {
             if !wlo.is_finite() || whi.is_nan() || whi < wlo {
                 return Err(format!(
@@ -1783,12 +1399,7 @@ impl AdaptiveDosingSpec {
                 ));
             }
         }
-        // `auc_target` (metrics only): the exposure band for `auc_target_attainment`.
-        // `low` must be finite *and non-negative* (the AUC of a non-negative signal
-        // cannot be < 0, so a negative target is a modelling error), `low <= high`,
-        // and `high` may be +∞ (one-sided "at or above low"). Checked here too, not
-        // just in the parser, so a hand-built spec can't reach metrics with an
-        // inverted/NaN/negative band.
+        // `auc_target`: low finite and >= 0, low <= high, high may be +∞.
         if let Some((alo, ahi)) = self.auc_target {
             if !alo.is_finite() || alo < 0.0 || ahi.is_nan() || ahi < alo {
                 return Err(format!(
@@ -1797,33 +1408,19 @@ impl AdaptiveDosingSpec {
                 ));
             }
         }
-        // The decision schedule must be a non-empty, finite, strictly-increasing
-        // list of non-negative times. The parser enforces this on the way in;
-        // re-check here so a hand-built spec can't silently run with no doses
-        // (empty `at`) or a permuted decision log (unsorted `at`).
+        // A non-empty, finite, strictly increasing list of non-negative times.
         validate_increasing_finite(&self.at, "`at` times")?;
         if self.at[0] < 0.0 {
             // Strictly increasing ⇒ `at[0]` is the minimum.
-            return Err(format!(
-                "[adaptive_dosing]: `at` times must be >= 0: {}",
-                self.at[0]
-            ));
+            return Err(format!("[adaptive_dosing]: `at` times must be >= 0: {}", self.at[0]));
         }
         if self.confirm < 1 {
             return Err(
-                "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)".to_string(),
+                "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)".to_string()
             );
         }
-        // Exactly one signal source. `observe` is the latent (Ipred) signal — a
-        // free-form expression with no measurement noise. `with_assay_error = true`
-        // makes the signal the *noised measurement* of the model output named by
-        // `assay_cmt`: its value and σ both come from that one output, so they can
-        // never be on different scales. The two forms are mutually exclusive.
-        match (
-            self.with_assay_error,
-            self.observe.is_some(),
-            self.assay_cmt.is_some(),
-        ) {
+        // Exactly one signal source: `observe` (latent) or `with_assay_error`.
+        match (self.with_assay_error, self.observe.is_some(), self.assay_cmt.is_some()) {
             (false, true, false) => {} // Ipred: titrate on the `observe` expression.
             (true, false, true) => {}  // Dv: titrate on the noised output at `assay_cmt`.
             (false, false, _) => {
@@ -1836,7 +1433,7 @@ impl AdaptiveDosingSpec {
             }
             (false, true, true) => {
                 return Err(
-                    "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string(),
+                    "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string()
                 )
             }
             (true, true, _) => {
@@ -1854,9 +1451,7 @@ impl AdaptiveDosingSpec {
             ),
         }
 
-        // The dose grid (`round_to`, #944): a finite step > 0 (P3), never with a `levels`
-        // ladder, which is already discrete (P4). Checked before the ladder, so a block
-        // with both is told this rather than a ladder or grid error.
+        // `round_to` (#944): finite > 0 (P3), never with `levels` (P4); before the ladder.
         if let Some(s) = self.round_to {
             if !s.is_finite() || s <= 0.0 {
                 return Err(round_to_message(&s.to_string()));
@@ -1876,10 +1471,7 @@ impl AdaptiveDosingSpec {
         });
         match &self.levels {
             Some(_) => {
-                // Non-empty, finite, strictly increasing: a `Level` step indexes
-                // this ladder and assumes ascending order — on a descending list
-                // `increase` would *lower* the dose. The parser checks this on the
-                // way in; re-check for hand-built specs.
+                // A descending ladder would make `increase` lower the dose.
                 if let Some(v @ DosePlanViolation::LevelsOrder(_)) = &violation {
                     return Err(literal_err(v));
                 }
@@ -1888,10 +1480,8 @@ impl AdaptiveDosingSpec {
                                 allowed with `levels`; use bare `increase`/`decrease` to step one level"
                         .to_string());
                 }
-                // `start_dose` must be a rung, and every rung must lie within
-                // `dose_bounds`; otherwise `step_dose` clamps the emitted dose while the
-                // rung index keeps advancing, decoupling the decision log from the
-                // realized dose.
+                // Start must be a rung and every rung within `dose_bounds`, or the rung
+                // index decouples from the clamped dose.
                 if let Some(v) = &violation {
                     return Err(literal_err(v));
                 }
@@ -1916,10 +1506,8 @@ impl AdaptiveDosingSpec {
         self.validate_intervals()
     }
 
-    /// The dosing-interval ladder's invariants (#945), shared by the parser and the
-    /// hand-built path through [`AdaptiveDosingSpec::validate`]. The check that each
-    /// interval lands on the `at` grid needs the `every` step and stays in the parser;
-    /// on an explicit list it is the driver's, at the decision that sets the interval.
+    /// The interval ladder's invariants (#945); the on-grid check needs the `every` step
+    /// and stays in the parser.
     fn validate_intervals(&self) -> Result<(), String> {
         let steps_interval = self.rules.iter().any(|r| r.interval.is_some());
         match (&self.intervals, self.start_interval) {
@@ -1948,10 +1536,7 @@ impl AdaptiveDosingSpec {
                 validate_increasing_finite(l, "intervals")?;
                 // Strictly increasing ⇒ `l[0]` is the minimum.
                 if l[0] <= 0.0 {
-                    return Err(format!(
-                        "[adaptive_dosing]: intervals must be > 0: {}",
-                        l[0]
-                    ));
+                    return Err(format!("[adaptive_dosing]: intervals must be > 0: {}", l[0]));
                 }
                 if !l.contains(&start) {
                     return Err(format!(
@@ -1961,10 +1546,8 @@ impl AdaptiveDosingSpec {
                 }
             }
         }
-        if let Some(r) = self
-            .rules
-            .iter()
-            .find(|r| r.interval.is_some() && r.action == AdaptiveAction::Stop)
+        if let Some(r) =
+            self.rules.iter().find(|r| r.interval.is_some() && r.action == AdaptiveAction::Stop)
         {
             return Err(format!(
                 "[adaptive_dosing]: `stop` cannot be combined with `lengthen` / `shorten` (a \
@@ -1974,10 +1557,8 @@ impl AdaptiveDosingSpec {
         }
         // `Maintain` is the dose effect of an interval-only rule; without the interval
         // effect the rule does nothing, and its label would name no effect at all.
-        if let Some(r) = self
-            .rules
-            .iter()
-            .find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
+        if let Some(r) =
+            self.rules.iter().find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
         {
             return Err(format!(
                 "[adaptive_dosing]: a rule must have an effect; `Maintain` is only the dose \
@@ -2120,12 +1701,7 @@ impl AdaptiveRule {
             .chain(self.interval.map(|i| i.label().to_string()))
             .filter(|e| !e.is_empty())
             .collect();
-        format!(
-            "signal {} {} : {}",
-            self.op.symbol(),
-            self.threshold,
-            effects.join(", ")
-        )
+        format!("signal {} {} : {}", self.op.symbol(), self.threshold, effects.join(", "))
     }
 }
 
@@ -2149,13 +1725,9 @@ mod tests {
 
     #[test]
     fn infuse_action_sets_rate_and_derived_duration() {
-        let de = DoseAction::Infuse {
-            amt: 100.0,
-            cmt: 2,
-            rate: 25.0,
-        }
-        .to_dose_event(0.0)
-        .expect("infusion yields a dose event");
+        let de = DoseAction::Infuse { amt: 100.0, cmt: 2, rate: 25.0 }
+            .to_dose_event(0.0)
+            .expect("infusion yields a dose event");
         assert_eq!(de.cmt_raw(), 2);
         assert_eq!(de.rate, 25.0);
         // DoseEvent::new derives duration = amt / rate.
@@ -2216,28 +1788,14 @@ mod tests {
         }
     }
 
-    // ── round_to: the dose grid (#944 PR3) ─────────────────────────────────────────
-    //
-    // The closed forms are the ones audit 1 computed outside the engine (Python).
+    // ── round_to: the dose grid (#944); closed forms from audit 1 ─────────────────
 
-    /// `0.35 / 0.1` is `3.4999999999999996`: a tie that plain `f64::round` sends down to
-    /// 0.3. The nudged half sends it up to 0.4 (#944 audit 1 row 12). `375` at `s = 250`
-    /// is an exact tie and also goes up, and a value just below a tie still goes down.
-    ///
-    /// Mutations: `(x / s).round() * s`; the nudge dropped. (A nudge made absolute differs
-    /// only at `|x / s| >~ 1e7`, which no dose grid here reaches; it is not pinned.)
+    /// Ties go up: `0.35 / 0.1` (`3.4999999999999996`) gives 0.4, `375` at `s = 250` gives
+    /// 500; just below a tie goes down.
     #[test]
     fn round_to_grid_sends_ties_up_on_a_decimal_grid() {
-        assert_eq!(
-            (0.35f64 / 0.1).round(),
-            3.0,
-            "premise: plain round sends it down"
-        );
-        assert!(
-            (round_to_grid(0.35, 0.1) - 0.4).abs() < 1e-12,
-            "{}",
-            round_to_grid(0.35, 0.1)
-        );
+        assert_eq!((0.35f64 / 0.1).round(), 3.0, "premise: plain round sends it down");
+        assert!((round_to_grid(0.35, 0.1) - 0.4).abs() < 1e-12, "{}", round_to_grid(0.35, 0.1));
         assert_eq!(round_to_grid(375.0, 250.0).to_bits(), 500.0f64.to_bits());
         assert_eq!(round_to_grid(374.999, 250.0).to_bits(), 250.0f64.to_bits());
         assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
@@ -2258,16 +1816,9 @@ mod tests {
         assert_eq!(round_to_grid(0.35, 0.1).to_bits(), 0.4f64.to_bits());
         assert_eq!(round_to_grid(1.3, 0.25).to_bits(), 1.25f64.to_bits());
         let g = DoseGrid::new(0.1, (0.05, 0.75)).expect("grid");
-        assert_eq!(
-            (g.low.to_bits(), g.high.to_bits()),
-            (0.1f64.to_bits(), 0.7f64.to_bits())
-        );
+        assert_eq!((g.low.to_bits(), g.high.to_bits()), (0.1f64.to_bits(), 0.7f64.to_bits()));
         for (x, k) in [(1300.0, 5.0), (375.0, 2.0), (4000.0, 16.0)] {
-            assert_eq!(
-                round_to_grid(x, 250.0).to_bits(),
-                (k * 250.0f64).to_bits(),
-                "{x}"
-            );
+            assert_eq!(round_to_grid(x, 250.0).to_bits(), (k * 250.0f64).to_bits(), "{x}");
         }
     }
 
@@ -2285,25 +1836,15 @@ mod tests {
         let g = DoseGrid::new(0.1, (0.0, 0.3)).expect("0, 0.1, 0.2 and 0.3 lie inside");
         assert_eq!(g.high.to_bits(), 0.3f64.to_bits(), "{g:?}");
         assert_eq!(g.place(0.3).to_bits(), 0.3f64.to_bits(), "{g:?}");
-        assert!(
-            (2.1f64 / 0.3).ceil() == 8.0,
-            "premise: a bare ceil overshoots"
-        );
+        assert!((2.1f64 / 0.3).ceil() == 8.0, "premise: a bare ceil overshoots");
         let g = DoseGrid::new(0.3, (2.1, 3.0)).expect("grid");
         assert!((g.low - 2.1).abs() < 1e-12, "{g:?}");
         let g = DoseGrid::new(0.1, (0.3, 0.3)).expect("0.3 is a multiple of 0.1");
-        assert_eq!(
-            (g.low.to_bits(), g.high.to_bits()),
-            (0.3f64.to_bits(), 0.3f64.to_bits())
-        );
+        assert_eq!((g.low.to_bits(), g.high.to_bits()), (0.3f64.to_bits(), 0.3f64.to_bits()));
     }
 
-    /// `hi = 1150, s = 250`: round first (1150 → 1250), then clamp to the aligned 1000.
-    /// Clamp-then-round gives 1250, above the bound (#944 audit 1 row 13). Off the bounds
-    /// a non-aligned low is lifted to the next multiple: `lo = 1e-6` aligns to 250, so 100
-    /// (which rounds to 0) becomes 250 (row 14).
-    ///
-    /// Mutations: clamp then round; the aligned bounds replaced by the raw ones.
+    /// `hi = 1150, s = 250`: round then clamp gives 1000 (row 13); `lo = 1e-6` aligns to
+    /// 250, so 100 becomes 250 (row 14).
     #[test]
     fn dose_grid_rounds_then_clamps_to_the_aligned_bounds() {
         let g = DoseGrid::new(250.0, (0.0, 1150.0)).expect("grid");
@@ -2312,10 +1853,7 @@ mod tests {
         let g = DoseGrid::new(250.0, (1e-6, 4000.0)).expect("grid");
         assert_eq!(g.low.to_bits(), 250.0f64.to_bits(), "{g:?}");
         assert_eq!(g.place(100.0).to_bits(), 250.0f64.to_bits());
-        assert!(
-            DoseGrid::new(250.0, (300.0, 400.0)).is_none(),
-            "no multiple in [300, 400]"
-        );
+        assert!(DoseGrid::new(250.0, (300.0, 400.0)).is_none(), "no multiple in [300, 400]");
         // A single grid point, with a low a hair above it (within the snap): the aligned
         // bounds collapse onto the written low rather than crossing.
         let lo = 250.0 * (1.0 + 1e-12);
@@ -2333,35 +1871,21 @@ mod tests {
         }
     }
 
-    // ── #2810: the smallest increase step absorbed at a dose the subject can be at ──
-    //
-    // `s = 250` throughout, so every grid dose and every tie is an exact integer and the
-    // expected values are hand-computed.
+    // ── #2810: the smallest increase step absorbed at a reachable dose (`s = 250`) ──
 
     /// `round_to = 250` with the rules `increase up%` (each of `ups`) and `decrease
     /// down%` (each of `downs`).
     fn stepped(bounds: (f64, f64), start: f64, ups: &[f64], downs: &[f64]) -> AdaptiveDosingSpec {
-        let rule = |op, action| AdaptiveRule {
-            op,
-            threshold: 10.0,
-            action,
-            interval: None,
-        };
+        let rule = |op, action| AdaptiveRule { op, threshold: 10.0, action, interval: None };
         let mut s = gridded(250.0, bounds, start);
         s.rules = ups
             .iter()
-            .map(|&p| {
-                rule(
-                    Comparison::Lt,
-                    AdaptiveAction::Increase(DoseStep::Percent(p)),
-                )
-            })
-            .chain(downs.iter().map(|&q| {
-                rule(
-                    Comparison::Gt,
-                    AdaptiveAction::Decrease(DoseStep::Percent(q)),
-                )
-            }))
+            .map(|&p| rule(Comparison::Lt, AdaptiveAction::Increase(DoseStep::Percent(p))))
+            .chain(
+                downs
+                    .iter()
+                    .map(|&q| rule(Comparison::Gt, AdaptiveAction::Decrease(DoseStep::Percent(q)))),
+            )
             .collect();
         s
     }
@@ -2370,22 +1894,13 @@ mod tests {
         spec.absorbed_increase(&spec.literal_dose_plan().expect("a block of numbers"))
     }
 
-    /// The threshold, both sides in one test: from 500, `increase 25%` changes the dose
-    /// by exactly half a step (625, a tie, which goes up to 750), so it is not absorbed;
-    /// `increase 24.99%` changes it by just under half (624.95, back to 500), so it is.
-    /// The straddle itself is asserted, so the pair cannot become two cases on one side.
-    ///
-    /// Mutations: ties sent down (`f64::round` on `x / s`, or `>` for `>=`) reddens the
-    /// 25% half; a check of `d * p / 100 < s` (a whole step) reddens it too; a check that
-    /// never fires reddens the 24.99% half.
+    /// Threshold straddle: from 500, `increase 25%` (625, a tie, up to 750) is not
+    /// absorbed; `increase 24.99%` (624.95, back to 500) is.
     #[test]
     fn an_increase_just_below_half_a_step_is_absorbed_and_one_at_half_is_not() {
         let half: f64 = 250.0 / 2.0;
         let (at, below) = (25.0, 24.99);
-        assert_eq!(
-            (percent_step(500.0, at, true) - 500.0).to_bits(),
-            half.to_bits()
-        );
+        assert_eq!((percent_step(500.0, at, true) - 500.0).to_bits(), half.to_bits());
         let short = percent_step(500.0, below, true) - 500.0;
         assert!(short < half && short > half - 0.1, "{short}");
 
@@ -2397,15 +1912,8 @@ mod tests {
         );
     }
 
-    /// The two cases. Under `increase 10%` a dose rises only from 1250 up. A start dose
-    /// of 1000 is absorbed itself. A start dose of 1500 rises (1650 gives 1750), but
-    /// `decrease 25%` brings it down 1500, 1250, 1000, 750, 500 and stops there (375 is
-    /// a tie, back to 500), and 500 is absorbed. The floor is 500, not the aligned low
-    /// of 250, which no decrease reaches.
-    ///
-    /// Mutations: reporting the aligned low gives 250; checking only the start dose
-    /// gives `None` for 1500; skipping the start check reports 1000 as stepped down to
-    /// 500.
+    /// Under `increase 10%`: start 1000 is absorbed; start 1500 rises but `decrease 25%`
+    /// brings it to 500 (absorbed), not the aligned low 250.
     #[test]
     fn the_start_dose_and_the_floor_of_the_decreases_are_told_apart() {
         let bounds = (250.0, 4000.0);
@@ -2419,54 +1927,31 @@ mod tests {
         );
     }
 
-    /// A low bound the subject cannot reach does not warn, although `increase 25%` is
-    /// absorbed there (250 gives 312.5, back to 250; asserted, so the case is live).
-    /// Without a decrease rule the dose never leaves 500 downward; with `decrease 25%`
-    /// the decrease is absorbed at 500 first (375 is a tie). From 500 the increase moves.
-    ///
-    /// Mutations: the check on the aligned low reports 250 in both; the floor taken as
-    /// the low whenever a decrease rule exists reports it in the second.
+    /// An unreachable low bound (250, where 25% is absorbed) does not warn, with or
+    /// without `decrease 25%` (absorbed at 500).
     #[test]
     fn a_low_bound_no_decrease_reaches_is_not_reported() {
         let bounds = (250.0, 4000.0);
         let grid = DoseGrid::new(250.0, bounds).expect("grid");
         assert_eq!(grid.low.to_bits(), 250.0f64.to_bits());
-        assert_eq!(
-            grid.step_percent(250.0, 25.0, true).to_bits(),
-            250.0f64.to_bits()
-        );
+        assert_eq!(grid.step_percent(250.0, 25.0, true).to_bits(), 250.0f64.to_bits());
         assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[])), None);
         assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[25.0])), None);
     }
 
-    /// A dose at the aligned high bound is not reported: 500 `increase 10%` stays 500
-    /// under bounds `[250, 500]` because of the bound. One grid point lower it is the
-    /// grid: with bounds `[250, 600]` (aligned high 500) a start dose of 300 is placed at
-    /// 250, where `increase 25%` is absorbed — the 20 kg subject of
-    /// `examples/adaptive_vanco_mgkg_rounded.ferx`.
-    ///
-    /// Mutations: dropping `d < high` reports the first; `d <= high - step` drops the
-    /// second.
+    /// A dose at the aligned high bound is not reported; one grid point lower it is
+    /// (`[250, 600]`, start 300 → 250, `examples/adaptive_vanco_mgkg_rounded.ferx`).
     #[test]
     fn a_dose_at_the_high_bound_is_not_reported() {
-        assert_eq!(
-            absorbed(&stepped((250.0, 500.0), 500.0, &[10.0], &[])),
-            None
-        );
+        assert_eq!(absorbed(&stepped((250.0, 500.0), 500.0, &[10.0], &[])), None);
         assert_eq!(
             absorbed(&stepped((250.0, 600.0), 300.0, &[25.0], &[])),
             Some(AbsorbedIncrease::FromStart(250.0))
         );
     }
 
-    /// Which rules are read. The smallest increase decides: with `increase 50%` and
-    /// `increase 10%`, 1000 is absorbed by the 10% rule; with 50% alone it is not. The
-    /// largest decrease sets the floor: with `decrease 5%` and `decrease 25%` the dose
-    /// comes down from 1500 to 500; with 5% alone it never leaves 1500 (1425 rounds back),
-    /// which the increase moves. `increase 0%` is not an increase step, and without
-    /// `round_to` there is no grid.
-    ///
-    /// Mutations: the largest increase, or the smallest decrease, each reddens its pair.
+    /// The smallest increase and the largest decrease decide; `increase 0%` is no step
+    /// and without `round_to` there is no grid.
     #[test]
     fn the_smallest_increase_and_the_largest_decrease_are_the_ones_read() {
         let bounds = (250.0, 4000.0);
@@ -2505,11 +1990,7 @@ mod tests {
     /// does not return for 1e-310%.
     #[test]
     fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
-        let open = |s: f64| DoseGrid {
-            step: s,
-            low: 0.0,
-            high: f64::INFINITY,
-        };
+        let open = |s: f64| DoseGrid { step: s, low: 0.0, high: f64::INFINITY };
         for (s, p, want) in [
             (250.0, 25.0, Some(500.0)),
             (250.0, 10.0, Some(1250.0)),
@@ -2526,10 +2007,7 @@ mod tests {
                 assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
             }
             let below = got - s;
-            assert!(
-                open(s).step_percent(got, p, true) > got,
-                "s = {s}, p = {p}: {got}"
-            );
+            assert!(open(s).step_percent(got, p, true) > got, "s = {s}, p = {p}: {got}");
             assert_eq!(
                 open(s).step_percent(below, p, true).to_bits(),
                 below.to_bits(),
@@ -2541,18 +2019,11 @@ mod tests {
         assert_eq!(DoseGrid::lowest_raised_by(1e308, 25.0), None);
     }
 
-    /// P3: a `round_to` that is not a finite number `> 0`, on a spec built in code (the
-    /// parser's own check is in `model_parser_adaptive_dosing_tests.rs`). One sentence.
-    ///
-    /// Mutations: the check only in the parser; `s < 0` instead of `s <= 0`.
+    /// P3: a `round_to` that is not finite `> 0` on a spec built in code.
     #[test]
     fn validate_refuses_a_round_to_that_is_not_positive_and_finite() {
-        for (s, shown) in [
-            (0.0, "0"),
-            (-250.0, "-250"),
-            (f64::NAN, "NaN"),
-            (f64::INFINITY, "inf"),
-        ] {
+        for (s, shown) in [(0.0, "0"), (-250.0, "-250"), (f64::NAN, "NaN"), (f64::INFINITY, "inf")]
+        {
             assert_eq!(
                 gridded(s, (250.0, 400.0), 250.0).validate().unwrap_err(),
                 format!("[adaptive_dosing]: round_to must be a finite number > 0: {shown}")
@@ -2560,11 +2031,7 @@ mod tests {
         }
     }
 
-    /// P4: `round_to` with a `levels` ladder, asserted whole, so deleting either clause
-    /// (the refusal, or the advice to write the rounded doses as the levels) reddens it.
-    /// The ladder itself is valid, so the refusal is not a ladder error.
-    ///
-    /// Mutation: P4 checked after the ladder's own checks, or not at all.
+    /// P4: `round_to` with a valid `levels` ladder, asserted whole.
     #[test]
     fn validate_refuses_round_to_with_levels() {
         let mut s = gridded(250.0, (0.0, 400.0), 100.0);
@@ -2577,33 +2044,21 @@ mod tests {
         );
     }
 
-    /// V7 on numeric bounds, at parse time: no multiple of 250 in [300, 400]. Whole text.
-    ///
-    /// Mutation: V7 only per subject.
+    /// V7 at parse time: no multiple of 250 in [300, 400].
     #[test]
     fn validate_refuses_bounds_holding_no_multiple_of_round_to() {
         assert_eq!(
-            gridded(250.0, (300.0, 400.0), 350.0)
-                .validate()
-                .unwrap_err(),
+            gridded(250.0, (300.0, 400.0), 350.0).validate().unwrap_err(),
             "[adaptive_dosing]: no multiple of round_to = 250 lies within dose_bounds [300, 400]"
         );
     }
 
-    /// V8 straddle: `lo = 0` with percentage steps is refused; `lo = 1e-6` aligns to 250
-    /// and passes; `lo = 0` with no percentage step passes (no step can strand a 0). The
-    /// message is asserted whole, so each of its clauses — the cause (a dose can round to
-    /// 0), the consequence (it cannot rise again), and the advice (raise the bound,
-    /// naming the step it is lifted to) — is killed by deleting it.
-    ///
-    /// Mutations: V8 gated on the raw `lo` instead of the aligned bound (`lo = 1e-6`
-    /// refused); V8 not gated on percentage steps; V8 dropped.
+    /// V8 straddle: `lo = 0` with percentage steps is refused (whole message); `lo = 1e-6`
+    /// aligns to 250 and passes; `lo = 0` without a percentage step passes.
     #[test]
     fn validate_refuses_a_lower_bound_that_aligns_to_zero_under_percentage_steps() {
         assert_eq!(
-            gridded(250.0, (0.0, 4000.0), 1000.0)
-                .validate()
-                .unwrap_err(),
+            gridded(250.0, (0.0, 4000.0), 1000.0).validate().unwrap_err(),
             "[adaptive_dosing]: with round_to = 250, dose_bounds low = 0 lets a dose round \
              to 0, and a running dose of 0 cannot rise again under percentage steps; set the \
              lower bound above 0 (any value up to 250 raises it to 250)"
@@ -2614,53 +2069,33 @@ mod tests {
         assert_eq!(hold_only.validate(), Ok(()));
     }
 
-    /// V8 refuses a low of exactly 0, never a positive one, however small against the
-    /// step: `lo = 1e-6` at `s = 1000` (and `1e-7` at `s = 250`, both within the 1e-9
-    /// snap of 0) is lifted to one step, as the docs and the example promise, so a dose
-    /// cannot round to 0 (#2805 review r1 row 1). The straddle: `lo = 0` at the same step
-    /// is refused.
-    ///
-    /// Mutation: the low's quotient snapped to index 0 for a positive low (V8 refuses
-    /// `1e-6`, and the aligned low is `1e-6`, not 1000).
+    /// V8 refuses only a low of exactly 0: `lo = 1e-6` at `s = 1000` and `1e-7` at
+    /// `s = 250` are lifted to one step (#2805).
     #[test]
     fn a_tiny_positive_low_bound_is_lifted_to_one_step_not_refused() {
         for (s, lo) in [(1000.0, 1e-6), (2000.0, 1e-6), (250.0, 1e-7)] {
-            assert_eq!(
-                gridded(s, (lo, 4000.0), 2000.0).validate(),
-                Ok(()),
-                "s = {s}, lo = {lo}"
-            );
+            assert_eq!(gridded(s, (lo, 4000.0), 2000.0).validate(), Ok(()), "s = {s}, lo = {lo}");
             let g = DoseGrid::new(s, (lo, 4000.0)).expect("grid");
             assert_eq!(g.low.to_bits(), s.to_bits(), "s = {s}, lo = {lo}: {g:?}");
             assert_eq!(g.place(1.0).to_bits(), s.to_bits(), "s = {s}, lo = {lo}");
         }
-        let e = gridded(1000.0, (0.0, 4000.0), 2000.0)
-            .validate()
-            .unwrap_err();
-        assert!(
-            e.contains("dose_bounds low = 0 lets a dose round to 0"),
-            "{e}"
-        );
+        let e = gridded(1000.0, (0.0, 4000.0), 2000.0).validate().unwrap_err();
+        assert!(e.contains("dose_bounds low = 0 lets a dose round to 0"), "{e}");
         // A positive low with no positive multiple at or below the high is V7, not a
         // grid that clamps every dose to the low.
         let e = gridded(250.0, (1e-7, 100.0), 50.0).validate().unwrap_err();
         assert!(e.contains("no multiple of round_to = 250"), "{e}");
     }
 
-    /// V8 needs only the low bound: a numeric `0` low is refused when the block is parsed
-    /// even when the high bound is an expression (#944 PR3 delta row 1).
-    ///
-    /// Mutation: the grid checks gated on both bounds being numbers.
+    /// V8 needs only the low bound: a numeric `0` low is refused at parse time even with
+    /// an expression high.
     #[test]
     fn validate_refuses_a_zero_low_bound_beside_an_expression_high() {
         let mut s = gridded(250.0, (0.0, 4000.0), 1000.0);
         s.start_dose = DoseValue::Expr("15 * WT".into());
         s.dose_bounds.1 = DoseValue::Expr("min(30 * WT, 4000)".into());
         let e = s.validate().unwrap_err();
-        assert!(
-            e.contains("dose_bounds low = 0 lets a dose round to 0"),
-            "{e}"
-        );
+        assert!(e.contains("dose_bounds low = 0 lets a dose round to 0"), "{e}");
         s.dose_bounds.0 = DoseValue::Literal(250.0);
         assert_eq!(s.validate(), Ok(()));
     }
@@ -2706,14 +2141,8 @@ mod tests {
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
     }
 
-    /// The two arms of `known_dose_violation` no other test reaches (#2667 review r2 N1,
-    /// N2), on a spec built in code: an infinite upper bound (neither below the lower
-    /// bound nor negative, so only the upper bound's own finiteness check refuses it) and
-    /// an empty ladder (with no known rung, only the empty-list arm checks the order).
-    ///
-    /// Regressions: `bad(hi)` dropped (the `[0, inf]` spec validates); the `l.is_empty()`
-    /// arm dropped (the empty ladder is refused as "must be one of the declared levels
-    /// []" instead).
+    /// `known_dose_violation` arms no other test reaches (#2667): an infinite upper bound
+    /// and an empty ladder.
     #[test]
     fn validate_refuses_an_infinite_high_bound_and_an_empty_ladder() {
         let mut s = base_spec();
@@ -2730,21 +2159,11 @@ mod tests {
             action: AdaptiveAction::Increase(DoseStep::Level),
             interval: None,
         }];
-        assert_eq!(
-            s.validate().unwrap_err(),
-            "[adaptive_dosing]: levels must be a non-empty list"
-        );
+        assert_eq!(s.validate().unwrap_err(), "[adaptive_dosing]: levels must be a non-empty list");
     }
 
-    /// A block of numbers that breaks two invariants names the one it named before
-    /// #944 (#2667 review r1 row 3): `validate` finds the violation once, through
-    /// `dose_plan_violation`, but reports each at its pre-#944 position — the bounds and
-    /// start checks first, the ladder order before the percent-step refusal, and
-    /// start-not-a-rung / rung-outside-bounds after it.
-    ///
-    /// Regressions: the `LevelsOrder` return moved below the percent refusal (case 1);
-    /// the start-not-a-rung return moved above it (case 2); the phase-A return moved
-    /// below the percent refusal (case 3).
+    /// A numeric block breaking two invariants names the one it named before #944
+    /// (#2667): each violation at its pre-#944 position.
     #[test]
     fn validate_reports_two_violations_in_the_pre_944_order() {
         // 1. A descending ladder with a percent rule: the ladder order wins.
@@ -2764,10 +2183,8 @@ mod tests {
             "[adaptive_dosing]: percentage actions (`increase N%`) are not allowed with \
              `levels`; use bare `increase`/`decrease` to step one level"
         );
-        // 3. A start outside the bounds and off the ladder, with a percent rule: the
-        //    bounds check wins over the percent refusal. (Without the percent rule the
-        //    first violation is the same wherever it is reported, so that case could
-        //    not see the order.)
+        // 3. Start outside the bounds and off the ladder, with a percent rule: the bounds
+        //    check wins.
         let mut s = base_spec();
         s.start_dose = (500.0).into();
         s.levels = crate::sim::adaptive::literal_levels(&[100.0, 200.0]);
@@ -2779,10 +2196,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_schedule_and_levels_ordering() {
-        // These single-field invariants are enforced by the block parser; `validate`
-        // is the safety net for a hand-built `pub` spec that never saw the parser.
-        // Without them a programmatic spec drives a silent wrong result through the
-        // public `simulate_adaptive_from_spec`.
+        // `validate` is the safety net for a hand-built `pub` spec that skipped the parser.
 
         // empty `at` — would otherwise run a silent no-dose simulation.
         let mut s = base_spec();
@@ -2804,9 +2218,7 @@ mod tests {
         s.confirm = 0;
         assert!(s.validate().unwrap_err().contains("confirm"));
 
-        // Descending `levels` — the regression that motivated this: a `Level` step
-        // on a non-ascending ladder makes `increase` *lower* the dose. `validate`
-        // must reject it rather than let the controller silently invert.
+        // Descending `levels` would make `increase` lower the dose.
         let mut s = base_spec();
         s.start_dose = (200.0).into();
         s.levels = crate::sim::adaptive::literal_levels(&[200.0, 100.0, 50.0]);
@@ -2821,11 +2233,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_inverted_or_nan_target_window() {
-        // `target_window` only feeds the `pct_time_in_window` metric, but a bad band
-        // must still be rejected: the parser checks it on the way in, and `validate`
-        // is the safety net for a hand-built `pub` spec reaching
-        // `simulate_adaptive_from_spec` without ever seeing the parser. Mirrors the
-        // parser's check (low finite, low <= high, high may be +inf).
+        // `target_window`: low finite, low <= high, high may be +inf.
 
         // high < low (inverted).
         let mut s = base_spec();
@@ -2856,9 +2264,7 @@ mod tests {
 
     #[test]
     fn validate_enforces_one_signal_source() {
-        // `observe` (latent) and `with_assay_error` (noised model output) are
-        // mutually exclusive; exactly one is required.
-        // valid Ipred: observe set, no assay error.
+        // `observe` and `with_assay_error` are mutually exclusive; exactly one required.
         assert!(base_spec().validate().is_ok());
 
         // valid Dv: no observe, with_assay_error naming the output.
@@ -2922,6 +2328,7 @@ mod tests {
         let obs = ObservedSignal {
             name: "CONC".to_string(),
             value: 12.5,
+            latent: 11.0,
             mode: ObserveMode::Dv,
         };
         let entry = DoseLedgerEntry {
@@ -2952,6 +2359,7 @@ mod tests {
         let obs = ObservedSignal {
             name: "A".to_string(),
             value: 0.0,
+            latent: 0.0,
             mode: ObserveMode::Ipred,
         };
         let entry = DecisionLogEntry {
@@ -2969,17 +2377,12 @@ mod tests {
         // The three outcome categories are distinct, and `Stop` carries the count
         // of any dose(s) issued before discontinuation.
         assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Dosed { n: 0 });
-        assert_ne!(
-            DecisionOutcome::Stop { dosed: 0 },
-            DecisionOutcome::Stop { dosed: 1 }
-        );
+        assert_ne!(DecisionOutcome::Stop { dosed: 0 }, DecisionOutcome::Stop { dosed: 1 });
         assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Stop { dosed: 0 });
     }
 
-    // #2581: one test per variant, each asserting both `label()` and `n_dosed()`.
-    // The literals are ferx-r's `decisions$OUTCOME` strings, so they must not move.
-    // "Every variant has a label" is not tested at runtime: both methods are
-    // exhaustive matches, so an unlabelled variant fails to compile.
+    // #2581: one test per variant for `label()` and `n_dosed()`; the literals are
+    // ferx-r's `decisions$OUTCOME` strings.
 
     /// Kills: swapping the `Dosed` label with another; `Dosed`'s count returning a
     /// constant (`3` is neither `0` nor `1`).
@@ -3019,26 +2422,14 @@ mod tests {
     #[test]
     fn validate_rejects_zero_compartment() {
         assert!(DoseAction::Bolus { amt: 100.0, cmt: 0 }.validate().is_err());
-        assert!(DoseAction::Infuse {
-            amt: 100.0,
-            cmt: 0,
-            rate: 10.0,
-        }
-        .validate()
-        .is_err());
+        assert!(DoseAction::Infuse { amt: 100.0, cmt: 0, rate: 10.0 }.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_nonpositive_or_nonfinite_infusion_rate() {
         for rate in [0.0, -5.0, f64::NAN, f64::INFINITY] {
             assert!(
-                DoseAction::Infuse {
-                    amt: 100.0,
-                    cmt: 1,
-                    rate,
-                }
-                .validate()
-                .is_err(),
+                DoseAction::Infuse { amt: 100.0, cmt: 1, rate }.validate().is_err(),
                 "rate {rate} should be rejected"
             );
         }
@@ -3047,24 +2438,13 @@ mod tests {
     #[test]
     fn validate_rejects_negative_or_nonfinite_amount() {
         assert!(DoseAction::Bolus { amt: -1.0, cmt: 1 }.validate().is_err());
-        assert!(DoseAction::Bolus {
-            amt: f64::NAN,
-            cmt: 1,
-        }
-        .validate()
-        .is_err());
+        assert!(DoseAction::Bolus { amt: f64::NAN, cmt: 1 }.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_well_formed_actions_and_holds() {
         assert!(DoseAction::Bolus { amt: 100.0, cmt: 1 }.validate().is_ok());
-        assert!(DoseAction::Infuse {
-            amt: 100.0,
-            cmt: 2,
-            rate: 25.0,
-        }
-        .validate()
-        .is_ok());
+        assert!(DoseAction::Infuse { amt: 100.0, cmt: 2, rate: 25.0 }.validate().is_ok());
         assert!(DoseAction::Hold.validate().is_ok());
         assert!(DoseAction::Stop.validate().is_ok());
     }
@@ -3083,52 +2463,25 @@ mod tests {
     fn combine_seed_is_order_sensitive() {
         // Folding components in a different order yields a different seed, so key
         // tuples map injectively enough for substream separation.
-        assert_ne!(
-            combine_seed(combine_seed(0, 1), 2),
-            combine_seed(combine_seed(0, 2), 1)
-        );
+        assert_ne!(combine_seed(combine_seed(0, 1), 2), combine_seed(combine_seed(0, 2), 1));
     }
 
     #[test]
     fn subject_assay_base_seed_separates_subjects_and_replicates() {
         let a = subject_assay_base_seed(42, "subj-1", 1);
         assert_eq!(a, subject_assay_base_seed(42, "subj-1", 1), "deterministic");
-        assert_ne!(
-            a,
-            subject_assay_base_seed(42, "subj-2", 1),
-            "subject id keys the stream"
-        );
-        assert_ne!(
-            a,
-            subject_assay_base_seed(42, "subj-1", 2),
-            "replicate keys the stream"
-        );
-        assert_ne!(
-            a,
-            subject_assay_base_seed(7, "subj-1", 1),
-            "root seed keys the stream"
-        );
+        assert_ne!(a, subject_assay_base_seed(42, "subj-2", 1), "subject id keys the stream");
+        assert_ne!(a, subject_assay_base_seed(42, "subj-1", 2), "replicate keys the stream");
+        assert_ne!(a, subject_assay_base_seed(7, "subj-1", 1), "root seed keys the stream");
     }
 
     #[test]
     fn assay_standard_normal_is_deterministic_and_key_separated() {
         let x = assay_standard_normal(100, 0, "A");
         assert_eq!(x, assay_standard_normal(100, 0, "A"), "deterministic");
-        assert_ne!(
-            x,
-            assay_standard_normal(100, 1, "A"),
-            "decision index keys the draw"
-        );
-        assert_ne!(
-            x,
-            assay_standard_normal(100, 0, "B"),
-            "analyte keys the draw"
-        );
-        assert_ne!(
-            x,
-            assay_standard_normal(101, 0, "A"),
-            "base seed keys the draw"
-        );
+        assert_ne!(x, assay_standard_normal(100, 1, "A"), "decision index keys the draw");
+        assert_ne!(x, assay_standard_normal(100, 0, "B"), "analyte keys the draw");
+        assert_ne!(x, assay_standard_normal(101, 0, "A"), "base seed keys the draw");
     }
 
     // ----- #701: IOV-kappa substream seed helpers -----------------------
@@ -3137,16 +2490,8 @@ mod tests {
     fn subject_kappa_base_seed_separates_and_is_disjoint_from_assay() {
         let a = subject_kappa_base_seed(42, "subj-1", 1);
         assert_eq!(a, subject_kappa_base_seed(42, "subj-1", 1), "deterministic");
-        assert_ne!(
-            a,
-            subject_kappa_base_seed(42, "subj-2", 1),
-            "subject id keys"
-        );
-        assert_ne!(
-            a,
-            subject_kappa_base_seed(42, "subj-1", 2),
-            "replicate keys"
-        );
+        assert_ne!(a, subject_kappa_base_seed(42, "subj-2", 1), "subject id keys");
+        assert_ne!(a, subject_kappa_base_seed(42, "subj-1", 2), "replicate keys");
         assert_ne!(a, subject_kappa_base_seed(7, "subj-1", 1), "root seed keys");
         // Disjoint from the assay stream that shares the same run root: the
         // purpose salt is what keeps enabling a `Dv` monitor from perturbing κ.
@@ -3157,12 +2502,8 @@ mod tests {
         );
     }
 
-    /// #946 (audit A3): `replicate_key` is the identity on `sim` in draw 1 / rep 1, so a
-    /// run without uncertainty keeps its κ and assay keys, and is distinct everywhere
-    /// else: across every cell of a 4 × 4 × 3 grid, and from every plain `sim` key.
-    ///
-    /// Mutations: dropping `draw` or `rep` from the fold (two cells collide); returning
-    /// the fold at (1, 1) too (the identity fails).
+    /// #946: `replicate_key` is `sim` at draw 1 / rep 1 and distinct across a 4 × 4 × 3
+    /// grid and from every plain `sim` key.
     #[test]
     fn replicate_key_is_sim_at_draw_one_rep_one_and_distinct_elsewhere() {
         for sim in 1..=50 {
@@ -3186,21 +2527,9 @@ mod tests {
     fn kappa_standard_normal_is_deterministic_and_key_separated() {
         let x = kappa_standard_normal(100, 0, 0);
         assert_eq!(x, kappa_standard_normal(100, 0, 0), "deterministic");
-        assert_ne!(
-            x,
-            kappa_standard_normal(100, 1, 0),
-            "occasion keys the draw"
-        );
-        assert_ne!(
-            x,
-            kappa_standard_normal(100, 0, 1),
-            "component keys the draw"
-        );
-        assert_ne!(
-            x,
-            kappa_standard_normal(101, 0, 0),
-            "base seed keys the draw"
-        );
+        assert_ne!(x, kappa_standard_normal(100, 1, 0), "occasion keys the draw");
+        assert_ne!(x, kappa_standard_normal(100, 0, 1), "component keys the draw");
+        assert_ne!(x, kappa_standard_normal(101, 0, 0), "base seed keys the draw");
     }
 
     #[test]
@@ -3209,19 +2538,10 @@ mod tests {
         // generator produces both signs across keys, with a mean near 0.
         let n = 2000;
         let draws: Vec<f64> = (0..n).map(|i| assay_standard_normal(1, i, "A")).collect();
-        assert!(
-            draws.iter().any(|&d| d < 0.0),
-            "some draws must be negative"
-        );
-        assert!(
-            draws.iter().any(|&d| d > 0.0),
-            "some draws must be positive"
-        );
+        assert!(draws.iter().any(|&d| d < 0.0), "some draws must be negative");
+        assert!(draws.iter().any(|&d| d > 0.0), "some draws must be positive");
         let mean = draws.iter().sum::<f64>() / n as f64;
-        assert!(
-            mean.abs() < 0.1,
-            "standard-normal draws should center near 0, got {mean}"
-        );
+        assert!(mean.abs() < 0.1, "standard-normal draws should center near 0, got {mean}");
         // Unit variance too, so the noise scale is right (a mis-scaled generator
         // would still pass the sign/mean checks).
         let var = draws.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / n as f64;
@@ -3264,12 +2584,80 @@ mod tests {
                     vec![ObservedSignal {
                         name: "signal".to_string(),
                         value: v,
+                        latent: v,
                         mode: ObserveMode::Ipred,
                     }]
                 })
                 .unwrap_or_default(),
             outcome,
             interval: None,
+        }
+    }
+
+    /// A `Dv` decision whose controller saw `value` while the latent readout was `latent`.
+    fn dv_decision(time: f64, value: f64, latent: f64) -> DecisionLogEntry {
+        DecisionLogEntry {
+            observed_signals: vec![ObservedSignal {
+                name: "signal".to_string(),
+                value,
+                latent,
+                mode: ObserveMode::Dv,
+            }],
+            ..decision(time, None, DecisionOutcome::Dosed { n: 1 })
+        }
+    }
+
+    #[test]
+    fn metrics_are_scored_on_latent_not_on_the_noised_value_946() {
+        // The noised values (8, 30, 15) and the latent ones (12, 18, 25) give different
+        // answers on every metric, so scoring on `value` again reddens each line.
+        let ledger = vec![ledger_entry(100.0)];
+        let decisions = vec![
+            dv_decision(0.0, 8.0, 12.0),
+            dv_decision(24.0, 30.0, 18.0),
+            dv_decision(48.0, 15.0, 25.0),
+        ];
+        let m =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
+        assert_eq!(m.signal_min, Some(12.0), "latent min, not the noised 8");
+        assert_eq!(m.signal_max, Some(25.0), "latent max, not the noised 30");
+        assert_eq!(m.signal_mean, Some(55.0 / 3.0), "latent mean, not the noised 53/3");
+        // Latent 12 and 18 are in [10, 20]; the noised values would put only 15 there.
+        assert_eq!(m.pct_readings_in_window, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn metrics_signal_summary_and_window_propagate_nan_946() {
+        // Unreachable through the engine (#1578 refuses a non-finite readout), so the
+        // signal is hand-built. `f64::min`/`f64::max` would drop the NaN and report the
+        // finite readings' 5 and 9 as if nothing happened; the window count would score
+        // it as a miss (2/3, since the band [5, 9] holds every finite reading).
+        let ledger = vec![ledger_entry(100.0)];
+        for nan_at in 0..3 {
+            let mut latents = [5.0, 7.0, 9.0];
+            latents[nan_at] = f64::NAN;
+            let decisions: Vec<_> = latents
+                .iter()
+                .enumerate()
+                .map(|(k, &l)| dv_decision(24.0 * k as f64, 1.0, l))
+                .collect();
+            let m = compute_subject_metrics(
+                "S",
+                1,
+                1,
+                &ledger,
+                &decisions,
+                Some((5.0, 9.0)),
+                None,
+                &[],
+            );
+            assert!(
+                m.pct_readings_in_window.is_some_and(f64::is_nan),
+                "NaN at {nan_at}: window {m:?}"
+            );
+            assert!(m.signal_min.is_some_and(f64::is_nan), "NaN at {nan_at}: min {m:?}");
+            assert!(m.signal_max.is_some_and(f64::is_nan), "NaN at {nan_at}: max {m:?}");
+            assert!(m.signal_mean.is_some_and(f64::is_nan), "NaN at {nan_at}: mean");
         }
     }
 
@@ -3298,22 +2686,19 @@ mod tests {
         assert_eq!(m.cumulative_dose, 425.0);
         assert_eq!(m.n_doses, 4);
         assert_eq!(m.n_increases, 1, "100→125 is the only step up");
-        assert_eq!(
-            m.n_decreases, 1,
-            "125→100 is the only step down; 100→100 is no change"
-        );
+        assert_eq!(m.n_decreases, 1, "125→100 is the only step down; 100→100 is no change");
         assert_eq!(m.n_holds, 1);
         assert!(m.discontinued);
         assert_eq!(m.time_to_discontinuation, Some(120.0));
         assert_eq!(m.signal_min, Some(5.0));
         assert_eq!(m.signal_max, Some(45.0));
         assert_eq!(m.signal_mean, Some(19.0)); // (8+5+22+15+45)/5
-        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.pct_readings_in_window, None, "no target_window declared");
         assert_eq!(m.auc_target_attainment, None, "no auc_target declared");
     }
 
     #[test]
-    fn metrics_pct_time_in_window_counts_signals_in_band() {
+    fn metrics_pct_readings_in_window_counts_signals_in_band() {
         let ledger = vec![ledger_entry(100.0)];
         let decisions = vec![
             decision(0.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }),
@@ -3323,17 +2708,9 @@ mod tests {
             decision(96.0, Some(45.0), DecisionOutcome::Dosed { n: 1 }),
         ];
         // Two-sided band [10, 20]: only 15 is in band ⇒ 1/5.
-        let band = compute_subject_metrics(
-            "S",
-            1,
-            1,
-            &ledger,
-            &decisions,
-            Some((10.0, 20.0)),
-            None,
-            &[],
-        );
-        assert_eq!(band.pct_time_in_window, Some(0.2));
+        let band =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
+        assert_eq!(band.pct_readings_in_window, Some(0.2));
         // One-sided "at or above 10" ([10, +∞]): 22, 15, 45 ⇒ 3/5.
         let one_sided = compute_subject_metrics(
             "S",
@@ -3345,7 +2722,7 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(one_sided.pct_time_in_window, Some(0.6));
+        assert_eq!(one_sided.pct_readings_in_window, Some(0.6));
     }
 
     #[test]
@@ -3371,16 +2748,8 @@ mod tests {
     fn metrics_empty_run_has_no_signal_summary() {
         // No doses, no decisions: counts are zero and the signal summary is `None`
         // (not a NaN), even when a target_window is set (no signal to score).
-        let m = compute_subject_metrics(
-            "S",
-            1,
-            1,
-            &[],
-            &[],
-            Some((10.0, 20.0)),
-            Some((1.0, 2.0)),
-            &[],
-        );
+        let m =
+            compute_subject_metrics("S", 1, 1, &[], &[], Some((10.0, 20.0)), Some((1.0, 2.0)), &[]);
         assert_eq!(m.cumulative_dose, 0.0);
         assert_eq!(m.n_doses, 0);
         assert_eq!(m.n_increases, 0);
@@ -3391,7 +2760,7 @@ mod tests {
         assert_eq!(m.signal_min, None);
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
-        assert_eq!(m.pct_time_in_window, None);
+        assert_eq!(m.pct_readings_in_window, None);
         // An `auc_target` was set, but the driver integrated no windows (no run), so
         // the exposure metric is `None` rather than a 0/0 NaN.
         assert_eq!(m.auc_target_attainment, None);
@@ -3399,13 +2768,8 @@ mod tests {
 
     #[test]
     fn metrics_signalless_decisions_are_excluded_not_counted_as_misses() {
-        // A *mixed* decision log — some decisions recorded a signal, some did not.
-        // `compute_subject_metrics` is a pure function whose contract admits this
-        // (a decision can carry an empty `observed_signals`), even though the
-        // current single-monitor engine records one at every decision. The signal
-        // summary and `pct_time_in_window` are over the **signal-bearing** decisions
-        // only: a measurement-less decision is neither in nor out of band, so it is
-        // excluded from the denominator rather than counted as a miss.
+        // A mixed decision log: the signal summary and `pct_readings_in_window` are over the
+        // signal-bearing decisions only.
         let ledger = vec![ledger_entry(100.0), ledger_entry(100.0)];
         let decisions = vec![
             decision(0.0, Some(12.0), DecisionOutcome::Dosed { n: 1 }), // in [10, 20]
@@ -3413,16 +2777,8 @@ mod tests {
             decision(48.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }), // below band
             decision(72.0, None, DecisionOutcome::Hold),                // no signal
         ];
-        let m = compute_subject_metrics(
-            "S",
-            1,
-            1,
-            &ledger,
-            &decisions,
-            Some((10.0, 20.0)),
-            None,
-            &[],
-        );
+        let m =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
 
         // Summary spans only the two decisions that recorded a signal (12 and 8),
         // not the two signal-less ones.
@@ -3431,7 +2787,7 @@ mod tests {
         assert_eq!(m.signal_mean, Some(10.0));
         // Denominator = 2 signal-bearing decisions, of which one (12) is in band:
         // 1/2 = 0.5 — not 1/4 (raw decision count) and not 1/3.
-        assert_eq!(m.pct_time_in_window, Some(0.5));
+        assert_eq!(m.pct_readings_in_window, Some(0.5));
         // Holds are counted over all decisions, independent of whether a signal
         // was recorded, so the signal-less Hold still registers.
         assert_eq!(m.n_holds, 1);
@@ -3439,10 +2795,7 @@ mod tests {
 
     #[test]
     fn metrics_auc_target_attainment_counts_windows_in_band() {
-        // `auc_target_attainment` is a pure reduction of the caller's per-window AUC
-        // series against the band — exercise it directly on a hand-built series (the
-        // driver's window AUC that produces it is tested separately). Four windows
-        // with AUCs [380, 450, 520, 610]; the band is the vancomycin AUC₂₄ target.
+        // Four windows with AUCs [380, 450, 520, 610] against the vancomycin AUC₂₄ band.
         let ledger = vec![ledger_entry(100.0)];
         let decisions = vec![decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 })];
         let window_aucs = [380.0, 450.0, 520.0, 610.0];
@@ -3459,7 +2812,7 @@ mod tests {
             &window_aucs,
         );
         assert_eq!(m.auc_target_attainment, Some(0.5));
-        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.pct_readings_in_window, None, "no target_window declared");
 
         // One-sided "at or above 400" ([400, +∞]): 450, 520, 610 ⇒ 3/4.
         let one_sided = compute_subject_metrics(
@@ -3496,10 +2849,8 @@ mod tests {
 
     #[test]
     fn run_has_dose_on_stop_flags_only_dose_carrying_stops() {
-        // The invariant the realized-window AUC relies on: no `[dose, Stop]`. A
-        // declarative `Stop` is dose-free (`dosed: 0`); a dose issued *at* a stop
-        // (`dosed > 0`, the programmatic `[Bolus, Stop]` shape) is what would strand
-        // an unscored final-dose window — the call-site `debug_assert!` trips on it.
+        // A declarative `Stop` is dose-free; `[Bolus, Stop]` (`dosed > 0`) is what the
+        // call-site `debug_assert!` guards.
         let dose_free_stop = vec![
             decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 }),
             decision(24.0, Some(12.0), DecisionOutcome::Stop { dosed: 0 }),
@@ -3520,10 +2871,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_inverted_or_negative_auc_target() {
-        // `auc_target` only feeds `auc_target_attainment`, but — like `target_window`
-        // — a malformed band must be rejected at both the parser and `validate` (the
-        // safety net for a hand-built `pub` spec). It is an AUC of a non-negative
-        // signal, so `low` must additionally be `>= 0`.
+        // A malformed `auc_target` is rejected by `validate`; `low` must also be `>= 0`.
         let mut s = base_spec();
         s.auc_target = Some((600.0, 400.0)); // inverted
         assert!(s.validate().unwrap_err().contains("auc_target"));
@@ -3550,28 +2898,19 @@ mod tests {
     }
 
     /// `SetInterval` injects nothing and must carry a positive, finite interval (#945).
-    /// Kills the `validate` guard (a zero / negative / non-finite interval would reach the
-    /// driver, where `t + 0` makes every later point due at once and `NaN` never due).
     #[test]
     fn set_interval_maps_to_no_dose_and_validates_its_interval() {
-        assert!(DoseAction::SetInterval { interval: 24.0 }
-            .to_dose_event(0.0)
-            .is_none());
+        assert!(DoseAction::SetInterval { interval: 24.0 }.to_dose_event(0.0).is_none());
         assert!(!DoseAction::SetInterval { interval: 24.0 }.is_stop());
-        assert!(DoseAction::SetInterval { interval: 24.0 }
-            .validate()
-            .is_ok());
+        assert!(DoseAction::SetInterval { interval: 24.0 }.validate().is_ok());
         for bad in [0.0, -12.0, f64::NAN, f64::INFINITY] {
-            let err = DoseAction::SetInterval { interval: bad }
-                .validate()
-                .unwrap_err();
+            let err = DoseAction::SetInterval { interval: bad }.validate().unwrap_err();
             assert!(err.contains("positive, finite interval"), "{bad}: {err}");
         }
     }
 
-    /// A not-due grid point is counted in `n_not_due`, never as a hold, and its signal still
-    /// feeds the signal summary (#945). Kills `NotDue` counted as `Hold`, and a summary that
-    /// skips not-due rows (`signal_mean` would be 10, not 15).
+    /// A not-due point counts in `n_not_due`, not as a hold, and its signal feeds the
+    /// summary (#945; `signal_mean` 15, not 10).
     #[test]
     fn metrics_count_not_due_apart_from_holds() {
         let decisions = vec![
@@ -3664,10 +3003,7 @@ mod tests {
     fn validate_rejects_a_malformed_interval_ladder() {
         let mut s = interval_base();
         s.intervals = Some(vec![24.0, 12.0]);
-        assert!(s
-            .validate()
-            .unwrap_err()
-            .contains("intervals must be strictly increasing"));
+        assert!(s.validate().unwrap_err().contains("intervals must be strictly increasing"));
 
         let mut s = interval_base();
         s.intervals = Some(vec![0.0, 24.0]);

@@ -100,13 +100,7 @@ fn two_doses() -> Vec<DoseEvent> {
 }
 
 fn lagged_zo_subject() -> Subject {
-    common::subject(
-        "1",
-        two_doses(),
-        OBS_T.to_vec(),
-        vec![1.0; OBS_T.len()],
-        vec![1; OBS_T.len()],
-    )
+    common::subject("1", two_doses(), OBS_T.to_vec(), vec![1.0; OBS_T.len()], vec![1; OBS_T.len()])
 }
 
 fn single_subject_pop(subject: Subject) -> Population {
@@ -133,10 +127,7 @@ fn assert_rel_close(got: &[f64], want: &[f64], tol: f64, what: &str) {
     );
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
         let rel = (g - w).abs() / w.abs().max(1e-12);
-        assert!(
-            rel <= tol,
-            "{what}: element {i} is {g}, want {w} (rel {rel:.3e} > {tol:.1e})"
-        );
+        assert!(rel <= tol, "{what}: element {i} is {g}, want {w} (rel {rel:.3e} > {tol:.1e})");
     }
 }
 
@@ -208,12 +199,7 @@ fn dense_solve_states_matches_the_objective_path() {
     let states = ode_dense_solve_states(ode, &pk.values, theta, &eta, &subject, &OBS_T);
     let conc: Vec<f64> = states.iter().map(|u| u[0] / v).collect();
     let objective = compute_predictions_with_tv(&model, &subject, theta, &eta);
-    assert_rel_close(
-        &conc,
-        &objective,
-        1e-8,
-        "ode_dense_solve_states vs objective IPRED",
-    );
+    assert_rel_close(&conc, &objective, 1e-8, "ode_dense_solve_states vs objective IPRED");
 }
 
 /// A subject with **time-varying covariates** routes `compute_predictions_with_states`
@@ -372,12 +358,8 @@ fn derived_grid_integral_over_a_lagged_zero_order_compartment() {
     let sr = &result.subjects[0];
 
     let theta = &model.default_params.theta;
-    let auc = sr
-        .extra_columns
-        .iter()
-        .find(|(n, _)| n == "AUC")
-        .expect("AUC column must exist")
-        .1[0];
+    let auc =
+        sr.extra_columns.iter().find(|(n, _)| n == "AUC").expect("AUC column must exist").1[0];
 
     // A(24) from the same run: the last compartment state, i.e. IPRED(24) · V.
     let a_end = *sr
@@ -392,10 +374,7 @@ fn derived_grid_integral_over_a_lagged_zero_order_compartment() {
     // survives a reordering of `[parameters]`, and a positional read would silently
     // produce a wrong reference instead of failing.
     let pk = compute_event_pk_params(&model, &pop.subjects[0], theta, sr.eta.as_slice()).obs[0];
-    let (cl, v) = (
-        pk.values[ferx_core::types::PK_IDX_CL],
-        pk.values[ferx_core::types::PK_IDX_V],
-    );
+    let (cl, v) = (pk.values[ferx_core::types::PK_IDX_CL], pk.values[ferx_core::types::PK_IDX_V]);
     let want = (200.0 - a_end) / (cl / v);
     let rel = (auc - want).abs() / want;
     // 1e-6, measured: the realised error is 6.500e-9 (AUC 1637.9486314 against the
@@ -601,10 +580,7 @@ fn simulated_event_times_see_the_lagged_zero_order_route() {
          all-censored means the hazard never saw the absorbed drug"
     );
     assert!(
-        drug_driven
-            .iter()
-            .zip(&drug_free)
-            .any(|(a, b)| (a - b).abs() > 1e-6),
+        drug_driven.iter().zip(&drug_free).any(|(a, b)| (a - b).abs() > 1e-6),
         "BETA = 0.5 and BETA = 0 produced identical event times off the same seed — \
          the drug-driven hazard collapsed to the drug-free baseline, i.e. the PK \
          compartment was zero"

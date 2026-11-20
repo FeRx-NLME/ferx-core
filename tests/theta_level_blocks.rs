@@ -115,11 +115,9 @@ fn write_case(model: &str, data: &str) -> (tempfile::TempDir, PathBuf, PathBuf) 
 #[test]
 fn a_level_block_binds_against_the_dataset_end_to_end() {
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
 
     // 2 studies x 3 timepoints = 6 observed levels; global sum-to-zero leaves 5.
     assert_eq!(result.theta_names.len(), 2 + 5, "{:?}", result.theta_names);
@@ -153,16 +151,11 @@ fn a_level_the_data_never_shows_is_not_estimated() {
     // is never sampled at TIME 1, so that cell must not become a parameter with
     // nothing to inform it.
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA_SPARSE);
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
     assert!(
-        !result
-            .theta_names
-            .iter()
-            .any(|n| n == "PLACEBO[STUDY=2,TIME=1]"),
+        !result.theta_names.iter().any(|n| n == "PLACEBO[STUDY=2,TIME=1]"),
         "{:?}",
         result.theta_names
     );
@@ -173,11 +166,9 @@ fn a_level_the_data_never_shows_is_not_estimated() {
 #[test]
 fn the_explicit_gather_form_fits_through_the_same_path() {
     let (_dir, model_path, data_path) = write_case(&explicit_model(6), DATA);
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
     assert_eq!(result.theta_names.len(), 2 + 6);
     assert_eq!(result.theta_names[1], "PLACEBO[1]");
     assert!(result.theta.iter().all(|t| t.is_finite()));
@@ -186,12 +177,9 @@ fn the_explicit_gather_form_fits_through_the_same_path() {
 #[test]
 fn a_zero_based_index_column_fails_loudly_before_the_fit() {
     let (_dir, model_path, data_path) = write_case(&explicit_model(6), DATA_ZERO_BASED);
-    let err = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect_err("a 0-based index must be rejected")
-    .to_string();
+    let err = run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+        .expect_err("a 0-based index must be rejected")
+        .to_string();
     assert!(
         err.contains("1-based") && err.contains("PLA_IDX"),
         "the error must name the column and the convention, got: {err}"
@@ -202,16 +190,10 @@ fn a_zero_based_index_column_fails_loudly_before_the_fit() {
 fn an_index_past_the_declared_level_count_fails_loudly() {
     // The data reaches level 6, the model declares 4.
     let (_dir, model_path, data_path) = write_case(&explicit_model(4), DATA);
-    let err = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect_err("an out-of-range index must be rejected")
-    .to_string();
-    assert!(
-        err.contains("has 4 levels"),
-        "the error must name the declared count, got: {err}"
-    );
+    let err = run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+        .expect_err("an out-of-range index must be rejected")
+        .to_string();
+    assert!(err.contains("has 4 levels"), "the error must name the declared count, got: {err}");
 }
 
 #[test]
@@ -311,16 +293,10 @@ fn binding_is_deterministic_so_predict_rebuilds_the_same_levels() {
     let (model_b, pop_b) = bind_once();
 
     assert_eq!(model_a.theta_names, model_b.theta_names);
-    assert_eq!(
-        ferx_core::theta_level_map(&model_a),
-        ferx_core::theta_level_map(&model_b)
-    );
+    assert_eq!(ferx_core::theta_level_map(&model_a), ferx_core::theta_level_map(&model_b));
     for (a, b) in pop_a.subjects.iter().zip(&pop_b.subjects) {
         let idx = |s: &ferx_core::Subject| -> Vec<f64> {
-            s.obs_covariates
-                .iter()
-                .map(|m| m["__level_PLACEBO"])
-                .collect()
+            s.obs_covariates.iter().map(|m| m["__level_PLACEBO"]).collect()
         };
         assert_eq!(idx(a), idx(b), "subject {} index column drifted", a.id);
     }
@@ -329,36 +305,23 @@ fn binding_is_deterministic_so_predict_rebuilds_the_same_levels() {
 #[test]
 fn check_binds_level_blocks_before_data_validation() {
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
-    let report = validate_model_file(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    );
+    let report =
+        validate_model_file(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()));
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("__level_PLACEBO")),
+        !report.diagnostics.iter().any(|d| d.message.contains("__level_PLACEBO")),
         "the synthesized level index must exist before checks run: {:?}",
         report.diagnostics
     );
-    assert!(
-        report.valid,
-        "valid bound model should pass check: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "valid bound model should pass check: {:?}", report.diagnostics);
 }
 
 #[test]
 fn check_reports_level_binding_errors_directly() {
-    let invalid = level_block_model().replace(
-        "PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)",
-        "PLACEBO[STUDY, TIME](0.5, -5.0, 5.0)",
-    );
+    let invalid = level_block_model()
+        .replace("PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)", "PLACEBO[STUDY, TIME](0.5, -5.0, 5.0)");
     let (_dir, model_path, data_path) = write_case(&invalid, DATA);
-    let report = validate_model_file(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    );
+    let report =
+        validate_model_file(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()));
     assert!(!report.valid);
     assert!(report
         .diagnostics
@@ -373,21 +336,14 @@ fn check_reports_level_binding_errors_directly() {
 /// Mutation — revert the default-box arm in the parser: the report is invalid.
 #[test]
 fn check_binds_a_constrained_block_without_written_bounds() {
-    let text = level_block_model().replace(
-        "PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)",
-        "PLACEBO[STUDY, TIME](0.0)",
-    );
+    let text = level_block_model()
+        .replace("PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)", "PLACEBO[STUDY, TIME](0.0)");
     assert!(text.contains("PLACEBO[STUDY, TIME](0.0)\n"), "replaced");
     let (_dir, model_path, data_path) = write_case(&text, DATA);
-    let report = validate_model_file(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    );
+    let report =
+        validate_model_file(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()));
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_THETA_LEVEL_BINDING"),
+        !report.diagnostics.iter().any(|d| d.code == "E_THETA_LEVEL_BINDING"),
         "{:?}",
         report.diagnostics
     );
@@ -430,10 +386,7 @@ fn predict_refuses_a_population_that_was_never_bound() {
         ferx_core::predict(&model, &unbound, &params).unwrap()
     }))
     .is_err();
-    assert!(
-        panicked,
-        "predict() must refuse a population missing the level index column"
-    );
+    assert!(panicked, "predict() must refuse a population missing the level index column");
 }
 
 #[test]
@@ -495,20 +448,15 @@ fn a_level_block_binds_against_a_simulation_design() {
 /// the model. Statement for statement the documented example
 /// (`docs/api/fitting.qmd`, `docs/api/index.qmd`), imports included.
 fn read_composable(
-    model_path: &std::path::Path,
-    data_path: &std::path::Path,
-    bind: bool,
+    model_path: &std::path::Path, data_path: &std::path::Path, bind: bool,
 ) -> (ferx_core::ParsedModel, ferx_core::Population) {
     use ferx_core::io::datareader::SelectionFilter;
 
     let mut parsed = ferx_core::parse_full_model_file(model_path).expect("parse");
     let opts = &parsed.fit_options;
-    let filter = SelectionFilter::from_opts(
-        &opts.ignore_exprs,
-        &opts.accept_exprs,
-        &opts.ignore_subjects,
-    )
-    .expect("selection filter");
+    let filter =
+        SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)
+            .expect("selection filter");
     let (mut population, _) = ferx_core::api::read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
@@ -533,9 +481,7 @@ fn read_composable(
 
 /// [`read_composable`], then `fit` with the parsed model's own inits and options.
 fn fit_composable(
-    model_path: &std::path::Path,
-    data_path: &std::path::Path,
-    bind: bool,
+    model_path: &std::path::Path, data_path: &std::path::Path, bind: bool,
 ) -> Result<(ferx_core::FitResult, ferx_core::CompiledModel), String> {
     let (parsed, population) = read_composable(model_path, data_path, bind);
     let result = ferx_core::fit(
@@ -554,11 +500,9 @@ fn the_composable_path_binds_exactly_like_the_file_entry_point() {
     // itself can fit a level-block model without a file entry point. The file
     // path is the oracle: the same parameter vector, and an OFV equal to the bit.
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
-    let (file, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("file fit");
+    let (file, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("file fit");
     let (composable, model) = fit_composable(&model_path, &data_path, true).expect("composable");
 
     assert_eq!(composable.theta_names, file.theta_names);
@@ -591,16 +535,11 @@ fn the_composable_path_binds_exactly_like_the_file_entry_point() {
 /// composable path, and return `(file, composable)` OFV and parameter count.
 fn file_and_composable(model: &str) -> ((f64, usize), (f64, usize)) {
     let (_dir, model_path, data_path) = write_case(model, DATA);
-    let (file, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("file fit");
+    let (file, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("file fit");
     let (composable, _model) = fit_composable(&model_path, &data_path, true).expect("composable");
-    (
-        (file.ofv, file.n_parameters),
-        (composable.ofv, composable.n_parameters),
-    )
+    ((file.ofv, file.n_parameters), (composable.ofv, composable.n_parameters))
 }
 
 #[test]
@@ -636,10 +575,7 @@ fn the_composable_path_applies_the_files_data_selection() {
     // remain: 3 free levels + TVCL + ω + σ = 6 parameters (`TVV` is fixed),
     // against 8 on the full data. The file path filters; the composable path
     // must too.
-    let model = format!(
-        "{}\n[data_selection]\n  ignore = TIME > 10\n",
-        level_block_model()
-    );
+    let model = format!("{}\n[data_selection]\n  ignore = TIME > 10\n", level_block_model());
     let ((file_ofv, file_n), (comp_ofv, comp_n)) = file_and_composable(&model);
     assert_eq!(file_n, 6, "the file path must apply [data_selection]");
     assert_eq!(comp_n, file_n, "composable parameter count vs file");
@@ -674,21 +610,15 @@ fn the_composable_path_writes_the_level_index_the_data_encodes() {
     // binder. `prepare_run` is compared too, but it shares the binder's index
     // writer, so that leg pins routing, not the index.
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
-    let prepared = ferx_core::prepare_run(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("prepare_run");
+    let prepared =
+        ferx_core::prepare_run(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("prepare_run");
     let (_parsed, population) = read_composable(&model_path, &data_path, true);
 
     assert_eq!(population.subjects.len(), 2);
     assert_eq!(prepared.population.subjects.len(), 2);
     let mut n_records = 0;
-    for (c, p) in population
-        .subjects
-        .iter()
-        .zip(&prepared.population.subjects)
-    {
+    for (c, p) in population.subjects.iter().zip(&prepared.population.subjects) {
         assert_eq!(c.id, p.id);
         for j in 0..c.obs_times.len() {
             let got = c.obs_cov(j)["__level_PLACEBO"];
@@ -795,8 +725,7 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY
 /// it against `fitted` — the documented simulate-after-fit sequence.
 #[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 fn bind_design_from_fit(
-    model_path: &std::path::Path,
-    design: &str,
+    model_path: &std::path::Path, design: &str,
     fitted: &ferx_core::parser::model_parser::LevelBindings,
 ) -> Result<(ferx_core::ParsedModel, ferx_core::Population), String> {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -864,10 +793,7 @@ fn a_reordered_design_binds_at_the_fits_positions() {
     let (_dir, model_path, fit_model, fitted) = fit_bindings();
     let (parsed, population) =
         bind_design_from_fit(&model_path, DESIGN_REORDERED, &fitted).expect("bind");
-    assert_eq!(
-        population.subjects[0].id, "2",
-        "fixture lists study 2 first"
-    );
+    assert_eq!(population.subjects[0].id, "2", "fixture lists study 2 first");
     assert_eq!(assert_index_is_pla_idx(&population, "reordered"), 6);
     assert_eq!(parsed.model.n_theta, fit_model.n_theta);
     assert_eq!(parsed.model.theta_names, fit_model.theta_names);
@@ -883,10 +809,7 @@ fn a_reordered_design_binds_at_the_fits_positions() {
 #[test]
 fn a_subset_design_binds_at_the_fits_positions_and_keeps_its_layout() {
     let (_dir, model_path, fit_model, fitted) = fit_bindings();
-    assert_eq!(
-        fit_model.n_theta, 7,
-        "2 studies x 3 times, sum-to-zero, + TVCL, TVV"
-    );
+    assert_eq!(fit_model.n_theta, 7, "2 studies x 3 times, sum-to-zero, + TVCL, TVV");
     let (parsed, population) =
         bind_design_from_fit(&model_path, DESIGN_STUDY2, &fitted).expect("bind");
     assert_eq!(assert_index_is_pla_idx(&population, "study 2 only"), 3);
@@ -897,10 +820,7 @@ fn a_subset_design_binds_at_the_fits_positions_and_keeps_its_layout() {
     assert_eq!(parsed.bindings.levels.len(), 1);
     assert_eq!(got.labels, want.labels);
     assert_eq!(got.groups, want.groups);
-    assert_eq!(
-        format!("{:?}", got.contrast),
-        format!("{:?}", want.contrast)
-    );
+    assert_eq!(format!("{:?}", got.contrast), format!("{:?}", want.contrast));
 }
 
 /// The refusal for each unseen-label case, held to the message contract: the
@@ -909,10 +829,7 @@ fn a_subset_design_binds_at_the_fits_positions_and_keeps_its_layout() {
 /// level-count claim, which is false at the same count, nor a Rust function name,
 /// since the R wrapper passes the text through verbatim (#1623).
 fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
-    assert!(
-        err.contains("theta PLACEBO[STUDY, TIME]"),
-        "{case}: block not named: {err}"
-    );
+    assert!(err.contains("theta PLACEBO[STUDY, TIME]"), "{case}: block not named: {err}");
     assert!(
         err.contains(&format!(
             "the design has {} level(s) the fit estimated no theta for",
@@ -925,10 +842,7 @@ fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
         "{case}: why an unseen level has no theta, missing: {err}"
     );
     for l in labels {
-        assert!(
-            err.contains(&format!("`{l}`")),
-            "{case}: label {l} not named: {err}"
-        );
+        assert!(err.contains(&format!("`{l}`")), "{case}: label {l} not named: {err}");
     }
     assert!(
         err.contains(
@@ -952,10 +866,7 @@ fn assert_unseen_refusal(err: &str, labels: &[&str], case: &str) {
         !err.contains("bind_theta_levels"),
         "{case}: a Rust function in a message the R wrapper passes through (#1623): {err}"
     );
-    assert!(
-        !err.contains("number of levels"),
-        "{case}: a level-count claim in: {err}"
-    );
+    assert!(!err.contains("number of levels"), "{case}: a level-count claim in: {err}");
 }
 
 /// T3. Same level count, unseen labels: refused, naming every one. The
@@ -970,20 +881,13 @@ fn a_same_count_design_with_unseen_levels_is_refused_by_label() {
     let err = bind_design_from_fit(&model_path, DESIGN_TIME24, &fitted)
         .map(|_| ())
         .expect_err("TIME 24 was never fitted");
-    assert_unseen_refusal(
-        &err,
-        &["STUDY=1,TIME=24", "STUDY=2,TIME=24"],
-        "TIME 12 -> 24",
-    );
+    assert_unseen_refusal(&err, &["STUDY=1,TIME=24", "STUDY=2,TIME=24"], "TIME 12 -> 24");
 
     let err = bind_design_from_fit(&model_path, DESIGN_DEPENDENT_ONLY, &fitted)
         .map(|_| ())
         .expect_err("STUDY=2,TIME=24 was never fitted");
     assert_unseen_refusal(&err, &["STUDY=2,TIME=24"], "dependent level only");
-    assert!(
-        !err.contains("STUDY=1,TIME="),
-        "only the unseen label may be named: {err}"
-    );
+    assert!(!err.contains("STUDY=1,TIME="), "only the unseen label may be named: {err}");
 }
 
 /// T4. A study the fit never saw: refused, naming all three of its labels.
@@ -1067,11 +971,7 @@ fn a_subset_design_simulates_the_closed_form_with_the_fits_theta() {
         // The bound leaves four orders of headroom and is still ~1e10 below the
         // smallest wrong-position error (P 0.4 → 0.1 at TIME 1: rel 3e-2).
         let rel = (row.ipred - want).abs() / want;
-        assert!(
-            rel <= 1e-12,
-            "TIME {t}: ipred {} vs closed form {want} (rel {rel:e})",
-            row.ipred
-        );
+        assert!(rel <= 1e-12, "TIME {t}: ipred {} vs closed form {want} (rel {rel:e})", row.ipred);
         worst = worst.max(rel);
     }
     eprintln!("closed-form worst rel error: {worst:e}");
@@ -1128,15 +1028,9 @@ fn the_level_reporting_surface_is_reachable_from_outside_the_crate() {
     assert_eq!(levels[0].se, Some(0.04f64.sqrt()));
     assert_eq!(levels[0].sir_ci, Some((theta[1], theta[1] + 0.5)));
     let derived = levels[5].se.expect("the dependent level's SE");
-    assert!(
-        (derived - 0.2f64.sqrt()).abs() < 1e-15,
-        "sqrt(5 × 0.04): {derived}"
-    );
+    assert!((derived - 0.2f64.sqrt()).abs() < 1e-15, "sqrt(5 × 0.04): {derived}");
     let (lo, hi) = levels[5].sir_ci.expect("the dependent level's interval");
-    assert!(
-        (lo - (-free - 2.5)).abs() < 1e-12 && hi == -free,
-        "({lo}, {hi})"
-    );
+    assert!((lo - (-free - 2.5)).abs() < 1e-12 && hi == -free, "({lo}, {hi})");
 
     assert_eq!(THETA_BLOCK_COMPACT_MIN, 20);
     assert!(
@@ -1153,11 +1047,9 @@ fn a_fit_reports_only_the_datas_real_covariate_columns() {
     // "Covariates:" line, `.fitrx`) lists the data's columns. The binder's
     // synthesized `__level_PLACEBO` is not one of them.
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
     assert_eq!(result.covariate_names, ["STUDY", "PLA_IDX"]);
 
     // Every real column declared: the bound re-parse raises no
@@ -1167,11 +1059,9 @@ fn a_fit_reports_only_the_datas_real_covariate_columns() {
         "[covariates]\n  STUDY categorical\n  PLA_IDX categorical\n\n[individual_parameters]",
     );
     let (_dir, model_path, data_path) = write_case(&declared, DATA);
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
     assert!(
         !result
             .warnings
@@ -1193,18 +1083,11 @@ fn listing_the_index_column_in_covariate_names_changes_no_bit_of_the_fit() {
     let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
     let (parsed, population) = read_composable(&model_path, &data_path, true);
     let mut old_contract = population.clone();
-    old_contract
-        .covariate_names
-        .push("__level_PLACEBO".to_string());
+    old_contract.covariate_names.push("__level_PLACEBO".to_string());
 
     let fit = |pop: &ferx_core::Population| {
-        ferx_core::fit(
-            &parsed.model,
-            pop,
-            &parsed.model.default_params,
-            &parsed.fit_options,
-        )
-        .expect("fit")
+        ferx_core::fit(&parsed.model, pop, &parsed.model.default_params, &parsed.fit_options)
+            .expect("fit")
     };
     let (now, before) = (fit(&population), fit(&old_contract));
     assert!(now.ofv.is_finite(), "OFV must be finite: {}", now.ofv);
@@ -1245,12 +1128,7 @@ const BINDINGS_MODEL: &str = r#"
 /// Six subjects, three studies, two doses each (0 h, 12 h); WT median 71.475.
 fn bindings_fit_data() -> String {
     let wts = [61.3, 70.85, 72.1, 80.4, 55.55, 90.2];
-    bindings_rows(
-        &wts.iter()
-            .enumerate()
-            .map(|(i, &w)| (i / 2 + 1, w))
-            .collect::<Vec<_>>(),
-    )
+    bindings_rows(&wts.iter().enumerate().map(|(i, &w)| (i / 2 + 1, w)).collect::<Vec<_>>())
 }
 
 /// Three subjects in studies 2 and 3 only, all heavier than the fit's: on its
@@ -1279,9 +1157,7 @@ fn bindings_rows(subjects: &[(usize, f64)]) -> String {
 /// the levels bind from the fit — the from-fit path a reloaded `.fitrx` takes.
 #[allow(deprecated)] // the deprecated binder, kept as a control (#1619)
 fn simulate_design_from(
-    model: &str,
-    b: &ferx_core::parser::model_parser::DataBindings,
-    design_path: &std::path::Path,
+    model: &str, b: &ferx_core::parser::model_parser::DataBindings, design_path: &std::path::Path,
     theta: &[f64],
 ) -> (usize, Vec<f64>) {
     let mut pop =
@@ -1335,10 +1211,7 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
     )
     .expect("fit");
     let live = &result.data_bindings;
-    assert_eq!(
-        live.levels["PLACEBO"].labels,
-        ["STUDY=1", "STUDY=2", "STUDY=3"]
-    );
+    assert_eq!(live.levels["PLACEBO"].labels, ["STUDY=1", "STUDY=2", "STUDY=3"]);
     assert_eq!(live.covariate_stats["WT"].median, 71.475);
     assert_eq!(result.theta.len(), 5);
 
@@ -1362,12 +1235,8 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
     assert_eq!(result.theta_names[3], "TVV");
 
     let (n_live, a) = simulate_design_from(BINDINGS_MODEL, live, &design_path, &theta);
-    let (n_loaded, b) = simulate_design_from(
-        BINDINGS_MODEL,
-        &loaded.fit.data_bindings,
-        &design_path,
-        &theta,
-    );
+    let (n_loaded, b) =
+        simulate_design_from(BINDINGS_MODEL, &loaded.fit.data_bindings, &design_path, &theta);
     assert_eq!((n_live, n_loaded), (5, 5));
     assert_eq!(a.len(), 30);
     assert_eq!(a.len(), b.len());
@@ -1395,10 +1264,7 @@ fn a_fits_data_bindings_survive_fitrx_and_drive_the_design_bit_for_bit() {
         assert!(y.is_finite(), "{y}");
         worst = worst.max(((x - y) / x).abs());
     }
-    assert!(
-        worst > 0.2,
-        "design-own WT statistics moved ipred by only {worst}"
-    );
+    assert!(worst > 0.2, "design-own WT statistics moved ipred by only {worst}");
 }
 
 /// #1621 review round 1, finding 1: the documented from-fit sequence must also
@@ -1452,11 +1318,7 @@ fn the_documented_from_fit_sequence_binds_statistics_without_a_level_block() {
     let mut params = bare.model.default_params.clone();
     params.theta = theta.to_vec();
     let err = ferx_core::api::simulate_with_seed(&bare.model, &pop, &params, 2, 7).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("still need data-derived statistics"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("still need data-derived statistics"), "{err}");
 
     // The documented sequence.
     let (n, a) = simulate_design_from(&model, &result.data_bindings, &design_path, &theta);
@@ -1538,11 +1400,7 @@ fn from_fit_model(level: bool, median: bool) -> String {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#,
-        lvl = if level {
-            "  theta SHIFT[STUDY](0.0, -2.0, 2.0)"
-        } else {
-            ""
-        },
+        lvl = if level { "  theta SHIFT[STUDY](0.0, -2.0, 2.0)" } else { "" },
         ka = if level { "exp(SHIFT) * " } else { "" },
         c = if median { "median" } else { "70" },
     )
@@ -1590,19 +1448,12 @@ fn from_fit_case(level: bool, median: bool) -> FromFitCase {
     let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
     let fit = ferx_core::api::fit_from_files(m, Some(d), None, Some(opts)).expect("fit");
     let prep = ferx_core::prepare_run(m, Some(d)).expect("prepare");
-    FromFitCase {
-        dir,
-        model,
-        data_path,
-        fit,
-        prep,
-    }
+    FromFitCase { dir, model, data_path, fit, prep }
 }
 
 /// Read `path` the way the fit read its data, for a fresh unbound parse of `model`.
 fn read_unbound(
-    model: &str,
-    path: &std::path::Path,
+    model: &str, path: &std::path::Path,
 ) -> (ferx_core::ParsedModel, ferx_core::Population) {
     let parsed = ferx_core::parser::model_parser::parse_full_model(model).unwrap();
     let (pop, _) = ferx_core::api::read_population_for(
@@ -1619,9 +1470,7 @@ fn read_unbound(
 }
 
 fn ipreds(
-    model: &ferx_core::CompiledModel,
-    pop: &ferx_core::Population,
-    theta: &[f64],
+    model: &ferx_core::CompiledModel, pop: &ferx_core::Population, theta: &[f64],
 ) -> Vec<f64> {
     let mut params = model.default_params.clone();
     params.theta = theta.to_vec();
@@ -1657,18 +1506,11 @@ fn bind_from_fit_on_the_fit_data_rebuilds_the_fitted_model() {
         let (mut parsed, mut pop) = read_unbound(&c.model, &c.data_path);
         ferx_core::bind_from_fit(&mut parsed, &c.model, &mut pop, &c.fit.data_bindings)
             .unwrap_or_else(|e| panic!("{what}: {e}"));
-        assert_eq!(
-            parsed.model.data_bindings(),
-            c.prep.parsed.model.data_bindings(),
-            "{what}"
-        );
+        assert_eq!(parsed.model.data_bindings(), c.prep.parsed.model.data_bindings(), "{what}");
         assert_eq!(parsed.model.n_theta, c.fit.theta.len(), "{what}");
         if level {
             let index = |p: &ferx_core::Population| -> Vec<u64> {
-                p.subjects
-                    .iter()
-                    .map(|s| s.covariates["__level_SHIFT"].to_bits())
-                    .collect()
+                p.subjects.iter().map(|s| s.covariates["__level_SHIFT"].to_bits()).collect()
             };
             assert_eq!(index(&pop), index(&c.prep.population), "{what}");
         }
@@ -1719,10 +1561,7 @@ fn bind_from_fit_keeps_the_fits_covariate_centres_on_a_design() {
         assert!(x.is_finite(), "{x}");
         worst = worst.max(((x - y) / y).abs());
     }
-    assert!(
-        worst > 0.15,
-        "the design's own median moved ipred by only {worst}"
-    );
+    assert!(worst > 0.15, "the design's own median moved ipred by only {worst}");
 
     // New: live, then from a reloaded `.fitrx`.
     let fitrx = c.dir.path().join("fit.fitrx");
@@ -1735,10 +1574,7 @@ fn bind_from_fit_keeps_the_fits_covariate_centres_on_a_design() {
     )
     .expect("save");
     let loaded = ferx_core::io::fitrx::load_fit(&fitrx).expect("load");
-    for (what, b) in [
-        ("live", &c.fit.data_bindings),
-        ("loaded", &loaded.fit.data_bindings),
-    ] {
+    for (what, b) in [("live", &c.fit.data_bindings), ("loaded", &loaded.fit.data_bindings)] {
         let (mut parsed, mut pop) = read_unbound(&c.model, &design_path);
         ferx_core::bind_from_fit(&mut parsed, &c.model, &mut pop, b).expect("bind");
         assert_bits(&ipreds(&parsed.model, &pop, theta), &reference, what);
@@ -1819,11 +1655,9 @@ fn in_fit_sir_resamples_a_negative_bounded_level_block() {
   sir_seed      = 1701
 "#;
     let (_dir, model_path, data_path) = write_case(model, &shifted_study_data());
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
 
     let names = &result.theta_names;
     let ci = result
@@ -1831,18 +1665,13 @@ fn in_fit_sir_resamples_a_negative_bounded_level_block() {
         .as_ref()
         .unwrap_or_else(|| panic!("no SIR CIs; warnings: {:?}", result.warnings));
     let se = result.se_theta.as_ref().expect("covariance step SEs");
-    let s1 = names
-        .iter()
-        .position(|n| n == "SHIFT[STUDY=1]")
-        .unwrap_or_else(|| panic!("{names:?}"));
+    let s1 =
+        names.iter().position(|n| n == "SHIFT[STUDY=1]").unwrap_or_else(|| panic!("{names:?}"));
 
     let mut worst = 0.0f64;
     for (i, name) in names.iter().enumerate() {
         let (lo, hi) = ci[i];
-        assert!(
-            lo.is_finite() && hi.is_finite() && lo < hi,
-            "{name}: SIR CI ({lo}, {hi})"
-        );
+        assert!(lo.is_finite() && hi.is_finite() && lo < hi, "{name}: SIR CI ({lo}, {hi})");
         assert!(se[i].is_finite() && se[i] > 0.0, "{name}: SE {}", se[i]);
         if !name.starts_with("SHIFT") {
             continue;
@@ -1851,23 +1680,13 @@ fn in_fit_sir_resamples_a_negative_bounded_level_block() {
         let (wlo, whi) = (result.theta[i] - half, result.theta[i] + half);
         // Gap in units of the Wald half-width, worse end.
         let gap = (lo - wlo).abs().max((hi - whi).abs()) / half;
-        eprintln!(
-            "{name}: θ̂ {} SIR ({lo}, {hi}) Wald ({wlo}, {whi}) gap {gap}",
-            result.theta[i]
-        );
+        eprintln!("{name}: θ̂ {} SIR ({lo}, {hi}) Wald ({wlo}, {whi}) gap {gap}", result.theta[i]);
         worst = worst.max(gap);
     }
     assert!(worst.is_finite(), "{worst}");
     let (lo1, _) = ci[s1];
-    assert!(
-        lo1 < 0.0,
-        "SHIFT[STUDY=1] SIR CI must reach below 0, got {:?}",
-        ci[s1]
-    );
-    assert!(
-        worst < SIR_WALD_TOL,
-        "SIR vs Wald gap {worst} (tol {SIR_WALD_TOL})"
-    );
+    assert!(lo1 < 0.0, "SHIFT[STUDY=1] SIR CI must reach below 0, got {:?}", ci[s1]);
+    assert!(worst < SIR_WALD_TOL, "SIR vs Wald gap {worst} (tol {SIR_WALD_TOL})");
 }
 
 /// Worst SIR-vs-Wald end gap over the `SHIFT` coefficients, in Wald
@@ -1909,12 +1728,7 @@ fn mbma_placebo_stays_within() {
             ferx_core::parser::model_parser::LevelContrast::SumToZeroWithin,
             "{tag}"
         );
-        let free = parsed
-            .model
-            .theta_names
-            .iter()
-            .filter(|n| n.starts_with("PLACEBO["))
-            .count();
+        let free = parsed.model.theta_names.iter().filter(|n| n.starts_with("PLACEBO[")).count();
         assert_eq!(free, 18, "{tag}: free levels");
         assert_eq!(binding.labels.len(), 24, "{tag}: 6 studies × 4 visits");
     }
@@ -1980,10 +1794,7 @@ fn mbma_placebo_mdv_rows_add_no_level_cell() {
         .filter(|(t, raw)| t != raw)
         .count();
     assert_eq!(moved, 6, "one moved observation per study");
-    assert_eq!(
-        with_rows.bindings.levels["PLACEBO"].labels,
-        base.bindings.levels["PLACEBO"].labels
-    );
+    assert_eq!(with_rows.bindings.levels["PLACEBO"].labels, base.bindings.levels["PLACEBO"].labels);
     assert_eq!(with_rows.bindings.levels["PLACEBO"].labels.len(), 24);
     assert_eq!(with_rows.model.theta_names, base.model.theta_names);
 }
@@ -1992,10 +1803,7 @@ fn mbma_placebo_mdv_rows_add_no_level_cell() {
 /// layout and the same objective, to [`MDV_ROWS_OFV_TOL`]. Before the fix the fit with
 /// the rows had 30 parameters and an objective of 93.9567 against 97.0700.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn mbma_placebo_mdv_rows_fit_the_same() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/mbma_placebo");
     let model = root.join("mbma_placebo.ferx");
@@ -2008,13 +1816,8 @@ fn mbma_placebo_mdv_rows_fit_the_same() {
             run_covariance_step: false,
             ..prep.parsed.fit_options.clone()
         };
-        let f = ferx_core::fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &opts,
-        )
-        .expect("fit");
+        let f = ferx_core::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+            .expect("fit");
         (prep.parsed.model.theta_names.clone(), f.ofv)
     };
     let (names, ofv) = fit(&root.join("mbma_placebo.csv"));
@@ -2022,10 +1825,7 @@ fn mbma_placebo_mdv_rows_fit_the_same() {
     assert_eq!(names_rows, names);
     assert!(ofv.is_finite() && ofv_rows.is_finite(), "{ofv} {ofv_rows}");
     eprintln!("mbma_placebo OFV {ofv:.10}, with MDV=1 rows {ofv_rows:.10}");
-    assert!(
-        (ofv_rows - ofv).abs() <= MDV_ROWS_OFV_TOL,
-        "{ofv_rows} vs {ofv}"
-    );
+    assert!((ofv_rows - ofv).abs() <= MDV_ROWS_OFV_TOL, "{ofv_rows} vs {ofv}");
 }
 
 /// The objective gap [`mbma_placebo_mdv_rows_fit_the_same`] allows. Measured 3.53e-8
@@ -2051,21 +1851,12 @@ const MDV_ROWS_OFV_TOL: f64 = 1e-6;
 /// Mutations — any join that reads a different matrix or scale than the fit's own
 /// (a); the Tier-1 rule mutations (b).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn mbma_placebo_level_uncertainty_joins_the_fits_own() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let prep = ferx_core::prepare_run(
-        root.join("tests/data/mbma_placebo/mbma_placebo.ferx")
-            .to_str()
-            .unwrap(),
-        Some(
-            root.join("tests/data/mbma_placebo/mbma_placebo.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        root.join("tests/data/mbma_placebo/mbma_placebo.ferx").to_str().unwrap(),
+        Some(root.join("tests/data/mbma_placebo/mbma_placebo.csv").to_str().unwrap()),
     )
     .expect("prepare");
     let opts = ferx_core::types::FitOptions {
@@ -2091,29 +1882,17 @@ fn mbma_placebo_level_uncertainty_joins_the_fits_own() {
 
     let lower = &model.default_params.theta_lower;
     let x: Vec<f64> = (0..f.theta.len())
-        .map(|k| {
-            if lower[k] >= 0.0 {
-                f.theta[k].ln()
-            } else {
-                f.theta[k]
-            }
-        })
+        .map(|k| if lower[k] >= 0.0 { f.theta[k].ln() } else { f.theta[k] })
         .collect();
     let value_at = |x: &[f64], level: usize| {
-        let th: Vec<f64> = (0..x.len())
-            .map(|k| if lower[k] >= 0.0 { x[k].exp() } else { x[k] })
-            .collect();
+        let th: Vec<f64> =
+            (0..x.len()).map(|k| if lower[k] >= 0.0 { x[k].exp() } else { x[k] }).collect();
         ferx_core::theta_level_values(model, &th, None, None).unwrap()["PLACEBO"][level].value
     };
     let (mut free, mut dependent, mut worst) = (0, 0, 0.0f64);
     for (level, l) in levels.iter().enumerate() {
         if let Some(k) = l.theta_index {
-            assert_eq!(
-                l.se.map(f64::to_bits),
-                Some(se_theta[k].to_bits()),
-                "{}",
-                l.label
-            );
+            assert_eq!(l.se.map(f64::to_bits), Some(se_theta[k].to_bits()), "{}", l.label);
             assert_eq!(l.sir_ci, Some(sir_ci_theta[k]), "{}", l.label);
             free += 1;
             continue;
@@ -2133,25 +1912,12 @@ fn mbma_placebo_level_uncertainty_joins_the_fits_own() {
             .sum();
         let want = q.sqrt();
         let got = l.se.expect("a dependent level's SE");
-        assert!(
-            got.is_finite() && want.is_finite(),
-            "{}: {got} vs {want}",
-            l.label
-        );
+        assert!(got.is_finite() && want.is_finite(), "{}: {got} vs {want}", l.label);
         let rel = (got - want).abs() / want;
         worst = worst.max(rel);
-        assert!(
-            rel < 1e-8,
-            "{}: se {got} vs FD {want} (rel {rel:e})",
-            l.label
-        );
+        assert!(rel < 1e-8, "{}: se {got} vs FD {want} (rel {rel:e})", l.label);
         let (lo, hi) = l.sir_ci.expect("a dependent level's interval");
-        assert!(
-            lo <= l.value && l.value <= hi,
-            "{}: {} outside ({lo}, {hi})",
-            l.label,
-            l.value
-        );
+        assert!(lo <= l.value && l.value <= hi, "{}: {} outside ({lo}, {hi})", l.label, l.value);
         dependent += 1;
     }
     eprintln!("mbma_placebo dependent-level SE vs FD: worst relative error {worst:e}");

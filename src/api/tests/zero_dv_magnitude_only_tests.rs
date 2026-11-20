@@ -58,14 +58,7 @@ fn pop(dvs: &[[f64; 4]], cmt: usize) -> Population {
 /// Three subjects, two of them with `DV = 0` rows (three between them), the first at ID 1,
 /// 0.5 h. The third has none, so the subject count is not the population size.
 fn with_zeros(cmt: usize) -> Population {
-    pop(
-        &[
-            [0.0, 20.0, 5.0, 1.0],
-            [0.0, 0.0, 5.0, 1.0],
-            [50.0, 20.0, 5.0, 1.0],
-        ],
-        cmt,
-    )
+    pop(&[[0.0, 20.0, 5.0, 1.0], [0.0, 0.0, 5.0, 1.0], [50.0, 20.0, 5.0, 1.0]], cmt)
 }
 
 /// The same design with the zeros replaced by positive values.
@@ -129,10 +122,7 @@ fn proportional_with_zero_dv_warns_and_says_why_and_what_to_do() {
 #[test]
 fn the_stated_floor_is_ln_min_positive() {
     let floor = f64::MIN_POSITIVE.ln();
-    assert!(
-        (floor - (-708.4)).abs() < 0.05,
-        "ln(MIN_POSITIVE) = {floor}"
-    );
+    assert!((floor - (-708.4)).abs() < 0.05, "ln(MIN_POSITIVE) = {floor}");
 }
 
 /// The gate is the engine's variance at `f = 0`, not the error model's name: a `power(...)`
@@ -149,10 +139,8 @@ fn power_warns_and_additive_does_not() {
 /// positive variance at `f = 0`, a zero one does not.
 #[test]
 fn combined_warns_only_when_its_additive_sd_starts_at_zero() {
-    let mut m = model(
-        "  DV ~ combined(PROP, ADD)\n",
-        "  sigma PROP ~ 0.1 (sd)\n  sigma ADD ~ 0.5 (sd)\n",
-    );
+    let mut m =
+        model("  DV ~ combined(PROP, ADD)\n", "  sigma PROP ~ 0.1 (sd)\n  sigma ADD ~ 0.5 (sd)\n");
     assert!(run(&m, &with_zeros(1), BloqMethod::Drop).is_none());
     m.default_params.sigma.values[1] = 0.0;
     assert!(run(&m, &with_zeros(1), BloqMethod::Drop).is_some());
@@ -180,11 +168,7 @@ fn frem_covariate_rows_are_skipped() {
     let m = proportional();
     let mut p = with_zeros(1);
     for s in &mut p.subjects {
-        s.fremtype = s
-            .observations
-            .iter()
-            .map(|&y| if y == 0.0 { 1 } else { 0 })
-            .collect();
+        s.fremtype = s.observations.iter().map(|&y| if y == 0.0 { 1 } else { 0 }).collect();
     }
     assert!(run(&m, &p, BloqMethod::Drop).is_none());
     for s in &mut p.subjects {
@@ -233,16 +217,10 @@ fn not_in_the_shared_model_data_bundle() {
     let p = with_zeros(1);
     assert!(run(&m, &p, BloqMethod::Drop).is_some());
     let bundle = crate::api::check_model_data_warnings(&m, &p, &m.default_params);
-    assert!(
-        !bundle.iter().any(|d| d.code == "W_ZERO_DV_MAGNITUDE_ONLY"),
-        "{bundle:?}"
-    );
+    assert!(!bundle.iter().any(|d| d.code == "W_ZERO_DV_MAGNITUDE_ONLY"), "{bundle:?}");
     let served = crate::api::predict_diag(&m, &p, &m.default_params).expect("predicts");
     assert!(
-        !served
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_ZERO_DV_MAGNITUDE_ONLY")),
+        !served.warnings.iter().any(|w| w.contains("W_ZERO_DV_MAGNITUDE_ONLY")),
         "{:?}",
         served.warnings
     );

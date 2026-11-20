@@ -115,12 +115,7 @@ impl Script {
     }
 
     fn dirs(&self) -> Vec<String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(d, _, _)| d.clone())
-            .collect()
+        self.calls.lock().unwrap().iter().map(|(d, _, _)| d.clone()).collect()
     }
 
     fn fitted_in(&self, dir: &str) -> Vec<String> {
@@ -146,19 +141,11 @@ impl Script {
     /// The number of observations of the dataset a step was fitted on
     /// (`None` for the search's own).
     fn data_of(&self, dir: &str) -> Option<usize> {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(d, _, _)| d == dir)
-            .and_then(|(_, _, n)| *n)
+        self.calls.lock().unwrap().iter().find(|(d, _, _)| d == dir).and_then(|(_, _, n)| *n)
     }
 
     fn respond(
-        &self,
-        dir: &str,
-        candidates: &[Candidate],
-        n_obs: Option<usize>,
+        &self, dir: &str, candidates: &[Candidate], n_obs: Option<usize>,
     ) -> Result<RunReport, String> {
         let n_calls = {
             let mut calls = self.calls.lock().unwrap();
@@ -250,10 +237,7 @@ impl StepFitter for Script {
     }
 
     fn fit_step_on(
-        &self,
-        dir: &str,
-        candidates: &[Candidate],
-        data: &Population,
+        &self, dir: &str, candidates: &[Candidate], data: &Population,
     ) -> Result<RunReport, String> {
         self.respond(dir, candidates, Some(data.n_obs()))
     }
@@ -376,17 +360,12 @@ fn tad_cutoffs_are_pandas_quantiles_over_every_observation() {
     assert!(tad_cutoffs(&pop, 4).is_empty());
     let sp = Space::build(
         ModelText::parse(BASE).unwrap(),
-        ErrorSpecText::read(&ModelText::parse(BASE).unwrap())
-            .unwrap()
-            .unwrap(),
+        ErrorSpecText::read(&ModelText::parse(BASE).unwrap()).unwrap().unwrap(),
         pop,
         true,
         &RuvsearchOptions::default(),
     );
-    assert!(sp
-        .notes
-        .iter()
-        .any(|n| n.contains("time_varying not tested")));
+    assert!(sp.notes.iter().any(|n| n.contains("time_varying not tested")));
     // The additive σ init: (min DV / 2)² = 1.0.
     assert_eq!(sp.add_sigma_init, 1.0);
 }
@@ -431,17 +410,11 @@ fn candidates_follow_pharmpys_order_and_the_parent_can_take_them() {
     // A non-interaction method drops IIV_on_RUV.
     let sp_foce = space_from(BASE, &options, false);
     assert!(!candidates_for(&parent, &sp_foce, &none).contains(&RuvFeature::IivOnRuv));
-    assert!(sp_foce
-        .notes
-        .iter()
-        .any(|n| n.contains("IIV_on_RUV not tested")));
+    assert!(sp_foce.notes.iter().any(|n| n.contains("IIV_on_RUV not tested")));
     // A power parent cannot take power or combined again.
     let mut spec = sp.input_spec.clone();
     spec.form = ErrorForm::Power;
-    let power_parent = Node {
-        spec,
-        ..parent.clone()
-    };
+    let power_parent = Node { spec, ..parent.clone() };
     assert_eq!(
         candidates_for(&power_parent, &sp, &none),
         vec![
@@ -478,45 +451,23 @@ fn derive_builds_each_feature_onto_the_parent_with_pharmpys_inits() {
     };
     let lines = |f: RuvFeature| -> (Vec<String>, Vec<String>) {
         let (c, _) = derive("x", &parent, f, &sp, None).unwrap().unwrap();
-        (
-            c.model.block_lines("error_model"),
-            c.model.block_lines("parameters"),
-        )
+        (c.model.block_lines("error_model"), c.model.block_lines("parameters"))
     };
     let (e, p) = lines(RuvFeature::IivOnRuv);
-    assert_eq!(
-        e,
-        vec!["DV ~ proportional(PROP_ERR)", "iiv_on_ruv = ETA_RUV"]
-    );
+    assert_eq!(e, vec!["DV ~ proportional(PROP_ERR)", "iiv_on_ruv = ETA_RUV"]);
     assert!(p.contains(&"omega ETA_RUV ~ 0.09".to_string()), "{p:?}");
     let (e, p) = lines(RuvFeature::Power);
     assert_eq!(e, vec!["DV ~ power(PROP_ERR, RUV_POW)"]);
-    assert!(
-        p.contains(&"theta RUV_POW(1.0, 0.01, 10.0)".to_string()),
-        "{p:?}"
-    );
+    assert!(p.contains(&"theta RUV_POW(1.0, 0.01, 10.0)".to_string()), "{p:?}");
     let (e, p) = lines(RuvFeature::Combined);
     assert_eq!(e, vec!["DV ~ combined(PROP_ERR, ADD_ERR)"]);
     assert!(p.contains(&"sigma ADD_ERR ~ 1.0".to_string()), "{p:?}");
     let (e, p) = lines(RuvFeature::TimeVarying(2));
-    assert_eq!(
-        e,
-        vec!["DV ~ proportional(PROP_ERR * (if (TAD < 5.0) RUV_TV else 1.0))"]
-    );
-    assert!(
-        p.contains(&"theta RUV_TV(1.0, 0.01, 10.0)".to_string()),
-        "{p:?}"
-    );
+    assert_eq!(e, vec!["DV ~ proportional(PROP_ERR * (if (TAD < 5.0) RUV_TV else 1.0))"]);
+    assert!(p.contains(&"theta RUV_TV(1.0, 0.01, 10.0)".to_string()), "{p:?}");
     // An init from the pre-screen overrides the default.
-    let (c, _) = derive(
-        "x",
-        &parent,
-        RuvFeature::Power,
-        &sp,
-        Some(Init { value: 1.37 }),
-    )
-    .unwrap()
-    .unwrap();
+    let (c, _) =
+        derive("x", &parent, RuvFeature::Power, &sp, Some(Init { value: 1.37 })).unwrap().unwrap();
     assert!(c
         .model
         .block_lines("parameters")
@@ -531,19 +482,12 @@ fn derive_builds_each_feature_onto_the_parent_with_pharmpys_inits() {
     assert_eq!(fresh_name(&taken, "ETA_RUV"), "ETA_RUV");
     // Out-of-range time-varying index and a parent that already has the
     // feature give no candidate.
-    assert!(derive("x", &parent, RuvFeature::TimeVarying(9), &sp, None)
-        .unwrap()
-        .is_none());
+    assert!(derive("x", &parent, RuvFeature::TimeVarying(9), &sp, None).unwrap().is_none());
     let with_iiv = Node {
-        spec: parent
-            .spec
-            .clone()
-            .with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09)),
+        spec: parent.spec.clone().with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09)),
         ..parent.clone()
     };
-    assert!(derive("x", &with_iiv, RuvFeature::IivOnRuv, &sp, None)
-        .unwrap()
-        .is_none());
+    assert!(derive("x", &with_iiv, RuvFeature::IivOnRuv, &sp, None).unwrap().is_none());
 }
 
 // ── the search ─────────────────────────────────────────────────────────────
@@ -573,22 +517,10 @@ fn an_iteration_selects_the_largest_significant_drop_and_retires_its_family() {
     assert_eq!(result.base_id, "input");
     // Iteration 2 tested neither power nor combined again.
     let it2 = script.fitted_in("iteration-2");
-    assert_eq!(
-        it2,
-        vec![
-            "IIV_on_RUV-2",
-            "time_varying1-2",
-            "time_varying2-2",
-            "time_varying3-2"
-        ]
-    );
+    assert_eq!(it2, vec!["IIV_on_RUV-2", "time_varying1-2", "time_varying2-2", "time_varying3-2"]);
     assert_eq!(script.dirs(), vec!["input", "iteration-1", "iteration-2"]);
     // The row for IIV_on_RUV-2 says why it lost: not significant.
-    let row = result
-        .rows
-        .iter()
-        .find(|r| r.candidate == "IIV_on_RUV-2")
-        .unwrap();
+    let row = result.rows.iter().find(|r| r.candidate == "IIV_on_RUV-2").unwrap();
     let lrt = row.lrt.unwrap();
     assert_eq!(lrt.df, 1);
     assert!((lrt.dofv - 5.0).abs() < 1e-12);
@@ -604,10 +536,8 @@ fn an_iteration_selects_the_largest_significant_drop_and_retires_its_family() {
 
 #[test]
 fn a_gated_or_failed_candidate_cannot_win() {
-    let options = RuvsearchOptions {
-        skip: vec![Family::TimeVarying],
-        ..RuvsearchOptions::default()
-    };
+    let options =
+        RuvsearchOptions { skip: vec![Family::TimeVarying], ..RuvsearchOptions::default() };
     let mut script = Script::new(&[
         ("input", 100.0),
         ("IIV_on_RUV-1", 50.0),
@@ -618,17 +548,9 @@ fn a_gated_or_failed_candidate_cannot_win() {
     script.erroring.push("power-1".into());
     let result = run(&script, space(&options), &options);
     assert_eq!(selected(&result), vec![(1, "combined-1".to_string())]);
-    let iiv = result
-        .rows
-        .iter()
-        .find(|r| r.candidate == "IIV_on_RUV-1")
-        .unwrap();
+    let iiv = result.rows.iter().find(|r| r.candidate == "IIV_on_RUV-1").unwrap();
     assert!(!iiv.passed && iiv.lrt.is_some_and(|t| t.significant));
-    let power = result
-        .rows
-        .iter()
-        .find(|r| r.candidate == "power-1")
-        .unwrap();
+    let power = result.rows.iter().find(|r| r.candidate == "power-1").unwrap();
     assert!(power.ofv.is_none() && power.note.is_some());
 }
 
@@ -648,41 +570,24 @@ fn an_input_that_is_not_proportional_gets_a_base_and_the_final_comparison_may_re
     assert_eq!(result.base_id, "base");
     assert_eq!(result.base_ofv, 130.0);
     let base_model = script.model_of("base", "base");
-    assert_eq!(
-        base_model.block_lines("error_model"),
-        vec!["DV ~ proportional(PROP_ERR)"]
-    );
-    assert!(base_model
-        .block_lines("parameters")
-        .contains(&"sigma PROP_ERR ~ 0.09".to_string()));
+    assert_eq!(base_model.block_lines("error_model"), vec!["DV ~ proportional(PROP_ERR)"]);
+    assert!(base_model.block_lines("parameters").contains(&"sigma PROP_ERR ~ 0.09".to_string()));
     assert!(!base_model.render().contains("ADD_ERR"));
     assert_eq!(selected(&result), vec![(1, "power-1".to_string())]);
     // 100 − 112 < 10.83: the input is returned.
     assert_eq!(result.final_id, "input");
     assert_eq!(result.final_ofv, 100.0);
     assert!(result.features.is_empty());
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("did not beat the input model")));
+    assert!(result.notes.iter().any(|n| n.contains("did not beat the input model")));
     assert_eq!(result.rows.iter().filter(|r| r.iteration == 0).count(), 2);
     // The reversion is also an event, so a CLI can say so as it happens.
     let events = Mutex::new(Vec::new());
     let progress = |e: RuvsearchEvent| events.lock().unwrap().push(e);
     let script = Script::new(&[("input", 100.0), ("base", 130.0), ("power-1", 112.0)]);
-    search(
-        &script,
-        space_from(&additive, &options, true),
-        &options,
-        Some(&progress),
-    )
-    .unwrap();
+    search(&script, space_from(&additive, &options, true), &options, Some(&progress)).unwrap();
     let events = events.into_inner().unwrap();
     assert!(
-        events.contains(&RuvsearchEvent::Reverted {
-            to: "input".into(),
-            ofv: 100.0
-        }),
+        events.contains(&RuvsearchEvent::Reverted { to: "input".into(), ofv: 100.0 }),
         "{events:?}"
     );
     assert!(events.contains(&RuvsearchEvent::BaseFinished { ofv: 130.0 }));
@@ -710,10 +615,7 @@ fn the_final_comparison_never_returns_a_base_worse_than_the_input() {
     assert_eq!(selected(&result), vec![(1, "power-1".to_string())]);
     assert_eq!(result.final_id, "input");
     assert_eq!(result.final_ofv, 100.0);
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("did not beat the input model")));
+    assert!(result.notes.iter().any(|n| n.contains("did not beat the input model")));
     // Nothing accepted: the selected model *is* the base, which does not beat
     // the input, so the input is returned — not the base.
     let script = Script::new(&[("input", 100.0), ("base", 102.0), ("power-1", 101.0)]);
@@ -737,10 +639,7 @@ fn a_combined_input_keeps_its_proportional_sigma_in_the_base() {
             "  sigma PROP_ERR ~ 0.02 (sd)\n",
             "  sigma PROP_ERR ~ 0.02 (sd)\n  sigma ADD_ERR ~ 0.5 (sd)\n",
         )
-        .replace(
-            "DV ~ proportional(PROP_ERR)",
-            "DV ~ combined(PROP_ERR, ADD_ERR)",
-        );
+        .replace("DV ~ proportional(PROP_ERR)", "DV ~ combined(PROP_ERR, ADD_ERR)");
     let options = RuvsearchOptions {
         max_iter: 1,
         skip: vec![Family::TimeVarying, Family::IivOnRuv],
@@ -803,10 +702,7 @@ fn cancellation_at_the_input_and_base_fits_returns_the_input() {
     let result = run(&script, space_from(&additive, &options, true), &options);
     assert!(result.cancelled);
     assert_eq!(result.base_id, "base");
-    assert_eq!(
-        result.final_id, "input",
-        "a cancelled base cannot be the answer"
-    );
+    assert_eq!(result.final_id, "input", "a cancelled base cannot be the answer");
     assert_eq!(script.dirs(), vec!["input", "base"]);
 }
 
@@ -838,11 +734,7 @@ fn cancellation_during_the_screen_and_the_refit_keeps_the_rows_so_far() {
     script.cancel_after = Some(3);
     let result = run(&script, warfarin_space(&options), &options);
     assert!(result.cancelled);
-    let refit = result
-        .rows
-        .iter()
-        .find(|r| r.candidate == "power-1")
-        .expect("the refit row");
+    let refit = result.rows.iter().find(|r| r.candidate == "power-1").expect("the refit row");
     assert!(!refit.selected);
     assert_eq!(result.final_id, "input");
 }
@@ -860,11 +752,7 @@ fn labels_p_values_and_the_default_directory() {
     let options = RuvsearchOptions::default();
     let script = Script::new(&[("input", 100.0), ("power-1", 80.0)]);
     let result = run(&script, space(&options), &options);
-    let power = result
-        .rows
-        .iter()
-        .find(|r| r.candidate == "power-1")
-        .unwrap();
+    let power = result.rows.iter().find(|r| r.candidate == "power-1").unwrap();
     assert!(power.p_value() < 0.001, "{}", power.p_value());
     let input = result.rows.iter().find(|r| r.candidate == "input").unwrap();
     assert!(input.p_value().is_nan(), "no test on the input row");
@@ -882,8 +770,7 @@ fn a_base_that_fails_the_gate_is_an_error() {
 // ── the pre-screen ─────────────────────────────────────────────────────────
 
 fn screen_fit(
-    theta: &[(&str, f64)],
-    omega: &[(&str, f64)],
+    theta: &[(&str, f64)], omega: &[(&str, f64)],
 ) -> (Vec<String>, Vec<f64>, Vec<String>, Vec<f64>) {
     (
         theta.iter().map(|(n, _)| n.to_string()).collect(),
@@ -927,31 +814,19 @@ fn the_prescreen_refits_only_the_largest_cwres_drop_seeded_from_the_screen() {
         screen_fit(&[("TVB", 0.0), ("RUV_POW", 0.4)], &[("ETA_B", 0.01)]),
     );
     let result = run(&script, warfarin_space(&options), &options);
-    assert_eq!(
-        script.dirs(),
-        vec!["input", "screen-1", "iteration-1", "screen-2"]
-    );
+    assert_eq!(script.dirs(), vec!["input", "screen-1", "iteration-1", "screen-2"]);
     // The screen fitted the base and the three candidates, on the CWRES data.
     assert_eq!(
         script.fitted_in("screen-1"),
-        vec![
-            "cwres-base-1",
-            "cwres-IIV_on_RUV-1",
-            "cwres-power-1",
-            "cwres-combined-1"
-        ]
+        vec!["cwres-base-1", "cwres-IIV_on_RUV-1", "cwres-power-1", "cwres-combined-1"]
     );
-    let n_cwres = script
-        .data_of("screen-1")
-        .expect("screened on another dataset");
+    let n_cwres = script.data_of("screen-1").expect("screened on another dataset");
     assert!(n_cwres > 0);
     // Only the pick was refitted, seeded with `power = θ̂ + 1`.
     assert_eq!(script.fitted_in("iteration-1"), vec!["power-1"]);
     let refit = script.model_of("iteration-1", "power-1");
     assert!(
-        refit
-            .block_lines("parameters")
-            .contains(&"theta RUV_POW(1.4, 0.01, 10.0)".to_string()),
+        refit.block_lines("parameters").contains(&"theta RUV_POW(1.4, 0.01, 10.0)".to_string()),
         "{:?}",
         refit.block_lines("parameters")
     );
@@ -962,19 +837,13 @@ fn the_prescreen_refits_only_the_largest_cwres_drop_seeded_from_the_screen() {
     assert!(screened
         .iter()
         .any(|r| r.candidate == "cwres-base-1" && r.feature.is_none() && r.ofv == Some(50.0)));
-    let pick = screened
-        .iter()
-        .find(|r| r.candidate == "cwres-power-1")
-        .unwrap();
+    let pick = screened.iter().find(|r| r.candidate == "cwres-power-1").unwrap();
     assert!(pick.selected);
     assert_eq!(pick.cwres_dofv, Some(20.0));
     assert!(pick.lrt.is_none(), "a screened row carries no LRT");
     // Iteration 2 screened IIV_on_RUV only (power and combined retired) and
     // found nothing.
-    assert_eq!(
-        script.fitted_in("screen-2"),
-        vec!["cwres-base-2", "cwres-IIV_on_RUV-2"]
-    );
+    assert_eq!(script.fitted_in("screen-2"), vec!["cwres-base-2", "cwres-IIV_on_RUV-2"]);
     assert_eq!(result.final_id, "power-1");
     // The screening models are on the result, readable and compilable.
     let m = &result.models["cwres-power-1"];
@@ -1003,10 +872,7 @@ fn a_screened_pick_whose_refit_is_not_accepted_retires_its_family_and_goes_on() 
     assert_eq!(selected(&result), vec![(2, "IIV_on_RUV-2".to_string())]);
     assert_eq!(result.final_id, "IIV_on_RUV-2");
     assert_eq!(result.features, vec![RuvFeature::IivOnRuv]);
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("picked power but its refit was not accepted")));
+    assert!(result.notes.iter().any(|n| n.contains("picked power but its refit was not accepted")));
     // The third iteration had nothing left to screen.
     assert!(result.notes.iter().any(|n| n.contains("no candidate left")));
 }
@@ -1018,17 +884,10 @@ fn screening_population_is_one_record_per_finite_cwres_with_ipred_and_doses() {
         .unwrap();
     let screen = cwres::screening_population(&fit, &pop).unwrap();
     assert_eq!(screen.covariate_names, vec![cwres::IPRED_COLUMN]);
-    let n_finite: usize = fit
-        .subjects
-        .iter()
-        .map(|s| s.cwres.iter().filter(|c| c.is_finite()).count())
-        .sum();
+    let n_finite: usize =
+        fit.subjects.iter().map(|s| s.cwres.iter().filter(|c| c.is_finite()).count()).sum();
     assert_eq!(screen.n_obs(), n_finite);
-    for (s, (sr, orig)) in screen
-        .subjects
-        .iter()
-        .zip(fit.subjects.iter().zip(&pop.subjects))
-    {
+    for (s, (sr, orig)) in screen.subjects.iter().zip(fit.subjects.iter().zip(&pop.subjects)) {
         assert_eq!(s.id, orig.id);
         assert_eq!(s.doses.len(), orig.doses.len(), "doses kept for TAD");
         assert_eq!(s.observations.len(), s.obs_covariates.len());
@@ -1053,33 +912,11 @@ fn screen_inits_map_back_as_pharmpy_does() {
     fit.eta_names = vec!["ETA_B".into(), "ETA_RUV".into()];
     fit.omega = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.01, 0.2]));
     // power = θ + 1 = −0.5 → floored to 0.02.
-    assert_eq!(
-        cwres::init_from_screen(RuvFeature::Power, &fit)
-            .unwrap()
-            .value,
-        0.02
-    );
+    assert_eq!(cwres::init_from_screen(RuvFeature::Power, &fit).unwrap().value, 0.02);
     fit.theta[1] = 0.3;
-    assert!(
-        (cwres::init_from_screen(RuvFeature::Power, &fit)
-            .unwrap()
-            .value
-            - 1.3)
-            .abs()
-            < 1e-12
-    );
-    assert_eq!(
-        cwres::init_from_screen(RuvFeature::IivOnRuv, &fit)
-            .unwrap()
-            .value,
-        0.2
-    );
-    assert_eq!(
-        cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit)
-            .unwrap()
-            .value,
-        0.7
-    );
+    assert!((cwres::init_from_screen(RuvFeature::Power, &fit).unwrap().value - 1.3).abs() < 1e-12);
+    assert_eq!(cwres::init_from_screen(RuvFeature::IivOnRuv, &fit).unwrap().value, 0.2);
+    assert_eq!(cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit).unwrap().value, 0.7);
     assert!(cwres::init_from_screen(RuvFeature::Combined, &fit).is_none());
 }
 
@@ -1093,29 +930,14 @@ fn screen_inits_are_kept_inside_the_refit_box() {
     fit.theta_names = vec!["TVB".into(), "RUV_POW".into(), "RUV_TV".into()];
     fit.theta = vec![0.0, 14.0, 25.0];
     // power = 15 > POWER_UPPER (10) → upper / 2.
-    assert_eq!(
-        cwres::init_from_screen(RuvFeature::Power, &fit)
-            .unwrap()
-            .value,
-        5.0
-    );
+    assert_eq!(cwres::init_from_screen(RuvFeature::Power, &fit).unwrap().value, 5.0);
     // RUV_TV = 25 > TIME_VARYING_UPPER (10) → upper / 2; this seed used to be
     // written as `theta RUV_TV(25, 0.01, 10.0)` verbatim.
-    assert_eq!(
-        cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit)
-            .unwrap()
-            .value,
-        5.0
-    );
+    assert_eq!(cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit).unwrap().value, 5.0);
     // A screen estimate at or below zero seeds twice the lower bound, as
     // Pharmpy's `0.02` floor on the power does.
     fit.theta[2] = 0.0;
-    assert_eq!(
-        cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit)
-            .unwrap()
-            .value,
-        0.02
-    );
+    assert_eq!(cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit).unwrap().value, 0.02);
     assert_eq!(seed_inside(0.7, 0.01, 10.0), 0.7);
     assert_eq!(seed_inside(0.015, 0.01, 10.0), 0.02);
 }
@@ -1125,12 +947,8 @@ fn every_screening_model_compiles() {
     let fit = converged_fit(100.0);
     let pop = ferx_core::read_nonmem_csv(Path::new(crate::search::test_support::DATA), None, None)
         .unwrap();
-    let features = [
-        RuvFeature::IivOnRuv,
-        RuvFeature::Power,
-        RuvFeature::Combined,
-        RuvFeature::TimeVarying(1),
-    ];
+    let features =
+        [RuvFeature::IivOnRuv, RuvFeature::Power, RuvFeature::Combined, RuvFeature::TimeVarying(1)];
     let screen = cwres::Screen::build(&fit, &pop, &features, &[2.0, 6.0, 24.0], 1).unwrap();
     assert_eq!(screen.candidates.len(), 5);
     for c in &screen.candidates {

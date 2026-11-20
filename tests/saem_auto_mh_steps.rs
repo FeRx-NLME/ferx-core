@@ -95,11 +95,8 @@ fn population_with(model: &CompiledModel, n: usize, obs_times: &[f64]) -> Popula
     let sim = simulate_with_seed(model, &template, &model.default_params, 1, 20260919).unwrap();
     let mut pop = template.clone();
     for subj in pop.subjects.iter_mut() {
-        let dv: Vec<f64> = sim
-            .iter()
-            .filter(|s| s.id == subj.id)
-            .map(|s| s.outcome.continuous_value())
-            .collect();
+        let dv: Vec<f64> =
+            sim.iter().filter(|s| s.id == subj.id).map(|s| s.outcome.continuous_value()).collect();
         // A non-finite simulated concentration would otherwise be floored to a
         // valid-looking number below and the fixture would go on to "pass" on a
         // dataset that never existed.
@@ -130,9 +127,7 @@ fn dense_population(model: &CompiledModel) -> Population {
     population_with(
         model,
         20,
-        &[
-            0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0,
-        ],
+        &[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0],
     )
 }
 
@@ -158,10 +153,7 @@ fn fingerprint(res: &ferx_core::types::FitResult) -> Vec<f64> {
         v.push(res.omega[(i, i)]);
     }
     v.extend(res.sigma.iter().copied());
-    assert!(
-        v.iter().all(|x| x.is_finite()),
-        "non-finite estimate in the fingerprint: {v:?}"
-    );
+    assert!(v.iter().all(|x| x.is_finite()), "non-finite estimate in the fingerprint: {v:?}");
     v
 }
 
@@ -183,12 +175,7 @@ fn saem_default_resolves_to_the_rules_count_on_every_arm() {
 
     for (what, pop, resolved, other) in [
         ("sparse", sparse_population(&model), RESOLVED_SPARSE, 20),
-        (
-            "middling",
-            middling_population(&model),
-            RESOLVED_MIDDLING,
-            6,
-        ),
+        ("middling", middling_population(&model), RESOLVED_MIDDLING, 6),
         ("dense", dense_population(&model), RESOLVED_DENSE, 6),
     ] {
         assert_eq!(
@@ -225,11 +212,8 @@ fn conddist_pass_resolves_the_same_count_on_every_arm() {
             saem_seed: Some(99),
             ..FitOptions::default()
         };
-        let warm: Vec<DVector<f64>> = pop
-            .subjects
-            .iter()
-            .map(|_| DVector::zeros(model.n_eta))
-            .collect();
+        let warm: Vec<DVector<f64>> =
+            pop.subjects.iter().map(|_| DVector::zeros(model.n_eta)).collect();
         let warm_kappas: Vec<Vec<DVector<f64>>> = pop.subjects.iter().map(|_| Vec::new()).collect();
         let cd = run_conditional_distribution(
             &model,
@@ -239,11 +223,7 @@ fn conddist_pass_resolves_the_same_count_on_every_arm() {
             &warm_kappas,
             &opts,
         );
-        let means: Vec<f64> = cd
-            .cond_mean
-            .iter()
-            .flat_map(|m| m.iter().copied())
-            .collect();
+        let means: Vec<f64> = cd.cond_mean.iter().flat_map(|m| m.iter().copied()).collect();
         assert!(
             !means.is_empty() && means.iter().all(|x| x.is_finite()),
             "non-finite or empty conditional mean: {means:?}"
@@ -253,12 +233,7 @@ fn conddist_pass_resolves_the_same_count_on_every_arm() {
 
     for (what, pop, resolved, other) in [
         ("sparse", sparse_population(&model), RESOLVED_SPARSE, 20),
-        (
-            "middling",
-            middling_population(&model),
-            RESOLVED_MIDDLING,
-            6,
-        ),
+        ("middling", middling_population(&model), RESOLVED_MIDDLING, 6),
         ("dense", dense_population(&model), RESOLVED_DENSE, 6),
     ] {
         assert_eq!(
@@ -303,10 +278,8 @@ fn bayes_eta_block_keeps_the_historical_count() {
         fingerprint(&fit(&model, pop, &model.default_params, &opts).expect("bayes fit Ok"))
     };
 
-    for (what, pop) in [
-        ("sparse", sparse_population(&model)),
-        ("dense", dense_population(&model)),
-    ] {
+    for (what, pop) in [("sparse", sparse_population(&model)), ("dense", dense_population(&model))]
+    {
         assert_eq!(
             run(&pop, 0),
             run(&pop, HISTORICAL_COUNT),

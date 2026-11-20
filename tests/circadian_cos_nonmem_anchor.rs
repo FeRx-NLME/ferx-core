@@ -68,12 +68,8 @@ fn phi(file: &str) -> Vec<[f64; 3]> {
         .lines()
         .skip(2)
         .map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .skip(2)
-                .take(3)
-                .map(|v| v.parse().unwrap())
-                .collect();
+            let f: Vec<f64> =
+                l.split_whitespace().skip(2).take(3).map(|v| v.parse().unwrap()).collect();
             [f[0], f[1], f[2]]
         })
         .collect()
@@ -96,16 +92,8 @@ fn tab(file: &str) -> Vec<(f64, f64)> {
 
 fn prepare() -> ferx_core::PreparedRun {
     ferx_core::prepare_run(
-        root()
-            .join("nonmem_anchor/circadian_cos_fit.ferx")
-            .to_str()
-            .unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/circadian_cos.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        root().join("nonmem_anchor/circadian_cos_fit.ferx").to_str().unwrap(),
+        Some(root().join("nonmem_anchor/circadian_cos.csv").to_str().unwrap()),
     )
     .expect("the circadian anchor model must parse and bind")
 }
@@ -116,10 +104,7 @@ fn prepare() -> ferx_core::PreparedRun {
 fn circadian_cos_sin_evaluation_matches_nonmem() {
     let est = ext("circadian_cos.ext", "-1000000000");
     let prep = prepare();
-    assert!(
-        prep.parsed.model.is_algebraic(),
-        "the anchor is the $PRED path"
-    );
+    assert!(prep.parsed.model.is_algebraic(), "the anchor is the $PRED path");
     let params = prep.init_params.clone();
     // The .ferx initial estimates are the control stream's, which NONMEM echoes.
     let theta_nm: Vec<f64> = (1..=5).map(|k| est[&format!("THETA{k}")]).collect();
@@ -148,12 +133,7 @@ fn circadian_cos_sin_evaluation_matches_nonmem() {
     assert_eq!(etas.len(), f.subjects.len(), "subjects");
 
     let d_ofv = (f.ofv - est["OBJ"]).abs();
-    assert!(
-        d_ofv.is_finite(),
-        "OFV: ferx {} NONMEM {}",
-        f.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv.is_finite(), "OFV: ferx {} NONMEM {}", f.ofv, est["OBJ"]);
 
     // The phase η̂ must be live, or the anchor does not see `cos`'s argument move.
     let shift_span = etas.iter().map(|e| e[2].abs()).fold(0.0, f64::max); // nan-ok: parsed from the .phi, finite or the parse panics
@@ -176,10 +156,7 @@ fn circadian_cos_sin_evaluation_matches_nonmem() {
     let (mut d_pred, mut d_ipred) = (0.0f64, 0.0f64);
     for ((p, i), (wp, wi)) in preds.iter().zip(&rows) {
         let (dp, di) = ((p - wp).abs() / wp.abs(), (i - wi).abs() / wi.abs());
-        assert!(
-            dp.is_finite() && di.is_finite(),
-            "PRED {p}/{wp}, IPRED {i}/{wi}"
-        );
+        assert!(dp.is_finite() && di.is_finite(), "PRED {p}/{wp}, IPRED {i}/{wi}");
         d_pred = d_pred.max(dp);
         d_ipred = d_ipred.max(di);
     }
@@ -218,18 +195,10 @@ fn circadian_cos_sin_fit_matches_nonmem() {
     let se = ext("circadian_cos_cov.ext", "-1000000001");
     let se_sd = ext("circadian_cos_cov.ext", "-1000000005");
     let prep = prepare();
-    let opts = FitOptions {
-        verbose: false,
-        run_covariance_step: true,
-        ..prep.parsed.fit_options.clone()
-    };
-    let f = ferx_core::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("the circadian fit must converge");
+    let opts =
+        FitOptions { verbose: false, run_covariance_step: true, ..prep.parsed.fit_options.clone() };
+    let f = ferx_core::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("the circadian fit must converge");
 
     let d_ofv = (f.ofv - est["OBJ"]).abs();
     eprintln!("OFV: ferx {:.6} NONMEM {:.6}", f.ofv, est["OBJ"]);
@@ -246,20 +215,13 @@ fn circadian_cos_sin_fit_matches_nonmem() {
         ses.push(rel(se_theta[k], se[&name], &format!("SE {name}")));
     }
     let se_omega = f.se_omega.as_ref().expect("Ω SEs");
-    for (k, name) in ["OMEGA(1,1)", "OMEGA(2,2)", "OMEGA(3,3)"]
-        .iter()
-        .enumerate()
-    {
+    for (k, name) in ["OMEGA(1,1)", "OMEGA(2,2)", "OMEGA(3,3)"].iter().enumerate() {
         ests.push(rel(f.omega[(k, k)], est[*name], name));
         ses.push(rel(se_omega[k], se[*name], &format!("SE {name}")));
     }
     // NONMEM's SIGMA is a variance; ferx reports the proportional SD and its SE.
     ests.push(rel(f.sigma[0], est["SIGMA(1,1)"].sqrt(), "σ (SD)"));
-    ses.push(rel(
-        f.se_sigma.as_ref().expect("σ SE")[0],
-        se_sd["SIGMA(1,1)"],
-        "SE σ (SD)",
-    ));
+    ses.push(rel(f.se_sigma.as_ref().expect("σ SE")[0], se_sd["SIGMA(1,1)"], "SE σ (SD)"));
     assert!(ests.iter().all(|e| e.is_finite()), "estimates: {ests:?}");
     assert!(ses.iter().all(|e| e.is_finite()), "SEs: {ses:?}");
     let worst_est = ests.iter().fold(0.0, |w: f64, &e| w.max(e));

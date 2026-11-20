@@ -1,23 +1,14 @@
 //! Neutral dose-resolution + steady-state-equilibration primitives.
 //!
-//! These were extracted from `ode/predictions.rs` so that `pk/`, `sens/`, and
-//! `api` no longer depend *upward* on `ode/` merely to resolve modeled-`RATE`
-//! doses or to share the SS-equilibration convergence tracker. Pure code motion.
-//! `ode::predictions` *privately* imports the symbols it still uses (it does NOT
-//! re-export them as `crate::ode::…`, so the upward dependency stays removed);
-//! every other consumer reaches these through `crate::dosing::…`.
+//! Kept out of `ode/` so `pk/`, `sens/` and `api` need not depend upward on it;
+//! every consumer reaches these through `crate::dosing::…`.
 //!
-//! - Dose resolution (`resolve_subject_doses{,_with}`): the #324 single source of
-//!   truth for turning modeled-`RATE` (`RATE=-2` → modeled duration `D{cmt}`)
-//!   doses into concrete `Fixed` doses.
-//! - Exact periodic steady state (`periodic_ss_fixed_point_g`): the engine-neutral
-//!   `u_ss = (I − M)⁻¹·b` solve of a linear one-cycle map, shared by the ODE
-//!   input-rate path (#835) and the analytical event-driven walk (#908).
-//! - SS equilibration (`SS_EQUILIBRATION_CYCLES`, `SS_EQUILIBRATION_TOL`,
-//!   `ss_cycle_converged`, `SsStopTracker`, and the test-only cycle recorder):
-//!   the truncated-pulse-train *fallback* policy, used when the exact solve
-//!   declines, shared by the analytical, ODE, and sensitivity SS loops so their
-//!   troughs can't drift apart.
+//! - Dose resolution (`resolve_subject_doses{,_with}`): modeled-`RATE` doses to
+//!   concrete `Fixed` doses (#324).
+//! - Exact periodic steady state (`periodic_ss_fixed_point_g`): `u_ss = (I − M)⁻¹·b`
+//!   for a linear one-cycle map (ODE #835, analytical #908).
+//! - SS equilibration (`SS_EQUILIBRATION_*`, `ss_cycle_converged`, `SsStopTracker`):
+//!   the pulse-train fallback, shared by every SS loop so troughs can't drift apart.
 
 use crate::types::{DoseEvent, Subject};
 use std::borrow::Cow;
@@ -31,29 +22,15 @@ use std::borrow::Cow;
 /// dose is already `Fixed` (the common case — see [`Subject::all_doses_fixed`]),
 /// and an owned copy with resolved `doses` otherwise.
 ///
-/// Single source of truth: every ODE entrypoint funnels its subject through this
-/// (or the thin [`resolve_subject_doses`] wrapper) before building the dose
-/// timeline, so the integrator and SS helpers only ever see a concrete
-/// `rate`/`duration` and a coded `RATE=-2` cannot reach them unresolved.
-///
-/// The owned branch clones the whole `Subject`, not just `doses`, because the
-/// downstream machinery ([`crate::pk::event_driven::EventSchedule::for_subject`],
-/// the SS pre-equilibration, the break-time timeline) consumes a unified
-/// `&Subject` and reads `obs_times` / `pk_only_times` / `reset_times` alongside
-/// the resolved `doses`. Cloning only `doses` would force every one of those deep
-/// helpers to take the resolved doses as a separate argument — the
-/// "thread the resolved doses through every helper" design that was deliberately
-/// rejected in favour of resolving once at the entrypoint. The clone is paid
-/// only on the (uncommon) modeled-`RATE` path; the all-`Fixed` path is borrowed.
+/// Every ODE entrypoint funnels its subject through this, so a coded `RATE=-2`
+/// never reaches the integrator unresolved. The owned branch clones the whole
+/// `Subject` (not just `doses`) because downstream helpers read `obs_times` /
+/// `pk_only_times` / `reset_times` alongside the resolved doses.
 pub(crate) fn resolve_subject_doses_with<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
+    subject: &'a Subject, attr_map: &crate::types::DoseAttrMap,
     pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) -> Cow<'a, Subject> {
-    // Fast path: with no compartment-indexed attribute there can be no modeled
-    // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
-    // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
-    // here with an empty map: it would have been rejected by the data gate first.
+    // Fast path: an empty map means no modeled dose (the data gate rejects one).
     let base = lower_zero_order_ss(subject, attr_map);
     if (attr_map.is_empty() && !attr_map.has_zero_order()) || base.all_doses_fixed() {
         return base;
@@ -80,8 +57,7 @@ fn is_zero_order_ss_record(attr_map: &crate::types::DoseAttrMap, d: &DoseEvent) 
 /// refused by validation, so this names the lowered doses and only them. Every walk asks it to
 /// keep such a dose on the plain-infusion paths (no forcing onset, no `R_in_inf`).
 pub(crate) fn is_lowered_zero_order_ss(
-    attr_map: &crate::types::DoseAttrMap,
-    d: &DoseEvent,
+    attr_map: &crate::types::DoseAttrMap, d: &DoseEvent,
 ) -> bool {
     d.ss && d.ii > 0.0 && d.is_infusion() && attr_map.zero_order_slot(d.cmt_1based()).is_some()
 }
@@ -89,22 +65,14 @@ pub(crate) fn is_lowered_zero_order_ss(
 /// Rewrite every `SS=1` bolus into a pure zero-order compartment as a duration-modeled
 /// infusion (`RATE=-2` with the forcing's `dur` as its `D{cmt}`), #2786.
 ///
-/// A zero-order window *is* an infusion: rate `F·amt/dur` over `[t + lag, t + lag + dur]`. The
-/// engines already carry a steady-state infusion exactly — the periodic seed with its active and
-/// quiet windows, the pulses of an overlapping train still running after the record, the lag
-/// phase and its clamp, resets — in value and in every derivative order, including the moving
-/// window end through the modeled duration's jet. Lowering the dose reuses all of it instead of
-/// growing a second implementation of the same train for `zero_order()`; non-SS doses keep the
-/// window machinery. Borrowed (no allocation) unless a dose is rewritten.
+/// A zero-order window *is* an infusion (rate `F·amt/dur` over `[t + lag, t + lag + dur]`), and
+/// the engines already carry an SS infusion exactly in every derivative order, so lowering reuses
+/// that instead of a second SS train for `zero_order()`. Borrowed unless a dose is rewritten.
 pub(crate) fn lower_zero_order_ss<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
+    subject: &'a Subject, attr_map: &crate::types::DoseAttrMap,
 ) -> Cow<'a, Subject> {
     if !attr_map.has_zero_order()
-        || !subject
-            .doses
-            .iter()
-            .any(|d| is_zero_order_ss_record(attr_map, d))
+        || !subject.doses.iter().any(|d| is_zero_order_ss_record(attr_map, d))
     {
         return Cow::Borrowed(subject);
     }
@@ -123,11 +91,7 @@ fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::
     if subject.doses.first().is_some_and(|d| d.amt == 4321.5) {
         MARKER_LOWERINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    for d in subject
-        .doses
-        .iter_mut()
-        .filter(|d| is_zero_order_ss_record(attr_map, d))
-    {
+    for d in subject.doses.iter_mut().filter(|d| is_zero_order_ss_record(attr_map, d)) {
         d.rate_mode = crate::types::RateMode::ModeledDuration;
         d.infusion_def = crate::types::InfusionDef::DurationDefined;
         d.rate = 0.0;
@@ -141,8 +105,7 @@ fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::
 /// [`lower_zero_order_ss`] on a bound subject is a scan that borrows instead of cloning the
 /// subject on every walk of every inner solve. Borrowed unless a dose is rewritten.
 pub(crate) fn lower_population_zero_order_ss<'a>(
-    population: &'a crate::types::Population,
-    attr_map: &crate::types::DoseAttrMap,
+    population: &'a crate::types::Population, attr_map: &crate::types::DoseAttrMap,
 ) -> Cow<'a, crate::types::Population> {
     let has = |s: &Subject| s.doses.iter().any(|d| is_zero_order_ss_record(attr_map, d));
     if !attr_map.has_zero_order() || !population.subjects.iter().any(has) {
@@ -161,9 +124,7 @@ pub(crate) fn lower_population_zero_order_ss<'a>(
 /// [`resolve_subject_doses_with`] directly with a per-dose closure. See
 /// [`resolve_subject_doses_with`].
 pub(crate) fn resolve_subject_doses<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
-    params: &'a [f64],
+    subject: &'a Subject, attr_map: &crate::types::DoseAttrMap, params: &'a [f64],
 ) -> Cow<'a, Subject> {
     resolve_subject_doses_with(subject, attr_map, |_| params)
 }
@@ -171,44 +132,27 @@ pub(crate) fn resolve_subject_doses<'a>(
 /// For each slot of an ordered event timeline, the index of the **record that
 /// governs the segment ending there** (#1073).
 ///
-/// NONMEM evaluates `$PK` at every data record and then advances *to* that record,
-/// so an interval is governed by the record that **terminates** it. Anything that is
-/// not a record — a lagged dose arrival, an infusion end, a zero-order cutoff, a
-/// per-route onset — supplies no parameters: it merely subdivides the interval its
-/// enclosing record terminates, and every piece of that interval runs on that
-/// record's snapshot.
+/// NONMEM evaluates `$PK` at each record and advances *to* it, so an interval is governed
+/// by the record that **terminates** it; non-records (lagged arrival, infusion end, onset)
+/// only subdivide it. Returns indices, not values, so callers map to their own snapshot type
+/// without copying a `PkDual<Dual2<N>>` per event.
 ///
-/// `is_record(i)` reports whether timeline slot `i` is a record; the caller owns the
-/// mapping from a returned index back to its own snapshot type (`PkParams`,
-/// `PkDual<T>`, or a `&[T]` slice), which is why this resolves *indices* rather than
-/// values — materialising a `PkDual<Dual2<N>>` per event would put ~4.7 KB × n_events
-/// of copying on the FOCEI gradient hot path.
+/// Both rules must match in all four walks (`ode::predictions`, `pk::event_driven`,
+/// `sens::propagate`, `sens::ode_provider`): a difference is a cross-engine divergence that
+/// FD parity cannot see.
 ///
-/// Two rules, and both must be identical in every engine — the four walks
-/// (`ode::predictions`, `pk::event_driven`, `sens::propagate`, `sens::ode_provider`)
-/// integrate the same subject, so a difference here is a silent cross-engine
-/// divergence that `Dual2`-vs-FD parity cannot see (FD perturbs a twin's own value
-/// path, so both sides move together):
+/// 1. A record resolves to **itself**, a non-record to the **next record ahead**.
+/// 2. Past the final record, slots keep the **last record that ran** (forward fill).
+///    Not observable through predictions today (no observation follows such a boundary), but the
+///    four walks once split between the last record and the dose row, which would become live
+///    once a trailing record, a reset or a second pass reads the state.
 ///
-/// 1. A record resolves to **itself**, and a non-record to the **next record ahead**
-///    (one backward scan — the answer for a non-record lies ahead of it in the walk).
-/// 2. Past the final record there is nothing ahead to terminate the segment, so it
-///    keeps the **last record that ran** (a forward fill). Not observable through
-///    predictions today — no observation follows such a boundary — but the four walks
-///    previously split two-and-two between the last record and the dose row here, and
-///    that becomes live the moment a trailing record, a reset, or a second pass reads
-///    the state.
-///
-/// Returns `None` in every slot only when the timeline contains no record at all — a
-/// subject with no observation, no EVID=2 row and no dose, which produces no
-/// prediction.
+/// `None` in every slot only when the timeline has no record at all.
 pub(crate) fn governing_record_indices(
-    n_events: usize,
-    is_record: impl Fn(usize) -> bool,
+    n_events: usize, is_record: impl Fn(usize) -> bool,
 ) -> Vec<Option<usize>> {
     let mut acc: Vec<Option<usize>> = vec![None; n_events];
-    // Rule 1: backward scan. `seen` is set *before* `acc[i]` is written, so a record
-    // resolves to itself rather than to its successor.
+    // Rule 1: backward scan; `seen` is set before `acc[i]`, so a record maps to itself.
     let mut seen: Option<usize> = None;
     for i in (0..n_events).rev() {
         if is_record(i) {
@@ -216,8 +160,7 @@ pub(crate) fn governing_record_indices(
         }
         acc[i] = seen;
     }
-    // Rule 2: forward fill the trailing tail (the only slots the backward scan left
-    // `None`, since every slot at or before the final record saw it).
+    // Rule 2: forward fill the trailing tail.
     let mut last: Option<usize> = None;
     for slot in acc.iter_mut() {
         match *slot {
@@ -240,35 +183,18 @@ pub(crate) enum FirstRecord {
 /// The subject's **first record**, whose `$PK` snapshot seeds `init(state) = expr` (#2121).
 /// `None` when the subject has no dose, EVID=2 or observation record.
 ///
-/// NONMEM evaluates `A_0` from the `$PK` of the subject's first data record **in file
-/// order, of any kind** — an observation, an EVID=2 row or a dose
-/// (`nonmem_anchor/init_seed_tie`). ferx keeps no file order across kinds, so the order
-/// here is the walk's: smallest time, then the walk's kind order at an instant (dose record
-/// < pk-only < observation, `ode_predictions_event_driven`'s `kind_order`), then index
-/// within a kind (each vector is in file order). The reader's #614/#1810 moves make that
-/// the file order: a record listed first in a tie whose kind the walk would process late is
-/// moved one ULP earlier. The seed must follow the **same** kind order as the walk —
-/// scanning observations before pk-only rows, as every engine did before #2121, seeded an
-/// EVID=2-then-observation tie from the observation, the second record (49.6 OFV on
-/// `init_seed_tie_ofv_a`).
+/// NONMEM seeds `A_0` from the first record **in file order, of any kind**
+/// (`nonmem_anchor/init_seed_tie`). ferx uses the walk's order instead — smallest time, then
+/// kind (dose < pk-only < observation), then index — which the reader's #614/#1810 ULP moves
+/// make equal to file order. The seed must use the walk's kind order (49.6 OFV on
+/// `init_seed_tie_ofv_a` otherwise).
 ///
-/// Only `subject.doses[..n_doses]` are candidates: the adaptive frozen replay appends the
-/// controller's injected doses after the base regimen, and those are not data records.
-/// Every other caller passes `subject.doses.len()`.
-///
-/// Resets are not candidates. An EVID=3/4 row re-seeds the state from its **own** row
-/// (#1133), so a reset at or before the first other record overwrites whatever this seed
-/// put there before anything reads it.
-///
-/// Every engine resolves the seed through this one function — the dense event-driven
-/// engine, the dual (`sens/ode_provider`) walk, the adaptive driver with its frozen replay,
-/// and the compartment-state pass behind `pk::compute_predictions_with_states` (sdtab
-/// states, `[derived]`). They used to carry scans that disagreed with each other and with
-/// the walk; the state pass seeded from the first *observation's* snapshot until #2133.
+/// Only `subject.doses[..n_doses]` are candidates (the adaptive replay appends injected doses
+/// that are not data records). Resets are not candidates: they re-seed from their own row
+/// (#1133). Every engine resolves the seed through this one function (#2133).
 pub(crate) fn first_record(subject: &Subject, n_doses: usize) -> Option<FirstRecord> {
     let mut best: Option<(f64, FirstRecord)> = None;
-    // Kinds in walk order under a strict `<`, so a co-timed record of an earlier kind, and
-    // the first row of a kind, wins the tie.
+    // Kinds in walk order under a strict `<`, so the earlier kind / first row wins a tie.
     let mut consider = |t: f64, rec: FirstRecord| {
         if best.is_none_or(|(bt, _)| t < bt) {
             best = Some((t, rec));
@@ -286,62 +212,36 @@ pub(crate) fn first_record(subject: &Subject, n_doses: usize) -> Option<FirstRec
     best.map(|(_, rec)| rec)
 }
 
-/// Number of dosing cycles to simulate when pre-equilibrating an SS=1
-/// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
-/// this is comfortably past saturation — each additional cycle adds
-/// `exp(-k·II)` of the prior decay, so by N=50 the truncation tail is
-/// well below 1e-6 for any reasonable PK. The analytic-sensitivity SS
-/// equilibration (`sens::ode_provider::equilibrate_ss_state_g`) reuses this
-/// same constant so its trough can't drift from this f64 predictor (#473 review #11).
+/// Dosing cycles simulated when pre-equilibrating an SS=1 dose. For t₁/₂/II < 2 the
+/// truncation tail at N=50 is well below 1e-6. Shared with the sensitivity SS loop so
+/// their troughs can't drift (#473).
 pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 
-/// Relative-`L∞` tolerance for the steady-state equilibration **early stop** (#519). The
-/// `(apply dose; integrate II)` cycle is a geometric contraction with ratio `≈ exp(−λ·II)`;
-/// once the cycle-to-cycle state change falls below this *relative* threshold, every
-/// remaining cycle would move the trough by less still, so the truncation is already at f64
-/// precision and we stop. Conservative (`1e-12`): the dropped tail is far below the
-/// `provider`-vs-production parity tolerance, so the value is unchanged for any realistic
-/// PK. Fast disposition (`λ·II ≈ 2`) converges in ~14 cycles; slow PK (`λ·II ≈ 0.1`) never
-/// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
+/// Relative-`L∞` tolerance for the SS equilibration **early stop** (#519). The cycle is a
+/// geometric contraction (`≈ exp(−λ·II)`), so once a step is below this the truncation is at
+/// f64 precision. Conservative: the dropped tail is far below the provider-vs-production parity
+/// tolerance, so values are unchanged for any realistic PK. `λ·II ≈ 2` stops in ~14 cycles; `λ·II ≈ 0.1` runs the full
+/// [`SS_EQUILIBRATION_CYCLES`].
 pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
 
 /// Exact periodic steady state of a **linear** one-cycle map, `u_ss = (I − M)⁻¹·b`, generic over
 /// the numeric type `T` — the engine-neutral replacement for iterating a truncated pulse train.
 ///
-/// One dosing cycle of a linear disposition is an affine map `u ↦ M·u + b`, so its periodic fixed
-/// point has a closed form. The advancement is *injected* as two "one cycle from `u0`" closures —
-/// `advance_unforced` (disposition alone; builds the drift `z0` and the propagator columns of
-/// `M = e^{A·II}`) and `advance_forced` (disposition + the cycle's own dose; builds `b` and drives
-/// the linearity check). Each caller keeps its own propagation machinery while this body owns only
-/// the `T`-typed algebra: the `I − M` assembly, the
-/// [`solve_linear_system_g`](crate::sens::linsolve::solve_linear_system_g) solve, and the
-/// value-part linearity verification. Run over a dual `T` it carries `∂u_ss/∂(θ,η)` (and the 2nd
-/// order) through the solve automatically — the implicit-function derivative, with no
-/// hand-assembled `dM`/`db`.
+/// One cycle of a linear disposition is affine, `u ↦ M·u + b`. The caller injects
+/// `advance_unforced` (disposition alone: drift `z0` and the columns of `M`) and
+/// `advance_forced` (with the cycle's dose: `b` and the linearity check); this body owns the
+/// `T`-typed algebra. Over a dual `T` the solve carries `∂u_ss/∂(θ,η)` automatically.
 ///
-/// Two callers, distinguished only by how much numerical noise their propagation carries:
+/// Callers: the ODE path (#835, RK45, so `vtol` scales with its `reltol`/`abstol`; may be
+/// nonlinear) and the analytical walks (#908, exact closed-form propagators, so `reltol = abstol = 0`
+/// leaves `vtol = 1e-9·scale`, the pure rounding floor; their disposition is always linear, so the
+/// self-check is a can't-happen assertion there).
 ///
-/// * **ODE** steady-state-into-absorption (`ode::predictions::equilibrate_ss_input_rate_g`, #835)
-///   advances by RK45, so `reltol`/`abstol` are the solver's own and `vtol` below is scaled to
-///   them. Its disposition may be genuinely nonlinear, which the self-check detects.
-/// * **Analytical** event-driven SS (`pk::event_driven`, `sens::propagate`, #908) advances by the
-///   closed-form eigenmode propagators, which are exact — it passes `reltol = abstol = 0`, leaving
-///   `vtol = 1e-9·scale`, the pure floating-point rounding floor. Its disposition is *always*
-///   linear (constant-coefficient), so the self-check is a can't-happen assertion there rather
-///   than a real branch.
-///
-/// Returns `None` on a **nonlinear** map (the one-/two-cycle self-check fails), a singular `I − M`,
-/// or any non-finite intermediate. A singular `I − M` means some disposition eigenvalue is zero —
-/// a compartment that never empties — in which case no periodic steady state exists and the
-/// caller's capped pulse-train fallback (plus [`note_ss_nonconvergence_if_capped`]) is the right
-/// answer.
+/// Returns `None` on a nonlinear map, a singular `I − M` (a zero eigenvalue: no periodic SS,
+/// so the capped fallback plus [`note_ss_nonconvergence_if_capped`] applies), or a non-finite
+/// intermediate.
 pub(crate) fn periodic_ss_fixed_point_g<T, FUnf, FFor>(
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_unforced: FUnf,
-    advance_forced: FFor,
+    n: usize, ii: f64, reltol: f64, abstol: f64, advance_unforced: FUnf, advance_forced: FFor,
 ) -> Option<Vec<T>>
 where
     T: crate::sens::num::PkNum,
@@ -374,39 +274,21 @@ where
     if u_ss.iter().any(|x| !x.br_abs_lt(f64::INFINITY)) {
         return None;
     }
-    // The checks below verify the map is affine — a property of the model, not of the point —
-    // and the solution above does not depend on their verdict. Each is a branch on the
-    // difference against a tolerance, so a recording holds while the verdict does and not at the
-    // one value it saw: an exact-value guard on `u_ss` or on a cycle's result would fail at
-    // every other point and record again on every evaluation.
-    // Confirm linearity on the value part: one and two forced cycles from u_ss must both return
-    // u_ss (only an affine one-cycle map does). The tolerance is scaled to the caller's own
-    // accuracy so the fast path is not falsely abandoned at a loose `ode_reltol`; a genuinely
-    // nonlinear map diverges by O(scale) and is rejected. Two cycles (not one) rejects a weakly-
-    // nonlinear map whose true fixed point merely happens to sit within `vtol` after the first.
-    // The scale is a magnitude (`abs_hint`, no guard): it only sets how loose the bound is.
+    // Linearity check on the value part: one and two forced cycles from u_ss must both return
+    // u_ss (two rejects a weakly nonlinear map that happens to pass one). Branches on a
+    // difference vs a tolerance, so a recording holds while the verdict does; the solution
+    // itself does not depend on the verdict. The scale is a magnitude only (`abs_hint`).
     let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.abs_hint()));
-    // Verification tolerance, scaled to the caller's own accuracy. For the ODE caller the
-    // one-cycle residual of a genuinely *linear* map is not zero but a solver-noise floor: `b`
-    // (forced from a zero state) and the check below (forced from `u_ss`) integrate the same
-    // periodic `R_in` over *different* adaptive step sequences, so their forcing quadratures
-    // differ by O(reltol·scale). Empirically that floor is ≈ 45·reltol (relative) — above the
-    // original `32·reltol`, which therefore falsely declined even linear models at a tight
-    // `ode_reltol` (e.g. 1e-10), silently forcing the fallback iteration. `256·reltol` clears the
-    // floor with ~5× margin while still rejecting a genuinely nonlinear map, whose one-cycle
-    // residual is O(scale) — ~1e8·reltol, eight orders above this bound (see
-    // `ss_input_rate_nonlinear_disposition_falls_back_to_iteration`). The analytical caller passes
-    // `reltol = abstol = 0`, so the bound degenerates to the `1e-9·scale` rounding floor its exact
-    // propagators need — seven orders above their measured ~1e-16 residual and still eight orders
-    // below a nonlinear map's O(scale).
+    // A linear map's ODE residual is a solver-noise floor ≈ 45·reltol (different adaptive
+    // steps for `b` and the check); `256·reltol` clears it ~5× (the original `32·reltol` falsely
+    // declined linear models at a tight `ode_reltol`, e.g. 1e-10) while a nonlinear map's
+    // O(scale) residual (~1e8·reltol) is rejected (see
+    // `ss_input_rate_nonlinear_disposition_falls_back_to_iteration`). Analytical callers get
+    // `1e-9·scale`, seven orders above their measured ~1e-16 residual.
     let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
     // `|c − u| ≤ vtol` is `< next_up(vtol)`, exactly, for a finite `vtol`.
     let vtol_open = vtol.next_up();
-    let within = |a: &[T], b: &[T]| {
-        a.iter()
-            .zip(b)
-            .all(|(&c, &u)| c.br_absdiff_lt(u, vtol_open))
-    };
+    let within = |a: &[T], b: &[T]| a.iter().zip(b).all(|(&c, &u)| c.br_absdiff_lt(u, vtol_open));
     let u_check = advance_forced(&u_ss)?;
     if !within(&u_check, &u_ss) {
         return None;
@@ -420,33 +302,21 @@ where
 }
 
 /// Whether the SS-equilibration trough has converged between two successive cycles. Shared
-/// by the f64 predictor, the event-driven f64 loop, and the dual gradient path so every path
-/// truncates on the *same* criterion — the dual feeds the value parts (`PkNum::val`) of its
-/// state (#519), which keeps its stop cycle identical to the f64 path's, so the truncated
-/// gradient is the exact derivative of the truncated value (see [`crate::sens::propagate::ss_dual_cycle_should_stop`]).
+/// by every f64 and dual path (the dual feeds its value parts, #519) so all stop on the same
+/// cycle and the truncated gradient is the derivative of the truncated value (see
+/// [`crate::sens::propagate::ss_dual_cycle_should_stop`]).
 ///
-/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment is
-/// converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag` —
-/// negligible both relative to itself and relative to the dominant compartment. Testing the
-/// *increment* (not the magnitude) is what makes this safe in a scale-separated model: a small
-/// compartment still in transit (effect-site / metabolite many orders below central) keeps the loop
-/// running until it too stops moving, rather than being declared converged merely for being small.
-/// The `tol·max_mag` term is the absolute floor that lets a genuinely-settled near-zero compartment
-/// — where the pure relative test is ill-conditioned — pass; without it the loop could never stop.
-/// Because the stop only fires once every compartment's increment is below f64-relative precision,
-/// the value has reached its fixed point and the elided cycles do not move it — predictions are
-/// unchanged to f64 precision, and gradients match a full budget to `< 1e-6` (measured by the
-/// pre-#2093 `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`, retired in #2093;
-/// after #914 a linear disposition takes the exact fixed point, so this early stop runs only on the
-/// nonlinear fallback).
+/// Mixed test on the per-cycle **increment** (#532): `|cur − prev| ≤ tol·|cur| + tol·max_mag`.
+/// Testing the increment keeps a small compartment still in transit from passing for being
+/// small; the `tol·max_mag` floor lets a settled near-zero compartment pass (without it the loop
+/// could never stop). The stop fires only once every increment is below f64-relative precision,
+/// so predictions are unchanged to f64 precision; gradients matched a full budget to `< 1e-6`
+/// (measured pre-#2093; since #914 this early stop runs only on the nonlinear fallback).
 ///
-/// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
-/// convergence — don't early-exit and silently return a poisoned state; run the full cycle
-/// budget exactly as the pre-#519 code did so the failure surfaces identically (#532 review
-/// #4). Required because `f64::max` would otherwise *drop* a `NaN` and mask it.
+/// A non-finite compartment never converges, so a blow-up runs the full budget and surfaces
+/// (`f64::max` would otherwise drop a `NaN`).
 pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
-    // Test-only escape hatch: force every path to run the full cycle budget so a test can
-    // compare the early-stopped result against the fully-equilibrated one (#532 review #4).
+    // Test-only: force the full cycle budget to compare against the early stop (#532).
     #[cfg(test)]
     if FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get()) {
         return false;
@@ -456,9 +326,7 @@ pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
     }
     let max_mag = cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
     let atol = tol * max_mag;
-    cur.iter()
-        .zip(prev)
-        .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
+    cur.iter().zip(prev).all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
 }
 
 /// The test-only full-budget switch, for the recording type's convergence test.
@@ -467,28 +335,17 @@ pub(crate) fn force_full_ss_equilibration() -> bool {
     FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get())
 }
 
-/// Rolling prev-state tracker for the f64 SS-equilibration early stop. Owns the previous
-/// cycle's state so the f64 predictor and the event-driven f64 loop share one scaffold instead
-/// of each re-implementing the `cycle > 0` + `copy_from_slice` dance — a later tweak missed in
-/// one site would reintroduce cross-path trough drift (#532 review #6). The dual paths use the
-/// generic [`crate::sens::propagate::ss_dual_cycle_should_stop`], which applies the same
-/// [`ss_cycle_converged`] criterion to the value parts of the dual state.
+/// Rolling prev-state tracker for the f64 SS-equilibration early stop, shared by the f64
+/// loops so they cannot drift apart (#532). The dual paths use
+/// [`crate::sens::propagate::ss_dual_cycle_should_stop`] with the same criterion.
 #[derive(Default)]
 pub(crate) struct SsStopTracker {
     prev: Vec<f64>,
-    /// **Absolute** L∞ increments `max|cur − prev|` of the two most recent *non-converged*
-    /// cycles, oldest first (`[prev_increment, last_increment]`) — the geometric-tail inputs for
-    /// the #867 cycle-cap non-convergence check. Absolute (not magnitude-relative) on purpose: a
-    /// *linearly diverging* trough (mean input ≥ max elimination) takes a ~constant step on a
-    /// growing value, so its absolute ratio reads `ρ ≈ 1` ("not contracting") while a
-    /// magnitude-relative step `B/(A+Bn)` would shrink as the trough grows and hide the
-    /// divergence. Rolled only on the else branch of [`Self::should_stop`]; the dual sensitivity
-    /// paths (which reuse the same stop criterion via `ss_dual_cycle_should_stop`) don't consult
-    /// this.
+    /// **Absolute** L∞ increments of the two most recent non-converged cycles, oldest first
+    /// (#867 cap check). Absolute on purpose: a linearly diverging trough takes ~constant steps,
+    /// so its ratio reads `ρ ≈ 1`, while a relative step would shrink and hide the divergence.
     abs_increments: [f64; 2],
-    /// L∞ magnitude `max|cur|` of the most recent non-converged cycle, used to re-express the
-    /// absolute tail as a fraction of the trough actually held (and as the noise-floor scale that
-    /// gates a false "no steady state" alarm on a converged model).
+    /// L∞ magnitude of the most recent non-converged cycle (scale for the tail and noise floor).
     last_mag: f64,
 }
 
@@ -500,9 +357,7 @@ impl SsStopTracker {
             if ss_cycle_converged(cur, &self.prev, SS_EQUILIBRATION_TOL) {
                 return true;
             }
-            // Not converged this cycle: roll the two-deep absolute-increment history (and the
-            // current magnitude) so a loop that runs out the cycle budget can estimate its
-            // un-taken geometric tail and its size relative to the trough (#867).
+            // Roll the increment history for the cap check (#867).
             self.abs_increments = [self.abs_increments[1], ss_abs_increment(cur, &self.prev)];
             self.last_mag = ss_max_magnitude(cur);
         }
@@ -511,26 +366,17 @@ impl SsStopTracker {
         false
     }
 
-    /// The `(prev_abs, last_abs, last_mag)` of the two most recent non-converged cycles — the
-    /// inputs to [`note_ss_nonconvergence_if_capped`] (#867). The absolute increments are `0.0`
-    /// (and `last_mag` `0.0`) on a loop that early-stopped or ran fewer than two non-converged
-    /// cycles, which that check treats as "nothing to warn about".
+    /// `(prev_abs, last_abs, last_mag)` for [`note_ss_nonconvergence_if_capped`] (#867); all
+    /// `0.0` ("nothing to warn about") after an early stop or fewer than two such cycles.
     pub(crate) fn recent_increments(&self) -> (f64, f64, f64) {
-        (
-            self.abs_increments[0],
-            self.abs_increments[1],
-            self.last_mag,
-        )
+        (self.abs_increments[0], self.abs_increments[1], self.last_mag)
     }
 }
 
-/// Absolute L∞ change between successive SS-equilibration cycles: `max|cur − prev|` (#867). Used
-/// to estimate the geometric contraction ratio when a loop hits the cycle cap; absolute so a
-/// constant-step linear divergence reads `ρ ≈ 1`. See [`SsStopTracker::abs_increments`].
+/// Absolute L∞ change `max|cur − prev|` between SS cycles (#867); see
+/// [`SsStopTracker::abs_increments`].
 fn ss_abs_increment(cur: &[f64], prev: &[f64]) -> f64 {
-    cur.iter()
-        .zip(prev)
-        .fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()))
+    cur.iter().zip(prev).fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()))
 }
 
 /// L∞ magnitude `max|cur|` of a cycle state — the scale the absolute tail is normalised against
@@ -541,57 +387,29 @@ fn ss_max_magnitude(cur: &[f64]) -> f64 {
 
 #[cfg(test)]
 thread_local! {
-    /// Cycles the most recent SS-equilibration call ran — a **test-only** observation of the
-    /// #519 early stop, so a test can assert it fired for fast PK and ran the full budget for
-    /// slow PK (#532 review #5/#6 — otherwise the stop logic ships unverified, since the loose
-    /// end-value tolerances absorb a too-early exit). Set by the f64 predictor, the dual ODE /
-    /// closed-form loops, and the event-driven loop.
+    /// Cycles the most recent SS-equilibration call ran (test-only observation of the #519
+    /// early stop; end-value tolerances alone would absorb a too-early exit, #532).
     static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
-    /// Branch the most recent SS equilibration took — see [`SsBranch`] for why the cycle
-    /// count above is not enough.
+    /// Branch the most recent SS equilibration took — see [`SsBranch`].
     #[cfg(test)]
     static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
         const { std::cell::Cell::new(SsBranch::None) };
 
     /// The warning the most recent [`note_ss_nonconvergence_if_capped`] call on this thread
-    /// produced, or `None` — a **test-only** observation, and the only way to ask "did *this*
-    /// equilibration warn, and with what text" without reading the process-global sink.
-    ///
-    /// The sink is one `Mutex<BTreeSet<String>>` for the whole process, so no lib test can
-    /// assert on it reliably in either direction:
-    ///
-    /// * **empty** (#1289): any concurrently-running test that caps an SS equilibration inserts
-    ///   through [`note_ss_nonconvergence_if_capped`], and the reader fails on a warning it did
-    ///   not produce;
-    /// * **present** (#2071): every draining `api` entry point (`fit`, `predict`/`predict_diag`,
-    ///   the `simulate*` family, the adaptive driver) clears the sink on entry, so any
-    ///   concurrently-running lib test calling one of them can empty it between a reader's write
-    ///   and its take, and the reader fails on a message it did write.
-    ///
-    /// A reader-side mutex could fix neither: the writers and drainers are production code. This
-    /// cell is per-thread, so "did *my* equilibration warn" has a correct answer regardless of
-    /// what else is running — the same arrangement [`LAST_SS_EQUILIBRATION_CYCLES`] already uses,
-    /// and it carries the same caveat: it reports whichever call ran *last* on this thread, so
-    /// assert it only from a test that calls the equilibration helpers (or a single-subject,
-    /// non-rayon predictor over them) directly. That the noted text then reaches
-    /// `FitResult.warnings` through the sink is pinned end to end by the Tier-2 binary
-    /// `tests/ss_absorption_nonmem_anchor.rs` (`SimulationOutput.warnings` and
-    /// `FitResult.warnings`), a separate process that takes one lock around every test touching
-    /// the sink, writers and drainers included.
+    /// produced, or `None` (test-only). The process-global sink cannot be asserted on from a
+    /// lib test in either direction: concurrent tests insert into it (#1289) and draining `api`
+    /// entry points empty it (#2071). Reports the *last* call on this thread, so assert it only
+    /// from tests that call the equilibration helpers directly; the sink path end to end is
+    /// pinned by `tests/ss_absorption_nonmem_anchor.rs`.
     static LAST_SS_NONCONVERGENCE_WARNING: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 
-    /// How many times this thread has cleared or drained the SS non-convergence sink — a
-    /// **test-only** observation, so a test can assert that some call does **not** drain it
-    /// (#2071) without reading the process-global sink, which a concurrent drainer would empty
-    /// under it. Every draining `api` entry point clears on the thread that called it, so a
-    /// helper that wrongly routes through one moves this counter on the caller's thread.
+    /// How many times this thread cleared or drained the SS sink (test-only), so a test can
+    /// assert a call does **not** drain it (#2071).
     static SS_SINK_DRAINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
-    /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
-    /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
-    /// equilibration (#532 review #4).
+    /// When set, [`ss_cycle_converged`] never converges, forcing the full budget (#532).
     static FORCE_FULL_SS_EQUILIBRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -621,15 +439,8 @@ pub(crate) fn ss_sink_drains_on_this_thread() -> usize {
 /// Record the warning this SS equilibration produced, or `None` (test observation; see
 /// [`LAST_SS_NONCONVERGENCE_WARNING`]).
 ///
-/// Called with `None` at the **top of every top-level equilibration** and with the real answer
-/// by [`note_ss_nonconvergence_if_capped`]. The up-front `None` is what makes
-/// [`last_ss_equilibration_warned`] mean "did *this* call warn" rather than "did any call on
-/// this thread ever warn": the paths that succeed without ever reaching the capped fallback —
-/// the exact affine fixed point, the input-rate closed form, and the `II <= 0` /
-/// out-of-range-compartment bail-outs — return without noting anything, so without the reset a
-/// warning-producing capped run followed by an exact one would still report `true`. That is
-/// deterministic on a reused harness thread, not a race, and it is the same stale-state class
-/// the [`SsBranch::None`] reset exists for (PR #1392 review).
+/// Called with `None` at the top of every top-level equilibration, so paths that never reach
+/// the capped fallback do not report a stale warning from an earlier call on this thread.
 #[cfg(test)]
 pub(crate) fn record_ss_nonconvergence_warning(warning: Option<&str>) {
     LAST_SS_NONCONVERGENCE_WARNING.with(|c| *c.borrow_mut() = warning.map(str::to_owned));
@@ -640,44 +451,20 @@ pub(crate) fn record_ss_equilibration_cycles(n: usize) {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
 }
 
-/// Which SS-equilibration branch the most recent call took — a **test-only** observation,
-/// alongside the cycle count above.
-///
-/// The branches **fall back to one another**: the exact linear fixed point declines to
-/// Anderson, and Anderson declines to the capped pulse train. When all three are correct
-/// they return the same trough, so a value assertion cannot tell them apart — and, worse,
-/// *breaking* one silently routes to the next and the assertion stays green. That is not
-/// hypothetical: two #1139 mutations (a `NaN` anchor in `equilibrate_ss_input_rate`'s
-/// one-cycle advance, and a flat `0` anchor in the monotone input-rate train) left the whole
-/// suite passing, because the first made the exact solve decline into a correct fallback and
-/// the second sat on a branch the fixture never reached. A test that means to pin a branch's
-/// clock must assert which branch ran.
-///
-/// **One cell per thread, shared across numeric types.** The recording sites live in
-/// helpers that are generic over `T: PkNum` (`equilibrate_ss_input_rate_g`,
-/// `anderson_ss_fixed_point_g`), and `sens::ode_provider` instantiates them with a dual
-/// `T`. So a test that drives a `fit()` or an analytic dual walk observes whichever walk
-/// ran *last*, f64 or dual — not necessarily the value-path run-in it means to pin. Assert
-/// this only from a test that calls the f64 helpers directly, as the #1139 tests do. The
-/// neighbouring cycle counter has the same property and the same caveat.
+/// Which SS-equilibration branch the most recent call took (test-only). The branches fall
+/// back to one another and return the same trough, so a value assertion cannot tell them
+/// apart and a broken branch silently routes to the next (two #1139 mutations survived that
+/// way): a test pinning a branch must assert which one ran. One cell per thread shared across
+/// numeric types, so assert it only from tests that call the f64 helpers directly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum SsBranch {
-    /// No SS equilibration has completed on this thread since the last one started.
-    ///
-    /// Written at the top of `equilibrate_ss_pk_state`, so a call that **bails out early**
-    /// (`II <= 0`, an out-of-range compartment) leaves `None` rather
-    /// than the previous call's tag. That matters: without it a test asserting a branch
-    /// after a bail-out would read a stale value and pass for the wrong reason — the class
-    /// of un-failable assertion this enum exists to prevent.
+    /// No SS equilibration has completed since the last one started (reset at the top of
+    /// `equilibrate_ss_pk_state`, so an early bail-out leaves no stale tag).
     #[default]
     None,
-    /// The exact affine fixed point `(I − M)⁻¹·b` for a **bolus or infusion** dose on a
-    /// linear disposition (#914) — `equilibrate_ss_pk_state`'s `periodic_ss_fixed_point_pk`.
+    /// The exact affine fixed point `(I − M)⁻¹·b` for a bolus or infusion dose (#914).
     Exact,
-    /// The same closed form on the **input-rate** (built-in absorption) path,
-    /// `equilibrate_ss_input_rate`. Distinct from [`Self::Exact`] so an assertion can say
-    /// which of the two ran: they are different functions with different windows, and a
-    /// test naming one of them should not pass on the other.
+    /// The same closed form on the **input-rate** (built-in absorption) path.
     InputRateExact,
     /// Anderson-accelerated iteration on the same one-cycle map, for a nonlinear
     /// disposition into a built-in absorption compartment (#867).
@@ -707,13 +494,10 @@ pub(crate) fn last_ss_equilibration_cycles() -> usize {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get())
 }
 
-/// Run `f` with every SS-equilibration path forced to the full cycle budget (#532 review #4).
-/// The reset rides a drop guard so a panic in `f` cannot leave the flag set and poison a later
-/// test sharing the harness thread.
+/// Run `f` with every SS-equilibration path forced to the full cycle budget (#532). A drop
+/// guard restores the prior value, so a panic or a nested call cannot leak the flag.
 #[cfg(test)]
 pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
-    // Re-entrant: the guard restores the PRIOR value, not an unconditional `false`, so a
-    // nested call leaves the outer body running with full equilibration still forced.
     struct Reset(bool);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -730,71 +514,44 @@ pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
 
-/// The branch tag's non-test counterpart — same signature, so the call sites are
-/// unconditional. [`SsBranch`] is a fieldless enum, so naming a variant costs nothing.
+/// Non-test counterpart (same signature, so call sites are unconditional).
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_branch(_b: SsBranch) {}
 
-/// The warning observation's non-test counterpart — same signature, so the reset at the top of
-/// each top-level equilibration is unconditional and costs nothing outside tests.
+/// Non-test counterpart (same signature, so call sites are unconditional).
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_ss_nonconvergence_warning(_warning: Option<&str>) {}
 
-/// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
-/// non-converged (#867). The pulse-train equilibration
-/// (`crate::ode::predictions::equilibrate_ss_state`) is a geometric contraction with per-cycle
-/// carryover ratio `ρ ≈ exp(−λ·II)`. A heavily-accumulating **nonlinear** disposition (e.g.
-/// Michaelis–Menten with elimination half-life ≫ dosing interval `II`) drives `ρ → 1`, so the
-/// [`SS_EQUILIBRATION_CYCLES`]-capped loop stops far short of the true periodic steady state and
-/// the returned trough is materially too low — silently, until now. The un-taken tail is estimated
-/// from the last two cycle increments as `incr·ρ/(1−ρ)` (the closed sum of the remaining geometric
-/// series); when it exceeds this fraction of the trough — or the sequence is not contracting
-/// (`ρ ≥ 1`: mean input ≥ maximum elimination, so no periodic steady state exists at all) — a
-/// warning is surfaced instead of returning the under-converged value silently.
+/// Relative threshold above which a **cycle-capped** SS equilibration warns (#867). A heavily
+/// accumulating nonlinear disposition drives `ρ ≈ exp(−λ·II) → 1`, so the capped loop stops
+/// short and the trough is too low; the tail `incr·ρ/(1−ρ)` is compared against this fraction
+/// of the trough (and `ρ ≥ 1` means no periodic SS exists).
 ///
-/// This constant plays **two** roles in [`ss_equilibration_tail_warning`]: the tail threshold
-/// above, and the **noise floor** below which the last step (`abs_last / mag`) is treated as
-/// converged — suppressing a false "no steady state" alarm when a genuinely converged model runs
-/// out the cycle budget with its increments jittering at the ODE solver's own (much looser)
-/// tolerance rather than reaching the `1e-12` early-stop bit-identity.
-///
-/// `1e-2` (1%): the accurate low-accumulation cases sit at ~0% estimated tail while the
-/// pathological cases in #867 are 38–79% low, so the threshold separates them with wide margin;
-/// and 1% is ~100× the default solver `reltol = 1e-4`, so the noise floor clears the jitter with
-/// room to spare. A **linear** disposition is unaffected — it takes the exact closed-form fast
-/// path (`(I − M)⁻¹·b`, #835) and never reaches this iteration.
+/// Also the **noise floor** in [`ss_equilibration_tail_warning`] below which the last step
+/// counts as converged (solver jitter at `reltol` can run out the budget without reaching
+/// `1e-12`). `1e-2`: accurate cases sit at ~0% tail, the #867 cases are 38–79% low, and 1% is
+/// ~100× the default `reltol = 1e-4`. Linear dispositions take the exact path and never get here.
 pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 
-/// Per-run collector for steady-state equilibration non-convergence warnings (#867, #2067).
+/// Per-run collector for SS non-convergence warnings (#867, #2067).
 ///
-/// The capped pulse-train equilibration runs deep inside the per-subject prediction walk
-/// (`ode::predictions::equilibrate_ss_state`), which rayon parallelises across subjects and whose
-/// numeric signatures carry no warning channel. Threading a `&mut Vec<String>` through every
-/// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
-/// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
-/// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
-/// map, one set per *run* (the id the pool tasks carry as their fit, [`run_scope`]), and drained by
-/// every `api` boundary that returns a `warnings` channel — `fit` (which reports only its pass at
-/// the estimates, [`ss_notes_at_estimates`], #1522), `simulate_with_options_diag`,
-/// `simulate_with_uncertainty_diag`, `predict_diag` and the adaptive driver behind `simulate_adaptive` / `simulate_adaptive_from_spec` (#1652) — via
-/// [`take_ss_nonconvergence_warnings`]. Bare `predict()` / `simulate()` are wrappers over their
-/// `_diag` forms, so they drain too and discard the note with the rest of the diagnostics.
+/// The capped equilibration runs deep in the rayon-parallel prediction walk, which has no
+/// warning channel, so the (model-structural) message is deduplicated here, one `BTreeSet` per
+/// run ([`run_scope`]), and drained via [`take_ss_nonconvergence_warnings`] by every `api`
+/// boundary with a `warnings` channel (`predict_diag`, the `simulate*` `_diag` family, the
+/// adaptive driver; #1652). Writes outside any scope land in bucket `0`.
+/// [`clear_ss_nonconvergence_warnings`] on entry and the take on exit bracket the run's set, so
+/// code running inside an entry point must not call a draining one (hence
+/// `api::predict_diag_undrained` in `suggest_start::sweep`). Bare `predict()` / `simulate()`
+/// wrap their `_diag` forms, so they drain too and discard the note. Writers that do not drain
+/// (e.g. `pk::compute_predictions_with_states`) leave their note for the next draining entry
+/// point of the same run, whose clear discards it.
 ///
-/// The message is model-structural (independent of subject and of objective-eval count), so the
-/// `BTreeSet` collapses the thousands of identical writes a fit produces down to one entry, and its
-/// deterministic ordering keeps the surfaced list stable. Each draining entrypoint opens a
-/// [`run_scope`] (joining the fit it runs inside, if any), so concurrent in-process operations —
-/// the candidate fits of a model search — keep their notes apart (#2067); a write from a thread
-/// that runs no scope lands in the shared bucket `0`. [`clear_ss_nonconvergence_warnings`] on entry
-/// and [`take_ss_nonconvergence_warnings`] on exit bracket the run's own set. A draining call
-/// *nested* inside another's window of the same run clears the outer run's notes, so code that
-/// runs inside an entry point must not call one. `suggest_start::sweep`, which predicts inside
-/// `fit()` (via `inits_from_nca`), therefore uses the non-draining `api::predict_diag_undrained`
-/// rather than `predict()` (#1652 review r1 #1). Writers that do not drain (e.g. the public
-/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint of
-/// the same run, whose clear discards it.
+/// `fit` neither clears nor drains this sink: it reports the notes of its pass at the
+/// estimates ([`ss_notes_at_estimates`], #1522), and its run's search notes leave with its
+/// [`run_scope`].
 type SsSink = std::sync::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<String>>>;
 
 fn ss_nonconvergence_sink() -> &'static SsSink {
@@ -812,10 +569,7 @@ fn ss_run_key() -> u64 {
 /// run id for the operation's duration (carried by its pool tasks), a thread inside one joins it.
 /// Dropping it discards what the run left in the sink.
 pub(crate) struct SsRunScope(
-    Option<(
-        u64,
-        crate::parser::model_parser::rhs_regcode::kernel_jit::FitGuard,
-    )>,
+    Option<(u64, crate::parser::model_parser::rhs_regcode::kernel_jit::FitGuard)>,
 );
 
 pub(crate) fn run_scope() -> SsRunScope {
@@ -837,31 +591,18 @@ pub(crate) fn drop_ss_run(run: u64) {
     }
 }
 
-/// Estimate the un-taken geometric tail of a cycle-capped SS equilibration and, if it is
-/// non-negligible, deduplicate a non-convergence warning into the [`ss_nonconvergence_sink`]
-/// (#867). `early_stopped` short-circuits (the loop converged, so there is nothing to warn about);
-/// `abs_prev` / `abs_last` are the two most recent *absolute*-L∞ cycle increments and `mag` the
-/// final trough magnitude ([`SsStopTracker::recent_increments`]).
+/// Estimate the un-taken tail of a cycle-capped SS equilibration and, if non-negligible, note a
+/// warning in the [`ss_nonconvergence_sink`] (#867). Inputs from
+/// [`SsStopTracker::recent_increments`].
 pub(crate) fn note_ss_nonconvergence_if_capped(
-    early_stopped: bool,
-    abs_prev: f64,
-    abs_last: f64,
-    mag: f64,
+    early_stopped: bool, abs_prev: f64, abs_last: f64, mag: f64,
 ) {
     let warning = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag);
-    // Recorded on EVERY call, not only the warning ones, so a capped run that converges clears
-    // a warning left by an earlier capped run on the same harness thread (#1289). The paths that
-    // never reach here at all are covered by the up-front `None` each top-level equilibration
-    // records — see `record_ss_nonconvergence_warning`.
+    // Recorded on every call so a converged run clears an earlier warning (#1289).
     record_ss_nonconvergence_warning(warning.as_deref());
     if let Some(msg) = warning {
         let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
-        if let Some(set) = ss_at_estimates()
-            .lock()
-            .as_mut()
-            .ok()
-            .and_then(|m| m.get_mut(&fit))
-        {
+        if let Some(set) = ss_at_estimates().lock().as_mut().ok().and_then(|m| m.get_mut(&fit)) {
             set.insert(msg.clone());
         }
         if let Ok(mut m) = ss_nonconvergence_sink().lock() {
@@ -884,11 +625,7 @@ fn ss_at_estimates() -> &'static SsSink {
 /// `CL ≈ 1e-46` — while the estimates have one.
 pub(crate) fn ss_notes_at_estimates<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
     let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
-    let at = || {
-        ss_at_estimates()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
+    let at = || ss_at_estimates().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     at().insert(fit, Default::default());
     let r = f();
     let notes = at().remove(&fit).unwrap_or_default();
@@ -896,49 +633,24 @@ pub(crate) fn ss_notes_at_estimates<R>(f: impl FnOnce() -> R) -> (R, Vec<String>
 }
 
 /// Build the #867 non-convergence warning from the last two **absolute** cycle increments and the
-/// final trough magnitude, or `None` when the equilibration is trustworthy. Split out from
-/// [`note_ss_nonconvergence_if_capped`] so the geometric-tail arithmetic is unit-testable without
-/// touching the global sink.
+/// final trough magnitude, or `None` when the equilibration is trustworthy.
 ///
-/// `ρ = abs_last / abs_prev` is the estimated per-cycle carryover ratio (absolute, so a
-/// constant-step linear divergence reads `ρ ≈ 1`); `rel_last = abs_last / mag` is the last step as
-/// a fraction of the trough. The remaining relative error is the closed geometric tail
-/// `rel_last·ρ/(1−ρ)`. Two guards keep this from crying wolf on a *converged* model:
-///
-/// * **Noise floor** — early-stop needs consecutive troughs within `SS_EQUILIBRATION_TOL` (1e-12),
-///   but the ODE solver's own relative tolerance (default `reltol = 1e-4`) is orders of magnitude
-///   looser, so a genuinely converged model can run out the whole cycle budget with its increments
-///   jittering at the solver noise floor rather than reaching bit-identity. There `ρ` is pure
-///   noise and lands `≥ 1` about half the time — which would fire the scariest "no steady state"
-///   message on correct output. The `rel_last ≤ SS_WARN_REL_TOL` short-circuit suppresses that:
-///   once the last step is under 1% of the trough the model has effectively converged regardless
-///   of the noisy ratio. The floor is *not* applied to the contracting (`ρ < 1`) branch, where a
-///   near-`ρ=1` heavy-accumulation model legitimately takes a small step yet still has a large
-///   summed tail.
-/// * `ρ ≥ 1` (or non-finite) means the sequence is not contracting — no periodic steady state —
-///   and warns *only* once past the noise floor.
+/// `ρ = abs_last / abs_prev`; `rel_last = abs_last / mag`; the remaining error is the geometric
+/// tail `rel_last·ρ/(1−ρ)`. `ρ ≥ 1` (not contracting, no periodic SS) warns only past the
+/// `rel_last ≤ SS_WARN_REL_TOL` noise floor, where solver jitter makes `ρ` meaningless. The
+/// floor is not applied to the `ρ < 1` branch: a near-1 ratio has a small step but a large tail.
 fn ss_equilibration_tail_warning(
-    early_stopped: bool,
-    abs_prev: f64,
-    abs_last: f64,
-    mag: f64,
+    early_stopped: bool, abs_prev: f64, abs_last: f64, mag: f64,
 ) -> Option<String> {
-    // Converged (broke out early), or nothing moving in the last cycle → trustworthy trough.
     if early_stopped || abs_last <= 0.0 {
         return None;
     }
-    // A blown-up integration (non-finite state) or an all-zero trough gives no scale to normalise
-    // against — don't manufacture a tail estimate from garbage. Mirrors the non-finite guard in
-    // [`ss_cycle_converged`] (the failure surfaces elsewhere as a non-finite prediction / OFV).
+    // Non-finite or all-zero state: no scale (a blow-up surfaces elsewhere as a non-finite OFV).
     if !abs_last.is_finite() || !mag.is_finite() || mag <= 0.0 {
         return None;
     }
-    // Last step as a fraction of the trough we hold — the noise-floor gate for the ρ ≥ 1 branch
-    // below and the scale for the tail estimate.
     let rel_last = abs_last / mag;
-    // Can't estimate ρ without a prior increment; a still-moving final cycle with no history is
-    // too little signal to cry non-convergence on. (Only happens if the very last cycle is the
-    // first non-converged one, which the cycle cap makes vanishingly unlikely.)
+    // No prior increment: too little signal to estimate ρ.
     if abs_prev <= 0.0 {
         return None;
     }
@@ -947,12 +659,8 @@ fn ss_equilibration_tail_warning(
         return None;
     }
     if rho >= 1.0 {
-        // Not contracting → no periodic steady state. But this is where solver-noise jitter on a
-        // *converged* model (last step at the ODE-tolerance floor, so `ρ` is meaningless and lands
-        // ≥ 1 about half the time) would otherwise fire the scariest message on correct output.
-        // Gate it on the last step being a real fraction of the trough. Applied *here only*, never
-        // to the contracting branch below — a near-`ρ=1` heavy-accumulation model legitimately
-        // takes a small step yet sums to a large tail, and must still warn.
+        // Not contracting → no periodic SS, unless the step is solver noise (noise floor; this
+        // branch only, see the doc comment).
         if rel_last <= SS_WARN_REL_TOL {
             return None;
         }
@@ -964,14 +672,10 @@ fn ss_equilibration_tail_warning(
              capacity). The returned SS trough is unreliable.",
         ));
     }
-    // Remaining tail relative to the (under-converged) *current* trough — the natural scale for
-    // the threshold, since that is what we hold.
+    // Remaining tail relative to the current (under-converged) trough.
     let remaining_vs_current = rel_last * rho / (1.0 - rho);
     if remaining_vs_current > SS_WARN_REL_TOL {
-        // Re-express as a fraction of the *true* steady state `u_ss ≈ u_last·(1 + tail)` for the
-        // human-facing "% below true SS" — the framing #867's evidence table uses (its 38% row is
-        // `remaining_vs_current ≈ 0.61`, i.e. 0.61/1.61 ≈ 38%). Reporting the ÷u_last figure would
-        // overstate the bias.
+        // Reported against the true SS `u_last·(1 + tail)` (#867: 0.61/1.61 ≈ 38%).
         let pct_below_true = 100.0 * remaining_vs_current / (1.0 + remaining_vs_current);
         return Some(format!(
             "Steady-state (SS=1) equilibration reached the {SS_EQUILIBRATION_CYCLES}-cycle cap \
@@ -1021,10 +725,7 @@ mod ss_warn_tests {
         // Not contracting (`ρ = 2`) and past the noise floor (last step 20% of the trough).
         let want = ss_equilibration_tail_warning(false, 1.0, 2.0, 10.0).expect("fixture warns");
         note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
-        assert_eq!(
-            last_ss_equilibration_warning().as_deref(),
-            Some(want.as_str())
-        );
+        assert_eq!(last_ss_equilibration_warning().as_deref(), Some(want.as_str()));
         assert!(last_ss_equilibration_warned());
         note_ss_nonconvergence_if_capped(true, 1.0, 2.0, 10.0);
         assert_eq!(last_ss_equilibration_warning(), None);
@@ -1070,13 +771,9 @@ mod ss_warn_tests {
             assert_ne!(fit, 0, "a top-level run opens a scope");
             // The write comes from another thread running the run's id, as a pool task does.
             std::thread::scope(|s| {
-                s.spawn(|| {
-                    in_fit(fit, || {
-                        note_ss_nonconvergence_if_capped(false, 1.0, 2.0, mag)
-                    })
-                })
-                .join()
-                .unwrap();
+                s.spawn(|| in_fit(fit, || note_ss_nonconvergence_if_capped(false, 1.0, 2.0, mag)))
+                    .join()
+                    .unwrap();
             });
             gate.wait(); // both runs have written before either reads
             (fit, take_ss_nonconvergence_warnings())
@@ -1114,84 +811,47 @@ mod ss_warn_tests {
         assert_eq!(ss_sink_drains_on_this_thread(), before + 2);
     }
 
+    /// Inputs that must not warn: early stop; negligible tail (ρ = 0.1, 5% step → 0.6%);
+    /// solver-noise jitter at ~1e-4 with ρ ≥ 1 and ρ < 1 (#867 review); zero or missing
+    /// increments; non-finite or zero magnitude.
     #[test]
-    fn early_stop_never_warns() {
-        assert!(ss_equilibration_tail_warning(true, 0.5, 0.4, 1.0).is_none());
+    fn trustworthy_equilibrations_do_not_warn() {
+        for (early, prev, last, mag) in [
+            (true, 0.5, 0.4, 1.0),
+            (false, 0.5, 0.05, 1.0),
+            (false, 1.0e-4, 1.1e-4, 1.0),
+            (false, 1.2e-4, 1.0e-4, 1.0),
+            (false, 0.0, 0.0, 1.0),
+            (false, 0.1, 0.0, 1.0),
+            (false, 0.0, 0.05, 1.0),
+            (false, 1.0, f64::INFINITY, 1.0),
+            (false, 1.0, 0.05, f64::INFINITY),
+            (false, 1.0, 0.05, f64::NAN),
+            (false, 0.1, 0.05, 0.0),
+        ] {
+            assert!(
+                ss_equilibration_tail_warning(early, prev, last, mag).is_none(),
+                "{early} {prev} {last} {mag}"
+            );
+        }
     }
 
+    /// Inputs that must warn, with the expected text: slow contraction (ρ = 0.9 → ~45% tail);
+    /// a small step below the noise floor with ρ = 0.98 (~25% tail: the floor must not apply to
+    /// the contracting branch, #874); growing and constant absolute steps (no periodic SS).
     #[test]
-    fn negligible_tail_does_not_warn() {
-        // ρ = 0.1 (fast contraction), last step 5% of trough: remaining ≈ 0.05·0.1/0.9 ≈ 0.6% < 1%
-        // → trustworthy (exercises the contracting branch, not the noise floor).
-        assert!(ss_equilibration_tail_warning(false, 0.5, 0.05, 1.0).is_none());
-    }
-
-    #[test]
-    fn slow_contraction_warns_biased_low() {
-        // ρ = 0.9, last step 5% of trough → remaining ≈ 0.05·9 = 45% ≫ 1%.
-        let w = ss_equilibration_tail_warning(false, 0.05 / 0.9, 0.05, 1.0).expect("should warn");
-        assert!(w.contains("below the true periodic steady state"), "{w}");
-    }
-
-    #[test]
-    fn non_contracting_warns_no_steady_state() {
-        // Increment growing (ρ > 1), well above the noise floor: no periodic steady state.
-        let w = ss_equilibration_tail_warning(false, 0.02, 0.03, 1.0).expect("should warn");
-        assert!(w.contains("not contracting"), "{w}");
-        assert!(w.contains("no periodic steady state"), "{w}");
-    }
-
-    #[test]
-    fn constant_step_divergence_warns_no_steady_state() {
-        // A linearly diverging trough takes a ~constant *absolute* step → ρ ≈ 1 → "no steady
-        // state". (The pre-fix relative-increment form would have shrunk the step as the trough
-        // grew, hidden the divergence, and mislabeled it "~50% below true SS".)
-        let w = ss_equilibration_tail_warning(false, 0.02, 0.02, 1.0).expect("should warn");
-        assert!(w.contains("no periodic steady state"), "{w}");
-    }
-
-    #[test]
-    fn noise_floor_suppresses_false_no_steady_state() {
-        // A *converged* model that ran the full budget: increments jitter at the solver noise
-        // floor (rel step ~1e-4 ≪ 1%), and noise makes abs_last ≥ abs_prev (ρ ≥ 1). Must NOT fire
-        // the "no steady state" alarm (the pre-fix code did). This is the #867-review regression.
-        assert!(ss_equilibration_tail_warning(false, 1.0e-4, 1.1e-4, 1.0).is_none());
-        // Same jitter with ρ < 1 is likewise trustworthy.
-        assert!(ss_equilibration_tail_warning(false, 1.2e-4, 1.0e-4, 1.0).is_none());
-    }
-
-    #[test]
-    fn small_step_large_tail_still_warns_near_rho_one() {
-        // Heavy accumulation: the last step is only 0.5% of the trough — *below* the 1%
-        // `SS_WARN_REL_TOL` noise floor — yet ρ = 0.98 sums to a large tail (remaining ≈
-        // 0.005·0.98/0.02 ≈ 25%). The noise floor must NOT suppress this: it is applied only to the
-        // ρ ≥ 1 branch, never to the contracting branch (regression guard for the #874-review fix,
-        // where an over-broad floor silenced exactly the #867 target cases).
-        let w =
-            ss_equilibration_tail_warning(false, 0.005 / 0.98, 0.005, 1.0).expect("should warn");
-        assert!(w.contains("below the true periodic steady state"), "{w}");
-    }
-
-    #[test]
-    fn zero_increment_is_trustworthy() {
-        assert!(ss_equilibration_tail_warning(false, 0.0, 0.0, 1.0).is_none());
-        assert!(ss_equilibration_tail_warning(false, 0.1, 0.0, 1.0).is_none());
-    }
-
-    #[test]
-    fn no_prior_increment_is_trustworthy() {
-        // Moving last step (past the noise floor) but no prior increment to estimate ρ from.
-        assert!(ss_equilibration_tail_warning(false, 0.0, 0.05, 1.0).is_none());
-    }
-
-    #[test]
-    fn non_finite_or_zero_magnitude_does_not_warn() {
-        // Blown-up state (non-finite increment or magnitude) or an all-zero trough → no scale to
-        // normalise against, so no manufactured warning (mirrors ss_cycle_converged's guard).
-        assert!(ss_equilibration_tail_warning(false, 1.0, f64::INFINITY, 1.0).is_none());
-        assert!(ss_equilibration_tail_warning(false, 1.0, 0.05, f64::INFINITY).is_none());
-        assert!(ss_equilibration_tail_warning(false, 1.0, 0.05, f64::NAN).is_none());
-        assert!(ss_equilibration_tail_warning(false, 0.1, 0.05, 0.0).is_none());
+    fn untrustworthy_equilibrations_warn() {
+        let below = "below the true periodic steady state";
+        for (prev, last, want) in [
+            (0.05 / 0.9, 0.05, below),
+            (0.005 / 0.98, 0.005, below),
+            (0.02, 0.03, "not contracting"),
+            (0.02, 0.03, "no periodic steady state"),
+            (0.02, 0.02, "no periodic steady state"),
+        ] {
+            let w = ss_equilibration_tail_warning(false, prev, last, 1.0).expect("should warn");
+            assert!(w.contains(want), "{w}");
+        }
     }
 
     #[test]
@@ -1203,47 +863,25 @@ mod ss_warn_tests {
     }
 }
 
-/// `is_infusion()` only checks `rate > 0`, but a degenerate row with
-/// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
-/// (or NaN). Treating those as infusions would push an infusion-end
-/// break that sorts before the dose itself, and NaN would panic the
-/// break-time sort. Such rows fall back to the bolus branch instead
-/// (a zero/negative bolus update — visible, not silently dropped).
+/// Whether `d` is a usable infusion. `is_infusion()` only checks `rate > 0`; a degenerate row
+/// with `duration <= 0` or NaN would break the break-time sort, so it falls back to a bolus (a
+/// zero/negative bolus update — visible, not silently dropped).
 pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
-    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
-    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
-    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
-    // tests rather than silently mis-handling it (an unresolved modeled dose has
-    // `duration == 0`, so it would quietly degrade to a bolus).
+    // Tripwire (#324): modeled-RATE doses must be resolved before any infusion logic.
     debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
-/// Whether a zero-order input into this dose's compartment has a rate channel at all —
-/// the compartment half of "this infusion contributes a `+rate`", spelled **once** for
-/// every engine (#1077).
+/// Whether a zero-order input into this dose's compartment has a rate channel at all,
+/// spelled once for every engine (#1077).
 ///
-/// `CMT=0` is NONMEM's *default dose compartment*: defined for a bolus, where both
-/// engines resolve it to state index 0 (#899), and **not** defined for a zero-order
-/// input, which has no default target. `check_dose_compartments` rejects such a row
-/// outright (`E_DOSE_CMT_NOT_INFUSABLE`, both engines), so this is reachable only from a
-/// hand-built spec that runs no validation — but *there* every engine has to read it the
-/// same way, which is the whole reason it is one function.
+/// `CMT=0` is NONMEM's default dose compartment for a bolus (#899) but undefined for a
+/// zero-order input. Validation rejects such a row (`E_DOSE_CMT_NOT_INFUSABLE`), so this only
+/// matters for unvalidated specs, where every engine must agree: a rate-off site that skipped
+/// this test moved `∂f/∂η_LAG` by `+1.8878965164` where FD reads `0.0`.
 ///
-/// Two callers, and #1077 is both of them disagreeing in turn. The value path
-/// ([`crate::ode::predictions::infusion_contributes`]) once had no compartment test at
-/// all and delivered such an infusion while the analytic sensitivity walk
-/// (`sens/ode_provider.rs`) dropped it — a *value* divergence, closed by #1196 step 3
-/// giving the value path this test. What that left was the walk disagreeing with
-/// **itself**: four rate-*on* sites spelled `cmt_raw() >= 1` and the rate-*off* saltation
-/// at `K_INF_END` did not, so a lagged `CMT=0` infusion delivered nothing (`f ≡ 0`, both
-/// engines) yet moved `∂f/∂η_LAG` by `+1.8878965164` at the first observation past the
-/// window end, where central FD of the predictor is exactly `0.0`.
-///
-/// Deliberately **not** folded into [`is_real_infusion`]: that predicate answers "are
-/// this row's `rate`/`duration` usable", the break-time builders ask it about every
-/// infusion including a `CMT=0` one (they must still break at its window end for the
-/// segment structure to line up), and only the *forcing* sites ask this.
+/// Not folded into [`is_real_infusion`]: break-time builders still break at a `CMT=0`
+/// infusion's window end; only the forcing sites ask this.
 #[inline]
 pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
     d.cmt_raw() != 0
@@ -1258,28 +896,14 @@ pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
 /// **record** and flowed forward to the lagged arrival (#1121), rather than
 /// equilibrated at the arrival itself.
 ///
-/// NONMEM runs `$PK` at the dose row, loads the steady-state compartments there,
-/// and then ADVANs to the lagged arrival under the record that *terminates* that
-/// interval. Equilibrating at the arrival instead computes the trough throughout
-/// under the dose row's snapshot. The two agree exactly under flat covariates —
-/// a full-cycle propagation from phase `II − lag` returns to the trough — which
-/// is why the difference stayed invisible until a covariate changed inside the
-/// pre-arrival window.
+/// NONMEM loads SS compartments at the dose row and ADVANs to the lagged arrival under the
+/// record terminating that interval; this only differs from equilibrating at the arrival when
+/// a covariate changes inside the pre-arrival window. `lag == 0` is excluded: record and
+/// arrival coincide, and a full extra cycle would only add solver error.
 ///
-/// `lag == 0` is excluded deliberately: record and arrival are the same instant,
-/// so there is nothing to propagate, and routing it through
-/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
-/// existing non-lagged SS result by solver error, for no gain.
-///
-/// Every call site reads this predicate rather than re-deriving the condition, and
-/// the arrival side reads its complement [`ss_equilibrates_at_arrival`], so the seed
-/// and the arrival-side equilibration cannot drift into overlapping (double-load,
-/// #1275) or disjoint (no-load) coverage — and the analytic twin
-/// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
-/// timeline break fires on exactly the doses production seeds. A twin that seeded
-/// on a wider or narrower set would disagree with production in *value*, which is
-/// the one thing the `fd_oracle` / `parity` tests (`sens/ode_adjoint_tests.rs`), which
-/// difference the production objective, cannot forgive.
+/// Every call site (including the analytic twin's `K_SS_SEED` break) reads this predicate and
+/// the arrival side its complement [`ss_equilibrates_at_arrival`], so coverage can neither
+/// overlap (double load, #1275) nor leave a gap.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     ss_seeded_at_record_g(dose, lag)
 }
@@ -1293,29 +917,17 @@ pub(crate) fn ss_seeded_at_record_g<G: crate::sens::num::PkNum>(dose: &DoseEvent
 /// Whether this steady-state dose's periodic state is equilibrated at its
 /// **arrival** — the complement of [`ss_seeded_at_record`] within the `SS` doses.
 ///
-/// **A lagged steady-state dose's state is loaded once, at its record; its arrival
-/// adds only the pulse** (#1275). Only an `SS` dose that was *not* seeded at its
-/// record — `lag == 0`, where record and arrival are the same instant — equilibrates
-/// here. Every value-path walk (the dense ODE walks, the ODE and closed-form
-/// event-driven walks, the dual ODE walk) reads this one spelling, so a walk
-/// cannot seed a dose at its record and then load it a second time at its arrival.
-///
-/// The dense walks used to re-equilibrate at the arrival whenever
-/// [`ss_arrival_is_trough`] held (`lag ≤ II`), on the grounds that the flowed state
-/// *is* the trough. It is — but only for the `SS` dose's own contribution. A second
-/// dose landing inside the pre-arrival window `(record, arrival)` is in the flowed
-/// state too, and re-equilibrating replaced the whole state vector with the
-/// periodic trough, erasing that dose: measured up to **−54 %** against NONMEM
-/// (`nonmem_anchor/ss_arrival_flow_*`, ADVAN13; `ss_reset_tie_*`, ADVAN2), while the
-/// event-driven walks, which already flowed, matched.
+/// A lagged SS dose's state is loaded once, at its record; its arrival adds only the pulse
+/// (#1275). Re-equilibrating at the arrival would also erase any dose landing inside
+/// `(record, arrival)`: up to **−54 %** against NONMEM (`nonmem_anchor/ss_arrival_flow_*`,
+/// `ss_reset_tie_*`). Every value-path walk reads this one spelling.
 pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
     ss_equilibrates_at_arrival_g(dose, lag)
 }
 
 /// [`ss_equilibrates_at_arrival`] for a lag of any type (#2786).
 pub(crate) fn ss_equilibrates_at_arrival_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: G,
+    dose: &DoseEvent, lag: G,
 ) -> bool {
     dose.ss && dose.ii > 0.0 && !ss_seeded_at_record_g(dose, lag)
 }
@@ -1326,22 +938,10 @@ pub(crate) fn ss_equilibrates_at_arrival_g<G: crate::sens::num::PkNum>(
 /// lagtime shorter than one interval puts it at `dose.time + lag − II` and the
 /// record reads the previous cycle's tail at phase `II − lag`.
 ///
-/// # `lag ≥ II` clamps rather than wraps — measured, not assumed
-///
-/// A lagtime of a full interval or more has no phase `II − lag`. NONMEM 7.6.0
-/// **clamps** it to zero: the pulse lands on the record itself, so the record
-/// carries the steady-state *peak* (`nonmem_anchor/results/ss_lag_ge_ii.tab`,
-/// where an `ALAG1 = 15`, `II = 12` bolus reads `PRED(0) = 13.197 =
-/// (D/V)/(1 − e^{−k·II})`, the post-pulse peak, and decays from there with no
-/// intervening pulse before the real arrival at `t = 15`). It does **not** wrap
-/// the phase into `[0, II)`: wrapping would put `PRED(0)` at `2.1815` instead.
-///
-/// Clamping is also the only continuous choice, which matters because `ALAG` is
-/// routinely *estimated*: as `lag → II⁻` the phase tends to `0⁺` (the pulse has
-/// just landed) and at `lag = II` it is `0` (the pulse lands here), so nothing
-/// jumps as the outer optimizer walks a lagtime across the interval. Wrapping
-/// would step the whole pre-arrival window by a factor of `e^{−k·II}` at that
-/// crossing.
+/// `lag ≥ II` **clamps** to phase 0, as NONMEM 7.6.0 does
+/// (`nonmem_anchor/results/ss_lag_ge_ii.tab`: `ALAG1 = 15`, `II = 12` reads the SS peak
+/// `PRED(0) = 13.197`; wrapping would give `2.1815`). Clamping is also continuous in an
+/// estimated `ALAG` across `lag = II`, where wrapping would jump by `e^{−k·II}`.
 pub(crate) fn ss_seed_phase(dose: &DoseEvent, lag: f64) -> f64 {
     (dose.ii - lag).max(0.0)
 }
@@ -1393,9 +993,7 @@ pub(crate) fn ss_overlap_split_g<G: crate::sens::num::PkNum>(t_inf: G, ii: f64) 
 /// not a physical reading of a 600 mg dose. ferx does not reproduce it; see
 /// `docs/model-file/lagtime.qmd`.
 pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: G,
-    t_inf: G,
+    dose: &DoseEvent, lag: G, t_inf: G,
 ) -> (G, usize) {
     let psi = if ss_seeded_at_record_g(dose, lag) {
         ss_seed_phase_g(dose, lag)
@@ -1403,11 +1001,7 @@ pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
         G::from_f64(dose.ii)
     };
     let first = t_inf - psi;
-    let n = if dose.ss && dose.ii > 0.0 {
-        count_gt_multiples(first, dose.ii)
-    } else {
-        0
-    };
+    let n = if dose.ss && dose.ii > 0.0 { count_gt_multiples(first, dose.ii) } else { 0 };
     (first, n)
 }
 
@@ -1424,11 +1018,7 @@ pub(crate) fn count_gt_multiples<G: crate::sens::num::PkNum>(x: G, ii: f64) -> u
     }
     // value-read-ok: an estimate; the two comparisons recorded below pin `n`, the value is not a decision
     let v = x.probe_value();
-    let mut n = if v.is_finite() {
-        (v / ii).ceil() as usize
-    } else {
-        usize::MAX
-    };
+    let mut n = if v.is_finite() { (v / ii).ceil() as usize } else { usize::MAX };
     n = n.max(1);
     // The loop's own arithmetic `n as f64 * ii`; correct the estimate by rounding.
     if n < (1usize << 52) {
@@ -1501,11 +1091,7 @@ impl ResidualEnds {
 /// split is read from the value; a recording type guards both sides of it (`end(j0−1) >
 /// horizon`, `end(j0) ≤ horizon`) so the kept set is what a replay at other parameters keeps.
 pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
-    t: f64,
-    first: G,
-    ii: f64,
-    n: usize,
-    horizon: f64,
+    t: f64, first: G, ii: f64, n: usize, horizon: f64,
 ) -> std::ops::Range<usize> {
     use crate::sens::num::BranchCmp::{Gt, Le};
     // value-read-ok: an estimate of the split; the two comparisons recorded below pin it
@@ -1520,16 +1106,11 @@ pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
     j0..n
 }
 
-/// The number of [`ss_residual_ends`]'s pulses of `dose` still running at `lo` (end `≥ lo`), the
-/// window `dur_eff` and `lo` numbers of the caller's type. The count is estimated from the
-/// values and pinned by the two comparisons either side of it, recorded as branches by a
-/// recording type (as [`residual_end_indices_g`]), so a replay at other parameters keeps the
-/// pulses it kept.
+/// The number of [`ss_residual_ends`]'s pulses of `dose` still running at `lo` (end `≥ lo`),
+/// estimated from values and pinned by two recorded comparisons (as
+/// [`residual_end_indices_g`]).
 pub(crate) fn ss_residual_count_ending_at_or_after_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: f64,
-    dur_eff: G,
-    lo: G,
+    dose: &DoseEvent, lag: f64, dur_eff: G, lo: G,
 ) -> usize {
     use crate::sens::num::BranchCmp::{Ge, Lt};
     if !is_real_infusion(dose) {
@@ -1560,26 +1141,15 @@ pub(crate) fn ss_residual_ends(dose: &DoseEvent, lag: f64, f_bio: f64) -> Residu
     } else {
         (0.0, 0)
     };
-    ResidualEnds {
-        t: dose.time,
-        first,
-        ii: dose.ii,
-        n,
-    }
+    ResidualEnds { t: dose.time, first, ii: dose.ii, n }
 }
 
 /// [`ss_residual_ends`]'s stop times lying in `[lo, hi]` — the span a caller integrates over;
 /// an end outside it is never reached (the pulse still counts in the rate, through `n`).
 pub(crate) fn ss_residual_infusion_ends(
-    dose: &DoseEvent,
-    lag: f64,
-    f_bio: f64,
-    lo: f64,
-    hi: f64,
+    dose: &DoseEvent, lag: f64, f_bio: f64, lo: f64, hi: f64,
 ) -> impl Iterator<Item = f64> {
-    ss_residual_ends(dose, lag, f_bio)
-        .within(lo, hi)
-        .map(|(_, e)| e)
+    ss_residual_ends(dose, lag, f_bio).within(lo, hi).map(|(_, e)| e)
 }
 
 /// Whether flowing a seeded steady-state dose from its record to its lagged
@@ -1587,25 +1157,13 @@ pub(crate) fn ss_residual_infusion_ends(
 /// a path that writes the trough at the arrival instead of propagating there gets
 /// the same number for that dose.
 ///
-/// The seed sits at phase [`ss_seed_phase`] and the arrival is `lag` later, so
-/// the flowed phase is `(II − lag) + lag = II ≡ 0⁻`, the trough, for every
-/// `lag ≤ II`. Past that the clamp pins the seed at phase 0 and the arrival lands
-/// at phase `lag > II` — strictly further down the same decay than the trough —
-/// so taking the trough there silently *raises* the state back to a full cycle's
-/// accumulation. Measured at **+4.3 %** on an `ALAG1 = 15`, `II = 12` bolus at
-/// `t = 26` (`nonmem_anchor/results/ss_lag_ge_ii`).
+/// The flowed phase is `(II − lag) + lag = II`, the trough, for `lag ≤ II`; past that the
+/// clamp lands the arrival further down the decay, and taking the trough would read **+4.3 %**
+/// high (`ALAG1 = 15`, `II = 12`, `t = 26`, `nonmem_anchor/results/ss_lag_ge_ii`).
 ///
-/// Its one reader is the analytic superposition (`pk/mod.rs`), which splits a
-/// lagged SS dose into tail + arrival past `lag = II` and otherwise keeps the
-/// collapsed `C_ss(t − t_eff)`. That is sound there because superposition is
-/// **additive**: every other dose is its own term, so nothing in the pre-arrival
-/// window is replaced.
-///
-/// It is **not** a licence for a state-vector walk to re-equilibrate at the
-/// arrival. The dense ODE walks used to, for every `lag ≤ II`, and that replaced
-/// the whole state — erasing any dose that landed between the record and the
-/// arrival (up to −54 % against NONMEM, #1275). Every ODE walk now reads
-/// [`ss_equilibrates_at_arrival`] instead.
+/// Its one reader is the additive analytic superposition (`pk/mod.rs`). It is **not** a
+/// licence for a state-vector walk to re-equilibrate at the arrival (#1275); those read
+/// [`ss_equilibrates_at_arrival`].
 pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
     lag <= dose.ii
 }
@@ -1681,9 +1239,7 @@ pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
 /// comparison through its branch API and the wrap through [`wrap_into_period_g`].
 #[inline]
 pub(crate) fn tad_referent_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: G,
-    t: G,
+    dose: &DoseEvent, lag: G, t: G,
 ) -> Option<G> {
     use crate::sens::num::BranchCmp::Le;
     let arrival = G::from_f64(dose.time) + lag;
@@ -1787,8 +1343,7 @@ pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
 /// [`ss_reset_cutoff`] at a time of any type: a recording type (#2786) decides `record ≤ t`
 /// through its branch API.
 pub(crate) fn ss_reset_cutoff_g<G: crate::sens::num::PkNum>(
-    doses: &[DoseEvent],
-    t: G,
+    doses: &[DoseEvent], t: G,
 ) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, d) in doses.iter().enumerate() {
@@ -1931,11 +1486,7 @@ impl DoseIndex {
     /// index was built from (it is only read on the scan fallback).
     #[inline]
     pub(crate) fn ss_cutoff(&self, doses: &[DoseEvent], t: f64) -> Option<usize> {
-        debug_assert_eq!(
-            doses.len(),
-            self.n_doses,
-            "DoseIndex queried with another list"
-        );
+        debug_assert_eq!(doses.len(), self.n_doses, "DoseIndex queried with another list");
         if self.ss_scan_fallback || t.is_nan() {
             return ss_reset_cutoff(doses, t);
         }
@@ -1963,11 +1514,7 @@ impl DoseIndex {
         }
         let mut out = own.to_vec();
         for (_, ends) in &self.residuals {
-            out.extend(
-                ends.within(lo, hi)
-                    .map(|(_, e)| e)
-                    .filter(|&e| e > lo && e < hi),
-            );
+            out.extend(ends.within(lo, hi).map(|(_, e)| e).filter(|&e| e > lo && e < hi));
         }
         out.sort_by(|a, b| a.total_cmp(b));
         std::borrow::Cow::Owned(out)
@@ -2039,11 +1586,7 @@ mod dose_index_tests {
                 _ => 200.0,
             };
             let ss = rng.below(4) == 0;
-            let ii = if ss {
-                [0.0, 6.0, 12.0][rng.below(3) as usize]
-            } else {
-                0.0
-            };
+            let ii = if ss { [0.0, 6.0, 12.0][rng.below(3) as usize] } else { 0.0 };
             doses.push(DoseEvent::new(time, 100.0, 1, rate, ss, ii));
             lags.push([0.0, 0.0, 0.25, 1.5, 7.0][rng.below(5) as usize]);
         }
@@ -2053,21 +1596,10 @@ mod dose_index_tests {
     /// The probe times: every dose time and arrival, each nudged by the match tolerances
     /// either way, plus points between and beyond the grid.
     fn probes(doses: &[DoseEvent], lags: &[f64]) -> Vec<f64> {
-        let mut ts = vec![
-            -1.0,
-            -0.0,
-            0.0,
-            0.1,
-            2.75,
-            100.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-        ];
+        let mut ts = vec![-1.0, -0.0, 0.0, 0.1, 2.75, 100.0, f64::INFINITY, f64::NEG_INFINITY];
         for (d, &lag) in doses.iter().zip(lags) {
             for base in [d.time, d.time + lag, d.time + lag + d.duration] {
-                for eps in [
-                    0.0, 1e-15, -1e-15, 1e-12, -1e-12, 5e-10, -5e-10, 2e-9, -2e-9,
-                ] {
+                for eps in [0.0, 1e-15, -1e-15, 1e-12, -1e-12, 5e-10, -5e-10, 2e-9, -2e-9] {
                     ts.push(base + eps);
                 }
             }
@@ -2123,11 +1655,7 @@ mod dose_index_tests {
         ];
         let index = DoseIndex::new(&doses, &[]);
         for t in [0.0, 1.0, 1.5, 3.0, f64::NAN] {
-            assert_eq!(
-                index.ss_cutoff(&doses, t),
-                ss_reset_cutoff(&doses, t),
-                "t = {t}"
-            );
+            assert_eq!(index.ss_cutoff(&doses, t), ss_reset_cutoff(&doses, t), "t = {t}");
         }
     }
 
@@ -2183,19 +1711,11 @@ mod dose_index_tests {
                     let a = ts[rng.below(ts.len() as u64) as usize];
                     let b = ts[rng.below(ts.len() as u64) as usize];
                     let (lo, hi) = (a.min(b) + 1e-15, a.max(b) - 1e-15);
-                    let got: Vec<u64> = index
-                        .breaks_within(lo, hi)
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect();
-                    let want: Vec<u64> = breaks_by_scan(&doses, &lags, lo, hi)
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect();
-                    assert_eq!(
-                        got, want,
-                        "({lo}, {hi}), doses = {doses:?}, lags = {lags:?}"
-                    );
+                    let got: Vec<u64> =
+                        index.breaks_within(lo, hi).iter().map(|x| x.to_bits()).collect();
+                    let want: Vec<u64> =
+                        breaks_by_scan(&doses, &lags, lo, hi).iter().map(|x| x.to_bits()).collect();
+                    assert_eq!(got, want, "({lo}, {hi}), doses = {doses:?}, lags = {lags:?}");
                 }
             }
         }
@@ -2214,17 +1734,11 @@ mod dose_index_tests {
                 let ts = probes(&doses, &lags);
                 for _ in 0..40 {
                     let a = ts[rng.below(ts.len() as u64) as usize];
-                    let b = if rng.below(2) == 0 {
-                        a
-                    } else {
-                        ts[rng.below(ts.len() as u64) as usize]
-                    };
+                    let b =
+                        if rng.below(2) == 0 { a } else { ts[rng.below(ts.len() as u64) as usize] };
                     let (lo, hi) = (a.min(b), a.max(b));
                     let near = index.near_moving_points(lo, hi);
-                    assert!(
-                        near.windows(2).all(|w| w[0] < w[1]),
-                        "not ascending: {near:?}"
-                    );
+                    assert!(near.windows(2).all(|w| w[0] < w[1]), "not ascending: {near:?}");
                     for (k, d) in doses.iter().enumerate() {
                         let t_start = d.time + lags[k];
                         let mut points = vec![t_start];
@@ -2253,9 +1767,8 @@ mod dose_index_tests {
     /// inter-dose interval are a handful, not every dose (#2754's `O(n²)`).
     #[test]
     fn one_interval_of_a_long_history_sees_a_handful_of_doses() {
-        let doses: Vec<DoseEvent> = (0..400)
-            .map(|i| DoseEvent::new(12.0 * i as f64, 100.0, 1, 0.0, false, 0.0))
-            .collect();
+        let doses: Vec<DoseEvent> =
+            (0..400).map(|i| DoseEvent::new(12.0 * i as f64, 100.0, 1, 0.0, false, 0.0)).collect();
         let lags = vec![0.75; doses.len()];
         let index = DoseIndex::new(&doses, &lags);
         let near = index.near_moving_points(12.0 * 200.0 + 0.75, 12.0 * 201.0 + 0.75);
@@ -2369,13 +1882,8 @@ ID,TIME,DV,MDV,EVID,AMT,CMT,WT
     /// are not records), and a subject with no record has no seed.
     #[test]
     fn first_record_skips_doses_past_n_doses_and_is_none_without_records() {
-        let mut s = Subject {
-            id: "1".into(),
-            obs_times: vec![1.0],
-            ..Default::default()
-        };
-        s.doses
-            .push(crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
+        let mut s = Subject { id: "1".into(), obs_times: vec![1.0], ..Default::default() };
+        s.doses.push(crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
         assert_eq!(first_record(&s, 1), Some(FirstRecord::Dose(0)));
         assert_eq!(first_record(&s, 0), Some(FirstRecord::Obs(0)));
         let empty = Subject::default();
@@ -2472,11 +1980,7 @@ mod tad_referent_tests {
     #[test]
     fn a_seeded_ss_dose_measures_the_pre_arrival_window_from_the_previous_cycles_pulse() {
         let d = ss_dose();
-        assert_eq!(
-            tad(&d, 3.0, 480.0),
-            Some(9.0),
-            "the record sits at phase II - lag"
-        );
+        assert_eq!(tad(&d, 3.0, 480.0), Some(9.0), "the record sits at phase II - lag");
         assert_eq!(tad(&d, 3.0, 481.0), Some(10.0));
         assert_eq!(tad(&d, 3.0, 482.0), Some(11.0));
         // The instant *before* the arrival is a full interval after the previous pulse …
@@ -2487,11 +1991,7 @@ mod tad_referent_tests {
         );
         // … and the arrival itself restarts the cycle.
         assert_eq!(tad(&d, 3.0, 483.0), Some(0.0));
-        assert_eq!(
-            tad(&d, 3.0, 485.0),
-            Some(2.0),
-            "back on the post-arrival fold"
-        );
+        assert_eq!(tad(&d, 3.0, 485.0), Some(2.0), "back on the post-arrival fold");
     }
 
     /// Before the dose **record** an `SS=1` row contributes nothing: `SS=1` establishes steady
@@ -2519,11 +2019,7 @@ mod tad_referent_tests {
         assert_eq!(ss_seed_phase(&d, lag), 0.0, "the clamp itself");
         assert_eq!(tad(&d, lag, 480.0), Some(0.0));
         assert_eq!(tad(&d, lag, 485.0), Some(5.0));
-        assert_eq!(
-            tad(&d, lag, 494.0),
-            Some(14.0),
-            "TAD exceeds II under the clamp"
-        );
+        assert_eq!(tad(&d, lag, 494.0), Some(14.0), "TAD exceeds II under the clamp");
         assert_eq!(tad(&d, lag, 495.0), Some(0.0), "the real arrival");
 
         // What the rejected spelling would have returned, computed here rather than
@@ -2554,11 +2050,7 @@ mod tad_referent_tests {
             "a non-SS dose contributes nothing before it arrives — the referent added by \
              #1126 is gated on `ss_seeded_at_record`"
         );
-        assert_eq!(
-            tad(&d1, 3.0, 27.0),
-            Some(0.0),
-            "…and everything once it does"
-        );
+        assert_eq!(tad(&d1, 3.0, 27.0), Some(0.0), "…and everything once it does");
     }
 
     /// `lag = 0` leaves no window to have a referent for, so the answer is the fold that stood
@@ -2587,11 +2079,7 @@ mod tad_referent_tests {
         // Past the SS arrival it is back on the periodic fold.
         assert_eq!(tad_at(&doses, &[3.0, 3.0], 485.0), 2.0);
         // A short slice means zero lag on the remaining doses, and `&[]` means all of them.
-        assert_eq!(
-            tad_at(&doses, &[3.0], 485.0),
-            5.0,
-            "dose 1 unlagged: pulse at 480"
-        );
+        assert_eq!(tad_at(&doses, &[3.0], 485.0), 5.0, "dose 1 unlagged: pulse at 480");
         assert_eq!(tad_at(&doses, &[], 485.0), 5.0);
         // Nothing has a referent yet.
         assert!(tad_at(&doses, &[3.0, 3.0], -1.0).is_nan());
@@ -2614,10 +2102,7 @@ mod tad_referent_tests {
 
         let d = ss_dose();
         assert_eq!(tad_referent(&d, f64::NAN, 481.0), None, "NaN lag");
-        assert!(
-            tad_referent(&d, 3.0, f64::NAN).is_none(),
-            "NaN observation time"
-        );
+        assert!(tad_referent(&d, 3.0, f64::NAN).is_none(), "NaN observation time");
 
         let mut nan_ii = ss_dose();
         nan_ii.ii = f64::NAN;
@@ -2659,14 +2144,10 @@ mod tad_referent_tests {
             obs_times: vec![0.0, 2.0, 23.9, 24.0, 30.0],
             ..Default::default()
         };
-        let mine: Vec<f64> = subject
-            .obs_times
-            .iter()
-            .map(|&t| super::tad_at(&subject.doses, &[], t))
-            .collect();
-        let theirs: Vec<f64> = (0..subject.obs_times.len())
-            .map(|j| subject.time_after_dose_at_or_before(j))
-            .collect();
+        let mine: Vec<f64> =
+            subject.obs_times.iter().map(|&t| super::tad_at(&subject.doses, &[], t)).collect();
+        let theirs: Vec<f64> =
+            (0..subject.obs_times.len()).map(|j| subject.time_after_dose_at_or_before(j)).collect();
         assert_eq!(
             mine, theirs,
             "the zero-lag fold and the sdtab fallback must agree on every row, including the \
@@ -2674,10 +2155,7 @@ mod tad_referent_tests {
         );
         // The straddle: assert the fixture actually reaches the tie, so this cannot quietly
         // become a comparison of two functions on rows where every spelling agrees.
-        assert_eq!(
-            mine[3], 0.0,
-            "obs@24 takes the dose at 24 — NONMEM record order"
-        );
+        assert_eq!(mine[3], 0.0, "obs@24 takes the dose at 24 — NONMEM record order");
         assert_eq!(
             subject.time_after_dose(3),
             24.0,
@@ -2734,11 +2212,7 @@ mod tad_referent_tests {
         let d = DoseEvent::new(480.0, 100.0, 1, 0.0, true, 0.0);
         assert_eq!(tad_referent(&d, 3.0, 481.0), None, "not yet arrived");
         assert_eq!(tad(&d, 3.0, 483.0), Some(0.0));
-        assert_eq!(
-            tad(&d, 3.0, 500.0),
-            Some(17.0),
-            "no wrap without an interval"
-        );
+        assert_eq!(tad(&d, 3.0, 500.0), Some(17.0), "no wrap without an interval");
     }
 }
 
@@ -2795,9 +2269,7 @@ mod ss_reset_tests {
     /// Indices live at `t`, the observable of the rule.
     fn live(doses: &[DoseEvent], t: f64) -> Vec<usize> {
         let c = ss_reset_cutoff(doses, t);
-        (0..doses.len())
-            .filter(|&k| ss_reset_live(doses, c, k))
-            .collect()
+        (0..doses.len()).filter(|&k| ss_reset_live(doses, c, k)).collect()
     }
 
     #[test]
@@ -2836,17 +2308,9 @@ mod ss_reset_tests {
     #[test]
     fn a_co_timed_dose_is_wiped_before_the_ss_row_and_live_after_it() {
         let row51 = [bolus(10.0), ss(10.0)];
-        assert_eq!(
-            live(&row51, 10.0),
-            vec![1],
-            "row 51: bolus row BEFORE the SS row is wiped"
-        );
+        assert_eq!(live(&row51, 10.0), vec![1], "row 51: bolus row BEFORE the SS row is wiped");
         let row52 = [ss(10.0), bolus(10.0)];
-        assert_eq!(
-            live(&row52, 10.0),
-            vec![0, 1],
-            "row 52: bolus row AFTER the SS row superposes"
-        );
+        assert_eq!(live(&row52, 10.0), vec![0, 1], "row 52: bolus row AFTER the SS row superposes");
     }
 
     #[test]
@@ -2881,10 +2345,7 @@ mod evid_reset_tests {
     fn a_dose_is_live_iff_recorded_at_or_after_the_reset() {
         assert!(evid_reset_live(9.0, f64::NEG_INFINITY), "no reset reached");
         assert!(!evid_reset_live(9.0, 10.0), "recorded before the reset");
-        assert!(
-            evid_reset_live(10.0, 10.0),
-            "recorded at the reset (EVID=4)"
-        );
+        assert!(evid_reset_live(10.0, 10.0), "recorded at the reset (EVID=4)");
         assert!(evid_reset_live(10.001, 10.0), "recorded after the reset");
     }
 }
@@ -2974,11 +2435,7 @@ mod residual_pulse_count_tests {
                 (1e9, 2e9),
                 (-5.0, -1.0),
             ] {
-                let want: Vec<f64> = all
-                    .iter()
-                    .copied()
-                    .filter(|&e| e >= lo && e <= hi)
-                    .collect();
+                let want: Vec<f64> = all.iter().copied().filter(|&e| e >= lo && e <= hi).collect();
                 let got: Vec<f64> = ss_residual_infusion_ends(&d, lag, 1.0, lo, hi).collect();
                 assert_eq!(got, want, "dose {d:?} lag {lag} range [{lo}, {hi}]");
             }
@@ -3059,10 +2516,7 @@ mod zero_order_binding_tests {
             assert!(matches!(lower_zero_order_ss(s, map), Cow::Borrowed(_)));
             assert!(is_lowered_zero_order_ss(map, &s.doses[0]));
         }
-        assert!(matches!(
-            lower_population_zero_order_ss(&bound, map),
-            Cow::Borrowed(_)
-        ));
+        assert!(matches!(lower_population_zero_order_ss(&bound, map), Cow::Borrowed(_)));
         // The data as read is untouched: the lowering is the fit's own.
         assert!(!pop.subjects[0].doses[0].is_infusion());
     }

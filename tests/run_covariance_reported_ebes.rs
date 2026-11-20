@@ -65,11 +65,8 @@ const OPTIMUM: f64 = -1199.3264;
 /// the `W_EBE_START_DEPENDENT` warning that names the row's arm, or `None` for no warning.
 fn fitted(inner_maxiter: Option<usize>, method: CovarianceMethod, arm: Option<&str>) -> Fitted {
     let what = format!("inner_maxiter = {inner_maxiter:?}, {method:?}");
-    let prep = prepare_run(
-        "examples/two_cpt_oral_cov.ferx",
-        Some("data/two_cpt_oral_cov.csv"),
-    )
-    .unwrap_or_else(|e| panic!("{what}: prepare: {e}"));
+    let prep = prepare_run("examples/two_cpt_oral_cov.ferx", Some("data/two_cpt_oral_cov.csv"))
+        .unwrap_or_else(|e| panic!("{what}: prepare: {e}"));
     let (model, population, init) = (prep.parsed.model, prep.population, prep.init_params);
     let defaults = FitOptions::default();
     let options = FitOptions {
@@ -93,21 +90,13 @@ fn fitted(inner_maxiter: Option<usize>, method: CovarianceMethod, arm: Option<&s
         "{what}: premise — the fit reaches the FOCEI optimum ({OPTIMUM}), got {}",
         fit.ofv
     );
-    let warning = fit
-        .warnings
-        .iter()
-        .find(|w| w.starts_with("W_EBE_START_DEPENDENT"));
+    let warning = fit.warnings.iter().find(|w| w.starts_with("W_EBE_START_DEPENDENT"));
     match (arm, warning) {
         (None, None) => {}
         (Some(arm), Some(w)) if w.contains(arm) => {}
         _ => panic!("{what}: premise — the row's arm moved; expected {arm:?}, got {warning:?}"),
     }
-    Fitted {
-        model,
-        population,
-        options,
-        fit,
-    }
+    Fitted { model, population, options, fit }
 }
 
 /// The covariance matrix, as bits. It must be finite: a `NaN` compares unequal.
@@ -116,10 +105,7 @@ fn bits(fit: &FitResult, what: &str) -> Vec<u64> {
         .covariance_matrix
         .as_ref()
         .unwrap_or_else(|| panic!("{what}: covariance step produced no matrix"));
-    assert!(
-        cov.iter().all(|x| x.is_finite()),
-        "{what}: non-finite covariance"
-    );
+    assert!(cov.iter().all(|x| x.is_finite()), "{what}: non-finite covariance");
     cov.iter().map(|x| x.to_bits()).collect()
 }
 
@@ -133,14 +119,7 @@ fn rerun(f: &Fitted, fit: &FitResult, what: &str) -> Vec<u64> {
 fn reload(f: &Fitted) -> FitResult {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fit.fitrx");
-    save_fit(
-        &f.fit,
-        &f.population,
-        "model\n",
-        &path,
-        SaveFitOptions::default(),
-    )
-    .expect("save_fit");
+    save_fit(&f.fit, &f.population, "model\n", &path, SaveFitOptions::default()).expect("save_fit");
     load_fit(&path).expect("load_fit").fit
 }
 
@@ -156,10 +135,7 @@ fn cold_reported_repeats_inline_covariance_in_memory_and_after_reload() {
     );
     let back = reload(&f);
     assert!(
-        back.subjects
-            .iter()
-            .zip(&f.fit.subjects)
-            .all(|(b, a)| b.eta == a.eta),
+        back.subjects.iter().zip(&f.fit.subjects).all(|(b, a)| b.eta == a.eta),
         "the .fitrx round trip must keep the EBEs exactly (#1847)"
     );
     assert!(
@@ -170,11 +146,7 @@ fn cold_reported_repeats_inline_covariance_in_memory_and_after_reload() {
 
 #[test]
 fn non_cold_reported_repeats_inline_covariance_r() {
-    let f = fitted(
-        Some(STARVED_INNER),
-        CovarianceMethod::Hessian,
-        Some(COLD_WORSE),
-    );
+    let f = fitted(Some(STARVED_INNER), CovarianceMethod::Hessian, Some(COLD_WORSE));
     assert!(
         rerun(&f, &f.fit, "non-cold reported, r") == bits(&f.fit, "inline"),
         "non-cold reported, r: run_covariance must start from the reported EBEs"
@@ -183,11 +155,7 @@ fn non_cold_reported_repeats_inline_covariance_r() {
 
 #[test]
 fn non_cold_reported_repeats_inline_covariance_s() {
-    let f = fitted(
-        Some(STARVED_INNER),
-        CovarianceMethod::CrossProduct,
-        Some(COLD_WORSE),
-    );
+    let f = fitted(Some(STARVED_INNER), CovarianceMethod::CrossProduct, Some(COLD_WORSE));
     assert!(
         rerun(&f, &f.fit, "non-cold reported, s") == bits(&f.fit, "inline"),
         "non-cold reported, s: run_covariance must score at the reported EBEs and their H"

@@ -1,39 +1,23 @@
 //! Event-driven analytical PK propagation.
 //!
-//! Walks events (doses + observations) in time order, propagating the
-//! amount-vector state from one event to the next using the rate matrix
-//! built from the *current* per-event PK parameters. This is what NONMEM
-//! `ADVAN` routines do — and is how time-varying covariates take effect:
-//! when CL or V change between events, the elimination rate during the
-//! next interval changes accordingly.
+//! Walks events (doses + observations) in time order, propagating the amount-vector state
+//! from one event to the next with the rate matrix built from the *current* per-event PK
+//! parameters (as NONMEM `ADVAN` does; this is how time-varying covariates take effect).
 //!
-//! Coverage:
-//!   - 1-compartment IV bolus & infusion (state = `[A_central]`)
-//!   - 1-compartment oral (state = `[A_depot, A_central]`)
-//!   - 2-compartment IV bolus & infusion (state = `[A_central, A_periph]`)
-//!   - 2-compartment oral (state = `[A_depot, A_central, A_periph]`)
-//!   - 3-compartment IV bolus & infusion (state = `[A_central, A_p1, A_p2]`)
-//!   - 3-compartment oral (state = `[A_depot, A_central, A_p1, A_p2]`)
-//!
-//! For oral models the dose into compartment 1 is the depot (NONMEM
-//! ADVAN2/ADVAN4 convention), and the observation read-out reads the
-//! *central* compartment (state slot 1, not 0).
+//! Coverage: 1-/2-/3-compartment IV bolus & infusion (state `[A_central, A_p1, A_p2]`) and
+//! oral (state `[A_depot, A_central, ...]`). For oral models the dose into compartment 1 is
+//! the depot (ADVAN2/ADVAN4 convention) and the read-out is the *central* compartment (slot 1).
 //!
 //! Infusion support (`rate > 0`):
-//!   - IV models: into the central compartment (cmt 1), plus the
-//!     peripheral compartment(s) for 2-/3-cpt IV.
-//!   - Oral models: into the **central** compartment (cmt 2, a
-//!     depot-bypassing infusion) AND into the **depot** (cmt 1, #400) —
-//!     a zero-order release into the depot, then first-order `ka`
-//!     absorption into central.
-//!   - Oral models, since #375: into the **peripheral** compartment(s) too
-//!     (cmt 3 on `two_cpt_oral`, cmt 3/4 on `three_cpt_oral`). Nothing flows
-//!     back into the depot, so a rate into a peripheral drives exactly the
-//!     central/peripheral sub-system the IV model has, and the oral propagator
-//!     superposes that same IV forced response onto its homogeneous evolution.
-//! Every compartment of the six walk-supported models is therefore infusable;
-//! what remains rejected is `CMT=0` (no default compartment for a zero-order
-//! input) and anything past the end of the state vector.
+//!   - IV models: into central (cmt 1), plus the peripheral compartment(s) for 2-/3-cpt.
+//!   - Oral models: into **central** (cmt 2, depot bypass) AND into the **depot** (cmt 1,
+//!     #400: zero-order release then first-order `ka`); since #375 also into the
+//!     **peripheral** compartment(s) (cmt 3 on `two_cpt_oral`, cmt 3/4 on `three_cpt_oral`).
+//!     Nothing flows back into the depot, so the oral propagator superposes the IV forced
+//!     response onto its homogeneous evolution.
+//!
+//! Every compartment of the six walk-supported models is infusable; `CMT=0` (no default
+//! compartment for a zero-order input) and indices past the state vector are rejected.
 
 use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
@@ -47,20 +31,11 @@ use std::sync::OnceLock;
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only count of [`EventSchedule::for_subject`] calls on **this thread**.
-    ///
-    /// The whole point of a schedule cache is that this number stops growing with
-    /// the number of likelihood evaluations, and an equality A/B between a cached
-    /// and an uncached fit cannot see that — both arms agree whether or not the
-    /// cache is wired up at all (#1452 review). This counter is the assertion that
-    /// can: it distinguishes "a schedule was built" from "a schedule was *reused*".
-    ///
-    /// Thread-local, not a global `AtomicU64`, so a test reads only the builds it
-    /// caused. A process-wide counter would be polluted by every other test in the
-    /// binary building schedules concurrently, which is exactly the kind of
-    /// approximate assertion this is meant to replace. A caller that fans out over
-    /// rayon reads it from inside a single-worker `install`, where every task runs
-    /// on the reading thread — see `saem_hotpath_tests::schedule_builds_in`.
+    /// Test-only count of [`EventSchedule::for_subject`] calls on **this thread**. It is the
+    /// assertion that distinguishes "a schedule was built" from "a schedule was *reused*" (an
+    /// equality A/B between a cached and an uncached fit cannot, #1452). Thread-local so a test
+    /// reads only the builds it caused; a caller that fans out over rayon reads it from inside
+    /// a single-worker `install` (see `saem_hotpath_tests::schedule_builds_in`).
     pub(crate) static SCHEDULE_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -81,11 +56,7 @@ static PROFILE_PRED_NANOS: AtomicU64 = AtomicU64::new(0);
 
 fn profile_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("FERX_PROFILE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    *E.get_or_init(|| std::env::var("FERX_PROFILE").map(|v| v == "1").unwrap_or(false))
 }
 
 /// Print the accumulated f64-prediction profile (no-op unless `FERX_PROFILE=1`).
@@ -140,40 +111,25 @@ pub struct Event {
     pub orig_idx: usize,
 }
 
-/// Pre-computed, subject-static event scheduling for the event-driven
-/// propagator.
+/// Pre-computed, subject-static event scheduling for the event-driven propagator.
 ///
-/// Building the merged event timeline (dose + obs + EVID=2) and the
-/// per-interval infusion sub-event bounds is purely a function of the
-/// subject's static event timeline (times, durations, rates) — none of
-/// it depends on theta or eta. Inside hot loops (BFGS line search and
-/// FOCE NLL evaluation) the same event_driven_predictions call gets
-/// invoked thousands of times per subject, so re-sorting events and
-/// re-deriving infusion bounds on every call is wasted work.
-///
-/// Build one of these once per subject per `find_ebe` (or once per fit,
-/// for callers that can amortise even further) and pass it into the
-/// `*_with_schedule` variants below.
+/// The merged event timeline (dose + obs + EVID=2) and per-interval infusion sub-event bounds
+/// depend only on the subject's static timeline (times, durations, rates), not on theta or
+/// eta, so hot loops (BFGS line search, FOCE NLL) should not redo them per call. Build one per
+/// subject per `find_ebe` (or per fit) and pass it to the `*_with_schedule` variants.
 #[derive(Debug, Clone)]
 pub struct EventSchedule {
-    /// Merged + sorted event list. Tie-break order is
-    /// `Reset < Dose < PkOnly < Obs` so a system reset zeros the state
-    /// before a same-time dose lands (EVID=4), and covariate-change markers
+    /// Merged + sorted event list. Tie-break order is `Reset < Dose < PkOnly < Obs` so a system
+    /// reset zeros the state before a same-time dose lands (EVID=4), and covariate-change markers
     /// run after a dose at the same time but before an observation.
     ///
-    /// NONMEM record order (an observation written before its same-TIME dose is
-    /// a pre-dose trough) is *not* expressed here — this tie-break alone would
-    /// always score such a sample post-dose. The data reader handles it upstream
-    /// by nudging a pre-dose observation one ULP below the coincident dose time
-    /// (see `io::datareader::parse_subject`), so by the time events reach this
-    /// sort the obs already carries a strictly-earlier time and orders correctly.
-    /// The same nudge moves the first record of a tie that carries a pk-only row
-    /// (an observation before it, or it before a dose) below the tie, so the record
-    /// NONMEM advances into the shared time with is the one this sort reaches
-    /// first (#1810).
+    /// NONMEM record order (an observation written before its same-TIME dose is a pre-dose
+    /// trough) is not expressed here: the data reader nudges such an observation one ULP below
+    /// the coincident dose time (see `io::datareader::parse_subject`), and likewise the first
+    /// record of a tie that carries a pk-only row (#1810), so it orders correctly by time.
     ///
-    /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
-    /// so the schedule already reflects per-dose lagtime.
+    /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]` (the schedule reflects
+    /// per-dose lagtime).
     pub events: Vec<Event>,
     /// `true` when any event time is `NaN`/infinite (#1189) — a non-finite dose
     /// lagtime, typically. The sort is [`f64::total_cmp`], a total order that puts
@@ -228,13 +184,9 @@ impl EventSchedule {
     /// replaces.
     pub(crate) fn rates_valid_for(&self, doses: &[DoseEvent]) -> bool {
         self.rates_dose_key.len() == doses.len()
-            && self
-                .rates_dose_key
-                .iter()
-                .zip(doses.iter())
-                .all(|(&(r, d), dose)| {
-                    r.to_bits() == dose.rate.to_bits() && d.to_bits() == dose.duration.to_bits()
-                })
+            && self.rates_dose_key.iter().zip(doses.iter()).all(|(&(r, d), dose)| {
+                r.to_bits() == dose.rate.to_bits() && d.to_bits() == dose.duration.to_bits()
+            })
     }
 
     /// A [`crate::dosing::DoseIndex`] over `doses` under this schedule's lagtimes: the
@@ -243,9 +195,7 @@ impl EventSchedule {
     /// fresh `O(n log n)` build otherwise. The index reads only times, `ss`/`ii`, lagtimes
     /// (all schedule-static) and `rate`/`duration` (what `rates_valid_for` checks).
     pub(crate) fn dose_index_for(
-        &self,
-        doses: &[DoseEvent],
-        rates_valid: bool,
+        &self, doses: &[DoseEvent], rates_valid: bool,
     ) -> std::borrow::Cow<'_, crate::dosing::DoseIndex> {
         if rates_valid {
             std::borrow::Cow::Borrowed(&self.dose_index)
@@ -254,29 +204,18 @@ impl EventSchedule {
         }
     }
 
-    /// Pre-compute the event timeline and per-interval infusion bounds
-    /// for `subject` under `pk_model`. The result is reusable across
-    /// arbitrary `(theta, eta)` evaluations of the same subject *as long
-    /// as the per-dose lagtimes are unchanged* — only the event times
-    /// (subject-static, plus lagtime offsets) matter, not the per-event
-    /// PK rate values.
+    /// Pre-compute the event timeline and per-interval infusion bounds for `subject` under
+    /// `pk_model`. Reusable across `(theta, eta)` evaluations of the same subject as long as the
+    /// per-dose lagtimes are unchanged.
     ///
-    /// `dose_lagtimes` must be length `subject.doses.len()` (or empty,
-    /// which is treated as all zeros for backward compatibility with the
-    /// no-lagtime fast path).
-    ///
-    /// `doses` is the per-dose `(rate, duration)` the schedule's infusion break
-    /// times are built from. Pass the **bioavailability-adjusted** doses (see
-    /// `DoseEvent::with_bioavailable_infusion`, #419) so the infusion-end break
-    /// at `start + duration` reflects `F`'s reshaping of a rate-defined window;
-    /// pass `&subject.doses` when `F` is `1`/absent or cannot reshape a window (the
-    /// cached fast path only caches in that case). Must be parallel to
-    /// `subject.doses` (same length/order; only `rate`/`duration` may differ).
+    /// `dose_lagtimes` must have length `subject.doses.len()` (or be empty, meaning all zeros).
+    /// `doses` is the per-dose `(rate, duration)` the infusion break times are built from: pass
+    /// the **bioavailability-adjusted** doses (`DoseEvent::with_bioavailable_infusion`, #419) so
+    /// the infusion-end break reflects `F`'s reshaping of a rate-defined window, or
+    /// `&subject.doses` when `F` is `1`/absent or cannot reshape a window (the cached fast path
+    /// only caches then). Parallel to `subject.doses` (only `rate`/`duration` may differ).
     pub fn for_subject(
-        subject: &Subject,
-        pk_model: PkModel,
-        doses: &[DoseEvent],
-        dose_lagtimes: &[f64],
+        subject: &Subject, pk_model: PkModel, doses: &[DoseEvent], dose_lagtimes: &[f64],
     ) -> Self {
         // A plan's recording builds what its runs replay: runtime work only (#2786).
         #[cfg(test)]
@@ -315,42 +254,20 @@ impl EventSchedule {
             // unconditionally — with `ALAG = 0` the arrival is no longer a
             // parameter source, so dropping the record would send the segment
             // ending at `d.time` looking forward past the dose instead.
-            events.push(Event {
-                time: d.time,
-                kind: EventKind::DoseRecord,
-                orig_idx: k,
-            });
-            events.push(Event {
-                time: d.time + get_lag(k),
-                kind: EventKind::Dose,
-                orig_idx: k,
-            });
+            events.push(Event { time: d.time, kind: EventKind::DoseRecord, orig_idx: k });
+            events.push(Event { time: d.time + get_lag(k), kind: EventKind::Dose, orig_idx: k });
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
-            events.push(Event {
-                time: t,
-                kind: EventKind::Obs,
-                orig_idx: j,
-            });
+            events.push(Event { time: t, kind: EventKind::Obs, orig_idx: j });
         }
         for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            events.push(Event {
-                time: t,
-                kind: EventKind::PkOnly,
-                orig_idx: m,
-            });
+            events.push(Event { time: t, kind: EventKind::PkOnly, orig_idx: m });
         }
         for (r, &t) in subject.reset_times.iter().enumerate() {
-            events.push(Event {
-                time: t,
-                kind: EventKind::Reset,
-                orig_idx: r,
-            });
+            events.push(Event { time: t, kind: EventKind::Reset, orig_idx: r });
         }
         events.sort_by(|a, b| {
-            a.time
-                .total_cmp(&b.time)
-                .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
+            a.time.total_cmp(&b.time).then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
         });
 
         // Materialize lagtimes for later use (active-infusion check).
@@ -454,17 +371,12 @@ fn kind_order(k: EventKind) -> u8 {
 /// same family, tracked separately rather than half-fixed here.
 #[inline]
 pub(crate) fn is_record(k: EventKind) -> bool {
-    matches!(
-        k,
-        EventKind::DoseRecord | EventKind::PkOnly | EventKind::Obs
-    )
+    matches!(k, EventKind::DoseRecord | EventKind::PkOnly | EventKind::Obs)
 }
 
-/// Sub-interval boundaries inside `(t_from, t_to)` at which the active
-/// infusion rate changes (an infusion starts or stops). The returned
-/// `Vec` is sorted, deduped, and always includes the two interval
-/// endpoints, so `windows(2)` enumerates every sub-interval over which
-/// the rate matrix is constant.
+/// Sub-interval boundaries inside `(t_from, t_to)` at which the active infusion rate changes.
+/// Sorted, deduped, always includes the two endpoints, so `windows(2)` enumerates every
+/// sub-interval over which the rate matrix is constant.
 ///
 /// The candidate breaks come from `index` ([`crate::dosing::DoseIndex::breaks_within`],
 /// #2754): every `rate > 0 && duration > 0` dose's lagged window start and end, plus —
@@ -476,9 +388,7 @@ pub(crate) fn is_record(k: EventKind) -> bool {
 /// The scan this replaced pushed the same values in dose order; the total-order sort
 /// below makes the result independent of push order, so it is the same `Vec`.
 pub(crate) fn compute_propagation_bounds(
-    t_from: f64,
-    t_to: f64,
-    index: &crate::dosing::DoseIndex,
+    t_from: f64, t_to: f64, index: &crate::dosing::DoseIndex,
 ) -> Vec<f64> {
     let inner = index.breaks_within(t_from + 1e-15, t_to - 1e-15);
     let mut bounds: Vec<f64> = Vec::with_capacity(2 + inner.len());
@@ -502,39 +412,31 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
     pk_model.topology().state_layout()
 }
 
-/// Pre-equilibrate the event-driven analytical state to its SS value for
-/// an SS=1 dose. The returned state is the "just-before-next-pulse" SS state;
-/// the caller applies the SS dose's own pulse through the normal flow.
+/// Pre-equilibrate the event-driven analytical state to its SS value for an SS=1 dose. The
+/// returned state is the "just-before-next-pulse" SS state; the caller applies the SS dose's
+/// own pulse through the normal flow.
 ///
-/// **Exact, not truncated (#908).** One dosing cycle of these models is an affine map
-/// `u ↦ M·u + b` — the analytical disposition is always linear (constant-coefficient), and the
-/// dose enters additively — so the periodic steady state has the closed form
-/// `u_ss = (I − M)⁻¹·b`. `M`'s columns and `b` come from the *same* propagator the walk itself
-/// uses, injected into [`crate::dosing::periodic_ss_fixed_point_g`] as one-cycle closures, so no
-/// new formula is introduced. This agrees with the dose-superposition SS closed forms to f64
-/// precision (≤ 1e-12 relative on every walk-supported model, bit-identical on several) rather
-/// than to a truncation tolerance, and costs `n + 4` propagator calls plus one `n×n` solve
-/// (`n ≤ 4`) instead of up to [`SS_EQUILIBRATION_CYCLES`](crate::dosing::SS_EQUILIBRATION_CYCLES).
+/// **Exact, not truncated (#908).** One dosing cycle is an affine map `u ↦ M·u + b` (the
+/// disposition is constant-coefficient linear, the dose enters additively), so the periodic
+/// steady state is `u_ss = (I − M)⁻¹·b`. `M`'s columns and `b` come from the *same*
+/// propagator the walk uses, injected into [`crate::dosing::periodic_ss_fixed_point_g`] as
+/// one-cycle closures. It agrees with the dose-superposition SS closed forms to f64
+/// precision (≤ 1e-12 relative on every walk-supported model) and costs `n + 4` propagator
+/// calls plus one `n×n` solve (`n ≤ 4`) instead of up to
+/// [`SS_EQUILIBRATION_CYCLES`](crate::dosing::SS_EQUILIBRATION_CYCLES).
 ///
-/// This replaced a truncated pulse train whose residual was `≈ exp(−50·λ_slow·II)`. That is
-/// negligible for fast PK but reached **30 %** on an ordinary long-half-life one-compartment
-/// model (`CL = 0.1`, `V = 50`, `II = 12`), and over 50 % on the deep peripheral *amounts* of
-/// slow 2-/3-compartment models — silently, because a subject is routed here (rather than to the
-/// exact superposition path) by something as incidental as a time-varying covariate, an
-/// `EVID=3/4` reset, IOV, or a dose into a non-default compartment.
+/// The replaced truncated pulse train left a residual `≈ exp(−50·λ_slow·II)`: **30 %** on a
+/// long-half-life one-compartment model (`CL = 0.1`, `V = 50`, `II = 12`), over 50 % on deep
+/// peripheral amounts of slow 2-/3-cpt models, silently (a subject is routed here by a
+/// time-varying covariate, an `EVID=3/4` reset, IOV, or a non-default compartment dose). The
+/// pulse train survives only as the fallback for a **singular** `I − M` (a disposition
+/// eigenvalue of zero, e.g. `CL = 0`; no periodic steady state exists), where the capped loop
+/// raises the #867 non-convergence warning.
 ///
-/// The pulse train survives only as the fallback for a **singular** `I − M`, i.e. a disposition
-/// eigenvalue of zero (a compartment that never empties, e.g. `CL = 0`). No periodic steady state
-/// exists there, so the capped loop now also raises the #867 non-convergence warning instead of
-/// returning a silently-truncated state.
-///
-/// `dose.ii > 0` is required (callers already guard it). Overlapping infusions
-/// (`T_inf > II`) replay their `m` always-running pulses as one more cycle window
-/// (`DoseEvent::ss_cycle_doses`).
+/// `dose.ii > 0` is required (callers guard it). Overlapping infusions (`T_inf > II`) replay
+/// their `m` always-running pulses as one more cycle window (`DoseEvent::ss_cycle_doses`).
 fn equilibrate_ss_state_event_driven(
-    pk_model: PkModel,
-    pk: &PkParams,
-    dose: &DoseEvent,
+    pk_model: PkModel, pk: &PkParams, dose: &DoseEvent,
 ) -> Vec<f64> {
     // Clear the warning observation up front (#1289, PR #1392 review): the exact affine fixed
     // point below and the two bail-outs return without reaching
@@ -567,19 +469,12 @@ fn equilibrate_ss_state_event_driven(
     // end) or [0, II] for boluses. Clone `dose` (not `DoseEvent::new`) so the
     // bioavailability-reshaped `(rate, duration)` it already carries survive -
     // `::new` would recompute `duration = amt/rate` and drop `F` (#419).
-    let synthetic_dose = if is_inf {
-        dose.ss_cycle_doses()
-    } else {
-        Vec::new()
-    };
+    let synthetic_dose = if is_inf { dose.ss_cycle_doses() } else { Vec::new() };
     let synthetic_lagtimes = vec![0.0; synthetic_dose.len()];
     let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lagtimes);
     let empty_index = crate::dosing::DoseIndex::default();
-    let bounds: Vec<f64> = if is_inf {
-        vec![0.0, synthetic_dose[0].duration, dose.ii]
-    } else {
-        vec![0.0, dose.ii]
-    };
+    let bounds: Vec<f64> =
+        if is_inf { vec![0.0, synthetic_dose[0].duration, dose.ii] } else { vec![0.0, dose.ii] };
 
     // Constant params across all SS-equilibration cycles → one eigendata solve. The `RefCell`
     // lets the two `Fn` closures below share that one cache; a fresh cache per closure call
@@ -677,10 +572,7 @@ fn equilibrate_ss_state_event_driven(
 /// infusions a `phase` inside the newest pulse leaves it (and any overlapping
 /// earlier pulse) mid-flight; the caller's residual windows carry them on.
 fn ss_state_at_phase_event_driven(
-    pk_model: PkModel,
-    pk: &PkParams,
-    dose: &DoseEvent,
-    phase: f64,
+    pk_model: PkModel, pk: &PkParams, dose: &DoseEvent, phase: f64,
 ) -> Vec<f64> {
     let mut state = equilibrate_ss_state_event_driven(pk_model, pk, dose);
     let (n_states, _) = state_layout(pk_model);
@@ -708,11 +600,8 @@ fn ss_state_at_phase_event_driven(
         let synthetic_dose = dose.ss_cycle_doses();
         let synthetic_lagtimes = vec![0.0; synthetic_dose.len()];
         let t_inf = synthetic_dose[0].duration;
-        let bounds: Vec<f64> = if phase > t_inf {
-            vec![0.0, t_inf, phase]
-        } else {
-            vec![0.0, phase]
-        };
+        let bounds: Vec<f64> =
+            if phase > t_inf { vec![0.0, t_inf, phase] } else { vec![0.0, phase] };
         let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lagtimes);
         propagate_with_bounds(
             &mut state,
@@ -813,10 +702,7 @@ fn bioavailable_doses<P: PkAt + ?Sized>(subject: &Subject, pk_at_dose: &P) -> Ve
 /// `V` is `pk_at_obs[j].v()` — i.e. the central-compartment volume at the
 /// *observation's* time. This matches NONMEM `S1 = V1` / `IPRED = A(1)/S1`.
 pub fn event_driven_predictions(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
+    pk_model: PkModel, subject: &Subject, pk_at_dose: &[PkParams], pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
     // Defensive guard (#324/#394): modeled-RATE doses (e.g. RATE=-2 -> D{cmt})
@@ -861,12 +747,8 @@ pub fn event_driven_predictions(
 /// infusion-bound construction otherwise dominate per-call CPU on the
 /// TV-cov path.
 pub fn event_driven_predictions_with_schedule(
-    pk_model: PkModel,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
+    pk_model: PkModel, subject: &Subject, schedule: &EventSchedule, pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams], pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
     // `eff_doses` are built here (once) and threaded into the walk so the
     // bioavailability adjustment is not recomputed per call (#419).
@@ -889,11 +771,7 @@ pub fn event_driven_predictions_with_schedule(
 /// [`event_driven_predictions_with_schedule`] over per-record parameters held as a table and
 /// indices (#2549): the same walk, borrowing each record's snapshot from the table.
 pub(crate) fn event_driven_predictions_with_schedule_at<P: PkAt + ?Sized>(
-    pk_model: PkModel,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    pk_at_dose: &P,
-    pk_at_obs: &P,
+    pk_model: PkModel, subject: &Subject, schedule: &EventSchedule, pk_at_dose: &P, pk_at_obs: &P,
     pk_at_pk_only: &P,
 ) -> Vec<f64> {
     let eff_doses = bioavailable_doses(subject, pk_at_dose);
@@ -910,13 +788,8 @@ pub(crate) fn event_driven_predictions_with_schedule_at<P: PkAt + ?Sized>(
 
 #[allow(clippy::too_many_arguments)]
 fn event_driven_predictions_run<P: PkAt + ?Sized>(
-    pk_model: PkModel,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    eff_doses: &[DoseEvent],
-    pk_at_dose: &P,
-    pk_at_obs: &P,
-    pk_at_pk_only: &P,
+    pk_model: PkModel, subject: &Subject, schedule: &EventSchedule, eff_doses: &[DoseEvent],
+    pk_at_dose: &P, pk_at_obs: &P, pk_at_pk_only: &P,
 ) -> Vec<f64> {
     let t0 = profile_enabled().then(std::time::Instant::now);
     let preds = event_driven_predictions_with_schedule_impl(
@@ -1040,10 +913,8 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
         // dt = 0 and `pk_now` is unused. `None` only for a subject with no record
         // anywhere in the walk — which has no observation, so the early return
         // above has already fired.
-        let pk_now = governing_record[i].map_or_else(
-            || pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only),
-            &record_pk_at,
-        );
+        let pk_now = governing_record[i]
+            .map_or_else(|| pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only), &record_pk_at);
 
         if ev.time > cur_t {
             // The interval (events[i-1], events[i]) — its bounds were
@@ -1087,11 +958,7 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
                 // were measured 7.665 OFV apart on `nonmem_anchor/dose_form_lag_ss`
                 // before this, having both equilibrated at the arrival instead.
                 let d = &eff_doses[ev.orig_idx];
-                let lag = schedule
-                    .dose_lagtimes
-                    .get(ev.orig_idx)
-                    .copied()
-                    .unwrap_or(0.0);
+                let lag = schedule.dose_lagtimes.get(ev.orig_idx).copied().unwrap_or(0.0);
                 if crate::dosing::ss_seeded_at_record(d, lag) {
                     state = ss_state_at_phase_event_driven(
                         pk_model,
@@ -1133,11 +1000,7 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
                 // Skipped when the trough was already loaded at this dose's record
                 // and flowed here (#1121); re-equilibrating would discard that
                 // propagation and put the trough at the arrival instead.
-                let lag = schedule
-                    .dose_lagtimes
-                    .get(ev.orig_idx)
-                    .copied()
-                    .unwrap_or(0.0);
+                let lag = schedule.dose_lagtimes.get(ev.orig_idx).copied().unwrap_or(0.0);
                 if crate::dosing::ss_equilibrates_at_arrival(d, lag) {
                     state = equilibrate_ss_state_event_driven(pk_model, dose_pk, d);
                 }
@@ -1219,10 +1082,7 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
 /// Borrows the event's snapshot (1 KB — see the note at `record_pk_at`).
 #[inline]
 fn pk_for<'a, P: PkAt + ?Sized>(
-    ev: Event,
-    pk_at_dose: &'a P,
-    pk_at_obs: &'a P,
-    pk_at_pk_only: &'a P,
+    ev: Event, pk_at_dose: &'a P, pk_at_obs: &'a P, pk_at_pk_only: &'a P,
 ) -> &'a PkParams {
     match ev.kind {
         EventKind::DoseRecord | EventKind::Dose => pk_at_dose.at(ev.orig_idx),
@@ -1234,39 +1094,29 @@ fn pk_for<'a, P: PkAt + ?Sized>(
     }
 }
 
-/// The zero-order input rate per channel — `[central, periph1, periph2, depot]` —
-/// active at time `mid`, summed over `doses` in dose order.
+/// The zero-order input rate per channel (`[central, periph1, periph2, depot]`) active at
+/// time `mid`, summed over `doses` in dose order.
 ///
-/// **The one spelling of "which infusions are running"** for the f64 walk: the
-/// per-call scan in [`propagate_with_bounds`] and the per-schedule precompute in
-/// [`EventSchedule::for_subject`] both call it, so the cached rates cannot drift
-/// from the scanned ones (#1477). It is `O(n_doses)`, which is why the schedule
-/// caches its result: the walk used to run it once per sub-interval of every
-/// evaluation, and on an infusion-heavy subject (the pembrolizumab bench: up to 58
-/// doses and 74 events) that scan was most of `propagate_with_bounds`'s 13 % self
-/// time in a single-threaded SAEM fit.
+/// **The one spelling of "which infusions are running"** for the f64 walk: the per-call scan
+/// in [`propagate_with_bounds`] and the per-schedule precompute in
+/// [`EventSchedule::for_subject`] both call it, so cached rates cannot drift from scanned
+/// ones (#1477). `O(n_doses)`, hence cached (on the pembrolizumab bench, 58 doses and 74
+/// events, it was most of `propagate_with_bounds`'s 13 % self time in a SAEM fit).
 ///
-/// `doses` are the bioavailability-adjusted (`eff_doses`) copies, so
-/// `d.rate`/`d.duration` already carry `F` (#419): the rate is injected as-is and
-/// the window `[t_start, t_start + d.duration]` is the `F`-reshaped one. A dur->0
-/// infusion still limits to the `F·AMT` bolus. `dose_lagtimes[k]` shifts dose `k`'s
-/// window. An infusion recorded before a reset reached at `mid` is off — the last EVID=3/4
-/// reset `reset_floor` (#1587) or an `SS=1` record (#1586), through one
-/// `ResetGate` built once per call — even a lagged one whose
-/// window opens after it. The depot channel (`cmt 1`, #400) is a zero-order release into
-/// the oral depot followed by first-order `ka` absorption — distinct from the
-/// central channel (cmt 2, depot bypass).
+/// `doses` are the bioavailability-adjusted (`eff_doses`) copies, so `d.rate`/`d.duration`
+/// already carry `F` (#419); a dur->0 infusion still limits to the `F·AMT` bolus.
+/// `dose_lagtimes[k]` shifts dose `k`'s window. An infusion recorded before a reset reached
+/// at `mid` is off (the last EVID=3/4 reset `reset_floor` #1587, or an `SS=1` record #1586,
+/// through one `ResetGate` built per call), even a lagged one whose window opens after it.
+/// The depot channel (cmt 1, #400) is a zero-order release into the depot followed by
+/// first-order `ka` absorption, distinct from the central channel (cmt 2, depot bypass).
 ///
 /// `index` is a [`crate::dosing::DoseIndex`] over these `doses` and lagtimes (#2754): the
-/// `SS=1` cutoff is a binary search, and only doses that can carry a rate
-/// (`duration > 0`) are visited — in dose order, so the sums are the scan's, bit for bit.
+/// `SS=1` cutoff is a binary search and only doses with `duration > 0` are visited, in dose
+/// order, so the sums are the scan's, bit for bit.
 fn active_rates_at(
-    mid: f64,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    index: &crate::dosing::DoseIndex,
-    reset_floor: f64,
-    pk_model: PkModel,
+    mid: f64, doses: &[DoseEvent], dose_lagtimes: &[f64], index: &crate::dosing::DoseIndex,
+    reset_floor: f64, pk_model: PkModel,
 ) -> [f64; 4] {
     let mut rate_central = 0.0;
     let mut rate_periph1 = 0.0;
@@ -1365,14 +1215,9 @@ fn propagate_with_bounds(
         }
         let [rate_central, rate_periph1, rate_periph2, rate_depot] = match precomputed {
             Some(r) => r[wi],
-            None => active_rates_at(
-                0.5 * (s0 + s1),
-                doses,
-                dose_lagtimes,
-                index,
-                reset_floor,
-                pk_model,
-            ),
+            None => {
+                active_rates_at(0.5 * (s0 + s1), doses, dose_lagtimes, index, reset_floor, pk_model)
+            }
         };
 
         // 2-/3-cpt dispatch goes through the per-walk eigendata memo (`eigen`) and
@@ -1505,11 +1350,7 @@ pub(crate) fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate:
 /// into the **depot** (RATE>0 into cmt 1, #400): zero-order release into the
 /// depot, then first-order `ka` absorption into central.
 pub(crate) fn propagate_one_cpt_oral(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_depot: f64,
+    state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64, rate_depot: f64,
 ) {
     crate::sens::propagate::propagate_one_cpt_oral_g::<f64>(
         state,
@@ -1529,7 +1370,6 @@ mod tests {
     use super::*;
     use crate::types::DoseEvent;
     use approx::assert_relative_eq;
-    use std::collections::HashMap;
 
     fn pk_one(cl: f64, v: f64) -> PkParams {
         let mut p = PkParams::default();
@@ -1550,34 +1390,13 @@ mod tests {
     fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         let n_obs = obs_times.len();
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times,
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n_obs],
             obs_cmts: vec![1; n_obs],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 
@@ -1744,14 +1563,8 @@ mod tests {
         }
         // The reshaped curve must NOT equal the old linear-in-F halving.
         let full = preds(100.0, 1.0);
-        let differs = half_f
-            .iter()
-            .zip(full.iter())
-            .any(|(&h, &f)| (h - 0.5 * f).abs() > 1e-6);
-        assert!(
-            differs,
-            "rate-defined infusion under F must reshape the curve, not halve it"
-        );
+        let differs = half_f.iter().zip(full.iter()).any(|(&h, &f)| (h - 0.5 * f).abs() > 1e-6);
+        assert!(differs, "rate-defined infusion under F must reshape the curve, not halve it");
     }
 
     #[test]
@@ -1787,24 +1600,9 @@ mod tests {
         let ss_infusion = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 25.0, true, 24.0);
 
         let cases: Vec<(&str, PkModel, PkParams, DoseEvent)> = vec![
-            (
-                "1cpt-iv bolus",
-                PkModel::OneCptIv,
-                with_f(pk_one(5.0, 50.0)),
-                bolus(1),
-            ),
-            (
-                "1cpt-iv infusion",
-                PkModel::OneCptIv,
-                with_f(pk_one(5.0, 50.0)),
-                infusion(1),
-            ),
-            (
-                "2cpt-iv bolus",
-                PkModel::TwoCptIv,
-                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
-                bolus(1),
-            ),
+            ("1cpt-iv bolus", PkModel::OneCptIv, with_f(pk_one(5.0, 50.0)), bolus(1)),
+            ("1cpt-iv infusion", PkModel::OneCptIv, with_f(pk_one(5.0, 50.0)), infusion(1)),
+            ("2cpt-iv bolus", PkModel::TwoCptIv, with_f(pk_two(5.0, 40.0, 3.0, 60.0)), bolus(1)),
             (
                 "2cpt-iv infusion",
                 PkModel::TwoCptIv,
@@ -1824,18 +1622,8 @@ mod tests {
                 infusion(1),
             ),
             // Steady-state (F!=1) across both routes and compartment counts.
-            (
-                "1cpt-iv SS bolus",
-                PkModel::OneCptIv,
-                with_f(pk_one(5.0, 50.0)),
-                ss_bolus(1),
-            ),
-            (
-                "1cpt-iv SS infusion",
-                PkModel::OneCptIv,
-                with_f(pk_one(5.0, 50.0)),
-                ss_infusion(1),
-            ),
+            ("1cpt-iv SS bolus", PkModel::OneCptIv, with_f(pk_one(5.0, 50.0)), ss_bolus(1)),
+            ("1cpt-iv SS infusion", PkModel::OneCptIv, with_f(pk_one(5.0, 50.0)), ss_infusion(1)),
             (
                 "2cpt-iv SS infusion",
                 PkModel::TwoCptIv,
@@ -1870,10 +1658,7 @@ mod tests {
                 &[],
             );
             for (j, (&s, &e)) in superposition.iter().zip(ev.iter()).enumerate() {
-                assert!(
-                    e > 0.0,
-                    "{label}: event-driven conc should be >0 at obs {j}"
-                );
+                assert!(e > 0.0, "{label}: event-driven conc should be >0 at obs {j}");
                 assert_relative_eq!(s, e, epsilon = 1e-9, max_relative = rtol);
             }
         }
@@ -1905,10 +1690,7 @@ mod tests {
             assert_relative_eq!(hf, ef, max_relative = 1e-12);
         }
         assert!(
-            half_f
-                .iter()
-                .zip(full.iter())
-                .any(|(&h, &f)| (h - 0.4 * f).abs() > 1e-6),
+            half_f.iter().zip(full.iter()).any(|(&h, &f)| (h - 0.4 * f).abs() > 1e-6),
             "rate-defined oral infusion under F must reshape, not scale"
         );
     }
@@ -1936,10 +1718,8 @@ mod tests {
             );
 
             // Same dose, no lag, sampled at t-L.
-            let subj_nolag = make_subject(
-                vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)],
-                shifted.clone(),
-            );
+            let subj_nolag =
+                make_subject(vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)], shifted.clone());
             let pk_nolag = pk_one(cl, v); // lagtime defaults to 0
             let unlagged = event_driven_predictions(
                 PkModel::OneCptIv,
@@ -1967,9 +1747,7 @@ mod tests {
 
     /// Time-varying `CL` snapshot per record.
     fn ed_lagged_fixture(
-        lag: f64,
-        cl_dose_row: f64,
-        cl_last_obs: f64,
+        lag: f64, cl_dose_row: f64, cl_last_obs: f64,
     ) -> (Subject, Vec<PkParams>, Vec<PkParams>) {
         // t=0   bolus 1000, no lag        (CL = CL_A)
         // t=5   obs                       (CL = CL_A)
@@ -2145,37 +1923,28 @@ mod tests {
         let pk_obs = vec![pk; obs_times.len()];
 
         let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
-        assert!(
-            preds[0] > 0.0,
-            "mid-infusion pre-reset obs should be positive"
-        );
+        assert!(preds[0] > 0.0, "mid-infusion pre-reset obs should be positive");
         assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
     }
 
-    /// #1477: the schedule's precomputed per-sub-interval rates must reproduce the
-    /// walk's per-call scan **bit for bit**, including the walk's *running* reset
-    /// floor. The fixture makes every branch of `active_rates_at` live on the
-    /// precomputed side — two overlapping infusions (summed in dose order), a reset
-    /// mid-infusion (turns both off), a lagged second dose (shifted window) and a
-    /// lagged steady-state infusion whose previous cycle is still running at its
-    /// record (the #1121 residual window, `lag = 11 > II − T_inf = 10`, so the seeded
-    /// state keeps delivering on `[20, 21]`) with a second reset *inside* that
-    /// pre-arrival window — and the scan side is forced by invalidating the key,
-    /// which is also the route an `F`-reshaped or η-resolved dose takes. Mutation
-    /// check: a precompute that ignores the reset floor keeps 175 running past 4 h
-    /// and the 5 h observation diverges; one that skips the lag misplaces the
-    /// 2.5–6.5 h window and the 3 h observation diverges; one that tests the residual
-    /// window against a stale floor keeps 100 running past the 20.6 h reset and the
-    /// 21 h observation diverges (a zero-lag SS dose cannot see that one — its
-    /// `ss_seeded_at_record` is false and the 100 comes from the ordinary arrival
-    /// window, PR #1482 review).
+    /// #1477: the schedule's precomputed per-sub-interval rates must reproduce the walk's
+    /// per-call scan **bit for bit**, including the walk's *running* reset floor. The fixture
+    /// makes every branch of `active_rates_at` live on the precomputed side: two overlapping
+    /// infusions (summed in dose order), a reset mid-infusion, a lagged second dose, and a lagged
+    /// SS infusion whose previous cycle is still running at its record (#1121 residual window,
+    /// `lag = 11 > II − T_inf = 10`, so the seeded state keeps delivering on `[20, 21]`) with a
+    /// second reset inside that pre-arrival window; the scan side is forced by invalidating the
+    /// key (also the route an `F`-reshaped or η-resolved dose takes). Mutations: ignoring the
+    /// reset floor keeps 175 running past 4 h (5 h obs diverges); skipping the lag misplaces the
+    /// 2.5-6.5 h window (3 h obs diverges); testing the residual window against a stale floor
+    /// keeps 100 running past the 20.6 h reset (21 h obs diverges; a zero-lag SS dose cannot see
+    /// that, PR #1482).
     ///
-    /// Since #1587 the 20.6 h reset also **cancels** the SS dose's own lagged arrival
-    /// window `[31, 33]`: its record (20 h) precedes the reset, as NONMEM measures it
-    /// (`nonmem_anchor/evid_reset_lag`). A fourth dose recorded after the reset (25 h,
-    /// lag 6) lands on the same window, so the lagged-arrival branch stays live on the
-    /// precomputed side, and the 32 h interval reads 100 — not 200, which is what a
-    /// precompute keyed on the arrival instead of the record would give.
+    /// Since #1587 the 20.6 h reset also **cancels** the SS dose's own lagged arrival window
+    /// `[31, 33]` (its record, 20 h, precedes the reset, as NONMEM measures it:
+    /// `nonmem_anchor/evid_reset_lag`). A fourth dose recorded after the reset (25 h, lag 6)
+    /// lands on the same window, so the lagged-arrival branch stays live, and the 32 h interval
+    /// reads 100, not 200.
     #[test]
     fn precomputed_interval_rates_match_the_per_call_scan_bit_for_bit() {
         let doses = vec![
@@ -2209,17 +1978,9 @@ mod tests {
         assert!(sched.rates_valid_for(&subj.doses));
         // The precompute is live and sees each regime: the 2.5–6.5 h overlap before
         // the reset (125 + 50), quiet stretches, and the SS infusion alone.
-        let central: Vec<f64> = sched
-            .rates_per_interval
-            .iter()
-            .flatten()
-            .map(|r| r[0])
-            .collect();
+        let central: Vec<f64> = sched.rates_per_interval.iter().flatten().map(|r| r[0]).collect();
         for want in [175.0, 125.0, 0.0, 100.0] {
-            assert!(
-                central.contains(&want),
-                "no sub-interval at rate {want}: {central:?}"
-            );
+            assert!(central.contains(&want), "no sub-interval at rate {want}: {central:?}");
         }
         let interval_ending_at_obs = |t: f64| -> &[[f64; 4]] {
             let (i, _) = sched
@@ -2272,10 +2033,7 @@ mod tests {
         );
         let mut scan = sched.clone();
         scan.rates_dose_key.clear();
-        assert!(
-            !scan.rates_valid_for(&subj.doses),
-            "an empty key must force the scan"
-        );
+        assert!(!scan.rates_valid_for(&subj.doses), "an empty key must force the scan");
         let slow = event_driven_predictions_with_schedule(
             PkModel::TwoCptIv,
             &subj,
@@ -2287,21 +2045,14 @@ mod tests {
         assert_eq!(fast.len(), obs_times.len());
         for (j, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
             assert!(a.is_finite(), "obs {j} non-finite: {a}");
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "obs {j}: precomputed {a} vs scanned {b}"
-            );
+            assert_eq!(a.to_bits(), b.to_bits(), "obs {j}: precomputed {a} vs scanned {b}");
         }
         // The pre-reset observations see drug and the post-reset ones do not — so the
         // identity above is between two live numbers, not two zeros. 20.3 h sits
         // inside the seeded residual window (drug present, still infusing); 21 h is
         // past the 20.6 h reset (zeroed, quiet); 32 h is inside the arrival window.
         assert!(fast[2] > 0.0 && fast[3] == 0.0, "{fast:?}");
-        assert!(
-            fast[6] > 0.0 && fast[7] == 0.0 && fast[10] > 0.0,
-            "{fast:?}"
-        );
+        assert!(fast[6] > 0.0 && fast[7] == 0.0 && fast[10] > 0.0, "{fast:?}");
     }
 
     /// #1586: an `SS=1` record stops an infusion running across it, on **both** sides of
@@ -2342,10 +2093,7 @@ mod tests {
                 .enumerate()
                 .find(|(_, e)| e.kind == EventKind::Obs && e.time == t)
                 .unwrap_or_else(|| panic!("obs at {t} h"));
-            sched.rates_per_interval[i - 1]
-                .iter()
-                .map(|r| r[3])
-                .collect()
+            sched.rates_per_interval[i - 1].iter().map(|r| r[3]).collect()
         };
         assert!(
             depot_rate_ending_at(9.5).iter().all(|&r| r == 10.0),
@@ -2384,11 +2132,7 @@ mod tests {
         assert_eq!(fast.len(), nonmem.len());
         for (j, (want, (a, b))) in nonmem.iter().zip(fast.iter().zip(&slow)).enumerate() {
             assert!(a.is_finite(), "obs {j} non-finite: {a}");
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "obs {j}: precomputed {a} vs scanned {b}"
-            );
+            assert_eq!(a.to_bits(), b.to_bits(), "obs {j}: precomputed {a} vs scanned {b}");
             // Measured ≤ 1.1e-15 relative at the fix (91× headroom); the defect is +14 % at
             // 15 h.
             assert_relative_eq!(*a, *want, max_relative = 1e-13);
@@ -2406,20 +2150,11 @@ mod tests {
         assert!(sched.rates_valid_for(&subj.doses));
         let mut reshaped = subj.doses.clone();
         reshaped[0].rate *= 0.5;
-        assert!(
-            !sched.rates_valid_for(&reshaped),
-            "a changed rate invalidates"
-        );
+        assert!(!sched.rates_valid_for(&reshaped), "a changed rate invalidates");
         let mut longer = subj.doses.clone();
         longer[0].duration += 1.0;
-        assert!(
-            !sched.rates_valid_for(&longer),
-            "a changed duration invalidates"
-        );
-        assert!(
-            !sched.rates_valid_for(&[]),
-            "a different dose count invalidates"
-        );
+        assert!(!sched.rates_valid_for(&longer), "a changed duration invalidates");
+        assert!(!sched.rates_valid_for(&[]), "a different dose count invalidates");
     }
 
     #[test]
@@ -2713,33 +2448,26 @@ mod tests {
         p
     }
 
-    /// #2104: the event-driven walk and the superposition closed forms serve the same value,
-    /// or both `NaN`, for every degenerate `CL` / `V` on every closed-form model — so a
-    /// subject's prediction no longer depends on whether one of its covariates varies over
-    /// time. Before the fix the walk *skipped* the step on a `CL ≤ 0`, keeping the whole dose
-    /// with no elimination (`AMT / V` = 6.25 on every IV row, where superposition served 0),
-    /// and neither engine caught `+inf`, where the walk formed `0 / 0`.
+    /// #2104: the event-driven walk and the superposition closed forms serve the same value, or
+    /// both `NaN`, for every degenerate `CL` / `V` on every closed-form model, so a prediction
+    /// does not depend on whether a covariate varies over time. (The walk used to *skip* the step
+    /// on `CL ≤ 0`, keeping the dose with no elimination: `AMT / V` = 6.25 on every IV row where
+    /// superposition served 0; neither engine caught `+inf`, the walk formed `0 / 0`.)
     ///
-    /// Three dosing histories: one bolus (an observation sits on its arrival, where no time
-    /// has elapsed and the walk reads the dose itself), two boluses, so the second lands on
-    /// residual drug, and two infusions (an observation on an infusion's start, where the
-    /// state is still empty but superposition already sums the dose). A `NaN` `CL` / `V` is in the table too: both engines must keep it (#2039).
+    /// Three dosing histories: one bolus (an observation on its arrival), two boluses (the
+    /// second lands on residual drug), two infusions (an observation on an infusion's start,
+    /// where the state is still empty but superposition already sums the dose). A `NaN` `CL` / `V`
+    /// is in the table too: both engines keep it (#2039).
     ///
-    /// Mutations (run): drop the degenerate check in `observe_central_g` → the `CL = 0` row
-    /// at `t = 0` dies (6.25 served); drop its `NaN`-`CL` check → the `NaN` `CL` row at
-    /// `t = 0` dies; drop its `dosed ||` → the infusion history's `NaN` `CL` row at `t = 1`
-    /// dies (0 served: the state is still empty); drop its `v.is_nan()` half → the
-    /// infusion history's `V = NaN` row at `t = 0`, before any dose, dies (`NaN` served
-    /// where superposition has nothing to sum); drop the `NaN` early return in
-    /// `single_dose_concentration` → the 2-cpt infusion `CL = NaN` row at `t = 1` dies (its
-    /// closed form returns 0 there); drop the `+inf` half of `cl_or_v_degenerate` → the `CL = +inf` rows die;
-    /// drop the early return in `single_dose_concentration` → the `CL = +inf` rows die (`NaN`
-    /// against 0); drop the empty-and-unforced clause of `skip_step_on_cl_v` → the
-    /// infusion history's `NaN` rows at `t = 0.5` die (the walk steps its empty state to
-    /// `NaN` where superposition, with no dose yet, serves 0). The propagation step's
-    /// emptying is *not* observable here — with constant
-    /// parameters every later observation's own degenerate `CL` reads 0 anyway — so it is
-    /// pinned by the time-varying test below.
+    /// Mutations (run): dropping the degenerate check in `observe_central_g` kills the `CL = 0`
+    /// row at `t = 0`; its `NaN`-`CL` check the `NaN` `CL` row at `t = 0`; its `dosed ||` the
+    /// infusion history's `NaN` `CL` row at `t = 1`; its `v.is_nan()` half the infusion history's
+    /// `V = NaN` row at `t = 0`; the `NaN` early return in `single_dose_concentration` the 2-cpt
+    /// infusion `CL = NaN` row at `t = 1`; the `+inf` half of `cl_or_v_degenerate` or the early
+    /// return in `single_dose_concentration` the `CL = +inf` rows; the empty-and-unforced clause
+    /// of `skip_step_on_cl_v` the infusion history's `NaN` rows at `t = 0.5`. The propagation
+    /// step's emptying is not observable here (constant parameters), so the time-varying test
+    /// below pins it.
     #[test]
     fn the_walk_and_superposition_agree_on_a_degenerate_clearance_or_volume() {
         let histories: [(&str, Vec<DoseEvent>, Vec<f64>); 3] = [
@@ -2840,10 +2568,7 @@ mod tests {
                         // eigenmode solve drops its `k12 = 3e-300` to 0. Both are numerical
                         // zeros, twelve decades below the 6.25 the old walk served.
                         let tol = 1e-12 * w.abs().max(c.abs()) + 1e-12;
-                        assert!(
-                            (w - c).abs() <= tol,
-                            "{where_}: walk {w} vs superposition {c}"
-                        );
+                        assert!((w - c).abs() <= tol, "{where_}: walk {w} vs superposition {c}");
                     }
                     // The fixture must be live where it claims to be: the control serves
                     // drug after the first dose, or "both 0" would pass vacuously.
@@ -2858,23 +2583,18 @@ mod tests {
         }
     }
 
-    /// #2104, the time-varying half: a `CL ≤ 0` on one record of a subject empties the
-    /// system over the interval it governs, and a later dose under valid parameters is served
-    /// as though it were the first. This is the case superposition cannot express (its
-    /// parameters are constant), so the reference is superposition of the *later dose
-    /// alone*. Before the fix the walk carried the first dose through the bad interval with
-    /// no elimination, so the post-second-dose rows read high by what remained of it.
+    /// #2104, the time-varying half: a `CL ≤ 0` on one record empties the system over the
+    /// interval it governs, and a later dose under valid parameters is served as though it were
+    /// the first. Superposition cannot express this, so the reference is superposition of the
+    /// *later dose alone* (the walk used to carry the first dose through the bad interval, so
+    /// post-second-dose rows read high). The rows after the bad record carry a valid `CL`, so
+    /// only the propagation step's emptying can supply the 0. Each model runs on the production
+    /// walk and the generic walk at `T = f64` (different code: the memoised arms of
+    /// `propagate_with_bounds` vs the inline `propagate_*_g` wrappers).
     ///
-    /// The rows after the bad record carry a *valid* `CL`, so the readout's own degenerate
-    /// check cannot supply the 0: only the propagation step's emptying can. Each model is run
-    /// on the production walk and on the generic walk at `T = f64`, which reach the 2-/3-cpt
-    /// gate through different code (the memoised arms of `propagate_with_bounds` against the
-    /// inline `propagate_*_g` wrappers).
-    ///
-    /// Mutations (run): restore the bare skip in `propagate_one_cpt_g` → the 1-cpt IV rows
-    /// die on both walks; drop the gate in one `propagate_with_bounds` 2-/3-cpt arm → that
-    /// model's production rows die; drop it in one inline `propagate_*_g` wrapper → that
-    /// model's generic-walk rows die.
+    /// Mutations (run): restoring the bare skip in `propagate_one_cpt_g` kills the 1-cpt IV rows
+    /// on both walks; dropping the gate in one `propagate_with_bounds` 2-/3-cpt arm kills that
+    /// model's production rows; in one inline `propagate_*_g` wrapper, its generic-walk rows.
     #[test]
     fn a_degenerate_clearance_on_one_record_empties_the_system_until_the_next_dose() {
         use crate::sens::propagate::{event_driven_sens_g, PkDual};
@@ -2911,9 +2631,8 @@ mod tests {
                 let mut bad = good;
                 bad.values[crate::types::PK_IDX_CL] = bad_cl;
                 // Record TIME 4 carries the degenerate CL; it governs the interval (2, 4].
-                let pk_obs: Vec<PkParams> = (0..obs_times.len())
-                    .map(|j| if j == 1 { bad } else { good })
-                    .collect();
+                let pk_obs: Vec<PkParams> =
+                    (0..obs_times.len()).map(|j| if j == 1 { bad } else { good }).collect();
                 let production =
                     event_driven_predictions(model, &subj, &[good, good], &pk_obs, &[]);
                 let schedule = EventSchedule::for_subject(&subj, model, &subj.doses, &[0.0, 0.0]);
@@ -2969,18 +2688,14 @@ mod tests {
         let subj = make_subject(doses, obs_times.clone());
         let bad_from = 2; // TIME 4
         for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
-            for (label, idx) in [
-                ("CL", crate::types::PK_IDX_CL),
-                ("V", crate::types::PK_IDX_V),
-            ] {
+            for (label, idx) in [("CL", crate::types::PK_IDX_CL), ("V", crate::types::PK_IDX_V)] {
                 let mut good = pk_two(5.0, 80.0, 3.0, 40.0);
                 good.values[crate::types::PK_IDX_KA] = 1.2;
                 let mut bad = good;
                 bad.values[idx] = f64::NAN;
                 let pk_dose = vec![good; subj.doses.len()];
-                let pk_obs: Vec<PkParams> = (0..obs_times.len())
-                    .map(|j| if j < bad_from { good } else { bad })
-                    .collect();
+                let pk_obs: Vec<PkParams> =
+                    (0..obs_times.len()).map(|j| if j < bad_from { good } else { bad }).collect();
                 let preds = event_driven_predictions(model, &subj, &pk_dose, &pk_obs, &[]);
                 for (j, p) in preds.iter().enumerate() {
                     if j < bad_from {
@@ -3018,10 +2733,7 @@ mod tests {
         let obs_times = vec![1.0, 4.0, 13.0, 24.0];
         let subj = make_subject(doses, obs_times.clone());
         for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
-            for (label, idx) in [
-                ("CL", crate::types::PK_IDX_CL),
-                ("V", crate::types::PK_IDX_V),
-            ] {
+            for (label, idx) in [("CL", crate::types::PK_IDX_CL), ("V", crate::types::PK_IDX_V)] {
                 let mut pk = pk_two(5.0, 80.0, 3.0, 40.0);
                 pk.values[crate::types::PK_IDX_KA] = 1.2;
                 pk.values[idx] = f64::NAN;
@@ -3191,10 +2903,8 @@ mod tests {
             event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose_f, &pk_obs_f, &[]);
         // (2) F=0.4 holds the rate (500) and scales the duration, so it equals a
         // full-F infusion of F·AMT = 400 at the same rate (#419) - not 0.4x.
-        let subj_scaled = make_subject(
-            vec![DoseEvent::new(0.0, 400.0, 1, 500.0, false, 0.0)],
-            obs_times.clone(),
-        );
+        let subj_scaled =
+            make_subject(vec![DoseEvent::new(0.0, 400.0, 1, 500.0, false, 0.0)], obs_times.clone());
         let preds_scaled = event_driven_predictions(
             PkModel::OneCptIv,
             &subj_scaled,
@@ -3239,40 +2949,22 @@ mod tests {
 
     #[test]
     fn event_driven_applies_oral_infusion_into_central() {
-        // Regression: the event-driven path previously DROPPED infusion input on
-        // oral models — `propagate_*_oral` ignored the central input rate — so an
-        // infusion into an oral model's central compartment (cmt 2, depot bypass)
-        // returned ~0 instead of the correct curve. This affected TV-covariate,
-        // reset, and IOV subjects on oral+infusion models.
-        //
-        // Three checks:
-        //   1. At F=1, event-driven == the superposition reference
-        //      (`predict_concentration` models an oral infusion as a depot-
-        //      bypassing IV-into-central infusion — the NONMEM result). Before
-        //      the fix this was ~0 vs a positive curve.
-        //   2. Predictions scale linearly with F (F=0.4 → 0.4×), confirming F is
-        //      applied to the infusion rate.
-        //   3. Cross-path agreement at F≠1: with #327/#349 now applying F on the
-        //      superposition path too, event-driven == superposition at F=0.4 —
-        //      not just F=1. Guards against either path silently dropping F
-        //      (the gap Ron's #351 review flagged that the F=1-only check (1)
-        //      cannot catch).
+        // Regression: the event-driven path once DROPPED infusion input on oral models
+        // (`propagate_*_oral` ignored the central input rate), so an infusion into central (cmt 2,
+        // depot bypass) returned ~0 (TV-covariate, reset and IOV subjects). Three checks:
+        //   1. At F=1, event-driven == the superposition reference (`predict_concentration` models
+        //      an oral infusion as a depot-bypassing IV-into-central infusion, the NONMEM result).
+        //   2. Predictions scale linearly with F (F=0.4 gives 0.4×): F is applied to the rate.
+        //   3. At F≠1 (#327/#349 apply F on the superposition path too), event-driven ==
+        //      superposition, guarding against either path silently dropping F (#351).
         let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
         // rate=25 → 4 h infusion into central (cmt 2) on an oral model.
         let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0);
         let subj = make_subject(vec![dose], obs_times.clone());
 
         let cases: Vec<(&str, PkModel, PkParams)> = vec![
-            (
-                "1cpt-oral",
-                PkModel::OneCptOral,
-                pk_one_oral(5.0, 50.0, 1.2),
-            ),
-            (
-                "2cpt-oral",
-                PkModel::TwoCptOral,
-                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
-            ),
+            ("1cpt-oral", PkModel::OneCptOral, pk_one_oral(5.0, 50.0, 1.2)),
+            ("2cpt-oral", PkModel::TwoCptOral, pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2)),
             (
                 "3cpt-oral",
                 PkModel::ThreeCptOral,
@@ -3359,16 +3051,8 @@ mod tests {
         let subj = make_subject(vec![dose], obs_times.clone());
 
         let cases: Vec<(&str, PkModel, PkParams)> = vec![
-            (
-                "1cpt-oral SS",
-                PkModel::OneCptOral,
-                pk_one_oral(5.0, 50.0, 1.2),
-            ),
-            (
-                "2cpt-oral SS",
-                PkModel::TwoCptOral,
-                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
-            ),
+            ("1cpt-oral SS", PkModel::OneCptOral, pk_one_oral(5.0, 50.0, 1.2)),
+            ("2cpt-oral SS", PkModel::TwoCptOral, pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2)),
             (
                 "3cpt-oral SS",
                 PkModel::ThreeCptOral,
@@ -3456,16 +3140,8 @@ mod tests {
         let subj = make_subject(doses, obs_times.clone());
 
         let cases: Vec<(&str, PkModel, PkParams)> = vec![
-            (
-                "1cpt-oral",
-                PkModel::OneCptOral,
-                pk_one_oral(5.0, 50.0, 1.2),
-            ),
-            (
-                "2cpt-oral",
-                PkModel::TwoCptOral,
-                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
-            ),
+            ("1cpt-oral", PkModel::OneCptOral, pk_one_oral(5.0, 50.0, 1.2)),
+            ("2cpt-oral", PkModel::TwoCptOral, pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2)),
             (
                 "3cpt-oral",
                 PkModel::ThreeCptOral,
@@ -3482,10 +3158,7 @@ mod tests {
                 .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
                 .collect();
             for (j, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
-                assert!(
-                    *a > 0.0,
-                    "{label}: obs {j} should be >0 (infusion accumulation)"
-                );
+                assert!(*a > 0.0, "{label}: obs {j} should be >0 (infusion accumulation)");
                 assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-7);
             }
         }
@@ -3858,10 +3531,7 @@ mod tests {
             let st = ss_state_at_phase_event_driven(PkModel::OneCptIv, &pk, &dose, phase);
             let conc = st[0] / v;
             let expected = one_cpt_infusion_ss(&dose, phase, cl, v);
-            assert!(
-                conc > 0.0,
-                "central amount must be positive at phase {phase}"
-            );
+            assert!(conc > 0.0, "central amount must be positive at phase {phase}");
             assert_relative_eq!(conc, expected, epsilon = 1e-12, max_relative = 1e-12);
         }
     }
@@ -3889,24 +3559,17 @@ mod tests {
         }
     }
 
-    /// **#908 oracle.** The walk's steady-state trough must equal the *exact* periodic
-    /// steady state — the dose-superposition SS closed forms — to f64 precision, on every
-    /// walk-supported model, including the slow-disposition cases where the pre-#908
-    /// 50-cycle pulse train was wrong by tens of percent.
+    /// **#908 oracle.** The walk's steady-state trough must equal the *exact* periodic steady
+    /// state (the dose-superposition SS closed forms) to f64 precision on every walk-supported
+    /// model, including slow-disposition cases where the pre-#908 50-cycle pulse train was wrong
+    /// by tens of percent. The trough is the pre-pulse state at phase `0⁻ ≡ II`, so
+    /// `closed_form(II)` is the reference (isolating the equilibration from the forward walk).
     ///
-    /// The trough is the pre-pulse state at phase `0⁻ ≡ II`, so `closed_form(II)` is the
-    /// reference; comparing there (rather than at an arbitrary observation) isolates the
-    /// equilibration from the forward walk that follows it.
-    ///
-    /// **Regression.** Restoring the pulse train makes the two `SLOW` one-compartment rows
-    /// miss by ~3.0e-1 — the walk had been returning a steady state a third too low for an
-    /// ordinary long-half-life drug. The slow 2-/3-cpt rows fail on the central compartment
-    /// too (~1.0e-1 / ~8.2e-2); their deep *peripheral* amounts, which no concentration
-    /// assertion sees, were off by more than half.
-    ///
-    /// The `cycles == 1` assertion is load-bearing: without it a silent fall back to the
-    /// pulse train on a *fast* row would still pass the value check, so the exact path could
-    /// stop being taken without any test noticing.
+    /// Regression: restoring the pulse train makes the two `SLOW` one-compartment rows miss by
+    /// ~3.0e-1 (a third too low), the slow 2-/3-cpt central rows by ~1.0e-1 / ~8.2e-2, and their
+    /// deep peripheral amounts (not seen by concentration assertions) by more than half. The
+    /// `cycles == 1` assertion is load-bearing: without it a silent fall back to the pulse train
+    /// on a *fast* row would still pass the value check.
     #[test]
     fn ss_equilibration_matches_the_exact_periodic_closed_form() {
         struct Case {
@@ -4045,11 +3708,7 @@ mod tests {
                 c.label
             );
             let got = trough[central] / c.pk.v();
-            assert!(
-                got > 0.0,
-                "{}: trough concentration must be positive",
-                c.label
-            );
+            assert!(got > 0.0, "{}: trough concentration must be positive", c.label);
             approx::assert_relative_eq!(got, c.expected_conc, max_relative = 1e-12);
         }
     }
@@ -4076,11 +3735,7 @@ mod tests {
                 PkModel::ThreeCptIv,
                 pk_three(5.0, 50.0, 3.0, 80.0, 0.0, 60.0),
             ),
-            (
-                "2cpt q=0 (eigen solve declines)",
-                PkModel::TwoCptIv,
-                pk_two(5.0, 50.0, 0.0, 80.0),
-            ),
+            ("2cpt q=0 (eigen solve declines)", PkModel::TwoCptIv, pk_two(5.0, 50.0, 0.0, 80.0)),
         ] {
             let state = equilibrate_ss_state_event_driven(model, &pk, &dose);
             assert_eq!(
@@ -4103,9 +3758,7 @@ mod tests {
         );
         let warning = crate::dosing::last_ss_equilibration_warning();
         assert!(
-            warning
-                .as_deref()
-                .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
+            warning.as_deref().is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
             "a model with no periodic steady state must surface a non-convergence warning \
              from the analytical walk; got: {warning:?}"
         );
@@ -4200,9 +3853,7 @@ mod tests {
 
     /// RK4 integrate `y' = f(t, y)` from 0 to `t_end` with `n` steps; return y(t_end).
     fn rk4<const D: usize>(
-        f: impl Fn(f64, &[f64; D]) -> [f64; D],
-        t_end: f64,
-        n: usize,
+        f: impl Fn(f64, &[f64; D]) -> [f64; D], t_end: f64, n: usize,
     ) -> [f64; D] {
         let h = t_end / n as f64;
         let mut y = [0.0_f64; D];
@@ -4402,9 +4053,8 @@ mod tests {
         // 50 cycles leaves negligible (≈0.09^50) residual below steady state.
         let n_doses = 50usize;
         let last = (n_doses - 1) as f64 * ii;
-        let acc_doses: Vec<DoseEvent> = (0..n_doses)
-            .map(|k| DoseEvent::new(k as f64 * ii, amt, 1, rate, false, 0.0))
-            .collect();
+        let acc_doses: Vec<DoseEvent> =
+            (0..n_doses).map(|k| DoseEvent::new(k as f64 * ii, amt, 1, rate, false, 0.0)).collect();
         let acc_times: Vec<f64> = phases.iter().map(|&p| last + p).collect();
         let acc_subj = make_subject(acc_doses, acc_times.clone());
         let acc_preds = event_driven_predictions(
@@ -4457,46 +4107,31 @@ mod tests {
         assert_relative_eq!(auc_inf, auc_bolus, max_relative = 2e-3);
     }
 
-    /// #1189 — a non-finite dose lagtime must not panic this walk's event sort, and
-    /// must not come back as a *finite* answer with the bad dose silently dropped.
+    /// #1189: a non-finite dose lagtime must not panic this walk's event sort, and must not come
+    /// back as a *finite* answer with the bad dose silently dropped. This is the **analytical**
+    /// event walk, a different timeline sort from the ODE engines' (an ODE-model test never
+    /// reaches it). It carried `partial_cmp(..).unwrap_or(Ordering::Equal)`, which is not a total
+    /// order, and `sort_by` panics on that only opportunistically (measured on this toolchain: a
+    /// 30-event (5 NaN) and an 84-event (2 NaN) timeline of this walk's `Event` panic; 24, 40,
+    /// 60, 120 do not). `total_cmp` alone is not enough: it sorts `NaN` last and the walk advances
+    /// on `ev.time > cur_t`, false for `NaN`, so the lagged dose is never applied and predictions
+    /// come back finite and drug-free.
     ///
-    /// This is the **analytical** (closed-form) event walk — a *different* timeline sort
-    /// from the ODE engines', and one an ODE-model test never reaches, which is why it
-    /// needs its own coverage. It carried `partial_cmp(..).unwrap_or(Ordering::Equal)`,
-    /// there deliberately as the NaN-safe form. It is not a total order, and `sort_by`
-    /// panics when it detects one — but **only opportunistically**: measured on this
-    /// toolchain the same composite comparator panics on a 30-event (5 NaN) and an
-    /// 84-event (2 NaN) timeline of this walk's own `Event` type, and does *not* on 24,
-    /// 40, 60 or 120. Adding a single `usize` to the element flips shapes either way, so
-    /// the old spelling was neither safe nor reliably loud.
-    ///
-    /// `total_cmp` alone is not enough either: it sorts `NaN` last, and the walk advances
-    /// on `ev.time > cur_t`, which is `false` for `NaN` — so the lagged dose is never
-    /// applied and every prediction comes back finite and drug-free.
-    ///
-    /// The fixture is 5 doses + 20 observations = **30 events**, one of the shapes
-    /// measured to trip the detector, so both mutations below are lethal here. The
-    /// durable signal is the second one: the guard makes the outcome deterministic on
-    /// every shape, whereas the panic is an implementation detail of the sort.
-    ///
-    /// Mutations (both run): restore `unwrap_or(Ordering::Equal)` → panic; drop
-    /// `EventSchedule::non_finite_event_time`'s guard → finite predictions and the assert
-    /// below fires.
+    /// The fixture (5 doses + 20 observations = 30 events) trips the detector, so both mutations
+    /// are lethal: restoring `unwrap_or(Ordering::Equal)` panics; dropping
+    /// `EventSchedule::non_finite_event_time`'s guard gives finite predictions and the assert fires.
     #[test]
     fn non_finite_lagtime_gives_a_non_finite_subject_not_a_panic_or_a_silent_drop() {
         // 5 doses x 2 events + 20 observations = 30 events, one of the shapes measured
         // to make `sort_by` detect the old non-total comparator (24 and 40 do not).
-        let doses: Vec<DoseEvent> = (0..5)
-            .map(|k| DoseEvent::new(k as f64 * 12.0, 100.0, 1, 0.0, false, 0.0))
-            .collect();
+        let doses: Vec<DoseEvent> =
+            (0..5).map(|k| DoseEvent::new(k as f64 * 12.0, 100.0, 1, 0.0, false, 0.0)).collect();
         let obs_times: Vec<f64> = (1..=20).map(|i| i as f64 * 1.5).collect();
         let subj = make_subject(doses, obs_times.clone());
 
-        for (label, lag) in [
-            ("NaN", f64::NAN),
-            ("+inf", f64::INFINITY),
-            ("-inf", f64::NEG_INFINITY),
-        ] {
+        for (label, lag) in
+            [("NaN", f64::NAN), ("+inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)]
+        {
             let lags = vec![lag; subj.doses.len()];
             let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &lags);
             assert_eq!(

@@ -140,12 +140,7 @@ fn run_modelsearch_command(args: &[String]) -> Result<i32, String> {
     let result = run_modelsearch(
         &config,
         &base,
-        ModelsearchRun {
-            dir: Some(dir.clone()),
-            threads,
-            cancel: None,
-            progress: Some(&progress),
-        },
+        ModelsearchRun { dir: Some(dir.clone()), threads, cancel: None, progress: Some(&progress) },
     )?;
 
     print!("{}", render_summary(&result));
@@ -174,27 +169,10 @@ mod tests {
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "modelsearch",
-                "a.ferxsearch",
-                "b.ferxsearch"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "modelsearch", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "modelsearch", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "modelsearch", "-h"])), 0);
         assert_eq!(run(&args(&["ferx", "modelsearch"])), 1);
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "modelsearch",
-                "x.ferxsearch",
-                "--samples",
-                "3"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "modelsearch", "x.ferxsearch", "--samples", "3"])), 1);
     }
 }

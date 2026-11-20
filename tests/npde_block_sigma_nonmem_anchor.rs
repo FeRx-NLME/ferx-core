@@ -119,23 +119,15 @@ fn nonmem_scores(file: &str) -> Vec<(String, f64, f64, f64, f64)> {
                 .collect();
             // NONMEM writes ID as a float; ferx keys subjects by the CSV string.
             (f[mdv] == 0.0).then(|| {
-                (
-                    format!("{}", f[id] as i64),
-                    f[time],
-                    free.map_or(0.0, |k| f[k]),
-                    f[npd],
-                    f[npde],
-                )
+                (format!("{}", f[id] as i64), f[time], free.map_or(0.0, |k| f[k]), f[npd], f[npde])
             })
         })
         .collect()
 }
 
 fn load(arm: &str) -> (CompiledModel, Population) {
-    let model = parse_model_file(Path::new(&format!(
-        "tests/fixtures/npde_block_sigma_{arm}.ferx"
-    )))
-    .expect("the anchor model parses");
+    let model = parse_model_file(Path::new(&format!("tests/fixtures/npde_block_sigma_{arm}.ferx")))
+        .expect("the anchor model parses");
     assert_eq!(model.residual_correlations.len(), 1);
     assert!(
         (model.residual_correlations[0].rho - 0.5).abs() < 1e-12,
@@ -153,19 +145,13 @@ fn load(arm: &str) -> (CompiledModel, Population) {
 /// The twin's parameters with ρ replaced, as a fit that estimated it returns them.
 fn at_rho(model: &CompiledModel, rho: f64) -> ModelParameters {
     let mut p = model.default_params.clone();
-    p.residual_correlations = vec![ResidualCorrelation {
-        rho,
-        ..model.residual_correlations[0].clone()
-    }];
+    p.residual_correlations =
+        vec![ResidualCorrelation { rho, ..model.residual_correlations[0].clone() }];
     p
 }
 
 fn free_of(subject: &ferx_core::types::Subject, j: usize) -> f64 {
-    subject
-        .obs_covariates
-        .get(j)
-        .and_then(|m| m.get("FREE").copied())
-        .unwrap_or(0.0)
+    subject.obs_covariates.get(j).and_then(|m| m.get("FREE").copied()).unwrap_or(0.0)
 }
 
 #[derive(Debug)]
@@ -182,11 +168,7 @@ struct Worst {
 /// back `NaN` would otherwise pass on the strength of the rows that worked.
 fn worst_vs_nonmem(ferx: &[SubjectNpde], pop: &Population, table: &str, n_rows: usize) -> Worst {
     let nm = nonmem_scores(table);
-    let mut w = Worst {
-        npd_free0: 0.0,
-        npd_free1: 0.0,
-        npde: 0.0,
-    };
+    let mut w = Worst { npd_free0: 0.0, npd_free1: 0.0, npde: 0.0 };
     let mut matched = 0usize;
     for (subj, s) in pop.subjects.iter().zip(ferx) {
         for (j, t) in subj.obs_times.iter().enumerate() {
@@ -214,11 +196,7 @@ fn worst_vs_nonmem(ferx: &[SubjectNpde], pop: &Population, table: &str, n_rows: 
             matched += 1;
         }
     }
-    assert_eq!(
-        matched,
-        nm.len(),
-        "every NONMEM observation row must be matched"
-    );
+    assert_eq!(matched, nm.len(), "every NONMEM observation row must be matched");
     assert_eq!(matched, n_rows, "the anchor design's observation count");
     w
 }

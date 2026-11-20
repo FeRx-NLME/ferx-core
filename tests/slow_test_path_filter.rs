@@ -65,14 +65,8 @@ struct Pattern {
 impl Pattern {
     fn parse(raw: &str) -> Self {
         match raw.strip_prefix('!') {
-            Some(rest) => Pattern {
-                glob: rest.to_string(),
-                negated: true,
-            },
-            None => Pattern {
-                glob: raw.to_string(),
-                negated: false,
-            },
+            Some(rest) => Pattern { glob: rest.to_string(), negated: true },
+            None => Pattern { glob: raw.to_string(), negated: false },
         }
     }
 }
@@ -191,14 +185,9 @@ fn strip_inline_comment(item: &str) -> &str {
 /// committed paths, so untracked scratch files and `.gitignore`d NONMEM run output (there
 /// is some under `nonmem_anchor/`) must not count as uncovered inputs.
 fn tracked_files(root: &Path) -> Vec<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-z"])
-        .output()
-        .expect(
-            "`git ls-files` runs (the guard needs the checkout git evaluates the filter against)",
-        );
+    let out = Command::new("git").arg("-C").arg(root).args(["ls-files", "-z"]).output().expect(
+        "`git ls-files` runs (the guard needs the checkout git evaluates the filter against)",
+    );
     assert!(
         out.status.success(),
         "`git ls-files` failed: {}",
@@ -234,10 +223,8 @@ fn tracked_files(root: &Path) -> Vec<String> {
 /// tests actually reference are confined to `.github/workflows/`. Put a fixture in a
 /// dot-directory and that test fails loudly instead of this harvest skipping it silently.
 fn runtime_input_roots(root: &Path, tracked: &[String]) -> BTreeSet<String> {
-    let tracked_roots: BTreeSet<&str> = tracked
-        .iter()
-        .filter_map(|p| p.split_once('/').map(|(head, _)| head))
-        .collect();
+    let tracked_roots: BTreeSet<&str> =
+        tracked.iter().filter_map(|p| p.split_once('/').map(|(head, _)| head)).collect();
 
     let mut roots = BTreeSet::new();
     for (_, literal) in referenced_paths(root, tracked) {
@@ -267,10 +254,8 @@ fn runtime_input_roots(root: &Path, tracked: &[String]) -> BTreeSet<String> {
 /// directory and the rest are taken as-is.
 fn referenced_paths(root: &Path, tracked: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let member_test_dirs: Vec<String> = built_members(root)
-        .into_iter()
-        .map(|m| format!("{m}/tests/"))
-        .collect();
+    let member_test_dirs: Vec<String> =
+        built_members(root).into_iter().map(|m| format!("{m}/tests/")).collect();
     for path in tracked.iter().filter(|p| {
         p.ends_with(".rs")
             && (p.starts_with("tests/") || member_test_dirs.iter().any(|d| p.starts_with(d)))
@@ -369,11 +354,8 @@ fn member_package_name(root: &Path, member: &str) -> Option<String> {
 /// would silently stop guarding that member while every test still passed. The guard's own
 /// failure mode is the one it exists to prevent.
 fn excluded_packages(workflow: &str) -> BTreeSet<String> {
-    let stripped: String = workflow
-        .lines()
-        .map(|line| strip_yaml_comment(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let stripped: String =
+        workflow.lines().map(|line| strip_yaml_comment(line)).collect::<Vec<_>>().join("\n");
     let mut out = BTreeSet::new();
     let mut tokens = stripped.split_whitespace().peekable();
     while let Some(tok) = tokens.next() {
@@ -466,19 +448,12 @@ fn required_inputs(root: &Path, tracked: &[String]) -> Vec<String> {
     // Directory prefixes, not top-level roots: a member's sources live two levels down
     // (`crates/ferx-tools/src/`), and matching on the head alone would pull in the whole of
     // `crates/` for a root the job does not build (a future docs-only crate, say).
-    let mut dir_prefixes: BTreeSet<String> = ["src/".to_string(), "tests/".to_string()]
-        .into_iter()
-        .collect();
-    dir_prefixes.extend(
-        runtime_input_roots(root, tracked)
-            .into_iter()
-            .map(|r| format!("{r}/")),
-    );
+    let mut dir_prefixes: BTreeSet<String> =
+        ["src/".to_string(), "tests/".to_string()].into_iter().collect();
+    dir_prefixes.extend(runtime_input_roots(root, tracked).into_iter().map(|r| format!("{r}/")));
 
-    let mut files: BTreeSet<String> = ["Cargo.toml", "Cargo.lock", WORKFLOW]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let mut files: BTreeSet<String> =
+        ["Cargo.toml", "Cargo.lock", WORKFLOW].into_iter().map(str::to_string).collect();
 
     // `--workspace` makes each built member's sources, tests and manifest compile inputs of
     // this job exactly as the root package's are. An `--exclude`d member is not built, so
@@ -497,10 +472,8 @@ fn required_inputs(root: &Path, tracked: &[String]) -> Vec<String> {
     // respect it.
     let all_members = workspace_members(root);
     let built = built_members(root);
-    let excluded_prefixes: Vec<String> = all_members
-        .difference(&built)
-        .map(|m| format!("{m}/"))
-        .collect();
+    let excluded_prefixes: Vec<String> =
+        all_members.difference(&built).map(|m| format!("{m}/")).collect();
 
     tracked
         .iter()
@@ -557,9 +530,7 @@ fn slow_test_filter_covers_every_input_the_heavy_fits_read() {
     );
     for member in &members {
         assert!(
-            required
-                .iter()
-                .any(|p| p.starts_with(&format!("{member}/src/"))),
+            required.iter().any(|p| p.starts_with(&format!("{member}/src/"))),
             "no required input under `{member}/src/` — `cargo test --workspace` compiles it, \
              so a push touching only that member must re-run the slow suite"
         );
@@ -608,10 +579,8 @@ fn the_filter_does_not_select_an_excluded_member() {
     let patterns = push_path_patterns(&workflow);
     let tracked = tracked_files(&root);
 
-    let excluded: BTreeSet<String> = workspace_members(&root)
-        .difference(&built_members(&root))
-        .cloned()
-        .collect();
+    let excluded: BTreeSet<String> =
+        workspace_members(&root).difference(&built_members(&root)).cloned().collect();
     assert!(
         !excluded.is_empty(),
         "the slow job `--exclude`s nothing, so this guard has nothing to check — delete it \
@@ -713,20 +682,14 @@ resolver = "2"
 [package]
 description = "not/a/member"
 "#;
-    let expected: BTreeSet<String> = ["crates/ferx-tools", "crates/ferx-cli"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let expected: BTreeSet<String> =
+        ["crates/ferx-tools", "crates/ferx-cli"].into_iter().map(str::to_string).collect();
     for (label, manifest) in [
         ("single line", one_line),
         ("trailing bracket", trailing),
         ("bracket on its own line", own_line),
     ] {
-        assert_eq!(
-            parse_workspace_members(manifest),
-            expected,
-            "{label} form parsed wrong"
-        );
+        assert_eq!(parse_workspace_members(manifest), expected, "{label} form parsed wrong");
     }
 }
 
@@ -738,18 +701,11 @@ fn slow_test_filter_has_no_dead_globs() {
     let patterns = push_path_patterns(&workflow);
     let tracked = tracked_files(&root);
 
-    assert!(
-        !patterns.is_empty(),
-        "parsed no `paths:` entries out of {WORKFLOW}"
-    );
+    assert!(!patterns.is_empty(), "parsed no `paths:` entries out of {WORKFLOW}");
 
     let dead: Vec<&str> = patterns
         .iter()
-        .filter(|p| {
-            !tracked
-                .iter()
-                .any(|f| glob_matches(p.glob.as_bytes(), f.as_bytes()))
-        })
+        .filter(|p| !tracked.iter().any(|f| glob_matches(p.glob.as_bytes(), f.as_bytes())))
         .map(|p| p.glob.as_str())
         .collect();
 
@@ -771,10 +727,7 @@ fn derived_runtime_roots_are_the_fixture_directories() {
     // The fixture roots the fits demonstrably read. Named here (rather than only relied on
     // implicitly) so that a harvest which quietly stops seeing one fails loudly.
     for expected in ["data", "examples", "nonmem_anchor"] {
-        assert!(
-            roots.contains(expected),
-            "harvest lost the `{expected}/` fixture root: {roots:?}"
-        );
+        assert!(roots.contains(expected), "harvest lost the `{expected}/` fixture root: {roots:?}");
     }
     // Repo tooling config is read by CI-guard tests (this file opens `.github/workflows/`),
     // but it is not a fit input and must not drag `.github/**` into the filter.
@@ -820,10 +773,8 @@ fn include_str_fixtures_resolve_to_their_repo_relative_path() {
     // reaches `examples/pktte_joint.ferx`.
     let root = repo_root();
     let tracked = tracked_files(&root);
-    let referenced: BTreeSet<String> = referenced_paths(&root, &tracked)
-        .into_iter()
-        .map(|(_, literal)| literal)
-        .collect();
+    let referenced: BTreeSet<String> =
+        referenced_paths(&root, &tracked).into_iter().map(|(_, literal)| literal).collect();
 
     for expected in ["data/warfarin.csv", "examples/pktte_joint.ferx"] {
         assert!(
@@ -835,10 +786,7 @@ fn include_str_fixtures_resolve_to_their_repo_relative_path() {
     assert!(
         !referenced.iter().any(|p| p.starts_with("../")),
         "an unresolved `../` literal survived resolution: {:?}",
-        referenced
-            .iter()
-            .filter(|p| p.starts_with("../"))
-            .collect::<Vec<_>>()
+        referenced.iter().filter(|p| p.starts_with("../")).collect::<Vec<_>>()
     );
 }
 
@@ -902,18 +850,12 @@ env:
     let globs: Vec<&str> = patterns.iter().map(|p| p.glob.as_str()).collect();
     assert_eq!(globs, vec!["src/**", "src/bin/**"]);
     assert!(!patterns[0].negated);
-    assert!(
-        patterns[1].negated,
-        "a `!`-prefixed entry must parse as an exclusion"
-    );
+    assert!(patterns[1].negated, "a `!`-prefixed entry must parse as an exclusion");
 }
 
 #[test]
 fn inline_comments_do_not_leak_into_globs() {
-    assert_eq!(
-        strip_inline_comment("'src/**'   # everything linked into the fits"),
-        "'src/**'   "
-    );
+    assert_eq!(strip_inline_comment("'src/**'   # everything linked into the fits"), "'src/**'   ");
     // A `#` that is not comment-introducing (no preceding space, or inside quotes) stays.
     assert_eq!(strip_inline_comment("'src/a#b/**'"), "'src/a#b/**'");
     assert_eq!(strip_inline_comment("'src/**'"), "'src/**'");
@@ -945,12 +887,9 @@ fn dispatch_nocapture_input_is_boolean_and_conditional() {
         .copied()
         .take_while(|l| l.trim().is_empty() || indent(l) > base)
         .collect();
-    let input = block
-        .iter()
-        .position(|l| l.trim() == "nocapture:")
-        .unwrap_or_else(|| {
-            panic!("workflow_dispatch must declare a `nocapture` input: {block:#?}")
-        });
+    let input = block.iter().position(|l| l.trim() == "nocapture:").unwrap_or_else(|| {
+        panic!("workflow_dispatch must declare a `nocapture` input: {block:#?}")
+    });
     let input_indent = indent(block[input]);
     let body: Vec<&str> = block[input + 1..]
         .iter()
@@ -968,10 +907,7 @@ fn dispatch_nocapture_input_is_boolean_and_conditional() {
     // (since #2182 there are two: the sharded legs and the nn job).
     let stripped = lines.join("\n");
     let ats: Vec<usize> = stripped.match_indices(EXPR).map(|(at, _)| at).collect();
-    assert!(
-        !ats.is_empty(),
-        "the slow-tests cargo command must carry `{EXPR}` (outside comments)"
-    );
+    assert!(!ats.is_empty(), "the slow-tests cargo command must carry `{EXPR}` (outside comments)");
     for at in ats {
         // The command the expression ends: back to the step's `run: |`.
         let start = stripped[..at].rfind("run: |").unwrap_or(0);

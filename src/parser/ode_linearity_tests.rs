@@ -5,11 +5,8 @@ use super::*;
 /// assigned inside the block parse as variables — and classify it.
 fn affine(states: &[&str], params: &[&str], body: &str) -> bool {
     let states: Vec<String> = states.iter().map(|s| s.to_string()).collect();
-    let mut defined: Vec<String> = states
-        .iter()
-        .cloned()
-        .chain(params.iter().map(|s| s.to_string()))
-        .collect();
+    let mut defined: Vec<String> =
+        states.iter().cloned().chain(params.iter().map(|s| s.to_string())).collect();
     let pre = parse_block_statements(body, ParseCtx::ode(&defined), StatementMode::Ode)
         .expect("fixture parses");
     for v in assigned_vars_in_order(&pre) {
@@ -28,12 +25,7 @@ const TWO_CPT: &[&str] = &["depot", "central", "periph"];
 #[test]
 fn accepts_linear_compartmental_systems() {
     let cases: &[(&str, &[&str], &[&str], &str)] = &[
-        (
-            "one-cpt",
-            ONE_CPT,
-            &["CL", "V"],
-            "d/dt(central) = -CL/V*central",
-        ),
+        ("one-cpt", ONE_CPT, &["CL", "V"], "d/dt(central) = -CL/V*central"),
         (
             "two-cpt with depot",
             TWO_CPT,
@@ -73,18 +65,10 @@ fn accepts_linear_compartmental_systems() {
             &["LCL", "V"],
             "d/dt(central) = -exp(LCL)/V*central + log(V)",
         ),
-        (
-            "case-insensitive state names",
-            ONE_CPT,
-            &["CL", "V"],
-            "d/dt(central) = -CL/V*CENTRAL",
-        ),
+        ("case-insensitive state names", ONE_CPT, &["CL", "V"], "d/dt(central) = -CL/V*CENTRAL"),
     ];
     for (name, states, params, body) in cases {
-        assert!(
-            affine(states, params, body),
-            "{name} should classify linear"
-        );
+        assert!(affine(states, params, body), "{name} should classify linear");
     }
 }
 
@@ -113,30 +97,10 @@ fn rejects_nonlinear_systems() {
              d/dt(target) = -KON*central*target + KOFF*complex
              d/dt(complex) = KON*central*target - (KOFF + KINT)*complex",
         ),
-        (
-            "state in a denominator",
-            ONE_CPT,
-            &["K"],
-            "d/dt(central) = -K/central",
-        ),
-        (
-            "transcendental of a state",
-            ONE_CPT,
-            &["K"],
-            "d/dt(central) = -K*exp(central)",
-        ),
-        (
-            "non-unit power of a state",
-            ONE_CPT,
-            &["K"],
-            "d/dt(central) = -K*central^2",
-        ),
-        (
-            "state power by a parameter",
-            ONE_CPT,
-            &["K", "G"],
-            "d/dt(central) = -K*central^G",
-        ),
+        ("state in a denominator", ONE_CPT, &["K"], "d/dt(central) = -K/central"),
+        ("transcendental of a state", ONE_CPT, &["K"], "d/dt(central) = -K*exp(central)"),
+        ("non-unit power of a state", ONE_CPT, &["K"], "d/dt(central) = -K*central^2"),
+        ("state power by a parameter", ONE_CPT, &["K", "G"], "d/dt(central) = -K*central^G"),
         (
             "state in an if condition",
             ONE_CPT,
@@ -174,10 +138,7 @@ fn rejects_nonlinear_systems() {
         ),
     ];
     for (name, states, params, body) in cases {
-        assert!(
-            !affine(states, params, body),
-            "{name} must not classify linear"
-        );
+        assert!(!affine(states, params, body), "{name} must not classify linear");
     }
 }
 

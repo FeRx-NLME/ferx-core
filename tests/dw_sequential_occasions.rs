@@ -103,16 +103,11 @@ fn evaluate(src: &str, data: &str) -> (Population, FitResult) {
         &parsed.column_map,
     )
     .expect("data loads");
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    };
+    let opts =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() };
     let r = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("evaluation");
     assert!(
-        r.subjects
-            .iter()
-            .all(|s| s.iwres.iter().all(|e| e.is_finite())),
+        r.subjects.iter().all(|s| s.iwres.iter().all(|e| e.is_finite())),
         "every IWRES must be finite, or the hand recomputation pairs other rows"
     );
     (pop, r)
@@ -153,9 +148,7 @@ fn sparse_tdm_dw_is_taken_over_the_subject_and_warns() {
         let (pop, r) = evaluate(&src, SPARSE_DATA);
         assert_eq!(pop.subjects.len(), 24);
         assert!(
-            pop.subjects
-                .iter()
-                .all(|s| s.observations.len() == 6 && s.doses.len() == 6),
+            pop.subjects.iter().all(|s| s.observations.len() == 6 && s.doses.len() == 6),
             "{occasions}: six doses and six troughs per subject"
         );
         if occasions.contains("iov_column") {
@@ -180,11 +173,7 @@ fn sparse_tdm_dw_is_taken_over_the_subject_and_warns() {
             "{occasions}: the fit's DW is the whole-subject one"
         );
         assert!((r.dw_statistic - want).abs() < 1e-12, "{occasions}: {want}");
-        assert!(
-            r.dw_statistic < 1.5,
-            "{occasions}: AR(1) residuals, DW {}",
-            r.dw_statistic
-        );
+        assert!(r.dw_statistic < 1.5, "{occasions}: AR(1) residuals, DW {}", r.dw_statistic);
         let dw = dw_warnings(&r);
         assert_eq!(dw.len(), 1, "{occasions}: {:#?}", r.warnings);
         assert!(
@@ -203,15 +192,10 @@ fn sparse_tdm_dw_is_taken_over_the_subject_and_warns() {
 /// Mutation that must redden this: `occasions_run_in_time` always `false`.
 #[test]
 fn warfarin_iov_dw_is_taken_over_the_subject() {
-    let (pop, r) = evaluate(
-        include_str!("../examples/warfarin_iov.ferx"),
-        "data/warfarin_iov.csv",
-    );
+    let (pop, r) = evaluate(include_str!("../examples/warfarin_iov.ferx"), "data/warfarin_iov.csv");
     assert_eq!(subjects_in_time(&pop), pop.subjects.len());
     assert!(
-        pop.subjects
-            .iter()
-            .all(|s| s.occasions.windows(2).any(|w| w[0] != w[1])),
+        pop.subjects.iter().all(|s| s.occasions.windows(2).any(|w| w[0] != w[1])),
         "every subject must carry more than one occasion"
     );
     let (pairs_whole, want) = pair_normalised_dw(&whole(&r));

@@ -31,11 +31,7 @@ fn pop_of(csv: &str) -> Population {
 
 fn preds(src: &str, csv: &str) -> Vec<f64> {
     let m = parse_full_model(src).expect("model parses").model;
-    predict(&m, &pop_of(csv), &m.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect()
+    predict(&m, &pop_of(csv), &m.default_params).unwrap().into_iter().map(|p| p.pred).collect()
 }
 
 const TWO_CPT_ORAL_CF: &str = r#"
@@ -177,10 +173,7 @@ fn assert_agree(cf: &[f64], ode: &[f64], tol: f64, case: &str) {
     );
     for (j, (&c, &o)) in cf.iter().zip(ode).enumerate() {
         let rel = (c - o).abs() / o.abs();
-        assert!(
-            rel < tol,
-            "{case} obs {j}: closed form {c:.14} vs ODE {o:.14} (rel {rel:.2e})"
-        );
+        assert!(rel < tol, "{case} obs {j}: closed form {c:.14} vs ODE {o:.14} (rel {rel:.2e})");
     }
 }
 

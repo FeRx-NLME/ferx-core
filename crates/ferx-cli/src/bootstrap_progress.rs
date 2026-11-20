@@ -101,10 +101,7 @@ impl BootstrapProgress {
     /// [`ProgressDrawTarget::stderr`] to a hidden target when stderr is
     /// redirected, so a bar in a log file or a pipe is already impossible.
     pub fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            state: Mutex::new(State::default()),
-        }
+        Self { enabled, state: Mutex::new(State::default()) }
     }
 
     /// Render one event. Never panics: it is called from inside `par_iter`,
@@ -120,11 +117,7 @@ impl BootstrapProgress {
             Err(_) => return,
         };
         match event {
-            BootstrapEvent::Started {
-                replicates,
-                reused,
-                base_fit,
-            } => {
+            BootstrapEvent::Started { replicates, reused, base_fit } => {
                 if reused > 0 {
                     eprintln!("  reusing {reused} replicates already on disk");
                 }
@@ -145,9 +138,7 @@ impl BootstrapProgress {
             BootstrapEvent::ReplicateDone { completed, .. } => {
                 state.advance(Pass::Replicates, completed);
             }
-            BootstrapEvent::DeltaOfvDone {
-                completed, total, ..
-            } => {
+            BootstrapEvent::DeltaOfvDone { completed, total, .. } => {
                 // Any Δofv event is where the replicate bar is done: the pass
                 // only starts once every replicate is in. Which one arrives
                 // first is not known - the evaluations are handed their count by
@@ -194,23 +185,13 @@ mod tests {
     /// hidden draw target and nothing is written - but `position()` is still
     /// the state the bar would draw, which is what these assert.
     fn positions(progress: &BootstrapProgress) -> Option<u64> {
-        progress
-            .state
-            .lock()
-            .expect("not poisoned")
-            .bar
-            .as_ref()
-            .map(|b| b.position())
+        progress.state.lock().expect("not poisoned").bar.as_ref().map(|b| b.position())
     }
 
     #[test]
     fn the_replicate_bar_appears_after_the_base_fit_and_tracks_completions() {
         let progress = BootstrapProgress::new(true);
-        progress.on_event(BootstrapEvent::Started {
-            replicates: 3,
-            reused: 0,
-            base_fit: true,
-        });
+        progress.on_event(BootstrapEvent::Started { replicates: 3, reused: 0, base_fit: true });
         // While the base model is fitting there is a spinner and no bar: a bar
         // sitting at 0/3 through a fit that can take minutes reads as stuck.
         assert!(positions(&progress).is_none());
@@ -235,11 +216,7 @@ mod tests {
     #[test]
     fn a_run_without_a_base_fit_starts_the_bar_immediately() {
         let progress = BootstrapProgress::new(true);
-        progress.on_event(BootstrapEvent::Started {
-            replicates: 5,
-            reused: 2,
-            base_fit: false,
-        });
+        progress.on_event(BootstrapEvent::Started { replicates: 5, reused: 2, base_fit: false });
         assert_eq!(positions(&progress), Some(0));
         // The length is what is left to fit, not the sample count: the two
         // reused replicates are already on disk.
@@ -250,11 +227,7 @@ mod tests {
     #[test]
     fn the_delta_ofv_pass_replaces_the_replicate_bar() {
         let progress = BootstrapProgress::new(true);
-        progress.on_event(BootstrapEvent::Started {
-            replicates: 2,
-            reused: 0,
-            base_fit: false,
-        });
+        progress.on_event(BootstrapEvent::Started { replicates: 2, reused: 0, base_fit: false });
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 2,
             total: 2,
@@ -290,11 +263,7 @@ mod tests {
         // A resumed run, so the two passes have different lengths: 4 replicates
         // left to fit, but the Δofv sweep covers all 6 including the reused.
         let progress = BootstrapProgress::new(true);
-        progress.on_event(BootstrapEvent::Started {
-            replicates: 4,
-            reused: 2,
-            base_fit: false,
-        });
+        progress.on_event(BootstrapEvent::Started { replicates: 4, reused: 2, base_fit: false });
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 4,
             total: 4,
@@ -323,11 +292,7 @@ mod tests {
     #[test]
     fn a_late_completion_does_not_step_the_bar_backwards() {
         let progress = BootstrapProgress::new(true);
-        progress.on_event(BootstrapEvent::Started {
-            replicates: 8,
-            reused: 0,
-            base_fit: false,
-        });
+        progress.on_event(BootstrapEvent::Started { replicates: 8, reused: 0, base_fit: false });
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 5,
             total: 8,
@@ -351,11 +316,7 @@ mod tests {
     #[test]
     fn a_disabled_progress_draws_nothing() {
         let progress = BootstrapProgress::new(false);
-        progress.on_event(BootstrapEvent::Started {
-            replicates: 4,
-            reused: 0,
-            base_fit: true,
-        });
+        progress.on_event(BootstrapEvent::Started { replicates: 4, reused: 0, base_fit: true });
         progress.on_event(BootstrapEvent::BaseFitDone);
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 1,

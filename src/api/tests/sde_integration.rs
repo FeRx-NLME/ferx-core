@@ -1,7 +1,6 @@
 use super::fit;
 use crate::parser::model_parser::parse_full_model;
 use crate::types::*;
-use std::collections::HashMap;
 
 /// 1-cpt IV ODE model with a [diffusion] block on the central compartment.
 /// Sigma (ADD) is fixed so that the diffusion parameter must absorb residual
@@ -89,34 +88,15 @@ fn make_sde_population() -> Population {
     let subjects = dvs
         .iter()
         .map(|(id, obs)| Subject {
-            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: obs.clone(),
             obs_cmts: vec![1; 3],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1u32; 3],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
     Population {
@@ -157,28 +137,18 @@ fn test_sde_fit_smoke() {
     let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
         .expect("SDE fit should succeed");
     assert!(result.uses_sde, "uses_sde must be true");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     let diff_idx = result
         .theta_names
         .iter()
         .position(|n| n == "DIFF_CENTRAL")
         .expect("DIFF_CENTRAL must be in theta_names");
     let diff_val = result.theta[diff_idx];
-    assert!(
-        diff_val > 0.0,
-        "DIFF_CENTRAL must be positive, got {diff_val}"
-    );
+    assert!(diff_val > 0.0, "DIFF_CENTRAL must be positive, got {diff_val}");
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn test_sde_ofv_le_base_ofv() {
     // Reference: the OFV from the identical model fit without the
     // [diffusion] block (BASE_MODEL_SRC). Since [diffusion] adds an extra
@@ -194,22 +164,12 @@ fn test_sde_ofv_le_base_ofv() {
     let opts = fast_foce_opts();
 
     let parsed_base = parse_full_model(BASE_MODEL_SRC).expect("base model should parse");
-    let base_result = fit(
-        &parsed_base.model,
-        &pop,
-        &parsed_base.model.default_params,
-        &opts,
-    )
-    .expect("base fit should succeed");
+    let base_result = fit(&parsed_base.model, &pop, &parsed_base.model.default_params, &opts)
+        .expect("base fit should succeed");
 
     let parsed_sde = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
-    let sde_result = fit(
-        &parsed_sde.model,
-        &pop,
-        &parsed_sde.model.default_params,
-        &opts,
-    )
-    .expect("SDE fit should succeed");
+    let sde_result = fit(&parsed_sde.model, &pop, &parsed_sde.model.default_params, &opts)
+        .expect("SDE fit should succeed");
 
     assert!(
         sde_result.ofv <= base_result.ofv + 1.0,
@@ -229,34 +189,13 @@ fn sde_gn_returns_error() {
         // Minimal single-subject population (no data needed — error fires before fitting).
         use crate::types::{DoseEvent, Population, Subject};
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0],
             obs_cmts: vec![1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         Population {
             subjects: vec![subj],
@@ -269,10 +208,7 @@ fn sde_gn_returns_error() {
     };
 
     for method in [EstimationMethod::FoceGn, EstimationMethod::FoceGnHybrid] {
-        let opts = FitOptions {
-            method,
-            ..FitOptions::default()
-        };
+        let opts = FitOptions { method, ..FitOptions::default() };
         let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts);
         assert!(result.is_err(), "expected error for {:?} + SDE", method);
         let msg = result.unwrap_err().to_string();
@@ -296,12 +232,7 @@ fn sde_emits_experimental_warning() {
         .find(|d| d.code == "W_EXPERIMENTAL_SDE")
         .expect("SDE model should emit W_EXPERIMENTAL_SDE");
     assert_eq!(exp.severity, crate::diagnostics::Severity::Warning);
-    assert_eq!(
-        crate::types::classify_warning(&exp.message)
-            .category
-            .as_str(),
-        "experimental"
-    );
+    assert_eq!(crate::types::classify_warning(&exp.message).category.as_str(), "experimental");
 
     // #1285 (#1350 row 10a): "experimental" alone does not tell a user *what*
     // is fitted. The message must keep saying that the state mean is never
@@ -467,10 +398,8 @@ mod sde_unsupported_dosing_warnings {
         let ml = &parsed_lag.model;
         let lag_diags =
             super::super::check_model_data_warnings(ml, &make_sde_population(), &ml.default_params);
-        let lag = lag_diags
-            .iter()
-            .find(|d| d.code == "W_SDE_LAGTIME")
-            .expect("W_SDE_LAGTIME present");
+        let lag =
+            lag_diags.iter().find(|d| d.code == "W_SDE_LAGTIME").expect("W_SDE_LAGTIME present");
         assert_eq!(lag.severity, crate::diagnostics::Severity::Warning);
         assert!(
             lag.message.contains("record time"),
@@ -548,12 +477,9 @@ mod sde_steady_state_scores_like_the_explicit_train {
     fn ofv(pop: &Population) -> (f64, Vec<String>) {
         let parsed = parse_full_model(MM_SDE_SRC).expect("model parses");
         let m = &parsed.model;
-        let opts = FitOptions {
-            outer_maxiter: 0,
-            run_covariance_step: false,
-            ..FitOptions::default()
-        }
-        .quiet();
+        let opts =
+            FitOptions { outer_maxiter: 0, run_covariance_step: false, ..FitOptions::default() }
+                .quiet();
         let fit = fit(m, pop, &m.default_params, &opts).expect("evaluation succeeds");
         assert!(fit.ofv.is_finite(), "non-finite objective {}", fit.ofv);
         (fit.ofv, fit.warnings)
@@ -563,9 +489,7 @@ mod sde_steady_state_scores_like_the_explicit_train {
     fn one_ss_record_scores_like_forty_one_explicit_doses() {
         let ss = subject(vec![DoseEvent::new(480.0, 100.0, 1, 0.0, true, 12.0)]);
         let train = subject(
-            (0..=40)
-                .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
-                .collect(),
+            (0..=40).map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0)).collect(),
         );
         let single = subject(vec![DoseEvent::new(480.0, 100.0, 1, 0.0, false, 0.0)]);
         let (got, warnings) = ofv(&ss);
@@ -606,35 +530,17 @@ mod sde_steady_state_scores_like_the_explicit_train {
 /// subject declines the adjoint (the variance rows fail to record) and falls back per subject.
 #[test]
 fn the_warfarin_sde_example_fits_without_a_finite_difference_fallback() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/warfarin_sde.ferx"
-    ))
-    .expect("example readable");
-    assert!(
-        !src.contains("gradient_method"),
-        "the example must not pin FD"
-    );
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/warfarin_sde.ferx"))
+            .expect("example readable");
+    assert!(!src.contains("gradient_method"), "the example must not pin FD");
     let parsed = parse_full_model(&src).expect("example parses");
     assert!(parsed.model.is_sde());
-    let opts = FitOptions {
-        outer_maxiter: 3,
-        optimizer: Optimizer::Auto,
-        ..fast_foce_opts()
-    };
-    let fit = fit(
-        &parsed.model,
-        &make_sde_population(),
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect("fit runs");
+    let opts = FitOptions { outer_maxiter: 3, optimizer: Optimizer::Auto, ..fast_foce_opts() };
+    let fit = fit(&parsed.model, &make_sde_population(), &parsed.model.default_params, &opts)
+        .expect("fit runs");
     assert!(fit.ofv.is_finite());
-    let fd: Vec<_> = fit
-        .warnings
-        .iter()
-        .filter(|w| w.contains("finite-difference"))
-        .collect();
+    let fd: Vec<_> = fit.warnings.iter().filter(|w| w.contains("finite-difference")).collect();
     assert!(fd.is_empty(), "FD fallback reported: {fd:?}");
 }
 
@@ -642,11 +548,9 @@ fn the_warfarin_sde_example_fits_without_a_finite_difference_fallback() {
 /// the held-EBE score run, and no warning anywhere reports a finite-difference route.
 #[test]
 fn the_warfarin_sde_example_reports_no_fd_fallback_with_a_covariance_step() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/warfarin_sde.ferx"
-    ))
-    .expect("example readable");
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/warfarin_sde.ferx"))
+            .expect("example readable");
     let parsed = parse_full_model(&src).expect("example parses");
     let opts = FitOptions {
         outer_maxiter: 3,
@@ -654,18 +558,10 @@ fn the_warfarin_sde_example_reports_no_fd_fallback_with_a_covariance_step() {
         run_covariance_step: true,
         ..fast_foce_opts()
     };
-    let fit = fit(
-        &parsed.model,
-        &make_sde_population(),
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect("fit runs");
+    let fit = fit(&parsed.model, &make_sde_population(), &parsed.model.default_params, &opts)
+        .expect("fit runs");
     assert!(fit.ofv.is_finite());
-    assert!(
-        fit.covariance_matrix.is_some(),
-        "the covariance step must run"
-    );
+    assert!(fit.covariance_matrix.is_some(), "the covariance step must run");
     let fd: Vec<_> = fit
         .warnings
         .iter()

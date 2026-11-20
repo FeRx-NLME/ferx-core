@@ -122,14 +122,12 @@ const FERX_A: &str = r#"
 "#;
 
 /// NONMEM-A `IPRED` at t = 0.5, 1, 2, 4, 8, 12, 24 h.
-const NONMEM_A: [f64; 7] = [
-    5.1307E-01, 7.3040E-01, 8.2387E-01, 7.1554E-01, 4.8142E-01, 3.2271E-01, 9.7198E-02,
-];
+const NONMEM_A: [f64; 7] =
+    [5.1307E-01, 7.3040E-01, 8.2387E-01, 7.1554E-01, 4.8142E-01, 3.2271E-01, 9.7198E-02];
 
 /// NONMEM-B `IPRED` at the same times — the legacy `F1`-in-the-flux convention.
-const NONMEM_B: [f64; 7] = [
-    2.5653E-01, 3.6520E-01, 4.1193E-01, 3.5777E-01, 2.4071E-01, 1.6135E-01, 4.8599E-02,
-];
+const NONMEM_B: [f64; 7] =
+    [2.5653E-01, 3.6520E-01, 4.1193E-01, 3.5777E-01, 2.4071E-01, 1.6135E-01, 4.8599E-02];
 
 #[test]
 fn ferx_matches_nonmem_when_f_is_applied_only_at_the_dose() {
@@ -137,30 +135,18 @@ fn ferx_matches_nonmem_when_f_is_applied_only_at_the_dose() {
     write!(f, "{CSV}").expect("write csv");
     f.flush().expect("flush csv");
     let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
-    let model = parse_full_model(FERX_A)
-        .expect("the correct convention parses")
-        .model;
+    let model = parse_full_model(FERX_A).expect("the correct convention parses").model;
 
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
-    assert_eq!(
-        preds.len(),
-        NONMEM_A.len(),
-        "one prediction per observation"
-    );
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
+    assert_eq!(preds.len(), NONMEM_A.len(), "one prediction per observation");
 
     // 1e-4 relative: NONMEM's table carries 5 significant figures, and the observed
     // agreement is 8.5e-6, so this has ~10x headroom over the reference's own
     // precision without being loose enough to hide a real divergence.
     for (i, (&got, &want)) in preds.iter().zip(NONMEM_A.iter()).enumerate() {
         let rel = (got - want).abs() / want;
-        assert!(
-            rel < 1e-4,
-            "obs {i}: ferx {got:.6} vs NONMEM {want:.6} (rel {rel:.2e})"
-        );
+        assert!(rel < 1e-4, "obs {i}: ferx {got:.6} vs NONMEM {want:.6} (rel {rel:.2e})");
     }
 }
 
@@ -219,9 +205,8 @@ const FERX_ANALYTICAL_A: &str = r#"
 
 /// Analytical NONMEM-B `IPRED` — the `S2 = V/F1` convention, i.e. `F1` applied at
 /// the dose and again in the readout scale.
-const NONMEM_ANALYTICAL_B: [f64; 7] = [
-    2.5653E-01, 3.6520E-01, 4.1193E-01, 3.5777E-01, 2.4071E-01, 1.6135E-01, 4.8599E-02,
-];
+const NONMEM_ANALYTICAL_B: [f64; 7] =
+    [2.5653E-01, 3.6520E-01, 4.1193E-01, 3.5777E-01, 2.4071E-01, 1.6135E-01, 4.8599E-02];
 
 #[test]
 fn ferx_analytical_matches_nonmem_advan2_when_f_is_applied_only_at_the_dose() {
@@ -238,16 +223,9 @@ fn ferx_analytical_matches_nonmem_advan2_when_f_is_applied_only_at_the_dose() {
         .expect("the correct analytical convention parses")
         .model;
 
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
-    assert_eq!(
-        preds.len(),
-        NONMEM_A.len(),
-        "one prediction per observation"
-    );
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
+    assert_eq!(preds.len(), NONMEM_A.len(), "one prediction per observation");
     for (i, (&got, &want)) in preds.iter().zip(NONMEM_A.iter()).enumerate() {
         let rel = (got - want).abs() / want;
         assert!(

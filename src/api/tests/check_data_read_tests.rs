@@ -42,10 +42,7 @@ fn a_clause_that_does_not_compile_is_an_e_parse_diagnostic() {
         "the block is what `validate_model_file` attaches the line number to: {:?}",
         err
     );
-    assert!(
-        !err.message.is_empty(),
-        "the builder's own sentence has to survive the wrap"
-    );
+    assert!(!err.message.is_empty(), "the builder's own sentence has to survive the wrap");
 }
 
 /// No clauses at all is `Ok(None)` — the same "read everything" the check did
@@ -61,10 +58,7 @@ fn no_clauses_is_no_filter() {
         "the default must carry no clauses, or this passes for the wrong reason"
     );
     let filter = check_selection_filter(&opts).expect("no clauses cannot fail to compile");
-    assert!(
-        filter.is_none(),
-        "an empty filter is `None`, not a filter that matches nothing"
-    );
+    assert!(filter.is_none(), "an empty filter is `None`, not a filter that matches nothing");
 }
 
 /// Each clause kind on its own reaches the builder. `ignore_subjects` is the one
@@ -75,32 +69,20 @@ fn every_clause_kind_on_its_own_produces_a_filter() {
     for (label, opts) in [
         (
             "ignore",
-            FitOptions {
-                ignore_exprs: vec!["CMT == 2".to_string()],
-                ..FitOptions::default()
-            },
+            FitOptions { ignore_exprs: vec!["CMT == 2".to_string()], ..FitOptions::default() },
         ),
         (
             "accept",
-            FitOptions {
-                accept_exprs: vec!["CMT == 1".to_string()],
-                ..FitOptions::default()
-            },
+            FitOptions { accept_exprs: vec!["CMT == 1".to_string()], ..FitOptions::default() },
         ),
         (
             "ignore_subjects",
-            FitOptions {
-                ignore_subjects: vec!["2".to_string()],
-                ..FitOptions::default()
-            },
+            FitOptions { ignore_subjects: vec!["2".to_string()], ..FitOptions::default() },
         ),
     ] {
         let filter = check_selection_filter(&opts)
             .unwrap_or_else(|e| panic!("{label}: {} {}", e.code, e.message));
-        assert!(
-            filter.is_some(),
-            "{label}: the clause must reach the compiled filter"
-        );
+        assert!(filter.is_some(), "{label}: the clause must reach the compiled filter");
     }
 }
 
@@ -116,35 +98,17 @@ fn every_clause_kind_on_its_own_produces_a_filter() {
 #[test]
 fn a_reader_warning_is_relayed_under_the_code_it_states() {
     for (message, want) in [
-        (
-            "W_MISSING_DV: 1 observation row(s) (EVID=0) had a missing DV",
-            "W_MISSING_DV",
-        ),
-        (
-            "W_ADDL_MISSING_II subject 3: ADDL > 0 but II is zero",
-            "W_ADDL_MISSING_II",
-        ),
+        ("W_MISSING_DV: 1 observation row(s) (EVID=0) had a missing DV", "W_MISSING_DV"),
+        ("W_ADDL_MISSING_II subject 3: ADDL > 0 but II is zero", "W_ADDL_MISSING_II"),
         (
             "W_FILTER_COLUMN_ABSENT: data-selection filter references column(s)",
             "W_FILTER_COLUMN_ABSENT",
         ),
-        (
-            "W_CMT_DEFAULTED: the dataset has no CMT column",
-            "W_CMT_DEFAULTED",
-        ),
+        ("W_CMT_DEFAULTED: the dataset has no CMT column", "W_CMT_DEFAULTED"),
         ("W_NO_DOSES: parsed zero dose events", "W_NO_DOSES"),
-        (
-            "W_ALL_DOSES_ZERO: every dose record has AMT = 0",
-            "W_ALL_DOSES_ZERO",
-        ),
-        (
-            "W_AMT_NOT_DOSED: 2 record(s) across 1 subject(s)",
-            "W_AMT_NOT_DOSED",
-        ),
-        (
-            "W_CENS_UNEXPECTED subject 1: CENS=7 is not -1, 0, or 1",
-            "W_CENS_UNEXPECTED",
-        ),
+        ("W_ALL_DOSES_ZERO: every dose record has AMT = 0", "W_ALL_DOSES_ZERO"),
+        ("W_AMT_NOT_DOSED: 2 record(s) across 1 subject(s)", "W_AMT_NOT_DOSED"),
+        ("W_CENS_UNEXPECTED subject 1: CENS=7 is not -1, 0, or 1", "W_CENS_UNEXPECTED"),
         (
             "W_COVARIATE_MISSING: covariate CRCL has no value for 1 of 10 subjects (3)",
             "W_COVARIATE_MISSING",

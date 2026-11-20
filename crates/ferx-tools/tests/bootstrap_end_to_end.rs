@@ -44,10 +44,7 @@ fn an_identity_resample_reproduces_the_original_fit_exactly() {
     let direct = fit(&p.parsed.model, &p.population, &p.init_params, &options)
         .expect("evaluation on the original population");
 
-    let identity = Replicate {
-        index: 1,
-        keys: (0..p.population.subjects.len()).collect(),
-    };
+    let identity = Replicate { index: 1, keys: (0..p.population.subjects.len()).collect() };
     let rebuilt = resample::build_population(&p.population, &identity);
     let via_resample = fit(&p.parsed.model, &rebuilt, &p.init_params, &options)
         .expect("evaluation on the rebuilt population");
@@ -83,13 +80,8 @@ fn a_duplicated_subject_contributes_twice() {
     let mut keys: Vec<usize> = (0..p.population.subjects.len()).collect();
     keys.push(0);
     keys.sort_unstable();
-    let doubled = resample::build_population(
-        &p.population,
-        &Replicate {
-            index: 1,
-            keys: keys.clone(),
-        },
-    );
+    let doubled =
+        resample::build_population(&p.population, &Replicate { index: 1, keys: keys.clone() });
     assert_eq!(doubled.subjects.len(), p.population.subjects.len() + 1);
 
     let base = fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("base eval");
@@ -108,10 +100,7 @@ fn a_duplicated_subject_contributes_twice() {
     // merged into one subject with twice the records, or dropped as a repeated
     // ID, this is where it shows.
     assert_eq!(with_dup.subjects[0].id, p.population.subjects[0].id);
-    assert_eq!(
-        with_dup.subjects[1].id,
-        format!("{}#2", p.population.subjects[0].id)
-    );
+    assert_eq!(with_dup.subjects[1].id, format!("{}#2", p.population.subjects[0].id));
     assert_eq!(
         with_dup.subjects[0].ofv_contribution.to_bits(),
         with_dup.subjects[1].ofv_contribution.to_bits(),
@@ -172,10 +161,7 @@ fn a_duplicated_subject_contributes_twice() {
 fn a_replicate_that_railed_still_gets_a_delta_ofv() {
     let p = prepared();
     let options = eval_options(&p.parsed.fit_options);
-    assert_eq!(
-        options.outer_maxiter, 0,
-        "premise: the Δofv sweep is an evaluation, not a fit"
-    );
+    assert_eq!(options.outer_maxiter, 0, "premise: the Δofv sweep is an evaluation, not a fit");
 
     let evaluated = fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("eval");
     let mut flat = flatten_estimates(&p.init_params, &evaluated);
@@ -201,10 +187,7 @@ fn a_replicate_that_railed_still_gets_a_delta_ofv() {
          this Err into a silent `None`: {:?}",
         out.err()
     );
-    assert!(
-        out.expect("evaluated").ofv.is_finite(),
-        "and the Δofv it feeds must be a real number"
-    );
+    assert!(out.expect("evaluated").ofv.is_finite(), "and the Δofv it feeds must be a real number");
 
     // The differential half: the same parameters *are* refused by a run that
     // actually optimises, so the exemption above is the evaluation-only scoping
@@ -263,19 +246,11 @@ fn a_small_bootstrap_runs_end_to_end_and_writes_every_artefact() {
     // Warfarin: 3 thetas + 3 diagonal omegas + 1 sigma.
     assert_eq!(result.parameter_names.len(), 7);
     assert_eq!(result.parameter_names[0], "TVCL");
-    assert!(result
-        .parameter_names
-        .iter()
-        .any(|n| n == "OMEGA(ETA_CL,ETA_CL)"));
+    assert!(result.parameter_names.iter().any(|n| n == "OMEGA(ETA_CL,ETA_CL)"));
     assert_eq!(result.n_estimated_parameters, 7);
 
     for r in &result.replicates {
-        assert!(
-            r.error.is_none(),
-            "replicate {} failed: {:?}",
-            r.index,
-            r.error
-        );
+        assert!(r.error.is_none(), "replicate {} failed: {:?}", r.index, r.error);
         assert_eq!(r.estimates.len(), result.parameter_names.len());
         assert!(r.ofv.is_finite());
         // No covariance step by default, so no per-replicate SEs.
@@ -293,10 +268,7 @@ fn a_small_bootstrap_runs_end_to_end_and_writes_every_artefact() {
     ] {
         let path = dir.path().join(name);
         assert!(path.exists(), "{name} was not written");
-        assert!(
-            std::fs::metadata(&path).unwrap().len() > 0,
-            "{name} is empty"
-        );
+        assert!(std::fs::metadata(&path).unwrap().len() > 0, "{name} is empty");
     }
     assert!(!dir.path().join("delta_ofv.csv").exists());
 }
@@ -316,22 +288,10 @@ fn the_drawn_datasets_do_not_depend_on_the_thread_count() {
         run_base_model: false,
         ..BootstrapOptions::default()
     };
-    let serial = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            threads: Some(1),
-            ..base.clone()
-        },
-    )
-    .expect("serial bootstrap");
-    let parallel = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            threads: Some(4),
-            ..base
-        },
-    )
-    .expect("parallel bootstrap");
+    let serial = run_bootstrap(&p, &BootstrapOptions { threads: Some(1), ..base.clone() })
+        .expect("serial bootstrap");
+    let parallel = run_bootstrap(&p, &BootstrapOptions { threads: Some(4), ..base })
+        .expect("parallel bootstrap");
 
     assert_eq!(serial.draws, parallel.draws);
     // And the results come back in replicate order regardless of who finished
@@ -355,10 +315,7 @@ fn raw_results_without_timings(dir: &Path) -> Vec<Vec<String>> {
         .records()
         .map(|r| r.expect("record").iter().map(str::to_string).collect())
         .collect();
-    let seconds = rows[0]
-        .iter()
-        .position(|h| h == "seconds")
-        .expect("a seconds column");
+    let seconds = rows[0].iter().position(|h| h == "seconds").expect("a seconds column");
     for row in rows.iter_mut() {
         row.remove(seconds);
     }
@@ -405,14 +362,9 @@ fn a_resumed_run_equals_an_uninterrupted_one() {
     let kept: Vec<&str> = text.lines().take(3).collect();
     std::fs::write(&raw, kept.join("\n") + "\n").expect("truncate");
 
-    let resumed = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            resume: true,
-            ..resume_options(part_dir.path())
-        },
-    )
-    .expect("the resumed run");
+    let resumed =
+        run_bootstrap(&p, &BootstrapOptions { resume: true, ..resume_options(part_dir.path()) })
+            .expect("the resumed run");
 
     assert_eq!(resumed.n_reused, 1, "sample 1 was already on disk");
     assert_eq!(resumed.replicates.len(), 3);
@@ -424,11 +376,7 @@ fn a_resumed_run_equals_an_uninterrupted_one() {
 
     // The three per-replicate draw files are rewritten in index order too, so
     // they are byte-identical — #1141's row-order guarantee survives a resume.
-    for name in [
-        "included_individuals1.csv",
-        "included_keys1.csv",
-        "sample_keys1.csv",
-    ] {
+    for name in ["included_individuals1.csv", "included_keys1.csv", "sample_keys1.csv"] {
         assert_eq!(
             std::fs::read(part_dir.path().join(name)).expect(name),
             std::fs::read(whole_dir.path().join(name)).expect(name),
@@ -452,14 +400,9 @@ fn a_run_cut_mid_row_resumes_by_refitting_that_sample() {
     // Cut the last row partway through a field.
     std::fs::write(&raw, &text[..text.len() - 12]).expect("truncate");
 
-    let resumed = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            resume: true,
-            ..resume_options(dir.path())
-        },
-    )
-    .expect("a truncated tail must not be fatal");
+    let resumed =
+        run_bootstrap(&p, &BootstrapOptions { resume: true, ..resume_options(dir.path()) })
+            .expect("a truncated tail must not be fatal");
 
     assert_eq!(resumed.n_reused, 2, "only the cut sample is refitted");
     assert_eq!(resumed.replicates.len(), 3);
@@ -475,14 +418,9 @@ fn resuming_a_complete_run_refits_nothing() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let first = run_bootstrap(&p, &resume_options(dir.path())).expect("the first pass");
-    let resumed = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            resume: true,
-            ..resume_options(dir.path())
-        },
-    )
-    .expect("resuming a complete run");
+    let resumed =
+        run_bootstrap(&p, &BootstrapOptions { resume: true, ..resume_options(dir.path()) })
+            .expect("resuming a complete run");
 
     assert_eq!(resumed.n_reused, 3);
     assert_eq!(resumed.summary.n_included, first.summary.n_included);
@@ -501,11 +439,7 @@ fn resuming_a_directory_from_a_different_seed_is_refused() {
 
     let err = run_bootstrap(
         &p,
-        &BootstrapOptions {
-            resume: true,
-            seed: 4242,
-            ..resume_options(dir.path())
-        },
+        &BootstrapOptions { resume: true, seed: 4242, ..resume_options(dir.path()) },
     )
     .expect_err("a different seed must refuse the resume");
     assert!(err.to_string().contains("--seed"), "{err}");
@@ -526,11 +460,7 @@ fn resuming_with_a_different_replicate_starting_point_is_refused() {
 
     let err = run_bootstrap(
         &p,
-        &BootstrapOptions {
-            resume: true,
-            update_inits: false,
-            ..resume_options(dir.path())
-        },
+        &BootstrapOptions { resume: true, update_inits: false, ..resume_options(dir.path()) },
     )
     .expect_err("changing where the replicates start must refuse the resume");
     assert!(err.to_string().contains("--update-inits"), "{err}");
@@ -570,14 +500,9 @@ fn a_run_cancelled_before_it_starts_leaves_the_directory_untouched() {
 
     let flag = CancelFlag::new();
     flag.cancel();
-    let err = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            cancel: Some(flag),
-            ..resume_options(dir.path())
-        },
-    )
-    .expect_err("a pre-cancelled run must not report success");
+    let err =
+        run_bootstrap(&p, &BootstrapOptions { cancel: Some(flag), ..resume_options(dir.path()) })
+            .expect_err("a pre-cancelled run must not report success");
     assert_eq!(err, BootstrapError::Cancelled);
 
     assert_eq!(
@@ -610,38 +535,21 @@ fn a_cancelled_run_stops_scheduling_and_resumes_into_the_uninterrupted_run() {
     };
     let err = run_bootstrap_with_progress(
         &p,
-        &BootstrapOptions {
-            cancel: Some(flag.clone()),
-            ..resume_options(part_dir.path())
-        },
+        &BootstrapOptions { cancel: Some(flag.clone()), ..resume_options(part_dir.path()) },
         Some(&sink),
     )
     .expect_err("a cancelled run must not report success");
-    assert_eq!(
-        err,
-        BootstrapError::Cancelled,
-        "a cancelled run reported as a failure: {err}"
-    );
+    assert_eq!(err, BootstrapError::Cancelled, "a cancelled run reported as a failure: {err}");
 
     // Header, the base fit, and exactly one replicate. The two draws that were
     // never fitted are absent rather than recorded as failures — recorded, a
     // resume would carry them forward instead of fitting them.
     let rows = raw_results_without_timings(part_dir.path());
-    assert_eq!(
-        rows.len(),
-        3,
-        "expected header + base + 1 replicate, got {} rows",
-        rows.len()
-    );
+    assert_eq!(rows.len(), 3, "expected header + base + 1 replicate, got {} rows", rows.len());
 
-    let resumed = run_bootstrap(
-        &p,
-        &BootstrapOptions {
-            resume: true,
-            ..resume_options(part_dir.path())
-        },
-    )
-    .expect("the cancelled run resumes");
+    let resumed =
+        run_bootstrap(&p, &BootstrapOptions { resume: true, ..resume_options(part_dir.path()) })
+            .expect("the cancelled run resumes");
     assert_eq!(
         resumed.n_reused, 1,
         "the resume should reuse the single replicate the cancelled run finished"
@@ -679,11 +587,7 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
     };
     let _ = run_bootstrap_with_progress(
         &p,
-        &BootstrapOptions {
-            cancel: Some(flag.clone()),
-            dofv: true,
-            ..resume_options(dir.path())
-        },
+        &BootstrapOptions { cancel: Some(flag.clone()), dofv: true, ..resume_options(dir.path()) },
         Some(&stop),
     )
     .expect_err("cancelled");
@@ -692,11 +596,7 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
     let sink = |event: BootstrapEvent| seen.lock().unwrap().push(event);
     let resumed = run_bootstrap_with_progress(
         &p,
-        &BootstrapOptions {
-            resume: true,
-            dofv: true,
-            ..resume_options(dir.path())
-        },
+        &BootstrapOptions { resume: true, dofv: true, ..resume_options(dir.path()) },
         Some(&sink),
     )
     .expect("the resume runs");
@@ -713,14 +613,9 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
     let replicates: Vec<_> = seen
         .iter()
         .filter_map(|e| match *e {
-            BootstrapEvent::ReplicateDone {
-                completed,
-                sample,
-                ofv,
-                outcome,
-                skipped,
-                ..
-            } => Some((completed, sample, ofv, outcome, skipped)),
+            BootstrapEvent::ReplicateDone { completed, sample, ofv, outcome, skipped, .. } => {
+                Some((completed, sample, ofv, outcome, skipped))
+            }
             _ => None,
         })
         .collect();
@@ -789,10 +684,7 @@ fn a_cancel_during_the_base_fit_is_a_cancellation_not_a_failure() {
     };
     let err = run_bootstrap_with_progress(
         &p,
-        &BootstrapOptions {
-            cancel: Some(flag.clone()),
-            ..resume_options(dir.path())
-        },
+        &BootstrapOptions { cancel: Some(flag.clone()), ..resume_options(dir.path()) },
         Some(&sink),
     )
     .expect_err("a run cancelled during its base fit must not report success");
@@ -801,10 +693,7 @@ fn a_cancel_during_the_base_fit_is_a_cancellation_not_a_failure() {
         BootstrapError::Cancelled,
         "a cancel during the base fit was reported as a failure: {err}"
     );
-    assert!(
-        err.is_cancelled(),
-        "the caller cannot tell the abort apart from a failed base fit"
-    );
+    assert!(err.is_cancelled(), "the caller cannot tell the abort apart from a failed base fit");
 
     // Header only: the base fit never produced a row, and no replicate ran.
     assert_eq!(
@@ -847,10 +736,7 @@ fn replicates_unwound_by_a_cancel_are_never_recorded_as_failures() {
     assert_eq!(err, BootstrapError::Cancelled);
 
     let rows = raw_results_without_timings(dir.path());
-    let error_at = rows[0]
-        .iter()
-        .position(|h| h == "error")
-        .expect("an error column");
+    let error_at = rows[0].iter().position(|h| h == "error").expect("an error column");
     for row in rows.iter().skip(1) {
         assert_eq!(
             row[error_at], "",
@@ -977,25 +863,17 @@ fn warfarin_with_study_column() -> tempfile::NamedTempFile {
     let src = std::fs::read_to_string(DATA).expect("warfarin data");
     let mut lines = src.lines();
     let header = lines.next().expect("header row");
-    let id_col = header
-        .split(',')
-        .position(|h| h.trim().eq_ignore_ascii_case("ID"))
-        .expect("an ID column");
+    let id_col =
+        header.split(',').position(|h| h.trim().eq_ignore_ascii_case("ID")).expect("an ID column");
 
-    let mut out = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .expect("temp file");
+    let mut out = tempfile::Builder::new().suffix(".csv").tempfile().expect("temp file");
     writeln!(out, "{header},STUDY").expect("write header");
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let id: u64 = line
-            .split(',')
-            .nth(id_col)
-            .and_then(|s| s.trim().parse().ok())
-            .expect("numeric ID");
+        let id: u64 =
+            line.split(',').nth(id_col).and_then(|s| s.trim().parse().ok()).expect("numeric ID");
         writeln!(out, "{line},{}", 1001 + id % 2).expect("write row");
     }
     out.flush().expect("flush");
@@ -1018,10 +896,7 @@ fn a_stratified_run_keeps_every_replicate_at_the_stratum_sizes() {
     // is trivially true.
     assert_eq!(strata.groups.len(), 2, "expected two strata");
     assert!(strata.groups.values().all(|g| !g.is_empty()));
-    assert_eq!(
-        strata.groups.values().map(|g| g.len()).sum::<usize>(),
-        p.population.subjects.len()
-    );
+    assert_eq!(strata.groups.values().map(|g| g.len()).sum::<usize>(), p.population.subjects.len());
 
     let allocation = strata.allocation(&SampleSize::Original).unwrap();
     assert_eq!(
@@ -1051,10 +926,7 @@ fn a_stratification_column_that_varies_within_a_subject_is_refused_on_real_data(
     let src = std::fs::read_to_string(DATA).expect("warfarin data");
     let mut lines = src.lines();
     let header = lines.next().expect("header row");
-    let mut file = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .expect("temp file");
+    let mut file = tempfile::Builder::new().suffix(".csv").tempfile().expect("temp file");
     writeln!(file, "{header},STUDY").expect("write header");
     for (i, line) in lines.filter(|l| !l.trim().is_empty()).enumerate() {
         writeln!(file, "{line},{}", 1001 + (i as u64 % 2)).expect("write row");
@@ -1097,11 +969,8 @@ fn err_of(options: BootstrapOptions) -> String {
 
 #[test]
 fn zero_samples_is_refused() {
-    let err = err_of(BootstrapOptions {
-        samples: 0,
-        directory: None,
-        ..BootstrapOptions::default()
-    });
+    let err =
+        err_of(BootstrapOptions { samples: 0, directory: None, ..BootstrapOptions::default() });
     assert!(err.contains("--samples"), "{err}");
 }
 
@@ -1123,20 +992,10 @@ fn a_covstep_filter_without_the_covariance_step_is_refused() {
     // The filter reads a diagnostic that only exists when the step ran. Silently
     // ignoring it would drop a filter the user asked for.
     for options in [
-        BootstrapOptions {
-            skip_covariance_step_terminated: true,
-            ..BootstrapOptions::default()
-        },
-        BootstrapOptions {
-            skip_with_covstep_warnings: true,
-            ..BootstrapOptions::default()
-        },
+        BootstrapOptions { skip_covariance_step_terminated: true, ..BootstrapOptions::default() },
+        BootstrapOptions { skip_with_covstep_warnings: true, ..BootstrapOptions::default() },
     ] {
-        let err = err_of(BootstrapOptions {
-            samples: 1,
-            directory: None,
-            ..options
-        });
+        let err = err_of(BootstrapOptions { samples: 1, directory: None, ..options });
         assert!(err.contains("--keep-covariance"), "{err}");
     }
 }
@@ -1209,18 +1068,12 @@ fn keep_covariance_populates_the_per_replicate_standard_errors() {
         },
     )
     .expect("bootstrap with covariance");
-    let se = with_cov.replicates[0]
-        .standard_errors
-        .as_ref()
-        .expect("covariance step ran, so SEs exist");
+    let se =
+        with_cov.replicates[0].standard_errors.as_ref().expect("covariance step ran, so SEs exist");
     assert_eq!(se.len(), with_cov.parameter_names.len());
     // Warfarin has a diagonal Omega and no IOV, so core reports an SE for every
     // coordinate — none of them may be absent here.
-    assert!(
-        se.iter()
-            .all(|v| v.is_some_and(|v| v.is_finite() && v >= 0.0)),
-        "{se:?}"
-    );
+    assert!(se.iter().all(|v| v.is_some_and(|v| v.is_finite() && v >= 0.0)), "{se:?}");
 }
 
 #[test]
@@ -1299,10 +1152,7 @@ fn an_iov_model_carries_its_kappa_through_the_whole_flat_vector() {
     let mut p = prepare_run(IOV_MODEL, Some(IOV_DATA)).expect("IOV model + data load");
     p.parsed.fit_options.outer_maxiter = 2;
 
-    assert!(
-        p.init_params.omega_iov.is_some(),
-        "the fixture stopped being an IOV model"
-    );
+    assert!(p.init_params.omega_iov.is_some(), "the fixture stopped being an IOV model");
 
     let names = ferx_tools::bootstrap::parameter_names(&p.init_params);
     assert!(
@@ -1352,11 +1202,8 @@ fn an_iov_model_carries_its_kappa_through_the_whole_flat_vector() {
     // model file's starting value.
     let base = result.original.as_ref().expect("base fit");
     let rebuilt = params_from_estimates(&p.init_params, &base.estimates);
-    let rebuilt_kappa = rebuilt
-        .omega_iov
-        .as_ref()
-        .expect("the rebuild keeps the IOV block")
-        .matrix[(0, 0)];
+    let rebuilt_kappa =
+        rebuilt.omega_iov.as_ref().expect("the rebuild keeps the IOV block").matrix[(0, 0)];
     assert!(
         (rebuilt_kappa - base.estimates[kappa]).abs() < 1e-12,
         "the round trip lost KAPPA: {rebuilt_kappa} vs {}",
@@ -1408,10 +1255,7 @@ fn a_block_omega_lines_its_standard_errors_up_with_its_names() {
     .expect("block-omega bootstrap");
 
     let base = result.original.as_ref().expect("base fit");
-    let se = base
-        .standard_errors
-        .as_ref()
-        .expect("the base fit runs its covariance step");
+    let se = base.standard_errors.as_ref().expect("the base fit runs its covariance step");
 
     // The decisive check: one SE per name. The old concatenation produced ten
     // entries against eight names on exactly this model.
@@ -1485,11 +1329,8 @@ fn a_replicate_started_at_its_own_optimum_is_not_excluded() {
     use ferx_core::Optimizer;
     use ferx_tools::bootstrap::{summary::exclusion_reason, ReplicateResult};
 
-    let p = prepare_run(
-        "../../examples/two_cpt_iv.ferx",
-        Some("../../data/two_cpt_iv.csv"),
-    )
-    .expect("two_cpt_iv model + data load");
+    let p = prepare_run("../../examples/two_cpt_iv.ferx", Some("../../data/two_cpt_iv.csv"))
+        .expect("two_cpt_iv model + data load");
     let mut options = p.parsed.fit_options.clone();
     options.optimizer = Optimizer::Bobyqa;
     options.run_covariance_step = false;
@@ -1498,16 +1339,10 @@ fn a_replicate_started_at_its_own_optimum_is_not_excluded() {
     options.checkpoint = false;
 
     let base = fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("base fit");
-    assert!(
-        base.converged,
-        "fixture precondition: the base fit converges"
-    );
+    assert!(base.converged, "fixture precondition: the base fit converges");
 
     let start = params_from_estimates(&p.init_params, &flatten_estimates(&p.init_params, &base));
-    let identity = Replicate {
-        index: 1,
-        keys: (0..p.population.subjects.len()).collect(),
-    };
+    let identity = Replicate { index: 1, keys: (0..p.population.subjects.len()).collect() };
     let population = resample::build_population(&p.population, &identity);
     let warm = fit(&p.parsed.model, &population, &start, &options).expect("replicate fit");
 
@@ -1517,12 +1352,7 @@ fn a_replicate_started_at_its_own_optimum_is_not_excluded() {
         "fixture precondition: a replicate started at its own optimum does not move"
     );
     assert!(warm.stationary_start, "{:?}", warm.warnings);
-    assert!(
-        (warm.ofv - base.ofv).abs() < 1e-3,
-        "replicate {} vs base {}",
-        warm.ofv,
-        base.ofv
-    );
+    assert!((warm.ofv - base.ofv).abs() < 1e-3, "replicate {} vs base {}", warm.ofv, base.ofv);
     let replicate = ReplicateResult {
         index: 1,
         estimates: flatten_estimates(&p.init_params, &warm),
@@ -1571,9 +1401,7 @@ fn a_replicate_is_skipped_only_when_the_exclusion_filters_say_so() {
         .unwrap()
         .iter()
         .filter_map(|e| match *e {
-            BootstrapEvent::ReplicateDone {
-                outcome, skipped, ..
-            } => Some((outcome, skipped)),
+            BootstrapEvent::ReplicateDone { outcome, skipped, .. } => Some((outcome, skipped)),
             _ => None,
         })
         .collect();

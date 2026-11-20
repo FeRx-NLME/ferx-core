@@ -58,15 +58,7 @@ pub(crate) struct TwoCpt<T> {
 impl<T: PkNum> TwoCpt<T> {
     pub(crate) fn new(cl: T, v1: T, q: T, v2: T) -> Self {
         let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
-        Self {
-            cl,
-            v1,
-            q,
-            v2,
-            alpha,
-            beta,
-            k21,
-        }
+        Self { cl, v1, q, v2, alpha, beta, k21 }
     }
 
     /// The disposition modes `(c, λ)` of the central impulse response `(1/V1)·Σ c·e^{−λt}`:
@@ -98,12 +90,7 @@ impl<T: PkNum> TwoCpt<T> {
 /// fit) short-circuits to `None` rather than slipping past a `α >= KTR` form into
 /// `mgf`'s `debug_assert`.
 pub(crate) fn transit_2cpt_domain_ok<T: PkNum>(
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    n: T,
-    mtt: T,
+    cl: T, v1: T, q: T, v2: T, n: T, mtt: T,
 ) -> Option<(T, T, T)> {
     if v1.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
         || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
@@ -165,14 +152,7 @@ pub(crate) fn two_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>) -> T
 
 /// 2-cpt infusion (zero-order input, duration `dur`, rate `rate`).
 pub fn two_cpt_infusion_g<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
+    rate: f64, dur: f64, amt: f64, t: T, cl: T, v1: T, q: T, v2: T,
 ) -> T {
     two_cpt_infusion_d(rate, dur, amt, t, &TwoCpt::new(cl, v1, q, v2))
 }
@@ -180,11 +160,7 @@ pub fn two_cpt_infusion_g<T: PkNum>(
 /// [`two_cpt_infusion_g`] over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 pub(crate) fn two_cpt_infusion_d<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    d: &TwoCpt<T>,
+    rate: f64, dur: f64, amt: f64, t: T, d: &TwoCpt<T>,
 ) -> T {
     let TwoCpt { cl, v1, .. } = *d;
 
@@ -215,14 +191,7 @@ pub(crate) fn two_cpt_infusion_d<T: PkNum>(
 /// from the fixed-duration infusion kernel).
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_zero_order_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    dur: T,
-    f_bio: T,
+    amt: f64, t: T, cl: T, v1: T, q: T, v2: T, dur: T, f_bio: T,
 ) -> T {
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -295,15 +264,7 @@ pub(crate) fn two_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>, ka: T, f
 /// `n = 0` it reduces to [`two_cpt_oral_g`] with `ka = 1/mtt`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_transit_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    n: T,
-    mtt: T,
-    f_bio: T,
+    amt: f64, t: T, cl: T, v1: T, q: T, v2: T, n: T, mtt: T, f_bio: T,
 ) -> T {
     two_cpt_transit_amt_g(T::from_f64(amt), t, cl, v1, q, v2, n, mtt, f_bio)
 }
@@ -322,15 +283,7 @@ pub fn two_cpt_transit_g<T: PkNum>(
 /// on mis-specified data.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_transit_amt_g<T: PkNum>(
-    amt: T,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    n: T,
-    mtt: T,
-    f_bio: T,
+    amt: T, t: T, cl: T, v1: T, q: T, v2: T, n: T, mtt: T, f_bio: T,
 ) -> T {
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -356,15 +309,7 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
 /// sensitivity share one definition.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_transit_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    n: T,
-    mtt: T,
-    f_bio: T,
+    dose: &DoseEvent, t: T, cl: T, v1: T, q: T, v2: T, n: T, mtt: T, f_bio: T,
 ) -> T {
     two_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v1, q, v2, n, mtt, f_bio)
 }
@@ -378,12 +323,7 @@ pub fn two_cpt_transit_conc_g<T: PkNum>(
 /// `!(α < abscissa)` form makes a transient `NaN` short-circuit to `None`, matching
 /// the central/peripheral readers so they can't drift.
 pub(crate) fn ig_2cpt_domain_ok<T: PkNum>(
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    mat: T,
-    cv2: T,
+    cl: T, v1: T, q: T, v2: T, mat: T, cv2: T,
 ) -> Option<(T, T, T)> {
     if v1.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
         || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
@@ -412,15 +352,7 @@ pub(crate) fn ig_2cpt_domain_ok<T: PkNum>(
 /// `T = Dual2<N>` gives exact `∂C/∂{cl,v1,q,v2,mat,cv2,f}` (+ 2nd order).
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_ig_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    mat: T,
-    cv2: T,
-    f_bio: T,
+    amt: f64, t: T, cl: T, v1: T, q: T, v2: T, mat: T, cv2: T, f_bio: T,
 ) -> T {
     two_cpt_ig_amt_g(T::from_f64(amt), t, cl, v1, q, v2, mat, cv2, f_bio)
 }
@@ -434,15 +366,7 @@ pub fn two_cpt_ig_g<T: PkNum>(
 /// NaN-safe `!(α < abscissa)` form of `ig_2cpt_domain_ok`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_ig_amt_g<T: PkNum>(
-    amt: T,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    mat: T,
-    cv2: T,
-    f_bio: T,
+    amt: T, t: T, cl: T, v1: T, q: T, v2: T, mat: T, cv2: T, f_bio: T,
 ) -> T {
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -454,10 +378,7 @@ pub fn two_cpt_ig_amt_g<T: PkNum>(
     let Some((alpha, beta, k21)) = ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2) else {
         return T::from_f64(0.0);
     };
-    let abs = IgAbsorption {
-        mat,
-        lambda: mat / cv2,
-    };
+    let abs = IgAbsorption { mat, lambda: mat / cv2 };
     convolve_2cpt(&abs, t, alpha, beta, k21, (f_bio * amt) / v1)
 }
 
@@ -467,15 +388,7 @@ pub fn two_cpt_ig_amt_g<T: PkNum>(
 /// wrapper over [`two_cpt_ig_amt_g`] with `F` baked into the kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_ig_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    mat: T,
-    cv2: T,
-    f_bio: T,
+    dose: &DoseEvent, t: T, cl: T, v1: T, q: T, v2: T, mat: T, cv2: T, f_bio: T,
 ) -> T {
     two_cpt_ig_amt_g(T::from_f64(dose.amt), t, cl, v1, q, v2, mat, cv2, f_bio)
 }
@@ -518,15 +431,7 @@ pub(crate) fn two_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &TwoCp
 /// 2-cpt oral at steady state: `(F·D·KA/V1)·Σ c·B_ss(λ, KA, t)`, smooth through `KA = λ`
 /// (`bateman_ss`).
 pub fn two_cpt_oral_ss_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    ii: f64,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    ka: T,
-    f_bio: T,
+    amt: f64, t: T, ii: f64, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T,
 ) -> T {
     two_cpt_oral_ss_d(amt, t, ii, &TwoCpt::new(cl, v1, q, v2), ka, f_bio)
 }
@@ -534,12 +439,7 @@ pub fn two_cpt_oral_ss_g<T: PkNum>(
 /// [`two_cpt_oral_ss_g`] over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 pub(crate) fn two_cpt_oral_ss_d<T: PkNum>(
-    amt: f64,
-    t: T,
-    ii: f64,
-    d: &TwoCpt<T>,
-    ka: T,
-    f_bio: T,
+    amt: f64, t: T, ii: f64, d: &TwoCpt<T>, ka: T, f_bio: T,
 ) -> T {
     let TwoCpt { cl, v1, q, v2, .. } = *d;
 
@@ -569,15 +469,7 @@ pub(crate) fn two_cpt_oral_ss_d<T: PkNum>(
 /// overlapping pulses (`dur > ii`). Mirrors production `two_cpt_infusion_ss`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_infusion_ss_g<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    ii: f64,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
+    rate: f64, dur: f64, amt: f64, t: T, ii: f64, cl: T, v1: T, q: T, v2: T,
 ) -> T {
     two_cpt_infusion_ss_d(rate, dur, amt, t, ii, &TwoCpt::new(cl, v1, q, v2))
 }
@@ -586,12 +478,7 @@ pub fn two_cpt_infusion_ss_g<T: PkNum>(
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_infusion_ss_d<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    ii: f64,
-    d: &TwoCpt<T>,
+    rate: f64, dur: f64, amt: f64, t: T, ii: f64, d: &TwoCpt<T>,
 ) -> T {
     let TwoCpt { cl, v1, q, v2, .. } = *d;
 
@@ -624,31 +511,19 @@ pub(crate) fn two_cpt_infusion_ss_d<T: PkNum>(
 /// Central-compartment concentration contribution of a single dose at elapsed
 /// time `t`, dispatching bolus / infusion / oral and their SS variants — the
 /// 2-cpt counterpart to [`super::one_cpt::one_cpt_conc_g`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn two_cpt_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    ka: T,
-    f_bio: T,
-    oral: bool,
+pub(crate) fn two_cpt_conc_g<T: PkNum>(
+    dose: &DoseEvent, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T, oral: bool,
 ) -> T {
     two_cpt_conc_d(dose, t, &TwoCpt::new(cl, v1, q, v2), ka, f_bio, oral)
 }
 
-/// [`two_cpt_conc_g`] over a precomputed disposition (its macro rates computed once per
+/// `two_cpt_conc_g` over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_conc_d<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    d: &TwoCpt<T>,
-    ka: T,
-    f_bio: T,
-    oral: bool,
+    dose: &DoseEvent, t: T, d: &TwoCpt<T>, ka: T, f_bio: T, oral: bool,
 ) -> T {
     // The shared #2104 rule decides an arrived dose before `F` scales it, as
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
@@ -743,10 +618,7 @@ mod tests {
                 "value {} vs f64 {v64} for {dose:?}",
                 d.value
             );
-            assert!(
-                d.grad.iter().all(|g| g.is_finite()),
-                "non-finite grad for {dose:?}"
-            );
+            assert!(d.grad.iter().all(|g| g.is_finite()), "non-finite grad for {dose:?}");
         }
     }
 
@@ -789,10 +661,7 @@ mod tests {
             (cl, v1, q, v2, 3.0, f64::NAN),
         ] {
             let r = two_cpt_transit_amt_g::<f64>(100.0, 2.0, p.0, p.1, p.2, p.3, p.4, p.5, 1.0);
-            assert!(
-                r.is_nan(),
-                "a NaN parameter must be served as NaN: {p:?} → {r}"
-            );
+            assert!(r.is_nan(), "a NaN parameter must be served as NaN: {p:?} → {r}");
             let r = two_cpt_ig_amt_g::<f64>(100.0, 2.0, p.0, p.1, p.2, p.3, 0.3, 0.5, 1.0);
             let ig_nan = p.4.is_nan() || p.5.is_nan();
             assert_eq!(r.is_nan(), !ig_nan, "IG, disposition {p:?} → {r}");

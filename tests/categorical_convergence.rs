@@ -39,16 +39,9 @@ fn binary_fixed_effects_matches_r_glm() {
     let (th0, thx, tht) = (r.theta[0], r.theta[1], r.theta[2]);
 
     // OFV == glm deviance pins the likelihood constant + form (exact to optimizer tol).
-    assert!(
-        (r.ofv - r_deviance).abs() < 0.05,
-        "ferx OFV {} vs glm deviance {r_deviance}",
-        r.ofv
-    );
+    assert!((r.ofv - r_deviance).abs() < 0.05, "ferx OFV {} vs glm deviance {r_deviance}", r.ofv);
     // θ estimates match the glm MLE within the derivative-free (BOBYQA) outer tolerance.
-    assert!(
-        (th0 - r_intercept).abs() < 0.01,
-        "TH0 {th0} vs glm {r_intercept}"
-    );
+    assert!((th0 - r_intercept).abs() < 0.01, "TH0 {th0} vs glm {r_intercept}");
     assert!((thx - r_x).abs() < 0.01, "THX {thx} vs glm {r_x}");
     assert!((tht - r_time).abs() < 0.01, "THT {tht} vs glm {r_time}");
 }
@@ -100,12 +93,7 @@ fn binary_simulate_then_fit_recovers_theta() {
             .unwrap();
     assert_eq!(
         sims.len(),
-        template
-            .subjects
-            .iter()
-            .map(|s| s.obs_records.len())
-            .sum::<usize>()
-            * n_sim,
+        template.subjects.iter().map(|s| s.obs_records.len()).sum::<usize>() * n_sim,
         "simulate() must emit one row per (record × replicate)"
     );
 
@@ -131,20 +119,12 @@ fn binary_simulate_then_fit_recovers_theta() {
             }
             pop.subjects.push(s);
         }
-        assert_eq!(
-            cursor,
-            replicate.len(),
-            "every simulated row must be consumed"
-        );
+        assert_eq!(cursor, replicate.len(), "every simulated row must be consumed");
     }
 
-    let refit = ferx_core::fit(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        &FitOptions::default(),
-    )
-    .expect("refit of simulated binary data must converge");
+    let refit =
+        ferx_core::fit(&parsed.model, &pop, &parsed.model.default_params, &FitOptions::default())
+            .expect("refit of simulated binary data must converge");
 
     // Recovery: with 3600 draws the per-θ SE is ≈0.05, so 0.15 is ~3 SE — tight enough
     // that a sampler drawing from the wrong p (e.g. an inverted link, or p from the

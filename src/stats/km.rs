@@ -101,15 +101,10 @@ impl std::error::Error for KmInputError {}
 /// [`KmInputError::BadTime`] for a time that is not finite or is negative.
 pub fn kaplan_meier(times: &[f64], events: &[bool]) -> Result<KmCurve, KmInputError> {
     if times.len() != events.len() {
-        return Err(KmInputError::LengthMismatch {
-            times: times.len(),
-            events: events.len(),
-        });
+        return Err(KmInputError::LengthMismatch { times: times.len(), events: events.len() });
     }
-    if let Some((index, &value)) = times
-        .iter()
-        .enumerate()
-        .find(|(_, t)| !(t.is_finite() && **t >= 0.0))
+    if let Some((index, &value)) =
+        times.iter().enumerate().find(|(_, t)| !(t.is_finite() && **t >= 0.0))
     {
         return Err(KmInputError::BadTime { index, value });
     }
@@ -162,26 +157,16 @@ pub struct KmmcCurve {
 /// is not as long as `times`, and [`KmInputError::BadValue`] for a value that is
 /// not finite (a missing covariate is `NaN` and would make every mean `NaN`).
 pub fn kaplan_meier_mean_covariate(
-    times: &[f64],
-    events: &[bool],
-    values: &[f64],
+    times: &[f64], events: &[bool], values: &[f64],
 ) -> Result<KmmcCurve, KmInputError> {
     if times.len() != events.len() {
-        return Err(KmInputError::LengthMismatch {
-            times: times.len(),
-            events: events.len(),
-        });
+        return Err(KmInputError::LengthMismatch { times: times.len(), events: events.len() });
     }
     if times.len() != values.len() {
-        return Err(KmInputError::ValueLengthMismatch {
-            times: times.len(),
-            values: values.len(),
-        });
+        return Err(KmInputError::ValueLengthMismatch { times: times.len(), values: values.len() });
     }
-    if let Some((index, &value)) = times
-        .iter()
-        .enumerate()
-        .find(|(_, t)| !(t.is_finite() && **t >= 0.0))
+    if let Some((index, &value)) =
+        times.iter().enumerate().find(|(_, t)| !(t.is_finite() && **t >= 0.0))
     {
         return Err(KmInputError::BadTime { index, value });
     }
@@ -258,11 +243,8 @@ fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> (Vec<CountRow>, Vec<
     let mut order: Vec<usize> = (0..marks.len()).collect();
     order.sort_by(|&a, &b| marks[a].0.total_cmp(&marks[b].0));
 
-    let mut at_risk = if event_leaves {
-        marks.len()
-    } else {
-        marks.iter().filter(|m| !m.1).count()
-    };
+    let mut at_risk =
+        if event_leaves { marks.len() } else { marks.iter().filter(|m| !m.1).count() };
     let mut rows = Vec::new();
     let mut k = 0;
     while k < order.len() {
@@ -278,13 +260,7 @@ fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> (Vec<CountRow>, Vec<
             k += 1;
         }
         // Events before departures: the `c` leaving at `t` are still in `at_risk`.
-        rows.push(CountRow {
-            time: t,
-            n_risk: at_risk,
-            n_event: d,
-            n_leave: c,
-            start,
-        });
+        rows.push(CountRow { time: t, n_risk: at_risk, n_event: d, n_leave: c, start });
         at_risk -= if event_leaves { d + c } else { c };
     }
     (rows, order)
@@ -357,15 +333,10 @@ impl std::error::Error for McfInputError {}
 /// that is not finite or is negative, and [`McfInputError::EventAfterFollowUp`] for
 /// an event later than every follow-up end, whose risk set is empty.
 pub fn mean_cumulative(
-    event_times: &[f64],
-    follow_up_ends: &[f64],
+    event_times: &[f64], follow_up_ends: &[f64],
 ) -> Result<McfCurve, McfInputError> {
-    let bad = |v: &[f64]| {
-        v.iter()
-            .copied()
-            .enumerate()
-            .find(|(_, t)| !(t.is_finite() && *t >= 0.0))
-    };
+    let bad =
+        |v: &[f64]| v.iter().copied().enumerate().find(|(_, t)| !(t.is_finite() && *t >= 0.0));
     if let Some((index, value)) = bad(event_times) {
         return Err(McfInputError::BadEventTime { index, value });
     }
@@ -455,11 +426,7 @@ pub fn probs_valid(probs: [f64; 3]) -> bool {
 /// rather than an estimate of the tail. Assumes [`probs_valid`].
 pub fn min_curves_for(probs: [f64; 3]) -> usize {
     // Increasing probabilities: the smallest tail is the first one's or the last one's.
-    let tail = if probs[0] < 1.0 - probs[2] {
-        probs[0]
-    } else {
-        1.0 - probs[2]
-    };
+    let tail = if probs[0] < 1.0 - probs[2] { probs[0] } else { 1.0 - probs[2] };
     // `1 / 0.05` is 20 up to rounding; the epsilon keeps the ceiling from stepping to 21.
     ((1.0 / tail) - 1e-9).ceil() as usize - 1
 }
@@ -473,9 +440,7 @@ pub fn min_curves_for(probs: [f64; 3]) -> usize {
 ///
 /// [`KmInputError::BadProbs`] unless [`probs_valid`].
 pub fn vpc_band(
-    curves: &[KmCurve],
-    grid: &[f64],
-    probs: [f64; 3],
+    curves: &[KmCurve], grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     band_over(curves.len(), |j, t| curves[j].at(t), grid, probs)
 }
@@ -488,9 +453,7 @@ pub fn vpc_band(
 ///
 /// [`KmInputError::BadProbs`] unless [`probs_valid`].
 pub fn vpc_band_mcf(
-    curves: &[McfCurve],
-    grid: &[f64],
-    probs: [f64; 3],
+    curves: &[McfCurve], grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     band_over(curves.len(), |j, t| curves[j].at(t), grid, probs)
 }
@@ -505,26 +468,15 @@ pub fn vpc_band_mcf(
 ///
 /// [`KmInputError::BadProbs`] unless [`probs_valid`].
 pub fn vpc_band_kmmc(
-    curves: &[KmmcCurve],
-    grid: &[f64],
-    probs: [f64; 3],
-    min_at_risk: usize,
+    curves: &[KmmcCurve], grid: &[f64], probs: [f64; 3], min_at_risk: usize,
 ) -> Result<VpcBand, KmInputError> {
-    band_over(
-        curves.len(),
-        |j, t| curves[j].at(t, min_at_risk),
-        grid,
-        probs,
-    )
+    band_over(curves.len(), |j, t| curves[j].at(t, min_at_risk), grid, probs)
 }
 
 /// The band of `n_curves` curves, `at(j, t)` being curve `j` at time `t`, or `None`
 /// where that curve is undefined.
 fn band_over(
-    n_curves: usize,
-    at: impl Fn(usize, f64) -> Option<f64>,
-    grid: &[f64],
-    probs: [f64; 3],
+    n_curves: usize, at: impl Fn(usize, f64) -> Option<f64>, grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     if !probs_valid(probs) {
         return Err(KmInputError::BadProbs { probs });

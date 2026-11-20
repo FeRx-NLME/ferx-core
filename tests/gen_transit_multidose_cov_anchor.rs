@@ -125,11 +125,8 @@ fn generate_transit_multidose_cov_anchor() {
     let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 719_611).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
-        subj.observations = sims
-            .iter()
-            .filter(|r| r.id == subj.id)
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        subj.observations =
+            sims.iter().filter(|r| r.id == subj.id).map(|r| r.outcome.continuous_value()).collect();
     }
 
     // Two NONMEM-format CSVs, records time-sorted per subject (each dose then its interval's obs).
