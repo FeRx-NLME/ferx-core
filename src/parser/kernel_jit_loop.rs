@@ -631,6 +631,15 @@ fn table_set() -> std::sync::MutexGuard<'static, (std::collections::HashSet<Arc<
 fn interned(t: LoopTables) -> Arc<LoopTables> {
     let mut g = table_set();
     let (set, prune_at) = &mut *g;
+    intern_into(set, prune_at, t)
+}
+
+/// [`interned`] on a given set: the copy of `t` in `set`, inserted if absent. When the set has
+/// reached `prune_at`, the copies only the set holds go first and the mark moves to twice what
+/// is left (at least 64), so pruning stays amortised.
+fn intern_into(
+    set: &mut std::collections::HashSet<Arc<LoopTables>>, prune_at: &mut usize, t: LoopTables,
+) -> Arc<LoopTables> {
     if let Some(a) = set.get(&t) {
         return a.clone();
     }
@@ -645,20 +654,24 @@ fn interned(t: LoopTables) -> Arc<LoopTables> {
 
 /// The distinct slot-table sets held (`FERX_KJIT_DEBUG`'s report), and their bytes.
 pub(crate) fn table_stats() -> (usize, usize) {
-    let g = table_set();
+    stats_of(&table_set().0)
+}
+
+/// The number of table sets in `set`, and the bytes of their tables.
+fn stats_of(set: &std::collections::HashSet<Arc<LoopTables>>) -> (usize, usize) {
     let v = |v: &Vec<u32>| v.len() * 4;
-    let bytes =
-        g.0.iter()
-            .map(|t| {
-                v(&t.rhs_idx)
-                    + v(&t.iota)
-                    + t.methods.iter().flatten().flatten().map(v).sum::<usize>()
-                    + t.forced.iter().flatten().flatten().map(v).sum::<usize>()
-                    + t.sw.as_ref().map_or(0, v)
-                    + t.jumps.iter().map(v).sum::<usize>()
-            })
-            .sum();
-    (g.0.len(), bytes)
+    let bytes = set
+        .iter()
+        .map(|t| {
+            v(&t.rhs_idx)
+                + v(&t.iota)
+                + t.methods.iter().flatten().flatten().map(v).sum::<usize>()
+                + t.forced.iter().flatten().flatten().map(v).sum::<usize>()
+                + t.sw.as_ref().map_or(0, v)
+                + t.jumps.iter().map(v).sum::<usize>()
+        })
+        .sum();
+    (set.len(), bytes)
 }
 
 /// A body's output slots in its index table.
@@ -2483,5 +2496,48 @@ mod tests {
         }
         assert!(!Arc::ptr_eq(&a_val.t, &c_val.t), "another shape has its own");
         assert!(*a_val.t != *c_val.t, "and they differ");
+        let (sets, bytes) = table_stats();
+        assert!(sets >= 2 && bytes > 0, "the global set holds both shapes while calls hold them");
+    }
+
+    /// The set hands back the copy it holds for equal content, and drops only the copies no
+    /// call holds once it reaches its mark. Dies when pruning stops (the set would grow without
+    /// bound over a fit), when it drops a copy a call still holds (the next equal call would get
+    /// a second copy), and when the debug report's byte count leaves out the fixture's tables.
+    #[test]
+    fn the_table_set_dedups_prunes_unheld_copies_and_counts_bytes() {
+        let tables = |n| {
+            let s = segment(n, 0.8, 3.0, &[0.7, 1.3]);
+            LoopTables::of(&s, Slots::of(&s))
+        };
+        let (mut set, mut prune_at) = (std::collections::HashSet::new(), 0);
+        let held = intern_into(&mut set, &mut prune_at, tables(2));
+        assert_eq!(prune_at, 64, "the first insert sets the mark");
+        let again = intern_into(&mut set, &mut prune_at, tables(2));
+        assert!(Arc::ptr_eq(&held, &again), "equal content gets the held copy");
+        drop(again);
+
+        let one = tables(2);
+        let words = |t: &LoopTables| {
+            let n = |v: &Vec<u32>| v.len();
+            n(&t.rhs_idx)
+                + n(&t.iota)
+                + t.methods.iter().flatten().flatten().map(n).sum::<usize>()
+                + t.forced.iter().flatten().flatten().map(n).sum::<usize>()
+                + t.sw.as_ref().map_or(0, n)
+                + t.jumps.iter().map(n).sum::<usize>()
+        };
+        assert!(!one.methods.is_empty(), "the fixture has stepper bodies");
+        assert_eq!(stats_of(&set), (1, 4 * words(&one)));
+
+        drop(intern_into(&mut set, &mut prune_at, tables(3)));
+        assert_eq!(set.len(), 2, "below the mark nothing is dropped");
+        prune_at = 2;
+        let four = intern_into(&mut set, &mut prune_at, tables(4));
+        assert_eq!(set.len(), 2, "the unheld three-state copy went, the four-state one came");
+        assert!(set.contains(&tables(2)) && set.contains(&tables(4)) && !set.contains(&tables(3)));
+        assert_eq!(prune_at, 64, "the mark moves to twice what is left, at least 64");
+        assert!(Arc::ptr_eq(&held, &intern_into(&mut set, &mut prune_at, tables(2))));
+        assert_eq!(stats_of(&set), (2, 4 * (words(&held) + words(&four))));
     }
 }
