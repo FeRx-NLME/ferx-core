@@ -36,6 +36,9 @@ pub mod ode_loop;
 #[cfg(any(test, feature = "test-support"))]
 pub use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
 #[cfg(test)]
+#[path = "kernel_jit_lanes.rs"]
+mod lanes;
+#[cfg(test)]
 #[path = "kernel_jit_plan_tests.rs"]
 mod plan_tests;
 #[path = "kernel_jit_simd.rs"]
@@ -2887,6 +2890,11 @@ pub fn templates_of(id: u64) -> usize {
 thread_local! {
     /// Native kernels this thread has freed ([`ChunkKernel`]'s drop).
     pub static KERNELS_FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Native code bytes this thread's kernel compiles emitted (`lower_chunk_opt`), for the
+    /// lane-loop prototype's size comparison (#3080).
+    pub(crate) static NATIVE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Cranelift instructions of the same compiles.
+    pub(crate) static NATIVE_CLIF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Forget the plans of every subject and model in scope `scope`: under the subjects' lock, with
@@ -6354,9 +6362,15 @@ impl Plan {
 /// `fold` for a chunk: input `i`'s lanes outside its directions are zero, a seed's own
 /// lane is one; literals carry no tangent.
 pub fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
+    fold_with(src, chunk_known(layout, spec))
+}
+
+/// The loaded lanes a chunk's inputs fix ([`fold_chunk`]'s `known`): `Some(c)` for a lane that
+/// is the constant `c` at every call.
+fn chunk_known(layout: Layout, spec: &[(DirMask, u16)]) -> impl Fn(u8, u32) -> Option<f64> + '_ {
     let lanes = layout.lanes();
     let n = layout.n as usize;
-    let lane_dir = |lane: usize| -> Option<(usize, usize)> {
+    let lane_dir = move |lane: usize| -> Option<(usize, usize)> {
         // lane 1..=n: direction k; payload lanes: the pair (k, l) of `ir::pairs`' order.
         if lane == 0 {
             None
@@ -6375,7 +6389,7 @@ pub fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
             None
         }
     };
-    let known = |arg: u8, off: u32| -> Option<f64> {
+    move |arg: u8, off: u32| -> Option<f64> {
         let (idx, lane) = (off as usize / lanes, off as usize % lanes);
         if lane == 0 {
             return None;
@@ -6399,8 +6413,7 @@ pub fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
             return Some(0.0);
         }
         None
-    };
-    fold_with(src, known)
+    }
 }
 
 /// Kernels above this many instructions are lowered as a chain of segments ([`SegPlan`]). Below
@@ -6938,7 +6951,14 @@ pub fn lower_chunk_opt(
         for o in reloaded.drain(..) {
             v[o] = None;
         }
+        #[cfg(test)]
+        NATIVE_CLIF.with(|c| c.set(c.get() + ctx.func.dfg.num_insts()));
         module.define_function(id, &mut ctx).ok()?;
+        #[cfg(test)]
+        NATIVE_BYTES.with(|c| {
+            let size = ctx.compiled_code().map_or(0, |cc| cc.code_info().total_size as usize);
+            c.set(c.get() + size)
+        });
         module.clear_context(&mut ctx);
         ids.push(id);
     }

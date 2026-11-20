@@ -1784,6 +1784,12 @@ struct EvalRoute {
 
 #[cfg(test)]
 thread_local! {
+    /// Fused IOV gradient-pass values put into the IOV EBE search's objective memo (#3088).
+    pub(crate) static IOV_MEMO_FUSED_PUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// The points [`EvalRoute::at`] decided on this thread, in order (a test asserts the solve
     /// asks once per point, not once per consumer).
     pub(crate) static EVAL_ROUTE_LOG: RefCell<Vec<Vec<u64>>> = const { RefCell::new(Vec::new()) };
@@ -1817,10 +1823,27 @@ impl EvalRoute {
 /// Identical to `effective_for` for every subject the walk cannot take
 /// (`effective_model_for_eval_iov` returns `effective_for` for them), so only a walk-eligible
 /// transit/IG subject changes behaviour.
+#[cfg(test)]
 fn inner_stall_enabled_at_iov(
     model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
 ) -> bool {
-    crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta).ode_spec.is_some()
+    iov_eval_route(model, subject, theta, stacked_eta).0
+}
+
+/// `(ode, fused_native)` at one IOV iterate ([`iov_eval_route`]).
+type IovRoute = (bool, bool);
+
+/// The IOV inner solve's route at one stacked iterate `[η_bsv, κ_g0.., κ_g1..]` (η in true
+/// space): `(ode, fused_native)`. `ode` is [`inner_stall_enabled_at_iov`]'s predicate; `fused_native`
+/// whether the fused gradient pass's value is bit-equal to the native objective there — the
+/// model actually evaluated is closed form and one the plan scores bit-equal
+/// ([`crate::stats::likelihood::plan_value_bit_equal`]), as [`EvalRoute`] without IOV.
+fn iov_eval_route(
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
+) -> IovRoute {
+    let eff = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
+    let ode = eff.ode_spec.is_some();
+    (ode, !ode && crate::stats::likelihood::plan_value_bit_equal(eff))
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -3940,7 +3963,7 @@ fn find_ebe_iov_seeded(
     let schedule_cached = cacheable_schedule_iov_cached(model, subject);
     let schedule = schedule_cached.as_ref().as_ref();
 
-    let obj = |p: &[f64]| -> f64 {
+    let obj_uncached = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
         let eta_t: Vec<f64> = p[..n_eta].iter().zip(mu.iter()).map(|(pi, mi)| pi - mi).collect();
         let Some(layout) = &layout else {
@@ -3964,6 +3987,31 @@ fn find_ebe_iov_seeded(
             schedule,
             frozen,
         )
+    };
+    // The objective memo of `find_ebe_solve` (#3088): the native values the search scored, and
+    // the values the gradient pass scored with them where those are bit-equal to the native
+    // objective (`route_at(..).1` below), so the line search's `obj(x)` after a `grad(x)` is a
+    // lookup instead of a second walk of the subject.
+    let memo: RefCell<Vec<(Vec<u64>, f64)>> = RefCell::new(Vec::with_capacity(OBJ_MEMO));
+    let memo_get = |p: &[f64]| -> Option<f64> {
+        memo.borrow().iter().find_map(|(k, v)| {
+            (k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
+        })
+    };
+    let memo_put = |p: &[f64], v: f64| {
+        let mut m = memo.borrow_mut();
+        let mut key = if m.len() == OBJ_MEMO { m.remove(0).0 } else { Vec::with_capacity(p.len()) };
+        key.clear();
+        key.extend(p.iter().map(|x| x.to_bits()));
+        m.push((key, v));
+    };
+    let obj = |p: &[f64]| -> f64 {
+        if let Some(v) = memo_get(p) {
+            return v;
+        }
+        let v = obj_uncached(p);
+        memo_put(p, v);
+        v
     };
 
     // IOV models are not FREM, so no inner preconditioner (identity H0). Use the exact
@@ -4002,7 +4050,17 @@ fn find_ebe_iov_seeded(
     // cannot serve at this iterate, whose objective is evaluated on the ODE twin (#719/#814,
     // #1560). Evaluated per iterate and latched in the cores: κ moves the walk's per-pair
     // flip-flop domain. See `inner_stall_enabled_at_iov`.
-    let stall_at = |p: &[f64]| {
+    //
+    // One decision per evaluated point ([`iov_eval_route`]), shared by the stall stop and the
+    // fused-value checks, as `find_ebe_solve`'s `route_at`.
+    let route_cache: RefCell<Option<(Vec<u64>, IovRoute)>> = RefCell::new(None);
+    let route_at = |p: &[f64]| -> IovRoute {
+        let mut c = route_cache.borrow_mut();
+        let same =
+            |k: &[u64]| k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits());
+        if let Some((_, r)) = c.as_ref().filter(|(k, _)| same(k)) {
+            return *r;
+        }
         let mut stacked_true = p.to_vec();
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
@@ -4012,11 +4070,17 @@ fn find_ebe_iov_seeded(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
+        let r = iov_eval_route(model, subject, &params.theta, &stacked_true);
+        *c = Some((p.iter().map(|v| v.to_bits()).collect(), r));
+        r
     };
+    let stall_at = |p: &[f64]| route_at(p).0;
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    // The recording's row buffer, reused by every analytic gradient of this search
+    // (#3088), as `find_ebe_solve`'s `obs_grad_recycle`.
+    let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
@@ -4045,7 +4109,21 @@ fn find_ebe_iov_seeded(
             frozen,
         )
     };
+    // The gradient a fused trial ([`PrimeFn`]) took at the exact bits of its point.
+    let primed: RefCell<Option<(Vec<u64>, Vec<f64>)>> = RefCell::new(None);
+    // The gradient pass scores its value against the declared residual correlation; the
+    // objective above scores the live ρ (#847), so the value is asked for only where neither
+    // is dense (the pass's own scope covers the declared one).
+    let want_value = !model.residual_cov_at(params).is_dense();
     let agrad = |p: &[f64]| -> Vec<f64> {
+        {
+            let mut held = primed.borrow_mut();
+            if held.as_ref().is_some_and(|(k, _)| {
+                k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits())
+            }) {
+                return held.take().map(|(_, g)| g).unwrap_or_default();
+            }
+        }
         if !analytic_iov_inner {
             // The kernel's exact gradient where it serves the subject, a cross-row
             // (dense) IOV residual included (#1082 PR5, #2101); central differences else.
@@ -4081,7 +4159,8 @@ fn find_ebe_iov_seeded(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        match analytic_eta_nll_gradient_iov_frozen(
+        let mut fused_value = None::<f64>;
+        match analytic_eta_nll_value_gradient_iov_frozen(
             model,
             subject,
             layout,
@@ -4092,8 +4171,18 @@ fn find_ebe_iov_seeded(
             &params.sigma.values,
             mult.as_deref(),
             frozen,
+            &mut obs_grad_recycle.borrow_mut(),
+            want_value.then_some(&mut fused_value),
         ) {
             Some(g) => {
+                // The objective's value at `p` from the pass that just took its gradient, where
+                // it is the native value bit for bit (`route_at`): the search's next `obj(p)` is
+                // a memo hit instead of a second walk (#3088).
+                if let Some(v) = fused_value.filter(|_| route_at(p).1) {
+                    #[cfg(test)]
+                    IOV_MEMO_FUSED_PUTS.with(|c| c.set(c.get() + 1));
+                    memo_put(p, v);
+                }
                 #[cfg(test)]
                 IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                 g
@@ -4203,8 +4292,43 @@ fn find_ebe_iov_seeded(
         })
         .flatten()
         .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
-    let primary = inner_minimize_with_grad(
+    // Value/gradient fusion on the line search's full-step trial, as in `find_ebe_solve`:
+    // where the gradient pass also scores the value bit-equal to the native objective, the
+    // trial runs that one pass — value for the Armijo test, gradient parked in `primed` for the
+    // driver's next `grad(x)` — instead of the native walk followed by the gradient pass.
+    // Closed-form objectives only, as there: on an ODE objective the gradient integration costs
+    // more than the value integration, and a rejected full step would pay it for nothing.
+    let fuse_eligible = analytic_iov_inner
+        && !opted_out
+        && layout.is_some()
+        && nested.is_none()
+        && !stall_at(&x)
+        && want_value
+        && model.frem_config.is_none()
+        && !model.is_sde()
+        && !matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
+        && subject.obs_records.is_empty()
+        && subject.fremtype.iter().all(|&ft| ft == 0);
+    let prime_fn = |p: &[f64]| -> Option<f64> {
+        if !route_at(p).1 {
+            return None;
+        }
+        let g = agrad(p);
+        {
+            let mut held = primed.borrow_mut();
+            let key = held.get_or_insert_with(|| (Vec::new(), Vec::new()));
+            key.0.clear();
+            key.0.extend(p.iter().map(|v| v.to_bits()));
+            key.1 = g;
+        }
+        // The value `agrad` just memoised (absent when its pass could not score `p`: the
+        // gradient stays parked for the `grad(p)` the driver takes anyway).
+        memo_get(p)
+    };
+    let prime: Option<&PrimeFn<'_>> = fuse_eligible.then_some(&prime_fn as &PrimeFn<'_>);
+    let primary = inner_minimize_with_prime(
         &obj,
+        prime,
         &agrad,
         &mut x,
         n_flat,
@@ -5622,6 +5746,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
         sigma,
         mult,
         None,
+        &mut Vec::new(),
     )
 }
 
@@ -5634,13 +5759,53 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
 /// [`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of),
 /// built once per EBE search by the caller (#2037); it carries `n_eta`, the κ width and
 /// the group count, so none of them is a parameter that could disagree with it.
+///
+/// `obs_grad_recycle` is the caller's per-subject row buffer, as in the non-IOV
+/// [`analytic_eta_nll_value_gradient_with_schedule`]: the recording fills it in place, so
+/// an EBE search reuses one `∂f/∂η` row per observation across its iterations (#3088).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
     omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
-    frozen_var_preds: Option<&[f64]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
 ) -> Option<Vec<f64>> {
+    analytic_eta_nll_value_gradient_iov_frozen(
+        model,
+        subject,
+        layout,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        obs_grad_recycle,
+        None,
+    )
+}
+
+/// [`analytic_eta_nll_gradient_iov_frozen`] that also reports the IOV objective's **value**
+/// through `value_out`, from the same pass (value/gradient fusion, as
+/// [`analytic_eta_nll_value_gradient_with_schedule`] does without IOV): the predictions the
+/// gradient is built from are the ones `individual_nll_iov_frozen_in` scores, so the value
+/// costs a few flops where the native objective re-predicts the whole subject (#3088).
+/// `*value_out` is `Some(l)` only for a plain Gaussian row sum on one IOV level — no nested
+/// levels, dense `R`, censored or FREM row, SDE variance or non-Gaussian record — with a
+/// finite value; `None` otherwise (the caller takes the native objective there). Under
+/// `frozen_var_preds` each row's variance is taken at `f₀[j]`, as the native objective does.
+#[allow(clippy::too_many_arguments)]
+fn analytic_eta_nll_value_gradient_iov_frozen(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    mut value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    if let Some(v) = value_out.as_deref_mut() {
+        *v = None;
+    }
     // A record without an exact η-channel would leave its term out of the gradient: refuse
     // the subject here too, not only at the routing gate (direct callers skip that).
     if !non_gaussian_eta_grad_served(model, subject) {
@@ -5649,22 +5814,64 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // The recording reads the per-cell `stacked_true` and returns the jet over the
     // layout's axes — the compact vector under nested levels (#1082), the stack itself
     // otherwise — so the gradient below is over the vector the EBE search moves.
-    let n_eta = layout.n_eta();
-    let axes = layout.to_axes(stacked_true)?;
+    // One level: the axes are the stack itself, read in place (no copy per call).
+    let axes: std::borrow::Cow<'_, [f64]> = if layout.nested().is_some() {
+        std::borrow::Cow::Owned(layout.to_axes(stacked_true)?)
+    } else if stacked_true.len() == layout.n_stacked() {
+        std::borrow::Cow::Borrowed(stacked_true)
+    } else {
+        return None;
+    };
     // No Gaussian rows ⇒ no Gaussian data term and nothing to record (an endpoint-only
     // subject: its inner gradient is the prior plus the non-Gaussian terms below).
-    let sens = if subject.obs_times.is_empty() {
-        Vec::new()
-    } else {
-        crate::sens::ode_provider::adjoint::exact_obs_grads_in(
-            model,
-            subject,
-            Some(layout),
-            theta,
-            model.is_sde().then_some(sigma),
-            stacked_true,
-        )?
-    };
+    // Otherwise the recording fills the caller's buffer in place, handed back on every exit.
+    let mut rows = std::mem::take(obs_grad_recycle);
+    if subject.obs_times.is_empty() {
+        rows.clear();
+    } else if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
+        model,
+        subject,
+        Some(layout),
+        theta,
+        model.is_sde().then_some(sigma),
+        stacked_true,
+        &mut rows,
+    ) {
+        *obs_grad_recycle = rows;
+        return None;
+    }
+    let grad = iov_gradient_from_rows(
+        model,
+        subject,
+        layout,
+        &rows,
+        theta,
+        stacked_true,
+        &axes,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        value_out,
+    );
+    *obs_grad_recycle = rows;
+    grad
+}
+
+/// The body of [`analytic_eta_nll_gradient_iov_frozen`] over the recorded rows `sens`
+/// (the subject's prediction rows, then an SDE subject's EKF variance rows) and the search
+/// vector `axes`, so the caller hands its row buffer back on every exit. `value_out`: the
+/// fused objective value (see [`analytic_eta_nll_value_gradient_iov_frozen`]).
+#[allow(clippy::too_many_arguments)]
+fn iov_gradient_from_rows(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    sens: &[crate::sens::provider::ObsGrad], theta: &[f64], stacked_true: &[f64], axes: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
+    mult: Option<&[Vec<f64>]>, frozen_var_preds: Option<&[f64]>,
+    value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    let n_eta = layout.n_eta();
     // An SDE subject's EKF variance rows (BSV-only filter: their κ columns are zero).
     let (sens, p_rows) = sens.split_at(sens.len().min(subject.observations.len()));
     let n_stacked = layout.n_axes();
@@ -5694,6 +5901,19 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // The value is scored only where `individual_nll_iov_frozen_in` is a plain Gaussian row
+    // sum over these predictions (see `analytic_eta_nll_value_gradient_iov_frozen`).
+    let value_ok = value_out.is_some()
+        && layout.nested().is_none()
+        && p_rows.is_empty()
+        && !model.is_sde()
+        && !model.bloq_in_force().has_censored_row(&subject.cens)
+        && !subject.fremtype.iter().any(|&ft| ft > 0)
+        && subject.obs_records.is_empty()
+        && !model.residual_cov_theta(theta).is_dense()
+        && omega_bsv.log_det.is_finite()
+        && omega_iov.log_det.is_finite();
+    let mut data_ll = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
         let cens = if m3 { subject.cens.get(j).copied().unwrap_or(0) } else { 0 };
         // The residual logic is shared with the non-IOV inner via `residual_inner_obs`
@@ -5717,6 +5937,18 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
             *g += coef * obs.df_deta[k] + p.map_or(0.0, |p| coef_p * p.df_deta[k]);
         }
         ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
+        if value_ok {
+            // `individual_nll_iov_frozen_in`'s row term, the same expression: the variance at
+            // `f₀[j]` under a frozen variance (where `ruv_scale` is 1, as there).
+            let v = model.residual_variance_at_scaled(
+                err_keys[j],
+                frozen_var_preds.map_or(obs.f, |f0| f0[j]),
+                sigma,
+                mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+            ) * ruv_scale;
+            let resid = subject.observations[j] - obs.f;
+            data_ll += resid * resid / v + v.ln();
+        }
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
@@ -5733,26 +5965,52 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under
     // nested levels one per group of each level, `Ω_L` the rows and columns of its κs.
-    let eta_bsv = DVector::from_column_slice(&axes[..n_eta]);
-    let prior_bsv = &omega_bsv.inv * &eta_bsv;
-    for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
-        *g += prior_bsv[k];
-    }
-    for (ks, base) in layout.kappa_blocks() {
-        let w = ks.len();
-        let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
-        // A block carrying every κ in order (each one-level group) reads `Ω_iov⁻¹` as is;
-        // only a nested level's subset is copied out (#2037).
-        let prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
-            &omega_iov.inv * &kappa_g
-        } else {
-            &omega_iov.inv.select_rows(&ks).select_columns(&ks) * &kappa_g
-        };
-        for c in 0..w {
-            grad[base + c] += prior_kg[c];
+    // Each block's product is read straight off the inverse, with no submatrix or vector
+    // copied out per call (#3088); the sum runs in the column order of a matrix product.
+    add_block_prior(&mut grad, &omega_bsv.inv, 0..n_eta, 0, axes);
+    if layout.nested().is_some() {
+        for (ks, base) in layout.kappa_blocks() {
+            add_block_prior(&mut grad, &omega_iov.inv, ks.iter().copied(), base, axes);
+        }
+    } else {
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            add_block_prior(&mut grad, &omega_iov.inv, 0..layout.n_kappa(), base, axes);
         }
     }
+    if let Some(out) = value_out.filter(|_| value_ok) {
+        // `½(ηᵀΩ⁻¹η + log|Ω| + Σ_g κ_gᵀΩ_IOV⁻¹κ_g + K·log|Ω_IOV| + data)`, the native order.
+        let quad = crate::stats::likelihood::quad_form;
+        let eta_prior = quad(&omega_bsv.inv, &stacked_true[..n_eta]);
+        let mut kappa_prior = 0.0;
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            kappa_prior += quad(&omega_iov.inv, &axes[base..base + layout.n_kappa()]);
+        }
+        let nll = 0.5
+            * (eta_prior
+                + omega_bsv.log_det
+                + kappa_prior
+                + (layout.n_groups() as f64) * omega_iov.log_det
+                + data_ll);
+        *out = nll.is_finite().then_some(nll);
+    }
     Some(grad)
+}
+
+/// `grad[base..base + w] += A·x[base..base + w]` with `A` the rows and columns `idx` of
+/// `inv` (`w = idx.len()`): one block of the block-diagonal stacked prior.
+fn add_block_prior(
+    grad: &mut [f64], inv: &DMatrix<f64>, idx: impl Iterator<Item = usize> + Clone, base: usize,
+    x: &[f64],
+) {
+    for (c, r) in idx.clone().enumerate() {
+        let mut acc = 0.0;
+        for (d, s) in idx.clone().enumerate() {
+            acc += inv[(r, s)] * x[base + d];
+        }
+        grad[base + c] += acc;
+    }
 }
 
 /// Build the diagonal inner-BFGS preconditioner (the search `H0`) for a subject.

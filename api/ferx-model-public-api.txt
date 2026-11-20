@@ -1537,7 +1537,7 @@ pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
 pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_model::sim::adaptive::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
@@ -1584,7 +1584,8 @@ pub ferx_model::sim::adaptive::MonitorSpec::mode: ferx_model::sim::adaptive::Obs
 pub ferx_model::sim::adaptive::MonitorSpec::name: alloc::string::String
 impl ferx_model::sim::adaptive::MonitorSpec
 pub fn ferx_model::sim::adaptive::MonitorSpec::new(name: impl core::convert::Into<alloc::string::String>, cmt: usize, mode: ferx_model::sim::adaptive::ObserveMode) -> Self
-pub struct ferx_model::sim::adaptive::ObservedSignal
+#[non_exhaustive] pub struct ferx_model::sim::adaptive::ObservedSignal
+pub ferx_model::sim::adaptive::ObservedSignal::latent: f64
 pub ferx_model::sim::adaptive::ObservedSignal::mode: ferx_model::sim::adaptive::ObserveMode
 pub ferx_model::sim::adaptive::ObservedSignal::name: alloc::string::String
 pub ferx_model::sim::adaptive::ObservedSignal::value: f64

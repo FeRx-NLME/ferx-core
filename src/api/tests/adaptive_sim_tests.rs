@@ -2,7 +2,7 @@ use super::*;
 use crate::parser::model_parser::{parse_full_model, parse_model_string};
 use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
-    DoseAction, DoseStep, MonitorSpec, ObserveMode,
+    DoseAction, DoseStep, MonitorSpec, ObserveMode, ObservedSignal,
 };
 #[allow(unused_imports)]
 use ferx_model::internal::*;
@@ -4042,7 +4042,7 @@ fn from_spec_observe_t_alias_fold_warns_at_parse_time() {
 fn from_spec_metrics_track_titration_and_window() {
     // End-to-end: the per-subject metrics row is populated from the same run's
     // ledger + decision log, keyed by (subject, draw, sim), and the
-    // `pct_time_in_window` metric reads the spec's `target_window`. Uses the
+    // `pct_readings_in_window` metric reads the spec's `target_window`. Uses the
     // converging titration with the band [8, 13] declared as the target.
     let parsed = parse_full_model(SPEC_TITRATE).expect("parse titrating block");
     let mut spec = parsed.adaptive_dosing.clone().expect("block present");
@@ -4077,14 +4077,15 @@ fn from_spec_metrics_track_titration_and_window() {
     assert_eq!(m.cumulative_dose, ledger_sum);
     assert!(m.signal_min.is_some() && m.signal_max.is_some() && m.signal_mean.is_some());
 
-    // pct_time_in_window re-derives from the decision log's observed troughs.
+    // pct_readings_in_window re-derives from the decision log's latent troughs (#946; this
+    // Ipred block's latent equals its value).
     let n = res.decisions.len();
     let in_band = res
         .decisions
         .iter()
-        .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].value))
+        .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].latent))
         .count();
-    assert_eq!(m.pct_time_in_window, Some(in_band as f64 / n as f64));
+    assert_eq!(m.pct_readings_in_window, Some(in_band as f64 / n as f64));
     // No `auc_target` on this spec ⇒ the window AUC is skipped and the
     // exposure metric stays unreported.
     assert_eq!(m.auc_target_attainment, None);
@@ -4205,7 +4206,7 @@ fn from_spec_metrics_degenerate_run_has_no_changes() {
     // The metrics half of the degenerate oracle: a block that never titrates
     // re-issues a fixed 100 mg at each of the 3 decisions, so the metrics show no
     // dose changes, no holds, no discontinuation, and — with no `target_window`
-    // declared — `pct_time_in_window` is unreported.
+    // declared — `pct_readings_in_window` is unreported.
     let parsed = parse_full_model(SPEC_DEGENERATE).expect("parse model + block");
     let spec = parsed.adaptive_dosing.as_ref().expect("block present");
     let pop = population(vec![subj("1", vec![6.0, 30.0, 54.0], vec![])]);
@@ -4228,7 +4229,7 @@ fn from_spec_metrics_degenerate_run_has_no_changes() {
     assert_eq!(m.n_holds, 0);
     assert!(!m.discontinued);
     assert_eq!(m.cumulative_dose, 300.0);
-    assert_eq!(m.pct_time_in_window, None, "no target_window in the block");
+    assert_eq!(m.pct_readings_in_window, None, "no target_window in the block");
 }
 
 #[test]
@@ -9188,4 +9189,110 @@ fn adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasi
         let want: Vec<u64> = preds.iter().map(|p| p.to_bits()).collect();
         assert_eq!(got, want, "observations {obs:?}: adaptive must equal predict_iov");
     }
+}
+
+// ----- #946 PR1.5: outcome metrics are scored on the latent signal -----------------
+
+/// The straddle pair for #946: one spec read under `Ipred` and under `Dv` (assay noise
+/// at the model's own σ, 20% proportional), same seed. The only rule never fires, so
+/// every decision re-issues `start_dose` and the dose schedule — hence the latent
+/// trajectory — cannot depend on the mode. Then the metrics, scored on the latent
+/// signal, must be equal across the pair, while the ledger's `value` must differ
+/// (the noise is still recorded for decision audit).
+///
+/// Regressions it exists to catch: scoring the metrics on `value` again (the `Dv`
+/// metrics move off the `Ipred` ones), and swapping `value`/`latent` at the monitor
+/// loop's constructor (the `Dv` latent stops matching the `Ipred` reading).
+#[test]
+fn dv_monitor_metrics_are_scored_on_latent_signal_946() {
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let at: Vec<f64> = (0..=10).map(|k| 24.0 * k as f64).collect();
+    let pop = population(vec![subj("1", vec![6.0, 30.0], vec![])]);
+    let window = (9.0, 10.0);
+    let ipred_spec = AdaptiveDosingSpec {
+        observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
+        with_assay_error: false,
+        assay_cmt: None,
+        at,
+        start_dose: (100.0).into(),
+        route: AdaptiveRoute::Bolus { cmt: 1 },
+        dose_bounds: ((0.0).into(), (1000.0).into()),
+        confirm: 1,
+        levels: None,
+        target_window: Some(window),
+        auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
+        decision_covariates: Default::default(),
+        // Never fires (an amount is never negative): every decision re-issues 100.
+        rules: vec![AdaptiveRule {
+            op: Comparison::Lt,
+            threshold: -1.0,
+            action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            interval: None,
+        }],
+        intervals: None,
+        start_interval: None,
+    };
+    let dv_spec = AdaptiveDosingSpec {
+        observe: None,
+        with_assay_error: true,
+        assay_cmt: Some(1),
+        ..ipred_spec.clone()
+    };
+    let opts = AdaptiveSimulateOptions { seed: Some(11), ..Default::default() };
+    let ipred =
+        simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &ipred_spec, &opts)
+            .expect("ipred run");
+    let dv = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &dv_spec, &opts)
+        .expect("dv run");
+
+    // Precondition: the schedule is mode-independent, so the latent trajectory is too.
+    let schedule = |r: &AdaptiveSimulationResult| {
+        r.ledger.iter().map(|e| (e.time.to_bits(), e.amt.to_bits())).collect::<Vec<_>>()
+    };
+    assert_eq!(schedule(&ipred), schedule(&dv), "the never-firing rule re-issues 100");
+    assert_eq!(ipred.decisions.len(), 11);
+    assert_eq!(dv.decisions.len(), 11);
+
+    let bits = |r: &AdaptiveSimulationResult, f: fn(&ObservedSignal) -> f64| {
+        r.decisions.iter().map(|d| f(&d.observed_signals[0]).to_bits()).collect::<Vec<_>>()
+    };
+    // Ipred: latent == value bit-for-bit.
+    assert_eq!(bits(&ipred, |s| s.latent), bits(&ipred, |s| s.value), "Ipred latent == value");
+    // Dv: its latent is the Ipred reading bit-for-bit (kills a value/latent swap at
+    // the constructor) ...
+    assert_eq!(bits(&dv, |s| s.latent), bits(&ipred, |s| s.value), "Dv latent == Ipred value");
+    // ... while its value carries the assay draw (noise still recorded).
+    assert_ne!(bits(&dv, |s| s.value), bits(&dv, |s| s.latent), "Dv value is noised");
+
+    // The straddle itself: scored on the noised values, the Dv run's metrics would
+    // differ from the latent ones, in the window count *and* the summary. Without
+    // this the equality below could hold for a fixture whose noise moves nothing.
+    let in_window = |vals: &[f64]| vals.iter().filter(|&&v| v >= window.0 && v <= window.1).count();
+    let vals = |r: &AdaptiveSimulationResult, f: fn(&ObservedSignal) -> f64| {
+        r.decisions.iter().map(|d| f(&d.observed_signals[0])).collect::<Vec<_>>()
+    };
+    let (noised, latent) = (vals(&dv, |s| s.value), vals(&dv, |s| s.latent));
+    assert!(noised.iter().chain(&latent).all(|v| v.is_finite()));
+    assert_ne!(
+        in_window(&noised),
+        in_window(&latent),
+        "noise must flip a reading across the window"
+    );
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    assert_ne!(mean(&noised).to_bits(), mean(&latent).to_bits());
+
+    // Latent scoring: the pair's metrics are equal, bit-for-bit.
+    let (mi, md) = (&ipred.metrics[0], &dv.metrics[0]);
+    assert_eq!(md.signal_min.map(f64::to_bits), mi.signal_min.map(f64::to_bits));
+    assert_eq!(md.signal_max.map(f64::to_bits), mi.signal_max.map(f64::to_bits));
+    assert_eq!(md.signal_mean.map(f64::to_bits), mi.signal_mean.map(f64::to_bits));
+    assert_eq!(md.pct_readings_in_window, mi.pct_readings_in_window);
+    assert_eq!(
+        md.pct_readings_in_window,
+        Some(in_window(&latent) as f64 / latent.len() as f64),
+        "pct_readings_in_window counts latent readings in the window"
+    );
 }
