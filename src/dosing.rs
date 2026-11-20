@@ -601,9 +601,12 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     // Recorded on every call so a converged run clears an earlier warning (#1289).
     record_ss_nonconvergence_warning(warning.as_deref());
     if let Some(msg) = warning {
-        let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
-        if let Some(set) = ss_at_estimates().lock().as_mut().ok().and_then(|m| m.get_mut(&fit)) {
-            set.insert(msg.clone());
+        // No fit collecting (every search): no second lock on the note path.
+        if SS_COLLECTING.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+            if let Some(set) = ss_at_estimates_lock().get_mut(&fit) {
+                set.insert(msg.clone());
+            }
         }
         if let Ok(mut m) = ss_nonconvergence_sink().lock() {
             m.entry(ss_run_key()).or_default().insert(msg);
@@ -612,23 +615,47 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
 }
 
 /// The fits collecting the notes of their pass at the reported estimates, and those notes
-/// ([`ss_notes_at_estimates`]).
-fn ss_at_estimates() -> &'static SsSink {
+/// ([`ss_notes_at_estimates`]); [`SS_COLLECTING`] counts them, so a note written while none is
+/// collecting takes no lock here. A poisoned lock is recovered, on both sides, so a note is never
+/// dropped for it.
+fn ss_at_estimates_lock() -> std::sync::MutexGuard<
+    'static,
+    std::collections::HashMap<u64, std::collections::BTreeSet<String>>,
+> {
     static AT: std::sync::OnceLock<SsSink> = std::sync::OnceLock::new();
     AT.get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// How many fits are inside [`ss_notes_at_estimates`].
+static SS_COLLECTING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `f`, run by the calling thread's fit, with the SS non-convergence notes its predictions write
 /// (its pool tasks carry the fit). A fit reports these, from its pass at the estimates, and not
 /// the run's: those also hold the trial points its searches visited, where an `η` far out can
 /// leave no periodic steady state at all — on #1522's linear model a line-search probe at
 /// `CL ≈ 1e-46` — while the estimates have one.
+///
+/// Called inside a fit (`current_fit() != 0`): bucket `0` is every unscoped thread's. The fit's
+/// entry and the count are released when `f` returns or unwinds.
 pub(crate) fn ss_notes_at_estimates<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    use std::sync::atomic::Ordering;
+    struct Collecting(u64);
+    impl Drop for Collecting {
+        fn drop(&mut self) {
+            ss_at_estimates_lock().remove(&self.0);
+            SS_COLLECTING.fetch_sub(1, Ordering::Release);
+        }
+    }
     let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
-    let at = || ss_at_estimates().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    at().insert(fit, Default::default());
+    debug_assert_ne!(fit, 0, "ss_notes_at_estimates outside a fit");
+    ss_at_estimates_lock().insert(fit, Default::default());
+    SS_COLLECTING.fetch_add(1, Ordering::Release);
+    let collecting = Collecting(fit);
     let r = f();
-    let notes = at().remove(&fit).unwrap_or_default();
+    let notes = ss_at_estimates_lock().get_mut(&fit).map(std::mem::take).unwrap_or_default();
+    drop(collecting);
     (r, notes.into_iter().collect())
 }
 
@@ -734,8 +761,9 @@ mod ss_warn_tests {
 
     /// #1522: a fit reports the notes of its pass at the estimates, including one a pool task of
     /// its fit writes, and not a note its search wrote before the pass or another fit wrote during
-    /// it. Mutation: write only the run's bucket -> no notes; drop the fit-id check -> the other
-    /// fit's note is among them.
+    /// it, and leaves nothing behind when it returns or unwinds. Mutations: write only the run's
+    /// bucket -> no notes; drop the fit-id check -> the other fit's note is among them; keep the
+    /// entry on return or unwind -> the entry is still there.
     #[test]
     fn a_fit_reports_only_the_notes_of_its_pass_at_the_estimates() {
         use crate::parser::model_parser::rhs_regcode::kernel_jit::{current_fit, in_fit};
@@ -755,6 +783,11 @@ mod ss_warn_tests {
         });
         let want = ss_equilibration_tail_warning(false, 1.0, 2.0, 10.0).unwrap();
         assert_eq!(notes, vec![want]);
+        // The fit's entry leaves with the call, also when the pass unwinds, so a later note under
+        // the same id collects nowhere.
+        assert!(!ss_at_estimates_lock().contains_key(&fit));
+        let unwound = std::panic::catch_unwind(|| ss_notes_at_estimates(|| panic!("pass")));
+        assert!(unwound.is_err() && !ss_at_estimates_lock().contains_key(&fit));
     }
 
     /// #2067: two runs open at once keep their notes apart, including a note written by a pool

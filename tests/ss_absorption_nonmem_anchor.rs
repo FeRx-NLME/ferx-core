@@ -294,7 +294,7 @@ fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 }
 
 /// The blocking-bug regression (#874 review): `n_starts` defaults to `1`, so a plain `fit()` takes
-/// the single-start fast path — which must drain the SS non-convergence sink into
+/// the single-start fast path, which must report an SS non-convergence note in
 /// `FitResult.warnings`, not just the multi-start arm. A fit reports the notes of its pass at the
 /// estimates (#1522), so it is evaluated at the start, where `VMAX = 10` is below the mean input
 /// `100/8`; covariance is off to keep it quick.
