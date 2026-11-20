@@ -88,7 +88,12 @@ pub enum AdaptiveComponentStatus {
     /// The estimate and its jackknife Monte Carlo standard error; `mc_se` is `None` when
     /// a delete-one replicate cannot estimate the layer (two draws for `Parameter`, two
     /// sims for `Bsv` without parameter uncertainty).
-    Estimated { value: f64, mc_se: Option<f64> },
+    Estimated {
+        /// The estimate, as computed: a negative value is not truncated.
+        value: f64,
+        /// The delete-one jackknife standard error of `value`.
+        mc_se: Option<f64>,
+    },
     /// The subject's η was supplied (`AdaptiveInputs::with_etas`), so there is no BSV to
     /// estimate.
     Supplied,
@@ -101,7 +106,9 @@ pub enum AdaptiveComponentStatus {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AdaptiveDecompositionSkip {
+    /// The metric left out for this subject.
     pub metric: AdaptiveSummaryMetric,
+    /// The subject (population row), by id.
     pub subject: String,
     /// Runs of the subject that do not carry the metric, out of `D × S × R`.
     pub n_missing: usize,
