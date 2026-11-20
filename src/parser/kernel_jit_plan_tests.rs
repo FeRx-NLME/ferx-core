@@ -2552,8 +2552,9 @@ fn a_phase_boundary_releases_only_the_running_fits_plans_and_keeps_its_bad_marks
 }
 
 /// A phase boundary frees every pool worker's thread-local buffers, not only the calling
-/// thread's (#3077): each keeps the largest a pass ever needed. Mutation: release only the
-/// calling thread (drop the `rayon::broadcast`) -> the other worker still holds its buffers.
+/// thread's (#3077): each keeps the largest a pass ever needed. Mutations: release only the
+/// calling thread (drop the `rayon::broadcast`) -> the other worker still holds its buffers;
+/// leave one pool out of `ode_loop::release_thread_buffers` (`IDX`) -> its table stays.
 #[test]
 fn a_phase_boundary_frees_every_workers_pooled_buffers() {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("a pool");
@@ -2574,6 +2575,7 @@ fn a_phase_boundary_frees_every_workers_pooled_buffers() {
             give(vec![0.0; 1 << 12]);
             super::in_fit(fit, || assert!(matches!(lookup(&key), Lookup::Found(_))));
             super::ode_loop::Log::default().give();
+            super::ode_loop::pool_an_offset_table();
         });
         let before = rayon::broadcast(|_| pooled());
         release_fit_plans();
@@ -2581,7 +2583,7 @@ fn a_phase_boundary_frees_every_workers_pooled_buffers() {
         drop(guard);
         (before, after)
     });
-    assert!(counts.0.iter().all(|&n| n >= 3), "fixture: each worker holds some: {:?}", counts.0);
+    assert!(counts.0.iter().all(|&n| n >= 4), "fixture: each worker holds some: {:?}", counts.0);
     assert_eq!(counts.1, vec![0, 0], "each worker's are freed");
     drop(m);
 }
@@ -2689,4 +2691,54 @@ fn a_checkpointed_ode_log_reverses_bit_for_bit_like_the_full_log() {
             );
         }
     }
+}
+
+/// A phase run on the tighter ODE scope's own pool — the covariance step's stencil, the settle
+/// check, the stagnation guard's decrement — leaves that pool's workers holding no plan handle
+/// or buffer (#3077). The pool is cached for the next caller, and a phase boundary on the fit's
+/// pool cannot reach it, so a worker's `LAST` would keep the plans the boundary pruned alive.
+/// Mutation: drop the `release_pool_thread_caches` call from `with_fit_scope_ode` -> the second
+/// visit finds the first one's buffers and plan handles on both workers.
+#[test]
+fn a_tighter_ode_scope_leaves_its_pools_workers_empty() {
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let subs = vec![crate::types::Subject::default()];
+    let options = crate::types::FitOptions { threads: Some(2), ..Default::default() };
+    // An override no other test arms, so the cached pool this leases is this test's alone.
+    let tight = crate::ode::solver::OdeSolverOverride {
+        reltol: Some(3.077e-9),
+        abstol: Some(3.077e-11),
+        ..Default::default()
+    };
+    let pooled = || {
+        POOL.with(|p| p.borrow().len())
+            + LAST.with(|l| usize::from(l.borrow().is_some()))
+            + super::ode_loop::pooled_buffers()
+    };
+    let guard = register(&m, &subs);
+    let fit = guard.fit;
+    let key = SubjectKey::new(&m, &subs[0], 1, 2).with_variant(Desc::of_value(&0x3077_0006u64));
+    add(&key, square_plan());
+    let (filled, before) = crate::pool::with_fit_scope_ode(&options, tight, || {
+        assert_eq!(rayon::current_num_threads(), 2, "fixture: the scope's own pool");
+        rayon::broadcast(|_| {
+            give(vec![0.0; 1 << 12]);
+            super::in_fit(fit, || assert!(matches!(lookup(&key), Lookup::Found(_))));
+            super::ode_loop::Log::default().give();
+            super::ode_loop::pool_an_offset_table();
+        });
+        let filled = rayon::broadcast(|_| pooled());
+        (filled, std::thread::current().id())
+    })
+    .expect("the tighter scope");
+    assert!(filled.iter().all(|&n| n >= 4), "fixture: each worker holds some: {filled:?}");
+    // The next caller of the same scope leases the same idle pool.
+    let (after, again) = crate::pool::with_fit_scope_ode(&options, tight, || {
+        let ids = rayon::broadcast(|_| std::thread::current().id());
+        (rayon::broadcast(|_| pooled()), ids)
+    })
+    .expect("the tighter scope");
+    assert!(again.contains(&before), "fixture: the cached pool is the one leased again");
+    assert_eq!(after, vec![0, 0], "the scope's workers were left empty");
+    drop(guard);
 }

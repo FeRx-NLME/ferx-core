@@ -881,17 +881,27 @@ impl Log {
     }
 }
 
-/// Free this thread's pooled slot buffers and run logs (`kernel_jit::release_thread_caches`,
-/// #3077): each keeps the largest run it ever served. A pool borrowed right now is left.
+/// Free this thread's pooled slot buffers, run logs and reverse offset tables
+/// (`kernel_jit::release_thread_caches`, #3077): each keeps the largest run it ever served. A pool borrowed right now is left.
 pub(super) fn release_thread_buffers() {
     let _ = BUFS.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
     let _ = LOGS.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+    let _ = IDX.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
 }
 
-/// How many slot buffers and run logs this thread's pools hold (test seam).
+/// How many slot buffers, run logs and reverse offset tables this thread's pools hold (test
+/// seam).
 #[cfg(test)]
 pub(super) fn pooled_buffers() -> usize {
-    BUFS.with(|p| p.borrow().len()) + LOGS.with(|p| p.borrow().len())
+    BUFS.with(|p| p.borrow().len())
+        + LOGS.with(|p| p.borrow().len())
+        + IDX.with(|p| p.borrow().len())
+}
+
+/// Pool one reverse offset table on this thread (test seam).
+#[cfg(test)]
+pub(super) fn pool_an_offset_table() {
+    give_idx(vec![0; 64]);
 }
 
 /// A loop call running over one layout's kernels.

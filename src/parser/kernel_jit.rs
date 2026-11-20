@@ -2932,7 +2932,9 @@ fn drop_scope(scope: u64) {
 /// Then every worker of the pool this thread runs on drops its thread-local buffers and plan
 /// handles ([`release_thread_caches`]), which keep the largest a pass ever needed. Off a pool,
 /// only this thread's. A fit sharing the pool (another start of a multi-start) loses only cached
-/// buffers, which its next pass allocates again.
+/// buffers, which its next pass allocates again. A phase that ran on another pool — the tighter
+/// ODE scope of the covariance step or the settle check — cleared that pool's workers as it
+/// left it (`crate::pool::with_fit_scope_ode`), so no worker anywhere keeps these plans alive.
 ///
 /// A no-op outside a registered fit: scope `0`'s plans leave with their model ([`drop_model`]).
 pub(crate) fn release_fit_plans() {
@@ -2949,11 +2951,7 @@ pub(crate) fn release_fit_plans() {
     drop(s);
     lock_families().retain(|k, _| k.scope != scope);
     prune_caches(|sc, _| sc == scope);
-    if rayon::current_thread_index().is_some() {
-        rayon::broadcast(|_| release_thread_caches());
-    } else {
-        release_thread_caches();
-    }
+    crate::pool::release_pool_thread_caches();
 }
 
 /// Drop this thread's cached buffers and plan handles: the pass buffers (`BUF`, `VBUF`, `ADJ`,
