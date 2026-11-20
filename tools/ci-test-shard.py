@@ -304,11 +304,27 @@ def split_build(rest):
     return rest[:i], rest[i + 1:]
 
 
+ENGINE_CRATES = ["-p", "ferx-core", "-p", "ferx-model"]
+
+
+def with_engine_crates(build):
+    """BUILD selecting both engine crates when it selects no package itself.
+
+    Since #3041 the model layer is its own crate, `ferx-model`. A root-only
+    `cargo test` builds it as a dependency but never runs its unit tests, and the
+    endpoints job's build args select nothing (the workflow file pins them). So
+    the selection lives here: args that name a package (`-p`, `--workspace`) are
+    kept as written."""
+    selects = any(a in ("-p", "--package", "--workspace") or a.startswith("--package=") for a in build)
+    return list(build) if selects else ENGINE_CRATES + list(build)
+
+
 def run(suite, k, n, p, output, build):
     """Every invocation with `--no-report` (one without it deletes the profiles
     of the ones before), then one `--no-run --workspace` report. Keeps going
     after a failing invocation, like `--no-fail-fast` within one, and exits
     non-zero if any failed."""
+    build = with_engine_crates(build)
     failed = []
     for inv in invocations(suite, k, n, p):
         if "--" in inv:

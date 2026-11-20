@@ -1436,3 +1436,41 @@ fn weights_parse_a_gh_log() {
         "no per-module unit-test weight — the timestamps were not read:\n{text}"
     );
 }
+
+/// Build args that select no package run both engine crates (#3041). The endpoints job's
+/// args name none, and a root-only `cargo llvm-cov` builds `ferx-model` as a dependency but
+/// never runs its unit tests. Every call, the report included, must carry the selection;
+/// args that do select (`--workspace`, the core job's) are pinned unchanged by the test above.
+#[test]
+fn unselected_build_args_run_both_engine_crates() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ci_test_shards_engine_crates");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("calls.txt");
+    let fake = dir.join("cargo");
+    std::fs::write(&fake, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n", log.display()))
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = Command::new("python3")
+        .arg(repo_root().join("tools/ci-test-shard.py"))
+        .args(["run", "endpoints", "1", "2", "--lib-parts", "1", "--output", "out.info", "--"])
+        .args(["--no-default-features", "--features", "ci,markov,nn", "--profile", "ci-cov"])
+        .env("CI_TEST_SHARD_CARGO", &fake)
+        .current_dir(repo_root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let calls: Vec<String> =
+        std::fs::read_to_string(&log).unwrap().lines().map(str::to_owned).collect();
+    assert!(calls.len() >= 2, "a unit invocation and the report: {calls:#?}");
+    for call in &calls {
+        assert!(
+            call.contains(" -p ferx-core -p ferx-model --no-default-features "),
+            "`{call}` does not select both engine crates"
+        );
+    }
+}
