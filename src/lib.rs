@@ -76,6 +76,36 @@ pub mod nn {
             export_dcm_as_analytic, export_dcm_from_fit, DcmExportOptions, DcmWeightForm,
         };
     }
+
+    // Lives here, not in ferx-model: it embeds a repo-level fixture, which a published
+    // ferx-model package does not contain (#3041), and only ferx-core tests call it.
+    /// `tests/fixtures/two_cpt_dcm_regularized.ferx` with its `init` line removed:
+    /// every output-layer bias at 0, so each output starts at `softplus(0)`. This is
+    /// the start #1277's line-search abort was measured from, and the one #1561 found
+    /// reporting convergence far above the covariate-free point.
+    ///
+    /// The penalty-kernel and gradient-parity tests evaluate at this start too, for a
+    /// different reason: its output-layer weights are Glorot draws. A declared `init`
+    /// zeroes that block, so the network is flat in its inputs, the curvature penalty
+    /// and its gradient read ≈ 0, and a parity check would compare zeros.
+    ///
+    /// Panics unless exactly one line was stripped, so a reworded `init` line cannot
+    /// quietly turn this back into the declared start.
+    #[cfg(test)]
+    pub(crate) fn dcm_fixture_without_init() -> String {
+        const MODEL: &str = include_str!("../tests/fixtures/two_cpt_dcm_regularized.ferx");
+        let bare: String = MODEL
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("init "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            bare.lines().count() + 1,
+            MODEL.lines().count(),
+            "exactly one `init` line must be stripped from the DCM fixture"
+        );
+        bare
+    }
 }
 pub(crate) use ferx_model::occasions;
 pub mod ode {

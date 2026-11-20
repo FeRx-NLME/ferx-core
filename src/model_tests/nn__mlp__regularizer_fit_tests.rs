@@ -28,9 +28,9 @@ fn load() -> (CompiledModel, FitOptions, Population) {
     load_text(MODEL)
 }
 
-/// The fixture without its `init` line; see [`super::dcm_fixture_without_init`].
+/// The fixture without its `init` line; see [`crate::nn::dcm_fixture_without_init`].
 fn load_bare() -> (CompiledModel, FitOptions, Population) {
-    load_text(&ferx_model::nn::mlp::dcm_fixture_without_init())
+    load_text(&crate::nn::dcm_fixture_without_init())
 }
 
 fn load_text(text: &str) -> (CompiledModel, FitOptions, Population) {
