@@ -130,6 +130,39 @@ fn ferx_core_does_not_depend_on_the_layers_above_it() {
     }
 }
 
+/// The published `ferx-core` depends on exactly its own release of `ferx-model` (#3041).
+///
+/// ferx-core uses ferx-model internals that carry no semver promise (the sealed traits of
+/// `ferx_model::internal`, members widened for the split), so a caret requirement would let
+/// a fresh resolution of an older ferx-core pick up a later 0.x.y ferx-model and stop
+/// compiling. The requirement is `=<version>`, and `<version>` is the workspace's own: the
+/// four crates release together (docs/development/sdlc.qmd).
+#[test]
+fn ferx_model_is_pinned_to_the_matching_release() {
+    let manifest =
+        std::fs::read_to_string(repo_root().join("Cargo.toml")).expect("root Cargo.toml is UTF-8");
+    let version = manifest
+        .split_once("\n[package]")
+        .and_then(|(_, rest)| rest.lines().find_map(|l| l.trim().strip_prefix("version = ")))
+        .map(|v| v.trim_matches('"').to_string())
+        .expect("root [package] has a version");
+    let model_version = std::fs::read_to_string(repo_root().join("crates/ferx-model/Cargo.toml"))
+        .expect("ferx-model manifest is UTF-8")
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("version = ").map(|v| v.trim_matches('"').to_string()))
+        .expect("ferx-model has a version");
+    assert_eq!(model_version, version, "ferx-model must carry ferx-core's version");
+    let dep = manifest
+        .lines()
+        .map(strip_toml_comment)
+        .find(|l| l.trim_start().starts_with("ferx-model = ") && !l.contains("test-support"))
+        .expect("ferx-core has a normal `ferx-model` dependency");
+    assert!(
+        dep.contains(&format!("version = \"={version}\"")),
+        "ferx-core must depend on exactly `ferx-model = \"={version}\"`, got: {dep}"
+    );
+}
+
 // ── Checked-in `ferx` CLI invocations ───────────────────────────────────────
 
 /// Text files that can plausibly carry a shell command a reader would run.
