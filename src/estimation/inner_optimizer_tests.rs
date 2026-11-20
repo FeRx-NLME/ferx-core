@@ -7681,10 +7681,11 @@ fn tmdd_2868_fixture() -> (CompiledModel, Subject, ModelParameters) {
 
 /// #2868: the FD inner gradient on an integrating objective must find the mode the analytic
 /// gradient finds. At the roundoff step `h = 1e-7·(1 + |η|)` the difference read the jump
-/// between two adaptive step sequences as slope, and this subject's search stopped 0.30 in
-/// nll short of the mode — the regression this exists to catch is the ODE branch of `ebe_gradient_fd`
-/// stepping by `FD_GRADIENT_STEP` again. Both solves are asserted on their own route, so the
-/// pair cannot collapse onto one engine.
+/// between two adaptive step sequences as slope, and before #2939 this subject's search stopped
+/// 0.30 in nll short of the mode; since #2939 the gap at the roundoff step is 1.9e-5 (see the
+/// closing comment), so the regression this exists to catch — the ODE branch of `ebe_gradient_fd`
+/// stepping by `FD_GRADIENT_STEP` again — is caught by the step assertions, not the nll bound.
+/// Both solves are asserted on their own route, so the pair cannot collapse onto one engine.
 #[test]
 fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
     let (model, subject, params) = tmdd_2868_fixture();
