@@ -1,5 +1,8 @@
 //! Generate NONMEM-format CSV datasets for all examples.
-//! Usage: cargo run --bin generate_data
+//! Usage: cargo run --bin generate_data [-- <name>]
+//!
+//! With no argument every dataset below is regenerated; with a name (`warfarin`,
+//! `two_cpt_iv`, `two_cpt_oral_cov`, `mm_oral`, `peak_memory`) only that one is.
 
 use ferx_core::api::SimulationResult;
 use ferx_core::*;
@@ -7,11 +10,88 @@ use std::collections::HashMap;
 use std::io::Write;
 
 fn main() {
-    generate_warfarin();
-    generate_two_cpt_iv();
-    generate_two_cpt_oral_cov();
-    generate_mm_oral();
-    eprintln!("All datasets generated in data/");
+    let only = std::env::args().nth(1);
+    let generators: [(&str, fn()); 5] = [
+        ("warfarin", generate_warfarin),
+        ("two_cpt_iv", generate_two_cpt_iv),
+        ("two_cpt_oral_cov", generate_two_cpt_oral_cov),
+        ("mm_oral", generate_mm_oral),
+        ("peak_memory", generate_peak_memory),
+    ];
+    if let Some(name) = only.as_deref() {
+        if !generators.iter().any(|(n, _)| *n == name) {
+            let names: Vec<&str> = generators.iter().map(|(n, _)| *n).collect();
+            eprintln!("unknown dataset {name:?}; one of {names:?}");
+            std::process::exit(2);
+        }
+    }
+    for (name, generate) in generators {
+        if only.as_deref().is_none_or(|o| o == name) {
+            generate();
+        }
+    }
+    eprintln!("Done.");
+}
+
+// ─── Peak-memory probe (#3081) ──────────────────────────────────────────────
+
+/// `tools/peak-memory/stiff_pkpd.csv`: 100 subjects simulated from
+/// `tools/peak-memory/stiff_pkpd.ferx` at its initial estimates. Two 21-day cycles of a
+/// 5-day daily oral dose (10 dose segments per subject), PK sampled on CMT 2 and the
+/// circulating-cell PD on CMT 9 — the multi-dose, two-endpoint shape of the private
+/// e7070 model the probe stands in for.
+fn generate_peak_memory() {
+    const MODEL: &str = "tools/peak-memory/stiff_pkpd.ferx";
+    const OUT: &str = "tools/peak-memory/stiff_pkpd.csv";
+    const N_SUBJECTS: usize = 100;
+    const DOSE: f64 = 300.0;
+    eprintln!("Generating peak-memory probe dataset...");
+
+    let dose_times: Vec<f64> =
+        [0.0, 504.0].iter().flat_map(|c| (0..5).map(move |d| c + 24.0 * d as f64)).collect();
+    let pk_times = [0.5, 1.0, 2.0, 4.0, 8.0, 23.5, 96.5, 98.0, 100.0, 104.0, 505.0, 508.0];
+    let pd_times = [0.01, 168.0, 240.0, 336.0, 420.0, 503.5, 672.0, 840.0, 1008.0];
+
+    // (time, evid, cmt) rows of one subject, time-sorted; no observation shares a dose time.
+    let mut rows: Vec<(f64, u8, usize)> = dose_times.iter().map(|&t| (t, 1, 1)).collect();
+    rows.extend(pk_times.iter().map(|&t| (t, 0, 2)));
+    rows.extend(pd_times.iter().map(|&t| (t, 0, 9)));
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let write = |path: &std::path::Path, dv: &dyn Fn(usize, usize) -> f64| {
+        let mut f = std::fs::File::create(path).unwrap();
+        writeln!(f, "ID,TIME,DV,EVID,AMT,CMT,MDV").unwrap();
+        for id in 1..=N_SUBJECTS {
+            let mut k = 0;
+            for &(t, evid, cmt) in &rows {
+                if evid == 1 {
+                    writeln!(f, "{id},{t},.,1,{DOSE},{cmt},1").unwrap();
+                } else {
+                    writeln!(f, "{id},{t},{:.6},0,.,{cmt},0", dv(id, k)).unwrap();
+                    k += 1;
+                }
+            }
+        }
+    };
+
+    // The design with placeholder DVs, read back through the ordinary reader so the
+    // simulated subjects are exactly what `fit()` will see.
+    let design = std::env::temp_dir().join("ferx-peak-memory-design.csv");
+    write(&design, &|_, _| 1.0);
+    let pop = read_nonmem_csv(&design, None, None).unwrap();
+    let _ = std::fs::remove_file(&design);
+
+    let model = parse_model_file(std::path::Path::new(MODEL)).unwrap();
+    let sim = simulate_with_seed(&model, &pop, &model.default_params, 1, 3081).unwrap();
+    let mut dv: HashMap<(String, usize), f64> = HashMap::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for s in &sim {
+        let k = seen.entry(s.id.clone()).or_insert(0);
+        dv.insert((s.id.clone(), *k), s.outcome.continuous_value());
+        *k += 1;
+    }
+    write(std::path::Path::new(OUT), &|id, k| dv[&(id.to_string(), k)]);
+    eprintln!("  Written: {OUT}");
 }
 
 fn write_nonmem_csv(
