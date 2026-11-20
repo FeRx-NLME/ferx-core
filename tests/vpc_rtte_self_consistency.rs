@@ -308,14 +308,22 @@ mod self_consistency {
     /// reached 0, the cells the rule before #2930 read as `Some(0.0)`. Measured: 272 cells
     /// past the last time, 104 of them at zero.
     ///
-    /// **A2**, the one-sided-miss signal: for gap order 3, misses pooled over the three
-    /// times number at least 30 and at least a quarter fall below the band. Before #2930
-    /// a replicate that reached 0 added a 0 to the band past its last time, so once enough
-    /// did the lower edge was 0, the observed curve could not fall below it and the misses
-    /// fell above. Measured with these seeds: this rule, 30 below / 19 above (share 0.61)
-    /// on Linux aarch64 (`tools/linux-test.sh`) and macOS arm64 alike; before #2930, 4 / 23
-    /// (0.15), and carrying the last value forward, 4 / 31 (0.11), both macOS arm64. Under symmetry a below-share under 0.25 with 49 misses has
-    /// probability about 2e-4.
+    /// **A2**, the one-sided-miss signal: for gap order 3, at least a quarter of the misses
+    /// pooled over the three times fall below the band. Before #2930 a replicate that
+    /// reached 0 added a 0 to the band past its last time, so once enough did the lower
+    /// edge was 0, the observed curve could not fall below it and the misses fell above.
+    /// Measured with these seeds: this rule, 30 below / 19 above (share 0.61) on Linux
+    /// aarch64 (`tools/linux-test.sh`) and macOS arm64 alike; before #2930, 4 / 23 (0.15);
+    /// carrying the last value forward, 4 / 31 (0.11); the band keeping the zeros while
+    /// the observed curve does not, 2 / 23 (0.08); all three macOS arm64. Under symmetry a
+    /// below-share under 0.25 with 49 misses has probability about 2e-4.
+    ///
+    /// A separate sample-size floor of 20 misses comes first, so the share is read only
+    /// where it can mean something (with 20 misses a share under 0.25 has probability
+    /// about 6e-3 under symmetry). It sits below every measured count, 25 to 49, so it
+    /// passes under each of the rules above and the share assertion alone is what fails
+    /// on them; a floor failure says the design lost its misses, not that they are
+    /// one-sided.
     #[test]
     fn gap_band_past_a_curve_last_time_has_misses_on_both_sides() {
         const BASE: u64 = 2_000_000;
@@ -383,7 +391,13 @@ mod self_consistency {
             "only {past_end_at_zero} reached-0 cells past the last time: A1 no longer straddles"
         );
         assert!(
-            below + above >= 30 && share >= 0.25,
+            below + above >= 20,
+            "gap 3: only {} misses ({below} below, {above} above) at 10, 12, 15, under the \
+             floor of 20: too few to read a below-share, the design has drifted",
+            below + above
+        );
+        assert!(
+            share >= 0.25,
             "gap 3: {below} misses below and {above} above the band, below-share {share:.2} \
              under 0.25: replicates that reached 0 hold the band's lower edge at 0"
         );
