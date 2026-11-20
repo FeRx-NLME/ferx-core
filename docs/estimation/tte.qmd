@@ -1443,10 +1443,14 @@ cumulative incidences within 2.2e-16. On seeded tied data the identities hold to
 `tests/vpc_cif_self_consistency.rs` draws 200 datasets outside the simulator (100 subjects, two
 exponential causes with rates 0.06 and 0.04 under one shared frailty, uniform dropout, `H = 30`)
 and runs a 200-replicate VPC of each. Under the data's own model the observed curves lie inside
-their bands in T9_COVERAGE of datasets at H/4, H/2 and 3H/4, inside the 99 % binomial interval
-(83 %–94.5 %) around the 89.1 % a band from 200 replicates covers. With the causes' rates
-swapped, the cause bands cover T9_SWAP_CIF of datasets while the survival band still covers
-T9_SWAP_S.
+their bands at H/4, H/2 and 3H/4 in 88 %, 85 % and 87.4 % of datasets for the first cause,
+90.5 %, 88.5 % and 86.9 % for the second, and 89 %, 87 % and 91.4 % for survival: all nine
+inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band from 200 replicates
+covers. With the causes' rates swapped on the first 100 datasets, the cause bands cover only 4 %
+to 27 % while the survival band still covers 89.8 % to 93 %. Replacing the replicates' estimator
+with `1 − KM` of each cause drops the first cause's coverage to 75 %, 40.5 % and 11.6 %. The
+numbers are the same on Linux and macOS. Two datasets had nobody under follow-up at 3H/4 and are
+left out of that time.
 
 ### What it refuses
 

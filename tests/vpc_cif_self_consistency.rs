@@ -18,8 +18,13 @@
 //! datasets. A check that cannot tell the causes apart passes the first half and fails the
 //! second; one that reads the wrong curve fails the first.
 //!
-//! Measured numbers (coverage at H/4, H/2, 3H/4) are printed by the test and stated at
-//! `LO` below.
+//! Measured on macOS arm64 (coverage at H/4, H/2, 3H/4; the test prints them): `F_A`
+//! 0.88 / 0.85 / 0.874, `F_B` 0.905 / 0.885 / 0.869, `S` 0.89 / 0.87 / 0.914, all 9 inside
+//! the interval. Swapped: `F_A` 0.27 / 0.12 / 0.041, `F_B` 0.25 / 0.11 / 0.061, `S`
+//! 0.93 / 0.89 / 0.898. Two of the 200 datasets (two of the 100) had nobody under
+//! follow-up at 3H/4 and were left out of that cell. Mutation-checked: replacing the
+//! replicates' estimator with `1 − KM_k` (the observed curve unchanged) drops `F_A` to
+//! 0.75 / 0.405 / 0.116 and fails.
 
 #[cfg(feature = "survival")]
 mod self_consistency {
@@ -99,25 +104,47 @@ mod self_consistency {
         }
     }
 
-    /// Per curve (`F_A`, `F_B`, `S`) and grid time, whether the observed value is inside
-    /// the band.
-    fn inside(v: &CifVpc) -> [[bool; 3]; 3] {
-        let s = &v.strata[0];
-        let bands = [&s.causes[0].band, &s.causes[1].band, &s.survival];
-        let mut out = [[false; 3]; 3];
-        for (c, b) in bands.iter().enumerate() {
-            for g in 0..3 {
-                let obs = b.obs_on_grid[g].expect("observed curve defined");
-                let (lo, hi) = (b.lo[g].expect("band"), b.hi[g].expect("band"));
-                assert!(obs.is_finite() && lo.is_finite() && hi.is_finite());
-                out[c][g] = lo <= obs && obs <= hi;
-            }
-        }
-        out
+    /// Coverage tallies per curve (`F_A`, `F_B`, `S`) and grid time: datasets inside the
+    /// band, and datasets where the cell is defined at all. With a total hazard of 0.1 a
+    /// dataset now and then has nobody under follow-up at 3H/4 (about 1 % per dataset),
+    /// and past its last time the observed curve is undefined (#2930), so that cell is
+    /// left out rather than counted as a miss. `skipped` is capped in the test.
+    #[derive(Default)]
+    struct Tally {
+        hit: [[usize; 3]; 3],
+        defined: [[usize; 3]; 3],
     }
 
-    fn coverage(hits: &[[usize; 3]; 3], n: usize) -> [[f64; 3]; 3] {
-        hits.map(|row| row.map(|h| h as f64 / n as f64))
+    impl Tally {
+        fn add(&mut self, v: &CifVpc) {
+            let s = &v.strata[0];
+            let bands = [&s.causes[0].band, &s.causes[1].band, &s.survival];
+            for (c, b) in bands.iter().enumerate() {
+                for g in 0..3 {
+                    let (Some(obs), Some(lo), Some(hi)) = (b.obs_on_grid[g], b.lo[g], b.hi[g])
+                    else {
+                        continue;
+                    };
+                    assert!(obs.is_finite() && lo.is_finite() && hi.is_finite());
+                    self.defined[c][g] += 1;
+                    self.hit[c][g] += usize::from(lo <= obs && obs <= hi);
+                }
+            }
+        }
+
+        fn coverage(&self) -> [[f64; 3]; 3] {
+            let mut out = [[0.0; 3]; 3];
+            for c in 0..3 {
+                for g in 0..3 {
+                    out[c][g] = self.hit[c][g] as f64 / self.defined[c][g] as f64;
+                }
+            }
+            out
+        }
+
+        fn skipped(&self, n: usize) -> usize {
+            self.defined.iter().flatten().map(|&d| n - d).max().unwrap_or(0)
+        }
     }
 
     #[test]
@@ -126,7 +153,7 @@ mod self_consistency {
         let mut swapped = model.default_params.clone();
         swapped.theta.swap(0, 1);
         let grid = vec![H / 4.0, H / 2.0, 3.0 * H / 4.0];
-        let (mut hit, mut hit_swap) = ([[0usize; 3]; 3], [[0usize; 3]; 3]);
+        let (mut own, mut swap_t) = (Tally::default(), Tally::default());
         for m in 0..M {
             let pop = draw_dataset(1_887_000 + m as u64);
             let opts = VpcCifOptions {
@@ -141,23 +168,20 @@ mod self_consistency {
             };
             let v = vpc_cif(&model, &pop, &model.default_params, &opts).unwrap();
             assert_eq!(v.cmts, [2, 3]);
-            for (c, row) in inside(&v).iter().enumerate() {
-                for (g, &ok) in row.iter().enumerate() {
-                    hit[c][g] += usize::from(ok);
-                }
-            }
+            own.add(&v);
             if m < M_SWAP {
-                let v = vpc_cif(&model, &pop, &swapped, &opts).unwrap();
-                for (c, row) in inside(&v).iter().enumerate() {
-                    for (g, &ok) in row.iter().enumerate() {
-                        hit_swap[c][g] += usize::from(ok);
-                    }
-                }
+                swap_t.add(&vpc_cif(&model, &pop, &swapped, &opts).unwrap());
             }
         }
-        let (cov, swap) = (coverage(&hit, M), coverage(&hit_swap, M_SWAP));
+        let (cov, swap) = (own.coverage(), swap_t.coverage());
         eprintln!("coverage F_A, F_B, S at H/4, H/2, 3H/4: {cov:?}");
         eprintln!("swapped causes, same: {swap:?}");
+        eprintln!(
+            "cells left out: {} of {M}, {} of {M_SWAP}",
+            own.skipped(M),
+            swap_t.skipped(M_SWAP)
+        );
+        assert!(own.skipped(M) <= 6 && swap_t.skipped(M_SWAP) <= 4, "too many undefined cells");
         let names = ["F_A", "F_B", "S"];
         for c in 0..3 {
             for g in 0..3 {
