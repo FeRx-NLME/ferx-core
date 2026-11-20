@@ -760,14 +760,14 @@ impl ErrorSpec {
         // Resolve which `SigmaType` (if any) global index `k` plays for this
         // observation's endpoint.
         let stype = match self {
-            ErrorSpec::Single(em) => em.sigma_types().get(k).copied(),
+            ErrorSpec::Single(em) => em.sigma_type(k),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 match map.get(&cmt) {
                     Some(ep) => ep
                         .sigma_idx
                         .iter()
                         .position(|&i| i == k)
-                        .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
+                        .and_then(|p| ep.error_model.sigma_type(p)),
                     None => None,
                 }
             }
@@ -3182,6 +3182,18 @@ mod tests {
     }
 
     /// `∂V/∂log σ_k` under an exponent, against FD in `log σ_k`.
+    /// The allocation-free `ErrorModel::sigma_type` is `sigma_types()[slot]`, slot by slot.
+    #[test]
+    fn sigma_type_is_sigma_types_without_the_allocation() {
+        use crate::types::ErrorModel as M;
+        for em in [M::Additive, M::Proportional, M::Combined, M::LogCombined] {
+            let all = em.sigma_types();
+            for slot in 0..4 {
+                assert_eq!(em.sigma_type(slot), all.get(slot).copied(), "{em:?} slot {slot}");
+            }
+        }
+    }
+
     #[test]
     fn dvar_dlogsigma_scaled_matches_fd_under_an_exponent() {
         let spec = ErrorSpec::Single(ErrorModel::Combined);

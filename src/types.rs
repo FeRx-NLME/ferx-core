@@ -3439,6 +3439,17 @@ impl ErrorModel {
         }
     }
 
+    /// [`Self::sigma_types`]`[slot]` without the allocation, for per-observation hot loops.
+    pub(crate) fn sigma_type(self, slot: usize) -> Option<SigmaType> {
+        match (self, slot) {
+            (ErrorModel::Proportional, 0) => Some(SigmaType::Proportional),
+            (ErrorModel::Additive, 0) => Some(SigmaType::Additive),
+            (ErrorModel::Combined | ErrorModel::LogCombined, 0) => Some(SigmaType::Proportional),
+            (ErrorModel::Combined | ErrorModel::LogCombined, 1) => Some(SigmaType::Additive),
+            _ => None,
+        }
+    }
+
     /// Number of sigma parameters this error model consumes.
     pub fn n_sigma(self) -> usize {
         match self {
@@ -8657,7 +8668,7 @@ pub struct FitResult {
     /// How the gradient E-step kernel ran (`saem_kernel = hmc | nuts`); `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saem_gradient_kernel: Option<SaemGradientKernelStats>,
-    /// The SAEM E-step's kernels as they ran, per chain per iteration (`imh 1, hmc 1`): the
+    /// The SAEM E-step's kernels as they ran, per chain per iteration (`hmc 1, imh 1`): the
     /// `saem_kernel` preset with the `isample_*` counts the caller set. `None` for non-SAEM
     /// methods and the legacy `rw` / `imh` kernels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9744,7 +9755,7 @@ pub struct FitOptions {
     /// covariance step use the original subjects. `1` is the single-chain SAEM.
     pub saem_n_chains: usize,
     /// The SAEM E-step's kernels, as counts per chain per iteration (#2986): any combination,
-    /// run in the fixed order `m1, imh, m1b, hmc, nuts, m2, m3`, every one of them leaving the
+    /// run in the fixed order `hmc, nuts, mala, m1, imh, m1b, m2, m3`, every one of them leaving the
     /// subject's conditional posterior invariant. A count left `None` is taken from the
     /// [`Self::saem_kernel`] preset (see [`SaemKernel`]); a count set here overrides it.
     /// `0` turns a kernel off. Ignored under the legacy presets `rw` and `imh`.
@@ -9754,8 +9765,8 @@ pub struct FitOptions {
     pub saem_isample_m1: Option<usize>,
     /// `imh`: f-SAEM independence proposals from the subject's Laplace approximation
     /// `N(η̂_i, c·Γ_i)` (Karimi, Lavielle & Moulines 2020), refreshed every
-    /// `saem_imh_refresh` iterations. Where the model is outside its scope its count runs as
-    /// `m1`.
+    /// `saem_imh_refresh` iterations, during exploration only (the f-SAEM authors' practice;
+    /// #2986). Where the model is outside its scope its count runs as `m1`.
     pub saem_isample_imh: Option<usize>,
     /// `m1b`: independence proposals from the chain's running conditional mean and covariance
     /// (NONMEM `ISAMPLE_M1B`).
@@ -10878,7 +10889,7 @@ pub enum SaemKernel {
     /// acceptance probability of 0.8 during exploration and frozen after. The η-gradient is
     /// the AD engine's exact one (with IOV, the stacked `[η, κ]` gradient's η block at the
     /// chain's κ); a subject it gives none for takes kernels 2 and 3 instead. The default
-    /// (#2986): the preset `imh 1, hmc 1`.
+    /// (#2986): the preset `hmc 1, imh 1`.
     #[default]
     Hmc,
     /// As [`SaemKernel::Hmc`], with a **NUTS** transition (Stan's multinomial No-U-Turn
@@ -10890,7 +10901,7 @@ pub enum SaemKernel {
     /// algorithm: one leapfrog step, i.e. a gradient-drifted Gaussian proposal under the same
     /// metric) in place of the HMC one, with their own step size adapted towards 0.574 (the
     /// optimal MALA acceptance rate, Roberts & Rosenthal 1998). Cheaper per transition than
-    /// HMC and more local: the preset `imh 1, mala 3`.
+    /// HMC and more local: the preset `mala 3, imh 1`.
     Mala,
 }
 

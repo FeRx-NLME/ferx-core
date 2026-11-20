@@ -51,16 +51,16 @@ Measured against the earlier default (`saem_kernel = rw`: `n_mh_steps` block pro
 
 ### Choosing the E-step kernels {#saem-kernels}
 
-Each SAEM iteration moves every chain's random effects with a sequence of kernels, each a Metropolis–Hastings or Hamiltonian move that leaves the subject's conditional posterior unchanged, so any combination is valid. You choose them as counts per chain per iteration; `0` turns one off. They run in this order, broad moves first:
+Each SAEM iteration moves every chain's random effects with a sequence of kernels, each a Metropolis–Hastings or Hamiltonian move that leaves the subject's conditional posterior unchanged, so any combination is valid. You choose them as counts per chain per iteration; `0` turns one off. They run in this order — the gradient moves first, since the post-M-step refresh leaves each chain's gradient at its state and their first transition starts from it; then the independence moves; then the local random walks:
 
 | count | kernel | cost per move | add it for |
 |---|---|---|---|
-| `isample_m1` | independence draw from N(0, Ω) (NONMEM M1) | 1 evaluation | jumps out of a wrong mode |
-| `isample_imh` | independence draw from the subject's Laplace approximation, refreshed every `saem_imh_refresh` iterations (f-SAEM, [below](#saem-imh)) | 1 evaluation | near-independent draws on data-rich subjects; outside its scope it runs as `m1` |
-| `isample_m1b` | independence draw from the chain's running conditional moments (NONMEM M1B) | 1 evaluation | the same, from the chain's own history |
 | `isample_hmc` | Hamiltonian Monte Carlo on the exact η-gradient ([gradient kernels](#gradient-kernels)) | 2–3 gradients | fast, exact local moves along correlated posteriors |
 | `isample_nuts` | No-U-Turn transition, otherwise as `hmc` | ~4–30 gradients | an adaptive trajectory length |
 | `isample_mala` | Metropolis-adjusted Langevin: one leapfrog step, otherwise as `hmc`, with its own step size | 1 gradient | cheap gradient-guided local moves |
+| `isample_m1` | independence draw from N(0, Ω) (NONMEM M1) | 1 evaluation | jumps out of a wrong mode |
+| `isample_imh` | independence draw from the subject's Laplace approximation, refreshed every `saem_imh_refresh` iterations, during exploration only (f-SAEM, [below](#saem-imh)) | 1 evaluation | near-independent draws on data-rich subjects; outside its scope it runs as `m1` |
+| `isample_m1b` | independence draw from the chain's running conditional moments (NONMEM M1B) | 1 evaluation | the same, from the chain's own history |
 | `isample_m2` | block random walk η + s·chol(Ω)·z (NONMEM M2) | 1 evaluation | NONMEM's local move |
 | `isample_m3` | componentwise sweeps, one η at a time (NONMEM M3) | n_η evaluations | coordinates the other moves neglect |
 
@@ -68,15 +68,15 @@ Each SAEM iteration moves every chain's random effects with a sequence of kernel
 
 | `saem_kernel` | counts |
 |---|---|
-| `hmc` (default) | `imh 1, hmc 1` (`m1 1, hmc 1` outside f-SAEM's scope) |
+| `hmc` (default) | `hmc 1, imh 1` (`hmc 1, m1 1` outside f-SAEM's scope) |
 | `nonmem` | `m1 2, m1b 2, m2 2, m3 2` — NONMEM's own kernels ([NONMEM's kernels](#nonmem-kernels)) |
-| `nuts` | `imh 1, nuts 1` (likewise) |
-| `mala` | `imh 1, mala 3` (likewise) |
+| `nuts` | `nuts 1, imh 1` (likewise) |
+| `mala` | `mala 3, imh 1` (likewise) |
 | `rw`, `imh` | the earlier random-walk and f-SAEM kernels, unchanged; the `isample_*` counts do not apply |
 
 Neither NONMEM nor Monolix runs a gradient kernel inside SAEM: NONMEM's NUTS is a separate full-Bayesian method (`$EST METHOD=NUTS`), and both tools' SAEM E-steps are Metropolis–Hastings kernels set by counts (NONMEM's `ISAMPLE_M1/M1B/M2/M3`, Monolix's m₁…m₄), the convention these counts follow. The default `hmc` targets the same conditional posterior, so SAEM aims at the same estimate. No two implementations reproduce each other's Monte Carlo runs (their random streams differ), so a comparison with NONMEM is of estimates, not iterations; `saem_kernel = nonmem` runs NONMEM's own kernels, the closest algorithmic match.
 
-So `saem_kernel = hmc` with `isample_m3 = 1` adds a componentwise sweep after HMC, `isample_imh = 0` drops its jump, and `isample_hmc = 1` alone adds HMC to NONMEM's four kernels. The fit reports what ran — `saem_kernels: "imh 1, hmc 1"` in `-fit.yaml`, `FitResult::saem_kernels` — and refuses a schedule with every count at 0.
+So `saem_kernel = hmc` with `isample_m3 = 1` adds a componentwise sweep after HMC, `isample_imh = 0` drops its jump, and `isample_hmc = 1` alone adds HMC to NONMEM's four kernels. The fit reports what ran — `saem_kernels: "hmc 1, imh 1"` in `-fit.yaml`, `FitResult::saem_kernels` — and refuses a schedule with every count at 0.
 
 ### Gradient kernels {#gradient-kernels}
 
@@ -95,7 +95,7 @@ Measured against `nonmem` (the automatic stop, 1000 averaging iterations, two ch
 | `warfarin_iov_saem`, mean gap (5 seeds) | +0.19 (sd 0.14) | **+0.02** (sd 0.01) |
 | CPU per fit, pk2s | 27.3 s | **23.8 s** |
 
-On `two_cpt_oral_cov` the subjects' posteriors are correlated along the V1–KA direction, which the random walks follow poorly; the drawn ηs then pull Ω and θ toward the trade-off mode. The preset's independence jump (f-SAEM's proposal, or M1 under IOV) ties HMC alone on `two_cpt_oral_cov` and pk2s and is what brings `warfarin_iov_saem` from +0.09 to +0.02. One chain instead of two halves the cost but failed a pk2s seed (+4.6, exploration at its maximum), and a shorter averaging phase loses ~0.02–0.03 per halving on every model while saving little where exploration dominates, so both stay as NONMEM has them. NUTS reaches HMC's quality on `two_cpt_oral_cov` at ~25 % more CPU. MALA (`saem_kernel = mala`, `imh 1, mala 3`) ties HMC: `two_cpt_oral_cov` 20 / 20 seeds at its optimum in 1.9 against 1.8 s, `warfarin_iov_saem` +0.02 in 1.6 against 1.5 s, and the pk2_big stand-in −0.05 against −0.09 (within seed noise) in **21.9 against 26.3 s** (median of five seeds; its exploration stop fires sooner, K1 1640 against 2360). `mala 1` is cheaper still but mixes too little: pk2s +0.37 and `warfarin_iov_saem` +0.21, one seed of five off its optimum on each; `mala 5` costs more for nothing (pk2s 36.6 s). So the preset runs three. An η-only move on the IOV model, κ left to its own random walk, was worse than `nonmem` (+0.50): the joint move matters. Reverse mode over the compiled plan gave the same gradient to 1e-15 but was ~7 % slower at these 2–5 random effects, so the forward jets stay.
+On `two_cpt_oral_cov` the subjects' posteriors are correlated along the V1–KA direction, which the random walks follow poorly; the drawn ηs then pull Ω and θ toward the trade-off mode. The preset's independence jump (f-SAEM's proposal, or M1 under IOV) ties HMC alone on `two_cpt_oral_cov` and pk2s and is what brings `warfarin_iov_saem` from +0.09 to +0.02. One chain instead of two halves the cost but failed a pk2s seed (+4.6, exploration at its maximum), and a shorter averaging phase loses ~0.02–0.03 per halving on every model while saving little where exploration dominates, so both stay as NONMEM has them. NUTS reaches HMC's quality on `two_cpt_oral_cov` at ~25 % more CPU. MALA (`saem_kernel = mala`, `mala 3, imh 1`) ties HMC: `two_cpt_oral_cov` 20 / 20 seeds at its optimum in 1.9 against 1.8 s, `warfarin_iov_saem` +0.02 in 1.6 against 1.5 s, and the pk2_big stand-in −0.05 against −0.09 (within seed noise) in **21.9 against 26.3 s** (median of five seeds; its exploration stop fires sooner, K1 1640 against 2360). `mala 1` is cheaper still but mixes too little: pk2s +0.37 and `warfarin_iov_saem` +0.21, one seed of five off its optimum on each; `mala 5` costs more for nothing (pk2s 36.6 s). So the preset runs three. An η-only move on the IOV model, κ left to its own random walk, was worse than `nonmem` (+0.50): the joint move matters. Reverse mode over the compiled plan gave the same gradient to 1e-15 but was ~7 % slower at these 2–5 random effects, so the forward jets stay.
 
 ### Chains {#chains}
 

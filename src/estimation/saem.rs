@@ -2475,9 +2475,34 @@ impl<'a> EtaPotential<'a> {
     }
 }
 
+/// The η-gradient the post-M-step refresh left at a chain's state (#2986): the refresh scores
+/// each chain by the fused value/gradient pass, and the next E-step's first gradient
+/// transition starts from `g` instead of a fresh AD pass — if the chain is still at exactly
+/// `x` and the parameters are exactly the ones it was taken at ([`grad_memo_params`]).
+#[derive(Debug, Clone)]
+struct GradMemo {
+    x: Vec<f64>,
+    g: Vec<f64>,
+}
+
+/// The parameters an η-gradient depends on, bit for bit: θ, Ω, σ and Ω_IOV.
+fn grad_memo_params(
+    theta: &[f64], omega: &DMatrix<f64>, sigma: &[f64], omega_iov: Option<&DMatrix<f64>>,
+) -> Vec<u64> {
+    theta
+        .iter()
+        .chain(omega.iter())
+        .chain(sigma.iter())
+        .chain(omega_iov.into_iter().flat_map(|m| m.iter()))
+        .map(|v| v.to_bits())
+        .collect()
+}
+
 /// The SAEM E-step's kernels as counts per chain per iteration (#2986), resolved from the
 /// `saem_kernel` preset and the `isample_*` counts the caller set (which override it). Run in
-/// this order: broad moves first, then the gradient move, then the local random walks.
+/// this order: the gradient moves first (their first transition starts from the gradient the
+/// post-M-step refresh left at the chain's state), then the independence moves, then the local
+/// random walks. The `imh` move runs during exploration only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct KernelSchedule {
     pub(crate) m1: usize,
@@ -2544,12 +2569,12 @@ impl KernelSchedule {
     /// `m1 2, m1b 2, m2 2, m3 2`: the kernels that run, in their order.
     pub(crate) fn describe(&self) -> String {
         [
-            ("m1", self.m1),
-            ("imh", self.imh),
-            ("m1b", self.m1b),
             ("hmc", self.hmc),
             ("nuts", self.nuts),
             ("mala", self.mala),
+            ("m1", self.m1),
+            ("imh", self.imh),
+            ("m1b", self.m1b),
             ("m2", self.m2),
             ("m3", self.m3),
         ]
@@ -5399,6 +5424,10 @@ pub fn run_saem(
     let hmc_alpha: Vec<[std::sync::atomic::AtomicU64; 2]> = (0..hmc_eps.len())
         .map(|_| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())))
         .collect();
+    // Each chain's gradient from the last post-M-step refresh, and the parameters it was
+    // taken at (`GradMemo`): the refresh is the fused pass wherever a gradient kernel runs.
+    let mut grad_memo: Vec<Option<GradMemo>> = Vec::new();
+    let mut grad_memo_at: Vec<u64> = Vec::new();
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -6548,6 +6577,16 @@ pub fn run_saem(
             let hmc_eps_ref = &hmc_eps;
             let joint_ref = &joint_moments;
             let hmc_alpha_ref = &hmc_alpha;
+            // The refresh's gradients serve this E-step only at exactly its parameters.
+            let memo_valid = !grad_memo.is_empty()
+                && grad_memo_at
+                    == grad_memo_params(
+                        theta_ref,
+                        &omega_ref.matrix,
+                        sigma_ref,
+                        omega_iov_cur_opt.as_ref().map(|o| &o.matrix),
+                    );
+            let grad_memo_ref = &grad_memo;
             let gradient_served_ref = &gradient_served;
             let gradient_declined_ref = &gradient_declined;
             let gradient_divergent_ref = &gradient_divergent;
@@ -6698,7 +6737,14 @@ pub fn run_saem(
                         // (never from the current η), for the legacy `imh` kernel and the
                         // counted one alike.
                         let mut imh_slot = imh_slot;
-                        if imh_slots_on {
+                        // The counted f-SAEM move runs during exploration only, as its authors
+                        // used it (Karimi, Lavielle & Moulines 2020: the IMH kernel for the
+                        // first iterations, the standard kernels after). Measured (#2986): the
+                        // move and its proposal refresh were ~27 % of a pk2_big stand-in fit;
+                        // without them in the averaging phase an iteration costs 6–9 % less at
+                        // the same −2LL on two_cpt_oral_cov, pk2s and warfarin_iov_saem.
+                        let imh_count = if k > k1 { 0 } else { sched.imh };
+                        if imh_slots_on && (imh_mode || imh_count > 0) {
                             imh_slot.refresh_if_due(
                                 k,
                                 imh_refresh,
@@ -6711,91 +6757,19 @@ pub fn run_saem(
                                 imh_counters_ref,
                             );
                         }
-                        let mut m1b_chol: Option<DMatrix<f64>> = None;
-                        if nonmem_kernel {
-                            let zero = vec![0.0_f64; eta_work.len()];
-                            let (_, nll_m1) = independence_steps(
-                                &mut eta_work,
-                                nll_cur,
-                                &zero,
-                                &omega_ref.chol,
-                                subject,
-                                model,
-                                theta_ref,
-                                omega_ref,
-                                sigma_ref,
-                                &mut rng,
-                                isample_m1_k,
-                                mh_scratch,
-                                schedules[i].as_ref(),
-                                kappas_mh_opt,
-                            );
-                            nll_cur = nll_m1;
-                            // Counted f-SAEM moves; before a chain's first proposal (or where
-                            // it declines) they run as M1.
-                            if sched.imh > 0 {
-                                nll_cur = match imh_slot.prop.as_ref() {
-                                    Some(prop) => {
-                                        crate::estimation::saem_imh::imh_steps(
-                                            &mut eta_work,
-                                            nll_cur,
-                                            prop,
-                                            subject,
-                                            model,
-                                            theta_ref,
-                                            omega_ref,
-                                            sigma_ref,
-                                            &mut rng,
-                                            sched.imh,
-                                            mh_scratch,
-                                            schedules[i].as_ref(),
-                                            imh_counters_ref,
-                                        )
-                                        .1
-                                    }
-                                    None => {
-                                        independence_steps(
-                                            &mut eta_work,
-                                            nll_cur,
-                                            &zero,
-                                            &omega_ref.chol,
-                                            subject,
-                                            model,
-                                            theta_ref,
-                                            omega_ref,
-                                            sigma_ref,
-                                            &mut rng,
-                                            sched.imh,
-                                            mh_scratch,
-                                            schedules[i].as_ref(),
-                                            kappas_mh_opt,
-                                        )
-                                        .1
-                                    }
-                                };
-                            }
+                        // Kernel 1B's proposal from the chain's draws before this iteration —
+                        // also the gradient kernels' metric, so it does not depend on whether
+                        // kernel 1B ran first.
+                        let m1b_prop: Option<(Vec<f64>, DMatrix<f64>)> = if nonmem_kernel {
                             let (sum, sumsq, n_draws) = &m1b_ref[i];
-                            if let Some((mean, l)) = m1b_proposal(sum, sumsq, *n_draws) {
-                                let (_, nll_m1b) = independence_steps(
-                                    &mut eta_work,
-                                    nll_cur,
-                                    &mean,
-                                    &l,
-                                    subject,
-                                    model,
-                                    theta_ref,
-                                    omega_ref,
-                                    sigma_ref,
-                                    &mut rng,
-                                    isample_m1b,
-                                    mh_scratch,
-                                    schedules[i].as_ref(),
-                                    kappas_mh_opt,
-                                );
-                                nll_cur = nll_m1b;
-                                m1b_chol = Some(l);
-                            }
-                        }
+                            m1b_proposal(sum, sumsq, *n_draws)
+                        } else {
+                            None
+                        };
+                        let m1b_chol: Option<&DMatrix<f64>> = m1b_prop.as_ref().map(|(_, l)| l);
+                        // The gradient kernels run first (#2986): the post-M-step refresh left
+                        // each chain's gradient at exactly this state (`grad_memo`), so the
+                        // first transition starts from it instead of a fresh AD pass.
                         // ---- `saem_kernel = hmc`: HMC in place of kernels 2 and 3 (#2986) ----
                         // Preconditioned by the chain's conditional covariance (kernel 1B's
                         // moments), or by Ω before it has them.
@@ -6809,7 +6783,7 @@ pub fn run_saem(
                             // information at η = 0 — measured worse: the chains settle at once,
                             // the exploration stop fires early, and the V1–KA trap of
                             // `two_cpt_oral_cov` returns on 4 of 20 seeds.)
-                            let l_eta = m1b_chol.as_ref().unwrap_or(&omega_ref.chol);
+                            let l_eta = m1b_chol.unwrap_or(&omega_ref.chol);
                             // Under IOV the move is joint over `[η, κ₁..κ_K]` (#2986), its
                             // metric block-diagonal: η's, then Ω_IOV's factor per occasion.
                             let joint = kappas_mh_opt.filter(|(k, _)| !k.is_empty());
@@ -6856,7 +6830,11 @@ pub fn run_saem(
                             // HMC and MALA transitions (NUTS does not report it).
                             let mut step: Option<GradStep> = None;
                             let mut alphas = [f64::NAN; 2];
-                            let mut grad_at: Option<Vec<f64>> = None;
+                            let mut grad_at: Option<Vec<f64>> = grad_memo_ref
+                                .get(i)
+                                .and_then(Option::as_ref)
+                                .filter(|m| memo_valid && m.x == x)
+                                .map(|m| m.g.clone());
                             for t in 0..sched.hmc + sched.nuts + sched.mala {
                                 let [eps, eps_mala] = hmc_eps_ref[i];
                                 let (g, which) = if t < sched.hmc {
@@ -6937,6 +6915,95 @@ pub fn run_saem(
                                 for (slot, a) in hmc_alpha_ref[i].iter().zip(alphas) {
                                     slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
                                 }
+                            }
+                        }
+                        // A joint gradient move under IOV moved κ with η: the kernels after it
+                        // read the moved κ (their baseline `nll_cur` is already at it).
+                        let kappas_cur: Option<Vec<Vec<f64>>> = kappas_new.clone();
+                        let kappas_mh_opt = match (&kappas_cur, kappas_mh_opt) {
+                            (Some(kc), Some((_, iov))) => Some((kc.as_slice(), iov)),
+                            (_, opt) => opt,
+                        };
+                        if nonmem_kernel {
+                            let zero = vec![0.0_f64; eta_work.len()];
+                            let (_, nll_m1) = independence_steps(
+                                &mut eta_work,
+                                nll_cur,
+                                &zero,
+                                &omega_ref.chol,
+                                subject,
+                                model,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                &mut rng,
+                                isample_m1_k,
+                                mh_scratch,
+                                schedules[i].as_ref(),
+                                kappas_mh_opt,
+                            );
+                            nll_cur = nll_m1;
+                            // Counted f-SAEM moves; before a chain's first proposal (or where
+                            // it declines) they run as M1.
+                            if imh_count > 0 {
+                                nll_cur = match imh_slot.prop.as_ref() {
+                                    Some(prop) => {
+                                        crate::estimation::saem_imh::imh_steps(
+                                            &mut eta_work,
+                                            nll_cur,
+                                            prop,
+                                            subject,
+                                            model,
+                                            theta_ref,
+                                            omega_ref,
+                                            sigma_ref,
+                                            &mut rng,
+                                            imh_count,
+                                            mh_scratch,
+                                            schedules[i].as_ref(),
+                                            imh_counters_ref,
+                                        )
+                                        .1
+                                    }
+                                    None => {
+                                        independence_steps(
+                                            &mut eta_work,
+                                            nll_cur,
+                                            &zero,
+                                            &omega_ref.chol,
+                                            subject,
+                                            model,
+                                            theta_ref,
+                                            omega_ref,
+                                            sigma_ref,
+                                            &mut rng,
+                                            imh_count,
+                                            mh_scratch,
+                                            schedules[i].as_ref(),
+                                            kappas_mh_opt,
+                                        )
+                                        .1
+                                    }
+                                };
+                            }
+                            if let Some((mean, l)) = m1b_prop.as_ref() {
+                                let (_, nll_m1b) = independence_steps(
+                                    &mut eta_work,
+                                    nll_cur,
+                                    mean,
+                                    l,
+                                    subject,
+                                    model,
+                                    theta_ref,
+                                    omega_ref,
+                                    sigma_ref,
+                                    &mut rng,
+                                    isample_m1b,
+                                    mh_scratch,
+                                    schedules[i].as_ref(),
+                                    kappas_mh_opt,
+                                );
+                                nll_cur = nll_m1b;
                             }
                         }
                         // HMC path: one gradient-guided proposal per SAEM iteration.
@@ -7616,6 +7683,7 @@ pub fn run_saem(
                         &mut extra_eta_draws,
                         eta_idx,
                     );
+
                     // Pin so NLopt leaves the closed-form value unchanged.
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
                     temp_theta_upper[theta_idx] = log_theta[theta_idx];
@@ -8036,7 +8104,58 @@ pub fn run_saem(
             } else {
                 (Vec::new(), Vec::new())
             };
-        if n_kappa > 0 {
+        if hmc_in_scope && saem_mix.is_none() {
+            // The fused refresh (#2986): each chain's value and η-gradient from one AD pass
+            // (`EtaPotential::grad`), the gradient kept for the next E-step's first gradient
+            // transition, which the E-step runs first. Parallel over chains, IOV included.
+            let omega_iov_upd = init_params.omega_iov.as_ref().filter(|_| n_kappa > 0).map(|r| {
+                OmegaMatrix::from_matrix_with_mask(
+                    state.omega_iov_mat.clone(),
+                    r.eta_names.clone(),
+                    r.diagonal,
+                    r.free_mask.clone(),
+                )
+            });
+            let refreshed: Vec<(f64, Option<GradMemo>)> =
+                crate::par::map_init(state.etas.len(), MhScratch::default, |scratch, i| {
+                    let subject = &population.subjects[i];
+                    let eta = &state.etas[i];
+                    let kaps = &state.kappas[i];
+                    scratch.begin_subject(model, subject, &state.theta, n_eta);
+                    let kap_opt = omega_iov_upd.as_ref().map(|iov| (kaps.as_slice(), iov));
+                    let joint = kap_opt.is_some_and(|(k, _)| !k.is_empty());
+                    let mut x = eta.clone();
+                    if joint {
+                        x.extend(kaps.iter().flatten());
+                    }
+                    let mut pot = EtaPotential::new(
+                        model,
+                        subject,
+                        &state.theta,
+                        &omega_upd,
+                        &state.sigma_vals,
+                        schedules.get(i).and_then(|s| s.as_ref()),
+                        kap_opt,
+                        scratch,
+                        n_eta,
+                        joint,
+                    );
+                    match pot.grad(&x, true) {
+                        Some((g, u)) if u.is_finite() => (u, Some(GradMemo { x, g })),
+                        _ => (pot.value(&x), None),
+                    }
+                });
+            let (nlls, memos): (Vec<f64>, Vec<Option<GradMemo>>) = refreshed.into_iter().unzip();
+            state.nll_cache = nlls;
+            grad_memo = memos;
+            // Taken from the matrices the potentials read, built as the E-step builds its own.
+            grad_memo_at = grad_memo_params(
+                &state.theta,
+                &omega_upd.matrix,
+                &state.sigma_vals,
+                omega_iov_upd.as_ref().map(|o| &o.matrix),
+            );
+        } else if n_kappa > 0 {
             // IOV NLL cache refresh — sequential rather than rayon-parallel.
             // individual_nll_iov is cheap (analytical PK, few occasions) and
             // the sequential loop avoids a second rayon scatter/gather.

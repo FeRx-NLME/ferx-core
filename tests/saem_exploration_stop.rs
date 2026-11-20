@@ -279,9 +279,9 @@ fn gradient_kernels_are_served_differ_and_recover_the_truth() {
         );
         assert_ne!(r.theta, nm.theta, "{kernel:?} reaches the E-step");
         let want = match kernel {
-            SaemKernel::Hmc => "imh 1, hmc 1",
-            SaemKernel::Nuts => "imh 1, nuts 1",
-            _ => "imh 1, mala 3",
+            SaemKernel::Hmc => "hmc 1, imh 1",
+            SaemKernel::Nuts => "nuts 1, imh 1",
+            _ => "mala 3, imh 1",
         };
         assert_eq!(r.saem_kernels.as_deref(), Some(want), "the fit reports the schedule it ran");
         let g = r.saem_gradient_kernel.as_ref().expect("gradient diagnostics");
@@ -344,7 +344,7 @@ fn a_user_chosen_kernel_combination_runs_and_all_zero_is_refused() {
         o.saem_kernel = SaemKernel::Nonmem;
     });
     assert_eq!(nm.saem_kernels.as_deref(), Some("m1 2, m1b 2, m2 2, m3 2"));
-    assert_eq!(run(fixed).saem_kernels.as_deref(), Some("imh 1, hmc 1"), "the default preset");
+    assert_eq!(run(fixed).saem_kernels.as_deref(), Some("hmc 1, imh 1"), "the default preset");
     let hmc = run(|o| {
         fixed(o);
         o.saem_kernel = SaemKernel::Hmc;

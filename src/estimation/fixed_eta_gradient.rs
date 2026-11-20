@@ -858,17 +858,20 @@ fn assemble_fisher(
     // coordinate keeps an all-zero row and column, which is what the caller's
     // linear solve drops.
     let mut fisher = vec![0.0f64; n * n];
-    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike.
-    let dv: Vec<Vec<f64>> = (0..n)
+    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike. The σ rows are
+    // the caller's, borrowed rather than copied per call.
+    let dv: Vec<std::borrow::Cow<'_, [f64]>> = (0..n)
         .map(|a| {
             if a < n_theta {
                 if df_packed[a].is_empty() {
-                    Vec::new()
+                    std::borrow::Cow::Borrowed(&[][..])
                 } else {
-                    (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect()
+                    std::borrow::Cow::Owned(
+                        (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect(),
+                    )
                 }
             } else {
-                dv_dlogsigma[a].clone()
+                std::borrow::Cow::Borrowed(dv_dlogsigma[a].as_slice())
             }
         })
         .collect();

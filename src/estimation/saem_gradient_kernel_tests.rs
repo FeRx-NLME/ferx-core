@@ -335,34 +335,34 @@ fn the_kernel_schedule_resolves_presets_and_overrides() {
     let nm = KernelSchedule::resolve(&with(SaemKernel::Nonmem, &|_| {}), true).expect("counted");
     assert_eq!(nm.describe(), "m1 2, m1b 2, m2 2, m3 2");
     let hmc = KernelSchedule::resolve(&with(SaemKernel::Hmc, &|_| {}), true).expect("counted");
-    assert_eq!(hmc.describe(), "imh 1, hmc 1");
+    assert_eq!(hmc.describe(), "hmc 1, imh 1");
     assert!(hmc.gradient());
     let nuts = KernelSchedule::resolve(&with(SaemKernel::Nuts, &|_| {}), true).expect("counted");
-    assert_eq!(nuts.describe(), "imh 1, nuts 1");
+    assert_eq!(nuts.describe(), "nuts 1, imh 1");
     let mala = KernelSchedule::resolve(&with(SaemKernel::Mala, &|_| {}), true).expect("counted");
-    assert_eq!(mala.describe(), "imh 1, mala 3");
+    assert_eq!(mala.describe(), "mala 3, imh 1");
     assert!(mala.gradient());
     // MALA beside the HMC preset, in the order the E-step runs them.
     let both = with(SaemKernel::Hmc, &|o| o.saem_isample_mala = Some(2));
     assert_eq!(
         KernelSchedule::resolve(&both, true).expect("counted").describe(),
-        "imh 1, hmc 1, mala 2"
+        "hmc 1, mala 2, imh 1"
     );
     // Outside the f-SAEM proposal's scope the preset's jump runs as M1.
     let out = KernelSchedule::resolve(&with(SaemKernel::Hmc, &|_| {}), false).expect("counted");
-    assert_eq!(out.describe(), "m1 1, hmc 1");
+    assert_eq!(out.describe(), "hmc 1, m1 1");
     // An override changes its own entry only.
     let mix = with(SaemKernel::Hmc, &|o| {
         o.saem_isample_m3 = Some(1);
     });
     assert_eq!(
         KernelSchedule::resolve(&mix, true).expect("counted").describe(),
-        "imh 1, hmc 1, m3 1"
+        "hmc 1, imh 1, m3 1"
     );
     // Outside the f-SAEM proposal's scope its count runs as M1.
     assert_eq!(
         KernelSchedule::resolve(&mix, false).expect("counted").describe(),
-        "m1 1, hmc 1, m3 1"
+        "hmc 1, m1 1, m3 1"
     );
     // A preset entry can be switched off; all of them off is empty.
     let off = with(SaemKernel::Nonmem, &|o| {
