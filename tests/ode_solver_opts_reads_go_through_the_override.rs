@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// permit a second read in the same file.
 const ALLOWED: &[&str] = [
     // The single place the merge itself happens — by definition it reads the baked value.
-    "crate::ode::solver::effective_solver_options(self.solver_opts)",
+    "let mut opts = crate::ode::solver::effective_solver_options(self.solver_opts);",
 ]
 .as_slice();
 

@@ -49,8 +49,12 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn no_doc_hidden_escape_hatch() {
     let mut sources = Vec::new();
-    rust_sources(&repo_root().join("src"), &mut sources);
-    assert!(!sources.is_empty(), "found no sources under src/");
+    // `ferx-model` has its own API baseline for the items ferx-core re-exports (#3041),
+    // so `#[doc(hidden)]` there is the same bypass.
+    for dir in ["src", "crates/ferx-model/src"] {
+        rust_sources(&repo_root().join(dir), &mut sources);
+    }
+    assert!(!sources.is_empty(), "found no engine sources");
 
     let mut offenders = Vec::new();
     for path in &sources {

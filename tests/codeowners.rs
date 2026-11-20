@@ -10,8 +10,15 @@
 
 use std::path::PathBuf;
 
-const NUMERICAL_CORE: &[&str] =
-    &["/src/estimation/", "/src/sens/", "/src/stats/", "/src/pk/", "/src/ode/"];
+const NUMERICAL_CORE: &[&str] = &[
+    "/src/estimation/",
+    "/src/stats/",
+    "/crates/ferx-model/src/estimation/",
+    "/crates/ferx-model/src/sens/",
+    "/crates/ferx-model/src/stats/",
+    "/crates/ferx-model/src/pk/",
+    "/crates/ferx-model/src/ode/",
+];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

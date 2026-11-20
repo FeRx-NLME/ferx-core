@@ -125,12 +125,12 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "`FitResult::interaction` round-tripped through the `.fitrx` record, not a `FitOptions`",
     ),
     (
-        "src/parser/model_parser.rs",
+        "crates/ferx-model/src/parser/model_parser.rs",
         2,
         "both `method =` arms resolve the parsed flag through `interaction_for`",
     ),
     (
-        "src/types.rs",
+        "crates/ferx-model/src/types.rs",
         1,
         "`FitOptions::non_interaction_stage` applies the same inherit rule to the GN stages \
          of the chain, whose flag `interaction_for` passes through",
@@ -259,10 +259,13 @@ fn the_allow_list_names_each_file_once() {
 #[test]
 fn raw_interaction_reads_stay_on_the_allow_list() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let src_dir = root.join("src");
+    // The engine is split across two crates (#3041): the model/numerics layer lives in
+    // `crates/ferx-model`, so a guard that walked only `src/` would silently stop seeing it.
     let mut sources = Vec::new();
-    rust_sources(&src_dir, &mut sources);
-    assert!(sources.len() > 50, "found only {} sources under src/", sources.len());
+    for dir in ["src", "crates/ferx-model/src"] {
+        rust_sources(&root.join(dir), &mut sources);
+    }
+    assert!(sources.len() > 50, "found only {} engine sources", sources.len());
 
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for path in &sources {

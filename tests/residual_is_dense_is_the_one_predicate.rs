@@ -134,14 +134,14 @@ fn wrapper_calls(src: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// `(file under src/, trimmed line)` of the emptiness tests that ask about the
+/// `(repo-relative file, trimmed line)` of the emptiness tests that ask about the
 /// `block_sigma` declaration itself, not about whether `R` is dense.
 const ALLOWED: &[(&str, &str, &str)] = &[
     // Reporting: the `block_sigma` ρ is reported as its own block (a serial ρ is a θ).
     (
-        "src/io/output_estimates.rs",
+        "crates/ferx-model/src/types/estimates_json.rs",
         "if result.residual_correlations.is_empty() {",
-        "block_sigma_section: reports the block_sigma rows (moved from output.rs, #2911)",
+        "block_sigma_section: reports the block_sigma rows (moved from output.rs, #2911; into ferx-model, #3041)",
     ),
     (
         "src/estimation/uncertainty_samples.rs",
@@ -155,7 +155,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     // The declaration's own validation.
     (
-        "src/parser/model_parser.rs",
+        "crates/ferx-model/src/parser/model_parser.rs",
         "if correlations.is_empty() {",
         "validate_residual_correlations: checks the declared block_sigma pairs",
     ),
@@ -177,7 +177,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // Per-observation diagonal: the within-observation `combined(...)` term is a
     // property of the block_sigma pairs, never of R's off-diagonal shape.
     (
-        "src/stats/residual_error.rs",
+        "crates/ferx-model/src/stats/residual_error.rs",
         "if correlations.is_empty() {",
         "variance_at_with_correlations (and its unguarded `_raw` twin, #2441) / \
          compute_r_diag_with_correlations / compute_iwres_with_correlations: diagonal only",
@@ -187,7 +187,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 /// How many times each allowed `(file, line)` may occur.
 fn allowed_count(file: &str, line: &str) -> usize {
     match (file, line) {
-        ("src/stats/residual_error.rs", "if correlations.is_empty() {") => 4,
+        ("crates/ferx-model/src/stats/residual_error.rs", "if correlations.is_empty() {") => 4,
         _ => 1,
     }
 }
@@ -201,8 +201,12 @@ where
     // directory to `tests/slow_test_path_filter.rs`.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
-    rust_sources(&root.join("src"), &mut sources);
-    assert!(sources.len() > 50, "found only {} sources under src/", sources.len());
+    // The engine is split across two crates (#3041): the model/numerics layer lives in
+    // `crates/ferx-model`, so a guard that walked only `src/` would silently stop seeing it.
+    for dir in ["src", "crates/ferx-model/src"] {
+        rust_sources(&root.join(dir), &mut sources);
+    }
+    assert!(sources.len() > 50, "found only {} engine sources", sources.len());
     let mut hits = Vec::new();
     for path in &sources {
         let src = std::fs::read_to_string(path).expect("source file is valid UTF-8");
