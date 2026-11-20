@@ -36,7 +36,7 @@ of the same shape. The shape is what drives plan memory, not the drug:
 The data were simulated from the model at its initial estimates:
 
 ```bash
-cargo run --release --bin generate_data -- peak_memory
+cargo run --release --example generate_peak_memory
 ```
 
 ## What a nightly does

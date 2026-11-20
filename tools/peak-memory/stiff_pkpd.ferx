@@ -14,7 +14,7 @@
 #     dosing, so every subject carries several event segments.
 #
 # The data (stiff_pkpd.csv, 100 subjects) were simulated from this file at its
-# initial estimates: `cargo run --release --bin generate_data -- peak_memory`.
+# initial estimates: `cargo run --release --example generate_peak_memory`.
 # Changing this file or the CSV changes what the baseline measures — re-measure
 # and re-commit baseline.json in the same PR (docs/development/peak-memory.qmd).
 #
