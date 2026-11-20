@@ -960,19 +960,18 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
     );
 }
 
-/// The production `SolverStatsScope::enter` sites are exactly the four this enum has phases
+/// The production `SolverStatsScope::enter` sites are exactly the three this enum has phases
 /// for — pinned at **exact counts per file**, against the source.
 ///
-/// Regression this catches: a fifth entry point opening a scope and reporting it under some
+/// Regression this catches: a fourth entry point opening a scope and reporting it under some
 /// other phase's wording, or — the #1304 defect in reverse — a scope opened and never routed
 /// into a warning at all. Either way the count moves and this fails, naming the file.
 ///
-/// The four, and the phase each answers to:
+/// The three, and the phase each answers to:
 ///
 /// | site | phase |
 /// |---|---|
 /// | `postfit::compute_subject_results` (per subject task) | `PostfitPredictions` |
-/// | `postfit::sweep_sensitivity_solver_stats` (per subject task) | `PostfitPredictions` |
 /// | `postfit::solver_stats_scope` (the shared gate) | `Simulate` / `SimulateAdaptive` / `PredictSurvival` |
 /// | `predict::predict_diag` (per subject task) | `Predict` |
 ///
@@ -983,7 +982,7 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
 #[test]
 fn the_production_scope_sites_are_the_phases_this_enum_lists() {
     const SITES: [(&str, &str, usize); 4] = [
-        ("postfit.rs", include_str!("../postfit.rs"), 3),
+        ("postfit.rs", include_str!("../postfit.rs"), 2),
         ("predict.rs", include_str!("../predict.rs"), 1),
         ("simulate.rs", include_str!("../simulate.rs"), 0),
         ("adaptive.rs", include_str!("../adaptive.rs"), 0),

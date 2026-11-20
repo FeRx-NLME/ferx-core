@@ -967,11 +967,13 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let lits = [0.0f64];
     // The forward.
     let t = cp.get(layout, Sweep::Forward).expect("a kernel");
-    let p = simd::packs(&t.f, l, false, 0).expect("the forward packs");
+    let p = simd::packs(&t.ir().unwrap(), l, false, 0).expect("the forward packs");
     let vec_ops = p
         .members
         .iter()
-        .filter(|m| !matches!(t.f.insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. }))
+        .filter(|m| {
+            !matches!(t.ir().unwrap().insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. })
+        })
         .count();
     assert!(vec_ops >= 20, "{vec_ops} vector operations");
     let mut interp = simd_inputs(l);
@@ -987,7 +989,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     }
     // The reverse, several seeds at once.
     let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
-    assert!(simd::packs(&t.f, l, true, t.prefix).is_some(), "the reverse packs");
+    assert!(simd::packs(&t.ir().unwrap(), l, true, t.prefix).is_some(), "the reverse packs");
     let (seeds, stride) = (3, 5 * l);
     let init = || {
         let mut adj = vec![0.0; seeds * stride];
@@ -2367,8 +2369,12 @@ fn a_plans_kernels_keep_only_what_runs_them() {
         assert_eq!(prog.code.capacity(), prog.code.len(), "a chunk program's code");
         for t in prog.compiled.lock().unwrap().values().flatten() {
             let what = if t.rev { "reverse" } else { "forward" };
-            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
-            assert_eq!(t.f.insts.capacity(), t.f.insts.len(), "the {what} kernel's instructions");
+            assert!(t.ir().unwrap().live.is_empty(), "the {what} kernel keeps `live`");
+            assert_eq!(
+                t.ir().unwrap().insts.capacity(),
+                t.ir().unwrap().insts.len(),
+                "the {what} kernel's instructions"
+            );
             seen[t.rev as usize] += 1;
         }
     }
@@ -2578,4 +2584,109 @@ fn a_phase_boundary_frees_every_workers_pooled_buffers() {
     assert!(counts.0.iter().all(|&n| n >= 3), "fixture: each worker holds some: {:?}", counts.0);
     assert_eq!(counts.1, vec![0, 0], "each worker's are freed");
     drop(m);
+}
+
+/// `f`'s plan's reverses at `eta`, as their adjoints' bits: per output, the first-order reverse
+/// from a first-order forward and from a second-order one (a prefix layout: the reverse reads
+/// the leading lanes of a wider log), then the rows forward-over-reverse along both η
+/// (`run_loop_rows`/`run_loop_rev_rows`) where the plan serves it. Also the loop logs' bytes,
+/// kept and as the full log would have held them.
+fn reverse_bits(plan: &Plan, n_out: usize, eta: [f64; 2]) -> (Vec<u64>, usize, usize, bool) {
+    let mut bits = Vec::new();
+    let mut bytes = (0, 0);
+    for lay in [Layout { n: 2, m: 0, th: false, wide: false, tan: 0 }, l2()] {
+        let l = lay.lanes();
+        let mut u = vec![0.0; 2 * l];
+        for k in 0..2 {
+            u[k * l] = eta[k];
+            u[k * l + 1 + k] = 1.0;
+        }
+        let fwd = plan.forward_kept(lay, &u, &[]).expect("runs");
+        for lg in &fwd.logs {
+            if let CallLog::Ode(lg) = lg {
+                bytes.0 += lg.bytes();
+                bytes.1 += lg.full_bytes();
+            }
+        }
+        let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
+        let lr = l1.lanes();
+        for j in 0..n_out {
+            let mut du_bar = vec![0.0; n_out * lr];
+            du_bar[j * lr] = 1.0;
+            du_bar[j * lr + 1] = 0.5;
+            let mut ub = vec![0.0; 2 * lr];
+            assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar), "reverses");
+            assert!(ub.iter().all(|x| x.is_finite()), "finite adjoints");
+            bits.extend(ub.iter().map(|x| x.to_bits()));
+        }
+    }
+    let rows = plan.rows_serve(Layout::F64);
+    if rows {
+        let tu = [1.0, 0.0, 0.0, 1.0];
+        let rf = plan.forward_rows(Layout::F64, &eta, &[], &tu, 2).expect("rows run");
+        let du: Vec<f64> = (0..n_out).map(|j| 1.0 - 0.1 * j as f64).collect();
+        let dut: Vec<f64> = (0..2 * n_out).map(|j| 0.3 + 0.05 * j as f64).collect();
+        let (mut ub, mut ut) = (vec![0.0; 2], vec![0.0; 4]);
+        assert!(plan.reverse_rows(&rf, &du, Some(&dut), &mut ub, &mut [], &mut ut, &mut []));
+        assert!(ub.iter().chain(&ut).all(|x| x.is_finite()), "finite rows adjoints");
+        bits.extend(ub.iter().chain(&ut).map(|x| x.to_bits()));
+    }
+    (bits, bytes.0, bytes.1, rows)
+}
+
+/// #3078: a loop call's log keeps a checkpoint — the lanes a step's bodies read that no body of
+/// the step wrote — instead of every body's inputs, and the reverse regenerates the inputs by
+/// running the step forward again. The reverse must be the full log's **bit for bit**: on every
+/// stepper family (explicit RK45 and Vern7, the Rosenbrock pair carrying a Jacobian), from a
+/// first-order forward, from a second-order one whose leading lanes the reverse reads, and
+/// through the rows forward-over-reverse; and each replayed body input a body reads equals the
+/// forward's, bit for bit (asserted inside every replay of a test build, so the whole suite
+/// checks it). The memory it buys, measured on this two-state fixture, is printed and bounded.
+///
+/// Mutations: the rewind of a rejected step keeping `known` (a slot it wrote is then never
+/// saved), and the clock not restored before a replayed body — each fails the replay's bitwise
+/// check here. (A jump's state copy left out of the replay fails the switch fixture of
+/// `checkpointed_loop_logs_give_the_full_logs_derivatives_bit_for_bit`; this fixture has no
+/// switch.)
+#[test]
+fn a_checkpointed_ode_log_reverses_bit_for_bit_like_the_full_log() {
+    use crate::ode::solver::OdeMethod;
+    use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
+    for method in [OdeMethod::Rk45, OdeMethod::Vern7, OdeMethod::Rosenbrock23, OdeMethod::Rodas5P] {
+        let f = case_ode_interp(method);
+        begin();
+        let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [0.1, -0.2][k])).collect();
+        let y = f(&et);
+        let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
+        let plan = rec.plan(l2(), 2, 0).expect("plans");
+        for eta in [[0.15, -0.1], [0.9, 0.6]] {
+            REPLAYED.with(|c| c.set(0));
+            let (got, kept, full, rows) = reverse_bits(&plan, y.len(), eta);
+            let replayed = REPLAYED.with(std::cell::Cell::get);
+            REPLAY_FROM_FULL.with(|c| c.set(true));
+            let (want, ..) = reverse_bits(&plan, y.len(), eta);
+            REPLAY_FROM_FULL.with(|c| c.set(false));
+            eprintln!(
+                "{method:?} at {eta:?}: log {kept} B vs {full} B full ({:.1}×), {replayed} \
+                 bodies replayed, rows {rows}",
+                full as f64 / kept as f64
+            );
+            assert!(replayed > 0, "{method:?}: the reverse replayed no body");
+            assert!(rows, "{method:?}: the rows path must be exercised");
+            assert_eq!(got.len(), want.len());
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    a,
+                    b,
+                    "{method:?} at {eta:?}: adjoint {i}: {} vs {} from the full log",
+                    f64::from_bits(*a),
+                    f64::from_bits(*b)
+                );
+            }
+            assert!(
+                kept < full,
+                "{method:?}: the checkpoint ({kept} B) is no smaller than {full} B"
+            );
+        }
+    }
 }
