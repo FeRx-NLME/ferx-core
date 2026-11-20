@@ -120,9 +120,9 @@ fn cif_and_survival_sum_to_one() {
 /// T4. [`CifCurve::at`] beside [`KmCurve::at`] of its own all-cause curve: defined
 /// exactly where that one is. On the T1 fixture (last record censored, `S = 5/24`):
 /// `0` before the first time, the step value at and between rows, and `None` past the
-/// last time. Returning the final value there (as if the curve had reached zero)
-/// reddens the `None` assertion; returning `1 − S` reddens the per-cause values, since
-/// `F_A ≠ 1 − S` once B has an event.
+/// last time. Returning the final value there reddens the `None` assertion; returning
+/// `1 − S` reddens the per-cause values, since `F_A ≠ 1 − S` once B has an event (at
+/// t = 2.5 and 4, the last two grid times).
 #[test]
 fn cif_at_follows_all_cause_definedness() {
     let c = t1();
@@ -134,7 +134,10 @@ fn cif_at_follows_all_cause_definedness() {
         let (fa, fb) = (c.at(0, t).unwrap(), c.at(1, t).unwrap());
         assert!((fa - a).abs() < 1e-15, "t = {t}: F_A = {fa}, want {a}");
         assert!((fb - b).abs() < 1e-15, "t = {t}: F_B = {fb}, want {b}");
-        assert!((fa - (1.0 - km.at(t).unwrap())).abs() > 1e-3 || t < 2.0, "t = {t}: F_A = 1 − S");
+    }
+    for t in [2.5, 4.0] {
+        let one_minus_s = 1.0 - km.at(t).unwrap();
+        assert!((c.at(0, t).unwrap() - one_minus_s).abs() > 0.1, "t = {t}: F_A is 1 − S");
     }
     assert_eq!(km.at(4.5), None, "S = 5/24 > 0 past the last time");
     assert_eq!(c.at(0, 4.5), None, "F_A past the last time with S > 0");
@@ -143,17 +146,23 @@ fn cif_at_follows_all_cause_definedness() {
     assert_eq!(c.at(2, 1.0), None, "cause index 2 of 2 causes");
 }
 
-/// T4, the other end. When the last subject has an event, `S` reaches zero and both
-/// curves stay defined past the last time: `S = 0` and every `F_k` at its final value.
-/// Returning `None` (or `0`) past the last time reddens it.
+/// T4, the other end. When the last subject has an event, `S` reaches zero. At the last
+/// time every `F_k` is at its final value (summing to 1); past it both curves are
+/// `None`, also at zero, the #2930 convention of [`KmCurve::at`], so a band past the
+/// replicates' follow-up gets no point mass at the final value. Returning the final value
+/// past the end reddens the `None` assertions; returning `None` at the last time reddens
+/// the values.
 #[test]
-fn cif_at_past_the_end_keeps_the_final_value_when_s_reaches_zero() {
+fn cif_at_reaching_zero_is_final_at_the_last_time_and_none_after() {
     let c = aalen_johansen(&[1.0, 2.0, 3.0], &[1, 0, 2], 2).unwrap();
-    assert_eq!(c.all_cause.at(9.0), Some(0.0));
-    let (fa, fb) = (c.at(0, 9.0).unwrap(), c.at(1, 9.0).unwrap());
+    assert_eq!(c.all_cause.at(3.0), Some(0.0));
+    let (fa, fb) = (c.at(0, 3.0).unwrap(), c.at(1, 3.0).unwrap());
     // S(1) = 2/3, S(3) = 0 after the censoring at 2: F_A = 1/3, F_B = 2/3.
     assert!((fa - 1.0 / 3.0).abs() < 1e-15, "F_A = {fa}");
     assert!((fb - 2.0 / 3.0).abs() < 1e-15, "F_B = {fb}");
+    assert_eq!(c.all_cause.at(9.0), None, "S past the last time, at zero");
+    assert_eq!(c.at(0, 9.0), None, "F_A past the last time, S at zero");
+    assert_eq!(c.at(1, 9.0), None, "F_B past the last time, S at zero");
     assert_eq!(c.n_causes(), 2);
 }
 
@@ -179,4 +188,43 @@ fn aj_refuses_bad_input_and_empty_is_undefined() {
     let c = aalen_johansen(&[], &[], 2).unwrap();
     assert_eq!(c.n_causes(), 2);
     assert_eq!(c.at(0, 0.0), None);
+}
+
+/// Step 3. [`vpc_band_cif`] over 30 seeded two-cause curves keeps exactly the curves
+/// whose all-cause curve is defined at each grid time — `n_used` equals
+/// [`vpc_band`](crate::stats::km::vpc_band)'s over the `all_cause` curves — and its
+/// quantiles are the type-7 quantiles of those `F_k` values, computed here outside
+/// the band. The grid straddles the curves' last times (asserted), so a band that read
+/// a curve past its end, or dropped one before it, changes `n_used`. A `k` that is not
+/// a cause leaves every point empty.
+#[test]
+fn cif_band_keeps_the_all_cause_definedness() {
+    use crate::stats::convergence::quantile_sorted;
+    use crate::stats::km::{min_curves_for, vpc_band};
+    let curves: Vec<CifCurve> =
+        random_sets(2, 30).iter().map(|(t, c)| aalen_johansen(t, c, 2).unwrap()).collect();
+    let km: Vec<KmCurve> = curves.iter().map(|c| c.all_cause.clone()).collect();
+    let grid = [0.5, 5.0, 15.0, 30.0, 60.0];
+    let probs = [0.05, 0.5, 0.95];
+    let all = vpc_band(&km, &grid, probs).unwrap();
+    assert!(
+        all.n_used.iter().any(|&n| n > min_curves_for(probs) && n < curves.len()),
+        "the grid must straddle some curves' last times: n_used = {:?}",
+        all.n_used
+    );
+    for k in 0..2 {
+        let band = vpc_band_cif(&curves, k, &grid, probs).unwrap();
+        assert_eq!(band.n_used, all.n_used, "cause {k}: n_used");
+        for (g, &t) in grid.iter().enumerate() {
+            let mut v: Vec<f64> = curves.iter().filter_map(|c| c.at(k, t)).collect();
+            v.sort_by(f64::total_cmp);
+            let want = |p: f64| (v.len() >= min_curves_for(probs)).then(|| quantile_sorted(&v, p));
+            assert_eq!(band.lo[g], want(probs[0]), "cause {k}, t = {t}: lo");
+            assert_eq!(band.med[g], want(probs[1]), "cause {k}, t = {t}: med");
+            assert_eq!(band.hi[g], want(probs[2]), "cause {k}, t = {t}: hi");
+        }
+    }
+    let none = vpc_band_cif(&curves, 2, &grid, probs).unwrap();
+    assert!(none.n_used.iter().all(|&n| n == 0) && none.med.iter().all(Option::is_none));
+    assert!(vpc_band_cif(&curves, 0, &grid, [0.5, 0.5, 0.9]).is_err(), "bad probs");
 }

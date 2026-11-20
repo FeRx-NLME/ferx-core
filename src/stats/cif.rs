@@ -29,7 +29,7 @@
 //! causes treated as censorings estimates the incidence in a world without the other
 //! causes, and overstates `F_k` whenever they are present.
 
-use crate::stats::km::{kaplan_meier, KmCurve};
+use crate::stats::km::{band_over, kaplan_meier, KmCurve, KmInputError, VpcBand};
 
 /// The Aalen–Johansen cumulative incidence curves of `n_causes` competing causes,
 /// on the rows of their all-cause Kaplan–Meier curve.
@@ -136,20 +136,40 @@ impl CifCurve {
     }
 
     /// `F_{k+1}(t)` for the zero-based cause index `k`: `0` before the first time, the
-    /// step value at or after it, and past the last time the final value when the
-    /// all-cause curve has reached zero and `None` when it has not.
+    /// step value at or after it up to and including the last time, and `None` past the
+    /// last time, also when the all-cause curve has reached zero.
     ///
     /// Definedness is the all-cause curve's: this is `None` exactly where
     /// [`KmCurve::at`] of `all_cause` is, so a band over CIF curves keeps the same
-    /// replicates at a grid time as a band over their all-cause curves. `None` for a
-    /// `k` that is not a cause, for an empty curve and for a `t` that is not a number.
+    /// replicates at a grid time as a band over their all-cause curves, and follows any
+    /// change to that rule. `None` for a `k` that is not a cause, for an empty curve and
+    /// for a `t` that is not a number.
     pub fn at(&self, k: usize, t: f64) -> Option<f64> {
         let f = self.cif.get(k)?;
         self.all_cause.at(t)?;
-        // Number of rows with time ≤ t (every row, past the last time).
+        // Number of rows with time ≤ t.
         let j = self.all_cause.time.partition_point(|&x| x <= t);
         Some(if j == 0 { 0.0 } else { f[j - 1] })
     }
+}
+
+/// [`vpc_band`](crate::stats::km::vpc_band) over the cumulative incidence of the
+/// zero-based cause `k`: the pointwise `probs` band of [`CifCurve::at`]`(k, t)` on
+/// `grid`. A curve is left out at `t` exactly where its all-cause curve is, so
+/// `n_used` equals the all-cause band's of the same curves, and the same
+/// [`min_curves_for`](crate::stats::km::min_curves_for) floor applies. A `k` that is
+/// not a cause of the curves leaves every point with `n_used = 0` and no quantiles.
+///
+/// Pointwise quantiles do not add up across causes: the medians of `F_1 … F_K` and
+/// of `S` need not sum to 1.
+///
+/// # Errors
+///
+/// [`KmInputError::BadProbs`] unless the probabilities are valid.
+pub fn vpc_band_cif(
+    curves: &[CifCurve], k: usize, grid: &[f64], probs: [f64; 3],
+) -> Result<VpcBand, KmInputError> {
+    band_over(curves.len(), |j, t| curves[j].at(k, t), grid, probs)
 }
 
 #[cfg(test)]
