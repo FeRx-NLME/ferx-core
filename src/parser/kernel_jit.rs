@@ -2516,7 +2516,21 @@ fn solver_desc(m: &crate::types::CompiledModel) -> Desc {
 /// Everything of `s` a recording can read, as its canonical bytes: its records' times, doses,
 /// compartments, occasions and covariate values. A covariate map is written as its entries
 /// sorted by name, so equal maps are equal whatever their iteration order.
+/// Test hook: how many times a subject whose id starts with [`SUBJECT_DESC_MARK`] was
+/// fingerprinted ([`subject_desc`]), on any thread. A registered subject is fingerprinted
+/// once, at registration; an unregistered one on every plan lookup. The id prefix keeps
+/// concurrent tests out of the count.
+#[cfg(test)]
+pub(crate) static SUBJECT_DESC_MARKED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) const SUBJECT_DESC_MARK: &str = "fp2986-";
+
 fn subject_desc(s: &crate::types::Subject) -> Desc {
+    #[cfg(test)]
+    if s.id.starts_with(SUBJECT_DESC_MARK) {
+        SUBJECT_DESC_MARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     use std::hash::Hash;
     Desc::of(|h| {
         let f = |h: &mut Canon, v: &[f64]| {

@@ -928,13 +928,15 @@ impl TypicalProgram {
         Self { defs: Vec::new(), root }
     }
 
-    /// The typical value at `theta` and one subject's covariate snapshot.
+    /// The typical value at `theta` and one subject's covariates, by the tree-walking
+    /// interpreter: the reference [`CompiledTypical`] is pinned to, bit for bit.
+    #[cfg(test)]
     pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
         self.eval_in(theta, covariates)
     }
 
-    /// The covariates the program reads, each once, in first-read order: the names of a
-    /// [`CovariateSnapshot`].
+    /// The covariates the program reads, each once, in first-read order: the slots of a
+    /// [`CompiledTypical`].
     pub(crate) fn covariate_names(&self) -> Vec<String> {
         fn walk(e: &Expression, out: &mut Vec<String>) {
             match e {
@@ -955,7 +957,7 @@ impl TypicalProgram {
                     walk(f, out);
                 }
                 // Every variant is listed, so a new one that can hold a covariate is a compile
-                // error here, not a covariate the snapshot silently reads as `0.0`.
+                // error here, not a covariate the compiled form silently reads as `0.0`.
                 Expression::Literal(_)
                 | Expression::Theta(_)
                 | Expression::Eta(_)
@@ -975,13 +977,7 @@ impl TypicalProgram {
         out
     }
 
-    /// [`Self::eval`] over a subject's covariates read once ([`CovariateSnapshot`]): a solve
-    /// that evaluates the same subjects at many θ looks each covariate up by name once, not at
-    /// every evaluation. Bit-identical to [`Self::eval`] on the map the snapshot was taken from.
-    pub(crate) fn eval_snapshot(&self, theta: &[f64], snapshot: &CovariateSnapshot<'_>) -> f64 {
-        self.eval_in(theta, snapshot)
-    }
-
+    #[cfg(test)]
     fn eval_in<C: CovariateSource>(&self, theta: &[f64], covariates: &C) -> f64 {
         // The definitions are few: a stack buffer keeps the common program allocation-free.
         let mut stack = [0.0f64; 8];
@@ -1062,16 +1058,19 @@ pub(crate) struct ProgramDefs {
 /// the definitions computed so far by index. A stray local name reads `0.0`
 /// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
 /// rather than letting it through.
+#[cfg(test)]
 struct TypicalEnv<'a, C: CovariateSource> {
     covariates: &'a C,
     defs: &'a [f64],
 }
 
 /// Where a [`TypicalProgram`] reads a covariate by name; an absent one is `0.0`.
+#[cfg(test)]
 pub(crate) trait CovariateSource {
     fn covariate(&self, name: &str) -> f64;
 }
 
+#[cfg(test)]
 impl CovariateSource for HashMap<String, f64> {
     #[inline]
     fn covariate(&self, name: &str) -> f64 {
@@ -1079,27 +1078,104 @@ impl CovariateSource for HashMap<String, f64> {
     }
 }
 
-/// A subject's values of the covariates a [`TypicalProgram`] reads
-/// ([`TypicalProgram::covariate_names`]), read from the subject's map once; each read then
-/// finds its name in that short list.
-pub(crate) struct CovariateSnapshot<'a> {
-    names: &'a [String],
-    values: Vec<f64>,
+/// A [`TypicalProgram`] lowered once to the VM's [`Bytecode`] (#2986), for a solve that
+/// evaluates the same typical value at many θ — the covariate mu-reference M-step. Covariates
+/// read slots of a per-subject vector in [`TypicalProgram::covariate_names`] order, so there is
+/// no tree walk and no name search per read.
+///
+/// [`Self::eval`] runs the `f64` VM, whose every operation is the interpreter's own formula
+/// (the same `/`, `ln`, `sqrt`, `logit` and `mod` guards), so it is bit for bit the
+/// interpreter (`TypicalProgram::eval`, kept for tests). [`Self::eval_g`] runs the generic VM
+/// over any [`VmNum`], with θ seeded by the caller — the route FOCEI/Laplace take through
+/// [`IndivParamProgram::eval_params_g`]: a forward dual seeded on some θ gives the exact
+/// ∂A/∂θ in one pass.
+///
+/// [`VmNum`]: crate::sens::num::vm::VmNum
+pub(crate) struct CompiledTypical {
+    /// One program per definition, in dependency order: `defs[j]` reads `defs[..j]` as vars.
+    defs: Vec<Bytecode>,
+    root: Bytecode,
 }
 
-impl<'a> CovariateSnapshot<'a> {
-    pub(crate) fn new(names: &'a [String], covariates: &HashMap<String, f64>) -> Self {
-        CovariateSnapshot { names, values: names.iter().map(|n| covariates.covariate(n)).collect() }
+impl TypicalProgram {
+    /// This program as [`CompiledTypical`], its covariates resolved against `names` (normally
+    /// [`Self::covariate_names`]).
+    pub(crate) fn compile(&self, names: &[String]) -> CompiledTypical {
+        let slots: HashMap<&str, usize> =
+            names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        let lower = |e: &Expression| compile_bytecode(&lower_typical(e, &slots));
+        CompiledTypical { defs: self.defs.iter().map(lower).collect(), root: lower(&self.root) }
     }
 }
 
-impl CovariateSource for CovariateSnapshot<'_> {
-    #[inline]
-    fn covariate(&self, name: &str) -> f64 {
-        self.names.iter().position(|n| n == name).map_or(0.0, |i| self.values[i])
+/// `e` with every read [`TypicalEnv`] resolves by name replaced by what the VM reads: a
+/// covariate by its slot in `slots` (absent reads `0.0`, as in the map), `MACHEPS` by its
+/// value, any other local name or a pre-resolved covariate index by `0.0` — `TypicalEnv`'s
+/// fall-through. `VariableIdx(j)` stays: the VM reads it from the definitions' values.
+fn lower_typical(e: &Expression, slots: &HashMap<&str, usize>) -> Expression {
+    let sub = |x: &Expression| Box::new(lower_typical(x, slots));
+    match e {
+        Expression::Covariate(n) => match slots.get(n.as_str()) {
+            Some(&i) => Expression::CovariateIdx(i),
+            None => Expression::Literal(0.0),
+        },
+        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
+            Expression::Literal(f64::EPSILON)
+        }
+        Expression::Variable(_) | Expression::CovariateIdx(_) => Expression::Literal(0.0),
+        Expression::BinOp(l, op, r) => Expression::BinOp(sub(l), *op, sub(r)),
+        Expression::Power(b, x) => Expression::Power(sub(b), sub(x)),
+        Expression::UnaryFn(n, a) => Expression::UnaryFn(n.clone(), sub(a)),
+        Expression::ThetaGather { spec, idx } => {
+            Expression::ThetaGather { spec: spec.clone(), idx: sub(idx) }
+        }
+        Expression::Conditional(c, t, f) => Expression::Conditional(
+            Box::new(map_condition_operands(c, &mut |x| lower_typical(x, slots))),
+            sub(t),
+            sub(f),
+        ),
+        Expression::Literal(_)
+        | Expression::Theta(_)
+        | Expression::Eta(_)
+        | Expression::Time
+        | Expression::MixNum
+        | Expression::VariableIdx(_)
+        | Expression::NnOutput { .. } => e.clone(),
     }
 }
 
+impl CompiledTypical {
+    /// The typical value at `theta` and one subject's covariate vector (slots of the names the
+    /// program was compiled against). Bit for bit the interpreter (`TypicalProgram::eval`,
+    /// kept for tests).
+    pub(crate) fn eval(&self, theta: &[f64], covariates: &[f64]) -> f64 {
+        let mut vars: Vec<f64> = crate::scratch::take();
+        let mut stack: Vec<f64> = crate::scratch::take();
+        for d in &self.defs {
+            let v = eval_bytecode(d, theta, &[], covariates, &vars, &[], &mut stack);
+            vars.push(v);
+        }
+        let v = eval_bytecode(&self.root, theta, &[], covariates, &vars, &[], &mut stack);
+        crate::scratch::give(vars);
+        crate::scratch::give(stack);
+        v
+    }
+
+    /// [`Self::eval`] over any VM number type, θ seeded by the caller.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], covariates: &[f64],
+    ) -> T {
+        let mut vars: Vec<T> = Vec::with_capacity(self.defs.len());
+        let mut stack: Vec<T> = Vec::new();
+        for d in &self.defs {
+            let v = eval_bytecode_g(d, theta, &[], covariates, &vars, &[], &mut stack);
+            vars.push(v);
+        }
+        eval_bytecode_g(&self.root, theta, &[], covariates, &vars, &[], &mut stack)
+    }
+}
+
+#[cfg(test)]
 impl<C: CovariateSource> EvalEnv for TypicalEnv<'_, C> {
     #[inline]
     fn resolve(&self, expr: &Expression) -> f64 {
@@ -12125,8 +12201,45 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "steihaug_max_iters" => opts.steihaug_max_iters = Some(parse_usize("steihaug_max_iters")?),
         "global_search" => opts.global_search = parse_bool("global_search")?,
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
-        "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
+        // An explicit length is a fixed length and overrides the automatic stop and
+        // its min/max (`FitOptions::saem_n_exploration`).
+        "n_exploration" => opts.saem_n_exploration = Some(parse_usize("n_exploration")?),
+        "n_exploration_min" => opts.saem_exploration_min = parse_usize("n_exploration_min")?,
+        "n_exploration_max" => opts.saem_exploration_max = parse_usize("n_exploration_max")?,
+        "smoothing_exponent" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v > 0.5 && v <= 1.0) {
+                return Err(format!(
+                    "fit option `{key}` must lie in (0.5, 1] (the Robbins-Monro conditions \
+                     on the step 1/(k-K1)^a), got {v}"
+                ));
+            }
+            opts.saem_smoothing_exponent = v;
+        }
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
+        "isample_m1" => opts.saem_isample_m1 = Some(parse_usize(key)?),
+        "mceta" => opts.saem_mceta = parse_usize(key)?,
+        "isample_m1b" => opts.saem_isample_m1b = Some(parse_usize(key)?),
+        "isample_m2" => opts.saem_isample_m2 = Some(parse_usize(key)?),
+        "isample_m3" => opts.saem_isample_m3 = Some(parse_usize(key)?),
+        "isample_imh" => opts.saem_isample_imh = Some(parse_usize(key)?),
+        "isample_hmc" => opts.saem_isample_hmc = Some(parse_usize(key)?),
+        "isample_nuts" => opts.saem_isample_nuts = Some(parse_usize(key)?),
+        "isample_mala" => opts.saem_isample_mala = Some(parse_usize(key)?),
+        "iaccept" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v > 0.0 && v < 1.0) {
+                return Err(format!("fit option `{key}` must lie in (0, 1), got {v}"));
+            }
+            opts.saem_iaccept = v;
+        }
+        "n_chains" => {
+            let n = parse_usize("n_chains")?;
+            if n == 0 {
+                return Err("fit option `n_chains` must be at least 1".to_string());
+            }
+            opts.saem_n_chains = n;
+        }
         // `auto` (the default) sizes the block kernel from the dataset — see
         // `estimation::saem::auto_n_mh_steps` (#1459). It is spelled out here
         // rather than left as a bare 0 so a model file can say what it means.
@@ -12211,9 +12324,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.saem_kernel = match value.to_lowercase().as_str() {
                 "rw" | "random_walk" | "random-walk" | "mh" => crate::types::SaemKernel::RandomWalk,
                 "imh" | "fsaem" | "f-saem" => crate::types::SaemKernel::Imh,
+                "nonmem" | "nm" => crate::types::SaemKernel::Nonmem,
+                "hmc" => crate::types::SaemKernel::Hmc,
+                "nuts" => crate::types::SaemKernel::Nuts,
+                "mala" => crate::types::SaemKernel::Mala,
                 other => {
                     return Err(format!(
-                        "fit option `{key}`: unknown value `{other}` — expected rw/imh"
+                        "fit option `{key}`: unknown value `{other}` — expected rw/imh/nonmem/hmc/nuts/mala"
                     ));
                 }
             };
@@ -27193,17 +27310,6 @@ fn eval_expression(
 ) -> f64 {
     let env = MapEnv { covariates, vars };
     eval_expr(expr, theta, eta, &env, nn_outputs)
-}
-
-/// Evaluate an eta-free typical value `A(θ, covariates)` — a
-/// [`CovariateMuRef`]'s `typical` — at one subject's covariate snapshot (#619).
-/// The local definitions it reads were resolved at detection time into the
-/// program's own lines ([`TypicalProgram`]); a stray name would read as `0.0`,
-/// which is why detection rejects them rather than letting one through.
-pub(crate) fn eval_typical_value(
-    typical: &TypicalProgram, theta: &[f64], covariates: &HashMap<String, f64>,
-) -> f64 {
-    typical.eval(theta, covariates)
 }
 
 #[inline]

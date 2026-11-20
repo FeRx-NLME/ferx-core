@@ -26,7 +26,7 @@ fn root() -> PathBuf {
 fn short_saem(ofv: SaemOfv) -> FitOptions {
     FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 10,
+        saem_n_exploration: Some(10),
         saem_n_convergence: 10,
         saem_seed: Some(11),
         imp_seed: Some(5),
@@ -181,7 +181,7 @@ fn iov_models_report_the_saem_objective_with_no_fallback() {
     let prep = prepare_run("examples/warfarin_iov_saem.ferx", Some("data/warfarin_iov_saem.csv"))
         .expect("prepare");
     let mut o = FitOptions { saem_ofv: SaemOfv::Saem, ..prep.parsed.fit_options.clone() };
-    o.saem_n_exploration = 10;
+    o.saem_n_exploration = Some(10);
     o.saem_n_convergence = 10;
     o.saem_ofv_samples = 200;
     o.run_covariance_step = false;
@@ -634,7 +634,7 @@ fn agq_readout_counts_iov_occasions_in_the_grid_and_falls_back() {
     let prep = prepare_run("examples/warfarin_iov_saem.ferx", Some("data/warfarin_iov_saem.csv"))
         .expect("prepare");
     let mut o = FitOptions { saem_ofv: SaemOfv::Agq, ..prep.parsed.fit_options.clone() };
-    o.saem_n_exploration = 10;
+    o.saem_n_exploration = Some(10);
     o.saem_n_convergence = 10;
     o.saem_ofv_samples = 200;
     o.run_covariance_step = false;

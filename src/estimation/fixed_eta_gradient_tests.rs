@@ -1122,9 +1122,13 @@ fn fisher_information_zeroes_a_pinned_coordinate() {
 #[test]
 fn fisher_information_is_withheld_outside_the_gaussian_scope() {
     use crate::types::DoseEvent;
-    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_14)
-        .expect("magnitude fixture parses");
-    assert!(model.has_custom_ruv_magnitude());
+    // A magnitude that reads a θ (#3064): θ reaches `V` directly. (`ONE_CPT_IV_14` itself reads
+    // only the covariate, which keeps the information: see the test below.)
+    let src = crate::test_models::ONE_CPT_IV_14
+        .replace("(1.0 + 0.5 * WPSE)", "(1.0 + TVV / 20.0 * WPSE)");
+    let model =
+        crate::parser::model_parser::parse_model_string(&src).expect("magnitude fixture parses");
+    assert!(model.has_custom_ruv_magnitude() && model.ruv_magnitude_reads_theta());
     let theta = vec![1.0f64, 10.0];
     let sigma_values = vec![0.10f64, 0.50];
     let n_theta = theta.len();
@@ -3140,4 +3144,201 @@ fn the_solve_entry_withholds_a_differenced_information_where_score_sa_takes_it()
     assert!(solve.2.is_none(), "the solve entry must not carry a differenced information");
     assert!(score_sa.2.is_some(), "score_sa takes the differenced rows");
     assert_eq!((solve.0, &solve.1), (score_sa.0, &score_sa.1));
+}
+
+/// The lean σ-only score (#2986) is the general path's, bit for bit: value, gradient and
+/// information with every θ pinned, one σ pinned or both free, with and without the
+/// information.
+#[test]
+fn the_sigma_only_score_is_the_general_path_bit_for_bit() {
+    use crate::types::DoseEvent;
+    let model = combined_error_two_cpt_model();
+    let theta = vec![1.4f64, 11.0, 2.1, 23.0];
+    let sigma_values = vec![0.15f64, 0.40];
+    let n_theta = theta.len();
+    let n_sigma = sigma_values.len();
+    let n = n_theta + n_sigma;
+    let eta = vec![0.13f64];
+    let subject = paired_residual_subject(
+        &model,
+        "1",
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[0.5, 2.0, 6.0, 12.0],
+        &theta,
+        &[0.2, 0.3],
+        &eta,
+    );
+    let mask = vec![true; n_theta];
+    for pin_add in [false, true] {
+        let mut lo = vec![-1e30f64; n];
+        let mut hi = vec![1e30f64; n];
+        for t in 0..n_theta {
+            lo[t] = theta[t].ln();
+            hi[t] = theta[t].ln();
+        }
+        if pin_add {
+            lo[n_theta + 1] = sigma_values[1].ln();
+            hi[n_theta + 1] = sigma_values[1].ln();
+        }
+        let run = |off: bool| {
+            SIGMA_ONLY_OFF.with(|c| c.set(off));
+            let mut scratch = EventPkParams::default();
+            let fisher = obs_nll_subject_grad_fisher(
+                &model,
+                &subject,
+                &theta,
+                &sigma_values,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            let plain = obs_nll_subject_grad(
+                &model,
+                &subject,
+                &theta,
+                &sigma_values,
+                &eta,
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            SIGMA_ONLY_OFF.with(|c| c.set(false));
+            (fisher, plain)
+        };
+        let (lean, lean_plain) = run(false);
+        let (general, general_plain) = run(true);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(lean.0.to_bits(), general.0.to_bits(), "value, pin_add {pin_add}");
+        assert_eq!(bits(&lean.1), bits(&general.1), "gradient, pin_add {pin_add}");
+        let (lf, gf) = (lean.2.expect("information"), general.2.expect("information"));
+        assert_eq!(bits(&lf), bits(&gf), "information, pin_add {pin_add}");
+        assert!(lf[n_theta * n + n_theta] > 0.0, "the free σ carries information");
+        assert_eq!(lean_plain.0.to_bits(), general_plain.0.to_bits());
+        assert_eq!(
+            bits(&lean_plain.1),
+            bits(&general_plain.1),
+            "plain gradient, pin_add {pin_add}"
+        );
+    }
+}
+
+/// #3064: a θ-free residual magnitude (`weight = SE`, the MBMA form) is a per-observation
+/// constant, so the expected information stays exact — `Σ[∂f∂fᵀ/V + ½∂V∂Vᵀ/V²]` with the
+/// magnitude riding `V`, `dV/df` and `dV/dlog σ` — and Newton serves it. Checked against the
+/// observed Hessian on paired residuals (`f ± √V` at each time, so the residual terms of the
+/// observed Hessian average out), as the magnitude-free test above.
+#[test]
+fn fisher_information_is_exact_under_a_theta_free_magnitude() {
+    use crate::types::{DoseEvent, Population};
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_14)
+        .expect("magnitude fixture parses");
+    assert!(model.has_custom_ruv_magnitude() && !model.ruv_magnitude_reads_theta());
+    let theta = vec![1.0f64, 10.0];
+    let sigma_values = vec![0.10f64, 0.50];
+    let n_theta = theta.len();
+    let n_sigma = sigma_values.len();
+    let n = n_theta + n_sigma;
+    let times = [0.5f64, 1.0, 2.0, 4.0, 8.0, 12.0];
+    let wpse = [0.6f64, 0.8, 1.1, 1.4, 0.9, 1.7];
+    let etas = vec![vec![0.0f64], vec![0.15], vec![-0.1]];
+    let subjects: Vec<Subject> = etas
+        .iter()
+        .enumerate()
+        .map(|(i, eta)| {
+            let mut obs_times = Vec::new();
+            let mut obs_cov = Vec::new();
+            for (t, w) in times.iter().zip(wpse) {
+                for _ in 0..2 {
+                    obs_times.push(*t);
+                    obs_cov.push([("WPSE".to_string(), w)].into_iter().collect());
+                }
+            }
+            let m = obs_times.len();
+            let mut s = Subject {
+                id: format!("{}", i + 1),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times,
+                observations: vec![0.0; m],
+                obs_cmts: vec![1; m],
+                cens: vec![0; m],
+                covariates: [("WPSE".to_string(), 1.0)].into_iter().collect(),
+                obs_covariates: obs_cov,
+                ..Default::default()
+            };
+            let mut scratch = EventPkParams::default();
+            let preds =
+                crate::pk::compute_predictions_with_tv_into(&model, &s, &theta, eta, &mut scratch);
+            let mult = model.ruv_obs_mult(&s, &theta).expect("a magnitude");
+            let keys: Vec<usize> = model.error_spec.obs_keys(&s).to_vec();
+            for j in 0..m {
+                let v = model.residual_variance_at_scaled(
+                    keys[j],
+                    preds[j],
+                    &sigma_values,
+                    Some(mult[j].as_slice()),
+                );
+                s.observations[j] = preds[j] + if j % 2 == 0 { 1.0 } else { -1.0 } * v.sqrt();
+            }
+            s
+        })
+        .collect();
+    let population = Population {
+        subjects,
+        covariate_names: vec!["WPSE".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mask = vec![true; n_theta];
+    let lo = vec![-1e30f64; n];
+    let hi = vec![1e30f64; n];
+    let mut scratch = EventPkParams::default();
+    let mut info = vec![0.0f64; n * n];
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let (_, _, fi) = obs_nll_subject_grad_fisher(
+            &model,
+            subject,
+            &theta,
+            &sigma_values,
+            &etas[i],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        let fi = fi.expect("a θ-free magnitude keeps the information");
+        for (a, v) in fi.iter().enumerate() {
+            info[a] += v;
+        }
+    }
+    let href = fd_packed_hessian(&model, &population, &theta, &sigma_values, &etas, 1e-4);
+    assert!(href.iter().all(|v| v.is_finite()), "non-finite reference Hessian");
+    assert!(info.iter().all(|v| v.is_finite()), "non-finite information");
+    let scale = href.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!(scale > 1.0, "reference Hessian is degenerate: max {scale:.3e}");
+    let mut worst = 0.0f64;
+    for a in 0..n {
+        assert!(info[a * n + a] > 1e-6 * scale, "coordinate {a} carries no information");
+        for b in 0..n {
+            let (got, want) = (info[a * n + b], href[a * n + b]);
+            assert!(got.is_finite() && want.is_finite(), "({a},{b}): {got} vs {want}");
+            let rel = (got - want).abs() / want.abs().max(1e-3 * scale);
+            assert!(rel.is_finite(), "({a},{b}): relative error {rel}");
+            worst = worst.max(rel);
+        }
+    }
+    eprintln!(
+        "MEASURE θ-free magnitude information vs observed Hessian: worst relative {worst:.3e}"
+    );
+    assert!(worst < 2.1e-4, "information vs observed Hessian: worst relative {worst:.3e}");
 }

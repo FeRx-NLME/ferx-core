@@ -24,13 +24,122 @@ SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, fol
 
 Step size $\gamma_k = 1$. The algorithm explores the parameter space rapidly, with the sufficient statistics being fully replaced each iteration. This allows fast movement toward the basin of the MLE.
 
-Default: 150 iterations.
+By default K1 is **chosen by the run** (see [the automatic stop](#exploration-stop)): at least 150 iterations (`n_exploration_min`), at most 4000 (`n_exploration_max`). Setting `n_exploration = n` instead fixes K1 = n and turns the automatic stop off.
 
-### Phase 2: Convergence (iterations K1+1 to K1+K2)
+### Phase 2: Convergence (iterations K1+1 to K1+K2) {#phase-2}
 
-Step size $\gamma_k = 1/(k - K_1)$. The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions.
+Step size $\gamma_k = 1/(k - K_1)^a$, with $a = 1$ by default (`smoothing_exponent`). The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions (the Robbins-Monro conditions need $a \in (1/2, 1]$).
 
-Default: 250 iterations.
+Default: 1000 iterations (NONMEM's `NITER` default).
+
+**Why 1000.** With $a = 1$ the averaging phase removes an offset left by the exploration phase only like $K_2^{-\lambda}$, where λ is the rate at which EM contracts in that direction — a slow, Robbins–Monro regime whenever λ < ½. Traced runs on `warfarin_iov_saem` measured λ ≈ 0.1–0.36 along the ETA_CL / KAPPA_CL ridge, so the estimate largely keeps where exploration ended: at the former 250 iterations an exploration of 500 ended +0.32 (−2 log L, paired over 5 seeds) worse than one of 150 — not because exploring longer hurts, but because averaging could not undo where the longer exploration happened to stop (from poor initial estimates the difference disappears). Lengthening the phase improved every set measured, paired against 250 (automatic exploration): 500 / 1000 / 2000 iterations gave −0.20 / −0.34 / −0.44 on the pk2_big stand-in (10/10 seeds better), −0.23 / −0.30 / −0.36 on `warfarin_iov_saem` (5/5) and −0.08 / −0.11 / −0.19 on `two_cpt_oral_cov`, at +20 / +53 / +120 % CPU. Polyak–Ruppert iterate averaging (exponent 0.7 or 0.8, mean over the last ½ or ¾) was measured as the alternative and is not used: −0.50 on the stand-in but +0.30 (sd 0.67) on `warfarin_iov_saem` and +0.15 on `two_cpt_oral_cov`.
+
+### NONMEM's kernels {#nonmem-kernels}
+
+The E-step samples each subject's η from its conditional distribution by Metropolis–Hastings. With `saem_kernel = nonmem` it runs NONMEM's SAEM kernels (Users Guide 7.5.1, `ISAMPLE_M1/M1B/M2/M3`), per chain per iteration and in NONMEM's order:
+
+| kernel | proposals (default) | proposal |
+|---|---|---|
+| M1 | `isample_m1` (2) | independent draws from the population density N(0, Ω) — the prior cancels and the acceptance is the data likelihood ratio, so a subject can leave a wrong region in one move |
+| M1B | `isample_m1b` (2) | independent draws from the chain's running conditional mean and covariance (its draws since the Ω burn-in, from the 10th on; a covariance that is not positive definite falls back to its diagonal) |
+| M2 | `isample_m2` (2) | the block random walk η + s·chol(Ω)·z |
+| M3 | `isample_m3` (2) | componentwise sweeps, one η at a time |
+
+The two random walks' scales are adapted towards `iaccept` (NONMEM's `IACCEPT`, 0.4) within NONMEM's `ISCALE` bounds `[1e-6, 1e6]`; how NONMEM itself steps the scale is not documented, so ferx's multiplicative rule does it. NONMEM's `MCETA` is the option `mceta` (default 0, NONMEM's): when larger than `isample_m1`, M1, M2 and M3 each run that many proposals on the first iteration. Measured at NONMEM's `AUTO=2` value of 100 it did not help — `two_cpt_oral_cov` 6 / 20 seeds at its optimum against 10 / 20 without, pk2s and `warfarin_iov_saem` unchanged within noise — so that model's V1–KA trap is not about where the chains start. How well they move is another matter: the [gradient kernels](#gradient-kernels) clear it. NONMEM's mode 1A (off by default there) and its `ISAMPEND` preprocess (a per-subject sample count from shrinkage, under `AUTO=1`) are not implemented.
+
+Measured against the earlier default (`saem_kernel = rw`: `n_mh_steps` block proposals, 6–20, plus the componentwise sweep), both under the automatic exploration stop, 1000 averaging iterations and two chains: the cost per iteration is the same (pk2_big stand-in 4.7 vs 4.55 ms in exploration), but the chain decorrelates faster, so the exploration stop is met sooner — pk2s K1 1260–1560 against 1730–4000, **20.9–23.2 s against 24–42 s CPU** (four seeds, interleaved), with no seed at the maximum (two of ten under `rw`) and median gap +0.04 against +0.18; `warfarin_iov_saem` 1.8 vs 2.7 s at a comparable gap (+0.17 vs +0.10, within IS noise); `two_cpt_oral_cov` 10 / 20 seeds at its optimum against 7 / 20 (8 against 12 in the V1–KA trap), at the same cost.
+
+### Choosing the E-step kernels {#saem-kernels}
+
+Each SAEM iteration moves every chain's random effects with a sequence of kernels, each a Metropolis–Hastings or Hamiltonian move that leaves the subject's conditional posterior unchanged, so any combination is valid. You choose them as counts per chain per iteration; `0` turns one off. They run in this order — the gradient moves first, since the post-M-step refresh leaves each chain's gradient at its state and their first transition starts from it; then the independence moves; then the local random walks:
+
+| count | kernel | cost per move | add it for |
+|---|---|---|---|
+| `isample_hmc` | Hamiltonian Monte Carlo on the exact η-gradient ([gradient kernels](#gradient-kernels)) | 2–3 gradients | fast, exact local moves along correlated posteriors |
+| `isample_nuts` | No-U-Turn transition, otherwise as `hmc` | ~4–30 gradients | an adaptive trajectory length |
+| `isample_mala` | Metropolis-adjusted Langevin: one leapfrog step, otherwise as `hmc`, with its own step size | 1 gradient | cheap gradient-guided local moves |
+| `isample_m1` | independence draw from N(0, Ω) (NONMEM M1) | 1 evaluation | jumps out of a wrong mode |
+| `isample_imh` | independence draw from the subject's Laplace approximation, refreshed every `saem_imh_refresh` iterations, during exploration only (f-SAEM, [below](#saem-imh)) | 1 evaluation | near-independent draws on data-rich subjects; outside its scope it runs as `m1` |
+| `isample_m1b` | independence draw from the chain's running conditional moments (NONMEM M1B) | 1 evaluation | the same, from the chain's own history |
+| `isample_m2` | block random walk η + s·chol(Ω)·z (NONMEM M2) | 1 evaluation | NONMEM's local move |
+| `isample_m3` | componentwise sweeps, one η at a time (NONMEM M3) | n_η evaluations | coordinates the other moves neglect |
+
+`saem_kernel` is a preset: it fills in every count you did not set, and a count you set overrides it.
+
+| `saem_kernel` | counts |
+|---|---|
+| `hmc` (default) | `hmc 1, imh 1` (`hmc 1, m1 1` outside f-SAEM's scope) |
+| `nonmem` | `m1 2, m1b 2, m2 2, m3 2` — NONMEM's own kernels ([NONMEM's kernels](#nonmem-kernels)) |
+| `nuts` | `nuts 1, imh 1` (likewise) |
+| `mala` | `mala 3, imh 1` (likewise) |
+| `rw`, `imh` | the earlier random-walk and f-SAEM kernels, unchanged; the `isample_*` counts do not apply |
+
+Neither NONMEM nor Monolix runs a gradient kernel inside SAEM: NONMEM's NUTS is a separate full-Bayesian method (`$EST METHOD=NUTS`), and both tools' SAEM E-steps are Metropolis–Hastings kernels set by counts (NONMEM's `ISAMPLE_M1/M1B/M2/M3`, Monolix's m₁…m₄), the convention these counts follow. The default `hmc` targets the same conditional posterior, so SAEM aims at the same estimate. No two implementations reproduce each other's Monte Carlo runs (their random streams differ), so a comparison with NONMEM is of estimates, not iterations; `saem_kernel = nonmem` runs NONMEM's own kernels, the closest algorithmic match.
+
+So `saem_kernel = hmc` with `isample_m3 = 1` adds a componentwise sweep after HMC, `isample_imh = 0` drops its jump, and `isample_hmc = 1` alone adds HMC to NONMEM's four kernels. The fit reports what ran — `saem_kernels: "hmc 1, imh 1"` in `-fit.yaml`, `FitResult::saem_kernels` — and refuses a schedule with every count at 0.
+
+### Gradient kernels {#gradient-kernels}
+
+`hmc`, `nuts` and `mala` move a chain along the exact gradient of its subject's conditional log-density, `−log p(y_i, η_i)` (the same function every other kernel scores with), from the AD engine: the subject's compiled plan, the value from the same pass. Under IOV the move is joint over η and every occasion's κ. A chain the engine gives no gradient for runs two `m2` and two `m3` moves in their place that iteration; if it gives none at all, the fit says so.
+
+Both are preconditioned: the mass matrix is the inverse of the chain's running conditional covariance (its moments from the tenth draw after the Ω burn-in; under IOV the stacked `[η, κ]` moments), so in the integrator's coordinates a near-Gaussian posterior is close to N(0, I). Before a chain has those draws the metric is Ω's own factor. That is deliberate: a metric fitted to the posterior from the start (the Fisher information at η = 0) measured *worse* — the chains settle at once, the exploration stop fires early (two_cpt_oral_cov K1 295 against 455), and that model's V1–KA trap returned on 4 of 20 seeds. HMC integrates for about π/2 in those coordinates (jittered ±20 %), exactly: `n = ⌈T/ε⌉` steps of `T/n`, a nearly independent draw in two or three leapfrog steps (stepping the adapted ε instead overshoots T by up to a step: measured 2.18 against 1.97 steps per transition and ~7 % more CPU on pk2s at the same −2LL); NUTS is Stan's multinomial No-U-Turn sampler to depth 5. The step size is adapted per chain towards an acceptance of 0.8 during exploration and frozen for the averaging phase. MALA is one leapfrog step from a fresh momentum — the Langevin proposal η′ = η − ½ε²·M⁻¹∇U(η) + ε·Lξ under the same metric, accepted with its Metropolis–Hastings ratio — with a step size of its own, adapted towards 0.574 (the optimal MALA acceptance, Roberts & Rosenthal 1998). Consecutive HMC and MALA transitions carry the gradient at the chain's state from one to the next, and the proposal's value comes from its gradient's pass (with IOV too, for a plain Gaussian residual), so a MALA transition costs one AD pass. Unit tests check all three kernels against the exact conditional moments, by quadrature, on a nonlinear model and on the joint IOV posterior, under the exact and a mis-scaled metric.
+
+`FitResult::saem_gradient_kernel` (and `-fit.yaml`) reports the transitions run and declined, the divergences in the averaging phase, the mean leapfrog steps, the averaging phase's mean acceptance and the median step size; a warning names more than 1 % divergences there, a mean acceptance below 0.6, or a step size at its floor.
+
+Measured against `nonmem` (the automatic stop, 1000 averaging iterations, two chains; gap = importance-sampled −2 log L above the reference):
+
+| | `nonmem` | `hmc` |
+|---|---|---|
+| `two_cpt_oral_cov`, 20 seeds at the optimum | 10 (8 in the V1–KA trap) | **20** (none) |
+| pk2_big stand-in, mean gap (5 seeds) | +0.20 (sd 0.19) | **−0.09** (sd 0.11) |
+| `warfarin_iov_saem`, mean gap (5 seeds) | +0.19 (sd 0.14) | **+0.02** (sd 0.01) |
+| CPU per fit, pk2s | 27.3 s | **23.8 s** |
+
+On `two_cpt_oral_cov` the subjects' posteriors are correlated along the V1–KA direction, which the random walks follow poorly; the drawn ηs then pull Ω and θ toward the trade-off mode. The preset's independence jump (f-SAEM's proposal, or M1 under IOV) ties HMC alone on `two_cpt_oral_cov` and pk2s and is what brings `warfarin_iov_saem` from +0.09 to +0.02. One chain instead of two halves the cost but failed a pk2s seed (+4.6, exploration at its maximum), and a shorter averaging phase loses ~0.02–0.03 per halving on every model while saving little where exploration dominates, so both stay as NONMEM has them. NUTS reaches HMC's quality on `two_cpt_oral_cov` at ~25 % more CPU. MALA (`saem_kernel = mala`, `mala 3, imh 1`) ties HMC: `two_cpt_oral_cov` 20 / 20 seeds at its optimum in 1.9 against 1.8 s, `warfarin_iov_saem` +0.02 in 1.6 against 1.5 s, and the pk2_big stand-in −0.05 against −0.09 (within seed noise) in **21.9 against 26.3 s** (median of five seeds; its exploration stop fires sooner, K1 1640 against 2360). `mala 1` is cheaper still but mixes too little: pk2s +0.37 and `warfarin_iov_saem` +0.21, one seed of five off its optimum on each; `mala 5` costs more for nothing (pk2s 36.6 s). So the preset runs three. An η-only move on the IOV model, κ left to its own random walk, was worse than `nonmem` (+0.50): the joint move matters. Reverse mode over the compiled plan gave the same gradient to 1e-15 but was ~7 % slower at these 2–5 random effects, so the forward jets stay.
+
+### Chains {#chains}
+
+`n_chains` (default **2**, NONMEM's `ISAMPLE=2`) independent η chains are run per subject. Each SAEM iteration draws one η per chain, and the sufficient statistics and the M-step use all of them, which lowers the Monte Carlo noise of every iteration. It is implemented the way Monolix describes its chains — the data set is replicated `n_chains` times for the SAEM iterations (chain 1 keeps the subjects' own random streams), and the final EBEs, OFV and covariance step use the original subjects. (Monolix's own default is to add chains until at least 50 subjects are sampled, `minIndivForChains = 50`.) With the automatic exploration stop and 1000 averaging iterations, two chains against one (measured on the base before main's hashed streams): pk2_big stand-in +1.22 → **+0.73** (mean gap, 10 seeds; sd 0.51 → 0.28), `warfarin_iov_saem` (10 subjects) +0.42 → **+0.11** (sd 0.56 → 0.10). A second chain costs ~1.9× per iteration: the copies are registered with the fit's kernel-JIT scope, so their plan keys are read by address rather than re-hashed per likelihood evaluation (unregistered, they cost 2.5–3×). On `two_cpt_oral_cov` two chains ended a little more often in a ridge region around $\omega^2_{V1}$ ≈ 0.15 (about +2, against the optimum's 0.11; importance-sampled estimation started there walks back to the optimum) — both chain counts reach it and the deeper V1–KA trap on some seeds, so it is a property of that surface, not of the chains: one chain on the data set duplicated is bit-for-bit the two-chain fit. Set `n_chains = 1` for the single-chain SAEM.
+
+### The exploration stop {#exploration-stop}
+
+The convergence phase *freezes* whatever the exploration phase reached: with $a = 1$ the averaging weight of iteration $K_1 + 1$ is 1 and the weights then decay, so a parameter that is still moving at $K_1$ is pinned near where it was. Weakly identified Ω entries are the ones that move slowly: under the exploration cap on the Ω step ($\gamma^\Omega \le 0.1$) a variance component whose optimum is far below its start decays over hundreds of iterations. On the 5-η, 9-θ `pk2_big` benchmark the fixed 150 iterations ended while $\omega^2_Q$ was still at 0.019 (optimum ≈ 0.003), and the importance-sampled −2 log L stayed 10.6 above the optimum (median of 5 seeds); a longer averaging phase barely helps, a longer *exploration* does.
+
+Monolix ends exploration by an automatic stop (on by default) between a minimum of 150 and a maximum of 500 iterations; the minimum is also "the interval length over which the auto-stop criteria are tested", and the criterion watches the stability of the convergence indicator (the complete-data log-likelihood), the Ω parameters and the error-model parameters — the test itself is not published. NONMEM's termination test (Users Guide 7.5.1, §I.46) is opt-in: `CTYPE=0`, the default, runs the whole `NBURN` (default 1000). With `CTYPE` = 1–3 it regresses each monitored quantity (objective, θ, σ; Ω diagonals from `CTYPE=2`, all of Ω at `3`) on the iteration number over the latest `CITER = 10` iterates spaced `CINTERVAL` apart and ends burn-in when no slope is significant at `CALPHA`. The guide stresses the spacing — consecutive SAEM iterates "can be highly correlated", so it advises `CINTERVAL` 10–100, and `CINTERVAL=0` lets NONMEM pick it; `AUTO=1` sets `CTYPE=3 NBURN=4000 CINTERVAL=0 CALPHA=0.05`; and it warns that the test "can often be very conservative", recommending `CALPHA` 0.01 and a large `NBURN`. ferx runs NONMEM's test, `CTYPE=3`, with the interval chosen per coordinate from its autocorrelation.
+
+#### The rule {#exploration-stop-rule}
+
+- **Tracked coordinates.** The complete-data −log L $\sum_i -\log p(y_i, \eta_i;\theta,\Omega,\sigma)$ at the current draws (the `condNLL` that `verbose` prints), θ, log Ω<sub>jj</sub>, the correlations $\Omega_{jk}/\sqrt{\Omega_{jj}\Omega_{kk}}$ (and the same for Ω<sub>IOV</sub>), and log σ. A fixed parameter or structural zero is constant and cannot drift.
+- **Test.** For each coordinate, its latest ten iterates spaced `c` apart (NONMEM `CITER=10`, `CINTERVAL=c`) are regressed on the iteration number, and the slope is tested against zero with a Student t (8 degrees of freedom, two-sided 5 %, NONMEM `CALPHA=0.05` as under `AUTO=1`). The spacing `c` is the coordinate's integrated autocorrelation time (Geyer initial-positive sequence, on the linearly detrended series after the 20 burn-in iterations), clamped to 10–50, so the ten points are close to independent. A coordinate whose series is still shorter than `10 × c` is not yet testable and blocks the stop. The test runs every 10 iterations.
+- **Why the spacing.** An earlier version of this rule tested five 20-iteration batch means over the trailing 100 iterations. Traced long runs showed integrated autocorrelation times of ~35 iterations at the median and 90–170 at the 90th percentile, so those batches were far from independent: on the stationary tail of the traces each coordinate was flagged 12–23 % of the time against a nominal 5 %, and the rule stopped when, by chance, every coordinate passed in the same window (on the pk2_big stand-in below, ω²<sub>Q</sub> was still 40–90 % above its plateau at the stop). Calibration of the spaced test on simulated AR(1) noise, 2000 iterations: false-trend rate 6.8 % / 6.5 % / 11.3 % at lag-1 correlation 0 / 0.9 / 0.97 (nominal 5 %).
+- **Rule.** Exploration ends at the first check ≥ `n_exploration_min` at which every tracked coordinate is testable and none trends, and never later than `n_exploration_max`. The shortest test window is 100 iterations (ten points at spacing 10), the longest 500; an `n_exploration_max` below 100 can never be tested and the fit warns.
+- **The Ω exploration step cap is kept.** Removing it alone made the E-step unstable in the investigation that led here; with the automatic stop the cap only slows the decay, and the stop waits for it.
+- **Precedence.** `n_exploration` present in the model file (or `saem_n_exploration = Some(n)` in code) is a *fixed* length: `n_exploration_min` / `n_exploration_max` are ignored, no test runs. Absent, the stop is automatic.
+- **Reporting.** The length used is `saem_n_exploration` in `-fit.yaml` (`FitResult::saem_n_exploration_used`; `verbose` prints it). If the maximum is reached before every coordinate was shown stationary, a warning says so and names them (still drifting, or too few iterations to test at their autocorrelation; for example `OMEGA(ETA_Q)`) — raise `n_exploration_max` and compare.
+
+#### Measured {#exploration-stop-measured}
+
+A public stand-in for `pk2_big` (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples), the `warfarin_iov_saem` example (10 subjects) and the 5-η `two_cpt_oral_cov` example (30 subjects); `--threads 2`, gap = importance-sampled −2 log L (3000 samples) above the best value reached — for the stand-in, an IMP estimate started from FOCEI (−4802.85, $\omega^2_Q$ 0.0057). Mean gap over seeds:
+
+Measured on ferx with these defaults merged onto main (hashed SAEM streams, `mstep_optimizer = auto`):
+
+| set (seeds) | old default: 150 + 250, 1 chain | **default: automatic + 1000, 2 chains** | K1 (default) | CPU / fit: old → default |
+|---|---|---|---|---|
+| pk2s (10) | +4.63 (sd 1.06) | **+0.18** (sd 0.19) | 1300–4000 (2 seeds reach the maximum and warn) | 6.1 → 28.9 s |
+| wiov (5) | +0.82 (sd 0.50) | **+0.14** (sd 0.12) | 540–580 | 1.0 → 2.7 s |
+| two_cpt_oral_cov (20) | 10 / 20 within 0.5 of the optimum, 9 / 20 in the V1–KA trap (> +5) | 7 / 20 within 0.5, 12 / 20 in the trap | 490–890 | 0.8 → 3.1 s |
+
+`two_cpt_oral_cov` ends in a V1–KA trade-off mode on about half the seeds under either schedule; the difference between the two (3 seeds of 20) is within binomial noise, but leans the way two chains' lower per-iteration noise would suggest (less of the wandering that lets a single chain leave the ridge). On the earlier base, one chain against two at the new schedule measured +1.22 → +0.73 on pk2s and +0.42 → +0.11 on wiov.
+
+Fixed exploration lengths, measured with 250 averaging iterations on the stand-in (15 seeds, median gap): 150 → +5.17, 500 → +2.00, 1500 → +1.97; the 100-iteration batch-means rule this replaces, +3.00.
+
+#### Maximum and smoothing exponent {#exploration-stop-max}
+
+**Maximum.** 4000, NONMEM's `NBURN` under `AUTO=1`. The stand-in stopped at 1300–4000 with two chains (2 of 10 seeds at the maximum, with the warning naming what still drifted); the longest test window is 500, so a maximum near 500 would turn the rule into a fixed length for any coordinate with an autocorrelation time of 50 or more.
+
+**Smoothing exponent.** `smoothing_exponent = 0.7` (Monolix's $\gamma_k = 1/(k-K_1)^{0.7}$) was measured with the earlier 150–500 rule and is *not* the default, because it was worse on an easy model: wiov +0.08 → +0.45 (median gap), pk1 +0.04 → +0.05, pk1_sparse +2.53 → +2.91, against pk2_big +2.94 → +2.54 and corr +0.16 → +0.11. The option is there for users who want it.
+
+**Annealing instead of the Ω step cap.** Monolix keeps the variances large early with *simulated annealing* — each variance may fall by at most 5 % per iteration, $\Omega_{jj,k} \ge 0.95\,\Omega_{jj,k-1}$ — rather than ferx's damped Ω step ($\gamma^\Omega \le 0.1$), which slows every Ω move tenfold. Replacing the cap with that rule (full γ for the Ω statistic in exploration, decrease bounded at 0.95, correlations kept) was measured with the automatic stop and is *not* adopted. On a public pk2_big stand-in (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples; 15 seeds; gap against an IMP estimate, −2 log L −4802.85, MC SE 0.37) the median gap was +3.12 (range 0.99–6.08) against +3.00 (1.23–4.20) with the cap, and +5.17 for the old fixed 150. On the 5-η `two_cpt_oral_cov` example it sent two of five seeds into a worse basin (+18, +16) that the capped runs avoided. (Measured with the earlier 100-iteration rule.)
 
 ## Per-Iteration Steps
 
@@ -327,7 +436,7 @@ $$
 
 with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator $(1/N) \sum_i \eta_i \eta_i^T$ is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration's MH proposal Cholesky and Ω drifts toward rank-deficiency. Free diagonals are then floored at `1e-6` to keep them away from zero (which would collapse the per-eta proposal scale `δ·chol(Ω)`); this floor does not by itself guarantee positive-definiteness of a full block Ω.
 
-**Burn-in.** This M-step is suppressed for the first `omega_burnin` iterations (default 20, clamped to `n_exploration`): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is $\delta_i \cdot \mathrm{chol}(\Omega)$, so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only `n_mh_steps` proposals) produces a tiny $(1/N) \sum_i \eta_i \eta_i^T$; with $\gamma_1 = 1$ the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic $S_2$ is still refreshed each burn-in iteration (at the damped rate $\gamma_k^\Omega$, so it is a running average of the warming chain), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set `omega_burnin = 0` to disable the burn-in; note that the damped Ω step above now also guards this cold-start collapse on its own (it is a strict generalisation — continuous rather than for the first `omega_burnin` iterations only), so disabling the burn-in no longer reproduces the collapse by itself.
+**Burn-in.** This M-step is suppressed for the first `omega_burnin` iterations (default 20, clamped to the exploration length — `n_exploration_min` under the automatic stop): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is $\delta_i \cdot \mathrm{chol}(\Omega)$, so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only `n_mh_steps` proposals) produces a tiny $(1/N) \sum_i \eta_i \eta_i^T$; with $\gamma_1 = 1$ the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic $S_2$ is still refreshed each burn-in iteration (at the damped rate $\gamma_k^\Omega$, so it is a running average of the warming chain), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set `omega_burnin = 0` to disable the burn-in; note that the damped Ω step above now also guards this cold-start collapse on its own (it is a strict generalisation — continuous rather than for the first `omega_burnin` iterations only), so disabling the burn-in no longer reproduces the collapse by itself.
 
 ### 4. M-Step for Theta and Sigma (Optimization) {#4-m-step-for-theta-and-sigma-optimization}
 
@@ -446,7 +555,9 @@ $$
 \hat\theta = \arg\min_\theta \; \sum_i \tfrac12\,(\phi_i - g(A_i(\theta)))^\top \Omega^{-1} (\phi_i - g(A_i(\theta))) \;+\; \sum_i -\log p(y_i \mid \phi_i, \theta)
 $$
 
-with $A_i$ the eta-free typical value at subject $i$'s covariates and $g$ the link (`log` or the logit-scale identity). The data term drops out — and the step is an exact nonlinear least-squares fit (Gauss–Newton) — when three things hold: every covariate the value reads is **constant within each subject**, no estimated theta of the group is read **anywhere else in the model**, and no *other* individual parameter reads the group's **eta**. Otherwise the term stays live and the sum is minimised numerically (BOBYQA), still in the $\phi$-frozen coordinates. A covariate that **varies within a subject** leaves a $\theta$-dependence through the within-subject ratio $A_i(t)/A_i(t_0)$; a theta the model reuses — `CL = (TVCL + TH_X*WT) * exp(ETA_CL)` alongside `V = TVV + TH_X` — leaves one through that other parameter, since preserving $\phi_{CL}$ pins `CL` but not `V`; an eta the model reuses — the same `CL` alongside `V = TVV * exp(0.5*ETA_CL)` — leaves one through the re-centring, which holds $\phi_{CL}$ fixed but moves `V`. ferx detects both kinds of reuse and says so in a fit warning naming the theta or the eta. The new estimate is blended with the same SA step $\gamma_k$ as the single-anchor shift, and each η is re-centred by the change in its own mu so $\phi_i$ is unchanged. This is NONMEM's `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` — a MU that is nonlinear in THETA — done automatically.
+with $A_i$ the eta-free typical value at subject $i$'s covariates and $g$ the link (`log` or the logit-scale identity). The data term drops out — and the step is an exact nonlinear least-squares fit (Gauss–Newton) — when three things hold: every covariate the value reads is **constant within each subject**, no estimated theta of the group is read **anywhere else in the model**, and no *other* individual parameter reads the group's **eta**. Otherwise the term stays live and the sum is minimised numerically (BOBYQA), still in the $\phi$-frozen coordinates. A covariate that **varies within a subject** leaves a $\theta$-dependence through the within-subject ratio $A_i(t)/A_i(t_0)$; a theta the model reuses — `CL = (TVCL + TH_X*WT) * exp(ETA_CL)` alongside `V = TVV + TH_X` — leaves one through that other parameter, since preserving $\phi_{CL}$ pins `CL` but not `V`; an eta the model reuses — the same `CL` alongside `V = TVV * exp(0.5*ETA_CL)` — leaves one through the re-centring, which holds $\phi_{CL}$ fixed but moves `V`. ferx detects both kinds of reuse and says so in a fit warning naming the theta or the eta. **The exact step works on SA-averaged statistics (#2986).** Each chain-subject's η is averaged with the SA step $\gamma_k$, and the average $\bar\eta$ is re-centred with the draws whenever a mu-referenced θ moves. So $\bar\phi_i = g(A_i(\theta)) + \bar\eta_i$ is the SA-averaged individual value at every θ, and the exact step fits θ to $\bar\phi$ and takes the result as is. That is SAEM's M-step on its sufficient statistics. Before, it fitted each draw and blended the solutions in packed coordinates, which averaged a log-packed exponent geometrically: measured +0.0024 on pk2_big's `B_CL` and +0.0003 on `THETA_WT`, the size the Jensen gap predicts. A numerical (data-term) step still fits the draw and blends its estimate with $\gamma_k$. Each η is re-centred by the change in its own mu, so $\phi_i$ is unchanged.
+
+**When the mu is affine in mixed coordinates,** the exact step is one least-squares solve (#2986). The mixed coordinates are `log θ` for a multiplicative scale and θ for an exponent or slope, as in `log(TVCL·(WT/70)^B_WT)` = `log TVCL + B_WT·log(WT/70)`. The design matrix is fixed, because the covariates are, so Levenberg–Marquardt's iterations collapse to one solve. Affinity is detected once per fit from the exact gradient at several θ points, and every solution is checked against the mu, falling back to the iterative solve if they disagree. Measured: the covariate M-step fell from 8 % to 1.8 % of a pk2_big stand-in fit. This is NONMEM's `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` — a MU that is nonlinear in THETA — done automatically.
 
 ##### Typical values that share a theta
 
@@ -536,6 +647,15 @@ recording of the predictions:
 All three solve the same problem — same objective, packed space, bounds and tolerance — so
 they move to the same optimum; they are not a different estimator. An explicit `newton` on
 a model outside its scope still warns and runs `bobyqa`; `auto` does not.
+
+Newton's scope includes a residual magnitude that reads no θ (#3064): `weight = SE`, the MBMA
+weighting, is a per-observation constant, so the expected information keeps its closed form
+(checked against the observed Hessian on paired residuals). Before, every magnitude was
+excluded, and since BOBYQA runs to tolerance an SE-weighted MBMA fit paid for it in full. On
+the naproxen MBMA data written in the `weight = WPSE` form (7 θ, 5 seeds), SAEM takes 0.76 s
+with Newton against 7.0 s with BOBYQA, at the same objective within seed noise (mean
+−172.78 against −173.04 on the FOCEI scale). A magnitude that reads a θ, such as
+`σ·(1 + THETA·X)`, moves the variance directly and stays outside the scope.
 
 ##### Budget and scope {#saem-mstep-optimizer-budget}
 
@@ -641,19 +761,24 @@ estimates, so a negative difference is a better fit.
 | `pk1_nomu` (5 seeds) | 5 | 0.68 | −1.5 to +2.9 |
 | `imp_non_mu_ref` (IMP) | 14 θ | 0.23 | −1.5, −2.6 |
 | IMPMAP, σ only (3 models) | 1 | 0.39 to 0.54 | 0.000 |
-| SAEM, σ only (14 models) | 0 to 1 | 1.00 (`auto` is `bobyqa` there: the BOBYQA fit) | 0.000 |
+| SAEM, σ only (14 models) | 0 to 1 | 1.00 to 1.07 | 0.000 |
 | SAEM, 2 θ on an ODE model (`frac_ode`) | 3 | 1.14 | within ±1.3 |
 
 The gain on the multi-θ models is mostly BOBYQA's old budget, not Newton: BOBYQA spends
 `2n + 1` evaluations on its first design, so on nine numerical θ nearly every M-step stopped
 on the budget far from the maximiser. Run to its tolerance (explicit `bobyqa` now) it
 reaches the same −2 log L (−3501 against Newton's −3502 on a nine-θ model); Newton gets there in 0.5 to 0.7 times the instructions. Where
-the M-step is σ only, BOBYQA's solve is already served by the prediction memo and Newton's
-fused value-score-information pass is the extra work (0 to 7 percent more instructions on 14
-SAEM models, two seeds each), so SAEM's `auto` keeps `bobyqa` there and the fit is the
-BOBYQA fit: identical estimates and instructions to `mstep_optimizer = bobyqa`. IMP and
-IMPMAP keep `newton` for σ-only solves, where BOBYQA has no memo and Newton's is the gain
-(0.39 to 0.54 times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
+the M-step is σ only (a combined error with every θ mu-referenced), both solves are served by
+the prediction memo — one prediction pass per M-step — and Newton's σ score and information
+are residual arithmetic on it, no recording: the same cost per iteration (0 to 7 percent more
+instructions on 14 SAEM models; 7.21 against 7.28 ms per iteration on the pk2_big stand-in).
+But Newton's exact σ follows each draw's noise, where the warm-started BOBYQA, stopping at its
+tolerance, smooths it, and the automatic exploration stop then fires later: on 30 pk2_big
+seeds K1 had a median of 2110 against 1805 (longer on 18 seeds, shorter on 8), about 10 percent
+more CPU at the same −2 log L. `auto` runs `newton` there anyway (#2986: the exact optimum by
+Fisher scoring, the same rule as everywhere else); `mstep_optimizer = bobyqa` restores the
+derivative-free solve and its earlier stop. Under IMP and IMPMAP, where BOBYQA has no memo,
+Newton's σ-only solve is the gain (0.39 to 0.54 times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
 with two θ that have no η, costs 1.14 times BOBYQA's instructions there.
 
 Newton's M-step is as exact as BOBYQA's at the same tolerance. On `pk1_nomu`, `pk2_big`,
@@ -838,7 +963,8 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
 Both are restricted to the plain Gaussian residual scope the expected
 information has a closed form on: no IOV, no [mixture](mixture.qmd), no M3, no
 time-to-event endpoint, no `block_sigma` residual correlation, no
-`[covariate_nn]` θ, no residual magnitude. FREM is in scope since #1421, which
+`[covariate_nn]` θ, no residual magnitude that reads a θ. A θ-free magnitude (`weight = SE`, the
+MBMA form) is a per-observation constant and is in scope since #3064. FREM is in scope since #1421, which
 fixed the σ score of its covariate pseudo-observations. A model outside it keeps
 the historical solver and says so by name in the fit's warnings.
 
@@ -1845,8 +1971,12 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 ```
 [fit_options]
   method        = saem
-  n_exploration = 150      # Phase 1 iterations
-  n_convergence = 250      # Phase 2 iterations
+  # n_exploration = 150    # Phase 1 length; omit for the automatic stop (150..4000)
+  n_exploration_min = 150  # automatic stop only
+  n_exploration_max = 4000 # automatic stop only
+  smoothing_exponent = 1.0 # Phase 2 step 1/(k-K1)^a
+  n_convergence = 1000     # Phase 2 iterations
+  n_chains      = 2        # eta chains per subject (NONMEM ISAMPLE)
   n_mh_steps    = auto     # block-MH steps/subject/iteration, or `auto` (see above)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency (interval rule)
@@ -1866,7 +1996,7 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 
 ### Not Converging
 
-- Increase `n_exploration` (e.g., 300) to give more time for basin finding
+- If the fit warns that exploration reached its maximum, raise `n_exploration_max` (e.g., 4000, NONMEM's `AUTO` value); to force a length instead, set `n_exploration` (e.g., 500)
 - Increase `n_convergence` (e.g., 500) for a longer averaging window
 - Raise `n_mh_steps` above what `auto` resolves to (e.g. 30-50) for better
   mixing in the E-step on hard surfaces. The rule caps at 20, the count

@@ -236,7 +236,7 @@ fn imp_after_saem_populates_field() {
     // Iterations are floored to the minimum SAEM accepts; convergence quality
     // is not being tested.
     let (model, population, mut opts) = warfarin_setup();
-    opts.saem_n_exploration = 5;
+    opts.saem_n_exploration = Some(5);
     opts.saem_n_convergence = 5;
     opts.saem_n_mh_steps = 2;
     opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Imp];

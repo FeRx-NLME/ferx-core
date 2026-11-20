@@ -1101,12 +1101,16 @@ fn information_scope_gap(model: &CompiledModel) -> Option<&'static str> {
     if !model.covariate_nns.is_empty() {
         return Some("the model has a `[covariate_nn]` block");
     }
-    if model.has_custom_ruv_magnitude() {
-        return Some("the residual error carries a magnitude term");
+    // A θ-free magnitude (`weight = SE`, the MBMA form) is a per-observation constant, and the
+    // information stays exact (#3064).
+    if model.ruv_magnitude_reads_theta() {
+        return Some("the residual error carries a magnitude term that reads a θ");
     }
     None
 }
 
+/// Returns the realised change, so a caller can re-centre other η sets with it.
+///
 /// One mu-referenced θ's closed-form SAEM shift: moves the packed θ by `γ·mean(η)` on its
 /// mu scale, clamped to its packed `bounds`, then re-centres every η — the current draw and
 /// the extra draws — by the change it **realised**. Not by `γ·mean(η)`: when the clamp bites
@@ -1118,7 +1122,7 @@ fn information_scope_gap(model: &CompiledModel) -> Option<&'static str> {
 fn closed_form_mu_shift(
     packed: &mut f64, bounds: (f64, f64), packs_log: bool, additive: bool, gamma: f64,
     etas: &mut [Vec<f64>], extra_eta_draws: &mut [Vec<Vec<f64>>], eta_idx: usize,
-) {
+) -> f64 {
     let (lo, hi) = bounds;
     let mean_eta: f64 = etas.iter().map(|e| e[eta_idx]).sum::<f64>() / etas.len() as f64;
     let before_packed = *packed;
@@ -1137,6 +1141,7 @@ fn closed_form_mu_shift(
         e[eta_idx] -= delta;
     }
     recentre_eta_draws(extra_eta_draws, eta_idx, delta);
+    delta
 }
 
 /// Apply the same re-centring a closed-form mu-reference shift makes to
@@ -1956,6 +1961,9 @@ fn saem_schedule_cache(
 pub(crate) struct MhScratch {
     nll: IndividualNllScratch,
     prep: IndividualNllPrep,
+    /// The gradient kernels' per-observation sensitivity rows, reused across subjects and
+    /// iterations by this worker (#2986).
+    obs_grads: Vec<crate::sens::provider::ObsGrad>,
     z: DVector<f64>,
     perturbation: DVector<f64>,
     eta_prop: Vec<f64>,
@@ -1966,6 +1974,7 @@ impl Default for MhScratch {
         Self {
             nll: IndividualNllScratch::default(),
             prep: IndividualNllPrep::default(),
+            obs_grads: Vec::new(),
             z: DVector::zeros(0),
             perturbation: DVector::zeros(0),
             eta_prop: Vec::new(),
@@ -2123,7 +2132,7 @@ pub(crate) fn mh_steps_with_proposal(
     let mut n_accepted = 0;
     // Split borrow: `perturbation.gemm(.., z, ..)` needs two fields of the
     // scratch at once, and `individual_nll_prepared` needs two more.
-    let MhScratch { nll: nll_scratch, prep, z, perturbation, eta_prop } = scratch;
+    let MhScratch { nll: nll_scratch, prep, z, perturbation, eta_prop, .. } = scratch;
 
     for _ in 0..n_steps {
         for slot in z.iter_mut() {
@@ -2182,6 +2191,772 @@ pub(crate) fn mh_steps_with_proposal(
 
     (n_accepted, nll)
 }
+
+/// Independence Metropolis–Hastings from a Gaussian proposal `N(mean, L·Lᵀ)` — NONMEM's
+/// SAEM kernels 1 (`mean = 0`, `L = chol(Ω)`: the population density) and 1B (the subject's
+/// running conditional mean and covariance), #2986. The proposal does not depend on the
+/// current η, so the acceptance carries its density: `log α = (nll − nll′) + (log q(η) −
+/// log q(η′))`, with `nll` the individual NLL including the η prior. Under kernel 1 the
+/// proposal is the prior, which cancels and leaves the data likelihood ratio. A factor with a
+/// non-positive diagonal (a degenerate covariance) runs no proposals. Returns
+/// `(n_accepted, updated_nll)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn independence_steps(
+    eta: &mut [f64], nll_current: f64, mean: &[f64], l: &DMatrix<f64>, subject: &Subject,
+    model: &CompiledModel, theta: &[f64], omega: &OmegaMatrix, sigma_values: &[f64],
+    rng: &mut impl Rng, n_steps: usize, scratch: &mut MhScratch,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, f64) {
+    let n_eta = eta.len();
+    if n_steps == 0 || (0..n_eta).any(|j| !(l[(j, j)] > 0.0)) {
+        return (0, nll_current);
+    }
+    // −½‖L⁻¹(x − mean)‖², by forward substitution (the shared −½log|LLᵀ| cancels).
+    let log_q = |x: &[f64]| -> f64 {
+        let mut w = [0.0_f64; 16];
+        let mut heap;
+        let w: &mut [f64] = if n_eta <= w.len() {
+            &mut w[..n_eta]
+        } else {
+            heap = vec![0.0_f64; n_eta];
+            &mut heap
+        };
+        let mut ss = 0.0;
+        for i in 0..n_eta {
+            let mut v = x[i] - mean[i];
+            for j in 0..i {
+                v -= l[(i, j)] * w[j];
+            }
+            w[i] = v / l[(i, i)];
+            ss += w[i] * w[i];
+        }
+        -0.5 * ss
+    };
+    let MhScratch { nll: nll_scratch, prep, z, perturbation, eta_prop, .. } = scratch;
+    let mut nll = nll_current;
+    let mut log_q_cur = log_q(eta);
+    let mut n_accepted = 0;
+    for _ in 0..n_steps {
+        for slot in z.iter_mut() {
+            *slot = rng.sample(StandardNormal);
+        }
+        cholesky_perturbation_into(l, z, perturbation);
+        for j in 0..n_eta {
+            eta_prop[j] = mean[j] + perturbation[j];
+        }
+        // The same two evaluation arms as the random walk (IOV needs the per-occasion
+        // `[η, κ_k]` predictions; see `mh_steps_with_proposal`).
+        let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
+            individual_nll_iov_with_scratch_and_schedule(
+                model,
+                subject,
+                theta,
+                eta_prop,
+                kappas,
+                omega,
+                Some(omega_iov),
+                sigma_values,
+                &mut nll_scratch.pk,
+                schedule,
+            )
+        } else {
+            individual_nll_prepared(
+                model,
+                subject,
+                theta,
+                eta_prop,
+                omega,
+                sigma_values,
+                prep,
+                schedule,
+                nll_scratch,
+            )
+        };
+        let log_q_prop = log_q(eta_prop);
+        let log_alpha = (nll - nll_prop) + (log_q_cur - log_q_prop);
+        let log_u: f64 = rng.random::<f64>().ln();
+        if log_alpha.is_finite() && log_u < log_alpha {
+            eta.copy_from_slice(eta_prop);
+            nll = nll_prop;
+            log_q_cur = log_q_prop;
+            n_accepted += 1;
+        }
+    }
+    (n_accepted, nll)
+}
+
+/// `saem_kernel = hmc` (#2986): the integration time of one transition, before jitter — a
+/// quarter period of the whitened Gaussian's flow, where a draw is independent of its start.
+const HMC_TIME: f64 = std::f64::consts::FRAC_PI_2;
+/// Leapfrog steps of one HMC transition at most.
+const HMC_MAX_LEAPFROG: usize = 8;
+/// `saem_kernel = nuts`: the deepest tree (`2^5 − 1 = 31` leapfrog steps at most).
+const NUTS_MAX_DEPTH: usize = 5;
+/// An energy error above this is a divergence (Stan's `Δ_max`).
+const NUTS_MAX_DELTA_H: f64 = 1000.0;
+/// A chain's step size in whitened coordinates: start, bounds (leapfrog is unstable on a unit
+/// Gaussian beyond 2), adaptation target and gain.
+const HMC_EPS_INIT: f64 = 0.5;
+const HMC_EPS_LO: f64 = 0.02;
+const HMC_EPS_HI: f64 = 1.9;
+const HMC_TARGET_ACCEPT: f64 = 0.8;
+/// `isample_mala`: MALA's own step size adapts towards the acceptance rate that is optimal for
+/// it (0.574, Roberts & Rosenthal 1998) — one leapfrog step accepts more often than a
+/// trajectory at the same step size, so it gets a step size of its own.
+const MALA_TARGET_ACCEPT: f64 = 0.574;
+const HMC_EPS_GAIN: f64 = 0.1;
+
+/// A subject's η potential `U(η) = NLL(η)` (κ held at the chain's draw) and its gradient from
+/// the AD engine, for the gradient kernels (`saem_kernel = hmc | nuts`, #2986). Built once per
+/// transition: everything the gradient needs that does not depend on η — the prepared residual
+/// dispatch and magnitudes, the residual covariance, the IOV layout — and its buffers.
+///
+/// Without IOV the gradient and value come from one pass (value/gradient fusion,
+/// `analytic_eta_nll_value_gradient_with_schedule`); the value falls back to the native NLL
+/// where the fused pass does not score the subject. With IOV the gradient is the stacked
+/// `[η, κ₁..κ_K]` one (its η block for an η-only move), and the value comes from the same pass
+/// (`analytic_eta_nll_value_gradient_iov`) or, outside its plain-Gaussian scope, the IOV NLL
+/// every other kernel scores with. Whether
+/// a gradient exists is the engine's call: `None` from it declines the transition.
+struct EtaPotential<'a> {
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+    theta: &'a [f64],
+    omega: &'a OmegaMatrix,
+    sigma: &'a [f64],
+    schedule: Option<&'a crate::pk::event_driven::EventSchedule>,
+    kappas: Option<(&'a [Vec<f64>], &'a OmegaMatrix)>,
+    prep: &'a IndividualNllPrep,
+    nll_scratch: &'a mut IndividualNllScratch,
+    residual_cov: crate::stats::residual_error::ResidualCov<'a>,
+    recycle: &'a mut Vec<crate::sens::provider::ObsGrad>,
+    eta_work: DVector<f64>,
+    prior_work: DVector<f64>,
+    stacked: Vec<f64>,
+    /// Under IOV, whether the state is the stacked `[η, κ₁..κ_K]` (a joint move, #2986) rather
+    /// than η alone at the chain's κ; `kappa_buf` holds the κ split back out of it.
+    joint: bool,
+    n_eta: usize,
+    kappa_buf: Vec<Vec<f64>>,
+}
+
+impl<'a> EtaPotential<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model: &'a CompiledModel, subject: &'a Subject, theta: &'a [f64], omega: &'a OmegaMatrix,
+        sigma: &'a [f64], schedule: Option<&'a crate::pk::event_driven::EventSchedule>,
+        kappas: Option<(&'a [Vec<f64>], &'a OmegaMatrix)>, scratch: &'a mut MhScratch,
+        n_eta: usize, joint: bool,
+    ) -> Self {
+        let MhScratch { nll: nll_scratch, prep, obs_grads, .. } = scratch;
+        EtaPotential {
+            model,
+            subject,
+            theta,
+            omega,
+            sigma,
+            schedule,
+            kappas,
+            prep,
+            nll_scratch,
+            residual_cov: model.residual_cov_theta(theta),
+            recycle: obs_grads,
+            eta_work: DVector::zeros(n_eta),
+            prior_work: DVector::zeros(n_eta),
+            stacked: Vec::new(),
+            joint: joint && kappas.is_some(),
+            n_eta,
+            kappa_buf: kappas.map(|(k, _)| k.to_vec()).unwrap_or_default(),
+        }
+    }
+
+    /// The NLL every other kernel scores with, at the state `x` (η, or the stacked `[η, κ]` of
+    /// a joint move).
+    fn value(&mut self, x: &[f64]) -> f64 {
+        match self.kappas {
+            Some((kappas, omega_iov)) => {
+                let (eta, kappas): (&[f64], &[Vec<f64>]) = if self.joint {
+                    let mut at = self.n_eta;
+                    for k in self.kappa_buf.iter_mut() {
+                        let w = k.len();
+                        k.copy_from_slice(&x[at..at + w]);
+                        at += w;
+                    }
+                    (&x[..self.n_eta], &self.kappa_buf)
+                } else {
+                    (x, kappas)
+                };
+                individual_nll_iov_with_scratch_and_schedule(
+                    self.model,
+                    self.subject,
+                    self.theta,
+                    eta,
+                    kappas,
+                    self.omega,
+                    Some(omega_iov),
+                    self.sigma,
+                    &mut self.nll_scratch.pk,
+                    self.schedule,
+                )
+            }
+            None => individual_nll_prepared(
+                self.model,
+                self.subject,
+                self.theta,
+                x,
+                self.omega,
+                self.sigma,
+                self.prep,
+                self.schedule,
+                self.nll_scratch,
+            ),
+        }
+    }
+
+    /// `∇_η U` at `eta`, and with `want_value` also `U(eta)`: `None` where the AD engine
+    /// gives no gradient. The value is the fused pass's where it scores the subject (equal
+    /// to the native NLL within the bound `fused_value_is_the_native_objective_value` pins,
+    /// ~1e-13 relative), else [`Self::value`].
+    fn grad(&mut self, eta: &[f64], want_value: bool) -> Option<(Vec<f64>, f64)> {
+        let n = eta.len();
+        let (g, fused) = match self.kappas {
+            Some((kappas, omega_iov)) => {
+                self.stacked.clear();
+                self.stacked.extend_from_slice(eta);
+                if !self.joint {
+                    for k in kappas {
+                        self.stacked.extend_from_slice(k);
+                    }
+                }
+                let mut fused: Option<f64> = None;
+                let g = crate::estimation::inner_optimizer::analytic_eta_nll_value_gradient_iov(
+                    self.model,
+                    self.subject,
+                    self.theta,
+                    &self.stacked,
+                    self.omega,
+                    omega_iov,
+                    self.sigma,
+                    self.prep.ruv_mult(),
+                    self.recycle,
+                    want_value.then_some(&mut fused),
+                )?;
+                // The η block leads the stacked vector unless the layout compacts it (nested
+                // levels); then the engine's axes are not ours, and we take no gradient.
+                if g.len() != self.stacked.len() {
+                    return None;
+                }
+                // A joint move takes the whole stacked gradient.
+                (if self.joint { g } else { g[..n].to_vec() }, fused)
+            }
+            None => {
+                let mut fused: Option<f64> = None;
+                let g = crate::estimation::inner_optimizer::analytic_eta_nll_value_gradient_with_schedule(
+                    self.model,
+                    self.subject,
+                    self.theta,
+                    eta,
+                    self.omega,
+                    self.sigma,
+                    self.residual_cov,
+                    self.schedule,
+                    self.prep.ruv_mult(),
+                    self.prep.err_keys(),
+                    self.recycle,
+                    &mut self.eta_work,
+                    &mut self.prior_work,
+                    None,
+                    want_value.then_some(&mut fused),
+                )?;
+                (g, fused)
+            }
+        };
+        if !g.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let u = if want_value { fused.unwrap_or_else(|| self.value(eta)) } else { f64::NAN };
+        Some((g, u))
+    }
+}
+
+/// The η-gradient the post-M-step refresh left at a chain's state (#2986): the refresh scores
+/// each chain by the fused value/gradient pass, and the next E-step's first gradient
+/// transition starts from `g` instead of a fresh AD pass — if the chain is still at exactly
+/// `x` and the parameters are exactly the ones it was taken at ([`grad_memo_params`]).
+#[derive(Debug, Clone)]
+struct GradMemo {
+    x: Vec<f64>,
+    g: Vec<f64>,
+}
+
+/// The parameters an η-gradient depends on, bit for bit: θ, Ω, σ and Ω_IOV.
+fn grad_memo_params(
+    theta: &[f64], omega: &DMatrix<f64>, sigma: &[f64], omega_iov: Option<&DMatrix<f64>>,
+) -> Vec<u64> {
+    theta
+        .iter()
+        .chain(omega.iter())
+        .chain(sigma.iter())
+        .chain(omega_iov.into_iter().flat_map(|m| m.iter()))
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// The SAEM E-step's kernels as counts per chain per iteration (#2986), resolved from the
+/// `saem_kernel` preset and the `isample_*` counts the caller set (which override it). Run in
+/// this order: the gradient moves first (their first transition starts from the gradient the
+/// post-M-step refresh left at the chain's state), then the independence moves, then the local
+/// random walks. The `imh` move runs during exploration only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct KernelSchedule {
+    pub(crate) m1: usize,
+    pub(crate) imh: usize,
+    pub(crate) m1b: usize,
+    pub(crate) hmc: usize,
+    pub(crate) nuts: usize,
+    pub(crate) mala: usize,
+    pub(crate) m2: usize,
+    pub(crate) m3: usize,
+}
+
+/// `m2` and `m3` moves a chain runs in place of a gradient kernel the AD engine gives it no
+/// gradient for (NONMEM's own counts).
+const GRADIENT_FALLBACK_M2: usize = 2;
+const GRADIENT_FALLBACK_M3: usize = 2;
+
+impl KernelSchedule {
+    /// The preset's counts, then each `isample_*` the caller set. `imh_in_scope`: the f-SAEM
+    /// proposal can be built for this model; where it cannot, the `imh` count runs as `m1`.
+    /// `None` for the legacy presets `rw` and `imh`, which keep their own kernels.
+    pub(crate) fn resolve(options: &FitOptions, imh_in_scope: bool) -> Option<Self> {
+        use crate::types::SaemKernel as K;
+        let preset = match options.saem_kernel {
+            K::Nonmem => KernelSchedule { m1: 2, m1b: 2, m2: 2, m3: 2, ..Default::default() },
+            // One independence jump beside the local gradient move: the f-SAEM proposal
+            // (M1 outside its scope). Measured: equal on two_cpt_oral_cov and pk2s, better
+            // under IOV (warfarin_iov_saem +0.02 against +0.09 with HMC alone).
+            K::Hmc => KernelSchedule { imh: 1, hmc: 1, ..Default::default() },
+            K::Nuts => KernelSchedule { imh: 1, nuts: 1, ..Default::default() },
+            // A MALA transition is one leapfrog step: three of them cost about what one HMC
+            // transition does (the gradient at a chain's state carries from one to the next).
+            K::Mala => KernelSchedule { imh: 1, mala: 3, ..Default::default() },
+            K::RandomWalk | K::Imh => return None,
+        };
+        let pick = |set: Option<usize>, preset: usize| set.unwrap_or(preset);
+        let mut s = KernelSchedule {
+            m1: pick(options.saem_isample_m1, preset.m1),
+            imh: pick(options.saem_isample_imh, preset.imh),
+            m1b: pick(options.saem_isample_m1b, preset.m1b),
+            hmc: pick(options.saem_isample_hmc, preset.hmc),
+            nuts: pick(options.saem_isample_nuts, preset.nuts),
+            mala: pick(options.saem_isample_mala, preset.mala),
+            m2: pick(options.saem_isample_m2, preset.m2),
+            m3: pick(options.saem_isample_m3, preset.m3),
+        };
+        if !imh_in_scope {
+            s.m1 += s.imh;
+            s.imh = 0;
+        }
+        Some(s)
+    }
+
+    /// No kernel moves η.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.m1 + self.imh + self.m1b + self.hmc + self.nuts + self.mala + self.m2 + self.m3 == 0
+    }
+
+    /// Whether a gradient kernel runs.
+    pub(crate) fn gradient(&self) -> bool {
+        self.hmc + self.nuts + self.mala > 0
+    }
+
+    /// `m1 2, m1b 2, m2 2, m3 2`: the kernels that run, in their order.
+    pub(crate) fn describe(&self) -> String {
+        [
+            ("hmc", self.hmc),
+            ("nuts", self.nuts),
+            ("mala", self.mala),
+            ("m1", self.m1),
+            ("imh", self.imh),
+            ("m1b", self.m1b),
+            ("m2", self.m2),
+            ("m3", self.m3),
+        ]
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{k} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+/// One gradient-kernel transition's outcome: the acceptance probability (HMC) or mean
+/// acceptance statistic (NUTS) the step size adapts on, the chain's NLL after it, the leapfrog
+/// steps it took, and whether it diverged.
+#[derive(Debug, Clone, Copy)]
+struct GradStep {
+    alpha: f64,
+    nll: f64,
+    n_leapfrog: usize,
+    divergent: bool,
+}
+
+/// `η = L z` and `Lᵀ g`: the whitening of the gradient kernels.
+fn lower_mul(l: &DMatrix<f64>, z: &[f64], out: &mut [f64]) {
+    let n = z.len();
+    for i in 0..n {
+        out[i] = (0..=i).map(|j| l[(i, j)] * z[j]).sum();
+    }
+}
+fn lower_t_mul(l: &DMatrix<f64>, g: &[f64], out: &mut [f64]) {
+    let n = g.len();
+    for j in 0..n {
+        out[j] = (j..n).map(|i| l[(i, j)] * g[i]).sum();
+    }
+}
+
+/// One preconditioned HMC transition of a subject's η (`saem_kernel = hmc`, #2986): the
+/// Hamiltonian `U(η) + ½‖p‖²` in the coordinates `z = L⁻¹η` (mass matrix `(LLᵀ)⁻¹`), so
+/// `ż = p`, `ṗ = −Lᵀ∇_η U`. `L` is the lower Cholesky factor of the chain's conditional
+/// covariance. `ceil(T/eps)` leapfrog steps with `T = HMC_TIME·U(0.8, 1.2)` (the jitter keeps a
+/// fixed path length from resonating with a period), capped at `max_leapfrog`; `L + 1`
+/// gradients, the last of which also scores the endpoint. Returns `(α, nll)` — the Metropolis
+/// acceptance probability `min(1, e^{−ΔH})` the caller adapts `eps` on, and the chain's NLL
+/// after the transition — or `None` when the engine gives no gradient at the start (the caller
+/// then runs kernels 2 and 3). A gradient declined mid-trajectory rejects with `α = 0`.
+///
+/// `fixed_steps = Some(1)` is MALA (`isample_mala`): one leapfrog step from a fresh momentum is
+/// the Langevin proposal `η' = η − ½ε²·LLᵀ∇U(η) + ε·Lξ`, and the HMC acceptance
+/// `e^{−ΔH}` equals MALA's Metropolis-Hastings ratio with its asymmetric proposal density.
+///
+/// `grad_at`: the gradient at `eta` if the caller has it (the last transition's endpoint or
+/// start), updated to the gradient at the state the transition leaves — consecutive
+/// transitions then pay one gradient less each.
+#[allow(clippy::too_many_arguments)]
+fn preconditioned_hmc_step(
+    eta: &mut [f64], nll_current: f64, l: &DMatrix<f64>, eps: f64, max_leapfrog: usize,
+    fixed_steps: Option<usize>, grad_at: &mut Option<Vec<f64>>, pot: &mut EtaPotential<'_>,
+    rng: &mut impl Rng,
+) -> Option<GradStep> {
+    let n = eta.len();
+    if n == 0 || (0..n).any(|j| !(l[(j, j)] > 0.0)) || !(eps > 0.0) {
+        return None;
+    }
+    let mut eps_eff = eps;
+    let g0 = match grad_at.take().filter(|g| g.len() == n) {
+        Some(g) => g,
+        None => pot.grad(eta, false)?.0,
+    };
+    let mut lg = vec![0.0; n];
+    lower_t_mul(l, &g0, &mut lg);
+    let p0: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
+    let n_steps = match fixed_steps {
+        Some(s) => s.max(1),
+        None => {
+            let t = HMC_TIME * (0.8 + 0.4 * rng.random::<f64>());
+            let n = ((t / eps).ceil() as usize).clamp(1, max_leapfrog.max(1));
+            // Integrate for exactly `t`: `ε = t/n`, no more than the adapted step. Measured
+            // (pk2_big stand-in, 10 seeds): the same −2LL, 1.97 against 2.18 leapfrog steps
+            // per transition and ~7 % less CPU than `n` steps of the adapted `ε` (which
+            // overshoot `t` by up to one step).
+            eps_eff = t / n as f64;
+            n
+        }
+    };
+    let eps = eps_eff;
+    let mut g_end: Vec<f64> = Vec::new();
+    let mut q = eta.to_vec();
+    let mut p = p0.clone();
+    let mut lp = vec![0.0; n];
+    let mut u_end = f64::NAN;
+    for step in 0..n_steps {
+        for j in 0..n {
+            p[j] -= 0.5 * eps * lg[j];
+        }
+        lower_mul(l, &p, &mut lp);
+        for i in 0..n {
+            q[i] += eps * lp[i];
+        }
+        let Some((g, u)) = pot.grad(&q, step + 1 == n_steps) else {
+            *grad_at = Some(g0);
+            return Some(GradStep {
+                alpha: 0.0,
+                nll: nll_current,
+                n_leapfrog: step + 1,
+                divergent: true,
+            });
+        };
+        u_end = u;
+        lower_t_mul(l, &g, &mut lg);
+        for j in 0..n {
+            p[j] -= 0.5 * eps * lg[j];
+        }
+        g_end = g;
+    }
+    let kin = |v: &[f64]| 0.5 * v.iter().map(|x| x * x).sum::<f64>();
+    let delta_h = (nll_current + kin(&p0)) - (u_end + kin(&p));
+    let alpha = if delta_h.is_finite() { delta_h.min(0.0).exp() } else { 0.0 };
+    let divergent = !delta_h.is_finite() || -delta_h > NUTS_MAX_DELTA_H;
+    let nll = if rng.random::<f64>() < alpha {
+        eta.copy_from_slice(&q);
+        *grad_at = Some(g_end);
+        u_end
+    } else {
+        *grad_at = Some(g0);
+        nll_current
+    };
+    Some(GradStep { alpha, nll, n_leapfrog: n_steps, divergent })
+}
+
+/// One end of a NUTS trajectory: whitened position, momentum, whitened gradient.
+#[derive(Clone)]
+struct NutsEdge {
+    z: Vec<f64>,
+    p: Vec<f64>,
+    gz: Vec<f64>,
+}
+
+/// A NUTS subtree: its two ends, its multinomial proposal and weight, the summed momentum
+/// `ρ` the U-turn criterion reads, and the acceptance statistics the step size adapts on.
+struct NutsTree {
+    minus: NutsEdge,
+    plus: NutsEdge,
+    z_prop: Vec<f64>,
+    u_prop: f64,
+    log_w: f64,
+    rho: Vec<f64>,
+    n_leapfrog: usize,
+    sum_accept: f64,
+    /// A divergence, a declined gradient or a U-turn inside: stop building.
+    stop: bool,
+    /// A divergence or a declined gradient inside (a U-turn is not one).
+    divergent: bool,
+}
+
+fn log_add_exp(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+/// The U-turn criterion of a span with summed momentum `rho` between end momenta `p_minus`,
+/// `p_plus` (identity metric in the whitened coordinates): it turns when either end's momentum
+/// points against `rho`.
+fn nuts_turning(rho: &[f64], p_minus: &[f64], p_plus: &[f64]) -> bool {
+    let d = |a: &[f64]| a.iter().zip(rho).map(|(x, r)| x * r).sum::<f64>();
+    d(p_minus) <= 0.0 || d(p_plus) <= 0.0
+}
+
+/// A NUTS subtree of `2^depth` leapfrog steps from `edge` in direction `dir` (Stan's
+/// multinomial NUTS, Betancourt 2017): uniform-progressive sampling inside, the U-turn
+/// criterion at every merge, divergence at `ΔH > NUTS_MAX_DELTA_H`.
+#[allow(clippy::too_many_arguments)]
+fn nuts_build(
+    edge: &NutsEdge, dir: f64, depth: usize, eps: f64, h0: f64, l: &DMatrix<f64>,
+    pot: &mut EtaPotential<'_>, rng: &mut impl Rng, eta_buf: &mut [f64],
+) -> NutsTree {
+    let n = edge.z.len();
+    if depth == 0 {
+        let e = eps * dir;
+        let mut p: Vec<f64> = (0..n).map(|j| edge.p[j] - 0.5 * e * edge.gz[j]).collect();
+        let z: Vec<f64> = (0..n).map(|j| edge.z[j] + e * p[j]).collect();
+        lower_mul(l, &z, eta_buf);
+        let fail = |edge: &NutsEdge| NutsTree {
+            minus: edge.clone(),
+            plus: edge.clone(),
+            z_prop: edge.z.clone(),
+            u_prop: f64::NAN,
+            log_w: f64::NEG_INFINITY,
+            rho: vec![0.0; n],
+            n_leapfrog: 1,
+            sum_accept: 0.0,
+            stop: true,
+            divergent: true,
+        };
+        let Some((g, u)) = pot.grad(eta_buf, true) else {
+            return fail(edge);
+        };
+        let mut gz = vec![0.0; n];
+        lower_t_mul(l, &g, &mut gz);
+        for j in 0..n {
+            p[j] -= 0.5 * e * gz[j];
+        }
+        let h = u + 0.5 * p.iter().map(|x| x * x).sum::<f64>();
+        if !h.is_finite() || h - h0 > NUTS_MAX_DELTA_H {
+            return fail(edge);
+        }
+        let leaf = NutsEdge { z: z.clone(), p: p.clone(), gz };
+        return NutsTree {
+            minus: leaf.clone(),
+            plus: leaf,
+            z_prop: z,
+            u_prop: u,
+            log_w: h0 - h,
+            rho: p,
+            n_leapfrog: 1,
+            sum_accept: (h0 - h).min(0.0).exp(),
+            stop: false,
+            divergent: false,
+        };
+    }
+    let first = nuts_build(edge, dir, depth - 1, eps, h0, l, pot, rng, eta_buf);
+    if first.stop {
+        return first;
+    }
+    let from = if dir > 0.0 { &first.plus } else { &first.minus };
+    let second = nuts_build(&from.clone(), dir, depth - 1, eps, h0, l, pot, rng, eta_buf);
+    let n_leapfrog = first.n_leapfrog + second.n_leapfrog;
+    let sum_accept = first.sum_accept + second.sum_accept;
+    if second.stop {
+        return NutsTree {
+            n_leapfrog,
+            sum_accept,
+            stop: true,
+            divergent: second.divergent,
+            ..first
+        };
+    }
+    let log_w = log_add_exp(first.log_w, second.log_w);
+    // Uniform-progressive (multinomial) sampling within the subtree.
+    let take_second = rng.random::<f64>().ln() < second.log_w - log_w;
+    let rho: Vec<f64> = first.rho.iter().zip(&second.rho).map(|(a, b)| a + b).collect();
+    let (minus, plus) =
+        if dir > 0.0 { (first.minus, second.plus) } else { (second.minus, first.plus) };
+    let stop = nuts_turning(&rho, &minus.p, &plus.p);
+    let (z_prop, u_prop) =
+        if take_second { (second.z_prop, second.u_prop) } else { (first.z_prop, first.u_prop) };
+    NutsTree {
+        minus,
+        plus,
+        z_prop,
+        u_prop,
+        log_w,
+        rho,
+        n_leapfrog,
+        sum_accept,
+        stop,
+        divergent: false,
+    }
+}
+
+/// One NUTS transition of a subject's η (`saem_kernel = nuts`, #2986), in the whitened
+/// coordinates of [`preconditioned_hmc_step`]: trees doubled in a random direction until the
+/// trajectory U-turns, diverges or reaches `NUTS_MAX_DEPTH`, each new subtree's proposal taken
+/// with probability `min(1, w_new / w_old)` (biased progressive sampling). Every state's
+/// potential comes from its gradient's own pass. Returns `(mean acceptance statistic, nll)`,
+/// or `None` when the engine gives no gradient at the start.
+fn nuts_step(
+    eta: &mut [f64], nll_current: f64, l: &DMatrix<f64>, eps: f64, pot: &mut EtaPotential<'_>,
+    rng: &mut impl Rng,
+) -> Option<GradStep> {
+    let n = eta.len();
+    if n == 0 || (0..n).any(|j| !(l[(j, j)] > 0.0)) || !(eps > 0.0) {
+        return None;
+    }
+    let (g0, _) = pot.grad(eta, false)?;
+    // z₀ = L⁻¹η by forward substitution.
+    let mut z0 = vec![0.0; n];
+    for i in 0..n {
+        let mut v = eta[i];
+        for j in 0..i {
+            v -= l[(i, j)] * z0[j];
+        }
+        z0[i] = v / l[(i, i)];
+    }
+    let mut gz0 = vec![0.0; n];
+    lower_t_mul(l, &g0, &mut gz0);
+    let p0: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
+    let h0 = nll_current + 0.5 * p0.iter().map(|x| x * x).sum::<f64>();
+    let start = NutsEdge { z: z0.clone(), p: p0.clone(), gz: gz0 };
+    let mut minus = start.clone();
+    let mut plus = start;
+    let mut z_prop = z0;
+    let mut u_prop = nll_current;
+    let mut log_w = 0.0;
+    let mut rho = p0;
+    let (mut n_leapfrog, mut sum_accept) = (0_usize, 0.0);
+    let mut eta_buf = vec![0.0; n];
+    let mut moved = false;
+    let mut divergent = false;
+    for depth in 0..NUTS_MAX_DEPTH {
+        let dir = if rng.random::<bool>() { 1.0 } else { -1.0 };
+        let edge = if dir > 0.0 { plus.clone() } else { minus.clone() };
+        let t = nuts_build(&edge, dir, depth, eps, h0, l, pot, rng, &mut eta_buf);
+        n_leapfrog += t.n_leapfrog;
+        sum_accept += t.sum_accept;
+        if t.stop {
+            divergent = t.divergent;
+            break;
+        }
+        if rng.random::<f64>().ln() < t.log_w - log_w {
+            z_prop = t.z_prop;
+            u_prop = t.u_prop;
+            moved = true;
+        }
+        log_w = log_add_exp(log_w, t.log_w);
+        for (r, v) in rho.iter_mut().zip(&t.rho) {
+            *r += v;
+        }
+        if dir > 0.0 {
+            plus = t.plus;
+        } else {
+            minus = t.minus;
+        }
+        if nuts_turning(&rho, &minus.p, &plus.p) {
+            break;
+        }
+    }
+    // A chain that kept its start keeps its η bit for bit (no `L·L⁻¹` round trip).
+    if moved {
+        lower_mul(l, &z_prop, eta);
+    }
+    Some(GradStep {
+        alpha: sum_accept / n_leapfrog.max(1) as f64,
+        nll: u_prop,
+        n_leapfrog,
+        divergent,
+    })
+}
+
+/// Kernel 1B's proposal from a subject's running draw moments `(Σ η, Σ ηηᵀ, n)`: the mean
+/// and the lower Cholesky factor of the covariance, or `None` before
+/// [`NONMEM_M1B_MIN_DRAWS`] draws. A covariance that is not positive definite falls back to
+/// its diagonal (each variance floored at `1e-12`).
+fn m1b_proposal(sum: &[f64], sumsq: &DMatrix<f64>, n: usize) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    if n < NONMEM_M1B_MIN_DRAWS {
+        return None;
+    }
+    let k = sum.len();
+    let nf = n as f64;
+    let mean: Vec<f64> = sum.iter().map(|v| v / nf).collect();
+    let mut cov = sumsq / nf;
+    for i in 0..k {
+        for j in 0..k {
+            cov[(i, j)] -= mean[i] * mean[j];
+        }
+    }
+    let l = match cov.clone().cholesky() {
+        Some(c) => c.l(),
+        None => {
+            DMatrix::from_fn(k, k, |i, j| if i == j { cov[(i, i)].max(1e-12).sqrt() } else { 0.0 })
+        }
+    };
+    Some((mean, l))
+}
+
+/// Draws a subject's chain must have made (after the Ω burn-in) before kernel 1B proposes
+/// from their moments (#2986).
+const NONMEM_M1B_MIN_DRAWS: usize = 10;
+/// NONMEM's `ISCALE_MIN` / `ISCALE_MAX` for MCMC sampling: the bounds on the random-walk
+/// scales under [`crate::types::SaemKernel::Nonmem`].
+const NONMEM_ISCALE_MIN: f64 = 1e-6;
+const NONMEM_ISCALE_MAX: f64 = 1e6;
 
 /// Componentwise (single-coordinate) Metropolis-within-Gibbs sweep for one
 /// subject — the second kernel of the Kuhn & Lavielle (2004) mixture.
@@ -2456,16 +3231,18 @@ pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Optio
 /// M-steps have any θ the closed-form steps do not own (a σ-only solve's score is the exact σ
 /// score whatever the adjoint's scope).
 ///
-/// `sigma_only_bobyqa` is where `auto` keeps `bobyqa` for a solve with no free θ: SAEM's, whose
-/// σ-only BOBYQA evaluations are *all* served by the prediction memo (one prediction pass per
-/// M-step, then residual arithmetic), so Newton's fused pass — a recording and its sweep — is
-/// extra work for no fewer evaluations (0–5% more instructions measured on the σ-only SAEM
-/// set). IMP/IMPMAP pass `false`: there BOBYQA keeps no memo (it is `subjects × K × n_obs`
-/// numbers at `imp_samples` per subject) and recomputes every σ-only evaluation, so Newton's
-/// memo is the gain (σ-only Newton is 0.39–0.54× BOBYQA's instructions).
+/// A σ-only solve (every θ the closed-form steps', e.g. a combined error) runs Newton under
+/// `auto` too (#2986): with every θ pinned its fused pass takes no recording — the σ score and
+/// information are residual arithmetic on the memoized predictions — so Fisher scoring reaches
+/// the exact optimum at BOBYQA's cost per iteration (pk2_big stand-in, 30 seeds: 7.21 against
+/// 7.28 ms). Measured trade-off under SAEM: the exact σ follows each draw's noise where the
+/// warm-started BOBYQA smooths it, so the automatic exploration stop fires later (median K1
+/// 2110 against 1805, ~10 % more CPU at the same −2LL); `mstep_optimizer = bobyqa` restores
+/// the derivative-free solve. Under IMP/IMPMAP, where BOBYQA keeps no memo, σ-only Newton is
+/// 0.39–0.54× BOBYQA's instructions.
 pub(crate) fn resolve_mstep_optimizer(
     model: &CompiledModel, requested: MstepOptimizer, score_sa_active: bool, is_mixture: bool,
-    theta_free: bool, sigma_only_bobyqa: bool, label: &str,
+    theta_free: bool, label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     resolve_mstep_optimizer_for(
         requested,
@@ -2473,7 +3250,6 @@ pub(crate) fn resolve_mstep_optimizer(
         crate::sens::ode_provider::adjoint::recorder_in_scope(model),
         newton_scope_gap(model, is_mixture),
         theta_free,
-        sigma_only_bobyqa,
         label,
     )
 }
@@ -2489,17 +3265,16 @@ pub(crate) fn mstep_has_free_theta(n_theta: usize, theta_fixed: &[bool], owned: 
 /// whether any θ is left to the numerical solve.
 fn resolve_mstep_optimizer_for(
     optimizer: MstepOptimizer, score_sa_active: bool, exact_theta_score: bool,
-    newton_gap: Option<&str>, theta_free: bool, sigma_only_bobyqa: bool, label: &str,
+    newton_gap: Option<&str>, theta_free: bool, label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     if optimizer == MstepOptimizer::Bobyqa {
         return (optimizer, None);
     }
     if optimizer == MstepOptimizer::Auto {
-        // The documented rule, applied silently: Newton wherever its scope holds. Under
-        // `score_sa` there is no numerical solve to choose for, and where BOBYQA's σ-only
-        // evaluations are memo-served (`sigma_only_bobyqa`) a solve with no θ has none to gain.
+        // The documented rule, applied silently: Newton wherever its scope holds, a σ-only
+        // solve included. Under `score_sa` there is no numerical solve to choose for.
         return (
-            if score_sa_active || newton_gap.is_some() || (sigma_only_bobyqa && !theta_free) {
+            if score_sa_active || newton_gap.is_some() {
                 MstepOptimizer::Bobyqa
             } else {
                 MstepOptimizer::Newton
@@ -4494,10 +5269,53 @@ fn saem_final_ofv_report(ofv: f64) -> String {
     format!("SAEM completed. FOCE/Laplace OFV = {:.4}", ofv)
 }
 
+/// The population SAEM iterates on with `n_chains` independent η chains per
+/// subject: the subjects repeated `n_chains` times, chain `c` of subject `i` at
+/// index `c·N + i` (chain 0 keeps the original indices, and so the per-subject
+/// random streams a single-chain run uses). Copies get distinct ids.
+fn replicate_for_chains(population: &Population, n_chains: usize) -> Population {
+    let mut rep = population.clone();
+    rep.subjects = (0..n_chains)
+        .flat_map(|c| {
+            population.subjects.iter().map(move |s| {
+                let mut s = s.clone();
+                if c > 0 {
+                    s.id = format!("{}#c{}", s.id, c + 1);
+                }
+                s
+            })
+        })
+        .collect();
+    rep
+}
+
 pub fn run_saem(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    // Chains (NONMEM `ISAMPLE`, Monolix's replicated data set): the SAEM iterations
+    // run on the subjects repeated `n_chains` times; the sufficient statistics are
+    // means over subjects and the θ/σ M-step objective a sum, so the copies average
+    // `n_chains` draws per subject without changing the target. Everything after the
+    // loop (final EBEs, OFV, covariance) uses the original subjects again.
+    let n_chains = options.saem_n_chains.max(1);
+    let n_subjects_data = population.subjects.len();
+    let original_population = population;
+    let replicated_population;
+    let population: &Population = if n_chains > 1 {
+        replicated_population = replicate_for_chains(population, n_chains);
+        &replicated_population
+    } else {
+        population
+    };
+    // The copies are new `Subject` objects: register them with the fit (joining its scope,
+    // as `impmap` does for its population) so the kernel JIT reads each one's plan key by
+    // address. Unregistered, every likelihood evaluation re-serialises and hashes the whole
+    // subject to find its plan — measured at ~28 % of a two-chain SAEM run (#2986). Held
+    // until `run_saem` returns; declared after the copies, so dropped before them.
+    let _chain_prints = (n_chains > 1).then(|| {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects)
+    });
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     // Run-time backstop for callers that bypass `check_model_options`
@@ -4510,17 +5328,111 @@ pub fn run_saem(
             .to_string());
     }
     let n_kappa = model.n_kappa;
-    let k1 = options.saem_n_exploration;
+    // Exploration length. An explicit `n_exploration` is a fixed length; otherwise
+    // the phase runs for at least `exploration_min` and stops at the first
+    // iteration where no Ω / σ / θ trajectory still trends, at most
+    // `exploration_max` (see `saem_exploration`). `k1` is the *current* end of the
+    // phase: `k_max` while it is open, the stopping iteration once decided.
+    let (auto_exploration, k_min, k_max) =
+        crate::estimation::saem_exploration::exploration_bounds(options);
+    let mut k1 = k_max;
     let k2 = options.saem_n_convergence;
-    let n_iter = k1 + k2;
+    let mut n_iter = k1 + k2;
+    let smoothing_exponent = options.saem_smoothing_exponent;
+    // The model-file parser rejects these; a `FitOptions` built in code reaches here
+    // unchecked, and 0 would skip the averaging, a negative value or NaN poisons γ.
+    if !(smoothing_exponent.is_finite() && smoothing_exponent > 0.5 && smoothing_exponent <= 1.0) {
+        return Err(format!(
+            "SAEM `saem_smoothing_exponent` must lie in (0.5, 1] (the Robbins-Monro \
+             conditions on the step 1/(k-K1)^a), got {smoothing_exponent}"
+        ));
+    }
+    let mut exploration_monitor =
+        crate::estimation::saem_exploration::ExplorationMonitor::default();
+    let mut exploration_hit_max = false;
     // Suppress the Ω M-step for the first `omega_burnin` iterations so the MH
     // chain warms up at the initial Ω before any variance component is
     // estimated. Clamped to the exploration length — burning in past K1 would
     // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
-    let omega_burnin = options.saem_omega_burnin.min(k1);
-    let n_mh_steps =
-        resolve_n_mh_steps(options.saem_n_mh_steps, population.n_obs(), n_subjects, n_eta);
-    let n_cw_sweeps = componentwise_sweeps(n_mh_steps, n_eta);
+    let omega_burnin = options.saem_omega_burnin.min(k_min);
+    // NONMEM's kernels (#2986): kernel 2's proposals and kernel 3's sweeps are NONMEM's
+    // counts; kernels 1 and 1B run before them in the E-step.
+    // The E-step's kernel schedule (#2986): counts per chain per iteration from the
+    // `saem_kernel` preset and the `isample_*` the caller set; `None` under the legacy `rw` /
+    // `imh` kernels, which keep their own path.
+    let schedule = KernelSchedule::resolve(options, imh_supported_model(model));
+    if schedule.is_some_and(|s| s.is_empty()) {
+        return Err("SAEM: every E-step kernel count is 0 (isample_m1, isample_imh, \
+                    isample_m1b, isample_hmc, isample_nuts, isample_mala, isample_m2, isample_m3 \
+                    after the saem_kernel preset), so nothing moves the random effects; set at least one \
+                    above 0"
+            .to_string());
+    }
+    let sched = schedule.unwrap_or_default();
+    let nonmem_kernel = schedule.is_some();
+    let hmc_in_scope = sched.gradient();
+    let isample_m1 = sched.m1;
+    let isample_m1b = sched.m1b;
+    // Gradient-kernel transitions the engine served, for the warning when it served none.
+    let gradient_served = std::sync::atomic::AtomicUsize::new(0);
+    // ... and those it declined, the divergences and the leapfrog steps (`FitResult::
+    // saem_gradient_kernel`), and the acceptance over the averaging phase.
+    let gradient_declined = std::sync::atomic::AtomicUsize::new(0);
+    // Divergences and transitions over the averaging phase, where the step size is frozen
+    // and the draws are the ones SAEM averages (exploration starts far from the posterior).
+    let gradient_divergent = std::sync::atomic::AtomicUsize::new(0);
+    let gradient_avg_transitions = std::sync::atomic::AtomicUsize::new(0);
+    let gradient_leapfrog = std::sync::atomic::AtomicUsize::new(0);
+    // ... per step size: `[0]` the trajectory kernels' (hmc, nuts), `[1]` MALA's.
+    let mut gradient_accept = [(0.0_f64, 0_usize); 2];
+    let n_mh_steps = if nonmem_kernel {
+        sched.m2
+    } else {
+        resolve_n_mh_steps(options.saem_n_mh_steps, population.n_obs(), n_subjects, n_eta)
+    };
+    let n_cw_sweeps =
+        if nonmem_kernel { sched.m3 } else { componentwise_sweeps(n_mh_steps, n_eta) };
+    // Acceptance targets and scale bounds: NONMEM's `IACCEPT` and `ISCALE_MIN/MAX` under
+    // its kernels, ferx's otherwise.
+    let cw_target_accept = if nonmem_kernel { options.saem_iaccept } else { CW_TARGET_ACCEPT };
+    let (blk_scale_lo, blk_scale_hi) = if nonmem_kernel {
+        (NONMEM_ISCALE_MIN, NONMEM_ISCALE_MAX)
+    } else {
+        (MH_BLOCK_SCALE_MIN, MH_BLOCK_SCALE_MAX)
+    };
+    let (cw_scale_lo, cw_scale_hi) = if nonmem_kernel {
+        (NONMEM_ISCALE_MIN, NONMEM_ISCALE_MAX)
+    } else {
+        (MH_CW_SCALE_MIN, MH_CW_SCALE_MAX)
+    };
+    // Kernel 1B: each chain's running draw moments `(Σ η, Σ ηηᵀ, n)`, from the Ω burn-in on.
+    #[allow(clippy::type_complexity)]
+    let mut m1b_moments: Vec<(Vec<f64>, DMatrix<f64>, usize)> = if nonmem_kernel {
+        vec![(vec![0.0; n_eta], DMatrix::zeros(n_eta, n_eta), 0); n_subjects]
+    } else {
+        Vec::new()
+    };
+    // `saem_kernel = hmc | nuts` under IOV: each chain's running moments of its stacked
+    // `[η, κ₁..κ_K]` draws, the joint move's metric from the 10th draw on (as M1B's for η).
+    #[allow(clippy::type_complexity)]
+    let mut joint_moments: Vec<(Vec<f64>, DMatrix<f64>, usize)> = if hmc_in_scope && n_kappa > 0 {
+        vec![(Vec::new(), DMatrix::zeros(0, 0), 0); n_subjects]
+    } else {
+        Vec::new()
+    };
+    // `saem_kernel = hmc`: each chain's step size, and the last transition's acceptance
+    // probability (`NaN` where no transition ran), read after the parallel E-step.
+    // Two per chain: `[0]` for the trajectory kernels (hmc, nuts), `[1]` for MALA, which
+    // adapts towards its own target.
+    let mut hmc_eps: Vec<[f64; 2]> =
+        vec![[HMC_EPS_INIT; 2]; if hmc_in_scope { n_subjects } else { 0 }];
+    let hmc_alpha: Vec<[std::sync::atomic::AtomicU64; 2]> = (0..hmc_eps.len())
+        .map(|_| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())))
+        .collect();
+    // Each chain's gradient from the last post-M-step refresh, and the parameters it was
+    // taken at (`GradMemo`): the refresh is the fused pass wherever a gradient kernel runs.
+    let mut grad_memo: Vec<Option<GradMemo>> = Vec::new();
+    let mut grad_memo_at: Vec<u64> = Vec::new();
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -4555,16 +5467,48 @@ pub fn run_saem(
 
     if verbose {
         eprintln!(
-            "SAEM: {} subjects, {} ETAs, {} total iter ({} explore + {} converge)",
-            n_subjects, n_eta, n_iter, k1, k2
+            "SAEM: {} subjects × {} chain(s), {} ETAs, up to {} total iter ({} explore{} + {} converge)",
+            n_subjects_data,
+            n_chains,
+            n_eta,
+            n_iter,
+            k1,
+            if auto_exploration {
+                format!(" at most, at least {k_min}, automatic stop")
+            } else {
+                String::new()
+            },
+            k2
         );
         // The block count is data-derived unless the caller pinned it, so say
         // which of the two a run is using — otherwise a reader cannot tell the
         // resolved count from a coincidence.
-        eprintln!("{}", mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps));
+        if nonmem_kernel {
+            eprintln!(
+                "SAEM kernels per chain per iteration: {} (random-walk acceptance target {}{})",
+                sched.describe(),
+                options.saem_iaccept,
+                if sched.gradient() {
+                    "; m2 2, m3 2 where the AD engine gives no η-gradient"
+                } else {
+                    ""
+                }
+            );
+        } else {
+            eprintln!("{}", mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps));
+        }
     }
 
     let mut warnings = Vec::new();
+    if auto_exploration && k_max < crate::estimation::saem_exploration::MIN_TEST_WINDOW {
+        warnings.push(format!(
+            "SAEM: `n_exploration_max` = {k_max} is shorter than the automatic stop's \
+             shortest test window ({} iterations), so the stop can never be tested and \
+             exploration always runs {k_max} iterations; set `n_exploration = {k_max}` for a \
+             fixed length, or raise `n_exploration_max`.",
+            crate::estimation::saem_exploration::MIN_TEST_WINDOW
+        ));
+    }
     // Acceptance window in which the Robbins-Monro step is skipped entirely
     // (#1449). Read once here so the two call sites below cannot drift, and
     // sanitised here because `FitOptions` is public and a band built in Rust
@@ -4603,7 +5547,38 @@ pub fn run_saem(
         warnings
             .push(format!("saem_n_leapfrog > 0 but {reason}; falling back to Metropolis-Hastings"));
     }
-    let target_accept_rate = if using_hmc { 0.65_f64 } else { 0.40_f64 };
+    // The counts belong to the counted kernels; the legacy `rw` / `imh` keep their own.
+    if schedule.is_none() {
+        let set: Vec<&str> = [
+            ("isample_m1", options.saem_isample_m1),
+            ("isample_imh", options.saem_isample_imh),
+            ("isample_m1b", options.saem_isample_m1b),
+            ("isample_hmc", options.saem_isample_hmc),
+            ("isample_nuts", options.saem_isample_nuts),
+            ("isample_mala", options.saem_isample_mala),
+            ("isample_m2", options.saem_isample_m2),
+            ("isample_m3", options.saem_isample_m3),
+        ]
+        .iter()
+        .filter(|(_, v)| v.is_some())
+        .map(|(k, _)| *k)
+        .collect();
+        if !set.is_empty() {
+            warnings.push(format!(
+                "{} ignored: saem_kernel = {} keeps its own kernels; the isample_* counts \
+                 apply under saem_kernel = nonmem, hmc or nuts",
+                set.join(", "),
+                if options.saem_kernel == crate::types::SaemKernel::Imh { "imh" } else { "rw" }
+            ));
+        }
+    }
+    let target_accept_rate = if using_hmc {
+        0.65_f64
+    } else if nonmem_kernel {
+        options.saem_iaccept
+    } else {
+        0.40_f64
+    };
 
     // ---- f-SAEM independent-MH kernel (`saem_kernel = imh`, #1449) ----------
     // Under the default `SaemKernel::RandomWalk` every IMH line below is inert:
@@ -4632,8 +5607,10 @@ pub fn run_saem(
     // Per-subject cached proposal, carried across iterations. `None` = no usable
     // proposal for this subject right now: it takes the block random walk this
     // iteration, exactly like an HMC decline.
+    // The f-SAEM slots also serve the counted `imh` kernel (`isample_imh`, #2986).
+    let imh_slots_on = imh_mode || sched.imh > 0;
     let mut imh_cache: Vec<crate::estimation::saem_imh::ImhSlot> =
-        vec![Default::default(); if imh_mode { n_subjects } else { 0 }];
+        vec![Default::default(); if imh_slots_on { n_subjects } else { 0 }];
 
     // Initialize state
     let theta_cur = init_params.theta.clone();
@@ -5341,7 +6318,6 @@ pub fn run_saem(
         use_score_sa,
         saem_mix.is_some(),
         mstep_has_free_theta(n_theta, &init_params.theta_fixed, &closed_form_owned),
-        true,
         "SAEM",
     );
     warnings.extend(mstep_optimizer_warning);
@@ -5359,6 +6335,11 @@ pub fn run_saem(
     // (see `recentre_eta_draws`), or a stored draw stops describing the same
     // individual parameters it was drawn for.
     let mut extra_eta_draws: Vec<Vec<Vec<f64>>> = Vec::new();
+    // The covariate mu-reference groups' sufficient statistic (#2986): each chain-subject's
+    // η averaged with the SA step, re-centred with the draws whenever a mu-referenced θ moves,
+    // so `φ̄ = μ(θ) + η̄` is the SA-averaged individual parameter at every θ. An exact group
+    // solves on it, the textbook SAEM M-step, instead of blending per-draw solutions.
+    let mut eta_bar: Vec<Vec<f64>> = Vec::new();
 
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
@@ -5419,7 +6400,8 @@ pub fn run_saem(
     // NONMEM's SAEMOBJ: per subject the log of the mean joint density over the convergence
     // phase's draws (`saem_objective`). Free: it reads the NLL cache the iteration refreshes.
     let mut saemobj = crate::estimation::saem_objective::SaemObjAccumulator::new(
-        n_subjects,
+        // Per data subject: the chain copies' draws are pooled into their subject's mean.
+        n_subjects_data,
         crate::estimation::saem_objective::unsupported(model).is_none(),
         // No random effect at all (neither η nor κ): nothing is sampled, so the value is the
         // data −2 log L at the last parameters. An IOV-only model samples κ and averages.
@@ -5427,7 +6409,10 @@ pub fn run_saem(
     );
 
     // Main loop
-    for k in 1..=n_iter {
+    for k in 1..=k_max + k2 {
+        if k > n_iter {
+            break;
+        }
         // Per-iteration combined (block + componentwise) accept / proposal
         // tallies — the honest E-step mixing rate reported to the trace (#895).
         let mut iter_acc: usize = 0;
@@ -5442,7 +6427,19 @@ pub fn run_saem(
             }
             break;
         }
-        let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
+        // NONMEM's MCETA (#2986): on the first iteration kernels M1, M2 and M3 run `mceta`
+        // proposals each, when that exceeds `isample_m1` — a robust initial search.
+        let mceta_now = nonmem_kernel && k == 1 && options.saem_mceta > isample_m1;
+        let isample_m1_k = if mceta_now { options.saem_mceta } else { isample_m1 };
+        let n_mh_steps = if mceta_now { options.saem_mceta } else { n_mh_steps };
+        let n_cw_sweeps = if mceta_now { options.saem_mceta } else { n_cw_sweeps };
+        let gamma = if k <= k1 {
+            1.0
+        } else if smoothing_exponent == 1.0 {
+            1.0 / (k - k1) as f64
+        } else {
+            1.0 / ((k - k1) as f64).powf(smoothing_exponent)
+        };
         // Damped SA step for the Ω sufficient statistic during exploration only.
         // With the full γ=1 used for θ, an undamped Ω would be overwritten each
         // exploration iteration by a single (warm-started, not-yet-equilibrated)
@@ -5577,7 +6574,7 @@ pub fn run_saem(
             // f-SAEM: hand each subject its slot. The zip needs one per subject
             // even when the kernel is off; then they are empty, nothing reads
             // them, and `repeat_n` yields them without allocating a buffer.
-            let imh_slots = if imh_mode {
+            let imh_slots = if imh_slots_on {
                 rayon::iter::Either::Left(std::mem::take(&mut imh_cache).into_par_iter())
             } else {
                 rayon::iter::Either::Right(rayon::iter::repeat_n(
@@ -5586,6 +6583,25 @@ pub fn run_saem(
                 ))
             };
             let imh_counters_ref = &imh_counters;
+            let m1b_ref = &m1b_moments;
+            let hmc_eps_ref = &hmc_eps;
+            let joint_ref = &joint_moments;
+            let hmc_alpha_ref = &hmc_alpha;
+            // The refresh's gradients serve this E-step only at exactly its parameters.
+            let memo_valid = !grad_memo.is_empty()
+                && grad_memo_at
+                    == grad_memo_params(
+                        theta_ref,
+                        &omega_ref.matrix,
+                        sigma_ref,
+                        omega_iov_cur_opt.as_ref().map(|o| &o.matrix),
+                    );
+            let grad_memo_ref = &grad_memo;
+            let gradient_served_ref = &gradient_served;
+            let gradient_declined_ref = &gradient_declined;
+            let gradient_divergent_ref = &gradient_divergent;
+            let gradient_avg_ref = &gradient_avg_transitions;
+            let gradient_leapfrog_ref = &gradient_leapfrog;
             let e_step_fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
             #[cfg(test)]
             let rw_block_calls_ref = &rw_block_calls;
@@ -5604,6 +6620,8 @@ pub fn run_saem(
                 bool,
                 usize,
                 crate::estimation::saem_imh::ImhSlot,
+                Option<Vec<Vec<f64>>>,
+                usize,
             )> = state
                 .etas
                 .par_iter()
@@ -5633,7 +6651,6 @@ pub fn run_saem(
                         ));
                         let kappas_mh_opt =
                             omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
-
                         // ---- Mixture E-step: draw the latent class ----
                         // Sample z_i ~ Categorical(PMIX_i) from the current
                         // posterior at this subject's η (and κ), then run the η
@@ -5721,19 +6738,23 @@ pub fn run_saem(
                         let mut nll_cur = nll;
                         let mut n_acc_primary = 0_usize;
                         let mut n_prop_primary = 0_usize;
-                        // HMC path: one gradient-guided proposal per SAEM iteration.
-                        // hmc_step returns None if HMC is unavailable for this subject
-                        // (e.g. TV-cov subject with unsupported PK model); fall through
-                        // to the block MH kernel. `did_hmc` doubles as the `used_hmc`
-                        // flag reported back for diagnostics.
-                        // ---- f-SAEM independent-MH primary move (#1449) ----
-                        // Rebuild `(η̂_i, Γ_i)` every `saem_imh_refresh` iterations
-                        // (`ImhSlot::refresh_if_due`: never from the current η, and a
-                        // decline waits the same interval). A slot without a proposal
-                        // takes the block random walk below — the same per-subject
-                        // fallback shape as HMC.
+                        // ---- NONMEM kernels 1 and 1B (#2986) ----
+                        // Independence proposals from the population density `N(0, Ω)`,
+                        // then from the chain's running conditional mean and covariance;
+                        // kernel 2 (the block random walk, `n_mh_steps = isample_m2`) and
+                        // kernel 3 (the componentwise sweep, `isample_m3`) follow below.
+                        // The f-SAEM proposal, refreshed every `saem_imh_refresh` iterations
+                        // (never from the current η), for the legacy `imh` kernel and the
+                        // counted one alike.
                         let mut imh_slot = imh_slot;
-                        if imh_mode {
+                        // The counted f-SAEM move runs during exploration only, as its authors
+                        // used it (Karimi, Lavielle & Moulines 2020: the IMH kernel for the
+                        // first iterations, the standard kernels after). Measured (#2986): the
+                        // move and its proposal refresh were ~27 % of a pk2_big stand-in fit;
+                        // without them in the averaging phase an iteration costs 6–9 % less at
+                        // the same −2LL on two_cpt_oral_cov, pk2s and warfarin_iov_saem.
+                        let imh_count = if k > k1 { 0 } else { sched.imh };
+                        if imh_slots_on && (imh_mode || imh_count > 0) {
                             imh_slot.refresh_if_due(
                                 k,
                                 imh_refresh,
@@ -5746,10 +6767,270 @@ pub fn run_saem(
                                 imh_counters_ref,
                             );
                         }
-                        // `imh_slot.prop` is `Some` only in `imh_mode` (the slots are
-                        // all empty otherwise and nothing refreshes them), so it alone
-                        // decides — one gate, not two that would cover for each other.
-                        let did_imh = match imh_slot.prop.as_ref() {
+                        // Kernel 1B's proposal from the chain's draws before this iteration —
+                        // also the gradient kernels' metric, so it does not depend on whether
+                        // kernel 1B ran first.
+                        let m1b_prop: Option<(Vec<f64>, DMatrix<f64>)> = if nonmem_kernel {
+                            let (sum, sumsq, n_draws) = &m1b_ref[i];
+                            m1b_proposal(sum, sumsq, *n_draws)
+                        } else {
+                            None
+                        };
+                        let m1b_chol: Option<&DMatrix<f64>> = m1b_prop.as_ref().map(|(_, l)| l);
+                        // The gradient kernels run first (#2986): the post-M-step refresh left
+                        // each chain's gradient at exactly this state (`grad_memo`), so the
+                        // first transition starts from it instead of a fresh AD pass.
+                        // ---- `saem_kernel = hmc`: HMC in place of kernels 2 and 3 (#2986) ----
+                        // Preconditioned by the chain's conditional covariance (kernel 1B's
+                        // moments), or by Ω before it has them.
+                        let mut hmc_served = false;
+                        // The engine gave this chain no gradient: M2 and M3 stand in.
+                        let mut grad_declined = false;
+                        let mut kappas_new: Option<Vec<Vec<f64>>> = None;
+                        if hmc_in_scope {
+                            // The chain's moments once it has ten draws; Ω's own factor before.
+                            // (A metric fitted to the posterior from the start — the Fisher
+                            // information at η = 0 — measured worse: the chains settle at once,
+                            // the exploration stop fires early, and the V1–KA trap of
+                            // `two_cpt_oral_cov` returns on 4 of 20 seeds.)
+                            let l_eta = m1b_chol.unwrap_or(&omega_ref.chol);
+                            // Under IOV the move is joint over `[η, κ₁..κ_K]` (#2986), its
+                            // metric block-diagonal: η's, then Ω_IOV's factor per occasion.
+                            let joint = kappas_mh_opt.filter(|(k, _)| !k.is_empty());
+                            let (mut x, l_joint) = match joint {
+                                Some((kap, oiov)) => {
+                                    let n_e = eta_work.len();
+                                    let n_k = oiov.chol.nrows();
+                                    let dim = n_e + kap.len() * n_k;
+                                    let mut lj = DMatrix::<f64>::zeros(dim, dim);
+                                    lj.view_mut((0, 0), (n_e, n_e)).copy_from(l_eta);
+                                    let mut x = eta_work.clone();
+                                    for (g, kg) in kap.iter().enumerate() {
+                                        let at = n_e + g * n_k;
+                                        lj.view_mut((at, at), (n_k, n_k)).copy_from(&oiov.chol);
+                                        x.extend_from_slice(kg);
+                                    }
+                                    // The chain's own joint moments, once it has ten draws.
+                                    let lj = joint_ref
+                                        .get(i)
+                                        .filter(|(sum, _, _)| sum.len() == dim)
+                                        .and_then(|(sum, sumsq, n)| m1b_proposal(sum, sumsq, *n))
+                                        .map_or(lj, |(_, l)| l);
+                                    (x, Some(lj))
+                                }
+                                None => (eta_work.clone(), None),
+                            };
+                            let l = l_joint.as_ref().unwrap_or(l_eta);
+                            let mut pot = EtaPotential::new(
+                                model,
+                                subject,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                schedules[i].as_ref(),
+                                kappas_mh_opt,
+                                mh_scratch,
+                                eta_work.len(),
+                                joint.is_some(),
+                            );
+                            // `isample_hmc` HMC, `isample_nuts` NUTS, then `isample_mala`
+                            // MALA transitions; the first the engine declines ends the run of
+                            // them. The last acceptance of each step size is kept for its
+                            // adaptation; the gradient at the chain's state carries between
+                            // HMC and MALA transitions (NUTS does not report it).
+                            let mut step: Option<GradStep> = None;
+                            let mut alphas = [f64::NAN; 2];
+                            let mut grad_at: Option<Vec<f64>> = grad_memo_ref
+                                .get(i)
+                                .and_then(Option::as_ref)
+                                .filter(|m| memo_valid && m.x == x)
+                                .map(|m| m.g.clone());
+                            for t in 0..sched.hmc + sched.nuts + sched.mala {
+                                let [eps, eps_mala] = hmc_eps_ref[i];
+                                let (g, which) = if t < sched.hmc {
+                                    let g = preconditioned_hmc_step(
+                                        &mut x,
+                                        nll_cur,
+                                        l,
+                                        eps,
+                                        HMC_MAX_LEAPFROG,
+                                        None,
+                                        &mut grad_at,
+                                        &mut pot,
+                                        &mut rng,
+                                    );
+                                    (g, 0)
+                                } else if t < sched.hmc + sched.nuts {
+                                    grad_at = None;
+                                    (nuts_step(&mut x, nll_cur, l, eps, &mut pot, &mut rng), 0)
+                                } else {
+                                    let g = preconditioned_hmc_step(
+                                        &mut x,
+                                        nll_cur,
+                                        l,
+                                        eps_mala,
+                                        1,
+                                        Some(1),
+                                        &mut grad_at,
+                                        &mut pot,
+                                        &mut rng,
+                                    );
+                                    (g, 1)
+                                };
+                                let Some(g) = g else {
+                                    break;
+                                };
+                                alphas[which] = g.alpha;
+                                nll_cur = g.nll;
+                                step = Some(match step {
+                                    Some(prev) => GradStep {
+                                        alpha: g.alpha,
+                                        nll: g.nll,
+                                        n_leapfrog: prev.n_leapfrog + g.n_leapfrog,
+                                        divergent: prev.divergent || g.divergent,
+                                    },
+                                    None => g,
+                                });
+                            }
+                            if step.is_none() {
+                                grad_declined = true;
+                                gradient_declined_ref
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some(GradStep { nll: nll_h, n_leapfrog, divergent, .. }) = step {
+                                use std::sync::atomic::Ordering::Relaxed;
+                                gradient_served_ref.fetch_add(1, Relaxed);
+                                gradient_leapfrog_ref.fetch_add(n_leapfrog, Relaxed);
+                                if k > k1 {
+                                    gradient_avg_ref.fetch_add(1, Relaxed);
+                                    gradient_divergent_ref
+                                        .fetch_add(usize::from(divergent), Relaxed);
+                                }
+                                let n_e = eta_work.len();
+                                eta_work.copy_from_slice(&x[..n_e]);
+                                if let Some((kap, _)) = joint {
+                                    let mut at = n_e;
+                                    kappas_new = Some(
+                                        kap.iter()
+                                            .map(|kg| {
+                                                let v = x[at..at + kg.len()].to_vec();
+                                                at += kg.len();
+                                                v
+                                            })
+                                            .collect(),
+                                    );
+                                }
+                                nll_cur = nll_h;
+                                hmc_served = true;
+                                for (slot, a) in hmc_alpha_ref[i].iter().zip(alphas) {
+                                    slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        // A joint gradient move under IOV moved κ with η: the kernels after it
+                        // read the moved κ (their baseline `nll_cur` is already at it).
+                        let kappas_cur: Option<Vec<Vec<f64>>> = kappas_new.clone();
+                        let kappas_mh_opt = match (&kappas_cur, kappas_mh_opt) {
+                            (Some(kc), Some((_, iov))) => Some((kc.as_slice(), iov)),
+                            (_, opt) => opt,
+                        };
+                        if nonmem_kernel {
+                            let zero = vec![0.0_f64; eta_work.len()];
+                            let (_, nll_m1) = independence_steps(
+                                &mut eta_work,
+                                nll_cur,
+                                &zero,
+                                &omega_ref.chol,
+                                subject,
+                                model,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                &mut rng,
+                                isample_m1_k,
+                                mh_scratch,
+                                schedules[i].as_ref(),
+                                kappas_mh_opt,
+                            );
+                            nll_cur = nll_m1;
+                            // Counted f-SAEM moves; before a chain's first proposal (or where
+                            // it declines) they run as M1.
+                            if imh_count > 0 {
+                                nll_cur = match imh_slot.prop.as_ref() {
+                                    Some(prop) => {
+                                        crate::estimation::saem_imh::imh_steps(
+                                            &mut eta_work,
+                                            nll_cur,
+                                            prop,
+                                            subject,
+                                            model,
+                                            theta_ref,
+                                            omega_ref,
+                                            sigma_ref,
+                                            &mut rng,
+                                            imh_count,
+                                            mh_scratch,
+                                            schedules[i].as_ref(),
+                                            imh_counters_ref,
+                                        )
+                                        .1
+                                    }
+                                    None => {
+                                        independence_steps(
+                                            &mut eta_work,
+                                            nll_cur,
+                                            &zero,
+                                            &omega_ref.chol,
+                                            subject,
+                                            model,
+                                            theta_ref,
+                                            omega_ref,
+                                            sigma_ref,
+                                            &mut rng,
+                                            imh_count,
+                                            mh_scratch,
+                                            schedules[i].as_ref(),
+                                            kappas_mh_opt,
+                                        )
+                                        .1
+                                    }
+                                };
+                            }
+                            if let Some((mean, l)) = m1b_prop.as_ref() {
+                                let (_, nll_m1b) = independence_steps(
+                                    &mut eta_work,
+                                    nll_cur,
+                                    mean,
+                                    l,
+                                    subject,
+                                    model,
+                                    theta_ref,
+                                    omega_ref,
+                                    sigma_ref,
+                                    &mut rng,
+                                    isample_m1b,
+                                    mh_scratch,
+                                    schedules[i].as_ref(),
+                                    kappas_mh_opt,
+                                );
+                                nll_cur = nll_m1b;
+                            }
+                        }
+                        // HMC path: one gradient-guided proposal per SAEM iteration.
+                        // hmc_step returns None if HMC is unavailable for this subject
+                        // (e.g. TV-cov subject with unsupported PK model); fall through
+                        // to the block MH kernel. `did_hmc` doubles as the `used_hmc`
+                        // flag reported back for diagnostics.
+                        // ---- f-SAEM independent-MH primary move (#1449) ----
+                        // Rebuild `(η̂_i, Γ_i)` every `saem_imh_refresh` iterations
+                        // (`ImhSlot::refresh_if_due`: never from the current η, and a
+                        // decline waits the same interval). A slot without a proposal
+                        // takes the block random walk below — the same per-subject
+                        // fallback shape as HMC.
+                        // `imh_slot.prop` is `Some` only where the slots are on; the
+                        // legacy kernel's primary move runs only in `imh_mode` (the counted
+                        // `imh` kernel ran above).
+                        let did_imh = match imh_slot.prop.as_ref().filter(|_| imh_mode) {
                             Some(prop) => {
                                 let (n_acc, nll_new) = crate::estimation::saem_imh::imh_steps(
                                     &mut eta_work,
@@ -5774,7 +7055,7 @@ pub fn run_saem(
                             None => false,
                         };
 
-                        let did_hmc = if using_hmc && !did_imh {
+                        let did_hmc = if using_hmc && !did_imh && !hmc_served {
                             if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
@@ -5793,7 +7074,13 @@ pub fn run_saem(
                             false
                         };
 
-                        if !did_hmc && !did_imh {
+                        // M2 and M3 at their own counts — beside a gradient move too — plus
+                        // NONMEM's two of each where the gradient move was declined.
+                        let m2_now =
+                            n_mh_steps + if grad_declined { GRADIENT_FALLBACK_M2 } else { 0 };
+                        let m3_now =
+                            n_cw_sweeps + if grad_declined { GRADIENT_FALLBACK_M3 } else { 0 };
+                        if !did_hmc && !did_imh && (!nonmem_kernel || m2_now > 0) {
                             #[cfg(test)]
                             rw_block_calls_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let (n_acc, nll_new) = mh_steps(
@@ -5807,14 +7094,14 @@ pub fn run_saem(
                                 scale,
                                 blk_eta_scale_ref,
                                 &mut rng,
-                                n_mh_steps,
+                                m2_now,
                                 mh_scratch,
                                 schedules[i].as_ref(),
                                 kappas_mh_opt,
                             );
                             nll_cur = nll_new;
                             n_acc_primary = n_acc;
-                            n_prop_primary = n_mh_steps;
+                            n_prop_primary = m2_now;
                         }
 
                         // ---- Kernel 2: componentwise decorrelating sweep ----
@@ -5829,7 +7116,7 @@ pub fn run_saem(
                             cw_sc_i,
                             cw_sd_ref,
                             &mut rng,
-                            n_cw_sweeps,
+                            m3_now,
                             mh_scratch,
                             schedules[i].as_ref(),
                             kappas_mh_opt,
@@ -5842,9 +7129,11 @@ pub fn run_saem(
                             n_prop_primary,
                             per_eta_acc_cw,
                             n_prop_cw,
-                            did_hmc,
+                            did_hmc || hmc_served,
                             mix_class,
                             imh_slot,
+                            kappas_new,
+                            m3_now,
                         )
                     },
                 )
@@ -5855,7 +7144,7 @@ pub fn run_saem(
             // (via `mixture_ofv`), matching what the FOCEI mixture path reports.
             let mut drawn_classes: Vec<usize> = vec![0; n_subjects];
             let mut imh_next: Vec<crate::estimation::saem_imh::ImhSlot> =
-                Vec::with_capacity(if imh_mode { n_subjects } else { 0 });
+                Vec::with_capacity(if imh_slots_on { n_subjects } else { 0 });
             for (
                 i,
                 (
@@ -5868,13 +7157,19 @@ pub fn run_saem(
                     used_hmc,
                     mix_class,
                     imh_slot,
+                    kappas_new,
+                    n_cw_ran,
                 ),
             ) in results.into_iter().enumerate()
             {
+                // A joint gradient move under IOV moved the chain's κ with its η (#2986).
+                if let Some(kap) = kappas_new {
+                    state.kappas[i] = kap;
+                }
                 // A proposal came back <=> the IMH kernel served this subject's
                 // primary move this iteration.
-                let used_imh = imh_slot.prop.is_some();
-                if imh_mode {
+                let used_imh = imh_mode && imh_slot.prop.is_some();
+                if imh_slots_on {
                     imh_next.push(imh_slot);
                 }
                 if used_imh && k > k1 {
@@ -5883,6 +7178,39 @@ pub fn run_saem(
                 }
                 drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
+                // Kernel 1B's moments: this chain's draws from the Ω burn-in on (#2986).
+                if nonmem_kernel && k > omega_burnin {
+                    let (sum, sumsq, n_draws) = &mut m1b_moments[i];
+                    let e = &state.etas[i];
+                    for a in 0..e.len() {
+                        sum[a] += e[a];
+                        for b in 0..e.len() {
+                            sumsq[(a, b)] += e[a] * e[b];
+                        }
+                    }
+                    *n_draws += 1;
+                }
+                if let Some((sum, sumsq, n_draws)) =
+                    joint_moments.get_mut(i).filter(|_| k > omega_burnin)
+                {
+                    let x: Vec<f64> = state.etas[i]
+                        .iter()
+                        .chain(state.kappas[i].iter().flatten())
+                        .copied()
+                        .collect();
+                    if sum.len() != x.len() {
+                        *sum = vec![0.0; x.len()];
+                        *sumsq = DMatrix::zeros(x.len(), x.len());
+                        *n_draws = 0;
+                    }
+                    for a in 0..x.len() {
+                        sum[a] += x[a];
+                        for b in 0..x.len() {
+                            sumsq[(a, b)] += x[a] * x[b];
+                        }
+                    }
+                    *n_draws += 1;
+                }
                 state.nll_cache[i] = nll_new;
                 // Deliberately NOT fed from the IMH kernel: these counters drive
                 // the *random walk's* step scale toward its 0.40 target, and an
@@ -5894,11 +7222,13 @@ pub fn run_saem(
                     state.accept_counts[i] += n_acc;
                     state.proposal_counts[i] += n_prop;
                 }
-                // Accumulate per-eta CW acceptance counts
+                // Accumulate per-eta CW acceptance counts. A subject `saem_kernel = hmc`
+                // served ran no sweep: no counts, so its sweep scales stay as they were for
+                // an iteration it falls back.
                 let cw_acc_i: usize = per_eta_acc_cw.iter().sum();
                 for j in 0..n_eta {
                     state.cw_accept_counts[i][j] += per_eta_acc_cw[j];
-                    state.cw_proposal_counts[i][j] += n_cw_sweeps;
+                    state.cw_proposal_counts[i][j] += n_cw_ran;
                 }
                 hmc_subjects[i] |= used_hmc;
                 // ---- Robbins-Monro step-scale adaptation (#1444, opt-in) ----
@@ -5912,7 +7242,7 @@ pub fn run_saem(
                     // above skip it: this controller steers the random walk's
                     // scale, and the IMH kernel's acceptance is not on that scale.
                     let rw_block = rw_scale_has_evidence(used_imh, n_prop);
-                    if rw_block || (n_cw_sweeps > 0 && !per_eta_acc_cw.is_empty()) {
+                    if rw_block || (n_cw_ran > 0 && !per_eta_acc_cw.is_empty()) {
                         first_scale_adapt.get_or_insert(k);
                     }
                     if rw_block {
@@ -5927,27 +7257,27 @@ pub fn run_saem(
                                 rate,
                                 target_accept_rate,
                                 k,
-                                MH_BLOCK_SCALE_MIN,
-                                MH_BLOCK_SCALE_MAX,
+                                blk_scale_lo,
+                                blk_scale_hi,
                             );
                         }
                     }
                     // Per-η, for the same reason the interval rule adapts each
                     // coordinate separately: a FREM covariate η and a PK η have
                     // posterior SDs orders of magnitude apart.
-                    if n_cw_sweeps > 0 {
+                    if n_cw_ran > 0 {
                         for j in 0..n_eta.min(per_eta_acc_cw.len()) {
-                            let rate = per_eta_acc_cw[j] as f64 / n_cw_sweeps as f64;
+                            let rate = per_eta_acc_cw[j] as f64 / n_cw_ran as f64;
                             if inside_scale_deadband(rate, scale_deadband) {
                                 continue;
                             }
                             state.cw_step_scales[i][j] = rm_scale_update(
                                 state.cw_step_scales[i][j],
                                 rate,
-                                CW_TARGET_ACCEPT,
+                                cw_target_accept,
                                 k,
-                                MH_CW_SCALE_MIN,
-                                MH_CW_SCALE_MAX,
+                                cw_scale_lo,
+                                cw_scale_hi,
                             );
                         }
                     }
@@ -5971,7 +7301,7 @@ pub fn run_saem(
                     mh_tally.1 += n_prop_cw as u64;
                 }
                 iter_target_weight +=
-                    blk_prop as f64 * target_accept_rate + n_prop_cw as f64 * CW_TARGET_ACCEPT;
+                    blk_prop as f64 * target_accept_rate + n_prop_cw as f64 * cw_target_accept;
             }
 
             // ---- Mixture bookkeeping (#985) ----
@@ -5982,7 +7312,7 @@ pub fn run_saem(
                 mix.classes = drawn_classes;
                 mix.update_rbar(gamma);
             }
-            if imh_mode {
+            if imh_slots_on {
                 imh_cache = imh_next;
             }
         }
@@ -6103,6 +7433,19 @@ pub fn run_saem(
             }
         }
         state.steps_since_adapt += 1;
+
+        // ---- Step 1c: the covariate mu-reference statistic η̄ (#2986) ----
+        if !cov_mu_groups.is_empty() {
+            if eta_bar.len() != state.etas.len() {
+                eta_bar = state.etas.clone();
+            } else {
+                for (b, e) in eta_bar.iter_mut().zip(&state.etas) {
+                    for (bj, ej) in b.iter_mut().zip(e) {
+                        *bj += gamma * (ej - *bj);
+                    }
+                }
+            }
+        }
 
         // ---- Step 2: SA update of sufficient statistic for Omega ----
         // #904: re-center the iiv_on_ruv η to zero mean, absorbing the shift into
@@ -6353,7 +7696,7 @@ pub fn run_saem(
                     if init_params.theta_fixed.get(theta_idx).copied().unwrap_or(false) {
                         continue;
                     }
-                    closed_form_mu_shift(
+                    let delta = closed_form_mu_shift(
                         &mut log_theta[theta_idx],
                         (log_theta_lower[theta_idx], log_theta_upper[theta_idx]),
                         theta_packs_log_mask[theta_idx],
@@ -6363,6 +7706,11 @@ pub fn run_saem(
                         &mut extra_eta_draws,
                         eta_idx,
                     );
+                    // The covariate groups' η̄ follows the same re-centring.
+                    for e in eta_bar.iter_mut() {
+                        e[eta_idx] -= delta;
+                    }
+
                     // Pin so NLopt leaves the closed-form value unchanged.
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
                     temp_theta_upper[theta_idx] = log_theta[theta_idx];
@@ -6371,8 +7719,11 @@ pub fn run_saem(
                 // ---- Covariate mu-reference groups (#619): φ-frozen M-step ----
                 // Exact (Gauss–Newton on the prior term) when the group's
                 // covariates are time-constant, prior + data (BOBYQA) when one
-                // varies within a subject. The result is blended with the same
-                // SA step `gamma` as the shift above, then each subject's eta is
+                // varies within a subject. An exact group solves on the SA-averaged
+                // η̄ (#2986) and takes the solution as is — the SA step is in the
+                // statistic, as for every other one; a numerical group (its data term
+                // reads this draw) blends its solution with the same SA step `gamma`
+                // as the shift above. Then each subject's eta, the draws and η̄ are
                 // re-centred by the realised change in its own mu so that
                 // `φ_i = g(A_i(θ)) + η_i` is unchanged — the per-subject twin of
                 // the `e[eta_idx] -= delta` above.
@@ -6400,7 +7751,11 @@ pub fn run_saem(
                                 theta_fixed: &init_params.theta_fixed,
                                 theta_packs_log: &theta_packs_log_mask,
                                 omega: &state.omega_mat,
-                                etas: &state.etas,
+                                etas: if group.needs_data_term || eta_bar.is_empty() {
+                                    &state.etas
+                                } else {
+                                    &eta_bar
+                                },
                             };
                             if group.needs_data_term {
                                 let etas_now = &state.etas;
@@ -6442,7 +7797,8 @@ pub fn run_saem(
                                 continue;
                             }
                             let target = pack_one(t, theta_star[t]);
-                            log_theta[t] = (log_theta[t] + gamma * (target - log_theta[t]))
+                            let step = if group.needs_data_term { gamma } else { 1.0 };
+                            log_theta[t] = (log_theta[t] + step * (target - log_theta[t]))
                                 .clamp(log_theta_lower[t], log_theta_upper[t]);
                             temp_theta_lower[t] = log_theta[t];
                             temp_theta_upper[t] = log_theta[t];
@@ -6453,8 +7809,9 @@ pub fn run_saem(
                         // and in every extra draw.
                         let theta_new = unpack_all(&log_theta);
                         let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
-                        for draw in
-                            std::iter::once(&mut state.etas).chain(extra_eta_draws.iter_mut())
+                        for draw in std::iter::once(&mut state.etas)
+                            .chain(extra_eta_draws.iter_mut())
+                            .chain(std::iter::once(&mut eta_bar))
                         {
                             for (i, e) in draw.iter_mut().enumerate() {
                                 group.recentre_eta(e, &deltas, i);
@@ -6783,7 +8140,58 @@ pub fn run_saem(
             } else {
                 (Vec::new(), Vec::new())
             };
-        if n_kappa > 0 {
+        if hmc_in_scope && saem_mix.is_none() {
+            // The fused refresh (#2986): each chain's value and η-gradient from one AD pass
+            // (`EtaPotential::grad`), the gradient kept for the next E-step's first gradient
+            // transition, which the E-step runs first. Parallel over chains, IOV included.
+            let omega_iov_upd = init_params.omega_iov.as_ref().filter(|_| n_kappa > 0).map(|r| {
+                OmegaMatrix::from_matrix_with_mask(
+                    state.omega_iov_mat.clone(),
+                    r.eta_names.clone(),
+                    r.diagonal,
+                    r.free_mask.clone(),
+                )
+            });
+            let refreshed: Vec<(f64, Option<GradMemo>)> =
+                crate::par::map_init(state.etas.len(), MhScratch::default, |scratch, i| {
+                    let subject = &population.subjects[i];
+                    let eta = &state.etas[i];
+                    let kaps = &state.kappas[i];
+                    scratch.begin_subject(model, subject, &state.theta, n_eta);
+                    let kap_opt = omega_iov_upd.as_ref().map(|iov| (kaps.as_slice(), iov));
+                    let joint = kap_opt.is_some_and(|(k, _)| !k.is_empty());
+                    let mut x = eta.clone();
+                    if joint {
+                        x.extend(kaps.iter().flatten());
+                    }
+                    let mut pot = EtaPotential::new(
+                        model,
+                        subject,
+                        &state.theta,
+                        &omega_upd,
+                        &state.sigma_vals,
+                        schedules.get(i).and_then(|s| s.as_ref()),
+                        kap_opt,
+                        scratch,
+                        n_eta,
+                        joint,
+                    );
+                    match pot.grad(&x, true) {
+                        Some((g, u)) if u.is_finite() => (u, Some(GradMemo { x, g })),
+                        _ => (pot.value(&x), None),
+                    }
+                });
+            let (nlls, memos): (Vec<f64>, Vec<Option<GradMemo>>) = refreshed.into_iter().unzip();
+            state.nll_cache = nlls;
+            grad_memo = memos;
+            // Taken from the matrices the potentials read, built as the E-step builds its own.
+            grad_memo_at = grad_memo_params(
+                &state.theta,
+                &omega_upd.matrix,
+                &state.sigma_vals,
+                omega_iov_upd.as_ref().map(|o| &o.matrix),
+            );
+        } else if n_kappa > 0 {
             // IOV NLL cache refresh — sequential rather than rayon-parallel.
             // individual_nll_iov is cheap (analytical PK, few occasions) and
             // the sequential loop avoids a second rayon scatter/gather.
@@ -6869,10 +8277,60 @@ pub fn run_saem(
         // ever loosens (`max`), so a genuine post-exploration runaway is still
         // bounded, and it preserves the bit-for-bit trajectory of a fit that never
         // approaches either ceiling.
+        if auto_exploration && k <= k1 {
+            let omega_iov = (n_kappa > 0).then_some(&state.omega_iov_mat);
+            // `nll_cache` was refreshed at this iteration's Ω/σ just above and holds
+            // each subject's −log p(yᵢ, ηᵢ) (η prior included): the complete-data −log L.
+            let mut coords = crate::estimation::saem_exploration::exploration_coords(
+                state.nll_cache.iter().sum(),
+                &state.theta,
+                &state.omega_mat,
+                omega_iov,
+                &state.sigma_vals,
+            );
+            // Mixture: the per-class Ω-override variances move on their own SA
+            // statistic, outside the base Ω (σ overrides are held at their inits,
+            // the mixing θ are already in `theta`).
+            if let Some(mix) = saem_mix.as_ref() {
+                coords.extend(
+                    mix.mp
+                        .omega_override_addr
+                        .iter()
+                        .map(|&(c, j)| mix.class_omega(c).matrix[(j, j)].max(1e-300).ln()),
+                );
+            }
+            exploration_monitor.push(&coords);
+            if k < k1 && exploration_monitor.may_stop_at(k, k_min) {
+                k1 = k;
+                n_iter = k1 + k2;
+            } else if k == k1 && !exploration_monitor.converged() {
+                exploration_hit_max = true;
+            }
+        }
         if k == k1 {
             reanchor_ruv_sigma_caps(&mut ruv_sigma_caps, &log_sigma, &log_sigma_upper);
             if let Some(kr) = model.residual_error_eta {
                 ruv_omega_cap = reanchor_ruv_omega_cap(ruv_omega_cap, state.omega_mat[(kr, kr)]);
+            }
+        }
+
+        // ---- `saem_kernel = hmc`: each chain's step size (#2986) ----
+        // A Robbins-Monro step on `log ε` toward the acceptance probability target, during
+        // exploration only: the averaging phase runs a fixed kernel.
+        for (i, slots) in hmc_alpha.iter().enumerate() {
+            for (w, (a, target)) in
+                slots.iter().zip([HMC_TARGET_ACCEPT, MALA_TARGET_ACCEPT]).enumerate()
+            {
+                let alpha = f64::from_bits(
+                    a.swap(f64::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed),
+                );
+                if k <= k1 && alpha.is_finite() {
+                    hmc_eps[i][w] = (hmc_eps[i][w] * (HMC_EPS_GAIN * (alpha - target)).exp())
+                        .clamp(HMC_EPS_LO, HMC_EPS_HI);
+                } else if alpha.is_finite() {
+                    gradient_accept[w].0 += alpha;
+                    gradient_accept[w].1 += 1;
+                }
             }
         }
 
@@ -6897,15 +8355,16 @@ pub fn run_saem(
                 // to the random walk the moment a refresh declines. So adapt only
                 // on evidence there; `imh_mode` is false by default, which keeps
                 // the default path's arithmetic untouched.
-                let rw_evidence = !imh_mode || state.proposal_counts[i] > 0;
+                // `saem_kernel = hmc` records no random-walk proposals for a subject it served.
+                let rw_evidence = !(imh_mode || hmc_in_scope) || state.proposal_counts[i] > 0;
                 if !rm_scale_adaptation && rw_evidence {
                     first_scale_adapt.get_or_insert(k);
                     state.step_scales[i] = interval_scale_update(
                         state.step_scales[i],
                         rate,
                         target_accept_rate,
-                        MH_BLOCK_SCALE_MIN,
-                        MH_BLOCK_SCALE_MAX,
+                        blk_scale_lo,
+                        blk_scale_hi,
                     );
                 }
                 state.accept_counts[i] = 0;
@@ -6920,6 +8379,9 @@ pub fn run_saem(
                 // posterior SD may be orders of magnitude below √Ω_jj.
                 if n_cw_sweeps > 0 {
                     for j in 0..n_eta {
+                        if hmc_in_scope && state.cw_proposal_counts[i][j] == 0 {
+                            continue;
+                        }
                         let cw_total = state.cw_proposal_counts[i][j].max(1);
                         let cw_rate = state.cw_accept_counts[i][j] as f64 / cw_total as f64;
                         // Same split as the block scale above.
@@ -6927,9 +8389,9 @@ pub fn run_saem(
                             state.cw_step_scales[i][j] = interval_scale_update(
                                 state.cw_step_scales[i][j],
                                 cw_rate,
-                                CW_TARGET_ACCEPT,
-                                MH_CW_SCALE_MIN,
-                                MH_CW_SCALE_MAX,
+                                cw_target_accept,
+                                cw_scale_lo,
+                                cw_scale_hi,
                             );
                         }
                         state.cw_accept_counts[i][j] = 0;
@@ -7016,6 +8478,81 @@ pub fn run_saem(
         eprintln!("SAEM iterations complete. Computing final EBEs and OFV...");
     }
 
+    // Back to the original subjects: keep chain 0 of each (indices `0..N`) as the
+    // warm start of the final EBEs; the other chains have done their job.
+    let population = original_population;
+    if n_chains > 1 {
+        state.etas.truncate(n_subjects_data);
+        state.kappas.truncate(n_subjects_data);
+        state.nll_cache.truncate(n_subjects_data);
+        state.step_scales.truncate(n_subjects_data);
+        hmc_subjects.truncate(n_subjects_data);
+        if let Some(mix) = saem_mix.as_mut() {
+            mix.classes.truncate(n_subjects_data);
+            mix.rbar.truncate(n_subjects_data);
+        }
+    }
+    // The reported step size and acceptance are the trajectory kernels' where one runs,
+    // MALA's otherwise (each adapts towards its own target).
+    let (w_report, target_report) =
+        if sched.hmc + sched.nuts > 0 { (0, HMC_TARGET_ACCEPT) } else { (1, MALA_TARGET_ACCEPT) };
+    let saem_gradient_kernel = hmc_in_scope.then(|| {
+        use std::sync::atomic::Ordering::Relaxed;
+        let transitions = gradient_served.load(Relaxed) as u64;
+        let gradient_accept = gradient_accept[w_report];
+        let mut eps: Vec<f64> = hmc_eps.iter().map(|e| e[w_report]).collect();
+        eps.sort_by(f64::total_cmp);
+        crate::types::SaemGradientKernelStats {
+            transitions,
+            declined: gradient_declined.load(Relaxed) as u64,
+            divergences: gradient_divergent.load(Relaxed) as u64,
+            mean_leapfrog: gradient_leapfrog.load(Relaxed) as f64 / transitions.max(1) as f64,
+            mean_accept: (gradient_accept.1 > 0)
+                .then(|| gradient_accept.0 / gradient_accept.1 as f64),
+            median_step_size: eps.get(eps.len() / 2).copied().unwrap_or(f64::NAN),
+        }
+    });
+    if let Some(g) = &saem_gradient_kernel {
+        let name = [("hmc", sched.hmc), ("nuts", sched.nuts), ("mala", sched.mala)]
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        if g.transitions == 0 {
+            warnings.push(format!(
+                "SAEM {name} kernel: the AD engine gave no subject's η-gradient, so NONMEM's \
+                 kernels 2 and 3 ran in its place"
+            ));
+        } else {
+            let avg = gradient_avg_transitions.load(std::sync::atomic::Ordering::Relaxed) as u64;
+            if g.divergences as f64 > 0.01 * avg as f64 {
+                warnings.push(format!(
+                    "SAEM {name} kernel: {} of {avg} gradient transitions in the averaging phase \
+                     diverged (energy error > 1000): the conditional posterior has regions the \
+                     integrator cannot follow at the adapted step size; compare with \
+                     saem_kernel = nonmem",
+                    g.divergences
+                ));
+            }
+            if g.mean_accept.is_some_and(|a| a < target_report - 0.2) {
+                warnings.push(format!(
+                    "SAEM {name} kernel: mean acceptance {:.2} over the averaging phase (target \
+                     {target_report}): the step size adapted during exploration no longer fits \
+                     the posterior",
+                    g.mean_accept.unwrap_or(f64::NAN)
+                ));
+            }
+            if g.median_step_size <= HMC_EPS_LO * 1.0001 {
+                warnings.push(format!(
+                    "SAEM {name} kernel: the step size sits at its floor ({HMC_EPS_LO}), so \
+                     each transition is a short random walk: the metric fits the posterior \
+                     poorly; compare with saem_kernel = nonmem"
+                ));
+            }
+        }
+    }
+
     // ---- Post-SAEM: build final parameters ----
     let mut final_params = saem_state_to_params(&state, init_params, n_kappa);
     // Mixture (#985): carry the estimated per-class Ω/σ overrides so the final
@@ -7041,6 +8578,37 @@ pub fn run_saem(
         // every other SE (#987 review). Their SEs report as 0, matching FIX.
         mp.sigma_override_fixed = vec![true; mp.sigma_override_addr.len()];
         final_params.mixture = Some(mp);
+    }
+
+    if exploration_hit_max {
+        let mut names = crate::estimation::saem_exploration::exploration_coord_names(
+            &init_params.theta_names,
+            &init_params.omega.eta_names,
+            init_params.omega_iov.as_ref().map(|m| m.eta_names.as_slice()),
+            &init_params.sigma.names,
+        );
+        if let Some(mix) = saem_mix.as_ref() {
+            names.extend(mix.mp.omega_override_addr.iter().map(|&(c, j)| {
+                let eta = init_params.omega.eta_names.get(j).map_or("?", String::as_str);
+                format!("OMEGA({eta}) class {}", c + 1)
+            }));
+        }
+        warnings.push(format!(
+            "SAEM: the exploration phase reached its maximum of {k_max} iterations while a \
+             parameter trajectory had not been shown stationary (still drifting, or too few \
+             iterations to test at its autocorrelation: {}). The convergence \
+             phase averaged from there, so weakly identified variance components may be \
+             frozen above their optimum; raise `n_exploration_max` (or set \
+             `n_exploration`) and compare.",
+            crate::estimation::saem_exploration::drifting_summary(
+                &exploration_monitor.drifting(),
+                &names,
+                8,
+            )
+        ));
+    }
+    if verbose && auto_exploration {
+        eprintln!("SAEM: exploration ended after {k1} iterations (min {k_min}, max {k_max})");
     }
 
     if combined_additive_sigma_at_floor(model, &final_params) {
@@ -7352,6 +8920,9 @@ pub fn run_saem(
         saem_objective_value: saemobj.value(),
         saem_n_subjects_hmc,
         saem_mh_accept_tail,
+        saem_n_exploration_used: Some(k1),
+        saem_gradient_kernel,
+        saem_kernels: schedule.map(|s| s.describe()),
         // The optimizer of the numerical M-step when one runs: not under `score_sa`, and not
         // where the closed-form σ update leaves no numerical θ/σ solve to run
         // (`scalar_residual_model`; the solve is skipped at both of its call sites).
@@ -7471,7 +9042,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -7593,7 +9164,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(1715);
         opts.run_covariance_step = false;
@@ -7646,7 +9217,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -7678,7 +9249,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -8090,7 +9661,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -8153,7 +9724,7 @@ mod tests {
         let pop = if iov { mix996_iov_pop(3) } else { mix996_pop(3) };
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -8196,7 +9767,7 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
             let mut opts = FitOptions::default();
             opts.method = crate::types::EstimationMethod::Saem;
-            opts.saem_n_exploration = 4;
+            opts.saem_n_exploration = Some(4);
             opts.saem_n_convergence = 2;
             opts.saem_seed = Some(2548);
             opts.run_covariance_step = false;
@@ -8315,7 +9886,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -8346,7 +9917,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -8381,7 +9952,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8415,7 +9986,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8504,7 +10075,7 @@ mod tests {
         let pop = covmuref_pop(false);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 6;
+        opts.saem_n_exploration = Some(6);
         opts.saem_n_convergence = 3;
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
@@ -8570,7 +10141,7 @@ mod tests {
         let pop = covmuref_pop(true);
         let mut saem = FitOptions::default();
         saem.method = crate::types::EstimationMethod::Saem;
-        saem.saem_n_exploration = 4;
+        saem.saem_n_exploration = Some(4);
         saem.saem_n_convergence = 2;
         saem.saem_seed = Some(1620);
         saem.run_covariance_step = false;
@@ -8609,7 +10180,7 @@ mod tests {
         let pop = covmuref_pop(true);
         let mut saem = FitOptions::default();
         saem.method = crate::types::EstimationMethod::Saem;
-        saem.saem_n_exploration = 4;
+        saem.saem_n_exploration = Some(4);
         saem.saem_n_convergence = 2;
         saem.saem_seed = Some(1620);
         saem.run_covariance_step = false;
@@ -8656,7 +10227,7 @@ mod tests {
         let pop = covmuref_pop(false);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8680,7 +10251,7 @@ mod tests {
         let pop = covmuref_pop(false);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
@@ -8700,7 +10271,7 @@ mod tests {
             let pop = covmuref_pop(true);
             let mut opts = FitOptions::default();
             opts.method = crate::types::EstimationMethod::Saem;
-            opts.saem_n_exploration = 3;
+            opts.saem_n_exploration = Some(3);
             opts.saem_n_convergence = 2;
             opts.saem_seed = Some(1630);
             opts.run_covariance_step = false;
@@ -8751,7 +10322,7 @@ mod tests {
         let pop = covmuref_pop(true);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 3;
+        opts.saem_n_exploration = Some(3);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
@@ -8780,7 +10351,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8914,7 +10485,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -10804,7 +12375,7 @@ DV ~ additive(EPS)
         let model = mix_iov_model();
         let population = mix_iov_pop();
         let opts = FitOptions {
-            saem_n_exploration: 3,
+            saem_n_exploration: Some(3),
             saem_n_convergence: 2,
             saem_n_mh_steps: 4,
             saem_omega_burnin: 0,
@@ -10934,7 +12505,7 @@ DV ~ additive(EPS)
         crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
 
         let opts = FitOptions {
-            saem_n_exploration: 2,
+            saem_n_exploration: Some(2),
             saem_n_convergence: 0,
             run_covariance_step: false,
             verbose: false,
@@ -11892,7 +13463,7 @@ DV ~ additive(EPS)
         let pop = mix996_pop(4);
         let opts = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 40,
+            saem_n_exploration: Some(40),
             saem_n_convergence: 20,
             saem_adapt_interval: 25,
             // `omega_burnin = 30` puts the whole reported window (iterations
@@ -11904,6 +13475,9 @@ DV ~ additive(EPS)
             saem_scale_deadband: band,
             saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
+            // The random walk's acceptance mechanics are the subject (#2986 made NONMEM's
+            // kernels the default).
+            saem_kernel: crate::types::SaemKernel::RandomWalk,
             ..FitOptions::default()
         };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
@@ -11921,11 +13495,14 @@ DV ~ additive(EPS)
         let pop = mix996_pop(4);
         let base = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 40,
+            saem_n_exploration: Some(40),
             saem_n_convergence: 20,
             saem_adapt_interval: 25,
             saem_seed: Some(1444),
             run_covariance_step: false,
+            // The random-walk scale rule is what this pins, so a kernel that runs the random
+            // walks: the default `hmc` preset runs none (#2986).
+            saem_kernel: crate::types::SaemKernel::Nonmem,
             ..FitOptions::default()
         };
         // Arm 1: the options left alone. Arm 2: exactly what #1449 says the
@@ -12197,13 +13774,14 @@ DV ~ additive(EPS)
         let pop = mix996_pop(4);
         let opts = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 40,
+            saem_n_exploration: Some(40),
             saem_n_convergence: 5,
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_scale_adaptation: ScaleAdaptation::Interval,
             saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
+            saem_kernel: crate::types::SaemKernel::RandomWalk,
             ..FitOptions::default()
         };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
@@ -12557,6 +14135,10 @@ DV ~ additive(EPS)
 #[cfg(test)]
 #[path = "saem_hotpath_tests.rs"]
 mod hotpath_tests;
+
+#[cfg(test)]
+#[path = "saem_gradient_kernel_tests.rs"]
+mod gradient_kernel_tests;
 
 #[cfg(test)]
 #[path = "saem_mstep_sa_tests.rs"]

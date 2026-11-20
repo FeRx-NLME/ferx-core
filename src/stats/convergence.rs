@@ -154,6 +154,40 @@ pub fn effective_sample_size(chains: &[Vec<f64>]) -> f64 {
     ess.min((m * n) as f64)
 }
 
+/// Integrated autocorrelation time `τ = 1 + 2 Σ_k ρ_k` of a single series, with
+/// Geyer's initial-positive truncation (pairs `ρ_2m + ρ_2m+1` are summed while
+/// positive). Unlike [`effective_sample_size`], the autocorrelations are computed
+/// lazily and the sum stops as soon as `τ` reaches `cap`, so the cost is
+/// `O(n · lags used)` rather than `O(n²)` — for callers that only need to know
+/// `min(τ, cap)`, every iteration of a long run. Returns at least `1`; a constant or
+/// too-short (`< 4`) series returns `1`.
+pub(crate) fn integrated_autocorr_time(x: &[f64], cap: f64) -> f64 {
+    let n = x.len();
+    if n < 4 {
+        return 1.0;
+    }
+    let mu = mean(x);
+    let var = x.iter().map(|v| (v - mu).powi(2)).sum::<f64>() / n as f64;
+    if var.is_nan() || var <= 0.0 {
+        return 1.0;
+    }
+    let rho = |k: usize| autocov(x, k, mu) / var;
+    let mut tau = -1.0;
+    let mut k = 0;
+    while k + 1 < n / 2 {
+        let pair = rho(k) + rho(k + 1);
+        if pair <= 0.0 {
+            break;
+        }
+        tau += 2.0 * pair;
+        if tau >= cap {
+            return cap;
+        }
+        k += 2;
+    }
+    tau.max(1.0)
+}
+
 /// Inverse standard-normal CDF (probit). Delegates to the shared Acklam
 /// approximation ([`crate::stats::special::normal_inv_cdf`]); the explicit clamp
 /// to `[1e-12, 1 − 1e-12]` reproduces this module's historical open-interval edge
@@ -242,6 +276,30 @@ mod tests {
     fn iid_normal_chains(m: usize, n: usize, seed: u64) -> Vec<Vec<f64>> {
         let mut rng = StdRng::seed_from_u64(seed);
         (0..m).map(|_| (0..n).map(|_| StandardNormal.sample(&mut rng)).collect()).collect()
+    }
+
+    #[test]
+    fn integrated_autocorr_time_matches_ar1_and_respects_the_cap() {
+        // AR(1) with rho = 0.8: tau = (1 + rho) / (1 - rho) = 9.
+        let mut rng = StdRng::seed_from_u64(11);
+        let rho = 0.8_f64;
+        let mut x = 0.0_f64;
+        let series: Vec<f64> = (0..20_000)
+            .map(|_| {
+                let e: f64 = StandardNormal.sample(&mut rng);
+                x = rho * x + (1.0 - rho * rho).sqrt() * e;
+                x
+            })
+            .collect();
+        let tau = integrated_autocorr_time(&series, 1e9);
+        assert!((7.5..10.5).contains(&tau), "tau {tau}");
+        assert_eq!(integrated_autocorr_time(&series, 4.0), 4.0, "capped");
+        // iid draws: tau near 1, never below 1.
+        let iid = &iid_normal_chains(1, 5000, 12)[0];
+        let t = integrated_autocorr_time(iid, 1e9);
+        assert!((1.0..1.3).contains(&t), "iid tau {t}");
+        assert_eq!(integrated_autocorr_time(&[2.0; 50], 1e9), 1.0, "constant");
+        assert_eq!(integrated_autocorr_time(&[1.0, 2.0], 1e9), 1.0, "too short");
     }
 
     #[test]

@@ -699,6 +699,16 @@ pub(crate) struct IndividualNllPrep {
 }
 
 impl IndividualNllPrep {
+    /// The subject's per-observation residual endpoint keys (`ErrorSpec::obs_keys`).
+    pub(crate) fn err_keys(&self) -> &[usize] {
+        &self.err_keys
+    }
+
+    /// The subject's residual-magnitude multipliers (`CompiledModel::ruv_obs_mult`).
+    pub(crate) fn ruv_mult(&self) -> Option<&[Vec<f64>]> {
+        self.ruv_mult.as_deref()
+    }
+
     /// Point an existing (possibly empty) prep at a subject, reusing the key
     /// buffer's allocation. There is deliberately no `new`: every caller holds a
     /// long-lived scratch and refreshes it per subject.

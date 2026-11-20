@@ -127,7 +127,7 @@ fn covariate_mu_refs_are_detected_in_both_anchor_models() {
 #[test]
 fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
     let (model, pop) = load("covmuref_additive_saem_fit.ferx", "covmuref_additive.csv");
-    let opts = FitOptions { saem_n_exploration: 2, saem_n_convergence: 1, ..saem_opts() };
+    let opts = FitOptions { saem_n_exploration: Some(2), saem_n_convergence: 1, ..saem_opts() };
     let result = fit(&model, &pop, &model.default_params, &opts).expect("short SAEM must run");
     assert!(
         result.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
@@ -168,7 +168,7 @@ fn an_if_else_assigned_covariate_local_joins_the_group() {
     assert_eq!(g.transform, d.transform);
     assert!(numeric.covariate_mu_refs.is_empty(), "{:?}", numeric.covariate_mu_refs);
 
-    let opts = FitOptions { saem_n_exploration: 2, saem_n_convergence: 1, ..saem_opts() };
+    let opts = FitOptions { saem_n_exploration: Some(2), saem_n_convergence: 1, ..saem_opts() };
     // (named in the ETA-less advisory, named in the carries-an-ETA advisory)
     let advisories_naming_th_wt = |model: &ferx_core::CompiledModel| {
         let result = fit(model, &pop, &model.default_params, &opts).expect("short SAEM must run");
@@ -465,7 +465,7 @@ fn score_sa_reaches_the_allometric_exponent_on_a_longer_schedule() {
         "score_sa @ 300/700",
         FitOptions {
             saem_mstep_solver: SaemMstepSolver::ScoreSa,
-            saem_n_exploration: 300,
+            saem_n_exploration: Some(300),
             saem_n_convergence: 700,
             outer_maxiter: 1000,
             ..saem_opts()
@@ -525,10 +525,12 @@ fn assert_mstep_arm_recovers_th_wt(name: &str, opts: FitOptions) {
 /// closed form does not hold there. Fast: the fit is cut to a handful of
 /// iterations, and what is asserted is the warning, not the estimate.
 ///
-/// The out-of-scope shape used here is a **residual magnitude** (`weight = …`),
-/// which is the case closest to in-scope — θ reaches the residual variance
-/// through a second channel the expected-information closed form does not carry
-/// — and which runs on the same data as the in-scope control.
+/// The out-of-scope shape used here is a **residual magnitude that reads a θ**
+/// (`ADD_ERR * (1 + TVCL/100·WT)`), which is the case closest to in-scope — θ
+/// reaches the residual variance through a second channel the expected-information
+/// closed form does not carry — and which runs on the same data as the in-scope
+/// control. A θ-free magnitude (`weight = WT` alone) is in scope since #3064: it is
+/// a per-observation constant.
 ///
 /// It takes **three** edits, not one: the parser refuses `weight =` on a purely
 /// proportional error ("a common scale factor cancels out of a proportional
@@ -543,7 +545,7 @@ fn assert_mstep_arm_recovers_th_wt(name: &str, opts: FitOptions) {
 fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
     let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
     let short = |mut o: FitOptions| {
-        o.saem_n_exploration = 2;
+        o.saem_n_exploration = Some(2);
         o.saem_n_convergence = 2;
         o.saem_n_mh_steps = 2;
         o
@@ -570,7 +572,7 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
         .replace("  sigma PROP_ERR ~ 0.02", "  sigma PROP_ERR ~ 0.02\n  sigma ADD_ERR  ~ 0.50 (sd)")
         .replace(
             "DV ~ proportional(PROP_ERR)",
-            "DV ~ combined(PROP_ERR, ADD_ERR) weight = WT
+            "DV ~ combined(PROP_ERR, ADD_ERR * (1.0 + TVCL / 100.0 * WT)) weight = WT
 
 [covariates]
   WT continuous",
@@ -635,7 +637,7 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
     let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
 
     let short = |mut o: FitOptions| {
-        o.saem_n_exploration = 8;
+        o.saem_n_exploration = Some(8);
         o.saem_n_convergence = 8;
         o.saem_n_mh_steps = 3;
         o
@@ -729,7 +731,7 @@ fn mstep_damping_reaches_sigma_under_score_sa() {
             saem_mstep_solver: SaemMstepSolver::ScoreSa,
             saem_mstep_damping: damping,
             mu_referencing,
-            saem_n_exploration: 25,
+            saem_n_exploration: Some(25),
             saem_n_convergence: 10,
             saem_n_mh_steps: 3,
             ..saem_opts()
@@ -950,7 +952,7 @@ fn saem_recovers_a_shared_allometric_exponent_on_every_mstep_arm() {
     let sa = fit_shared_seeds(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
     assert_saem_shared_arm("SAEM score_sa 150/250", &sa);
     let long = fit_shared_seeds(|o| {
-        o.saem_n_exploration = 300;
+        o.saem_n_exploration = Some(300);
         o.saem_n_convergence = 700;
     });
     assert_saem_shared_arm("SAEM 300/700", &long);
@@ -1114,7 +1116,7 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
         .map(|seed| {
             fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
                 o.saem_seed = Some(seed);
-                o.saem_n_exploration = 300;
+                o.saem_n_exploration = Some(300);
                 o.saem_n_convergence = 700;
             })
         })

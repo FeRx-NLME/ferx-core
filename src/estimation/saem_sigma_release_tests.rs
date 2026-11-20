@@ -316,7 +316,7 @@ fn a_well_identified_sigma_is_released_in_a_production_fit() {
     let pop = release_fit_population(&model);
     let mut opts = FitOptions::default();
     opts.method = crate::types::EstimationMethod::Saem;
-    opts.saem_n_exploration = 3;
+    opts.saem_n_exploration = Some(3);
     opts.saem_n_convergence = 1;
     opts.saem_seed = Some(1464);
     opts.run_covariance_step = false;

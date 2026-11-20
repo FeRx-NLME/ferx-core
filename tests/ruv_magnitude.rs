@@ -149,7 +149,7 @@ fn saem_ofv(ruv_late_init: &str) -> f64 {
     opts.method = EstimationMethod::Saem;
     opts.methods = vec![];
     // A couple of cheap passes: this is a wiring check, not a convergence test.
-    opts.saem_n_exploration = 2;
+    opts.saem_n_exploration = Some(2);
     opts.saem_n_convergence = 2;
     opts.saem_seed = Some(1);
     let result = fit(&model, &population, &model.default_params, &opts)
@@ -227,7 +227,7 @@ fn endpoint_magnitude_ofv(tpf: &str, method: EstimationMethod) -> f64 {
         verbose: false,
         checkpoint: false,
         threads: Some(2),
-        saem_n_exploration: 2,
+        saem_n_exploration: Some(2),
         saem_n_convergence: 2,
         saem_seed: Some(1),
         ..FitOptions::default()

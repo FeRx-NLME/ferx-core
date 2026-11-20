@@ -3439,6 +3439,17 @@ impl ErrorModel {
         }
     }
 
+    /// [`Self::sigma_types`]`[slot]` without the allocation, for per-observation hot loops.
+    pub(crate) fn sigma_type(self, slot: usize) -> Option<SigmaType> {
+        match (self, slot) {
+            (ErrorModel::Proportional, 0) => Some(SigmaType::Proportional),
+            (ErrorModel::Additive, 0) => Some(SigmaType::Additive),
+            (ErrorModel::Combined | ErrorModel::LogCombined, 0) => Some(SigmaType::Proportional),
+            (ErrorModel::Combined | ErrorModel::LogCombined, 1) => Some(SigmaType::Additive),
+            _ => None,
+        }
+    }
+
     /// Number of sigma parameters this error model consumes.
     pub fn n_sigma(self) -> usize {
         match self {
@@ -6539,6 +6550,14 @@ impl CompiledModel {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
+    /// Whether an active residual magnitude reads a θ (`RuvMagnitude::theta_dependent`): then θ
+    /// reaches the residual variance directly, not only through the prediction. A θ-free one —
+    /// every `weight = <covariate>` model, the MBMA SE weighting — is a per-observation constant
+    /// for a fixed dataset (#3064).
+    pub(crate) fn ruv_magnitude_reads_theta(&self) -> bool {
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active() && m.theta_dependent)
+    }
+
     /// Exact number of free coordinates the outer optimizer searches over.
     /// This uses the same packed FIX and structural-zero masks as estimation,
     /// including diagonal/separate BSV and IOV blocks and mixture overrides.
@@ -8657,6 +8676,18 @@ pub struct FitResult {
     /// across whichever ran (issue #1444).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saem_mh_accept_tail: Option<f64>,
+    /// Exploration-phase length SAEM actually ran (fixed `n_exploration`, or the
+    /// iteration the automatic stop chose). `None` for non-SAEM methods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_n_exploration_used: Option<usize>,
+    /// How the gradient E-step kernel ran (`saem_kernel = hmc | nuts`); `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_gradient_kernel: Option<SaemGradientKernelStats>,
+    /// The SAEM E-step's kernels as they ran, per chain per iteration (`hmc 1, imh 1`): the
+    /// `saem_kernel` preset with the `isample_*` counts the caller set. `None` for non-SAEM
+    /// methods and the legacy `rw` / `imh` kernels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_kernels: Option<String>,
     /// The numerical θ/σ M-step optimizer a SAEM, IMP or IMPMAP fit actually ran
     /// (`newton`, `bobyqa` or `lbfgs`): what `[fit_options] mstep_optimizer = auto`
     /// (the default) resolved to for this model. `None` for other methods and where no
@@ -9708,8 +9739,75 @@ pub struct FitOptions {
     /// Max evaluations for the global pre-search (0 = auto).
     pub global_maxeval: usize,
     // SAEM-specific options
-    pub saem_n_exploration: usize,
+    /// Length of SAEM's exploration phase (step size γ = 1).
+    ///
+    /// `None` (the default, `n_exploration` absent from the model file) ends the
+    /// phase by NONMEM's termination test with an autocorrelation-chosen interval:
+    /// at least [`Self::saem_exploration_min`] iterations, then as soon as no
+    /// tracked trajectory (complete-data −log L, θ, Ω, σ) shows a significant trend
+    /// over its latest ten spaced iterates, but never beyond
+    /// [`Self::saem_exploration_max`]. `Some(n)` — `n_exploration = n` — is a
+    /// fixed length and takes precedence over both bounds. The length a run
+    /// used is reported in [`FitResult::saem_n_exploration_used`].
+    pub saem_n_exploration: Option<usize>,
+    /// Minimum exploration length under the automatic stop (default 150, the
+    /// former fixed length and Monolix's minimum). Ignored when
+    /// `saem_n_exploration` is `Some`.
+    pub saem_exploration_min: usize,
+    /// Maximum exploration length under the automatic stop (default 4000, NONMEM's
+    /// `NBURN` under `AUTO=1`). Ignored when `saem_n_exploration` is `Some`.
+    pub saem_exploration_max: usize,
+    /// Exponent `a` of the convergence-phase step `γ_k = 1/(k − K1)^a`
+    /// (default `1.0`, the classical Kuhn–Lavielle choice; Monolix uses `0.7`).
+    /// Must lie in `(0.5, 1]` — the Robbins–Monro conditions `Σγ = ∞`, `Σγ² < ∞`.
+    pub saem_smoothing_exponent: f64,
     pub saem_n_convergence: usize,
+    /// Independent η chains per subject in SAEM (default `2`, NONMEM's `ISAMPLE=2`).
+    /// Each SAEM iteration draws one η per chain and the sufficient statistics and
+    /// M-step use all of them, which lowers the Monte Carlo noise of every
+    /// iteration. Implemented as Monolix describes its chains: the dataset is
+    /// replicated `n` times for the SAEM iterations, and the final EBEs, OFV and
+    /// covariance step use the original subjects. `1` is the single-chain SAEM.
+    pub saem_n_chains: usize,
+    /// The SAEM E-step's kernels, as counts per chain per iteration (#2986): any combination,
+    /// run in the fixed order `hmc, nuts, mala, m1, imh, m1b, m2, m3`, every one of them leaving the
+    /// subject's conditional posterior invariant. A count left `None` is taken from the
+    /// [`Self::saem_kernel`] preset (see [`SaemKernel`]); a count set here overrides it.
+    /// `0` turns a kernel off. Ignored under the legacy presets `rw` and `imh`.
+    ///
+    /// `m1`: independence proposals from the population density `N(0, Ω)` (NONMEM
+    /// `ISAMPLE_M1`).
+    pub saem_isample_m1: Option<usize>,
+    /// `imh`: f-SAEM independence proposals from the subject's Laplace approximation
+    /// `N(η̂_i, c·Γ_i)` (Karimi, Lavielle & Moulines 2020), refreshed every
+    /// `saem_imh_refresh` iterations, during exploration only (the f-SAEM authors' practice;
+    /// #2986). Where the model is outside its scope its count runs as `m1`.
+    pub saem_isample_imh: Option<usize>,
+    /// `m1b`: independence proposals from the chain's running conditional mean and covariance
+    /// (NONMEM `ISAMPLE_M1B`).
+    pub saem_isample_m1b: Option<usize>,
+    /// `hmc`: preconditioned Hamiltonian Monte Carlo transitions on the AD engine's exact
+    /// η-gradient (joint with κ under IOV). A chain the engine gives no gradient for runs two
+    /// `m2` and two `m3` moves in their place that iteration.
+    pub saem_isample_hmc: Option<usize>,
+    /// `nuts`: No-U-Turn transitions, otherwise as `hmc`.
+    pub saem_isample_nuts: Option<usize>,
+    /// `mala`: preconditioned Metropolis-adjusted Langevin transitions — one leapfrog step,
+    /// the proposal `η + ½ε²·M⁻¹(−∇U) + ε·L·ξ` — with their own step size, adapted towards
+    /// an acceptance probability of 0.574; otherwise as `hmc`.
+    pub saem_isample_mala: Option<usize>,
+    /// `m2`: block random-walk proposals `η + s·chol(Ω)·z` (NONMEM `ISAMPLE_M2`).
+    pub saem_isample_m2: Option<usize>,
+    /// `m3`: componentwise random-walk sweeps (NONMEM `ISAMPLE_M3`).
+    pub saem_isample_m3: Option<usize>,
+    /// [`SaemKernel::Nonmem`]: target acceptance of the random-walk kernels (NONMEM
+    /// `IACCEPT`, default 0.4).
+    pub saem_iaccept: f64,
+    /// [`SaemKernel::Nonmem`]: NONMEM's `MCETA` for SAEM — when larger than `isample_m1`,
+    /// kernels M1, M2 and M3 each run this many proposals on the **first** iteration, a
+    /// robust initial search for each subject's η (NONMEM 7.5; `AUTO=2` uses 100). `0`
+    /// (the default, NONMEM's) leaves the first iteration like every other.
+    pub saem_mceta: usize,
     /// Number of block-kernel MH proposals per subject per SAEM outer
     /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
     /// file — to size it from the dataset.
@@ -9846,7 +9944,7 @@ pub struct FitOptions {
     /// warms up. Prevents the iteration-1 Ω collapse on sparse data, where a
     /// cold-start chain (η = 0, few MH steps) yields a tiny `(1/N)Σηηᵀ` that
     /// the γ=1 M-step would otherwise install as Ω, starving the proposal.
-    /// Clamped to `saem_n_exploration` at use. `0` disables the burn-in.
+    /// Clamped to the exploration length (the minimum under the automatic stop) at use. `0` disables the burn-in.
     pub saem_omega_burnin: usize,
     pub saem_seed: Option<u64>,
     /// Run a post-fit conditional-distribution pass after SAEM converges.
@@ -9877,9 +9975,10 @@ pub struct FitOptions {
     /// back to MH otherwise.
     pub saem_n_leapfrog: usize,
     /// The SAEM E-step's primary kernel, set via `[fit_options] saem_kernel`
-    /// (#1449). Defaults to [`SaemKernel::RandomWalk`], the historical block
-    /// random walk; [`SaemKernel::Imh`] is the opt-in f-SAEM independent
-    /// Metropolis-Hastings kernel. See [`SaemKernel`] for when it pays.
+    /// (#1449). Defaults to [`SaemKernel::Nonmem`], NONMEM's four η kernels (#2986);
+    /// [`SaemKernel::RandomWalk`] is the historical block random walk and
+    /// [`SaemKernel::Imh`] the opt-in f-SAEM independent Metropolis-Hastings kernel. See
+    /// [`SaemKernel`] for when each pays.
     pub saem_kernel: SaemKernel,
     /// Independent-MH proposals per subject per SAEM iteration under
     /// [`SaemKernel::Imh`] (`[fit_options] saem_imh_proposals`). Each costs one
@@ -10432,9 +10531,24 @@ impl Default for FitOptions {
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
-            saem_n_exploration: 150,
-            saem_n_convergence: 250,
-            // 0 = `auto` (`estimation::saem::auto_n_mh_steps`, #1459).
+            saem_n_exploration: None,
+            saem_exploration_min: 150,
+            saem_exploration_max: 4000,
+            saem_smoothing_exponent: 1.0,
+            saem_n_convergence: 1000,
+            saem_n_chains: 2,
+            saem_isample_m1: None,
+            saem_isample_m1b: None,
+            saem_isample_m2: None,
+            saem_isample_m3: None,
+            saem_isample_imh: None,
+            saem_isample_hmc: None,
+            saem_isample_nuts: None,
+            saem_isample_mala: None,
+            saem_iaccept: 0.4,
+            saem_mceta: 0,
+            // 0 = `auto`: resolved from the dataset by
+            // `estimation::saem::auto_n_mh_steps` (#1459).
             saem_n_mh_steps: 0,
             saem_adapt_interval: 50,
             saem_scale_adaptation: ScaleAdaptation::default(),
@@ -10627,9 +10741,36 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// How many threads hold an override (`LOCAL_BLOQ_OVERRIDE` is `Some`), so
+/// [`CompiledModel::bloq_in_force`] can skip the thread-local read — on macOS a
+/// `_tlv_get_addr` call, once per likelihood evaluation (~3 % of an SAEM fit, #2986) —
+/// whenever no thread holds one, which is every fit without a per-call `bloq_method`.
+///
+/// Every change is a read-modify-write, so each value after a thread's increment includes
+/// it until that thread decrements: a thread holding an override never reads `0`. A thread
+/// that reads `0` holds none, and its thread-local would read `None` too. A thread that
+/// exits holding one leaves the count raised; that only turns the shortcut off.
+static BLOQ_OVERRIDES_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set this thread's override, keeping [`BLOQ_OVERRIDES_HELD`] in step. Returns the previous.
+fn replace_bloq_override(bloq: Option<BloqMethod>) -> Option<BloqMethod> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let prev = LOCAL_BLOQ_OVERRIDE.replace(bloq);
+    match (prev.is_some(), bloq.is_some()) {
+        (false, true) => {
+            BLOQ_OVERRIDES_HELD.fetch_add(1, Relaxed);
+        }
+        (true, false) => {
+            BLOQ_OVERRIDES_HELD.fetch_sub(1, Relaxed);
+        }
+        _ => {}
+    }
+    prev
+}
+
 /// Install `bloq` for a pool worker's whole lifetime (its `start_handler`).
 pub(crate) fn install_worker_bloq_override(bloq: Option<BloqMethod>) {
-    LOCAL_BLOQ_OVERRIDE.set(bloq);
+    replace_bloq_override(bloq);
 }
 
 /// Arms this call's `bloq_method` override on this thread until dropped (fan-out via
@@ -10641,12 +10782,12 @@ pub(crate) struct BloqOverrideGuard {
 
 /// See [`BloqOverrideGuard`]. `None` arms `None`, so a nested call reads its own model.
 pub(crate) fn arm_bloq_override(bloq: Option<BloqMethod>) -> BloqOverrideGuard {
-    BloqOverrideGuard { prev: LOCAL_BLOQ_OVERRIDE.replace(bloq) }
+    BloqOverrideGuard { prev: replace_bloq_override(bloq) }
 }
 
 impl Drop for BloqOverrideGuard {
     fn drop(&mut self) {
-        LOCAL_BLOQ_OVERRIDE.set(self.prev);
+        replace_bloq_override(self.prev);
     }
 }
 
@@ -10655,6 +10796,9 @@ impl CompiledModel {
     /// [`bloq_method`](Self::bloq_method) (#1824). The one reader of the field
     /// (`tests/bloq_in_force_is_the_one_reader.rs`).
     pub(crate) fn bloq_in_force(&self) -> BloqMethod {
+        if BLOQ_OVERRIDES_HELD.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return self.bloq_method;
+        }
         LOCAL_BLOQ_OVERRIDE.get().unwrap_or(self.bloq_method)
     }
 }
@@ -10729,8 +10873,8 @@ pub enum ScaleAdaptation {
 /// (#1449).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SaemKernel {
-    /// The block random walk `η + δ_i·chol(Ω)·z`, `n_mh_steps` proposals (default).
-    #[default]
+    /// The block random walk `η + δ_i·chol(Ω)·z`, `n_mh_steps` proposals, plus the
+    /// componentwise sweep (the default before #2986).
     RandomWalk,
     /// The f-SAEM independent MH kernel (Karimi, Lavielle & Moulines, CSDA 2020):
     /// `saem_imh_proposals` draws per subject from `N(η̂_i, c·Γ_i)` with
@@ -10743,6 +10887,37 @@ pub enum SaemKernel {
     /// with a warning. A subject without a curvature uses the random walk until its next
     /// refresh. Neither gate reads a clock, so seeded fits are reproducible.
     Imh,
+    /// NONMEM's SAEM/BAYES η kernels (Users Guide 7.5.1, `ISAMPLE_M1/M1B/M2/M3`), per
+    /// chain per iteration, in NONMEM's order: `isample_m1` independence proposals from
+    /// the population density `N(0, Ω)`; `isample_m1b` from the subject's running
+    /// conditional mean and covariance (its draws since the Ω burn-in); `isample_m2`
+    /// block random-walk proposals `η + s·chol(Ω)·z`; `isample_m3` componentwise sweeps.
+    /// The random-walk scales are adapted towards `iaccept` (0.4) within NONMEM's
+    /// `ISCALE` bounds `[1e-6, 1e6]`. The preset `m1 2, m1b 2, m2 2, m3 2` (#2986).
+    Nonmem,
+    /// NONMEM's independence kernels 1 and 1B, then one **preconditioned HMC** transition in
+    /// place of kernels 2 and 3 (#2986). The mass matrix is the inverse of the chain's running
+    /// conditional covariance (kernel 1B's moments; `Ω` before it has them), so the
+    /// near-Gaussian posterior is close to `N(0, I)` in the integrator's coordinates; the
+    /// integration time is about `π/2` (jittered), which there gives a nearly independent
+    /// draw in a few leapfrog steps; the step size is adapted per chain towards a Metropolis
+    /// acceptance probability of 0.8 during exploration and frozen after. The η-gradient is
+    /// the AD engine's exact one (with IOV, the stacked `[η, κ]` gradient's η block at the
+    /// chain's κ); a subject it gives none for takes kernels 2 and 3 instead. The default
+    /// (#2986): the preset `hmc 1, imh 1`.
+    #[default]
+    Hmc,
+    /// As [`SaemKernel::Hmc`], with a **NUTS** transition (Stan's multinomial No-U-Turn
+    /// sampler: trajectories doubled until they U-turn, diverge or reach depth 5) in place of
+    /// the fixed-length HMC one; the step size adapts towards a mean acceptance statistic of
+    /// 0.8.
+    Nuts,
+    /// As [`SaemKernel::Hmc`], with **MALA** transitions (the Metropolis-adjusted Langevin
+    /// algorithm: one leapfrog step, i.e. a gradient-drifted Gaussian proposal under the same
+    /// metric) in place of the HMC one, with their own step size adapted towards 0.574 (the
+    /// optimal MALA acceptance rate, Roberts & Rosenthal 1998). Cheaper per transition than
+    /// HMC and more local: the preset `mala 3, imh 1`.
+    Mala,
 }
 
 /// Which solver moves the SAEM numerical θ/σ M-step (`[fit_options] mstep_solver`,
@@ -11086,6 +11261,31 @@ pub enum SaemOfv {
     Agq,
     /// The FOCE/Laplace objective at the SAEM estimates (pre-#2973 behaviour).
     Focei,
+}
+
+/// How a SAEM fit's gradient E-step kernel ran (`saem_kernel = hmc | nuts | mala`, #2986), so a
+/// caller can see a sampler that struggled without parsing a warning.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct SaemGradientKernelStats {
+    /// Gradient transitions run (per chain per iteration where the AD engine gave the
+    /// η-gradient).
+    pub transitions: u64,
+    /// Chain-iterations the engine gave no gradient for, which ran NONMEM's kernels 2 and 3.
+    pub declined: u64,
+    /// Transitions in the averaging phase whose energy error exceeded 1000 or went
+    /// non-finite, or whose gradient failed mid-trajectory (rejected; Stan's divergences).
+    /// Exploration's are not counted: it starts far from the posterior.
+    pub divergences: u64,
+    /// Mean leapfrog steps per transition.
+    pub mean_leapfrog: f64,
+    /// Mean acceptance probability (HMC, MALA) or acceptance statistic (NUTS) over the
+    /// averaging phase, where the step size is frozen; `None` when that phase ran no
+    /// transition. With MALA beside HMC or NUTS, the trajectory kernel's: MALA has a step size
+    /// and target (0.574) of its own.
+    pub mean_accept: Option<f64>,
+    /// Median over chains of the frozen step size, in the metric's whitened coordinates
+    /// (bounded to `[0.02, 1.9]`); the trajectory kernel's where one runs, as `mean_accept`.
+    pub median_step_size: f64,
 }
 
 /// What the OFV of a SAEM fit is, when it is not the FOCE/Laplace value (#2973). Surfaced on
@@ -11701,7 +11901,21 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "n_exploration",
+            "n_exploration_min",
+            "n_exploration_max",
+            "smoothing_exponent",
             "n_convergence",
+            "n_chains",
+            "isample_m1",
+            "isample_m1b",
+            "isample_m2",
+            "isample_m3",
+            "isample_imh",
+            "isample_hmc",
+            "isample_nuts",
+            "isample_mala",
+            "iaccept",
+            "mceta",
             "n_mh_steps",
             "n_leapfrog",
             "saem_n_leapfrog",

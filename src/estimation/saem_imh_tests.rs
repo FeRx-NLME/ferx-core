@@ -1019,12 +1019,15 @@ fn imh_model_gate_rejects_the_shapes_the_curvature_does_not_score() {
 fn imh_opts(seed: u64) -> FitOptions {
     FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 6,
+        saem_n_exploration: Some(6),
         saem_n_convergence: 6,
         saem_seed: Some(seed),
         run_covariance_step: false,
         saem_kernel: SaemKernel::Imh,
         saem_imh_refresh: 2,
+        // These tests count kernel work per subject per iteration; one chain keeps
+        // the count the subjects' own (two would double it, #2986).
+        saem_n_chains: 1,
         ..Default::default()
     }
 }
@@ -1165,7 +1168,7 @@ fn imh_acceptance_never_steers_the_random_walk_scale() {
     let pop = population_of(&well_conditioned_subject(), 4);
     for rule in [ScaleAdaptation::RobbinsMonro, ScaleAdaptation::Interval] {
         let base = FitOptions {
-            saem_n_exploration: 30,
+            saem_n_exploration: Some(30),
             saem_n_convergence: 30,
             saem_adapt_interval: 10,
             saem_scale_adaptation: rule,
@@ -1205,11 +1208,12 @@ fn a_seeded_imh_fit_is_reproducible() {
     assert_ne!(a, c, "the seed does not reach the estimates — the comparison above is vacuous");
 }
 
-/// The default `saem_kernel` must not build a single proposal or spend a single
-/// IMH evaluation.
+/// The legacy f-SAEM kernel's own move is opt-in: `saem_kernel = rw` builds no proposal and
+/// spends no IMH evaluation (the default `hmc` preset's single `imh` jump is a counted kernel
+/// of its own, #2986).
 #[test]
 fn default_fit_options_leave_the_imh_kernel_untouched() {
-    assert_eq!(FitOptions::default().saem_kernel, SaemKernel::RandomWalk);
+    assert_eq!(FitOptions::default().saem_kernel, SaemKernel::Hmc);
     let model = parse_model_string(IV_MODEL).expect("parse");
     let pop = population_of(&well_conditioned_subject(), 3);
     let opts = FitOptions { saem_kernel: SaemKernel::RandomWalk, ..imh_opts(1) };
@@ -1552,7 +1556,7 @@ fn the_mixing_tally_leaves_the_imh_move_out() {
     let model = parse_model_string(IV_MODEL).expect("parse");
     let pop = population_of(&well_conditioned_subject(), 3);
     let opts = FitOptions {
-        saem_n_exploration: 10,
+        saem_n_exploration: Some(10),
         saem_n_convergence: 10,
         saem_omega_burnin: 0,
         ..imh_opts(9)
@@ -1619,10 +1623,14 @@ fn the_default_random_walk_fit_matches_main() {
     };
     let opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 8,
+        saem_n_exploration: Some(8),
         saem_n_convergence: 8,
         saem_seed: Some(11),
+        // Pinned to main's random-walk trajectory (#2986 made NONMEM's kernels the default).
+        saem_kernel: SaemKernel::RandomWalk,
         run_covariance_step: false,
+        // Pinned against main's single-chain trajectory (#2986 made two the default).
+        saem_n_chains: 1,
         ..Default::default()
     };
     let r = run_saem(&model, &pop, &model.default_params, &opts).expect("SAEM runs");
@@ -2226,7 +2234,7 @@ fn mstep_optimizer_reaches_the_saem_m_step() {
         MSTEP_ROUTE.with(|c| c.set([0; 3]));
         let o = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 6,
+            saem_n_exploration: Some(6),
             saem_n_convergence: 6,
             saem_seed: Some(3),
             run_covariance_step: false,

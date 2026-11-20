@@ -108,7 +108,7 @@ fn fit_with(
     opts.run_covariance_step = false;
     opts.verbose = false;
     opts.outer_maxiter = 300;
-    opts.saem_n_exploration = 80;
+    opts.saem_n_exploration = Some(80);
     opts.saem_n_convergence = 80;
     opts.saem_seed = Some(267);
 
@@ -250,7 +250,7 @@ fn sparse_fit(
     opts.run_covariance_step = false;
     opts.verbose = false;
     opts.outer_maxiter = 400;
-    opts.saem_n_exploration = 150;
+    opts.saem_n_exploration = Some(150);
     opts.saem_n_convergence = 250;
     opts.saem_seed = Some(seed);
     fit(model, pop, &model.default_params, &opts).expect("fit must succeed")
@@ -418,7 +418,7 @@ fn score_sa_does_not_bring_back_the_additive_sigma_collapse() {
         opts.run_covariance_step = false;
         opts.verbose = false;
         opts.outer_maxiter = 400;
-        opts.saem_n_exploration = 150;
+        opts.saem_n_exploration = Some(150);
         opts.saem_n_convergence = 250;
         opts.saem_seed = Some(seed);
         opts.saem_mstep_solver = SaemMstepSolver::ScoreSa;

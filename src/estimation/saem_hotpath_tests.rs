@@ -159,7 +159,7 @@ fn tv_population(with_occasions: bool) -> Population {
 
 fn saem_opts() -> FitOptions {
     FitOptions {
-        saem_n_exploration: 4,
+        saem_n_exploration: Some(4),
         saem_n_convergence: 3,
         saem_n_mh_steps: 4,
         saem_omega_burnin: 0,
@@ -941,7 +941,7 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
 
         let short = saem_opts();
         let long = FitOptions {
-            saem_n_exploration: short.saem_n_exploration * 3,
+            saem_n_exploration: short.saem_n_exploration.map(|n| n * 3),
             saem_n_convergence: short.saem_n_convergence * 3,
             ..short.clone()
         };
@@ -971,8 +971,8 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
         // `extra_iters · n` = 84. The bound below is a quarter of that: 21, so
         // 4× clear of the leak it must catch and 2.3× clear of the worst drift
         // it must tolerate.
-        let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
-            - short.saem_n_exploration
+        let extra_iters = (long.saem_n_exploration.unwrap() + long.saem_n_convergence
+            - short.saem_n_exploration.unwrap()
             - short.saem_n_convergence) as u64;
         let leak_bound = extra_iters * n as u64 / 4;
         assert!(
@@ -1026,10 +1026,15 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
 fn the_score_sa_mstep_rebuilds_the_event_schedule() {
     let (model, pop) = (time_only_model(), baseline_cov_population());
     let n = pop.subjects.len() as u64;
-    let short =
-        FitOptions { saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa, ..saem_opts() };
+    let short = FitOptions {
+        saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa,
+        // One rebuild per *data* subject per iteration is what is counted; a second
+        // chain would add one per copy (#2986).
+        saem_n_chains: 1,
+        ..saem_opts()
+    };
     let long = FitOptions {
-        saem_n_exploration: short.saem_n_exploration * 3,
+        saem_n_exploration: short.saem_n_exploration.map(|n| n * 3),
         saem_n_convergence: short.saem_n_convergence * 3,
         ..short.clone()
     };
@@ -1037,8 +1042,8 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
         with_build_count_1thread(|| run_bits_with(&model, &pop, opts)).1
     };
     let (a, b) = (count(&short), count(&long));
-    let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
-        - short.saem_n_exploration
+    let extra_iters = (long.saem_n_exploration.unwrap() + long.saem_n_convergence
+        - short.saem_n_exploration.unwrap()
         - short.saem_n_convergence) as u64;
     let drift = b.saturating_sub(a);
     // One build per subject per iteration, on the nose (measured 67 → 151 over
@@ -1313,4 +1318,108 @@ fn e_step_prep_is_built_inside_the_drawn_mixture_class() {
     let r = run_saem(&model, &pop, &model.default_params, &saem_opts())
         .expect("mixture SAEM run must succeed");
     assert!(r.ofv.is_finite(), "mixture SAEM produced a non-finite OFV");
+}
+
+/// #2986: the chain copies `run_saem` builds are registered with the fit, so the kernel JIT
+/// reads each one's plan key by address. Unregistered, every likelihood evaluation
+/// fingerprints the whole subject again (measured at ~28 % of a two-chain run). A fit
+/// fingerprints each data subject once (`fit`'s registration) and each copy once (the
+/// chains'), so at most three per subject with two chains — not one per evaluation.
+#[test]
+fn chain_copies_are_fingerprinted_once_not_per_evaluation() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::{
+        SUBJECT_DESC_MARK, SUBJECT_DESC_MARKED,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    // The pk2_big shape whose profile showed it: a two-compartment oral model with
+    // allometric covariates, evaluated through the planned (kernel-JIT) path.
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(3.0, 0.5, 30.0)
+  theta TVV1(20.0, 2.0, 200.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(40.0, 2.0, 400.0)
+  theta TVKA(1.0, 0.05, 10.0)
+  theta B_CL(0.75, 0.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.05
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^B_CL * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70) * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    )
+    .expect("two-compartment covariate model parses");
+    let mut pop = baseline_cov_population();
+    for s in &mut pop.subjects {
+        s.id = format!("{SUBJECT_DESC_MARK}{}", s.id);
+    }
+    let n = pop.subjects.len();
+    let opts = FitOptions {
+        method: crate::types::EstimationMethod::Saem,
+        saem_n_chains: 2,
+        run_covariance_step: false,
+        ..saem_opts()
+    };
+    let before = SUBJECT_DESC_MARKED.load(Relaxed);
+    crate::fit(&model, &pop, &model.default_params, &opts).expect("SAEM fit");
+    let calls = SUBJECT_DESC_MARKED.load(Relaxed) - before;
+    assert!(
+        calls <= 3 * n,
+        "{calls} subject fingerprints for {n} subjects × 2 chains: the chain copies are not \
+         registered, so every likelihood evaluation re-hashes its subject"
+    );
+}
+
+/// #2986: kernel 1B proposes from a chain's running draw moments — nothing before
+/// `NONMEM_M1B_MIN_DRAWS` draws, then their mean and the Cholesky factor of their
+/// covariance, and the diagonal when that covariance is not positive definite.
+#[test]
+fn m1b_proposal_reads_the_running_moments() {
+    use super::{m1b_proposal, NONMEM_M1B_MIN_DRAWS};
+    use nalgebra::DMatrix;
+    let draws = [[0.1, -0.2], [0.3, 0.0], [-0.1, 0.4], [0.2, 0.1]];
+    let n = NONMEM_M1B_MIN_DRAWS.max(draws.len());
+    let mut sum = vec![0.0; 2];
+    let mut sumsq = DMatrix::<f64>::zeros(2, 2);
+    for k in 0..n {
+        let e = draws[k % draws.len()];
+        for a in 0..2 {
+            sum[a] += e[a];
+            for b in 0..2 {
+                sumsq[(a, b)] += e[a] * e[b];
+            }
+        }
+    }
+    assert!(m1b_proposal(&sum, &sumsq, NONMEM_M1B_MIN_DRAWS - 1).is_none());
+    let (mean, l) = m1b_proposal(&sum, &sumsq, n).expect("enough draws");
+    let nf = n as f64;
+    for a in 0..2 {
+        assert!((mean[a] - sum[a] / nf).abs() < 1e-15);
+    }
+    let cov = &l * l.transpose();
+    for a in 0..2 {
+        for b in 0..2 {
+            let want = sumsq[(a, b)] / nf - mean[a] * mean[b];
+            assert!((cov[(a, b)] - want).abs() < 1e-12, "cov[{a},{b}] {} vs {want}", cov[(a, b)]);
+        }
+    }
+    // Identical draws: zero covariance, not positive definite — the floored diagonal.
+    let (_, l0) =
+        m1b_proposal(&[1.0, 2.0], &DMatrix::from_row_slice(2, 2, &[0.1, 0.2, 0.2, 0.4]), 10)
+            .expect("enough draws");
+    assert_eq!(l0[(0, 1)], 0.0);
+    assert_eq!(l0[(1, 0)], 0.0);
+    assert!(l0[(0, 0)] > 0.0 && l0[(1, 1)] > 0.0);
 }

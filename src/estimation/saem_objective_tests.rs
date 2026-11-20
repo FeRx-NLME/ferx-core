@@ -41,6 +41,26 @@ fn accumulator_is_minus_two_log_of_the_mean_density() {
 
 /// Nothing is ever exponentiated raw: at NLLs of 1e4 `exp(−nll)` underflows to zero, and the
 /// value is still the exact log-mean-exp.
+/// #2986: with `n_chains` the NLL slice holds every chain's copy of every subject
+/// (`chain · N + subject`). The chains pool into their subject's mean: one update with two
+/// chains is exactly two single-chain updates with the same draws — not a sum over 2N subjects.
+#[test]
+fn accumulator_pools_chain_copies_into_their_subject() {
+    let (a1, b1, a2, b2) = (3.1, 7.4, 2.6, 8.2);
+    let mut pooled = SaemObjAccumulator::new(2, true, false);
+    pooled.update(&[a1, b1, a2, b2]);
+    let mut serial = SaemObjAccumulator::new(2, true, false);
+    serial.update(&[a1, b1]);
+    serial.update(&[a2, b2]);
+    assert_eq!(pooled.value(), serial.value());
+    // No random effect: every chain's value is the same; the first is read.
+    let mut last = SaemObjAccumulator::new(2, true, true);
+    last.update(&[a1, b1, a1, b1]);
+    let mut last1 = SaemObjAccumulator::new(2, true, true);
+    last1.update(&[a1, b1]);
+    assert_eq!(last.value(), last1.value());
+}
+
 #[test]
 fn accumulator_survives_nlls_whose_exponential_underflows() {
     let mut acc = SaemObjAccumulator::new(1, true, false);

@@ -81,7 +81,7 @@
 //! M-steps prefer the group. FOCE / FOCEI / Laplace fits are byte-identical with
 //! and without a group.
 
-use crate::parser::model_parser::{eval_typical_value, CovariateSnapshot};
+use crate::parser::model_parser::CompiledTypical;
 use crate::types::{CompiledModel, CovariateMuRef, MuTransform, Population, Subject};
 use nalgebra::{DMatrix, DVector};
 
@@ -101,30 +101,245 @@ pub(crate) struct GroupMember<'m> {
     pub eta_idx: usize,
     pub transform: MuTransform,
     spec: &'m CovariateMuRef,
+    /// The covariates the typical value reads, in the order of [`Self::compiled`]'s slots.
+    names: Vec<String>,
+    /// The typical value compiled once (#2986): bit for bit the interpreter's value, and the
+    /// generic VM the M-step's exact ∂A/∂θ runs on.
+    compiled: CompiledTypical,
+    /// [`Self::distinct_slots`] of the last population asked for, keyed by its address and
+    /// size: a fit asks for the same one every iteration, and its covariates do not change.
+    slots_cache: std::sync::Mutex<Option<(usize, usize, std::sync::Arc<DistinctSlots>)>>,
+    /// [`Self::linear_form`] for the last population and free set asked for (`None` inside:
+    /// the mu is not linear in the mixed coordinates, so the solve iterates).
+    #[allow(clippy::type_complexity)]
+    linear_cache:
+        std::sync::Mutex<Option<(usize, usize, Vec<usize>, Option<std::sync::Arc<LinearForm>>)>>,
 }
 
-impl GroupMember<'_> {
+/// How a free θ enters a mu that is affine in the mixed coordinates `z` (#2986): `z = log θ`
+/// for a multiplicative scale (`TVCL` in `log(TVCL·(WT/70)^B)`), `z = θ` for an exponent or
+/// slope (`B`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinRole {
+    Lin,
+    Log,
+}
+
+/// A member's mu over its distinct covariate vectors as `μ_u(θ) = c_u + X_u·z(θ)` with `X`
+/// constant: the closed-form M-step solves one least-squares problem in `z` instead of
+/// iterating Levenberg–Marquardt in θ.
+struct LinearForm {
+    roles: Vec<LinRole>,
+    /// `∂μ_u/∂z_j`, one row per distinct covariate vector.
+    x: DMatrix<f64>,
+}
+
+impl<'m> GroupMember<'m> {
     /// `g(A_i(θ))` for one subject: `log A_i` under the lognormal link, `A_i`
     /// itself under the logit link (the typical value is already on the logit
     /// scale). `NaN` when the lognormal typical value is not positive — the
     /// caller treats a `NaN` mu as "this θ is not admissible".
     pub fn mu(&self, theta: &[f64], subject: &Subject) -> f64 {
-        let a = eval_typical_value(&self.spec.typical, theta, &subject.covariates);
-        self.link(a)
+        self.mu_at(theta, &self.covariate_slots(subject))
     }
 
-    /// [`Self::mu`] over a subject's covariates read once ([`Self::snapshots`]).
-    fn mu_snapshot(&self, theta: &[f64], snapshot: &CovariateSnapshot<'_>) -> f64 {
-        self.link(self.spec.typical.eval_snapshot(theta, snapshot))
+    fn new(eta_idx: usize, spec: &'m CovariateMuRef) -> Self {
+        let names = spec.typical.covariate_names();
+        let compiled = spec.typical.compile(&names);
+        GroupMember {
+            eta_idx,
+            transform: spec.transform,
+            spec,
+            names,
+            compiled,
+            slots_cache: std::sync::Mutex::new(None),
+            linear_cache: std::sync::Mutex::new(None),
+        }
     }
 
-    /// Each subject's covariates this member's typical value reads, looked up once for a solve
-    /// that evaluates [`Self::mu_snapshot`] at many θ. `names` is
-    /// `TypicalProgram::covariate_names`.
-    fn snapshots<'n>(
-        &self, names: &'n [String], population: &Population,
-    ) -> Vec<CovariateSnapshot<'n>> {
-        population.subjects.iter().map(|s| CovariateSnapshot::new(names, &s.covariates)).collect()
+    /// Whether this member's mu is affine in the mixed coordinates `z` over the free thetas
+    /// (see [`LinRole`]), and its constant design if so — decided once per population and
+    /// free set from the exact gradient at θ, at θ with each free θ moved alone, and at θ with
+    /// all of them moved by different factors: a column `∂μ/∂θ_j` that does not move is linear
+    /// in `θ_j`, one whose `θ_j·∂μ/∂θ_j` does not move is linear in `log θ_j`. The points are
+    /// evidence, not proof; the solve also checks every value it returns against the mu itself
+    /// ([`solve_linear`]).
+    fn linear_form(
+        &self, theta: &[f64], d: &DistinctSlots, free: &[usize],
+    ) -> Option<std::sync::Arc<LinearForm>> {
+        let key = (d as *const DistinctSlots as usize, d.uniq.len());
+        let mut cache = self.linear_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((a, n, f, lf)) = cache.as_ref() {
+            if (*a, *n) == key && f.as_slice() == free {
+                return lf.clone();
+            }
+        }
+        let lf = self.detect_linear_form(theta, d, free).map(std::sync::Arc::new);
+        *cache = Some((key.0, key.1, free.to_vec(), lf.clone()));
+        lf
+    }
+
+    fn detect_linear_form(
+        &self, theta: &[f64], d: &DistinctSlots, free: &[usize],
+    ) -> Option<LinearForm> {
+        let nf = free.len();
+        if nf == 0 || d.uniq.is_empty() {
+            return None;
+        }
+        // θ itself, each free θ moved alone, and all of them moved by different factors: a
+        // common factor would let a homogeneous mu (`log(TVCL + c·TH)` is invariant to scaling
+        // both) pass for log-affine.
+        let moved = |t: &mut [f64], j: usize, factor: f64| {
+            t[j] = if t[j] > 0.0 {
+                t[j] * factor
+            } else {
+                t[j] + (factor - 1.0) * t[j].abs().max(1.0)
+            };
+        };
+        let mut points = vec![theta.to_vec()];
+        for &j in free {
+            let mut t = theta.to_vec();
+            moved(&mut t, j, 1.37);
+            points.push(t);
+        }
+        let mut all = theta.to_vec();
+        for (k, &j) in free.iter().enumerate() {
+            moved(&mut all, j, 0.71 + 0.13 * k as f64);
+        }
+        points.push(all);
+        let grads: Vec<Vec<Vec<f64>>> = points
+            .iter()
+            .map(|t| d.uniq.iter().map(|c| self.mu_grad(t, c, free)).collect::<Option<Vec<_>>>())
+            .collect::<Option<_>>()?;
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1e-12);
+        let mut roles = Vec::with_capacity(nf);
+        for (j, &t) in free.iter().enumerate() {
+            let np = points.len();
+            let lin =
+                (0..d.uniq.len()).all(|u| (1..np).all(|k| close(grads[0][u][j], grads[k][u][j])));
+            let log = points.iter().all(|p| p[t] > 0.0)
+                && (0..d.uniq.len()).all(|u| {
+                    let s = |k: usize| points[k][t] * grads[k][u][j];
+                    (1..np).all(|k| close(s(0), s(k)))
+                });
+            roles.push(if lin {
+                LinRole::Lin
+            } else if log {
+                LinRole::Log
+            } else {
+                return None;
+            });
+        }
+        let mut x = DMatrix::<f64>::zeros(d.uniq.len(), nf);
+        for u in 0..d.uniq.len() {
+            for (j, &t) in free.iter().enumerate() {
+                x[(u, j)] = match roles[j] {
+                    LinRole::Lin => grads[0][u][j],
+                    LinRole::Log => theta[t] * grads[0][u][j],
+                };
+            }
+        }
+        Some(LinearForm { roles, x })
+    }
+
+    /// The covariates this member's typical value reads, from one subject, in slot order
+    /// (absent reads `0.0`).
+    fn covariate_slots(&self, subject: &Subject) -> Vec<f64> {
+        self.names.iter().map(|n| subject.covariates.get(n).copied().unwrap_or(0.0)).collect()
+    }
+
+    /// The distinct [`Self::covariate_slots`] of the population, and each subject's index
+    /// into them, read once for a solve that evaluates [`Self::mu_at`] at many θ. A typical
+    /// value depends on θ and these slots alone, so a solve evaluates it once per distinct
+    /// vector: SAEM's chain copies share their subject's covariates (#2986), and a covariate
+    /// with few levels collapses further. Bit for bit the per-subject values.
+    fn distinct_slots(&self, population: &Population) -> std::sync::Arc<DistinctSlots> {
+        let key = (population as *const Population as usize, population.subjects.len());
+        let mut cache = self.slots_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((a, n, d)) = cache.as_ref() {
+            if (*a, *n) == key {
+                return d.clone();
+            }
+        }
+        let d = std::sync::Arc::new(self.build_distinct_slots(population));
+        *cache = Some((key.0, key.1, d.clone()));
+        d
+    }
+
+    fn build_distinct_slots(&self, population: &Population) -> DistinctSlots {
+        let mut index: std::collections::HashMap<Vec<u64>, usize> =
+            std::collections::HashMap::new();
+        let mut uniq: Vec<Vec<f64>> = Vec::new();
+        let of = population
+            .subjects
+            .iter()
+            .map(|s| {
+                let slots = self.covariate_slots(s);
+                let key: Vec<u64> = slots.iter().map(|v| v.to_bits()).collect();
+                *index.entry(key).or_insert_with(|| {
+                    uniq.push(slots);
+                    uniq.len() - 1
+                })
+            })
+            .collect();
+        DistinctSlots { uniq, of }
+    }
+
+    /// [`Self::mu_at`] at every distinct slot vector, or `None` at the first non-finite one —
+    /// the same verdict as a walk over the subjects, which reach exactly these vectors.
+    fn mus_distinct(&self, theta: &[f64], d: &DistinctSlots) -> Option<Vec<f64>> {
+        d.uniq.iter().map(|c| Some(self.mu_at(theta, c)).filter(|m| m.is_finite())).collect()
+    }
+
+    /// [`Self::mu`] at one subject's [`Self::covariate_slots`].
+    fn mu_at(&self, theta: &[f64], covariates: &[f64]) -> f64 {
+        self.link(self.compiled.eval(theta, covariates))
+    }
+
+    /// `∂μ/∂θ` over the thetas `free`, exactly: one pass of the typical value's VM on a forward
+    /// dual seeded on them (`sens::jet::DualT`, the type FOCEI/Laplace differentiate their
+    /// parameter programs with), then the link's derivative. `None` when the mu is not
+    /// admissible there, a derivative is not finite, or `free` is wider than the dispatch
+    /// below; the caller then takes finite differences.
+    fn mu_grad(&self, theta: &[f64], covariates: &[f64], free: &[usize]) -> Option<Vec<f64>> {
+        fn at<const N: usize>(
+            c: &CompiledTypical, theta: &[f64], covariates: &[f64], free: &[usize],
+        ) -> (f64, Vec<f64>) {
+            use crate::sens::jet::DualT;
+            use crate::sens::num::PkNum;
+            let seeded: Vec<DualT<N, f64>> = theta
+                .iter()
+                .enumerate()
+                .map(|(t, &v)| match free.iter().position(|&f| f == t) {
+                    Some(j) => <DualT<N, f64> as PkNum>::var(v, j),
+                    None => DualT::constant(v),
+                })
+                .collect();
+            let a = c.eval_g(&seeded, covariates);
+            (a.v, a.g.to_vec())
+        }
+        let c = &self.compiled;
+        let (a, da) = match free.len() {
+            1 => at::<1>(c, theta, covariates, free),
+            2 => at::<2>(c, theta, covariates, free),
+            3 => at::<3>(c, theta, covariates, free),
+            4 => at::<4>(c, theta, covariates, free),
+            5 => at::<5>(c, theta, covariates, free),
+            6 => at::<6>(c, theta, covariates, free),
+            7 => at::<7>(c, theta, covariates, free),
+            8 => at::<8>(c, theta, covariates, free),
+            _ => return None,
+        };
+        let g: Vec<f64> = match self.transform {
+            MuTransform::Log => {
+                if !(a.is_finite() && a > 0.0) {
+                    return None;
+                }
+                da.iter().map(|d| d / a).collect()
+            }
+            MuTransform::Logit | MuTransform::Identity | MuTransform::LogitProbability => da,
+        };
+        g.iter().all(|v| v.is_finite()).then_some(g)
     }
 
     fn link(&self, a: f64) -> f64 {
@@ -150,10 +365,19 @@ impl GroupMember<'_> {
         &self.spec.theta_names
     }
 
-    /// [`Self::mu`] over the population.
+    /// [`Self::mu`] over the population, evaluated once per distinct covariate vector.
     pub fn mus(&self, theta: &[f64], population: &Population) -> Vec<f64> {
-        population.subjects.iter().map(|s| self.mu(theta, s)).collect()
+        let d = self.distinct_slots(population);
+        let mu: Vec<f64> = d.uniq.iter().map(|c| self.mu_at(theta, c)).collect();
+        d.of.iter().map(|&u| mu[u]).collect()
     }
+}
+
+/// A member's distinct covariate vectors over a population and each subject's index into
+/// them ([`GroupMember::distinct_slots`]).
+struct DistinctSlots {
+    uniq: Vec<Vec<f64>>,
+    of: Vec<usize>,
 }
 
 /// The covariate mu-references one M-step moves together, resolved against the
@@ -589,14 +813,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         }
         let eta_shared = members.iter().any(|m| m.spec.eta_shared);
         groups.push(CovariateMuGroup {
-            members: members
-                .iter()
-                .map(|m| GroupMember {
-                    eta_idx: m.eta_idx,
-                    transform: m.spec.transform,
-                    spec: m.spec,
-                })
-                .collect(),
+            members: members.iter().map(|m| GroupMember::new(m.eta_idx, m.spec)).collect(),
             theta_idx,
             needs_data_term: time_varying || !outside.is_empty() || dropped_reader || eta_shared,
         });
@@ -683,11 +900,14 @@ fn prior_weight(omega: &DMatrix<f64>) -> DMatrix<f64> {
 /// Gauss–Newton with Levenberg–Marquardt damping on `residuals` over the free
 /// thetas, started at `input.theta` and kept inside the bounds. `residuals`
 /// returns the residual vector and its sum of squares, or `None` at an
-/// inadmissible θ. Returns the full natural theta vector, or `None` when the
-/// starting point itself is inadmissible.
+/// inadmissible θ. `jacobian` is the residual's exact Jacobian over the free thetas
+/// (#2986), or `None` where it cannot be had; that iteration then takes central
+/// differences of `residuals`. Returns the full natural theta vector, or `None`
+/// when the starting point itself is inadmissible.
 fn levenberg_marquardt(
     input: &GroupStepInput<'_>, free: &[usize],
     residuals: impl Fn(&[f64]) -> Option<(Vec<f64>, f64)>,
+    jacobian: impl Fn(&[f64]) -> Option<DMatrix<f64>>,
 ) -> Option<Vec<f64>> {
     let clamp = |t: usize, v: f64| -> f64 {
         let lo = input.theta_lower.get(t).copied().unwrap_or(f64::NEG_INFINITY);
@@ -701,21 +921,28 @@ fn levenberg_marquardt(
     let d = free.len();
     let mut lambda = 1e-3;
     for _ in 0..EXACT_MAX_ITER {
-        // Jacobian of the residual, central differences per free theta.
-        let mut jac = DMatrix::<f64>::zeros(n, d);
-        for (j, &t) in free.iter().enumerate() {
-            let h = 1e-6 * theta[t].abs().max(1.0);
-            let mut up = theta.clone();
-            up[t] += h;
-            let mut dn = theta.clone();
-            dn[t] -= h;
-            let (Some((ru, _)), Some((rd, _))) = (residuals(&up), residuals(&dn)) else {
-                return Some(theta);
-            };
-            for i in 0..n {
-                jac[(i, j)] = (ru[i] - rd[i]) / (2.0 * h);
+        // The exact Jacobian; central differences per free theta only where it is
+        // unavailable.
+        let jac = match jacobian(&theta).filter(|j| j.nrows() == n && j.ncols() == d) {
+            Some(j) => j,
+            None => {
+                let mut jac = DMatrix::<f64>::zeros(n, d);
+                for (j, &t) in free.iter().enumerate() {
+                    let h = 1e-6 * theta[t].abs().max(1.0);
+                    let mut up = theta.clone();
+                    up[t] += h;
+                    let mut dn = theta.clone();
+                    dn[t] -= h;
+                    let (Some((ru, _)), Some((rd, _))) = (residuals(&up), residuals(&dn)) else {
+                        return Some(theta);
+                    };
+                    for i in 0..n {
+                        jac[(i, j)] = (ru[i] - rd[i]) / (2.0 * h);
+                    }
+                }
+                jac
             }
-        }
+        };
         let rv = DVector::from_vec(r.clone());
         let jtj = jac.transpose() * &jac;
         let g = jac.transpose() * &rv;
@@ -908,11 +1135,15 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
-        let names: Vec<Vec<String>> =
-            self.members.iter().map(|m| m.spec.typical.covariate_names()).collect();
-        let snaps: Vec<Vec<CovariateSnapshot<'_>>> =
-            self.members.iter().zip(&names).map(|(m, n)| m.snapshots(n, population)).collect();
+        let slots: Vec<std::sync::Arc<DistinctSlots>> =
+            self.members.iter().map(|m| m.distinct_slots(population)).collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
+            let mu_new: Vec<Vec<f64>> = self
+                .members
+                .iter()
+                .zip(&slots)
+                .map(|(m, d)| m.mus_distinct(theta, d))
+                .collect::<Option<_>>()?;
             let mut r = Vec::with_capacity(population.subjects.len() * q);
             let mut ss = 0.0;
             for i in 0..population.subjects.len() {
@@ -921,10 +1152,7 @@ impl CovariateMuGroup<'_> {
                     e[l] = *v;
                 }
                 for (m, member) in self.members.iter().enumerate() {
-                    let mu = member.mu_snapshot(theta, &snaps[m][i]);
-                    if !mu.is_finite() {
-                        return None;
-                    }
+                    let mu = mu_new[m][slots[m].of[i]];
                     if member.eta_idx < q {
                         e[member.eta_idx] += mu_old[m][i] - mu;
                     }
@@ -936,7 +1164,35 @@ impl CovariateMuGroup<'_> {
             }
             Some((r, ss))
         };
-        levenberg_marquardt(input, free, residuals)
+        // `∂r_i/∂θ_j = Lᵀ d_ij`, `d_ij` zero but `−∂μ_m/∂θ_j` at each member's eta.
+        let jacobian = |theta: &[f64]| -> Option<DMatrix<f64>> {
+            let d = free.len();
+            // `∂μ/∂θ` once per member and distinct covariate vector.
+            let grads: Vec<Vec<Vec<f64>>> = self
+                .members
+                .iter()
+                .zip(&slots)
+                .map(|(m, ds)| {
+                    ds.uniq.iter().map(|c| m.mu_grad(theta, c, free)).collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<_>>()?;
+            let mut jac = DMatrix::<f64>::zeros(population.subjects.len() * q, d);
+            for i in 0..population.subjects.len() {
+                let mut di = DMatrix::<f64>::zeros(q, d);
+                for (m, member) in self.members.iter().enumerate() {
+                    if member.eta_idx >= q {
+                        continue;
+                    }
+                    let g = &grads[m][slots[m].of[i]];
+                    for j in 0..d {
+                        di[(member.eta_idx, j)] -= g[j];
+                    }
+                }
+                jac.rows_mut(i * q, q).copy_from(&(&lt * di));
+            }
+            Some(jac)
+        };
+        levenberg_marquardt(input, free, residuals, jacobian)
     }
 
     /// Numerical M-step: minimise the prior quadratic form plus the data term
@@ -1089,23 +1345,94 @@ fn solve_exact_single(
             t
         })
         .collect();
-    let names = member.spec.typical.covariate_names();
-    let snaps = member.snapshots(&names, population);
+    let slots = member.distinct_slots(population);
+    // An affine mu in the mixed coordinates: one least-squares solve (#2986).
+    if let Some(lf) = member.linear_form(input.theta, &slots, free) {
+        if let Some(t) = solve_linear(member, input, free, &lf, &slots, &target) {
+            return Some(t);
+        }
+    }
     let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
+        let mu = member.mus_distinct(theta, &slots)?;
         let mut r = Vec::with_capacity(n);
         let mut ss = 0.0;
         for i in 0..n {
-            let m = member.mu_snapshot(theta, &snaps[i]);
-            if !m.is_finite() {
-                return None;
-            }
-            let ri = target[i] - m;
+            let ri = target[i] - mu[slots.of[i]];
             ss += ri * ri;
             r.push(ri);
         }
         Some((r, ss))
     };
-    levenberg_marquardt(input, free, residuals)
+    // `∂r_i/∂θ_j = −∂μ_i/∂θ_j`: the target is constant.
+    let jacobian = |theta: &[f64]| -> Option<DMatrix<f64>> {
+        let grads: Vec<Vec<f64>> =
+            slots.uniq.iter().map(|c| member.mu_grad(theta, c, free)).collect::<Option<_>>()?;
+        let mut jac = DMatrix::<f64>::zeros(n, free.len());
+        for i in 0..n {
+            for (j, g) in grads[slots.of[i]].iter().enumerate() {
+                jac[(i, j)] = -g;
+            }
+        }
+        Some(jac)
+    };
+    levenberg_marquardt(input, free, residuals, jacobian)
+}
+
+/// The closed-form step of an affine mu (#2986): `z* = argmin Σ_i (t_i − c_u(i) − X_u(i)·z)²`
+/// with `c_u = μ_u(θ) − X_u·z(θ)`, the normal equations over the distinct covariate vectors
+/// weighted by their subject counts. `None` — the caller then iterates — when the system is
+/// singular, a log-coordinate θ is not positive, the solution leaves a bound, or the mu at
+/// the solution is not the affine prediction to 1e-9 (the design was not affine after all).
+fn solve_linear(
+    member: &GroupMember<'_>, input: &GroupStepInput<'_>, free: &[usize], lf: &LinearForm,
+    slots: &DistinctSlots, target: &[f64],
+) -> Option<Vec<f64>> {
+    let nf = free.len();
+    let nu = slots.uniq.len();
+    let z0: Vec<f64> = free
+        .iter()
+        .zip(&lf.roles)
+        .map(|(&t, r)| match r {
+            LinRole::Lin => Some(input.theta[t]),
+            LinRole::Log => (input.theta[t] > 0.0).then(|| input.theta[t].ln()),
+        })
+        .collect::<Option<_>>()?;
+    let mu0 = member.mus_distinct(input.theta, slots)?;
+    let c: Vec<f64> =
+        (0..nu).map(|u| mu0[u] - (0..nf).map(|j| lf.x[(u, j)] * z0[j]).sum::<f64>()).collect();
+    let mut a = DMatrix::<f64>::zeros(nf, nf);
+    let mut b = DVector::<f64>::zeros(nf);
+    for (i, &u) in slots.of.iter().enumerate() {
+        let r = target[i] - c[u];
+        for j in 0..nf {
+            b[j] += lf.x[(u, j)] * r;
+            for k in 0..nf {
+                a[(j, k)] += lf.x[(u, j)] * lf.x[(u, k)];
+            }
+        }
+    }
+    let z = a.cholesky()?.solve(&b);
+    let mut theta = input.theta.to_vec();
+    for (j, &t) in free.iter().enumerate() {
+        let v = match lf.roles[j] {
+            LinRole::Lin => z[j],
+            LinRole::Log => z[j].exp(),
+        };
+        let lo = input.theta_lower.get(t).copied().unwrap_or(f64::NEG_INFINITY);
+        let hi = input.theta_upper.get(t).copied().unwrap_or(f64::INFINITY);
+        if !(v.is_finite() && v >= lo && v <= hi) {
+            return None;
+        }
+        theta[t] = v;
+    }
+    let mu1 = member.mus_distinct(&theta, slots)?;
+    for u in 0..nu {
+        let pred = c[u] + (0..nf).map(|j| lf.x[(u, j)] * z[j]).sum::<f64>();
+        if (mu1[u] - pred).abs() > 1e-9 * pred.abs().max(1.0) {
+            return None;
+        }
+    }
+    Some(theta)
 }
 
 #[cfg(test)]

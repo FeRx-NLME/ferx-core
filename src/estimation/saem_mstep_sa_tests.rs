@@ -646,9 +646,39 @@ fn magnitude_model() -> CompiledModel {
     .expect("magnitude fixture parses")
 }
 
+/// [`magnitude_model`] with a θ in the magnitude: θ then reaches the residual variance directly.
+fn theta_magnitude_model() -> CompiledModel {
+    parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta MAG(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma ADD_ERR  ~ 0.50 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR * (1.0 + MAG * WPSE), ADD_ERR) weight = WPSE
+[covariates]
+  WPSE continuous
+",
+    )
+    .expect("θ-magnitude fixture parses")
+}
+
+/// #3064: a residual magnitude that reads a θ is outside the information's scope (θ reaches
+/// `V` directly); a θ-free one — `weight = SE`, the MBMA form — is a per-observation constant
+/// and stays in it, so Newton (and `score_sa`) serve it.
 #[test]
-fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
-    assert!(numerical_mstep_scope_gap(&magnitude_model(), 0, false).is_some());
+fn numerical_mstep_scope_gap_refuses_only_a_theta_reading_magnitude() {
+    assert!(numerical_mstep_scope_gap(&theta_magnitude_model(), 0, false).is_some());
+    assert_eq!(numerical_mstep_scope_gap(&magnitude_model(), 0, false), None);
+    assert_eq!(newton_scope_gap(&magnitude_model(), false), None);
 }
 
 /// #1421: a FREM model is in scope — its covariate rows' score and information
@@ -1412,7 +1442,7 @@ fn lbfgs_mstep_at_the_production_budget_captures_the_converged_gain() {
 fn the_lbfgs_advisory_names_its_cause() {
     use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
     let advisory =
-        |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, true, false, label).1;
+        |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, true, label).1;
     assert!(advisory(Bobyqa, false, false, "SAEM").is_none());
     assert!(advisory(Bobyqa, true, false, "SAEM").is_none());
     assert!(advisory(Lbfgs, false, true, "SAEM").is_none());
@@ -1423,7 +1453,7 @@ fn the_lbfgs_advisory_names_its_cause() {
     assert!(fd.contains("forward difference") && !fd.contains("score_sa"), "{fd}");
     // The production wrapper reads the adjoint's scope: an analytic two-compartment model is in it.
     let model = no_eta_theta_model();
-    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, true, false, "SAEM");
+    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, true, "SAEM");
     assert_eq!(prod(false), (Lbfgs, None));
     assert!(prod(true).1.is_some());
 }
@@ -1576,8 +1606,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     ] {
         let gap = newton_scope_gap(model, mixture).unwrap_or_else(|| panic!("{label}: no gap"));
         assert!(gap.contains(reasons[want]), "{label}: {gap}");
-        let (opt, warning) =
-            resolve_mstep_optimizer(model, Newton, false, mixture, true, false, "IMP");
+        let (opt, warning) = resolve_mstep_optimizer(model, Newton, false, mixture, true, "IMP");
         let w = warning.unwrap_or_else(|| panic!("{label}: silent"));
         assert_eq!(opt, Bobyqa, "{label}");
         assert!(w.starts_with("IMP:") && w.contains("runs `bobyqa`"), "{label}: {w}");
@@ -1587,22 +1616,19 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
         assert!(!w.contains("score_sa"), "{label}: {w}");
     }
     // The model-property reasons of the Gaussian-scope list are the same list `score_sa` reads.
-    for (model, k) in [(correlated_residual_model(), 2), (magnitude_model(), 3)] {
+    for (model, k) in [(correlated_residual_model(), 2), (theta_magnitude_model(), 3)] {
         let gap = newton_scope_gap(&model, false).expect("a gap");
         assert!(gap.contains(reasons[k]), "{gap}");
         assert_eq!(Some(gap), numerical_mstep_scope_gap(&model, 0, false));
     }
     // Inside it — a closed form, IOV (the adjoint records the stacked `[η | κ]`), FREM — newton
     // is the optimizer, with no warning.
-    assert_eq!(
-        resolve_mstep_optimizer(&plain, Newton, false, false, true, false, "SAEM"),
-        (Newton, None)
-    );
+    assert_eq!(resolve_mstep_optimizer(&plain, Newton, false, false, true, "SAEM"), (Newton, None));
     assert_eq!(newton_scope_gap(&iov_model(), false), None);
     assert_eq!(newton_scope_gap(&frem_model(), false), None);
     // `score_sa` replaces the numerical solve: the option has nothing to act on, and says that
     // (not a scope reason).
-    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, true, false, "SAEM");
+    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, true, "SAEM");
     let w = w.expect("score_sa");
     assert!(
         opt == Bobyqa
@@ -1612,10 +1638,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
         "{w}"
     );
     // Bobyqa and lbfgs are not Newton's to change.
-    assert_eq!(
-        resolve_mstep_optimizer(&m3, Bobyqa, false, true, true, false, "SAEM"),
-        (Bobyqa, None)
-    );
+    assert_eq!(resolve_mstep_optimizer(&m3, Bobyqa, false, true, true, "SAEM"), (Bobyqa, None));
     assert_eq!(
         resolve_mstep_optimizer(
             &plain,
@@ -1623,7 +1646,6 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
             false,
             true,
             true,
-            false,
             "SAEM"
         )
         .0,
@@ -1656,7 +1678,7 @@ fn auto_is_newton_inside_the_scope_and_silent_bobyqa_outside() {
         ("score_sa", &plain, true, false, Bobyqa),
     ] {
         assert_eq!(
-            resolve_mstep_optimizer(model, Auto, sa, mixture, true, false, "SAEM"),
+            resolve_mstep_optimizer(model, Auto, sa, mixture, true, "SAEM"),
             (want, None),
             "{label}"
         );
@@ -1667,7 +1689,7 @@ fn auto_is_newton_inside_the_scope_and_silent_bobyqa_outside() {
         );
     }
     // The explicit request out of scope still says why.
-    assert!(resolve_mstep_optimizer(&m3, Newton, false, false, true, false, "SAEM").1.is_some());
+    assert!(resolve_mstep_optimizer(&m3, Newton, false, false, true, "SAEM").1.is_some());
     assert_eq!(Auto.as_str(), "auto");
 }
 
@@ -1828,7 +1850,7 @@ fn a_newton_solve_that_loses_its_information_is_reported_by_the_fit() {
     // The fit reports it: every Newton solve of a SAEM fit declines under the hook.
     let mut opts = crate::types::FitOptions::default();
     opts.method = crate::types::EstimationMethod::Saem;
-    opts.saem_n_exploration = 3;
+    opts.saem_n_exploration = Some(3);
     opts.saem_n_convergence = 2;
     opts.saem_seed = Some(7);
     opts.run_covariance_step = false;
@@ -1921,7 +1943,7 @@ fn the_lbfgs_advisory_needs_a_theta_for_the_solve_to_differentiate() {
         let model = declined_ode_model(v_expr);
         let mut opts = crate::types::FitOptions::default();
         opts.method = method;
-        opts.saem_n_exploration = 2;
+        opts.saem_n_exploration = Some(2);
         opts.saem_n_convergence = 1;
         opts.saem_seed = Some(3);
         opts.imp_iterations = 2;
@@ -1952,7 +1974,7 @@ fn the_lbfgs_advisory_needs_a_theta_for_the_solve_to_differentiate() {
 fn the_lbfgs_advisory_gate_and_the_free_theta_predicate() {
     use crate::types::MstepOptimizer::Lbfgs;
     let advisory =
-        |exact, free| resolve_mstep_optimizer_for(Lbfgs, false, exact, None, free, false, "IMP").1;
+        |exact, free| resolve_mstep_optimizer_for(Lbfgs, false, exact, None, free, "IMP").1;
     assert!(advisory(false, true).is_some());
     assert!(advisory(false, false).is_none(), "no θ free: nothing differenced");
     assert!(advisory(true, true).is_none());
@@ -2074,33 +2096,22 @@ fn a_stalled_newton_mstep_keeps_a_pinned_theta_memo_and_retires_a_tracking_one()
     }
 }
 
-/// `auto` keeps BOBYQA for a SAEM solve with no free θ and Newton for one with — where Newton
-/// is in scope at all — and keeps Newton for IMP/IMPMAP either way (`sigma_only_bobyqa`): the
-/// rule is structural (free θ × who owns the memo), never a size. An explicit `newton` is the
-/// user's, σ-only included, in both. And the fits report it: a SAEM fit with every θ
-/// mu-referenced runs `bobyqa`, an IMP fit of the same model `newton`.
+/// `auto` is Newton wherever Newton is in scope, a σ-only solve included (#2986: with every θ
+/// pinned its σ score and information are residual arithmetic on the memoized predictions, no
+/// recording). An explicit `newton` is the user's, an explicit `bobyqa` too. And the fits
+/// report it: a SAEM fit of a combined error with every θ mu-referenced runs `newton`.
 #[test]
-fn auto_is_bobyqa_for_a_sigma_only_saem_solve_and_newton_for_imp() {
+fn auto_is_newton_for_a_sigma_only_solve_too() {
     use crate::types::MstepOptimizer::{Auto, Bobyqa, Newton};
     let plain = no_eta_theta_model();
-    for (theta_free, sigma_only_bobyqa, want) in
-        [(true, true, Newton), (true, false, Newton), (false, true, Bobyqa), (false, false, Newton)]
-    {
+    for theta_free in [true, false] {
         assert_eq!(
-            resolve_mstep_optimizer(&plain, Auto, false, false, theta_free, sigma_only_bobyqa, "X"),
-            (want, None),
-            "θ free {theta_free}, σ-only bobyqa {sigma_only_bobyqa}"
+            resolve_mstep_optimizer(&plain, Auto, false, false, theta_free, "X"),
+            (Newton, None),
+            "θ free {theta_free}: the exact derivatives are cheap either way"
         );
         assert_eq!(
-            resolve_mstep_optimizer(
-                &plain,
-                Newton,
-                false,
-                false,
-                theta_free,
-                sigma_only_bobyqa,
-                "X"
-            ),
+            resolve_mstep_optimizer(&plain, Newton, false, false, theta_free, "X"),
             (Newton, None),
             "an explicit newton is the request"
         );
@@ -2121,7 +2132,7 @@ fn auto_is_bobyqa_for_a_sigma_only_saem_solve_and_newton_for_imp() {
         let mut opts = crate::types::FitOptions::default();
         opts.method = method;
         opts.mstep_optimizer = optimizer;
-        opts.saem_n_exploration = 2;
+        opts.saem_n_exploration = Some(2);
         opts.saem_n_convergence = 1;
         opts.saem_seed = Some(3);
         opts.imp_iterations = 2;
@@ -2146,10 +2157,12 @@ fn auto_is_bobyqa_for_a_sigma_only_saem_solve_and_newton_for_imp() {
     }
     // IMP/IMPMAP have no closed-form σ: the same model runs the numerical solve.
     assert_eq!(used(&closed, Imp, Auto).as_deref(), Some("newton"));
-    // Two σ (combined): SAEM's σ-only numerical solve *does* run — `auto` keeps BOBYQA for it
-    // (its evaluations are memo-served), an explicit `newton` is run as asked.
+    // Two σ (combined): SAEM's σ-only numerical solve *does* run — Newton under `auto` (#2986:
+    // its σ score and information are residual arithmetic on the memoized predictions), BOBYQA
+    // when asked.
     let numerical = model("DV ~ combined(EPS, ADD)", "  sigma ADD ~ 0.1\n");
-    assert_eq!(used(&numerical, Saem, Auto).as_deref(), Some("bobyqa"));
+    assert_eq!(used(&numerical, Saem, Auto).as_deref(), Some("newton"));
+    assert_eq!(used(&numerical, Saem, Bobyqa).as_deref(), Some("bobyqa"));
     assert_eq!(used(&numerical, Saem, Newton).as_deref(), Some("newton"));
     assert_eq!(used(&numerical, Imp, Auto).as_deref(), Some("newton"));
 }

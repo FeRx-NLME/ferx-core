@@ -48,7 +48,7 @@ fn saem(o: FitOptions) -> FitOptions {
     FitOptions {
         method: EstimationMethod::Saem,
         methods: vec![EstimationMethod::Saem],
-        saem_n_exploration: 4,
+        saem_n_exploration: Some(4),
         saem_n_convergence: 4,
         saem_seed: Some(7),
         ..o

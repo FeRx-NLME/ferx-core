@@ -3496,7 +3496,7 @@ fn test_parse_mu_referencing_invalid_rejected() {
 fn test_apply_fit_option_known_applies() {
     let mut opts = FitOptions::default();
     assert_eq!(apply_fit_option(&mut opts, "n_exploration", "200"), Ok(true));
-    assert_eq!(opts.saem_n_exploration, 200);
+    assert_eq!(opts.saem_n_exploration, Some(200));
 
     assert_eq!(apply_fit_option(&mut opts, "n_convergence", "400"), Ok(true));
     assert_eq!(opts.saem_n_convergence, 400);
@@ -3662,7 +3662,7 @@ fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
 fn test_saem_imh_options_round_trip_validate_and_warn() {
     use crate::types::SaemKernel;
     let mut opts = FitOptions::default();
-    assert_eq!(opts.saem_kernel, SaemKernel::RandomWalk);
+    assert_eq!(opts.saem_kernel, SaemKernel::Hmc, "the HMC preset is the default (#2986)");
     assert_eq!((opts.saem_imh_proposals, opts.saem_imh_refresh), (2, 5), "defaults moved");
     assert_eq!(opts.saem_imh_defensive, 0.05);
     assert_eq!(opts.saem_imh_min_obs_per_eta, 2.0);
@@ -3671,8 +3671,16 @@ fn test_saem_imh_options_round_trip_validate_and_warn() {
     assert_eq!(opts.saem_kernel, SaemKernel::Imh);
     assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "rw"), Ok(true));
     assert_eq!(opts.saem_kernel, SaemKernel::RandomWalk);
-    let err = apply_fit_option(&mut opts, "saem_kernel", "hmc").expect_err("unknown kernel");
-    assert!(err.contains("rw/imh") && err.contains("hmc"), "got: {err}");
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "hmc"), Ok(true));
+    assert_eq!(opts.saem_kernel, SaemKernel::Hmc);
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "NUTS"), Ok(true));
+    assert_eq!(opts.saem_kernel, SaemKernel::Nuts);
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "mala"), Ok(true));
+    assert_eq!(opts.saem_kernel, SaemKernel::Mala);
+    assert_eq!(apply_fit_option(&mut opts, "isample_mala", "4"), Ok(true));
+    assert_eq!(opts.saem_isample_mala, Some(4));
+    let err = apply_fit_option(&mut opts, "saem_kernel", "gibbs").expect_err("unknown kernel");
+    assert!(err.contains("rw/imh/nonmem/hmc/nuts/mala") && err.contains("gibbs"), "got: {err}");
 
     // Each message is asserted whole: every clause is something the user reads
     // (what the key is, the bound, the value they wrote), so deleting any of them
@@ -3814,7 +3822,65 @@ fn test_apply_fit_option_malformed_value_errors() {
     assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
     assert!(apply_fit_option(&mut opts, "sir_df", "0.5").is_err());
     // Failed apply must not mutate — default preserved.
-    assert_eq!(opts.saem_n_exploration, 150);
+    assert_eq!(opts.saem_n_exploration, None);
+}
+
+/// The automatic exploration stop's options: absent `n_exploration` is automatic (`None`) with
+/// the documented bounds; each key lands in its own field; an explicit length is `Some`; the
+/// smoothing exponent is confined to the Robbins-Monro range (0.5, 1] and a rejected value
+/// leaves the default.
+#[test]
+fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.saem_n_exploration, None);
+    assert_eq!(opts.saem_exploration_min, 150);
+    assert_eq!(opts.saem_exploration_max, 4000);
+    assert_eq!(opts.saem_n_chains, 2);
+    assert_eq!(apply_fit_option(&mut opts, "n_chains", "3"), Ok(true));
+    assert_eq!(opts.saem_n_chains, 3);
+    assert!(apply_fit_option(&mut opts, "n_chains", "0").is_err());
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "nonmem"), Ok(true));
+    assert_eq!(opts.saem_kernel, crate::types::SaemKernel::Nonmem);
+    for (k, v) in
+        [("isample_m1", "3"), ("isample_m1b", "0"), ("isample_m2", "4"), ("isample_m3", "1")]
+    {
+        assert_eq!(apply_fit_option(&mut opts, k, v), Ok(true), "{k}");
+    }
+    assert_eq!(
+        (opts.saem_isample_m1, opts.saem_isample_m1b, opts.saem_isample_m2, opts.saem_isample_m3),
+        (Some(3), Some(0), Some(4), Some(1))
+    );
+    assert_eq!(opts.saem_mceta, 0, "NONMEM's default MCETA");
+    assert_eq!(apply_fit_option(&mut opts, "mceta", "100"), Ok(true));
+    assert_eq!(opts.saem_mceta, 100);
+    assert_eq!(apply_fit_option(&mut opts, "iaccept", "0.3"), Ok(true));
+    assert_eq!(opts.saem_iaccept, 0.3);
+    assert!(apply_fit_option(&mut opts, "iaccept", "1.0").is_err());
+    assert_eq!(opts.saem_iaccept, 0.3, "a rejected value leaves the previous one");
+    assert_eq!(opts.saem_n_chains, 3, "a rejected value leaves the previous one");
+    assert_eq!(opts.saem_smoothing_exponent, 1.0);
+
+    assert_eq!(apply_fit_option(&mut opts, "n_exploration_min", "80"), Ok(true));
+    assert_eq!(apply_fit_option(&mut opts, "n_exploration_max", "700"), Ok(true));
+    assert_eq!(apply_fit_option(&mut opts, "smoothing_exponent", "0.7"), Ok(true));
+    assert_eq!(opts.saem_exploration_min, 80);
+    assert_eq!(opts.saem_exploration_max, 700);
+    assert_eq!(opts.saem_smoothing_exponent, 0.7);
+    // min/max alone never make the length explicit.
+    assert_eq!(opts.saem_n_exploration, None);
+    // An explicit length does.
+    assert_eq!(apply_fit_option(&mut opts, "n_exploration", "40"), Ok(true));
+    assert_eq!(opts.saem_n_exploration, Some(40));
+
+    for bad in ["0.5", "0.3", "1.01", "-1", "nan", "inf", "x"] {
+        let mut o = FitOptions::default();
+        assert!(apply_fit_option(&mut o, "smoothing_exponent", bad).is_err(), "{bad}");
+        assert_eq!(o.saem_smoothing_exponent, 1.0, "{bad} must not mutate");
+    }
+    let mut o = FitOptions::default();
+    assert_eq!(apply_fit_option(&mut o, "smoothing_exponent", "1"), Ok(true));
+    assert!(apply_fit_option(&mut o, "n_exploration_min", "-3").is_err());
+    assert!(apply_fit_option(&mut o, "n_exploration_max", "x").is_err());
 }
 
 #[test]
@@ -5368,7 +5434,7 @@ fn test_parse_fit_options_applies_known_keys() {
     ];
     let opts = parse_fit_options(&lines).unwrap();
     assert_eq!(opts.method, EstimationMethod::Saem);
-    assert_eq!(opts.saem_n_exploration, 200);
+    assert_eq!(opts.saem_n_exploration, Some(200));
     assert_eq!(opts.saem_n_convergence, 400);
     assert!(opts.sir);
     assert_eq!(opts.sir_samples, 2000);
@@ -5910,7 +5976,7 @@ fn block_value(stmts: &[Statement], theta: &[f64], covs: &[(&str, f64)], name: &
 /// A group's typical value at `covs`.
 fn group_typical(g: &CovariateMuRef, theta: &[f64], covs: &[(&str, f64)]) -> f64 {
     let map: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    eval_typical_value(&g.typical, theta, &map)
+    g.typical.eval(theta, &map)
 }
 
 /// The issue's melphalan model: `CRCLR` is assigned in both arms of an
@@ -35881,13 +35947,13 @@ fn a_theta_dependent_gather_index_selects_its_level_in_the_recording() {
     }
 }
 
-/// A snapshot of a subject's covariates evaluates a typical value bit-for-bit as the map does,
-/// an absent covariate reads `0.0` in both, a program with more definitions than the stack
-/// buffer holds agrees too, and the names are each covariate once in first-read order. Dies when
-/// the snapshot resolves a name to another's slot (`WT` and `AGE` swapped changes the value) or
-/// the snapshot drops the absent-is-zero rule (`GHOST` would be NaN or panic).
+/// A typical value compiled to the VM ([`CompiledTypical`], #2986) evaluates bit-for-bit as the
+/// map does, an absent covariate reads `0.0` in both, a program with more definitions than the
+/// interpreter's stack buffer holds agrees too, and the names are each covariate once in
+/// first-read order. Dies when compilation resolves a name to another's slot (`WT` and `AGE`
+/// swapped changes the value) or drops the absent-is-zero rule (`GHOST` would be NaN or panic).
 #[test]
-fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() {
+fn a_compiled_typical_value_evaluates_bit_for_bit_as_the_map_does() {
     let cov = |n: &str| Expression::Covariate(n.to_string());
     let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
     let root = bin(
@@ -35919,11 +35985,13 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         let names = prog.covariate_names();
         assert_eq!(names.len(), 3);
         assert!(names.contains(&"GHOST".to_string()));
-        let snap = CovariateSnapshot::new(&names, &covs);
+        let compiled = prog.compile(&names);
+        let slots = covariate_slots(&names, &covs);
         for theta in [[0.3], [-1.7]] {
             assert_eq!(
-                prog.eval_snapshot(&theta, &snap).to_bits(),
-                prog.eval(&theta, &covs).to_bits()
+                compiled.eval(&theta, &slots).to_bits(),
+                prog.eval(&theta, &covs).to_bits(),
+                "the compiled typical value (#2986) is the interpreter's, bit for bit"
             );
         }
     }
@@ -35989,13 +36057,58 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         names,
         ["CA", "CB", "CC", "CD", "CE", "CF", "LVL", "UF", "PB", "PE"].map(String::from)
     );
-    let snap = CovariateSnapshot::new(&names, &covs);
+    let compiled = nested.compile(&names);
+    let slots = covariate_slots(&names, &covs);
     for theta in [[0.3, 1.9], [-1.7, 2.5]] {
-        assert_eq!(
-            nested.eval_snapshot(&theta, &snap).to_bits(),
-            nested.eval(&theta, &covs).to_bits()
-        );
+        assert_eq!(compiled.eval(&theta, &slots).to_bits(), nested.eval(&theta, &covs).to_bits());
     }
+}
+
+/// A subject's covariate vector in `names` order, absent reading `0.0`: what
+/// [`CompiledTypical::eval`] reads.
+fn covariate_slots(names: &[String], covs: &HashMap<String, f64>) -> Vec<f64> {
+    names.iter().map(|n| covs.get(n).copied().unwrap_or(0.0)).collect()
+}
+
+/// The compiled typical value's generic VM on a forward dual seeded on θ (#2986) gives the
+/// exact gradient: `A = θ₀·(WT/70)^θ₁ + MACHEPS` has `∂A/∂θ₀ = (WT/70)^θ₁`,
+/// `∂A/∂θ₁ = θ₀·(WT/70)^θ₁·ln(WT/70)`, and its value lane is the `f64` VM's. A seed on an
+/// unread θ₂ reads exactly `0`. Dies when a covariate or `MACHEPS` is lowered to the wrong
+/// read, or when the θ reads lose their seeds.
+#[test]
+fn a_compiled_typical_value_differentiates_through_the_forward_dual() {
+    use crate::sens::jet::DualT;
+    use crate::sens::num::PkNum;
+    let cov = |n: &str| Expression::Covariate(n.to_string());
+    let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
+    let prog = TypicalProgram::of(bin(
+        bin(
+            Expression::Theta(0),
+            BinOp::Mul,
+            Expression::Power(
+                Box::new(bin(cov("WT"), BinOp::Div, Expression::Literal(70.0))),
+                Box::new(Expression::Theta(1)),
+            ),
+        ),
+        BinOp::Add,
+        Expression::Variable("MACHEPS".into()),
+    ));
+    let names = prog.covariate_names();
+    let covs: HashMap<String, f64> = [("WT".to_string(), 83.5)].into();
+    let slots = covariate_slots(&names, &covs);
+    let compiled = prog.compile(&names);
+    let theta = [4.2, 0.75, 9.0];
+    let seeded: Vec<DualT<3, f64>> =
+        theta.iter().enumerate().map(|(j, &v)| <DualT<3, f64> as PkNum>::var(v, j)).collect();
+    let a = compiled.eval_g(&seeded, &slots);
+    assert_eq!(a.v.to_bits(), compiled.eval(&theta, &slots).to_bits());
+    assert_eq!(a.v.to_bits(), prog.eval(&theta, &covs).to_bits());
+    let r: f64 = 83.5 / 70.0;
+    let p = r.powf(0.75);
+    assert!((a.g[0] - p).abs() <= 1e-14 * p, "∂A/∂θ₀ {} vs {p}", a.g[0]);
+    let d1 = 4.2 * p * r.ln();
+    assert!((a.g[1] - d1).abs() <= 1e-14 * d1.abs(), "∂A/∂θ₁ {} vs {d1}", a.g[1]);
+    assert_eq!(a.g[2], 0.0, "an unread θ has no derivative");
 }
 
 /// The covariance Hessian's mu fold (#2982) carries a θ on the η lanes only when every route it

@@ -200,7 +200,7 @@ fn saem_then_imp_chain_runs() {
     let (model, mut population) = warfarin();
     downsample(&mut population, 2);
     let mut opts = sparse_opts();
-    opts.saem_n_exploration = 5;
+    opts.saem_n_exploration = Some(5);
     opts.saem_n_convergence = 5;
     opts.saem_n_mh_steps = 2;
     opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Imp];
