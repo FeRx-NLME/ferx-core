@@ -374,9 +374,7 @@ fn the_committed_baseline_matches_the_committed_probe() {
     let sha = |name: &str| {
         let out = Command::new("python3")
             .args(["-I", "-c"])
-            .arg(format!(
-                "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())"
-            ))
+            .arg("import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())")
             .arg(probe_dir().join(name))
             .output()
             .unwrap();

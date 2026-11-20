@@ -128,11 +128,21 @@ taken on Linux.
 
 ### The committed baseline
 
-The first baseline was measured on Linux arm64 (OrbStack, `rustlang/rust:nightly`),
-because a contributor cannot dispatch a workflow from a branch that is not yet
-pushed. The CI runner is Linux x86_64, so the first nightly reports
-"shown, not judged". Re-baseline from that night's `peak-memory-results`
-artifact with `accept`. From then on the job judges.
+The first baseline was not measured on a CI runner. The branch that added the
+probe could not dispatch the workflow before it was pushed, so the baseline
+comes from the release build on Linux x86_64 under emulation (OrbStack with
+Rosetta on Apple silicon, image `rustlang/rust:nightly`, glibc 2.41):
+
+| case | peak RSS | wall |
+|---|--:|--:|
+| `eval` | 205 MB (a repeat run: 189 MB, −8 %) | 94 s |
+| `fit` | 962 MB | 24 min |
+
+The platform string matches the runner's, so the first nightly judges against
+these numbers. Emulation can move peak RSS by itself. If the first nightly reads
+`▲` or `▼` and no change explains it, re-baseline from that night's
+`peak-memory-results` artifact with `accept`. Do the same if it reads `=`, so the
+baseline names a real runner measurement.
 
 ## Running it locally
 

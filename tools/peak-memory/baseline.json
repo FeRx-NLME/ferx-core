@@ -1,0 +1,20 @@
+{
+ "cases": {
+  "eval": {
+   "peak_rss_bytes": 214867968,
+   "wall_s": 94.4
+  },
+  "fit": {
+   "peak_rss_bytes": 1008562176,
+   "wall_s": 1420.3
+  }
+ },
+ "created": "2026-11-20T06:13:59Z",
+ "data_sha256": "0079ccb6a5a7784a5ea7fa98bf604943083c5991689984600fbbef227802d130",
+ "measured": "64b3afd7+3081 Linux/x86_64 (OrbStack Rosetta)",
+ "model_sha256": "8f77bc47bda2554593d35887b993c9f1d6451c146ff4963ab09bdcd7a01a1c74",
+ "platform": "Linux/x86_64",
+ "reason": "#3081: first baseline, release build of 64b3afd7 + this branch, 4 threads, Linux/x86_64 under OrbStack (Rosetta) on Apple silicon, not a CI runner: re-baseline from the first nightly's peak-memory-results. A repeat eval run read 189 MB (-8%).",
+ "schema": 1,
+ "threads": 4
+}
