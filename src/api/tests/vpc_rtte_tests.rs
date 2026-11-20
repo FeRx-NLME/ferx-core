@@ -1020,3 +1020,38 @@ fn refuses_bad_strata() {
          show. Bin it into a categorical covariate and stratify on that.",
     );
 }
+
+// ── #2947: a stratum with no band ────────────────────────────────────────────
+
+/// D-r1. Fixture P4 (#2947 plan §0): 30 streams with one or two events, all followed to
+/// 3.5 = H. A grid past H has no MCF band, and every absolute and gap curve ends at or
+/// before its replicate's follow-up end, so they are all empty too: one warning per
+/// stratum, read from the MCF. It names the MCF's latest last time, 3.5; a gap curve
+/// would name an earlier one. It is appended after the simulator's warnings.
+#[test]
+fn vpc_rtte_warns_past_follow_up_and_every_curve_is_empty() {
+    const RTTE_NO_IIV: &str = "\n[parameters]\n  theta TVLAMBDA(0.5, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  type   = rtte\n  family = exponential\n  scale  = TVLAMBDA\n";
+    let p = pop((1..=30)
+        .map(|i| {
+            let off = 0.01 * i as f64;
+            let events: &[f64] = if i % 2 == 0 { &[1.0 + off, 2.0 + off] } else { &[1.0 + off] };
+            stream(&i.to_string(), 3.5, events)
+        })
+        .collect());
+    let mut o = opts(20);
+    o.max_order = Some(4);
+    o.grid = VpcGrid::Times(vec![5.0, 8.0]);
+    let v = run(RTTE_NO_IIV, &p, &o).unwrap();
+    assert_eq!(v.horizon, 3.5);
+    let s = &v.strata[0];
+    assert_eq!(s.mcf.n_used, [0, 0]);
+    for b in s.absolute.iter().chain(&s.gap) {
+        assert_eq!(b.n_used, [0, 0], "order {}", b.order);
+        assert!(b.med.iter().all(Option::is_none), "order {}", b.order);
+    }
+    let want = "W_VPC_EMPTY_STRATUM: stratum `all` has no band at any grid time. Every grid \
+                time is past the last time of every replicate curve; the latest is 3.5. Grid \
+                times after 3.5 can never have a band.";
+    assert_eq!(super::super::vpc_tte::empty_stratum_warnings(&v.warnings), [want]);
+    assert_eq!(v.warnings.last().map(String::as_str), Some(want));
+}

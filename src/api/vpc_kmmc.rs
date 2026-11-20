@@ -40,8 +40,9 @@
 //! `sim.horizon` unset `H` is the latest record and nothing is cut.
 
 use super::vpc_tte::{
-    check_band_options, horizon_and_cut, observed_rows, refuse, resolve_cmt, simulate_replicates,
-    stratum_grid, Entry, TteCensorRule, VpcCensoring, VpcStratify, VpcTteOptions,
+    check_band_options, empty_stratum_warning, horizon_and_cut, observed_rows, refuse, resolve_cmt,
+    simulate_replicates, stratum_grid, Entry, TteCensorRule, VpcCensoring, VpcStratify,
+    VpcTteOptions,
 };
 use crate::diagnostics::EngineError;
 use crate::stats::km::{kaplan_meier_mean_covariate, vpc_band_kmmc, KmmcCurve};
@@ -129,7 +130,8 @@ pub struct KmmcVpc {
     pub censoring: VpcCensoring,
     pub strata: Vec<KmmcVpcStratum>,
     /// `W_VPC_KMMC_TIME_VARYING_COVARIATE` when the covariate changes within a subject,
-    /// then the simulator's warnings.
+    /// then the simulator's warnings, then `W_VPC_EMPTY_STRATUM` per stratum with no band
+    /// at any grid time.
     pub warnings: Vec<String>,
 }
 
@@ -280,6 +282,15 @@ pub fn vpc_kmmc(
         );
         let band = vpc_band_kmmc(&curves, &grid, probs, opts.min_at_risk)
             .map_err(|e| refuse(format!("{WHO}: {e}")))?;
+        warnings.extend(empty_stratum_warning(
+            WHO,
+            &label,
+            &grid,
+            &band.n_used,
+            probs,
+            curves.iter().map(|c| c.time.as_slice()),
+            Some((ot.len(), opts.min_at_risk)),
+        ));
         strata.push(KmmcVpcStratum {
             label,
             value,

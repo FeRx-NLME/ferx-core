@@ -1046,6 +1046,16 @@ The automatic grid is 0, the stratum's observed times and 101 evenly spaced poin
 horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of
 every replicate curve, which gives exact step ribbons on a large grid.
 
+Late in follow-up a band point is built from the replicates still followed up there, not all
+of them: where most replicate curves have ended at 0, the band can still sit above 0.
+`n_used` gives the number at each grid time. When no grid time of a stratum has a band, the
+result's `warnings` carry `W_VPC_EMPTY_STRATUM` with the reason: fewer subjects than
+`min_at_risk` (`vpc_kmmc()`), every grid time past the last time of every replicate curve
+(a `VpcGrid::Times` grid placed too late), or too few replicate curves defined at any grid
+time. The `Auto` and `AllSteps` grids start at 0, where every replicate is defined, so
+`vpc_tte()` and `vpc_rtte()` raise it only for a `VpcGrid::Times` grid. An empty
+`VpcGrid::Times` grid is refused.
+
 ### Censoring in the replicates
 
 The simulator censors a right-censored record at its own time and draws an event record
