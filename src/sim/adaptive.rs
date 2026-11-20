@@ -893,11 +893,31 @@ fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
     (if lo > 0.0 { kl.max(1.0) } else { kl }, snapped_integer(qh).unwrap_or_else(|| qh.floor()))
 }
 
-/// `x` rounded to the nearest multiple of `s`, ties up: the half is nudged up by
-/// [`GRID_SNAP`] (relative), since `x / s` misses a tie by an ulp (`0.35 / 0.1`).
+/// How far, in units of `ε·|q|` (at least one ulp of `q`), the quotient `q = x / s` may miss
+/// a tie `k + 0.5` and still count as one (#2927). Measured on a sweep of 22 decimal steps
+/// (0.1, 0.25, 0.05, 1e-3, 1e-6, 1e-9, 2.5, 250, ...): a tie written as a decimal
+/// (`0.35 / 0.1 = 3.4999999999999996`) misses by at most 1 ulp of `q`, a tie reached by a
+/// percent step (`d · (1 ± p/100)`, 19 percentages, 7.1 million ties) by at most 3 ulps
+/// (`s = 0.0001`, `decrease 33%` from 2.405); an exact multiple misses `k` by at most 1 ulp.
+/// 8 is 2.7× the worst tie.
+const TIE_ULPS: f64 = 8.0;
+
+/// `x` rounded to the nearest multiple of `s`, ties up. `x / s` misses a tie by a few ulps
+/// (`0.35 / 0.1`), so a fraction within `w = TIE_ULPS · ε · |q|` below a half still goes up.
+/// The tolerance is capped at `0.5 − w`, so the threshold never comes within `w` of `k`
+/// and an exact multiple stays put at every grid index (#2927). The relative nudge it
+/// replaces, `1e-9 · |q|`, reached a half at `q = 5e8` and moved a multiple up one step
+/// each time it was placed. Past `w = 0.25` (`q ≈ 1.4e14`) the cap shrinks the tolerance,
+/// and from `q ≈ 3.4e14` (measured, the first decimal tie lost on the sweep) a tie that
+/// misses can go down: there a few ulps are a sizeable part of a step, and a missed tie and
+/// a multiple can no longer both be told apart. The floor at 0 keeps an exact tie going up.
 pub(crate) fn round_to_grid(x: f64, s: f64) -> f64 {
     let q = x / s;
-    grid_point((q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor(), s)
+    // Exact: `k <= q < k + 1 <= 2k` (Sterbenz) for `k >= 1`, and `q - 0` for `k = 0`.
+    let k = q.floor();
+    let w = TIE_ULPS * f64::EPSILON * q.abs();
+    let tol = w.min(0.5 - w).max(0.0);
+    grid_point(if q - k >= 0.5 - tol { k + 1.0 } else { k }, s)
 }
 
 /// The `k`-th multiple of `s`: `k / n` when `1 / s` is within [`GRID_SNAP`] of an integer
@@ -950,7 +970,7 @@ impl DoseGrid {
 
     /// The lowest multiple of `step` that `increase p%` raises on an unbounded grid
     /// (#2810); `None` if none up to index 2^52. Found by bisection on
-    /// [`Self::step_percent`], since the relative tie nudge makes `50 / p` inexact (#2890).
+    /// [`Self::step_percent`], since the tie tolerance makes `50 / p` inexact (#2890).
     pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
         const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
         let open = Self { step, low: 0.0, high: f64::INFINITY };
@@ -1801,6 +1821,70 @@ mod tests {
         assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
     }
 
+    /// A dose on the grid is a fixed point of [`DoseGrid::place`] at every grid index (#2927).
+    /// The relative nudge before the fix reached a half at index `5e8`, so from there each
+    /// placement moved a multiple up one step (`5e8 + 0.5 + 0.5`). Indices: small, `5e4`,
+    /// around `5e8`, and the largest where `k · s` is exact (`2^53` at `s = 1` and
+    /// `s = 0.25`, `floor(2^53 / 125)` at `s = 250`). A decimal step is never exact; its
+    /// multiples are checked up to `1e15`, where `x / s` still rounds to `k`, which is asserted
+    /// first. An exact tie keeps going up where it is representable (`2^52 − 0.5` at `s = 1`),
+    /// past the index where the cap takes the tolerance to 0.
+    ///
+    /// Mutations: the old nudge moves `5e8` at every step; the cap at the half
+    /// (`w.min(0.5)`) moves every multiple from `q ≈ 2.8e14`, so `2^53`; the tolerance
+    /// without its floor at 0 sends the exact tie at `2^51 + 0.5` down.
+    #[test]
+    fn a_dose_on_the_grid_is_a_fixed_point_of_place_at_every_index() {
+        const TWO_53: f64 = 9_007_199_254_740_992.0;
+        let open = |s: f64| DoseGrid { step: s, low: 0.0, high: f64::INFINITY };
+        let around = |k: f64| [k - 1.0, k, k + 1.0];
+        let common =
+            [1.0, 3.0, 49_999.0, 50_000.0].into_iter().chain(around(5e8)).chain(around(1e12));
+        for (s, top) in [(1.0, TWO_53), (0.25, TWO_53), (250.0, (TWO_53 / 125.0).floor())] {
+            for k in common.clone().chain(around(top - 1.0)) {
+                let x = k * s;
+                assert_eq!(x / s, k, "premise: s = {s}, k = {k} is exact");
+                let placed = open(s).place(x);
+                assert_eq!(placed.to_bits(), x.to_bits(), "s = {s}, k = {k}: {x} -> {placed}");
+            }
+        }
+        for s in [0.1, 0.05, 1e-3, 1e-6, 0.3] {
+            for k in common.clone().chain(around(1e15)) {
+                let x = grid_point(k, s);
+                assert_eq!((x / s).round(), k, "premise: s = {s}, k = {k} is recoverable");
+                let placed = open(s).place(x);
+                assert_eq!(placed.to_bits(), x.to_bits(), "s = {s}, k = {k}: {x} -> {placed}");
+                assert_eq!(open(s).place(placed).to_bits(), x.to_bits(), "s = {s}, k = {k}");
+            }
+        }
+        for k in [5e8, 2f64.powi(49), 2f64.powi(51), TWO_53 / 2.0 - 1.0] {
+            let tie = k + 0.5;
+            assert_eq!(tie - k, 0.5, "premise: {tie} is an exact tie");
+            assert_eq!(round_to_grid(tie, 1.0).to_bits(), (k + 1.0).to_bits(), "tie {tie}");
+        }
+    }
+
+    /// A tie reached by a percent step goes up though `q` misses it by 3 ulps: the worst of
+    /// the sweep behind [`TIE_ULPS`] (#2927), `decrease 33%` from 2.405 at `s = 0.0001`, is
+    /// `1.6113499999999996`, `q = 16113.499999999995`. Just below a tie by more than the
+    /// tolerance still goes down.
+    ///
+    /// Mutations: `TIE_ULPS` at 1 sends it down (here `ε · |q|` is 1.97 ulps of `q`, so 2
+    /// still covers the 3; at 2 only the 1e-6% start in
+    /// `lowest_raised_by_is_the_first_multiple_the_step_moves` moves); at 0 the decimal tie
+    /// goes down too (`round_to_grid_sends_ties_up_on_a_decimal_grid`).
+    #[test]
+    fn a_percent_step_tie_three_ulps_short_goes_up() {
+        let x = percent_step(2.405, 33.0, false);
+        assert_eq!(x, 1.6113499999999996, "premise: the step misses the tie");
+        let q = x / 0.0001;
+        let ulps = (16113.5 - q) / (q.next_up() - q);
+        assert!((2.5..=3.0).contains(&ulps), "premise: 3 ulps short, got {ulps}");
+        assert!((round_to_grid(x, 0.0001) - 1.6114).abs() < 1e-15, "{}", round_to_grid(x, 0.0001));
+        // 1e-4 of a step short (8e7 ulps of `q`) is not a tie.
+        assert!((round_to_grid(1.61134999, 0.0001) - 1.6113).abs() < 1e-15);
+    }
+
     /// A step that divides 1 gives the decimal multiple, not `k * s`: `7 * 0.1` is
     /// `0.7000000000000001`, but the grid dose for 0.7 at `s = 0.1` is `0.7` exactly, as
     /// are `0.3` (`3 * 0.1 = 0.30000000000000004`) and the multiples of 0.25. An integer
@@ -1977,16 +2061,20 @@ mod tests {
     /// does not (372.5), so it starts at 500. On a decimal grid, `0.1` under 25%: 0.1
     /// gives 0.125 (back to 0.1), 0.2 gives 0.25, a tie, up to 0.3.
     ///
-    /// Small percentages (#2890 review r1 rows 1 and 2): the tie nudge is relative, so
-    /// the engine raises a dose below `50 * s / p`. At `s = 1` the reviewer's bisection
-    /// gave 16667 for 0.003%, 49996 for 0.001% (not 50000) and 45454546 for 1e-6% (not
-    /// 50000000). `1e-310%` must return: `50 / p` is infinite there.
+    /// Small percentages (#2890 review r1 rows 1 and 2, #2927). At `s = 1`, 0.003% starts
+    /// at 16667 and 0.001% at 50000, a half step exactly (the relative nudge before #2927
+    /// gave 49996). 1e-6% starts at 49999992, not 50000000: `49999999 · (1 + 1e-8)` misses
+    /// the half by 1e-8, 1.3 ulps of `q`, which is inside the tie tolerance (percent-step ties
+    /// miss by up to 3 ulps, [`TIE_ULPS`]); the old nudge gave 45454546. `1e-310%` raises
+    /// nothing up to index 2^52, since `1 + 1e-312` is 1 (the old nudge raised every
+    /// multiple from `5e8` up, so it returned there), and it must return: `50 / p` is
+    /// infinite.
     ///
     /// Each value is also checked against the engine: it is raised and the multiple
     /// below it is not.
     ///
     /// Mutations: returning `50 * s / p` unrounded gives 510.2 for 49%; ties down gives
-    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000 for 0.001% and
+    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000000 for 1e-6% and
     /// does not return for 1e-310%.
     #[test]
     fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
@@ -1998,14 +2086,13 @@ mod tests {
             (250.0, 49.0, Some(500.0)),
             (0.1, 25.0, Some(0.2)),
             (1.0, 0.003, Some(16667.0)),
-            (1.0, 0.001, Some(49996.0)),
-            (1.0, 1e-6, Some(45_454_546.0)),
+            (1.0, 0.001, Some(50000.0)),
+            (1.0, 1e-6, Some(49_999_992.0)),
             (1.0, 1e-310, None),
         ] {
-            let got = DoseGrid::lowest_raised_by(s, p).expect("a multiple is raised");
-            if let Some(want) = want {
-                assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
-            }
+            let got = DoseGrid::lowest_raised_by(s, p);
+            assert_eq!(got.map(f64::to_bits), want.map(f64::to_bits), "s = {s}, p = {p}");
+            let Some(got) = got else { continue };
             let below = got - s;
             assert!(open(s).step_percent(got, p, true) > got, "s = {s}, p = {p}: {got}");
             assert_eq!(
