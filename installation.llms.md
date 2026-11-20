@@ -1,0 +1,199 @@
+# Installation
+
+ferx-core builds with a recent **nightly** Rust toolchain (pinned in `rust-toolchain.toml`) — `cargo build` is all you need. The exact FOCE/FOCEI and HMC gradients come from hand-rolled analytic `Dual2` sensitivities where available, with finite differences used elsewhere. A stock nightly suffices.
+
+Pick your platform:
+
+- [**Linux**](#linux) — fully supported
+- [**macOS**](#macos) — supported (Intel and Apple Silicon)
+- [**Windows**](#windows) — supported (native, or via WSL2)
+- [**Docker**](#docker) — the `ferx` CLI without installing Rust
+
+------------------------------------------------------------------------
+
+## Prerequisites
+
+### Linux
+
+Tested on Ubuntu 22.04/24.04; other distributions work with package-manager adjustments.
+
+``` bash
+# rustup + nightly (provides cargo):
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+rustup toolchain install nightly --profile minimal
+
+# Build tools + the NLopt C library (the only non-Rust dependency):
+sudo apt update
+sudo apt install -y build-essential pkg-config libnlopt-dev
+```
+
+**Do not use snap’s rustup** — its filesystem confinement breaks on non-standard home directories (common on enterprise servers). Use the rustup.rs installer above.
+
+### macOS
+
+Supported on Intel and Apple Silicon.
+
+``` bash
+xcode-select --install          # Xcode Command Line Tools (clang, git)
+brew install nlopt
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+rustup toolchain install nightly --profile minimal
+```
+
+### Windows
+
+ferx-core builds natively on Windows with the MSVC toolchain. Install [rustup](https://rustup.rs) and a nightly toolchain (`rustup toolchain install nightly`); the NLopt crate builds via CMake (install the [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/) if the link step complains). WSL2 with the [Linux](#linux) instructions also works and is convenient if you already use a Unix workflow.
+
+------------------------------------------------------------------------
+
+## Building ferx-core from source
+
+``` bash
+git clone https://github.com/FeRx-NLME/ferx-core
+cd ferx-core
+
+# The repo is a cargo workspace: the root package is the `ferx-core` library
+# and the `ferx` binary lives in the `ferx-cli` package, so build the workspace
+# (a bare `cargo build --release` builds the library only).
+cargo build --release --workspace
+# Binary at target/release/ferx
+```
+
+The `release` profile uses `lto = "fat"`, so the first build’s final link step is single-threaded and takes a few minutes; Cargo caches dependencies, so later builds are fast. Extra cores do not speed up the final LTO link — that is normal, not a hang.
+
+### Build options
+
+``` bash
+# Debug build (faster compile, slower runtime)
+cargo build --workspace
+
+# Quick type-check without building
+cargo check
+
+# Lints
+cargo clippy
+
+# CI configuration (release-level opt, thin LTO — what CI uses)
+cargo build --release --no-default-features --features ci
+```
+
+Feature flags belong to the `ferx-core` package, so when building the whole workspace they need to be written package-qualified:
+
+``` bash
+cargo build --release --workspace --no-default-features --features ferx-core/ci
+```
+
+The `ci` feature is a no-op kept for compatibility with existing `--features ci` invocations; it does not change behaviour.
+
+### CPU-specific builds
+
+Tuning the build for your CPU does not make ferx meaningfully faster, and it is not recommended. \#1917 measured this from the same commit on an Apple M5 Pro and an AMD Ryzen 7 7840U (Zen 4), across FOCEI, SAEM and `gn_hybrid`:
+
+- `RUSTFLAGS="-C target-cpu=native"` on Apple Silicon gave no meaningful benefit. The default aarch64 macOS target is already tuned for Apple cores.
+- On x86_64, `-C target-cpu=x86-64-v3` was neutral on most models and 12 % *slower* on one. `-C target-cpu=native`, which enables AVX-512 on Zen 4, was 2–15 % slower.
+- `codegen-units = 1` helped only the ODE models: about 3 % wall time on Zen 4, and 3–5 % fewer instructions on the Mac. It made a clean release build 41 % longer on Zen 4, and much longer on the Mac.
+
+On each machine, the fits from these builds were bit-identical to the portable build of the same commit; only the speed differed. That says nothing about fits across operating systems, where the system math library can differ. For a faster fit, give it more threads instead; see [choosing a thread count](model-file/fit-options.llms.md#choosing-a-thread-count).
+
+### Verify the build
+
+``` bash
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
+```
+
+This should print a successful model fit with parameter estimates.
+
+------------------------------------------------------------------------
+
+## Docker
+
+To use the `ferx` CLI without installing Rust, run the public image `ghcr.io/ferx-nlme/ferx-r` (`linux/amd64` and `linux/arm64`). It is published from the ferx-r repository and carries R, the ferx R package and the `ferx` binary. The binary is built with the `ci`, `nn` and `survival` features, at the ferx-core commit that ferx-r’s `src/rust/Cargo.lock` pins.
+
+Mount your project at `/work`, the image’s working directory:
+
+``` bash
+docker run --rm -v "$PWD:/work" ghcr.io/ferx-nlme/ferx-r:latest \
+  ferx model.ferx --data data.csv
+docker run --rm -v "$PWD:/work" ghcr.io/ferx-nlme/ferx-r:latest \
+  ferx check model.ferx
+```
+
+That commit can lag ferx-core `main`, so a CLI flag or model-file feature described in this book may not be in the image yet. To see which ferx-core commit the image contains, and compare it with the feature you need:
+
+``` bash
+docker run --rm ghcr.io/ferx-nlme/ferx-r:latest cat /usr/local/share/ferx-core-rev
+```
+
+The `latest` tag is the newest ferx-r `main` build and moves. From ferx-r 0.5.0 on, `release` follows the newest release and `X.Y.Z` names one release; a version tag is never replaced, so pin one for reproducible work.
+
+When several containers share a node, pass `--threads N` to match the cores each job was given. Inside a container ferx does not see a Kubernetes CPU request without a limit, or a Slurm allocation not enforced through cgroups, so by default it may use more threads than the job has.
+
+The R side, image digests, derived images and the RStudio image are covered in the [ferx-r README](https://github.com/FeRx-NLME/ferx-r#docker) and the [ferx book’s installation chapter](https://ferx-nlme.org/ferx-book/chapters/01-installation.html#sec-docker).
+
+------------------------------------------------------------------------
+
+## Installing the ferx R package
+
+The R package handles the Rust build for you:
+
+``` r
+pak::pak("FeRx-NLME/ferx-r")
+# or: devtools::install_github("FeRx-NLME/ferx-r")
+```
+
+See the [ferx R package README](https://github.com/FeRx-NLME/ferx-r) for API usage.
+
+### Cancelling a running fit (Ctrl-C)
+
+`ferx_fit()` runs the estimator on a worker thread and polls for R interrupts on the main thread every ~100 ms, so **Ctrl-C** (or RStudio’s red stop button) aborts the fit cleanly. The worker exits at the next safe checkpoint, typically within a second or two. With the NLopt outer optimizers (`auto`, `nlopt_lbfgs`, `bobyqa`, `slsqp`, `mma`) and the `global_search` pre-search, FOCE, FOCEI and Laplace check again before each subject’s EBE solve in an objective evaluation (except for mixture models). A cancel that arrives during that pass waits only for the solves already running, one per thread. Other phases finish the pass they are in first: the outer gradient, the Laplace/AGQ quadrature, `trust_region`, `method = gn`, mixture models and the other estimators. Once the optimizer stops, it still runs its final EBE readout at the best estimates. That is one or two full population passes, or one pass per class for a mixture model. On a heavy ODE model, cleanup can therefore take a few population passes. The call then returns with an R error:
+
+    Error: ferx_fit: cancelled by user
+
+Ctrl-Z (SIGTSTP) will *not* abort the fit — it suspends the whole R process to the shell. Use Ctrl-C instead.
+
+------------------------------------------------------------------------
+
+## Dependencies
+
+ferx-core depends on these crates (managed automatically by Cargo):
+
+| Crate                | Purpose                                     |
+|----------------------|---------------------------------------------|
+| `nalgebra`           | Linear algebra (matrices, Cholesky)         |
+| `nlopt`              | Nonlinear optimization (SLSQP, L-BFGS, MMA) |
+| `rayon`              | Parallel computation                        |
+| `rand`, `rand_distr` | Random number generation (SAEM, SIR)        |
+| `csv`                | CSV data file reading                       |
+| `regex`              | Model file expression parsing               |
+
+The `nlopt` crate requires the NLopt C library. Most platforms handle this automatically; if the build fails on NLopt, install it via your system package manager:
+
+``` bash
+# macOS
+brew install nlopt
+
+# Ubuntu/Debian
+sudo apt install libnlopt-dev
+
+# Fedora
+sudo dnf install NLopt-devel
+```
+
+------------------------------------------------------------------------
+
+## Troubleshooting
+
+### `"error: the option 'Z' is only accepted on the nightly compiler"`
+
+Your shell (or R) is finding a non-nightly `rustc`. Check `rustc --version` and your `PATH`. For R, verify `Sys.which("rustc")` and `~/.Renviron`. ferx-core builds on the nightly toolchain pinned in `rust-toolchain.toml`.
+
+### The build fails on NLopt
+
+Install the NLopt C library for your platform (see [Dependencies](#dependencies)).
+
+### Choosing a gradient method
+
+Use `gradient = auto` for the default analytic `Dual2` route where it is in scope, with finite differences elsewhere. Use `gradient = fd` to force finite differences.

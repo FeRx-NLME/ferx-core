@@ -1,0 +1,334 @@
+# `[covariate_nn]` — Deep Compartment Models (DCM)
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+A `[covariate_nn]` block replaces the **typical-value covariate model** with a small feed-forward neural network. Instead of writing
+
+``` ferx
+CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+```
+
+you write a network whose inputs are subject covariates and whose outputs are PK typical values, then compose with etas the standard way:
+
+``` ferx
+[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]
+  outputs    = [CL, V1, Q, V2, KA]
+  layers     = [8, 8]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
+  Q  = TYPICAL_PK.Q  * exp(ETA_Q)
+  V2 = TYPICAL_PK.V2 * exp(ETA_V2)
+  KA = TYPICAL_PK.KA * exp(ETA_KA)
+```
+
+The compartmental ODE / analytical solution downstream is unchanged; etas attach to the *final* PK parameters (not the NN weights), so the inner FOCEI loop runs exactly as it does for an analytical model. This is the “mixed-effects DCM” variant.
+
+> **Reference**: Janssen A. et al. (2022). *Deep compartment models: A deep learning approach for the reliable prediction of time-series data in pharmacokinetic modeling.* CPT Pharmacometrics Syst Pharmacol 11:934–945. DOI [10.1002/psp4.12808](https://doi.org/10.1002/psp4.12808).
+
+## Status
+
+Behind the `nn` cargo feature (off by default). Build with:
+
+``` sh
+cargo build --release -p ferx-cli --features ferx-core/nn
+```
+
+A full runnable example lives at [`examples/warfarin_dcm.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_dcm.ferx) — compare with [`examples/two_cpt_oral_cov.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_oral_cov.ferx), which uses the same data and eta structure but an analytical covariate model.
+
+## Block syntax
+
+``` ferx
+[covariate_nn NAME]
+  inputs     = [COV_1, COV_2, ...]
+  outputs    = [PK_PARAM_1, PK_PARAM_2, ...]
+  layers     = [hidden_1, hidden_2, ...]
+  activation = tanh | relu | sigmoid | softplus | exp | identity
+  output     = tanh | relu | sigmoid | softplus | exp | identity   # optional, default `identity`
+  center     = [c_1, c_2, ...]   # optional, default all 0
+  scale      = [s_1, s_2, ...]   # optional, default all 1
+```
+
+| Field | Required | Meaning |
+|----|----|----|
+| `inputs` | yes | Covariate column names from the NONMEM CSV |
+| `outputs` | yes | PK parameter names (`cl`, `v` / `v1`, `q` / `q2`, `v2`, `ka`, `f`, `q3`, `v3`, `lagtime` / `alag`) |
+| `layers` | yes | Hidden layer widths, in order. At least one entry required |
+| `activation` | yes | Hidden-layer element-wise activation |
+| `output` | no | Output-layer activation. Use `softplus` or `exp` for positive PK params |
+| `center` | no | Per-input value subtracted before the forward pass. One entry per input |
+| `scale` | no | Per-input divisor applied after centering. One entry per input; must be finite and non-zero |
+| `init` | no | Starting value per output, on the parameter’s own scale. One entry per output; must be reachable by the output activation. Strongly recommended — see [Start the network at plausible values](#start-the-network-at-plausible-values-init) |
+
+The header form `[covariate_nn NAME]` requires the **NAME** (e.g. `TYPICAL_PK`). NAME is the dot-access prefix in `[individual_parameters]` expressions (`NAME.CL`, `NAME.V1`, …).
+
+Multiple `[covariate_nn]` blocks per model are permitted; they’re keyed by NAME and ordered alphabetically when generating theta names.
+
+## Normalize your inputs
+
+The network sees `(x - center) / scale`. Both default to the identity, so an existing model is unchanged — but on real covariates you almost always want them set.
+
+Raw covariates are badly scaled for a neural net. `WT ≈ 70` or `CRCL ≈ 86` drive every `tanh` unit to ±1 at Glorot initialization, where the derivative is ~0 and the layer is nearly blind to its input. The optimizer’s only route out is to shrink the first-layer weights toward zero while later layers grow to compensate, which is slow, ill-conditioned, and prone to running away. Measured on a two-covariate DCM, unnormalized inputs pushed weights to ~1e11 and left the residual error at 15× its true value; the same model with standardized inputs kept every weight inside `[-1.3, 1.6]`.
+
+A fit warns when it is handed inputs like these. `W_NN_UNSCALED_INPUT` names every input whose values in the data, after the block’s `center`/`scale`, reach past `3/a` (`6/a` for a sigmoid), where `a = √(6/(fan_in + fan_out))` is the first layer’s Glorot weight scale: past that, one input alone drives a hidden unit into saturation at its initial weights. On such a network which optimum a fit reaches can depend on the path to it — without normalisation, `examples/warfarin_dcm.ferx` ends at very different objectives depending only on how the inner loop is warm-started (#2549).
+
+Use the covariate’s mean and SD in your dataset, or any round numbers near them — the network does not care whether the standardization is exact, only that its inputs land in roughly `[-3, 3]`:
+
+``` ferx
+[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]
+  center     = [70, 86]
+  scale      = [12, 23]
+  outputs    = [CL, V1]
+  layers     = [8]
+  activation = tanh
+  output     = softplus
+```
+
+### Why these are declared, not learned from the data
+
+They are constants in the model file rather than statistics computed at fit time, which is deliberate. Statistics derived from the estimation data could not be carried into `predict()` — recomputing them on a new dataset would silently change the model between fitting and prediction, the standard train/serve skew. Writing them down keeps the model file a complete description of the transform, and matches what population PK already does when it writes `(WT/70)^0.75` and names its reference weight.
+
+## Auto-generated parameters
+
+For each block, the parser generates one theta per weight and per bias. Names follow the convention:
+
+- `W_<NAME>_<l>_<i>_<j>` — weight from input unit `j` (in layer `l−1`) to output unit `i` (in layer `l`)
+- `B_<NAME>_<l>_<i>` — bias of output unit `i` in layer `l`
+
+Layers are 1-indexed (input layer is layer 0, doesn’t have weights). For a 2 → 8 → 8 → 5 network: 2·8 + 8 + 8·8 + 8 + 8·5 + 5 = **141 thetas**.
+
+Initial values use a Glorot-style deterministic scheme seeded by the block NAME, so builds are reproducible without pulling `rand` into the parser. Weights are unbounded (identity-packed): the optimizer sees them on the natural scale, no log transform. Biases initialise to 0.
+
+## Activation reference
+
+| `activation` value | Behavior | Typical use |
+|----|----|----|
+| `identity` | `f(x) = x` | Output layer when you’ll wrap your own positivity head |
+| `relu` | `f(x) = max(0, x)` | Cheap hidden activation, but creates kinks; reduces smoothness for FOCEI |
+| `tanh` | `f(x) = tanh(x)` | **Recommended hidden default** — smooth, bounded `(-1, 1)` |
+| `sigmoid` | `f(x) = 1 / (1 + exp(-x))` | Bounded `(0, 1)`; useful for `F` bioavailability outputs |
+| `softplus` | `f(x) = ln(1 + exp(x))` | **Recommended output for PK params** — guarantees positivity, no exp blow-up |
+| `exp` | `f(x) = exp(x)` | Strictly positive, but unbounded; prefer `softplus` |
+
+All activations use `if`/`else` instead of `f64::max`/`f64::min` so they remain differentiable under the `Dual2` sensitivity type (see [AGENTS.md](https://github.com/FeRx-NLME/ferx-core/blob/main/AGENTS.md) → “Analytic Sensitivities”).
+
+## Mu-ref composition with etas
+
+The pattern `TYPICAL_PK.CL * exp(ETA_CL)` is recognised by the parser as a **lognormal mu-ref** with `TYPICAL_PK.CL` as the structured anchor name. It shows up in `FitResult.mu_refs` as:
+
+    { "ETA_CL": MuRef { theta_name: "TYPICAL_PK.CL", log_transformed: true } }
+
+and in `eta_param_info[ETA_CL].param_type` as `LogNormal`. The mu-ref re-centering fast path (`compute_mu_k`) currently silently skips structured-name mu-refs and FOCEI falls back to its standard inner-loop path — correct, just slower than a structured-name-aware inner loop. That perf improvement lives on the Phase A M2 roadmap in [`plans/dcm-and-low-dim-node.md`](https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md).
+
+## Fit output
+
+Fit YAML (`{model}-fit.yaml`) and `.fitrx` bundles emit a compact `neural_networks:` section in addition to the regular `theta:` block. The NN weights are summarised by shape, activations, weight count, and basic statistics over the trained values rather than dumped one row per weight — for a 141-weight network, the YAML stays scannable:
+
+``` yaml
+neural_networks:
+  TYPICAL_PK:
+    shape: [2, 8, 8, 5]
+    hidden_activation: tanh
+    output_activation: softplus
+    inputs: [WT, CRCL]
+    outputs: [CL, V1, Q, V2, KA]
+    n_weights: 141
+    weights_summary:
+      min:  -1.034521
+      max:   0.987643
+      mean:  0.014277
+      std:   0.342118
+```
+
+Full per-weight values remain in `result.theta` at indices `weights_offset..weights_offset + n_weights` (the `weights_offset` is also exposed on each `FitResult.neural_networks[k]` entry). `ferx-r` loaders round-trip them losslessly via `fit.json` inside the `.fitrx` archive.
+
+When the model declares [normalization](#normalize-your-inputs), the summary carries `center:` and `scale:` alongside the shape, and each `FitResult.neural_networks[k]` entry carries `input_center` / `input_scale` in `input_names` order. Both are needed to *use* the reported weights: the network was fitted against `(x - center) / scale`, so evaluating the same weights on raw covariates yields a different network with nothing to signal it. Models that declare no normalization report the identity (all-zero `center`, all-one `scale`) and the YAML omits the two lines entirely.
+
+The `init` values are deliberately not reported. They set where the optimizer *starts*; the fitted weights supersede them, and they say nothing about what the converged network computes.
+
+## Start the network at plausible values (`init`)
+
+Declare one starting value per output, on the scale the parameter actually has:
+
+``` ferx
+[covariate_nn TYPICAL_PK]
+  inputs  = [WT, CRCL]
+  outputs = [CL, V]
+  layers  = [8, 8]
+  activation = tanh
+  output  = softplus
+  center  = [70, 90]
+  scale   = [15, 30]
+  init    = [1.0, 10.0]        # CL ≈ 1 L/h, V ≈ 10 L at iteration 0
+```
+
+**Do this on every DCM.** Without it, every output-layer bias starts at 0, so a `softplus` head starts *every* PK parameter at `softplus(0) = 0.693` — a clearance of 0.69 L/h and a volume of 0.69 L, whatever the model means by them. The initial predictions are then wrong by orders of magnitude and the optimizer starts from a correspondingly absurd objective.
+
+That is not a slow start; it changes the answer. On a 60-subject busulfan-shaped DCM, identical data and seed:
+
+| start                | `−2 log L` | KDEC (true 0.01) | `elbo_tightness_ratio` |
+|----------------------|------------|------------------|------------------------|
+| bare head            | 2033.6     | 0.0057           | 306.6                  |
+| `init = [1.0, 10.0]` | **1061.0** | **0.0126**       | **0.54**               |
+
+The bare-head fit reported `converged: true`.
+
+The same happens under FOCEI. On the two-compartment DCM in `tests/fixtures/two_cpt_dcm_regularized.ferx` (5 outputs, `two_cpt_oral_cov` data), the unpenalized fit from a bare head reported `converged: true` at OFV −234. That is worse than setting every network weight to zero, a covariate-free model inside the same parameter space, which reaches −1185. With `init = [4, 40, 8, 80, 1]` the same fit reaches −1252 ([\#1561](https://github.com/FeRx-NLME/ferx-core/issues/1561)).
+
+`fit()` and `ferx check` warn about a bare head (`W_NN_BARE_OUTPUT_START`). The warning reads the start the fit is given, so a warm start from an earlier fit does not trigger it.
+
+The realisation is exact: the output-layer weight block is zeroed alongside the biases, so the network emits exactly `init` for every subject at iteration 0, independent of covariates. Those weights are not frozen — they take gradient from the first step, and the hidden layers from the second.
+
+Values must be reachable by the output activation (`softplus`/`exp`/`relu` need a positive value, `sigmoid` needs one in (0, 1), `tanh` one in (−1, 1)); anything else is a parse error rather than a `NaN` weight.
+
+## Weight gradients
+
+Estimators that hold the random effects fixed while differentiating the population parameters — SAEM’s M-step, importance sampling, and variational inference — used to obtain `∂NLL/∂θ` by perturbing each `θ` in turn and re-solving the subject. For a classical model that is a handful of solves. For a DCM the weights *are* `θ`, so a 141-weight network meant 141 solves per subject per draw.
+
+The weights are now taken analytically. The network touches the likelihood through one narrow channel — its output layer — so its influence factors as
+
+$$\frac{\partial \mathrm{NLL}}{\partial w_j} = \sum_k \frac{\partial \mathrm{NLL}}{\partial z_k} \cdot \frac{\partial z_k}{\partial w_j}$$
+
+where $z$ is the output layer’s pre-activation. The second factor is exact backpropagation, already available and cheap. Only the `n_outputs` values of the first factor need the model solved, and they come from the output-layer biases: $b_k$ shifts $z_k$ one-for-one and leaves every other output alone, so a finite difference in $b_k$ *is* $\partial \mathrm{NLL} / \partial z_k$. That is `2 × n_outputs` solves — 10 rather than 141 on the model above, taking each difference centrally.
+
+Two consequences worth knowing:
+
+- **Accuracy improves more than speed.** Agreement with a central finite difference of the objective goes from ~2e-5 to ~1e-9 relative. Wall-clock on the reference DCM improves ~1.4×, because the `θ` loop was only about 30% of a VI iteration to begin with.
+- **Time-varying NN inputs opt out.** The factorization needs one output vector per subject. If a covariate feeding the network changes within a subject, each event has its own $z$ and the bias difference returns their sum, which cannot be unpicked. Those subjects fall back to the per-`θ` loop — correct, just slower. Covariates that vary but do *not* feed the network are unaffected.
+
+### FOCE / FOCEI / Laplace: the adjoint gradient
+
+`method = focei` (and `foce`, `laplace`, AGQ) differentiates through the network with the adjoint (#486). The weights are θ inputs of its plan, so one reverse pass returns every weight’s derivative, at a cost that does not grow with the number of weights. Static and time-varying network inputs, IOV (`kappa`), an `[initial_conditions]` baseline, an `obs_scale` expression and a Form C readout are all served, on both loops. A model that reads a generated weight parameter directly (`… + B_TYPICAL_PK_2_1`) is served too: the adjoint records the weights as θ leaves. Only the weight-gradient speed-ups (`NnGradPlan`, `NnReduction`) stand down for such a model.
+
+Two things keep the network off the hot paths:
+
+- **The inner EBE search never differentiates the weights.** The network’s outputs depend only on the weights and the subject’s covariates, so they are evaluated once per solve and enter the η-only recordings as constants.
+- **The covariance R-matrix works in the networks’ output basis.** With subject-static inputs the weights reach the likelihood only through a few outputs, so the R-matrix is assembled over those outputs and the weight block is added from the small network alone.
+
+On the 141-weight `warfarin_dcm` example a FOCEI fit runs about 3.5× faster than the forward provider it replaced, and the R-matrix step takes about 0.3 s instead of about 15 s.
+
+Before \#2093 the forward sensitivity provider had two width problems on networks, fixed in turn: a time-varying network input bounded its dual width on the model’s total θ count (#1300; on the vancomycin example, ~5–10 s per objective evaluation against 18 ms for the analytical covariate twin), and the IOV walk seeded every θ on its own axis, which left a DCM with IOV no analytic outer gradient at all (#1339; on the busulfan reference, 546 BOBYQA evaluations against 41 L-BFGS ones). Both are gone with the adjoint, which has no θ limit.
+
+### Finite-difference steps on the weights
+
+Where a weight is finite-differenced (the reconverged FD gradient, the FD covariance stencil), its step is `h·(1 + |w|)`. That is the unit floor of [`fd_hessian_step`](../model-file/fit-options.llms.md#fd-hessian-step-choice), never the `|θ₀|` floor an identity-packed θ declared below 1 takes. A weight’s θ₀ is its initial draw, not a magnitude anyone declared, and the objective’s sensitivity to the weight does not scale with that draw. On `two_cpt_oral_cov` (8 subjects) with a `CRCL`/`WT` network, a first-layer weight at 1e-4 gets a reconverged-FD gradient 6.4e-3 off the exact adjoint gradient under the `|θ₀|` floor, and 1.1e-8 off under the unit floor, at the default `inner_tol` (#2406; the test `a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route` pins it).
+
+## Regularization (`nn_l2`, `nn_smooth`)
+
+Because an unregularized DCM can invent spurious covariate-driven variation — and the amount grows with network capacity (`[4]` \< `[4,4]` ≈ `[8]`), showing up as sharp high-frequency wiggles in the learned covariate→modulator curves — two optional penalties are available. Both default to `0.0` (off, a strict no-op) and are set from `[fit_options]` (or `ferx_fit(settings = ...)`):
+
+- **`nn_l2`** — L2 weight decay, `nn_l2 · Σ wᵢ²` over the **weight** matrices only (biases stay free). Shrinks every weight toward 0.
+- **`nn_smooth`** — smoothness/curvature penalty, `nn_smooth · Σ C²`, where `C = f(x+h) − 2·f(x) + f(x−h)` is the finite-difference 2nd derivative of each output along an input’s marginal partial-dependence curve. It penalizes *curvature*, so monotone slopes are free and only the wiggles are punished.
+
+The curvature grid is built **in the network’s own input space** — the `(x − center) / scale` values the MLP actually receives (see [Normalize your inputs](#normalize-your-inputs)) — sweeping each input across its observed range in steps of a quarter of its sd while the other inputs sit at their median. A grid on raw covariates would probe the network where the fit never evaluates it (with `center`/`scale` declared, raw `WT ∈ [45, 90]` saturates every `tanh` unit and the penalty would silently read ≈ 0). Wide-range inputs get a coarser step over the full range rather than a truncated sweep. The sweep spans every covariate snapshot the network is evaluated at: for a time-varying NN input that is each subject’s per-record values (dose, observation, `EVID=2` and reset rows), not just its baseline — so a population whose subjects all *start* at the same value but move later still gets a penalized axis over the range they traverse. Within a subject, repeated (carried-forward) values count once, so a densely sampled subject does not dominate the axis’ range and step. Subjects with no finite value for an input are left out of that axis.
+
+Both add to the objective the optimizer minimizes and carry matching analytic gradients (no autodiff — the smoothness term reuses the MLP’s analytic Jacobian) and, where the optimizer uses one, the penalty’s curvature in the Hessian. They apply across the **FOCE-family** methods — `foce`, `focei`, `laplace` (every outer optimizer: NLopt, built-in BFGS, trust-region) and `gn` / `gn_hybrid` — and under **`vi`**, which folds the same penalty gradient into its Adam step on the same scale, so a given `nn_l2` matches its FOCEI meaning. Under `vi` the penalty also breaks the network’s permutation/scale weight symmetry, so a regularized DCM settles and early-stops instead of running the full `vi_iters` ceiling an unregularized one would. SAEM, IMP/IMPMAP and Bayes do not apply them; setting either key with one of those as the final stage produces a warning and an unregularized fit.
+
+The **reported** `fit$ofv` (and hence AIC/BIC) is the **unpenalized** −2·log-likelihood, so a regularized DCM stays directly comparable to an analytic-covariate model on information criteria; the penalty only shapes the optimization. The optimizer trace, checkpoint and verbose `Eval`/`Iter` lines carry that same unpenalized value, so they agree with the reported OFV. Two consequences to keep in mind:
+
+- `final_gradient` is the gradient of the *penalized* objective — that is what a regularized fit converges on; the gradient of the reported OFV is not ≈ 0 at the optimum by design.
+- Multi-start (`n_starts`) and the `gn_hybrid` phase selection rank candidates on the penalized objective, so a heavier λ cannot be out-voted by a start that merely fits the data better.
+- **Standard errors** are the curvature of the *penalized* objective — the one the optimizer minimised — so they are penalized-ML standard errors, and the fit’s warnings say so. The covariance step adds the penalty’s exact Hessian to the R matrix (`2·nn_l2` on each weight coordinate, and the smoothness term’s full second derivative) on the analytic and the finite-difference route alike. That matters most where the penalty is doing its job: the weight directions the data does not identify are flat or indefinite in the unpenalized OFV, and without the penalty the step would floor them or fall back to SIR. Read an NN-weight SE as uncertainty under the penalty, not as “how much the data alone constrain this weight”. `covariance_method = s` is the exception: `S` is a sum of per-subject scores and the penalty has no per-subject part, so its SEs ignore the penalty, and a warning says so. Under `saem` / `imp` / `impmap` / `bayes`, which never apply the penalty, nothing is added.
+
+&nbsp;
+
+    [fit_options]
+      method    = focei
+      nn_l2     = 1e-2   # weight decay
+      nn_smooth = 1e-1   # curvature / anti-wiggle
+
+See [fit-options.qmd](../model-file/fit-options.llms.md#covariate-nn-regularization-nn_l2-nn_smooth) for the full reference.
+
+## Exporting a fitted DCM
+
+After the fit the weights are constants, and a network at fixed weights is an ordinary algebraic function of its covariates. `ferx export-dcm` writes it out as one: every `[covariate_nn]` block becomes plain `[individual_parameters]` equations at the fitted weights, and every `NAME.OUTPUT` reference becomes the variable holding that output.
+
+``` bash
+ferx export-dcm run.fitrx -o run-analytic.ferx
+ferx export-dcm warfarin_dcm.ferx --fit run.json      # model + JSON fit
+ferx export-dcm run.fitrx --fixed-theta               # weights as FIXed thetas
+```
+
+The result has no `[covariate_nn]` block, so it loads in a build without the `nn` feature (the R package’s default build), reads as equations a reviewer can check by hand, and is the starting point for a NONMEM `$PK` translation. For the 2 → 3 → 2 → 2 network of `tests/data/dcm_export/model.ferx` (`tanh` hidden layers, `softplus` head):
+
+    [individual_parameters]
+      # --- [covariate_nn TYPICAL_PK] expanded: 2 -> 3 -> 2 -> 2, tanh hidden / softplus output ---
+      # Always taken: the `if` keeps the network's units out of the individual
+      # parameters, so an ODE model does not give each one a PK slot.
+      if (0 == 0) {
+        Z_TYPICAL_PK_WT = (WT - 70.0) / 12.0
+        Z_TYPICAL_PK_CRCL = (CRCL + 5.0) / 23.5
+        H1_TYPICAL_PK_1 = tanh(0.29552020666133955 * Z_TYPICAL_PK_WT
+                               + 1.0391970592293505 * Z_TYPICAL_PK_CRCL
+                               - 1.6337206970902447)
+        ...
+        TYPICAL_PK_CL = softplus(-2.739502212547247 * H2_TYPICAL_PK_1
+                                 - 1.7619321248456368 * H2_TYPICAL_PK_2
+                                 - 3.967115413772459)
+        ...
+      } else {
+        TYPICAL_PK_CL = 0
+        TYPICAL_PK_KA = 0
+      }
+      CL = TYPICAL_PK_CL * exp(ETA_CL)
+
+The units sit inside an `if (0 == 0)` block that is always taken. A name assigned at the top level of `[individual_parameters]` is an individual parameter, and an ODE model gives each one a slot in a layout of fewer than 128, so a network with two 64-unit hidden layers would not fit. Inside the block the units stay local, and only the outputs are read afterwards.
+
+Each network input is written into the equations by name, so it has to read the data column there. `export-dcm` refuses an input that is not a plain identifier, one named like a built-in (`TIME`, `MIXNUM`, …), and one that shares its name with a parameter or variable of the model, which the equation would read instead.
+
+When the model file and the fit are given separately, `export-dcm` first checks that the fit was made with the same networks: the fit carries its own model text, and each `[covariate_nn]` block must declare the same inputs, outputs, layers, activations, `center` and `scale` in both (comments and `init` may differ). The weight names only record the block name and the shape, so without this check a fit of a different network of the same shape would export without complaint. The rest of the model has to be the fit’s too — every equation, the error model, which parameters exist and which are `FIX` — or the estimates would be written into a model they were not made for. Comments, layout, the order (and key case) of a `[covariate_nn]` block’s fields, the values in `[parameters]` (starting values, bounds and inline priors — not a kappa `weight` expression), `[data] path` and `[priors]` may differ; anything else is an error naming the first line that does.
+
+The library entry points are `ferx_core::nn::export::export_dcm_from_fit` (model text + fit, with that check and the fit’s other estimates) and `export_dcm_as_analytic` (model text + the fit’s `theta_names` / `theta`: the networks only, without the check). Both are compiled in every build, `nn` or not.
+
+### The fit’s other estimates
+
+`export-dcm` writes the whole fitted model, not only the networks: every `theta`, `omega`, `sigma` and `kappa` declaration, `block_omega`, `block_sigma` and `block_kappa` included, is set to the fit’s estimate, and the header of the exported file says so.
+
+    [parameters]
+      theta TVV(31.5, 1, 100)          # was theta TVV(30, 1, 100)
+      omega ETA_CL ~ 0.0912
+      sigma PROP_ERR ~ 0.1234 (sd)
+
+Each declaration keeps the scale it is written on, so a `(sd)` tag, and an inline `prior(...)` declared on that scale, keep their meaning. A fit reports Ω and κ as variances and Σ as an SD; a value declared on the other scale goes through a square or a square root and reads back within a few ULP, every other value bit for bit. The export is parsed again and compared with the fit before it is written, so a declaration the estimate cannot be written into — a vector theta, a theta generated by `[covariate_model]`, a `[mixture]` class override — is an error naming the parameter, not a silent starting value. Pass `--network-only` (`DcmExportOptions::network_only` in the library) to write only the networks and keep every other value as the model file declares it.
+
+### Paths, priors and other blocks
+
+The `[data]` and `[priors]` blocks are copied exactly. A relative `[data] path` or `[priors] from_fit` then resolves against wherever the export is loaded from, so `export-dcm` prints a note when the export is written to a different directory than the model. A `.fitrx` does not record the original model’s directory, so for a bundle the note asks you to check the path resolves from the export’s directory. A `from_fit` prior was made for the network model; its network-weight entries match no free theta in the export and are skipped. When the prior source can be found (next to the model file, or by an absolute path), `export-dcm` loads the export with it, and refuses the export if nothing else would import — the export would otherwise fail to load. When it cannot be found, the note says the check was not made. `-o` naming the model or the fit is refused rather than overwriting it.
+
+A block this build of ferx cannot parse — `[event_model]` or `[binary_model]` without the `survival` feature, `[markov_model]` without `markov` — is copied like any other and left out of the validation parse, so a joint DCM exports from the default `ferx` binary. A `NAME.OUTPUT` reference in such a block is still rewritten, but nothing checks that block against the exported equations; load the export in a build with the feature to validate it.
+
+### Exactness
+
+The exported model predicts **exactly** what the fitted network does, bit for bit, not to a tolerance. The equations accumulate each unit in the order the network does, `tanh` and `softplus` are expression functions running the network’s own code, and every weight is printed at full round-trip precision.
+
+The fit has to carry the weights at full precision, so `export-dcm` reads a `.fitrx` bundle or a `--output-format json` fit. It refuses the `{model}-fit.yaml` report, which rounds to 6 decimals and lists the network only as a summary.
+
+A covariate the data leaves blank is `NaN`, and the network’s outputs are then `NaN`. The export keeps that: the normalisation is written as `(X - center) / scale` with no `present(X)` guard, so a subject the network cannot predict is not silently given finite predictions by the export.
+
+A model that reads a weight theta directly (`W_TYPICAL_PK_1_1_1` in an expression) keeps reading the same value: the default export writes the weight’s value in its place, and `--fixed-theta` declares the theta again.
+
+A network output read anywhere but `[individual_parameters]` — a `kappa` `weight = TYPICAL_PK.CL` in `[parameters]`, say — is refused. The exported equations live in `[individual_parameters]`, so outside it `TYPICAL_PK_CL` would read a data column of that name instead. Move the read into `[individual_parameters]` before exporting.
+
+### Do not refit the export
+
+`--fixed-theta` declares each weight as `theta W_<NAME>_<l>_<i>_<j>(value, lo, hi) FIX` so the equations name it and a weight can be perturbed by hand. The weights stay fixed. Freeing them gives a model with as many thetas as the network has weights and no identifiability: the export is for reading, predicting and translating, not for estimating.
+
+## What’s not yet wired
+
+These items are tracked against Phase A M2 / future PRs in the [plan](https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md):
+
+- `method = nn_mse` — Janssen 2022’s original fixed-effects MSE objective (FOCEI works as the default today).
+- Mu-ref re-centering for NN-anchored etas — fits work today but the inner-loop fast path skips NN-anchored etas; performance improvement, not correctness.
+- Phase B `[dynamics_nn]` block for neural-ODE-style RHS terms (Bräm et al. 2025).
+
+## See also
+
+- [`docs/model-file/neural-networks.qmd`](../model-file/neural-networks.llms.md) — landing page with the “which block do I need?” decision table.
+- [`examples/warfarin_dcm.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_dcm.ferx) — runnable example.
+- [`examples/two_cpt_oral_cov.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_oral_cov.ferx) — analytical equivalent for comparison.
+- [`plans/dcm-and-low-dim-node.md`](https://github.com/FeRx-NLME/ferx-core/blob/main/plans/dcm-and-low-dim-node.md) — full milestone roadmap.

@@ -1,0 +1,143 @@
+# LOQ-Censored Observations
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+Observations below the lower limit of quantification (LLOQ) or above the upper limit of quantification (ULOQ) cannot be treated as ordinary data: they carry only the information that the true concentration is outside the assay’s quantified range. Ignoring them (dropping rows) biases parameter estimates; treating the reported value (e.g. LLOQ/2 or ULOQ) as a real observation is also biased. The statistically correct approach is to integrate the likelihood over the censored region.
+
+ferx-core supports two strategies, selected via `bloq_method` in `[fit_options]`.
+
+------------------------------------------------------------------------
+
+## Data format
+
+Mark a below-LOQ observation by setting `CENS = 1` in the dataset. The `DV` column for that row should contain the LLOQ value (used by the M3 method as the integration upper bound). Mark an above-LOQ observation by setting `CENS = -1`; its `DV` column should contain the ULOQ value:
+
+    ID,TIME,DV,CENS,EVID,AMT
+    1,0.0,0,0,1,100
+    1,1.0,2.45,0,0,0
+    1,6.0,0.02,1,0,0   # below LOQ: DV holds the LLOQ
+    1,8.0,20.0,-1,0,0  # above LOQ: DV holds the ULOQ
+    1,12.0,0.52,0,0,0
+
+Rows with `CENS != 0` and `MDV = 1` are skipped entirely (already excluded by `MDV`). Rows with `CENS = 0` are treated as ordinary quantified observations regardless of their value.
+
+### Out-of-domain values
+
+A missing cell (blank, `.`, `NA`) reads as `0`. A whole number may carry a decimal point — pandas writes an integer column that has a blank cell as `1.0`, and ferx’s own sdtab writes the flag as `1.000000` — and either reads as `1`.
+
+Any other **whole number**, such as `7` or `-2`, counts by its sign alone. Under `bloq_method = m3` a positive flag is scored like `1` (the lower tail, below the LLOQ) and a negative one like `-1` (the upper tail, above the ULOQ); under `bloq_method = drop` the row is scored as an ordinary observation, like any other `CENS` row. ferx warns with `W_CENS_UNEXPECTED`, quoting the cell, once per subject for each sign. It does not warn on a simulation design row with no `DV`, since such a row is never scored.
+
+A cell that is **not a whole number**, such as `1.5`, `abc` or `inf`, is an error on a Gaussian observation row that carries a `DV` and that [`[data_selection]`](../model-file/data-selection.llms.md) keeps. This holds whether the file is read for a fit or for a simulation. The message names the subject, the row’s time and the cell. Correct the cell; if the column is not a censoring flag at all, rename it, in the dataset or aside in the model’s [`[data]`](../model-file/data.llms.md) block.
+
+The same cell is never read, and is not an error, on these rows:
+
+- a dose row;
+- a time-to-event or categorical row;
+- a row whose `DV` is missing;
+- a row that `[data_selection]` removes.
+
+Compared with NONMEM 7.6.0 for `abc`: NONMEM also rejects it on an observation record and accepts it on a record its `IGNORE` removes. Unlike ferx, it rejects it on a dose record too. NONMEM accepts `1.5`, as a number whose meaning your own code decides; ferx gives `CENS` a fixed meaning, so it rejects it, as it rejects `SS=1.5` ([\#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)).
+
+------------------------------------------------------------------------
+
+## Methods
+
+### `bloq_method = drop` (default)
+
+Censored rows (`CENS = 1` or `CENS = -1`) are excluded from special handling and treated as ordinary observations at the value in `DV`. Fast and simple, but biased when the censored fraction is substantial (\>10–15% of observations).
+
+    [fit_options]
+      bloq_method = drop
+
+### `bloq_method = m3`
+
+Implements Beal’s M3 method (2001): the likelihood contribution of a below-LOQ observation is the probability that the true value falls below the LLOQ:
+
+$$L_i^{\text{BLOQ}} = \Phi\!\left(\frac{\text{LLOQ} - f_{ij}}{\sqrt{V_{ij}}}\right)$$
+
+where $f_{ij}$ is the model prediction, $V_{ij}$ is the residual variance, and $\Phi$ is the standard normal CDF. This is the maximum-likelihood treatment of censored normal data.
+
+For above-LOQ observations (`CENS = -1`), ferx uses the mirrored upper-tail probability:
+
+$$L_i^{\text{ULOQ}} = \Phi\!\left(\frac{f_{ij} - \text{ULOQ}}{\sqrt{V_{ij}}}\right)$$
+
+This `CENS` polarity matches Monolix and nlmixr2: `1` means left-censored below LLOQ, and `-1` means right-censored above ULOQ.
+
+### NONMEM comparison for above-LOQ censoring
+
+The upper-tail contribution is cross-checked against NONMEM 7.5.1 in `tests/nonmem/right_censored_m3.ctl`. The control stream uses `F_FLAG=1` with two identical `CENS=-1` rows, `F=12`, `DV=ULOQ=10`, and `W=2`, so each row has $z = (F - \text{ULOQ}) / W = 1$. NONMEM reports OFV `0.69101514210943182`, matching ferx’s `-4 * log(Φ(1))` to within `1e-6` (the small difference is the CDF approximation used by ferx).
+
+    [fit_options]
+      bloq_method = m3
+
+`bloq` is accepted as an alias for `bloq_method`.
+
+### Setting it from code
+
+From Rust the key is `FitOptions::bloq_method`, an `Option<BloqMethod>`, and `fit()` honours it on every call:
+
+- `None` (the default) fits under the model’s own method. That is the file’s `bloq_method` key, or `drop` when the file has none. A model parsed from an `m3` file and fitted with `FitOptions::default()` therefore stays on M3.
+- `Some(BloqMethod::M3)` or `Some(BloqMethod::Drop)` overrides the model for that call only. An explicit `Drop` turns M3 off on a model parsed from an `m3` file.
+
+The method a fit used is reported as `FitResult::bloq_method`. `run_covariance` and `run_sir` read it from there, so a post-hoc step scores the same likelihood as the fit. Up to 0.4.0 a direct `fit()` read only the model, and an M3 request placed in the options was ignored without a warning ([\#1824](https://github.com/FeRx-NLME/ferx-core/issues/1824)). `fit_from_files` ignores the file’s `[fit_options]` by design, so a caller that gives it no `bloq_method` gets `drop`, as before.
+
+------------------------------------------------------------------------
+
+## When to use M3
+
+Use M3 whenever more than ~5–10% of observations are censored. Common situations:
+
+- Sparse PK sampling with a long terminal phase
+- Studies where the LLOQ is relatively high compared to trough concentrations, or the ULOQ is exceeded after high doses
+- Pediatric or renal-impaired populations with reduced drug exposure
+
+The cost is a modest increase in run time (the CDF evaluation adds a small overhead per censored row). The OFV from M3 is not directly comparable to the drop-method OFV; always compare M3 models against other M3 models.
+
+------------------------------------------------------------------------
+
+## Gradient evaluation
+
+The M3 censored likelihood is differentiated with **exact analytic sensitivities** for FOCEI and non-interaction FOCE — including with inter-occasion variability (IOV) and IIV on the residual error (`iiv_on_ruv`) — on both the closed-form (1/2/3-compartment) and user-`[odes]` paths. The censored data term $-\log\Phi$ and its derivatives ride the same per-subject gradient assembly as quantified observations; both the true random-effect Hessian and the FOCEI Laplace $\log|\tilde H|$ include the censored rows at Gauss–Newton (FOCEI) order — the structural $g_2\,a a^\top$ curvature plus, under `iiv_on_ruv`, the residual-$\eta$ cross terms — consistently with quantified rows, matching NONMEM’s LAPLACE M3 Hessian. Because the residual-error $\eta$ does not enter the structural prediction, the sensitivity walk emits a zero $\partial f/\partial\eta_{\text{ruv}}$ column and the $\exp(2\eta_{\text{ruv}})$ variance scaling is applied downstream, so the full triple **M3 + IOV + `iiv_on_ruv`** is analytic on the ODE path too — as is the **non-IOV** ODE M3 + `iiv_on_ruv` model (the ODE and closed-form packed gradients are bit-identical and both match reconverged finite differences to ~1e-7 on each censoring tail), completing the entire `iiv_on_ruv` × {plain, IOV, M3} × {closed-form, ODE} matrix.
+
+The censored *moments* follow each method’s own approximation. Under **FOCE** (non-interaction, Sheiner–Beal) the tail probability uses the linearized-**marginal** moments — mean $f_0 = f(\hat\eta) - H\hat\eta$ and variance $\tilde R_{jj} = H_j\Omega H_j^\top + R^0$, the same moments the quantified rows use (#646, matching Monolix’s linearization likelihood and first-order/Tobit theory) — so plain FOCE stays a self-consistent Sheiner–Beal objective. **FOCEI** instead evaluates the tail at the *conditional* $f(\hat\eta)$ and residual variance $R^0$ — the same conditional censored treatment NONMEM’s `METHOD=1 LAPLACE` M3 uses (the only way NONMEM runs M3). Note that ferx’s FOCEI is a first-order (Gauss–Newton) conditional method: it drops the $\partial^2 f/\partial\eta^2$ curvature term that *full* Laplace keeps, so it matches NONMEM’s Laplace M3 only **up to that FOCEI-vs-Laplace second-order term** (ferx has no full-Laplace M3 mode yet). The two are therefore genuinely different — each correct for its own approximation — and give different optima on censored data, most visibly when between-subject variance is large (so $H\Omega H^\top$ dominates $R^0$).
+
+Because NONMEM cannot run M3 under a non-Laplace (FOCE) method — `$ERROR F_FLAG=1` forces the LAPLACIAN (i.e. conditional) estimation method — the FOCE-M3 marginal objective has **no NONMEM reference** to anchor against. It is validated instead by (a) self-consistency: its analytic packed gradient matches reconverged finite differences of the objective to ~1e-6 for non-IOV/IOV × closed-form/ODE (`population_packed_gradient_m3_foce_matches_fd`, `iov_m3_foce_*`); and (b) the first-order / Tobit theory and the Monolix-linearization precedent above. For a NONMEM-comparable BLQ likelihood, use **FOCEI**, whose conditional censored term is the one NONMEM’s `METHOD=1 LAPLACE` M3 uses — matching it up to the FOCEI-vs-Laplace second-order term (§ [FOCE / FOCEI](../estimation/foce.llms.md)).
+
+The analytical covariance R-matrix supports M3 on closed-form and `[odes]` models for FOCE, FOCEI, and FOCEI-anchored AGQ, including combined with IOV. It differentiates FOCE’s linearized-marginal tail and FOCEI/AGQ’s conditional tail separately. Exact-anchor Laplace retains the numerical covariance path.
+
+As a cross-check on the ODE path, `examples/warfarin_iov_ode_bloq.ferx` and the closed-form `examples/warfarin_iov_bloq.ferx` fit the same IOV + M3 dataset (`data/warfarin_iov_bloq.csv`) and converge to the same optimum — `TVCL`/`TVV`/`TVKA` and every variance component agree to ~6 significant figures (the closed-form path is itself anchored to NONMEM). The two OFVs differ only at the fourth significant figure, reflecting the closed-form-vs-RK45 prediction difference amplified through the censored marginal near the limit. This cross-check is enforced in CI by the `iov_m3_ode_matches_closed_form_estimates` convergence test (`tests/iov_convergence.rs`), so the ODE leg inherits the closed-form path’s NONMEM anchoring at the estimate level and a regression cannot pass unnoticed.
+
+------------------------------------------------------------------------
+
+## Example
+
+    [parameters]
+      theta TVCL(0.13, 0.01, 10.0)
+      theta TVV(8.0, 1.0, 100.0)
+      theta TVKA(1.0, 0.1, 10.0)
+      omega ETA_CL ~ 0.09
+      omega ETA_V  ~ 0.04
+      sigma PROP_ERR ~ 0.02
+
+    [individual_parameters]
+      CL = TVCL * exp(ETA_CL)
+      V  = TVV  * exp(ETA_V)
+      KA = TVKA
+
+    [structural_model]
+      pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+    [fit_options]
+      method      = focei
+      bloq_method = m3
+
+A complete runnable example is in [`examples/warfarin_bloq.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_bloq.ferx) with the corresponding dataset in `data/warfarin_bloq.csv`. See also the [BLOQ example walkthrough](../examples/bloq.llms.md).
+
+------------------------------------------------------------------------
+
+## Reference
+
+Beal, S.L. (2001). *Ways to fit a PK model with some data below the quantification limit.* Journal of Pharmacokinetics and Pharmacodynamics, 28(5), 481–504.

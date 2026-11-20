@@ -1,0 +1,303 @@
+# Steady-State Doses (SS=1)
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+A dose record with `SS=1` and `II > 0` tells ferx-core that, at the time of the record, the compartmental state is at steady state under repeated dosing of that amount/rate every `II` time units. The record itself is treated as one of the pulses in the train.
+
+This matches the NONMEM `SS=1` semantic: the compartments are initialised to the value that would arise from an infinite-past pulse train at interval `II`. Subsequent observations decay from that loaded state under the model’s normal dynamics; the SS train is **not** implicitly continued past the SS dose record. To continue dosing forward in time, add explicit dose records (the typical clinical pattern is one `SS=1` “loading” row followed by any number of probe observations).
+
+## Dataset columns
+
+A steady-state row uses two NONMEM-format columns: `SS` and `II`.
+
+    ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS
+    1,0,.,1,100,1,0,1,24,1     # SS=1: at SS under q24h dosing of AMT=100
+    1,1,4.18,0,.,1,0,0,.,.
+    1,4,3.86,0,.,1,0,0,.,.
+    1,12,1.78,0,.,1,0,0,.,.
+    1,23,0.59,0,.,1,0,0,.,.
+
+`II` is the dosing interval. For a bolus row (`RATE=0`) and an infusion row (`RATE>0`), `SS=1` works the same way — the steady-state state is computed from the corresponding single-dose response repeated every `II`.
+
+## A later `SS=1` record resets the system
+
+An `SS=1` record does more than set the state at its own time. Like NONMEM, it **resets the system** at the record:
+
+- A dose that precedes the record contributes nothing at or after it. This holds for bolus, oral and absorption-forcing doses (`first_order(...)`, `transit(...)`, …).
+- The `SS=1` dose’s implied train of past pulses contributes nothing before its own record.
+
+“Precedes” means earlier in time, or at the **same time in an earlier row**. A dose row written before a co-timed `SS=1` row is wiped. A dose row written after it superposes on the steady state. NONMEM uses the same row order.
+
+Doses after the record are unaffected. A non-SS dose superposes on the steady state, and a later `SS=1` record resets the system again. So a dataset that flags `SS=1` on every visit reads the steady state of the latest visit’s regimen in each interval.
+
+A subject whose only `SS=1` record is its first dose is unaffected by this rule.
+
+Before [\#1576](https://github.com/FeRx-NLME/ferx-core/issues/1576), two engines did not reset:
+
+- Analytic superposition summed every dose. `SS=1` on every visit read up to 91 % high.
+- An ODE absorption forcing leaked a later `SS=1` record’s past pulses into the observations before it, and kept absorbing an earlier dose after the record.
+
+An ODE model with an explicit depot state was already correct, because the steady-state solve replaces the compartment state at the record.
+
+The reset is keyed on the dose **record**, and the row-order rule holds on every engine, with or without a lagtime ([\#1588](https://github.com/FeRx-NLME/ferx-core/issues/1588)). So every input whose record precedes the `SS=1` record stops there, as NONMEM does:
+
+- a lagged dose whose arrival follows the record is cancelled;
+- an infusion still running at the record stops, into the depot or into central, and so does a `zero_order(...)` window ([\#1586](https://github.com/FeRx-NLME/ferx-core/issues/1586));
+- a lagged infusion whose window opens after the record never starts;
+- an infusion or `zero_order(...)` row before a co-timed `SS=1` row never runs, and one after it does;
+- the tail of an earlier `SS=1` infusion that was still running at its own record stops at a later `SS=1` record.
+
+The predictions of the ODE engines, analytic superposition and the analytic event-driven path match NONMEM to ≤ 2.6e-12 on these cases (`nonmem_anchor/ss_infusion_stop`); the adaptive driver matches to its own 3e-4 floor. The gradients FOCE/FOCEI use describe the same dosing history: each gradient walk’s value equals the prediction, and its derivatives match finite differences of it.
+
+One case is not yet covered: an analytic `init()` baseline is still superposed on an `SS=1` dose, as the `W_STEADY_STATE_INIT` warning says.
+
+`SS=1` combined with a lagtime into an absorption forcing is still rejected.
+
+## Supported prediction paths
+
+Every prediction path in ferx-core honours `SS=1`:
+
+| Path | Where | How |
+|----|----|----|
+| Analytical (1-/2-/3-cpt, no TV covariates) | `predict_concentration` in `src/pk/mod.rs` | Closed-form geometric-series |
+| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs` | Exact linear fixed point `(I − M)⁻¹·b` |
+| ODE (`[odes]`-block models) | `ode_predictions` / `ode_predictions_event_driven` in `src/ode/predictions.rs` | Exact linear fixed point `(I − M)⁻¹·b`; nonlinear RHS falls back to numerical pulse expansion |
+
+Both kinds of paths start from the same underlying identity — the choice between them is a question of whether the geometric series has a closed form for the model in question.
+
+### Analytical path: closed-form geometric series
+
+For linear analytical PK (1-/2-/3-cpt), the single-dose response is a sum of exponentials with known eigenvalues. The steady-state series
+
+    C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
+
+collapses per eigenvalue: every exponential `A·exp(-λ·t)` in the single-dose response contributes a steady-state amplitude `A·exp(-λ·τ) / (1 - exp(-λ·II))`. ferx evaluates this exactly — no iteration, single-pass cost equivalent to evaluating the single-dose formula plus one extra division per eigenvalue. For oral models the per-eigenvalue absorption term is written as one smooth function of `KA` and `λ`, so `KA = λ` (and every point near it) needs no special case: values and parameter derivatives stay exact there.
+
+### ODE path: exact fixed point, with a numerical fallback
+
+An `[odes]`-block model is an arbitrary user-defined RHS. `dy/dt = f(y, p, t)` can be non-linear (Michaelis-Menten elimination), so no *general* closed form exists — but the common case is a **linear** disposition, and there the periodic steady state has the same exact fixed point the analytical event-driven path uses. `equilibrate_ss_state` (#914) therefore tries that first:
+
+1.  **Reset** the compartment state to zero. NONMEM `SS=1` semantics say prior dynamics are discarded at the SS dose, so anything earlier in the timeline is overwritten here.
+2.  **Exact solve.** One dosing cycle of a linear disposition is an affine map `u ↦ M·u + b`, so its periodic fixed point is `u_ss = (I − M)⁻¹·b`. Two injected “one cycle from `u`” propagators build `M` (disposition alone, over one `II`) and `b` (disposition **plus** the cycle’s own dose — an added bolus, or an active-infusion window followed by a quiet window). This is `crate::dosing::periodic_ss_fixed_point_g`, shared with the analytical walk (#908) and the built-in-absorption branch (#835), and costs a handful of one-cycle integrations plus one `n×n` solve — no truncation, so a slow disposition is exact rather than tens of percent low.
+3.  **Nonlinear fallback.** If the RHS is genuinely nonlinear the affine self-check declines, and ferx falls back to expanding the pulse train numerically — loop up to `N = 50` cycles of `(apply the dose; integrate the rest of the cycle)` — with a non-convergence warning if the cap is hit without settling (see below).
+4.  Either way the compartment state equals the “just-before-the-next-pulse” steady state; normal-timeline handling resumes and the SS dose’s own pulse is applied through the standard bolus/infusion path, taking the state from pre-pulse to at-pulse SS.
+
+The exact solve is unit-tested against the analytical closed form (see `ss_linear_disposition_uses_exact_fixed_point` and `ode_ss_iv_bolus_matches_analytical_ss` in `src/ode/predictions.rs`) and its dual sensitivities against finite differences (`ode_provider_ss_linear_bolus_uses_exact_solve`). For a non-linear disposition that *doesn’t* have a true periodic steady state (e.g. dosing a saturable Michaelis-Menten elimination above its capacity), the fallback iteration cannot converge and SS=1 isn’t really applicable — the warning below fires.
+
+### Analytic gradient during `fit()`
+
+During estimation, SS=1 `[odes]` dosing gets an **exact analytic FOCE/FOCEI gradient** (outer θ/Ω/σ and inner EBE), not finite differences. `equilibrate_ss_state_g` is the dual counterpart of `equilibrate_ss_state`: on the linear exact solve the derivative `∂(steady state)/∂(θ,η)` falls out of the `(I − M)⁻¹·b` linear solve directly (the implicit-function derivative, with no hand-assembled `dM`/`db`), and on the nonlinear fallback the *finite and explicit* pulse train propagates it cycle by cycle. Either way the analytic trough is the exact derivative of the predictor’s trough (result-neutral, validated against the production predictor + finite differences, including the 2nd-order Hessian blocks used for covariance/SEs). Both SS **bolus** and SS **infusion** are covered, and SS composes with time-varying covariates, IOV, and EVID 3/4 resets.
+
+This also covers the dosing forms below (all closed by \#486):
+
+- **A modeled-duration/rate dose** (`RATE=-1`/`-2` → `R{cmt}`/`D{cmt}`) combined with SS — `equilibrate_ss_state_g` rebuilds the effective rate/window from the resolved PK slot each cycle, the same jet the non-SS event-driven walk uses. The **closed-form** (analytical 1-/2-/3-cpt) path now mirrors this: its `equilibrate_ss_g` threads the modeled-window dual into each cycle’s active/quiet split, so a modeled dose × SS is analytic on the analytical models too (#486).
+- **A rate-defined infusion under bioavailability `F ≠ 1`** — NONMEM holds the rate and scales the window to `F·amt/rate`; the per-cycle equilibration now injects the same rate-off event-time saltation the main walk uses at an ordinary infusion’s window end.
+- **An estimated lagtime** — the dose arrives at `t_dose + lag`, so observations in the pre-arrival window `[t_dose, t_dose+lag)` must read the *previous* interval’s steady-state tail; the walk seeds it at the dose’s record time from the trough advanced to phase `II − lag`, mirroring the production predictor’s own pre-arrival seed. The dose’s own arrival still gets the same event-time saltation as any other lagged dose — the trough’s *value* doesn’t depend on `lag` (an autonomous RHS, see below, makes the periodic recurrence anchored to the pulse, not wall-clock time), but a later observation’s elapsed time since arrival still does, and the saltation captures exactly that.
+
+**SS + an RHS reading a clock** (`TIME`/`T`/`TAFD`, or `TAD` under a lagged SS dose) is analytic too: the dual run-in replays the value path’s per-window clocks, so the gradient is the exact derivative of the value path’s convention (an absolute clock has no periodic limit, and the value is whatever the windows’ local clocks give, \#1139). See [Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs).
+
+### Numeric cross-check against NONMEM 7.5.1 (SS + modeled-duration dose)
+
+For a 1-cpt IV ODE model with an SS=1 dose whose infusion *duration* is modeled (`RATE=-2` → `D1`, `D1 = TVD1·exp(ETA_D1)`, `II=12`, 35 simulated subjects), a live FOCEI fit driven by the new analytic gradient matches NONMEM 7.5.1 (`ADVAN1 TRANS2`, `METHOD=1 INTER`) to the same optimum:
+
+| Parameter  | ferx FOCEI (± SE) | NONMEM 7.5.1 FOCEI |
+|------------|------------------:|-------------------:|
+| OFV (−2LL) |         −454.4806 |          −454.9867 |
+| TVCL       |    4.0698 ± 0.129 |             4.1070 |
+| TVV        |    30.760 ± 0.941 |             30.389 |
+| TVD1       |    1.8876 ± 0.056 |             1.8752 |
+| ω²CL       |            0.0410 |             0.0405 |
+| ω²V        |            0.0329 |             0.0326 |
+| ω²D1       |            0.0698 |             0.0751 |
+| σ² (prop)  |           0.01110 |            0.01075 |
+
+All estimates agree to within a few percent — consistent with finite-sample noise and different optimizers (NONMEM’s own quasi-Newton vs ferx’s `optimizer = lbfgs`), not a discrepancy. The SS + estimated-lagtime sub-case is corroborated instead by the already-committed NONMEM PRED-only anchor for SS + `ALAG1` — see [Estimated lagtime](../model-file/lagtime.llms.md) — plus the local FD-vs-production and Hessian-vs-FD-of-gradient test suite.
+
+### Analytical event-driven path: the exact linear fixed point
+
+A subject with a time-varying covariate, an `EVID=3/4` reset, IOV, or a dose into a non-default compartment cannot be served by dose superposition, so it is routed to the event-driven walk instead. That walk still faces an `SS=1` dose, but it does not have the superposition path’s closed form to hand — it carries a compartment state forward through events.
+
+It solves the steady state exactly all the same. One dosing cycle of a linear disposition is an affine map on the state vector,
+
+    u ↦ M·u + b
+
+where `M` is the one-cycle propagator (the monodromy) and `b` the cycle’s own dose response. The periodic steady state is its fixed point:
+
+    u_ss = (I − M)⁻¹·b
+
+Both `M` (column by column, from the homogeneous response of each unit basis state) and `b` (the forced response from a zero state) come from one cycle of the *same* propagators the walk already uses, so no new closed form is introduced. The analytical models’ disposition is always linear, so this always applies.
+
+The result agrees with the dose-superposition closed forms to f64 precision — `≤ 1e-12` relative on every supported model, bit-identical on several — rather than to a tolerance. The two representations of the same dataset therefore agree by construction.
+
+> **NOTE:**
+>
+> Until \#908 the event-driven walk expanded a **pulse train** capped at 50 cycles, as the ODE path did until \#914, leaving a residual of `exp(-50·λ_slow·II)`. That is negligible for typical PK (`λ_slow·II ≈ 2` gives `exp(-100) ≈ 4e-44`) but not always: a one-compartment oral model with `CL = 0.1`, `V = 50` (t½ ≈ 350 h) at `II = 12` has `λ_slow·II ≈ 0.024` and was **30 %** below the true steady state. Deep peripheral *amounts* were worse — over 50 % on slow 2- and 3-compartment models. Since routing is per subject, adding one unrelated dose row could move a prediction by that much. If you have results from an earlier version involving `SS=1` on any of those paths, they are worth regenerating.
+
+The pulse train survives here only for a **singular** `I − M` — a zero disposition rate constant, i.e. a compartment that never empties (`CL = 0`). No periodic steady state exists then, and the capped loop now raises a non-convergence warning rather than returning a silently truncated state.
+
+### When does the ODE path still expand the pulse train?
+
+Only for a **nonlinear** disposition. A linear one — the overwhelmingly common case — takes the exact `(I − M)⁻¹·b` fixed point (#914) and never iterates; a saturable (Michaelis-Menten) or otherwise nonlinear RHS fails the affine self-check and falls back to the pulse train, exactly as the built-in-absorption branch falls back to an Anderson-accelerated iteration on a nonlinear disposition (#835/#867).
+
+On that fallback the truncation tail after `N` cycles is `≈ exp(-N·λ_slow·II)`, where `λ_slow` is the **slowest** effective disposition rate constant — the governing quantity is `λ_slow·II`, not the number of compartments. ferx loops up to `N = 50` cycles with an early stop once the cycle-to-cycle change falls below `SS_EQUILIBRATION_TOL` (`1e-12` relative, `src/dosing.rs`, \#519/#532). If the cap is reached without converging — a slowly-accumulating nonlinear disposition, or one dosed above its elimination capacity so no periodic steady state exists at all — the returned trough may be materially below the true SS, so ferx surfaces a **non-convergence warning** in `FitResult.warnings` / `SimulationOutput.warnings` rather than returning a silently truncated state (#867, extended to the ordinary bolus/infusion path by \#914). If you need tighter accuracy for an unusually slow *nonlinear* PK, the cap has a single definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs`.
+
+### Cost comparison
+
+| Path | Per SS-dose cost | Notes |
+|----|----|----|
+| Analytical closed | ~1 single-dose evaluation | Effectively free |
+| Event-driven exact | `n + 4` propagator calls + one `n×n` solve (`n ≤ 4`) | Exact, and cheaper than the 50-cycle train it replaced |
+| ODE exact (linear) | `~n + 2` RK45 one-cycle integrations + one `n×n` solve | Exact (#914); replaces the ~50× pulse train for the common linear disposition |
+| ODE pulse (nonlinear fallback) | ≤ 50× RK45 segment integrations | Only when the RHS is nonlinear; early-stops for fast PK, warns if the cap is hit |
+
+SS doses are typically rare (one per subject at the start of a maintenance regimen), so the absolute overhead per fit iteration is modest even for ODE models.
+
+## DSL example
+
+No new DSL syntax is required — the model file is identical to a single-dose model. SS is a property of the **dataset**:
+
+    [parameters]
+      theta TVCL(2.5, 0.01, 50.0)
+      theta TVV(15.0, 0.5, 200.0)
+      theta TVKA(1.0, 0.05, 20.0)
+
+      omega ETA_CL ~ 0.05
+      omega ETA_V  ~ 0.05
+      omega ETA_KA ~ 0.1
+
+      sigma PROP_ERR ~ 0.02 (sd)
+
+    [individual_parameters]
+      CL = TVCL * exp(ETA_CL)
+      V  = TVV  * exp(ETA_V)
+      KA = TVKA * exp(ETA_KA)
+
+    [structural_model]
+      pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+    [fit_options]
+      method  = focei
+      maxiter = 100
+
+Combine with the SS=1 dataset above and run:
+
+    cargo run --release -p ferx-cli -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+
+A runnable example pair ships in the repository at `examples/ss_oral_q24.ferx` + `data/ss_oral_q24.csv`.
+
+## Combining with `LAGTIME`
+
+`LAGTIME` (NONMEM `ALAG1`) shifts every pulse in the SS train, including the SS pulse itself. Writing `τ = t − dose.time` for the time since the dose *record* and `L` for the lagtime, the steady-state concentration is
+
+    C_ss(τ, L) = C_ss(τ − L,      0)    for τ ≥ L          (current interval)
+    C_ss(τ, L) = C_ss(τ − L + II, 0)    for 0 ≤ τ < L      (previous interval)
+
+The second line matters: a sample taken **earlier than the lagtime** (between the dose record time and the lagged arrival) is still at steady state, so it shows the decaying tail of the *previous* dosing interval — not zero. ferx-core implements both branches on all three prediction paths (analytical superposition, the event-driven analytical walker, and the ODE solver), and the result is validated against NONMEM `ALAG1` + `SS=1` to 5 significant figures (see *Validation* below). Declaring `LAGTIME` on a steady-state model is fully supported.
+
+> SS **infusions** whose previous-cycle infusion is still running at the record (`L > II − T_inf`) are supported too: the residual rate flows past the record exactly as in NONMEM. See [Lag time](../model-file/lagtime.llms.md) and the anchors `nonmem_anchor/ss_lag_infusion.ctl` and `nonmem_anchor/ss_arrival_flow_lag{11,12}.ctl` (ID 5). Overlapping infusions (`T_inf > II`) are supported too — see below.
+
+## Steady state with a `TAD`-reading RHS
+
+An `[odes]` right-hand side may read the model-time builtins `TIME`/`T`, `TAFD` and `TAD` (see [ODE models](../model-file/ode-models.llms.md)). Under `SS=1` these behave differently, because the steady-state run-in does not integrate on the subject’s clock — it expands a periodic pulse train on a clock local to each cycle.
+
+`TAD` is the one of the three that has a periodic steady state at all: it is bounded inside one dosing interval, so an infinitely long dose train converges. ferx anchors it to each run-in window’s own pulse, so an `SS=1` dose on a `TAD`-reading RHS returns the periodic solution and agrees with the same model written as an explicit dose train.
+
+    [odes]
+      d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+
+Measured on `CL = 1`, `V = 20`, `AMT = 100`, `II = 12` with a single `SS=1` record at `t = 480` and samples at 482/485/488/491, against NONMEM 7.6.0 (`ADVAN13 TOL=9`, the cycle clock written as `MOD(T + 120, 12)` since `$DES` has no `TAD` builtin — see `nonmem_anchor/ss_tad.ctl`):
+
+|  | t = 482 | worst relative error |
+|----|----|----|
+| ferx `SS=1` | 8.8902009677 | — |
+| NONMEM `SS=1` | 8.8902010334 | 7.4e-9 |
+| Explicit 41-dose train (both engines) | 8.8902010448 | 9.1e-9 |
+| Closed form, outside both engines | 8.8902009650 | ferx 3.0e-10 · NONMEM 8.3e-9 |
+
+Before [\#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) this returned `NaN` at every observation and a non-finite objective — including when the term’s coefficient was **zero**, since `0.0 * NaN` is `NaN`, so merely mentioning `TAD` broke an otherwise ordinary steady-state model.
+
+### Under a lagtime
+
+A lagtime opens a window between the dose **record** and the lagged arrival, `[t_dose, t_dose + ALAG)`. Since ferx 0.3 the periodic state is loaded at the record and flows to the arrival, so the state in that window is the *previous* cycle’s decaying tail — and `TAD` measures from that cycle’s pulse, at `t_dose − max(II − ALAG, 0)`. It therefore runs `II − ALAG … II` across the window and resets to `0` when the dose lands, which is the same sawtooth an explicit dose train produces.
+
+The same model with `ALAG1 = 3`, one `SS=1` record at `t = 480` (so the arrival is at 483) and samples at 481 / 482, both **inside** the window:
+
+|                                        | t = 481      | worst relative error |
+|----------------------------------------|--------------|----------------------|
+| ferx `SS=1`                            | 5.5452940851 | —                    |
+| Explicit 41-dose lagged train (ferx)   | 5.5452940849 | 2.5e-11              |
+| Explicit 41-dose lagged train (NONMEM) | 5.5452941786 | 1.7e-8               |
+| Closed form, outside both engines      | 5.5452940825 | ferx 4.7e-10         |
+| NONMEM `SS=1` record                   | 5.4709357327 | **1.3e-2**           |
+
+The last row is why the *train* is the reference and NONMEM’s own steady-state record is not. With the `TAD` term removed, NONMEM’s lagged `SS=1` record reproduces its own lagged train to 1.1e-9 — so the lag geometry is not in question — but with it, NONMEM’s steady-state routine sits 1.3 % from its own train, on both sides of the arrival. ferx reproduces the train.
+
+A lagtime of a **full interval or more** keeps the clamped phase described under [Lagtime](../model-file/lagtime.llms.md): the pulse lands on the record itself, nothing intervenes before the real arrival, and `TAD` runs `0 … ALAG` across the window — exceeding `II`, which is what the clamp means.
+
+Before ferx 0.3 this combination returned `NaN` for the **whole subject**, not only inside the window, because the wrong value was carried into the steady-state trough.
+
+## Steady state with `TAFD` or `TIME`
+
+`TAFD` and `TIME`/`T` are a different case and are **not** covered by the above. They read an absolute clock, so the dose train has no periodic limit for the run-in to converge to — measured, an explicit absolute-clock train moves 29 % per doubling of its length while the `TAD` train moves 3.5e-7. There is therefore nothing for a steady-state run-in to compute, and the two spellings fail differently rather than alike:
+
+| `[odes]` term under `SS=1` | ferx |  |
+|----|----|----|
+| `0.003*T`, `0.003*TIME` | 8.5679354785 | finite, and matches NONMEM’s own `SS=1` record to better than 1e-8 |
+| the same model as an explicit 41-dose train | 5.1221001380 | 67 % away, on *both* engines |
+| `0.003*TAFD`, and `0.0*TAFD` | `NaN` | no referent inside the run-in at all |
+
+`TIME`/`T` come back finite because ferx and NONMEM share the same convention — both equilibrate on a clock local to each cycle and then integrate forward on absolute time — so both sit the same distance from their own non-convergent train. That parity is kept deliberately: the number matches the engine most users are porting from, and it is still not the steady state of a system that has one. ferx gives `TAFD` no convention at all inside the run-in: the periodic fiction has no first dose, so there is no finite value to hand back and the solve returns `NaN` — including when the term’s coefficient is zero, since `0.0 * NaN` is `NaN`. Giving it the run-in’s own origin instead would silently redefine `TAFD` as `TAD`. (The `TIME`/`T` row above is anchored against a committed NONMEM run; there is no `TAFD` control stream, so nothing here is a claim about what NONMEM does with that spelling.)
+
+Through ferx 0.3.1 this combination was served silently; it is now reported as `W_STEADY_STATE_ABSOLUTE_TIME` by both `fit()` and `ferx check` (see [Check report](../file-formats/check-report.llms.md#codes-data-and-dosing)). It is a **warning**, not a rejection — the model still runs, and for `TIME`/`T` it still matches NONMEM.
+
+If your model means a per-dose clock, use `TAD`, which does have a periodic steady state. If it means an absolute clock, write the subject’s dose history out as explicit records — but the prediction then depends on **how many** doses you write, because the train has no limit to converge to. Measured on `0.003*TAFD`, a 21-dose and a 41-dose train differ by 22.7 % / 30.6 % / 37.7 % / 44.1 % at the four sample phases. That dependence is the model’s, not the solver’s; `SS=1` does not remove it, it only hides it behind one number.
+
+> **NOTE:**
+>
+> The check asks whether the **PK block** reads an absolute clock, so a `TIME`-reading hazard alone does not trigger it — the run-in holds the cumulative-hazard accumulator at its record value, so a time-dependent baseline is unaffected (see [SS with an ODE-accumulated hazard](#ss-with-an-ode-accumulated-hazard)).
+>
+> That holds however the hazard’s time term is written. An `[odes]` **intermediate** consumed only by the hazard (`TT = TIME`, then `hazard = f(TT)`) is not part of the PK block, and neither is a chain of them (`TT = TIME`, `UU = TT`, `hazard = f(UU)`): an intermediate counts only if some `d/dt(...)` line reads it, directly or through other intermediates. The same `TT = TIME` read by `d/dt(central)` *is* reported (#1279).
+>
+> It asks the `[odes]` right-hand side only, so `TIME` read from [`[individual_parameters]`](../model-file/individual-parameters.llms.md#time-dependent-parameters) is out of scope and is **not** reported. That case is different in kind: the run-in receives the parameter snapshot taken at the `SS=1` record, exactly as NONMEM’s `$PK` does, so the whole infinite past uses one frozen value rather than a clock with no limit. It still leaves the steady state short of the model’s own explicit train — measured on `CL = TVCL * (1.0 + 0.003*TIME)`, by 0.2026 % on every observation against a 41-dose train, against 67 % for the same coefficient in the RHS.
+
+## Limitations
+
+For the following malformed configurations, ferx-core skips the SS pre-equilibration (treating the dose as a single, non-SS bolus or infusion) and emits a warning in `FitResult.warnings`. The predictions in these cases are *not* zero — the dose is still applied through the normal flow — but the system isn’t actually at steady state at the dose time, so don’t interpret the fit as a steady-state fit.
+
+- **`SS=1` with `II ≤ 0`** — interval is required for SS predictions. The SS branch is gated on `dose.ii > 0`, so the dose falls through to the single-dose path. Set `II` in the dataset or remove the `SS=1` flag.
+
+### Overlapping infusions (`T_inf > II`)
+
+An `SS=1` infusion longer than its interval has several pulses running at once. With `T_inf = m·II + r` (`0 < r ≤ II`), every cycle of the steady state has `m + 1` pulses infusing for the first `r` hours and `m` for the rest, and at the record `m` earlier pulses are still running — they stop `T_inf − II`, `T_inf − 2·II`, … after it (`ALAG` later under a lag time). Every engine computes exactly that: the analytical superposition and event walk, the ODE solver and the SDE filter, and the exact gradients of each. `nonmem_anchor/ss_infusion_overlap_{1cpt,2cpt}.ctl` holds the 1.5·`II`, 2.5·`II` and exactly 2·`II` cases, with and without a lag time and a time-varying covariate, each followed by a dose on residual drug; ferx matches an exact pulse-train superposition of them (`ss_infusion_overlap_ref.py`) on every engine.
+
+### SS with an ODE-accumulated hazard
+
+A joint PK-TTE model (`[event_model] hazard = ...`) appends a cumulative-hazard accumulator to the ODE system. That row is **not** a compartment: it is a pure integrator with no elimination term, so it has no steady state — it just counts up.
+
+`SS=1` therefore equilibrates the **PK compartments only**. The accumulator keeps the value it had at the dose record:
+
+- At the **first** dose of a record that value is `0`, so `H(0) = 0`. The cumulative hazard is measured from the start of the subject’s record; no amount of run-in changes that.
+- At a **later** `SS=1` dose the value is whatever has accrued so far, and it survives the re-equilibration. A second `SS=1` dose at `t = 48` re-loads the compartments but keeps `H(48)` — the dose is not a reset. (`EVID=3`/`EVID=4` *are*, and zero the accumulator like any other state.)
+
+Through ferx 0.3.1 the accumulator was cycled along with the compartments, so `H(0)` came back holding the run-in’s own hazard — `H0 x 50 cycles x II` for a constant hazard — and every survival quantity downstream of it was displaced by that amount ([\#1210](https://github.com/FeRx-NLME/ferx-core/issues/1210)).
+
+**NONMEM has no native answer here.** Handing NONMEM’s own steady-state routine an `ADVAN13` system with a hazard compartment returns `A(3) = -2.4e7` and `#OBJV = +INF` for a constant hazard, and `NUMERICAL DIFFICULTIES WITH STEADY STATE SOLUTION` / `PROGRAM TERMINATED BY OBJ` for a drug-driven one. A NONMEM user has to gate the hazard by hand — an explicit pulse train with `IF (T.GE.TREC) GATE = 1` in `$DES`. That construction is exactly what ferx’s convention reproduces, and it is committed as the anchor for this behaviour (`nonmem_anchor/ss_chz_r2_*.ctl`).
+
+### `SS=2`
+
+NONMEM’s `SS=2` semantic (“add to the existing train without re-equilibrating”) is **not implemented**. The CSV reader accepts any positive integer in the `SS` column and treats it as a boolean: an `SS=2` row is parsed identically to `SS=1` and goes through the re-equilibration path described above. This is not bit-for-bit NONMEM-compatible for datasets that distinguish `SS=1` and `SS=2` records — convert `SS=2` rows to explicit dose records if the no-re-equilibration semantic is required.
+
+## NONMEM equivalence
+
+- `SS=1`, `II=24`, `AMT=100`, `RATE=0` → matches NONMEM SS=1 bolus.
+- `SS=1`, `II=24`, `AMT=100`, `RATE=25` → matches NONMEM SS=1 infusion of duration `4` (= `AMT/RATE`), repeated every 24 time units.
+- The SS state is computed assuming the same `CL`, `V`, etc. as the current PK record — i.e. ferx uses the **current** subject’s parameters, not a separate “SS parameters” set. This matches NONMEM’s `$PK` evaluation convention.
+
+## Validation
+
+Closed-form SS expressions are unit-tested against 200- to 400-term numerical pulse sums at 1e-9 relative tolerance (see `src/pk/one_compartment.rs::tests::test_ss_*`, similarly for 2-cpt and 3-cpt). The ODE and event-driven paths are cross-checked against the analytical closed forms in their own test modules. The end-to-end fit path is covered by `tests/ss_fit_smoke.rs`.
+
+SS + `LAGTIME` is additionally cross-checked against **NONMEM 7.5.1** (`ADVAN1`/`ADVAN2`, `$ESTIMATION MAXEVAL=0`) to 1e-4 relative — including the previous-interval tail for samples earlier than the lagtime. The reference values and the NONMEM control files are documented in `tests/ss_lagtime_nonmem.rs`, with per-path coverage in `src/pk/mod.rs`, `src/pk/event_driven.rs`, and `src/ode/predictions.rs` (`*_ss_*_with_lagtime_matches_nonmem`).

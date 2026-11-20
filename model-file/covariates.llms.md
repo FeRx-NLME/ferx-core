@@ -1,0 +1,77 @@
+# Covariates
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The optional `[covariates]` block declares which dataset columns are covariates and whether each is **continuous** or **categorical**. This is a declaration of *availability* — it does **not** mean the covariate is used in the structural model, only that it is potentially available. Once declared, ferx-core echoes the covariate columns back on the fit result (the [covariate table](#covariate-table)), which downstream tooling (e.g. the R package) can use for summary statistics and covariate-search workflows.
+
+## Syntax
+
+Two line forms are accepted and may be mixed. The type is one of `continuous`/`cont` or `categorical`/`cat` (case-insensitive):
+
+    [covariates]
+      WT   continuous
+      HT   continuous
+      CRCL continuous
+      SEX  categorical
+      RACE categorical
+
+The equivalent terser `TYPE: NAME, ...` form:
+
+    [covariates]
+      continuous: WT, HT, CRCL
+      categorical: SEX, RACE
+
+Covariate names are **case-sensitive** and must match the CSV header exactly. The built-ins `TIME` and `time` are not covariates and should not be declared here; they are always available in `[individual_parameters]` expressions and as direct `pk(...=TIME)` / `pk(...=time)` mappings.
+
+## Declaring covariate *effects*
+
+This block declares which columns *are* covariates. To state how one acts on a parameter, either write the factor into [`[individual_parameters]`](../model-file/individual-parameters.llms.md) yourself, or declare the relation in [`[covariate_model]`](../model-file/covariate-model.llms.md) and let ferx build the expression — one line per relation, with PsN `scm`-parity forms and defaults. A categorical covariate used by a `[covariate_model]` relation must declare its levels here (`SEX categorical(levels = [0, 1])`, or `levels = auto` to read them off the data).
+
+## Semantics
+
+- **Optional & backward-compatible.** When the block is absent, behaviour is unchanged: every non-standard CSV column is auto-detected as a covariate. A record column (`ID`, `DV`, `AMT`, `CMT`, …) or the `iov_column` is not auto-detected, but one the model reads — `if (OCC == 2) …` in `[individual_parameters]`, as in a NONMEM `$PK` — is read all the same, with or without this block (#1936). `TIME` in `[individual_parameters]` is the built-in record time, not a read of the column.
+- **Authoritative for the table and typing.** Only the listed columns appear in the covariate table and carry a declared type; other non-standard columns (e.g. `STUDY`, `DATE`) are not tabled.
+- **Undeclared-but-used is a warning, not an error.** A covariate used in `[individual_parameters]` but missing from `[covariates]` is still usable — ferx reads it (leniently) and emits a warning recommending you declare it so its type is recorded and it appears in the table. A column named only on a `level … by COL in …` line is a grouping column, not a covariate, and is not in this warning; one an expression also reads is. Declaring a covariate the model does *not* use is also fine — that is the point.
+- **Validation against the data.** A *declared* column that is absent from the dataset is an error (`E_MISSING_COVARIATE`).
+
+## Categorical covariates must be numerically coded
+
+Covariate values are carried as floating-point numbers, so categorical covariates must be encoded as integer levels in the data (e.g. `SEX` as `0`/`1`, not `"M"`/`"F"`). Under a `[covariates]` block this is enforced: a non-numeric value in a declared covariate is a hard error rather than a silent coercion to `0.0`. (In the legacy auto-detect path — no `[covariates]` block — a non-numeric covariate value fails to parse, is dropped, and the covariate evaluates to `0.0` in the model, preserving prior behaviour.)
+
+Missing values (blank, `.`, `NA`) are permitted and recorded as missing. Within a subject they are carried forward from the last record that had one (see [Time-varying covariates](#time-varying-covariates)). A subject with **no** value anywhere in the column — every cell `.` — has the covariate recorded as `NaN` rather than dropped, so it cannot be mistaken for a genuine zero, and the reader warns naming the covariate and the subjects. Guard such a relation with `present(COV)`, impute the column, or exclude the subjects; unguarded, the covariate expression evaluates to `NaN` for them and the fit fails.
+
+`ferx check` reads through the same covariate-aware path the fit uses, so a declared column that is absent (`E_MISSING_COVARIATE`) or non-numeric (`E_COVARIATE_NOT_NUMERIC`), or a referenced covariate missing from the data, is reported at check time rather than only failing once the fit starts.
+
+## Time-varying covariates
+
+A covariate may change **within** a subject — e.g. body weight measured at each visit, or a creatinine clearance that drifts over an admission. ferx detects this per subject: when a covariate column holds more than one value across a subject’s records, that subject carries a **per-record covariate snapshot** (last observation carried forward, LOCF) instead of a single subject-static value, and the structural model is evaluated at each event’s snapshot. A subject whose covariates are constant keeps the cheap static path.
+
+For the analytical 1-/2-/3-compartment models this is handled **exactly**: a time-varying covariate makes the individual PK parameters switch part-way through a dose’s decay (e.g. `CL = TVCL*(WT/70)^THETA_WT*exp(ETA_CL)` with a changing `WT`), and the predictions flow through a state-propagating event-driven solver that carries the amounts across each covariate change. Under a **gradient-based outer optimizer** (`lbfgs`, `bfgs`, or `slsqp`) these subjects also drive the **exact analytic FOCE/FOCEI gradient** (each event’s parameter derivatives are taken at that event’s covariate snapshot), rather than falling back to finite differences. Covariate changes carried by EVID=2 records between observations are supported, as are combinations with EVID 3/4 resets, **steady-state dosing**, a **constant `obs_scale` divisor**, and **inter-occasion variability (IOV)** (the covariate and κ both switch the individual parameters across occasions, including subject-static expression `obs_scale` divisors since \#590). A non-IOV **ODE** model with time-varying covariates now also stays analytic when combined with an **expression-based output scaling** (`obs_scale = <expr>`, applied as a subject-static post-walk quotient), an **`EVID=2` covariate-only breakpoint**, or **`init(...)` initial conditions** (seeded at the subject’s first-record covariate snapshot, all since \#486) — including when `init(...)` is combined with an **EVID 3/4 reset**. Time-varying covariates with **dose lagtime** on the closed-form analytical models still fall back to the finite-difference gradient. (See [FOCE/FOCEI](../estimation/foce.llms.md) for the optimizer/gradient interaction.)
+
+> **NOTE:**
+>
+> An EVID=3/4 row is a **data record**: NONMEM runs `$PK` at it and then ADVANs to it. So when a reset restarts the episode, a covariate-driven `init(state) = <expr>` is evaluated with **that row’s own covariate values** — not the preceding record’s, and not the next record’s (since \#1133). The same rule governs every other boundary: a segment is parameterised by the record that *terminates* it, and a lagged arrival, an infusion end or a zero-order cutoff is not a record at all. When several records share the segment’s end `TIME`, the one that terminates it is the **first in file order**, as in NONMEM; the later ones advance by zero. So an observation listed before a co-timed `EVID=2` row is advanced under the observation’s covariates, and an `EVID=2` row listed before a co-timed dose under the `EVID=2` row’s ([\#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810); see [Record order at a shared `TIME`](../data-format.llms.md#record-order-at-a-shared-time-pre-dose-troughs)).
+>
+> Concretely, for `init(central) = 10*WT` with `WT` stepping 70 → 140 at the reset row, the compartment restarts at `1400`, not `700`. The same holds for the row’s `OCC` under an `iov_column`: a reset that opens a new occasion re-seeds under that occasion’s κ. Anchored against NONMEM 7.6.0 in `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl`.
+>
+> One gap remains (#1135): an **analytical** (closed-form) model using `[initial_conditions]` drops its baseline at the first reset and never re-deposits it, where NONMEM re-applies `A_0`. Use an `[odes]` model if you need a baseline that survives a reset.
+
+## Covariate table
+
+When a `[covariates]` block is present and the fit is launched from a data file, the result carries a covariate table (`FitResult.covariate_table`) echoing the declared columns:
+
+- Columns: `ID`, `TIME`, `EVID`, then one column per declared covariate.
+- **One row per input dataset record** — including dose and other-event rows. (This differs from the `sdtab` diagnostic table, which has observation rows only.)
+- Missing values are written as empty cells (the in-memory representation uses `NaN`).
+
+The CLI writes it to `{model}-covtab.csv` alongside `{model}-sdtab.csv` whenever the model declares covariates.
+
+## Example
+
+See `examples/two_cpt_oral_cov.ferx`, which declares:
+
+    [covariates]
+      WT   continuous
+      CRCL continuous
+
+Both `WT` and `CRCL` are used in `[individual_parameters]` to scale `CL` and `V1`, so they are declared here. A covariate used in the model but left out of the block still works, but the parser emits a warning recommending it be declared (so its type is recorded and it appears in the covariate table).

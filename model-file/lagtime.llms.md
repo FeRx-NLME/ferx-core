@@ -1,0 +1,136 @@
+# Lagtime
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+A `lagtime` PK parameter shifts the effective start of every dose record by a fixed amount. This is the standard way to model delayed-onset oral absorption: even after the dose is administered at clock time `t_dose`, no drug enters the system until `t_dose + lagtime`.
+
+`lagtime` is the ferx-core name for what NONMEM calls `ALAG`. The DSL accepts both `lagtime=` (preferred) and `alag=` (alias) on the `[structural_model]` line; both route to the same internal slot.
+
+## DSL example
+
+    [parameters]
+      theta TVCL(5.0,  0.1,  50.0)
+      theta TVV(50.0,  5.0, 500.0)
+      theta TVKA(1.5, 0.05,  20.0)
+      theta TVLAGTIME(0.5, 0.001, 5.0)
+
+      omega ETA_CL      ~ 0.09
+      omega ETA_LAGTIME ~ 0.10
+
+      sigma PROP_ERR ~ 0.10
+
+    [individual_parameters]
+      CL      = TVCL * exp(ETA_CL)
+      V       = TVV
+      KA      = TVKA
+      LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)
+
+    [structural_model]
+      pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+This is exactly analogous to declaring `F` (bioavailability): a typical value (optionally with a random effect) flows through `[individual_parameters]` and lands in a dedicated PK slot.
+
+## Semantics
+
+For every dose record (bolus, infusion, or oral depot), the effective arrival time is `dose.time + lagtime`. For infusions the duration is unchanged — only the start (and therefore the end) shifts. An observation before the lagged arrival reads `0`.
+
+If `lagtime` is not declared, the slot defaults to `0.0` — existing models behave identically to the pre-feature path.
+
+`lagtime` is supported on:
+
+- the analytical superposition path (predictions),
+- the analytic `Dual2` sensitivity gradient used during `fit()`,
+- the ODE path.
+
+On the ODE path the estimated lagtime gets the **exact analytic gradient** (outer θ/Ω/σ and inner EBE), including in combination with time-varying covariates, IOV, finite-duration infusions, and EVID 3/4 resets — the dose’s event time is shifted to `t_dose + lagtime` and its sensitivity injected as an event-time saltation. A lagtime combined with **steady-state dosing** is analytic too (#486): the pre-arrival window `[t_dose, t_dose+lagtime)` is seeded from the previous interval’s steady-state tail (see [Steady-state dosing](../model-file/steady-state.llms.md)), and the SS dose’s own arrival gets the same event-time saltation as any other lagged dose.
+
+## NONMEM equivalence
+
+NONMEM’s per-compartment `ALAG1`, `ALAG2`, … are mapped to a single `lagtime` slot in ferx-core, applied to all dose records of the model. For typical PK models (one absorption compartment, doses into the depot) this is equivalent to setting `ALAG1` on the depot compartment.
+
+On an **analytical** `pk` model, bind the lag through the bare `lagtime=` (alias `alag=`) argument. You may name the parameter `ALAG1`/`LAGTIME1` and map it — `pk(..., lagtime=ALAG1)` applies it exactly like `lagtime=TLAG` — but an `ALAG{n}`/`LAGTIME{n}` parameter left *unmapped* is a parse error, since on the single-route analytical engine it would otherwise be silently discarded (#725). Genuinely per-compartment lag (a different `ALAG{n}` per dose compartment) is an [ODE-model](../model-file/ode-models.llms.md) feature.
+
+### Numeric cross-check against NONMEM 7.5.1
+
+The analytic FOCE/FOCEI lagtime gradient is the exact derivative (verified result-neutral against finite differences) of the lagtime *prediction* — and that prediction is validated numerically against NONMEM. For a 1-cpt oral `SS=1` model (`II=24`, `AMT=100`, `CL=2`, `V=20`, `KA=1.5`, `ALAG1=1.5`), ferx’s population `PRED` matches NONMEM 7.5.1 (`$ESTIMATION MAXEVAL=0`) to `<1e-4` relative across the dosing interval — including the two pre-lag samples that fall in the previous interval’s steady-state tail (the case that historically regressed):
+
+| TIME | ferx `PRED` | NONMEM 7.5.1 `PRED` |
+|-----:|------------:|--------------------:|
+|  0.5 |     0.59069 |             0.59069 |
+|  1.0 |     0.56188 |             0.56188 |
+|  2.0 |     3.07370 |             3.07370 |
+|  4.0 |     4.46240 |             4.46240 |
+|  8.0 |     3.07540 |             3.07540 |
+| 12.0 |     2.06170 |             2.06170 |
+| 18.0 |     1.13150 |             1.13150 |
+| 23.0 |     0.68628 |             0.68628 |
+| 25.0 |     0.56188 |             0.56188 |
+| 30.0 |     0.34080 |             0.34080 |
+
+The reference (NONMEM control stream + data) and the assertion live in `tests/ss_lagtime_nonmem.rs`; per-path coverage (analytical / event-driven / ODE) is in the `*_with_lagtime_matches_nonmem` unit tests. Because the gradient is the exact derivative of this NONMEM-matching prediction, a FOCE/FOCEI fit driven by it descends the same objective surface NONMEM’s `ALAG`-shifted prediction defines.
+
+### End-to-end estimation cross-check (FOCEI)
+
+To confirm the analytic lagtime gradient drives a full FOCEI estimation to the same optimum NONMEM reaches, a 1-cpt oral ODE model with an estimated `ALAG1` was fit to a simulated dataset (60 subjects, dense early sampling, IIV on CL/V/KA) in **both** ferx (`ode(states=[depot, central])` with the analytic lagtime gradient) and NONMEM 7.5.1 (`ADVAN2 TRANS2`, `$ESTIMATION METHOD=1 INTER`, `$COVARIANCE`). NONMEM’s `ADVAN2` is the **analytical** 1-cpt solution, so ferx is run with tight ODE tolerances (`ode_reltol = 1e-12`, `ode_abstol = 1e-14`) for an apples-to-apples comparison of the numerical integrator against the closed form:
+
+| Parameter     |    True |     ferx FOCEI (± SE) | NONMEM 7.5.1 FOCEI (± SE) |
+|---------------|--------:|----------------------:|--------------------------:|
+| OFV (−2LL)    |       — |              176.6706 |                  176.6706 |
+| TVCL          |   0.134 |    0.142859 ± 0.00600 |        0.142859 ± 0.00592 |
+| TVV           |     8.1 |      8.35241 ± 0.1476 |          8.35241 ± 0.1457 |
+| TVKA          |     1.0 |      1.01212 ± 0.0435 |          1.01212 ± 0.0436 |
+| **TVLAG (h)** | **0.5** | **0.492148 ± 0.0109** |     **0.492148 ± 0.0125** |
+| ω²CL          |    0.09 |      0.09662 ± 0.0195 |          0.09662 ± 0.0232 |
+| ω²V           |    0.02 |      0.01759 ± 0.0034 |          0.01759 ± 0.0033 |
+| ω²KA          |    0.09 |      0.08576 ± 0.0167 |          0.08576 ± 0.0150 |
+| σ (prop, SD)  |    0.05 |     0.049772 ± 0.0017 |                  0.049772 |
+
+The objective functions agree to `1e-4`, **every** point estimate to 5–6 significant figures, and the standard errors to within ~1 % (θ) / ~16 % (ω, the usual delta-method variance↔︎SD spread) — i.e. the analytic lagtime gradient lands the FOCEI optimiser on NONMEM’s exact solution. The cross-check was confirmed at the objective level too: evaluated at NONMEM’s final estimates, ferx’s FOCEI objective is `176.6706` versus NONMEM’s `176.6706`.
+
+> **NOTE:**
+>
+> For ODE models the FOCEI objective and its FD-Hessian covariance are only as accurate as the ODE integration. At loose tolerances the integration noise both perturbs the optimum and can render the covariance FD-Hessian indefinite (regularised SEs); use tight `ode_reltol`/`ode_abstol` when comparing against an analytical reference or when SEs look ill-conditioned.
+
+If both `lagtime=` and `alag=` are supplied on the same `[structural_model]` line (or both keys appear in a programmatically constructed PK parameter map) and they bind **different** values, the model is rejected at parse time ([\#1048](https://github.com/FeRx-NLME/ferx-core/issues/1048)):
+
+    [structural_model]: `alag=TLAGA` and `lagtime=TLAGB` are two spellings of the
+    same parameter (the absorption lag time) bound to different values — only
+    `lagtime=TLAGB` would be applied and `TLAGA` silently discarded. Use one spelling.
+
+Both spellings bound to the **same** value (`lagtime=X, alag=X`) is redundant but harmless and still accepted. The same rule applies to the other two alias pairs, `v=`/`v1=` (central volume) and `q=`/`q2=` (inter-compartmental clearance). Prefer using only one of the two names per model.
+
+The mirror image — one variable under two **different** roles, `f=X, lagtime=X` — is rejected too ([\#1359](https://github.com/FeRx-NLME/ferx-core/issues/1359)); the rule covers every pair of roles, see [Structural model](../model-file/structural-model.llms.md):
+
+    [structural_model]: `f=X` and `lagtime=X` bind one parameter to two different
+    PK roles (the bioavailability and the absorption lag time). Each role needs its
+    own [individual_parameters] variable — e.g. `lagtime=X_LAGTIME` with
+    `X_LAGTIME = X` declared in the block.
+
+A `LAGTIME` declared in `[individual_parameters]` but **not** mapped with `lagtime=` on an analytical `pk(...)` line is not a lag: the value never reaches the dose, the parser warns that it is computed but never used, and the model stays on the lag-free fast paths.
+
+## Notes and caveats
+
+- `lagtime` may carry a random effect like any other PK parameter (`LAGTIME = TVLAGTIME * exp(ETA_LAGTIME)`). The optimiser handles derivatives through the same machinery used for `CL`, `V`, `KA`, etc.
+
+- A **negative** `lagtime` (or `ALAG{n}`) at the initial estimates is rejected: `fit()` and `ferx check` stop with `E_NEGATIVE_LAGTIME`, naming the subject and the dose record, as NONMEM does (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`). Like `E_DOSE_ATTR_NONFINITE` below, it is evaluated at typical values at each dose record’s own snapshot, so a lag that only turns negative at a later dose is caught too ([\#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)). Prefer a log-link (`exp(...)`) or a lower bound of 0 on the lag’s `theta`. A lag driven negative *mid-fit* by an η or θ excursion is not rejected: predictions treat the dose as effective before its record time, identically on every engine. `predict()` and `simulate()` run no data errors, so they serve a negative lag the same way and report it as the warning `W_NEGATIVE_LAGTIME`.
+
+- A **non-finite** `lagtime` (`NaN`/`Inf`) is rejected, not warned. It makes `dose time + lagtime` — and every break derived from it — non-finite, so the subject’s integration timeline cannot be ordered at all. One that is already non-finite at typical values is caught at fit-init as `E_DOSE_ATTR_NONFINITE`, naming the subject **and the dose record**: the check evaluates at each dose’s own covariate snapshot and its `TIME`, so a lag that is benign at the first dose and overflows at a later one is caught too — as is one driven by a `TIME` built-in on a model with no covariates at all ([\#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235)). One produced by a mid-fit parameter excursion instead makes that subject’s predictions `NaN`, which the estimator treats as a diverged solve.
+
+- Steady-state doses (`SS=1`) combined with non-zero `lagtime` are fully supported. Under linear superposition the lagged SS curve at time `t` equals the un-lagged SS curve evaluated at `t - lagtime`, i.e. `C_ss(t, L) = C_ss(t - L, 0)`. See [Steady-State Doses](../model-file/steady-state.llms.md) for the full SS=1 reference.
+
+- With **time-varying covariates**, the identity above stops being the whole story, because the two sides are then evaluated under different parameters. ferx loads the periodic solution at the dose **record** (phase `II - lagtime`, under the dose row’s own covariates) and advances from there to the arrival under the record governing that interval — matching NONMEM. It does not compute the trough *at* the arrival; doing so was worth 7.67 OFV on the committed anchor (#1121). See [the FAQ](../faq.llms.md) for the worked timing rule.
+
+- Another dose that lands **between** the record and the lagged arrival superposes on that flowing state, and the arrival then adds only the steady-state dose’s own pulse, on every prediction path. Before \#1275 the default ODE predictor re-loaded the steady state at the arrival and erased such a dose (up to −54 % against NONMEM, `nonmem_anchor/ss_arrival_flow_lag*.ctl`).
+
+- A `lagtime` of a **full dosing interval or longer** (`lagtime >= II`) on a steady-state dose is supported, and follows NONMEM: the cycle phase at the record is **clamped** to zero rather than wrapped into `[0, II)`, so the record carries the steady-state *peak* and decays from there, with no intervening pulse before the real arrival. Verified against NONMEM 7.6.0 (`nonmem_anchor/ss_lag_ge_ii.ctl`); wrapping the phase instead would put the whole pre-arrival window a factor `exp(-k*II)` low.
+
+  Clamping is also the only *continuous* choice, which matters when `lagtime` is estimated: nothing in the objective steps as the optimiser walks a lagtime across the dosing interval.
+
+- A steady-state **infusion** whose lagtime is a full interval or longer is the one corner where ferx and NONMEM disagree. ferx starts the previous cycle’s infusion at the dose record (what the clamped phase means) and so delivers exactly `AMT`. NONMEM instead infuses for `T_inf + (lagtime - II)` hours — 8 h at `RATE = 100` for an `AMT = 600` dose, i.e. 800 mg — which is not a mass-balanced reading of the dose, so ferx does not reproduce it. Every ferx engine agrees with every other here; only NONMEM differs.
+
+- A steady-state **infusion** whose lagtime exceeds `II - T_inf` (so the previous cycle is still running when the dose record arrives) is supported: that residual rate keeps flowing past the record and stops at `record + (T_inf - phase)`, exactly as NONMEM does (`nonmem_anchor/ss_lag_infusion.ctl`). Before ferx 0.3 the rate was dropped at the record, which read ~4 % low across the whole pre-arrival window.
+
+See `examples/oral_with_lagtime.ferx` for a runnable model.

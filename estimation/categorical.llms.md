@@ -1,0 +1,86 @@
+# Categorical endpoints (binary / logistic)
+
+A [`[binary_model]`](../model-file/categorical.llms.md) endpoint is fit with the same generalized negative-log-likelihood machinery as time-to-event: the per-subject data term is the Bernoulli `−log L`, and the population parameters are optimized with the appropriate marginal likelihood.
+
+## Estimation method
+
+| Method | Binary | Notes |
+|----|:--:|----|
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (see below); the `½ log\|H̃\|` correction uses the data term’s **exact** η-Hessian ([Exact data-term curvature](../estimation/tte.llms.md#exact-data-term-curvature)), and the outer θ-gradient is the exact marginal gradient, as for [TTE](../estimation/tte.llms.md#outer-gradient-reconverged). |
+| **SAEM** | ✓ | Preferred for sparse binary data — no Laplace approximation. |
+| **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood; use a larger `isample` for non-Gaussian endpoints. |
+| **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
+| Pure Gauss–Newton | — | The `J'R⁻¹J` structure is Gaussian-specific; use FOCEI or SAEM. |
+
+The **fixed-effects** (`n_eta = 0`) case has no inner loop — the objective reduces to the plain Bernoulli likelihood `Σ_j −log L_j`, and the outer optimizer fits `θ` by direct maximum likelihood. This is ordinary logistic regression.
+
+### Analytic inner gradient
+
+The EBE search differentiates the Bernoulli data term **analytically** (#2024). The `logit` predictor is compiled to the same dual-evaluable bytecode the PK parameters use and replayed with θ and η seeded, giving an exact `∂lp/∂η` on every record; the logit likelihood then has a closed-form score,
+
+    ∂/∂η [ softplus(lp) − y·lp ] = (p − y) · ∂lp/∂η,     p = inv_logit(lp)
+
+which is added to the Gaussian rows’ gradient on a joint PK + binary model. The objective is unchanged — only the search direction is exact instead of differenced — so EBEs agree with the FD route to the inner tolerance.
+
+The predictor is replayed on an η-only dual, so the number of θ does not cap it. A subject keeps the FD inner gradient for its whole objective when any record it carries has no analytic term, which only a predictor supplied as an opaque Rust closure through the API lacks: every parsed predictor compiles exactly, and a [count](../model-file/count.llms.md) record beside the binary ones has an exact term of its own. The “*N* of *M* subjects use finite-difference inner gradients” warning counts those subjects and names the cause. A time-to-event record beside the binary ones has an analytic term of its own ([TTE](../estimation/tte.llms.md#estimation)), so a joint binary + TTE subject stays analytic.
+
+## Objective function
+
+ferx reports the OFV on the **`−2 log L` (deviance) scale**, matching NONMEM. For a fixed-effects logistic fit this equals the residual deviance reported by R `glm`.
+
+## Validation — exact agreement with R `glm`
+
+A fixed-effects logistic fit *is* ordinary logistic regression, so it can be checked **exactly** against base-R `glm(DV ~ …, family = binomial)` — a license-free, deterministic reference. Using the committed dataset `data/binary_logistic.csv` (60 subjects × 3 times; data-generating `TH0 = −0.4`, `THX = 0.9`, `THT = 0.5`) with `examples/binary_logistic.ferx`:
+
+| Parameter                     |         ferx |      R `glm` | NONMEM `F_FLAG=1` |
+|-------------------------------|-------------:|-------------:|------------------:|
+| `TH0` (intercept)             |    −0.774849 |    −0.775172 |         −0.775172 |
+| `THX` (× `X`)                 |     0.870901 |     0.870140 |          0.870140 |
+| `THT` (× `TIME`)              |     0.826837 |     0.827029 |          0.827029 |
+| **OFV / deviance / −2 log L** | **213.5955** | **213.5955** |      **213.5955** |
+
+All three agree. NONMEM and `glm` match to six significant figures (both exact ML); ferx’s OFV equals the glm deviance / NONMEM `−2 log L` to five decimals — which pins the Bernoulli likelihood constant *and* form — with the θ estimates matching the MLE to the derivative-free (BOBYQA) outer tolerance. The comparison is guarded by the Tier-3 test `tests/categorical_convergence.rs` (the NONMEM control file is committed at `tests/reference/binary_logistic/`).
+
+## Validation — simulate → fit recovery (SSE)
+
+The `glm` / NONMEM anchor above scores *observed* data, so it cannot detect a wrong **sampler**: `simulate()` could draw from the wrong probability and every fit-side test would still pass. The companion guard is a simulation-estimation round trip — simulate binary outcomes from a known `θ`, refit them, and require the generating `θ` back (`binary_simulate_then_fit_recovers_theta`, Tier 3).
+
+Internally the likelihood, the sampler and the predictor share a single linear-predictor evaluator, so they cannot disagree about which records belong to the endpoint, what a `TIME` term resolves to, or what `lp` a record carries. They deliberately differ in one place: a *saturated* predictor (`lp = ±∞`, from an extreme parameter or covariate) is a valid degenerate probability to the sampler, which draws from it, but the likelihood repels the optimizer away from it. Simulation has no optimizer to steer, so it must produce something; fitting can and should refuse.
+
+## Simulation and prediction
+
+``` r
+sim  <- simulate(model, data, params, n_sim = 100)  # one 0/1 draw per binary record
+```
+
+`simulate()` emits one categorical row per binary observation record, on the endpoint’s CMT, with `ipred` carrying the probability `p` the outcome was drawn around. Binary outcomes are observed on the **fixed observation grid** — unlike a time-to-event endpoint there is no horizon and no event location, so a `[simulation]` block needs `times`, not a `horizon`.
+
+Predictions come from `predict_categorical()`, which returns a probability vector per record (`P(Y = 0)`, `P(Y = 1)`) rather than a scalar. The plain `predict()` is the Gaussian predictor and returns no rows for a binary endpoint — the same split as `predict_survival()` for time-to-event.
+
+## Diagnostics (sdtab)
+
+A binary endpoint contributes one `{model}-sdtab.csv` row per observation record, after the Gaussian rows:
+
+| Column  | Binary meaning                                     |
+|---------|----------------------------------------------------|
+| `DV`    | the observed 0/1 outcome                           |
+| `CMT`   | the endpoint’s compartment                         |
+| `PRED`  | `P(Y = 1)` at `η = 0` (typical subject)            |
+| `IPRED` | `P(Y = 1)` at the subject’s EBE `η`                |
+| `IWRES` | standardized (Pearson) residual `(y − p) / √(p·q)` |
+| `CWRES` | *blank*                                            |
+
+`CWRES` is empty by design: the conditional weighted residual is defined through the Gaussian residual-variance model, and a Bernoulli outcome has none. Columns that cannot be defined for a discrete record — `CENS`, `OCC`, `NPDE`/`NPD`, `TAFD`, `TAD`, and any `[derived]` / `[output]` column — are likewise written as empty cells rather than sentinel values.
+
+`q = P(Y = 0)` is computed independently rather than as `1 − p`. That matters at the tails: `p` saturates to exactly `1.0` in double precision once the log-odds exceed about 36.7, so `1 − p` would cancel to zero and blank the *largest* residuals — and only on the positive side, since `1 − p ≈ 1` keeps full precision at the other end. Computing `q` directly keeps both tails symmetric and resolvable.
+
+`IWRES` is left blank only when the variance genuinely underflows, where the residual is undefined — never substituted with a large finite number that would look meaningful in a plot.
+
+## Reference R session
+
+``` r
+d   <- read.csv("data/binary_logistic.csv")
+fit <- glm(DV ~ X + TIME, family = binomial, data = d)
+coef(fit)      # (Intercept) -0.775172   X 0.870140   TIME 0.827029
+fit$deviance   # 213.5955
+```

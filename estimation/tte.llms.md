@@ -1,0 +1,854 @@
+# Time-to-Event (TTE) Models
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+> **Phase 1 (current):** Parametric TTE with exponential, Weibull, and Gompertz hazard families; right-censored, exact, and interval-censored observations; left truncation via `TENTRY`; FOCEI and SAEM estimation; fixed-effects (`n_eta = 0`) and random-effects paths. `[structural_model]`, `[error_model]`, and `[individual_parameters]` are all optional for TTE-only models.
+
+## Overview
+
+TTE models describe the probability distribution of the time until a clinical event (e.g. first adverse event, study dropout, disease progression). ferx uses the same FOCEI Laplace objective as for continuous PK/PD data, extended to the per-subject log-likelihood contribution
+
+    ℓᵢ = δᵢ · log h(Tᵢ) − H(Tᵢ)
+
+where δᵢ is the event indicator, h(t) the hazard function, and H(t) = ∫₀ᵗ h(s) ds the cumulative hazard.
+
+## Model file syntax
+
+Add one `[event_model]` block per TTE endpoint.
+
+    [event_model]
+      cmt    = 2                        # data-file CMT value that carries TTE rows
+      family = exponential              # exponential | weibull | gompertz
+      scale  = TVLAMBDA * exp(ETA_LAMBDA)  # theta/eta/covariate expression
+
+> **Note:** `[event_model]` parameter expressions are evaluated in the theta / eta / covariate namespace, and may also reference names defined in `[individual_parameters]` (e.g. `LAMBDA`); those are resolved per subject at evaluation time. Writing the full expression in terms of `theta` and `eta` names directly also works. A hazard may **not** depend on an inter-occasion (IOV/kappa) random effect — whether by referencing an `[individual_parameters]` value that uses one, or by naming a `kappa` directly in the hazard expression — because it is evaluated once per subject, with no occasion context; either is rejected with an error.
+
+For Weibull, a `shape` parameter is also required:
+
+    [event_model]
+      cmt    = 2
+      family = weibull
+      scale  = TVSCALE * exp(ETA_SCALE)
+      shape  = TVSHAPE
+
+Gompertz uses `alpha` (baseline hazard) and `gamma` (growth rate):
+
+    [event_model]
+      cmt    = 2
+      family = gompertz
+      alpha  = TVALPHA
+      gamma  = TVGAMMA
+
+Multiple TTE endpoints are supported by repeating the block with unique names:
+
+    [event_model DROPOUT]
+      cmt    = 2
+      family = exponential
+      scale  = TVLAMBDA_DROPOUT * exp(ETA_LAMBDA)
+
+    [event_model DEATH]
+      cmt    = 3
+      family = weibull
+      scale  = TVSCALE_DEATH
+      shape  = TVSHAPE_DEATH
+
+### `[structural_model]` and `[error_model]` requirement
+
+The parser currently requires both blocks even for TTE-only models. Include a dummy 1-cpt block with fixed parameters:
+
+    [parameters]
+      theta TVLAMBDA(0.05, 0.001, 10.0)
+      theta DUMMY_CL(1.0, FIX)
+      theta DUMMY_V(1.0, FIX)
+      omega ETA_LAMBDA ~ 0.09
+      sigma SIGMA_DV ~ 0.01 FIX
+
+    [individual_parameters]
+      LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+      CL     = DUMMY_CL
+      V      = DUMMY_V
+
+    [structural_model]
+      pk one_cpt_iv(cl=CL, v=V)     # inert: no CMT-1 observations in TTE-only data
+
+    [error_model]
+      DV ~ additive(SIGMA_DV)       # inert: sigma carries zero gradient
+
+    [event_model]
+      cmt    = 2
+      family = exponential
+      scale  = TVLAMBDA * exp(ETA_LAMBDA)  # theta/eta directly, or an [individual_parameters] name
+
+This `[structural_model]` / `[error_model]` requirement will be lifted in a future release. (The separate `[individual_parameters]`-namespace restriction noted above has already been lifted — hazard expressions may reference individual parameters.)
+
+## Data format
+
+TTE rows follow the NONMEM observation convention with `EVID=0` and a CMT that matches the `cmt =` declaration in `[event_model]`:
+
+| DV | Meaning |
+|----|----|
+| `0` | Right-censored (survived past T) |
+| `1` | Exact event at T |
+| `2` | Interval-censored: right bound (pair with preceding DV=0 row for same CMT) |
+
+For interval-censored observations, precede the DV=2 row with a DV=0 row carrying the left bound (entry into the at-risk window):
+
+    ID,TIME,DV,EVID,CMT
+    1, 5.0, 0, 0, 2   # left bound of interval (entry)
+    1,10.0, 2, 0, 2   # right bound  →  event occurred in (5, 10]
+
+**Loading the data.** The event rows are recognised *by the model*: read the dataset with `read_population_for(&model, …)` (the R entry points and the CLI do), not with the model-blind `read_nonmem_csv()`. A population read without the model carries the event rows as Gaussian observations and no event records, and `fit()` refuses it with `E_ENDPOINT_UNROUTED`; a dataset whose event CMT has no rows at all — usually a missing `CMT` column — is refused with `E_ENDPOINT_NO_RECORDS`. See the [check report codes](../file-formats/check-report.llms.md#codes-data-and-dosing).
+
+### Left truncation (delayed entry)
+
+If subjects enter the study at a time \> 0 (e.g. they survived until enrolment), add a `TENTRY` column. ferx computes
+
+    H_eff(T) = H(T) − H(TENTRY)
+
+conditioning the likelihood on survival past the entry time:
+
+    ID,TIME,DV,EVID,CMT,TENTRY
+    1,18.3, 1, 0, 2, 5.0   # subject entered at t=5, event at t=18.3
+    2,30.0, 0, 0, 2, 5.0   # entered at t=5, censored at t=30
+
+## Hazard families
+
+| Family | Parameters | h(t) | H(t) |
+|----|----|----|----|
+| `exponential` | `scale` = λ | λ · exp(loghr) | λ · exp(loghr) · t |
+| `weibull` | `scale` = α, `shape` = γ | (γ/α)(t/α)^(γ−1) · exp(loghr) | (t/α)^γ · exp(loghr) |
+| `gompertz` | `alpha` = α, `gamma` = γ | α · exp(γ·t) · exp(loghr) | (α/γ)(exp(γ·t) − 1) · exp(loghr) |
+
+All parameters must be positive. The optional `loghr` key adds a proportional-hazards covariate term: the entire hazard (and cumulative hazard) is multiplied by `exp(loghr)`. When `loghr` is omitted it defaults to 0 (no effect).
+
+    # Exponential with PH covariate on sex (SEX=1 reference):
+    [event_model]
+      cmt    = 2
+      family = exponential
+      scale  = TVLAMBDA * exp(ETA_LAMBDA)
+      loghr  = BETA_SEX * SEX
+
+    # Weibull with PH covariate on weight:
+    [event_model]
+      cmt    = 2
+      family = weibull
+      scale  = TVSCALE * exp(ETA_SCALE)
+      shape  = TVSHAPE
+      loghr  = BETA_WT * WT
+
+> **Covariates on a hazard must be constant within each subject.** Time-varying covariates on a hazard are not yet supported. A covariate referenced by a hazard — in `scale` / `shape` / `alpha` / `gamma` / `loghr`, or in a drug-driven `hazard =` expression — would otherwise be read at its baseline value (the analytic hazard families take no time argument, and the joint PK-TTE ODE hazard integrates with the PK parameters frozen at `t = 0`), silently fitting the wrong hazard. `fit()` therefore rejects such a model up front (and `predict()` / `simulate()` error), naming the covariate and the subject (#741). A time-varying covariate used only elsewhere — e.g. on the PK parameters of a joint model whose hazard does not reference it — is unaffected. The same freeze on the `TIME` axis — an individual parameter that reads `TIME` and is integrated by a drug-driven hazard — is refused too; see [A `TIME`-dependent disposition is refused](#time-dependent-disposition) (#1853). On an **analytic** hazard the `TIME` axis is refused at parse: a `scale` / `shape` / `alpha` / `gamma` / `loghr` that reads `TIME`, directly or through an individual parameter, would be evaluated with no time argument and silently read 0 (#1919).
+
+## Estimation
+
+The FOCEI Laplace objective includes the curvature of the data term in η:
+
+    OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)| ]
+
+The same term carries the curvature of binary and CTMM data terms.
+
+Set `method = focei` in `[fit_options]`.
+
+A subject that carries a TTE record takes the analytic inner (EBE) gradient: the hazard parameters are replayed on an η-dual through the same survival curves, including under IOV (the hazard reads the BSV η only) and for a drug-driven hazard, whose augmented PK + cumulative-hazard system is solved on the dual. A hazard built through the Rust API without a compiled program has no exact channel and still runs finite differences; the “*N* of *M* subjects use finite-difference inner gradients” warning counts such subjects and names the time-to-event record as the cause. (#1861 made that report honest when every TTE subject ran FD; it is now the exception.)
+
+**IOV with a non-Gaussian endpoint.** Before this release, a FOCE/FOCEI fit with IOV (`kappa` / `block_kappa`) and a TTE, binary or CTMM endpoint optimized a marginal objective that omitted the endpoint’s data term, although the EBE search included it. The marginal now includes it, so the OFV and estimates of such fits change.
+
+`method = laplace` with `n_agq > 1` integrates the event likelihood by adaptive quadrature instead of the Laplace step, and `saem` / `imp` / `impmap` estimate the exact marginal. After those three, the covariance step uses the 7-node quadrature marginal rather than the FOCEI objective — see [SAEM: covariance step on a non-Gaussian model](../estimation/saem.llms.md#saem-covariance-non-gaussian) (#1781).
+
+How `∇²ℓᵢ` is computed depends on the endpoint.
+
+### Exact data-term curvature
+
+`∇²ℓᵢ` is exact for every endpoint whose parameters ferx compiles to a dual program: an analytic-family hazard (exponential, Weibull or Gompertz, single or repeated events), a binary linear predictor, a time-homogeneous CTMM generator, and — through the same duals carried through the ODE solve — a drug-driven (ODE-accumulated) hazard and a time-inhomogeneous CTMM (#2482).
+
+Each of these likelihoods is written once, over a generic number type. The objective’s value is that code run on plain floating point. The η-Hessian is the same code run on second-order dual numbers in η, with the endpoint’s parameter expressions evaluated on the same duals. There is no separate derivative formula to drift from the value:
+
+- **TTE**: the closed-form hazard and cumulative hazard, with every record kind (exact, right-censored, interval-censored, left-truncated) and both repeated-event clocks. At Gompertz `γt` near 0, where `(e^{γt} − 1)/γ` is `0/0`, the cumulative hazard takes a series that keeps its γ-derivatives, so a `γ(η)` estimated at 0 keeps its curvature.
+- **Binary**: the logit term `softplus(lp) − y·lp`.
+- **CTMM**: the transition probabilities from the degree-13 Padé matrix exponential; the objective’s value uses the same exponential. A drug-driven generator’s occupancy ODE is solved on the same duals, on the value path’s own grid.
+- **Drug-driven hazard**: the cumulative-hazard state and `h(t)` read off a dual solve of the joint system, at the value path’s clock anchors.
+
+There is no step, so nothing in the objective depends on a step’s size. It is smooth in θ, and it does not depend on η’s units: `logit = TH + 1000 * ETA` with `ω = 0.25e-6` and `logit = TH + ETA` with `ω = 0.25` give the same FOCEI objective to 9e-16. Against a Richardson-extrapolated stencil of the objective’s own value, the exact η-Hessians agree to 2e-9 relative on every endpoint, record kind, recurrence and boundary value tested (`src/stats/non_gaussian_eta_hessian_tests.rs`), at any η count.
+
+### Finite-difference fallback
+
+The duals do not reach every endpoint. These keep a 4-point central-difference stencil:
+
+- an expression ferx cannot compile to a dual program;
+
+The step on each η axis is `2.4e-3` conditional posterior standard deviations, `1/√((Ω⁻¹)_jj + Ĥ_jj)`. The stencil moves one η with the others held, so the prior precision is `(Ω⁻¹)_jj`, not the marginal `1/ω_jj`. Under a correlation of 0.9 the two differ 5-fold. `Ĥ_jj` is the data term’s curvature at η̂, read off a ladder of pilot second differences. The ladder starts at the conditional prior SD’s width and halves until two successive pilots agree. The step is never wider than the widest pilot that agreed, so under a vague prior the curvature is read locally, not over a span where the likelihood has saturated. A pilot point that is a repelled-evaluation sentinel makes the pilot retry at half the width. The step is built from Ω and the data term’s curvature, never from its gradient, so the objective stays smooth in θ, and every width is in posterior SDs, so it stays independent of η’s units. Measured against closed-form η-Hessians on binary, Weibull and CTMM data terms, from `ω = 1e-4` to the largest ω the optimizer allows (about 1.6e5), the error relative to `Ω⁻¹ + ∇²ℓ` is at most 2.4e-6.
+
+A time-inhomogeneous CTMM that falls back uses `0.1` posterior SDs instead. Its occupancy ODE is integrated adaptively, and at the narrow step its second difference reads the integration error. On `examples/ctmm_pd_2state.ferx` the η-Hessian moved 2–8% between steps of about `7e-4` and `3e-2`, then held within 0.5% from half to twice the wider step. A drug-driven TTE hazard that falls back is integrated accurately enough for the narrow step: its η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
+
+### Before \#2437
+
+Every one of these endpoints used a finite difference on Shi (2021)’s ε^⅓ step, about 5e-6, re-derived from the data-term gradient at every θ. That scale suits a first derivative, but there the second difference is mostly roundoff: about 1e-5 against closed-form η-Hessians, which made the objective rough in θ. It moved the BOBYQA optimum of `examples/ctmm_pd_2state.ferx` by 0.73 OFV. Against NONMEM, the binary-endpoint control of the `reset_clock_cat` anchor (`tests/reset_clock_nonmem_anchor.rs`) now sits 7.4e-10 OFV from NONMEM’s objective, on Linux and macOS. On the Shi step it sat 6.6e-5 away, and on the finite-difference fallback’s step 1.5e-6.
+
+### The outer gradient carries the EBE response
+
+On a model with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and at least one random effect, the FOCE/FOCEI outer gradient is the **exact analytic marginal gradient**: the endpoint’s data term enters the adjoint’s objective as production scores it — in the data term, in `H̃` and in the inner gradient — so the gradient carries `½ ∂_η log|H̃| · dη̂/dθ` without re-solving any EBE. That holds under IOV (the endpoint reads the BSV η only), for an ODE-accumulated hazard, and for an endpoint-only subject with no Gaussian rows. The NLopt gradient optimizers (`nlopt_lbfgs`, `slsqp`, `mma`) take it, a derivative-free fit reports its final gradient from it, and the per-subject fixed-EBE scores Gauss–Newton and the S matrix use are exact for these endpoints too. Before, these models took the **reconverged** finite-difference θ-gradient — each perturbed point re-solving the subject’s EBE from the base point’s η̂, `2·n_x` full inner loops per evaluation ([\#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)) — and a subject outside the exact scope (see [Known FD fallbacks](../estimation/foce.llms.md#known-fd-fallbacks)) still does. Under IOV, `method = gn` steps along the same per-subject outer gradient the NLopt optimizers sum, on every model, Gaussian included ([\#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)).
+
+The cheaper fixed-EBE gradient holds η̂ while θ moves. The envelope theorem makes that exact for the inner objective, whose η-gradient is zero at η̂. It is not exact for the `½ log|H̃|` term, whose η-derivative is not zero, so the fixed-EBE gradient drops `½ ∂_η log|H̃| · dη̂/dθ`. A Gaussian endpoint on the analytic route never sees this, because the exact analytic gradient carries the term; a Gaussian model on a [finite-difference fallback](../estimation/foce.llms.md#known-fd-fallbacks) drops it too, which is the fixed-EBE bias [Gradient accuracy vs cost](../estimation/foce.llms.md#gradient-accuracy-vs-cost-reconverged-ebes) describes. For a hazard (curvature `λ·e^η·t`) or a Bernoulli likelihood (`p(1−p)`), `H̃` changes strongly with η. The dropped term is then a bias rather than noise, and the optimizer stops at a point that is not stationary and reports convergence. Measured on the models in `examples/` when \#1778 replaced the fixed-EBE gradient by the reconverged one (macOS, one thread):
+
+| Model | Optimizer | Before | After | `bobyqa` |
+|----|----|---:|---:|---:|
+| `tte_exponential` | `nlopt_lbfgs` | 166.4983 | 166.4394 | 166.4394 |
+| `tte_exponential` | `method = gn` | 166.4983 | 166.4395 | 166.4394 |
+| `pktte_joint` | `slsqp` | 68.3968 | 66.9748 | 66.9751 |
+| `pktte_joint` | `nlopt_lbfgs` | 66.9785 | 66.9748 | 66.9751 |
+| `binary_logistic` + a random intercept | `mma` | 212.4972 | 212.4836 | 212.4831 |
+
+Every gradient optimizer reported convergence before the fix, except on the joint model, where Gauss-Newton and `trust_region` do not converge before or after it; use `gn_hybrid` or `bobyqa` there. The reconverged gradient costs more per evaluation. On `pktte_joint` the `nlopt_lbfgs` fit went from 0.8 s to 1.4 s and `mma` from 1.1 s to 2.6 s, against 1.4 s for `bobyqa` (timings of the reconverged finite-difference gradient, which the exact gradient has since replaced). A model without random effects keeps the fixed-EBE gradient, which is exact there.
+
+## Joint PK-TTE
+
+When the hazard depends on drug exposure, write it as an expression over the PK state instead of a closed-form `family`. On an ODE model, the `hazard` key in `[event_model]` is accumulated as an extra ODE compartment and estimated **jointly** with the PK, with shared random effects:
+
+    [parameters]
+      theta TVCL(1.0, 0.01, 100)
+      theta TVV(10, 0.1, 500)
+      theta TVKA(1, 0.01, 50)
+      theta TVH0(0.01, 1e-5, 10)
+      theta TVBETA(0.5, -10, 10)
+      omega ETA_CL ~ 0.09
+      sigma PROP_ERR ~ 0.05 (sd)
+
+    [individual_parameters]
+      CL   = TVCL * exp(ETA_CL)
+      V    = TVV
+      KA   = TVKA
+      H0   = TVH0
+      BETA = TVBETA
+
+    [structural_model]
+      ode(obs_cmt=central, states=[depot, central])
+
+    [odes]
+      d/dt(depot)   = -KA * depot
+      d/dt(central) =  KA * depot - (CL/V) * central
+
+    [event_model]
+      cmt    = 3                                  # TTE on its own CMT (PK observed on CMT 2)
+      hazard = H0 * exp(BETA * (central / V))     # log-linear hazard in concentration
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)                  # Gaussian PK rows (CMT 2); TTE rows (CMT 3) route to the event likelihood
+
+    [fit_options]
+      method = focei
+
+The parser appends `d/dt(__chz) = H0 * exp(BETA * (central / V))` (init 0) to the ODE system; the TTE likelihood reads `H(T)` from that state and `h(T)` from its derivative, combined with the Gaussian PK likelihood in one FOCEI objective (`central / V` is the concentration driving the hazard). Put the PK observation and the event on **different compartments** so the data reader can route Gaussian rows and TTE rows unambiguously.
+
+`predict_survival()` returns `S(t)` / `H(t)` / `h(t)` for the endpoint by integrating the same augmented system at the typical values (its `mean_survival` is `NaN` — an `∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from the cumulative-hazard grid). `predict_survival_diag()` returns the same rows together with the diagnostics `predict_diag()` carries — parse and data-reader warnings, the model/data checks, and the ODE-solver diagnostics of that integration ([\#2164](https://github.com/FeRx-NLME/ferx-core/issues/2164); see [the non-fit bundle](../warnings.llms.md#non-fit-bundle)).
+
+**A hazard time at or before the subject’s first record.** A `TENTRY` (left truncation) or an interval-censored left bound below the start of the integration contributes nothing: nothing has acted on the system yet, so `H = 0` and `h = h(u₀)` there, and the left-truncated `H(T) − H(entry)` reduces to the untruncated `H(T)`. `predict_survival()` reports the same values at such a grid point ([\#1223](https://github.com/FeRx-NLME/ferx-core/issues/1223)). The clock starts where NONMEM’s does, at the subject’s first record of *any* `EVID`: a dose, a scored observation, an `EVID = 2` row or an `EVID = 0, MDV = 1` row. So a baseline hazard accumulates from a covariate-marker row ahead of the first dose. Before [\#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) the reader dropped the last two kinds of row (an `EVID = 2` row was kept only with time-varying covariates), and the clock started at the first dose or scored observation. One row is still not a record: an observation row whose `DV` is missing, which the reader skips under `W_MISSING_DV`.
+
+### A time-dependent hazard keeps the single shared solve
+
+A Weibull or Gompertz baseline reads `TIME`, so the appended `d/dt(__chz_<cmt>)` line is time-dependent — but the PK block above it usually is not, and ferx now asks that question of the **PK equations alone**. Such a model gets both halves of the objective from one integration of the augmented system rather than two:
+
+    [event_model]
+      cmt    = 3
+      hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))   # Gompertz × exposure
+
+Writing `TIME` in a PK equation still splits the solve, and on a model with a drug-driven hazard it is refused when that parameter is one the hazard depends on — see [the next section](#time-dependent-disposition) for the dependency test and for the three shapes it accepts. `__chz_*` may not be read from `[odes]` or seeded with `init(...)` — see [the ODE-models page](../model-file/ode-models.llms.md#chz-is-not-your-rhs).
+
+The same “the accumulator is not a compartment” reading governs steady-state dosing. An `SS=1` dose equilibrates the PK compartments to their periodic steady state, but the accumulator has none — it is a pure integrator — so it is held out of the run-in and keeps its value at the dose record. `H` therefore starts at `0` for a subject’s first dose, and a later `SS=1` dose re-loads the compartments without discarding the hazard accrued so far. NONMEM’s own steady-state routine cannot be handed such a system at all; see [SS with an ODE-accumulated hazard](../model-file/steady-state.llms.md#ss-with-an-ode-accumulated-hazard) for the convention, the NONMEM result, and the committed anchor.
+
+> **NOTE:**
+>
+> Between [\#1124](https://github.com/FeRx-NLME/ferx-core/issues/1124) and [\#1166](https://github.com/FeRx-NLME/ferx-core/issues/1166) every joint model with a time-dependent hazard declined the shared solve and integrated twice per subject per objective evaluation. Measured on a 40-subject fixture, one variable: **2.1×** on a single objective evaluation and **2.6×** over eight outer iterations. The objective itself moved only at solver-tolerance scale (4.4e-3 OFV at default tolerances, decaying with the tolerance), so earlier results do not need re-running — they were merely slow.
+
+Validated against NONMEM: `nonmem_anchor/pktte_tdep.ctl` (`ADVAN13 TOL=9`, `$OMEGA 0 FIX`) on 40 subjects. At `ode_reltol = 1e-9` ferx’s `H(t)` matches NONMEM’s `A(3)` to 3.6e-9 relative at every event record, and the per-subject objective matches the `.phi` `OBJ` to 6.0e-8 absolute with **no** additive constant between the two conventions (`tests/pktte_tdep_nonmem_anchor.rs`).
+
+### A `TIME`-dependent disposition is refused
+
+The hazard pass integrates the augmented system under **one** `$PK` snapshot, taken at `TIME = 0`. Since [\#1575](https://github.com/FeRx-NLME/ferx-core/issues/1575) every *dose-record* quantity — absorption kernel, pathway fraction, route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`, the `SS=1` run-in — is read at its own dose record instead, so a `TIME`-reading `MTT` or `ALAG1` is exact and keeps fitting. What is still one snapshot is the **disposition**: the parameters the `[odes]` RHS integrates (CL, V, …), the parameters the `hazard =` expression itself reads, and `init(...)`.
+
+The Gaussian half of the same objective does not freeze them — a model whose `$PK` reads `TIME` routes its predictions through the per-record event-driven walk, which evaluates `[individual_parameters]` at every record, as NONMEM’s `$PK` does, while the hazard pass keeps the `TIME = 0` value. The two halves can therefore integrate different concentration curves. Measured on a 1-cpt IV model with `CL = TVCL · (1 + 0.05 · TIME)`, `V = 10`, a 100 mg bolus and `hazard = H0 · exp(BETA · C)`: at `t = 8` the Gaussian pass predicts `central = 33.79` while the hazard pass reads `44.93`; at `t = 20`, `3.07` against `13.53`. `H(20)` comes out 10.1 % high and the exact-event `−log L` is off by 0.046 per subject. Worse, the frozen hazard is *bit-identical* whether the `TIME` coefficient is `0` or `0.05` — the term has no influence at all on the survival half it was written for.
+
+`fit()` therefore rejects such a model up front, and `predict()` / `predict_survival()` / `simulate()` return the same error, naming the parameter and whether the `[odes]` RHS or an `init(...)` seed reads it ([\#1853](https://github.com/FeRx-NLME/ferx-core/issues/1853)):
+
+    [event_model] on CMT=2: the ODE-accumulated (joint PK-TTE) hazard is integrated with the
+    individual parameters frozen at their TIME=0 values, but `CL` reads the `TIME` built-in and
+    the [odes] RHS reads it. ...
+
+The refusal is narrow in three ways, so what it stops is a model whose two halves can disagree — narrow by *structure*, not by value (see the caveats below it):
+
+- a `TIME` read that stays inside the `[odes]` **RHS** — `d/dt(central) = … · (1 + K · TIME)`, or a Weibull / Gompertz baseline hazard — is fine: the integrator resolves `TIME` at every step, so nothing there is frozen;
+- a `TIME`-reading **dose-record** quantity is fine, as above;
+- a `TIME`-reading parameter the **hazard does not depend on** is fine. `hazard = H0` with a time-dependent `CL` integrates a constant, so the accumulator is the same whatever snapshot the hazard pass runs under; ferx cuts a dependency slice back from each `d/dt(__chz_<cmt>)` row — data reads, the state dynamics behind them, the `init(...)` of a state they reach, and the `if` conditions governing any of it — and refuses only what lands in it. On a competing-risks model the error names the endpoint whose own hazard is affected.
+
+Two cases are still refused that need not be, both because the test is structural rather than value-based. A `TIME`-dependent definition that a later line overwrites before anything reads it is followed anyway ([\#1931](https://github.com/FeRx-NLME/ferx-core/issues/1931)); and a `TIME` term that cancels — `CL = TVCL + 0.0 * TIME` — counts as a `TIME` read. In both the remedy is to delete the line or the term, which is what the model already means.
+
+Hold the *individual parameters a drug-driven hazard depends on* constant in `TIME` for now; a per-record disposition for the hazard pass is tracked in [\#1920](https://github.com/FeRx-NLME/ferx-core/issues/1920).
+
+### Simulating drug-driven event times
+
+`simulate()` draws event times from a drug-driven hazard by integrating the augmented PK + cumulative-hazard system until `H(T) = −log U` — the ODE analogue of the analytic inverse-CDF — localizing the crossing inside the solver step. Because a drug-driven hazard can vanish (the drug clears, the hazard falls toward baseline, and an event may never fire), an ODE-TTE simulation **requires a finite `[simulation] horizon`**; a subject that has not crossed by the horizon is right-censored there. EVID-3/4 resets and left-truncated entry (`entry_time > 0`) are not yet supported for ODE-TTE simulation and raise a clear error rather than mis-sampling. A negative or non-finite hazard fails loudly during sampling — it is never silently treated as a censor.
+
+> **NOTE:**
+>
+> The hazard expression lives in the `[odes]` RHS namespace (ODE states + individual parameters — route thetas/covariates through `[individual_parameters]`), and inter-occasion variability (IOV) is rejected. Joint PK-TTE is the standard NONMEM `$DES` + cumulative-hazard construct; recovery against NONMEM / nlmixr2 is tracked in issue \#564. See `examples/pktte_joint.ferx`.
+
+## Competing risks (cause-specific hazards)
+
+When a subject is at risk of several mutually-exclusive event types, give each cause its own `[event_model NAME]` block on a distinct compartment. The blocks share the model’s random effects (a common frailty links the causes), so this is the standard *cause-specific hazard* approach:
+
+``` ferx
+[parameters]
+  theta TVLAMBDA_A(0.10, 0.001, 10.0)
+  theta TVLAMBDA_B(0.06, 0.001, 10.0)
+  omega ETA_F ~ 0.25
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)
+```
+
+**Data format.** Each subject has one row per cause CMT. The cause that occurred is `DV=1` on its CMT; every other cause is right-censored (`DV=0`) at the *same* time, because one event removes the subject from risk of the others:
+
+    ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+    1,12.25,1,0,0,2,0,0     # subject 1: cause A (CMT 2) at t=12.25 …
+    1,12.25,0,0,0,3,0,0     #            … censored for cause B (CMT 3) at the same time
+    2,9.38,0,0,0,2,0,0      # subject 2: reached the horizon with no event —
+    2,9.38,0,0,0,3,0,0      #            right-censored for both causes
+
+See `examples/tte_competing_risks.ferx` and `data/tte_competing_risks.csv`.
+
+**Prediction — cumulative incidence.** `predict_survival()` reports, per cause, the cause-specific cumulative incidence `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du` alongside the all-cause survival `S_all(t) = exp(−Σ_j H_j(t))`. With competing risks the naive `1 − exp(−H_k)` *over*-states a cause’s incidence (it ignores that the other causes remove subjects from risk); the reported CIF is correct, and across all causes `Σ_k F_k(t) + S_all(t) = 1` exactly. For a single endpoint it reduces to `F(t) = 1 − S(t)`. Rows: ascending CMT per subject.
+
+**Estimation note.** The cause-specific *rates* are well-identified and recover tightly. The shared frailty variance ω² is weakly identified for TTE and reads high under FOCEI-Laplace at higher event rates (the same approximation limit as single-endpoint frailty; see below) — prefer SAEM/IMP for the variance component. Subdistribution-hazard (Fine–Gray) modelling is not currently provided; cause-specific hazard covers the standard pharmacometric use case.
+
+**Validation of the cumulative incidence.** The CIF is anchored at three levels:
+
+1.  *Closed form (constant hazards).* For two exponential causes the actuarial allocation is exact: `F_k(t) = (λ_k / Σλ)·(1 − e^{−Σλ·t})`. Asserted to machine precision in `cif_two_cause_exponential_closed_form` (`src/survival/mod.rs`).
+
+2.  *Independent quadrature (time-varying hazards).* For a Weibull + Gompertz pair the per-cause `F_k(t)` from `cif_curves` matches a high-resolution composite-Simpson integration of the defining integral `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du` — a different scheme — to within `1e-3` (`cif_time_varying_matches_independent_quadrature`).
+
+3.  *Nonparametric reference (R `cmprsk::cuminc`).* Simulating the example’s two exponential causes (`λ_A = 0.10`, `λ_B = 0.06`, administrative censoring at `t = 14`, `N = 200 000`) and estimating the cumulative incidence with the license-free `cmprsk::cuminc` reproduces ferx’s analytic CIF (max absolute difference `≈ 2·10⁻³`, i.e. Monte-Carlo noise):
+
+    |   t | cause A — `cmprsk` | cause A — ferx | cause B — `cmprsk` | cause B — ferx |
+    |----:|-------------------:|---------------:|-------------------:|---------------:|
+    |   2 |             0.1708 |         0.1712 |             0.1032 |         0.1027 |
+    |   6 |             0.3848 |         0.3857 |             0.2324 |         0.2314 |
+    |  10 |             0.4970 |         0.4988 |             0.3009 |         0.2993 |
+    |  14 |             0.5565 |         0.5585 |             0.3370 |         0.3351 |
+
+    ``` r
+    library(cmprsk)
+    set.seed(20260625)
+    lamA <- 0.10; lamB <- 0.06; tau <- 14; N <- 2e5
+    tA <- rexp(N, lamA); tB <- rexp(N, lamB)
+    tmin <- pmin(tA, tB); cause <- ifelse(tA < tB, 1L, 2L)
+    status <- ifelse(tmin <= tau, cause, 0L); ftime <- pmin(tmin, tau)
+    timepoints(cuminc(ftime, status, cencode = 0L), c(2, 6, 10, 14))$est
+    # ferx analytic: F_k(t) = (lam_k/(lamA+lamB)) * (1 - exp(-(lamA+lamB)*t))
+    ```
+
+**Simulation and VPC.** `simulate()` draws the competing causes with the same earliest-cause-wins rule: a latent time is drawn per cause, the earliest is the observed event, and every other cause is right-censored at that time. For a **visual predictive check** the simulation needs an administrative censoring horizon that is *decoupled from the observed event times* — otherwise a re-simulated subject that already carries an event re-draws unbounded, biasing the simulated event-time distribution. Supply it with the [`[simulation] horizon`](../model-file/simulation.llms.md#tte-simulation) key (or `SimulateOptions { horizon, .. }` on the library API); when set, it overrides each record’s per-record window so every cause censors at the planned study end:
+
+``` ferx
+[simulation]
+  n_subjects = 200
+  horizon    = 14     # follow each subject to t = 14, censoring survivors there
+  seed       = 12345
+```
+
+Running `ferx examples/tte_competing_risks.ferx --simulate` then generates one right-censored TTE row per cause compartment (CMT 2 and CMT 3) per synthetic subject and overwrites each with the drawn outcome. A TTE `[simulation]` block **requires `horizon`** (there are no continuous `times` to schedule).
+
+## Repeated events (RTTE)
+
+A **repeated** TTE model (`type = rtte` in `[event_model]`) lets one subject experience the same event several times. Add `type = rtte` and give each subject multiple `DV = 1` rows in time order, ending in a `DV = 0` administrative-censoring row:
+
+    [parameters]
+      theta TVLAMBDA(0.15, 0.001, 10.0)
+      omega ETA_LAMBDA ~ 0.09
+
+    [event_model]
+      cmt    = 2
+      type   = rtte
+      family = exponential
+      scale  = TVLAMBDA * exp(ETA_LAMBDA)   # frailty shared across a subject's events
+
+    [fit_options]
+      method = saem
+
+`clock = forward` (the default, Andersen–Gill total time) integrates the cumulative hazard once across the whole window (`Σ_k log h(t_k) − H(T)`); `clock = reset` (gap time) restarts the hazard clock at each event (`Σ_k log h(Δ_k) − Σ_k H(Δ_k)` over inter-event gaps). For a time-homogeneous hazard the two coincide. See [Repeated events](../model-file/event-model.llms.md#rtte) for the DSL details.
+
+Both clocks accept **left truncation** (a `TENTRY` column; see [above](#left-truncation-delayed-entry)). Under `clock = forward` the cumulative hazard integrates from `H(TENTRY)`. Under `clock = reset` the *first* sojourn is measured from the time origin and conditioned on survival to entry — `H(t₁) − H(TENTRY) − log h(t₁)` — after which the renewal clock takes over for later gaps. This is the same delayed-entry conditioning across every survival endpoint: `TENTRY` always means “condition on survival past entry”, never “restart the clock at entry” (the two would differ for a time-varying hazard, and only the former is a standard, anchorable left-truncation model). Reset left truncation assumes the time origin `t = 0` is the renewal origin of the first sojourn (the subject was event-free and at risk from 0); it coincides with clock-forward for a memoryless (exponential) hazard.
+
+`simulate()` accepts left truncation for repeated events too (#740): the stream is drawn on the same time origin conditioned on survival to `TENTRY` — clock-forward seeds its conditioning clock at `TENTRY`, clock-reset draws its first sojourn conditional on survival to entry and renews from 0 thereafter — so a simulated left-truncated stream refits under the same convention it was drawn from. `TENTRY = 0` is byte-identical to the non-truncated draw. (The simulated event rows carry the drawn times; as with single-event TTE simulation, `TENTRY` itself is a property of the input design, not re-emitted onto the output rows.)
+
+> **WARNING:**
+>
+> A Laplace-based fit (`focei`/`foce`) can **underestimate the frailty ω²** for RTTE at low event rates (Karlsson et al. 2009: −91 % to −96 % below a 43 % event rate). ferx warns and recommends `method = saem` or `method = imp`. For an *event-rich* design the methods coincide (see the anchor below).
+
+### Validation — constant-hazard RTTE
+
+Dataset `tests/reference/rtte_exponential/rtte_exp.csv` (100 subjects; data-generating `TVLAMBDA = 0.15`, `ω² = 0.09`; censored at t = 20 → **305 events, 3.05/subject**). Two of the anchors are **exact and license-free** — for a constant hazard the RTTE likelihood factorises, so the per-subject event *counts* are `Poisson(λᵢ·T)` and a Poisson-lognormal GLMM on the counts is the exact MLE (`count_equivalence.R`).
+
+| Method                            |    TVLAMBDA | ω²(log rate) |     OFV |
+|-----------------------------------|------------:|-------------:|--------:|
+| Analytic MLE `D/Σt` (fixed)       | **0.15250** |            — | 1757.16 |
+| ferx fixed-effects                |     0.15250 |            — | 1757.16 |
+| Poisson-LN GLMM (exact mixed MLE) |     0.14062 |      0.16455 |       — |
+| **NONMEM** LAPLACE                |     0.14062 |      0.16450 | 1748.49 |
+| **ferx** FOCEI                    |     0.14060 |      0.16448 | 1748.49 |
+| ferx SAEM (seed 31)               |     0.14033 |      0.16993 | 1748.50 |
+
+ferx FOCEI reproduces NONMEM LAPLACE to 4–5 significant figures and the OFV to the decimal (1748.49), and both land on the exact Poisson-LN GLMM MLE. The frailty ω² is well-identified here because the design is event-rich, so FOCEI, SAEM, NONMEM and the GLMM coincide — the Karlsson Laplace bias is a *low-event-rate* effect. Full write-up in `tests/reference/rtte_exponential/expected.md`.
+
+### Simulating repeated events
+
+`simulate()` draws a **recurrent event stream** per subject up to the administrative `[simulation] horizon` (analytic hazard families; RTTE with a drug-driven ODE hazard is a later slice). Under `clock = forward` each next event is drawn *conditional on survival past the previous one* — the closed-form inverse of `H(t) − H(t_{k−1}) = −log u` — so a time-varying hazard keeps accumulating across the window; under `clock = reset` each inter-event gap is a fresh draw from zero. Every subject emits its events (`DV = 1`) followed by one administrative censor (`DV = 0`) at the horizon, so simulated data round-trips straight back through the data reader. A finite horizon is required (the stream has no implicit end); left truncation, multiple RTTE causes, an RTTE cause mixed with a competing single-event cause, and EVID=3/4 resets are rejected with a clear error rather than silently mis-sampled.
+
+Unlike fitting, `simulate()` **regenerates** each subject’s stream from `t = 0` out of the model and drawn frailty — it never reads the input event rows. The fit-boundary input-shape checks (out-of-order, interval-censored, or non-finite event times; see [Repeated events](../model-file/event-model.llms.md#rtte)) therefore do **not** apply to simulation: such rows are simply not consulted, not rejected.
+
+## Individual survival curves at the EBEs
+
+`predict_survival()` and `predict_survival_diag()` give the **population** curve: every subject’s `S(t)`, `H(t)` and `h(t)` at the typical values (η = 0), differing only through covariates. `predict_survival_at_etas_diag()` gives each subject’s **individual** curve, `Ŝᵢ(t)`, `Ĥᵢ(t)`, `ĥᵢ(t)`, at that subject’s own η ([\#1885](https://github.com/FeRx-NLME/ferx-core/issues/1885)). The η come as a `SuppliedEtas`, the same input adaptive dosing takes:
+
+``` rust
+let etas = SuppliedEtas::from_fit(&fit_result, &model)?; // the fit's reported EBEs
+let out = predict_survival_at_etas_diag(&model, &population, &params, &etas, &grid)?;
+```
+
+`SuppliedEtas::from_table` takes your own rows instead. Each population subject is matched to its row by ID, and a supplied ID the population lacks is ignored, so a subset population is a valid call. The output rows are the population form’s, field for field: the cause-specific CIF and `S_all` of a competing-risks model are built from the same individual curves, so `Σ_k F_k + S_all = 1` still holds, and RTTE rows keep the [first-event semantics](#rtte) of `predict_survival`. A subject supplied with η = 0 gets the population rows bit for bit.
+
+**What “the EBE” is.** `from_fit` takes `SubjectResult.eta`, the fit’s reported EBE. That is the conditional mode for FOCE, FOCEI and Laplace, and whatever SAEM or IMP report there. A supplied η is treated as exact, which is optimistic for a subject whose few records barely move it from 0 (high shrinkage).
+
+### Agreement with the likelihood
+
+For an analytic hazard and a single-event record without delayed entry, `cum_hazard` at the record’s time is the `H(Tᵢ)` the likelihood evaluated at η̂ᵢ, bit for bit. Under delayed entry (`TENTRY`) or gap-time RTTE the scored term is a difference of this curve, `H(T) − H(entry)` or `H(t − t_prev)`, not a row of it. A joint PK-TTE (ODE-accumulated) hazard is integrated on this call’s grid, and an adaptive solve’s value at a time depends on the other times it is asked for. So it agrees with the scored value to the ODE tolerance, about 1e-4 relative at the default tolerances, and bit for bit only when the grid is exactly the scored times of a subject the likelihood scored on the dedicated solve.
+
+### IOV, mixtures and refusals
+
+IOV κ are taken as 0. That is exact, because no hazard can read a κ: the parser refuses one in an `[event_model]` and in an ODE-accumulated hazard. A `[mixture]` model is refused (`E_SUPPLIED_ETAS`): each η̂ was estimated under the subject’s own class, and the entry has no class to evaluate it under.
+
+After the checks `predict_survival_diag` makes, `E_SUPPLIED_ETAS` for a `[mixture]` model, η names that are not the model’s (in the model’s order), or a population subject with no supplied row. To get the population curve for such a subject, call `predict_survival_diag`.
+
+### Validation against NONMEM `POSTHOC`
+
+Two NONMEM 7.6.0 `MAXEVAL=0 POSTHOC` runs with every parameter `FIX`, so NONMEM’s ETA1 is the conditional mode at a stated point:
+
+| Anchor | ferx `H` at NONMEM’s ETA1 | ferx η̂ vs ETA1 | ferx `H` at its own η̂ |
+|----|----|----|----|
+| joint PK-TTE, live IIV on CL (`pktte_ebe.ctl`, 8 subjects, doses at 0/12/24) | 4.4e-9 rel | 4.3e-10 | 4.5e-9 rel |
+| exponential TTE at the Laplace optimum (`tte_exponential_ebe.ctl`, 30 subjects) | 2.1e-9 rel | 6.0e-9 | 5.9e-9 rel |
+
+Worst case over every grid and record row, measured on Linux aarch64 (macOS arm64 agrees to the digits shown, except η̂ at 4.7e-10), with ferx’s ODE tolerances at 1e-9 / 1e-11 against `ADVAN13 TOL=9`. The η = 0 curve misses the same references by 103 % and 25 %. Tests: `tests/pktte_ebe_nonmem_anchor.rs` and `tests/tte_exponential_ebe_nonmem_anchor.rs`.
+
+## Residuals
+
+Every time-to-event record gets a row in the sdtab with four residuals at the subject’s EBE ([\#901](https://github.com/FeRx-NLME/ferx-core/issues/901)), in the counting-process convention of R’s `survival::residuals(…, collapse = FALSE)`. In Rust they are `SubjectResult::tte_rows`, one `TteObsDiagnostic` per record.
+
+Each is built from `ΔH`, the cumulative-hazard increment the likelihood scored for that record over its own risk interval, with `δ` the event indicator (1 event, 0 censor):
+
+| Column | Value | Under a correct model |
+|----|----|----|
+| `COXSNELL` | `ΔH` | Exp(1), with censoring |
+| `MARTINGALE` | `δ − ΔH` | mean 0 |
+| `DEVIANCE` | `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])`; `−√(2ΔH)` for a censor | roughly N(0, 1) when the expected count is large |
+| `PIT` | `exp(−ΔH)` | U(0, 1) over events **only without censoring** |
+
+`PIT` over events is not uniform once records can be censored: the events are the draws that came before their censoring time, so they lean towards high survival. With exponential `λ = 0.1` and censoring uniform on (0, 15), the event `PIT` mean is 0.71, not 0.5, under the true model. With censoring, compare `COXSNELL` with Exp(1) using a censored estimate (a Kaplan–Meier curve of `COXSNELL` against `exp(−x)`), not `PIT` with a uniform.
+
+### What `ΔH` is for each record
+
+- **Single event, no delayed entry:** `ΔH = Ĥ(T)`.
+- **Delayed entry (`TENTRY > 0`):** `ΔH = H(T) − H(entry)`. `PIT` is the survival from entry to `T` *given survival to entry*, not `Ŝ(T)`.
+- **Clock-forward RTTE:** each record’s increment since the previous record, `H(tₖ) − H(tₖ₋₁)` (the first from entry). A subject’s `MARTINGALE` sums to `N(T) − [H(T) − H(entry)]`. The rows of one subject are not independent observations.
+- **Clock-reset RTTE:** each record on its own gap, `ΔH = H(Δₖ)`, never `H(tₖ)`.
+- **Competing risks:** one row per cause’s record on that cause’s `CMT`, from the cause-specific `H_k`. There is no total-hazard residual.
+
+`ΔH` comes from the same code and the same curves as the objective, chosen in one place for both. A joint PK-TTE subject is scored off the exact-derivative walk wherever that serves it, otherwise off the single shared solve if it took one, otherwise off a dedicated solve. So the terms sum to the subject’s TTE likelihood bit for bit. They are not read off `predict_survival_at_etas_diag`’s grid, which agrees with the scored values only to ODE tolerance ([above](#agreement-with-the-likelihood)).
+
+The per-subject martingale residual is the sum of a subject’s `MARTINGALE` rows, grouped by `ID`. When η sits on log λ, every increment is proportional to `e^η`, so the EBE’s own optimality condition makes that sum exactly `η̂ᵢ/ω`. The sum over **subjects** is therefore `Σ η̂ᵢ/ω`, which is not 0 at the population optimum (1.716 in NONMEM’s own table for `tte_exponential_ebe`). A `Σᵢ Mᵢ ≈ 0` check is a check of a fixed-effects model.
+
+### Rows and blank cells
+
+TTE rows come after every Gaussian row and every discrete-endpoint row, one block per endpoint family, not interleaved by subject. Join them back to the data on `ID`, `CMT` and `TIME`. The `CMT` column is always written when there are TTE rows. `DV` is `δ`. `PRED`, `IPRED`, `IWRES`, `CWRES`, `N_OBS` and any `[derived]` or `[output]` column are blank on a TTE row. The four residual columns exist only when the fit has a TTE record, and are blank on every other row.
+
+With `npde_nsim > 0` a single-event TTE row also carries its [simulation-based npde](#tte-npde) in `NPDE` and `NPD` (the same number in both). `EPRED`, `EWRES` and `PWRES` are blank on a TTE row.
+
+All four residual cells are blank:
+
+- for an **interval-censored** record (its `DV` too), which has no single `ΔH`;
+- for every record of a subject whose survival likelihood is the `1e20` repellent at its EBE (a non-monotone or non-finite hazard).
+
+`DEVIANCE` is also blank for an event the model gave no hazard mass (`ΔH = 0`), where it is `+∞`.
+
+The cells report the `ΔH` the likelihood scored, unclamped. A joint PK-TTE hazard that is flat over a record can score it a solver round-off below 0, and then `COXSNELL` is a tiny negative and `PIT` a hair above 1. Only `DEVIANCE` clamps `ΔH` at 0.
+
+IOV κ never reach a hazard (see [IOV, mixtures and refusals](#iov-mixtures-and-refusals)), so the residuals are those of the BSV η̂ alone.
+
+A `.fitrx` bundle carries the TTE rows (`predictions_tte.csv`, [\#911](https://github.com/FeRx-NLME/ferx-core/issues/911)), so the sdtab of a restored fit equals the live one. The npde score travels in a trailing `NPDE` column of that entry, written only when some record has one; a build from before \#1889 cannot read a bundle that carries it. Only a bundle written before \#911 has none: writing its sdtab is refused with a message saying the bundle predates the TTE rows.
+
+### Validation
+
+Two exact identities and two NONMEM 7.6.0 `POSTHOC` tables. No new NONMEM run is needed:
+
+| Check | Worst abs error |
+|----|----|
+| `MARTINGALE` vs `η̂/ω`, exponential (`tte_exponential_ebe`, 30 subjects) | 8.9e-12 |
+| `MARTINGALE` vs NONMEM `DV − CHZ`, same | 5.5e-9 |
+| `MARTINGALE` vs NONMEM `DV − CHZ`, joint PK-TTE (`pktte_ebe`, η on CL, exact-derivative walk) | 3.9e-9 |
+| per-subject `Σ MARTINGALE` vs `η̂/ω`, RTTE clock-forward / clock-reset (100 subjects) | 8.4e-11 / 8.4e-11 |
+
+Measured on Linux aarch64 at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-11 for the joint model; macOS arm64 agrees to every digit shown. The inner η-gradient is exact, which is why the identities hold to ~1e-11. Test: `tests/tte_residuals_nonmem_anchor.rs`.
+
+### Simulation-based npde
+
+With `[fit_options] npde_nsim > 0` a single-event record also gets a simulation-based score ([\#1889](https://github.com/FeRx-NLME/ferx-core/issues/1889)), written to the `NPDE` and `NPD` columns of its sdtab row. It differs from `PIT` in what it conditions on: `PIT` is the survival at the subject’s EBE, the npde scores the record against the **population** predictive distribution, with η drawn from Ω, so it does not inherit the EBE’s shrinkage.
+
+With `F̂(y)` the fraction of the `K` simulated replicates of the subject that have an event before `y`, an observed event at `t` has `pd = F̂(t)`, and a time right-censored at `c` has `pd` drawn uniformly between `F̂(c)` and 1. `NPDE = Φ⁻¹(pd)` after the `[1/(2K), 1 − 1/(2K)]` clamp. An event earlier than predicted is negative. No simulated time is ranked: only the count of events before `y` enters, so a replicate with no event (censored at the simulation horizon, a cure-fraction draw, a failed solve) is “not before `y`” and never a number in the empirical distribution.
+
+The censored rule is the one the R `npde` package applies to censored data (`cens.method = "cdf"`), mirrored to right censoring. The censored score is imputed on `pd`, not as a time: drawing η from Ω and then a time past `c` given that η would skip the weighting of η by `S(c | η)`.
+
+Under a correct model the scores are N(0, 1) when censoring is independent of the event time given the model, the assumption the likelihood makes. `NPDE = NPD` for a single event. The post-fit function is `stats::npde::compute_tte_npde`; with the fitted parameters (`fitted_params_from_result`) and the recorded `npde_seed` it reproduces the stored cells.
+
+Not scored: a repeated-events endpoint, competing risks, left truncation, an interval-censored record, more than one record per subject on the endpoint. At fit time the cells stay blank and the fit carries one `W_NPDE_TTE_SKIPPED` warning quoting the reason; `compute_tte_npde` returns `E_NPDE_TTE_INPUT`.
+
+#### Validation of the npde
+
+NONMEM has no npde for event times, so there is no NONMEM run to compare with. The checks are a closed form, a distribution test and the R `npde` package (CRAN 3.5).
+
+| Check | Result |
+|----|----|
+| Event `pd` vs `1 − exp(−λt)`, no random effect, K = 20,000 | worst error 1.7e-3 (bound: 4 Monte-Carlo SD) |
+| Event `pd` vs quadrature `F(3) = 0.27751`, `F(8) = 0.55678` (λ = 0.1, ω² = 0.25) | errors 2.2e-3, 3.8e-3 (0.7 and 1.1 SD) |
+| 20 subjects all censored where `F(c) = 0.95` | every `pd ≥ 0.9495` |
+| KS distance of `pd` from U(0, 1), N = 1000, 71 % censored by independent dropout, K = 1000 | 0.0196 under the true model, 0.1265 under a hazard twice too large (0.1 % critical value 0.0616) |
+| Kernel vs R `npde` 3.5 on R’s own simulated times (40 subjects, K = 200, one common censoring time) | event `pd`: 5.6e-17; event `npde`: 2.1e-9; censored `F̂(c)`: 5.6e-17 |
+| Constant hazard through the ODE engine, joint PK-TTE subjects, K = 2,000 | worst error 5.3e-3 (bound: 4 SD) |
+| `fit()` cells vs `compute_tte_npde` after the fit (25 scored records, correlated Ω block rebuilt by `fitted_params_from_result`) | bit-equal |
+
+A replicate with no event (a cure-fraction draw, a failed event-time solve) stays in the denominator. `compute_tte_npde` returns the simulator’s warning for it once per warning code, with the number raised over the replicates. A fit keeps only the failed solves (`W_TTE_SOLVE_FAILED`, worded as reference replicates): a replicate that never has an event is what a cure-fraction hazard draws, and is not reported on the fit.
+
+The R package is a reference for less than it looks. It has no time-to-event mode; it is fed `−T`, with right censoring as left censoring. That is exact for event rows and for **one common censoring time**: with per-subject censoring times the package applies one limit, the smallest censored value, to every subject. So the committed R reference (`tests/fixtures/npde_tte_reference/`) censors administratively at a single time, and per-subject censoring rests on the closed-form row and the KS row above. R scores `−T`, so its sign is the opposite of the one here. The numbers are statistics of seeded simulations on macOS arm64, not fit results. Tests: `src/stats/npde_tte_tests.rs`, `tests/npde_tte_fit.rs`.
+
+## Kaplan–Meier VPC
+
+`vpc_tte()` checks a fitted single-event TTE model against its data. It simulates `n_sim` replicates of the observed design in one simulator call (it never refits). Then it returns the observed Kaplan–Meier curve beside the pointwise band of the replicate curves, per stratum.
+
+``` rust
+let opts = VpcTteOptions {
+    n_sim: 500,
+    stratify: VpcStratify::Covariate("SEX".into()),
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_tte(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid, s.obs_on_grid, s.lo / s.med / s.hi, s.n_used, s.observed (KmCurve)
+}
+```
+
+Each stratum carries the observed curve with its Nelson–Aalen cumulative hazard (`observed`: time, number at risk, events, censorings, survival, cumulative hazard), the grid, the observed curve read on the grid, the band, and how many replicates are still under follow-up at each grid time. The defaults are 200 replicates, a 5 %–95 % band with the median, the automatic grid, observed censoring and no strata.
+
+### The curve and the band
+
+The curve uses R `survival::survfit`’s tie convention: at a tied time, events count before censorings, so the subjects censored at that time are still in the risk set of its events. `ferx_core::stats::km::kaplan_meier` computes it. The band at each grid time is R’s default quantile (type 7, the one `vpc::vpc_tte` uses) over the replicate curves still defined there. A replicate past its last follow-up time is left out, also when its curve has reached zero; it is not counted as 0 or 1. Counting it as 0 would put a point mass at 0 into the band, so once enough replicates had reached zero the lower edge would sit at 0, the observed curve could never fall below it and the misses would all fall above (#2930). The observed curve follows the same rule: past its last time it is undefined. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1` (19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one curve, so its quantile is only an interpolation between the two most extreme values. So `n_sim` must be at least one more than that, 20 for the default band.
+
+The automatic grid is 0, the stratum’s observed times and 101 evenly spaced points up to the horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of every replicate curve, which gives exact step ribbons on a large grid.
+
+### Censoring in the replicates
+
+The simulator censors a right-censored record at its own time and draws an event record unbounded, and a horizon replaces every record’s window. So `vpc_tte()` simulates to `H` (`sim.horizon`, or the latest time recorded on the endpoint) and then, under the default `VpcCensoring::Observed`, gives each subject a censoring time: a draw after it becomes a censoring there. A subject observed censored keeps its own time. A subject observed with an event was never seen censored, only known to be censored later than its event time, so it draws a censoring time from the reverse Kaplan–Meier curve of the observed censorings in its own stratum, conditional on exceeding its event time (`H` if no censoring is left past it). Every subject’s replicate censoring time then has its stratum’s censoring distribution, so the replicates are exchangeable with the data when censoring is independent of the event time within a stratum. Keeping `H` for event subjects, the common administrative-end shortcut, censors the replicates too little: with 45 % censored the band covered the data in 85.5 % of datasets at 3H/4 for a nominal 90 %, against 91 % with the draw. A horizon below a subject’s censoring time wins. `VpcCensoring::Horizon` censors every replicate at `H` only. The draws are seeded by `sim.seed`.
+
+The observed data are read on `[0, H]` only, as `vpc_rtte()` reads its streams: a record after `H` becomes a censoring at `H`, and an event exactly at `H` is kept. So a `sim.horizon` below the data’s follow-up gives exactly the result of calling `vpc_tte()` on the data cut at `H` first. At every time up to `H` the curve and its band are the same either way. What changes: the raw `observed` curve now ends at `H` instead of running past the band; the observed value at a `VpcGrid::Times` point past `H` is now empty; and the automatic grids can gain the point `H` itself, because the observed curve now steps there ([\#2950](https://github.com/FeRx-NLME/ferx-core/issues/2950)). With `sim.horizon` unset nothing is cut.
+
+`VpcStratify::Covariate(name)` groups subjects by the exact covariate value at their first record, up to 10 values; bin a continuous covariate first. `VpcStratify::Dose` groups by the first dose’s amount.
+
+### Repeated events
+
+`vpc_rtte()` is the same check for a repeated-events endpoint (`type = rtte`). It takes the options of `vpc_tte()` plus `max_order`, and returns three families of curves per stratum, each an observed curve beside the band of the same curve over the replicates.
+
+``` rust
+let opts = VpcRtteOptions {
+    n_sim: 500,
+    max_order: Some(3),
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_rtte(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.mcf       the mean cumulative function (observed: McfCurve)
+    // s.absolute  Kaplan–Meier by event order on absolute time, orders 1..=3
+    // s.gap       Kaplan–Meier by event order on gap time, orders 2..=3
+}
+```
+
+Every curve carries `grid`, `obs_on_grid`, `lo`, `med`, `hi` and `n_used` as a `vpc_tte()` stratum does, with the same band rule, grids and strata.
+
+#### The three curves
+
+A subject’s follow-up ends at the time of its last record on the endpoint, an event or a censoring. A censoring row that is not the last record does not end follow-up.
+
+- **Mean cumulative function (MCF).** The expected number of events per subject by time `t`, estimated as the Nelson–Aalen sum `Σ d(s) / Y(s)`: `d(s)` counts all events at `s` and `Y(s)` the subjects still under follow-up at `s`, whatever number of events they have had. A subject with no event counts in `Y` until its follow-up ends. `ferx_core::stats::km::mean_cumulative` computes it.
+- **Absolute time, order `k`.** The Kaplan–Meier curve of the time to the `k`-th event, censored at the end of follow-up for a subject with fewer than `k` events. It is the probability of fewer than `k` events by `t`. Every subject is in it.
+- **Gap time, order `k`.** The Kaplan–Meier curve of the time from the `(k − 1)`-th event to the `k`-th, among the subjects that had `k − 1` events, censored at the time left until the end of follow-up. Gap order 1 is absolute order 1, so the gap curves start at order 2.
+
+Ties follow the same convention as the single-event curve. Two events at one time in one subject both count in the MCF, step the absolute curves of two consecutive orders at the same time, and give a gap of 0. An event at the very end of follow-up counts with the subject still at risk, and the next order’s gap is then censored at 0.
+
+`max_order` is the highest order `K`: absolute orders 1 to `K` and gap orders 2 to `K`. Left unset, it is the largest `k` for which at least 10 observed subjects, counted across all strata, have `k` or more events (at least 1). One `K` applies to every stratum, so a small stratum can show an order few of its own subjects reached; each curve’s `n_subjects` says how many. A gap order that no observed subject in a stratum reached comes back with an empty observed curve and an empty band.
+
+#### Reading a gap-time band
+
+A gap-time curve of order 2 or higher is **not** an estimate of the gap-time distribution. Its subjects are selected by having had `k − 1` events, and the follow-up they have left depends on how long their earlier gaps were, so subjects with short gaps are over-represented and long gaps are censored more often. The band is the distribution, over the replicates, of the same statistic computed the same way: the Kaplan–Meier curve of the `k`-th gap among that replicate’s subjects that reached `k − 1` events. Those are different subjects in each replicate. The observed curve and the replicates carry the same selection, so comparing them is a valid predictive check, and a model that fits should have its observed curve inside the band. A replicate in which no subject reached `k − 1` events has no curve; it is left out of the band and `n_used` shows it.
+
+#### Follow-up of the replicates
+
+The simulator regenerates one event stream per subject per replicate and follows every subject to the horizon `H` (`sim.horizon`, or the latest time recorded on the endpoint). The data usually have subjects leaving earlier. A band from replicates all followed to `H` has more subjects at risk late than the data had, and is too narrow there. Under the default `VpcCensoring::Observed`, each replicate subject is therefore cut at its own observed follow-up end: its simulated events after that time are dropped and its follow-up ends there, or at `H` when `H` is earlier. A recurrent subject’s follow-up end is always observed, so, unlike the single-event VPC, no censoring time has to be drawn. `VpcCensoring::Horizon` follows every replicate subject to `H`.
+
+The observed curves are cut at `H` the same way, before anything is computed from them: a subject’s events after `H` are dropped, an event exactly at `H` is kept, and its follow-up ends at `H` when it went on longer. So `sim.horizon = H` below the data’s own follow-up gives exactly the result of calling `vpc_rtte()` on the data cut at `H` first: every curve, the default `max_order` and the warnings. Without the cut, a gap-time risk set would count events the replicates cannot have, and the misses of an observed gap-time curve would fall almost all above its band ([\#2908](https://github.com/FeRx-NLME/ferx-core/issues/2908)). With `sim.horizon` unset, `H` is the latest follow-up end and nothing is cut. `vpc_tte()` cuts its records at `H` the same way ([Censoring in the replicates](#censoring-in-the-replicates)).
+
+When a subject’s last record is an event, its follow-up ends at that event: the data say nothing later about it. The observed subject then has an event exactly at its follow-up end, which a replicate almost never has. The usual layout, one censoring row closing each subject, does not have this. The result’s `warnings` carry `W_VPC_RTTE_ENDS_ON_EVENT` with the number of such subjects, counted on the data cut at `H`: a subject followed past `H` ends at `H` on no event, whatever its last record was.
+
+#### Validation of the repeated-events curves
+
+NONMEM has no Kaplan–Meier or MCF estimator, so R’s `survfit` is the external reference here too. `tests/rtte_survfit_reference.rs` runs `vpc_rtte()` on 80 subjects in two strata with whole-unit times (13 with no event, 19 with an event at their follow-up end) and matches survfit 3.8.12 row for row: the MCF against the cumulative hazard of the counting-process fit, exactly, and the absolute curves of orders 1 to 3 and the gap curves of orders 2 and 3 within 1.1e-16. survfit cannot express two events at one time in one subject, so that case is pinned by its exact closed form instead.
+
+| Reference | Fixture | Agreement |
+|----|----|----|
+| `survival::survfit` 3.8.12 | `tests/fixtures/rtte_survfit` (80 subjects, 2 strata) | MCF exact; absolute orders 1–3 and gap orders 2–3 within 1.1e-16 (`tests/rtte_survfit_reference.rs`) |
+| `reda::mcf` 0.5.6 | the same fixture | MCF within 4.4e-16, with `numRisk` equal to ferx’s at-risk count on all 40 rows |
+| `reda::mcf` 0.5.6 | `r2()` in `src/stats/km_tests.rs`, also used by `vpc_rtte_tests.rs` T7: two events at time 5 in one subject, the layout survfit refuses | `MCF(5) = 37/30` and `MCF(8) = 19/10` exactly, the closed form ferx is pinned to |
+
+reda refuses an event at a subject’s follow-up end `cᵢ` (19 subjects in the survfit fixture, 2 of the 6 in `r2()`), so for reda each such subject gets a censoring appended at `cᵢ + ε`. The two layouts give the same MCF: for `t ≤ cᵢ` the subject is at risk under both, and on `(cᵢ, cᵢ + ε]` it is at risk only under reda’s, but every time in both fixtures is a whole number and `ε < 1`, so no event falls in that interval. The extra rows reda reports at the `cᵢ + ε` are dropped by matching on ferx’s times; `ε = 0.5` and `ε = 1e-9` give identical results on both fixtures. reda also refuses a censoring that is not a subject’s last record when an event follows it. ferx accepts that layout, so it is not compared. Neither reda comparison is a committed test.
+
+##### Against `vpc::vpc_tte`
+
+**`vpc::vpc_tte(rtte = TRUE)` is a reference only in its default gap mode, from vpc 1.3.8.** Its Kaplan–Meier step is survfit itself; what differs is which rows it builds for “order `k`”. Up to 1.3.7 its default gap mode (`rtte_calc_diff = TRUE`) sorted each subject’s intervals by length before numbering them, so “order `k`” was the `k`-th *shortest* interval ([ronkeizer/vpc#127](https://github.com/ronkeizer/vpc/issues/127)), and its other two modes failed unless the data had a column named `t` ([ronkeizer/vpc#128](https://github.com/ronkeizer/vpc/issues/128)). Both are fixed in vpc 1.3.8 (master `aeba2e1`, 2026-11-14). On the fixture above, 1.3.8’s gap mode now equals ferx’s gap curves of orders 2 and 3 within 5.6e-17 at every time, and its order 1 equals ferx’s absolute order 1 within 5.6e-17 (1.2.4 was off by 0.22 and 0.25). Its gaps are the intervals between consecutive records, so one difference remains by definition: a subject whose last record is an event has no record `k + 1` and is left out of gap order `k + 1`, where ferx keeps it, censored at gap 0. On the survfit fixture that changes no value of S. On `r2()`, where one subject has two events at time 5, it does: gap order 3 has S(0) = 1/2 in vpc 1.3.8 and 2/3 in ferx. The two other modes are unchanged in 1.3.8 and are **not** ferx’s curve. With `rtte_calc_diff = FALSE` order `k` keeps only the subjects with at least `k` records: a subject with fewer events drops out instead of being censored at its follow-up end, and so does one with exactly `k − 1` events whose last record is an event (up to 0.34 at orders 2 and 3). With `rtte_conditional = FALSE` one subject enters the risk set up to `k` times, so the curve is not a Kaplan–Meier estimate of the time to the `k`-th event. That construction reproduces vpc’s curves exactly for stratum A of the fixture (7 orders), but not for stratum B (12 orders): stratified, B is off by 0.69 even at order 1, while B run alone matches at order 1 exactly; 1.3.8 gives the same numbers. That cause is not traced; labels with two-digit orders are suspected. A VPC drawn by vpc’s own RTTE mode therefore overlays `vpc_rtte()`’s curves only in gap mode with vpc ≥ 1.3.8, and only up to the gap-0 difference above. Every difference that is traced is in vpc’s row construction, not in either Kaplan–Meier step.
+
+##### Band self-consistency
+
+The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.rs`. 200 datasets are drawn outside the simulator from a Poisson process with between-subject variability, about 80 % of subjects leaving before `H`, and each gets a 200-replicate VPC. The observed MCF lies inside its 5 %–95 % band in 89 %, 89 % and 92 % of datasets at H/4, H/2 and 3H/4, and the observed order-2 absolute curve in 89 %, 85 % and 92.5 %. A 5 %–95 % band read from 200 replicates covers an exchangeable observation 89.1 % of the time, not 90 %, and these are inside the 99 % binomial interval around that (83 %–94.5 %). Following every replicate subject to `H` instead takes the order-2 curve to 79 % and 82 % at H/2 and 3H/4, out of it.
+
+### Kaplan–Meier mean covariate
+
+`vpc_kmmc()` checks whether a model captures how a covariate drives the hazard. At every step of the Kaplan–Meier curve it takes the mean of one baseline covariate over the subjects still at risk, in the data and in each replicate, and returns the observed curve beside the band of the replicate curves, per stratum (Hooker & Karlsson, PAGE 21 (2012) Abstr 2564; Xpose 4’s `kaplan.plot(cov = )` and PsN `vpc -tte` draw the same plot). It is for a single-event endpoint.
+
+``` rust
+let mut opts = VpcKmmcOptions::new("WT");
+opts.vpc.n_sim = 500;
+opts.vpc.sim = SimulateOptions { seed: Some(1), ..Default::default() };
+let vpc = vpc_kmmc(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid, s.obs_on_grid, s.lo / s.med / s.hi, s.n_used, s.observed (KmmcCurve)
+}
+```
+
+`opts.vpc` holds every `vpc_tte()` option: replicates, band, grid, censoring, strata, `cmt` and the simulator options. `level: Some(v)` turns the mean into the share of at-risk subjects whose value equals `v`, for a multi-level code such as an arm, where a mean of codes means nothing. For a 0/1 covariate the mean already is the share coded 1. `min_at_risk` (default 10) leaves a curve undefined where fewer subjects are at risk.
+
+#### The curve
+
+The covariate is each subject’s baseline value, its first non-missing value, the one strata read. At time `t` the curve is the mean of that value over the subjects whose time is `t` or later: the Kaplan–Meier risk set, with the same tie convention, so a subject censored at a tied time is still in it. `ferx_core::stats::km::kaplan_meier_mean_covariate` computes it, one row per row of the Kaplan–Meier curve. Read at a time, the curve takes the set at risk *at* that time: the value of the first row at or after it. Before the first row it is the mean over everyone, and past the last time it is undefined. A step plot of the rows therefore steps just after each row’s time. At an event time, Xpose 4’s `kaplan.plot` plots the value just after the step, the same function seen from the right. At a time with only censorings its observed curve carries the previous value, while its simulated curve takes the set at that time, so its two curves differ there; ferx applies the one rule to both.
+
+The floor applies to the observed curve and to each replicate on its own: a replicate with too few subjects at risk at a grid time is left out of the band there, and `n_used` shows how many remain. Applying it only where the observed curve is defined would select datasets and break the comparison.
+
+A covariate that changes within a subject is not refused. The curve uses each subject’s first value, and the result’s `warnings` carry `W_VPC_KMMC_TIME_VARYING_COVARIATE` with the number of subjects it changes in. The mean of a time-varying value at the risk time is a planned follow-up.
+
+#### Censoring of the replicates
+
+The replicates reuse the observed population, so every replicate subject keeps its covariate. Under the default `VpcCensoring::Observed`, **every** replicate subject draws its censoring time from its own stratum’s reverse Kaplan–Meier censoring distribution, whether it was observed censored or with an event. This differs from `vpc_tte()`, where a subject observed censored keeps its own time. Censored subjects are the ones that outlasted their censoring time, so they lean towards a low hazard. Keeping their exact times removes the same covariate values from the risk set at the same times in every replicate as in the data, and the band hugs the observed curve. In a prototype outside ferx (200 datasets, 200 replicates, a band that should cover 89.1 %), the kept times covered 95 % and 95.5 % at H/2 and 3H/4, and up to 98.5 % for a binary covariate, while the Kaplan–Meier band on the same data covered 88.5 %–90.5 %. Drawing every subject’s time gave 89 % and 92.5 %. The draw assumes what the censoring distribution already assumes: within a stratum, censoring does not depend on the covariate. Stratify on what drives dropout. `VpcCensoring::Horizon` follows every replicate subject to `H`.
+
+The observed data are read on `[0, H]` only, by the same rule as `vpc_tte()`’s ([Censoring in the replicates](#censoring-in-the-replicates)): a record after `H` becomes a censoring at `H`, and an event exactly at `H` is kept. So a `sim.horizon` below the data’s follow-up gives exactly the result of calling `vpc_kmmc()` on the data cut at `H` first. Although every replicate subject draws from the censoring distribution from time 0, the band does not move: the distribution below `H` depends only on who is still followed before `H`, which the cut leaves alone, and a draw at or past `H` censors nothing. Measured on 24 configurations (two horizons, with and without strata, both censorings, all three grids), every band cell and every observed value up to `H` was bit-identical with the records cut or not. What changes is the raw `observed` curve, which now ends at `H` instead of running past the band, and the observed value at a `VpcGrid::Times` point past `H`, which is now empty ([\#2955](https://github.com/FeRx-NLME/ferx-core/issues/2955)). With `sim.horizon` unset nothing is cut.
+
+#### Reading it
+
+At `t = 0` every subject is at risk in the data and in every replicate, so the observed value, `lo`, `med` and `hi` are all the population mean and the band has width 0. A gap there is impossible, and agreement there says nothing. The signal is **who stays at risk**: as subjects have their events or drop out, the mean drifts. If a higher value raises the hazard, those subjects leave first and the mean falls; a model without that effect has replicates whose mean stays near the start, and the observed curve leaves the band. The check can see what the Kaplan–Meier VPC cannot: for a binary covariate with its effect left out and the overall rate matched, the Kaplan–Meier band still covered 88.5 % of datasets in the prototype, while the mean-covariate band covered only 49.5 %.
+
+Stratifying on the covariate itself is refused, since the mean is then constant in each stratum.
+
+#### Validation of the mean-covariate curve
+
+NONMEM has no Kaplan–Meier estimator, so there is no NONMEM spelling of this curve either. The reference is the risk sets of R’s `survfit` 3.8.12 with the mean taken in R: `tests/kmmc_survfit_reference.rs` runs the kernel and `vpc_kmmc()`, stratified, on 120 subjects in two strata with a weight and a 0/1 sex (15 rows with tied events, 12 with an event and a censoring at one time) and matches every row: the counts exactly, the means within 2.2e-14 (about one unit in the last place of a weight mean near 71). The R means agree with exact fractions to 1.25e-16 relative.
+
+`tests/vpc_kmmc_self_consistency.rs` draws 200 datasets outside the simulator (100 subjects, a normal covariate with log hazard ratio 0.7, uniform dropout, `H = 30`) and runs a 200-replicate VPC of each. Under the data’s own model the observed curve lies inside the band in 90.5 %, 92 % and 91.5 % of datasets at H/4, 3H/8 and H/2, inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band from 200 replicates covers. Under a model without the covariate effect, with the overall rate matched, it lies outside in 82 % of datasets at H/4 (81.5 % and 79 % later), while the Kaplan–Meier band of that model still covers 84 % at H/4.
+
+### Cumulative incidence (competing risks)
+
+`vpc_cif()` checks a competing-risks model. Every TTE endpoint of the model is a cause. Per stratum it returns the observed cumulative incidence of each cause and the observed all-cause Kaplan–Meier curve, each beside the pointwise band of the replicate curves. It is the nonparametric counterpart of the cumulative incidence `predict_survival()` reports for a fitted model ([Competing risks](#competing-risks-cause-specific-hazards)).
+
+``` rust
+let opts = VpcCifOptions {
+    n_sim: 500,
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_cif(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid; s.survival and s.causes[k].band: obs_on_grid, lo / med / hi, n_used;
+    // s.causes[k].cmt; s.observed (CifCurve: all_cause KmCurve, n_event, cif)
+}
+```
+
+The options are `vpc_tte()`’s without `cmt`: replicates, band probabilities, grid, censoring, strata and the simulator options. `vpc.cmts` lists the causes in ascending order, and `s.causes[k]` and `s.observed.cif[k]` follow it.
+
+#### The curves
+
+The cumulative incidence of cause `k` is the Aalen–Johansen estimate
+
+`F_k(t) = Σ_{t_j ≤ t} (S(t_j⁻) − S(t_j)) · d_kj / d_j`,
+
+where `S` is the all-cause Kaplan–Meier curve, `d_kj` the cause-`k` events at `t_j` and `d_j` the events of any cause there. Each drop of the all-cause curve is split among the causes in proportion to their events, the same split the parametric cumulative incidence uses. `S` is built by the Kaplan–Meier code `vpc_tte()` uses, so the rows and the tie convention are survfit’s. At every time the observed `F_1 + … + F_K + S = 1`.
+
+This is not `1 − KM` of one cause with the other causes treated as censorings. That curve estimates the incidence in a world without the other causes and overstates it: on the survfit fixture below (stratum B, the first cause) it ends at 0.750 where the cumulative incidence ends at 0.375. It is also why `vpc_tte()` and `vpc_kmmc()` refuse several TTE endpoints without a `cmt`.
+
+The bands are pointwise, cause by cause. A band’s median or limits at a time need not add up across causes, so a stacked plot (cumulative incidences on top of each other, survival on top) draws the observed curves, not the bands. A curve is read where its all-cause curve is defined: up to and including its last time, never past it, as for `vpc_tte()`.
+
+A model with a single TTE endpoint is accepted. Its cumulative incidence is `1 − KM`, and the result is `vpc_tte()`’s turned upside down: the same replicates, the same survival band bit for bit, and the cause band `1 − S` with the limits swapped.
+
+#### Censoring of the replicates
+
+The censoring is `vpc_tte()`’s ([Censoring in the replicates](#censoring-in-the-replicates)), on the all-cause time. Under `VpcCensoring::Observed` a subject observed censored for every cause keeps its own time, and a subject with an event on some cause draws a censoring time from its stratum’s reverse Kaplan–Meier curve, given that it exceeds the event time. A replicate’s first event past that time becomes a censoring there. A subject’s records on the other causes at its event time are competing events, not dropout, and never count as a censoring time. The draws are keyed by subject exactly as `vpc_tte()`’s, which is what makes the single-cause result equal. The data are read on `[0, H]` by the same cut. Like `vpc_tte()`, this assumes censoring is independent of the event within a stratum.
+
+Every subject with a cause record needs one record on **every** cause, all at the same time, with at most one of them an event. The simulator competes only the causes a subject has records on, so a subject with fewer would be simulated under fewer causes than the data imply; such a subject is refused, not skipped. A subject with no cause record at all (a PK-only subject in a joint model) is skipped.
+
+#### Reading it
+
+The cumulative incidences see what the all-cause curve cannot. A model can match the all-cause hazard while putting it on the wrong cause. In the self-consistency design below, replicates drawn with the two causes’ rates swapped leave the survival band covering as before, while the cause bands cover the observed incidence in under half the datasets.
+
+#### Validation of the cumulative-incidence curves
+
+NONMEM has no nonparametric cumulative-incidence estimator and no VPC, so there is no NONMEM run to anchor against. R’s `survfit` multi-state fit (`Surv(time, factor(cause))`) is the Aalen–Johansen estimator and the external reference. `tests/cif_survfit_reference.rs` matches survfit 3.8.12 row for row on 160 subjects in two strata with two causes (21 rows with more than one event, 11 with an event and a censoring at one time): the counts exactly, survival and both cumulative incidences within 2.2e-16. On seeded tied data the identities hold to rounding: `F = 1 − S` with one cause within 1.8e-15, and `ΣF + S = 1` with three causes within 5.6e-16.
+
+`tests/vpc_cif_self_consistency.rs` draws 200 datasets outside the simulator (100 subjects, two exponential causes with rates 0.06 and 0.04 under one shared frailty, uniform dropout, `H = 30`) and runs a 200-replicate VPC of each. Under the data’s own model the observed curves lie inside their bands at H/4, H/2 and 3H/4 in 88 %, 85 % and 87.4 % of datasets for the first cause, 90.5 %, 88.5 % and 86.9 % for the second, and 89 %, 87 % and 91.4 % for survival: all nine inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band from 200 replicates covers. With the causes’ rates swapped on the first 100 datasets, the cause bands cover only 4 % to 27 % while the survival band still covers 89.8 % to 93 %. Replacing the replicates’ estimator with `1 − KM` of each cause drops the first cause’s coverage to 75 %, 40.5 % and 11.6 %. The numbers are the same on Linux and macOS. Two datasets had nobody under follow-up at 3H/4 and are left out of that time.
+
+### What it refuses
+
+`vpc_tte()` returns `E_VPC_TTE_INPUT` rather than a wrong curve for: several TTE endpoints and no `cmt` (under competing risks, 1 − KM of one cause is not its cumulative incidence; with `cmt` set, the curve is that cause’s survival with the other causes as censoring; `vpc_cif()` draws the cumulative incidence of every cause); a repeated-events endpoint, which `vpc_rtte()` draws; left truncation; interval-censored records; more than one record per subject on the endpoint; too few replicates or invalid band probabilities; and a stratification covariate a subject lacks or that has more than 10 values.
+
+`vpc_rtte()` returns the same code for: several TTE endpoints and no `cmt`; a single-event endpoint, which `vpc_tte()` draws; left truncation (the simulator supports it for repeated events, but these risk sets have no delayed entry yet); interval-censored records; a subject’s records out of time order; `max_order = 0`; and the same replicate, probability and stratification checks.
+
+`vpc_kmmc()` returns the same code for everything `vpc_tte()` refuses, and also for: no covariate named (`VpcKmmcOptions::default()` leaves it empty); a repeated-events endpoint (a mean covariate by event order is not supported yet); a subject on the endpoint that lacks the covariate, or whose baseline value is missing; a `level` no subject has; and stratifying on the covariate itself.
+
+`vpc_cif()` returns the same code for: no TTE endpoint; a repeated-events endpoint (every cause must be single-event); a subject with records on some causes but not all; more than one record on a cause; a subject’s cause records at different times; events on two causes in one subject; left truncation; interval-censored records; and the same replicate, probability and stratification checks.
+
+Binned strata and left truncation are planned follow-ups.
+
+### Validation against survfit and by self-consistency
+
+NONMEM has no Kaplan–Meier estimator, so there is no NONMEM run to anchor against. R’s `survfit` is the external reference. `tests/km_survfit_reference.rs` matches survfit 3.8.12 row for row on 120 subjects in two strata with frequent ties: the counts exactly, survival within 1.1e-16 and the cumulative hazard exactly. The band is checked for self-consistency in `tests/vpc_tte_self_consistency.rs`. 200 datasets are drawn outside the simulator from the model, with about 45 % censored, and each gets a 200-replicate VPC. The observed curve then lies inside the 5 %–95 % band in 92.5 %, 89.5 % and 91 % of datasets at H/4, H/2 and 3H/4, inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band read from 200 replicates covers. Dropping the per-subject censoring takes the coverage at 3H/4 to 82 %, out of it.
+
+> **NOTE:**
+>
+> A degenerate draw is handled *per subject*, not by aborting the run: a non-positive / non-finite analytic hazard rate produces no event (the subject is censored), and an RTTE hazard so extreme it would fire more than a million times over the window has its stream skipped (also censored). For an ODE-accumulated (drug-driven) hazard, an event-time solve that fails, for example because an `[odes]` state diverged for that subject’s parameter draw, censors the subject at the observation window too. Under competing risks every cause of that subject is censored. The subject is not simulated past the failure, so its censoring overstates survival. Rather than let these look like ordinary censoring, the `simulate_with_options_diag` API returns a `SimulationOutput { results, warnings }` naming the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE` / `W_TTE_SOLVE_FAILED`); `ferx … --simulate` echoes them alongside the fit warnings. `W_TTE_DEGENERATE_HAZARD` is one line per subject and CMT for the whole run, in population order: it gives the number of replicates in which the subject ended censored because of the degenerate draw and names them (`sim` indices, or the uncertainty draws under `simulate_with_uncertainty_diag`). The plain `simulate()` / `simulate_with_seed()` / `simulate_with_options()` entry points apply the same per-subject handling but return only the rows.
+
+    [simulation]
+      n_subjects = 200
+      horizon    = 20
+      seed       = 33
+
+The sampler is validated four ways (all in `tests/tte_convergence.rs` except the last):
+
+- *Analytic count law (Tier-1, exact).* For a constant hazard the stream is a homogeneous Poisson process, so `N(T) ~ Poisson(λT)`; for clock-forward Weibull it is non-homogeneous with `N(T) ~ Poisson(H(T))`. The simulated counts match these exact laws.
+
+- *Goodness-of-fit (PIT/KS, estimation-free).* By the time-rescaling theorem the rescaled inter-event increments `H(t_k) − H(t_{k−1})` are iid `Exp(1)` under correct sampling; a Kolmogorov–Smirnov test of `V_k = exp(−ΔH_k)` against Uniform(0,1) passes (D ≈ 0.018), confirming the conditional forward draws reproduce `H(t)`.
+
+- *Frailty variance (method of moments, estimation-free).* The simulated event counts imply `Var(log λ_i) = ω²`; at a well-identified design (≈31 events/subject) the read is `ω² = 0.092` against the injected `0.09`.
+
+- *Cross-tool anchor (NONMEM, external).* ferx *simulated* `tests/reference/rtte_exponential_sim/rtte_sim.csv` (300 subjects; truth `TVLAMBDA = 0.15`, `ω² = 0.09`); ferx **and NONMEM** then both *fit* it:
+
+  | Engine | Method  | TVLAMBDA | ω²(log rate) |      OFV |
+  |--------|---------|---------:|-------------:|---------:|
+  | NONMEM | LAPLACE |  0.15617 |      0.12801 | 5557.266 |
+  | ferx   | FOCEI   |  0.15619 |      0.12794 | 5557.266 |
+
+  An independent engine recovering the same parameters from ferx-simulated data is the external corroboration that the simulator is correct. Both land at ω² ≈ 0.128 (above the data-generating 0.09) because this single 300-subject realization is over-dispersed — a Monte-Carlo property of the drawn dataset, not the sampler, whose true injected variance the method-of-moments check pins at 0.09. Full write-up in `tests/reference/rtte_exponential_sim/expected.md`.
+
+## Comparison with reference software
+
+The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv` (100 subjects; data-generating λ=0.1 h⁻¹, ω²=0.25 on log-rate; right-censored at t=24 → 82 events, 18% censored). All tools fit the same file.
+
+**Fixed-effects (no random effect) — exact, license-free anchor.** A censored exponential MLE is the closed form λ = events/Σtime, so a ferx `n_eta=0` fit must match base-R `survival::survreg` exactly:
+
+| Quantity       | ferx (fixed) | `survreg` | agreement      |
+|----------------|--------------|-----------|----------------|
+| λ (rate)       | 0.074506     | 0.074506  | exact (\<1e‑4) |
+| OFV / −2logLik | 589.888      | 589.888   | exact          |
+
+This confirms ferx’s TTE hazard, censoring, and likelihood **constants** are correct.
+
+**Mixed-effects (frailty) — FOCEI.** ferx recovers the data-generating truth under a clean large-N simulation–estimation check (N=2000): λ_pop = 0.099 (−1%), ω² = 0.232 (−7%). The small ω² shortfall is the expected mild FOCEI-Laplace bias for TTE (it grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:
+
+| Parameter       | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM (LAPLACIAN) |
+|-----------------|------|------------|---------------|--------------------|
+| TVLAMBDA (rate) | 0.10 | 0.0768     | 0.0770        | 0.0771             |
+| ω²(ETA_LAMBDA)  | 0.25 | 0.290      | 0.293         | 0.286              |
+| OFV (−2LL)      | —    | 588.93     | 588.94        | 588.93             |
+
+ferx and **nlmixr2** FOCEI agree to ~3 digits on all parameters and the −2LL for all three families (Weibull and Gompertz likewise — see `tests/reference/tte_*/expected.md`), **including the nonlinear-frailty Weibull `omega^2`**: ferx 0.176, nlmixr2 0.173, NONMEM LAPLACIAN 0.175. Earlier ferx read 0.204 there — not a likelihood difference but a derivative-free outer-optimizer artifact: on the near-flat ω² ridge (the whole 0.175→0.204 span is \<0.01 OFV) BOBYQA’s `ftol_rel` default stopped it short of ferx’s own profile minimum, which already sat at ~0.175. Tightening the TTE outer `ftol_rel` to `1e-8` (#469; auto-applied to pure-TTE models, whose hazard objective is exact) lands it on the consensus. This is separate from the FOCEI-Laplace *method* bias above (the large-N Weibull SSE still over-estimates the shape frailty, ~0.34 vs a true 0.20 — that is \#440, unchanged by the optimizer fix).
+
+> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The NONMEM frailty column is from `nonmem_frailty.ctl` (`CONDITIONAL LAPLACIAN INTERACTION`). Two NONMEM gotchas for `F_FLAG=1` likelihood models: a dummy `$SIGMA 1 FIX` is required **and must be referenced** (`DUMMY = EPS(1)`) or NM-TRAN infers single-subject data and rejects `CONDITIONAL`; and `NUMERICAL SLOW` are required with `LAPLACIAN INTERACTION`. All three tools agree on the linear-frailty exponential (λ within 0.4%, ω² within ~2%, identical −2LL). **Gompertz** (fixed-effects) also matches NONMEM to OFV 3011.12. nlmixr2’s OFV constants differ (§11.3) — compare parameters.
+
+### nlmixr2 equivalent
+
+``` r
+m <- function() {
+  ini({
+    TVLAMBDA <- 0.05
+    eta.lambda ~ 0.09
+  })
+  model({
+    lambda <- TVLAMBDA * exp(eta.lambda)
+    ll(time.to.event) ~ event * log(lambda) - lambda * time.to.event
+  })
+}
+fit <- nlmixr(m, data, est = "focei")
+```
+
+### NONMEM equivalent
+
+    $ESTIMATION METHOD=LAPLACIAN INTERACTION MAXEVAL=500
+    $THETA (0.001, 0.05, 10)
+    $OMEGA 0.09
+
+### Weibull and Gompertz
+
+The same validation kit exists for Weibull (`tests/reference/tte_weibull/`) and Gompertz (`tests/reference/tte_gompertz/`). Highlights:
+
+- **Weibull** fixed-effects fit matches `survreg` exactly (scale 22.18, shape 2.12); the 300-subject **Gompertz** RCT fixed-effects fit recovers `log_alpha`, `log_gamma` and the treatment `log_hr` essentially exactly, exercising the `[event_model]` covariate + `loghr` term.
+
+> **Choosing an estimator for frailty TTE.** When a random effect sits on a *nonlinear* hazard parameter (e.g. the Weibull **shape** or Gompertz **growth rate**, not the exponential rate), FOCEI-Laplace **over-estimates** the frailty variance `omega^2` — a clean large-N simulation–estimation check recovers the structural parameters but inflates `omega^2` (Weibull shape: 0.34 vs a true 0.20), while a SAEM fit of the same data reads lower (~0.13). This is an approximation limitation, not a likelihood error (fixed-effects fits match `survreg` exactly), and it is a property of the *method*, not of any one tool: a three-tool cross-check on the n=100 Weibull file has **ferx FOCEI (ω² 0.176), nlmixr2 FOCEI (0.173) and NONMEM LAPLACIAN (0.175) all in agreement** (structural params and −2LL match too, ≤0.5% / identical OFV). (ferx read 0.204 here before \#469 — a derivative-free outer-optimizer convergence artifact on the flat ω² ridge, since fixed; it is unrelated to the method bias, which shows in the large-N SSE above.) Prefer **SAEM/IMP** for frailty TTE on nonlinear parameters, as in the standard pharmacometric guidance; FOCEI on a *linear* rate (exponential) is near-unbiased and all three tools agree there (ω² 0.286–0.293).
+
+### Joint PK-TTE — fit and simulation
+
+The drug-driven joint model is anchored against NONMEM and nlmixr2 on a shared dataset (`tests/reference/pktte_joint/`, N=120; oral 1-cpt PK + `h = H0·exp(BETA·Cc)`).
+
+**Fit.** All three tools recover the PK fixed effects and variance components closely:
+
+| Parameter | Truth | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACE |
+|-----------|------:|-----------:|--------------:|---------------:|
+| CL        |   1.0 |      1.039 |         1.026 |          1.031 |
+| V         |  10.0 |      9.879 |         9.946 |          9.897 |
+| KA        |   1.0 |      0.978 |         0.994 |          0.980 |
+| ω²(CL)    |  0.09 |      0.083 |         0.080 |          0.081 |
+| H0        | 0.015 |     0.0145 |        0.0210 |         0.0149 |
+| BETA      |  0.25 |      0.256 |         0.201 |          0.251 |
+
+The baseline hazard `H0` and the exposure slope `BETA` are **collinear** — `H0·exp(BETA·Cc)` trades baseline against slope over the narrow single-occasion concentration range. ferx and NONMEM (both truth-started) sit near truth; nlmixr2 lands at the other end of the *same* flat ridge — all valid optima of an under-determined likelihood, with corr(H0, BETA) = −0.93 (ferx) / −0.91 (NONMEM). So the PK block is the cross-tool agreement check; `H0` and `BETA` are jointly, not individually, identified. (The objective value is not cross-tool comparable here — different `F_FLAG` likelihood normalization — so compare ΔOFV between nested models, not absolutes.)
+
+**Simulation.** ferx’s `simulate()` event-time distribution is validated two ways (`tests/reference/pktte_joint_sim/`):
+
+- *Goodness-of-fit (in-tree, license-free):* simulated event times, probability-integral- transformed against the model’s own survival via an **independent** integrator, pass a Kolmogorov–Smirnov test against Uniform(0,1) — D = 0.040 vs the 5% critical 0.061 at N=500, ≈ the value expected for an exactly-correct sampler. This is immune to the H0/BETA ridge (no estimation), so it is the decisive sampler check.
+- *Cross-tool (NONMEM `$SIM`):* ferx’s Kaplan–Meier survival matches NONMEM’s analytic marginal survival `mean_i exp(−CHZ_i(t))` to **max \|ΔS(t)\| = 0.044** across the horizon (N=500).
+
+## See also
+
+- `examples/tte_exponential.ferx` — minimal worked example
+- `data/tte_exponential.csv` — small dataset (30 subjects) used by the smoke tests
+- `tests/reference/tte_exponential/` — 100-subject validation dataset (`tte_exp.csv`), reference scripts (`simulate.R`, `survreg.R`, `nlmixr2.R`, `nonmem.ctl`), `README.md` (NONMEM/nlmixr2 hand-off) and `expected.md` (filled comparison)
+- `examples/pktte_joint.ferx` — joint PK-TTE worked example (drug-driven ODE hazard)
+- `tests/reference/pktte_joint/` — joint PK-TTE **fit** anchor (ferx / NONMEM / nlmixr2)
+- `tests/reference/pktte_joint_sim/` — joint PK-TTE **simulation** anchor (ferx vs NONMEM `$SIM`: `make_template.py`, `sim.ctl`, `compare.R`, `expected.md`)
+- `tests/tte_smoke.rs` — Tier-2 parse and short-run smoke tests
+- `tests/tte_convergence.rs` — Tier-3 convergence + SSE tests (`--features survival,slow-tests`)
+- `plans/tte-survival-markov.md` — full multi-phase roadmap

@@ -1,0 +1,105 @@
+# Count endpoints — `[count_model]`
+
+A count endpoint scores a **non-negative integer** observation — seizures per week, lesions per scan, exacerbations per interval — against a **Poisson** or **negative-binomial** law whose mean is any expression over the model’s parameters. It is the count member of the non-Gaussian family that [`[binary_model]`](../model-file/categorical.llms.md) belongs to, declared with a `[count_model]` block, and needs `--features survival` like the binary endpoint (#2877).
+
+## The `[count_model]` block
+
+``` ini
+[count_model]
+cmt        = 4
+type       = poisson                                 ; or negbin
+log_lambda = log(BASE) + BETA * (WT / 70 - 1) + ETA_C ; log of the mean count per record
+; negbin only:
+; r        = R                                        ; size (> 0); variance λ + λ²/r
+```
+
+Observations for the block’s `cmt` carry the count in `DV` (`EVID = 0`). For each record the model computes the mean `λ` and scores
+
+$$\begin{aligned}
+\text{Poisson:}\quad -\log P(k) &= \lambda - k\log\lambda + \ln\Gamma(k+1), \\
+\text{NegBin:}\quad -\log P(k) &= -\Big[\ln\frac{\Gamma(k+r)}{\Gamma(r)\,\Gamma(k+1)}
+  + r\log\frac{r}{r+\lambda} + k\log\frac{\lambda}{r+\lambda}\Big].
+\end{aligned}$$
+
+The constant `ln Γ(k+1)` is kept, so the OFV is the full `−2 log L` — NONMEM’s `F_FLAG = 1` (`-2LL`) objective with `Y = −2·LOG(PMF)`, and R’s `-2 * logLik()`.
+
+### Keys
+
+| Key | Required | Meaning |
+|----|----|----|
+| `cmt` | yes | Data-file `CMT` column value for this endpoint’s rows. |
+| `type` | no | `poisson` (the default) or `negbin`. |
+| `lambda` | one of `lambda` / `log_lambda` | The mean count `λ` of the record. Must evaluate to a finite, positive number. |
+| `log_lambda` | one of `lambda` / `log_lambda` | `log λ` instead — any finite number. The natural spelling of a log-linear model, and it cannot go non-positive. |
+| `r` | `negbin` only | The size `r > 0`. Variance `λ + λ²/r`; the Poisson is the limit `r → ∞`. |
+
+Every expression reads the same namespace as a `[binary_model]` predictor: θ, η, covariates (each record’s own value, as a `$PRED` reads the current record), values from `[individual_parameters]`, and `TIME`. A count-only model needs no `[structural_model]`, `[error_model]` or `[individual_parameters]` block. `r` is an ordinary θ — write `r = R` with `theta R(5, 0.01, 1000)`, or put a covariate or random effect on it. A θ level block (`theta PLACEBO[STUDY, TIME](0.0)`) read bare in the mean is scored at each record’s own level, and the count records define the block’s levels, as binary records do (see [θ level blocks](../model-file/parameters.llms.md)); `contrast = auto` sees a random effect the mean or `r` reads beside the block, as it does in a binary predictor.
+
+### Exposure and offsets
+
+Counts over intervals of different length need no dedicated key: put the exposure in the mean. With the interval length in a data column `DUR`, `log_lambda = log(RATE) + log(DUR) + ETA_C` (or `lambda = RATE * DUR * exp(ETA_C)`) is the Poisson rate model with an offset, R’s `offset(log(DUR))`.
+
+### Where the law is undefined
+
+A `lambda` that is zero, negative or not finite, a `log_lambda` that is not finite or whose exponential overflows, and an `r` that is not finite and positive have no count law. At such a point the subject’s objective is the finite `1e20` repellent (as for an overflowed binary predictor), never a `NaN`, so the optimizer is pushed back rather than stopped; a simulated record there is skipped with a warning naming the subject and the CMT. Writing the mean as `log_lambda` removes the positivity edge altogether.
+
+## Negative-binomial parameterisation
+
+ferx uses the **mean / size** form: mean `λ`, size `r`, variance `λ + λ²/r`. The other common spellings map onto it as follows.
+
+| Tool | Spelling | In ferx |
+|----|----|----|
+| R `dnbinom(k, size, mu)`, `MASS::glm.nb` (`theta`), `lme4::glmer.nb` | size, mean | `r = size`, `lambda = mu` |
+| nlmixr2 `dnbinomMu(size, mu)` | size, mean | `r = size`, `lambda = mu` |
+| Dispersion `α` (Stata `nbreg`, many papers; `var = μ + αμ²`) | `α = 1/r` | `r = 1 / ALPHA` |
+| NONMEM | user-coded `$PRED` log-PMF (`GAMLN`), any form | the size form as coded in `nonmem_anchor/count_nb_laplace.ctl` |
+| Monolix (`count` observation model) | user-coded `pCount` | write its `log(P)` in the size form above |
+
+## Data format
+
+`DV` holds the count. A DV on a count CMT that is not a finite non-negative integer (`2.5`, `-1`, `inf`) stops the read with a message naming the subject, the CMT and the time; a missing DV (`.`) is an `MDV = 1` row, as on every endpoint.
+
+``` csv
+ID,TIME,DV,CMT,EVID,MDV,WT,TRT
+1,0,6,1,0,0,73.2,0
+1,7,9,1,0,0,73.2,0
+1,21,3,1,0,0,73.2,1
+```
+
+## Estimation
+
+| Method | Count | Notes |
+|----|:--:|----|
+| **FOCEI** / **Laplace** | ✓ | Default. The data term is non-Gaussian, so FOCEI on a count row *is* the Laplace marginal; FOCE gives the same objective here. The inner gradient, the exact η-Hessian of the `½ log\|H\|` term and the outer gradient come from the subject’s compiled plan, as for [binary](../estimation/categorical.llms.md#analytic-inner-gradient). |
+| **SAEM** | ✓ | No Laplace approximation; preferred for very sparse counts. |
+| **IMP** | ✓ | Importance-sampling marginal likelihood. |
+| Gauss–Newton (`gn`, `gn_hybrid`) | — | Refused (`E_COUNT_GN_UNSUPPORTED`): its Hessian is Gaussian-specific. |
+
+On the validation fixtures below, IMP lands on the Laplace optimum (1514.514 Poisson, 1697.356 NB, against 1514.514 / 1697.356), and SAEM within 0.5 and 2.6 OFV of it at the default settings — its stochastic approximation, as on a binary endpoint.
+
+A count mean or size that the expression compiler cannot represent exactly keeps the finite-difference inner gradient, and the “*N* of *M* subjects use finite-difference inner gradients” warning says so.
+
+## Validation
+
+`tests/count_nonmem_anchor.rs` holds the fixtures `nonmem_anchor/count_pois.*` and `count_nb.*` (60 subjects × 6 records; the mean reads `WT`, which varies between subjects, and `TRT`, which changes within each subject):
+
+| Case | ferx OFV | NONMEM (`LAPLACE -2LL`) | R |
+|----|---:|---:|---:|
+| Poisson, fixed effects | 1775.3799168106 | 1775.3799168107 | `glm`: 1775.3799165101 ¹ |
+| NegBin, fixed effects | 1739.1620527867 | 1739.1620527867 | `glm.nb`: 1739.1620527867 |
+| Poisson, random intercept | 1514.5136400073 | 1514.5136399861 | `glmer`: 1514.51389 ² |
+| NegBin, random intercept | 1697.3555547131 | 1697.3555547199 | `glmer.nb`: see ³ |
+
+¹ At R’s own (more precise) optimum, where ferx gives 1775.3799165101 as well. ² At glmer’s optimum ferx and NONMEM agree to 3.6e-9; glmer’s reported deviance is 2.5e-4 higher, from its own inner solve. ³ At glmer.nb’s optimum ferx and NONMEM agree to 3.3e-9 (1697.44362), while glmer.nb reports −2 log L = 1697.2560; its outer `r` loop ended with “iteration limit reached”, and that figure is not the Laplace objective.
+
+Every row is evaluated under Laplace, FOCEI and FOCE at NONMEM’s estimates (ferx’s objective is within 2.1e-8 of NONMEM’s on all of them), on the exact derivatives; the Tier-3 test fits both random-intercept models to convergence from the file’s initial estimates and lands on NONMEM’s optimum.
+
+## Simulation and prediction
+
+`simulate()` and `--simulate` draw one count per count record — a Poisson draw, or the negative binomial as its gamma–Poisson mixture — on the shared seeded stream, with `ipred` carrying the record’s mean `λ`. Like a binary endpoint a count is observed on the fixed grid, so a `[simulation]` block needs `times`.
+
+`predict_categorical()` returns `Prediction::Rate { lambda, size }` for a count record (`size` is `None` for a Poisson endpoint); `Prediction::prob(k)` turns it into `P(Y = k)`.
+
+## Diagnostics (sdtab)
+
+A count endpoint contributes one sdtab row per record: `DV` the count, `PRED` the mean at `η = 0`, `IPRED` the mean at the subject’s EBE, and `IWRES` the Pearson residual `(k − λ)/√Var` (`Var = λ`, or `λ + λ²/r`). `CWRES` is blank, as for a binary record. The rows round-trip through `.fitrx` with the binary ones.

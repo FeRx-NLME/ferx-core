@@ -1,0 +1,78 @@
+# Estimation Methods
+
+ferx-core separates two orthogonal choices: the **statistical method** (how random effects are handled) and the **outer optimizer** (the algorithm that minimises the population objective).
+
+## Statistical methods
+
+- **[FOCE / FOCEI](../estimation/foce.llms.md)** — First-Order Conditional Estimation (with or without interaction). The workhorse of population PK, using nested MAP optimization to find maximum likelihood estimates.
+
+- **[Gauss-Newton (BHHH)](../estimation/gauss-newton.llms.md)** — A fast alternative that exploits the nonlinear-least-squares structure of the FOCE objective. Converges in 10–30 iterations using the outer product of per-subject gradients as an approximate Hessian. Available as pure GN (`gn`) or a GN+FOCEI hybrid (`gn_hybrid`).
+
+- **[SAEM](../estimation/saem.llms.md)** — Stochastic Approximation Expectation-Maximization. Uses MCMC sampling for random effects, providing more robust convergence on complex models with many random effects.
+
+- **[Importance Sampling (IMP)](../estimation/importance-sampling.llms.md)** — Monte-Carlo EM estimator (NONMEM `METHOD=IMP`) that maximises the importance-sampled marginal likelihood. Re-centers the proposal from the previous iteration’s sample moments (cheaper than IMPMAP; on a sharp posterior a warm start with `[focei, imp]` or IMPMAP is the more robust choice). Set `imp_eval_only = true` (NONMEM `EONLY=1`) to evaluate `−2 log L` at fixed parameters instead of estimating.
+
+- **[IMPMAP](../estimation/impmap.llms.md)** — Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`). A Monte-Carlo EM estimator that re-centers a per-subject importance-sampling proposal on the conditional mode every iteration. Targets high-dimensional, rich-data models where a non-MAP importance-sampling EM stalls. Runs standalone (`method = impmap`) or chained (`method = [focei, impmap]`).
+
+- **[Bayesian (MCMC)](../estimation/bayes.llms.md)** — Full posterior sampling (`method = bayes`, Gibbs-within-HMC, NONMEM `METHOD=BAYES` parity). Reports posterior means, credible intervals, and convergence diagnostics (split-R̂, ESS) instead of a point estimate. BSV-only in this first cut.
+
+## Post-estimation steps
+
+These chain after a primary method via `method = [...]` and refine the result rather than re-estimating from scratch:
+
+- **Importance Sampling (IMP), evaluation-only** (`method = [..., imp]` with `imp_eval_only = true`) — a Monte-Carlo marginal likelihood estimate (`−2 log L`) more accurate than the Laplace approximation, for model comparison when the FOCE OFV may be biased (sparse data, complex random-effect structure). This is the post-estimation *scoring* use of [IMP](../estimation/importance-sampling.llms.md); without `imp_eval_only` the same `imp` token *estimates* instead (see Statistical methods above).
+
+- **[SIR](../estimation/sir.llms.md)** — Sampling Importance Resampling. Provides non-parametric 95% CIs for all parameters, more robust than the asymptotic covariance matrix. Appended automatically when `sir = true` in `[fit_options]`.
+
+## Parameterization
+
+All of these methods optimize the same **[packed parameter vector](../estimation/parameterization.llms.md)** — theta on the log (or identity) scale, Omega by its Cholesky factor, sigma on the log scale, in one flat vector. That page documents the layout, the bounds, how FIX is enforced, and where the packed space shows up in output (the covariance matrix, SIR resamples, uncertainty draws).
+
+## Outer optimizers
+
+The outer loop optimizer is selected independently of the method. See **[Outer Optimizers](../estimation/optimizers.llms.md)** for a full comparison of BOBYQA, SLSQP, trust-region, BFGS, and the others. Short version: keep the default (`auto`, which picks `nlopt_lbfgs` when the exact analytic gradient is available and the derivative-free `bobyqa` when only finite differences are — see [the `auto` default](../estimation/optimizers.llms.md#the-auto-default) for the exceptions); name a specific optimizer only to override that choice.
+
+------------------------------------------------------------------------
+
+## Quick comparison
+
+|  | FOCE/FOCEI | Gauss-Newton | SAEM |
+|----|----|----|----|
+| Random effect estimation | MAP (optimization) | MAP (optimization) | MCMC (sampling) |
+| Convergence speed | Medium (~50–100 evals) | Fast (~10–30 iters) | Slower (~400 iters) |
+| Local minima robustness | Can get stuck | Can get stuck | More robust |
+| Gradient required | Yes (analytic or FD) | Yes (FD, per-subject) | No (E-step) |
+| Stochastic | No | No | Yes |
+| OFV comparable to FOCE | — | Yes (post-GN Laplace) | Only with `saem_ofv = focei` (default: NONMEM’s SAEM objective, not a likelihood; `saem_ofv = imp` gives the importance-sampled −2LL, as NONMEM `IMP EONLY=1`; the Laplace value is `saem_objective.foce_ofv`) |
+| Best for | General use | Fast model development | Complex models, many ETAs |
+
+## Choosing a method
+
+**Start with FOCEI** for standard 1–3 compartment models with 2–4 random effects. It is deterministic and comparable to NONMEM FOCEI.
+
+**Try Gauss-Newton (`gn` or `gn_hybrid`)** when you want fast turnaround during model development, or when FOCE is slow to converge on a well-conditioned model.
+
+**Switch to SAEM** when: - FOCE fails to converge or produces implausible estimates - The model has many random effects (\>4 ETAs) - You suspect the FOCE solution is a local minimum - The model has complex nonlinear random effect structure
+
+**Chain with IMP** (`method = [focei, imp]` or `[saem, imp]`, with `imp_eval_only = true`) when you need a more accurate marginal likelihood for model selection — especially on sparse data where the Laplace approximation is biased. Read it from `FitResult.importance_sampling`, not `ofv`. (A SAEM fit already reports this readout as its `ofv` by default; see [the reported OFV](../estimation/saem.llms.md#saem-reported-ofv).) Without `imp_eval_only`, the `imp` stage re-estimates the parameters by Monte-Carlo EM instead of scoring the previous stage’s fit.
+
+**Add SIR** (`sir = true`) when the covariance step fails or when you want non-parametric uncertainty intervals.
+
+## Method chaining
+
+Methods can be chained so that each stage warm-starts from the previous result:
+
+    [fit_options]
+      method        = [saem, focei, imp]
+      imp_eval_only = true
+
+This runs SAEM to find the basin → FOCEI polishes to the FOCEI optimum → IMP evaluates the importance-sampled marginal `−2 log L` at those estimates (a Monte-Carlo estimate with a reported standard error, on `FitResult.importance_sampling`). Drop `imp_eval_only` and the `imp` stage *estimates* instead (NONMEM `METHOD=IMP`), moving the parameters away from FOCEI’s. Any two- or three-stage combination is valid; the most common chains are:
+
+| Chain | Use case |
+|----|----|
+| `[saem, focei]` | Robust convergence + precise FOCE estimates |
+| `[gn, focei]` | Equivalent to `gn_hybrid` |
+| `[focei, imp]` + `imp_eval_only` | Importance-sampled marginal likelihood after a standard fit |
+| `[saem, imp]` + `imp_eval_only` | Importance-sampled marginal likelihood at the SAEM estimates (NONMEM `SAEM` → `IMP EONLY=1`) |
+| `[saem, focei, imp]` + `imp_eval_only` | Most thorough: robust start + polished estimates + importance-sampled OFV |
+| `[focei, imp]` | IMP estimation warm-started from FOCEI |

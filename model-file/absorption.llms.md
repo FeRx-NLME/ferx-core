@@ -1,0 +1,661 @@
+# Built-in Absorption Models
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+ferx provides built-in **absorption input-rate functions** for ODE models — a dose-driven appearance rate `R_in(tad)` that is added into the dosing compartment instead of treating the dose as an instantaneous bolus. They let you write a flexible absorption *shape* (transit-chain delay, etc.) as a single intrinsic in the `[odes]` block, rather than hand-coding a chain of physical transit compartments.
+
+ferx ships the **transit-compartment** model (`transit`), the **Freijer & Post inverse-Gaussian** model (`igd`), the **Weibull** model (`weibull`), and the **zero-order** model (`zero_order`). Two or more input-rate terms can be combined on one compartment with **pathway fractions** (`FR1*igd(...) + FR2*igd(...)`) for biphasic / parallel absorption — see [Biphasic (parallel) absorption](#biphasic-parallel-absorption). The dual-pathway first-order (`parallel`) and zero-order + first-order (`mixed`) families are built with `first_order(ka)` — see [Parallel / mixed absorption](#parallel-mixed).
+
+## Transit-compartment absorption — `transit(n, mtt)`
+
+The Savic et al. (2007) transit-compartment model with a **continuous** number of compartments `n`:
+
+$$R_\text{in}(t_\text{ad}) = F\cdot\text{Dose}\;\cdot\;
+\text{KTR}\;\frac{(\text{KTR}\cdot t_\text{ad})^{n}\,e^{-\text{KTR}\cdot t_\text{ad}}}{\Gamma(n+1)},
+\qquad \text{KTR}=\frac{n+1}{\text{MTT}}$$
+
+where `tad` is time after the dose, `MTT` is the mean transit time, and `KTR` is the transit rate constant. The input integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`), and `R_in = 0` for `tad ≤ 0`. With `n = 0` it reduces to a first-order (Bateman) input with rate `1/MTT`. Because `n` is continuous, the absorption *shape* itself is an estimable parameter.
+
+### Syntax — transit
+
+Add `transit(...)` to the right-hand side of the depot compartment’s ODE:
+
+``` text
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA  = TVKA
+  MTT = TVMTT          # mean transit time (h)
+  NTR = TVN            # number of transit compartments (continuous)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central
+```
+
+- **Arguments are named**: `n=<param>` and `mtt=<param>`. Both must be declared `[individual_parameters]` (so they fold in theta/eta/covariates and can carry IIV/IOV exactly like any other individual parameter).
+- `transit(...)` may appear **once** on a `d/dt(...)` line and must not be scaled or combined with other input-rate terms — it is the chain input, not an ordinary expression. (It is split out of the RHS at parse time and evaluated by the engine with dose context; the rest of the RHS — here `- KA*depot` — is the disposition you write normally.)
+
+### Dose routing — the dose feeds the function, not a bolus
+
+A dose into a transit compartment is delivered **entirely** through `R_in` over time. ferx therefore does **not** also add it as an instantaneous bolus — doing so would double-count the dose. This mirrors NONMEM, where the transit dose compartment carries `F1 = 0` for the bolus while the analytical/`$DES` input delivers the mass.
+
+- **Bioavailability `F`** scales the delivered mass (`Dose = F · AMT`), exactly as for ordinary doses — see [Bioavailability](../model-file/ode-models.llms.md#bioavailability). Do **not** multiply `transit(...)` by `F` in the RHS.
+- **Lagtime** shifts `tad` (the input starts at `dose time + lagtime`).
+- **Multiple doses** superpose: `R_in` is summed per dose, each dose through the `n`/`mtt` of **its own dose record** — see [Absorption parameters are read at the dose record](#absorption-at-dose).
+
+### Absorption parameters are read at the dose record
+
+Every built-in absorption forcing — `transit`, `igd`, `weibull`, `first_order`, `zero_order` — is a **per-dose** input: dose `d` enters as `F · Dose · FR · R_in(t − t_d − lagtime − lag_route)`, and `R_in` integrates to 1. ferx reads **all** of a dose’s absorption parameters at **its own dose record**, as it always has for `F` and the lagtime: the kernel (`n`/`mtt`, `mat`/`cv2`, `td`/`beta`, `ka`, `dur`), the pathway fraction `FR` and the per-route `lag=`. Only the **disposition** — the rest of the right-hand side, e.g. `CL` and `V` — follows the current interval.
+
+This matters only when an absorption parameter changes while a dose is still absorbing: IOV on `MTT` / `MAT` / `KA`, or a time-varying covariate (or `TIME`) in one. Each dose then keeps its own kernel to the end and delivers exactly `F · Dose · FR`. Re-reading the kernel in every interval, as ferx did before [\#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569), splices two densities at the same time since dose, and that creates or destroys drug. One transit dose (`n = 3`) whose `MTT` changes once, mid-absorption:
+
+| `MTT` change | at `t` | absorbed, re-read per interval | absorbed, fixed at dose |
+|--------------|--------|--------------------------------|-------------------------|
+| 4.0 → 2.5    | 5      | 0.777                          | 1.000                   |
+| 2.0 → 4.0    | 2      | 1.424                          | 1.000                   |
+| 4.0 → 2.0    | 3      | 0.504                          | 1.000                   |
+
+With IOV only on disposition parameters (`CL`, `V`, `Q`, `V2`), or occasions spaced beyond the absorption window, the two rules coincide and predictions do not change.
+
+**NONMEM.** A `$DES` that reads the *current* `MTT` for every dose has the same artefact. To reproduce ferx, capture each dose’s kernel at its dose record in `$PK` (under IOV: the dose’s occasion) and superpose the doses in `$DES` — `nonmem_anchor/transit_iov_mtt.ctl` and `ig_iov_mat.ctl` do exactly that, and are the reference ferx is validated against.
+
+### Parameter domains
+
+The domain is `mtt > 0` and `n ≥ 0`. It is enforced in two places:
+
+- **Typical values** (η = κ = 0) are validated at fit time, at **every dose record’s own snapshot** — that record’s covariate values and its `TIME` — which is where the engine reads them ([\#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235), [\#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569)). A value that leaves the domain only at an observation, an EVID=2 row or an EVID=3/4 reset never enters `IPRED` or `PRED`, and is not rejected. A non-finite or out-of-domain typical value is rejected with `E_ABSORPTION_DOMAIN` — a clear error, not an opaque `NaN` fit failure — and the message names the dose. Constrain the parameter so it stays in range, e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
+- **Transient mid-fit excursions** are clamped. With an additive parameterisation (`MTT = TVMTT + ETA_MTT`), the inner EBE search or a finite-difference step can momentarily push `mtt ≤ 0` / `n < 0` even though the typical value is in range. There `R_in` is evaluated at the domain boundary (a finite value) rather than producing a `NaN` that would poison the objective. Because the converged optimum is interior, this clamp never affects reported estimates — it only keeps the optimiser numerically stable. (A log-normal parameterisation avoids the excursion entirely and is recommended.)
+
+### Steady-state dosing (`SS=1`)
+
+A steady-state dose into a built-in absorption compartment — the density kernels `transit()`, `igd()`, `weibull()`, and `first_order()` — **is supported** (#719). The single `SS=1` record stands for an infinite past pulse train, and ferx serves it *through* the absorption kernel rather than as a bolus: the still-arriving tail of every prior pulse is superposed as a periodic `R_in = Σⱼ R_in(tad + j·II)`, and the disposition carried in from those prior pulses (the trough) is the periodic steady state of the disposition. For a **linear** disposition (every built-in PK model) that trough is a closed form — `u_ss = (I − M)⁻¹·b`, with `M = e^{A·II}` one homogeneous cycle and `b` one forced cycle — so it costs a handful of ODE solves rather than iterating the pulse train (a nonlinear disposition self-detects and falls back to the iteration). Predictions therefore match an explicit long run-in of the same schedule (to solver precision) and NONMEM’s exact analytic `ADVAN2` steady state (see `tests/ss_absorption_nonmem_anchor.rs`). A closed-form `pk *_transit` / `*_ig` model with an `SS` dose reroutes to its ODE twin automatically, exactly as for time-varying covariates and IOV.
+
+> **NOTE:**
+>
+> A nonlinear disposition (e.g. Michaelis–Menten) declines the linear closed form, so its periodic steady state is found by an **Anderson-accelerated solve** of the same one-cycle fixed point `u = P(u)` (#867). Across the clinical accumulation range this converges in a bounded handful of cycles even when the elimination half-life far exceeds `II` and the per-cycle carryover ratio approaches 1 — the regime where the earlier fixed-budget iteration silently stopped short and returned an `SS` trough biased low — so the trough (and its analytic sensitivities) are correct there. A case with **no periodic steady state** — a saturable drug whose mean input rate meets or exceeds its maximum elimination rate (phenytoin-like dosing above capacity), where the amount grows without bound — is declined and falls to the capped pulse train with a non-convergence warning (surfaced through `simulate()` / `fit()`; `predict()` returns the value without a warnings channel). An extreme genuinely-accumulating model that the bounded solve cannot converge degrades the same way rather than returning a silently-biased trough.
+
+`fit()` on an SS-absorption model works and converges, with **analytic** FOCEI sensitivities: the closed-form linear trough carries its `∂u_ss/∂(θ,η)` through the dual linear solve (#835), and the nonlinear Anderson solve carries them through the same fixed-point recursion plus a dual Newton derivative correction (#867) — not the FD-of-prediction fallback the earlier nonlinear case used. (The Newton correction’s state-Jacobian `J_P` is itself a finite difference, so the nonlinear-SS gradient carries an `O(reltol/eps)` term amplified by `1/(1−ρ)`; it is accurate across the clinical range but loosens as `ρ → 1`.)
+
+### Steady state with a lag, and into a `zero_order()` window
+
+Both combinations that used to be rejected (`E_ABSORPTION_SS_LAG`, `E_ABSORPTION_SS_ZERO_ORDER`, \#719) are supported (#2786), with exact analytic gradients and no finite-difference fallback.
+
+**A lag** — a compartment `lagtime`/`ALAG{c}` or a per-route `lag=`, the two add — moves the dose’s own pulse `L` after its record; the earlier pulses of the periodic train are anchored on the record. The state the record installs is the fixed point of the cycle that starts there with the own pulse arriving `L` into it, the forcing after the record is the same periodic sum, and for `L ≥ II` the train **clamps** onto the record (the pulse before the dose lands on it), as for every other lagged steady-state dose ([lagtime](../model-file/lagtime.llms.md)).
+
+**A `zero_order()` window** is an infusion — rate `F·AMT/dur` over `[t + lag, t + lag + dur]` — so an `SS=1` dose into a compartment fed by a lone `zero_order()` is carried as the duration-modeled steady-state infusion it is: the periodic window seed, the windows of earlier pulses still running at the record (`dur > II`, or lag + `dur` past `II`) and the exact derivatives through `dur` and the lag are the steady-state infusion’s own. A per-route `lag=` on such a compartment is its `ALAG{c}`; the two spellings are the same model.
+
+Anchored against an independent pulse-train reference to 1e-9 and against NONMEM 7.6.0 (`nonmem_anchor/ss_zero_order_lag.ctl`, `ss_first_order_lag.ctl`, `tests/ss_absorption_lag_anchor.rs`). For `lag > II` NONMEM’s analytic `ADVAN1`/`ADVAN2` follow the unclamped periodic train from `t = lag − II` on (and are not a concentration before it); ferx follows the documented clamp, verified against `ADVAN13`. Two cases stay **rejected with a clear error**: a `zero_order()` window mixed with another absorption function on the same compartment (`E_ABSORPTION_SS_ZERO_ORDER_MIXED`), and a zero-order compartment carrying both a per-route `lag=` and its own `ALAG{c}` (`E_ABSORPTION_SS_ZERO_ORDER_LAG`).
+
+### Infusion (`RATE>0`) into an absorption compartment
+
+An infusion into a built-in absorption compartment — the density kernels `transit()`, `igd()`, `weibull()`, and `first_order()` — **is supported** (#719): the dose is a **zero-order source feeding the kernel**. Instead of an instantaneous bolus, its mass is released at a constant rate over the infusion window `T` (`= F·amt/RATE`), so `R_in` becomes the convolution of the kernel with that rectangle,
+
+$$R_{\text{in,inf}}(t_{ad}) = \frac{F\cdot amt}{T}\,\bigl[G(t_{ad}) - G(t_{ad}-T)\bigr],$$
+
+where `G` is the kernel’s absorbed-fraction CDF (`PreparedInputRate::rate_infused`). This is mass-exact (`∫R_in_inf = F·amt`) and reduces to the bolus `R_in` as `T→0`; the dose’s plain `+rate` injection is suppressed so it is not double-counted. It matches NONMEM’s native `ADVAN2` zero-order-into-depot behaviour exactly (see `tests/infusion_absorption_nonmem_anchor.rs`) and an explicit sub-dose train. A closed-form `pk *_transit` / `*_ig` model with an infusion reroutes to its ODE twin automatically. Because every kernel’s CDF is a closed form (`regularized_gamma_p` for transit, the two-`Φ` IG CDF, elementary for Weibull/first-order), `R_in_inf` is exact and cheap, and fit-time sensitivities are exact: the adjoint walks deliver the infusion through the same convolved `R_in_inf` (no plain `+rate`), and when the window’s start or end moves with an estimated parameter — `F` on a rate-defined infusion, a modeled `RATE=-1`/`-2` dose, or a compartment or per-route lag — the kink of `R_in_inf` there is crossed as a moving boundary. The window end is a break of every integration timeline, including under a per-route lag (where it sits one window after the route’s onset).
+
+Two infusion combinations remain **rejected with a clear error**: into a `zero_order()` window (`E_ABSORPTION_RATE_ZERO_ORDER` — a window-with-window convolution) and a **steady-state infusion** (`SS=1` with `RATE>0`, `E_ABSORPTION_SS_INFUSION` — a periodic zero-order source feeding the kernel).
+
+### Not yet supported (Phase 0)
+
+These combinations are **rejected with a clear error** rather than silently mis-modeled:
+
+- **A `[diffusion]` block (SDE/EKF) together with `transit()`** (`E_ABSORPTION_DIFFUSION`) — the EKF propagation does not yet carry the input-rate forcing.
+
+> **Note:** these built-in-absorption guards run at `fit()` time and via `ferx check` — where full model–data compatibility is validated — **and on the lower-level predict / simulate paths too** (#588). Every entry point (`predict()`, `simulate()`, `simulate_with_options()`, …) reports the combination as the same `Err` `fit()` does — see [When a precondition fails](../warnings.llms.md#entry-point-errors). The data-independent *structural* rules (e.g. the pathway-fraction partition below) fire even earlier, at parse time, so *every* entry point rejects a malformed model. Other, non-absorption data checks are still only run by `fit()` / `ferx check`, so validate a new model there before relying on `predict`/`simulate` output.
+
+## Analytic closed form — `pk one_cpt_transit(cl, v, n, mtt)`
+
+The `transit()` forcing above runs on the numerical **ODE** path. For a **one-compartment** disposition there is also a fast **analytic** transit model, `pk one_cpt_transit(...)`, that needs no ODE solver:
+
+    [structural_model]
+      pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+It evaluates the exponential-tilting closed form of the Savic transit input absorbed directly into central,
+
+      C(t) = (F·Dose/V) · M(ke) · exp(−ke·t) · P(N+1, (KTR−ke)·t),   ke = CL/V
+
+where `M` is the Gamma moment-generating function and `P` the regularized lower incomplete gamma. The closed form carries **exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V, N, MTT, F, η}` — the same gradients the estimator uses — so a transit fit avoids both the ODE solve and finite differences. `N` is continuous (the absorption *shape* is estimable), and `F` / `lagtime` map exactly as for `one_cpt_oral`. With `N = 0` the model reduces exactly to first-order (Bateman) oral absorption with `ka = 1/MTT`.
+
+**Domain.** The closed form converges for `ke = CL/V` below the transit rate `KTR = (N+1)/MTT` (the absorption-rate-limited regime — the usual case). At or above it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see the flip-flop note below.
+
+### Scope (first version)
+
+This analytic model supports single and multiple **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central` initial amount.
+
+**IOV and time-varying covariates stay analytic.** A subject with inter-occasion variability (IOV, `n_kappa > 0`) or a time-varying covariate is served by an **exact event-driven walk** (#1560). A static closed form cannot carry a dose’s drug across a record where the disposition changes, so the walk splits the model at each record:
+
+- the **disposition** (`CL`, `V`) is the current interval’s;
+- each **dose** keeps the kernel, `F` and lag of its own record (see [Absorption parameters are read at the dose record](#absorption-at-dose)).
+
+On an interval `[s₀, s₁]` the central amount decays at `ke` and each open dose adds its delivery over that window, `F·Dose · M(ke) · e^{−ke(s₁−t_d)} · [G(s₁−t_d) − G(s₀−t_d)]`. Every term is closed-form, so the predictions are exact and the FOCE/FOCEI gradients are exact `Dual2` jets.
+
+The walk matches an independent quadrature to 1e-14 and the ODE twin to its tolerance (`tests/data/absorption_walk_1cpt_quadrature.py`, \#1569’s 2-cpt table). For transit it is 3–4× faster per subject than the twin at default ODE tolerances, and 28–30× faster at `ode_reltol = 1e-12`.
+
+**What still reroutes to the ODE twin.** The twin is the exact `transit()` ODE model, and it serves:
+
+- a `TIME`-dependent structural parameter;
+- a **steady-state (`SS=1`) dose** or an **infusion (`RATE>0`)** (#719);
+- any subject the walk cannot factorise — the flip-flop regime, below;
+- a subject whose gradient the walk cannot serve analytically, so that it keeps the twin’s analytic ODE sensitivities rather than falling back to finite differences: an IOV subject with `n_eta + K·n_kappa ≥ 24` stacked random effects (`K` occasions), or a time-varying covariate model outside the closed-form analytic-sensitivity scope.
+
+**System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** with an actionable message. Use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver tolerance (`tests/transit_analytic_equivalence.rs`).
+
+### The flip-flop regime
+
+When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt` (the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a faster disposition), the closed form is outside its convergence domain. ferx detects this *per evaluation* and routes the model to its exact ODE `transit()` twin, which is valid in both regimes. On the IOV / time-varying-covariate walk the test is per **(interval, arrived dose) pair**: every interval’s `ke` must sit below the `KTR` of every dose that has arrived by then — even one long since absorbed — each at its own dose-record kernel. So one slow dose followed by a later occasion that raises `CL` past its `KTR` sends that subject to the twin (matched to a NONMEM ADVAN13 transit simulation to ~1e-4), so a flip-flop model fits and predicts correctly instead of returning a zero profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value estimates. The reroute needs an ODE twin. A closed-form transit model that carries a `lagtime` or bioavailability `f` mapping is desugared to a twin that applies them too (since \#735), so it auto-routes just like the plain form. Only a model with a user `[odes]` / `[scaling]` / `[initial_conditions]` block cannot be desugared (no unique twin); rather than silently returning a zero profile that degenerates the objective, such a twin-less model is **rejected with a hard error** (`E_TRANSIT_FLIP_FLOP`) on `fit`, `predict`, `simulate`, and `ferx check` — rewrite it as an explicit ODE `transit()` model, or adjust the MTT / CL starting estimates.
+
+> **NOTE:**
+>
+> The twin is a real ODE model, built and validated when your model file is parsed. It is therefore subject to the checks that apply only to ODE models — which your analytic model itself is out of scope for. So a construct can be legal in the closed form and illegal in its twin. The likeliest one is an individual parameter named after one of the twin’s own compartments: `CENTRAL = ...` (or `PERIPH` for a 2-compartment model) means nothing to the closed form, which has no compartment namespace, but collides with the twin’s state names.
+>
+> Such a model still parses and still fits — it simply keeps no ODE fallback, and ferx says so with a `W_ABSORPTION_TWIN_DECLINED` warning quoting the reason. The consequence is that every feature reached through the twin becomes unavailable: SS and infusion doses, IOV, time-varying covariates, a `TIME`-dependent parameter, and the flip-flop reroute above are all rejected with an explicit error instead — and that error repeats the reason, so you do not have to go back to the parse warning to find out what broke. Renaming the offending parameter restores the twin.
+>
+> (A handful of shapes are recognised by name and declined **without** that warning — a user `[odes]` / `[scaling]` / `[initial_conditions]` block; a parameter whose name shadows a reserved `f` / `lagtime` slot it is not the mapping for, or collides with a slot already taken by a disposition role (`f=V1` alongside `v=V`); and a parameter that is both a dose attribute and a disposition parameter, as in `pk one_cpt_transit(..., v=F, f=F)`. Those are deliberate scope limits rather than build failures, so they are silent — but the model is just as twin-less, and the same SS / IOV / time-varying-covariate rejections apply, with no quoted reason since there is no build failure to quote.)
+
+[`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx) is a complete self-contained analytic transit model:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/one_cpt_transit.ferx --simulate
+```
+
+## Two-compartment analytic transit — `pk two_cpt_transit(cl, v1, q, v2, n, mtt)`
+
+The same closed form extends to a **two-compartment** disposition:
+
+    [structural_model]
+      pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)
+
+The 2-cpt central impulse response is the bi-exponential `cα·e^{−α·t} + cβ·e^{−β·t}` at the disposition macro-rates `α ≥ β`; convolving each exponential with the Savic transit density gives the two-term tilting form
+
+      C(t) = (F·Dose/V1) · [ cα·M(α)·e^{−α·t}·P(N+1,(KTR−α)·t)
+                           + cβ·M(β)·e^{−β·t}·P(N+1,(KTR−β)·t) ]
+
+with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)` (`cα + cβ = 1`). It carries the same **exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V1, Q, V2, N, MTT, F, η}`, and with `N = 0` reduces exactly to 2-cpt first-order oral absorption with `ka = 1/MTT`. The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identical to `one_cpt_transit`: bolus doses into the depot, bioavailability, lag time; time-varying covariates and IOV (`n_kappa > 0`) served by the exact event-driven walk, whose 2-cpt step carries the central **and** peripheral amounts and adds each open dose’s window at both macro-rates (#1560); `TIME`-dependent parameters, an `SS=1` dose (#719), an infusion, and the flip-flop regime (`α ≥ KTR`, per interval and open dose on the walk) auto-rerouted to an exact 2-cpt ODE `transit()` twin; resets / non-depot (`CMT≠1`) doses / `depot`-init still rejected — use an ODE transit model for those.
+
+[`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx) is a complete self-contained example:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/two_cpt_transit.ferx --simulate
+```
+
+## Analytic inverse-Gaussian — `pk one_cpt_ig(cl, v, mat, cv2)` / `pk two_cpt_ig(...)`
+
+The Freijer & Post `igd()` forcing (below) also has a fast **analytic** closed form, `pk one_cpt_ig(...)` (and the 2-cpt `pk two_cpt_ig(...)`), that needs no ODE solver:
+
+    [structural_model]
+      pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+
+It is the exponential-tilting closed form of the same inverse-Gaussian absorption-time density (mean `MAT`, relative dispersion `CV2`, shape `λ = MAT/CV2`) absorbed directly into central,
+
+      C(t) = (F·Dose/V) · M(ke) · exp(−ke·t) · F_IG(t; μ*, λ),   ke = CL/V
+
+where `M(k) = exp((λ/μ)(1 − √(1 − 2μ²k/λ)))` is the IG moment-generating function and `F_IG(·; μ*, λ)` the IG CDF of the exponentially-tilted density (`μ* = μ/√(1 − 2μ²k/λ)`), expressed through the normal CDF `Φ`. The closed form carries **exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V, MAT, CV2, F, η}` — the same gradients the estimator uses — so an IG fit avoids both the ODE solve and finite differences. `F` / `lagtime` map exactly as for `one_cpt_oral`. The 2-cpt form `pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)` convolves the IG density with the bi-exponential 2-cpt impulse response, carrying `∂C/∂{CL, V1, Q, V2, MAT, CV2, F, η}`.
+
+**Domain.** The closed form converges for `ke = CL/V` below the IG abscissa `1/(2·MAT·CV²)` (the 2-cpt guard is `α < 1/(2·MAT·CV²)`, since `α ≥ β`). At or above it (the flip-flop regime) ferx routes the model to its ODE `igd()` twin automatically.
+
+**Scope / limits.** Identical to the analytic transit models above: single and multiple **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central` initial amount are supported; **time-varying covariates** and **IOV** (`n_kappa > 0`) are served by the same exact event-driven walk as transit (#1560), with each dose’s `MAT`/`CV²` fixed at its own record; `TIME`-dependent parameters are rerouted to an exact ODE `igd()` twin; the **flip-flop** regime (`ke ≥ 1/(2·MAT·CV²)`, per interval and open dose on the walk) is likewise auto-rerouted to that twin per evaluation, with a `W_IG_FLIP_FLOP` note at the typical-value estimates. A **steady-state (`SS=1`) dose or an infusion (`RATE>0`) reroutes** to the `igd()` twin too (#719). On the walk IG is never slower than its twin — 1.1–2.3× faster per subject at default ODE tolerances, 12–20× at `ode_reltol = 1e-12` — unlike the static closed form below. **System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** with an actionable message — use the `igd()` ODE forcing below for those. A flip-flop model carrying a `lagtime`/`f`/user-`[odes]` mapping has no ODE twin to route to and is **rejected with a hard error** (`E_IG_FLIP_FLOP`). The analytic and ODE paths agree to ODE-solver tolerance (`tests/ig_analytic_equivalence.rs`, 1- and 2-cpt), and the closed form is anchored **directly** against NONMEM `$DES` on an in-domain IG-truth dataset (`tests/ig_analytic_nonmem_anchor.rs`: ferx −1303.528 vs NONMEM −1303.639).
+
+> **NOTE:**
+>
+> The analytic *transit* models are ~28–31× faster than their ODE forcing because the transit chain is comparatively expensive to integrate — the closed form’s win is *avoiding that integration*. IG has no such win: its `igd()` ODE is **non-stiff and cheap** (and not even tolerance-sensitive — ~134 ms/eval at default tol, ~157 ms at `TOL=9`), so the closed form — whose normal-CDF terms go through the exact-derivative incomplete-gamma continued fraction — is actually **~2× slower per objective evaluation** than the `igd()` forcing on a typical dataset. `pk one_cpt_ig` is a **consistency / correctness** feature: exact `Dual2` gradients that don’t depend on ODE-solver tolerance, and a uniform `pk`-line interface matching the transit models. **If raw fit speed is what you need, prefer the `igd()` ODE forcing** below.
+
+[`examples/one_cpt_ig.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_ig.ferx) is a complete self-contained analytic IG model:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/one_cpt_ig.ferx --simulate
+```
+
+## Worked example — analytic transit
+
+[`examples/transit_savic.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_savic.ferx) is a complete one-compartment oral model with built-in transit absorption. Run it on simulated data:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/transit_savic.ferx --simulate
+```
+
+For comparison, [`examples/transit_2cpt.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt.ferx) codes the same idea as three **explicit** transit ODE states (fixed integer `n = 3`); the built-in `transit()` collapses that to one line with a single continuous `n`. See [Transit Absorption](../examples/transit-absorption.llms.md) for the worked two-compartment example and diagnostics guidance.
+
+## Inverse-Gaussian absorption — `igd(mat, cv2)`
+
+The Freijer & Post (1997) convection–dispersion absorption model: the absorption time follows an **inverse-Gaussian distribution**, and the input rate is that density scaled by the dose, fed **straight into the central compartment** (no separate first-order `ka` step — the IG models the entire absorption delay):
+
+$$R_\text{in}(t_\text{ad}) = \text{Dose}\;\sqrt{\frac{\text{MAT}}{2\pi\,\text{CV2}\,t_\text{ad}^{3}}}\;
+\exp\!\left(-\frac{(t_\text{ad}-\text{MAT})^2}{2\,\text{CV2}\,\text{MAT}\,t_\text{ad}}\right)$$
+
+with mean absorption time `MAT` (the distribution mean μ) and relative dispersion `CV2` (= Var/mean², equivalently shape λ = MAT/CV2). Like `transit`, the input integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0` for `tad ≤ 0`; the essential singularity at `tad → 0` is finite (`R_in → 0`).
+
+### Syntax — inverse-Gaussian
+
+Add `igd(...)` to the **central** compartment’s ODE. Because the input rate carries mass (not concentration), write the central state as an **amount** and convert to concentration in `[scaling]` — the NONMEM `A(2)` / `IPRED = A(2)/V` convention:
+
+``` text
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MAT = TVMAT          # mean absorption time (h)
+  CV2 = TVCV2          # relative dispersion (Var/mean²)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+
+[scaling]
+  y = central / V
+```
+
+- **Arguments are named**: `mat=<param>` and `cv2=<param>`, both declared `[individual_parameters]` (so they fold in theta/eta/covariates and carry IIV/IOV like any other parameter).
+- `igd(...)` is a positively-signed input-rate term: it must not be negated, divided, raised to a power, or parenthesised. It **may** be scaled by a single declared pathway fraction (`FR*igd(...)`), and more than one input-rate term may feed a compartment — see [Biphasic (parallel) absorption](#biphasic-parallel-absorption) below for the Freijer sum-of-two.
+
+### Shared behaviour — inverse-Gaussian
+
+`igd` reuses the same dose machinery as `transit`, so the rules are identical:
+
+- **Dose routing** — the dose feeds `igd` over time and is **not** also added as a bolus; the dose record targets the `igd` compartment (here `central`). See [Dose routing](#dose-routing-the-dose-feeds-the-function-not-a-bolus) above.
+- **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave exactly as for `transit`. Do not multiply `igd(...)` by `F`.
+- **Parameter domains** `mat > 0`, `cv2 > 0` are validated at typical values (`E_ABSORPTION_DOMAIN`), at **every dose record’s own snapshot** exactly as for `transit` above, and clamped for transient mid-fit excursions — a log-normal parameterisation avoids excursions and is recommended.
+- Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate compartment are now **supported** (#719 — SS through a periodic-sum `R_in`, infusion as a zero-order source feeding the kernel); a `[diffusion]` block (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
+
+### Worked example — inverse-Gaussian
+
+[`examples/igd_inverse_gaussian.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/igd_inverse_gaussian.ferx) is a complete one-compartment oral model with inverse-Gaussian absorption. Run it on simulated data:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/igd_inverse_gaussian.ferx --simulate
+```
+
+### Biphasic (parallel) absorption
+
+The Freijer & Post **biphasic** form splits the dose across two inverse-Gaussian pathways — typically a fast and a slow one — that feed the same compartment. Write it as a sum of two `igd(...)` terms, each scaled by a **pathway fraction**:
+
+``` text
+[individual_parameters]
+  FR1   = TVFR1            # fraction through the fast pathway
+  FR2   = 1 - TVFR1        # complementary fraction (FR1 + FR2 = 1)
+  MAT1  = TVMAT1
+  MAT2  = TVMAT2
+  CV2_1 = TVCV2_1
+  CV2_2 = TVCV2_2
+
+[odes]
+  d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + FR2*igd(mat=MAT2, cv2=CV2_2) - CL/V*central
+```
+
+Rules for the fraction multiplier:
+
+- It must be a **single declared individual parameter** (`FR1*igd(...)`), *not* an expression such as `(1-FR)`. Declare the complementary fraction explicitly (`FR2 = 1 - TVFR1`) so each term binds to one parameter. This also lets the fraction carry IIV/covariates and keeps its gradient exact (analytic `Dual2`).
+- The dose is **partitioned**, not duplicated: when more than one input-rate term feeds a compartment, **each** must carry a fraction (and a *lone* fractioned term is rejected — a single pathway is written bare). This *structural* rule is checked at **parse time**, so it fires for every entry point. The *value* checks — each fraction in `(0, 1]` and the fractions summing to ≈ 1 (`E_ABSORPTION_FRACTION`) — are evaluated at typical values by `fit()` / `ferx check`, at **every dose record’s own snapshot** as for the domain checks above, and enforced on `predict()` / `simulate()` as well (#588, \#1235). A dose’s fractions are read at its dose record and held for its whole absorption ([\#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569)), so the pathways together deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`) even when a covariate moves a fraction mid-absorption.
+- The same multiplier works for `transit`/`weibull`/`first_order` terms, and on `zero_order(...)` as part of a `mixed` model — see [Parallel / mixed absorption](#parallel-mixed) ([\#505](https://github.com/FeRx-NLME/ferx-core/issues/505)).
+
+[`examples/biphasic_igd_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/biphasic_igd_absorption.ferx) is a complete biphasic model; run it on simulated data:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/biphasic_igd_absorption.ferx --simulate
+```
+
+## Weibull absorption — `weibull(td, beta)`
+
+The absorption time follows a **Weibull distribution**, and the input rate is that density scaled by the dose, fed **straight into the central compartment** (no separate first-order `ka` step — like `igd`, the Weibull models the entire absorption delay):
+
+$$R_\text{in}(t_\text{ad}) = \text{Dose}\;\frac{\beta}{T_d}\left(\frac{t_\text{ad}}{T_d}\right)^{\beta-1}
+\exp\!\left(-\left(\frac{t_\text{ad}}{T_d}\right)^{\beta}\right)$$
+
+with scale `td` ($T_d$) and shape `beta` ($\beta$) — the appearance-rate form of the cumulative absorbed fraction $1 - \exp(-(t_\text{ad}/T_d)^\beta)$. The input integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0` for `tad ≤ 0`.
+
+The **shape `beta` selects the absorption profile**:
+
+| `beta` | Profile | Edge at `tad → 0` |
+|----|----|----|
+| `> 1` | Delayed, sigmoidal uptake with an interior peak — the common PK case | `R_in → 0` |
+| `= 1` | Reduces exactly to first-order absorption with `ka = 1/Td` | finite (`Dose/Td`) |
+| `< 1` | Fast early uptake tapering off | `R_in → ∞`, an **integrable** spike |
+
+For `beta < 1` the rate diverges as `tad → 0⁺`, but the spike is integrable (the cumulative absorbed amount still goes to 0 as the window shrinks, and `∫R_in = F·Dose` holds) — the value is *not* capped, and the adaptive ODE solver resolves it with small steps.
+
+### Syntax — Weibull
+
+Add `weibull(...)` to the **central** compartment’s ODE, writing the state as an **amount** and converting to concentration in `[scaling]` (the same convention as `igd`):
+
+``` text
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  TD   = TVTD          # Weibull scale (h)
+  BETA = TVBETA        # Weibull shape (dimensionless)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+
+[scaling]
+  y = central / V
+```
+
+- **Arguments are named**: `td=<param>` and `beta=<param>`, both declared `[individual_parameters]`.
+- As with `transit`/`igd`, `weibull(...)` is a standalone, positively-signed input-rate term: it may appear **once** per `d/dt` line and must not be scaled, negated, or parenthesised.
+
+### Shared behaviour — Weibull
+
+`weibull` reuses the same dose machinery as `transit`/`igd`:
+
+- **Dose routing** — the dose feeds `weibull` over time and is **not** also added as a bolus.
+- **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave exactly as for `transit`. Do not multiply `weibull(...)` by `F`.
+- **Parameter domains** `td > 0`, `beta > 0` are validated at typical values (`E_ABSORPTION_DOMAIN`), at **every dose record’s own snapshot** exactly as for `transit` above, and clamped for transient mid-fit excursions — a log-normal parameterisation avoids excursions and is recommended.
+- Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate compartment are now **supported** (#719 — SS through a periodic-sum `R_in`, infusion as a zero-order source feeding the kernel); a `[diffusion]` block (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
+
+Unlike `transit`/`igd`, the Weibull has **no elementary closed form** with linear disposition, so it is permanently a numerical-ODE model — it always requires an explicit ODE disposition (`ode(...)` or `ode_template`) and can never ride an analytical `pk` (see the error rule below). Because the forcing is evaluated over `Dual2`, a `weibull()` model still drives **exact analytic** FOCE/FOCEI/Bayes gradients — this generic input-rate forcing is the *only* exact-gradient route for Weibull (it has no Phase-3 closed form to fall back on).
+
+### Worked example — Weibull
+
+[`examples/weibull_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/weibull_absorption.ferx) is a complete one-compartment oral model with Weibull absorption. Run it on simulated data:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/weibull_absorption.ferx --simulate
+```
+
+## Zero-order absorption — `zero_order(dur)`
+
+The dose enters at a **constant rate** over a modeled duration `dur` — a zero-order input (an infusion whose duration is an estimated parameter):
+
+$$R_\text{in}(t_\text{ad}) = \frac{\text{Dose}}{\text{dur}}\quad\text{for } 0 < t_\text{ad} \le \text{dur},\qquad 0 \text{ otherwise}$$
+
+The input integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0` for `tad ≤ 0` and `tad > dur`. This is the same constant-rate input as a NONMEM modeled-duration infusion (`RATE=−2` / `D1`, \#324), exposed as an `[odes]` input-rate function so it can drive any compartment.
+
+### Syntax — zero-order
+
+`zero_order` takes a **single** named argument `dur`. Add it to the compartment the dose feeds — central directly, or a depot for a *sequential* (zero-then-first-order) model:
+
+``` text
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR          # zero-order input duration (h)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+```
+
+For **sequential** absorption — a zero-order fill of a depot followed by first-order `ka` to central — compose `zero_order` with a hand-written transfer term (there is no separate `sequential` keyword):
+
+``` text
+[odes]
+  d/dt(depot)   = zero_order(dur=DUR) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+```
+
+- The argument is named: `dur=<param>`, declared in `[individual_parameters]`.
+- A bare `zero_order(...)` is a standalone, positively-signed term and must not be scaled (other than by a pathway fraction), negated, or parenthesised. It **may** be weighted by a single declared pathway fraction (`FZO*zero_order(...)`) as part of a `mixed` model — see [Parallel / mixed absorption](#parallel-mixed) below. At most **one** `zero_order(...)` term may feed a given compartment.
+
+### Shared behaviour — zero-order
+
+`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`.
+
+#### Dose handling
+
+- **Dose routing** — the dose feeds `zero_order` over its window and is **not** also added as a bolus; the depot/central state stays an amount.
+- **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave exactly as for the other input rates (`F` scales the rate `F·Dose/dur`; the window stays `dur`). Do not multiply `zero_order(...)` by `F`.
+- **Parameter domain** `dur > 0` is validated at typical values (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions. Like the density kernels above, `dur` is checked at **each dose’s own snapshot and nowhere else**: the engine fixes the window’s width, pathway fraction and per-route lag at dose time, which is what makes the delivered mass exact under a time-varying covariate. A `dur` that only leaves the domain at a later observation therefore never enters `IPRED` or `PRED`, and is not rejected.
+- Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate compartment are now **supported** (#719 — SS through a periodic-sum `R_in`, infusion as a zero-order source feeding the kernel); a `[diffusion]` block (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
+
+#### The window is bracketed at both edges
+
+The window is handled exactly: ferx breaks the integration timeline at **both** edges — the onset `t_dose + lagtime` and the cutoff `t_dose + lagtime + dur` — and delivers the input as a per-segment constant (the way an infusion is injected), so the absorbed mass is exact, not smeared across the step.
+
+Both edges matter, because a segment receives the constant rate only if it lies *entirely* inside the window. Bracketing only the cutoff leaves the segment straddling the onset failing that test, which drops the rate for the **whole** window rather than mis-resolving one step. Until [\#1171](https://github.com/FeRx-NLME/ferx-core/issues/1171) that was the behaviour on the engines serving sdtab, `[derived]` grid integrals, the joint PK-TTE hazard and `simulate()` whenever the route carried its own `lag=`: a model whose only input was a lagged `zero_order` reported exactly `0.0` at every observation, while the objective — which segments on a different code path — was correct throughout.
+
+#### Analytic sensitivity across the moving boundary
+
+> **NOTE:**
+>
+> All input-rate models — including `zero_order(dur)` — carry **exact analytic** (`Dual2`) FOCE/FOCEI gradients. The derivative with respect to `dur` crosses the moving boundary at `tad = dur` (a Leibniz boundary term); the analytic provider delivers the window as a per-segment constant (like an infusion) and injects the **rate-off saltation** at the cutoff for that boundary term — the sign-mirror of the estimated-lagtime dose-start saltation. The closely-related **modeled-duration / modeled-rate infusion** (`RATE=−2` / `D{cmt}` and `RATE=−1` / `R{cmt}`) is analytic by the same mechanism, but on the *event-driven* walk.
+>
+> The two paths differ in what keeps them analytic. A **modeled-duration / -rate dose** stays analytic when composed with an estimated lagtime (the start *and* end saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying covariates, multiple doses, **IOV**, or a **steady-state** dose (the dual SS equilibration threads the modeled-window jet into each cycle’s active/quiet split, on both the ODE and closed-form paths, \#486) — only a rate-defined `RATE=-1` infusion under `F ≠ 1` is analytic through the event walk too. The **`zero_order(dur)` forcing** is analytic across multiple doses, a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 — the reset case is kind-agnostic, so `zero_order` inherits it too) on the static walk, and its moving-boundary window is now also carried on the **event-driven** walk, so it stays analytic combined with an estimated **lagtime** or **time-varying covariates** (#486): the constant `F·amt·frac/dur` window is delivered per segment there, its moving end `d.time + lag + dur` (and, under lagtime, its moving start) injected as the same rate-on / rate-off saltations used for infusions. Under a covariate that varies *across* the window end the rate-off uses the general `g⁻ − g⁺` saltation (the RHS Jacobian jumps across the boundary too, not just the forcing). Because the IOV walk is the same event-driven walk, **every** absorption forcing is analytic under **IOV** too (#486 — the smooth densities `igd`/`transit`/`weibull`/`first_order`, the moving-window `zero_order`, and any composition `mixed`/`parallel`; each forcing’s rate/window is rebuilt from its dose’s own occasion-seeded PK jet); the only IOV holdout is any forcing combined with a **steady-state** dose (the dual SS equilibration does not spread the forcing over the cycle). See [\#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
+>
+> The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a *wider* analytic scope combined with an EVID 3/4 reset or time-varying covariates: all four stay analytic there (#486) — the reset case turns off a dose’s pre-reset tail exactly like the infusion rule, and the TV-cov case builds each dose’s forcing constants once, from its own dose record (#1569), on the event-driven walk. Combined with an **estimated lagtime**, `igd`/`transit`/`first_order` are *also* analytic (#486): the continuous `∂R_in/∂lag` rides the walk’s dual time-after-dose, and the forcing’s onset at the dose’s lagged arrival is injected as an exact rate-on saltation — the sign-mirror of the `zero_order` rate-off saltation above, generalised from a constant rate to `R_in(0⁺)`. `weibull` and `transit` boluses are *also* analytic under a lagtime, for every shape — including `β < 1` and `0 < n < 1`, where the density is infinite (or its slope not integrable) at the onset and no rate-on saltation exists. The segment after a moving onset is integrated from the state at the true onset, on the walk’s clock shifted by the onset’s jet, so the kernel is read at an age with no derivative and the state is flowed back to the fixed time afterwards, where the field is smooth. A Weibull with `β < 1` — whose density is infinite at the onset — is integrated as the absorbed mass besides: its lagged dose shifts the state by `D·(S(τ₀) − S(τ))`, with `S = 1 − G` the not-yet-absorbed fraction (a closed form), so the right-hand side reads `S`, which is continuous there, instead of the density. Predictions are unchanged for every other kernel and shape; the framed Weibull’s move only at the integrator’s tolerance (≤ 7e-7 relative at `reltol = 1e-10`), a tolerance that is relative to the shifted state, so on a long segment with fast elimination tighten `reltol` for the late amounts.
+
+### Worked examples — zero-order sensitivity
+
+[`examples/zero_order_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/zero_order_absorption.ferx) is a one-compartment model with zero-order input, and [`examples/sequential_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/sequential_absorption.ferx) is the sequential (zero-then-first-order) variant. Run either on simulated data:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/zero_order_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/sequential_absorption.ferx --simulate
+```
+
+## Parallel / mixed absorption — `first_order(ka)`
+
+Some drugs are absorbed through **two pathways at once** — e.g. a fast and a slow first-order phase, or an immediate zero-order release plus a first-order tail. ferx expresses these by **composing input-rate functions split by a dose fraction**, with no need for extra compartments or per-compartment bioavailability.
+
+The building block is `first_order(ka)` — the classic first-order (Bateman) absorption, exposed as an input-rate function so it can be composed:
+
+$$R_\text{in}(t_\text{ad}) = \text{Dose}\cdot k_a\cdot e^{-k_a\,t_\text{ad}}$$
+
+(Standalone first-order absorption still uses the analytical `pk one_cpt_oral(...)` path; `first_order(...)` is for the multi-pathway case a single closed form can’t express.)
+
+### Pathway fractions
+
+A multi-pathway term is written `FR*fn(...)`, where `FR` is a **single declared individual parameter** in `(0, 1]` (not an expression like `(1-FR)`). The fractions on a compartment must **partition the dose** — `Σ FR ≈ 1` — so a two-pathway split declares a complementary parameter:
+
+``` text
+[individual_parameters]
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1      # declared complement; FR1 + FR2 = 1
+```
+
+This is the same fraction mechanism as biphasic `igd` (see above): validated at fit-init (`E_ABSORPTION_FRACTION`) — each `0 < FR ≤ 1`, the fractions sum to 1, and a lone fractioned term is rejected (a single pathway is written bare).
+
+### Parallel — dual first-order
+
+Two first-order pathways (a fast `KA1` and a slow `KA2`) feeding central:
+
+``` text
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+```
+
+### Mixed — zero-order + first-order
+
+A zero-order release (`FZO` of the dose, over `DUR`) plus a first-order phase (`FZO1 = 1 − FZO`):
+
+``` text
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+```
+
+A pathway fraction on `zero_order(...)` is supported here (the per-segment zero-order channel carries the fraction). At most **one** `zero_order(...)` term may feed a compartment — biphasic zero-order is rejected when the model is parsed (so a `fit`, `simulate`, or `predict` run all surface the error the same way).
+
+### Per-route lag — `first_order(ka=…, lag=L)`
+
+Every input-rate function takes an optional `lag` argument giving **that pathway its own absorption delay**, so parallel / mixed routes can switch on at different times — the classic immediate-release + delayed-release (enteric-coated) picture:
+
+``` text
+[individual_parameters]
+  FR1  = TVFR1          # immediate-release fraction (no lag)
+  FR2  = 1 - TVFR1      # delayed-release fraction
+  LAG2 = TVLAG2         # delayed-release onset (h)
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1)
+                + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+```
+
+The per-route lag is an offset **on top of** any compartment lagtime (`lagtime` / `ALAG{n}`): a bare `lagtime` shifts *every* route together, while `lag=` adds a further delay to *one* route, so a route’s effective onset is `dose time + lag_cmt + lag_route`. The argument is universal — `zero_order(dur=DUR, lag=L)` shifts the whole zero-order window (start, end, and its cutoff break) by `L`. `lag` must be a single declared individual parameter (like the `FR*` fraction), and must be finite; a negative value at the initial estimates is rejected by `fit()` and `ferx check` (`E_NEGATIVE_LAGTIME`), as NONMEM rejects a negative absorption lag (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`) ([\#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)). A negative value reached mid-fit, or served by `predict()` / `simulate()` (which warn, `W_NEGATIVE_LAGTIME`), is not clamped: the subject’s timeline starts at the *earlier* onset, identically on every engine — the predictions equal the closed form from that earlier onset, and the grid nodes between it and the first record are integrated, not left missing. `lag=0` (or no `lag`) is bit-identical to an unlagged route, so the argument is a strict superset. A **non-finite** lag (`NaN`/`Inf`) is a different matter: it is rejected at fit-init with `E_DOSE_ATTR_NONFINITE`, and one arising mid-fit makes that subject’s predictions `NaN` rather than aborting the run.
+
+A plain **infusion** (`RATE>0`) into a per-route-lagged compartment composes as expected (the whole infused-kernel appearance is delayed by `lag`). **Steady-state** dosing (`SS=1`) into a per-route-lagged compartment is supported ([above](#ss-absorption-lag), \#2786).
+
+### Closed-form evaluation
+
+A parallel / mixed / per-route-lagged model with a **linear disposition** (1- or 2-compartment) whose pathways are all `first_order`, `zero_order`, `transit`, or `igd` is evaluated **without integrating the ODE**. Because the disposition is linear and time-invariant its inputs superpose, so the observable is a fraction-weighted sum of the *single-route* closed forms, each shifted by its onset:
+
+$$y(t) = \sum_k \text{FR}_k \cdot C_k\!\left(t - \text{LAG}_k\right)$$
+
+ferx recognises the disposition from the compiled model **by its behaviour, not by how it is written**: it probes the RHS for a constant, canonical 1-/2-compartment Jacobian and reads the observable’s scale off the readout, so `- CL/V*central`, `- KE*central`, and micro-constant forms are all detected, while a non-linear disposition (e.g. Michaelis–Menten) is *declined* and integrated instead. The closed form is used for `predict()`, `simulate()`, and finite-difference fits; it reduces to the integrated `[odes]` twin to solver tolerance, and so to the same NONMEM `$DES` optimum the twin already matches. An **analytic-sensitivity** (default) FOCE/FOCEI fit on the same static subjects also skips the ODE integration for its gradient — the disposition-recovery and superposition formulas are evaluated once over dual numbers instead of over plain doubles, giving the exact `∂/∂(θ,η)` jet with no separate integration pass.
+
+It applies only to **static** subjects: a time-varying covariate, IOV, a reset (`EVID 3/4`), a steady-state or infusion dose, a compartment-indexed `F{c}`/`ALAG{c}`, a `weibull` pathway, or a route in its flip-flop domain routes the subject back to the ODE solver automatically — the result is identical, only slower.
+
+> **NOTE:**
+>
+> A per-route `lag=` on a **`first_order`**, **`zero_order`**, **`transit`**, or **`igd`** forcing is fit with **exact analytic** FOCE/FOCEI gradients ([\#859](https://github.com/FeRx-NLME/ferx-core/issues/859)). The event-driven walk gives each route its own onset event at `dose + lag_cmt + lag_route`: for the discontinuous kernels (`first_order`, `zero_order`) that onset injects a rate-on saltation carrying the combined `∂/∂(lag_cmt + lag_route)` jet — and a route-lagged `zero_order` window also carries the same jet on its rate-off at the window end; for the smooth kernels (`transit`, `igd`) the onset is continuous (`R_in → 0`), so the route lag flows through the continuous `∂R_in/∂lag_route` alone, with a timeline break at the onset. The predicted values are unchanged — only the gradient moves off finite differences.
+>
+> A per-route lag on a **`weibull`** forcing is analytic too (see the lagtime note above: its bolus is delivered as absorbed mass, with no onset to cross). A per-route lag combined with **IOV** (`κ`) is analytic too (formerly [\#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
+
+### Sensitivities
+
+Both `parallel` (smooth `first_order` terms) and `mixed` (a `zero_order` term alongside a `first_order` one) keep **exact analytic** (`Dual2`) FOCE/FOCEI gradients — including the derivatives with respect to the pathway fraction and the zero-order **duration**: the moving-boundary `∂/∂dur` is carried by the rate-off saltation at the cutoff ([\#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). Both families are now analytic combined with an EVID 3/4 reset, **time-varying covariates**, *or* an estimated **lagtime** (#486): **`parallel`** (two `first_order` terms, no `zero_order`) because every forcing feeding the compartment is a smooth density carried on the event-driven walk; **`mixed`** because that walk now also carries the `zero_order` term’s moving-boundary window (delivered as a per-segment constant, with rate-on / rate-off saltations at its moving start / end). In the `mixed` case the two forcings switch on together at the lagged arrival, so their onset saltations sum on the shared compartment. The **IOV** path shares this same event-driven walk, so **all** of these families (`igd`/`transit`/`weibull`/`first_order`, `zero_order`, `mixed`, `parallel`) are analytic under IOV too (#486); the only holdouts are `weibull` + lagtime and any forcing combined with a **steady-state** dose (the dual SS equilibration does not spread the forcing over the cycle).
+
+### Worked examples — analytic gradients
+
+[`examples/parallel_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/parallel_absorption.ferx) and [`examples/mixed_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/mixed_absorption.ferx) are self-contained; run either on simulated data:
+
+``` bash
+cargo run --release -p ferx-cli -- examples/parallel_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/mixed_absorption.ferx --simulate
+```
+
+The value path is anchored by an **in-engine superposition oracle** (`tests/parallel_mixed_absorption.rs`): by the linearity of the disposition ODE, a dual-pathway curve is *exactly* the fraction-weighted sum of its single-pathway curves, so `parallel ≡ FR1·first_order(ka1) + FR2·first_order(ka2)` and `mixed ≡ FZO1·first_order(ka) + FZO·zero_order(dur)` to numerical precision. Each is *also* anchored against a licensed NONMEM `ADVAN13 $DES` run (committed under `nonmem_anchor/`): ferx’s FOCEI objective at NONMEM’s optimum matches NONMEM’s `#OBJV` to ~1e-5 for `parallel` (−688.019) and ~1e-4 for `mixed` (−698.966), and both recover the data-generating parameters (`tests/parallel_mixed_nonmem_anchor.rs`).
+
+The **per-route lag** ([`examples/per_route_lag_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/per_route_lag_absorption.ferx), `tests/per_route_lag.rs`) is validated two ways. First, *reduction to an already-anchored term*: a single route with `lag=L` is, by construction, the same time shift as that route on a compartment `lagtime`/`ALAG` — a lag form validated against NONMEM above — so it must predict identically, which the tests pin to 1e-5 (matching the analytic Bateman-with-lag value); by the linearity of the disposition ODE the parallel / mixed cases are then the fraction-weighted sum of these anchored single-route curves. The single-route reduction also cross-validates the two f64 integration paths (a route lag rides the static superposition walk; its compartment-lag twin rides the event-driven walk). Second, a **direct NONMEM `ADVAN13 $DES` anchor** (an immediate-release + delayed-release model, the DR pathway’s `$DES` input shifted by a per-route lag; committed under `nonmem_anchor/`): NONMEM recovers the data-generating per-route lag (`LAG2 = 3.074` from a truth of 3.0), and ferx’s FOCEI objective at NONMEM’s optimum matches NONMEM’s `#OBJV = −882.357` to ~1e-6 (`tests/per_route_lag_nonmem_anchor.rs`).
+
+## Numerical note
+
+The transit input is integrated numerically through the ODE solver (the same RHS-wrapper mechanism that injects `+rate` for infusions). An analytical closed form for continuous-`n` transit (via the regularized incomplete gamma function) is planned so 1-/2-compartment transit models can stay in the analytical engine — see `plans/absorption-models.md`.
+
+## Verification against NONMEM
+
+### Savic transit (`transit`)
+
+The Savic transit model was validated against NONMEM (`ADVAN13 TOL=9`, FOCEI) on a 20-subject / 240-observation single-dose oral dataset simulated from the model (`TVCL=5`, `TVV=50`, `TVKA=1`, `TVMTT=1`, `TVN=3`; IIV on CL & V ω²=0.09; proportional SD 0.15). The NONMEM control stream, dataset, and ferx model live in `nonmem_anchor/` in the repository.
+
+| Quantity  | Truth  | NONMEM   | ferx (default tols) |
+|-----------|--------|----------|---------------------|
+| OFV       | —      | −1077.13 | **−1077.1258**      |
+| TVCL      | 5.0    | 5.386    | 5.3855              |
+| TVV       | 50.0   | 56.169   | 56.1694             |
+| TVKA      | 1.0    | 0.952    | 0.9523              |
+| TVMTT     | 1.0    | 0.965    | 0.9651              |
+| TVN       | 3.0    | 3.133    | 3.1332              |
+| ω²(CL)    | 0.09   | 0.0480   | 0.0480              |
+| ω²(V)     | 0.09   | 0.0431   | 0.0431              |
+| σ² (prop) | 0.0225 | 0.0255   | 0.0255              |
+
+**At the default tolerances ferx matches NONMEM to every figure NONMEM prints** — including both variance components, which the fixed effects had always agreed on but ω² had not. The apparent departure from truth in ω² is a property of this 20-subject dataset, not of either engine: both recover ≈0.048 / 0.043 against a simulated 0.09.
+
+### Tolerance sensitivity
+
+The same fit swept across four orders of magnitude of `ode_reltol` / `ode_abstol`, re-measured 2026-09-16 on `nonmem_anchor/transit_savic_fit.ferx` (#520):
+
+| `ode_reltol` / `ode_abstol` | OFV | ω²(CL) | ω²(V) | SE(TVMTT) | wall (20 subj, 2 threads) |
+|----|----|----|----|----|----|
+| **`1e-4` / `1e-6` (default)** | **−1077.1258** | **0.04800** | **0.04307** | **0.05271** | 1.5 s |
+| `1e-6` / `1e-8` | −1077.1256 | 0.04800 | 0.04307 | 0.05270 | 1.9 s (1.3×) |
+| `1e-8` / `1e-10` | −1077.1256 | 0.04800 | 0.04307 | 0.05271 | 2.7 s (1.8×) |
+| `1e-10` / `1e-12` | −1077.1256 | 0.04800 | 0.04307 | 0.05271 | 3.9 s (2.5×) |
+
+Every reported quantity is flat to four significant figures across the whole sweep; the only thing tightening buys is a 2.5× longer fit. **There is no reason to tighten `ode_reltol` on a transit model for the sake of the estimates.**
+
+> **NOTE:**
+>
+> Before 2026-09-16 this section carried a table showing ω² off by ~15 % at the default and advised tightening `ode_reltol` / `ode_abstol` toward `1e-9`. That measurement was taken on 2026-06-17, two days after `transit()` landed, and it no longer reproduces: the exact analytic FOCE/FOCEI gradient (#367 / \#381) and the analytic covariance R-matrix for `[odes]` models (#1291) both arrived after it, and the analytic route differentiates the trajectory rather than second-differencing the objective, so a loose tolerance no longer reaches the estimates through that `1/h²` mechanism — every quantity in the table above is flat across the sweep. That is a statement about one mechanism, not a claim that the analytic route is step-free: its third-order assembly still finite-differences the `Dual2` jet, and [\#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505) measured that step crossing a lagged-dose arrival (`SE(TVLAG)` 27 % low); the sweep now bounds the step by the observation-to-arrival gap, and a subject whose mode sits on the arrival declines to the per-subject salvage instead. Standard errors on the **finite-difference** covariance route are a separate question again — see the `ode_reltol` row in [fit options](../model-file/fit-options.llms.md#ode-solver-tolerances) and issue \#520.
+
+### Freijer & Post inverse-Gaussian (`igd`)
+
+`igd(mat, cv2)` was cross-checked against a NONMEM `$DES` inverse-Gaussian run (`nonmem_anchor/freijer_ig.ctl`, `ADVAN13 TOL=9`, FOCEI) on the same 20-subject / 240-observation dataset (re-keyed to one central compartment so the dose feeds the `igd` input — likelihood-equivalent to the control’s inert depot + `PODO`). Because the data were simulated from a transit model, the IG fit is mildly mis-specified, so this is an **implementation** check (NONMEM-igd ≈ ferx-igd on identical data), not a parameter-recovery check.
+
+On the mis-specified objective the likelihood surface has a long flat ridge: NONMEM’s gradient FOCEI climbs it to `MAT≈6.07`, whereas ferx’s default derivative-free outer optimiser stalls partway up (full-fit OFV ≈ −881). The optimiser *path* on a flat surface is not the implementation check — the **objective at the optimum** is. (This stall is the ODE analogue of the fixed-EBE gradient bias that the analytic FOCE/FOCEI gradient work — issues \#367 / \#381 — removes for *analytical* models; extending that exact gradient to ODE models via sensitivity equations is the path to converging such fits.) Evaluating ferx’s full FOCEI objective (inner EBEs + Laplace + ODE integration of the `igd` forcing) at NONMEM’s reported optimum reproduces it:
+
+| Quantity | NONMEM | ferx (at NONMEM’s optimum, `ode_reltol=ode_abstol=1e-9`) |
+|----|----|----|
+| FOCEI objective | −899.38 | **−899.39** (Δ 0.02) |
+
+evaluated at `CL 5.612`, `V 33.95`, `MAT 6.071`, `CV2 1.868`. The 0.02-unit agreement confirms the `igd` density and its ODE machinery reproduce the NONMEM `$DES` inverse-Gaussian input (`nonmem_anchor/results/freijer_ig.ext`; the ferx anchor is `tests/igd_nonmem_anchor.rs`, gated behind `--features slow-tests`).
+
+### Weibull (`weibull`)
+
+The Weibull NONMEM cross-check uses the same `$DES` implementation-anchor design as `igd`: a NONMEM `ADVAN13 TOL=9` FOCEI control with the Weibull density forcing (`nonmem_anchor/weibull_absorption.ctl`) and the matching ferx model (`nonmem_anchor/weibull_absorption_fit.ferx`), run on the shared `igd_oral.csv` dataset. Because the data were simulated from a transit model, the Weibull fit is mildly mis-specified, so the check is **NONMEM-weibull ≈ ferx-weibull at the shared optimum** (the objective, not the optimiser path), not parameter recovery.
+
+As for `igd`, the path-independent implementation check is the **objective at the shared optimum**. Evaluating ferx’s full FOCEI objective (inner EBEs + Laplace + ODE integration of the `weibull` forcing) at NONMEM’s reported optimum reproduces it (NONMEM `ADVAN13 TOL=9`, MINIMIZATION SUCCESSFUL):
+
+| Quantity        | NONMEM  | ferx (at NONMEM’s optimum) |
+|-----------------|---------|----------------------------|
+| FOCEI objective | −943.83 | **−943.85** (Δ 0.01)       |
+
+evaluated at `CL 5.398`, `V 63.02`, `TD 1.656`, `BETA 3.479`. The 0.01-unit agreement confirms the `weibull` density and its ODE machinery reproduce the NONMEM `$DES` Weibull input (`nonmem_anchor/results/weibull_absorption.ext`; the ferx anchor is `tests/weibull_nonmem_anchor.rs`, gated behind `--features slow-tests`). Unlike the stiffer transit/IG forcings, the smooth Weibull density matches to 0.01 even at default ODE tolerances. The forcing is additionally validated in-repo without NONMEM by the absorption-independent **mass-balance invariant** `∫A dt = F·Dose/ke` (`tests/weibull_absorption.rs`) and the **analytic-`Dual2` ≡ central-FD gradient** parity (`src/pk/absorption.rs`, `src/sens/ode_provider.rs`).
+
+A **free fit also converges** under the default [`optimizer = auto`](../model-file/fit-options.llms.md), which selects gradient-based NLopt L-BFGS whenever the exact analytic outer gradient is available — and the `weibull()` forcing now provides it through the `Dual2` ODE-sensitivity path. From generic initials the free fit lands essentially **on** the NONMEM optimum; the legacy derivative-free `bobyqa` (the pre-`auto` default) is shown for contrast:
+
+| Quantity | NONMEM | `auto` → L-BFGS (default) | Δ vs NM | legacy `optimizer = bobyqa` |
+|----|----|----|----|----|
+| OFV | −943.8326 | **−943.8326** | ~1e-6 | −942.359 (+1.47) |
+| TVCL | 5.39758 | 5.39762 | +0.007 % | 5.4237 |
+| TVV | 63.0166 | 63.0172 | +0.001 % | 63.868 |
+| TVTD | 1.65572 | 1.65571 | −0.001 % | 1.6581 |
+| TVBETA | 3.47905 | 3.47907 | +0.001 % | 3.4750 |
+| ω²(CL) | 0.050675 | 0.050671 | −0.008 % | 0.0343 |
+| ω²(V) | 0.042042 | 0.042046 | +0.010 % | 0.0493 |
+| σ²(prop) | 0.0479645 | 0.047964 | −0.001 % | 0.0490 |
+
+Under `auto` → L-BFGS the free fit matches NONMEM to **~1e-6** in OFV and **\< 0.01 %** on every fixed effect and variance component. The legacy `bobyqa` instead stalls ~1.47 units short: a derivative-free trust-region method cannot resolve the shallow descent direction on the flat mis-specified ridge from function values alone — a pure optimiser artefact, not a density issue (the shared-optimum check above rules that out at 0.01 units). This run doubles as an end-to-end verification that `auto` plus the analytic `Dual2` ODE-forcing gradient resolve and converge on a `weibull()` model.
+
+### Zero-order (`zero_order`)
+
+`zero_order(dur)` is, by definition, a zero-order infusion of duration `dur` — i.e. NONMEM’s modeled-duration case (`RATE=−2` → `D1`, rate `AMT/D1`) — so it is anchored two ways in `tests/zero_order_absorption.rs`:
+
+- **Directly against NONMEM.** `zero_order(dur=5)` (CL = 5, V = 50, AMT = 100) reproduces NONMEM’s exact ADVAN1 PRED for the matching `RATE=−2`/`D1` run — published in `tests/nonmem/modeled_duration.ctl` / `data/modeled_duration_ref.csv` — to within NONMEM’s 3-decimal output rounding (observed max ≈ `4·10⁻⁴`). This ties the absorption term to a real licensed NONMEM run, not only to an in-engine sibling.
+- **In-engine against an explicit infusion.** A `zero_order(dur=DUR)` model fed by a bolus predicts identically (to `1e-6`, across the in-window ramp, the window-end kink, and the post-window decay) to the *same disposition* fed by an explicit infusion of duration `DUR` (rate `Dose/DUR`) — pinning the new per-segment delivery against the established infusion path.
+
+The forcing is additionally validated by the absorption-independent **mass-balance invariant** `∫A dt = F·Dose/ke` and by an end-to-end **duration-recovery fit** (gated behind `--features slow-tests`). `dur`’s sensitivity is finite-difference (see the note above), so this model uses the FD gradient path rather than the analytic `Dual2` route.
+
+## Generating the disposition — `ode_template`
+
+The transit example above hand-writes the disposition ODE (`d/dt(central) = KA*depot/V - CL/V*central`). For the **standard** PK models you do not have to: `ode_template NAME(...)` tells ferx to **generate** the standard disposition ODE for a named model — the same closed-form↔︎ODE transcription that [`pk NAME(...)`](../model-file/structural-model.llms.md) uses, but written out as states you can then customise. The generated model is fully runnable on its own:
+
+``` text
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+```
+
+is exactly equivalent to writing the `ode(obs_cmt=central, states=[depot, central, periph])` structural line, the three `d/dt(...)` disposition equations, and `[scaling] obs_scale = V1` by hand. `ode_template NAME(...)` takes the **same parameters as the analytical `pk NAME(...)`** for the same model — including `ka` for the oral routes (the generated `central` equation needs the depot→central transfer constant, so it is required even when you override the depot below).
+
+Supported names: `one_cpt_iv`, `one_cpt_oral`, `two_cpt_iv`, `two_cpt_oral`, `three_cpt_iv`, `three_cpt_oral` (the `*_compartment_*` spellings also work).
+
+### Override semantics — re-declare a compartment to replace it
+
+To add absorption (or any custom dynamics), re-declare that compartment’s equation in `[odes]`. A `d/dt(X)` you write **replaces** the template’s equation for compartment `X`; every compartment you leave undeclared keeps its generated equation. (There is no `+=` append form — an override is a full replacement.)
+
+``` text
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[odes]
+  # Replaces the generated depot equation with a transit input;
+  # d/dt(central) and d/dt(periph) keep their generated equations.
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot
+```
+
+A `d/dt(X)` for a compartment the template does not generate is an error (it names the generated states) — write a fully hand-written `ode(...)` model if you need a different compartment structure.
+
+## The error rule — ODE-only absorption needs an ODE disposition
+
+`transit(...)`, `igd(...)`, `weibull(...)`, and `zero_order(...)` are currently served by numerical ODE integration, so they can only feed an ODE disposition. Combining one with an analytical `pk NAME(...)` is a **hard error**, not a silent conversion:
+
+``` text
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)   # analytical — closed form
+
+[odes]
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot   # ERROR
+```
+
+ferx rejects this and points you at the fix: replace `pk two_cpt_oral(...)` with `ode_template two_cpt_oral(...)` and keep the `transit(...)` override in `[odes]`. ferx never silently turns an analytical `pk` request into an ODE — asking for the closed-form model and getting numerical integration instead would be a surprise.
+
+`transit` and `igd` both have closed-form convolutions with 1-/2-compartment disposition (planned via the analytical incomplete-gamma / inverse-Gaussian forms, `plans/absorption-models.md`), so this restriction is interim for them. `zero_order` is also closed-form-able (it is a zero-order infusion), so its rule is likewise interim — it ships on the ODE path first and leaves the list when the closed-form acceleration lands. **Weibull has no elementary closed form, so its error rule is permanent** — `weibull(...)` will always require an explicit ODE disposition.

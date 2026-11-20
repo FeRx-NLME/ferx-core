@@ -1,0 +1,376 @@
+# Outer Optimizers
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The **outer optimizer** is the algorithm that minimises the population objective function (OFV) over the transformed parameter vector `[log θ, chol(Ω), log σ]`.
+
+It only applies to methods that *have* a single outer-loop minimisation over that vector:
+
+| method | does `optimizer` apply? |
+|----|----|
+| `foce` / `focei` | yes — picks the algorithm for the population OFV minimisation |
+| `gn` (pure Gauss-Newton) | no — GN runs its own trust-region loop |
+| `gn_hybrid` | yes for the FOCEI polish phase only; the preceding GN phase ignores it |
+| `saem` | **no** — SAEM has no single outer minimisation; the M-step uses a hardcoded NLopt algorithm and is not user-selectable. Setting `optimizer` under `method = saem` triggers a warning and is otherwise ignored. |
+| `[saem, focei]` (chain) | applies to the FOCEI polish stage only |
+| `imp` | no — IS is a sampling pass, not an optimisation |
+
+Set via `[fit_options]`:
+
+    [fit_options]
+      method    = focei
+      optimizer = auto
+
+The default `optimizer = auto` picks the algorithm per model (see [`auto`](#the-auto-default) below); name a specific optimizer to override it.
+
+------------------------------------------------------------------------
+
+## Available optimizers
+
+### Automatic selection
+
+| Key | Algorithm | Notes |
+|----|----|----|
+| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are. A `[mixture]` model follows the same rule. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
+
+### NLopt algorithms
+
+| Key | Algorithm | Notes |
+|----|----|----|
+| `bobyqa` | Bounded Optimization BY Quadratic Approximation | Derivative-free quadratic trust-region; what `auto` selects on FD-only fits. Avoids the fixed-EBE gradient bias that stalls gradient methods on ill-conditioned fits; consistently reaches a lower OFV on ODE/PD models, sparse data, and Hill-ridge problems without reconverging the inner loop. |
+| `slsqp` | Sequential Least Squares Programming | Gradient-based, handles bounds well. Fast on well-conditioned analytical PK models; can stall above the true minimum on ODE/PD / sparse-data fits unless paired with `reconverge_gradient_interval = 1` (5–6× cost). |
+| `nlopt_lbfgs` | L-BFGS via NLopt | Limited-memory BFGS. Fast on analytical 1-/2-/3-cpt FOCE/FOCEI fits (exact analytic gradient); also useful for high-parameter-count models. |
+| `mma` | Method of Moving Asymptotes | Alternative constrained gradient optimizer. Rarely needed. |
+
+### Deprecated aliases
+
+| Key     | Algorithm       | Notes                                           |
+|---------|-----------------|-------------------------------------------------|
+| `bfgs`  | → `nlopt_lbfgs` | **Deprecated alias.** Now selects NLopt L-BFGS. |
+| `lbfgs` | → `nlopt_lbfgs` | **Deprecated alias.** Now selects NLopt L-BFGS. |
+
+> **NOTE:**
+>
+> `bfgs` and `lbfgs` previously selected a hand-rolled built-in BFGS / limited-memory L-BFGS. Benchmarking showed that path was strictly worse than NLopt L-BFGS — 3–5× slower on analytic-gradient models and prone to diverging or hanging on harder problems ([\#483](https://github.com/FeRx-NLME/ferx-core/issues/483)) — so both keys are now aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
+
+### Newton trust-region
+
+| Key | Algorithm | Notes |
+|----|----|----|
+| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ dᵢdᵢᵀ` built from the same per-subject total derivatives `dᵢ` the gradient sums (always positive semi-definite; [\#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. Stops when it can no longer make progress — see [convergence reporting](#trust-region-convergence-reporting). |
+
+### Trust-region convergence reporting
+
+`trust_region` stops once it has gone 20 consecutive iterations without measurable progress — no objective improvement beyond `outer_ftol` and no parameter movement beyond `outer_xtol` (default `1e-4`, relative). `outer_ftol` is resolved exactly as it is for `bobyqa`: `1e-8` for a pure non-Gaussian (TTE / categorical) non-ODE objective and `1e-6` otherwise, with an explicit `[fit_options] outer_ftol` always winning. A run that instead exhausts `maxiter` is reported as **`Converged: NO`**, with a warning naming the budget it ran out of and the gradient norm it stopped at.
+
+Because progress is an *or* — the objective improved **or** the parameters moved — and a rejected trust-region step moves neither, 20 no-progress iterations means 20 consecutive *rejections*: the radius has shrunk by roughly `0.25²⁰ ≈ 1e-12` from the last accepted step. That is the real content of the count, and it is why it does not need tuning per model.
+
+Two consequences worth knowing:
+
+- Demonstrating settling costs at least 21 outer iterations, so a fit run with `maxiter` below that can never report `Converged: YES` however good it is. The warning says so explicitly rather than blaming the fit.
+- A run that rejects *every* step from the first iteration has not converged, it failed to start. That is reported as its own non-convergence reason — pointing at the starting values, not the budget — and the fit bails out there instead of spending the rest of `maxiter` on a frozen state.
+
+Before [\#1000](https://github.com/FeRx-NLME/ferx-core/issues/1000) every `trust_region` run reported `Converged: YES`, including one that had simply run out of iterations: the underlying solver has no convergence criterion of its own, so hitting `maxiter` was its only way to stop. On `examples/one_cpt_iv_pooled.ferx` with `data/one_cpt_iv.csv`:
+
+| `maxiter` | OFV | reported (before) | reported (now) |
+|----|----|----|----|
+| 5 | 11325.8283 | `Converged: YES` | `Converged: NO` (budget below the 21-iteration floor) |
+| 300 | 8504.4349 | `Converged: YES` | `Converged: NO` |
+| 2000 | −269.6370 | `Converged: YES` | `Converged: YES` (at iteration 1920) |
+
+The true optimum is −269.6370 (NONMEM `$OMEGA 0 FIX` anchors it at −269.63700440), so the first two rows were 8 000–11 000 OFV units off and reported as converged, with standard errors computed at a non-stationary point.
+
+The stopping rule is deliberately **not** a gradient test. The outer gradient is evaluated at EBEs held fixed within the iteration, which makes its norm an unreliable stationarity measure on an ODE model: on `one_cpt_iv_ode` the norm at the optimum the default optimizer reaches (OFV −387.0737) is 43.2, while a *worse* point 0.73 OFV units away carries 4.0 — not monotone in solution quality, so no threshold separates the two. Objective and step size are the noise-robust measures, and they are what `bobyqa` already stops on.
+
+Stopping early also saves work: the warfarin fit settles at iteration 59 and now returns there rather than grinding out the remaining budget.
+
+Note that “converged” still means *this optimizer stopped making progress*, not that the point is a verified global optimum — a `trust_region` fit can settle slightly above the optimum other optimizers reach ([\#864](https://github.com/FeRx-NLME/ferx-core/issues/864)). Compare against a second optimizer when the OFV matters.
+
+One more thing changes for multi-start users: `n_starts` ranks candidates by validity, then by *converged*, then by OFV. Every `trust_region` start used to report `Converged: YES`, so that middle key was inert and selection came down to OFV. Now that budget exhaustion reports honestly, a start that settled can be preferred over one that was still descending when it ran out of iterations, even if the latter reached a lower OFV. Give `trust_region` multi-starts a `maxiter` generous enough that the good start is allowed to settle.
+
+------------------------------------------------------------------------
+
+## When to use which
+
+**`auto` (default)** — leave this in place for most fits. It inspects the model and picks `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available and `bobyqa` when only finite differences are — the two choices that came out fastest-and-most-reliable in the \#490 benchmarking (see [The `auto` default](#the-auto-default)). Override it only when you have a model-specific reason to pin a particular optimizer.
+
+**`bobyqa`** — what `auto` selects on FD-only problems, and a fine explicit choice there. Derivative-free quadratic trust-region; re-evaluates EBEs at every trial point so it avoids the fixed-EBE gradient bias that stalls gradient-based optimizers on ill-conditioned fits. On the cefepime 2-cpt benchmark below it reaches a lower OFV than `slsqp` (even reconverged at full cost) in less wall time. Works equally well on smooth analytical PK models — converges more slowly than gradient methods per iteration but each iteration is cheap (no FD gradient sweep).
+
+**`slsqp`** — switch to this when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can need many quadratic-interpolation samples to triangulate a high-dimensional surface). Gradient-based, handles box constraints cleanly; pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
+
+**`trust_region`** — for models with many parameters (large θ + Ω) or when combined with `inits_from_nca`. The second-order curvature information helps when starting values are already in the basin.
+
+**`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](../estimation/gauss-newton.llms.md), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it. (`gn_hybrid` polishes via FOCEI and inherits the `optimizer` setting for that stage — so the polish runs with the `auto`-selected optimizer unless overridden.)
+
+**`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (the [known FD fallbacks](../estimation/foce.llms.md#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. TTE, binary and CTMM endpoints are inside it: their outer gradient is the exact marginal one, EBE response included ([TTE: the outer gradient](../estimation/tte.llms.md#outer-gradient-reconverged)). **`mma`** is rarely needed.
+
+> **Why these two?** `bobyqa` doesn’t use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](../estimation/saem.llms.md) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since \#490) routes each model to the right one of the two automatically; before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
+
+------------------------------------------------------------------------
+
+## The `auto` default
+
+`optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
+
+- **`nlopt_lbfgs`** — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
+- **`bobyqa`** — otherwise: a model the recorders cannot serve (a hand-built `CompiledModel` with no compiled individual-parameter program), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+
+Two cases override that rule:
+
+- **More than 64 free packed parameters** (`BOBYQA_MAX_DIM`) → `nlopt_lbfgs` even on a finite-difference gradient. BOBYQA’s interpolation set grows quadratically with the parameter count, so above that size O(n) FD passes are cheaper (#1064).
+- **Mixture models** (`[mixture]`) follow the same rule: `nlopt_lbfgs` on the exact posterior-weighted mixture gradient, for every method including Laplace and AGQ (#3025). Before \#3025 `auto` was `bobyqa` for a mixture whatever the gradient.
+
+Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
+
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with NLopt L-BFGS is reported as `nlopt_lbfgs`, with a warning; an explicit `bobyqa` or NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured, with no warning. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+
+### `gradient = fd` moves the optimizer too
+
+Because `auto` resolves off the availability of the analytic gradient, changing **one** line in `[fit_options]` — `gradient = auto` to `gradient = fd` — changes **two** factors: the gradient the outer loop computes, *and* the optimizer that consumes it. On the model that prompted [\#1381](https://github.com/FeRx-NLME/ferx-core/issues/1381) that one-line change moved the OFV by 4.98; with `optimizer = bobyqa` pinned in both arms, the gradient alone accounted for **0.38**. The other 4.6 was the optimizer swap.
+
+The default is not wrong — picking the optimizer that suits the available gradient is the whole point of `auto`, and it rests on the \#490 benchmarking above. But a controlled one-variable experiment has to pin the other variable:
+
+    [fit_options]
+    gradient = fd
+    optimizer = bobyqa      # pin it in BOTH arms, so the difference is the gradient
+
+ferx warns when you don’t. Setting `gradient = fd` while leaving `optimizer` at `auto`, on a model whose analytic gradient *is* in scope, emits `W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT` naming both the optimizer that ran and the one the unforced arm would use. `ferx check` reports it too, against the `gradient` line itself, so the coupling surfaces before the fit is run.
+
+The warning is silent whenever nothing was actually coupled — `optimizer` pinned; a model out of analytic scope anyway, where `auto` picks `bobyqa` either way; a model above `BOBYQA_MAX_DIM`, where `auto` takes `nlopt_lbfgs` on a finite-difference gradient regardless; an evaluation-only (`maxiter = 0`) run, which constructs no optimizer at all.
+
+Two related fields record the *effect* after the fact rather than the coupling: `optimizer` reports the compound `"auto (bobyqa)"`, and `final_gradient_source` reports a post-fit `"analytic"` or `"finite_difference"` gradient, not `"optimizer"`, for an arm that silently became derivative-free.
+
+### Leaving the initial estimates
+
+Both gradient-based NLopt optimizers start with their quasi-Newton Hessian set to the identity, so their opening search direction is simply $-\nabla f$. On a typical PK model the scaled analytic gradient is large at the initial estimates ($10^2$–$10^3$ in log/Cholesky space), so that first step lands in a corner of the parameter box, the objective there explodes, and the line search fails — leaving the fit sitting on (or a hair off) its initial estimates for the rest of the budget.
+
+ferx rescales the gradient by a single scalar on that opening step, so it stays inside a sane per-dimension budget. The direction is unchanged. The rescale is deliberately *not* held on afterwards: L-BFGS reconstructs its Hessian from successive gradient differences, and rescaling those differences corrupts the curvature it has learned (SLSQP re-solves its subproblem from scratch each step, so it is rescaled throughout).
+
+If the fit nevertheless ends up still on its initial estimates, ferx re-runs it once from the same start with the rescale **held on until the fit escapes** — a fit that never moved has no curvature worth protecting. The second attempt is reported only if it both left the initial estimates *and* reached a lower OFV; if it stalled as well, the first attempt stands (together with its “did not converge” warning), so a fit reported as non-convergent is never one that quietly picked up a lower objective at a point it never reached. A fit that was descending normally never triggers any of this and follows exactly the trajectory it always did.
+
+A fit that nonetheless fails to leave its initial estimates **through this path** is reported with `converged = false` and a “did not converge” warning — never as a converged fit whose estimates and standard errors happen to be the starting values. If you see this, the usual remedies are better initial estimates, a different `optimizer`, or `parameter_scaling` (see [`fit_options`](../model-file/fit-options.llms.md)).
+
+That guarantee covers the case where the optimizer itself reports failure. It does not cover a derivative-free optimizer that reports *success* at the start — BOBYQA can meet its own `outer_xtol` without having travelled anywhere, and then `converged = true` is a statement about the step size, not about the objective. Since \#997 every fit that ends with no free THETA, OMEGA or SIGMA coordinate moved carries a [`stalled_at_init`](../warnings.llms.md#codes-identifiability) warning regardless of what the optimizer concluded. The check is deliberately all-or-nothing — it fires only when *nothing* moved. A per-parameter version would be worse than useless: an initial estimate close to the truth is one a good optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
+
+### A warm start at an optimum
+
+A fit started at a previous fit’s final estimates (a bootstrap sample, a refit of a search winner, a model written back out with its estimates as initial values) has nowhere to go, so it does not move either. Displacement alone cannot tell that from a stall, and before [\#2506](https://github.com/FeRx-NLME/ferx-core/issues/2506) such a refit came back at the same OFV with `W_STALLED_AT_INIT` and, on L-BFGS and BOBYQA alike, `converged = false`.
+
+When the NLopt outer loop ends without leaving its start, it now asks the optimizer whether the start is an optimum: it **restarts from a perturbation of the start** (every free coordinate moved by 0.1 in the optimizer’s scaled space, alternating in sign and turned around at a bound; a tight box may shorten a coordinate’s move, and the restart runs as long as some coordinate moves at least 0.01) on what is left of the fit’s `maxiter` budget, and compares where that restart ends with the objective at the start.
+
+- **It converges back**, to within 0.01 OFV (about ten times the largest gap measured on warm refits, 1.1e-3 under Gauss–Newton): the start was an optimum, and **the restart’s verdict is what is reported** — its `converged` flag and warnings, as for any fit. None of the verdict of the run that did not move is carried over, so every check that run would have failed (the plateau rule, the EBE start-dependence check, the objective gate) is asked again of the restart and answered on its own merits. The reported **point** is the lower of the two: the restart’s estimates and objective, or the start’s when the restart ended above it (it stops on its own tolerance, so it can end slightly above a start that was already the optimum; a fit never reports a point worse than one it evaluated). While the reported estimates are still within the escape step of the start, `FitResult::stationary_start` is `true` and no `stalled_at_init` warning is raised, so `Strictness::default()` passes a converged restart. Measured on warm refits of `two_cpt_iv` (L-BFGS, BOBYQA, AGQ) and a two-class mixture, the restart ends within `1e-5` OFV of the start (Linux).
+- **It finds a lower objective**, by more than 0.01: the start was a stall, and it is **reported as one**: the run that did not move, with `W_STALLED_AT_INIT`, so a bootstrap drops the sample and `Strictness::default()` fails it, however far the restart got. A warning names the lower objective the restart reached, so you know better estimates are within reach; refit from different initial estimates. A stop the optimizer reported as a success (BOBYQA can meet its `xtol` at the start) is treated the same way. On L-BFGS the retry for a stall at the start (identity-Hessian cap held on) still runs afterwards.
+- **Anything else** (it did not converge, or converged higher, in another basin; no budget was left): no verdict. The fit is judged by displacement as before, and its warning says the start *may* have been an optimum rather than asserting it was not.
+
+Because the question is answered by the optimizer itself, bounds, flat directions and saddles are handled the way every fit handles them, and the check covers any model and objective, AGQ and mixtures included. It costs one extra optimization from near the start, paid only by a fit that did not move. A basin-shift or mid-descent restart that does not leave its own start is asked the same question ([\#2707](https://github.com/FeRx-NLME/ferx-core/issues/2707), [details](../estimation/foce.llms.md#restart-at-its-own-start)).
+
+A model with a `profile`d θ block runs the same check ([\#2591](https://github.com/FeRx-NLME/ferx-core/issues/2591)). Only its structural coordinates count as moving or get perturbed: the profiled levels are re-solved at every evaluation, so they never stay at their initial values. When the levels are the only estimated parameters (every structural parameter `FIX`), there is nothing to restart. The fit is a single profile solve, which puts the levels at their minimum, so it is reported converged and is never flagged as a stall.
+
+The other FOCE-family outer optimizers run the same restart: the built-in `bfgs` / `lbfgs` loops, `trust_region`, and `method = gn` / `gn_hybrid`. Their movement test and perturbation are measured in the space each optimizer steps in: the built-in BFGS loops’ scaled space (`parameter_scaling`), Gauss–Newton’s (`scale_params`), and the packed (log / Cholesky) space for trust-region, which does not scale. BFGS and trust-region restart on what is left of `maxiter`. Gauss–Newton does not count the iterations it used, so its restart gets a fresh `maxiter`. Each outcome is reported exactly as on the NLopt path. Other estimators (SAEM, IMP, Bayes, VI) do not run it.
+
+### A THETA on the log-packing floor
+
+A THETA declared non-negative (`theta CL(1.0, 0.0, 100.0)`) is optimized as `ln θ`, floored at `1e-10`. On that floor the gradient the optimizer sees is `θ · ∂OFV/∂θ`, which is `1e-10` times the real slope, so a point where the objective still falls steeply as the THETA rises looks stationary, and every check that asks “can a fresh leg improve on this?” says no. A large first step can put a THETA there. On the profiled MBMA anchor ([\#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339)), starting the baseline at 55 instead of 45 sent it to the floor on the first L-BFGS step. The between-arm κ grew to 2071 to absorb the baseline, and the fit used to stop `converged = true` 171.9 OFV above NONMEM’s optimum. NONMEM reached the optimum from the same start.
+
+Since \#2339, after the outer optimizer of a FOCE-family fit stops, ferx checks every free THETA on that floor that started above it. It evaluates the objective once with the THETA at 1/1000 of its start, everything else held. If that is lower by more than `1e-6`, the floor is not a minimum, and the fit is restarted from its own estimates with that THETA back at its start. Any variance coordinate that collapsed onto its lower rail is reset along with it, since a collapsed THETA drags one with it. The restart is reported only if it ends lower (an `optimizer_health` warning names the THETA and both objectives). If it ends no lower, or on the floor again, the fit is reported `converged = false` with a `convergence` warning. The same holds when the restart leaves a THETA just above the floor, below 1/1000 of its start, where two more evaluations (that point, and the THETA at 1/1000 of its start) show the objective still falling as it rises ([\#2629](https://github.com/FeRx-NLME/ferx-core/issues/2629)). A THETA whose objective rises off the floor is a genuine boundary estimate and is left alone; only `n_iterations` counts the evaluation ([\#2850](https://github.com/FeRx-NLME/ferx-core/issues/2850)). The check costs one evaluation on a fit that ended on the floor, two more after a restart that left a THETA that low, and nothing on any other. The restart gets a fresh `maxiter` budget, so `n_iterations` on such a fit can exceed it.
+
+The same model has a genuine second mode, which this check rightly does not touch. At OFV ≈ 104.68, ω(ETA_EM) has collapsed onto its variance rail, 2.77 above the optimum, and both ferx and NONMEM stop there when started near it. A start far from the expected estimates can reach a mode like that on any model. Compare fits from two or three starts, or use a [global pre-search](#global-pre-search), when the starts are uncertain.
+
+### A variance collapsed far below its start
+
+Because a variance is optimized as the log of its standard deviation, the gradient the optimizer sees for it is `2·ω² · ∂OFV/∂ω²`: the real slope scaled down by the variance itself. A quasi-Newton step built while other parameters are still far from their optimum can throw a variance down by several orders of magnitude, and where it lands the packed gradient is under tolerance even though the objective still falls as the variance rises. On a linear C-QTc mixed model ([\#3005](https://github.com/FeRx-NLME/ferx-core/issues/3005); 44 subjects, `ETA_SLOPE ~ 600`) the default L-BFGS took ω²_slope from 650 to 2.3 in four iterations and stopped `converged = true` at 0.0062, 0.72 OFV above the optimum, with the C-QTc slope at 10.5 instead of 13.5 ms per µg/mL. NONMEM, lme4 and nlmixr2 reach ω²_slope = 652 from the same starts. ferx’s objective was never the problem: scored at NONMEM’s estimates it agrees to four decimals.
+
+Since \#3005, after the outer optimizer of a FOCE-family fit stops (and after the [log-packing floor](#log-packing-floor) check above), ferx looks at every free variance below 1/1000 of its initial value: Ω and κ diagonals (a block’s Cholesky diagonal `L_ii`), σ, and `[mixture]` overrides, wherever it landed, on its internal guard included. It re-scores the stop and evaluates the objective once per such variance with that variance alone raised back to 1/1000 of its initial value, at the same one inner budget as the guard check below. Each variance that is lower there by more than `1e-6` is re-inflated to its initial value and the fit is resumed once.
+
+The outcomes are those of the guard check. A resumed run that ends lower is reported with an `optimizer_health` warning naming each variance, its value and both objectives; on the C-QTc model it reaches 3326.856470, NONMEM’s 3326.8565. One that ends no lower leaves the first stop `converged = false` with a `convergence` warning, and so does one that collapses again with the objective still falling. A variance whose objective rises when it is raised is a genuine near-zero estimate and is left alone, bit for bit; only `n_iterations` counts the evaluations. A run that the [guard check](#variance-short-of-guard) below resumes is a full optimization too, so when it adopts one, this check reads that run again, for at most two rounds; a variance a last resumed run leaves collapsed and downhill is reported `converged = false` without a further restart. Every run either check resumes also goes through the [log-packing floor](#log-packing-floor) check again, since re-inflating a variance can put a THETA on that floor. The check costs nothing on a fit with no variance that far below its start. Starting a variance closer to its expected size, `optimizer = slsqp`, or `method = gn_hybrid` avoid the collapse in the first place.
+
+### A variance stopped short of its guard
+
+A variance is optimized as the log of its standard deviation (for Ω and κ, of the Cholesky diagonal), with an internal lower guard: −6 for Ω, κ and `[mixture]` Ω overrides, −8 for σ. When the data carry no variability for a random effect, the objective falls all the way to that guard, but the fall flattens geometrically on the log scale. A derivative-free optimizer can then shrink its trust region below its `xtol` stop before it reaches the guard and report `converged = true` at a point that is not a minimum. On a two-class `[mixture]` fixture ([\#2832](https://github.com/FeRx-NLME/ferx-core/issues/2832)) BOBYQA stopped the class-2 override 1.2 log units above the guard, 0.159 OFV above the optimum. The base ω stopped short in the same way when the class labels were swapped. L-BFGS reached the guard on both.
+
+Since \#2832, after the outer optimizer of a FOCE-family fit stops (and after the [log-packing floor](#log-packing-floor) and [collapse](#variance-collapsed-below-start) checks above), ferx looks at every free variance within 2 log units of its guard but not on it: Ω and κ diagonals, σ, and `[mixture]` overrides. A block’s coordinate is its Cholesky diagonal `L_ii`, as for the [collapse hold](../estimation/parameterization.llms.md#held-parameters), so `Ω_ii` itself need not be small; for a block’s later rows the warning reports `L_ii` as the “conditional SD in its block”. ferx re-scores the stop, evaluation-only, and evaluates the objective once per variance with that variance alone on its guard, all at one inner budget (`inner_maxiter` or the default 200, whichever is larger), so a difference in budget does not read as a slope. Each variance that is lower by more than `1e-6` is moved to the guard, and the fit is resumed once with it `1e-3` above the guard. Started exactly on the guard, BOBYQA walked one variance back off it.
+
+If the resumed run ends no lower, the first stop is kept, `converged = false`, with a `convergence` warning. If it ends lower, it is reported, with an `optimizer_health` warning that names each variance (a `[mixture]` override by its class, `ETA_CL_MIX2`), its value and both objectives. The resumed run is then checked the same way. When it ended on the guard, the post-fit collapse warning names the variance as well. When it stopped short of a guard again, with the objective still falling there, it is still reported (it is lower), but `converged = false`, with a `convergence` warning that names what it left short. A variance whose objective rises on the guard is a genuine small estimate, and the fit is left untouched, bit for bit; only `n_iterations` counts the evaluations. The check costs the re-score plus one evaluation per variance in that band, and nothing on any other fit. It covers FOCE, FOCEI, Laplace and AGQ, profiled or not, but not Gauss–Newton, SAEM or VI, which run their own loops.
+
+### A BOBYQA tolerance stop is polished
+
+BOBYQA’s own stopping rules are *relative*: `outer_ftol` (default `1e-6`) on the objective change of one accepted step, and `outer_xtol` (default `1e-4`) on its trust radius. Neither one says the objective has stopped falling. At \|OFV\| ≈ 430, a single step of 4e-4 OFV satisfies the first, so a run can stop mid-descent and still report success. Before \#1782, any such stop was reported as `converged = true`.
+
+Now a BOBYQA stop on either tolerance — including the plain `Success` it returns when its trust radius reaches the `outer_xtol` floor — is treated as a checkpoint, not the end of the run. ferx restarts BOBYQA from the best point seen, at a fresh trust radius. The restart is called a *polish leg*. Its tolerances are ceilings: `ftol_rel = 1e-10` and `xtol_rel = 1e-7`, or your own `outer_ftol` / `outer_xtol` where those are tighter. Only the last leg’s stop decides `converged`.
+
+- If a leg still lowers the objective by more than 1e-3, it is followed by another, up to four polish legs.
+- All the legs share the fit’s `maxiter` evaluation budget.
+- The [stagnation guard](../model-file/fit-options.llms.md#stagnation-guard) and the plateau check still apply inside each leg. On a noisy objective a leg therefore ends on a 1e-3 plateau instead of grinding toward `1e-10`.
+
+Two endings report `converged = false`, because the tolerance stop they were meant to check is still unchecked:
+
+- **The budget runs out.** Either no evaluations are left for a polish leg, or a leg spends the rest. The fit carries the usual “hit the evaluation budget … increase maxiter” warning.
+- **The fourth leg still gained more than 1e-3.** The objective was still falling when polishing stopped, and a warning says so (“still improving after 4 polish legs”).
+
+Measured on the fixtures from \#1782, all with `optimizer = bobyqa`:
+
+| model | platform | before: OFV (evals) | polished: OFV (evals) | reference optimum |
+|----|----|----|----|----|
+| issue’s 2-cpt IV on `data/two_cpt_iv.csv`, FOCEI, `--threads 4` | macOS arm64 | −432.0317 (1006) | −432.1668 (1148) | −432.1668 (NONMEM, L-BFGS) |
+| same | Linux arm64 | −432.1645 (636, issue, x86_64) | −432.1668 (657) | −432.1668 |
+| `examples/warfarin_iov.ferx`, FOCE, `--threads 1` | macOS arm64 | 205.1043 | 205.0927 (502) | 205.0903 (L-BFGS) |
+| same | Linux arm64 | 205.2279 | 205.0914 (561) | 205.0903 |
+
+On the 2-cpt IV fixture the polish costs 14% more evaluations on macOS. The thread count changes the trajectory: the same fit at the library’s default thread count takes 1236 evaluations to the same −432.1668. It does not make BOBYQA a gradient method. On `examples/ctmm_pd_2state.ferx` under BOBYQA (which `auto` picked there before the CTMM outer gradient became exact), the fit moves from 711.68 to 711.46. `trust_region` reports a lower 710.76 on the same objective, but with ‖∇‖∞ ≈ 4e2 and a singular covariance step, so neither optimizer’s endpoint on that model is a clean stationary point. If the OFV matters, compare against a second optimizer.
+
+### An L-BFGS / SLSQP stop is verified at a tight inner tolerance
+
+A FOCE / FOCEI fit with `nlopt_lbfgs` or `slsqp` (including `optimizer = auto` when it picks L-BFGS) has stopping rules it cannot reach. It stops when its line search can no longer find a lower objective, and the plateau check then decides whether that stop is converged. At the default `inner_tol = 1e-5`, though, the EBE re-solve noise can hide the remaining descent on an ill-conditioned objective. On the unprofiled A2 MBMA anchor (#2462), 16 of 80 starts stopped 1.7e-4 to 5.3e-4 above NONMEM’s optimum and were reported `converged = true`. A restart at the fit’s own settings gained exactly nothing from any of them.
+
+So since \#2462 every such stop that would be reported converged is first checked by a *verification leg*: the same optimizer, run again from the best point, with
+
+- the inner loop at `inner_tol = 1e-10` (or your own, if tighter) for that leg only,
+- the leg’s own best point, ranked at that tolerance,
+- the stagnation guard off, and
+- the EBEs of its first evaluation solved from the incumbent’s own modes (#2549).
+
+A leg **settles** the stop when it lowered its own objective by at most 3e-5. The first leg also settles when it lowered it by at most 1e-3, the objective’s noise floor (#2507): it ran to its own stop at the tight tolerance, which is what the leg exists to provide, and a second leg from there gained nothing in any measured case (at most 8.1e-9 on all 16 A2 starts that took one). From the second leg on, a leg also settles when it ended no further below the lowest leg before it than the objective can resolve there. That resolution is measured, not chosen. The leg’s first, cold-seeded score of its starting point is compared with the score the same point had in the leg that found it, at the same tolerance, and their gap is how much the objective disagrees with itself. A leg that ends lower by less than that gap, or not lower at all, is measuring the noise, not a descent (#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where the old `net ≤ 0` rule ran a third), and the fit keeps the lowest leg’s point. Otherwise another leg runs, up to four. A settled stop is converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep descending, or a spent `maxiter` budget, report `converged = false`, with a warning (“still improving after 4 verification legs”).
+
+Measured on Linux aarch64:
+
+| fixture | before | with the leg |
+|----|----|----|
+| A2 unprofiled, 80 starts | 16 stops +1.7e-4 to +5.3e-4, all `converged` | all 80 within 5.1e-7 of NONMEM |
+| eight fixtures at their optimum (10 to 100 subjects, \|OFV\| 62 to 3792) | — | first leg gains at most 1.8e-6 and settles |
+| the 200-subject Michaelis–Menten benchmark | — | legs gain up to 2.4e-3 on the inner noise; settles on legs 2 to 4 by the net-change rule |
+
+A leg from an optimum costs about 5 to 20 objective evaluations, and each is slower than the fit’s own because its inner solves run to `1e-10`. Over the A2 grid the legs cost 19% more evaluations in total and doubled the wall time (9.7 s to 20.7 s for 80 fits); on `warfarin_iov` they add 21 evaluations to a 49-evaluation fit. The fit’s reported OFV is still the final cold re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
+
+#### Rounds from outside the incumbent’s modes
+
+A leg started at the incumbent can verify a stop that a different start would leave, so once the legs have settled, two more rounds of legs may run (#2645). Each opens from somewhere the legs could not reach, and the fit keeps a round only if it ended lower; otherwise the incumbent and its verdict stand. Neither start wins everywhere, which is why the warm legs run first: a cold start left a subject unconverged on the `transit_flip_flop` ODE twin, and on one simulated dataset the cold round ended several OFV above the incumbent.
+
+- **From a cold solve’s modes.** A cold solve at the verified point runs, and if any subject’s `−2LL` term differs from the incumbent’s by more than 1e-3, *in either direction*, a round starts at the cold modes. The direction matters: a subject’s other mode can score worse at the incumbent and still lead to a lower optimum in θ, so comparing subjects at that point finds nothing. On a 24-subject 3-compartment benchmark the cold solve scored −3038.866 against the incumbent’s −3038.980, and the round ended at −3039.288158, NONMEM’s −3039.2882. Starting *at* those modes means the first evaluation re-solves them warm, so a subject left unconverged cold is not what the EBE guard judges.
+- **From a Newton step.** When the BHHH decrement says a Newton step would still gain more than 0.1 OFV, a round starts along that step, capped at 0.3 on any packed coordinate (a full step overshoots: `S` is nearly singular along the valley it is for). A leg restarts L-BFGS with no curvature memory, so on a long valley its first line search can fail at a point that is no minimum. On a 1518-subject ODE + IOV benchmark with two nearly confounded parameters, the fit stopped at 126579.41 with \|g\|∞ 4.26 and a predicted gain of 7.9 (macOS arm64; the same start needs no round on Linux); the round reached 126565.48 with \|g\|∞ 0.08, in about 40% more wall time. The step needs more subjects than coordinates it moves: below that `S` is rank-deficient and the decrement measures nothing, so no round runs.
+
+On a fit whose modes do not depend on the start and which sits at its optimum, the two checks cost one inner pass and one gradient pass, and no leg. That was every bundled example that reached a leg.
+
+A stop that a restart would take takes no round: one whose cold solve is inconsistent with it, or beats it. A round could lower such a stop just enough to pass those checks, and the restart that would have gone further would never run. On one simulated dataset, rounds took a stop at 778.06 (cold 781.31) to 777.17, reported converged, where the restarts reach 775.45.
+
+#### Inner searches stuck at their mode
+
+At `1e-10` many subjects’ inner BFGS reach their mode before the objective can resolve the last decrease. Before \#2497 each such solve repeated the same zero-gain step to `inner_maxiter`, then ran a Nelder–Mead restart that ended back at the same point. Now the search stops after five accepted steps that leave the objective bit-for-bit unchanged and move the gradient vector by at most 1e-6 of its norm, while the steps together move the iterate by at most 1e-10 of its scale. If the Newton certificate then shows the point is at its mode, the solve counts as converged and skips the restart. A point the certificate accepts only because the objective can no longer resolve the remaining decrease, with its gradient still above `inner_tol`, is treated as a certified fallback point is: a profiled fit’s adjoint level gradient keeps it, since the certificate bounds the error there. The fallback count (`total_ebe_fallbacks`) counts only restarts that ran. This applies to IOV and non-IOV subjects, but not to FREM, whose restart re-centres the proposal. A search that runs out of `inner_maxiter` or finds no acceptable step still takes the fallback.
+
+On a 74-subject one-compartment IIV+IOV fit (macOS arm64), the fit went from 15.4 s to 1.6 s, with the same OFV to the six decimals the fit reports (1079.457264). On the bundled examples, re-solving from a `1e-5` mode at `1e-10` returns the same NLL and EBEs, bit for bit, as the old restart path.
+
+### Checking a derivative-free `converged`
+
+`converged` reports that an optimizer’s stopping rule was met. For the gradient-based optimizers the result also carries `final_gradient`, so the claim can be checked independently: at a genuine interior optimum it is ≈ 0. A derivative-free run has no gradient to report — which is the wrong way round, because a derivative-free run is where a premature stop is most likely and where a bad answer is hardest to see. On the stiff binding model in \#997 a BOBYQA fit stopped 1.54 OFV above the L-BFGS optimum on the same model and data, and reported `converged = true` with nothing to check it against; widening the parameter box a thousandfold returned a bit-identical objective to six decimals, because it had never travelled far enough for a bound to matter.
+
+So when the optimizer supplies no gradient, ferx computes one after the fit:
+
+| field | meaning |
+|----|----|
+| `final_gradient` | ∇ of the objective the fit minimised, at the reported estimates, in packed space (log-THETA, Cholesky-OMEGA, log-SIGMA) |
+| `final_gradient_source` | `"optimizer"` — the optimizer’s own, evaluated during the fit; `"analytic"` — the exact gradient, computed afterwards purely for reporting; or `"finite_difference"` — a central difference computed afterwards, where the exact one does not serve |
+
+The `"analytic"` version is the exact outer gradient at the final modes, EBE response included, plus the penalty gradients; it is taken whenever every subject is in the analytic gradient’s scope, and costs one gradient. Otherwise the `"finite_difference"` version is a central difference of the same (penalized) objective, with the EBEs re-solved at every perturbed point, so it too is the gradient of the marginal objective rather than a fixed-EBE approximation to it. It costs `2 × n_free` objective evaluations — one gradient’s worth, the same as a single step of the optimizers that report one for free. Neither steers anything: the estimates are bit-identical whether it runs or not. Set `report_final_gradient = false` in `[fit_options]` to skip it when that cost is not worth paying.
+
+Both kinds are read the same way, but they do not prove the same thing. An `"optimizer"` gradient near zero is a stationarity claim the optimizer itself acted on. An `"analytic"` or `"finite_difference"` gradient near zero is an independent check on a run that had no gradient at all — and a large one says the fit stopped somewhere the objective was still moving, whatever `converged` says.
+
+The largest component, \|g\|∞, is printed with its source as a `Final gradient:` line right under `Converged:` in the console report and `ferx summary`, and written to the fit YAML as `final_gradient_max_abs` / `final_gradient_source` (#1934); the full vector is in the `.fitrx`.
+
+#### What it reads on a fit that is right, and one that is not
+
+Measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv` under `method = focei`, `maxiter = 300`, fitting the same model from the same start with the two optimizers:
+
+| optimizer | `converged` | OFV | `final_gradient_source` | ‖∇‖∞ |
+|----|----|----|----|----|
+| `nlopt_lbfgs` | `true` | **−286.0042** | `optimizer` | 2.29e−4 |
+| `bobyqa`, before \#1782 | `true` | −285.9866 | `finite_difference` | **2.47e0** |
+| `bobyqa`, polished (#1782, macOS arm64) | `true` | −286.0042 | `finite_difference` | 3.44e−3 |
+
+(Measured when the reporting gradient was always the stencil; on this in-scope model a BOBYQA fit now reports an `analytic` one.)
+
+Both of the first two rows report success. Before \#1782, BOBYQA stopped 0.018 OFV short with a gradient four orders of magnitude larger. Before \#997, that gradient column was the only difference visible in the fit object, because the optimizer’s own gradient was missing for exactly the arm that needed it. The [polish leg](#bobyqa-tolerance-polish) now carries BOBYQA on to the L-BFGS optimum, and the reporting gradient falls to match.
+
+The two numbers above come from different stencils, so to check that the comparison is fair the *same* finite-difference stencil was also run at the L-BFGS solution: it reads **3.04e−4** there, against the optimizer’s own 2.29e−4. So the reporting gradient does go to zero at a genuine optimum on this model; the 2.47 is BOBYQA’s, not the stencil’s. The step is `h = 1e-4·(1+|x|)` per packed coordinate, which sits in the flat part of the step-size curve — sweeping `h` over `1e-4 … 1e-2` moves the BOBYQA reading by less than 0.1 %, while `h = 1e-1` inflates both arms to ~3.5e1 on truncation error alone.
+
+One caveat on reading the magnitude: it is the gradient in **packed** space (log-THETA, Cholesky-OMEGA, log-SIGMA) and it is not normalised, so there is no universal threshold. It is a comparative quantity — against a second fit of the same model, or against the optimizer gradient of a gradient-based arm — not a pass/fail test. A weakly-identified direction can carry a sizeable ∂OFV/∂x across a genuinely flat objective, which is the same reason ferx does not use a gradient norm as its convergence criterion (see [Leaving the initial estimates](#leaving-the-initial-estimates)).
+
+### What `converged` guarantees
+
+`converged: true` is a verdict, not a copy of the optimizer’s stop state. NLopt’s own word is kept beside it as `optimizer_stop` (#2785), and the two can disagree in either direction:
+
+- a bare `Failure` is converged when the OFV trace has gone flat and a cold re-solve reproduces it ([Leaving the initial estimates](#leaving-the-initial-estimates)) — the analytic-gradient L-BFGS returns one at a plateaued optimum its line search can no longer improve on;
+- an `FtolReached`, an `XtolReached`, or that same accepted `Failure` is **not** converged when the estimates are not a stationary point of the objective.
+
+The second check is made by the covariance step. At the estimates it takes the gradient `g` of the objective, at the modes it reconverges, and with the Hessian `H` it has just built it forms the **Newton decrement** `½·gᵀH⁻¹g`: the OFV a Newton step from the estimates is predicted to remove. The covariance is `R⁻¹ = 2·H⁻¹`, so the decrement is also the squared distance from the estimates to the minimum of the quadratic model, in standard errors. Unlike the raw gradient, it does not change when a coordinate is rescaled. A coordinate whose gradient is large only because it is badly scaled, or because the objective is flat along it, gets a small decrement. One the optimizer stalled on gets a large one.
+
+For FOCE, FOCEI, Laplace / AGQ and Gauss–Newton (`gn`, `gn_hybrid`), a decrement above **1 OFV unit**, one standard error, reports `converged: false` with `W_NON_STATIONARY_OPTIMUM`. The message gives the decrement and names the three coordinates with the largest Newton steps, in standard errors, with the sign of the move a minimiser would make. The threshold and its measurements are the ones \#2541 set for samplers (see [SAEM’s stationarity test](../estimation/saem.llms.md#saem-stationarity)). On converged fits the decrement reads 1e-13 to 1e-7 (table below), at least seven orders of magnitude under it. The value is published as `newton_decrement` on the result and in the fit YAML. A sampler (SAEM, IMP, IMPMAP, VI) still gets `W_COV_NON_STATIONARY_ESTIMATE` and keeps its verdict, since its estimate is not expected to minimise the objective `R` is the Hessian of.
+
+Two cases are deliberately left out of the test:
+
+- **A coordinate on a bound** whose descent would leave the box keeps a non-zero gradient at a legitimate constrained optimum. It is held out of the decrement (a Schur complement on `H⁻¹`, not a deleted row), so a θ resting on its declared bound does not demote the fit.
+- **A fit with no unfloored `R`** makes no claim either way: `run_covariance_step = false`, `covariance_method = s` (which builds no `R`), an `R` that needed an eigenvalue floor (it has its own warning, and `H⁻¹` along a floored direction would measure the floor), a profiled fit, or a cancelled run. `newton_decrement` is then absent.
+
+A fit demoted this way is what `[strictness] require_converged` exists to reject, so a model search steps past it rather than ranking an objective that is still falling. To recover the estimates, restart from the reported values and compare the OFV. If the same coordinate keeps stalling, rescale it or tighten its bounds.
+
+The shareable reproduction is the built-in BFGS (`Optimizer::Bfgs` through the Rust API) on `examples/warfarin.ferx`, whose stop rule is a raw gradient norm `|g| < outer_gtol` (`a_bfgs_stop_on_a_raw_gradient_norm_short_of_the_minimum_is_not_converged`). Measured in a debug build on Linux x86_64, sweeping `outer_gtol` against a minimum of OFV −286.00:
+
+| `outer_gtol` | iterations | OFV | `newton_decrement` | `converged` |
+|----|----|----|----|----|
+| 30 | 10 | −285.65 | 0.36 | `true` |
+| 50 | 9 | −285.51 | 0.47 | `true` |
+| 100 | 4 | −273.08 | **337.4** | `false` since \#2785 (`true` before) |
+| 200 | 2 | −267.08 | — (`R` floored, not tested) | `true` |
+| default | — | −286.00 | 1.9e−8 | `true` |
+
+The first two rows stop within one standard error of the minimum, and the decrement matches the OFV they left on the table, so they stay converged. The 100 row is the case the gate exists for. The 200 row shows its limit: so far from the minimum that `R` is not positive definite, the step makes no claim, and only the eigenvalue-floor warning flags the fit. On the bundled golden-set examples with a covariance step (`warfarin`, its BOBYQA, block-Ω and prior variants, `two_cpt_iv`, `two_cpt_oral_cov`, `one_cpt_infusion`, `three_cpt_iv`), the decrement reads 7.8e−14 to 8.6e−8 and every fit stays converged (`ci-fast` build, Linux x86_64).
+
+------------------------------------------------------------------------
+
+## Fixed-EBE gradient bias and `reconverge_gradient_interval`
+
+By default, gradient-based optimizers (`slsqp`, `lbfgs`, etc.) hold each subject’s EBEs fixed while computing the population gradient. This is cheap but omits the response of the inner solution to θ and Ω. On ill-conditioned models the omitted term causes `slsqp` to stall well above the `bobyqa` optimum.
+
+Set `reconverge_gradient_interval = 1` to re-solve the inner loop at every gradient evaluation, recovering the full gradient surface at roughly **5–6× cost**. A value of `N` reconverges every Nth evaluation and uses the cheap gradient in between — often enough to close most of the gap:
+
+| Configuration              |        OFV | Wall time |
+|----------------------------|-----------:|----------:|
+| `slsqp` (fixed-EBE)        |     68,252 |     390 s |
+| `slsqp` + `interval = 10`  |     66,118 |     633 s |
+| `slsqp` + `interval = 1`   | **65,485** |   1,871 s |
+| `bobyqa` (derivative-free) |     65,598 |     315 s |
+
+On this cefepime 2-compartment dataset `bobyqa` reaches a near-optimal solution faster than any reconverged `slsqp` setting. The reconverged gradient is most useful when derivative-free search is too slow (high parameter count) or when a gradient optimizer is required for other reasons.
+
+IOV models (`kappa`/`block_kappa`) always reconverge regardless of this setting. Even so, a *pure* `slsqp` cold-start on an IOV model can terminate a few OFV units above the minimum, and the exact stopping point is platform-dependent (the re-converged FD gradient’s summation order differs across architectures — issue \#160). Prefer `optimizer = bobyqa` or a `method = [saem, focei]` chain for IOV fits; both reach the minimum platform-independently. See [Inter-Occasion Variability](../model-file/iov.llms.md#limitations).
+
+------------------------------------------------------------------------
+
+## Analytic FOCE / FOCEI gradient
+
+Under **FOCE, FOCEI, Laplace and AGQ** (either anchor, any node count, with or without IOV), the gradient-based optimizers (`bfgs`, `lbfgs`, `nlopt_lbfgs`, `slsqp`) use the **exact gradient of the marginal** in place of a finite-difference one. FOCEI differentiates the Laplace marginal, FOCE ferx’s Sheiner–Beal linearized marginal (at its frozen-variance EBE), and Laplace/AGQ the quadrature marginal under its own anchor. The gradient *includes the full EBE response* — the term `reconverge_gradient_interval` recovers by brute force — so it carries **no** fixed-EBE bias. There is nothing to configure: the `method` and `optimizer` choices are the switch.
+
+The gradient is computed by the **adjoint method**. At the EBE `η̂` the total derivative of the subject objective `F` is the partial derivative, at fixed `η̂` and fixed `w`, of one scalar:
+
+    Ψ = F − wᵀ ∇_η l,     w = H⁻¹ ∇_η F,     H = ∇²_η l
+
+The predictions are recorded once per subject, with η-tangents, and one reverse sweep of `Ψ` gives the derivative for every θ, Ω, σ and ρ at once. The cost therefore does **not** grow with the number of θ or individual parameters, and no per-model width or slot caps apply. The recorder is the production integrator itself, so the gradient is exact for the trajectory the objective predicts. It serves the closed-form 1-/2-/3-compartment models on every dose path (lag, steady state, infusion, modeled duration, time-varying covariates, `TIME`, `init(...)`, scaling, LTBS), compartment-free models, user `[odes]` models on both the explicit and the Rosenbrock integrators, IOV, FREM, M3 BLOQ, IIV on the residual, correlated residuals, custom residual magnitudes, mixtures and covariate networks. TTE, binary and CTMM endpoints enter the same `Ψ`, their data term folded into the subject objective as production scores it. A subject no recorder serves (SDE, or one of the [known FD fallbacks](../estimation/foce.llms.md#known-fd-fallbacks)) takes its own finite-difference salvage, and the fit reports it (see [the outer-loop route](../estimation/foce.llms.md#outer-loop-fd-fallback)).
+
+The same identity, one order up, gives the **covariance step’s R-matrix**. Along the mode’s tangent directions `u = (e, dη̂/dx)`, the profile Hessian is `Uᵀ∇²Ψ U`, assembled by forward over reverse through the same recorder: each prediction plan runs once per subject along its input axes, the likelihood is differentiated through its row aggregates, and every direction’s Hessian column is assembled from those ([\#2980](https://github.com/FeRx-NLME/ferx-core/issues/2980); see [the R-matrix](../estimation/foce.llms.md#sensitivity-assembly)). It is exact for every estimator above, including Laplace’s exact anchor and FOCE with a prediction-dependent residual variance, which used to take the reconverged finite-difference stencil.
+
+Because the gradient is exact and bias-free, `lbfgs` / `nlopt_lbfgs` are strong choices: each evaluation is one recording and two sweeps per subject rather than an `O(n)` finite-difference sweep, and the optimizer reaches the true optimum. Wall time against the derivative-free `bobyqa` is model-dependent.
+
+The exact gradient lands on the same optimum as the underlying objective. Validated against NONMEM on the warfarin 1-cpt oral model: FOCE reaches OFV −280.36 (NONMEM −280.36; TVCL 0.1330, TVKA 0.7252, ω²: 0.0286 / 0.00958 / 0.349) and FOCEI −286.00 (NONMEM −286.00), both agreeing to ~4–5 significant figures across θ, Ω and σ. On the warfarin LTBS model (`log(DV) ~ additive(...)`) the gradient-based `lbfgs` path reaches OFV −675.302 and recovers NONMEM’s MLE (TVCL 0.1327, TVV 7.738, TVKA 0.811) to ~4 significant figures.
+
+------------------------------------------------------------------------
+
+## Global pre-search
+
+Enable `global_search = true` to run a derivative-free CRS2-LM pre-search before the local optimizer. This helps escape local minima on complex models:
+
+    [fit_options]
+      method        = focei
+      global_search = true
+      global_maxeval = 2000   # auto-scaled if omitted
+
+The pre-search uses NLopt’s Controlled Random Search and requires lower/upper bounds on all theta parameters. It hands off to the local optimizer (`optimizer` key) once the budget is exhausted.
+
+See also [`fit-options.md`](../model-file/fit-options.llms.md) for the full list of optimizer-related options.

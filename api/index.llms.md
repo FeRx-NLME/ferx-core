@@ -1,0 +1,58 @@
+# Rust API
+
+ferx-core can be used as a Rust library for embedding population PK estimation in your own applications.
+
+## Adding as a Dependency
+
+``` toml
+[dependencies]
+ferx-core = { path = "../ferx-core" }
+```
+
+## Quick Example
+
+``` rust
+use ferx_core::api::{bind_covariate_stats, read_population_for};
+use ferx_core::io::datareader::SelectionFilter;
+use ferx_core::*;
+use std::path::Path;
+
+fn main() -> Result<(), String> {
+    // Parse model and data, applying the file's [data_selection] and IOV column
+    let model_text = std::fs::read_to_string("model.ferx").map_err(|e| e.to_string())?;
+    let mut parsed = parse_full_model_file(Path::new("model.ferx"))?;
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)?;
+    let (mut population, _) = read_population_for(
+        &parsed.model, &parsed.covariate_decls, "data.csv", None,
+        opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
+    )?;
+
+    // Bind data-driven declarations (no-ops for a model without them). The binders
+    // return an `EngineError`, whose `to_string()` is the message.
+    bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
+    bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
+
+    // Run estimation from the model's own initial estimates and options. `fit` also
+    // returns an `EngineError`.
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)
+        .map_err(|e| e.to_string())?;
+
+    // Access results
+    println!("OFV: {}", result.ofv);
+    for (name, val) in result.theta_names.iter().zip(result.theta.iter()) {
+        println!("  {} = {:.6}", name, val);
+    }
+
+    Ok(())
+}
+```
+
+Why the bind, filter and gradient steps are there, and when they matter, is in [Assembling the inputs yourself](../api/fitting.llms.md#assembling-the-inputs-yourself).
+
+## API Sections
+
+- [Core Types](../api/types.llms.md) – `CompiledModel`, `Population`, `FitResult`, `FitOptions`, etc.
+- [Fitting Functions](../api/fitting.llms.md) – `fit()`, `fit_from_files()`, `run_model_with_data()`
+- [Simulation](../api/simulation.llms.md) – `simulate()`, `simulate_with_seed()`, `predict()`
+- [Parsing](../api/parsing.llms.md) – `parse_model_file()`, `parse_full_model_file()`, `read_population_for()`, `read_nonmem_csv()`

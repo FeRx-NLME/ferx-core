@@ -1,0 +1,477 @@
+# Inter-Occasion Variability (IOV)
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+Inter-Occasion Variability (IOV) models the fact that a subject’s PK parameters may shift between occasions (treatment periods, study visits, dosing intervals). Unlike between-subject variability (BSV), which is fixed for a subject across the whole study, IOV is a random effect that is re-drawn for each occasion.
+
+## Concepts
+
+### Occasions
+
+An **occasion** is a distinct time window during which the same kappa value applies. All rows — dose records and observation records — that share the same occasion index belong to one occasion. Occasions can be supplied two ways:
+
+- **From the data** — an integer column (e.g. `OCC`) named via `iov_column` in `[fit_options]`.
+- **From the model** — a rule (`iov_occasion = dose` or `iov_occasion = time(...)`) that derives the occasion of each row from its timeline, so you do not have to precompute an occasion column. See [Declaring occasions in the model](#declaring-occasions-in-the-model).
+
+**Every record runs under its own occasion**, including the rows that are neither a dose nor a scored observation: an `EVID=2` row, an `EVID=0` row with `MDV=1`, and a reset (`EVID=3`/`4`). Under the end-of-interval rule such a row governs the interval that ends at it, so its occasion’s κ is the one in force over that interval. NONMEM runs `$PK` on these rows the same way (#1133, \#1876). An occasion that only `EVID=2`, `MDV=1` or reset rows carry gets a κ of its own, like one that only doses carry: it is informed through the interval the row governs, or the `init(...)` baseline a reset re-seeds, and a row after the subject’s last observation leaves the objective unchanged. NONMEM gives such an occasion an `ETA` too (`nonmem_anchor/reset_init_snapshot_K.ctl`, \#1153). A subject built in memory without per-row labels for them runs those rows under κ = 0; ferx does not guess an occasion from a neighbouring record.
+
+In an adaptive-dosing run the occasions are the decisions, and the same rule applies. Every decision is a record, so the piece of a dosing window that ends at the next decision runs under the next occasion’s κ: see [Which κ a decision window runs under](../model-file/adaptive-dosing.llms.md#window-kappa).
+
+### Kappa parameters
+
+**Kappa** (κ) is the IOV random effect, analogous to eta (η) for BSV. Each kappa is drawn independently per occasion:
+
+$$\kappa_{ik} \sim \mathcal{N}(0, \Omega_\text{IOV})$$
+
+where *i* indexes subjects and *k* indexes occasions. The IOV omega matrix Ω_IOV is estimated alongside the BSV omega.
+
+### Individual parameters
+
+Kappas enter the individual-parameter expressions in the same way as etas:
+
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+
+At each occasion *k*, the effective individual CL is `TVCL * exp(ETA_CL_i + KAPPA_CL_ik)`. The BSV eta captures stable between-subject differences; the kappa captures occasion-to-occasion fluctuation within a subject.
+
+**A kappa on an absorption parameter belongs to the dose.** A dose keeps the absorption parameters of **its own** occasion — the kernel of a built-in forcing (`MTT`, `MAT`, `KA`, …), a pathway fraction, a lag, `F` — for the whole of its absorption, even while a later occasion is in force; only disposition parameters (`CL`, `V`, …) switch at the occasion boundary. So a dose still absorbing when the next occasion begins delivers exactly its own mass ([\#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569)); see [Absorption parameters are read at the dose record](../model-file/absorption.llms.md#absorption-at-dose).
+
+### How a kappa row is labelled
+
+A kappa’s variance is printed on the scale the kappa enters its parameter (#1643): `CV%` for a log-normal kappa, `SD` for an additive or logit one, and nothing for any other shape. The scale comes from **where the kappa sits**, read along the whole path up to the parameter (#1714): through `+` and `-` only it is additive, under `inv_logit` logit, and under `exp` log-normal only if nothing but `*` and `/` sits between that `exp` and the parameter.
+
+| Expression | Kappa reported as |
+|----|----|
+| `TVCL * exp(ETA_CL + KAPPA_CL)` | log-normal, `CV%` |
+| `TVV + ETA_V + KAPPA_V` | additive, `SD` |
+| `inv_logit(TH + ETA + KAPPA)` | logit, `SD = …, logit scale` |
+| `(TVV + KAPPA_V) * WT` | custom, no CV% or SD |
+| `TVCL * exp((exp(ETA_CL + KAPPA_CL)^L - 1) / L)` (Box-Cox) | custom, no CV% or SD |
+
+A kappa that reaches its parameter through an intermediate variable is followed to where that variable is used: with `IOVCL = KAPPA_CL` and then `CL = TVCL * exp(ETA_CL + IOVCL)` (the NONMEM IOV idiom), the kappa is log-normal. A variable a block reads as a parameter — `[structural_model]`, `[odes]`, a `[scaling]` readout, `[initial_conditions]` or an endpoint block such as `[event_model]` — is a parameter in its own right, and the walk stops there: in the weighted example below, if the model reads `LEMAX` directly, `KAPPA_EMAX` is additive on `LEMAX`, so its SD is on the log scale `LEMAX` is written on. If only a later `EMAX = exp(LEMAX)` reads it, the kappa is log-normal. `[derived]` and `[output]` only report a value, so a variable they read is still followed (#1662).
+
+ETAs are classified by the same rule (#1656), so `TVV + ETA_V + KAPPA_V` reports an `SD` for both rows. A reassigned parameter is labelled by its last assignment for both, too (see [How an ETA row is labelled](../model-file/individual-parameters.llms.md#how-an-eta-row-is-labelled), \#1673).
+
+A kappa that enters two parameters on different scales, or that no parameter reads, is custom. So is one that enters any parameter twice (`2·κ`, \#1724), checked on every parameter the model reads as for an ETA on an intermediate (see [An ETA that enters its scale twice](../model-file/individual-parameters.llms.md#an-eta-that-enters-its-scale-twice)). A weighted kappa is classified on the expression as written, before the `weight =` rewrite, and its CV% or SD is labelled `at weight 1` (see [What is reported](#what-is-reported)). The classification is stored on `FitResult.kappa_param_types`, parallel to `kappa_names`.
+
+### Structural-model scope
+
+IOV composes with every structural model, including the **analytic absorption closed forms** — `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig`. A per-dose closed-form superposition cannot carry a dose’s drug across an occasion boundary where the disposition changes, so a subject with IOV on such a model is served by an **exact event-driven walk**: the carried amount decays at each occasion’s disposition, and each dose absorbs on the kernel of its own occasion (#1560). Predictions and gradients stay closed-form, with no ODE solve. A subject whose occasions push elimination past the absorption rate of any dose that has arrived by then — even one long since absorbed (the flip-flop regime) — or whose `n_eta + K·n_kappa` reaches 24, or that carries an `SS` dose, an infusion or a `TIME`-dependent parameter, is **transparently rerouted to the model’s exact `transit()` / `igd()` ODE twin** instead. Both are automatic — no model change is needed — and covered on the [Absorption](../model-file/absorption.llms.md) page. A closed-form absorption model that has *no* ODE twin (one carrying a user `[odes]` / `[scaling]` / `[initial_conditions]` block, a role that shadows a reserved `F`/lagtime slot, or one whose twin could not be built — see [When a model loses its ODE twin](../model-file/absorption.llms.md)) still rejects IOV with an actionable message.
+
+## Option A: Diagonal IOV (independent kappas)
+
+Each kappa is declared independently, giving a **diagonal** Ω_IOV:
+
+    [parameters]
+      ...
+      kappa KAPPA_CL ~ 0.05
+      kappa KAPPA_V  ~ 0.03
+
+The two kappas are uncorrelated across occasions. This is the most common formulation and corresponds to NONMEM’s IOV Option A.
+
+Use `FIX` to hold a kappa variance constant during estimation:
+
+    kappa KAPPA_CL ~ 0.05 FIX
+
+## Option B: Block IOV (correlated kappas)
+
+When occasion effects on different parameters are expected to covary, use `block_kappa`:
+
+    [parameters]
+      ...
+      block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]
+
+Values are the lower triangle of Ω_IOV: Var(KAPPA_CL), Cov(KAPPA_CL, KAPPA_V), Var(KAPPA_V). This mirrors the `block_omega` syntax for BSV, including that the block is variance-only: a scale tag such as `(sd)` after the `]` is rejected with `E_BLOCK_VARIANCE_ONLY`, not applied (see [Parameters](../model-file/parameters.llms.md#choosing-the-scale-variance-or-sd)).
+
+### Mixed Option A + B
+
+`kappa` and `block_kappa` declarations can be combined freely — uncorrelated kappas can coexist with a correlated block:
+
+    block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]
+    kappa KAPPA_KA ~ 0.10
+
+A name may not appear in both a `kappa` and a `block_kappa` line.
+
+## Sample-size-weighted IOV (`weight = ...`)
+
+> **Maturity: beta** ([\#1031](https://github.com/FeRx-NLME/ferx-core/issues/1031)).
+
+The arm-level random effect of a longitudinal model-based meta-analysis — the **between-treatment-arm variability (BTAV)** — is not drawn from one variance. It scales with the number of subjects behind the arm:
+
+$$\kappa_{ik} \sim \mathcal{N}\!\left(0, \frac{\gamma^2}{N_{ik}}\right)$$
+
+A 400-subject arm’s mean wanders a quarter as far as a 25-subject arm’s. Declare that where the rest of the variance structure is declared (for the whole MBMA model, see [MBMA: start here](../model-file/mbma.llms.md)):
+
+    [parameters]
+      kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM
+
+    [individual_parameters]
+      LEMAX = LEMAX0 + log(OR_ABATA) * ABATA + ETA_EMAX + KAPPA_EMAX
+
+    [covariates]
+      NARM continuous     # number of subjects in this arm
+
+`weight = W` means `κ ~ N(0, Ω_IOV / W)`. The engine applies the scaling by rewriting every reference to the kappa as `KAPPA / sqrt(W)` — precisely the hand-written form the modifier replaces — so the objective, the analytic sensitivities, the EBEs and every estimator see a model they already support.
+
+### Why declare it rather than write it
+
+`KAPPA_EMAX / sqrt(NARM)` in the middle of a structural equation works, but it puts a **variance-structure decision inside a structural expression**:
+
+- `/ NARM` instead of `/ sqrt(NARM)` produces a plausible wrong answer rather than an error;
+- nothing in the model summary marks `KAPPA_EMAX` as weighted — it reports as an ordinary IOV term;
+- the term can only be scaled where it is *used*, so the same divisor has to be repeated in every expression the kappa enters.
+
+### What is reported
+
+The estimate stays the **unweighted** $\gamma^2$ — the quantity a published MBMA reports. Its SD — or, for a log-normal kappa, its CV% (#1666) — is labelled `at weight 1`, the figure of a one-subject arm, and the fit prints the same figure at the median arm on the next line:
+
+    --- KAPPA (IOV) Estimates ---
+      KAPPA_EMAX           = 4.145382  (SD = 2.0360 at weight 1)  SE = 0.412000
+                             weight = NARM  →  SD = 0.1440 at NARM = 200.0000 (κ ~ N(0, KAPPA_EMAX/NARM))
+
+The next line is on the row’s scale (#1683): under a log-normal kappa’s CV% row it is a CV% too, so the two compare directly:
+
+      KAPPA_CL             = 0.050133  (CV% = 22.7 at weight 1)  SE = 0.004100
+                             weight = NARM  →  CV% = 11.2 at NARM = 4.0000 (κ ~ N(0, KAPPA_CL/NARM))
+
+The line’s figure is the row’s note at the typical arm, worded the same way with `at NARM = …` in place of `at weight 1`. A CV% is the exact $\sqrt{e^{\gamma^2/n} - 1}\cdot 100$ at an arm of size $n$, computed from the arm’s variance $\gamma^2/n$ (#1858): not the row’s CV% divided by $\sqrt{n}$, which only the first-order approximation would give. An additive kappa gets `SD = …`, as above, and a logit kappa keeps its row’s tag in the row’s order (#1697):
+
+      KAPPA_P              = 0.250000  (SD = 0.5000 at weight 1, logit scale)  SE = 0.031000
+                             weight = NARM  →  SD = 0.2500 at NARM = 4.0000, logit scale (κ ~ N(0, KAPPA_P/NARM))
+
+The figure is printed exactly when the row’s note is (#1698). A kappa whose expression gives it no label (custom) has no note, and a failed or SIR-fallback covariance step hides every note; in both cases the line keeps only `weight = NARM (κ ~ N(0, KAPPA_P/NARM))`. The fit YAML still writes `sd_at_typical_weight` in both cases. When the covariance step failed, that matches `sd` and `cv_pct`, which the YAML writes whatever the covariance step did. For a custom kappa it is the one spread key written, since a custom entry has no `sd` or `cv_pct`.
+
+A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided; $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for. `FitResult` carries both as `kappa_weights` (the source text) and `kappa_weight_typical` (the median arm size). The same block, weight line included, appears in `format_summary()` (#1657), and the fit YAML’s `omega_iov` entry for the kappa adds them as extra keys (#1660):
+
+``` yaml
+omega_iov:
+  KAPPA_EMAX:
+    variance: 4.145382
+    sd: 2.036021
+    weight: "NARM"
+    weight_typical: 200.000000
+    sd_at_typical_weight: 0.143968
+    se: 0.412000
+```
+
+`variance` stays the unweighted $\gamma^2$, and its `cv_pct` (log-normal) or `sd` line is the weight-1 figure; the typical arm is read from `sd_at_typical_weight`. For a log-normal (or untyped) kappa that key is still the log-scale SD, and the CV% the console’s weight line prints is written beside it as `cv_pct_at_typical_weight` (#1858) — for `KAPPA_CL` above, `sd_at_typical_weight: 0.111952` and `cv_pct_at_typical_weight: 11.23`. The two are not related by a factor of 100 in general: the exact CV% grows faster than the SD. An unweighted kappa’s entry is unchanged.
+
+A wrapper prints the same rows through the engine’s own formatter, at print time (#1825). It builds a `ferx_core::io::output::KappaRowsInput` from the fit’s `omega_iov`, kappa names, FIX flags, `se_kappa`, types, weights and covariance status (`KappaRowsInput::from_result` does this for a `FitResult`), then calls `format_kappa_rows_from`. A covariance step run later therefore changes the printed notes, just as it does in the CLI. `KappaRowsOptions { ascii: true }` spells `→` as `->` and `κ` as `kappa` for a console that cannot print UTF-8. Names are printed as given. A `block_kappa`’s correlations are not part of the rows: `ferx_core::io::output::offdiag_corrs` over `omega_iov`, `omega_iov_param_corr` and the kappa names returns the pairs the console’s `--- Correlations ---` block reports, with each correlation’s source (#2231; see [Printing the OMEGA rows from a wrapper](../model-file/individual-parameters.llms.md#printing-the-omega-rows-from-a-wrapper)).
+
+### Rules and diagnostics
+
+- The weight may reference **covariates, `FIX`ed thetas and `TIME`** — not random effects, and not estimated thetas. A weight is the *known* precision of an occasion: a random effect there would make the variance of κ a function of κ, and an estimated theta would move the weight during the fit, so the positivity check below (evaluated at the initial θ) could not certify it.
+- A weighted kappa may be referenced **only in `[individual_parameters]`**. Elsewhere it would read as the unweighted κ, so the parser rejects it — and it must be referenced *somewhere* in that block, since a weight that scales nothing would still be reported as if it had been applied.
+- `block_kappa` cannot carry a weight: the divisor would have to apply to the block’s covariances too for the matrix to stay a valid one. Declare a weighted kappa as a diagonal `kappa`.
+- A weight that is zero, negative or non-finite at any record is a fit-time error (`E_KAPPA_WEIGHT_NONPOSITIVE`) — the usual cause is a blank arm-size cell. `simulate()` enforces the same check. A weight that changes *within* an occasion warns (`W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION`): κ is drawn once per occasion, so `Ω_IOV/W` is ambiguous when `W` moves underneath it.
+
+### Validation against NONMEM
+
+NONMEM has no `weight =` on an `$OMEGA`, so its equivalent model writes the scaling into `$PK` by hand — which is exactly what the declaration desugars into. Both engines were run on the warfarin IOV dataset with an arm-size column (`NARM` = 400 on occasion 1, 25 on occasion 2), 1-cpt oral, FOCE, same starting values (`tests/nonmem/kappa_weight_iov.{ctl,lst,ext}`):
+
+| Quantity               | NONMEM 7.6.0 | ferx     |
+|------------------------|--------------|----------|
+| OFV (without constant) | 207.455      | 205.683  |
+| TVCL                   | 0.31727      | 0.32464  |
+| TVV                    | 8.4018       | 8.4445   |
+| TVKA                   | 2.6180       | 2.4467   |
+| ω²(CL)                 | 0.59721      | 0.61281  |
+| ω²(KA)                 | 1.0571       | 0.89725  |
+| γ² (Ω_IOV)             | 2.0013       | 1.8402   |
+| σ² (proportional)      | 0.037588     | 0.040884 |
+
+ferx reaches a lower objective from the same start on a surface where κ is weakly identified (it enters divided by √400 and √25). The residual difference is the pre-existing cross-engine FOCE/IOV gap, not the weighting — evaluated at *identical fixed* parameters it is **smaller** with the weight than without:
+
+| Parameters        | Model              | NONMEM  | ferx    | Δ    |
+|-------------------|--------------------|---------|---------|------|
+| inits, γ² = 0.01  | weighted `κ/√NARM` | 466.779 | 466.720 | 0.06 |
+| inits, γ² = 0.01  | plain `κ`          | 332.265 | 331.620 | 0.65 |
+| NM MLE, γ² = 2.00 | weighted `κ/√NARM` | 207.455 | 205.943 | 1.51 |
+| NM MLE, γ² = 2.00 | plain `κ`          | 238.889 | 238.524 | 0.37 |
+
+The declaration itself is exact: `weight = NARM` and the hand-written `KAPPA_CL / sqrt(NARM)` score **bit-identically** in ferx under FOCE, FOCEI, Laplace and SAEM (`tests/weighted_kappa_iov.rs`), and the analytic `∂f/∂κ` matches finite differences of the production predictor to tolerance.
+
+This is the random-effect sibling of the residual [`weight = ...`](../model-file/error-model.llms.md#residual-weighting-weight-...) modifier, and the two share syntax and validation.
+
+### Simulating an arm that is not in the data
+
+The weight is a data column, and `fit()` always has one — the arm exists, and its size is a column. A simulated trial frequently does not: the point of simulating one is to propose arms that are *not* in the data. Arm sizes are therefore part of a `[simulation]` design and must be stated with `covariate NARM = [...]`; a design that omits one is refused rather than defaulted. See [Covariates in simulation](../model-file/simulation.llms.md#sim-covariates-required) for why neither silent default is safe.
+
+## Model File Setup
+
+    [parameters]
+      theta TVCL(0.2, 0.001, 10.0)
+      theta TVV(10.0, 0.1, 500.0)
+      theta TVKA(1.5, 0.01, 50.0)
+
+      omega ETA_CL ~ 0.09          # BSV
+      omega ETA_V  ~ 0.04
+      omega ETA_KA ~ 0.30
+
+      kappa KAPPA_CL ~ 0.05        # IOV (Option A)
+
+      sigma PROP_ERR ~ 0.02
+
+    [individual_parameters]
+      CL = TVCL * exp(ETA_CL + KAPPA_CL)
+      V  = TVV  * exp(ETA_V)
+      KA = TVKA * exp(ETA_KA)
+
+    [structural_model]
+      pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+    [fit_options]
+      method     = foce
+      iov_column = OCC
+
+See `examples/warfarin_iov.ferx` for a complete runnable example.
+
+## Declaring occasions in the model
+
+Instead of carrying an occasion column in the data, you can have ferx derive the occasion partition from each subject’s timeline with the `iov_occasion` key in `[fit_options]`. The kappa declarations are unchanged — only where the occasion *labels* come from differs.
+
+| `iov_occasion` value | Meaning |
+|----|----|
+| `column` (default) | Occasions come from the `iov_column` dataset column. |
+| `dose` | Each administration *time* begins a new occasion. An observation takes the occasion of the most recent dose at or before its time (dose-before-observation at equal `TIME`). Doses that share a time (e.g. a simultaneous depot + central bolus) share one occasion. ADDL-expanded doses each start their own occasion. |
+| `time(t₁, t₂, …)` | Time-window breakpoints. The strictly-increasing edges define bins: `time(24, 48)` → occasion 0 for `TIME < 24`, occasion 1 for `24 ≤ TIME < 48`, occasion 2 for `TIME ≥ 48`. The first occasion runs from `-∞` to the first breakpoint and the last runs from the last breakpoint to `+∞`, so you specify only the *interior* boundaries. |
+
+For example, a two-period crossover with a washout at 24 h needs no `OCC` column:
+
+    [fit_options]
+      method       = foce
+      iov_occasion = time(24)
+
+This single breakpoint defines **two** occasions: `TIME < 24` (occasion 0) and `TIME ≥ 24` (occasion 1). You give only the interior boundaries — the breakpoint list is *not* a list of occasion start times. In particular, **do not add a leading `0`**: occasion 0 already starts at `-∞`, so `time(0, 24, 48)` is a mistake (it would carve out an empty occasion for `TIME < 0` and shift every real occasion up by one). ferx rejects a `0` breakpoint with an error pointing you at the correct `time(24, 48)` form. Likewise there is no trailing edge for the last occasion — it runs to `+∞`.
+
+**Precedence.** If both `iov_occasion` (set to `dose`/`time(...)`) and `iov_column` are given, the model-side rule **wins** and a warning notes that the column was ignored.
+
+**`--simulate`.** A population simulated from the `[simulation]` block has no dataset, so `iov_column` cannot label it. `iov_occasion = dose` cannot either: every simulated subject receives the block’s single dose, so the rule derives one occasion, which is unidentifiable (see *Identifiability* below). A model with `kappa` run with `--simulate` therefore needs `iov_occasion = time(...)` with a breakpoint between the first and last of the `[simulation]` `times`. Without a rule the run is refused with `E_IOV_MISSING_OCC` before anything is simulated, and a model that sets `iov_column` is told that the key has no effect there. A rule that derives only one occasion on the `[simulation]` design — `dose`, or `time(...)` with no breakpoint between the dose at time 0 and the last of the `times` — is also refused before anything is simulated, with a message that names only the `time(...)` remedy.
+
+**Clock.** Both rules bucket observations, doses *and* `EVID=3/4` reset rows on ferx’s internal event clock — the same monotonic timeline the solver integrates on. For reset-stacked subjects (`EVID=3/4`, where the data-file `TIME` restarts each period) that clock keeps advancing across the reset, so `time(...)` breakpoints separate the periods correctly and each dose stays in the same occasion as its co-timed observations.
+
+**Reset rows.** A reset row’s occasion decides which κ an `[odes]` `init(...)` re-seed runs under (see [initial conditions](../model-file/initial-conditions.llms.md)). `time(...)` places it in its window. `dose` places it in the occasion of the last dose at or before it, so an `EVID=4` row, or an `EVID=3` row with a dose at the same time, re-seeds under the occasion that dose opens. That is what NONMEM gives when `$PK` computes the occasion from `TIME`. It is anchored against NONMEM in `nonmem_anchor/iov_rule_reset_{A,B}.ctl`.
+
+**Identifiability.** A rule that yields only one occasion for every subject (e.g. `time(...)` breakpoints outside the sampling window, or `dose` on single-dose subjects) leaves kappa confounded with between-subject variability, so `fit()` errors. The count is over doses and observations: an `EVID=2` or `MDV=1` row that a breakpoint puts in an occasion of its own lies before or after all of them, so its κ informs nothing and does not lift the error. Set breakpoints inside the sampling window, use `dose` on a multiple-dose design, or supply an `iov_column`. On the other end, `dose` on a long ADDL/steady-state train produces one occasion per expanded dose; this can balloon the per-subject inner problem, so ferx warns when the derived occasion count is large — prefer `time(...)` windows there. If the model declares no `kappa`, `iov_occasion` has no effect and a warning says so.
+
+## Nested levels below the subject (`level … by … in …`)
+
+> **Maturity: beta** ([\#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082)).
+
+The occasion is one level of grouping below `ID`. A model can declare several, nested inside each other: sponsor → study → arm for a model-based meta-analysis, or subject → period → day in a clinical study. Each kappa lives at one level and is drawn once per group of that level, so a study effect is shared by every arm of the study while each arm gets its own arm effect.
+
+All levels are integrated inside one subject. The coarsest grouping that needs a random effect is `ID` (in the meta-analysis below, the sponsor), and everything finer is a level. The FOCE/FOCEI marginal of each subject is the exact one over all of its random effects together, as for ordinary IOV.
+
+### Declaring levels
+
+    [parameters]
+      omega ETA_SP ~ 0.09                       # at ID: one per sponsor
+      level STUDY by STUDY in ID                # groups of rows with one STUDY value, inside a subject
+      level ARM   by ARM   in STUDY             # groups with one ARM value, inside a study
+      kappa K_ST  ~ 0.04 at STUDY               # between-study, unweighted
+      kappa K_ARM ~ 4.0  at ARM weight = NARM   # between-arm, gamma^2 / NARM
+
+    [individual_parameters]
+      EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)
+
+- `level NAME by COLUMN in PARENT` declares a level. `PARENT` is `ID` for the first level and the level declared just before it for each later one, so the levels form one chain. Two levels inside the same parent would be *crossed* levels, which are not supported.
+- `kappa … at LEVEL` (or `block_kappa (…) = […] at LEVEL`) attaches a kappa to a level. A block lives at one level, so random effects at two levels are never correlated. Once a `level` is declared, every kappa says where it lives.
+- **Groups are nested by key.** A group is identified by its labels from the outermost level down, so `ARM = 1` in study 1 and `ARM = 1` in study 2 are two different arms. Arm labels need not be unique across studies, and numbering them uniquely gives the same fit to the bit.
+- **The weight is on the kappa**, exactly as for [sample-size-weighted IOV](#sample-size-weighted-iov-weight-...): one level can hold a weighted and an unweighted kappa. `weight = W` scales that kappa’s variance to `γ²/W`. `W` must be constant within a group of the kappa’s own level; `W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION` names the group where it is not.
+- **Centering.** The prior of every level has mean zero, and the estimated random effects of a level are not forced to average to zero. That is NONMEM’s `LEVCENTER = 0`.
+
+**One level is today’s IOV.** `level OCC by OCC in ID` with `kappa … at OCC` is the explicit spelling of `iov_column = OCC`. It reads the same column the same way and fits to the same bits, so it works with every method that supports IOV. A `level` replaces `iov_column` and `iov_occasion` rather than combining with them. Writing both in the model file, setting `iov_occasion` to `dose` or `time(...)` in the fit options of a model with nested levels, or a kappa without `at` once levels are declared, is refused with `E_LEVEL_MIXED_WITH_IOV_COLUMN`.
+
+### The data
+
+The level columns are read with the data, like covariates, so they need no `[covariates]` declaration, and a model with a `[covariates]` block does not warn about them unless an expression also reads one (`if (ARM == 2)`) or a `theta …[COL]` level block indexes on one (`theta PLACEBO[STUDY, TIME]`), which makes it a covariate as well. Every record needs a value in every level column, since its group at each level is identified by those values, and a label is a **numeric code**: a text id such as `NCT01` has to be written as a number. A record with no numeric value is refused with `E_LEVEL_MISSING_LABEL`, which names the level, the record and its time.
+
+Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA` or empty) on a row is that row’s missing label, even when the rows around it are labelled, so write the label on every row rather than only on the first row of a group. This holds when the data are read for the model: by the model file’s own fit, by `read_population_for` (the CLI and the R package use it) and by `ferx check --data`. The model-blind readers (`read_nonmem_csv*`) do not know which columns are levels, so they fill a blank level cell from the record before it like any covariate’s, but they note the filled cell (`Subject::filled_cells`), and `fit()`, `ferx check --data` and `simulate*` refuse it with `E_LEVEL_MISSING_LABEL` all the same (#2036).
+
+A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject’s η for the first level). The kappa is then the parent’s random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits. The check compares the parameters that read each random effect **directly** in `[individual_parameters]`: a kappa that reaches the same parameter through an intermediate (`CLI = CL * exp(K_ST)` beside `CL = TVCL * exp(ETA)`) is not caught, though it is just as confounded.
+
+`ferx check --data` prints one informational row per level, `W_LEVEL_SUMMARY` (severity `info`, so it is not counted as a warning), so a level where only some parents hold a single group is visible before the fit: the level’s group count, the groups per parent (min, median and max), how many parents hold a single group, and the kappas at the level. It counts on the observation records, as the refusal does.
+
+### What this release supports
+
+Nested levels (more than one `level`) are estimated with `method = foce` or `focei` at `n_agq = 1`. In this release:
+
+- **Gradients and the covariance step are analytic.** The inner and outer gradients come from the same exact adjoint recordings as one-level IOV (compartment-free, closed-form and `[odes]` models), so the fit reports `gradient_method_inner` and `gradient_method_outer` as `analytic` and `optimizer = auto` takes its gradient-based choice; the covariance step takes the exact analytic R-matrix. Each kappa’s derivative lands on its own group’s random effect: an arm’s records move the arm kappa of that arm and the study kappa of its study, which every arm of the study shares. A closed-form transit or inverse-Gaussian absorption model (`pk one_cpt_transit`, …) is served too: its IOV subjects run on the absorption ODE twin, whose adjoint recording is exact.
+- **Other estimators are refused** with `E_NESTED_LEVEL_METHOD_UNSUPPORTED`: SAEM, IMP, IMPMAP, Bayes, VI, Laplace and FOCEI quadrature, GN, a `[mixture]` and FREM. Each is enabled later with its own anchor. A single level is not affected.
+- **Simulation** draws each kappa once per group of its level ([below](#nested-levels-simulation)). The adaptive-dosing entry points are refused with `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`: their kappa stream draws one kappa per occasion.
+- **A residual `correlation … by` line** fits and simulates with nested levels, as with one level ([residual correlation](../model-file/residual-correlation.llms.md#with-kappa-and-nested-levels)): the marginal’s `R̃` carries every level’s random effects and the line’s dense `R`. `by ARM` naming a level groups by that level’s groups, nested by key. With the line, the inner and outer gradients and the covariance step stay analytic (#2101), and `cs` over the groups of a kappa-carrying level is refused with `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`.
+- **A `theta NAME[COL, …]` level block** is checked against the kappas as with one level. Whether a block can absorb a kappa is decided per group of the kappa’s level: a kappa at `STUDY` is absorbed by `PLACEBO[STUDY, TIME]` when each of the block’s levels lies inside one study, and the block then takes the within-study contrast, or is refused when no contrast identifies both. When measuring, the binder moves the kappa on every arm of its study at once, since the arms share it. A block whose levels cross those groups (`PLACEBO[TIME]`, say) cannot absorb the kappa.
+- **Post-fit output is per level** ([below](#nested-levels-output)).
+
+### Cost grows with the groups inside each subject
+
+Each subject’s inner problem is over all of its random effects at once: its η plus one κ per group of every level it contains. For `ID ⊃ STUDY ⊃ ARM` with one kappa at each level, a subject holding `S` studies of `A` arms each solves for $n_\eta + S + S \cdot A$ random effects. Making a coarse grouping the subject — a sponsor or a programme as `ID` — therefore stacks every arm of every study into one inner problem, and its cost rises much faster than the number of rows.
+
+Measured on one synthetic dataset of 48 arms (192 rows; compartment-free model, one η, one kappa per level, `threads = 1`, macOS arm64), regrouped so only the stacked width changes:
+
+| Subjects × studies × arms | Stacked width | `wall_time_secs` | `n_iterations` (all converged) |
+|----|----|----|----|
+| 8 × 2 × 3 | 9 | 0.56 | 45 |
+| 4 × 4 × 3 | 17 | 1.57 | 50 |
+| 2 × 8 × 3 | 33 | 6.97 | 51 |
+
+The iteration count barely moves, so the growth is the cost of each inner solve. There is no cap on the stacked width: a subject far past the old 48 keeps the exact gradient (the recorders have no width limit).
+
+To keep the width down, make `ID` the coarsest grouping that genuinely needs its own random effect, and declare a level only where its kappa is needed.
+
+### Output per level
+
+A kappa at a level has one estimate per group of that level, so each post-fit quantity is taken over those groups:
+
+| Output | What it holds |
+|----|----|
+| `FitResult.kappa_levels` | each kappa’s level, parallel to `kappa_names` (`["STUDY", "ARM"]`) |
+| `FitResult.ebe_kappas_by_level` | per level, outermost first: the level’s columns and kappas, and per subject each group’s labels (`[1, 2]` = study 1, arm 2) and its estimates, each group once |
+| `FitResult.ebe_kappas` | unchanged: per subject, one vector per **cell** (one arm of one study) with the kappas that cell reads, so a study kappa repeats for each of its arms |
+| `shrinkage_kappa` | per kappa, pooled over the groups of its own level, not the cells. A group counts when a record of it informs the kappa (#1911): a study counts when any of its arms does. `shrinkage_kappa_by_occ` is empty, since an occasion slot would mix studies and arms |
+| `kappa_weight_typical` | the median weight over the groups of the kappa’s level: one value per study for a weighted study kappa |
+| the KAPPA rows | the level after the name: `K_ST at STUDY = 0.040000 …`, `K_ST at STUDY [FIX]` when fixed; the rest of the row is unchanged |
+| the fit YAML | a `level:` line in each kappa’s `omega_iov:` entry |
+| the sdtab | one column per kappa, named after it, with the estimate of the row’s own group: `K_ST` is the study estimate, `K_ARM` the arm estimate |
+| `.fitrx` | one `ebes_kappa_<LEVEL>.csv` per level (`ID,GROUP,<label columns>,<kappas>`), listed in `fit.json` |
+
+A model with a single level (`iov_column`, or one `level` line) has none of the additions, and its output is as before.
+
+### Simulation
+
+`simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` and the NPDE reference distribution draw each kappa once per group of its level, from that level’s block of Ω_(IOV): one study kappa shared by every record of the study, one arm kappa per arm. The groups come from the level columns of the population being simulated, read as `fit()` reads them, so every record needs a numeric label at every level (`E_LEVEL_MISSING_LABEL`). A `[simulation]` design gives each subject one value per covariate, so it cannot express several groups of a level within a subject; simulate a nested model on a dataset that carries the level columns row by row. `ferx --simulate` on a nested model therefore ends one of three ways (`tests/nested_levels_cli_simulate.rs`):
+
+- **No `covariate STUDY = …` / `covariate ARM = …` lines.** Refused with `E_MISSING_COVARIATE` before anything is simulated. The message names each level whose column is missing, says that the design cannot express groups below a subject, and points to `simulate()` on a dataset.
+- **With them, and a kappa that reads the same parameters as a random effect of the level above it** (a study kappa on the same parameters as an η, say). Every subject has a single group at each level, so the fit of the simulated data is refused with `E_LEVEL_SINGLE_MEMBER`.
+- **With them, and no such kappa.** The run goes end to end, with one group per level per subject.
+
+A kappa drawn per level reduces exactly to today’s draw. A nested model whose kappas all live at one level simulates the same rows, bit for bit, as a one-level model whose `iov_column` labels that level’s groups (`tests/nested_levels_simulate.rs`), and data simulated at the exact3 truth are refitted to the variance components they were drawn from (`tests/nested_levels_round_trip.rs`).
+
+A derived `iov_occasion` rule in `SimulateOptions` is refused with `E_LEVEL_MIXED_WITH_IOV_COLUMN`, as in `fit()`: the levels define the groups.
+
+### Validation against NONMEM
+
+NONMEM’s exact spelling of nested levels is the IOV idiom: re-base `ID` at the coarsest level and write each finer level’s random effects as occasion-style `ETA` slots with `$OMEGA BLOCK(1) SAME`, the arm-size weight written by hand as `ETA/SQRT(NARM)`. ferx is anchored against that coding on a synthetic three-level arm-mean dataset (12 sponsors × 2 studies × 2 arms × 5 visits, `nonmem_anchor/nested_levels_3.*`). At NONMEM 7.6.0’s FOCEI optimum both engines evaluate the same parameters:
+
+|  | NONMEM 7.6.0 | ferx |
+|----|----|----|
+| OFV | 107.04357106 | 107.04357095 |
+| worst \|Δ\| over the 108 compared η̂ and κ̂ (84 distinct: each study κ̂ is read by both of its arms) |  | 8.8e-6 |
+
+NONMEM’s `$LEVEL` is a different object and is not an oracle for this: its help describes its FOCE as a linearized approximation at the super-ID level. On the same data it recovers γ² = 0.88 against a truth of 4 (the IOV-idiom coding recovers 3.76), and its covariance step aborts.
+
+## Algorithm Details
+
+### Inner loop
+
+When a model has kappa declarations and the subject has occasion labels, the inner optimizer runs `find_ebe_iov` instead of the standard `find_ebe`. It jointly optimizes over:
+
+$$p = [\underbrace{\eta_1, \ldots, \eta_{n_\eta}}_{\text{BSV}},\ \underbrace{\kappa_{1,1}, \ldots, \kappa_{1,n_\kappa}}_{\text{occasion 1}},\ \ldots,\ \underbrace{\kappa_{K,1}, \ldots, \kappa_{K,n_\kappa}}_{\text{occasion K}}]$$
+
+The joint negative log-posterior is:
+
+$$-\log p(p \mid y_i) = \frac{1}{2}\left[
+  \eta^T \Omega^{-1} \eta + \log|\Omega|
+  + \sum_{k=1}^{K} \kappa_k^T \Omega_\text{IOV}^{-1} \kappa_k
+  + K \log|\Omega_\text{IOV}|
+  + \sum_{j} \left(\frac{(y_{ij} - f_{ij}^{(k_j)})^2}{V_{ij}} + \log V_{ij}\right)
+\right]$$
+
+where $k_j$ is the occasion of observation *j* and $f_{ij}^{(k)} = f(\theta, \eta_i, \kappa_{ik})$.
+
+Optimization uses BFGS. The inner gradient and the H-matrix (the Jacobian ∂f/∂\[η, κ\] over the stacked random effects) come from the adjoint’s exact recordings for every engine they serve: the closed forms, the event walks and user `[odes]`, with steady-state doses, lag times, resets, `iiv_on_ruv` and FREM. The stacked `[η, κ₁…κ_K]` count is not capped. A subject takes finite differences only when its data shape is one no recorder serves (named per subject in `FitResult.warnings`).
+
+### Outer loop
+
+The IOV omega is packed after the sigma block in the optimizer vector. For Option A (diagonal Ω_IOV) only the log-diagonal entries are appended; for Option B the full Cholesky lower triangle is appended (log-diagonals plus off-diagonals as-is), mirroring the BSV omega packing:
+
+$$x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Omega_\text{IOV})]$$
+
+The per-subject FOCE objective is a *proper augmented marginal*: the per-occasion kappas are integrated out through the linearised marginal exactly like the BSV etas. The random-effect vector is $b = [\eta,\ \kappa_1, \ldots, \kappa_K]$ with block-diagonal prior covariance
+
+$$\Sigma_b = \text{blockdiag}(\Omega_\text{BSV},\ \Omega_\text{IOV},\ \ldots,\ \Omega_\text{IOV})$$
+
+(*K* copies of Ω_IOV), and the H-matrix is **augmented** with kappa columns, $H_\text{full} = [\,\partial f/\partial\eta \mid \partial f/\partial\kappa_1 \mid \cdots \mid \partial f/\partial\kappa_K\,]$. A kappa column can affect later observations through cross-occasion carryover, including when the kappa belongs to a dose-only occasion. The objective is then the ordinary Sheiner–Beal form
+
+$$\text{NLL}_i = \tfrac{1}{2}\left[(y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}|\right],\qquad
+\tilde{R} = H_\text{full}\,\Sigma_b\,H_\text{full}^T + R$$
+
+with no separate kappa prior added (it is already folded into $\tilde{R}$). This reduces exactly to the BSV-only FOCE objective when there are no kappas.
+
+> **Why this matters (issue \#101).** An earlier implementation linearised only the BSV etas and added an explicit kappa MAP penalty $\tfrac{1}{2}\sum_k(\kappa_k^T\Omega_\text{IOV}^{-1}\kappa_k + \log|\Omega_\text{IOV}|)$. That penalty omits the kappa Laplace determinant, so Ω_IOV was unidentified and the FOCE OFV disagreed with SAEM and NONMEM. The augmented marginal above fixes this; all estimation paths now share one consistent objective.
+
+### Outer-loop gradient (EBE re-convergence for IOV)
+
+The IOV variance components — especially Ω_IOV — are *weakly identified*, and their gradient is dominated by the **EBE response**. Raising Ω_IOV un-shrinks the per-occasion kappas and improves the data fit, an effect a *fixed-EBE* gradient cannot see, so a gradient that holds the EBEs fixed leaves Ω_IOV pinned at its initial value (while derivative-free methods, which re-solve the EBEs at each trial point, move it freely).
+
+For IOV models within the analytical 1-/2-/3-compartment scope, under a **gradient-based outer optimizer** (`lbfgs`, `bfgs`, `slsqp`), the outer gradient is now the **exact analytic marginal gradient** (Almquist et al. 2015) assembled over the stacked random-effect vector `[η_bsv, κ₁, …, κ_K]` with the block-diagonal prior `Ω_bsv ⊕ K·Ω_iov`. It carries the EBE response (Eq. 46) in closed form on every θ/Ω/σ/Ω_iov block — including the κ-variance — so it sees the un-shrinkage effect directly and converges Ω_IOV without re-solving the inner loop. Both FOCEI (Laplace marginal) and FOCE (Sheiner–Beal linearized marginal) have exact closed-form gradients here, and the cross-occasion dose carryover is differentiated exactly through the second-order-dual event-driven walk. Validated against reconverged finite differences (~1e-6 on every packed parameter) and against NONMEM on the warfarin IOV model.
+
+For closed-form models the number of θ is not capped. The adjoint records θ on a reverse tape, so its cost does not grow with θ, and a closed-form model with many θ — fixed ones included, as in a translated model that pins structural constants — keeps the exact gradient on both loops; before \#1907 one with more than 24 `(θ, η, κ)` in total quietly ran finite differences for every subject. No model-level width limit is left on the gradient: a closed-form model with `n_eta + n_kappa = 24` (12 + 12, two occasions) reports the exact gradient on both loops. The only width limit is the per-subject count below. (The 24 that remains is a prediction routing rule for the transit/IG absorption walk, in [Structural-model scope](#structural-model-scope); it does not decide the gradient.)
+
+The exact outer gradient is the adjoint’s, for the same engines as the inner loop. The number of θ does not limit it (the adjoint’s cost does not grow with θ); nor does the per-subject stacked `[η, κ₁…κ_K]` count. The outer gradient is assembled **per subject**: one whose data shape no recorder serves, or one with a non-finite analytic component at a trial point falls back to **central finite differences that re-converge that subject’s inner loop at each perturbed point** (`subject_reconverged_fd_gradient`), so one such subject does not force the whole population onto finite differences. **BOBYQA** (`optimizer = bobyqa`) is derivative-free and uses neither path. Setting `reconverge_gradient_interval = 1` forces the reconverged-FD gradient even within the analytical scope, as a documented escape hatch.
+
+In addition, on the **SLSQP** path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a *pure* FOCEI/SLSQP fit moves the variance components off their initial values and descends toward the marginal minimum from a cold start. It does not always *reach* it: the final descent is driven by a noisy re-converged FD gradient on a weakly-identified variance surface, and SLSQP can terminate a few OFV units high in a platform-dependent way (see [Limitations](#limitations)). An explicit `optimizer = bobyqa` and the `method = [saem, focei]` chain reach the true minimum platform-independently. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global `scale_params` default stays off to preserve the issue-#99 non-IOV behaviour.)
+
+### Importance sampling (`imp` / `impmap`)
+
+IMP and IMPMAP sample each subject’s stacked `[η, κ₁…κ_K]` from one joint proposal and update Ω_(IOV) in closed form from the importance-weighted κ second moments pooled over all occasions (#2301). See [IMPMAP: inter-occasion variability](../estimation/impmap.llms.md#impmap-iov).
+
+### Covariance step
+
+When `covariance = true`, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed by the covariance step at convergence — the exact analytic R matrix in scope, the finite-difference stencil outside it — using the same procedure as for BSV omega.
+
+## Output
+
+The following IOV-related fields are populated on `FitResult` and printed by `print_results()`. The fit YAML gains an `omega_iov:` section listing the kappa variances and (for Option B) the off-diagonal covariances/correlations.
+
+| Field | Description |
+|----|----|
+| `omega_iov` | Estimated IOV covariance matrix (`Option<DMatrix<f64>>`) |
+| `kappa_names` | Names of kappa parameters in declaration order |
+| `kappa_fixed` | Per-kappa `FIX` flags |
+| `se_kappa` | Standard errors for IOV omega elements (requires `covariance = true`) |
+| `ebe_kappas` | Per-subject, per-occasion kappa EBEs. `ebe_kappas[i][k]` is the kappa vector for subject *i*, occasion *k* |
+
+When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one row per observation, the subject’s occasion index for that row).
+
+`shrinkage_kappa` (pooled) and `shrinkage_kappa_by_occ` (per occasion slot) report kappa shrinkage over the occasion groups an observation informs; a group no observation can read is left out (#1911). See [Output files](../output.llms.md).
+
+## Simulation
+
+`simulate()` is occasion-aware for a `kappa` model: it draws one independent κ ~ N(0, Ω_(IOV)) per occasion group, so a VPC from an IOV model carries the inter-occasion spread the fit estimated (drawing a single κ for the whole subject would silently under-disperse it).
+
+The occasion groups come from the population’s occasion labels. A model whose occasions are derived by `iov_occasion = dose` or `iov_occasion = time(...)` rather than read from an `iov_column` has no labels in the data, so each simulate entry point has to apply the rule itself, as `fit()` does (#1955):
+
+| Entry point | Rule applied |
+|----|----|
+| `simulate_with_options()`, `simulate_with_options_diag()` | `SimulateOptions::iov_occasion`. Applied before the propensity posthoc pass too, so a matched simulation estimates η̂ with κ |
+| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | `FitResult::iov_occasion`, the rule the fit ran under |
+| `ferx --simulate` | the model file’s own `[fit_options] iov_occasion` |
+| `simulate()`, `simulate_with_seed()` | none |
+
+A subject that still carries no occasion label is simulated at κ = 0, with no inter-occasion variability. That is the intended reading of a population with no occasions (NONMEM `$SIM` treats `OCC = 0` as `KAPPA = 0`), so it is not an error. The `_diag` forms report it as one `W_IOV_NO_OCCASIONS` warning, which counts the subjects affected. `simulate()` and `simulate_with_seed()` return no warnings, so on a rule-derived model they simulate at κ = 0 silently. Use `simulate_with_options_diag()` with the rule instead. `ferx --simulate` never gets that far: its `[simulation]` design has no occasion column, so without an `iov_occasion` rule it is refused with `E_IOV_MISSING_OCC` before anything is simulated (see *`--simulate`* above). With a rule, the returned population carries the derived labels, so the sdtab writes `OCC`.
+
+That draw needs Ω_(IOV) in the parameters you hand to `simulate()`. The model’s own parameters (`model.default_params`) always carry it, but a caller that **rebuilds** parameters from a fit must thread the fitted IOV covariance through as well — `estimation::uncertainty_samples::fitted_params_from_result()` does this and is the supported way to go from a `FitResult` to a simulate-ready `ModelParameters`; it refuses (`E_PARAM_SHAPE`) a fit whose `omega_iov` does not match the model’s `kappa`: missing on a model with `kappa` (rather than substituting the model’s initial Ω_(IOV)), present on a model without, or mis-sized (issue \#1789), and a fit whose Ω, σ or Ω_(IOV) is mis-sized or not square (issue \#1833). Parameters with a missing `omega_iov` are rejected: every `simulate*` entry point returns an `Err` naming the omission rather than silently emitting occasion-free draws (issue \#1019).
+
+## Limitations
+
+- **Cross-occasion dose carryover.** Predictions are computed by `pk::predict_iov`, which builds per-event PK parameters carrying each event’s occasion kappa and propagates the compartment amounts *continuously* across occasion boundaries (via the event-driven solver). A dose from an earlier occasion is therefore eliminated through a later occasion with the later occasion’s clearance — matching NONMEM’s integration model (this replaced the earlier “Option A” superposition, which used a single clearance for the whole dose history and biased no-washout designs; issue \#104). On the warfarin IOV reference, ferx’s population prediction now matches NONMEM’s to 5 significant figures on every row. A ~17 OFV-unit gap versus NONMEM remains at matched parameters, but it is *not* a prediction difference — it is a cross-engine FOCEI marginal/EBE difference for this weakly-identified multi-random-effect model (and NONMEM’s reference itself did not converge cleanly here). See `tests/warfarin_iov_nonmem.rs`.
+- **Local-optimizer convergence from a far-off cold start.** Pure FOCEI (SLSQP via the auto-scaling above, or BFGS) reaches the minimum from a *sensible* start, but the IOV variance surface is ill-conditioned and weakly identified, so a *far-off* start (e.g. a residual-error init off by more than ~2×) can still stall. Set a realistic `sigma` init (a too-small one drives early omega inflation). The most robust workflow remains **SAEM**, or a `method = [saem, focei]` chain (SAEM finds the basin, FOCEI polishes to a strictly better marginal optimum). See `tests/iov_convergence.rs`.
+- **Platform-dependent pure-SLSQP cold-start termination.** Even from the model’s cold default start, a *pure* FOCEI/SLSQP fit on `warfarin_iov` reaches a different point on different architectures: macOS arm64 lands at ≈307.8 (the minimum), while Linux x86_64 deterministically stalls at ≈314.7, ~7 OFV units high (issue \#160). The descent direction near the minimum comes from a re-converged central-FD gradient whose floating-point summation order differs across architectures, and SLSQP’s stagnation guard latches at whichever flat-looking point it reaches first. This affects only an explicit `optimizer = slsqp`; an explicit `optimizer = bobyqa` (derivative-free) and the SAEM→FOCEI chain reach ≈307.8 on both platforms. Prefer them for IOV fits — reserve pure SLSQP for a warm start already in the basin.
+- **Form C output (`[scaling] y = <expr>`) cannot reference `KAPPA_*` directly** under IOV — the `[scaling]` eta scope is between-subject only, so a bare kappa name would resolve to `kappa = 0`. The parser rejects it with a clear error (issue \#107); put the occasion dependence in an `[individual_parameters]` entry (e.g. `BASE = TVBASE * exp(KAPPA_B)`, or a structural parameter such as `CL`) and reference *that* in the readout. Such a reference **is** occasion-correct: the readout is evaluated per observation with that observation’s occasion κ, on both the ODE and the closed-form engine (fixed in \#1079 for the closed-form engine, which previously evaluated the readout’s individual parameters at `kappa = 0`). The PK dynamics themselves are always occasion-correct.
+- **Inner-loop and outer gradients are exact** for every IOV subject the adjoint’s recordings serve, at any stacked `[η, κ₁…κ_K]` width (see [Inner loop](#inner-loop) and [Outer-loop gradient](#outer-loop-gradient-ebe-re-convergence-for-iov)); the covariance step’s analytic R-matrix and Laplace’s exact anchor do too. Before \#2093 the forward provider capped the stacked axes at 96, with a separate 24-axis `(θ, η, κ)` model limit. θ is no longer counted, FIX θ included: the recordings put θ on a reverse tape, so a model with many θ keeps the exact gradient on the closed-form, ODE and compartment-free engines alike (#1907, \#2031). On a 20-subject, 9-occasion fit with 30 stacked random effects per subject, the exact gradient took 41.5 s where the finite-difference route took 2739 s, at the same OFV.
+- The occasion column must hold non-negative whole numbers (`2.0` is occasion 2). A missing, fractional, negative or non-numeric value becomes `OCC = 0` and is counted in one `W_IOV_OCC_MISSING` warning.
+- Kappa EBEs are not emitted as sdtab columns for a one-level model; access them via `FitResult.ebe_kappas`. A model with nested levels gets one column per kappa ([output per level](#nested-levels-output)).
+
+## Comparison to NONMEM
+
+| Concept | NONMEM | ferx-core |
+|----|----|----|
+| Diagonal IOV | `OMEGA BLOCK(n) SAME` with one kappa per block | `kappa NAME ~ variance` (Option A) |
+| Correlated IOV | `OMEGA BLOCK(n)` shared across occasions | `block_kappa (N1, N2) = [...]` (Option B) |
+| Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]`; `OCC` can also be read in `[individual_parameters]` (`if (OCC == 2) …`), no `[covariates]` declaration needed |
+| Occasion from model | `IF(TIME.LT.24) OCC=1` logic in `$PK` | `iov_occasion = dose` or `time(...)` in `[fit_options]` |
+| Nested levels below the subject | `ETA` slots per level with `$OMEGA BLOCK(1) SAME` under a re-based `ID` (`$LEVEL` is a linearized approximation) | `level NAME by COL in PARENT` and `kappa … at NAME` ([nested levels](#nested-levels)) |
+| Kappa in PK | `ETA(n)` with `SAME` block | `KAPPA_xxx` in `[individual_parameters]` |

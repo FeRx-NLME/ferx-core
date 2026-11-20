@@ -1,0 +1,163 @@
+# Stochastic Differential Equations (SDE / Diffusion)
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The `[diffusion]` block adds continuous stochastic noise to ODE state variables. This models *system noise* — structural uncertainty that accumulates between observations — as opposed to measurement noise (sigma) or inter-individual variability (omega).
+
+## What is system noise?
+
+In a standard ODE-based NLME model the trajectory of each subject is deterministic once the individual parameters are fixed. In an SDE model the ODE is replaced by an Itô stochastic differential equation:
+
+    dX = f(X, t, θ) dt  +  diag(σ_w) dW
+
+where `dW` is a vector of independent Wiener increments. The diagonal entries `σ_w` are the *diffusion standard deviations*; their squares `σ²_w` are the **diffusion variances** declared in `[diffusion]`.
+
+ferx-core estimates the diffusion variances with an Extended Kalman Filter (EKF). What is implemented today is the *covariance* half of that filter: the state covariance matrix `P` is propagated alongside the ODE trajectory and shrunk at each observation, while the state **mean** stays the deterministic ODE solution and is never corrected by the observed values. The total observation variance is:
+
+    V_total = P_ekf[obs_cmt, obs_cmt]  +  V_residual
+
+where `V_residual` is the variance from the `[error_model]` (sigma-based). The Kalman update’s measurement variance is that residual variance at the filter’s own mean, so one solve gives both the mean and `P`.
+
+So the residual actually scored is the ordinary ODE residual `DV - IPRED`, and the inflation `P` depends on the parameters, the sampling times and the residual variance — but on nothing the subject observed. Read [What the filter does not do](#what-the-filter-does-not-do) below before interpreting a `[diffusion]` fit.
+
+## Declaring diffusion variances
+
+    [diffusion]
+      STATE_NAME ~ initial_value
+      STATE_NAME ~ initial_value FIX
+
+- `STATE_NAME` must be one of the state names listed in `[structural_model]`.
+- The value after `~` is the **initial estimate of the variance** σ²_w (≥ 0).
+- `FIX` pins the parameter at its initial value (not estimated).
+- Each declared state gets a population parameter named `DIFF_<STATE>` (e.g., `DIFF_CENTRAL`). These appear in `theta_names` of the fit result alongside the regular structural parameters.
+
+## How diffusion differs from sigma and omega
+
+|  | **sigma** | **omega** | **diffusion** |
+|----|----|----|----|
+| What it is | Measurement noise (assay/residual error) | Between-subject variability | Within-subject system noise |
+| When it acts | At each observation time | At model initialisation (between subjects) | Continuously along the trajectory |
+| What it affects | Observation residuals only | Individual parameter values | State trajectories between doses |
+| NONMEM analogy | `EPS` / `SIGMA` | `ETA` / `OMEGA` | No direct analogy |
+
+A large estimated `DIFF_CENTRAL` relative to sigma suggests that the ODE structure is missing an important mechanism (e.g., a compartment, a feedback loop, or a covariate effect).
+
+## Derivatives
+
+Every estimation route on an SDE model is exact (the EKF’s process-noise variance is differentiated through the adjoint): FOCE/FOCEI, AGQ/Laplace, IOV, `[scaling]` and LTBS, time-varying covariates, and the covariance step. A steady-state dose, a modeled `RATE`/`D` dose and a rate-defined infusion under an estimated `F` are exact too: a moving infusion window end carries its derivatives through the filter.
+
+## When to use SDE models
+
+`[diffusion]` buys one extra parameter per state: how much unexplained variance accumulates along the trajectory. That is worth asking for when you want to *quantify* how far a mechanistically committed ODE is from the data — a large `DIFF_<STATE>` relative to sigma says the structure is missing something — and when the competing structural models are not identifiable from the design.
+
+It is **not** a remedy for residual autocorrelation, and ferx no longer suggests it as one. With the state mean uncorrected the likelihood factorises over observations, with inflations that do not depend on what was observed, so a diffusion term cannot follow a subject’s drift — it re-weights the fit instead. Measured on a two-compartment population fitted as one compartment (40 subjects × 14 observations, 5 % proportional error; one variable changed, the `[diffusion]` block; Durbin-Watson as computed through 0.4.0, before it was pair-normalised):
+
+| Model                  | OFV    | Durbin-Watson | Fitted CL (truth 1.0) |
+|------------------------|--------|---------------|-----------------------|
+| ODE                    | 692.67 | 0.403         | 0.99                  |
+| ODE + `central ~ 0.01` | 23.30  | 0.766         | 2.49                  |
+
+The objective improves by 669 for one parameter, the Durbin-Watson statistic still trips its threshold, and CL moves 2.5× away from the value the ODE fit had recovered. Fit the missing compartment, not the noise.
+
+## What the filter does not do
+
+Three consequences of the uncorrected state mean, all structural rather than a matter of tolerance — tracked as [issue \#1285](https://github.com/FeRx-NLME/ferx-core/issues/1285):
+
+- **No state correction.** At an observation the filter applies the posterior covariance update but not the mean update `x += K * (y - y_pred)`. The next interval integrates from the open-loop ODE state, not from a corrected one.
+- **No filtered `IPRED`, no posterior trajectory.** `IPRED`, sdtab and `[derived]` compartment states all come from the ordinary ODE pass. A zero-drift state carrying a parameter (`d/dt(lkel) = 0` together with `[diffusion] lkel ~ 0.01`) parses and fits, but that state never moves — only its variance grows — so it cannot be read as a time course of the parameter.
+- **sdtab `IWRES` is over-dispersed.** `IWRES` is scaled by the residual error alone; the process variance the objective adds never reaches it. On the misspecified fixture above the mean square of `IWRES` is 1e10 on the SDE fit against 0.94 on the ODE fit, because sigma collapses to 0.0165 to absorb what the inflation already explained. Do not read `IWRES`, `CWRES` or a residual plot from a `[diffusion]` fit as a goodness-of-fit summary.
+
+The `W_EXPERIMENTAL_SDE` warning repeats all three points on every fit. The mean update is planned; until it lands, read `DIFF_<STATE>` as a variance-inflation parameter and nothing more.
+
+## Unit convention (important)
+
+The EKF propagates the variance of the **ODE state in whatever units the user defines it**. ferx adds `dose.amt` directly to the state (`u[cmt-1] += amt`) and returns the raw state value as `ipred` — there is no implicit `amount → concentration` normalisation. You are responsible for making the ODE’s state match the `DV` column.
+
+Two common forms for a 1-cpt oral model (both equations shown so the expressions are self-contained):
+
+    # State = amount (mg).  DV must be in mg.
+    d/dt(depot)   = -KA * depot
+    d/dt(central) =  KA * depot - (CL / V) * central
+
+    # State = concentration (mg/L).  DV must be in mg/L.
+    d/dt(depot)   = -KA * depot
+    d/dt(central) =  KA * depot / V - (CL / V) * central
+
+If the units don’t match (e.g. amount-form ODE with concentration `DV`), predictions and observations will differ by a factor of `V` and the fit will not converge. `DIFF_<STATE>` is then the variance of process noise *in the same units as the state* — e.g. `(mg/L)²` for the concentration form, `(mg)²` for the amount form. See `examples/bioavailability_ode.ferx` for a worked concentration-form ODE.
+
+## Worked example: 1-cpt IV with central diffusion
+
+    [parameters]
+      theta TVCL(5.0, 0.1, 50.0)
+      theta TVV(50.0, 1.0, 500.0)
+      omega ETA_CL ~ 0.09
+      sigma ADD ~ 1.0
+
+    [individual_parameters]
+      CL = TVCL * exp(ETA_CL)
+      V  = TVV
+
+    [structural_model]
+      ode(obs_cmt=central, states=[central])
+
+    [odes]
+      d/dt(central) = -(CL/V) * central
+
+    [diffusion]
+      central ~ 0.5       # initial estimate for DIFF_CENTRAL
+
+    [error_model]
+      DV ~ additive(ADD)
+
+    [fit_options]
+      method = foce
+
+The estimated `DIFF_CENTRAL` gives the variance of the stochastic driving noise on the central compartment amount per unit time. A value near zero indicates the ODE alone explains the data; a large value suggests model misspecification.
+
+## Constraints and incompatibilities
+
+| Situation | Behaviour |
+|----|----|
+| `[diffusion]` on an analytical PK model (`pk ...`) | Parse-time error |
+| `method = saem` with `[diffusion]` and `block_sigma` | Hard error at fit time |
+| Analytic gradients with `[diffusion]` | Exact on every route: FOCE/FOCEI, AGQ/Laplace, the covariance step, fixed-EBE scores (GN, trust region), SAEM’s IMH proposal, IOV, steady state, a modeled `RATE`/`D`, `[scaling]` and LTBS |
+| State name not in `states = [...]` | Parse-time error |
+| Negative initial value | Parse-time error |
+
+## Model-time builtins in the RHS
+
+An `[odes]` right-hand side under `[diffusion]` may read the solver-injected builtins `TIME` / `T`, `TAFD` and `TAD`, with the same meaning as on the ordinary ODE path — see [TAD before the first dose arrives](../model-file/ode-models.llms.md#tad-before-the-first-dose-arrives) for what `TAD` reads in the window before an arrival, and for the dose-free case.
+
+    [odes]
+      d/dt(central) = -(CL/V) * central * (1.0 + KTAD * TAD)
+    [diffusion]
+      central ~ 0.01
+
+`TAD` is re-anchored at each dose segment by the same rule the two ODE predictors use, so an SDE fit of a time-varying right-hand side reduces to its ODE twin as the diffusion variance goes to zero. Measured on the model above (`CL = 1`, `V = 20`, `KTAD = 0.3`, doses at 0 and 12): `OFV = 14.7016` from the EKF at `central ~ 1e-14` and `14.7016` from the same model with the `[diffusion]` block removed.
+
+That reduction holds for the dataset above. It is **not** unconditional, because the EKF/SDE path does not implement every dosing feature the ODE path does. Each gap below raises a warning rather than failing, so check the fit’s warnings before relying on the equivalence:
+
+| Dataset feature | Code | What the SDE path does instead |
+|----|----|----|
+| `EVID=3`/`4` system reset | `W_SDE_RESET` | the reset is ignored; compartment amounts carry through |
+| `lagtime` / `ALAGn` | `W_SDE_LAGTIME` | every dose is applied at its record time |
+
+One more gap raises no warning: **where the filter starts**. The ODE path starts each subject at its first record of any type, as NONMEM does, and that includes an `EVID=2` row or an `EVID=0, MDV=1` row ahead of the first dose or observation ([\#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809)). The EKF starts at the first observation or dose. On a subject whose first record is such a row, and whose state changes before its first observation or dose (an `init()` that is not an equilibrium, a production term, or `TIME` in the right-hand side), the objective is then computed on a later clock than `IPRED`.
+
+These are **fitting** gaps, not prediction gaps. The filter runs only inside the objective, so `predict()` and `simulate()` on the same model go through the ordinary ODE path, which does apply a lag time. A model can therefore show a correct `IPRED` and a wrong objective at the same time — which is why the warnings are raised by `fit()` and `ferx check` rather than at prediction time.
+
+`TIME` / `T` is the integration variable itself and has always been readable here. `TAFD` and `TAD` are passed in two extra parameter slots, and until \#1131 the EKF was handed an array two slots short, so both evaluated to `NaN` for the whole trajectory. That failure was easy to miss: `IPRED` is computed on the ordinary ODE path and stayed correct, while the objective — which is what the filter actually contributes — became the diverged-subject sentinel. A right-hand side reading neither builtin was never affected.
+
+### Steady-state records are equilibrated
+
+An `SS=1` record is equilibrated on the EKF path the way the ODE path’s nonlinear run-in does it: from an empty state, cycles of *(dose; integrate `II`)* are expanded until the filter’s **mean and covariance** both stop moving, or the cycle cap is spent — in which case the same non-convergence warning the ODE run-in raises is attached to the fit. Both halves matter. The covariance at the record is the stationary Riccati value rather than zero (on `dA/dt = −k·A` that is `q / 2k` exactly), and on a nonlinear right-hand side the Riccati Jacobian is linearised along the *steady-state* mean, whose phase a one-dose mean gets wrong.
+
+Measured on the fixture the gap was reported on (Michaelis–Menten elimination, `VMAX = 20`, `KM = 50`, `central ~ 5.0`, 100 mg every 12 h for 480 h, four samples after the last dose): one `SS=1, II=12` record scored **610.41** where the 41 explicit records scored **489.88**, while the ODE path gave the identical objective both ways. The two spellings now agree to `1e-9` relative in `IPRED` and in the filter covariance at every sample, and so does an `SS=1` infusion against its explicit infusion train on a right-hand side reading `TAD`, and an `SS=1` infusion longer than `II` (overlapping pulses) against its explicit overlapping train.
+
+The run-in reads model time the way the ODE run-in does: each cycle is integrated on a clock whose origin is its own pulse, so `TAD` is anchored per window, `T` / `TIME` take that cycle-local value, and `TAFD` reads `NaN` — there is no periodic steady state for a quantity that grows without bound. A right-hand side reading `TAFD`, `T` or `TIME` under an `SS=1` record is named by `W_STEADY_STATE_ABSOLUTE_TIME` at check time, with or without a `[diffusion]` block.
+
+The run-in is the cost of the train the record abbreviates, paid on every objective evaluation: on the fixture above one evaluation takes 569 ms with the `SS=1` record against 996 ms with the 41 explicit records and 58 ms with the record read as a single dose (debug build; the run-in stops after 16–21 cycles).
+
+## ferx-r usage note
+
+When using ferx-core from R via the ferx-r package, the `[diffusion]` block is part of the `.ferx` model file and requires no special R-side argument. The estimated diffusion variances appear in the returned fit object alongside other theta parameters. See the ferx-r documentation (`?ferx_fit`) for details on accessing `theta_names` and interpreting `uses_sde` in the fit object.

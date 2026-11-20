@@ -1,0 +1,593 @@
+# Output Files
+
+Each model run produces two output files (plus a third, `{model}-covtab.csv`, when the model declares a [`[covariates]`](model-file/covariates.llms.md) block). The human-readable fit estimates default to YAML; pass [`--output-format json` or `both`](#fit-json-modelfitjson) to additionally emit a complete, machine-readable JSON result for programmatic or agentic consumers.
+
+## Quick reference: where to find what
+
+Different quantities live in different outputs — this table is the fastest way to find what you need.
+
+| What you want | Where it lives | Shape | When present |
+|----|----|----|----|
+| Covariates in sdtab (via [`[output]`](model-file/output.llms.md)) | `{model}-sdtab.csv` | one row per **observation** | declared in `[output]` |
+| Raw covariate values for all dataset records | `{model}-covtab.csv` | one row per **dataset record** (doses + obs) | model has `[covariates]` block |
+| ETA / EBE values per subject | `ebes.csv` inside `.fitrx` | one row per **subject** | always |
+| `[derived]` computed columns | `{model}-sdtab.csv` | one row per **observation** | model has `[derived]` block |
+| `[output]` declared columns (covariates, individual PK parameters) | `{model}-sdtab.csv` | one row per **observation** | declared in `[output]` |
+
+**Key distinctions:**
+
+- `[output]` covariates in the sdtab use LOCF — each observation row carries the covariate value that was active at that time. The covtab carries the covariate exactly as read from each row of the input dataset, including dose and event rows where sdtab has no entry.
+- ETA / EBE values are **not** written to sdtab. They live in `fit$ebe_etas` (and `ebes.csv` in the `.fitrx` bundle) — one row per subject. ETAs are available as context variables in `[derived]` expressions (e.g. `KE = CL / V` can reference `ETA_CL`), but are not columns in the sdtab itself.
+
+## sdtab CSV (`{model}-sdtab.csv`)
+
+A CSV file with per-observation diagnostics, one row per observation per subject.
+
+### Columns — sdtab
+
+| Column | Description |
+|----|----|
+| `ID` | Subject identifier |
+| `TIME` | Observation time |
+| `DV` | Observed value |
+| `CENS` | Censoring flag (`0`, `1`, or `-1`); omitted when no censored observations |
+| `OCC` | Occasion label; omitted when model has no IOV block |
+| `CMT` | Observation compartment; omitted for single-compartment models |
+| `PRED` | Population prediction (eta = 0) |
+| `IPRED` | Individual prediction (eta = EBE) |
+| `CWRES` | Conditional weighted residual |
+| `IWRES` | Individual weighted residual |
+| `NPDE`, `NPD` | Simulation-based normalized prediction (distribution) errors; only with `npde_nsim > 0` |
+| `EPRED` | Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation; only with `npde_nsim > 0` |
+| `EWRES`, `PWRES` | Monte-Carlo population-weighted residual `Σ_sim^(-1/2)(y − EPRED)`, one value under its NONMEM and its Monolix name; only with `npde_nsim > 0` |
+| `EBE_OFV` | Each subject’s contribution to the total OFV |
+| `N_OBS` | Number of observations for the subject |
+| `TAFD` | Time after first dose |
+| `TAD` | Time after most recent dose (SS-aware) |
+| *`[derived]` names* | One column per expression in the `[derived]` block |
+| *`[output]` names* | Covariates and individual parameters declared in `[output]` |
+| `COXSNELL` | Time-to-event rows only: Cox–Snell residual `ΔH`; omitted without a TTE endpoint |
+| `MARTINGALE` | Time-to-event rows only: martingale residual `δ − ΔH` |
+| `DEVIANCE` | Time-to-event rows only: deviance residual |
+| `PIT` | Time-to-event rows only: probability-integral transform `exp(−ΔH)` |
+
+A fit with a binary endpoint adds one row per binary record after the Gaussian rows, and a fit with a time-to-event endpoint adds one row per TTE record after those, with `DV` the event indicator. The four TTE columns, their definitions and which cells are blank are in [Time-to-event residuals](estimation/tte.llms.md#tte-residuals).
+
+### Individual-parameter columns
+
+Any name assigned in `[individual_parameters]` may be declared in `[output]`, and each one reports **its own value**, re-evaluated on every row with that row’s EBE η, that row’s covariates, and that row’s `TIME`. That includes names the `[structural_model]` line never binds — an intermediate such as `TVCL = THCL * 3`, and a modeled-dose duration/rate `D{n}` / `R{n}`. The same values back the `[derived]` block and the ferx-r `individual_estimates` table.
+
+> **NOTE:**
+>
+> Before ferx-core 0.4.0 an unbound name on an **analytical** (`pk ...`) model reported `CL`’s value instead of its own, because the column was read from the parameter’s PK slot and such a name has no slot of its own. Under the usual `CL = TVCL * exp(ETA_CL)` the two coincide at η = 0, so the column often looked plausible. ODE and compartment-free models were never affected. See [\#1356](https://github.com/FeRx-NLME/ferx-core/issues/1356).
+
+### Residual Definitions
+
+**IWRES** (Individual Weighted Residual): $$\text{IWRES}_j = \frac{y_j - \text{IPRED}_j}{\sqrt{V_j}}$$ where $V_j$ is the residual variance evaluated at the individual prediction.
+
+**CWRES** (Conditional Weighted Residual, Hooker et al. 2007, NONMEM’s `CWRES`): $$\text{CWRES} = \tilde{R}^{-1/2}\,(y - f_0)$$ where $f_0 = f(\hat{\eta}) - H\hat{\eta}$ is the linearized population prediction, $H = \partial f/\partial\eta$ at $\hat\eta$, $\tilde{R} = H\Omega H^T + R$ is its covariance, and $\tilde{R}^{-1/2}$ is the symmetric inverse square root. $R$ is evaluated at `IPRED` under FOCEI and at the population prediction under FOCE, the points the two objectives use. Rows censored for the fit (`bloq_method = m3`) are blank.
+
+**PWRES / EWRES** (population-weighted residual, Monolix’s `PWRES`, NONMEM’s `EWRES`; only with `npde_nsim > 0`) is the simulation-based analogue of CWRES: $$\text{PWRES} = \Sigma_{\text{sim}}^{-1/2}\,(y - \text{EPRED})$$ where `EPRED` and $\Sigma_{\text{sim}}$ are the empirical mean and within-subject covariance of the NPDE simulation, with no linearization. It decorrelates with the same symmetric inverse square root as CWRES. See [Population-weighted residuals](model-file/fit-options.llms.md#population-weighted-residuals-epred-pwres-ewres) for when to prefer it over CWRES and NPDE.
+
+#### CWRES under inter-occasion variability
+
+With `kappa` declared, the random effects of a subject with $K$ occasions are $b = [\eta, \kappa_1, \ldots, \kappa_K]$, and CWRES linearizes over all of them: $f_0 = f(\hat b) - H_b\hat b$ and $\tilde{R} = H_b\,\Sigma_b H_b^T + R$, with $\Sigma_b = \mathrm{blkdiag}(\Omega, \Omega_{\mathrm{IOV}}, \ldots, \Omega_{\mathrm{IOV}})$. This is the same linearization the IOV objective integrates, and it is NONMEM’s convention: there an occasion κ is one more `ETA`. Under FOCE $R$ is evaluated at $\eta = 0$ and $\kappa = 0$.
+
+Before [\#1948](https://github.com/FeRx-NLME/ferx-core/issues/1948), CWRES under IOV used η alone. That left $H_\kappa\hat\kappa$ in the residual and dropped $H_\kappa\Omega_{\mathrm{IOV}}H_\kappa^T$ from $\tilde{R}$, while `OFV`, `IPRED` and the EBEs already matched NONMEM. NONMEM 7.5.1 comparison on the anchor `tests/iov_cwres_nonmem_anchor.rs` (30 subjects × 2 occasions, 1-compartment IV, IIV and IOV on CL, proportional error, evaluated at one fixed point, macOS arm64):
+
+| Method | worst \|ΔCWRES\| before | worst \|ΔCWRES\| after | \|ΔOFV\| | worst \|Δη̂, κ̂\| |
+|----|----|----|----|----|
+| FOCEI | 0.426 | 9.6e-8 | 4.4e-7 | 1.1e-7 |
+| FOCE | 0.252 | 4.2e-8 | 7.9e-8 | 2.2e-7 |
+
+`OFV`, `IPRED` and the EBEs are unchanged by the fix; only `CWRES` moves.
+
+### Example — sdtab
+
+``` csv
+ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS,TAFD,TAD
+1,0.5,9.49,10.12,9.55,-0.23,-0.06,2.14,8,0.5,0.5
+1,1.0,14.42,14.87,14.35,0.18,0.05,2.14,8,1.0,1.0
+```
+
+## covtab CSV (`{model}-covtab.csv`)
+
+Written only when the model declares a [`[covariates]`](model-file/covariates.llms.md) block. Unlike sdtab (observation rows only), it echoes the declared covariate columns with **one row per input dataset record**, including dose and other-event rows. Missing values are written as empty cells. It is also available programmatically as `FitResult::covariate_table`.
+
+### Columns — covtab
+
+| Column | Description |
+|----|----|
+| `ID` | Subject identifier |
+| `TIME` | Record time |
+| `EVID` | Event ID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose) |
+| *declared covariates* | One column per covariate in the `[covariates]` block, in declaration order |
+
+### Example — covtab
+
+``` csv
+ID,TIME,EVID,WT,CRCL
+1,0.000000,1,70.600000,73.700000
+1,0.500000,0,70.600000,73.700000
+1,1.000000,0,70.600000,73.700000
+```
+
+## Fit JSON (`{model}-fit.json`)
+
+The YAML above is a *curated, human-oriented* view of a fit. For programmatic consumers — a script, the R wrapper, or an **agentic model-development loop** that reads diagnostics and decides the next step — pass `--output-format` to get the **complete** `FitResult` as JSON:
+
+``` bash
+ferx warfarin.ferx --data warfarin.csv --output-format json   # {model}-fit.json only
+ferx warfarin.ferx --data warfarin.csv --output-format both   # both YAML and JSON
+```
+
+`--output-format yaml` is the default and leaves current behaviour unchanged. The flag controls only the estimates file; the sdtab/covtab/conddist CSVs are written regardless.
+
+Unlike the YAML, the JSON is **not curated**: every field of the fit — all estimates, standard errors, the covariance matrix, condition number, shrinkage, per-subject records (`eta`, `ipred`, residuals, …), warnings, and provenance (model/data hashes, `ferx` version, environment) — is present.
+
+**Schema guarantees** (so consumers can pin against it):
+
+- A top-level `schema_version` integer. It is bumped only on a *breaking* change (renamed/removed field, changed nesting); additive fields do not bump it.
+- Matrices (`omega`, `covariance_matrix`, …) serialize as `{ "rows": r, "cols": c, "data": [..] }` with `data` in **row-major** order. Vectors (a subject’s `eta`, …) serialize as flat JSON arrays.
+- Enums serialize as their variant name (e.g. `"method": "FoceI"`); structured warnings carry `{severity, category, message, source_method}` plus an optional `details` payload, where `category` is a stable typed [`WarningCode`](warnings.llms.md#warning-codes) token.
+- Non-finite floats (`NaN`, `±Inf`) serialize as JSON `null`, matching the empty-cell convention of the YAML/CSV writers.
+
+``` json
+{
+  "schema_version": 1,
+  "converged": true,
+  "method": "FoceI",
+  "ofv": -280.36,
+  "theta": [0.133, 7.73, 0.725],
+  "theta_names": ["TVCL", "TVV", "TVKA"],
+  "omega": { "rows": 3, "cols": 3, "data": [0.0286, 0.0, 0.0, 0.0, 0.0096, 0.0, 0.0, 0.0, 0.349] },
+  "cov_condition_number": 2.64,
+  "shrinkage_eta": [0.0002, 0.0011, 0.0019],
+  "subjects": [ { "id": "1", "eta": [0.028, 0.066, 0.482], "ipred": [/* … */] } ]
+}
+```
+
+Library callers get the identical payload in-process, without touching the filesystem, via `FitResult::to_json_value() -> serde_json::Value`.
+
+### Parameter estimates keyed by name (`estimates`)
+
+The vectors above (`theta` beside `theta_names`, `omega` as a flat matrix) are `FitResult`’s own fields. For reading final estimates back — substituting them into a model, a report, a comparison across runs — **both** fit files carry a top-level `estimates` block with the same layout: the sections, entry names and field names of the YAML’s [parameter estimates](#parameter-estimates). One path reads either file, with no branch on the format:
+
+``` r
+fit <- if (grepl("\\.json$", path)) jsonlite::read_json(path) else yaml::read_yaml(path)
+fit$estimates$theta$TVCL$estimate
+```
+
+In the YAML, `estimates:` repeats the top-level `theta:` / `omega:` / `sigma:` / … sections nested one level down; the top-level copies stay, so a reader that already uses `yaml$theta$TVCL$estimate` keeps working. The `estimates:` block is the supported path for code that has to read both formats. In the JSON:
+
+``` json
+"estimates": {
+  "theta": {
+    "TVCL": { "estimate": 0.13291, "se": 0.0071, "rse_pct": 5.34 },
+    "TVV":  { "estimate": 7.7301, "fixed": true, "se": null, "rse_pct": null }
+  },
+  "omega": {
+    "ETA_CL":         { "variance": 0.0286, "cv_pct": 17.03, "se": 0.0081 },
+    "ETA_V__ETA_CL":  { "covariance": 0.0061, "se": 0.0040, "correlation": 0.37 }
+  },
+  "sigma": {
+    "PROP_ERR": { "estimate": 0.1496, "variance": 0.0224, "type": "proportional", "cv_pct": 14.96, "se": 0.011 }
+  }
+}
+```
+
+- The sections are `theta`, `omega` and `sigma` (always present, possibly an empty map — `{}` in both files) and `block_sigma`, `omega_iov` and `mixture_overrides` (present when the fit has them). All three renderings — the YAML’s top-level sections, its `estimates:` block and the JSON’s `estimates` — come from one table, so they cannot list different parameters or fields.
+- The JSON values are full `f64` precision, where the YAML rounds to six decimals (two for `rse_pct` / `cv_pct`). An estimate below ~1e-4 keeps its significant figures only in the JSON.
+- JSON `null` is the YAML’s `~`, and also a non-finite value the YAML prints as `NaN` / `inf` / `.inf`.
+- Under the YAML’s `estimates:`, every parameter name — and a mixture override’s `base` — is double-quoted (`"TVCL":`), so a name YAML would otherwise read as a boolean or null (`YES`, `NO`, `ON`, `OFF`, `NULL`, …) reaches a YAML reader as the same string the JSON has. The top-level sections quote only those names and leave every other one bare, as before.
+- Keys within a section are sorted, not in declaration order; read them by name. Declaration order is `theta_names` / `eta_names` / `sigma_names`.
+- `estimates` is derived output, like `status`: reading the JSON back as a `FitResult` ignores it. It is `null` only for a result the YAML writer refuses (a `block_sigma` correlation naming a σ index the fit does not have).
+
+## Fit YAML (`{model}-fit.yaml`)
+
+A YAML file containing parameter estimates, standard errors, and model diagnostics.
+
+### Structure
+
+``` yaml
+model:
+  converged: true
+  final_gradient_max_abs: 2.290000e-4
+  final_gradient_source: optimizer
+  newton_decrement: 4.311000e-9
+  optimizer_stop: Failure
+  status: converged_with_issues
+  status_reasons: ["covariance_failed", "collapsed_at_guard: ETA_KA"]
+  method: FOCE
+  covariance_method: r
+objective_function:
+  ofv: -280.1838
+  aic: -266.1838
+  bic: -247.2804
+data:
+  n_subjects: 10
+  n_observations: 110
+  n_parameters: 7
+theta:
+  TVCL:
+    estimate: 0.132735
+    se: 0.014549
+    rse_pct: 11.0
+  TVV:
+    estimate: 7.694842
+    se: 0.293028
+    rse_pct: 3.8
+omega:
+  omega_11:
+    variance: 0.028584
+    cv_pct: 17.03
+    se: 0.006394
+  omega_22:
+    variance: 0.009613
+    cv_pct: 9.83
+    se: 0.002165
+sigma:
+  sigma_1:
+    estimate: 0.010638
+    se: 0.000788
+estimates:              # theta/omega/sigma/... again, one level down (#2911)
+  theta:
+    TVCL:
+      estimate: 0.132735
+      # … every section and field exactly as above
+covariance_matrix:
+  # optimizer parameterization: theta log-transformed when lower bound >= 0
+  # (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored
+  parameters: [TVCL, TVV, log_chol_ETA_CL, log_chol_ETA_V, sigma_1]
+  rows:
+    TVCL:            [1.234567e-4, 2.345678e-5, 0.000000e+0, 0.000000e+0, 0.000000e+0]
+    TVV:             [2.345678e-5, 1.456789e-3, 0.000000e+0, 0.000000e+0, 0.000000e+0]
+    log_chol_ETA_CL: [0.000000e+0, 0.000000e+0, 5.678901e-5, 0.000000e+0, 0.000000e+0]
+    log_chol_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
+    sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
+warnings:
+  - "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20)."
+warning_details:
+  - code: dw_autocorrelation
+    severity: "Warning"
+    message: "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20)."
+    details: {"durbin_watson":1.2,"iwres_lag1_autocorr":0.4}
+estimation:
+  focei_wall_time_secs: 11.845678
+  covariance_wall_time_secs: 0.500000
+  wall_time_secs: 12.345678
+  n_threads_used: 8
+environment:
+  os: linux
+  arch: x86_64
+  in_docker: true
+  username: "ron"
+  ferx_version: 0.2.0
+```
+
+`estimates:` repeats the parameter sections under one key so that `estimates.theta.TVCL.estimate` reads this file and `{model}-fit.json` alike — see [Parameter estimates keyed by name](#fit-json-estimates).
+
+The `covariance_matrix:` block is only present when the covariance step ran successfully or was regularised. The values are in **optimizer space** — thetas and sigma are on the log scale (or identity scale when the lower bound is negative), omega and kappa are Cholesky-factored. The `parameters:` list gives the canonical column order; `rows:` keys match that order. Omega and kappa diagonal entries appear as `log_chol_<eta>` — the packed value is `log(L_ii)` where `omega = L Lᵀ` (log of the Cholesky diagonal, **not** the variance). Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`, not log-transformed). See [Packed Parameter Space](estimation/parameterization.llms.md) for the full layout and bounds.
+
+A SAEM fit reports NONMEM’s SAEM objective (`SAEMOBJ`) as `ofv` by default (`saem_ofv = saem`), which is not a likelihood; `objective_function` then carries `ofv_type: saem_objective` and `ofv_foce_laplace`, the FOCE/Laplace value at the same estimates. There is no AIC or BIC for it: `aic` and `bic` are written as `null` and the console prints `AIC/BIC: n/a` with the fix (`saem_ofv = imp`, or `agq` / `focei`). Under `saem_ofv = imp` (or `agq`) `ofv` is the importance-sampled `−2 log L` and `objective_function` carries `ofv_type: importance_sampling` (or `agq`), `ofv_mc_standard_error`, `ofv_n_samples` (or `ofv_n_nodes`) and `ofv_foce_laplace`; AIC and BIC are built from `ofv`. See [The reported OFV](estimation/saem.llms.md#saem-reported-ofv).
+
+On an IMP or IMPMAP fit, `objective_function` also carries `ofv_type: laplace`, and any fit with an importance-sampling marginal carries `marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. See [which number matches NONMEM](estimation/importance-sampling.llms.md#how-the-estimator-works).
+
+`warnings:` lists the warning messages. `warning_details:` follows it with every warning that carries a structured `details` payload — see [Where `details` is written](warnings.llms.md#where-details-is-written). Both blocks are absent when there is nothing to list.
+
+### The `multi_start:` block
+
+A fit with `n_starts > 1` adds a `multi_start:` block before `covariance_matrix:`. A single-start fit has none. This one is `examples/mm_multistart.ferx` with `start_sigma = 1.5` (macOS arm64; two of the eight rows shown):
+
+``` yaml
+multi_start:
+  n_starts: 8
+  seed: 42
+  selected_start: 2
+  n_converged: 8
+  n_not_converged: 0
+  n_failed: 0
+  compared: ofv
+  best: -221.877049
+  agree_within: 1.0
+  n_compared: 8
+  n_within: 7
+  range: 5.273825
+  starts:
+    - {start: 0, ofv: -221.877048, converged: true, status: converged, n_iterations: 84, wall_time_secs: 1.318677, selected: false, theta: [7.457722, 22.146652, 18.475210, 2.414018]}
+    # ... starts 1 to 3
+    - {start: 4, ofv: -216.603223, converged: true, status: converged, n_iterations: 334, wall_time_secs: 2.698044, selected: false, theta: [50.000000, 40.137733, 3.919750, 0.361034]}
+    # ... starts 5 to 7
+```
+
+| Key | Meaning |
+|----|----|
+| `seed` | `multi_start_seed`, when one was set |
+| `selected_start` | The start whose result the file reports |
+| `n_converged`, `n_not_converged`, `n_failed` | Each start counted once |
+| `compared` | `ofv`, or `penalized_objective` under `nn_l2` / `nn_smooth`: the value `best`, `range` and the count are measured on |
+| `best` | That value on the selected start; `null` when it has none |
+| `agree_within` | The cutoff for `n_within`, fixed at 1.0 |
+| `n_compared`, `n_within` | The converged starts with a usable value, and how many of them are within the cutoff of `best`. Every start with a usable value when none converged |
+| `range` | The largest distance above `best` among the compared starts |
+| `starts` | One row per start. `status` is the start’s own status token, followed by `status_reasons` when it has any. A failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. A start ranked on a penalized objective also carries `objective`, `null` when that value is not finite. A non-finite θ is `null` |
+
+The rows are [`FitResult.starts`](model-file/fit-options.llms.md#multi-start-spread), which the fit JSON and the `.fitrx` bundle carry as `starts`.
+
+### Key Fields
+
+#### Run status and objective
+
+- **converged**: whether the run reached a solution of the problem posed. It is never `true` at an objective that is not a usable number — `NaN`, infinite, or past the `1e14` divergence cutoff all report `converged: false` with a `W_NONFINITE_OBJECTIVE` warning saying which. See [A non-finite objective](warnings.llms.md#non-finite-objective).
+
+- **final_gradient_max_abs** / **final_gradient_source**: \|g\|∞, the largest absolute component of the fit’s `final_gradient`, and where that vector came from (`optimizer`, `analytic` or `finite_difference`). The console prints the same thing as a `Final gradient:` line right under `Converged:` (#1934). It is measured in the packed optimizer coordinates and is a comparative figure, not a pass/fail test — see [What the reporting gradient reads](estimation/optimizers.llms.md#what-the-reporting-gradient-reads). Both keys are omitted when the fit reported no gradient; a non-finite component is written as `.nan`.
+
+- **newton_decrement**: the OFV a Newton step from the estimates is predicted to remove, `½·gᵀH⁻¹g`, taken by the covariance step. Its square root is the distance to the minimum in standard errors, so unlike `final_gradient_max_abs` it does not depend on how a coordinate is scaled. Above 1 it demotes `converged` for FOCE, FOCEI, Laplace / AGQ and Gauss–Newton (`W_NON_STATIONARY_OPTIMUM`). Omitted when the covariance step did not test it — see [What `converged` guarantees](estimation/optimizers.llms.md#what-converged-guarantees) (#2785).
+
+- **optimizer_stop**: the NLopt stop state of the leg that produced the estimates (`FtolReached`, `XtolReached`, `MaxEvalReached`, `Failure`, `RoundoffLimited`, …). `converged` is a verdict built on it, not a copy: a bare `Failure` at a plateau is converged, an `FtolReached` at a non-stationary point is not. Omitted for optimizers other than NLopt’s (#2785).
+
+- **status** / **status_reasons**: the usability verdict beside `converged` (`converged`, `converged_with_issues` or `not_converged`) and the reasons that qualify it, always present (`[]` when there are none). See [Fit status](#fit-status) (#2799).
+
+- **ofv**: Objective Function Value (-2 log-likelihood)
+
+- **aic**: Akaike Information Criterion (OFV + 2p); `null` when the reported objective is not a likelihood (a SAEM fit under the default `saem_ofv = saem`, \#2973)
+
+- **bic**: Bayesian Information Criterion (OFV + p \* ln(n), with n the number of observations). The Delattre-style variants a model search ranks on (`mixed`, `iiv`, `random`) are computed from the same result by `ferx_core::bic()` — see [Ranking candidates](api/fitting.llms.md#ranking-candidates-bic-variants-and-strictness). \#### Parameter estimates
+
+- **se**: Standard error from the covariance step — see [Which covariance estimator produced these numbers](#covariance-estimator) before comparing one against another tool
+
+- **rse_pct**: Relative standard error as percentage (SE/estimate \* 100)
+
+- **cv_pct** / **sd**: how an `omega` / `omega_iov` variance reads on the scale its random effect enters (#1643). A log-normal effect (`TVCL * exp(ETA)`) gets `cv_pct` = sqrt(exp(variance) - 1) \* 100, the exact CV (#1858; formerly the first-order sqrt(variance) \* 100: 44.7 for 47.1 at 0.2; `.inf` past ~709.8). So does an untyped one. An additive (`TVV + ETA`) or logit (`inv_logit(THETA + ETA)`) effect gets `sd` = sqrt(variance) instead, since a CV% of an effect that does not multiply its parameter means nothing. An effect in any other expression gets neither key. An ETA’s and a kappa’s scale are both read from where it sits in its expression, so `TVE0 + PLACEBO + ETA_E0` is additive (#1656); an ETA’s is stored in `eta_param_info` (see [How an ETA row is labelled](model-file/individual-parameters.llms.md#how-an-eta-row-is-labelled) and [How a kappa row is labelled](model-file/iov.llms.md#how-a-kappa-row-is-labelled)). The console prints the same thing as `(CV% = …)`, `(SD = …)` or `(SD = …, logit scale)`; for a sample-size-weighted kappa each reads `at weight 1` — `(CV% = … at weight 1)`, `(SD = … at weight 1)` or `(SD = … at weight 1, logit scale)` (#1666) — the figure of a one-subject arm, followed by a line with the same note at the typical arm size, worded alike: `CV% = … at NARM = …`, `SD = … at NARM = …` or `SD = … at NARM = …, logit scale` (#1683, \#1697). A console CV% of 1e6 or more prints to three significant figures in scientific notation (`CV% = 7.64e35`) rather than every integer digit of the double (#1883); a CV% that size usually means the variance is on another scale, e.g. an additive kappa read as log-normal on a result with no `kappa_param_types`. The YAML’s `cv_pct` keeps its full figure. That line’s figure is printed exactly when the row’s note is (#1698): a custom kappa, or a covariance step that failed or fell back to SIR, leaves the bare `weight = NARM (κ ~ …)`. The YAML keys are written either way.
+
+- **weight** / **weight_typical** / **sd_at_typical_weight** / **cv_pct_at_typical_weight**: present only on the `omega_iov` entry of a sample-size-weighted kappa (`kappa K ~ γ² weight = W`, \#1660). `weight` is the source text of `W` (quoted), `weight_typical` the median weight over the dataset’s subject-occasions, and `sd_at_typical_weight` = sqrt(variance / weight_typical), the between-arm SD at that typical arm — the number the console’s weight line prints for an additive or logit kappa. A log-normal (or untyped) kappa also gets `cv_pct_at_typical_weight` = sqrt(exp(variance / weight_typical) - 1) \* 100, its weight line’s CV% (#1858), which is not `100 * sd_at_typical_weight`. `variance` and its `cv_pct` / `sd` line stay the weight-1 γ² and its CV% or square root (#1666). Without a positive typical weight, or when the variance is negative, only `weight` is written. An unweighted kappa’s entry carries none of these.
+
+- **covariance_method**: which estimator produced the standard errors — `r`, `s` or `rsr`. Present only when a covariance matrix was produced; see below.
+
+The `estimation:` block replaces the standalone `{model}-timing.txt` file (removed in \#704): `wall_time_secs` measures only the estimation step itself (not model parsing or data reading — the old timing file’s `elapsed_seconds` covered the whole CLI run, so the two are not a like-for-like replacement, just the closest equivalent), and `n_threads_used` is the Rayon worker count used. `wall_time_secs` is further broken down (#713) into a `{method}_wall_time_secs` entry for each stage of `method = ...`/`method = [...]` (e.g. `focei_wall_time_secs`, `imp_wall_time_secs` for a `[focei, imp]` chain) plus `covariance_wall_time_secs` for the post-estimation FD-Hessian / SIR-fallback step, which only ever runs once, on the last estimating stage (#615). The per-stage keys measure convergence only and exclude the covariance step. The `environment:` block is a snapshot of the machine and account the fit ran under — `os`/`arch` from the running binary’s target, `in_docker` (whether `/.dockerenv`, `KUBERNETES_SERVICE_HOST`, or `/proc/1/cgroup` indicate a container), `username` (`$USER`/`%USERNAME%`, quoted/escaped since it’s free-form text), and `ferx_version`.
+
+#### Mixture per-class overrides (`mixture_overrides:`)
+
+A `[mixture]` fit with `omega(k)` / `sigma(k)` overrides gets a top-level `mixture_overrides:` section after `omega_iov:` (#2833). Each entry is named as in the optimizer trace: the base name with a `_MIX<k>` suffix.
+
+``` yaml
+mixture_overrides:
+  ETA_CL_MIX2:
+    class: 2
+    base: ETA_CL
+    kind: omega
+    variance: 0.266883
+    cv_pct: 55.31
+    se: 0.064976
+  EPS_MIX2:
+    class: 2
+    base: EPS
+    kind: sigma
+    estimate: 0.211171
+    se: 0.010668
+```
+
+- An Ω override reports the class **variance**, with the `cv_pct` / `sd` line of its base η’s type. A σ override reports `estimate` on the SD scale, as `sigma:` does.
+- `se` uses the base blocks’ keys. A `FIX` override, or a σ override SAEM held at its initial value, has `fixed: true` and `se: ~`. An override in `held_at_bound` has `se: ~` and `held: <reason>`. Its base parameter keeps its own SE either way.
+- The section is separate from `omega:` / `sigma:` on purpose: `[priors] from_fit` reads every entry there as a base parameter.
+- The console prints the same rows under `--- Mixture per-class overrides ---`, after SIGMA: `[FIX]` with `SE = ---` when fixed, `SE = N/A` when held. `parameter_table` lists them with types `OMEGA var (class k)` and `SIGMA SD (class k)`.
+- In `covariance_matrix.parameters` an Ω override is `log_chol_<eta>_MIX<k>` (it packs the log of the class SD, like a base diagonal) and a σ override is `<eps>_MIX<k>`. A `block_sigma` correlation, packed last, is `<eps_i>~<eps_j>`. Before \#2833 all of these were `param_<n>`.
+
+The same data is on `FitResult` as `mixture_overrides` (values), `se_mixture_overrides` (SEs on the same scales; `0.0` when fixed) and `mixture_override_params` (name, `kind`, base `index`, `class`, `packed_index`, `fixed`).
+
+### SIR intervals (`sir:`)
+
+A fit run with `sir = true`, or a `FitResult` returned by `run_sir`, gets a `sir:` block (see [SIR](estimation/sir.llms.md)). Abridged, from the `mbma_placebo` BTAV fixture (`tests/data/mbma_placebo/`, seed 1705, Linux run):
+
+``` yaml
+sir:
+  settings:
+    scale: packed
+    df: 5
+    samples: 1000
+    resamples: 250
+    seed: 1705
+  effective_sample_size: 143.2
+  ci_theta:
+    # ... one entry per theta, keyed by name
+  ci_omega:
+    ETA_E0:
+      lower: 2.053046
+      upper: 25.221134
+  ci_sigma:
+    ADD_ERR:
+      lower: 1.000000
+      upper: 1.000000
+  ci_kappa:
+    KAPPA_ARM:
+      lower: 83.166077
+      upper: 367.409851
+```
+
+`settings` names what the intervals came from: the scale SIR’s flat prior is flat on, the Student-t degrees of freedom, the draw counts and the seed actually used ([\#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)). The console prints the same on one `Settings:` line. The complete record, inner-loop and ODE settings included, is `FitResult::sir_settings` and the `.fitrx` bundle.
+
+Each `lower` / `upper` pair is the 2.5th / 97.5th percentile of the resampled draws, on the scale the estimate is reported on: a θ as estimated, and the **variance** for an `omega`, `sigma` or `kappa` entry. `ci_omega` and `ci_kappa` cover the diagonal only, so a `block_omega` / `block_kappa` covariance gets no interval. `ci_kappa` (#1705) holds one entry per kappa, keyed by its name; for a sample-size-weighted kappa the interval is on the weight-1 γ², like the `omega_iov` entry’s `variance`. A model with no kappa writes no `ci_kappa:` key. On the `FitResult` the same numbers are `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (`None` without a kappa) and `sir_ess`, and they are saved in a `.fitrx` bundle.
+
+## FitResult Fields (Rust API / console)
+
+The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `method_wall_times_secs`, `covariance_wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.
+
+### Shrinkage
+
+Two shrinkage metrics are reported after every fit:
+
+**ETA shrinkage** (per random effect — `shrinkage_eta: Vec<f64>`): $$\text{shrinkage}_k = 1 - \frac{\sqrt{\frac{1}{n}\sum_i \hat{\eta}_{k,i}^2}}{\sqrt{\omega_{kk}}}$$
+
+A value near 1 means individual EBEs are all pulled toward zero — the data are not informative about that random effect. A value near 0 means the ETAs are spread consistent with the prior omega.
+
+**EPS shrinkage** (scalar — `shrinkage_eps: f64`): $$\text{shrinkage}_\varepsilon = 1 - \sqrt{\frac{1}{n}\sum_j \text{IWRES}_j^2}$$
+
+Both formulas use the **uncentered second moment with `n` divisor**, matching the NONMEM / PsN / Monolix convention — the population model assumes `E[η]=0` and `E[IWRES²]=1`, so the natural estimator is `√(Σx²/n)` rather than the unbiased sample SD (which centers on the sample mean and divides by `n-1`). The unbiased form would inflate SD by `√(n/(n-1))` and routinely produce spurious negative shrinkage on small samples.
+
+**Negative `shrinkage_eps`** is mathematically possible and meaningful: it indicates `mean(IWRES²) > 1`, i.e. the residual error model does not absorb the residuals seen at the final EBE etas. Common causes include SAEM converging to a local optimum with under-fit sigma (often resolved by polishing with `method = [saem, focei]` or trying a different start), model misspecification for a subset of subjects (check the IWRES distribution in the sdtab for outliers), or sigma at a bound. When `shrinkage_eps < -5%`, ferx emits a warning to `FitResult.warnings`; the raw value is retained for parity with NONMEM/PsN.
+
+Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
+
+**Kappa shrinkage** (IOV models only — `shrinkage_kappa: Vec<f64>` and `shrinkage_kappa_by_occ: Vec<Vec<f64>>`):
+
+When the model contains `kappa` or `block_kappa` declarations, two additional shrinkage metrics are computed using the same uncentered-moment convention.
+
+*Pooled* — one value per kappa parameter `j`, averaged over the `N_\text{pairs}` **informed** (subject, occasion) pairs: $$\text{shrinkage}_{\kappa,j} = 1 - \frac{\sqrt{\frac{1}{N_{\text{pairs}}}\sum_i \sum_{q} \hat{\kappa}_{iqj}^2}}{\sqrt{\omega_{\text{iov},jj}}}$$ where `q` indexes occasions and `N_\text{pairs} = \sum_i K_i` (informed subject-occasion pairs; equals `N_\text{subj} \cdot K` only for balanced designs).
+
+An occasion group is **informed** when a scored observation can read its κ: it owns an observation, or — on a model with compartments — an observation sits at or after the group’s first record, so a dose’s carryover or the interval a pk-only row closes reaches it. A group no observation can read (a dose after the last sample, an `EVID=2` / `MDV=1` row after every observation, or on a compartment-free (`$PRED`-style, e.g. MBMA) model any occasion that owns no observation) has κ̂ = 0, the prior’s mode, and leaves the objective unchanged; it is left out, so it does not push the shrinkage up (#1911). A subject with no informed group contributes nothing, and a kappa with fewer than two informed pairs is `NaN`.
+
+*Per-occasion slot* — the same formula restricted to the informed pairs in occasion slot `occ_idx`, stored in `shrinkage_kappa_by_occ[occ_idx][kappa_idx]` (`NaN` when fewer than two subjects inform that slot). On an occasion-aligned design a slot is NONMEM’s per-occasion `ETA`, and the informed slots match its `ETASHRINKSD`; NONMEM lists an uninformed occasion as its own 100 % entry, where ferx reports `NaN`. Only reported when two or more occasions are present. Useful for identifying sparse occasions (high shrinkage in one slot suggests that occasion has little information on kappa).
+
+> **Note on unbalanced designs:** `occ_idx` is the 0-based position within each subject’s own occasion list (order of first appearance in that subject’s rows), *not* the raw `OCC` column value. When subjects have different `OCC` sequences (e.g., a late-entry subject whose data begins at OCC 2), a given slot may pool kappas from different occasions across subjects. In that case, use the pooled `shrinkage_kappa` and interpret per-slot values with caution.
+
+Both metrics are `NaN` when `omega_iov` diagonal is zero or fewer than two subject-occasion observations are available for that slot.
+
+### IWRES Autocorrelation
+
+Two pooled autocorrelation diagnostics are reported after every fit:
+
+Both are pooled over **lag pairs**: two consecutive rows of one series. A series is the rows of one subject, in row order. It is split at the subject’s occasions (an `iov_column`, a derived `iov_occasion`, or a nested model’s innermost level cell) and at its `correlation … by` blocks, each only when they are **parallel**, such as the arms of one study or level cells, which restart the clock: a pair never joins one arm’s last visit to the next arm’s first. Occasions or blocks that **run in time**, such as dosing intervals, study periods or a `correlation … by OCC` line over visits, stay one series, so the last row of one visit and the first row of the next are a pair.
+
+A subject’s occasions (and, by the same rule, its blocks) run in time when each label is one unbroken run of its observation rows and the time is strictly later at every change of label. The time is the one the fit uses, which keeps running across an `EVID = 4` reset. This is decided per subject, from the data. Before [\#2829](https://github.com/FeRx-NLME/ferx-core/issues/2829) every occasion split the series, so a design with one observation per occasion had no pair at all and no statistic.
+
+Both diagnostics are `NaN` when no series has two rows, for example with one observation per arm.
+
+**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES over those pairs. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+
+**`dw_statistic`** — pooled Durbin-Watson statistic, pair-normalised: $$\text{DW} = \frac{\sum_{\text{pairs}} (e_{t} - e_{t-1})^2}{\sum_{\text{pairs}} \tfrac12\,(e_{t}^2 + e_{t-1}^2)}$$
+
+The denominator runs over the same pairs as the numerator, so independent residuals give 2 however short the series are. The classic form, $\sum e_t^2$ over every row, has expectation about $2 \cdot \text{pairs}/\text{rows}$: 1.70 on the 122 rows of the naproxen MBMA, where it warned on 12% of white-noise draws. The pair-normalised, per-series statistic has mean 2.00 there and warns on about 1% of draws on each side, about 2% in all (the classic form’s 12% was all on the low side; its high-DW warning fired on 0.0% of draws). This changed after 0.4.0 ([\#2798](https://github.com/FeRx-NLME/ferx-core/issues/2798)), so DW values from earlier versions are not comparable. Under a `correlation` line the residuals are decorrelated first ([Diagnostics](model-file/residual-correlation.llms.md#diagnostics)).
+
+| DW range | Interpretation |
+|----|----|
+| ≈ 2.0 | No autocorrelation |
+| \< 1.5 | Positive autocorrelation — structural model likely missing dynamics |
+| \> 2.5 | Negative autocorrelation — possible over-parameterization or misspecified error model |
+
+A series with fewer than 2 finite IWRES values contributes no pair. Both fields are `NaN` when there is no pair at all.
+
+When `dw_statistic < 1.5`, ferx warns. On a model with compartments the warning suggests a transit absorption model, an additional compartment, or IOV on ka/F; on a compartment-free model it suggests a `correlation` line ([`dw_autocorrelation`](warnings.llms.md#codes-residuals)). When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
+
+The warning used to add “SDE process noise may also help” on ODE models. It no longer does: the Kalman filter behind `[diffusion]` propagates the state covariance but never corrects the state mean with the observed data, so it inflates the observation variance instead of supplying the dynamics the statistic is reporting — see [what the filter does not do](model-file/diffusion.llms.md#what-the-filter-does-not-do).
+
+Under a [`correlation` line](model-file/residual-correlation.llms.md#diagnostics) both statistics are taken on each subject’s residuals **decorrelated by the fitted residual covariance** (`L⁻¹(y − IPRED)`), not on IWRES: IWRES of a correlated model are correlated by construction, so they would report the correlation the line models. The `IWRES` column itself is unchanged.
+
+### Covariance Status
+
+`covariance_status: CovarianceStatus` takes one of three values:
+
+| Value | Meaning |
+|----|----|
+| `Computed` | Covariance step succeeded; SE values are valid |
+| `Failed` | Hessian was singular or inversion failed; SE fields are `None` |
+| `NotRequested` | `covariance = false` was set, or no step belongs to the run (a Bayes fit, or a standalone `imp_eval_only` / `agq_eval_only` evaluation); SE fields are `None` |
+
+### Fit status
+
+`FitResult::status()` returns a `FitStatus`: one verdict on whether the fit can be used as it stands, read from facts the result already carries. It is computed when you ask for it, never stored, so it is current after `run_covariance` and available on a fit loaded from a `.fitrx` or JSON file. The console prints it as a `Status:` line after `Final gradient:`, the YAML writes `status:` and `status_reasons:`, and the JSON carries a derived `status` key (#2799).
+
+The rule:
+
+| `converged` | Reasons      | Status                                     |
+|-------------|--------------|--------------------------------------------|
+| `false`     | any          | `NOT CONVERGED` (with its reasons, if any) |
+| `true`      | none         | `CONVERGED`                                |
+| `true`      | at least one | `CONVERGED WITH ISSUES`                    |
+
+`converged` itself is unchanged. It still means the optimizer’s stop was verified, and the status never rewrites it. Multi-start selection still reads `converged` and OFV, not the status.
+
+Each reason has one source, and they are listed in this order:
+
+| Reason | Source |
+|----|----|
+| `evaluation_only` | `evaluation_only`: no stage estimated. That is `maxiter = 0` on FOCE, FOCEI, Laplace/AGQ or pure Gauss–Newton (which read it as NONMEM’s `MAXEVAL=0`), or a standalone `imp_eval_only` / `agq_eval_only` run |
+| `budget_spent` | `eval_budget_spent`: the outer optimizer used its whole `maxiter` budget. Set by NLopt (profiled or not), the trust region, pure Gauss–Newton and `optimizer = bfgs`. Not by SAEM, IMP, IMPMAP, Bayes or VI, which report their own iteration caps in warnings, nor by the Gauss–Newton hybrid, whose polish runs a fixed budget |
+| a warning code, e.g. `condition_number` | each distinct code of a `Critical` [structured warning](warnings.llms.md#severity), in order of first appearance. An earlier chain stage’s counts. `covariance_failed` never appears here |
+| `covariance_failed` | `covariance_status` is `Failed` |
+| `collapsed_at_guard: ETA_KA, …` | a coordinate collapsed onto ferx’s internal guard ([held parameters](estimation/parameterization.llms.md#held-parameters)) that a covariance step ran on and did **not** hold, because the step failed, floored `R` or fell back to `S` |
+
+A collapse the step held (marked in `cov_fixed`) is not a reason: its SE is reported as not available and every other SE is conditional on it, which is a clean answer. Neither is a collapse with no covariance step, which leaves no `R` to judge it, nor a profiled level on its declared box. The guard warning still names those.
+
+So `maxiter = 0` prints `NOT CONVERGED (evaluation_only)` rather than a bare `NOT CONVERGED`. A standalone `imp_eval_only` or `agq_eval_only` run is also an evaluation, but it reports `converged = true` whenever its objective is finite, so it prints `CONVERGED WITH ISSUES (evaluation_only)`. The two read differently because the status never rewrites `converged`; the shared reason is what says no stage estimated. A converged fit whose covariance step failed beside an unheld collapse prints `CONVERGED WITH ISSUES (covariance_failed, collapsed_at_guard: ETA_KA)`: the optimizer stopped, and the point it stopped at needs a second look.
+
+### Which covariance estimator produced these numbers
+
+`covariance_method: Option<CovarianceMethod>` records which of the three estimators produced `covariance_matrix`, the `se_*` fields, `cov_eigenvalues` and `cov_condition_number`:
+
+| Value | Written as | Matrix | NONMEM equivalent |
+|----|----|----|----|
+| `Hessian` | `r` | `R⁻¹` | `$COVARIANCE MATRIX=R` |
+| `CrossProduct` | `s` | `S⁻¹` | `$COVARIANCE MATRIX=S` |
+| `Sandwich` | `rsr` | `R⁻¹SR⁻¹` | `$COVARIANCE MATRIX=RSR` (NONMEM’s default) |
+
+**None of those numbers is comparable across estimators.** One fit measured a condition number of **1.42e8** under the sandwich and **3.68e5** under `s` — both correct for their estimator. Comparing a ferx condition number against NONMEM without matching the estimator compares two different quantities, and ferx’s default (`r`) is *not* NONMEM’s default (`RSR`). The same caution applies to the gradient mode: the same data under `gradient = auto` and `gradient = fd` measured 3.68e5 and 5.68e4, so quote `gradient_method_outer` / `gradient_method_inner` alongside the estimator.
+
+The value is `Some` exactly when `covariance_matrix` is `Some`. A step that was not requested, failed, or fell back to SIR produces no matrix, no standard errors and no condition number, so there is nothing for an estimator name to describe and the field is `None` (and the YAML key is omitted, never `null`).
+
+**It is the estimator that ran, not the one requested.** Above 100 free parameters a *defaulted* `covariance_method = r` is routed onto the cross-product when its `R` matrix would be the finite-difference stencil, which needs `2n²` re-converged objective evaluations; the substitution is reported as a warning and this field reports `s`. A fit the analytic R-matrix serves keeps `r` at any size. Reading `covariance_method` back off `[fit_options]` would report `r` for standard errors that came out of `S⁻¹`.
+
+Where it appears:
+
+- the console summary — next to the `SE` column heading, on the `Covariance:` line, and on the `Condition number:` line;
+- `{model}-fit.yaml` — `model.covariance_method`, plus an `estimator` key inside the `covariance_matrix:` block for tools that consume the raw matrix;
+- `{model}-fit.json` and the `.fitrx` bundle — as the same `r` / `s` / `rsr` token, so a recorded value can be pasted straight back into `[fit_options]`;
+- the `condition_number` and `covariance_regularized` warning `details` payloads — see [Details payloads](warnings.llms.md#details). Not `covariance_failed`: that code means the step produced no matrix, so by the rule above there is no estimator to name and the key is omitted.
+
+### Run Record Fields
+
+| Field | Description |
+|----|----|
+| `model_name` | Name from the `.ferx` file (or `"Unnamed"`) |
+| `ferx_version` | Version of ferx-core that produced the result |
+| `wall_time_secs` | Wall-clock time for the complete fit (seconds) |
+| `method_wall_times_secs` | Wall-clock convergence time per stage, parallel to `method_chain` (seconds); excludes the covariance step |
+| `covariance_wall_time_secs` | Wall-clock time spent on the post-estimation covariance step; `0.0` when not run |
+| `gradient_method_inner` | Gradient method used in the inner (EBE) loop, e.g. `analytic` or `finite differences`; `finite differences (compiled plan failed)` or `analytic ×a, FD ×k` when `W_PLAN_FD_FALLBACK` fired |
+| `gradient_method_outer` | Gradient method used in the outer loop, e.g. `finite differences` |
+| `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
+| `n_threads_used` | Number of Rayon threads used during estimation |
+| `n_starts`, `multi_start_seed` | The multi-start settings the fit ran under (`1` and absent for a single-start fit) |
+| `starts` | One [`StartRecord`](model-file/fit-options.llms.md#multi-start-spread) per start of a multi-start fit; empty when `n_starts = 1` |
+| `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
+| `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step’s `R` matrix runs on the finite-difference route (`2n²`), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step’s estimator reads `R` — never under `covariance_method = s`, which builds no `R`, and never when the analytic `R` assembly (`analytic_cov_hessian`, the default) is expected to cover every subject, since it runs none. When only a minority of subjects is outside the analytic scope, the count is the same `2n²` but each evaluation covers just those subjects. Predicted before the fit, so a subject that bails out of the analytic assembly at run time can still make the step costlier than this says |
+| `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |
+
+### Environment Info
+
+`FitResult.environment: EnvironmentInfo` is detected once per fit:
+
+| Field | Description |
+|----|----|
+| `os` | Target OS family (`std::env::consts::OS`), e.g. `"linux"`, `"macos"`, `"windows"` |
+| `arch` | Target CPU architecture (`std::env::consts::ARCH`), e.g. `"x86_64"`, `"aarch64"` |
+| `in_docker` | `true` when `/.dockerenv` exists, `KUBERNETES_SERVICE_HOST` is set, or `/proc/1/cgroup` names a container runtime |
+| `username` | OS username the fit ran under (`$USER`/`%USERNAME%`), `"unknown"` if neither is set |
+
+Container detection is best-effort: a cgroup-v2 host with a cgroup namespace (common under containerd/CRI-O) hides the pod’s own cgroup path, which is why the Kubernetes env var check exists as a fallback alongside the `/.dockerenv` marker and cgroup substring match.
+
+A `.fitrx` bundle returns the environment it recorded, not the *loading* machine’s.
+
+### EBE Convergence Diagnostics
+
+Counters from the inner-loop (EBE) optimizer, useful for diagnosing problematic fits. Always `0` for SAEM (which uses MH sampling rather than EBE optimization).
+
+| Field | Description |
+|----|----|
+| `ebe_convergence_warnings` | Number of outer iterations in which at least one subject had an unconverged EBE |
+| `max_unconverged_subjects` | Worst-case unconverged-subject count seen in a single outer iteration |
+| `total_ebe_fallbacks` | Total number of times, summed over all subjects and outer iterations, that an inner solve returned a fallback’s point (the Nelder–Mead recovery after the primary search failed, or the runaway-EBE guard’s). A fallback point that a multi-start candidate replaced is not counted. Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`, `mma`, and `nlopt_lbfgs` with its aliases `lbfgs` / `bfgs`) for FOCE, FOCEI, Laplace and AGQ, by a fit with a `profile`d level block, and by Bayes; every other path (e.g. `optimizer = trust_region`, SAEM, `gn` and `gn_hybrid`, VI, IMP / IMPMAP) reports 0 |
+| `total_ebe_nm_polished` | Under `inner_optimizer = nelder_mead`: total number of times, counted the same way, that a Nelder–Mead stop was not a mode and the stationarity certificate moved it there with the gradient. Never counted together with a fallback for the same solve. 0 under every other `inner_optimizer`, and on every path that does not count `total_ebe_fallbacks` |
+
+## Optimizer Trace CSV
+
+When `optimizer_trace = true` is set in `[fit_options]`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is also stored in `FitResult::trace_path`, and the text in `FitResult::trace_csv`, which a `.fitrx` bundle carries as `trace.csv` after the temporary file is gone.
+
+Each row is one outer iteration. See the [fit-options trace table](model-file/fit-options.llms.md#optimizer-trace) for the full column reference.
+
+Example use in R (with the `ferx` package):
+
+``` r
+fit <- ferx_fit("model.ferx", "data.csv", optimizer_trace = TRUE)
+trace <- read.csv(fit$trace_path)
+plot(trace$iter, trace$ofv, type = "l", xlab = "Iteration", ylab = "OFV")
+```

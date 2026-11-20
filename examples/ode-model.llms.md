@@ -1,0 +1,83 @@
+# ODE Model (Michaelis-Menten)
+
+This example demonstrates a one-compartment oral model with saturable (Michaelis-Menten) elimination, solved using the ODE integrator.
+
+## Model File (`mm_oral.ferx`)
+
+    # One-compartment oral model with Michaelis-Menten elimination
+
+    [parameters]
+      theta TVVMAX(10.0, 0.1, 1000.0)
+      theta TVKM(2.0, 0.01, 100.0)
+      theta TVV(10.0, 0.1, 500.0)
+      theta TVKA(1.0, 0.01, 50.0)
+
+      omega ETA_VMAX ~ 0.09
+      omega ETA_V    ~ 0.04
+
+      sigma PROP_ERR ~ 0.1
+
+    [individual_parameters]
+      VMAX = TVVMAX * exp(ETA_VMAX)
+      KM   = TVKM
+      V    = TVV * exp(ETA_V)
+      KA   = TVKA
+
+    [structural_model]
+      ode(obs_cmt=central, states=[depot, central])
+
+    [odes]
+      d/dt(depot)   = -KA * depot
+      d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+    [fit_options]
+      method     = focei
+      maxiter    = 500
+      covariance = true
+
+## Model Description
+
+### Why Use ODEs
+
+Michaelis-Menten (saturable) elimination cannot be described by a simple exponential function. At high concentrations, elimination approaches a maximum rate (VMAX), leading to nonlinear pharmacokinetics. This requires numerical ODE integration.
+
+### ODE System
+
+    d/dt(depot)   = -KA * depot
+    d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+- **depot**: Absorption compartment. First-order absorption at rate KA.
+- **central**: Central compartment. Drug enters from depot and is eliminated by Michaelis-Menten kinetics.
+
+### Parameters
+
+- **VMAX**: Maximum elimination rate (amount/time)
+- **KM**: Michaelis-Menten constant (concentration at half-maximal rate)
+- **V**: Volume of distribution
+- **KA**: First-order absorption rate constant
+
+Note that only VMAX and V have random effects. KM and KA are treated as population parameters (no between-subject variability).
+
+### Structural Model Declaration
+
+    [structural_model]
+      ode(obs_cmt=central, states=[depot, central])
+
+- `obs_cmt=central`: The `central` compartment is observed (matched to DV in the data)
+- `states=[depot, central]`: Two state variables (compartments)
+
+## Running
+
+``` bash
+ferx examples/mm_oral.ferx --data data/mm_oral.csv
+```
+
+## Notes
+
+- ODE models are slower than analytical models because each prediction requires numerical integration
+- The ODE solver uses adaptive step-size control (Dormand-Prince RK45) for accuracy
+- For standard first-order kinetics, use the analytical `one_cpt_oral` model instead – it is much faster
+- The `central` compartment in this model contains the drug amount. If you want concentration as the observed variable, divide by V in the ODE equations (as done here with `KA * depot / V`)

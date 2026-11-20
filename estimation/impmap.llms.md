@@ -1,0 +1,196 @@
+# IMPMAP — Importance Sampling assisted by Mode A Posteriori
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+`impmap` (alias `importance_sampling_map`) is a **Monte-Carlo EM (MCEM) estimator**, equivalent to NONMEM `$EST METHOD=IMPMAP`. It estimates the population parameters θ/Ω/σ by maximizing the importance-sampled marginal likelihood.
+
+Both [`imp`](../estimation/importance-sampling.llms.md) and `impmap` are MCEM estimators; they differ only in how the proposal is re-centered. `impmap` re-derives each subject’s conditional mode and first-order variance **every** iteration (robust on rich data), whereas `imp` re-centers from the previous iteration’s sample moments after the first iteration (cheaper, but can stall on rich data). `imp` can also run in evaluation-only mode (`imp_eval_only = true`), which `impmap` has no equivalent of.
+
+> **NONMEM’s description.** *“Sometimes for highly dimensioned PK/PD problems with very rich data the importance sampling method does not advance the objective function well or even diverges. For this the IMPMAP method may be used. At each iteration, conditional modes and conditional first-order variances are evaluated as in the ITS or FOCE method, not just on the first iteration as is done with IMP method. These are then used as parameters to the multivariate normal proposal density for the Monte Carlo importance sampling step.”*
+
+## When to use it
+
+IMPMAP targets the regime where a plain importance-sampling EM stalls or diverges: **high-dimensional models with rich data**, where the individual posteriors are sharp and a proposal not re-centered on the mode samples the likelihood poorly. Re-evaluating the conditional mode and first-order variance **every** iteration keeps the proposal aligned with the posterior throughout.
+
+For routine 1–3 compartment PK with a few random effects, FOCEI is faster and deterministic — reach for IMPMAP when FOCEI struggles or you want a sampling-based cross-check that does not rely on the Laplace approximation.
+
+## How it runs
+
+Standalone, or as a chain stage warm-started by a preceding estimator:
+
+    [fit_options]
+      method             = importance_sampling_map   # or: impmap
+      impmap_iterations  = 200
+      impmap_samples     = 300
+      impmap_proposal_df = 4           # Student-t (default); `normal` for MVN
+      impmap_seed        = 12345
+
+    [fit_options]
+      method = [focei, impmap]         # FOCEI warm-start, then IMPMAP refine
+
+Because `impmap` is an estimator, in a chain like `[focei, impmap]` the reported `FitResult.method` is `IMPMAP` and `method_chain` preserves the full sequence.
+
+## Algorithm
+
+Each MCEM iteration, at the current parameters θ⁽ᵗ⁾, Ω⁽ᵗ⁾, σ⁽ᵗ⁾:
+
+1.  **MAP re-center (E-step A).** Run the FOCE inner loop for every subject to get the conditional mode η̂ᵢ and Jacobian Jᵢ, and form the first-order-variance Hessian $H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}$. Each subject’s search is warm-started from its previous-iteration mode **and** re-solved from η = 0; the lower individual objective wins (see [Stale warm-start modes](#impmap-stale-warm-start)).
+
+2.  **Importance sampling (E-step B).** Draw `K = impmap_samples` samples $\eta_{ik} \sim q(\hat\eta_i, H_i^{-1})$ — a Student-t by default (`impmap_proposal_df = 4`, heavier tails for robust importance weights), or a multivariate normal (`= normal`) — with self-normalized weights $\tilde w_{ik} \propto p(y_i\mid\eta_{ik},\theta)\,p(\eta_{ik}\mid\Omega)/q(\eta_{ik})$.
+
+3.  **M-step.**
+
+    - **Ω** (closed form): $\Omega = \tfrac1N \sum_i \sum_k \tilde w_{ik}\,\eta_{ik}\eta_{ik}^\top$, then structural off-diagonals zeroed, FIX entries restored, free diagonals floored to stay positive-definite.
+    - **θ** (mu-referenced): the log-typical value is shifted by the importance-weighted population mean random effect, $\log\theta \mathrel{+}= \tfrac1N\sum_i \sum_k \tilde w_{ik}\,\eta_{ik}$. Re-MAPing at the new θ drives the mean random effect toward zero, so this fixed-point iteration resolves the θ–η confounding that would otherwise inflate Ω.
+    - **θ** (non-mu-ref) and **σ**: maximize the importance-weighted observation likelihood $\sum_i \sum_k \tilde w_{ik}\log p(y_i\mid\eta_{ik},\theta,\sigma)$ with a derivative-free NLopt BOBYQA step ([if it leaves a parameter behind](../estimation/importance-sampling.llms.md#mstep-frozen)).
+
+> **High-dimensional models need more samples.** The self-normalized importance weights make the M-step moments carry a finite-sample bias that grows with the number of ETAs, so the default `impmap_samples = 300` — ample for a 3–4 ETA PK model — is badly under-sampled for a high-dimensional FREM model (often 10+ ETAs) and can bias the typical-value and Ω estimates (e.g. the absorption parameter on a 13-ETA FREM model drifts at `K = 300` and recovers as `K` grows into the thousands). Two options address this: set **`impmap_auto = true`** (NONMEM `AUTO`) to ramp the sample count automatically until the per-subject objective Monte-Carlo SE drops to 0.05 ([the rule](../estimation/importance-sampling.llms.md#adaptive-sample-count)) — on the 13-ETA FREM model this ramps `300 → 10000` and brings the absorption typical value from ~4.6 to ~3.0 (matching NONMEM); or raise `impmap_samples` manually (several thousand for FREM). IMPMAP also warns when the objective is left under-sampled. FOCEI is unaffected and is a good cross-check for the typical values.
+
+The reported estimate is the running mean of the parameter vector over the final `impmap_averaging` iterations. A FOCE-Laplace `ofv` is computed at the final parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM. The importance-sampling Monte-Carlo **marginal** `−2 log L` — the number NONMEM `METHOD=IMPMAP` reports as its `#OBJV` — is also evaluated at the final estimates and surfaced on `FitResult.importance_sampling.minus2_log_likelihood` (± its MC SE). If IMPMAP is configured with a Gaussian proposal (`impmap_proposal_df = normal`), this final marginal eval substitutes a finite-`t` proposal to keep the importance weights bounded. Use that field, not `ofv`, to compare against NONMEM’s reported IMPMAP objective.
+
+> **Mu-referencing is required.** The closed-form `packed θ += mean(η)` shift is the EM-correct typical-value update for a mu-referenced random effect, so it is always applied for eligible parameters — log-mu-referenced (`CL = TVCL * exp(ETA_CL)`) and, since [\#918](https://github.com/FeRx-NLME/ferx-core/issues/918), logit-mu-referenced with the theta declared on the logit scale (`F = inv_logit(LOGIT_F + ETA_F)`) — independent of the `mu_referencing` fit option, which only governs inner-loop centering. A typical value that reads several thetas (`CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`) gets the same treatment in its general form since [\#619](https://github.com/FeRx-NLME/ferx-core/issues/619): the group’s thetas are re-fitted to the importance-weighted posterior means of the individual values each iteration (see the [SAEM page](../estimation/saem.llms.md#saem-mstep-covariate-mu-ref)). Like NONMEM’s EM methods, IMPMAP needs a mu-referenced parameterization: a model with random effects whose typical values are *not* eligible emits a warning and may estimate those typical values poorly (θ and the η mean are confounded over the importance samples). Use FOCEI for such models. A theta that anchors **two** ETAs is not eligible either — the shift has no single well-defined value for it — so it is estimated by the weighted M-step alone, with an advisory naming it.
+
+## Inter-occasion variability
+
+A model with `kappa` / `block_kappa` declarations is estimated the way NONMEM’s IMPMAP treats IOV — as extra random effects, one block per occasion ([\#2301](https://github.com/FeRx-NLME/ferx-core/issues/2301)):
+
+- **E-step.** The MAP step solves each subject’s stacked $b_i = [\eta_i, \kappa_{i1}, \ldots, \kappa_{iK_i}]$ jointly (the IOV inner loop), and the importance samples are drawn for the whole of $b_i$ from one proposal around that mode, against the block-diagonal prior $\Omega \oplus I_{K_i} \otimes \Omega_\text{IOV}$. Each sample is scored with per-occasion predictions, so a dose from an earlier occasion is eliminated with the later occasion’s κ. This is the same joint proposal the final IS objective uses.
+- **M-step.** Ω is the weighted second moment of the η block, as before. Ω_(IOV) is the weighted second moment of κ pooled over **every occasion of every subject**, $\Omega_\text{IOV} = \sum_i \sum_{g=1}^{K_i} \sum_k \tilde w_{ik}\,
+  \kappa_{ikg}\kappa_{ikg}^\top \big/ \sum_i K_i$, with the same structural zeros, `FIX` handling and diagonal floor. θ and σ are fitted to the weighted observation likelihood with each sample’s κ in place.
+- **Output.** The fit reports Ω_(IOV) and per-occasion κ̂, and the final IS objective marginalises κ (`kappa_treatment: marginalized`). `imp` (sample-moment recentring) runs the same E- and M-steps. `impmap_trace` does not yet carry Ω_(IOV) columns.
+- **Not yet with `[mixture]`.** The mixture E-step has no κ, so a `[mixture]` model with IOV under `imp` / `impmap` is refused at check time with `E_IMP_MIXTURE_IOV_UNSUPPORTED`; fit it with `saem` or `focei`.
+
+Against NONMEM 7.6.0 `METHOD=IMPMAP` on warfarin with IOV on CL (same data, model and starting values, 200 iterations, 300 samples), ferx’s averaged estimates fall within 0.9 of NONMEM’s own iteration-to-iteration SD of NONMEM’s last-50-iteration mean for every parameter: Ω_(IOV) 0.035446 vs 0.035404, IS −2 log L 309.65 vs 310.32. See `tests/warfarin_iov_impmap_nonmem.rs` and `nonmem_anchor/warfarin_iov_impmap.ctl`.
+
+`imp` is anchored the same way against NONMEM `METHOD=IMP` (`tests/warfarin_iov_imp_estimation_nonmem.rs`, `nonmem_anchor/warfarin_iov_imp.ctl`). IMP’s iterates are strongly autocorrelated, so one NONMEM run’s iteration-to-iteration SD understates how far its last-50 mean moves with the seed. The reference is therefore the mean of five NONMEM seeds, and every ferx estimate falls within 0.78 of the larger of the two spreads (Ω_(IOV) 0.035458 vs 0.035538).
+
+Both anchors fit one dataset against NONMEM. A recovery check, fitting simulated IOV data and comparing `imp` / `impmap` against SAEM and FOCEI on the known truth, has not been run yet ([\#2596](https://github.com/FeRx-NLME/ferx-core/issues/2596)).
+
+## Validation against NONMEM
+
+On the bundled warfarin example (1-cpt oral, proportional error, 3 mu-referenced ETAs), ferx IMPMAP (`impmap_iterations = 150`, `impmap_samples = 500`, MVN proposal, seed 12345) matches NONMEM 7.5.1 `METHOD=IMPMAP` on the same model/data (`tests/nonmem/warfarin_impmap.ctl`):
+
+| Parameter    | NONMEM IMPMAP | ferx IMPMAP |
+|--------------|--------------:|------------:|
+| TVCL         |         0.135 |      0.1327 |
+| TVV          |          7.89 |       7.737 |
+| TVKA         |         0.730 |       0.811 |
+| ω²(ETA_CL)   |        0.0291 |      0.0286 |
+| ω²(ETA_V)    |        0.0101 |      0.0096 |
+| ω²(ETA_KA)   |         0.340 |       0.336 |
+| σ (PROP, SD) |       0.01034 |     0.01056 |
+| −2 log L     |       −284.92 |     −286.00 |
+
+The well-determined CL/V structure and all three variance components agree to a few percent; TVKA is the least-identified parameter on this 10-subject extract (ETA_KA variance ≈ 0.34, high shrinkage) and carries the loosest band. NONMEM’s −284.92 is its IMPMAP **marginal** `#OBJV` (“without constant”); the matching ferx number is `importance_sampling.minus2_log_likelihood`, not the Laplace `ofv` (−286.00) shown in the table. Both objectives drop the same `Nobs·log(2π)` constant, so the residual difference is the parameter-estimate gap, within the usual cross-engine + Monte-Carlo margin. This comparison is asserted by the gated `ferx_impmap_matches_nonmem_impmap_on_warfarin` test (nightly, `slow-tests`); a companion `impmap_converges_to_focei_on_warfarin` test checks agreement with ferx’s own FOCEI.
+
+### Two-compartment oral model with covariates
+
+On `examples/two_cpt_oral_cov.ferx` with V1 given its own weight exponent (`THETA_WT_V1`), default IMPMAP settings, against NONMEM 7.6.0 `METHOD=IMPMAP INTERACTION NITER=200 ISAMPLE=300` followed by `IMP EONLY=1 ISAMPLE=3000` (`ADVAN4 TRANS4`, linear MU form), both on Linux (#1629):
+
+|                             |  TVV1 |  TVKA | ω²(ETA_V1) | ω²(ETA_KA) |  IS −2 log L |
+|-----------------------------|------:|------:|-----------:|-----------:|-------------:|
+| NONMEM IMPMAP               | 48.27 | 1.250 |     0.1088 |     0.1783 |     −1199.78 |
+| ferx IMPMAP                 | 48.21 | 1.248 |     0.1099 |     0.1794 |     −1198.73 |
+| ferx FOCEI (= NONMEM FOCEI) | 48.56 | 1.256 |     0.1061 |     0.1750 | OFV −1199.43 |
+
+The ferx IMPMAP row’s IS readout uses K = 300; an `imp_eval_only` evaluation at the same estimates with K = 3000 gives −1199.41. The other thetas, ω² and σ agree to about 1%. Before \#1629 ferx IMPMAP reported −1177.62 here, with ω²(ETA_V1) 0.176 and ω²(ETA_KA) 0.228. The next section explains why.
+
+### A model with no closed-form step
+
+Here every θ and σ goes through the weighted M-step: a two-compartment oral model with θ on (−10, 10), none mu-referenced, and three strata of combined error, so 14 coordinates. The data are 100 simulated subjects with 2200 observations, and the fit starts from deliberately wrong values (#2718). Both programs ran K = 1000 from the same start. ferx ran 200 iterations. NONMEM 7.5.1 was stopped by a time limit, so its rows are iteration 80, not final estimates. One evaluator scored all four: NONMEM `EONLY=1`, K = 5000.
+
+| Estimate                      | −2 log L | `LOG_KA` | `B_CLSEX` | SD of `A2` |
+|-------------------------------|---------:|---------:|----------:|-----------:|
+| ferx `imp`                    |  −4871.6 |    0.179 |    −0.154 |     0.1064 |
+| ferx `impmap`                 |  −4871.6 |    0.176 |    −0.156 |     0.1065 |
+| NONMEM `IMP`, iteration 80    |  −4873.2 |    0.242 |    −0.211 |     0.1069 |
+| NONMEM `IMPMAP`, iteration 80 |  −4873.3 |    0.241 |    −0.214 |     0.1069 |
+
+σ agrees. ferx ends 1.6 above NONMEM, with some θ still apart, so the run has not fully reached NONMEM’s point. At K = 300 and 15 iterations ferx’s own marginal for this model was −4508.2 before \#2718 and −4743.4 after it. The control stream, data and model are `imp_non_mu_ref_mstep` under `nonmem_anchor/`.
+
+## Stale warm-start modes
+
+A subject’s posterior can have two modes. In a two-compartment oral model, a low-V1/low-KA basin can compete with the η ≈ 0 basin. Which mode is lower can change as the parameters move, and early MCEM iterations move them a long way. A MAP search warm-started from the previous iteration’s mode stays in that basin even after it has stopped being the lower one. The proposal then sits off the posterior, the subject’s importance-sampling likelihood is underestimated, and its sampled η inflate Ω.
+
+On the model above, subject 6’s mode at the initial estimates is η_V1 ≈ −1.0, η_KA ≈ −0.8. From iteration 2 on, the η ≈ 0 mode is 8.4 objective units lower. Before \#1629 the warm start kept the subject in the old basin for all 200 iterations. The reported IS −2 log L read 17 units high, and the Laplace `ofv` and the final EBEs were off by about as much. ω²(ETA_V1) and ω²(ETA_KA) were inflated by 60% and 30%.
+
+Every warm-started MAP search, including the final EBE solve, is now also run from η = 0. A cold solve that only finds the same mode is discarded, so the warm start’s mode is kept on ties. The extra cost is one inner solve per subject per iteration. FOCEI does a similar cold-versus-warm check at its final estimates (#833).
+
+## Multi-start MAP (`impmap_mceta`)
+
+In high-dimensional models (e.g. FREM with many covariates, ≥ 5 ETAs) the per-subject MAP optimization can converge to a local mode, degrading importance-sampling efficiency (low ESS) and biasing the M-step. The `impmap_mceta` option (analogous to NONMEM `MCETA`) adds random starting points drawn from N(0, Ω) and keeps the start with the lowest individual NLL:
+
+    [fit_options]
+      method        = impmap
+      impmap_mceta  = 3       # 1 warm-start + 3 random starts per subject
+
+The default is `0`: the warm start plus the cold (η = 0) re-solve described [above](#impmap-stale-warm-start), with no random starts. `impmap_mceta = 3` is a good choice for FREM models. The cost is roughly `(1 + mceta) ×` the MAP step per iteration, but since E-step B (IS draws) dominates, the total wall-time increase is typically 15–40%.
+
+## Quasi-random draws (`impmap_sobol`)
+
+`impmap_sobol = true` builds every importance sample from one point of a Sobol sequence (Owen-scrambled, keyed by `impmap_seed`), instead of the pseudo-random stream. This is the sampling idea behind Phoenix’s QRPEM. Every random number a draw uses comes from that point:
+
+- the normal vector;
+- for the default Student-t proposal, the χ² scale variable;
+- with `imp_defensive_alpha > 0`, the choice of mixture component, which stratifies the defensive fraction instead of drawing it binomially (within one draw of αK when K is a power of two; low-discrepancy otherwise).
+
+So it works with every proposal form. (Before \#1965 it applied only to `impmap_proposal_df = normal` and was ignored, with a warning, otherwise.) Estimating `imp` has the same switch as `imp_sobol`.
+
+    [fit_options]
+      method         = impmap
+      impmap_sobol   = true
+      impmap_samples = 100
+
+**When it helps: few random effects and small K.** Quasi-random integration error falls faster than pseudo-random error only in low dimension, so the gain shrinks as the number of ETAs grows and disappears once K is large enough.
+
+The \#1965 benchmark compared normal proposals over 10 seeds. It reports the spread across seeds of a common large-K importance-sampled −2LL computed at each fit’s estimates:
+
+| model (ETAs)                        | K   | pseudo-random SD | Sobol SD |
+|-------------------------------------|-----|------------------|----------|
+| warfarin (3)                        | 100 | 1.0e-4           | 2.3e-6   |
+| sparse 2-cpt IV, N = 300 (3, block) | 100 | 0.096            | 0.020    |
+| sparse 2-cpt IV, N = 300 (3, block) | 300 | 0.012            | 0.015    |
+| 3-cpt IV (6)                        | 100 | 0.016            | 0.007    |
+
+At K = 100, Sobol cut the spread 2–44× against pseudo-random draws at the same K and cost per sample; on warfarin it beat pseudo-random K = 1000. At K ≥ 300 on the normal proposal the two tied.
+
+On the default t₄ proposal the gain is larger and also holds at K = 300 and on the 6-ETA model:
+
+| model (ETAs)                | K   | t₄ SD  | t₄ + Sobol SD |
+|-----------------------------|-----|--------|---------------|
+| warfarin (3)                | 300 | 4.2e-5 | 2.0e-6        |
+| sparse 2-cpt IV (3, block)  | 300 | 0.0099 | 0.0037        |
+| 3-cpt IV (6)                | 300 | 0.0034 | 0.0004        |
+| 2-cpt oral + covariates (5) | 300 | 0.0014 | 0.0010        |
+
+The scramble matters. Until the second \#1965 change, the Sobol points were randomized by one random shift per coordinate (Cranley–Patterson). Owen scrambling keeps the points’ stratification under randomization, and in the same benchmark it cut the spread a further 1.3–2.2× against the shift on the three models above the warfarin noise floor. On a smooth test integrand its error fell 6.9× from K = 256 to K = 1024, against 4.5× for the shift.
+
+**At the default settings the gain is small.** `impmap_sobol` stays off by default. With `impmap_auto` growing K up to 10000, the spread across 10 seeds was already at most 0.004 without Sobol, against a Monte Carlo error of 0.016–0.24 in the −2LL itself. Sobol narrowed it 1.8–21× on three of the four models and widened it 1.5× on `two_cpt_oral_cov`. Turn it on when you run a fixed, small K.
+
+Scripts and full tables are in `bench/qrpem_1965/` in the repository.
+
+**What it does not fix.** Sobol reduces integration noise only. On a model whose spread across seeds comes from a subject’s MAP sitting in the wrong mode, it changes nothing; use [`impmap_mceta`](#multi-start-map-impmap_mceta) for that. In the same benchmark on `two_cpt_oral_cov`, before the cold re-solve described [above](#impmap-stale-warm-start) existed:
+
+- every IMPMAP arm, Sobol or not, at any K, spread about 1.7 across seeds;
+- `impmap_mceta = 3` brought that down to 0.004.
+
+## Cost
+
+Per iteration ≈ one MAP inner loop (parallel over subjects) plus `K × n_subjects` predicts for the IS step plus a short weighted M-step. Total cost is roughly `impmap_iterations ×` the cost of a single `imp` evaluation. Everything is parallelized over subjects via the shared Rayon pool.
+
+The weighted M-step’s optimizer is `mstep_optimizer = auto` by default (#3001): Fisher scoring (`newton`) wherever the model is in its scope, BOBYQA run to its tolerance elsewhere (mixtures, M3 censoring, correlated residuals, models outside the adjoint’s scope). Fisher scoring keeps one prediction per importance sample across the solve (`subjects × K × n_obs` numbers: 112 MB at 2000 subjects × 1000 samples × 7 observations); on the benchmarks it costs 0.23 to 0.54 times the instructions of the previous BOBYQA default, and the NONMEM anchors keep their worst \|z\|. See [the SAEM page](../estimation/saem.llms.md#saem-mstep-default) for the measurements, and `mstep_optimizer = bobyqa` to keep the derivative-free solve.
+
+## Standard errors on a non-Gaussian model
+
+With a TTE, `[binary_model]` or CTMM endpoint, the covariance step after `impmap` differentiates the 7-node quadrature marginal (`method = laplace, n_agq = 7`) rather than the FOCEI objective, whose minimum can sit far from the `impmap` estimate on such a model (#1781). See [SAEM: covariance step on a non-Gaussian model](../estimation/saem.llms.md#saem-covariance-non-gaussian) for when it applies, the measured effect, and the warnings it carries.
+
+## Not yet supported
+
+- **IOV together with a `[mixture]` block** — refused with `E_IMP_MIXTURE_IOV_UNSUPPORTED`; use SAEM or FOCEI (see [Inter-occasion variability](#impmap-iov)).
+- **Nested variability levels** (`level … by … in …`) — refused; use FOCE / FOCEI.
+- **SDE / `[diffusion]`** — refused for the same reason `imp` refuses them (the EKF process-noise variance is not threaded through the IS observation likelihood). Use FOCE / FOCEI.
+
+## See also
+
+- [Importance Sampling (IMP)](../estimation/importance-sampling.llms.md) — the sample-moment re-centered sibling estimator (and its evaluation-only mode) that shares IMPMAP’s per-subject IS kernel and M-step.
+- [SAEM](../estimation/saem.llms.md) — the other sampling-based estimator; a common warm-start (`method = [saem, impmap]`).

@@ -1,0 +1,77 @@
+# Initial Conditions
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The optional `[initial_conditions]` block declares a **non-zero starting amount** in one or more compartments at the subject’s time origin (t = 0) for an **analytical** (closed-form) PK model. It is the analytical-path equivalent of NONMEM’s `A_0(cmt)` and of the ODE-path `init(state) = <expr>` directive in `[odes]`.
+
+This exists so a model with an endogenous baseline, a pre-dose concentration, or any other non-zero initial state can stay on the fast closed-form engine instead of being forced onto the numerical ODE solver. For a linear compartment model that is otherwise a textbook 1-/2-/3-cpt structure, the ODE solver is often the single dominant cost — see the [benchmark](#nonmem-comparison) below, where it made a 6-thioguanine model **~13× slower**.
+
+## Syntax
+
+``` ferx
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+```
+
+Each line is `init(NAME) = <expr>`, where:
+
+- **`NAME`** is a compartment: `central` (every model), `depot` (oral models), or a 1-based `CMT` index. Peripheral compartments are **not** supported on the analytical path (see [Limitations](#limitations)).
+- **`<expr>`** is the initial **amount** (not concentration). It may reference thetas, etas, covariates, and individual parameters declared in `[individual_parameters]` — exactly the symbols a Form-B `[scaling]` expression sees. So `init(central) = CONC0 * V` reads the data column `CONC0` and the per-subject `V`. A parameter **no** `pk(...)` role binds (`BASEAMT = CONC0 * V`, then `init(central) = BASEAMT`) takes a free differentiable PK slot of its own, shared with `[scaling]`; before \#1898 it had none and silently read `CL`’s value. Unlike `[scaling]`, that includes a parameter the `pk(...)` call maps as a dose attribute (`f=`, `lagtime=`/`alag=`): an initial condition is **not** an absorbed dose, so the engine deposits the amount with `F = 1` and no lag. `init(depot) = F * 500` — the bioavailable residue of a pre-study 500 mg dose — therefore applies `F` exactly once and is accepted ([\#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)).
+
+> **IMPORTANT:**
+>
+> A covariate named in the init expression is a **required data column**, matched **case-sensitively**. `init(central) = CONC0 * V` needs a `CONC0` column; if the dataset header is `conc0`, either rename it in the `[data]` block (`CONC0 = conc0`) or lowercase the expression (`init(central) = conc0 * V`). A name that matches no column now fails the fit loudly with `E_MISSING_COVARIATE` listing the available columns — earlier versions silently evaluated the missing covariate to `0`, dropping the baseline with no warning (issue \#765).
+
+## How it works
+
+For a **linear** disposition, an initial amount $A_0$ in compartment $c$ is identical to an $F$-bypassed bolus of $A_0$ into $c$ at $t = 0$. Because the system is linear, this contribution **superimposes** on the dose-driven prediction:
+
+$$\text{pred}(t) = \underbrace{\text{dose contribution}(t)}_{\text{oral / IV doses}}
+              + \underbrace{\text{impulse}_c(A_0, t)}_{\text{initial amount}}$$
+
+ferx evaluates $A_0$ once per subject and adds the closed-form impulse response at each observation time, **before** any `[scaling]` divisor or log-transform — so a scaling factor applies to the dose + init total, matching the ODE path.
+
+A central initial amount decays as the IV-bolus impulse (e.g. for one compartment $\;(A_0/V)\,e^{-(CL/V)\,t}$); a depot initial amount is absorbed first-order through `ka` with $F = 1$ (it is an initial condition, not an absorbed dose, so bioavailability does not apply).
+
+### Mapping from NONMEM
+
+NONMEM’s `$PK` block seeds the disposition state directly:
+
+``` fortran
+IF(A_0FLG.EQ.1) A_0(2) = CONC0 * V    ; initial amount in central
+```
+
+The ferx analytical equivalent is `init(central) = CONC0 * V`. NONMEM applies this inside the closed-form `ADVAN2`; ferx applies it as the closed-form impulse above — numerically equivalent, and still allocation-free.
+
+## Limitations
+
+- **Analytical models only.** For an ODE model (`ode(...)` in `[structural_model]`), declare `init(state) = <expr>` inside the `[odes]` block instead; `[initial_conditions]` errors on ODE models with a message pointing you there.
+- **Central or depot only.** A peripheral-compartment initial amount needs the cross-compartment impulse response, which the analytical closed forms do not expose. Use an ODE model for that.
+- **No `TIME` in the init expression.** The baseline amount is evaluated once per subject at the time origin, so `TIME` would read exactly `0` and the reference could only flatten the expression — `init(central) = TIME + 50` was bit-identical to `init(central) = 50`. The parser rejects it (issue \#994). Note that `T` / `TAFD` / `TAD` / `MACHEPS` are **not** built-ins on this surface: outside `[odes]` they are ordinary covariates, so they are accepted here and become required data columns, exactly as in `[scaling]`. See [What an `init(...)` expression may reference](../model-file/ode-models.llms.md#init-scope) for the two surfaces side by side.
+- **No `KAPPA_*` (IOV) in the init expression.** The baseline amount is a single t = 0 quantity evaluated with the between-subject η only, so a per-occasion kappa reference would silently see `kappa = 0`. The parser rejects it (the same guard as a Form C ODE readout, issue \#107); reference the occasion-dependent structural parameter (e.g. `CL`) instead. The baseline’s *decay* over time does use each observation’s occasion-specific PK parameters on the IOV path.
+- **System resets: `[odes]` re-deposits the baseline, `[initial_conditions]` does not.** A reset record (NONMEM `EVID = 3/4`) discards every compartment amount, including the residual baseline. What happens next differs by engine, and only one of the two matches NONMEM today:
+  - On an **`[odes]`** model the reset re-applies `init(state) = <expr>`, evaluated at the **reset row’s own data items** — `$PK` runs at that row, so a covariate-driven baseline restarts on that row’s values, not the preceding record’s and not the following one’s (#1133). With an `iov_column` this covers the row’s `OCC` too: a reset that opens a new occasion re-seeds under that occasion’s κ. The same holds when `iov_occasion = dose` or `time(...)` derives the occasions, since the rule labels the reset row as well (`nonmem_anchor/iov_rule_reset_{A,B}.ctl`). Anchored against NONMEM 7.6.0 in `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl` — including a reset that is the subject’s first event (H), a reset with a separate dose row at the same time (G), and the occasion question in isolation (J).
+  - On an **analytical** model with `[initial_conditions]` nothing re-deposits the baseline, so observations at or after the first reset carry no baseline contribution. NONMEM re-applies `A_0` there too, so this is a known divergence (#1135) — use an `[odes]` model if you need a baseline that survives a reset.
+- **Steady-state doses warn.** A steady-state dose (`SS = 1`) already pre-equilibrates an infinite dose history, so superposing an init baseline double-counts the starting amount. The combination raises `W_STEADY_STATE_INIT` rather than being silently combined.
+- **Compartment states / `[derived]` are not init-aware.** Predictions (PRED / IPRED) include the baseline, but the analytical compartment-state reconstruction does not seed it, so `[derived]` expressions referencing `compartments[i]` evaluate to `NaN` for baseline models (`W_DERIVED_INIT_ANALYTICAL`). Use an ODE model if compartment amounts are required.
+- **Exact analytic gradients, including under IOV and time-varying covariates.** An `[initial_conditions]` baseline uses exact analytic FOCE/FOCEI gradients under `gradient = auto` (issue \#524): the sensitivity kernels carry the init impulse and its θ/η dependence, so the baseline never forces FD. As of issue \#486 this holds for the full feature set — the closed-form baseline on the time-varying-covariate walk, and the baseline **under IOV** (kappa) on both the closed-form and ODE engines. For an IOV baseline the amount `A₀` is driven by the between-subject (BSV) parameters while the decay kernel follows each occasion’s clearance, matching the `predict_iov` prediction. On ODE `[odes]` models the same applies when the baseline is combined with a finite infusion, an estimated lagtime, a built-in input-rate forcing, steady-state dosing, a modeled-duration/rate dose, or an EVID 3/4 reset (production re-applies `init` at each reset from that reset row’s own snapshot, and the sensitivity walk re-seeds it from the same one — \#1133).
+
+## NONMEM comparison
+
+The 6-thioguanine model (`run14`, NONMEM `ADVAN2 TRANS2`) carries a pre-dose baseline `A_0(2) = CONC0 * V` for 7 of 31 subjects. Translating it with `[initial_conditions]` keeps it on the closed-form engine. All three fits below use the same data, structural model, and error model.
+
+| Quantity     | NONMEM `SAEM`→`IMP` | ferx analytical `FOCEI` | ferx ODE `FOCEI` |
+|--------------|---------------------|-------------------------|------------------|
+| TVV          | 270.5               | 288.9                   | 289.4            |
+| TVCL         | 110.4               | 114.1                   | 113.7            |
+| ASA on CL    | 1.58                | 1.53                    | 1.53             |
+| ω²(V)        | 0.27                | 0.25                    | 0.25             |
+| ω²(CL)       | 0.15                | 0.14                    | 0.14             |
+| cov(V,CL)    | 0.120               | 0.102                   | 0.10             |
+| −2LL / OFV   | −249.2 (IMP)        | −242.0 (Laplace)        | −242.0 (Laplace) |
+| **Run time** | **62 s**            | **~2 s**                | **27 s**         |
+
+The analytical translation reproduces the ferx ODE fit (identical engine, exact predictions — see `tests/analytical_init_equivalence.rs`) and tracks the NONMEM structural parameters and BSV closely. The OFV gap to NONMEM is the usual FOCEI-Laplace vs. SAEM/IMP difference on sparse data. The headline is wall time: removing the numerical ODE solve makes FOCEI **~13× faster** and makes a sampling estimator (SAEM/IMP) tractable on this model.

@@ -1,0 +1,106 @@
+# Gauss-Newton (BHHH)
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The Gauss-Newton optimizer is an alternative to the standard FOCE/FOCEI approach that exploits the nonlinear-least-squares structure of the FOCE objective. It uses the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian and typically converges in 10-30 iterations, compared to 100+ evaluations for gradient-based methods like SLSQP.
+
+This approach mirrors NONMEM’s modified Gauss-Newton algorithm.
+
+## Variants
+
+| Method | Key | Description |
+|----|----|----|
+| Pure Gauss-Newton | `gn` | Fast convergence for well-conditioned problems |
+| GN + FOCEI hybrid | `gn_hybrid` | Runs GN first, then polishes with FOCEI for robustness |
+
+## Algorithm Overview
+
+### BHHH Hessian Approximation
+
+The FOCE objective has the form:
+
+$$\text{OFV} = 2 \sum_{i=1}^{N} \text{NLL}_i$$
+
+The BHHH approximation uses the outer product of per-subject gradients as an approximate Hessian:
+
+$$H_{\text{BHHH}} = 4 \sum_{i=1}^{N} d_i \, d_i^T, \qquad \nabla\,\text{OFV} = 2 \sum_{i=1}^{N} d_i$$
+
+where $d_i = d\,\text{NLL}_i / dx$ is the **total** derivative of subject $i$’s objective with respect to the packed parameter vector: its EBEs $\hat\eta_i$ (and, under IOV, the occasion effects $\hat\kappa_{ik}$) re-estimated at every $x$, so their response to $x$ is included. It is the subject’s term of the outer gradient the NLopt optimizers take, from the analytic adjoint at the mode (one pass per subject, every estimator and model class it serves), and the same row the covariance step squares into its $S$ matrix ([`covariance_method = s` / `rsr`](../estimation/foce.llms.md#covariance-estimator-r-s-or-sandwich)). Under `gradient = fd`, or for a subject the adjoint declines, it is a central difference of the subject’s objective with $\hat\eta_i$ re-solved at each point.
+
+Before [\#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974), the BHHH matrix was built from the **fixed-mode** score $g_i$ instead, with $\hat\eta_i$, its linearisation $H$ and $\hat\kappa_i$ held at their values (its θ axis a forward difference of the predictions on the closed forms), and the gradient added the gap $t_i = d_i - g_i$ for FOCEI, TTE / discrete and IOV subjects ([\#2740](https://github.com/FeRx-NLME/ferx-core/issues/2740), [\#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)). Holding $\hat\eta_i$ drops the response of the FOCEI $\log|\tilde H(\hat\eta_i)|$ term, which is non-zero under proportional or combined error, so the quadratic model’s curvature and its slope came from two different vectors. Both now come from $d_i$, for FOCE as well as FOCEI.
+
+**A subject whose mode sits near a fold** ([\#2777](https://github.com/FeRx-NLME/ferx-core/issues/2777)). Its $d_i$ is exact at the point but changes over a distance far smaller than any step GN can take. After three rejected, unclamped steps in a row, GN looks for one subject whose $\lVert d_i - g_i\rVert$ is at least ten times every other subject’s and outweighs the rest of the gradient on some coordinate, and takes that subject back to its fixed-mode score $g_i$ in both the gradient and the BHHH matrix for the rest of the fit, with a warning naming it.
+
+This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
+
+### Trust region
+
+Each iteration takes one trust-region step on the quadratic model built from the gradient and $H_{\text{BHHH}}$. Before the solve, every coordinate is divided by a per-parameter scale (fixed from the initial estimates; identity with `scale_params = false`) so the system is better conditioned. The radius is measured in this scaled space.
+
+- **The step:** $\delta$ approximately minimises $g^T\delta + \tfrac12\,\delta^T H_{\text{BHHH}}\,\delta$ subject to $\lVert\delta\rVert \le \Delta$, by Steihaug truncated conjugate gradients. CG stops once its residual is small, steps to the boundary when it would leave the region or meets a direction of non-positive curvature, and runs at most $\max(\lceil\sqrt{n}\rceil, 5)$ iterations for $n$ packed parameters. There is no damping factor, Cholesky solve or line search.
+- **The trial point:** the inner loop re-estimates every subject’s EBEs at $x + \delta$ (warm-started from the current EBEs), so the trial OFV is the FOCE/FOCEI objective, not the quadratic model.
+- **The ratio:** $\rho$ is the actual OFV reduction divided by the reduction the quadratic model predicts. A non-finite trial OFV counts as $\rho < 0$, and so does a step clamped at a bound whose predicted reduction is no longer positive.
+- **The radius:** $\Delta$ starts at 1 and never exceeds 10.
+
+| $\rho$           | Step     | Radius               |
+|------------------|----------|----------------------|
+| $< 0.25$         | rejected | $\Delta / 4$         |
+| $0.25$ to $0.75$ | accepted | unchanged            |
+| $> 0.75$         | accepted | $\min(2\Delta,\ 10)$ |
+
+A rejected step costs an iteration but keeps the current estimates. When the quadratic model predicts almost no reduction ($< 10^{-10}$) while the gradient is not zero, the BHHH matrix is degenerate along the step: the radius is divided by 4 and the next iteration starts, with no trial point evaluated. That iteration still counts toward `maxiter`.
+
+### Bounds and stalled steps
+
+A parameter that reaches its bound while the gradient still pushes it outward is held for that iteration, the way a `FIX` parameter is, and the rest of the step is solved without it. When a step does run into a bound, the trust region judges it against the reduction the quadratic model predicts for the step actually taken, not the unclamped one. Before [\#2777](https://github.com/FeRx-NLME/ferx-core/issues/2777) the clamped coordinate still claimed its share of the prediction, so the ratio of actual to predicted reduction stayed at a fixed value below 0.25 at every radius and the fit stopped on “trust radius collapsed” (`examples/one_cpt_transit.ferx` under `method = gn`: 1513.94; now 1492.17, with `TVV` on its upper bound of 500 and no collapse).
+
+After three rejected steps in a row that no bound clamped, GN checks whether one subject’s EBE-response term sets the step direction: its term is at least 10 times every other subject’s, and on some parameter it outweighs the rest of the gradient. That happens when the subject’s EBE mode moves sharply with the parameters (for example near a fold), so its slope is exact at the point but wrong over any step GN can take. GN then uses that subject’s raw score for the rest of the fit and adds a warning that names it. The reported final gradient keeps the subject’s full term.
+
+### Convergence
+
+The GN loop ends at the first of:
+
+- **Converged, small change:** an accepted step changes the OFV by less than $10^{-6}$ relative to $\max(\lvert\text{OFV}\rvert, 1)$, from iteration 4 on, and the trust radius the step was taken at is at least $10^{-3}$. One such step is enough. Below that radius a step changes the OFV little *because* it is tiny, whatever the gradient, so it does not count; the loop goes on and ends on one of the rules below ([\#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)). Near a real optimum the quadratic model predicts well, so accepted steps double the radius and it climbs back above $10^{-3}$ within a few iterations.
+- **Converged, stationary point:** the predicted reduction is below $10^{-10}$ and the scaled gradient norm is below $10^{-8}$.
+- **Not converged, trust radius collapsed:** the radius falls below $10^{-10}$, after rejected steps or degenerate-BHHH retries. The fit adds the warning “Gauss-Newton: trust radius collapsed without convergence” (or “degenerate BHHH Hessian, trust radius collapsed without convergence”), classified critical, like the budget warning.
+- **Not converged, budget spent:** `maxiter` iterations ran, with the warning “Gauss-Newton: max iterations reached without convergence”. Only this stop carries it: a collapsed radius or a cancelled fit reports its own reason alone ([\#1049](https://github.com/FeRx-NLME/ferx-core/issues/1049)).
+
+This is the loop’s verdict, not yet the fit’s. Pure `gn` re-checks `converged` afterwards: a cold re-solve of the EBEs at the final estimates ([\#2097](https://github.com/FeRx-NLME/ferx-core/issues/2097)), the covariance step’s check that the end point is stationary ([\#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785)), and a check that the final objective is finite can each demote it.
+
+The optimizer trace (`optimizer_trace = true`) logs one row per step. For GN rows its `lm_lambda` column holds the trust radius: the radius the step was tried with on a rejected row, and the radius after the update on an accepted one. The column keeps its old name, from the Levenberg-Marquardt loop GN ran before 0.1.0, so existing readers still find it.
+
+## Hybrid Mode (GN + FOCEI)
+
+When `method = gn_hybrid`, the algorithm runs in two phases:
+
+1.  **GN phase**: Run Gauss-Newton iterations to quickly find the basin of the minimum
+2.  **FOCEI polish**: Run up to 100 iterations of standard FOCEI optimization, warm-started from the GN result. The polish stage uses the configured outer optimizer (`optimizer` in `[fit_options]`), which defaults to `auto`: `nlopt_lbfgs` when the exact analytic gradient is available (e.g. warfarin), `bobyqa` otherwise — see [Outer Optimizers](../estimation/optimizers.llms.md#the-auto-default) for the full rule.
+
+The final result is whichever phase produced the lower OFV. This combines the fast convergence of Gauss-Newton with the refined accuracy of FOCEI.
+
+## Configuration
+
+    [fit_options]
+      method     = gn          # or gn_hybrid
+      maxiter    = 100         # max GN iterations
+      covariance = true
+
+The trust region has no user setting: the starting radius, its cap and the CG budget are fixed as described under [Trust region](#trust-region). `gn_lambda`, the Levenberg-Marquardt damping factor of the loop GN replaced in 0.1.0, has no effect. ferx still accepts the key but warns when it is set, on any method, and the next minor release removes it.
+
+## When to Use
+
+**Use `gn`** when: - You want fast convergence and the model is well-conditioned - You are iterating on model development and need quick feedback
+
+**Use `gn_hybrid`** when: - You want robustness against local minima - The model is complex (many parameters or random effects) - You want the speed of GN with a safety net
+
+**Stick with `foce`/`focei`** when: - The model has convergence issues with GN (rare) - You need exact compatibility with standard FOCE/FOCEI results - The model has **no random effects** and you are not confident in the `sigma` start (see below)
+
+### Fixed-effects-only models
+
+`gn` and `gn_hybrid` both reduce correctly at `n_eta = 0` ([no omega at all](../model-file/parameters.llms.md#no-omega-at-all-fixed-effects-only-naive-pooled-fits)), but GN is the method most sensitive to the starting values there. Without random effects there is no inner EBE loop to absorb a mis-specified `sigma`, so the initial objective can start orders of magnitude above the optimum, and BHHH’s outer-product Hessian badly over-estimates curvature that far out — the step collapses and the fit crawls into `maxiter`.
+
+Concretely, on `examples/one_cpt_iv_pooled.ferx` and its own `sigma PROP_ERR ~ 0.02 (sd)` start, `gn` begins at OFV 11374, stops at **8670** and reports `Converged: NO` with ~6900% RSEs, where `foce`, `focei`, `laplace` and `gn_hybrid` all reach **−269.6370**. That is a wrong answer, not an imprecise one, so `gn` is **not recommended** for fixed-effects-only models. From `0.13 (sd)` it does converge, to −269.6322 — the right basin, still 0.005 short of FOCEI’s −269.6370. FOCEI reaches the optimum from either start. If a fixed-effects GN fit stalls, check `sigma` before anything else — or use `gn_hybrid`, whose FOCEI polish recovers it.
+
+Since [\#1006](https://github.com/FeRx-NLME/ferx-core/issues/1006) the combination is flagged rather than left to the reader: `ferx check` emits `W_GN_NO_RANDOM_EFFECTS` for `method = gn` at `n_eta = 0`, and a pure-GN run that ends `Converged: NO` there adds a post-fit warning saying the result may be badly wrong rather than merely imprecise — `Converged: NO` is the state that actually predicts the bad answer. `gn_hybrid` is exempt from both, since its FOCEI polish recovers the optimum — and so is a hand-written `method = [gn, focei]`, which is the same polish spelled out. The rule is “`gn` is the last estimating stage”: a GN result something else re-optimises is not the result you get.
+
+The two split the message between them: `W_GN_NO_RANDOM_EFFECTS` carries the remedy (prefer `gn_hybrid` or `focei`, or improve the `sigma` start), the post-fit warning carries only the outcome. A run that trips both — the usual case for a standalone `gn` — therefore states the advice once, not twice.

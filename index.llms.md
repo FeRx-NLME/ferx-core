@@ -1,0 +1,79 @@
+# Open-source NLME modeling for pharmacometrics
+
+ferx is an open-source **nonlinear mixed-effects (NLME) modeling** platform for population pharmacokinetic and pharmacodynamic (**PopPK/PD**) analysis. Its high-performance Rust engine supports established pharmacometric methods and NONMEM-compatible data through a command-line interface, Rust API, and [R package](https://ferx-nlme.org/ferx-book/).
+
+[Install ferx](installation.llms.md) or [run your first PopPK model](quick-start.llms.md).
+
+## Key Features
+
+- **FOCE/FOCEI estimation** – First-Order Conditional Estimation with optional interaction, the gold standard for PopPK
+- **SAEM estimation** – Stochastic Approximation EM for robust convergence on complex models
+- **Gauss-Newton (BHHH)** – Fast outer optimizer with a trust region, plus a GN+FOCEI hybrid
+- **Importance Sampling (IMP) and SIR** – For exact likelihood estimation and posterior sampling
+- **Analytical PK solutions** – Built-in one-, two-, and three-compartment models (IV bolus, oral, infusion) with numerical stability guarantees
+- **ODE solver** – Dormand-Prince RK45 adaptive integrator for custom kinetic models (e.g. Michaelis-Menten), plus Rosenbrock (`rodas4` / `rodas5p` / `rosenbrock23`) steppers for stiff systems
+- **SDE / diffusion models** – Extended Kalman Filter path for stochastic differential equations via the `[diffusion]` block
+- **Analytic gradients** – One adjoint (reverse-mode) gradient for FOCE, FOCEI, Laplace and AGQ, exact and with a cost that does not grow with the parameter count, plus the exact covariance R-matrix
+- **Multiple error models** – Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD
+- **Inter-occasion variability (IOV)** – `kappa` random effects with FOCE/FOCEI and SAEM support
+- **Model-based meta-analysis (MBMA)** – Arm-level summary data with inverse-variance weighting, sample-size-weighted between-arm variability and placebo level blocks; see [MBMA: start here](model-file/mbma.llms.md)
+- **Lagtime / ALAG** – Absorption lag for analytical and ODE paths
+- **LOQ censoring** – Beal M3 method for below-LLOQ and above-ULOQ observations
+- **NCA-based starting values** – `inits_from_nca` for automatic theta initialization from the data
+- **Simple model DSL** – Declarative `.ferx` model files that read like equations
+- **NONMEM-compatible data** – Reads standard NONMEM CSV datasets directly
+- **Covariate support** – Time-constant and time-varying covariates with automatic detection
+- **Parallel estimation** – Per-subject computations parallelized via Rayon
+- **Neural network covariates** – MLP-based covariate mapper behind the `nn` feature (experimental)
+
+## How It Compares
+
+| Feature | ferx-core | NONMEM | nlmixr2 | Monolix | Pumas |
+|----|----|----|----|----|----|
+| Language | Rust | Fortran | R, C/C++ (rxode2) | C++ | Julia |
+| FOCE/FOCEI | Yes | Yes | Yes | No | Yes |
+| SAEM | Yes | Yes | Yes | Yes | Yes |
+| Analytical PK | Yes | Yes | Yes (`linCmt()`) | Yes | Yes |
+| ODE models | Yes | Yes | Yes | Yes | Yes |
+| Open source | Yes | No | Yes | No | No |
+| License | MIT | Proprietary | GPL (≥ 3) | Proprietary[^1] | Proprietary[^2] |
+
+Method coverage is broadly the same across these engines: NONMEM has offered SAEM, importance sampling and Bayesian estimation alongside FOCE since NONMEM 7, and Monolix estimates with SAEM rather than FOCE. The table compares method availability only, as documented by each tool (checked September 2026; sources below). It does not rank how each engine computes gradients, which differs by method and option; for ferx’s own approach see [Gradient route (analytic vs FD)](estimation/foce.llms.md#gradient-route-analytic-vs-fd).
+
+Sources: NONMEM — [Bauer, *NONMEM Tutorial Part II: Estimation Methods and Advanced Examples*, CPT:PSP 2019](https://doi.org/10.1002/psp4.12422); nlmixr2 — [CRAN package page](https://cran.r-project.org/web/packages/nlmixr2/index.html) and [nlmixr2.org](https://nlmixr2.org/); Monolix — [SAEM task documentation](https://monolix.lixoft.com/tasks/population-parameter-estimation-using-saem/) and [licensing](https://monolixsuite.slp-software.com/getting-started/2024R1/licencing); Pumas — [estimation documentation](https://docs.pumas.ai/dev/basics/estimation/).
+
+## Architecture Overview
+
+ferx-core uses a two-level optimization structure:
+
+- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt L-BFGS, BOBYQA, SLSQP, MMA, built-in BFGS, Newton trust-region, or Gauss-Newton (BHHH). The default, `optimizer = auto`, picks L-BFGS when the exact analytic gradient is available and the derivative-free BOBYQA otherwise (see [Outer Optimizers](estimation/optimizers.llms.md))
+- **Inner loop**: For each subject, finds empirical Bayes estimates (EBEs) of random effects by minimizing individual negative log-likelihood
+
+Parameters are internally transformed for unconstrained optimization: theta and sigma are log-transformed, and omega uses Cholesky factorization to guarantee positive-definiteness.
+
+## Project Structure
+
+    src/                -- the ferx-core engine (one model, one dataset, one fit)
+      types.rs          -- Core data structures
+      api/              -- Public API (fit, simulate, predict)
+      parser/           -- .ferx model file parser
+      pk/               -- Analytical PK solutions
+      ode/              -- ODE solver and predictions
+      estimation/       -- FOCE/FOCEI, SAEM, Gauss-Newton, IMP, SIR, trust-region
+      stats/            -- Likelihood and residual computations
+      io/               -- Data reading and output writing
+      sens/             -- Analytic derivatives (PkNum kernels, the adjoint and its compiled per-subject plans)
+      nn/               -- Neural network components (DCM / NODE)
+    crates/
+      ferx-tools/       -- Workflows that run many fits (bootstrap, model searches)
+      ferx-cli/         -- The `ferx` command-line binary
+
+## License
+
+ferx-core is released under the [MIT License](https://github.com/FeRx-NLME/ferx-core/blob/main/LICENSE).
+
+## Footnotes
+
+[^1]: Free academic license for non-commercial use.
+
+[^2]: Free academic access for non-commercial research and education.

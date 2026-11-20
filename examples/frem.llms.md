@@ -1,0 +1,89 @@
+# FREM (Covariate Analysis)
+
+This example demonstrates FREM covariate analysis using the warfarin one-compartment oral model with body weight (WT) and age (AGE) as covariates.
+
+The covariates and their continuous/categorical kind are declared in the model’s [`[covariates]`](../model-file/covariates.llms.md) block — the source of truth FREM reads from:
+
+``` text
+[covariates]
+  WT  continuous
+  AGE continuous
+```
+
+## Workflow
+
+FREM is a two-step process: **transform** the base model and dataset, then **fit** the extended model.
+
+### R
+
+``` r
+library(ferx)
+
+# Step 1: FREM transformation. Covariates come from the model's [covariates]
+# block, so `covariates` can be omitted to use all of them.
+frem <- ferx_model_to_frem(
+  model      = "warfarin.ferx",
+  data       = "warfarin_cov.csv",
+  output_dir = file.path(tempdir(), "frem")  # default: next to the model file
+)
+# `output_dir` needs ferx-r from `main` (after 0.3.0). Release 0.3.0 creates the
+# directory and then writes next to the model anyway, unless `output_model` and
+# `output_data` are both given.
+# To FREM only a subset, filter with e.g. covariates = "WT".
+
+# Step 2: Fit the FREM model. `frem` is a ferx_model, so pass it straight in.
+fit <- ferx_fit(frem, method = "saem",
+                settings = list(n_exploration = 500L, n_convergence = 800L))
+
+# Inspect results
+fit$omega  # 5x5 block: rows/cols 1-3 are PK, 4-5 are covariates
+```
+
+### Rust API
+
+``` rust
+use ferx_core::{prepare_frem, fit_from_files};
+
+let frem = prepare_frem(
+    &Path::new("warfarin.ferx"),
+    &Path::new("warfarin_cov.csv"),
+    &[],   // empty filter → all covariates from the [covariates] block
+    None, None, None, None,
+    None,  // no prior fit: keep the base model's declared inits
+)?;
+
+let result = fit_from_files(
+    frem.model_path.to_str().unwrap(),
+    Some(frem.data_path.to_str().unwrap()),
+    None, None,
+)?;
+```
+
+## What `prepare_frem` does
+
+1.  Reads the base model and dataset
+2.  Computes sample means and variances for each covariate
+3.  Adds pseudo-observation rows per subject (one per covariate, `DV` = covariate value)
+4.  Generates a new `.ferx` model with:
+    - Fixed covariate thetas (set to sample means)
+    - Extended block omega (PK + covariate etas, initial covariate diag = sample variance)
+    - `EPSCOV` sigma for covariate observations
+    - `frem_predictions` and `frem_sigma` fit options
+
+## Interpreting the omega matrix
+
+After fitting, the 5×5 omega for this example has the structure:
+
+             ETA_CL  ETA_V  ETA_KA  ETA_WT  ETA_AGE
+    ETA_CL   [  PK IIV  ]  [  PK-cov correlations  ]
+    ETA_V    [           ]  [                       ]
+    ETA_KA   [           ]  [                       ]
+    ETA_WT   [  PK-cov   ]  [  covariate variances  ]
+    ETA_AGE  [           ]  [                       ]
+
+- **Diagonal (4,4)** and **(5,5)**: should approximate the sample variance of WT and AGE respectively.
+- **Off-diagonal** elements reveal covariate-parameter associations without requiring explicit covariate models.
+
+## Example model file
+
+See [`examples/warfarin_frem.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_frem.ferx) for the generated FREM model structure.

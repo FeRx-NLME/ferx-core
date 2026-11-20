@@ -1,0 +1,502 @@
+# Development Lifecycle (SDLC)
+
+This page describes how the FeRx project is developed across its two coupled repositories — **ferx-core** (the Rust NLME engine) and **ferx-r** (the R wrapper package) — from idea to release. It is the canonical process document for contributors and AI agents working on either repo.
+
+FeRx follows an **iterative, trunk-based continuous-delivery** model (close to Agile): small changes flow continuously to `main`, releases are tags, and the loop repeats. The scarcest planning/feasibility input is often not engineering time but **AI token budget** — treat it as first-class when scoping and sequencing work (a heavy multi-agent review or a large refactor is a *cost* to plan for, see [§4](#the-development-workflow-with-ai)).
+
+> **Scope.** This covers governance, the issue→PR→merge→release flow, the git model, cross-repo synchronization, the testing pyramid, NONMEM validation, and the quality gates enforced by CI. It complements (does not replace) each repo’s `AGENTS.md`, which carries the low-level build/test/style rules.
+>
+> **Want to help?** You don’t need to be on the core team — see [Contributing to FeRx development](../development/contributing.llms.md).
+
+------------------------------------------------------------------------
+
+## 1. Philosophy and quality bar
+
+FeRx is a numerical estimation engine. A wrong answer that *looks* right is worse than a crash. Because the project is openly AI-assisted, it is (fairly or not) perceived as an “AI-generated” product, which raises — not lowers — the bar we hold ourselves to.
+
+**Principles**
+
+- **High quality bar, especially for core numerics.** Aim *higher* than comparable tools on testing and validation. Every numerical result must be reproducible and validated (see [§7](#gold-standard-validation)).
+- **Match dev speed to risk.** Fast iteration is welcome for simple, non-core features and fixes. **Deliberately slow down** for anything that touches estimation, likelihood, PK/ODE math, or the `.ferx`/DSL surface.
+- **Parity first, novelty second.** The initial priority is parity with **NONMEM**, then Monolix / nlmixr2. Novel features (copula-IIV, neural ODEs, FREM, …) come *after* the core is trusted. The emphasis will shift toward novel features as the foundation matures.
+- **Avoid FeRx becoming a “Christmas tree”** Not every request belongs in FeRx. Evaluate each issue/PR against the design philosophy and **prioritize the majority of users**. It is fine — expected — to push back, defer, or decline, even for PRs from well-known developers. Deferral is a valid outcome if feature is not a priority: log it as a backlog issue.
+
+**Gate questions for any incoming issue or PR**
+
+1.  Does it fit the design philosophy, or does it bloat the tool?
+2.  Does it serve the majority of users, or a niche of one?
+3.  For a PR: is the code well-designed, well-documented, and well-tested?
+4.  Can it be deferred to a future cycle without harm?
+
+------------------------------------------------------------------------
+
+## 2. Team and governance
+
+| Role | Members | Responsibility |
+|----|----|----|
+| **Core team** (≤ ~5) | TBD | Direction, design authority, merge rights, releases |
+| **Power users / developers** (10+) | TBD | Feature contributions, domain review |
+| **Advisory board** | TBD | Scientific guidance, validation perspective |
+| **Pharma partners** | — | Real-world use cases, guidance |
+
+**Governance guardrails**
+
+- **No single controlling entity.** Explicitly avoid one organization controlling the project’s direction.
+- **Avoid a bloated organization.** Keep the decision-making core small and the process lightweight.
+- Design-level decisions (DSL changes, estimation defaults, breaking API changes) require **core-team** sign-off.
+
+------------------------------------------------------------------------
+
+## 3. Communication
+
+- **Google Chat** for day-to-day coordination.
+- **(Bi-)weekly meetings** for planning and design discussion.
+- **Technical discussion happens on GitHub** — in the relevant Issue or PR — so it is visible, searchable, and tied to the code. Decisions made in chat or meetings that affect design should be written back into the issue/PR.
+
+------------------------------------------------------------------------
+
+## 4. The development workflow (with AI)
+
+FeRx is developed with Claude Code (CC) as a primary implementer, with humans owning intent, design, and final judgment. The standard loop:
+
+1.  **Open a Backlog Issue** in the GitHub Project view. Describe the intent clearly — **Why, How, and the design choices**. This gives visibility to the rest of the team and forces the problem to be laid out before code is written.
+2.  **Review the issue and agree the design before coding.** Have CC rewrite the issue for clarity, then settle the *approach*. For anything touching estimation, the numerics, or the `.ferx`/DSL surface, this is an explicit **design gate**: write the chosen approach and the alternatives weighed into the Issue (or a short design note) and get **core-team buy-in first** — don’t discover the design in the diff. Simple, non-core changes can skip straight to implementation.
+3.  **Have CC implement the issue and open the PR.** Fill every section of the [PR template](#pull-requests) — including the cross-repo dependency table.
+4.  **For large / complex PRs — especially with numerical consequences — run the multi-agent review** (`/code-review` / “ultrareview”, at medium or high effort with up to ~9 agents), then have CC fix what it finds. This is token-expensive: if the budget is tight, schedule it overnight or hand it to someone with budget.
+5.  **Produce a NONMEM comparison** of the fit (see [§7](#gold-standard-validation)). Wire it into the test suite at the right tier: a real convergence fit → **slow tests**; a simulation or quick numeric check → **regular tests**.
+6.  *(Optional, for complex issues)* have **Copilot** review afterward as a second independent pass.
+7.  **Large / complex PRs, or anything affecting design or the DSL, always get a human review** in addition to AI review.
+8.  **Log any remaining or deferred work as new Issues** — nothing important should live only in a PR comment.
+9.  **Manually test an example fit**, ideally on real data and/or a model not already used by CC. If it misbehaves, have CC fix it.
+10. **Merge.** Before merging, confirm the **Rust and R sides are in sync**, documentation is updated, and the feature/fix is fully tested.
+
+> **Rule of thumb on AI autonomy:** let CC move fast on mechanical and non-core work; insert human checkpoints (design discussion, manual fit, human review) precisely where a subtle numerical error would be expensive.
+
+------------------------------------------------------------------------
+
+## 5. Git workflow
+
+### 5.1 Branching model — trunk-based
+
+**`main` is always the latest code.**
+
+- New feature/fix work is **branched off `main`**.
+- When done (reviewed, tested, in sync), the branch is **merged into `main`**.
+- A **release is a tag on `main`** (e.g. `v0.3.0`); see [§9](#releases).
+
+&nbsp;
+
+    main ──●──●──●──●──●──▶   tag v0.3.0
+            \   /  \   /
+     feat/x  ●─●    \ /
+     fix/y         ●──●
+
+**Trade-off we accept:** `main` is always newest but is *not guaranteed release-stable* between tags. We mitigate this with the CI gates in [§8](#cicd-and-quality-gates) and by treating tagged releases — not arbitrary `main` commits — as what we point users at.
+
+> This is intentionally the simplest model. If instability on `main` becomes a recurring problem, the alternative (`dev` + release branches) can be revisited by the core team — but the default is trunk-based.
+
+**Hygiene**
+
+- **Always pull the latest `main` before starting new work**, and branch off it.
+- Keep branches short-lived and focused on one issue.
+- Branch/PR titles follow `type(scope): short description [closes #N]` — see the PR template header for the allowed `type`/`scope` values.
+
+### 5.2 Experimental / large features
+
+Big experimental features (e.g. copula-IIV, neural ODEs, FREM) are the exception to “merge small, merge often”:
+
+- Develop them on a **long-lived feature branch** until production-ready — **do not** merge them into `main` piece-by-piece in a half-working state.
+- They must be **documented with multiple examples**.
+- They must be **referenced to the literature** (or carry a vignette, if the method is genuinely new).
+
+### 5.3 Git worktrees
+
+By default git checks out one revision per folder, so you work one issue at a time. **Worktrees** let you check out multiple branches at once, so CC can work several issues in parallel. The cost: local testing is harder (e.g. for the R package you must install from the worktree folder).
+
+- **Avoid worktrees** unless you have **two or more complex issues** that can’t each be finished quickly.
+- **Always create the worktree off `main`.**
+- **In ferx-r specifically**, use `EnterWorktree` at the start of any session on a non-`main` branch — it stops uncommitted WIP from one chat contaminating another chat that shares the same checkout directory.
+
+------------------------------------------------------------------------
+
+## 6. Pull requests
+
+Every PR uses `.github/PULL_REQUEST_TEMPLATE.md` and must fill **every** section before `gh pr create`. Key sections that exist specifically because of how FeRx is built:
+
+- **Cross-repo dependency table** — record the matching ferx-r (or ferx-core) PR and whether it must merge *before / after / together*. If a sibling PR is required but not yet open, mark the PR **Draft**. See [§10](#cross-repo-synchronization).
+- **Numerical validation** — reference values vs NONMEM / nlmixr2 / a prior ferx commit (see [§7](#gold-standard-validation)).
+- **Breaking changes** — `.ferx` format, `FitResult`/sdtab fields, or public Rust API. sdtab/`FitResult` changes are parsed by ferx-r → link the R PR.
+- **Tests**, **Docs**, **Example**, and the **example-execution checklist** (build ferx-core, rebuild ferx-r against it, run affected examples).
+
+**R-side pre-PR gates (ferx-r)**
+
+- Run `roxygen2::roxygenize()` and **commit the regenerated `man/*.Rd`** — they are checked into the repo and must stay in sync with the `#'` comments in `R/`. Never hand-edit the auto-generated `R/extendr-wrappers.R`.
+
+- **No non-ASCII characters in `R/*.R`** — `R CMD check --as-cran` requires pure ASCII (use `-` / `...`, not `—` / `…`). Verify before every PR:
+
+  ``` bash
+  python3 -c "import glob; [print(f) for f in glob.glob('R/*.R') if any(b>127 for b in open(f,'rb').read())]"
+  ```
+
+**Review requirements**
+
+- All PRs: green CI + at least the AI review pass.
+- Large/complex, numerical, design-, or DSL-affecting PRs: **a human core-team review is mandatory** on top of AI review.
+
+------------------------------------------------------------------------
+
+## 7. Gold-standard validation
+
+**Every feature that produces numerical results requires a comparison with NONMEM output**, and every new feature requires a test (lowest tier that fits).
+
+- NONMEM comparison is **essential for core features**. nlmixr2 parity is a fine *first pass*, but **NONMEM parity is what matters** — unless it’s clear nlmixr2 is the better reference.
+- CI has **no NONMEM access**, so commit the **NONMEM output files** alongside the test/docs rather than running NONMEM in CI.
+- Reference NONMEM 7.5+ runs are reproducible in the `pmx` container.
+
+Put the comparison either in the feature’s docs page (`docs/...`, `docs/faq.qmd`, or the relevant `estimation/*.qmd`) or in the PR description.
+
+------------------------------------------------------------------------
+
+## 8. CI/CD and quality gates
+
+### 8.1 Testing pyramid
+
+Tests live in three tiers (see `AGENTS.md` for placement rules). Put a new test in the **lowest tier whose constraints it fits**.
+
+| Tier | What | Where | When it runs |
+|----|----|----|----|
+| **1 — Unit** | Smallest helper isolating the behaviour; core functionality, math/predictions, fast numeric checks vs NONMEM (e.g. IPRED for ADVAN1-5). Avoid `fit()`. | inline `#[cfg(test)]` in `src/**` | Every PR. **Whole suite must stay \< 10 min** (target seconds). |
+| **2 — Integration** | Public API (`fit()`, `predict()`, …) but returns immediately — `Ok` after a few outer iterations, or an `Err`. **No convergence loops.** | `tests/*.rs` | Compile-checked every PR; run nightly. |
+| **3 — Slow / convergence** | Full population fits to convergence; NONMEM / nlmixr2 fit comparisons. | `tests/*.rs` or `src/`, gated behind `slow-tests` | Nightly (`slow-tests.yml`, 06:00 UTC, four shards + a summary verdict) + on push to `main` touching estimation code. |
+
+**Real-data tests** are currently **manual** (a handful of models Ron re-runs after each major feature) and not yet on GitHub — a known gap to formalize.
+
+### 8.2 CI workflows (ferx-core)
+
+| Workflow | Trigger | Jobs |
+|----|----|----|
+| `ci.yml` | PR, merge queue, push to `main` | `Check` (compile-only, incl. the `survival` / `markov` / `slow-tests` feature combos), `Tests + coverage (core k/6)` (`--tests --features ci` split over six runners by `tools/ci-test-shard.py` — integration binaries whole, the lib unit tests by module, \#2167; instrumented on `--profile ci-cov` — runs the Tier-1/2 suite with the `debug_assert!` guards live), `Tests + coverage (core)` (uploads the six shard reports as the one patch-coverage report), `Tests + coverage (TTE/CTMM endpoints k/4)` (`--features ci,markov,nn`: the lib unit tests and only the endpoint test binaries of `tools/ci-endpoint-tests.txt`, split the same way), `Tests + coverage (TTE/CTMM endpoints)` (uploads those four reports as one), `Tests (release semantics)` (`--lib` on the **`ci-fast`** profile, so the guards are compiled out and release overflow semantics are exercised — see below), `Clippy`, `Format`, `Public API baseline` (diffs `api/ferx-core-public-api.txt`), `Changelog` (validates `changelog.d/` fragments); **`Tests + coverage (full, slow-tests)`** on weekly schedule / manual |
+| `changelog.yml` | PR, incl. label changes | `Changelog fragment` — a PR touching user-facing source must add a `changelog.d/` fragment or carry the `no-changelog` label |
+| `slow-tests.yml` | nightly 06:00 UTC, Sundays 07:00 UTC (`full-nn`), manual, push to `main` touching the suite’s inputs | Tier-3 fits to convergence on `--profile ci-test`: `Slow regression tests (core k/4)` (the whole workspace suite split over four runners by `tools/ci-test-shard.py`, \#2182), `Slow regression tests (core)` (the one verdict over the four shards), `Slow regression tests (nn)` (the lib unit tests and `tools/slow-nn-tests.txt` with `nn` on), `Slow regression tests (nn test set)`; on Sundays `full-nn k/4` instead — see [Slow tests, sharded](#slow-tests-sharded) |
+| `golden-fits.yml` | nightly 04:30 UTC, manual | `Golden fit set (Linux)`: the reference models of `tools/golden-fits/models.tsv` fitted at the last release and at head, diffed into the job summary; report-only until 2026-12-07, then fails outside the measured band — see [Golden fit set](../development/golden-fits.llms.md) |
+| `peak-memory.yml` | nightly 05:00 UTC, manual | `Peak memory (Linux)`: the shipped (`--release`, mimalloc) `ferx` binary’s peak RSS on the synthetic 9-state stiff ODE probe `tools/peak-memory/stiff_pkpd.ferx`, for one evaluation and a short fit with the covariance step; fails on growth beyond 25 % over `tools/peak-memory/baseline.json` — see [Peak-memory probe](../development/peak-memory.llms.md) |
+| `mutants.yml` | nightly 01:30 UTC, manual | cargo-mutants over the previous UTC day’s merges to `main`: `Plan mutants`, `Mutants (k/N)` (N sized from the selection), `Mutants summary` (survivors as `file:line` + mutation in the job summary; an untested tail goes to a follow-up pass on the same commit); report-only — see [Nightly mutants](#nightly-mutants) |
+| `docs.yml` | push to `main` touching `docs/**` | `quarto render` → deploy to `gh-pages` |
+| `release.yml` | tag `v*` or manual | GitHub release with generated notes |
+
+> Note: `RAYON_NUM_THREADS=1` is pinned in CI so cargo owns the test parallelism on 2-core runners. Don’t remove it. Since \#2800 it also sizes every unpinned `fit()` to one worker (before, fits ignored it and ran the engine default); a test that pins `threads` is unaffected.
+
+#### Merge queue
+
+PRs land on `main` through GitHub’s merge queue (#2042). Before it, a PR merged on checks that ran against whatever `main` it was opened on, so two PRs that were each green, with no textual conflict, could break `main` together. That happened twice: a crate-wide change in one PR (a new `Subject` field, a removed `From` impl) and a new use of the old shape in the other (#1768 × \#1746, \#1957 × \#1925). The queue builds each PR on top of current `main` and the PRs queued ahead of it, and merges only if the required checks pass on that combination.
+
+In the queue (`merge_group` event) `ci.yml` runs only the fast gates: `Check`, `Clippy`, `Rustdoc`, `Format`, `Docs lint`, `Public API baseline` and `Changelog`. Those catch a compile-level conflict in minutes. The test and coverage jobs already ran on the PR, so they are skipped in the queue; GitHub counts a skipped job as a passing required check. A conflict that still compiles but breaks a test is caught by the nightly slow tests, as before.
+
+`codecov/patch` is a status Codecov posts after an upload, and no upload runs in the queue. The `codecov/patch (merge queue)` job posts it as `success` on the merge-group commit, because the patch gate was already enforced on the PR. That job runs on `merge_group` only; on a PR it would bypass the patch gate. `tests/ci_merge_queue.rs` evaluates every job’s `if:` per event and pins all of the above, including that every required check still runs on a PR and on a push to `main`.
+
+#### Slow tests, sharded
+
+One slow-tests job per leg outgrew its budget in October 2026: 66 minutes on a fast runner, killed at 100 on a slow one. Since \#2182 the suite is split by test binary over four runners, each compiling the workspace, and a fifth job holds the verdict. A sharded run is green only if:
+
+- every test target `cargo metadata` names ran on **exactly one** shard;
+- every binary ran every test its own `--list` names, as passed or ignored, with none filtered out (a binary with no tests at all is fine);
+- every shard reported a complete manifest, and every shard job succeeded;
+- no test failed.
+
+Each shard’s `tools/ci-test-shard.py run slow` lists its binaries before running them and uploads the result as a manifest; `Slow regression tests (core)` runs `check` over the four. A failed condition is its own `::error::`, naming the binary or shard. A job killed by `timeout-minutes` is reported by GitHub as `cancelled`, so the summary job runs `if: always()` and fails on any shard result other than `success`.
+
+The `nn` job runs only the binaries that gain a test under `nn`, listed in `tools/slow-nn-tests.txt`. Two checks hold the list to that: a per-PR test that scans the test files for a positive `cfg(feature = "nn")`, and `Slow regression tests (nn test set)`, which compares every binary’s `--list` with `nn` on against the core shards’ lists. The weekly `full-nn` leg runs every binary with `nn`.
+
+The shard balance comes from `tools/ci-test-weights-slow.txt`. A stale weight only unbalances the shards; it never drops a test. The summary warns when a shard uses more than 70% of its budget, or a binary takes more than twice its weight. To refresh the weights, append the logs of a green run’s four `core k/4` jobs to one file, once per job:
+
+``` bash
+gh run view --job <core-shard-job-id> --log >> slow.log
+```
+
+Then regenerate the weights file from it:
+
+``` bash
+tools/ci-test-shard.py weights slow slow.log
+```
+
+#### Nightly mutants
+
+AGENTS.md asks for mutation evidence on every new assertion. Done by hand, that is the step most often left incomplete (#1171 / \#1174, \#1223). Both of those survivors were function-body edits — dropping a call, deleting a fill — which is exactly the edit cargo-mutants makes. `mutants.yml` (#2633) runs it every night over the production `src/` lines that merged to `main` the previous UTC day, and lists every surviving mutant in the job summary. Run `tools/nightly-mutants.sh --help` for the subcommands it uses.
+
+The job is **report-only**. A survivor never turns it red; it fails only when the tool cannot run (a bad diff, or `main`’s own `--lib` tests failing in the unmutated baseline). Triage each survivor: add a test that kills it, or record why it cannot matter.
+
+##### What it runs
+
+- **Every function-body replacement, with tuple products pruned.** cargo-mutants generates one mutant per combination of default values for a tuple return. On the 2026-11-02 merges that was 58,192 mutants, 34,848 of them from one 7-tuple function. `select` splits each generated value into its innermost comma-separated slots, and keeps the fewest variants in which every value of every slot still appears. A scalar return has one slot, so all of its variants run: `-> bool` runs both `true` and `false`. That day, the 7-tuple ran 12 variants and the whole day 1,261.
+- **Operator, match-arm and struct-field mutants** run only on a manual dispatch with `all_genres`. Each of those is a distinct edit, so all of them run.
+- **`--lib` only, on `ci,markov,nn`.** Without `markov`/`nn`, a mutant in their gated source builds, passes every test, and reads as a false survivor. `--lib` is passed as `--cargo-arg`, not after `--`. Trailing args reach only the test phase, so the build would compile every integration binary for each mutant.
+
+##### Shards and follow-up passes
+
+The plan job sizes the shard matrix from the selection: one shard per `PER_SHARD` mutants, up to `MAX_SHARDS`. Each shard stops at its wall-clock budget. Any selected mutant without an outcome is not dropped. A shard that ran slow, or one that died, leaves a tail. The summary job hands that tail to a follow-up pass: the same workflow, dispatched on the same commit, carrying every outcome so far. The last pass’s summary is the report for the whole window. After `MAX_PASSES`, anything still untested is listed by name under “Not examined”, never dropped silently. Every summary prints the measured per-mutant time of its own run, so `PER_SHARD` can be re-derived from CI rather than from these local numbers.
+
+##### Measured cost
+
+Per mutant, one body edit in `src/api/levels.rs`, `--lib --features ci,markov,nn`:
+
+| Platform | Profile | Rebuild | `--lib` tests | Per mutant |
+|----|----|---:|---:|---:|
+| macOS arm64, 10 cores | `ci-fast` | 419 s | 34 s | 453 s |
+| macOS arm64, 10 cores | `dev` | 24 s | 503 s | 527 s |
+| macOS arm64, 10 cores | `dev`, opt-level 1 | 247 s | 43 s | 290 s |
+| macOS arm64, 10 cores | `ci-fast` + incremental | 210 s | 37 s | 247 s |
+| Linux aarch64, Docker `--cpus 4` | `mutants` | 216–246 s | 61–257 s | 354 s mean, 485 s max |
+
+The Linux row is cargo-mutants itself on the four viable mutants of `src/api/levels.rs`, at the runner’s 4-CPU size. One of them rebuilt in 35 s and is left out of the rebuild range. On the same machine, the unmutated baseline took 498 s to build cold and 116 s to test. A caught mutant can test longer than the baseline: cargo-mutants runs the whole suite to completion.
+
+The job builds on `[profile.mutants]`, which is `ci-cov` plus `incremental`. The lib build dominates, as \#2633 predicted. Release profiles turn incremental off, and turning it back on halves the rebuild.
+
+Selected mutants per day, for the merges of 2026-10-27 to 2026-11-02: 523, 160, 276, 1,632, 477, 96 and 1,261 (median 477). At 6 minutes a mutant, a 300-minute shard finishes about 47. `PER_SHARD` is set to 40 for headroom, so the median day plans 12 shards and finishes in one pass. The heaviest day plans the 16-shard cap, and the follow-up passes take its tail: 1,632 mutants is three passes.
+
+##### What a clean summary does not mean
+
+- **Message text was checked.** cargo-mutants never mutates string literals. A false sentence in a diagnostic (#1405 / \#1456) still needs the manual sentence-deletion check described in AGENTS.md.
+- **Every combination of a tuple return ran.** A survivor needing two slots’ values *together*, where every variant carrying each value alone is caught, is the one case the pruning does not test.
+- **Only the selection ran.** In cargo-mutants 27.1.0 (pinned), struct-field deletions ignore both `examine_re` and `exclude_re`. A few run on every pass regardless of the selection, and the plan step counts them in.
+
+#### Both build modes, every PR
+
+**Why the coverage jobs build `ci-cov`.** `release`, `ci-test` and `ci-fast` all leave `debug-assertions` off, so each of the ~180 `debug_assert!` guards in the crate compiles to nothing. That cost two separate things:
+
+1.  The guards were invariant checks CI never ran. An off-by-one in `compute_max_stack` tripped its own `debug_assert!` for any expression containing an `if`, and four lib tests panicked under the dev profile while CI stayed green (fixed in \#342; the blind spot in \#344).
+2.  `llvm-cov` still emits a coverage region for a guard’s condition even when the macro expands to nothing — a region that can never execute. Every multi-line `debug_assert!` therefore contributed guaranteed-missed lines to the ≥90% patch gate, unreachable by any test. On \#1136 that put the ceiling at **49/56 = 87.5%** against a 90% gate (#1248).
+
+`[profile.ci-cov]` — `ci-fast` plus `debug-assertions` and `overflow-checks` — fixes both at once, and the two per-PR coverage jobs build under it. It replaced the standalone `Tests (debug-assertions)` job \#344 had added, which cost 32–42 min: the CI critical path, roughly twice the next-longest job. Measured on a 15-core machine with `--features ci`:
+
+|  | guards off (`ci-fast`) | `debug-assertions` | `+ overflow-checks` (`ci-cov`) |
+|----|----|----|----|
+| `--workspace --tests` | 133 s | 133 s | 147 s |
+| `--lib` | 5.76 s | 6.45 s | — |
+| clean lib compile | 92 s / 98 s | 93 s / 87 s | — |
+
+so the guards are essentially free on a release-optimised profile, and 63 condition lines flip from zero-hit to covered in `--lib` scope alone. A separate profile rather than a flipped `ci-fast`, because `ci-fast` is not CI-only — `tools/vi-nuts-anchor/run.sh` and `tools/vi-emvi-comparison/run.sh` build numerical anchors with it. It adds no CI compile: both coverage jobs already carry coverage `RUSTFLAGS` and their own cache keys, so nothing was shared with another job anyway.
+
+Run the same thing locally with
+
+``` bash
+tools/preflight.sh debug-assertions
+```
+
+That group is the one `tools/preflight.sh` skips when you pass no arguments: it runs a test suite rather than a compile, so it is minutes rather than seconds. Name it when you want it.
+
+Its commands, and the coverage steps in `ci.yml`, carry `FERX_REQUIRE_DEBUG_ASSERTIONS=1`, which arms a canary (`debug_assertion_canary` in `src/lib_tests.rs`) that fails the run if `debug_assert!` turns out to compile to nothing after all. Without it the gate would rest on the *absence* of a mistake, and a `[profile.ci-cov] debug-assertions = false`, a `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS` in the environment, or a `--profile` that quietly reverted to `ci-fast` would neuter it with every test still green. Do not set that variable anywhere else: every other job legitimately runs with the guards off.
+
+#### The guards-off lane
+
+Turning the guards on for both coverage jobs would have left *no* per-PR job running the crate the way a user’s release build behaves — guards compiled out, overflow wrapping. The remaining `ci-test` runs are scheduled, manual or post-merge, so a release-only regression could merge green. `Tests (release semantics)` is the counterweight: `--lib` on `ci,markov,nn` under `ci-fast`, in parallel with the coverage jobs and shorter than either, so it adds no wall-clock. It does not restore guards-off `tests/` binaries — those still run guards-off in `slow-tests.yml` and the nightly coverage job.
+
+Each lane arms a canary in the direction it cares about: `FERX_REQUIRE_DEBUG_ASSERTIONS=1` on the coverage jobs, `FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1` on the release lane. Without the second, the release lane would silently become a duplicate of the coverage jobs the moment `ci-fast` acquired `debug-assertions` — green throughout.
+
+#### Writing tests that span both modes
+
+**Do not gate a test on `#[cfg(not(debug_assertions))]`**. It does not fail under a guarded profile — it silently stops existing, which is worse. If a function has one behaviour under a live guard and another without (a misuse `debug_assert!` plus a NaN fallback, say), assert **both** with `catch_unwind` plus `cfg!(debug_assertions)`, so the test is meaningful in either lane; `src/types_tests.rs` has the pattern. Do not swap the panic hook to silence the expected panic — `set_hook` is process-global and races with the parallel harness badly enough to silence the whole process.
+
+### 8.3 CI workflows (ferx-r)
+
+`R-CMD-check.yaml` and `test-coverage.yaml`. **ferx-r CI builds ferx-core from the commit pinned in `ferx-r/src/rust/Cargo.lock`** — not from latest `main`. See [§10](#cross-repo-synchronization).
+
+### 8.4 Code-quality thresholds
+
+| Tool | Measures | Target |
+|----|----|----|
+| **Codecov** | unit-test line coverage | **\>90%**; a PR must not degrade coverage (Codecov comments on PRs) |
+| **CodeFactor** | code quality / smells | **A+** |
+
+`rustfmt` is enforced by the shared pre-commit hook (`git config core.hooksPath .githooks`) and by the `fmt` CI job.
+
+What the `Clippy` job actually fails on is narrower than “clippy is clean”, and worth knowing before you rely on it. `cargo clippy` exits 0 on warn-level findings, so only two things redden the job: clippy’s deny-by-default `correctness` group, and rustc’s `unused` group, which `tools/preflight.sh` denies explicitly (`-Dunused`, \#1470). That covers the leftovers a refactor drops — an orphaned `use`, a field nothing reads, a variable nothing consumes — and, because `-D` on a *group* also promotes its allow-by-default members, a `macro_rules!` arm nothing invokes. It does not cover a `pub` item nobody calls, since `dead_code` never fires on one, nor anything compiled out of the `ci,markov,nn` feature set. The rest of clippy’s warn-level surface (style, complexity, pedantic-adjacent perf lints) is advisory: it is printed, it does not fail, and a green `Clippy` job is therefore not a warning-free tree.
+
+### 8.5 Documentation workflow
+
+Docs are a [Quarto](https://quarto.org/) website under `docs/`, using the same brand assets and styling as the main ferx site in `../ferx-nlme.github.io`.
+
+- **Edit only Quarto sources under `docs/`.** `docs/_site/` is generated, git-ignored, and **never committed** — `docs.yml` builds and deploys it to `gh-pages` on every push to `main` touching `docs/**`. Build locally to preview, but leave the output untracked.
+- **New pages must be linked in `docs/_quarto.yml`** or they won’t appear in the website sidebar.
+- Route user-visible changes to the right page: `model-file/fit-options.qmd` (`[fit_options]` keys), `model-file/individual-parameters.qmd` (DSL syntax), `estimation/*.qmd` (estimator behaviour), `faq.qmd` (NONMEM / nlmixr2 comparisons).
+- On the R side, the `roxygen2`-generated `man/*.Rd` files **are** the docs — regenerate and commit them (see [§6](#pull-requests)).
+- **`cargo test -p docs-lint` gates the structure** — section size, heading levels, duplicate anchors and dead internal links. It runs on every PR as the `Docs lint` job; the rules and how to fix each one are on the [Docs linter](../development/docs-lint.llms.md) page.
+- **Keep rationale and validation in their own subsection**, so a usage section is not also a wall of background — see [Writing a docs page](../development/contributing.llms.md#writing-a-docs-page).
+
+Render locally with `tools/render-docs.sh` before marking documentation-heavy PRs ready for review. Prefer it to a bare `quarto render docs`: Quarto’s project input discovery skips any path with a **hidden** (dot-prefixed) directory component, so in a worktree under `.claude/worktrees/<name>/` — which `AGENTS.md` asks for on any branch that is not `main` — `quarto render docs` finds *zero* inputs. It writes `robots.txt` and `sitemap.xml`, renders not one page, prints no warning and **exits 0**. The script stages `docs/` outside the dot directory in that case, and fails loudly if a render produces no pages.
+
+### 8.6 Build portability (stock nightly)
+
+ferx-core builds on a **stock nightly** toolchain — no custom compiler. The exact FOCE/FOCEI and HMC gradients come from hand-rolled analytic `Dual2` sensitivities (`sens/`), and models outside the provider’s scope fall back to finite differences.
+
+In fact there is no nightly-only code left, which is why the three coverage jobs in `ci.yml` override `RUSTUP_TOOLCHAIN` to **stable**: stable’s rustc version holds for ~6 weeks against nightly’s daily bump, keeping their instrumented build cache warm. `rust-toolchain.toml` still pins nightly as the default, and `Check` / `Clippy` / `Format` run on it.
+
+- **Keep the build toolchain-light.** Standard-Rust users (Mac / Linux / Windows) and CI install ferx with `cargo build` alone. Do not reintroduce a dependency on a custom compiler or a non-default Cargo feature for the core gradient path.
+
+------------------------------------------------------------------------
+
+### 8.7 The public-API gate
+
+The repo is a cargo workspace: the root package is the `ferx-core` **library**, with `crates/ferx-tools` (multi-fit tooling — bootstrap, covariate search, cross-validation) and `crates/ferx-cli` (the `ferx` binary) stacked on top. The boundary rule is *`ferx-core` = one model, one dataset, one fit; `ferx-tools` = many fits*. Statistical kernels stay in core; orchestration of repeated fits does not.
+
+Members can only reach `ferx-core` through its `pub` API, so the way that boundary erodes is core growing an ad-hoc `pub` in the same PR that needs it. `api/ferx-core-public-api.txt` is a committed `cargo public-api` snapshot and the `Public API baseline` job diffs it, which turns every widening into one explicit reviewable line rather than something buried in a large change. It doubles as semver protection for the crates.io release and for ferx-r.
+
+``` bash
+tools/update-public-api.sh          # regenerate after an intended change
+tools/update-public-api.sh --check  # what CI runs
+```
+
+`#[doc(hidden)]` is banned outright (`tests/public_api_boundary.rs`): `cargo public-api` omits such items, so the attribute is a working bypass of this gate, not a style question. And anything `ferx-tools` needs must also be reachable from ferx-r, which consumes `ferx-core` as an ordinary external crate — an API that only makes sense “because we’re in the same workspace” is the wrong API.
+
+### 8.8 Reference platform (Linux)
+
+CI runs on Linux, so reference numbers for fits — Tier-3 bands, anchor tolerances, headroom claims, and whether a test is red on `main` — come from Linux. macOS fits can differ, and the cause is the **OS math library, not the CPU**: at `cff801db` the `per_route_lag` fit reaches the same OFV (−688.936445811360) on Linux arm64 and Linux amd64, in every printed digit, while native macOS arm64 converges to a different optimum (−420.33) and fails the test. A number measured on macOS names its platform and is never compared against a Linux one; a macOS-only failure is a question about the test, not a reason to widen its tolerance.
+
+To get a Linux number locally, run cargo through Docker:
+
+``` bash
+tools/linux-test.sh -- test --no-default-features \
+    --features ci,survival,slow-tests --profile ci-test --test per_route_lag
+```
+
+The script mounts the checkout read-only and copies it into the container, so tests that regenerate committed fixtures cannot touch your tree. It builds with one job by default: Docker Desktop’s default 8 GB VM runs out of memory at two jobs on the full slow sweep (`--jobs N` once you have raised Docker’s memory). Before cargo starts, the container prints a `ferx-platform: Linux/<arch> <libc> <rustc>` marker, which tooling uses to tell a Linux log from a macOS one. Build caches live in the Docker volumes `ferx-linux-target` and `ferx-linux-registry` (`--amd64` uses its own pair); `tools/linux-test.sh --help` shows how to remove them.
+
+To get the x86_64 CI digits of a test that *passes* — whose `eprintln!` output cargo normally swallows — dispatch the slow-test workflow with `nocapture`:
+
+``` bash
+gh workflow run slow-tests.yml --ref <branch> -f nocapture=true
+```
+
+Scheduled and push runs never set it, so their logs stay readable.
+
+------------------------------------------------------------------------
+
+## 9. Releases
+
+Trunk-based, so a release is a **tag on `main`**:
+
+1.  Confirm `main` is green (CI), ferx-core ↔︎ ferx-r are in sync, docs are current, and the relevant `Cargo.toml` / `DESCRIPTION` versions are bumped. *(Current: ferx-core `0.4.0`, ferx-r `0.4.0`.)* Assemble the changelog in the same release PR: `tools/changelog.sh assemble X.Y.Z` writes the `changelog.d/` fragments into `CHANGELOG.md` under `## [X.Y.Z] - <date>`, updates the compare links and deletes the fragments. Add any release-level prose (upgrade notes) under the new heading by hand. If anything merges to `main` before the release PR does, merge `main` back in and assemble again: the `Changelog fragment` check fails a release PR that leaves a fragment pending, and `release.yml` refuses a tag whose tree still has one (`tools/changelog.sh released <tag>`). In the same PR, clear `accepted` in `tools/golden-fits/bands.json`: the new release becomes the golden set’s baseline, which absorbs those changes (see [Golden fit set](../development/golden-fits.llms.md#an-intentional-change)).
+
+2.  Tag `main` with `vX.Y.Z` (e.g. `v0.3.0`). `release.yml` builds the GitHub release and generates notes.
+
+3.  Point users at the **tagged release**, not an arbitrary `main` commit.
+
+4.  For an R-side release, ensure `Cargo.lock` pins the intended ferx-core commit (see below) so the build is reproducible.
+
+5.  Publish the crates to crates.io from a **clean checkout of the tag** (an untracked file in the tree would otherwise block or leak into the upload):
+
+    ``` bash
+    git worktree add --detach ../ferx-publish vX.Y.Z
+    cd ../ferx-publish
+    cargo publish --workspace --exclude docs-lint --dry-run   # then without --dry-run
+    ```
+
+    Cargo publishes `ferx-core` → `ferx-tools` → `ferx-cli` in dependency order. A published version can be yanked but never replaced, so check the dry-run’s file list (`cargo package -p <crate> --list`) first.
+
+**Versioning.** Both repos follow **semantic versioning** (`MAJOR.MINOR.PATCH`). A breaking change to the `.ferx` format, the public Rust API, or sdtab / `FitResult` fields bumps MAJOR (pre-1.0, bump MINOR); a backward-compatible feature bumps MINOR; a fix bumps PATCH. The PR template’s *Breaking changes* section is what flags that a MAJOR/MINOR bump is due.
+
+**Changelog.** ferx-core keeps a hand-curated `CHANGELOG.md` (Keep a Changelog format), assembled from **fragments**: a user-facing PR adds one file, `changelog.d/<N>.<category>.md`, holding one bullet, instead of editing `CHANGELOG.md` — `AGENTS.md` carries the rule and `changelog.d/README.md` the format. Appending to a shared `[Unreleased]` section made every concurrent PR conflict with whichever merged first; separate files cannot (#1545). A PR that changes `src/` or a member crate’s source without a fragment fails the `Changelog fragment` check unless it carries the `no-changelog` label; `tools/changelog.sh preview` shows what the next release will list. ferx-r keeps the equivalent `NEWS.md`, so a cross-repo change may touch both. `release.yml` additionally auto-generates GitHub release notes from merged PRs, so keep PR titles in `type(scope): …` form. User-facing breaking changes also carry **migration notes** (PR template).
+
+**Distribution.** Releases are **GitHub releases** built by `release.yml` on each `vX.Y.Z` tag. Since `0.4.0`, `ferx-core`, `ferx-tools` and `ferx-cli` are also published to **crates.io** (step 5 above); `docs-lint` is `publish = false`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g. `remotes::install_github`). If we later publish to a CRAN-style channel, add that step here.
+
+------------------------------------------------------------------------
+
+## 10. Cross-repo synchronization
+
+The two repos are coupled, and keeping them in sync is a first-class part of the lifecycle — **a PR is not “done” until both sides agree.**
+
+**Local builds (automatic).** ferx-r’s `src/rust/.cargo/config.toml` carries a `[patch]` that swaps in `../../../ferx-core` when this checkout exists, so **local** R builds pick up ferx-core changes with no Cargo edits. Verify a ferx-core change by rebuilding the R package:
+
+``` bash
+cargo build --release                       # ferx-core
+cd ../ferx-r && R CMD INSTALL .
+```
+
+> **Never commit a `Cargo.toml` that flips the ferx-core dep to a path dependency.** ferx-r’s `src/rust/Cargo.toml` pins ferx-core as a git dep on `main`; the `[patch]` already handles the local swap. A committed path dep breaks reviewers and CI, which build against GitHub `main`.
+
+**ferx-r CI (manual bump required).** CI does **not** get the change automatically — it builds from the ferx-core commit pinned in `ferx-r/src/rust/Cargo.lock`. A ferx-r PR that needs a new ferx-core commit (e.g. a newly-`pub` API) must bump that lock with:
+
+``` bash
+ferx-r/tools/update-ferx-core-lock.sh        # never a bare `cargo update`
+```
+
+A bare `cargo update` unpins the patch and CI fails with `error[E0603]: ... is private`.
+
+**Checklist when changing a `pub` API or `FitResult`/sdtab field**
+
+Regenerate the public-API baseline in the same PR (`tools/update-public-api.sh`) and state which caller needs each added item — the `Public API baseline` job fails until you do. See [§8.7](#the-public-api-gate).
+
+Open the matching ferx-r PR and record it in the PR cross-repo table.
+
+Bump `Cargo.lock` in ferx-r via `update-ferx-core-lock.sh`.
+
+Confirm the R package compiles against the new ferx-core.
+
+Update docs on both sides.
+
+Coverage not degraded.
+
+------------------------------------------------------------------------
+
+## 11. Tooling conventions
+
+- **Model:** use **Opus 4.6 or better** for development. **Never Sonnet or Haiku** for code (Sonnet is acceptable only for documentation). *(Newer Opus releases — 4.7, 4.8 — supersede 4.6 under the same rule.)*
+- **Pre-commit hook:** `git config core.hooksPath .githooks` after cloning (blocks commits failing `rustfmt`).
+- **Sensitivity-reachable code:** keep functions on the `Dual2` path (the `*_g<T: PkNum>` closed forms and propagators) differentiable — use `if`/`else` rather than `f64::max`/`min` where it matters; see “Analytic Sensitivities” in `AGENTS.md`.
+
+------------------------------------------------------------------------
+
+## 12. Definition of done
+
+A change is done only when **all** of the following hold:
+
+Implements the issue’s stated intent; design choices discussed where open.
+
+Tests added at the correct tier; whole fast suite still \< 10 min.
+
+NONMEM comparison included for any numerical behaviour.
+
+CI green: `check`, `test`, `survival`, `clippy`, `fmt`, `public-api`; coverage not degraded.
+
+AI review run (and human review for large/numerical/DSL/design PRs).
+
+Docs updated (`docs/**`, examples) for any user-visible change.
+
+ferx-core ↔︎ ferx-r in sync (R package compiles; `Cargo.lock` bumped if needed).
+
+R-side (if touched): `man/` regenerated & committed, `R/*.R` pure ASCII, the package still installs with a stock `cargo build`.
+
+Deferred/remaining work logged as new Issues.
+
+Manually tested on an example fit (ideally real / novel data).
+
+------------------------------------------------------------------------
+
+## 13. Maintenance & support
+
+Work doesn’t stop at a release — most of an estimation engine’s life is bug reports, parity questions, and follow-up fixes.
+
+**Bug triage.** User-reported problems land as GitHub Issues (see [Contributing](../development/contributing.llms.md)) and are labelled and prioritized in the Project view. Reproduce first; a confirmed bug gets a **failing regression test before the fix** (see [§8](#cicd-and-quality-gates)). Correctness bugs in the core numerics outrank cosmetic issues.
+
+**Patch / hotfix releases.** Trunk-based keeps `main` as the newest code, which is the easy case: an urgent fix branches off `main`, merges, and ships as a **PATCH tag** (`vX.Y.Z+1`). If `main` already carries unreleased work that shouldn’t go out yet, cherry-pick the fix onto the **latest release tag** on a short-lived `release/vX.Y` branch and tag the patch from there — this is the explicit answer to trunk-based’s “`main` isn’t always release-stable” trade-off ([§5](#git-workflow)). A cross-repo fix must keep ferx-core ↔︎ ferx-r in sync ([§10](#cross-repo-synchronization)).
+
+**Deprecation & breaking changes.** Avoid silent breaks. A breaking change to the `.ferx` format, the public API, or sdtab / `FitResult` fields must be flagged in the PR template’s *Breaking changes* section, carry **migration notes**, bump the version ([§9](#releases)), and be announced in the release notes / `NEWS.md`. Where practical, **deprecate with a warning for one release** before removing.
+
+**Supported versions & support channel.** We support the **latest release** and encourage users to upgrade; old release lines aren’t maintained unless a security fix demands it. User-facing support is via **GitHub Issues**; internal coordination via Google Chat ([§3](#communication)).
+
+------------------------------------------------------------------------
+
+## 14. Security & dependencies
+
+FeRx is a numerical library, not a network service, so its attack surface is small — but it ships native code (FFI via extendr) and a tree of crate / R dependencies, all of which need hygiene. We aim for a lightweight **DevSecOps** posture: push these checks into CI rather than bolt them on later.
+
+**Dependency hygiene.** Keep dependencies current and watch for advisories:
+
+- Run **`cargo audit`** (RUSTSEC advisory DB) over the Rust tree — wired into CI as `.github/workflows/audit.yml` (on dependency-file changes, weekly, and on demand).
+- **Dependabot** (`.github/dependabot.yml`) opens weekly `cargo` and `github-actions` update PRs for ferx-core. *(ferx-r: still to add.)*
+- Pin the nightly toolchain (`rust-toolchain.toml`) and bump it deliberately; a toolchain roll should not silently change numerical behaviour ([§8](#cicd-and-quality-gates)).
+
+**Native / unsafe code.** Review any `unsafe` and the **extendr FFI boundary** (`src/rust/src/lib.rs` in ferx-r) with extra care — a memory-safety bug there can crash the host R session. Prefer safe abstractions; justify any `unsafe` in the PR.
+
+**Vulnerability reporting.** Report suspected vulnerabilities **privately**, not in a public Issue — ferx-core’s [`SECURITY.md`](https://github.com/FeRx-NLME/ferx-core/security/policy) documents the GitHub private-advisory flow. *(ferx-r: `SECURITY.md` still to add.)*
+
+**Security-sensitive changes.** For changes that parse untrusted input, do file I/O, or touch the FFI boundary, run the **`/security-review`** skill (or request a focused human review) before merge.

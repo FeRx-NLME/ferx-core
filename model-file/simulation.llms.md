@@ -1,0 +1,149 @@
+# Simulation
+
+> **Maturity: stable** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The optional `[simulation]` block defines a virtual clinical trial design for generating simulated data. This is useful for model validation and testing.
+
+## Syntax
+
+    [simulation]
+      n_subjects = N
+      dose_amt   = AMOUNT
+      dose_cmt   = COMPARTMENT
+      seed       = SEED
+      times      = [t1, t2, t3, ...]
+      horizon    = T          # TTE only — administrative censoring time
+      covariate NAME = VALUE  # or = [v1, v2, ...], one per subject
+
+| Key | Aliases | Description |
+|----|----|----|
+| `n_subjects` | `subjects` | Number of virtual subjects to simulate |
+| `dose_amt` | `dose` | Dose amount administered to each subject |
+| `dose_cmt` | `cmt` | Dosing compartment (1-indexed) |
+| `seed` |  | Random seed for reproducible simulations |
+| `times` |  | Continuous observation time points (Gaussian endpoints) |
+| `horizon` |  | Administrative censoring time for TTE endpoints (finite, `> 0`) |
+| `covariate NAME` |  | Value of covariate `NAME` for the simulated subjects — a scalar, or one value per subject (see [Covariates in simulation](#covariates-in-simulation)) |
+
+A block must define **at least one of `times` or `horizon`**, matched to the model’s endpoints:
+
+- a model with a **continuous** (residual-error) endpoint **requires `times`**;
+- a model with a [**time-to-event** endpoint](../estimation/tte.llms.md) **requires `horizon`** (see [TTE simulation](#tte-simulation) below);
+- a **joint PK + TTE** model requires **both**.
+
+Supplying only `horizon` for a model that has a continuous endpoint is an error (it would otherwise simulate zero continuous observations), as is supplying only `times` for a TTE model.
+
+An **unknown or malformed key in `[simulation]` is a parse error** (not silently ignored), so a typo such as `n_subject`, or a line missing its `=` such as `n_subjects 6`, is reported rather than falling back to the default. A `horizon` that is not finite and strictly positive is likewise rejected.
+
+## Example
+
+    [simulation]
+      n_subjects = 100
+      dose_amt   = 100
+      dose_cmt   = 1
+      seed       = 12345
+      times      = [0.5, 1, 2, 4, 8, 12, 24]
+
+This simulates 100 subjects, each receiving a dose of 100 units into compartment 1, with observations at 0.5, 1, 2, 4, 8, 12, and 24 hours.
+
+## Usage
+
+Run a simulation-estimation study from the CLI:
+
+``` bash
+ferx model.ferx --simulate
+```
+
+This will: 1. Parse the model and `[simulation]` block 2. Generate simulated data using the model’s default parameters and random effects 3. Fit the model to the simulated data 4. Report parameter estimates and diagnostics
+
+## Simulation Process
+
+1.  For each subject, random effects are sampled from $\eta_i \sim N(0, \Omega)$. For IOV (`kappa`) models an independent occasion random effect $\kappa_{i,o} \sim N(0, \Omega_{\text{IOV}})$ is **also** drawn for each occasion $o$ (grouped by the `iov_column`, or by the occasions an `iov_occasion = dose | time(...)` rule derives — see [IOV: Simulation](../model-file/iov.llms.md#simulation)), so the simulated data reproduces the between-occasion variability the model parameterizes — matching NONMEM `$SIM`. The post-fit NPDE/NPD diagnostics are a separate code path that draws its own per-occasion kappas the same way; see [fit options](../model-file/fit-options.llms.md#simulation-based-diagnostics-npde-npd).
+2.  Individual parameters are computed using the `[individual_parameters]` equations
+3.  Predictions are generated using the structural model
+4.  Residual error is added: $DV = IPRED + \epsilon$, where $\epsilon \sim N(0, V)$
+5.  Observations below 0.001 are clipped to 0.001
+
+### IOV validation against NONMEM `$SIM`
+
+The occasion-`kappa` draw is anchored to NONMEM `$SIMULATION`. On a shared 300-subject × 3-occasion design (1-cpt IV bolus, IOV on `V`, `EVID=4` reset + bolus at the start of each occasion, one observation at `t=0` so `IPRED = AMT/V` exactly), the within-subject between-occasion variance of `log(IPRED)` is an unbiased estimate of $\Omega_{\text{IOV}}$:
+
+| Source                        | between-occasion Var(log IPRED) |
+|-------------------------------|--------------------------------:|
+| Truth ($\Omega_{\text{IOV}}$) |                         0.04000 |
+| NONMEM 7.6.0 `$SIMULATION`    |                         0.04151 |
+| ferx `simulate()` (df 12000)  |                         0.03939 |
+
+All three agree within Monte-Carlo error; the previous behaviour (kappa held at zero) collapsed the ferx figure to ~0. A higher-resolution 100-replicate run (df 60000) tightens the ferx estimate to 0.03988 (0.5 SE from truth), ruling out systematic under-dispersion. The 0.03939 figure in the table is pinned by `tests/simulate_iov_kappa.rs::simulate_iov_recovers_omega_iov_variance`.
+
+A second anchor pins that `[scaling]` is applied on the **occasion-less** IOV path — an IOV model simulated on data read without an `iov_column`, where the occasion `kappa` collapses to zero. On the same 1-cpt IV design with `obs_scale = 1000`, $IPRED = (AMT/V)/1000$, so $\text{mean}(\log IPRED) = \log(AMT/TVV/1000) = -4.60517$ and $\text{Var}(\log IPRED) = \omega^2_V = 0.04$ (BSV only — no occasion component):
+
+| Source                     | mean(log IPRED) | Var(log IPRED) |
+|----------------------------|----------------:|---------------:|
+| Analytic (scaling applied) |        −4.60517 |        0.04000 |
+| NONMEM 7.6.0 `$SIMULATION` |        −4.60873 |        0.03965 |
+| ferx `simulate()`          |        −4.60378 |        0.04138 |
+
+ferx and NONMEM agree to ~0.005 on the scaled level. Before the fix, `simulate()` dropped the scale factor on the empty-occasion path, inflating the mean by $\log(1000) \approx 6.9$. Pinned by `tests/simulate_iov_kappa.rs::simulate_iov_scaling_matches_nonmem_occasionless`.
+
+## TTE simulation
+
+For a [time-to-event model](../estimation/tte.llms.md) there are no continuous observations to schedule; instead each synthetic subject is followed until an event occurs or until the **administrative `horizon`**, at which point an event-free subject is right-censored. `--simulate` therefore generates, for each subject, **one right-censored TTE row per event (cause) compartment**, then draws the outcome:
+
+- a single `[event_model]` yields one row per subject — an event before the horizon, or right-censoring at the horizon;
+- [competing risks](../estimation/tte.llms.md#competing-risks-cause-specific-hazards) (several `[event_model]` blocks on distinct compartments) yield one row per cause: the earliest latent event is observed and the remaining causes are right-censored at that same time, or — if no cause fires before the horizon — every cause is right-censored at the horizon.
+
+&nbsp;
+
+    [simulation]
+      n_subjects = 200
+      horizon    = 14     # follow each subject to t = 14, censoring survivors there
+      seed       = 12345
+
+Because a TTE design has no continuous `times`, the `horizon` key is **required** when the model has a TTE endpoint; omitting it is a parse error. See `examples/tte_competing_risks.ferx`.
+
+### Decoupled horizon and VPC
+
+The `horizon` is an administrative censoring time **decoupled from the observed event times**. This matters when re-simulating an *existing* event-bearing dataset for a visual predictive check (VPC): without an explicit horizon a record that already carries an event imposes no censoring window (it would re-draw unbounded), which biases the simulated event-time distribution. Supplying `horizon` overrides each record’s per-record window so every simulated cause censors at the planned study end. The same control is available on the library API as `SimulateOptions { horizon, .. }`.
+
+## Covariates in simulation
+
+A `covariate` statement gives the simulated subjects a covariate value. Write a scalar to use the same value for every subject, or a list with one value per subject:
+
+    [simulation]
+      n_subjects = 3
+      times      = [1, 2, 4, 8]
+      covariate WT   = 70                # every subject weighs 70 kg
+      covariate NARM = [400, 200, 50]    # one arm size per subject
+
+A list must have exactly `n_subjects` entries — a short one is a parse error, not a silently recycled or zero-filled tail. The keys are order-independent, so the `covariate` line may precede the `n_subjects` it is checked against. When the model has a `[covariates]` block, that block is authoritative: a name it does not declare is rejected here too.
+
+Values are constant per subject. Time-varying covariates are not expressible in a `[simulation]` design; read a dataset with `--data` for those. Covariates are not randomised — each subject gets exactly the value the design states.
+
+### A referenced covariate must be supplied
+
+If the model references a covariate that the `[simulation]` block does not supply, simulation is refused and the message names the covariate and the fix. There is no default, and that is deliberate.
+
+This matters most for the two `weight = <expr>` modifiers, both of which read a data column:
+
+- `kappa K ~ γ² weight = NARM` ([IOV](../model-file/iov.llms.md)) — an arm-level random effect that scales with the number of subjects behind the arm, `κ ~ N(0, γ²/N)`;
+- `DV ~ additive(S) weight = WPSE` ([error model](../model-file/error-model.llms.md)) — inverse-variance weighting for a trial-level mean with a known standard error.
+
+`fit()` always has a row to read those from: the arm exists, and its size and its reported standard error are columns in the dataset. A simulated trial frequently does not — the point of simulating one is to invent arms that are *not* in the data (“what would a 300-subject arm of this design look like?”), and an arm that does not exist yet has no row.
+
+So the arm sizes of a simulated trial are part of the design being evaluated, and stating them is the question, not a burden:
+
+    [parameters]
+      kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM
+
+    [covariates]
+      NARM continuous
+
+    [simulation]
+      n_subjects = 3
+      times      = [1, 2, 4, 8]
+      covariate NARM = [400, 200, 50]
+
+Falling back to a typical value from the fitted data would answer a different question than the one asked, and either silent default is worse than an error: a weight read as `1` gives a simulated arm the variability of a *single-subject* arm, and one read as `0` gives it none at all — `κ/√0` evaluates to zero rather than blowing up, and a zeroed residual weight makes the simulated observation equal its own prediction. Both produce plausible-looking plots.
+
+If you do want the fitted data’s own weights, simulate against that dataset (`--data`, or pass the fitted `Population` to `simulate()`) rather than writing a synthetic design — then the weights come from the rows they were fitted from.

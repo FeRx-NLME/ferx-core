@@ -1,0 +1,205 @@
+# Data Selection
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+The optional `[data_selection]` block lets you exclude records from the dataset at read time without modifying the CSV file. It is the ferx equivalent of NONMEM’s `$DATA IGNORE=` / `$DATA ACCEPT=`.
+
+## Syntax
+
+    [data_selection]
+      ignore = <expression>
+      accept = <expression>
+      ignore_subjects = [<id>, ...]
+
+All three keys are optional and may be repeated. Missing the block entirely means “use all records”.
+
+------------------------------------------------------------------------
+
+## `ignore`
+
+A record is **excluded** when the expression is true.
+
+    [data_selection]
+      ignore = DV < 0.001
+      ignore = EVID != 0
+
+Multiple `ignore` lines are independent: a record is excluded when **any one** of them matches. That means each line is a separate reason to drop the record; the lines do not combine with OR into a single expression.
+
+Within a single line you can join sub-conditions with `&&` (all must hold):
+
+    [data_selection]
+      ignore = EVID == 0 && DV < 0.001
+
+Use `ignore` when you want to flag specific outlier values or dose rows with no matching observation.
+
+------------------------------------------------------------------------
+
+## `accept`
+
+A record is **kept** only when the expression is true; it is excluded otherwise.
+
+    [data_selection]
+      accept = BW >= 30 && BW < 48
+
+Multiple `accept` lines are independent; a record is excluded when **any one** accept condition fails.
+
+Use `accept` when it is easier to state what the valid range is rather than listing each invalid condition.
+
+------------------------------------------------------------------------
+
+## `ignore_subjects`
+
+Exclude all records for one or more subjects, given by their ID values:
+
+    [data_selection]
+      ignore_subjects = [3, 17]
+
+Single-subject shorthand (no brackets):
+
+    [data_selection]
+      ignore_subjects = 3
+
+Subject IDs are matched as strings (the same way they appear in the ID column of the CSV). An entirely excluded subject does not appear in any output.
+
+------------------------------------------------------------------------
+
+## Supported columns
+
+| Column | Type | Notes |
+|----|----|----|
+| `ID` | string equality / inequality | `ID == "3"` or `ID == 3` |
+| `TIME` | numeric |  |
+| `DV` | numeric |  |
+| `EVID` | numeric (0/1/2/3/4) |  |
+| `AMT` | numeric |  |
+| `CMT` | numeric | compares the compartment ferx **resolved**, not the raw cell — see the note below |
+| `RATE` | numeric |  |
+| `MDV` | numeric |  |
+| `CENS` | numeric |  |
+| `II` | numeric |  |
+| `SS` | numeric |  |
+| any covariate column | numeric, or string via `==`/`!=` | case-insensitive (`BW`, `bw`, `Bw` all match); a non-numeric label column (e.g. NONMEM’s comment flag `C`) is compared as a raw string — see [Comment-flag column](#comment-flag-column-ignorec) |
+
+Column names in expressions are case-insensitive.
+
+### Missing and unreadable cells
+
+A record whose `DV`, `AMT`, `RATE` or `II` is **missing** (`.`, blank, `NA`) never matches a comparison on that column. For example, `ignore = DV < 0.001` does **not** exclude dose rows, whose `DV` is `.`; only observation rows with a real `DV` below the threshold are dropped. (You can still write `ignore = EVID == 0 && DV < 0.001` to be explicit.)
+
+`TIME`, `EVID`, `MDV`, `SS` and `CENS` are different: a missing cell reads as their default, `0`, before the filter sees it — so `ignore = CENS == 0` **does** match a record whose `CENS` is `.`, exactly as it matches one whose `CENS` is `0`.
+
+A cell that is present but **not a number** (`abc`, or `1.5` in a whole-number column) is not read as anything. A rule whose outcome on that record rests on that column — whether it would remove the record or keep it — is an error naming the rule, since it would otherwise decide the record on a value the dataset does not hold ([\#1501](https://github.com/FeRx-NLME/ferx-core/issues/1501)). A rule’s outcome rests on the column when the rule reads it and every other `&&` term holds: `ignore = EVID == 2 && RATE == 0` on an observation is decided by `EVID`, whatever its `RATE` cell says. A rule on another column may still remove the record, and then the cell is never read, as with NONMEM’s `IGNORE`; see [A cell that is not a number](../data-format.llms.md#a-cell-that-is-not-a-number).
+
+**`CMT` is the exception to both rules**, because it is the one column with a default. A missing (`.`/blank/`NA`) or unreadable cell — and an absent `CMT` column altogether — resolves to compartment **1** before the filter ever sees the record. The guessed compartment can then go wrong in either direction:
+
+- a clause **stops** matching, and a row you meant to drop is kept — `ignore = CMT == 2` on a cell that should have read `2`;
+- a clause **starts** matching, and a row you meant to keep is deleted — `ignore = CMT == 1` on a cell that should have read something else.
+
+Measured on a one-compartment model with a single observation cell spelled `2` against `x`, nothing else changed: under `ignore = CMT == 2`, 3 records scored at an objective of −5.7650 against 4 records at −5.2516; under `ignore = CMT == 1 && TIME == 4`, the same two numbers the other way round.
+
+Since ferx 0.4.0 a `[data_selection]` clause that compares `CMT` therefore makes the dataset’s defaulted compartments a reported finding — [`W_CMT_DEFAULTED`](../file-formats/check-report.llms.md#dose-records) — the same warning a model whose dose compartment or per-CMT readout depends on `CMT` already gets. Rows the filter **removed** on the strength of a guessed compartment are counted and named separately in that message, since they are not in the fit at all: writing the compartment out would give you back data rather than move it. A clause on any other column stays silent, even when a `CMT` clause sits beside it in the same block — the count is keyed on the rule that actually excluded the record. Write the compartment explicitly in every row you intend to filter on.
+
+------------------------------------------------------------------------
+
+## Evaluation order
+
+For each record, the checks run in this order:
+
+1.  `ignore_subjects` — if the record’s ID is in the list, exclude immediately.
+2.  `ignore` clauses — if **any** clause matches, exclude.
+3.  `accept` clauses — if **any** clause does **not** match, exclude.
+
+A record must pass all three stages to be included.
+
+------------------------------------------------------------------------
+
+## Exclusion summary
+
+After reading the data, ferx reports what was dropped:
+
+    --- Data Selection ---
+      Records read: 420  Obs excluded: 12  Doses excluded: 0  Other excluded: 0
+      Fired ignore conditions:
+        * ignore: DV < 0.001
+
+The same information appears in the `exclusions:` block of the YAML output file (`*-fit.yaml`):
+
+``` yaml
+exclusions:
+  n_records_total: 420
+  n_obs_excluded: 12
+  n_dose_excluded: 0
+  n_other_excluded: 0
+  fired_ignore:
+    - "ignore: DV < 0.001"
+```
+
+`Other excluded` (`n_other_excluded`) counts excluded records that are neither a scored observation nor a dose — EVID 2 (other event), EVID 3 (reset), and missing-DV observation rows (EVID 0 with MDV 1). It also counts a record whose type ferx could not read — an `EVID`, `MDV` or (with no `EVID` column) `AMT` cell that is not a number — when a rule that does not read that cell removed it: such a record is not filed as a dose or an observation on the strength of the reader’s fallback for the cell. The three counts together account for every excluded record.
+
+Each fired condition is listed once. Because checks short-circuit on the first match (see *Evaluation order*), a record is attributed to the **first** rule that excludes it — so a condition that only ever matches records already removed by an earlier rule will not appear in the fired list.
+
+------------------------------------------------------------------------
+
+## `ferx check` applies the block
+
+`ferx check model.ferx --data data.csv` reads the dataset through these clauses, so every data-dependent finding it reports describes the records a fit of the same two files would score. A model whose `[error_model]` covers only the compartments left after an `ignore` is **valid** to the check, and a warning that names the observed compartments names the ones that survived the filter.
+
+Reader warnings the clauses cause reach the check too, and they arrive in two different shapes:
+
+- Raised while the clauses are **compiled**, against the dataset’s headers: `W_FILTER_COLUMN_ABSENT`, for a condition naming a column the file does not have. It carries its own code in the [check report](../file-formats/check-report.llms.md).
+- Raised while the clauses **run**, per subject: `subject N: all dose records were excluded … but observations remain` and `subject N: all observation records were excluded … but dose records remain`. Both need the filter to have removed something, so neither could appear from a check before the clauses were applied at all. Neither states a code of its own, so both are reported under the generic `W_DATA`; giving them real codes is [\#1495](https://github.com/FeRx-NLME/ferx-core/issues/1495).
+
+What it cannot see is conditions supplied by a **caller** rather than written in the model file: `ferx check` takes no fit options, so conditions passed to `ferx_fit(ignore =, accept =, ignore_ids =)`, carried by a `ferx_apply_selection()` result passed as `data`, or held in a `FitOptions` handed to `fit_from_files`, are invisible to it. Those are merged into the fit’s own read (see *Merging with R call conditions* below) and a check of the file alone is silent about them.
+
+Before [\#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465) the check read the **unfiltered** file, so it could reject a model that fits — reporting an uncovered compartment that a clause deletes, with a non-zero exit code.
+
+------------------------------------------------------------------------
+
+## Limitations
+
+- `||` (OR) within a single expression is not supported. Use multiple lines instead — each line is already an independent “any of these reasons” condition.
+- `AND` / `OR` keywords are not supported; use `&&` within a line.
+- String comparisons (`ID` or a non-numeric label column) are limited to `==` and `!=`. Ordered comparisons (`<`, `<=`, `>`, `>=`) on a string value are rejected at parse time — use `==`/`!=` or `ignore_subjects`.
+- `ADDL` and the occasion / IOV column are **not** filter targets; a condition referencing them is an inert no-op. Filter on the columns in the table above (or expand `ADDL` rows beforehand if you must select on dose number).
+- Covariate values seen by a condition reflect the subject’s full record history (last-observation-carried-forward across all rows), independent of which records the filter removes. This matters only when filtering on a time-varying covariate whose value differs on the rows being excluded.
+- A column name that is not present in the dataset always evaluates to false (never fires). This is surfaced as a `W_FILTER_COLUMN_ABSENT` warning naming the missing column(s), so a typo (e.g. `ignore = Coment`) no longer silently has no effect. (Covariate columns referenced by a condition are read even when a `[covariates]` block does not declare them, so filtering on an undeclared covariate works as expected.)
+- A non-numeric value against a **standard** numeric column (the columns in the table above, e.g. `DV == 0.O01` with a letter O, or `EVID == abc`) is rejected at parse time. Such a comparison could never match, so it is treated as a typo rather than a silent no-op. Unquoted string labels are only meaningful against a covariate/label column (the `IGNORE(C.EQ.C)` case).
+- The covariate table echo (`*-covtab.csv`, written only when a `[covariates]` block is declared) is a faithful echo of the **raw input file** and therefore still lists records that `[data_selection]` excluded from the fit. The fit itself, the residual table (`*-sdtab.csv`), and all `[output]` columns are computed from the filtered data, so they only contain retained records.
+
+------------------------------------------------------------------------
+
+## Merging with R call conditions
+
+When you also supply conditions from R, through the `ignore`, `accept` or `ignore_ids` arguments of `ferx_fit()` or through a `ferx_apply_selection()` result passed as `data`, the model-file conditions and the R-call conditions are **merged** (not replaced). Exact-duplicate expressions are deduplicated automatically; a condition specified in both places is only evaluated once.
+
+See the ferx-r documentation for `ferx_apply_selection()` and `ferx_fit()`.
+
+------------------------------------------------------------------------
+
+## NONMEM equivalent
+
+| NONMEM | ferx |
+|----|----|
+| `$DATA IGNORE=C` | `[data_selection] ignore = C` |
+| `$DATA IGNORE=(C.EQ.C)` | `[data_selection] ignore = C == C` |
+| `$DATA IGNORE=(BW.GT.80)` | `[data_selection] ignore = BW > 80` |
+| `$DATA ACCEPT=(DV.GE.0.001)` | `[data_selection] accept = DV >= 0.001` |
+| `$DATA IGNORE=(ID.EQ.3) IGNORE=(ID.EQ.17)` | `[data_selection] ignore_subjects = [3, 17]` |
+
+ferx uses standard inequality operators (`>`, `>=`, `<`, `<=`, `==`, `!=`) instead of NONMEM’s Fortran-style `.GT.`, `.GE.`, etc.
+
+### Comment-flag column (`IGNORE=C`)
+
+NONMEM commonly drops comment rows with a label column — conventionally named `C` — that holds the literal character `C` on rows to skip and a numeric value (e.g. `0`) on real records. ferx mirrors both spellings:
+
+``` toml
+[data_selection]
+  ignore = C == C    # drop rows whose C column equals the literal "C"
+```
+
+``` toml
+[data_selection]
+  ignore = C         # shorthand: expands to `C == C`
+```
+
+The right-hand side of `==` / `!=` may be an unquoted label (compared as a string against the **raw** cell value), so a non-numeric flag column the numeric covariate machinery would otherwise drop is matched correctly. The bare form `ignore = X` is shorthand for `X == X` — it ignores rows whose `X` column holds the literal text `X`.

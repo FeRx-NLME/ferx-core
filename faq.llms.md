@@ -1,0 +1,437 @@
+# Frequently Asked Questions
+
+## Do I need to use MU-referencing in my model definitions, like in NONMEM / nlmixr2?
+
+**No.** You do not need to write an explicit `MU_i` intermediate variable — ferx detects the same structure automatically from the right-hand side of each `[individual_parameters]` line.
+
+In NONMEM and nlmixr2, MU-referencing is a convention in which each random effect `ETA(i)` is linearly associated with a single `MU_i` term (typically `MU_i = LOG(THETA(i))`), so individual parameters look like:
+
+    MU_1 = LOG(THETA(1))
+    CL   = EXP(MU_1 + ETA(1))
+
+This structure is required by NONMEM’s SAEM implementation, whose conjugate-Gibbs E-step is only valid when the `MU_i → ETA(i)` relationship is strictly linear (typically on a log scale). Deviating from it — for example writing `CL = THETA(1) * EXP(ETA(1))` without going through an intermediate `MU_1` — causes NONMEM SAEM to reject the model or silently produce biased estimates.
+
+### How ferx handles it
+
+In ferx, you simply write the individual-parameter line in the form that makes sense for your model. The parser inspects each line and records which `THETA` acts as the “anchor” for each `ETA`, then uses that information to re-centre the estimation search at every outer iteration. The following patterns are detected automatically:
+
+    CL = TVCL * exp(ETA_CL)              # multiplicative exp — most common
+    CL = exp(log(TVCL) + ETA_CL)         # canonical MU form
+    CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)   # with covariate adjustment
+    CL = TVCL + ETA_CL                   # additive eta (linear shift)
+    F  = inv_logit(LOGIT_F + ETA_F)      # logit-normal, theta on the logit scale
+    F  = inv_logit(logit(TVF) + ETA_F)   # logit-normal, theta on the (0,1) scale
+    F  = 1/(1 + exp(-(LOGIT_F + ETA_F))) # the same, written out by hand
+
+The parser records `ETA_CL → (TVCL, transform)` and at each outer step computes the shift
+
+    mu[i] = log(theta[i])   # for multiplicative/exp patterns
+    mu[i] = theta[i]        # for additive and logit-scale-theta patterns
+
+Detection also sees through a typical value defined on its own line (`TVCL = THETA_CL * (WT/70)^0.75` then `CL = TVCL * exp(ETA_CL)`) and through an explicit NONMEM-style `MU_1 = log(TVCL)` intermediate, as long as that variable is assigned exactly once and is not itself eta-bearing.
+
+The inner optimizer (and the SAEM exploration-phase MH proposal) is then centred on this `mu` shift rather than on `eta = 0`. This matches the convergence behaviour that NONMEM / nlmixr2 get from an explicit `MU_i = LOG(THETA(i))` block, without requiring you to write it.
+
+Patterns that ferx **does not** auto-detect (and therefore falls back to the plain `eta = 0` start) include:
+
+- Parameters with two or more free thetas in the typical value (`CL = TVCL * TVSCALE * exp(ETA_CL)`, `CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`) — no single anchor. FOCE/FOCEI leave these un-centred; SAEM and IMP/IMPMAP record them as a [covariate mu-reference](model-file/individual-parameters.llms.md#sec-covariate-mu-ref) and re-fit all the thetas jointly (#619).
+- Compound eta expressions inside the `exp` (`CL = TVCL * exp(ETA_CL + ETA_OCC)`).
+- Non-standard transforms the parser doesn’t recognise.
+
+Mu-referencing being absent is not an error — it just means that eta for that parameter is initialised to zero at each outer step, same as the pre-automatic behaviour. When a fit runs, ferx records the list of auto-detected mu-referenced ETAs in `FitResult.warnings` (as a line starting with `mu-ref: …`) so you can confirm what the parser picked up.
+
+### Why it matters
+
+Mu-referencing mostly affects convergence speed and robustness, not the final MLE:
+
+- **FOCE / FOCEI**: each outer step re-optimises ETA by BFGS. With a mu-shift, the warm-started BFGS sees a much better starting point when `THETA` moves away from the initial estimate, so fewer inner iterations are needed and pathological steps are less likely.
+- **SAEM**: during the exploration phase, Metropolis–Hastings proposals are centred on `mu_k` instead of on the current chain state. This helps the chain escape the (incorrect) `eta = 0` basin when `TVCL` is still far from the true value. During the convergence phase the proposal reverts to a symmetric random walk so that detailed balance holds.
+
+Because the estimator is MLE in both cases, models that converge without mu-referencing will converge to the same estimates with it — just (usually) in fewer iterations.
+
+### Disabling it
+
+If you want to benchmark against the pre-2026 behaviour, set:
+
+    [fit_options]
+      mu_referencing = false
+
+or, from the Rust API, `FitOptions { mu_referencing: false, .. }`. The default is `true`.
+
+### Porting from NONMEM
+
+If you have a NONMEM model that uses an explicit `MU_1 = LOG(THETA(1))` line, you can either drop the `MU_i` intermediate and write the individual parameter directly, or keep it as-is — ferx detects the mu-reference either way, and the fit is equivalent.
+
+## Can I use `if` / `else` statements like in NONMEM or nlmixr2?
+
+**Yes.** ferx supports two forms of conditional logic in both `[individual_parameters]` and `[odes]` blocks:
+
+    # Block form
+    if (WT > 70) {
+      CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
+    } else if (SEX == 1) {
+      CL = TVCL * 1.2 * exp(ETA_CL)
+    } else {
+      CL = TVCL * exp(ETA_CL)
+    }
+
+    # Inline (ternary) form
+    CL = if (SEX == 1) TVCL * 1.5 else TVCL
+
+Conditions support comparisons (`<`, `<=`, `>`, `>=`, `==`, `!=`) and logical operators (`&&`, `||`, `!`). Either form may be combined with arbitrary arithmetic, including covariate references and other ETAs.
+
+**Compared to NONMEM:** NONMEM uses Fortran-style `IF (cond) THEN ... ELSE ... ENDIF` and Fortran comparison aliases (`.GT.`, `.LE.`, etc.). ferx uses C-style braces and operator symbols. The semantics are otherwise the same — exactly one branch fires per evaluation, the rest are ignored.
+
+**Compared to nlmixr2:** nlmixr2’s `if (cond) { ... } else { ... }` syntax is a near-verbatim match for ferx’s block form. Drop the `<-` assignments in favour of `=` and the model translates directly.
+
+**Caveat:** when a parameter is assigned inside an `if` block, ferx skips mu-reference detection for that parameter (the `(ETA → THETA)` link is no longer unconditional). See [Individual Parameters](model-file/individual-parameters.llms.md#interaction-with-mu-referencing) for the workaround if you need both conditional logic and mu-referencing on the same parameter.
+
+**A note on `==` and `!=`:** these operators do an exact bitwise float comparison. They work as you’d expect for integer-coded covariates (`SEX == 1`, `STUDY != 3`) but are unreliable on continuous values, where floating-point round-off can flip the result. For continuous thresholds prefer a bracketed comparison (`WT >= 70 && WT < 80`) over `WT == 75`.
+
+## Which outer optimizer should I pick?
+
+Leave the default, `optimizer = auto`, in place for most models. It picks per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` (derivative-free quadratic trust-region, robust to noisy FD gradients) when the outer loop has to fall back to finite differences — a model outside the analytic scope, or `gradient = fd`. Models with more than 64 free parameters take `nlopt_lbfgs` regardless, and mixture models take `bobyqa` regardless. A FOCE/FOCEI fit reports the pick as `auto (<resolved>)`; see [Outer Optimizers](estimation/optimizers.llms.md#the-auto-default) for the rules, their exceptions, and the benchmarks behind them. To pin one, set `optimizer = ...` in `[fit_options]`.
+
+Reach for a different optimizer when the default misbehaves:
+
+- **`slsqp`** — gradient-based; faster per iteration on smooth, well-conditioned analytical PK models with many parameters. Can stall above the true minimum on ill-conditioned fits unless paired with `reconverge_gradient_interval = 1` (5–6× cost per gradient).
+- **`trust_region`** — second-order Newton trust-region with the analytic outer gradient and BHHH approximate Hessian. Can be faster near convergence because it uses curvature information; the CG budget defaults to `ceil(sqrt(n_params))` (~5 for standard NLME models), but you can pin it with `steihaug_max_iters` if you have many packed parameters and want more aggressive sub-problem solves.
+- **`nlopt_lbfgs`** — gradient-based L-BFGS; what `auto` already picks when the analytic gradient is available. `lbfgs` and `bfgs` are deprecated aliases for it.
+
+See [Fit Options](model-file/fit-options.llms.md#optimizer-choices) for the full list.
+
+## Does ferx have a `LAPLACIAN` estimation method, like NONMEM?
+
+There is no separate `LAPLACE` / `LAPLACIAN` switch in ferx — and you don’t need one. In NONMEM, `METHOD=COND` (FOCE/FOCEI) and `METHOD=COND LAPLACE` differ only in how the curvature of the individual objective in the random effects (`η`) is formed: FOCE uses a first-order (Gauss–Newton) approximation that drops the second derivative of the prediction, whereas LAPLACE computes the **exact** second derivative of the individual `−2·log L` in `η`. LAPLACE is *required* whenever a subject’s likelihood is not the built-in Gaussian-residual form — i.e. a user-defined likelihood (NONMEM’s `F_FLAG`): categorical, count, and **time-to-event** data.
+
+ferx’s conditional engine is itself a Laplace approximation, and it selects the right curvature per endpoint automatically:
+
+| Endpoint | NONMEM | ferx |
+|----|----|----|
+| Continuous (Gaussian residual error) | FOCE / FOCEI — first-order Hessian | FOCEI — same first-order Laplace form (matches nlmixr2) |
+| Time-to-event (`[event_model]` hazard) | **`LAPLACIAN` required** | **exact second-order η-Hessian — applied automatically** |
+
+So for a survival model you still write `method = focei`; ferx detects the `[event_model]` endpoint and, because there is no Gaussian residual to linearize, computes the true second derivative of the hazard `−log L` with respect to `η` and folds it into the Laplace marginal. That is exactly NONMEM’s LAPLACIAN computation — which is why ferx TTE fits are validated against NONMEM `CONDITIONAL LAPLACIAN INTERACTION` (see [Time-to-event estimation](estimation/tte.llms.md)). It is not a user-selectable option because no alternative is meaningful: a hazard likelihood always uses it.
+
+For continuous data, ferx (like nlmixr2 FOCEI) keeps the first-order Hessian and does **not** offer a full-Laplace-on-Gaussian toggle — the extra curvature term it would add is rarely worth it. When FOCE/Laplace accuracy is genuinely the concern (strong nonlinearity, non-Gaussian `η` posteriors), reach for the importance-sampling (`imp` / `impmap`) or `saem` / `bayes` methods, which *integrate* over `η` rather than approximating around its mode. See [FOCE/FOCEI](estimation/foce.llms.md) and [Fit Options](model-file/fit-options.llms.md).
+
+> **The Laplace approximation has limits either way.** Because Laplace is exact only for Gaussian integrands, frailty variances on *nonlinear* hazard parameters can be over-estimated under FOCEI-Laplace — in ferx **and** in NONMEM. Prefer SAEM/IMP there; the [TTE page](estimation/tte.llms.md) has the cross-tool comparison.
+
+## How do I fit on the log scale, like NONMEM’s `Y = LOG(F) + EPS(1)`?
+
+Use a log-transform-both-sides (LTBS) error model. Two forms are available in the `[error_model]` block, depending on the scale of your `DV` column:
+
+    # DV on the natural scale — engine log-transforms DV and the prediction:
+    log(DV) ~ additive(ADD_LOG)
+
+    # DV already log-transformed in the data (e.g. ported from NONMEM):
+    DV ~ log_additive(ADD_LOG)
+
+Both compare `log(prediction)` to a log-scale observation with **additive** error on the log scale — exactly NONMEM’s `IPRED = LOG(F); Y = IPRED + EPS(1)`. Under LTBS, `IPRED`/`PRED`, `IWRES`/`CWRES`, and simulated `DV` are all reported on the log scale (back-transform with `exp()` for natural-scale values).
+
+**Relationship to proportional error.** For a small residual CV, additive-on-log and proportional error coincide. On the warfarin dataset the two parameterizations agree closely: `examples/warfarin.ferx` (`DV ~ proportional(PROP_ERR)`) fits `PROP_ERR ≈ 0.0106` with `TVCL ≈ 0.133, TVV ≈ 7.69, TVKA ≈ 0.76`, and `examples/warfarin_ltbs.ferx` (`log(DV) ~ additive(ADD_LOG)`) fits `ADD_LOG ≈ 0.0106` with `TVCL ≈ 0.133, TVV ≈ 7.74, TVKA ≈ 0.81` — the same structural parameters and the same residual magnitude. See [Error Model](model-file/error-model.llms.md#log-transform-both-sides-ltbs) for the full reference and restrictions.
+
+## How do I scale predictions to match my data’s units, like NONMEM’s `S1`/`S2`?
+
+Use the `[scaling]` block. The convention is divisive (`pred_scaled = pred_raw / scale`), matching the natural reading of `obs_scale = V/1000`.
+
+    [scaling]
+      obs_scale = 1000          # mg/L → mg/mL
+
+The block also supports expression-form scales (`obs_scale = WT / 70`) and a full Form C readout that replaces the built-in output entirely — on ODE **and** analytical (closed-form) PK models (#650):
+
+    [structural_model]
+      ode(states=[depot, central])   # or: pk one_cpt_iv(cl=CL, v=V)
+
+    [scaling]
+      y = central / V           # central holds the amount; observe as concentration
+
+On an analytical model the readout can express a nonlinear multi-DV output such as a saturable free-vs-total protein-binding correction switched by a per-row covariate, and stays analytic in the FOCEI/FOCE gradient (including non-structural readout parameters like a binding `BMAX`/`KD`):
+
+    [scaling]
+      y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) \
+          else           central / V
+
+For models with multiple observed compartments (parent + metabolite, sum-of-moieties, free vs. total), specify a scale per CMT:
+
+    [scaling]
+      obs_scale[CMT=1] = 1000
+      obs_scale[CMT=2] = 1
+      y[CMT=1] = parent / V
+      y[CMT=2] = metab  / VM
+
+Every observed CMT must have a matching `[CMT=N]` entry — `fit()` errors at startup with the list of missing CMTs.
+
+See [Scaling](model-file/scaling.llms.md) for the full reference, including how this compares to NONMEM’s `S1`/`S2` and nlmixr2’s `cmt(central); f = ...`.
+
+## My DV data is on the log scale (or I want to fit on the log scale). How do I do that?
+
+Use the log-transform-both-sides (LTBS) error model. There are two forms depending on the scale of the `DV` column:
+
+**`DV` is on the natural (concentration) scale** — use `log(DV) ~ additive(SIGMA)`. ferx log-transforms the `DV` column at load time and compares it to `log(prediction)`:
+
+    [parameters]
+      sigma ADD_LOG ~ 0.1     # additive SD on the log scale (≈ CV if small)
+
+    [error_model]
+      log(DV) ~ additive(ADD_LOG)
+
+**`DV` is already log-transformed in the dataset** — use `DV ~ log_additive(SIGMA)`. ferx takes `DV` as-is and only log-transforms the prediction:
+
+    [error_model]
+      DV ~ log_additive(ADD_LOG)
+
+Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with `exp()` for natural-scale values). BLOQ/M3 is supported; multi-endpoint and SDE models are not. See [Error Model](model-file/error-model.llms.md#log-transform-both-sides-ltbs) for full details.
+
+## Which outer optimizer should I use?
+
+**Default (`auto`)** works well for most models: it takes `nlopt_lbfgs` when the exact analytic gradient is available and `bobyqa` — robust on FD-only ODE/PD models, sparse data, and Hill-ridge problems where gradient-based optimizers stall — when it is not. If you’re unsure, start here.
+
+**`slsqp`** is the right pick when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can take many quadratic-interpolation samples to triangulate a high-dimensional surface). Pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
+
+**`trust_region`** shines on high-parameter-count models (many thetas/omegas) or when combined with `inits_from_nca` — the second-order curvature helps when starting values are good. Set `steihaug_max_iters` if you want to pin the CG budget.
+
+**`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness; that polish stage uses the configured `optimizer` (default `auto`).
+
+**Gradient-based (`lbfgs`, `mma`)** are rarely needed; prefer `bobyqa` or `slsqp`. See [FOCE/FOCEI — Optimizer Options](estimation/foce.llms.md#optimizer-options) for a full comparison.
+
+## Fixed-effects-only fits vs NONMEM
+
+You can fit a model with no random effects at all — just omit every `omega` declaration and the corresponding `exp(ETA_…)` terms (see [no omega at all](model-file/parameters.llms.md#no-omega-at-all-fixed-effects-only-naive-pooled-fits)). `sigma` is still required for a continuous endpoint.
+
+**The NONMEM equivalent is `$OMEGA 0 FIX`, not an omitted `$OMEGA`.** This trips people up, so it is worth being precise. If you delete `$OMEGA` from a control stream, NM-TRAN does not give you a fixed-effects population fit — it reports
+
+``` text
+(WARNING  1) NM-TRAN INFERS THAT THE DATA ARE SINGLE-SUBJECT.
+(WARNING 132) SIGMA IS INTEPRETED AS RESIDUAL VARIANCE TO SINGLE SUBJECT ANALYSIS
+```
+
+and switches to a **single-subject** analysis, dropping the `ID` grouping. On a multi-subject dataset whose `TIME` restarts at 0 for each subject, the run then aborts outright:
+
+``` text
+0DATA REC          11: TIME DATA ITEM IS LESS THAN PREVIOUS TIME DATA ITEM
+0RUN TERMINATED BECAUSE OF ERRORS IN DATA RECORDS
+```
+
+Declaring a degenerate `ETA(1)` with its variance fixed at zero keeps NONMEM in population mode with per-subject dose bookkeeping, which is what ferx does at `n_eta = 0`:
+
+``` text
+$PK    CL = THETA(1)*EXP(ETA(1))
+       V  = THETA(2)
+       S1 = V
+$OMEGA 0 FIX
+```
+
+### Anchor
+
+`examples/one_cpt_iv_pooled.ferx` against `data/one_cpt_iv.csv`, versus the control stream above under `$EST METHOD=0 MAXEVAL=9999 SIGDIGITS=4` (`nonmem_anchor/results/zero_omega_pooled.{ctl,lst,ext}`, NONMEM 7.6.0):
+
+| Quantity            | ferx        | NONMEM        | Relative Δ |
+|---------------------|-------------|---------------|------------|
+| OFV                 | −269.637010 | −269.63700440 | 6e-6 (abs) |
+| TVCL                | 4.840820    | 4.84070       | 2.5e-5     |
+| TVV                 | 52.834133   | 52.8324       | 3.3e-5     |
+| SIGMA (variance)    | 0.0166360   | 0.0166323     | 2.2e-4     |
+| SE TVCL             | 0.166312    | 0.166298      | 8e-5       |
+| SE TVV              | 1.760499    | 1.76021       | 1.6e-4     |
+| SE SIGMA (SD scale) | 0.018243    | 0.0182395     | 2e-4       |
+
+Two conventions matter when reproducing this:
+
+- **OFV constant.** ferx’s `ofv` is `Σ IWRES² + Σ log Var`, matching NONMEM’s `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`. NONMEM also prints a *with constant* figure (here −104.228068) that adds `n·log 2π`.
+- **Covariance estimator.** The standard errors above are ferx’s under `covariance_method = rsr`. NONMEM’s `$COVARIANCE` default is the `RSR` sandwich, while ferx’s default is `r` (the inverse Hessian). Comparing ferx’s default against NONMEM’s default on this model gives SEs that differ by roughly a factor of two — that is the convention difference, not a discrepancy. See [`covariance_method`](model-file/fit-options.llms.md).
+
+## How do I fit count data (Poisson / negative binomial), like NONMEM’s `-2LL` count models or nlmixr2’s `dpois`?
+
+Declare a [`[count_model]`](model-file/count.llms.md) block: `type = poisson` or `type = negbin`, the mean as `lambda = …` or `log_lambda = …`, and for the negative binomial the size `r = …` (variance `λ + λ²/r`). There is no `$PRED` log-likelihood to write by hand.
+
+|  | NONMEM | nlmixr2 | ferx |
+|----|----|----|----|
+| Poisson | `Y = -2*(DV*LOG(LAM) - LAM - GAMLN(DV+1))`, `$EST ... -2LL` | `DV ~ dpois(lambda)` | `type = poisson`, `lambda = …` |
+| Negative binomial | a `GAMLN`-based log-PMF in `$PRED` | `DV ~ dnbinomMu(size, mu)` | `type = negbin`, `lambda = …`, `r = size` |
+| Objective | `−2 log L`, `ln Γ(k+1)` included | `−2 log L` | `−2 log L`, `ln Γ(k+1)` included |
+
+The ferx objective equals NONMEM’s `METHOD=COND LAPLACE -2LL` objective at the same estimates (within 2.1e-8 on the committed anchors), and on fixed effects it equals R’s `glm(family = poisson)` / `MASS::glm.nb` deviance-scale `−2 log L`. A dispersion parameterisation `var = μ + αμ²` is `r = 1 / ALPHA`; see [Negative-binomial parameterisation](model-file/count.llms.md#negative-binomial-parameterisation).
+
+## How do I validate a model file without running a full fit?
+
+Use `ferx check`:
+
+``` bash
+ferx check model.ferx                  # parse + structural validation
+ferx check model.ferx --data data.csv  # also run data-dependent checks
+ferx check model.ferx --data data.csv --json
+```
+
+It runs the parser and every validation step that normally fires at the start of a fit — missing blocks, missing covariates, per-CMT scaling / error-model coverage, steady-state and lag-time sanity — then reports the findings and exits, without fitting. This turns a multi-second fit-to-find-a-typo into a sub-second loop.
+
+`--json` emits a structured report (stable `code` per finding, optional block / line / suggestion) that tooling and coding agents can consume directly, rather than parsing prose. The exit code is `0` when no errors are found, `1` when there are errors. See the [check report reference](file-formats/check-report.llms.md) for the JSON schema and the full code table.
+
+## How do I evaluate the OFV at given parameter values?
+
+Put the values in `[parameters]` as the initial estimates and set `maxiter = 0` in `[fit_options]` (NONMEM’s `MAXEVAL=0`; from R, `settings = list(maxiter = 0)`):
+
+    [fit_options]
+      method     = focei
+      maxiter    = 0
+      covariance = false
+
+No outer optimizer is built. What you get back:
+
+- **The objective at those values**, with each subject’s EBEs solved once at them, so the sdtab’s `IPRED` is at those EBEs.
+- **`converged: false`, by design.** Nothing was optimised, so the fit is never marked converged. That does not mean the evaluation failed.
+- **The starts clamped into bounds.** A free parameter that starts outside its bounds is evaluated at the bound: `theta TVE0(30, -20, 20)` is scored at `20`, and a free `omega ~ 0.0` at `exp(-12)` ≈ `6.1e-6`. To evaluate exactly the value you wrote, `FIX` it: `theta TVE0(30, -20, 20) FIX` is scored at `30`. The `theta` case is reported: a `W_THETA_INIT_OUTSIDE_BOUNDS` warning names the declared start and the value scored. The `omega` case is not.
+- **Standard errors only where they mean something.** `covariance = true` (the default) still runs the covariance step, which is what you want at a known optimum. At any other point the curvature is not that of an optimum, so set `covariance = false` there.
+
+The reported OFV follows ferx’s conventions (no `N·log 2π`, natural scale), so compare it with NONMEM’s `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`, or see [OFV conventions across tools](model-file/error-model.llms.md#ofv-conventions). `maxiter` counts objective evaluations rather than outer iterations for some optimizers ([\#1430](https://github.com/FeRx-NLME/ferx-core/issues/1430)), but `0` means evaluation-only for all of them.
+
+## How do I exclude records or subjects, like NONMEM’s `$DATA IGNORE=`?
+
+Use the `[data_selection]` block:
+
+    [data_selection]
+      ignore = DV < 0.001          # drop any obs where DV is below detection
+      ignore_subjects = [3, 17]    # drop subjects 3 and 17 entirely
+
+The `ignore` key works like NONMEM’s `$DATA IGNORE=`: a record is excluded when the expression is true. The `accept` key is the complement: a record is kept only when the expression passes (equivalent to NONMEM’s `$DATA ACCEPT=`).
+
+| NONMEM                                     | ferx                        |
+|--------------------------------------------|-----------------------------|
+| `$DATA IGNORE=(BW.GT.80)`                  | `ignore = BW > 80`          |
+| `$DATA ACCEPT=(DV.GE.0.001)`               | `accept = DV >= 0.001`      |
+| `$DATA IGNORE=(ID.EQ.3) IGNORE=(ID.EQ.17)` | `ignore_subjects = [3, 17]` |
+
+Multiple `ignore` lines mean “exclude if any condition matches”; multiple `accept` lines mean “exclude unless all conditions pass”. Conditions within a single line can be joined with `&&` (both must hold to trigger the rule). `||` within a single expression is not supported — use two separate lines instead.
+
+After the fit, the CLI prints a `--- Data Selection ---` block and the YAML output file includes an `exclusions:` section with record counts and the expressions that fired. See [Data Selection](model-file/data-selection.llms.md) for the full reference.
+
+## What about NONMEM’s coded `RATE` values (`-1`, `-2`)?
+
+NONMEM overloads the `RATE` column. A positive value is a constant infusion rate, but negative values are *codes* that tell NONMEM to take the rate or duration from a `$PK` parameter rather than the data:
+
+| `RATE` | NONMEM meaning | ferx |
+|----|----|----|
+| `0` | Bolus — route set by the dose compartment | supported |
+| `> 0` | Constant-rate infusion, duration = `AMT/RATE` | supported |
+| `-1` | Infusion **rate** modeled — `R1` defined in `$PK` | supported, both engines (#324) |
+| `-2` | Infusion **duration** modeled — `D1` defined in `$PK` | supported, both engines (#324, \#394) |
+
+`RATE = -2` (duration) and `RATE = -1` (rate) are both supported on the analytical `pk(...)` engine and `ode(...)` models. Declare the matching `$PK`-style parameter — `D{cmt}` for `-2` (ferx infuses `AMT` over that duration, rate `AMT / D{cmt}`) or `R{cmt}` for `-1` (ferx infuses at that rate, duration `AMT / R{cmt}`) — evaluated per iteration and occasion, matching NONMEM’s `$PK D{n}` / `R{n}`. A coded `RATE` with no matching parameter is a loud error (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`), never a silent bolus. Both codes are *parameter*-driven; neither reads a separate `DURATION` data column. Any other negative or non-finite `RATE` is rejected — earlier versions silently misread the coded forms as a bolus (#324).
+
+### Which compartments can an analytical model be infused into?
+
+On the six analytical **disposition** models — `one_cpt_iv`, `one_cpt_oral`, `two_cpt_iv`, `two_cpt_oral`, `three_cpt_iv`, `three_cpt_oral` — the closed forms deliver a zero-order input into **any compartment the model has**: the **central** compartment of every model, the **oral depot** (`CMT=1`, a zero-order release followed by first-order `ka` absorption), and the **peripheral** compartment(s) of both the IV and the oral models. A **bolus** likewise targets any compartment those models have.
+
+Two cases are still rejected, both up front, naming the subject and time:
+
+- `CMT=0` on an **infusion** → `E_DOSE_CMT_NOT_INFUSABLE`. `CMT=0` is NONMEM’s *default dose compartment*, which is defined for a bolus (and treated as compartment 1 throughout ferx, including under `SS`) but has no meaning for a zero-order input. Name the target compartment explicitly.
+- A `CMT` past the end of the model’s compartment list, for **either** dose kind → `E_DOSE_CMT_OUT_OF_RANGE` (#375).
+
+`fit()` returns the error; `predict()` / `simulate()` fail with the same message.
+
+The **transit** and **inverse-Gaussian** absorption models are the exception: they are dosed through the depot (`CMT=1`) only, for either dose kind, because the closed form routes every dose through the absorption process regardless of compartment while their ODE twin would bolus it into a disposition compartment — so the two paths would disagree. Use an `ode(...)` model to dose those compartments directly; ODE models address any compartment their `[odes]` block declares, so neither check applies to them.
+
+For bioavailability `F ≠ 1`, ferx reshapes an infusion the NONMEM way (#419): a *rate-defined* infusion (`RATE>0` data and `RATE=-1` → `R{cmt}`) holds the rate and scales the **duration** to `F·AMT/RATE`, while a *duration-defined* infusion (`RATE=-2` → `D{cmt}`) holds the duration and scales the **rate** to `F·AMT/D{cmt}`. Total exposure (`F·AMT`) is identical; only the infusion shape differs between the two modes, and only when `F ≠ 1`. At `F = 1` they coincide.
+
+`RATE=0` denotes a *bolus*, not specifically an *intravenous* dose: the route follows the dose compartment — a bolus into the central compartment is intravenous, while a bolus into a depot compartment with first-order absorption is extravascular (oral).
+
+## Can I model zero-order absorption (zero-order input into the depot)?
+
+Yes — on the analytical engine, with no `ode(...)` block. A `RATE=-2` modeled duration `D1` (or an explicit positive `RATE`) into **compartment 1** of an analytical oral model (`pk one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`) releases the dose into the **depot** at a constant zero-order rate over `D1`, which is then absorbed first-order into central via `KA` — the standard zero-order-into-depot absorption model. This mirrors NONMEM’s `ADVAN2` with a `$PK D1` (the depot is compartment 1 in both). `D2` into the same model is a depot-bypassing infusion straight into central.
+
+This stays on the closed form (it’s a linear system with piecewise-constant forcing) — `ferx` does not silently rewrite it into an ODE. The one limitation: per-compartment amounts in `sdtab` / `[derived]` are not available for these subjects (predictions are exact; a `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning notes it). Use an `ode(...)` model if you need the compartment amounts.
+
+### NONMEM comparison
+
+A `one_cpt_oral` model with `CL=5`, `V=50`, `KA=1`, and a modeled depot duration `D1=5` (so a 100-unit dose is released into the depot at rate 20 over 5 h), versus NONMEM 7.5.1 `ADVAN2 TRANS2` with `$PK D1=THETA(4)` (`MAXEVAL=0`, `eta=0`). Control file and data: `tests/nonmem/oral_depot_d1.ctl` / `.csv`.
+
+| time (h) | ferx `pk one_cpt_oral` | NONMEM `ADVAN2` PRED |
+|---------:|-----------------------:|---------------------:|
+|        1 |                0.14200 |              0.14200 |
+|        2 |                0.42135 |              0.42135 |
+|        3 |                0.72960 |              0.72960 |
+|        5 |                1.30730 |              1.30730 |
+|        8 |                1.27350 |              1.27350 |
+|       12 |                0.86800 |              0.86800 |
+|       18 |                0.47659 |              0.47659 |
+|       24 |                0.26156 |              0.26156 |
+
+ferx matches NONMEM to the 5 significant figures tabulated (the `analytical_oral_depot_modeled_duration_matches_nonmem` regression test asserts this).
+
+## Which record’s covariates govern a lagged dose, like NONMEM’s `$PK` timing?
+
+The record that **terminates** the interval — never the dose row, and never the row before it.
+
+NONMEM evaluates `$PK` at every data record and then lets `ADVAN` propagate *to* that record, so the advance over `(recordᵢ, recordᵢ₊₁]` uses **`recordᵢ₊₁`’s** covariates. A lagged dose arrival at `t + ALAG` is not a data record: it changes the compartment state, but no `$PK` runs there. It therefore lands *inside* whichever record interval contains it, and the whole of that interval — both sides of the arrival — runs on the covariates of the record that ends it.
+
+The same holds for every other event that is not a data row: an infusion’s end, a `zero_order(dur)` window’s cutoff, a per-route absorption onset.
+
+### Worked example
+
+``` text
+TIME   EVID  AMT   WT
+   5      0    .   150     observation
+   6      1  100   150     dose,  ALAG1 = 0.7  ->  arrives at 6.7
+   7      0    .    75     observation
+```
+
+| interval | governed by             | `WT`   |
+|----------|-------------------------|--------|
+| `(5, 6]` | the `t = 6` dose record | 150    |
+| `(6, 7]` | the `t = 7` observation | **75** |
+
+The arrival at 6.7 sits inside `(6, 7]`, so it is propagated at `WT = 75` on **both** sides. The dose row’s `WT = 150` governs the advance *into* `t = 6` and nothing after it — though it still supplies the dose’s own attributes (`F`, `ALAG`, `D`/`R`, and the steady-state equilibration), which are properties of that record rather than of the interval.
+
+> **NOTE:**
+>
+> Before that fix ferx broke the timeline only at the arrival, so the dose row’s snapshot was stretched forward to `6.7` and `(6, 6.7]` ran at `WT = 150`. On the committed anchor this was worth **14.89 OFV** against NONMEM 7.6.0. If you are comparing a fit across that change, expect estimates to move for any model combining a lagtime with time-varying covariates or IOV — re-run rather than diffing.
+
+### A useful invariant
+
+Inserting an extra record inside `[dose row, arrival]` that carries the *same* covariate values as the record already governing the interval must not change any prediction. That is true in NONMEM, and it is now true in ferx — the `a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction` regression test asserts it. If you are ever unsure which convention a tool uses, that null test tells you without needing a reference implementation.
+
+### What if the arrival lands a few ULP before a sample?
+
+It is still *before* the sample, so the sample reads post-dose — the same answer NONMEM gives, and the same answer you get when the gap is an hour.
+
+This is not hypothetical: an estimated or covariate-scaled `ALAG` is a float sum, so an optimizer walking it continuously will land arrivals a handful of ULP away from a sample time. The rule has no tolerance in it at all — it is just the ordering, and it is **one-sided**:
+
+| the arrival is…                            | the sample reads |
+|--------------------------------------------|------------------|
+| **at or before** the sample, by any amount | post-dose        |
+| **after** the sample, by any amount        | pre-dose         |
+
+The one-sidedness is the part worth knowing: an arrival even one ULP *after* a sample has not happened yet at that sample, and never contributes to it.
+
+A `1e-12` tolerance appears only in *how* the first row is evaluated when the gap is tiny. A sample within `1e-12` after the arrival is read from the state just after the arrival’s events (reset, then dose), rather than by integrating the sub-picosecond span to the sample’s own time; the difference is bounded by `|f|·1e-12`, far below any solver tolerance. Beyond that gap the sample is read off the ordinary integration — same answer, arrived at the usual way.
+
+That `1e-12` is an absolute tolerance, so how many representable times it spans depends on where you are on the clock: 563 of them at `t = 8.2 h`, nine at `t = 1000 h`, and past `t ≈ 16384 h` — roughly two years — none but the sample time itself, because one floating-point step is already wider than the tolerance. The rule in the table above does not change there; only the sub-tolerance case stops arising, since a gap that small can no longer be represented.
+
+> **NOTE:**
+>
+> Before that fix an arrival landing within `1e-12` **before** a sample was read *pre*-dose on the objective, on `sdtab`, and on the dense grid that feeds the joint PK-TTE hazard, `[derived]` integrals and `simulate()` — the subject read drug-free at a sample taken after its own dose. On the committed anchor that is 45.38 against NONMEM’s 145.38, a whole 100 mg dose, and it moved the OFV rather than only a diagnostic. The event-driven predictor and the analytical closed forms were always correct. Both signs are anchored on NONMEM 7.6.0 in `nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`.
+
+### What about a steady-state dose with a lagtime?
+
+Same rule, one extra step. `SS = 1` says “assume the patient has already been on this regimen forever”, so the compartments are *loaded* rather than propagated into — and they are loaded at the **dose record**, not at the lagged arrival.
+
+The state at the record time is the periodic solution at phase `II − ALAG`: the previous cycle’s pulse landed at `t + ALAG − II`, so by `t` it has been decaying for `II − ALAG`. From there the ordinary rule takes over — the walk advances to the arrival under the record that terminates that interval — and the arrival applies only the dose’s own pulse.
+
+Two things follow that are easy to get wrong:
+
+- The **equilibration** uses the dose row’s own covariates, because the steady state is a property of that record (like `F` and `ALAG`). The **propagation** from the record to the arrival does not — it follows the interval rule above.
+- Observations falling between the dose row and the lagged arrival read that decaying tail, not zero and not the trough.
+
+> **NOTE:**
+>
+> ferx previously equilibrated at the *arrival*, computing the trough throughout under the dose row’s covariates. Under flat covariates that is the same number — propagating from phase `II − ALAG` for `ALAG` hours returns exactly to the trough — so this only ever showed up when a covariate changed inside the pre-arrival window. On the committed anchor it was worth **7.67 OFV** against NONMEM 7.6.0, from a per-point error of about 2 %. Fits without both ingredients are unaffected.
+>
+> The same change gives the IOV predictor a pre-arrival state, where it previously returned zero for any observation between an `SS` dose’s record and its arrival.
+
+Two edges of the same rule are worth stating, because in both of them “load at the record” and “equilibrate at the arrival” are genuinely different numbers:
+
+- **The previous cycle may still be infusing.** If `ALAG > II − T_inf`, the pulse before the record is recent enough that its infusion has not finished, so the rate keeps flowing *past the dose record* and stops at `record + (T_inf − phase)`. That window belongs to no dose row in the data — it is part of the periodic fiction — and ferx carries it explicitly. NONMEM does the same: on the committed anchor the concentration *rises* off the record and turns over exactly there.
+
+- **`ALAG` may exceed `II`.** There is then no phase `II − ALAG`. ferx clamps it to zero rather than wrapping it, matching NONMEM: the pulse lands on the record itself, so the record carries the steady-state *peak* and decays from there with no intervening pulse before the real arrival. Clamping is also the only choice that is continuous in `ALAG`, which matters whenever the lagtime is estimated — wrapping would step every pre-arrival prediction by a factor `exp(-k·II)` the moment the optimiser walked `ALAG` across the interval.
+
+  The one place ferx deliberately differs from NONMEM is `ALAG ≥ II` on an **infusion**, where NONMEM delivers more drug than the dose specifies; see [Lagtime](model-file/lagtime.llms.md).

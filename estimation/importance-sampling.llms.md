@@ -1,0 +1,349 @@
+# Importance Sampling (IMP)
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+`imp` is, **by default, a Monte-Carlo EM estimator** — the equivalent of NONMEM `$EST METHOD=IMP`. It maximises the importance-sampled marginal likelihood, updating θ/Ω/σ each iteration. Set `imp_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate* the marginal log-likelihood
+
+$$-2 \log L(\theta) \;=\; -2 \sum_i \log p(y_i \mid \theta)
+\;=\; -2 \sum_i \log \int p(y_i \mid \eta, \theta)\, p(\eta \mid \theta)\, d\eta$$
+
+at the **fixed** input parameters without estimating them.
+
+> **⚠️ Behaviour change.** Before this release `imp` only *evaluated* `−2 log L` at fixed parameters (the `imp_eval_only` behaviour). It is now an estimator by default. If you used `method = imp` (or `[focei, imp]`) purely to *score* a fit, add `imp_eval_only = true` to keep the old behaviour.
+
+## Mapping to NONMEM
+
+| ferx | NONMEM |
+|----|----|
+| `method = imp` (default) | `$EST METHOD=IMP` (estimator) |
+| `method = imp` + `imp_eval_only = true` | `$EST METHOD=IMP EONLY=1` (evaluate) |
+| `method = impmap` | `$EST METHOD=IMPMAP` (estimator) |
+
+The IS Monte-Carlo estimator of `p(yᵢ|θ)` is unbiased; the reported `−2 log L` carries a Jensen bias from the `log(·)` transform that vanishes as `K → ∞`. That bias is small only while the proposal covers the posterior, which is why ferx [adapts the proposal](#adaptive-evaluation) before it reports a marginal.
+
+## How the estimator works
+
+IMP is a Monte-Carlo EM (MCEM) loop sharing all of its machinery with [IMPMAP](../estimation/impmap.llms.md) except the **proposal re-centering strategy**:
+
+- On the **first** iteration it finds each subject’s conditional mode and first-order variance via a FOCE inner loop, and centres the importance-sampling proposal there.
+- On **every subsequent** iteration it re-centres the proposal from the *previous* iteration’s importance-sample mean and covariance — it does **not** re-run the inner loop. This is the one-line difference from IMPMAP (which re-derives the mode/variance every iteration) and the source of IMP’s lower per-iteration cost.
+
+Each iteration’s M-step updates θ/Ω/σ from the importance-weighted posterior moments (closed-form Ω and log-mu-referenced θ; a small BOBYQA step for σ and non-mu-ref θ), exactly as in IMPMAP. The reported estimate is the running mean of the parameter vector over the final `imp_averaging` iterations, and `ofv` is a final FOCE Laplace pass for AIC/BIC comparability.
+
+> **Which number matches NONMEM’s reported OFV?** NONMEM `METHOD=IMP` reports the importance-sampling Monte-Carlo **marginal** `−2 log L` (the `.ext`/`.lst` `#OBJV`), *not* a Laplace value. ferx’s `ofv` is a Laplace pass, so it will **not** equal NONMEM’s IMP `#OBJV` on data where the Laplace approximation and the true marginal diverge (sparse / strongly nonlinear). The NONMEM-comparable number is the marginal, evaluated at the final estimates and surfaced on `FitResult.importance_sampling.minus2_log_likelihood` (with its Monte-Carlo SE on `.mc_standard_error`) for **estimating** `imp`/`impmap` runs too — not only the evaluation-only path. If IMPMAP is configured with a Gaussian proposal (`impmap_proposal_df = normal`), it is replaced by a finite-`t` proposal for this final marginal eval, so the heavier tails keep the importance weights bounded. `imp` makes no such substitution: `imp_proposal_df = normal` is used as given.
+
+The console report and the fit YAML label both numbers. In R, the marginal is `fit$importance_sampling$minus2_log_likelihood`. AIC and BIC come from `ofv`, so they differ from NONMEM’s IMP objective in the same way. The console report prints:
+
+    OFV (Laplace):  4326.6000
+    IS marginal -2LL:  4299.6000  (MC SE = 0.7500, K = 1000)
+    AIC:  4340.6000
+    BIC:  4371.2000
+    OFV, AIC and BIC come from a final Laplace pass, not the IS marginal.
+    Compare NONMEM METHOD=IMP objectives with the IS marginal, not OFV.
+
+and the YAML `objective_function` block adds `ofv_type: laplace`, `marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. `ofv` itself keeps its value and key. If the marginal evaluation was skipped, a warning gives the reason and the marginal rows are absent. `ferx summary` labels `ofv` the same way but shows no marginal, because a `.fitrx` file does not store it.
+
+An `imp_eval_only` stage after an estimator leaves that estimator’s objective in `ofv`, so `ofv` gets no Laplace label there, and the marginal is printed beside it all the same. A trailing `agq_eval_only` stage replaces `ofv` with its quadrature marginal, and the label is dropped for the same reason.
+
+### Adaptive sample count
+
+`imp_auto` and `impmap_auto` are on by default, so `imp_samples` and `impmap_samples` are starting counts, and K never goes below them. After each iteration K may rise, up to 10000, while the **per-subject** objective Monte-Carlo SE exceeds 0.05. The SE used is the median of the last five iterations, rescaled to the current K, because a single iteration’s SE follows the few worst-sampled subjects:
+
+$$\frac{\operatorname{SE}(-2 \log L_{IS})}{\sqrt{N}} \;>\; 0.05$$
+
+A rise waits until one of two things is true:
+
+- **The objective has settled.** The means of the last two 5-iteration windows differ by no more than two standard errors of that difference, taken from the total MC SE. Early in a run the proposal lags the parameters, so the SE reflects that lag and says little about what the converged fit needs.
+- **The averaging window is about to start**, so the iterations behind the reported estimate are sampled to the target even on a fit that never settles. The hold covers at least the first half of the run and at most the first three quarters.
+
+Each rise aims for the K the SE asks for, since SE² scales as 1/K, plus 10% headroom, and at most doubles K. When the SE falls below 0.025, K halves.
+
+K also stops rising when samples stop paying for themselves. If SE² scales as 1/K, then SE²·K stays constant, so once it has doubled since the first rise that assumption has failed and following the SE would only walk K to the cap. On `cefepime_jordan` the SE was 0.071 at K = 1000 and 0.083 at K = 6912. If the product falls back, rises resume. A fit that ends noisy after this stop says so in its warnings, and a larger `imp_samples` is unlikely to help it.
+
+A subject whose importance weights are degenerate, with ESS below 2 because one draw carries all the weight or because its sampler failed, adds about 1 to the variance sum whatever K is. One such subject keeps the per-subject SE above 0.05 for any N below 1600, so it could ramp every subject to the cap without improving itself. A degenerate subject still counts at first, since a proposal that only undersamples the posterior recovers as K grows. It is left out of the decision once, over consecutive degenerate iterations, K has risen above the lowest K of that run and the subject is still degenerate; a lowering of K does not count. A failed subject is left out at once. When the set left out changes, the five-iteration SE window is recomputed without them, so they stop driving rises straight away. The fit’s warning names the subjects left out at the final iteration: they need a better proposal (check their EBE and Hessian), not more samples. The reported MC SE still includes them.
+
+The per-subject form keeps the rule from ramping a large dataset purely because it has more subjects, since the total SE grows as √N. NONMEM’s `AUTO` targets the total: `STDOBJ = 1.0` corresponds to 0.05 only near N = 400. With 100 subjects the ferx rule asks for a total SE of 0.5, half of NONMEM’s target, so it can sample far more than NONMEM would on the same model.
+
+A model that stays above the target ramps to the cap and runs there, at about ten times the per-iteration cost of K = 1000. If a run is too slow, set `imp_auto = false` to pin `imp_samples`. The fit then warns if the final per-subject MC SE is above 0.1. The cap and target are fixed.
+
+The final marginal uses the configured `imp_samples` / `impmap_samples`, not the ramped K, so its `K` and MC SE describe that one evaluation. To tighten the MC SE of the reported marginal, raise the starting count.
+
+### Wall-clock limit
+
+`imp_max_time` and `impmap_max_time` cap the MCEM iterations, in seconds. The limit is checked after each iteration, so the iteration in progress finishes. A fit that reaches the limit stops there and keeps its result:
+
+- The estimate is the mean of the averaging iterations reached, or the last iteration’s parameters if the averaging window had not started.
+- `converged` is `false`, and a warning gives the iteration reached. The [settling check](#not-settled) does not run, since the run did not reach its iteration limit.
+- The post-fit work still runs: final EBEs, the covariance step if enabled, and the marginal evaluation. It is not counted against the limit, so set `covariance = false` if the budget is tight.
+
+The limit covers the IMP or IMPMAP stage alone, not earlier stages of a chain such as `[focei, imp]`. Where a fit stops depends on the machine, so a run that reaches the limit is not reproducible from its seed.
+
+### Rich data and cold starts
+
+IMP’s proposal lags one iteration behind the parameters, so the bookkeeping between iterations matters. The closed-form mu-ref step moves each packed θ by the population mean of η, and the posterior of η moves the other way by the same amount. ferx translates each subject’s stored importance draws with it — the samples and their weighted mean, per class under a mixture — so the proposal stays on the posterior while the individual parameters do not change. Each \#619 group step does the same with its own shift. The samples move as well as the moments because a later group step in the same iteration, under `impmap` too, scores them at the already-shifted θ.
+
+Until \#1365 those stored means were left where they were. From a cold start the first step is several posterior SDs, so on iteration 2 every subject went low-ESS and the fit diverged. That collapse was read as IMP’s inherent rich-data weakness, but it was this bookkeeping gap. Measured cold-start runs, as the importance-sampling −2 log L at the last iteration (macOS arm64):
+
+| Model, iterations | before | after | reference |
+|----|----|----|----|
+| `examples/warfarin.ferx`, 50 | 1.4e15, every subject low-ESS | −286.0 | NONMEM `METHOD=IMP` −285.69 |
+| `examples/two_cpt_oral_cov.ferx`, 30 | 4.8e14, every subject low-ESS | −1199.6 | `[focei, imp]` −1199.4 |
+| FREM warfarin fixture (`tests/frem_warfarin.rs`), 3 | +328.8 | −151.6 | 60 iterations reach −220.9; SAEM / IMPMAP −220.7 |
+
+A warm start (`method = [focei, imp]`) still saves iterations. A subject whose posterior is very sharp can still lose overlap after a large step in a parameter the shift does not own (a non-mu-referenced θ, σ, or Ω), and [`impmap`](../estimation/impmap.llms.md), which re-centres on the mode every iteration, is the robust choice when the low-ESS count stays high.
+
+    [fit_options]
+      method        = imp            # estimate by importance-sampling MCEM
+      imp_iterations = 200            # MCEM iterations
+      imp_samples    = 1000           # K, samples per subject per iteration
+      imp_averaging  = 50             # terminal iterations to average
+      imp_proposal_df = 5             # ν, Student-t tail weight (or `normal` → MVN)
+      imp_seed       = 12345
+
+    [fit_options]
+      method = [focei, imp]          # robust on rich data: warm-start IMP from FOCEI
+
+## Evaluation-only mode (`imp_eval_only = true`)
+
+With `imp_eval_only = true`, `imp` does **not** estimate: it evaluates the IS `−2 log L` at the fixed input parameters and reports it on `FitResult.importance_sampling` (handy for scoring imported / fixed parameter sets, or comparing models on a lower-bias likelihood than the Laplace OFV).
+
+### When evaluation-only is useful
+
+The Laplace approximation behind the FOCE/FOCEI OFV assumes each subject’s posterior of η is Gaussian-shaped — fine for **well-sampled** PK (≥ 5–6 obs per subject) but biased for **sparse data**, **strong nonlinearity** (Michaelis–Menten, TMDD, transit absorption), or **categorical/binary PD**. There the FOCE OFV is typically *under*-stated, so naïve AIC/BIC favours over-parameterised models; the IS `−2 log L` is much lower-bias.
+
+    [fit_options]
+      method        = [focei, imp]   # estimate with FOCEI, then score the IS-LL
+      imp_eval_only  = true
+      imp_samples    = 2000
+      imp_proposal_df = 5
+
+    [fit_options]
+      method       = imp             # standalone: IS-LL at the initial parameters
+      imp_eval_only = true
+
+Rules for the **evaluation-only** mode:
+
+- **Standalone is allowed.** `method = imp` + `imp_eval_only` evaluates the IS-LL at the **initial parameters** — deriving the EBEs/Jacobian (the proposal centre/scale) there via a FOCE inner loop. When chained after an estimator (`[focei, imp]`), it uses that stage’s EBEs/Jacobian instead.
+- **Must appear at most once** (true for both modes).
+- **Must be terminal.** `method = [imp, focei]` with `imp_eval_only` is rejected — a following stage would overwrite the parameters and make the IS result meaningless. (The *estimating* `imp` has no such restriction; it may lead or sit mid-chain like any estimator.)
+
+For the estimating `imp`, `FitResult.method` reports `IMP`. For an evaluation-only `imp` after an estimator it reports that estimating stage (e.g. `FOCEI`); standalone evaluation-only reports `IMP`. Either way `FitResult.method_chain` preserves the full chain, and the IS-LL lands on `FitResult.importance_sampling`.
+
+## Adaptive evaluation
+
+Every reported marginal, whether from `imp_eval_only` or at the end of an estimating `imp` or `impmap` stage, first adapts each subject’s proposal. The MCEM iterations themselves are not affected.
+
+- **Pilot passes.** `imp_adapt_passes` (default 5) passes each draw K samples from the current proposal and re-centre it on their weighted mean and covariance, as NONMEM does across `NITER` under `EONLY=1`. A pass with too few effective draws to estimate a covariance (fewer than 2(d + 1) for d sampled random effects) stops there and keeps the last good proposal.
+- **Fresh final draws.** The pilots only choose the proposal, and the reported marginal comes from K new draws, so it stays unbiased.
+- **A prior component.** The final proposal and the pilots keep at least 10% of the prior `N(0, Ω)`, as in the [defensive mixture](#defensive-mixture); a larger `imp_defensive_alpha` is kept. Re-centring cannot reach a second mode, and the prior’s bounded weights can.
+
+Each pass costs one more K draws per subject, so the default evaluation costs 6× the single-proposal one (pembrolizumab, K = 3000: 1.9 s to 12.7 s per evaluation on 6 threads). `imp_adapt_passes = 0` restores the single Laplace proposal with `imp_defensive_alpha` as set. On a FREM Rao-Blackwellised subject the prior component applies but the pilots do not run; its low-dimensional conditional proposal is already well matched.
+
+An evaluation does not use the options that adapt the MCEM iterations. It draws at a proposal scale of 1, so `iscale_min` and `iscale_max` have no effect, and it draws a fixed `imp_samples` in each pass, so `imp_auto` has no effect either. Setting any of the three under `imp_eval_only` draws a warning. An evaluation’s proposal follows `imp_adapt_passes`, `imp_proposal_df` and `imp_defensive_alpha`, and its Monte-Carlo error falls as `imp_samples` rises. In `method = [impmap, imp]` the IMPMAP stage still reads `iscale_*`, so those two draw no warning there.
+
+### Why a proposal built at the mode reads high
+
+On a very sparse subject the posterior of a poorly informed η can run along a long ridge or hold a second mode, and a proposal built from the mode and its curvature never reaches that mass. The missing mass lowers `log p̂`, so the marginal reads **high**. The MC SE comes from the same draws, so it does not show the gap, and it shrinks as slowly as the bias does: on cefepime the ESS of the worst subjects *falls* as K grows, because rare tail draws start to appear.
+
+Measured on cefepime (458 subjects, 702 observations, 3 ETAs, macOS arm64) at NONMEM’s FOCEI estimates. The reference is an independent estimate, drawn from a proposal at the prior scale so that the weights are bounded.
+
+| Evaluator                                       |     K |       −2 log L |
+|-------------------------------------------------|------:|---------------:|
+| Reference (prior-scale proposal)                |   10⁶ | 4297.24 ± 0.11 |
+| ferx, adaptive (default)                        |  1000 | 4297.07 ± 1.34 |
+| ferx, adaptive (default)                        |  3000 | 4297.06 ± 0.50 |
+| ferx, `imp_adapt_passes = 0`                    |  3000 | 4306.54 ± 2.47 |
+| ferx, `imp_adapt_passes = 0`                    | 30000 | 4299.83 ± 3.74 |
+| NONMEM 7.5.1 `EONLY=1 NITER=5`, normal proposal |  3000 | 4301.84 ± 0.94 |
+| NONMEM, same, last pass of one run              | 30000 |         4299.2 |
+| NONMEM, same with `DF=4`, last pass of one run  |  3000 |         4297.2 |
+| NONMEM, same with `DF=4`, last pass of one run  | 30000 |         4297.5 |
+
+The ferx rows are the mean ± SD over six seeds, and the reference and the 3000-sample NONMEM row over three. So on data this sparse ferx reads **below** NONMEM’s default `EONLY=1` run, and NONMEM’s default is the one that is high: give NONMEM a heavy-tailed proposal (`DF=4`) and the two agree. Compare against that, not against the default normal proposal. At a second parameter point on the same model the reference is 4275.0, ferx reads 4275.3 ± 1.6 at K = 1000, and NONMEM’s default reads 4282.7.
+
+On the six other models tested the default stays within 0.4 of NONMEM’s `EONLY=1` at K = 3000 (warfarin, thioguanine, infliximab, vancomycin, propofol, pembrolizumab), and the worst-subject ESS / K rises on all but warfarin (propofol: 0.011 to 0.59).
+
+### When the marginal is still unreliable
+
+If the worst subject ends with fewer than 10 effective draws, the fit adds a warning to `FitResult.warnings`: the marginal tends to read high and the MC SE understates the error. Raise `imp_samples`, and turn adaptation back on if it was off.
+
+## Algorithm
+
+This is the per-subject importance-sampling kernel — the E-step of the estimator and the whole of the evaluation-only mode. The estimating loop simply re-runs this kernel each iteration (re-centring the proposal from the previous iteration’s sample moments) and feeds the weighted moments into the M-step. An [adaptive evaluation](#adaptive-evaluation) runs it once per pilot pass, then once more for the reported marginal.
+
+For each subject *i* with proposal centre η̂ᵢ (the EBE on the first iteration, and at the start of an evaluation) and inner-loop Jacobian Jᵢ = ∂f/∂η at η̂ᵢ:
+
+1.  **Build proposal scale Σᵢ:**
+
+    - Compute Sheiner–Beal posterior Hessian $H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}$ at η̂ᵢ ($R_i$ = diagonal residual variance at the EBE).
+    - Add a small ridge $\lambda I$ for numerical safety (λ = max(10⁻⁶ · trace(H)/d, 10⁻¹⁰)).
+    - Cholesky-factor; on failure fall back to Σᵢ = Ω (broad prior-scale proposal — gives a valid but noisy LL estimate).
+
+2.  **Draw K samples** $\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)$ (multivariate Student-t; a multivariate normal with `imp_proposal_df = normal`). With `imp_defensive_alpha > 0` a fraction of the draws come from the prior (see [Defensive mixture](#defensive-mixture)). An IOV subject samples the stacked (η, κ) vector the same way.
+
+3.  **Compute log importance weights:** $$\log w_{ik} = \log p(y_i \mid \eta_{ik}, \theta)
+                 + \log p(\eta_{ik} \mid \theta)
+                 - \log q(\eta_{ik}).$$
+
+4.  **Subject marginal LL** via log-sum-exp: $$\log \hat p(y_i \mid \theta)
+    \;=\; \operatorname{lse}_k \log w_{ik} - \log K.$$
+
+5.  **Per-subject effective sample size:** $\mathrm{ESS}_i = 1 / \sum_k \tilde w_{ik}^2$ (normalised weights). The result reports the across-subject min and median of ESS/K, plus any subjects below `imp_low_ess_threshold` (default 10%).
+
+6.  **Monte-Carlo standard error.** For a self-normalised IS estimator the asymptotic per-subject variance (Geweke 1989) is $$\operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)
+    \;\approx\; \frac{1}{K}\left(\frac{1}{\mathrm{ESS}_i / K} - 1\right).$$ Aggregating across subjects (LL is a sum of independent per-subject log-marginals) and converting to the `−2 log L` scale, $$\operatorname{SE}(-2 \log L_{IS})
+    \;=\; 2 \sqrt{\sum_i \operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)}.$$ Subjects with degenerate ESS ($\mathrm{ESS}_i / K = 0$ — complete proposal collapse) fall back to a per-subject variance of `1.0`, which produces a *finite* but inflated SE rather than a NaN. A separate warning is emitted on `FitResult.warnings` listing the collapsed subjects; the IS-LL itself remains usable as a point estimate.
+
+7.  **Population −2 log L** = `−2 · Σᵢ log p̂(yᵢ | θ)`, reported on `FitResult.importance_sampling.minus2_log_likelihood` together with `mc_standard_error`.
+
+## Tuning
+
+- **`imp_iterations` / `imp_averaging`** (estimator only) set the number of MCEM iterations and how many terminal iterations are averaged into the reported estimate. Defaults 200 / 50. Under-running shows up as estimates still drifting with the MC noise; raise `imp_iterations` if the trace hasn’t stabilised.
+- **K = `imp_samples`** controls accuracy. The MC SE scales as $1/\sqrt{K}$; halve it by quadrupling K. Default 1000 is fine for a smoke test; bump to 2000–5000 for any reported LL.
+- **ν = `imp_proposal_df`** controls the proposal tails. The default of 5 is robust to mild proposal misspecification (Geweke 1989); raise toward 30+ to recover a near-Gaussian proposal when the posterior is known to be light-tailed. `normal` (or `mvn`) uses a true multivariate-normal proposal, which is the closest match to NONMEM. Its light tails make it the less forgiving choice when the posterior is not close to Gaussian, so watch ESS and the MC SE.
+- **Low-ESS subjects** signal a proposal that doesn’t match the posterior well, which can mean the EBE didn’t converge or the Hessian was near-singular, or that the posterior is genuinely not Gaussian. The marginal then tends to read [high rather than just noisy](#why-a-proposal-built-at-the-mode-reads-high). Investigate by re-running with a tighter `inner_tol` or inspecting the `FitResult.subjects[i]` diagnostics.
+- **`imp_adapt_passes`** sets how many pilot passes adapt the proposal before a marginal is reported. See [Adaptive evaluation](#adaptive-evaluation).
+- **Reproducibility.** When `imp_seed` is unset, the evaluation (an `imp_eval_only` stage, or the marginal reported after a stage) uses `42` and the `imp` estimator’s MCEM iterations use `12345`, so two fits with the same `imp_samples` and `imp_proposal_df` produce identical `−2 log L`. Set it explicitly to vary the RNG stream. Each subject’s stream is a hash of `imp_seed` and its coordinates (the subject index, plus the MCEM iteration for the estimator), so runs under different seeds share no subject stream (before \#3021, seed `s` subject `i` and seed `s+1` subject `i-1` were the same stream, so consecutive seeds were nearly the same run). The full set of `imp_*` defaults is listed in the [`[fit_options]` reference](../model-file/fit-options.llms.md#importance-sampling-imp).
+
+## When the marginal shows a collapse
+
+IMP and IMPMAP run a fixed iteration schedule, so `converged` has no stopping test to report. It rests on the objectives instead, and on the check in [When the objective has not settled](#not-settled). `ofv` is a Laplace pass, which can look sane on a run that has collapsed, so `fit()` also checks the marginal in `importance_sampling.minus2_log_likelihood` and reports `converged: false` in two cases (#2652):
+
+| Warning | Fires when |
+|----|----|
+| `W_NONFINITE_MARGINAL` | The marginal is `NaN`, infinite, or past the divergence cutoffs. This covers an `imp_eval_only` readout too, whatever the stage before it reported. |
+| `W_MCEM_OBJECTIVE_ROSE` | The marginal sits above the lowest objective any iteration reached by more than 10% of that objective’s magnitude, or of the observation count if that is larger. |
+
+An EM iteration should not raise the objective, so the only legitimate gap between the lowest iteration and the final marginal is Monte-Carlo noise. In a seven-model comparison with NONMEM, measured on Linux, the widest gap on a healthy run was 0.13% of that scale. The narrowest on a collapsed run, from before the proposal-covariance fix of \#2650 removed those collapses, was 51%. The baseline is the lowest iteration and not the first because a cold start begins far above the optimum: a collapse can end below where it started and still be nowhere near the optimum.
+
+The rise check needs an estimating IMP / IMPMAP stage and a published marginal. If the marginal pass was skipped, a warning says so and this check does not run. The marginal is computed after the last estimating stage, so a trailing `agq_eval_only` readout replaces `ofv` and leaves both checks in force.
+
+## When the objective has not settled
+
+Every IMP and IMPMAP run stops at its iteration limit, finished or not. So `fit()`, and a direct `run_imp` or `run_impmap` call, check the end of the iteration trace, and report `converged: false` with `W_MCEM_NOT_SETTLED` when it shows the run had not finished (#2686).
+
+The check reads the objective’s *floor*: the lower 10% point of the last 50 iterations. A shorter run uses windows of a third of its length, so it never reads the first third, where a cold start descends. A gap counts when it exceeds both 3.84, one likelihood-ratio step, and 4 Monte-Carlo SEs. Each side brings its own SE, taken as a window’s median, and they combine as independent estimates. That matters under `imp_auto`: an earlier window can have sampled less than the last one, and the final pass does not inherit a ramped-up sample count. Fewer samples also raise the objective, by about SE²/4, so that excess comes off a fall before it is tested.
+
+| What the floor shows | What it means | What to do |
+|----|----|----|
+| It fell from the window before | The run needed more iterations | Raise `imp_iterations` (`impmap_iterations`) |
+| It stayed above the final marginal | The iterations were not sampling the posterior well | Raise `imp_samples` (`impmap_samples`), use a heavy-tailed proposal (`imp_proposal_df`, `impmap_proposal_df`), or chain a FOCE/FOCEI stage first |
+
+The second test needs the marginal, so it does not run if the marginal pass was skipped.
+
+The check reads the floor and not the spread because a failed proposal misses posterior mass, which only ever raises an iteration’s objective. A `normal` proposal makes large upward excursions on runs whose estimates are fine, so a wide trace alone proves nothing.
+
+The bounds were measured on Linux, on the six models of a comparison with NONMEM, at K = 1000 and 200 iterations. On healthy runs the floor fell by at most 1.78, and sat at most 3.86 above the marginal, which is 1.5 Monte-Carlo SEs. The two cold runs that NONMEM’s own evaluator scored short of the optimum read 30.5 (vancomycin, falling) and 42.4 (cefepime, above the marginal). With `imp_auto` on, the same cold runs mostly reach the optimum: eleven of the twelve finished, including three whose K moved inside the windows, and none was demoted. The widest fall was 2.16. The twelfth, cefepime with a `normal` proposal, did not finish in the time allowed.
+
+A run of fewer than 30 iterations is too short to test. It keeps its verdict and gets `W_MCEM_SETTLING_UNTESTED`, which says `converged` then only means the run did not diverge.
+
+A longer run whose trace cannot be read is another matter. If either window has fewer than 10 finite objectives or SEs, those iterations produced no usable likelihood, so the fit is reported `converged: false` with `W_MCEM_NOT_SETTLED`, `reason: unusable_trace`.
+
+## When the M-step leaves a parameter behind
+
+σ, and any θ the closed-form shift does not own, are updated by a BOBYQA solve of the importance-weighted observation likelihood. Two checks read what that solve did (#2718).
+
+`W_MCEM_MSTEP_FROZEN` names a parameter the solve never moved although it should have. The parameter ended the run within 1e-6 of where the solve first took it up, in packed units, and after the last solve a step along it alone, of 0.1 or a quarter of a narrower interval, still lowered −2 log L by more than 3.84, one likelihood-ratio step. The value reported is then a starting value, so the fit is `converged: false`. A parameter that starts near its optimum, sits on a bound with its optimum outside, or barely affects the objective does not trigger this, and nor does one the closed-form shift owns or that is `FIX`. A run stopped by `imp_max_time` is not judged.
+
+The objective cannot show this, because Ω keeps absorbing the misfit and the objective keeps falling, so the settling check above does not see it. To clear the warning, start closer, mu-reference the parameters so the closed-form shift owns them, or chain a FOCE/FOCEI stage first.
+
+`W_MCEM_MSTEP_FAILED` says NLopt failed at least one solve, for a reason other than roundoff, and also reports `converged: false`, whether or not the parameters moved. It points at a solver fault rather than the data, so please report it.
+
+## Defensive mixture
+
+A weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose `V` cancels in the amplitude — can produce a proposal so badly centred that a *single* importance sample carries almost all the weight. That one sample then hijacks the weighted M-step and walks θ to the parameter bounds; the run “diverges” to a finite-but-enormous OFV. (This is issue \#528; the OFV blow-up is now caught by the convergence check, which flags an objective ≥ `1e15` as **not converged** for both IMP/IMPMAP and SAEM.)
+
+The optional **defensive mixture** (`imp_defensive_alpha`, default `0`) hardens the sampler against this. With weight $\alpha \in [0,1)$ the proposal becomes
+
+$$q(\eta) = (1-\alpha)\,q_\text{narrow}(\eta) + \alpha\,q_\text{broad}(\eta),$$
+
+where $q_\text{broad} = \mathcal N(0, \Omega)$ is the prior (for the FREM Rao-Blackwell path it is the *conditional* PK prior $\mathcal N(\mu, P_{pp}^{-1})$). An $\alpha$ fraction of draws come from $q_\text{broad}$, and **every** sample is scored under the full mixture density (the balance heuristic). Because the prior provably covers the conditional posterior, this bounds each importance weight by $p(y\mid\eta)/\alpha$, so no single sample can dominate — keeping the population estimates identifiable even when the narrow proposal is poor.
+
+Practical notes:
+
+- **Opt-in for the MCEM iterations.** There the default `0` reproduces the single-proposal sampler **exactly** (same numbers, same RNG stream), like NONMEM, which has no defensive mixture. Enable it (e.g. `0.1`) only for models that exhibit the runaway above. A reported marginal is different: an [adaptive evaluation](#adaptive-evaluation) always keeps at least $\alpha = 0.1$.
+- **It bounds the weights, not the raw ESS.** A sharp interior likelihood spike can still keep ESS low; the mixture only guarantees no single sample runs away.
+- **Complementary to the ISCALE pilot search, not redundant with it.** During the MCEM iterations, the per-subject ISCALE search (`iscale_min`/`iscale_max`) already rescues *many* collapses by isotropically rebroadening a too-narrow proposal, and with it on the mixture is often unnecessary. But ISCALE applies a single scalar to the whole proposal covariance: it cannot cover a proposal that is badly *centred* or wrong in *shape* (anisotropic). The $\mathcal N(0,\Omega)$ mixture component covers the full prior support regardless of the narrow proposal’s centre or shape, so it remains the guard of last resort when a scalar rescale is not enough. (On the \#528 analytical-`[initial_conditions]` fixture the two overlap — ISCALE alone now prevents the runaway — which is why the regression test pins ISCALE off to isolate the mixture’s distinct contribution; see \#961.)
+- **ESS-floor side effect.** Roughly $\alpha$ of each subject’s samples now come from the broad prior, which raises the per-subject ESS fraction. A genuinely weakly-identified subject that would have been listed under `imp_low_ess_threshold` may no longer trip it — read the low-ESS diagnostic with that in mind when $\alpha > 0$.
+- **Sobol QMC still applies** while the mixture is active (#1965): with `impmap_sobol` / `imp_sobol` on, a dedicated quasi-random coordinate picks each draw’s component, so the broad fraction is stratified (within one draw of αK when K is a power of two) instead of binomial, and both components take their normals from the same Sobol point. Under `imp_sobol` the Student-t proposal is limited to `imp_proposal_df ≤ 1000` (use `normal` beyond that) and a draw to 1000 quasi-random coordinates; both are checked when the fit starts.
+- For an IMPMAP stage the option may also be written `impmap_defensive_alpha` (an alias for the same field).
+
+## SDE / \[diffusion\] models (not supported)
+
+IMP refuses to run on models with a `[diffusion]` block. The EKF process-noise variance that inflates the residual variance for SDE models is not yet threaded through the IS observation-likelihood path, so the marginal would be silently biased. Use FOCE / FOCEI for the Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.
+
+## IOV (inter-occasion variability)
+
+> Both the estimating `imp` and evaluation-only `imp` support IOV. The estimating method samples the same joint (η, κ) vector each iteration and updates Ω_(IOV) in closed form — see [IMPMAP: inter-occasion variability](../estimation/impmap.llms.md#impmap-iov), whose E- and M-steps it shares (#2301).
+
+For models with `kappa` declarations, IMP performs **joint sampling** of both η (between-subject variability) and κ (between-occasion variability). The proposal is built from the full (n_eta + n_kappa × n_occasions) posterior Hessian, and the IS weights include both the η and κ priors.
+
+The result struct flags this via `kappa_treatment = "marginalized"` (YAML) and the CLI prints a notice. The reported `−2 log L` integrates over both η and κ uncertainty, making it directly comparable to NONMEM `$EST METHOD=IMP LAPLACIAN=1` on κ.
+
+## Standard errors on a non-Gaussian model
+
+With a TTE, `[binary_model]` or CTMM endpoint, the covariance step after `imp` differentiates the 7-node quadrature marginal (`method = laplace, n_agq = 7`) rather than the FOCEI objective, whose minimum can sit far from the `imp` estimate on such a model (#1781). See [SAEM: covariance step on a non-Gaussian model](../estimation/saem.llms.md#saem-covariance-non-gaussian) for when it applies, the measured effect, and the warnings it carries.
+
+## Cost
+
+An estimating iteration adds a weighted M-step to the sampling below. That solve runs on the θ and σ the closed-form shift does not own, and its evaluation budget grows with their number.
+
+K × n_subjects predict calls per pass, and an evaluation runs `imp_adapt_passes + 1` passes. For warfarin (32 subjects) with K=2000 and the default 5 pilots this is ≈ 384k predicts — seconds to a minute on a typical laptop. The cost is linear in K and trivially parallel over subjects (uses the same Rayon worker pool as the inner loop).
+
+## Output
+
+In the CLI:
+
+    --- Importance Sampling (marginal log-likelihood) ---
+      -2 log L (IS): 1284.52  (MC SE = 0.41, K = 2000, ν = 5)
+      ESS / K: min = 0.18, median = 0.62
+      Proposal adaptation: up to 5 pilot passes
+      Low-ESS subjects (3): 12=0.18, 27=0.21, 34=0.22
+
+In the fit YAML:
+
+``` yaml
+importance_sampling:
+  minus2_log_likelihood: 1284.524300
+  mc_standard_error: 0.412700
+  n_samples: 2000
+  proposal_df: 5.0000
+  ess_min: 0.1800
+  ess_median: 0.6200
+  adapt_passes: 5
+  kappa_treatment: marginalized  # or not_applicable if no IOV
+  low_ess_subjects:
+    - id: "12"
+      ess_fraction: 0.1800
+    - id: "27"
+      ess_fraction: 0.2100
+    - id: "34"
+      ess_fraction: 0.2200
+```
+
+The Rust `FitResult.importance_sampling` field carries the same data typed as `Option<ImportanceSamplingResult>`.
+
+## NONMEM comparison
+
+ferx’s estimating `imp` is validated against NONMEM 7.5.1 `METHOD=IMP` on the warfarin example (10-subject extract, `data/warfarin.csv`). Both engines are warm-started from a FOCE/FOCEI pass (ferx `method = [focei, imp]`; NONMEM `$EST METHOD=COND INTERACTION` → `$EST METHOD=IMP INTERACTION NITER=100 ISAMPLE=1000 SEED=12345`, control stream `tests/nonmem/warfarin_imp.ctl`).
+
+| Parameter               | NONMEM `METHOD=IMP` | ferx `[focei, imp]` |
+|-------------------------|--------------------:|--------------------:|
+| TVCL                    |              0.1264 |              0.1327 |
+| TVV                     |               7.723 |               7.737 |
+| TVKA                    |              0.8857 |               0.811 |
+| ω²(CL)                  |              0.0304 |              0.0286 |
+| ω²(V)                   |              0.0096 |              0.0096 |
+| ω²(KA)                  |              0.3405 |               0.336 |
+| σ (SD)                  |              0.0105 |              0.0106 |
+| IMP marginal `−2 log L` |             −285.69 |      −285.93 ± 0.07 |
+| Laplace `ofv`           |   (−286.00 at COND) |             −286.00 |
+
+Both engines start from the same FOCEI basin (NONMEM `METHOD=COND` OFV −286.00, identical to ferx’s FOCEI). NONMEM’s IMP MCEM then drifts slightly off it toward the importance-sampled marginal optimum (TVKA up to 0.886), while ferx’s warm-started IMP holds near the FOCEI optimum — both stable and agreeing within the cross-engine + Monte-Carlo margin. TVKA is the least-identified parameter on this small extract (ETA_KA variance ≈ 0.34, high shrinkage); CL/V and the variance components agree to a few percent.
+
+Compare like with like: NONMEM’s reported IMP `#OBJV` (−285.69) is the importance-sampling **marginal** `−2 log L`, so the matching ferx number is `importance_sampling.minus2_log_likelihood` (−285.93 ± 0.07), *not* ferx’s Laplace `ofv` (−286.00, which instead coincides with NONMEM’s COND OBJ). The small residual gap is the parameter-estimate difference (ferx’s TVKA sits a little below NONMEM’s), not an OFV-definition difference — both objectives drop the same `Nobs·log(2π)` constant (NONMEM “WITHOUT CONSTANT”). The cross-check lives in `tests/warfarin_imp_nonmem.rs`.
+
+## See also
+
+- [SAEM](../estimation/saem.llms.md) — common upstream stage for `method = [saem, imp]` with `imp_eval_only = true`, which scores the SAEM fit (NONMEM `SAEM` → `IMP EONLY=1`); see [Post-SAEM Finalization](../estimation/saem.llms.md#post-saem-finalization).
+- [SIR](../estimation/sir.llms.md) — a different importance-sampling-flavoured procedure that targets *parameter uncertainty* (CIs on θ/Ω/σ), not the marginal likelihood. The name overlap is unfortunate; the two methods are unrelated in goal and implementation.

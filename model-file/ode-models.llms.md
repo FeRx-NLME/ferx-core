@@ -1,0 +1,737 @@
+# ODE Models
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.llms.md) for what this means.
+
+For pharmacokinetic models without analytical solutions (e.g., saturable elimination, target-mediated drug disposition), ferx-core provides an ODE solver.
+
+## Structural Model Declaration
+
+    [structural_model]
+      ode(obs_cmt=OBSERVABLE_COMPARTMENT, states=[state1, state2, ...])
+
+- **obs_cmt**: The compartment whose concentration is observed (matched to DV)
+- **states**: List of state variable names (compartments)
+
+## ODE Equations
+
+The `[odes]` block defines the right-hand side of the ODE system:
+
+    [odes]
+      d/dt(state_name) = expression
+
+Expressions can reference: - State variables by name - Individual parameters defined in `[individual_parameters]` - The reserved builtins `TIME`/`TAFD`/`TAD` (solver time axes) and `MACHEPS` (machine epsilon, `f64::EPSILON`) - Arithmetic operators and functions (`exp`, `log`, `sqrt`, etc.) - Conditional logic with the same `if (cond) { ... } else { ... }` and inline `if (cond) expr else expr` syntax described in [Individual Parameters](../model-file/individual-parameters.llms.md). For example, you can switch between linear and saturable elimination based on the central amount:
+
+    [odes]
+      d/dt(depot)   = -KA * depot
+      if (central > KM_THRESHOLD) {
+        d/dt(central) = KA * depot - VMAX * central / (KM + central)
+      } else {
+        d/dt(central) = KA * depot - CL_LIN * central
+      }
+
+Each `d/dt(state)` reachable from any branch counts as defined; states that aren’t assigned in the firing branch this step receive a derivative of `0`.
+
+An `if` that switches during the integration at a time a model parameter can move is a **moving switch**: `if (tau > LAGT)`, and also the example above, since `central` depends on the parameters in its equation. `TAD` and `TAFD` move with an estimated lag. The integrator locates each one: when a step crosses it, the step is shortened to end on the crossing, so the right-hand side changes arm there rather than somewhere inside a step, and the exact derivatives jump there by the sensitivity the switching time carries (#2649). Values change too, by about the solver tolerance: a step no longer straddles the switch. A model without a moving switch is integrated exactly as before.
+
+Nothing is located for a clock or a state that no parameter reaches against a literal (`if (TIME > 24)`), a comparison by `==` or `!=`, `min`, `max`, `clamp` with literal bounds, or an inline `if` whose arms meet at its switch, such as the Friberg feedback `if (rb < CIRC0) (CIRC0 / rb)^0.16 else 1.0`, where both arms are 1 at `rb = CIRC0`: a right-hand side continuous at the switch puts no jump in the first-order sensitivities. Its gradient is still inexact to second order, by about 1% on a measured feedback model. ferx checks the arms by evaluating them at points on the switch, and locates the switch when it cannot: for a compound condition, a nested `if`, `mod`, any function other than `log` and `sqrt`, a condition that is not linear in what it reads, or an arm so steep that rounding hides the gap at the switch.
+
+### `TAD` before the first dose arrives
+
+`TAD` is time since the most recent dose *arrival* — the dose record’s time plus its `ALAG`. Under a lagtime a subject therefore has a window between the first dose row and that dose landing, and any observation or integrator step inside it precedes every arrival. There `TAD` reads relative to the subject’s **first arrival**, so it is negative in that window and reaches `0` when the dose lands.
+
+Before ferx 0.3 this window read `NaN` instead, which multiplied into the compartment state and turned any fit of an `[odes]` RHS referencing `TAD` into the `1e20` objective sentinel. The value is now finite, and it depends only on the subject’s dosing — not on where observations happen to fall — so adding a sample inside that window cannot move a later prediction. What `TAD` *should* mean before an ordinary dose has arrived is a convention rather than a derivable answer, so a model that reads `TAD` there should guard it explicitly rather than rely on the sign.
+
+**A steady-state dose is the exception, and it is not a convention.** Under `SS=1` the periodic fiction *does* have a prior pulse, at `t_dose − max(II − ALAG, 0)`, and the state in the pre-arrival window is that cycle’s decaying tail. `TAD` there is measured from that pulse, so it is positive and continuous with the post-arrival sawtooth rather than negative. See [Steady-state doses](../model-file/steady-state.llms.md#steady-state-tad-under-a-lagtime).
+
+A subject with **no** doses at all still reads `NaN` — `TAD` has no referent there — matching the sdtab column.
+
+Every name in an ODE expression must resolve to a declared state, an individual parameter, an intermediate variable assigned earlier in the block, or one of the reserved builtins `TIME`/`TAFD`/`TAD`/`MACHEPS`. A name that matches none of these — a typo, an omitted parameter, or a covariate — is **rejected at parse time** rather than silently read as `0.0`, the same structurally-broken-fit guard the analytical `pk(...)` mappings apply. Covariates cannot be referenced directly in an ODE RHS: pre-compute the covariate-dependent term in `[individual_parameters]` and reference that variable here instead.
+
+## Initial Compartment Amounts
+
+By default every compartment starts at zero, and drug enters only through dose records. To start a compartment at a non-zero amount — e.g. a pre-dose baseline for an indirect-response / turnover model — declare an initial condition in the `[odes]` block:
+
+    [odes]
+      init(state_name) = expression
+      d/dt(state_name) = expression
+
+- The right-hand side is evaluated **once per subject** at the start of the record and may reference individual parameters (and therefore folds in `theta`, `eta`, and covariates through the `[individual_parameters]` layer). State names referenced in an `init` expression are treated as `0` (no drug is present yet).
+- A name in an `init` expression that is not a declared state or individual parameter is rejected at parse time (it would otherwise be read as `0.0`).
+- Compartments without an `init(...)` line start at zero, as before.
+- This is the analogue of NONMEM’s `A_0(n)`.
+
+### What an `init(...)` expression may reference
+
+The scope is closed. It is **not** identical on the two init surfaces — the `[odes]` block injects solver built-ins that do not exist outside it, so `[odes] init(...)` and the analytical [`[initial_conditions]`](../model-file/initial-conditions.llms.md) block differ on four names:
+
+| Name | `[odes] init(...)` | `[initial_conditions] init(...)` |
+|----|----|----|
+| declared states | yes — bound to `0` (no drug is present yet) | n/a |
+| individual parameters | yes (folds in `theta` / `eta` / covariates) | yes, plus `theta` / `eta` directly |
+| covariates by name | no — reach them through `[individual_parameters]` | yes — a required, case-sensitive data column |
+| `MIXNUM` | yes (any casing) | yes (any casing) |
+| `MACHEPS` | yes (any casing) — machine epsilon | **no** — an ordinary covariate here |
+| `TIME` / `time` | **rejected** | **rejected** |
+| `T`, `TAFD`, `TAD` | **rejected** | ordinary covariates |
+| `KAPPA_*` (IOV) | n/a | rejected (see that page) |
+
+`MIXNUM` resolves to the subject’s mixture class on both surfaces, so a class-switched baseline works. `MACHEPS` / `TAFD` / `TAD` are **solver-injected built-ins only inside `[odes]`**; anywhere else — `[scaling]` and `[initial_conditions]` alike — the name is an ordinary covariate that must be a data column. That is deliberate, so a dataset that really carries a `TAD` column can use it.
+
+`TIME` is the one name rejected on both surfaces. An initial condition is evaluated at the time origin, so a clock there reads exactly `0` and the expression can only ever produce its `t = 0` value. Before issue [\#994](https://github.com/FeRx-NLME/ferx-core/issues/994) a bare `TIME` was **accepted** on both — `init(central) = TIME * SOMETHING` initialised the compartment to zero, validated clean, and fitted — while `Time` was reported as an undefined name and `T` / `TAFD` / `TAD` were rejected, a split that followed how each name happened to be represented in the parser rather than any scope decision. Put the time dependence in `d/dt(...)`, where `TIME` resolves to the integrator’s current time, or in a `[scaling]` Form C readout on the analytical path, where it resolves per observation.
+
+The `[odes]` built-in name sets are exposed by the engine (`ODE_INIT_SCOPE_BUILTINS` / `ODE_INIT_REJECTED_BUILTINS`) so a code generator can source the rule from the same binary it will parse with, instead of keeping its own copy — the same arrangement as `known_block_names()` for block names. They are named for the `[odes]` surface because that is what they describe: mirroring them on an analytical model would reject a legal `TAD` covariate and accept a `MACHEPS` that is really a missing data column.
+
+### Which record’s covariates seed `init(...)`
+
+Because the initial condition is a pre-record baseline, it is evaluated a single time using the covariate values from the subject’s **first record**. If a covariate that feeds the `init` expression changes later in the record, the initial amount is *not* re-evaluated — the later covariate values affect `d/dt(...)` going forward (the system evolves from the baseline), but the t=0 starting point is fixed by the first record’s covariates. For most models this is exactly what you want, since the baseline represents the pre-dose steady state. If you need the starting amount to track a covariate value observed mid-record, model it as a state driven by `d/dt` rather than as an `init`.
+
+The first record is the subject’s first row **in file order, of any kind**: a scored observation, an `EVID=2` (or `EVID=0, MDV=1`) row, or a dose — what NONMEM uses for `A_0`. When several rows share the subject’s first `TIME`, the one written first supplies the covariates. A covariate-marker `EVID=2` row written before a baseline sample at `TIME 0` therefore seeds the `init` with *its* values, not the sample’s. `predict()`, `fit()` (both its value and its gradient path) and adaptive simulation all apply this one rule; before \#2121 they took the observation in that case, which moved the objective by 49.6 on `nonmem_anchor/init_seed_tie_ofv_a`.
+
+A turnover model whose response variable sits at its baseline `KIN/KOUT` before any perturbation:
+
+    [odes]
+      init(response) = KIN / KOUT
+      d/dt(response) = KIN - KOUT * response
+
+**Interaction with system resets (EVID=3/4):** a reset re-applies the `init` expression to initialized compartments (returning them to baseline) and zeros all other compartments — so a reset behaves like the start of a fresh episode. See [Data Format](../data-format.llms.md) for reset rows.
+
+Note one deliberate asymmetry with the start-of-record seeding described above: the re-applied baseline at a reset is evaluated with the covariate values in effect **at the reset time**, not the first record’s. With time-varying covariates this means the post-reset baseline reflects the most recent covariate values — appropriate for a “fresh episode” that starts under current conditions — whereas the very first baseline uses the first record’s covariates. For time-constant covariates the two are identical.
+
+## Example: Michaelis-Menten Elimination
+
+A one-compartment oral model with saturable (Michaelis-Menten) elimination:
+
+    [parameters]
+      theta TVVMAX(10.0, 0.1, 1000.0)
+      theta TVKM(2.0, 0.01, 100.0)
+      theta TVV(10.0, 0.1, 500.0)
+      theta TVKA(1.0, 0.01, 50.0)
+
+      omega ETA_VMAX ~ 0.09
+      omega ETA_V    ~ 0.04
+
+      sigma PROP_ERR ~ 0.1
+
+    [individual_parameters]
+      VMAX = TVVMAX * exp(ETA_VMAX)
+      KM   = TVKM
+      V    = TVV * exp(ETA_V)
+      KA   = TVKA
+
+    [structural_model]
+      ode(obs_cmt=central, states=[depot, central])
+
+    [odes]
+      d/dt(depot)   = -KA * depot
+      d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+    [error_model]
+      DV ~ proportional(PROP_ERR)
+
+## Linear Models Are Solved Exactly
+
+When every equation in `[odes]` is **linear in the states**, ferx does not integrate the system at all. Between two dosing events such a system is `du/dt = A·u + b` with constant `A` and `b`, and its solution is the matrix exponential
+
+    u(t + h) = exp(A·h)·u(t) + ∫₀ʰ exp(A·s) ds · b
+
+which ferx evaluates directly — the same thing NONMEM’s `ADVAN5` does for a general linear model, except that you write the differential equations rather than a table of `K` constants. There is nothing to configure: the default `ode_method = auto` takes this path whenever the model qualifies, and integrates otherwise ([\#852](https://github.com/FeRx-NLME/ferx-core/issues/852)).
+
+    [structural_model]
+      ode(obs_cmt=central, states=[depot, transit1, transit2, central, peripheral])
+
+    [odes]
+      d/dt(depot)      = -KTR * depot
+      d/dt(transit1)   =  KTR * depot    - KTR * transit1
+      d/dt(transit2)   =  KTR * transit1 - KTR * transit2
+      d/dt(central)    =  KTR * transit2 - (CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+      d/dt(peripheral) =  (Q/V1) * central - (Q/V2) * peripheral
+
+The result is exact to floating-point rounding rather than to `ode_reltol`, and it has no stability limit: a fast compartment — a well-stirred liver draining at 50/h next to a terminal phase of 0.04/h — costs nothing extra, where an integrator would be forced into tiny steps. Steady state is exact as well (the infinite dose train is summed, not run in), and so are the analytic gradients FOCE/FOCEI use, which differentiate the same exponential.
+
+The cost is one matrix exponential per distinct gap between output times. Gaps a power of two apart share most of that work: past a small norm, `exp(A·h)` is computed by squaring the exponential of a scaled-down matrix, so `exp(A·4)` is often `exp(A·2)` squared once, and a sampling design such as 0.5, 1, 2, 4, 8, 12, 24 h pays for roughly half its gaps in full. The work is also kept between the segments a thread solves (the cycles of a steady-state run-in, subjects with equal parameters), up to a bounded number of approximants. The result is bit-identical to computing each gap on its own.
+
+### What counts as linear
+
+ferx decides this from the equations as written, before any number is evaluated. A model qualifies when every `d/dt(...)` is a sum of terms, each either free of states or a state-free coefficient times a single state. Coefficients may be any function of individual parameters — `exp(LCL)/V`, an `if` on a covariate-derived parameter — and intermediates are followed (`C = central/V` then `-CL*C` is linear).
+
+A model is integrated instead when an equation
+
+- multiplies two states, divides by a state, raises one to a power other than 1, or passes one to a function (`exp`, `log`, `sqrt`, …) — Michaelis-Menten, TMDD and binding models;
+- tests a state in an `if` condition;
+- reads model time (`TIME`, `T`, `TAFD`, `TAD`);
+- uses an absorption input function (`first_order(...)`, `transit(...)`, `igd(...)`, `weibull(...)`, `zero_order(...)`) — write first-order absorption as a depot state, as above, and it qualifies;
+
+or the model has a `[diffusion]` block. The decision is structural on purpose: a saturable term evaluated far below its `KM` looks linear to any numerical test, and a model certified that way would be wrong exactly when a subject’s concentration reaches `KM`.
+
+Infusions, bolus doses, lag times, bioavailability, `init(...)`, resets, IOV and time-varying covariates all work on this path — each is constant between two events, which is all the exponential needs.
+
+Two computations still step with the integrator on a linear model, and carry `ode_reltol`-level error where the PK predictions do not:
+
+- locating the time at which a cumulative hazard crosses its drawn threshold, when `simulate()` draws event times for an ODE time-to-event model — the search needs the crossing inside a segment, not the state at its end;
+- the transition probabilities of a drug-driven Markov (`ctmm`) endpoint, whose generator follows the drug concentration and so changes within every interval. Its share of the objective is integrated; the PK model that drives it is not.
+
+### Asserting it, or opting out
+
+`ode_method = linear` states that a model must take the exact path. On a model that does not qualify it is a parse error that names the reason, rather than a silent fall back to integration:
+
+    [fit_options]
+      ode_method = linear
+
+To integrate a linear model anyway — to compare against an earlier result, or to rule the solver out while diagnosing a fit — name an integrator (`ode_method = rk45`, `rodas5p`, …).
+
+The settings record `ode_method` as you wrote it, so `auto` stays `auto`. Which path actually ran is reported separately: the console header prints `ODE solution: exact (linear system, matrix exponential)`, and the fit YAML carries `ode_linear_exact: true` (or `false` for an integrated ODE model; the key is absent for an analytical one). The same flag is `FitResult::ode_linear_exact` in Rust. It is also `false` on a linear model if the exponential declined any segment at the final estimates — overflow on an extremely fast rate, say — since that segment was integrated instead.
+
+### Measured
+
+Against **NONMEM 7.6.0 `ADVAN5`** — the six-state model described below, written as `K` constants on the NONMEM side and as `[odes]` on the ferx side, with `F1`, `ALAG1`, multiple doses landing on residual drug, steady-state depot dosing, central infusions and a steady-state infusion, evaluated at fixed parameters (`MAXEVAL=0`, FOCEI): `PRED` agrees to **3.1e-12** relative on every observation, the post-hoc η to 3.0e-8, and the objective function to **5.2e-8** (−340.390273316 vs −340.390273263). The same model integrated with `rk45` misses NONMEM’s `PRED` by 2.6e-5 (`tests/advan5_linear_nonmem_anchor.rs`, `nonmem_anchor/advan5_liver.ctl`).
+
+Each standard model (`one_cpt` to `three_cpt`, IV and oral), written as `ode_template` and therefore solved exactly, against its analytical `pk` closed form — two implementations that share no numerical code — across single and multiple bolus doses, steady state (bolus and infusion), infusions, lag time and bioavailability: worst difference **1.2e-14** relative to the peak (`tests/linear_ode_exact.rs`). On the same comparison the integrator at default tolerances is off by 1e-5.
+
+A six-state tacrolimus-style model — three transit compartments at one rate (a matrix eigendecomposition cannot represent; ferx never uses one), a liver draining at 50/h and a two-compartment disposition — with steady-state dosing, 200 subjects, `predict()`:
+
+| `ode_method` | Time | Worst relative difference from `linear` |
+|----|----|----|
+| `auto` → `linear` | 5.2 ms | — |
+| `rk45` | 181 ms | 2.0e-6 |
+| `rodas5p` | 180 ms | 3.5e-7 |
+| `rodas5p`, `ode_reltol = 1e-12` | 663 ms | 1.6e-13 |
+
+## Solver Details
+
+For a model that is not [linear](#linear-exact), ferx-core chooses the stepper from the equations by default, and integrates non-stiff systems with an adaptive Dormand-Prince RK45:
+
+| Setting | Value |
+|----|----|
+| Method | `auto` — explicit Runge-Kutta 4(5), switching to a stiff method where the system calls for one ([below](#letting-ferx-pick-the-stepper-ode_method--auto)) |
+| Absolute tolerance | 1e-6 |
+| Relative tolerance | 1e-4 |
+| Max steps | 10,000 |
+| Initial step size | 0.1 |
+| Minimum step size | 1e-12 |
+
+The solver automatically adapts step sizes based on local error estimates.
+
+### Is the OFV settled at the tolerance?
+
+The default tolerance is accurate enough for most models, but not for all of them. On a stiff PK–neutrophil model with a `(BASE/neut)^GAM` feedback term the default left about 4 OFV units of error against NONMEM, and the sign of the error changed with the data ([\#2994](https://github.com/FeRx-NLME/ferx-core/issues/2994)). An error that size is more than the 3.84 of a 1-df likelihood-ratio test, so a model comparison made at the default can come out the wrong way.
+
+So after a fit of a model that integrates an ODE, ferx re-finds the EBEs and re-scores the objective once at the final estimates, with `ode_reltol` and `ode_abstol` one decade tighter (and ten times `ode_max_steps`). When the OFV moves by more than 0.1 units, or the tighter solve gives a non-finite objective, the fit carries `W_ODE_OFV_NOT_SETTLED` (category `ode_solver`), with both objectives and both tolerance pairs in its `details`. The remedy is to refit at the tighter tolerance and compare again, until the OFV stops moving. The estimates and the reported OFV are not changed by the check.
+
+On `examples/mm_iv.ferx` at its initial estimates, the shift for one decade is 0.052 at the default (its error against `ode_reltol = 1e-10` is 0.050), 1.41 at `1e-3` and 3e-8 at `1e-10`. So that model has no warning at the default and gets one at `1e-3`.
+
+Scope and limits:
+
+- It checks the objective the fit publishes, so it runs when that objective comes from `foce`, `focei`, `gn`, `gn_hybrid` or `laplace` (also with `n_agq > 1`). A trailing `agq_eval_only` readout owns the published OFV, so `method = [focei, laplace]` is checked on the quadrature marginal and `method = [vi, laplace]` is checked too, under the readout’s settings. A `[mixture]` model and an objective published by a Monte-Carlo estimator are not checked. A model whose PK is solved exactly by the [matrix exponential](#linear-exact) is checked: its objective can still integrate at the tolerance (a drug-driven CTMM likelihood, or a segment that falls back to integration), and where nothing integrates both sides agree and no warning is given.
+- A re-scored objective is used only if it can be trusted. The fit carries `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, naming every reason, when the tighter solve cannot be set up (its worker pool cannot be built), or when either side has
+  - an integration that is not clean: a step forced at the minimum step size, a segment left unfinished (which includes stiff-aborted and diverged ones), or an abandoned timeline. Every integration behind the objective is counted, including the EBE search, `H` and each AGQ node, not only the prediction at the mode;
+  - or EBEs that fail the fit’s own convergence guard: a subject hard-rejected at its start, or more unconverged subjects than `max_unconverged_frac` allows.
+
+  Each of those can still return a finite OFV, so a check that did not really run never reads as a settled objective.
+- Both sides re-find the EBEs the same way: one warm solve per subject from the fit’s modes, under the settings of the stage that published the OFV (such as the tighter `inner_tol` a `laplace` stage uses). Only the ODE tolerance differs between them, so further movement of the EBEs is not reported as a tolerance shift. The fit-tolerance side therefore agrees with the reported OFV only as closely as the fit’s EBEs were converged.
+- It costs two inner-loop passes over all subjects, one at each tolerance. A cancelled fit stops the check and does not report it.
+- Neither tolerance goes below its floor (`ode_reltol = 1e-12`, `ode_abstol = 1e-14`), since one more decade would measure round-off. A tolerance already at its floor stays there while the other is tightened, and only a fit with both at their floors is not checked.
+- One decade estimates the remaining error. It does not bound it. When something other than the tolerance limits the step size, such as the spacing of the output times or the initial step, two tolerances can accept the same steps. On `mm_iv`, `ode_reltol = 1e-1` and `1e-2` score within 1e-8 of each other and 1.47 units from the converged value. So no warning does not prove the tolerance is tight enough, but a warning does mean it is too loose.
+
+### Native right-hand side
+
+The equations in `[odes]` are evaluated at every stage of every step of every solve, so their cost is most of an ODE fit’s time. When a model is loaded, ferx compiles the `[odes]` block to machine code with [Cranelift](https://cranelift.dev). The program is first written out per number type as scalar code — the value and every derivative part as plain arithmetic, each type’s own operations in its own order — and that one form is compiled two ways:
+
+- **forward**, for every number type whose parts are all plain numbers: the predictions, the inner gradient’s first-order sensitivities and the exact inner Hessian’s second-order ones (Laplace). The integrators call it directly at every stage and Jacobian column, and values that depend only on the parameters are computed once per solve;
+- **in reverse**, as the right-hand side’s vector-Jacobian product. The adjoint gradient’s tape records each right-hand-side call as one block whose reverse rule is that compiled pass, instead of one record per operation, so its cost stays independent of the number of parameters. The integrators’ own taped arithmetic (stage combinations, Jacobian columns, the linear path’s matrix products) is likewise recorded one node per entry.
+
+Each function is compiled the first time a fit evaluates it (the first evaluation waits for the compile). On a host Cranelift cannot target, for a dual too wide to compile quickly, or with the environment variable `FERX_NO_RHS_JIT=1`, the register code (and the per-operation tape) runs instead; the results do not change.
+
+**What is identical and what is not.** The forward code performs the same IEEE operations as the interpreter, in the same order, so every prediction, inner gradient and inner Hessian is **bit-identical** with and without it. A reverse sweep through a block sums the same adjoints in a different order than a node-per-operation tape, so the outer gradient differs in the last bits (measured: within `4e-15` relative on random programs). An optimizer that reads it can then take a slightly different path: on the benchmarks below the objective values agree to five or more significant digits, some with one or two iterations more or fewer. A block keeps the interpreter if it uses a statement-level `if (cond) { ... }` block, `inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm` or `mod`, or reads anything other than the states, the individual parameters, its own intermediate variables, literals and the time variables. `sqrt` compiles (as `sqrt(max(x, 0))`, the interpreter’s guard, with a zero derivative where the argument is not positive), so a quasi-steady-state root such as `0.5 * (B + sqrt(B * B + 4 * KSS * CT))` no longer needs to be written with `^ 0.5` to get native code.
+
+Whole fits (FOCEI with the covariance step, one thread) with forward native code alone (“before”) and with the direct stepper calls, the compiled reverse pass and the PK-space sensitivities below (“after”), as the median of two interleaved runs (one interleaved pair for the last four, larger fits):
+
+| Model | Solver | Before (s) | After (s) | Speed-up | OFV |
+|----|----|---:|---:|---:|----|
+| `two_cpt_oral_ode` | default | 2.44 | 2.08 | 1.17× | identical |
+| `warfarin_ode` | default | 0.62 | 0.49 | 1.27× | identical |
+| `three_cpt_iv_ode` | default | 2.71 | 2.02 | 1.34× | identical |
+| `pkpd_nonmem` | default | 0.31 | 0.25 | 1.25× | identical |
+| `transit_savic` | default | 1.10 | 1.04 | 1.06× | identical |
+| `mm_oral` | Laplace | 1.51 | 1.42 | 1.06× | identical |
+| `mm_oral` | default | 0.97 | 0.98 | 1.00× | identical, one iteration more |
+| `two_cpt_oral_ode`, 8× the subjects | default | 28.1 | 21.0 | 1.34× | identical |
+| `two_cpt_oral_ode`, 8× the subjects | RK45 | 284.8 | 155.7 | 1.83× | to `6e-4` |
+| 8-state PK/PD, 8 random effects, 80 subjects | default | 337.3 | 205.4 | 1.64× | to `8e-4` |
+| TMDD (stiff) | default | 170.6 | 134.9 | 1.26× | to `4e-3`, 16 iterations more |
+
+The gain grows with the model and the data: it is per right-hand-side call and per recorded solve, so it does not shrink as either gets larger.
+
+A fit whose outer gradient changed in the last bits can take a different path: forced RK45 on `two_cpt_oral_ode` ran 48 iterations instead of 39 here, and the same fit started from four perturbed initial estimates came out 0.91× to 1.21× either way — the spread of the path, not of the per-evaluation cost.
+
+#### Inline conditionals
+
+An inline `if (cond) a else b` — and `min`, `max` and `clamp`, which are written as one — is compiled (#2680). The native code computes both arms and keeps the taken one, which gives the same bits as running the taken arm alone; where the untaken arm produces a `NaN` or an infinity (a negative base under a fractional power, say), its derivatives are masked to an exact zero, so it cannot reach a gradient. A taped evaluation records the taken arm only, as the interpreter does. The condition itself carries no derivative; a parameter that moves *when* a condition switches is handled separately (see the conditional-logic notes above). The block form of the saturable-elimination example above therefore runs on the interpreter, and the same model written inline runs native: `d/dt(central) = KA * depot - (if (central > KM_THRESHOLD) VMAX * central / (KM + central) else CL_LIN * central)`.
+
+Before and after, one thread, Linux, the mean of two interleaved runs:
+
+| Model | Fit | Before (s) | After (s) | Speed-up | OFV |
+|----|----|---:|---:|---:|----|
+| `warfarin_ode_time` (two inline `if`s) | FOCE to convergence | 63.2 | 18.2 | 3.5× | identical, same iterations |
+| 8-state Friberg neutropenia, `if (rb < CIRC0)` feedback, 512 subjects | FOCEI, `maxiter = 0` | 146.9 | 34.9 | 4.2× | identical |
+
+The neutropenia model written jump-free with `abs` ran in 32–36 s on both builds, so the inline `if` now costs what the hand rewrite did.
+
+#### Which engine ran it
+
+A fit reports the right-hand side’s engine when it is not native code, once, as an informational entry in `warnings` / `warning_details` (category `ode_rhs_route`), and `ferx check` reports the same text as an `info` row ([\#2681](https://github.com/FeRx-NLME/ferx-core/issues/2681)):
+
+- `W_ODE_RHS_INTERPRETED`: the block keeps the interpreter. The message names the construct (an `if (…) { … }` statement, `tanh`, a read of `L` before it is assigned, …) and the statement it is in (`d/dt(sm)`, the assignment to `E`). `sin` and `cos` ([\#2720](https://github.com/FeRx-NLME/ferx-core/issues/2720)) are among the functions the compiler does not translate, as are `pnorm`, `tanh`, `softplus`, `logit` and `inv_logit`; `sqrt` is translated ([\#2844](https://github.com/FeRx-NLME/ferx-core/issues/2844)).
+- `W_ODE_RHS_NOT_NATIVE`: the block compiled, but runs as register code, because `FERX_NO_RHS_JIT=1` is set, Cranelift cannot target the host, or the native compiler did not build the program.
+
+A compiled block that runs as native code gets no entry. To keep a block compiled, rewrite the construct the message names: an `if (…) { … }` statement as inline `if`s (see [Inline conditionals](#inline-conditionals)); a `tanh` of individual parameters only moves to `[individual_parameters]`.
+
+### Sensitivities in PK space
+
+A subject whose individual parameters are constant over time has predictions that depend on the random effects and θ only through those few parameters (`CL`, `V`, …). The exact derivative paths use that: they solve the subject once with derivatives in the *live* individual parameters, to the order the caller needs (two for the outer gradient, three or four for the covariance step’s exact Hessian), and carry the result to η and θ by the chain rule.
+
+This is chosen per recording by its cost: it runs when a derivative in the individual parameters is no more work per operation than the recording it replaces — typically when the outer gradient would otherwise tape the whole solve, or when the random effects outnumber the individual parameters — and the direct recording runs otherwise. Both are exact; they agree to rounding at tight tolerances (`1e-14` relative on the closed forms, `1e-11` on an ODE). At a working tolerance an explicit solver stepping at its stability edge amplifies rounding in the derivatives as it does in the values, so the two agree to about the solver tolerance there, never worse than the predictions themselves.
+
+### Two prediction engines agree to solver tolerance, not bit-for-bit
+
+An ODE subject is integrated by one of two engines. A subject with no time-varying covariates, resets or `TIME` reads takes the **single-pass** engine: one solve per dose interval, with the observations as output points. Every other subject takes the **event-driven** walk, which starts a fresh solve at every record so that each record’s covariate snapshot governs the interval ending there. Both meet `ode_reltol` / `ode_abstol`, but they take different steps, so their predictions agree to the solver tolerance and not to the last bit.
+
+This shows up when two datasets that should predict the same land on different engines. Before scoring, `fit()` clears the per-record snapshots of every subject whose referenced covariates never differ from its baseline value, so such a subject runs on the single-pass engine. Two consequences ([\#1873](https://github.com/FeRx-NLME/ferx-core/issues/1873)):
+
+- Changing a covariate at a single record moves that subject to the event-driven engine. Its IPRED can then move by about the solver tolerance, even when the changed value reaches nothing the predictions read (for example, a transit `MTT` at an observation record, where no dose reads it). Measured on Linux at the default tolerances, the gap was 3.4e-7 relative. It falls to 4.8e-11 at `ode_reltol = 1e-8` and to 4.0e-16 at `1e-12`. At `1e-12` the gap is floating-point roundoff, so it depends on the platform’s math library: macOS arm64 measures 4.0e-15 there, and matches Linux at the looser tolerances. Anything evaluated at the EBE, such as η̂ or a `[derived]` integral, inherits the gap.
+- `predict()` and `compute_predictions_with_states` do not prune, so they run on the subject exactly as given. The data reader attaches snapshots to a subject as soon as any covariate column varies within it, including a column the model never reads (a `DAY` column, say). Such a subject, and a hand-built `Population` that carries constant snapshots, is event-driven in `predict()` and single-pass inside `fit()`, so the two report IPREDs that differ at the solver tolerance.
+
+If a comparison has to be exact, put both sides on the same engine, or tighten `ode_reltol` / `ode_abstol` until the gap is below what you are measuring.
+
+### A right-hand side that reads model time is always integrated
+
+For some models ferx skips integration entirely. A static multi-route absorption model with a linear one- or two-compartment disposition — parallel or mixed `first_order` / `transit` / `igd` / `zero_order` pathways — is evaluated as a superposition of closed-form single-route solutions, which is exact and much faster than stepping the system.
+
+That shortcut needs the disposition to be **time-invariant**, so it does not apply to a right-hand side that reads `TIME`, `T`/`t`, `TAFD`, or `TAD` — including one that reads them only inside an `if` condition:
+
+    [odes]
+      # non-autonomous: integrated, never served by the closed form
+      d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)
+                      - CL/V*central*(1.0 + 0.3*TAD)
+
+Such models take the event-driven ODE path, which places each dose on its timeline at its (possibly lagged) arrival so `TAD` anchors correctly. There is nothing to configure; the cost is that these models integrate rather than evaluate in closed form.
+
+A **steady-state** (`SS=1`) dose is a separate question, because the run-in that stands in for the infinite past does not integrate on the subject’s clock — see [Steady state with a `TAD`-reading RHS](../model-file/steady-state.llms.md#steady-state-with-a-tad-reading-rhs). `TAD` is anchored per run-in window and is NONMEM-anchored, with or without a lagtime. `TAFD` and `TIME`/`T` are not — an absolute clock has no periodic steady state for the run-in to converge to — and that combination is reported as `W_STEADY_STATE_ABSOLUTE_TIME`.
+
+#### The injected joint PK-TTE hazard line does not count
+
+A joint PK-TTE model’s `[event_model] hazard = …` is appended to the ODE system as a cumulative-hazard state, `d/dt(__chz_<cmt>) = <hazard>`. A Weibull or Gompertz baseline hazard reads `TIME` by definition, but that line never writes a PK state, so it does **not** make the PK dynamics non-autonomous and does not route the model off the fast paths:
+
+    [odes]
+      d/dt(depot)   = -KA*depot
+      d/dt(central) =  KA*depot - (CL/V)*central     # autonomous: the fast paths still apply
+
+    [event_model]
+      cmt    = 3
+      hazard = H0*exp(GAM*TIME)*exp(BETA*central/V)  # time-dependent, and that is fine
+
+Writing `TIME` in a PK equation still counts, hazard or no hazard.
+
+`__chz_*` is reserved and **write-only**: reading it from an `[odes]` equation, from an `if` condition, from the hazard itself, or seeding it with `init(__chz_<cmt>)` is a parse error. The accumulator is not part of the dynamics it accumulates over, and `H(0) = 0` by definition. A `[scaling]` readout may read it — a readout cannot feed back — which is how you would report `H(t)` alongside the predictions.
+
+That covers one case more than it strictly must. A **self-exciting** hazard — `hazard = f(__chz_<cmt>)`, where the risk rises with hazard already accrued — only couples the accumulator to itself and leaves the PK block autonomous, so it is rejected for want of evidence rather than because it is known to be wrong: no reference run anchors that model family on any of the paths that read the hazard state. Tracked in [\#1208](https://github.com/FeRx-NLME/ferx-core/issues/1208).
+
+One case is declined more often than it strictly must be: an intermediate that reads time and is used *only* by the hazard (`TT = TIME` … `hazard = f(TT)`) still marks the block non-autonomous. Write the time term in the `hazard =` expression itself to avoid it.
+
+### `TIME` after a reset that restarts it
+
+> **WARNING:**
+>
+> ferx’s reader keeps, per subject, the latest event time so far. That includes the end of an infusion and the last dose of an `ADDL` train, not only the records themselves. When an `EVID=3`/`4` row’s `TIME` is at or before it, the reader moves that row and everything after it to 1 time unit past it on its internal clock. Examples: a period 2 written from 0 again, a reset written at the same `TIME` as the record before it, or a reset during a running infusion. Three surfaces read that internal clock rather than the `TIME` as written:
+>
+> - `TIME` / `T` inside `[odes]`;
+> - `TIME` in a `[binary_model]` linear predictor;
+> - `TIME` in an `[event_model] hazard =`, both where it is integrated and at an exact event.
+>
+> NONMEM reads the `TIME` as written on all three. Measured with NONMEM 7.5.1: `$DES`’s `T` restarts at the reset row, and `$ERROR` reads the written `TIME` at a binary or TTE record. On the reference fixtures, ferx at NONMEM’s optimum is off by 7648 (`[odes]`), 135 (`[binary_model]`) and 239 (`hazard`) OFV. In each case ferx reproduces NONMEM run on the data rewritten so that `TIME` keeps running. The fixtures and the full table are in `nonmem_anchor/reset_clock_*` and `tests/reset_clock_nonmem_anchor.rs`.
+>
+> Data in which every reset row is strictly later than every earlier event of its subject, infusion ends and `ADDL` doses included, is unaffected. So is a model where none of the three surfaces above reads `TIME`. The `[individual_parameters]` half of the same question is [\#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969).
+
+> **WARNING:**
+>
+> Until [\#1124](https://github.com/FeRx-NLME/ferx-core/issues/1124) a right-hand side reading **any** of `TIME`, `T`/`t`, `TAFD`, or `TAD` could be admitted by the closed-form path, which never evaluates the right-hand side at all — so the time-dependent term was **dropped from the predictions**, silently and with no warning. Re-run any earlier result whose `[odes]` block mentions one of those four names, including where it is read only inside an `if` condition:
+>
+>     [odes]
+>       KE = CL/V
+>       if (TIME > 6.0) { KE = 3.0*CL/V }   # also affected
+>       d/dt(central) = first_order(ka=KA) - KE*central
+>
+> Measured on the reference cases: a `TAD` term in the elimination gave 8× the correct concentration by 12 h, and each of the four spellings read from an untaken `if` branch was wrong by 4.0e-1 relative. Models that do not mention model time in `[odes]` are unaffected.
+
+### A right-hand side that is nonlinear in the state is always integrated
+
+The same shortcut also needs the disposition to be **linear in the compartment amounts**, so it does not apply to a right-hand side where a state multiplies another state, or where a branch tests one:
+
+    [odes]
+      # nonlinear: integrated, never served by the closed form
+      d/dt(central) = first_order(ka=KA) - CL/V*central - Q/V*central + Q/V2*periph
+                      - KON*central*periph          # target binding (TMDD)
+      d/dt(periph)  = Q/V*central - Q/V2*periph
+
+    [odes]
+      # state-triggered branch: also integrated
+      if (central > 10.0) { KE = 3.0*CL/V } else { KE = CL/V }
+      d/dt(central) = first_order(ka=KA) - KE*central
+
+Saturable elimination (`- VMAX*central/(KM + central)`) has always been integrated for the same reason. As with model time, there is nothing to configure — the only consequence is that these models step the system rather than evaluating a closed form. If they are also stiff, see [Stiff systems](#stiff-systems) below.
+
+> **WARNING:**
+>
+> Until [\#1149](https://github.com/FeRx-NLME/ferx-core/issues/1149) ferx established linearity by evaluating the right-hand side one compartment at a time, with every *other* amount held at zero. A term that only switches on away from those points was therefore invisible: `KON*central*periph` is exactly zero whenever either amount is zero, and a threshold above the probe’s amplitude was never crossed. Such a model was admitted to the closed-form path, which does not evaluate the right-hand side at all, so the term was **dropped from the predictions** — the same silent failure as the model-time case above, and with no time variable involved.
+>
+> Re-run any earlier result whose `[odes]` block multiplies two compartment amounts together, or branches on one. A right-hand side that is linear in the amounts is unaffected, including one whose *coefficients* are arbitrary functions of `θ`, `η`, and covariates.
+
+### Stiff systems
+
+An explicit method like RK45 is *stability*-limited on a stiff system: it keeps shrinking the step to stay stable, not to meet your tolerance. The symptom is a fit that crawls, or an integration that silently exhausts `ode_max_steps` and freeze-pads the remainder of the segment. That freeze-pad applies only to a stop on a *finite* state. When a state has gone non-finite (the right-hand side diverged), the rest of the segment is `NaN` in **every** state instead, since nothing past that point was integrated, and no `ode_method` can fix it (#1539). Stiffness in PK/PD models typically comes from a wide separation of time scales:
+
+- fast reversible binding on top of slow elimination (TMDD and quasi-equilibrium models);
+- Michaelis-Menten elimination with `KM` far below the observed concentrations;
+- long transit chains with a large `KTR`;
+- QSP / systems-pharmacology cascades mixing minute- and week-scale states.
+
+Set `ode_method` in `[fit_options]` to pick a different stepper:
+
+| `ode_method` | Order | Stages | Stiff? | Use for |
+|----|----|----|----|----|
+| `rk45` | 5(4) | 7 | no | the general-purpose explicit choice; fastest at default tolerances, and what `auto` selects on a non-stiff system |
+| `vern7` (alias `verner7`) | 7(6) | 10 | no | **accuracy**-limited fits at tight tolerances (`ode_reltol` ≤ 1e-8) |
+| `rosenbrock23` (aliases `ros23`, `ode23s`) | 2(3) | 3 | yes | crude tolerances, rough right-hand sides |
+| `rodas4` | 4(3) | 6 | yes | the stiff workhorse at typical tolerances (1e-6 – 1e-9) |
+| `rodas5p` | 5(4) | 8 | yes | stiff systems at tight tolerances (`ode_reltol` ≤ 1e-9) |
+| `auto` (default) | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method--auto) |
+
+Note the two different axes. The Rosenbrock methods buy **stability**; `vern7` buys **order**. Which one helps depends on what is capping your step size, and picking the wrong one costs time without buying accuracy — see below.
+
+    [fit_options]
+      ode_method = rodas5p
+      ode_reltol = 1e-9
+      ode_abstol = 1e-11
+
+A stiff step is more expensive than an explicit one — it builds the right-hand side’s exact Jacobian (a forward tangent of the compiled `[odes]` program along each state and the clock) and factorizes an `n × n` matrix once per step — so on a non-stiff one- to three-compartment model RK45 remains faster. Switch only when stiffness, not accuracy, is what is capping the step size.
+
+### Letting ferx pick the stepper (`ode_method = auto`)
+
+`auto` is **the default**, so this section describes what happens to a model that says nothing about `ode_method` at all. It decides from the model rather than from the data. To opt out and pin a stepper, name one:
+
+    [fit_options]
+      ode_method = rk45      # or rodas4, rodas5p, rosenbrock23, vern7
+
+Before each integration, ferx builds the Jacobian `J = ∂f/∂u` of your `[odes]` right-hand side at the state that integration is about to start from, and reads its eigenvalues. The discriminator is the fastest mode,
+
+$$\lambda_{\max} = \max_i |\operatorname{Re} \lambda_i(J)|, \qquad \tau_{\text{fast}} = 1/\lambda_{\max},$$
+
+and a system whose fastest mode decays faster than `1/30` of a time unit (`λ_max ≥ 30`) starts on a stiff method — `rodas4`, or `rodas5p` when `ode_reltol ≤ 1e-8`. Everything else stays on the explicit default. Naming any other `ode_method` still forces that method exactly; `auto` is the only value that decides anything.
+
+Three properties are worth knowing before you rely on it.
+
+#### It probes per integration segment
+
+ferx splits a subject’s timeline at every dose, and the probe runs at the start of each of those segments. That is deliberate: in a binding model the fast eigenvalue is carried by a term like `KON · central`, which is identically **zero before any drug is present**. A model whose stiffness comes from binding is at its least stiff at the declared initial condition, so a single probe there would read it as non-stiff and never escalate. Probing per segment sees the post-dose Jacobian, where the stiffness actually lives. It also re-decides as the optimizer moves θ, so a fit that walks into a stiff region of parameter space switches with it.
+
+#### A failed escalation is caught and undone
+
+Every stiff method in ferx has been measured diverging on *some* model where the explicit family stayed clean, and those failures differ between methods — so `auto` treats a bad escalation as an expected outcome, not an impossible one. If the stiff solve comes back non-finite, **or** clamps at the minimum step (the freeze-pad failure described above — finite output, silently wrong), the result is discarded and the segment is re-solved explicitly. When the fallback integrates cleanly, that bounds the result to “the explicit answer, at twice the cost” rather than a corrupted objective function. If it also fails, `auto_fallback_failed` reports that neither attempt produced a usable trajectory. The guard applies only to `auto`: a named method is always honoured as asked. When it fires, the fit says so — see [where those counts show up](#which-regime-am-i-in), below.
+
+#### What the probe cannot see
+
+Two things, both worth knowing now that `auto` is the default. When the fallback completes, neither makes the answer worse than the explicit result, but both can make a fit slower than pinning a method by hand.
+
+*The starting decision is a rate, so it carries your model’s time unit.* `λ_max ≥ 30` is calibrated for the hour-based convention typical of PK models, and the one the default tolerances assume. The same model written in days reads 24× smaller and may never trigger; written in minutes it reads 60× larger and can escalate wholesale — an oral model with `ka = 0.6/min` puts `λ_max` at 36 with nothing stiff in it anywhere. Once RK45 is running, its stage-based detector uses the dimensionless product of step size and an estimated Jacobian rate, so that second decision is unchanged by an hours-to-days conversion.
+
+*It measures speed, not separation.* Stiffness is really a *ratio* — a fast mode alongside a slow one — and this reads only the fast end. A system whose modes are all equally fast is not stiff and RK45 handles it comfortably, but it reads the same as one that is: a transit chain written out in `[odes]` with `ktr = 50` has every eigenvalue at −50 and escalates, paying a Jacobian and a matrix factorization per step for nothing.
+
+Both were accepted rather than fixed, because the obvious alternatives are worse: a ratio `λ_max/λ_min` is undefined the moment any mode sits at zero, which is every compartment before its first dose, and scaling by the segment length makes a long segment on a benign model read stiff. On either of these, name a method.
+
+#### What `auto` did: the six counters
+
+Three counters record what `auto` did. They sit on the solver-statistics struct alongside the step counts, and ride along in the `ode_solver` warning’s `details` payload:
+
+- **auto-stiff segments** — integrations `auto` put on a stiff method, whether the probe escalated at the segment’s start or a mid-segment re-probe did. Always `0` under a named method, so any non-zero value is `auto` at work.
+- **auto-switched segments** — of those, the ones whose stepper changed *part-way through the segment* (see below). One per segment, however many times it changed its mind.
+- **auto-stiff rejections** — escalations whose result was thrown away and re-solved explicitly. A subset of the first, and normally `0`. A non-zero count means the probe was right that the system is stiff but the method it picked could not integrate it — try naming `rodas5p` or `rosenbrock23` explicitly.
+
+Four more counters close the guard’s last ambiguity. Unlike the three above, the first two are recorded under *every* `ode_method`, not just `auto` — an `rk45` fit that runs out of steps shows them too.
+
+- **unfinished segments** — attempts that stopped before their requested end and freeze-padded the remaining output times with the last state (or `NaN`-padded them, for the diverged subset below).
+- **diverged segments** — the unfinished segments that stopped because a state went non-finite. Their remaining output times are `NaN` in every state, not freeze-padded, including a decoupled observed state that would otherwise have been served frozen at a finite value (#1539). No solver setting repairs this: check the `[odes]` right-hand side and the parameter values. The warning drops its `ode_method` / tolerance advice when every damaged segment diverged.
+- **discarded unfinished segments** — the subset belonging to stiff attempts the guard threw away, so the difference (`kept_unfinished_segments`) is the number of unfinished trajectories the caller actually received.
+- **auto-fallback failures** — rejected escalations whose explicit re-solve *also* stopped early or returned non-finite output. There is no clean trajectory left for the guard to return, so it deterministically keeps the explicit fallback but reports that **both attempts failed**. Do not treat a fit with a non-zero value here as a usable result; pin another stiff method and check the tolerances and parameter estimates.
+
+`kept_unfinished_segments` is a roll-up, not a disjoint category: a segment abandoned by `ode_stiff_abort_after`, and one that stopped because it could not form a step at the minimum step size, are unfinished segments too. Do not add it to `stiff_aborted_segments` — the `ode_solver` warning subtracts the abandoned ones before reporting the rest, so its clauses partition the damaged segments rather than counting them twice. What is left after that subtraction is dominated by segments that exhausted `ode_max_steps`.
+
+All six counters are floors rather than totals. They cover the segment solves only, so escalations and failures on the event-time path — the threshold solver that drives time-to-event and adaptive-dosing models — are not in them. A zero is not by itself proof that every integration in the fit was clean.
+
+#### Measured impact
+
+Measured on the ferx-testdata ODE library at default tolerances. `λ_max` is the range across every integration segment of every subject; the wall-clock columns are FOCEI fits:
+
+| model | `λ_max` across segments | what `auto` starts | `rk45` | `auto` |
+|----|----|----|----|----|
+| cyclophosphamide `run2_final` | 35 – 234 | `rodas4` | 827 s for **one** capped iteration, OFV 3243.83, not converged | **0.7 s to convergence**, OFV 3241.708 |
+| TMDD SAD `cr`, 4-iteration budget | 3.7 – 126 | mixed, per segment | 372.4 s, OFV 5018.5 | **2.3 s**, OFV 4888.4 |
+| TMDD SAD `crib`, 4-iteration budget | 3.7 – 126 | mixed, per segment | 33.1 s, OFV 4885.0 | **2.2 s**, OFV 4893.0 |
+| busulfan, pembrolizumab | 0.1 – 4.6 | `rk45` (no escalation) | — | unchanged |
+
+Read the wall-clock column first and the OFV column second. On the two TMDD rows the solvers sit at different points on the optimizer’s path after the same number of iterations, so the OFV difference there mixes accuracy with how far each got — `crib` lands slightly higher and `cr` 130 units lower, and neither is a claim about accuracy. The cyclophosphamide row is the like-for-like one: `auto` reaches OFV 3241.708 against NONMEM FOCEI’s 3241.721 on the same model and data, a difference of 0.013, while `rk45` spends 827 seconds without finishing a single iteration.
+
+The cyclophosphamide model is the clear win: it is stiff at every segment, so an explicit method is stability-limited throughout. The TMDD models are the more interesting case — stiff on the high-dose segments and not on the low-dose ones, which is exactly the situation a single per-model choice cannot serve and a per-segment probe can.
+
+#### When to pin a method instead
+
+`auto` is the default because whether a system is stiff is a property of the equations, and a user who has to know the answer in advance in order to get a tractable fit is being asked the wrong question. Three situations still call for naming one:
+
+- **A model on an unusual time scale**, per the threshold caveat above.
+- **A control stream you intend to publish or archive.** A per-segment decision is reproducible — same model, same data, same parameters, same choice — but it is not readable off the file, and a reviewer cannot tell which stepper produced a number without running it. Naming the method `auto` selected makes the run self-documenting, and costs nothing.
+- **Diagnosing a solver problem.** Pinning removes a variable.
+
+The cost when nothing is stiff is one Jacobian build and one eigensolve per integration segment — the same work a single Rosenbrock step attempt does, against a segment that takes tens to thousands of steps. Zero-length segments skip it entirely.
+
+### When a segment turns stiff halfway through
+
+The probe reads the Jacobian at a segment’s **entry** state, and for a binding model that is the state it looks least stiff at: the fast mode is carried by a term like `KON · C · R`, so it does not exist until both drug and target are present. A depot-absorption binding model reads `|Re λ|max = 10` when the dose lands — comfortably non-stiff — and `7.6e3` an hour later, once drug has been absorbed and target has accumulated.
+
+That gap is not merely slow. Integrated explicitly at default tolerances, the same 24-hour segment exhausts `ode_max_steps` and comes back with a **median relative error of 143 %** in the central compartment, while `rodas4` integrates it to `7e-8` in 79 steps. And it does so *quietly*: the segment produces **zero** minimum-step clamps and a **lower** step-rejection rate than the accurate cases, so neither the min-step counter nor a rejection-rate detector can see it. A stage-based stability estimate or a fresh Jacobian can.
+
+RK45 now uses the stages of every accepted step to estimate `h·ρ(J)`, the same dimensionless stability signal used by the original Dormand–Prince stiffness detector. Consecutive stiff verdicts switch to the stiff method without another RHS evaluation. Those verdict counters belong to the subject solve and survive event boundaries, even though the stepper workspace is rebuilt because a dose or forcing change invalidates its stages. Every 25 accepted steps `auto` also re-runs the Jacobian probe as a backstop. If either detector finds the segment stiff, it **swaps the stepper in place**: the segment keeps everything it has integrated so far and carries on with the stiff method, rather than restarting or re-solving.
+
+The switch is **one-way**: explicit to stiff, never back (#2845). Once a segment is on a stiff stepper it is not re-probed, so a fast mode that relaxes later in the segment does not demote it to RK45. Demotion on a single probe reading used to do exactly that on a full-TMDD model whose binding mode relaxes after the dose: the tail was integrated at explicit accuracy, at a point set by step counts, so `auto` carried RK45’s OFV error and its jitter in θ instead of `rodas4`’s. A stiff stepper integrates a non-stiff tail correctly, only at a higher cost per step, and the next segment is probed afresh at its entry state, so that cost never outlives the segment.
+
+A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with the explicit stepper. If that fallback also stops early or returns non-finite output, the solver keeps it rather than guessing at a third method, but reports `auto_fallback_failed` in the `ode_solver` warning; the old “explicit answer, twice the cost” bound holds only when that counter is zero. Only clamps taken *by the stiff stepper* count towards that test — a segment that clamped explicitly and was then rescued by the switch is kept, since discarding it would hand back exactly the explicit result the switch had just avoided. The event-time path (TTE draws, adaptive dosing) switches on the same rule, where it matters more — its output *is* the answer, so a badly integrated span moves the event time rather than one prediction.
+
+Being threshold tests, both detectors add a **discontinuity** in the objective as a function of θ: a segment whose stage estimate or `|Re λ|max` sits near its threshold can switch at θ and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The start-of-segment probe and the escalation guard have the same property — re-probing adds one more decision per segment, the step at which it escalates. Unlike `ode_stiff_abort_after` this is still on by default, because on a segment that actually turns stiff the alternative is not a slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it with `ode_auto_switch = false`, or with a named stiff method (pinned, and so free of both the probe and the guard), to see whether the switching is what moved them.
+
+A benign segment stays on its stepper. Its per-step stage estimate is arithmetic over values RK45 already computed; it pays no extra RHS calls. The periodic backstop costs roughly one Jacobian probe per 25 accepted steps, counted across event intervals. To go back to one method per segment, chosen at its start:
+
+    [fit_options]
+      ode_auto_switch = false
+
+Like every other part of `auto`, this is off under a named `ode_method` — a pinned method is honoured as asked.
+
+### Which regime am I in?
+
+This matters, because a stiff solver does **not** speed up a fit that is merely *accurate*- limited. Run your model and look at the solver’s step counts:
+
+- **Stability-limited (stiff).** Steps are tiny regardless of `ode_reltol`, and the integration hits its minimum step or exhausts `ode_max_steps`. A stiff method is the fix, and the win is large.
+
+  A **non-zero min-step count is the one number worth checking after switching, too.** If a Rosenbrock method cannot form a step at all at the minimum step size — a singular `W = I/(γh) − J`, which a badly scaled or discontinuous right-hand side can produce — the integration stops there and pads the remaining output times with the last state it reached. Those predictions are finite and look perfectly ordinary; the min-step count is the only place that failure is reported.
+
+- **Accuracy-limited.** Almost every step is accepted, nothing is min-step clamped, and tightening `ode_reltol` is what drives the step count up. A stiff method will not help; what helps is a *higher-order* method, or a looser tolerance if the model can afford it.
+
+#### Where the step counts show up
+
+After a fit, ferx runs one pass over every subject at the final estimates — the ordinary prediction dispatch — and reports what the solver did there as an `ode_solver` warning (see [Warnings](../warnings.llms.md#warning-codes)). It fires when a step clamped at the minimum step size, when a returned segment stopped before its requested end, when an `auto` escalation had to be discarded and re-solved explicitly, when that explicit fallback also failed, when `ode_stiff_abort_after` cut a segment short, or when a walk was abandoned *before integrating* because the subject’s timeline could not be ordered — and, at `Info` severity, when `auto` escalated and everything worked, so an escalation is never invisible. Either way it says how many segments changed stepper part-way through, because that changes how the step counts above it read: the steps before a switch were taken by a different method than the ones after it. Clamps taken inside an escalation the guard *discarded* are reported as part of that rejection rather than as freeze-padding: the trajectory they produced was thrown away and re-solved explicitly. A **rejected** escalation is the most actionable line ferx prints about the solver: the probe was right that the segment is stiff and wrong about which stiff method could integrate it, which is the case for naming `ode_method = rodas5p` (or `rosenbrock23`) by hand. The counters ride along in the warning’s `details` payload.
+
+The abandoned-walk case is the odd one out, and has its own counter (`abandoned_non_finite_timeline`) for that reason. A `NaN` or infinite dose time, lagtime, route lag or infusion duration makes the timeline unsortable, so ferx returns `NaN` predictions for that subject rather than silently dropping the offending dose and reporting the remaining, drug-free trajectory as valid. Nothing is integrated, so such a subject contributes nothing to any other counter in the payload — which, before this counter existed, read exactly like a subject there was nothing to integrate for. It is not an `ode_method` problem and no solver setting fixes it: check the dose records, and any exponential covariate model on `ALAG` / `F` / `D` / `R` that can overflow at typical covariate values.
+
+The counter is reported by `fit()`. `predict()`, `simulate()` and `predict_survival()` still return `NaN` for such a subject and say nothing about it — the solver-statistics scope those counters accumulate into is opened by the fit only. The `NaN` itself is the signal on those entry points, as it was before.
+
+#### When the derivatives overflow but the predictions do not
+
+One rejection reason is not about the method at all. A dual number’s derivative jets carry higher powers of what its value carries linearly — integrating `u' = p·u` gives `∂u/∂p = t·u` and `∂²u/∂p² = t²·u`, and a `1/x` in the right-hand side scales the gradient by `1/x²` and the Hessian by `1/x³` — so a trajectory that reaches the top of double precision overflows its Hessian first, its gradient next, and its predicted value not at all. The result is a solve that reports success, returns finite predictions everywhere, clamps nothing, and hands FOCE/FOCEI a `NaN` gradient.
+
+`ode_method = auto` discards such a segment and re-solves it explicitly, and reports it as `auto_stiff_rejected_jets`. This is the one decision ferx takes on the sensitivity solve that it does not take on the prediction solve: `f64` carries no derivatives to check, so the predictions keep the stiff trajectory while the gradient comes from the explicit re-solve. The asymmetry is deliberate — a gradient that disagrees with its trajectory by solver tolerance is worth having, a `NaN` one is not — but a non-zero count is a reliable sign that the model is running at the edge of what `f64` can represent. Naming a different method will not help. Check the units and scaling instead: a state carried in ng rather than mg, a rate constant on a per-second clock, or a growth term with nothing bounding it.
+
+This decision is taken only by a solve carried out directly at a dual number type. A fit’s analytic derivatives come from compiled plans instead, whose ODE loops integrate on the values and so cannot take it, and the post-fit prediction pass is plain `f64`. So `fit()` currently always reports `auto_stiff_rejected_jets` as 0. It no longer runs a separate sensitivity solve per subject to look for it, because that solve went through the same plans, could not observe the decision either, and cost gigabytes of memory on large ODE models (#3076). On a fit, an overflow like this shows up as a failed analytic Hessian, not as this counter.
+
+Only a segment that *entered* with finite jets is scored. Derivatives that have already overflowed stay overflowed for the rest of a subject’s event chain, and re-solving a later segment cannot repair damage done in an earlier one.
+
+A **named** `ode_method` is not guarded this way, here as everywhere else: a user who asked for `rodas4` gets `rodas4`, non-finite jets included.
+
+#### Bounding what a stalled segment costs
+
+A stability-limited segment keeps stepping at the minimum step size until it exhausts `ode_max_steps` — thousands of steps that buy wall time rather than accuracy. `ode_stiff_abort_after = N` gives up on a segment after `N` of its steps have clamped:
+
+    [fit_options]
+      ode_stiff_abort_after = 25
+
+It is off by default, and that is deliberate. Aborting freeze-pads the segment’s remaining output times with the last state, so it trades a slow-but-eventually-integrated segment for a padded one — and it does so on **every likelihood evaluation**, not just the final prediction pass. That makes the objective *discontinuous* in θ: a segment that clamps `N-1` times at θ and `N` times at a perturbed θ comes back truncated at a different place, which is exactly the kind of step the outer optimizer’s line search and the covariance step’s finite-difference Hessian cannot cope with. So read a fit whose `ode_solver` warning reports a non-zero abort count as a *diagnosis* — “these segments are stability-limited” — and not as an estimate: fix the grinding with a stiff method, then turn the budget back off.
+
+(On the time-to-event path, where the integration returns an event time rather than a trajectory, an abort is reported as a failed segment instead of being padded — a padded crossing would be laundered into the likelihood as though it had been integrated. A step that clamps *and* brackets the crossing still returns its crossing; the budget bounds cost, it does not discard an answer the solver already found.)
+
+#### Measured: an accuracy-limited fit
+
+The Savic transit anchor (`tests/transit_nonmem_anchor.rs`) at NONMEM-equivalent accuracy (`ode_reltol = ode_abstol = 1e-9`) is a measured example of the second regime — 97 % of steps accepted, zero min-step clamps — and the methods behave exactly as that diagnosis predicts:
+
+| `ode_method`   | accepted steps | rejected | min-step clamped | wall-clock |
+|----------------|----------------|----------|------------------|------------|
+| `rk45`         | 3 940          | 120      | 0                | 3.9 ms     |
+| **`vern7`**    | **1 420**      | 140      | 0                | **1.7 ms** |
+| `rodas5p`      | 4 060          | 180      | 0                | 5.8 ms     |
+| `rodas4`       | 16 200         | 120      | 0                | 17.6 ms    |
+| `rosenbrock23` | 85 180         | 120      | 0                | 62.4 ms    |
+
+`vern7` takes 2.8× fewer steps and is ~2.3× faster: higher order is what an accuracy-limited fit rewards. `rodas5p` takes the *same* number of steps as `rk45` and is ~1.5× slower, because each step now buys a Jacobian and a factorization the fit does not need — and the lower-order stiff methods are worse still (4.5× and 16×), ordered exactly as their convergence orders predict.
+
+The crossover is real, so do not switch blindly: on the same model at **default** tolerances `vern7` is ~1.4× *slower* than `rk45` (740 → 520 steps, but 10 stages per step instead of 6), because there is no accuracy pressure for its extra order to relieve. Tight tolerance → `vern7`; stability-limited → a Rosenbrock method; otherwise stay on `rk45`.
+
+Read the step counts, not the milliseconds. Step counts are a deterministic property of the method and the model — the ones above reproduce exactly, run to run and machine to machine. The timings are medians of five runs of an optimized build on one machine and move by tens of percent between runs; they are here to show the *ordering*, not as a benchmark to reproduce.
+
+#### Every feature works with every method
+
+> **NOTE:**
+>
+> Features that read state *between* solver steps — a joint PK-TTE hazard at event times, a CTMM occupancy grid, adaptive-dosing monitors — use each method’s continuous extension. `vern7` interpolates with a cubic Hermite (its own continuous extension needs three extra stages), so those readouts are 3rd-order accurate even though its steps are 7th-order accurate. For a model that leans on in-step readouts at very tight tolerance, `rk45` or `rodas5p` interpolate closer to their own step accuracy.
+
+These methods are *linearly implicit*: one Jacobian and one matrix factorization per step, with no Newton iteration. That is also what lets ferx’s analytic sensitivities (`∂ŷ/∂θ`, `∂ŷ/∂η`) run through the identical stepper, so switching methods does not move you off the analytic-gradient path.
+
+The stiff methods are full peers of `rk45`: every feature works with every method. Each method carries its own *continuous extension* (the polynomial that reconstructs the state between two solver steps), which is what the rest of the engine reads state through — the cumulative hazard at event times in a joint PK-TTE fit, a CTMM occupancy grid, `[output]` state columns, adaptive-dosing monitors, and time-to-event simulation, which locates the hazard crossing inside a step. Analytic sensitivities run through the same steppers too. So non-Gaussian endpoints, feedback dosing and TTE simulation all work under `rodas5p` exactly as they do under `rk45`, and asking for an interpolated readout never changes the trajectory it is read from.
+
+## Dose Handling
+
+- **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount, scaled by bioavailability (`F · AMT`), is added to the target compartment (the state at `CMT − 1`, since `CMT` is 1-based — see indexing below)
+- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. A `RATE>0` (or `RATE=-1`) infusion is *rate-defined*, so bioavailability holds the rate and scales the **duration** (#419): the integrator’s timeline is broken at the `F`-scaled end `time + F·AMT/RATE`, and the unscaled `RATE` is added to the target compartment’s derivative for every fully-spanned segment. (A `RATE=-2` modeled-duration infusion is instead *duration-defined* — the window is `time + D{cmt}` and the rate is scaled to `F·AMT/D{cmt}`.) Overlapping infusions on the same compartment sum their rates
+- **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
+- **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
+- **Built-in absorption input rates**: A dose can instead be delivered as a dose-driven appearance rate `R_in(tad)` (e.g. transit-compartment absorption) added into the depot over time — see [Built-in Absorption Models](../model-file/absorption.llms.md)
+
+### Bioavailability
+
+If your `[individual_parameters]` block declares an `F` parameter, the ODE engine applies it **when the dose enters the compartment** — a bolus loads the dosing compartment with `F · AMT`, and an infusion delivers a total of `F · AMT` (a rate-defined infusion holds its rate and scales the duration to `F·AMT/RATE`; a duration-defined `RATE=-2` infusion holds its duration and scales the rate to `F·AMT/D{cmt}`; \#419) — exactly like NONMEM’s `F1` and like ferx’s analytical PK functions. Write the depot’s elimination as the plain `KA · depot` and **do not** multiply by `F` anywhere in the right-hand side, or bioavailability is applied twice. `F` defaults to `1.0` when not declared, so IV and non-bioavailability models are unaffected.
+
+``` text
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = inv_logit(logit(THETA_F) + ETA_F)   # F is applied at dose entry
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - CL/V * central   # no F here
+```
+
+> ⚠️ **Migration note.** Earlier versions of ferx added the *full* dose to the compartment and required `F` to be folded into the absorption flux (e.g. `d/dt(central) = F * KA * depot / V - …`). That `F` must now be removed from the right-hand side — otherwise it is applied both at dose entry **and** in the flux, giving an effective bioavailability of `F²`. Since [\#993](https://github.com/FeRx-NLME/ferx-core/issues/993) such a model is rejected rather than quietly computing `F²`, so a model carried over from that era fails loudly with the fix named.
+>
+> **ferx is stricter than NONMEM here — measured, not assumed.** Two `ADVAN13` control streams differing in exactly one `$DES` line, `F1 = 0.5` fixed, run on NONMEM 7.6.0: with `DADT(2) = F1*KA*A(1) − K*A(2)` every prediction is lower than the `DADT(2) = KA*A(1) − K*A(2)` form by exactly `F1` (`B/A = 0.500000` across 0.5–24 h), i.e. an effective bioavailability of `F²` — and NONMEM reports **nothing**, completing the run with an objective function value. That divergence is the entire point of [\#993](https://github.com/FeRx-NLME/ferx-core/issues/993), but it means a mechanically translated control stream can newly fail to parse even though it ran in NONMEM. Anyone converting control streams (including `ferxtranslate`) should drop the `F` from the translated RHS rather than transcribe `$DES` literally. Control streams, outputs and the ferx-vs-NONMEM comparison are in `nonmem_anchor/` and `tests/dose_attr_double_use_nonmem_anchor.rs`.
+
+The name `F` (any case) is what flags a parameter as bioavailability and routes it to the dosing compartment. If you need a fraction-like quantity inside the RHS that is *not* bioavailability, give it a different name.
+
+### Reading a dose attribute is an error, not a warning
+
+`F` is consumed by the engine **at the dose event**, so a correct model never reads it back on the prediction path. Declaring `F` *and* referencing it in the `[odes]` **RHS** or `[scaling]` is rejected at parse time with `E_DOSE_ATTR_DOUBLE_USE` ([\#993](https://github.com/FeRx-NLME/ferx-core/issues/993)) — an `init(...)` seed is exempt, see below:
+
+``` text
+[odes]: `F` is this model's bioavailability — the engine already scales each dose
+amount by it — but it is also read in the [odes] RHS, so the value is applied
+twice: once at the dose, once where you read it (#993). If `F` is meant to be
+bioavailability, remove it from the [odes] RHS; if it is meant to be an ordinary
+parameter, rename it — `F` is a reserved dose-attribute name.
+```
+
+The rule follows the **expressions compiled against your individual parameters**, not the block headings: every read in the `[odes]` **RHS** counts, and so does the `[adaptive_dosing] observe` signal. That last one matters most — `observe` is what the `when` rules compare against, so a double-applied `F` there biases the titration decision itself and every dose the controller goes on to emit, not just a reported number.
+
+> **NOTE:**
+>
+> An initial condition is not an absorbed dose. The engine seeds the state with the raw expression value and applies dose attributes only at dose events, so
+>
+> ``` text
+> [odes]
+>   init(central) = F * 100.0
+>   d/dt(central) = -(CL/V) * central
+> ```
+>
+> applies `F` **once**, to a quantity nothing else scales — the bioavailable residue of a pre-study 100 mg dose. This is accepted ([\#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)); it was rejected before, which made a correct model unwritable and advised the one repair that is always wrong for it — renaming the parameter whose meaning *is* bioavailability.
+>
+> The RHS is genuinely different: `d/dt(central) = … F …` folds `F` into the flux, so every gram that ever entered the compartment is multiplied by it a second time. That stays rejected.
+>
+> NONMEM agrees. `A_0(1) = F1*100` with `F1 = 0.5` seeds 50, not 25, and `A_0(1) = ALAG1*100` is deposited unshifted — each run byte-identical to the twin seeding from an ordinary parameter of the same value (`nonmem_anchor/odes_init_dose_attr_{f,lag}_{A,B}.ctl`). The analytical `[initial_conditions]` block carries the same carve-out.
+
+The same rule covers `LAGTIME`/`ALAG` and the compartment-indexed `F{n}` / `ALAG{n}` / `LAGTIME{n}` below. These apply to **every** dose, so the collision is decidable from the model alone. `D{n}` / `R{n}` are different: the engine only consults them for a dose that codes `RATE=-2` / `RATE=-1`, so an `R1` that is really a rate constant is a perfectly good model on ordinary data. That pair is therefore checked against the **dataset** instead — see [Modeled infusion duration](#modeled-infusion-duration-dn-rate-2) and [Modeled infusion rate](#modeled-infusion-rate-rn-rate-1) — and reports the same code only when a coded-`RATE` dose actually lands on the parameter.
+
+Reads that are *not* on the prediction path are fine: `[derived]` and `[output]` are post-solve reporting, so tabulating your own `F` (or an exposure computed from it) is correct and stays silent.
+
+Analytical (`pk ...`) models are covered by the same rule ([\#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)), keyed off the `pk(..., f=F)` / `lagtime=…` mapping instead of the name — their prediction-path surfaces are `[scaling]` and `[adaptive_dosing] observe` (an `[initial_conditions]` amount is not a dose, so the engine seeds it with `F = 1` and no lag, and reading the attribute there applies it once). Because the mapping is the binding, the remediation is to drop the `f=`/`lagtime=` argument rather than rename the parameter; a parameter merely *named* `F` that nothing maps is an ordinary parameter on that engine. See [Individual Parameters](../model-file/individual-parameters.llms.md#pk-parameter-names).
+
+See `examples/bioavailability_ode.ferx` for a complete worked model.
+
+### Compartment-indexed bioavailability and lag (`Fn` / `ALAGn`)
+
+When a model is dosed into **more than one compartment**, bioavailability and absorption lag can differ by route. Mirroring NONMEM’s `F1`/`F2` and `ALAG1`/`ALAG2`, name an individual parameter `F{n}` or `ALAG{n}` (equivalently `LAGTIME{n}`), where `n` is the 1-based dose compartment:
+
+``` text
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  F1    = inv_logit(THETA_F1)   # bioavailability for doses into compartment 1
+  F2    = inv_logit(THETA_F2)   # ... and into compartment 2
+  ALAG2 = TVLAG2                # absorption lag for compartment-2 doses only
+```
+
+- A dose into compartment `n` uses `F{n}` / `ALAG{n}` if declared.
+- A **bare** `F` / `lagtime` (no index) remains the all-compartment default, so existing single-route models are unchanged. An indexed value overrides the bare default for its compartment only; compartments without an indexed entry fall back to the bare value (or to `F = 1`, `lag = 0`).
+- The index must refer to a compartment the model actually has — `F3` on a two-state model is a parse error, not a silently-ignored parameter.
+- Each declared `Fn`/`ALAGn` occupies one free slot in the fixed PK parameter layout (`MAX_PK_PARAMS`, 128 slots), shared with the model’s other individual parameters. A model that runs out gets a clear “too many individual parameters” parse error rather than failing silently.
+
+> ⚠️ **`F{n}` / `ALAG{n}` / `LAGTIME{n}` are reserved names** (just like the bare `F` / `lagtime` above, and exactly as in NONMEM). On an ODE model, declaring an individual parameter with one of these names binds it as compartment `n`’s bioavailability / lag and applies it to **every** dose into compartment `n` — even if you also reference the parameter in the `[odes]` RHS. So don’t reuse `F2`, `ALAG2`, … for an unrelated fraction or rate term; give such a quantity a different (un-indexed-looking) name.
+
+This is an **ODE-engine** feature: the analytical PK functions have a single fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. You may still *name* an analytical parameter `F{n}`/`ALAG{n}` and bind it through that mapping (`pk(..., f=F1)` routes `F1` into the single `F` slot and applies it exactly like `f=F`), but an `F{n}`/`ALAG{n}`/`LAGTIME{n}` parameter left *unmapped* on an analytical model is a parse error rather than a silently-ignored no-op (#725). (The EKF/`[diffusion]` path applies per-compartment `F` but, as elsewhere, does not apply absorption lag.)
+
+> Per-compartment **observation scaling** (NONMEM’s `Sn`, e.g. `S2 = V`) is a separate, readout-side concept — it divides a compartment’s amount to give the observed concentration. It is configured in the [`[scaling]`](../model-file/scaling.llms.md) block (`obs_scale[CMT=n] = …` or `y[CMT=n] = …`), not via a reserved `Sn` individual parameter.
+
+### Modeled infusion duration (`Dn`, `RATE=-2`)
+
+NONMEM’s `RATE = -2` makes a zero-order infusion’s **duration** a model parameter rather than a data value. Mirror it by naming an individual parameter `D{n}` for the dose compartment `n`, and coding `RATE = -2` on the dose row (`AMT` is still the amount). ferx then infuses `AMT` over the modeled duration `D{n}` — i.e. at rate `AMT / D{n}` — resolved **per iteration and occasion** from the parameter, so the duration can carry covariate effects and between-occasion variability:
+
+``` text
+[parameters]
+  theta TVD1(2.0, 0.1, 24.0)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1 * exp(ETA_D1)   # modeled duration for infusions into compartment 1
+```
+
+``` text
+# dataset: a RATE=-2 dose of 100 units into compartment 1
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,-2,1
+```
+
+- A `RATE=-2` dose into compartment `n` **requires** a `D{n}` parameter; without one it is a loud error at the model+data join (`ferx check` / `fit`), never a silent bolus.
+- `D{n}` composes with the dose attributes above: bioavailability `F{n}` scales the delivered amount **once** (`F·AMT` over `D{n}`, matching NONMEM’s `F·RATE`), and absorption lag `ALAG{n}` shifts the infusion window’s start while `D{n}` sets its length.
+- A transient `D{n} ≤ 0` during estimation is clamped to a tiny positive floor (so `AMT / D{n}` stays finite); the converged optimum is interior, so reported estimates are unaffected — the same guard the built-in absorption models use.
+- A **non-finite** `D{n}` (`NaN` / `Inf`) is *not* clamped — it is out of domain, not on the wrong side of a wall. One that is already non-finite at typical values is rejected at fit-init as `E_DOSE_ATTR_NONFINITE`, naming the subject and the dose record; one produced by a mid-fit parameter excursion makes that subject’s predictions `NaN`, which the estimator reads as a diverged solve and the optimizer as a wall to climb away from. Before [\#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284) both shapes were quietly served as an **instantaneous bolus** — `NaN` took the floor (every `>` is false for `NaN`) and `+Inf` gave `rate = AMT/Inf = 0`, which is not an infusion at all — so the fit returned finite, silently wrong numbers, measured 2.03× high at one elimination half-time on a 1-cpt model.
+
+> ⚠️ Like `F{n}` / `ALAG{n}`, `D{n}` is a **reserved name** when a `RATE=-2` dose targets compartment `n` (as in NONMEM). It then denotes that compartment’s infusion duration even if you also reference it in the `[odes]` RHS — so don’t reuse `D1`, `D2`, … for an unrelated decay constant or rate term.
+
+`RATE=-2` works on **both engines**. On an analytical model (`pk(...)`) declare the `D{n}` individual parameter and the closed-form infusion uses `rate = AMT / D{n}`. A `RATE=-2` dose still **requires** a matching `D{n}` parameter, or it is a loud error (never a silent bolus). The compartment index follows the analytical model’s compartment numbering (e.g. `D1` for the central compartment of a `two_cpt_iv` model, `D2` for its peripheral compartment).
+
+The modeled duration just sets the *rate* of an otherwise ordinary infusion, so the **target compartment must be one the analytical engine can infuse into** — exactly the same set as for an explicit positive `RATE`: the central compartment for every model, the peripheral compartment(s) for the 2-/3-cpt IV models, and — since \#400 — the **oral depot** (compartment 1) of `one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`. A `D1` into the oral depot is a **zero-order absorption** model: drug is released into the depot at a constant rate over the modeled duration, then absorbed first-order into central via `KA`. This stays on the closed-form engine — no `ode(...)` block needed. (Per-compartment amounts in `sdtab`/`[derived]` are not available for those subjects — the predictions are exact; use an `ode(...)` model if you need the compartment amounts.) Since \#375 the closed forms also infuse an oral **peripheral** compartment, so `D3` on `two_cpt_oral` (and `D3`/`D4` on `three_cpt_oral`) is accepted. A `D{cmt}` naming a compartment the model does not have — or any `D{cmt}` on a transit / inverse-Gaussian absorption model — is still **rejected at parse time**; use an `ode(...)` model for those.
+
+> A modeled-`RATE` dose (`RATE=-2` or `-1`) on an **analytical** model keeps the exact gradient on both loops: the infusion window’s end is a moving boundary carried in the dual sub-interval lengths.
+
+### Modeled infusion rate (`Rn`, `RATE=-1`)
+
+NONMEM’s `RATE = -1` is the mirror of `-2`: it makes the infusion **rate** a model parameter rather than a data value. Name an individual parameter `R{n}` for the dose compartment `n` and code `RATE = -1` on the dose row; ferx then infuses `AMT` at the modeled rate `R{n}` — i.e. over duration `AMT / R{n}` — resolved **per iteration and occasion**, so the rate can carry covariate effects and between-occasion variability:
+
+``` text
+[individual_parameters]
+  R1 = TVR1 * exp(ETA_R1)   # modeled rate for infusions into compartment 1
+```
+
+``` text
+# dataset: a RATE=-1 dose of 100 units into compartment 1
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,-1,1
+```
+
+Everything said about `D{n}` applies symmetrically: a `RATE=-1` dose **requires** a matching `R{n}` (else a loud `E_MODELED_RATE_NO_PARAM` error, never a silent bolus); `R{n}` is a **reserved name** when a `RATE=-1` dose targets compartment `n`; it works on **both engines** over the same infusable compartments; a transient `R{n} ≤ 0` is clamped to a tiny positive floor (and warned via `W_MODELED_RATE_NONPOSITIVE` if non-positive at the initial estimate); a **non-finite** `R{n}` is rejected at fit-init or repels the subject mid-fit, exactly as for `D{n}` above ([\#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284) — the damage ran the other way there, a `NaN` clamped to `RATE_FLOOR = 1e-8` spreading the dose over `AMT/1e-8` time units so that essentially nothing was delivered); and a modeled-rate dose keeps its exact analytic gradient. Internally, `RATE=-1 R{n}=r` resolves to exactly the explicit `RATE = r` infusion.
+
+> ⚠️ **Bioavailability `F ≠ 1`.** ferx applies `F` by scaling the infusion *rate* (over the duration `AMT/R{n}`), so a `RATE=-1` dose behaves identically to its explicit `RATE = R{n}` twin — exact at `F = 1` (the usual case, and the NONMEM-anchored one). NONMEM instead keeps the rate at `R{n}` and scales the *duration* to `F·AMT/R{n}` for rate-defined infusions; total exposure (`F·AMT`) agrees but the infusion shape differs when `F ≠ 1`. Aligning rate-defined infusions (`RATE>0` and `RATE=-1`) with NONMEM’s duration-scaling under `F ≠ 1` is a tracked follow-up.
+
+## Stochastic ODE Models (SDE)
+
+To model within-subject system noise that accumulates between observations, add a `[diffusion]` block to your ODE model. See [Stochastic Differential Equations](../model-file/diffusion.llms.md) for a full description, worked example, and comparison with sigma and omega.
+
+## Limitations
+
+- The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed
+- SDE (`[diffusion]`) is not compatible with SAEM; under FOCE/FOCEI it runs on the exact gradient
+
+Steady-state (`SS=1`) is supported for ODE models via numerical pulse-expansion equilibration — see [Steady-State Doses](../model-file/steady-state.llms.md) for the mechanism and how it differs from the analytical closed forms.
