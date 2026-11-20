@@ -136,8 +136,8 @@ pub(crate) const EVENT_MATCH_TOL: f64 = 1e-12;
 /// `17520` is hours in two years, so this is an ordinary study timescale, not a corner.
 /// The difference form degrades gracefully: as `ulp` grows past the tolerance the band
 /// narrows to exactly the bit-equal set and never below it. That is the same shape as the
-/// dose-application predicate (`(dose.time - t_start).abs() < EVENT_MATCH_TOL`), which is
-/// why that one never had this failure mode.
+/// dose-application band in [`event_on_break`] (`(t_event - t_break).abs() < EVENT_MATCH_TOL`),
+/// which is why that one never had this failure mode.
 #[inline]
 pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
     t >= t_break && t - t_break < EVENT_MATCH_TOL
@@ -237,9 +237,10 @@ fn dedup_breaks_keeping_records(
 /// an event that has a break of its own later in the band is applied there, not here. The
 /// band can hold two breaks when the reader moved a record one ULP below a co-timed event
 /// (#614, #1810) and that record is itself a break — every observation is on the
-/// time-varying / IOV adaptive walk (#2532), and a lag arrival can land on its bits (#2534). Matched by the band alone, the dose listed after
-/// a pre-dose observation fired at the observation's break, so the observation read the
-/// post-dose state, and so did a decision at the dose's own time (#933's trough).
+/// time-varying / IOV adaptive walk (#2532), and a lag arrival can land on its bits (#2534).
+/// Matched by the band alone, the dose listed after a pre-dose observation fired at the
+/// observation's break, so the observation read the post-dose state, and so did a decision
+/// at the dose's own time (#933's trough).
 ///
 /// The second condition never leaves an event unapplied: a later break at or before
 /// `t_event` is itself within the band, so the event fires there. The timeline's 1e-15 dedup
@@ -252,8 +253,9 @@ fn dedup_breaks_keeping_records(
 /// adaptive driver and both frozen replays. Matched by the band alone, a dose listed after a
 /// trough that a lag arrival lands one ULP below fired at the arrival's break, and the trough
 /// read post-dose (#2534). The adjoint's `integrate_g` and the EKF still match by the band:
-/// they apply no lag, and an infusion end or route onset there leaves the state unchanged, so
-/// [`band_read_state`] already reads the trough pre-dose. Resets go through it with the real
+/// they apply no lag (`plain_walk_subject_supported` routes a lag to the event-driven walk;
+/// the EKF ignores one under `W_SDE_LAGTIME`), and an infusion end or route onset there
+/// leaves the state unchanged, so [`band_read_state`] already reads the trough pre-dose. Resets go through it with the real
 /// `t_next` in `apply_segment_boundary` (#2141).
 #[inline]
 pub(crate) fn event_on_break(t_event: f64, t_break: f64, t_next: f64) -> bool {
@@ -8126,7 +8128,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &dose_lagtimes,
             &injected_f,
             t_start,
-            t_next,
+            // Re-read: the hook may have inserted a controller infusion's end after `t_start`.
+            break_times.get(k + 1).copied().unwrap_or(f64::INFINITY),
             reset_floor,
             &mut applied,
             &mut off_states,
