@@ -5966,6 +5966,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
         sigma,
         mult,
         frozen_var_preds,
+        obs_grad_recycle,
         None,
     )
 }
@@ -5983,7 +5984,8 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
 pub(crate) fn analytic_eta_nll_value_gradient_iov(
     model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_true: &[f64],
     omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
-    mult: Option<&[Vec<f64>]>, value_out: Option<&mut Option<f64>>,
+    mult: Option<&[Vec<f64>]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    value_out: Option<&mut Option<f64>>,
 ) -> Option<Vec<f64>> {
     let layout = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)?;
     analytic_eta_nll_value_gradient_iov_frozen(
@@ -5997,6 +5999,7 @@ pub(crate) fn analytic_eta_nll_value_gradient_iov(
         sigma,
         mult,
         None,
+        obs_grad_recycle,
         value_out,
     )
 }
@@ -6006,7 +6009,8 @@ fn analytic_eta_nll_value_gradient_iov_frozen(
     model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
     omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
-    frozen_var_preds: Option<&[f64]>, mut value_out: Option<&mut Option<f64>>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    mut value_out: Option<&mut Option<f64>>,
 ) -> Option<Vec<f64>> {
     if let Some(v) = value_out.as_deref_mut() {
         *v = None;
@@ -6058,6 +6062,7 @@ fn analytic_eta_nll_value_gradient_iov_frozen(
         sigma,
         mult,
         frozen_var_preds,
+        value_out,
     );
     *obs_grad_recycle = rows;
     grad
@@ -6065,13 +6070,15 @@ fn analytic_eta_nll_value_gradient_iov_frozen(
 
 /// The body of [`analytic_eta_nll_gradient_iov_frozen`] over the recorded rows `sens`
 /// (the subject's prediction rows, then an SDE subject's EKF variance rows) and the search
-/// vector `axes`, so the caller hands its row buffer back on every exit.
+/// vector `axes`, so the caller hands its row buffer back on every exit. `value_out`: the
+/// fused objective value (see [`analytic_eta_nll_value_gradient_iov`]).
 #[allow(clippy::too_many_arguments)]
 fn iov_gradient_from_rows(
     model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
     sens: &[crate::sens::provider::ObsGrad], theta: &[f64], stacked_true: &[f64], axes: &[f64],
     omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
     mult: Option<&[Vec<f64>]>, frozen_var_preds: Option<&[f64]>,
+    value_out: Option<&mut Option<f64>>,
 ) -> Option<Vec<f64>> {
     let n_eta = layout.n_eta();
     // An SDE subject's EKF variance rows (BSV-only filter: their κ columns are zero).

@@ -1701,9 +1701,6 @@ fn run_mcem(
                 &init_params.theta_fixed,
                 &closed_form_owned,
             ),
-            // `auto` keeps Newton for a σ-only solve here: BOBYQA has no memo at `imp_samples`
-            // per subject, Newton's is the gain (`resolve_mstep_optimizer`).
-            false,
             label,
         );
     warnings.extend(mstep_optimizer_warning);
@@ -2989,7 +2986,6 @@ fn run_mcem_mixture(
             true,
             // Every class θ is the weighted M-step's here, but the mixing ones.
             true,
-            false,
             label,
         );
     warnings.extend(mstep_optimizer_warning);

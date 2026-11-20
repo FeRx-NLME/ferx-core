@@ -2434,6 +2434,7 @@ impl<'a> EtaPotential<'a> {
                     omega_iov,
                     self.sigma,
                     self.prep.ruv_mult(),
+                    self.recycle,
                     want_value.then_some(&mut fused),
                 )?;
                 // The η block leads the stacked vector unless the layout compacts it (nested
@@ -3200,20 +3201,18 @@ pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Optio
 /// M-steps have any θ the closed-form steps do not own (a σ-only solve's score is the exact σ
 /// score whatever the adjoint's scope).
 ///
-/// `sigma_only_bobyqa` is where `auto` keeps `bobyqa` for a solve with no free θ: SAEM's, whose
-/// σ-only BOBYQA evaluations are *all* served by the prediction memo (one prediction pass per
-/// M-step, then residual arithmetic). Newton's σ-only pass needs no recording either (every θ
-/// pinned), and costs the same per iteration (pk2_big stand-in, 30 seeds: 7.21 against
-/// 7.28 ms), but its exact σ follows each draw's noise where the warm-started BOBYQA, stopping
-/// at its tolerance, smooths it, and the automatic exploration stop then fires later: K1
-/// median 2110 against 1805 (longer on 18 seeds, shorter on 8), ~10 % more CPU at the same
-/// −2LL (#2986). IMP/IMPMAP pass `false`: there BOBYQA keeps no memo (it is
-/// `subjects × K × n_obs` numbers at `imp_samples` per subject) and recomputes every σ-only
-/// evaluation, so Newton's memo is the gain (σ-only Newton is 0.39–0.54× BOBYQA's
-/// instructions).
+/// A σ-only solve (every θ the closed-form steps', e.g. a combined error) runs Newton under
+/// `auto` too (#2986): with every θ pinned its fused pass takes no recording — the σ score and
+/// information are residual arithmetic on the memoized predictions — so Fisher scoring reaches
+/// the exact optimum at BOBYQA's cost per iteration (pk2_big stand-in, 30 seeds: 7.21 against
+/// 7.28 ms). Measured trade-off under SAEM: the exact σ follows each draw's noise where the
+/// warm-started BOBYQA smooths it, so the automatic exploration stop fires later (median K1
+/// 2110 against 1805, ~10 % more CPU at the same −2LL); `mstep_optimizer = bobyqa` restores
+/// the derivative-free solve. Under IMP/IMPMAP, where BOBYQA keeps no memo, σ-only Newton is
+/// 0.39–0.54× BOBYQA's instructions.
 pub(crate) fn resolve_mstep_optimizer(
     model: &CompiledModel, requested: MstepOptimizer, score_sa_active: bool, is_mixture: bool,
-    theta_free: bool, sigma_only_bobyqa: bool, label: &str,
+    theta_free: bool, label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     resolve_mstep_optimizer_for(
         requested,
@@ -3221,7 +3220,6 @@ pub(crate) fn resolve_mstep_optimizer(
         crate::sens::ode_provider::adjoint::recorder_in_scope(model),
         newton_scope_gap(model, is_mixture),
         theta_free,
-        sigma_only_bobyqa,
         label,
     )
 }
@@ -3237,17 +3235,16 @@ pub(crate) fn mstep_has_free_theta(n_theta: usize, theta_fixed: &[bool], owned: 
 /// whether any θ is left to the numerical solve.
 fn resolve_mstep_optimizer_for(
     optimizer: MstepOptimizer, score_sa_active: bool, exact_theta_score: bool,
-    newton_gap: Option<&str>, theta_free: bool, sigma_only_bobyqa: bool, label: &str,
+    newton_gap: Option<&str>, theta_free: bool, label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     if optimizer == MstepOptimizer::Bobyqa {
         return (optimizer, None);
     }
     if optimizer == MstepOptimizer::Auto {
-        // The documented rule, applied silently: Newton wherever its scope holds. Under
-        // `score_sa` there is no numerical solve to choose for, and where BOBYQA's σ-only
-        // evaluations are memo-served (`sigma_only_bobyqa`) a solve with no θ has none to gain.
+        // The documented rule, applied silently: Newton wherever its scope holds, a σ-only
+        // solve included. Under `score_sa` there is no numerical solve to choose for.
         return (
-            if score_sa_active || newton_gap.is_some() || (sigma_only_bobyqa && !theta_free) {
+            if score_sa_active || newton_gap.is_some() {
                 MstepOptimizer::Bobyqa
             } else {
                 MstepOptimizer::Newton
@@ -6287,7 +6284,6 @@ pub fn run_saem(
         use_score_sa,
         saem_mix.is_some(),
         mstep_has_free_theta(n_theta, &init_params.theta_fixed, &closed_form_owned),
-        true,
         "SAEM",
     );
     warnings.extend(mstep_optimizer_warning);

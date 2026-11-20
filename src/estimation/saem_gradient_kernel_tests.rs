@@ -417,6 +417,7 @@ fn the_fused_iov_value_is_the_native_iov_nll() {
             omega_iov,
             sigma,
             None,
+            &mut Vec::new(),
             Some(&mut direct),
         )
         .expect("served");

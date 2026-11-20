@@ -750,7 +750,7 @@ estimates, so a negative difference is a better fit.
 | `pk1_nomu` (5 seeds) | 5 | 0.68 | −1.5 to +2.9 |
 | `imp_non_mu_ref` (IMP) | 14 θ | 0.23 | −1.5, −2.6 |
 | IMPMAP, σ only (3 models) | 1 | 0.39 to 0.54 | 0.000 |
-| SAEM, σ only (14 models) | 0 to 1 | 1.00 (`auto` is `bobyqa` there: the BOBYQA fit) | 0.000 |
+| SAEM, σ only (14 models) | 0 to 1 | 1.00 to 1.07 | 0.000 |
 | SAEM, 2 θ on an ODE model (`frac_ode`) | 3 | 1.14 | within ±1.3 |
 
 The gain on the multi-θ models is mostly BOBYQA's old budget, not Newton: BOBYQA spends
@@ -764,10 +764,10 @@ instructions on 14 SAEM models; 7.21 against 7.28 ms per iteration on the pk2_bi
 But Newton's exact σ follows each draw's noise, where the warm-started BOBYQA, stopping at its
 tolerance, smooths it, and the automatic exploration stop then fires later: on 30 pk2_big
 seeds K1 had a median of 2110 against 1805 (longer on 18 seeds, shorter on 8), about 10 percent
-more CPU at the same −2 log L. So SAEM's `auto` keeps `bobyqa` there and the fit is the BOBYQA
-fit: identical estimates and instructions to `mstep_optimizer = bobyqa`. IMP and IMPMAP keep
-`newton` for σ-only solves, where BOBYQA has no memo and Newton's is the gain (0.39 to 0.54
-times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
+more CPU at the same −2 log L. `auto` runs `newton` there anyway (#2986: the exact optimum by
+Fisher scoring, the same rule as everywhere else); `mstep_optimizer = bobyqa` restores the
+derivative-free solve and its earlier stop. Under IMP and IMPMAP, where BOBYQA has no memo,
+Newton's σ-only solve is the gain (0.39 to 0.54 times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
 with two θ that have no η, costs 1.14 times BOBYQA's instructions there.
 
 Newton's M-step is as exact as BOBYQA's at the same tolerance. On `pk1_nomu`, `pk2_big`,
