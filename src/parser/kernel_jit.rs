@@ -3367,7 +3367,15 @@ unsafe impl Sync for ChunkKernel {}
 /// tiers agree bit for bit (`NaN` and the sign of a zero included); only the cost moves. A
 /// kernel the fit calls a few dozen times is never compiled, one it calls millions of times is optimized.
 pub(crate) struct Tiered {
-    f: Func,
+    /// The folded scalar function (#3076): read by the interpreter, by each tier's compile and
+    /// once by [`SegPlan::new`], so it is dropped (`None`) once the kernel's final tier
+    /// ([`Self::final_tier`]) is compiled — nothing reads it after that. An interpreting call
+    /// holds its own `Arc` for the length of the call, so a compile that swaps the final entry
+    /// point in on another thread cannot free the function under it. Kept while the kernel is
+    /// still below its final tier, including after a failed or panicked compile.
+    f: Mutex<Option<Arc<Func>>>,
+    /// The function's instruction count, which outlives it: what picks the last tier.
+    n_insts: usize,
     layout: Layout,
     n_in: usize,
     rev: bool,
@@ -3450,13 +3458,15 @@ const TIER3_MAX_INSTS: usize = 4096;
 impl Tiered {
     fn new(f: Func, layout: Layout, n_in: usize, rev: bool, prefix: usize) -> Arc<Self> {
         let f = f.into_kernel();
+        let n_insts = f.insts.len();
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             spill: OnceLock::new(),
             want: std::sync::atomic::AtomicU8::new(0),
             queued: std::sync::atomic::AtomicBool::new(false),
             prefix,
-            f,
+            f: Mutex::new(Some(Arc::new(f))),
+            n_insts,
             layout,
             n_in,
             rev,
@@ -3472,13 +3482,15 @@ impl Tiered {
     /// [`Self::new`] for a rows reverse kernel splitting its slot table at `entries`.
     fn new_rows(f: Func, layout: Layout, n_in: usize, prefix: usize, entries: usize) -> Arc<Self> {
         let f = f.into_kernel();
+        let n_insts = f.insts.len();
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             spill: OnceLock::new(),
             want: std::sync::atomic::AtomicU8::new(0),
             queued: std::sync::atomic::AtomicBool::new(false),
             prefix,
-            f,
+            f: Mutex::new(Some(Arc::new(f))),
+            n_insts,
             layout,
             n_in,
             rev: true,
@@ -3516,10 +3528,15 @@ impl Tiered {
     #[inline]
     unsafe fn call(&self, base: *mut f64, adj: *mut f64, idx: *const u32, lits: *const f64) {
         self.count(1);
-        let p = self.native.load(std::sync::atomic::Ordering::Acquire);
+        let mut p = self.native.load(std::sync::atomic::Ordering::Acquire);
         if p == 0 {
-            self.interpret(base, adj, idx, lits, 1, 0);
-        } else if p & SEGMENTED != 0 {
+            if self.interpret(base, adj, idx, lits, 1, 0) {
+                return;
+            }
+            // The final tier landed (and dropped the function) since the load above.
+            p = self.native_after_drop();
+        }
+        if p & SEGMENTED != 0 {
             self.run_segments(p, base, adj, idx, lits, 1, 0);
         } else if self.rev {
             let f: ChunkRevFn = std::mem::transmute(p);
@@ -3551,7 +3568,7 @@ impl Tiered {
     /// Compile every tier `n` calls have reached and this kernel has not.
     #[cold]
     fn promote_to(&self, n: usize) {
-        let want = if n >= TIER3_CALLS && self.f.insts.len() <= TIER3_MAX_INSTS {
+        let want = if n >= TIER3_CALLS && self.n_insts <= TIER3_MAX_INSTS {
             3
         } else if n >= TIER2_CALLS {
             2
@@ -3582,12 +3599,18 @@ impl Tiered {
                 }
                 return;
             }
-            match want {
+            let compiled = match want {
                 1 => self.promote(true, "none"),
                 2 => self.promote(true, "speed"),
                 _ => self.promote(false, "speed"),
-            }
+            };
             self.tier.store(want, Relaxed);
+            // The final tier's entry point is in: nothing reads the function again (#3076).
+            // A failed compile leaves the kernel on its previous entry point, which may be the
+            // interpreter, so it keeps the function.
+            if compiled && want >= self.final_tier() {
+                *self.f.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
         }
     }
 
@@ -3647,33 +3670,55 @@ impl Tiered {
         lits: *const f64,
     ) {
         self.count(seeds);
-        let p = self.native.load(std::sync::atomic::Ordering::Acquire);
+        let mut p = self.native.load(std::sync::atomic::Ordering::Acquire);
         if p == 0 {
-            self.interpret(base, adj, idx, lits, seeds, stride);
-        } else {
-            if p & SEGMENTED != 0 {
-                return self.run_segments(p, base, adj, idx, lits, seeds, stride);
+            if self.interpret(base, adj, idx, lits, seeds, stride) {
+                return;
             }
-            let f: ChunkRevFn = std::mem::transmute(p);
-            f(base, adj, idx, lits, seeds, stride);
+            p = self.native_after_drop();
+        }
+        if p & SEGMENTED != 0 {
+            return self.run_segments(p, base, adj, idx, lits, seeds, stride);
+        }
+        let f: ChunkRevFn = std::mem::transmute(p);
+        f(base, adj, idx, lits, seeds, stride);
+    }
+
+    /// The function, while the kernel still holds it (until its final tier is compiled).
+    fn ir(&self) -> Option<Arc<Func>> {
+        self.f.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The last tier this kernel is ever compiled to: the backtracking allocator's only up to
+    /// [`TIER3_MAX_INSTS`].
+    fn final_tier(&self) -> u8 {
+        if self.n_insts <= TIER3_MAX_INSTS {
+            3
+        } else {
+            2
         }
     }
 
-    /// Compile the next tier and switch to it; a failed compile keeps the current one.
-    fn promote(&self, quick: bool, opt: &str) {
+    /// The native entry point of a kernel whose function is gone: the final tier's, stored
+    /// (`Release`) before the function was dropped under the lock this caller just took.
+    fn native_after_drop(&self) -> usize {
+        let p = self.native.load(std::sync::atomic::Ordering::Acquire);
+        assert!(p != 0, "a kernel dropped its function before its final entry point landed");
+        p
+    }
+
+    /// Compile the next tier and switch to it; a failed compile keeps the current one
+    /// (`false`).
+    fn promote(&self, quick: bool, opt: &str) -> bool {
         let t = std::time::Instant::now();
-        let plan = self.spill.get_or_init(|| SegPlan::new(&self.f, self.rev, self.prefix)).as_ref();
-        let Some(k) = lower_chunk_opt(
-            &self.f,
-            self.layout,
-            self.n_in,
-            self.rev,
-            self.prefix,
-            quick,
-            opt,
-            plan,
-        ) else {
-            return;
+        let Some(f) = self.ir() else {
+            return false;
+        };
+        let plan = self.spill.get_or_init(|| SegPlan::new(&f, self.rev, self.prefix)).as_ref();
+        let Some(k) =
+            lower_chunk_opt(&f, self.layout, self.n_in, self.rev, self.prefix, quick, opt, plan)
+        else {
+            return false;
         };
         // A segmented kernel's entry point is tagged (a function's address is aligned).
         let p = k.f as usize | if k.segs.is_some() { SEGMENTED } else { 0 };
@@ -3681,17 +3726,22 @@ impl Tiered {
         self.native.store(p, std::sync::atomic::Ordering::Release);
         STATS.compiled.fetch_add(1, Relaxed);
         STATS.compile_us.fetch_add(t.elapsed().as_micros() as usize, Relaxed);
+        true
     }
 
     /// The chunk's scalar function run in Rust ([`interpret_func`]): the cold tier. A reverse's
     /// seeds share its forward. It is the function the compiled tiers lower, so every tier of
-    /// a kernel gives the same bits.
+    /// a kernel gives the same bits. `false`, running nothing, once the function is dropped
+    /// (the final tier's entry point serves instead).
     unsafe fn interpret(
         &self, base: *mut f64, adj: *mut f64, idx: *const u32, lits: *const f64, seeds: usize,
         stride: usize,
-    ) {
+    ) -> bool {
+        let Some(f) = self.ir() else {
+            return false;
+        };
         interpret_func(
-            &self.f,
+            &f,
             self.layout.lanes(),
             self.n_in,
             self.rev,
@@ -3703,6 +3753,7 @@ impl Tiered {
             seeds,
             stride,
         );
+        true
     }
 }
 
@@ -5633,7 +5684,7 @@ impl Plan {
                         assert!(
                             worst < 1e-12,
                             "rows reverse vs per-direction on a {}-instruction chunk: {worst:e}",
-                            k.f.insts.len()
+                            k.n_insts
                         );
                     }
                 }
@@ -5861,7 +5912,7 @@ impl Plan {
                         assert!(
                             worst < 1e-12,
                             "rows forward vs one tangent on a {}-instruction chunk: {worst:e}",
-                            k.f.insts.len()
+                            k.n_insts
                         );
                     }
                     if guard.is_some_and(|g| buf[g as usize * l] != 1.0) {
@@ -6915,8 +6966,8 @@ mod seg_tests {
         f.insts.reserve(64);
         assert!(!f.live.is_empty() && f.insts.capacity() > f.insts.len());
         let t = Tiered::new_rows(f, layout(), 8, 0, 8);
-        assert!(t.f.live.is_empty());
-        assert_eq!(t.f.insts.capacity(), t.f.insts.len());
+        assert!(t.ir().unwrap().live.is_empty());
+        assert_eq!(t.ir().unwrap().insts.capacity(), t.ir().unwrap().insts.len());
     }
 
     #[test]
@@ -6940,7 +6991,7 @@ mod seg_tests {
     fn a_promoted_large_kernel_runs_on_a_small_stack_at_every_tier() {
         let l = layout().lanes();
         let t = Tiered::new(sum_func(l), layout(), M, false, 0);
-        assert!(t.spill.get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix)).is_some());
+        assert!(t.spill.get_or_init(|| SegPlan::new(&t.ir().unwrap(), t.rev, t.prefix)).is_some());
         let idx: Vec<u32> = (0..=M as u32).collect();
         let inp = inputs(l);
         let mut want = inp.clone();
@@ -6967,6 +7018,70 @@ mod seg_tests {
         }
     }
 
+    /// A kernel drops its function once its final tier is compiled, and not before (#3076):
+    /// the function is dead after that (nothing interprets, compiles or plans from it again),
+    /// and on a fit's ODE loop kernels it was over a gigabyte. Driven through its calls — the
+    /// production promotion path — each kernel gives the interpreter's bits at every call,
+    /// before and after the drop. Two sizes, because the final tier differs: the optimizing
+    /// allocator's (3) for a small kernel, the quick tier's (2) for one past
+    /// [`TIER3_MAX_INSTS`], which never compiles further.
+    /// Mutations: never drop → the `is_none` checks fail; drop at any compiled tier → the small
+    /// kernel's `is_some` after tier 2 fails; drop by `TIER3_MAX_INSTS` on the wrong side → one
+    /// of the two kernels fails.
+    #[test]
+    fn a_kernel_drops_its_function_at_its_final_tier_and_computes_the_same_bits() {
+        let l = layout().lanes();
+        for (m, last, last_calls) in [(8, 3u8, TIER3_CALLS), (1500, 2u8, TIER2_CALLS)] {
+            let t = Tiered::new(sum_func_n(m, l), layout(), m, false, 0);
+            assert_eq!(t.n_insts > TIER3_MAX_INSTS, last == 2, "the {m}-input kernel's size");
+            assert_eq!(t.final_tier(), last);
+            let idx: Vec<u32> = (0..=m as u32).collect();
+            let inp: Vec<f64> = (0..(m + 1) * l).map(|k| 0.5 + (k as f64 * 0.37).sin()).collect();
+            let mut want = inp.clone();
+            // SAFETY: `idx` names `m + 1` lane blocks of `want`.
+            assert!(unsafe {
+                t.interpret(
+                    want.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    idx.as_ptr(),
+                    [].as_ptr(),
+                    1,
+                    0,
+                )
+            });
+            let want = want[m * l];
+            assert!(want.is_finite() && want != inp[m * l]);
+            let mut buf = inp.clone();
+            for n in 1..=last_calls + 16 {
+                buf[m * l] = 0.0;
+                // SAFETY: as above, for `buf`.
+                unsafe {
+                    t.call(buf.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), [].as_ptr())
+                };
+                assert_eq!(buf[m * l].to_bits(), want.to_bits(), "{m} inputs, call {n}");
+                if n == TIER2_CALLS {
+                    assert_eq!(t.tier.load(Relaxed), 2, "{m} inputs at tier 2");
+                    assert_eq!(t.ir().is_none(), last == 2, "{m} inputs: function after tier 2");
+                }
+            }
+            assert_eq!(t.tier.load(Relaxed), last, "{m} inputs reached their final tier");
+            assert_ne!(t.native.load(Relaxed), 0);
+            assert!(t.ir().is_none(), "{m} inputs: the function outlived the final tier");
+            // The interpreter declines rather than run a function that is gone.
+            let mut again = inp.clone();
+            assert!(!unsafe {
+                t.interpret(
+                    again.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    idx.as_ptr(),
+                    [].as_ptr(),
+                    1,
+                    0,
+                )
+            });
+        }
+    }
+
     /// The largest kernel left whole ([`SEG_MIN_INSTS`]) has every value live across it, the worst
     /// case for the single-pass allocator's spill slots: its frame still fits the stack a deep
     /// caller leaves (512 KiB stack, 64 KiB used), at both quick tiers. Past it the kernel is cut
@@ -6976,8 +7091,11 @@ mod seg_tests {
         let m = SEG_MIN_INSTS / 3;
         let l = layout().lanes();
         let t = Tiered::new(sum_func_n(m, l), layout(), m, false, 0);
-        assert!(t.f.insts.len() <= SEG_MIN_INSTS && t.f.insts.len() + 3 > SEG_MIN_INSTS);
-        assert!(t.spill.get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix)).is_none());
+        assert!(
+            t.ir().unwrap().insts.len() <= SEG_MIN_INSTS
+                && t.ir().unwrap().insts.len() + 3 > SEG_MIN_INSTS
+        );
+        assert!(t.spill.get_or_init(|| SegPlan::new(&t.ir().unwrap(), t.rev, t.prefix)).is_none());
         let idx: Vec<u32> = (0..=m as u32).collect();
         let inp: Vec<f64> = (0..(m + 1) * l).map(|k| 0.5 + (k as f64 * 0.37).sin()).collect();
         let mut want = inp.clone();
@@ -7004,7 +7122,7 @@ mod seg_tests {
         let l = layout().lanes();
         let (f, prefix) = rev_func(l);
         let t = Tiered::new(f, layout(), M, true, prefix);
-        assert!(t.spill.get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix)).is_some());
+        assert!(t.spill.get_or_init(|| SegPlan::new(&t.ir().unwrap(), t.rev, t.prefix)).is_some());
         let idx: Vec<u32> = (0..=M as u32).collect();
         let inp = inputs(l);
         let stride = (M + 1) * l;

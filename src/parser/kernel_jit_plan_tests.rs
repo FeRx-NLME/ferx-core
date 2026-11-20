@@ -967,11 +967,13 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let lits = [0.0f64];
     // The forward.
     let t = cp.get(layout, Sweep::Forward).expect("a kernel");
-    let p = simd::packs(&t.f, l, false, 0).expect("the forward packs");
+    let p = simd::packs(&t.ir().unwrap(), l, false, 0).expect("the forward packs");
     let vec_ops = p
         .members
         .iter()
-        .filter(|m| !matches!(t.f.insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. }))
+        .filter(|m| {
+            !matches!(t.ir().unwrap().insts[m[0] as usize], Inst::Load { .. } | Inst::Store { .. })
+        })
         .count();
     assert!(vec_ops >= 20, "{vec_ops} vector operations");
     let mut interp = simd_inputs(l);
@@ -987,7 +989,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     }
     // The reverse, several seeds at once.
     let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
-    assert!(simd::packs(&t.f, l, true, t.prefix).is_some(), "the reverse packs");
+    assert!(simd::packs(&t.ir().unwrap(), l, true, t.prefix).is_some(), "the reverse packs");
     let (seeds, stride) = (3, 5 * l);
     let init = || {
         let mut adj = vec![0.0; seeds * stride];
@@ -2367,8 +2369,12 @@ fn a_plans_kernels_keep_only_what_runs_them() {
         assert_eq!(prog.code.capacity(), prog.code.len(), "a chunk program's code");
         for t in prog.compiled.lock().unwrap().values().flatten() {
             let what = if t.rev { "reverse" } else { "forward" };
-            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
-            assert_eq!(t.f.insts.capacity(), t.f.insts.len(), "the {what} kernel's instructions");
+            assert!(t.ir().unwrap().live.is_empty(), "the {what} kernel keeps `live`");
+            assert_eq!(
+                t.ir().unwrap().insts.capacity(),
+                t.ir().unwrap().insts.len(),
+                "the {what} kernel's instructions"
+            );
             seen[t.rev as usize] += 1;
         }
     }
