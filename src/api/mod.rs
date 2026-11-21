@@ -64,6 +64,8 @@ mod run;
 mod scoring_horizon;
 mod simulate;
 #[cfg(feature = "survival")]
+mod vpc_cif;
+#[cfg(feature = "survival")]
 mod vpc_kmmc;
 #[cfg(feature = "survival")]
 mod vpc_rtte;
@@ -146,6 +148,8 @@ pub use run::{
 pub(crate) use simulate::check_theta_length;
 #[cfg(feature = "survival")]
 pub(crate) use simulate::simulate_with_options_tallied;
+#[cfg(feature = "survival")]
+pub use vpc_cif::{vpc_cif, CifCauseBand, CifVpc, CifVpcBand, CifVpcStratum, VpcCifOptions};
 #[cfg(feature = "survival")]
 pub use vpc_kmmc::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};
 #[cfg(feature = "survival")]

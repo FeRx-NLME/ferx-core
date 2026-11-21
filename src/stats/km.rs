@@ -503,7 +503,7 @@ pub fn vpc_band_kmmc(
 
 /// The band of `n_curves` curves, `at(j, t)` being curve `j` at time `t`, or `None`
 /// where that curve is undefined.
-fn band_over(
+pub(crate) fn band_over(
     n_curves: usize, at: impl Fn(usize, f64) -> Option<f64>, grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     if !probs_valid(probs) {

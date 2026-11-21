@@ -126,6 +126,31 @@ pub ferx_core::api::AdaptiveVarianceComponent::metric: ferx_core::AdaptiveSummar
 pub ferx_core::api::AdaptiveVarianceComponent::n_subjects: usize
 pub ferx_core::api::AdaptiveVarianceComponent::scope: ferx_core::AdaptiveVarianceScope
 pub ferx_core::api::AdaptiveVarianceComponent::status: ferx_core::AdaptiveComponentStatus
+pub struct ferx_core::api::CifCauseBand
+pub ferx_core::api::CifCauseBand::band: ferx_core::CifVpcBand
+pub ferx_core::api::CifCauseBand::cmt: usize
+pub struct ferx_core::api::CifVpc
+pub ferx_core::api::CifVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::CifVpc::cmts: alloc::vec::Vec<usize>
+pub ferx_core::api::CifVpc::horizon: f64
+pub ferx_core::api::CifVpc::n_sim: usize
+pub ferx_core::api::CifVpc::probs: [f64; 3]
+pub ferx_core::api::CifVpc::strata: alloc::vec::Vec<ferx_core::CifVpcStratum>
+pub ferx_core::api::CifVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::CifVpcBand
+pub ferx_core::api::CifVpcBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::CifVpcBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::CifVpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::CifVpcBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::api::CifVpcBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub struct ferx_core::api::CifVpcStratum
+pub ferx_core::api::CifVpcStratum::causes: alloc::vec::Vec<ferx_core::CifCauseBand>
+pub ferx_core::api::CifVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::api::CifVpcStratum::label: alloc::string::String
+pub ferx_core::api::CifVpcStratum::n_subjects: usize
+pub ferx_core::api::CifVpcStratum::observed: ferx_core::stats::cif::CifCurve
+pub ferx_core::api::CifVpcStratum::survival: ferx_core::CifVpcBand
+pub ferx_core::api::CifVpcStratum::value: core::option::Option<f64>
 #[non_exhaustive] pub struct ferx_core::api::DrawnParameters
 pub ferx_core::api::DrawnParameters::draw: usize
 pub ferx_core::api::DrawnParameters::parameters: ferx_core::ModelParameters
@@ -314,6 +339,15 @@ pub ferx_core::api::TteVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::api::UncertaintySpec
 pub ferx_core::api::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::api::UncertaintySpec::n_draws: usize
+pub struct ferx_core::api::VpcCifOptions
+pub ferx_core::api::VpcCifOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::VpcCifOptions::grid: ferx_core::VpcGrid
+pub ferx_core::api::VpcCifOptions::n_sim: usize
+pub ferx_core::api::VpcCifOptions::probs: [f64; 3]
+pub ferx_core::api::VpcCifOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::api::VpcCifOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcCifOptions
+pub fn ferx_core::VpcCifOptions::default() -> Self
 #[non_exhaustive] pub struct ferx_core::api::VpcKmmcOptions
 pub ferx_core::api::VpcKmmcOptions::covariate: alloc::string::String
 pub ferx_core::api::VpcKmmcOptions::level: core::option::Option<f64>
@@ -397,6 +431,7 @@ pub fn ferx_core::api::theta_level_values(model: &ferx_core::CompiledModel, thet
 pub fn ferx_core::api::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_output_columns(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
+pub fn ferx_core::api::vpc_cif(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcCifOptions) -> core::result::Result<ferx_core::CifVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
@@ -2462,6 +2497,30 @@ pub ferx_core::sim::adaptive::ObservedSignal::name: alloc::string::String
 pub ferx_core::sim::adaptive::ObservedSignal::value: f64
 pub mod ferx_core::sim::adaptive_control
 pub mod ferx_core::stats
+pub mod ferx_core::stats::cif
+pub enum ferx_core::stats::cif::CifInputError
+pub ferx_core::stats::cif::CifInputError::BadCause
+pub ferx_core::stats::cif::CifInputError::BadCause::index: usize
+pub ferx_core::stats::cif::CifInputError::BadCause::n_causes: usize
+pub ferx_core::stats::cif::CifInputError::BadCause::value: usize
+pub ferx_core::stats::cif::CifInputError::BadTime
+pub ferx_core::stats::cif::CifInputError::BadTime::index: usize
+pub ferx_core::stats::cif::CifInputError::BadTime::value: f64
+pub ferx_core::stats::cif::CifInputError::LengthMismatch
+pub ferx_core::stats::cif::CifInputError::LengthMismatch::causes: usize
+pub ferx_core::stats::cif::CifInputError::LengthMismatch::times: usize
+impl core::error::Error for ferx_core::stats::cif::CifInputError
+impl core::fmt::Display for ferx_core::stats::cif::CifInputError
+pub fn ferx_core::stats::cif::CifInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::stats::cif::CifCurve
+pub ferx_core::stats::cif::CifCurve::all_cause: ferx_core::stats::km::KmCurve
+pub ferx_core::stats::cif::CifCurve::cif: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::stats::cif::CifCurve::n_event: alloc::vec::Vec<alloc::vec::Vec<usize>>
+impl ferx_core::stats::cif::CifCurve
+pub fn ferx_core::stats::cif::CifCurve::at(&self, k: usize, t: f64) -> core::option::Option<f64>
+pub fn ferx_core::stats::cif::CifCurve::n_causes(&self) -> usize
+pub fn ferx_core::stats::cif::aalen_johansen(times: &[f64], causes: &[usize], n_causes: usize) -> core::result::Result<ferx_core::stats::cif::CifCurve, ferx_core::stats::cif::CifInputError>
+pub fn ferx_core::stats::cif::vpc_band_cif(curves: &[ferx_core::stats::cif::CifCurve], k: usize, grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
 pub mod ferx_core::stats::convergence
 pub fn ferx_core::stats::convergence::effective_sample_size(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) -> f64
@@ -4907,6 +4966,31 @@ pub fn ferx_core::diagnostics::CheckReport::error_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::info_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::new(model: impl core::convert::Into<alloc::string::String>, data: core::option::Option<alloc::string::String>, diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>) -> Self
 pub fn ferx_core::diagnostics::CheckReport::warning_count(&self) -> usize
+pub struct ferx_core::CifCauseBand
+pub ferx_core::CifCauseBand::band: ferx_core::CifVpcBand
+pub ferx_core::CifCauseBand::cmt: usize
+pub struct ferx_core::CifVpc
+pub ferx_core::CifVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::CifVpc::cmts: alloc::vec::Vec<usize>
+pub ferx_core::CifVpc::horizon: f64
+pub ferx_core::CifVpc::n_sim: usize
+pub ferx_core::CifVpc::probs: [f64; 3]
+pub ferx_core::CifVpc::strata: alloc::vec::Vec<ferx_core::CifVpcStratum>
+pub ferx_core::CifVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::CifVpcBand
+pub ferx_core::CifVpcBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::CifVpcBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::CifVpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::CifVpcBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::CifVpcBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub struct ferx_core::CifVpcStratum
+pub ferx_core::CifVpcStratum::causes: alloc::vec::Vec<ferx_core::CifCauseBand>
+pub ferx_core::CifVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::CifVpcStratum::label: alloc::string::String
+pub ferx_core::CifVpcStratum::n_subjects: usize
+pub ferx_core::CifVpcStratum::observed: ferx_core::stats::cif::CifCurve
+pub ferx_core::CifVpcStratum::survival: ferx_core::CifVpcBand
+pub ferx_core::CifVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::CmtToggle
 pub ferx_core::CmtToggle::on: bool
 pub ferx_core::CmtToggle::pk_only: usize
@@ -6189,6 +6273,15 @@ pub ferx_core::ViResult::n_mc_samples: usize
 pub ferx_core::ViResult::neg_two_elbo: f64
 pub ferx_core::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::ViResult::superseded_by: core::option::Option<alloc::string::String>
+pub struct ferx_core::VpcCifOptions
+pub ferx_core::VpcCifOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::VpcCifOptions::grid: ferx_core::VpcGrid
+pub ferx_core::VpcCifOptions::n_sim: usize
+pub ferx_core::VpcCifOptions::probs: [f64; 3]
+pub ferx_core::VpcCifOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::VpcCifOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcCifOptions
+pub fn ferx_core::VpcCifOptions::default() -> Self
 #[non_exhaustive] pub struct ferx_core::VpcKmmcOptions
 pub ferx_core::VpcKmmcOptions::covariate: alloc::string::String
 pub ferx_core::VpcKmmcOptions::level: core::option::Option<f64>
@@ -6310,6 +6403,7 @@ pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::coll
 pub fn ferx_core::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::vpc_cif(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcCifOptions) -> core::result::Result<ferx_core::CifVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
