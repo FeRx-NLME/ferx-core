@@ -2277,10 +2277,7 @@ fn profile_start_solve_takes_a_solved_zero_mode_as_warm() {
         let n = rec.multistarts.iter().filter(|id| *id == "EMPTY").count();
         (s, n)
     };
-    let (first, cold) = runs(
-        &ProfileWarm::from_template(&layout, &p.init_params),
-        &p.init_params,
-    );
+    let (first, cold) = runs(&ProfileWarm::from_template(&layout, &p.init_params), &p.init_params);
     let (_, warm) = runs(&ProfileWarm::from_solve(&layout, &first), &first.params);
     assert!(cold > 0, "the cold start solve multi-starts it");
     assert_eq!(warm, 0, "a start solve warm from its zero mode does not");
