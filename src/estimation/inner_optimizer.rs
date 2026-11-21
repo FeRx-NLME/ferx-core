@@ -3530,11 +3530,12 @@ fn find_ebe_solve(
             }
         }
         // Reset / TV-covariate subjects (family 1) scan every coordinate, exactly
-        // as before — bit-identical. Everyone else (family 2) is probed per
+        // as before — bit-identical; an inert first-record reset does not count (#2081).
+        // Everyone else (family 2) is probed per
         // coordinate and scans only the weakly-identified ones, so well-informed
         // subjects pay just `2·n_eta` cheap objective evaluations and their EBE
         // stays bit-identical to `inner_restarts = 0` (no seed solve runs).
-        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let scan_all = subject.has_effective_resets() || subject.has_tv_covariates();
         let scan_coord: Vec<bool> = if scan_all {
             vec![true; n_eta]
         } else {
