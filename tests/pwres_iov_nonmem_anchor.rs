@@ -73,24 +73,15 @@ fn nonmem_rows(file: &str) -> Vec<(String, f64, f64, f64)> {
         .unwrap_or_else(|e| panic!("the committed NONMEM table must be readable: {e}"));
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. line");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header line")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> = lines.next().expect("column header line").split_whitespace().collect();
     let col = |name: &str| {
         header
             .iter()
             .position(|h| *h == name)
             .unwrap_or_else(|| panic!("the table must carry a `{name}` column: {header:?}"))
     };
-    let (id, time, dv, epred, ewres) = (
-        col("ID"),
-        col("TIME"),
-        col("DV"),
-        col("EPRED"),
-        col("EWRES"),
-    );
+    let (id, time, dv, epred, ewres) =
+        (col("ID"), col("TIME"), col("DV"), col("EPRED"), col("EWRES"));
     lines
         .filter_map(|l| {
             let f: Vec<f64> = l
@@ -142,11 +133,7 @@ fn gaps(ferx: &[SubjectNpde], pop: &Population, table: &str) -> (f64, f64, f64) 
             matched += 1;
         }
     }
-    assert_eq!(
-        matched,
-        nm.len(),
-        "every NONMEM observation row must be matched"
-    );
+    assert_eq!(matched, nm.len(), "every NONMEM observation row must be matched");
     assert_eq!(matched, 540, "the anchor design is 60 x 3 x 3 observations");
     (worst_epred, worst_pwres, (ss / matched as f64).sqrt())
 }

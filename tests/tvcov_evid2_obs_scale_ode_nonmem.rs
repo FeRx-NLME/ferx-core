@@ -67,32 +67,21 @@ const MODEL: &str = r#"
 "#;
 
 // NONMEM 7.5.1 PREDs (observation rows), from tests/nonmem/tvcov_intermediate_evid2.ctl.
-const NONMEM: &[(f64, f64)] = &[
-    (0.5, 1.5669061473),
-    (2.0, 0.82189504423),
-    (6.0, 0.27541521381),
-    (12.0, 0.16633647993),
-];
+const NONMEM: &[(f64, f64)] =
+    &[(0.5, 1.5669061473), (2.0, 0.82189504423), (6.0, 0.27541521381), (12.0, 0.16633647993)];
 
 #[test]
 fn ode_tvcov_evid2_obs_scale_matches_nonmem_pred() {
     let model = parse_full_model(MODEL).expect("model parses").model;
-    let population = read_nonmem_csv(
-        Path::new("tests/nonmem/tvcov_intermediate_evid2.csv"),
-        None,
-        None,
-    )
-    .expect("dataset loads");
+    let population =
+        read_nonmem_csv(Path::new("tests/nonmem/tvcov_intermediate_evid2.csv"), None, None)
+            .expect("dataset loads");
 
     let preds = predict(&model, &population, &model.default_params).unwrap();
     assert_eq!(preds.len(), NONMEM.len());
 
     for (p, &(t, expected)) in preds.iter().zip(NONMEM) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "prediction time {} != expected {t}",
-            p.time
-        );
+        assert!((p.time - t).abs() < 1e-9, "prediction time {} != expected {t}", p.time);
         // ODE (RK45) vs NONMEM's closed-form ADVAN3: tight ODE tolerances bring the
         // event-driven dual walk to within a few ulps-scaled units of the analytical
         // reference, so a 1e-6 relative band is comfortable while still catching a

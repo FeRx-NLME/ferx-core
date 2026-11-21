@@ -331,11 +331,7 @@ fn fit_opts() -> FitOptions {
     // Default is already FOCEI / outer_maxiter = 500 / interaction = true — i.e.
     // run-to-convergence. We only quiet it and request the covariance step so the
     // comparison table can report SEs.
-    FitOptions {
-        verbose: false,
-        run_covariance_step: true,
-        ..FitOptions::default()
-    }
+    FitOptions { verbose: false, run_covariance_step: true, ..FitOptions::default() }
 }
 
 /// `n` bare TTE subjects (one placeholder Event each on CMT 2) used only as a
@@ -375,10 +371,7 @@ fn competing_pop_from_sims(sims: &[SimulationResult]) -> Population {
     for r in sims {
         match &r.outcome {
             SimOutcome::Event { time, observed } => {
-                by_id
-                    .entry(r.id.clone())
-                    .or_default()
-                    .push((r.cmt, *time, *observed));
+                by_id.entry(r.id.clone()).or_default().push((r.cmt, *time, *observed));
             }
             _ => panic!("expected an Event outcome for a competing-risks simulation"),
         }
@@ -392,11 +385,7 @@ fn competing_pop_from_sims(sims: &[SimulationResult]) -> Population {
                 .into_iter()
                 .map(|(cmt, time, observed)| ObsRecord::Event {
                     time,
-                    event_type: if observed {
-                        EventType::Exact
-                    } else {
-                        EventType::RightCensored
-                    },
+                    event_type: if observed { EventType::Exact } else { EventType::RightCensored },
                     entry_time: 0.0,
                     cmt,
                 })
@@ -492,11 +481,7 @@ fn joint_pktte_pop_from_sims(template: &Population, sims: &[SimulationResult]) -
         if let Some((time, observed, cmt)) = ev_by_id.get(&s.id) {
             s.obs_records = vec![ObsRecord::Event {
                 time: *time,
-                event_type: if *observed {
-                    EventType::Exact
-                } else {
-                    EventType::RightCensored
-                },
+                event_type: if *observed { EventType::Exact } else { EventType::RightCensored },
                 entry_time: 0.0,
                 cmt: *cmt,
             }];
@@ -621,10 +606,7 @@ fn joint_pktte_event_times_match_model_survival() {
 
     // PIT: V_i = exp(−Ĥ(T_i)) via the independent oracle; sorted for the KS sweep.
     let hgrid = cumhaz_grid(DOSE, CL, V, KA, H0, BETA, HORIZON);
-    let mut u: Vec<f64> = times
-        .iter()
-        .map(|&t| (-interp_at(&hgrid, t)).exp())
-        .collect();
+    let mut u: Vec<f64> = times.iter().map(|&t| (-interp_at(&hgrid, t)).exp()).collect();
     u.sort_by(|a, b| a.partial_cmp(b).expect("event times are finite"));
 
     // Kolmogorov–Smirnov statistic against the FULLY-SPECIFIED Uniform(0,1) (truth
@@ -705,10 +687,7 @@ fn joint_pktte_ss_sim_template(n: usize, horizon: f64, ii: f64) -> Population {
 /// starts above every `-log U`, so the sampler fires every subject's event at `t = 0` and the
 /// assertions below trip before any parameter band is reached.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
     use ferx_core::{simulate_with_options, SimulateOptions};
     // 100, not the sibling's 300, and the difference is measured rather than taste. Every
@@ -738,11 +717,7 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
     let event_times: Vec<f64> = sims
         .iter()
         .filter_map(|r| match r.outcome {
-            SimOutcome::Event {
-                observed: true,
-                time,
-                ..
-            } => Some(time),
+            SimOutcome::Event { observed: true, time, .. } => Some(time),
             _ => None,
         })
         .collect();
@@ -771,11 +746,8 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
     // steady-state equilibration per subject. Everything else is `fit_opts()`: FOCEI,
     // `outer_maxiter = 500`, i.e. still run-to-convergence, which is the point of the arm.
     // The shared helper is left alone so the sibling tests keep reporting SEs.
-    let opts_fit = FitOptions {
-        verbose: false,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts_fit =
+        FitOptions { verbose: false, run_covariance_step: false, ..FitOptions::default() };
     let r = fit(&model, &fit_pop, &model.default_params, &opts_fit)
         .expect("SS-dosed joint SSE fit must succeed");
 
@@ -786,11 +758,7 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
          BETA={beta:.4}(0.30; collinear) omega^2={omega2:.4}(0.09) OFV={:.3}",
         r.ofv
     );
-    assert!(
-        r.ofv.is_finite(),
-        "SS-dosed joint fit OFV is not finite: {}",
-        r.ofv
-    );
+    assert!(r.ofv.is_finite(), "SS-dosed joint fit OFV is not finite: {}", r.ofv);
 
     // **Deliberately NOT asserted here: the absence of an SS non-convergence warning.**
     // It is asserted at `maxiter = 0` instead, by
@@ -819,18 +787,9 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
     // A band on `CL` alone would be a wide "sane-range" guard on a non-identified parameter,
     // which is precisely what `joint_pktte_sse_recovers_pk_and_omega` warns against.
     let ke = cl / v;
-    assert!(
-        (0.095..0.108).contains(&ke),
-        "CL/V not recovered: {ke} (truth 0.1; CL={cl}, V={v})"
-    );
-    assert!(
-        (0.95..1.08).contains(&ka),
-        "KA not recovered: {ka} (truth 1.0)"
-    );
-    assert!(
-        (0.07..0.115).contains(&omega2),
-        "omega^2(CL) not recovered: {omega2} (truth 0.09)"
-    );
+    assert!((0.095..0.108).contains(&ke), "CL/V not recovered: {ke} (truth 0.1; CL={cl}, V={v})");
+    assert!((0.95..1.08).contains(&ka), "KA not recovered: {ka} (truth 1.0)");
+    assert!((0.07..0.115).contains(&omega2), "omega^2(CL) not recovered: {omega2} (truth 0.09)");
 }
 
 /// **Slice 2.2 SSE** — license-free round-trip validator for the joint PK-TTE
@@ -913,25 +872,13 @@ fn joint_pktte_sse_recovers_pk_and_omega() {
     // over 0.99–1.08 and V over 9.73–10.50 while CL/V stayed within 0.1024–0.1044
     // (truth 0.1). The band below holds every arm with the truth inside.
     let ke = cl / v;
-    assert!(
-        (0.095..0.110).contains(&ke),
-        "CL/V not recovered: {ke} (truth 0.1; CL={cl}, V={v})"
-    );
-    assert!(
-        (0.92..1.08).contains(&ka),
-        "KA not recovered: {ka} (truth 1.0)"
-    );
-    assert!(
-        (0.05..0.13).contains(&omega2),
-        "omega^2(CL) not recovered: {omega2} (truth 0.09)"
-    );
+    assert!((0.095..0.110).contains(&ke), "CL/V not recovered: {ke} (truth 0.1; CL={cl}, V={v})");
+    assert!((0.92..1.08).contains(&ka), "KA not recovered: {ka} (truth 1.0)");
+    assert!((0.05..0.13).contains(&omega2), "omega^2(CL) not recovered: {omega2} (truth 0.09)");
     // (H0, BETA) are intentionally not band-checked here — see the doc comment and
     // `joint_pktte_event_times_match_model_survival`. Only require they stayed in the
     // feasible region (a NaN / sign-blown hazard would surface as a non-finite OFV).
-    assert!(
-        h0 > 0.0 && beta.is_finite(),
-        "hazard params must stay feasible"
-    );
+    assert!(h0 > 0.0 && beta.is_finite(), "hazard params must stay feasible");
     assert!(r.ofv.is_finite(), "joint PK-TTE SSE OFV must be finite");
 }
 
@@ -951,10 +898,7 @@ fn rtte_pop_from_sims(sims: &[SimulationResult]) -> Population {
     for r in sims {
         match r.outcome {
             SimOutcome::Event { time, observed } => {
-                by_id
-                    .entry(r.id.clone())
-                    .or_default()
-                    .push((r.cmt, time, observed));
+                by_id.entry(r.id.clone()).or_default().push((r.cmt, time, observed));
             }
             ref o => panic!("expected an Event outcome for an RTTE simulation, got {o:?}"),
         }
@@ -968,11 +912,7 @@ fn rtte_pop_from_sims(sims: &[SimulationResult]) -> Population {
                 .into_iter()
                 .map(|(cmt, time, observed)| ObsRecord::Event {
                     time,
-                    event_type: if observed {
-                        EventType::Exact
-                    } else {
-                        EventType::RightCensored
-                    },
+                    event_type: if observed { EventType::Exact } else { EventType::RightCensored },
                     entry_time: 0.0,
                     cmt,
                 })
@@ -1045,11 +985,7 @@ fn rtte_forward_event_times_match_model_survival() {
     let cumhaz = |t: f64| (t / SCALE).powf(SHAPE);
     let mut by_id: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for r in &sims {
-        if let SimOutcome::Event {
-            time,
-            observed: true,
-        } = r.outcome
-        {
+        if let SimOutcome::Event { time, observed: true } = r.outcome {
             by_id.entry(r.id.clone()).or_default().push(time);
         }
     }
@@ -1084,10 +1020,7 @@ fn rtte_forward_event_times_match_model_survival() {
         d = d.max((i as f64 + 1.0) / n - vi).max(vi - i as f64 / n);
     }
     let crit = 1.36 / n.sqrt();
-    eprintln!(
-        "[PIT-RTTE] increments={} KS D={d:.4} vs 5% critical {crit:.4}",
-        v.len()
-    );
+    eprintln!("[PIT-RTTE] increments={} KS D={d:.4} vs 5% critical {crit:.4}", v.len());
     assert!(
         d < crit,
         "RTTE forward sampler fails the KS goodness-of-fit against the model survival: \
@@ -1107,11 +1040,7 @@ fn rtte_event_counts(sims: &[SimulationResult], n: usize) -> Vec<f64> {
             *c += 1;
         }
     }
-    assert_eq!(
-        by_id.len(),
-        n,
-        "every subject must appear (via its censor row)"
-    );
+    assert_eq!(by_id.len(), n, "every subject must appear (via its censor row)");
     by_id.values().map(|&c| c as f64).collect()
 }
 
@@ -1250,10 +1179,7 @@ fn rtte_sse_forward_exponential_recovers_rate() {
 /// this seed's realized fit; a re-broken guard drops the event count to zero and trips
 /// the first assertion long before the parameter bands.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn rtte_sse_forward_gompertz_declining_recovers_negative_gamma() {
     use ferx_core::{simulate_with_options, SimulateOptions};
     const N: usize = 1200;
@@ -1306,25 +1232,17 @@ fn rtte_sse_forward_gompertz_declining_recovers_negative_gamma() {
         "[SSE-RTTE-GOMPERTZ] FOCEI α={alpha:.5} (truth 0.15) γ={gamma:.5} (truth −0.03) OFV={:.4}",
         r.ofv
     );
-    assert!(
-        (0.11..0.19).contains(&alpha),
-        "α not recovered: got {alpha:.5}, expected ~0.15"
-    );
+    assert!((0.11..0.19).contains(&alpha), "α not recovered: got {alpha:.5}, expected ~0.15");
     assert!(
         (-0.06..-0.012).contains(&gamma),
         "γ not recovered as a declining hazard: got {gamma:.5}, expected ~−0.03 — it must stay \
          clearly negative, not collapse toward 0 (the pre-fix simulate→fit inconsistency)"
     );
-    assert!(
-        r.ofv.is_finite(),
-        "declining-Gompertz RTTE SSE OFV must be finite"
-    );
+    assert!(r.ofv.is_finite(), "declining-Gompertz RTTE SSE OFV must be finite");
 }
 
-const RTTE_SIM_ANCHOR_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/reference/rtte_exponential_sim/rtte_sim.csv"
-);
+const RTTE_SIM_ANCHOR_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/rtte_exponential_sim/rtte_sim.csv");
 
 /// **Slice 3.3 cross-tool simulation anchor** (the external, AGENTS.md-required leg).
 /// ferx *simulated* `tests/reference/rtte_exponential_sim/rtte_sim.csv` (300 subjects,
@@ -1374,10 +1292,8 @@ fn rtte_sim_anchor_ferx_matches_nonmem() {
     );
 }
 
-const REF_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/reference/tte_exponential/tte_exp.csv"
-);
+const REF_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/tte_exponential/tte_exp.csv");
 
 /// `survival::survreg(Surv(TIME,DV) ~ 1, dist="exponential")` on `tte_exp.csv`.
 /// Closed form `lambda = events / sum(time) = 82 / 1100.6`. Regenerate via
@@ -1467,11 +1383,7 @@ fn tte_sse_competing_risks_recovers_truth() {
     let template = common::tte_competing_pop(&vec![(T_CENSOR, 0u8); N]);
 
     let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED).unwrap();
-    assert_eq!(
-        sims.len(),
-        2 * N,
-        "two rows per subject (one per cause CMT)"
-    );
+    assert_eq!(sims.len(), 2 * N, "two rows per subject (one per cause CMT)");
 
     // Cause-specific observed-event fractions (a subject contributes to at most one).
     let (mut f2, mut f3) = (0usize, 0usize);
@@ -1489,19 +1401,12 @@ fn tte_sse_competing_risks_recovers_truth() {
     // λ_A:λ_B = 0.10:0.06 ⇒ cause 2 (higher rate) produces more events; with τ=14 the
     // all-cause event rate is high, so both causes are well-populated and some subjects
     // are administratively censored.
-    assert!(
-        frac2 > frac3,
-        "cause 2 (higher rate) must produce more events"
-    );
+    assert!(frac2 > frac3, "cause 2 (higher rate) must produce more events");
     assert!(frac2 > 0.05 && frac3 > 0.05, "both causes must fire");
 
     let model = parse_model_string(COMPETING_FIT).expect("competing fit model must parse");
     let pop = competing_pop_from_sims(&sims);
-    assert_eq!(
-        pop.subjects.len(),
-        N,
-        "one fit subject per simulated subject"
-    );
+    assert_eq!(pop.subjects.len(), N, "one fit subject per simulated subject");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("SSE fit must succeed");
     let (la, lb, om) = (r.theta[0], r.theta[1], r.omega[(0, 0)]);
@@ -1514,14 +1419,8 @@ fn tte_sse_competing_risks_recovers_truth() {
     // are the headline competing-risks guard: a wrong cause→CMT routing, a dropped
     // censoring row, or a factor-of-2 in either hazard breaks them. (Deterministic
     // under RAYON_NUM_THREADS=1, as CI pins; seed-fixed values λ_A≈0.098, λ_B≈0.061.)
-    assert!(
-        (0.090..0.110).contains(&la),
-        "lambda_A not recovered: {la:.5}"
-    );
-    assert!(
-        (0.052..0.070).contains(&lb),
-        "lambda_B not recovered: {lb:.5}"
-    );
+    assert!((0.090..0.110).contains(&la), "lambda_A not recovered: {la:.5}");
+    assert!((0.052..0.070).contains(&lb), "lambda_B not recovered: {lb:.5}");
 
     // The SHARED frailty ω² is weakly identified (the −2LL is flat over a wide ω²
     // range — #469) AND over-estimated by FOCEI-Laplace at this all-cause event
@@ -1563,14 +1462,8 @@ fn tte_convergence_exponential_mixed() {
     // `tests/reference/tte_exponential/expected.md` — every tool fits *this* file,
     // so they should agree with each other regardless of the 0.1/0.25 truth. The
     // bands here are only a gross-failure guard.
-    assert!(
-        (0.06..0.14).contains(&lambda),
-        "lambda_pop off: got {lambda:.5}, expected ~0.1"
-    );
-    assert!(
-        (0.12..0.50).contains(&omega2),
-        "omega^2 off: got {omega2:.5}, expected ~0.25"
-    );
+    assert!((0.06..0.14).contains(&lambda), "lambda_pop off: got {lambda:.5}, expected ~0.1");
+    assert!((0.12..0.50).contains(&omega2), "omega^2 off: got {omega2:.5}, expected ~0.25");
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }
 
@@ -1586,10 +1479,7 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
     let lambda = r.theta[0];
-    eprintln!(
-        "[fixed] lambda = {lambda:.6} (survreg {SURVREG_LAMBDA:.6}), OFV = {:.4}",
-        r.ofv
-    );
+    eprintln!("[fixed] lambda = {lambda:.6} (survreg {SURVREG_LAMBDA:.6}), OFV = {:.4}", r.ofv);
 
     let rel_err = (lambda - SURVREG_LAMBDA).abs() / SURVREG_LAMBDA;
     assert!(
@@ -1607,10 +1497,8 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
 
 // ── RTTE (repeated TTE, clock-forward) — tests/reference/rtte_exponential ──────
 
-const RTTE_REF_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/reference/rtte_exponential/rtte_exp.csv"
-);
+const RTTE_REF_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/rtte_exponential/rtte_exp.csv");
 
 const RTTE_FIT_FIXED: &str = r"
 [parameters]
@@ -1698,11 +1586,7 @@ fn rtte_convergence_mixed_matches_nonmem() {
         (0.140..0.190).contains(&omega2),
         "omega^2 {omega2:.5} off the NONMEM/GLMM value ~0.1645"
     );
-    assert!(
-        (r.ofv - 1748.493).abs() < 0.2,
-        "OFV {:.4} must match NONMEM LAPLACE 1748.493",
-        r.ofv
-    );
+    assert!((r.ofv - 1748.493).abs() < 0.2, "OFV {:.4} must match NONMEM LAPLACE 1748.493", r.ofv);
 }
 
 // ── RTTE clock-reset (gap time) — tests/reference/rtte_weibull_reset ───────────
@@ -1792,23 +1676,10 @@ fn rtte_reset_convergence_mixed_matches_nonmem() {
     );
 
     // NONMEM LAPLACE: 5.15939 / 1.52987 / 0.13225 / 3175.863.
-    assert!(
-        (5.0..5.35).contains(&scale),
-        "scale {scale:.5} off the NONMEM value ~5.16"
-    );
-    assert!(
-        (1.45..1.60).contains(&shape),
-        "shape {shape:.5} off the NONMEM value ~1.53"
-    );
-    assert!(
-        (0.10..0.17).contains(&omega2),
-        "omega^2 {omega2:.5} off the NONMEM value ~0.132"
-    );
-    assert!(
-        (r.ofv - 3175.863).abs() < 0.3,
-        "OFV {:.4} must match NONMEM LAPLACE 3175.863",
-        r.ofv
-    );
+    assert!((5.0..5.35).contains(&scale), "scale {scale:.5} off the NONMEM value ~5.16");
+    assert!((1.45..1.60).contains(&shape), "shape {shape:.5} off the NONMEM value ~1.53");
+    assert!((0.10..0.17).contains(&omega2), "omega^2 {omega2:.5} off the NONMEM value ~0.132");
+    assert!((r.ofv - 3175.863).abs() < 0.3, "OFV {:.4} must match NONMEM LAPLACE 3175.863", r.ofv);
 }
 
 /// Cross-tool, exact: a FIXED-EFFECTS (n_eta=0) competing-risks exponential fit
@@ -1897,10 +1768,8 @@ const WEIBULL_FIT_FIXED: &str = r"
   shape  = TVSHAPE
 ";
 
-const WEIBULL_REF_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/reference/tte_weibull/tte_weibull.csv"
-);
+const WEIBULL_REF_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/tte_weibull/tte_weibull.csv");
 
 // survreg(Surv(TIME,DV)~1, dist="weibull") on tte_weibull.csv, mapped to ferx's
 // (scale, shape) via shape = 1/scale_sr, scale = exp(intercept). See survreg.R.
@@ -1919,25 +1788,15 @@ fn tte_sse_weibull_recovers_truth() {
     const SEED: u64 = 20260622;
 
     let truth = parse_model_string(WEIBULL_TRUTH).expect("truth model must parse");
-    let sims = simulate_with_seed(
-        &truth,
-        &tte_sim_template(N, T_CENSOR),
-        &truth.default_params,
-        1,
-        SEED,
-    )
-    .unwrap();
+    let sims =
+        simulate_with_seed(&truth, &tte_sim_template(N, T_CENSOR), &truth.default_params, 1, SEED)
+            .unwrap();
 
     let pairs = sims_to_pairs(&sims);
 
     let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
-    let r = fit(
-        &model,
-        &common::tte_pop_from_pairs(&pairs),
-        &model.default_params,
-        &fit_opts(),
-    )
-    .expect("SSE fit must succeed");
+    let r = fit(&model, &common::tte_pop_from_pairs(&pairs), &model.default_params, &fit_opts())
+        .expect("SSE fit must succeed");
 
     let scale = r.theta[0];
     let shape = r.theta[1];
@@ -1947,14 +1806,8 @@ fn tte_sse_weibull_recovers_truth() {
     );
 
     // Structural parameters recover tightly under FOCEI.
-    assert!(
-        (18.5..21.5).contains(&scale),
-        "scale not recovered: got {scale:.4}, expected ~20"
-    );
-    assert!(
-        (1.85..2.15).contains(&shape),
-        "shape not recovered: got {shape:.4}, expected ~2"
-    );
+    assert!((18.5..21.5).contains(&scale), "scale not recovered: got {scale:.4}, expected ~20");
+    assert!((1.85..2.15).contains(&shape), "shape not recovered: got {shape:.4}, expected ~2");
     // omega^2 (frailty on the *shape* — a nonlinear hazard parameter) is materially
     // OVER-estimated by FOCEI-Laplace: this seed deterministically gives ~0.344 vs a
     // true 0.20 (+72%), and the bias does NOT vanish as the true omega^2 shrinks
@@ -2035,14 +1888,8 @@ fn tte_convergence_weibull_mixed() {
     );
 
     // Gross-failure guard; exact estimates are tabulated in expected.md.
-    assert!(
-        (15.0..26.0).contains(&scale),
-        "scale off: got {scale:.4}, expected ~20"
-    );
-    assert!(
-        (1.5..2.8).contains(&shape),
-        "shape off: got {shape:.4}, expected ~2"
-    );
+    assert!((15.0..26.0).contains(&scale), "scale off: got {scale:.4}, expected ~20");
+    assert!((1.5..2.8).contains(&shape), "shape off: got {shape:.4}, expected ~2");
     // On this single n=100 realisation ferx's shape-frailty omega^2 is ~0.176 — on the
     // NONMEM LAPLACIAN (0.175) / nlmixr2 FOCEI (0.173) consensus. Before #469 ferx read
     // 0.204 here: the derivative-free BOBYQA outer optimizer false-converged on the
@@ -2084,10 +1931,8 @@ const GOMPERTZ_FIT: &str = r"
   loghr  = LHR * TRT
 ";
 
-const GOMPERTZ_REF_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/reference/tte_gompertz/tte_gompertz.csv"
-);
+const GOMPERTZ_REF_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/tte_gompertz/tte_gompertz.csv");
 
 /// Frailty-Gompertz SSE truth (BSV on gamma) — recover alpha, gamma, omega^2.
 const GOMPERTZ_TRUTH_FRAILTY: &str = r"
@@ -2141,18 +1986,9 @@ fn tte_convergence_gompertz_rct_recovers() {
         r.ofv
     );
 
-    assert!(
-        (0.0012..0.0045).contains(&alpha),
-        "alpha off: got {alpha:.6}, expected ~0.00248"
-    );
-    assert!(
-        (0.0025..0.0070).contains(&gamma),
-        "gamma off: got {gamma:.6}, expected ~0.00450"
-    );
-    assert!(
-        (-1.3..-0.3).contains(&loghr),
-        "loghr off: got {loghr:.4}, expected ~-0.8"
-    );
+    assert!((0.0012..0.0045).contains(&alpha), "alpha off: got {alpha:.6}, expected ~0.00248");
+    assert!((0.0025..0.0070).contains(&gamma), "gamma off: got {gamma:.6}, expected ~0.00450");
+    assert!((-1.3..-0.3).contains(&loghr), "loghr off: got {loghr:.4}, expected ~-0.8");
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }
 
@@ -2164,25 +2000,15 @@ fn tte_sse_gompertz_recovers_truth() {
     const SEED: u64 = 20260623;
 
     let truth = parse_model_string(GOMPERTZ_TRUTH_FRAILTY).expect("truth model must parse");
-    let sims = simulate_with_seed(
-        &truth,
-        &tte_sim_template(N, T_CENSOR),
-        &truth.default_params,
-        1,
-        SEED,
-    )
-    .unwrap();
+    let sims =
+        simulate_with_seed(&truth, &tte_sim_template(N, T_CENSOR), &truth.default_params, 1, SEED)
+            .unwrap();
 
     let pairs = sims_to_pairs(&sims);
 
     let model = parse_model_string(GOMPERTZ_FIT_FRAILTY).expect("fit model must parse");
-    let r = fit(
-        &model,
-        &common::tte_pop_from_pairs(&pairs),
-        &model.default_params,
-        &fit_opts(),
-    )
-    .expect("SSE fit must succeed");
+    let r = fit(&model, &common::tte_pop_from_pairs(&pairs), &model.default_params, &fit_opts())
+        .expect("SSE fit must succeed");
 
     let alpha = r.theta[0];
     let gamma = r.theta[1];
@@ -2197,10 +2023,7 @@ fn tte_sse_gompertz_recovers_truth() {
         (0.0012..0.0028).contains(&alpha),
         "alpha not recovered: got {alpha:.5}, expected ~0.002"
     );
-    assert!(
-        (0.043..0.060).contains(&gamma),
-        "gamma not recovered: got {gamma:.5}, expected ~0.05"
-    );
+    assert!((0.043..0.060).contains(&gamma), "gamma not recovered: got {gamma:.5}, expected ~0.05");
     // omega^2 (frailty on *gamma*, a nonlinear hazard parameter) is over-estimated by
     // FOCEI-Laplace — this seed deterministically gives ~0.081 vs truth 0.05 (+62%),
     // the same nonlinear-frailty limitation seen for the Weibull shape (#440). As for
@@ -2278,11 +2101,7 @@ fn joint_pktte_focei_fit_completes() {
             let censored = event_times[i] >= 30.0;
             s.obs_records = vec![ObsRecord::Event {
                 time: event_times[i],
-                event_type: if censored {
-                    EventType::RightCensored
-                } else {
-                    EventType::Exact
-                },
+                event_type: if censored { EventType::RightCensored } else { EventType::Exact },
                 entry_time: 0.0,
                 cmt: 2,
             }];
@@ -2301,11 +2120,7 @@ fn joint_pktte_focei_fit_completes() {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     match fit(&model, &pop, &model.default_params, &opts) {
-        Ok(r) => assert!(
-            r.ofv.is_finite(),
-            "joint PK-TTE FOCEI OFV must be finite; got {}",
-            r.ofv
-        ),
+        Ok(r) => assert!(r.ofv.is_finite(), "joint PK-TTE FOCEI OFV must be finite; got {}", r.ofv),
         Err(e) => panic!("joint PK-TTE FOCEI fit must not error: {e}"),
     }
 }

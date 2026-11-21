@@ -54,10 +54,7 @@ fn written_pk_only(s: &Subject, m: usize) -> f64 {
     s.pk_only_raw_times[m]
 }
 fn written_at(s: &Subject, t: f64) -> f64 {
-    s.reset_period_times
-        .iter()
-        .find(|&&(e, _)| e == t)
-        .map_or(t, |&(_, w)| w)
+    s.reset_period_times.iter().find(|&&(e, _)| e == t).map_or(t, |&(_, w)| w)
 }
 
 fn whitespace_rows(name: &str) -> Vec<Vec<String>> {
@@ -88,22 +85,15 @@ fn nm_ofv(case: &str) -> f64 {
 /// `.tab` written at `FORMAT=s1PE23.16`.
 fn nm_ipred(case: &str) -> BTreeMap<String, Vec<f64>> {
     let rows = whitespace_rows(&format!("param_time_{case}.tab"));
-    let header = rows
-        .iter()
-        .find(|r| r.first().map(String::as_str) == Some("ID"))
-        .expect(".tab header");
+    let header =
+        rows.iter().find(|r| r.first().map(String::as_str) == Some("ID")).expect(".tab header");
     let at = |label: &str| header.iter().position(|h| h == label).expect(label);
     let (id, evid, ipred) = (at("ID"), at("EVID"), at("IPRED"));
     let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for r in rows
-        .iter()
-        .filter(|r| r.len() == header.len() && r[0] != "ID")
-    {
+    for r in rows.iter().filter(|r| r.len() == header.len() && r[0] != "ID") {
         let num = |c: usize| -> f64 { r[c].parse().expect("a .tab number") };
         if num(evid) == 0.0 {
-            out.entry(format!("{}", num(id) as i64))
-                .or_default()
-                .push(num(ipred));
+            out.entry(format!("{}", num(id) as i64)).or_default().push(num(ipred));
         }
     }
     out
@@ -115,13 +105,8 @@ fn run(case: &str, engine: &str) -> (FitResult, Population) {
         Some(&anchor(&format!("param_time_{case}.csv"))),
     )
     .unwrap_or_else(|e| panic!("{case}/{engine}: the anchor model and dataset load: {e}"));
-    let r = fit(
-        &run.parsed.model,
-        &run.population,
-        &run.init_params,
-        &run.parsed.fit_options,
-    )
-    .unwrap_or_else(|e| panic!("{case}/{engine}: the evaluation runs: {e}"));
+    let r = fit(&run.parsed.model, &run.population, &run.init_params, &run.parsed.fit_options)
+        .unwrap_or_else(|e| panic!("{case}/{engine}: the evaluation runs: {e}"));
     (r, run.population)
 }
 
@@ -145,9 +130,7 @@ fn assert_matches_nonmem(case: &str, engine: &str) {
     // Every fixture must run the analytic (Dual) inner gradient: an FD fallback would leave the
     // dual seeders this fix also changes unexercised.
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "{case}/{engine}: a subject fell back to FD inner gradients: {:?}",
         r.warnings
     );
@@ -245,13 +228,8 @@ fn the_sdtab_parameter_columns_read_the_written_time() {
             Some(&anchor(&format!("param_time_{case}.csv"))),
         )
         .expect("load");
-        let r = fit(
-            &run.parsed.model,
-            &run.population,
-            &run.init_params,
-            &run.parsed.fit_options,
-        )
-        .expect("evaluate");
+        let r = fit(&run.parsed.model, &run.population, &run.init_params, &run.parsed.fit_options)
+            .expect("evaluate");
 
         // NONMEM's CL and IND at each observation row, per subject.
         let rows = whitespace_rows(&format!("param_time_{case}.tab"));
@@ -259,15 +237,10 @@ fn the_sdtab_parameter_columns_read_the_written_time() {
         let at = |l: &str| header.iter().position(|h| h == l).expect(l);
         let (id, evid, cl, ind) = (at("ID"), at("EVID"), at("CL"), at("IND"));
         let mut want: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-        for r in rows
-            .iter()
-            .filter(|r| r.len() == header.len() && r[0] != "ID")
-        {
+        for r in rows.iter().filter(|r| r.len() == header.len() && r[0] != "ID") {
             let n = |c: usize| -> f64 { r[c].parse().expect("number") };
             if n(evid) == 0.0 {
-                want.entry(format!("{}", n(id) as i64))
-                    .or_default()
-                    .push((n(cl), n(ind)));
+                want.entry(format!("{}", n(id) as i64)).or_default().push((n(cl), n(ind)));
             }
         }
 
@@ -302,14 +275,8 @@ fn the_sdtab_parameter_columns_read_the_written_time() {
             }
         }
         eprintln!("{case}: sdtab CL worst rel gap {worst:.3e}");
-        assert!(
-            stepped_at_trough > 0,
-            "{case}: no moved trough at 24 was checked"
-        );
-        assert!(
-            worst < 2e-8,
-            "{case}: sdtab CL vs NONMEM, worst rel {worst:.3e}"
-        );
+        assert!(stepped_at_trough > 0, "{case}: no moved trough at 24 was checked");
+        assert!(worst < 2e-8, "{case}: sdtab CL vs NONMEM, worst rel {worst:.3e}");
     }
 }
 
@@ -328,11 +295,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let j = (0..s.obs_times.len())
         .find(|&j| written_obs(s, j) == 24.0)
         .expect("moved: an observation written at 24");
-    assert!(
-        s.obs_times[j] < 24.0,
-        "moved: engine time {}",
-        s.obs_times[j]
-    );
+    assert!(s.obs_times[j] < 24.0, "moved: engine time {}", s.obs_times[j]);
 
     // pkonly: the EVID=2 row at 24 runs below 24; the observation there is not the one moved.
     let p = pop("pkonly");
@@ -340,11 +303,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
     let m = (0..s.pk_only_times.len())
         .find(|&m| written_pk_only(s, m) == 24.0)
         .expect("pkonly: an EVID=2 row written at 24");
-    assert!(
-        s.pk_only_times[m] < 24.0,
-        "pkonly: engine time {}",
-        s.pk_only_times[m]
-    );
+    assert!(s.pk_only_times[m] < 24.0, "pkonly: engine time {}", s.pk_only_times[m]);
 
     // reset: period 2's records run past 73 but were written from 0.
     let p = pop("reset");
@@ -381,11 +340,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
             assert_eq!(s.obs_times[j], written_obs(s, j), "control: obs {j}");
         }
         for m in 0..s.pk_only_times.len() {
-            assert_eq!(
-                s.pk_only_times[m],
-                written_pk_only(s, m),
-                "control: pk-only {m}"
-            );
+            assert_eq!(s.pk_only_times[m], written_pk_only(s, m), "control: pk-only {m}");
         }
         for d in &s.doses {
             assert_eq!(d.time, written_at(s, d.time), "control: dose at {}", d.time);
@@ -395,11 +350,7 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
 }
 
 fn run_population(case: &str) -> Population {
-    let engine = if case == "reset_seed" {
-        "ode"
-    } else {
-        "analytic"
-    };
+    let engine = if case == "reset_seed" { "ode" } else { "analytic" };
     prepare_run(
         &anchor(&format!("param_time_{case}_{engine}.ferx")),
         Some(&anchor(&format!("param_time_{case}.csv"))),

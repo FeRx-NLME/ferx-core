@@ -119,11 +119,7 @@ fn assert_matches(res: &AdaptiveSimulationResult, reference: &[Vec<RefRow>]) -> 
         let got: Vec<_> = res.decisions.iter().filter(|d| d.subject == *id).collect();
         assert_eq!(got.len(), want.len(), "subject {id}: one decision per row");
         let ledger: Vec<_> = res.ledger.iter().filter(|e| e.subject == *id).collect();
-        assert_eq!(
-            ledger.len(),
-            want.len(),
-            "subject {id}: a dose at every decision"
-        );
+        assert_eq!(ledger.len(), want.len(), "subject {id}: a dose at every decision");
         for ((d, e), (t, trough, fired, amt)) in got.iter().zip(&ledger).zip(want) {
             assert_eq!((d.time, e.time), (*t, *t), "subject {id}");
             let sig = d.observed_signals[0].value;
@@ -160,11 +156,7 @@ fn assert_matches(res: &AdaptiveSimulationResult, reference: &[Vec<RefRow>]) -> 
 fn vanco_mgkg_kit_is_non_degenerate() {
     let r = reference();
     let (s1, s2) = (&r[0], &r[1]);
-    assert_eq!(
-        (s1[0].3, s2[0].3),
-        (15.0 * 50.0, 15.0 * 150.0),
-        "start doses"
-    );
+    assert_eq!((s1[0].3, s2[0].3), (15.0 * 50.0, 15.0 * 150.0), "start doses");
     let cap = |s: &Vec<RefRow>| {
         assert!(s.iter().map(|row| row.3).all(f64::is_finite));
         s.iter().map(|row| row.3).fold(0.0, f64::max)
@@ -173,9 +165,7 @@ fn vanco_mgkg_kit_is_non_degenerate() {
     assert_eq!(cap(s2), 4000.0, "subject 2 capped at 4000 mg");
     assert!(4000.0 < 30.0 * 150.0, "the min binds for subject 2 only");
     // An increase absorbed at the cap: the rule fires and the dose stays.
-    assert!(s1
-        .windows(2)
-        .any(|w| w[1].2 == "increase" && w[1].3 == w[0].3));
+    assert!(s1.windows(2).any(|w| w[1].2 == "increase" && w[1].3 == w[0].3));
 }
 
 /// One row of `expected_round_to.md`'s `raw` column: the dose before rounding (the start
@@ -191,10 +181,7 @@ fn raw_column() -> Vec<Vec<Option<f64>>> {
         let cells: Vec<&str> = line.split('|').map(str::trim).collect();
         // `| decision | time | trough | fired | amt | margin | raw |`
         if cells.len() >= 8 && cells[1].parse::<usize>().is_ok() {
-            subjects
-                .last_mut()
-                .expect("a subject header first")
-                .push(cells[7].parse().ok());
+            subjects.last_mut().expect("a subject header first").push(cells[7].parse().ok());
         }
     }
     subjects
@@ -217,10 +204,7 @@ fn vanco_mgkg_round_to_kit_is_non_degenerate() {
     for (s, wt) in [(s1, 40.0), (s2, 80.0)] {
         for row in s.iter() {
             assert!(row.3.is_finite() && row.3 % 250.0 == 0.0, "{row:?}");
-            assert!(
-                (250.0..=f64::min(30.0 * wt, 4000.0)).contains(&row.3),
-                "{row:?}"
-            );
+            assert!((250.0..=f64::min(30.0 * wt, 4000.0)).contains(&row.3), "{row:?}");
         }
     }
     // A rounded start dose.
@@ -237,10 +221,7 @@ fn vanco_mgkg_round_to_kit_is_non_degenerate() {
     for (s, raw, wt, cap) in [(s1, r1, 40.0, 1000.0), (s2, r2, 80.0, 2250.0)] {
         let hi = 30.0 * wt;
         assert!(cap < hi && s.iter().any(|row| row.3 == cap), "cap {cap}");
-        assert!(raw
-            .iter()
-            .flatten()
-            .any(|&x| x > hi && ((hi / 250.0 + 0.5).floor() * 250.0) > hi));
+        assert!(raw.iter().flatten().any(|&x| x > hi && ((hi / 250.0 + 0.5).floor() * 250.0) > hi));
     }
     // The carried dose: decision 3's step is 1.25 times decision 1's rounded dose.
     assert_eq!((s1[1].3, r1[1]), (750.0, Some(625.0)));

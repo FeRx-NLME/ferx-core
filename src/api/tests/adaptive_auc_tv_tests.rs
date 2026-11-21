@@ -45,10 +45,7 @@ pub(super) struct Seg {
 /// of the segment beginning at their time — reset first (Reset < Dose). A dose at a decision
 /// opens that decision's window.
 pub(super) fn exact_window_aucs(
-    segs: &[Seg],
-    boluses: &[(f64, f64)],
-    resets: &[f64],
-    decisions: &[f64],
+    segs: &[Seg], boluses: &[(f64, f64)], resets: &[f64], decisions: &[f64],
 ) -> Vec<f64> {
     for &(t, _) in boluses {
         assert!(
@@ -57,10 +54,7 @@ pub(super) fn exact_window_aucs(
         );
     }
     for &t in resets {
-        assert!(
-            segs.iter().any(|s| s.t0 == t),
-            "reset at {t} is not a segment start"
-        );
+        assert!(segs.iter().any(|s| s.t0 == t), "reset at {t} is not a segment start");
     }
     for w in segs.windows(2) {
         assert_eq!(w[0].t1, w[1].t0, "segments are contiguous");
@@ -71,11 +65,7 @@ pub(super) fn exact_window_aucs(
         if resets.contains(&s.t0) {
             a = 0.0;
         }
-        a += boluses
-            .iter()
-            .filter(|b| b.0 == s.t0)
-            .map(|b| b.1)
-            .sum::<f64>();
+        a += boluses.iter().filter(|b| b.0 == s.t0).map(|b| b.1).sum::<f64>();
         let w = decisions.partition_point(|&d| d <= s.t0) - 1;
         let decay = (-s.k * (s.t1 - s.t0)).exp();
         out[w] += s.factor * a / s.k * (1.0 - decay);
@@ -117,42 +107,25 @@ pub(super) fn fixed_dose_spec(observe: Option<&str>, at: &[f64], dose: f64) -> A
 
 /// How many realized windows fall in `band`.
 fn windows_in(
-    m: &CompiledModel,
-    pop: &Population,
-    spec: &AdaptiveDosingSpec,
-    seed: u64,
-    band: (f64, f64),
+    m: &CompiledModel, pop: &Population, spec: &AdaptiveDosingSpec, seed: u64, band: (f64, f64),
 ) -> usize {
     let mut spec = spec.clone();
     spec.auc_target = Some(band);
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(seed),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(seed), ..Default::default() };
     let res = simulate_adaptive_from_spec(m, pop, &m.default_params, 1, &spec, &opts)
         .expect("adaptive run with auc_target");
     let n_windows = res.decisions.len() - 1;
-    let attain = res.metrics[0]
-        .auc_target_attainment
-        .expect("auc_target declared");
+    let attain = res.metrics[0].auc_target_attainment.expect("auc_target declared");
     let n = attain * n_windows as f64;
-    assert!(
-        (n - n.round()).abs() < 1e-9,
-        "attainment {attain} is k/{n_windows}"
-    );
+    assert!((n - n.round()).abs() < 1e-9, "attainment {attain} is k/{n_windows}");
     n.round() as usize
 }
 
 /// Every realized window AUC of the run matches `want[i]` to `tol` relative. The bands are
 /// first checked pairwise disjoint, so a count of one in band `i` is window `i`.
 pub(super) fn assert_window_aucs(
-    m: &CompiledModel,
-    pop: &Population,
-    spec: &AdaptiveDosingSpec,
-    seed: u64,
-    want: &[f64],
-    tol: f64,
-    label: &str,
+    m: &CompiledModel, pop: &Population, spec: &AdaptiveDosingSpec, seed: u64, want: &[f64],
+    tol: f64, label: &str,
 ) {
     let band_of = |r: f64| (r * (1.0 - tol), r * (1.0 + tol));
     for (i, &a) in want.iter().enumerate() {
@@ -184,15 +157,8 @@ pub(super) fn assert_window_aucs(
 /// alternative convention is far enough from the right one for the fixture to tell them
 /// apart.
 pub(super) fn assert_distinct(got: &[f64], alt: &[f64], tol: f64, label: &str) {
-    let worst = got
-        .iter()
-        .zip(alt)
-        .map(|(g, a)| ((a - g) / g).abs())
-        .fold(0.0, f64::max);
-    assert!(
-        got.iter().chain(alt).all(|x| x.is_finite()),
-        "{label}: non-finite closed form"
-    );
+    let worst = got.iter().zip(alt).map(|(g, a)| ((a - g) / g).abs()).fold(0.0, f64::max);
+    assert!(got.iter().chain(alt).all(|x| x.is_finite()), "{label}: non-finite closed form");
     assert!(
         worst > 10.0 * tol,
         "{label}: the alternative is only {worst:e} from the closed form, inside 10× the band"
@@ -239,12 +205,7 @@ const DECISIONS: [f64; 3] = [0.0, 24.0, 48.0];
 /// The closed-form segment of `MODEL_TV` on `(t0, t1]` under the row `(CRCL, WT, FU)`.
 fn tv_seg(t0: f64, t1: f64, (crcl, wt, fu): (f64, f64, f64)) -> Seg {
     let (cl, v) = (5.0 * crcl / 100.0, 50.0 * wt / 70.0);
-    Seg {
-        t0,
-        t1,
-        k: cl / v,
-        factor: fu / v,
-    }
+    Seg { t0, t1, k: cl / v, factor: fu / v }
 }
 
 /// `MODEL_TV` with a 100 bolus at each decision; `rows` are `(TIME, EVID, AMT, II, ADDL,
@@ -253,9 +214,7 @@ fn tv_csv(rows: &[(f64, u8, f64, f64, u32, f64, f64, f64)]) -> String {
     let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,II,ADDL,CRCL,WT,FU\n");
     for &(t, evid, amt, ii, addl, crcl, wt, fu) in rows {
         let mdv = u8::from(evid != 0);
-        s.push_str(&format!(
-            "1,{t},0,{evid},{amt},1,{mdv},{ii},{addl},{crcl},{wt},{fu}\n"
-        ));
+        s.push_str(&format!("1,{t},0,{evid},{amt},1,{mdv},{ii},{addl},{crcl},{wt},{fu}\n"));
     }
     s
 }
@@ -354,11 +313,7 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
     // LOCF row, the one at 12, under `decision_covariates = locf` (the default), and the row
     // of the next data record, the one at 30, under `nocb`. `nocb` is the pre-#2895 value.
     let decision_off_grid = segs_off(R12);
-    run_tv(
-        &tv_csv(&off_grid),
-        &decision_off_grid,
-        "decision with no data row",
-    );
+    run_tv(&tv_csv(&off_grid), &decision_off_grid, "decision with no data row");
     let nocb_off_grid = segs_off(R24);
     {
         let m = parse_model_string(MODEL_TV).expect("parse");
@@ -387,12 +342,7 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
     let in_force_fu = exact_window_aucs(
         &[
             tv_seg(0.0, 12.0, R12),
-            Seg {
-                t0: 12.0,
-                t1: 24.0,
-                k: cl / v,
-                factor: R12.2 / v,
-            },
+            Seg { t0: 12.0, t1: 24.0, k: cl / v, factor: R12.2 / v },
             tv_seg(24.0, 30.0, R24),
             tv_seg(30.0, 36.0, R36),
             tv_seg(36.0, 48.0, R48),
@@ -411,12 +361,7 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
     // Records stop at 36, before the last decision: `(36, 48]` has no record ahead, so it
     // runs under the last record that ran (the PK carry) and reads that record's row — the
     // one at 36, not the subject's baseline row.
-    let short = [
-        obs_row(0.0, R0),
-        obs_row(12.0, R12),
-        obs_row(24.0, R24),
-        obs_row(36.0, R36),
-    ];
+    let short = [obs_row(0.0, R0), obs_row(12.0, R12), obs_row(24.0, R24), obs_row(36.0, R36)];
     let trailing = |last| {
         exact_window_aucs(
             &[
@@ -439,23 +384,13 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
             tv_seg(0.0, 12.0, R12),
             tv_seg(12.0, 24.0, R24),
             tv_seg(24.0, 36.0, R36),
-            Seg {
-                t0: 36.0,
-                t1: 48.0,
-                k: cl / v,
-                factor: R0.2 / v,
-            },
+            Seg { t0: 36.0, t1: 48.0, k: cl / v, factor: R0.2 / v },
         ],
         &boluses,
         &[],
         &DECISIONS,
     );
-    assert_distinct(
-        &past_last,
-        &baseline_fu,
-        AUC_TOL,
-        "baseline row past the final record",
-    );
+    assert_distinct(&past_last, &baseline_fu, AUC_TOL, "baseline row past the final record");
 
     // The alternatives the mutations produce are far from the closed form.
     let static_fu: Vec<Seg> = [
@@ -465,10 +400,7 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
         tv_seg(36.0, 48.0, R48),
     ]
     .iter()
-    .map(|s| Seg {
-        factor: s.factor / [R12, R24, R36, R48][(s.t0 / 12.0) as usize].2 * R0.2,
-        ..*s
-    })
+    .map(|s| Seg { factor: s.factor / [R12, R24, R36, R48][(s.t0 / 12.0) as usize].2 * R0.2, ..*s })
     .collect();
     let static_fu = exact_window_aucs(&static_fu, &boluses, &[], &DECISIONS);
     assert_distinct(&inside, &static_fu, AUC_TOL, "static FU at the grid points");
@@ -499,12 +431,7 @@ const MODEL_TIME: &str = r#"
 fn time_seg(t0: f64, t1: f64) -> Seg {
     // The record at `t1` governs `(t0, t1]`, so `$PK` ran at `TIME = t1`.
     let (cl, v) = (5.0 * (1.0 + 0.02 * t1), 50.0 * (1.0 + 0.01 * t1));
-    Seg {
-        t0,
-        t1,
-        k: cl / v,
-        factor: 1.0 / v,
-    }
+    Seg { t0, t1, k: cl / v, factor: 1.0 / v }
 }
 
 /// `TIME` in the PK (#943): each segment runs under `$PK` evaluated at the record that
@@ -528,12 +455,7 @@ fn auc_target_follows_time_in_the_pk() {
     };
 
     let inside = exact_window_aucs(
-        &[
-            time_seg(0.0, 12.0),
-            time_seg(12.0, 24.0),
-            time_seg(24.0, 36.0),
-            time_seg(36.0, 48.0),
-        ],
+        &[time_seg(0.0, 12.0), time_seg(12.0, 24.0), time_seg(24.0, 36.0), time_seg(36.0, 48.0)],
         &boluses,
         &[],
         &DECISIONS,
@@ -541,28 +463,11 @@ fn auc_target_follows_time_in_the_pk() {
     let pop = read_pop(&csv(&[0.0, 12.0, 24.0, 36.0, 48.0]), &[]);
     assert_window_aucs(&m, &pop, &spec, 1, &inside, AUC_TOL, "TIME, records inside");
 
-    let edges = exact_window_aucs(
-        &[time_seg(0.0, 24.0), time_seg(24.0, 48.0)],
-        &boluses,
-        &[],
-        &DECISIONS,
-    );
+    let edges =
+        exact_window_aucs(&[time_seg(0.0, 24.0), time_seg(24.0, 48.0)], &boluses, &[], &DECISIONS);
     let pop = read_pop(&csv(&[0.0, 24.0, 48.0]), &[]);
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        1,
-        &edges,
-        AUC_TOL,
-        "TIME, records on the edges",
-    );
-    assert_distinct(
-        &inside,
-        &edges,
-        AUC_TOL,
-        "TIME: interior record vs edges only",
-    );
+    assert_window_aucs(&m, &pop, &spec, 1, &edges, AUC_TOL, "TIME, records on the edges");
+    assert_distinct(&inside, &edges, AUC_TOL, "TIME: interior record vs edges only");
 }
 
 // ── IOV ─────────────────────────────────────────────────────────────────────────────────
@@ -598,26 +503,17 @@ const IOV_DECISIONS: [f64; 4] = [0.0, 24.0, 48.0, 72.0];
 pub(super) fn reconstructed_kappa(m: &CompiledModel, seed: u64, n: usize) -> Vec<f64> {
     let chol = &m.default_params.omega_iov.as_ref().expect("omega_iov").chol;
     let base = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
-    (0..n)
-        .map(|g| chol[(0, 0)] * crate::sim::adaptive::kappa_standard_normal(base, g, 0))
-        .collect()
+    (0..n).map(|g| chol[(0, 0)] * crate::sim::adaptive::kappa_standard_normal(base, g, 0)).collect()
 }
 
 fn iov_seg(t0: f64, t1: f64, kappa: f64) -> Seg {
     let v = 50.0 * kappa.exp();
-    Seg {
-        t0,
-        t1,
-        k: 5.0 / v,
-        factor: 1.0 / v,
-    }
+    Seg { t0, t1, k: 5.0 / v, factor: 1.0 / v }
 }
 
 fn iov_csv(resets: &[f64]) -> String {
-    let mut rows: Vec<(f64, String)> = IOV_DECISIONS
-        .iter()
-        .map(|&t| (t, format!("1,{t},0,0,0,1,0\n")))
-        .collect();
+    let mut rows: Vec<(f64, String)> =
+        IOV_DECISIONS.iter().map(|&t| (t, format!("1,{t},0,0,0,1,0\n"))).collect();
     rows.extend(resets.iter().map(|&t| (t, format!("1,{t},0,3,0,1,1\n"))));
     rows.sort_by(|a, b| a.0.total_cmp(&b.0));
     std::iter::once("ID,TIME,DV,EVID,AMT,CMT,MDV\n".to_string())
@@ -646,31 +542,21 @@ fn auc_target_reads_each_window_under_its_segments_kappa() {
     }
     let spec = fixed_dose_spec(None, &IOV_DECISIONS, 100.0);
     let boluses = [(0.0, 100.0), (24.0, 100.0), (48.0, 100.0)];
-    let segs: Vec<Seg> = (0..3)
-        .map(|w| iov_seg(IOV_DECISIONS[w], IOV_DECISIONS[w + 1], kappa[w + 1]))
-        .collect();
+    let segs: Vec<Seg> =
+        (0..3).map(|w| iov_seg(IOV_DECISIONS[w], IOV_DECISIONS[w + 1], kappa[w + 1])).collect();
     let want = exact_window_aucs(&segs, &boluses, &[], &IOV_DECISIONS);
     let pop = read_pop(&iov_csv(&[]), &[]);
     assert_window_aucs(&m, &pop, &spec, IOV_SEED, &want, AUC_TOL, "IOV");
 
     // The κ = 0 divisor: the state still integrated under κ_{w+1}, divided by V(0).
-    let zero_div: Vec<Seg> = segs
-        .iter()
-        .map(|s| Seg {
-            factor: 1.0 / 50.0,
-            ..*s
-        })
-        .collect();
+    let zero_div: Vec<Seg> = segs.iter().map(|s| Seg { factor: 1.0 / 50.0, ..*s }).collect();
     let zero_div = exact_window_aucs(&zero_div, &boluses, &[], &IOV_DECISIONS);
     assert_distinct(&want, &zero_div, AUC_TOL, "κ = 0 divisor");
     // The decision window's κ_w in the readout and divisor (state under κ_{w+1}).
     let window_kappa: Vec<Seg> = segs
         .iter()
         .zip(&kappa)
-        .map(|(s, &kw)| Seg {
-            factor: 1.0 / (50.0 * kw.exp()),
-            ..*s
-        })
+        .map(|(s, &kw)| Seg { factor: 1.0 / (50.0 * kw.exp()), ..*s })
         .collect();
     let window_kappa = exact_window_aucs(&window_kappa, &boluses, &[], &IOV_DECISIONS);
     assert_distinct(&want, &window_kappa, AUC_TOL, "decision-window κ");
@@ -701,15 +587,7 @@ fn auc_target_reads_a_reset_rows_own_kappa() {
         &IOV_DECISIONS,
     );
     let pop = read_pop(&iov_csv(&[12.0]), &[]);
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        IOV_SEED,
-        &in_window0,
-        AUC_TOL,
-        "reset at 12",
-    );
+    assert_window_aucs(&m, &pop, &spec, IOV_SEED, &in_window0, AUC_TOL, "reset at 12");
     // Had the reset taken the next record's κ_1, window 0 would move.
     let next_kappa = exact_window_aucs(
         &[
@@ -736,15 +614,7 @@ fn auc_target_reads_a_reset_rows_own_kappa() {
         &IOV_DECISIONS,
     );
     let pop = read_pop(&iov_csv(&[30.0]), &[]);
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        IOV_SEED,
-        &in_window1,
-        AUC_TOL,
-        "reset at 30",
-    );
+    assert_window_aucs(&m, &pop, &spec, IOV_SEED, &in_window1, AUC_TOL, "reset at 30");
 }
 
 // ── Past the final record: every decision is a record (#2895) ──────────────────────────
@@ -762,10 +632,7 @@ fn auc_target_reads_a_reset_rows_own_kappa() {
 /// window ends at a decision, and the decision governs the piece that ends there.
 #[test]
 fn auc_target_past_the_last_record_runs_under_the_decision_records() {
-    let rows = [
-        (0.0, 1, 100.0, 12.0, 3, R0.0, R0.1, R0.2),
-        obs_row(6.0, R12),
-    ];
+    let rows = [(0.0, 1, 100.0, 12.0, 3, R0.0, R0.1, R0.2), obs_row(6.0, R12)];
     // Base 100 at 0, 12, 24, 36, plus the controller's 100 at each decision.
     let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 200.0), (36.0, 100.0)];
     let after_6 = |row| {
@@ -784,12 +651,7 @@ fn auc_target_past_the_last_record_runs_under_the_decision_records() {
     };
     let want = after_6(R12);
     run_tv(&tv_csv(&rows), &want, "ADDL train past the last record");
-    assert_distinct(
-        &want,
-        &after_6(R0),
-        AUC_TOL,
-        "parent row past the last record (before #2895)",
-    );
+    assert_distinct(&want, &after_6(R0), AUC_TOL, "parent row past the last record (before #2895)");
 }
 
 /// The IOV twin of [`auc_target_past_the_last_record_runs_under_the_decision_records`]
@@ -824,20 +686,12 @@ fn auc_target_past_the_last_record_follows_the_decision_records_under_iov() {
 "#;
     let m = parse_model_string(MODEL_TV_IOV).expect("parse");
     let kappa = reconstructed_kappa(&m, IOV_SEED, DECISIONS.len());
-    let rows = [
-        (0.0, 1, 100.0, 12.0, 1, R0.0, R0.1, R0.2),
-        obs_row(6.0, R12),
-    ];
+    let rows = [(0.0, 1, 100.0, 12.0, 1, R0.0, R0.1, R0.2), obs_row(6.0, R12)];
     let pop = read_pop(&tv_csv(&rows), &TV_COVS);
     let spec = fixed_dose_spec(Some(TV_OBSERVE), &DECISIONS, 100.0);
     let seg = |t0: f64, t1: f64, pk_row: (f64, f64, f64), fu: f64, kappa: f64| {
         let (cl, v) = (5.0 * pk_row.0 / 100.0, 50.0 * pk_row.1 / 70.0 * kappa.exp());
-        Seg {
-            t0,
-            t1,
-            k: cl / v,
-            factor: fu / v,
-        }
+        Seg { t0, t1, k: cl / v, factor: fu / v }
     };
     let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 100.0)];
     let want = exact_window_aucs(
@@ -851,15 +705,7 @@ fn auc_target_past_the_last_record_follows_the_decision_records_under_iov() {
         &[],
         &DECISIONS,
     );
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        IOV_SEED,
-        &want,
-        AUC_TOL,
-        "IOV, every decision a record",
-    );
+    assert_window_aucs(&m, &pop, &spec, IOV_SEED, &want, AUC_TOL, "IOV, every decision a record");
     let before_2895 = exact_window_aucs(
         &[
             seg(0.0, 6.0, R12, R12.2, kappa[0]),
@@ -882,30 +728,18 @@ fn auc_target_past_the_last_record_follows_the_decision_records_under_iov() {
 /// which an implied dose is not (#2528).
 #[test]
 fn auc_target_reads_an_implied_dose_under_its_governing_record() {
-    let rows = [
-        (0.0, 1, 100.0, 12.0, 1, R0.0, R0.1, R0.2),
-        obs_row(24.0, R24),
-        obs_row(48.0, R48),
-    ];
+    let rows = [(0.0, 1, 100.0, 12.0, 1, R0.0, R0.1, R0.2), obs_row(24.0, R24), obs_row(48.0, R48)];
     // Base 100 at 0 and its implied 100 at 12, plus the controller's 100 at each decision.
     let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 100.0)];
     let want = exact_window_aucs(
-        &[
-            tv_seg(0.0, 12.0, R24),
-            tv_seg(12.0, 24.0, R24),
-            tv_seg(24.0, 48.0, R48),
-        ],
+        &[tv_seg(0.0, 12.0, R24), tv_seg(12.0, 24.0, R24), tv_seg(24.0, 48.0, R48)],
         &boluses,
         &[],
         &DECISIONS,
     );
     run_tv(&tv_csv(&rows), &want, "ADDL-implied dose");
     let dose_row = exact_window_aucs(
-        &[
-            tv_seg(0.0, 12.0, R0),
-            tv_seg(12.0, 24.0, R24),
-            tv_seg(24.0, 48.0, R48),
-        ],
+        &[tv_seg(0.0, 12.0, R0), tv_seg(12.0, 24.0, R24), tv_seg(24.0, 48.0, R48)],
         &boluses,
         &[],
         &DECISIONS,
@@ -936,13 +770,7 @@ fn auc_target_reads_an_implied_doses_occasion_under_iov() {
         });
     }
     let pop = read_pop(&csv, &[]);
-    let boluses = [
-        (0.0, 100.0),
-        (12.0, 100.0),
-        (24.0, 100.0),
-        (36.0, 100.0),
-        (48.0, 100.0),
-    ];
+    let boluses = [(0.0, 100.0), (12.0, 100.0), (24.0, 100.0), (36.0, 100.0), (48.0, 100.0)];
     let with = |k_24_36: f64| {
         exact_window_aucs(
             &[
@@ -954,10 +782,7 @@ fn auc_target_reads_an_implied_doses_occasion_under_iov() {
             ]
             .map(|s| {
                 if s.t0 == 24.0 {
-                    Seg {
-                        factor: 1.0 / (50.0 * k_24_36.exp()),
-                        ..s
-                    }
+                    Seg { factor: 1.0 / (50.0 * k_24_36.exp()), ..s }
                 } else {
                     s
                 }
@@ -968,21 +793,8 @@ fn auc_target_reads_an_implied_doses_occasion_under_iov() {
         )
     };
     let want = with(kappa[2]);
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        IOV_SEED,
-        &want,
-        AUC_TOL,
-        "IOV implied dose",
-    );
-    assert_distinct(
-        &want,
-        &with(kappa[1]),
-        AUC_TOL,
-        "implied dose under its own time's κ",
-    );
+    assert_window_aucs(&m, &pop, &spec, IOV_SEED, &want, AUC_TOL, "IOV implied dose");
+    assert_distinct(&want, &with(kappa[1]), AUC_TOL, "implied dose under its own time's κ");
 }
 
 /// Two co-timed records on a window edge (#2485 / #2533 tie order): at 24 an observation and
@@ -1009,22 +821,12 @@ fn auc_target_reads_the_first_of_two_cotimed_records_on_a_window_edge() {
     };
     let (obs_first, evid2_first) = (under(R24), under(evid2));
     run_tv(
-        &tv_csv(&[
-            obs_row(0.0, R0),
-            obs_row(24.0, R24),
-            evid2_row,
-            obs_row(48.0, R48),
-        ]),
+        &tv_csv(&[obs_row(0.0, R0), obs_row(24.0, R24), evid2_row, obs_row(48.0, R48)]),
         &obs_first,
         "observation listed first",
     );
     run_tv(
-        &tv_csv(&[
-            obs_row(0.0, R0),
-            evid2_row,
-            obs_row(24.0, R24),
-            obs_row(48.0, R48),
-        ]),
+        &tv_csv(&[obs_row(0.0, R0), evid2_row, obs_row(24.0, R24), obs_row(48.0, R48)]),
         &evid2_first,
         "EVID=2 row listed first",
     );
@@ -1053,30 +855,17 @@ fn auc_target_reads_a_trough_tied_to_a_mid_window_dose() {
     );
     let boluses = [(0.0, 100.0), (12.0, 100.0), (24.0, 100.0)];
     let want = exact_window_aucs(
-        &[
-            tv_seg(0.0, 12.0, R12),
-            tv_seg(12.0, 24.0, R24),
-            tv_seg(24.0, 48.0, R48),
-        ],
+        &[tv_seg(0.0, 12.0, R12), tv_seg(12.0, 24.0, R24), tv_seg(24.0, 48.0, R48)],
         &boluses,
         &[],
         &DECISIONS,
     );
     run_tv(&tv_csv(&rows), &want, "trough tied to a dose");
     let under_dose_row = exact_window_aucs(
-        &[
-            tv_seg(0.0, 12.0, dose_row),
-            tv_seg(12.0, 24.0, R24),
-            tv_seg(24.0, 48.0, R48),
-        ],
+        &[tv_seg(0.0, 12.0, dose_row), tv_seg(12.0, 24.0, R24), tv_seg(24.0, 48.0, R48)],
         &boluses,
         &[],
         &DECISIONS,
     );
-    assert_distinct(
-        &want,
-        &under_dose_row,
-        AUC_TOL,
-        "dose row governs the trough",
-    );
+    assert_distinct(&want, &under_dose_row, AUC_TOL, "dose row governs the trough");
 }

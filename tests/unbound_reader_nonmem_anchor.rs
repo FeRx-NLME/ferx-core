@@ -100,27 +100,17 @@ fn preds(src: &str) -> Vec<f64> {
 /// compared absolutely. Measured worst error 3.73e-5 relative (init arm)
 /// — the table's own rounding, at most 5e-5 — so 1e-4 is 2.7× headroom.
 fn assert_matches(got: &[f64], want: &[f64], label: &str) {
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "{label}: one prediction per observation"
-    );
+    assert_eq!(got.len(), want.len(), "{label}: one prediction per observation");
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         assert!(g.is_finite(), "{label} obs {i}: ferx {g}");
         let err = if w == 0.0 { g.abs() } else { (g - w).abs() / w };
-        assert!(
-            err < 1e-4,
-            "{label} obs {i}: ferx {g:.6} vs NONMEM {w:.6} ({err:.2e})"
-        );
+        assert!(err < 1e-4, "{label} obs {i}: ferx {g:.6} vs NONMEM {w:.6} ({err:.2e})");
     }
 }
 
 #[test]
 fn ferx_matches_nonmem_when_an_init_reads_an_unbound_parameter() {
-    let src = model(
-        "S = 0.5 * TVS * WT",
-        "[initial_conditions]\n  init(central) = S",
-    );
+    let src = model("S = 0.5 * TVS * WT", "[initial_conditions]\n  init(central) = S");
     assert_matches(&preds(&src), &NONMEM_INIT, "init");
 }
 

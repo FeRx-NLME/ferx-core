@@ -122,15 +122,9 @@ impl GroupMember<'_> {
     /// that evaluates [`Self::mu_snapshot`] at many θ. `names` is
     /// `TypicalProgram::covariate_names`.
     fn snapshots<'n>(
-        &self,
-        names: &'n [String],
-        population: &Population,
+        &self, names: &'n [String], population: &Population,
     ) -> Vec<CovariateSnapshot<'n>> {
-        population
-            .subjects
-            .iter()
-            .map(|s| CovariateSnapshot::new(names, &s.covariates))
-            .collect()
+        population.subjects.iter().map(|s| CovariateSnapshot::new(names, &s.covariates)).collect()
     }
 
     fn link(&self, a: f64) -> f64 {
@@ -158,11 +152,7 @@ impl GroupMember<'_> {
 
     /// [`Self::mu`] over the population.
     pub fn mus(&self, theta: &[f64], population: &Population) -> Vec<f64> {
-        population
-            .subjects
-            .iter()
-            .map(|s| self.mu(theta, s))
-            .collect()
+        population.subjects.iter().map(|s| self.mu(theta, s)).collect()
     }
 }
 
@@ -262,11 +252,8 @@ struct Admitted<'m> {
 /// `A{t1}`, `B{t2}`, `C{t1, t2}` — become one group (#1620). A shared `FIX`ed
 /// theta links nothing: no step moves it, so it cannot drift.
 pub(crate) fn resolve_covariate_mu_groups<'m>(
-    model: &'m CompiledModel,
-    population: &Population,
-    plain_pairs: &[(usize, usize)],
-    theta_fixed: &[bool],
-    omega: &DMatrix<f64>,
+    model: &'m CompiledModel, population: &Population, plain_pairs: &[(usize, usize)],
+    theta_fixed: &[bool], omega: &DMatrix<f64>,
 ) -> (Vec<CovariateMuGroup<'m>>, Vec<String>) {
     let is_free = |t: usize| !theta_fixed.get(t).copied().unwrap_or(false);
     let theta_name = |t: usize| model.theta_names.get(t).map(String::as_str).unwrap_or("?");
@@ -327,12 +314,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
             ));
             continue;
         }
-        candidates.push(Admitted {
-            eta_idx,
-            theta_idx,
-            spec,
-            absorbed_anchor: false,
-        });
+        candidates.push(Admitted { eta_idx, theta_idx, spec, absorbed_anchor: false });
     }
 
     // 2. Collisions with a single-anchor pair on another eta (#1630). Only a
@@ -458,10 +440,8 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
     let mut groups: Vec<CovariateMuGroup<'m>> = Vec::with_capacity(components.len());
     for component in components {
         let members: Vec<&Admitted<'m>> = component.iter().map(|&a| &admitted[a]).collect();
-        let mut theta_idx: Vec<usize> = members
-            .iter()
-            .flat_map(|m| m.theta_idx.iter().copied())
-            .collect();
+        let mut theta_idx: Vec<usize> =
+            members.iter().flat_map(|m| m.theta_idx.iter().copied()).collect();
         theta_idx.sort_unstable();
         theta_idx.dedup();
         let free: Vec<usize> = theta_idx.iter().copied().filter(|&t| is_free(t)).collect();
@@ -469,11 +449,7 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         let eta_list = join_names(members.iter().map(|m| m.spec.eta_name.as_str()));
         // An absorbed anchor is not a covariate mu-reference (#1630).
         let anchors: Vec<&&Admitted<'m>> = members.iter().filter(|m| m.absorbed_anchor).collect();
-        let kind = if anchors.is_empty() {
-            "covariate mu-references"
-        } else {
-            "mu-references"
-        };
+        let kind = if anchors.is_empty() { "covariate mu-references" } else { "mu-references" };
         // How a note names the group: one member keeps the historical wording.
         let (subject, keeps, its) = if joint {
             (format!("{kind} on {eta_list}"), "keep", "their joint")
@@ -497,27 +473,15 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
                 .map(theta_name)
                 .collect();
             let described = join_names(members.iter().map(|m| {
-                let reads = if m.absorbed_anchor {
-                    "anchored on"
-                } else {
-                    "reads"
-                };
-                format!(
-                    "{} ({reads} {})",
-                    m.spec.eta_name,
-                    m.spec.theta_names.join(", ")
-                )
+                let reads = if m.absorbed_anchor { "anchored on" } else { "reads" };
+                format!("{} ({reads} {})", m.spec.eta_name, m.spec.theta_names.join(", "))
             }));
             let all = if members.len() == 2 {
                 "both".to_string()
             } else {
                 format!("all {} of them", members.len())
             };
-            let issue = if anchors.is_empty() {
-                "#1620"
-            } else {
-                "#1620, #1630"
-            };
+            let issue = if anchors.is_empty() { "#1620" } else { "#1620, #1630" };
             notes.push(format!(
                 "{kind} on {described} share {} and take one joint M-step that re-centres {all} \
                  ({issue}).",
@@ -526,12 +490,10 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
         }
 
         let time_varying = members.iter().any(|m| {
-            m.spec.covariate_names.iter().any(|c| {
-                population
-                    .subjects
-                    .iter()
-                    .any(|s| covariate_varies_within(s, c))
-            })
+            m.spec
+                .covariate_names
+                .iter()
+                .any(|c| population.subjects.iter().any(|s| covariate_varies_within(s, c)))
         });
         // A free theta that reaches the data by a route no member's `φ_i`
         // pins keeps the data term live even with every covariate
@@ -557,12 +519,9 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
             .map(theta_name)
             .filter(|n| {
                 unabsorbed_anchor_thetas.contains(n)
-                    || members.iter().any(|m| {
-                        m.spec
-                            .read_outside_groups_and_anchors
-                            .iter()
-                            .any(|r| r == n)
-                    })
+                    || members
+                        .iter()
+                        .any(|m| m.spec.read_outside_groups_and_anchors.iter().any(|r| r == n))
             })
             .collect();
         if !outside.is_empty() {
@@ -706,11 +665,7 @@ fn cross_weights(k: usize, omega: &DMatrix<f64>) -> Option<Vec<f64>> {
     if !(wkk.is_finite() && wkk > 0.0) {
         return None;
     }
-    Some(
-        (0..n)
-            .map(|l| if l == k { 0.0 } else { w[(k, l)] / wkk })
-            .collect(),
-    )
+    Some((0..n).map(|l| if l == k { 0.0 } else { w[(k, l)] / wkk }).collect())
 }
 
 /// `Ω⁻¹`, or its diagonal approximation when Ω is singular — the weight the
@@ -731,16 +686,11 @@ fn prior_weight(omega: &DMatrix<f64>) -> DMatrix<f64> {
 /// inadmissible θ. Returns the full natural theta vector, or `None` when the
 /// starting point itself is inadmissible.
 fn levenberg_marquardt(
-    input: &GroupStepInput<'_>,
-    free: &[usize],
+    input: &GroupStepInput<'_>, free: &[usize],
     residuals: impl Fn(&[f64]) -> Option<(Vec<f64>, f64)>,
 ) -> Option<Vec<f64>> {
     let clamp = |t: usize, v: f64| -> f64 {
-        let lo = input
-            .theta_lower
-            .get(t)
-            .copied()
-            .unwrap_or(f64::NEG_INFINITY);
+        let lo = input.theta_lower.get(t).copied().unwrap_or(f64::NEG_INFINITY);
         let hi = input.theta_upper.get(t).copied().unwrap_or(f64::INFINITY);
         v.clamp(lo, hi)
     };
@@ -835,16 +785,10 @@ impl CovariateMuGroup<'_> {
     /// "its typical value was")` for one member, the plural for a joint group.
     pub fn skipped_step_phrases(&self) -> (String, &'static str) {
         if self.members.len() == 1 {
-            (
-                format!("covariate mu-reference on {}", self.eta_names()),
-                "its typical value was",
-            )
+            (format!("covariate mu-reference on {}", self.eta_names()), "its typical value was")
         } else {
             (
-                format!(
-                    "covariate mu-references on {} (one joint group)",
-                    self.eta_names()
-                ),
+                format!("covariate mu-references on {} (one joint group)", self.eta_names()),
                 "one of their typical values was",
             )
         }
@@ -852,10 +796,7 @@ impl CovariateMuGroup<'_> {
 
     /// [`GroupMember::mus`] for every member: `mus[m][i]`.
     pub fn mus(&self, theta: &[f64], population: &Population) -> Vec<Vec<f64>> {
-        self.members
-            .iter()
-            .map(|m| m.mus(theta, population))
-            .collect()
+        self.members.iter().map(|m| m.mus(theta, population)).collect()
     }
 
     /// Whether a group step started from `theta` can do anything at all — the
@@ -872,10 +813,7 @@ impl CovariateMuGroup<'_> {
     /// fit (#918 review).
     pub fn can_step(&self, theta: &[f64], population: &Population, theta_fixed: &[bool]) -> bool {
         !self.free_thetas(theta_fixed).is_empty()
-            && self
-                .members
-                .iter()
-                .all(|m| m.mus(theta, population).iter().all(|v| v.is_finite()))
+            && self.members.iter().all(|m| m.mus(theta, population).iter().all(|v| v.is_finite()))
     }
 
     /// Add `shifts[m][i]` to member `m`'s coordinate of `eta`, one of subject
@@ -898,10 +836,7 @@ impl CovariateMuGroup<'_> {
     /// eta `members[m].eta_idx`. A non-finite entry means "leave this subject
     /// alone".
     pub fn recentre_deltas(
-        &self,
-        theta_old: &[f64],
-        theta_new: &[f64],
-        population: &Population,
+        &self, theta_old: &[f64], theta_new: &[f64], population: &Population,
     ) -> Vec<Vec<f64>> {
         self.members
             .iter()
@@ -948,9 +883,7 @@ impl CovariateMuGroup<'_> {
     /// the residual is `Lᵀ η'_i` with `Ω⁻¹ = L Lᵀ`, which carries the cross
     /// terms between members and to the non-member etas alike.
     pub fn solve_exact(
-        &self,
-        population: &Population,
-        input: &GroupStepInput<'_>,
+        &self, population: &Population, input: &GroupStepInput<'_>,
     ) -> Option<Vec<f64>> {
         let free = self.free_thetas(input.theta_fixed);
         if free.is_empty() {
@@ -963,10 +896,7 @@ impl CovariateMuGroup<'_> {
     }
 
     fn solve_exact_joint(
-        &self,
-        population: &Population,
-        input: &GroupStepInput<'_>,
-        free: &[usize],
+        &self, population: &Population, input: &GroupStepInput<'_>, free: &[usize],
     ) -> Option<Vec<f64>> {
         let mu_old = self.mus(input.theta, population);
         if mu_old.iter().flatten().any(|m| !m.is_finite()) {
@@ -978,17 +908,10 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
-        let names: Vec<Vec<String>> = self
-            .members
-            .iter()
-            .map(|m| m.spec.typical.covariate_names())
-            .collect();
-        let snaps: Vec<Vec<CovariateSnapshot<'_>>> = self
-            .members
-            .iter()
-            .zip(&names)
-            .map(|(m, n)| m.snapshots(n, population))
-            .collect();
+        let names: Vec<Vec<String>> =
+            self.members.iter().map(|m| m.spec.typical.covariate_names()).collect();
+        let snaps: Vec<Vec<CovariateSnapshot<'_>>> =
+            self.members.iter().zip(&names).map(|(m, n)| m.snapshots(n, population)).collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
             let mut r = Vec::with_capacity(population.subjects.len() * q);
             let mut ss = 0.0;
@@ -1026,10 +949,7 @@ impl CovariateMuGroup<'_> {
     /// that member's individual parameter moving with the shared theta. Returns
     /// the full natural theta vector, or `None` when nothing can move.
     pub fn solve_numerical(
-        &self,
-        population: &Population,
-        input: &GroupStepInput<'_>,
-        maxiter: u32,
+        &self, population: &Population, input: &GroupStepInput<'_>, maxiter: u32,
         data_nll: &dyn Fn(&[f64], &[Vec<f64>]) -> f64,
     ) -> Option<Vec<f64>> {
         let free = self.free_thetas(input.theta_fixed);
@@ -1127,13 +1047,8 @@ impl CovariateMuGroup<'_> {
         };
         let mut x = start.clone();
         {
-            let mut opt = nlopt::Nlopt::new(
-                nlopt::Algorithm::Bobyqa,
-                d,
-                obj,
-                nlopt::Target::Minimize,
-                (),
-            );
+            let mut opt =
+                nlopt::Nlopt::new(nlopt::Algorithm::Bobyqa, d, obj, nlopt::Target::Minimize, ());
             opt.set_lower_bounds(&lower).ok()?;
             opt.set_upper_bounds(&upper).ok()?;
             opt.set_maxeval(maxiter.max(1) * (d as u32 + 2)).ok()?;
@@ -1152,10 +1067,7 @@ impl CovariateMuGroup<'_> {
 /// [`CovariateMuGroup::solve_exact`] for one member: `Σ_i (t_i − g(A_i(θ)))²`
 /// with the block-Ω cross terms folded into the constant target `t_i`.
 fn solve_exact_single(
-    member: &GroupMember<'_>,
-    population: &Population,
-    input: &GroupStepInput<'_>,
-    free: &[usize],
+    member: &GroupMember<'_>, population: &Population, input: &GroupStepInput<'_>, free: &[usize],
 ) -> Option<Vec<f64>> {
     let n = population.subjects.len();
     let mu_old = member.mus(input.theta, population);

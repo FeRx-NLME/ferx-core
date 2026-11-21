@@ -107,17 +107,9 @@ fn data_cr(kc1: f64) -> String {
 fn population(model: &CompiledModel, csv: &str) -> Population {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(csv.as_bytes()).unwrap();
-    read_population_for(
-        model,
-        &None,
-        f.path().to_str().unwrap(),
-        None,
-        None,
-        None,
-        &[],
-    )
-    .expect("read population")
-    .0
+    read_population_for(model, &None, f.path().to_str().unwrap(), None, None, None, &[])
+        .expect("read population")
+        .0
 }
 
 fn simulate(model_src: &str, csv: &str, n_sim: usize) -> SimulationOutput {
@@ -134,10 +126,7 @@ fn simulate(model_src: &str, csv: &str, n_sim: usize) -> SimulationOutput {
 }
 
 fn solve_failed(out: &SimulationOutput) -> Vec<&String> {
-    out.warnings
-        .iter()
-        .filter(|w| w.starts_with("W_TTE_SOLVE_FAILED"))
-        .collect()
+    out.warnings.iter().filter(|w| w.starts_with("W_TTE_SOLVE_FAILED")).collect()
 }
 
 fn rows_of<'a>(out: &'a SimulationOutput, id: &str) -> Vec<&'a SimulationResult> {
@@ -159,15 +148,7 @@ fn row_bits(r: &SimulationResult) -> (usize, usize, String, u64, usize, u64, Str
         SimOutcome::Event { time, observed } => format!("event:{:x}:{observed}", time.to_bits()),
         ref other => format!("{other:?}"),
     };
-    (
-        r.draw,
-        r.sim,
-        r.id.clone(),
-        r.time.to_bits(),
-        r.cmt,
-        r.ipred.to_bits(),
-        outcome,
-    )
+    (r.draw, r.sim, r.id.clone(), r.time.to_bits(), r.cmt, r.ipred.to_bits(), outcome)
 }
 
 /// T1: the diverging subject no longer panics the run. Every replicate keeps both subjects'
@@ -184,27 +165,15 @@ fn diverging_subject_is_censored_and_the_run_continues() {
 
     let s1 = rows_of(&out, "1");
     let s1_tte: Vec<_> = s1.iter().filter(|r| r.cmt == 2).collect();
-    assert_eq!(
-        s1.len(),
-        2 * n_sim,
-        "subject 1 keeps a PK and a TTE row per replicate"
-    );
+    assert_eq!(s1.len(), 2 * n_sim, "subject 1 keeps a PK and a TTE row per replicate");
     assert_eq!(s1_tte.len(), n_sim);
     for r in &s1_tte {
         let (t, observed) = event(r).expect("CMT 2 is the event row");
         assert!(!observed, "a failed solve is censored, never an event");
-        assert_eq!(
-            t.to_bits(),
-            HORIZON.to_bits(),
-            "censored at the window, got {t}"
-        );
+        assert_eq!(t.to_bits(), HORIZON.to_bits(), "censored at the window, got {t}");
         assert_eq!(r.time.to_bits(), HORIZON.to_bits());
     }
-    assert_eq!(
-        rows_of(&out, "2").len(),
-        2 * n_sim,
-        "the healthy subject still simulates"
-    );
+    assert_eq!(rows_of(&out, "2").len(), 2 * n_sim, "the healthy subject still simulates");
     assert_eq!(solve_failed(&out).len(), n_sim, "{:#?}", out.warnings);
 }
 
@@ -230,10 +199,7 @@ fn healthy_subject_is_bit_identical_whether_or_not_another_diverges() {
     let a2: Vec<_> = rows_of(&a, "2").into_iter().map(row_bits).collect();
     let b2: Vec<_> = rows_of(&b, "2").into_iter().map(row_bits).collect();
     assert_eq!(a2.len(), 2 * n_sim);
-    assert_eq!(
-        a2, b2,
-        "subject 2's rows must not depend on subject 1's solve failing"
-    );
+    assert_eq!(a2, b2, "subject 2's rows must not depend on subject 1's solve failing");
     // The comparison has teeth only if subject 2's rows carry RNG-drawn values.
     assert!(rows_of(&a, "2").iter().any(|r| matches!(
         r.outcome,
@@ -264,13 +230,7 @@ fn warning_names_the_subject_the_state_and_the_censoring() {
     ] {
         assert!(w.contains(want), "missing {want:?} in: {w}");
     }
-    for unwanted in [
-        "state 0",
-        "__chz",
-        "subject '2'",
-        "degenerate",
-        "[event_model] hazard",
-    ] {
+    for unwanted in ["state 0", "__chz", "subject '2'", "degenerate", "[event_model] hazard"] {
         assert!(!w.contains(unwanted), "unexpected {unwanted:?} in: {w}");
     }
     assert_eq!(out.warnings.len(), 1, "{:#?}", out.warnings);
@@ -295,18 +255,12 @@ fn competing_risks_failure_censors_every_cause() {
     for w in &w {
         assert!(w.contains("subject '1' (CMT=2)"), "{w}");
         assert!(!w.contains("CMT=3"), "{w}");
-        assert!(
-            w.contains("every cause of the subject is censored at"),
-            "{w}"
-        );
+        assert!(w.contains("every cause of the subject is censored at"), "{w}");
     }
     assert!(solve_failed(&b).is_empty(), "{:#?}", b.warnings);
 
     for cmt in [2, 3] {
-        let tte: Vec<_> = rows_of(&a, "1")
-            .into_iter()
-            .filter(|r| r.cmt == cmt)
-            .collect();
+        let tte: Vec<_> = rows_of(&a, "1").into_iter().filter(|r| r.cmt == cmt).collect();
         assert_eq!(tte.len(), n_sim, "CMT {cmt}");
         for r in tte {
             let (t, observed) = event(r).expect("event row");
@@ -325,8 +279,5 @@ fn competing_risks_failure_censors_every_cause() {
     let a2: Vec<_> = rows_of(&a, "2").into_iter().map(row_bits).collect();
     let b2: Vec<_> = rows_of(&b, "2").into_iter().map(row_bits).collect();
     assert_eq!(a2.len(), 3 * n_sim);
-    assert_eq!(
-        a2, b2,
-        "subject 2's rows must not depend on subject 1's solve failing"
-    );
+    assert_eq!(a2, b2, "subject 2's rows must not depend on subject 1's solve failing");
 }

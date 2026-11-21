@@ -46,18 +46,12 @@ use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
 use std::path::Path;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     let model = parse_model_file(Path::new("examples/warfarin_ltbs.ferx"))
         .expect("LTBS warfarin model must parse");
     assert!(model.log_transform, "model must be flagged LTBS");
-    assert!(
-        !model.dv_pre_logged,
-        "log(DV) ~ additive logs DV in-engine (case 2)"
-    );
+    assert!(!model.dv_pre_logged, "log(DV) ~ additive logs DV in-engine (case 2)");
 
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data must load");
@@ -70,11 +64,7 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("LTBS FOCEI fit must succeed");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(result.converged, "LTBS fit should converge");
 
     // Cross-check against the NONMEM 7.5.1 FOCEI reference (see module docs and
@@ -95,16 +85,8 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     );
 
     let rel = |got: f64, nm: f64| (got - nm).abs() / nm.abs();
-    assert!(
-        rel(result.theta[0], NM_TVCL) < 0.02,
-        "TVCL {} vs NM {NM_TVCL}",
-        result.theta[0]
-    );
-    assert!(
-        rel(result.theta[1], NM_TVV) < 0.02,
-        "TVV {} vs NM {NM_TVV}",
-        result.theta[1]
-    );
+    assert!(rel(result.theta[0], NM_TVCL) < 0.02, "TVCL {} vs NM {NM_TVCL}", result.theta[0]);
+    assert!(rel(result.theta[1], NM_TVV) < 0.02, "TVV {} vs NM {NM_TVV}", result.theta[1]);
     // TVKA is the weakest-determined θ here (≈18% RSE, ETA_KA CV ≈ 58%), sitting
     // on a flat OFV ridge. It had a 5% band while the default outer was
     // derivative-free BOBYQA, which false-converged ~0.2 SE from NONMEM (≈0.79 vs
@@ -112,15 +94,8 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     // in-scope model (asserted below) and lands TVKA at a relative error of
     // 1.6e-5 (measured on #1540, release, macOS), so it now shares the 2% band of
     // the other θ — over 1000× headroom on the measured error.
-    assert_eq!(
-        result.optimizer, "auto (nlopt_lbfgs)",
-        "the default arm this band was measured on"
-    );
-    assert!(
-        rel(result.theta[2], NM_TVKA) < 0.02,
-        "TVKA {} vs NM {NM_TVKA}",
-        result.theta[2]
-    );
+    assert_eq!(result.optimizer, "auto (nlopt_lbfgs)", "the default arm this band was measured on");
+    assert!(rel(result.theta[2], NM_TVKA) < 0.02, "TVKA {} vs NM {NM_TVKA}", result.theta[2]);
     assert!(
         rel(result.sigma[0], NM_ADD_LOG_SD) < 0.05,
         "ADD_LOG SD {} vs NM {NM_ADD_LOG_SD}",
@@ -129,21 +104,9 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
 
     // OMEGA diagonal (variances), parallel to eta order CL, V, KA.
     let om: Vec<f64> = (0..3).map(|i| result.omega[(i, i)]).collect();
-    assert!(
-        rel(om[0], NM_OM_CL) < 0.10,
-        "ω²(CL) {} vs NM {NM_OM_CL}",
-        om[0]
-    );
-    assert!(
-        rel(om[1], NM_OM_V) < 0.10,
-        "ω²(V) {} vs NM {NM_OM_V}",
-        om[1]
-    );
-    assert!(
-        rel(om[2], NM_OM_KA) < 0.10,
-        "ω²(KA) {} vs NM {NM_OM_KA}",
-        om[2]
-    );
+    assert!(rel(om[0], NM_OM_CL) < 0.10, "ω²(CL) {} vs NM {NM_OM_CL}", om[0]);
+    assert!(rel(om[1], NM_OM_V) < 0.10, "ω²(V) {} vs NM {NM_OM_V}", om[1]);
+    assert!(rel(om[2], NM_OM_KA) < 0.10, "ω²(KA) {} vs NM {NM_OM_KA}", om[2]);
 }
 
 /// LTBS cross-check driven through the **analytic (adjoint) gradient**: the
@@ -195,11 +158,7 @@ fn ltbs_warfarin_analytic_lbfgs_matches_nonmem() {
     // Substantive convergence is asserted via the OFV/estimate match below; the
     // `converged` gradient-norm flag is fragile on warfarin's flat KA ridge and
     // depends on the inner solver, so it is not hard-asserted here.
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 
     const NM_OFV: f64 = -675.3016;
     const NM_TVCL: f64 = 0.132697;
@@ -216,42 +175,18 @@ fn ltbs_warfarin_analytic_lbfgs_matches_nonmem() {
         result.ofv
     );
     let rel = |got: f64, nm: f64| (got - nm).abs() / nm.abs();
-    assert!(
-        rel(result.theta[0], NM_TVCL) < 0.01,
-        "TVCL {} vs NM {NM_TVCL}",
-        result.theta[0]
-    );
-    assert!(
-        rel(result.theta[1], NM_TVV) < 0.01,
-        "TVV {} vs NM {NM_TVV}",
-        result.theta[1]
-    );
-    assert!(
-        rel(result.theta[2], NM_TVKA) < 0.01,
-        "TVKA {} vs NM {NM_TVKA}",
-        result.theta[2]
-    );
+    assert!(rel(result.theta[0], NM_TVCL) < 0.01, "TVCL {} vs NM {NM_TVCL}", result.theta[0]);
+    assert!(rel(result.theta[1], NM_TVV) < 0.01, "TVV {} vs NM {NM_TVV}", result.theta[1]);
+    assert!(rel(result.theta[2], NM_TVKA) < 0.01, "TVKA {} vs NM {NM_TVKA}", result.theta[2]);
     assert!(
         rel(result.sigma[0], NM_ADD_LOG_SD) < 0.02,
         "ADD_LOG SD {} vs NM {NM_ADD_LOG_SD}",
         result.sigma[0]
     );
     let om: Vec<f64> = (0..3).map(|i| result.omega[(i, i)]).collect();
-    assert!(
-        rel(om[0], NM_OM_CL) < 0.05,
-        "ω²(CL) {} vs NM {NM_OM_CL}",
-        om[0]
-    );
-    assert!(
-        rel(om[1], NM_OM_V) < 0.05,
-        "ω²(V) {} vs NM {NM_OM_V}",
-        om[1]
-    );
-    assert!(
-        rel(om[2], NM_OM_KA) < 0.05,
-        "ω²(KA) {} vs NM {NM_OM_KA}",
-        om[2]
-    );
+    assert!(rel(om[0], NM_OM_CL) < 0.05, "ω²(CL) {} vs NM {NM_OM_CL}", om[0]);
+    assert!(rel(om[1], NM_OM_V) < 0.05, "ω²(V) {} vs NM {NM_OM_V}", om[1]);
+    assert!(rel(om[2], NM_OM_KA) < 0.05, "ω²(KA) {} vs NM {NM_OM_KA}", om[2]);
 }
 
 /// NONMEM `$COVARIANCE MATRIX=R` cross-check for the LTBS (additive-on-log)
@@ -284,10 +219,7 @@ fn ltbs_covariance_se_matches_nonmem() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("LTBS FOCEI fit must succeed");
 
-    assert!(
-        result.covariance_matrix.is_some(),
-        "LTBS covariance step must produce a matrix"
-    );
+    assert!(result.covariance_matrix.is_some(), "LTBS covariance step must produce a matrix");
     let se_theta = result.se_theta.as_ref().expect("theta SEs present");
     let se_omega = result.se_omega.as_ref().expect("omega SEs present");
     let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");

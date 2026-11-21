@@ -50,19 +50,13 @@ fn iiv() -> CompiledModel {
 
 /// η and κ on CL.
 fn iiv_iov() -> CompiledModel {
-    model(
-        "  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.09",
-        "TVCL * exp(ETA_CL + KAPPA_CL)",
-    )
+    model("  omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.09", "TVCL * exp(ETA_CL + KAPPA_CL)")
 }
 
 /// Ω FIX 0 (η exactly 0, #1605), with or without a κ on CL.
 fn zero_omega(kappa: bool) -> CompiledModel {
     if kappa {
-        model(
-            "  omega ETA_CL ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.09",
-            "TVCL * exp(ETA_CL + KAPPA_CL)",
-        )
+        model("  omega ETA_CL ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.09", "TVCL * exp(ETA_CL + KAPPA_CL)")
     } else {
         model("  omega ETA_CL ~ 0.0 FIX", "TVCL * exp(ETA_CL)")
     }
@@ -73,20 +67,14 @@ const OBS: [f64; 4] = [6.0, 24.0, 30.0, 54.0];
 const SEED: u64 = 946;
 
 fn pop(n: usize) -> Population {
-    population(
-        (1..=n)
-            .map(|i| subj(&i.to_string(), OBS.to_vec(), vec![]))
-            .collect(),
-    )
+    population((1..=n).map(|i| subj(&i.to_string(), OBS.to_vec(), vec![])).collect())
 }
 
 fn opts(mode: Option<ObserveMode>) -> AdaptiveSimulateOptions {
     AdaptiveSimulateOptions {
         seed: Some(SEED),
         decision_times: DECISIONS.to_vec(),
-        monitors: mode
-            .map(|m| vec![MonitorSpec::new("A", 1, m)])
-            .unwrap_or_default(),
+        monitors: mode.map(|m| vec![MonitorSpec::new("A", 1, m)]).unwrap_or_default(),
         ..Default::default()
     }
 }
@@ -121,14 +109,7 @@ fn draw_rows(r: &AdaptiveSimulationResult, draw: usize) -> DrawRows {
             .filter(|t| t.draw == draw)
             .map(|t| {
                 assert!(t.ipred.is_finite(), "non-finite IPRED {t:?}");
-                (
-                    t.sim,
-                    t.id.clone(),
-                    t.time.to_bits(),
-                    t.cmt,
-                    t.ipred.to_bits(),
-                    t.mixnum,
-                )
+                (t.sim, t.id.clone(), t.time.to_bits(), t.cmt, t.ipred.to_bits(), t.mixnum)
             })
             .collect(),
         ledger: r
@@ -195,11 +176,8 @@ fn fit_of(model: &CompiledModel) -> FitResult {
 #[test]
 fn replicate_tag_names_the_draw_only_under_uncertainty() {
     use crate::sim::adaptive::ReplicateTag;
-    let off = ReplicateTag { draw: None, sim: 3 };
-    let on = ReplicateTag {
-        draw: Some(2),
-        sim: 3,
-    };
+    let off = ReplicateTag { draw: None, sim: 3, rep: None };
+    let on = ReplicateTag { draw: Some(2), sim: 3, rep: None };
     assert_eq!(off.sim_label(), "sim 3");
     assert_eq!(on.sim_label(), "draw 2, sim 3");
     assert_eq!(off.replicate_label(), "replicate 3");
@@ -246,10 +224,7 @@ fn absorbed_step_warning_names_the_draw_of_the_first_replicate() {
     let population = pop(1);
     let plan = |draw, sim| AbsorbedPlan {
         subject: 0,
-        replicate: Some(ReplicateTag {
-            draw: Some(draw),
-            sim,
-        }),
+        replicate: Some(ReplicateTag { draw: Some(draw), sim, rep: None }),
         found: FromStart(500.0),
     };
     let w =
@@ -298,10 +273,7 @@ fn draws_at_the_point_estimate_reproduce_the_run_without_uncertainty() {
     assert_eq!(draws_of(&seam), [1, 2].into());
     assert!(base.parameters.is_empty(), "no uncertainty, no draws");
     assert_eq!(seam.parameters.len(), 2);
-    assert_eq!(
-        seam.parameters.iter().map(|d| d.draw).collect::<Vec<_>>(),
-        [1, 2]
-    );
+    assert_eq!(seam.parameters.iter().map(|d| d.draw).collect::<Vec<_>>(), [1, 2]);
     let (want, got) = (draw_rows(&base, 1), draw_rows(&seam, 1));
     assert_eq!(got.traj.len(), 3 * 2 * OBS.len(), "every row present");
     assert!(!got.ledger.is_empty(), "the controller dosed");
@@ -357,18 +329,12 @@ fn kappa_and_assay_keys_fold_the_draw() {
         (draw_rows(&r, 1), draw_rows(&r, 2))
     };
     let (a, b) = run(&zero_omega(false), ObserveMode::Ipred);
-    assert_eq!(
-        a, b,
-        "the straddle: with no κ and no assay, the draws are equal"
-    );
+    assert_eq!(a, b, "the straddle: with no κ and no assay, the draws are equal");
     let (a, b) = run(&zero_omega(true), ObserveMode::Ipred);
     assert_ne!(a.traj, b.traj, "κ: draw 2 has its own occasion draws");
     let (a, b) = run(&zero_omega(false), ObserveMode::Dv);
     assert_eq!(a.traj.len(), b.traj.len());
-    assert_ne!(
-        a.decisions, b.decisions,
-        "assay: draw 2 reads its own assay noise"
-    );
+    assert_ne!(a.decisions, b.decisions, "assay: draw 2 reads its own assay noise");
 }
 
 /// C3: the mixture class is a between-subject draw keyed by `(draw, sim)`, so two draws at
@@ -451,10 +417,7 @@ fn more_draws_leave_draw_one_unchanged_on_the_real_sampler() {
             &pop(2),
             &AdaptiveInputs::new(&params).with_uncertainty(
                 &fit,
-                UncertaintySpec {
-                    method: UncertaintyMethod::Asymptotic,
-                    n_draws,
-                },
+                UncertaintySpec { method: UncertaintyMethod::Asymptotic, n_draws },
             ),
             2,
             fixed_bolus,
@@ -466,11 +429,7 @@ fn more_draws_leave_draw_one_unchanged_on_the_real_sampler() {
     assert_eq!(draws_of(&one), [1].into());
     assert_eq!(draws_of(&three), [1, 2, 3].into());
     assert_eq!(draw_rows(&one, 1), draw_rows(&three, 1));
-    assert_ne!(
-        draw_rows(&three, 1).traj,
-        draw_rows(&three, 2).traj,
-        "the draws differ"
-    );
+    assert_ne!(draw_rows(&three, 1).traj, draw_rows(&three, 2).traj, "the draws differ");
     let mut rng = rand::rngs::StdRng::seed_from_u64(crate::sim::adaptive::combine_seed(
         SEED ^ super::adaptive_inputs::PARAM_PURPOSE_SALT,
         0,
@@ -529,16 +488,10 @@ fn cross_check_against_simulate_with_uncertainty_on_the_same_draws() {
         &opts(None),
     )
     .expect("adaptive");
-    let doses: Vec<DoseEvent> = DECISIONS
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
-    let static_pop = population(
-        ["1", "2"]
-            .iter()
-            .map(|id| subj(id, OBS.to_vec(), doses.clone()))
-            .collect(),
-    );
+    let doses: Vec<DoseEvent> =
+        DECISIONS.iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
+    let static_pop =
+        population(["1", "2"].iter().map(|id| subj(id, OBS.to_vec(), doses.clone())).collect());
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
     let (mut rows, mut warnings) = (Vec::new(), Vec::new());
     super::simulate::simulate_uncertainty_draws(
@@ -565,11 +518,7 @@ fn cross_check_against_simulate_with_uncertainty_on_the_same_draws() {
             .find(|a| a.draw == s.draw && a.id == s.id && a.time == s.time)
             .unwrap_or_else(|| panic!("no adaptive row for {s:?}"));
         assert!(a.ipred.is_finite(), "{a:?}");
-        assert_eq!(
-            a.ipred.to_bits(),
-            s.ipred.to_bits(),
-            "adaptive {a:?} vs static {s:?}"
-        );
+        assert_eq!(a.ipred.to_bits(), s.ipred.to_bits(), "adaptive {a:?} vs static {s:?}");
     }
     // Draw 2 really is at its own θ: its IPRED is not draw 1's.
     let at = |draw: usize| {
@@ -586,10 +535,7 @@ fn cross_check_against_simulate_with_uncertainty_on_the_same_draws() {
 // ── refusals ───────────────────────────────────────────────────────────────────────────
 
 fn with_spec(
-    model: &CompiledModel,
-    params: &ModelParameters,
-    fit: &FitResult,
-    method: UncertaintyMethod,
+    model: &CompiledModel, params: &ModelParameters, fit: &FitResult, method: UncertaintyMethod,
     n_draws: usize,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
     simulate_adaptive_with_inputs(
@@ -612,13 +558,7 @@ fn zero_draws_are_refused() {
     let p =
         crate::estimation::uncertainty_samples::fitted_params_from_result(&fit, &model).unwrap();
     assert_eq!(
-        refusal(with_spec(
-            &model,
-            &p,
-            &fit,
-            UncertaintyMethod::Asymptotic,
-            0
-        )),
+        refusal(with_spec(&model, &p, &fit, UncertaintyMethod::Asymptotic, 0)),
         (
             "E_ADAPTIVE_OPTIONS".to_string(),
             "`UncertaintySpec::n_draws` must be at least 1; omit `with_uncertainty` to \
@@ -649,13 +589,7 @@ fn params_must_carry_the_fits_values() {
     );
     let mut theta = r_shaped.clone();
     theta.theta[0] = f64::from_bits(theta.theta[0].to_bits() + 1);
-    let (code, text) = refusal(with_spec(
-        &model,
-        &theta,
-        &fit,
-        UncertaintyMethod::Asymptotic,
-        1,
-    ));
+    let (code, text) = refusal(with_spec(&model, &theta, &fit, UncertaintyMethod::Asymptotic, 1));
     assert_eq!(code, "E_ADAPTIVE_OPTIONS");
     assert_eq!(
         text,
@@ -668,31 +602,13 @@ fn params_must_carry_the_fits_values() {
         )
     );
     let mut omega = r_shaped.clone();
-    omega.omega = OmegaMatrix::from_matrix(
-        fit.omega.clone() * 2.0,
-        fit.eta_names.clone(),
-        t.omega.diagonal,
-    );
-    let (_, text) = refusal(with_spec(
-        &model,
-        &omega,
-        &fit,
-        UncertaintyMethod::Asymptotic,
-        1,
-    ));
-    assert!(
-        text.contains("Ω[1, 1] is 0.18, the fit's is 0.09"),
-        "{text}"
-    );
+    omega.omega =
+        OmegaMatrix::from_matrix(fit.omega.clone() * 2.0, fit.eta_names.clone(), t.omega.diagonal);
+    let (_, text) = refusal(with_spec(&model, &omega, &fit, UncertaintyMethod::Asymptotic, 1));
+    assert!(text.contains("Ω[1, 1] is 0.18, the fit's is 0.09"), "{text}");
     let mut sigma = r_shaped;
     sigma.sigma.values[0] = 0.25;
-    let (_, text) = refusal(with_spec(
-        &model,
-        &sigma,
-        &fit,
-        UncertaintyMethod::Asymptotic,
-        1,
-    ));
+    let (_, text) = refusal(with_spec(&model, &sigma, &fit, UncertaintyMethod::Asymptotic, 1));
     assert!(text.contains("σ PROP is 0.25, the fit's is 0.2"), "{text}");
 }
 
@@ -715,11 +631,8 @@ fn value_difference_covers_iov_and_rho_and_ignores_flags() {
     let d = first_value_difference(&iov, &t).expect("Ω_IOV differs");
     assert!(d.starts_with("Ω_IOV[1, 1] is"), "{d}");
     let mut rho = t.clone();
-    rho.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 0,
-        rho: 0.5,
-    }];
+    rho.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 0, rho: 0.5 }];
     let d = first_value_difference(&rho, &t).expect("ρ differs");
     assert_eq!(d, "residual ρ has 1 value(s), the fit's 0");
     // Same length: named by the σ pair it correlates (review r1 row 6).
@@ -747,13 +660,7 @@ fn a_fit_without_a_covariance_matrix_is_refused_with_its_remedy() {
                 none (its covariance step did not run or did not succeed).";
     let code = "E_FIT_INPUT_MISSING".to_string();
     assert_eq!(
-        refusal(with_spec(
-            &model,
-            &p,
-            &fit,
-            UncertaintyMethod::Asymptotic,
-            1
-        )),
+        refusal(with_spec(&model, &p, &fit, UncertaintyMethod::Asymptotic, 1)),
         (
             code.clone(),
             format!(
@@ -774,13 +681,7 @@ fn a_fit_without_a_covariance_matrix_is_refused_with_its_remedy() {
     let packed = crate::estimation::parameterization::pack_params(&p);
     fit.sir_resamples_packed = Some(vec![packed]);
     assert_eq!(
-        refusal(with_spec(
-            &model,
-            &p,
-            &fit,
-            UncertaintyMethod::Asymptotic,
-            1
-        )),
+        refusal(with_spec(&model, &p, &fit, UncertaintyMethod::Asymptotic, 1)),
         (
             code,
             format!(
@@ -822,18 +723,13 @@ fn supplied_etas_are_refused_under_uncertainty_for_both_policies() {
     );
     let draws = [p.clone()];
     for policy in [UnmatchedSubjects::Refuse, UnmatchedSubjects::Draw] {
-        let base = AdaptiveInputs::new(&p)
-            .with_etas(&etas)
-            .with_unmatched(policy);
+        let base = AdaptiveInputs::new(&p).with_etas(&etas).with_unmatched(policy);
         for (how, inputs) in [
             (
                 "sampler",
                 base.with_uncertainty(
                     &fit,
-                    UncertaintySpec {
-                        method: UncertaintyMethod::Asymptotic,
-                        n_draws: 1,
-                    },
+                    UncertaintySpec { method: UncertaintyMethod::Asymptotic, n_draws: 1 },
                 ),
             ),
             ("seam", base.with_injected_draws(&draws)),
@@ -849,9 +745,7 @@ fn supplied_etas_are_refused_under_uncertainty_for_both_policies() {
             assert_eq!(refusal(r), want, "{policy:?}, {how}");
         }
     }
-    let ok = AdaptiveInputs::new(&p)
-        .with_etas(&etas)
-        .with_unmatched(UnmatchedSubjects::Draw);
+    let ok = AdaptiveInputs::new(&p).with_etas(&etas).with_unmatched(UnmatchedSubjects::Draw);
     assert!(
         simulate_adaptive_with_inputs(&model, &pop(2), &ok, 1, fixed_bolus, &opts(None)).is_ok(),
         "without uncertainty the supplied η run"
@@ -945,18 +839,11 @@ fn a_theta_only_dose_expression_stays_at_the_point_estimate_in_every_draw() {
     .expect("runs");
     assert_eq!(draws_of(&r), [1, 2].into());
     for draw in [1, 2] {
-        let first = r
-            .ledger
-            .iter()
-            .find(|e| e.draw == draw)
-            .unwrap_or_else(|| panic!("draw {draw} doses"));
+        let first =
+            r.ledger.iter().find(|e| e.draw == draw).unwrap_or_else(|| panic!("draw {draw} doses"));
         assert_eq!(first.amt, 50.0, "draw {draw}: 10 × θ̂ = 50");
     }
-    assert_ne!(
-        draw_rows(&r, 1).traj,
-        draw_rows(&r, 2).traj,
-        "θ_d moves the run"
-    );
+    assert_ne!(draw_rows(&r, 1).traj, draw_rows(&r, 2).traj, "θ_d moves the run");
 }
 
 // ── round 1 (#2965 review) ─────────────────────────────────────────────────────────────
@@ -992,8 +879,7 @@ fn oracle_spec(extra: &str) -> crate::ParsedModel {
 }
 
 fn spec_run(
-    p: &crate::ParsedModel,
-    inputs: &AdaptiveInputs<'_>,
+    p: &crate::ParsedModel, inputs: &AdaptiveInputs<'_>,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
     let mut o = AdaptiveSimulateOptions::default();
     o.seed = Some(SEED);
@@ -1017,11 +903,7 @@ fn an_oracle_dose_plan_follows_the_draws_theta() {
     let draws = [p0.clone(), p1];
     let r = spec_run(&p, &AdaptiveInputs::new(&p0).with_injected_draws(&draws)).expect("runs");
     let first = |draw: usize| {
-        r.ledger
-            .iter()
-            .find(|e| e.draw == draw)
-            .unwrap_or_else(|| panic!("draw {draw} doses"))
-            .amt
+        r.ledger.iter().find(|e| e.draw == draw).unwrap_or_else(|| panic!("draw {draw} doses")).amt
     };
     assert_eq!(first(1), 500.0, "100 × TVCL₁");
     assert_eq!(first(2), 550.0, "100 × TVCL₂");
@@ -1041,10 +923,7 @@ fn an_oracle_plan_refusal_names_the_draw_only_under_uncertainty() {
     let mut p1 = p0.clone();
     p1.theta[0] = 7.0;
     let draws = [p0.clone(), p1.clone()];
-    let (code, on) = refusal(spec_run(
-        &p,
-        &AdaptiveInputs::new(&p0).with_injected_draws(&draws),
-    ));
+    let (code, on) = refusal(spec_run(&p, &AdaptiveInputs::new(&p0).with_injected_draws(&draws)));
     assert_eq!(code, "E_ADAPTIVE_DOSE_VALUE");
     assert!(
         on.contains("[adaptive_dosing] subject 1, draw 2, replicate 1: start_dose = 100 * CL"),
@@ -1087,12 +966,8 @@ fn absorbed_step_warning_counts_every_draw_through_the_spec_entry() {
 }
 
 fn with_spec_pop(
-    model: &CompiledModel,
-    params: &ModelParameters,
-    fit: &FitResult,
-    method: UncertaintyMethod,
-    n_draws: usize,
-    n_sim: usize,
+    model: &CompiledModel, params: &ModelParameters, fit: &FitResult, method: UncertaintyMethod,
+    n_draws: usize, n_sim: usize,
 ) -> AdaptiveSimulationResult {
     simulate_adaptive_with_inputs(
         model,
@@ -1134,22 +1009,14 @@ fn a_sir_pool_at_the_point_estimate_reproduces_the_run_without_uncertainty() {
         .iter()
         .chain(d.omega.matrix.iter())
         .chain(&d.sigma.values)
-        .zip(
-            p.theta
-                .iter()
-                .chain(p.omega.matrix.iter())
-                .chain(&p.sigma.values),
-        )
+        .zip(p.theta.iter().chain(p.omega.matrix.iter()).chain(&p.sigma.values))
     {
         worst_param = worst_param.max(ulps(*a, *b));
     }
     let mut worst_row = 0u64;
     assert_eq!(sir.trajectories.len(), base.trajectories.len());
     for (a, b) in sir.trajectories.iter().zip(&base.trajectories) {
-        assert_eq!(
-            (a.sim, &a.id, a.time.to_bits()),
-            (b.sim, &b.id, b.time.to_bits())
-        );
+        assert_eq!((a.sim, &a.id, a.time.to_bits()), (b.sim, &b.id, b.time.to_bits()));
         worst_row = worst_row.max(ulps(a.ipred, b.ipred));
     }
     assert!(worst_param <= 4, "param {worst_param} ulp");
@@ -1166,12 +1033,8 @@ fn simulate_with_uncertainty_draw_one_moves_with_the_number_of_draws() {
     let model = iiv();
     let fit = fit_of(&model);
     let dose = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
-    let dosed = population(
-        ["1", "2"]
-            .iter()
-            .map(|id| subj(id, OBS.to_vec(), dose.clone()))
-            .collect(),
-    );
+    let dosed =
+        population(["1", "2"].iter().map(|id| subj(id, OBS.to_vec(), dose.clone())).collect());
     let run = |n| {
         simulate_with_uncertainty(
             &model,

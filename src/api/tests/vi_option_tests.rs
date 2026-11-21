@@ -30,11 +30,7 @@ fn omega_warnings(opts: &FitOptions) -> Vec<Diagnostic> {
 #[test]
 fn mc_kl_plus_adam_omega_warns_that_omega_is_unanchored() {
     let diags = omega_warnings(&vi_opts(ViKl::Mc, ViOmegaUpdate::Adam));
-    assert_eq!(
-        diags.len(),
-        1,
-        "expected exactly one warning, got {diags:?}"
-    );
+    assert_eq!(diags.len(), 1, "expected exactly one warning, got {diags:?}");
 
     let d = &diags[0];
     assert_eq!(
@@ -45,11 +41,7 @@ fn mc_kl_plus_adam_omega_warns_that_omega_is_unanchored() {
     assert_eq!(d.block.as_deref(), Some("fit_options"));
     // Both culprits are named, so the message is actionable without the docs.
     assert!(d.message.contains("vi_kl = mc"), "message: {}", d.message);
-    assert!(
-        d.message.contains("vi_omega_update = adam"),
-        "message: {}",
-        d.message
-    );
+    assert!(d.message.contains("vi_omega_update = adam"), "message: {}", d.message);
     assert!(
         d.message.contains("closed_form") || d.message.contains("vi_mc_samples"),
         "the warning should say what to do about it: {}",
@@ -71,10 +63,7 @@ fn neither_option_alone_warns_about_omega() {
         (ViKl::Mc, ViOmegaUpdate::ClosedForm),
     ] {
         let diags = omega_warnings(&vi_opts(kl, omega));
-        assert!(
-            diags.is_empty(),
-            "{kl:?} + {omega:?} must not warn, got {diags:?}"
-        );
+        assert!(diags.is_empty(), "{kl:?} + {omega:?} must not warn, got {diags:?}");
     }
 }
 
@@ -113,11 +102,7 @@ fn n_agq_is_accepted_when_a_quadrature_stage_consumes_it() {
     let mut solo = vi_opts(ViKl::Analytic, ViOmegaUpdate::ClosedForm);
     solo.n_agq = 21;
     let diags = nagq_diags(&solo);
-    assert_eq!(
-        diags.len(),
-        1,
-        "expected the VI-only rejection, got {diags:?}"
-    );
+    assert_eq!(diags.len(), 1, "expected the VI-only rejection, got {diags:?}");
     assert_eq!(diags[0].severity, Severity::Error);
 
     // The documented readout chain: the Laplace stage consumes the grid.

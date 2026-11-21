@@ -55,11 +55,7 @@ pub enum BootstrapEvent {
     /// actually do. `replicates` is what is still to be fitted, so a `--resume`
     /// run reports what is left rather than what the whole run was, and
     /// `reused` is what it read off disk instead.
-    Started {
-        replicates: usize,
-        reused: usize,
-        base_fit: bool,
-    },
+    Started { replicates: usize, reused: usize, base_fit: bool },
     /// The fit on the original dataset finished. Not emitted when there is no
     /// base fit to run (`run_base_model = false`, or a resume that reuses it).
     BaseFitDone,
@@ -97,12 +93,7 @@ pub enum BootstrapEvent {
     /// `dofv` is the replicate's Δofv, or `None` when it was skipped (the
     /// replicate's own fit failed) or the evaluation failed — the empty
     /// `delta_ofv` cell of `raw_results.csv`.
-    DeltaOfvDone {
-        completed: usize,
-        total: usize,
-        sample: usize,
-        dofv: Option<f64>,
-    },
+    DeltaOfvDone { completed: usize, total: usize, sample: usize, dofv: Option<f64> },
     /// The run is over. Emitted after the last fit on a run that succeeds, and
     /// on the way out of one that fails, so a sink that has seen `Started` is
     /// always told where to stop. On success the summary and the CSV artefacts
@@ -175,10 +166,7 @@ struct FinishGuard<'a> {
 
 impl<'a> FinishGuard<'a> {
     fn new(progress: Option<ProgressFn<'a>>) -> Self {
-        Self {
-            progress,
-            pending: true,
-        }
+        Self { progress, pending: true }
     }
 
     fn finish(&mut self) {
@@ -542,11 +530,7 @@ fn is_fixed(template: &ModelParameters, coord: Coord) -> bool {
 /// silently means something different the moment an eta is added.
 pub fn parameter_names(template: &ModelParameters) -> Vec<String> {
     let eta = &template.omega.eta_names;
-    let kappa = template
-        .omega_iov
-        .as_ref()
-        .map(|iov| iov.eta_names.clone())
-        .unwrap_or_default();
+    let kappa = template.omega_iov.as_ref().map(|iov| iov.eta_names.clone()).unwrap_or_default();
     coordinates(template)
         .into_iter()
         .map(|c| match c {
@@ -598,8 +582,7 @@ pub fn flatten_estimates(template: &ModelParameters, result: &FitResult) -> Vec<
 /// where core does not report an SE: `se_kappa` carries only the IOV diagonal
 /// variances, so an IOV covariance has no reported SE at all.
 fn flat_standard_errors(
-    template: &ModelParameters,
-    result: &FitResult,
+    template: &ModelParameters, result: &FitResult,
 ) -> Option<Vec<Option<f64>>> {
     result.se_theta.as_ref()?;
     let n_eta = template.omega.dim();
@@ -658,10 +641,7 @@ pub fn params_from_estimates(template: &ModelParameters, flat: &[f64]) -> ModelP
         template.omega.diagonal,
         template.omega.free_mask.clone(),
     );
-    params.sigma = SigmaVector {
-        values: sigma,
-        names: template.sigma.names.clone(),
-    };
+    params.sigma = SigmaVector { values: sigma, names: template.sigma.names.clone() };
     params.omega_iov = match (omega_iov, &template.omega_iov) {
         (Some(m), Some(t)) => Some(OmegaMatrix::from_matrix_with_mask(
             m,
@@ -688,10 +668,7 @@ pub fn params_from_estimates(template: &ModelParameters, flat: &[f64]) -> ModelP
 /// "the algorithm requires that an individual can unambiguously be categorized
 /// according to the stratification variable" — naming the offending subject.
 pub fn strata_from_csv(
-    data_path: &str,
-    column_map: &[(String, String)],
-    population: &Population,
-    stratify_on: &str,
+    data_path: &str, column_map: &[(String, String)], population: &Population, stratify_on: &str,
 ) -> Result<Strata, String> {
     let id_header = column_map
         .iter()
@@ -705,11 +682,7 @@ pub fn strata_from_csv(
         .map_err(|e| format!("--stratify-on: cannot read the header row of `{data_path}`: {e}"))?
         .clone();
 
-    let find = |name: &str| {
-        headers
-            .iter()
-            .position(|h| h.trim().eq_ignore_ascii_case(name))
-    };
+    let find = |name: &str| headers.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
     let id_col = id_header
         .as_deref()
         .and_then(find)
@@ -786,9 +759,7 @@ pub fn strata_from_csv(
 /// whatever the model file's own `FitOptions` carried and a run without one is
 /// left exactly as it was.
 fn replicate_options(
-    base: &FitOptions,
-    keep_covariance: bool,
-    cancel: &Option<CancelFlag>,
+    base: &FitOptions, keep_covariance: bool, cancel: &Option<CancelFlag>,
 ) -> FitOptions {
     let mut o = base.clone();
     o.verbose = false;
@@ -853,17 +824,11 @@ fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
     let near_boundary = ferx_core::estimate_near_boundary(result);
     let cov_ok = ferx_core::check_strictness(
         result,
-        &Strictness {
-            require_covariance: true,
-            ..Strictness::none()
-        },
+        &Strictness { require_covariance: true, ..Strictness::none() },
     )
     .passed;
     let cov_warnings = result.warnings_structured.iter().any(|w| {
-        matches!(
-            w.category,
-            WarningCode::CovarianceRegularized | WarningCode::CovarianceStep
-        )
+        matches!(w.category, WarningCode::CovarianceRegularized | WarningCode::CovarianceStep)
     });
     (near_boundary, cov_ok, cov_warnings)
 }
@@ -928,22 +893,19 @@ fn reject_id_dependent_model(model: &CompiledModel) -> Result<(), String> {
 /// unit-tested without constructing a whole [`CompiledModel`].
 fn reject_id_dependent(referenced: &[String]) -> Result<(), String> {
     if referenced.iter().any(|c| c.eq_ignore_ascii_case("id")) {
-        return Err(
-            "this model uses `ID` as a covariate, which the bootstrap cannot support: \
+        return Err("this model uses `ID` as a covariate, which the bootstrap cannot support: \
              resampling with replacement draws the same subject more than once, and the \
              copies must enter the fit as independent individuals, so their IDs are \
              necessarily renamed. Re-express the covariate on a column that describes the \
              subject (study, arm, group) rather than identifies it."
-                .to_string(),
-        );
+            .to_string());
     }
     Ok(())
 }
 
 /// Run the bootstrap.
 pub fn run_bootstrap(
-    prepared: &PreparedRun,
-    options: &BootstrapOptions,
+    prepared: &PreparedRun, options: &BootstrapOptions,
 ) -> Result<BootstrapResult, BootstrapError> {
     run_bootstrap_with_progress(prepared, options, None)
 }
@@ -968,9 +930,7 @@ pub fn run_bootstrap(
 /// recorded: its `Err` cannot be told apart from a genuine failure, and a
 /// failure is what `resume` declines to refit.
 pub fn run_bootstrap_with_progress(
-    prepared: &PreparedRun,
-    options: &BootstrapOptions,
-    progress: Option<ProgressFn<'_>>,
+    prepared: &PreparedRun, options: &BootstrapOptions, progress: Option<ProgressFn<'_>>,
 ) -> Result<BootstrapResult, BootstrapError> {
     let emit = |event: BootstrapEvent| {
         if let Some(sink) = progress {
@@ -992,12 +952,8 @@ pub fn run_bootstrap_with_progress(
 
     let template = &prepared.init_params;
     let names = parameter_names(template);
-    let subject_ids: Vec<String> = prepared
-        .population
-        .subjects
-        .iter()
-        .map(|s| s.id.clone())
-        .collect();
+    let subject_ids: Vec<String> =
+        prepared.population.subjects.iter().map(|s| s.id.clone()).collect();
 
     let strata = match &options.stratify_on {
         None => Strata::unstratified(subject_ids.len()),
@@ -1023,12 +979,8 @@ pub fn run_bootstrap_with_progress(
         .collect();
 
     // ── resume ──────────────────────────────────────────────────────────────
-    let manifest = RunManifest::new(
-        options,
-        prepared.model_hash.clone(),
-        prepared.data_hash.clone(),
-        &names,
-    );
+    let manifest =
+        RunManifest::new(options, prepared.model_hash.clone(), prepared.data_hash.clone(), &names);
     let (reused_original, reused) = if options.resume {
         let dir = options
             .directory
@@ -1076,11 +1028,8 @@ pub fn run_bootstrap_with_progress(
     };
 
     // ── the base fit ────────────────────────────────────────────────────────
-    let base_options = replicate_options(
-        &prepared.parsed.fit_options,
-        options.keep_covariance,
-        &cancel,
-    );
+    let base_options =
+        replicate_options(&prepared.parsed.fit_options, options.keep_covariance, &cancel);
     let original = match reused_original {
         // A resumed run must **not** refit the base model. `--update-inits`
         // starts every replicate from its estimates, and a second fit can land
@@ -1164,12 +1113,7 @@ pub fn run_bootstrap_with_progress(
         }
         let population = resample::build_population(&prepared.population, replicate);
         let started = Instant::now();
-        let outcome = fit(
-            &prepared.parsed.model,
-            &population,
-            &replicate_init,
-            &base_options,
-        );
+        let outcome = fit(&prepared.parsed.model, &population, &replicate_init, &base_options);
         let seconds = started.elapsed().as_secs_f64();
         let mut how = ReplicateOutcome::Failed;
         let result = match outcome {
@@ -1228,11 +1172,8 @@ pub fn run_bootstrap_with_progress(
         Some(result)
     };
 
-    let todo: Vec<Replicate> = draws
-        .iter()
-        .filter(|d| !already_done.contains(&d.index))
-        .cloned()
-        .collect();
+    let todo: Vec<Replicate> =
+        draws.iter().filter(|d| !already_done.contains(&d.index)).cloned().collect();
 
     // Exactly `width` replicates are live at once (#1329). The previous shape —
     // a `par_iter` over `todo` on a `width`-worker pool — bounded the *workers*
@@ -1322,9 +1263,7 @@ pub fn run_bootstrap_with_progress(
 /// the only unsafe outcome is *keeping* a row that does not belong to this run,
 /// which is what [`RunManifest::check_compatible`] rules out.
 fn load_resumable(
-    dir: &std::path::Path,
-    manifest: &RunManifest,
-    options: &BootstrapOptions,
+    dir: &std::path::Path, manifest: &RunManifest, options: &BootstrapOptions,
 ) -> Result<(Option<ReplicateResult>, Vec<ReplicateResult>), String> {
     let raw = journal::raw_results_path(dir);
     if !raw.exists() {
@@ -1373,9 +1312,7 @@ fn load_resumable(
     // caller asked not to have. Through the CLI the manifest refuses that
     // transition before reaching here (it also changes where every replicate
     // starts); this covers a library caller that built its own manifest.
-    let original = original
-        .filter(|_| options.run_base_model)
-        .filter(|r| keep(r));
+    let original = original.filter(|_| options.run_base_model).filter(|r| keep(r));
     Ok((original, kept))
 }
 
@@ -1390,8 +1327,7 @@ fn load_resumable(
 /// Rewrites `bootstrap_results.csv` and `bootstrap_diagnostics.csv` in place and
 /// returns the new summary.
 pub fn resummarize(
-    directory: &std::path::Path,
-    options: &BootstrapOptions,
+    directory: &std::path::Path, options: &BootstrapOptions,
 ) -> Result<BootstrapSummary, String> {
     options.validate()?;
     let raw = directory.join("raw_results.csv");
@@ -1446,14 +1382,9 @@ pub fn resummarize(
 // name the same values once more for one call site.
 #[allow(clippy::too_many_arguments)]
 fn compute_delta_ofv(
-    prepared: &PreparedRun,
-    template: &ModelParameters,
-    ofv_original: f64,
-    base_options: &FitOptions,
-    replicates: &mut [ReplicateResult],
-    width: usize,
-    progress: Option<ProgressFn<'_>>,
-    cancel: &Option<CancelFlag>,
+    prepared: &PreparedRun, template: &ModelParameters, ofv_original: f64,
+    base_options: &FitOptions, replicates: &mut [ReplicateResult], width: usize,
+    progress: Option<ProgressFn<'_>>, cancel: &Option<CancelFlag>,
 ) -> Result<(), String> {
     let mut eval = base_options.clone();
     eval.outer_maxiter = 0;
@@ -1511,9 +1442,7 @@ fn compute_delta_ofv(
 /// `Some(0)` is one lane rather than none, matching the old `Some(_)` arm, which
 /// ran the replicates serially.
 fn replicate_lane_width(threads: Option<usize>, n_todo: usize) -> usize {
-    threads
-        .unwrap_or_else(rayon::current_num_threads)
-        .clamp(1, n_todo.max(1))
+    threads.unwrap_or_else(rayon::current_num_threads).clamp(1, n_todo.max(1))
 }
 
 /// Non-fixed parameters — the chi-square degrees of freedom for the Δofv
@@ -1525,10 +1454,7 @@ fn count_estimated(template: &ModelParameters) -> usize {
     // two flags. Getting this wrong writes a chi-square reference with too few
     // degrees of freedom, which makes the Δofv distribution look better than it
     // is — the one direction a diagnostic must never fail in.
-    coordinates(template)
-        .into_iter()
-        .filter(|c| !is_fixed(template, *c))
-        .count()
+    coordinates(template).into_iter().filter(|c| !is_fixed(template, *c)).count()
 }
 
 #[cfg(test)]

@@ -40,10 +40,7 @@ fn snap_of(subject: usize, study: f64, arm: f64) -> HashMap<String, f64> {
     [
         ("STUDY".to_string(), study),
         ("ARM".to_string(), arm),
-        (
-            "ARMID".to_string(),
-            100.0 * subject as f64 + 10.0 * study + arm,
-        ),
+        ("ARMID".to_string(), 100.0 * subject as f64 + 10.0 * study + arm),
         ("STUDYID".to_string(), 10.0 * subject as f64 + study),
         ("NARM".to_string(), 50.0),
     ]
@@ -73,10 +70,7 @@ fn population(subjects: &[&[(f64, f64)]]) -> Population {
         .collect();
     Population {
         subjects,
-        covariate_names: ["STUDY", "ARM", "ARMID", "NARM"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        covariate_names: ["STUDY", "ARM", "ARMID", "NARM"].iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
         exclusions: None,
@@ -91,10 +85,7 @@ fn full_design() -> Population {
 }
 
 fn code_in(diags: &[crate::diagnostics::Diagnostic], code: &str) -> Option<String> {
-    diags
-        .iter()
-        .find(|d| d.code == code)
-        .map(|d| d.message.clone())
+    diags.iter().find(|d| d.code == code).map(|d| d.message.clone())
 }
 
 /// #2062 review B1: a model file that does not parse keeps its exact text on the file
@@ -108,11 +99,7 @@ fn code_in(diags: &[crate::diagnostics::Diagnostic], code: &str) -> Option<Strin
 #[test]
 fn a_model_file_that_does_not_parse_keeps_its_text_and_carries_its_code() {
     let cells = [
-        (
-            "misspelt block",
-            format!("{}\n[fit_optoins]\n  maxiter = 1\n", src()),
-            "E_UNKNOWN_BLOCK",
-        ),
+        ("misspelt block", format!("{}\n[fit_optoins]\n  maxiter = 1\n", src()), "E_UNKNOWN_BLOCK"),
         (
             "level beside iov_column",
             src_with(
@@ -127,22 +114,15 @@ fn a_model_file_that_does_not_parse_keeps_its_text_and_carries_its_code() {
         let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
         std::fs::write(f.path(), &text).unwrap();
         let p = f.path().to_str().unwrap();
-        let old = crate::io::model_source::ModelSource::read(p)
-            .err()
-            .expect("the file does not parse");
+        let old =
+            crate::io::model_source::ModelSource::read(p).err().expect("the file does not parse");
         let errs = [
-            (
-                "prepare_run",
-                crate::api::prepare_run(p, Some("data/warfarin.csv")).err(),
-            ),
+            ("prepare_run", crate::api::prepare_run(p, Some("data/warfarin.csv")).err()),
             (
                 "fit_from_files",
                 crate::api::fit_from_files(p, Some("data/warfarin.csv"), None, None).err(),
             ),
-            (
-                "run_model_simulate",
-                crate::api::run_model_simulate(p).err(),
-            ),
+            ("run_model_simulate", crate::api::run_model_simulate(p).err()),
         ];
         for (entry, e) in errs {
             let e = e.unwrap_or_else(|| panic!("{label} via {entry}: accepted"));
@@ -164,10 +144,7 @@ fn level_lines_and_at_tails_make_a_nested_model() {
         .iter()
         .map(|l| (l.name.as_str(), l.column.as_str(), l.parent.as_str()))
         .collect();
-    assert_eq!(
-        names,
-        vec![("STUDY", "STUDY", "ID"), ("ARM", "ARM", "STUDY")]
-    );
+    assert_eq!(names, vec![("STUDY", "STUDY", "ID"), ("ARM", "ARM", "STUDY")]);
     assert_eq!(levels.kappa_level, vec![0, 1]);
     // The weight survives the `at` tail.
     assert_eq!(m.kappa_weights.iter().filter(|w| w.is_some()).count(), 1);
@@ -177,10 +154,7 @@ fn level_lines_and_at_tails_make_a_nested_model() {
     }
     // The readers the single-member check compares, in [η, κ] order.
     assert_eq!(levels.readers[0], vec!["EMAX".to_string()]);
-    assert_eq!(
-        levels.readers[2],
-        vec!["E0".to_string(), "EMAX".to_string()]
-    );
+    assert_eq!(levels.readers[2], vec!["E0".to_string(), "EMAX".to_string()]);
 }
 
 #[test]
@@ -202,10 +176,7 @@ fn a_level_must_nest_in_the_one_declared_before_it() {
     let err = parse_model_string(&bad).err().expect("refused");
     assert!(err.contains("level ARM by ARM in ID"), "{err}");
     assert!(err.contains("must be `in STUDY`"), "{err}");
-    assert!(
-        err.contains("would be crossed, which is not supported"),
-        "{err}"
-    );
+    assert!(err.contains("would be crossed, which is not supported"), "{err}");
     let first = src().replace("level STUDY by STUDY in ID", "level STUDY by STUDY in ARM");
     let err = parse_model_string(&first).err().expect("refused");
     assert!(err.contains("must be `in ID`"), "{err}");
@@ -215,47 +186,29 @@ fn a_level_must_nest_in_the_one_declared_before_it() {
 fn a_level_name_is_used_once() {
     let dup = src().replace("level ARM by ARM in STUDY", "level STUDY by ARM in STUDY");
     let err = parse_model_string(&dup).err().expect("refused");
-    assert!(
-        err.contains("level STUDY: the name is already taken"),
-        "{err}"
-    );
+    assert!(err.contains("level STUDY: the name is already taken"), "{err}");
     let id = src().replace("level STUDY by STUDY in ID", "level ID by STUDY in ID");
-    assert!(parse_model_string(&id)
-        .err()
-        .unwrap()
-        .contains("already taken"));
+    assert!(parse_model_string(&id).err().unwrap().contains("already taken"));
 }
 
 #[test]
 fn at_names_a_declared_level() {
     let unknown = src().replace("kappa K_ST ~ 0.04 at STUDY", "kappa K_ST ~ 0.04 at SITE");
     let err = parse_model_string(&unknown).err().expect("refused");
-    assert!(
-        err.contains("`SITE` is not a declared level (declared: STUDY, ARM)"),
-        "{err}"
-    );
+    assert!(err.contains("`SITE` is not a declared level (declared: STUDY, ARM)"), "{err}");
     let none = "[parameters]\n  theta T(1.0)\n  kappa K ~ 0.1 at ARM\n  sigma S ~ 0.1\n\
                 [individual_parameters]\n  P = T * exp(K)\n[structural_model]\n  y = P\n\
                 [error_model]\n  DV ~ additive(S)\n";
     let err = parse_model_string(none).err().expect("refused");
-    assert!(
-        err.contains("kappa K at ARM: no level is declared"),
-        "{err}"
-    );
+    assert!(err.contains("kappa K at ARM: no level is declared"), "{err}");
     assert!(err.contains("`level ARM by COLUMN in ID`"), "{err}");
 }
 
 #[test]
 fn a_level_takes_no_weight() {
-    let w = src().replace(
-        "level ARM by ARM in STUDY",
-        "level ARM by ARM in STUDY weight = NARM",
-    );
+    let w = src().replace("level ARM by ARM in STUDY", "level ARM by ARM in STUDY weight = NARM");
     let err = parse_model_string(&w).err().expect("refused");
-    assert!(
-        err.contains("a level takes no `prior(...)` or `weight =`"),
-        "{err}"
-    );
+    assert!(err.contains("a level takes no `prior(...)` or `weight =`"), "{err}");
 }
 
 /// The mixing refusal, from both of its causes, through `ferx check`'s code mapping.
@@ -284,10 +237,7 @@ fn levels_do_not_mix_with_the_occasion_options_or_an_unattached_kappa() {
     .expect("iov_column refused");
     assert!(column.contains("declares `level STUDY`"), "{column}");
     assert!(column.contains("also sets `iov_column`"), "{column}");
-    assert!(
-        column.contains("A `level` declaration replaces the occasion option"),
-        "{column}"
-    );
+    assert!(column.contains("A `level` declaration replaces the occasion option"), "{column}");
     assert!(column.contains("remove it from [fit_options]"), "{column}");
     let derived = check(&src_with(
         "",
@@ -298,10 +248,7 @@ fn levels_do_not_mix_with_the_occasion_options_or_an_unattached_kappa() {
     assert!(derived.contains("also sets `iov_occasion`"), "{derived}");
     let unattached = check(&src().replace("kappa K_ST ~ 0.04 at STUDY", "kappa K_ST ~ 0.04"))
         .expect("an unattached kappa refused");
-    assert!(
-        unattached.contains("kappa K_ST has no `at LEVEL`"),
-        "{unattached}"
-    );
+    assert!(unattached.contains("kappa K_ST has no `at LEVEL`"), "{unattached}");
     assert!(
         unattached
             .contains("Once a `level` is declared, every kappa says which level it lives at."),
@@ -327,10 +274,7 @@ fn a_record_without_a_level_label_is_refused() {
         ),
         "{msg}"
     );
-    assert!(
-        msg.contains("Every record needs a label at every level"),
-        "{msg}"
-    );
+    assert!(msg.contains("Every record needs a label at every level"), "{msg}");
     assert!(
         msg.contains("a label is a numeric code: write a text id such as `NCT01` as a number."),
         "{msg}"
@@ -342,10 +286,7 @@ fn a_record_without_a_level_label_is_refused() {
     pop.subjects[0].pk_only_covariates[0].remove("STUDY");
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(msg.contains("level `STUDY` reads column `STUDY`"), "{msg}");
-    assert!(
-        msg.contains("non-observation (EVID=2 or MDV=1) record of subject `1`"),
-        "{msg}"
-    );
+    assert!(msg.contains("non-observation (EVID=2 or MDV=1) record of subject `1`"), "{msg}");
 }
 
 #[test]
@@ -395,31 +336,16 @@ fn a_level_with_one_member_per_parent_is_refused_only_when_its_kappa_has_a_twin(
     ))
     .unwrap();
     let levels = twin.nested_levels().unwrap();
-    assert_eq!(
-        levels.readers[1], levels.readers[2],
-        "the fixture's κs are twins"
-    );
+    assert_eq!(levels.readers[1], levels.readers[2], "the fixture's κs are twins");
     let msg = code_in(
         &check_model_data(&twin, &population(&[single_arm, single_arm])),
         "E_LEVEL_SINGLE_MEMBER",
     )
     .expect("refused");
-    assert!(
-        msg.contains("level `ARM` has a single group inside every `STUDY` group"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("kappa `K_ARM` moves the same records as `K_ST` does"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("through the same parameters (E0, EMAX)"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("Drop one of the two random effects, or drop the level."),
-        "{msg}"
-    );
+    assert!(msg.contains("level `ARM` has a single group inside every `STUDY` group"), "{msg}");
+    assert!(msg.contains("kappa `K_ARM` moves the same records as `K_ST` does"), "{msg}");
+    assert!(msg.contains("through the same parameters (E0, EMAX)"), "{msg}");
+    assert!(msg.contains("Drop one of the two random effects, or drop the level."), "{msg}");
     // Some study with two arms: identified.
     assert!(code_in(
         &check_model_data(&twin, &population(&[single_arm, one_study_two_arms])),
@@ -439,26 +365,16 @@ fn a_level_with_one_member_per_parent_is_refused_only_when_its_kappa_has_a_twin(
 
 #[test]
 fn a_single_study_per_subject_twins_the_study_kappa_with_the_subject_eta() {
-    let m = parse_model_string(&src_with(
-        "",
-        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)",
-        "",
-    ))
-    .unwrap();
+    let m = parse_model_string(&src_with("", "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)", ""))
+        .unwrap();
     let one_study: &[(f64, f64)] = &[(1.0, 1.0), (1.0, 2.0)];
     let msg = code_in(
         &check_model_data(&m, &population(&[one_study, one_study])),
         "E_LEVEL_SINGLE_MEMBER",
     )
     .expect("refused");
-    assert!(
-        msg.contains("level `STUDY` has a single group inside every subject"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("kappa `K_ST` moves the same records as `ETA_SP` does"),
-        "{msg}"
-    );
+    assert!(msg.contains("level `STUDY` has a single group inside every subject"), "{msg}");
+    assert!(msg.contains("kappa `K_ST` moves the same records as `ETA_SP` does"), "{msg}");
     // Two studies in one subject: identified.
     let two: &[(f64, f64)] = &[(1.0, 1.0), (2.0, 1.0)];
     assert!(code_in(
@@ -470,7 +386,7 @@ fn a_single_study_per_subject_twins_the_study_kappa_with_the_subject_eta() {
 
 /// A θ level block whose levels each sit inside one arm or one study is no longer
 /// refused by the data check (#2034): the binder measures the kappas on their own
-/// levels' groups (`api::levels`' `nested_units` tests). Mutation — restore the
+/// levels' groups (`levels`' `nested_units` tests). Mutation — restore the
 /// refusal: the nested cells carry it.
 #[test]
 fn a_theta_block_nested_in_a_kappa_level_is_left_to_the_binder() {
@@ -482,20 +398,14 @@ fn a_theta_block_nested_in_a_kappa_level_is_left_to_the_binder() {
         ))
         .unwrap();
         let diags = check_model_data(&m, &full_design());
-        assert!(
-            diags.iter().all(|d| !d.code.starts_with("E_NESTED_LEVEL")),
-            "[{cols}]: {diags:?}"
-        );
+        assert!(diags.iter().all(|d| !d.code.starts_with("E_NESTED_LEVEL")), "[{cols}]: {diags:?}");
     }
 }
 
 // ── refusals ─────────────────────────────────────────────────────────────────────
 
 fn options(method: EstimationMethod) -> FitOptions {
-    FitOptions {
-        method,
-        ..Default::default()
-    }
+    FitOptions { method, ..Default::default() }
 }
 
 #[test]
@@ -503,11 +413,8 @@ fn only_foce_and_focei_fit_a_nested_model() {
     let m = model();
     for ok in [EstimationMethod::Foce, EstimationMethod::FoceI] {
         assert!(
-            code_in(
-                &check_model_options(&m, &options(ok)),
-                "E_NESTED_LEVEL_METHOD_UNSUPPORTED"
-            )
-            .is_none(),
+            code_in(&check_model_options(&m, &options(ok)), "E_NESTED_LEVEL_METHOD_UNSUPPORTED")
+                .is_none(),
             "{ok:?}"
         );
     }
@@ -519,33 +426,15 @@ fn only_foce_and_focei_fit_a_nested_model() {
         (EstimationMethod::Vi, "method = vi"),
         (EstimationMethod::Bayes, "method = bayes"),
     ] {
-        let msg = code_in(
-            &check_model_options(&m, &options(bad)),
-            "E_NESTED_LEVEL_METHOD_UNSUPPORTED",
-        )
-        .unwrap_or_else(|| panic!("{bad:?} not refused"));
-        assert!(
-            msg.starts_with(&format!("{label} is not yet supported")),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("on a model with nested levels (more than one `level`)"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("Fit it with method = focei (or foce) at n_agq = 1."),
-            "{msg}"
-        );
+        let msg =
+            code_in(&check_model_options(&m, &options(bad)), "E_NESTED_LEVEL_METHOD_UNSUPPORTED")
+                .unwrap_or_else(|| panic!("{bad:?} not refused"));
+        assert!(msg.starts_with(&format!("{label} is not yet supported")), "{msg}");
+        assert!(msg.contains("on a model with nested levels (more than one `level`)"), "{msg}");
+        assert!(msg.contains("Fit it with method = focei (or foce) at n_agq = 1."), "{msg}");
     }
-    let agq = FitOptions {
-        n_agq: 3,
-        ..options(EstimationMethod::FoceI)
-    };
-    let msg = code_in(
-        &check_model_options(&m, &agq),
-        "E_NESTED_LEVEL_METHOD_UNSUPPORTED",
-    )
-    .unwrap();
+    let agq = FitOptions { n_agq: 3, ..options(EstimationMethod::FoceI) };
+    let msg = code_in(&check_model_options(&m, &agq), "E_NESTED_LEVEL_METHOD_UNSUPPORTED").unwrap();
     assert!(msg.starts_with("method = focei with n_agq = 3"), "{msg}");
     // The same method on a one-level model is not this refusal.
     let one = parse_model_string(&src().replace("  level ARM by ARM in STUDY\n", "").replace(
@@ -573,20 +462,12 @@ fn a_residual_correlation_is_accepted_on_a_nested_model() {
             "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)",
             "",
         )
-        .replace(
-            "DV ~ additive(ADD)\n",
-            "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
-        ),
+        .replace("DV ~ additive(ADD)\n", "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n"),
     )
     .expect("parse");
     assert!(m.residual_serial.is_some() && m.has_nested_levels());
     let diags = check_model_options(&m, &options(EstimationMethod::FoceI));
-    assert!(
-        diags
-            .iter()
-            .all(|d| d.severity != crate::diagnostics::Severity::Error),
-        "{diags:?}"
-    );
+    assert!(diags.iter().all(|d| d.severity != crate::diagnostics::Severity::Error), "{diags:?}");
 }
 
 /// `simulate()` draws a nested model per level since #1082 PR4 (the draw itself is
@@ -626,10 +507,7 @@ fn simulate_refuses_what_the_nested_fit_refuses() {
         ),
         "{msg}"
     );
-    assert!(
-        msg.contains("leave `iov_occasion` unset (or `column`)"),
-        "{msg}"
-    );
+    assert!(msg.contains("leave `iov_occasion` unset (or `column`)"), "{msg}");
     let column = crate::api::SimulateOptions {
         seed: Some(1),
         iov_occasion: Some(IovOccasionRule::Column),
@@ -639,28 +517,16 @@ fn simulate_refuses_what_the_nested_fit_refuses() {
 
     let mut blank = full_design();
     blank.subjects[1].obs_covariates[2].insert("ARM".to_string(), f64::NAN);
-    let err = crate::api::simulate_with_seed(&m, &blank, &m.default_params, 1, 1)
-        .err()
-        .expect("refused");
+    let err =
+        crate::api::simulate_with_seed(&m, &blank, &m.default_params, 1, 1).err().expect("refused");
     assert_eq!(err.code(), Some("E_LEVEL_MISSING_LABEL"));
-    assert!(
-        err.to_string().contains("level `ARM` reads column `ARM`"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("level `ARM` reads column `ARM`"), "{err}");
 
-    let err = crate::api::adaptive::check_adaptive_model_data(&m, &p)
-        .err()
-        .expect("refused");
+    let err = crate::api::adaptive::check_adaptive_model_data(&m, &p).err().expect("refused");
     assert_eq!(err.code(), Some("E_NESTED_LEVEL_SIMULATE_UNSUPPORTED"));
     let msg = err.to_string();
-    assert!(
-        msg.contains("adaptive dosing does not yet support nested levels"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("a kappa at an outer level must be drawn once per group"),
-        "{msg}"
-    );
+    assert!(msg.contains("adaptive dosing does not yet support nested levels"), "{msg}");
+    assert!(msg.contains("a kappa at an outer level must be drawn once per group"), "{msg}");
     assert!(
         msg.contains("`simulate()` and `simulate_with_uncertainty()` support the model."),
         "{msg}"
@@ -719,9 +585,7 @@ fn simulation_refuses_an_omega_iov_that_couples_two_levels() {
         iov.eta_names.clone(),
         false,
     );
-    let err = crate::api::simulate_with_seed(&m, &p, &params, 1, 1)
-        .err()
-        .expect("refused");
+    let err = crate::api::simulate_with_seed(&m, &p, &params, 1, 1).err().expect("refused");
     assert_eq!(err.code(), Some("E_PARAM_SHAPE"));
     let msg = err.to_string();
     assert!(
@@ -747,15 +611,9 @@ fn the_kappa_draw_refuses_a_nested_subject_without_cells() {
     let err = KappaDraw::of(&m, &p.subjects[0]).err().expect("refused");
     assert!(err.to_string().contains("without its level cells"), "{err}");
     let prepared = with_level_cells(&m, &p);
-    assert!(matches!(
-        KappaDraw::of(&m, &prepared.subjects[0]),
-        Ok(KappaDraw::Nested(_))
-    ));
+    assert!(matches!(KappaDraw::of(&m, &prepared.subjects[0]), Ok(KappaDraw::Nested(_))));
     // A prepared population is borrowed, not copied again.
-    assert!(matches!(
-        with_level_cells(&m, &prepared),
-        std::borrow::Cow::Borrowed(_)
-    ));
+    assert!(matches!(with_level_cells(&m, &prepared), std::borrow::Cow::Borrowed(_)));
 }
 
 /// Review r2 on #1082 PR4: a population whose records carry occasion ids that are not
@@ -773,10 +631,7 @@ fn foreign_occasion_ids_on_a_nested_population_are_regrouped_not_borrowed() {
     for s in &mut foreign.subjects {
         s.occasions = vec![1, 1, 2, 2];
     }
-    assert!(matches!(
-        with_level_cells(&m, &foreign),
-        std::borrow::Cow::Owned(_)
-    ));
+    assert!(matches!(with_level_cells(&m, &foreign), std::borrow::Cow::Owned(_)));
     assert!(NestedLayout::of(&m, &foreign.subjects[0]).is_none());
     let bits = |p: &Population| -> Vec<u64> {
         crate::api::simulate_with_seed(&m, p, &m.default_params, 2, 7)
@@ -849,11 +704,8 @@ fn every_nested_parity_fixture_fits_on_the_analytic_walks() {
         assert!(r.ofv.is_finite(), "{label}");
         assert_eq!(r.gradient_method_inner, analytic, "{label}");
         assert_eq!(r.gradient_method_outer, analytic, "{label}");
-        let fd: Vec<&String> = r
-            .warnings
-            .iter()
-            .filter(|w| w.contains("finite-difference"))
-            .collect();
+        let fd: Vec<&String> =
+            r.warnings.iter().filter(|w| w.contains("finite-difference")).collect();
         assert!(fd.is_empty(), "{label}: {fd:?}");
     }
 }
@@ -887,18 +739,9 @@ fn a_nested_model_reports_the_analytic_walks_on_every_class() {
     assert_eq!(twin.nested_levels(), transit.nested_levels());
     for (label, m) in [("algebraic", model()), ("transit", transit)] {
         assert!(m.has_nested_levels(), "{label}");
-        assert!(
-            crate::sens::ode_provider::adjoint::recorder_in_scope(&m),
-            "{label}"
-        );
-        assert!(
-            crate::estimation::inner_optimizer::inner_reports_analytic_model(&m),
-            "{label}"
-        );
-        assert!(
-            crate::sens::provider::analytic_outer_gradient_in_scope(&m),
-            "{label}"
-        );
+        assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(&m), "{label}");
+        assert!(crate::estimation::inner_optimizer::inner_reports_analytic_model(&m), "{label}");
+        assert!(crate::sens::provider::analytic_outer_gradient_in_scope(&m), "{label}");
     }
 }
 
@@ -929,15 +772,11 @@ fn a_weight_varying_inside_its_kappas_group_warns_per_level() {
         ),
         "{msg}"
     );
-    assert!(
-        msg.contains("κ is drawn once per group of its level, so the group's"),
-        "{msg}"
-    );
+    assert!(msg.contains("κ is drawn once per group of its level, so the group's"), "{msg}");
     // A weighted kappa at the study sees the between-arm change.
-    let at_study = parse_model_string(&src().replace(
-        "kappa K_ST ~ 0.04 at STUDY",
-        "kappa K_ST ~ 0.04 at STUDY weight = NARM",
-    ))
+    let at_study = parse_model_string(
+        &src().replace("kappa K_ST ~ 0.04 at STUDY", "kappa K_ST ~ 0.04 at STUDY weight = NARM"),
+    )
     .unwrap();
     let msg = warn(&at_study, &between).expect("warned");
     assert!(
@@ -980,11 +819,7 @@ fn a_blank_level_cell_is_a_missing_label_and_a_blank_covariate_still_carries_for
     let pop = read(csv);
     let s = &pop.subjects[0];
     assert!(s.obs_cov(2)["ARM"].is_nan(), "the blank label is missing");
-    assert_eq!(
-        s.obs_cov(2)["NARM"],
-        40.0,
-        "the blank covariate carries forward"
-    );
+    assert_eq!(s.obs_cov(2)["NARM"], 40.0, "the blank covariate carries forward");
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(
         msg.contains(
@@ -1016,10 +851,8 @@ fn a_blank_level_cell_is_a_missing_label_and_a_blank_covariate_still_carries_for
 fn a_blank_level_cell_read_without_the_model_is_refused_at_fit() {
     let m = model();
     let write = |tag: &str, csv: &str| {
-        let path = std::env::temp_dir().join(format!(
-            "ferx_nested_blind_{}_{tag}.csv",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir()
+            .join(format!("ferx_nested_blind_{}_{tag}.csv", std::process::id()));
         std::fs::write(&path, csv).unwrap();
         path
     };
@@ -1031,15 +864,8 @@ fn a_blank_level_cell_read_without_the_model_is_refused_at_fit() {
     );
     let pop = crate::io::datareader::read_nonmem_csv(&blank, None, None).unwrap();
     let s = &pop.subjects[0];
-    assert_eq!(
-        s.obs_cov(2)["ARM"],
-        2.0,
-        "the model-blind reader carries it forward"
-    );
-    assert_eq!(
-        s.filled_cells,
-        vec![("ARM".to_string(), 3.0), ("NARM".to_string(), 3.0)]
-    );
+    assert_eq!(s.obs_cov(2)["ARM"], 2.0, "the model-blind reader carries it forward");
+    assert_eq!(s.filled_cells, vec![("ARM".to_string(), 3.0), ("NARM".to_string(), 3.0)]);
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
     assert!(
         msg.contains(
@@ -1056,34 +882,20 @@ fn a_blank_level_cell_read_without_the_model_is_refused_at_fit() {
         run_covariance_step: false,
         ..Default::default()
     };
-    let err = crate::api::fit(&m, &pop, &m.default_params, &opts)
-        .err()
-        .expect("refused");
+    let err = crate::api::fit(&m, &pop, &m.default_params, &opts).err().expect("refused");
     assert_eq!(err.code(), Some("E_LEVEL_MISSING_LABEL"), "{err}");
 
     // A blank before the first value is filled backward, and refused the same way.
-    let first = write(
-        "first",
-        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,.,50\n1,2,11,1,2,50\n",
-    );
+    let first = write("first", "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,.,50\n1,2,11,1,2,50\n");
     let pop = crate::io::datareader::read_nonmem_csv(&first, None, None).unwrap();
     assert_eq!(pop.subjects[0].obs_cov(0)["ARM"], 2.0);
     let msg = code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").expect("refused");
-    assert!(
-        msg.contains("at TIME 1. The dataset was read without"),
-        "{msg}"
-    );
+    assert!(msg.contains("at TIME 1. The dataset was read without"), "{msg}");
 
     // Only the covariate is blank: noted, not refused.
-    let cov = write(
-        "cov",
-        "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,\n",
-    );
+    let cov = write("cov", "ID,TIME,DV,STUDY,ARM,NARM\n1,1,10,1,1,50\n1,2,11,1,2,\n");
     let pop = crate::io::datareader::read_nonmem_csv(&cov, None, None).unwrap();
-    assert_eq!(
-        pop.subjects[0].filled_cells,
-        vec![("NARM".to_string(), 2.0)]
-    );
+    assert_eq!(pop.subjects[0].filled_cells, vec![("NARM".to_string(), 2.0)]);
     assert!(code_in(&check_model_data(&m, &pop), "E_LEVEL_MISSING_LABEL").is_none());
 
     // The model-aware reader: the label is `NaN` (refused by the record's path), the
@@ -1092,10 +904,7 @@ fn a_blank_level_cell_read_without_the_model_is_refused_at_fit() {
         crate::api::read_population_for(&m, &None, blank.to_str().unwrap(), None, None, None, &[])
             .unwrap();
     assert!(aware.subjects[0].obs_cov(2)["ARM"].is_nan());
-    assert_eq!(
-        aware.subjects[0].filled_cells,
-        vec![("NARM".to_string(), 3.0)]
-    );
+    assert_eq!(aware.subjects[0].filled_cells, vec![("NARM".to_string(), 3.0)]);
     for p in [blank, first, cov] {
         let _ = std::fs::remove_file(p);
     }
@@ -1117,14 +926,8 @@ fn a_filled_level_cell_moves_the_population_fingerprint() {
         let _ = std::fs::remove_file(&path);
         pop
     };
-    let written = read(
-        "written",
-        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n",
-    );
-    let blank = read(
-        "blank",
-        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n",
-    );
+    let written = read("written", "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n");
+    let blank = read("blank", "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n");
     let (w, b) = (&written.subjects[0], &blank.subjects[0]);
     assert_eq!(w.covariates, b.covariates);
     assert_eq!(w.obs_covariates, b.obs_covariates, "the snapshots agree");
@@ -1136,11 +939,7 @@ fn a_filled_level_cell_moves_the_population_fingerprint() {
         fp.first_difference(&blank).is_some(),
         "the fit of the written-out file vouches for the blank one"
     );
-    assert!(code_in(
-        &check_model_data(&model(), &written),
-        "E_LEVEL_MISSING_LABEL"
-    )
-    .is_none());
+    assert!(code_in(&check_model_data(&model(), &written), "E_LEVEL_MISSING_LABEL").is_none());
     assert!(code_in(&check_model_data(&model(), &blank), "E_LEVEL_MISSING_LABEL").is_some());
 }
 
@@ -1161,28 +960,14 @@ fn a_fit_time_occasion_rule_is_refused_on_a_nested_model() {
         "E_LEVEL_MIXED_WITH_IOV_COLUMN"
     )
     .is_none());
-    for rule in [
-        IovOccasionRule::PerDose,
-        IovOccasionRule::TimeWindows(vec![2.5]),
-    ] {
-        let msg = code_in(
-            &check_model_options(&m, &with(rule.clone())),
-            "E_LEVEL_MIXED_WITH_IOV_COLUMN",
-        )
-        .unwrap_or_else(|| panic!("{rule:?} not refused"));
+    for rule in [IovOccasionRule::PerDose, IovOccasionRule::TimeWindows(vec![2.5])] {
+        let msg =
+            code_in(&check_model_options(&m, &with(rule.clone())), "E_LEVEL_MIXED_WITH_IOV_COLUMN")
+                .unwrap_or_else(|| panic!("{rule:?} not refused"));
         assert!(msg.contains("the fit options set `iov_occasion`"), "{msg}");
-        assert!(
-            msg.contains("on a model that declares `level STUDY`"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("The levels already define the groups"),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("leave `iov_occasion` at its default (`column`)"),
-            "{msg}"
-        );
+        assert!(msg.contains("on a model that declares `level STUDY`"), "{msg}");
+        assert!(msg.contains("The levels already define the groups"), "{msg}");
+        assert!(msg.contains("leave `iov_occasion` at its default (`column`)"), "{msg}");
         let err = crate::api::fit(&m, &full_design(), &m.default_params, &with(rule))
             .err()
             .expect("fit refuses it")
@@ -1211,10 +996,7 @@ fn fitted_population_keeps_the_level_cells_under_a_derived_rule() {
     let m = model();
     let pop = full_design();
     let mut warnings = Vec::new();
-    for rule in [
-        IovOccasionRule::Column,
-        IovOccasionRule::TimeWindows(vec![2.5]),
-    ] {
+    for rule in [IovOccasionRule::Column, IovOccasionRule::TimeWindows(vec![2.5])] {
         let prepared = crate::api::fit::fitted_population(
             &m,
             &rule,
@@ -1249,10 +1031,7 @@ fn a_text_level_label_is_refused_as_a_non_numeric_value() {
         msg.contains("level `STUDY` reads column `STUDY`, which has no numeric value"),
         "{msg}"
     );
-    assert!(
-        msg.contains("write a text id such as `NCT01` as a number"),
-        "{msg}"
-    );
+    assert!(msg.contains("write a text id such as `NCT01` as a number"), "{msg}");
 }
 
 /// Review r1 #8: `at LEVEL` names a level as `in PARENT` and the uniqueness rule do,
@@ -1287,28 +1066,16 @@ fn an_unprepared_nested_subject_is_refused_by_every_estimator_site() {
     let h = |s: &Subject| nalgebra::DMatrix::zeros(s.obs_times.len(), m.n_eta);
     let cells =
         |s: &Subject| vec![vec![0.0; m.n_kappa]; crate::stats::stacked_layout::group_count(s)];
-    let dcells = |s: &Subject| {
-        cells(s)
-            .into_iter()
-            .map(nalgebra::DVector::from_vec)
-            .collect::<Vec<_>>()
-    };
+    let dcells =
+        |s: &Subject| cells(s).into_iter().map(nalgebra::DVector::from_vec).collect::<Vec<_>>();
     for (s_raw, s_ok) in raw.subjects.iter().zip(&prepared.subjects) {
         assert!(crate::stats::nested_levels::unprepared(&m, s_raw));
         assert!(!crate::stats::nested_levels::unprepared(&m, s_ok));
 
         let r = find_ebe(&m, s_raw, p, 50, 1e-6, None, None, 0);
-        assert!(
-            r.hard_reject && r.nll >= 1e20,
-            "find_ebe took the subject: {}",
-            r.nll
-        );
+        assert!(r.hard_reject && r.nll >= 1e20, "find_ebe took the subject: {}", r.nll);
         let r = find_ebe(&m, s_ok, p, 50, 1e-6, None, None, 0);
-        assert!(
-            !r.hard_reject && r.nll.is_finite() && r.nll < 1e10,
-            "{}",
-            r.nll
-        );
+        assert!(!r.hard_reject && r.nll.is_finite() && r.nll < 1e10, "{}", r.nll);
         assert_eq!(r.kappas.len(), 4, "one κ̂ vector per cell");
 
         let f = |s: &Subject| {
@@ -1340,10 +1107,7 @@ fn an_unprepared_nested_subject_is_refused_by_every_estimator_site() {
                 iov,
             )
         };
-        assert!(
-            lin(s_raw).is_none(),
-            "the linearization refuses the unprepared subject"
-        );
+        assert!(lin(s_raw).is_none(), "the linearization refuses the unprepared subject");
         assert!(lin(s_ok).is_some());
 
         let i = |s: &Subject| {
@@ -1421,11 +1185,7 @@ fn the_level_row_says_none_or_every_and_counts_zero_or_several_kappas() {
         "{}",
         rows[0]
     );
-    assert!(
-        rows[1].contains("no `STUDY` group holds a single `ARM` group"),
-        "{}",
-        rows[1]
-    );
+    assert!(rows[1].contains("no `STUDY` group holds a single `ARM` group"), "{}", rows[1]);
 
     let one_arm: &[(f64, f64)] = &[(1.0, 1.0), (2.0, 1.0)];
     let three: &[(f64, f64)] = &[(1.0, 1.0), (2.0, 1.0), (3.0, 1.0)];
@@ -1435,11 +1195,7 @@ fn the_level_row_says_none_or_every_and_counts_zero_or_several_kappas() {
         "{}",
         rows[0]
     );
-    assert!(
-        rows[1].contains("every `STUDY` group holds a single `ARM` group"),
-        "{}",
-        rows[1]
-    );
+    assert!(rows[1].contains("every `STUDY` group holds a single `ARM` group"), "{}", rows[1]);
 
     let alone: &[(f64, f64)] = &[(1.0, 1.0), (1.0, 1.0)];
     let rows = level_rows(&model(), &population(&[alone]));
@@ -1464,11 +1220,7 @@ fn the_level_row_says_none_or_every_and_counts_zero_or_several_kappas() {
     .expect("a level with no kappa parses");
     let rows = level_rows(&no_study_kappa, &full_design());
     assert!(rows[0].contains("; no kappa at `STUDY`."), "{}", rows[0]);
-    assert!(
-        rows[1].contains("; 1 kappa at `ARM` (K_ARM)."),
-        "{}",
-        rows[1]
-    );
+    assert!(rows[1].contains("; 1 kappa at `ARM` (K_ARM)."), "{}", rows[1]);
 
     let two_at_arm = parse_model_string(&src_with(
         "  kappa K_ARM2 ~ 1.0 at ARM\n",
@@ -1477,11 +1229,7 @@ fn the_level_row_says_none_or_every_and_counts_zero_or_several_kappas() {
     ))
     .expect("parse");
     let rows = level_rows(&two_at_arm, &full_design());
-    assert!(
-        rows[1].contains("; 2 kappas at `ARM` (K_ARM, K_ARM2)."),
-        "{}",
-        rows[1]
-    );
+    assert!(rows[1].contains("; 2 kappas at `ARM` (K_ARM, K_ARM2)."), "{}", rows[1]);
 }
 
 /// #2035: the groups are counted on the observation records, as `E_LEVEL_SINGLE_MEMBER`
@@ -1500,10 +1248,7 @@ fn the_level_row_counts_observation_records_only() {
         "{}",
         rows[1]
     );
-    let rows = level_rows(
-        &model(),
-        &population(&[&[(1.0, 1.0), (1.0, 2.0), (2.0, 1.0)]]),
-    );
+    let rows = level_rows(&model(), &population(&[&[(1.0, 1.0), (1.0, 2.0), (2.0, 1.0)]]));
     assert!(
         rows[1].contains("3 groups in 2 `STUDY` groups") && rows[1].contains("1 of 2"),
         "{}",
@@ -1546,10 +1291,8 @@ fn ferx_check_with_data_prints_the_level_rows_and_fit_does_not_record_them() {
          2,1,10,1,1,50\n2,2,11,2,1,50\n2,3,12,2,2,50\n",
     )
     .unwrap();
-    let report = validate_model_file(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    );
+    let report =
+        validate_model_file(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()));
     assert!(report.valid, "{:?}", report.diagnostics);
     // #2387: the rows are counted as info, never as warnings, so a nested-level model
     // with nothing else to report validates clean rather than "with warnings".
@@ -1562,11 +1305,7 @@ fn ferx_check_with_data_prints_the_level_rows_and_fit_does_not_record_them() {
         .map(|d| d.message.as_str())
         .collect();
     assert_eq!(rows.len(), 2, "{:?}", report.diagnostics);
-    assert!(
-        rows[0].starts_with("level `STUDY`: 4 groups in 2 subjects"),
-        "{}",
-        rows[0]
-    );
+    assert!(rows[0].starts_with("level `STUDY`: 4 groups in 2 subjects"), "{}", rows[0]);
     assert!(
         rows[1].starts_with("level `ARM`: 6 groups in 4 `STUDY` groups")
             && rows[1].contains("2 of 4 `STUDY` groups hold a single `ARM` group"),

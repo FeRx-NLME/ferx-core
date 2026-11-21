@@ -77,21 +77,13 @@ impl FixedSpec {
 
     /// The call over `layout`: `inputs` the captures' lanes, `out` the state's (`n × lanes`).
     pub(super) fn run(
-        &self,
-        layout: Layout,
-        inputs: &[f64],
-        out: &mut [f64],
-        log: Option<&mut Option<FixedLog>>,
+        &self, layout: Layout, inputs: &[f64], out: &mut [f64], log: Option<&mut Option<FixedLog>>,
     ) -> bool {
         self.run_inner(layout, inputs, out, log).is_some()
     }
 
     fn run_inner(
-        &self,
-        layout: Layout,
-        inputs: &[f64],
-        out: &mut [f64],
-        log: Option<&mut Option<FixedLog>>,
+        &self, layout: Layout, inputs: &[f64], out: &mut [f64], log: Option<&mut Option<FixedLog>>,
     ) -> Option<()> {
         let (n, l) = (self.n, layout.lanes());
         // 1. The value search, on the captures' values.
@@ -126,11 +118,7 @@ impl FixedSpec {
                 }
                 out[..n * l].copy_from_slice(&u);
                 if let Some(lg) = log {
-                    *lg = Some(FixedLog {
-                        steps,
-                        map,
-                        m: Vec::new(),
-                    });
+                    *lg = Some(FixedLog { steps, map, m: Vec::new() });
                 }
                 return Some(());
             }
@@ -143,13 +131,7 @@ impl FixedSpec {
             return Some(());
         }
         // 2. `M = (I − J)⁻¹` through the defining map, `u`'s tangents one-hot.
-        let lj = Layout {
-            n: n as u16,
-            m: 0,
-            th: false,
-            wide: false,
-            tan: 0,
-        };
+        let lj = Layout { n: n as u16, m: 0, th: false, wide: false, tan: 0 };
         let w = lj.lanes();
         let mut uj = vec![0.0; n * w];
         for i in 0..n {
@@ -227,12 +209,14 @@ impl FixedSpec {
     /// The reverse over `layout` from the forward's `log`, for `seeds` blocks: `out_adj` the
     /// state's adjoints (`seeds × n × lanes`), adding the captures' into `in_adj`
     /// (`seeds × n_caps × lanes`). The state the search started from takes none.
+    ///
+    /// The walk is the same for every `sweep`: `M` is a constant of the recorded steps (their
+    /// count already covers the derivative order of a reverse), and `w = Mᵀū` is applied lane
+    /// by lane, so under forward over reverse the adjoints' tangent lanes go through it as
+    /// their values do — the tangent of the same step program the reverse over forward
+    /// differentiates (#2980).
     pub(super) fn run_rev(
-        &self,
-        layout: Layout,
-        log: &FixedLog,
-        seeds: usize,
-        out_adj: &[f64],
+        &self, layout: Layout, sweep: Sweep, log: &FixedLog, seeds: usize, out_adj: &[f64],
         in_adj: &mut [f64],
     ) -> bool {
         let (n, l, nc) = (self.n, layout.lanes(), self.n_caps);
@@ -247,7 +231,7 @@ impl FixedSpec {
                 let mut ub: Vec<f64> = out_adj[sd * n * l..(sd + 1) * n * l].to_vec();
                 for f in log.steps.iter().rev() {
                     let mut pb = vec![0.0; (n + nc) * l];
-                    if !plan.reverse_from(f, layout, 1, &mut [], &mut pb, &ub) {
+                    if !plan.sweep_back(f, layout, sweep, 1, &mut [], &mut pb, &ub) {
                         return false;
                     }
                     ub.copy_from_slice(&pb[..n * l]);
@@ -274,7 +258,7 @@ impl FixedSpec {
                     }
                 }
                 let mut pb = vec![0.0; (n + nc) * l];
-                if !plan.reverse_from(f, layout, 1, &mut [], &mut pb, &w) {
+                if !plan.sweep_back(f, layout, sweep, 1, &mut [], &mut pb, &w) {
                     return false;
                 }
                 for i in 0..n * l {
@@ -298,10 +282,7 @@ impl FixedSpec {
 /// is taken over the rest. `None` — the recording fails — if a map cannot be recorded or the
 /// search fails.
 pub(crate) fn record_fixed(
-    n: usize,
-    held: &[usize],
-    u0: &[f64],
-    maps: &[&dyn Fn(&[Tr]) -> Option<Vec<Tr>>],
+    n: usize, held: &[usize], u0: &[f64], maps: &[&dyn Fn(&[Tr]) -> Option<Vec<Tr>>],
     solve: Box<SolveFn>,
 ) -> Option<Vec<Tr>> {
     let mut caps: Vec<u32> = Vec::new();
@@ -313,19 +294,9 @@ pub(crate) fn record_fixed(
     let n_caps = caps.len();
     let plans: Vec<Arc<Plan>> = subs
         .into_iter()
-        .map(|r| {
-            r.with_caps(n, &caps)
-                .plan(Layout::F64, 0, n + n_caps)
-                .map(Arc::new)
-        })
+        .map(|r| r.with_caps(n, &caps).plan(Layout::F64, 0, n + n_caps).map(Arc::new))
         .collect::<Option<_>>()?;
-    let spec = Arc::new(FixedSpec {
-        n,
-        held: held.to_vec(),
-        n_caps,
-        maps: plans,
-        solve,
-    });
+    let spec = Arc::new(FixedSpec { n, held: held.to_vec(), n_caps, maps: plans, solve });
     let cap_vals: Vec<f64> = rec(|r| caps.iter().map(|&c| r.vals[c as usize]).collect());
     let mut out = vec![0.0; n];
     if !spec.run(Layout::F64, &cap_vals, &mut out, None) {
@@ -355,25 +326,14 @@ pub(crate) fn record_fixed(
 /// Record `f` over fresh variables (values `u0`) cut out of the open recording as a recording
 /// of its own: its inputs the variables, then the outer registers it reads (added to `caps`).
 fn record_sub(
-    n: usize,
-    u0: &[f64],
-    caps: &mut Vec<u32>,
-    f: &dyn Fn(&[Tr]) -> Option<Vec<Tr>>,
+    n: usize, u0: &[f64], caps: &mut Vec<u32>, f: &dyn Fn(&[Tr]) -> Option<Vec<Tr>>,
 ) -> Option<Recording> {
     let (start_code, start_reg, outer_guard, outer_guarded, outer_marks) = rec(|r| {
         r.sub_depth += 1;
-        (
-            r.code.len(),
-            r.n_regs,
-            r.guard.take(),
-            std::mem::take(&mut r.guarded),
-            r.marks.len(),
-        )
+        (r.code.len(), r.n_regs, r.guard.take(), std::mem::take(&mut r.guarded), r.marks.len())
     });
-    let vars: Vec<Tr> = u0
-        .iter()
-        .map(|&v| Tr::mk(v, node(None, |d| Flat::LoadK { d, c: v }), true))
-        .collect();
+    let vars: Vec<Tr> =
+        u0.iter().map(|&v| Tr::mk(v, node(None, |d| Flat::LoadK { d, c: v }), true)).collect();
     let y = f(&vars);
     let (region, guard, marks) = rec(|r| {
         r.sub_depth -= 1;
@@ -381,12 +341,8 @@ fn record_sub(
         let g = r.guard.take();
         r.guard = outer_guard;
         r.guarded = outer_guarded;
-        let marks: Vec<usize> = r
-            .marks
-            .split_off(outer_marks)
-            .into_iter()
-            .map(|m| m - start_code)
-            .collect();
+        let marks: Vec<usize> =
+            r.marks.split_off(outer_marks).into_iter().map(|m| m - start_code).collect();
         r.cse.retain(|_, v| *v < start_reg);
         (region, g, marks)
     });
@@ -453,16 +409,10 @@ impl Recording {
     fn with_caps(mut self, n: usize, caps: &[u32]) -> Recording {
         let mut code: Vec<Flat> = Vec::with_capacity(n + caps.len() + self.code.len());
         for &(r, i) in &self.theta_regs {
-            code.push(Flat::LoadParam {
-                d: r as u32,
-                slot: i as u32,
-            });
+            code.push(Flat::LoadParam { d: r as u32, slot: i as u32 });
         }
         for (c, &r) in caps.iter().enumerate() {
-            code.push(Flat::LoadParam {
-                d: r as u32,
-                slot: (n + c) as u32,
-            });
+            code.push(Flat::LoadParam { d: r as u32, slot: (n + c) as u32 });
             self.theta_regs.push((r, n + c));
         }
         let shift = code.len();
@@ -487,11 +437,7 @@ impl RepeatSpec {
     /// The call over `layout`: `inputs` the state's lanes, the count's, then the captures';
     /// `out` the state's after `count` applications.
     pub(super) fn run(
-        &self,
-        layout: Layout,
-        inputs: &[f64],
-        out: &mut [f64],
-        log: Option<&mut Option<FixedLog>>,
+        &self, layout: Layout, inputs: &[f64], out: &mut [f64], log: Option<&mut Option<FixedLog>>,
     ) -> bool {
         let (n, l) = (self.n, layout.lanes());
         let count = inputs[n * l];
@@ -507,6 +453,8 @@ impl RepeatSpec {
             p.extend_from_slice(caps);
             let mut du = vec![0.0; (self.body.n_out() + 1) * l];
             let Some(f) = self.body.forward_layout(layout, &[], &p, &mut du) else {
+                // A failed body call: when it was an overflow the call said so itself
+                // (`MatSpec::run` notes a non-finite result to an open recording).
                 return false;
             };
             if du[self.body.n_out() * l] != 1.0 {
@@ -519,11 +467,7 @@ impl RepeatSpec {
         }
         out[..n * l].copy_from_slice(&x);
         if let Some(lg) = log {
-            *lg = Some(FixedLog {
-                steps,
-                map: 0,
-                m: Vec::new(),
-            });
+            *lg = Some(FixedLog { steps, map: 0, m: Vec::new() });
         }
         true
     }
@@ -531,11 +475,7 @@ impl RepeatSpec {
     /// The reverse: `out_adj` the final state's adjoints per seed, into `in_adj` per seed the
     /// initial state's, none for the count, and the captures'.
     pub(super) fn run_rev(
-        &self,
-        layout: Layout,
-        log: &FixedLog,
-        seeds: usize,
-        out_adj: &[f64],
+        &self, layout: Layout, sweep: Sweep, log: &FixedLog, seeds: usize, out_adj: &[f64],
         in_adj: &mut [f64],
     ) -> bool {
         let (n, l, nc) = (self.n, layout.lanes(), self.n_caps);
@@ -545,7 +485,7 @@ impl RepeatSpec {
             let ia = &mut in_adj[sd * w..(sd + 1) * w];
             for f in log.steps.iter().rev() {
                 let mut pb = vec![0.0; (n + nc) * l];
-                if !self.body.reverse_from(f, layout, 1, &mut [], &mut pb, &ub) {
+                if !self.body.sweep_back(f, layout, sweep, 1, &mut [], &mut pb, &ub) {
                     return false;
                 }
                 ub.copy_from_slice(&pb[..n * l]);
@@ -564,9 +504,7 @@ impl RepeatSpec {
 /// Record `body` applied `count` times to `x0` (see [`RepeatSpec`]): the body once, as a
 /// sub-plan over fresh variables and the outer values it reads, then the call.
 pub(crate) fn record_repeat(
-    x0: &[Tr],
-    count: Tr,
-    body: &dyn Fn(&[Tr]) -> Vec<Tr>,
+    x0: &[Tr], count: Tr, body: &dyn Fn(&[Tr]) -> Vec<Tr>,
 ) -> Option<Vec<Tr>> {
     let n = x0.len();
     let mut caps: Vec<u32> = Vec::new();
@@ -575,18 +513,10 @@ pub(crate) fn record_repeat(
     let sub = record_sub(n, &vals, &mut caps, &f)?;
     let n_caps = caps.len();
     let plan = Arc::new(sub.with_caps(n, &caps).plan(Layout::F64, 0, n + n_caps)?);
-    let spec = Arc::new(RepeatSpec {
-        n,
-        n_caps,
-        body: plan,
-    });
+    let spec = Arc::new(RepeatSpec { n, n_caps, body: plan });
     let mut inputs = vals.clone();
     inputs.push(count.v);
-    inputs.extend(rec(|r| {
-        caps.iter()
-            .map(|&c| r.vals[c as usize])
-            .collect::<Vec<f64>>()
-    }));
+    inputs.extend(rec(|r| caps.iter().map(|&c| r.vals[c as usize]).collect::<Vec<f64>>()));
     let mut out = vec![0.0; n];
     if !spec.run(Layout::F64, &inputs, &mut out, None) {
         fail_here("a repeat call's record-time run failed");
@@ -596,12 +526,7 @@ pub(crate) fn record_repeat(
         r.loops.push(CallKind::Repeat(spec));
         (r.loops.len() - 1) as u32
     });
-    for a in x0
-        .iter()
-        .map(|v| v.r)
-        .chain(std::iter::once(count.r))
-        .chain(caps.iter().copied())
-    {
+    for a in x0.iter().map(|v| v.r).chain(std::iter::once(count.r)).chain(caps.iter().copied()) {
         let a = a as u32;
         rec(|r| r.code.push(Flat::LoopArg { a }));
     }

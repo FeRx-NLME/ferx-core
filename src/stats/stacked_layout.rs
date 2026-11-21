@@ -53,9 +53,7 @@ pub(crate) fn group_count(subject: &Subject) -> usize {
 /// `b` at the κ offsets. Serves both the prior covariance (`Ω`, `Ω_iov`) and the prior
 /// precision (`Ω⁻¹`, `Ω_iov⁻¹`), which have the same block structure.
 pub(crate) fn block_diag_stack(
-    a: &DMatrix<f64>,
-    b: &DMatrix<f64>,
-    n_groups: usize,
+    a: &DMatrix<f64>, b: &DMatrix<f64>, n_groups: usize,
 ) -> DMatrix<f64> {
     let n_a = a.nrows();
     let n_b = b.nrows();
@@ -154,23 +152,14 @@ impl StackedLayout {
         let groups = crate::stats::likelihood::iov_occasion_groups(subject);
         let occ_to_group = crate::stats::likelihood::iov_occ_to_k(&groups);
         let occ_sorted = sorted_occasions(&occ_to_group);
-        Self {
-            n_eta,
-            n_kappa,
-            groups,
-            occ_to_group,
-            occ_sorted,
-            nested: None,
-        }
+        Self { n_eta, n_kappa, groups, occ_to_group, occ_sorted, nested: None }
     }
 
     /// [`Self::new`], built once per fit for a registered subject
     /// ([`kernel_jit::prepared`](crate::parser::model_parser::rhs_regcode::kernel_jit::prepared)):
     /// the layout is a function of the subject and the two widths alone.
     pub(crate) fn new_cached(
-        n_eta: usize,
-        n_kappa: usize,
-        subject: &Subject,
+        n_eta: usize, n_kappa: usize, subject: &Subject,
     ) -> std::sync::Arc<Self> {
         crate::parser::model_parser::rhs_regcode::kernel_jit::prepared(
             subject,
@@ -182,8 +171,7 @@ impl StackedLayout {
     /// [`Self::sens_of`], built once per fit for a registered subject: a function of the subject
     /// and the model's widths and nested levels, which the model's identity fixes.
     pub(crate) fn sens_of_cached(
-        model: &CompiledModel,
-        subject: &Subject,
+        model: &CompiledModel, subject: &Subject,
     ) -> Option<std::sync::Arc<Self>> {
         let built = crate::parser::model_parser::rhs_regcode::kernel_jit::prepared(
             subject,
@@ -248,9 +236,8 @@ impl StackedLayout {
         }
         match &self.nested {
             Some(n) => {
-                let cells: Vec<&[f64]> = (0..self.n_groups())
-                    .map(|g| self.kappa(stacked, g))
-                    .collect();
+                let cells: Vec<&[f64]> =
+                    (0..self.n_groups()).map(|g| self.kappa(stacked, g)).collect();
                 n.compact(&stacked[..self.n_eta], &cells)
             }
             None => Some(stacked.to_vec()),
@@ -319,10 +306,7 @@ impl StackedLayout {
 
     /// The group of occasion label `occ`, or `None` for a label no group carries.
     pub(crate) fn group_of(&self, occ: u32) -> Option<usize> {
-        self.occ_sorted
-            .binary_search_by_key(&occ, |&(o, _)| o)
-            .ok()
-            .map(|i| self.occ_sorted[i].1)
+        self.occ_sorted.binary_search_by_key(&occ, |&(o, _)| o).ok().map(|i| self.occ_sorted[i].1)
     }
 
     /// Stacked index of group `g`'s first κ entry.
@@ -348,9 +332,7 @@ impl StackedLayout {
         if self.n_kappa == 0 {
             return Vec::new();
         }
-        stacked[self.n_eta.min(stacked.len())..]
-            .chunks(self.n_kappa)
-            .collect()
+        stacked[self.n_eta.min(stacked.len())..].chunks(self.n_kappa).collect()
     }
 
     /// The combined `[η_bsv, κ_g]` a record of group `g` sees.

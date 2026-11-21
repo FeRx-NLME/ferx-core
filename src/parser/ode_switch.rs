@@ -122,12 +122,7 @@ impl Walker<'_> {
         } else if key == "TAD" || key == "TAFD" {
             out.moves = true;
             out.params.extend(self.inputs.lag_params.iter().cloned());
-        } else if let Some(p) = self
-            .inputs
-            .params
-            .iter()
-            .find(|p| p.eq_ignore_ascii_case(n))
-        {
+        } else if let Some(p) = self.inputs.params.iter().find(|p| p.eq_ignore_ascii_case(n)) {
             out.params.insert(p.clone());
         }
     }
@@ -168,18 +163,10 @@ impl Walker<'_> {
             })
             .collect();
         let params: Vec<String> = r.params.iter().cloned().collect();
-        let i = match self
-            .found
-            .iter()
-            .position(|f| f.params == params && f.moves == r.moves)
-        {
+        let i = match self.found.iter().position(|f| f.params == params && f.moves == r.moves) {
             Some(i) => i,
             None => {
-                self.found.push(ConditionReads {
-                    params,
-                    moves: r.moves,
-                    leaves: Vec::new(),
-                });
+                self.found.push(ConditionReads { params, moves: r.moves, leaves: Vec::new() });
                 self.found.len() - 1
             }
         };
@@ -212,24 +199,15 @@ impl Walker<'_> {
                     self.inline_conditions(e);
                     let mut r = self.expr_reads(e);
                     r.merge(ctx);
-                    self.scope
-                        .entry(name.to_ascii_uppercase())
-                        .or_default()
-                        .merge(&r);
+                    self.scope.entry(name.to_ascii_uppercase()).or_default().merge(&r);
                 }
                 Statement::DiffEq(name, e) => {
                     self.inline_conditions(e);
                     let mut r = self.expr_reads(e);
                     r.merge(ctx);
-                    self.state_reads
-                        .entry(name.to_ascii_uppercase())
-                        .or_default()
-                        .merge(&r);
+                    self.state_reads.entry(name.to_ascii_uppercase()).or_default().merge(&r);
                 }
-                Statement::If {
-                    branches,
-                    else_body,
-                } => {
+                Statement::If { branches, else_body } => {
                     // Each arm is reached through every condition before it.
                     let mut arm_ctx = ctx.clone();
                     for (cond, body) in branches {
@@ -370,9 +348,7 @@ fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression)
     // One value per name, then the clock, which is not a name.
     let eval = |e: &Expression, x: &[f64]| {
         let vars: HashMap<String, f64> = names.iter().cloned().zip(x.iter().copied()).collect();
-        with_model_time(x[names.len()], || {
-            eval_expression(e, &[], &[], &vars, &vars, &[])
-        })
+        with_model_time(x[names.len()], || eval_expression(e, &[], &[], &vars, &vars, &[]))
     };
     let gap = |x: &[f64]| eval(l, x) - eval(r, x);
     let mut rng = StdRng::seed_from_u64(2649);
@@ -432,35 +408,26 @@ fn arms_agree_on_switch(c: &Condition, then_e: &Expression, else_e: &Expression)
 /// Every condition in the **unresolved** `[odes]` program `stmts` that an individual parameter
 /// reaches. A resolved program reports nothing, so call this before the slot rewrite.
 pub(super) fn conditions_reading_params(
-    stmts: &[Statement],
-    inputs: &SwitchInputs,
+    stmts: &[Statement], inputs: &SwitchInputs,
 ) -> Vec<ConditionReads> {
-    let mut w = Walker {
-        inputs,
-        scope: Scope::new(),
-        state_reads: Scope::new(),
-        found: Vec::new(),
-    };
+    let mut w =
+        Walker { inputs, scope: Scope::new(), state_reads: Scope::new(), found: Vec::new() };
     for s in inputs.states {
         let mut r = Reads::default();
         r.params.extend(inputs.dose_params.iter().cloned());
         w.state_reads.insert(s.to_ascii_uppercase(), r);
     }
     for (slot, params) in &inputs.forcing_params {
-        if let Some(r) = inputs
-            .states
-            .get(*slot)
-            .and_then(|s| w.state_reads.get_mut(&s.to_ascii_uppercase()))
+        if let Some(r) =
+            inputs.states.get(*slot).and_then(|s| w.state_reads.get_mut(&s.to_ascii_uppercase()))
         {
             r.params.extend(params.iter().cloned());
         }
     }
     for (slot, e) in inputs.inits {
         let r = w.expr_reads(e);
-        if let Some(reads) = inputs
-            .states
-            .get(*slot)
-            .and_then(|s| w.state_reads.get_mut(&s.to_ascii_uppercase()))
+        if let Some(reads) =
+            inputs.states.get(*slot).and_then(|s| w.state_reads.get_mut(&s.to_ascii_uppercase()))
         {
             reads.merge(&r);
         }
@@ -538,10 +505,7 @@ pub(super) fn instrument(stmts: &mut Vec<Statement>, leaves: &[String]) {
         let mut g = Vec::new();
         match &mut s {
             Statement::Assign(_, e) | Statement::DiffEq(_, e) => expr(e, leaves, &mut g),
-            Statement::If {
-                branches,
-                else_body,
-            } => {
+            Statement::If { branches, else_body } => {
                 for (c, body) in branches.iter_mut() {
                     cond(c, leaves, &mut g);
                     instrument(body, leaves);

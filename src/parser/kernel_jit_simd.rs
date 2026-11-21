@@ -106,9 +106,7 @@ pub(super) fn packs(f: &ir::Func, lanes: usize, rev: bool, prefix: usize) -> Opt
     let n = insts.len();
     // A host call runs on a queue its instructions fill in program order: left scalar.
     if lanes < 3
-        || insts
-            .iter()
-            .any(|i| matches!(i, Inst::Host(_) | Inst::HostArg(_) | Inst::HostOut(_)))
+        || insts.iter().any(|i| matches!(i, Inst::Host(_) | Inst::HostArg(_) | Inst::HostOut(_)))
     {
         return None;
     }
@@ -138,10 +136,7 @@ pub(super) fn packs(f: &ir::Func, lanes: usize, rev: bool, prefix: usize) -> Opt
     let mut members: Vec<[V; 2]> = Vec::new();
     let mut work: Vec<u32> = Vec::new();
     fn add(
-        of: &mut [Option<(u32, u8)>],
-        members: &mut Vec<[V; 2]>,
-        m: [V; 2],
-        work: &mut Vec<u32>,
+        of: &mut [Option<(u32, u8)>], members: &mut Vec<[V; 2]>, m: [V; 2], work: &mut Vec<u32>,
     ) {
         let p = members.len() as u32;
         of[m[0] as usize] = Some((p, 0));
@@ -284,11 +279,7 @@ pub(super) fn packs(f: &ir::Func, lanes: usize, rev: bool, prefix: usize) -> Opt
 /// A topological order of the nodes, each as early as its operands allow and in program order
 /// otherwise; `None` on a cycle (a pack that would have to come before itself).
 fn schedule(
-    insts: &[Inst],
-    of: &[Option<(u32, u8)>],
-    members: &[[V; 2]],
-    rev: bool,
-    prefix: usize,
+    insts: &[Inst], of: &[Option<(u32, u8)>], members: &[[V; 2]], rev: bool, prefix: usize,
 ) -> Option<Vec<Node>> {
     let n = insts.len();
     let np = members.len();
@@ -378,11 +369,7 @@ fn schedule(
     }
     for r in 0..2 {
         while let Some(Reverse((_, d))) = ready[r].pop() {
-            order.push(if d >= n {
-                Node::Pack((d - n) as u32)
-            } else {
-                Node::Scalar(d as V)
-            });
+            order.push(if d >= n { Node::Pack((d - n) as u32) } else { Node::Scalar(d as V) });
             for &s in &succs[d] {
                 indeg[s] -= 1;
                 if indeg[s] == 0 {

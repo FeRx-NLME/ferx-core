@@ -3,25 +3,7 @@ use crate::types::{MuTransform, Population};
 use nalgebra::DMatrix;
 use std::io::Write;
 
-const ADDITIVE_MODEL: &str = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+const ADDITIVE_MODEL: &str = crate::test_models::ONE_CPT_IV_19;
 
 fn model(src: &str) -> CompiledModel {
     crate::parser::model_parser::parse_model_string(src).expect("model parses")
@@ -47,18 +29,15 @@ fn pop_time_varying() -> Population {
     crate::io::datareader::read_nonmem_csv(f.path(), Some(&["CRCL"]), None).unwrap()
 }
 
-const CRCL_GRID: [f64; 12] = [
-    40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0,
-];
+const CRCL_GRID: [f64; 12] =
+    [40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0];
 
 fn diag_omega(vars: &[f64]) -> DMatrix<f64> {
     DMatrix::from_diagonal(&nalgebra::DVector::from_column_slice(vars))
 }
 
 fn only_group<'m>(
-    m: &'m CompiledModel,
-    pop: &Population,
-    omega: &DMatrix<f64>,
+    m: &'m CompiledModel, pop: &Population, omega: &DMatrix<f64>,
 ) -> CovariateMuGroup<'m> {
     let fixed = vec![false; m.theta_names.len()];
     let (mut groups, notes) = resolve_covariate_mu_groups(m, pop, &[], &fixed, omega);
@@ -71,16 +50,11 @@ fn only_group<'m>(
 /// `η_i = g(A_i(θ_true)) − g(A_i(θ_start))`, so the exact solver's optimum *is*
 /// θ_true and the test has a closed-form answer, not a tolerance story.
 fn planted_etas(
-    g: &CovariateMuGroup<'_>,
-    pop: &Population,
-    start: &[f64],
-    truth: &[f64],
+    g: &CovariateMuGroup<'_>, pop: &Population, start: &[f64], truth: &[f64],
 ) -> Vec<Vec<f64>> {
     let mu_s = g.members[0].mus(start, pop);
     let mu_t = g.members[0].mus(truth, pop);
-    (0..pop.subjects.len())
-        .map(|i| vec![mu_t[i] - mu_s[i], 0.0])
-        .collect()
+    (0..pop.subjects.len()).map(|i| vec![mu_t[i] - mu_s[i], 0.0]).collect()
 }
 
 /// [`ADDITIVE_MODEL`] with `TH_CRCL` also feeding bioavailability, so the
@@ -121,11 +95,7 @@ fn a_theta_the_rest_of_the_model_reads_keeps_the_data_term() {
     let omega = diag_omega(&[0.2, 0.1]);
     let free = vec![false; m.theta_names.len()];
     let (groups, notes) = resolve_covariate_mu_groups(&m, &pop, &[], &free, &omega);
-    assert_eq!(
-        groups.len(),
-        1,
-        "the group is still estimated, just differently"
-    );
+    assert_eq!(groups.len(), 1, "the group is still estimated, just differently");
     assert!(groups[0].needs_data_term);
     assert!(
         notes.iter().any(|n| n.contains("TH_CRCL")),
@@ -136,11 +106,7 @@ fn a_theta_the_rest_of_the_model_reads_keeps_the_data_term() {
     // exact engine stays available. Without this the check above is satisfied by
     // routing on the mere presence of a name in `shared_thetas`.
     let mut fixed = vec![false; m.theta_names.len()];
-    fixed[m
-        .theta_names
-        .iter()
-        .position(|t| t == "TH_CRCL")
-        .expect("TH_CRCL is declared")] = true;
+    fixed[m.theta_names.iter().position(|t| t == "TH_CRCL").expect("TH_CRCL is declared")] = true;
     let (groups, _) = resolve_covariate_mu_groups(&m, &pop, &[], &fixed, &omega);
     assert_eq!(groups.len(), 1);
     assert!(!groups[0].needs_data_term);
@@ -177,9 +143,7 @@ fn mu_is_log_of_the_typical_value_per_subject() {
     assert!((mus[0] - (120.0 + (40.0 - 90.0) * 1.4f64).ln()).abs() < 1e-12);
     assert!((mus[1] - (120.0 + (140.0 - 90.0) * 1.4f64).ln()).abs() < 1e-12);
     // A non-positive lognormal typical value is inadmissible, not log(1e-30).
-    assert!(g.members[0]
-        .mu(&[10.0, 2.0, 10.0], &pop.subjects[0])
-        .is_nan());
+    assert!(g.members[0].mu(&[10.0, 2.0, 10.0], &pop.subjects[0]).is_nan());
 }
 
 #[test]
@@ -231,19 +195,14 @@ fn exact_solver_leaves_a_fixed_theta_alone() {
     assert!(out[1] < 2.0, "the free slope compensates: {}", out[1]);
     // With every group theta FIXed there is nothing to solve.
     let all_fixed = [true, true, false];
-    let input2 = GroupStepInput {
-        theta_fixed: &all_fixed,
-        ..input
-    };
+    let input2 = GroupStepInput { theta_fixed: &all_fixed, ..input };
     assert!(g.solve_exact(&pop, &input2).is_none());
 }
 
 #[test]
 fn exact_solver_clamps_to_the_declared_bounds() {
-    let src = ADDITIVE_MODEL.replace(
-        "theta TH_CRCL(2.0, 0.0, 50.0)",
-        "theta TH_CRCL(0.5, 0.0, 1.0)",
-    );
+    let src =
+        ADDITIVE_MODEL.replace("theta TH_CRCL(2.0, 0.0, 50.0)", "theta TH_CRCL(0.5, 0.0, 1.0)");
     let m = model(&src);
     let pop = pop_with_crcl(&CRCL_GRID);
     let omega = diag_omega(&[0.2, 0.1]);
@@ -262,11 +221,7 @@ fn exact_solver_clamps_to_the_declared_bounds() {
         etas: &etas,
     };
     let out = g.solve_exact(&pop, &input).expect("solvable");
-    assert!(
-        out[1] <= 1.0 + 1e-12,
-        "slope must respect the bound: {}",
-        out[1]
-    );
+    assert!(out[1] <= 1.0 + 1e-12, "slope must respect the bound: {}", out[1]);
     assert!(out[1] > 0.99, "and sit at it: {}", out[1]);
 }
 
@@ -304,10 +259,7 @@ fn exact_solver_folds_the_block_omega_cross_term() {
     let g = only_group(&m, &pop, &omega);
     let w = omega.clone().try_inverse().unwrap();
     let c = w[(0, 1)] / w[(0, 0)];
-    assert!(
-        c.abs() > 0.1,
-        "the fixture must have a live cross term: {c}"
-    );
+    assert!(c.abs() > 0.1, "the fixture must have a live cross term: {c}");
     let start = [150.0, 2.0, 10.0];
     let truth = [120.0, 1.4, 10.0];
     let mu_s = g.members[0].mus(&start, &pop);
@@ -336,16 +288,9 @@ fn exact_solver_folds_the_block_omega_cross_term() {
     // so the assertion above cannot be satisfied by ignoring the cross term.
     let diag = diag_omega(&[0.2, 0.1]);
     let g2 = only_group(&m, &pop, &diag);
-    let input2 = GroupStepInput {
-        omega: &diag,
-        ..input
-    };
+    let input2 = GroupStepInput { omega: &diag, ..input };
     let out2 = g2.solve_exact(&pop, &input2).expect("solvable");
-    assert!(
-        (out2[1] - 1.4).abs() > 1e-3,
-        "control must differ: {}",
-        out2[1]
-    );
+    assert!((out2[1] - 1.4).abs() > 1e-3, "control must differ: {}", out2[1]);
 }
 
 /// The numerical engine's prior term must reproduce the exact engine when the
@@ -369,9 +314,7 @@ fn numerical_solver_matches_exact_when_the_data_term_is_constant() {
         omega: &omega,
         etas: &etas,
     };
-    let out = g
-        .solve_numerical(&pop, &input, 200, &|_theta, _shift| 0.0)
-        .expect("solvable");
+    let out = g.solve_numerical(&pop, &input, 200, &|_theta, _shift| 0.0).expect("solvable");
     assert!((out[0] - 120.0).abs() < 0.5, "TVCL = {}", out[0]);
     assert!((out[1] - 1.4).abs() < 0.01, "TH_CRCL = {}", out[1]);
 }
@@ -498,10 +441,7 @@ const ABSORBED_JOINT_NOTE: &str = "mu-references on ETA_CL (reads TVV1, TH_R, TH
 fn a_running_anchor_sharing_a_theta_joins_the_group() {
     let m = plain_anchor_collision_model();
     let pairs = estimator_pairs(&m);
-    assert!(
-        pairs.contains(&(0, 0)),
-        "premise: (TVV1, ETA_V1) is a declared pair, got {pairs:?}"
-    );
+    assert!(pairs.contains(&(0, 0)), "premise: (TVV1, ETA_V1) is a declared pair, got {pairs:?}");
     let pop = pop_with_wt_crcl(&wt_crcl_grid());
     let (groups, notes) =
         resolve_covariate_mu_groups(&m, &pop, &pairs, &[false; 3], &diag_omega(&[0.15, 0.2]));
@@ -538,10 +478,7 @@ fn the_absorbed_anchor_takes_the_joint_gls_step() {
     let etas: Vec<Vec<f64>> = (0..pop.subjects.len())
         .map(|i| {
             let x = i as f64;
-            vec![
-                0.3 * (x + 1.0).sin() + 0.1,
-                0.25 * (2.0 * x + 1.0).cos() - 0.2,
-            ]
+            vec![0.3 * (x + 1.0).sin() + 0.1, 0.25 * (2.0 * x + 1.0).cos() - 0.2]
         })
         .collect();
     // GLS over β = (log TVV1, log TH_R, TH_WT), rows (V1, CL), W = diag(1/ω²).
@@ -628,10 +565,7 @@ fn a_superseded_anchor_is_not_a_collision() {
 ",
     );
     let pairs = estimator_pairs(&m);
-    assert!(
-        pairs.contains(&(0, 0)),
-        "premise: (TVCL, ETA_CL) is a declared pair, got {pairs:?}"
-    );
+    assert!(pairs.contains(&(0, 0)), "premise: (TVCL, ETA_CL) is a declared pair, got {pairs:?}");
     let pop = pop_with_wt_crcl(&wt_crcl_grid());
     let (groups, notes) =
         resolve_covariate_mu_groups(&m, &pop, &pairs, &[false; 4], &diag_omega(&[0.15, 0.15]));
@@ -641,11 +575,9 @@ fn a_superseded_anchor_is_not_a_collision() {
     assert!(!groups[0].needs_data_term, "{notes:?}");
     assert_eq!(
         notes,
-        vec![
-            "covariate mu-references on ETA_CL (reads TVCL, TH_WT) and ETA_V1 (reads TVCL, \
+        vec!["covariate mu-references on ETA_CL (reads TVCL, TH_WT) and ETA_V1 (reads TVCL, \
              TH_R, TH_WTV) share TVCL and take one joint M-step that re-centres both (#1620)."
-                .to_string()
-        ]
+            .to_string()]
     );
 }
 
@@ -669,13 +601,11 @@ fn an_anchor_that_cannot_join_declines_the_group() {
     assert!(groups.is_empty(), "{notes:?}");
     assert_eq!(
         notes,
-        vec![
-            "covariate mu-reference on ETA_CL (typical value of CL reads TVV1, TH_R, TH_WT) is \
+        vec!["covariate mu-reference on ETA_CL (typical value of CL reads TVV1, TH_R, TH_WT) is \
              not used: TVV1 is also the mu-reference anchor of ETA_V1, whose random effect has \
              negligible variance (ω² < 1e-3), so the two cannot take one joint M-step; TVV1, \
              TH_R, TH_WT are estimated as if this mu-reference were absent (#619, #1630)."
-                .to_string()
-        ]
+            .to_string()]
     );
 
     let additive = anchor_collision_model("1.0", "TVV1 + ETA_V1");
@@ -901,11 +831,7 @@ fn an_anchor_left_out_of_the_group_keeps_the_data_term() {
         spec.read_outside_groups_and_anchors.is_empty(),
         "premise: the anchor-stopped walk sees no other route"
     );
-    assert_eq!(
-        spec.colliding_anchors.len(),
-        1,
-        "premise: the anchor is recorded"
-    );
+    assert_eq!(spec.colliding_anchors.len(), 1, "premise: the anchor is recorded");
     let pairs = estimator_pairs(&m);
     assert!(
         !pairs.iter().any(|&(_, e)| e == 0),
@@ -919,12 +845,10 @@ fn an_anchor_left_out_of_the_group_keeps_the_data_term() {
     assert!(groups[0].needs_data_term, "{notes:?}");
     assert_eq!(
         notes,
-        vec![
-            "covariate mu-reference on ETA_CL (reads TVV1, TH_R, TH_WT) keeps the observation \
+        vec!["covariate mu-reference on ETA_CL (reads TVV1, TH_R, TH_WT) keeps the observation \
              term in its M-step: TVV1 also appear(s) elsewhere in the model, so freezing the \
              individual parameter does not make the data independent of them (#619)."
-                .to_string()
-        ]
+            .to_string()]
     );
 }
 
@@ -943,18 +867,10 @@ fn resolve_drops_weak_iiv_and_all_fixed_groups() {
     assert_eq!(notes.len(), 1);
     assert!(notes[0].contains("negligible variance"), "{}", notes[0]);
 
-    let (groups, notes) = resolve_covariate_mu_groups(
-        &m,
-        &pop,
-        &[],
-        &[true, true, false],
-        &diag_omega(&[0.2, 0.1]),
-    );
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&m, &pop, &[], &[true, true, false], &diag_omega(&[0.2, 0.1]));
     assert!(groups.is_empty());
-    assert!(
-        notes.is_empty(),
-        "an all-FIX group is silently inert: {notes:?}"
-    );
+    assert!(notes.is_empty(), "an all-FIX group is silently inert: {notes:?}");
 }
 
 #[test]
@@ -986,10 +902,7 @@ fn logit_group_mu_is_the_typical_value_itself() {
     let g = only_group(&m, &pop, &diag_omega(&[0.09, 0.04]));
     assert_eq!(g.members[0].eta_idx, 1);
     let mu = g.members[0].mu(&[1.0, 0.4, 0.5], &pop.subjects[0]);
-    assert!(
-        (mu - 0.9).abs() < 1e-12,
-        "logit-scale mu = LOGIT_F + TH_SEX·CRCL: {mu}"
-    );
+    assert!((mu - 0.9).abs() < 1e-12, "logit-scale mu = LOGIT_F + TH_SEX·CRCL: {mu}");
 }
 
 // ── #918 review follow-ups ───────────────────────────────────────────────────
@@ -1029,10 +942,7 @@ const SHARED_ETA_MODEL: &str = r"
 fn an_eta_a_second_typical_value_reads_keeps_the_data_term() {
     let shared = model(SHARED_ETA_MODEL);
     assert_eq!(shared.covariate_mu_refs.len(), 1, "the group survives");
-    assert!(
-        shared.covariate_mu_refs[0].eta_shared,
-        "ETA_CL is read by V as well"
-    );
+    assert!(shared.covariate_mu_refs[0].eta_shared, "ETA_CL is read by V as well");
 
     let pop = pop_with_crcl(&CRCL_GRID);
     let free = vec![false; shared.theta_names.len()];
@@ -1049,10 +959,7 @@ fn an_eta_a_second_typical_value_reads_keeps_the_data_term() {
     );
 
     let control = model(ADDITIVE_MODEL);
-    assert!(
-        !control.covariate_mu_refs[0].eta_shared,
-        "V has its own ETA_V there"
-    );
+    assert!(!control.covariate_mu_refs[0].eta_shared, "V has its own ETA_V there");
     let g = only_group(&control, &pop, &diag_omega(&[0.2, 0.1]));
     assert!(!g.needs_data_term, "control still takes the exact engine");
 }
@@ -1095,11 +1002,7 @@ fn can_step_agrees_with_both_engines_returning_none() {
             omega: &omega,
             etas: &e,
         };
-        assert_eq!(
-            g.can_step(&t, &pop, &fixed),
-            want,
-            "[{label}] can_step disagreed"
-        );
+        assert_eq!(g.can_step(&t, &pop, &fixed), want, "[{label}] can_step disagreed");
         assert_eq!(
             g.solve_exact(&pop, &input).is_some(),
             want,
@@ -1158,9 +1061,7 @@ fn numerical_solver_returns_the_best_evaluated_point() {
         seen_ref.borrow_mut().push(theta.to_vec());
         1e3 * ((theta[1] - 1.2) * (theta[1] - 1.2) + 0.001 * (theta[0] - 120.0).abs())
     };
-    let out = g
-        .solve_numerical(&pop, &input, 50, &data)
-        .expect("solvable");
+    let out = g.solve_numerical(&pop, &input, 50, &data).expect("solvable");
     let evaluated = seen.into_inner();
     assert!(
         evaluated.len() > 2,
@@ -1169,9 +1070,7 @@ fn numerical_solver_returns_the_best_evaluated_point() {
     );
     // The returned point must be one of the evaluated ones …
     assert!(
-        evaluated
-            .iter()
-            .any(|t| (t[0] - out[0]).abs() < 1e-9 && (t[1] - out[1]).abs() < 1e-9),
+        evaluated.iter().any(|t| (t[0] - out[0]).abs() < 1e-9 && (t[1] - out[1]).abs() < 1e-9),
         "returned θ = ({}, {}) was never evaluated",
         out[0],
         out[1]
@@ -1203,9 +1102,7 @@ fn pop_with_wt_crcl(rows: &[(f64, f64)]) -> Population {
     let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT,CRCL\n");
     for (i, (wt, crcl)) in rows.iter().enumerate() {
         let id = i + 1;
-        csv.push_str(&format!(
-            "{id},0,0,100,1,1,{wt},{crcl}\n{id},1,5.0,0,0,1,{wt},{crcl}\n"
-        ));
+        csv.push_str(&format!("{id},0,0,100,1,1,{wt},{crcl}\n{id},1,5.0,0,0,1,{wt},{crcl}\n"));
     }
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(csv.as_bytes()).unwrap();
@@ -1213,13 +1110,11 @@ fn pop_with_wt_crcl(rows: &[(f64, f64)]) -> Population {
 }
 
 fn wt_crcl_grid() -> Vec<(f64, f64)> {
-    [
-        50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, 110.0,
-    ]
-    .iter()
-    .zip(CRCL_GRID.iter())
-    .map(|(&w, &c)| (w, c))
-    .collect()
+    [50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, 110.0]
+        .iter()
+        .zip(CRCL_GRID.iter())
+        .map(|(&w, &c)| (w, c))
+        .collect()
 }
 
 /// The `[individual_parameters]` of `examples/two_cpt_oral_cov.ferx` on a
@@ -1418,10 +1313,7 @@ fn a_joint_member_with_a_shared_eta_keeps_its_note() {
 fn group_etas_lists_every_member() {
     let pop = pop_with_wt_crcl(&wt_crcl_grid());
     let m = shared_wt_model("", "");
-    assert!(
-        m.mu_refs.contains_key("ETA_V1"),
-        "premise: V1 also has a single-anchor pair"
-    );
+    assert!(m.mu_refs.contains_key("ETA_V1"), "premise: V1 also has a single-anchor pair");
     let (groups, _) =
         resolve_covariate_mu_groups(&m, &pop, &[], &[false; 4], &diag_omega(&[0.15, 0.15]));
     assert_eq!(group_etas(&groups), vec![0, 1]);
@@ -1586,9 +1478,7 @@ fn numerical_multi_passes_every_members_shift() {
                 let want = mu_old[m][i] - mu_new[m][i];
                 let got = shift.get(i).copied().unwrap_or(f64::NAN);
                 if !((got - want).abs() < 1e-12) {
-                    wrong.replace(Some(format!(
-                        "member {m}, subject {i}: shift {got} vs {want}"
-                    )));
+                    wrong.replace(Some(format!("member {m}, subject {i}: shift {got} vs {want}")));
                 }
                 moved.set(moved.get() || want.abs() > 1e-3);
             }
@@ -1596,9 +1486,7 @@ fn numerical_multi_passes_every_members_shift() {
         calls.set(calls.get() + 1);
         0.0
     };
-    let out = g
-        .solve_numerical(&pop, &input, 200, &data)
-        .expect("solvable");
+    let out = g.solve_numerical(&pop, &input, 200, &data).expect("solvable");
     assert!(calls.get() > 2, "the data term must have been evaluated");
     assert_eq!(wrong.into_inner(), None);
     assert!(moved.get(), "premise: the search left the start");

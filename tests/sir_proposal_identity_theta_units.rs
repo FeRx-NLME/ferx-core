@@ -91,10 +91,7 @@ fn sir_intervals_do_not_move_with_an_identity_thetas_units() {
             NAMES[i]
         );
     }
-    assert!(
-        ess_ref.is_finite() && ess_ref > 10.0,
-        "k = 1: ESS {ess_ref}"
-    );
+    assert!(ess_ref.is_finite() && ess_ref > 10.0, "k = 1: ESS {ess_ref}");
     for k in [1e5, 1e6, 3e-6] {
         let (ci, ess) = sir_run(k);
         assert!(ess.is_finite(), "k = {k}: ESS {ess}");
@@ -103,11 +100,7 @@ fn sir_intervals_do_not_move_with_an_identity_thetas_units() {
         let mut worst = ((ess - ess_ref) / ess_ref).abs();
         eprintln!("k = {k:e}: ESS {ess:.6} vs k = 1 {ess_ref:.6}");
         for (i, ((lo, hi), (rlo, rhi))) in ci.iter().zip(&reference).enumerate() {
-            assert!(
-                lo.is_finite() && hi.is_finite(),
-                "k = {k}: CI({}) = [{lo}, {hi}]",
-                NAMES[i]
-            );
+            assert!(lo.is_finite() && hi.is_finite(), "k = {k}: CI({}) = [{lo}, {hi}]", NAMES[i]);
             let rel = ((lo - rlo).abs() / rlo.abs()).max((hi - rhi).abs() / rhi.abs());
             eprintln!(
                 "k = {k:e}: CI({}) = [{lo:.6}, {hi:.6}] vs k = 1 [{rlo:.6}, {rhi:.6}], rel {rel:.2e}",

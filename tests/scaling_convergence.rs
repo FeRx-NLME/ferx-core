@@ -63,10 +63,7 @@ fn expression_scale_matches_nonmem() {
     let model = parse_model_file(Path::new("examples/warfarin_exprscale_additive.ferx"))
         .expect("expression-scaled model must parse");
     assert!(
-        matches!(
-            model.scaling,
-            ferx_core::ScalingSpec::ExpressionScale { deriv: Some(_), .. }
-        ),
+        matches!(model.scaling, ferx_core::ScalingSpec::ExpressionScale { deriv: Some(_), .. }),
         "model must carry a differentiable ExpressionScale program"
     );
     let population = read_nonmem_csv(Path::new("tests/nonmem/warfarin_scaled.csv"), None, None)
@@ -90,21 +87,13 @@ fn expression_scale_matches_nonmem() {
     const NM_TVV: f64 = 7.72787;
     const NM_TVKA: f64 = 0.810919;
     const NM_ADD_SD: f64 = 0.0086872;
-    assert!(
-        (r.ofv - NM_OFV).abs() < 0.1,
-        "OFV {:.4} vs NONMEM {NM_OFV:.4}",
-        r.ofv
-    );
+    assert!((r.ofv - NM_OFV).abs() < 0.1, "OFV {:.4} vs NONMEM {NM_OFV:.4}", r.ofv);
     assert!(rel(r.theta[0], NM_TVCL) < 0.01, "TVCL {}", r.theta[0]);
     assert!(rel(r.theta[1], NM_TVV) < 0.01, "TVV {}", r.theta[1]);
     assert!(rel(r.theta[2], NM_TVKA) < 0.02, "TVKA {}", r.theta[2]);
     assert!(rel(r.sigma[0], NM_ADD_SD) < 0.02, "ADD {}", r.sigma[0]);
     // TVSCALE stays fixed at its declared value.
-    assert!(
-        (r.theta[3] - 10.0).abs() < 1e-9,
-        "TVSCALE must stay fixed at 10, got {}",
-        r.theta[3]
-    );
+    assert!((r.theta[3] - 10.0).abs() < 1e-9, "TVSCALE must stay fixed at 10, got {}", r.theta[3]);
 }
 
 /// The analytic scaling path converges and the gradient-based (analytic
@@ -113,10 +102,7 @@ fn expression_scale_matches_nonmem() {
 /// estimates as a regression guard; the NONMEM cross-check is the documented
 /// hand-off above.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn scaling_obs_scale_additive_converges_and_agrees() {
     let model = parse_model_file(Path::new("examples/warfarin_scaled_additive.ferx"))
         .expect("scaled additive model must parse");
@@ -146,35 +132,15 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
     // leaves it just above tolerance on warfarin's flat KA ridge. Substantive
     // convergence is asserted below via the OFV/estimate match (anchored to ferx
     // and, independently, to the gradient-free BOBYQA optimizer).
-    assert!(
-        lbfgs.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        lbfgs.ofv
-    );
+    assert!(lbfgs.ofv.is_finite(), "OFV must be finite, got {}", lbfgs.ofv);
 
     // ferx self-consistency anchor (analytic L-BFGS path).
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
     assert!(rel(lbfgs.ofv, -740.838).abs() < 0.01, "OFV {}", lbfgs.ofv);
-    assert!(
-        rel(lbfgs.theta[0], 0.132956) < 0.02,
-        "TVCL {}",
-        lbfgs.theta[0]
-    );
-    assert!(
-        rel(lbfgs.theta[1], 7.72748) < 0.02,
-        "TVV {}",
-        lbfgs.theta[1]
-    );
-    assert!(
-        rel(lbfgs.theta[2], 0.810476) < 0.05,
-        "TVKA {}",
-        lbfgs.theta[2]
-    );
-    assert!(
-        rel(lbfgs.sigma[0], 0.008687) < 0.05,
-        "ADD {}",
-        lbfgs.sigma[0]
-    );
+    assert!(rel(lbfgs.theta[0], 0.132956) < 0.02, "TVCL {}", lbfgs.theta[0]);
+    assert!(rel(lbfgs.theta[1], 7.72748) < 0.02, "TVV {}", lbfgs.theta[1]);
+    assert!(rel(lbfgs.theta[2], 0.810476) < 0.05, "TVKA {}", lbfgs.theta[2]);
+    assert!(rel(lbfgs.sigma[0], 0.008687) < 0.05, "ADD {}", lbfgs.sigma[0]);
 
     // The gradient-free path sees the same scaled objective: OFV agrees and
     // the well-determined θ (CL, V) match; TVKA sits on a flat ridge (≈58% CV),
@@ -191,16 +157,8 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
         .expect("BOBYQA scaled fit must succeed");
     // The two arms must be two different optimizers, or the agreement below is
     // L-BFGS against itself.
-    assert_eq!(
-        def.optimizer, "bobyqa",
-        "the gradient-free arm must run BOBYQA"
-    );
-    assert!(
-        (lbfgs.ofv - def.ofv).abs() < 0.5,
-        "OFV L-BFGS {} vs BOBYQA {}",
-        lbfgs.ofv,
-        def.ofv
-    );
+    assert_eq!(def.optimizer, "bobyqa", "the gradient-free arm must run BOBYQA");
+    assert!((lbfgs.ofv - def.ofv).abs() < 0.5, "OFV L-BFGS {} vs BOBYQA {}", lbfgs.ofv, def.ofv);
     assert!(
         rel(lbfgs.theta[0], def.theta[0]) < 0.02,
         "TVCL L-BFGS {} vs BOBYQA {}",
@@ -226,45 +184,13 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
     const NM_OM_V: f64 = 0.00947183;
     const NM_OM_KA: f64 = 0.335508;
 
-    assert!(
-        (lbfgs.ofv - NM_OFV).abs() < 0.1,
-        "OFV {:.4} vs NONMEM {NM_OFV:.4}",
-        lbfgs.ofv
-    );
-    assert!(
-        rel(lbfgs.theta[0], NM_TVCL) < 0.01,
-        "TVCL {} vs NM {NM_TVCL}",
-        lbfgs.theta[0]
-    );
-    assert!(
-        rel(lbfgs.theta[1], NM_TVV) < 0.01,
-        "TVV {} vs NM {NM_TVV}",
-        lbfgs.theta[1]
-    );
-    assert!(
-        rel(lbfgs.theta[2], NM_TVKA) < 0.02,
-        "TVKA {} vs NM {NM_TVKA}",
-        lbfgs.theta[2]
-    );
-    assert!(
-        rel(lbfgs.sigma[0], NM_ADD_SD) < 0.02,
-        "ADD {} vs NM {NM_ADD_SD}",
-        lbfgs.sigma[0]
-    );
+    assert!((lbfgs.ofv - NM_OFV).abs() < 0.1, "OFV {:.4} vs NONMEM {NM_OFV:.4}", lbfgs.ofv);
+    assert!(rel(lbfgs.theta[0], NM_TVCL) < 0.01, "TVCL {} vs NM {NM_TVCL}", lbfgs.theta[0]);
+    assert!(rel(lbfgs.theta[1], NM_TVV) < 0.01, "TVV {} vs NM {NM_TVV}", lbfgs.theta[1]);
+    assert!(rel(lbfgs.theta[2], NM_TVKA) < 0.02, "TVKA {} vs NM {NM_TVKA}", lbfgs.theta[2]);
+    assert!(rel(lbfgs.sigma[0], NM_ADD_SD) < 0.02, "ADD {} vs NM {NM_ADD_SD}", lbfgs.sigma[0]);
     let om: Vec<f64> = (0..3).map(|i| lbfgs.omega[(i, i)]).collect();
-    assert!(
-        rel(om[0], NM_OM_CL) < 0.05,
-        "ω²(CL) {} vs NM {NM_OM_CL}",
-        om[0]
-    );
-    assert!(
-        rel(om[1], NM_OM_V) < 0.05,
-        "ω²(V) {} vs NM {NM_OM_V}",
-        om[1]
-    );
-    assert!(
-        rel(om[2], NM_OM_KA) < 0.05,
-        "ω²(KA) {} vs NM {NM_OM_KA}",
-        om[2]
-    );
+    assert!(rel(om[0], NM_OM_CL) < 0.05, "ω²(CL) {} vs NM {NM_OM_CL}", om[0]);
+    assert!(rel(om[1], NM_OM_V) < 0.05, "ω²(V) {} vs NM {NM_OM_V}", om[1]);
+    assert!(rel(om[2], NM_OM_KA) < 0.05, "ω²(KA) {} vs NM {NM_OM_KA}", om[2]);
 }

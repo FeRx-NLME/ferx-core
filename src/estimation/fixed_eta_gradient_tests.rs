@@ -18,47 +18,21 @@ use crate::types::GradientMethod;
 #[test]
 fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
     use crate::types::{DoseEvent, Population};
-    use std::collections::HashMap;
 
     let model = analytical_model(GradientMethod::Auto);
 
     let make_subj = |id: &str, obs: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![obs, obs * 0.6, obs * 0.3],
         obs_cmts: vec![1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let population = Population {
-        subjects: vec![
-            make_subj("1", 8.0),
-            make_subj("2", 5.0),
-            make_subj("3", 11.0),
-        ],
+        subjects: vec![make_subj("1", 8.0), make_subj("2", 5.0), make_subj("3", 11.0)],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: vec![],
@@ -120,12 +94,7 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
         }
     }
 
-    assert!(
-        (total_nll - f0).abs() < 1e-10,
-        "nll mismatch: {} vs {}",
-        total_nll,
-        f0
-    );
+    assert!((total_nll - f0).abs() < 1e-10, "nll mismatch: {} vs {}", total_nll, f0);
 
     for j in 0..n {
         let rel = if ref_grad[j].abs() > 1e-10 {
@@ -151,106 +120,39 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
 #[test]
 fn obs_nll_subject_grad_iov_matches_fd() {
     use crate::types::{
-        BloqMethod, CompiledModel, DoseEvent, ErrorModel, ErrorSpec, GradientMethod,
-        ModelParameters, OmegaMatrix, PkModel, PkParams, ScalingSpec, SigmaVector, Subject,
+        CompiledModel, DoseEvent, ErrorModel, ErrorSpec, ModelParameters, OmegaMatrix, PkParams,
+        Subject,
     };
     use std::collections::HashMap;
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "iov_grad_test".into(),
-        pk_model: PkModel::OneCptIv,
-        error_model: ErrorModel::Proportional,
         error_spec: ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-                p.values[0] = theta[0] * (eta[0] + kappa).exp();
-                p.values[1] = theta[1];
-                p
-            },
-        ),
-        n_theta: 2,
-        n_eta: 1,
-        n_epsilon: 1,
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+            p.values[0] = theta[0] * (eta[0] + kappa).exp();
+            p.values[1] = theta[1];
+            p
+        }),
         n_kappa: 1,
         kappa_names: vec!["KAPPA_CL".into()],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        eta_names: vec!["ETA_CL".into()],
-        indiv_param_names: vec!["CL".into(), "V".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        default_params: ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            theta: vec![5.0, 50.0],
-            theta_names: vec!["TVCL".into(), "TVV".into()],
-            theta_lower: vec![0.1, 5.0],
-            theta_upper: vec![50.0, 500.0],
-            theta_fixed: vec![false; 2],
-            omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![0.05],
-                names: vec!["PROP_ERR".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
-            kappa_fixed: vec![false],
-            mixture: None,
-        },
-        omega_init_as_sd: vec![false],
-        sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
-        eta_map: vec![0],
-        pk_idx_f64: vec![0.0, 1.0],
-        sel_flat: vec![1.0, 0.0],
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
         derived_exprs: Vec::new(),
         output_columns: Vec::new(),
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(ModelParameters {
+            omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
+            kappa_fixed: vec![false],
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[0.09],
+                vec!["ETA_CL".into()],
+            ))
+        })
     };
 
     // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -260,27 +162,10 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         obs_raw_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         observations: vec![36.0, 28.0, 21.0, 34.0, 26.0, 19.0],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: Vec::new(),
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let theta = vec![5.0f64, 50.0];
@@ -308,15 +193,8 @@ fn obs_nll_subject_grad_iov_matches_fd() {
     );
 
     // Reference: forward-FD of obs_nll_subject_into_iov in log-packed space.
-    let f0 = obs_nll_subject_into_iov(
-        &model,
-        &subject,
-        &theta,
-        &sigma,
-        &eta,
-        &kappas,
-        &mut scratch,
-    );
+    let f0 =
+        obs_nll_subject_into_iov(&model, &subject, &theta, &sigma, &eta, &kappas, &mut scratch);
     assert!((nll - f0).abs() < 1e-10, "nll mismatch: {nll} vs {f0}");
 
     let h = 1e-6;
@@ -361,7 +239,6 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 fn obs_nll_subject_grad_per_cmt_matches_fd() {
     use crate::parser::model_parser::parse_model_string;
     use crate::types::{DoseEvent, Population};
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -398,11 +275,9 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
 
     // obs at CMT=1 (PK) and CMT=2 (PD), interleaved.
     let make_subj = |id: &str, scale: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
-        obs_raw_times: Vec::new(),
         observations: vec![
             8.0 * scale,
             2.0 * scale,
@@ -412,27 +287,8 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
             3.5 * scale,
         ],
         obs_cmts: vec![1, 2, 1, 2, 1, 2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
@@ -494,10 +350,7 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
         }
     }
 
-    assert!(
-        (total_nll - f0).abs() < 1e-8,
-        "nll mismatch: {total_nll} vs {f0}"
-    );
+    assert!((total_nll - f0).abs() < 1e-8, "nll mismatch: {total_nll} vs {f0}");
     for j in 0..n {
         let rel = if ref_grad[j].abs() > 1e-8 {
             (total_grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
@@ -522,7 +375,6 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
 fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     use crate::parser::model_parser::parse_model_string;
     use crate::types::{DoseEvent, Population};
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -557,34 +409,13 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     .expect("cross-endpoint block_sigma ODE model parses");
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0],
-        obs_raw_times: Vec::new(),
         observations: vec![17.0, 8.0, 15.0, 7.0],
         obs_cmts: vec![1, 2, 1, 2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject.clone()],
@@ -722,12 +553,7 @@ fn assert_magnitude_takes_the_exact_score(model: &CompiledModel, theta: &[f64], 
     let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
     for i in 0..n {
         // Measured below 1e-5 of the row: the quotient's forward-step truncation.
-        assert!(
-            (g_e[i] - g_f[i]).abs() < 1e-4 * scale,
-            "[{i}] {} vs {}",
-            g_e[i],
-            g_f[i]
-        );
+        assert!((g_e[i] - g_f[i]).abs() < 1e-4 * scale, "[{i}] {} vs {}", g_e[i], g_f[i]);
     }
 }
 
@@ -786,15 +612,7 @@ fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_value
     use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
     for fail in [false, true] {
         FORCE_PLAN_FAIL.set(fail);
-        check_saem_mstep_score(
-            model,
-            &population,
-            theta,
-            sigma_values,
-            &etas,
-            f0,
-            &ref_grad,
-        );
+        check_saem_mstep_score(model, &population, theta, sigma_values, &etas, f0, &ref_grad);
         FORCE_PLAN_FAIL.set(false);
     }
 }
@@ -802,13 +620,8 @@ fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_value
 /// [`check_saem_mstep_matches_fd`]'s comparison of the M-step `(nll, grad)` against `f0` and
 /// its forward difference `ref_grad`.
 fn check_saem_mstep_score(
-    model: &CompiledModel,
-    population: &crate::types::Population,
-    theta: &[f64],
-    sigma_values: &[f64],
-    etas: &[Vec<f64>],
-    f0: f64,
-    ref_grad: &[f64],
+    model: &CompiledModel, population: &crate::types::Population, theta: &[f64],
+    sigma_values: &[f64], etas: &[Vec<f64>], f0: f64, ref_grad: &[f64],
 ) {
     let (n_theta, n_sigma) = (theta.len(), sigma_values.len());
     let n = n_theta + n_sigma;
@@ -863,26 +676,8 @@ fn check_saem_mstep_score(
 /// rule stays exact once V / ∂V∂f / ∂V∂logσ take their `_scaled` forms.
 #[test]
 fn obs_nll_subject_grad_weighted_error_matches_fd() {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP_ERR ~ 0.10 (sd)
-  sigma ADD_ERR  ~ 0.50 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE
-[covariates]
-  WPSE continuous
-",
-    )
-    .expect("weighted model parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_14)
+        .expect("weighted model parses");
     assert!(model.has_custom_ruv_magnitude());
     assert!(
         !model.has_theta_dependent_ruv_magnitude(),
@@ -978,13 +773,8 @@ fn obs_nll_subject_grad_power_exponent_matches_fd() {
 /// observed Hessian of `obs_nll_sum` equals the expected information exactly.
 /// Returns the subject.
 fn paired_residual_subject(
-    model: &CompiledModel,
-    id: &str,
-    doses: Vec<DoseEvent>,
-    times: &[f64],
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, id: &str, doses: Vec<DoseEvent>, times: &[f64], theta: &[f64],
+    sigma_values: &[f64], eta: &[f64],
 ) -> Subject {
     use crate::types::Subject;
     // First pass: predictions at the *paired* times, with placeholder DVs.
@@ -1019,12 +809,8 @@ fn paired_residual_subject(
 /// Central-difference Hessian of `obs_nll_sum` in the packed
 /// `[log θ | log σ]` space, row-major `n × n`.
 fn fd_packed_hessian(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    sigma_values: &[f64],
-    etas: &[Vec<f64>],
-    h: f64,
+    model: &CompiledModel, population: &Population, theta: &[f64], sigma_values: &[f64],
+    etas: &[Vec<f64>], h: f64,
 ) -> Vec<f64> {
     let n_theta = theta.len();
     let n_sigma = sigma_values.len();
@@ -1159,10 +945,7 @@ fn fisher_information_matches_the_observed_hessian_on_paired_residuals() {
     // against an all-zero Hessian, and a fixture whose cross block is dead
     // cannot see a missing variance channel.
     let scale = href.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    assert!(
-        scale > 1.0,
-        "reference Hessian is degenerate: max {scale:.3e}"
-    );
+    assert!(scale > 1.0, "reference Hessian is degenerate: max {scale:.3e}");
     for a in 0..n {
         assert!(
             info[a * n + a].abs() > 1e-6 * scale,
@@ -1256,21 +1039,14 @@ fn fisher_information_is_symmetric_and_psd() {
     let fi = fi.expect("in scope");
     for a in 0..n {
         for b in 0..n {
-            assert_eq!(
-                fi[a * n + b],
-                fi[b * n + a],
-                "information is not symmetric at ({a},{b})"
-            );
+            assert_eq!(fi[a * n + b], fi[b * n + a], "information is not symmetric at ({a},{b})");
         }
     }
     let m = nalgebra::DMatrix::from_fn(n, n, |a, b| fi[a * n + b]);
     let eig = m.symmetric_eigenvalues();
     let min = eig.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let max = eig.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-    assert!(
-        max > 1.0,
-        "degenerate fixture: largest eigenvalue {max:.3e}"
-    );
+    assert!(max > 1.0, "degenerate fixture: largest eigenvalue {max:.3e}");
     assert!(
         min > -1e-8 * max,
         "information is not PSD: smallest eigenvalue {min:.3e} against largest {max:.3e}"
@@ -1346,26 +1122,8 @@ fn fisher_information_zeroes_a_pinned_coordinate() {
 #[test]
 fn fisher_information_is_withheld_outside_the_gaussian_scope() {
     use crate::types::DoseEvent;
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP_ERR ~ 0.10 (sd)
-  sigma ADD_ERR  ~ 0.50 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE
-[covariates]
-  WPSE continuous
-",
-    )
-    .expect("magnitude fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_14)
+        .expect("magnitude fixture parses");
     assert!(model.has_custom_ruv_magnitude());
     let theta = vec![1.0f64, 10.0];
     let sigma_values = vec![0.10f64, 0.50];
@@ -1404,10 +1162,7 @@ fn fisher_information_is_withheld_outside_the_gaussian_scope() {
         n_sigma,
         &mut scratch,
     );
-    assert!(
-        fi.is_none(),
-        "a residual magnitude must withhold the information"
-    );
+    assert!(fi.is_none(), "a residual magnitude must withhold the information");
     assert!(nll.is_finite(), "the objective is still returned");
     let (nll_plain, grad_plain) = obs_nll_subject_grad(
         &model,
@@ -1423,10 +1178,7 @@ fn fisher_information_is_withheld_outside_the_gaussian_scope() {
         &mut scratch,
     );
     assert_eq!(nll, nll_plain);
-    assert_eq!(
-        grad, grad_plain,
-        "the gradient must be the same one entry point"
-    );
+    assert_eq!(grad, grad_plain, "the gradient must be the same one entry point");
 }
 
 fn subject_eta() -> Vec<f64> {
@@ -1568,11 +1320,7 @@ fn obs_nll_subject_grad_sees_a_correlation_rho() {
     );
     assert!(want.is_finite() && grad[2].is_finite());
     assert!(want.abs() > 1e-2, "fixture: ρ moves the objective ({want})");
-    assert!(
-        (grad[2] - want).abs() <= 1e-4 * want.abs(),
-        "∂NLL/∂ρ: {} vs FD {want}",
-        grad[2]
-    );
+    assert!((grad[2] - want).abs() <= 1e-4 * want.abs(), "∂NLL/∂ρ: {} vs FD {want}", grad[2]);
 }
 
 /// A FREM model with a **free** covariate σ (`EPSCOV`) and a separate PK σ
@@ -1580,11 +1328,8 @@ fn obs_nll_subject_grad_sees_a_correlation_rho() {
 /// PK observations, `EPSCOV` on the covariate pseudo-observations. `iov` adds a
 /// κ on CL for the IOV-path twin.
 fn frem_free_cov_sigma_model(iov: bool) -> CompiledModel {
-    let (kappa, kappa_term) = if iov {
-        ("  kappa KAPPA_CL ~ 0.04\n", " + KAPPA_CL")
-    } else {
-        ("", "")
-    };
+    let (kappa, kappa_term) =
+        if iov { ("  kappa KAPPA_CL ~ 0.04\n", " + KAPPA_CL") } else { ("", "") };
     crate::parser::model_parser::parse_model_string(&format!(
         "[parameters]\n  theta TVCL(1.5, 0.1, 10.0)\n  theta TVV(20.0, 1.0, 100.0)\n  \
          theta TV_WT(70.0, 1.0, 200.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_WT_FREM ~ 100.0\n\
@@ -1607,15 +1352,11 @@ fn with_frem_rows(mut subject: Subject, dvs: &[f64]) -> Subject {
     subject.fremtype.extend(std::iter::repeat_n(0u16, n_pk));
     subject.obs_times.splice(0..0, std::iter::repeat_n(0.0, n));
     subject.observations.splice(0..0, dvs.iter().copied());
-    subject
-        .obs_cmts
-        .splice(0..0, std::iter::repeat_n(1usize, n));
+    subject.obs_cmts.splice(0..0, std::iter::repeat_n(1usize, n));
     subject.cens.splice(0..0, std::iter::repeat_n(0, n));
     if !subject.occasions.is_empty() {
         let first = subject.occasions[0];
-        subject
-            .occasions
-            .splice(0..0, std::iter::repeat_n(first, n));
+        subject.occasions.splice(0..0, std::iter::repeat_n(first, n));
     }
     assert!(
         subject.obs_raw_times.is_empty() && subject.obs_covariates.is_empty(),
@@ -1630,15 +1371,9 @@ fn with_frem_rows(mut subject: Subject, dvs: &[f64]) -> Subject {
 fn assert_grad_close(grad: &[f64], want: &[f64], tol: f64, what: &str) -> f64 {
     let mut worst = 0.0f64;
     for (j, (&g, &w)) in grad.iter().zip(want).enumerate() {
-        assert!(
-            g.is_finite() && w.is_finite(),
-            "{what} grad[{j}]: {g} vs {w}"
-        );
+        assert!(g.is_finite() && w.is_finite(), "{what} grad[{j}]: {g} vs {w}");
         let err = (g - w).abs() / w.abs().max(1e-8);
-        assert!(
-            err < tol,
-            "{what} grad[{j}]: analytic={g:.6e}, fd={w:.6e}, rel={err:.2e}"
-        );
+        assert!(err < tol, "{what} grad[{j}]: analytic={g:.6e}, fd={w:.6e}, rel={err:.2e}");
         worst = worst.max(err);
     }
     eprintln!("{what}: worst relative error {worst:.3e}");
@@ -1878,10 +1613,7 @@ fn obs_nll_subject_grad_gives_a_floored_covariate_sigma_no_score() {
         (grad[n_theta + 1], fd)
     };
     let (floored, fd_floored) = epscov_score(1e-7);
-    assert_eq!(
-        fd_floored, 0.0,
-        "the objective is flat in EPSCOV on the floor"
-    );
+    assert_eq!(fd_floored, 0.0, "the objective is flat in EPSCOV on the floor");
     assert_eq!(floored, 0.0, "a floored EPSCOV scored {floored:.3e}");
     let (live, _) = epscov_score(2e-6);
     assert!(
@@ -2000,16 +1732,9 @@ fn scaled_v_fixture(k: f64, iov: bool, m3: bool) -> (CompiledModel, Vec<Subject>
     let src = include_str!("../../examples/warfarin_iov_bloq.ferx")
         .replace(
             "theta TVV(10.0, 0.1, 500.0)",
-            &format!(
-                "theta TVV_S({tvv:e}, {:e}, {:e})",
-                -100.0 * tvv,
-                100.0 * tvv
-            ),
+            &format!("theta TVV_S({tvv:e}, {:e}, {:e})", -100.0 * tvv, 100.0 * tvv),
         )
-        .replace(
-            "V  = TVV  * exp(ETA_V)",
-            &format!("V  = TVV_S / {k:e} * exp(ETA_V)"),
-        );
+        .replace("V  = TVV  * exp(ETA_V)", &format!("V  = TVV_S / {k:e} * exp(ETA_V)"));
     let src = if iov {
         src
     } else {
@@ -2017,11 +1742,7 @@ fn scaled_v_fixture(k: f64, iov: bool, m3: bool) -> (CompiledModel, Vec<Subject>
             .replace("exp(ETA_CL + KAPPA_CL)", "exp(ETA_CL)")
             .replace("  iov_column  = OCC\n", "")
     };
-    let src = if m3 {
-        src
-    } else {
-        src.replace("  bloq_method = m3\n", "")
-    };
+    let src = if m3 { src } else { src.replace("  bloq_method = m3\n", "") };
     assert_ne!(
         src,
         include_str!("../../examples/warfarin_iov_bloq.ferx"),
@@ -2033,11 +1754,7 @@ fn scaled_v_fixture(k: f64, iov: bool, m3: bool) -> (CompiledModel, Vec<Subject>
         4,
     );
     assert_eq!(model.n_kappa > 0, iov, "fixture: IOV {iov}");
-    assert_eq!(
-        matches!(model.bloq_in_force(), BloqMethod::M3),
-        m3,
-        "fixture: M3 {m3}"
-    );
+    assert_eq!(matches!(model.bloq_in_force(), BloqMethod::M3), m3, "fixture: M3 {m3}");
     assert!(src.contains("TVV_S /"), "fixture: V is rescaled");
     (model, pop.subjects)
 }
@@ -2171,18 +1888,13 @@ fn the_natural_theta_step_floor_ignores_the_packing() {
     assert_eq!(fd_theta_step_floor(&model, 99), 1.0);
     assert_eq!(
         fd_theta_step_floors(&model),
-        (0..3)
-            .map(|i| fd_theta_step_floor(&model, i))
-            .collect::<Vec<_>>()
+        (0..3).map(|i| fd_theta_step_floor(&model, i)).collect::<Vec<_>>()
     );
     assert_eq!(
         theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 2).to_bits(),
         (1e-5 * (1.0 + 7.7_f64)).to_bits()
     );
-    assert_eq!(
-        theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 1),
-        1e-5 * (1e-3 + 1e-3)
-    );
+    assert_eq!(theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 1), 1e-5 * (1e-3 + 1e-3));
 }
 
 /// #2406: the forward-differenced σ score of the M3 path (`DATA_SCORE_FD_FORCE`), IOV and
@@ -2303,10 +2015,7 @@ fn ltbs_ruv_mult_grad_error(obs_times: &[f64]) -> (f64, bool) {
         id: "ltbs".into(),
         doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: obs_times.to_vec(),
-        observations: obs_times
-            .iter()
-            .map(|&t| (10.0 * (-0.1 * t).exp()).ln() + 0.05)
-            .collect(),
+        observations: obs_times.iter().map(|&t| (10.0 * (-0.1 * t).exp()).ln() + 0.05).collect(),
         obs_cmts: vec![1; n],
         cens: vec![0; n],
         covariates: [("WPSE".to_string(), wpse[0])].into_iter().collect(),
@@ -2371,23 +2080,12 @@ fn ltbs_ruv_mult_grad_error(obs_times: &[f64]) -> (f64, bool) {
         n_sigma,
         &mut scratch,
     );
-    assert!(
-        (nll - f0).abs() < 1e-10,
-        "gradient's NLL {nll} vs obs_nll_subject_into {f0}"
-    );
+    assert!((nll - f0).abs() < 1e-10, "gradient's NLL {nll} vs obs_nll_subject_into {f0}");
     let mut worst = 0.0f64;
     for j in 0..nn {
-        assert!(
-            grad[j].is_finite() && fd[j].is_finite(),
-            "grad[{j}] not finite"
-        );
+        assert!(grad[j].is_finite() && fd[j].is_finite(), "grad[{j}] not finite");
         let err = (grad[j] - fd[j]).abs() / fd[j].abs().max(1.0);
-        assert!(
-            err.is_finite(),
-            "grad[{j}]: analytic {} fd {}",
-            grad[j],
-            fd[j]
-        );
+        assert!(err.is_finite(), "grad[{j}]: analytic {} fd {}", grad[j], fd[j]);
         worst = worst.max(err);
     }
     (worst, saw_negative)
@@ -2404,10 +2102,7 @@ fn ltbs_ruv_mult_grad_error(obs_times: &[f64]) -> (f64, bool) {
 fn obs_nll_subject_grad_ltbs_ruv_mult_matches_fd_below_unit_concentration() {
     let (worst, saw_negative) = ltbs_ruv_mult_grad_error(&[1.0, 4.0, 8.0, 30.0, 40.0, 50.0]);
     assert!(saw_negative, "fixture must reach a negative log prediction");
-    assert!(
-        worst < 3e-3,
-        "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}"
-    );
+    assert!(worst < 3e-3, "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}");
 }
 
 /// #2440 control arm: every log prediction positive, so the floor never bit. Pins
@@ -2415,15 +2110,9 @@ fn obs_nll_subject_grad_ltbs_ruv_mult_matches_fd_below_unit_concentration() {
 #[test]
 fn obs_nll_subject_grad_ltbs_ruv_mult_matches_fd_above_unit_concentration() {
     let (worst, saw_negative) = ltbs_ruv_mult_grad_error(&[1.0, 4.0, 8.0, 12.0, 20.0]);
-    assert!(
-        !saw_negative,
-        "control must keep every log prediction positive"
-    );
+    assert!(!saw_negative, "control must keep every log prediction positive");
     // Realised 2.7e-4 on macOS arm64; same bound as the negative arm.
-    assert!(
-        worst < 3e-3,
-        "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}"
-    );
+    assert!(worst < 3e-3, "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}");
 }
 
 /// #2440 review: a finite base whose *forward-perturbed* prediction is NaN. At
@@ -2469,11 +2158,7 @@ fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
         cens: vec![0; 3],
         covariates: [("WPSE".to_string(), 0.5)].into_iter().collect(),
         obs_covariates: (0..3)
-            .map(|j| {
-                [("WPSE".to_string(), 0.5 + 0.1 * j as f64)]
-                    .into_iter()
-                    .collect()
-            })
+            .map(|j| [("WPSE".to_string(), 0.5 + 0.1 * j as f64)].into_iter().collect())
             .collect(),
         ..Default::default()
     };
@@ -2485,10 +2170,7 @@ fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
     // Fixture premise: finite base, NaN forward-perturbed prediction on TVA.
     let base =
         crate::pk::compute_predictions_with_tv_into(&model, &subject, &theta, &eta, &mut scratch);
-    assert!(
-        base.iter().all(|f| f.is_finite()),
-        "base must be finite: {base:?}"
-    );
+    assert!(base.iter().all(|f| f.is_finite()), "base must be finite: {base:?}");
     let mut tp = theta;
     tp[2] += theta_fd_step(&model, 1e-5, &theta, 2);
     let pert =
@@ -2520,22 +2202,13 @@ fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
     // downstream is poisoned. (At the domain edge `TVA = 1` the derivative of
     // `(1 − TVA)^0.5` does not exist; the dual `pow` reads it as zero there.)
     let (nll, grad) = run(false);
-    assert!(
-        nll.is_finite() && nll < 1e3,
-        "base NLL must score normally: {nll}"
-    );
+    assert!(nll.is_finite() && nll < 1e3, "base NLL must score normally: {nll}");
     for (j, g) in grad.iter().enumerate() {
-        assert!(
-            g.is_finite(),
-            "exact path grad[{j}] is not finite: {grad:?}"
-        );
+        assert!(g.is_finite(), "exact path grad[{j}] is not finite: {grad:?}");
     }
     // The difference quotient — still the fallback on a decline — must repel there.
     let (nll, grad) = run(true);
-    assert!(
-        nll.is_finite() && nll < 1e3,
-        "base NLL must score normally: {nll}"
-    );
+    assert!(nll.is_finite() && nll < 1e3, "base NLL must score normally: {nll}");
     for (j, g) in grad.iter().enumerate() {
         assert!(!g.is_nan(), "grad[{j}] is NaN: {grad:?}");
     }
@@ -2546,11 +2219,7 @@ fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
     );
     // The other coordinates never see the NaN side and stay ordinary.
     for j in [0, 1, 3, 4] {
-        assert!(
-            grad[j].abs() < 1e6,
-            "grad[{j}] = {} should be unaffected",
-            grad[j]
-        );
+        assert!(grad[j].abs() < 1e6, "grad[{j}] = {} should be unaffected", grad[j]);
     }
 }
 
@@ -2571,15 +2240,16 @@ fn the_fixed_eta_data_score_is_exact() {
         crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap()
     };
     let packed = |model: &CompiledModel, theta: &[f64], sigma: &[f64], dt: &[f64], ds: &[f64]| {
-        let mut g: Vec<f64> = (0..theta.len())
-            .map(|i| {
-                if model.default_params.theta_lower[i] >= 0.0 {
-                    theta[i] * dt[i]
-                } else {
-                    dt[i]
-                }
-            })
-            .collect();
+        let mut g: Vec<f64> =
+            (0..theta.len())
+                .map(|i| {
+                    if model.default_params.theta_lower[i] >= 0.0 {
+                        theta[i] * dt[i]
+                    } else {
+                        dt[i]
+                    }
+                })
+                .collect();
         g.extend((0..sigma.len()).map(|k| sigma[k] * ds[k]));
         g
     };
@@ -2589,16 +2259,8 @@ fn the_fixed_eta_data_score_is_exact() {
     let theta = model.default_params.theta.clone();
     let sigma = model.default_params.sigma.values.clone();
     let (n_theta, n_sigma) = (theta.len(), sigma.len());
-    let mask: Vec<bool> = model
-        .default_params
-        .theta_lower
-        .iter()
-        .map(|&l| l >= 0.0)
-        .collect();
-    let (lo, hi) = (
-        vec![-1e30; n_theta + n_sigma],
-        vec![1e30; n_theta + n_sigma],
-    );
+    let mask: Vec<bool> = model.default_params.theta_lower.iter().map(|&l| l >= 0.0).collect();
+    let (lo, hi) = (vec![-1e30; n_theta + n_sigma], vec![1e30; n_theta + n_sigma]);
     let mut scratch = EventPkParams::default();
     let mut worst_exact = 0.0f64;
     for s in prep.population.subjects.iter().take(4) {
@@ -2635,30 +2297,16 @@ fn the_fixed_eta_data_score_is_exact() {
     let mut worst = 0.0f64;
     for (m, d) in [
         ("examples/warfarin_bloq.ferx", "data/warfarin_bloq.csv"),
-        (
-            "examples/correlated_residual_combined.ferx",
-            "data/correlated_residual_combined.csv",
-        ),
-        (
-            "examples/warfarin_iov_bloq.ferx",
-            "data/warfarin_iov_bloq.csv",
-        ),
+        ("examples/correlated_residual_combined.ferx", "data/correlated_residual_combined.csv"),
+        ("examples/warfarin_iov_bloq.ferx", "data/warfarin_iov_bloq.csv"),
     ] {
         let prep = load(m, d);
         let model = &prep.parsed.model;
         let theta = model.default_params.theta.clone();
         let sigma = model.default_params.sigma.values.clone();
         let (n_theta, n_sigma) = (theta.len(), sigma.len());
-        let mask: Vec<bool> = model
-            .default_params
-            .theta_lower
-            .iter()
-            .map(|&l| l >= 0.0)
-            .collect();
-        let (lo, hi) = (
-            vec![-1e30; n_theta + n_sigma],
-            vec![1e30; n_theta + n_sigma],
-        );
+        let mask: Vec<bool> = model.default_params.theta_lower.iter().map(|&l| l >= 0.0).collect();
+        let (lo, hi) = (vec![-1e30; n_theta + n_sigma], vec![1e30; n_theta + n_sigma]);
         for (i, s) in prep.population.subjects.iter().enumerate().take(3) {
             let eta = vec![0.05; model.n_eta];
             let run = |force: bool, scratch: &mut EventPkParams| {
@@ -2685,9 +2333,7 @@ fn the_fixed_eta_data_score_is_exact() {
             let tag = format!("{m} subject {i}");
             assert_eq!(nll_e.to_bits(), nll_f.to_bits(), "{tag}: objective");
             assert!(
-                g_e.iter()
-                    .zip(&g_f)
-                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                g_e.iter().zip(&g_f).any(|(a, b)| a.to_bits() != b.to_bits()),
                 "{tag}: the exact branch did not run"
             );
             let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
@@ -2725,13 +2371,8 @@ fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
             ode.solver_opts.reltol = 1e-12;
             ode.solver_opts.abstol = 1e-14;
         }
-        let s = prep
-            .population
-            .subjects
-            .iter()
-            .find(|s| !s.obs_records.is_empty())
-            .unwrap()
-            .clone();
+        let s =
+            prep.population.subjects.iter().find(|s| !s.obs_records.is_empty()).unwrap().clone();
         cases.push((m.into(), prep.parsed.model, s));
     }
     let binary = crate::parser::model_parser::parse_model_string(
@@ -2763,16 +2404,8 @@ fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
         let theta = model.default_params.theta.clone();
         let sigma = model.default_params.sigma.values.clone();
         let (n_theta, n_sigma) = (theta.len(), sigma.len());
-        let mask: Vec<bool> = model
-            .default_params
-            .theta_lower
-            .iter()
-            .map(|&l| l >= 0.0)
-            .collect();
-        let (lo, hi) = (
-            vec![-1e30; n_theta + n_sigma],
-            vec![1e30; n_theta + n_sigma],
-        );
+        let mask: Vec<bool> = model.default_params.theta_lower.iter().map(|&l| l >= 0.0).collect();
+        let (lo, hi) = (vec![-1e30; n_theta + n_sigma], vec![1e30; n_theta + n_sigma]);
         let eta = vec![0.05; model.n_eta];
         let mut scratch = EventPkParams::default();
         let run = |force: bool, scratch: &mut EventPkParams| {
@@ -2791,23 +2424,11 @@ fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
         );
         // Richardson in the raw parameter, then the packing's chain factor.
         let mut f = |th: &[f64], sg: &[f64]| {
-            obs_nll_subject_into(
-                model,
-                s,
-                th,
-                sg,
-                model.residual_cov_theta(th),
-                &eta,
-                &mut scratch,
-            )
+            obs_nll_subject_into(model, s, th, sg, model.residual_cov_theta(th), &eta, &mut scratch)
         };
         let mut oracle = vec![0.0; n_theta + n_sigma];
         for i in 0..n_theta + n_sigma {
-            let x0 = if i < n_theta {
-                theta[i]
-            } else {
-                sigma[i - n_theta]
-            };
+            let x0 = if i < n_theta { theta[i] } else { sigma[i - n_theta] };
             let mut d = |h: f64| {
                 let (mut tp, mut tm, mut sp, mut sm) =
                     (theta.clone(), theta.clone(), sigma.clone(), sigma.clone());
@@ -2822,11 +2443,7 @@ fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
             };
             let h = 1e-3 * (1.0 + x0.abs());
             let raw = (4.0 * d(h / 2.0) - d(h)) / 3.0;
-            oracle[i] = if i >= n_theta || mask[i] {
-                x0 * raw
-            } else {
-                raw
-            };
+            oracle[i] = if i >= n_theta || mask[i] { x0 * raw } else { raw };
         }
         let scale = oracle.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
         for (k, (a, b)) in g.iter().zip(&oracle).enumerate() {
@@ -2954,15 +2571,7 @@ fn the_exact_theta_score_is_the_central_difference_of_the_production_objective()
         Vec<f64>,
         Vec<Vec<f64>>,
     )> = vec![
-        (
-            "ode",
-            &ode,
-            &ode_subject,
-            vec![4.0, 30.0, 1.2],
-            vec![0.1],
-            vec![0.1, -0.05],
-            vec![],
-        ),
+        ("ode", &ode, &ode_subject, vec![4.0, 30.0, 1.2], vec![0.1], vec![0.1, -0.05], vec![]),
         (
             "transit_twin",
             &transit,
@@ -2990,15 +2599,7 @@ fn the_exact_theta_score_is_the_central_difference_of_the_production_objective()
             vec![0.1, 1.0],
             vec![vec![0.05], vec![-0.05]],
         ),
-        (
-            "iov_wide",
-            &iov_model,
-            &wide_subject,
-            vec![5.0, 50.0],
-            vec![0.1],
-            vec![0.1],
-            wide_kappas,
-        ),
+        ("iov_wide", &iov_model, &wide_subject, vec![5.0, 50.0], vec![0.1], vec![0.1], wide_kappas),
     ];
     for (label, model, subject, theta, sigma, eta, kappas) in cases {
         let iov = !kappas.is_empty();
@@ -3074,10 +2675,7 @@ fn the_exact_theta_score_is_the_central_difference_of_the_production_objective()
             *w = theta[i] * (at(h, &mut scratch) - at(-h, &mut scratch)) / (2.0 * h);
         }
         let scale = want.iter().fold(0.0f64, |m, w| m.max(w.abs()));
-        assert!(
-            scale > 1e-2,
-            "{label}: a flat θ score tests nothing ({want:?})"
-        );
+        assert!(scale > 1e-2, "{label}: a flat θ score tests nothing ({want:?})");
         let worst = grad[..n_theta]
             .iter()
             .zip(&want)
@@ -3087,10 +2685,459 @@ fn the_exact_theta_score_is_the_central_difference_of_the_production_objective()
             })
             .fold(0.0f64, f64::max);
         eprintln!("{label}: exact θ score vs central FD, worst {worst:.2e} of the largest");
+        assert!(worst < 1e-6, "{label}: exact {:?} vs FD {want:?}", &grad[..n_theta]);
+    }
+}
+
+/// With every θ pinned (SAEM's σ-only numerical M-step), the score skips the θ recording
+/// and sweep: its θ part is zero and its σ part and value are exactly those of the same call
+/// with θ free; with one θ free the sweep runs. The counter tells which side ran, so a
+/// mutation that always sweeps, or never does, reddens one of the two.
+#[test]
+fn a_fully_pinned_theta_block_skips_the_adjoint_and_keeps_the_sigma_score() {
+    use crate::types::DoseEvent;
+    let model = crate::types::test_helpers::parsed_analytical_model(GradientMethod::Auto);
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 4.0, 8.0],
+        observations: vec![8.0, 4.8, 2.4],
+        obs_cmts: vec![1, 1, 1],
+        cens: vec![0, 0, 0],
+        ..Default::default()
+    };
+    let (theta, sigma, eta) = ([1.5f64, 20.0, 1.0], [0.2f64], [0.05f64]);
+    let mask = [true, true, true];
+    let score = |lower: &[f64], upper: &[f64]| {
+        let before = EXACT_THETA_SCORES.with(|c| c.get());
+        let mut scratch = EventPkParams::default();
+        let (v, g) = obs_nll_subject_grad(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta,
+            &mask,
+            lower,
+            upper,
+            3,
+            1,
+            &mut scratch,
+        );
+        (v, g, EXACT_THETA_SCORES.with(|c| c.get()) - before)
+    };
+    let (v_free, g_free, swept_free) = score(&[-9.0; 4], &[9.0; 4]);
+    let (v_pin, g_pin, swept_pin) = score(&[-9.0; 4], &[-9.0, -9.0, -9.0, 9.0]);
+    let (_, g_one, swept_one) = score(&[-9.0; 4], &[-9.0, 9.0, -9.0, 9.0]);
+    assert_eq!((swept_free, swept_pin, swept_one), (1, 0, 1));
+    assert_eq!(v_free, v_pin);
+    assert_eq!(&g_pin[..3], &[0.0, 0.0, 0.0]);
+    assert_eq!(g_pin[3], g_free[3], "the σ score must not depend on the θ block");
+    assert_eq!(g_one[0], 0.0);
+    assert!(g_free[0].abs() > 1e-6 && g_one[1] == g_free[1]);
+}
+
+/// The IOV score's expected information (`obs_nll_subject_score_iov`) against the closed
+/// form of a proportional-error model assembled independently from central differences of
+/// `predict_iov` (`V = σ²f²`, so `dV/df = 2σ²f`, `∂V/∂log σ = 2V`):
+/// the sum of `f_a f_b / V + ½ V_a V_b / V²` over observations, written out below term by
+/// term, including the θσ cross block. The value and gradient are the non-Fisher IOV score's to the bit, the
+/// information is symmetric, and an adjoint decline (the stub model) withholds it.
+/// Two occasions with a dose in each, so κ acts on a later dose with drug on board.
+#[test]
+fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
+    use crate::types::DoseEvent;
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("fixture parses");
+    let times = vec![1.0, 3.0, 6.0, 13.0, 16.0, 20.0];
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        dose_occasions: vec![1, 2],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_cmts: vec![1; 6],
+        cens: vec![0; 6],
+        obs_times: times,
+        observations: vec![1.7, 1.2, 0.8, 2.1, 1.6, 1.0],
+        ..Default::default()
+    };
+    let (theta, sigma, eta) = (vec![5.0f64, 50.0], vec![0.1f64], vec![0.1f64]);
+    let kappas = vec![vec![0.15f64], vec![-0.1]];
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let mut scratch = EventPkParams::default();
+    let (v0, g0) = obs_nll_subject_grad_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+    );
+    let (v1, g1, info) = obs_nll_subject_score_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+        true,
+        None,
+        None,
+    );
+    // The objective is the same call; the gradient is the same derivative taken two ways —
+    // one reverse sweep seeded with the weights, or (with the information, whose rows it
+    // needs anyway) the weights' contraction of the forward-tangent Jacobian — so it agrees
+    // to rounding, not in the bits (measured: 7e-15 relative).
+    assert_eq!(v0, v1, "the objective is the same call");
+    for (a, b) in g0.iter().zip(&g1) {
         assert!(
-            worst < 1e-6,
-            "{label}: exact {:?} vs FD {want:?}",
-            &grad[..n_theta]
+            (a - b).abs() <= 1e-12 * (1.0 + a.abs()),
+            "the score is the same derivative: {g0:?} vs {g1:?}"
         );
     }
+    let info = info.expect("a parsed IOV model is inside the information's scope");
+
+    // Independent assembly: ∂f_j/∂(log θ_a) by central differences of the IOV predictions.
+    let f0 = crate::pk::predict_iov(&model, &subject, &theta, &eta, &kappas);
+    let mut df = vec![vec![0.0f64; f0.len()]; n_theta];
+    for a in 0..n_theta {
+        let h = 1e-5 * theta[a];
+        let at = |d: f64| {
+            let mut t = theta.clone();
+            t[a] += d;
+            crate::pk::predict_iov(&model, &subject, &t, &eta, &kappas)
+        };
+        let (up, dn) = (at(h), at(-h));
+        for j in 0..f0.len() {
+            df[a][j] = theta[a] * (up[j] - dn[j]) / (2.0 * h);
+        }
+    }
+    let s2 = sigma[0] * sigma[0];
+    let mut want = vec![0.0f64; n * n];
+    for j in 0..f0.len() {
+        let (f, v) = (f0[j], s2 * f0[j] * f0[j]);
+        let dv_df = 2.0 * s2 * f;
+        let dv: Vec<f64> =
+            (0..n).map(|a| if a < n_theta { dv_df * df[a][j] } else { 2.0 * v }).collect();
+        for a in 0..n {
+            for b in 0..n {
+                let fa = if a < n_theta { df[a][j] } else { 0.0 };
+                let fb = if b < n_theta { df[b][j] } else { 0.0 };
+                want[a * n + b] += fa * fb / v + 0.5 * dv[a] * dv[b] / (v * v);
+            }
+        }
+    }
+    assert!(want.iter().all(|w| w.is_finite()), "{want:?}");
+    let scale = want.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+    assert!(scale > 1.0, "a flat information tests nothing ({scale})");
+    for a in 0..n {
+        for b in 0..n {
+            let (g, w) = (info[a * n + b], want[a * n + b]);
+            assert!(g.is_finite(), "({a},{b}): {g}");
+            assert!(
+                (g - w).abs() < 1e-6 * scale,
+                "({a},{b}): {g} vs closed form {w} (scale {scale})"
+            );
+            assert_eq!(g, info[b * n + a], "symmetry at ({a},{b})");
+        }
+    }
+    // κ must be live: the occasion-2 rows differ from a κ = 0 evaluation, or the stacked
+    // adjoint input could be ignored without this test seeing it.
+    let (_, _, flat) = obs_nll_subject_score_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &[vec![0.0], vec![0.0]],
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+        true,
+        None,
+        None,
+    );
+    let flat = flat.expect("in scope");
+    assert!(
+        (0..n * n).any(|i| (flat[i] - info[i]).abs() > 1e-3 * scale),
+        "κ does not move the information on this fixture"
+    );
+    // A pinned θ keeps an all-zero row and column.
+    let mut hi_pin = hi.clone();
+    let mut lo_pin = lo.clone();
+    lo_pin[1] = 0.0;
+    hi_pin[1] = 0.0;
+    let (_, _, pinned) = obs_nll_subject_score_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &mask,
+        &lo_pin,
+        &hi_pin,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+        true,
+        None,
+        None,
+    );
+    let pinned = pinned.expect("in scope");
+    for b in 0..n {
+        assert_eq!((pinned[n + b], pinned[b * n + 1]), (0.0, 0.0), "row/col 1 at {b}");
+    }
+    assert_eq!(pinned[0], info[0], "a free coordinate's own block is unchanged");
+}
+
+/// The prediction memo changes no number: the score (value, gradient, information) and the
+/// IOV value, with predictions served from a slot, equal the memo-free calls bit for bit across
+/// a σ-only sequence, a θ change, and the value-then-score sharing of one slot. The slot really
+/// serves: the same θ with *different* η returns the first η's score (a stale slot), and a
+/// different θ recomputes. Non-IOV (parsed analytic model) and IOV (κ live on a later dose).
+#[test]
+fn memoised_predictions_change_no_score_and_are_served_for_an_unchanged_theta() {
+    use crate::estimation::pred_memo::{MemoSlot, PredMemo};
+    use crate::types::DoseEvent;
+    let mk = |iov: bool| {
+        let kappa = if iov { "  kappa KAPPA_CL ~ 0.04\n" } else { "" };
+        let cl = if iov { "TVCL * exp(ETA_CL + KAPPA_CL)" } else { "TVCL * exp(ETA_CL)" };
+        crate::parser::model_parser::parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n{kappa}  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = {cl}\n  V = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        ))
+        .expect("fixture parses")
+    };
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        dose_occasions: vec![1, 2],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_cmts: vec![1; 6],
+        cens: vec![0; 6],
+        obs_times: vec![1.0, 3.0, 6.0, 13.0, 16.0, 20.0],
+        observations: vec![1.7, 1.2, 0.8, 2.1, 1.6, 1.0],
+        ..Default::default()
+    };
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let kappas = vec![vec![0.15f64], vec![-0.1]];
+    for iov in [false, true] {
+        let model = mk(iov);
+        let mut scratch = EventPkParams::default();
+        let mut score = |theta: &[f64], sigma: f64, eta: f64, memo: Option<MemoSlot<'_>>| {
+            if iov {
+                obs_nll_subject_score_iov(
+                    &model,
+                    &subject,
+                    theta,
+                    &[sigma],
+                    &[eta],
+                    &kappas,
+                    &mask,
+                    &lo,
+                    &hi,
+                    n_theta,
+                    n_sigma,
+                    &mut scratch,
+                    true,
+                    memo,
+                    None,
+                )
+            } else {
+                obs_nll_subject_score(
+                    &model,
+                    &subject,
+                    theta,
+                    &[sigma],
+                    &[eta],
+                    &mask,
+                    &lo,
+                    &hi,
+                    n_theta,
+                    n_sigma,
+                    &mut scratch,
+                    true,
+                    memo,
+                    None,
+                )
+            }
+        };
+        // θ free under Newton: the memo follows θ, one evaluation per distinct θ.
+        let memo = PredMemo::for_solve([1usize], true, true).unwrap();
+        let slot = |theta: &[f64]| memo.begin(theta).map(|ev| ev.slot(0, 0));
+        let th = [5.0f64, 50.0];
+        // σ-only sequence: the first call fills the slot, the rest are served from it.
+        for sigma in [0.1, 0.17, 0.3] {
+            let plain = score(&th, sigma, 0.1, None);
+            let with = score(&th, sigma, 0.1, slot(&th));
+            assert_eq!(plain, with, "iov={iov} σ={sigma}");
+            assert!(plain.2.is_some(), "iov={iov}: information in scope");
+        }
+        // Stale on purpose: the slot holds η = 0.1's predictions for this θ, so η = -0.3 through
+        // it scores η = 0.1's predictions — and the memo-free η = -0.3 is a different number.
+        let first = score(&th, 0.1, 0.1, None);
+        let stale = score(&th, 0.1, -0.3, slot(&th));
+        let fresh = score(&th, 0.1, -0.3, None);
+        assert_eq!(stale.0, first.0, "iov={iov}: served from the slot");
+        assert!(fresh.0 != first.0, "iov={iov}: the two η must differ");
+        // A different θ recomputes (and now the slot holds that one).
+        let th2 = [5.5f64, 48.0];
+        assert_eq!(score(&th2, 0.1, -0.3, slot(&th2)), score(&th2, 0.1, -0.3, None), "iov={iov}");
+        // One slot shared by the value path and the score path.
+        if iov {
+            let memo2 = PredMemo::for_solve([1usize], true, true).unwrap();
+            let s2 = memo2.begin(&th).map(|ev| ev.slot(0, 0));
+            let mut scratch2 = EventPkParams::default();
+            let plain_v = obs_nll_subject_into_iov(
+                &model,
+                &subject,
+                &th,
+                &[0.1],
+                &[0.1],
+                &kappas,
+                &mut scratch2,
+            );
+            let memo_v = obs_nll_subject_into_iov_memo(
+                &model,
+                &subject,
+                &th,
+                &[0.1],
+                &[0.1],
+                &kappas,
+                &mut scratch2,
+                None,
+                s2,
+            );
+            assert_eq!(plain_v, memo_v);
+            let via = score(&th, 0.2, 0.1, s2);
+            assert_eq!(via, score(&th, 0.2, 0.1, None));
+        }
+    }
+}
+
+/// The Newton M-step's information is the adjoint's or none: `obs_nll_subject_score` (the
+/// M-step solves' entry) withholds it from a subject the adjoint declined — whose per-θ rows
+/// would be forward differences, a curvature the exact-curvature solve must not step on —
+/// while `obs_nll_subject_grad_fisher` (`score_sa`'s) still takes the differenced rows; the
+/// gradient is the same either way. Both sides on one declined subject, and the in-scope
+/// control, where the two entries agree to the bit.
+#[test]
+fn the_solve_entry_withholds_a_differenced_information_where_score_sa_takes_it() {
+    use crate::types::DoseEvent;
+    let src = |ode: bool| {
+        let structural = if ode {
+            "ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V"
+        } else {
+            "pk one_cpt_iv(cl=CL, v=V)"
+        };
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+             [structural_model]\n  {structural}\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        )
+    };
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        dose_occasions: vec![1],
+        occasions: vec![1; 3],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        obs_times: vec![1.0, 3.0, 6.0],
+        observations: vec![1.7, 1.2, 0.8],
+        ..Default::default()
+    };
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let both = |model: &CompiledModel| {
+        let th = [5.0f64, 50.0];
+        let mut scratch = EventPkParams::default();
+        let solve = obs_nll_subject_score(
+            model,
+            &subject,
+            &th,
+            &[0.1],
+            &[0.1],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+            true,
+            None,
+            None,
+        );
+        let score_sa = obs_nll_subject_grad_fisher(
+            model,
+            &subject,
+            &th,
+            &[0.1],
+            &[0.1],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        (solve, score_sa)
+    };
+    // In scope: the exact rows serve both entries, bit for bit.
+    let model = crate::parser::model_parser::parse_model_string(&src(false)).unwrap();
+    assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(&model));
+    let (solve, score_sa) = both(&model);
+    assert!(solve.2.is_some());
+    assert_eq!(solve, score_sa);
+    // Declined (an ODE readout without its compiled program): the gradient is the same
+    // forward difference in both; only `score_sa` has an information, and the solve has none.
+    let mut model = crate::parser::model_parser::parse_model_string(&src(true)).unwrap();
+    assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(&model));
+    model.ode_spec.as_mut().unwrap().readout_program = None;
+    assert!(!crate::sens::ode_provider::adjoint::recorder_in_scope(&model));
+    let (solve, score_sa) = both(&model);
+    assert!(solve.2.is_none(), "the solve entry must not carry a differenced information");
+    assert!(score_sa.2.is_some(), "score_sa takes the differenced rows");
+    assert_eq!((solve.0, &solve.1), (score_sa.0, &score_sa.1));
 }

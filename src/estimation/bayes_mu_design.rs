@@ -147,9 +147,7 @@ impl<'m> MuDesign<'m> {
     /// pre-#1626 move — and is what a mixture model uses (the class-switched
     /// typical values have not been derived for a group).
     pub(crate) fn build(
-        model: &'m CompiledModel,
-        population: &Population,
-        params: &ModelParameters,
+        model: &'m CompiledModel, population: &Population, params: &ModelParameters,
         allow_groups: bool,
     ) -> Option<Self> {
         let n_eta = model.n_eta;
@@ -171,28 +169,20 @@ impl<'m> MuDesign<'m> {
                 }
             }
         }
-        let mut rows: Vec<Option<MuRow<'m>>> = anchor
-            .iter()
-            .map(|a| a.map(|theta_idx| MuRow::Anchor { theta_idx }))
-            .collect();
+        let mut rows: Vec<Option<MuRow<'m>>> =
+            anchor.iter().map(|a| a.map(|theta_idx| MuRow::Anchor { theta_idx })).collect();
         // Coordinates the anchors fix to the log scale.
         let anchor_thetas: Vec<usize> = anchor.iter().flatten().copied().collect();
         let mut coords: Vec<BetaCoord> = Vec::new();
         for &t in &anchor_thetas {
             if !coords.iter().any(|c| c.theta_idx == t) {
-                coords.push(BetaCoord {
-                    theta_idx: t,
-                    log: true,
-                });
+                coords.push(BetaCoord { theta_idx: t, log: true });
             }
         }
 
         if allow_groups {
-            let plain_pairs: Vec<(usize, usize)> = anchor
-                .iter()
-                .enumerate()
-                .filter_map(|(e, a)| a.map(|t| (t, e)))
-                .collect();
+            let plain_pairs: Vec<(usize, usize)> =
+                anchor.iter().enumerate().filter_map(|(e, a)| a.map(|t| (t, e))).collect();
             let (groups, _notes) = resolve_covariate_mu_groups(
                 model,
                 population,
@@ -241,14 +231,8 @@ impl<'m> MuDesign<'m> {
         let rows: Vec<MuRow<'m>> = rows.into_iter().collect::<Option<Vec<_>>>()?;
         // Drop anchor coordinates no row reads any more (an anchor superseded
         // by its eta's group, whose theta the group did not keep).
-        let mut design = MuDesign {
-            rows,
-            coords,
-            x: Vec::new(),
-        };
-        design
-            .coords
-            .retain(|c| design_reads(&design.rows, c.theta_idx));
+        let mut design = MuDesign { rows, coords, x: Vec::new() };
+        design.coords.retain(|c| design_reads(&design.rows, c.theta_idx));
         if design.coords.is_empty() {
             return None;
         }
@@ -261,10 +245,7 @@ impl<'m> MuDesign<'m> {
             return None;
         }
         design.coords = kept.iter().map(|&k| design.coords[k]).collect();
-        design.x = x
-            .into_iter()
-            .map(|xi| xi.select_columns(kept.iter()))
-            .collect();
+        design.x = x.into_iter().map(|xi| xi.select_columns(kept.iter())).collect();
         Some(design)
     }
 
@@ -279,10 +260,7 @@ impl<'m> MuDesign<'m> {
     }
 
     fn beta(&self, theta: &[f64]) -> Vec<f64> {
-        self.coords
-            .iter()
-            .map(|c| c.to_beta(theta[c.theta_idx]))
-            .collect()
+        self.coords.iter().map(|c| c.to_beta(theta[c.theta_idx])).collect()
     }
 
     fn theta_at(&self, theta: &[f64], beta: &[f64]) -> Vec<f64> {
@@ -299,11 +277,8 @@ impl<'m> MuDesign<'m> {
         let p = self.coords.len();
         let n_eta = self.rows.len();
         let beta = self.beta(theta);
-        let mut x: Vec<DMatrix<f64>> = population
-            .subjects
-            .iter()
-            .map(|_| DMatrix::zeros(n_eta, p))
-            .collect();
+        let mut x: Vec<DMatrix<f64>> =
+            population.subjects.iter().map(|_| DMatrix::zeros(n_eta, p)).collect();
         for k in 0..p {
             let h = step_for(self.coords[k], beta[k]);
             let mut bp = beta.clone();
@@ -330,10 +305,7 @@ impl<'m> MuDesign<'m> {
     /// The full conditional of `β` given the current `η` (i.e. given `φ`) and
     /// `Ω`: returns `(mean, precision)`, both in `β` coordinates.
     pub(crate) fn conditional(
-        &self,
-        theta: &[f64],
-        etas: &[Vec<f64>],
-        omega: &OmegaMatrix,
+        &self, theta: &[f64], etas: &[Vec<f64>], omega: &OmegaMatrix,
     ) -> Option<(DVector<f64>, DMatrix<f64>)> {
         let p = self.coords.len();
         let w = Cholesky::new(omega.matrix.clone())?.inverse();
@@ -359,18 +331,12 @@ impl<'m> MuDesign<'m> {
     /// vector (no bound check, no re-centring).
     #[cfg(test)]
     pub(crate) fn sample_theta(
-        &self,
-        theta: &[f64],
-        etas: &[Vec<f64>],
-        omega: &OmegaMatrix,
-        rng: &mut impl Rng,
+        &self, theta: &[f64], etas: &[Vec<f64>], omega: &OmegaMatrix, rng: &mut impl Rng,
     ) -> Option<Vec<f64>> {
         let (mean, prec) = self.conditional(theta, etas, omega)?;
         let l = Cholesky::new(prec)?.l();
-        let z = DVector::from_iterator(
-            mean.len(),
-            (0..mean.len()).map(|_| rng.sample(StandardNormal)),
-        );
+        let z =
+            DVector::from_iterator(mean.len(), (0..mean.len()).map(|_| rng.sample(StandardNormal)));
         // v = L⁻ᵀ z has covariance (L Lᵀ)⁻¹ = P⁻¹.
         let v = l.transpose().solve_upper_triangular(&z)?;
         let beta_new: Vec<f64> = (0..mean.len()).map(|k| mean[k] + v[k]).collect();
@@ -412,31 +378,16 @@ impl<'m> MuDesign<'m> {
     /// Returns the outcome and `log α` (`NaN` when no ratio was formed).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw(
-        &self,
-        theta: &mut [f64],
-        etas: &mut [Vec<f64>],
-        omega: &OmegaMatrix,
-        lower: &[f64],
-        upper: &[f64],
-        population: &Population,
-        rng: &mut impl Rng,
-        nll: &mut [f64],
+        &self, theta: &mut [f64], etas: &mut [Vec<f64>], omega: &OmegaMatrix, lower: &[f64],
+        upper: &[f64], population: &Population, rng: &mut impl Rng, nll: &mut [f64],
         subject_nlls: &mut dyn FnMut(&[f64], &[Vec<f64>]) -> Vec<f64>,
     ) -> (DrawOutcome, f64) {
         // Checked before a single RNG draw or mutation, not at the point of
         // use: `conditional` would silently `zip`-truncate a short `etas`, and
         // a short `nll` would panic in `copy_from_slice` *after* θ and η were
         // already committed — a partial move, which no `DrawOutcome` describes.
-        debug_assert_eq!(
-            etas.len(),
-            population.subjects.len(),
-            "one eta vector per subject"
-        );
-        debug_assert_eq!(
-            nll.len(),
-            population.subjects.len(),
-            "one cached NLL per subject"
-        );
+        debug_assert_eq!(etas.len(), population.subjects.len(), "one eta vector per subject");
+        debug_assert_eq!(nll.len(), population.subjects.len(), "one cached NLL per subject");
         let Some((mean, prec)) = self.conditional(theta, etas, omega) else {
             return (DrawOutcome::Skipped, f64::NAN);
         };
@@ -444,10 +395,8 @@ impl<'m> MuDesign<'m> {
             return (DrawOutcome::Skipped, f64::NAN);
         };
         let l = chol.l();
-        let z = DVector::from_iterator(
-            mean.len(),
-            (0..mean.len()).map(|_| rng.sample(StandardNormal)),
-        );
+        let z =
+            DVector::from_iterator(mean.len(), (0..mean.len()).map(|_| rng.sample(StandardNormal)));
         // v = L⁻ᵀ z has covariance (L Lᵀ)⁻¹ = P⁻¹.
         let Some(v) = l.transpose().solve_upper_triangular(&z) else {
             return (DrawOutcome::Skipped, f64::NAN);
@@ -466,11 +415,8 @@ impl<'m> MuDesign<'m> {
         for (s, eta) in population.subjects.iter().zip(etas.iter()) {
             let old = self.mus(theta, s);
             let new = self.mus(&theta_new, s);
-            let e: Vec<f64> = eta
-                .iter()
-                .zip(new.iter().zip(&old))
-                .map(|(e, (n, o))| e - (n - o))
-                .collect();
+            let e: Vec<f64> =
+                eta.iter().zip(new.iter().zip(&old)).map(|(e, (n, o))| e - (n - o)).collect();
             if e.iter().any(|v| !v.is_finite()) {
                 return (DrawOutcome::Skipped, f64::NAN);
             }
@@ -569,11 +515,7 @@ enum FormKind {
 
 impl<'p> Forms<'p> {
     fn new(defs: &'p [Expression], is_free: &'p dyn Fn(usize) -> bool) -> Self {
-        Self {
-            defs,
-            is_free,
-            memo: RefCell::new(HashMap::new()),
-        }
+        Self { defs, is_free, memo: RefCell::new(HashMap::new()) }
     }
 
     /// The answer to `kind` for definition `j`, walked on first use. A
@@ -672,9 +614,7 @@ fn log_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
 /// symmetric second difference about `θ₀` (codex review of #1951). A form the
 /// walker does not recognise stays on the random walk, which is always valid.
 fn affine_coords(
-    members: &[GroupMember<'_>],
-    is_free: &dyn Fn(usize) -> bool,
-    theta0: &[f64],
+    members: &[GroupMember<'_>], is_free: &dyn Fn(usize) -> bool, theta0: &[f64],
 ) -> Option<Vec<BetaCoord>> {
     let mut coords: Coords = Vec::new();
     for m in members {
@@ -689,18 +629,10 @@ fn affine_coords(
         coords = merge(coords, form)?;
     }
     // `β = ln θ` needs θ > 0 at the start (the exp map keeps it there).
-    if coords
-        .iter()
-        .any(|&(t, log)| log && !(theta0.get(t).copied().unwrap_or(f64::NAN) > 0.0))
-    {
+    if coords.iter().any(|&(t, log)| log && !(theta0.get(t).copied().unwrap_or(f64::NAN) > 0.0)) {
         return None;
     }
-    Some(
-        coords
-            .into_iter()
-            .map(|(theta_idx, log)| BetaCoord { theta_idx, log })
-            .collect(),
-    )
+    Some(coords.into_iter().map(|(theta_idx, log)| BetaCoord { theta_idx, log }).collect())
 }
 
 /// The coordinates, in order, that keep the stacked design `[X_1; …; X_N]` at

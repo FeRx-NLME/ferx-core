@@ -111,11 +111,8 @@ fn cells_per_subject() -> Vec<(u32, Vec<(usize, usize)>)> {
     let mut out: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
     for l in text.lines().skip(1) {
         let f: Vec<&str> = l.split(',').collect();
-        let (id, study, slot) = (
-            f[0].parse().unwrap(),
-            f[1].parse().unwrap(),
-            f[5].parse().unwrap(),
-        );
+        let (id, study, slot) =
+            (f[0].parse().unwrap(), f[1].parse().unwrap(), f[5].parse().unwrap());
         if out.last().is_none_or(|(i, _)| *i != id) {
             out.push((id, Vec::new()));
         }
@@ -132,15 +129,8 @@ fn cells_per_subject() -> Vec<(u32, Vec<(usize, usize)>)> {
 fn nested_levels_match_nonmem_exact3_at_its_optimum() {
     let r = eval(MODEL);
     let d_ofv = (r.ofv - NM_OFV).abs();
-    eprintln!(
-        "ferx OFV {:.14}  NONMEM {NM_OFV:.14}  |Δ| {d_ofv:.3e}",
-        r.ofv
-    );
-    assert!(
-        r.ofv.is_finite() && d_ofv < OFV_TOL,
-        "OFV {} vs NONMEM {NM_OFV}",
-        r.ofv
-    );
+    eprintln!("ferx OFV {:.14}  NONMEM {NM_OFV:.14}  |Δ| {d_ofv:.3e}", r.ofv);
+    assert!(r.ofv.is_finite() && d_ofv < OFV_TOL, "OFV {} vs NONMEM {NM_OFV}", r.ofv);
 
     let phi = nonmem_phi();
     let cells = cells_per_subject();
@@ -161,22 +151,10 @@ fn nested_levels_match_nonmem_exact3_at_its_optimum() {
             worst = worst.max(d);
             compared += 1;
         };
-        check(
-            r.subjects[i].eta[0],
-            nm[0],
-            format!("subject {id} η_sponsor"),
-        );
+        check(r.subjects[i].eta[0], nm[0], format!("subject {id} η_sponsor"));
         for (g, &(study, slot)) in cell.iter().enumerate() {
-            check(
-                kappas[g][0],
-                nm[study],
-                format!("subject {id} κ_study {study}"),
-            );
-            check(
-                kappas[g][1],
-                nm[2 + slot],
-                format!("subject {id} κ_arm slot {slot}"),
-            );
+            check(kappas[g][0], nm[study], format!("subject {id} κ_study {study}"));
+            check(kappas[g][1], nm[2 + slot], format!("subject {id} κ_arm slot {slot}"));
         }
     }
     assert_eq!(compared, 12 * 9);
@@ -185,19 +163,9 @@ fn nested_levels_match_nonmem_exact3_at_its_optimum() {
     // The route (#1082 PR3): the compartment-free walk serves the nested model on both
     // loops, so the EBEs above were found on the analytic inner gradient, and no subject
     // fell back to finite differences.
-    assert_eq!(
-        r.gradient_method_inner,
-        GradientMethodKind::Analytic.as_str()
-    );
-    assert_eq!(
-        r.gradient_method_outer,
-        GradientMethodKind::Analytic.as_str()
-    );
-    assert!(
-        !r.warnings.iter().any(|w| w.contains("finite-difference")),
-        "{:?}",
-        r.warnings
-    );
+    assert_eq!(r.gradient_method_inner, GradientMethodKind::Analytic.as_str());
+    assert_eq!(r.gradient_method_outer, GradientMethodKind::Analytic.as_str());
+    assert!(!r.warnings.iter().any(|w| w.contains("finite-difference")), "{:?}", r.warnings);
 }
 
 /// O3, nesting by key: `ARM` repeats 1, 2 in every study, and `ARMID` numbers the same
@@ -215,24 +183,15 @@ fn arm_labels_local_to_a_study_score_like_globally_unique_ones() {
         Default::default();
     for l in text.lines().skip(1) {
         let f: Vec<&str> = l.split(',').collect();
-        by_label
-            .entry((f[0].to_string(), f[2]))
-            .or_default()
-            .insert(f[1]);
-        unique
-            .entry((f[0].to_string(), f[3]))
-            .or_default()
-            .insert(f[1]);
+        by_label.entry((f[0].to_string(), f[2])).or_default().insert(f[1]);
+        unique.entry((f[0].to_string(), f[3])).or_default().insert(f[1]);
     }
     assert!(by_label.values().any(|studies| studies.len() > 1));
     assert!(unique.values().all(|studies| studies.len() == 1));
 
     let local = eval(MODEL);
     let global = eval(&MODEL.replace("level ARM by ARM in STUDY", "level ARM by ARMID in STUDY"));
-    assert_ne!(
-        MODEL,
-        MODEL.replace("level ARM by ARM in STUDY", "level ARM by ARMID in STUDY")
-    );
+    assert_ne!(MODEL, MODEL.replace("level ARM by ARM in STUDY", "level ARM by ARMID in STUDY"));
     assert!(local.ofv.is_finite());
     assert_eq!(
         local.ofv.to_bits(),
@@ -286,9 +245,7 @@ fn the_covariance_step_finite_differences_a_nested_pk_model() {
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
-        let n = seen
-            .entry((f[0].to_string(), f[8].to_string()))
-            .or_insert(0);
+        let n = seen.entry((f[0].to_string(), f[8].to_string())).or_insert(0);
         *n += 1;
         out.push_str(&format!("{line},{}\n", if *n <= 5 { 1 } else { 2 }));
     }
@@ -330,24 +287,14 @@ fn the_covariance_step_finite_differences_a_nested_pk_model() {
     let (a, fd) = (run(true), run(false));
     let _ = std::fs::remove_file(&path);
     // Three subjects, two occasions, two phases each: four cells per subject.
-    assert!(
-        a.ebe_kappas.iter().all(|k| k.len() == 4),
-        "{:?}",
-        a.ebe_kappas
-    );
+    assert!(a.ebe_kappas.iter().all(|k| k.len() == 4), "{:?}", a.ebe_kappas);
     let cov = |r: &FitResult| r.covariance_matrix.clone().expect("a covariance matrix");
     assert!(cov(&fd).iter().all(|v| v.is_finite()), "{}", cov(&fd));
-    let free = (0..cov(&fd).nrows())
-        .filter(|&i| cov(&fd)[(i, i)] > 0.0)
-        .count();
+    let free = (0..cov(&fd).nrows()).filter(|&i| cov(&fd)[(i, i)] > 0.0).count();
     assert_eq!(free, 7, "three θ, ω², two κ variances, σ: {}", cov(&fd));
     // The analytic route was taken: it cannot reproduce the stencil's bits.
     let bits = |m: nalgebra::DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-    assert_ne!(
-        bits(cov(&a)),
-        bits(cov(&fd)),
-        "the nested covariance stayed on the stencil"
-    );
+    assert_ne!(bits(cov(&a)), bits(cov(&fd)), "the nested covariance stayed on the stencil");
     let (ca, cf) = (cov(&a), cov(&fd));
     let mut worst = 0.0f64;
     for i in 0..ca.nrows() {
@@ -375,9 +322,7 @@ const SE_COLUMNS: [&str; 8] = [
     "OMEGA(4,4)",
     "SIGMA(1,1)",
 ];
-const SE_NAMES: [&str; 8] = [
-    "TVE0", "TVEMAX", "ED50", "ET50", "ETA_SP", "K_ST", "K_ARM", "ADD",
-];
+const SE_NAMES: [&str; 8] = ["TVE0", "TVEMAX", "ED50", "ET50", "ETA_SP", "K_ST", "K_ARM", "ADD"];
 
 /// The `-1000000001` (standard error) row of a NONMEM `.ext`, picked by column name.
 fn nonmem_ses(ext: &str) -> [f64; 8] {
@@ -401,10 +346,7 @@ fn nonmem_ses(ext: &str) -> [f64; 8] {
 
 /// The names of the parameters whose ferx SE is not within `tol` of `nm`, relatively.
 fn se_misses(ferx: &[f64; 8], nm: &[f64; 8], tol: f64) -> Vec<&'static str> {
-    (0..8)
-        .filter(|&i| !((ferx[i] / nm[i] - 1.0).abs() < tol))
-        .map(|i| SE_NAMES[i])
-        .collect()
+    (0..8).filter(|&i| !((ferx[i] / nm[i] - 1.0).abs() < tol)).map(|i| SE_NAMES[i]).collect()
 }
 
 /// Worst realised |ferx/NONMEM − 1| over the eight SEs against `$COV MATRIX=R SIGL=12`
@@ -424,16 +366,8 @@ const SE_TOL: f64 = 0.03;
 ///
 /// Steps 1e-2 and 3e-3 agree within 3.2e-4 (ED50). At 1e-3 the EBE noise over h² takes over
 /// (6.8e-4 on ETA_SP).
-const EXT_FD_SE: [f64; 8] = [
-    1.274414e-1,
-    2.976518,
-    5.862647,
-    1.341867e-1,
-    5.711978e-2,
-    4.809719e-2,
-    1.426637,
-    2.621309e-2,
-];
+const EXT_FD_SE: [f64; 8] =
+    [1.274414e-1, 2.976518, 5.862647, 1.341867e-1, 5.711978e-2, 4.809719e-2, 1.426637, 2.621309e-2];
 /// Worst realised |analytic/external − 1|: 1.84e-4 (K_ST). The whole-population FD stencil
 /// misses by 5.0e-3 (TVE0), 3.1e-3 (ET50) and 2.2e-3 (ED50). `1e-3` sits 5.4× above the
 /// analytic gap, 3.1× above the oracle's step-to-step spread, and 2.2× below the stencil's
@@ -461,29 +395,11 @@ const ROUTE_TOL: f64 = 1e-3;
 fn nested_levels_r_ses_match_nonmem_matrix_r_at_sigl12() {
     let r = eval_with(MODEL, true);
     let se = |v: &Option<Vec<f64>>| v.clone().expect("an SE vector");
-    let (t, o, k, s) = (
-        se(&r.se_theta),
-        se(&r.se_omega),
-        se(&r.se_kappa),
-        se(&r.se_sigma),
-    );
-    assert_eq!(
-        (t.len(), o.len(), k.len(), s.len()),
-        (4, 1, 2, 1),
-        "{t:?} {o:?} {k:?} {s:?}"
-    );
+    let (t, o, k, s) = (se(&r.se_theta), se(&r.se_omega), se(&r.se_kappa), se(&r.se_sigma));
+    assert_eq!((t.len(), o.len(), k.len(), s.len()), (4, 1, 2, 1), "{t:?} {o:?} {k:?} {s:?}");
     assert_eq!(r.sigma_names, ["ADD"]);
     // ferx carries σ as an SD; NONMEM's SIGMA(1,1) SE is on the variance: d(σ²) = 2σ dσ.
-    let ferx = [
-        t[0],
-        t[1],
-        t[2],
-        t[3],
-        o[0],
-        k[0],
-        k[1],
-        2.0 * r.sigma[0] * s[0],
-    ];
+    let ferx = [t[0], t[1], t[2], t[3], o[0], k[0], k[1], 2.0 * r.sigma[0] * s[0]];
     assert!(ferx.iter().all(|v| v.is_finite() && *v > 0.0), "{ferx:?}");
     assert_eq!(r.covariance_status, CovarianceStatus::Computed);
     assert_eq!(r.covariance_method, Some(CovarianceMethod::Hessian));
@@ -503,15 +419,9 @@ fn nested_levels_r_ses_match_nonmem_matrix_r_at_sigl12() {
         worst = worst.max(rel.abs());
     }
     eprintln!("MEASURE worst SE rel vs $COV SIGL=12: {worst:.4e}");
-    assert_eq!(
-        se_misses(&ferx, &nm, SE_TOL),
-        Vec::<&str>::new(),
-        "ferx {ferx:?} vs NONMEM {nm:?}"
-    );
+    assert_eq!(se_misses(&ferx, &nm, SE_TOL), Vec::<&str>::new(), "ferx {ferx:?} vs NONMEM {nm:?}");
 
-    let route_worst = (0..8)
-        .map(|i| (ferx[i] / EXT_FD_SE[i] - 1.0).abs())
-        .fold(0.0f64, f64::max);
+    let route_worst = (0..8).map(|i| (ferx[i] / EXT_FD_SE[i] - 1.0).abs()).fold(0.0f64, f64::max);
     eprintln!("MEASURE worst SE rel vs external FD Hessian: {route_worst:.4e}");
     assert_eq!(
         se_misses(&ferx, &EXT_FD_SE, ROUTE_TOL),

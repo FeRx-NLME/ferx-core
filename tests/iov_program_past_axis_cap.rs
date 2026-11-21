@@ -28,18 +28,14 @@ fn padded(n_pad: usize) -> String {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/warfarin_iov.ferx"),
     )
     .unwrap();
-    let pads: String = (1..=n_pad)
-        .map(|i| format!("  theta P{i}(0.0, -1.0, 1.0) FIX\n"))
-        .collect();
+    let pads: String = (1..=n_pad).map(|i| format!("  theta P{i}(0.0, -1.0, 1.0) FIX\n")).collect();
     let sum: String = (1..=n_pad).map(|i| format!(" + P{i}")).collect();
-    let text = base
-        .replacen("  omega ETA_CL ~", &format!("{pads}  omega ETA_CL ~"), 1)
-        .replacen(
-            // The leading newline skips the header comment's copy of the line.
-            "\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
-            &format!("\n  CL = TVCL * exp(ETA_CL + KAPPA_CL{sum})"),
-            1,
-        );
+    let text = base.replacen("  omega ETA_CL ~", &format!("{pads}  omega ETA_CL ~"), 1).replacen(
+        // The leading newline skips the header comment's copy of the line.
+        "\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        &format!("\n  CL = TVCL * exp(ETA_CL + KAPPA_CL{sum})"),
+        1,
+    );
     format!("{text}  maxiter    = 1\n  checkpoint = false\n")
 }
 
@@ -73,9 +69,7 @@ fn iov_program_one_past_the_axis_cap_keeps_the_analytic_gradient() {
         assert_eq!(r.gradient_method_outer, "analytic", "{name}: outer");
         // The inner route has no trial-point declines: any inner FD use is structural.
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("finite-difference inner gradients")),
+            !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
             "{name}: a subject fell back to finite-difference inner gradients: {:?}",
             r.warnings
         );

@@ -27,9 +27,7 @@ fn main() {
     use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
     use std::collections::BTreeMap;
 
-    let out = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "rtte_sim.csv".into());
+    let out = std::env::args().nth(1).unwrap_or_else(|| "rtte_sim.csv".into());
     const N: usize = 300;
     const HORIZON: f64 = 20.0;
     const SEED: u64 = 20260709;

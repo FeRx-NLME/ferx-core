@@ -70,8 +70,7 @@ impl PkTemplate {
         let trimmed = line.trim();
         let (keyword, rest) = Self::KEYWORDS.iter().find_map(|kw| {
             let rest = trimmed.strip_prefix(kw)?;
-            rest.starts_with(|c: char| c.is_whitespace())
-                .then_some((*kw, rest))
+            rest.starts_with(|c: char| c.is_whitespace()).then_some((*kw, rest))
         })?;
         let rest = rest.trim();
         let open = match rest.find('(') {
@@ -81,11 +80,7 @@ impl PkTemplate {
         let name = rest[..open].trim().to_string();
         let close = match rest.rfind(')') {
             Some(i) if i > open => i,
-            _ => {
-                return Some(Err(format!(
-                    "`{keyword}` line has no closing `)`: `{line}`"
-                )))
-            }
+            _ => return Some(Err(format!("`{keyword}` line has no closing `)`: `{line}`"))),
         };
         let mut bindings = Vec::new();
         for pair in rest[open + 1..close].split(',') {
@@ -100,11 +95,7 @@ impl PkTemplate {
             };
             bindings.push((role.trim().to_ascii_lowercase(), var.trim().to_string()));
         }
-        Some(Ok(PkTemplate {
-            keyword: keyword.to_string(),
-            name,
-            bindings,
-        }))
+        Some(Ok(PkTemplate { keyword: keyword.to_string(), name, bindings }))
     }
 
     fn with_roles(&self, roles: &[&str]) -> Vec<String> {
@@ -160,9 +151,7 @@ impl ModelContext {
     /// every declared covariate exists in the data, and the model names at
     /// least one individual parameter.
     pub fn from_model(
-        parsed: &ParsedModel,
-        text: &ModelText,
-        population: &Population,
+        parsed: &ParsedModel, text: &ModelText, population: &Population,
     ) -> Result<Self, String> {
         // The parser's list of top-level `[individual_parameters]`
         // assignments, in source order — not a text scan, which would read a
@@ -196,12 +185,10 @@ impl ModelContext {
                 break;
             }
         }
-        let covariates = parsed.covariate_decls.as_ref().map(|decls| {
-            decls
-                .iter()
-                .map(|d| (d.name.clone(), d.kind))
-                .collect::<Vec<_>>()
-        });
+        let covariates = parsed
+            .covariate_decls
+            .as_ref()
+            .map(|decls| decls.iter().map(|d| (d.name.clone(), d.kind)).collect::<Vec<_>>());
         let data_covariates = population.covariate_names.clone();
         if let Some(decls) = &covariates {
             let missing: Vec<&str> = decls
@@ -213,22 +200,12 @@ impl ModelContext {
                 return Err(format!(
                     "search space: `[covariates]` declares {} but the dataset has no such \
                      column; it has: {}",
-                    missing
-                        .iter()
-                        .map(|m| format!("`{m}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", "),
                     data_covariates.join(", ")
                 ));
             }
         }
-        Ok(ModelContext {
-            parameters,
-            iiv,
-            template,
-            covariates,
-            data_covariates,
-        })
+        Ok(ModelContext { parameters, iiv, template, covariates, data_covariates })
     }
 
     /// Every covariate a `COVARIATE` statement may name: the declared ones
@@ -242,20 +219,14 @@ impl ModelContext {
 
     /// The declared kind of a covariate; `None` when undeclared (no block).
     pub fn covariate_kind(&self, name: &str) -> Option<CovariateKind> {
-        self.covariates
-            .as_ref()?
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, k)| *k)
+        self.covariates.as_ref()?.iter().find(|(n, _)| n == name).map(|(_, k)| *k)
     }
 
     fn declared_of_kind(&self, kind: CovariateKind, symbol: &str) -> Result<Vec<String>, String> {
         match &self.covariates {
-            Some(decls) => Ok(decls
-                .iter()
-                .filter(|(_, k)| *k == kind)
-                .map(|(n, _)| n.clone())
-                .collect()),
+            Some(decls) => {
+                Ok(decls.iter().filter(|(_, k)| *k == kind).map(|(n, _)| n.clone()).collect())
+            }
             None => Err(format!(
                 "search space: `@{symbol}` needs a `[covariates]` block in the base model to \
                  say which columns are {} — the dataset alone cannot tell a categorical \
@@ -275,11 +246,7 @@ impl ModelContext {
     fn template_parameters(&self, bound: Vec<String>) -> Vec<String> {
         let mut out = Vec::new();
         for value in bound {
-            if let Some(p) = self
-                .parameters
-                .iter()
-                .find(|p| p.eq_ignore_ascii_case(&value))
-            {
+            if let Some(p) = self.parameters.iter().find(|p| p.eq_ignore_ascii_case(&value)) {
                 if !out.contains(p) {
                     out.push(p.clone());
                 }
@@ -380,13 +347,7 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
 
     for feature in mfl.features() {
         match feature {
-            Feature::Covariate {
-                optional,
-                parameters,
-                covariates,
-                effects,
-                op,
-            } => {
+            Feature::Covariate { optional, parameters, covariates, effects, op } => {
                 // Pharmpy's override rule (covariate.py, `Covariate.eval`):
                 // a statement is overridable only when its *parameter*
                 // operand is a symbol. `COVARIATE?(CL, @CONTINUOUS, …)` names
@@ -441,24 +402,12 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 }
                 covariate_terms.push((terms, explicit));
             }
-            Feature::Iiv {
-                optional,
-                parameters,
-                effects,
-            }
-            | Feature::Iov {
-                optional,
-                parameters,
-                effects,
-            } => {
+            Feature::Iiv { optional, parameters, effects }
+            | Feature::Iov { optional, parameters, effects } => {
                 // `IIV(*, …)` is every parameter an η could go on; `IOV(*, …)`
                 // is every parameter that already has one (Pharmpy's iovsearch
                 // adds κ on top of the IIV set).
-                let wildcard = if matches!(feature, Feature::Iiv { .. }) {
-                    "PK"
-                } else {
-                    "IIV"
-                };
+                let wildcard = if matches!(feature, Feature::Iiv { .. }) { "PK" } else { "IIV" };
                 let params =
                     resolve_parameters(parameters, ctx, &lets, &feature.keyword(), wildcard)?;
                 if params.is_empty() {
@@ -483,11 +432,7 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 };
                 statements.push(Statement::Feature(ground));
             }
-            Feature::Covariance {
-                optional,
-                level,
-                parameters,
-            } => {
+            Feature::Covariance { optional, level, parameters } => {
                 // `COVARIANCE(IIV, *)`: the wildcard is the η-bearing set, not
                 // `@PK` — a covariance between parameters without an η is not
                 // a candidate anything can build.
@@ -560,11 +505,7 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
         );
     }
 
-    Ok(Resolved {
-        mfl: Mfl { statements },
-        covariate_effects,
-        notes,
-    })
+    Ok(Resolved { mfl: Mfl { statements }, covariate_effects, notes })
 }
 
 fn collect_lets(mfl: &Mfl) -> Result<HashMap<String, Vec<String>>, String> {
@@ -585,9 +526,7 @@ fn collect_lets(mfl: &Mfl) -> Result<HashMap<String, Vec<String>>, String> {
 }
 
 fn lookup(
-    symbol: &str,
-    ctx: &ModelContext,
-    lets: &HashMap<String, Vec<String>>,
+    symbol: &str, ctx: &ModelContext, lets: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<String>, String> {
     if let Some(values) = lets.get(&symbol.to_ascii_uppercase()) {
         return Ok(values.clone());
@@ -619,11 +558,7 @@ fn check_covariate_name(name: &str, ctx: &ModelContext, context: &str) -> Result
     };
     Err(format!(
         "search space: in {context}: `{name}` is not {where_}; known: {}",
-        if known.is_empty() {
-            "(none)".to_string()
-        } else {
-            known.join(", ")
-        }
+        if known.is_empty() { "(none)".to_string() } else { known.join(", ") }
     ))
 }
 
@@ -632,10 +567,7 @@ fn check_covariate_name(name: &str, ctx: &ModelContext, context: &str) -> Result
 /// `@IIV` for a covariance's), so the caller says which. It resolves exactly
 /// as `@{wildcard}` would, `LET` overrides included.
 fn resolve_parameters(
-    operand: &Operand,
-    ctx: &ModelContext,
-    lets: &HashMap<String, Vec<String>>,
-    context: &str,
+    operand: &Operand, ctx: &ModelContext, lets: &HashMap<String, Vec<String>>, context: &str,
     wildcard: &str,
 ) -> Result<Vec<String>, String> {
     let names = match operand {
@@ -656,10 +588,7 @@ fn resolve_parameters(
 }
 
 fn resolve_covariates(
-    operand: &Operand,
-    ctx: &ModelContext,
-    lets: &HashMap<String, Vec<String>>,
-    context: &str,
+    operand: &Operand, ctx: &ModelContext, lets: &HashMap<String, Vec<String>>, context: &str,
 ) -> Result<Vec<String>, String> {
     let names = match operand {
         Operand::Names(names) => names.clone(),
@@ -677,10 +606,7 @@ fn resolve_covariates(
 }
 
 fn check_effect_kind(
-    cov: &str,
-    kind: Option<CovariateKind>,
-    effect: CovariateEffect,
-    feature: &Feature,
+    cov: &str, kind: Option<CovariateKind>, effect: CovariateEffect, feature: &Feature,
 ) -> Result<(), String> {
     match kind {
         Some(CovariateKind::Categorical) if !effect.is_categorical() => Err(format!(
@@ -713,10 +639,7 @@ fn merge_covariate_terms(
     let explicit_pairs: HashSet<(String, String)> = terms
         .iter()
         .filter(|(_, explicit)| *explicit)
-        .flat_map(|(list, _)| {
-            list.iter()
-                .map(|t| (t.parameter.clone(), t.covariate.clone()))
-        })
+        .flat_map(|(list, _)| list.iter().map(|t| (t.parameter.clone(), t.covariate.clone())))
         .collect();
 
     let mut forced_owner: HashMap<(String, String), usize> = HashMap::new();
@@ -772,21 +695,18 @@ fn ground_modes(feature: &Feature) -> Feature {
     match feature {
         Feature::Absorption(m) => Feature::Absorption(g(m)),
         Feature::Elimination(m) => Feature::Elimination(g(m)),
-        Feature::Peripherals { counts, kind } => Feature::Peripherals {
-            counts: counts.clone(),
-            kind: kind.as_ref().map(g),
-        },
-        Feature::Transits { counts, depot } => Feature::Transits {
-            counts: counts.clone(),
-            depot: depot.as_ref().map(g),
-        },
+        Feature::Peripherals { counts, kind } => {
+            Feature::Peripherals { counts: counts.clone(), kind: kind.as_ref().map(g) }
+        }
+        Feature::Transits { counts, depot } => {
+            Feature::Transits { counts: counts.clone(), depot: depot.as_ref().map(g) }
+        }
         Feature::Lagtime(m) => Feature::Lagtime(g(m)),
         Feature::DirectEffect(m) => Feature::DirectEffect(g(m)),
         Feature::EffectComp(m) => Feature::EffectComp(g(m)),
-        Feature::IndirectEffect { mode, production } => Feature::IndirectEffect {
-            mode: g(mode),
-            production: g(production),
-        },
+        Feature::IndirectEffect { mode, production } => {
+            Feature::IndirectEffect { mode: g(mode), production: g(production) }
+        }
         Feature::Metabolite(m) => Feature::Metabolite(g(m)),
         other => other.clone(),
     }
