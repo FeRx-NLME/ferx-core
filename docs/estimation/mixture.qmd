@@ -54,7 +54,7 @@ a softmax (reference class $K$ has logit 0), while `p(k)` is used as the
 probability directly and the class weights are renormalised to sum to one. A
 constant `p(1) = 0.3` is therefore identical to `logit(1) = \ln(0.3/0.7)`. The
 outer gradient is analytic for both forms: the softmax (`logit`) or clamp-and-renormalise
-(`p(k)`) map is differentiated exactly, so neither form takes a finite-difference gradient.
+(`p(k)`) map is differentiated exactly when the analytic mixture gradient runs.
 
 ## Objective
 
@@ -94,15 +94,16 @@ and on the class's own grid (the Hessian that scales the grid is class $k$'s, ex
 Laplace and Gauss-Newton for FOCEI quadrature), instead of the FOCE/FOCEI marginal; the
 log-sum-exp over classes is unchanged. Under IOV the class mode is the stacked
 $[\hat\eta, \hat\kappa]$, as for a single population. The outer gradient, the
-covariance R-matrix and the score cross-product $S$ are exact for the same objective, with
-no finite-difference fallback: a (subject $\times$ class) term the adjoint declines at run
-time is salvaged on its own by that term's reconverged difference, as for FOCE/FOCEI.
+covariance R-matrix and the score cross-product $S$ have exact routes for the same objective.
+For the outer gradient, a (subject $\times$ class) term the adjoint declines at run time
+uses a reconverged finite difference, as for FOCE/FOCEI.
 A mixture of identical classes reproduces the single-population Laplace/AGQ fit.
 The FOCE and FOCEI mixture objectives are unchanged; their default optimizer is not (below).
 
 `optimizer = auto` resolves for a mixture exactly as for a single population: NLopt L-BFGS on
-the exact mixture gradient for every method (FOCE, FOCEI, Laplace, AGQ). An explicit
-`optimizer = bobyqa` is honoured. `agq_eval_only = true` is refused on a mixture
+the exact mixture gradient for supported FOCE, FOCEI, Laplace, and AGQ fits.
+Laplace keeps L-BFGS with `gradient = fd` and supplies a finite-difference gradient.
+An explicit `optimizer = bobyqa` is honoured. `agq_eval_only = true` is refused on a mixture
 (`E_MIXTURE_METHOD`): the evaluation-only quadrature stage scores a single population and
 would replace the mixture objective with a one-class value; an estimating `laplace` stage
 already reports the mixture objective.
@@ -184,7 +185,9 @@ The warning does not change the fit. A start with near-identical classes is a
 near-symmetric point of the objective, where the gradient barely separates the classes
 and the fit can settle on a saddle (at the collapsed optimum above the exact
 R-matrix has one negative eigenvalue, $-0.18$ against a largest of $5.5\times10^{3}$).
-When it fires, refit with the class starts further apart and compare the objectives:
+With exactly symmetric starts in exchangeable classes, the derivative in the direction that
+separates the classes is zero. Give the classes distinct starting values to keep using
+L-BFGS. If the warning fires, move the class starts further apart and compare the objectives:
 on the fixture above, a start of 1.2 / 2.5 reaches 299.86 under the default L-BFGS.
 Changing the optimizer is not a reliable fix, because neither one escapes every
 symmetric start: from 1.70 / 1.71, `optimizer = bobyqa` reaches 299.86 under FOCEI but
