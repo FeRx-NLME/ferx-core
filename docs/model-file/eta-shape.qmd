@@ -73,14 +73,16 @@ two spellings give the same model, the same θ layout and the same fit.
 The block refuses, by name:
 
 - an ETA that is not declared, or one shaped twice;
-- an ETA that `[individual_parameters]` *also* shapes inline (it would be
-  transformed twice);
+- an ETA that `[individual_parameters]` *also* shapes inline, directly as the
+  shape's argument (it would be transformed twice) — a shape applied through an
+  intermediate variable is not seen, so check that yourself;
 - an IOV kappa — shaping a kappa is not supported yet
   ([#1717](https://github.com/FeRx-NLME/ferx-core/issues/1717));
-- an ETA that a prediction block reads directly (`[error_model]`'s
-  `iiv_on_ruv = ETA_RUV`, an `[odes]` line, a hazard in a named
-  `[event_model NAME]`): the shape applies in
-  `[individual_parameters]` only, so read it through an individual parameter;
+- an ETA that another block reads directly, where it would see η rather than
+  h(η): a hazard in a named `[event_model NAME]` (read it through an individual
+  parameter instead — the shape applies in `[individual_parameters]` only),
+  `[error_model]`'s `iiv_on_ruv = ETA_RUV` (which takes an unshaped ETA: give
+  it its own), or a `[mixture]` mixing expression (which reads no ETA);
 - an auto-declared θ name that `[parameters]` already uses — name the θ inside
   the parentheses instead.
 
