@@ -78,9 +78,7 @@ impl ModelSource {
     /// `E_MODEL_READ`, an edited one `E_FIT_INPUT_CHANGED`, one that does not parse
     /// the parse's own code. Its `Display` is the read's text, unchanged.
     pub fn read_verified(
-        path: impl AsRef<Path>,
-        expected_hash: Option<&str>,
-        entry: &str,
+        path: impl AsRef<Path>, expected_hash: Option<&str>, entry: &str,
     ) -> Result<Self, EngineError> {
         // Classify the unprefixed read: several parse codes are keyed on the
         // parser's message from byte zero (`Missing [`, `Unknown block`), so a
@@ -94,10 +92,7 @@ impl ModelSource {
     /// `prefix` opens every message; `because` closes the read and hash failures
     /// (the post-hoc resolver says there why the file is needed at all).
     pub(crate) fn load(
-        path: &Path,
-        expected_hash: Option<&str>,
-        prefix: &str,
-        because: &str,
+        path: &Path, expected_hash: Option<&str>, prefix: &str, because: &str,
     ) -> Result<Self, ModelSourceError> {
         let shown = path.display();
         let bytes = std::fs::read(path).map_err(|e| {
@@ -120,12 +115,7 @@ impl ModelSource {
         })?;
         let parsed = crate::parser::model_parser::parse_full_model_source(&text, path)
             .map_err(|e| ModelSourceError::Parse(format!("{prefix}{e}")))?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            text,
-            hash,
-            parsed,
-        })
+        Ok(Self { path: path.to_path_buf(), text, hash, parsed })
     }
 }
 
@@ -213,9 +203,8 @@ mod tests {
     #[test]
     fn a_prefix_keyed_parse_code_survives_the_entry() {
         let (_d, path) = file(MODEL.split("[error_model]").next().unwrap());
-        let err = ModelSource::read_verified(&path, None, "ferx_sir")
-            .err()
-            .expect("no [error_model]");
+        let err =
+            ModelSource::read_verified(&path, None, "ferx_sir").err().expect("no [error_model]");
         assert_eq!(err.code(), Some("E_MISSING_BLOCK"), "{err}");
         assert_eq!(err.block(), Some("error_model"));
         assert_eq!(err.context(), Some("ferx_sir"));
@@ -232,9 +221,7 @@ mod tests {
         let err = ModelSource::read(&path).err().expect("missing");
         let want = format!("cannot read the model file {}: ", path.display());
         assert!(err.starts_with(&want), "{err}");
-        let err = ModelSource::read_verified(&path, None, "ferx_sir")
-            .err()
-            .expect("missing");
+        let err = ModelSource::read_verified(&path, None, "ferx_sir").err().expect("missing");
         assert_eq!(err.code(), Some("E_MODEL_READ"));
         let err = err.to_string();
         assert!(err.starts_with(&format!("ferx_sir: {want}")), "{err}");
@@ -249,13 +236,8 @@ mod tests {
         let err = ModelSource::read(&path).err().expect("not UTF-8");
         let want = format!("the model file {} is not UTF-8: ", path.display());
         assert!(err.starts_with(&want), "{err}");
-        let err = ModelSource::read_verified(&path, None, "ferx_sir")
-            .err()
-            .expect("not UTF-8");
+        let err = ModelSource::read_verified(&path, None, "ferx_sir").err().expect("not UTF-8");
         assert_eq!(err.code(), Some("E_MODEL_READ"));
-        assert!(
-            err.to_string().starts_with(&format!("ferx_sir: {want}")),
-            "{err}"
-        );
+        assert!(err.to_string().starts_with(&format!("ferx_sir: {want}")), "{err}");
     }
 }

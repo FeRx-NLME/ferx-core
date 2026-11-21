@@ -65,53 +65,29 @@ const OFV_AT_TRUTH_TOL: f64 = 1e-7;
 const MIN_IMPROVEMENT: f64 = 4.5;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_ctmm_matches_nonmem_2state() {
-    let opts = FitOptions {
-        outer_maxiter: 300,
-        ..Default::default()
-    };
-    let res = fit_from_files(
-        "examples/ctmm_2state.ferx",
-        Some("data/ctmm_2state.csv"),
-        None,
-        Some(opts),
-    )
-    .expect("2-state CTMM fit must converge");
+    let opts = FitOptions { outer_maxiter: 300, ..Default::default() };
+    let res =
+        fit_from_files("examples/ctmm_2state.ferx", Some("data/ctmm_2state.csv"), None, Some(opts))
+            .expect("2-state CTMM fit must converge");
 
     let (lq01, lq10) = (res.theta[0], res.theta[1]);
 
     // Log-intensities: NONMEM and ferx agree to ~1e-3 on an identical likelihood
     // (< 0.01 of the ~0.14 SEs). Use an absolute tolerance — the values are near
     // zero, so a relative one would be needlessly strict.
-    assert!(
-        (lq01 - NM_LQ01).abs() < 5e-3,
-        "LQ01 {lq01} vs NONMEM {NM_LQ01}"
-    );
-    assert!(
-        (lq10 - NM_LQ10).abs() < 5e-3,
-        "LQ10 {lq10} vs NONMEM {NM_LQ10}"
-    );
+    assert!((lq01 - NM_LQ01).abs() < 5e-3, "LQ01 {lq01} vs NONMEM {NM_LQ01}");
+    assert!((lq10 - NM_LQ10).abs() < 5e-3, "LQ10 {lq10} vs NONMEM {NM_LQ10}");
 
     // OFV (−2 log L): exact same objective; agree to well under 0.01.
-    assert!(
-        (res.ofv - NM_OFV).abs() < 1e-2,
-        "OFV {} vs NONMEM {NM_OFV}",
-        res.ofv
-    );
+    assert!((res.ofv - NM_OFV).abs() < 1e-2, "OFV {} vs NONMEM {NM_OFV}", res.ofv);
 }
 
 /// The objective of `examples/ctmm_pd_2state.ferx` at its own initial estimates, which are
 /// the data-generating parameters (`outer_maxiter = 0`, so one evaluation and no optimizer).
 fn drug_driven_ctmm_ofv_at_truth() -> f64 {
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..Default::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..Default::default() };
     let res = fit_from_files(
         "examples/ctmm_pd_2state.ferx",
         Some("data/ctmm_pd_2state.csv"),
@@ -167,15 +143,9 @@ fn drug_driven_ctmm_objective_at_truth() {
 /// that only re-solves the other parameters cannot clear `MIN_IMPROVEMENT`. Measured: 6.59
 /// on macOS arm64 and 6.59 on Linux x86_64 (BOBYQA to the bound, 709.07).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_drug_driven_ctmm_recovers_simulated_params() {
-    let opts = FitOptions {
-        outer_maxiter: 300,
-        ..Default::default()
-    };
+    let opts = FitOptions { outer_maxiter: 300, ..Default::default() };
     let res = fit_from_files(
         "examples/ctmm_pd_2state.ferx",
         Some("data/ctmm_pd_2state.csv"),
@@ -188,14 +158,8 @@ fn ferx_drug_driven_ctmm_recovers_simulated_params() {
     // concentration effect is resolved as clearly positive (not merely near 0) all along the
     // ridge (≥ 0.11 on the profile above); its size rides the ridge.
     let slope = res.theta[4];
-    assert!(
-        slope > 0.05,
-        "SLOPE {slope} must be a clear positive drug effect"
-    );
-    assert!(
-        res.converged,
-        "drug-driven CTMM fit must report convergence"
-    );
+    assert!(slope > 0.05, "SLOPE {slope} must be a clear positive drug effect");
+    assert!(res.converged, "drug-driven CTMM fit must report convergence");
     // The start is the truth, so a fit that barely moves would pass the bound above. It must
     // descend the ridge, past what refitting at the truth's LQ01 reaches (see above).
     let at_truth = drug_driven_ctmm_ofv_at_truth();
@@ -240,15 +204,9 @@ const NM_MCTMM_THETA: [f64; 4] = [0.637932, -0.440228, 0.506227, 1.06458];
 const NM_MCTMM_OFV: f64 = 966.44693124;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_mctmm_matches_nonmem_3state() {
-    let opts = FitOptions {
-        outer_maxiter: 300,
-        ..Default::default()
-    };
+    let opts = FitOptions { outer_maxiter: 300, ..Default::default() };
     let res = fit_from_files(
         "examples/mctmm_3state.ferx",
         Some("data/mctmm_3state.csv"),
@@ -260,10 +218,7 @@ fn ferx_mctmm_matches_nonmem_3state() {
     eprintln!("mCTMM ferx theta = {:?}, OFV = {:.10}", res.theta, res.ofv);
     for (i, (got, want)) in res.theta.iter().zip(NM_MCTMM_THETA).enumerate() {
         assert!(got.is_finite(), "theta[{i}] = {got}");
-        assert!(
-            (got - want).abs() < MCTMM_THETA_TOL,
-            "theta[{i}] {got} vs NONMEM {want}"
-        );
+        assert!((got - want).abs() < MCTMM_THETA_TOL, "theta[{i}] {got} vs NONMEM {want}");
     }
     assert!(
         (res.ofv - NM_MCTMM_OFV).abs() < MCTMM_OFV_TOL,

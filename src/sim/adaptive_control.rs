@@ -130,10 +130,7 @@ impl AdaptiveController {
     /// `confirm` debounce, and return the dose action(s).
     fn decide(&mut self, ctx: &ControllerCtx) -> ControllerDecision {
         if self.stopped {
-            return ControllerDecision {
-                actions: vec![],
-                rule: None,
-            };
+            return ControllerDecision { actions: vec![], rule: None };
         }
         // The engine-side half always declares the `signal` monitor this
         // controller reads, so `None` is an internal wiring bug, not user input;
@@ -141,12 +138,7 @@ impl AdaptiveController {
         // signal.
         let signal = match ctx.signal(ADAPTIVE_SIGNAL) {
             Some(v) => v,
-            None => {
-                return ControllerDecision {
-                    actions: self.emit_dose(self.dose),
-                    rule: None,
-                }
-            }
+            None => return ControllerDecision { actions: self.emit_dose(self.dose), rule: None },
         };
 
         let matched = self.rules.iter().position(|r| r.matches(signal));
@@ -175,16 +167,10 @@ impl AdaptiveController {
                 let step = self.rules[idx].interval;
                 let mut actions = self.apply(action);
                 actions.extend(self.step_interval(step));
-                return ControllerDecision {
-                    actions,
-                    rule: Some(rule),
-                };
+                return ControllerDecision { actions, rule: Some(rule) };
             }
         }
-        ControllerDecision {
-            actions: self.emit_dose(self.dose),
-            rule: None,
-        }
+        ControllerDecision { actions: self.emit_dose(self.dose), rule: None }
     }
 
     fn apply(&mut self, action: AdaptiveAction) -> Vec<DoseAction> {
@@ -219,9 +205,7 @@ impl AdaptiveController {
             return None;
         }
         self.rung = rung;
-        Some(DoseAction::SetInterval {
-            interval: ladder[rung],
-        })
+        Some(DoseAction::SetInterval { interval: ladder[rung] })
     }
 
     /// Move the running dose one step up/down, clamped to `dose_bounds` — or, with
@@ -262,11 +246,9 @@ impl AdaptiveController {
         }
         match self.route {
             AdaptiveRoute::Bolus { cmt } => vec![DoseAction::Bolus { amt: dose, cmt }],
-            AdaptiveRoute::Infuse { cmt, over } => vec![DoseAction::Infuse {
-                amt: dose,
-                cmt,
-                rate: dose / over,
-            }],
+            AdaptiveRoute::Infuse { cmt, over } => {
+                vec![DoseAction::Infuse { amt: dose, cmt, rate: dose / over }]
+            }
         }
     }
 }
@@ -345,9 +327,7 @@ impl CompiledDoseExprs {
     /// Whether any expression reads a subject value, so that a subject may be dosed from
     /// it only when that value is known (or under `dose_knowledge = oracle`).
     pub(crate) fn reads_subject_values(&self) -> bool {
-        self.exprs
-            .iter()
-            .any(|e| !e.reads.subject_values.is_empty())
+        self.exprs.iter().any(|e| !e.reads.subject_values.is_empty())
     }
 
     /// Whether any expression reads an individual parameter, a draw-free one included:
@@ -366,12 +346,8 @@ impl CompiledDoseExprs {
     /// zeros too; the caller passes `None` only when [`Self::reads_indiv_params`] and
     /// [`Self::reads_subject_values`] are both false.
     pub(crate) fn resolve(
-        &self,
-        spec: &AdaptiveDosingSpec,
-        model: &CompiledModel,
-        theta: &[f64],
-        covs: &std::collections::HashMap<String, f64>,
-        subject: Option<&SubjectValues<'_>>,
+        &self, spec: &AdaptiveDosingSpec, model: &CompiledModel, theta: &[f64],
+        covs: &std::collections::HashMap<String, f64>, subject: Option<&SubjectValues<'_>>,
     ) -> ResolvedDosePlan {
         let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
         let states = vec![0.0; n_states];
@@ -381,36 +357,21 @@ impl CompiledDoseExprs {
             Some(v) => (v.pk, v.eta),
             None => (&zero_pk, zero_eta.as_slice()),
         };
-        let mut values = self
-            .exprs
-            .iter()
-            .map(|e| (e.eval)(&states, &pk.values, theta, eta, covs));
+        let mut values = self.exprs.iter().map(|e| (e.eval)(&states, &pk.values, theta, eta, covs));
         let mut value = |v: &crate::sim::adaptive::DoseValue| match v.as_literal() {
             Some(x) => x,
-            None => values
-                .next()
-                .expect("one compiled expression per dose expression, in order"),
+            None => values.next().expect("one compiled expression per dose expression, in order"),
         };
         // `dose_expressions` order: start_dose, the two bounds, then the levels.
         let start_dose = value(&spec.start_dose);
         let dose_bounds = (value(&spec.dose_bounds.0), value(&spec.dose_bounds.1));
-        let levels = spec
-            .levels
-            .as_ref()
-            .map(|l| l.iter().map(&mut value).collect::<Vec<f64>>());
-        let plan = SubjectDosePlan {
-            start_dose,
-            dose_bounds,
-            levels,
-        };
+        let levels = spec.levels.as_ref().map(|l| l.iter().map(&mut value).collect::<Vec<f64>>());
+        let plan = SubjectDosePlan { start_dose, dose_bounds, levels };
         let mut reads: Vec<(String, f64)> = self
             .covariates()
             .into_iter()
             .map(|(_, c)| {
-                (
-                    c.to_string(),
-                    crate::parser::model_parser::output_covariate_read(covs, c),
-                )
+                (c.to_string(), crate::parser::model_parser::output_covariate_read(covs, c))
             })
             .collect();
         // Every individual parameter read, then the random effects and `MIXNUM`.
@@ -423,15 +384,9 @@ impl CompiledDoseExprs {
             }
         }
         reads.extend(
-            names
-                .into_iter()
-                .map(|n| (n.to_string(), subject_value_read(model, pk, eta, n))),
+            names.into_iter().map(|n| (n.to_string(), subject_value_read(model, pk, eta, n))),
         );
-        ResolvedDosePlan {
-            violation: dose_plan_violation(spec, &plan),
-            plan,
-            reads,
-        }
+        ResolvedDosePlan { violation: dose_plan_violation(spec, &plan), plan, reads }
     }
 }
 
@@ -456,10 +411,7 @@ fn first_reads<'a>(
 /// effect's η, or the mixture class. For the "reads" sentence of a refusal, so it
 /// reports the value the expression used.
 fn subject_value_read(
-    model: &CompiledModel,
-    pk: &crate::types::PkParams,
-    eta: &[f64],
-    name: &str,
+    model: &CompiledModel, pk: &crate::types::PkParams, eta: &[f64], name: &str,
 ) -> f64 {
     if name == "MIXNUM" {
         return crate::parser::model_parser::current_mixture_class() as f64;
@@ -467,11 +419,7 @@ fn subject_value_read(
     if let Some(i) = model.indiv_param_names.iter().position(|n| n == name) {
         return pk.values[model.pk_indices.get(i).copied().unwrap_or(i)];
     }
-    model
-        .eta_names
-        .iter()
-        .position(|n| n == name)
-        .map_or(f64::NAN, |i| eta[i])
+    model.eta_names.iter().position(|n| n == name).map_or(f64::NAN, |i| eta[i])
 }
 
 /// Compile every dose expression of `spec` (#944) through the same
@@ -479,13 +427,9 @@ fn subject_value_read(
 /// a dose expression may not make (the parser's check, again, for a spec built in
 /// code).
 pub(crate) fn compile_dose_exprs(
-    model: &CompiledModel,
-    spec: &AdaptiveDosingSpec,
+    model: &CompiledModel, spec: &AdaptiveDosingSpec,
 ) -> Result<CompiledDoseExprs, String> {
-    let state_names: &[String] = model
-        .ode_spec
-        .as_ref()
-        .map_or(&[], |o| o.state_names.as_slice());
+    let state_names: &[String] = model.ode_spec.as_ref().map_or(&[], |o| o.state_names.as_slice());
     let mut exprs = Vec::new();
     for (key, src) in spec.dose_expressions() {
         let reads = crate::parser::model_parser::check_adaptive_dose_expression(
@@ -514,12 +458,7 @@ pub(crate) fn compile_dose_exprs(
             &mut warnings,
             &mut Vec::new(),
         )?;
-        exprs.push(CompiledDoseExpr {
-            key,
-            eval,
-            covariates,
-            reads,
-        });
+        exprs.push(CompiledDoseExpr { key, eval, covariates, reads });
     }
     let compiled = CompiledDoseExprs { exprs };
     crate::parser::model_parser::check_dose_knowledge_used(
@@ -547,9 +486,7 @@ pub(crate) fn compile_dose_exprs(
 /// model reads a declared `T` as the data column in `[scaling]` and as the
 /// model-time built-in here (#1028).
 pub(crate) fn compile_observe(
-    model: &CompiledModel,
-    observe: &str,
-    declared_covariates: &[String],
+    model: &CompiledModel, observe: &str, declared_covariates: &[String],
 ) -> Result<(OdeOutputFn, Vec<String>), String> {
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
         "[adaptive_dosing] requires an ODE model (the analytical engine is a follow-up)".to_string()
@@ -620,8 +557,7 @@ pub(crate) struct CompiledAdaptive {
 /// Compile a declarative spec against its model into the engine-ready
 /// [`CompiledAdaptive`] bundle (#391 S2.2).
 pub(crate) fn compile_adaptive(
-    model: &CompiledModel,
-    spec: &AdaptiveDosingSpec,
+    model: &CompiledModel, spec: &AdaptiveDosingSpec,
 ) -> Result<CompiledAdaptive, Diagnostic> {
     // Re-check the spec's cross-field invariants here too: the struct is `pub`
     // with `pub` fields, so a programmatically-built spec may not have passed
@@ -641,9 +577,7 @@ pub(crate) fn compile_adaptive(
         // own readout — `observe = None` makes the driver read `read_observable(cmt)`
         // — and its σ from that cmt's `[error_model]`, so the two share one source
         // and can never be on different scales.
-        let cmt = spec
-            .assay_cmt
-            .expect("validate() requires assay_cmt under with_assay_error");
+        let cmt = spec.assay_cmt.expect("validate() requires assay_cmt under with_assay_error");
         if cmt == 0 || cmt > ode.n_states {
             return Err(crate::api::adaptive_spec(format!(
                 "[adaptive_dosing]: assay_cmt = {cmt} is out of range (model has {} compartment(s))",
@@ -654,10 +588,8 @@ pub(crate) fn compile_adaptive(
     } else {
         // Ipred: titrate on the compiled `observe` expression (no measurement
         // noise); the monitor `cmt` is unused (placeholder 1).
-        let observe_src = spec
-            .observe
-            .as_deref()
-            .expect("validate() requires observe without with_assay_error");
+        let observe_src =
+            spec.observe.as_deref().expect("validate() requires observe without with_assay_error");
         let (out_fn, cov) = compile_observe(model, observe_src, &spec.observe_declared_covariates)
             .map_err(crate::api::adaptive_spec)?;
         (ObserveMode::Ipred, Some(out_fn), cov, 1)
@@ -681,12 +613,8 @@ mod tests {
     use std::collections::HashMap;
 
     fn spec(
-        start_dose: f64,
-        route: AdaptiveRoute,
-        dose_bounds: (f64, f64),
-        confirm: u32,
-        levels: Option<Vec<f64>>,
-        rules: Vec<AdaptiveRule>,
+        start_dose: f64, route: AdaptiveRoute, dose_bounds: (f64, f64), confirm: u32,
+        levels: Option<Vec<f64>>, rules: Vec<AdaptiveRule>,
     ) -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
             observe: Some("central".to_string()),
@@ -711,12 +639,7 @@ mod tests {
     }
 
     fn rule(op: Comparison, threshold: f64, action: AdaptiveAction) -> AdaptiveRule {
-        AdaptiveRule {
-            op,
-            threshold,
-            action,
-            interval: None,
-        }
+        AdaptiveRule { op, threshold, action, interval: None }
     }
 
     /// Drive a fresh controller through a sequence of signal values, returning the
@@ -757,11 +680,7 @@ mod tests {
             (0.0, 400.0),
             1,
             None,
-            vec![rule(
-                Comparison::Lt,
-                10.0,
-                AdaptiveAction::Increase(DoseStep::Percent(25.0)),
-            )],
+            vec![rule(Comparison::Lt, 10.0, AdaptiveAction::Increase(DoseStep::Percent(25.0)))],
         );
         let out = run(&s, &[50.0, 50.0]); // signal never < 10
         assert_eq!(out[0], bolus(100.0, 1));
@@ -776,11 +695,7 @@ mod tests {
             (0.0, 400.0),
             1,
             None,
-            vec![rule(
-                Comparison::Lt,
-                10.0,
-                AdaptiveAction::Increase(DoseStep::Percent(25.0)),
-            )],
+            vec![rule(Comparison::Lt, 10.0, AdaptiveAction::Increase(DoseStep::Percent(25.0)))],
         );
         let out = run(&s, &[5.0]);
         assert_eq!(out[0], bolus(125.0, 1));
@@ -794,11 +709,7 @@ mod tests {
             (0.0, 1000.0),
             2,
             None,
-            vec![rule(
-                Comparison::Lt,
-                10.0,
-                AdaptiveAction::Increase(DoseStep::Percent(25.0)),
-            )],
+            vec![rule(Comparison::Lt, 10.0, AdaptiveAction::Increase(DoseStep::Percent(25.0)))],
         );
         // signal < 10 at every decision; confirm = 2 ⇒ act on every 2nd consecutive match.
         let out = run(&s, &[5.0, 5.0, 5.0, 5.0]);
@@ -816,11 +727,7 @@ mod tests {
             (10.0, 400.0),
             1,
             None,
-            vec![rule(
-                Comparison::Gt,
-                20.0,
-                AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
-            )],
+            vec![rule(Comparison::Gt, 20.0, AdaptiveAction::Decrease(DoseStep::Percent(50.0)))],
         );
         let out = run(&s, &[30.0, 30.0, 30.0]); // 100 → 50 → 25 → 12.5? clamp at 10
         assert_eq!(out[0], bolus(50.0, 1));
@@ -834,22 +741,10 @@ mod tests {
         // not a zero-amount dose: an `Infuse { amt: 0 }` would carry `rate = 0`,
         // which the driver's up-front action validation rejects (`rate > 0`),
         // erroring the whole run. Both routes must emit `Hold` instead.
-        let decrease_100 = || {
-            vec![rule(
-                Comparison::Gt,
-                1.0,
-                AdaptiveAction::Decrease(DoseStep::Percent(100.0)),
-            )]
-        };
+        let decrease_100 =
+            || vec![rule(Comparison::Gt, 1.0, AdaptiveAction::Decrease(DoseStep::Percent(100.0)))];
         // Bolus route (previously a zero bolus the driver silently skipped).
-        let s = spec(
-            100.0,
-            AdaptiveRoute::Bolus { cmt: 1 },
-            (0.0, 400.0),
-            1,
-            None,
-            decrease_100(),
-        );
+        let s = spec(100.0, AdaptiveRoute::Bolus { cmt: 1 }, (0.0, 400.0), 1, None, decrease_100());
         assert_eq!(run(&s, &[50.0])[0], vec![DoseAction::Hold]);
 
         // Infuse route: previously emitted `Infuse { amt: 0, rate: 0 }`, the
@@ -874,16 +769,8 @@ mod tests {
             1,
             Some(vec![50.0, 100.0, 150.0, 200.0]),
             vec![
-                rule(
-                    Comparison::Lt,
-                    1.0,
-                    AdaptiveAction::Increase(DoseStep::Level),
-                ),
-                rule(
-                    Comparison::Gt,
-                    3.0,
-                    AdaptiveAction::Decrease(DoseStep::Level),
-                ),
+                rule(Comparison::Lt, 1.0, AdaptiveAction::Increase(DoseStep::Level)),
+                rule(Comparison::Gt, 3.0, AdaptiveAction::Decrease(DoseStep::Level)),
             ],
         );
         // start at level idx 1 (=100). up, up (saturate at 200), then down.
@@ -955,11 +842,7 @@ mod tests {
             None,
             vec![
                 rule(Comparison::Gt, 10.0, AdaptiveAction::Hold), // matches first for signal 50
-                rule(
-                    Comparison::Gt,
-                    20.0,
-                    AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
-                ),
+                rule(Comparison::Gt, 20.0, AdaptiveAction::Decrease(DoseStep::Percent(50.0))),
             ],
         );
         let out = run(&s, &[50.0]);
@@ -974,11 +857,7 @@ mod tests {
             (0.0, 1000.0),
             1,
             None,
-            vec![rule(
-                Comparison::Lt,
-                10.0,
-                AdaptiveAction::Increase(DoseStep::Percent(50.0)),
-            )],
+            vec![rule(Comparison::Lt, 10.0, AdaptiveAction::Increase(DoseStep::Percent(50.0)))],
         );
         let factory = build_adaptive_controller(&s);
         let empty_cov: HashMap<String, f64> = HashMap::new();
@@ -1044,9 +923,7 @@ mod tests {
 "#;
 
     fn mk_spec(
-        observe: &str,
-        with_assay_error: bool,
-        assay_cmt: Option<usize>,
+        observe: &str, with_assay_error: bool, assay_cmt: Option<usize>,
     ) -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
             // `observe` is the latent (Ipred) signal; under assay error there is no
@@ -1083,18 +960,14 @@ mod tests {
         let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
         // central amount = 200, V = 50 ⇒ concentration 4.0 — NOT the raw amount 200.
         let v = observe(&[200.0], &pk.values, &theta, &eta, &cov);
-        assert!(
-            (v - 4.0).abs() < 1e-9,
-            "expected concentration 4.0, got {v}"
-        );
+        assert!((v - 4.0).abs() < 1e-9, "expected concentration 4.0, got {v}");
     }
 
     #[test]
     fn compile_observe_requires_ode_model() {
         let model = parse_full_model(ANALYTICAL_MODEL).unwrap().model;
-        let err = compile_observe(&model, "central / V", &[])
-            .err()
-            .expect("analytical model must error");
+        let err =
+            compile_observe(&model, "central / V", &[]).err().expect("analytical model must error");
         assert!(err.contains("requires an ODE model"), "got: {err}");
     }
 
@@ -1105,20 +978,14 @@ mod tests {
         assert_eq!(ipred.monitors.len(), 1);
         assert_eq!(ipred.monitors[0].name, ADAPTIVE_SIGNAL);
         assert_eq!(ipred.monitors[0].mode, ObserveMode::Ipred);
-        assert!(
-            ipred.observe.is_some(),
-            "Ipred compiles the observe expression"
-        );
+        assert!(ipred.observe.is_some(), "Ipred compiles the observe expression");
 
         // Dv: the signal is the noised model output named by `assay_cmt`; its value
         // comes from the model's own readout, so no `observe` expression is compiled.
         let dv = compile_adaptive(&model, &mk_spec("", true, Some(1))).unwrap();
         assert_eq!(dv.monitors[0].mode, ObserveMode::Dv);
         assert_eq!(dv.monitors[0].cmt, 1);
-        assert!(
-            dv.observe.is_none(),
-            "Dv reads the model output, not a re-typed expression"
-        );
+        assert!(dv.observe.is_none(), "Dv reads the model output, not a re-typed expression");
     }
 
     #[test]
@@ -1128,19 +995,13 @@ mod tests {
         let err = compile_adaptive(&model, &mk_spec("", true, None))
             .err()
             .expect("with_assay_error needs assay_cmt");
-        assert!(
-            err.message.contains("requires `assay_cmt"),
-            "needs assay_cmt: {err:?}"
-        );
+        assert!(err.message.contains("requires `assay_cmt"), "needs assay_cmt: {err:?}");
         assert_eq!(err.code, "E_ADAPTIVE_SPEC", "{err:?}");
         // a measured output beyond the model's compartments
         let err = compile_adaptive(&model, &mk_spec("", true, Some(3)))
             .err()
             .expect("out-of-range assay_cmt must error");
-        assert!(
-            err.message.contains("out of range"),
-            "out of range: {err:?}"
-        );
+        assert!(err.message.contains("out of range"), "out of range: {err:?}");
         assert_eq!(err.code, "E_ADAPTIVE_SPEC", "{err:?}");
     }
 
@@ -1149,19 +1010,10 @@ mod tests {
     /// `spec` with an interval ladder and `start_interval`; the rules carry their own
     /// interval effects.
     fn interval_spec(
-        confirm: u32,
-        intervals: &[f64],
-        start: f64,
-        rules: Vec<AdaptiveRule>,
+        confirm: u32, intervals: &[f64], start: f64, rules: Vec<AdaptiveRule>,
     ) -> AdaptiveDosingSpec {
-        let mut s = spec(
-            100.0,
-            AdaptiveRoute::Bolus { cmt: 1 },
-            (0.0, 400.0),
-            confirm,
-            None,
-            rules,
-        );
+        let mut s =
+            spec(100.0, AdaptiveRoute::Bolus { cmt: 1 }, (0.0, 400.0), confirm, None, rules);
         s.intervals = Some(intervals.to_vec());
         s.start_interval = Some(start);
         s
@@ -1234,11 +1086,7 @@ mod tests {
                     IntervalStep::Lengthen,
                 ),
                 with_interval(
-                    rule(
-                        Comparison::Gt,
-                        20.0,
-                        AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
-                    ),
+                    rule(Comparison::Gt, 20.0, AdaptiveAction::Decrease(DoseStep::Percent(50.0))),
                     IntervalStep::Lengthen,
                 ),
             ],
@@ -1274,11 +1122,7 @@ mod tests {
     #[test]
     fn rule_label_names_both_effects() {
         let r = with_interval(
-            rule(
-                Comparison::Gt,
-                20.0,
-                AdaptiveAction::Decrease(DoseStep::Percent(25.0)),
-            ),
+            rule(Comparison::Gt, 20.0, AdaptiveAction::Decrease(DoseStep::Percent(25.0))),
             IntervalStep::Lengthen,
         );
         assert_eq!(r.label(), "signal > 20 : decrease 25%, lengthen");
@@ -1347,11 +1191,8 @@ mod tests {
     /// Mutation: `step_dose` carries `x` and only the emitted amount is rounded.
     #[test]
     fn round_to_carries_the_rounded_dose() {
-        let s = grid_spec(
-            500.0,
-            (250.0, 4000.0),
-            AdaptiveAction::Increase(DoseStep::Percent(30.0)),
-        );
+        let s =
+            grid_spec(500.0, (250.0, 4000.0), AdaptiveAction::Increase(DoseStep::Percent(30.0)));
         let out = run(&s, &[0.0, 0.0, 50.0]);
         assert_eq!(amt(&out[0]).to_bits(), 750.0f64.to_bits(), "{out:?}");
         assert_eq!(amt(&out[1]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
@@ -1365,11 +1206,8 @@ mod tests {
     /// Mutation: clamp to the raw bounds, then round.
     #[test]
     fn round_to_rounds_then_clamps_to_the_aligned_bound() {
-        let s = grid_spec(
-            1000.0,
-            (250.0, 1150.0),
-            AdaptiveAction::Increase(DoseStep::Percent(30.0)),
-        );
+        let s =
+            grid_spec(1000.0, (250.0, 1150.0), AdaptiveAction::Increase(DoseStep::Percent(30.0)));
         let out = run(&s, &[0.0]);
         assert_eq!(amt(&out[0]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
     }
@@ -1396,22 +1234,12 @@ mod tests {
     /// Mutation: an absorbed step reported as no rule.
     #[test]
     fn round_to_an_absorbed_step_names_the_rule_and_keeps_the_dose() {
-        let s = grid_spec(
-            500.0,
-            (250.0, 4000.0),
-            AdaptiveAction::Increase(DoseStep::Percent(10.0)),
-        );
+        let s =
+            grid_spec(500.0, (250.0, 4000.0), AdaptiveAction::Increase(DoseStep::Percent(10.0)));
         let out = decisions(&s, &[0.0, 0.0]);
         for (i, d) in out.iter().enumerate() {
-            assert_eq!(
-                amt(&d.actions).to_bits(),
-                500.0f64.to_bits(),
-                "decision {i}"
-            );
-            assert!(
-                d.rule.is_some(),
-                "decision {i}: the rule that fired is named"
-            );
+            assert_eq!(amt(&d.actions).to_bits(), 500.0f64.to_bits(), "decision {i}");
+            assert!(d.rule.is_some(), "decision {i}: the rule that fired is named");
         }
     }
 
@@ -1430,21 +1258,9 @@ mod tests {
             1,
             None,
             vec![
-                rule(
-                    Comparison::Lt,
-                    10.0,
-                    AdaptiveAction::Increase(DoseStep::Percent(50.0)),
-                ),
-                rule(
-                    Comparison::Gt,
-                    90.0,
-                    AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
-                ),
-                rule(
-                    Comparison::Lt,
-                    20.0,
-                    AdaptiveAction::Increase(DoseStep::Percent(100.0)),
-                ),
+                rule(Comparison::Lt, 10.0, AdaptiveAction::Increase(DoseStep::Percent(50.0))),
+                rule(Comparison::Gt, 90.0, AdaptiveAction::Decrease(DoseStep::Percent(50.0))),
+                rule(Comparison::Lt, 20.0, AdaptiveAction::Increase(DoseStep::Percent(100.0))),
             ],
         );
         let signals = [0.0, 95.0, 15.0, 50.0];

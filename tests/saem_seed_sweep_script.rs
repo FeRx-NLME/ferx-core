@@ -25,22 +25,11 @@ fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .expect("git on PATH");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -108,16 +97,7 @@ fn sweep_rewrites_saem_seed_alias_and_compares_builds_paired() {
         .arg(&model)
         .arg("--data")
         .arg(&data)
-        .args([
-            "--rev",
-            &sha_a,
-            "--rev",
-            &sha_b,
-            "--seeds",
-            "1 2 3 4 5",
-            "--jobs",
-            "2",
-        ])
+        .args(["--rev", &sha_a, "--rev", &sha_b, "--seeds", "1 2 3 4 5", "--jobs", "2"])
         .arg("--workdir")
         .arg(&workdir)
         .output()
@@ -129,32 +109,17 @@ fn sweep_rewrites_saem_seed_alias_and_compares_builds_paired() {
     // The swept seed reached the fit: with `saem_seed = 7` surviving, every row of
     // revision A would read -7000.
     for s in 1..=5 {
-        let row = format!(
-            "{}\t{s}\t{}\t{:.4}",
-            &sha_a[..8],
-            s + 1000,
-            -1000.0 * s as f64
-        );
+        let row = format!("{}\t{s}\t{}\t{:.4}", &sha_a[..8], s + 1000, -1000.0 * s as f64);
         assert!(text.contains(&row), "missing `{row}` in\n{text}");
     }
     let run_model = std::fs::read_to_string(
-        workdir
-            .join("runs")
-            .join(&sha_a)
-            .join("s3-i1003")
-            .join("model.ferx"),
+        workdir.join("runs").join(&sha_a).join("s3-i1003").join("model.ferx"),
     )
     .unwrap();
     assert!(!run_model.contains("saem_seed"), "{run_model}");
     assert!(!run_model.contains("imp_seed = 9"), "{run_model}");
-    assert!(
-        run_model.contains("  seed = 3\n  imp_seed = 1003\n"),
-        "{run_model}"
-    );
-    assert!(
-        run_model.contains("[simulation]\n  seed = 42"),
-        "{run_model}"
-    );
+    assert!(run_model.contains("  seed = 3\n  imp_seed = 1003\n"), "{run_model}");
+    assert!(run_model.contains("[simulation]\n  seed = 42"), "{run_model}");
 
     // Paired: diffs 1.1, 1.0, 1.1, 1.0 (seed 5 is NA on B) -> mean 1.05,
     // sd 0.057735, SE 0.028868, t 36.37. The between-seed spread (1000 per seed) is
@@ -166,8 +131,5 @@ fn sweep_rewrites_saem_seed_alias_and_compares_builds_paired() {
         )),
         "{text}"
     );
-    assert!(
-        text.contains(&format!("{sha_b}    4    1")),
-        "B must count its NaN as NA:\n{text}"
-    );
+    assert!(text.contains(&format!("{sha_b}    4    1")), "B must count its NaN as NA:\n{text}");
 }

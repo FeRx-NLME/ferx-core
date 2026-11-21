@@ -60,7 +60,7 @@ fn parse_spline_df(args: &[String]) -> Result<Vec<usize>, String> {
                 }
                 _ => {
                     return Err(
-                        "--spline-df requires a positive integer (e.g. --spline-df 3)".into(),
+                        "--spline-df requires a positive integer (e.g. --spline-df 3)".into()
                     )
                 }
             }
@@ -100,14 +100,8 @@ fn parse_threads(args: &[String]) -> Result<Option<usize>, String> {
 }
 
 /// Flags that consume the following token as their value.
-const VALUE_FLAGS: &[&str] = &[
-    "--data",
-    "--from-fit",
-    "--csv",
-    "--spline-df",
-    "--shrink",
-    "--threads",
-];
+const VALUE_FLAGS: &[&str] =
+    &["--data", "--from-fit", "--csv", "--spline-df", "--shrink", "--threads"];
 /// Boolean (no-value) flags.
 const BOOL_FLAGS: &[&str] = &["--no-fit", "--no-linear", "--no-csv", "-h", "--help"];
 
@@ -200,8 +194,7 @@ fn no_fit_supported(m: ferx_core::EstimationMethod, imp_eval_only: bool) -> bool
 /// own docs call the worst outcome for a tool whose entire output is an
 /// ordering. Compare the ids and refuse instead.
 fn check_subject_alignment(
-    fit: &ferx_core::FitResult,
-    population: &ferx_core::Population,
+    fit: &ferx_core::FitResult, population: &ferx_core::Population,
 ) -> Result<(), String> {
     if fit.subjects.len() != population.subjects.len() {
         return Err(format!(
@@ -238,15 +231,11 @@ fn check_subject_alignment(
 /// overwrite the target. `create_dir` fails rather than following an existing
 /// entry, which makes claiming the directory the atomic step.
 fn population_from_model_source(
-    model_source: &str,
-    data_path: &str,
+    model_source: &str, data_path: &str,
 ) -> Result<ferx_core::Population, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("ferx-gam-{}-{nanos:x}", std::process::id()));
     std::fs::create_dir(&dir)
         .map_err(|e| format!("cannot create temporary directory {}: {e}", dir.display()))?;
@@ -255,12 +244,8 @@ fn population_from_model_source(
     let result = (|| {
         std::fs::write(&model_file, model_source)
             .map_err(|e| format!("cannot write temporary model file: {e}"))?;
-        let path = model_file
-            .to_str()
-            .ok_or("temporary model path is not valid UTF-8")?;
-        Ok(ferx_core::prepare_run(path, Some(data_path))
-            .map_err(|e| e.to_string())?
-            .population)
+        let path = model_file.to_str().ok_or("temporary model path is not valid UTF-8")?;
+        Ok(ferx_core::prepare_run(path, Some(data_path)).map_err(|e| e.to_string())?.population)
     })();
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -363,10 +348,8 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
             // `no_fit_supported` for the two families that do not.
             let opts = &prepared.parsed.fit_options;
             let eval_only = opts.imp_eval_only;
-            if let Some(bad) = opts
-                .method_chain()
-                .into_iter()
-                .find(|m| !no_fit_supported(*m, eval_only))
+            if let Some(bad) =
+                opts.method_chain().into_iter().find(|m| !no_fit_supported(*m, eval_only))
             {
                 return Err(format!(
                     "--no-fit is not supported with method '{}': \
@@ -419,9 +402,7 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
         "GAM: {:.1} ms  ({} ETAs x {} covariates)",
         t0.elapsed().as_secs_f64() * 1000.0,
         gam.eta_results.len(),
-        gam.eta_results
-            .first()
-            .map_or(0, |e| e.covariate_scores.len()),
+        gam.eta_results.first().map_or(0, |e| e.covariate_scores.len()),
     );
 
     // Warnings.
@@ -435,9 +416,8 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
     // default `{stem}-gam.csv` matches how a plain `ferx` run writes
     // `{model}-sdtab.csv` next to the model.
     if !no_csv {
-        let out_path = csv_flag
-            .map(String::from)
-            .unwrap_or_else(|| format!("{model_stem}-gam.csv"));
+        let out_path =
+            csv_flag.map(String::from).unwrap_or_else(|| format!("{model_stem}-gam.csv"));
         write_gam_csv(&gam, &out_path)?;
         eprintln!("GAM results written to {out_path}");
     }
@@ -450,9 +430,7 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
 /// This is the body of the main fit path's `--gam` flag. It lives here, rather
 /// than inline in `main`, so it is reachable from a test — `main` itself is not.
 pub fn run_after_fit(
-    fit: &ferx_core::FitResult,
-    population: &ferx_core::Population,
-    model_stem: &str,
+    fit: &ferx_core::FitResult, population: &ferx_core::Population, model_stem: &str,
 ) -> Result<String, String> {
     let gam = gam_screen(fit, population, &GamOptions::default());
     for w in &gam.warnings {
@@ -476,10 +454,7 @@ fn print_gam_table(gam: &ferx_tools::gam::GamResult) {
         if eta_res.covariate_scores.is_empty() {
             println!("  (no covariates screened)");
         } else {
-            println!(
-                "  {:>12}  {:>10}  {:>8}  {:>8}  form",
-                "covariate", "delta_aic", "aic", "r2"
-            );
+            println!("  {:>12}  {:>10}  {:>8}  {:>8}  form", "covariate", "delta_aic", "aic", "r2");
             for s in &eta_res.covariate_scores {
                 let form = match &s.best_form {
                     ferx_tools::gam::CovariateForm::Linear => "Linear".to_string(),
@@ -567,10 +542,7 @@ mod tests {
             "m.ferx"
         );
         // ... and `d.csv` here.
-        assert_eq!(
-            model_path(&args(&["--data", "d.csv", "m.ferx"])).unwrap(),
-            "m.ferx"
-        );
+        assert_eq!(model_path(&args(&["--data", "d.csv", "m.ferx"])).unwrap(), "m.ferx");
         // A repeated value flag consumes each of its own values.
         assert_eq!(
             model_path(&args(&[
@@ -589,10 +561,7 @@ mod tests {
 
     #[test]
     fn the_model_file_is_found_in_the_ordinary_position() {
-        assert_eq!(
-            model_path(&args(&["m.ferx", "--data", "d.csv"])).unwrap(),
-            "m.ferx"
-        );
+        assert_eq!(model_path(&args(&["m.ferx", "--data", "d.csv"])).unwrap(), "m.ferx");
     }
 
     #[test]
@@ -672,10 +641,7 @@ mod tests {
 
     #[test]
     fn parse_threads_positive_integer_works() {
-        assert_eq!(
-            parse_threads(&args(&["m.ferx", "--threads", "4"])).unwrap(),
-            Some(4)
-        );
+        assert_eq!(parse_threads(&args(&["m.ferx", "--threads", "4"])).unwrap(), Some(4));
     }
 
     #[test]
@@ -822,14 +788,7 @@ mod tests {
     fn no_fit_runs_end_to_end_and_writes_the_csv() {
         let dir = tempfile::tempdir().expect("tempdir");
         let csv = dir.path().join("gam.csv");
-        let code = run(&args(&[
-            MODEL,
-            "--data",
-            DATA,
-            "--no-fit",
-            "--csv",
-            csv.to_str().unwrap(),
-        ]));
+        let code = run(&args(&[MODEL, "--data", DATA, "--no-fit", "--csv", csv.to_str().unwrap()]));
         assert_eq!(code, 0);
 
         let text = std::fs::read_to_string(&csv).expect("gam csv written");
@@ -856,11 +815,7 @@ mod tests {
 
         let code = run(&args(&[MODEL, "--data", DATA, "--no-fit", "--no-csv"]));
         assert_eq!(code, 0);
-        assert!(
-            !default_path.exists(),
-            "--no-csv wrote {}",
-            default_path.display()
-        );
+        assert!(!default_path.exists(), "--no-csv wrote {}", default_path.display());
     }
 
     #[test]

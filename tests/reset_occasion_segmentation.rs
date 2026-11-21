@@ -76,11 +76,7 @@ fn reset_occasions_are_not_double_dosed() {
     // Sanity: the two-occasion subject carries two resets, segmented onto a
     // monotonic timeline (the second occasion shifted past the first).
     let subj2 = &population.subjects[1];
-    assert_eq!(
-        subj2.reset_times.len(),
-        2,
-        "subject 2 has two reset occasions"
-    );
+    assert_eq!(subj2.reset_times.len(), 2, "subject 2 has two reset occasions");
     assert!(
         subj2.obs_times.windows(2).all(|w| w[1] > w[0]),
         "subject 2 obs times must be monotonic across the occasion boundary: {:?}",
@@ -90,23 +86,11 @@ fn reset_occasions_are_not_double_dosed() {
     let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // Split predictions by subject id.
-    let single: Vec<f64> = preds
-        .iter()
-        .filter(|p| p.id == "1")
-        .map(|p| p.pred)
-        .collect();
-    let double: Vec<f64> = preds
-        .iter()
-        .filter(|p| p.id == "2")
-        .map(|p| p.pred)
-        .collect();
+    let single: Vec<f64> = preds.iter().filter(|p| p.id == "1").map(|p| p.pred).collect();
+    let double: Vec<f64> = preds.iter().filter(|p| p.id == "2").map(|p| p.pred).collect();
 
     assert_eq!(single.len(), 4, "single-occasion subject has 4 obs");
-    assert_eq!(
-        double.len(),
-        8,
-        "two-occasion subject has 8 obs (4 per occasion)"
-    );
+    assert_eq!(double.len(), 8, "two-occasion subject has 8 obs (4 per occasion)");
 
     // Each prediction is positive (the infusion produced drug).
     assert!(single.iter().all(|&c| c > 0.0));

@@ -18,11 +18,7 @@ fn cov_model() -> (CompiledModel, Population) {
 }
 
 fn theta_idx(model: &CompiledModel, name: &str) -> usize {
-    model
-        .theta_names
-        .iter()
-        .position(|n| n == name)
-        .expect(name)
+    model.theta_names.iter().position(|n| n == name).expect(name)
 }
 
 /// Deterministic, subject- and eta-varying η values.
@@ -39,9 +35,7 @@ fn fixture_etas(n_subjects: usize, n_eta: usize) -> Vec<Vec<f64>> {
 /// The production log target the sampler hands `draw`: `−Σᵢ individual_nll`
 /// at the model's default σ.
 fn nll_target<'a>(
-    model: &'a CompiledModel,
-    pop: &'a Population,
-    omega: &'a OmegaMatrix,
+    model: &'a CompiledModel, pop: &'a Population, omega: &'a OmegaMatrix,
 ) -> impl FnMut(&[f64], &[Vec<f64>]) -> Vec<f64> + 'a {
     move |theta: &[f64], etas: &[Vec<f64>]| {
         pop.subjects
@@ -64,11 +58,7 @@ fn nll_target<'a>(
 /// The per-subject NLL baseline [`MuDesign::draw`] takes in, at the state the
 /// draw starts from.
 fn nll_baseline(
-    model: &CompiledModel,
-    pop: &Population,
-    omega: &OmegaMatrix,
-    theta: &[f64],
-    etas: &[Vec<f64>],
+    model: &CompiledModel, pop: &Population, omega: &OmegaMatrix, theta: &[f64], etas: &[Vec<f64>],
 ) -> Vec<f64> {
     nll_target(model, pop, omega)(theta, etas)
 }
@@ -95,16 +85,10 @@ fn covariate_exponents_join_the_conjugate_design_on_their_natural_scale() {
         *d.coords.iter().find(|c| c.theta_idx == t).expect(n)
     };
     for tv in ["TVCL", "TVV1", "TVQ", "TVV2", "TVKA"] {
-        assert!(
-            coord(tv).log,
-            "{tv} is a typical value: drawn on the log scale"
-        );
+        assert!(coord(tv).log, "{tv} is a typical value: drawn on the log scale");
     }
     for ex in ["THETA_WT", "THETA_CRCL"] {
-        assert!(
-            !coord(ex).log,
-            "{ex} is an exponent: linear only on its own scale"
-        );
+        assert!(!coord(ex).log, "{ex} is an exponent: linear only on its own scale");
     }
     assert_eq!(d.coords.len(), 7);
 }
@@ -116,10 +100,8 @@ fn without_groups_the_design_is_the_anchor_only_move() {
         .expect("every eta has a log anchor");
     let mut got = d.theta_indices();
     got.sort_unstable();
-    let mut want: Vec<usize> = ["TVCL", "TVV1", "TVQ", "TVV2", "TVKA"]
-        .iter()
-        .map(|n| theta_idx(&model, n))
-        .collect();
+    let mut want: Vec<usize> =
+        ["TVCL", "TVV1", "TVQ", "TVV2", "TVKA"].iter().map(|n| theta_idx(&model, n)).collect();
     want.sort_unstable();
     assert_eq!(got, want, "the exponents stay with the random walk");
 }
@@ -213,9 +195,7 @@ fn conjugate_draws_have_the_conditional_moments() {
     let mut sum = DVector::<f64>::zeros(p);
     let mut sq = DMatrix::<f64>::zeros(p, p);
     for _ in 0..n {
-        let t = d
-            .sample_theta(&theta, &etas, &omega, &mut rng)
-            .expect("draw");
+        let t = d.sample_theta(&theta, &etas, &omega, &mut rng).expect("draw");
         let b = DVector::from_iterator(
             p,
             d.coords.iter().map(|c| {
@@ -313,10 +293,7 @@ fn a_moved_draw_holds_every_individual_parameter() {
         fresh, nll0,
         "the moved state must have a different NLL, or the check below is vacuous"
     );
-    assert_eq!(
-        nll, fresh,
-        "the returned NLL baseline is the proposed state's"
-    );
+    assert_eq!(nll, fresh, "the returned NLL baseline is the proposed state's");
 }
 
 /// A Metropolis rejection leaves the caller's cache alone. `draw` evaluates the
@@ -506,10 +483,7 @@ fn an_out_of_bounds_draw_is_rejected_and_changes_nothing() {
     assert_eq!(out, DrawOutcome::RejectedOutOfBounds);
     assert_eq!(theta, params.theta, "θ unchanged on reject");
     assert_eq!(etas, etas0, "η unchanged on reject");
-    assert_eq!(
-        nll, nll0,
-        "the caller's NLL baseline is unchanged on reject"
-    );
+    assert_eq!(nll, nll0, "the caller's NLL baseline is unchanged on reject");
 
     let mut theta = params.theta.clone();
     let mut etas = etas0.clone();
@@ -527,11 +501,7 @@ fn an_out_of_bounds_draw_is_rejected_and_changes_nothing() {
             &mut nll_target(&model, &pop, &omega),
         )
         .0;
-    assert_eq!(
-        out,
-        DrawOutcome::Moved,
-        "the same draw inside the bounds moves"
-    );
+    assert_eq!(out, DrawOutcome::Moved, "the same draw inside the bounds moves");
 }
 
 #[test]
@@ -575,10 +545,7 @@ fn a_non_affine_typical_value_is_left_to_the_random_walk() {
     let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
     let (_m, pop) = cov_model();
     assert!(
-        model
-            .covariate_mu_refs
-            .iter()
-            .any(|c| c.eta_name == "ETA_CL"),
+        model.covariate_mu_refs.iter().any(|c| c.eta_name == "ETA_CL"),
         "precondition: ETA_CL is a recorded covariate mu-reference"
     );
     assert!(
@@ -617,26 +584,17 @@ fn has_coord(d: &MuDesign<'_>, model: &CompiledModel, name: &str) -> bool {
 #[test]
 fn an_odd_nonlinear_exponent_is_not_admitted_but_the_affine_one_is() {
     let affine = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("model text");
-    let odd = affine.replace(
-        "(WT / 70)^THETA_WT",
-        "(WT / 70)^(THETA_WT + (THETA_WT - 0.6)^3)",
-    );
+    let odd = affine.replace("(WT / 70)^THETA_WT", "(WT / 70)^(THETA_WT + (THETA_WT - 0.6)^3)");
     assert_ne!(odd, affine, "precondition: the substitution happened");
     let (_m, pop) = cov_model();
 
     let m_aff = crate::parser::model_parser::parse_model_string(&affine).expect("parses");
     let d_aff = MuDesign::build(&m_aff, &pop, &m_aff.default_params, true).expect("design");
-    assert!(
-        has_coord(&d_aff, &m_aff, "THETA_WT"),
-        "control: the affine exponent is drawn"
-    );
+    assert!(has_coord(&d_aff, &m_aff, "THETA_WT"), "control: the affine exponent is drawn");
 
     let m_odd = crate::parser::model_parser::parse_model_string(&odd).expect("parses");
     assert!(
-        m_odd
-            .covariate_mu_refs
-            .iter()
-            .any(|c| c.eta_name == "ETA_CL"),
+        m_odd.covariate_mu_refs.iter().any(|c| c.eta_name == "ETA_CL"),
         "precondition: the odd form is still a recorded covariate mu-reference"
     );
     let d_odd = MuDesign::build(&m_odd, &pop, &m_odd.default_params, true)
@@ -705,8 +663,7 @@ fn a_constant_covariate_drops_only_its_collinear_exponent() {
     let omega = dense_omega(model.n_eta, model.eta_names.clone());
     let etas = fixture_etas(pop.subjects.len(), model.n_eta);
     assert!(
-        d.conditional(&model.default_params.theta, &etas, &omega)
-            .is_some(),
+        d.conditional(&model.default_params.theta, &etas, &omega).is_some(),
         "the reduced design's conditional can be formed"
     );
 }
@@ -724,16 +681,10 @@ fn affinity_is_proven_from_the_expression_form() {
         Box::new(E::BinOp(
             th(0),
             BinOp::Mul,
-            Box::new(E::Power(
-                Box::new(E::BinOp(cov("WT"), BinOp::Div, lit(70.0))),
-                th(1),
-            )),
+            Box::new(E::Power(Box::new(E::BinOp(cov("WT"), BinOp::Div, lit(70.0))), th(1))),
         )),
         BinOp::Mul,
-        Box::new(E::UnaryFn(
-            "exp".into(),
-            Box::new(E::BinOp(th(2), BinOp::Mul, cov("SEX"))),
-        )),
+        Box::new(E::UnaryFn("exp".into(), Box::new(E::BinOp(th(2), BinOp::Mul, cov("SEX"))))),
     );
     let mut got = log_form(&e, &free).expect("affine");
     got.sort_unstable();
@@ -741,16 +692,9 @@ fn affinity_is_proven_from_the_expression_form() {
     // sqrt(θ0) is refused — the evaluator clamps its argument at 0 — while
     // θ0·θ0 is log-affine.
     assert_eq!(log_form(&E::UnaryFn("sqrt".into(), th(0)), &free), None);
-    assert_eq!(
-        log_form(&E::BinOp(th(0), BinOp::Mul, th(0)), &free),
-        Some(vec![(0, true)])
-    );
+    assert_eq!(log_form(&E::BinOp(th(0), BinOp::Mul, th(0)), &free), Some(vec![(0, true)]));
     // θ0 + c·θ1 under the log link: ln of a sum is not affine.
-    let sum = E::BinOp(
-        th(0),
-        BinOp::Add,
-        Box::new(E::BinOp(cov("CRCL"), BinOp::Mul, th(1))),
-    );
+    let sum = E::BinOp(th(0), BinOp::Add, Box::new(E::BinOp(cov("CRCL"), BinOp::Mul, th(1))));
     assert_eq!(log_form(&sum, &free), None);
     // ... but under the identity/logit link it is.
     let mut got = lin_form(&sum, &free).expect("affine");
@@ -761,18 +705,12 @@ fn affinity_is_proven_from_the_expression_form() {
     let both = E::BinOp(
         th(0),
         BinOp::Mul,
-        Box::new(E::UnaryFn(
-            "exp".into(),
-            Box::new(E::BinOp(th(0), BinOp::Mul, cov("WT"))),
-        )),
+        Box::new(E::UnaryFn("exp".into(), Box::new(E::BinOp(th(0), BinOp::Mul, cov("WT"))))),
     );
     assert_eq!(log_form(&both, &free), None);
     // A FIX-ed theta is a constant.
     let fixed_1 = |t: usize| t != 1;
-    assert_eq!(
-        log_form(&E::BinOp(th(0), BinOp::Mul, th(1)), &fixed_1),
-        Some(vec![(0, true)])
-    );
+    assert_eq!(log_form(&E::BinOp(th(0), BinOp::Mul, th(1)), &fixed_1), Some(vec![(0, true)]));
 }
 
 /// The affinity walk reads a typical-value program's definitions through their
@@ -790,11 +728,8 @@ fn affinity_reads_a_programs_definitions_once() {
     use crate::parser::model_parser::{BinOp, Expression as E};
     let free = |_t: usize| true;
     let r = |j: usize| Box::new(E::VariableIdx(j));
-    let mut defs = vec![E::BinOp(
-        Box::new(E::Theta(0)),
-        BinOp::Mul,
-        Box::new(E::Covariate("WT".into())),
-    )];
+    let mut defs =
+        vec![E::BinOp(Box::new(E::Theta(0)), BinOp::Mul, Box::new(E::Covariate("WT".into())))];
     for j in 0..40 {
         defs.push(E::BinOp(r(j), BinOp::Mul, r(j)));
     }
@@ -804,11 +739,8 @@ fn affinity_reads_a_programs_definitions_once() {
     let sum = E::BinOp(r(40), BinOp::Add, Box::new(E::Theta(1)));
     assert_eq!(forms.log(&sum), None);
     // A definition of data alone is a constant.
-    let data = [E::BinOp(
-        Box::new(E::Covariate("WT".into())),
-        BinOp::Div,
-        Box::new(E::Literal(70.0)),
-    )];
+    let data =
+        [E::BinOp(Box::new(E::Covariate("WT".into())), BinOp::Div, Box::new(E::Literal(70.0)))];
     let forms = Forms::new(&data, &free);
     let scaled = E::BinOp(Box::new(E::Theta(1)), BinOp::Mul, r(0));
     assert_eq!(forms.lin(&scaled), Some(vec![(1, false)]));
@@ -833,11 +765,7 @@ fn run_bayes_samples_every_theta_when_the_covariates_are_at_reference() {
     let b = res.bayes.as_ref().expect("BayesResult");
     for name in ["TVCL", "TVV1", "THETA_WT", "THETA_CRCL"] {
         let s = b.summaries.iter().find(|s| s.name == name).expect(name);
-        assert!(
-            s.sd.is_finite() && s.sd > 0.0,
-            "{name} never moved (sd {})",
-            s.sd
-        );
+        assert!(s.sd.is_finite() && s.sd > 0.0, "{name} never moved (sd {})", s.sd);
     }
     for name in ["THETA_WT", "THETA_CRCL"] {
         let s = b.summaries.iter().find(|s| s.name == name).expect(name);
@@ -853,19 +781,13 @@ fn a_floored_log_of_theta_is_not_admitted_but_the_unfloored_form_is() {
     let base = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx")
         .expect("model text")
         .replace("THETA_WT(0.6, 0.01, 5.0)", "THETA_WT(0.6, -200.0, 200.0)");
-    assert!(
-        base.contains("THETA_WT(0.6, -200.0, 200.0)"),
-        "precondition"
-    );
+    assert!(base.contains("THETA_WT(0.6, -200.0, 200.0)"), "precondition");
     let control = base.replace("(WT / 70)^THETA_WT", "exp(THETA_WT * (WT / 70))");
     let floored = base.replace("(WT / 70)^THETA_WT", "exp(log(exp(THETA_WT * (WT / 70))))");
     let (_m, pop) = cov_model();
     let m_c = crate::parser::model_parser::parse_model_string(&control).expect("parses");
     let d_c = MuDesign::build(&m_c, &pop, &m_c.default_params, true).expect("design");
-    assert!(
-        has_coord(&d_c, &m_c, "THETA_WT"),
-        "control: exp(θ·c) is linear in θ"
-    );
+    assert!(has_coord(&d_c, &m_c, "THETA_WT"), "control: exp(θ·c) is linear in θ");
     let m_f = crate::parser::model_parser::parse_model_string(&floored).expect("parses");
     assert!(
         m_f.covariate_mu_refs.iter().any(|c| c.eta_name == "ETA_CL"),
@@ -890,18 +812,13 @@ fn the_conjugate_move_is_corrected_on_the_real_likelihood() {
     let affine = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("model text");
     let a = "CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)";
     assert!(affine.contains(a), "precondition: the CL line");
-    let bad = affine.replace(
-        a,
-        "CL = TVCL * (WT / 70)^TVCL * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)",
-    );
+    let bad =
+        affine.replace(a, "CL = TVCL * (WT / 70)^TVCL * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)");
     let (_m, pop) = cov_model();
     let worst_log_alpha = |src: &str| -> (f64, usize) {
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let d = MuDesign::build(&model, &pop, &model.default_params, true).expect("design");
-        assert!(
-            has_coord(&d, &model, "TVCL"),
-            "precondition: TVCL is conjugate"
-        );
+        assert!(has_coord(&d, &model, "TVCL"), "precondition: TVCL is conjugate");
         let omega = dense_omega(model.n_eta, model.eta_names.clone());
         let theta0 = model.default_params.theta.clone();
         let etas0 = fixture_etas(pop.subjects.len(), model.n_eta);
@@ -941,9 +858,6 @@ fn the_conjugate_move_is_corrected_on_the_real_likelihood() {
     // would have moved the real CL with nothing to account for it.
     assert!(ctrl < 1e-8, "affine design: |log α| {ctrl:e} should be ~0");
     assert_eq!(ctrl_rej, 0);
-    assert!(
-        bad_la > 0.05,
-        "the correction must see the moved CL: |log α| {bad_la}"
-    );
+    assert!(bad_la > 0.05, "the correction must see the moved CL: |log α| {bad_la}");
     assert!(bad_rej > 0, "and reject some draws");
 }

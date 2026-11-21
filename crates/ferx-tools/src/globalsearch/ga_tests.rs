@@ -52,8 +52,7 @@ impl Oracle for Landscape {
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel_after_batches
-            .is_some_and(|n| self.batches.len() >= n)
+        self.cancel_after_batches.is_some_and(|n| self.batches.len() >= n)
     }
 }
 
@@ -107,20 +106,13 @@ fn the_ga_finds_the_exhaustive_optimum_on_a_small_space() {
     let alleles = [3usize, 3, 3, 4, 2];
     let (f, target) = deceptive(&alleles);
     let (best_g, best_f) = exhaustive_best(&alleles, &f);
-    assert_eq!(
-        best_g, target,
-        "the landscape's minimum is where it was put"
-    );
+    assert_eq!(best_g, target, "the landscape's minimum is where it was put");
 
     for seed in [1u64, 7, 42, 1185, 99991] {
         let (f, _) = deceptive(&alleles);
         let mut oracle = Landscape::new(f);
-        let options = GaOptions {
-            population_size: 16,
-            generations: 8,
-            seed,
-            ..GaOptions::default()
-        };
+        let options =
+            GaOptions { population_size: 16, generations: 8, seed, ..GaOptions::default() };
         let outcome = run(&alleles, &options, &mut oracle).unwrap();
         assert_eq!(outcome.best, best_g, "seed {seed}");
         assert_eq!(outcome.best_fitness, best_f, "seed {seed}");
@@ -149,9 +141,7 @@ fn the_ga_beats_a_hill_climb_on_the_deceptive_landscape() {
     let (f, target) = deceptive(&alleles);
     let mut oracle = Landscape::new(f);
     let start: Genome = vec![1, 0, 0, 0, 0];
-    let f0 = oracle
-        .evaluate("start", std::slice::from_ref(&start))
-        .unwrap()[0];
+    let f0 = oracle.evaluate("start", std::slice::from_ref(&start)).unwrap()[0];
     let (g, fitness, moved) = downhill(&alleles, start, f0, "hill", &mut oracle).unwrap();
     assert!(moved);
     assert_eq!(g, vec![0, 0, 0, 0, 0], "the hill climb ends in the decoy");
@@ -166,12 +156,8 @@ fn the_same_seed_proposes_the_same_genomes() {
         .map(|_| {
             let (f, _) = deceptive(&alleles);
             let mut oracle = Landscape::new(f);
-            let options = GaOptions {
-                population_size: 8,
-                generations: 4,
-                seed: 3,
-                ..GaOptions::default()
-            };
+            let options =
+                GaOptions { population_size: 8, generations: 4, seed: 3, ..GaOptions::default() };
             let outcome = run(&alleles, &options, &mut oracle).unwrap();
             (outcome, oracle.batches)
         })
@@ -181,12 +167,7 @@ fn the_same_seed_proposes_the_same_genomes() {
     // the proposals do not).
     let (f, _) = deceptive(&alleles);
     let mut oracle = Landscape::new(f);
-    let options = GaOptions {
-        population_size: 8,
-        generations: 4,
-        seed: 4,
-        ..GaOptions::default()
-    };
+    let options = GaOptions { population_size: 8, generations: 4, seed: 4, ..GaOptions::default() };
     run(&alleles, &options, &mut oracle).unwrap();
     assert_ne!(oracle.batches, runs[0].1);
 }
@@ -208,17 +189,11 @@ fn batches_are_named_for_the_journal_and_the_initial_population_is_distinct() {
     let names: Vec<&str> = oracle.batches.iter().map(|b| b.0.as_str()).collect();
     assert_eq!(names[0], "generation-0");
     assert_eq!(oracle.batches[0].1, 10);
-    assert_eq!(
-        oracle.batches[0].2, 10,
-        "the initial population holds ten distinct genomes"
-    );
+    assert_eq!(oracle.batches[0].2, 10, "the initial population holds ten distinct genomes");
     assert!(names.contains(&"generation-5"));
     // The downhill search ran after generation 5 (the period and the final
     // pass coincide, so once), for up to two niches, at least one round.
-    assert!(
-        names.iter().any(|n| n.starts_with("downhill-5-1-")),
-        "{names:?}"
-    );
+    assert!(names.iter().any(|n| n.starts_with("downhill-5-1-")), "{names:?}");
     assert!(!names.iter().any(|n| n.starts_with("downhill-1-")));
     // Within one batch every genome is distinct, so a fit is never asked
     // for twice in a step.
@@ -234,19 +209,11 @@ fn a_cancellation_stops_the_search_with_the_best_so_far() {
     let (f, _) = deceptive(&alleles);
     let mut oracle = Landscape::new(f);
     oracle.cancel_after_batches = Some(2);
-    let options = GaOptions {
-        population_size: 8,
-        generations: 10,
-        seed: 5,
-        ..GaOptions::default()
-    };
+    let options =
+        GaOptions { population_size: 8, generations: 10, seed: 5, ..GaOptions::default() };
     let outcome = run(&alleles, &options, &mut oracle).unwrap();
     assert!(outcome.cancelled);
-    assert_eq!(
-        outcome.generations.len(),
-        2,
-        "generations 0 and 1 were evaluated"
-    );
+    assert_eq!(outcome.generations.len(), 2, "generations 0 and 1 were evaluated");
     assert_eq!(oracle.batches.len(), 2);
     assert!(outcome.best_fitness.is_finite());
 }
@@ -277,10 +244,7 @@ fn the_downhill_search_leaves_a_one_gene_local_optimum() {
     // Without the final pass the initial population is all there is.
     let (f, _) = deceptive(&alleles);
     let mut oracle = Landscape::new(f);
-    let options = GaOptions {
-        final_downhill: false,
-        ..options
-    };
+    let options = GaOptions { final_downhill: false, ..options };
     run(&alleles, &options, &mut oracle).unwrap();
     assert_eq!(oracle.batches.len(), 1);
 }
@@ -299,11 +263,7 @@ fn the_population_is_capped_at_the_size_of_the_space() {
     };
     let outcome = run(&alleles, &options, &mut oracle).unwrap();
     assert_eq!(oracle.batches[0].1, 4);
-    assert_eq!(
-        oracle.unique_evaluations(),
-        4,
-        "a four-point space costs four fits"
-    );
+    assert_eq!(oracle.unique_evaluations(), 4, "a four-point space costs four fits");
     let (_, best_f) = exhaustive_best(&alleles, &|g: &Genome| {
         let (f, _) = deceptive(&alleles);
         f(g)
@@ -323,53 +283,14 @@ fn a_one_point_space_and_bad_options_are_refused() {
     let bad = [
         (
             "population_size must be at least 2",
-            GaOptions {
-                population_size: 1,
-                ..GaOptions::default()
-            },
+            GaOptions { population_size: 1, ..GaOptions::default() },
         ),
-        (
-            "crossover_rate = 1.5",
-            GaOptions {
-                crossover_rate: 1.5,
-                ..GaOptions::default()
-            },
-        ),
-        (
-            "elites = 20 must be smaller",
-            GaOptions {
-                elites: 20,
-                ..GaOptions::default()
-            },
-        ),
-        (
-            "tournament_size",
-            GaOptions {
-                tournament_size: 0,
-                ..GaOptions::default()
-            },
-        ),
-        (
-            "niche_penalty = -1",
-            GaOptions {
-                niche_penalty: -1.0,
-                ..GaOptions::default()
-            },
-        ),
-        (
-            "sharing_alpha = 0",
-            GaOptions {
-                sharing_alpha: 0.0,
-                ..GaOptions::default()
-            },
-        ),
-        (
-            "niches must be at least 1",
-            GaOptions {
-                niches: 0,
-                ..GaOptions::default()
-            },
-        ),
+        ("crossover_rate = 1.5", GaOptions { crossover_rate: 1.5, ..GaOptions::default() }),
+        ("elites = 20 must be smaller", GaOptions { elites: 20, ..GaOptions::default() }),
+        ("tournament_size", GaOptions { tournament_size: 0, ..GaOptions::default() }),
+        ("niche_penalty = -1", GaOptions { niche_penalty: -1.0, ..GaOptions::default() }),
+        ("sharing_alpha = 0", GaOptions { sharing_alpha: 0.0, ..GaOptions::default() }),
+        ("niches must be at least 1", GaOptions { niches: 0, ..GaOptions::default() }),
     ];
     for (msg, options) in bad {
         let e = options.validate().unwrap_err();
@@ -391,10 +312,7 @@ fn fitness_sharing_charges_the_crowded_individual_only_for_selection() {
     // The first two are one apart (< r = 2): each crowds the other by
     // 1 − 1/2 = 0.5, i.e. a charge of 10; the third is alone.
     assert_eq!(shared, vec![20.0, 20.0, 10.0]);
-    let off = GaOptions {
-        niche_radius: 0,
-        ..options
-    };
+    let off = GaOptions { niche_radius: 0, ..options };
     assert_eq!(shared_fitness(&population, &fitness, &off), fitness);
     assert_eq!(hamming(&[0, 1, 2], &[0, 2, 2]), 1);
 }
@@ -402,14 +320,7 @@ fn fitness_sharing_charges_the_crowded_individual_only_for_selection() {
 #[test]
 fn the_toml_section_overlays_the_defaults() {
     let o: GaOptions = toml::from_str("population_size = 30\nseed = 7").unwrap();
-    assert_eq!(
-        o,
-        GaOptions {
-            population_size: 30,
-            seed: 7,
-            ..GaOptions::default()
-        }
-    );
+    assert_eq!(o, GaOptions { population_size: 30, seed: 7, ..GaOptions::default() });
     let e = toml::from_str::<GaOptions>("generation = 3").unwrap_err();
     assert!(e.to_string().contains("unknown field `generation`"), "{e}");
 }

@@ -24,8 +24,7 @@ use std::path::PathBuf;
 const WALD_LOG_GAP_TOL: f64 = 0.30;
 
 fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
-    ci.as_ref()
-        .map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
+    ci.as_ref().map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
 }
 
 /// One fit with `sir = true` and the covariance step, then `run_sir` on the
@@ -48,10 +47,7 @@ fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
 ///    agreement, so an interval that drifts away from the covariance step's
 ///    without leaving κ (a wrong percentile, a mis-weighted resample) is seen.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn mbma_placebo_kappa_sir_interval_is_shared_brackets_and_matches_wald() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/mbma_placebo");
     let prep = prepare_run(
@@ -84,13 +80,8 @@ fn mbma_placebo_kappa_sir_interval_is_shared_brackets_and_matches_wald() {
     // 1. Identity.
     let ess = f.sir_ess.expect("in-fit ESS");
     assert!(ess.is_finite() && ess > 10.0, "degenerate SIR, ESS {ess}");
-    let k_fit = f
-        .sir_ci_kappa
-        .as_ref()
-        .expect("in-fit SIR filled no sir_ci_kappa");
-    sa.sir_ci_kappa
-        .as_ref()
-        .expect("standalone run_sir filled no sir_ci_kappa");
+    let k_fit = f.sir_ci_kappa.as_ref().expect("in-fit SIR filled no sir_ci_kappa");
+    sa.sir_ci_kappa.as_ref().expect("standalone run_sir filled no sir_ci_kappa");
     assert_eq!(ci_bits(&sa.sir_ci_kappa), ci_bits(&f.sir_ci_kappa), "κ");
     assert_eq!(ci_bits(&sa.sir_ci_theta), ci_bits(&f.sir_ci_theta), "θ");
     assert_eq!(ci_bits(&sa.sir_ci_omega), ci_bits(&f.sir_ci_omega), "Ω");
@@ -99,10 +90,7 @@ fn mbma_placebo_kappa_sir_interval_is_shared_brackets_and_matches_wald() {
 
     // 2. Bracketing, and 3. Wald agreement.
     let iov = f.omega_iov.as_ref().expect("an IOV fit");
-    let se = f
-        .se_kappa
-        .as_ref()
-        .expect("se_kappa from the covariance step");
+    let se = f.se_kappa.as_ref().expect("se_kappa from the covariance step");
     assert_eq!(k_fit.len(), 1, "one kappa: {:?}", f.kappa_names);
     let mut worst = 0.0_f64;
     for (k, &(lo, hi)) in k_fit.iter().enumerate() {
@@ -131,8 +119,5 @@ fn mbma_placebo_kappa_sir_interval_is_shared_brackets_and_matches_wald() {
         );
         worst = worst.max(gap);
     }
-    assert!(
-        worst < WALD_LOG_GAP_TOL,
-        "SIR vs Wald worst |ln| gap {worst:.4} ≥ {WALD_LOG_GAP_TOL}"
-    );
+    assert!(worst < WALD_LOG_GAP_TOL, "SIR vs Wald worst |ln| gap {worst:.4} ≥ {WALD_LOG_GAP_TOL}");
 }

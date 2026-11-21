@@ -12,14 +12,8 @@ use ferx_core::{simulate_with_seed, Population, SimOutcome, Subject};
 use std::collections::HashMap;
 
 /// (arm, time) per row.
-const ROWS: [(f64, f64); 6] = [
-    (1.0, 0.0),
-    (2.0, 0.5),
-    (1.0, 2.0),
-    (2.0, 3.0),
-    (1.0, 5.0),
-    (2.0, 8.0),
-];
+const ROWS: [(f64, f64); 6] =
+    [(1.0, 0.0), (2.0, 0.5), (1.0, 2.0), (2.0, 3.0), (1.0, 5.0), (2.0, 8.0)];
 /// Position within the arm in time order, by hand.
 const POS: [i32; 6] = [0, 0, 1, 1, 2, 2];
 const N_SIM: usize = 20_000;
@@ -41,10 +35,7 @@ fn population() -> Population {
         obs_cmts: vec![1; 6],
         cens: vec![0; 6],
         covariates: HashMap::from([("ARM".to_string(), 1.0)]),
-        obs_covariates: ROWS
-            .iter()
-            .map(|r| HashMap::from([("ARM".to_string(), r.0)]))
-            .collect(),
+        obs_covariates: ROWS.iter().map(|r| HashMap::from([("ARM".to_string(), r.0)])).collect(),
         ..Default::default()
     };
     Population {
@@ -83,10 +74,7 @@ fn simulate_draws_the_serial_residual_correlation() {
             let SimOutcome::Continuous { value } = r.outcome else {
                 panic!("a Gaussian row");
             };
-            let j = ROWS
-                .iter()
-                .position(|row| row.1 == r.time)
-                .expect("a fixture row");
+            let j = ROWS.iter().position(|row| row.1 == r.time).expect("a fixture row");
             eps[r.sim - 1][j] = value - r.ipred;
         }
         assert!(eps.iter().flatten().all(|v| v.is_finite()));
@@ -172,17 +160,13 @@ fn population_of(rows: &[(f64, f64)]) -> Population {
     s.observations = vec![10.0; rows.len()];
     s.obs_cmts = vec![1; rows.len()];
     s.cens = vec![0; rows.len()];
-    s.obs_covariates = rows
-        .iter()
-        .map(|r| HashMap::from([("ARM".to_string(), r.0)]))
-        .collect();
+    s.obs_covariates = rows.iter().map(|r| HashMap::from([("ARM".to_string(), r.0)])).collect();
     pop
 }
 
 /// `simulate_with_seed(…, 2, 7)` succeeded with two replicates of finite rows.
 fn assert_finite_rows(
-    what: &str,
-    sims: Result<Vec<ferx_core::SimulationResult>, ferx_core::EngineError>,
+    what: &str, sims: Result<Vec<ferx_core::SimulationResult>, ferx_core::EngineError>,
     n_rows: usize,
 ) {
     let sims = sims.unwrap_or_else(|e| panic!("{what}: simulates, got {e}"));
@@ -197,9 +181,7 @@ fn assert_finite_rows(
 
 /// The error of a refused simulation, with its code checked.
 fn refused(
-    what: &str,
-    sims: Result<Vec<ferx_core::SimulationResult>, ferx_core::EngineError>,
-    code: &str,
+    what: &str, sims: Result<Vec<ferx_core::SimulationResult>, ferx_core::EngineError>, code: &str,
 ) -> String {
     let err = sims.expect_err(what);
     assert_eq!(err.code(), Some(code), "{what}: {err}");
@@ -207,9 +189,7 @@ fn refused(
 }
 
 fn sim_at(
-    kind: &str,
-    rho: &str,
-    pop: &Population,
+    kind: &str, rho: &str, pop: &Population,
 ) -> Result<Vec<ferx_core::SimulationResult>, ferx_core::EngineError> {
     let m = fixed_model(kind, rho);
     simulate_with_seed(&m, pop, &m.default_params, 2, 7)
@@ -225,11 +205,7 @@ fn simulate_refuses_a_serial_rho_at_or_past_one() {
     let pop = population();
     for (kind, rhos, inside) in [
         ("car1", &["1.0", "1.2"][..], &["0.0", "0.9"][..]),
-        (
-            "ar1",
-            &["1.0", "1.2", "-1.0", "-1.5"][..],
-            &["-0.9", "0.9"][..],
-        ),
+        ("ar1", &["1.0", "1.2", "-1.0", "-1.5"][..], &["-0.9", "0.9"][..]),
     ] {
         for rho in rhos {
             let msg = refused(
@@ -278,11 +254,7 @@ fn simulate_refuses_a_cs_rho_outside_the_block_range() {
         );
         assert!(msg.contains("Keep ρ above -0.5000."), "{msg}");
     }
-    let msg = refused(
-        "cs at 1.0",
-        sim_at("cs", "1.0", &pop),
-        "E_RESIDUAL_CORRELATION_RANGE",
-    );
+    let msg = refused("cs at 1.0", sim_at("cs", "1.0", &pop), "E_RESIDUAL_CORRELATION_RANGE");
     assert!(
         msg.contains(
             "`correlation cs(RHO) by ARM`: theta RHO is 1; a correlation must lie strictly \
@@ -315,11 +287,7 @@ fn simulate_refuses_tied_times_within_a_block() {
              and R is singular.",
         ),
     ] {
-        let msg = refused(
-            kind,
-            sim_at(kind, "0.3", &tied),
-            "E_RESIDUAL_CORRELATION_TIES",
-        );
+        let msg = refused(kind, sim_at(kind, "0.3", &tied), "E_RESIDUAL_CORRELATION_TIES");
         assert!(
             msg.contains(&format!(
                 "`correlation {kind}(RHO) by ARM`: subject 1 has two rows at TIME 2 in the block \
@@ -328,10 +296,7 @@ fn simulate_refuses_tied_times_within_a_block() {
             "{msg}"
         );
         assert!(msg.contains(why), "{msg}");
-        assert!(
-            msg.contains("Give them distinct times, or use `cs`."),
-            "{msg}"
-        );
+        assert!(msg.contains("Give them distinct times, or use `cs`."), "{msg}");
         assert_finite_rows(&format!("{kind} split"), sim_at(kind, "0.3", &split), 3);
     }
     assert_finite_rows("cs tied", sim_at("cs", "0.3", &tied), 3);
@@ -352,11 +317,7 @@ fn simulate_refuses_a_block_across_a_time_reset() {
     let spanning = pop_with([1.0; 6]);
     let split = pop_with([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     for kind in ["ar1", "car1"] {
-        let msg = refused(
-            kind,
-            sim_at(kind, "0.3", &spanning),
-            "E_RESIDUAL_CORRELATION_RESET",
-        );
+        let msg = refused(kind, sim_at(kind, "0.3", &spanning), "E_RESIDUAL_CORRELATION_RESET");
         assert!(
             msg.contains(&format!(
                 "`correlation {kind}(RHO) by ARM`: subject 1 has rows at TIME 0 and TIME 1 in \

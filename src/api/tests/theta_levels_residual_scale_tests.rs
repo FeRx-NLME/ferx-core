@@ -42,11 +42,8 @@ const SCALES: [&str; 3] = ["1.0", "1e-8", "1e8"];
 /// block `ERRSCALE[cols]` under `contrast` (`""` = auto): `readout` the `y`
 /// line, `error` the `DV ~` line.
 fn ruv_model(cols: &str, contrast: &str, readout: &str, error: &str) -> String {
-    let modifier = if contrast.is_empty() {
-        String::new()
-    } else {
-        format!(", contrast = {contrast}")
-    };
+    let modifier =
+        if contrast.is_empty() { String::new() } else { format!(", contrast = {contrast}") };
     format!(
         r#"
 [parameters]
@@ -157,10 +154,7 @@ fn a_block_scaling_the_whole_residual_absorbs_an_iiv_on_ruv_eta() {
                 // variance and the block does scale all of it.
                 let additive = ADDITIVE_PART.replace(
                     "ADD_ERR * exp(ERRSCALE)",
-                    &format!(
-                        "ADD_ERR * exp(ERRSCALE) * {}",
-                        y.rsplit(' ').next().unwrap()
-                    ),
+                    &format!("ADD_ERR * exp(ERRSCALE) * {}", y.rsplit(' ').next().unwrap()),
                 );
                 if let Err(e) = try_bind(&ruv_model("STUDY", c, &y, &additive), pop) {
                     wrong.push(format!("{at} additive part: refused: {e}"));
@@ -215,14 +209,8 @@ fn a_level_scaling_the_prediction_does_not_absorb_it() {
 fn a_nested_block_binds_within_next_to_an_iiv_on_ruv_eta() {
     let pop = occ_pop(3, 1, &T6, 3, true);
     let text = |c: &str| ruv_model("STUDY, OCC", c, Y, WHOLE);
-    assert_eq!(
-        try_bind(&text(""), &pop),
-        Ok(LevelContrast::SumToZeroWithin)
-    );
-    assert_eq!(
-        try_bind(&text("sum_to_zero_within"), &pop),
-        Ok(LevelContrast::SumToZeroWithin)
-    );
+    assert_eq!(try_bind(&text(""), &pop), Ok(LevelContrast::SumToZeroWithin));
+    assert_eq!(try_bind(&text("sum_to_zero_within"), &pop), Ok(LevelContrast::SumToZeroWithin));
     for c in ["ref", "none"] {
         let e = try_bind(&text(c), &pop).expect_err(c);
         assert!(e.contains(&residual_clause("subject")), "{c:?}: {e}");

@@ -31,13 +31,16 @@ pub(crate) const fn outlined(n: usize, size: usize) -> bool {
 /// [`PkNum::jet_max_abs`] override, so a `NaN` jet fails the comparison it feeds rather than
 /// being discarded by `f64::max`.
 pub(crate) fn nan_max_abs(xs: impl IntoIterator<Item = f64>) -> f64 {
-    xs.into_iter().fold(0.0_f64, |m, x| {
-        if x.is_nan() || m.is_nan() {
-            f64::NAN
-        } else {
-            m.max(x.abs())
-        }
-    })
+    xs.into_iter().fold(
+        0.0_f64,
+        |m, x| {
+            if x.is_nan() || m.is_nan() {
+                f64::NAN
+            } else {
+                m.max(x.abs())
+            }
+        },
+    )
 }
 
 /// An `f64` analysis the generic code runs on values ([`PkNum::host`]): a decision, or a
@@ -555,18 +558,10 @@ pub(crate) trait RecHooks: Sized {
     /// type. `auto` is the driver's auto-switch state.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn ode_segment(
-        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        _u0: &[Self],
-        _t_span: (f64, f64),
-        _params: &[Self],
-        _saveat: &[f64],
-        _interp_at: &[f64],
-        _opts: &crate::ode::OdeSolverOptions,
-        _auto: &mut dyn std::any::Any,
-    ) -> Option<(
-        Vec<crate::ode::SolPointG<Self>>,
-        Vec<crate::ode::SolPointG<Self>>,
-    )> {
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]), _u0: &[Self], _t_span: (f64, f64),
+        _params: &[Self], _saveat: &[f64], _interp_at: &[f64],
+        _opts: &crate::ode::OdeSolverOptions, _auto: &mut dyn std::any::Any,
+    ) -> Option<(Vec<crate::ode::SolPointG<Self>>, Vec<crate::ode::SolPointG<Self>>)> {
         None
     }
     /// `⌊self⌋` as a constant (no derivative): a recording type (#2786) records it, so it
@@ -588,6 +583,12 @@ pub(crate) trait RecHooks: Sized {
     /// instead of the values it saw; every other type ignores it.
     #[inline]
     fn span_hint(_t0: Self, _t1: Self) {}
+    /// The point being recorded is one the value path declines (its repel sentinel: a rate or
+    /// state that overflowed, a probability that underflowed), so a recording that fails here is
+    /// a repelled point, not a failed plan. Nothing but a recording type has anything to note.
+    #[cfg(feature = "markov")]
+    #[inline]
+    fn note_declined() {}
     /// The span [`Self::span_hint`] left, taken (`None` once taken, and on every type but a
     /// recording one).
     #[inline]
@@ -616,9 +617,7 @@ pub(crate) trait RecHooks: Sized {
     /// time (#2786, `kernel_jit::record_repeat`): `None` for every type that is not a recording
     /// type (the caller loops), `Some(None)` when the recording cannot take the call.
     fn repeat(
-        _x0: &[Self],
-        _count: Self,
-        _body: &dyn Fn(&[Self]) -> Vec<Self>,
+        _x0: &[Self], _count: Self, _body: &dyn Fn(&[Self]) -> Vec<Self>,
     ) -> Option<Option<Vec<Self>>> {
         None
     }
@@ -640,10 +639,7 @@ pub(crate) trait RecHooks: Sized {
     /// the call (it fails).
     #[allow(clippy::type_complexity)]
     fn ss_fixed_point(
-        _n: usize,
-        _held: &[usize],
-        _u0: &[f64],
-        _maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
+        _n: usize, _held: &[usize], _u0: &[f64], _maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
         _solve: Box<crate::parser::model_parser::rhs_regcode::kernel_jit::SolveFn>,
     ) -> Option<Option<Vec<Self>>> {
         None
@@ -693,11 +689,8 @@ pub(crate) trait RecHooks: Sized {
     /// the RHS itself — for every number type.
     #[inline]
     fn affine_parts(
-        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        _params: &[Self],
-        _t: f64,
-        _a: &mut [Self],
-        _b: &mut [Self],
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]), _params: &[Self], _t: f64,
+        _a: &mut [Self], _b: &mut [Self],
     ) -> bool {
         false
     }
@@ -707,13 +700,8 @@ pub(crate) trait RecHooks: Sized {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn rhs_jacobian(
-        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        _u: &[Self],
-        _params: &[Self],
-        _t: Self,
-        _f: &mut [Self],
-        _jac: &mut [Self],
-        _ft: &mut [Self],
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]), _u: &[Self], _params: &[Self],
+        _t: Self, _f: &mut [Self], _jac: &mut [Self], _ft: &mut [Self],
     ) -> bool {
         false
     }
@@ -755,10 +743,8 @@ impl<T: PkNum> NonRecRead for T {}
 macro_rules! plain_pknum_methods {
     () => {
         fn host(f: $crate::sens::num::HostFn, args: &[Self]) -> Vec<Self> {
-            let vals: Vec<f64> = args
-                .iter()
-                .map(|x| $crate::sens::num::NonRecording::val(*x))
-                .collect();
+            let vals: Vec<f64> =
+                args.iter().map(|x| $crate::sens::num::NonRecording::val(*x)).collect();
             let mut out = Vec::new();
             f.run(&vals, &mut out);
             out.into_iter().map(Self::from_f64).collect()
@@ -1150,13 +1136,7 @@ pub(crate) mod vm {
     }
 
     impl Layout {
-        pub(crate) const F64: Layout = Layout {
-            n: 0,
-            m: 0,
-            th: false,
-            wide: false,
-            tan: 0,
-        };
+        pub(crate) const F64: Layout = Layout { n: 0, m: 0, th: false, wide: false, tan: 0 };
         pub(crate) const fn lanes(&self) -> usize {
             self.base_lanes() * (1 + self.tan as usize)
         }
@@ -1401,11 +1381,7 @@ mod tests {
         fn check<T: PkNum>(name: &str, mk: impl Fn(f64) -> T) {
             for x in [0.0, -0.0, -1e-18] {
                 for floored in [false, true] {
-                    let a = if floored {
-                        mk(x).guard_floor(0.0)
-                    } else {
-                        mk(x)
-                    };
+                    let a = if floored { mk(x).guard_floor(0.0) } else { mk(x) };
                     let y = a.sqrt();
                     assert!(
                         y.jets_finite() && y.is_constant(),
@@ -1575,21 +1551,9 @@ mod tests {
         let (v, d1, d2) = (0.3, -1.7, 2.9);
         let want = PkNum::lift2(x, v, d1, d2);
         let got = PkNum::lift2(Ext(x), v, d1, d2).0;
-        assert!(
-            (got.value - want.value).abs() < 1e-15,
-            "{got:?} vs {want:?}"
-        );
-        assert!(
-            (got.grad[0] - want.grad[0]).abs() < 1e-14,
-            "{got:?} vs {want:?}"
-        );
-        assert!(
-            (got.hess[0][0] - want.hess[0][0]).abs() < 1e-13,
-            "{got:?} vs {want:?}"
-        );
-        assert!(
-            want.hess[0][0].abs() > 1.0,
-            "a curved jet, so the d2 term is live"
-        );
+        assert!((got.value - want.value).abs() < 1e-15, "{got:?} vs {want:?}");
+        assert!((got.grad[0] - want.grad[0]).abs() < 1e-14, "{got:?} vs {want:?}");
+        assert!((got.hess[0][0] - want.hess[0][0]).abs() < 1e-13, "{got:?} vs {want:?}");
+        assert!(want.hess[0][0].abs() > 1.0, "a curved jet, so the d2 term is live");
     }
 }

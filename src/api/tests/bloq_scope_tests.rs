@@ -9,7 +9,7 @@
 //!
 //! **The rule.** `FitOptions::bloq_method` is an `Option`: `Some(m)` runs this call under `m`,
 //! `None` under the model's own method. `fit` arms it (`types::arm_bloq_override`, carried to
-//! the workers by `api::pool::FitScope::bloq`) and every reader asks
+//! the workers by `pool::FitScope::bloq`) and every reader asks
 //! `CompiledModel::bloq_in_force` (pinned by `tests/bloq_in_force_is_the_one_reader.rs`).
 //!
 //! Every case reads **which method the fit reports** (`FitResult::bloq_method`, built from
@@ -58,13 +58,7 @@ fn opts(bloq: Option<BloqMethod>, threads: usize) -> FitOptions {
 
 fn run_on(own: BloqMethod, bloq: Option<BloqMethod>, threads: usize) -> FitResult {
     let (model, population) = warfarin_bloq(own);
-    fit(
-        &model,
-        &population,
-        &model.default_params,
-        &opts(bloq, threads),
-    )
-    .expect("fit")
+    fit(&model, &population, &model.default_params, &opts(bloq, threads)).expect("fit")
 }
 
 fn run(own: BloqMethod, bloq: Option<BloqMethod>) -> FitResult {
@@ -76,10 +70,7 @@ fn run(own: BloqMethod, bloq: Option<BloqMethod>) -> FitResult {
 fn straddle(m3: &FitResult, drop: &FitResult) {
     let (_, population) = warfarin_bloq(BloqMethod::Drop);
     assert!(
-        population
-            .subjects
-            .iter()
-            .any(|s| s.has_censored_observation()),
+        population.subjects.iter().any(|s| s.has_censored_observation()),
         "the fixture carries no censored rows"
     );
     assert!(m3.ofv.is_finite() && drop.ofv.is_finite());
@@ -149,10 +140,7 @@ fn no_override_defers_to_the_model_and_agreeing_options_change_nothing() {
         &model,
         &population,
         &model.default_params,
-        &FitOptions {
-            bloq_method: None,
-            ..opts(None, 1)
-        },
+        &FitOptions { bloq_method: None, ..opts(None, 1) },
     )
     .expect("fit");
     assert_eq!(defaulted.bloq_method, "m3", "None on an m3 model");
@@ -160,11 +148,7 @@ fn no_override_defers_to_the_model_and_agreeing_options_change_nothing() {
     for (own, want) in [(BloqMethod::M3, &m3), (BloqMethod::Drop, &drop)] {
         let agreeing = run(own, Some(own));
         assert_eq!(agreeing.bloq_method, want.bloq_method, "{own:?}: label");
-        assert_eq!(
-            agreeing.ofv.to_bits(),
-            want.ofv.to_bits(),
-            "{own:?}: objective"
-        );
+        assert_eq!(agreeing.ofv.to_bits(), want.ofv.to_bits(), "{own:?}: objective");
     }
 }
 
@@ -198,18 +182,9 @@ fn the_fit_pool_workers_score_the_override() {
 #[test]
 fn the_override_does_not_outlive_the_call() {
     let (model, population) = warfarin_bloq(BloqMethod::Drop);
-    let _ = fit(
-        &model,
-        &population,
-        &model.default_params,
-        &opts(Some(BloqMethod::M3), 1),
-    )
-    .expect("fit");
-    assert_eq!(
-        model.bloq_in_force(),
-        BloqMethod::Drop,
-        "calling thread after the fit"
-    );
+    let _ = fit(&model, &population, &model.default_params, &opts(Some(BloqMethod::M3), 1))
+        .expect("fit");
+    assert_eq!(model.bloq_in_force(), BloqMethod::Drop, "calling thread after the fit");
     let after = fit(&model, &population, &model.default_params, &opts(None, 1)).expect("fit");
     assert_eq!(after.bloq_method, "drop", "a later default fit");
 
@@ -217,23 +192,11 @@ fn the_override_does_not_outlive_the_call() {
     assert_eq!(model.bloq_in_force(), BloqMethod::M3, "armed");
     {
         let _inner = crate::types::arm_bloq_override(None);
-        assert_eq!(
-            model.bloq_in_force(),
-            BloqMethod::Drop,
-            "nested None reads the model"
-        );
+        assert_eq!(model.bloq_in_force(), BloqMethod::Drop, "nested None reads the model");
     }
-    assert_eq!(
-        model.bloq_in_force(),
-        BloqMethod::M3,
-        "restored after the nested call"
-    );
+    assert_eq!(model.bloq_in_force(), BloqMethod::M3, "restored after the nested call");
     drop(outer);
-    assert_eq!(
-        model.bloq_in_force(),
-        BloqMethod::Drop,
-        "restored after the outer call"
-    );
+    assert_eq!(model.bloq_in_force(), BloqMethod::Drop, "restored after the outer call");
 }
 
 /// **B6 — the post-hoc steps score the fit's recorded method.** `run_covariance` is handed the
@@ -246,31 +209,14 @@ fn the_override_does_not_outlive_the_call() {
 fn run_covariance_scores_the_method_the_fit_recorded() {
     let (drop_model, population) = warfarin_bloq(BloqMethod::Drop);
     let (m3_model, _) = warfarin_bloq(BloqMethod::M3);
-    let direct = fit(
-        &drop_model,
-        &population,
-        &drop_model.default_params,
-        &opts(Some(BloqMethod::M3), 1),
-    )
-    .expect("direct fit");
-    let stamped = fit(
-        &m3_model,
-        &population,
-        &m3_model.default_params,
-        &opts(None, 1),
-    )
-    .expect("stamped fit");
-    assert_eq!(
-        direct.ofv.to_bits(),
-        stamped.ofv.to_bits(),
-        "same estimates"
-    );
+    let direct =
+        fit(&drop_model, &population, &drop_model.default_params, &opts(Some(BloqMethod::M3), 1))
+            .expect("direct fit");
+    let stamped =
+        fit(&m3_model, &population, &m3_model.default_params, &opts(None, 1)).expect("stamped fit");
+    assert_eq!(direct.ofv.to_bits(), stamped.ofv.to_bits(), "same estimates");
 
-    let defaults = FitOptions {
-        verbose: false,
-        threads: Some(1),
-        ..Default::default()
-    };
+    let defaults = FitOptions { verbose: false, threads: Some(1), ..Default::default() };
     let se = |fit: &FitResult, model: &CompiledModel| -> Vec<f64> {
         crate::run_covariance(fit, Some(model), Some(&population), &defaults)
             .expect("run_covariance")
@@ -283,11 +229,7 @@ fn run_covariance_scores_the_method_the_fit_recorded() {
     let mut as_drop = direct.clone();
     as_drop.bloq_method = "drop".to_string();
     let under_drop = se(&as_drop, &drop_model);
-    assert!(want
-        .iter()
-        .chain(&got)
-        .chain(&under_drop)
-        .all(|v| v.is_finite()));
+    assert!(want.iter().chain(&got).chain(&under_drop).all(|v| v.is_finite()));
     assert_ne!(
         want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         under_drop.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -308,19 +250,12 @@ fn fitted_marginal_options_takes_the_recorded_method_when_there_is_one() {
         bloq_method: "m3".to_string(),
         ..crate::types::test_helpers::minimal_fit_result()
     };
-    let caller = FitOptions {
-        bloq_method: Some(BloqMethod::Drop),
-        ..Default::default()
-    };
+    let caller = FitOptions { bloq_method: Some(BloqMethod::Drop), ..Default::default() };
     let resolved = crate::estimation::fit_inputs::fitted_marginal_options(&fit, &caller);
     assert_eq!(resolved.bloq_method, Some(BloqMethod::M3), "recorded m3");
     fit.bloq_method = String::new();
     let resolved = crate::estimation::fit_inputs::fitted_marginal_options(&fit, &caller);
-    assert_eq!(
-        resolved.bloq_method,
-        Some(BloqMethod::Drop),
-        "nothing recorded"
-    );
+    assert_eq!(resolved.bloq_method, Some(BloqMethod::Drop), "nothing recorded");
 }
 
 /// **B7 — `fit_from_files` is bit-identical to before #1824.** It ignores the file's
@@ -340,11 +275,7 @@ fn fit_from_files_keeps_ignoring_the_files_bloq_method() {
 
     let none = eval(None);
     assert_eq!(none.bloq_method, "drop", "no opinion on an m3 file");
-    assert_eq!(
-        none.ofv.to_bits(),
-        drop.ofv.to_bits(),
-        "no opinion: drop objective"
-    );
+    assert_eq!(none.ofv.to_bits(), drop.ofv.to_bits(), "no opinion: drop objective");
     let asked = eval(Some(BloqMethod::M3));
     assert_eq!(asked.bloq_method, "m3", "asked for m3");
     assert_eq!(asked.ofv.to_bits(), m3.ofv.to_bits(), "asked: M3 objective");
@@ -371,10 +302,7 @@ fn check_model_options_reads_the_options_bloq_method() {
     let codes = |bloq: Option<BloqMethod>| -> Vec<String> {
         crate::api::check_model_options(
             &model,
-            &FitOptions {
-                bloq_method: bloq,
-                ..Default::default()
-            },
+            &FitOptions { bloq_method: bloq, ..Default::default() },
         )
         .into_iter()
         .map(|d| d.code.to_string())
@@ -384,13 +312,6 @@ fn check_model_options_reads_the_options_bloq_method() {
     let with_m3 = codes(Some(BloqMethod::M3));
     let without = codes(None);
     assert!(with_m3.iter().any(|c| c == CODE), "Some(M3): {with_m3:?}");
-    assert!(
-        !without.iter().any(|c| c == CODE),
-        "None on a drop model: {without:?}"
-    );
-    assert_eq!(
-        model.bloq_in_force(),
-        BloqMethod::Drop,
-        "nothing outlives the call"
-    );
+    assert!(!without.iter().any(|c| c == CODE), "None on a drop model: {without:?}");
+    assert_eq!(model.bloq_in_force(), BloqMethod::Drop, "nothing outlives the call");
 }

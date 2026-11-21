@@ -130,11 +130,7 @@ fn nonmem_pred(file: &str) -> Vec<(String, f64, f64)> {
         .unwrap_or_else(|e| panic!("the committed NONMEM table must be readable: {e}"));
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. line");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header line")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> = lines.next().expect("column header line").split_whitespace().collect();
     let col = |name: &str| {
         header
             .iter()
@@ -170,9 +166,8 @@ fn worst_pred_error(model_src: &str, table: &str) -> f64 {
     let mut worst: f64 = 0.0;
     let mut matched = 0usize;
     for row in &ferx {
-        let Some((_, _, want)) = nm
-            .iter()
-            .find(|(id, time, _)| *id == row.id && (*time - row.time).abs() < 1e-9)
+        let Some((_, _, want)) =
+            nm.iter().find(|(id, time, _)| *id == row.id && (*time - row.time).abs() < 1e-9)
         else {
             panic!("no NONMEM row for subject {} at t = {}", row.id, row.time);
         };
@@ -190,10 +185,7 @@ fn worst_pred_error(model_src: &str, table: &str) -> f64 {
         worst = worst.max((row.pred - want).abs() / want.abs());
         matched += 1;
     }
-    assert_eq!(
-        matched, 300,
-        "the anchor must compare all 300 observations, not a subset"
-    );
+    assert_eq!(matched, 300, "the anchor must compare all 300 observations, not a subset");
     worst
 }
 
@@ -208,10 +200,7 @@ const NM_OFV_B_NULL: f64 = -1037.8010768417562;
 fn ferx_ofv(model_src: &str) -> f64 {
     let parsed = parse_full_model(model_src).expect("the ferx model must parse");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("the dataset must load");
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..parsed.fit_options.clone()
-    };
+    let options = FitOptions { outer_maxiter: 0, ..parsed.fit_options.clone() };
     let result = fit(&parsed.model, &pop, &parsed.model.default_params, &options)
         .expect("the evaluation must run");
     assert!(result.ofv.is_finite(), "ferx OFV is not finite");
@@ -235,10 +224,7 @@ fn an_additive_relation_matches_nonmem() {
     // cannot pass it.
     let delta = ferx_ofv(&arm_a(0.04)) - ferx_ofv(&arm_a(0.0));
     let want = NM_OFV_A - NM_OFV_A_NULL;
-    assert!(
-        (delta - want).abs() < 1e-3,
-        "arm A ΔOFV: ferx {delta}, NONMEM {want}"
-    );
+    assert!((delta - want).abs() < 1e-3, "arm A ΔOFV: ferx {delta}, NONMEM {want}");
 }
 
 #[test]
@@ -251,10 +237,7 @@ fn a_multiplicative_and_an_additive_relation_on_one_parameter_match_nonmem() {
     // (3.1e-4 relative); bound 3× the measurement.
     let delta = ferx_ofv(&arm_b(0.02)) - ferx_ofv(&arm_b(0.0));
     let want = NM_OFV_B - NM_OFV_B_NULL;
-    assert!(
-        (delta - want).abs() < 1e-3,
-        "arm B ΔOFV: ferx {delta}, NONMEM {want}"
-    );
+    assert!((delta - want).abs() < 1e-3, "arm B ΔOFV: ferx {delta}, NONMEM {want}");
 }
 
 #[test]

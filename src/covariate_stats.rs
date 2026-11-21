@@ -27,8 +27,8 @@
 
 use std::collections::HashSet;
 
-use crate::api::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
 use crate::diagnostics::{Diagnostic, EngineError};
+use crate::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::parser::model_parser::parse_full_model_with;
 use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
@@ -45,7 +45,7 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// declares, so a `parsed` already bound to other data is re-centred on
 /// `population` exactly as a fresh parse would be. Level bindings `parsed` was
 /// bound with are kept only when they are `population`'s: every subject carries
-/// each block's index column, which [`bind_theta_levels`](crate::api::bind_theta_levels)
+/// each block's index column, which [`bind_theta_levels`](crate::levels::bind_theta_levels)
 /// writes, and `population` shows exactly the bound levels, so the column was
 /// written for this layout. Otherwise they are dropped, and the blocks are left for
 /// `bind_theta_levels` to bind on `population`.
@@ -59,8 +59,8 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// contrast on `population`.
 ///
 /// Also a no-op on a model laid out on a fit's bindings
-/// ([`bind_from_fit`](crate::api::bind_from_fit),
-/// [`layout_from_fit`](crate::api::layout_from_fit)): its centres are the fit's,
+/// ([`bind_from_fit`](crate::levels::bind_from_fit),
+/// [`layout_from_fit`](crate::levels::layout_from_fit)): its centres are the fit's,
 /// which the fitted θ was estimated against, and are never re-taken from the data
 /// at hand. A model the deprecated `bind_theta_levels_from_fit` laid out without
 /// the fit's statistics has no fit centre to keep, and is refused.
@@ -68,9 +68,7 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// Every refusal carries the code `E_COVARIATE_STATS_BINDING` on block
 /// `covariate_model` (#1773), the code `ferx check --data` reports for it.
 pub fn bind_covariate_stats(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &Population,
+    parsed: &mut ParsedModel, model_text: &str, population: &Population,
 ) -> Result<(), EngineError> {
     bind_covariate_stats_diag(parsed, model_text, population).map_err(EngineError::from_diagnostic)
 }
@@ -78,9 +76,7 @@ pub fn bind_covariate_stats(
 /// [`bind_covariate_stats`], refusing with the [`Diagnostic`] itself: what
 /// `ferx check`'s binding step reads.
 pub(crate) fn bind_covariate_stats_diag(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &Population,
+    parsed: &mut ParsedModel, model_text: &str, population: &Population,
 ) -> Result<(), Diagnostic> {
     bind_stats_on_data(parsed, model_text, population).map_err(stats_binding_error)
 }
@@ -94,9 +90,7 @@ pub(crate) fn stats_binding_error(message: impl Into<String>) -> Diagnostic {
 
 /// The body of [`bind_covariate_stats`]; every refusal is the statistics half's.
 fn bind_stats_on_data(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &Population,
+    parsed: &mut ParsedModel, model_text: &str, population: &Population,
 ) -> Result<(), String> {
     if parsed.model.bound_from_fit() {
         // The fit's centres, when it gave any, are the ones to keep. A model laid out
@@ -124,11 +118,7 @@ fn bind_stats_on_data(
     // Summarise every covariate any relation reads, not only the unresolved
     // ones: a second relation on the same covariate costs one pass either way,
     // and the resulting table is what the fit YAML echoes.
-    let wanted: HashSet<&str> = spec
-        .relations
-        .iter()
-        .map(|r| r.covariate.as_str())
-        .collect();
+    let wanted: HashSet<&str> = spec.relations.iter().map(|r| r.covariate.as_str()).collect();
     let mut stats = CovariateStatBindings::new();
     for name in wanted {
         stats.insert(name.to_string(), summarize(name, population)?);
@@ -154,9 +144,7 @@ fn bind_stats_on_data(
 /// moving nothing. `None` when the model has no relation still needing one,
 /// or a covariate does not summarise — the bind itself names that.
 pub(crate) fn stats_on_data(
-    parsed: &ParsedModel,
-    model_text: &str,
-    population: &Population,
+    parsed: &ParsedModel, model_text: &str, population: &Population,
 ) -> Option<CovariateStatBindings> {
     if parsed.model.bound_from_fit() {
         return None;
@@ -168,10 +156,7 @@ pub(crate) fn stats_on_data(
     }
     let mut stats = CovariateStatBindings::new();
     for r in &spec.relations {
-        stats.insert(
-            r.covariate.clone(),
-            summarize(&r.covariate, population).ok()?,
-        );
+        stats.insert(r.covariate.clone(), summarize(&r.covariate, population).ok()?);
     }
     Some(stats)
 }
@@ -181,9 +166,7 @@ pub(crate) fn stats_on_data(
 /// covariate `population` lacks counts as differing. Deterministic, since the
 /// summary is the one the statistics were made by.
 pub(crate) fn stats_hold_on(stats: &CovariateStatBindings, population: &Population) -> bool {
-    stats
-        .iter()
-        .all(|(name, held)| summarize(name, population).is_ok_and(|s| &s == held))
+    stats.iter().all(|(name, held)| summarize(name, population).is_ok_and(|s| &s == held))
 }
 
 /// Reject a model whose `[covariate_model]` still carries a relation waiting on
@@ -223,10 +206,7 @@ fn unresolved_lines(model: &CompiledModel) -> Option<String> {
     if unresolved.is_empty() {
         return None;
     }
-    let lines: Vec<String> = unresolved
-        .iter()
-        .map(|r| format!("  {}", r.source_line))
-        .collect();
+    let lines: Vec<String> = unresolved.iter().map(|r| format!("  {}", r.source_line)).collect();
     Some(lines.join("\n"))
 }
 
@@ -236,11 +216,7 @@ pub(crate) fn symbolic_covariates(model: &CompiledModel) -> Vec<String> {
     let Some(spec) = model.covariate_model.as_ref() else {
         return Vec::new();
     };
-    let mut names: Vec<String> = spec
-        .unresolved()
-        .iter()
-        .map(|r| r.covariate.clone())
-        .collect();
+    let mut names: Vec<String> = spec.unresolved().iter().map(|r| r.covariate.clone()).collect();
     names.sort_unstable();
     names.dedup();
     names
@@ -252,13 +228,10 @@ pub(crate) fn symbolic_covariates(model: &CompiledModel) -> Vec<String> {
 /// level bindings, the statistics travel in a `.fitrx` as data a caller can edit,
 /// and the binder must never fill a gap by summarising the population at hand.
 pub(crate) fn validate_fitted_stats(
-    model: &CompiledModel,
-    fitted: &CovariateStatBindings,
+    model: &CompiledModel, fitted: &CovariateStatBindings,
 ) -> Result<(), String> {
-    let missing: Vec<String> = symbolic_covariates(model)
-        .into_iter()
-        .filter(|c| !fitted.contains_key(c))
-        .collect();
+    let missing: Vec<String> =
+        symbolic_covariates(model).into_iter().filter(|c| !fitted.contains_key(c)).collect();
     if !missing.is_empty() {
         return Err(format!(
             "[covariate_model] relations state a statistic of {} symbolically, but the fit's \
@@ -270,18 +243,10 @@ pub(crate) fn validate_fitted_stats(
     let read: HashSet<&str> = model
         .covariate_model
         .as_ref()
-        .map(|spec| {
-            spec.relations
-                .iter()
-                .map(|r| r.covariate.as_str())
-                .collect()
-        })
+        .map(|spec| spec.relations.iter().map(|r| r.covariate.as_str()).collect())
         .unwrap_or_default();
-    let mut extra: Vec<String> = fitted
-        .keys()
-        .filter(|c| !read.contains(c.as_str()))
-        .cloned()
-        .collect();
+    let mut extra: Vec<String> =
+        fitted.keys().filter(|c| !read.contains(c.as_str())).cloned().collect();
     if !extra.is_empty() {
         extra.sort_unstable();
         return Err(format!(
@@ -322,8 +287,7 @@ pub(crate) struct StatMismatch {
 /// value) is the binder's own refusal, `E_COVARIATE_STATS_BINDING`
 /// ([`stats_binding_error`]), as `bind_covariate_stats` gives it on the same data.
 pub(crate) fn check_stats_on(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Result<Option<StatMismatch>, Diagnostic> {
     let stats = &model.data_bindings().covariate_stats;
     let mut names: Vec<&String> = stats.keys().collect();
@@ -331,12 +295,7 @@ pub(crate) fn check_stats_on(
     for name in names {
         let data = summarize(name, population).map_err(stats_binding_error)?;
         if let Some((field, model, data)) = first_difference(&stats[name], &data) {
-            return Ok(Some(StatMismatch {
-                covariate: name.clone(),
-                field,
-                model,
-                data,
-            }));
+            return Ok(Some(StatMismatch { covariate: name.clone(), field, model, data }));
         }
     }
     Ok(None)
@@ -345,8 +304,7 @@ pub(crate) fn check_stats_on(
 /// The first field, in the order median, mean, min, max, mode, levels, where two
 /// summaries differ, with both values formatted.
 fn first_difference(
-    model: &CovariateSummary,
-    data: &CovariateSummary,
+    model: &CovariateSummary, data: &CovariateSummary,
 ) -> Option<(&'static str, String, String)> {
     let scalars = [
         ("median", model.median, data.median),
@@ -358,21 +316,12 @@ fn first_difference(
     if let Some((field, m, d)) = scalars.into_iter().find(|(_, m, d)| m != d) {
         return Some((field, m.to_string(), d.to_string()));
     }
-    (model.levels != data.levels).then(|| {
-        (
-            "levels",
-            format!("{:?}", model.levels),
-            format!("{:?}", data.levels),
-        )
-    })
+    (model.levels != data.levels)
+        .then(|| ("levels", format!("{:?}", model.levels), format!("{:?}", data.levels)))
 }
 
 fn backticked(names: &[String]) -> String {
-    names
-        .iter()
-        .map(|n| format!("`{n}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
 }
 
 /// Summarise one covariate over the population.
@@ -401,11 +350,7 @@ fn summarize(name: &str, population: &Population) -> Result<CovariateSummary, St
     }
     values.sort_by(f64::total_cmp);
     let n = values.len();
-    let median = if n % 2 == 1 {
-        values[n / 2]
-    } else {
-        0.5 * (values[n / 2 - 1] + values[n / 2])
-    };
+    let median = if n % 2 == 1 { values[n / 2] } else { 0.5 * (values[n / 2 - 1] + values[n / 2]) };
     Ok(CovariateSummary {
         median,
         mean: values.iter().sum::<f64>() / n as f64,
@@ -486,5 +431,5 @@ fn distinct(sorted: &[f64]) -> Vec<f64> {
 }
 
 #[cfg(test)]
-#[path = "tests/covariate_stats_tests.rs"]
+#[path = "api/tests/covariate_stats_tests.rs"]
 mod tests;

@@ -27,10 +27,7 @@ fn record_kernel_matches_hand_computed_pmf() {
         assert!((log - want).abs() < 1e-12, "{fam:?} log {log} vs {want}");
         let sz = (fam == NB).then_some(size);
         let pmf = -count_log_pmf(lam, sz, f64::from(k));
-        assert!(
-            (pmf - want).abs() < 1e-12,
-            "{fam:?} count_log_pmf {pmf} vs {want}"
-        );
+        assert!((pmf - want).abs() < 1e-12, "{fam:?} count_log_pmf {pmf} vs {want}");
     }
     // `k = 0` reduces to `λ` (Poisson) and `r·log(1 + λ/r)` (NB).
     let p0 = count_record_nll_g(P, LIN, 2.5, 0.0, 0).unwrap();
@@ -47,14 +44,8 @@ fn negbin_tends_to_poisson_and_differs_at_small_size() {
         let p = count_record_nll_g(P, LIN, 3.7, 0.0, k).unwrap();
         let big = count_record_nll_g(NB, LIN, 3.7, 1e9, k).unwrap();
         let small = count_record_nll_g(NB, LIN, 3.7, 0.8, k).unwrap();
-        assert!(
-            (p - big).abs() < 1e-6,
-            "k={k}: Poisson {p} vs NB(r=1e9) {big}"
-        );
-        assert!(
-            (p - small).abs() > 0.05,
-            "k={k}: NB(r=0.8) {small} too close to {p}"
-        );
+        assert!((p - big).abs() < 1e-6, "k={k}: Poisson {p} vs NB(r=1e9) {big}");
+        assert!((p - small).abs() > 0.05, "k={k}: NB(r=0.8) {small} too close to {p}");
     }
 }
 
@@ -85,16 +76,10 @@ fn negbin_keeps_its_digits_at_huge_size() {
             let gap = (got - pmf).abs() / pmf.abs().max(1.0);
             assert!(gap.is_finite());
             worst = worst.max(gap);
-            assert!(
-                gap < 1e-13,
-                "λ={lam} r={r} k={k}: {got} vs count_log_pmf {pmf}"
-            );
+            assert!(gap < 1e-13, "λ={lam} r={r} k={k}: {got} vs count_log_pmf {pmf}");
             if r >= 1e12 {
                 let pois = count_record_nll_g(P, LIN, lam, 0.0, k).unwrap();
-                assert!(
-                    (got - pois).abs() < 1e-10,
-                    "λ={lam} r={r} k={k}: {got} vs Poisson {pois}"
-                );
+                assert!((got - pois).abs() < 1e-10, "λ={lam} r={r} k={k}: {got} vs Poisson {pois}");
             }
             let d = count_record_nll_g(NB, LIN, Dual2::<1>::var(lam, 0), Dual2::constant(r), k)
                 .unwrap();
@@ -102,11 +87,7 @@ fn negbin_keeps_its_digits_at_huge_size() {
             let g = (kf + r) / (r + lam) - kf / lam;
             let h = kf / (lam * lam) - (kf + r) / ((r + lam) * (r + lam));
             assert!(d.grad[0].is_finite() && d.hess[0][0].is_finite());
-            assert!(
-                (d.grad[0] - g).abs() < 1e-12,
-                "λ={lam} r={r} k={k}: ∂λ {} vs {g}",
-                d.grad[0]
-            );
+            assert!((d.grad[0] - g).abs() < 1e-12, "λ={lam} r={r} k={k}: ∂λ {} vs {g}", d.grad[0]);
             assert!(
                 (d.hess[0][0] - h).abs() < 1e-12,
                 "λ={lam} r={r} k={k}: ∂²λ {} vs {h}",
@@ -118,10 +99,7 @@ fn negbin_keeps_its_digits_at_huge_size() {
     let r = 1000.0;
     let below = count_record_nll_g(NB, LIN, 1.0 - 1e-12, r, 2).unwrap();
     let above = count_record_nll_g(NB, LIN, 1.0 + 1e-12, r, 2).unwrap();
-    assert!(
-        (below - above).abs() < 1e-11,
-        "switch jump {below} vs {above}"
-    );
+    assert!((below - above).abs() < 1e-11, "switch jump {below} vs {above}");
     eprintln!("NB huge-size worst relative value gap {worst:.2e}");
 }
 
@@ -168,31 +146,15 @@ fn negbin_high_counts_keep_their_digits_at_any_size() {
         assert!(gap_r.is_finite() && gap_d.is_finite());
         worst_r = worst_r.max(gap_r);
         worst_d = worst_d.max(gap_d);
-        assert!(
-            gap_r < 1e-10,
-            "λ={lam} r={r} k={k}: kernel {got} vs R {want}"
-        );
-        assert!(
-            gap_d < 1e-12,
-            "λ={lam} r={r} k={k}: kernel {got} vs direct sum {dir}"
-        );
-        assert!(
-            (log - got).abs() / got < 1e-13,
-            "λ={lam} r={r} k={k}: log scale {log}"
-        );
-        assert_eq!(
-            got, pmf,
-            "λ={lam} r={r} k={k}: kernel and count_log_pmf differ"
-        );
+        assert!(gap_r < 1e-10, "λ={lam} r={r} k={k}: kernel {got} vs R {want}");
+        assert!(gap_d < 1e-12, "λ={lam} r={r} k={k}: kernel {got} vs direct sum {dir}");
+        assert!((log - got).abs() / got < 1e-13, "λ={lam} r={r} k={k}: log scale {log}");
+        assert_eq!(got, pmf, "λ={lam} r={r} k={k}: kernel and count_log_pmf differ");
     }
     eprintln!("NB high-count worst relative gap: vs R {worst_r:.2e}, vs direct sum {worst_d:.2e}");
     let mut worst_g = 0.0f64;
     let mut worst_h = 0.0f64;
-    for (lam, r, k) in [
-        (400.0, 25.0, 1000u32),
-        (30.0, 60.0, 400),
-        (300.0, 500.0, 700),
-    ] {
+    for (lam, r, k) in [(400.0, 25.0, 1000u32), (30.0, 60.0, 400), (300.0, 500.0, 700)] {
         let d =
             count_record_nll_g(NB, LIN, Dual2::<1>::constant(lam), Dual2::var(r, 0), k).unwrap();
         let f = |rr: f64| count_record_nll_g(NB, LIN, lam, rr, k).unwrap();
@@ -235,10 +197,7 @@ fn negbin_lgamma_branches_agree_across_the_switch() {
         // `ln Γ(k + r)` is ~1200 here: the direct form carries ~1e-10 of rounding.
         assert!((got - direct).abs() < 1e-9, "k={k}: {got} vs {direct}");
         let pmf = -count_log_pmf(lam, Some(r), kf);
-        assert!(
-            (got - pmf).abs() < 1e-9,
-            "k={k}: {got} vs count_log_pmf {pmf}"
-        );
+        assert!((got - pmf).abs() < 1e-9, "k={k}: {got} vs count_log_pmf {pmf}");
     }
 }
 
@@ -248,16 +207,10 @@ fn negbin_lgamma_branches_agree_across_the_switch() {
 #[test]
 fn undefined_laws_are_declined() {
     for lam in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        assert!(
-            count_record_nll_g(P, LIN, lam, 0.0, 2).is_none(),
-            "λ = {lam}"
-        );
+        assert!(count_record_nll_g(P, LIN, lam, 0.0, 2).is_none(), "λ = {lam}");
     }
     for ll in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 800.0] {
-        assert!(
-            count_record_nll_g(P, LOG, ll, 0.0, 2).is_none(),
-            "log λ = {ll}"
-        );
+        assert!(count_record_nll_g(P, LOG, ll, 0.0, 2).is_none(), "log λ = {ll}");
     }
     for r in [0.0, -2.0, f64::NAN, f64::INFINITY] {
         assert!(count_record_nll_g(NB, LIN, 2.0, r, 2).is_none(), "r = {r}");
@@ -278,12 +231,9 @@ fn record_kernel_dual_matches_fd() {
     let f = |fam, sc, m: f64, r: f64, k| count_record_nll_g(fam, sc, m, r, k).unwrap();
     let mut worst_g = 0.0f64;
     let mut worst_h = 0.0f64;
-    for (fam, sc, m, r) in [
-        (P, LIN, 2.3, 0.0),
-        (P, LOG, 0.4, 0.0),
-        (NB, LIN, 2.3, 1.7),
-        (NB, LOG, 1.1, 6.0),
-    ] {
+    for (fam, sc, m, r) in
+        [(P, LIN, 2.3, 0.0), (P, LOG, 0.4, 0.0), (NB, LIN, 2.3, 1.7), (NB, LOG, 1.1, 6.0)]
+    {
         for k in [0u32, 1, 3, 9] {
             let d =
                 count_record_nll_g(fam, sc, Dual2::<2>::var(m, 0), Dual2::var(r, 1), k).unwrap();
@@ -311,10 +261,7 @@ fn record_kernel_dual_matches_fd() {
                 }
             }
             if fam == P {
-                assert_eq!(
-                    d.grad[1], 0.0,
-                    "a Poisson record must not read the size slot"
-                );
+                assert_eq!(d.grad[1], 0.0, "a Poisson record must not read the size slot");
             }
         }
     }
@@ -353,20 +300,14 @@ fn loaded_data_term_sums_the_records_at_their_own_covariates() {
     let theta = &model.default_params.theta;
     let eta = [0.13, -0.2];
     let s = &prep.population.subjects[0];
-    let n_count = s
-        .obs_records
-        .iter()
-        .filter(|r| matches!(r, ObsRecord::Count { .. }))
-        .count();
+    let n_count = s.obs_records.iter().filter(|r| matches!(r, ObsRecord::Count { .. })).count();
     assert_eq!(n_count, 6, "every row is a count record");
     let wt = s.covariates["WT"];
     let trt = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     let mut want = 0.0;
     let mut lams = Vec::new();
     for (r, t) in s.obs_records.iter().zip(trt) {
-        let ObsRecord::Count { count, .. } = r else {
-            unreachable!()
-        };
+        let ObsRecord::Count { count, .. } = r else { unreachable!() };
         let lam =
             theta[0] * (theta[1] * (wt / 70.0 - 1.0) + theta[2] * t * eta[1].exp() + eta[0]).exp();
         want -= count_log_pmf(lam, Some(theta[3]), f64::from(*count));
@@ -383,9 +324,7 @@ fn loaded_data_term_sums_the_records_at_their_own_covariates() {
     assert_eq!(preds.len(), 6);
     assert_eq!(diags.len(), 6);
     for ((p, d), lam) in preds.iter().zip(&diags).zip(&lams) {
-        let Prediction::Rate { lambda, size } = p.prediction else {
-            panic!("{:?}", p.prediction)
-        };
+        let Prediction::Rate { lambda, size } = p.prediction else { panic!("{:?}", p.prediction) };
         assert!((lambda - lam).abs() < 1e-12 && (d.ipred - lam).abs() < 1e-12);
         assert_eq!(size, Some(theta[3]));
         assert_eq!(p.observed, Some(d.dv));
@@ -442,10 +381,7 @@ fn planned_eta_gradient_and_hessian_match_fd() {
                 wh = wh.max((h[(i, j)] - fd2).abs() / fd2.abs().max(1.0));
             }
         }
-        assert!(
-            h[(0, 1)].abs() > 1e-3,
-            "the off-diagonal block must be live"
-        );
+        assert!(h[(0, 1)].abs() > 1e-3, "the off-diagonal block must be live");
     }
     eprintln!("count planned η-derivatives vs FD: grad {wg:.2e}, hess {wh:.2e}");
     assert!(wg < 1e-7, "gradient {wg:.2e}");
@@ -500,17 +436,13 @@ fn simulated_counts_have_the_law_s_mean_and_variance() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(2877);
     for (size, var_want, band) in [(None, 4.0, 0.04), (Some(2.0), 12.0, 0.06)] {
         let n = 40_000;
-        let xs: Vec<f64> = (0..n)
-            .map(|_| f64::from(draw_count(4.0, size, &mut rng).unwrap()))
-            .collect();
+        let xs: Vec<f64> =
+            (0..n).map(|_| f64::from(draw_count(4.0, size, &mut rng).unwrap())).collect();
         let mean = xs.iter().sum::<f64>() / n as f64;
         let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
         eprintln!("size {size:?}: mean {mean:.4}, var {var:.4} (want {var_want})");
         assert!((mean - 4.0).abs() < 0.05, "mean {mean}");
-        assert!(
-            (var / var_want - 1.0).abs() < band,
-            "var {var} vs {var_want}"
-        );
+        assert!((var / var_want - 1.0).abs() < band, "var {var} vs {var_want}");
     }
     // A zero mean draws zero.
     assert_eq!(draw_count(0.0, None, &mut rng), Some(0));
@@ -528,17 +460,7 @@ fn simulate_count_emits_one_row_per_record_and_warns_on_undefined_laws() {
     let s = &prep.population.subjects[0];
     let mut rng = rand::rngs::StdRng::seed_from_u64(1);
     let (mut out, mut warn) = (Vec::new(), Vec::new());
-    simulate_count(
-        model,
-        s,
-        theta,
-        &[0.0, 0.0],
-        0,
-        0,
-        &mut rng,
-        &mut out,
-        &mut warn,
-    );
+    simulate_count(model, s, theta, &[0.0, 0.0], 0, 0, &mut rng, &mut out, &mut warn);
     assert_eq!(out.len(), 6);
     assert!(warn.is_empty(), "{warn:?}");
     let mut preds = Vec::new();
@@ -546,25 +468,13 @@ fn simulate_count_emits_one_row_per_record_and_warns_on_undefined_laws() {
     for (row, p) in out.iter().zip(&preds) {
         assert!(matches!(row.outcome, SimOutcome::Count { .. }));
         assert_eq!(row.time, p.time);
-        let Prediction::Rate { lambda, .. } = p.prediction else {
-            unreachable!()
-        };
+        let Prediction::Rate { lambda, .. } = p.prediction else { unreachable!() };
         assert_eq!(row.ipred, lambda);
     }
     let mut bad = theta.clone();
     bad[3] = -1.0; // size r < 0: no law
     let (mut out, mut warn) = (Vec::new(), Vec::new());
-    simulate_count(
-        model,
-        s,
-        &bad,
-        &[0.0, 0.0],
-        0,
-        0,
-        &mut rng,
-        &mut out,
-        &mut warn,
-    );
+    simulate_count(model, s, &bad, &[0.0, 0.0], 0, 0, &mut rng, &mut out, &mut warn);
     assert!(out.is_empty());
     assert_eq!(warn.len(), 1, "{warn:?}");
     let w = &warn[0];
@@ -604,10 +514,7 @@ fn count_model_block_refusals_name_the_fix() {
     assert!(e.contains("the block is a Poisson endpoint"), "{e}");
     assert!(e.contains("add `type = negbin`, or drop `r`"), "{e}");
     let e = parse_err("  cmt = 1\n  lambda = B\n  log_lambda = log(B) + E\n");
-    assert!(
-        e.contains("the mean is given twice (`lambda` and `log_lambda`)"),
-        "{e}"
-    );
+    assert!(e.contains("the mean is given twice (`lambda` and `log_lambda`)"), "{e}");
     let e = parse_err("  cmt = 1\n  lambda = B\n  lambda = B + E\n");
     assert!(e.contains("`lambda` is given twice"), "{e}");
     assert!(!e.contains("log_lambda` and"), "{e}");
@@ -616,10 +523,7 @@ fn count_model_block_refusals_name_the_fix() {
     assert!(e.contains("`poisson` (the default) and `negbin`"), "{e}");
     let e = parse_err("  cmt = 1\n  mu = B * exp(E)\n");
     assert!(e.contains("unknown key `mu`"), "{e}");
-    assert!(
-        e.contains("valid keys: cmt, type, lambda, log_lambda, r"),
-        "{e}"
-    );
+    assert!(e.contains("valid keys: cmt, type, lambda, log_lambda, r"), "{e}");
     let e = parse_err("  cmt = 1\n  type = poisson\n");
     assert!(e.contains("missing the mean"), "{e}");
     assert!(e.contains("`log_lambda = …` (its log)"), "{e}");
@@ -658,13 +562,7 @@ fn lambda_and_log_lambda_spell_the_same_mean() {
         })
     ));
     let th = &a.parsed.model.default_params.theta;
-    for (sa, sb) in a
-        .population
-        .subjects
-        .iter()
-        .zip(&b.population.subjects)
-        .take(4)
-    {
+    for (sa, sb) in a.population.subjects.iter().zip(&b.population.subjects).take(4) {
         let va = super::super::discrete_subject_nll(&a.parsed.model, sa, th, &[0.3]);
         let vb = super::super::discrete_subject_nll(&b.parsed.model, sb, th, &[0.3]);
         assert!((va - vb).abs() < 1e-10, "{va} vs {vb}");
@@ -731,10 +629,8 @@ fn gather_index_is_validated_on_count_records() {
     .unwrap()
     .model;
     let population = |second: Option<f64>| {
-        let idx = |v: Option<f64>| {
-            v.map(|v| HashMap::from([("IDX".to_string(), v)]))
-                .unwrap_or_default()
-        };
+        let idx =
+            |v: Option<f64>| v.map(|v| HashMap::from([("IDX".to_string(), v)])).unwrap_or_default();
         let mut s = Subject {
             id: "1".into(),
             covariates: idx(Some(1.0)),
@@ -742,12 +638,7 @@ fn gather_index_is_validated_on_count_records() {
             ..Default::default()
         };
         s.obs_records = [0.0, 4.0]
-            .map(|t| ObsRecord::Count {
-                time: t,
-                raw_time: t,
-                count: 2,
-                cmt: 1,
-            })
+            .map(|t| ObsRecord::Count { time: t, raw_time: t, count: 2, cmt: 1 })
             .to_vec();
         Population {
             subjects: vec![s],
@@ -768,11 +659,7 @@ fn gather_index_is_validated_on_count_records() {
     let refused = codes(Some(3.0));
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0].0, "E_THETA_GATHER_INDEX_RANGE");
-    assert!(
-        refused[0].1.contains("is 3 on subject `1` at TIME 4"),
-        "{}",
-        refused[0].1
-    );
+    assert!(refused[0].1.contains("is 3 on subject `1` at TIME 4"), "{}", refused[0].1);
     let missing = codes(None);
     assert_eq!(missing.len(), 1, "{missing:?}");
     assert_eq!(missing[0].0, "E_THETA_GATHER_INDEX_MISSING");
@@ -794,10 +681,7 @@ fn zero_mean_limit_is_consistent_across_likelihood_pmf_and_sampler() {
         assert_eq!(p.prob(0), Some(1.0), "{size:?}");
         assert_eq!(p.prob(1), Some(0.0), "{size:?}");
     }
-    assert!(
-        count_log_pmf(0.0, Some(-1.0), 0.0).is_nan(),
-        "a bad size stays undefined"
-    );
+    assert!(count_log_pmf(0.0, Some(-1.0), 0.0).is_nan(), "a bad size stays undefined");
     assert!(count_log_pmf(-1.0, None, 0.0).is_nan());
     assert_eq!(count_record_nll_g(NB, LOG, -800.0, 2.0, 0), Some(0.0));
     let mut rng = rand::rngs::StdRng::seed_from_u64(3);
@@ -814,22 +698,10 @@ fn zero_mean_limit_is_consistent_across_likelihood_pmf_and_sampler() {
     let s = &prep.population.subjects[0];
     let (mut out, mut warn) = (Vec::new(), Vec::new());
     let th = &model.default_params.theta;
-    simulate_count(
-        model,
-        s,
-        th,
-        &[0.0, 0.0],
-        0,
-        0,
-        &mut rng,
-        &mut out,
-        &mut warn,
-    );
+    simulate_count(model, s, th, &[0.0, 0.0], 0, 0, &mut rng, &mut out, &mut warn);
     assert!(warn.is_empty(), "{warn:?}");
     assert_eq!(out.len(), 6);
-    assert!(out
-        .iter()
-        .all(|r| matches!(r.outcome, SimOutcome::Count { count: 0 })));
+    assert!(out.iter().all(|r| matches!(r.outcome, SimOutcome::Count { count: 0 })));
 }
 
 /// A data-driven θ level block read bare by a count mean, on count-only data (review r3):
@@ -851,19 +723,13 @@ fn count_records_define_and_carry_theta_levels() {
     // level, and every record is scored at it.
     let blocks = &model.indiv_param_partials.theta_blocks.level_blocks;
     assert_eq!(blocks.len(), 1);
-    assert_eq!(
-        blocks[0].record_cmts,
-        vec![1],
-        "the count endpoint reads the block"
-    );
+    assert_eq!(blocks[0].record_cmts, vec![1], "the count endpoint reads the block");
     assert_eq!(model.theta_names, vec!["BASE", "EFF[TRT=0]"]);
     let theta = [4.0, 0.35];
     let s = &prep.population.subjects[0];
     let mut want = 0.0;
     for (k, r) in s.obs_records.iter().enumerate() {
-        let ObsRecord::Count { count, .. } = r else {
-            unreachable!()
-        };
+        let ObsRecord::Count { count, .. } = r else { unreachable!() };
         // Records 0..3 are TRT = 0, records 3..6 TRT = 1.
         let eff = if k < 3 { theta[1] } else { -theta[1] };
         want -= count_log_pmf(4.0 * eff.exp(), None, f64::from(*count));
@@ -884,23 +750,13 @@ fn counts_past_u32_max_are_out_of_domain_not_narrowed() {
     let max = f64::from(u32::MAX);
     for size in [None, Some(3.5)] {
         let at_max = count_log_pmf(4e9, size, max);
-        assert!(
-            at_max.is_finite(),
-            "size {size:?}: P(Y = u32::MAX) = {at_max}"
-        );
+        assert!(at_max.is_finite(), "size {size:?}: P(Y = u32::MAX) = {at_max}");
         let past = count_log_pmf(4e9, size, max + 1.0);
         assert!(past.is_nan(), "size {size:?}: P(Y = 2³²) = {past}, not NaN");
     }
-    let rate = Prediction::Rate {
-        lambda: 4e9,
-        size: Some(3.5),
-    };
+    let rate = Prediction::Rate { lambda: 4e9, size: Some(3.5) };
     assert!(rate.prob(u32::MAX as usize).is_some_and(|p| p.is_finite()));
     if let Ok(big) = usize::try_from(1u64 << 32) {
-        assert_eq!(
-            rate.prob(big),
-            None,
-            "a count past u32::MAX is out of range"
-        );
+        assert_eq!(rate.prob(big), None, "a count past u32::MAX is out of range");
     }
 }

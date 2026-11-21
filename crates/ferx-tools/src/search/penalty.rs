@@ -208,11 +208,7 @@ impl Penalties {
 fn parameter_counts(result: &FitResult) -> (usize, usize, usize) {
     let inp = &result.bic_inputs;
     if inp.n_free() == result.n_parameters {
-        (
-            inp.theta_random + inp.theta_fixed,
-            inp.omega + inp.kappa,
-            inp.sigma,
-        )
+        (inp.theta_random + inp.theta_fixed, inp.omega + inp.kappa, inp.sigma)
     } else {
         (result.n_parameters, 0, 0)
     }

@@ -61,24 +61,14 @@ fn anchor(name: &str) -> String {
 
 /// Fit `nonmem_anchor/<data>` with the committed anchor model at `maxiter = 0`.
 fn fit_anchor(data: &str) -> FitResult {
-    let parsed = parse_full_model_file(std::path::Path::new(&anchor(
-        "defdose_depot_second_fit.ferx",
-    )))
-    .expect("the anchor model parses");
+    let parsed =
+        parse_full_model_file(std::path::Path::new(&anchor("defdose_depot_second_fit.ferx")))
+            .expect("the anchor model parses");
     let population = read_nonmem_csv(std::path::Path::new(&anchor(data)), None, None)
         .unwrap_or_else(|e| panic!("{data} loads: {e}"));
-    assert_eq!(
-        population.subjects.len(),
-        10,
-        "{data} must carry all 10 warfarin subjects"
-    );
-    let result = fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &parsed.fit_options,
-    )
-    .unwrap_or_else(|e| panic!("fit on {data} returns Ok: {e}"));
+    assert_eq!(population.subjects.len(), 10, "{data} must carry all 10 warfarin subjects");
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)
+        .unwrap_or_else(|e| panic!("fit on {data} returns Ok: {e}"));
     assert!(
         result.ofv.is_finite(),
         "{data}: objective must be finite before it is compared, got {}",
@@ -108,10 +98,7 @@ fn explicit_cmt2_matches_the_nonmem_objective() {
     );
     // The warning must be silent here: the dataset said which compartment.
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        !result.warnings.iter().any(|w| w.contains("W_CMT_DEFAULTED")),
         "an explicit CMT column is not a default: {:?}",
         result.warnings
     );
@@ -134,10 +121,7 @@ fn float_formatted_cmt_is_bit_identical_to_the_integer_spelling() {
     // says something if the control arm is ever deleted.
     let err = (float - NONMEM_OBJV).abs();
     println!("defdose_cmt2float: ferx {float:.12}, NONMEM {NONMEM_OBJV:.12}, |Δ| = {err:.3e}");
-    assert!(
-        err < OBJV_TOL,
-        "float arm: {float:.12} (|Δ| = {err:.3e}, bound {OBJV_TOL:.1e})"
-    );
+    assert!(err < OBJV_TOL, "float arm: {float:.12} (|Δ| = {err:.3e}, bound {OBJV_TOL:.1e})");
 }
 
 #[test]

@@ -144,8 +144,8 @@ pub struct FitResult {
     pub method: EstimationMethod,
     pub converged: bool,
     pub ofv: f64,
-    pub aic: f64,
-    pub bic: f64,
+    pub aic: Option<f64>, // None: the objective is not a likelihood (#2973)
+    pub bic: Option<f64>,
     pub theta: Vec<f64>,
     pub theta_names: Vec<String>,
     pub omega: DMatrix<f64>,
