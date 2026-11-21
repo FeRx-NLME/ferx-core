@@ -482,13 +482,134 @@ pub(crate) fn fd_r_objective_evals(n: usize) -> Option<usize> {
     n.checked_mul(n)?.checked_mul(2)
 }
 
-/// The step's reason when `S` is singular or rank-deficient under `covariance_method = s`.
-pub(crate) const S_SINGULAR_MSG: &str =
-    "Covariance step failed: the score cross-product matrix S is \
-     singular or rank-deficient (covariance_method = s); typically fewer subjects than free \
-     parameters, or collinear per-subject scores. Use covariance_method = r or rsr, which \
-     never invert S; both need R positive definite at the estimate, which after saem, imp, \
-     impmap or vi it may not be. SE estimates not available.";
+/// The display names of the packed coordinates `free_idx` of `template`; one the names do not
+/// cover is `coordinate <k>` (1-based).
+pub(crate) fn free_coordinate_names(template: &ModelParameters, free_idx: &[usize]) -> Vec<String> {
+    let names = crate::estimation::parameterization::coordinate_names(template);
+    free_idx
+        .iter()
+        .map(|&i| {
+            names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("coordinate {}", i + 1))
+        })
+        .collect()
+}
+
+/// The step's reason when [`invert_cross_product`] rejects `S` under `covariance_method = s`,
+/// naming the cause (#1780), judged on the matrix the inverse judges (its unit-free scaling and
+/// floor): free coordinates whose score is zero in every subject; fewer subjects than free
+/// coordinates; else the other coordinates loading on the eigenvectors the floor clips (at
+/// least 0.1 of each one's largest loading): one alone is a near-zero score, and `k` clipped
+/// eigenvalues need `k` of them fixed. `names` are the free coordinates', in `s`'s order.
+/// Only a design with no zero score is advised `r`/`rsr`: otherwise the objective is flat along
+/// the same direction, so `R` is singular too.
+pub(crate) fn s_singular_msg(
+    s: &DMatrix<f64>,
+    units: &[CoordUnits],
+    names: &[String],
+    n_subjects: usize,
+) -> String {
+    let n = s.nrows();
+    let list = |ix: &[usize]| {
+        ix.iter()
+            .map(|&i| names[i].as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let c = unit_coordinate_scales(s, units).map_or_else(|| s.clone(), |d| unit_free(s, &d));
+    let dmax = (0..n).map(|i| c[(i, i)]).fold(0.0, f64::max);
+    let zero: Vec<usize> = (0..n).filter(|&i| !(c[(i, i)] > 1e-20 * dmax)).collect();
+    let mut cause = Vec::new();
+    if zero.len() == n {
+        cause.push(
+            "The per-subject score is zero for every free parameter, so no subject's likelihood \
+             depends on the estimated parameters as scored."
+                .to_string(),
+        );
+    } else if !zero.is_empty() {
+        let it = if zero.len() == 1 { "it" } else { "them" };
+        cause.push(format!(
+            "The score for {} is zero in every subject, so the data do not inform {it}; fix or \
+             remove {it}.",
+            list(&zero)
+        ));
+    }
+    if zero.len() < n && n_subjects < n {
+        let subjects = if n_subjects == 1 {
+            "subject"
+        } else {
+            "subjects"
+        };
+        cause.push(format!(
+            "With {n_subjects} {subjects} and {n} free parameters S has rank at most {n_subjects}, \
+             so it is singular on this design at any estimate."
+        ));
+        if zero.is_empty() {
+            cause.push(
+                "Use covariance_method = r or rsr, which never invert S; both need R positive \
+                 definite at the estimate, which after saem, imp, impmap or vi it may not be."
+                    .to_string(),
+            );
+        }
+    } else if zero.len() < n {
+        // On the scored coordinates only: a zero score's null direction is degenerate with a
+        // collinear one, so the eigensolver could mix the two and miscount `low`.
+        let nz: Vec<usize> = (0..n).filter(|i| !zero.contains(i)).collect();
+        let eig = SymmetricEigen::new(c.select_rows(&nz).select_columns(&nz));
+        let floor = psd_floor(eig.eigenvalues.max());
+        let low: Vec<usize> = (0..nz.len())
+            .filter(|&k| eig.eigenvalues[k] < floor)
+            .collect();
+        let mut ix: Vec<usize> = Vec::new();
+        for &k in &low {
+            let w = eig.eigenvectors.column(k);
+            let top = w.amax();
+            ix.extend(
+                (0..nz.len())
+                    .filter(|&i| w[i].abs() >= 0.1 * top)
+                    .map(|i| nz[i]),
+            );
+        }
+        ix.sort_unstable();
+        ix.dedup();
+        if ix.len() == 1 {
+            cause.push(format!(
+                "The score for {} is nearly zero in every subject relative to the others, so the \
+                 data barely inform it; fix or remove it.",
+                list(&ix)
+            ));
+        } else if !ix.is_empty() {
+            let k = low.len();
+            let which = if k == 1 {
+                "one".to_string()
+            } else {
+                k.to_string()
+            };
+            cause.push(format!(
+                "The per-subject scores of {} are collinear, so the data inform only a \
+                 combination of them; fix or remove {which} of them.",
+                list(&ix)
+            ));
+        }
+    }
+    format!(
+        "Covariance step failed: the score cross-product matrix S is singular \
+         (covariance_method = s). {} SE estimates not available.",
+        cause.join(" ")
+    )
+}
+
+/// The eigenvalue floor of [`invert_psd_with_floor`] for a spectrum whose largest is `max_eig`.
+fn psd_floor(max_eig: f64) -> f64 {
+    (max_eig * 1e-10).max(1e-12)
+}
+
+/// `m` with entry `(i, j)` divided by `d[i]·d[j]`: [`unit_coordinate_scales`]' unit-free matrix.
+fn unit_free(m: &DMatrix<f64>, d: &[f64]) -> DMatrix<f64> {
+    DMatrix::from_fn(m.nrows(), m.ncols(), |i, j| m[(i, j)] / (d[i] * d[j]))
+}
 
 /// The free-block matrix `m` (ordered as `free_idx`) embedded into the full `n × n` packed
 /// space, FIX rows and columns left at zero.
@@ -2332,7 +2453,12 @@ fn covariance_step(
             Err(reason) => return Some(CovarianceStepResult::Unusable(reason)),
         };
         let Some(cov_free) = invert_cross_product(&s_free, &unit_coords) else {
-            return Some(CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string()));
+            return Some(CovarianceStepResult::Unusable(s_singular_msg(
+                &s_free,
+                &unit_coords,
+                &free_coordinate_names(template, &free_idx),
+                population.subjects.len(),
+            )));
         };
         // #2797: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
         // inverted cleanly — the verdict this estimator has instead of `R`'s.
@@ -3344,7 +3470,7 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
         return None;
     }
 
-    let floor = (max_eig * 1e-10).max(1e-12);
+    let floor = psd_floor(max_eig);
     let mut min_eig = f64::INFINITY;
     let mut n_clipped = 0;
     let mut inv_lambdas = DVector::zeros(n);
@@ -3474,13 +3600,7 @@ pub(crate) fn invert_psd_with_floor_unit_free(
     let Some(d) = unit_coordinate_scales(sym, units) else {
         return invert_psd_with_floor(sym);
     };
-    let mut c = sym.clone();
-    for i in 0..n {
-        for j in 0..n {
-            c[(i, j)] /= d[i] * d[j];
-        }
-    }
-    let mut inv = invert_psd_with_floor(&c)?;
+    let mut inv = invert_psd_with_floor(&unit_free(sym, &d))?;
     for i in 0..n {
         for j in 0..n {
             let s = d[i] * d[j];
