@@ -28,45 +28,26 @@ const DATA: &str = "tests/fixtures/tmdd_auto_2845/data.csv";
 
 /// The objective at `TVKON = tvkon` (every other parameter at the file's values), no step.
 fn ofv(method: &str, tvkon: f64) -> f64 {
-    let src = MODEL.replace(
-        "  maxiter = 300",
-        &format!("  maxiter = 0\n  ode_method = {method}"),
-    );
+    let src = MODEL.replace("  maxiter = 300", &format!("  maxiter = 0\n  ode_method = {method}"));
     assert!(src.contains("ode_method"), "fixture: fit options moved");
     let parsed = parse_full_model(&src).expect("the model parses");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("the data load");
     let mut params = parsed.model.default_params.clone();
-    let k = parsed
-        .model
-        .theta_names
-        .iter()
-        .position(|n| n == "TVKON")
-        .expect("TVKON");
+    let k = parsed.model.theta_names.iter().position(|n| n == "TVKON").expect("TVKON");
     params.theta[k] = tvkon;
-    let options = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    }
-    .quiet();
-    fit(&parsed.model, &pop, &params, &options)
-        .expect("the evaluation runs")
-        .ofv
+    let options =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() }
+            .quiet();
+    fit(&parsed.model, &pop, &params, &options).expect("the evaluation runs").ofv
 }
 
 /// Four evaluations of a stiff 30-subject ODE model: about 23 s in a debug build.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn auto_keeps_the_tmdd_segment_on_its_stiff_stepper() {
     for (tvkon, reference) in [(1.326, 1353.9916370867804), (1.340, 1420.1087978454166)] {
         let (auto, rodas4) = (ofv("auto", tvkon), ofv("rodas4", tvkon));
-        assert!(
-            (auto - rodas4).abs() < 1e-2,
-            "TVKON {tvkon}: auto {auto} vs rodas4 {rodas4}"
-        );
+        assert!((auto - rodas4).abs() < 1e-2, "TVKON {tvkon}: auto {auto} vs rodas4 {rodas4}");
         assert!(
             (auto - reference).abs() < 0.15,
             "TVKON {tvkon}: auto {auto} vs the vern7 reference {reference}"
