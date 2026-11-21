@@ -11888,6 +11888,37 @@ fn the_ode_adjoint_through_shape_transforms_is_the_hand_written_ones() {
     }
 }
 
+/// #1716: the plan through Box-Cox at λ = 0 exactly, where the closed form `expm1(λη)/λ` is
+/// `0/0` and the transform is `η·exprel(0)`, and at λ = −2.5 with η̂ < 0 on
+/// `exprel`'s closed-form side (`|λη| > 2`) — against reconverged FD of the objective, which
+/// shares no derivative code with the plan. The twins above sit at `|λη| ≲ 0.3`.
+#[test]
+fn box_cox_through_lambda_zero_matches_reconverged_fd() {
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 4.0, 11.0, 13.0, 16.0, 24.0, 48.0];
+    for (lambda, eta_ref) in [(0.0, [0.25, -0.3, 0.4]), (-2.5, [-1.2, -0.3, 0.4])] {
+        let src = SHAPED_2CPT
+            .replace("theta LAMBDA(0.8, -3.0, 3.0)", &format!("theta LAMBDA({lambda}, -3.0, 3.0)"));
+        let model = parse_model_string(&src).expect("parse shaped model");
+        let s = subject(&model, doses.clone(), &times, &eta_ref);
+        // The point the oracle differentiates at: `moved_params`' λ and the EBE there.
+        let params = moved_params(&model);
+        let eta = ebe_for(&model, &s, &params, 1e-12, true);
+        let z = params.theta[3] * eta[0];
+        assert!(if lambda == 0.0 { z == 0.0 } else { z > 2.0 }, "λη̂ = {z}");
+        let worst = fd_oracle(&model, &s, true);
+        eprintln!("λ = {lambda}: λη̂ = {z:.3}, worst {worst:.2e}");
+        // Measured worst 2.05e-9 (λ = 0) and 1.06e-9 (λ = −2.5, λη̂ = 2.51), the Richardson FD
+        // noise floor; ~25× headroom for the FD oracle's platform drift. (At λ = +2.5 the same
+        // fixture leaves the adjoint's scope, and so does its hand-written twin: CL is ~130× its
+        // typical value and the predictions collapse.)
+        assert!(worst < 5e-8, "λ = {lambda}: worst relative difference {worst:.2e}");
+    }
+}
+
 /// Measured worst 9.5e-15 over the ten cases above (closed form, IOV and ODE; FOCEI and
 /// FOCE): rounding, since neither side is FD. About 10× headroom.
 const SHAPE_TWIN_TOL: f64 = 1e-13;
