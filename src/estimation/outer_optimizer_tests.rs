@@ -8297,7 +8297,7 @@ pub(crate) mod outer_fd_fallback {
             cancel: flag.map(|f| f()),
             ..live.clone()
         };
-        crate::api::with_fit_scope(&live, || {
+        crate::pool::with_fit_scope(&live, || {
             let mu = compute_mu_k(&model, &params.theta, live.mu_referencing);
             let (ehs, _, _, kappas) =
                 run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
@@ -8346,14 +8346,8 @@ pub(crate) mod outer_fd_fallback {
             );
             for (k, name) in names.iter().enumerate() {
                 let (g, c, p) = (&lives[k], &cuts[k], &parts[k]);
-                assert!(
-                    g.iter().any(|v| *v != 0.0),
-                    "fixture: {name} gradient is live"
-                );
-                assert!(
-                    c.iter().all(|v| *v == 0.0),
-                    "{name}: a probe ran after the cancel: {c:?}"
-                );
+                assert!(g.iter().any(|v| *v != 0.0), "fixture: {name} gradient is live");
+                assert!(c.iter().all(|v| *v == 0.0), "{name}: a probe ran after the cancel: {c:?}");
                 let kept = |a: &f64, b: &f64| a.to_bits() == b.to_bits();
                 assert!(
                     p.iter().zip(g).all(|(a, b)| kept(a, b) || *a == 0.0),
