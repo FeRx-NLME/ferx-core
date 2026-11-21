@@ -282,7 +282,7 @@ pub fn check_links(
 }
 
 /// Lexical path normalization (`..`/`.`), without touching the filesystem.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -296,10 +296,15 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// The ids each page defines, keyed on its normalized path — the lookup R4
+/// resolves a link's `#anchor` against.
+pub fn ids_by_file(docs: &[Doc]) -> HashMap<PathBuf, HashSet<String>> {
+    docs.iter().map(|d| (normalize(&d.path), d.ids.clone())).collect()
+}
+
 /// Run every rule over a parsed corpus, sorted by file then line.
 pub fn lint(docs: &[Doc], root: &Path, cfg: &Config) -> Vec<Violation> {
-    let ids_by_file: HashMap<PathBuf, HashSet<String>> =
-        docs.iter().map(|d| (normalize(&d.path), d.ids.clone())).collect();
+    let ids_by_file = ids_by_file(docs);
 
     let mut out = Vec::new();
     for doc in docs {

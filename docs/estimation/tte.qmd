@@ -1032,11 +1032,15 @@ The curve uses R `survival::survfit`'s tie convention: at a tied time, events co
 censorings, so the subjects censored at that time are still in the risk set of its events.
 `ferx_core::stats::km::kaplan_meier` computes it. The band at each grid time is R's default
 quantile (type 7, the one `vpc::vpc_tte` uses) over the replicate curves still defined there.
-A replicate past its last follow-up time is left out unless its curve has reached zero; it
-is not counted as 0 or 1. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1`
-(19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one
-curve, so its quantile is only an interpolation between the two most extreme values. So
-`n_sim` must be at least one more than that, 20 for the default band.
+A replicate past its last follow-up time is left out, also when its curve has reached zero;
+it is not counted as 0 or 1. Counting it as 0 would put a point mass at 0 into the band, so
+once enough replicates had reached zero the lower edge would sit at 0, the observed curve
+could never fall below it and the misses would all fall above (#2930). The observed curve
+follows the same rule: past its last time it is undefined. A band point with fewer
+replicates than `⌈1 / min(p, 1 − p)⌉ − 1` (19 for 5 %/95 %) is empty: with fewer than
+about 1/p curves the p-tail holds less than one curve, so its quantile is only an
+interpolation between the two most extreme values. So `n_sim` must be at least one more
+than that, 20 for the default band.
 
 The automatic grid is 0, the stratum's observed times and 101 evenly spaced points up to the
 horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of
@@ -1350,12 +1354,112 @@ in 90.5 %, 92 % and 91.5 % of datasets at H/4, 3H/8 and H/2, inside the 99 % bin
 covariate effect, with the overall rate matched, it lies outside in 82 % of datasets at H/4
 (81.5 % and 79 % later), while the Kaplan–Meier band of that model still covers 84 % at H/4.
 
+### Cumulative incidence (competing risks) {#km-vpc-cif}
+
+`vpc_cif()` checks a competing-risks model. Every TTE endpoint of the model is a cause. Per
+stratum it returns the observed cumulative incidence of each cause and the observed all-cause
+Kaplan–Meier curve, each beside the pointwise band of the replicate curves. It is the
+nonparametric counterpart of the cumulative incidence `predict_survival()` reports for a fitted
+model ([Competing risks](#competing-risks-cause-specific-hazards)).
+
+```rust
+let opts = VpcCifOptions {
+    n_sim: 500,
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_cif(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid; s.survival and s.causes[k].band: obs_on_grid, lo / med / hi, n_used;
+    // s.causes[k].cmt; s.observed (CifCurve: all_cause KmCurve, n_event, cif)
+}
+```
+
+The options are `vpc_tte()`'s without `cmt`: replicates, band probabilities, grid, censoring,
+strata and the simulator options. `vpc.cmts` lists the causes in ascending order, and
+`s.causes[k]` and `s.observed.cif[k]` follow it.
+
+#### The curves {#km-vpc-cif-curves}
+
+The cumulative incidence of cause `k` is the Aalen–Johansen estimate
+
+`F_k(t) = Σ_{t_j ≤ t} (S(t_j⁻) − S(t_j)) · d_kj / d_j`,
+
+where `S` is the all-cause Kaplan–Meier curve, `d_kj` the cause-`k` events at `t_j` and `d_j`
+the events of any cause there. Each drop of the all-cause curve is split among the causes in
+proportion to their events, the same split the parametric cumulative incidence uses. `S` is
+built by the Kaplan–Meier code `vpc_tte()` uses, so the rows and the tie convention are
+survfit's. At every time the observed `F_1 + … + F_K + S = 1`.
+
+This is not `1 − KM` of one cause with the other causes treated as censorings. That curve
+estimates the incidence in a world without the other causes and overstates it: on the survfit
+fixture below (stratum B, the first cause) it ends at 0.750 where the cumulative incidence ends
+at 0.375. It is also why
+`vpc_tte()` and `vpc_kmmc()` refuse several TTE endpoints without a `cmt`.
+
+The bands are pointwise, cause by cause. A band's median or limits at a time need not add up
+across causes, so a stacked plot (cumulative incidences on top of each other, survival on top)
+draws the observed curves, not the bands. A curve is read where its all-cause curve is
+defined: up to and including its last time, never past it, as for `vpc_tte()`.
+
+A model with a single TTE endpoint is accepted. Its cumulative incidence is `1 − KM`, and the
+result is `vpc_tte()`'s turned upside down: the same replicates, the same survival band bit
+for bit, and the cause band `1 − S` with the limits swapped.
+
+#### Censoring of the replicates {#km-vpc-cif-censoring}
+
+The censoring is `vpc_tte()`'s ([Censoring in the replicates](#censoring-in-the-replicates)),
+on the all-cause time. Under `VpcCensoring::Observed` a subject observed censored for every
+cause keeps its own time, and a subject with an event on some cause draws a censoring time from
+its stratum's reverse Kaplan–Meier curve, given that it exceeds the event time. A replicate's
+first event past that time becomes a censoring there. A subject's records on the other causes
+at its event time are competing events, not dropout, and never count as a censoring time. The
+draws are keyed by subject exactly as `vpc_tte()`'s, which is what makes the single-cause
+result equal. The data are read on `[0, H]` by the same cut. Like `vpc_tte()`, this assumes
+censoring is independent of the event within a stratum.
+
+Every subject with a cause record needs one record on **every** cause, all at the same time,
+with at most one of them an event. The simulator competes only the causes a subject has records
+on, so a subject with fewer would be simulated under fewer causes than the data imply; such a
+subject is refused, not skipped. A subject with no cause record at all (a PK-only subject in a
+joint model) is skipped.
+
+#### Reading it {#km-vpc-cif-reading}
+
+The cumulative incidences see what the all-cause curve cannot. A model can match the all-cause
+hazard while putting it on the wrong cause. In the self-consistency design below, replicates
+drawn with the two causes' rates swapped leave the survival band covering as before, while the
+cause bands cover the observed incidence in under half the datasets.
+
+#### Validation of the cumulative-incidence curves {#km-vpc-cif-validation}
+
+NONMEM has no nonparametric cumulative-incidence estimator and no VPC, so there is no NONMEM run
+to anchor against. R's `survfit` multi-state fit (`Surv(time, factor(cause))`) is the
+Aalen–Johansen estimator and the external reference. `tests/cif_survfit_reference.rs` matches
+survfit 3.8.12 row for row on 160 subjects in two strata with two causes (21 rows with more than
+one event, 11 with an event and a censoring at one time): the counts exactly, survival and both
+cumulative incidences within 2.2e-16. On seeded tied data the identities hold to rounding:
+`F = 1 − S` with one cause within 1.8e-15, and `ΣF + S = 1` with three causes within 5.6e-16.
+
+`tests/vpc_cif_self_consistency.rs` draws 200 datasets outside the simulator (100 subjects, two
+exponential causes with rates 0.06 and 0.04 under one shared frailty, uniform dropout, `H = 30`)
+and runs a 200-replicate VPC of each. Under the data's own model the observed curves lie inside
+their bands at H/4, H/2 and 3H/4 in 88 %, 85 % and 87.4 % of datasets for the first cause,
+90.5 %, 88.5 % and 86.9 % for the second, and 89 %, 87 % and 91.4 % for survival: all nine
+inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band from 200 replicates
+covers. With the causes' rates swapped on the first 100 datasets, the cause bands cover only 4 %
+to 27 % while the survival band still covers 89.8 % to 93 %. Replacing the replicates' estimator
+with `1 − KM` of each cause drops the first cause's coverage to 75 %, 40.5 % and 11.6 %. The
+numbers are the same on Linux and macOS. Two datasets had nobody under follow-up at 3H/4 and are
+left out of that time.
+
 ### What it refuses
 
 `vpc_tte()` returns `E_VPC_TTE_INPUT` rather than a wrong curve for: several TTE endpoints and
 no `cmt` (under competing risks, 1 − KM of one cause is not its cumulative incidence; with
-`cmt` set, the curve is that cause's survival with the other causes as censoring); a
-repeated-events endpoint, which `vpc_rtte()` draws; left truncation; interval-censored
+`cmt` set, the curve is that cause's survival with the other causes as censoring; `vpc_cif()`
+draws the cumulative incidence of every cause); a repeated-events endpoint, which `vpc_rtte()`
+draws; left truncation; interval-censored
 records; more than one record per subject on the endpoint; too few replicates or invalid band
 probabilities; and a stratification covariate a subject lacks or that has more than 10 values.
 
@@ -1370,7 +1474,13 @@ covariate named (`VpcKmmcOptions::default()` leaves it empty); a repeated-events
 the endpoint that lacks the covariate, or whose baseline value is missing; a `level` no subject
 has; and stratifying on the covariate itself.
 
-Cumulative-incidence VPCs, binned strata and left truncation are planned follow-ups.
+`vpc_cif()` returns the same code for: no TTE endpoint; a repeated-events endpoint (every cause
+must be single-event); a subject with records on some causes but not all; more than one record
+on a cause; a subject's cause records at different times; events on two causes in one subject;
+left truncation; interval-censored records; and the same replicate, probability and
+stratification checks.
+
+Binned strata and left truncation are planned follow-ups.
 
 ### Validation against survfit and by self-consistency
 

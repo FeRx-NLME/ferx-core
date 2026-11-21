@@ -4,6 +4,7 @@ pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
 pub(crate) mod cold_sort;
+pub(crate) mod covariate_stats;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;
@@ -12,10 +13,13 @@ pub mod environment;
 pub mod estimation;
 pub mod frem;
 pub mod io;
+pub(crate) mod levels;
 #[cfg(feature = "markov")]
 pub mod markov;
+pub(crate) mod model_checks;
 pub mod model_selection;
 pub mod nn;
+pub(crate) mod occasions;
 pub mod ode;
 pub(crate) mod par;
 pub mod parser;
@@ -45,12 +49,15 @@ pub use api::{
     run_model_with_overrides, simulate, simulate_adaptive, simulate_adaptive_from_spec,
     simulate_adaptive_from_spec_with_inputs, simulate_adaptive_with_inputs, simulate_with_options,
     simulate_with_options_diag, simulate_with_seed, simulate_with_uncertainty,
-    simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
-    validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
-    DrawnParameters, PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings,
-    RunOverrides, SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters,
-    SimulatedSubjectParameters, SimulationOutput, SimulationResult, SuppliedEtas, UncertaintySpec,
-    UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
+    simulate_with_uncertainty_diag, summarize_adaptive, theta_level_map, theta_level_values,
+    validate_model_file, validate_model_file_with, AdaptiveBandStatus, AdaptiveInputs,
+    AdaptivePopulationSummary, AdaptivePredictionInterval, AdaptiveQuantiles,
+    AdaptiveSimulateOptions, AdaptiveSimulationResult, AdaptiveSummaryBand, AdaptiveSummaryMetric,
+    AdaptiveSummaryOptions, AdaptiveSummaryRow, AdaptiveSummaryStatistic, DrawnParameters,
+    PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
+    SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters,
+    SimulationOutput, SimulationResult, SuppliedEtas, UncertaintySpec, UnmatchedSubjects,
+    FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};
@@ -89,6 +96,9 @@ pub use api::{
     predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
     SurvivalPredictionOutput, SurvivalPredictionResult,
 };
+// Cumulative-incidence VPC of competing risks: every cause's Aalen–Johansen curve (#1887).
+#[cfg(feature = "survival")]
+pub use api::{vpc_cif, CifCauseBand, CifVpc, CifVpcBand, CifVpcStratum, VpcCifOptions};
 // Kaplan–Meier mean covariate VPC of a single-event TTE endpoint (#1886).
 #[cfg(feature = "survival")]
 pub use api::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};

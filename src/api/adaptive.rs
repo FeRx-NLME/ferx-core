@@ -174,8 +174,9 @@ impl Default for AdaptiveSimulateOptions {
 /// returned as one verified unit so a caller can never pair a trajectory with
 /// the wrong ledger. All three are long-form rows tagged by `(draw, sim, id)`.
 ///
-/// `#[non_exhaustive]`: the remaining Part-D artifacts (population summary, run
-/// manifest) land as added fields without breaking callers who receive this struct.
+/// `#[non_exhaustive]`: the remaining Part-D artifacts (a run manifest) land as added
+/// fields without breaking callers who receive this struct. The population summary is
+/// not a field: [`super::summarize_adaptive`] computes it from this result.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AdaptiveSimulationResult {
@@ -191,10 +192,10 @@ pub struct AdaptiveSimulationResult {
     pub decisions: Vec<DecisionLogEntry>,
     /// Per-subject outcome metrics (#391 S2.4): one row per realized `(subject,
     /// draw, sim)` run — cumulative dose, dose-change / hold / discontinuation
-    /// counts, the observed-signal summary, and `pct_time_in_window` when the block
+    /// counts, the signal summary (on the latent signal, #946), and `pct_readings_in_window` when the block
     /// declares a `target_window`. Derived from `ledger` + `decisions` alone (no
-    /// re-integration). The population summary *with bands* rides with the
-    /// uncertainty slice (S5), where bands carry meaning.
+    /// re-integration). The population summary with bands across parameter draws is
+    /// [`super::summarize_adaptive`].
     pub metrics: Vec<AdaptiveSubjectMetrics>,
     /// The parameter sets of a run with parameter uncertainty
     /// ([`AdaptiveInputs::with_uncertainty`], #946): one per draw, in draw order, the θ,
@@ -394,7 +395,7 @@ where
         &monitors,
         |_supplied: &[Option<Vec<f64>>]| Ok(make),
         // Programmatic path: no declarative block, so no target band — the
-        // window-dependent metric (`pct_time_in_window`) is left unreported.
+        // window-dependent metric (`pct_readings_in_window`) is left unreported.
         None,
         // ...and no `auc_target`, so the window AUC is skipped and
         // `auc_target_attainment` is left unreported.
@@ -1088,8 +1089,16 @@ where
     if let Some(d) = opts.start_interval {
         check_start_interval(decision_times, d).map_err(crate::entry_refusals::adaptive_options)?;
     }
-    for am in monitors {
+    for (k, am) in monitors.iter().enumerate() {
         let m = am.spec;
+        // Signals are keyed by name: with two monitors of one name the controller reads only
+        // the last (`ControllerCtx::signals` is a map), and the summary counts each run twice.
+        if monitors[..k].iter().any(|o| o.spec.name == m.name) {
+            return Err(crate::entry_refusals::adaptive_options(format!(
+                "two monitors are named '{}'; give each monitor its own name",
+                m.name
+            )));
+        }
         if m.cmt == 0 || m.cmt > ode.n_states {
             return Err(crate::entry_refusals::adaptive_options(format!(
                 "monitor '{}' observes compartment {} but the model has {} state(s)",
@@ -1543,7 +1552,7 @@ where
                 // into the exposure metric as silent misses (double-counting one event into two
                 // metrics). Confining to realized decisions keeps `auc_target_attainment` a clean
                 // "of the windows we dosed, how many hit target", on the same realized basis as
-                // `pct_time_in_window`. For a run that never discontinues the two decision lists
+                // `pct_readings_in_window`. For a run that never discontinues the two decision lists
                 // are identical.
                 //
                 // Dropping the post-`Stop` windows loses no *dosed* window: a declarative `Stop`
@@ -2479,7 +2488,7 @@ pub fn simulate_adaptive_from_spec_with_inputs(
             })
         },
         // The declarative block's optional therapeutic band feeds the
-        // `pct_time_in_window` metric (it never influences dosing).
+        // `pct_readings_in_window` metric (it never influences dosing).
         spec.target_window,
         // ...and the optional exposure band feeds `auc_target_attainment` (likewise
         // metrics-only); `Some` here is what turns on the window AUC.

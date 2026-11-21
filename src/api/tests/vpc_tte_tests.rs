@@ -142,6 +142,37 @@ fn observed_censoring_stops_replicates_at_each_subjects_own_time() {
     assert!(v.strata[0].lo[1].unwrap().is_finite());
 }
 
+/// A curve that reached 0 is undefined past its last time, on the observed side and
+/// in every replicate (#2930). 30 subjects with an event at `0.1·i`, λ = 0.5 with no
+/// IIV, horizon 30: with no censoring every replicate is followed to its own last
+/// event and reaches 0 well before 20, so at 20 nothing is defined. Under the rule
+/// before #2930 the observed value, `n_used` and the band at 20 were `Some(0.0)`, 20
+/// and `Some(0.0)`; carrying the last value forward keeps the observed `Some(0.0)`.
+/// The point at 2 is the control, defined under every rule.
+#[test]
+fn observed_curve_and_band_are_undefined_past_the_last_time_even_at_zero() {
+    const EXP_NO_IIV: &str = "\n[parameters]\n  theta TVLAMBDA(0.5, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n";
+    let p = pop((1..=30)
+        .map(|i| subj(&i.to_string(), vec![rec(0.1 * i as f64, EventType::Exact, 2)]))
+        .collect());
+    let mut o = opts(20);
+    o.sim.horizon = Some(30.0);
+    o.grid = VpcGrid::Times(vec![2.0, 20.0]);
+    let v = run(EXP_NO_IIV, &p, &o).unwrap();
+    let s = &v.strata[0];
+    // The straddle: the observed curve reached 0, and 20 is past its last time.
+    assert_eq!(s.observed.surv.last(), Some(&0.0));
+    assert!(20.0 > *s.observed.time.last().unwrap());
+    // Control at 2: 10 of 30 events are later.
+    assert!((s.obs_on_grid[0].unwrap() - 1.0 / 3.0).abs() < 1e-12, "{:?}", s.obs_on_grid);
+    assert_eq!(s.n_used[0], 20);
+    assert!(s.lo[0].unwrap().is_finite());
+    // Past the last time, even at zero.
+    assert_eq!(s.obs_on_grid[1], None, "observed past its last time");
+    assert_eq!(s.n_used[1], 0, "no replicate is followed up to 20");
+    assert_eq!((s.lo[1], s.med[1], s.hi[1]), (None, None, None));
+}
+
 /// 15 subjects censored at 2 and 15 with an event at 1, horizon 10. The censoring
 /// distribution puts all its mass at 2, so each event subject draws `c = 2` and no
 /// replicate is followed past 2: at t = 5 no curve is defined. Letting event subjects
@@ -498,7 +529,8 @@ fn refuses_two_tte_endpoints_without_cmt() {
         run(COMPETING, &p, &opts(20)),
         "vpc_tte: the model has TTE endpoints on cmt 2, 3; set `cmt` to the one to check. \
          Under competing risks 1 − KM of one cause is not its cumulative incidence: the curve \
-         is that cause's survival with the other causes as censoring.",
+         is that cause's survival with the other causes as censoring. `vpc_cif` draws the \
+         cumulative incidence of every cause.",
     );
 }
 

@@ -4,11 +4,14 @@ use super::*;
 use crate::diagnostics::EngineError;
 use crate::io::data_source::DataSource;
 use crate::io::datareader::{
-    read_nonmem_csv_routed, read_nonmem_csv_routed_from, CovariateReads, CsvInput, MissingDvPolicy,
-    ObsRouting, SelectionFilter,
+    read_nonmem_csv_routed, read_nonmem_csv_routed_from, CsvInput, MissingDvPolicy, SelectionFilter,
 };
 use std::collections::HashMap;
 use std::path::Path;
+
+pub(crate) use crate::model_checks::{
+    model_routes_rows_by_cmt, obs_routing_for, referenced_columns,
+};
 
 /// Log-transform every observation (including M3 LLOQ values carried on CENS
 /// rows — they live in the same `observations` vector) in place, for LTBS case 2
@@ -1032,25 +1035,6 @@ fn build_init_params(parsed: &ParsedModel) -> ModelParameters {
     parsed.model.default_params.clone()
 }
 
-/// Every data column the model itself reads — the one owner of "what a
-/// model-aware read must take from the CSV" (#1936). Passed to the reader as
-/// `extra` on **both** the `[covariates]` path and the no-block path, so a model
-/// reading a role column or its `iov_column` (NONMEM's `$PK` spelling of
-/// `IF (OCC.EQ.2)`) reads the same columns whether or not it declares anything.
-/// Before #1936 only the declared path passed them: an unrelated
-/// `[covariates] WT` line turned `E_MISSING_COVARIATE` on `OCC` into a working fit.
-pub(crate) fn referenced_columns(model: &CompiledModel) -> Vec<String> {
-    model
-        .referenced_covariates
-        .iter()
-        // A a level block index column (#1064) is synthesized by
-        // `bind_theta_levels` after the read, never present in the CSV — asking
-        // the reader for it would fail on a column the user never wrote.
-        .filter(|c| !crate::parser::model_parser::is_level_index_column(c))
-        .cloned()
-        .collect()
-}
-
 /// Covariates referenced by the model but missing from the `[covariates]`
 /// declaration. These are still read (leniently) so the model works; the parser
 /// has already warned that they ought to be declared.
@@ -1119,154 +1103,6 @@ pub(crate) fn merge_selection_exprs(
         }
     }
     (ignore, accept, subjects)
-}
-
-/// The non-Gaussian row routing a dataset needs for `model`: every CMT the model
-/// declares as a TTE / binary / CTMM endpoint, plus the design-row DV placeholder
-/// per CTMM endpoint and the missing-DV policy. Empty routing sets for a
-/// Gaussian-only model.
-///
-/// This is the **only** place the routing is derived from a model. Every reader
-/// call that has a model in hand must go through it — the file-based
-/// [`read_population_for`] family, and [`read_population_routed_by`] for the
-/// `.fitrx` reload and the `run_covariance` / `run_sir` re-read — because a
-/// population read *without* it carries the endpoint's rows as Gaussian
-/// observations and no event records, which `fit()` then rejects with
-/// `E_ENDPOINT_UNROUTED` (#1199).
-fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRouting {
-    // Nothing to route without `survival`: no non-Gaussian endpoint can be parsed.
-    #[cfg(not(feature = "survival"))]
-    let _ = model;
-    // Extract TTE CMTs from model endpoints so the reader can route TTE rows
-    // to obs_records instead of the Gaussian parallel Vecs.
-    #[cfg(feature = "survival")]
-    let tte_cmts: std::collections::HashSet<usize> = model
-        .endpoints
-        .iter()
-        .filter_map(
-            |(&cmt, ep)| {
-                if matches!(ep, EndpointLikelihood::Tte { .. }) {
-                    Some(cmt)
-                } else {
-                    None
-                }
-            },
-        )
-        .collect();
-    #[cfg(not(feature = "survival"))]
-    let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    // Discrete-state CMTs route to `ObsRecord::DiscreteState` (integer DV), like TTE
-    // rows route to `ObsRecord::Event` — both need the non-Gaussian reader path. This
-    // set covers binary/categorical (#760) and CTMM (#759) endpoints, which share the
-    // discrete-state plumbing.
-    #[cfg(feature = "survival")]
-    // Binary **∪ CTMM** — every CMT whose integer DV routes to `ObsRecord::DiscreteState`.
-    // Deliberately not named `binary_cmts`: this function used to share that name with the
-    // binary-only `Vec` above, and the two are equal today only because CTMM `--simulate`
-    // is rejected upstream. When CTMM simulation lands (#820) they diverge.
-    let discrete_cmts: std::collections::HashSet<usize> = {
-        let discrete: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
-        #[cfg(feature = "markov")]
-        let discrete =
-            discrete.into_iter().chain(model.ctmm_cmts()).chain(model.dtmm_cmts()).collect();
-        discrete
-    };
-    #[cfg(not(feature = "survival"))]
-    let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    // One reader call covers every combination: the routing sets are empty for a
-    // Gaussian-only model (so no row is routed to `obs_records`), and the reader
-    // builds the covariate read set from `decls` when the model declares
-    // `[covariates]`, from `fallback_columns` otherwise.
-    // Placeholder DV code for an integer-coded design row: the endpoint's first
-    // declared state code, so a `state_codes` table that is not 0-based (e.g.
-    // `1`/`2`) never gets an undecodable `0` placeholder. Only CTMM declares
-    // codes; Binary is `{0,1}` and keeps the `0` default.
-    #[cfg(feature = "markov")]
-    let design_states: HashMap<usize, usize> = model
-        .endpoints
-        .iter()
-        .filter_map(|(&cmt, ep)| match ep {
-            EndpointLikelihood::Ctmm { state_codes, .. }
-            | EndpointLikelihood::Dtmm { state_codes, .. } => {
-                state_codes.first().map(|&code| (cmt, code))
-            }
-            _ => None,
-        })
-        .collect();
-    #[cfg(not(feature = "markov"))]
-    let design_states: HashMap<usize, usize> = HashMap::new();
-
-    // Nested levels (#1082): a blank level cell is missing, not the previous record's label.
-    let no_carry_forward: std::collections::HashSet<String> = model
-        .nested_levels()
-        .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
-        .unwrap_or_default();
-
-    // Count CMTs (#2877) route to `ObsRecord::Count`.
-    #[cfg(feature = "survival")]
-    let count_cmts: std::collections::HashSet<usize> = model.count_cmts().into_iter().collect();
-    #[cfg(not(feature = "survival"))]
-    let count_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
-        .with_count(count_cmts)
-        .with_missing_dv(missing_dv)
-        .with_design_states(design_states)
-        .with_no_carry_forward(no_carry_forward)
-        // `W_COVARIATE_MISSING` only for a column a relation reads (#2599).
-        .with_warn_missing_covariates(columns_read_by_relations(model))
-}
-
-/// Every data column a relation of `model` reads, the set `W_COVARIATE_MISSING`
-/// is raised for (#2599); the reader adds the columns its `[data_selection]`
-/// filter reads. Matched exactly: the required [`referenced_columns`], which are
-/// case-sensitive. Matched in any case: the `[output]` columns echoed from the
-/// data, resolved case-insensitively. Matched as `[derived]` resolves them (the
-/// verbatim, uppercase or lowercase spelling of the column): the names a
-/// `[derived]` expression looks up at evaluation time (not required columns, so
-/// not in `referenced_covariates`). A column only declared in `[covariates]` or
-/// listed in `covariate_columns`, with nothing reading it, is in neither — a gap
-/// in it reaches neither the objective nor an output.
-fn columns_read_by_relations(model: &CompiledModel) -> CovariateReads {
-    CovariateReads {
-        exact: referenced_columns(model).into_iter().collect(),
-        any_case: super::output_columns::output_echo_columns(model).cloned().collect(),
-        derived: model.derived_reads().iter().cloned().collect(),
-    }
-}
-
-/// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
-///
-/// Derived from [`obs_routing_for`] — the only place a routing set is built from a
-/// model — rather than restated, so an endpoint family added there is in scope for
-/// `W_CMT_DEFAULTED` without a second edit. The missing-DV policy does not enter the
-/// question, so the fitting policy is passed and the answer is the same either way.
-pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
-    let routing = obs_routing_for(model, MissingDvPolicy::Skip);
-    if !routing.routes_by_cmt() {
-        return false;
-    }
-    // The one endpoint shape where the default is provably the right answer, so
-    // reporting it is a false positive rather than a caught ambiguity: an
-    // **endpoint-only** model (no `[error_model]`, so no Gaussian grid to fall into)
-    // whose routing names **only** the compartment the reader falls back to. Every
-    // row keys to that endpoint whatever the cell said, and any other CMT is an
-    // `E_PER_CMT_ERROR_MODEL` error rather than a silent re-route. Documented as a known
-    // limit when the endpoint channel landed; closed here (#1409 review).
-    //
-    // Both halves are needed. Drop the Gaussian test and a model with a `cmt = 1`
-    // endpoint *and* ordinary observations stops reporting, although a defaulted row
-    // there really does pick between the endpoint and the Gaussian grid. Drop the
-    // `routes_only` test and a competing-risks model at `cmt = 1`/`cmt = 2` stops
-    // reporting, which is the #1404 measurement this whole channel exists for.
-    if !crate::api::validation::model_scores_gaussian_observations(model)
-        && routing.routes_only(crate::io::datareader::DEFAULT_CMT)
-    {
-        return false;
-    }
-    true
 }
 
 /// Read a model file's dataset the way a fit of that file reads it: its

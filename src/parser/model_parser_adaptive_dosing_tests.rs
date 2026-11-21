@@ -85,7 +85,7 @@ fn minimal_block_parses_with_defaults() {
     assert!(!spec.with_assay_error);
     assert_eq!(spec.assay_cmt, None);
     assert_eq!(spec.levels, None);
-    // No `target_window` declared ⇒ `None` (metrics leave `pct_time_in_window`
+    // No `target_window` declared ⇒ `None` (metrics leave `pct_readings_in_window`
     // unreported rather than guessing a band).
     assert_eq!(spec.target_window, None);
 }

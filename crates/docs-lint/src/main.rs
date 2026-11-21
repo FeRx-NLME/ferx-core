@@ -34,7 +34,8 @@ RULES:
     R1  a section with no subsections stays under the character limit
     R2  never skip a heading level
     R3  no two headings on a page may generate the same id
-    R4  internal links must resolve, including the anchor
+    R4  internal links must resolve, including the anchor (also over
+        llms.txt, whose absolute site URLs map back to their .qmd)
 
 Silence one rule for one section with `<!-- lint-disable R1 -->` on the line
 above its heading, and say in the comment why it cannot be split.

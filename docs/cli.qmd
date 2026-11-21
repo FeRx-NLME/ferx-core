@@ -340,6 +340,69 @@ ferx summary run1.fitrx run2.fitrx run3.fitrx
 | ... | ... | ... | ... |
 ```
 
+#### Machine-Readable Summary (`--json`)
+
+```bash
+ferx summary --json run1.fitrx run2.fitrx
+```
+
+`--json` emits the same content as **one JSON document on stdout**, for a script
+or agent comparing saved runs without scraping the tables (it mirrors
+`ferx check --json`). The document carries a `schema_version` (bumped only on a
+breaking change, the policy of `{model}-fit.json`), the `fit_schema_version` of
+the fit JSON its fields follow, and a `runs` array with one object per bundle in
+command-line order:
+
+- `label` (the file stem) and `path`.
+- **Run status** — `model_name`, `method`, `method_chain`, `converged`,
+  `status` (the usability verdict, with reasons), `final_gradient`,
+  `final_gradient_source`, `n_iterations`, `n_subjects`, `n_obs`, `n_parameters`.
+- **Objective** — `ofv`, `ofv_data`, `ofv_prior`, `aic`, `bic`, `prior_summary`,
+  `saem_objective`, `importance_sampling`.
+- **Estimates** — `estimates`, the name-keyed layout of the fit YAML / JSON
+  (`estimates.theta.CL.estimate`, with `se` and `rse_pct`; Ω `variance`,
+  `cv_pct` and off-diagonal `correlation`; `omega_iov` for κ; σ), with
+  `fixed: true` on a FIX parameter; and `error_model`. Like the text table,
+  `estimates.theta` leaves out the coefficients of a compact θ block (20 or more
+  levels) and `[covariate_nn]` weights, so every θ is also given by position in
+  `theta`, `theta_names`, `theta_fixed` and `se_theta`, with `held_at_bound`
+  naming coordinates held on a bound (no SE) and `profiled_blocks` the blocks
+  declared `profile`.
+- **θ blocks** — `theta_blocks`, keyed by block name, the `--- THETA BLOCKS ---`
+  rows: `n_free_coefficients`, `n_fixed_coefficients`, `profiled`, `min`,
+  `median`, `max` (over every coefficient, FIX included), and `theta_start` /
+  `theta_end`, the half-open index range of the block's coefficients in `theta`.
+  `{}` for a fit without one.
+- **Diagnostics** — `covariance_status`, `covariance_method`,
+  `cov_condition_number`, and `shrinkage_eta`, `shrinkage_kappa`,
+  `shrinkage_kappa_by_occ`, `shrinkage_eps` as **fractions** (not percent),
+  indexed like `eta_names` / `kappa_names`.
+- **Run info** — `wall_time_secs`, `ferx_version`, and `warnings_structured`
+  (`severity`, `category`, `message`, …).
+
+Every one of these is copied from the fit JSON's own serializer under the same
+key, so a value reads the same here and in `{model}-fit.json`. Non-finite
+values are `null`. With two or more bundles the document also has
+`reference_run: 0` and each run a `delta_ofv` against the first run (the
+comparison table's ΔOFV row; `null` when the first bundle failed to load).
+
+```json
+{
+  "schema_version": 1,
+  "fit_schema_version": 1,
+  "reference_run": 0,
+  "runs": [
+    { "label": "run1", "path": "run1.fitrx", "ofv": -280.3595, "delta_ofv": 0.0,
+      "converged": true, "estimates": { "theta": { "TVCL": { "estimate": 0.133, ... } } }, ... },
+    { "label": "run2", "path": "run2.fitrx", "error": "failed to load run2.fitrx: ..." }
+  ]
+}
+```
+
+The exit codes are those of the text summary. A bundle that fails to load does
+not stop the others: it gets an `error` entry in place of the fit fields, the
+document is still printed, and the exit code is `1`.
+
 ## Output Files
 
 Two files are always generated, named after the model file:

@@ -108,7 +108,7 @@ fn nonmem_optimum() -> (Vec<f64>, f64, f64) {
 #[test]
 fn a_binary_endpoints_records_define_the_profiled_levels() {
     let p = b1(None, ARMS[0].1);
-    let active = crate::api::active_levels(&p.parsed.model, &p.population);
+    let active = crate::levels::active_levels(&p.parsed.model, &p.population);
     assert_eq!(active.len(), 1);
     for (i, levels) in active[0].per_subject.iter().enumerate() {
         let want: Vec<usize> = (4 * i..4 * i + 4).collect();
@@ -128,14 +128,14 @@ fn a_binary_endpoints_records_define_the_profiled_levels() {
 #[test]
 fn the_rsr_one_subject_note_counts_binary_records() {
     let p = prep(B1, B1_DATA, None, |t| t);
-    let sandwich = crate::api::rsr_one_subject_levels_warning(
+    let sandwich = crate::levels::rsr_one_subject_levels_warning(
         &p.parsed.model,
         &p.population,
         Some(crate::types::CovarianceMethod::Sandwich),
     )
     .expect("every level is read by one study");
     assert!(sandwich.contains("40 of the 40 levels of theta PLACEBO[...]"), "{sandwich}");
-    assert!(crate::api::rsr_one_subject_levels_warning(
+    assert!(crate::levels::rsr_one_subject_levels_warning(
         &p.parsed.model,
         &p.population,
         Some(crate::types::CovarianceMethod::Hessian),
@@ -214,7 +214,7 @@ fn a_counted_block_read_by_the_binary_predictor_takes_its_levels_from_the_record
     std::fs::write(&model, text).unwrap();
     let p = crate::api::prepare_run(model.to_str().unwrap(), Some(data.to_str().unwrap()))
         .unwrap_or_else(|e| panic!("{e}"));
-    let active = crate::api::active_levels(&p.parsed.model, &p.population);
+    let active = crate::levels::active_levels(&p.parsed.model, &p.population);
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].per_subject[0], vec![0, 1, 2], "study 1");
     for (i, levels) in active[0].per_subject.iter().enumerate().skip(1) {
