@@ -488,12 +488,7 @@ pub(crate) fn free_coordinate_names(template: &ModelParameters, free_idx: &[usiz
     let names = crate::estimation::parameterization::coordinate_names(template);
     free_idx
         .iter()
-        .map(|&i| {
-            names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("coordinate {}", i + 1))
-        })
+        .map(|&i| names.get(i).cloned().unwrap_or_else(|| format!("coordinate {}", i + 1)))
         .collect()
 }
 
@@ -506,18 +501,10 @@ pub(crate) fn free_coordinate_names(template: &ModelParameters, free_idx: &[usiz
 /// Only a design with no zero score is advised `r`/`rsr`: otherwise the objective is flat along
 /// the same direction, so `R` is singular too.
 pub(crate) fn s_singular_msg(
-    s: &DMatrix<f64>,
-    units: &[CoordUnits],
-    names: &[String],
-    n_subjects: usize,
+    s: &DMatrix<f64>, units: &[CoordUnits], names: &[String], n_subjects: usize,
 ) -> String {
     let n = s.nrows();
-    let list = |ix: &[usize]| {
-        ix.iter()
-            .map(|&i| names[i].as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let list = |ix: &[usize]| ix.iter().map(|&i| names[i].as_str()).collect::<Vec<_>>().join(", ");
     let c = unit_coordinate_scales(s, units).map_or_else(|| s.clone(), |d| unit_free(s, &d));
     let dmax = (0..n).map(|i| c[(i, i)]).fold(0.0, f64::max);
     let zero: Vec<usize> = (0..n).filter(|&i| !(c[(i, i)] > 1e-20 * dmax)).collect();
@@ -537,11 +524,7 @@ pub(crate) fn s_singular_msg(
         ));
     }
     if zero.len() < n && n_subjects < n {
-        let subjects = if n_subjects == 1 {
-            "subject"
-        } else {
-            "subjects"
-        };
+        let subjects = if n_subjects == 1 { "subject" } else { "subjects" };
         cause.push(format!(
             "With {n_subjects} {subjects} and {n} free parameters S has rank at most {n_subjects}, \
              so it is singular on this design at any estimate."
@@ -559,18 +542,12 @@ pub(crate) fn s_singular_msg(
         let nz: Vec<usize> = (0..n).filter(|i| !zero.contains(i)).collect();
         let eig = SymmetricEigen::new(c.select_rows(&nz).select_columns(&nz));
         let floor = psd_floor(eig.eigenvalues.max());
-        let low: Vec<usize> = (0..nz.len())
-            .filter(|&k| eig.eigenvalues[k] < floor)
-            .collect();
+        let low: Vec<usize> = (0..nz.len()).filter(|&k| eig.eigenvalues[k] < floor).collect();
         let mut ix: Vec<usize> = Vec::new();
         for &k in &low {
             let w = eig.eigenvectors.column(k);
             let top = w.amax();
-            ix.extend(
-                (0..nz.len())
-                    .filter(|&i| w[i].abs() >= 0.1 * top)
-                    .map(|i| nz[i]),
-            );
+            ix.extend((0..nz.len()).filter(|&i| w[i].abs() >= 0.1 * top).map(|i| nz[i]));
         }
         ix.sort_unstable();
         ix.dedup();
@@ -582,11 +559,7 @@ pub(crate) fn s_singular_msg(
             ));
         } else if !ix.is_empty() {
             let k = low.len();
-            let which = if k == 1 {
-                "one".to_string()
-            } else {
-                k.to_string()
-            };
+            let which = if k == 1 { "one".to_string() } else { k.to_string() };
             cause.push(format!(
                 "The per-subject scores of {} are collinear, so the data inform only a \
                  combination of them; fix or remove {which} of them.",

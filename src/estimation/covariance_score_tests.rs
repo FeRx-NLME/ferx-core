@@ -314,12 +314,7 @@ fn cross(g: &[[f64; 3]]) -> DMatrix<f64> {
 fn singular_msg(s: &DMatrix<f64>, n_subjects: usize) -> String {
     use super::CoordUnits::{Dimensionless, IdentityTheta};
     let names = ["TVKON".to_string(), "TVVB".into(), "TVV".into()];
-    super::s_singular_msg(
-        s,
-        &[Dimensionless, Dimensionless, IdentityTheta],
-        &names,
-        n_subjects,
-    )
+    super::s_singular_msg(s, &[Dimensionless, Dimensionless, IdentityTheta], &names, n_subjects)
 }
 
 /// A score that is zero in every subject names its parameters, for all of them and for some,
@@ -333,10 +328,7 @@ fn a_zero_score_names_its_parameters() {
          no subject's likelihood depends on the estimated parameters as scored."
     ));
     assert!(all.ends_with(" SE estimates not available."), "{all}");
-    let one = singular_msg(
-        &cross(&[[1.0, 0.0, 2.0], [3.0, 0.0, -1.0], [2.0, 0.0, 5.0]]),
-        3,
-    );
+    let one = singular_msg(&cross(&[[1.0, 0.0, 2.0], [3.0, 0.0, -1.0], [2.0, 0.0, 5.0]]), 3);
     assert!(
         one.contains(
             "The score for TVVB is zero in every subject, so the data do not inform it; fix or \
@@ -353,10 +345,7 @@ fn a_zero_score_names_its_parameters() {
         "{two}"
     );
     // Between the zero floor (1e-20) and the eigen floor (1e-10): named alone, not collinear.
-    let near = singular_msg(
-        &cross(&[[1.0, 1e-7, 2.0], [3.0, -2e-7, -1.0], [2.0, 1e-7, 5.0]]),
-        3,
-    );
+    let near = singular_msg(&cross(&[[1.0, 1e-7, 2.0], [3.0, -2e-7, -1.0], [2.0, 1e-7, 5.0]]), 3);
     assert!(
         near.contains(
             "(covariance_method = s). The score for TVVB is nearly zero in every subject \
@@ -386,10 +375,7 @@ fn fewer_subjects_than_parameters_states_the_rank_only_below_the_count() {
     assert!(singular_msg(&s, 2).contains(&design(2, "subjects")));
     assert!(singular_msg(&s, 1).contains(&design(1, "subject")));
     let at_count = singular_msg(&s, 3);
-    assert!(
-        !at_count.contains("rank at most") && !at_count.contains("rsr"),
-        "{at_count}"
-    );
+    assert!(!at_count.contains("rank at most") && !at_count.contains("rsr"), "{at_count}");
     assert!(at_count.contains("are collinear"), "{at_count}");
     // A zero score and the design are separate causes, and both are named; `r`/`rsr` is not
     // advised, since `R` is singular along the zero score too.
@@ -401,36 +387,21 @@ fn fewer_subjects_than_parameters_states_the_rank_only_below_the_count() {
         ),
         "{both}"
     );
-    assert!(
-        !both.contains("collinear") && !both.contains("rsr"),
-        "{both}"
-    );
+    assert!(!both.contains("collinear") && !both.contains("rsr"), "{both}");
 }
 
 /// Two parameters whose scores cancel in every subject (the likelihood reads only their ratio)
 /// are named, and the third is not; the same design with the pair informed separately inverts.
 #[test]
 fn collinear_scores_name_the_parameters_they_cancel_in() {
-    let bad = cross(&[
-        [1.0, -1.0, 40.0],
-        [2.0, -2.0, -30.0],
-        [-0.5, 0.5, 70.0],
-        [3.0, -3.0, 10.0],
-    ]);
-    let ok = cross(&[
-        [1.0, -0.2, 40.0],
-        [2.0, -2.0, -30.0],
-        [-0.5, 0.9, 70.0],
-        [3.0, -1.0, 10.0],
-    ]);
+    let bad = cross(&[[1.0, -1.0, 40.0], [2.0, -2.0, -30.0], [-0.5, 0.5, 70.0], [3.0, -3.0, 10.0]]);
+    let ok = cross(&[[1.0, -0.2, 40.0], [2.0, -2.0, -30.0], [-0.5, 0.9, 70.0], [3.0, -1.0, 10.0]]);
     let units = [super::CoordUnits::Dimensionless; 3];
     assert!(super::invert_cross_product(&bad, &units).is_none());
     assert!(super::invert_cross_product(&ok, &units).is_some());
     // A zero score does not hide a collinear pair among the others.
-    let with_zero = singular_msg(
-        &cross(&[[1.0, -1.0, 0.0], [2.0, -2.0, 0.0], [-0.5, 0.5, 0.0]]),
-        3,
-    );
+    let with_zero =
+        singular_msg(&cross(&[[1.0, -1.0, 0.0], [2.0, -2.0, 0.0], [-0.5, 0.5, 0.0]]), 3);
     assert!(
         with_zero.contains("fix or remove it. The per-subject scores of TVKON, TVVB are collinear"),
         "{with_zero}"
@@ -445,10 +416,7 @@ fn collinear_scores_name_the_parameters_they_cancel_in() {
     );
     // Rank 1 over three: two clipped eigenvalues, both loading on every coordinate, so each
     // name is listed once and two must go.
-    let rank1 = singular_msg(
-        &cross(&[[1.0, 2.0, 3.0], [-2.0, -4.0, -6.0], [0.5, 1.0, 1.5]]),
-        3,
-    );
+    let rank1 = singular_msg(&cross(&[[1.0, 2.0, 3.0], [-2.0, -4.0, -6.0], [0.5, 1.0, 1.5]]), 3);
     assert!(
         rank1.contains(
             "(covariance_method = s). The per-subject scores of TVKON, TVVB, TVV are collinear, \
