@@ -146,6 +146,10 @@ pub struct OuterResult {
     /// `EstimationMethod::Vi`; carried here so the chain dispatch lifts it onto
     /// `FitResult.vi` through the same generic path `bayes` uses.
     pub vi: Option<crate::types::ViResult>,
+    /// Fitted regular-vine copula + zero-mean marginal summary (`omega_dist = vine`, #225).
+    pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    /// Importance-sampled marginal `−2 log L` under the fitted vine copula prior (#225).
+    pub vine_corrected_ofv: Option<f64>,
     /// The fit's first evaluation, unguarded — the reference [`above_start_warning`] holds
     /// the reported objective against (#2461). `Some` for the NLopt and profiled loops
     /// (#2519). It is the **fit's** start: restart legs inherit it through [`RestartLeg`]
@@ -202,6 +206,8 @@ impl OuterResult {
             stationary_start: false,
             mixture_posteriors: None,
             vi: None,
+            vine_params: None,
+            vine_corrected_ofv: None,
             start_eval: None,
             mcem_lowest_objective: None,
             mcem_objective_trail: None,

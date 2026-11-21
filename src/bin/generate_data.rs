@@ -223,6 +223,7 @@ fn build_warfarin_model() -> CompiledModel {
         omega_iov: None,
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     };
     let pk_param_fn: PkParamFn =
         Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -276,6 +277,7 @@ fn build_warfarin_true_params() -> ModelParameters {
         omega_iov: None,
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     }
 }
 
@@ -302,6 +304,7 @@ fn generate_two_cpt_iv() {
         omega_iov: None,
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     };
     let pk_param_fn: PkParamFn =
         Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -373,6 +376,7 @@ fn generate_two_cpt_oral_cov() {
         omega_iov: None,
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     };
     let pk_param_fn: PkParamFn =
         Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
@@ -520,6 +524,7 @@ fn generate_mm_oral() {
         omega_iov: None,
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     };
     let pk_param_fn: PkParamFn =
         Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {

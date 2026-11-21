@@ -1698,8 +1698,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 let n = population.subjects.len();
                 let pool: Vec<DVector<f64>> = (0..n)
                     .map(|_| {
-                        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                        &**eta_factor * DVector::from_column_slice(&z)
+                        if let Some(vine) = &params.vine_dist {
+                            DVector::from_vec(vine.draw_eta(rng))
+                        } else {
+                            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                            &**eta_factor * DVector::from_column_slice(&z)
+                        }
                     })
                     .collect();
                 let assign = crate::propensity_match::match_draws_to_fitted(
@@ -1747,11 +1751,15 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     // The subject's mixture class (#2163), held until its rows are out.
                     let class = classes.enter(subject, draw, sim);
                     let first_row = results.len();
-                    // Sample eta from N(0, Omega); append zero kappas for IOV models.
-                    let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                    let z_vec = DVector::from_column_slice(&z);
-                    let eta = class.eta_factor * z_vec;
-                    let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                    // Sample eta from fitted vine (when present) or N(0, Omega); append zero kappas for IOV models.
+                    let mut eta_slice: Vec<f64> = if let Some(vine) = &class.params.vine_dist {
+                        vine.draw_eta(rng)
+                    } else {
+                        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                        let z_vec = DVector::from_column_slice(&z);
+                        let eta = class.eta_factor * z_vec;
+                        eta.iter().copied().collect()
+                    };
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
                     let predicted = emit_subject_rows(

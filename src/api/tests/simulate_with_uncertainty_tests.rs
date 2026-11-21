@@ -729,6 +729,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         optimizer_stop: None,
         eval_budget_spent: false,
         evaluation_only: false,
+        vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 

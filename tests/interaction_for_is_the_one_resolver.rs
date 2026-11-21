@@ -113,6 +113,12 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     ("src/estimation/saem.rs", 1, "the SAEM stage's final objective, on its stage options"),
     (
+        "src/estimation/saem_vine.rs",
+        1,
+        "`run_saem_vine` resolves the flag itself, `interaction_for(EstimationMethod::Saem, \
+         options.interaction)`, for its Gaussian-equivalent FOCE/Laplace baseline readout",
+    ),
+    (
         "src/estimation/trace.rs",
         1,
         "`method_label` (#2552) resolves the flag itself, `interaction_for(options.method, \

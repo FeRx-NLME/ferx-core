@@ -3029,6 +3029,51 @@ pub struct ModelParameters {
     /// a copy of the base) plus the packing addresses of the per-class
     /// overrides. `None` for a single-population model.
     pub mixture: Option<MixtureParams>,
+    /// Fitted regular-vine copula + zero-mean flexible marginal distribution
+    /// (`[fit_options] omega_dist = vine`, #225). `None` for Gaussian random effects.
+    pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
+}
+
+/// Random-effect distribution family for SAEM (`[fit_options] omega_dist`, #225).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OmegaDist {
+    /// Multivariate normal `η ~ N(0, Ω)` (default).
+    #[default]
+    Gaussian,
+    /// Regular-vine copula + zero-mean flexible parametric marginals.
+    VineCopula,
+}
+
+impl OmegaDist {
+    /// Canonical `[fit_options]` token (`"gaussian"` or `"vine"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gaussian => "gaussian",
+            Self::VineCopula => "vine",
+        }
+    }
+}
+
+/// Marginal family selection policy under `omega_dist = vine` (`[fit_options] vine_marginals`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VineMarginals {
+    /// Select among zero-mean Normal, Student-t, Skew-Normal, and Skew-t by BIC (default).
+    #[default]
+    Auto,
+    /// Pin marginals to zero-mean Normal (isolates pure copula tail/rank dependence).
+    Gaussian,
+}
+
+impl VineMarginals {
+    /// Canonical `[fit_options]` token (`"auto"` or `"gaussian"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gaussian => "gaussian",
+        }
+    }
 }
 
 /// Numeric per-class Omega/Sigma for a `$MIXTURE` model (#977 Phase 2).
@@ -7781,6 +7826,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // #2786: a compiled plan failed and its subjects took finite differences. Token arm
         // ahead of the prose ones: the message quotes the plan layer's own failure reason.
         (WarningSeverity::Warning, WarningCode::GradientFallback)
+    } else if lower.starts_with("w_vine_multimodal_ebe") {
+        // #225: multi-start Vine MAP EBE solver found secondary posterior modes or a
+        // non-positive-definite Hessian at the EBE mode.
+        (WarningSeverity::Warning, WarningCode::EbeStartDependent)
     } else if lower.starts_with("w_ode_rhs_") {
         // #2681: which engine runs the `[odes]` RHS. Informational, and a token arm ahead of
         // the prose ones: the message names the construct, and "interpreter" or a function
@@ -8580,6 +8629,14 @@ pub struct FitResult {
     /// the ELBO (which is **not** an OFV — see [`ViResult`]) and the per-subject
     /// variational posteriors.
     pub vi: Option<ViResult>,
+    /// Fitted regular-vine copula + zero-mean marginal summary (`omega_dist = vine`, #225).
+    /// `None` for Gaussian random-effect fits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    /// Importance-sampled marginal `−2 log L` under the fitted vine copula prior
+    /// (`omega_dist = vine`, #225). Directly comparable to `saem` with `saem_ofv = imp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vine_corrected_ofv: Option<f64>,
     // IOV results (present when kappa declarations exist in the model)
     #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_iov: Option<DMatrix<f64>>,
@@ -9922,6 +9979,12 @@ pub struct FitOptions {
     /// kernel for the whole run, not one per subject depending on how many
     /// samples each happened to give.
     pub saem_imh_min_obs_per_eta: f64,
+    /// Random-effect distribution family for SAEM (`[fit_options] omega_dist`, #225).
+    /// Default [`OmegaDist::Gaussian`].
+    pub saem_omega_dist: OmegaDist,
+    /// Marginal family selection mode under `omega_dist = vine` (`[fit_options] vine_marginals`).
+    /// Default [`VineMarginals::Auto`].
+    pub vine_marginals: VineMarginals,
     // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
     /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
     /// the reported posterior. HMC step size / leapfrog count adapt during this
@@ -10455,6 +10518,8 @@ impl Default for FitOptions {
             saem_imh_refresh: 5,
             saem_imh_defensive: 0.05,
             saem_imh_min_obs_per_eta: 2.0,
+            saem_omega_dist: OmegaDist::default(),
+            vine_marginals: VineMarginals::default(),
             bayes_warmup: 1000,
             bayes_iters: 1000,
             bayes_chains: 4,
@@ -11723,6 +11788,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_imh_defensive",
             "saem_imh_min_obs_per_eta",
             "omega_burnin",
+            "saem_omega_burnin",
+            "omega_dist",
+            "saem_omega_dist",
+            "vine_marginals",
             "conddist",
             "saem_conddist",
             "conddist_nsamp",

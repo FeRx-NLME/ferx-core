@@ -20,6 +20,7 @@ pub(crate) fn bare_params(omega: OmegaMatrix) -> ModelParameters {
         omega_iov: None,
         kappa_fixed: Vec::new(),
         mixture: None,
+        vine_dist: None,
     }
 }
 
@@ -311,6 +312,8 @@ pub(crate) fn empty_fit_result() -> FitResult {
         impmap_trace: None,
         bayes: None,
         vi: None,
+        vine_params: None,
+        vine_corrected_ofv: None,
         omega_iov: None,
         kappa_names: Vec::new(),
         kappa_fixed: Vec::new(),

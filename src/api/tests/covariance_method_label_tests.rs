@@ -229,6 +229,7 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
         // The profiled outer loop (#1065).
         ("src/estimation/profile.rs", (1, 1)),
         ("src/estimation/saem.rs", (1, 1)),
+        ("src/estimation/saem_vine.rs", (1, 1)),
         ("src/estimation/trust_region.rs", (1, 1)),
         ("src/estimation/vi/run.rs", (1, 1)),
         // The standalone re-run, which assigns onto a cloned `FitResult`.

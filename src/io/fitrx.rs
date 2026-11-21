@@ -273,6 +273,10 @@ struct FitWire {
     saem_objective: Option<crate::types::SaemObjective>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nan_tolerant")]
     impmap_trace: Option<ImpmapTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nan_tolerant")]
+    vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::io::serde_nan::opt")]
+    vine_corrected_ofv: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exclusions: Option<ExclusionSummary>,
 
@@ -1715,6 +1719,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         importance_sampling: r.importance_sampling.clone(),
         saem_objective: r.saem_objective.clone(),
         impmap_trace: r.impmap_trace.clone(),
+        vine_params: r.vine_params.clone(),
+        vine_corrected_ofv: r.vine_corrected_ofv,
         exclusions: r.exclusions.clone(),
         stalled_at_init: crate::model_selection::stalled_at_init(r),
         estimate_near_boundary: crate::model_selection::estimate_near_boundary(r),
@@ -3732,6 +3738,8 @@ fn wire_to_fit_result(
         impmap_trace: w.impmap_trace,
         bayes: w.bayes,
         vi,
+        vine_params: w.vine_params,
+        vine_corrected_ofv: w.vine_corrected_ofv,
         omega_iov,
         kappa_names,
         kappa_fixed,

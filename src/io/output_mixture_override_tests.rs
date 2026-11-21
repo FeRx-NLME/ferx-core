@@ -38,6 +38,7 @@ fn template() -> ModelParameters {
             sigma_override_addr: vec![(1, 1)],
             sigma_override_fixed: vec![false],
         }),
+        vine_dist: None,
     }
 }
 

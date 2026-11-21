@@ -815,7 +815,7 @@ const SIGMA_CAP_RELEASE_MAX_LOG_SE: f64 = 0.1;
 /// the exploration average with one draw — is #1445's second half, and the
 /// #1464 measurement is of the first. It binds for four iterations either
 /// way.
-fn sigma_mstep_sa_steps(
+pub(crate) fn sigma_mstep_sa_steps(
     gamma: f64, gamma_mstep: f64, exploring: bool, log_se: Option<&[f64]>, n_sigma: usize,
 ) -> Vec<f64> {
     let capped = sigma_mstep_sa_step(gamma, gamma_mstep);
@@ -870,7 +870,7 @@ fn sigma_cap_release_scope_gap(
 /// would be the exact opposite. `<= 0.0` (`-∞` included) and `NaN` fall back to
 /// the default rather than to a hair above zero, since a near-zero cap is
 /// itself a frozen fit (#1415). `None` means the value was already in range.
-fn sanitize_mstep_damping(cap: f64) -> Option<f64> {
+pub(crate) fn sanitize_mstep_damping(cap: f64) -> Option<f64> {
     if cap.is_nan() || cap <= 0.0 {
         Some(MSTEP_SA_MAX_STEP)
     } else if cap > 1.0 {
@@ -891,7 +891,7 @@ fn sanitize_mstep_damping(cap: f64) -> Option<f64> {
 /// such pinning — it is genuinely re-maximised every iteration — and is damped
 /// deliberately, because it comes out of the *same* joint NLopt solve as θ (see
 /// [`mstep_sa_step`]).
-fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
+pub(crate) fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
     if gamma >= 1.0 {
         cur.copy_from_slice(new);
         return;
@@ -927,7 +927,7 @@ fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
 /// the undamped assignment is reproduced bit-for-bit. A non-finite `new`
 /// (NLopt returned garbage for a coordinate) leaves that coordinate alone
 /// rather than poisoning the running average.
-fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: &[f64]) {
+pub(crate) fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: &[f64]) {
     for ((c, &n), &gamma) in cur.iter_mut().zip(new.iter()).zip(gamma.iter()) {
         if gamma >= 1.0 {
             *c = n;
@@ -2575,7 +2575,7 @@ pub(crate) fn note_mstep_route(optimizer: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn theta_sigma_mstep_light(
+pub(crate) fn theta_sigma_mstep_light(
     model: &CompiledModel,
     population: &Population,
     etas: &[Vec<f64>],
@@ -4342,6 +4342,7 @@ fn saem_state_to_params(
         },
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: None,
+        vine_dist: None,
     }
 }
 
@@ -4429,7 +4430,7 @@ pub(crate) fn resolve_n_mh_steps_bayes(requested: usize) -> usize {
 /// The `verbose` line describing the resolved E-step kernel sizes. Kept as a
 /// pure function so the wording is unit-testable, like
 /// [`saem_final_ofv_report`].
-fn mh_steps_report(requested: usize, resolved: usize, n_cw_sweeps: usize) -> String {
+pub(crate) fn mh_steps_report(requested: usize, resolved: usize, n_cw_sweeps: usize) -> String {
     let origin = if requested == SAEM_N_MH_STEPS_AUTO {
         "auto, from observations per subject per eta"
     } else {
@@ -4490,7 +4491,7 @@ pub(crate) fn componentwise_sweeps(n_mh_steps: usize, n_eta: usize) -> usize {
 /// the run, so reporting the OFV first lets a CLI user interrupt (Ctrl-C) on a
 /// bad OFV before paying for the covariance matrix. Kept as a pure function so
 /// the message is unit-testable.
-fn saem_final_ofv_report(ofv: f64) -> String {
+pub(crate) fn saem_final_ofv_report(ofv: f64) -> String {
     format!("SAEM completed. FOCE/Laplace OFV = {:.4}", ofv)
 }
 
@@ -4498,6 +4499,14 @@ pub fn run_saem(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    if options.saem_omega_dist == OmegaDist::VineCopula {
+        return crate::estimation::saem_vine::run_saem_vine(
+            model,
+            population,
+            init_params,
+            options,
+        );
+    }
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     // Run-time backstop for callers that bypass `check_model_options`

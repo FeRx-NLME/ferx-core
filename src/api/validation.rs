@@ -3157,6 +3157,95 @@ pub(crate) fn check_iiv_on_ruv(model: &CompiledModel, options: &FitOptions) -> V
     diags
 }
 
+/// Refusals for `omega_dist = vine` (`OmegaDist::VineCopula`, #225).
+pub(crate) fn check_omega_dist_options(
+    model: &CompiledModel, options: &FitOptions,
+) -> Vec<Diagnostic> {
+    if options.saem_omega_dist != crate::types::OmegaDist::VineCopula {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+    let chain = options.method_chain();
+    if !chain.contains(&EstimationMethod::Saem) {
+        let names: Vec<String> = chain.iter().map(|m| m.label().to_ascii_lowercase()).collect();
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_NO_SAEM",
+                format!(
+                    "`omega_dist = vine` requires `method = saem` (got `{}`). \
+                     Vine-copula random effects are estimated by SAEM; set `method = saem` \
+                     or `omega_dist = gaussian`.",
+                    names.join(", ")
+                ),
+            )
+            .with_block("fit_options"),
+        );
+    } else if let Some(&other) = chain.iter().find(|&&m| m != EstimationMethod::Saem) {
+        let other_name = other.label().to_ascii_lowercase();
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_CHAIN",
+                format!(
+                    "`omega_dist = vine` cannot be chained with `method = {other_name}`: \
+                     every non-SAEM estimator scores a Gaussian `N(0, Omega)` prior and would \
+                     overwrite the fitted vine parameters or objective. Use standalone \
+                     `method = saem` (its marginal OFV is already importance-sampled under \
+                     the fitted vine).",
+                ),
+            )
+            .with_block("fit_options"),
+        );
+    }
+    if options.sir || options.covariance_fallback == crate::types::CovarianceFallback::Sir {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_SIR",
+                "`omega_dist = vine` is incompatible with SIR (`sir = true` or \
+                 `covariance_fallback = sir`): SIR resamples Cholesky-packed Gaussian `Omega` \
+                 vectors rather than vine marginal/copula parameters. Disable `sir` (and use \
+                 `covariance_fallback = none`) for vine-copula fits.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+    if model.mixture.is_some() {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_MIXTURE",
+                "`omega_dist = vine` is incompatible with `[mixture]` models: discrete \
+                 subpopulations (`[mixture]`) and continuous vine-copula random effects cannot \
+                 be combined in one fit.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+    if options.saem_n_exploration == 0 {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_OPTIONS",
+                "`omega_dist = vine` requires `n_exploration >= 1` (got 0): vine marginal and \
+                 pair-copula BIC selection requires conditional MCMC draws from the exploration \
+                 phase (`n_exploration = 0` would select on all-zero initial ETAs). Set \
+                 `n_exploration` to at least 1.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+    if options.saem_ofv == crate::types::SaemOfv::Agq {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_OPTIONS",
+                "`omega_dist = vine` is incompatible with `saem_ofv = agq`: adaptive \
+                 Gauss–Hermite quadrature integrates a multivariate normal `N(0, Omega)` prior \
+                 rather than the fitted regular-vine copula. Use `saem_ofv = imp` (the QMC \
+                 marginal likelihood reported for vine models) or `saem_ofv = focei`.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+    diags
+}
+
 /// The `[mixture]` (#977) refusals of a fit's options and starting parameters (#1788), in
 /// `fit()`'s order:
 ///
@@ -4053,6 +4142,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // its; listed here so `ferx check` reports what `fit()` refuses (#1788).
     diags.extend(check_ltbs_model(model));
     diags.extend(check_iiv_on_ruv(model, options));
+    diags.extend(check_omega_dist_options(model, options));
 
     // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent variable, so every
     // estimator whose objective *is* an integral over η degenerates. SAEM's E-step is empty: it runs,

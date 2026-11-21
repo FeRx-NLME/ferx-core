@@ -1202,10 +1202,20 @@ where
                 // A supplied subject (#1594) still draws its `n_eta` normals and drops
                 // them: one stream serves every subject, so skipping the draw would shift
                 // every later subject's η off the values the same seed gives without it.
-                let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                let mut eta_slice: Vec<f64> = match supplied {
-                    Some(eta) => eta.clone(),
-                    None => (eta_factor * DVector::from_column_slice(&z)).iter().copied().collect(),
+                let mut eta_slice: Vec<f64> = if let Some(vine) = &params.vine_dist {
+                    let drawn = vine.draw_eta(&mut rng);
+                    match supplied {
+                        Some(eta) => eta.clone(),
+                        None => drawn,
+                    }
+                } else {
+                    let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                    match supplied {
+                        Some(eta) => eta.clone(),
+                        None => {
+                            (eta_factor * DVector::from_column_slice(&z)).iter().copied().collect()
+                        }
+                    }
                 };
                 eta_slice.resize(n_eta + model.n_kappa, 0.0);
 

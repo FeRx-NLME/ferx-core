@@ -3816,7 +3816,7 @@ fn iov_h_route(model: &CompiledModel, subject: &Subject) -> bool {
 
 /// One subject's `H` at its EBE, by the rule the inner loop finishes with and with no captured
 /// Jacobian. `kappas` is read on the IOV route only.
-fn ebe_h_matrix_of(
+pub(crate) fn ebe_h_matrix_of(
     model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta: &[f64],
     kappas: &[DVector<f64>],
 ) -> DMatrix<f64> {

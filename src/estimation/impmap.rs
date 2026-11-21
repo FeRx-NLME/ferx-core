@@ -1848,6 +1848,7 @@ fn run_mcem(
             omega_iov: omega_iov_snapshot(init_params, omega_iov_mat.as_ref()),
             kappa_fixed: init_params.kappa_fixed.clone(),
             mixture: None,
+            vine_dist: None,
         };
 
         // ---- E-step A: position the proposal ----
@@ -2689,6 +2690,7 @@ fn run_mcem(
         omega_iov: omega_iov_snapshot(init_params, final_omega_iov_mat.as_ref()),
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: None,
+        vine_dist: None,
     };
 
     // ---- Final EBEs (warm-started) + FOCE Laplace OFV for comparability ----
@@ -3236,6 +3238,7 @@ fn run_mcem_mixture(
             omega_iov: None,
             kappa_fixed: init_params.kappa_fixed.clone(),
             mixture: None,
+            vine_dist: None,
         };
         let run_inner = recenter == ProposalRecenter::Map || prev_draws.is_none();
         let prev = prev_draws.as_ref();
@@ -3669,6 +3672,7 @@ fn run_mcem_mixture(
         omega_iov: None,
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: final_mixture,
+        vine_dist: None,
     };
 
     // ---- Final EBEs / OFV / posteriors via the K-fold marginal ----

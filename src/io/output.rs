@@ -1265,9 +1265,86 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
             let _ = writeln!(out, "{indent}{}", ic_unavailable_line(result));
         }
     }
+    if let Some(vc) = result.vine_corrected_ofv {
+        let _ = writeln!(out, "{indent}Vine QMC IS OFV: {vc:.4}");
+    }
     for note in objective_notes(result) {
         let _ = writeln!(out, "{indent}{note}");
     }
+}
+
+/// Format the `--- VINE COPULA ---` block shared by [`print_results`] and [`format_summary`].
+fn format_vine_copula_section(
+    vp: &crate::stats::vine_copula::VineFitParams, vine_ofv: Option<f64>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "\n--- VINE COPULA (r_vine, {} free parameters) ---", vp.n_free_params());
+    if let Some(vc) = vine_ofv.filter(|v| v.is_finite()) {
+        let _ = writeln!(s, "  Vine QMC IS -2 log L: {vc:.4}");
+    }
+    let _ = writeln!(s, "  Marginals (E[eta] = 0):");
+    for m in &vp.marginals {
+        let p_str: Vec<String> = m
+            .params
+            .iter()
+            .enumerate()
+            .map(|(idx, (k, v))| {
+                let se_opt = m.se.get(idx).map(|(_, se)| *se);
+                format!("{k}={v:.4} (SE={})", se_cell(se_opt))
+            })
+            .collect();
+        let mut moments = Vec::new();
+        if let Some(sk) = m.skewness.filter(|v| v.is_finite()) {
+            moments.push(format!("skew={sk:.4}"));
+        }
+        if let Some(ek) = m.excess_kurtosis.filter(|v| v.is_finite()) {
+            moments.push(format!("ex_kurt={ek:.4}"));
+        }
+        let mom_str =
+            if moments.is_empty() { String::new() } else { format!(" [{}]", moments.join(", ")) };
+        let _ = writeln!(
+            s,
+            "    {:<12} {:<12} SD = {:.4}  {}{}",
+            m.eta,
+            m.family,
+            m.sd,
+            p_str.join(", "),
+            mom_str
+        );
+    }
+    let any_pair = vp.trees.iter().any(|t| !t.pairs.is_empty());
+    if any_pair {
+        let _ = writeln!(s, "  Pair-copulas:");
+        for t in &vp.trees {
+            for p in &t.pairs {
+                let c = &p.copula;
+                let cp_str: Vec<String> = c
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (k, v))| {
+                        let se_opt = c.se.get(idx).map(|(_, se)| *se);
+                        format!("{k}={v:.4} (SE={})", se_cell(se_opt))
+                    })
+                    .collect();
+                let cp_join =
+                    if cp_str.is_empty() { "none".to_string() } else { cp_str.join(", ") };
+                let _ = writeln!(
+                    s,
+                    "    T{} ({}): {} [{}] (tau = {:.3}, tail_L = {:.3}, tail_U = {:.3})",
+                    t.tree,
+                    p.label,
+                    c.family,
+                    cp_join,
+                    c.kendall_tau,
+                    c.tail_dep_lower,
+                    c.tail_dep_upper
+                );
+            }
+        }
+    }
+    s
 }
 
 /// The covariance-step status with its estimator appended, e.g.
@@ -1435,6 +1512,11 @@ pub fn print_results(result: &FitResult) {
         eprint!("{}", format_kappa_rows(result));
         // Off-diagonal covariances/correlations (block_kappa)
         eprint!("{}", format_kappa_corr_rows(result));
+    }
+
+    // Regular-vine copula random-effect summary (#225)
+    if let Some(ref vp) = result.vine_params {
+        eprint!("{}", format_vine_copula_section(vp, result.vine_corrected_ofv));
     }
 
     // Importance sampling marginal log-likelihood
@@ -1669,6 +1751,9 @@ pub fn format_summary(result: &FitResult) -> String {
         {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
+    }
+    if let Some(ref vp) = result.vine_params {
+        out.push_str(&format_vine_copula_section(vp, result.vine_corrected_ofv));
     }
 
     // --- KAPPA (IOV) --- the console's rows verbatim (#1657), so the two
@@ -2919,6 +3004,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  marginal_mc_standard_error: {:.6}", is.mc_standard_error)
             .map_err(|e| e.to_string())?;
     }
+    if let Some(vc) = result.vine_corrected_ofv {
+        writeln!(f, "  vine_corrected_ofv: {}", yaml_f64_6(vc)).map_err(|e| e.to_string())?;
+    }
     for note in objective_notes(result) {
         writeln!(f, "  # {note}").map_err(|e| e.to_string())?;
     }
@@ -3306,6 +3394,79 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                                 .map_err(|e| e.to_string())?;
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Vine copula section (#225)
+    if let Some(ref vp) = result.vine_params {
+        writeln!(f, "\nvine_copula:").map_err(|e| e.to_string())?;
+        writeln!(f, "  vine_type: r_vine").map_err(|e| e.to_string())?;
+        writeln!(f, "  n_free_params: {}", vp.n_free_params()).map_err(|e| e.to_string())?;
+        writeln!(f, "  marginals:").map_err(|e| e.to_string())?;
+        for m in &vp.marginals {
+            writeln!(f, "    - eta: {}", yaml_quote(&m.eta)).map_err(|e| e.to_string())?;
+            writeln!(f, "      family: {}", m.family).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {}", yaml_f64_6(m.mean)).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {}", yaml_f64_6(m.sd)).map_err(|e| e.to_string())?;
+            if let Some(sk) = m.skewness.filter(|v| v.is_finite()) {
+                writeln!(f, "      skewness: {}", yaml_f64_6(sk)).map_err(|e| e.to_string())?;
+            }
+            if let Some(ek) = m.excess_kurtosis.filter(|v| v.is_finite()) {
+                writeln!(f, "      excess_kurtosis: {}", yaml_f64_6(ek))
+                    .map_err(|e| e.to_string())?;
+            }
+            if !m.params.is_empty() {
+                writeln!(f, "      params:").map_err(|e| e.to_string())?;
+                for (k, v) in &m.params {
+                    writeln!(f, "        {k}: {}", yaml_f64_6(*v)).map_err(|e| e.to_string())?;
+                }
+            }
+            let finite_se: Vec<&(String, f64)> =
+                m.se.iter().filter(|(_, v)| v.is_finite()).collect();
+            if !finite_se.is_empty() {
+                writeln!(f, "      se:").map_err(|e| e.to_string())?;
+                for (k, v) in finite_se {
+                    writeln!(f, "        {k}: {}", yaml_f64_6(*v)).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        writeln!(f, "  trees:").map_err(|e| e.to_string())?;
+        for t in &vp.trees {
+            writeln!(f, "    - tree: {}", t.tree).map_err(|e| e.to_string())?;
+            if t.pairs.is_empty() {
+                writeln!(f, "      pairs: []").map_err(|e| e.to_string())?;
+            } else {
+                writeln!(f, "      pairs:").map_err(|e| e.to_string())?;
+                for p in &t.pairs {
+                    let c = &p.copula;
+                    writeln!(f, "        - label: {}", yaml_quote(&p.label))
+                        .map_err(|e| e.to_string())?;
+                    writeln!(f, "          family: {}", c.family).map_err(|e| e.to_string())?;
+                    writeln!(f, "          rotation: {}", c.rotation).map_err(|e| e.to_string())?;
+                    if !c.params.is_empty() {
+                        writeln!(f, "          params:").map_err(|e| e.to_string())?;
+                        for (k, v) in &c.params {
+                            writeln!(f, "            {k}: {}", yaml_f64_6(*v))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    let finite_se: Vec<&(String, f64)> =
+                        c.se.iter().filter(|(_, v)| v.is_finite()).collect();
+                    if !finite_se.is_empty() {
+                        writeln!(f, "          se:").map_err(|e| e.to_string())?;
+                        for (k, v) in finite_se {
+                            writeln!(f, "            {k}: {}", yaml_f64_6(*v))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    writeln!(f, "          kendall_tau: {}", yaml_f64_6(c.kendall_tau))
+                        .map_err(|e| e.to_string())?;
+                    writeln!(f, "          tail_dep_lower: {}", yaml_f64_6(c.tail_dep_lower))
+                        .map_err(|e| e.to_string())?;
+                    writeln!(f, "          tail_dep_upper: {}", yaml_f64_6(c.tail_dep_upper))
+                        .map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -3841,6 +4002,8 @@ mod tests {
             optimizer_stop: None,
             eval_budget_spent: false,
             evaluation_only: false,
+            vine_params: None,
+            vine_corrected_ofv: None,
         }
     }
 
@@ -5221,6 +5384,8 @@ mod tests {
             optimizer_stop: None,
             eval_budget_spent: false,
             evaluation_only: false,
+            vine_params: None,
+            vine_corrected_ofv: None,
         }
     }
 
