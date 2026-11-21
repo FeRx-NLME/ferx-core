@@ -195,21 +195,38 @@ fn fit_reports_the_mixture_rule_for_a_mixture_model() {
 
 #[test]
 fn laplace_mixture_reports_its_stage_optimizer_and_gradient() {
-    use crate::build_info::{gradient_method_outer, GradientMethodKind, BUILD_INFO};
+    use crate::build_info::GradientMethodKind;
+    use crate::types::GradientMethod;
 
-    let mut model = parse(MIXTURE);
+    let model = parse(MIXTURE);
     assert_analytic_scope(&model);
-    let method = EstimationMethod::Laplace;
-    assert_eq!(
-        gradient_method_outer(&BUILD_INFO, method, Optimizer::Bobyqa, &model),
-        GradientMethodKind::NotApplicable
-    );
-
-    model.gradient_method = crate::types::GradientMethod::Fd;
-    let options = FitOptions { method, optimizer: Optimizer::Auto, ..Default::default() };
-    assert_eq!(reported_optimizer_label(method, &options, &model, true), "auto (nlopt_lbfgs)");
-    assert_eq!(
-        gradient_method_outer(&BUILD_INFO, method, options.optimizer, &model),
-        GradientMethodKind::FiniteDifferences
-    );
+    let pop = Population {
+        subjects: vec![subject("1", 1.0), subject("2", 1.2), subject("3", 3.0), subject("4", 2.8)],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    for (optimizer, gradient_method, label, gradient) in [
+        (
+            Optimizer::Auto,
+            GradientMethod::Fd,
+            "auto (nlopt_lbfgs)",
+            GradientMethodKind::FiniteDifferences,
+        ),
+        (Optimizer::Bobyqa, GradientMethod::Auto, "bobyqa", GradientMethodKind::NotApplicable),
+    ] {
+        let options = FitOptions {
+            method: EstimationMethod::Laplace,
+            optimizer,
+            gradient_method,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let result = fit(&model, &pop, &model.default_params, &options).expect("Laplace fit runs");
+        assert_eq!(result.optimizer, label);
+        assert_eq!(result.gradient_method_outer, gradient.as_str());
+    }
 }
