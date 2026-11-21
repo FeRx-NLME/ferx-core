@@ -26,6 +26,7 @@ fn metrics_row(draw: usize, sim: usize, id: &str, dose: f64) -> AdaptiveSubjectM
         subject: id.to_string(),
         draw,
         sim,
+        rep: 1,
         cumulative_dose: dose,
         n_doses: 1,
         n_increases: 0,
@@ -49,6 +50,7 @@ fn decision(draw: usize, sim: usize, id: &str, idx: usize, latent: f64) -> Decis
         subject: id.to_string(),
         draw,
         sim,
+        rep: 1,
         decision_idx: idx,
         time: 24.0 * idx as f64,
         observed_signals: vec![ObservedSignal {
