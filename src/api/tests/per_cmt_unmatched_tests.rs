@@ -493,12 +493,9 @@ fn readout_finding_block(model: &CompiledModel) -> (Option<String>, String) {
     (found[0].block.clone(), found[0].message.clone())
 }
 
-#[test]
-fn a_compartment_free_readout_finding_names_structural_model() {
-    // #1827: a compartment-free model writes `y[CMT=N]` in `[structural_model]`, and
-    // its equations reach the readout through the `[scaling]` pipeline. The finding
-    // named `[scaling]`, a block the file does not have.
-    let m = model_of(
+/// A compartment-free model declaring `y[CMT=1]` and `y[CMT=2]` in `[structural_model]`.
+fn compartment_free_readout_model() -> CompiledModel {
+    model_of(
         "[parameters]
   theta TVB(10.0, 0.1, 100.0)
   theta TVB2(5.0, 0.1, 100.0)
@@ -516,7 +513,15 @@ fn a_compartment_free_readout_finding_names_structural_model() {
 [error_model]
   DV ~ proportional(PROP)
 ",
-    );
+    )
+}
+
+#[test]
+fn a_compartment_free_readout_finding_names_structural_model() {
+    // #1827: a compartment-free model writes `y[CMT=N]` in `[structural_model]`, and
+    // its equations reach the readout through the `[scaling]` pipeline. The finding
+    // named `[scaling]`, a block the file does not have.
+    let m = compartment_free_readout_model();
     assert!(m.is_algebraic(), "fixture must be compartment-free");
     assert_only_live_channel(&m, CmtConsumer::PerCmtReadout);
 
@@ -542,6 +547,36 @@ fn a_compartmental_readout_finding_keeps_the_scaling_label() {
         msg.contains("`[scaling] y[CMT=N]` declares compartment(s) 2 "),
         "a real [scaling] block keeps its own name: {msg}"
     );
+}
+
+/// #1457, the `observed ⊆ declared` direction: an observed compartment with no `y[CMT=N]`
+/// entry is `E_PER_CMT_SCALING` on an analytical and a compartment-free model too, as on
+/// `[odes]`, named in the block the entries are written in. Before, only `ode_spec`'s readout
+/// was checked, so both validated clean and the fit ran to the divergence sentinel.
+/// Observations on the declared CMTs only are the control. Mutations: drop the `analytic_readout`
+/// leg -> no error on either model; flag every observed CMT -> the control is refused.
+#[test]
+fn an_observed_cmt_with_no_readout_entry_is_an_error_on_every_readout() {
+    let pop = population(OBS_CMT_1_2_3);
+    let analytic =
+        per_cmt_analytic_readout_model("  y[CMT=1] = CENTRAL / V\n  y[CMT=2] = CENTRAL / V");
+    for (m, block) in
+        [(analytic, "scaling"), (compartment_free_readout_model(), "structural_model")]
+    {
+        let errs = |pop: &Population| -> Vec<Diagnostic> {
+            crate::api::check_model_data(&m, pop)
+                .into_iter()
+                .filter(|d| d.code == "E_PER_CMT_SCALING")
+                .collect()
+        };
+        let got = errs(&pop);
+        assert_eq!(got.len(), 1, "{block}: {got:?}");
+        assert_eq!(got[0].block.as_deref(), Some(block), "{:?}", got[0]);
+        assert!(got[0].message.starts_with(&format!("[{block}]:")), "{}", got[0].message);
+        assert!(got[0].message.contains("[3]"), "{}", got[0].message);
+        // The control: observations on the declared CMTs only are not refused.
+        assert!(errs(&population(OBS_BOTH_CMTS)).is_empty(), "{block}: covered CMTs refused");
+    }
 }
 
 // ---------------------------------------------------------------------------

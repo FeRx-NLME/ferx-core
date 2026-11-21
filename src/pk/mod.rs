@@ -787,9 +787,13 @@ pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
     }
 }
 
-/// Validate that every observed CMT has an entry in the model's `ScalingSpec::PerCmt` map
-/// (or nested `OdeReadout::PerCmt`). Called once at the top of `fit()`; the error names
-/// every missing CMT. `Ok(())` for non-PerCmt scaling.
+/// Validate that every observed CMT has an entry in the model's `ScalingSpec::PerCmt` map, or
+/// in its per-CMT `y[CMT=N]` readout: an `[odes]` model's `OdeReadout::PerCmt`, or the
+/// `AnalyticReadout` of an analytical or compartment-free model (#1457). Called once at the top
+/// of `fit()`; the error names every missing CMT and opens with the block the entries are
+/// written in (`[structural_model]` on a compartment-free model, `[scaling]` otherwise), which
+/// `api::validation`'s `E_PER_CMT_SCALING` reads back as its block.
+/// `Ok(())` for non-PerCmt scaling.
 pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> Result<(), String> {
     use std::collections::BTreeSet;
 
@@ -814,14 +818,19 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
         }
     }
 
-    // Check OdeReadout::PerCmt coverage (Form C per-CMT).
-    if let Some(ref ode) = model.ode_spec {
-        if let crate::ode::OdeReadout::PerCmt(map) = &ode.readout {
+    // Check OdeReadout::PerCmt coverage (Form C per-CMT): an `[odes]` model's, and an analytical
+    // or compartment-free model's (`AnalyticReadout`, #1457), whose entries a compartment-free
+    // model writes in `[structural_model]` (#1827).
+    let readouts = (model.ode_spec.iter().map(|o| &o.readout))
+        .chain(model.analytic_readout.iter().map(|a| &a.readout));
+    for readout in readouts {
+        if let crate::ode::OdeReadout::PerCmt(map) = readout {
             let missing: Vec<usize> =
                 observed_cmts.iter().copied().filter(|c| !map.contains_key(c)).collect();
             if !missing.is_empty() {
+                let block = if model.is_algebraic() { "[structural_model]" } else { "[scaling]" };
                 return Err(format!(
-                    "[scaling]: per-CMT `y[CMT=N]` Form C is missing entries for observed CMTs {:?}. \
+                    "{block}: per-CMT `y[CMT=N]` Form C is missing entries for observed CMTs {:?}. \
                      Every observed CMT must have a `y[CMT=N]` entry.",
                     missing
                 ));
