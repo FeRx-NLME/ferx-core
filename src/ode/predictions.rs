@@ -6733,7 +6733,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         }
                     };
                     signals.insert(m.name.clone(), value);
-                    observed.push(ObservedSignal { name: m.name.clone(), value, mode: m.mode });
+                    observed.push(ObservedSignal {
+                        name: m.name.clone(),
+                        value,
+                        latent,
+                        mode: m.mode,
+                    });
                 }
 
                 // #945: at a grid point that is not yet due under the dosing interval the
@@ -6842,6 +6847,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 subject: shadow.id.clone(),
                                 draw: 0,
                                 sim: 0,
+                                rep: 0,
                                 dose_idx: ledger.len(),
                                 time: t_start,
                                 amt,
@@ -6896,6 +6902,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 subject: shadow.id.clone(),
                                 draw: 0,
                                 sim: 0,
+                                rep: 0,
                                 dose_idx: ledger.len(),
                                 time: t_start,
                                 amt,
@@ -6952,6 +6959,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     subject: shadow.id.clone(),
                     draw: 0,
                     sim: 0,
+                    rep: 0,
                     decision_idx: decision_index,
                     time: t_start,
                     observed_signals: observed,

@@ -38,6 +38,9 @@ mod ode_loop;
 #[cfg(test)]
 pub(crate) use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
 #[cfg(test)]
+#[path = "kernel_jit_lanes.rs"]
+mod lanes;
+#[cfg(test)]
 #[path = "kernel_jit_plan_tests.rs"]
 mod plan_tests;
 #[path = "kernel_jit_simd.rs"]
@@ -2889,6 +2892,11 @@ pub(crate) fn templates_of(id: u64) -> usize {
 thread_local! {
     /// Native kernels this thread has freed ([`ChunkKernel`]'s drop).
     pub(crate) static KERNELS_FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Native code bytes this thread's kernel compiles emitted (`lower_chunk_opt`), for the
+    /// lane-loop prototype's size comparison (#3080).
+    pub(crate) static NATIVE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Cranelift instructions of the same compiles.
+    pub(crate) static NATIVE_CLIF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Forget the plans of every subject and model in scope `scope`: under the subjects' lock, with
@@ -2913,6 +2921,93 @@ fn drop_scope(scope: u64) {
         lock_families().retain(|k, _| k.scope != scope);
         prune_caches(|sc, _| sc == scope);
     }
+}
+
+/// Release the plans the fit this thread runs holds — at a boundary between two of its phases
+/// (#3077): estimation, the covariance step, the post-fit sensitivity sweep, the ODE tolerance
+/// settle check. Each phase records plans of its own (another layout, another solver override),
+/// which would otherwise all live until the fit's scope ends ([`drop_scope`]), so every later
+/// phase's peak would stack on the estimation plateau instead of replacing it.
+///
+/// Plans are a cache — a template replays what planning would build, bit for bit, and a kept
+/// forward is the forward its plan would run again — so a release costs a later phase a
+/// re-recording, never a value. What is released: the scope's plans, its families' templates,
+/// its kept forwards, and through them the chunk programs (IR and native code) only they ran
+/// ([`ChunkCache`] holds them weakly). What stays: the scope's bad marks and model bad marks
+/// (a subject that failed to plan does not try again) and its failure records, which the fit
+/// reports at its end ([`plan_failure_counts`]).
+///
+/// Then every worker of the pool this thread runs on drops its thread-local buffers and plan
+/// handles ([`release_thread_caches`]), which keep the largest a pass ever needed. Off a pool,
+/// only this thread's. A fit sharing the pool (another start of a multi-start) loses only cached
+/// buffers, which its next pass allocates again. A phase that ran on another pool — the tighter
+/// ODE scope of the covariance step or the settle check — cleared that pool's workers as it
+/// left it (`crate::pool::with_fit_scope_ode`), so no worker anywhere keeps these plans alive.
+///
+/// A no-op outside a registered fit: scope `0`'s plans leave with their model ([`drop_model`]).
+pub(crate) fn release_fit_plans() {
+    let scope = current_fit();
+    if scope == 0 {
+        return;
+    }
+    clear_kept(|k| k.scope == scope);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A bad mark (`None`) stays: the subject's plan failed, and re-trying it each phase would
+    // only fail again.
+    s.retain(|k, v| k.scope != scope || v.is_none());
+    GENERATION.fetch_add(1, Relaxed);
+    drop(s);
+    lock_families().retain(|k, _| k.scope != scope);
+    prune_caches(|sc, _| sc == scope);
+    crate::pool::release_pool_thread_caches();
+}
+
+/// [`release_fit_plans`] when dropped: the fit's last phase boundary, whatever its last plan
+/// consumer was and on every return path. Declared after the fit's registration ([`register`]),
+/// so it drops first, while the thread still runs the fit. Ending the scope ([`drop_scope`])
+/// prunes the shared maps but reaches no worker, whose `LAST` entry and buffers would otherwise
+/// outlive the fit on a cached pool. Not while unwinding: a panic leaves the caches to the
+/// scope's end.
+pub(crate) struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            release_fit_plans();
+        }
+    }
+}
+
+/// How many cached buffers and plan handles this thread holds (test seam): the pass pool,
+/// `LAST`, the hot table's entries and the ODE loop's pools.
+#[cfg(test)]
+pub(crate) fn thread_cache_count() -> usize {
+    POOL.with(|p| p.borrow().len())
+        + LAST.with(|l| usize::from(l.borrow().is_some()))
+        + HOT.with(|h| h.borrow().filled.len())
+        + BUF.with(|b| usize::from(!b.borrow().is_empty()))
+        + VBUF.with(|b| usize::from(!b.borrow().is_empty()))
+        + ode_loop::pooled_buffers()
+}
+
+/// Drop this thread's cached buffers and plan handles: the pass buffers (`BUF`, `VBUF`, `ADJ`,
+/// the pool [`take`] serves), the ODE loop's slot buffers and run logs, and the last-subject and
+/// hot lookup entries, which hold plans. Each is a cache its next user refills. A cell borrowed
+/// right now — a worker that picked this up while waiting inside a pass that holds it — is left
+/// as it is, and so is what depends on it (`LAST_RUN` describes `BUF`).
+pub(crate) fn release_thread_caches() {
+    let freed =
+        BUF.try_with(|b| b.try_borrow_mut().map(|mut b| *b = Vec::new()).is_ok()).unwrap_or(false);
+    if freed {
+        LAST_RUN.with(|c| c.set(None));
+    }
+    for cell in [&VBUF, &ADJ] {
+        let _ = cell.try_with(|c| c.try_borrow_mut().map(|mut v| *v = Vec::new()));
+    }
+    let _ = POOL.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+    let _ = LAST.try_with(|l| l.try_borrow_mut().map(|mut l| *l = None));
+    let _ = HOT.try_with(|h| h.try_borrow_mut().map(|mut h| *h = HotTable::default()));
+    ode_loop::release_thread_buffers();
 }
 
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
@@ -3316,6 +3411,11 @@ pub(crate) fn report() {
         );
         let c = chunk_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         eprintln!("kjit: {} distinct chunk kernels", c.values().map(Vec::len).sum::<usize>());
+        let (sets, bytes) = ode_loop::table_stats();
+        eprintln!(
+            "kjit: {sets} distinct ODE loop slot-table sets ({:.1} KiB)",
+            bytes as f64 / 1024.0
+        );
     }
 }
 
@@ -6257,9 +6357,15 @@ impl Plan {
 /// [`fold`] for a chunk: input `i`'s lanes outside its directions are zero, a seed's own
 /// lane is one; literals carry no tangent.
 fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
+    fold_with(src, chunk_known(layout, spec))
+}
+
+/// The loaded lanes a chunk's inputs fix ([`fold_chunk`]'s `known`): `Some(c)` for a lane that
+/// is the constant `c` at every call.
+fn chunk_known(layout: Layout, spec: &[(DirMask, u16)]) -> impl Fn(u8, u32) -> Option<f64> + '_ {
     let lanes = layout.lanes();
     let n = layout.n as usize;
-    let lane_dir = |lane: usize| -> Option<(usize, usize)> {
+    let lane_dir = move |lane: usize| -> Option<(usize, usize)> {
         // lane 1..=n: direction k; payload lanes: the pair (k, l) of `ir::pairs`' order.
         if lane == 0 {
             None
@@ -6278,7 +6384,7 @@ fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
             None
         }
     };
-    let known = |arg: u8, off: u32| -> Option<f64> {
+    move |arg: u8, off: u32| -> Option<f64> {
         let (idx, lane) = (off as usize / lanes, off as usize % lanes);
         if lane == 0 {
             return None;
@@ -6302,8 +6408,7 @@ fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
             return Some(0.0);
         }
         None
-    };
-    fold_with(src, known)
+    }
 }
 
 /// Kernels above this many instructions are lowered as a chain of segments ([`SegPlan`]). Below
@@ -6841,7 +6946,14 @@ fn lower_chunk_opt(
         for o in reloaded.drain(..) {
             v[o] = None;
         }
+        #[cfg(test)]
+        NATIVE_CLIF.with(|c| c.set(c.get() + ctx.func.dfg.num_insts()));
         module.define_function(id, &mut ctx).ok()?;
+        #[cfg(test)]
+        NATIVE_BYTES.with(|c| {
+            let size = ctx.compiled_code().map_or(0, |cc| cc.code_info().total_size as usize);
+            c.set(c.get() + size)
+        });
         module.clear_context(&mut ctx);
         ids.push(id);
     }

@@ -3934,9 +3934,15 @@ pub(crate) fn run_covariance_step(
     if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
         #[cfg(test)]
         COVARIANCE_STEPS_RUN.lock().unwrap().push(population as *const Population as usize);
-        run_covariance_step_inner(
+        // The step records plans of its own (third-order layouts) and keeps none of the
+        // estimation's: release those before it and its own after it, so its peak replaces
+        // the estimation plateau instead of stacking on it (#3077).
+        crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
+        let out = run_covariance_step_inner(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, options, pre_msg,
-        )
+        );
+        crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
+        out
     } else {
         CovStepOutcome {
             matrix: None,

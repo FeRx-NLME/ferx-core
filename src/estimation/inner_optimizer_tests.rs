@@ -2860,6 +2860,7 @@ mod frozen_ebe_variance {
                     &p.sigma.values,
                     None,
                     frozen,
+                    &mut Vec::new(),
                 )
                 .expect("IOV in scope")
             };

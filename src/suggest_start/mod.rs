@@ -82,8 +82,8 @@ pub fn inits_from_nca(
     // entrypoint; the Sweep/Ebe strategies predict, so guard the modeled-`RATE`
     // dose precondition here too — same loud-not-silent contract as
     // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
-    first_error(&crate::api::check_modeled_dose_rates(model, population))?;
-    first_error(&crate::api::check_dose_compartments(model, population))?;
+    first_error(&crate::model_checks::check_modeled_dose_rates(model, population))?;
+    first_error(&crate::model_checks::check_dose_compartments(model, population))?;
     match method {
         NcaInit::Nca => Ok(nca_only(model, population)),
         NcaInit::Sweep => nca_with_sweep(model, population),

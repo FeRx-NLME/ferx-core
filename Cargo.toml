@@ -55,6 +55,9 @@ readme = "README.md"
 exclude = [
   "data/mbma_naproxen*",
   "examples/mbma_naproxen.ferx",
+  # Regenerates tools/peak-memory/stiff_pkpd.csv (#3081) from repo paths that are
+  # themselves excluded (`tools/*`), so in the tarball it is an example that cannot run.
+  "examples/generate_peak_memory.rs",
   "api/*",
   # Repo infrastructure, not crate content. None of it is needed to build or
   # document the crate, and together it is roughly 7.5 MB of a 19.6 MB tarball.

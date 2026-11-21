@@ -19,7 +19,7 @@
 //!   (`subject_nll`), never a re-derivation — including a `correlation … by` line's dense
 //!   `R` over its blocks, with kappas and nested levels (#2110), which that builder
 //!   carries for the objective already. The gradient is the **total** gradient of each
-//!   subject's term over its own levels ([`crate::api::active_levels`]): the adjoint's
+//!   subject's term over its own levels ([`crate::levels::active_levels`]): the adjoint's
 //!   exact one wherever the production outer gradient is analytic (#2109), otherwise a
 //!   central difference with the EBE re-solved at each point. On a model linear in (η, κ)
 //!   the Newton step is the exact GLS solution and the solve takes one step; otherwise a
@@ -566,7 +566,7 @@ impl ProfileLayout {
         model: &CompiledModel, population: &Population, template: &ModelParameters,
     ) -> Option<Self> {
         let blocks = &model.indiv_param_partials.theta_blocks;
-        let active_levels = crate::api::active_levels(model, population);
+        let active_levels = crate::levels::active_levels(model, population);
         if active_levels.is_empty() {
             return None;
         }

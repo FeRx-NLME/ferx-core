@@ -3,7 +3,7 @@
 //! observations do, and each carries its own level index in its covariate snapshot.
 
 use super::*;
-use crate::api::levels::{level_index_finding, LevelIndexFinding};
+use crate::levels::{level_index_finding, LevelIndexFinding};
 use crate::types::{ObsRecord, ParsedModel};
 
 /// The binary MBMA shape of #2111's B1, small: one subject per study, an arm covariate
@@ -418,7 +418,7 @@ fn a_dtmm_chains_first_record_reads_no_level() {
     }
     crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
         .unwrap_or_else(|e| panic!("DTMM records define the levels: {e}"));
-    let found = crate::api::levels::one_subject_levels(&parsed.model, &pop);
+    let found = crate::levels::one_subject_levels(&parsed.model, &pop);
     assert_eq!(found.len(), 1, "{found:?}");
     let (block, single, n) = &found[0];
     assert_eq!((block.as_str(), *n), ("PLACEBO", 12));
@@ -612,7 +612,7 @@ fn the_unindexed_refusal_names_the_records_that_define_levels() {
     let mut fitted = fit_pop(with_event);
     crate::api::bind_theta_levels(&mut parsed, text, &mut fitted).expect("studies 1 and 2 bind");
     let mut reread = fit_pop(pop.subjects.clone());
-    let err = crate::api::levels::write_fitted_level_columns(
+    let err = crate::levels::write_fitted_level_columns(
         &parsed.model,
         &mut reread,
         &parsed.model.data_bindings().levels,
@@ -893,7 +893,7 @@ fn bind_read(rows: Rows, read: Read, records: bool) -> Result<(), crate::diagnos
     let text = read_model(rows, read);
     let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{rows:?}/{read:?}: {e}"));
     let mut pop = read_population(rows, records);
-    crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+    crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
 }
 
 /// The sentences of the #2623 refusal, each asserted on its own so deleting any one
@@ -1106,7 +1106,7 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
             }
         }
     }
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("no Gaussian rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert_bare_read_refusal("y bare", &d.message, false, true);
@@ -1132,7 +1132,7 @@ fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
         "fixture precondition: read bare by the hazard alone"
     );
     let mut pop = read_population(Rows::Binary, true);
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("a hazard defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert_bare_read_refusal("hazard bare", &d.message, false, true);
@@ -1163,7 +1163,7 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
 ";
     let mut parsed = parse_full_model(ctmm).unwrap();
     let mut pop = state_population();
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
         .expect_err("a CTMM defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     // #2808: its records are all on the CTMM, so no reader could define a level.
@@ -1195,7 +1195,7 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
         "fixture precondition: the CMT-1 DTMM reads the block"
     );
     let mut pop = state_population();
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
         .expect_err("no record on CMT 1");
     assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true, true);
 }
@@ -1329,7 +1329,7 @@ fn record_kind_cells() {
             let cell = format!("{kinds:?} × {reader:?}");
             let bind = |pop: &mut Population| {
                 let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{cell}: {e}"));
-                crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, pop)
+                crate::levels::bind_theta_levels_diag(&mut parsed, &text, pop)
             };
             let d = bind(&mut records_population(kinds)).expect_err(&cell);
             assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
@@ -1534,7 +1534,7 @@ fn ctmm_records_define_no_level_cells() {
                 });
             }
             let mut parsed = parse_full_model(&text).unwrap();
-            let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+            let d = crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
                 .expect_err(&cell);
             assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
             let m = &d.message;
@@ -1585,7 +1585,7 @@ fn count_records_on_a_count_endpoint_are_level_capable() {
     let message = |text: &str| {
         let mut parsed = parse_full_model(text).unwrap();
         let mut pop = records_population(Kinds { discrete: false, events: false, counts: true });
-        crate::api::levels::bind_theta_levels_diag(&mut parsed, text, &mut pop)
+        crate::levels::bind_theta_levels_diag(&mut parsed, text, &mut pop)
             .expect_err("no level")
             .message
     };

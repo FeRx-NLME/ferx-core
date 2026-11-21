@@ -65,7 +65,7 @@
 50 lib:api
 49 lib:estimation::bayes
 36 lib:estimation::run_covariance
-35 lib:api::levels
+35 lib:levels
 25 lib:estimation::vi::elbo
 20 lib:estimation::mixture
 18 lib:api::fit

@@ -480,6 +480,7 @@ Docs live in `docs/` as a [Quarto](https://quarto.org/) website:
 
 - `docs/**/*.qmd` — Quarto source pages. **These are the only docs files you edit or commit.**
 - `docs/_quarto.yml` — Quarto website configuration and sidebar; new pages must be added here to show up in the site navigation.
+- `docs/llms.txt` — the curated index for language models (#3073), published at the site root by the post-render script `docs/_llms.py`, which also builds `llms-full.txt` from the per-page `.llms.md` twins Quarto writes (`website: llms-txt: true`). Its links are absolute site URLs, checked by docs-lint R4; a new user-facing page worth an agent's attention gets a line there. The user-facing counterpart of this file is `docs/agents.qmd`.
 - `docs/_site/` — built HTML. **Generated, git-ignored, and never committed.** CI builds and deploys it: the `Deploy Docs` workflow (`.github/workflows/docs.yml`) runs `quarto render docs` and publishes to the `gh-pages` branch on every push to `main` that touches `docs/**`. Do **not** commit rendered output (you may still build locally to preview — the result stays untracked).
 - Styling and branding should stay aligned with the main Quarto site in `../ferx-nlme.github.io` (shared `assets/ferx.scss`, `assets/ferx-dark.scss`, `_brand.yml`, logo assets, and `styles.css`).
 
@@ -566,7 +567,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `ode/solver.rs` | `Stepper` abstraction + shared integration drivers; the Dormand-Prince RK45 stepper (default method) |
 | `ode/rosenbrock.rs` | Linearly implicit Rosenbrock steppers (`rosenbrock23`/`rodas4`/`rodas5p`) for stiff systems — same `Stepper` trait, so every feature works with every method |
 | `ode/predictions.rs` | ODE-based predictions with dose event handling |
-| `pool.rs`, `entry_refusals.rs` | Fit-scoped Rayon pools and the coded entry refusals; crate-level, not in `api/`, so code below `api` uses them without depending on it (#3041) |
+| `pool.rs`, `entry_refusals.rs`, `levels.rs`, `covariate_stats.rs`, `occasions.rs` | Fit-scoped pools, coded entry refusals, nested-level and covariate-statistic binding, IOV occasion rules: crate-level, not in `api/`, so code below `api` uses them without depending on it (#3041) |
 | `dosing.rs` | Neutral dose-resolution (`resolve_subject_doses`, #324) + SS-equilibration policy (`SS_EQUILIBRATION_CYCLES`, `SsStopTracker`) — the single home shared by pk/ode/sens |
 | `estimation/gauss_newton.rs` | Gauss-Newton (BHHH) trust-region optimizer; pure GN and GN+FOCEI hybrid |
 | `estimation/trust_region.rs` | Newton trust-region outer optimizer (argmin + Steihaug CG); FD gradient & Hessian with fixed EBEs |

@@ -145,6 +145,10 @@ fn tte_npde_skipped_warning(why: &EngineError) -> String {
 }
 
 #[cfg(test)]
+#[path = "tests/phase_release_tests.rs"]
+mod phase_release_tests;
+
+#[cfg(test)]
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
 mod dw_autocorrelation_warning_tests;
 
@@ -1688,6 +1692,10 @@ fn fit_inner(
     // The plans' keys read this fit's fingerprints instead of hashing per lookup.
     let _prints =
         crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
+    // The fit's last phase boundary (#3077): whatever the last plan consumer is — the settle
+    // check applies to integrated models only — the plans and every worker's caches go here,
+    // before the registration above ends the scope.
+    let _release_last_phase = crate::parser::model_parser::rhs_regcode::kernel_jit::ReleaseOnDrop;
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -2865,6 +2873,9 @@ fn fit_inner(
     }
 
     let mut result = result.expect("method chain must have at least one stage");
+    // Estimation is over: its plans go before the post-fit phases record their own, so the
+    // post-fit peak replaces the estimation plateau instead of stacking on it (#3077).
+    crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
     // Overwrite with chain-aware totals
     result.n_iterations = total_iterations;
 
@@ -3555,18 +3566,30 @@ fn fit_inner(
     // both are out of scope.
     {
         use crate::estimation::ode_tolerance_check as otc;
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans;
         // The owner's options are recorded by every stage this check can re-score; an
         // `imp_eval_only` owner records none and is out of scope anyway.
         let stage = objective_stage_opts.filter(|o| otc::method_in_scope(o.method));
         if let (Some(stage), None) = (stage, &result.mixture_posteriors) {
-            match otc::ofv_tolerance_shift(
+            // The check re-records every subject at a tighter solver override, which a plan
+            // carries (`Plan::ode_override`): it starts from no plans of the phases before it
+            // (SIR's draws, the output columns) and leaves none behind (#3077).
+            let applies = otc::tightened_override(model, &stage).is_some();
+            if applies {
+                release_fit_plans();
+            }
+            let shift = otc::ofv_tolerance_shift(
                 model,
                 population,
                 &result.params,
                 &result.eta_hats,
                 &result.kappas,
                 &stage,
-            ) {
+            );
+            if applies {
+                release_fit_plans();
+            }
+            match shift {
                 Some(Ok(shift)) => {
                     if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)
                     {
