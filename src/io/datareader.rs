@@ -41,15 +41,7 @@ impl SelectionFilter {
     /// clause (standard NONMEM columns excluded), so the reader reads an undeclared
     /// filtered column instead of the clause silently never firing.
     pub fn referenced_covariate_columns(&self) -> Vec<String> {
-        let mut cols: Vec<String> = Vec::new();
-        for clause in self.ignore.iter().chain(self.accept.iter()) {
-            for c in clause.covariate_columns() {
-                if !cols.iter().any(|existing| existing == c) {
-                    cols.push(c.to_string());
-                }
-            }
-        }
-        cols
+        covariate_columns_of(self.ignore.iter().chain(self.accept.iter()))
     }
 
     /// True when any ignore/accept clause reads `col` (case-insensitive; standard
@@ -128,6 +120,17 @@ impl SelectionFilter {
             .map(Excluder::Ignore)
             .or_else(|| self.accept.iter().find(depends).map(Excluder::Accept))
     }
+}
+
+/// De-duplicated, lowercased covariate columns `clauses` reference, in first-appearance order.
+fn covariate_columns_of<'a>(clauses: impl Iterator<Item = &'a FilterClause>) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    for c in clauses.flat_map(FilterClause::covariate_columns) {
+        if !cols.iter().any(|existing| existing == c) {
+            cols.push(c.to_string());
+        }
+    }
+    cols
 }
 
 /// Which rule removed a record — the answer [`SelectionFilter::first_excluding_rule`]
@@ -904,16 +907,16 @@ fn read_nonmem_csv_impl(
         .collect();
 
     // A filter on a covariate column absent from the data can never fire (often a
-    // typo, e.g. `ignore = Coment`); collect those names and warn once below.
-    // ID is never a covariate.
-    let filter_absent_cols: Vec<String> = filter
-        .map(|f| {
-            f.referenced_covariate_columns()
-                .into_iter()
-                .filter(|c| c != "id" && col_idx_cs(c).is_none() && col_idx_ci(c).is_none())
-                .collect()
-        })
-        .unwrap_or_default();
+    // typo, e.g. `ignore = Coment`); collect those names and warn once below, per key:
+    // a clause that never fires excludes nothing under `ignore` and every record under
+    // `accept` (#1492).
+    let absent_in = |clauses: &[FilterClause]| -> Vec<String> {
+        let mut cols = covariate_columns_of(clauses.iter());
+        cols.retain(|c| col_idx_cs(c).is_none() && col_idx_ci(c).is_none());
+        cols
+    };
+    let (absent_ignore, absent_accept) =
+        filter.map_or_else(Default::default, |f| (absent_in(&f.ignore), absent_in(&f.accept)));
 
     // Optional covariate table over the *declared* covariates. Every declared
     // column must exist — otherwise it would silently vanish and evaluate to
@@ -1006,12 +1009,24 @@ fn read_nonmem_csv_impl(
     let mut total_amt_ignored: usize = 0;
     let mut subjects_with_amt_ignored: usize = 0;
     let mut population_warnings: Vec<String> = Vec::new();
-    if !filter_absent_cols.is_empty() {
+    let mut absent = absent_ignore.clone();
+    absent.extend(absent_accept.iter().filter(|c| !absent_ignore.contains(c)).cloned());
+    if !absent.is_empty() {
+        let mut effects = String::new();
+        for (cols, key, what) in
+            [(&absent_ignore, "ignore", "nothing"), (&absent_accept, "accept", "every record")]
+        {
+            if !cols.is_empty() {
+                let cols = cols.join(", ");
+                effects += &format!(
+                    " The `{key}` conditions on {cols} never match, so they exclude {what}."
+                );
+            }
+        }
         population_warnings.push(format!(
             "W_FILTER_COLUMN_ABSENT: data-selection filter references column(s) not found in the \
-             data: {}. These conditions never match, so no rows are excluded for them — check for \
-             a typo in the column name. Available columns: {}.",
-            filter_absent_cols.join(", "),
+             data: {}.{effects} Check for a typo in the column name. Available columns: {}.",
+            absent.join(", "),
             headers.join(", ")
         ));
     }
