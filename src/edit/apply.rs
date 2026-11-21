@@ -1467,6 +1467,49 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             );
         }
     }
+    // A `[covariate_model]` coefficient has no `[parameters]` line unless the modeller wrote
+    // one (#2864). Each fitted one goes into its relation's `=>` clause as `NAME(estimate)`,
+    // which keeps the form's default bounds; a part that states its bounds keeps them.
+    let declared: HashSet<String> = text
+        .logical_lines("parameters")
+        .iter()
+        .filter_map(|(_, c)| THETA_RE.captures(c).map(|m| m[2].to_string()))
+        .collect();
+    for (span, code) in text.logical_lines("covariate_model") {
+        let (body, clause) = code.split_once("=>").unwrap_or((&code, ""));
+        let Some((param, rest)) = body.split_once('~') else { continue };
+        let cov = rest.split_whitespace().next().unwrap_or("");
+        let Some(rel) = fit
+            .covariate_relations
+            .iter()
+            .find(|r| r.parameter == param.trim() && r.covariate == cov)
+        else {
+            continue;
+        };
+        if rel.thetas.is_empty()
+            || rel
+                .thetas
+                .iter()
+                .any(|t| t.fixed || !t.estimate.is_finite() || declared.contains(&t.name))
+        {
+            continue;
+        }
+        let stated: HashMap<String, String> =
+            crate::parser::model_parser::split_top_level_args(clause)
+                .iter()
+                .filter_map(|p| p.trim().strip_suffix(')')?.split_once('('))
+                .map(|(n, a)| (n.trim().to_string(), a.to_string()))
+                .collect();
+        let parts: Vec<String> = rel
+            .thetas
+            .iter()
+            .map(|t| match stated.get(&t.name).and_then(|a| a.split_once(',')) {
+                Some((_, bounds)) => format!("{}({}, {})", t.name, num(t.estimate), bounds.trim()),
+                None => format!("{}({})", t.name, num(t.estimate)),
+            })
+            .collect();
+        stale.extend(text.set_span(&span, &format!("{} => {}", body.trim_end(), parts.join(", "))));
+    }
     text.delete_lines(stale);
     Ok(())
 }
