@@ -52,11 +52,7 @@ type Rec = (f64, u32, f64, f64);
 
 /// #1810's seven cases, each a subject, with every time shifted by `t0`.
 fn cases(t0: f64) -> Vec<(&'static str, Vec<Rec>)> {
-    let c = |v: Vec<Rec>| {
-        v.into_iter()
-            .map(|(t, e, x, a)| (t + t0, e, x, a))
-            .collect()
-    };
+    let c = |v: Vec<Rec>| v.into_iter().map(|(t, e, x, a)| (t + t0, e, x, a)).collect();
     vec![
         (
             "1 obs, EVID=2",
@@ -114,11 +110,7 @@ fn cases(t0: f64) -> Vec<(&'static str, Vec<Rec>)> {
         ),
         (
             "7 obs1, obs2 (control)",
-            c(vec![
-                (0.0, 1, 1.0, 100.0),
-                (4.0, 0, 1.0, 0.0),
-                (4.0, 0, 3.0, 0.0),
-            ]),
+            c(vec![(0.0, 1, 1.0, 100.0), (4.0, 0, 1.0, 0.0), (4.0, 0, 3.0, 0.0)]),
         ),
     ]
 }
@@ -131,11 +123,8 @@ const MDV1: u32 = 100;
 /// of the tie pass that the seven cannot see, and carries the record order the engines would
 /// use if that choice were wrong, so the test can assert the case straddles it.
 fn review_cases(t0: f64) -> Vec<(&'static str, Vec<Rec>, Vec<Rec>)> {
-    let c = |v: Vec<Rec>| -> Vec<Rec> {
-        v.into_iter()
-            .map(|(t, e, x, a)| (t + t0, e, x, a))
-            .collect()
-    };
+    let c =
+        |v: Vec<Rec>| -> Vec<Rec> { v.into_iter().map(|(t, e, x, a)| (t + t0, e, x, a)).collect() };
     let (d0, end) = ((0.0, 1, 1.0, 100.0), (8.0, 0, 3.0, 0.0));
     let (d1, p, d2) = ((4.0, 1, 3.0, 50.0), (4.0, 2, 2.0, 0.0), (4.0, 1, 4.0, 30.0));
     let (p1, o, p2) = ((4.0, 2, 2.0, 0.0), (4.0, 0, 1.0, 0.0), (4.0, 2, 3.0, 0.0));
@@ -143,31 +132,15 @@ fn review_cases(t0: f64) -> Vec<(&'static str, Vec<Rec>, Vec<Rec>)> {
     vec![
         // The first dose at the tie decides whether the pk-only row is ahead of the doses:
         // taking the last one (`.max()`) moves P below D1.
-        (
-            "8 dose1, EVID=2, dose2",
-            c(vec![d0, d1, p, d2, end]),
-            c(vec![d0, p, d1, d2, end]),
-        ),
+        ("8 dose1, EVID=2, dose2", c(vec![d0, d1, p, d2, end]), c(vec![d0, p, d1, d2, end])),
         // The first pk-only row at the tie is the one compared: taking the last one
         // (`rposition`) finds the observation ahead of it and moves the observation.
-        (
-            "9 EVID=2, obs, EVID=2",
-            c(vec![d0, p1, o, p2, end]),
-            c(vec![d0, o, p1, p2, end]),
-        ),
+        ("9 EVID=2, obs, EVID=2", c(vec![d0, p1, o, p2, end]), c(vec![d0, o, p1, p2, end])),
         // ...and is the one moved below a dose: the last one would govern instead.
-        (
-            "10 EVID=2, EVID=2, dose",
-            c(vec![d0, p1, p2, d1, end]),
-            c(vec![d0, p2, p1, d1, end]),
-        ),
+        ("10 EVID=2, EVID=2, dose", c(vec![d0, p1, p2, d1, end]), c(vec![d0, p2, p1, d1, end])),
         // `EVID=0, MDV=1` twins of cases 1 and 6: the same pk-only record, spelled as a
         // missing observation.
-        (
-            "11 obs, MDV=1",
-            c(vec![d0, o_m, m, end]),
-            c(vec![d0, m, o_m, end]),
-        ),
+        ("11 obs, MDV=1", c(vec![d0, o_m, m, end]), c(vec![d0, m, o_m, end])),
         (
             "12 MDV=1, dose",
             c(vec![d0, m, (4.0, 1, 3.0, 50.0), end]),
@@ -181,9 +154,7 @@ fn review_cases(t0: f64) -> Vec<(&'static str, Vec<Rec>, Vec<Rec>)> {
 /// amount; an observation reads the state. `advance(a, x, dt)` is the model's exact
 /// propagator, `read(a, x)` its readout.
 fn nonmem_reference(
-    recs: &[Rec],
-    advance: impl Fn(f64, f64, f64) -> f64,
-    read: impl Fn(f64, f64) -> f64,
+    recs: &[Rec], advance: impl Fn(f64, f64, f64) -> f64, read: impl Fn(f64, f64) -> f64,
 ) -> Vec<f64> {
     let (mut a, mut t_prev, mut out) = (0.0, recs[0].0, Vec::new());
     for &(t, evid, x, amt) in recs {
@@ -205,11 +176,7 @@ fn ode_reference(recs: &[Rec]) -> Vec<f64> {
 
 /// Analytical: `dA/dt = −(2·X/10)·A`, readout `A / 10`.
 fn pk_reference(recs: &[Rec]) -> Vec<f64> {
-    nonmem_reference(
-        recs,
-        |a, x, dt| a * (-(0.2 * x) * dt).exp(),
-        |a, _| a / 10.0,
-    )
+    nonmem_reference(recs, |a, x, dt| a * (-(0.2 * x) * dt).exp(), |a, _| a / 10.0)
 }
 
 fn csv_of(cases: &[(&str, Vec<Rec>)]) -> String {
@@ -217,16 +184,8 @@ fn csv_of(cases: &[(&str, Vec<Rec>)]) -> String {
     for (i, (_, recs)) in cases.iter().enumerate() {
         for &(t, evid, x, amt) in recs {
             // `{:?}` keeps every digit of `4.000001` and `17524.0`, so the tie is exact.
-            let amt = if evid == 1 {
-                format!("{amt:?}")
-            } else {
-                ".".to_string()
-            };
-            let (evid, mdv) = if evid == MDV1 {
-                (0, 1)
-            } else {
-                (evid, u32::from(evid != 0))
-            };
+            let amt = if evid == 1 { format!("{amt:?}") } else { ".".to_string() };
+            let (evid, mdv) = if evid == MDV1 { (0, 1) } else { (evid, u32::from(evid != 0)) };
             s.push_str(&format!("{},{t:?},0,{evid},{mdv},{amt},1,{x:?}\n", i + 1));
         }
     }
@@ -243,27 +202,15 @@ fn preds_by_subject(model: &CompiledModel, pop: &Population) -> Vec<Vec<f64>> {
     let rows = predict(model, pop, &model.default_params).expect("predict");
     pop.subjects
         .iter()
-        .map(|s| {
-            rows.iter()
-                .filter(|r| r.id == s.id)
-                .map(|r| r.pred)
-                .collect()
-        })
+        .map(|s| rows.iter().filter(|r| r.id == s.id).map(|r| r.pred).collect())
         .collect()
 }
 
 /// Finite first, then within `tol` of `want`, with the worst error in the message.
 fn assert_close(label: &str, got: &[f64], want: &[f64], tol: f64) {
     assert_eq!(got.len(), want.len(), "{label}: row count");
-    assert!(
-        got.iter().all(|v| v.is_finite()),
-        "{label}: non-finite {got:?}"
-    );
-    let worst = got
-        .iter()
-        .zip(want)
-        .map(|(g, w)| (g - w).abs())
-        .fold(0.0, f64::max);
+    assert!(got.iter().all(|v| v.is_finite()), "{label}: non-finite {got:?}");
+    let worst = got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
     assert!(
         worst < tol,
         "{label}: got {got:?}, NONMEM convention {want:?} (worst |error| {worst:.3e})"
@@ -296,18 +243,8 @@ fn the_closed_form_reference_is_nonmems() {
     // triage table at its 5 printed significant figures. Case 3's `+1e-6` moves the ODE
     // values by O(1e-6) and the ADVAN1 ones by less, inside the print.
     for (i, (label, recs)) in cases(0.0).iter().enumerate() {
-        assert_close(
-            &format!("ODE {label}"),
-            &ode_reference(recs),
-            NONMEM_ODE[i],
-            1e-5,
-        );
-        assert_close(
-            &format!("ADVAN1 {label}"),
-            &pk_reference(recs),
-            NONMEM_PK[i],
-            6e-6,
-        );
+        assert_close(&format!("ODE {label}"), &ode_reference(recs), NONMEM_ODE[i], 1e-5);
+        assert_close(&format!("ADVAN1 {label}"), &pk_reference(recs), NONMEM_PK[i], 6e-6);
     }
 }
 
@@ -317,23 +254,14 @@ fn check_all_cases(model_src: &str, reference: fn(&[Rec]) -> Vec<f64>, t0: f64, 
 }
 
 fn check_cases(
-    model_src: &str,
-    reference: fn(&[Rec]) -> Vec<f64>,
-    cs: &[(&str, Vec<Rec>)],
-    t0: f64,
-    tol: f64,
+    model_src: &str, reference: fn(&[Rec]) -> Vec<f64>, cs: &[(&str, Vec<Rec>)], t0: f64, tol: f64,
 ) {
     let model = parse_model_string(model_src).expect("parse");
     let pop = population(cs);
-    for (s, ((label, recs), got)) in pop
-        .subjects
-        .iter()
-        .zip(cs.iter().zip(preds_by_subject(&model, &pop)))
+    for (s, ((label, recs), got)) in
+        pop.subjects.iter().zip(cs.iter().zip(preds_by_subject(&model, &pop)))
     {
-        assert!(
-            s.has_tv_covariates(),
-            "{label}: X must vary, so the EVID=2 rows carry snapshots"
-        );
+        assert!(s.has_tv_covariates(), "{label}: X must vary, so the EVID=2 rows carry snapshots");
         assert_close(&format!("{label} (t0 = {t0})"), &got, &reference(recs), tol);
     }
 }
@@ -365,10 +293,7 @@ fn ties_follow_file_order_at_large_time() {
 
 /// The review cases as `(label, file-order records)`.
 fn review_file_order(t0: f64) -> Vec<(&'static str, Vec<Rec>)> {
-    review_cases(t0)
-        .into_iter()
-        .map(|(label, file, _)| (label, file))
-        .collect()
+    review_cases(t0).into_iter().map(|(label, file, _)| (label, file)).collect()
 }
 
 #[test]
@@ -376,16 +301,11 @@ fn review_ties_follow_file_order() {
     // Each case must straddle its wrong order on both models, or it cannot see the choice
     // it pins: the closed form in file order and in the wrong order differ by at least 0.1.
     for (label, file, wrong) in review_cases(0.0) {
-        for (model, reference) in [
-            ("ODE", ode_reference as fn(&[Rec]) -> Vec<f64>),
-            ("ADVAN1", pk_reference),
-        ] {
+        for (model, reference) in
+            [("ODE", ode_reference as fn(&[Rec]) -> Vec<f64>), ("ADVAN1", pk_reference)]
+        {
             let (want, other) = (reference(&file), reference(&wrong));
-            let gap = want
-                .iter()
-                .zip(&other)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f64::max);
+            let gap = want.iter().zip(&other).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
             assert!(
                 want.iter().chain(&other).all(|v| v.is_finite()) && gap > 0.1,
                 "{model} {label}: file order {want:?} and wrong order {other:?} differ by \
@@ -417,20 +337,10 @@ fn the_analytic_providers_value_follows_file_order() {
         let o = crate::sens::provider::subject_eta_grad(&ode, s, &ode.default_params.theta, &[0.0])
             .unwrap_or_else(|| panic!("{label}: ODE model in analytic scope"));
         let f: Vec<f64> = o.iter().map(|x| x.f).collect();
-        assert_close(
-            &format!("ODE provider {label}"),
-            &f,
-            &ode_reference(recs),
-            1e-9,
-        );
+        assert_close(&format!("ODE provider {label}"), &f, &ode_reference(recs), 1e-9);
         let a = crate::sens::provider::subject_eta_grad(&pk, s, &pk.default_params.theta, &[0.0])
             .unwrap_or_else(|| panic!("{label}: analytical model in analytic scope"));
         let f: Vec<f64> = a.iter().map(|x| x.f).collect();
-        assert_close(
-            &format!("analytic provider {label}"),
-            &f,
-            &pk_reference(recs),
-            1e-12,
-        );
+        assert_close(&format!("analytic provider {label}"), &f, &pk_reference(recs), 1e-12);
     }
 }

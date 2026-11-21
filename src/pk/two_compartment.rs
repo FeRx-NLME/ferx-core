@@ -46,14 +46,7 @@ pub fn two_cpt_oral(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64,
 
 #[inline]
 pub fn two_cpt_oral_f(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    ka: f64,
-    f_bio: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64, f_bio: f64,
 ) -> f64 {
     two_cpt_oral_g::<f64>(dose.amt, t, cl, v1, q, v2, ka, f_bio)
 }
@@ -64,15 +57,7 @@ pub fn two_cpt_oral_f(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_transit_f(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    n: f64,
-    mtt: f64,
-    f_bio: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, n: f64, mtt: f64, f_bio: f64,
 ) -> f64 {
     two_cpt_transit_g::<f64>(dose.amt, t, cl, v1, q, v2, n, mtt, f_bio)
 }
@@ -100,14 +85,8 @@ fn guard_then<T>(domain_ok: Option<T>, f: impl FnOnce() -> f64) -> f64 {
 /// (confluent `α = β` / flip-flop) — mirrors the central guards.
 #[allow(clippy::too_many_arguments)]
 fn two_cpt_absorption_peripheral<A: TiltedAbsorption<f64>>(
-    abs: &A,
-    domain_ok: Option<(f64, f64, f64)>,
-    dose: &DoseEvent,
-    tau: f64,
-    q: f64,
-    v1: f64,
-    v2: f64,
-    f_bio: f64,
+    abs: &A, domain_ok: Option<(f64, f64, f64)>, dose: &DoseEvent, tau: f64, q: f64, v1: f64,
+    v2: f64, f_bio: f64,
 ) -> f64 {
     if tau < 0.0 || dose.is_infusion() {
         return 0.0;
@@ -130,15 +109,7 @@ fn two_cpt_absorption_peripheral<A: TiltedAbsorption<f64>>(
 /// collapse to 0 (#634 review finding 4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_transit_depot(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    n: f64,
-    mtt: f64,
-    f_bio: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q: f64, v2: f64, n: f64, mtt: f64, f_bio: f64,
 ) -> f64 {
     guard_then(transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt), || {
         one_cpt_transit_depot(dose, tau, n, mtt, f_bio)
@@ -153,15 +124,7 @@ pub(crate) fn two_cpt_transit_depot(
 /// confluent `α = β` edge, or flip-flop `α ≥ KTR` (mirrors the central guards).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_transit_peripheral(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    n: f64,
-    mtt: f64,
-    f_bio: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q: f64, v2: f64, n: f64, mtt: f64, f_bio: f64,
 ) -> f64 {
     // Same shared disposition-domain guard as the central path (#634 finding 7).
     two_cpt_absorption_peripheral(
@@ -182,15 +145,7 @@ pub(crate) fn two_cpt_transit_peripheral(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_ig_f(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    mat: f64,
-    cv2: f64,
-    f_bio: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, mat: f64, cv2: f64, f_bio: f64,
 ) -> f64 {
     two_cpt_ig_g::<f64>(dose.amt, t, cl, v1, q, v2, mat, cv2, f_bio)
 }
@@ -204,15 +159,7 @@ pub fn two_cpt_ig_f(
 /// and peripheral closed forms both collapse to 0.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_ig_depot(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    mat: f64,
-    cv2: f64,
-    f_bio: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q: f64, v2: f64, mat: f64, cv2: f64, f_bio: f64,
 ) -> f64 {
     guard_then(ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2), || {
         one_cpt_ig_depot(dose, tau, mat, cv2, f_bio)
@@ -227,21 +174,10 @@ pub(crate) fn two_cpt_ig_depot(
 /// (mirrors the central guards).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_ig_peripheral(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    mat: f64,
-    cv2: f64,
-    f_bio: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q: f64, v2: f64, mat: f64, cv2: f64, f_bio: f64,
 ) -> f64 {
     two_cpt_absorption_peripheral(
-        &IgAbsorption {
-            mat,
-            lambda: mat / cv2,
-        },
+        &IgAbsorption { mat, lambda: mat / cv2 },
         ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2),
         dose,
         tau,
@@ -254,13 +190,7 @@ pub(crate) fn two_cpt_ig_peripheral(
 
 /// Predict concentration from a single dose at elapsed time t using 2-cmt model.
 pub fn two_cpt_predict(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    ka: Option<f64>,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: Option<f64>,
     f_bio: Option<f64>,
 ) -> f64 {
     if dose.is_infusion() {
@@ -289,30 +219,13 @@ pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v
 /// overlapping pulses (`T_inf > II`). Evaluated at phase `t ∈ [0, II)`.
 #[inline]
 pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    two_cpt_infusion_ss_g::<f64>(
-        dose.rate,
-        dose.duration,
-        dose.amt,
-        t,
-        dose.ii,
-        cl,
-        v1,
-        q,
-        v2,
-    )
+    two_cpt_infusion_ss_g::<f64>(dose.rate, dose.duration, dose.amt, t, dose.ii, cl, v1, q, v2)
 }
 
 /// Two-compartment oral absorption at steady state (with bioavailability).
 #[inline]
 pub fn two_cpt_oral_f_ss(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    ka: f64,
-    f_bio: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64, f_bio: f64,
 ) -> f64 {
     two_cpt_oral_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q, v2, ka, f_bio)
 }
@@ -320,13 +233,7 @@ pub fn two_cpt_oral_f_ss(
 /// Two-compartment oral absorption at steady state (F = 1).
 #[inline]
 pub fn two_cpt_oral_ss(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    ka: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64,
 ) -> f64 {
     two_cpt_oral_f_ss(dose, t, cl, v1, q, v2, ka, 1.0)
 }
@@ -339,12 +246,7 @@ pub fn two_cpt_oral_ss(
 /// Derivation: C2(t) = k12/v2/diff * dose.amt * (exp(-β·t) − exp(-α·t))  for bolus.
 /// Infusion uses the convolution integral; SS uses geometric-series factor.
 pub(crate) fn two_cpt_iv_peripheral(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q: f64, v2: f64,
 ) -> f64 {
     if tau < 0.0 {
         return 0.0;
@@ -397,14 +299,7 @@ fn peripheral_modes(cl: f64, v1: f64, q: f64, v2: f64) -> Option<[(f64, f64); 2]
 /// ([`crate::sens::num::bateman`], smooth through `ka = α, β`):
 ///   C2(τ) = (q/v2)·D · (B(β, ka, τ) − B(α, ka, τ))/(α − β)
 pub(crate) fn two_cpt_oral_peripheral(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q: f64,
-    v2: f64,
-    ka: f64,
-    f_bio: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64, f_bio: f64,
 ) -> f64 {
     if tau < 0.0 {
         return 0.0;
@@ -459,41 +354,20 @@ mod tests {
         assert!(two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, n, mtt, 1.0) > 0.0);
         assert!(two_cpt_transit_peripheral(&d, 2.0, cl, v1, q, v2, n, mtt, 1.0) > 0.0);
         // Depot guards: tau<0, n<0, mtt≤0, infusion ⇒ 0.
-        assert_eq!(
-            two_cpt_transit_depot(&d, -1.0, cl, v1, q, v2, n, mtt, 1.0),
-            0.0
-        );
-        assert_eq!(
-            two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, -1.0, mtt, 1.0),
-            0.0
-        );
-        assert_eq!(
-            two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, n, 0.0, 1.0),
-            0.0
-        );
+        assert_eq!(two_cpt_transit_depot(&d, -1.0, cl, v1, q, v2, n, mtt, 1.0), 0.0);
+        assert_eq!(two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, -1.0, mtt, 1.0), 0.0);
+        assert_eq!(two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, n, 0.0, 1.0), 0.0);
         assert_eq!(
             two_cpt_transit_depot(&infusion_dose(100.0, 50.0), 2.0, cl, v1, q, v2, n, mtt, 1.0),
             0.0
         );
         // Flip-flop α≥KTR (large mtt ⇒ tiny KTR): depot zeroes to match the central /
         // peripheral collapse, keeping [derived] mass balanced (#634 finding 4).
-        assert_eq!(
-            two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, 0.0, 50.0, 1.0),
-            0.0
-        );
+        assert_eq!(two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, 0.0, 50.0, 1.0), 0.0);
         // Peripheral guards: invalid params, infusion, and flip-flop α≥KTR ⇒ 0.
-        assert_eq!(
-            two_cpt_transit_peripheral(&d, -1.0, cl, v1, q, v2, n, mtt, 1.0),
-            0.0
-        );
-        assert_eq!(
-            two_cpt_transit_peripheral(&d, 2.0, 0.0, v1, q, v2, n, mtt, 1.0),
-            0.0
-        );
-        assert_eq!(
-            two_cpt_transit_peripheral(&d, 2.0, cl, v1, -0.1, v2, n, mtt, 1.0),
-            0.0
-        );
+        assert_eq!(two_cpt_transit_peripheral(&d, -1.0, cl, v1, q, v2, n, mtt, 1.0), 0.0);
+        assert_eq!(two_cpt_transit_peripheral(&d, 2.0, 0.0, v1, q, v2, n, mtt, 1.0), 0.0);
+        assert_eq!(two_cpt_transit_peripheral(&d, 2.0, cl, v1, -0.1, v2, n, mtt, 1.0), 0.0);
         assert_eq!(
             two_cpt_transit_peripheral(
                 &infusion_dose(100.0, 50.0),
@@ -509,10 +383,7 @@ mod tests {
             0.0
         );
         // Flip-flop (large mtt ⇒ tiny KTR ⇒ α≥KTR).
-        assert_eq!(
-            two_cpt_transit_peripheral(&d, 2.0, cl, v1, q, v2, 0.0, 50.0, 1.0),
-            0.0
-        );
+        assert_eq!(two_cpt_transit_peripheral(&d, 2.0, cl, v1, q, v2, 0.0, 50.0, 1.0), 0.0);
     }
 
     // Typical 2-cpt PK parameters

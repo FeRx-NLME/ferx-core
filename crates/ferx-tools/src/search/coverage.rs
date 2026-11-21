@@ -161,10 +161,7 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
                 TransitCounts::N => DepotMode::NoDepot,
                 TransitCounts::Counts(_) => DepotMode::Depot,
             };
-            let modes = depot
-                .as_ref()
-                .map(Modes::expand)
-                .unwrap_or_else(|| vec![default]);
+            let modes = depot.as_ref().map(Modes::expand).unwrap_or_else(|| vec![default]);
             if modes.contains(&DepotMode::Depot) {
                 gap(
                     gaps,
@@ -256,10 +253,7 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
 
 /// The variability effects `ferx-core::edit::IivForm` can write.
 pub fn iiv_effect_supported(effect: VariabilityEffect) -> bool {
-    matches!(
-        effect,
-        VariabilityEffect::Exp | VariabilityEffect::Add | VariabilityEffect::Prop
-    )
+    matches!(effect, VariabilityEffect::Exp | VariabilityEffect::Add | VariabilityEffect::Prop)
 }
 
 #[cfg(test)]

@@ -46,13 +46,8 @@ fn a_fit_reports_the_objective_its_optimizer_reached() {
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data must load");
 
-    let starved = fit(
-        &model,
-        &population,
-        &model.default_params,
-        &starved_inner_opts(),
-    )
-    .expect("a starved-inner fit still returns a result");
+    let starved = fit(&model, &population, &model.default_params, &starved_inner_opts())
+        .expect("a starved-inner fit still returns a result");
 
     // If the cold and warm solves still disagree, pin the #833 selection and warning
     // wiring.  With analytic Hessian seeding the cold solve can now reach the warm mode
@@ -113,10 +108,7 @@ fn an_ordinary_fit_reports_no_start_dependence() {
     let ordinary = fit(&model, &population, &model.default_params, &opts).expect("warfarin fit");
 
     assert!(
-        !ordinary
-            .warnings_structured
-            .iter()
-            .any(|w| w.category == WarningCode::EbeStartDependent),
+        !ordinary.warnings_structured.iter().any(|w| w.category == WarningCode::EbeStartDependent),
         "no start dependence expected on warfarin at the default inner budget: {:?}",
         ordinary.warnings
     );

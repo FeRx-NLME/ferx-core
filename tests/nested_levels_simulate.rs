@@ -49,10 +49,7 @@ fn snap(subject: usize, study: f64, arm: f64) -> HashMap<String, f64> {
         ("STUDY".to_string(), study),
         ("ARM".to_string(), arm),
         ("STUDYID".to_string(), 10.0 * subject as f64 + study),
-        (
-            "ARMID".to_string(),
-            100.0 * subject as f64 + 10.0 * study + arm,
-        ),
+        ("ARMID".to_string(), 100.0 * subject as f64 + 10.0 * study + arm),
     ]
     .into_iter()
     .collect()
@@ -115,15 +112,8 @@ fn rows_bits(m: &CompiledModel, p: &Population, seed: u64) -> Vec<(String, u64, 
         .expect("simulates")
         .into_iter()
         .map(|r| {
-            let SimOutcome::Continuous { value } = r.outcome else {
-                panic!("Gaussian rows only")
-            };
-            (
-                format!("{}#{}", r.id, r.sim),
-                r.time.to_bits(),
-                r.ipred.to_bits(),
-                value.to_bits(),
-            )
+            let SimOutcome::Continuous { value } = r.outcome else { panic!("Gaussian rows only") };
+            (format!("{}#{}", r.id, r.sim), r.time.to_bits(), r.ipred.to_bits(), value.to_bits())
         })
         .collect()
 }
@@ -144,11 +134,7 @@ fn assert_bit_identical(level: &str, nested: &CompiledModel, one_level: &Compile
 #[test]
 fn a_kappa_at_study_only_draws_as_iov_by_study() {
     let nested = model(LEVELS, "kappa K ~ 4.0 at STUDY", "");
-    let one_level = model(
-        "",
-        "kappa K ~ 4.0",
-        "[fit_options]\n  iov_column = STUDYID\n",
-    );
+    let one_level = model("", "kappa K ~ 4.0", "[fit_options]\n  iov_column = STUDYID\n");
     assert_bit_identical("STUDY", &nested, &one_level, "STUDYID");
 }
 
@@ -172,23 +158,13 @@ fn both_levels_draw_and_the_rows_of_an_arm_share_them() {
     )
     .unwrap();
     let rows = simulate_with_seed(&m, &population(None), &m.default_params, 1, 5).unwrap();
-    let subject_1: Vec<f64> = rows
-        .iter()
-        .filter(|r| r.id == "1")
-        .map(|r| r.ipred)
-        .collect();
+    let subject_1: Vec<f64> = rows.iter().filter(|r| r.id == "1").map(|r| r.ipred).collect();
     assert_eq!(subject_1.len(), ROWS.len());
     for pair in subject_1.chunks(2) {
         assert!(pair[0].is_finite());
-        assert_eq!(
-            pair[0], pair[1],
-            "the two rows of one arm read one κ: {subject_1:?}"
-        );
+        assert_eq!(pair[0], pair[1], "the two rows of one arm read one κ: {subject_1:?}");
     }
-    assert_ne!(
-        subject_1[0], subject_1[2],
-        "two arms of study 1 differ: {subject_1:?}"
-    );
+    assert_ne!(subject_1[0], subject_1[2], "two arms of study 1 differ: {subject_1:?}");
 }
 
 /// Seeded one-level IOV rows (`iov_column = ARMID`, `kappa K ~ 4.0`, seeds 1 and 1082,
@@ -211,10 +187,7 @@ fn one_level_simulation_is_unchanged() {
             eat(value);
         }
     }
-    assert_eq!(
-        h, ONE_LEVEL_HASH,
-        "one-level seeded rows moved: hash {h:#018x}"
-    );
+    assert_eq!(h, ONE_LEVEL_HASH, "one-level seeded rows moved: hash {h:#018x}");
 }
 
 const ONE_LEVEL_HASH: u64 = 0x2d97_0f91_8913_b10f;
@@ -227,19 +200,11 @@ const ONE_LEVEL_HASH: u64 = 0x2d97_0f91_8913_b10f;
 #[test]
 fn a_zero_kappa_at_a_level_draws_exactly_zero() {
     let nested = model(LEVELS, "kappa K ~ 0.0 FIX at STUDY", "");
-    let one_level = model(
-        "",
-        "kappa K ~ 0.0 FIX",
-        "[fit_options]\n  iov_column = STUDYID\n",
-    );
+    let one_level = model("", "kappa K ~ 0.0 FIX", "[fit_options]\n  iov_column = STUDYID\n");
     let rows = simulate_with_seed(&nested, &population(None), &nested.default_params, 1, 3)
         .expect("simulates");
     for id in ["1", "2", "3"] {
-        let ipred: Vec<f64> = rows
-            .iter()
-            .filter(|r| r.id == id)
-            .map(|r| r.ipred)
-            .collect();
+        let ipred: Vec<f64> = rows.iter().filter(|r| r.id == id).map(|r| r.ipred).collect();
         assert_eq!(ipred.len(), ROWS.len());
         assert!(ipred[0].is_finite());
         assert!(
@@ -284,11 +249,7 @@ fn npde_bits(m: &CompiledModel, mut p: Population) -> Vec<(u64, u64)> {
 #[test]
 fn the_npde_reference_draws_a_study_kappa_as_iov_by_study() {
     let nested = model(LEVELS, "kappa K ~ 4.0 at STUDY", "");
-    let one_level = model(
-        "",
-        "kappa K ~ 4.0",
-        "[fit_options]\n  iov_column = STUDYID\n",
-    );
+    let one_level = model("", "kappa K ~ 4.0", "[fit_options]\n  iov_column = STUDYID\n");
     assert_eq!(
         npde_bits(&nested, population(None)),
         npde_bits(&one_level, population(Some("STUDYID"))),

@@ -34,10 +34,7 @@ fn rel_err(got: &DMatrix<f64>, want: &DMatrix<f64>) -> f64 {
     );
     let scale = want.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     assert!(scale > 0.0, "degenerate reference Hessian {want}");
-    got.iter()
-        .zip(want.iter())
-        .fold(0.0_f64, |m, (g, w)| m.max((g - w).abs()))
-        / scale
+    got.iter().zip(want.iter()).fold(0.0_f64, |m, (g, w)| m.max((g - w).abs())) / scale
 }
 
 /// Every off-diagonal entry of `h` is live, so a kernel that drops the cross terms fails.
@@ -54,21 +51,11 @@ fn assert_coupled(label: &str, h: &DMatrix<f64>) {
 }
 
 fn discrete(time: f64, state: usize, cmt: usize) -> ObsRecord {
-    ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt,
-    }
+    ObsRecord::DiscreteState { time, raw_time: time, state, cmt }
 }
 
 fn event(time: f64, event_type: EventType, entry_time: f64) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time,
-        cmt: 2,
-    }
+    ObsRecord::Event { time, event_type, entry_time, cmt: 2 }
 }
 
 /// One cell of the parity matrix: the endpoint's own exact `(value, H)`, the marginal's
@@ -86,9 +73,7 @@ struct Cell<'a> {
 /// integrated objective, has no `tol/h²` roundoff — the solver's steps are differentiated
 /// as taken, exactly as the recording does.
 fn dual_hessian1<S: crate::survival::SubjectTerm>(
-    term: &S,
-    theta: &[f64],
-    eta: f64,
+    term: &S, theta: &[f64], eta: f64,
 ) -> DMatrix<f64> {
     use crate::sens::dual2::Dual2;
     let th: Vec<Dual2<1>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
@@ -106,18 +91,10 @@ fn whole_term(model: &CompiledModel, s: &Subject, eta: &[f64]) -> Option<DMatrix
 /// Check one cell; `Err` names what failed, so the matrix reports every bad cell at once.
 fn check(c: &Cell<'_>) -> Result<f64, String> {
     let label = &c.label;
-    let (v, h) = c
-        .exact
-        .as_ref()
-        .ok_or(format!("{label}: the endpoint's plan declined"))?;
-    let whole = c
-        .hessian
-        .as_ref()
-        .ok_or(format!("{label}: the whole term's plan declined"))?;
+    let (v, h) = c.exact.as_ref().ok_or(format!("{label}: the endpoint's plan declined"))?;
+    let whole = c.hessian.as_ref().ok_or(format!("{label}: the whole term's plan declined"))?;
     if (whole - h).abs().max() != 0.0 {
-        return Err(format!(
-            "{label}: the marginal's Hessian is not the endpoint's plan's"
-        ));
+        return Err(format!("{label}: the marginal's Hessian is not the endpoint's plan's"));
     }
     let f0 = (c.value)(&c.eta);
     if !(f0.is_finite() && f0.abs() < 1e3) {
@@ -174,10 +151,7 @@ fn tte_exact(model: &CompiledModel, s: &Subject, eta: &[f64]) -> Option<(f64, DM
 }
 
 fn tte_cell<'a>(label: &str, model: &'a CompiledModel, s: &'a Subject, eta: &[f64]) -> Cell<'a> {
-    let Some(EndpointLikelihood::Tte {
-        hazard, recurrence, ..
-    }) = model.endpoints.get(&2)
-    else {
+    let Some(EndpointLikelihood::Tte { hazard, recurrence, .. }) = model.endpoints.get(&2) else {
         panic!("{label}: fixture precondition: a TTE endpoint on CMT 2");
     };
     assert!(
@@ -229,10 +203,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
                       ~ 0.16\n[binary_model]\n  cmt   = 3\n  logit = TH0 + THX * X + ETA_A + \
                       THT * exp(ETA_B + 0.5 * ETA_A) * TIME\n";
     let binary = parse(binary_src);
-    let mut bs = Subject {
-        id: "1".into(),
-        ..Default::default()
-    };
+    let mut bs = Subject { id: "1".into(), ..Default::default() };
     bs.covariates.insert("X".into(), 0.8);
     bs.obs_records = [(0.5, 1), (1.0, 0), (2.0, 1), (3.5, 0)]
         .into_iter()
@@ -256,9 +227,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
         m
     };
     let mut two_bs = bs.clone();
-    two_bs
-        .obs_records
-        .extend([(0.7, 0), (1.5, 1), (3.0, 1)].map(|(t, y)| discrete(t, y, 4)));
+    two_bs.obs_records.extend([(0.7, 0), (1.5, 1), (3.0, 1)].map(|(t, y)| discrete(t, y, 4)));
 
     #[cfg(feature = "markov")]
     let ctmm = |rate: f64| {
@@ -279,26 +248,15 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
     let (ctmm_fast, ctmm_slow) = (ctmm(0.0), ctmm(-9.0));
     #[cfg(feature = "markov")]
     let cs = {
-        let mut s = Subject {
-            id: "1".into(),
-            ..Default::default()
-        };
+        let mut s = Subject { id: "1".into(), ..Default::default() };
         // A live covariate on an asymmetric rate, so the generator must be built from the
         // subject's covariates on both paths.
         s.covariates.insert("X".into(), 0.7);
-        s.obs_records = [
-            (0.0, 0),
-            (1.0, 1),
-            (1.0, 1),
-            (2.5, 2),
-            (4.0, 1),
-            (6.0, 0),
-            (7.0, 0),
-            (9.0, 2),
-        ]
-        .into_iter()
-        .map(|(t, st)| discrete(t, st, 5))
-        .collect();
+        s.obs_records =
+            [(0.0, 0), (1.0, 1), (1.0, 1), (2.5, 2), (4.0, 1), (6.0, 0), (7.0, 0), (9.0, 2)]
+                .into_iter()
+                .map(|(t, st)| discrete(t, st, 5))
+                .collect();
         s
     };
 
@@ -320,10 +278,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
     let binary_and_dtmm = parse(&format!("{binary_src}{dtmm_body}"));
     #[cfg(feature = "markov")]
     let ds = {
-        let mut s = Subject {
-            id: "1".into(),
-            ..Default::default()
-        };
+        let mut s = Subject { id: "1".into(), ..Default::default() };
         s.covariates.insert("X".into(), 0.8);
         s.obs_records = [0, 0, 1, 1, 0, 2, 2, 1, 0]
             .into_iter()
@@ -344,14 +299,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
     let single = [
         event(3.0, EventType::Exact, 0.5),
         event(8.0, EventType::RightCensored, 0.0),
-        event(
-            0.0,
-            EventType::IntervalCensored {
-                left: 2.0,
-                right: 5.0,
-            },
-            0.0,
-        ),
+        event(0.0, EventType::IntervalCensored { left: 2.0, right: 5.0 }, 0.0),
     ];
     let recurrent = [
         event(1.5, EventType::Exact, 0.5),
@@ -364,8 +312,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
              * X + 0.3 * ETA_S"
         )
     };
-    let tte: Vec<(&str, String, &[ObsRecord], [f64; 2])> =
-        vec![
+    let tte: Vec<(&str, String, &[ObsRecord], [f64; 2])> = vec![
         (
             "exponential",
             "family = exponential\n  scale  = TA * exp(ETA_S)\n  loghr  = TX * X + 0.4 * ETA_K \
@@ -413,11 +360,8 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
         .into_iter()
         .map(|(label, body, records, eta)| {
             let model = parse(&format!("{params}[event_model]\n  cmt    = 2\n  {body}\n"));
-            let mut s = Subject {
-                id: "1".into(),
-                obs_records: records.to_vec(),
-                ..Default::default()
-            };
+            let mut s =
+                Subject { id: "1".into(), obs_records: records.to_vec(), ..Default::default() };
             s.covariates.insert("X".to_string(), 0.8);
             (label, model, s, eta)
         })
@@ -434,12 +378,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
         cells.push(ctmm_cell("ctmm", &ctmm_fast, &cs, &[0.3, -0.2]));
         cells.push(ctmm_cell("ctmm slow rates", &ctmm_slow, &cs, &[0.3, -0.2]));
         cells.push(binary_cell("dtmm", &dtmm, &ds, &[0.3, -0.2]));
-        cells.push(binary_cell(
-            "binary + dtmm",
-            &binary_and_dtmm,
-            &bds,
-            &[0.3, -0.2],
-        ));
+        cells.push(binary_cell("binary + dtmm", &binary_and_dtmm, &bds, &[0.3, -0.2]));
     }
     for (label, model, s, eta) in &tte_models {
         cells.push(tte_cell(label, model, s, eta));
@@ -460,22 +399,15 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
 fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
     let n = 49;
     let omegas: String = (0..n).map(|k| format!("  omega E{k} ~ 0.1\n")).collect();
-    let lp: Vec<String> = (0..n)
-        .map(|k| format!("{} * E{k}", 0.02 * (k + 1) as f64))
-        .collect();
+    let lp: Vec<String> = (0..n).map(|k| format!("{} * E{k}", 0.02 * (k + 1) as f64)).collect();
     let model = parse(&format!(
         "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n{omegas}[binary_model]\n  cmt   = 3\n  \
          logit = TH0 + {}\n",
         lp.join(" + ")
     ));
-    let mut s = Subject {
-        id: "1".into(),
-        ..Default::default()
-    };
-    s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
-        .into_iter()
-        .map(|(t, y)| discrete(t, y, 3))
-        .collect();
+    let mut s = Subject { id: "1".into(), ..Default::default() };
+    s.obs_records =
+        [(0.0, 1), (1.0, 0), (2.0, 1)].into_iter().map(|(t, y)| discrete(t, y, 3)).collect();
     let theta = model.default_params.theta.clone();
     let eta = vec![0.1; n];
     let got = whole_term(&model, &s, &eta).expect("a 49-η binary term records");
@@ -500,9 +432,7 @@ fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
         .endpoints
         .iter()
         .find_map(|(cmt, ep)| match ep {
-            EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } => Some((*cmt, hazard, *recurrence)),
+            EndpointLikelihood::Tte { hazard, recurrence, .. } => Some((*cmt, hazard, *recurrence)),
             _ => None,
         })
         .expect("a TTE endpoint");
@@ -512,12 +442,8 @@ fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         ..Default::default()
     };
-    s.obs_records = vec![ObsRecord::Event {
-        time: 12.0,
-        event_type: EventType::Exact,
-        entry_time: 0.0,
-        cmt,
-    }];
+    s.obs_records =
+        vec![ObsRecord::Event { time: 12.0, event_type: EventType::Exact, entry_time: 0.0, cmt }];
     let theta = model.default_params.theta.clone();
     let eta = [0.2];
     let records = s.obs_records.clone();
@@ -526,10 +452,7 @@ fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
     let (v, _, _) =
         crate::survival::non_gaussian_eta_jets2(&model, &s, &theta, &eta).expect("records");
     let want_v = tte_endpoint_nll(&model, &s, hazard, recurrence, &records, &theta, &eta);
-    assert!(
-        (v - want_v).abs() <= 1e-12 * want_v.abs(),
-        "value {v} vs {want_v}"
-    );
+    assert!((v - want_v).abs() <= 1e-12 * want_v.abs(), "value {v} vs {want_v}");
     let want = dual_hessian1(&crate::survival::TteTerm::new(&model, &s), &theta, eta[0]);
     let err = rel_err(&got, &want);
     eprintln!("drug-driven TTE: {err:.3e}");
@@ -565,14 +488,8 @@ fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
         let (v, _, _) =
             crate::survival::non_gaussian_eta_jets2(&model, &s, &theta, &eta).expect("records");
         let want_v = crate::markov::endpoint::ctmm_subject_nll(&model, &s, &theta, &eta);
-        assert!(
-            (v - want_v).abs() <= 1e-12 * want_v.abs(),
-            "value {v} vs {want_v}"
-        );
-        let term = crate::markov::endpoint::CtmmTerm {
-            model: &model,
-            subject: &s,
-        };
+        assert!((v - want_v).abs() <= 1e-12 * want_v.abs(), "value {v} vs {want_v}");
+        let term = crate::markov::endpoint::CtmmTerm { model: &model, subject: &s };
         let want = dual_hessian1(&term, &theta, eta[0]);
         let err = rel_err(&got, &want);
         eprintln!("drug-driven CTMM: {err:.3e}");
@@ -591,10 +508,7 @@ fn a_repelled_subject_declines_the_exact_hessian() {
         "[parameters]\n  theta TA(0.5, -10.0, 10.0)\n  omega ETA_S ~ 0.25\n[event_model]\n  \
          cmt    = 2\n  family = exponential\n  scale  = TA * ETA_S\n",
     );
-    let Some(EndpointLikelihood::Tte {
-        hazard, recurrence, ..
-    }) = tte.endpoints.get(&2)
-    else {
+    let Some(EndpointLikelihood::Tte { hazard, recurrence, .. }) = tte.endpoints.get(&2) else {
         panic!("fixture precondition: a TTE endpoint on CMT 2");
     };
     let ts = Subject {
@@ -611,10 +525,7 @@ fn a_repelled_subject_declines_the_exact_hessian() {
         &[0.0],
         &ts.covariates,
     );
-    assert_eq!(
-        v, 1e20,
-        "fixture precondition: h = 0 at an exact event is repelled"
-    );
+    assert_eq!(v, 1e20, "fixture precondition: h = 0 at an exact event is repelled");
     assert!(tte_exact(&tte, &ts, &[0.0]).is_none());
     assert!(whole_term(&tte, &ts, &[0.0]).is_none());
 
@@ -622,17 +533,11 @@ fn a_repelled_subject_declines_the_exact_hessian() {
         "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  omega ETA_A ~ 0.25\n[binary_model]\n  \
          cmt   = 3\n  logit = TH0 + exp(1000 * ETA_A)\n",
     );
-    let mut bs = Subject {
-        id: "1".into(),
-        ..Default::default()
-    };
+    let mut bs = Subject { id: "1".into(), ..Default::default() };
     bs.obs_records = vec![discrete(1.0, 1, 3)];
     let theta = binary.default_params.theta.clone();
     let v = crate::categorical::discrete_subject_nll(&binary, &bs, &theta, &[1.0]);
-    assert_eq!(
-        v, 1e20,
-        "fixture precondition: an overflowed predictor is repelled"
-    );
+    assert_eq!(v, 1e20, "fixture precondition: an overflowed predictor is repelled");
     assert!(
         crate::categorical::discrete_subject_eta_hessian(&binary, &bs, &theta, &[1.0]).is_none()
     );
@@ -645,20 +550,15 @@ fn a_repelled_subject_declines_the_exact_hessian() {
              type   = ctmm\n  cmt    = 5\n  states = [s0=0, s1=1]\n  transition s0 -> s1 = \
              L01 + ETA_A\n  transition s1 -> s0 = exp(L01)\n",
         );
-        let mut cs = Subject {
-            id: "1".into(),
-            ..Default::default()
-        };
+        let mut cs = Subject { id: "1".into(), ..Default::default() };
         // A stay in s0: with `q01 < 0` its `P[0, 0] > 1` clamps to a finite constant, so
         // only the negative-rate guard makes this subject the sentinel.
         cs.obs_records = vec![discrete(0.0, 0, 5), discrete(1.0, 0, 5)];
         let theta = ctmm.default_params.theta.clone();
         let v = crate::markov::endpoint::ctmm_subject_nll(&ctmm, &cs, &theta, &[-1.0]);
         assert_eq!(v, 1e20, "fixture precondition: a negative rate is repelled");
-        assert!(
-            crate::markov::endpoint::ctmm_subject_eta_hessian(&ctmm, &cs, &theta, &[-1.0])
-                .is_none()
-        );
+        assert!(crate::markov::endpoint::ctmm_subject_eta_hessian(&ctmm, &cs, &theta, &[-1.0])
+            .is_none());
         assert!(whole_term(&ctmm, &cs, &[-1.0]).is_none());
     }
 }

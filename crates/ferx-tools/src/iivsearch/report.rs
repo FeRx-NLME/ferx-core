@@ -90,12 +90,7 @@ fn write_models(path: &Path, result: &IivsearchResult) -> Result<(), String> {
                 r.step.to_string(),
                 r.structure.description(),
                 r.structure.etas.join(";"),
-                r.structure
-                    .blocks
-                    .iter()
-                    .map(|b| b.join(","))
-                    .collect::<Vec<_>>()
-                    .join(";"),
+                r.structure.blocks.iter().map(|b| b.join(",")).collect::<Vec<_>>().join(";"),
                 r.n_parameters.map(|n| n.to_string()).unwrap_or_default(),
                 opt_number(r.ofv),
                 number(r.criterion),
@@ -104,19 +99,14 @@ fn write_models(path: &Path, result: &IivsearchResult) -> Result<(), String> {
                 r.converged.map(|c| c.to_string()).unwrap_or_default(),
                 r.passed.to_string(),
                 r.failures.join("; "),
-                r.error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_default(),
+                r.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
                 r.starts.to_string(),
                 number(r.seconds),
                 r.selected.to_string(),
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// A human-readable rendering of the search: the input and base, every
@@ -125,21 +115,14 @@ pub fn render_summary(result: &IivsearchResult) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let label = result.criterion.label();
-    let describe_id = |id: &str| -> String {
-        result
-            .row(id)
-            .map(|r| describe(&r.structure))
-            .unwrap_or_default()
-    };
+    let describe_id =
+        |id: &str| -> String { result.row(id).map(|r| describe(&r.structure)).unwrap_or_default() };
     if let Some(input) = result.row("input") {
         let _ = writeln!(
             out,
             "Input model: {} — OFV {}, {label} {}",
             describe(&input.structure),
-            input
-                .ofv
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_else(|| "-".into()),
+            input.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
             number_or_dash(input.criterion)
         );
     }
@@ -149,9 +132,7 @@ pub fn render_summary(result: &IivsearchResult) -> String {
                 out,
                 "Base model: {} — OFV {}, {label} {}",
                 describe(&base.structure),
-                base.ofv
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
+                base.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
                 number_or_dash(base.criterion)
             );
         }
@@ -160,18 +141,10 @@ pub fn render_summary(result: &IivsearchResult) -> String {
         out,
         "Algorithm: {}{}, {} model{} fitted{}",
         result.options.algorithm.label(),
-        if result.options.block_stage() {
-            " + top_down_exhaustive blocks"
-        } else {
-            ""
-        },
+        if result.options.block_stage() { " + top_down_exhaustive blocks" } else { "" },
         result.rows.len(),
         if result.rows.len() == 1 { "" } else { "s" },
-        if result.cancelled {
-            " (search cancelled)"
-        } else {
-            ""
-        }
+        if result.cancelled { " (search cancelled)" } else { "" }
     );
     for step in &result.steps {
         let _ = writeln!(
@@ -225,13 +198,9 @@ pub fn render_summary(result: &IivsearchResult) -> String {
                 row.and_then(|r| r.n_parameters)
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "-".into()),
-                row.and_then(|r| r.ofv)
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
+                row.and_then(|r| r.ofv).map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
                 number_or_dash(r.criterion),
-                r.d_criterion
-                    .map(|v| format!("{v:+.3}"))
-                    .unwrap_or_else(|| "-".into()),
+                r.d_criterion.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "-".into()),
                 r.rank.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
                 status,
                 decision

@@ -60,10 +60,7 @@ fn foce_family_and_vi_apply_the_penalty_and_the_rest_does_not() {
         EstimationMethod::Impmap,
         EstimationMethod::Bayes,
     ] {
-        assert!(
-            !applies_nn_regularization(m),
-            "{m:?} must not apply the penalty"
-        );
+        assert!(!applies_nn_regularization(m), "{m:?} must not apply the penalty");
     }
 }
 
@@ -73,9 +70,7 @@ fn warns_only_for_a_regularized_nn_model_whose_final_stage_is_not_foce_family() 
     let mut opts = FitOptions::default();
 
     // λ = 0: nothing to warn about, whatever the method.
-    assert!(
-        nn_regularization_unapplied_warning(&model, &opts, &[EstimationMethod::Saem]).is_none()
-    );
+    assert!(nn_regularization_unapplied_warning(&model, &opts, &[EstimationMethod::Saem]).is_none());
 
     opts.nn_l2_lambda = 1e-2;
     // FOCE-family final stage: applied, no warning — including after a SAEM
@@ -108,8 +103,6 @@ fn warns_only_for_a_regularized_nn_model_whose_final_stage_is_not_foce_family() 
 
     // No `[covariate_nn]` block: the penalty is a no-op regardless of method,
     // so there is nothing to warn about.
-    assert!(
-        nn_regularization_unapplied_warning(&plain_model(), &opts, &[EstimationMethod::Saem])
-            .is_none()
-    );
+    assert!(nn_regularization_unapplied_warning(&plain_model(), &opts, &[EstimationMethod::Saem])
+        .is_none());
 }

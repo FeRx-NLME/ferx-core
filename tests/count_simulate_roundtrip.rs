@@ -27,11 +27,7 @@ fn round_trip(fam: &str, truth: &[f64], omega: f64, n_sim: usize, seed: u64) -> 
     gen.omega = OmegaMatrix::from_diagonal(&[omega], vec!["ETA_C".into()]);
     let sims = ferx_core::simulate_with_seed(model, template, &gen, n_sim, seed).unwrap();
     let n_rec: usize = template.subjects.iter().map(|s| s.obs_records.len()).sum();
-    assert_eq!(
-        sims.len(),
-        n_rec * n_sim,
-        "one row per (record × replicate)"
-    );
+    assert_eq!(sims.len(), n_rec * n_sim, "one row per (record × replicate)");
 
     let mut pop = template.clone();
     pop.subjects.clear();
@@ -54,11 +50,8 @@ fn round_trip(fam: &str, truth: &[f64], omega: f64, n_sim: usize, seed: u64) -> 
         }
         assert_eq!(cursor, rep.len(), "every simulated row is consumed");
     }
-    let options = FitOptions {
-        verbose: false,
-        run_covariance_step: false,
-        ..p.parsed.fit_options.clone()
-    };
+    let options =
+        FitOptions { verbose: false, run_covariance_step: false, ..p.parsed.fit_options.clone() };
     let f = ferx_core::fit(model, &pop, &p.init_params, &options).unwrap();
     (f.theta.clone(), f.omega[(0, 0)])
 }
@@ -72,10 +65,7 @@ fn round_trip(fam: &str, truth: &[f64], omega: f64, n_sim: usize, seed: u64) -> 
 /// instead of the individual one sends ω to 0, the NB as a Poisson sends r to its bound)
 /// misses them by far more.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn simulated_counts_refit_to_the_generating_parameters() {
     for (fam, truth, omega, seed) in [
         ("pois", vec![3.5, 0.6, -0.5], 0.3, 2877u64),
@@ -83,20 +73,12 @@ fn simulated_counts_refit_to_the_generating_parameters() {
     ] {
         let (th, om) = round_trip(fam, &truth, omega, 10, seed);
         eprintln!("count_{fam}: truth {truth:?} ω {omega} → θ {th:?} ω {om:.4}");
-        assert!(
-            (th[0].ln() - truth[0].ln()).abs() < 0.12,
-            "{fam} BASE {}",
-            th[0]
-        );
+        assert!((th[0].ln() - truth[0].ln()).abs() < 0.12, "{fam} BASE {}", th[0]);
         assert!((th[1] - truth[1]).abs() < 0.25, "{fam} BETA {}", th[1]);
         assert!((th[2] - truth[2]).abs() < 0.09, "{fam} GAM {}", th[2]);
         assert!((om - omega).abs() < 0.08, "{fam} ω {om}");
         if fam == "nb" {
-            assert!(
-                (th[3].ln() - truth[3].ln()).abs() < 0.2,
-                "{fam} r {}",
-                th[3]
-            );
+            assert!((th[3].ln() - truth[3].ln()).abs() < 0.2, "{fam} r {}", th[3]);
         }
     }
 }

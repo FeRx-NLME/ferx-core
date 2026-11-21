@@ -164,11 +164,7 @@ impl DirLock {
                     }
                 }
                 let owner = owner.trim();
-                let owner = if owner.is_empty() {
-                    "owner unknown"
-                } else {
-                    owner
-                };
+                let owner = if owner.is_empty() { "owner unknown" } else { owner };
                 Err(format!(
                     "the search directory `{}` is already in use ({owner}): two runs sharing one \
                      directory overwrite each other's journal, so one run's fits would be lost. \
@@ -189,9 +185,7 @@ impl DirLock {
         // unreadable owner reads as "still running", which refuses rather than
         // steals.
         let _ = writeln!(file, "pid {}", std::process::id());
-        Ok(DirLock {
-            path: path.to_path_buf(),
-        })
+        Ok(DirLock { path: path.to_path_buf() })
     }
 }
 
@@ -201,10 +195,8 @@ impl DirLock {
 /// deletes another run's lock, so everything it cannot positively establish has
 /// to fall on the refusing side.
 fn owner_is_running(contents: &str) -> bool {
-    let Some(pid) = contents
-        .trim()
-        .strip_prefix("pid ")
-        .and_then(|rest| rest.trim().parse::<u32>().ok())
+    let Some(pid) =
+        contents.trim().strip_prefix("pid ").and_then(|rest| rest.trim().parse::<u32>().ok())
     else {
         return true;
     };
@@ -306,8 +298,7 @@ impl Journal {
             for record in kept {
                 write_line(&mut out, record)?;
             }
-            out.flush()
-                .map_err(|e| format!("cannot flush `{}`: {e}", temp.display()))?;
+            out.flush().map_err(|e| format!("cannot flush `{}`: {e}", temp.display()))?;
         }
         std::fs::rename(&temp, &final_path).map_err(|e| {
             let _ = std::fs::remove_file(&temp);
@@ -317,11 +308,7 @@ impl Journal {
             .append(true)
             .open(&final_path)
             .map_err(|e| format!("cannot open `{}` for appending: {e}", final_path.display()))?;
-        Ok(Journal {
-            dir: dir.to_path_buf(),
-            file: Mutex::new(file),
-            error: Mutex::new(None),
-        })
+        Ok(Journal { dir: dir.to_path_buf(), file: Mutex::new(file), error: Mutex::new(None) })
     }
 
     /// Append one finished candidate, and cache its fit when there is one.
@@ -342,9 +329,7 @@ impl Journal {
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Err(e) = write_line(&mut *guard, record).and_then(|()| {
-            guard
-                .flush()
-                .map_err(|e| format!("cannot flush the search journal: {e}"))
+            guard.flush().map_err(|e| format!("cannot flush the search journal: {e}"))
         }) {
             drop(guard);
             self.record_error(e);
@@ -456,11 +441,7 @@ impl SearchManifest {
             ))
         };
         if disk.criterion != self.criterion {
-            return refuse(
-                "the ranking criterion",
-                disk.criterion.clone(),
-                self.criterion.clone(),
-            );
+            return refuse("the ranking criterion", disk.criterion.clone(), self.criterion.clone());
         }
         if disk.n_starts != self.n_starts {
             return refuse(
@@ -547,14 +528,8 @@ impl SearchManifest {
         {
             return refuse(
                 "the dataset",
-                format!(
-                    "{} subjects / {} observations",
-                    disk.n_subjects, disk.n_observations
-                ),
-                format!(
-                    "{} subjects / {} observations",
-                    self.n_subjects, self.n_observations
-                ),
+                format!("{} subjects / {} observations", disk.n_subjects, disk.n_observations),
+                format!("{} subjects / {} observations", self.n_subjects, self.n_observations),
             );
         }
         Ok(())
@@ -592,11 +567,7 @@ fn fit_options_fingerprint(options: &FitOptions) -> String {
     normalised.user_set_keys.clear();
     // The runner's own pin (`compile_and_fit`, #1824): caller options replace the file's
     // wholesale, so no `bloq_method` means `drop`. Both spellings run the same fit.
-    normalised.bloq_method = Some(
-        normalised
-            .bloq_method
-            .unwrap_or(ferx_core::BloqMethod::Drop),
-    );
+    normalised.bloq_method = Some(normalised.bloq_method.unwrap_or(ferx_core::BloqMethod::Drop));
     ferx_core::io::hash::sha256_bytes(format!("{normalised:?}").as_bytes())
 }
 
@@ -730,9 +701,7 @@ fn data_fingerprint(data: &Population) -> String {
 /// Append covariate snapshots in **key order**, so the digest does not depend on
 /// `HashMap`'s per-process iteration order.
 fn write_covariates(
-    buf: &mut String,
-    label: &str,
-    maps: &[std::collections::HashMap<String, f64>],
+    buf: &mut String, label: &str, maps: &[std::collections::HashMap<String, f64>],
 ) {
     use std::fmt::Write as _;
 

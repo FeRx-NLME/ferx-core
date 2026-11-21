@@ -496,10 +496,7 @@ impl RhsLayout<'_> {
             return Some(Flat::LoadState { d: 0, i });
         }
         if let Some(&p) = self.indiv_to_params_slot.get(slot - self.state_count) {
-            return Some(Flat::LoadParam {
-                d: 0,
-                slot: u32::try_from(p).ok()?,
-            });
+            return Some(Flat::LoadParam { d: 0, slot: u32::try_from(p).ok()? });
         }
         let k = self.seed_slots.iter().position(|&s| s == slot)?;
         Some(Flat::LoadSeed { d: 0, k: k as u32 })
@@ -741,16 +738,11 @@ impl NativeF64<'_> {
         let pair = &self.0;
         let slots = pair.param_slots();
         let fresh = cache.key.len() == slots.len() + 1
-            && slots
-                .iter()
-                .zip(&cache.key)
-                .all(|(&s, &k)| params[s as usize].to_bits() == k)
+            && slots.iter().zip(&cache.key).all(|(&s, &k)| params[s as usize].to_bits() == k)
             && cache.key[slots.len()] == seeds[3].to_bits();
         if !fresh {
             cache.key.clear();
-            cache
-                .key
-                .extend(slots.iter().map(|&s| params[s as usize].to_bits()));
+            cache.key.extend(slots.iter().map(|&s| params[s as usize].to_bits()));
             cache.key.push(seeds[3].to_bits());
             cache.vals.clear();
             cache.vals.resize(pair.cache_len(), 0.0);
@@ -765,10 +757,7 @@ impl NativeF64<'_> {
     /// `main(u, params, seeds, du, cache)`, valid while `params` is unchanged and the cache is
     /// not refilled for other parameters.
     pub(crate) fn main_call(
-        &self,
-        (u_len, du_len): (usize, usize),
-        params: &[f64],
-        seeds: &[f64; 4],
+        &self, (u_len, du_len): (usize, usize), params: &[f64], seeds: &[f64; 4],
         cache: &mut HoistCache,
     ) -> Option<(NativeMain, *const f64)> {
         if !self.0.fits(u_len, params.len(), du_len) {
@@ -782,12 +771,7 @@ impl NativeF64<'_> {
     /// `du`), `false` with nothing written when a slice is shorter than the program reads.
     #[inline(always)]
     pub(crate) fn run(
-        &self,
-        u: &[f64],
-        params: &[f64],
-        seeds: &[f64; 4],
-        du: &mut [f64],
-        cache: &mut HoistCache,
+        &self, u: &[f64], params: &[f64], seeds: &[f64; 4], du: &mut [f64], cache: &mut HoistCache,
     ) -> bool {
         let pair = &self.0;
         if !pair.fits(u.len(), params.len(), du.len()) {
@@ -831,10 +815,7 @@ impl NativeTan<'_> {
         }
         // SAFETY: `fits` covers every element the program loads or stores, at `l` lanes each,
         // and `seeds` holds four elements; `du` is a separate slice.
-        unsafe {
-            self.0
-                .call(u.as_ptr(), params.as_ptr(), seeds.as_ptr(), du.as_mut_ptr())
-        };
+        unsafe { self.0.call(u.as_ptr(), params.as_ptr(), seeds.as_ptr(), du.as_mut_ptr()) };
         true
     }
 }
@@ -852,15 +833,11 @@ impl RhsRegProgram {
     /// [`Self::compile`], except under the test-only `RHS_REGCODE_DISABLED`, which declines
     /// as [`RhsConstruct::Shape`] at no site in particular.
     pub(super) fn compile_unless_disabled(
-        stmts: &[Statement],
-        layout: &RhsLayout<'_>,
+        stmts: &[Statement], layout: &RhsLayout<'_>,
     ) -> Result<Self, RhsRefusal> {
         #[cfg(test)]
         if super::RHS_REGCODE_DISABLED.with(|c| c.get()) {
-            return Err(RhsRefusal {
-                construct: RhsConstruct::Shape,
-                site: RhsSite::IfBlock,
-            });
+            return Err(RhsRefusal { construct: RhsConstruct::Shape, site: RhsSite::IfBlock });
         }
         Self::compile(stmts, layout)
     }
@@ -870,24 +847,15 @@ impl RhsRegProgram {
     /// the interpreter for it.
     pub(super) fn compile(stmts: &[Statement], layout: &RhsLayout<'_>) -> Result<Self, RhsRefusal> {
         let n_vars = layout.n_vars;
-        let mut b = Builder {
-            ins: Vec::new(),
-            n_tmp: 0,
-            n_vars,
-        };
+        let mut b = Builder { ins: Vec::new(), n_tmp: 0, n_vars };
         // The statement each instruction came from, for `lower`'s refusals.
         let mut sites: Vec<RhsSite> = Vec::new();
-        let shape = |site| RhsRefusal {
-            construct: RhsConstruct::Shape,
-            site,
-        };
+        let shape = |site| RhsRefusal { construct: RhsConstruct::Shape, site };
         for s in stmts {
             let site = match s {
                 Statement::AssignBc(slot, bc) => {
                     let site = RhsSite::Assign(*slot);
-                    let v = b
-                        .expr(bc)
-                        .map_err(|construct| RhsRefusal { construct, site })?;
+                    let v = b.expr(bc).map_err(|construct| RhsRefusal { construct, site })?;
                     // The interpreter drops a write past the end of `vars`.
                     if *slot < n_vars {
                         b.ins.push(Ins::Assign {
@@ -899,9 +867,7 @@ impl RhsRegProgram {
                 }
                 Statement::DiffEqBc(state, bc) => {
                     let site = RhsSite::Deriv(*state);
-                    let v = b
-                        .expr(bc)
-                        .map_err(|construct| RhsRefusal { construct, site })?;
+                    let v = b.expr(bc).map_err(|construct| RhsRefusal { construct, site })?;
                     b.ins.push(Ins::Deriv {
                         state: u32::try_from(*state).map_err(|_| shape(site))?,
                         v,
@@ -948,12 +914,7 @@ impl RhsRegProgram {
     /// at least [`Self::n_regs`] values.
     #[inline]
     pub(super) fn run<T: VmNum>(
-        &self,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-        regs: &mut [T],
+        &self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T], regs: &mut [T],
     ) {
         if self.run_native(u, params, seeds, du) {
             return;
@@ -978,10 +939,7 @@ impl RhsRegProgram {
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return None;
         }
-        self.jit
-            .as_ref()?
-            .resolve_hoisted(ir::Layout::F64)
-            .map(NativeF64)
+        self.jit.as_ref()?.resolve_hoisted(ir::Layout::F64).map(NativeF64)
     }
 
     /// The `f64` RHS over `k` forward tangent directions as one native function (built on
@@ -991,10 +949,7 @@ impl RhsRegProgram {
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return None;
         }
-        let layout = ir::Layout {
-            tan: u8::try_from(k).ok()?,
-            ..ir::Layout::F64
-        };
+        let layout = ir::Layout { tan: u8::try_from(k).ok()?, ..ir::Layout::F64 };
         self.jit.as_ref()?.resolve(layout).map(|f| NativeTan(f, k))
     }
 
@@ -1002,11 +957,7 @@ impl RhsRegProgram {
     /// it ran (and wrote `du`), `false` with nothing written otherwise.
     #[inline]
     pub(super) fn try_native<T: VmNum>(
-        &self,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
+        &self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T],
     ) -> bool {
         self.run_native(u, params, seeds, du)
     }
@@ -1088,13 +1039,7 @@ impl RhsRegProgram {
 
     #[inline(always)]
     fn exec<T: VmNum>(
-        &self,
-        code: &[Flat],
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-        r: &mut [T],
+        &self, code: &[Flat], u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T], r: &mut [T],
     ) {
         self.exec_range(code, 0, code.len(), u, params, seeds, du, r)
     }
@@ -1103,15 +1048,8 @@ impl RhsRegProgram {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn exec_range<T: VmNum>(
-        &self,
-        code: &[Flat],
-        start: usize,
-        end: usize,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-        r: &mut [T],
+        &self, code: &[Flat], start: usize, end: usize, u: &[T], params: &[T], seeds: &[T; 4],
+        du: &mut [T], r: &mut [T],
     ) {
         let k = T::from_f64;
         macro_rules! bin {
@@ -1172,14 +1110,7 @@ impl RhsRegProgram {
                 Flat::MulK { d, a, c } => bin!(d, a, |x: &mut T| x.mul_scalar_in(c)),
                 Flat::DivK { d, a, c } => bin!(d, a, |x: &mut T| apply_scalar_in(x, Op::Div, c)),
                 Flat::Pow { d, a, e } => r[d as usize] = r[a as usize].pow(r[e as usize]),
-                Flat::GammaPq {
-                    d,
-                    a,
-                    x,
-                    upper,
-                    i,
-                    j,
-                } => {
+                Flat::GammaPq { d, a, x, upper, i, j } => {
                     debug_assert!(i == 0 && j == 0, "a partial is never interpreted");
                     r[d as usize] = r[a as usize].gamma_pq(r[x as usize], upper)
                 }
@@ -1269,16 +1200,8 @@ impl RhsRegProgram {
     /// `x` — the selection hands the arm's adjoints to the constant.
     #[allow(clippy::too_many_arguments)]
     fn both_arms<T: VmNum>(
-        &self,
-        code: &[Flat],
-        then_start: usize,
-        else_start: usize,
-        c: u32,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-        r: &mut [T],
+        &self, code: &[Flat], then_start: usize, else_start: usize, c: u32, u: &[T], params: &[T],
+        seeds: &[T; 4], du: &mut [T], r: &mut [T],
     ) -> usize {
         use crate::sens::num::BranchCmp::{Eq, Ne};
         let zero = T::from_f64(0.0);
@@ -1325,30 +1248,14 @@ impl RhsRegProgram {
         let (_, w_then, d_then) = scan(then_start..then_end);
         let (_, w_else, d_else) = scan(else_start..end);
         for i in w_then.iter().chain(&w_else).copied() {
-            let t = if w_then.contains(&i) {
-                r_then[i]
-            } else {
-                snap_r[i]
-            };
-            let e = if w_else.contains(&i) {
-                r_else[i]
-            } else {
-                snap_r[i]
-            };
+            let t = if w_then.contains(&i) { r_then[i] } else { snap_r[i] };
+            let e = if w_else.contains(&i) { r_else[i] } else { snap_r[i] };
             r[i] = T::select_if(Ne, cond, zero, t, e);
         }
         for s in d_then.iter().chain(&d_else).copied() {
             if s < du.len() {
-                let t = if d_then.contains(&s) {
-                    du_then[s]
-                } else {
-                    snap_du[s]
-                };
-                let e = if d_else.contains(&s) {
-                    du_else[s]
-                } else {
-                    snap_du[s]
-                };
+                let t = if d_then.contains(&s) { du_then[s] } else { snap_du[s] };
+                let e = if d_else.contains(&s) { du_else[s] } else { snap_du[s] };
                 du[s] = T::select_if(Ne, cond, zero, t, e);
             }
         }
@@ -1365,10 +1272,7 @@ impl RhsRegProgram {
 ///
 /// `sites[i]` is the statement `ins[i]` came from, named in a refusal.
 fn lower(
-    ins: &[Ins],
-    sites: &[RhsSite],
-    n_tmp: usize,
-    layout: &RhsLayout<'_>,
+    ins: &[Ins], sites: &[RhsSite], n_tmp: usize, layout: &RhsLayout<'_>,
 ) -> Result<RhsRegProgram, RhsRefusal> {
     let mut next = n_tmp;
     let mut alloc = || -> Option<u32> {
@@ -1454,11 +1358,7 @@ fn lower(
             }
             Ins::Unary { dst, op, a } => {
                 let a = operand(a, &mut slot_reg, &mut prologue, &mut body).map_err(at)?;
-                Flat::Unary {
-                    d: reg(dst)?,
-                    op,
-                    a,
-                }
+                Flat::Unary { d: reg(dst)?, op, a }
             }
             Ins::Assign { slot, v } => {
                 // A local lives in its register: later reads of the slot see this value, as
@@ -1478,12 +1378,7 @@ fn lower(
             Ins::Cmp { dst, cc, a, b } => {
                 let a = operand(a, &mut slot_reg, &mut prologue, &mut body).map_err(at)?;
                 let b = operand(b, &mut slot_reg, &mut prologue, &mut body).map_err(at)?;
-                Flat::Cmp {
-                    d: reg(dst)?,
-                    cc,
-                    a,
-                    b,
-                }
+                Flat::Cmp { d: reg(dst)?, cc, a, b }
             }
             Ins::Logic { dst, or, a, b } => {
                 let a = operand(a, &mut slot_reg, &mut prologue, &mut body).map_err(at)?;
@@ -1544,20 +1439,14 @@ fn lower(
     let off = u32::try_from(prologue.len()).map_err(|_| last(RhsConstruct::Shape))?;
     for f in &mut body {
         if let Flat::Branch { to, .. } | Flat::Jump { to } = f {
-            *to = to
-                .checked_add(off)
-                .ok_or_else(|| last(RhsConstruct::Shape))?;
+            *to = to.checked_add(off).ok_or_else(|| last(RhsConstruct::Shape))?;
         }
     }
     // The prologue reads every slot at its call-entry value; an assignment renames the slot
     // for the instructions after it, so no prologue load can observe a later write.
     prologue.extend(body);
     let (code, n_regs) = reuse_registers(prologue, next);
-    Ok(RhsRegProgram {
-        jit: Some(jit::JitCode::new(&code, n_regs)),
-        code,
-        n_regs,
-    })
+    Ok(RhsRegProgram { jit: Some(jit::JitCode::new(&code, n_regs)), code, n_regs })
 }
 
 /// The register an instruction writes, and the ones it reads.
@@ -1698,12 +1587,7 @@ impl Builder {
     /// Simulate `ops` from `pc` until it reaches `fence`; the `pc` it stops at, which is one
     /// past `fence` when the last operand pushed fuses with the op at `fence`.
     fn run(
-        &mut self,
-        ops: &[Op],
-        consts: &[f64],
-        mut pc: usize,
-        fence: usize,
-        stack: &mut Vec<Src>,
+        &mut self, ops: &[Op], consts: &[f64], mut pc: usize, fence: usize, stack: &mut Vec<Src>,
     ) -> Result<usize, RhsConstruct> {
         while pc < fence {
             pc = self.step(ops, consts, pc, stack)?;
@@ -1713,17 +1597,10 @@ impl Builder {
 
     /// One op (two, fused) of `eval_bytecode_g`, at `pc`; the next `pc`.
     fn step(
-        &mut self,
-        ops: &[Op],
-        consts: &[f64],
-        pc: usize,
-        stack: &mut Vec<Src>,
+        &mut self, ops: &[Op], consts: &[f64], pc: usize, stack: &mut Vec<Src>,
     ) -> Result<usize, RhsConstruct> {
-        let fused = if stack.is_empty() {
-            None
-        } else {
-            ops.get(pc + 1).copied().and_then(Arith::of)
-        };
+        let fused =
+            if stack.is_empty() { None } else { ops.get(pc + 1).copied().and_then(Arith::of) };
         match (ops[pc], fused) {
             // Operand fusion, exactly as `eval_bytecode_g` applies it: a constant
             // consumed by the next arithmetic op is applied as a scalar, a variable in
@@ -1741,12 +1618,7 @@ impl Builder {
             (Op::PushVar(i), Some(op)) if (i as usize) < self.n_vars => {
                 let a = stack.pop().ok_or(SHAPE)?;
                 let dst = self.tmp().ok_or(SHAPE)?;
-                self.ins.push(Ins::Bin {
-                    dst,
-                    op,
-                    a,
-                    b: Src::Var(i),
-                });
+                self.ins.push(Ins::Bin { dst, op, a, b: Src::Var(i) });
                 stack.push(Src::Tmp(dst));
                 return Ok(pc + 2);
             }
@@ -1759,12 +1631,7 @@ impl Builder {
                 let b = stack.pop().ok_or(SHAPE)?;
                 let a = stack.pop().ok_or(SHAPE)?;
                 let dst = self.tmp().ok_or(SHAPE)?;
-                self.ins.push(Ins::Bin {
-                    dst,
-                    op: Arith::of(op).ok_or(SHAPE)?,
-                    a,
-                    b,
-                });
+                self.ins.push(Ins::Bin { dst, op: Arith::of(op).ok_or(SHAPE)?, a, b });
                 stack.push(Src::Tmp(dst));
             }
             (Op::Pow, _) => {
@@ -1875,12 +1742,7 @@ impl Builder {
     /// A construct an arm cannot translate is reported as itself (a `tanh` in an arm is
     /// `tanh`); an `if` whose bytecode is not in this shape is [`RhsConstruct::InlineIf`].
     fn conditional(
-        &mut self,
-        ops: &[Op],
-        consts: &[f64],
-        pc: usize,
-        else_at: usize,
-        stack: &mut Vec<Src>,
+        &mut self, ops: &[Op], consts: &[f64], pc: usize, else_at: usize, stack: &mut Vec<Src>,
     ) -> Result<usize, RhsConstruct> {
         const IF: RhsConstruct = RhsConstruct::InlineIf;
         let c = stack.pop().ok_or(SHAPE)?;

@@ -114,17 +114,10 @@ const SIGNAL_TOL: f64 = 0.02;
 fn vanco_renal_example_parses_and_pins_the_ladder() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal.ferx"))
         .expect("vanco renal model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 500.0, "empiric start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
-    assert_eq!(
-        spec.target_window,
-        Some((10.0, 15.0)),
-        "trough target band (point metric)"
-    );
+    assert_eq!(spec.target_window, Some((10.0, 15.0)), "trough target band (point metric)");
     assert_eq!(
         spec.auc_target, None,
         "the renal example declares no auc_target; the window-AUC test adds one (#943)"
@@ -143,10 +136,7 @@ fn vanco_renal_example_parses_and_pins_the_ladder() {
 fn vanco_renal_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal.ferx"))
         .expect("vanco renal model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
     // `read_nonmem_csv` auto-detects the (non-standard) `CRCL` column and, because
     // it varies across rows, populates each subject's `obs_covariates` — the
     // per-event snapshots the reactive driver resolves PK from (#700).
@@ -187,11 +177,7 @@ fn vanco_renal_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - trough_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
@@ -255,9 +241,9 @@ fn vanco_renal_titration_matches_mrgsolve() {
 
     // Point metric: troughs in [10, 15] on 6 of 14 decisions (5, 6, 9, 10, 12, 13).
     assert!(
-        (m.pct_time_in_window.expect("trough window declared") - 6.0 / 14.0).abs() < 1e-9,
-        "pct_time_in_window {:?}",
-        m.pct_time_in_window
+        (m.pct_readings_in_window.expect("trough window declared") - 6.0 / 14.0).abs() < 1e-9,
+        "pct_readings_in_window {:?}",
+        m.pct_readings_in_window
     );
 
     // The example declares no `auc_target`, so no exposure metric is reported.
@@ -297,10 +283,7 @@ fn vanco_renal_window_aucs_match_mrgsolve() {
 fn windows_in(band: (f64, f64)) -> usize {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal.ferx"))
         .expect("model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     spec.auc_target = Some(band);
     let pop = read_nonmem_csv(
         Path::new("tests/reference/vanco_renal_mrgsolve/vanco_renal_subject.csv"),

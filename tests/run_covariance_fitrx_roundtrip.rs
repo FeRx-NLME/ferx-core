@@ -70,53 +70,18 @@ const MIN_DISCRIMINATING: usize = 1;
 /// (`analytic_cov_hessian = false`) amplify that change by the stencil's `ε/h²`, so they
 /// discriminate by construction; the claim is asserted on every row either way.
 const ROWS: [(&str, &str, EstimationMethod, bool); 7] = [
-    (
-        "examples/warfarin.ferx",
-        "data/warfarin.csv",
-        EstimationMethod::Foce,
-        true,
-    ),
-    (
-        "examples/two_cpt_oral_cov.ferx",
-        "data/two_cpt_oral_cov.csv",
-        EstimationMethod::FoceI,
-        true,
-    ),
+    ("examples/warfarin.ferx", "data/warfarin.csv", EstimationMethod::Foce, true),
+    ("examples/two_cpt_oral_cov.ferx", "data/two_cpt_oral_cov.csv", EstimationMethod::FoceI, true),
     // Review r1 #3: the docs' Laplace claim.
-    (
-        "examples/warfarin.ferx",
-        "data/warfarin.csv",
-        EstimationMethod::Laplace,
-        true,
-    ),
+    ("examples/warfarin.ferx", "data/warfarin.csv", EstimationMethod::Laplace, true),
     // The issue's "done when" fixture.
-    (
-        "examples/warfarin_iov.ferx",
-        "data/warfarin_iov.csv",
-        EstimationMethod::FoceI,
-        true,
-    ),
-    (
-        "examples/warfarin.ferx",
-        "data/warfarin.csv",
-        EstimationMethod::Foce,
-        false,
-    ),
-    (
-        "examples/two_cpt_oral_cov.ferx",
-        "data/two_cpt_oral_cov.csv",
-        EstimationMethod::FoceI,
-        false,
-    ),
+    ("examples/warfarin_iov.ferx", "data/warfarin_iov.csv", EstimationMethod::FoceI, true),
+    ("examples/warfarin.ferx", "data/warfarin.csv", EstimationMethod::Foce, false),
+    ("examples/two_cpt_oral_cov.ferx", "data/two_cpt_oral_cov.csv", EstimationMethod::FoceI, false),
     // The premise row: the Laplace fit's packed vector does not survive `pack(unpack(x))`
     // (log-packed TVKA moves one ulp through `ln(exp(x))`), and the FD stencil steps from
     // that vector, so without it every stencil point moves.
-    (
-        "examples/warfarin.ferx",
-        "data/warfarin.csv",
-        EstimationMethod::Laplace,
-        false,
-    ),
+    ("examples/warfarin.ferx", "data/warfarin.csv", EstimationMethod::Laplace, false),
 ];
 
 struct Fitted {
@@ -128,11 +93,7 @@ struct Fitted {
 
 /// `row` labels every panic: two rows share `model_path` (warfarin FOCE and Laplace).
 fn fit_inline(
-    row: &str,
-    model_path: &str,
-    data_path: &str,
-    method: EstimationMethod,
-    analytic_cov: bool,
+    row: &str, model_path: &str, data_path: &str, method: EstimationMethod, analytic_cov: bool,
 ) -> Fitted {
     let prep =
         prepare_run(model_path, Some(data_path)).unwrap_or_else(|e| panic!("{row}: prepare: {e}"));
@@ -153,29 +114,14 @@ fn fit_inline(
         "{row}: the engine this file names moved: {}",
         fit.gradient_method_inner
     );
-    assert!(
-        fit.packed_estimate.is_some(),
-        "{row}: a packed-space fit must carry packed_estimate"
-    );
-    Fitted {
-        model,
-        population,
-        fit,
-        analytic_cov,
-    }
+    assert!(fit.packed_estimate.is_some(), "{row}: a packed-space fit must carry packed_estimate");
+    Fitted { model, population, fit, analytic_cov }
 }
 
 fn reload(f: &Fitted) -> FitResult {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fit.fitrx");
-    save_fit(
-        &f.fit,
-        &f.population,
-        "model\n",
-        &path,
-        SaveFitOptions::default(),
-    )
-    .expect("save_fit");
+    save_fit(&f.fit, &f.population, "model\n", &path, SaveFitOptions::default()).expect("save_fit");
     load_fit(&path).expect("load_fit").fit
 }
 
@@ -198,15 +144,9 @@ fn bits_of(fit: &FitResult, what: &str) -> (Vec<u64>, Vec<u64>) {
         .as_ref()
         .unwrap_or_else(|| panic!("{what}: covariance step produced no matrix"));
     assert!(cov.iter().all(|x| x.is_finite()), "{what}: non-finite cov");
-    let se = fit
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("{what}: no se_theta"));
+    let se = fit.se_theta.as_ref().unwrap_or_else(|| panic!("{what}: no se_theta"));
     assert!(se.iter().all(|x| x.is_finite()), "{what}: non-finite se");
-    (
-        cov.iter().map(|x| x.to_bits()).collect(),
-        se.iter().map(|x| x.to_bits()).collect(),
-    )
+    (cov.iter().map(|x| x.to_bits()).collect(), se.iter().map(|x| x.to_bits()).collect())
 }
 
 /// Max |Δ| of two bit vectors read back as `f64`. Both sides are finite (`bits_of`),
@@ -223,11 +163,7 @@ fn max_gap(a: &[u64], b: &[u64]) -> f64 {
 /// reload (no packed vector) and the inline step when their bits differ, `None` when
 /// they are bit-identical.
 fn roundtrip_row(
-    row: &str,
-    model_path: &str,
-    data_path: &str,
-    method: EstimationMethod,
-    analytic_cov: bool,
+    row: &str, model_path: &str, data_path: &str, method: EstimationMethod, analytic_cov: bool,
 ) -> Option<f64> {
     let f = fit_inline(row, model_path, data_path, method, analytic_cov);
     let inline = bits_of(&f.fit, &format!("{row} inline"));
@@ -237,10 +173,7 @@ fn roundtrip_row(
             .packed_estimate
             .as_deref()
             .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
-        f.fit
-            .packed_estimate
-            .as_deref()
-            .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
+        f.fit.packed_estimate.as_deref().map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()),
         "{row}: the bundle must carry the packed vector bit for bit"
     );
     assert!(

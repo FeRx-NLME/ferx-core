@@ -52,9 +52,7 @@ pub(crate) fn map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 
 /// `(0..n).into_par_iter().map_init(init, f).collect()`: one `init()` scratch per leaf range.
 pub(crate) fn map_init<S, T: Send>(
-    n: usize,
-    init: impl Fn() -> S + Sync,
-    f: impl Fn(&mut S, usize) -> T + Sync,
+    n: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) -> T + Sync,
 ) -> Vec<T> {
     let mut out: Vec<T> = Vec::with_capacity(n);
     let slots = Slots(out.as_mut_ptr());

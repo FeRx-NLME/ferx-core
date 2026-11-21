@@ -182,11 +182,9 @@ fn fit_on(model_text: &str, data: &str) -> FitResult {
     let data_path = dir.path().join("d.csv");
     write!(std::fs::File::create(&model_path).unwrap(), "{model_text}").unwrap();
     write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
-    let (result, _pop) = run_model_with_data(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("fit");
+    let (result, _pop) =
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("fit");
     result
 }
 
@@ -199,11 +197,7 @@ fn levels(result: &FitResult) -> Vec<(usize, f64)> {
         .filter(|(_, n)| n.starts_with("PLACEBO["))
         .map(|(i, _)| (i, result.theta[i]))
         .collect();
-    assert!(
-        !out.is_empty(),
-        "no PLACEBO level in {:?}",
-        result.theta_names
-    );
+    assert!(!out.is_empty(), "no PLACEBO level in {:?}", result.theta_names);
     out
 }
 
@@ -232,11 +226,8 @@ fn assert_analytic_ran(result: &FitResult, case: &str) {
         "{case}: the model-level route must be the analytic gradient under test, got {}",
         result.gradient_method_outer
     );
-    let fallback: Vec<&String> = result
-        .warnings
-        .iter()
-        .filter(|w| w.contains(OUTER_FD_FALLBACK))
-        .collect();
+    let fallback: Vec<&String> =
+        result.warnings.iter().filter(|w| w.contains(OUTER_FD_FALLBACK)).collect();
     assert!(
         fallback.is_empty(),
         "{case}: subjects fell back off the analytic outer gradient: {fallback:?}"
@@ -258,9 +249,7 @@ fn assert_analytic_ran_sees_a_runtime_decline() {
     let result = fit(&model(form, form.gather_line, SHORT_FIT));
     assert_analytic_ran(&result, "clean control");
     let mut declined = result.clone();
-    declined
-        .warnings
-        .push(format!("1 of 3 subjects {OUTER_FD_FALLBACK}"));
+    declined.warnings.push(format!("1 of 3 subjects {OUTER_FD_FALLBACK}"));
     assert!(
         declined.gradient_method_outer.starts_with("analytic"),
         "the label must stay analytic for this to be the case under test: {}",
@@ -269,10 +258,7 @@ fn assert_analytic_ran_sees_a_runtime_decline() {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_analytic_ran(&declined, "runtime-decline control")
     }));
-    assert!(
-        caught.is_err(),
-        "assert_analytic_ran must reject a fit whose subject fell back to FD"
-    );
+    assert!(caught.is_err(), "assert_analytic_ran must reject a fit whose subject fell back to FD");
 }
 
 #[test]
@@ -281,12 +267,7 @@ fn a_gathered_theta_leaves_its_init_on_the_analytic_gradient() {
         let result = fit(&model(form, form.gather_line, SHORT_FIT));
         assert_analytic_ran(&result, form.name);
         for (i, v) in levels(&result) {
-            assert!(
-                v.is_finite(),
-                "{}: {} = {v}",
-                form.name,
-                result.theta_names[i]
-            );
+            assert!(v.is_finite(), "{}: {} = {v}", form.name, result.theta_names[i]);
             assert!(
                 (v - form.init).abs() > 1e-3,
                 "{}: {} stayed at its init {} — the analytic gradient does not \
@@ -317,12 +298,7 @@ fn a_gathered_theta_fits_exactly_like_its_directly_read_twin() {
                 direct.theta_names[i]
             );
         }
-        assert!(
-            gathered.ofv.is_finite(),
-            "{}: OFV {}",
-            form.name,
-            gathered.ofv
-        );
+        assert!(gathered.ofv.is_finite(), "{}: OFV {}", form.name, gathered.ofv);
         // Not bit for bit since #486: the adjoint tapes each model's own program, and the
         // twin's `+ 0 * TVV` reads TVV directly — another θ axis and a `Shift` node on the
         // tape — so the reverse sweep accumulates in a different order. Measured 68 ULP
@@ -359,27 +335,15 @@ fn a_gathered_theta_is_not_reported_as_unreferenced() {
         let text = model(form, form.gather_line, SHORT_FIT)
             .replace("  theta TVV(", "  theta UNUSED(1.0, FIX)\n  theta TVV(");
         let result = fit(&text);
-        let unreferenced: Vec<&String> = result
-            .warnings
-            .iter()
-            .filter(|w| w.contains("but not referenced"))
-            .collect();
+        let unreferenced: Vec<&String> =
+            result.warnings.iter().filter(|w| w.contains("but not referenced")).collect();
         assert!(
             unreferenced.iter().all(|w| !w.contains("PLACEBO")),
             "{}: a gathered level reported unreferenced: {unreferenced:?}",
             form.name
         );
-        assert_eq!(
-            unreferenced.len(),
-            1,
-            "{}: exactly the control θ: {unreferenced:?}",
-            form.name
-        );
-        assert!(
-            unreferenced[0].contains("'UNUSED'"),
-            "{}: {unreferenced:?}",
-            form.name
-        );
+        assert_eq!(unreferenced.len(), 1, "{}: exactly the control θ: {unreferenced:?}", form.name);
+        assert!(unreferenced[0].contains("'UNUSED'"), "{}: {unreferenced:?}", form.name);
     }
 }
 
@@ -394,11 +358,7 @@ fn study_cl(form: &Form, result: &FitResult) -> [f64; 3] {
             "counted" => format!("PLACEBO[{study}]"),
             _ => format!("PLACEBO[STUDY={study}]"),
         };
-        result
-            .theta_names
-            .iter()
-            .position(|n| *n == name)
-            .map(|i| result.theta[i])
+        result.theta_names.iter().position(|n| *n == name).map(|i| result.theta[i])
     };
     if form.init != 0.0 {
         return [1, 2, 3].map(|s| by_study(s).expect("every level is free"));
@@ -450,10 +410,7 @@ fn study_cl(form: &Form, result: &FitResult) -> [f64; 3] {
 /// Every number is printed for every form before anything is asserted, so a
 /// red run on one platform still reports the other forms.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_gathered_theta_converges_to_the_finite_difference_optimum() {
     const CONVERGE: &str = "  maxiter = 500";
     const OFV_SLACK: f64 = 1e-3;
@@ -463,11 +420,7 @@ fn a_gathered_theta_converges_to_the_finite_difference_optimum() {
     let mut failures: Vec<String> = Vec::new();
     for form in &FORMS {
         let analytic = fit(&model(form, form.gather_line, CONVERGE));
-        let fd = fit(&model(
-            form,
-            form.gather_line,
-            &format!("{CONVERGE}\n  gradient = fd"),
-        ));
+        let fd = fit(&model(form, form.gather_line, &format!("{CONVERGE}\n  gradient = fd")));
         // Without the runtime half of this check, a fit whose subjects all fell
         // back to FD would make this an FD-vs-FD comparison and pass.
         assert_analytic_ran(&analytic, form.name);
@@ -488,9 +441,7 @@ fn a_gathered_theta_converges_to_the_finite_difference_optimum() {
             fd.ofv
         );
         let d_ofv = analytic.ofv - fd.ofv;
-        let cl_rel: Vec<f64> = (0..3)
-            .map(|k| (cl_a[k] - cl_f[k]).abs() / cl_f[k])
-            .collect();
+        let cl_rel: Vec<f64> = (0..3).map(|k| (cl_a[k] - cl_f[k]).abs() / cl_f[k]).collect();
         let cl_rel_txt: Vec<String> = cl_rel.iter().map(|r| format!("{r:.3e}")).collect();
         eprintln!(
             "{}: OFV analytic {:.10} fd {:.10} (analytic − fd {d_ofv:.3e}); \
@@ -711,35 +662,17 @@ const READOUTS: [Readout; 3] = [
             pk_readout_model(ODE_STRUCTURAL, theta, "", "central / V * SCALE[STUDY]", fo)
         },
         lifted: |theta, fo| {
-            pk_readout_model(
-                ODE_STRUCTURAL,
-                theta,
-                "S = SCALE[STUDY]",
-                "central / V * S",
-                fo,
-            )
+            pk_readout_model(ODE_STRUCTURAL, theta, "S = SCALE[STUDY]", "central / V * S", fo)
         },
     },
     Readout {
         engine: "closed-form Form-C (sens/provider.rs)",
         data: DATA,
         in_y: |theta, fo| {
-            pk_readout_model(
-                CLOSED_STRUCTURAL,
-                theta,
-                "",
-                "central / V * SCALE[STUDY]",
-                fo,
-            )
+            pk_readout_model(CLOSED_STRUCTURAL, theta, "", "central / V * SCALE[STUDY]", fo)
         },
         lifted: |theta, fo| {
-            pk_readout_model(
-                CLOSED_STRUCTURAL,
-                theta,
-                "S = SCALE[STUDY]",
-                "central / V * S",
-                fo,
-            )
+            pk_readout_model(CLOSED_STRUCTURAL, theta, "S = SCALE[STUDY]", "central / V * S", fo)
         },
     },
     Readout {
@@ -792,11 +725,8 @@ fn a_readout_gather_fits_exactly_like_its_lifted_twin() {
         let lifted = fit_on(&(r.lifted)(READOUT_BLOCK, SHORT_FIT), r.data);
         assert_analytic_ran(&in_y, r.engine);
         assert_analytic_ran(&lifted, r.engine);
-        let unreferenced: Vec<&String> = in_y
-            .warnings
-            .iter()
-            .filter(|w| w.contains("but not referenced"))
-            .collect();
+        let unreferenced: Vec<&String> =
+            in_y.warnings.iter().filter(|w| w.contains("but not referenced")).collect();
         assert!(
             unreferenced.is_empty(),
             "{}: a level read in the readout reported unreferenced: {unreferenced:?}",
@@ -851,9 +781,7 @@ fn level_preds(model: &str, data: &str) -> Vec<(String, f64, f64)> {
         }
     }
     let rows = ferx_core::predict(&parsed.model, &pop, &params).expect("predict");
-    rows.iter()
-        .map(|r| (r.id.clone(), r.time, r.pred))
-        .collect()
+    rows.iter().map(|r| (r.id.clone(), r.time, r.pred)).collect()
 }
 
 /// T5: `predict()` is bit-identical between the gather in `y` and the gather
@@ -945,10 +873,7 @@ fn a_readout_gather_predicts_exactly_like_its_lifted_twin() {
 /// the compartment-free engine (#1636 plan §0, B1/F1/A1), so the slack still kills
 /// all three.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_readout_gather_converges_to_the_lifted_optimum() {
     const CONVERGE: &str = "  maxiter = 500";
     const FD_OFV_SLACK: f64 = 1e-2;
@@ -956,10 +881,7 @@ fn a_readout_gather_converges_to_the_lifted_optimum() {
     for r in &READOUTS {
         let in_y = fit_on(&(r.in_y)(READOUT_BLOCK, CONVERGE), r.data);
         let lifted = fit_on(&(r.lifted)(READOUT_BLOCK, CONVERGE), r.data);
-        let fd = fit_on(
-            &(r.in_y)(READOUT_BLOCK, &format!("{CONVERGE}\n  gradient = fd")),
-            r.data,
-        );
+        let fd = fit_on(&(r.in_y)(READOUT_BLOCK, &format!("{CONVERGE}\n  gradient = fd")), r.data);
         assert_analytic_ran(&in_y, r.engine);
         assert!(
             in_y.ofv.is_finite() && lifted.ofv.is_finite() && fd.ofv.is_finite(),
@@ -979,10 +901,7 @@ fn a_readout_gather_converges_to_the_lifted_optimum() {
             readout_levels(&in_y)
         );
         if in_y.ofv.to_bits() != lifted.ofv.to_bits() {
-            failures.push(format!(
-                "{}: OFV {} vs lifted {}",
-                r.engine, in_y.ofv, lifted.ofv
-            ));
+            failures.push(format!("{}: OFV {} vs lifted {}", r.engine, in_y.ofv, lifted.ofv));
         }
         if d_fd >= FD_OFV_SLACK {
             failures.push(format!(
@@ -1041,16 +960,8 @@ const RUV_INIT: f64 = 2.0;
 
 /// Counted, and a bare named block (implicit index, bound from the data).
 const RUV_GATHER_FORMS: [(&str, &str, &str); 2] = [
-    (
-        "counted",
-        "theta ERRSCALE[3](2.0, 0.1, 10.0)",
-        "ERRSCALE[STUDY]",
-    ),
-    (
-        "named, bare",
-        "theta ERRSCALE[STUDY, contrast = none](2.0, 0.1, 10.0)",
-        "ERRSCALE",
-    ),
+    ("counted", "theta ERRSCALE[3](2.0, 0.1, 10.0)", "ERRSCALE[STUDY]"),
+    ("named, bare", "theta ERRSCALE[STUDY, contrast = none](2.0, 0.1, 10.0)", "ERRSCALE"),
 ];
 
 fn ruv_levels(result: &FitResult) -> Vec<(String, f64)> {
@@ -1092,10 +1003,7 @@ fn a_gathered_residual_magnitude_is_estimated_under_gauss_newton() {
             worst = worst.max((a - f).abs() / f.abs());
         }
         eprintln!("{form}: short GN, worst level rel vs fd {worst:.3e}");
-        assert!(
-            worst < SHORT_GN_REL_TOL,
-            "{form}: {analytic:?} vs fd {fd:?} (rel {worst:.3e})"
-        );
+        assert!(worst < SHORT_GN_REL_TOL, "{form}: {analytic:?} vs fd {fd:?} (rel {worst:.3e})");
     }
 }
 
@@ -1119,10 +1027,7 @@ const SHORT_GN_REL_TOL: f64 = 1e-8;
 /// land at OFV 52.4389 instead — so the oracle is FD from the *same* start, not a
 /// fixed number.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_gathered_residual_magnitude_converges_to_the_fd_gauss_newton_optimum() {
     const LEVEL_REL_TOL: f64 = 1e-5;
     const OFV_TOL: f64 = 1e-3;
@@ -1159,9 +1064,7 @@ fn a_gathered_residual_magnitude_converges_to_the_fd_gauss_newton_optimum() {
             failures.push(format!("{form}: OFV {} vs fd {}", analytic.ofv, fd.ofv));
         }
         if worst >= LEVEL_REL_TOL {
-            failures.push(format!(
-                "{form}: levels {la:?} vs fd {lf:?} (rel {worst:.3e})"
-            ));
+            failures.push(format!("{form}: levels {la:?} vs fd {lf:?} (rel {worst:.3e})"));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -1210,13 +1113,7 @@ fn a_kappa_weight_reading_a_bound_estimated_named_block_is_refused() {
     let data: String = DATA
         .lines()
         .enumerate()
-        .map(|(i, l)| {
-            if i == 0 {
-                format!("{l},OCC\n")
-            } else {
-                format!("{l},1\n")
-            }
-        })
+        .map(|(i, l)| if i == 0 { format!("{l},OCC\n") } else { format!("{l},1\n") })
         .collect();
     let run = |text: &str| {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1224,12 +1121,9 @@ fn a_kappa_weight_reading_a_bound_estimated_named_block_is_refused() {
         let data_path = dir.path().join("d.csv");
         write!(std::fs::File::create(&model_path).unwrap(), "{text}").unwrap();
         write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
-        run_model_with_data(
-            model_path.to_str().unwrap(),
-            Some(data_path.to_str().unwrap()),
-        )
-        .map(|_| ())
-        .map_err(|e| format!("{e}"))
+        run_model_with_data(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .map(|_| ())
+            .map_err(|e| format!("{e}"))
     };
     // The premise: the unbound parse alone cannot refuse it.
     assert!(
