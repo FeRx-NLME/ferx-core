@@ -89,19 +89,12 @@ pub(crate) const GN_BUDGET_WARNING: &str =
 /// free parameters, else `None`; `fit` drops it from a GN stage a later stage re-optimises
 /// ([`GN_RANK_DEFICIENT_HEAD`], `postfit::keep_gn_zero_eta_warning`).
 pub(crate) fn gn_rank_deficient_warning(
-    converged: bool,
-    n_subjects: usize,
-    n_free: usize,
-    method: EstimationMethod,
+    converged: bool, n_subjects: usize, n_free: usize, method: EstimationMethod,
 ) -> Option<String> {
     if converged || n_subjects >= n_free || method == EstimationMethod::FoceGnHybrid {
         return None;
     }
-    let subjects = if n_subjects == 1 {
-        "subject"
-    } else {
-        "subjects"
-    };
+    let subjects = if n_subjects == 1 { "subject" } else { "subjects" };
     Some(format!(
         "{GN_RANK_DEFICIENT_HEAD}{n_subjects} {subjects} for {n_free} free parameters, so the \
          BHHH information has rank at most {n_subjects} and is singular; its steps can stall \
@@ -717,12 +710,7 @@ pub fn run_foce_gn(
     // #2438: with fewer subjects than free parameters the BHHH is singular, the likely reason
     // the loop stalled.
     let n_free = fixed_mask.iter().filter(|&&f| !f).count();
-    warnings.extend(gn_rank_deficient_warning(
-        converged,
-        n_subj,
-        n_free,
-        options.method,
-    ));
+    warnings.extend(gn_rank_deficient_warning(converged, n_subj, n_free, options.method));
 
     // Recompute gradient at the final accepted x so the stored value is always
     // at the converged point (mid-loop capture would be off by one step).
@@ -2649,37 +2637,22 @@ mod tests {
         };
         assert_eq!(
             rank(&pop, &opts),
-            [
-                "Gauss-Newton (BHHH): 3 subjects for 4 free parameters, so the BHHH information \
+            ["Gauss-Newton (BHHH): 3 subjects for 4 free parameters, so the BHHH information \
               has rank at most 3 and is singular; its steps can stall short of the optimum. Use \
-              method = gn_hybrid, or a different optimizer."
-            ]
+              method = gn_hybrid, or a different optimizer."]
         );
         let mut four = pop.clone();
-        four.subjects.push(Subject {
-            id: "4".into(),
-            ..pop.subjects[0].clone()
-        });
-        assert!(
-            rank(&four, &opts).is_empty(),
-            "as many subjects as parameters"
-        );
-        let hybrid = FitOptions {
-            method: crate::types::EstimationMethod::FoceGnHybrid,
-            ..opts.clone()
-        };
+        four.subjects.push(Subject { id: "4".into(), ..pop.subjects[0].clone() });
+        assert!(rank(&four, &opts).is_empty(), "as many subjects as parameters");
+        let hybrid =
+            FitOptions { method: crate::types::EstimationMethod::FoceGnHybrid, ..opts.clone() };
         assert!(rank(&pop, &hybrid).is_empty(), "gn_hybrid");
         // A fit that converged is not told it stalled. No `gn` fixture with fewer subjects than
         // parameters converges (this one stalls at OFV 5.7e4 in 100 iterations), so the gate
         // is pinned on the function.
-        assert_eq!(
-            gn_rank_deficient_warning(true, 3, 4, EstimationMethod::FoceGn),
-            None
-        );
-        assert!(
-            gn_rank_deficient_warning(false, 1, 2, EstimationMethod::FoceGn)
-                .is_some_and(|w| w.starts_with("Gauss-Newton (BHHH): 1 subject for"))
-        );
+        assert_eq!(gn_rank_deficient_warning(true, 3, 4, EstimationMethod::FoceGn), None);
+        assert!(gn_rank_deficient_warning(false, 1, 2, EstimationMethod::FoceGn)
+            .is_some_and(|w| w.starts_with("Gauss-Newton (BHHH): 1 subject for")));
     }
 
     /// #816 follow-up regression: GN and its FOCEI hybrid both optimize in packed
