@@ -138,37 +138,23 @@ impl std::fmt::Display for Difference {
             if names.is_empty() {
                 "none".to_string()
             } else {
-                names
-                    .iter()
-                    .map(|n| format!("`{n}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
             }
         };
         match self {
             Difference::SubjectCount { population, fit } => {
                 write!(f, "it has {population} subjects, the fit's has {fit}")
             }
-            Difference::SubjectId {
-                position,
-                population,
-                fit,
-            } => write!(
-                f,
-                "its subject {} is `{population}`, the fit's is `{fit}`",
-                position + 1
-            ),
+            Difference::SubjectId { position, population, fit } => {
+                write!(f, "its subject {} is `{population}`, the fit's is `{fit}`", position + 1)
+            }
             Difference::CovariateNames { missing, extra } => write!(
                 f,
                 "its covariate columns are not the fit's: missing {}, extra {}",
                 list(missing),
                 list(extra)
             ),
-            Difference::Records {
-                id,
-                population,
-                fit,
-            } if population != fit => write!(
+            Difference::Records { id, population, fit } if population != fit => write!(
                 f,
                 "the records of subject `{id}` differ: {population} observations in this \
                  population, {fit} in the fit's"
@@ -181,11 +167,7 @@ impl std::fmt::Display for Difference {
                  observations: an observation time, value, compartment, censoring flag or \
                  occasion, or an `EVID = 2` or reset row"
             ),
-            Difference::Doses {
-                id,
-                population,
-                fit,
-            } if population != fit => write!(
+            Difference::Doses { id, population, fit } if population != fit => write!(
                 f,
                 "the doses of subject `{id}` differ: {population} in this population, {fit} \
                  in the fit's, with the same observation records"
@@ -239,10 +221,7 @@ impl PopulationFingerprint {
             scheme: SCHEME,
             occasions_derived,
             covariate_names: names,
-            subjects: subjects
-                .iter()
-                .map(|s| subject_print(s, occasions_derived))
-                .collect(),
+            subjects: subjects.iter().map(|s| subject_print(s, occasions_derived)).collect(),
         }
     }
 
@@ -345,9 +324,7 @@ impl PopulationFingerprint {
     /// cannot be compared, so nothing is checked and the one note says so; on a
     /// match the notes are empty.
     pub fn verify(
-        &self,
-        model: &crate::types::CompiledModel,
-        population: &Population,
+        &self, model: &crate::types::CompiledModel, population: &Population,
     ) -> Result<Vec<String>, crate::EngineError> {
         crate::estimation::fit_inputs::verify_given_population(self, model, population)
     }
@@ -358,24 +335,14 @@ impl PopulationFingerprint {
 /// `fit.subjects` leg, which runs whenever `fit.subjects` is filled (#1868 r1 #1),
 /// so both name a subject-list mismatch the same way.
 pub(crate) fn subject_list_difference<'a>(
-    population: impl ExactSizeIterator<Item = &'a str>,
-    fit: impl ExactSizeIterator<Item = &'a str>,
+    population: impl ExactSizeIterator<Item = &'a str>, fit: impl ExactSizeIterator<Item = &'a str>,
 ) -> Option<Difference> {
     if population.len() != fit.len() {
-        return Some(Difference::SubjectCount {
-            population: population.len(),
-            fit: fit.len(),
-        });
+        return Some(Difference::SubjectCount { population: population.len(), fit: fit.len() });
     }
-    population
-        .zip(fit)
-        .enumerate()
-        .find(|(_, (p, f))| p != f)
-        .map(|(position, (p, f))| Difference::SubjectId {
-            position,
-            population: p.to_string(),
-            fit: f.to_string(),
-        })
+    population.zip(fit).enumerate().find(|(_, (p, f))| p != f).map(|(position, (p, f))| {
+        Difference::SubjectId { position, population: p.to_string(), fit: f.to_string() }
+    })
 }
 
 fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
@@ -425,11 +392,7 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
     cens.iter().for_each(|&c| r.bytes(&c.to_le_bytes()));
     // Derived labels are the fit's, not the population's: both sides hash none.
     let derived_out: &[u32] = &[];
-    r.u32s(if occasions_derived {
-        derived_out
-    } else {
-        occasions
-    });
+    r.u32s(if occasions_derived { derived_out } else { occasions });
     r.len(obs_l2.len());
     obs_l2.iter().for_each(|&l| r.bytes(&l.to_le_bytes()));
     r.len(fremtype.len());
@@ -449,40 +412,22 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         });
     }
     r.len(reset_period_times.len());
-    reset_period_times
-        .iter()
-        .for_each(|&(e, w)| r.f64s(&[e, w]));
+    reset_period_times.iter().for_each(|&(e, w)| r.f64s(&[e, w]));
     // A derived rule overwrites these too (`apply_iov_occasion_rule`: pk-only rows
     // since #1876, reset rows since #1944).
-    r.u32s(if occasions_derived {
-        derived_out
-    } else {
-        reset_occasions
-    });
-    r.u32s(if occasions_derived {
-        derived_out
-    } else {
-        pk_only_occasions
-    });
+    r.u32s(if occasions_derived { derived_out } else { reset_occasions });
+    r.u32s(if occasions_derived { derived_out } else { pk_only_occasions });
 
     let mut d = Encoder::default();
     d.len(doses.len());
     doses.iter().for_each(|x| dose(&mut d, x));
-    d.u32s(if occasions_derived {
-        derived_out
-    } else {
-        dose_occasions
-    });
+    d.u32s(if occasions_derived { derived_out } else { dose_occasions });
 
     let mut c = Encoder::default();
     c.map(covariates);
-    for snapshots in [
-        dose_covariates,
-        obs_covariates,
-        pk_only_covariates,
-        reset_covariates,
-        endpoint_covariates,
-    ] {
+    for snapshots in
+        [dose_covariates, obs_covariates, pk_only_covariates, reset_covariates, endpoint_covariates]
+    {
         c.len(snapshots.len());
         snapshots.iter().for_each(|m| c.map(m));
     }
@@ -555,12 +500,7 @@ fn dose(e: &mut Encoder, d: &DoseEvent) {
 fn obs_record(e: &mut Encoder, o: &ObsRecord) {
     match o {
         #[cfg(feature = "survival")]
-        ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            cmt,
-        } => {
+        ObsRecord::Event { time, event_type, entry_time, cmt } => {
             e.bytes(&[0]);
             e.f64(*time);
             match event_type {
@@ -575,24 +515,14 @@ fn obs_record(e: &mut Encoder, o: &ObsRecord) {
             e.f64(*entry_time);
             e.usize(*cmt);
         }
-        ObsRecord::DiscreteState {
-            time,
-            raw_time,
-            state,
-            cmt,
-        } => {
+        ObsRecord::DiscreteState { time, raw_time, state, cmt } => {
             e.bytes(&[1]);
             e.f64(*time);
             e.f64(*raw_time);
             e.usize(*state);
             e.usize(*cmt);
         }
-        ObsRecord::Count {
-            time,
-            raw_time,
-            count,
-            cmt,
-        } => {
+        ObsRecord::Count { time, raw_time, count, cmt } => {
             e.bytes(&[2]);
             e.f64(*time);
             e.f64(*raw_time);

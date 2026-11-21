@@ -42,10 +42,7 @@ fn mismatch(what: &str, how: &str) -> String {
 
 /// Its `to_string()` from `entry`: the context, the message, the suggestion.
 fn refusal(entry: &str, what: &str, how: &str) -> String {
-    format!(
-        "{entry}: {} Use the population the fit was given, or refit.",
-        mismatch(what, how)
-    )
+    format!("{entry}: {} Use the population the fit was given, or refit.", mismatch(what, how))
 }
 
 fn bits(v: &[f64]) -> Vec<u64> {
@@ -100,20 +97,12 @@ fn read_recorded(c: &Case) -> Population {
 #[test]
 fn a_caller_row_filter_is_replayed_on_the_re_read() {
     let c = case_with_call_ignore(Kind::Plain, false, &["TIME > 24"]);
-    let settings = c
-        .fit
-        .reader_settings
-        .as_ref()
-        .expect("fit_from_files records");
+    let settings = c.fit.reader_settings.as_ref().expect("fit_from_files records");
     assert_eq!(settings.ignore_exprs, ["TIME > 24"]);
     let fitted = read_recorded(&c);
     let (file_read, _) = crate::api::read_population_as_fitted(&c.prep.parsed, data(&c)).unwrap();
     assert_eq!((c.fit.n_obs, fitted.n_obs()), (240, 240));
-    assert_eq!(
-        file_read.n_obs(),
-        300,
-        "the straddle: the model file has no clause"
-    );
+    assert_eq!(file_read.n_obs(), 300, "the straddle: the model file has no clause");
 
     let model = &c.prep.parsed.model;
     let want = run_covariance(&c.fit, Some(model), Some(&fitted), &c.opts).expect("oracle");
@@ -134,43 +123,25 @@ fn a_caller_row_filter_is_replayed_on_the_re_read() {
     assert_same_covariance(&got, &want, "stale scheme, recorded settings");
     assert!(got.warnings.iter().any(|w| w == STALE_FINGERPRINT_WARNING));
 
-    let (n_file, n_fit) = (
-        file_read.subjects[0].observations.len(),
-        fitted.subjects[0].observations.len(),
-    );
+    let (n_file, n_fit) =
+        (file_read.subjects[0].observations.len(), fitted.subjects[0].observations.len());
     assert_eq!((n_file, n_fit), (10, 8));
     let records = format!(
         "the records of subject `1` differ: {n_file} observations in this population, \
          {n_fit} in the fit's."
     );
-    let err = err_of(run_covariance(
-        &c.fit,
-        Some(model),
-        Some(&file_read),
-        &c.opts,
-    ));
+    let err = err_of(run_covariance(&c.fit, Some(model), Some(&file_read), &c.opts));
     assert_eq!(err, refusal("run_covariance", &records, SUPPLIED));
 
     let mut drifted = c.fit.clone();
-    drifted
-        .reader_settings
-        .as_mut()
-        .unwrap()
-        .ignore_exprs
-        .clear();
+    drifted.reader_settings.as_mut().unwrap().ignore_exprs.clear();
     let err = err_of(run_covariance(&drifted, None, None, &c.opts));
-    assert_eq!(
-        err,
-        refusal("run_covariance", &records, &format!("{RECORDED}{HASHED}"))
-    );
+    assert_eq!(err, refusal("run_covariance", &records, &format!("{RECORDED}{HASHED}")));
 
     let mut in_memory = c.fit.clone();
     in_memory.reader_settings = None;
     let err = err_of(run_sir(&in_memory, None, None, &c.opts));
-    assert_eq!(
-        err,
-        refusal("run_sir", &records, &format!("{FILE}{HASHED}"))
-    );
+    assert_eq!(err, refusal("run_sir", &records, &format!("{FILE}{HASHED}")));
 }
 
 /// T1, the SIR half: the recorded filter reaches the SIR re-read too (probe A: SIR
@@ -194,10 +165,7 @@ fn sir_replays_a_caller_row_filter() {
     };
     assert!(want.sir_ess.unwrap().is_finite());
     assert_eq!(ci(&got), ci(&want));
-    assert_eq!(
-        got.sir_ess.map(f64::to_bits),
-        want.sir_ess.map(f64::to_bits)
-    );
+    assert_eq!(got.sir_ess.map(f64::to_bits), want.sir_ess.map(f64::to_bits));
 }
 
 /// T2, probe B (re-measured at `045ca1b2`: covariance `Ok` with every θ "zero
@@ -216,9 +184,7 @@ fn sir_replays_a_caller_row_filter() {
 fn a_population_never_bound_for_the_level_block_hears_the_binder() {
     let c = case(Kind::Level);
     let bare = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
-    let never_bound = crate::api::read_population_as_fitted(&bare, data(&c))
-        .unwrap()
-        .0;
+    let never_bound = crate::api::read_population_as_fitted(&bare, data(&c)).unwrap().0;
     let model = &c.prep.parsed.model;
     for entry in ["run_covariance", "run_sir"] {
         let r = match entry {
@@ -227,18 +193,9 @@ fn a_population_never_bound_for_the_level_block_hears_the_binder() {
         };
         let e = r.map(|_| ()).expect_err("refused");
         // #1814 T4: `verify` gives the resolver's refusal on the same population.
-        let v = c
-            .fit
-            .population_fingerprint
-            .as_ref()
-            .unwrap()
-            .verify(model, &never_bound);
+        let v = c.fit.population_fingerprint.as_ref().unwrap().verify(model, &never_bound);
         let v = v.expect_err("verify refuses");
-        assert_eq!(
-            (v.code(), v.message(), v.context()),
-            (e.code(), e.message(), None),
-            "{entry}"
-        );
+        assert_eq!((v.code(), v.message(), v.context()), (e.code(), e.message(), None), "{entry}");
         // #1746: the #1647 refusal keeps its `ferx check` code through the resolver.
         assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
         assert_eq!(e.context(), Some(entry), "{e}");
@@ -277,20 +234,13 @@ fn a_population_never_bound_for_the_level_block_hears_the_binder() {
         let e = r.map(|_| ()).expect_err("a legacy fit refuses too");
         assert_eq!(
             (e.code(), e.context(), e.message()),
-            (
-                Some("E_THETA_LEVELS_DATA_UNBOUND"),
-                Some(entry),
-                want.as_str()
-            ),
+            (Some("E_THETA_LEVELS_DATA_UNBOUND"), Some(entry), want.as_str()),
             "{entry}"
         );
     }
     let own = run_covariance(&legacy, Some(model), Some(&c.prep.population), &c.opts)
         .expect("the straddle: a legacy fit runs on the fit's own population");
-    let se = own
-        .se_theta
-        .as_ref()
-        .expect("SEs on the fit's own population");
+    let se = own.se_theta.as_ref().expect("SEs on the fit's own population");
     assert!(se.iter().all(|v| v.is_finite()), "{se:?}");
 }
 
@@ -322,9 +272,7 @@ fn strip_level_index(pop: &mut Population, which: impl IntoIterator<Item = usize
 fn bound_on_its_own(c: &Case, relabel: fn(f64) -> f64) -> Population {
     let text = std::fs::read_to_string(&c.model_path).unwrap();
     let mut parsed = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
-    let mut pop = crate::api::read_population_as_fitted(&parsed, data(c))
-        .unwrap()
-        .0;
+    let mut pop = crate::api::read_population_as_fitted(&parsed, data(c)).unwrap().0;
     for s in &mut pop.subjects {
         for m in std::iter::once(&mut s.covariates).chain(s.obs_covariates.iter_mut()) {
             if let Some(v) = m.get_mut("STUDY") {
@@ -332,7 +280,7 @@ fn bound_on_its_own(c: &Case, relabel: fn(f64) -> f64) -> Population {
             }
         }
     }
-    crate::api::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
+    crate::levels::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
     pop
 }
 
@@ -355,8 +303,11 @@ fn never_bound_is_decided_from_the_subjects_not_the_listed_names() {
                  its records carry no index into the block's levels. Bind the population with \
                  `bind_from_fit(";
     let message_of = |pop: &Population| -> Vec<(&str, String)> {
-        let check =
-            crate::api::check_level_index_columns(model, pop, crate::api::LevelDataEntry::Run);
+        let check = crate::model_checks::check_level_index_columns(
+            model,
+            pop,
+            crate::model_checks::LevelDataEntry::Run,
+        );
         assert_eq!(check.len(), 1, "{check:?}");
         let e = |r: Result<(), EngineError>| r.expect_err("refused").message().to_string();
         vec![
@@ -369,10 +320,7 @@ fn never_bound_is_decided_from_the_subjects_not_the_listed_names() {
                 "run_covariance",
                 e(run_covariance(&c.fit, Some(model), Some(pop), &c.opts).map(|_| ())),
             ),
-            (
-                "run_sir",
-                e(run_sir(&c.fit, Some(model), Some(pop), &c.opts).map(|_| ())),
-            ),
+            ("run_sir", e(run_sir(&c.fit, Some(model), Some(pop), &c.opts).map(|_| ()))),
         ]
     };
 
@@ -412,8 +360,11 @@ fn never_bound_is_decided_from_the_subjects_not_the_listed_names() {
         if listed {
             empty.covariate_names.push("__level_SHIFT".to_string());
         }
-        let d =
-            crate::api::check_level_index_columns(model, &empty, crate::api::LevelDataEntry::Run);
+        let d = crate::model_checks::check_level_index_columns(
+            model,
+            &empty,
+            crate::model_checks::LevelDataEntry::Run,
+        );
         assert_eq!(d.len(), 1, "empty, listed = {listed}: {d:?}");
         assert!(d[0].message.starts_with(never), "empty, listed = {listed}");
     }
@@ -470,10 +421,7 @@ fn a_fit_without_a_fingerprint_checks_the_population_s_level_index() {
             (Some("E_THETA_LEVELS_DATA_UNBOUND"), Some(entry)),
             "{e}"
         );
-        assert!(
-            e.message().contains(&format!("but 1 of {n} subjects")),
-            "{e}"
-        );
+        assert!(e.message().contains(&format!("but 1 of {n} subjects")), "{e}");
 
         let e = run(&legacy, &permuted, entry);
         assert_eq!(
@@ -489,10 +437,7 @@ fn a_fit_without_a_fingerprint_checks_the_population_s_level_index() {
             ),
             "{m}"
         );
-        assert!(
-            m.contains("Bind the population with `bind_from_fit("),
-            "{m}"
-        );
+        assert!(m.contains("Bind the population with `bind_from_fit("), "{m}");
 
         let e = run(&legacy, &shifted, entry);
         assert_eq!(
@@ -515,10 +460,7 @@ fn a_fit_without_a_fingerprint_checks_the_population_s_level_index() {
             ),
             "{m}"
         );
-        assert!(
-            !m.contains("a fit of a model bound on this population"),
-            "{m}"
-        );
+        assert!(!m.contains("a fit of a model bound on this population"), "{m}");
 
         // The fingerprinted controls are unchanged.
         let codes: Vec<_> = [&partly, &permuted, &shifted]
@@ -567,18 +509,9 @@ fn a_partly_bound_population_hears_k_of_n_on_a_post_hoc_step() {
         };
         let e = r.map(|_| ()).expect_err("refused");
         // #1814 T4: `verify` gives the resolver's refusal on the same population.
-        let v = c
-            .fit
-            .population_fingerprint
-            .as_ref()
-            .unwrap()
-            .verify(model, &partly);
+        let v = c.fit.population_fingerprint.as_ref().unwrap().verify(model, &partly);
         let v = v.expect_err("verify refuses");
-        assert_eq!(
-            (v.code(), v.message(), v.context()),
-            (e.code(), e.message(), None),
-            "{entry}"
-        );
+        assert_eq!((v.code(), v.message(), v.context()), (e.code(), e.message(), None), "{entry}");
         assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
         assert_eq!(e.context(), Some(entry), "{e}");
         let err = e.to_string();
@@ -590,11 +523,7 @@ fn a_partly_bound_population_hears_k_of_n_on_a_post_hoc_step() {
             )),
             "{err}"
         );
-        for never in [
-            "not the one the fit was given",
-            "never bound",
-            "__level_SHIFT",
-        ] {
+        for never in ["not the one the fit was given", "never bound", "__level_SHIFT"] {
             assert!(!err.contains(never), "{entry}: says {never}: {err}");
         }
     }
@@ -614,9 +543,7 @@ fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
     let c = case(Kind::Level);
     let text = std::fs::read_to_string(&c.model_path).unwrap();
     let mut parsed = crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
-    let mut other = crate::api::read_population_as_fitted(&parsed, data(&c))
-        .unwrap()
-        .0;
+    let mut other = crate::api::read_population_as_fitted(&parsed, data(&c)).unwrap().0;
     for s in &mut other.subjects {
         for m in std::iter::once(&mut s.covariates).chain(s.obs_covariates.iter_mut()) {
             if let Some(v) = m.get_mut("STUDY") {
@@ -624,13 +551,16 @@ fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
             }
         }
     }
-    crate::api::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
+    crate::levels::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
     let model = &c.prep.parsed.model;
-    let codes: Vec<_> =
-        crate::api::check_level_index_columns(model, &other, crate::api::LevelDataEntry::Run)
-            .into_iter()
-            .map(|d| d.code)
-            .collect();
+    let codes: Vec<_> = crate::model_checks::check_level_index_columns(
+        model,
+        &other,
+        crate::model_checks::LevelDataEntry::Run,
+    )
+    .into_iter()
+    .map(|d| d.code)
+    .collect();
     assert_eq!(codes, ["E_THETA_LEVELS_DATA_MISMATCH"], "the straddle");
 
     for entry in ["run_covariance", "run_sir"] {
@@ -640,23 +570,10 @@ fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
         };
         let e = r.map(|_| ()).expect_err("refused");
         // #1814 T4: `verify` gives the resolver's refusal on the same population.
-        let v = c
-            .fit
-            .population_fingerprint
-            .as_ref()
-            .unwrap()
-            .verify(model, &other);
+        let v = c.fit.population_fingerprint.as_ref().unwrap().verify(model, &other);
         let v = v.expect_err("verify refuses");
-        assert_eq!(
-            (v.code(), v.message(), v.context()),
-            (e.code(), e.message(), None),
-            "{entry}"
-        );
-        assert_eq!(
-            (e.code(), e.context()),
-            (Some("E_POPULATION_MISMATCH"), Some(entry)),
-            "{e}"
-        );
+        assert_eq!((v.code(), v.message(), v.context()), (e.code(), e.message(), None), "{entry}");
+        assert_eq!((e.code(), e.context()), (Some("E_POPULATION_MISMATCH"), Some(entry)), "{e}");
         let err = e.to_string();
         assert!(err.starts_with(&format!("{entry}: {LEAD}")), "{err}");
         assert_eq!(e.suggestion(), Some(FIX), "{err}");
@@ -690,16 +607,11 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
     let s = c.fit.reader_settings.clone().unwrap();
     let mut unfiltered_settings = s.clone();
     unfiltered_settings.ignore_exprs.clear();
-    let unfiltered = crate::api::read_population_with(model, &unfiltered_settings, data(&c))
-        .unwrap()
-        .0;
+    let unfiltered =
+        crate::api::read_population_with(model, &unfiltered_settings, data(&c)).unwrap().0;
     let doses = |p: &Population| p.subjects.iter().map(|s| s.doses.len()).sum::<usize>();
     assert_eq!((doses(&c.prep.population), doses(&unfiltered)), (30, 60));
-    assert_eq!(
-        c.prep.population.n_obs(),
-        unfiltered.n_obs(),
-        "observations equal"
-    );
+    assert_eq!(c.prep.population.n_obs(), unfiltered.n_obs(), "observations equal");
 
     let what = format!(
         "the doses of subject `1` differ: 2 in this population, 1 in the fit's, with the \
@@ -723,18 +635,10 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
         .map(|f| f.with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1));
     let out = run_covariance(&stale, Some(model), Some(&unfiltered), &c.opts)
         .expect("another scheme is not compared");
-    assert!(
-        out.warnings.iter().any(|w| w == STALE_FINGERPRINT_WARNING),
-        "{:?}",
-        out.warnings
-    );
+    assert!(out.warnings.iter().any(|w| w == STALE_FINGERPRINT_WARNING), "{:?}", out.warnings);
     // Once, however often the result is piped back in.
     let again = run_covariance(&out, Some(model), Some(&unfiltered), &c.opts).unwrap();
-    let n = again
-        .warnings
-        .iter()
-        .filter(|w| *w == STALE_FINGERPRINT_WARNING)
-        .count();
+    let n = again.warnings.iter().filter(|w| *w == STALE_FINGERPRINT_WARNING).count();
     assert_eq!(n, 1);
 
     let mut extra = c.prep.population.clone();
@@ -750,9 +654,7 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
     );
 
     let mut heavier = c.prep.population.clone();
-    heavier.subjects[0]
-        .covariates
-        .insert("WT".to_string(), 99.0);
+    heavier.subjects[0].covariates.insert("WT".to_string(), 99.0);
     let err = err_of(run_covariance(&c.fit, Some(model), Some(&heavier), &c.opts));
     assert_eq!(
         err,
@@ -785,10 +687,7 @@ fn a_dose_row_filter_is_seen_and_a_stale_scheme_is_not_compared() {
     routed.model_path = None;
     routed.reader_settings = None;
     let err = err_of(run_covariance(&routed, Some(model), None, &c.opts));
-    assert_eq!(
-        err,
-        refusal("run_covariance", &what, &format!("{ROUTED}{HASHED}"))
-    );
+    assert_eq!(err, refusal("run_covariance", &what, &format!("{ROUTED}{HASHED}")));
 }
 
 /// T9: an IOV model with recorded settings. `(Some(model), None)` was refused (the
@@ -808,22 +707,14 @@ fn an_iov_model_re_reads_with_its_recorded_occasion_column() {
     let prep = crate::api::prepare_run(model_path.to_str().unwrap(), data_path.to_str())
         .expect("prepares");
     assert!(prep.parsed.model.n_kappa > 0);
-    assert!(
-        prep.reader_settings.iov_column.is_some(),
-        "the file names its column"
-    );
+    assert!(prep.reader_settings.iov_column.is_some(), "the file names its column");
     let opts = FitOptions {
         outer_maxiter: 2,
         run_covariance_step: false,
         ..prep.parsed.fit_options.clone()
     };
-    let mut fit = crate::api::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .unwrap();
+    let mut fit =
+        crate::api::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).unwrap();
     fit.model_path = model_path.to_str().map(String::from);
     fit.data_path = Some(prep.data_path.clone());
     fit.model_hash = prep.model_hash.clone();
@@ -843,14 +734,9 @@ fn an_iov_model_re_reads_with_its_recorded_occasion_column() {
 /// `DoseFilter` the dose digest, `Select` a subject filter.
 #[test]
 fn every_legitimate_cell_resolves_to_the_fitted_population() {
-    for kind in [
-        Kind::Plain,
-        Kind::Median,
-        Kind::Level,
-        Kind::LevelMedian,
-        Kind::Select,
-        Kind::DoseFilter,
-    ] {
+    for kind in
+        [Kind::Plain, Kind::Median, Kind::Level, Kind::LevelMedian, Kind::Select, Kind::DoseFilter]
+    {
         let c = case(kind);
         let fp = c.fit.population_fingerprint.as_ref().expect("fit() stamps");
         let model = &c.prep.parsed.model;
@@ -864,20 +750,13 @@ fn every_legitimate_cell_resolves_to_the_fitted_population() {
         for (m, p, what) in cells {
             let inputs = resolve_fit_inputs(&c.fit, m, p, "t10")
                 .unwrap_or_else(|e| panic!("{kind:?} {what}: {e}"));
-            assert_eq!(
-                fp.first_difference(inputs.population()),
-                None,
-                "{kind:?} {what}"
-            );
+            assert_eq!(fp.first_difference(inputs.population()), None, "{kind:?} {what}");
         }
         // And the unbound parse with the fit's population: refused on its bindings
         // where it has any, never on the fingerprint.
         let bare = unbound(&c);
         if let Err(e) = resolve_fit_inputs(&c.fit, Some(&bare), Some(pop), "t10") {
-            assert!(
-                !e.to_string().contains("not the one the fit was given"),
-                "{kind:?}: {e}"
-            );
+            assert!(!e.to_string().contains("not the one the fit was given"), "{kind:?}: {e}");
         }
     }
 }
@@ -910,10 +789,7 @@ fn the_population_a_file_fit_returns_with_derived_occasions_is_accepted() {
     assert!(!returned.subjects[0].occasions.is_empty());
 
     let opts = prep.parsed.fit_options.clone();
-    for (p, what) in [
-        (Some(&returned), "returned"),
-        (Some(&prep.population), "read"),
-    ] {
+    for (p, what) in [(Some(&returned), "returned"), (Some(&prep.population), "read")] {
         crate::estimation::fit_inputs::resolve_fit_inputs(&fit, None, p, "probe")
             .map(|_| ())
             .unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -956,12 +832,7 @@ mod fitted_population_1783 {
 
     /// The SIR settings of T2.
     fn sir_opts(opts: &FitOptions) -> FitOptions {
-        FitOptions {
-            sir_samples: 300,
-            sir_resamples: 100,
-            sir_seed: Some(1),
-            ..opts.clone()
-        }
+        FitOptions { sir_samples: 300, sir_resamples: 100, sir_seed: Some(1), ..opts.clone() }
     }
 
     struct FileFit {
@@ -980,9 +851,7 @@ mod fitted_population_1783 {
     }
 
     fn write_case(
-        model_src: &str,
-        data_src: &str,
-        edits: &[(&str, &str)],
+        model_src: &str, data_src: &str, edits: &[(&str, &str)],
         data_edit: Option<fn(&str) -> String>,
     ) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1005,9 +874,7 @@ mod fitted_population_1783 {
 
     /// A fit through `run_model_with_data`, whose rule is the model file's.
     fn run_fit(
-        model_src: &str,
-        data_src: &str,
-        edits: &[(&str, &str)],
+        model_src: &str, data_src: &str, edits: &[(&str, &str)],
         data_edit: Option<fn(&str) -> String>,
     ) -> FileFit {
         let (dir, model_path, data_path) = write_case(model_src, data_src, edits, data_edit);
@@ -1015,15 +882,7 @@ mod fitted_population_1783 {
         let (fit, returned) = crate::api::run_model_with_data(m, Some(d)).expect("fits");
         let prep = crate::api::prepare_run(m, Some(d)).expect("prepares");
         let opts = prep.parsed.fit_options.clone();
-        FileFit {
-            _dir: dir,
-            model_path,
-            data_path,
-            fit,
-            returned: Some(returned),
-            prep,
-            opts,
-        }
+        FileFit { _dir: dir, model_path, data_path, fit, returned: Some(returned), prep, opts }
     }
 
     fn iov(rule: &str) -> FileFit {
@@ -1076,10 +935,7 @@ mod fitted_population_1783 {
             let (dir, model_path, data_path) = write_case(
                 "examples/warfarin_iov.ferx",
                 "data/warfarin_iov.csv",
-                &[(
-                    "iov_column = OCC\n  covariance = false",
-                    "covariance = true",
-                )],
+                &[("iov_column = OCC\n  covariance = false", "covariance = true")],
                 None,
             );
             let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
@@ -1094,15 +950,7 @@ mod fitted_population_1783 {
                 ..opts.clone()
             };
             let fit = crate::api::fit_from_files(m, Some(d), None, Some(fit_opts)).expect("fits");
-            FileFit {
-                _dir: dir,
-                model_path,
-                data_path,
-                fit,
-                returned: None,
-                prep,
-                opts,
-            }
+            FileFit { _dir: dir, model_path, data_path, fit, returned: None, prep, opts }
         })
     }
 
@@ -1110,12 +958,7 @@ mod fitted_population_1783 {
         let iters = format!("maxiter = {MAXITER}\n  checkpoint = false");
         let mut all = vec![("maxiter    = 300", iters.as_str())];
         all.extend_from_slice(edits);
-        run_fit(
-            "examples/warfarin_ltbs.ferx",
-            "data/warfarin_ltbs.csv",
-            &all,
-            data_edit,
-        )
+        run_fit("examples/warfarin_ltbs.ferx", "data/warfarin_ltbs.csv", &all, data_edit)
     }
 
     fn ltbs() -> &'static FileFit {
@@ -1146,10 +989,7 @@ mod fitted_population_1783 {
     fn pre_logged() -> &'static FileFit {
         static F: OnceLock<FileFit> = OnceLock::new();
         F.get_or_init(|| {
-            ltbs_fit(
-                &[("log(DV) ~ additive(ADD_LOG)", "DV ~ log_additive(ADD_LOG)")],
-                Some(log_dv),
-            )
+            ltbs_fit(&[("log(DV) ~ additive(ADD_LOG)", "DV ~ log_additive(ADD_LOG)")], Some(log_dv))
         })
     }
 
@@ -1188,15 +1028,8 @@ mod fitted_population_1783 {
     #[test]
     fn derived_rule_posthoc_matches_inline() {
         for (f, what) in [(dose(), "dose"), (column(), "column")] {
-            assert_eq!(
-                f.fit.covariance_status,
-                CovarianceStatus::Computed,
-                "{what}"
-            );
-            assert!(
-                has_kappa_se(&f.fit),
-                "{what}: the inline step has kappa SEs"
-            );
+            assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed, "{what}");
+            assert!(has_kappa_se(&f.fit), "{what}: the inline step has kappa SEs");
             for (p, cell) in cells(f) {
                 let got = run_covariance(&f.fit, None, p, &f.opts)
                     .unwrap_or_else(|e| panic!("{what} {cell}: {e}"));
@@ -1206,9 +1039,7 @@ mod fitted_population_1783 {
         // Live: the read population of the `dose` fit carries no labels, the returned
         // one does, and the control's read population has its column's.
         assert!(dose().prep.population.subjects[0].occasions.is_empty());
-        assert!(!dose().returned.as_ref().unwrap().subjects[0]
-            .occasions
-            .is_empty());
+        assert!(!dose().returned.as_ref().unwrap().subjects[0].occasions.is_empty());
         assert!(!column().prep.population.subjects[0].occasions.is_empty());
         assert_eq!(dose().fit.iov_occasion, Some(IovOccasionRule::PerDose));
         assert_eq!(column().fit.iov_occasion, Some(IovOccasionRule::Column));
@@ -1242,11 +1073,7 @@ mod fitted_population_1783 {
         };
         assert!(!ci(&runs[0].0).is_empty());
         for (r, cell) in &runs[1..] {
-            assert_eq!(
-                r.sir_ess.map(f64::to_bits),
-                Some(ess.to_bits()),
-                "{cell}: ESS"
-            );
+            assert_eq!(r.sir_ess.map(f64::to_bits), Some(ess.to_bits()), "{cell}: ESS");
             assert_eq!(ci(r), ci(&runs[0].0), "{cell}: kappa CI");
         }
     }
@@ -1263,15 +1090,12 @@ mod fitted_population_1783 {
         let f = time_window();
         assert_eq!(f.fit.covariance_status, CovarianceStatus::Computed);
         assert!(has_kappa_se(&f.fit));
-        assert_eq!(
-            f.fit.iov_occasion,
-            Some(IovOccasionRule::TimeWindows(vec![EDGE]))
-        );
+        assert_eq!(f.fit.iov_occasion, Some(IovOccasionRule::TimeWindows(vec![EDGE])));
         // The precondition of the first mutation: `time(60)` and `dose` partition the
         // fixture differently.
         let derive = |rule: &IovOccasionRule| {
             let mut p = f.prep.population.clone();
-            crate::api::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
+            crate::occasions::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
             p.subjects[0].occasions.clone()
         };
         assert_ne!(
@@ -1342,18 +1166,13 @@ mod fitted_population_1783 {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dose.fitrx");
         let src = std::fs::read_to_string(&f.model_path).unwrap();
-        let opts = crate::io::fitrx::SaveFitOptions {
-            include_data: Some(f.data_path.clone()),
-        };
+        let opts = crate::io::fitrx::SaveFitOptions { include_data: Some(f.data_path.clone()) };
         crate::io::fitrx::save_fit(&f.fit, f.returned.as_ref().unwrap(), &src, &path, opts)
             .unwrap();
         let loaded = crate::io::fitrx::load_fit(&path).unwrap();
         assert_eq!(loaded.fit.iov_occasion, Some(IovOccasionRule::PerDose));
         let pop = loaded.population.as_ref().expect("data bundled");
-        assert!(
-            pop.subjects[0].occasions.is_empty(),
-            "the bundle is unlabelled"
-        );
+        assert!(pop.subjects[0].occasions.is_empty(), "the bundle is unlabelled");
         let got = run_covariance(&loaded.fit, None, Some(pop), &f.opts).unwrap();
         let want = run_covariance(&loaded.fit, None, f.returned.as_ref(), &f.opts).unwrap();
         assert!(has_kappa_se(&want));
@@ -1381,9 +1200,7 @@ mod fitted_population_1783 {
                                `fit.iov_occasion` to the rule the fit ran with.";
 
     fn has_file_note(r: &FitResult) -> bool {
-        r.warnings
-            .iter()
-            .any(|w| w.contains("derived with the model file's"))
+        r.warnings.iter().any(|w| w.contains("derived with the model file's"))
     }
 
     /// T7. A fit that records no rule takes the model file's when the step reads
@@ -1402,11 +1219,7 @@ mod fitted_population_1783 {
             let got =
                 run_covariance(&fit, None, p, &f.opts).unwrap_or_else(|e| panic!("{cell}: {e}"));
             assert_same_cov(&got, &f.fit, cell);
-            assert!(
-                got.warnings.iter().any(|w| w == W_FILE_DOSE),
-                "{cell}: {:?}",
-                got.warnings
-            );
+            assert!(got.warnings.iter().any(|w| w == W_FILE_DOSE), "{cell}: {:?}", got.warnings);
             let recorded = run_covariance(&f.fit, None, p, &f.opts).unwrap();
             assert!(!has_file_note(&recorded), "{cell}: recorded rule");
         }
@@ -1415,11 +1228,7 @@ mod fitted_population_1783 {
         let c = column();
         let got = run_covariance(&unrecorded(c, true), None, None, &c.opts).unwrap();
         assert_same_cov(&got, &c.fit, "column, unrecorded");
-        assert!(
-            !has_file_note(&got),
-            "column, unrecorded: {:?}",
-            got.warnings
-        );
+        assert!(!has_file_note(&got), "column, unrecorded: {:?}", got.warnings);
     }
 
     /// A model file stating `iov_occasion = dose`, fitted through `fit_from_files`
@@ -1447,15 +1256,7 @@ mod fitted_population_1783 {
                 ..opts.clone()
             };
             let fit = crate::api::fit_from_files(m, Some(d), None, Some(fit_opts)).expect("fits");
-            FileFit {
-                _dir: dir,
-                model_path,
-                data_path,
-                fit,
-                returned: None,
-                prep,
-                opts,
-            }
+            FileFit { _dir: dir, model_path, data_path, fit, returned: None, prep, opts }
         })
     }
 
@@ -1476,11 +1277,7 @@ mod fitted_population_1783 {
         let fit = unrecorded(f, true);
         for (p, cell) in cells(f) {
             let got = run_covariance(&fit, None, p, &f.opts).unwrap();
-            assert!(
-                got.warnings.iter().any(|w| w == W_FILE_DOSE),
-                "{cell}: {:?}",
-                got.warnings
-            );
+            assert!(got.warnings.iter().any(|w| w == W_FILE_DOSE), "{cell}: {:?}", got.warnings);
             // The note is not a false alarm here: the guess is wrong.
             assert_ne!(
                 got.se_kappa.as_deref().map(bits),
@@ -1538,10 +1335,9 @@ mod fitted_population_1783 {
         let f = dose();
         let m = &f.prep.parsed.model;
         let read = &f.prep.population;
-        for (keep_fp, want) in [
-            (false, format!("{F_LEAD}{F_FIX}")),
-            (true, format!("{F_LEAD}{F_DERIVED}{F_FIX}")),
-        ] {
+        for (keep_fp, want) in
+            [(false, format!("{F_LEAD}{F_FIX}")), (true, format!("{F_LEAD}{F_DERIVED}{F_FIX}"))]
+        {
             let fit = unrecorded(f, keep_fp);
             assert_eq!(
                 err_of(run_covariance(&fit, Some(m), Some(read), &f.opts)),
@@ -1557,18 +1353,11 @@ mod fitted_population_1783 {
         // the sentence; the `dose` fit's own must. Without this pair a gate on the
         // fingerprint's presence alone passes (#1783 mutation sweep, M12).
         let stale = |fp: &crate::types::PopulationFingerprint| {
-            fp.clone()
-                .with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1)
+            fp.clone().with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1)
         };
         for (fp, want) in [
-            (
-                column().fit.population_fingerprint.as_ref().unwrap(),
-                format!("{F_LEAD}{F_FIX}"),
-            ),
-            (
-                f.fit.population_fingerprint.as_ref().unwrap(),
-                format!("{F_LEAD}{F_DERIVED}{F_FIX}"),
-            ),
+            (column().fit.population_fingerprint.as_ref().unwrap(), format!("{F_LEAD}{F_FIX}")),
+            (f.fit.population_fingerprint.as_ref().unwrap(), format!("{F_LEAD}{F_DERIVED}{F_FIX}")),
         ] {
             let mut fit = unrecorded(f, false);
             fit.population_fingerprint = Some(stale(fp));
@@ -1634,20 +1423,12 @@ fn a_level_refusal_in_the_resolver_carries_the_binder_code() {
             _ => run_sir(fit, m, p, &c.opts),
         };
         let cells = [
-            (
-                "rebuilt",
-                run(&c.fit, None, Some(&design.population)),
-                "`STUDY=4`",
-            ),
+            ("rebuilt", run(&c.fit, None, Some(&design.population)), "`STUDY=4`"),
             ("lent", run(&legacy, Some(lent), None), "`STUDY=3`"),
         ];
         for (what, r, unseen) in cells {
             let e = r.map(|_| ()).expect_err(what);
-            assert_eq!(
-                e.code(),
-                Some("E_THETA_LEVEL_BINDING"),
-                "{entry}/{what}: {e}"
-            );
+            assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{entry}/{what}: {e}");
             assert_eq!(e.block(), Some("parameters"), "{entry}/{what}: {e}");
             assert_eq!(e.context(), Some(entry), "{entry}/{what}: {e}");
             assert!(
@@ -1670,10 +1451,9 @@ fn a_level_refusal_in_the_resolver_carries_the_binder_code() {
 /// both cells' `code()` is `None`.
 #[test]
 fn a_fit_without_bindings_is_refused_with_the_half_code() {
-    for (kind, code) in [
-        (Kind::Level, "E_THETA_LEVEL_BINDING"),
-        (Kind::Median, "E_COVARIATE_STATS_BINDING"),
-    ] {
+    for (kind, code) in
+        [(Kind::Level, "E_THETA_LEVEL_BINDING"), (Kind::Median, "E_COVARIATE_STATS_BINDING")]
+    {
         let c = case(kind);
         let mut fit = c.fit.clone();
         fit.data_bindings = Default::default();
@@ -1683,8 +1463,7 @@ fn a_fit_without_bindings_is_refused_with_the_half_code() {
         assert_eq!(e.code(), Some(code), "{kind:?}: {e}");
         assert_eq!(e.context(), Some("run_covariance"), "{kind:?}: {e}");
         assert!(
-            e.to_string()
-                .contains("this fit carries no data-derived bindings"),
+            e.to_string().contains("this fit carries no data-derived bindings"),
             "{kind:?}: {e}"
         );
     }
@@ -1778,14 +1557,8 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
         ($f:ident) => {
             let name = stringify!($f);
             assert_ne!(rec.$f, d.$f, "{name}: premise — the record is off-default");
-            assert_eq!(
-                resolved.$f, rec.$f,
-                "{name}: record — a default caller takes it"
-            );
-            assert_eq!(
-                kept.$f, caller.$f,
-                "{name}: caller — a non-default caller keeps it"
-            );
+            assert_eq!(resolved.$f, rec.$f, "{name}: record — a default caller takes it");
+            assert_eq!(kept.$f, caller.$f, "{name}: caller — a non-default caller keeps it");
         };
     }
     field!(inner_maxiter);
@@ -1806,10 +1579,7 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
     field!(gradient_method);
     // Nothing outside the record moves: a step setting, and the tally the record leaves out.
     assert_eq!(resolved.cov_inner_tol, d.cov_inner_tol);
-    assert_eq!(
-        resolved.min_obs_for_convergence_check,
-        d.min_obs_for_convergence_check
-    );
+    assert_eq!(resolved.min_obs_for_convergence_check, d.min_obs_for_convergence_check);
 }
 
 /// #1835 T7: `gradient_method` resolves as the union of record and caller over the two values
@@ -1820,20 +1590,11 @@ fn scoring_record_fills_each_field_the_caller_left_default() {
 #[test]
 fn gradient_method_record_is_the_union_with_the_caller() {
     use crate::types::GradientMethod::{Auto, Fd};
-    for (recorded, caller, want) in [
-        (Auto, Auto, Auto),
-        (Fd, Auto, Fd),
-        (Auto, Fd, Fd),
-        (Fd, Fd, Fd),
-    ] {
-        let rec = ScoringSettings {
-            gradient_method: recorded,
-            ..ScoringSettings::default()
-        };
-        let o = FitOptions {
-            gradient_method: caller,
-            ..FitOptions::default()
-        };
+    for (recorded, caller, want) in
+        [(Auto, Auto, Auto), (Fd, Auto, Fd), (Auto, Fd, Fd), (Fd, Fd, Fd)]
+    {
+        let rec = ScoringSettings { gradient_method: recorded, ..ScoringSettings::default() };
+        let o = FitOptions { gradient_method: caller, ..FitOptions::default() };
         assert_eq!(
             with_scoring_record(Some(&rec), &o).gradient_method,
             want,
@@ -1960,11 +1721,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
     differs!(gradient_method);
 
     let over = rec.overwrite(&caller);
-    assert_eq!(
-        ScoringSettings::from_options(&over),
-        rec,
-        "overwrite round trip"
-    );
+    assert_eq!(ScoringSettings::from_options(&over), rec, "overwrite round trip");
     assert_eq!(over.inner_tol, rec.inner_tol);
     assert_eq!(
         with_scoring_record(Some(&rec), &caller).inner_tol,
@@ -1985,10 +1742,7 @@ fn overwrite_replaces_every_field_where_with_scoring_record_keeps_the_callers() 
 #[test]
 fn resolve_scoring_options_prefers_the_fits_record_then_the_sir_records() {
     let fit_rec = off_default_scoring();
-    let sir_rec = ScoringSettings {
-        inner_maxiter: 99,
-        ..off_default_scoring()
-    };
+    let sir_rec = ScoringSettings { inner_maxiter: 99, ..off_default_scoring() };
     let mut fit = crate::types::test_helpers::minimal_fit_result();
     fit.scoring_settings = Some(fit_rec.clone());
     fit.sir_settings = Some(crate::estimation::sir::SirSettings {
@@ -1996,15 +1750,9 @@ fn resolve_scoring_options_prefers_the_fits_record_then_the_sir_records() {
         ..Default::default()
     });
     let d = FitOptions::default();
-    assert_eq!(
-        ScoringSettings::from_options(&resolve_scoring_options(&fit, &d)),
-        fit_rec
-    );
+    assert_eq!(ScoringSettings::from_options(&resolve_scoring_options(&fit, &d)), fit_rec);
     fit.scoring_settings = None;
-    assert_eq!(
-        ScoringSettings::from_options(&resolve_scoring_options(&fit, &d)),
-        sir_rec
-    );
+    assert_eq!(ScoringSettings::from_options(&resolve_scoring_options(&fit, &d)), sir_rec);
     fit.sir_settings = None;
     let caller = FitOptions {
         inner_tol: 1e-7,
@@ -2029,12 +1777,8 @@ enum Entry {
 }
 
 impl Entry {
-    const ALL: [Entry; 4] = [
-        Entry::RunCovariance,
-        Entry::RunSir,
-        Entry::Verify,
-        Entry::RunCovarianceNoSubjects,
-    ];
+    const ALL: [Entry; 4] =
+        [Entry::RunCovariance, Entry::RunSir, Entry::Verify, Entry::RunCovarianceNoSubjects];
 
     /// The entry point the error names, if any.
     fn context(self) -> Option<&'static str> {
@@ -2051,9 +1795,9 @@ impl Entry {
             Entry::RunCovariance => run_covariance(&c.fit, Some(model), Some(pop), &c.opts)
                 .map(|_| ())
                 .expect_err("refused"),
-            Entry::RunSir => run_sir(&c.fit, Some(model), Some(pop), &c.opts)
-                .map(|_| ())
-                .expect_err("refused"),
+            Entry::RunSir => {
+                run_sir(&c.fit, Some(model), Some(pop), &c.opts).map(|_| ()).expect_err("refused")
+            }
             Entry::Verify => c
                 .fit
                 .population_fingerprint
@@ -2103,10 +1847,7 @@ fn every_mismatch_cell_is_coded_by_every_entry() {
     assert_eq!(fitted.subjects[0].doses.len(), 1, "one dose per subject");
 
     // The control: the fitted population is accepted by every entry.
-    assert_eq!(
-        fp.verify(model, fitted).expect("the fit's population"),
-        Vec::<String>::new()
-    );
+    assert_eq!(fp.verify(model, fitted).expect("the fit's population"), Vec::<String>::new());
     run_covariance(&c.fit, Some(model), Some(fitted), &c.opts).expect("the fit's population");
 
     let mut missing = fitted.clone();
@@ -2119,13 +1860,9 @@ fn every_mismatch_cell_is_coded_by_every_entry() {
     swapped.subjects.swap(0, 1);
     let mut settings = c.fit.reader_settings.clone().expect("recorded");
     settings.ignore_exprs.push("TIME > 24".to_string());
-    let filtered = crate::api::read_population_with(model, &settings, data(&c))
-        .unwrap()
-        .0;
-    let (n_filtered, n_fit) = (
-        filtered.subjects[0].observations.len(),
-        fitted.subjects[0].observations.len(),
-    );
+    let filtered = crate::api::read_population_with(model, &settings, data(&c)).unwrap().0;
+    let (n_filtered, n_fit) =
+        (filtered.subjects[0].observations.len(), fitted.subjects[0].observations.len());
     assert!(n_filtered < n_fit, "{n_filtered} vs {n_fit}");
     let mut nudged = fitted.clone();
     nudged.subjects[0].observations[3] *= 1.5;
@@ -2141,21 +1878,9 @@ fn every_mismatch_cell_is_coded_by_every_entry() {
     renamed.covariate_names.push("EXTRA".to_string());
 
     let cells: [(&str, &Population, String); 9] = [
-        (
-            "missing",
-            &missing,
-            "it has 29 subjects, the fit's has 30.".into(),
-        ),
-        (
-            "extra",
-            &extra,
-            "it has 31 subjects, the fit's has 30.".into(),
-        ),
-        (
-            "swapped",
-            &swapped,
-            "its subject 1 is `2`, the fit's is `1`.".into(),
-        ),
+        ("missing", &missing, "it has 29 subjects, the fit's has 30.".into()),
+        ("extra", &extra, "it has 31 subjects, the fit's has 30.".into()),
+        ("swapped", &swapped, "its subject 1 is `2`, the fit's is `1`.".into()),
         (
             "records ≠",
             &filtered,
@@ -2259,12 +1984,7 @@ fn a_re_read_names_only_what_it_did() {
     let tampered = PopulationFingerprint::of(&heavier);
 
     let mut edited = c.fit.clone();
-    edited
-        .reader_settings
-        .as_mut()
-        .unwrap()
-        .ignore_exprs
-        .push("TIME > 24".to_string());
+    edited.reader_settings.as_mut().unwrap().ignore_exprs.push("TIME > 24".to_string());
     let n_fit = c.prep.population.subjects[0].observations.len();
     let n_edited =
         crate::api::read_population_with(model, edited.reader_settings.as_ref().unwrap(), data(&c))
@@ -2297,44 +2017,17 @@ fn a_re_read_names_only_what_it_did() {
         f
     };
     let cells: [(&str, FitResult, &str, String); 6] = [
-        (
-            "P10",
-            edited,
-            records.as_str(),
-            format!("{RECORDED}{HASHED}"),
-        ),
+        ("P10", edited, records.as_str(), format!("{RECORDED}{HASHED}")),
         ("P9", repointed, wt, format!("{RECORDED}{UNHASHED}")),
-        (
-            "file, hash",
-            variant(false, true, true),
-            wt,
-            format!("{FILE}{HASHED}"),
-        ),
-        (
-            "file, no hash",
-            variant(false, true, false),
-            wt,
-            format!("{FILE}{UNHASHED}"),
-        ),
-        (
-            "routed, hash",
-            variant(false, false, true),
-            wt,
-            format!("{ROUTED}{HASHED}"),
-        ),
-        (
-            "routed, no hash",
-            variant(false, false, false),
-            wt,
-            format!("{ROUTED}{UNHASHED}"),
-        ),
+        ("file, hash", variant(false, true, true), wt, format!("{FILE}{HASHED}")),
+        ("file, no hash", variant(false, true, false), wt, format!("{FILE}{UNHASHED}")),
+        ("routed, hash", variant(false, false, true), wt, format!("{ROUTED}{HASHED}")),
+        ("routed, no hash", variant(false, false, false), wt, format!("{ROUTED}{UNHASHED}")),
     ];
     for (cell, fit, what, how) in &cells {
         // The routed re-read needs the model in hand: there is no file to rebuild it.
         let m = fit.model_path.is_none().then_some(model);
-        let e = run_covariance(fit, m, None, &c.opts)
-            .map(|_| ())
-            .expect_err(cell);
+        let e = run_covariance(fit, m, None, &c.opts).map(|_| ()).expect_err(cell);
         assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{cell}: {e}");
         assert_eq!(e.message(), mismatch(what, how), "{cell}");
         assert_eq!(e.suggestion(), Some(FIX), "{cell}");
@@ -2377,16 +2070,8 @@ fn the_fits_subject_rows_must_line_up_with_its_population() {
     short.subjects.pop();
     // `short` through `run_sir` first: it is the cell that panicked.
     let cells: [(&str, &FitResult, &str); 2] = [
-        (
-            "short",
-            &short,
-            "the fit has results for 29 subjects, its population has 30",
-        ),
-        (
-            "rotated",
-            &rotated,
-            "the fit's subject 1 is `2`, its population's is `1`",
-        ),
+        ("short", &short, "the fit has results for 29 subjects, its population has 30"),
+        ("rotated", &rotated, "the fit's subject 1 is `2`, its population's is `1`"),
     ];
     for (cell, fit, what) in cells {
         for entry in ["run_sir", "run_covariance"] {
@@ -2405,17 +2090,11 @@ fn the_fits_subject_rows_must_line_up_with_its_population() {
                 ),
                 "{at}"
             );
-            assert_eq!(
-                e.suggestion(),
-                Some(FIT_SUBJECTS_MISMATCH_SUGGESTION),
-                "{at}"
-            );
+            assert_eq!(e.suggestion(), Some(FIT_SUBJECTS_MISMATCH_SUGGESTION), "{at}");
             assert_eq!(e.context(), Some(entry), "{at}");
         }
     }
-    let e = run_sir(&rotated, Some(model), Some(fitted), &c.opts)
-        .map(|_| ())
-        .expect_err("refused");
+    let e = run_sir(&rotated, Some(model), Some(fitted), &c.opts).map(|_| ()).expect_err("refused");
     assert_eq!(
         e.to_string(),
         "run_sir: the fit's per-subject results do not line up with the population it was \
@@ -2430,18 +2109,10 @@ fn the_fits_subject_rows_must_line_up_with_its_population() {
         .map(|_| ())
         .expect_err("refused");
     assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{e}");
-    assert_eq!(
-        e.message(),
-        mismatch("its subject 1 is `1`, the fit's is `2`.", SUPPLIED)
-    );
+    assert_eq!(e.message(), mismatch("its subject 1 is `1`, the fit's is `2`.", SUPPLIED));
     // `verify` compares the population only.
     assert_eq!(
-        c.fit
-            .population_fingerprint
-            .as_ref()
-            .unwrap()
-            .verify(model, fitted)
-            .unwrap(),
+        c.fit.population_fingerprint.as_ref().unwrap().verify(model, fitted).unwrap(),
         Vec::<String>::new()
     );
 }
@@ -2462,13 +2133,9 @@ fn verify_notes_what_it_could_not_compare() {
     let mut heavier = c.prep.population.clone();
     *heavier.subjects[0].covariates.get_mut("WT").unwrap() += 1.0;
 
-    let stale = fp
-        .clone()
-        .with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1);
+    let stale = fp.clone().with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1);
     assert_eq!(
-        stale
-            .verify(model, &heavier)
-            .expect("another scheme is not compared"),
+        stale.verify(model, &heavier).expect("another scheme is not compared"),
         vec![STALE_FINGERPRINT_WARNING.to_string()]
     );
     let e = fp.verify(model, &heavier).expect_err("the straddle");
@@ -2485,11 +2152,7 @@ fn verify_notes_what_it_could_not_compare() {
     assert_eq!(e.code(), Some("E_POPULATION_MISMATCH"), "{e}");
     assert_eq!(
         e.to_string(),
-        refusal(
-            "run_covariance",
-            "it has 29 subjects, the fit's has 30.",
-            SUPPLIED
-        )
+        refusal("run_covariance", "it has 29 subjects, the fit's has 30.", SUPPLIED)
     );
 }
 
@@ -2505,11 +2168,8 @@ fn verify_notes_what_it_could_not_compare() {
 #[test]
 fn unrecorded_fd_route_note_clauses() {
     use crate::build_info::GradientMethodKind as K;
-    let (fd, analytic, na) = (
-        K::FiniteDifferences.as_str(),
-        K::Analytic.as_str(),
-        K::NotApplicable.as_str(),
-    );
+    let (fd, analytic, na) =
+        (K::FiniteDifferences.as_str(), K::Analytic.as_str(), K::NotApplicable.as_str());
     let note = |inner: &str, outer: &str, model: &CompiledModel, carried: bool| {
         let mut fit = crate::types::test_helpers::minimal_fit_result();
         fit.gradient_method_inner = inner.into();
@@ -2538,19 +2198,13 @@ fn unrecorded_fd_route_note_clauses() {
 
     assert!(note(fd, fd, &auto, false), "(FD, FD)");
     assert!(note(fd, na, &auto, false), "(FD, N/A): BOBYQA");
-    assert!(
-        note(fd, fd, &auto, true),
-        "carried over and still applies: once"
-    );
+    assert!(note(fd, fd, &auto, true), "carried over and still applies: once");
     assert!(!note(fd, analytic, &auto, false), "(FD, analytic)");
     // A `.fitrx` an earlier engine wrote labels its analytic route `analytic (Dual2)`: the
     // same route, so a result loaded from it does not warn (and `is_analytic_label` is the one
     // comparison, so the plan-failure labels read it the same way).
     // Mutation: compare the outer label with `K::Analytic.as_str()` alone -> this row warns.
-    assert!(
-        !note(fd, "analytic (Dual2)", &auto, false),
-        "(FD, legacy analytic)"
-    );
+    assert!(!note(fd, "analytic (Dual2)", &auto, false), "(FD, legacy analytic)");
     assert!(crate::build_info::is_analytic_label("analytic (Dual2)"));
     assert!(!crate::build_info::is_analytic_label("finite differences"));
     assert_eq!(
@@ -2559,20 +2213,11 @@ fn unrecorded_fd_route_note_clauses() {
         "a legacy analytic label is rewritten like today's"
     );
     assert!(!note(analytic, na, &auto, false), "(analytic, N/A)");
-    assert!(
-        !note(analytic, analytic, &auto, true),
-        "carried over, no longer applies"
-    );
-    assert!(
-        !note(fd, fd, &stamped, false),
-        "the model's own gradient = fd"
-    );
+    assert!(!note(analytic, analytic, &auto, true), "carried over, no longer applies");
+    assert!(!note(fd, fd, &stamped, false), "the model's own gradient = fd");
     {
         let _fd = crate::types::arm_forced_fd(true);
-        assert!(
-            !note(fd, fd, &auto, false),
-            "a resolved gradient_method = fd"
-        );
+        assert!(!note(fd, fd, &auto, false), "a resolved gradient_method = fd");
         assert!(!note(fd, fd, &auto, true), "…takes a carried-over copy off");
     }
 }

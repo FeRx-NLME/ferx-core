@@ -77,14 +77,8 @@ pub(crate) fn ode() -> String {
 /// one nested case the analytic walks decline.
 pub(crate) fn transit() -> String {
     closed_form()
-        .replace(
-            "theta TVKA(1.2, 0.01, 50.0)",
-            "theta TVMTT(3.0, 0.05, 24.0)\n  theta TVN(3.0)",
-        )
-        .replace(
-            "KA = TVKA * exp(K_B)",
-            "MTT = TVMTT * exp(K_B)\n  NTR = TVN",
-        )
+        .replace("theta TVKA(1.2, 0.01, 50.0)", "theta TVMTT(3.0, 0.05, 24.0)\n  theta TVN(3.0)")
+        .replace("KA = TVKA * exp(K_B)", "MTT = TVMTT * exp(K_B)\n  NTR = TVN")
         .replace(
             "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
             "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)",
@@ -93,13 +87,9 @@ pub(crate) fn transit() -> String {
 
 fn snap(arm: usize) -> HashMap<String, f64> {
     let (study, a, narm, _) = ARMS[arm];
-    [
-        ("STUDY".to_string(), study),
-        ("ARM".to_string(), a),
-        ("NARM".to_string(), narm),
-    ]
-    .into_iter()
-    .collect()
+    [("STUDY".to_string(), study), ("ARM".to_string(), a), ("NARM".to_string(), narm)]
+        .into_iter()
+        .collect()
 }
 
 /// The fixture subject, `id`, with doses when `doses` (the PK models) and every
@@ -144,9 +134,7 @@ pub(crate) fn prepared(src: &str, n_subjects: usize) -> (CompiledModel, Populati
     let model = crate::parser::model_parser::parse_model_string(src).expect("fixture parses");
     let doses = !model.is_algebraic();
     let mut population = Population {
-        subjects: (0..n_subjects)
-            .map(|i| subject(&(i + 1).to_string(), doses))
-            .collect(),
+        subjects: (0..n_subjects).map(|i| subject(&(i + 1).to_string(), doses)).collect(),
         covariate_names: vec!["STUDY".into(), "ARM".into(), "NARM".into()],
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
@@ -188,9 +176,7 @@ fn with_data(model: &CompiledModel, s: &mut Subject, i: usize) {
 /// A compact vector with every entry non-zero and distinct, scaled by `scale`: η first,
 /// then each κ block (study, then arm).
 pub(crate) fn point(layout: &NestedLayout, scale: f64) -> Vec<f64> {
-    (0..layout.n_compact())
-        .map(|i| scale * 0.1 * (1.0 + 0.37 * i as f64).sin())
-        .collect()
+    (0..layout.n_compact()).map(|i| scale * 0.1 * (1.0 + 0.37 * i as f64).sin()).collect()
 }
 
 /// What compact index `i` is, for failure messages: `η k`, or `level L group g κ NAME`.

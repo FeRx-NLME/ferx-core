@@ -121,13 +121,7 @@ fn population(doses: Vec<DoseEvent>, obs_times: Vec<f64>, obs_cmt: usize) -> Pop
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            doses,
-            obs_times,
-            vec![0.0; n],
-            vec![obs_cmt; n],
-        )],
+        subjects: vec![common::subject("1", doses, obs_times, vec![0.0; n], vec![obs_cmt; n])],
     }
 }
 

@@ -89,30 +89,8 @@ pub(crate) const VERN7: ErkTableau = ErkTableau {
     a: [
         [0.0; MAX_STAGES],
         [0.005, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [
-            -1.076_790_123_456_79,
-            1.185_679_012_345_679,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
-        [
-            0.040_833_333_333_333_33,
-            0.0,
-            0.1225,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
+        [-1.076_790_123_456_79, 1.185_679_012_345_679, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.040_833_333_333_333_33, 0.0, 0.1225, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         [
             0.638_913_923_625_572_6,
             0.0,
@@ -261,10 +239,7 @@ impl<T: PkNum> ErkStepper<T> {
     /// decision: what a recording type records as the step's code (#2786).
     #[allow(clippy::needless_range_loop)]
     pub(crate) fn stages(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T],
         clock: &super::solver::StepClock<T>,
     ) {
         let n = self.n;
@@ -292,12 +267,7 @@ impl<T: PkNum> ErkStepper<T> {
                 }
                 self.u_tmp[i] = u[i] + h * acc;
             }
-            rhs(
-                &self.u_tmp,
-                params,
-                clock.at(self.tab.c[stage]),
-                &mut self.ks[stage],
-            );
+            rhs(&self.u_tmp, params, clock.at(self.tab.c[stage]), &mut self.ks[stage]);
         }
 
         for i in 0..n {
@@ -360,13 +330,8 @@ pub(crate) fn erk_u_new_at(n: usize, tab: &ErkTableau) -> usize {
 #[allow(clippy::needless_range_loop)]
 #[inline(always)]
 pub(crate) fn erk_err_norm(
-    n: usize,
-    tab: &ErkTableau,
-    k: impl Fn(usize, usize) -> f64,
-    u_new: impl Fn(usize) -> f64,
-    u: impl Fn(usize) -> f64,
-    dt: f64,
-    opts: &OdeSolverOptions,
+    n: usize, tab: &ErkTableau, k: impl Fn(usize, usize) -> f64, u_new: impl Fn(usize) -> f64,
+    u: impl Fn(usize) -> f64, dt: f64, opts: &OdeSolverOptions,
 ) -> f64 {
     let s = tab.stages;
     let mut err_norm = 0.0;
@@ -389,12 +354,7 @@ pub(crate) fn erk_err_norm(
 /// `k(block, i)` (`ks…, u_tmp, u_new, f_end`): the cubic Hermite over the step's ends.
 #[inline(always)]
 pub(crate) fn erk_interp<T: PkNum>(
-    tab: &ErkTableau,
-    k: impl Fn(usize, usize) -> T,
-    theta: f64,
-    u_old_i: T,
-    dt: f64,
-    i: usize,
+    tab: &ErkTableau, k: impl Fn(usize, usize) -> T, theta: f64, u_old_i: T, dt: f64, i: usize,
 ) -> T {
     let s = tab.stages;
     let d_end = if tab.fsal { k(s - 1, i) } else { k(s + 2, i) };
@@ -403,20 +363,14 @@ pub(crate) fn erk_interp<T: PkNum>(
 
 impl<T: PkNum> super::solver::StepBody<T> for ErkStepper<T> {
     fn start(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T],
         clock: &super::solver::StepClock<T>,
     ) {
         rhs(&u[..self.n], params, clock.start(), &mut self.ks[0]);
         self.have_k1 = true;
     }
     fn step(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T],
         clock: &super::solver::StepClock<T>,
     ) {
         self.have_k1 = true;
@@ -424,22 +378,14 @@ impl<T: PkNum> super::solver::StepBody<T> for ErkStepper<T> {
     }
     fn carried_into(&self, out: &mut Vec<T>) {
         out.clear();
-        for v in self
-            .ks
-            .iter()
-            .chain([&self.u_tmp, &self.u_new, &self.f_end])
-        {
+        for v in self.ks.iter().chain([&self.u_tmp, &self.u_new, &self.f_end]) {
             out.extend_from_slice(v);
         }
     }
     fn set_carried(&mut self, v: &[T]) {
         let n = self.n;
         let mut at = 0;
-        for dst in self
-            .ks
-            .iter_mut()
-            .chain([&mut self.u_tmp, &mut self.u_new, &mut self.f_end])
-        {
+        for dst in self.ks.iter_mut().chain([&mut self.u_tmp, &mut self.u_new, &mut self.f_end]) {
             dst.copy_from_slice(&v[at..at + n]);
             at += n;
         }
@@ -449,12 +395,7 @@ impl<T: PkNum> super::solver::StepBody<T> for ErkStepper<T> {
 
 impl<T: PkNum> Stepper<T> for ErkStepper<T> {
     fn attempt(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64, dt: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
         self.stages(rhs, u, params, &super::solver::StepClock::new(t, dt));
@@ -493,10 +434,7 @@ impl<T: PkNum> Stepper<T> for ErkStepper<T> {
             // `(u, t)` moved and nothing was evaluated there, so `ks[0]` is stale.
             self.have_k1 = false;
         }
-        debug_assert_eq!(
-            self.have_k1,
-            self.tab.start_kept_on_accept(self.dense_required)
-        );
+        debug_assert_eq!(self.have_k1, self.tab.start_kept_on_accept(self.dense_required));
     }
 
     fn err_exp(&self) -> f64 {

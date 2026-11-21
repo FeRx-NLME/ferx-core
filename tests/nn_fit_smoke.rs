@@ -66,10 +66,7 @@ const NN_DCM_MODEL: &str = r#"
 "#;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn fit_runs_without_panicking_on_nn_bearing_model() {
     let parsed = parse_full_model(NN_DCM_MODEL).expect("model parses with --features nn");
     let model = parsed.model;
@@ -97,11 +94,7 @@ fn fit_runs_without_panicking_on_nn_bearing_model() {
     let result = fit(&model, &population, &model.default_params, &options).expect("fit returns Ok");
 
     // OFV must be finite.
-    assert!(
-        result.ofv.is_finite(),
-        "fit returned non-finite OFV: {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "fit returned non-finite OFV: {}", result.ofv);
 
     // The optimizer should have nudged at least one NN weight.
     let final_theta = &result.theta;

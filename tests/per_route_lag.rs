@@ -197,9 +197,8 @@ const ROUTE_LAG_MIXED: &str = r#"
 
 /// Single-route reference at `ka` with a compartment lag `lag`.
 fn comp_lag_first_order_curve(ka: f64, lag: f64, obs_times: &[f64]) -> Vec<f64> {
-    let model = parse_full_model(COMP_LAG_SINGLE)
-        .expect("comp-lag single first_order parses")
-        .model;
+    let model =
+        parse_full_model(COMP_LAG_SINGLE).expect("comp-lag single first_order parses").model;
     let mut params = model.default_params.clone();
     params.theta[2] = ka;
     params.theta[3] = lag;
@@ -212,9 +211,7 @@ fn comp_lag_first_order_curve(ka: f64, lag: f64, obs_times: &[f64]) -> Vec<f64> 
 
 /// Single zero-order reference at `dur` with a compartment lag `lag`.
 fn comp_lag_zero_order_curve(dur: f64, lag: f64, obs_times: &[f64]) -> Vec<f64> {
-    let model = parse_full_model(COMP_LAG_ZERO)
-        .expect("comp-lag single zero_order parses")
-        .model;
+    let model = parse_full_model(COMP_LAG_ZERO).expect("comp-lag single zero_order parses").model;
     let mut params = model.default_params.clone();
     params.theta[2] = dur;
     params.theta[3] = lag;
@@ -229,23 +226,15 @@ fn comp_lag_zero_order_curve(dur: f64, lag: f64, obs_times: &[f64]) -> Vec<f64> 
 /// observed at `obs_times` on CMT 1.
 fn pop_doses(dose_times: &[f64], obs_times: Vec<f64>) -> Population {
     let n = obs_times.len();
-    let doses: Vec<DoseEvent> = dose_times
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
+    let doses: Vec<DoseEvent> =
+        dose_times.iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
     Population {
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            doses,
-            obs_times,
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", doses, obs_times, vec![0.0; n], vec![1; n])],
     }
 }
 
@@ -256,15 +245,11 @@ fn pop_single(obs_times: Vec<f64>) -> Population {
 
 fn predict_curve(src: &str, obs_times: &[f64]) -> Vec<f64> {
     let model = parse_full_model(src).expect("model parses").model;
-    predict(
-        &model,
-        &pop_single(obs_times.to_vec()),
-        &model.default_params,
-    )
-    .unwrap()
-    .iter()
-    .map(|p| p.pred)
-    .collect()
+    predict(&model, &pop_single(obs_times.to_vec()), &model.default_params)
+        .unwrap()
+        .iter()
+        .map(|p| p.pred)
+        .collect()
 }
 
 fn assert_close(a: &[f64], b: &[f64], obs_times: &[f64], tol: f64, what: &str) {
@@ -289,28 +274,12 @@ fn route_lag_equals_compartment_lag_first_order() {
     let obs: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect(); // 0..30 h
     let route = predict_curve(ROUTE_LAG_SINGLE, &obs);
     let comp = comp_lag_first_order_curve(1.0, 2.0, &obs);
-    assert_close(
-        &route,
-        &comp,
-        &obs,
-        1e-5,
-        "route-lag vs comp-lag (first-order)",
-    );
+    assert_close(&route, &comp, &obs, 1e-5, "route-lag vs comp-lag (first-order)");
     // A real delayed curve: ~0 before the lag, a real peak after.
-    let before: f64 = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t < 2.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    assert!(
-        before < 1e-6,
-        "concentration must be ~0 before the lag; got {before}"
-    );
-    assert!(
-        route.iter().cloned().fold(0.0, f64::max) > 0.5,
-        "expected a real peak"
-    );
+    let before: f64 =
+        obs.iter().zip(&route).filter(|(&t, _)| t < 2.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    assert!(before < 1e-6, "concentration must be ~0 before the lag; got {before}");
+    assert!(route.iter().cloned().fold(0.0, f64::max) > 0.5, "expected a real peak");
 }
 
 #[test]
@@ -321,23 +290,10 @@ fn route_lag_equals_compartment_lag_zero_order() {
     let obs: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect();
     let route = predict_curve(ROUTE_LAG_ZERO, &obs);
     let comp = comp_lag_zero_order_curve(3.0, 2.0, &obs);
-    assert_close(
-        &route,
-        &comp,
-        &obs,
-        1e-5,
-        "route-lag vs comp-lag (zero-order)",
-    );
-    let before: f64 = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t < 2.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    assert!(
-        before < 1e-6,
-        "zero-order onset must wait for the lag; got {before}"
-    );
+    assert_close(&route, &comp, &obs, 1e-5, "route-lag vs comp-lag (zero-order)");
+    let before: f64 =
+        obs.iter().zip(&route).filter(|(&t, _)| t < 2.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    assert!(before < 1e-6, "zero-order onset must wait for the lag; got {before}");
 }
 
 #[test]
@@ -369,13 +325,7 @@ fn parallel_distinct_route_lags_equal_superposition() {
     let c1 = comp_lag_first_order_curve(1.5, 0.5, &obs);
     let c2 = comp_lag_first_order_curve(0.7, 3.0, &obs);
     let want: Vec<f64> = (0..obs.len()).map(|i| fr1 * c1[i] + fr2 * c2[i]).collect();
-    assert_close(
-        &parallel,
-        &want,
-        &obs,
-        2e-3,
-        "parallel per-route-lag superposition",
-    );
+    assert_close(&parallel, &want, &obs, 2e-3, "parallel per-route-lag superposition");
     // Two distinct onsets: fast route from ~0.5 h, slow route only after 3 h — so the
     // slope must visibly increase across t=3 (a second phase), not a single curve.
     let idx = |tt: f64| obs.iter().position(|&t| (t - tt).abs() < 1e-9).unwrap();
@@ -397,16 +347,8 @@ fn mixed_zero_order_route_lag_equals_superposition() {
     // first-order (no lag) reference: comp-lag twin with lag 0.
     let c_fo = comp_lag_first_order_curve(1.0, 0.0, &obs);
     let c_zo = comp_lag_zero_order_curve(3.0, 2.0, &obs);
-    let want: Vec<f64> = (0..obs.len())
-        .map(|i| fzo1 * c_fo[i] + fzo * c_zo[i])
-        .collect();
-    assert_close(
-        &mixed,
-        &want,
-        &obs,
-        1e-5,
-        "mixed zero-order-route-lag superposition",
-    );
+    let want: Vec<f64> = (0..obs.len()).map(|i| fzo1 * c_fo[i] + fzo * c_zo[i]).collect();
+    assert_close(&mixed, &want, &obs, 1e-5, "mixed zero-order-route-lag superposition");
 }
 
 #[test]
@@ -459,10 +401,7 @@ fn zero_route_lag_is_bit_identical_to_no_lag() {
     let no_lag = predict_curve(NO_LAG, &obs);
     let lag_zero = predict_curve(LAG_ZERO, &obs);
     for (i, &t) in obs.iter().enumerate() {
-        assert_eq!(
-            no_lag[i], lag_zero[i],
-            "lag=0 must be bit-identical to no lag at t={t}"
-        );
+        assert_eq!(no_lag[i], lag_zero[i], "lag=0 must be bit-identical to no lag at t={t}");
     }
 }
 
@@ -488,13 +427,7 @@ fn route_lag_multi_dose_equals_compartment_lag() {
             .map(|p| p.pred)
             .collect::<Vec<_>>()
     };
-    assert_close(
-        &route,
-        &comp,
-        &obs,
-        1e-5,
-        "multi-dose route-lag vs comp-lag",
-    );
+    assert_close(&route, &comp, &obs, 1e-5, "multi-dose route-lag vs comp-lag");
 }
 
 #[test]
@@ -510,10 +443,8 @@ fn route_lag_on_event_driven_path_equals_compartment_lag() {
     let build = |src: &str| -> Vec<f64> {
         let m = parse_full_model(src).expect("parses").model;
         let n = obs.len();
-        let doses: Vec<DoseEvent> = dose_times
-            .iter()
-            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-            .collect();
+        let doses: Vec<DoseEvent> =
+            dose_times.iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
         let mut subj = common::subject("1", doses, obs.clone(), vec![0.0; n], vec![1; n]);
         subj.reset_times = vec![reset_at];
         let pop = Population {
@@ -524,33 +455,16 @@ fn route_lag_on_event_driven_path_equals_compartment_lag() {
             warnings: vec![],
             subjects: vec![subj],
         };
-        predict(&m, &pop, &m.default_params)
-            .unwrap()
-            .iter()
-            .map(|p| p.pred)
-            .collect()
+        predict(&m, &pop, &m.default_params).unwrap().iter().map(|p| p.pred).collect()
     };
     let route = build(ROUTE_LAG_SINGLE);
     let comp = build(COMP_LAG_SINGLE);
-    assert_close(
-        &route,
-        &comp,
-        &obs,
-        1e-5,
-        "reset event-driven route-lag vs comp-lag",
-    );
+    assert_close(&route, &comp, &obs, 1e-5, "reset event-driven route-lag vs comp-lag");
     // The reset zeros state at t=12; the post-reset dose at 13 (+lag 2) re-absorbs, so
     // there is real signal after the reset (not an all-zero degenerate match).
-    let after: f64 = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t > 15.5)
-        .map(|(_, &c)| c)
-        .fold(0.0, f64::max);
-    assert!(
-        after > 0.3,
-        "post-reset re-dose must produce real signal, got {after}"
-    );
+    let after: f64 =
+        obs.iter().zip(&route).filter(|(&t, _)| t > 15.5).map(|(_, &c)| c).fold(0.0, f64::max);
+    assert!(after > 0.3, "post-reset re-dose must produce real signal, got {after}");
 }
 
 /// Tier-2 (fast): a per-route-lag model runs through the optimizer end-to-end. Since #859
@@ -562,12 +476,7 @@ fn per_route_lag_fit_runs_end_to_end() {
     use ferx_core::{fit, FitOptions};
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
     let obs_times: Vec<f64> = (1..=20).map(|i| i as f64 * 0.5).collect();
-    let truth = predict(
-        &model,
-        &pop_single(obs_times.clone()),
-        &model.default_params,
-    )
-    .unwrap();
+    let truth = predict(&model, &pop_single(obs_times.clone()), &model.default_params).unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
@@ -579,16 +488,9 @@ fn per_route_lag_fit_runs_end_to_end() {
         warnings: vec![],
         subjects: vec![common::subject("1", vec![dose], obs_times, obs, vec![1; n])],
     };
-    let opts = FitOptions {
-        outer_maxiter: 2,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 2, ..FitOptions::default() };
     let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit runs end-to-end");
-    assert!(
-        fitted.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        fitted.ofv
-    );
+    assert!(fitted.ofv.is_finite(), "OFV must be finite, got {}", fitted.ofv);
 }
 
 /// The noise-free onset design `per_route_lag_fit_recovers_lag` fits, before its DV = 0 rows
@@ -658,11 +560,8 @@ fn zero_dv_rows_under_proportional_error_warn_at_fit_time() {
     // The fit's own `bloq_method` decides whether a `CENS = 1` zero is scored at its DV: the
     // same four rows flagged censored are skipped under `m3` and counted under `drop`.
     let mut censored = with_zeros.clone();
-    censored.subjects[0].cens = censored.subjects[0]
-        .observations
-        .iter()
-        .map(|&y| i8::from(y == 0.0))
-        .collect();
+    censored.subjects[0].cens =
+        censored.subjects[0].observations.iter().map(|&y| i8::from(y == 0.0)).collect();
     for (bloq, warns) in [(BloqMethod::M3, false), (BloqMethod::Drop, true)] {
         let mut o = opts.clone();
         o.bloq_method = Some(bloq);
@@ -674,18 +573,9 @@ fn zero_dv_rows_under_proportional_error_warn_at_fit_time() {
             r.warnings
         );
     }
-    let clean = fit(
-        &model,
-        &drop_zero_dv(with_zeros),
-        &model.default_params,
-        &opts,
-    )
-    .expect("fit runs");
-    assert!(
-        !clean.warnings.iter().any(|w| w.starts_with(CODE)),
-        "{:?}",
-        clean.warnings
-    );
+    let clean =
+        fit(&model, &drop_zero_dv(with_zeros), &model.default_params, &opts).expect("fit runs");
+    assert!(!clean.warnings.iter().any(|w| w.starts_with(CODE)), "{:?}", clean.warnings);
 }
 
 /// Tier-3 (slow): a full FOCEI fit (exact analytic gradients since #859) recovers the
@@ -712,10 +602,7 @@ fn zero_dv_rows_under_proportional_error_warn_at_fit_time() {
 /// So the fix declares what the model already says — zero IIV — rather than teaching the
 /// assertion to accept a runaway.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn per_route_lag_fit_recovers_lag() {
     use ferx_core::{fit, FitOptions};
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
@@ -889,10 +776,7 @@ fn shipped_per_route_lag_example_binds_its_residual_components_by_role() {
         .expect("read per_route_lag_absorption.ferx");
     let parsed = parse_full_model(&src).expect("per_route_lag_absorption.ferx parses");
     assert!(
-        matches!(
-            parsed.model.error_model,
-            ferx_core::types::ErrorModel::Combined
-        ),
+        matches!(parsed.model.error_model, ferx_core::types::ErrorModel::Combined),
         "expected a combined error model, got {:?}",
         parsed.model.error_model
     );
@@ -1034,26 +918,12 @@ fn route_lag_equals_compartment_lag_transit() {
     let route = predict_curve(TRANSIT_ROUTE_LAG, &obs);
     let comp = predict_curve(TRANSIT_COMP_LAG, &obs);
     assert_close(&route, &comp, &obs, 1e-5, "route-lag vs comp-lag (transit)");
-    let before = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t < 2.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    let after = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t > 6.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    assert!(
-        before < 1e-6,
-        "transit conc must be ~0 before the lag; got {before}"
-    );
-    assert!(
-        after > 1e-3,
-        "transit conc must rise after the lag; got {after}"
-    );
+    let before =
+        obs.iter().zip(&route).filter(|(&t, _)| t < 2.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    let after =
+        obs.iter().zip(&route).filter(|(&t, _)| t > 6.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    assert!(before < 1e-6, "transit conc must be ~0 before the lag; got {before}");
+    assert!(after > 1e-3, "transit conc must rise after the lag; got {after}");
 }
 
 /// `igd(mat, cv2, lag=L)` ≡ `igd(mat, cv2)` + compartment lagtime L (1e-5).
@@ -1063,26 +933,12 @@ fn route_lag_equals_compartment_lag_igd() {
     let route = predict_curve(IGD_ROUTE_LAG, &obs);
     let comp = predict_curve(IGD_COMP_LAG, &obs);
     assert_close(&route, &comp, &obs, 1e-5, "route-lag vs comp-lag (igd)");
-    let before = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t < 2.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    let after = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t > 6.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    assert!(
-        before < 1e-6,
-        "igd conc must be ~0 before the lag; got {before}"
-    );
-    assert!(
-        after > 1e-3,
-        "igd conc must rise after the lag; got {after}"
-    );
+    let before =
+        obs.iter().zip(&route).filter(|(&t, _)| t < 2.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    let after =
+        obs.iter().zip(&route).filter(|(&t, _)| t > 6.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    assert!(before < 1e-6, "igd conc must be ~0 before the lag; got {before}");
+    assert!(after > 1e-3, "igd conc must rise after the lag; got {after}");
 }
 
 /// Multi-dose transit + route lag ≡ multi-dose transit + compartment lag — the route
@@ -1108,13 +964,7 @@ fn route_lag_multi_dose_equals_compartment_lag_transit() {
             .map(|p| p.pred)
             .collect::<Vec<_>>()
     };
-    assert_close(
-        &route,
-        &comp,
-        &obs,
-        1e-5,
-        "transit multi-dose route vs comp",
-    );
+    assert_close(&route, &comp, &obs, 1e-5, "transit multi-dose route vs comp");
 }
 
 // ── Composition with SS (#834) and infusion (#836) into an absorption compartment ──
@@ -1194,24 +1044,13 @@ fn infusion_into_per_route_lag_equals_compartment_lag() {
                 vec![1; n],
             )],
         };
-        predict(&m, &pop, &m.default_params)
-            .unwrap()
-            .iter()
-            .map(|p| p.pred)
-            .collect::<Vec<_>>()
+        predict(&m, &pop, &m.default_params).unwrap().iter().map(|p| p.pred).collect::<Vec<_>>()
     };
     let route = inf(ROUTE_LAG_SINGLE);
     let comp = inf(COMP_LAG_SINGLE);
     assert_close(&route, &comp, &obs, 1e-5, "infusion route-lag vs comp-lag");
     // Genuinely delayed: ~0 before the lag.
-    let before = obs
-        .iter()
-        .zip(&route)
-        .filter(|(&t, _)| t < 2.0)
-        .map(|(_, &c)| c.abs())
-        .fold(0.0, f64::max);
-    assert!(
-        before < 1e-6,
-        "infused conc must be ~0 before the lag; got {before}"
-    );
+    let before =
+        obs.iter().zip(&route).filter(|(&t, _)| t < 2.0).map(|(_, &c)| c.abs()).fold(0.0, f64::max);
+    assert!(before < 1e-6, "infused conc must be ~0 before the lag; got {before}");
 }

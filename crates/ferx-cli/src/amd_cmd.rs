@@ -109,11 +109,7 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
         base.prepared.population.n_obs()
     );
     eprintln!("Space:      {}", config.mfl.render());
-    eprintln!(
-        "Strategy:   {}, retries {}",
-        options.strategy.label(),
-        options.retries.label()
-    );
+    eprintln!("Strategy:   {}, retries {}", options.strategy.label(), options.retries.label());
     eprintln!("Directory:  {}", dir.display());
 
     // The plan before the first fit, so a user sees what will and will not run
@@ -121,11 +117,9 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
     let plan = ferx_tools::amd::plan(&options, &config.mfl, &Context::from_base(&base))?;
     for step in &plan {
         match &step.skipped {
-            Some(reason) => eprintln!(
-                "  {} {:<12} skipped: {reason}",
-                step.index,
-                step.step.label()
-            ),
+            Some(reason) => {
+                eprintln!("  {} {:<12} skipped: {reason}", step.index, step.step.label())
+            }
             None => eprintln!("  {} {:<12} -> {}", step.index, step.step.label(), step.dir),
         }
     }
@@ -141,13 +135,7 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
                 "Starting model: OFV {}",
                 ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into())
             ),
-            AmdEvent::StepStarted {
-                position,
-                total,
-                step,
-                rerun,
-                ..
-            } => eprintln!(
+            AmdEvent::StepStarted { position, total, step, rerun, .. } => eprintln!(
                 "Step {position}/{total}: {}{} ({})...",
                 step.label(),
                 if rerun { " (rerun)" } else { "" },
@@ -160,27 +148,12 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
                 "Step {} failed: {error}; carrying on from the model it was handed",
                 step.label()
             ),
-            AmdEvent::StepFinished {
-                step,
-                criterion,
-                before,
-                after,
-                selected,
-                ..
-            } => eprintln!(
+            AmdEvent::StepFinished { step, criterion, before, after, selected, .. } => eprintln!(
                 "  {} done: {criterion} {} -> {}; selected {}",
                 step.label(),
-                before
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
-                after
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
-                if selected.is_empty() {
-                    "nothing".to_string()
-                } else {
-                    selected.join("; ")
-                }
+                before.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                after.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                if selected.is_empty() { "nothing".to_string() } else { selected.join("; ") }
             ),
             AmdEvent::RetriesStarted { starts, .. } => {
                 eprintln!("  retries: refitting the selected model with {starts} starts...")
@@ -199,12 +172,7 @@ fn run_amd_command(args: &[String]) -> Result<i32, String> {
     let result = run_amd(
         &config,
         &base,
-        AmdRun {
-            dir: dir.clone(),
-            threads,
-            cancel: None,
-            progress: Some(&progress),
-        },
+        AmdRun { dir: dir.clone(), threads, cancel: None, progress: Some(&progress) },
     )?;
 
     print!("{}", render_summary(&result));
@@ -280,15 +248,9 @@ mod tests {
     /// A model, a dataset, a space and an `[amd]` section, written out as a
     /// `.ferxsearch` file the command can be pointed at.
     fn write(
-        dir: &std::path::Path,
-        base: &str,
-        data: &str,
-        space: &str,
-        amd: &str,
+        dir: &std::path::Path, base: &str, data: &str, space: &str, amd: &str,
     ) -> std::path::PathBuf {
-        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data")
-            .join(data);
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data").join(data);
         std::fs::write(dir.join("base.ferx"), base).unwrap();
         let config = dir.join("search.ferxsearch");
         let space = if space.is_empty() {
@@ -345,10 +307,7 @@ mod tests {
     #[test]
     fn run_drives_the_pipeline_writes_the_report_and_resumes_quietly() {
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(
-            dir.path(),
-            "[amd]\nstrategy = \"SIR\"\nretries = \"skip\"\n",
-        );
+        let config = write_config(dir.path(), "[amd]\nstrategy = \"SIR\"\nretries = \"skip\"\n");
         let out = dir.path().join("run");
         let common = [
             "ferx".to_string(),
@@ -360,19 +319,11 @@ mod tests {
             "2".to_string(),
         ];
         assert_eq!(run(&common), 0);
-        for file in [
-            "steps.csv",
-            "candidates.csv",
-            "final.ferx",
-            "final-fit.yaml",
-        ] {
+        for file in ["steps.csv", "candidates.csv", "final.ferx", "final-fit.yaml"] {
             assert!(out.join(file).is_file(), "{file} missing");
         }
         for step in ["00-start", "01-modelsearch", "02-iivsearch", "03-ruvsearch"] {
-            assert!(
-                out.join(step).join("input.ferx").is_file(),
-                "{step}/input.ferx missing"
-            );
+            assert!(out.join(step).join("input.ferx").is_file(), "{step}/input.ferx missing");
         }
         let steps = std::fs::read_to_string(out.join("steps.csv")).unwrap();
         assert_eq!(steps.lines().count(), 4, "one header, three steps");
@@ -393,10 +344,8 @@ mod tests {
     #[test]
     fn the_default_strategy_skips_iov_and_allometry_for_cause() {
         let dir = tempfile::tempdir().unwrap();
-        let config = write_config(
-            dir.path(),
-            "[amd]\nretries = \"skip\"\nskip = [\"structural\"]\n",
-        );
+        let config =
+            write_config(dir.path(), "[amd]\nretries = \"skip\"\nskip = [\"structural\"]\n");
         let out = dir.path().join("run");
         assert_eq!(drive(&config, &out), 0);
         let steps = std::fs::read_to_string(out.join("steps.csv")).unwrap();
@@ -426,15 +375,11 @@ mod tests {
         assert!(candidates.contains("allometry,base,"), "{candidates}");
         assert!(candidates.contains("allometry,allometric,"), "{candidates}");
         let steps = std::fs::read_to_string(out.join("steps.csv")).unwrap();
-        let row = steps
-            .lines()
-            .find(|l| l.starts_with("allometry,"))
-            .expect("the allometry step ran");
+        let row =
+            steps.lines().find(|l| l.starts_with("allometry,")).expect("the allometry step ran");
         assert!(row.contains(",ran,"), "{row}");
         assert!(
-            std::fs::read_to_string(out.join("final.ferx"))
-                .unwrap()
-                .contains("WT"),
+            std::fs::read_to_string(out.join("final.ferx")).unwrap().contains("WT"),
             "the scaled model was not carried forward"
         );
     }
@@ -454,10 +399,7 @@ mod tests {
         let out = dir.path().join("run");
         assert_eq!(drive(&config, &out), 0);
         let steps = std::fs::read_to_string(out.join("steps.csv")).unwrap();
-        let row = steps
-            .lines()
-            .find(|l| l.starts_with("iovsearch,"))
-            .expect("the IOV step ran");
+        let row = steps.lines().find(|l| l.starts_with("iovsearch,")).expect("the IOV step ran");
         assert!(row.contains(",ran,"), "{row}");
         // Every other step is skipped: four because the file has no [space]
         // at all, and the residual step because `[amd] skip` names it.
@@ -467,16 +409,10 @@ mod tests {
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
-        assert_eq!(
-            run(&args(&["ferx", "amd", "a.ferxsearch", "b.ferxsearch"])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "amd", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "amd", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "amd", "-h"])), 0);
         assert_eq!(run(&args(&["ferx", "amd"])), 1);
-        assert_eq!(
-            run(&args(&["ferx", "amd", "x.ferxsearch", "--samples", "3"])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "amd", "x.ferxsearch", "--samples", "3"])), 1);
     }
 }

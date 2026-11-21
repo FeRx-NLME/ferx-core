@@ -61,11 +61,7 @@ pub(super) fn rich_result() -> FitResult {
     r.sigma_fixed = vec![false, true];
     r.se_sigma = Some(vec![0.012, 0.0]);
     r.error_model = crate::types::ErrorModel::Combined;
-    r.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho: 0.25,
-    }];
+    r.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.25 }];
     r.residual_correlation_fixed = vec![false];
     r.se_residual_correlations = Some(vec![0.05]);
     r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.04, 0.01, 0.01, 0.0625]));
@@ -86,10 +82,8 @@ pub(super) fn rich_result() -> FitResult {
         p.name = name.into();
         p
     };
-    r.mixture_override_params = vec![
-        param("eta_CL_MIX2", "Omega", 0, 11),
-        param("add_MIX2", "Sigma", 1, 12),
-    ];
+    r.mixture_override_params =
+        vec![param("eta_CL_MIX2", "Omega", 0, 11), param("add_MIX2", "Sigma", 1, 12)];
     r.mixture_overrides = Some(vec![0.3, 0.7]);
     r.se_mixture_overrides = Some(vec![0.06, 0.0]);
     r
@@ -99,17 +93,10 @@ pub(super) fn rich_result() -> FitResult {
 /// the top-level copies (`nested = false`) or the `estimates:` block (`nested = true`).
 /// Only the sections [`estimate_sections`] owns, at the writer's exact indentation.
 fn yaml_estimate_fields(
-    yaml: &str,
-    nested: bool,
+    yaml: &str, nested: bool,
 ) -> std::collections::BTreeMap<(String, String, String), String> {
-    const OWNED: &[&str] = &[
-        "theta",
-        "omega",
-        "sigma",
-        "block_sigma",
-        "omega_iov",
-        "mixture_overrides",
-    ];
+    const OWNED: &[&str] =
+        &["theta", "omega", "sigma", "block_sigma", "omega_iov", "mixture_overrides"];
     let base = if nested { 2 } else { 0 };
     let mut out = std::collections::BTreeMap::new();
     let mut in_estimates = false;
@@ -232,14 +219,7 @@ fn json_estimates_are_the_yaml_estimate_sections() {
     // side must not pass on the strength of the others.
     let json = r.to_json_value();
     let est = &json["estimates"];
-    for s in [
-        "theta",
-        "omega",
-        "sigma",
-        "block_sigma",
-        "omega_iov",
-        "mixture_overrides",
-    ] {
+    for s in ["theta", "omega", "sigma", "block_sigma", "omega_iov", "mixture_overrides"] {
         assert!(est[s].is_object(), "`estimates.{s}` missing: {est}");
     }
     assert!(n >= 60, "only {n} fields compared");
@@ -254,10 +234,7 @@ fn json_estimates_are_the_yaml_estimate_sections() {
     assert_eq!(est["omega"]["eta_V__eta_CL"]["covariance"], 0.03);
     assert_eq!(est["sigma"]["prop"]["estimate"], 0.12);
     assert_eq!(est["omega_iov"]["KAPPA_CL"]["weight"], "NARM");
-    assert_eq!(
-        est["mixture_overrides"]["add_MIX2"]["held"],
-        "collapsed_at_guard"
-    );
+    assert_eq!(est["mixture_overrides"]["add_MIX2"]["held"], "collapsed_at_guard");
 }
 
 #[test]
@@ -311,10 +288,7 @@ fn a_fit_json_with_estimates_still_reads_back() {
     let text = serde_json::to_string(&r.to_json_value()).unwrap();
     let back = FitResult::from_json_str(&text).unwrap();
     assert_eq!(back.theta_names, r.theta_names);
-    assert_eq!(
-        back.to_json_value()["estimates"],
-        r.to_json_value()["estimates"]
-    );
+    assert_eq!(back.to_json_value()["estimates"], r.to_json_value()["estimates"]);
 }
 
 #[test]
@@ -346,25 +320,16 @@ fn yaml_quotes_names_yaml_would_misread() {
 
     // Top level: only the misread names are quoted, so every other byte is as before.
     for name in ["YES", "NULL", "OFF"] {
-        assert!(
-            top.contains(&format!("\n  \"{name}\":\n")),
-            "{name}:\n{top}"
-        );
+        assert!(top.contains(&format!("\n  \"{name}\":\n")), "{name}:\n{top}");
         assert!(!top.contains(&format!("\n  {name}:\n")), "{name}:\n{top}");
     }
-    assert!(
-        top.contains("\n  KA:\n") && top.contains("\n  OFF__prop:\n"),
-        "{top}"
-    );
+    assert!(top.contains("\n  KA:\n") && top.contains("\n  OFF__prop:\n"), "{top}");
     assert!(top.contains("    base: \"OFF\"\n"), "{top}");
     assert!(top.contains("    base: \"NULL\"\n"), "{top}");
 
     // Under `estimates:` every name is quoted, ordinary ones included.
     for name in ["YES", "NULL", "OFF", "KA", "OFF__prop", "add_MIX2"] {
-        assert!(
-            nested.contains(&format!("\n    \"{name}\":\n")),
-            "{name}:\n{nested}"
-        );
+        assert!(nested.contains(&format!("\n    \"{name}\":\n")), "{name}:\n{nested}");
     }
     assert!(nested.contains("      base: \"OFF\"\n"), "{nested}");
     // Fixed vocabulary is not a name and stays bare.
@@ -385,19 +350,10 @@ fn yaml_quotes_names_yaml_would_misread() {
 
 #[test]
 fn yaml_name_quotes_exactly_the_implicit_scalars_unless_asked() {
-    for misread in [
-        "YES", "yes", "Y", "n", "No", "ON", "off", "TRUE", "False", "NULL", "~",
-    ] {
+    for misread in ["YES", "yes", "Y", "n", "No", "ON", "off", "TRUE", "False", "NULL", "~"] {
         assert_eq!(yaml_name(misread, false), yaml_quote(misread), "{misread}");
     }
-    for plain in [
-        "CL",
-        "YESNO",
-        "ON_RATE",
-        "eta_NULL",
-        "PLACEBO[L=2]",
-        "ETA_V__ETA_CL",
-    ] {
+    for plain in ["CL", "YESNO", "ON_RATE", "eta_NULL", "PLACEBO[L=2]", "ETA_V__ETA_CL"] {
         assert_eq!(yaml_name(plain, false), plain, "{plain}");
         assert_eq!(yaml_name(plain, true), yaml_quote(plain), "{plain}");
     }
@@ -419,15 +375,10 @@ fn yaml_flow_name_quotes_flow_indicators_that_block_context_allows() {
         assert_eq!(yaml_name(plain, false), plain, "{plain}");
     }
     // Every reason block context quotes for carries over to flow context.
-    for misread in [
-        "YES", "null", "", "[A]", "-x", "#c", "a: b", "a #b", "t:", " lead",
-    ] {
+    for misread in ["YES", "null", "", "[A]", "-x", "#c", "a: b", "a #b", "t:", " lead"] {
         assert_eq!(yaml_name(misread, false), yaml_quote(misread), "{misread}");
         assert_eq!(yaml_flow_name(misread), yaml_quote(misread), "{misread}");
     }
-    assert_eq!(
-        yaml_flow_names(&["INT", "TEFF[TIME=0.5]"]),
-        "[INT, \"TEFF[TIME=0.5]\"]"
-    );
+    assert_eq!(yaml_flow_names(&["INT", "TEFF[TIME=0.5]"]), "[INT, \"TEFF[TIME=0.5]\"]");
     assert_eq!(yaml_flow_names::<&str>(&[]), "[]");
 }

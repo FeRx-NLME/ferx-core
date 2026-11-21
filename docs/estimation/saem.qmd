@@ -486,6 +486,203 @@ The NLopt M-step uses **BOBYQA** (derivative-free trust-region with quadratic in
 
 When `mu_referencing = false`, the full NLopt M-step runs for all thetas as before.
 
+#### The optimizer of the numerical M-step (`mstep_optimizer`) {#saem-mstep-optimizer}
+
+##### The two solves {#saem-mstep-optimizer-solves}
+
+
+The numerical θ/σ M-step minimises a sum of per-observation Gaussian negative
+log-likelihoods at the iteration's frozen η (SAEM) or at importance-weighted samples
+(IMP, IMPMAP). `mstep_optimizer = auto`, the default, runs `newton` wherever its scope
+(below) holds and `bobyqa` elsewhere — and, in SAEM, `bobyqa` too when no θ is left to the
+numerical solve (every θ is owned by a closed-form step: a σ-only solve), where BOBYQA's
+evaluations are all served by the prediction memo (below) and Newton's fused pass is extra
+work for no fewer evaluations. IMP and IMPMAP keep `newton` for a σ-only solve: their
+BOBYQA keeps no memo, so there Newton's is the gain. It is a rule, not a request the model
+can fail, so it is silent; the fit file records the result (`mstep_optimizer: newton` under `model`)
+and `FitResult::mstep_optimizer_used` carries it (both are absent where SAEM runs no numerical solve at all: a single additive or proportional σ with every free θ mu-referenced is updated in closed form). BOBYQA reads only objective *values*: it
+spends `2n + 1` of them on its first interpolation model and several more per step. The
+same fit can instead read the exact derivatives, which the adjoint produces from one
+recording of the predictions:
+
+- `mstep_optimizer = newton` takes Fisher-scoring (Gauss-Newton) steps. One pass returns
+  the objective, its exact score (the adjoint θ score and the analytic σ score) and the
+  expected information `Σⱼ [∇fⱼ∇fⱼᵀ/Vⱼ + ½ ∇Vⱼ∇Vⱼᵀ/Vⱼ²]`, which is positive semi-definite. The
+  step solves it from the previous M-step's point, Levenberg-damped where it does not
+  factor or the objective rejects it, and a trial point is judged on the objective
+  *value alone*: only an accepted point the solve continues from pays for the
+  derivatives. It stops, as BOBYQA does, on NLopt's rule: a decrease below `1e-7` relative to
+  the objective's size (the mean of the old and new values) or below `1e-7` absolute, so an
+  objective near zero, or crossing it, does not collapse the tolerance to nothing — on an
+  accepted plain Fisher step, and at any point on the decrease
+  the *undamped* Fisher step predicts for it (a damping carried over from earlier
+  rejections shortens a step, so a step at that damping understates what is left and never
+  decides convergence) — within the evaluation budget BOBYQA gets (below), in which every
+  pass, value or fused, counts as one evaluation. A warm-started M-step is typically one fused
+  pass plus one or two value passes. The prediction alone never ends a solve before the
+  objective has confirmed a step: a start the model calls converged still takes its one
+  undamped Fisher step (one value pass) and the objective decides, as BOBYQA's first design
+  always evaluates. Where the objective is dominated by a constant the model cannot see — a
+  start at which a subject is scored by the invalid-variance guard carries 1e13 of it — the
+  relative tolerance is the constant's, and a decrease of 0.08 predicted there is far inside
+  it while the smooth part still has something to give. A start that is converged costs one
+  value pass for it; measured over nine Newton fits (SAEM, IMP, IMPMAP; three seeds each) the
+  confirmation changes whole-fit instructions by 0.97 to 1.00 times (SAEM 0.99 to 1.00, IMP and
+  IMPMAP 0.97 to 0.99): it does not slow a fit.
+- `mstep_optimizer = lbfgs` runs NLopt L-BFGS on the same score. It needs a gradient
+  pass per iteration and has no curvature to start from (see the table); it is kept as
+  the quasi-Newton alternative.
+
+All three solve the same problem — same objective, packed space, bounds and tolerance — so
+they move to the same optimum; they are not a different estimator. An explicit `newton` on
+a model outside its scope still warns and runs `bobyqa`; `auto` does not.
+
+##### Budget and scope {#saem-mstep-optimizer-budget}
+
+BOBYQA runs to its tolerance (`1e-7` relative) wherever it runs: `bobyqa` itself, the
+out-of-scope models under `auto`, and Newton's continuation. Its evaluation budget is a
+runaway guard of 100 evaluations per interpolation point of its model (`2n + 1` points for
+`n` free coordinates), not the `mstep_maxiter · (n + 1)` of a gradient method, which BOBYQA's
+own first design (`2n + 1` evaluations) used up: with nine numerical θ nearly every M-step
+stopped on that budget, far from the maximiser. The 100 is not tuned: it is 3 times the
+largest need measured, and the stop-reason census below shows the guard binding on none of
+the benchmark M-steps. `lbfgs` (a gradient method, `n + 1` evaluations per gradient) and
+SAEM's mixture arm (which keeps its pre-#1415 configuration) keep `maxiter · (n + 1)`.
+
+`newton` serves exactly the models whose expected information has a closed form from the
+adjoint: the adjoint in scope, a plain Gaussian likelihood (no M3 censoring, TTE endpoint,
+`block_sigma` residual correlation, `[covariate_nn]` θ or residual magnitude), and not a
+mixture (SAEM, IMP and IMPMAP alike). IOV is inside it. This is decided once per fit; on any
+other model the M-step runs `bobyqa`, and a warning in the fit's `warnings` names the
+property that put the model out of scope. Fisher scoring is never run on finite-difference
+curvature. A Newton solve that cannot take a step it has not converged for (information
+that does not factor at any damping, or no damped step that decreases the objective)
+continues with BOBYQA from the point it reached, with the evaluations Newton did not spend
+(one budget per M-step), and the weighted M-step's failure and frozen-coordinate gates
+(`W_MCEM_MSTEP_FAILED`, `W_MCEM_MSTEP_FROZEN`) see that continuation. So does a solve whose
+information is unavailable at run time — a subject whose recording the adjoint declines
+inside a model the scope decision admitted: the fit's `warnings` count the M-steps handed
+to BOBYQA this way and the cause.
+
+##### Measured {#saem-mstep-optimizer-measured}
+
+Whole SAEM fits (150 + 250 iterations, `--threads 1`, instructions retired in user
+space, median of five seeds). Every optimizer first benefits from the prediction memo
+described next; the "before" column is the default solve without it.
+
+| set | numerical M-step | BOBYQA before | BOBYQA | L-BFGS | Newton |
+|---|---|---|---|---|---|
+| `pk1` (500 subjects) | σ only | 26.79 G | **20.19** (1.33×) | 23.15 | 20.38 |
+| `pk1_ode` | σ only | 78.95 | **40.37** (1.96×) | 43.32 | 40.52 |
+| `pk1_sparse` | σ only | 10.72 | **8.20** (1.31×) | 9.13 | 8.54 |
+| `pk2_big` (14 θ) | σ and 2 θ | 40.16 | **28.24** (1.42×) | 32.04 | 28.75 |
+| `wiov` (IOV) | σ only | 82.37 | **60.31** (1.37×) | 64.49 | 61.13 |
+| `corr` | none (all closed form) | 8.04 | 8.04 | 8.04 | 8.04 |
+
+Without the memo (the first measurement of this option) Newton was 1.13 to 1.54 times
+cheaper than BOBYQA, because BOBYQA's 8 to 15 value evaluations each predicted again and
+Newton needs 3 to 4 passes. Predictions never depend on σ and a solve holds every η, κ and
+importance sample fixed, so every evaluation at an unchanged θ shares one prediction pass
+per subject (per sample): in a σ-only M-step that is every evaluation. The memo is kept only
+where an evaluation can repeat a θ — a SAEM solve whose θ are all pinned (every evaluation)
+and a Newton solve (the value pass at a trial point, then the fused pass at the accepted
+one); a free-θ solve under BOBYQA or L-BFGS visits no θ twice and stores nothing. IMP and
+IMPMAP keep it under `newton` and `lbfgs` only: their samples are `imp_samples` (1000 by default, up to
+10 000 under auto-sampling) per subject, so the memo is `subjects × samples × n_obs`
+numbers, several times what the estimator itself holds, and a default fit must not grow by
+that. (Under `bobyqa` it would serve the σ-only solve on every evaluation and halve a
+fit's instructions, 2.1× on the benchmarks, for 112 MB at 2000 subjects × 1000 samples × 7
+observations; under the opt-in solvers the cost is the documented price of the option.) A sample takes
+space only once it is scored (a zero importance weight takes none), and a subject's buffer grows
+with the samples scored, never with the sample count. A Newton solve that stalls and hands over
+to BOBYQA drops a memo that follows θ (free θ) first: BOBYQA evaluates each θ once, so
+that memo could only copy predictions in and never serve one. A memo that holds a pinned θ
+(a σ-only solve) is kept: the continuation sees the same θ bit for bit and every one of its
+evaluations is a hit. The θ is
+compared once per evaluation and a subject's samples share one buffer that a hit borrows.
+It returns the predictions the solve's own predictor returned the first time,
+so the fit file and the sdtab of all 90 fits (6 sets, 3 optimizers, 5 seeds) are
+byte-identical to the memo-free run, and BOBYQA alone takes 1.3 to 2.0 times fewer
+instructions. What is left of the M-step is one prediction pass plus residual arithmetic,
+and there the optimizers are within 1 to 4 percent of each other (Newton slightly
+behind). `newton` and `lbfgs` are therefore alternatives, not an optimization: reach for
+`newton` where evaluations stay expensive (a free θ that moves every trial), not for speed
+in a σ-only solve.
+
+Same-seed estimates agree with BOBYQA's to well inside one standard error on every
+parameter of `pk1`, `pk1_ode` and `wiov` (largest median difference 0.21 SE, largest single
+seed 0.37 SE). `pk1_sparse` moves a typical value by up to 1.5 SE on one seed, with an
+importance-sampled −2 log L within seed noise (BOBYQA 1415.0, Newton 1414.9 median).
+On `pk2_big`, the 14-θ model whose SAEM fits spread widely from seed to seed, 15 seeds give an importance-sampled −2 log L of −3501.9 (median) under both BOBYQA and Newton, means −3501.0 and −3499.7 (standard deviations 4.3 and 5.8): not distinguishable at this sample size, with Newton's bad tail a little heavier (its worst seed is 13 units worse than BOBYQA's fit of the same seed).
+
+Against NONMEM and the published references, the anchors that run a numerical M-step
+(`warfarin_impmap`, `warfarin_imp`, `warfarin_iov_impmap`, `covmuref_power_saem`) land on
+the same worst |z| under every optimizer to the six digits the fit file prints: with σ the
+only numerical coordinate the solve is one-dimensional and every optimizer converges to
+the same point, so identical anchor rows are the expected reading, not a sign that the
+option did nothing (`mstep_optimizer` reaches the M-step on each of the three estimators,
+the IOV score included; a unit test counts the solver that actually ran).
+
+##### Newton as the default {#saem-mstep-default}
+
+`mstep_optimizer = auto` (#3001) makes Newton the default M-step and BOBYQA run to its
+tolerance the rule everywhere else. This changes default results. Measured against the
+previous default (`bobyqa` on a `maxiter · (n + 1)` budget): seeds 1 and 2, `--threads 1`,
+instructions retired in user space, importance-sampled −2 log L (`K = 20000`) at the final
+estimates, so a negative difference is a better fit.
+
+| model | numerical coordinates | instructions, new / old | −2 log L, new − old |
+|---|---|---|---|
+| `pk2_big_nomu` (SAEM) | 11 | 0.69 | −133.5, −128.6 |
+| `warfarin_nomu` | 4 θ + σ | 0.75 | −25.0, −15.9 |
+| `mm` (ODE) | 2 | 0.66 | −28.9, −21.4 |
+| `anchor_a_nomu` | 9 | 0.51 | −2.4, −23.9 |
+| `shared_nomu` | 8 | 0.57 | −5.0, −6.2 |
+| `pk1_nomu` (5 seeds) | 5 | 0.68 | −1.5 to +2.9 |
+| `imp_non_mu_ref` (IMP) | 14 θ | 0.23 | −1.5, −2.6 |
+| IMPMAP, σ only (3 models) | 1 | 0.39 to 0.54 | 0.000 |
+| SAEM, σ only (14 models) | 0 to 1 | 1.00 (`auto` is `bobyqa` there: the BOBYQA fit) | 0.000 |
+| SAEM, 2 θ on an ODE model (`frac_ode`) | 3 | 1.14 | within ±1.3 |
+
+The gain on the multi-θ models is mostly BOBYQA's old budget, not Newton: BOBYQA spends
+`2n + 1` evaluations on its first design, so on nine numerical θ nearly every M-step stopped
+on the budget far from the maximiser. Run to its tolerance (explicit `bobyqa` now) it
+reaches the same −2 log L (−3501 against Newton's −3502 on a nine-θ model); Newton gets there in 0.5 to 0.7 times the instructions. Where
+the M-step is σ only, BOBYQA's solve is already served by the prediction memo and Newton's
+fused value-score-information pass is the extra work (0 to 7 percent more instructions on 14
+SAEM models, two seeds each), so SAEM's `auto` keeps `bobyqa` there and the fit is the
+BOBYQA fit: identical estimates and instructions to `mstep_optimizer = bobyqa`. IMP and
+IMPMAP keep `newton` for σ-only solves, where BOBYQA has no memo and Newton's is the gain
+(0.39 to 0.54 times). A model with a numerical θ stays on `newton`: `frac_ode`, an ODE model
+with two θ that have no η, costs 1.14 times BOBYQA's instructions there.
+
+Newton's M-step is as exact as BOBYQA's at the same tolerance. On `pk1_nomu`, `pk2_big`,
+`warfarin_iov` and `wiov` (304 M-steps each) a converged reference solve from the same start
+puts Newton's objective within 3.4e-4 of it at the worst M-step (median 4e-9 to 9e-6), against
+0.14 for BOBYQA at its worst on `pk1_nomu`; in a one-coordinate σ solve BOBYQA is the tighter (median
+1e-14 to 3e-12 against 4e-9 to 7e-7) and both are far inside the E-step's Monte Carlo noise. The census of
+BOBYQA's stop reasons over the same fits finds `FtolReached` on every M-step of every
+model but the mixture arm, at most 33 evaluations per interpolation point, so the 100 of the
+runaway guard never binds.
+
+The standing seed-to-seed spread decides what a paired difference means. Over 15 seeds
+`warfarin_iov` gives −2 log L 310.75 (Newton), 310.72 (BOBYQA to tolerance) and 310.56
+(previous default), standard deviation 0.5; the worst |z| of an ω against NONMEM is 8.1,
+6.9 and 5.7 (the ω have a small NONMEM standard error, so the SAEM's own noise reads as
+several z). `pk2_big` over 40 seeds gives −3489.4 (Newton, sd 14.7, median −3495.3) and −3488.5 (BOBYQA,
+sd 11.3, median −3491.9), a paired difference of −0.9 ± 2.0: the same distribution, with two
+Newton seeds beyond −3460 (−3443.9, −3448.3) against one for BOBYQA (−3459.3). Nothing in the
+solve separates them. In the worst seed every one of the 304 Newton M-steps converged (none
+stalled, handed over to BOBYQA, or converged at its start), and each agrees with BOBYQA's
+solve from the same state to 1e-4 in log σ; the two fits decorrelate by M-step 10 to 20 from
+that difference through the E-step's sampling, and end on different draws from one
+multimodal SAEM distribution. This model's numerical M-step is σ only (two σ), so
+`auto` runs `bobyqa` on it and the default does not see the tail at all.
+
+NONMEM anchors that run a numerical M-step, worst |z| before to after (median of two
+seeds): `warfarin_saem` SAEM 0.73 to 0.73 and IMPMAP 0.74 to 0.74, `warfarin_iov` IMPMAP 0.70
+to 0.70, `imp_non_mu_ref` IMP 2.15 to 0.30, `warfarin_nomu` SAEM 17.4 to 4.2.
+
 #### Thetas the closed-form update cannot reach {#saem-mstep-no-closed-form}
 
 Two model shapes leave a theta on the numerical M-step. The first is slower; the second
@@ -622,8 +819,8 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
   [#1445](https://github.com/FeRx-NLME/ferx-core/issues/1445) policy the
   derivative-free arms use, not a second copy of it. That is a smaller *gain* on
   the step, not the blend stacked on top of it (which really would move σ at
-  `γ²`). One gradient sweep is cheaper than the `mstep_maxiter·(n+1)` population
-  passes the derivative-free solve costs, so this M-step runs every iteration
+  `γ²`). One gradient sweep is cheaper than the population passes a derivative-free
+  solve run to its tolerance costs (tens to hundreds of value evaluations per M-step), so this M-step runs every iteration
   rather than every third during exploration. The score's θ block, and the
   per-observation `∂f/∂θ` the expected information is built from, are exact: one
   recording of the subject's predictions with θ on the adjoint's tape and one
@@ -682,7 +879,8 @@ SAEM benchmarks, 6 seeds each, single-threaded, it is tie-or-better than `bobyqa
 importance-sampled −2 log L on every one — best on busulfan (−5.14), busulfan-`TVQ`-FIX
 (−5.58) and the thiotepa ODE bench (−11.07) — and it costs **25–54 % less CPU** (cefepime
 5.36 → 2.45 s, thiotepa 215 → 94 s), because one gradient sweep per iteration replaces a
-derivative-free solve whose cost is `mstep_maxiter·(n+1)` population passes.
+derivative-free solve whose cost is the population passes of a BOBYQA solve run to its
+tolerance (tens to hundreds of value evaluations per M-step).
 
 **Against — the σ half, fixed in
 [#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480).** As #1458 shipped it,
@@ -1111,36 +1309,182 @@ After the SAEM iterations complete:
    check it yourself (RSE, σ-correlation, profile likelihood), and on sparse
    data prefer the importance-sampling −2LL over the Laplace OFV when judging
    whether the additive term is real.
-3. **FOCE OFV**: Compute the objective function using the FOCE/Laplace approximation, so AIC and BIC are directly comparable with FOCE results
+3. **Reported OFV**: Report NONMEM's SAEM objective (`SAEMOBJ`, `saem_ofv = saem`, the default; not a likelihood) at the final estimates as `ofv`. The importance-sampled `−2 log L` (NONMEM `$EST METHOD=IMP EONLY=1`, `saem_ofv = imp`) is the explicit follow-up. There is no AIC or BIC for it (`aic` / `bic` are `None` / `null`, as NONMEM reports none); the FOCE/Laplace objective at the same estimates is kept as a separately labelled diagnostic (see [The reported OFV](#saem-reported-ofv))
 4. **Covariance Step**: Optionally compute standard errors via the covariance step's Hessian (same method as FOCE: the exact R matrix in scope, the finite-difference stencil outside it) — on the FOCEI objective for an all-Gaussian model, and on the quadrature marginal when the model has a non-Gaussian endpoint (see [below](#saem-covariance-non-gaussian))
 5. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
 
-For sparsely-sampled data where the Laplace OFV is biased, you can
-append an importance-sampling stage that estimates `−2 log L` by Monte
-Carlo at the SAEM estimates — the equivalent of NONMEM `$EST METHOD=SAEM`
-followed by `$EST METHOD=IMP EONLY=1`:
+### The reported OFV {#saem-reported-ofv}
+
+SAEM maximises the exact marginal likelihood but produces no usable value of it. NONMEM
+reports its **`SAEMOBJ`** for the SAEM step, a stochastic-approximation readout of the
+complete-data objective that is *not a likelihood*, and follows `METHOD=SAEM` with
+`METHOD=IMP EONLY=1` when the marginal `−2 log L` is wanted. ferx does the same: the `ofv` of a
+SAEM fit is the SAEM objective, and the importance-sampled `−2 log L` is the explicit follow-up
+(`saem_ofv = imp`, or `method = [saem, imp]` with `imp_eval_only = true`). **Do not compare the
+SAEM objective across models or with a FOCE/FOCEI/IMP objective**: it is −2210 on the shared-θ
+anchor where the exact marginal is −1199. AIC and BIC are therefore absent under the default
+(`FitResult::aic` / `bic` are `None`, `aic: null` in `fit.yaml`; model search and the other
+ranking tools stop with an error naming `saem_ofv = imp`). Set `saem_ofv = imp`, `agq` or
+`focei` for information criteria, built from that likelihood value; rank models by the
+importance-sampled objective (see
+[the `iiv_on_ruv` example](importance-sampling.qmd#adaptive-evaluation) for why the Laplace value
+is biased where SAEM is usually chosen).
 
 ```
 [fit_options]
-  method        = [saem, imp]
-  imp_eval_only = true
-  imp_samples   = 3000      # default 1000; 2000–5000 for a reported value
+  method           = saem
+  saem_ofv         = saem    # saem (default) | imp | agq | focei
+  saem_ofv_samples = 3000    # importance samples per subject, saem_ofv = imp
+  saem_ofv_nodes   = 11      # nodes per random effect, saem_ofv = agq
 ```
 
-`imp_eval_only = true` is required. Without it the `imp` stage is an
-estimator (NONMEM `METHOD=IMP`): it re-fits θ/Ω/σ by Monte-Carlo EM, so the
-reported estimates are no longer SAEM's.
+| `saem_ofv` | `ofv` | AIC, BIC | Notes |
+|---|---|---|---|
+| `saem` (default) | NONMEM's `SAEMOBJ` | none (`None`) | Free (accumulated from the E-step's draws). IOV models (an IOV-only model included) average the joint density of data, η and κ draws; a model with no random effects at all reports the data `−2 log L`. A mixture has no NONMEM-anchored convention, so it reports the `imp` value **with a warning** naming the fallback. |
+| `imp` | importance-sampled `−2 log L`, NONMEM `IMP EONLY=1` | from `ofv` | `saem_ofv_samples` draws per subject (3000, the `ISAMPLE=3000` setting the [NONMEM comparison](importance-sampling.qmd#nonmem-comparison) uses), seeded by `imp_seed` so two runs agree to the bit. Carries a Monte-Carlo standard error. |
+| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | from `ofv` | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture, a model with more random effects, or an IOV model whose stacked grid (`n_eta + n_occ·n_kappa` dimensions) exceeds the quadrature grid limit falls back to `imp` with a warning. A natural cross-check of the IS value. |
+| `focei` | the FOCE/Laplace objective | from `ofv` | The behaviour before #2973, and the value that is directly comparable with a FOCE/FOCEI fit. |
 
-The importance-sampled `−2 log L` and its Monte-Carlo standard error are on
-`FitResult.importance_sampling` (`fit$importance_sampling` in R; the
-`IS done. −2 log L = …` line in verbose output). `ofv` remains the FOCE
-approximation at the SAEM estimates described above, and AIC/BIC are built from
-it. The `imp` stage starts each subject's proposal from the final EBE refinement in
+#### What the SAEM objective is {#saem-objective-definition}
+
+$$\text{SAEMOBJ} = \sum_i -2\log\Big(\tfrac1K\sum_k p(y_i,\eta_{ik}\mid\theta,\Omega,\sigma)\Big)$$
+
+the joint density of the data and the random effects, **no `2π` constants** (neither
+`N_obs·log 2π` nor `NIND·NETA·log 2π`; `log|Ω|` and `log σ²` are in), averaged *inside* the log.
+During burn-in the average runs over the chain states of the current iteration; in the
+accumulation phase over the draws **and the iterations**, which is the value NONMEM prints last.
+ferx keeps a running log-sum-exp of the joint density per subject over its convergence phase
+(one draw per iteration, scored under the parameters the iteration ends with; with the step
+$\gamma_k = 1/(k-K_1)$ the stochastic-approximation average is this plain mean), so the
+objective costs nothing beyond the NLL cache the E-step already refreshes.
+
+This was established on NONMEM 7.6.0 with a linear-Gaussian model where the posterior
+expectation $E[-2\log p]$ and the marginal are closed-form, and it explains the offset the
+committed SAEM runs show against the posterior expectation: the log of a mean of many posterior
+draws sits $n_\eta(\ln 2 - 1) = -0.307$ per subject per random effect below $E[-2\log p]$
+(`linear_gaussian_offset_from_the_posterior_expectation_is_ln2_minus_one` reproduces it in closed
+form). On the ten committed runs `(SAEMOBJ − E[−2 log p]) / (N·n_η)` is 0.299–0.323, mean 0.312
+(a non-Gaussian posterior moves it; a constant `1 − ln 2 = 0.307`, `ln(2π)/6 = 0.306` or
+`1/π = 0.318` each sits within 2.5 standard errors of that mean but none within the scatter, which
+is why the closed-form experiment, not the anchors, settles it). `IMP EONLY=1` prints the marginal
+`−2 log L` without `N_obs·log 2π` and with the `NIND·NETA·log 2π` term, which is what ferx's
+importance-sampled readout reports.
+
+A complete ferx SAEM fit (default settings, the committed `*_fit.ferx` models) against NONMEM's
+own printed SAEMOBJ. Both sides are one Monte-Carlo run with its own estimates, so the
+difference is the two runs' spread, not a convention gap:
+
+| anchor | NONMEM `SAEMOBJ` | ferx | (ferx − NONMEM) / (N·n_η) |
+|---|---:|---:|---:|
+| `covmuref_additive_saem` | −1855.592 | −1856.433 | −0.007 |
+| `covmuref_power_saem` | −1887.202 | −1887.145 | +0.000 |
+| `covmuref_shared_saem` | −2210.147 | −2208.459 | +0.011 |
+| `covmuref_anchor_a_saem` | −2210.552 | −2216.564 | −0.040 |
+| `covmuref_anchor_b_saem` | −2210.896 | −2216.564 | −0.038 |
+| `logit_fraction_saem` (ODE) | −4603.996 | −4604.612 | −0.003 |
+| `saem_additive_mu` | 151.755 | 151.604 | −0.025 |
+
+The worst is 0.040 per subject per random effect, a fifth of the 0.31 by which the posterior
+expectation differs, and `src/estimation/saem_objective_tests.rs` asserts 0.04 on the three
+fastest anchors.
+
+#### Where it is reported, and explicit stages {#saem-ofv-where}
+
+
+- **Console / summary file:** the OFV row reads `OFV (SAEM objective, NONMEM SAEMOBJ convention; not a likelihood)`
+  (or `OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = …, K = …)`, `OFV (AGQ -2LL, n nodes)`), followed by `FOCE/Laplace OFV (diagnostic)`. The verbose progress
+  line `SAEM completed. FOCE/Laplace OFV = …` is that diagnostic, printed before the covariance step.
+- **`fit.yaml`:** `objective_function` carries `ofv_type: saem_objective` (or `importance_sampling`, `agq`),
+  `ofv_mc_standard_error`, `ofv_n_samples` (or `ofv_n_nodes`) and `ofv_foce_laplace`. A
+  `saem_ofv = focei` fit carries none of these.
+- **R / Rust:** `FitResult.saem_objective` (`fit$saem_objective`) holds the kind, SE, sample or
+  node count and `foce_ofv`; `FitResult.importance_sampling` holds the full IS result (ESS,
+  low-ESS subjects). Both are stored in `.fitrx`.
+
+To compare a SAEM fit with a FOCE/FOCEI fit, use `saem_objective.foce_ofv` (or set
+`saem_ofv = focei`); the two numbers are different integrals and are not interchangeable.
+
+**Explicit stages still work.** `method = [saem, imp]` with `imp_eval_only = true` is the same
+workflow spelled out: its IS value (at `imp_samples`, default 1000) becomes the reported `ofv`
+under the default and under `saem_ofv = imp`, with `saem_ofv_samples` unused. A chain with its own evaluator stage
+(`imp_eval_only`, or `agq_eval_only` with a trailing `laplace`) is never given a second readout.
+`imp_eval_only = true` is required for the `imp` stage: without it the stage is an estimator
+(NONMEM `METHOD=IMP`) and re-fits θ/Ω/σ.
+
+The IS evaluation starts each subject's proposal from the final EBE refinement in
 step 1 and adapts it over `imp_adapt_passes` pilot passes (default 5; see
 [Adaptive evaluation](importance-sampling.qmd#adaptive-evaluation)), so for a
 subject still listed under `low_ess_subjects`, check that refinement's EBE and
 Hessian first. See
 [Importance Sampling (IMP)](importance-sampling.qmd#evaluation-only-mode-imp_eval_only-true).
+
+#### Cost and node count {#saem-ofv-cost}
+
+The readout runs once, after the iterations: `imp_adapt_passes` pilot passes that fit each
+subject's proposal (default 5) and one final pass of `saem_ofv_samples` draws. The pilots
+draw `saem_ofv_pilot_samples` each (default 300, a tenth of K), so the readout costs
+`5 × 300 + 3000` posterior evaluations per subject rather than the `6 × 3000` of full-size
+pilots. The final pass is always K, so the estimate stays unbiased; the pilots only place the
+proposal. Measured on `pk1_saem` (500 subjects, 3 random effects): MC SE 0.454 at full-size
+pilots, 0.467 at 500, 0.475 at 300 (the default), 0.487 at 200; the minimum per-subject
+ESS/K goes 0.72, 0.69, 0.66, 0.61, and the value moves by 0.02–0.13, well inside the SE.
+`saem_ofv_pilot_samples = 0` restores full-size pilots, which is bit-identical to the readout
+before the option existed.
+
+Measured as user-space instructions (`--threads 1`, 500 subjects × 6 observations, 3 random
+effects; the `focei` column is the pre-#2973 behaviour, identical code up to the readout):
+
+| bench fit | `focei` | `imp`, full-size pilots | `imp` (default) | `agq` (11 nodes) |
+|---|---:|---:|---:|---:|
+| `pk1_saem` (analytic, 150 + 250) | 27.47 G | 96.43 G (3.5×) | 44.23 G (1.6×) | ≈ 1.13× |
+| `pk1_saem_short` (analytic, short schedule) | 3.49 G | 72.45 G (21×) | 20.25 G (5.8×) | ≈ 2.0× |
+| `pk1_ode_saem` (ODE, 150 + 250) | 81.58 G | 365.72 G (4.5×) | 152.16 G (1.9×) | ≈ 1.09× |
+
+What remains is the likelihood itself: 30% of the readout is `exp`/`expm1`/`log` in the
+closed-form prediction, the individual-parameter program and the Student-t density, and the
+draws are the same draws a NONMEM `EONLY=1` iteration makes. The readout is a fixed cost per
+subject, so it dominates a short schedule and is a minority of a full one. Lower
+`saem_ofv_samples` (the standard error scales as 1/√K), or choose `saem_ofv = agq` on a
+model with up to three random effects, where it costs a twentieth as much;
+`saem_ofv = focei` skips it. The estimates and sdtab are bit-identical under all of them,
+since the readout never feeds back into the fit.
+
+The node count default is measured. On `pk1_saem` the `agq` readout gives 5224.76, 5221.22, 5220.31 and 5220.21
+at 5, 7, 11 and 15 nodes, against 5220.28 ± 0.18 and 5220.41 ± 0.18 from the importance
+sampler at K = 20000 (two seeds), and 5219.9, 5219.8, 5219.5 (± 0.45) at the default
+K = 3000 (three seeds). Eleven nodes is 0.1 from the 15-node value, where seven is 1.0
+away, so 11 is the default. The two evaluators agree where both are converged.
+
+
+#### NONMEM validation {#saem-ofv-nonmem}
+
+The importance sampler is checked against NONMEM `METHOD=SAEM` followed by
+`METHOD=IMP EONLY=1 NITER=10 ISAMPLE=3000` on the committed SAEM anchors
+(`nonmem_anchor/results/*.ext`, NONMEM 7.5.1). ferx evaluates its sampler at
+**NONMEM's own SAEM estimates** (`THETA`, `OMEGA`, `SIGMA` from the SAEM table), so both
+numbers are the same integral at the same point and must agree within their Monte-Carlo
+errors. NONMEM's error is the spread of its ten evaluation iterations (each an independent
+K = 3000 draw); ferx's is `mc_standard_error`. The SAEM table's own objective (`SAEMOBJ`)
+is shown to make the point of the change: it is not a likelihood, and it sits 700–1000
+units from the exact marginal.
+
+| anchor | NONMEM `SAEMOBJ` | NONMEM `EONLY` (SE) | ferx IS at NONMEM's estimates (SE) | diff | z |
+|---|---:|---:|---:|---:|---:|
+| `covmuref_shared_saem` (#1620) | −2210.147 | −1199.382 (0.300) | −1199.331 (0.155) | +0.050 | +0.15 |
+| `covmuref_additive_saem` (#619) | −1855.592 | −1178.442 (0.202) | −1178.691 (0.128) | −0.249 | −1.04 |
+| `covmuref_power_saem` (#619) | −1887.202 | −1202.372 (0.199) | −1202.636 (0.129) | −0.264 | −1.11 |
+| `covmuref_anchor_a_saem` (#1630) | −2210.552 | −1199.333 (0.136) | −1199.401 (0.154) | −0.068 | −0.33 |
+| `covmuref_anchor_b_saem` (#1630) | −2210.896 | −1199.337 (0.138) | −1199.414 (0.156) | −0.077 | −0.37 |
+| `logit_fraction_saem` (#918, ODE) | −4603.996 | −3698.448 (0.171) | −3698.480 (0.151) | −0.031 | −0.14 |
+
+All six agree within 1.2 combined standard errors (worst 0.26 OFV units); the reference
+for this table is `tests/saem_objective_2973.rs`. Two further anchors that carry an `EONLY`
+objective were checked in their own tests and are not repeated: the mixture class-marginal
+(`tests/mixture_nonmem.rs`: ferx IS against NONMEM 300.8707) and the FREM reprex
+(`frem.qmd`: ferx 6866.6 ± 1.2 against NONMEM 7.6 6869.7, sd 1.2, at the same estimates).
+NONMEM's `METHOD=SAEM` run is one chain's draw, so ferx's own SAEM estimates differ a little
+from NONMEM's; that difference, not the objective, is what separates the two engines'
+reported values on a default fit.
 
 ### Covariance step on a non-Gaussian model {#saem-covariance-non-gaussian}
 
@@ -1669,11 +2013,11 @@ SAEM: 10 subjects, 3 ETAs, 400 total iter (150 explore + 250 converge)
   SAEM iter  200/400 [converge] γ=0.020  condNLL=36.799
   SAEM iter  400/400 [converge] γ=0.004  condNLL=38.096
 SAEM iterations complete. Computing final EBEs and OFV...
-SAEM completed. Final OFV = ...
+SAEM completed. FOCE/Laplace OFV = ...
 Running covariance step...
 ```
 
-The `Final OFV = ...` line is printed **before** the covariance step starts (#893).
+The `FOCE/Laplace OFV = ...` line is printed **before** the covariance step starts (#893). It is the diagnostic value; the reported OFV (NONMEM's SAEM objective by default, the importance-sampled `−2 log L` under `saem_ofv = imp`) follows in the final report. See [The reported OFV](#saem-reported-ofv).
 SAEM only learns its OFV at the very end (the final FOCE approximation), and the
 covariance matrix is often the most expensive part of the run — so seeing the OFV
 first lets you interrupt (Ctrl-C) when the OFV already rules the run out, instead of
@@ -1696,7 +2040,7 @@ $$
 
 This is a cheap per-iteration progress signal. It is **not** the marginal objective function value (OFV): it is evaluated at one stochastic draw of the random effects rather than integrated over their distribution, so unlike the FOCE/FOCEI outer-loop OFV it is noisy, will not decrease monotonically, and is **not comparable across runs** for model selection.
 
-The true marginal **OFV** ($-2 \log L$ via the Laplace approximation, directly comparable with FOCE for AIC/BIC) is expensive and is therefore computed only once, after the iterations finish — this is the `Final OFV = ...` line. See [Post-SAEM Finalization](#post-saem-finalization).
+The reported **OFV** is computed only once, after the iterations finish: by default NONMEM's SAEM objective (one refinement of the conditional modes), or under `saem_ofv = imp` the marginal $-2 \log L$ importance-sampled as NONMEM's `IMP EONLY=1`, which is expensive; the `FOCE/Laplace OFV = ...` line is the Laplace diagnostic computed first. See [Post-SAEM Finalization](#post-saem-finalization).
 
 (`NLL` = *negative log-likelihood*, i.e. $-\log L$. NONMEM's `OFV = -2 \log L` is essentially `2 × NLL` plus a constant.)
 

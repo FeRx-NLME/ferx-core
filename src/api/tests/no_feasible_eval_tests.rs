@@ -76,7 +76,6 @@ use crate::estimation::outer_optimizer::{
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{Optimizer, WarningCode, WarningSeverity};
-use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  The fixture — the issue's second reproduction, ported from ferx-r
@@ -118,40 +117,16 @@ fn subject(id: &str, observations: Vec<f64>) -> Subject {
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        obs_rgroup: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
 fn two_subjects() -> Population {
     Population {
-        subjects: vec![
-            subject("1", vec![8.1, 6.2, 3.1]),
-            subject("2", vec![7.4, 5.5, 2.8]),
-        ],
+        subjects: vec![subject("1", vec![8.1, 6.2, 3.1]), subject("2", vec![7.4, 5.5, 2.8])],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: Vec::new(),
@@ -325,11 +300,7 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
         .unwrap_or_else(|| {
             panic!(
                 "the demotion must carry a typed warning naming the guard; got {:?}",
-                result
-                    .warnings_structured
-                    .iter()
-                    .map(|w| &w.message)
-                    .collect::<Vec<_>>()
+                result.warnings_structured.iter().map(|w| &w.message).collect::<Vec<_>>()
             )
         });
     assert_eq!(entry.severity, WarningSeverity::Critical, "{entry:?}");
@@ -374,18 +345,12 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
     //     the re-score at the starting estimates is a real objective (76.85), not a
     //     sentinel. E5 is the same assertion on the other row, where it does fire.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Outer optimization did not converge")),
+        result.warnings.iter().any(|w| w.contains("Outer optimization did not converge")),
         "a demoted run carries the generic line too: {:?}",
         result.warnings
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
+        !result.warnings.iter().any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
         "the objective at the reported point is finite on this row ({}), so its own gate \
          must stay quiet: {:?}",
         result.ofv,
@@ -420,17 +385,11 @@ fn a_fit_with_no_feasible_evaluation_is_not_reported_converged() {
 fn a_feasible_fit_is_untouched() {
     let model = starvable_model();
     let pop = two_subjects();
-    let options = FitOptions {
-        outer_maxiter: 4,
-        ..opts(200)
-    };
+    let options = FitOptions { outer_maxiter: 4, ..opts(200) };
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
 
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        !result.warnings.iter().any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "a fit with feasible evaluations must not carry the no-feasible-evaluation warning: \
          {:?}",
         result.warnings
@@ -473,20 +432,14 @@ fn a_feasible_fit_is_untouched() {
 /// `omega = [[0.002407034368112816]]`. That is 35 OFV units below the 24.578 the defect
 /// reported — the whole reason #1617 is a defect and not a cosmetic flag.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_healthy_fit_still_converges_to_its_optimum() {
     let model = starvable_model();
     let pop = two_subjects();
     let result = fit(&model, &pop, &model.default_params, &opts(200)).expect("fit");
 
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        !result.warnings.iter().any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "{:?}",
         result.warnings
     );
@@ -524,10 +477,7 @@ fn a_cancelled_run_carries_no_no_feasible_eval_warning() {
     let pop = two_subjects();
     let flag = crate::cancel::CancelFlag::new();
     flag.cancel();
-    let options = FitOptions {
-        cancel: Some(flag),
-        ..opts(200)
-    };
+    let options = FitOptions { cancel: Some(flag), ..opts(200) };
     let result = crate::estimation::outer_optimizer::optimize_population(
         &model,
         &pop,
@@ -535,10 +485,7 @@ fn a_cancelled_run_carries_no_no_feasible_eval_warning() {
         &options,
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        !result.warnings.iter().any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "cancellation is not an EBE-guard finding: {:?}",
         result.warnings
     );
@@ -576,19 +523,12 @@ fn a_cancelled_run_carries_no_no_feasible_eval_warning() {
 fn a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter() {
     let model = starvable_model();
     let pop = two_subjects();
-    let options = FitOptions {
-        optimizer: Optimizer::Mma,
-        outer_maxiter: 1,
-        ..opts(STARVED)
-    };
+    let options = FitOptions { optimizer: Optimizer::Mma, outer_maxiter: 1, ..opts(STARVED) };
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
 
     // (1) The fixture still delivers an infeasible trace...
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        result.warnings.iter().any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "the fixture must still produce a run with no feasible evaluation: {:?}",
         result.warnings
     );
@@ -607,10 +547,7 @@ fn a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter() {
     );
     // (3) ...so the generic budget advice must be withheld.
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("increase maxiter")),
+        !result.warnings.iter().any(|w| w.contains("increase maxiter")),
         "a run that never scored the objective has no fit to tighten, so the \
          \"increase maxiter\" advice must not be offered next to W_NO_FEASIBLE_EVAL: {:?}",
         result.warnings
@@ -674,19 +611,13 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
             panic!(
                 "a run whose every objective was non-finite has no feasible evaluation \
                  either, and must say so; got {:?}",
-                result
-                    .warnings_structured
-                    .iter()
-                    .map(|w| &w.message)
-                    .collect::<Vec<_>>()
+                result.warnings_structured.iter().map(|w| &w.message).collect::<Vec<_>>()
             )
         });
     // (3) ...through the non-finite arm, not the guard's: the guard never fired here, so
     //     naming it would be false, and `inner_maxiter` is not the budget that binds.
     assert!(
-        entry
-            .message
-            .contains("every trial returned a non-finite objective"),
+        entry.message.contains("every trial returned a non-finite objective"),
         "{}",
         entry.message
     );
@@ -698,12 +629,7 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
     // (4) The non-finite tally, checked the same way E1 checks the guard's: every callback
     //     here produced a trial (no cancellation, and 4 evaluations is far short of the
     //     stagnation window), and none of them was the guard's.
-    assert_eq!(
-        trials_in(&entry.message),
-        result.n_iterations,
-        "{}",
-        entry.message
-    );
+    assert_eq!(trials_in(&entry.message), result.n_iterations, "{}", entry.message);
     assert_eq!(
         result.ebe_convergence_warnings, 0,
         "the guard never fired on this row, so its tally must be empty — otherwise the arm \
@@ -713,10 +639,7 @@ fn an_all_non_finite_run_reports_the_non_finite_arm_end_to_end() {
     // (5) ...and the objective gate speaks for itself. Two facts, two warnings — the
     //     claim the docs make about this row.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
+        result.warnings.iter().any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
         "the reported objective is `NaN` here, so its own gate must fire too: {:?}",
         result.warnings
     );
@@ -762,12 +685,7 @@ fn an_infeasible_run_writes_no_checkpoint() {
         None,
         None,
         vec!["focei".to_string()],
-        vec![
-            "TVCL".into(),
-            "TVV".into(),
-            "ETA_V".into(),
-            "PROP_ERR".into(),
-        ],
+        vec!["TVCL".into(), "TVV".into(), "ETA_V".into(), "PROP_ERR".into()],
         0,
     );
 
@@ -783,10 +701,7 @@ fn an_infeasible_run_writes_no_checkpoint() {
 
     // The fixture still delivers an infeasible trace.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        result.warnings.iter().any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "{:?}",
         result.warnings
     );
@@ -837,19 +752,13 @@ fn an_infeasible_derivative_free_run_also_reports_its_start() {
     )
     .expect("parse");
     let pop = two_subjects();
-    let options = FitOptions {
-        optimizer: Optimizer::Bobyqa,
-        ..opts(STARVED)
-    };
+    let options = FitOptions { optimizer: Optimizer::Bobyqa, ..opts(STARVED) };
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
 
     // (1) The fixture still delivers an infeasible trace — under the derivative-free arm,
     //     which is the half this test exists for.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
+        result.warnings.iter().any(|w| w.contains(NO_FEASIBLE_EVAL_TOKEN)),
         "BOBYQA must still be rejected at every trial here, or this test is pinning the \
          gradient arm's behaviour by accident: {:?}",
         result.warnings
@@ -862,11 +771,7 @@ fn an_infeasible_derivative_free_run_also_reports_its_start() {
          included; got {}",
         result.theta[0]
     );
-    assert!(
-        (result.omega[(0, 0)] - 0.04).abs() <= 1e-12 * 0.04,
-        "got {}",
-        result.omega[(0, 0)]
-    );
+    assert!((result.omega[(0, 0)] - 0.04).abs() <= 1e-12 * 0.04, "got {}", result.omega[(0, 0)]);
 }
 
 /// Write a v1-shaped checkpoint for `model` at `packed` / `ofv`, with both integrity hashes
@@ -948,15 +853,9 @@ fn a_pre_fix_checkpoint_holding_the_penalty_is_refused() {
 
     // (1) It was refused for *this* reason, not for a hash or layout mismatch — otherwise
     //     the test would be asserting one of the pre-existing checks.
-    let msg = result
-        .warnings
-        .iter()
-        .find(|w| w.contains("Ignoring checkpoint"))
-        .unwrap_or_else(|| {
-            panic!(
-                "the seeded checkpoint must be refused; warnings were {:?}",
-                result.warnings
-            )
+    let msg =
+        result.warnings.iter().find(|w| w.contains("Ignoring checkpoint")).unwrap_or_else(|| {
+            panic!("the seeded checkpoint must be refused; warnings were {:?}", result.warnings)
         });
     assert!(
         msg.contains("holds the EBE guard's rejection penalty at the midpoint"),
@@ -1003,12 +902,7 @@ fn a_checkpoint_with_a_huge_objective_away_from_the_box_centre_is_resumed() {
     // Away from the centre in θ — `ln(4.0)` and `ln(40.0)`, nowhere near the
     // `ln(sqrt(lower·upper))` midpoints — with an objective five orders past anything
     // physical, the shape an early SAEM iteration can produce.
-    seed_checkpoint(
-        &path,
-        &model,
-        vec![4.0_f64.ln(), 40.0_f64.ln(), 0.0, -1.5],
-        5e12,
-    );
+    seed_checkpoint(&path, &model, vec![4.0_f64.ln(), 40.0_f64.ln(), 0.0, -1.5], 5e12);
 
     let options = resuming_opts(&path, 200);
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
@@ -1017,19 +911,13 @@ fn a_checkpoint_with_a_huge_objective_away_from_the_box_centre_is_resumed() {
 
     // (1) It was resumed from, not refused.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Resuming from checkpoint")),
+        result.warnings.iter().any(|w| w.contains("Resuming from checkpoint")),
         "a checkpoint away from the box centre must be resumed from however large its \
          recorded objective — the magnitude alone is not the fingerprint: {:?}",
         result.warnings
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Ignoring checkpoint")),
+        !result.warnings.iter().any(|w| w.contains("Ignoring checkpoint")),
         "{:?}",
         result.warnings
     );
@@ -1072,10 +960,7 @@ fn a_checkpoint_at_the_box_centre_with_a_real_objective_is_resumed() {
     crate::io::checkpoint::remove(&path);
 
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Resuming from checkpoint")),
+        result.warnings.iter().any(|w| w.contains("Resuming from checkpoint")),
         "a checkpoint at the box centre carrying a real objective is an ordinary resume \
          point — a fit whose initial estimates sit at the midpoint writes one — and must \
          not be refused: {:?}",
@@ -1109,10 +994,7 @@ fn fraction_run() -> RunFeasibility {
 #[test]
 fn a_run_with_one_feasible_evaluation_is_not_demoted() {
     let mut converged = true;
-    let run = RunFeasibility {
-        feasible_evals: 1,
-        ..fraction_run()
-    };
+    let run = RunFeasibility { feasible_evals: 1, ..fraction_run() };
     assert_eq!(no_feasible_eval_warning(&mut converged, &run), None);
     assert!(
         converged,
@@ -1126,10 +1008,7 @@ fn a_run_with_one_feasible_evaluation_is_not_demoted() {
 #[test]
 fn a_cancelled_run_is_not_reported_as_infeasible() {
     let mut converged = true;
-    let run = RunFeasibility {
-        cancelled: true,
-        ..fraction_run()
-    };
+    let run = RunFeasibility { cancelled: true, ..fraction_run() };
     assert_eq!(no_feasible_eval_warning(&mut converged, &run), None);
     assert!(converged, "cancellation is not a convergence finding");
 }
@@ -1144,29 +1023,17 @@ fn the_fraction_trigger_names_the_share_and_both_knobs() {
     assert!(msg.starts_with(NO_FEASIBLE_EVAL_TOKEN), "{msg}");
     // The head sentence: what happened, how many trials, and where the estimates came
     // from. Deleting any clause of it reddens this assertion.
-    assert!(
-        msg.contains("without a single feasible objective evaluation"),
-        "{msg}"
-    );
+    assert!(msg.contains("without a single feasible objective evaluation"), "{msg}");
     assert!(msg.contains("all 7 of its trials"), "{msg}");
-    assert!(
-        msg.contains("the estimates reported are the ones the fit started from"),
-        "{msg}"
-    );
+    assert!(msg.contains("the estimates reported are the ones the fit started from"), "{msg}");
     // The cause sentence.
-    assert!(
-        msg.contains("the EBE convergence guard rejected 7 of them"),
-        "{msg}"
-    );
+    assert!(msg.contains("the EBE convergence guard rejected 7 of them"), "{msg}");
     assert!(msg.contains("at worst 9 of 10 subjects"), "{msg}");
     // "against", not "above". `ebe_guard_rejects` has a second, unconditional trigger this
     // message does not branch on (see its doc comment), so the sentence must not assert
     // that the fraction threshold is what was exceeded — it reports the share and the
     // threshold and lets them be read together.
-    assert!(
-        msg.contains("against `max_unconverged_frac` = 0.1"),
-        "{msg}"
-    );
+    assert!(msg.contains("against `max_unconverged_frac` = 0.1"), "{msg}");
     assert!(!msg.contains("above `max_unconverged_frac`"), "{msg}");
     // The remedy sentence.
     assert!(msg.contains("Raise `inner_maxiter` (currently 3)"), "{msg}");
@@ -1192,20 +1059,14 @@ fn an_all_non_finite_trace_does_not_blame_the_guard() {
     let msg = no_feasible_eval_warning(&mut converged, &run).expect("a warning");
     assert!(!converged);
     // The cause sentence.
-    assert!(
-        msg.contains("every trial returned a non-finite objective"),
-        "{msg}"
-    );
+    assert!(msg.contains("every trial returned a non-finite objective"), "{msg}");
     assert!(msg.contains("never came into it"), "{msg}");
     // The remedy sentence, asserted in its own right — see the note in U4.
     assert!(
         msg.contains("Look for the parameter value or record that poisons the objective"),
         "{msg}"
     );
-    assert!(
-        msg.contains("at and around the starting estimates"),
-        "{msg}"
-    );
+    assert!(msg.contains("at and around the starting estimates"), "{msg}");
     assert!(
         !msg.contains("Raise `inner_maxiter`"),
         "a non-finite objective is not an inner-budget problem: {msg}"
@@ -1218,21 +1079,14 @@ fn an_all_non_finite_trace_does_not_blame_the_guard() {
 #[test]
 fn a_mixed_trace_accounts_for_every_trial() {
     let mut converged = true;
-    let run = RunFeasibility {
-        n_guard_rejected: 5,
-        n_nonfinite: 2,
-        ..fraction_run()
-    };
+    let run = RunFeasibility { n_guard_rejected: 5, n_nonfinite: 2, ..fraction_run() };
     let msg = no_feasible_eval_warning(&mut converged, &run).expect("a warning");
     assert!(!converged);
     // The trial count is the sum of the two causes, not a callback count: see
     // `RunFeasibility::n_trials`.
     assert!(msg.contains("all 7 of its trials"), "{msg}");
     assert!(msg.contains("rejected 5 of them"), "{msg}");
-    assert!(
-        msg.contains("The remaining 2 returned a non-finite objective"),
-        "{msg}"
-    );
+    assert!(msg.contains("The remaining 2 returned a non-finite objective"), "{msg}");
     // ...and *both* remedies, because neither covers the other's trials: `inner_maxiter`
     // does not make a `NaN` finite, and chasing a poisoned record does not widen the inner
     // budget. The guard remedy alone was what round 3 of review caught.
@@ -1262,19 +1116,10 @@ fn a_mixed_trace_accounts_for_every_trial() {
 /// than a reachable failure: reintroducing the bug means reintroducing the field.
 #[test]
 fn the_trial_count_is_the_sum_of_the_two_causes() {
-    let run = RunFeasibility {
-        n_guard_rejected: 5,
-        n_nonfinite: 2,
-        ..fraction_run()
-    };
+    let run = RunFeasibility { n_guard_rejected: 5, n_nonfinite: 2, ..fraction_run() };
     assert_eq!(run.n_trials(), 7);
     assert_eq!(
-        RunFeasibility {
-            n_guard_rejected: 0,
-            n_nonfinite: 3,
-            ..fraction_run()
-        }
-        .n_trials(),
+        RunFeasibility { n_guard_rejected: 0, n_nonfinite: 3, ..fraction_run() }.n_trials(),
         3
     );
     let mut converged = true;

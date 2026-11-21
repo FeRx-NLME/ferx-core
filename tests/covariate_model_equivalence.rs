@@ -113,10 +113,7 @@ fn the_block_is_the_classical_model_it_desugars_to() {
     // The two θ vectors must line up name for name, or "the same parameter
     // vector" below would be comparing different models.
     assert_eq!(hand.model.theta_names, block.model.theta_names);
-    assert_eq!(
-        hand.model.default_params.theta,
-        block.model.default_params.theta
-    );
+    assert_eq!(hand.model.default_params.theta, block.model.default_params.theta);
 
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
 
@@ -134,10 +131,7 @@ fn the_block_is_the_classical_model_it_desugars_to() {
     //    that same start. `maxiter = 2` keeps this a Tier-2 test: it exercises
     //    the fit path without running a convergence loop.
     // Tier-2: a couple of outer iterations, never a convergence loop.
-    let opts = FitOptions {
-        outer_maxiter: 2,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 2, ..FitOptions::default() };
     let hand_fit = fit(&hand.model, &pop, &hand.model.default_params, &opts)
         .expect("short classical fit must not error");
     let block_fit = fit(&block.model, &pop, &block.model.default_params, &opts)
@@ -149,16 +143,52 @@ fn the_block_is_the_classical_model_it_desugars_to() {
     assert_eq!(hand_fit.theta, block_fit.theta);
 }
 
+/// SAEM reads the covariate groups' outside reads to choose its M-step (#619, #1620): the block
+/// must route there exactly as the relation written by hand, so a short seeded run of each is
+/// bit-identical (#3014). Before the fix the block's own text made its relation θ look read
+/// outside the groups, sending the block form down the other M-step.
+#[test]
+fn saem_takes_the_same_route_for_both_forms() {
+    let hand = parse_full_model(&classical()).expect("classical model must parse");
+    let block = parse_full_model(&declarative()).expect("block-declared model must parse");
+    // Non-degeneracy: the hand form must actually reach the joint M-step, or both arms taking
+    // the data-term route would agree just as well. Both relation lines are covariate groups
+    // and no group θ is read outside its own line.
+    let groups = &hand.model.covariate_mu_refs;
+    let mut etas: Vec<&str> = groups.iter().map(|g| g.eta_name.as_str()).collect();
+    etas.sort_unstable();
+    assert_eq!(etas, ["ETA_CL", "ETA_V1"], "both relations are groups");
+    assert!(
+        groups.iter().all(|g| g.shared_thetas.is_empty()),
+        "the hand form's relation θ are exclusive to their groups: {groups:?}"
+    );
+    let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
+    // Tier-2: a few SAEM iterations, never a convergence loop.
+    let opts = FitOptions {
+        method: ferx_core::types::EstimationMethod::Saem,
+        saem_n_exploration: 3,
+        saem_n_convergence: 3,
+        // The route under test is the M-step; nothing below reads the covariance step.
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let hand_fit = fit(&hand.model, &pop, &hand.model.default_params, &opts)
+        .expect("short classical SAEM fit must not error");
+    let block_fit = fit(&block.model, &pop, &block.model.default_params, &opts)
+        .expect("short block-declared SAEM fit must not error");
+    assert!(hand_fit.ofv.is_finite(), "the classical arm must produce an objective");
+    assert_eq!(hand_fit.ofv, block_fit.ofv);
+    assert_eq!(hand_fit.theta, block_fit.theta);
+    assert_eq!(hand_fit.omega, block_fit.omega);
+}
+
 #[test]
 fn the_relation_table_is_echoed_on_the_fit_result() {
     // The point of the block: a search reads the covariate model back off the
     // result instead of regexing the `.ferx` file.
     let block = parse_full_model(&declarative()).expect("block-declared model must parse");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
-    let opts = FitOptions {
-        outer_maxiter: 2,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 2, ..FitOptions::default() };
     let result = fit(&block.model, &pop, &block.model.default_params, &opts)
         .expect("short block-declared fit must not error");
 
@@ -200,17 +230,9 @@ fn fit_from_files_binds_symbolic_covariate_statistics() {
         .replace("power(center = 100)", "power(center = median)");
     std::fs::write(&path, &text).expect("write model file");
 
-    let opts = FitOptions {
-        outer_maxiter: 2,
-        ..FitOptions::default()
-    };
-    let result = fit_from_files(
-        path.to_str().expect("utf-8 path"),
-        Some(DATA),
-        None,
-        Some(opts),
-    )
-    .expect("fit_from_files must bind `center = median` rather than reject it");
+    let opts = FitOptions { outer_maxiter: 2, ..FitOptions::default() };
+    let result = fit_from_files(path.to_str().expect("utf-8 path"), Some(DATA), None, Some(opts))
+        .expect("fit_from_files must bind `center = median` rather than reject it");
 
     // Non-degeneracy: the centres actually came from the data, so they are
     // neither absent nor the literals the file no longer states.
@@ -231,19 +253,13 @@ fn fit_from_files_binds_symbolic_covariate_statistics() {
 /// the covariance step — the level at which a difference in the *gradient* of
 /// the generated expression, rather than in its value, would show up.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_two_forms_converge_to_the_same_estimates_and_ses() {
     let hand = parse_full_model(&classical()).expect("classical model must parse");
     let block = parse_full_model(&declarative()).expect("block-declared model must parse");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
 
-    let opts = FitOptions {
-        run_covariance_step: true,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { run_covariance_step: true, ..FitOptions::default() };
     let hand_fit = fit(&hand.model, &pop, &hand.model.default_params, &opts)
         .expect("classical fit must not error");
     let block_fit = fit(&block.model, &pop, &block.model.default_params, &opts)
@@ -254,11 +270,8 @@ fn the_two_forms_converge_to_the_same_estimates_and_ses() {
     assert!(hand_fit.converged, "classical arm must actually converge");
     assert!(block_fit.converged, "block arm must actually converge");
     for name in ["THETA_CL_WT", "THETA_CL_CRCL", "THETA_V1_WT"] {
-        let i = block_fit
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .expect("generated θ is estimated");
+        let i =
+            block_fit.theta_names.iter().position(|n| n == name).expect("generated θ is estimated");
         let init = block.model.default_params.theta[i];
         assert!(
             (block_fit.theta[i] - init).abs() > 1e-6,

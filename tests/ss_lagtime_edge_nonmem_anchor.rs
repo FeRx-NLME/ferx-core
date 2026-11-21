@@ -120,16 +120,9 @@ fn nonmem_pred_table(tab: &str) -> std::collections::HashMap<(String, u64), f64>
     let text = std::fs::read_to_string(anchor(tab)).expect("the NONMEM table is committed");
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. banner");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> = lines.next().expect("column header").split_whitespace().collect();
     let col = |name: &str| {
-        header
-            .iter()
-            .position(|c| *c == name)
-            .unwrap_or_else(|| panic!("{name} column"))
+        header.iter().position(|c| *c == name).unwrap_or_else(|| panic!("{name} column"))
     };
     let (id_col, time_col, pred_col) = (col("ID"), col("TIME"), col("PRED"));
     let mut out = std::collections::HashMap::new();
@@ -167,11 +160,7 @@ fn ferx_pred_table(model: &str, data: &str) -> Vec<(String, f64, f64)> {
 /// Compare every ferx η = 0 prediction against NONMEM's `PRED` at the same
 /// `(ID, TIME)`, optionally restricted to `only_ids`.
 fn assert_pred_matches_nonmem_for(
-    model: &str,
-    data: &str,
-    tab: &str,
-    max_relative: f64,
-    only_ids: &[&str],
+    model: &str, data: &str, tab: &str, max_relative: f64, only_ids: &[&str],
 ) {
     let nm = nonmem_pred_table(tab);
     let ferx = ferx_pred_table(model, data);
@@ -195,10 +184,7 @@ fn assert_pred_matches_nonmem_for(
     // A silent zero-comparison pass is the failure mode this helper exists to
     // avoid — a key mismatch, or an `only_ids` filter that matches nothing, must
     // not read as agreement.
-    assert!(
-        compared > 0,
-        "no ferx prediction was matched against a NONMEM row for {data}"
-    );
+    assert!(compared > 0, "no ferx prediction was matched against a NONMEM row for {data}");
 }
 
 /// The tolerance every pointwise check here uses. NONMEM's `$TABLE` writes five
@@ -344,11 +330,7 @@ fn ferx_engines_agree_on_a_steady_state_infusion_with_a_lagtime_past_the_interva
     for data in ["ss_lag_infusion.csv", "ss_lag_infusion_flatwt.csv"] {
         let ode = ferx_pred_table("ss_lag_iv_fit.ferx", data);
         let cf = ferx_pred_table("ss_lag_iv_cf_fit.ferx", data);
-        assert_eq!(
-            ode.len(),
-            cf.len(),
-            "{data}: both engines predict every row"
-        );
+        assert_eq!(ode.len(), cf.len(), "{data}: both engines predict every row");
         let mut compared = 0usize;
         for ((id, t, a), (id2, t2, b)) in ode.iter().zip(cf.iter()) {
             assert_eq!((id, t), (id2, t2), "{data}: row alignment");
@@ -398,10 +380,7 @@ const NM_OBJV_GE_II_FLATWT: f64 = -50.236_960_368_462_199;
 )]
 fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_dosing_interval() {
     let ofv = ferx_ofv("ss_lag_iv_fit.ferx", "ss_lag_ge_ii.csv");
-    assert!(
-        (ofv - NM_OBJV_GE_II).abs() < TOL,
-        "ferx {ofv:.6} vs NONMEM {NM_OBJV_GE_II:.6}"
-    );
+    assert!((ofv - NM_OBJV_GE_II).abs() < TOL, "ferx {ofv:.6} vs NONMEM {NM_OBJV_GE_II:.6}");
 }
 
 /// The static-route twin of the above.

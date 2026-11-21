@@ -42,13 +42,7 @@ fn evaluate(inner_restarts: Option<usize>) -> FitResult {
         inner_restarts: inner_restarts.unwrap_or(base.inner_restarts),
         ..base
     };
-    fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("evaluation")
+    fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("evaluation")
 }
 
 /// The sentinel is finite (`2e20`), so `is_finite()` cannot see it: bound the magnitude.
@@ -66,9 +60,7 @@ fn assert_scored(r: &FitResult, label: &str) {
         r.warnings
     );
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
+        !r.warnings.iter().any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
         "{label}: no non-finite-objective demotion expected: {:?}",
         r.warnings
     );
@@ -77,10 +69,7 @@ fn assert_scored(r: &FitResult, label: &str) {
 #[test]
 fn cold_evaluation_scores_the_iov_subject_with_the_default_restart_scan() {
     let r = evaluate(None);
-    assert!(
-        r.evaluation_only,
-        "premise: maxiter = 0 is an evaluation-only run"
-    );
+    assert!(r.evaluation_only, "premise: maxiter = 0 is an evaluation-only run");
     assert_scored(&r, "default inner_restarts");
 }
 

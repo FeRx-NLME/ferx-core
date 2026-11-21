@@ -103,11 +103,7 @@ fn write_models(path: &Path, result: &ModelsearchResult) -> Result<(), String> {
                 r.id.clone(),
                 r.parent.clone().unwrap_or_default(),
                 r.layer.to_string(),
-                r.path
-                    .iter()
-                    .map(|k| k.to_string())
-                    .collect::<Vec<_>>()
-                    .join(";"),
+                r.path.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(";"),
                 r.structure.absorption.label().to_string(),
                 r.structure.peripherals.to_string(),
                 transits(r.structure.transits),
@@ -120,10 +116,7 @@ fn write_models(path: &Path, result: &ModelsearchResult) -> Result<(), String> {
                 r.converged.map(|c| c.to_string()).unwrap_or_default(),
                 r.passed.to_string(),
                 r.failures.join("; "),
-                r.error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_default(),
+                r.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
                 number(r.seconds),
                 r.selected.to_string(),
                 r.continued.to_string(),
@@ -131,9 +124,7 @@ fn write_models(path: &Path, result: &ModelsearchResult) -> Result<(), String> {
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// A human-readable rendering of the search: every model, best first, then
@@ -148,11 +139,8 @@ pub fn render_summary(result: &ModelsearchResult) -> String {
         "Base model ({}): {} — OFV {}, {label} {}",
         result.base_id,
         structure_label(&result.base_structure),
-        base.and_then(|r| r.ofv)
-            .map(|v| format!("{v:.3}"))
-            .unwrap_or_else(|| "-".into()),
-        base.map(|r| number_or_dash(r.criterion))
-            .unwrap_or_else(|| "-".into())
+        base.and_then(|r| r.ofv).map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+        base.map(|r| number_or_dash(r.criterion)).unwrap_or_else(|| "-".into())
     );
     let _ = writeln!(
         out,
@@ -160,11 +148,7 @@ pub fn render_summary(result: &ModelsearchResult) -> String {
         result.options.algorithm.label(),
         result.rows.len(),
         if result.rows.len() == 1 { "" } else { "s" },
-        if result.cancelled {
-            " (search cancelled)"
-        } else {
-            ""
-        }
+        if result.cancelled { " (search cancelled)" } else { "" }
     );
     let _ = writeln!(
         out,
@@ -197,16 +181,10 @@ pub fn render_summary(result: &ModelsearchResult) -> String {
             "  {:<8} {:<40} {:>5} {:>12} {:>12} {:>9} {:>4} {:>7.1}  {:<13} {}",
             r.id,
             structure_label(&r.structure),
-            r.n_parameters
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "-".into()),
-            r.ofv
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_else(|| "-".into()),
+            r.n_parameters.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            r.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
             number_or_dash(r.criterion),
-            r.d_criterion
-                .map(|v| format!("{v:+.3}"))
-                .unwrap_or_else(|| "-".into()),
+            r.d_criterion.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "-".into()),
             r.rank.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
             r.seconds,
             status,
@@ -217,10 +195,7 @@ pub fn render_summary(result: &ModelsearchResult) -> String {
         out,
         "\nFinal model: {} — {} ({label} {})",
         result.final_id,
-        result
-            .row(&result.final_id)
-            .map(|r| structure_label(&r.structure))
-            .unwrap_or_default(),
+        result.row(&result.final_id).map(|r| structure_label(&r.structure)).unwrap_or_default(),
         number_or_dash(result.final_criterion)
     );
     if !result.notes.is_empty() {

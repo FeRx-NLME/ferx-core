@@ -86,23 +86,12 @@ fn predict_matches_nonmem_ss_first_order_absorption() {
     let preds = predict(&model, &population, &model.default_params).unwrap();
 
     // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time.
-    let nonmem: &[(f64, f64)] = &[
-        (0.5, 12.231),
-        (1.0, 12.402),
-        (2.0, 12.634),
-        (4.0, 12.735),
-        (6.0, 12.490),
-        (7.9, 12.044),
-    ];
+    let nonmem: &[(f64, f64)] =
+        &[(0.5, 12.231), (1.0, 12.402), (2.0, 12.634), (4.0, 12.735), (6.0, 12.490), (7.9, 12.044)];
     assert_eq!(preds.len(), nonmem.len());
 
     for (p, &(t, expected)) in preds.iter().zip(nonmem) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "prediction time {} != expected {}",
-            p.time,
-            t
-        );
+        assert!((p.time - t).abs() < 1e-9, "prediction time {} != expected {}", p.time, t);
         let rel = (p.pred - expected).abs() / expected;
         assert!(
             rel < 1e-4,
@@ -295,18 +284,13 @@ fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
     .expect("simulate returns Ok");
 
     assert!(
-        out.warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        out.warnings.iter().any(|w| w.contains("Steady-state (SS=1) equilibration")),
         "a saturable SS model dosed above capacity must surface a non-convergence warning through \
          SimulationOutput.warnings; got: {:?}",
         out.warnings
     );
     // Simulated rows are still produced (the returned trough is finite, just unreliable).
-    assert!(
-        !out.results.is_empty(),
-        "simulate must still return rows alongside the warning"
-    );
+    assert!(!out.results.is_empty(), "simulate must still return rows alongside the warning");
 }
 
 /// The blocking-bug regression (#874 review): `n_starts` defaults to `1`, so a plain `fit()` takes
@@ -329,10 +313,7 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
     let result = fit(&model, &population, &model.default_params, &opts).expect("fit returns Ok");
 
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        result.warnings.iter().any(|w| w.contains("Steady-state (SS=1) equilibration")),
         "default single-start fit() must surface the SS non-convergence warning to \
          FitResult.warnings; got: {:?}",
         result.warnings
@@ -350,10 +331,8 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
 #[test]
 fn concurrent_fits_each_report_only_their_own_ss_notes() {
     let capped = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
-    let benign_src = SS_MM_NO_STEADY_STATE_MODEL.replace(
-        "theta TVVMAX(10.0, 1.0, 100.0)",
-        "theta TVVMAX(500.0, 1.0, 5000.0)",
-    );
+    let benign_src = SS_MM_NO_STEADY_STATE_MODEL
+        .replace("theta TVVMAX(10.0, 1.0, 100.0)", "theta TVVMAX(500.0, 1.0, 5000.0)");
     let benign = parse_full_model(&benign_src).expect("model parses");
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
         .expect("dataset loads");
@@ -361,13 +340,8 @@ fn concurrent_fits_each_report_only_their_own_ss_notes() {
         let mut opts = parsed.fit_options.clone();
         opts.outer_maxiter = 3;
         opts.run_covariance_step = false;
-        let r = fit(
-            &parsed.model,
-            &population,
-            &parsed.model.default_params,
-            &opts,
-        )
-        .expect("fit returns Ok");
+        let r = fit(&parsed.model, &population, &parsed.model.default_params, &opts)
+            .expect("fit returns Ok");
         let mut v: Vec<String> = r
             .warnings
             .into_iter()
@@ -378,10 +352,7 @@ fn concurrent_fits_each_report_only_their_own_ss_notes() {
     };
     let (serial_capped, serial_benign) = (notes(&capped), notes(&benign));
     assert!(!serial_capped.is_empty(), "the capped fit warns serially");
-    assert_ne!(
-        serial_capped, serial_benign,
-        "the two fits' notes differ, so a swap is visible"
-    );
+    assert_ne!(serial_capped, serial_benign, "the two fits' notes differ, so a swap is visible");
     for rep in 0..2 {
         let gate = std::sync::Barrier::new(2);
         let (c, b) = std::thread::scope(|s| {
@@ -408,10 +379,8 @@ fn concurrent_fits_each_report_only_their_own_ss_notes() {
 #[test]
 fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
     // Serialize against the other SS tests in this binary (#1113).
-    let src = SS_MM_NO_STEADY_STATE_MODEL.replace(
-        "theta TVVMAX(10.0, 1.0, 100.0)",
-        "theta TVVMAX(500.0, 1.0, 5000.0)",
-    );
+    let src = SS_MM_NO_STEADY_STATE_MODEL
+        .replace("theta TVVMAX(10.0, 1.0, 100.0)", "theta TVVMAX(500.0, 1.0, 5000.0)");
     let parsed = parse_full_model(&src).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
@@ -427,9 +396,7 @@ fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
     .expect("simulate returns Ok");
 
     assert!(
-        !out.warnings
-            .iter()
-            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        !out.warnings.iter().any(|w| w.contains("Steady-state (SS=1) equilibration")),
         "benign fast-contracting nonlinear SS model must stay silent; got: {:?}",
         out.warnings
     );
@@ -450,9 +417,7 @@ fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
 const SS_NOTE: &str = "Steady-state (SS=1) equilibration";
 
 fn capped_fixture() -> (CompiledModel, Population) {
-    let model = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL)
-        .expect("model parses")
-        .model;
+    let model = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses").model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
         .expect("dataset loads");
     (model, population)
@@ -461,10 +426,8 @@ fn capped_fixture() -> (CompiledModel, Population) {
 /// The `TVVMAX 500` variant `simulate_stays_silent_for_benign_nonlinear_ss_absorption` uses:
 /// nonlinear, so it still takes the pulse train, but it settles well inside the cycle budget.
 fn benign_fixture() -> (CompiledModel, Population) {
-    let src = SS_MM_NO_STEADY_STATE_MODEL.replace(
-        "theta TVVMAX(10.0, 1.0, 100.0)",
-        "theta TVVMAX(500.0, 1.0, 5000.0)",
-    );
+    let src = SS_MM_NO_STEADY_STATE_MODEL
+        .replace("theta TVVMAX(10.0, 1.0, 100.0)", "theta TVVMAX(500.0, 1.0, 5000.0)");
     let model = parse_full_model(&src).expect("model parses").model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
         .expect("dataset loads");
@@ -527,10 +490,7 @@ fn predict_diag_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
          PredictionOutput.warnings, as simulate does on the same input; got: {:?}",
         out.warnings
     );
-    assert!(
-        !out.results.is_empty(),
-        "predict_diag must still return rows"
-    );
+    assert!(!out.results.is_empty(), "predict_diag must still return rows");
 }
 
 /// T2. Mutation: drop the `take` in `run_adaptive_population` → no note.
@@ -544,10 +504,7 @@ fn adaptive_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
          AdaptiveSimulationResult.warnings; got: {:?}",
         res.warnings
     );
-    assert!(
-        !res.trajectories.is_empty(),
-        "the adaptive driver must still return trajectories"
-    );
+    assert!(!res.trajectories.is_empty(), "the adaptive driver must still return trajectories");
 }
 
 /// T3. Mutation: drop the `clear` in `predict_diag` → the residue is reported as this pass's.

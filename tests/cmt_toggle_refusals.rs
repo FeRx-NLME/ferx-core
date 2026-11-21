@@ -103,9 +103,7 @@ fn an_off_row_past_the_declared_states_is_refused() {
 #[test]
 fn an_on_row_past_the_declared_states_changes_nothing() {
     let m = model(ODE);
-    let pop = data(&format!(
-        "{OFF_AT_3}1,3.5,.,2,.,3,1,0,0\n1,4,1,0,.,1,0,0,0\n"
-    ));
+    let pop = data(&format!("{OFF_AT_3}1,3.5,.,2,.,3,1,0,0\n1,4,1,0,.,1,0,0,0\n"));
     assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
 }
 
@@ -120,20 +118,12 @@ fn an_analytical_model_refuses_the_row() {
 
 #[test]
 fn a_steady_state_dose_while_a_compartment_is_off_is_refused() {
-    let pop = data(&format!(
-        "{OFF_AT_3}1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"
-    ));
+    let pop = data(&format!("{OFF_AT_3}1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"));
     let e = refusal(&model(ODE), &pop);
     assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
     assert!(e.contains("while `urine` is off"), "{e}");
-    assert!(
-        e.contains("a lagged dose only turns a compartment on when it arrives"),
-        "{e}"
-    );
-    assert!(
-        e.contains("with an `EVID=2` row before the steady-state record"),
-        "{e}"
-    );
+    assert!(e.contains("a lagged dose only turns a compartment on when it arrives"), "{e}");
+    assert!(e.contains("with an `EVID=2` row before the steady-state record"), "{e}");
 }
 
 /// NONMEM's answer here is its own periodic solve of the compartment, which ferx does not
@@ -141,9 +131,7 @@ fn a_steady_state_dose_while_a_compartment_is_off_is_refused() {
 /// dose's own compartment must not count as on for this check.
 #[test]
 fn a_steady_state_dose_into_the_off_compartment_is_refused() {
-    let pop = data(&format!(
-        "{OFF_AT_3}1,4,.,1,100,2,1,12,1\n1,5,1,0,.,1,0,0,0\n"
-    ));
+    let pop = data(&format!("{OFF_AT_3}1,4,.,1,100,2,1,12,1\n1,5,1,0,.,1,0,0,0\n"));
     let e = refusal(&model(ODE), &pop);
     assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
 }
@@ -151,9 +139,8 @@ fn a_steady_state_dose_into_the_off_compartment_is_refused() {
 #[test]
 fn a_steady_state_dose_with_everything_on_is_accepted() {
     let m = model(ODE);
-    let pop = data(&format!(
-        "{OFF_AT_3}1,3.5,.,2,.,2,1,0,0\n1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"
-    ));
+    let pop =
+        data(&format!("{OFF_AT_3}1,3.5,.,2,.,2,1,0,0\n1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"));
     assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
 }
 
@@ -169,10 +156,7 @@ fn a_compartment_fed_by_a_built_in_input_cannot_be_switched() {
     let pop = data("1,0,.,1,100,1,1,0,0\n1,3,.,2,.,-1,1,0,0\n1,4,1,0,.,2,0,0,0\n");
     let e = refusal(&model(&source), &pop);
     assert!(e.contains("E_CMT_TOGGLE_UNSUPPORTED"), "{e}");
-    assert!(
-        e.contains("`central`, which a built-in absorption input feeds"),
-        "{e}"
-    );
+    assert!(e.contains("`central`, which a built-in absorption input feeds"), "{e}");
 }
 
 #[test]
@@ -198,10 +182,7 @@ fn an_endpoint_model_refuses_the_row() {
     let pop = data(&format!("{OFF_AT_3}1,4,1,0,.,1,0,0,0\n"));
     let e = refusal(&parsed.model, &pop);
     assert!(e.contains("E_CMT_TOGGLE_UNSUPPORTED"), "{e}");
-    assert!(
-        e.contains("a model with a declared endpoint cannot honour"),
-        "{e}"
-    );
+    assert!(e.contains("a model with a declared endpoint cannot honour"), "{e}");
     assert!(!e.contains("SDE"), "{e}");
 }
 
@@ -227,16 +208,9 @@ fn a_fit_runs_on_the_analytic_gradient_and_a_grid_output_reads_nan() {
         Some(data_path.to_str().unwrap()),
     )
     .expect("the fit runs");
+    assert!(result.ofv.is_finite() && result.ofv < 1e6, "OFV {}", result.ofv);
     assert!(
-        result.ofv.is_finite() && result.ofv < 1e6,
-        "OFV {}",
-        result.ofv
-    );
-    assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
+        !result.warnings.iter().any(|w| w.contains("finite-difference")),
         "{:?}",
         result.warnings
     );
@@ -252,11 +226,7 @@ fn a_fit_runs_on_the_analytic_gradient_and_a_grid_output_reads_nan() {
         assert!(amount.iter().all(|v| v.is_finite()), "{amount:?}");
         // Refilled from zero after the window: the t = 8 amount is under the t = 4 one.
         assert!(amount[2] < amount[1], "{amount:?}");
-        assert!(
-            column("AUC_U").iter().all(|v| v.is_nan()),
-            "{:?}",
-            column("AUC_U")
-        );
+        assert!(column("AUC_U").iter().all(|v| v.is_nan()), "{:?}", column("AUC_U"));
     }
 }
 
@@ -270,22 +240,12 @@ fn a_subject_built_in_memory_is_refused_at_its_engine_time() {
     let s = &mut pop.subjects[0];
     s.obs_raw_times.clear();
     s.pk_only_raw_times.clear();
-    assert_eq!(
-        s.cmt_toggles[0],
-        CmtToggle {
-            pk_only: 0,
-            state: 1,
-            on: false
-        }
-    );
+    assert_eq!(s.cmt_toggles[0], CmtToggle { pk_only: 0, state: 1, on: false });
     let e = refusal(&m, &pop);
     assert!(e.contains("E_OBS_CMT_OFF") && e.contains("time 4"), "{e}");
     pop.subjects[0].cmt_toggles[0].state = 5;
     let e = refusal(&m, &pop);
-    assert!(
-        e.contains("E_CMT_TOGGLE_OUT_OF_RANGE") && e.contains("time 3"),
-        "{e}"
-    );
+    assert!(e.contains("E_CMT_TOGGLE_OUT_OF_RANGE") && e.contains("time 3"), "{e}");
 }
 
 /// NONMEM stops on this row too, but it asks for no prediction, so ferx reads it as the
@@ -317,9 +277,8 @@ const LAGGED_DOSE_AT_4: &str = "1,4,.,1,50,2,1,0,0\n";
 /// the compartment off to the arrival, so an `SS=1` record in between would refill it.
 #[test]
 fn a_steady_state_dose_before_a_lagged_arrival_is_refused() {
-    let pop = data(&format!(
-        "{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,.,1,100,1,1,12,1\n1,6,1,0,.,1,0,0,0\n"
-    ));
+    let pop =
+        data(&format!("{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,.,1,100,1,1,12,1\n1,6,1,0,.,1,0,0,0\n"));
     let e = refusal(&lagged_urine(), &pop);
     assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
     assert!(e.contains("time 4.5"), "{e}");
@@ -342,9 +301,7 @@ fn the_lag_alone_decides_the_steady_state_refusal() {
     ));
     assert!(ferx_core::predict(&m, &turned_on, &m.default_params).is_ok());
 
-    let observed = data(&format!(
-        "{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,1,0,.,2,0,0,0\n"
-    ));
+    let observed = data(&format!("{OFF_AT_3}{LAGGED_DOSE_AT_4}1,4.5,1,0,.,2,0,0,0\n"));
     assert!(ferx_core::predict(&m, &observed, &m.default_params).is_ok());
 }
 
@@ -352,9 +309,8 @@ fn the_lag_alone_decides_the_steady_state_refusal() {
 #[test]
 fn a_steady_state_dose_after_a_reset_is_accepted() {
     let m = model(ODE);
-    let pop = data(&format!(
-        "{OFF_AT_3}1,3.5,.,3,.,1,1,0,0\n1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"
-    ));
+    let pop =
+        data(&format!("{OFF_AT_3}1,3.5,.,3,.,1,1,0,0\n1,4,.,1,100,1,1,12,1\n1,5,1,0,.,1,0,0,0\n"));
     assert!(ferx_core::predict(&m, &pop, &m.default_params).is_ok());
 }
 
@@ -362,11 +318,7 @@ fn a_steady_state_dose_after_a_reset_is_accepted() {
 fn data_addl(rows: &str) -> Population {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.csv");
-    std::fs::write(
-        &path,
-        format!("ID,TIME,DV,EVID,AMT,CMT,MDV,II,SS,ADDL\n{rows}"),
-    )
-    .unwrap();
+    std::fs::write(&path, format!("ID,TIME,DV,EVID,AMT,CMT,MDV,II,SS,ADDL\n{rows}")).unwrap();
     ferx_core::read_nonmem_csv(&path, None, None).expect("the dataset loads")
 }
 
@@ -386,9 +338,7 @@ fn an_observation_past_a_cancelled_train_is_refused() {
 
 #[test]
 fn a_steady_state_dose_past_a_cancelled_train_is_refused() {
-    let pop = data_addl(&format!(
-        "{CANCELLED_TRAIN}1,5,.,1,100,1,1,12,1,0\n1,6,1,0,.,1,0,0,0,0\n"
-    ));
+    let pop = data_addl(&format!("{CANCELLED_TRAIN}1,5,.,1,100,1,1,12,1,0\n1,6,1,0,.,1,0,0,0,0\n"));
     let e = refusal(&model(ODE), &pop);
     assert!(e.contains("E_CMT_TOGGLE_SS"), "{e}");
     assert!(e.contains("time 5"), "{e}");

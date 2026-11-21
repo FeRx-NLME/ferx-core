@@ -62,9 +62,7 @@ fn append_writer(path: &Path) -> Result<csv::Writer<File>, String> {
 }
 
 fn truncate(path: &Path) -> Result<(), String> {
-    File::create(path)
-        .map(|_| ())
-        .map_err(|e| format!("cannot create `{}`: {e}", path.display()))
+    File::create(path).map(|_| ()).map_err(|e| format!("cannot create `{}`: {e}", path.display()))
 }
 
 /// The temp sibling a per-replicate file is rewritten through. It sits in the
@@ -110,12 +108,8 @@ impl Journal {
     /// draws are recomputed for `1..=samples` before anything is fitted.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
-        dir: &Path,
-        parameter_names: &[String],
-        subject_ids: &[String],
-        kept_original: Option<&ReplicateResult>,
-        kept: &[ReplicateResult],
-        draws: &[Replicate],
+        dir: &Path, parameter_names: &[String], subject_ids: &[String],
+        kept_original: Option<&ReplicateResult>, kept: &[ReplicateResult], draws: &[Replicate],
         options: &BootstrapOptions,
     ) -> Result<Journal, String> {
         std::fs::create_dir_all(dir)
@@ -171,12 +165,8 @@ impl Journal {
     /// files after the swap and never have to be reopened.
     #[allow(clippy::too_many_arguments)]
     fn seed(
-        paths: &[PathBuf; 4],
-        parameter_names: &[String],
-        subject_ids: &[String],
-        kept_original: Option<&ReplicateResult>,
-        kept: &[ReplicateResult],
-        draws: &[Replicate],
+        paths: &[PathBuf; 4], parameter_names: &[String], subject_ids: &[String],
+        kept_original: Option<&ReplicateResult>, kept: &[ReplicateResult], draws: &[Replicate],
         options: &BootstrapOptions,
     ) -> Result<Journal, String> {
         for path in paths {

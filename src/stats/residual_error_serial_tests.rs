@@ -29,10 +29,7 @@ fn mult() -> Vec<Vec<f64>> {
     WEIGHTS.iter().map(|&w| vec![1.0, w]).collect()
 }
 fn cov(kind: ResidualSerialKind, rho: f64) -> ResidualCov<'static> {
-    ResidualCov {
-        pairs: &[],
-        serial: Some(SerialCov { kind, rho }),
-    }
+    ResidualCov { pairs: &[], serial: Some(SerialCov { kind, rho }) }
 }
 fn spec() -> ErrorSpec {
     ErrorSpec::Single(crate::types::ErrorModel::Combined)
@@ -83,16 +80,8 @@ fn scaled_r(kind: ResidualSerialKind, rho: f64) -> DMatrix<f64> {
 /// time gaps (the visits are irregular: 0, 2, 12 and 0, 1, 5).
 #[test]
 fn serial_r_matches_the_closed_form() {
-    for kind in [
-        ResidualSerialKind::Cs,
-        ResidualSerialKind::Ar1,
-        ResidualSerialKind::Car1,
-    ] {
-        let rhos = if kind == ResidualSerialKind::Car1 {
-            [0.6, 0.3]
-        } else {
-            [0.6, -0.3]
-        };
+    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1, ResidualSerialKind::Car1] {
+        let rhos = if kind == ResidualSerialKind::Car1 { [0.6, 0.3] } else { [0.6, -0.3] };
         for rho in rhos {
             let r = scaled_r(kind, rho);
             for j in 0..6 {
@@ -146,11 +135,7 @@ fn serial_r_two_by_two_by_hand() {
 #[test]
 fn serial_r_at_rho_zero_is_the_independent_r_bit_for_bit() {
     let none = ResidualCov::block_sigma(&[]);
-    for kind in [
-        ResidualSerialKind::Cs,
-        ResidualSerialKind::Ar1,
-        ResidualSerialKind::Car1,
-    ] {
+    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1, ResidualSerialKind::Car1] {
         let scaled = |c| {
             compute_r_matrix_with_correlations_scaled_cov(
                 &spec(),
@@ -181,16 +166,8 @@ fn serial_r_at_rho_zero_is_the_independent_r_bit_for_bit() {
             )
         };
         let bits = |m: DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-        assert_eq!(
-            bits(scaled(cov(kind, 0.0))),
-            bits(scaled(none)),
-            "{kind:?} scaled"
-        );
-        assert_eq!(
-            bits(bare(cov(kind, 0.0))),
-            bits(bare(none)),
-            "{kind:?} bare"
-        );
+        assert_eq!(bits(scaled(cov(kind, 0.0))), bits(scaled(none)), "{kind:?} scaled");
+        assert_eq!(bits(bare(cov(kind, 0.0))), bits(bare(none)), "{kind:?} bare");
         // and a live ρ does move it, so the comparison above is not vacuous
         assert_ne!(bits(bare(cov(kind, 0.5))), bits(bare(none)));
     }
@@ -243,11 +220,7 @@ fn unit_weight_is_no_weight_on_an_additive_endpoint() {
 #[test]
 fn serial_dr_and_d2r_match_finite_differences() {
     let n = 6;
-    for kind in [
-        ResidualSerialKind::Cs,
-        ResidualSerialKind::Ar1,
-        ResidualSerialKind::Car1,
-    ] {
+    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1, ResidualSerialKind::Car1] {
         for scaled in [false, true] {
             let m = mult();
             let mopt = scaled.then_some(m.as_slice());
@@ -344,10 +317,7 @@ fn serial_dr_and_d2r_match_finite_differences() {
                     }
                 }
             }
-            assert!(
-                off_diagonal_seen,
-                "{kind:?}: the fixture has a live ∂R_jk/∂f"
-            );
+            assert!(off_diagonal_seen, "{kind:?}: the fixture has a live ∂R_jk/∂f");
         }
     }
 }
@@ -491,14 +461,7 @@ fn serial_model(by: &[&str]) -> crate::types::CompiledModel {
 #[test]
 fn residual_groups_reads_the_by_column_per_row() {
     let model = serial_model(&["ARM"]);
-    let s = subject_with(&[
-        Some(7.0),
-        Some(3.0),
-        None,
-        Some(7.0),
-        Some(f64::NAN),
-        Some(3.0),
-    ]);
+    let s = subject_with(&[Some(7.0), Some(3.0), None, Some(7.0), Some(f64::NAN), Some(3.0)]);
     assert_eq!(residual_groups(&model, &s), vec![1, 2, 0, 1, 0, 2]);
     // No `correlation` line: no blocks at all.
     let mut plain = model;
@@ -615,20 +578,13 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
     assert_relative_eq!(got.0, want.0, max_relative = 1e-12);
     assert_relative_eq!(got.1, want.1, max_relative = 1e-12);
     let raw = iwres_autocorrelation(std::slice::from_ref(&res));
-    assert!(
-        (raw.1 - want.1).abs() > 0.1,
-        "raw {raw:?} vs whitened {want:?}"
-    );
+    assert!((raw.1 - want.1).abs() > 0.1, "raw {raw:?} vs whitened {want:?}");
     // B4 (#2798), by hand: the blocks [0.8, −0.3, 0.4] and [1.1, −0.9] have squared
     // steps 1.21 + 0.49 + 4.00 = 5.70 over pair means 0.365 + 0.125 + 1.01 = 1.5, so
     // DW = 3.8. The whole series would pair across the blocks: 5.35 / 2.185 = 2.4485.
     // This fixture has no `occasions`, so the split here is `obs_rgroup` alone.
     assert!(pop.subjects[0].occasions.is_empty());
-    assert!(
-        (got.1 - 3.8).abs() < 1e-12,
-        "whitened DW split by residual block: 3.8, got {}",
-        got.1
-    );
+    assert!((got.1 - 3.8).abs() < 1e-12, "whitened DW split by residual block: 3.8, got {}", got.1);
 }
 
 /// B5 (#2798): rows are grouped by key, not by contiguous run. Two occasions written
@@ -664,10 +620,9 @@ fn grouped_dw_groups_by_key_not_by_contiguous_run() {
         r.iwres = iwres;
         r
     };
-    for (occ, times) in [
-        (vec![1, 2, 1, 2], vec![0.0, 0.0, 1.0, 1.0]),
-        (vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]),
-    ] {
+    for (occ, times) in
+        [(vec![1, 2, 1, 2], vec![0.0, 0.0, 1.0, 1.0]), (vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0])]
+    {
         assert!(
             !occasions_run_in_time(&pop_of(occ.clone(), times).subjects[0]),
             "{occ:?} must be parallel, or the key is never read"
@@ -682,11 +637,7 @@ fn grouped_dw_groups_by_key_not_by_contiguous_run() {
         &[res_of(vec![1.0, 2.0, -1.0, 3.0])],
     );
     assert!(interleaved.1.is_finite() && contiguous.1.is_finite());
-    assert!(
-        (contiguous.1 - 17.0 / 7.5).abs() < 1e-12,
-        "contiguous: {}",
-        contiguous.1
-    );
+    assert!((contiguous.1 - 17.0 / 7.5).abs() < 1e-12, "contiguous: {}", contiguous.1);
     assert_eq!(interleaved.1.to_bits(), contiguous.1.to_bits());
     assert_eq!(interleaved.0.to_bits(), contiguous.0.to_bits());
 }
@@ -724,21 +675,13 @@ fn grouped_dw_keys_on_occasion_and_block_together() {
     let res = [res];
     let occ = vec![1, 1, 1, 1, 2, 2, 2, 2];
     let grp = vec![0, 0, 1, 1, 0, 0, 1, 1];
-    assert!(!occasions_run_in_time(
-        &pop_of(occ.clone(), grp.clone()).subjects[0]
-    ));
+    assert!(!occasions_run_in_time(&pop_of(occ.clone(), grp.clone()).subjects[0]));
     let both = grouped_iwres_autocorrelation(&pop_of(occ.clone(), grp.clone()), &res).1;
     let occ_only = grouped_iwres_autocorrelation(&pop_of(occ, vec![]), &res).1;
     let grp_only = grouped_iwres_autocorrelation(&pop_of(vec![], grp), &res).1;
     assert!(both.is_finite() && occ_only.is_finite() && grp_only.is_finite());
-    assert!(
-        (occ_only - 11.0 / 21.5).abs() < 1e-12,
-        "occasion only: {occ_only}"
-    );
-    assert!(
-        (grp_only - 19.0 / 17.5).abs() < 1e-12,
-        "block only: {grp_only}"
-    );
+    assert!((occ_only - 11.0 / 21.5).abs() < 1e-12, "occasion only: {occ_only}");
+    assert!((grp_only - 19.0 / 17.5).abs() < 1e-12, "block only: {grp_only}");
     assert!(
         (both - 9.0 / 12.5).abs() < 1e-12,
         "(occasion, block): {both}, occasion alone {occ_only}, block alone {grp_only}"
@@ -781,18 +724,10 @@ fn occasions_in_time_still_split_at_residual_blocks() {
     let no_occ = grouped_iwres_autocorrelation(&pop_of(vec![], running), &res);
     let parallel = grouped_iwres_autocorrelation(&pop_of(occ, restarting), &res);
     assert!(in_time.1.is_finite() && no_occ.1.is_finite() && parallel.1.is_finite());
-    assert!(
-        (in_time.1 - 19.0 / 17.5).abs() < 1e-12,
-        "block only: {}",
-        in_time.1
-    );
+    assert!((in_time.1 - 19.0 / 17.5).abs() < 1e-12, "block only: {}", in_time.1);
     assert_eq!(in_time.1.to_bits(), no_occ.1.to_bits());
     assert_eq!(in_time.0.to_bits(), no_occ.0.to_bits());
-    assert!(
-        (parallel.1 - 9.0 / 12.5).abs() < 1e-12,
-        "(occasion, block): {}",
-        parallel.1
-    );
+    assert!((parallel.1 - 9.0 / 12.5).abs() < 1e-12, "(occasion, block): {}", parallel.1);
 }
 
 /// T7b (#2829, plan amendment 1): the **whitened** statistic inherits the gate,
@@ -862,9 +797,7 @@ fn whitened_dw_joins_occasions_that_run_in_time() {
 }
 
 fn rows_population(
-    occasions: Vec<u32>,
-    obs_rgroup: Vec<u32>,
-    obs_times: Vec<f64>,
+    occasions: Vec<u32>, obs_rgroup: Vec<u32>, obs_times: Vec<f64>,
 ) -> crate::types::Population {
     let n = obs_times.len();
     crate::types::Population {
@@ -910,11 +843,7 @@ fn residual_blocks_in_time_are_one_series() {
     assert!((in_time.1 - 2.6).abs() < 1e-12, "in time: {}", in_time.1);
     assert_eq!(in_time.1.to_bits(), whole.1.to_bits());
     assert_eq!(in_time.0.to_bits(), whole.0.to_bits());
-    assert!(
-        (parallel.1 - 17.0 / 7.5).abs() < 1e-12,
-        "parallel: {}",
-        parallel.1
-    );
+    assert!((parallel.1 - 17.0 / 7.5).abs() < 1e-12, "parallel: {}", parallel.1);
     // The rule is the occasions' rule: a label that comes back is parallel, and one
     // block, or none, has nothing to split at.
     for (blocks, in_time) in [
@@ -924,11 +853,7 @@ fn residual_blocks_in_time_are_one_series() {
         (vec![], true),
     ] {
         let pop = rows_population(vec![], blocks.clone(), vec![0.0, 1.0, 2.0, 3.0]);
-        assert_eq!(
-            residual_blocks_run_in_time(&pop.subjects[0]),
-            in_time,
-            "{blocks:?}"
-        );
+        assert_eq!(residual_blocks_run_in_time(&pop.subjects[0]), in_time, "{blocks:?}");
     }
 }
 
@@ -1090,12 +1015,60 @@ fn cross_block_dw_takes_only_pairs_that_join_blocks_in_time() {
     assert_eq!((pairs, dw.is_nan()), (0, true), "parallel blocks");
 
     let (pairs, dw) = run([1.0, 1.0, 2.0, 2.0], vec![1, 2, 1, 2], running.clone());
-    assert_eq!(
-        (pairs, dw.is_nan()),
-        (0, true),
-        "a parallel occasion boundary"
-    );
+    assert_eq!((pairs, dw.is_nan()), (0, true), "a parallel occasion boundary");
 
     let (pairs, dw) = run([1.0; 4], vec![], running);
     assert_eq!((pairs, dw.is_nan()), (0, true), "one block");
+}
+
+/// `r_matrix_g`'s coupling blocks (#3060) are the serial groups, read from the data and not
+/// from row adjacency (the arms are interleaved), and every entry between two blocks is the
+/// structural zero the blocked factorisation skips — for each kind. Dies on: blocks taken as
+/// contiguous runs, a block spanning the two arms, a pair written into `R` without being
+/// joined (an off-block entry that is not zero), and an unassigned population (`R` all `NaN`)
+/// split into blocks instead of left one.
+#[test]
+fn r_matrix_g_blocks_are_the_serial_groups() {
+    let subject = Subject {
+        obs_times: times(),
+        obs_raw_times: times(),
+        obs_rgroup: rgroup(),
+        observations: vec![1.0; 6],
+        obs_cmts: vec![1; 6],
+        ..Default::default()
+    };
+    let loadings = |j: usize| vec![(0usize, IPREDS[j]), (1usize, WEIGHTS[j])];
+    for kind in [ResidualSerialKind::Cs, ResidualSerialKind::Ar1, ResidualSerialKind::Car1] {
+        let (r, blk) =
+            r_matrix_g(loadings, 6, &subject, &SIGMA, cov(kind, 0.4), |_| 0.0, Some(0.4));
+        for j in 0..6 {
+            let want: Vec<usize> = (0..6).filter(|&k| ROWS[k].0 == ROWS[j].0).collect();
+            assert_eq!(blk.rows(j), &want[..], "{kind:?}: row {j}'s block");
+            for k in 0..6 {
+                assert_eq!(blk.same(j, k), ROWS[j].0 == ROWS[k].0, "{kind:?}: ({j}, {k})");
+                if !blk.same(j, k) {
+                    assert_eq!(r[j][k].to_bits(), 0.0f64.to_bits(), "{kind:?}: R[{j}][{k}]");
+                } else {
+                    assert!(r[j][k] != 0.0, "{kind:?}: R[{j}][{k}] is coupled");
+                }
+            }
+        }
+    }
+    // No serial term: every row its own block.
+    let plain = ResidualCov { pairs: &[], serial: None };
+    let (_, blk) = r_matrix_g(loadings, 6, &subject, &SIGMA, plain, |_| 0.0, None);
+    assert!((0..6).all(|j| blk.rows(j) == [j]));
+    // Rows never given their blocks: `R` is all `NaN`, one block (nothing is skipped).
+    let unassigned = Subject { obs_rgroup: Vec::new(), ..subject };
+    let (r, blk) = r_matrix_g(
+        loadings,
+        6,
+        &unassigned,
+        &SIGMA,
+        cov(ResidualSerialKind::Cs, 0.4),
+        |_| 0.0,
+        Some(0.4),
+    );
+    assert!(r.iter().flatten().all(|v| v.is_nan()));
+    assert!((0..6).all(|j| blk.rows(j) == [0, 1, 2, 3, 4, 5]));
 }

@@ -85,10 +85,7 @@ fn population() -> ferx_core::types::Population {
 /// once. The OFV must match NONMEM's to within cross-engine FOCEI tolerance —
 /// validating the per-CMT likelihood independent of either optimizer.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn objective_matches_nonmem_at_reference_params() {
     // Same structural model as examples/pkpd_nonmem.ferx, parameters FIXed at
     // NONMEM's MLE (sigmas on the SD scale that ferx reports).
@@ -150,10 +147,7 @@ fn objective_matches_nonmem_at_reference_params() {
 /// SDs, and the ETA_CL variance (OMEGA) close to NONMEM. The OMEGA check is the
 /// acceptance criterion for issue #99 (see the module note).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn fit_recovers_theta_and_per_cmt_sigma() {
     let model =
         parse_model_file(Path::new("examples/pkpd_nonmem.ferx")).expect("example must parse");
@@ -166,39 +160,19 @@ fn fit_recovers_theta_and_per_cmt_sigma() {
 
     let r = fit(&model, &pop, &model.default_params, &opts).expect("fit must converge");
 
-    let theta: std::collections::HashMap<&str, f64> = r
-        .theta_names
-        .iter()
-        .map(|s| s.as_str())
-        .zip(r.theta.iter().copied())
-        .collect();
+    let theta: std::collections::HashMap<&str, f64> =
+        r.theta_names.iter().map(|s| s.as_str()).zip(r.theta.iter().copied()).collect();
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
 
     // Fixed effects: within 5% of NONMEM.
-    assert!(
-        rel(theta["TVCL"], NM_TVCL) < 0.05,
-        "TVCL {:?}",
-        theta.get("TVCL")
-    );
-    assert!(
-        rel(theta["TVV"], NM_TVV) < 0.05,
-        "TVV {:?}",
-        theta.get("TVV")
-    );
-    assert!(
-        rel(theta["TVKE0"], NM_TVKE0) < 0.05,
-        "TVKE0 {:?}",
-        theta.get("TVKE0")
-    );
+    assert!(rel(theta["TVCL"], NM_TVCL) < 0.05, "TVCL {:?}", theta.get("TVCL"));
+    assert!(rel(theta["TVV"], NM_TVV) < 0.05, "TVV {:?}", theta.get("TVV"));
+    assert!(rel(theta["TVKE0"], NM_TVKE0) < 0.05, "TVKE0 {:?}", theta.get("TVKE0"));
 
     // Per-CMT residual SDs: within 12% of NONMEM (the crux of the per-CMT
     // feature — proportional on CMT=1, additive on CMT=2).
     let sd = |name: &str| -> f64 {
-        let i = r
-            .sigma_names
-            .iter()
-            .position(|s| s == name)
-            .expect("sigma present");
+        let i = r.sigma_names.iter().position(|s| s == name).expect("sigma present");
         r.sigma[i]
     };
     assert!(

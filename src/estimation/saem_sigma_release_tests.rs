@@ -93,13 +93,7 @@ fn dense_one_cpt_population(n: usize) -> Population {
     let times = [0.5_f64, 2.0, 6.0, 12.0, 24.0];
     population(
         (1..=n)
-            .map(|i| {
-                subject(
-                    i,
-                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                    &times,
-                )
-            })
+            .map(|i| subject(i, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], &times))
             .collect(),
     )
 }
@@ -193,9 +187,8 @@ fn sigma_log_se_inverts_the_combined_block() {
         );
     }
     // The confounding is real on this fixture, so the inverse is doing work.
-    for (k, (got, diag_only)) in [(se[0], 1.0 / i_pp.sqrt()), (se[1], 1.0 / i_aa.sqrt())]
-        .into_iter()
-        .enumerate()
+    for (k, (got, diag_only)) in
+        [(se[0], 1.0 / i_pp.sqrt()), (se[1], 1.0 / i_aa.sqrt())].into_iter().enumerate()
     {
         assert!(
             got > 1.05 * diag_only,
@@ -231,10 +224,7 @@ fn sigma_mstep_sa_steps_releases_only_identified_components_in_exploration() {
     assert_eq!(capped, SIGMA_SA_MAX_STEP);
 
     // Exploration, damping off: the identified components are assigned.
-    assert_eq!(
-        sigma_mstep_sa_steps(1.0, 1.0, true, Some(&se), 4),
-        vec![1.0, 1.0, capped, capped]
-    );
+    assert_eq!(sigma_mstep_sa_steps(1.0, 1.0, true, Some(&se), 4), vec![1.0, 1.0, capped, capped]);
     // Never faster than θ: with `mstep_damping` binding, released == γ_mstep.
     assert_eq!(
         sigma_mstep_sa_steps(1.0, 0.5, true, Some(&se), 4),
@@ -245,20 +235,11 @@ fn sigma_mstep_sa_steps_releases_only_identified_components_in_exploration() {
         vec![MSTEP_SA_MAX_STEP_IIV_ON_RUV; 4]
     );
     // No SE (out of scope, singular, not computed): the #1445 schedule exactly.
-    assert_eq!(
-        sigma_mstep_sa_steps(1.0, 1.0, true, None, 3),
-        vec![capped; 3]
-    );
+    assert_eq!(sigma_mstep_sa_steps(1.0, 1.0, true, None, 3), vec![capped; 3]);
     // Convergence: the hand-off cap stays on for every component, and the
     // decaying schedule is untouched past it.
-    assert_eq!(
-        sigma_mstep_sa_steps(1.0, 1.0, false, Some(&se), 4),
-        vec![capped; 4]
-    );
-    assert_eq!(
-        sigma_mstep_sa_steps(1.0 / 6.0, 1.0, false, Some(&se), 4),
-        vec![1.0 / 6.0; 4]
-    );
+    assert_eq!(sigma_mstep_sa_steps(1.0, 1.0, false, Some(&se), 4), vec![capped; 4]);
+    assert_eq!(sigma_mstep_sa_steps(1.0 / 6.0, 1.0, false, Some(&se), 4), vec![1.0 / 6.0; 4]);
 }
 
 /// One-compartment IV with a **no-ETA** `TVV` — so the numerical θ/σ M-step
@@ -288,21 +269,13 @@ fn release_fit_population(model: &CompiledModel) -> Population {
     let times = [0.5_f64, 1.0, 2.0, 6.0, 12.0, 24.0];
     let mut pop = population(
         (1..=30)
-            .map(|i| {
-                subject(
-                    i,
-                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                    &times,
-                )
-            })
+            .map(|i| subject(i, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], &times))
             .collect(),
     );
     let mut scratch = EventPkParams::default();
     let mut st = 0x1464_u64;
     let mut next = || {
-        st = st
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
+        st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
         ((st >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     };
     for s in pop.subjects.iter_mut() {
@@ -347,9 +320,8 @@ fn a_well_identified_sigma_is_released_in_a_production_fit() {
     opts.saem_n_convergence = 1;
     opts.saem_seed = Some(1464);
     opts.run_covariance_step = false;
-    let sigma = crate::api::fit(&model, &pop, &model.default_params, &opts)
-        .expect("SAEM Ok")
-        .sigma[0];
+    let sigma =
+        crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok").sigma[0];
     assert!(sigma.is_finite(), "σ = {sigma}");
     assert!(
         sigma < 0.3,
@@ -357,10 +329,7 @@ fn a_well_identified_sigma_is_released_in_a_production_fit() {
          {RELEASE_FIT_TRUE_PROP}: the capped schedule leaves σ ≥ 0.64, so the \
          release did not reach this fit"
     );
-    assert!(
-        sigma > 0.5 * RELEASE_FIT_TRUE_PROP,
-        "σ = {sigma} overshot to below half its truth"
-    );
+    assert!(sigma > 0.5 * RELEASE_FIT_TRUE_PROP, "σ = {sigma} overshot to below half its truth");
 }
 
 /// The release is gated to the scope the information is defined on, and an
@@ -393,10 +362,7 @@ fn the_release_scope_excludes_iiv_on_ruv_and_every_numerical_mstep_gap() {
 ",
     )
     .expect("iiv_on_ruv fixture parses");
-    assert!(
-        ruv.residual_error_eta.is_some(),
-        "fixture must carry iiv_on_ruv"
-    );
+    assert!(ruv.residual_error_eta.is_some(), "fixture must carry iiv_on_ruv");
     assert!(sigma_cap_release_scope_gap(&ruv, None).is_some());
 }
 
@@ -425,9 +391,7 @@ const SPARSE_1445_MODEL: &str = r"
 fn sparse_1445_population(n: usize) -> Population {
     let mut st: u64 = 0x1445_0000_beef;
     let mut next = || {
-        st = st
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
+        st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
         ((st >> 33) as f64) / ((1u64 << 31) as f64)
     };
     population(

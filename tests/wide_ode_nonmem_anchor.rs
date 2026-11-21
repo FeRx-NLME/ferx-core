@@ -68,46 +68,18 @@ const THETA_NAMES: [&str; 4] = ["TVBAS", "TVMTT", "TVSLOPE", "TVGAM"];
 fn model_at_nonmem_optimum() -> String {
     let src = std::fs::read_to_string(MODEL_FILE).expect("anchor model file");
     let swaps = [
-        (
-            "theta TVBAS(4, 0.1, 100)",
-            format!("theta TVBAS({}, 0.1, 100)", NM_THETA[0]),
-        ),
-        (
-            "theta TVMTT(80, 1, 1000)",
-            format!("theta TVMTT({}, 1, 1000)", NM_THETA[1]),
-        ),
-        (
-            "theta TVSLOPE(0.06, 0.0001, 10)",
-            format!("theta TVSLOPE({}, 0.0001, 10)", NM_THETA[2]),
-        ),
-        (
-            "theta TVGAM(0.25, 0.01, 2)",
-            format!("theta TVGAM({}, 0.01, 2)", NM_THETA[3]),
-        ),
-        (
-            "omega ETA_BAS   ~ 0.05",
-            format!("omega ETA_BAS   ~ {}", NM_OMEGA[0]),
-        ),
-        (
-            "omega ETA_MTT   ~ 0.05",
-            format!("omega ETA_MTT   ~ {}", NM_OMEGA[1]),
-        ),
-        (
-            "omega ETA_SLOPE ~ 0.05",
-            format!("omega ETA_SLOPE ~ {}", NM_OMEGA[2]),
-        ),
-        (
-            "sigma PROP_ERR ~ 0.04",
-            format!("sigma PROP_ERR ~ {NM_SIGMA_VAR}"),
-        ),
+        ("theta TVBAS(4, 0.1, 100)", format!("theta TVBAS({}, 0.1, 100)", NM_THETA[0])),
+        ("theta TVMTT(80, 1, 1000)", format!("theta TVMTT({}, 1, 1000)", NM_THETA[1])),
+        ("theta TVSLOPE(0.06, 0.0001, 10)", format!("theta TVSLOPE({}, 0.0001, 10)", NM_THETA[2])),
+        ("theta TVGAM(0.25, 0.01, 2)", format!("theta TVGAM({}, 0.01, 2)", NM_THETA[3])),
+        ("omega ETA_BAS   ~ 0.05", format!("omega ETA_BAS   ~ {}", NM_OMEGA[0])),
+        ("omega ETA_MTT   ~ 0.05", format!("omega ETA_MTT   ~ {}", NM_OMEGA[1])),
+        ("omega ETA_SLOPE ~ 0.05", format!("omega ETA_SLOPE ~ {}", NM_OMEGA[2])),
+        ("sigma PROP_ERR ~ 0.04", format!("sigma PROP_ERR ~ {NM_SIGMA_VAR}")),
     ];
     let mut out = src;
     for (from, to) in swaps {
-        assert_eq!(
-            out.matches(from).count(),
-            1,
-            "anchor model line not found: {from}"
-        );
+        assert_eq!(out.matches(from).count(), 1, "anchor model line not found: {from}");
         out = out.replace(from, &to);
     }
     out
@@ -165,10 +137,7 @@ fn wide_ode_model_matches_nonmem_at_their_optimum() {
         "#1661: a model past 12 individual parameters must take the analytic inner route"
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
+        !result.warnings.iter().any(|w| w.contains("finite-difference")),
         "no subject may fall back to FD: {:?}",
         result.warnings
     );
@@ -176,11 +145,7 @@ fn wide_ode_model_matches_nonmem_at_their_optimum() {
     // Measured: ferx 95.685276 against NONMEM 95.685257, a gap of 1.9e-5. The bound
     // keeps ~50× headroom over that, and stays far below a single subject's EBE being
     // left short: on the reported model the FD inner loop cost 1–118 per subject.
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - NM_OFV).abs() < 1e-3,
         "ferx OFV {:.6} at NONMEM's optimum vs NONMEM {NM_OFV:.6}",

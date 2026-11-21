@@ -1,6 +1,125 @@
 use super::*;
 use std::collections::HashMap;
 
+/// The `ModelParameters` of [`bare_model`]'s shape at `omega`: θ `TVCL = 5`, `TVV = 50`
+/// (bounds `[0.1, 50]`, `[5, 500]`), one proportional σ `PROP_ERR = 0.05`, nothing fixed,
+/// no IOV, mixture or residual correlation. A base for struct-update test literals.
+pub(crate) fn bare_params(omega: OmegaMatrix) -> ModelParameters {
+    ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
+        theta: vec![5.0, 50.0],
+        theta_names: vec!["TVCL".into(), "TVV".into()],
+        theta_lower: vec![0.1, 5.0],
+        theta_upper: vec![50.0, 500.0],
+        theta_fixed: vec![false; 2],
+        omega,
+        omega_fixed: vec![false],
+        sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
+        sigma_fixed: vec![false],
+        omega_iov: None,
+        kappa_fixed: Vec::new(),
+        mixture: None,
+    }
+}
+
+/// A one-state ODE spec (`central`, read out at observation compartment 0) around `rhs`,
+/// with default solver options and no inputs, init, diffusion or compiled programs. A base
+/// for struct-update test literals.
+pub(crate) fn bare_ode(rhs: crate::ode::solver::OdeRhsFn) -> crate::ode::OdeSpec {
+    use crate::ode::{OdeReadout, OdeSolverOptions};
+    crate::ode::OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs,
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        init_fn: None,
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// A minimal 1-cpt IV, proportional-error `CompiledModel` — θ `TVCL`/`TVV`, one η on CL, one
+/// ε, analytic, no covariates — at `default_params`, every optional part absent and a
+/// `pk_param_fn` that returns default parameters. The base test literals extend with struct
+/// update syntax, naming only the fields they change:
+///
+/// ```ignore
+/// CompiledModel { pk_param_fn: Box::new(..), ..crate::types::test_helpers::bare_model(params) }
+/// ```
+pub(crate) fn bare_model(default_params: ModelParameters) -> CompiledModel {
+    CompiledModel {
+        plan_id: Default::default(),
+        residual_serial: None,
+        priors: Vec::new(),
+        prior_from_fit: None,
+        covariate_model: None,
+        name: "test".into(),
+        pk_model: PkModel::OneCptIv,
+        error_model: ErrorModel::Proportional,
+        error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+        residual_correlations: Vec::new(),
+        pk_param_fn: Box::new(|_, _, _, _| PkParams::default()),
+        n_theta: 2,
+        n_eta: 1,
+        n_epsilon: 1,
+        n_kappa: 0,
+        theta_names: vec!["TVCL".into(), "TVV".into()],
+        eta_names: vec!["ETA_CL".into()],
+        kappa_names: Vec::new(),
+        indiv_param_names: vec!["CL".into(), "V".into()],
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        default_params,
+        omega_init_as_sd: vec![false],
+        sigma_init_as_sd: vec![false],
+        kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
+        mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
+        kappa_mu_refs: HashMap::new(),
+        tv_fn: None,
+        pk_indices: vec![0, 1],
+        eta_map: vec![0],
+        pk_idx_f64: vec![0.0, 1.0],
+        sel_flat: vec![1.0, 0.0],
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
+        ode_spec: None,
+        dose_attr_map: Default::default(),
+        bloq_method: BloqMethod::Drop,
+        referenced_covariates: Vec::new(),
+        gradient_method: GradientMethod::Fd,
+        parse_warnings: Vec::new(),
+        has_conditional_eta_params: false,
+        eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
+        theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
+        #[cfg(feature = "nn")]
+        covariate_nns: Vec::new(),
+        scaling: ScalingSpec::None,
+        log_transform: false,
+        dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::BTreeMap::new(),
+        frem_config: None,
+        residual_error_eta: None,
+        analytical_init: Vec::new(),
+        analytic_readout: None,
+        ruv_magnitude: None,
+        absorption_ode_equivalent: None,
+        mixture: None,
+    }
+}
+
 /// Build an analytical-PK model (`tv_fn = Some`, `ode_spec = None`).
 pub(crate) fn analytical_model(gradient_method: GradientMethod) -> CompiledModel {
     make_compiled_model(false, gradient_method)
@@ -29,109 +148,45 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
-        name: "test".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Additive,
         error_spec: ErrorSpec::Single(ErrorModel::Additive),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(|_, _, _, _| PkParams::default()),
         n_theta: 1,
-        n_eta: 1,
-        n_epsilon: 1,
-        n_kappa: 0,
         theta_names: vec!["CL".into()],
-        eta_names: vec!["ETA_CL".into()],
-        kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
-        default_params: ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
+        // Analytical models populate tv_fn; ODE models leave it None.
+        tv_fn: if with_ode { None } else { Some(Box::new(|_t, _c| vec![1.0])) },
+        pk_indices: vec![],
+        eta_map: vec![],
+        pk_idx_f64: vec![],
+        sel_flat: vec![],
+        ode_spec: if with_ode {
+            Some(crate::ode::OdeSpec {
+                n_states: 2,
+                state_names: vec!["depot".into(), "central".into()],
+                readout: crate::ode::OdeReadout::ObsCmt(0),
+                solver_opts: crate::ode::OdeSolverOptions::default(),
+                ..crate::types::test_helpers::bare_ode(Box::new(|_y, _p, _t, _dy| {}))
+            })
+        } else {
+            None
+        },
+        referenced_covariates: vec![],
+        gradient_method,
+        ..crate::types::test_helpers::bare_model(ModelParameters {
             theta: vec![1.0],
             theta_names: vec!["CL".into()],
             theta_lower: vec![0.0],
             theta_upper: vec![f64::INFINITY],
             theta_fixed: vec![false],
-            omega: OmegaMatrix::from_diagonal(&[0.1], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["EPS".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
-        },
-        omega_init_as_sd: vec![false],
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        // Analytical models populate tv_fn; ODE models leave it None.
-        tv_fn: if with_ode {
-            None
-        } else {
-            Some(Box::new(|_t, _c| vec![1.0]))
-        },
-        pk_indices: vec![],
-        eta_map: vec![],
-        pk_idx_f64: vec![],
-        sel_flat: vec![],
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        ode_spec: if with_ode {
-            Some(crate::ode::OdeSpec {
-                chz_state_slots: Vec::new(),
-                rhs: Box::new(|_y, _p, _t, _dy| {}),
-                n_states: 2,
-                state_names: vec!["depot".into(), "central".into()],
-                readout: crate::ode::OdeReadout::ObsCmt(0),
-                diffusion_var: Vec::new(),
-                init_fn: None,
-                solver_opts: crate::ode::OdeSolverOptions::default(),
-                input_rate: Vec::new(),
-                rhs_program: None,
-                readout_program: None,
-                indiv_param_program: None,
-                dose_attr_map: Default::default(),
-            })
-        } else {
-            None
-        },
-        dose_attr_map: Default::default(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: vec![],
-        gradient_method,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+            sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[0.1],
+                vec!["ETA_CL".into()],
+            ))
+        })
     }
 }
 
@@ -145,35 +200,12 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
 /// simulated replicates is residual error, which keeps NPD deterministic.
 pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
     let params = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
-        theta: vec![5.0, 50.0],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        theta_lower: vec![0.1, 5.0],
-        theta_upper: vec![50.0, 500.0],
-        theta_fixed: vec![false; 2],
-        omega: OmegaMatrix::from_diagonal(&[], vec![]),
         omega_fixed: Vec::new(),
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(&[], vec![]))
     };
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "tv_cov_iv".into(),
-        pk_model: PkModel::OneCptIv,
-        error_model: ErrorModel::Proportional,
         error_spec: ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(
             |theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
                 let mut p = PkParams::default();
@@ -183,67 +215,22 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
                 p
             },
         ),
-        n_theta: 2,
         n_eta: 0,
-        n_epsilon: 1,
-        n_kappa: 0,
-        kappa_names: Vec::new(),
-        theta_names: vec!["TVCL".into(), "TVV".into()],
         eta_names: Vec::new(),
-        indiv_param_names: vec!["CL".into(), "V".into()],
         indiv_param_partials: IndivParamPartials::empty(),
-        default_params: params.clone(),
         omega_init_as_sd: Vec::new(),
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
         eta_map: Vec::new(),
-        pk_idx_f64: vec![0.0, 1.0],
         sel_flat: Vec::new(),
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
         referenced_covariates: vec!["WT".into()],
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(params.clone())
     };
 
     let mut baseline_cov = HashMap::new();
     baseline_cov.insert("WT".to_string(), 70.0);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "TVCOV".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0, 0.0],
         obs_cmts: vec![1, 1, 1],
         covariates: baseline_cov,
@@ -253,24 +240,10 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
             HashMap::from([("WT".to_string(), 140.0)]),
             HashMap::from([("WT".to_string(), 210.0)]),
         ],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     (model, subject)
 }
@@ -298,8 +271,8 @@ pub(crate) fn empty_fit_result() -> FitResult {
         covariance_wall_time_secs: 0.0,
         converged: false,
         ofv: 0.0,
-        aic: 0.0,
-        bic: 0.0,
+        aic: Some(0.0),
+        bic: Some(0.0),
         theta: Vec::new(),
         theta_names: Vec::new(),
         eta_names: Vec::new(),
@@ -334,6 +307,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,
+        saem_objective: None,
         impmap_trace: None,
         bayes: None,
         vi: None,
@@ -352,6 +326,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         gradient_method_inner: String::new(),
         gradient_method_outer: String::new(),
         uses_ode_solver: false,
@@ -449,29 +424,17 @@ pub(crate) fn empty_fit_result() -> FitResult {
 pub(crate) fn minimal_fit_result() -> FitResult {
     let n_eta = 2;
     FitResult {
-        ofv_data: 0.0,
-        ofv_prior: 0.0,
-        prior_summary: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
-        se_residual_correlations: None,
-        covariate_relations: Vec::new(),
-        restored_from_checkpoint: false,
-        method: EstimationMethod::FoceI,
-        method_chain: vec![EstimationMethod::FoceI],
         method_wall_times_secs: vec![1.234],
-        covariance_wall_time_secs: 0.0,
         converged: true,
         ofv: 100.0,
-        aic: 110.0,
-        bic: 115.0,
+        aic: Some(110.0),
+        bic: Some(115.0),
         theta: vec![1.0, 2.0, 0.5],
         theta_names: vec!["CL".into(), "V".into(), "KA".into()],
         eta_names: vec!["eta_CL".into(), "eta_V".into()],
         omega: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
         sigma: vec![0.05],
         sigma_names: vec!["prop".into()],
-        residual_correlations: Vec::new(),
-        error_model: ErrorModel::Proportional,
         covariance_matrix: Some(DMatrix::<f64>::identity(3, 3)),
         se_theta: Some(vec![0.01, 0.02, 0.005]),
         se_omega: Some(vec![0.01, 0.02]),
@@ -489,61 +452,28 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         interaction: true,
         warnings: vec!["watch out".into()],
         warnings_structured: vec![crate::types::classify_warning("watch out")],
-        sir_ci_theta: None,
-        sir_ci_omega: None,
-        sir_ci_sigma: None,
-        sir_ci_kappa: None,
-        sir_ess: None,
-        sir_resamples_packed: None,
-        importance_sampling: None,
-        impmap_trace: None,
-        bayes: None,
-        vi: None,
-        omega_iov: None,
         kappa_names: vec![],
         kappa_fixed: vec![],
         kappa_init_as_sd: vec![],
-        kappa_weights: Vec::new(),
-        kappa_weight_typical: Vec::new(),
-        se_kappa: None,
         shrinkage_kappa: vec![],
         shrinkage_kappa_by_occ: vec![],
         ebe_kappas: vec![],
-        kappa_levels: Vec::new(),
-        ebe_kappas_by_level: Vec::new(),
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
         gradient_method_inner: "analytic".into(),
         gradient_method_outer: "finite differences".into(),
-        uses_ode_solver: false,
-        ode_linear_exact: false,
-        uses_sde: false,
         n_threads_used: 4,
         nlopt_missing_algorithms: vec![],
-        covariance_n_evals_estimated: None,
-        trace_path: None,
-        trace_csv: None,
-        cov_fixed: Vec::new(),
-        interface_extras: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
         covariance_status: CovarianceStatus::Computed,
         // This fixture carries a covariance matrix, so it carries the estimator
         // that produced it — the `Some(matrix) ⟺ Some(method)` pairing #1382
         // introduced holds for hand-built fixtures too.
         covariance_method: Some(crate::types::CovarianceMethod::Hessian),
         shrinkage_eta: vec![0.1, 0.15],
-        cond_dist: None,
         shrinkage_eps: 0.05,
         iwres_lag1_r: 0.12,
         dw_statistic: 1.75,
         wall_time_secs: 1.234,
         model_name: "test_model".into(),
         ferx_version: "0.1.0".into(),
-        environment: crate::environment::detect(),
         eta_param_info: vec![
             EtaParamInfo {
                 eta_name: "eta_CL".into(),
@@ -558,69 +488,23 @@ pub(crate) fn minimal_fit_result() -> FitResult {
                 individual_param_name: "V".into(),
             },
         ],
-        kappa_param_types: Vec::new(),
-        data_bindings: Default::default(),
-        theta_transform: vec![
-            ThetaTransform::Log,
-            ThetaTransform::Log,
-            ThetaTransform::Log,
-        ],
+        theta_transform: vec![ThetaTransform::Log, ThetaTransform::Log, ThetaTransform::Log],
         sigma_types: vec![SigmaType::Proportional],
         cov_eigenvalues: Some(vec![1.0, 0.5, 0.2]),
         cov_condition_number: Some(5.0),
-        bic_inputs: BicInputs::default(),
-        profiled_blocks: Vec::new(),
-        profiled_levels_at_bound: Vec::new(),
-        held_at_bound: Vec::new(),
         eta_log_transformed: vec![true, true],
-        omega_param_corr: None,
-        omega_iov_param_corr: None,
-        model_path: None,
-        data_path: None,
-        model_hash: None,
-        data_hash: None,
-        model_text: None,
-        reader_settings: None,
-        population_fingerprint: None,
-        iov_occasion: None,
         theta_init: vec![1.0, 2.0, 0.5],
         omega_init: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
         sigma_init: vec![0.05],
         obs_time_range: Some((0.25, 24.0)),
-        final_gradient: None,
-        final_gradient_source: None,
         optimizer: "slsqp".to_string(),
-        n_starts: 1,
-        multi_start_seed: None,
-        starts: Vec::new(),
-        saem_seed: None,
-        sir_seed: None,
-        sir_settings: None,
-        scoring_settings: None,
-        imp_seed: None,
-        npde_seed: None,
         bloq_method: "drop".to_string(),
         outer_maxiter: 300,
         outer_gtol: 1e-4,
-        inits_from_nca: None,
         covariate_names: vec!["WT".into(), "AGE".into()],
         input_columns: vec![],
-        #[cfg(feature = "nn")]
-        neural_networks: Vec::new(),
-        covariate_table: None,
-        exclusions: None,
-        packed_estimate: None,
-        mixture_overrides: None,
-        mixture_override_params: Vec::new(),
-        se_mixture_overrides: None,
-        left_init: None,
-        stationary_start: false,
         omega_is_diagonal: Some(true),
-        kappa_is_diagonal: None,
-        newton_decrement: None,
-        optimizer_stop: None,
-        eval_budget_spent: false,
-        evaluation_only: false,
+        ..empty_fit_result()
     }
 }
 
@@ -691,11 +575,7 @@ pub(crate) fn param_time_straddle_subject(kind: ParamTimeStraddle) -> Subject {
             s.pk_only_times = vec![moved];
             s.pk_only_raw_times = vec![24.0];
             s.pk_only_occasions = vec![1];
-            (
-                vec![6.0, 12.0, 30.0, 36.0],
-                vec![6.0, 12.0, 30.0, 36.0],
-                vec![1, 1, 2, 2],
-            )
+            (vec![6.0, 12.0, 30.0, 36.0], vec![6.0, 12.0, 30.0, 36.0], vec![1, 1, 2, 2])
         }
         ParamTimeStraddle::Reset => {
             s.doses = vec![bolus(0.0), bolus(50.0), bolus(74.0)];

@@ -15,11 +15,7 @@ fn result(id: &str) -> CandidateResult {
         fit: Some(converged_fit(12.0)),
         ofv: Some(12.0),
         converged: Some(true),
-        verdict: StrictnessVerdict {
-            passed: true,
-            failures: vec![],
-            skipped: vec![],
-        },
+        verdict: StrictnessVerdict { passed: true, failures: vec![], skipped: vec![] },
         criterion: 17.0,
         seconds: 2.5,
         error: None,
@@ -30,12 +26,8 @@ fn result(id: &str) -> CandidateResult {
 
 fn rows(dir: &std::path::Path) -> Vec<Vec<String>> {
     let mut reader = csv::Reader::from_path(table_path(dir)).expect("candidates.csv");
-    let header: Vec<String> = reader
-        .headers()
-        .expect("header")
-        .iter()
-        .map(str::to_string)
-        .collect();
+    let header: Vec<String> =
+        reader.headers().expect("header").iter().map(str::to_string).collect();
     let mut out = vec![header];
     for record in reader.records() {
         out.push(record.expect("row").iter().map(str::to_string).collect());
@@ -145,11 +137,7 @@ fn a_cancelled_runs_partial_table_does_not_replace_a_complete_one() {
     write_table(dir.path(), &complete).expect("write");
     write_partial_table(dir.path(), &[result("a")]).expect("write partial");
 
-    assert_eq!(
-        rows(dir.path()).len(),
-        4,
-        "the complete table was rewritten"
-    );
+    assert_eq!(rows(dir.path()).len(), 4, "the complete table was rewritten");
     let mut reader =
         csv::Reader::from_path(partial_table_path(dir.path())).expect("candidates.partial.csv");
     assert_eq!(reader.records().count(), 1);

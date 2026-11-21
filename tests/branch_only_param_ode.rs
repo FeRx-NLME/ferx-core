@@ -134,10 +134,7 @@ fn assert_branch_matches_top_level(wt: f64) {
             any_positive = true;
         }
     }
-    assert!(
-        any_positive,
-        "all predictions were zero (WT={wt}) — model is degenerate"
-    );
+    assert!(any_positive, "all predictions were zero (WT={wt}) — model is degenerate");
 }
 
 #[test]
@@ -193,12 +190,8 @@ fn unused_branch_f_does_not_hijack_bioavailability() {
     // place. Predictions must equal the model without the F block. If `F` were
     // promoted it would land in PK_IDX_F = 0.5, halving the delivered dose and
     // halving every prediction.
-    let top = parse_full_model(TOP_LEVEL)
-        .expect("top-level model did not parse")
-        .model;
-    let with_f = parse_full_model(UNUSED_BRANCH_F)
-        .expect("unused-F model did not parse")
-        .model;
+    let top = parse_full_model(TOP_LEVEL).expect("top-level model did not parse").model;
+    let with_f = parse_full_model(UNUSED_BRANCH_F).expect("unused-F model did not parse").model;
 
     let pop = population(80.0);
     let pt = predict(&top, &pop, &top.default_params).unwrap();
@@ -262,11 +255,7 @@ fn level_block_read_through_an_if_without_else_is_refused_at_parse() {
     let dir = tempfile::tempdir().expect("tempdir");
     let model_path = dir.path().join("m.ferx");
     let data_path = dir.path().join("d.csv");
-    write!(
-        std::fs::File::create(&model_path).unwrap(),
-        "{LEVEL_BLOCK_NO_ELSE}"
-    )
-    .unwrap();
+    write!(std::fs::File::create(&model_path).unwrap(), "{LEVEL_BLOCK_NO_ELSE}").unwrap();
     write!(std::fs::File::create(&data_path).unwrap(), "{data}").unwrap();
 
     let err = match ferx_core::run_model_with_data(
