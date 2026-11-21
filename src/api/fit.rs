@@ -286,6 +286,15 @@ pub fn fit_from_files(
     Ok(result)
 }
 
+/// The optimizer request handed to the outer loop by an estimation stage.
+pub(crate) fn stage_optimizer_request(method: EstimationMethod, requested: Optimizer) -> Optimizer {
+    if method == EstimationMethod::Laplace && requested == Optimizer::Auto {
+        Optimizer::NloptLbfgs
+    } else {
+        requested
+    }
+}
+
 /// The outer optimizer reported on `FitResult::optimizer`: the one that actually ran, and the
 /// optimizer `build_info::gradient_method_outer` is to report the outer gradient of.
 ///
@@ -325,7 +334,7 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Imp => fixed("imp-bobyqa"),
         _ => {
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_fit_optimizer(
-                options.optimizer,
+                stage_optimizer_request(method, options.optimizer),
                 model,
                 has_mixture,
                 crate::sens::provider::analytic_outer_gradient_available(model),
@@ -2518,9 +2527,7 @@ fn fit_inner(
         // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
         // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
         // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
-        if matches!(method, EstimationMethod::Laplace) && stage_opts.optimizer == Optimizer::Auto {
-            stage_opts.optimizer = Optimizer::NloptLbfgs;
-        }
+        stage_opts.optimizer = stage_optimizer_request(method, stage_opts.optimizer);
         // The **quadrature** methods need a tighter EBE than plain FOCE/FOCEI: their analytic
         // grid gradient assumes b̂ is exactly the mode (Bartlett identity), so a loose b̂ from
         // a poor start yields a non-descent direction that stalls the outer optimizer.

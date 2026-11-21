@@ -346,3 +346,31 @@ fn a_later_stage_is_judged_at_its_own_start() {
         result.warnings
     );
 }
+
+#[test]
+fn laplace_reports_its_stage_optimizer_and_gradient() {
+    use crate::build_info::{gradient_method_outer, GradientMethodKind, BUILD_INFO};
+
+    let mut model = parse(NO_MIXTURE);
+    assert_analytic_scope(&model);
+    let method = EstimationMethod::Laplace;
+    assert_eq!(
+        gradient_method_outer(&BUILD_INFO, method, Optimizer::Bobyqa, &model),
+        GradientMethodKind::NotApplicable
+    );
+
+    model.gradient_method = crate::types::GradientMethod::Fd;
+    let options = FitOptions {
+        method,
+        optimizer: Optimizer::Auto,
+        ..Default::default()
+    };
+    assert_eq!(
+        reported_optimizer_label(method, &options, &model, false, Vec::new),
+        ("auto (nlopt_lbfgs)".into(), Optimizer::NloptLbfgs)
+    );
+    assert_eq!(
+        gradient_method_outer(&BUILD_INFO, method, options.optimizer, &model),
+        GradientMethodKind::FiniteDifferences
+    );
+}
