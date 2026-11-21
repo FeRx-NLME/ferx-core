@@ -40,8 +40,9 @@
 //! `sim.horizon` unset `H` is the latest record and nothing is cut.
 
 use super::vpc_tte::{
-    check_band_options, horizon_and_cut, observed_rows, refuse, resolve_cmt, simulate_replicates,
-    stratum_grid, Entry, TteCensorRule, VpcCensoring, VpcStratify, VpcTteOptions,
+    check_band_options, empty_stratum_warning, horizon_and_cut, observed_rows, refuse, resolve_cmt,
+    simulate_replicates, stratum_grid, Entry, TteCensorRule, VpcCensoring, VpcStratify,
+    VpcTteOptions,
 };
 use crate::diagnostics::EngineError;
 use crate::stats::km::{kaplan_meier_mean_covariate, vpc_band_kmmc, KmmcCurve};
@@ -129,16 +130,15 @@ pub struct KmmcVpc {
     pub censoring: VpcCensoring,
     pub strata: Vec<KmmcVpcStratum>,
     /// `W_VPC_KMMC_TIME_VARYING_COVARIATE` when the covariate changes within a subject,
-    /// then the simulator's warnings.
+    /// then the simulator's warnings, then `W_VPC_EMPTY_STRATUM` per stratum with no band
+    /// at any grid time.
     pub warnings: Vec<String>,
 }
 
 /// Each observed row's covariate value, with the refusals for a subject that lacks
 /// the covariate and for a missing (non-finite) baseline.
 fn row_covariates(
-    rows_ids: &[&str],
-    by_id: &HashMap<&str, &Subject>,
-    name: &str,
+    rows_ids: &[&str], by_id: &HashMap<&str, &Subject>, name: &str,
 ) -> Result<Vec<f64>, EngineError> {
     let mut values = Vec::with_capacity(rows_ids.len());
     let mut missing: Vec<&str> = Vec::new();
@@ -175,26 +175,14 @@ fn curve_values(cov: &[f64], name: &str, level: Option<f64>) -> Result<Vec<f64>,
              asked for."
         )));
     }
-    Ok(cov
-        .iter()
-        .map(|v| {
-            if v.to_bits() == lv.to_bits() {
-                1.0
-            } else {
-                0.0
-            }
-        })
-        .collect())
+    Ok(cov.iter().map(|v| if v.to_bits() == lv.to_bits() { 1.0 } else { 0.0 }).collect())
 }
 
 /// `W_VPC_KMMC_TIME_VARYING_COVARIATE` when `name` changes within any of `subjects`.
 fn time_varying_warning<'a>(
-    subjects: impl Iterator<Item = &'a Subject>,
-    name: &str,
+    subjects: impl Iterator<Item = &'a Subject>, name: &str,
 ) -> Option<String> {
-    let n = subjects
-        .filter(|s| s.time_varying_covariate_names().iter().any(|c| c == name))
-        .count();
+    let n = subjects.filter(|s| s.time_varying_covariate_names().iter().any(|c| c == name)).count();
     (n > 0).then(|| {
         format!(
             "W_VPC_KMMC_TIME_VARYING_COVARIATE: covariate `{name}` changes over time in {n} \
@@ -220,10 +208,7 @@ fn time_varying_warning<'a>(
 /// such subject has, and stratifying on the covariate itself. Otherwise any `Err` the
 /// simulator returns.
 pub fn vpc_kmmc(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    opts: &VpcKmmcOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, opts: &VpcKmmcOptions,
 ) -> Result<KmmcVpc, EngineError> {
     let vpc = &opts.vpc;
     let name = opts.covariate.as_str();
@@ -245,17 +230,13 @@ pub fn vpc_kmmc(
     let cmt = resolve_cmt(WHO, model, vpc.cmt)?;
     let (mut rows, values, labels) = observed_rows(WHO, population, cmt, &vpc.stratify)?;
 
-    let by_id: HashMap<&str, &Subject> = population
-        .subjects
-        .iter()
-        .map(|s| (s.id.as_str(), s))
-        .collect();
+    let by_id: HashMap<&str, &Subject> =
+        population.subjects.iter().map(|s| (s.id.as_str(), s)).collect();
     let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
     let cov = row_covariates(&ids, &by_id, name)?;
     let vals = curve_values(&cov, name, opts.level)?;
-    let mut warnings: Vec<String> = time_varying_warning(ids.iter().map(|id| by_id[id]), name)
-        .into_iter()
-        .collect();
+    let mut warnings: Vec<String> =
+        time_varying_warning(ids.iter().map(|id| by_id[id]), name).into_iter().collect();
 
     let horizon = horizon_and_cut(&mut rows, vpc.sim.horizon);
     let n_strata = values.len();
@@ -301,14 +282,20 @@ pub fn vpc_kmmc(
         );
         let band = vpc_band_kmmc(&curves, &grid, probs, opts.min_at_risk)
             .map_err(|e| refuse(format!("{WHO}: {e}")))?;
+        warnings.extend(empty_stratum_warning(
+            WHO,
+            &label,
+            &grid,
+            &band.n_used,
+            probs,
+            curves.iter().map(|c| c.time.as_slice()),
+            Some((ot.len(), opts.min_at_risk)),
+        ));
         strata.push(KmmcVpcStratum {
             label,
             value,
             n_subjects: ot.len(),
-            obs_on_grid: grid
-                .iter()
-                .map(|&t| observed.at(t, opts.min_at_risk))
-                .collect(),
+            obs_on_grid: grid.iter().map(|&t| observed.at(t, opts.min_at_risk)).collect(),
             observed,
             grid,
             lo: band.lo,

@@ -61,28 +61,16 @@ struct ChainRecord {
 /// Every `DiscreteState` row on `cmt`, in record order. `Err(code)` on a DV code outside
 /// `state_codes` (refused before the fit by [`validate_dtmm_records`]).
 fn collect_states(
-    cmt: usize,
-    state_codes: &[usize],
-    records: &[ObsRecord],
+    cmt: usize, state_codes: &[usize], records: &[ObsRecord],
 ) -> Result<Vec<ChainRecord>, usize> {
     let mut out = Vec::new();
     for (idx, r) in records.iter().enumerate() {
-        if let ObsRecord::DiscreteState {
-            raw_time,
-            state,
-            cmt: c,
-            ..
-        } = r
-        {
+        if let ObsRecord::DiscreteState { raw_time, state, cmt: c, .. } = r {
             if *c != cmt {
                 continue;
             }
             match state_codes.iter().position(|&code| code == *state) {
-                Some(i) => out.push(ChainRecord {
-                    idx,
-                    raw_time: *raw_time,
-                    state: i,
-                }),
+                Some(i) => out.push(ChainRecord { idx, raw_time: *raw_time, state: i }),
                 None => return Err(*state),
             }
         }
@@ -94,9 +82,7 @@ fn collect_states(
 /// stochastic `n_states × n_states` matrix: every one finite and in `[0, 1]`, and every
 /// row's off-diagonals summing to at most 1 (so every stay probability is in `[0, 1]`).
 fn is_stochastic<T: crate::sens::num::PkNum>(
-    transitions: &[(usize, usize)],
-    probs: &[T],
-    n_states: usize,
+    transitions: &[(usize, usize)], probs: &[T], n_states: usize,
 ) -> bool {
     use crate::sens::num::BranchCmp::{Ge, Le};
     // Through the branch API: a recording type (#2786) guards each verdict.
@@ -117,10 +103,7 @@ fn is_stochastic<T: crate::sens::num::PkNum>(
 /// [`is_stochastic`]: the declared off-diagonal, or the filled-in stay probability. `None`
 /// when it is `≤ 0` — an observed step the parameters make impossible.
 fn step_probability<T: crate::sens::num::PkNum>(
-    transitions: &[(usize, usize)],
-    probs: &[T],
-    from: usize,
-    to: usize,
+    transitions: &[(usize, usize)], probs: &[T], from: usize, to: usize,
 ) -> Option<T> {
     use crate::sens::num::BranchCmp::{Gt, Lt};
     let one = T::from_f64(1.0);
@@ -135,21 +118,15 @@ fn step_probability<T: crate::sens::num::PkNum>(
         }
     }
     let p = if from == to { one - off_sum } else { p_to };
-    p.br_cmp_c(Gt, 0.0)
-        .then(|| T::select_if(Lt, p, one, p, one))
+    p.br_cmp_c(Gt, 0.0).then(|| T::select_if(Lt, p, one, p, one))
 }
 
 /// Negative DTMM log-likelihood for one subject on one `Dtmm` endpoint. Raw (positive);
 /// the caller applies the OFV-scale factor.
 #[allow(clippy::too_many_arguments)]
 fn dtmm_endpoint_nll(
-    subject: &Subject,
-    cmt: usize,
-    n_states: usize,
-    state_codes: &[usize],
-    transitions: &[(usize, usize)],
-    prob_fn: &crate::types::TransitionProbFn,
-    theta: &[f64],
+    subject: &Subject, cmt: usize, n_states: usize, state_codes: &[usize],
+    transitions: &[(usize, usize)], prob_fn: &crate::types::TransitionProbFn, theta: &[f64],
     eta: &[f64],
 ) -> f64 {
     let Ok(chain) = collect_states(cmt, state_codes, &subject.obs_records) else {
@@ -194,23 +171,15 @@ fn dtmm_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &Endpoi
 /// seam, so every FOCEI / IOV / SAEM / IMP path and the FD-Hessian closure score it with no
 /// dispatch edit of its own.
 pub(crate) fn dtmm_subject_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> f64 {
     if subject.obs_records.is_empty() {
         return 0.0;
     }
     let mut nll = 0.0;
     for (cmt, endpoint) in dtmm_endpoints(model) {
-        if let EndpointLikelihood::Dtmm {
-            n_states,
-            state_codes,
-            transitions,
-            prob_fn,
-            ..
-        } = endpoint
+        if let EndpointLikelihood::Dtmm { n_states, state_codes, transitions, prob_fn, .. } =
+            endpoint
         {
             nll += dtmm_endpoint_nll(
                 subject,
@@ -254,11 +223,7 @@ impl crate::survival::SubjectTerm for DtmmTerm<'_> {
         let snaps = subject.record_covariate_snapshots();
         for (cmt, endpoint) in dtmm_endpoints(model) {
             let EndpointLikelihood::Dtmm {
-                n_states,
-                state_codes,
-                transitions,
-                prob_program,
-                ..
+                n_states, state_codes, transitions, prob_program, ..
             } = endpoint
             else {
                 continue;
@@ -300,10 +265,7 @@ impl crate::survival::SubjectTerm for DtmmTerm<'_> {
 /// at the same 1× scale as the value. `None` as for [`DtmmTerm`].
 #[cfg(test)]
 pub(crate) fn dtmm_subject_eta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
     // The subject's compiled term (#2786).
     use crate::sens::ode_provider::adjoint::terms::{term_gradient_planned, TermKind};
@@ -330,10 +292,7 @@ pub(crate) fn all_dtmm_endpoints_analytic(model: &CompiledModel) -> bool {
 ///   step has probability 0 for **every** parameter value, so the subject could only ever
 ///   score the sentinel, and no optimizer can fix that.
 pub fn validate_dtmm_records(
-    cmt: usize,
-    state_codes: &[usize],
-    transitions: &[(usize, usize)],
-    records: &[ObsRecord],
+    cmt: usize, state_codes: &[usize], transitions: &[(usize, usize)], records: &[ObsRecord],
 ) -> Result<(), String> {
     crate::markov::endpoint::validate_ctmm_states(cmt, state_codes, records)?;
     crate::markov::endpoint::validate_ctmm_times(cmt, records)?;

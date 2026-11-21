@@ -72,9 +72,7 @@ fn anchor(name: &str) -> std::path::PathBuf {
 
 fn model(file: &str) -> CompiledModel {
     let src = std::fs::read_to_string(anchor(file)).expect("the ferx twin is committed");
-    parse_full_model(&src)
-        .expect("the anchor model must parse")
-        .model
+    parse_full_model(&src).expect("the anchor model must parse").model
 }
 
 fn population(csv: &str) -> Population {
@@ -92,12 +90,8 @@ fn nonmem_ipred(stream: &str) -> Vec<(f64, f64)> {
         .expect("the NONMEM table is committed");
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. banner");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header")
-        .split(',')
-        .map(str::trim)
-        .collect();
+    let header: Vec<&str> =
+        lines.next().expect("column header").split(',').map(str::trim).collect();
     let col = |name: &str| {
         header
             .iter()
@@ -126,8 +120,7 @@ fn nonmem_ipred(stream: &str) -> Vec<(f64, f64)> {
 
 /// ferx predictions at η = 0 from one engine, as `(time, value)`.
 fn ferx_rows(
-    m: &CompiledModel,
-    pop: &Population,
+    m: &CompiledModel, pop: &Population,
     f: impl Fn(&CompiledModel, &ferx_core::Subject, &[f64], &[f64]) -> Vec<f64>,
 ) -> Vec<(f64, f64)> {
     let theta = &m.default_params.theta;
@@ -150,15 +143,9 @@ fn worst_rel(got: &[(f64, f64)], want: &[(f64, f64)], what: &str) -> f64 {
     assert_eq!(got.len(), want.len(), "{what}: row count");
     let mut worst = 0.0_f64;
     for (&(tg, g), &(tw, w)) in got.iter().zip(want) {
-        assert!(
-            (tg - tw).abs() < 1e-9,
-            "{what}: time misalignment {tg} vs {tw}"
-        );
+        assert!((tg - tw).abs() < 1e-9, "{what}: time misalignment {tg} vs {tw}");
         assert!(g.is_finite(), "{what}: ferx returned {g} at t={tg}");
-        assert!(
-            w.is_finite() && w != 0.0,
-            "{what}: bad reference {w} at t={tw}"
-        );
+        assert!(w.is_finite() && w != 0.0, "{what}: bad reference {w} at t={tw}");
         worst = worst.max((g - w).abs() / w.abs());
     }
     worst
@@ -245,11 +232,7 @@ fn ss_tad_objective_engine_matches_nonmem() {
     // It cannot usefully be tighter: NONMEM's own values sit 7.7e-9 *above* the exact
     // closed form, which is `TOL=9` plus the `1PE20.13` print, so this bound measures
     // NONMEM's accuracy floor rather than ferx's.
-    let worst = worst_rel_external(
-        &got,
-        &nonmem_ipred("ss_tad"),
-        "objective engine vs NONMEM SS",
-    );
+    let worst = worst_rel_external(&got, &nonmem_ipred("ss_tad"), "objective engine vs NONMEM SS");
     assert!(worst < 5e-8, "worst relative error {worst:.3e}");
 }
 
@@ -330,11 +313,7 @@ fn ss_tad_objective_matches_nonmem_end_to_end() {
 
     // `is_finite` first and on its own: that is the regression, and a bound checked against
     // a `NaN` reads as false rather than as a failure, so it must be asserted separately.
-    assert!(
-        ss.ofv.is_finite(),
-        "SS objective is {} — the #1139 symptom is back",
-        ss.ofv
-    );
+    assert!(ss.ofv.is_finite(), "SS objective is {} — the #1139 symptom is back", ss.ofv);
     assert!(train.ofv.is_finite(), "train objective is {}", train.ofv);
 
     // NONMEM `#OBJV` from `results/ss_tad.lst` and `results/train_tad.lst`, both 286.890 —
@@ -345,10 +324,7 @@ fn ss_tad_objective_matches_nonmem_end_to_end() {
     const NM_OBJV: f64 = 286.890;
     for (what, got) in [("SS", ss.ofv), ("train", train.ofv)] {
         let rel = (got - NM_OBJV).abs() / NM_OBJV;
-        assert!(
-            rel < 1e-5,
-            "{what} OFV {got:.5} vs NONMEM {NM_OBJV} (rel {rel:.3e})"
-        );
+        assert!(rel < 1e-5, "{what} OFV {got:.5} vs NONMEM {NM_OBJV} (rel {rel:.3e})");
     }
     // And the two ferx runs agree with each other far more tightly than either agrees with
     // NONMEM's printed value — the steady-state record really is standing in for the train,
@@ -379,11 +355,7 @@ fn tad_train_matches_nonmem() {
     // Realised error, measured: 9.07e-9 relative worst (8.8902009676645 against NONMEM
     // 8.8902010448184). Bound at 5e-8, ~5.5x headroom — again NONMEM's floor, since ferx's
     // train matches the exact closed form to 4.4e-10 (asserted below).
-    let worst = worst_rel_external(
-        &got,
-        &nonmem_ipred("train_tad"),
-        "ferx train vs NONMEM train",
-    );
+    let worst = worst_rel_external(&got, &nonmem_ipred("train_tad"), "ferx train vs NONMEM train");
     assert!(worst < 5e-8, "worst relative error {worst:.3e}");
 }
 
@@ -419,10 +391,7 @@ fn the_tad_train_converges_and_the_absolute_time_train_does_not() {
     // times. Compare on the phase, and assert that the phases really do line up, so a
     // future dataset edit cannot silently make this compare unrelated points.
     let by_phase = |stream: &str, last_dose: f64| -> Vec<(f64, f64)> {
-        nonmem_ipred(stream)
-            .into_iter()
-            .map(|(t, v)| (t - last_dose, v))
-            .collect()
+        nonmem_ipred(stream).into_iter().map(|(t, v)| (t - last_dose, v)).collect()
     };
     let tad = worst_rel_external(
         &by_phase("train_tad_n21", 240.0),
@@ -435,18 +404,12 @@ fn the_tad_train_converges_and_the_absolute_time_train_does_not() {
         "absolute-time train N=21 vs N=41",
     );
     assert_eq!(
-        by_phase("train_tad_n21", 240.0)
-            .iter()
-            .map(|&(p, _)| p)
-            .collect::<Vec<_>>(),
+        by_phase("train_tad_n21", 240.0).iter().map(|&(p, _)| p).collect::<Vec<_>>(),
         vec![2.0, 5.0, 8.0, 11.0],
         "the short train's samples must sit at the same cycle phases as the long one's"
     );
     // Measured: 3.5e-7 for TAD, 0.294 for absolute time — six orders apart.
-    assert!(
-        tad < 1e-5,
-        "the TAD train must have a periodic limit; N=21 vs N=41 moved {tad:.3e}"
-    );
+    assert!(tad < 1e-5, "the TAD train must have a periodic limit; N=21 vs N=41 moved {tad:.3e}");
     assert!(
         tabs > 0.1,
         "the absolute-time train must NOT have one, or this test has stopped separating \
@@ -498,16 +461,8 @@ fn absolute_time_ss_still_matches_nonmem() {
 #[test]
 fn both_spellings_of_absolute_time_give_the_same_steady_state() {
     let pop = population("ss_tabs.csv");
-    let t_rows = ferx_rows(
-        &model("ss_tabs_fit.ferx"),
-        &pop,
-        compute_predictions_with_tv,
-    );
-    let time_rows = ferx_rows(
-        &model("ss_tabs_time_fit.ferx"),
-        &pop,
-        compute_predictions_with_tv,
-    );
+    let t_rows = ferx_rows(&model("ss_tabs_fit.ferx"), &pop, compute_predictions_with_tv);
+    let time_rows = ferx_rows(&model("ss_tabs_time_fit.ferx"), &pop, compute_predictions_with_tv);
     assert_eq!(t_rows.len(), time_rows.len());
     for (&(t, a), &(_, b)) in t_rows.iter().zip(&time_rows) {
         assert!(a.is_finite() && b.is_finite(), "t={t}: {a} / {b}");
@@ -541,16 +496,8 @@ fn the_absolute_clock_steady_state_is_not_its_own_train_on_either_engine() {
     );
     let m = model("ss_tabs_fit.ferx");
     let ferx_ss = ferx_rows(&m, &population("ss_tabs.csv"), compute_predictions_with_tv);
-    let ferx_train = ferx_rows(
-        &m,
-        &population("train_tabs.csv"),
-        compute_predictions_with_tv,
-    );
-    let ferx_gap = worst_rel(
-        &ferx_ss,
-        &ferx_train,
-        "ferx absolute-time SS vs its own train",
-    );
+    let ferx_train = ferx_rows(&m, &population("train_tabs.csv"), compute_predictions_with_tv);
+    let ferx_gap = worst_rel(&ferx_ss, &ferx_train, "ferx absolute-time SS vs its own train");
 
     // Measured: 0.673 on both sides at t = 482 (8.5679 against 5.1221).
     assert!(
@@ -571,16 +518,8 @@ fn the_absolute_clock_steady_state_is_not_its_own_train_on_either_engine() {
     // states in general: the same comparison on the `TAD` model agrees to 3.8e-13.
     let m_tad = model("ss_tad_fit.ferx");
     let tad_gap = worst_rel(
-        &ferx_rows(
-            &m_tad,
-            &population("ss_tad.csv"),
-            compute_predictions_with_tv,
-        ),
-        &ferx_rows(
-            &m_tad,
-            &population("train_tad.csv"),
-            compute_predictions_with_tv,
-        ),
+        &ferx_rows(&m_tad, &population("ss_tad.csv"), compute_predictions_with_tv),
+        &ferx_rows(&m_tad, &population("train_tad.csv"), compute_predictions_with_tv),
         "ferx TAD SS vs its own train",
     );
     assert!(
@@ -613,11 +552,8 @@ fn the_closed_form_certifies_both_engines_and_nonmem() {
     assert!(ferx_worst < 5e-9, "ferx vs closed form {ferx_worst:.3e}");
 
     // Measured: 8.330e-9 worst — NONMEM's own accuracy floor on this problem.
-    let nm_worst = worst_rel_external(
-        &nonmem_ipred("ss_tad"),
-        &exact,
-        "NONMEM SS vs the closed form",
-    );
+    let nm_worst =
+        worst_rel_external(&nonmem_ipred("ss_tad"), &exact, "NONMEM SS vs the closed form");
     assert!(nm_worst < 5e-8, "NONMEM vs closed form {nm_worst:.3e}");
 
     // And the ordering itself: ferx is closer to the exact answer than NONMEM is. If that
@@ -638,9 +574,7 @@ fn the_closed_form_certifies_both_engines_and_nonmem() {
 /// this dataset except `TAFD`, whose first dose is at `t = 480` rather than `0`, so it is a
 /// genuinely different RHS and is written out rather than claimed equivalent.
 fn respelled(term: &str) -> CompiledModel {
-    parse_full_model(&respelled_src(term))
-        .expect("respelled model parses")
-        .model
+    parse_full_model(&respelled_src(term)).expect("respelled model parses").model
 }
 
 fn respelled_src(term: &str) -> String {
@@ -658,10 +592,7 @@ fn respelled_src(term: &str) -> String {
 /// measure the integrator's error rather than the `TAD` plumbing it exists to check.
 fn respelled_integrated(term: &str) -> CompiledModel {
     let src = respelled_src(term);
-    assert!(
-        src.contains("[fit_options]\n"),
-        "the fixture has no [fit_options] block"
-    );
+    assert!(src.contains("[fit_options]\n"), "the fixture has no [fit_options] block");
     parse_full_model(&src.replace("[fit_options]\n", "[fit_options]\n  ode_method = rk45\n"))
         .expect("respelled model parses")
         .model
@@ -712,11 +643,7 @@ fn tafd_under_an_unlagged_ss_dose_stays_nan_while_tad_does_not() {
     // Realised worst relative difference, measured: 4.633876e-12. Bound at 1e-10, ~22x
     // headroom, matching the sibling's bound so the pair can be read together.
     let autonomous = ferx_rows(&respelled("0.0*TAD"), &pop, compute_predictions_with_tv);
-    let plain = ferx_rows(
-        &respelled_integrated("0.0"),
-        &pop,
-        compute_predictions_with_tv,
-    );
+    let plain = ferx_rows(&respelled_integrated("0.0"), &pop, compute_predictions_with_tv);
     // `worst_rel` asserts `is_finite` on both sides before folding, so a `NaN` fails here
     // rather than being absorbed by `f64::max` — which is the failure this half exists to
     // separate from the `TAFD` rows above.
@@ -757,11 +684,7 @@ fn the_fit_warns_about_an_absolute_clock_under_steady_state() {
 
     // `T` — a finite, NONMEM-matching, silently-wrong number.
     let w = fired(&respelled("0.003*T"));
-    assert_eq!(
-        w.len(),
-        1,
-        "expected exactly one absolute-clock warning: {w:?}"
-    );
+    assert_eq!(w.len(), 1, "expected exactly one absolute-clock warning: {w:?}");
     assert!(
         w[0].contains("`T`/`TIME` therefore return a finite number"),
         "the `T` consequence must be the one reported: {}",
@@ -770,11 +693,7 @@ fn the_fit_warns_about_an_absolute_clock_under_steady_state() {
 
     // `TAFD` — the NaN objective #1139 reports.
     let w = fired(&respelled("0.003*TAFD"));
-    assert_eq!(
-        w.len(),
-        1,
-        "expected exactly one absolute-clock warning: {w:?}"
-    );
+    assert_eq!(w.len(), 1, "expected exactly one absolute-clock warning: {w:?}");
     assert!(
         w[0].contains("`TAFD` has no referent inside the run-in"),
         "the `TAFD` consequence must be the one reported: {}",
@@ -804,21 +723,9 @@ fn ferx_check_reports_the_absolute_clock_warning_without_failing_the_report() {
         anchor("ss_tabs_fit.ferx").to_str().expect("utf-8 path"),
         Some(data.to_str().expect("utf-8 path")),
     );
-    let hit: Vec<_> = report
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == CODE)
-        .collect();
-    assert_eq!(
-        hit.len(),
-        1,
-        "expected one {CODE}: {:?}",
-        report.diagnostics
-    );
-    assert!(
-        report.valid,
-        "a warning must not invalidate the report — `ferx check` still exits 0"
-    );
+    let hit: Vec<_> = report.diagnostics.iter().filter(|d| d.code == CODE).collect();
+    assert_eq!(hit.len(), 1, "expected one {CODE}: {:?}", report.diagnostics);
+    assert!(report.valid, "a warning must not invalidate the report — `ferx check` still exits 0");
 
     // Same negative control as the fit test, through the other entry point.
     let data = anchor("ss_tad.csv");

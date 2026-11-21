@@ -51,12 +51,7 @@ const NM_FINAL_OBJ: f64 = 417.23048569895218;
 /// `ADD` moves it by ~1100, and each floor row alone contributes ~50.
 const OFV_TOL: f64 = 5e-8;
 
-const INITS: Params = Params {
-    theta: [2.2, 9.0, 1.3],
-    prop: 0.12,
-    add: 0.07,
-    omega: [0.09, 0.04],
-};
+const INITS: Params = Params { theta: [2.2, 9.0, 1.3], prop: 0.12, add: 0.07, omega: [0.09, 0.04] };
 /// `ltbs_combined.ext`'s printed final estimates (6 significant figures), which is
 /// exactly the point `ltbs_combined_final_eval.ctl` evaluates.
 const FINAL: Params = Params {
@@ -116,23 +111,15 @@ fn evaluate(m: &ferx_core::types::CompiledModel, data: &str, method: EstimationM
         threads: Some(2),
         ..FitOptions::default()
     };
-    fit(m, &pop, &m.default_params, &opts)
-        .expect("evaluation")
-        .ofv
+    fit(m, &pop, &m.default_params, &opts).expect("evaluation").ofv
 }
 
 /// Both spellings: `DV ~ log_combined` on the log-scale data NONMEM reads, and
 /// `log(DV) ~ combined` on the same data exponentiated.
 fn check(p: &Params, method: EstimationMethod, want: f64, label: &str) {
     for (statement, data) in [
-        (
-            "DV ~ log_combined(PROP_ERR, ADD_ERR)",
-            "tests/nonmem/ltbs_combined.csv",
-        ),
-        (
-            "log(DV) ~ combined(PROP_ERR, ADD_ERR)",
-            "tests/nonmem/ltbs_combined_natural.csv",
-        ),
+        ("DV ~ log_combined(PROP_ERR, ADD_ERR)", "tests/nonmem/ltbs_combined.csv"),
+        ("log(DV) ~ combined(PROP_ERR, ADD_ERR)", "tests/nonmem/ltbs_combined_natural.csv"),
     ] {
         let ofv = evaluate(&model(p, statement), data, method);
         eprintln!(
@@ -140,21 +127,13 @@ fn check(p: &Params, method: EstimationMethod, want: f64, label: &str) {
             ofv - want
         );
         assert!(ofv.is_finite(), "{label} [{statement}]: ferx OFV {ofv}");
-        assert!(
-            (ofv - want).abs() < OFV_TOL,
-            "{label} [{statement}]: ferx {ofv} vs NONMEM {want}"
-        );
+        assert!((ofv - want).abs() < OFV_TOL, "{label} [{statement}]: ferx {ofv} vs NONMEM {want}");
     }
 }
 
 #[test]
 fn ltbs_combined_focei_objective_matches_nonmem_at_the_initial_estimates() {
-    check(
-        &INITS,
-        EstimationMethod::FoceI,
-        NM_FOCEI_OBJ,
-        "FOCEI, inits",
-    );
+    check(&INITS, EstimationMethod::FoceI, NM_FOCEI_OBJ, "FOCEI, inits");
 }
 
 #[test]
@@ -164,12 +143,7 @@ fn ltbs_combined_foce_objective_matches_nonmem_at_the_initial_estimates() {
 
 #[test]
 fn ltbs_combined_focei_objective_matches_nonmem_at_its_final_estimates() {
-    check(
-        &FINAL,
-        EstimationMethod::FoceI,
-        NM_FINAL_OBJ,
-        "FOCEI, NONMEM final",
-    );
+    check(&FINAL, EstimationMethod::FoceI, NM_FINAL_OBJ, "FOCEI, NONMEM final");
 }
 
 /// Non-degeneracy: with `ADD → 0` (the reduced model the issue's port was forced into)
@@ -185,10 +159,7 @@ fn dropping_add_moves_the_objective_far_beyond_the_tolerance() {
     );
     eprintln!("ADD → 0: ferx {ofv:.6} vs combined NONMEM {NM_FOCEI_OBJ:.6}");
     assert!(ofv.is_finite());
-    assert!(
-        (ofv - NM_FOCEI_OBJ).abs() > 100.0,
-        "dropping ADD left the objective at {ofv}"
-    );
+    assert!((ofv - NM_FOCEI_OBJ).abs() > 100.0, "dropping ADD left the objective at {ofv}");
 }
 
 /// The FOCEI fit from the initial estimates lands where NONMEM's did: OBJ 417.2305
@@ -197,18 +168,11 @@ fn dropping_add_moves_the_objective_far_beyond_the_tolerance() {
 /// 417.230410, 7.6e-5 *below* NONMEM's (which stopped on `ROUNDING ERRORS`), and
 /// `ADD` 0.0321140 against NONMEM's 0.0321163 (7e-5 relative).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ltbs_combined_focei_fit_matches_nonmem() {
     let m = model(&INITS, "log(DV) ~ combined(PROP_ERR, ADD_ERR)");
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/ltbs_combined_natural.csv"),
-        None,
-        None,
-    )
-    .expect("data");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/ltbs_combined_natural.csv"), None, None)
+        .expect("data");
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         run_covariance_step: false,
@@ -223,11 +187,7 @@ fn ltbs_combined_focei_fit_matches_nonmem() {
         r.ofv, r.sigma, r.theta
     );
     assert!(r.ofv.is_finite());
-    assert!(
-        r.ofv < NM_FINAL_OBJ + 1e-3,
-        "ferx {} is worse than NONMEM's {NM_FINAL_OBJ}",
-        r.ofv
-    );
+    assert!(r.ofv < NM_FINAL_OBJ + 1e-3, "ferx {} is worse than NONMEM's {NM_FINAL_OBJ}", r.ofv);
     assert!(
         (r.sigma[1] - FINAL.add).abs() < 0.01 * FINAL.add,
         "ADD {} vs NONMEM {}",

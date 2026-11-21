@@ -112,33 +112,20 @@ fn warfarin(optimizer: Optimizer, scaling: ParameterScaling) -> FitResult {
 
 fn assert_at_min(r: &FitResult, want: f64, label: &str) {
     assert!(r.ofv.is_finite(), "{label}: OFV {}", r.ofv);
-    assert!(
-        (r.ofv - want).abs() < TOL,
-        "{label}: OFV {:.4}, want {want} ± {TOL}",
-        r.ofv
-    );
+    assert!((r.ofv - want).abs() < TOL, "{label}: OFV {:.4}, want {want} ± {TOL}", r.ofv);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bobyqa_reaches_the_minimum_from_a_near_zero_identity_theta() {
     let r = warfarin(Optimizer::Bobyqa, ParameterScaling::Auto);
     assert_at_min(&r, WARFARIN_MIN, "bobyqa");
     let tvv_s = r.theta[1];
-    assert!(
-        (tvv_s - 7.7377e-6).abs() < 1e-8,
-        "bobyqa: TVV_S {tvv_s:e}, want 7.7377e-6"
-    );
+    assert!((tvv_s - 7.7377e-6).abs() < 1e-8, "bobyqa: TVV_S {tvv_s:e}, want 7.7377e-6");
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gradient_optimizers_reach_the_minimum_from_a_near_zero_identity_theta() {
     for opt in [Optimizer::Auto, Optimizer::Slsqp] {
         let r = warfarin(opt, ParameterScaling::Auto);
@@ -149,10 +136,7 @@ fn gradient_optimizers_reach_the_minimum_from_a_near_zero_identity_theta() {
 /// The control arm: with the probe off the fixture still stops short, so the two
 /// tests above are about the scale, not about a fixture any optimizer solves.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn an_explicit_none_still_stops_short_on_the_fixture() {
     let r = warfarin(Optimizer::Bobyqa, ParameterScaling::None);
     assert!(
@@ -172,10 +156,7 @@ fn an_explicit_none_still_stops_short_on_the_fixture() {
 
 /// A mixture with the small-unit volume reaches the plain model's minimum.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_mixture_reaches_the_minimum_from_a_near_zero_identity_theta() {
     for opt in [Optimizer::Bobyqa, Optimizer::Slsqp] {
         let r = mixture(opt, ParameterScaling::Auto);
@@ -186,29 +167,15 @@ fn a_mixture_reaches_the_minimum_from_a_near_zero_identity_theta() {
 /// The rule must not move a near-zero O(1) slope off the unit scale: both covariate
 /// exponents of `two_cpt_oral_cov` started at 0.001 still reach −1199.3264.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_near_zero_slope_keeps_reaching_the_minimum() {
     let src = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx").expect("example reads");
     let src = src
-        .replace(
-            "theta THETA_WT(0.6, 0.01, 5.0)",
-            "theta THETA_WT(0.001, -5.0, 5.0)",
-        )
-        .replace(
-            "theta THETA_CRCL(0.3, 0.01, 5.0)",
-            "theta THETA_CRCL(0.001, -5.0, 5.0)",
-        );
+        .replace("theta THETA_WT(0.6, 0.01, 5.0)", "theta THETA_WT(0.001, -5.0, 5.0)")
+        .replace("theta THETA_CRCL(0.3, 0.01, 5.0)", "theta THETA_CRCL(0.001, -5.0, 5.0)");
     assert!(src.contains("THETA_WT(0.001, -5.0") && src.contains("THETA_CRCL(0.001, -5.0"));
     for opt in [Optimizer::Bobyqa, Optimizer::Auto, Optimizer::Slsqp] {
-        let r = run(
-            &src,
-            "data/two_cpt_oral_cov.csv",
-            opt,
-            ParameterScaling::Auto,
-        );
+        let r = run(&src, "data/two_cpt_oral_cov.csv", opt, ParameterScaling::Auto);
         assert_at_min(&r, TWO_CPT_MIN, &format!("two_cpt_oral_cov {opt:?}"));
     }
 }

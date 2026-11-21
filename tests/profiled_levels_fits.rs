@@ -56,19 +56,13 @@ fn prep(model: &str, data: &str, unprofiled: Option<&str>) -> ferx_core::Prepare
     };
     let path = unique_temp("ferx_profiled_fits");
     std::fs::write(&path, text).unwrap();
-    ferx_core::prepare_run(
-        path.to_str().unwrap(),
-        Some(root().join(data).to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("{e}"))
+    ferx_core::prepare_run(path.to_str().unwrap(), Some(root().join(data).to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn fit(p: &ferx_core::PreparedRun, params: &ModelParameters, cov: bool) -> (FitResult, f64) {
-    let opts = FitOptions {
-        verbose: false,
-        run_covariance_step: cov,
-        ..p.parsed.fit_options.clone()
-    };
+    let opts =
+        FitOptions { verbose: false, run_covariance_step: cov, ..p.parsed.fit_options.clone() };
     let t = Instant::now();
     let f = ferx_core::fit(&p.parsed.model, &p.population, params, &opts)
         .unwrap_or_else(|e| panic!("{e}"));
@@ -96,21 +90,13 @@ fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
 /// The degenerate oracle with the profiled block line rewritten to `prof_decl` when given
 /// (D2b, a bounded profiled block), returning both fits.
 fn degenerate_oracle_with(
-    model: &str,
-    data: &str,
-    prof_decl: Option<&str>,
-    decl: &str,
-    n_struct: usize,
+    model: &str, data: &str, prof_decl: Option<&str>, decl: &str, n_struct: usize,
 ) -> (ferx_core::PreparedRun, FitResult, FitResult) {
     let prof_prep = prep(model, data, prof_decl);
     let (prof, t_prof) = fit(&prof_prep, &prof_prep.init_params, false);
     assert!(prof.converged, "{:?}", prof.warnings);
     let plain_prep = prep(model, data, Some(decl));
-    let (plain, t_plain) = fit(
-        &plain_prep,
-        &start_at(&plain_prep.init_params, &prof),
-        false,
-    );
+    let (plain, t_plain) = fit(&plain_prep, &start_at(&plain_prep.init_params, &prof), false);
     assert!(prof.ofv.is_finite() && plain.ofv.is_finite());
     let improvement = prof.ofv - plain.ofv;
     let worst_theta = (0..n_struct)
@@ -124,14 +110,8 @@ fn degenerate_oracle_with(
          ({t_plain:.1}s); improvement {improvement:.3e}, structural θ {worst_theta:.3e}",
         prof.ofv, prof.n_iterations, plain.ofv
     );
-    assert!(
-        improvement < D_OFV,
-        "the unprofiled fit improved by {improvement}"
-    );
-    assert!(
-        improvement > -D_OFV,
-        "the unprofiled fit lost {improvement}"
-    );
+    assert!(improvement < D_OFV, "the unprofiled fit improved by {improvement}");
+    assert!(improvement > -D_OFV, "the unprofiled fit lost {improvement}");
     assert!(worst_theta < D_THETA, "{worst_theta}");
     (plain_prep, prof, plain)
 }
@@ -143,13 +123,7 @@ fn degenerate_oracle_with(
 /// the equality is about a constrained optimum and not two unconstrained ones. Bounds
 /// below 0 on both sides, so neither fit log-packs a level.
 fn bounded_degenerate_oracle(
-    model: &str,
-    data: &str,
-    bx: &str,
-    n_struct: usize,
-    upper: f64,
-    pinned: &str,
-    control: &str,
+    model: &str, data: &str, bx: &str, n_struct: usize, upper: f64, pinned: &str, control: &str,
 ) {
     let (p, prof, plain) = degenerate_oracle_with(
         model,
@@ -159,21 +133,14 @@ fn bounded_degenerate_oracle(
         n_struct,
     );
     let idx = |name: &str| {
-        p.init_params
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("{name}"))
+        p.init_params.theta_names.iter().position(|n| n == name).unwrap_or_else(|| panic!("{name}"))
     };
     let (k, c) = (idx(pinned), idx(control));
     eprintln!(
         "D2b {model}: {pinned} profiled {} unprofiled {}; {control} profiled {} unprofiled {}",
         prof.theta[k], plain.theta[k], prof.theta[c], plain.theta[c]
     );
-    assert_eq!(
-        prof.theta[k], upper,
-        "the profiled fit holds it on the bound"
-    );
+    assert_eq!(prof.theta[k], upper, "the profiled fit holds it on the bound");
     assert!((plain.theta[k] - upper).abs() < 1e-6, "{}", plain.theta[k]);
     for v in [prof.theta[c], plain.theta[c]] {
         assert!(v.is_finite() && v < upper - 1e-3, "{control}: {v}");
@@ -221,15 +188,8 @@ fn d2b_a_bounded_profiled_fit_is_the_bounded_unprofiled_fit() {
 fn a3_a_bounded_profiled_fit_reaches_nonmems_optimum_with_the_level_fixed() {
     let text = std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma_bound.ext"))
         .unwrap();
-    let last = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("-1000000000"))
-        .unwrap();
-    let row: Vec<f64> = last
-        .split_whitespace()
-        .skip(1)
-        .map(|v| v.parse().unwrap())
-        .collect();
+    let last = text.lines().find(|l| l.trim_start().starts_with("-1000000000")).unwrap();
+    let row: Vec<f64> = last.split_whitespace().skip(1).map(|v| v.parse().unwrap()).collect();
     let obj = *row.last().unwrap();
     let p = prep(
         "nonmem_anchor/profile_mbma_fit.ferx",
@@ -238,12 +198,10 @@ fn a3_a_bounded_profiled_fit_reaches_nonmems_optimum_with_the_level_fixed() {
     );
     let (f, t) = fit(&p, &p.init_params, false);
     let worst_theta =
-        (0..3)
-            .map(|k| ((f.theta[k] - row[k]) / row[k]).abs())
-            .fold(0.0_f64, |a, v| {
-                assert!(v.is_finite());
-                a.max(v)
-            });
+        (0..3).map(|k| ((f.theta[k] - row[k]) / row[k]).abs()).fold(0.0_f64, |a, v| {
+            assert!(v.is_finite());
+            a.max(v)
+        });
     eprintln!(
         "A3 fit: ferx {:.9} NONMEM {obj:.9} (Δ {:.3e}), structural θ {worst_theta:.3e}, {t:.1}s",
         f.ofv,
@@ -295,11 +253,8 @@ fn laplace_copy(model: &str) -> String {
     let text = std::fs::read_to_string(root().join(model)).unwrap();
     assert!(text.contains("  method     = focei\n"), "fixture moved");
     let path = unique_temp("ferx_profiled_fits_laplace");
-    std::fs::write(
-        &path,
-        text.replace("  method     = focei\n", "  method     = laplace\n"),
-    )
-    .unwrap();
+    std::fs::write(&path, text.replace("  method     = focei\n", "  method     = laplace\n"))
+        .unwrap();
     path.to_str().unwrap().to_string()
 }
 
@@ -345,11 +300,7 @@ fn d2_l_a_profiled_laplace_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
 fn fd_fallback_warnings(warnings: &[String]) -> Vec<&String> {
     warnings
         .iter()
-        .filter(|w| {
-            w.to_lowercase()
-                .replace('-', " ")
-                .contains("finite differen")
-        })
+        .filter(|w| w.to_lowercase().replace('-', " ").contains("finite differen"))
         .collect()
 }
 
@@ -398,11 +349,8 @@ fn agq3_degenerate_oracle(model: &str, data: &str, n_struct: usize, straddle: bo
             // the same anchor's one-node profiled fit (`laplace`, or plain `focei`) lands
             // more than `D_OFV` away. A dropped `n_agq` would pass the parity above as a
             // one-node fit and fail here (#2561 review row 3).
-            let one_model = if method == "laplace" {
-                laplace_copy(model)
-            } else {
-                model.to_string()
-            };
+            let one_model =
+                if method == "laplace" { laplace_copy(model) } else { model.to_string() };
             let p1 = prep(&one_model, data, None);
             let (one, _) = fit(&p1, &p1.init_params, false);
             eprintln!(
@@ -469,17 +417,9 @@ fn d2_agq_a_profiled_quadrature_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
 )]
 fn a2_a_profiled_fit_reaches_nonmems_optimum() {
     let obj = a2_nonmem_ofv();
-    let p = prep(
-        "nonmem_anchor/profile_mbma_fit.ferx",
-        "nonmem_anchor/profile_mbma.csv",
-        None,
-    );
+    let p = prep("nonmem_anchor/profile_mbma_fit.ferx", "nonmem_anchor/profile_mbma.csv", None);
     let (f, t) = fit(&p, &p.init_params, false);
-    eprintln!(
-        "A2 fit: ferx {:.9} NONMEM {obj:.9} (Δ {:.3e}), {t:.1}s",
-        f.ofv,
-        f.ofv - obj
-    );
+    eprintln!("A2 fit: ferx {:.9} NONMEM {obj:.9} (Δ {:.3e}), {t:.1}s", f.ofv, f.ofv - obj);
     assert!(f.converged && f.ofv.is_finite());
     assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
 }
@@ -495,10 +435,7 @@ fn a2_a_profiled_fit_reaches_nonmems_optimum() {
 )]
 fn a2_l_a_profiled_laplace_fit_reaches_nonmems_optimum() {
     let obj = ext_final_ofv("profile_mbma_laplace.ext");
-    assert!(
-        (obj - a2_nonmem_ofv()).abs() > 1e3 * A2_FIT_OFV,
-        "the straddle"
-    );
+    assert!((obj - a2_nonmem_ofv()).abs() > 1e3 * A2_FIT_OFV, "the straddle");
     let p = prep(
         &laplace_copy("nonmem_anchor/profile_mbma_fit.ferx"),
         "nonmem_anchor/profile_mbma.csv",
@@ -517,11 +454,7 @@ fn a2_l_a_profiled_laplace_fit_reaches_nonmems_optimum() {
             f.converged,
             f.n_iterations
         );
-        assert!(
-            f.converged && f.ofv.is_finite(),
-            "{start:?}: {:?}",
-            f.warnings
-        );
+        assert!(f.converged && f.ofv.is_finite(), "{start:?}: {:?}", f.warnings);
         assert!(
             (f.ofv - obj).abs() < A2_FIT_OFV,
             "{start:?}: converged at {} vs NONMEM {obj}",
@@ -576,11 +509,7 @@ fn ext_final_ofv(name: &str) -> f64 {
 )]
 fn a2_a_nearby_start_reaches_nonmems_optimum() {
     let obj = a2_nonmem_ofv();
-    let p = prep(
-        "nonmem_anchor/profile_mbma_fit.ferx",
-        "nonmem_anchor/profile_mbma.csv",
-        None,
-    );
+    let p = prep("nonmem_anchor/profile_mbma_fit.ferx", "nonmem_anchor/profile_mbma.csv", None);
     assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
     for start in [[45.0, 6.0, 2.0], [40.0, 6.0, 2.0], [50.0, 6.0, 2.0]] {
         let mut params = p.init_params.clone();
@@ -593,11 +522,7 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
             f.converged,
             f.n_iterations
         );
-        assert!(
-            f.converged && f.ofv.is_finite(),
-            "{start:?}: {:?}",
-            f.warnings
-        );
+        assert!(f.converged && f.ofv.is_finite(), "{start:?}: {:?}", f.warnings);
         assert!(
             (f.ofv - obj).abs() < A2_FIT_OFV,
             "{start:?}: converged at {} vs NONMEM {obj}",
@@ -623,11 +548,7 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
 )]
 fn a2_a_profiled_bobyqa_fit_is_converged_only_on_nonmems_optimum() {
     let obj = a2_nonmem_ofv();
-    let mut p = prep(
-        "nonmem_anchor/profile_mbma_fit.ferx",
-        "nonmem_anchor/profile_mbma.csv",
-        None,
-    );
+    let mut p = prep("nonmem_anchor/profile_mbma_fit.ferx", "nonmem_anchor/profile_mbma.csv", None);
     p.parsed.fit_options.optimizer = Optimizer::Bobyqa;
     assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
     for (start, must_converge) in [([45.0, 8.0, 2.0], true), ([45.0, 12.0, 2.0], false)] {
@@ -675,11 +596,7 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
         (nm55 - obj).abs() < A2_FIT_OFV,
         "NONMEM from TVE0 = 55 ends at {nm55}, not its own optimum {obj}"
     );
-    let prof = prep(
-        "nonmem_anchor/profile_mbma_fit.ferx",
-        "nonmem_anchor/profile_mbma.csv",
-        None,
-    );
+    let prof = prep("nonmem_anchor/profile_mbma_fit.ferx", "nonmem_anchor/profile_mbma.csv", None);
     let plain = prep(
         "nonmem_anchor/profile_mbma_fit.ferx",
         "nonmem_anchor/profile_mbma.csv",
@@ -688,12 +605,7 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
     for (label, p, start, band) in [
         ("profiled", &prof, [55.0, 8.0, 2.0], A2_FIT_OFV),
         ("profiled", &prof, [52.0, 8.0, 2.0], A2_FIT_OFV),
-        (
-            "unprofiled",
-            &plain,
-            [55.0, 8.0, 2.0],
-            A2_UNPROFILED_RESTART_OFV,
-        ),
+        ("unprofiled", &plain, [55.0, 8.0, 2.0], A2_UNPROFILED_RESTART_OFV),
     ] {
         let mut params = p.init_params.clone();
         params.theta[..3].copy_from_slice(&start);
@@ -712,11 +624,7 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
             "{label} {start:?}: the floor escape did not run: {:?}",
             f.warnings
         );
-        assert!(
-            f.converged && f.ofv.is_finite(),
-            "{label} {start:?}: {:?}",
-            f.warnings
-        );
+        assert!(f.converged && f.ofv.is_finite(), "{label} {start:?}: {:?}", f.warnings);
         // #2629: a restart that leaves EMAX below its probe point (1e-3 of its start) is
         // probed and demoted; this anchor's restart lands on the optimum, EMAX far above it.
         assert!(
@@ -775,10 +683,7 @@ const A2_FIT_OFV: f64 = 1e-5;
     ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
-    let s1 = (
-        "tests/data/profile_mbma/s1_profile.ferx",
-        "tests/data/profile_mbma/s100t8.csv",
-    );
+    let s1 = ("tests/data/profile_mbma/s1_profile.ferx", "tests/data/profile_mbma/s100t8.csv");
     let p = prep(s1.0, s1.1, None);
     let (prof, t_prof) = fit(&p, &p.init_params, true);
     assert!(prof.converged, "{:?}", prof.warnings);
@@ -789,9 +694,7 @@ fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
     let levels = &ferx_core::theta_level_values(&p.parsed.model, &prof.theta, Some(cov), None)
         .unwrap()["PLACEBO"];
     assert_eq!(levels.len(), 800);
-    assert!(levels
-        .iter()
-        .all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
+    assert!(levels.iter().all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
 
     eprintln!(
         "S1: profiled OFV {:.6} ({t_prof:.1}s, covariance {:.2}s, {} evals, n_parameters {})",
@@ -807,11 +710,7 @@ fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
         "S1: unprofiled OFV {:.6} ({t_plain:.1}s, {} evals, converged {})",
         plain.ofv, plain.n_iterations, plain.converged
     );
-    assert!(
-        plain.converged && plain.ofv.is_finite(),
-        "{:?}",
-        plain.warnings
-    );
+    assert!(plain.converged && plain.ofv.is_finite(), "{:?}", plain.warnings);
     assert!(
         (prof.ofv - plain.ofv).abs() < S1_OFV,
         "profiled {} vs unprofiled {}",
@@ -844,9 +743,8 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
     let data = "tests/data/profile_mbma/s100t8.csv";
     let model = "tests/data/profile_mbma/s1_profile.ferx";
     let text = std::fs::read_to_string(root().join(model)).unwrap();
-    let no_e0 = text
-        .replace("  omega ETA_E0 ~ 0.1\n", "")
-        .replace("E0 = TVE0 + ETA_E0", "E0 = TVE0");
+    let no_e0 =
+        text.replace("  omega ETA_E0 ~ 0.1\n", "").replace("E0 = TVE0 + ETA_E0", "E0 = TVE0");
     let block = "PLACEBO[STUDY, TIME]";
     assert!(
         no_e0.contains(block) && !no_e0.contains("omega ETA_E0") && !no_e0.contains("+ ETA_E0"),
@@ -856,17 +754,11 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
         let path = unique_temp("ferx_profiled_s1_global");
         std::fs::write(
             &path,
-            no_e0.replace(
-                block,
-                &format!("PLACEBO[STUDY, TIME, contrast = {contrast}]"),
-            ),
+            no_e0.replace(block, &format!("PLACEBO[STUDY, TIME, contrast = {contrast}]")),
         )
         .unwrap();
-        ferx_core::prepare_run(
-            path.to_str().unwrap(),
-            Some(root().join(data).to_str().unwrap()),
-        )
-        .unwrap_or_else(|e| panic!("{e}"))
+        ferx_core::prepare_run(path.to_str().unwrap(), Some(root().join(data).to_str().unwrap()))
+            .unwrap_or_else(|e| panic!("{e}"))
     };
     let p = with_contrast("sum_to_zero");
     let (prof, t_prof) = fit(&p, &p.init_params, true);
@@ -884,27 +776,16 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
     let levels = &ferx_core::theta_level_values(&p.parsed.model, &prof.theta, Some(cov), None)
         .unwrap()["PLACEBO"];
     assert_eq!(levels.len(), 800);
-    assert!(levels
-        .iter()
-        .all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
+    assert!(levels.iter().all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
     let w = with_contrast("sum_to_zero_within");
     let (within, t_within) = fit(&w, &w.init_params, false);
     eprintln!(
         "S1 sum_to_zero_within: profiled OFV {:.6} ({t_within:.1}s, n_parameters {})",
         within.ofv, within.n_parameters
     );
-    assert!(
-        within.converged && within.ofv.is_finite(),
-        "{:?}",
-        within.warnings
-    );
+    assert!(within.converged && within.ofv.is_finite(), "{:?}", within.warnings);
     assert_eq!(within.n_parameters, 705, "3 θ, 700 levels, ω, σ");
-    assert!(
-        prof.ofv <= within.ofv + 1e-3,
-        "global {} vs within {}",
-        prof.ofv,
-        within.ofv
-    );
+    assert!(prof.ofv <= within.ofv + 1e-3, "global {} vs within {}", prof.ofv, within.ofv);
 }
 
 /// `run_covariance` on a **converged** profiled fit repeats its covariance step bit for bit
@@ -941,16 +822,9 @@ fn r1_run_covariance_replays_a_converged_profiled_fit() {
     // list at once to make this fail.
     assert_eq!(p.init_params.theta_names[0], "TVE0");
     let lossy_of = |f: &FitResult| -> usize {
-        let x_hat = f
-            .packed_estimate
-            .as_ref()
-            .expect("a profiled fit carries its packed point");
+        let x_hat = f.packed_estimate.as_ref().expect("a profiled fit carries its packed point");
         let repack = pack_params(&unpack_params(x_hat, &p.init_params));
-        x_hat
-            .iter()
-            .zip(&repack)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count()
+        x_hat.iter().zip(&repack).filter(|(a, b)| a.to_bits() != b.to_bits()).count()
     };
     let (f, lossy) = [47.0, 44.5, 45.5, 43.0, 44.0, 45.0]
         .into_iter()
@@ -972,24 +846,15 @@ fn r1_run_covariance_replays_a_converged_profiled_fit() {
     assert!(f.converged, "{:?}", f.warnings);
     assert!(lossy > 0);
     let want = f.covariance_matrix.as_ref().expect("inline covariance");
-    let opts = FitOptions {
-        verbose: false,
-        ..p.parsed.fit_options.clone()
-    };
+    let opts = FitOptions { verbose: false, ..p.parsed.fit_options.clone() };
     let replay = |fit: &FitResult, how: &str| {
         let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
             .unwrap_or_else(|e| panic!("{how}: {e}"));
         let got = r.covariance_matrix.as_ref().expect("replayed covariance");
         assert_eq!(got.shape(), want.shape(), "{how}");
-        let differing = got
-            .iter()
-            .zip(want.iter())
-            .filter(|(g, w)| g.to_bits() != w.to_bits())
-            .count();
-        eprintln!(
-            "R1 {how}: {differing} of {} covariance entries differ",
-            want.len()
-        );
+        let differing =
+            got.iter().zip(want.iter()).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+        eprintln!("R1 {how}: {differing} of {} covariance entries differ", want.len());
         assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
         assert_eq!(r.se_theta, f.se_theta, "{how}");
     };

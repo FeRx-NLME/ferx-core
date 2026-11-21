@@ -20,10 +20,7 @@ impl Fixture {
         let unique = format!(
             "docs-lint-{tag}-{}-{:?}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         );
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).expect("create fixture dir");
@@ -51,10 +48,7 @@ impl Drop for Fixture {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_docs-lint"))
-        .args(args)
-        .output()
-        .expect("run docs-lint")
+    Command::new(env!("CARGO_BIN_EXE_docs-lint")).args(args).output().expect("run docs-lint")
 }
 
 fn code(out: &Output) -> i32 {
@@ -96,10 +90,7 @@ fn help_exits_zero_and_names_the_rules() {
     assert_eq!(code(&out), 0);
     let text = stdout(&out);
     for rule in ["R1", "R2", "R3", "R4"] {
-        assert!(
-            text.contains(rule),
-            "--help does not mention {rule}:\n{text}"
-        );
+        assert!(text.contains(rule), "--help does not mention {rule}:\n{text}");
     }
 }
 
@@ -158,12 +149,7 @@ fn max_chars_moves_the_r1_threshold() {
     fx.write("page.qmd", "# Page\n\n## One\n\n0123456789\n");
     let lenient = run(&[fx.path().to_str().unwrap(), "--no-baseline"]);
     assert_eq!(code(&lenient), 0);
-    let strict = run(&[
-        fx.path().to_str().unwrap(),
-        "--no-baseline",
-        "--max-chars",
-        "5",
-    ]);
+    let strict = run(&[fx.path().to_str().unwrap(), "--no-baseline", "--max-chars", "5"]);
     assert_eq!(code(&strict), 1);
     assert!(stdout(&strict).contains("R1:"));
 }
@@ -177,14 +163,7 @@ fn the_baseline_excuses_shrinks_and_fails_growth_and_staleness() {
     let bl = baseline.to_str().unwrap().to_string();
 
     // Record the violation, then the same run passes.
-    let update = run(&[
-        &docs,
-        "--max-chars",
-        "5",
-        "--baseline",
-        &bl,
-        "--update-baseline",
-    ]);
+    let update = run(&[&docs, "--max-chars", "5", "--baseline", &bl, "--update-baseline"]);
     assert_eq!(code(&update), 0, "stderr:\n{}", stderr(&update));
     assert!(std::fs::read_to_string(&baseline).unwrap().contains("R1 "));
     let excused = run(&[&docs, "--max-chars", "5", "--baseline", &bl]);
@@ -195,21 +174,13 @@ fn the_baseline_excuses_shrinks_and_fails_growth_and_staleness() {
     fx.write("page.qmd", "# Page\n\n## One\n\n0123456789abcdef\n");
     let grown = run(&[&docs, "--max-chars", "5", "--baseline", &bl]);
     assert_eq!(code(&grown), 1);
-    assert!(
-        stdout(&grown).contains("may only shrink"),
-        "{}",
-        stdout(&grown)
-    );
+    assert!(stdout(&grown).contains("may only shrink"), "{}", stdout(&grown));
 
     // A section that no longer violates leaves a stale entry, which also fails.
     fx.write("page.qmd", "# Page\n\n## One\n\nx\n");
     let stale = run(&[&docs, "--max-chars", "5", "--baseline", &bl]);
     assert_eq!(code(&stale), 1);
-    assert!(
-        stdout(&stale).contains("remove this line"),
-        "{}",
-        stdout(&stale)
-    );
+    assert!(stdout(&stale).contains("remove this line"), "{}", stdout(&stale));
 }
 
 #[test]
@@ -217,11 +188,7 @@ fn a_malformed_baseline_is_a_usage_error_not_a_pass() {
     let fx = Fixture::new("badbaseline");
     fx.write("page.qmd", "# Page\n\n## One\n\nshort\n");
     let baseline = fx.write("baseline.txt", "R1 not-a-number docs/x.qmd::a\n");
-    let out = run(&[
-        fx.path().to_str().unwrap(),
-        "--baseline",
-        baseline.to_str().unwrap(),
-    ]);
+    let out = run(&[fx.path().to_str().unwrap(), "--baseline", baseline.to_str().unwrap()]);
     assert_eq!(code(&out), 2);
     assert!(stderr(&out).contains("character count"), "{}", stderr(&out));
 }

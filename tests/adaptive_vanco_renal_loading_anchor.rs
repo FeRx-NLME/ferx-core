@@ -87,26 +87,15 @@ const LOADING_DOSE_MG: f64 = 1500.0;
 fn vanco_renal_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_loading.ferx"))
         .expect("vanco renal-loading model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 750.0, "empiric maintenance start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
-    assert_eq!(
-        spec.target_window,
-        Some((10.0, 15.0)),
-        "trough target band (point metric)"
-    );
+    assert_eq!(spec.target_window, Some((10.0, 15.0)), "trough target band (point metric)");
     assert_eq!(
         spec.auc_target, None,
         "the example declares no auc_target; the window-AUC test adds one (#943)"
     );
-    assert_eq!(
-        spec.at.len(),
-        8,
-        "8 daily maintenance decisions, t = 24..=192 h"
-    );
+    assert_eq!(spec.at.len(), 8, "8 daily maintenance decisions, t = 24..=192 h");
     assert_eq!(spec.levels, None, "continuous (percentage) titration");
     assert_eq!(spec.rules.len(), 2, "increase / decrease rungs");
 
@@ -132,10 +121,7 @@ fn vanco_renal_loading_example_parses_and_pins_the_scenario() {
 fn vanco_renal_loading_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_loading.ferx"))
         .expect("vanco renal-loading model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
     // `read_nonmem_csv` auto-detects the `CRCL` column and, because it varies across rows,
     // populates each subject's per-record covariates — the snapshots the reactive driver
     // resolves PK from (#700), and the per-dose F snapshot for the base dose (#930).
@@ -167,11 +153,7 @@ fn vanco_renal_loading_titration_matches_mrgsolve() {
     // Eight maintenance decisions, each dosed (no hold/stop here). The loading dose is a BASE
     // dose — it drives the trajectory but never enters the reactive ledger.
     assert_eq!(res.decisions.len(), 8, "one decision per day, t = 24..=192");
-    assert_eq!(
-        res.ledger.len(),
-        8,
-        "every decision issued a maintenance dose"
-    );
+    assert_eq!(res.ledger.len(), 8, "every decision issued a maintenance dose");
     assert!(
         res.ledger.iter().all(|e| e.amt != LOADING_DOSE_MG),
         "the loading dose is a base dose, not a reactive ledger entry"
@@ -179,11 +161,8 @@ fn vanco_renal_loading_titration_matches_mrgsolve() {
 
     // The #930 assertion: the day-1 trough is the loading dose decayed under CRCL(24), not ~0
     // and not the t=0-covariate value. A dropped or covariate-frozen base regimen fails this.
-    let first_trough = res.decisions[0]
-        .observed_signals
-        .first()
-        .map(|s| s.value)
-        .unwrap_or(f64::NAN);
+    let first_trough =
+        res.decisions[0].observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
     assert!(
         first_trough > 5.0,
         "day-1 trough {first_trough:.6} must reflect the integrated loading dose (>5 mg/L); \
@@ -196,11 +175,7 @@ fn vanco_renal_loading_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - trough_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
@@ -268,9 +243,9 @@ fn vanco_renal_loading_titration_matches_mrgsolve() {
 
     // Point metric: troughs in [10, 15] on 2 of 8 decisions (3 and 7).
     assert!(
-        (m.pct_time_in_window.expect("trough window declared") - 2.0 / 8.0).abs() < 1e-9,
-        "pct_time_in_window {:?}",
-        m.pct_time_in_window
+        (m.pct_readings_in_window.expect("trough window declared") - 2.0 / 8.0).abs() < 1e-9,
+        "pct_readings_in_window {:?}",
+        m.pct_readings_in_window
     );
 
     // The example declares no `auc_target`, so no exposure metric is reported.
@@ -283,9 +258,8 @@ fn vanco_renal_loading_titration_matches_mrgsolve() {
 /// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
 /// `tests/reference/vanco_renal_loading_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
 /// start of each window, integrated on the same piecewise-constant CL as the troughs above.
-const REF_AUC24: [f64; 7] = [
-    261.270558, 336.037198, 459.171369, 551.095341, 548.295417, 507.064148, 450.456723,
-];
+const REF_AUC24: [f64; 7] =
+    [261.270558, 336.037198, 459.171369, 551.095341, 548.295417, 507.064148, 450.456723];
 
 /// Relative band of each ferx AUC24 against mrgsolve's (#943), the band the constant-path vanco
 /// anchor used before it moved to η = 0 (#2580). Measured on Linux aarch64
@@ -309,10 +283,7 @@ fn vanco_renal_loading_window_aucs_match_mrgsolve() {
 fn windows_in(band: (f64, f64)) -> usize {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_loading.ferx"))
         .expect("model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     spec.auc_target = Some(band);
     let pop = read_nonmem_csv(
         Path::new("tests/reference/vanco_renal_loading_mrgsolve/vanco_renal_loading_subject.csv"),

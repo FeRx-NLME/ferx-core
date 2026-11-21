@@ -73,16 +73,11 @@ fn write_config(dir: &Path, base: &str, section: &str) -> PathBuf {
 }
 
 fn direct_ofv(base: &ferx_tools::search::BaseModel) -> f64 {
-    fit(
-        &base.prepared.parsed.model,
-        &base.prepared.population,
-        &base.prepared.init_params,
-        &{
-            let mut o = base.prepared.parsed.fit_options.clone().quiet();
-            o.threads = Some(2);
-            o
-        },
-    )
+    fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &{
+        let mut o = base.prepared.parsed.fit_options.clone().quiet();
+        o.threads = Some(2);
+        o
+    })
     .expect("direct evaluation")
     .ofv
 }
@@ -98,17 +93,11 @@ fn an_evaluation_only_search_returns_the_input_bit_for_bit_and_fits_every_candid
     let result = run_ruvsearch(
         &config,
         &base,
-        RuvsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..RuvsearchRun::default()
-        },
+        RuvsearchRun { dir: Some(dir.path().join("run")), ..RuvsearchRun::default() },
     )
     .expect("search");
 
-    assert_eq!(
-        result.base_id, "input",
-        "a plain proportional input is its own base"
-    );
+    assert_eq!(result.base_id, "input", "a plain proportional input is its own base");
     assert_eq!(
         result.input_ofv.to_bits(),
         direct.to_bits(),
@@ -125,10 +114,7 @@ fn an_evaluation_only_search_returns_the_input_bit_for_bit_and_fits_every_candid
     // Every candidate was built and evaluated: IIV_on_RUV, power, combined,
     // and the time-varying cuts (warfarin's TAD distribution has three
     // distinct quantiles).
-    let it1: Vec<&str> = result
-        .iteration_rows(1)
-        .map(|r| r.candidate.as_str())
-        .collect();
+    let it1: Vec<&str> = result.iteration_rows(1).map(|r| r.candidate.as_str()).collect();
     assert_eq!(
         it1,
         vec![
@@ -142,9 +128,7 @@ fn an_evaluation_only_search_returns_the_input_bit_for_bit_and_fits_every_candid
     );
     for r in result.iteration_rows(1) {
         assert!(r.ofv.is_some_and(|v| v.is_finite()), "{r:?}");
-        let lrt = r
-            .lrt
-            .unwrap_or_else(|| panic!("{}: {:?}", r.candidate, r.note));
+        let lrt = r.lrt.unwrap_or_else(|| panic!("{}: {:?}", r.candidate, r.note));
         assert_eq!(lrt.df, 1, "{}: one parameter added", r.candidate);
         assert!(!lrt.significant);
         assert!(!r.selected);
@@ -180,9 +164,7 @@ fn an_evaluation_only_search_returns_the_input_bit_for_bit_and_fits_every_candid
     let run = dir.path().join("run");
     assert!(ferx_tools::ruvsearch::steps_path(&run).exists());
     assert!(ferx_tools::ruvsearch::final_model_path(&run).exists());
-    assert!(ferx_tools::ruvsearch::models_dir(&run)
-        .join("power-1.ferx")
-        .exists());
+    assert!(ferx_tools::ruvsearch::models_dir(&run).join("power-1.ferx").exists());
     let steps = std::fs::read_to_string(ferx_tools::ruvsearch::steps_path(&run)).unwrap();
     assert_eq!(steps.lines().count(), 1 + result.rows.len());
 }
@@ -190,11 +172,8 @@ fn an_evaluation_only_search_returns_the_input_bit_for_bit_and_fits_every_candid
 #[test]
 fn a_generated_power_candidate_is_the_hand_written_model() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        BASE,
-        "max_iter = 1\nskip = [\"IIV_on_RUV\", \"time_varying\"]\n",
-    );
+    let path =
+        write_config(dir.path(), BASE, "max_iter = 1\nskip = [\"IIV_on_RUV\", \"time_varying\"]\n");
     let config = SearchConfig::load(&path).unwrap();
     let base = config.load_base().unwrap();
     let result = run_ruvsearch(&config, &base, RuvsearchRun::default()).expect("search");
@@ -207,10 +186,7 @@ fn a_generated_power_candidate_is_the_hand_written_model() {
             "  sigma PROP_ERR ~ 0.02 (sd)\n",
             "  sigma PROP_ERR ~ 0.02 (sd)\n  theta RUV_POW(1.0, 0.01, 10.0)\n",
         )
-        .replace(
-            "DV ~ proportional(PROP_ERR)",
-            "DV ~ power(PROP_ERR, RUV_POW)",
-        );
+        .replace("DV ~ proportional(PROP_ERR)", "DV ~ power(PROP_ERR, RUV_POW)");
     let g = parse_full_model(&generated).unwrap_or_else(|e| panic!("{e}\n{generated}"));
     let h = parse_full_model(&hand).unwrap();
     assert_eq!(g.model.theta_names, h.model.theta_names);
@@ -219,39 +195,15 @@ fn a_generated_power_candidate_is_the_hand_written_model() {
         o.threads = Some(2);
         o
     };
-    let fg = fit(
-        &g.model,
-        &base.prepared.population,
-        &g.model.default_params,
-        &opts,
-    )
-    .unwrap();
-    let fh = fit(
-        &h.model,
-        &base.prepared.population,
-        &h.model.default_params,
-        &opts,
-    )
-    .unwrap();
-    assert_eq!(
-        fg.ofv.to_bits(),
-        fh.ofv.to_bits(),
-        "{} vs {}",
-        fg.ofv,
-        fh.ofv
-    );
+    let fg = fit(&g.model, &base.prepared.population, &g.model.default_params, &opts).unwrap();
+    let fh = fit(&h.model, &base.prepared.population, &h.model.default_params, &opts).unwrap();
+    assert_eq!(fg.ofv.to_bits(), fh.ofv.to_bits(), "{} vs {}", fg.ofv, fh.ofv);
     assert_eq!(fg.n_parameters, fh.n_parameters);
     // And a power candidate at a non-neutral exponent is a different model
     // from the input: the straddle that makes the equality above meaningful.
     let other = hand.replace("RUV_POW(1.0,", "RUV_POW(1.3,");
     let o = parse_full_model(&other).unwrap();
-    let fo = fit(
-        &o.model,
-        &base.prepared.population,
-        &o.model.default_params,
-        &opts,
-    )
-    .unwrap();
+    let fo = fit(&o.model, &base.prepared.population, &o.model.default_params, &opts).unwrap();
     assert_ne!(fo.ofv.to_bits(), fh.ofv.to_bits());
 }
 
@@ -271,10 +223,7 @@ fn an_additive_input_is_refitted_as_proportional_first() {
     let result = run_ruvsearch(&config, &base, RuvsearchRun::default()).expect("search");
     assert_eq!(result.base_id, "base");
     let base_model = &result.models["base"];
-    assert_eq!(
-        base_model.block_lines("error_model"),
-        vec!["DV ~ proportional(PROP_ERR)"]
-    );
+    assert_eq!(base_model.block_lines("error_model"), vec!["DV ~ proportional(PROP_ERR)"]);
     assert!(!base_model.render().contains("ADD_ERR"));
     assert!(result.base_ofv.is_finite() && result.input_ofv.is_finite());
     // No candidate at all: `power` skipped retires `combined` too.
@@ -283,10 +232,7 @@ fn an_additive_input_is_refitted_as_proportional_first() {
     // The final comparison: the input is returned (the base cannot beat the
     // input by 10.83 in an evaluation), and the note says so.
     assert_eq!(result.final_id, "input");
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("did not beat the input model")));
+    assert!(result.notes.iter().any(|n| n.contains("did not beat the input model")));
     // What `ferx ruvsearch` prints: the base line, the iteration table, the
     // final model.
     let summary = render_summary(&result);
@@ -303,10 +249,7 @@ fn the_cwres_prescreen_evaluates_every_screening_model_on_the_residuals() {
     let result = run_ruvsearch(
         &config,
         &base,
-        RuvsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..RuvsearchRun::default()
-        },
+        RuvsearchRun { dir: Some(dir.path().join("run")), ..RuvsearchRun::default() },
     )
     .expect("search");
     let screened: Vec<_> = result.rows.iter().filter(|r| r.screened).collect();
@@ -322,10 +265,7 @@ fn the_cwres_prescreen_evaluates_every_screening_model_on_the_residuals() {
             r.failures
         );
     }
-    let base_row = screened
-        .iter()
-        .find(|r| r.candidate == "cwres-base-1")
-        .unwrap();
+    let base_row = screened.iter().find(|r| r.candidate == "cwres-base-1").unwrap();
     assert!(base_row.feature.is_none());
     // The summary renders the screen as its own table, the base first.
     let summary = render_summary(&result);
@@ -347,11 +287,7 @@ fn the_cwres_prescreen_evaluates_every_screening_model_on_the_residuals() {
     // A screening *evaluation* compares the candidates' variance structures
     // at their initial values, so it may or may not clear the cutoff; what
     // is pinned is the shape — at most one refit, and it is the screened pick.
-    let refits: Vec<_> = result
-        .rows
-        .iter()
-        .filter(|r| !r.screened && r.iteration == 1)
-        .collect();
+    let refits: Vec<_> = result.rows.iter().filter(|r| !r.screened && r.iteration == 1).collect();
     assert!(refits.len() <= 1, "{refits:?}");
     if let Some(refit) = refits.first() {
         let pick = screened.iter().find(|r| r.selected).expect("a pick");
@@ -381,25 +317,12 @@ fn a_chained_method_with_a_foce_stage_does_not_test_iiv_on_ruv() {
     let result = run_ruvsearch(
         &config,
         &base,
-        RuvsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..RuvsearchRun::default()
-        },
+        RuvsearchRun { dir: Some(dir.path().join("run")), ..RuvsearchRun::default() },
     )
     .expect("search");
+    assert!(result.notes.iter().any(|n| n.contains("IIV_on_RUV not tested")), "{:?}", result.notes);
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("IIV_on_RUV not tested")),
-        "{:?}",
-        result.notes
-    );
-    assert!(
-        result
-            .rows
-            .iter()
-            .all(|r| !r.candidate.starts_with("IIV_on_RUV")),
+        result.rows.iter().all(|r| !r.candidate.starts_with("IIV_on_RUV")),
         "{:?}",
         result.rows.iter().map(|r| &r.candidate).collect::<Vec<_>>()
     );

@@ -61,29 +61,16 @@ use std::path::Path;
 fn nonmem_preds(name: &str) -> Vec<(String, f64, f64)> {
     let path = format!("nonmem_anchor/results/{name}.tab");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
-    let header: Vec<&str> = lines
-        .next()
-        .expect(".tab header")
-        .split_whitespace()
-        .collect();
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
+    let header: Vec<&str> = lines.next().expect(".tab header").split_whitespace().collect();
     let col = |name: &str| header.iter().position(|h| *h == name);
-    let (id, time, evid, pred) = (
-        col("ID").unwrap(),
-        col("TIME").unwrap(),
-        col("EVID").unwrap(),
-        col("PRED").unwrap(),
-    );
+    let (id, time, evid, pred) =
+        (col("ID").unwrap(), col("TIME").unwrap(), col("EVID").unwrap(), col("PRED").unwrap());
     let mdv = col("MDV");
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0 && mdv.is_none_or(|m| r[m] == 0.0))
@@ -102,11 +89,7 @@ fn worst_pred_error(anchor: &str, twin: &str, csv: &str, pk_only: &[(&str, &[f64
 
 /// [`worst_pred_error`] restricted to the subjects in `only` when it is `Some`.
 fn worst_pred_error_on(
-    anchor: &str,
-    twin: &str,
-    csv: &str,
-    pk_only: &[(&str, &[f64])],
-    only: Option<&[&str]>,
+    anchor: &str, twin: &str, csv: &str, pk_only: &[(&str, &[f64])], only: Option<&[&str]>,
 ) -> f64 {
     let keep = |id: &str| only.is_none_or(|ids| ids.contains(&id));
     let model_path = format!("nonmem_anchor/{twin}_fit.ferx");
@@ -137,11 +120,7 @@ fn worst_pred_error_on(
             r.time
         );
         // Finite first: `f64::max` would discard a NaN.
-        assert!(
-            r.pred.is_finite(),
-            "{anchor} ID {id} TIME {t}: PRED {}",
-            r.pred
-        );
+        assert!(r.pred.is_finite(), "{anchor} ID {id} TIME {t}: PRED {}", r.pred);
         let err = (r.pred - want).abs();
         assert!(
             err < tol,
@@ -150,10 +129,7 @@ fn worst_pred_error_on(
         );
         worst = worst.max(err);
     }
-    println!(
-        "{anchor}: worst |PRED − NONMEM| {worst:.3e} over {} observations",
-        nm.len()
-    );
+    println!("{anchor}: worst |PRED − NONMEM| {worst:.3e} over {} observations", nm.len());
     worst
 }
 
@@ -163,13 +139,7 @@ fn a_leading_evid2_or_mdv1_record_starts_the_clock_matches_nonmem() {
         "evid2_clock",
         "evid2_clock",
         "evid2_clock",
-        &[
-            ("1", &[0.0]),
-            ("2", &[0.0]),
-            ("3", &[0.0]),
-            ("4", &[0.0]),
-            ("5", &[0.0]),
-        ],
+        &[("1", &[0.0]), ("2", &[0.0]), ("3", &[0.0]), ("4", &[0.0]), ("5", &[0.0])],
     );
 }
 
@@ -188,12 +158,7 @@ fn co_timed_records_follow_file_order_matches_nonmem() {
         ("7", &[]),
     ];
     worst_pred_error("tied_evid2", "tied_evid2", "tied_evid2", pk_only);
-    worst_pred_error(
-        "tied_evid2_advan1",
-        "tied_evid2_advan1",
-        "tied_evid2",
-        pk_only,
-    );
+    worst_pred_error("tied_evid2_advan1", "tied_evid2_advan1", "tied_evid2", pk_only);
 }
 
 #[test]
@@ -248,13 +213,7 @@ fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_recor
     let d1: &[&str] = &["1", "2", "5"];
     for anchor in ["addl_dx", "addl_dt"] {
         worst_pred_error_on(anchor, anchor, "addl_inf", pk_only, Some(d1));
-        worst_pred_error_on(
-            anchor,
-            &format!("{anchor}_ode"),
-            "addl_inf",
-            pk_only,
-            Some(d1),
-        );
+        worst_pred_error_on(anchor, &format!("{anchor}_ode"), "addl_inf", pk_only, Some(d1));
     }
 }
 

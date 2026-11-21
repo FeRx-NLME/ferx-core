@@ -70,13 +70,8 @@ struct Allometry {
 /// feature is not searched" — so the fillers are dropped before the sets are
 /// compared, and *only* when ferx's subspace is silent about that keyword,
 /// which is what keeps a genuinely dropped statement red.
-const FILLERS: [&str; 5] = [
-    "ELIMINATION(FO)",
-    "TRANSITS(0)",
-    "LAGTIME(OFF)",
-    "PERIPHERALS(0)",
-    "ABSORPTION(INST)",
-];
+const FILLERS: [&str; 5] =
+    ["ELIMINATION(FO)", "TRANSITS(0)", "LAGTIME(OFF)", "PERIPHERALS(0)", "ABSORPTION(INST)"];
 
 fn anchor() -> Anchor {
     serde_json::from_str(ANCHOR).expect("the Pharmpy AMD anchor parses")
@@ -92,10 +87,7 @@ fn statements(mfl: &str) -> BTreeSet<String> {
 }
 
 fn keyword(statement: &str) -> &str {
-    statement
-        .split_once('(')
-        .map(|(k, _)| k.trim_end_matches('?'))
-        .unwrap_or(statement)
+    statement.split_once('(').map(|(k, _)| k.trim_end_matches('?')).unwrap_or(statement)
 }
 
 /// `pharmpy` minus the fillers for keywords `ferx` does not mention.
@@ -140,21 +132,11 @@ fn every_strategy_order_matches_pharmpy() {
         anchor.orders.keys().collect::<Vec<_>>()
     );
     for (name, strategy) in ferx {
-        let theirs = anchor
-            .orders
-            .get(name)
-            .unwrap_or_else(|| panic!("Pharmpy has no `{name}` strategy"));
-        let ours: Vec<String> = strategy
-            .order()
-            .iter()
-            .map(|s| s.label().to_string())
-            .collect();
+        let theirs =
+            anchor.orders.get(name).unwrap_or_else(|| panic!("Pharmpy has no `{name}` strategy"));
+        let ours: Vec<String> = strategy.order().iter().map(|s| s.label().to_string()).collect();
         assert_eq!(&ours, theirs, "the {name} strategy runs a different order");
-        assert_eq!(
-            strategy.label(),
-            name,
-            "the strategy is spelled differently"
-        );
+        assert_eq!(strategy.label(), name, "the strategy is spelled differently");
     }
 }
 
@@ -219,9 +201,7 @@ fn the_covariate_and_allometry_subspaces_match_pharmpys() {
         // statement, which is what every tool of the epic refuses by name.
         let structural = ferx_subspace(&case.mfl, Step::Structural);
         assert!(
-            structural
-                .iter()
-                .all(|s| !s.starts_with("COVARIATE") && !s.starts_with("ALLOMETRY")),
+            structural.iter().all(|s| !s.starts_with("COVARIATE") && !s.starts_with("ALLOMETRY")),
             "`{}`: a covariate statement reached the structural step",
             case.mfl
         );
@@ -257,10 +237,7 @@ fn the_default_fill_divergence_is_real() {
             case.mfl
         );
     }
-    assert!(
-        seen > 0,
-        "the corpus no longer covers the default-fill case"
-    );
+    assert!(seen > 0, "the corpus no longer covers the default-fill case");
 
     // The same on the covariate side: no COVARIATE statement, and Pharmpy
     // still hands covsearch its two exploratory defaults.
@@ -273,10 +250,7 @@ fn the_default_fill_divergence_is_real() {
         assert!(ferx_subspace(&case.mfl, Step::Covariates).is_empty());
         assert!(statements(&case.covsearch).len() >= 2, "`{}`", case.mfl);
     }
-    assert!(
-        seen > 0,
-        "the corpus no longer covers a space with no COVARIATE"
-    );
+    assert!(seen > 0, "the corpus no longer covers a space with no COVARIATE");
 }
 
 /// **Divergence.** Pharmpy resolves a `LET` when it parses the space; ferx

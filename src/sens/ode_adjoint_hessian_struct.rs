@@ -233,11 +233,7 @@ impl Preps {
     /// The prepared adjoints of `n` adjoint vectors, vector `v`'s aggregate `k` read from
     /// `src(v)[at[k]..]`.
     fn new<'s>(
-        aggs: &[(usize, Mono)],
-        at: &[usize],
-        m: usize,
-        n: usize,
-        src: impl Fn(usize) -> &'s [f64],
+        aggs: &[(usize, Mono)], at: &[usize], m: usize, n: usize, src: impl Fn(usize) -> &'s [f64],
     ) -> Self {
         let mut off = Vec::with_capacity(aggs.len());
         let mut width = 0;
@@ -273,12 +269,7 @@ impl Preps {
                 }
             }
         }
-        Preps {
-            buf,
-            off,
-            width,
-            monos: aggs.iter().map(|a| a.1).collect(),
-        }
+        Preps { buf, off, width, monos: aggs.iter().map(|a| a.1).collect() }
     }
 
     /// Vector `v`'s aggregate `k`.
@@ -339,14 +330,7 @@ fn back(a: Prep<'_>, g: &[f64], r: f64, dg: &mut [f64], qg: &mut [f64]) -> f64 {
 /// is `P·G` as [`back`] left it (a `Gg` aggregate; direction-free), `sc` scratch of width `2m`.
 #[allow(clippy::too_many_arguments)]
 fn back_t(
-    a: Prep<'_>,
-    ad: Prep<'_>,
-    g: &[f64],
-    gd: &[f64],
-    r: f64,
-    rd: f64,
-    qg: &[f64],
-    dgd: &mut [f64],
+    a: Prep<'_>, ad: Prep<'_>, g: &[f64], gd: &[f64], r: f64, rd: f64, qg: &[f64], dgd: &mut [f64],
     sc: &mut [f64],
 ) -> f64 {
     match (a, ad) {
@@ -399,14 +383,8 @@ impl CovPlan<'_> {
         let fam = match self.objective {
             Objective::Focei => Family::Focei,
             Objective::Foce => Family::Foce,
-            Objective::Agq {
-                n_agq: 1,
-                exact: true,
-            } => Family::Laplace,
-            Objective::Agq {
-                n_agq: 1,
-                exact: false,
-            } => Family::LaplaceGn,
+            Objective::Agq { n_agq: 1, exact: true } => Family::Laplace,
+            Objective::Agq { n_agq: 1, exact: false } => Family::LaplaceGn,
             Objective::Agq { exact: true, .. } => Family::AgqExact,
             Objective::Agq { exact: false, .. } => Family::AgqGn,
         };
@@ -428,11 +406,8 @@ impl CovPlan<'_> {
     /// variance), the η-gradients `g(j, k)` and the packed coordinates `x(i)`. `None` where the
     /// structured form does not hold here (a row off its domain, FOCE off its Woodbury gate).
     fn rows(
-        &self,
-        f: &dyn Fn(usize) -> f64,
-        fp: &dyn Fn(usize) -> Option<f64>,
-        gv: &dyn Fn(usize, usize) -> f64,
-        qv: &dyn Fn(usize, usize) -> f64,
+        &self, f: &dyn Fn(usize) -> f64, fp: &dyn Fn(usize) -> Option<f64>,
+        gv: &dyn Fn(usize, usize) -> f64, qv: &dyn Fn(usize, usize) -> f64,
         xv: &dyn Fn(usize) -> f64,
     ) -> Option<std::cell::Ref<'_, Rows>> {
         if self.st_rows.borrow().is_none() {
@@ -441,9 +416,7 @@ impl CovPlan<'_> {
             let n_obs = self.subject.observations.len();
             let pop_lane = (family == Family::Foce).then_some(1);
             let s0 = packed_segments(self.template).sigma_start();
-            let sig: Vec<usize> = (0..self.sc.params.sigma.values.len())
-                .map(|k| s0 + k)
-                .collect();
+            let sig: Vec<usize> = (0..self.sc.params.sigma.values.len()).map(|k| s0 + k).collect();
             let lane0 = 1 + usize::from(pop_lane.is_some());
             let (rs, l_chol) = match lane0 + sig.len() {
                 0..=2 => self.eval_rows::<2>(family, n_obs, f, fp, xv, &sig, lane0),
@@ -453,11 +426,7 @@ impl CovPlan<'_> {
             }?;
             let aggs = family.aggs();
             let (at, na) = offsets(aggs, pn);
-            let nq = if family.rows() == Family::Laplace {
-                pn * (pn + 1) / 2
-            } else {
-                0
-            };
+            let nq = if family.rows() == Family::Laplace { pn * (pn + 1) / 2 } else { 0 };
             let mut s = Vec::with_capacity(n_obs);
             let mut g = Vec::with_capacity(n_obs);
             let mut qs = Vec::with_capacity(n_obs);
@@ -490,15 +459,7 @@ impl CovPlan<'_> {
                     return None;
                 }
             }
-            *self.st_rows.borrow_mut() = Some(Rows {
-                family,
-                pop_lane,
-                sig,
-                s,
-                g,
-                q: qs,
-                aggr,
-            });
+            *self.st_rows.borrow_mut() = Some(Rows { family, pop_lane, sig, s, g, q: qs, aggr });
         }
         let rows = self.st_rows.borrow();
         std::cell::Ref::filter_map(rows, Option::as_ref).ok()
@@ -507,10 +468,7 @@ impl CovPlan<'_> {
     /// The population parameters on `Dual2<L>`: σ's packed coordinates `sig` on lanes
     /// `lane0 ..`, everything else constant.
     fn local_params<const L: usize>(
-        &self,
-        xv: &dyn Fn(usize) -> f64,
-        sig: &[usize],
-        lane0: usize,
+        &self, xv: &dyn Fn(usize) -> f64, sig: &[usize], lane0: usize,
     ) -> Option<crate::sens::focei_kernel::ParT<Dual2<L>>> {
         let xo = |i: usize| -> Dual2<L> {
             let v = xv(i);
@@ -536,14 +494,8 @@ impl CovPlan<'_> {
     /// (FOCE's Woodbury gate).
     #[allow(clippy::too_many_arguments)]
     fn eval_rows<const L: usize>(
-        &self,
-        family: Family,
-        n_obs: usize,
-        f: &dyn Fn(usize) -> f64,
-        fp: &dyn Fn(usize) -> Option<f64>,
-        xv: &dyn Fn(usize) -> f64,
-        sig: &[usize],
-        lane0: usize,
+        &self, family: Family, n_obs: usize, f: &dyn Fn(usize) -> f64,
+        fp: &dyn Fn(usize) -> Option<f64>, xv: &dyn Fn(usize) -> f64, sig: &[usize], lane0: usize,
     ) -> Option<(Vec<Vec<Dual2<NL>>>, Vec<Vec<f64>>)> {
         let p = self.local_params::<L>(xv, sig, lane0)?;
         let mut out = Vec::with_capacity(n_obs);
@@ -570,9 +522,7 @@ impl CovPlan<'_> {
         let pn = self.pn();
         let l = if family == Family::Foce {
             let lc = p.omega_chol(pn);
-            (0..pn)
-                .map(|a| (0..pn).map(|c| lc[a][c].value).collect())
-                .collect()
+            (0..pn).map(|a| (0..pn).map(|c| lc[a][c].value).collect()).collect()
         } else {
             Vec::new()
         };
@@ -581,13 +531,8 @@ impl CovPlan<'_> {
 
     /// The quadrature node rows' `ℓ` on `Dual2<L>` (prediction, then σ), widened.
     fn eval_node_rows<const L: usize>(
-        &self,
-        fb: &dyn Fn(usize, usize) -> f64,
-        xv: &dyn Fn(usize) -> f64,
-        n_nodes: usize,
-        n_obs: usize,
-        s0: usize,
-        n_sig: usize,
+        &self, fb: &dyn Fn(usize, usize) -> f64, xv: &dyn Fn(usize) -> f64, n_nodes: usize,
+        n_obs: usize, s0: usize, n_sig: usize,
     ) -> Option<Vec<Vec<Dual2<NL>>>> {
         let sig: Vec<usize> = (s0..s0 + n_sig).collect();
         let p = self.local_params::<L>(xv, &sig, 1)?;
@@ -603,10 +548,7 @@ impl CovPlan<'_> {
     /// The rows at the quadrature's nodes (formed once, as [`Self::rows`]): `fb(d, j)` node
     /// `d`'s prediction of observation `j`, `xv` the packed coordinates.
     fn node_rows(
-        &self,
-        fb: &dyn Fn(usize, usize) -> f64,
-        xv: &dyn Fn(usize) -> f64,
-        n_nodes: usize,
+        &self, fb: &dyn Fn(usize, usize) -> f64, xv: &dyn Fn(usize) -> f64, n_nodes: usize,
     ) -> Option<std::cell::Ref<'_, NodeRows>> {
         if self.st_node_rows.borrow().is_none() {
             let n_obs = self.subject.observations.len();
@@ -649,12 +591,8 @@ impl CovPlan<'_> {
             return true;
         }
         let val = |s: usize| inputs[s * (1 + kt)];
-        self.node_rows(
-            &|d, j| val(sl.nf + d * sl.n_rows + j),
-            &|i| val(sl.x + i),
-            sl.n_nodes,
-        )
-        .is_some()
+        self.node_rows(&|d, j| val(sl.nf + d * sl.n_rows + j), &|i| val(sl.x + i), sl.n_nodes)
+            .is_some()
     }
 
     /// The anchor rows' tangents along a pass's `kt` directions, read from the kernel inputs
@@ -711,44 +649,19 @@ impl CovPlan<'_> {
                 let t = &tg[(j * kt + a) * stride..(j * kt + a + 1) * stride];
                 let ad = &mut adot[a * na..(a + 1) * na];
                 for (k, &(si, mono)) in aggs.iter().enumerate() {
-                    let (v, vd) = if mono == Mono::Q {
-                        (q, &t[o_q..o_r])
-                    } else {
-                        (g, &t[o_g..o_q])
-                    };
-                    aggr_t(
-                        mono,
-                        v,
-                        vd,
-                        rows.s[j][si].value,
-                        t[o_r + si],
-                        pn,
-                        &mut ad[at[k]..],
-                    );
+                    let (v, vd) =
+                        if mono == Mono::Q { (q, &t[o_q..o_r]) } else { (g, &t[o_g..o_q]) };
+                    aggr_t(mono, v, vd, rows.s[j][si].value, t[o_r + si], pn, &mut ad[at[k]..]);
                 }
             }
         }
-        AnchorTan {
-            tg,
-            slots,
-            stride,
-            o_g,
-            o_q,
-            o_r,
-            nla,
-            adot,
-        }
+        AnchorTan { tg, slots, stride, o_g, o_q, o_r, nla, adot }
     }
 
     /// Stage 1's input `(η, x, A)` along `kt` tangents: η and x from the kernel inputs, the
     /// anchor's aggregates and their tangents.
     fn stage1_in(
-        &self,
-        rows: &Rows,
-        at: &AnchorTan,
-        inputs: &[f64],
-        sl: &Slots,
-        kt: usize,
+        &self, rows: &Rows, at: &AnchorTan, inputs: &[f64], sl: &Slots, kt: usize,
     ) -> Vec<f64> {
         let (pn, nx, lk) = (self.pn(), self.nx, 1 + kt);
         let na = rows.aggr.len();
@@ -832,12 +745,7 @@ impl CovPlan<'_> {
     /// `stage` 2 is the objective (one output, seeded `1`); stage 1 the nodes' locations, seeded
     /// with `seed` (per output its value lane, then its tangent along each direction).
     fn reduce_for(
-        &self,
-        family: Family,
-        stage: u8,
-        rin: &[f64],
-        kt: usize,
-        seed: &[f64],
+        &self, family: Family, stage: u8, rin: &[f64], kt: usize, seed: &[f64],
     ) -> Option<Vec<f64>> {
         let lk = 1 + kt;
         let n_in = rin.len() / lk;
@@ -873,12 +781,7 @@ impl CovPlan<'_> {
     /// once, each direction a seed of its tangents. `None` where its plan has no rows kernels or
     /// its guard does not hold at these values; the caller then runs a direction at a time.
     fn reduce_rows(
-        &self,
-        family: Family,
-        stage: u8,
-        rin: &[f64],
-        kt: usize,
-        seed: &[f64],
+        &self, family: Family, stage: u8, rin: &[f64], kt: usize, seed: &[f64],
     ) -> Option<Vec<f64>> {
         let lk = 1 + kt;
         let (n_in, n_out) = (rin.len() / lk, seed.len() / lk);
@@ -908,12 +811,7 @@ impl CovPlan<'_> {
     /// each of its `kt` directions a seed: its plan and the kept forward. `None` without
     /// tangents, where the plan has no rows kernels, or where its guard does not hold.
     fn reduce_fwd_rows(
-        &self,
-        family: Family,
-        stage: u8,
-        rin: &[f64],
-        kt: usize,
-        n_out: usize,
+        &self, family: Family, stage: u8, rin: &[f64], kt: usize, n_out: usize,
     ) -> Option<(std::sync::Arc<kj::Plan>, kj::RowsFwd)> {
         let lk = 1 + kt;
         let n_in = rin.len() / lk;
@@ -921,10 +819,7 @@ impl CovPlan<'_> {
             return None;
         }
         let vals: Vec<f64> = (0..n_in).map(|i| rin[i * lk]).collect();
-        let plan = self
-            .reduce_run(family, stage, &vals, 0, n_out)?
-            .plan()
-            .clone();
+        let plan = self.reduce_run(family, stage, &vals, 0, n_out)?.plan().clone();
         if !plan.rows_serve(Layout::F64) {
             return None;
         }
@@ -941,17 +836,9 @@ impl CovPlan<'_> {
     /// The reduce `R(η, x, A, w)` along `kt` tangents (`rin`: each input's value, then its
     /// tangents): a small recorded program, no rows.
     fn reduce_run(
-        &self,
-        family: Family,
-        stage: u8,
-        rin: &[f64],
-        kt: usize,
-        n_out: usize,
+        &self, family: Family, stage: u8, rin: &[f64], kt: usize, n_out: usize,
     ) -> Option<super::kernel::KernelRun> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..Layout::F64
-        };
+        let layout = Layout { tan: kt as u8, ..Layout::F64 };
         let si = usize::from(stage == 1);
         // The subject's reduce plan, looked up once (its key hashes the subject and the
         // parameters); every later run goes straight to it unless a guard sends it back.
@@ -969,14 +856,8 @@ impl CovPlan<'_> {
             _ => Vec::new(),
         };
         let nn = grid.len();
-        let (model, subject, template, sc, so, ctx) = (
-            self.sc.model,
-            self.subject,
-            self.template,
-            self.sc,
-            self.so,
-            self.ctx,
-        );
+        let (model, subject, template, sc, so, ctx) =
+            (self.sc.model, self.subject, self.template, self.sc, self.so, self.ctx);
         let record = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
             type T = kj::Tr;
             let c = |v: f64| <T as PkNum>::from_f64(v);
@@ -989,27 +870,21 @@ impl CovPlan<'_> {
             let w = |k: usize| lv[pn + nx + na + nn + k];
             let oi = p.omega_inv(pn).clone();
             let mat = |off: usize| -> Vec<Vec<T>> {
-                (0..pn)
-                    .map(|k| (0..pn).map(|l| ag(off + tri(k, l))).collect())
-                    .collect()
+                (0..pn).map(|k| (0..pn).map(|l| ag(off + tri(k, l))).collect()).collect()
             };
-            let oieta: Vec<T> = (0..pn)
-                .map(|k| (0..pn).fold(c(0.0), |s, l| s + oi[k][l] * eta[l]))
-                .collect();
+            let oieta: Vec<T> =
+                (0..pn).map(|k| (0..pn).fold(c(0.0), |s, l| s + oi[k][l] * eta[l])).collect();
             match family {
                 Family::Focei => {
                     let s = mat(at[2]);
-                    let a: Vec<Vec<T>> = (0..pn)
-                        .map(|k| (0..pn).map(|l| oi[k][l] + s[k][l]).collect())
-                        .collect();
+                    let a: Vec<Vec<T>> =
+                        (0..pn).map(|k| (0..pn).map(|l| oi[k][l] + s[k][l]).collect()).collect();
                     let ld = chol_logdet(&chol(&a)?);
                     let mut wg = c(0.0);
                     for k in 0..pn {
                         wg = wg + w(k) * (oieta[k] + c(0.5) * ag(at[1] + k));
                     }
-                    Some(vec![
-                        c(0.5) * (ag(at[0]) + prior_of(ctx, &eta, &p) + ld) - wg,
-                    ])
+                    Some(vec![c(0.5) * (ag(at[0]) + prior_of(ctx, &eta, &p) + ld) - wg])
                 }
                 Family::Foce => {
                     let s = mat(at[2]);
@@ -1101,9 +976,8 @@ impl CovPlan<'_> {
                     let half_logdet = c(0.5) * chol_logdet(&lh);
                     // `wᵀg` (stage 2 only: stage 1's inputs stop at the aggregates).
                     let wg = || {
-                        (0..pn).fold(c(0.0), |acc, k| {
-                            acc + w(k) * (oieta[k] + c(0.5) * ag(at[1] + k))
-                        })
+                        (0..pn)
+                            .fold(c(0.0), |acc, k| acc + w(k) * (oieta[k] + c(0.5) * ag(at[1] + k)))
                     };
                     if family == Family::LaplaceGn {
                         return Some(vec![
@@ -1138,9 +1012,7 @@ impl CovPlan<'_> {
                             c(*cw) - c(0.5) * (prior_of(ctx, b, &p) + node_agg(d))
                         })
                         .collect();
-                    Some(vec![
-                        half_logdet - crate::sens::num::log_sum_exp(&terms) - wg(),
-                    ])
+                    Some(vec![half_logdet - crate::sens::num::log_sum_exp(&terms) - wg()])
                 }
             }
         };
@@ -1182,9 +1054,7 @@ impl CovPlan<'_> {
     /// back-propagation [`Self::struct_finish`] completes once every contribution to the
     /// aggregates' adjoint is in; and `ψ_a`.
     pub(super) fn struct_adjoint(
-        &self,
-        r: &CovRun,
-        seed: &[f64],
+        &self, r: &CovRun, seed: &[f64],
     ) -> Option<(Vec<f64>, Vec<f64>, Pending)> {
         let inputs = r.st_inputs.as_ref()?;
         let (sl, kt) = (&r.slots, r.kt);
@@ -1288,10 +1158,8 @@ impl CovPlan<'_> {
         // The node rows: `N_d`'s adjoint back to the node predictions and σ.
         if let Some(nr) = nodes.as_ref() {
             for d in 0..nn {
-                let (nv, nt) = (
-                    radj[(base + d) * lk],
-                    &radj[(base + d) * lk + 1..(base + d + 1) * lk],
-                );
+                let (nv, nt) =
+                    (radj[(base + d) * lk], &radj[(base + d) * lk + 1..(base + d + 1) * lk]);
                 for (j, x) in nr.l[d].iter().enumerate() {
                     let ls = |lane: usize| {
                         if lane == 0 {
@@ -1323,11 +1191,7 @@ impl CovPlan<'_> {
     /// [`Self::struct_nodes`]' output; the node plans' reverse) adds its η, x and aggregate
     /// adjoints; then the aggregates' adjoint back through the anchor rows into `adj`.
     pub(super) fn struct_finish(
-        &self,
-        r: &CovRun,
-        adj: &mut [f64],
-        pending: Pending,
-        b_seed: Option<&[f64]>,
+        &self, r: &CovRun, adj: &mut [f64], pending: Pending, b_seed: Option<&[f64]>,
     ) -> Option<()> {
         let inputs = r.st_inputs.as_ref()?;
         let (sl, kt) = (&r.slots, r.kt);
@@ -1336,11 +1200,7 @@ impl CovPlan<'_> {
         let nx = self.nx;
         let rows = self.st_rows.borrow();
         let rows = rows.as_ref()?;
-        let Pending {
-            at,
-            mut a_val,
-            mut a_tan,
-        } = pending;
+        let Pending { at, mut a_val, mut a_tan } = pending;
         let family = rows.family;
         let aggs = family.aggs();
         let (offs, na) = offsets(aggs, pn);
@@ -1368,16 +1228,7 @@ impl CovPlan<'_> {
         let pt = Preps::new(aggs, &offs, pn, kt, |a| &a_tan[a * na..(a + 1) * na]);
         let nq = rows.q.first().map_or(0, Vec::len);
         let kk = family.n_scalars();
-        let AnchorTan {
-            tg,
-            slots,
-            stride,
-            o_g,
-            o_q,
-            o_r,
-            nla,
-            ..
-        } = at;
+        let AnchorTan { tg, slots, stride, o_g, o_q, o_r, nla, .. } = at;
         let (mut dg, mut dq, mut ds) = (vec![0.0; pn], vec![0.0; nq], vec![0.0; kk]);
         let (mut dgd, mut dqd, mut dsd) = (vec![0.0; pn], vec![0.0; nq], vec![0.0; kk]);
         // Per aggregate, `P·G` of a `Gg` aggregate's value adjoint at the row: direction-free.
@@ -1390,18 +1241,8 @@ impl CovPlan<'_> {
             dq.fill(0.0);
             ds.fill(0.0);
             for (k, &(si, mono)) in aggs.iter().enumerate() {
-                let (v, dv) = if mono == Mono::Q {
-                    (q, &mut dq[..])
-                } else {
-                    (g, &mut dg[..])
-                };
-                ds[si] += back(
-                    pv.get(0, k),
-                    v,
-                    rj[si].value,
-                    dv,
-                    &mut qg[k * pn..(k + 1) * pn],
-                );
+                let (v, dv) = if mono == Mono::Q { (q, &mut dq[..]) } else { (g, &mut dg[..]) };
+                ds[si] += back(pv.get(0, k), v, rj[si].value, dv, &mut qg[k * pn..(k + 1) * pn]);
             }
             for (lane, &s) in ls.iter().enumerate().take(nla) {
                 if s != usize::MAX {
@@ -1444,11 +1285,8 @@ impl CovPlan<'_> {
                     }
                     let mut v = 0.0;
                     for k in 0..kk {
-                        let hu: f64 = rj[k].hess[lane][..nla]
-                            .iter()
-                            .zip(u)
-                            .map(|(h, x)| h * x)
-                            .sum();
+                        let hu: f64 =
+                            rj[k].hess[lane][..nla].iter().zip(u).map(|(h, x)| h * x).sum();
                         v += ds[k] * hu + dsd[k] * rj[k].grad[lane];
                     }
                     adj[s * lk + 1 + a] += v;
@@ -1471,8 +1309,7 @@ impl CovPlan<'_> {
     /// not structured, or a plan the basis does not serve (FOCE's population plan is not
     /// assembled here); the recorded path then answers.
     pub(super) fn struct_mode(
-        &self,
-        along: &[Dir],
+        &self, along: &[Dir],
     ) -> Option<(Vec<f64>, DMatrix<f64>, DMatrix<f64>)> {
         let family = self.family()?;
         let model = self.sc.model;
@@ -1488,13 +1325,7 @@ impl CovPlan<'_> {
         self.prepare(along);
         let kt = super::pass_width(true, along.len());
         let nq = if self.second { pn * (pn + 1) / 2 } else { 0 };
-        let base = Layout {
-            n: pn as u16,
-            m: nq as u16,
-            th: false,
-            wide: false,
-            tan: 0,
-        };
+        let base = Layout { n: pn as u16, m: nq as u16, th: false, wide: false, tan: 0 };
         let eta = &self.sc.eta[..pn];
         let zero = |_: usize, _: usize| 0.0;
         // Only a basis serves here: a plan the basis is not narrower for declines before running
@@ -1509,9 +1340,7 @@ impl CovPlan<'_> {
             &zero,
             kt,
             &|lanes, et, k| {
-                axes_only(lanes)
-                    .then(|| self.run_pred(model, eta, et, lanes, base, k))
-                    .flatten()
+                axes_only(lanes).then(|| self.run_pred(model, eta, et, lanes, base, k)).flatten()
             },
         )?;
         if !matches!(pr, PlanRun::Basis(_)) {
@@ -1554,20 +1383,14 @@ impl CovPlan<'_> {
                 )?;
                 rows.aggr.clone()
             };
-            let rin1: Vec<f64> = eta
-                .iter()
-                .chain(self.x.iter())
-                .chain(&aggr)
-                .copied()
-                .collect();
+            let rin1: Vec<f64> = eta.iter().chain(self.x.iter()).chain(&aggr).copied().collect();
             let nn = match self.objective {
                 Objective::Agq { n_agq, .. } => agq_grid(n_agq, pn).len(),
                 _ => 0,
             };
             let kr = self.reduce_run(family, 1, &rin1, 0, nn * pn)?;
-            let b: Vec<Vec<f64>> = (0..nn)
-                .map(|d| (0..pn).map(|k| kr.out[d * pn + k]).collect())
-                .collect();
+            let b: Vec<Vec<f64>> =
+                (0..nn).map(|d| (0..pn).map(|k| kr.out[d * pn + k]).collect()).collect();
             (rin1, b)
         } else {
             (Vec::new(), Vec::new())
@@ -1598,11 +1421,7 @@ impl CovPlan<'_> {
         let node_parts: Vec<_> = (0..nn)
             .map(|d| bases.get(&PlanKey::Node(d)).map(|b| b.parts()))
             .collect::<Option<Vec<_>>>()?;
-        let pop = if need_pop {
-            Some(bases.get(&PlanKey::Pop)?.parts())
-        } else {
-            None
-        };
+        let pop = if need_pop { Some(bases.get(&PlanKey::Pop)?.parts()) } else { None };
         let rows = self.rows(
             &|j| vals[j * lb],
             &|j| pop.map(|(_, plb, pv, _)| pv[j * plb]),
@@ -1737,11 +1556,8 @@ impl CovPlan<'_> {
                 let mut sc = vec![0.0; pn];
                 let mut ds = vec![0.0; kk];
                 for (k, &(si, mono)) in aggs.iter().enumerate() {
-                    let (v, dv) = if mono == Mono::Q {
-                        (&q[..], &mut dq[..])
-                    } else {
-                        (&g[..], &mut dg[..])
-                    };
+                    let (v, dv) =
+                        if mono == Mono::Q { (&q[..], &mut dq[..]) } else { (&g[..], &mut dg[..]) };
                     ds[si] += back(py.get(0, k), v, rj[si].value, dv, &mut sc);
                 }
                 kf[y][j * lb] += (0..kk).map(|k| ds[k] * rj[k].grad[0]).sum::<f64>();
@@ -1834,9 +1650,6 @@ impl CovPlan<'_> {
         let grad_f: Vec<f64> = (0..pn).map(|k| out[0][self.eta_slot(k)]).collect();
         let h = DMatrix::from_fn(pn, pn, |o, k| out[1 + o][self.eta_slot(k)]);
         let gx = DMatrix::from_fn(pn, along.len(), |o, j| self.along(&out[1 + o], &along[j]));
-        out.iter()
-            .flatten()
-            .all(|v| v.is_finite())
-            .then_some((grad_f, h, gx))
+        out.iter().flatten().all(|v| v.is_finite()).then_some((grad_f, h, gx))
     }
 }

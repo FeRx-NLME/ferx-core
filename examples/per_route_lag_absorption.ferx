@@ -20,12 +20,12 @@
 # one dose record delivers F·Dose, split FR1/FR2 across the routes, each switched on
 # at its own `LAGk`.
 #
-# NOTE (engine): a model carrying any per-route `lag=` is fit over finite differences
-# (the analytic sensitivity walk's per-route onset saltation is a follow-up), exactly
-# like `weibull()` + lagtime — predictions and simulation are exact; only the FOCEI
-# gradient is FD. A single per-route-lagged route is, by construction, the same shift
-# as that route on a compartment lagtime — a lag form validated against NONMEM — so
-# the value path reduces to an already-anchored term (see tests/per_route_lag.rs).
+# NOTE (engine): the per-route onset is an exact saltation on the event walk, so the FOCEI
+# gradient, the inner gradient and the covariance R-matrix are exact (served by the adjoint
+# plan; no finite-difference fallback). A single per-route-lagged route is, by
+# construction, the same shift as that route on a compartment lagtime — a lag form
+# validated against NONMEM — so the value path reduces to an already-anchored term (see
+# tests/per_route_lag.rs).
 #
 # ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
 #   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V

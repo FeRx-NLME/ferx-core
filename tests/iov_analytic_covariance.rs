@@ -75,10 +75,7 @@ fn iov_analytic_covariance_matches_nonmem() {
             nm[i],
             (a[i] - nm[i]).abs() / nm[i]
         );
-        assert!(
-            (a[i] - nm[i]).abs() / nm[i] < 0.01,
-            "analytic/NONMEM SE mismatch at {i}"
-        );
+        assert!((a[i] - nm[i]).abs() / nm[i] < 0.01, "analytic/NONMEM SE mismatch at {i}");
     }
     assert!((an.ofv - 308.83046873982664).abs() < 0.01);
 }

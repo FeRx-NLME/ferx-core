@@ -47,11 +47,7 @@ fn fit_inline(model_path: &str, data_path: &str, methods: &[EstimationMethod]) -
     let options = FitOptions {
         verbose: false,
         method: last,
-        methods: if methods.len() > 1 {
-            methods.to_vec()
-        } else {
-            Vec::new()
-        },
+        methods: if methods.len() > 1 { methods.to_vec() } else { Vec::new() },
         interaction: last != Foce,
         run_covariance_step: true,
         sir: false,
@@ -64,12 +60,7 @@ fn fit_inline(model_path: &str, data_path: &str, methods: &[EstimationMethod]) -
         "{row}: the engine this file names moved: {}",
         fit.gradient_method_inner
     );
-    Fitted {
-        row,
-        model,
-        population,
-        fit,
-    }
+    Fitted { row, model, population, fit }
 }
 
 /// The covariance matrix and every SE vector, as bits, in that order. All finite: a `NaN`
@@ -81,10 +72,7 @@ fn bits_of(fit: &FitResult, what: &str) -> Vec<Vec<u64>> {
         .unwrap_or_else(|| panic!("{what}: covariance step produced no matrix"));
     let mut out = vec![cov.iter().copied().collect::<Vec<f64>>()];
     for (name, se) in [
-        (
-            "se_theta",
-            fit.se_theta.as_ref().map(|v| v.as_slice().to_vec()),
-        ),
+        ("se_theta", fit.se_theta.as_ref().map(|v| v.as_slice().to_vec())),
         ("se_omega", fit.se_omega.clone()),
         ("se_sigma", fit.se_sigma.clone()),
         ("se_kappa", fit.se_kappa.clone()),
@@ -96,16 +84,11 @@ fn bits_of(fit: &FitResult, what: &str) -> Vec<Vec<u64>> {
     for v in &out {
         assert!(v.iter().all(|x| x.is_finite()), "{what}: non-finite entry");
     }
-    out.into_iter()
-        .map(|v| v.iter().map(|x| x.to_bits()).collect())
-        .collect()
+    out.into_iter().map(|v| v.iter().map(|x| x.to_bits()).collect()).collect()
 }
 
 fn rerun(f: &Fitted, fit: &FitResult, what: &str) -> Vec<Vec<u64>> {
-    let options = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
+    let options = FitOptions { verbose: false, ..FitOptions::default() };
     let out = run_covariance(fit, Some(&f.model), Some(&f.population), &options)
         .unwrap_or_else(|e| panic!("{what}: run_covariance: {e}"));
     assert!(!out.cov_fixed.is_empty(), "{what}: a matrix has a mask");
@@ -117,14 +100,8 @@ fn rerun(f: &Fitted, fit: &FitResult, what: &str) -> Vec<Vec<u64>> {
 }
 
 fn save(f: &Fitted, path: &Path) {
-    save_fit(
-        &f.fit,
-        &f.population,
-        "model\n",
-        path,
-        SaveFitOptions::default(),
-    )
-    .unwrap_or_else(|e| panic!("{}: save_fit: {e}", f.row));
+    save_fit(&f.fit, &f.population, "model\n", path, SaveFitOptions::default())
+        .unwrap_or_else(|e| panic!("{}: save_fit: {e}", f.row));
 }
 
 /// One row: the in-memory and reload claims (module doc).
@@ -141,15 +118,10 @@ fn check_row(model_path: &str, data_path: &str, methods: &[EstimationMethod]) {
     let dir = tempfile::tempdir().unwrap();
     let exact = dir.path().join("fit.fitrx");
     save(&f, &exact);
-    let reloaded = load_fit(&exact)
-        .unwrap_or_else(|e| panic!("{row}: load_fit: {e}"))
-        .fit;
+    let reloaded = load_fit(&exact).unwrap_or_else(|e| panic!("{row}: load_fit: {e}")).fit;
     for (a, b) in reloaded.subjects.iter().zip(&f.fit.subjects) {
         assert!(
-            a.eta
-                .iter()
-                .zip(b.eta.iter())
-                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            a.eta.iter().zip(b.eta.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
             "{row}: the bundle must carry the EBEs bit for bit (subject {})",
             b.id
         );
@@ -180,10 +152,7 @@ fn check_row(model_path: &str, data_path: &str, methods: &[EstimationMethod]) {
 }
 
 const WARFARIN: (&str, &str) = ("examples/warfarin.ferx", "data/warfarin.csv");
-const TWO_CPT: (&str, &str) = (
-    "examples/two_cpt_oral_cov.ferx",
-    "data/two_cpt_oral_cov.csv",
-);
+const TWO_CPT: (&str, &str) = ("examples/two_cpt_oral_cov.ferx", "data/two_cpt_oral_cov.csv");
 
 #[test]
 fn warfarin_foce() {
@@ -203,21 +172,13 @@ fn warfarin_gn_hybrid() {
 /// κ̂ through `ebes_kappa.csv`.
 #[test]
 fn warfarin_iov_focei() {
-    check_row(
-        "examples/warfarin_iov.ferx",
-        "data/warfarin_iov.csv",
-        &[FoceI],
-    );
+    check_row("examples/warfarin_iov.ferx", "data/warfarin_iov.csv", &[FoceI]);
 }
 
 /// κ̂ per group of each nested level, which the optimizer's warm caches carry since #2261.
 #[test]
 fn nested_levels_3_focei() {
-    check_row(
-        "nonmem_anchor/nested_levels_3.ferx",
-        "nonmem_anchor/nested_levels_3.csv",
-        &[FoceI],
-    );
+    check_row("nonmem_anchor/nested_levels_3.ferx", "nonmem_anchor/nested_levels_3.csv", &[FoceI]);
 }
 
 #[test]
@@ -261,10 +222,7 @@ fn warfarin_iov_vi() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn two_cpt_oral_cov_warm_started_engines() {
     for methods in [&[FoceGn][..], &[Saem], &[FoceI, Imp], &[Impmap], &[Vi]] {
         check_row(TWO_CPT.0, TWO_CPT.1, methods);
@@ -279,10 +237,7 @@ fn two_cpt_oral_cov_warm_started_engines() {
 /// no longer for its cost: 1.6 s on Linux aarch64 and 2.1 s on macOS arm64 since #2331,
 /// against 183 s before it (#2183).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn warfarin_standalone_imp() {
     check_row(WARFARIN.0, WARFARIN.1, &[Imp]);
 }

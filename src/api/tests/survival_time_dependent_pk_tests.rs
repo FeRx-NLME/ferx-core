@@ -214,11 +214,7 @@ fn a_time_dependent_dose_record_quantity_is_not_refused() {
         "straddle: this block must read TIME, or the fast exit is what returns None"
     );
     assert!(
-        model
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.rhs_program.as_ref())
-            .is_some(),
+        model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).is_some(),
         "straddle: the model must carry a compiled [odes] block"
     );
     assert_eq!(
@@ -531,10 +527,7 @@ fn the_message_names_the_endpoint_whose_hazard_depends_on_the_parameter() {
         msg.contains("CMT=4"),
         "the message must name the endpoint whose hazard reads `central`: {msg}"
     );
-    assert!(
-        !msg.contains("CMT=3"),
-        "CMT 3 integrates a constant and is unaffected: {msg}"
-    );
+    assert!(!msg.contains("CMT=3"), "CMT 3 integrates a constant and is unaffected: {msg}");
 }
 
 /// **Missing analysis metadata fails closed** (round-3 review of PR #1924). Both halves
@@ -579,12 +572,9 @@ fn missing_analysis_metadata_is_refused_rather_than_passed() {
     let msg = check_survival_time_dependent_pk(&no_rhs)
         .expect("a model with no compiled [odes] program must not be passed");
     assert_message_is_well_formed("the missing-[odes]-program refusal", &msg);
-    for want in [
-        "CMT=3",
-        "no compiled `[odes]` program",
-        "drop the ODE-accumulated hazard",
-        "#1853",
-    ] {
+    for want in
+        ["CMT=3", "no compiled `[odes]` program", "drop the ODE-accumulated hazard", "#1853"]
+    {
         assert!(msg.contains(want), "missing {want:?} in: {msg}");
     }
 

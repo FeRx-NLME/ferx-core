@@ -105,10 +105,7 @@ mod non_gaussian_score {
         let (mut lam, mut b) = (0.05, 0.0);
         for _ in 0..50 {
             let g: Vector2<f64> = DATA.iter().map(|&row| score(lam, b, row)).sum();
-            let step = information(lam, b)
-                .try_inverse()
-                .expect("information is PD")
-                * g;
+            let step = information(lam, b).try_inverse().expect("information is PD") * g;
             lam += step[0];
             b += step[1];
             if step.norm() < 1e-14 {
@@ -138,10 +135,7 @@ mod non_gaussian_score {
         let model = parse_model_string(MODEL).expect("MODEL parses");
         let mut params = model.default_params.clone();
         params.theta = theta.to_vec();
-        let options = FitOptions {
-            outer_maxiter: 0,
-            ..options.clone()
-        };
+        let options = FitOptions { outer_maxiter: 0, ..options.clone() };
         fit(&model, &population(), &params, &options).expect("the evaluation runs")
     }
 
@@ -156,8 +150,7 @@ mod non_gaussian_score {
                 ..options()
             },
         );
-        res.se_theta
-            .unwrap_or_else(|| panic!("{method:?}: no SEs; warnings: {:?}", res.warnings))
+        res.se_theta.unwrap_or_else(|| panic!("{method:?}: no SEs; warnings: {:?}", res.warnings))
     }
 
     /// `MATRIX=S` and `MATRIX=RSR` are the two estimators that read the per-subject
@@ -174,9 +167,7 @@ mod non_gaussian_score {
     #[test]
     fn s_and_sandwich_covariance_match_the_closed_form_score() {
         let (lam, b) = mle();
-        let r_inv = information(lam, b)
-            .try_inverse()
-            .expect("information is PD");
+        let r_inv = information(lam, b).try_inverse().expect("information is PD");
         let s = score_cross_product(lam, b);
         let cases = [
             (CovarianceMethod::Hessian, closed_form_se(r_inv), 2e-3),
@@ -185,11 +176,7 @@ mod non_gaussian_score {
                 closed_form_se(s.try_inverse().expect("S is PD")),
                 1e-6,
             ),
-            (
-                CovarianceMethod::Sandwich,
-                closed_form_se(r_inv * s * r_inv),
-                3e-3,
-            ),
+            (CovarianceMethod::Sandwich, closed_form_se(r_inv * s * r_inv), 3e-3),
         ];
         for (method, want, tol) in cases {
             let got = se_at_mle(method);
@@ -244,18 +231,10 @@ mod non_gaussian_score {
                 &model,
                 &pop,
                 &model.default_params,
-                &FitOptions {
-                    method,
-                    optimizer,
-                    outer_maxiter: 5,
-                    ..options()
-                },
+                &FitOptions { method, optimizer, outer_maxiter: 5, ..options() },
             )
             .expect("the fit runs");
-            assert!(
-                res.ofv.is_finite(),
-                "{method:?}/{optimizer:?}: OFV is not finite"
-            );
+            assert!(res.ofv.is_finite(), "{method:?}/{optimizer:?}: OFV is not finite");
             let left = (res.ofv - ofv_mle) / gap;
             eprintln!(
                 "{method:?}/{optimizer:?}: OFV left {:.3e} ({:.3e} of the gap)",

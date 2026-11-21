@@ -68,9 +68,7 @@ mod non_gaussian_eta_convergence {
     }
 
     fn fit_ofv(
-        label: &str,
-        parsed: &ParsedModel,
-        data: &str,
+        label: &str, parsed: &ParsedModel, data: &str,
         (method, optimizer): (EstimationMethod, Optimizer),
     ) -> f64 {
         let (pop, _) = read_population_for(
@@ -95,18 +93,12 @@ mod non_gaussian_eta_convergence {
         };
         let res = fit(&parsed.model, &pop, &parsed.model.default_params, &options)
             .unwrap_or_else(|e| panic!("{label} {method:?}/{optimizer:?}: {e}"));
-        assert!(
-            res.ofv.is_finite(),
-            "{label} {method:?}/{optimizer:?}: OFV is not finite"
-        );
+        assert!(res.ofv.is_finite(), "{label} {method:?}/{optimizer:?}: OFV is not finite");
         res.ofv
     }
 
     #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: opt in with --features slow-tests"
-    )]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn gradient_optimizers_reach_the_bobyqa_optimum_on_non_gaussian_models_with_eta() {
         let tte = parse_full_model_file(Path::new("examples/tte_exponential.ferx")).expect("parse");
         let joint = parse_full_model_file(Path::new("examples/pktte_joint.ferx")).expect("parse");
@@ -119,29 +111,13 @@ mod non_gaussian_eta_convergence {
                 vec![LBFGS, SLSQP, MMA, TR, GN],
                 5e-3,
             ),
-            (
-                "pktte_joint",
-                &joint,
-                "data/pktte_joint.csv",
-                vec![LBFGS, SLSQP, MMA],
-                1e-3,
-            ),
-            (
-                "binary with η",
-                &binary,
-                "data/binary_logistic.csv",
-                vec![LBFGS, MMA, TR],
-                3.5e-3,
-            ),
+            ("pktte_joint", &joint, "data/pktte_joint.csv", vec![LBFGS, SLSQP, MMA], 1e-3),
+            ("binary with η", &binary, "data/binary_logistic.csv", vec![LBFGS, MMA, TR], 3.5e-3),
         ];
         let mut failures = Vec::new();
         for (label, parsed, data, routes, bound) in cases {
-            let reference = fit_ofv(
-                label,
-                parsed,
-                data,
-                (EstimationMethod::FoceI, Optimizer::Bobyqa),
-            );
+            let reference =
+                fit_ofv(label, parsed, data, (EstimationMethod::FoceI, Optimizer::Bobyqa));
             for route in routes {
                 let gap = fit_ofv(label, parsed, data, route) - reference;
                 eprintln!(

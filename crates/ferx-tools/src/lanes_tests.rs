@@ -39,11 +39,7 @@ struct LiveProbe {
 
 impl LiveProbe {
     fn new() -> Self {
-        Self {
-            state: Mutex::new((0, 0)),
-            woken: Condvar::new(),
-            calls: Mutex::new(Vec::new()),
-        }
+        Self { state: Mutex::new((0, 0)), woken: Condvar::new(), calls: Mutex::new(Vec::new()) }
     }
 
     /// Returns whether `target` jobs were ever live while this one was.
@@ -134,9 +130,7 @@ fn the_shape_this_replaces_admits_more_jobs_than_its_width() {
     let jobs: Vec<usize> = (0..8).collect();
     PoolPlan::new(1, 1)
         .install(|| {
-            jobs.par_iter()
-                .filter_map(|&i| probe.run(i, 2).then_some(i))
-                .collect::<Vec<_>>()
+            jobs.par_iter().filter_map(|&i| probe.run(i, 2).then_some(i)).collect::<Vec<_>>()
         })
         .expect("outer pool");
 

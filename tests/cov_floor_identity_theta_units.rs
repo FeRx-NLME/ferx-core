@@ -15,9 +15,7 @@ use ferx_core::{fit, read_nonmem_csv};
 use std::path::Path;
 
 const TVV: f64 = 7.737706;
-const NAMES: [&str; 7] = [
-    "TVCL", "TVV_S/k", "TVKA", "ETA_CL", "ETA_V", "ETA_KA", "PROP_ERR",
-];
+const NAMES: [&str; 7] = ["TVCL", "TVV_S/k", "TVKA", "ETA_CL", "ETA_V", "ETA_KA", "PROP_ERR"];
 
 fn model_src(k: f64) -> String {
     let tvv_s = TVV * k;
@@ -168,10 +166,8 @@ fn r_on_a_large_unit_volume_matches_nonmem_matrix_r() {
         ..opts(CovarianceMethod::Hessian)
     };
     let r = fit(&model, &pop, &model.default_params, &opts).unwrap();
-    let se_theta = r
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("no SEs; warnings: {:?}", r.warnings));
+    let se_theta =
+        r.se_theta.as_ref().unwrap_or_else(|| panic!("no SEs; warnings: {:?}", r.warnings));
     assert!(
         !r.warnings.iter().any(|w| w.contains("regularized")),
         "the floor fired; warnings: {:?}",

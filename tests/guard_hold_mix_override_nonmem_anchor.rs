@@ -61,11 +61,7 @@ fn ext_row(iteration: &str) -> std::collections::HashMap<String, f64> {
         .expect("the row")
         .split_whitespace()
         .collect();
-    header
-        .iter()
-        .zip(&row)
-        .map(|(h, v)| (h.to_string(), v.parse::<f64>().unwrap()))
-        .collect()
+    header.iter().zip(&row).map(|(h, v)| (h.to_string(), v.parse::<f64>().unwrap())).collect()
 }
 
 fn evaluate() -> FitResult {
@@ -85,31 +81,17 @@ fn held_override_standard_errors_match_nonmem_with_the_override_fixed() {
     // Same point, same objective. Measured: ferx −37.391596589835 (macOS arm64), NONMEM
     // −37.391596611526303 (Δ 2.2e-8).
     let d_ofv = (f.ofv - est["OBJ"]).abs();
-    assert!(
-        d_ofv < 1e-6,
-        "OFV {} vs NONMEM {} (Δ {d_ofv:e})",
-        f.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv < 1e-6, "OFV {} vs NONMEM {} (Δ {d_ofv:e})", f.ofv, est["OBJ"]);
 
     // ferx held the class-2 override; NONMEM had it FIX.
     assert_eq!(f.held_at_bound.len(), 1, "{:?}", f.held_at_bound);
     let h = &f.held_at_bound[0];
     assert_eq!(
         (h.name.as_str(), h.kind, h.index, h.class, h.reason),
-        (
-            "ETA_CL_MIX2",
-            ParameterKind::Omega,
-            0,
-            Some(2),
-            HeldReason::CollapsedAtGuard
-        )
+        ("ETA_CL_MIX2", ParameterKind::Omega, 0, Some(2), HeldReason::CollapsedAtGuard)
     );
     assert!(f.cov_fixed[6], "{:?}", f.cov_fixed);
-    assert_eq!(
-        se["OMEGA(2,2)"], 1e10,
-        "NONMEM reports no SE for a FIX element"
-    );
+    assert_eq!(se["OMEGA(2,2)"], 1e10, "NONMEM reports no SE for a FIX element");
 
     let st = f.se_theta.as_ref().unwrap();
     let so = f.se_omega.as_ref().unwrap();
@@ -137,19 +119,11 @@ fn held_override_standard_errors_match_nonmem_with_the_override_fixed() {
         ("THETA3", st[2], se["THETA3"], 3e-5),
         ("THETA4", st[3], se["THETA4"], 2e-5),
         ("OMEGA(1,1)", so[0], se["OMEGA(1,1)"], 1.6e-4),
-        (
-            "SIGMA(1,1)",
-            s_sd,
-            se["SIGMA(1,1)"] / (2.0 * SIGMA_SD),
-            8e-4,
-        ),
+        ("SIGMA(1,1)", s_sd, se["SIGMA(1,1)"] / (2.0 * SIGMA_SD), 8e-4),
     ];
     let mut failed = Vec::new();
     for (name, ferx, nm, bound) in pairs {
-        assert!(
-            ferx.is_finite() && nm.is_finite() && nm > 0.0,
-            "{name}: {ferx} vs {nm}"
-        );
+        assert!(ferx.is_finite() && nm.is_finite() && nm > 0.0, "{name}: {ferx} vs {nm}");
         let rel = (ferx - nm).abs() / nm;
         eprintln!("{name}: ferx {ferx:.6e}  NONMEM {nm:.5e}  rel {rel:.2e}  bound {bound:.1e}");
         if rel >= bound {
@@ -189,10 +163,7 @@ fn held_override_renders_held_and_its_base_keeps_its_se() {
             .unwrap_or_else(|| panic!("no `{name}` row in:\n{text}"))
             .to_string()
     };
-    assert!(
-        line(&summary, "ETA_CL_MIX2").ends_with("SE = N/A"),
-        "{summary}"
-    );
+    assert!(line(&summary, "ETA_CL_MIX2").ends_with("SE = N/A"), "{summary}");
     let base = line(&summary, "ETA_CL");
     assert!(!base.contains("N/A") && !base.contains("---"), "{summary}");
 
@@ -214,13 +185,6 @@ fn held_override_renders_held_and_its_base_keeps_its_se() {
         ),
         "{section}"
     );
-    assert!(
-        section.contains("    se: ~\n    held: collapsed_at_guard\n"),
-        "{section}"
-    );
-    assert_eq!(
-        yaml.matches("held: collapsed_at_guard").count(),
-        1,
-        "{yaml}"
-    );
+    assert!(section.contains("    se: ~\n    held: collapsed_at_guard\n"), "{section}");
+    assert_eq!(yaml.matches("held: collapsed_at_guard").count(), 1, "{yaml}");
 }

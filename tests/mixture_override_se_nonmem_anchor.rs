@@ -115,10 +115,7 @@ fn nonmem_ses() -> Vec<(&'static str, f64)> {
 /// ferx's SEs in [`nonmem_ses`] order.
 fn ferx_ses(f: &FitResult) -> Vec<f64> {
     let st = f.se_theta.as_ref().expect("se_theta");
-    let ov = f
-        .se_mixture_overrides
-        .as_ref()
-        .expect("se_mixture_overrides");
+    let ov = f.se_mixture_overrides.as_ref().expect("se_mixture_overrides");
     vec![
         st[0],
         st[1],
@@ -135,10 +132,7 @@ fn ferx_ses(f: &FitResult) -> Vec<f64> {
 fn assert_against_nonmem(f: &FitResult, bounds: [f64; 8], engine: &str) {
     let mut failed = Vec::new();
     for (((name, nm), ferx), bound) in nonmem_ses().into_iter().zip(ferx_ses(f)).zip(bounds) {
-        assert!(
-            ferx.is_finite() && nm.is_finite() && nm > 0.0,
-            "{engine} {name}: {ferx} vs {nm}"
-        );
+        assert!(ferx.is_finite() && nm.is_finite() && nm > 0.0, "{engine} {name}: {ferx} vs {nm}");
         let rel = (ferx - nm).abs() / nm;
         eprintln!(
             "{engine} {name}: ferx {ferx:.9e}  NONMEM {nm:.6e}  rel {rel:.2e}  bound {bound:.1e}"
@@ -158,16 +152,7 @@ fn assert_fixture(f: &FitResult) {
     let got: Vec<_> = f
         .mixture_override_params
         .iter()
-        .map(|p| {
-            (
-                p.name.as_str(),
-                p.kind,
-                p.index,
-                p.class,
-                p.packed_index,
-                p.fixed,
-            )
-        })
+        .map(|p| (p.name.as_str(), p.kind, p.index, p.class, p.packed_index, p.fixed))
         .collect();
     assert_eq!(
         got,
@@ -178,9 +163,7 @@ fn assert_fixture(f: &FitResult) {
     );
     assert!(f.held_at_bound.is_empty(), "{:?}", f.held_at_bound);
     assert!(
-        !f.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !f.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "the fixture fell back to FD inner gradients: {:?}",
         f.warnings
     );
@@ -227,10 +210,8 @@ fn override_standard_errors_match_nonmem_analytic_r() {
     );
     assert!(!yaml.contains("param_"), "{yaml}");
     let table = ferx_core::io::output::parameter_table(&f);
-    let row = table
-        .lines()
-        .find(|l| l.starts_with("ETA_CL_MIX2 "))
-        .unwrap_or_else(|| panic!("{table}"));
+    let row =
+        table.lines().find(|l| l.starts_with("ETA_CL_MIX2 ")).unwrap_or_else(|| panic!("{table}"));
     assert!(
         row.contains(" 0.266883 ") && row.contains(" 0.064976 ") && row.ends_with("(class 2)"),
         "{row}"
@@ -274,10 +255,7 @@ fn run_covariance_refreshes_override_standard_errors() {
     let out = run_covariance(&stale, None, None, &FitOptions::default()).expect("run_covariance");
     let again = out.se_mixture_overrides.expect("run_covariance SEs");
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    assert!(
-        inline.iter().all(|s| s.is_finite() && *s > 0.0),
-        "{inline:?}"
-    );
+    assert!(inline.iter().all(|s| s.is_finite() && *s > 0.0), "{inline:?}");
     assert_eq!(bits(&again), bits(&inline), "{again:?} vs {inline:?}");
     assert_eq!(out.se_theta, f.se_theta);
     assert_eq!(out.mixture_override_params, f.mixture_override_params);
@@ -295,12 +273,7 @@ fn user_fixed_override_renders_fixed() {
     let f = evaluate(dir.path(), true, true);
     let p = &f.mixture_override_params[1];
     assert_eq!((p.name.as_str(), p.packed_index), ("EPS_MIX2", 7));
-    assert!(
-        p.fixed && f.cov_fixed[7],
-        "fixed {} cov_fixed {}",
-        p.fixed,
-        f.cov_fixed[7]
-    );
+    assert!(p.fixed && f.cov_fixed[7], "fixed {} cov_fixed {}", p.fixed, f.cov_fixed[7]);
     assert!(!f.mixture_override_params[0].fixed);
     assert!(f.held_at_bound.is_empty(), "{:?}", f.held_at_bound);
     let se = f.se_mixture_overrides.as_ref().unwrap();

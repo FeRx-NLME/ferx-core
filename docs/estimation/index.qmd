@@ -53,7 +53,7 @@ The outer loop optimizer is selected independently of the method. See **[Outer O
 | Local minima robustness | Can get stuck | Can get stuck | More robust |
 | Gradient required | Yes (analytic or FD) | Yes (FD, per-subject) | No (E-step) |
 | Stochastic | No | No | Yes |
-| OFV comparable to FOCE | — | Yes (post-GN Laplace) | Yes (post-SAEM Laplace) |
+| OFV comparable to FOCE | — | Yes (post-GN Laplace) | Only with `saem_ofv = focei` (default: NONMEM's SAEM objective, not a likelihood; `saem_ofv = imp` gives the importance-sampled −2LL, as NONMEM `IMP EONLY=1`; the Laplace value is `saem_objective.foce_ofv`) |
 | Best for | General use | Fast model development | Complex models, many ETAs |
 
 ## Choosing a method
@@ -68,7 +68,7 @@ The outer loop optimizer is selected independently of the method. See **[Outer O
 - You suspect the FOCE solution is a local minimum
 - The model has complex nonlinear random effect structure
 
-**Chain with IMP** (`method = [focei, imp]` or `[saem, imp]`, with `imp_eval_only = true`) when you need a more accurate marginal likelihood for model selection — especially on sparse data where the Laplace approximation is biased. Read it from `FitResult.importance_sampling`, not `ofv`. Without `imp_eval_only`, the `imp` stage re-estimates the parameters by Monte-Carlo EM instead of scoring the previous stage's fit.
+**Chain with IMP** (`method = [focei, imp]` or `[saem, imp]`, with `imp_eval_only = true`) when you need a more accurate marginal likelihood for model selection — especially on sparse data where the Laplace approximation is biased. Read it from `FitResult.importance_sampling`, not `ofv`. (A SAEM fit already reports this readout as its `ofv` by default; see [the reported OFV](saem.qmd#saem-reported-ofv).) Without `imp_eval_only`, the `imp` stage re-estimates the parameters by Monte-Carlo EM instead of scoring the previous stage's fit.
 
 **Add SIR** (`sir = true`) when the covariance step fails or when you want non-parametric uncertainty intervals.
 

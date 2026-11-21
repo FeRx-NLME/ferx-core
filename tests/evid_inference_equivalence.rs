@@ -90,10 +90,7 @@ fn fit_warfarin(data_path: &Path) -> (f64, usize) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn no_evid_warfarin_fits_identically_to_explicit_evid() {
     // Explicit EVID — the NONMEM-validated reference fit.
     let (ofv_with, doses_with) = fit_warfarin(Path::new("data/warfarin.csv"));
@@ -103,10 +100,7 @@ fn no_evid_warfarin_fits_identically_to_explicit_evid() {
 
     // The reference parses warfarin's 10 doses (guards against a silently empty
     // stripped file) ...
-    assert_eq!(
-        doses_with, 10,
-        "explicit-EVID warfarin should parse 10 doses"
-    );
+    assert_eq!(doses_with, 10, "explicit-EVID warfarin should parse 10 doses");
     // ... and inference reproduces exactly those doses (not zero — the #262 bug).
     assert_eq!(
         doses_without, doses_with,

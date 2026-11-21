@@ -16,60 +16,22 @@ const EXP_TTE: &str = r"
   scale  = TVLAMBDA * exp(ETA_LAMBDA)
 ";
 
-const COMPETING: &str = r"
-[parameters]
-  theta TVLAMBDA_A(0.05, 0.001, 10.0)
-  theta TVLAMBDA_B(0.03, 0.001, 10.0)
-
-[event_model cause_a]
-  cmt    = 2
-  family = exponential
-  scale  = TVLAMBDA_A
-
-[event_model cause_b]
-  cmt    = 3
-  family = exponential
-  scale  = TVLAMBDA_B
-";
+const COMPETING: &str = crate::test_models::MODEL_2;
 
 const RTTE: &str = "\n[parameters]\n  theta TVLAMBDA(0.15, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  type   = rtte\n  family = exponential\n  scale  = TVLAMBDA\n";
 
-const PK_ONLY: &str = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  sigma PROP_ERR ~ 0.05 (sd)
-
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+const PK_ONLY: &str = crate::test_models::ONE_CPT_IV_22;
 
 fn model(src: &str) -> CompiledModel {
     parse_model_string(src).expect("model parses")
 }
 
 fn rec(time: f64, event_type: EventType, cmt: usize) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time: 0.0,
-        cmt,
-    }
+    ObsRecord::Event { time, event_type, entry_time: 0.0, cmt }
 }
 
 fn subj(id: &str, records: Vec<ObsRecord>) -> Subject {
-    Subject {
-        id: id.into(),
-        obs_records: records,
-        ..Default::default()
-    }
+    Subject { id: id.into(), obs_records: records, ..Default::default() }
 }
 
 fn pop(subjects: Vec<Subject>) -> Population {
@@ -86,23 +48,14 @@ fn pop(subjects: Vec<Subject>) -> Population {
 /// `n` subjects on cmt 2, every one censored at `c` (`event = false`) or with an event
 /// at `c` (`event = true`).
 fn uniform_pop(n: usize, c: f64, event: bool) -> Population {
-    let et = if event {
-        EventType::Exact
-    } else {
-        EventType::RightCensored
-    };
-    pop((1..=n)
-        .map(|i| subj(&i.to_string(), vec![rec(c, et.clone(), 2)]))
-        .collect())
+    let et = if event { EventType::Exact } else { EventType::RightCensored };
+    pop((1..=n).map(|i| subj(&i.to_string(), vec![rec(c, et.clone(), 2)])).collect())
 }
 
 fn opts(n_sim: usize) -> VpcTteOptions {
     VpcTteOptions {
         n_sim,
-        sim: SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        sim: SimulateOptions { seed: Some(7), ..Default::default() },
         ..Default::default()
     }
 }
@@ -132,23 +85,18 @@ fn post_censor_censors_draws_past_the_censoring_time() {
 /// 6 for `u = 0.6`; reading the censoring curve the wrong way round changes `g.surv`.
 #[test]
 fn draw_censoring_inverts_the_conditional_censoring_distribution() {
-    let rows: Vec<ObsRow> = [
-        (1.0, None),
-        (2.0, Some(2.0)),
-        (3.0, None),
-        (4.0, Some(4.0)),
-        (6.0, Some(6.0)),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, (time, censor_at))| ObsRow {
-        id: i.to_string(),
-        time,
-        event: censor_at.is_none(),
-        censor_at,
-        stratum: 0,
-    })
-    .collect();
+    let rows: Vec<ObsRow> =
+        [(1.0, None), (2.0, Some(2.0)), (3.0, None), (4.0, Some(4.0)), (6.0, Some(6.0))]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (time, censor_at))| ObsRow {
+                id: i.to_string(),
+                time,
+                event: censor_at.is_none(),
+                censor_at,
+                stratum: 0,
+            })
+            .collect();
     let g = censoring_curve(rows.iter());
     assert_eq!(g.surv, [1.0, 0.75, 0.75, 0.375, 0.0]);
     assert_eq!(draw_censoring(&g, 1.0, 0.8, 9.0), 2.0);
@@ -166,9 +114,7 @@ fn draw_censoring_inverts_the_conditional_censoring_distribution() {
 /// The censoring uniforms are in `[0, 1)`, depend on every key, and look uniform.
 #[test]
 fn censoring_uniform_is_keyed_and_uniform() {
-    let u: Vec<f64> = (0..10_000)
-        .map(|i| censoring_uniform(3, 1 + i / 100, i % 100))
-        .collect();
+    let u: Vec<f64> = (0..10_000).map(|i| censoring_uniform(3, 1 + i / 100, i % 100)).collect();
     assert!(u.iter().all(|x| (0.0..1.0).contains(x)));
     let mean = u.iter().sum::<f64>() / u.len() as f64;
     assert!((mean - 0.5).abs() < 0.01, "{mean}");
@@ -194,6 +140,37 @@ fn observed_censoring_stops_replicates_at_each_subjects_own_time() {
     let v = run(EXP_TTE, &p, &o).unwrap();
     assert_eq!(v.strata[0].n_used, [20, 20]);
     assert!(v.strata[0].lo[1].unwrap().is_finite());
+}
+
+/// A curve that reached 0 is undefined past its last time, on the observed side and
+/// in every replicate (#2930). 30 subjects with an event at `0.1·i`, λ = 0.5 with no
+/// IIV, horizon 30: with no censoring every replicate is followed to its own last
+/// event and reaches 0 well before 20, so at 20 nothing is defined. Under the rule
+/// before #2930 the observed value, `n_used` and the band at 20 were `Some(0.0)`, 20
+/// and `Some(0.0)`; carrying the last value forward keeps the observed `Some(0.0)`.
+/// The point at 2 is the control, defined under every rule.
+#[test]
+fn observed_curve_and_band_are_undefined_past_the_last_time_even_at_zero() {
+    const EXP_NO_IIV: &str = "\n[parameters]\n  theta TVLAMBDA(0.5, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n";
+    let p = pop((1..=30)
+        .map(|i| subj(&i.to_string(), vec![rec(0.1 * i as f64, EventType::Exact, 2)]))
+        .collect());
+    let mut o = opts(20);
+    o.sim.horizon = Some(30.0);
+    o.grid = VpcGrid::Times(vec![2.0, 20.0]);
+    let v = run(EXP_NO_IIV, &p, &o).unwrap();
+    let s = &v.strata[0];
+    // The straddle: the observed curve reached 0, and 20 is past its last time.
+    assert_eq!(s.observed.surv.last(), Some(&0.0));
+    assert!(20.0 > *s.observed.time.last().unwrap());
+    // Control at 2: 10 of 30 events are later.
+    assert!((s.obs_on_grid[0].unwrap() - 1.0 / 3.0).abs() < 1e-12, "{:?}", s.obs_on_grid);
+    assert_eq!(s.n_used[0], 20);
+    assert!(s.lo[0].unwrap().is_finite());
+    // Past the last time, even at zero.
+    assert_eq!(s.obs_on_grid[1], None, "observed past its last time");
+    assert_eq!(s.n_used[1], 0, "no replicate is followed up to 20");
+    assert_eq!((s.lo[1], s.med[1], s.hi[1]), (None, None, None));
 }
 
 /// 15 subjects censored at 2 and 15 with an event at 1, horizon 10. The censoring
@@ -247,11 +224,7 @@ fn censoring_distribution_is_per_stratum() {
     o.stratify = VpcStratify::Covariate("ARM".into());
     let v = run(EXP_TTE, &pop(subjects), &o).unwrap();
     assert_eq!(v.strata[0].label, "ARM=0");
-    assert_eq!(
-        v.strata[0].n_used,
-        [20, 0],
-        "ARM 0 is never followed past 2"
-    );
+    assert_eq!(v.strata[0].n_used, [20, 0], "ARM 0 is never followed past 2");
     assert_eq!(v.strata[1].n_used, [20, 20], "ARM 1 is followed to 8");
 }
 
@@ -268,10 +241,7 @@ fn competing_event_is_not_an_observed_censoring() {
         .map(|i| {
             subj(
                 &i.to_string(),
-                vec![
-                    rec(1.0, EventType::Exact, 2),
-                    rec(1.0, EventType::RightCensored, 3),
-                ],
+                vec![rec(1.0, EventType::Exact, 2), rec(1.0, EventType::RightCensored, 3)],
             )
         })
         .collect();
@@ -304,9 +274,8 @@ fn event_subjects_keep_the_horizon_without_observed_censoring() {
 /// censoring at 30 are censorings at 5, so at 6 the observed value is empty.
 #[test]
 fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
-    let mut subjects: Vec<Subject> = (1..=25)
-        .map(|i| subj(&i.to_string(), vec![rec(i as f64, EventType::Exact, 2)]))
-        .collect();
+    let mut subjects: Vec<Subject> =
+        (1..=25).map(|i| subj(&i.to_string(), vec![rec(i as f64, EventType::Exact, 2)])).collect();
     subjects.push(subj("26", vec![rec(30.0, EventType::RightCensored, 2)]));
     let p = pop(subjects);
     let v = run(EXP_TTE, &p, &opts(20)).unwrap();
@@ -319,19 +288,11 @@ fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
     assert_eq!(s.grid.last(), Some(&30.0));
     // The observed times are on the grid, and the overlay reads the observed curve.
     for t in [1.0, 13.0, 25.0] {
-        let k = s
-            .grid
-            .iter()
-            .position(|&g| g == t)
-            .expect("observed time on grid");
+        let k = s.grid.iter().position(|&g| g == t).expect("observed time on grid");
         assert_eq!(s.obs_on_grid[k], s.observed.at(t));
     }
     // 101 even points plus 26 observed times, minus those that coincide.
-    assert!(
-        s.grid.len() > 101 && s.grid.len() <= 101 + 26,
-        "{}",
-        s.grid.len()
-    );
+    assert!(s.grid.len() > 101 && s.grid.len() <= 101 + 26, "{}", s.grid.len());
     assert!(s.n_used.iter().all(|&n| n <= 20));
 
     let mut o = opts(20);
@@ -416,14 +377,8 @@ fn horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
             })
             .collect()
     };
-    assert!(
-        times(&g).iter().any(|&t| t > G_HORIZON),
-        "G has records past H"
-    );
-    assert!(
-        times(&cut).iter().all(|&t| t <= G_HORIZON),
-        "the cut has none"
-    );
+    assert!(times(&g).iter().any(|&t| t > G_HORIZON), "G has records past H");
+    assert!(times(&cut).iter().all(|&t| t <= G_HORIZON), "the cut has none");
 
     for censoring in [VpcCensoring::Observed, VpcCensoring::Horizon] {
         for grid in [VpcGrid::Auto, VpcGrid::Times(vec![3.0, 9.0, 10.0, 15.0])] {
@@ -482,8 +437,7 @@ fn stratify_by_covariate_splits_subjects_by_exact_value() {
     let subjects = (1..=30)
         .map(|i| {
             let mut s = subj(&i.to_string(), vec![rec(i as f64, EventType::Exact, 2)]);
-            s.covariates
-                .insert("SEX".into(), if i % 3 == 0 { 1.0 } else { 0.0 });
+            s.covariates.insert("SEX".into(), if i % 3 == 0 { 1.0 } else { 0.0 });
             s
         })
         .collect();
@@ -537,10 +491,7 @@ fn competing_risks_with_cmt_reads_that_cause() {
             } else {
                 (EventType::RightCensored, EventType::Exact)
             };
-            subj(
-                &i.to_string(),
-                vec![rec(i as f64, a, 2), rec(i as f64, b, 3)],
-            )
+            subj(&i.to_string(), vec![rec(i as f64, a, 2), rec(i as f64, b, 3)])
         })
         .collect();
     let mut o = opts(20);
@@ -572,16 +523,14 @@ fn assert_refusal<T: std::fmt::Debug>(got: Result<T, EngineError>, text: &str) {
 fn refuses_two_tte_endpoints_without_cmt() {
     let p = pop(vec![subj(
         "1",
-        vec![
-            rec(1.0, EventType::Exact, 2),
-            rec(1.0, EventType::RightCensored, 3),
-        ],
+        vec![rec(1.0, EventType::Exact, 2), rec(1.0, EventType::RightCensored, 3)],
     )]);
     assert_refusal(
         run(COMPETING, &p, &opts(20)),
         "vpc_tte: the model has TTE endpoints on cmt 2, 3; set `cmt` to the one to check. \
          Under competing risks 1 − KM of one cause is not its cumulative incidence: the curve \
-         is that cause's survival with the other causes as censoring.",
+         is that cause's survival with the other causes as censoring. `vpc_cif` draws the \
+         cumulative incidence of every cause.",
     );
 }
 
@@ -612,12 +561,7 @@ fn refuses_no_tte_endpoint_and_a_cmt_that_is_not_one() {
 fn refuses_left_truncation() {
     let p = pop(vec![subj(
         "7",
-        vec![ObsRecord::Event {
-            time: 5.0,
-            event_type: EventType::Exact,
-            entry_time: 1.5,
-            cmt: 2,
-        }],
+        vec![ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 1.5, cmt: 2 }],
     )]);
     assert_refusal(
         run(EXP_TTE, &p, &opts(20)),
@@ -630,14 +574,7 @@ fn refuses_left_truncation() {
 fn refuses_interval_censoring() {
     let p = pop(vec![subj(
         "8",
-        vec![rec(
-            5.0,
-            EventType::IntervalCensored {
-                left: 2.0,
-                right: 5.0,
-            },
-            2,
-        )],
+        vec![rec(5.0, EventType::IntervalCensored { left: 2.0, right: 5.0 }, 2)],
     )]);
     assert_refusal(
         run(EXP_TTE, &p, &opts(20)),
@@ -707,10 +644,7 @@ fn refuses_a_missing_stratification_covariate() {
 fn refuses_several_records_duplicate_ids_and_no_records() {
     let p = pop(vec![subj(
         "4",
-        vec![
-            rec(1.0, EventType::RightCensored, 2),
-            rec(2.0, EventType::Exact, 2),
-        ],
+        vec![rec(1.0, EventType::RightCensored, 2), rec(2.0, EventType::Exact, 2)],
     )]);
     assert_refusal(
         run(EXP_TTE, &p, &opts(20)),
@@ -758,5 +692,217 @@ fn refuses_a_bad_grid_time() {
     assert_refusal(
         run(EXP_TTE, &uniform_pop(3, 1.0, true), &o),
         "vpc_tte: grid time -2 is not a finite, non-negative number.",
+    );
+}
+
+// ── #2947: a stratum with no band ────────────────────────────────────────────
+
+const PROBS: [f64; 3] = [0.05, 0.5, 0.95];
+const HEAD: &str = "W_VPC_EMPTY_STRATUM: stratum `all` has no band at any grid time.";
+const ZERO: &str = " A Kaplan–Meier curve ends at its last time, also where it has reached 0.";
+const FLOOR: &str = " A replicate curve counts at a time only while at least `min_at_risk = 10` \
+                     subjects are at risk there.";
+
+/// `n` replicate curves, each with its last time at `last`.
+fn reps_ending_at(n: usize, last: f64) -> Vec<Vec<f64>> {
+    (0..n).map(|_| vec![0.5 * last, last]).collect()
+}
+
+fn warn_for(
+    who: Entry, grid: &[f64], n_used: &[usize], reps: &[Vec<f64>], at_risk: Option<(usize, usize)>,
+) -> Option<String> {
+    empty_stratum_warning(who, "all", grid, n_used, PROBS, reps.iter().map(Vec::as_slice), at_risk)
+}
+
+fn too_few(most: usize, n_sim: usize) -> String {
+    format!(
+        " At most {most} of the {n_sim} replicate curves are defined at any grid time, and a \
+         band point needs 19."
+    )
+}
+
+fn past(latest: &str) -> String {
+    format!(
+        " Every grid time is past the last time of every replicate curve; the latest is \
+         {latest}."
+    )
+}
+
+fn never(latest: &str) -> String {
+    format!(" Grid times after {latest} can never have a band.")
+}
+
+/// H1. The gate is "every grid time below the floor", on the most curves at any grid
+/// time: `[0, 19]` has a band at its second point, `[0, 18]` has none. Reading the
+/// least instead of the most, `>` for `>=`, or no gate at all reddens it.
+#[test]
+fn empty_stratum_gate_is_below_the_floor() {
+    let reps = reps_ending_at(20, 17.5);
+    assert_eq!(min_curves_for(PROBS), 19);
+    assert_eq!(warn_for(Entry::Tte, &[1.0, 2.0], &[0, 19], &reps, None), None);
+    assert_eq!(warn_for(Entry::Tte, &[1.0, 2.0], &[19, 0], &reps, None), None);
+    assert_eq!(
+        warn_for(Entry::Tte, &[1.0, 2.0], &[0, 18], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(18, 20)).as_str())
+    );
+}
+
+/// H2. The at-risk floor is the first reason, also when the grid is past every last
+/// time; a stratum of exactly `min_at_risk` subjects is not below it and gets the
+/// past-follow-up text instead.
+#[test]
+fn at_risk_floor_comes_first_and_needs_fewer_subjects_than_the_floor() {
+    let reps = reps_ending_at(20, 17.5);
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[20.0], &[0], &reps, Some((5, 10))).as_deref(),
+        Some(
+            format!(
+                "{HEAD} It has 5 subjects, fewer than `min_at_risk = 10`, so no risk set \
+                 reaches the at-risk floor. Lower `min_at_risk`, or use larger strata."
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[20.0], &[0], &reps, Some((10, 10))).as_deref(),
+        Some(format!("{HEAD}{}{}", past("17.5"), never("17.5")).as_str())
+    );
+}
+
+/// H4. Past every replicate's last time: the latest is named, and the zero sentence
+/// (#3107) appears for a Kaplan–Meier curve only, not for an MCF.
+#[test]
+fn past_follow_up_names_the_latest_and_reaches_zero_only_for_km() {
+    let mut reps = reps_ending_at(19, 12.0);
+    reps.push(vec![3.0, 17.5]);
+    assert_eq!(
+        warn_for(Entry::Tte, &[20.0, 25.0], &[0, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}{}", past("17.5"), never("17.5")).as_str())
+    );
+    assert_eq!(
+        warn_for(Entry::Rtte, &[20.0, 25.0], &[0, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{}", past("17.5"), never("17.5")).as_str())
+    );
+}
+
+/// H5. A grid time at the latest last time is not past it, and `n_used = 0` alone does
+/// not mean past follow-up: a `vpc_kmmc` stratum above the floor with no curve defined
+/// at 3 (its risk sets below `min_at_risk`) gets the too-few text with the floor
+/// sentence. `>` → `>=`, or deciding "past" by `most == 0`, reddens it.
+#[test]
+fn a_grid_time_at_the_latest_last_time_is_not_past_it() {
+    let reps = reps_ending_at(20, 3.0);
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[3.0], &[0], &reps, Some((30, 10))).as_deref(),
+        Some(format!("{HEAD}{}{FLOOR}", too_few(0, 20)).as_str())
+    );
+}
+
+/// H6. The too-few text per entry point: the zero sentence for `vpc_tte` only, the
+/// floor sentence for `vpc_kmmc` only.
+#[test]
+fn too_few_curves_text_per_entry() {
+    let reps = reps_ending_at(20, 17.5);
+    assert_eq!(
+        warn_for(Entry::Tte, &[5.0], &[3], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(3, 20)).as_str())
+    );
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[5.0], &[3], &reps, Some((30, 10))).as_deref(),
+        Some(format!("{HEAD}{}{FLOOR}", too_few(3, 20)).as_str())
+    );
+    // #3111 r1 row 1: a grid running from before the latest last time to after it is
+    // too few curves, not past it — only *every* grid time past `latest` is C2.
+    assert_eq!(
+        warn_for(Entry::Tte, &[10.0, 20.0], &[3, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(3, 20)).as_str())
+    );
+}
+
+/// Fixture P1 (#2947 plan §0): 30 subjects with events at `0.1·i`, λ = 0.5, no IIV,
+/// `H = 30`, 20 replicates.
+fn p1(grid: Vec<f64>) -> TteVpc {
+    const EXP_NO_IIV: &str = "\n[parameters]\n  theta TVLAMBDA(0.5, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n";
+    let p = pop((1..=30)
+        .map(|i| subj(&i.to_string(), vec![rec(0.1 * i as f64, EventType::Exact, 2)]))
+        .collect());
+    let mut o = opts(20);
+    o.sim.horizon = Some(30.0);
+    o.grid = VpcGrid::Times(grid);
+    run(EXP_NO_IIV, &p, &o).unwrap()
+}
+
+/// D-t1. #3107's case: every replicate reached 0 before t = 20, inside `H = 30`, so no
+/// curve is defined there. Before #3107 a curve that reached 0 stayed `Some(0.0)` and
+/// the band was 0/0/0 (probe P1′, `n_used` 20), with nothing to warn about.
+#[test]
+fn vpc_tte_warns_past_every_replicate_last_time_inside_h() {
+    let v = p1(vec![20.0]);
+    let s = &v.strata[0];
+    // The straddle: 20 is inside H, and the observed curve reached 0.
+    assert!(20.0 < v.horizon);
+    assert_eq!(s.observed.surv.last(), Some(&0.0));
+    assert_eq!(s.n_used, [0]);
+    let w = empty_stratum_warnings(&v.warnings);
+    assert_eq!(w.len(), 1, "{:?}", v.warnings);
+    let latest = w[0]
+        .split("the latest is ")
+        .nth(1)
+        .and_then(|r| r.split(". A Kaplan").next())
+        .expect("names the latest last time");
+    let t: f64 = latest.parse().unwrap();
+    eprintln!("D-t1 latest replicate last time: {t}");
+    // Measured: the latest replicate last time is in (17.5, 18) (probe P1).
+    assert!(t > 17.5 && t < 18.0, "latest {t}");
+    assert_eq!(w[0], format!("{HEAD}{}{ZERO}{}", past(latest), never(latest)));
+}
+
+/// D-t2. At t = 10 three of the 20 replicates are still defined (probe P1).
+#[test]
+fn vpc_tte_warns_too_few_curves() {
+    let v = p1(vec![10.0]);
+    assert_eq!(v.strata[0].n_used, [3]);
+    assert_eq!(empty_stratum_warnings(&v.warnings), [format!("{HEAD}{}{ZERO}", too_few(3, 20))]);
+}
+
+/// D-t3. One grid time with a band (19 curves at t = 5, exactly the floor) is enough:
+/// a later empty point does not make the stratum empty.
+#[test]
+fn vpc_tte_one_defined_point_is_not_empty() {
+    let v = p1(vec![5.0, 20.0]);
+    assert_eq!(v.strata[0].n_used, [19, 0]);
+    assert!(v.strata[0].lo[0].is_some());
+    assert_eq!(empty_stratum_warnings(&v.warnings), Vec::<&str>::new());
+}
+
+/// D-g. An empty `VpcGrid::Times` grid is refused by every entry point, each naming
+/// itself: it would make every stratum vacuously empty.
+#[test]
+fn refuses_an_empty_grid_in_every_entry_point() {
+    let refusal = |who: &str| {
+        format!("{who}: the grid is empty. Give at least one grid time, or use VpcGrid::Auto.")
+    };
+    let mut o = opts(20);
+    o.grid = VpcGrid::Times(vec![]);
+    assert_refusal(run(EXP_TTE, &uniform_pop(3, 1.0, true), &o), &refusal("vpc_tte"));
+
+    let m = model(RTTE);
+    let ro = crate::api::VpcRtteOptions {
+        n_sim: 20,
+        grid: VpcGrid::Times(vec![]),
+        ..Default::default()
+    };
+    assert_refusal(
+        crate::api::vpc_rtte(&m, &uniform_pop(3, 1.0, true), &m.default_params, &ro),
+        &refusal("vpc_rtte"),
+    );
+
+    let m = model(EXP_TTE);
+    let mut ko = crate::api::VpcKmmcOptions::new("Z");
+    ko.vpc.n_sim = 20;
+    ko.vpc.grid = VpcGrid::Times(vec![]);
+    assert_refusal(
+        crate::api::vpc_kmmc(&m, &uniform_pop(3, 1.0, true), &m.default_params, &ko),
+        &refusal("vpc_kmmc"),
     );
 }

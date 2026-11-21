@@ -74,23 +74,10 @@ fn compare(label: &str, got: &KmCurve, want: &[Row]) -> (f64, f64) {
         assert_eq!(got.n_risk[j], w.n_risk, "{at}: n.risk");
         assert_eq!(got.n_event[j], w.n_event, "{at}: n.event");
         assert_eq!(got.n_censor[j], w.n_censor, "{at}: n.censor");
-        let (ds, dh) = (
-            (got.surv[j] - w.surv).abs(),
-            (got.cumhaz[j] - w.cumhaz).abs(),
-        );
+        let (ds, dh) = ((got.surv[j] - w.surv).abs(), (got.cumhaz[j] - w.cumhaz).abs());
         assert!(ds.is_finite() && dh.is_finite(), "{at}: non-finite");
-        assert!(
-            ds <= TOL,
-            "{at}: surv {} vs survfit {}",
-            got.surv[j],
-            w.surv
-        );
-        assert!(
-            dh <= TOL,
-            "{at}: cumhaz {} vs survfit {}",
-            got.cumhaz[j],
-            w.cumhaz
-        );
+        assert!(ds <= TOL, "{at}: surv {} vs survfit {}", got.surv[j], w.surv);
+        assert!(dh <= TOL, "{at}: cumhaz {} vs survfit {}", got.cumhaz[j], w.cumhaz);
         ws = ws.max(ds);
         wh = wh.max(dh);
     }
@@ -105,16 +92,8 @@ fn compare(label: &str, got: &KmCurve, want: &[Row]) -> (f64, f64) {
 fn kaplan_meier_matches_survfit_per_stratum() {
     let data = data_by_stratum();
     let reference = reference_by_stratum();
-    assert_eq!(
-        data.keys().collect::<Vec<_>>(),
-        ["A", "B"],
-        "two strata in the data"
-    );
-    assert_eq!(
-        reference.keys().collect::<Vec<_>>(),
-        ["A", "B"],
-        "two strata in the reference"
-    );
+    assert_eq!(data.keys().collect::<Vec<_>>(), ["A", "B"], "two strata in the data");
+    assert_eq!(reference.keys().collect::<Vec<_>>(), ["A", "B"], "two strata in the reference");
     let (mut ws, mut wh) = (0.0_f64, 0.0_f64);
     for (label, (times, events)) in &data {
         let curve = kaplan_meier(times, events).unwrap();
@@ -124,19 +103,8 @@ fn kaplan_meier_matches_survfit_per_stratum() {
         wh = wh.max(h);
     }
     // The fixture must exercise ties, or it cannot see the convention.
-    let tied = reference
-        .values()
-        .flatten()
-        .filter(|r| r.n_event > 1)
-        .count();
-    let mixed = reference
-        .values()
-        .flatten()
-        .filter(|r| r.n_event > 0 && r.n_censor > 0)
-        .count();
-    assert!(
-        tied >= 10 && mixed >= 3,
-        "fixture lost its ties: {tied} tied, {mixed} mixed"
-    );
+    let tied = reference.values().flatten().filter(|r| r.n_event > 1).count();
+    let mixed = reference.values().flatten().filter(|r| r.n_event > 0 && r.n_censor > 0).count();
+    assert!(tied >= 10 && mixed >= 3, "fixture lost its ties: {tied} tied, {mixed} mixed");
     eprintln!("km vs survfit: worst |Δsurv| = {ws:.3e}, worst |Δcumhaz| = {wh:.3e}");
 }

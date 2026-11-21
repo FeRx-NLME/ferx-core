@@ -258,9 +258,7 @@ fn find<'a>(diags: &'a [Diagnostic], code: &str) -> &'a Diagnostic {
 /// `cmt = 1` and dose 2 is skipped); and evaluating only the *first* dose snapshot.
 #[test]
 fn arm_a_a_covariate_that_overflows_at_a_later_dose_is_rejected() {
-    let model = parse_full_model(TV_COV_LAG_MODEL)
-        .expect("the exp-lag model parses")
-        .model;
+    let model = parse_full_model(TV_COV_LAG_MODEL).expect("the exp-lag model parses").model;
     // The fixture has to be live on both sides: benign where the old check looked,
     // non-finite where the engine actually reads it. Assert both, so this cannot pass
     // on a fixture that was never bad (or was bad everywhere).
@@ -273,16 +271,8 @@ fn arm_a_a_covariate_that_overflows_at_a_later_dose_is_rejected() {
     let pop = population(two_dose_tv_subject(0.5, [0.5, 1000.0], [0.5, 0.5]), &["WT"]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_DOSE_ATTR_NONFINITE");
-    assert!(
-        hit.message.contains("subject 1"),
-        "must name the subject: {}",
-        hit.message
-    );
-    assert!(
-        hit.message.contains("lag time"),
-        "must name the attribute: {}",
-        hit.message
-    );
+    assert!(hit.message.contains("subject 1"), "must name the subject: {}", hit.message);
+    assert!(hit.message.contains("lag time"), "must name the attribute: {}", hit.message);
     assert!(
         hit.message.contains("dose 2 at TIME=24"),
         "must name the record whose snapshot went bad — that is what tells the user \
@@ -303,9 +293,7 @@ fn arm_a_a_covariate_that_overflows_at_a_later_dose_is_rejected() {
 /// drops it to the frozen `TIME = 0` snapshot where `exp(0) = 1` is perfectly finite.
 #[test]
 fn arm_b_a_time_reading_lag_is_rejected_with_no_covariates_at_all() {
-    let model = parse_full_model(TIME_LAG_MODEL)
-        .expect("the TIME-lag model parses")
-        .model;
+    let model = parse_full_model(TIME_LAG_MODEL).expect("the TIME-lag model parses").model;
     let mut s = common::subject(
         "1",
         vec![
@@ -328,11 +316,7 @@ fn arm_b_a_time_reading_lag_is_rejected_with_no_covariates_at_all() {
     let pop = population(s, &[]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_DOSE_ATTR_NONFINITE");
-    assert!(
-        hit.message.contains("dose 2 at TIME=1000"),
-        "must name the record: {}",
-        hit.message
-    );
+    assert!(hit.message.contains("dose 2 at TIME=1000"), "must name the record: {}", hit.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,9 +332,7 @@ fn arm_b_a_time_reading_lag_is_rejected_with_no_covariates_at_all() {
 /// the dose-attribute check — widen it to observations and this test is the one that dies.
 #[test]
 fn a_lag_non_finite_only_at_an_observation_is_not_rejected_and_still_predicts() {
-    let model = parse_full_model(TV_COV_LAG_MODEL)
-        .expect("the exp-lag model parses")
-        .model;
+    let model = parse_full_model(TV_COV_LAG_MODEL).expect("the exp-lag model parses").model;
     // Doses benign, second observation catastrophic.
     let pop = population(two_dose_tv_subject(0.5, [0.5, 0.5], [0.5, 1000.0]), &["WT"]);
     let diags = check_model_data(&model, &pop);
@@ -362,11 +344,8 @@ fn a_lag_non_finite_only_at_an_observation_is_not_rejected_and_still_predicts() 
     // And it is not merely un-rejected: it still works. If this ever returns NaN, the
     // premise above ("the engine reads a lag at dose snapshots only") is wrong and the
     // snapshot set is the thing to revisit.
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().iter().map(|p| p.pred).collect();
     assert!(
         preds.iter().all(|p| p.is_finite()),
         "the subject must still predict finite values, got {preds:?}"
@@ -406,9 +385,8 @@ fn modeled_dose_pop(mode: RateMode, wt_per_dose: &[f64]) -> Population {
 /// single-dose fixture alone cannot fail either mutation.
 #[test]
 fn a_non_finite_modeled_duration_is_rejected_at_one_dose_and_at_a_later_one() {
-    let model = parse_full_model(MODELED_DURATION_MODEL)
-        .expect("the modeled-duration model parses")
-        .model;
+    let model =
+        parse_full_model(MODELED_DURATION_MODEL).expect("the modeled-duration model parses").model;
     for (shape, wts, at) in [
         ("single dose", &[1000.0][..], "dose 1 at TIME=0"),
         ("multi dose", &[0.0, 1000.0][..], "dose 2 at TIME=24"),
@@ -433,9 +411,7 @@ fn a_non_finite_modeled_duration_is_rejected_at_one_dose_and_at_a_later_one() {
 /// slots through different `DoseAttr`s, so neither arm stands in for the other.
 #[test]
 fn a_non_finite_modeled_rate_is_rejected_at_one_dose_and_at_a_later_one() {
-    let model = parse_full_model(MODELED_RATE_MODEL)
-        .expect("the modeled-rate model parses")
-        .model;
+    let model = parse_full_model(MODELED_RATE_MODEL).expect("the modeled-rate model parses").model;
     for (shape, wts, at) in [
         ("single dose", &[1000.0][..], "dose 1 at TIME=0"),
         ("multi dose", &[0.0, 1000.0][..], "dose 2 at TIME=24"),
@@ -473,11 +449,8 @@ fn a_multi_dose_modeled_regimen_with_every_dose_finite_is_not_rejected() {
             "{name}: a finite multi-dose regimen must not be rejected, got {:?}",
             codes(&diags)
         );
-        let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-            .unwrap()
-            .iter()
-            .map(|p| p.pred)
-            .collect();
+        let preds: Vec<f64> =
+            predict(&model, &pop, &model.default_params).unwrap().iter().map(|p| p.pred).collect();
         assert!(
             preds.iter().all(|p| p.is_finite()),
             "{name}: must still predict finite values, got {preds:?}"
@@ -492,9 +465,8 @@ fn a_multi_dose_modeled_regimen_with_every_dose_finite_is_not_rejected() {
 /// coincide.
 #[test]
 fn a_finite_modeled_duration_is_accepted_and_is_not_the_bolus_curve() {
-    let model = parse_full_model(MODELED_DURATION_MODEL)
-        .expect("the modeled-duration model parses")
-        .model;
+    let model =
+        parse_full_model(MODELED_DURATION_MODEL).expect("the modeled-duration model parses").model;
     let pop = modeled_dose_pop(RateMode::ModeledDuration, &[0.0]);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -502,11 +474,8 @@ fn a_finite_modeled_duration_is_accepted_and_is_not_the_bolus_curve() {
         "a finite modeled duration must not be rejected, got {:?}",
         codes(&diags)
     );
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().iter().map(|p| p.pred).collect();
     assert!(
         preds.iter().all(|p| p.is_finite()),
         "the control must predict finite values, got {preds:?}"
@@ -589,11 +558,7 @@ fn an_absorption_parameter_out_of_domain_at_the_dose_is_still_rejected() {
     let pop = population(one_dose_subject(2, 10.0, [0.0, 0.0]), &["WT"]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_ABSORPTION_DOMAIN");
-    assert!(
-        hit.message.contains("dose 1 at TIME=0"),
-        "must name the dose: {}",
-        hit.message
-    );
+    assert!(hit.message.contains("dose 1 at TIME=0"), "must name the dose: {}", hit.message);
 }
 
 /// The `E_ABSORPTION_FRACTION` counterpart: a pathway fraction is read at the dose record
@@ -635,11 +600,7 @@ fn a_pathway_fraction_out_of_range_at_the_dose_is_still_rejected() {
     let pop = population(one_dose_subject(1, 5.0, [0.0, 0.0]), &["WT"]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_ABSORPTION_FRACTION");
-    assert!(
-        hit.message.contains("dose 1 at TIME=0"),
-        "must name the dose: {}",
-        hit.message
-    );
+    assert!(hit.message.contains("dose 1 at TIME=0"), "must name the dose: {}", hit.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -691,9 +652,7 @@ fn a_modeled_duration_nonpositive_only_at_a_later_dose_is_warned() {
     let bad = modeled_dose_pop(RateMode::ModeledDuration, &[0.0, 3.0]);
     let warns = ferx_core::api::check_model_data_warnings(&model, &bad, &model.default_params);
     assert!(
-        warns
-            .iter()
-            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        warns.iter().any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
         "a duration ≤ 0 at dose 2 must be warned, got {:?}",
         codes(&warns)
     );
@@ -701,9 +660,7 @@ fn a_modeled_duration_nonpositive_only_at_a_later_dose_is_warned() {
     let ok = modeled_dose_pop(RateMode::ModeledDuration, &[0.0, 0.5]);
     let warns = ferx_core::api::check_model_data_warnings(&model, &ok, &model.default_params);
     assert!(
-        !warns
-            .iter()
-            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        !warns.iter().any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
         "every dose is positive; must not warn, got {:?}",
         codes(&warns)
     );
@@ -768,10 +725,7 @@ const TV_COV_MIXED_FRACTION_MODEL: &str = r#"
 /// One dose at `t = 0`, observations at 1 and 8, `WT` per record; optionally an EVID=3/4
 /// reset at `t = 4` and an EVID=2 row at `t = 4`, each with its own `WT`.
 fn transit_subject(
-    wt_dose: f64,
-    wt_obs: [f64; 2],
-    wt_reset: Option<f64>,
-    wt_pk_only: Option<f64>,
+    wt_dose: f64, wt_obs: [f64; 2], wt_reset: Option<f64>, wt_pk_only: Option<f64>,
 ) -> Subject {
     let mut s = common::subject(
         "1",
@@ -795,11 +749,7 @@ fn transit_subject(
 }
 
 fn preds(model: &ferx_core::types::CompiledModel, pop: &Population) -> Vec<f64> {
-    predict(model, pop, &model.default_params)
-        .unwrap()
-        .iter()
-        .map(|p| p.pred)
-        .collect()
+    predict(model, pop, &model.default_params).unwrap().iter().map(|p| p.pred).collect()
 }
 
 /// An EVID=2 row is a governing record — `is_record` admits `Kind::PkOnly` — so it sets
@@ -917,11 +867,7 @@ fn a_zero_order_duration_out_of_domain_at_the_dose_is_still_rejected() {
     let pop = population(transit_subject(5.0, [0.0, 0.0], None, None), &["WT"]);
     let diags = check_model_data(&model, &pop);
     let hit = find(&diags, "E_ABSORPTION_DOMAIN");
-    assert!(
-        hit.message.contains("dose 1 at TIME=0"),
-        "must name the dose: {}",
-        hit.message
-    );
+    assert!(hit.message.contains("dose 1 at TIME=0"), "must name the dose: {}", hit.message);
 }
 
 /// The Σ ≈ 1 completeness rule on a compartment mixing a zero-order pathway with a
@@ -959,10 +905,7 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
     let model = parse_full_model(TV_COV_TRANSIT_MODEL)
         .expect("the TV-covariate transit model parses")
         .model;
-    let pop = population(
-        transit_subject(0.0, [0.1, 0.2], Some(0.3), Some(0.4)),
-        &["WT"],
-    );
+    let pop = population(transit_subject(0.0, [0.1, 0.2], Some(0.3), Some(0.4)), &["WT"]);
     let diags = check_model_data(&model, &pop);
     assert!(
         !diags
@@ -972,10 +915,7 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
         codes(&diags)
     );
     let p = preds(&model, &pop);
-    assert!(
-        p.iter().all(|v| v.is_finite()),
-        "must predict finite values, got {p:?}"
-    );
+    assert!(p.iter().all(|v| v.is_finite()), "must predict finite values, got {p:?}");
 }
 
 /// **A stated behaviour change on a public entry point.** `predict()` / `simulate()` run
@@ -1027,13 +967,8 @@ fn predict_returns_the_control_curve_for_an_absorption_value_reached_only_at_an_
 /// observation 1 only.
 fn states_subject(doses: Vec<DoseEvent>, obs_cmt: usize, wt_obs1: f64) -> Subject {
     let n_doses = doses.len();
-    let mut s = common::subject(
-        "1",
-        doses,
-        vec![1.0, 8.0, 14.0, 30.0],
-        vec![0.0; 4],
-        vec![obs_cmt; 4],
-    );
+    let mut s =
+        common::subject("1", doses, vec![1.0, 8.0, 14.0, 30.0], vec![0.0; 4], vec![obs_cmt; 4]);
     s.covariates = wt(0.0);
     s.dose_covariates = vec![wt(0.0); n_doses];
     s.obs_covariates = vec![wt(wt_obs1), wt(0.0), wt(0.0), wt(0.0)];
@@ -1065,16 +1000,10 @@ fn bits(v: &[f64]) -> Vec<u64> {
 ///
 /// Returns the control's states.
 fn states_arm(
-    arm: &str,
-    src: &str,
-    doses: Vec<DoseEvent>,
-    obs_cmt: usize,
-    wt_bad: f64,
-    param: &str,
+    arm: &str, src: &str, doses: Vec<DoseEvent>, obs_cmt: usize, wt_bad: f64, param: &str,
 ) -> Vec<Vec<f64>> {
-    let model = parse_full_model(src)
-        .unwrap_or_else(|e| panic!("{arm}: model parses: {e:?}"))
-        .model;
+    let model =
+        parse_full_model(src).unwrap_or_else(|e| panic!("{arm}: model parses: {e:?}")).model;
     let theta = model.default_params.theta.clone();
     let eta = vec![0.0; model.n_eta];
     let slot = model.pk_indices[model
@@ -1141,14 +1070,7 @@ fn states_arm(
 /// Dies if `ode_predictions_event_driven_with_states` hands the dense pass `Shared` reads.
 #[test]
 fn states_read_the_transit_kernel_at_the_dose_record() {
-    states_arm(
-        "S1 transit",
-        TV_COV_TRANSIT_MODEL,
-        two_bolus_doses(),
-        2,
-        10.0,
-        "MTT",
-    );
+    states_arm("S1 transit", TV_COV_TRANSIT_MODEL, two_bolus_doses(), 2, 10.0, "MTT");
 }
 
 /// [`TV_COV_PARALLEL_MODEL`] at a tolerance tight enough for S2's closed form to outrank the
@@ -1202,14 +1124,8 @@ const TV_COV_PARALLEL_TIGHT_MODEL: &str = r#"
 /// everything else goes per dose.
 #[test]
 fn states_read_the_pathway_fraction_at_the_dose_record_and_match_bateman() {
-    let ctl = states_arm(
-        "S2 parallel",
-        TV_COV_PARALLEL_TIGHT_MODEL,
-        two_bolus_doses(),
-        1,
-        5.0,
-        "FR1",
-    );
+    let ctl =
+        states_arm("S2 parallel", TV_COV_PARALLEL_TIGHT_MODEL, two_bolus_doses(), 1, 5.0, "FR1");
     let want = [
         (1.0, 53.665189848309986),
         (8.0, 50.401699072124362),
@@ -1234,14 +1150,7 @@ fn states_read_the_pathway_fraction_at_the_dose_record_and_match_bateman() {
 /// `zero_order_windows` reads `dur` from the disposition snapshot.
 #[test]
 fn states_read_the_zero_order_duration_at_the_dose_record() {
-    states_arm(
-        "S3 zero-order",
-        TV_COV_ZERO_ORDER_MODEL,
-        two_bolus_doses(),
-        1,
-        5.0,
-        "DUR",
-    );
+    states_arm("S3 zero-order", TV_COV_ZERO_ORDER_MODEL, two_bolus_doses(), 1, 5.0, "DUR");
 }
 
 /// `first_order` absorption with a per-route lag `LR = 0.5 + WT`.
@@ -1275,14 +1184,7 @@ const TV_COV_ROUTE_LAG_MODEL: &str = r#"
 /// lag from the disposition snapshot.
 #[test]
 fn states_break_at_the_route_onset_of_the_dose_record() {
-    states_arm(
-        "S4 route lag",
-        TV_COV_ROUTE_LAG_MODEL,
-        two_bolus_doses(),
-        1,
-        1.0,
-        "LR",
-    );
+    states_arm("S4 route lag", TV_COV_ROUTE_LAG_MODEL, two_bolus_doses(), 1, 1.0, "LR");
 }
 
 /// Depot → central with a compartment lag `ALAG1 = 0.3 + WT`.
@@ -1316,14 +1218,7 @@ const TV_COV_ALAG_MODEL: &str = r#"
 /// from the disposition snapshot.
 #[test]
 fn states_read_the_compartment_lag_at_the_dose_record() {
-    states_arm(
-        "S5 ALAG1",
-        TV_COV_ALAG_MODEL,
-        two_bolus_doses(),
-        2,
-        2.0,
-        "ALAG1",
-    );
+    states_arm("S5 ALAG1", TV_COV_ALAG_MODEL, two_bolus_doses(), 2, 2.0, "ALAG1");
 }
 
 /// One-compartment bolus with bioavailability `F1 = 0.8 − WT`.
@@ -1383,14 +1278,7 @@ const TV_COV_MODELED_DURATION_MODEL: &str = r#"
 fn states_resolve_a_modeled_duration_at_the_dose_record() {
     let doses = (0..2)
         .map(|k| {
-            DoseEvent::modeled(
-                12.0 * k as f64,
-                100.0,
-                1,
-                false,
-                0.0,
-                RateMode::ModeledDuration,
-            )
+            DoseEvent::modeled(12.0 * k as f64, 100.0, 1, false, 0.0, RateMode::ModeledDuration)
         })
         .collect();
     states_arm("S7 D1", TV_COV_MODELED_DURATION_MODEL, doses, 1, 3.0, "D1");
@@ -1410,14 +1298,7 @@ fn steady_state_then_plain_dose() -> Vec<DoseEvent> {
 /// disposition snapshot.
 #[test]
 fn states_equilibrate_a_steady_state_dose_on_its_own_record() {
-    states_arm(
-        "S8 SS",
-        TV_COV_TRANSIT_MODEL,
-        steady_state_then_plain_dose(),
-        2,
-        10.0,
-        "MTT",
-    );
+    states_arm("S8 SS", TV_COV_TRANSIT_MODEL, steady_state_then_plain_dose(), 2, 10.0, "MTT");
 }
 
 /// [`TV_COV_F_MODEL`] with a constant compartment lag, so an `SS = 1` dose is seeded at its
@@ -1515,11 +1396,8 @@ fn a_derived_grid_integral_reads_the_transit_kernel_at_the_dose_record() {
     let theta = model.default_params.theta.clone();
     let eta = vec![0.0; model.n_eta];
     let mtt = |w: f64| {
-        let slot = model.pk_indices[model
-            .indiv_param_names
-            .iter()
-            .position(|n| n == "MTT")
-            .expect("MTT")];
+        let slot =
+            model.pk_indices[model.indiv_param_names.iter().position(|n| n == "MTT").expect("MTT")];
         (model.pk_param_fn)(&theta, &eta, &wt(w), 0.0).values[slot]
     };
     // The straddle: observation 1's snapshot is out of domain in the bad arm only; every
@@ -1612,11 +1490,8 @@ fn states_read_each_dose_at_its_own_record_not_the_first() {
     s.dose_covariates = vec![wt(0.0), wt(0.3)];
     // The two dose records really differ, and both are in domain.
     let fr1 = |w: f64, t: f64| {
-        let slot = model.pk_indices[model
-            .indiv_param_names
-            .iter()
-            .position(|n| n == "FR1")
-            .expect("FR1")];
+        let slot =
+            model.pk_indices[model.indiv_param_names.iter().position(|n| n == "FR1").expect("FR1")];
         (model.pk_param_fn)(&theta, &eta, &wt(w), t).values[slot]
     };
     assert_eq!(fr1(0.0, 0.0), 0.6);
@@ -1692,19 +1567,15 @@ const TV_COV_F_TIGHT_MODEL: &str = r#"
 /// arm, and still 2.5e9× under the 24.56 a `per_dose[0]` read moves central by at t = 14.
 #[test]
 fn states_read_each_dose_attribute_at_its_own_record_not_the_first() {
-    let model = parse_full_model(TV_COV_F_TIGHT_MODEL)
-        .expect("the TV-covariate F model parses")
-        .model;
+    let model =
+        parse_full_model(TV_COV_F_TIGHT_MODEL).expect("the TV-covariate F model parses").model;
     let theta = model.default_params.theta.clone();
     let eta = vec![0.0; model.n_eta];
     let mut s = states_subject(two_bolus_doses(), 1, 0.0);
     s.dose_covariates = vec![wt(0.0), wt(0.3)];
     let f1 = |w: f64, t: f64| {
-        let slot = model.pk_indices[model
-            .indiv_param_names
-            .iter()
-            .position(|n| n == "F1")
-            .expect("F1")];
+        let slot =
+            model.pk_indices[model.indiv_param_names.iter().position(|n| n == "F1").expect("F1")];
         (model.pk_param_fn)(&theta, &eta, &wt(w), t).values[slot]
     };
     assert_eq!(f1(0.0, 0.0), 0.8);
@@ -1765,16 +1636,10 @@ fn states_read_each_dose_attribute_at_its_own_record_not_the_first() {
 #[test]
 fn fit_ipred_is_the_prediction_of_the_population_fit_scores() {
     use ferx_core::{fit, EstimationMethod, FitOptions};
-    let src = TV_COV_TRANSIT_AUC_MODEL
-        .split("[derived]")
-        .next()
-        .expect("model text");
+    let src = TV_COV_TRANSIT_AUC_MODEL.split("[derived]").next().expect("model text");
     let model = parse_full_model(src).expect("model parses").model;
-    for (reltol, abstol, bound) in [
-        (1e-4, 1e-6, 3e-6),
-        (1e-8, 1e-10, 5e-10),
-        (1e-12, 1e-14, 1e-14),
-    ] {
+    for (reltol, abstol, bound) in [(1e-4, 1e-6, 3e-6), (1e-8, 1e-10, 5e-10), (1e-12, 1e-14, 1e-14)]
+    {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
             outer_maxiter: 0,
@@ -1791,10 +1656,7 @@ fn fit_ipred_is_the_prediction_of_the_population_fit_scores() {
 
         let arm = |wt_obs1: f64| -> (Vec<f64>, bool) {
             let pop = population(states_subject(two_bolus_doses(), 2, wt_obs1), &["WT"]);
-            assert!(
-                pop.subjects[0].has_tv_covariates(),
-                "both arms start with snapshots"
-            );
+            assert!(pop.subjects[0].has_tv_covariates(), "both arms start with snapshots");
             let res = fit(&model, &pop, &model.default_params, &opts).expect("maxiter-0 fit runs");
             let mut pruned = pop.clone();
             pruned.prune_irrelevant_tv_covariates(&model.referenced_covariates);
@@ -1818,10 +1680,7 @@ fn fit_ipred_is_the_prediction_of_the_population_fit_scores() {
         );
         let mut worst = 0.0_f64;
         for (b, c) in bad.iter().zip(&ctl) {
-            assert!(
-                b.is_finite() && c.is_finite() && *c > 0.1,
-                "live drug: {bad:?} vs {ctl:?}"
-            );
+            assert!(b.is_finite() && c.is_finite() && *c > 0.1, "live drug: {bad:?} vs {ctl:?}");
             worst = worst.max(((b - c) / c).abs());
         }
         assert!(

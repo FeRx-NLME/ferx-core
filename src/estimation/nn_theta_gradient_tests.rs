@@ -71,34 +71,14 @@ fn static_subject() -> Subject {
     cov.insert("WT".to_string(), 72.0);
     cov.insert("CRCL".to_string(), 95.0);
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0, 12.0],
-        obs_raw_times: Vec::new(),
         observations: vec![7.5, 6.0, 3.8, 2.1],
         obs_cmts: vec![1, 1, 1, 1],
         covariates: cov,
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         cens: vec![0, 0, 0, 0],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -142,11 +122,7 @@ fn nn_theta_indices(model: &CompiledModel) -> Vec<usize> {
 /// space, restricted to the θ block. The reference every parity test compares
 /// against.
 fn central_fd_theta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
     mask: &[bool],
 ) -> Vec<f64> {
     central_fd_theta_grad_at(model, subject, theta, sigma_values, eta, mask, 1e-6)
@@ -154,13 +130,8 @@ fn central_fd_theta_grad(
 
 /// [`central_fd_theta_grad`] at the relative step `rel`, for Richardson extrapolation.
 fn central_fd_theta_grad_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    mask: &[bool],
-    rel: f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64], eta: &[f64],
+    mask: &[bool], rel: f64,
 ) -> Vec<f64> {
     let mut scratch = EventPkParams::default();
     let mut out = vec![0.0f64; theta.len()];
@@ -248,10 +219,7 @@ fn hybrid_nn_weight_gradient_matches_central_fd() {
 
     let nn_idx = nn_theta_indices(&model);
     assert_eq!(nn_idx.len(), 17, "unexpected NN weight count");
-    let peak = nn_idx
-        .iter()
-        .map(|&i| reference[i].abs())
-        .fold(0.0f64, f64::max);
+    let peak = nn_idx.iter().map(|&i| reference[i].abs()).fold(0.0f64, f64::max);
     let mut n_informative = 0;
     for &i in &nn_idx {
         if reference[i].abs() > 1e-3 * peak {
@@ -290,12 +258,8 @@ fn non_nn_theta_is_unaffected_by_the_hybrid_path() {
     let (mask, lo, hi) = unpinned(&model, n_theta + 1);
 
     let plan = NnGradPlan::build(&model, &subject, &theta, n_theta).expect("plan builds");
-    let tvka_idx = model
-        .default_params
-        .theta_names
-        .iter()
-        .position(|n| n == "TVKA")
-        .expect("TVKA present");
+    let tvka_idx =
+        model.default_params.theta_names.iter().position(|n| n == "TVKA").expect("TVKA present");
     assert!(!plan.covers(tvka_idx), "TVKA must stay on the FD path");
 
     let mut scratch = EventPkParams::default();
@@ -449,12 +413,7 @@ fn time_varying_nn_input_is_served_exactly_though_the_plan_declines() {
     let mut worst = 0.0f64;
     for &i in &nn_theta_indices(&model) {
         let rel = relative(grad[i], reference[i]);
-        assert!(
-            rel.is_finite(),
-            "theta {i}: {} vs {}",
-            grad[i],
-            reference[i]
-        );
+        assert!(rel.is_finite(), "theta {i}: {} vs {}", grad[i], reference[i]);
         worst = worst.max(rel);
     }
     eprintln!("time-varying NN exact score vs central FD: worst relative {worst:.2e}");
@@ -469,11 +428,7 @@ fn time_varying_non_nn_covariate_keeps_the_plan() {
     let model = parse_model_string(&dcm_model_src()).expect("DCM model parses");
     let mut subject = static_subject();
     let snap = |dose: f64| {
-        HashMap::from([
-            ("WT".into(), 72.0),
-            ("CRCL".into(), 95.0),
-            ("CONMED".into(), dose),
-        ])
+        HashMap::from([("WT".into(), 72.0), ("CRCL".into(), 95.0), ("CONMED".into(), dose)])
     };
     subject.obs_covariates = vec![snap(0.0), snap(1.0), snap(1.0), snap(0.0)];
     subject.dose_covariates = vec![snap(0.0)];
@@ -586,10 +541,8 @@ fn hybrid_nn_weight_gradient_matches_central_fd_under_iov() {
         "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
         "  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL)",
     );
-    let src = src.replace(
-        "  omega ETA_V  ~ 0.09",
-        "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05",
-    );
+    let src =
+        src.replace("  omega ETA_V  ~ 0.09", "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05");
     let model = parse_model_string(&src).expect("IOV DCM model parses");
     assert!(model.n_kappa > 0, "model must carry IOV");
 
@@ -756,14 +709,8 @@ fn hybrid_nn_weight_gradient_matches_central_fd_under_m3() {
     let reference = central_fd_theta_grad(&model, &subject, &theta, &sigma_values, &eta, &mask);
 
     let nn_idx = nn_theta_indices(&model);
-    let peak = nn_idx
-        .iter()
-        .map(|&i| reference[i].abs())
-        .fold(0.0f64, f64::max);
-    assert!(
-        peak > 0.0,
-        "the M3 objective must actually depend on the network weights"
-    );
+    let peak = nn_idx.iter().map(|&i| reference[i].abs()).fold(0.0f64, f64::max);
+    assert!(peak > 0.0, "the M3 objective must actually depend on the network weights");
     let mut n_informative = 0;
     for &i in &nn_idx {
         if reference[i].abs() > 1e-3 * peak {
@@ -819,11 +766,7 @@ fn exact_m3_score_matches_richardson() {
     let mut worst = 0.0f64;
     for &i in &nn_idx {
         let r = (4.0 * dh2[i] - dh[i]) / 3.0;
-        assert!(
-            grad[i].is_finite() && r.is_finite(),
-            "theta[{i}]: {} vs {r}",
-            grad[i]
-        );
+        assert!(grad[i].is_finite() && r.is_finite(), "theta[{i}]: {} vs {r}", grad[i]);
         let rel = (grad[i] - r).abs() / r.abs().max(1e-3 * peak);
         worst = worst.max(rel);
         assert!(
@@ -845,10 +788,7 @@ fn hybrid_nn_weight_gradient_matches_central_fd_under_m3_iov() {
             "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
             "  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL)",
         )
-        .replace(
-            "  omega ETA_V  ~ 0.09",
-            "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05",
-        );
+        .replace("  omega ETA_V  ~ 0.09", "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05");
     let model = parse_model_string(&src).expect("M3 IOV DCM model parses");
     assert!(model.n_kappa > 0, "model must carry IOV");
     assert!(
@@ -918,14 +858,8 @@ fn hybrid_nn_weight_gradient_matches_central_fd_under_m3_iov() {
     }
 
     let nn_idx = nn_theta_indices(&model);
-    let peak = nn_idx
-        .iter()
-        .map(|&i| reference[i].abs())
-        .fold(0.0f64, f64::max);
-    assert!(
-        peak > 0.0,
-        "the M3 IOV objective must actually depend on the network weights"
-    );
+    let peak = nn_idx.iter().map(|&i| reference[i].abs()).fold(0.0f64, f64::max);
+    assert!(peak > 0.0, "the M3 IOV objective must actually depend on the network weights");
     for &i in &nn_idx {
         assert!(
             relative(grad[i], reference[i]) < 1e-5,
@@ -1020,10 +954,7 @@ fn a_fully_pinned_nn_block_does_no_solves() {
         "an all-pinned block must skip its output-bias solves, not just zero the result"
     );
     for &i in &nn_theta_indices(&model) {
-        assert_eq!(
-            grad[i], 0.0,
-            "pinned NN weight theta[{i}] must be left at zero"
-        );
+        assert_eq!(grad[i], 0.0, "pinned NN weight theta[{i}] must be left at zero");
     }
 }
 
@@ -1052,24 +983,10 @@ fn a_log_packed_nn_weight_is_scaled_by_its_value() {
     let deriv = |_i: usize, _sign: f64| 0.25f64;
 
     let mut raw_grad = vec![0.0f64; n_theta + n_sigma];
-    plan.accumulate(
-        deriv,
-        &theta,
-        &vec![false; n_theta + n_sigma],
-        &lo,
-        &hi,
-        &mut raw_grad,
-    );
+    plan.accumulate(deriv, &theta, &vec![false; n_theta + n_sigma], &lo, &hi, &mut raw_grad);
 
     let mut logged_grad = vec![0.0f64; n_theta + n_sigma];
-    plan.accumulate(
-        deriv,
-        &theta,
-        &vec![true; n_theta + n_sigma],
-        &lo,
-        &hi,
-        &mut logged_grad,
-    );
+    plan.accumulate(deriv, &theta, &vec![true; n_theta + n_sigma], &lo, &hi, &mut logged_grad);
 
     let mut n_checked = 0;
     for &g in &nn_idx {
@@ -1085,10 +1002,7 @@ fn a_log_packed_nn_weight_is_scaled_by_its_value() {
             expected
         );
     }
-    assert!(
-        n_checked > 0,
-        "the fixture must produce at least one non-zero weight entry to scale"
-    );
+    assert!(n_checked > 0, "the fixture must produce at least one non-zero weight entry to scale");
 }
 
 /// The snapshots can be perfectly self-consistent and *still* disagree with the
