@@ -100,11 +100,7 @@ impl Lrt {
     /// that compiled to the same parameter vector — and the step has to say so
     /// rather than pass it through `χ²(0)`.
     pub fn forward(
-        ofv_reduced: f64,
-        n_reduced: usize,
-        ofv_extended: f64,
-        n_extended: usize,
-        alpha: f64,
+        ofv_reduced: f64, n_reduced: usize, ofv_extended: f64, n_extended: usize, alpha: f64,
     ) -> Result<Lrt, String> {
         if n_extended <= n_reduced {
             return Err(format!(
@@ -115,11 +111,7 @@ impl Lrt {
         }
         let df = n_extended - n_reduced;
         let dofv = ofv_reduced - ofv_extended;
-        let p_value = if dofv.is_finite() {
-            chi_square_sf(dofv, df)
-        } else {
-            f64::NAN
-        };
+        let p_value = if dofv.is_finite() { chi_square_sf(dofv, df) } else { f64::NAN };
         Ok(Lrt {
             dofv,
             df,
@@ -195,11 +187,7 @@ mod tests {
         let two_df = Lrt::forward(100.0, 10, 100.0 - 6.64, 12, 0.01).unwrap();
         assert_eq!(two_df.df, 2);
         assert!(!two_df.significant, "{two_df:?}");
-        assert!(
-            Lrt::forward(100.0, 10, 100.0 - 9.3, 12, 0.01)
-                .unwrap()
-                .significant
-        );
+        assert!(Lrt::forward(100.0, 10, 100.0 - 9.3, 12, 0.01).unwrap().significant);
     }
 
     #[test]
@@ -215,10 +203,7 @@ mod tests {
         let e = Lrt::forward(100.0, 10, 90.0, 10, 0.01).unwrap_err();
         assert!(e.contains("needs at least one more"), "{e}");
         let e = Lrt::forward(100.0, 10, 90.0, 9, 0.01).unwrap_err();
-        assert!(
-            e.contains("9 free parameters against the reduced model's 10"),
-            "{e}"
-        );
+        assert!(e.contains("9 free parameters against the reduced model's 10"), "{e}");
     }
 
     #[test]

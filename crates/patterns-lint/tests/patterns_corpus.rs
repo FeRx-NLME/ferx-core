@@ -41,10 +41,7 @@ fn the_scan_actually_reaches_test_code() {
         whole_test > 100,
         "only {whole_test} whole-file test sources found — scope discovery is broken"
     );
-    for must in [
-        "tests/preflight_owns_the_fast_gates.rs",
-        "crates/ferx-cli/tests/cli_ferx.rs",
-    ] {
+    for must in ["tests/preflight_owns_the_fast_gates.rs", "crates/ferx-cli/tests/cli_ferx.rs"] {
         assert!(
             files.iter().any(|f| f.rel == must && f.whole_test),
             "`{must}` was not scanned as test code"
@@ -52,9 +49,7 @@ fn the_scan_actually_reaches_test_code() {
     }
     // A sibling `#[path]` test file, by the repo's `*_tests.rs` convention.
     assert!(
-        files
-            .iter()
-            .any(|f| f.rel.starts_with("src/") && f.rel.ends_with("_tests.rs")),
+        files.iter().any(|f| f.rel.starts_with("src/") && f.rel.ends_with("_tests.rs")),
         "no src/**/*_tests.rs sibling test file was scanned"
     );
 }
@@ -65,16 +60,10 @@ fn the_scan_actually_reaches_test_code() {
 fn recorded_value_read_has_no_baseline_entries() {
     let root = repo_root();
     let base = Baseline::load(&default_baseline_path(&root)).expect("parse the baseline");
-    let entries: Vec<_> = base
-        .entries
-        .keys()
-        .filter(|(rule, _)| rule == "recorded-value-read")
-        .collect();
+    let entries: Vec<_> =
+        base.entries.keys().filter(|(rule, _)| rule == "recorded-value-read").collect();
     assert!(entries.is_empty(), "baselined: {entries:?}");
     let findings = lint_tree(&root).expect("scan the tree");
-    let n = findings
-        .iter()
-        .filter(|f| f.rule == "recorded-value-read")
-        .count();
+    let n = findings.iter().filter(|f| f.rule == "recorded-value-read").count();
     assert_eq!(n, 0, "recorded-value-read findings: {n}");
 }

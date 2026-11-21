@@ -43,25 +43,15 @@ impl Fixture {
             theta_lower: vec![theta_lower],
             theta_upper: vec![1e9],
             theta_fixed: vec![false],
-            omega: OmegaMatrix::from_diagonal(&[omega_var], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![sigma_sd],
-                names: vec!["PROP_ERR".into()],
-            },
-            sigma_fixed: vec![false],
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            sigma: SigmaVector { values: vec![sigma_sd], names: vec!["PROP_ERR".into()] },
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[omega_var],
+                vec!["ETA_CL".into()],
+            ))
         };
         model.omega_init_as_sd = vec![false];
         model.sigma_init_as_sd = vec![false];
-        Self {
-            model,
-            expand_err: None,
-        }
+        Self { model, expand_err: None }
     }
 
     /// A typed `prior(...)` that names no family, the way a hand-built
@@ -69,12 +59,7 @@ impl Fixture {
     /// the name resolves on its own; the family-qualified form is exercised by
     /// `a_name_shared_by_a_theta_and_an_omega_still_resolves`.
     fn with_prior(mut self, name: &str, value: f64, spread: PriorSpread) -> Self {
-        self.model.priors.push(ParameterPrior {
-            name: name.into(),
-            value,
-            spread,
-            kind: None,
-        });
+        self.model.priors.push(ParameterPrior { name: name.into(), value, spread, kind: None });
         self
     }
 
@@ -94,10 +79,8 @@ impl Fixture {
     /// also the only check that the coordinate walk reaches past the Σ block
     /// with its indices intact.
     fn with_iov(mut self, kappa_var: f64) -> Self {
-        self.model.default_params.omega_iov = Some(OmegaMatrix::from_diagonal(
-            &[kappa_var],
-            vec!["KAPPA_CL".into()],
-        ));
+        self.model.default_params.omega_iov =
+            Some(OmegaMatrix::from_diagonal(&[kappa_var], vec!["KAPPA_CL".into()]));
         self.model.default_params.kappa_fixed = vec![false];
         self.model.kappa_init_as_sd = vec![false];
         self
@@ -215,19 +198,18 @@ fn variance_declared_omega_prior_is_lognormal_on_the_variance() {
 fn sd_declared_omega_is_a_different_prior_from_the_variance_declaration() {
     let as_var =
         Fixture::new(0.2, 0.001, 0.16, 0.1).with_prior("ETA_CL", 0.09, PriorSpread::Rse(0.4));
-    let as_sd = Fixture::new(0.2, 0.001, 0.16, 0.1)
-        .omega_declared_as_sd()
-        .with_prior("ETA_CL", 0.3, PriorSpread::Rse(0.4));
+    let as_sd = Fixture::new(0.2, 0.001, 0.16, 0.1).omega_declared_as_sd().with_prior(
+        "ETA_CL",
+        0.3,
+        PriorSpread::Rse(0.4),
+    );
 
     let pen_var = as_var.set().penalty(&as_var.packed());
     let pen_sd = as_sd.set().penalty(&as_sd.packed());
 
     // ln(0.4/0.3)/TAU_40 = 0.2876820724 / 0.3852531702 = 0.7467351205, squared.
     assert!((pen_sd - 0.557_613_340_2).abs() < 1e-8);
-    assert!(
-        (pen_var / pen_sd - 4.0).abs() < 1e-9,
-        "{pen_var} vs {pen_sd}"
-    );
+    assert!((pen_var / pen_sd - 4.0).abs() < 1e-9, "{pen_var} vs {pen_sd}");
 }
 
 /// σ is stored internally on the SD scale but declared as a variance by
@@ -239,9 +221,11 @@ fn sigma_honours_its_declared_scale() {
     // Stored σ is an SD of 0.4, i.e. a declared variance of 0.16.
     let as_var =
         Fixture::new(0.2, 0.001, 0.1, 0.4).with_prior("PROP_ERR", 0.09, PriorSpread::Rse(0.4));
-    let as_sd = Fixture::new(0.2, 0.001, 0.1, 0.4)
-        .sigma_declared_as_sd()
-        .with_prior("PROP_ERR", 0.3, PriorSpread::Rse(0.4));
+    let as_sd = Fixture::new(0.2, 0.001, 0.1, 0.4).sigma_declared_as_sd().with_prior(
+        "PROP_ERR",
+        0.3,
+        PriorSpread::Rse(0.4),
+    );
 
     let pen_var = as_var.set().penalty(&as_var.packed());
     let pen_sd = as_sd.set().penalty(&as_sd.packed());
@@ -256,10 +240,7 @@ fn absolute_sd_matches_the_equivalent_rse_on_a_log_packed_coordinate() {
     let by_rse = Fixture::new(0.2, 0.001, 0.1, 0.1).with_prior("TVCL", 0.15, PriorSpread::Rse(0.2));
     // 0.03 / 0.15 == 0.2.
     let by_sd = Fixture::new(0.2, 0.001, 0.1, 0.1).with_prior("TVCL", 0.15, PriorSpread::Sd(0.03));
-    assert_eq!(
-        by_rse.set().penalty(&by_rse.packed()),
-        by_sd.set().penalty(&by_sd.packed())
-    );
+    assert_eq!(by_rse.set().penalty(&by_rse.packed()), by_sd.set().penalty(&by_sd.packed()));
 }
 
 /// On an identity-packed θ there is no log scale to relate to, so `sd` is the
@@ -465,11 +446,7 @@ fn a_non_positive_central_value_on_a_log_packed_coordinate_is_an_error() {
 
 #[test]
 fn a_non_positive_spread_is_an_error() {
-    for spread in [
-        PriorSpread::Rse(0.0),
-        PriorSpread::Rse(-0.2),
-        PriorSpread::Sd(0.0),
-    ] {
+    for spread in [PriorSpread::Rse(0.0), PriorSpread::Rse(-0.2), PriorSpread::Sd(0.0)] {
         let f = Fixture::new(0.2, 0.001, 0.1, 0.1).with_prior("TVCL", 0.15, spread);
         let msg = err_of(&f);
         assert!(msg.contains("> 0"), "{spread:?}: {msg}");
@@ -519,10 +496,7 @@ fn a_non_finite_spread_is_an_error() {
     ] {
         let f = Fixture::new(0.2, 0.001, 0.1, 0.1).with_prior("TVCL", 0.15, spread);
         let msg = err_of(&f);
-        assert!(
-            msg.contains("finite") || msg.contains("> 0"),
-            "{spread:?}: {msg}"
-        );
+        assert!(msg.contains("finite") || msg.contains("> 0"), "{spread:?}: {msg}");
     }
 }
 
@@ -584,9 +558,7 @@ fn a_prior_on_a_block_diagonal_with_a_fixed_covariance_is_an_error() {
     // independent variance and resolves. Without this the first half is satisfied
     // by a predicate that rejects every non-`diagonal` matrix outright, which is
     // the mixed-Ω regression the test above this one exists to prevent.
-    fixed_cov(0.0)
-        .build()
-        .expect("an uncorrelated diagonal must still resolve");
+    fixed_cov(0.0).build().expect("an uncorrelated diagonal must still resolve");
 }
 
 /// A **mixed** Ω — `block_omega (A, B)` alongside an independent `omega C` — is a
@@ -638,9 +610,8 @@ fn a_prior_on_an_independent_diagonal_of_a_mixed_omega_is_accepted() {
 
     // C is independent → its prior resolves, on C's own declared (SD) scale.
     let on_c = mixed("ETA_C", 0.4);
-    let set = on_c
-        .build()
-        .expect("a prior on an independent diagonal of a mixed Omega must resolve");
+    let set =
+        on_c.build().expect("a prior on an independent diagonal of a mixed Omega must resolve");
     // Ω_CC = 0.16 → SD 0.4, which is the prior mean, so the penalty is exactly 0
     // on the SD scale. Under the variance scale the mean would be ½·ln(0.4) while
     // the packed value stays ln(0.4), giving a large penalty — so this pins the
@@ -648,9 +619,8 @@ fn a_prior_on_an_independent_diagonal_of_a_mixed_omega_is_accepted() {
     assert_eq!(set.penalty(&on_c.packed()), 0.0);
 
     // A belongs to the block → still rejected, naming the block.
-    let err = mixed("ETA_A", 0.09)
-        .build()
-        .expect_err("a prior on a block member must still be rejected");
+    let err =
+        mixed("ETA_A", 0.09).build().expect_err("a prior on a block member must still be rejected");
     assert!(err.contains("block_omega"), "{err}");
 }
 
@@ -721,10 +691,7 @@ fn an_imported_prior_equals_the_prior_the_user_would_have_typed() {
 
     let got = imported.set().penalty(&imported.packed());
     let want = typed.set().penalty(&typed.packed());
-    assert!(
-        got > 0.0,
-        "fixture is degenerate: every estimate sits on its prior"
-    );
+    assert!(got > 0.0, "fixture is degenerate: every estimate sits on its prior");
     assert!((got - want).abs() < 1e-12, "{got} vs {want}");
     assert_eq!(imported.set().summarize(&imported.packed()).len(), 3);
 }
@@ -744,21 +711,14 @@ fn sigma_converts_from_the_source_sd_onto_the_declared_scale() {
     // Declared as a variance (the default).
     let (var, _d1) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.2), &src);
     let as_var = var.set().summarize(&var.packed());
-    let sigma = as_var
-        .iter()
-        .find(|s| s.name == "PROP_ERR")
-        .unwrap()
-        .clone();
+    let sigma = as_var.iter().find(|s| s.name == "PROP_ERR").unwrap().clone();
     // σ̂ = 0.2 is exactly the prior centre on either scale, so the penalty is 0
     // and the informative number is the reported centre: 0.04, a variance.
     assert!((sigma.prior_value - 0.04).abs() < 1e-12, "{sigma:?}");
     assert_eq!(sigma.penalty, 0.0);
 
     // Declared `(sd)` — same source file, same parameter, centre now 0.2.
-    let (sd, _d2) = with_from_fit(
-        Fixture::new(0.2, 0.001, 0.1, 0.2).sigma_declared_as_sd(),
-        &src,
-    );
+    let (sd, _d2) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.2).sigma_declared_as_sd(), &src);
     let as_sd = sd.set().summarize(&sd.packed());
     let sigma_sd = as_sd.iter().find(|s| s.name == "PROP_ERR").unwrap().clone();
     assert!((sigma_sd.prior_value - 0.2).abs() < 1e-12, "{sigma_sd:?}");
@@ -803,10 +763,8 @@ fn omega_declared_as_sd_in_the_source_is_invisible() {
 /// becomes `sqrt(variance)` and the relative SE halves.
 #[test]
 fn omega_converts_onto_the_targets_declared_scale() {
-    let (f, _dir) = with_from_fit(
-        Fixture::new(0.2, 0.001, 0.1, 0.25).omega_declared_as_sd(),
-        &source_fit(),
-    );
+    let (f, _dir) =
+        with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25).omega_declared_as_sd(), &source_fit());
     let s = f.set().summarize(&f.packed());
     let omega = s.iter().find(|s| s.name == "ETA_CL").unwrap();
     // Source variance 0.09 → declared SD 0.3.
@@ -821,10 +779,7 @@ fn omega_converts_onto_the_targets_declared_scale() {
     // `expect_s` = 0.198_042_9 → 0.266_005. An un-halved RSE would divide by
     // `TAU_40` = 0.385_253_2 instead and give 0.136_743, so the two cannot both
     // satisfy this bound.
-    assert!(
-        (omega.shift_in_prior_sds - 0.266_005).abs() < 1e-5,
-        "{omega:?}"
-    );
+    assert!((omega.shift_in_prior_sds - 0.266_005).abs() < 1e-5, "{omega:?}");
 }
 
 /// A θ that may be negative has no meaningful *relative* standard error, so its
@@ -926,9 +881,7 @@ fn a_source_estimate_matching_two_coordinates_is_noted_not_dropped() {
     // θ and σ still import; the ambiguous Ω does not.
     assert_eq!(f.set().summarize(&f.packed()).len(), 2);
     assert!(
-        f.notes()
-            .iter()
-            .any(|n| n.contains("ETA_CL") && n.contains("2 packed coordinates")),
+        f.notes().iter().any(|n| n.contains("ETA_CL") && n.contains("2 packed coordinates")),
         "{:?}",
         f.notes()
     );
@@ -944,13 +897,7 @@ fn a_fixed_target_parameter_is_skipped_with_a_note() {
     let (f, _dir) = with_from_fit(f, &source_fit());
     let set = f.set();
     assert_eq!(set.summarize(&f.packed()).len(), 2);
-    assert!(
-        f.notes()
-            .iter()
-            .any(|n| n.contains("TVCL") && n.contains("FIX")),
-        "{:?}",
-        f.notes()
-    );
+    assert!(f.notes().iter().any(|n| n.contains("TVCL") && n.contains("FIX")), "{:?}", f.notes());
 
     // The typed form on the same parameter is still a hard error — the two
     // behaviours must not collapse into one.
@@ -971,9 +918,7 @@ fn a_source_parameter_without_a_standard_error_is_skipped() {
     let set = f.set();
     assert_eq!(set.summarize(&f.packed()).len(), 2);
     assert!(
-        f.notes()
-            .iter()
-            .any(|n| n.contains("TVCL") && n.contains("standard error")),
+        f.notes().iter().any(|n| n.contains("TVCL") && n.contains("standard error")),
         "{:?}",
         f.notes()
     );
@@ -991,9 +936,7 @@ fn a_name_that_matches_a_different_family_is_not_imported() {
     src.sigma_names = vec!["ALSO_ELSE".into()];
 
     let (f, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &src);
-    let err = f
-        .build()
-        .expect_err("a θ named after an Ω must not be imported as one");
+    let err = f.build().expect_err("a θ named after an Ω must not be imported as one");
     assert!(err.contains("no prior could be imported"), "{err}");
 
     // The straddle: with the family put back, the very same name *does* import.
@@ -1061,9 +1004,7 @@ fn a_name_shared_by_a_theta_and_an_omega_still_resolves() {
         spread: PriorSpread::Rse(0.4),
         kind: None,
     });
-    let err = h
-        .build()
-        .expect_err("an unqualified collision has no answer");
+    let err = h.build().expect_err("an unqualified collision has no answer");
     assert!(err.contains("resolves to 2 packed coordinates"), "{err}");
 }
 
@@ -1120,9 +1061,7 @@ fn an_import_that_lands_nothing_is_an_error() {
     src.eta_names = vec!["NOR_THIS".into()];
     src.sigma_names = vec!["NOR_THAT".into()];
     let (f, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &src);
-    let err = f
-        .build()
-        .expect_err("an empty import must not pass silently");
+    let err = f.build().expect_err("an empty import must not pass silently");
     assert!(err.contains("no prior could be imported"), "{err}");
     assert!(err.contains("name and family"), "{err}");
 
@@ -1180,10 +1119,7 @@ fn a_kappa_prior_is_imported_onto_the_iov_coordinate() {
     // z = ln(0.09/0.04) / TAU_40 = 0.8109302162 / 0.3852531702 = 2.1049280811
     let z = (0.09f64 / 0.04).ln() / TAU_40;
     assert!((kappa.shift_in_prior_sds - z).abs() < 1e-12, "{kappa:?}");
-    assert!(
-        (kappa.shift_in_prior_sds - 2.104_928_081).abs() < 1e-8,
-        "{kappa:?}"
-    );
+    assert!((kappa.shift_in_prior_sds - 2.104_928_081).abs() < 1e-8, "{kappa:?}");
 
     // And it landed on the κ coordinate, not on the Ω one: the packed layout is
     // [θ, Ω, Σ, κ], so only index 3 may move the penalty. Perturbing each
@@ -1228,12 +1164,7 @@ fn an_unexpanded_from_fit_is_refused_rather_than_dropped() {
     let (g, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &source_fit());
     f.model.prior_from_fit = g.model.prior_from_fit.clone().or_else(|| {
         // `with_from_fit` consumed it; rebuild the same path from the temp dir.
-        Some(
-            _dir.path()
-                .join("parent-fit.yaml")
-                .to_string_lossy()
-                .into_owned(),
-        )
+        Some(_dir.path().join("parent-fit.yaml").to_string_lossy().into_owned())
     });
     let err = f.build().unwrap_err();
     assert!(err.contains("has not been expanded"), "{err}");
@@ -1241,10 +1172,7 @@ fn an_unexpanded_from_fit_is_refused_rather_than_dropped() {
 
     // The straddle: expanding it makes the very same model build.
     super::expand_prior_from_fit(&mut f.model).unwrap();
-    assert!(
-        f.model.prior_from_fit.is_none(),
-        "the path must be consumed"
-    );
+    assert!(f.model.prior_from_fit.is_none(), "the path must be consumed");
     assert_eq!(f.set().summarize(&f.packed()).len(), 3);
 }
 

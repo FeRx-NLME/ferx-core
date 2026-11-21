@@ -144,9 +144,7 @@ impl<'a> AdaptiveInputs<'a> {
     /// (`E_FIT_INPUT_MISSING`, naming the remedy the fit allows), and whatever
     /// `fitted_params_from_result` and the sampler refuse, with their codes.
     pub(crate) fn resolve_draws(
-        &self,
-        model: &CompiledModel,
-        root: u64,
+        &self, model: &CompiledModel, root: u64,
     ) -> Result<Option<Vec<ModelParameters>>, EngineError> {
         if let Some(draws) = self.injected_draws {
             debug_assert!(!draws.is_empty(), "the seam is handed at least one draw");
@@ -156,7 +154,7 @@ impl<'a> AdaptiveInputs<'a> {
             return Ok(None);
         };
         if spec.n_draws == 0 {
-            return Err(super::entry_refusals::adaptive_options(
+            return Err(crate::entry_refusals::adaptive_options(
                 "`UncertaintySpec::n_draws` must be at least 1; omit `with_uncertainty` to \
                  simulate at the point estimate",
             ));
@@ -164,7 +162,7 @@ impl<'a> AdaptiveInputs<'a> {
         let template =
             crate::estimation::uncertainty_samples::fitted_params_from_result(fit, model)?;
         if let Some(what) = first_value_difference(self.params, &template) {
-            return Err(super::entry_refusals::adaptive_options(format!(
+            return Err(crate::entry_refusals::adaptive_options(format!(
                 "`with_uncertainty` draws around the fit's point estimate, but the run's \
                  parameters differ from it: {what}. Pass the fit's parameters (for example \
                  `fitted_params_from_result(&fit, &model)`) as the run's `params`"
@@ -178,7 +176,7 @@ impl<'a> AdaptiveInputs<'a> {
                 "Refit with `covariance_fallback = sir` and `sir_keep_samples = true` to draw \
                  from the SIR pool instead (#223)."
             };
-            return Err(super::entry_refusals::fit_input_missing(format!(
+            return Err(crate::entry_refusals::fit_input_missing(format!(
                 "Asymptotic uncertainty requires FitResult.covariance_matrix, and this fit has \
                  none (its covariance step did not run or did not succeed). {remedy}"
             )));
@@ -216,9 +214,7 @@ impl<'a> AdaptiveInputs<'a> {
 
     /// Each population subject's supplied η, in population order (`None`: draw it).
     pub(crate) fn resolve(
-        &self,
-        model: &CompiledModel,
-        population: &Population,
+        &self, model: &CompiledModel, population: &Population,
     ) -> Result<Vec<Option<Vec<f64>>>, EngineError> {
         let Some(etas) = self.etas else {
             return Ok(vec![None; population.subjects.len()]);
@@ -234,12 +230,7 @@ impl<'a> AdaptiveInputs<'a> {
                     .to_string(),
             ));
         }
-        resolve_supplied_etas(
-            model,
-            population,
-            etas,
-            SuppliedEtasEntry::Adaptive(self.unmatched),
-        )
+        resolve_supplied_etas(model, population, etas, SuppliedEtasEntry::Adaptive(self.unmatched))
     }
 }
 
@@ -260,10 +251,7 @@ pub(crate) enum SuppliedEtasEntry {
 /// `[mixture]` model, η names that are not the model's, and (unless the entry may draw)
 /// a population subject with no row. A supplied ID the population lacks is ignored.
 pub(crate) fn resolve_supplied_etas(
-    model: &CompiledModel,
-    population: &Population,
-    etas: &SuppliedEtas,
-    entry: SuppliedEtasEntry,
+    model: &CompiledModel, population: &Population, etas: &SuppliedEtas, entry: SuppliedEtasEntry,
 ) -> Result<Vec<Option<Vec<f64>>>, EngineError> {
     // A mixture fit estimates each subject's η under its own class, but the adaptive
     // run draws each subject's class from the mixing probabilities (#2163), so a
@@ -295,11 +283,8 @@ pub(crate) fn resolve_supplied_etas(
             model.eta_names.join(", ")
         )));
     }
-    let resolved: Vec<Option<Vec<f64>>> = population
-        .subjects
-        .iter()
-        .map(|s| etas.get(&s.id).map(<[f64]>::to_vec))
-        .collect();
+    let resolved: Vec<Option<Vec<f64>>> =
+        population.subjects.iter().map(|s| etas.get(&s.id).map(<[f64]>::to_vec)).collect();
     if matches!(entry, SuppliedEtasEntry::Adaptive(UnmatchedSubjects::Draw)) {
         return Ok(resolved);
     }
@@ -341,9 +326,7 @@ impl SuppliedEtas {
     /// `E_SUPPLIED_ETAS` when `ids` and `rows` differ in length, a row's length is
     /// not the number of `names`, an ID repeats, or a value is not finite.
     pub fn from_table(
-        ids: Vec<String>,
-        names: Vec<String>,
-        rows: Vec<Vec<f64>>,
+        ids: Vec<String>, names: Vec<String>, rows: Vec<Vec<f64>>,
     ) -> Result<Self, EngineError> {
         if ids.len() != rows.len() {
             return Err(refusal(format!(
@@ -371,12 +354,7 @@ impl SuppliedEtas {
                 return Err(refusal(format!("subject ID '{id}' appears more than once")));
             }
         }
-        Ok(Self {
-            ids,
-            names,
-            rows,
-            index,
-        })
+        Ok(Self { ids, names, rows, index })
     }
 
     /// A fit's empirical Bayes estimates (`fit.subjects[i].eta`), one row per fitted
@@ -401,10 +379,7 @@ impl SuppliedEtas {
         Self::from_table(
             fit.subjects.iter().map(|s| s.id.clone()).collect(),
             fit.eta_names.clone(),
-            fit.subjects
-                .iter()
-                .map(|s| s.eta.iter().copied().collect())
-                .collect(),
+            fit.subjects.iter().map(|s| s.eta.iter().copied().collect()).collect(),
         )
     }
 
@@ -430,18 +405,14 @@ impl SuppliedEtas {
 /// its `params` through `OmegaMatrix::from_matrix` with the template's flags, and the
 /// draws pin FIX coordinates from the fit either way.
 pub(super) fn first_value_difference(
-    run: &ModelParameters,
-    fit: &ModelParameters,
+    run: &ModelParameters, fit: &ModelParameters,
 ) -> Option<String> {
     let bits_eq = |a: f64, b: f64| a.to_bits() == b.to_bits();
     let first_in = |a: &[f64], b: &[f64]| -> Option<Option<usize>> {
         if a.len() != b.len() {
             return Some(None);
         }
-        a.iter()
-            .zip(b)
-            .position(|(&x, &y)| !bits_eq(x, y))
-            .map(Some)
+        a.iter().zip(b).position(|(&x, &y)| !bits_eq(x, y)).map(Some)
     };
     // A vector parameter by the fit's name for the element: `θ TVCL is …`.
     let named = |kind: &str,
@@ -464,23 +435,13 @@ pub(super) fn first_value_difference(
     }
     let matrix = |name: &str, a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>| {
         if a.shape() != b.shape() {
-            return Some(format!(
-                "{name} is {:?}, the fit's is {:?}",
-                a.shape(),
-                b.shape()
-            ));
+            return Some(format!("{name} is {:?}, the fit's is {:?}", a.shape(), b.shape()));
         }
         (0..a.nrows())
             .flat_map(|i| (0..a.ncols()).map(move |j| (i, j)))
             .find(|&(i, j)| !bits_eq(a[(i, j)], b[(i, j)]))
             .map(|(i, j)| {
-                format!(
-                    "{name}[{}, {}] is {}, the fit's is {}",
-                    i + 1,
-                    j + 1,
-                    a[(i, j)],
-                    b[(i, j)]
-                )
+                format!("{name}[{}, {}] is {}, the fit's is {}", i + 1, j + 1, a[(i, j)], b[(i, j)])
             })
     };
     if let Some(d) = matrix("Ω", &run.omega.matrix, &fit.omega.matrix) {
@@ -523,12 +484,7 @@ pub(super) fn first_value_difference(
 /// At most 10 IDs, then a count of the rest.
 pub(crate) fn list_ids(ids: &[&str]) -> String {
     const SHOWN: usize = 10;
-    let head = ids
-        .iter()
-        .take(SHOWN)
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let head = ids.iter().take(SHOWN).map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ");
     if ids.len() > SHOWN {
         format!("{head} and {} more", ids.len() - SHOWN)
     } else {
@@ -537,5 +493,5 @@ pub(crate) fn list_ids(ids: &[&str]) -> String {
 }
 
 fn refusal(message: String) -> EngineError {
-    super::entry_refusals::supplied_etas(message)
+    crate::entry_refusals::supplied_etas(message)
 }

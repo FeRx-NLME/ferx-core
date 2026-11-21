@@ -34,12 +34,7 @@ pub(crate) fn label_path(levels: &NestedLevels, cov: &HashMap<String, f64>) -> O
     levels
         .levels
         .iter()
-        .map(|l| {
-            cov.get(&l.column)
-                .copied()
-                .filter(|v| !v.is_nan())
-                .map(f64::to_bits)
-        })
+        .map(|l| cov.get(&l.column).copied().filter(|v| !v.is_nan()).map(f64::to_bits))
         .collect()
 }
 
@@ -55,33 +50,20 @@ pub(crate) enum RecordKind {
 /// Every record of `subject` that carries an occasion label, with its label path:
 /// observations, doses, pk-only rows and resets, in that order.
 pub(crate) fn record_paths(
-    levels: &NestedLevels,
-    subject: &Subject,
+    levels: &NestedLevels, subject: &Subject,
 ) -> Vec<(RecordKind, usize, Option<Vec<u64>>)> {
     let mut out = Vec::new();
     for j in 0..subject.obs_times.len() {
-        out.push((
-            RecordKind::Observation,
-            j,
-            label_path(levels, subject.obs_cov(j)),
-        ));
+        out.push((RecordKind::Observation, j, label_path(levels, subject.obs_cov(j))));
     }
     for k in 0..subject.doses.len() {
         out.push((RecordKind::Dose, k, label_path(levels, subject.dose_cov(k))));
     }
     for m in 0..subject.pk_only_times.len() {
-        out.push((
-            RecordKind::PkOnly,
-            m,
-            label_path(levels, subject.pk_only_cov(m)),
-        ));
+        out.push((RecordKind::PkOnly, m, label_path(levels, subject.pk_only_cov(m))));
     }
     for r in 0..subject.reset_times.len() {
-        out.push((
-            RecordKind::Reset,
-            r,
-            label_path(levels, subject.reset_cov(r)),
-        ));
+        out.push((RecordKind::Reset, r, label_path(levels, subject.reset_cov(r))));
     }
     out
 }
@@ -158,8 +140,7 @@ impl KappaDraw {
     /// (`check_level_labels`): one that has not is an `Err`, never a one-level draw,
     /// which would draw every outer-level κ once per cell (review r1 #1 on #1082 PR4).
     pub(crate) fn of(
-        model: &CompiledModel,
-        subject: &Subject,
+        model: &CompiledModel, subject: &Subject,
     ) -> Result<Self, crate::diagnostics::EngineError> {
         match NestedLayout::of(model, subject) {
             Some(layout) => Ok(Self::Nested(layout)),
@@ -184,8 +165,7 @@ impl KappaDraw {
     /// [`Self::draw`] the regularised `chol` instead (review r2 on #1082 PR4: under nested
     /// levels the NPDE reference cannot observe that difference, so a type has to).
     pub(crate) fn factor<'a>(
-        model: &CompiledModel,
-        omega_iov: &'a crate::types::OmegaMatrix,
+        model: &CompiledModel, omega_iov: &'a crate::types::OmegaMatrix,
     ) -> KappaFactor<'a> {
         KappaFactor(omega_iov.sim_draw_factor(
             model.default_params.omega_iov.as_ref(),
@@ -195,10 +175,7 @@ impl KappaDraw {
 
     /// One draw of the per-group κ vectors from `factor` ([`Self::factor`]).
     pub(crate) fn draw<R: rand::Rng>(
-        &self,
-        factor: &KappaFactor<'_>,
-        normal: rand_distr::Normal<f64>,
-        rng: &mut R,
+        &self, factor: &KappaFactor<'_>, normal: rand_distr::Normal<f64>, rng: &mut R,
     ) -> Vec<Vec<f64>> {
         let omega_iov_chol: &DMatrix<f64> = &factor.0;
         match self {
@@ -222,8 +199,7 @@ impl KappaDraw {
 /// couples two levels; a fitted Ω_IOV holds those entries at structural zeros, but a
 /// caller-built one could set them, and the draw would then be silently wrong.
 pub(crate) fn check_cross_level_omega_iov(
-    model: &CompiledModel,
-    omega_iov: &DMatrix<f64>,
+    model: &CompiledModel, omega_iov: &DMatrix<f64>,
 ) -> Result<(), crate::diagnostics::EngineError> {
     let Some(levels) = model.nested_levels() else {
         return Ok(());
@@ -233,7 +209,7 @@ pub(crate) fn check_cross_level_omega_iov(
         for j in 0..i {
             let (li, lj) = (levels.kappa_level[i], levels.kappa_level[j]);
             if li != lj && omega_iov[(i, j)] != 0.0 {
-                return Err(crate::api::param_shape(format!(
+                return Err(crate::entry_refusals::param_shape(format!(
                     "omega_iov[{i}, {j}] = {} correlates kappa `{}` at level `{}` with `{}` at \
                      level `{}`, but kappas at two levels are independent (a `block_kappa` lives \
                      at one level). Set the entry to 0.",
@@ -256,8 +232,7 @@ pub(crate) fn check_cross_level_omega_iov(
 /// prepared (`with_derived_occasions`, or each draw of `simulate_with_uncertainty`) is
 /// borrowed rather than copied again.
 pub(crate) fn with_level_cells<'a>(
-    model: &CompiledModel,
-    population: &'a Population,
+    model: &CompiledModel, population: &'a Population,
 ) -> std::borrow::Cow<'a, Population> {
     let Some(levels) = model.nested_levels() else {
         return std::borrow::Cow::Borrowed(population);
@@ -275,9 +250,7 @@ pub(crate) fn with_level_cells<'a>(
 /// nesting by key the value at `l` alone (`ARM 2`) names a group in every study. Rows with
 /// a missing label are left out (the data check refuses them).
 pub(crate) fn obs_groups_at(
-    levels: &NestedLevels,
-    subject: &Subject,
-    l: usize,
+    levels: &NestedLevels, subject: &Subject, l: usize,
 ) -> Vec<(String, Vec<usize>)> {
     let mut groups: Vec<(Vec<u64>, Vec<usize>)> = Vec::new();
     for j in 0..subject.obs_times.len() {
@@ -352,7 +325,7 @@ fn cells_assigned(subject: &Subject) -> bool {
 
 /// A nested-level model with a subject that has no [`NestedLayout`]: the population was
 /// not prepared for the fit (`fitted_population` never ran, as on the lower-level entry
-/// points `optimize_population` / `run_inner_loop` handed a population as read), or a
+/// point `optimize_population` handed a population as read), or a
 /// record kept a missing label. The estimator must not fall back to one-level IOV for it,
 /// which would integrate κ per record kind as read, or drop κ altogether; each site
 /// refuses the subject with its own sentinel instead (review r1 #6 on #2028).
@@ -412,10 +385,8 @@ impl NestedLayout {
             }
         }
         let cells = crate::stats::likelihood::iov_occasion_groups(subject);
-        let cell_paths: Option<Vec<Vec<u64>>> = cells
-            .iter()
-            .map(|(occ, _)| path_of.get(occ).cloned())
-            .collect();
+        let cell_paths: Option<Vec<Vec<u64>>> =
+            cells.iter().map(|(occ, _)| path_of.get(occ).cloned()).collect();
         let cell_paths = cell_paths?;
         let (cell_groups, level_count) = level_groups(levels, &cell_paths);
 
@@ -472,11 +443,7 @@ impl NestedLayout {
     /// The per-cell κ vectors of the compact vector `b`.
     pub(crate) fn expand(&self, b: &[f64]) -> Vec<Vec<f64>> {
         (0..self.n_cells())
-            .map(|g| {
-                (0..self.kappa_slot.len())
-                    .map(|k| b[self.compact_index(g, k)])
-                    .collect()
-            })
+            .map(|g| (0..self.kappa_slot.len()).map(|k| b[self.compact_index(g, k)]).collect())
             .collect()
     }
 
@@ -485,9 +452,7 @@ impl NestedLayout {
     /// not hold one full-width vector per cell.
     pub(crate) fn compact<K: AsRef<[f64]>>(&self, eta: &[f64], kappas: &[K]) -> Option<Vec<f64>> {
         if kappas.len() != self.n_cells()
-            || kappas
-                .iter()
-                .any(|k| k.as_ref().len() != self.kappa_slot.len())
+            || kappas.iter().any(|k| k.as_ref().len() != self.kappa_slot.len())
         {
             return None;
         }
@@ -544,10 +509,7 @@ impl NestedLayout {
     /// Cholesky diagonal on a level is that of `Ω_L` (elimination never fills in between
     /// unconnected indices). With one level this is today's `Σ_k κ_kᵀΩ⁻¹κ_k + K·log|Ω|`.
     pub(crate) fn kappa_prior(
-        &self,
-        b: &[f64],
-        omega_iov_inv: &DMatrix<f64>,
-        omega_iov_chol: &DMatrix<f64>,
+        &self, b: &[f64], omega_iov_inv: &DMatrix<f64>, omega_iov_chol: &DMatrix<f64>,
     ) -> f64 {
         let mut total = 0.0;
         for l in 0..self.level_width.len() {
@@ -633,10 +595,7 @@ impl NestedLayout {
 
     /// Cell `g`'s labels from the outermost level down to level `l`, as values.
     pub(crate) fn labels(&self, g: usize, l: usize) -> Vec<f64> {
-        self.cell_paths[g][..=l]
-            .iter()
-            .map(|&b| f64::from_bits(b))
-            .collect()
+        self.cell_paths[g][..=l].iter().map(|&b| f64::from_bits(b)).collect()
     }
 
     /// One κ draw for simulation (#1082 PR4): per level, outermost first, one block
@@ -650,10 +609,7 @@ impl NestedLayout {
     /// between two levels. With every κ at one level this is one `chol·z` per group,
     /// the one-level draw `simulate()` makes per occasion.
     pub(crate) fn draw<R: rand::Rng>(
-        &self,
-        omega_iov_chol: &DMatrix<f64>,
-        normal: rand_distr::Normal<f64>,
-        rng: &mut R,
+        &self, omega_iov_chol: &DMatrix<f64>, normal: rand_distr::Normal<f64>, rng: &mut R,
     ) -> Vec<Vec<f64>> {
         let mut b = vec![0.0; self.n_compact];
         for l in 0..self.level_width.len() {

@@ -102,13 +102,8 @@ fn diagonal_returns_none() {
     omega[(0, 0)] = 0.09;
     omega[(1, 1)] = 0.04;
     let mut warnings = Vec::new();
-    let result = compute_param_corr(
-        &omega,
-        &[true, true],
-        &names(&["A", "B"]),
-        "test",
-        &mut warnings,
-    );
+    let result =
+        compute_param_corr(&omega, &[true, true], &names(&["A", "B"]), "test", &mut warnings);
     assert!(result.is_none());
     assert!(warnings.is_empty());
 }

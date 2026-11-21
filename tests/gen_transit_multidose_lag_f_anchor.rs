@@ -114,11 +114,8 @@ fn generate_transit_multidose_lag_f_anchor() {
     let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 719_735).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
-        subj.observations = sims
-            .iter()
-            .filter(|r| r.id == subj.id)
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        subj.observations =
+            sims.iter().filter(|r| r.id == subj.id).map(|r| r.outcome.continuous_value()).collect();
     }
 
     let mut csv_nm = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,WT\n");

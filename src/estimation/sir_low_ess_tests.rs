@@ -19,30 +19,20 @@ const S_TO_PACKED: &str = "Under `sir_scale = natural` a variance informed by fe
                            heavy upper tail; `sir_scale = packed` may sample it better.";
 
 fn heaviest() -> HeaviestDraw {
-    HeaviestDraw {
-        share: 0.529,
-        name: "ETA_CL".into(),
-        sd_units: -6.357,
-        value: 4.585e-4,
-    }
+    HeaviestDraw { share: 0.529, name: "ETA_CL".into(), sd_units: -6.357, value: 4.585e-4 }
 }
 
 /// The measured `warfarin_iov` FOCEI floor probe (#1723 §0).
 fn wiov_probe() -> Vec<FloorProbe> {
-    [
-        ("ETA_CL", 9.31),
-        ("ETA_V", 18.09),
-        ("ETA_KA", 1.56),
-        ("KAPPA_CL", 76.78),
-    ]
-    .into_iter()
-    .map(|(n, d)| FloorProbe {
-        name: n.into(),
-        dofv: d,
-        variance: 6.14e-6,
-        covariances_zeroed: false,
-    })
-    .collect()
+    [("ETA_CL", 9.31), ("ETA_V", 18.09), ("ETA_KA", 1.56), ("KAPPA_CL", 76.78)]
+        .into_iter()
+        .map(|(n, d)| FloorProbe {
+            name: n.into(),
+            dofv: d,
+            variance: 6.14e-6,
+            covariances_zeroed: false,
+        })
+        .collect()
 }
 
 fn has(msg: &str, s: &str) -> bool {
@@ -61,10 +51,7 @@ fn low_ess_warning_gate_straddles_the_threshold_and_skips_the_probe_above_it() {
         calls.set(calls.get() + 1);
         wiov_probe()
     };
-    assert_eq!(
-        low_ess_warning(100.0, 1000, SirScale::Packed, &heaviest(), probe),
-        None
-    );
+    assert_eq!(low_ess_warning(100.0, 1000, SirScale::Packed, &heaviest(), probe), None);
     assert_eq!(calls.get(), 0, "the probe ran on a healthy run");
     let below = 100.0f64.next_down();
     let probe = || {
@@ -82,23 +69,12 @@ fn low_ess_warning_gate_straddles_the_threshold_and_skips_the_probe_above_it() {
 /// `sir_scale` advice — nothing predicts `natural` would help.
 #[test]
 fn low_ess_warning_without_a_flagged_variance_names_the_draw_only() {
-    let probe = || {
-        wiov_probe()
-            .into_iter()
-            .filter(|p| p.name != "ETA_KA")
-            .collect()
-    };
+    let probe = || wiov_probe().into_iter().filter(|p| p.name != "ETA_KA").collect();
     let msg = low_ess_warning(3.548, 1000, SirScale::Packed, &heaviest(), probe).unwrap();
     for s in [S_ESS, S_THRESHOLD, S_HEAVIEST, S_MORE] {
         assert!(has(&msg, s), "missing {s:?} in {msg}");
     }
-    for s in [
-        S_SHELF_HEAD,
-        S_SHELF_TAIL,
-        S_TO_NATURAL,
-        S_TO_PACKED,
-        "sir_scale",
-    ] {
+    for s in [S_SHELF_HEAD, S_SHELF_TAIL, S_TO_NATURAL, S_TO_PACKED, "sir_scale"] {
         assert!(!has(&msg, s), "unexpected {s:?} in {msg}");
     }
     assert!(!msg.contains("bounded away"), "{msg}");
@@ -163,10 +139,7 @@ fn low_ess_warning_notes_zeroed_covariances_on_that_variance_only() {
         ),
         "{msg}"
     );
-    assert!(
-        has(&msg, "ETA_KA (ΔOFV 1.56 at variance 6.14e-6), ETA_Q"),
-        "{msg}"
-    );
+    assert!(has(&msg, "ETA_KA (ΔOFV 1.56 at variance 6.14e-6), ETA_Q"), "{msg}");
     assert_eq!(msg.matches("also set to 0").count(), 1, "{msg}");
 }
 
@@ -174,12 +147,7 @@ fn low_ess_warning_notes_zeroed_covariances_on_that_variance_only() {
 /// flagged separately, and nothing says the θ sits near a box.
 #[test]
 fn low_ess_warning_keeps_a_theta_move_apart_from_the_variance_flags() {
-    let h = HeaviestDraw {
-        name: "TVE0".into(),
-        sd_units: 4.26,
-        value: 52.76,
-        share: 0.12,
-    };
+    let h = HeaviestDraw { name: "TVE0".into(), sd_units: 4.26, value: 52.76, share: 0.12 };
     let msg = low_ess_warning(35.2, 1000, SirScale::Packed, &h, wiov_probe).unwrap();
     assert!(has(&msg, "it moves TVE0 by +4.26 proposal"), "{msg}");
     assert!(has(&msg, "do not bound ETA_KA (ΔOFV"), "{msg}");
@@ -239,10 +207,7 @@ fn low_ess_warning_under_natural_points_back_to_packed_and_never_probes() {
     for s in [S_SHELF_HEAD, S_SHELF_TAIL, S_TO_NATURAL] {
         assert!(!has(&msg, s), "unexpected {s:?} in {msg}");
     }
-    assert_eq!(
-        low_ess_warning(100.0, 1000, SirScale::Natural, &heaviest(), wiov_probe),
-        None
-    );
+    assert_eq!(low_ess_warning(100.0, 1000, SirScale::Natural, &heaviest(), wiov_probe), None);
 }
 
 /// The model the probe and the run-level tests share: a free Ω, a FIX Ω, a
@@ -304,12 +269,7 @@ fn floor_probe_coords_are_the_free_variance_diagonals() {
     let names = coordinate_names(p);
     let got: Vec<(&str, Vec<&str>)> = floor_probe_coords(p, &fixed)
         .into_iter()
-        .map(|c| {
-            (
-                names[c.diag].as_str(),
-                c.row_off.iter().map(|&j| names[j].as_str()).collect(),
-            )
-        })
+        .map(|c| (names[c.diag].as_str(), c.row_off.iter().map(|&j| names[j].as_str()).collect()))
         .collect();
     let diags: Vec<&str> = got.iter().map(|g| g.0).collect();
     assert_eq!(diags, ["ETA_CL", "ETA_V", "ETA_Q", "KAPPA_CL"], "{names:?}");
@@ -331,28 +291,16 @@ fn floor_probe_coords_are_the_free_variance_diagonals() {
 fn floor_probe_point_puts_a_block_variance_at_its_floor() {
     let (model, _) = probe_fixture();
     let p = &model.default_params;
-    let PackedStart {
-        packed,
-        bounds,
-        fixed,
-        ..
-    } = pack_with_bounds(p);
+    let PackedStart { packed, bounds, fixed, .. } = pack_with_bounds(p);
     let coords = floor_probe_coords(p, &fixed);
     let names = coordinate_names(p);
-    let q = coords
-        .iter()
-        .find(|c| names[c.diag] == "ETA_Q")
-        .expect("ETA_Q probed");
+    let q = coords.iter().find(|c| names[c.diag] == "ETA_Q").expect("ETA_Q probed");
     let at = unpack_params(&floor_probe_point(&packed, &bounds, q), p);
     let iq = p.omega.eta_names.iter().position(|n| n == "ETA_Q").unwrap();
     let iv = p.omega.eta_names.iter().position(|n| n == "ETA_V").unwrap();
     let floor = (2.0 * bounds.lower[q.diag]).exp();
     let s = &at.omega.matrix;
-    assert!(
-        ((s[(iq, iq)] - floor) / floor).abs() < 1e-9,
-        "Σ_QQ {} vs floor {floor}",
-        s[(iq, iq)]
-    );
+    assert!(((s[(iq, iq)] - floor) / floor).abs() < 1e-9, "Σ_QQ {} vs floor {floor}", s[(iq, iq)]);
     assert_eq!(s[(iq, iv)], 0.0, "ETA_Q~ETA_V left live");
     let est = &p.omega.matrix;
     assert!((s[(iv, iv)] - est[(iv, iv)]).abs() < 1e-12, "ETA_V moved");
@@ -360,18 +308,11 @@ fn floor_probe_point_puts_a_block_variance_at_its_floor() {
     // KAPPA_CL are diagonal; ETA_V is the block's first η, and its row's only
     // entries are structural zeros (already 0) — a note keyed on `row_off`
     // being non-empty would mark it wrongly.
-    let zeroes: Vec<(&str, bool)> = coords
-        .iter()
-        .map(|c| (names[c.diag].as_str(), c.zeroes_a_covariance(&packed)))
-        .collect();
+    let zeroes: Vec<(&str, bool)> =
+        coords.iter().map(|c| (names[c.diag].as_str(), c.zeroes_a_covariance(&packed))).collect();
     assert_eq!(
         zeroes,
-        [
-            ("ETA_CL", false),
-            ("ETA_V", false),
-            ("ETA_Q", true),
-            ("KAPPA_CL", false)
-        ],
+        [("ETA_CL", false), ("ETA_V", false), ("ETA_Q", true), ("KAPPA_CL", false)],
         "{coords:?}"
     );
 }
@@ -379,8 +320,7 @@ fn floor_probe_point_puts_a_block_variance_at_its_floor() {
 /// A SIR run on the probe fixture with only 40 draws, so the ESS is below the
 /// threshold whatever the proposal, and `adjust_box` applied first.
 fn run_probe_fixture(
-    scale: SirScale,
-    adjust_box: impl FnOnce(&mut PackedBounds),
+    scale: SirScale, adjust_box: impl FnOnce(&mut PackedBounds),
 ) -> Result<SirResult, crate::EngineError> {
     run_probe_fixture_with(scale, 0.0, PROBE_MODEL, adjust_box)
 }
@@ -388,10 +328,7 @@ fn run_probe_fixture(
 /// [`run_probe_fixture`] on `model_src`, with `ofv_offset` added to the
 /// `ofv_hat` handed to SIR.
 fn run_probe_fixture_with(
-    scale: SirScale,
-    ofv_offset: f64,
-    model_src: &str,
-    adjust_box: impl FnOnce(&mut PackedBounds),
+    scale: SirScale, ofv_offset: f64, model_src: &str, adjust_box: impl FnOnce(&mut PackedBounds),
 ) -> Result<SirResult, crate::EngineError> {
     let (_, pop) = probe_fixture();
     let model = crate::parser::model_parser::parse_model_string(model_src).expect("parse");
@@ -425,16 +362,7 @@ fn run_probe_fixture_with(
         );
         2.0 * pop_nll_opts(&model, &pop, &params, &ehs, &hms, &kp, &opts)
     };
-    run_sir_in_box(
-        &model,
-        &pop,
-        &params,
-        &etas,
-        &cov,
-        ofv + ofv_offset,
-        &opts,
-        adjust_box,
-    )
+    run_sir_in_box(&model, &pop, &params, &etas, &cov, ofv + ofv_offset, &opts, adjust_box)
 }
 
 /// #1749 r1 #3: the probe's ΔOFV is measured from `ofv_at` at the estimate,
@@ -447,10 +375,7 @@ fn run_probe_fixture_with(
 fn floor_probe_baseline_ignores_the_callers_ofv_hat() {
     let floor = |b: &mut PackedBounds| {
         let (model, _) = probe_fixture();
-        let i = coordinate_names(&model.default_params)
-            .iter()
-            .position(|n| n == "ETA_CL")
-            .unwrap();
+        let i = coordinate_names(&model.default_params).iter().position(|n| n == "ETA_CL").unwrap();
         b.lower[i] = -3.0;
     };
     let low = |r: &SirResult| {
@@ -474,10 +399,8 @@ fn floor_probe_baseline_ignores_the_callers_ofv_hat() {
 /// Mutation — the site back on a bare `String`: the code assertion dies.
 #[test]
 fn natural_scale_is_refused_with_a_prior_only() {
-    let priored = PROBE_MODEL.replace(
-        "theta TVCL(5.0, 0.01, 100)",
-        "theta TVCL(5.0, 0.01, 100) prior(5.0, rse = 20%)",
-    );
+    let priored = PROBE_MODEL
+        .replace("theta TVCL(5.0, 0.01, 100)", "theta TVCL(5.0, 0.01, 100) prior(5.0, rse = 20%)");
     assert_ne!(priored, PROBE_MODEL);
     let err = run_probe_fixture_with(SirScale::Natural, 0.0, &priored, |_| {}).unwrap_err();
     assert_eq!(
@@ -513,22 +436,10 @@ fn heaviest_draw_reports_the_largest_move_in_marginal_proposal_sds() {
     moved[free[1]] -= 5.0;
     let samples = vec![packed.clone(), moved.clone(), packed.clone()];
     let z = vec![vec![0.1, 0.1], vec![1.0, -2.0], vec![0.0, 0.0]];
-    let h = heaviest_draw(
-        &[0.2, 0.7, 0.1],
-        &z,
-        &samples,
-        &chol,
-        &free,
-        &free_names,
-        &params,
-    );
+    let h = heaviest_draw(&[0.2, 0.7, 0.1], &z, &samples, &chol, &free, &free_names, &params);
     assert_eq!(h.share, 0.7);
     assert_eq!(h.name, free_names[1]);
-    assert!(
-        (h.sd_units - (-5.0 / 10f64.sqrt())).abs() < 1e-12,
-        "{}",
-        h.sd_units
-    );
+    assert!((h.sd_units - (-5.0 / 10f64.sqrt())).abs() < 1e-12, "{}", h.sd_units);
     let want = coordinate_values(&unpack_params(&moved, &params))[free[1]];
     assert_eq!(h.value, want);
 }
@@ -548,10 +459,7 @@ fn low_ess_warning_first_sentence_for_few_draws_and_near_the_threshold() {
     );
     assert!(!few.contains(S_THRESHOLD), "{few}");
     let near = low_ess_warning(99.96, 1000, SirScale::Packed, &heaviest(), Vec::new).unwrap();
-    assert!(
-        near.starts_with("effective sample size is 99.9 of 1000 draws, below"),
-        "{near}"
-    );
+    assert!(near.starts_with("effective sample size is 99.9 of 1000 draws, below"), "{near}");
 }
 
 /// S2, run level: the probe reads each coordinate's **own** lower bound. With
@@ -560,10 +468,7 @@ fn low_ess_warning_first_sentence_for_few_draws_and_near_the_threshold() {
 #[test]
 fn floor_probe_moves_each_coordinate_to_its_own_box_floor() {
     let (model, _) = probe_fixture();
-    let i = coordinate_names(&model.default_params)
-        .iter()
-        .position(|n| n == "ETA_CL")
-        .unwrap();
+    let i = coordinate_names(&model.default_params).iter().position(|n| n == "ETA_CL").unwrap();
     let r = run_probe_fixture(SirScale::Packed, |b| b.lower[i] = -3.0).expect("sir");
     let w = r
         .warnings
@@ -577,14 +482,9 @@ fn floor_probe_moves_each_coordinate_to_its_own_box_floor() {
     // #1749 r2: the run wires each probe's covariance note through. ETA_Q (the
     // block's second η) carries it, ETA_V (the first) and ETA_CL do not. Matched
     // on ETA_Q's own entry, not its ΔOFV digits, which are a fit number.
-    let q = &w[w
-        .find("ETA_Q (ΔOFV")
-        .unwrap_or_else(|| panic!("ETA_Q not flagged: {w}"))..];
+    let q = &w[w.find("ETA_Q (ΔOFV").unwrap_or_else(|| panic!("ETA_Q not flagged: {w}"))..];
     let q = &q[..=q.find(')').unwrap()];
-    assert!(
-        q.ends_with(", with its covariances in the block also set to 0)"),
-        "{q}"
-    );
+    assert!(q.ends_with(", with its covariances in the block also set to 0)"), "{q}");
     assert_eq!(w.matches("also set to 0").count(), 1, "{w}");
 }
 
@@ -594,10 +494,7 @@ fn floor_probe_moves_each_coordinate_to_its_own_box_floor() {
 fn natural_centre_is_the_laplace_shift_clamped_into_the_box() {
     let c = DMatrix::from_row_slice(2, 2, &[0.04, 0.01, 0.01, 0.09]);
     let g = DVector::from_vec(vec![2.0, 1.0]);
-    let b = PackedBounds {
-        lower: vec![-10.0, -10.0, -10.0],
-        upper: vec![10.0, 10.0, 0.05],
-    };
+    let b = PackedBounds { lower: vec![-10.0, -10.0, -10.0], upper: vec![10.0, 10.0, 0.05] };
     let got = natural_centre(&[7.0, -1.0, 0.0], &c, &g, &[0, 2], &b);
     assert_eq!(got[1], -1.0, "a held coordinate moved");
     assert_eq!(got[0], 7.0 + (0.04 * 2.0 + 0.01 * 1.0));
@@ -654,10 +551,7 @@ fn packed_sir_is_unchanged_from_before_1723() {
     // Both halves in one message, so a platform failure reports both.
     let what = format!("ESS {ess} (before #1723 {want}, rel {rel:e}); hash {hash}");
     assert!(ess.is_finite() && rel < ESS_PLATFORM_TOL, "{what}");
-    assert_eq!(
-        hash, PACKED_RESAMPLE_HASH,
-        "resampled vectors moved: {what}"
-    );
+    assert_eq!(hash, PACKED_RESAMPLE_HASH, "resampled vectors moved: {what}");
 }
 
 /// The ESS is a ratio of `exp`'d log-weights, and on this fixture (ESS 1.5)
@@ -693,10 +587,7 @@ const PACKED_RESAMPLE_HASH: u64 = 4_345_404_384_744_949_393;
 /// 2.59), and the ESS above 4 000 (measured 8 771.5 / 8 776.5; that mutation
 /// 120.1 / 123.6).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
     use crate::estimation::uncertainty_samples::fitted_params_from_result;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -728,20 +619,11 @@ fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
             sir_scale: scale,
             ..opts.clone()
         };
-        let r = run_sir_in_box(
-            model,
-            &prep.population,
-            &params,
-            &etas,
-            &cov,
-            f.ofv,
-            &o,
-            |b| {
-                for c in &floors {
-                    b.lower[c.diag] = floor;
-                }
-            },
-        )
+        let r = run_sir_in_box(model, &prep.population, &params, &etas, &cov, f.ofv, &o, |b| {
+            for c in &floors {
+                b.lower[c.diag] = floor;
+            }
+        })
         .expect("sir");
         let lo = r.ci_omega[2].0;
         eprintln!(
@@ -752,24 +634,14 @@ fn natural_scale_lower_limit_is_box_independent_where_packed_is_not() {
         if scale == SirScale::Natural {
             let ess = r.effective_sample_size;
             assert!(ess > 4_000.0, "natural ESS {ess} at floor {floor}");
-            assert!(
-                (lo / 5.17e-3).ln().abs() < 0.4,
-                "natural ω²_KA lower {lo:e} at floor {floor}"
-            );
+            assert!((lo / 5.17e-3).ln().abs() < 0.4, "natural ω²_KA lower {lo:e} at floor {floor}");
         }
         lo
     };
     let packed = (ka_lower(SirScale::Packed, -4.0) / ka_lower(SirScale::Packed, -9.0)).ln();
     let natural = (ka_lower(SirScale::Natural, -4.0) / ka_lower(SirScale::Natural, -9.0)).ln();
-    eprintln!(
-        "S7 |ln ratio| packed {:.3} natural {:.3}",
-        packed.abs(),
-        natural.abs()
-    );
-    assert!(
-        packed.abs() > 0.8,
-        "packed no longer tracks the floor: {packed}"
-    );
+    eprintln!("S7 |ln ratio| packed {:.3} natural {:.3}", packed.abs(), natural.abs());
+    assert!(packed.abs() > 0.8, "packed no longer tracks the floor: {packed}");
     assert!(natural.abs() < 0.15, "natural tracks the floor: {natural}");
 }
 
@@ -785,17 +657,11 @@ fn counted_floor_probe(cancel: Option<crate::cancel::CancelFlag>) -> (Vec<FloorP
 /// objective, as a point whose subject is rejected at its inner start even cold does
 /// (#2382). Call 1 is the baseline, then one per free variance in coordinate order.
 fn counted_floor_probe_unscored(
-    cancel: Option<crate::cancel::CancelFlag>,
-    unscored: &[usize],
+    cancel: Option<crate::cancel::CancelFlag>, unscored: &[usize],
 ) -> (Vec<FloorProbe>, usize) {
     let (model, _) = probe_fixture();
     let p = &model.default_params;
-    let PackedStart {
-        packed,
-        bounds,
-        fixed,
-        ..
-    } = pack_with_bounds(p);
+    let PackedStart { packed, bounds, fixed, .. } = pack_with_bounds(p);
     let names = coordinate_names(p);
     let calls = Cell::new(0);
     let ofv_at = |_: &ModelParameters, _: &[f64]| {
@@ -854,16 +720,11 @@ fn floor_probe_drops_a_point_with_no_objective() {
 #[test]
 fn low_ess_warning_after_a_cancel_drops_the_shelf_sentence_only() {
     let warn = |cancel| {
-        low_ess_warning(3.5, 1000, SirScale::Packed, &heaviest(), || {
-            counted_floor_probe(cancel).0
-        })
-        .expect("warns")
+        low_ess_warning(3.5, 1000, SirScale::Packed, &heaviest(), || counted_floor_probe(cancel).0)
+            .expect("warns")
     };
     let live = warn(None);
-    assert!(
-        has(&live, S_SHELF_HEAD) && has(&live, S_SHELF_TAIL),
-        "{live}"
-    );
+    assert!(has(&live, S_SHELF_HEAD) && has(&live, S_SHELF_TAIL), "{live}");
     assert!(has(&live, S_TO_NATURAL), "{live}");
     let cut = warn(Some(crate::cancel::CancelFlag::trip_after(0)));
     for s in [S_ESS, S_THRESHOLD, S_HEAVIEST, S_MORE] {

@@ -551,9 +551,11 @@ for a model with IOV. Entries are in `ebes.csv` row order, and each `id` must na
 subject on that row; a bundle where they disagree is refused as corrupt. The block is
 absent for every other method, which loads `vi` as `None`.
 
-A VI fit under the default `vi_final_ofv = none` has no likelihood, so its `ofv`, `aic`
-and `bic` (and, for a fit with priors, `ofv_data`) are `NaN`, written as `null` like any
-other non-finite float.
+A VI fit under the default `vi_final_ofv = none` has no likelihood, so its `ofv` (and, for a
+fit with priors, `ofv_data`) are `NaN`, written as `null` like any other non-finite float.
+Its `aic` and `bic` are absent (`None`), and so are a SAEM fit's under the default
+`saem_ofv = saem` (#2973); both are written as `null`. A bundle written before they became
+optional stores plain numbers, and reads unchanged.
 
 ## `ebes.csv`
 

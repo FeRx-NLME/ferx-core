@@ -67,9 +67,7 @@ fn one_line(s: &str) -> String {
 
 /// Write every artefact into `dir`, creating it if needed.
 pub fn write_all(
-    dir: &Path,
-    result: &BootstrapResult,
-    options: &BootstrapOptions,
+    dir: &Path, result: &BootstrapResult, options: &BootstrapOptions,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("cannot create bootstrap directory `{}`: {e}", dir.display()))?;
@@ -91,8 +89,7 @@ fn writer(path: &Path) -> Result<csv::Writer<std::fs::File>, String> {
 }
 
 fn finish(mut w: csv::Writer<std::fs::File>, path: &Path) -> Result<(), String> {
-    w.flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    w.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// One row per fit, **first row the original dataset** (`sample = 0`), as in
@@ -102,9 +99,7 @@ fn finish(mut w: csv::Writer<std::fs::File>, path: &Path) -> Result<(), String> 
 /// estimates: that is what makes `--summarize` possible — the exclusion filters
 /// are re-applied to this file rather than baked into it.
 pub fn write_raw_results(
-    path: &Path,
-    result: &BootstrapResult,
-    options: &BootstrapOptions,
+    path: &Path, result: &BootstrapResult, options: &BootstrapOptions,
 ) -> Result<(), String> {
     let mut w = writer(path)?;
     w.write_record(raw_results_header(&result.parameter_names, options))
@@ -149,9 +144,7 @@ pub(crate) fn raw_results_header(names: &[String], options: &BootstrapOptions) -
 
 /// One `raw_results.csv` row. See [`raw_results_header`] for why it is shared.
 pub(crate) fn raw_results_row(
-    r: &ReplicateResult,
-    n_params: usize,
-    options: &BootstrapOptions,
+    r: &ReplicateResult, n_params: usize, options: &BootstrapOptions,
 ) -> Vec<String> {
     let mut row = vec![
         r.index.to_string(),
@@ -168,10 +161,7 @@ pub(crate) fn raw_results_row(
     if options.keep_covariance {
         for j in 0..n_params {
             row.push(opt_exact(
-                r.standard_errors
-                    .as_ref()
-                    .and_then(|s| s.get(j).copied())
-                    .flatten(),
+                r.standard_errors.as_ref().and_then(|s| s.get(j).copied()).flatten(),
             ));
         }
     }
@@ -194,10 +184,7 @@ pub(crate) fn included_keys_row(draw: &Replicate) -> Vec<String> {
 
 /// One `sample_keys1.csv` row: how many times each original subject was drawn.
 pub(crate) fn sample_keys_row(draw: &Replicate, n_subjects: usize) -> Vec<String> {
-    draw.counts(n_subjects)
-        .iter()
-        .map(|c| c.to_string())
-        .collect()
+    draw.counts(n_subjects).iter().map(|c| c.to_string()).collect()
 }
 
 /// The statistics table: one row per parameter.
@@ -248,16 +235,10 @@ pub fn write_diagnostics(path: &Path, result: &BootstrapResult) -> Result<(), St
         .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     let s = &result.summary;
     let mut rows = vec![
-        (
-            "samples_requested".to_string(),
-            result.replicates.len() as f64,
-        ),
+        ("samples_requested".to_string(), result.replicates.len() as f64),
         ("samples_completed".to_string(), s.n_completed as f64),
         ("samples_included".to_string(), s.n_included as f64),
-        (
-            "chi_square_df".to_string(),
-            result.n_estimated_parameters as f64,
-        ),
+        ("chi_square_df".to_string(), result.n_estimated_parameters as f64),
     ];
     for (reason, n) in &s.excluded_by {
         rows.push((format!("excluded: {reason}"), *n as f64));
@@ -275,11 +256,9 @@ pub fn write_diagnostics(path: &Path, result: &BootstrapResult) -> Result<(), St
 /// Every subject of the original dataset, in dataset order.
 pub fn write_all_individuals(path: &Path, result: &BootstrapResult) -> Result<(), String> {
     let mut w = writer(path)?;
-    w.write_record(["ID"])
-        .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
+    w.write_record(["ID"]).map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     for id in &result.subject_ids {
-        w.write_record([id])
-            .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
+        w.write_record([id]).map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
     finish(w, path)
 }
@@ -372,21 +351,12 @@ pub fn read_diagnostic(path: &Path, key: &str) -> Option<f64> {
 #[allow(clippy::type_complexity)]
 pub fn read_raw_results(
     path: &Path,
-) -> Result<
-    (
-        Vec<String>,
-        Option<super::ReplicateResult>,
-        Vec<super::ReplicateResult>,
-    ),
-    String,
-> {
+) -> Result<(Vec<String>, Option<super::ReplicateResult>, Vec<super::ReplicateResult>), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
     // `flexible` so a truncated row arrives as a short record to be inspected
     // below, instead of aborting the whole read with `UnequalLengths`.
-    let mut reader = csv::ReaderBuilder::new()
-        .flexible(true)
-        .from_reader(text.as_bytes());
+    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(text.as_bytes());
     let header: Vec<String> = reader
         .headers()
         .map_err(|e| format!("cannot read the header of `{}`: {e}", path.display()))?
@@ -477,10 +447,7 @@ pub fn read_raw_results(
             .get(0)
             .and_then(|s| s.trim().parse::<usize>().ok())
             .ok_or_else(|| format!("non-numeric `sample` column in `{}`", path.display()))?;
-        let error = error_at
-            .and_then(|i| row.get(i))
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
+        let error = error_at.and_then(|i| row.get(i)).map(str::to_string).filter(|s| !s.is_empty());
         let estimates: Vec<f64> = if error.is_some() {
             Vec::new()
         } else {

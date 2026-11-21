@@ -206,15 +206,11 @@ This also covers the dosing forms below (all closed by #486):
   recurrence anchored to the pulse, not wall-clock time), but a later observation's elapsed
   time since arrival still does, and the saltation captures exactly that.
 
-One SS sub-case routes to the finite-difference fallback:
-
-- **SS + an RHS reading an absolute clock** (`TIME`/`T`/`TAFD`), or **`TAD` under a
-  lagged SS dose**. An absolute clock has no periodic steady state, and the lagged
-  pre-arrival window's `TAD` convention is still open (#1126), so these subjects fit with a
-  finite-difference inner gradient, reported in `FitResult.warnings`. A `TAD`-only RHS
-  under unlagged SS dosing is analytic: the dual run-in replays the value path's per-window
-  clocks (see
-  [Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs)).
+**SS + an RHS reading a clock** (`TIME`/`T`/`TAFD`, or `TAD` under a lagged SS dose) is
+analytic too: the dual run-in replays the value path's per-window clocks, so the gradient is
+the exact derivative of the value path's convention (an absolute clock has no periodic limit,
+and the value is whatever the windows' local clocks give, #1139). See
+[Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs).
 
 ### Numeric cross-check against NONMEM 7.5.1 (SS + modeled-duration dose)
 

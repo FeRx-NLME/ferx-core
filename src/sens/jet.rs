@@ -19,10 +19,7 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
     const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
     #[inline]
     pub fn constant(v: f64) -> Self {
-        DualT {
-            v: B::from_f64(v),
-            g: [B::from_f64(0.0); N],
-        }
+        DualT { v: B::from_f64(v), g: [B::from_f64(0.0); N] }
     }
     #[inline]
     fn chain(self, hv: B, d: B) -> Self {
@@ -190,23 +187,18 @@ impl<const N: usize, B: PkNum> crate::sens::num::RecHooks for DualT<N, B> {
     // be the recorder's to record, not a dual's to carry): nothing integrates one, and the
     // driver's entry points assert it.
     const ODE_DRIVER_OK: bool = !B::RECORDS_BRANCHES;
+    #[cfg(feature = "markov")]
+    fn note_declined() {
+        B::note_declined();
+    }
     fn floor_c(self) -> Self {
-        DualT {
-            v: self.v.floor_c(),
-            g: [B::from_f64(0.0); N],
-        }
+        DualT { v: self.v.floor_c(), g: [B::from_f64(0.0); N] }
     }
     fn ceil_c(self) -> Self {
-        DualT {
-            v: self.v.ceil_c(),
-            g: [B::from_f64(0.0); N],
-        }
+        DualT { v: self.v.ceil_c(), g: [B::from_f64(0.0); N] }
     }
     fn round_c(self) -> Self {
-        DualT {
-            v: self.v.round_c(),
-            g: [B::from_f64(0.0); N],
-        }
+        DualT { v: self.v.round_c(), g: [B::from_f64(0.0); N] }
     }
     fn span_value(self) -> f64 {
         self.v.span_value()
@@ -297,23 +289,14 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     }
     fn host(f: crate::sens::num::HostFn, args: &[Self]) -> Vec<Self> {
         let vs: Vec<B> = args.iter().map(|a| a.v).collect();
-        B::host(f, &vs)
-            .into_iter()
-            .map(|v| DualT {
-                v,
-                g: [B::from_f64(0.0); N],
-            })
-            .collect()
+        B::host(f, &vs).into_iter().map(|v| DualT { v, g: [B::from_f64(0.0); N] }).collect()
     }
     fn exprel(self, _orders: usize) -> Self {
         self.jet_k(crate::sens::num::JetFn::Exprel, 0)
     }
     #[inline]
     fn value_only(self) -> Self {
-        DualT {
-            v: self.v.value_only(),
-            g: [B::from_f64(0.0); N],
-        }
+        DualT { v: self.v.value_only(), g: [B::from_f64(0.0); N] }
     }
     #[inline]
     fn is_constant(self) -> bool {
@@ -365,10 +348,7 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
                 } else {
                     f64::NAN
                 };
-                return DualT {
-                    v: B::from_f64(v),
-                    g: [B::from_f64(0.0); N],
-                };
+                return DualT { v: B::from_f64(v), g: [B::from_f64(0.0); N] };
             }
             let d1 = n * self.v.pow(n - B::from_f64(1.0));
             return self.chain(self.v.pow(n), d1);
@@ -439,10 +419,7 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         self.chain(self.v.lift3(v, d1, d2, d3), self.v.lift2(d1, d2, d3))
     }
     fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, d4: f64) -> Self {
-        self.chain(
-            self.v.lift4(v, d1, d2, d3, d4),
-            self.v.lift3(d1, d2, d3, d4),
-        )
+        self.chain(self.v.lift4(v, d1, d2, d3, d4), self.v.lift3(d1, d2, d3, d4))
     }
 }
 
@@ -466,17 +443,11 @@ mod tests {
     /// exponent at the same base, which keeps the `exp(e·ln x)` route (NaN there).
     #[test]
     fn a_constant_exponent_is_the_power_rule_at_a_negative_base() {
-        let x = DualT::<2, f64> {
-            v: -2.0,
-            g: [1.0, 0.5],
-        };
+        let x = DualT::<2, f64> { v: -2.0, g: [1.0, 0.5] };
         let y = x.pow(DualT::constant(2.0));
         assert_eq!(y.v, 4.0);
         assert_eq!(y.g, [-4.0, -2.0]);
-        let live = DualT::<2, f64> {
-            v: 2.0,
-            g: [0.0, 1.0],
-        };
+        let live = DualT::<2, f64> { v: 2.0, g: [0.0, 1.0] };
         assert!(x.pow(live).v.is_nan(), "a live exponent keeps exp(e·ln x)");
     }
 
@@ -499,12 +470,7 @@ mod tests {
                 assert!(got.v.is_finite() && got.g[0].is_finite(), "{name}({x})");
                 assert_eq!(got.v.to_bits(), want.value.to_bits(), "{name}({x}) value");
                 let rel = (got.g[0] - want.grad[0]).abs() / want.grad[0].abs().max(1e-300);
-                assert!(
-                    rel < 1e-13,
-                    "{name}({x}): tangent {} vs {}",
-                    got.g[0],
-                    want.grad[0]
-                );
+                assert!(rel < 1e-13, "{name}({x}): tangent {} vs {}", got.g[0], want.grad[0]);
             }
         }
     }
@@ -524,9 +490,6 @@ mod tests {
         }
         let mut out = Vec::new();
         HostFn::RemEuclid.run(&[-7.5, 2.0], &mut out);
-        assert_eq!(
-            out,
-            vec![(-7.5f64).rem_euclid(2.0), (-7.5f64).div_euclid(2.0)]
-        );
+        assert_eq!(out, vec![(-7.5f64).rem_euclid(2.0), (-7.5f64).div_euclid(2.0)]);
     }
 }

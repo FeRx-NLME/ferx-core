@@ -202,11 +202,7 @@ where
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
     rust_sources(&root.join("src"), &mut sources);
-    assert!(
-        sources.len() > 50,
-        "found only {} sources under src/",
-        sources.len()
-    );
+    assert!(sources.len() > 50, "found only {} sources under src/", sources.len());
     let mut hits = Vec::new();
     for path in &sources {
         let src = std::fs::read_to_string(path).expect("source file is valid UTF-8");
@@ -241,11 +237,7 @@ fn the_scanners_see_gates_and_calls_and_skip_test_modules() {
     let prod = production_part(src);
     let gates: Vec<usize> = emptiness_tests(&prod).into_iter().map(|(n, _)| n).collect();
     // 16: a rustfmt-wrapped chain; 20 is the same shape on a non-correlation field.
-    assert_eq!(
-        gates,
-        vec![1, 4, 13, 16],
-        "gates on lines 1, 4, 13 and 16 only"
-    );
+    assert_eq!(gates, vec![1, 4, 13, 16], "gates on lines 1, 4, 13 and 16 only");
     let calls: Vec<usize> = wrapper_calls(&prod).into_iter().map(|(n, _)| n).collect();
     assert_eq!(calls, vec![5, 7], "wrapper calls on lines 5 and 7 only");
 }
@@ -286,10 +278,8 @@ fn no_production_code_tests_residual_correlations_for_emptiness() {
 
 #[test]
 fn no_production_code_calls_a_block_sigma_only_dense_builder() {
-    let offenders: Vec<String> = scan(wrapper_calls)
-        .into_iter()
-        .map(|(f, n, l)| format!("{f}:{n}: {l}"))
-        .collect();
+    let offenders: Vec<String> =
+        scan(wrapper_calls).into_iter().map(|(f, n, l)| format!("{f}:{n}: {l}")).collect();
     assert!(
         offenders.is_empty(),
         "production code calls a `pub` dense-R builder that takes `&[ResidualCorrelation]`. \

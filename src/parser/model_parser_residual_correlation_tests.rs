@@ -39,19 +39,11 @@ fn a_correlation_line_compiles_to_its_structure() {
         .expect("parses");
         assert_eq!(
             m.residual_serial,
-            Some(ResidualSerial {
-                kind: want,
-                rho_theta: 2,
-                by: vec!["ARM".into()],
-            })
+            Some(ResidualSerial { kind: want, rho_theta: 2, by: vec!["ARM".into()] })
         );
         // `by` columns are required data columns, and ρ counts as used.
         assert!(m.referenced_covariates.contains(&"ARM".to_string()));
-        assert!(
-            m.parse_warnings.iter().all(|w| !w.contains("RHO")),
-            "{:?}",
-            m.parse_warnings
-        );
+        assert!(m.parse_warnings.iter().all(|w| !w.contains("RHO")), "{:?}", m.parse_warnings);
         assert!(m.residual_is_dense());
     }
 }
@@ -96,10 +88,7 @@ fn rho_fixed_at_zero_drops_the_line() {
 
 #[test]
 fn an_unknown_structure_lists_the_supported_ones() {
-    let e = err(
-        RHO,
-        "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation car2(RHO) by ARM",
-    );
+    let e = err(RHO, "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation car2(RHO) by ARM");
     assert_eq!(
         e,
         "[error_model] `correlation car2(…)`: unknown structure `car2`. Supported: `cs`, `ar1`, \
@@ -142,10 +131,7 @@ fn a_second_correlation_line_is_refused() {
 
 #[test]
 fn rho_must_be_a_declared_theta() {
-    let e = err(
-        RHO,
-        "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(R0) by ARM",
-    );
+    let e = err(RHO, "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation cs(R0) by ARM");
     assert_eq!(
         e,
         "[error_model] `correlation cs(R0)`: `R0` is not a theta declared in [parameters]. The \
@@ -201,10 +187,7 @@ fn a_correlation_line_composes_with_iiv_on_ruv_in_either_order() {
     let corr = "  correlation ar1(RHO) by ARM";
     let ruv = "  iiv_on_ruv = ETA_RUV";
     let statement = "  DV ~ combined(PROP_ERR, ADD_ERR)";
-    for body in [
-        format!("{statement}\n{corr}\n{ruv}"),
-        format!("{statement}\n{ruv}\n{corr}"),
-    ] {
+    for body in [format!("{statement}\n{corr}\n{ruv}"), format!("{statement}\n{ruv}\n{corr}")] {
         let m = parse_model_string(&text(&format!("{RHO}  omega ETA_RUV ~ 0.1\n"), "", &body))
             .expect("parses");
         assert_eq!(m.residual_error_eta, Some(0), "{body}");
@@ -231,10 +214,7 @@ fn iiv_on_ruv_sits_beside_a_selected_error_model() {
         );
         let m = parse_model_string(&src).expect("parses");
         assert_eq!(m.residual_error_eta, Some(0), "{body}");
-        assert!(
-            matches!(m.error_spec, crate::types::ErrorSpec::Selected { .. }),
-            "{body}"
-        );
+        assert!(matches!(m.error_spec, crate::types::ErrorSpec::Selected { .. }), "{body}");
         assert_eq!(m.residual_correlations.len(), 1, "{body}");
     }
     let twice = format!("{selected}\n{ruv}\n  iiv_on_ruv = ETA_CL");
@@ -257,20 +237,11 @@ fn iiv_on_ruv_sits_beside_a_selected_error_model() {
 fn iiv_on_ruv_inside_a_selected_branch_is_refused() {
     let want = "[error_model] `iiv_on_ruv = ETA_RUV` is inside an `if/else` branch. It scales \
                 every branch, so write it after the closing `}`.";
-    let (a, b) = (
-        "    DV ~ proportional(PROP_ERR)\n",
-        "    DV ~ proportional(ADD_ERR)\n",
-    );
+    let (a, b) = ("    DV ~ proportional(PROP_ERR)\n", "    DV ~ proportional(ADD_ERR)\n");
     let ruv = "    iiv_on_ruv = ETA_RUV  # meant for this branch\n";
     for (label, body) in [
-        (
-            "if",
-            format!("  if (FREE == 0) {{\n{a}{ruv}  }} else {{\n{b}  }}"),
-        ),
-        (
-            "else",
-            format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}{ruv}  }}"),
-        ),
+        ("if", format!("  if (FREE == 0) {{\n{a}{ruv}  }} else {{\n{b}  }}")),
+        ("else", format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}{ruv}  }}")),
         (
             "else if",
             format!(
@@ -283,23 +254,16 @@ fn iiv_on_ruv_inside_a_selected_branch_is_refused() {
     // The depth returns to 0 at the closing brace, so the same line right after it parses.
     let beside = format!("  if (FREE == 0) {{\n{a}  }} else {{\n{b}  }}\n{ruv}");
     let src = text("  omega ETA_RUV ~ 0.1\n", "", &beside);
-    assert_eq!(
-        parse_model_string(&src).expect("beside").residual_error_eta,
-        Some(0)
-    );
+    assert_eq!(parse_model_string(&src).expect("beside").residual_error_eta, Some(0));
 }
 
 #[test]
 fn a_correlation_line_next_to_block_sigma_is_refused() {
-    let src = text(
-        RHO,
-        "",
-        "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation ar1(RHO) by ARM",
-    )
-    .replace(
-        "  sigma PROP_ERR ~ 0.2 (sd)\n  sigma ADD_ERR ~ 1.0 (sd)\n",
-        "  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.01, 1.0]\n",
-    );
+    let src = text(RHO, "", "  DV ~ combined(PROP_ERR, ADD_ERR)\n  correlation ar1(RHO) by ARM")
+        .replace(
+            "  sigma PROP_ERR ~ 0.2 (sd)\n  sigma ADD_ERR ~ 1.0 (sd)\n",
+            "  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.01, 1.0]\n",
+        );
     assert_eq!(
         parse_model_string(&src).expect_err("refused"),
         "[error_model] `correlation ar1(RHO)` is not supported in a model that also declares \
@@ -347,11 +311,7 @@ fn iiv_on_ruv_after_an_if_else_with_independent_sigmas_parses() {
     let body = text("  omega ETA_RUV ~ 0.1\n", "", block);
     for src in [body.clone(), format!("[data]\n  path = data.csv\n\n{body}")] {
         let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{e}\n{src}"));
-        assert_eq!(
-            m.residual_error_eta,
-            Some(0),
-            "ETA_RUV is declared ahead of ETA_CL"
-        );
+        assert_eq!(m.residual_error_eta, Some(0), "ETA_RUV is declared ahead of ETA_CL");
         let crate::types::ErrorSpec::Selected { .. } = m.error_spec else {
             panic!("expected a selected error model, got {:?}", m.error_spec);
         };

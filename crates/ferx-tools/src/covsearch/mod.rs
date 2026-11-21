@@ -201,14 +201,9 @@ impl CovsearchOptions {
 
     /// The bounds Pharmpy enforces: both levels in `(0, 1]`.
     pub fn validate(&self) -> Result<(), String> {
-        for (key, p) in [
-            ("p_forward", self.p_forward),
-            ("p_backward", self.p_backward),
-        ] {
+        for (key, p) in [("p_forward", self.p_forward), ("p_backward", self.p_backward)] {
             if !(p > 0.0 && p <= 1.0) {
-                return Err(format!(
-                    "[covsearch] {key} = {p}: must be a probability in (0, 1]"
-                ));
+                return Err(format!("[covsearch] {key} = {p}: must be a probability in (0, 1]"));
             }
         }
         if self.max_steps == Some(0) {
@@ -324,18 +319,10 @@ pub enum CovsearchEvent {
     /// The base model's fit.
     BaseFinished { ofv: f64, n_parameters: usize },
     /// A step is about to fit `candidates` models.
-    StepStarted {
-        step: usize,
-        phase: Phase,
-        candidates: usize,
-    },
+    StepStarted { step: usize, phase: Phase, candidates: usize },
     /// A step finished. `selected` names the effect that won, with the new
     /// OFV; `None` when nothing was accepted and the phase ends.
-    StepFinished {
-        step: usize,
-        phase: Phase,
-        selected: Option<(Effect, f64)>,
-    },
+    StepFinished { step: usize, phase: Phase, selected: Option<(Effect, f64)> },
     /// One candidate's fit finished (#2512): emitted from the worker as each
     /// one completes, so a log gets a line per candidate rather than per step.
     /// See [`CandidateFinished`](crate::search::CandidateFinished) for the
@@ -411,9 +398,7 @@ pub struct CovsearchRun<'a> {
 /// `[strictness]` the gate and `[run]` the retries and resume flag. Writes
 /// `steps.csv` and `final.ferx` into `run.dir` when given.
 pub fn run_covsearch(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: CovsearchRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: CovsearchRun<'_>,
 ) -> Result<CovsearchResult, String> {
     let options = CovsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
@@ -478,10 +463,7 @@ impl Space {
             .covariate_model
             .as_ref()
             .map(|spec| {
-                spec.relations
-                    .iter()
-                    .map(|r| (r.parameter.clone(), r.covariate.clone()))
-                    .collect()
+                spec.relations.iter().map(|r| (r.parameter.clone(), r.covariate.clone())).collect()
             })
             .unwrap_or_default();
         let mut included: Vec<Included> = base
@@ -510,9 +492,8 @@ impl Space {
         let mut candidates = Vec::new();
         for spec in &resolved.covariate_effects {
             let effect = Effect::from_spec(spec)?;
-            let in_base = existing
-                .iter()
-                .any(|(p, c)| *p == effect.parameter && *c == effect.covariate);
+            let in_base =
+                existing.iter().any(|(p, c)| *p == effect.parameter && *c == effect.covariate);
             if spec.optional {
                 if in_base {
                     notes.push(format!(
@@ -536,18 +517,10 @@ impl Space {
                 base_model
                     .apply(ModelEdit::AddCovariateRelation(effect.relation()))
                     .map_err(|e| format!("forcing {} into the base model: {e}", effect.label()))?;
-                included.push(Included {
-                    effect,
-                    origin: Origin::Forced,
-                });
+                included.push(Included { effect, origin: Origin::Forced });
             }
         }
-        Ok(Space {
-            base_model,
-            candidates,
-            included,
-            notes,
-        })
+        Ok(Space { base_model, candidates, included, notes })
     }
 }
 
@@ -577,9 +550,7 @@ impl Parent {
 
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
-    fitter: &dyn StepFitter,
-    space: Space,
-    options: &CovsearchOptions,
+    fitter: &dyn StepFitter, space: Space, options: &CovsearchOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<CovsearchResult, String> {
     let emit = |event: CovsearchEvent| {
@@ -587,12 +558,7 @@ pub(crate) fn search(
             p(event);
         }
     };
-    let Space {
-        base_model,
-        candidates,
-        mut included,
-        mut notes,
-    } = space;
+    let Space { base_model, candidates, mut included, mut notes } = space;
 
     // ── the base model ──────────────────────────────────────────────────
     emit(CovsearchEvent::BaseStarted);
@@ -601,10 +567,7 @@ pub(crate) fn search(
     let report = fitter.fit_step("base", std::slice::from_ref(&base_candidate))?;
     notes.extend(report.warnings.iter().cloned());
     let mut parent = {
-        let result = report
-            .results
-            .first()
-            .ok_or("the base model was not fitted")?;
+        let result = report.results.first().ok_or("the base model was not fitted")?;
         if let Some(e) = &result.error {
             return Err(format!("the base model could not be fitted: {e}"));
         }
@@ -626,10 +589,7 @@ pub(crate) fn search(
         Parent::from_result(result, base_model.clone(), 0)
     };
     let base_ofv = parent.ofv;
-    emit(CovsearchEvent::BaseFinished {
-        ofv: base_ofv,
-        n_parameters: parent.n_parameters,
-    });
+    emit(CovsearchEvent::BaseFinished { ofv: base_ofv, n_parameters: parent.n_parameters });
     if report.cancelled {
         return Ok(finish(
             options,
@@ -651,11 +611,7 @@ pub(crate) fn search(
     // ── forward ─────────────────────────────────────────────────────────
     let mut remaining = candidates;
     let mut stash: Vec<Effect> = Vec::new();
-    let forward = Pass {
-        fitter,
-        options,
-        emit: &emit,
-    };
+    let forward = Pass { fitter, options, emit: &emit };
     let outcome = forward.run(
         Phase::Forward,
         &mut parent,
@@ -718,14 +674,8 @@ pub(crate) fn search(
 
 #[allow(clippy::too_many_arguments)]
 fn finish(
-    options: &CovsearchOptions,
-    base_model: ModelText,
-    base_ofv: f64,
-    steps: Vec<StepRow>,
-    parent: Parent,
-    included: Vec<Included>,
-    notes: Vec<String>,
-    cancelled: bool,
+    options: &CovsearchOptions, base_model: ModelText, base_ofv: f64, steps: Vec<StepRow>,
+    parent: Parent, included: Vec<Included>, notes: Vec<String>, cancelled: bool,
     backward_incomplete: Option<String>,
 ) -> CovsearchResult {
     CovsearchResult {
@@ -753,17 +703,11 @@ struct Outcome {
 
 impl Outcome {
     fn finished() -> Outcome {
-        Outcome {
-            cancelled: false,
-            incomplete: None,
-        }
+        Outcome { cancelled: false, incomplete: None }
     }
 
     fn cancelled() -> Outcome {
-        Outcome {
-            cancelled: true,
-            incomplete: None,
-        }
+        Outcome { cancelled: true, incomplete: None }
     }
 }
 
@@ -786,15 +730,9 @@ impl Pass<'_> {
     /// `remaining`, mutating the parent as effects are accepted.
     #[allow(clippy::too_many_arguments)]
     fn run(
-        &self,
-        phase: Phase,
-        parent: &mut Parent,
-        remaining: &mut Vec<Effect>,
-        included: &mut Vec<Included>,
-        mut stash: Option<&mut Vec<Effect>>,
-        rows: &mut Vec<StepRow>,
-        step: &mut usize,
-        notes: &mut Vec<String>,
+        &self, phase: Phase, parent: &mut Parent, remaining: &mut Vec<Effect>,
+        included: &mut Vec<Included>, mut stash: Option<&mut Vec<Effect>>, rows: &mut Vec<StepRow>,
+        step: &mut usize, notes: &mut Vec<String>,
     ) -> Result<Outcome, String> {
         let mut taken = 0usize;
         while !remaining.is_empty() && self.steps_left(taken) {
@@ -839,11 +777,7 @@ impl Pass<'_> {
             // selected, and the event says so.
             if report.cancelled {
                 rows.extend(step_rows);
-                (self.emit)(CovsearchEvent::StepFinished {
-                    step: *step,
-                    phase,
-                    selected: None,
-                });
+                (self.emit)(CovsearchEvent::StepFinished { step: *step, phase, selected: None });
                 return Ok(Outcome::cancelled());
             }
             // A complete step has one row per candidate, in candidate order,
@@ -900,10 +834,7 @@ impl Pass<'_> {
                     effect.label()
                 ));
             }
-            included.push(Included {
-                effect: effect.clone(),
-                origin: Origin::Forward(*step),
-            });
+            included.push(Included { effect: effect.clone(), origin: Origin::Forward(*step) });
             // One line per (parameter, covariate) pair: the other forms on the
             // pair that just went in are no longer candidates. Nor is anything
             // stashed — that is the whole saving of SCM+. Exact effects only:
@@ -921,12 +852,8 @@ impl Pass<'_> {
 
     /// Backward elimination over the effects the forward phases added.
     fn backward(
-        &self,
-        parent: &mut Parent,
-        included: &mut Vec<Included>,
-        rows: &mut Vec<StepRow>,
-        step: &mut usize,
-        notes: &mut Vec<String>,
+        &self, parent: &mut Parent, included: &mut Vec<Included>, rows: &mut Vec<StepRow>,
+        step: &mut usize, notes: &mut Vec<String>,
     ) -> Result<Outcome, String> {
         let mut taken = 0usize;
         // What the latest step left untested. A later step retries those
@@ -941,10 +868,7 @@ impl Pass<'_> {
                 .map(|i| i.effect.clone())
                 .collect();
             if removable.is_empty() || !self.steps_left(taken) {
-                return Ok(Outcome {
-                    cancelled: false,
-                    incomplete,
-                });
+                return Ok(Outcome { cancelled: false, incomplete });
             }
             *step += 1;
             let phase = Phase::Backward;
@@ -989,11 +913,7 @@ impl Pass<'_> {
             // so nothing is selected from them.
             if report.cancelled {
                 rows.extend(step_rows);
-                (self.emit)(CovsearchEvent::StepFinished {
-                    step: *step,
-                    phase,
-                    selected: None,
-                });
+                (self.emit)(CovsearchEvent::StepFinished { step: *step, phase, selected: None });
                 return Ok(Outcome::cancelled());
             }
             debug_assert_eq!(step_rows.len(), removable.len());
@@ -1010,18 +930,11 @@ impl Pass<'_> {
                 step_rows[i].selected = true;
             }
             let selected = winner.map(|i| (removable[i].clone(), step_rows[i].ofv.unwrap()));
-            (self.emit)(CovsearchEvent::StepFinished {
-                step: *step,
-                phase,
-                selected,
-            });
+            (self.emit)(CovsearchEvent::StepFinished { step: *step, phase, selected });
             incomplete = incomplete_backward_note(*step, &step_rows, self.options.p_backward);
             rows.extend(step_rows);
             let Some(i) = winner else {
-                return Ok(Outcome {
-                    cancelled: false,
-                    incomplete,
-                });
+                return Ok(Outcome { cancelled: false, incomplete });
             };
             let effect = &removable[i];
             let result = report
@@ -1051,10 +964,7 @@ impl Pass<'_> {
 /// this the two read the same: exit 0 and a `Final model` holding terms that
 /// never met `p_backward` (#2789).
 fn incomplete_backward_note(step: usize, rows: &[StepRow], alpha: f64) -> Option<String> {
-    let untested: Vec<&StepRow> = rows
-        .iter()
-        .filter(|r| !(r.passed && r.lrt.is_some()))
-        .collect();
+    let untested: Vec<&StepRow> = rows.iter().filter(|r| !(r.passed && r.lrt.is_some())).collect();
     let first = untested.first()?;
     let how_many = if untested.len() == rows.len() {
         "every candidate".to_string()
@@ -1062,11 +972,8 @@ fn incomplete_backward_note(step: usize, rows: &[StepRow], alpha: f64) -> Option
         format!("{} of {} candidates", untested.len(), rows.len())
     };
     let labels: Vec<String> = untested.iter().map(|r| r.effect.label()).collect();
-    let reason = first
-        .failures
-        .first()
-        .or(first.note.as_ref())
-        .map_or("no reason recorded", String::as_str);
+    let reason =
+        first.failures.first().or(first.note.as_ref()).map_or("no reason recorded", String::as_str);
     Some(format!(
         "backward elimination is incomplete: {how_many} of backward step {step} failed, so {} \
          stayed in the final model without being tested at p_backward = {alpha}. First failure \
@@ -1083,13 +990,8 @@ fn incomplete_backward_note(step: usize, rows: &[StepRow], alpha: f64) -> Option
 /// `lrt` describes the *removal*: `dofv` is the increase, `significant` means
 /// the effect has to stay.
 fn judge(
-    phase: Phase,
-    step: usize,
-    parent: &Parent,
-    effects: &[Effect],
-    candidates: &[Candidate],
-    report: &RunReport,
-    alpha: f64,
+    phase: Phase, step: usize, parent: &Parent, effects: &[Effect], candidates: &[Candidate],
+    report: &RunReport, alpha: f64,
 ) -> Vec<StepRow> {
     let mut rows = Vec::with_capacity(candidates.len());
     for (effect, candidate) in effects.iter().zip(candidates) {
@@ -1118,10 +1020,7 @@ fn judge(
 }
 
 fn judge_one(
-    phase: Phase,
-    parent: &Parent,
-    result: &CandidateResult,
-    alpha: f64,
+    phase: Phase, parent: &Parent, result: &CandidateResult, alpha: f64,
 ) -> (Option<Lrt>, Option<String>) {
     if result.error.is_some() {
         return (None, None);
@@ -1173,9 +1072,7 @@ fn candidate_id(phase: Phase, step: usize, effect: &Effect) -> String {
 /// The candidate's relation set as a feature vector: every included pair, plus
 /// `adding`, minus `removing`.
 fn features_of(
-    included: &[Included],
-    adding: Option<&Effect>,
-    removing: Option<&Effect>,
+    included: &[Included], adding: Option<&Effect>, removing: Option<&Effect>,
 ) -> FeatureVector {
     let mut v = FeatureVector::new();
     for inc in included {

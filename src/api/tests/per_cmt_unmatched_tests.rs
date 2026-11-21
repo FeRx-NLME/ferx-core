@@ -151,11 +151,7 @@ fn warnings_of(model: &CompiledModel, pop: &Population) -> Vec<Diagnostic> {
 }
 
 fn unmatched_messages(model: &CompiledModel, pop: &Population) -> Vec<String> {
-    warnings_of(model, pop)
-        .into_iter()
-        .filter(|d| d.code == CODE)
-        .map(|d| d.message)
-        .collect()
+    warnings_of(model, pop).into_iter().filter(|d| d.code == CODE).map(|d| d.message).collect()
 }
 
 /// The channel-isolation guard every fixture runs before it asserts anything.
@@ -173,9 +169,7 @@ fn assert_only_live_channel(model: &CompiledModel, want: CmtConsumer) {
 /// test rather than a silently broader assertion.
 fn assert_live_channels(model: &CompiledModel, want: &[CmtConsumer]) {
     let opts = FitOptions::default();
-    let live: Vec<CmtConsumer> = CmtConsumer::iter()
-        .filter(|c| c.is_live(model, &opts))
-        .collect();
+    let live: Vec<CmtConsumer> = CmtConsumer::iter().filter(|c| c.is_live(model, &opts)).collect();
     assert_eq!(
         live,
         want.to_vec(),
@@ -381,10 +375,7 @@ fn unmatched_per_cmt_scaling_entry_warns() {
         msg.contains("declares compartment(s) 2 "),
         "must name 2 as the unmatched entry: {msg}"
     );
-    assert!(
-        msg.contains("(observed: 1)"),
-        "must name 1 as what the data does carry: {msg}"
-    );
+    assert!(msg.contains("(observed: 1)"), "must name 1 as what the data does carry: {msg}");
     // No live `[data_selection]`, so the filter clause must not be offered as an
     // explanation — the message would otherwise send every user chasing a block
     // their model does not have.
@@ -454,11 +445,7 @@ fn unmatched_per_cmt_readout_entry_warns() {
 
     let msgs = unmatched_messages(&m, &pop);
     assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
-    assert!(
-        msgs[0].contains("y[CMT=N]"),
-        "must name the readout syntax: {}",
-        msgs[0]
-    );
+    assert!(msgs[0].contains("y[CMT=N]"), "must name the readout syntax: {}", msgs[0]);
     assert!(
         msgs[0].contains("declares compartment(s) 2 ") && msgs[0].contains("(observed: 1)"),
         "must name both sets the right way round: {}",
@@ -481,14 +468,8 @@ fn unmatched_per_cmt_readout_entry_warns_on_the_analytic_readout_too() {
     // a different `if let` — dropping either leg leaves the other test green, which
     // is precisely the twin-with-an-unexercised-leg shape #1223 was about.
     let m = per_cmt_analytic_readout_model("  y[CMT=1] = CENTRAL / V\n  y[CMT=2] = CENTRAL / V");
-    assert!(
-        m.ode_spec.is_none(),
-        "fixture must carry NO ode_spec, or it exercises the other leg"
-    );
-    assert!(
-        m.analytic_readout.is_some(),
-        "fixture must carry an analytic readout"
-    );
+    assert!(m.ode_spec.is_none(), "fixture must carry NO ode_spec, or it exercises the other leg");
+    assert!(m.analytic_readout.is_some(), "fixture must carry an analytic readout");
     assert_only_live_channel(&m, CmtConsumer::PerCmtReadout);
     let pop = population(OBS_CMT1_ONLY);
 
@@ -506,10 +487,8 @@ fn unmatched_per_cmt_readout_entry_warns_on_the_analytic_readout_too() {
 /// The `[block]` a `y[CMT=N]` finding names, read off the `Diagnostic` and its text.
 fn readout_finding_block(model: &CompiledModel) -> (Option<String>, String) {
     let pop = population(OBS_CMT1_ONLY);
-    let found: Vec<Diagnostic> = warnings_of(model, &pop)
-        .into_iter()
-        .filter(|d| d.code == CODE)
-        .collect();
+    let found: Vec<Diagnostic> =
+        warnings_of(model, &pop).into_iter().filter(|d| d.code == CODE).collect();
     assert_eq!(found.len(), 1, "expected one finding, got {found:?}");
     (found[0].block.clone(), found[0].message.clone())
 }
@@ -547,10 +526,7 @@ fn a_compartment_free_readout_finding_names_structural_model() {
         msg.contains("`[structural_model] y[CMT=N]` declares compartment(s) 2 "),
         "must name the block the user wrote: {msg}"
     );
-    assert!(
-        !msg.contains("[scaling]"),
-        "must not name a block the file does not have: {msg}"
-    );
+    assert!(!msg.contains("[scaling]"), "must not name a block the file does not have: {msg}");
 }
 
 #[test]
@@ -653,14 +629,8 @@ fn a_filtered_read_names_data_selection_as_a_cause() {
     );
 
     let pop = filtered_population(&m, OBS_BOTH_CMTS, "STUDY == 2");
-    let excl = pop
-        .exclusions
-        .as_ref()
-        .expect("a filtered read records its exclusions");
-    assert!(
-        excl.n_obs_excluded > 0,
-        "the clause must actually remove observation rows: {excl:?}"
-    );
+    let excl = pop.exclusions.as_ref().expect("a filtered read records its exclusions");
+    assert!(excl.n_obs_excluded > 0, "the clause must actually remove observation rows: {excl:?}");
 
     let msgs = unmatched_messages(&m, &pop);
     assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
@@ -810,10 +780,7 @@ fn declared_cmts_is_some_only_when_the_channel_is_live() {
             }
         }
     }
-    assert!(
-        any_some,
-        "no fixture produced a declared set — the loop asserted nothing"
-    );
+    assert!(any_some, "no fixture produced a declared set — the loop asserted nothing");
 }
 
 #[test]
@@ -836,10 +803,7 @@ fn every_channel_without_a_declared_map_says_why() {
         // a set of compartments.
         CmtConsumer::DataSelectionFilter,
     ] {
-        assert!(
-            c.declared_cmts(&m).is_none(),
-            "{c:?} must declare no per-CMT map"
-        );
+        assert!(c.declared_cmts(&m).is_none(), "{c:?} must declare no per-CMT map");
     }
     // Non-degeneracy: the model above really does make one of the *other* channels
     // live, so this test is not passing because nothing is configured.
@@ -873,20 +837,13 @@ fn the_missing_column_advice_is_offered_only_when_the_data_reads_column_less() {
     // column between two datasets that both had one, so the pair could not fail.
     let column_less = population(OBS_NO_CMT_COLUMN);
     assert!(
-        column_less
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        column_less.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "this side of the pair must be the column-less case the reader reports: {:?}",
         column_less.warnings
     );
     let on = unmatched_messages(&m, &column_less);
     assert_eq!(on.len(), 1, "expected one finding, got {on:?}");
-    assert!(
-        on[0].contains("(observed: 1)"),
-        "this side of the pair must observe {{1}}: {}",
-        on[0]
-    );
+    assert!(on[0].contains("(observed: 1)"), "this side of the pair must observe {{1}}: {}", on[0]);
     assert!(
         on[0].contains(COLUMN_ADVICE),
         "a column-less dataset is the case the column advice is true of: {}",
@@ -900,10 +857,7 @@ fn the_missing_column_advice_is_offered_only_when_the_data_reads_column_less() {
     // legitimate case, a shared `[scaling]` block declaring more than one dataset uses.
     let present_all_ones = population(OBS_CMT1_ONLY);
     assert!(
-        !present_all_ones
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        !present_all_ones.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "this side must have a present, correct column: {:?}",
         present_all_ones.warnings
     );
@@ -975,11 +929,7 @@ fn a_filter_is_blamed_only_for_the_compartments_it_emptied() {
     );
     // Non-degeneracy: unfiltered, only entry 2 is dead and no filter is mentioned.
     let unfiltered = unmatched_messages(&m, &population(OBS_CMT1_AND_3));
-    assert_eq!(
-        unfiltered.len(),
-        1,
-        "expected one finding, got {unfiltered:?}"
-    );
+    assert_eq!(unfiltered.len(), 1, "expected one finding, got {unfiltered:?}");
     assert!(
         unfiltered[0].contains("declares compartment(s) 2 ")
             && !unfiltered[0].contains("data_selection"),
@@ -988,10 +938,7 @@ fn a_filter_is_blamed_only_for_the_compartments_it_emptied() {
     );
 
     let pop = filtered_population(&m, OBS_CMT1_AND_3, "CMT == 3");
-    let excl = pop
-        .exclusions
-        .as_ref()
-        .expect("a filtered read records its exclusions");
+    let excl = pop.exclusions.as_ref().expect("a filtered read records its exclusions");
     assert_eq!(
         excl.obs_cmts_excluded,
         vec![3],
@@ -1001,10 +948,7 @@ fn a_filter_is_blamed_only_for_the_compartments_it_emptied() {
     let msgs = unmatched_messages(&m, &pop);
     assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
     let msg = &msgs[0];
-    assert!(
-        msg.contains("declares compartment(s) 2, 3 "),
-        "both entries are now unmatched: {msg}"
-    );
+    assert!(msg.contains("declares compartment(s) 2, 3 "), "both entries are now unmatched: {msg}");
     assert!(
         msg.contains("observations on compartment(s) 3, so check"),
         "the filter must be named for compartment 3, which it emptied: {msg}"
@@ -1031,10 +975,7 @@ fn a_filter_that_emptied_no_declared_compartment_is_not_blamed_at_all() {
     // below is what sees it.
     let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
     let pop = filtered_population(&m, OBS_CMT1_AND_3, "CMT == 3");
-    let excl = pop
-        .exclusions
-        .as_ref()
-        .expect("a filtered read records its exclusions");
+    let excl = pop.exclusions.as_ref().expect("a filtered read records its exclusions");
     assert!(
         excl.n_obs_excluded > 0 && excl.obs_cmts_excluded == vec![3],
         "the clause must really have removed observation rows, all on compartment 3, \
@@ -1043,11 +984,7 @@ fn a_filter_that_emptied_no_declared_compartment_is_not_blamed_at_all() {
 
     let msgs = unmatched_messages(&m, &pop);
     assert_eq!(msgs.len(), 1, "the entry is still dead, got {msgs:?}");
-    assert!(
-        msgs[0].contains("declares compartment(s) 2 "),
-        "entry 2 is the dead one: {}",
-        msgs[0]
-    );
+    assert!(msgs[0].contains("declares compartment(s) 2 "), "entry 2 is the dead one: {}", msgs[0]);
     assert!(
         !msgs[0].contains("data_selection"),
         "a filter that emptied no declared compartment must not be offered as the \
@@ -1087,20 +1024,14 @@ fn the_missing_column_advice_stays_withdrawn_on_a_filtered_read_of_a_column_bear
         "  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500",
     );
     let pop = filtered_population(&m, OBS_CMT1_AND_3, "CMT == 3");
-    let excl = pop
-        .exclusions
-        .as_ref()
-        .expect("a filtered read records its exclusions");
+    let excl = pop.exclusions.as_ref().expect("a filtered read records its exclusions");
     assert_eq!(
         excl.obs_cmts_excluded,
         vec![3],
         "the clause must have emptied compartment 3: {excl:?}"
     );
     assert!(
-        pop.subjects
-            .iter()
-            .flat_map(|s| s.obs_cmts.iter())
-            .all(|c| *c == 1),
+        pop.subjects.iter().flat_map(|s| s.obs_cmts.iter()).all(|c| *c == 1),
         "post-filter the population must observe only compartment 1, or the gate on \
          `observed` alone would not have fired and this test proves nothing"
     );
@@ -1108,10 +1039,7 @@ fn the_missing_column_advice_stays_withdrawn_on_a_filtered_read_of_a_column_bear
     let msgs = unmatched_messages(&m, &pop);
     assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
     let msg = &msgs[0];
-    assert!(
-        msg.contains("(observed: 1)"),
-        "the observed set really is {{1}} here: {msg}"
-    );
+    assert!(msg.contains("(observed: 1)"), "the observed set really is {{1}} here: {msg}");
     assert!(
         msg.contains("observations on compartment(s) 3, so check"),
         "the filter note must still name compartment 3: {msg}"
@@ -1139,20 +1067,13 @@ fn a_model_with_two_live_per_cmt_channels_reports_both() {
     // and not the first channel only. A `break` in the loop, or a `diags.push` moved
     // outside it, passes every single-channel test above.
     let m = two_live_per_cmt_channels_model();
-    assert_live_channels(
-        &m,
-        &[CmtConsumer::PerCmtScaling, CmtConsumer::PerCmtErrorModel],
-    );
+    assert_live_channels(&m, &[CmtConsumer::PerCmtScaling, CmtConsumer::PerCmtErrorModel]);
 
     let diags: Vec<_> = warnings_of(&m, &population(OBS_CMT1_ONLY))
         .into_iter()
         .filter(|d| d.code == CODE)
         .collect();
-    assert_eq!(
-        diags.len(),
-        2,
-        "one finding per live channel, got {diags:?}"
-    );
+    assert_eq!(diags.len(), 2, "one finding per live channel, got {diags:?}");
 
     let scaling = diags
         .iter()
@@ -1214,10 +1135,7 @@ fn predict_and_simulate_report_it_too() {
         &pop,
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(7), ..Default::default() },
     )
     .expect("simulate");
     assert!(
@@ -1244,10 +1162,7 @@ fn predict_and_simulate_report_it_too() {
             &matched,
             &m.default_params,
             1,
-            &SimulateOptions {
-                seed: Some(7),
-                ..Default::default()
-            },
+            &SimulateOptions { seed: Some(7), ..Default::default() },
         )
         .expect("simulate")
         .warnings
@@ -1316,11 +1231,7 @@ fn the_filter_note_does_not_claim_the_removed_rows_would_have_been_scored() {
     // load-bearing.
     let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
     let unfiltered = unmatched_messages(&m, &population(DV_DOT_ON_CMT2));
-    assert_eq!(
-        unfiltered.len(),
-        1,
-        "expected one finding, got {unfiltered:?}"
-    );
+    assert_eq!(unfiltered.len(), 1, "expected one finding, got {unfiltered:?}");
     assert!(
         unfiltered[0].contains("declares compartment(s) 2 "),
         "entry 2 must be dead even unfiltered, or this proves nothing: {}",
@@ -1328,10 +1239,7 @@ fn the_filter_note_does_not_claim_the_removed_rows_would_have_been_scored() {
     );
 
     let pop = filtered_population(&m, DV_DOT_ON_CMT2, "CMT == 2");
-    let excl = pop
-        .exclusions
-        .as_ref()
-        .expect("a filtered read records its exclusions");
+    let excl = pop.exclusions.as_ref().expect("a filtered read records its exclusions");
     assert_eq!(
         excl.obs_cmts_excluded,
         vec![2],

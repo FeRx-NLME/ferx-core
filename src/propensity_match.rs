@@ -61,11 +61,7 @@ pub fn mahalanobis_sq(a: &[f64], b: &[f64], omega_inv: &DMatrix<f64>) -> f64 {
 /// arbitrarily but deterministically.
 pub fn optimal_assignment(cost: &DMatrix<f64>) -> Vec<usize> {
     let n = cost.nrows();
-    assert_eq!(
-        cost.ncols(),
-        n,
-        "optimal_assignment requires a square matrix"
-    );
+    assert_eq!(cost.ncols(), n, "optimal_assignment requires a square matrix");
     // Non-finite costs would make the shortest-path search never terminate (a
     // NaN compares false against every candidate). Callers must screen them out
     // (e.g. `simulate_with_options` rejects non-finite posthoc etas upstream).
@@ -151,11 +147,7 @@ pub fn optimal_assignment(cost: &DMatrix<f64>) -> Vec<usize> {
 /// neighbour matching of `MatchIt(method = "nearest")`.
 pub fn greedy_assignment(cost: &DMatrix<f64>) -> Vec<usize> {
     let n = cost.nrows();
-    assert_eq!(
-        cost.ncols(),
-        n,
-        "greedy_assignment requires a square matrix"
-    );
+    assert_eq!(cost.ncols(), n, "greedy_assignment requires a square matrix");
     let mut used = vec![false; n];
     let mut assign = vec![0usize; n];
     for i in 0..n {
@@ -185,16 +177,10 @@ fn mahalanobis_norm(a: &[f64], omega_inv: &DMatrix<f64>) -> f64 {
 /// Dense rank of each eta by its Mahalanobis norm, ascending. Returns a vector
 /// of rank positions `0..n` (ties broken by index, so a stable permutation).
 fn ranks_by_norm(etas: &[DVector<f64>], omega_inv: &DMatrix<f64>) -> Vec<f64> {
-    let scores: Vec<f64> = etas
-        .iter()
-        .map(|e| mahalanobis_norm(e.as_slice(), omega_inv))
-        .collect();
+    let scores: Vec<f64> = etas.iter().map(|e| mahalanobis_norm(e.as_slice(), omega_inv)).collect();
     let mut order: Vec<usize> = (0..scores.len()).collect();
     order.cold_sort_by(&|&a, &b| {
-        scores[a]
-            .partial_cmp(&scores[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
+        scores[a].partial_cmp(&scores[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
     });
     let mut rank = vec![0.0f64; scores.len()];
     for (r, &idx) in order.iter().enumerate() {
@@ -206,9 +192,7 @@ fn ranks_by_norm(etas: &[DVector<f64>], omega_inv: &DMatrix<f64>) -> Vec<f64> {
 /// Squared-Mahalanobis cost matrix: rows = subjects (`fitted`), columns = drawn
 /// `pool`. `cost[(i, j)] = d²(fitted[i], pool[j])` under `Ω⁻¹`.
 fn mahalanobis_cost(
-    pool: &[DVector<f64>],
-    fitted: &[DVector<f64>],
-    omega_inv: &DMatrix<f64>,
+    pool: &[DVector<f64>], fitted: &[DVector<f64>], omega_inv: &DMatrix<f64>,
 ) -> DMatrix<f64> {
     let n = fitted.len();
     let mut cost = DMatrix::zeros(n, n);
@@ -240,10 +224,7 @@ pub enum MatchMethod {
 /// has length `n` with `assign[i]` the `pool` index assigned to subject `i`
 /// (a permutation of `0..n`).
 pub fn match_draws_to_fitted(
-    pool: &[DVector<f64>],
-    fitted: &[DVector<f64>],
-    omega_inv: &DMatrix<f64>,
-    method: MatchMethod,
+    pool: &[DVector<f64>], fitted: &[DVector<f64>], omega_inv: &DMatrix<f64>, method: MatchMethod,
 ) -> Vec<usize> {
     let n = fitted.len();
     assert_eq!(pool.len(), n, "pool and fitted must have equal length");
@@ -369,11 +350,7 @@ mod tests {
             DVector::from_vec(vec![-2.0, 1.0]),
         ];
         let pool = fitted.clone();
-        for method in [
-            MatchMethod::Optimal,
-            MatchMethod::Nearest,
-            MatchMethod::Rank,
-        ] {
+        for method in [MatchMethod::Optimal, MatchMethod::Nearest, MatchMethod::Rank] {
             let assign = match_draws_to_fitted(&pool, &fitted, &omega_inv, method);
             assert_eq!(assign, vec![0, 1, 2], "method {method:?}");
         }

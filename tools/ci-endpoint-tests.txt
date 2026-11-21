@@ -21,6 +21,9 @@ categorical_smoke
 cmt_data_selection_scope
 cmt_endpoint_scope
 cmt_toggle_refusals
+count_nonmem_anchor
+count_simulate_roundtrip
+ctmm_repelled_plan_routing
 ctmm_time_dependent_pk
 dcm_export_predict
 dose_compartment_routing
@@ -57,6 +60,7 @@ tte_ode_solve_failed
 tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery
+vpc_cif_self_consistency
 vpc_kmmc_self_consistency
 vpc_rtte_self_consistency
 vpc_tte_self_consistency

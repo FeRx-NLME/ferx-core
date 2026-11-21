@@ -94,11 +94,7 @@ pub(crate) fn apply(text: &mut ModelText, edit: ModelEdit<'_>) -> Result<(), Str
         ModelEdit::AddIiv { param, form } => add_iiv(text, &param, &form),
         ModelEdit::DropIiv { param } => drop_iiv(text, &param),
         ModelEdit::SetOmegaBlock(names) => set_omega_block(text, &names),
-        ModelEdit::AddIov {
-            param,
-            kappa,
-            variance,
-        } => add_iov(text, &param, &kappa, variance),
+        ModelEdit::AddIov { param, kappa, variance } => add_iov(text, &param, &kappa, variance),
         ModelEdit::DropIov { param } => drop_iov(text, &param),
         ModelEdit::SetKappaBlock(names) => set_kappa_block(text, &names),
         ModelEdit::SplitOmegaBlock(names) => split_block(text, &names, RandomEffectKind::Eta),
@@ -253,21 +249,13 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
     }
     // Every declaration the spec supplies and the model does not have — the
     // bound ones and the ones only an `[odes]` override reads (`KM`, `BETA`).
-    let to_create: Vec<&NewParameter> = spec
-        .new_parameters
-        .iter()
-        .filter(|p| !existing.contains(&p.name))
-        .collect();
+    let to_create: Vec<&NewParameter> =
+        spec.new_parameters.iter().filter(|p| !existing.contains(&p.name)).collect();
 
     // ── Mutate ──
-    let pairs: Vec<String> = on_line
-        .iter()
-        .map(|(role, var)| format!("{role}={var}"))
-        .collect();
-    let stale = text.set_span(
-        &line_span,
-        &format!("{keyword} {}({})", spec.template, pairs.join(", ")),
-    );
+    let pairs: Vec<String> = on_line.iter().map(|(role, var)| format!("{role}={var}")).collect();
+    let stale =
+        text.set_span(&line_span, &format!("{keyword} {}({})", spec.template, pairs.join(", ")));
     text.delete_lines(stale);
 
     for p in to_create {
@@ -434,19 +422,13 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
         ));
     };
     if omega_decl(text, form.eta()).is_some() {
-        return Err(format!(
-            "ferx-core::edit: `omega {}` is already declared",
-            form.eta()
-        ));
+        return Err(format!("ferx-core::edit: `omega {}` is already declared", form.eta()));
     }
     // `OMEGA_RE` is anchored on `omega`, so it does not see an η that a
     // `block_omega` declares — appending a diagonal `omega` for one would
     // declare the same random effect twice.
     if let Some((_, block)) = block_omega_decl(text, form.eta()) {
-        return Err(format!(
-            "ferx-core::edit: `{}` is already declared by `{block}`",
-            form.eta()
-        ));
+        return Err(format!("ferx-core::edit: `{}` is already declared by `{block}`", form.eta()));
     }
     if let Some(existing) = declared_etas(text).iter().find(|e| mentions(&rhs, e)) {
         return Err(format!(
@@ -480,10 +462,7 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
 
     let stale = text.set_span(&span, &format!("{param} = {new_rhs}"));
     text.delete_lines(stale);
-    text.append_to_block(
-        "parameters",
-        &format!("omega {} ~ {}", form.eta(), num(form.variance())),
-    );
+    text.append_to_block("parameters", &format!("omega {} ~ {}", form.eta(), num(form.variance())));
     Ok(())
 }
 
@@ -499,14 +478,10 @@ fn add_iov(text: &mut ModelText, param: &str, kappa: &str, variance: f64) -> Res
         ));
     };
     if kappa_decl(text, kappa).is_some() {
-        return Err(format!(
-            "ferx-core::edit: `kappa {kappa}` is already declared"
-        ));
+        return Err(format!("ferx-core::edit: `kappa {kappa}` is already declared"));
     }
     if let Some((_, block)) = block_kappa_decl(text, kappa) {
-        return Err(format!(
-            "ferx-core::edit: `{kappa}` is already declared by `{block}`"
-        ));
+        return Err(format!("ferx-core::edit: `{kappa}` is already declared by `{block}`"));
     }
     if let Some(existing) = declared_kappas(text).iter().find(|k| mentions(&rhs, k)) {
         return Err(format!(
@@ -608,9 +583,7 @@ impl RandomEffectKind {
 /// `DropIiv` / `DropIov`: take one random effect of `kind` out of `param`'s
 /// trailing `exp(…)`, and its declaration with it when nothing else reads it.
 fn drop_random_effect(
-    text: &mut ModelText,
-    param: &str,
-    kind: RandomEffectKind,
+    text: &mut ModelText, param: &str, kind: RandomEffectKind,
 ) -> Result<(), String> {
     let (diag, block) = kind.keywords();
     let sym = kind.symbol();
@@ -641,11 +614,7 @@ fn drop_random_effect(
     let of_kind: Vec<&String> = terms.iter().filter(|t| mine.contains(t)).collect();
     let name = match of_kind.as_slice() {
         [one] => (*one).clone(),
-        [] => {
-            return Err(format!(
-                "ferx-core::edit: `{param} = {rhs}` carries no {sym} to remove"
-            ))
-        }
+        [] => return Err(format!("ferx-core::edit: `{param} = {rhs}` carries no {sym} to remove")),
         _ => {
             return Err(format!(
                 "ferx-core::edit: `{param} = {rhs}` mentions more than one {sym}; dropping one \
@@ -675,13 +644,7 @@ fn drop_random_effect(
     let new_rhs = if rest.is_empty() {
         head
     } else {
-        format!(
-            "{head} * exp({})",
-            rest.iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(" + ")
-        )
+        format!("{head} * exp({})", rest.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" + "))
     };
     let mut stale = text.set_span(&span, &format!("{param} = {new_rhs}"));
     // The declaration goes only if nothing else still reads the random
@@ -713,9 +676,7 @@ fn drop_random_effect(
 /// `split_joint_distribution`. A name that is already diagonal is left as it
 /// is; an undeclared one is an error.
 fn split_block(
-    text: &mut ModelText,
-    names: &[String],
-    kind: RandomEffectKind,
+    text: &mut ModelText, names: &[String], kind: RandomEffectKind,
 ) -> Result<(), String> {
     let (diag, block) = kind.keywords();
     for n in names {
@@ -729,26 +690,17 @@ fn split_block(
     // One block at a time, re-read after each rewrite since the lines move.
     loop {
         let Some((span, code, names_in)) =
-            text.logical_lines("parameters")
-                .into_iter()
-                .find_map(|(span, code)| {
-                    let caps = kind.block_re().captures(&code)?;
-                    let names_in = block_names(&caps[2]);
-                    names_in.iter().any(|m| names.contains(m)).then_some((
-                        span,
-                        code.clone(),
-                        names_in,
-                    ))
-                })
+            text.logical_lines("parameters").into_iter().find_map(|(span, code)| {
+                let caps = kind.block_re().captures(&code)?;
+                let names_in = block_names(&caps[2]);
+                names_in.iter().any(|m| names.contains(m)).then_some((span, code.clone(), names_in))
+            })
         else {
             break;
         };
-        let leaving: Vec<usize> = (0..names_in.len())
-            .filter(|k| names.contains(&names_in[*k]))
-            .collect();
-        let keep: Vec<usize> = (0..names_in.len())
-            .filter(|k| !leaving.contains(k))
-            .collect();
+        let leaving: Vec<usize> =
+            (0..names_in.len()).filter(|k| names.contains(&names_in[*k])).collect();
+        let keep: Vec<usize> = (0..names_in.len()).filter(|k| !leaving.contains(k)).collect();
         let values = block_values(&code, kind)?;
         let rest = kind.block_re().captures(&code).expect("a block")[4].to_string();
         let fixed = FIX_RE.is_match(&rest);
@@ -816,17 +768,10 @@ pub(crate) fn split_trailing_exp(rhs: &str, declared: &[String]) -> Option<(Stri
     let rhs = rhs.trim();
     let factors = top_level_factors(rhs)?;
     let (last, head) = factors.split_last()?;
-    let inner = last
-        .trim()
-        .strip_prefix("exp")?
-        .trim()
-        .strip_prefix('(')?
-        .strip_suffix(')')?;
+    let inner = last.trim().strip_prefix("exp")?.trim().strip_prefix('(')?.strip_suffix(')')?;
     let terms: Vec<String> = inner.split('+').map(|t| t.trim().to_string()).collect();
     if terms.is_empty()
-        || terms
-            .iter()
-            .any(|t| !BARE_IDENT_RE.is_match(t) || !declared.iter().any(|d| d == t))
+        || terms.iter().any(|t| !BARE_IDENT_RE.is_match(t) || !declared.iter().any(|d| d == t))
     {
         return None;
     }
@@ -890,9 +835,7 @@ pub(crate) fn is_top_level_product(rhs: &str) -> bool {
                 // from an identifier that merely ends in `e`: `BASE-1`,
                 // `AGE-40` and `SIZE-1` all have an `e` in front of the sign.
                 // A number has to be there too, on both sides of the `e`.
-                let exponent = i
-                    .checked_sub(1)
-                    .is_some_and(|p| matches!(bytes[p], 'e' | 'E'))
+                let exponent = i.checked_sub(1).is_some_and(|p| matches!(bytes[p], 'e' | 'E'))
                     && i.checked_sub(2)
                         .is_some_and(|p| bytes[p].is_ascii_digit() || bytes[p] == '.')
                     && bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit());
@@ -944,19 +887,13 @@ fn set_block(text: &mut ModelText, names: &[String], kind: RandomEffectKind) -> 
         return Err(format!(
             "ferx-core::edit: Set{}Block needs at least two {sym} — a 1×1 block is the diagonal \
              declaration it would replace",
-            if kind == RandomEffectKind::Eta {
-                "Omega"
-            } else {
-                "Kappa"
-            }
+            if kind == RandomEffectKind::Eta { "Omega" } else { "Kappa" }
         ));
     }
     let mut seen = std::collections::HashSet::new();
     for n in names {
         if !seen.insert(n) {
-            return Err(format!(
-                "ferx-core::edit: `{n}` is listed twice in the {diag} block"
-            ));
+            return Err(format!("ferx-core::edit: `{n}` is listed twice in the {diag} block"));
         }
     }
     // Collected per name and then sorted by declaration line: the block takes
@@ -967,9 +904,7 @@ fn set_block(text: &mut ModelText, names: &[String], kind: RandomEffectKind) -> 
     let mut slots: Vec<(Range<usize>, &str, f64, bool)> = Vec::with_capacity(names.len());
     for n in names {
         if let Some((_, decl)) = kind.block_decl(text, n) {
-            return Err(format!(
-                "ferx-core::edit: `{n}` is already blocked by `{decl}`"
-            ));
+            return Err(format!("ferx-core::edit: `{n}` is already blocked by `{decl}`"));
         }
         let Some((span, code)) = kind.decl(text, n) else {
             return Err(format!(
@@ -997,11 +932,8 @@ fn set_block(text: &mut ModelText, names: &[String], kind: RandomEffectKind) -> 
     // whose extra parameters the search would not know it had added.
     let fixed = slots.iter().filter(|(_, _, _, f)| *f).count();
     if fixed != 0 && fixed != slots.len() {
-        let free: Vec<&str> = slots
-            .iter()
-            .filter(|(_, _, _, f)| !f)
-            .map(|(_, n, _, _)| *n)
-            .collect();
+        let free: Vec<&str> =
+            slots.iter().filter(|(_, _, _, f)| !f).map(|(_, n, _, _)| *n).collect();
         return Err(format!(
             "ferx-core::edit: {} of the {sym} to block are `FIX`ed and {} are not ({}). `FIX` is \
              a block-level flag, so a mixed block cannot be written; fix or free them all first.",
@@ -1049,12 +981,9 @@ pub(crate) fn declared_variance(code: &str, kind: RandomEffectKind) -> Result<f6
         .diagonal_re()
         .captures(code)
         .ok_or_else(|| format!("ferx-core::edit: cannot read the variance of `{code}`"))?;
-    let raw: f64 = caps[3].parse().map_err(|_| {
-        format!(
-            "ferx-core::edit: `{}` is not a number in `{code}`",
-            &caps[3]
-        )
-    })?;
+    let raw: f64 = caps[3]
+        .parse()
+        .map_err(|_| format!("ferx-core::edit: `{}` is not a number in `{code}`", &caps[3]))?;
     Ok(if SD_RE.is_match(code) { raw * raw } else { raw })
 }
 
@@ -1087,11 +1016,7 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
         }
         _ => {}
     }
-    for t in spec
-        .exponent
-        .iter()
-        .chain(spec.time_varying.as_ref().map(|tv| &tv.theta))
-    {
+    for t in spec.exponent.iter().chain(spec.time_varying.as_ref().map(|tv| &tv.theta)) {
         finite(t.init, &format!("`theta {}` init", t.name))?;
         // An infinite bound is "no bound"; only `NaN` cannot be written.
         for (b, what) in [(t.lower, "lower"), (t.upper, "upper")] {
@@ -1130,23 +1055,16 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     }
     // The `iiv_on_ruv = ETA` line is the spec's to set or clear; the statement
     // line(s) are what the endpoint check below looks at.
-    let (iiv_lines, existing): (Vec<(Range<usize>, String)>, Vec<(Range<usize>, String)>) = text
-        .logical_lines("error_model")
-        .into_iter()
-        .partition(|(_, c)| IIV_ON_RUV_RE.is_match(c));
+    let (iiv_lines, existing): (Vec<(Range<usize>, String)>, Vec<(Range<usize>, String)>) =
+        text.logical_lines("error_model").into_iter().partition(|(_, c)| IIV_ON_RUV_RE.is_match(c));
     // A per-CMT or covariate-selected block describes endpoints this edit does
     // not know about; replacing it wholesale would drop them silently.
-    if existing.len() > 1
-        || existing
-            .iter()
-            .any(|(_, c)| c.contains("CMT") || c.starts_with("if"))
+    if existing.len() > 1 || existing.iter().any(|(_, c)| c.contains("CMT") || c.starts_with("if"))
     {
-        return Err(
-            "ferx-core::edit: [error_model] is a per-CMT or covariate-selected block. \
+        return Err("ferx-core::edit: [error_model] is a per-CMT or covariate-selected block. \
              SetErrorModel replaces a single `DV ~ TYPE(...)` statement and would drop the \
              other endpoints; edit the block by hand."
-                .to_string(),
-        );
+            .to_string());
     }
     // What the old block referenced, so a θ / ω only it used can be pruned
     // once the new block is in — the exponent of a power form being replaced,
@@ -1183,10 +1101,7 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
         }
         (None, _) => {}
     }
-    for (span, _) in iiv_lines
-        .iter()
-        .skip(usize::from(spec.iiv_on_ruv.is_some()))
-    {
+    for (span, _) in iiv_lines.iter().skip(usize::from(spec.iiv_on_ruv.is_some())) {
         stale.extend(span.clone());
     }
     text.delete_lines(stale);
@@ -1236,15 +1151,10 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     // multiplier — and the `iiv_on_ruv` ω: declared when `[parameters]` lacks
     // them, left verbatim when it has them (their init and bounds are then the
     // author's, as for an existing σ above).
-    for t in spec
-        .exponent
-        .iter()
-        .chain(spec.time_varying.as_ref().map(|tv| &tv.theta))
-    {
-        let declared = find_decl(text, "parameters", |c| {
-            THETA_RE.captures(c).is_some_and(|m| m[2] == t.name)
-        })
-        .is_some();
+    for t in spec.exponent.iter().chain(spec.time_varying.as_ref().map(|tv| &tv.theta)) {
+        let declared =
+            find_decl(text, "parameters", |c| THETA_RE.captures(c).is_some_and(|m| m[2] == t.name))
+                .is_some();
         if !declared {
             text.append_to_block("parameters", &t.render());
         }
@@ -1267,10 +1177,7 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     let mut dead = Vec::new();
     for name in old_idents.difference(&new_idents) {
         let decl = find_decl(text, "parameters", |c| {
-            THETA_RE
-                .captures(c)
-                .or_else(|| OMEGA_RE.captures(c))
-                .is_some_and(|m| m[2] == *name)
+            THETA_RE.captures(c).or_else(|| OMEGA_RE.captures(c)).is_some_and(|m| m[2] == *name)
         });
         let Some((span, _)) = decl else {
             continue;
@@ -1319,9 +1226,7 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
     // Before the shape regex, which a trailing modifier fails too — the
     // specific message beats "is not `DV ~ form(...)`".
     if stmt.contains("weight") && stmt.contains('=') {
-        return Err(unreadable(&format!(
-            "statement `{stmt}` carries a `weight =` modifier"
-        )));
+        return Err(unreadable(&format!("statement `{stmt}` carries a `weight =` modifier")));
     }
     let caps = ERROR_STMT_RE
         .captures(&stmt)
@@ -1332,15 +1237,14 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
     let mut args = crate::parser::model_parser::split_top_level_args(&caps[3]);
 
     let theta_decl = |name: &str| -> Result<ThetaDecl, String> {
-        let (_, code) = find_decl(text, "parameters", |c| {
-            THETA_RE.captures(c).is_some_and(|m| m[2] == *name)
-        })
-        .ok_or_else(|| {
-            format!(
+        let (_, code) =
+            find_decl(text, "parameters", |c| THETA_RE.captures(c).is_some_and(|m| m[2] == *name))
+                .ok_or_else(|| {
+                    format!(
                 "ferx-core::edit: [error_model] names theta `{name}`, which [parameters] does \
                  not declare"
             )
-        })?;
+                })?;
         let m = THETA_RE.captures(&code).expect("matched above");
         let init: f64 = m[3]
             .parse()
@@ -1358,9 +1262,7 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
     };
 
     let exponent = if form == ErrorForm::Power {
-        let p = args
-            .pop()
-            .ok_or_else(|| unreadable("`power(...)` has no exponent argument"))?;
+        let p = args.pop().ok_or_else(|| unreadable("`power(...)` has no exponent argument"))?;
         if !BARE_IDENT_RE.is_match(&p) {
             return Err(unreadable(&format!(
                 "the power exponent `{p}` is an expression, not a theta name"
@@ -1411,9 +1313,7 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
                 }
             }
             (Some(_), None) => {
-                return Err(unreadable(
-                    "the time-varying magnitude is on some σ but not all",
-                ));
+                return Err(unreadable("the time-varying magnitude is on some σ but not all"));
             }
             (None, None) => {}
         }
@@ -1434,11 +1334,7 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
         let init: f64 = m[3]
             .parse()
             .map_err(|_| format!("ferx-core::edit: cannot read the init of `{code}`"))?;
-        sigmas.push(SigmaDecl {
-            name: sigma_name,
-            init,
-            as_sd: SD_RE.is_match(&code),
-        });
+        sigmas.push(SigmaDecl { name: sigma_name, init, as_sd: SD_RE.is_match(&code) });
     }
 
     let iiv_on_ruv = match iiv {
@@ -1476,31 +1372,15 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
 // ── Initial estimates ───────────────────────────────────────────────────────
 
 fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
-    let theta: HashMap<&str, f64> = fit
-        .theta_names
-        .iter()
-        .map(|s| s.as_str())
-        .zip(fit.theta.iter().copied())
-        .collect();
-    let eta_index: HashMap<&str, usize> = fit
-        .eta_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    let sigma: HashMap<&str, f64> = fit
-        .sigma_names
-        .iter()
-        .map(|s| s.as_str())
-        .zip(fit.sigma.iter().copied())
-        .collect();
+    let theta: HashMap<&str, f64> =
+        fit.theta_names.iter().map(|s| s.as_str()).zip(fit.theta.iter().copied()).collect();
+    let eta_index: HashMap<&str, usize> =
+        fit.eta_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let sigma: HashMap<&str, f64> =
+        fit.sigma_names.iter().map(|s| s.as_str()).zip(fit.sigma.iter().copied()).collect();
     // The IOV κ live in their own matrix, indexed by `kappa_names`.
-    let kappa_index: HashMap<&str, usize> = fit
-        .kappa_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
+    let kappa_index: HashMap<&str, usize> =
+        fit.kappa_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let omega_iov = fit.omega_iov.as_ref();
 
     // The lower triangle of a fitted sub-matrix, by the named indices —
@@ -1543,11 +1423,7 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             }
             // The declaration's own scale wins: rewriting `(sd)` as a variance
             // would change the number's meaning as well as its value.
-            let value = if SD_RE.is_match(&code) {
-                var.sqrt()
-            } else {
-                var
-            };
+            let value = if SD_RE.is_match(&code) { var.sqrt() } else { var };
             stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
         } else if let Some(caps) = SIGMA_RE.captures(&code) {
             // `FitResult::sigma` is on the SD scale throughout the engine.
@@ -1557,18 +1433,15 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             let value = if SD_RE.is_match(&code) { sd } else { sd * sd };
             stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
         } else if let Some(caps) = BLOCK_OMEGA_RE.captures(&code) {
-            let idx: Option<Vec<usize>> = block_names(&caps[2])
-                .iter()
-                .map(|n| eta_index.get(n.as_str()).copied())
-                .collect();
+            let idx: Option<Vec<usize>> =
+                block_names(&caps[2]).iter().map(|n| eta_index.get(n.as_str()).copied()).collect();
             let Some(idx) = idx else { continue };
             let Some(values) = triangle_of(&fit.omega, &idx) else {
                 continue;
             };
-            stale.extend(text.set_span(
-                &span,
-                &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4]),
-            ));
+            stale.extend(
+                text.set_span(&span, &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4])),
+            );
         } else if let Some(caps) = KAPPA_RE.captures(&code) {
             let (Some(k), Some(iov)) = (kappa_index.get(&caps[2]).copied(), omega_iov) else {
                 continue;
@@ -1577,11 +1450,7 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             if !var.is_finite() {
                 continue;
             }
-            let value = if SD_RE.is_match(&code) {
-                var.sqrt()
-            } else {
-                var
-            };
+            let value = if SD_RE.is_match(&code) { var.sqrt() } else { var };
             stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
         } else if let Some(caps) = BLOCK_KAPPA_RE.captures(&code) {
             let Some(iov) = omega_iov else { continue };
@@ -1593,10 +1462,9 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             let Some(values) = triangle_of(iov, &idx) else {
                 continue;
             };
-            stale.extend(text.set_span(
-                &span,
-                &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4]),
-            ));
+            stale.extend(
+                text.set_span(&span, &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4])),
+            );
         }
     }
     text.delete_lines(stale);
@@ -1616,10 +1484,7 @@ fn set_fit_option(text: &mut ModelText, key: &str, value: &str) -> Result<(), St
     }
     // `code_of` strips `#` and `//` before the parser ever sees the line, so a
     // marker anywhere in the option would silently truncate it on read-back.
-    if [key, value]
-        .iter()
-        .any(|s| s.contains('#') || s.contains("//"))
-    {
+    if [key, value].iter().any(|s| s.contains('#') || s.contains("//")) {
         return Err(format!(
             "ferx-core::edit: `{key} = {value}` contains a comment marker (`#` or `//`), which \
              is stripped when the line is read back — the option would be truncated"
@@ -1642,21 +1507,15 @@ fn set_fit_option(text: &mut ModelText, key: &str, value: &str) -> Result<(), St
 // ── Shared lookups ──────────────────────────────────────────────────────────
 
 fn find_line(text: &ModelText, block: &str, pred: impl Fn(&str) -> bool) -> Option<usize> {
-    text.body_indices(block)
-        .into_iter()
-        .find(|i| pred(text.code(*i)))
+    text.body_indices(block).into_iter().find(|i| pred(text.code(*i)))
 }
 
 /// The first declaration of `block` whose *logical* text satisfies `pred` —
 /// the span it occupies and that text.
 fn find_decl(
-    text: &ModelText,
-    block: &str,
-    pred: impl Fn(&str) -> bool,
+    text: &ModelText, block: &str, pred: impl Fn(&str) -> bool,
 ) -> Option<(Range<usize>, String)> {
-    text.logical_lines(block)
-        .into_iter()
-        .find(|(_, code)| pred(code))
+    text.logical_lines(block).into_iter().find(|(_, code)| pred(code))
 }
 
 /// The names `[individual_parameters]` assigns.
@@ -1668,49 +1527,35 @@ fn individual_parameter_names(text: &ModelText) -> HashSet<String> {
 }
 
 fn find_assignment(text: &ModelText, param: &str) -> Option<(Range<usize>, String)> {
-    text.logical_lines("individual_parameters")
-        .into_iter()
-        .find_map(|(span, code)| {
-            let caps = ASSIGN_RE.captures(&code)?;
-            (&caps[1] == param).then(|| (span.clone(), caps[2].trim().to_string()))
-        })
+    text.logical_lines("individual_parameters").into_iter().find_map(|(span, code)| {
+        let caps = ASSIGN_RE.captures(&code)?;
+        (&caps[1] == param).then(|| (span.clone(), caps[2].trim().to_string()))
+    })
 }
 
 pub(crate) fn omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
-    find_decl(text, "parameters", |c| {
-        OMEGA_RE.captures(c).is_some_and(|m| &m[2] == eta)
-    })
+    find_decl(text, "parameters", |c| OMEGA_RE.captures(c).is_some_and(|m| &m[2] == eta))
 }
 
 pub(crate) fn block_omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
     find_decl(text, "parameters", |c| {
-        BLOCK_OMEGA_RE
-            .captures(c)
-            .is_some_and(|m| m[2].split(',').any(|n| n.trim() == eta))
+        BLOCK_OMEGA_RE.captures(c).is_some_and(|m| m[2].split(',').any(|n| n.trim() == eta))
     })
 }
 
 pub(crate) fn kappa_decl(text: &ModelText, kappa: &str) -> Option<(Range<usize>, String)> {
-    find_decl(text, "parameters", |c| {
-        KAPPA_RE.captures(c).is_some_and(|m| &m[2] == kappa)
-    })
+    find_decl(text, "parameters", |c| KAPPA_RE.captures(c).is_some_and(|m| &m[2] == kappa))
 }
 
 pub(crate) fn block_kappa_decl(text: &ModelText, kappa: &str) -> Option<(Range<usize>, String)> {
     find_decl(text, "parameters", |c| {
-        BLOCK_KAPPA_RE
-            .captures(c)
-            .is_some_and(|m| m[2].split(',').any(|n| n.trim() == kappa))
+        BLOCK_KAPPA_RE.captures(c).is_some_and(|m| m[2].split(',').any(|n| n.trim() == kappa))
     })
 }
 
 /// The names a `block_omega` / `block_kappa` line lists.
 pub(crate) fn block_names(names: &str) -> Vec<String> {
-    names
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    names.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
 }
 
 /// Every η the model declares — diagonal `omega` and `block_omega` alike.
@@ -1939,11 +1784,8 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
         }
     }
 
-    let dead: Vec<&Decl> = decls
-        .iter()
-        .chain(relations.iter())
-        .filter(|d| !live.contains(&d.name))
-        .collect();
+    let dead: Vec<&Decl> =
+        decls.iter().chain(relations.iter()).filter(|d| !live.contains(&d.name)).collect();
     if conditional {
         if let Some(d) = dead.iter().find(|d| individual.contains(&d.span.start)) {
             return Err(format!(
@@ -1960,9 +1802,7 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     // left, rather than kept whole (a random effect no parameter uses) or
     // deleted whole (which would take the live η with it).
     for (names, span, code, kind) in &blocks {
-        let keep: Vec<usize> = (0..names.len())
-            .filter(|k| live.contains(&names[*k]))
-            .collect();
+        let keep: Vec<usize> = (0..names.len()).filter(|k| live.contains(&names[*k])).collect();
         if keep.len() == names.len() {
             continue;
         }
@@ -1987,10 +1827,7 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
 /// survivor is written back as the diagonal `omega` / `kappa` it would
 /// otherwise be a 1×1 block of, which is not a form the parser accepts.
 fn shrink_block(
-    code: &str,
-    names: &[String],
-    keep: &[usize],
-    kind: RandomEffectKind,
+    code: &str, names: &[String], keep: &[usize], kind: RandomEffectKind,
 ) -> Result<String, String> {
     let (diag, block) = kind.keywords();
     let caps = kind
@@ -2028,9 +1865,5 @@ fn shrink_block(
         }
     }
     let kept: Vec<&str> = keep.iter().map(|k| names[*k].as_str()).collect();
-    Ok(format!(
-        "{block} ({}) = [{}]{rest}",
-        kept.join(", "),
-        tri.join(", ")
-    ))
+    Ok(format!("{block} ({}) = [{}]{rest}", kept.join(", "), tri.join(", ")))
 }

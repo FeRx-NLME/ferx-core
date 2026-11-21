@@ -77,9 +77,7 @@ fn inject_decoy_covariates(pop: &mut ferx_core::Population) {
         for d in 0..N_DECOYS {
             let phase = (d as f64 + 1.0) * 0.7;
             let value = 50.0 + ((i as f64 * phase + 0.31).sin() * 12.0);
-            subject
-                .covariates
-                .insert(format!("DECOY_{d}"), (value * 1e6).round() / 1e6);
+            subject.covariates.insert(format!("DECOY_{d}"), (value * 1e6).round() / 1e6);
         }
     }
     for d in 0..N_DECOYS {
@@ -88,19 +86,12 @@ fn inject_decoy_covariates(pop: &mut ferx_core::Population) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gam_ranks_wt_and_crcl_for_eta_cl() {
     // Write the base model to a temp file.
-    let mut model_file = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model file");
-    model_file
-        .write_all(BASE_MODEL.as_bytes())
-        .expect("write base model");
+    let mut model_file =
+        tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model file");
+    model_file.write_all(BASE_MODEL.as_bytes()).expect("write base model");
     let model_path = model_file.path().to_str().unwrap().to_string();
 
     // Parse model and read data.
@@ -111,19 +102,10 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
     p.parsed.fit_options.run_covariance_step = false;
     p.parsed.fit_options.threads = Some(4);
 
-    let fit_result = fit(
-        &p.parsed.model,
-        &p.population,
-        &p.init_params,
-        &p.parsed.fit_options,
-    )
-    .expect("base model fit should succeed");
+    let fit_result = fit(&p.parsed.model, &p.population, &p.init_params, &p.parsed.fit_options)
+        .expect("base model fit should succeed");
 
-    assert!(
-        fit_result.converged,
-        "base model should converge; OFV = {}",
-        fit_result.ofv
-    );
+    assert!(fit_result.converged, "base model should converge; OFV = {}", fit_result.ofv);
 
     // Screen WT and CRCL against decoys that carry no signal, so the ranking
     // assertions below can actually fail.
@@ -134,16 +116,9 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
 
     // No error-level warnings (high shrinkage is possible for some ETAs, just
     // advisory; convergence / NaN warnings would be a real failure).
-    let hard_warnings: Vec<&str> = gam
-        .warnings
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|w| !w.contains("shrinkage"))
-        .collect();
-    assert!(
-        hard_warnings.is_empty(),
-        "unexpected hard warnings: {hard_warnings:?}"
-    );
+    let hard_warnings: Vec<&str> =
+        gam.warnings.iter().map(|s| s.as_str()).filter(|w| !w.contains("shrinkage")).collect();
+    assert!(hard_warnings.is_empty(), "unexpected hard warnings: {hard_warnings:?}");
 
     // Find the ETA_CL result.
     let eta_cl = gam
@@ -153,19 +128,10 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
         .expect("ETA_CL should be in results");
 
     // Both WT and CRCL should appear in the screening output.
-    let cov_names: Vec<&str> = eta_cl
-        .covariate_scores
-        .iter()
-        .map(|s| s.covariate.as_str())
-        .collect();
-    assert!(
-        cov_names.contains(&"WT"),
-        "WT should be screened for ETA_CL; got {cov_names:?}"
-    );
-    assert!(
-        cov_names.contains(&"CRCL"),
-        "CRCL should be screened for ETA_CL; got {cov_names:?}"
-    );
+    let cov_names: Vec<&str> =
+        eta_cl.covariate_scores.iter().map(|s| s.covariate.as_str()).collect();
+    assert!(cov_names.contains(&"WT"), "WT should be screened for ETA_CL; got {cov_names:?}");
+    assert!(cov_names.contains(&"CRCL"), "CRCL should be screened for ETA_CL; got {cov_names:?}");
 
     // Every decoy must be screened too, otherwise the comparison below is
     // between WT/CRCL and nothing.
@@ -177,12 +143,8 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
 
     // WT and CRCL must be *the* top two for ETA_CL — the dataset was generated
     // with both effects on CL, and the decoys have none.
-    let top2: Vec<&str> = eta_cl
-        .covariate_scores
-        .iter()
-        .take(2)
-        .map(|s| s.covariate.as_str())
-        .collect();
+    let top2: Vec<&str> =
+        eta_cl.covariate_scores.iter().take(2).map(|s| s.covariate.as_str()).collect();
     assert!(
         top2.contains(&"WT") && top2.contains(&"CRCL"),
         "WT and CRCL should be the top-2 for ETA_CL, ahead of {N_DECOYS} decoys; \
@@ -203,9 +165,8 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
             .unwrap_or_else(|| panic!("{name} should be screened"))
             .delta_aic
     };
-    let best_decoy: f64 = (0..N_DECOYS)
-        .map(|d| delta(&format!("DECOY_{d}")))
-        .fold(f64::NEG_INFINITY, f64::max);
+    let best_decoy: f64 =
+        (0..N_DECOYS).map(|d| delta(&format!("DECOY_{d}"))).fold(f64::NEG_INFINITY, f64::max);
     for name in ["WT", "CRCL"] {
         assert!(
             delta(name) > best_decoy + 1.0,
