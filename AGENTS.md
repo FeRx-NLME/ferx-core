@@ -480,6 +480,7 @@ Docs live in `docs/` as a [Quarto](https://quarto.org/) website:
 
 - `docs/**/*.qmd` — Quarto source pages. **These are the only docs files you edit or commit.**
 - `docs/_quarto.yml` — Quarto website configuration and sidebar; new pages must be added here to show up in the site navigation.
+- `docs/llms.txt` — the curated index for language models (#3073), published at the site root by the post-render script `docs/_llms.py`, which also builds `llms-full.txt` from the per-page `.llms.md` twins Quarto writes (`website: llms-txt: true`). Its links are absolute site URLs, checked by docs-lint R4; a new user-facing page worth an agent's attention gets a line there. The user-facing counterpart of this file is `docs/agents.qmd`.
 - `docs/_site/` — built HTML. **Generated, git-ignored, and never committed.** CI builds and deploys it: the `Deploy Docs` workflow (`.github/workflows/docs.yml`) runs `quarto render docs` and publishes to the `gh-pages` branch on every push to `main` that touches `docs/**`. Do **not** commit rendered output (you may still build locally to preview — the result stays untracked).
 - Styling and branding should stay aligned with the main Quarto site in `../ferx-nlme.github.io` (shared `assets/ferx.scss`, `assets/ferx-dark.scss`, `_brand.yml`, logo assets, and `styles.css`).
 

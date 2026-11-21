@@ -396,7 +396,8 @@ fn refuses_two_tte_endpoints_without_cmt() {
         e,
         "vpc_kmmc: the model has TTE endpoints on cmt 2, 3; set `cmt` to the one to check. \
          Under competing risks the risk set of one cause holds the subjects free of every \
-         cause, so the other causes act as censorings."
+         cause, so the other causes act as censorings. `vpc_cif` draws the cumulative \
+         incidence of every cause."
     );
 }
 
