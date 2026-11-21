@@ -103,12 +103,7 @@ fn closed_form(theta: &[f64], b: [f64; 3]) -> (Vec<f64>, DMatrix<f64>) {
 
 /// Hooker CWRES over the given linearization (`R = (σ·r_pred)²`, proportional error).
 fn recipe(
-    f: &[f64],
-    h: &DMatrix<f64>,
-    b: &DVector<f64>,
-    w: &DMatrix<f64>,
-    sigma_sd: f64,
-    r_pred: &[f64],
+    f: &[f64], h: &DMatrix<f64>, b: &DVector<f64>, w: &DMatrix<f64>, sigma_sd: f64, r_pred: &[f64],
 ) -> Vec<f64> {
     let n = f.len();
     let hb = h * b;
@@ -134,11 +129,7 @@ fn case(omega_iov: f64) -> Case {
     let mut params = model.default_params.clone();
     let names = params.omega_iov.as_ref().unwrap().eta_names.clone();
     params.omega_iov = Some(OmegaMatrix::from_diagonal(&[omega_iov], names));
-    Case {
-        model,
-        pop: population(),
-        params,
-    }
+    Case { model, pop: population(), params }
 }
 
 /// ferx's sdtab CWRES at `b̂`, alongside the recipe's.
@@ -147,10 +138,7 @@ fn run(c: &Case, b: [f64; 3], interaction: bool) -> (Vec<f64>, Vec<f64>) {
     let (f, h) = closed_form(theta, b);
     let eta_hats = vec![DVector::from_element(1, b[0])];
     let h_eta = vec![h.columns(0, 1).into_owned()];
-    let kappas = vec![vec![
-        DVector::from_element(1, b[1]),
-        DVector::from_element(1, b[2]),
-    ]];
+    let kappas = vec![vec![DVector::from_element(1, b[1]), DVector::from_element(1, b[2])]];
     let (subjects, _) = compute_subject_results(
         &c.model,
         &c.pop,
@@ -174,11 +162,7 @@ fn run(c: &Case, b: [f64; 3], interaction: bool) -> (Vec<f64>, Vec<f64>) {
     let omega = c.params.omega.matrix[(0, 0)];
     let omega_iov = c.params.omega_iov.as_ref().unwrap().matrix[(0, 0)];
     let w = DMatrix::from_diagonal(&DVector::from_vec(vec![omega, omega_iov, omega_iov]));
-    let r_pred = if interaction {
-        f.clone()
-    } else {
-        closed_form(theta, [0.0; 3]).0
-    };
+    let r_pred = if interaction { f.clone() } else { closed_form(theta, [0.0; 3]).0 };
     let want = recipe(&f, &h, &DVector::from_row_slice(&b), &w, sigma_sd, &r_pred);
     (s.cwres.clone(), want)
 }
@@ -188,11 +172,7 @@ fn eta_only(c: &Case, b: [f64; 3], interaction: bool) -> Vec<f64> {
     let theta = &c.params.theta;
     let (f, h) = closed_form(theta, b);
     let w = DMatrix::from_element(1, 1, c.params.omega.matrix[(0, 0)]);
-    let r_pred = if interaction {
-        f.clone()
-    } else {
-        closed_form(theta, [0.0; 3]).0
-    };
+    let r_pred = if interaction { f.clone() } else { closed_form(theta, [0.0; 3]).0 };
     recipe(
         &f,
         &h.columns(0, 1).into_owned(),
@@ -252,10 +232,7 @@ fn f0_subtracts_the_kappa_part_of_the_linearization() {
         let d = worst("f0", &got, &want);
         let gap_old = worst("eta-only premise", &eta_only(&c, b, interaction), &want);
         eprintln!("MEASURE f0 interaction={interaction}: |d| {d:.3e}, eta-only gap {gap_old:.3e}");
-        assert!(
-            gap_old > 1e-2,
-            "premise: H_k*k_hat must be live ({gap_old:e})"
-        );
+        assert!(gap_old > 1e-2, "premise: H_k*k_hat must be live ({gap_old:e})");
         assert!(
             d < TOL,
             "interaction={interaction}: CWRES off the recipe by {d:e}: f0 is not subtracting \
@@ -276,10 +253,7 @@ fn rtilde_carries_the_iov_variance() {
         eprintln!(
             "MEASURE rtilde interaction={interaction}: |d| {d:.3e}, eta-only gap {gap_old:.3e}"
         );
-        assert!(
-            gap_old > 1e-2,
-            "premise: H_k*W_iov*H_k' must be live ({gap_old:e})"
-        );
+        assert!(gap_old > 1e-2, "premise: H_k*W_iov*H_k' must be live ({gap_old:e})");
         assert!(
             d < TOL,
             "interaction={interaction}: CWRES off the recipe by {d:e}: R-tilde is missing \
@@ -316,11 +290,7 @@ fn a_kappa_shape_mismatch_is_refused() {
             false,
         );
         let s = &subjects[0];
-        assert_eq!(
-            s.cwres.len(),
-            OBS.len(),
-            "interaction={interaction}: CWRES rows"
-        );
+        assert_eq!(s.cwres.len(), OBS.len(), "interaction={interaction}: CWRES rows");
         assert!(
             s.cwres.iter().all(|x| x.is_nan()),
             "interaction={interaction}: CWRES {:?} must be NaN without a linearization",

@@ -27,11 +27,7 @@ fn files(csv: &str) -> Files {
     let data = dir.path().join("d.csv");
     std::fs::write(&model, MODEL).unwrap();
     std::fs::write(&data, csv).unwrap();
-    Files {
-        _dir: dir,
-        model,
-        data,
-    }
+    Files { _dir: dir, model, data }
 }
 
 fn path(p: &std::path::Path) -> &str {
@@ -80,11 +76,7 @@ fn an_edit_after_the_read_does_not_reach_the_population() {
     let parsed = ModelSource::read(&f.model).unwrap().parsed;
     let s = ReaderSettings::from_parsed(&parsed);
     let src = DataSource::read(&f.data).unwrap();
-    std::fs::write(
-        &f.data,
-        "ID,TIME,DV,EVID,AMT,CMT\n9,0,.,1,100,1\n9,1,8.0,0,.,1\n",
-    )
-    .unwrap();
+    std::fs::write(&f.data, "ID,TIME,DV,EVID,AMT,CMT\n9,0,.,1,100,1\n9,1,8.0,0,.,1\n").unwrap();
     let got = crate::read_population_with_source(&parsed.model, &s, &src).unwrap();
     assert_eq!(ids(&got.0), ["1", "2", "3"]);
     let now = crate::read_population_with(&parsed.model, &s, path(&f.data)).unwrap();
@@ -102,9 +94,8 @@ fn a_refused_dataset_is_refused_alike_from_a_source() {
         .err()
         .expect("no TIME column");
     let src = DataSource::read(&f.data).unwrap();
-    let by_src = crate::read_population_with_source(&parsed.model, &s, &src)
-        .err()
-        .expect("no TIME column");
+    let by_src =
+        crate::read_population_with_source(&parsed.model, &s, &src).err().expect("no TIME column");
     assert_eq!(by_src.code(), Some("E_DATA"));
     assert_eq!(by_src.code(), by_path.code());
     assert_eq!(by_src.to_string(), by_path.to_string());
@@ -135,11 +126,7 @@ fn the_hashed_read_is_the_path_read_and_the_files_hash() {
         .err()
         .expect("missing");
     assert_eq!(got.code, "E_DATA");
-    assert!(
-        got.message.starts_with("Failed to open CSV: "),
-        "{}",
-        got.message
-    );
+    assert!(got.message.starts_with("Failed to open CSV: "), "{}", got.message);
     assert_eq!(got.message, want.message);
 
     let mut bad = s.clone();

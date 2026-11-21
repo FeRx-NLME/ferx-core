@@ -22,27 +22,8 @@ use std::collections::HashMap;
 /// identically zero and the parity tests would pass vacuously. Two `η`s rather
 /// than one also means `FullRank` has a genuine off-diagonal to exercise.
 fn fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("closed-form 1-cpt IV fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_15)
+        .expect("closed-form 1-cpt IV fixture parses");
     let params = model.default_params.clone();
     (model, two_subject_population(1.0), params)
 }
@@ -50,34 +31,13 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
 /// Three concentration observations after a single bolus, scaled per subject.
 fn subject(id: &str, scale: f64) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0 * scale, 5.0 * scale, 2.5 * scale],
         obs_cmts: vec![1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -101,29 +61,8 @@ fn two_subject_population(scale: f64) -> Population {
 /// `(2,0)` and `(2,1)` — are **structural zeros**: they occupy packed coordinates
 /// but are not parameters. Nothing else in the VI test suite exercises them.
 fn mixed_omega_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("mixed block + diagonal omega fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_ORAL_1)
+        .expect("mixed block + diagonal omega fixture parses");
     let params = model.default_params.clone();
     (model, two_subject_population(1.0), params)
 }
@@ -154,12 +93,7 @@ fn perturbed_phis(family: &dyn VariationalFamily, omega: &OmegaMatrix, n: usize)
 }
 
 fn cfg_seeded() -> ElboConfig {
-    ElboConfig {
-        n_mc_samples: 3,
-        eta_grad: EtaGradMode::Auto,
-        kl: KlMode::Analytic,
-        seed: 12345,
-    }
+    ElboConfig { n_mc_samples: 3, eta_grad: EtaGradMode::Auto, kl: KlMode::Analytic, seed: 12345 }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +196,7 @@ fn kl_half_vanishes_at_the_prior() {
         1,
     )
     .unwrap();
-    assert!(
-        e.kl_term.abs() < 1e-9,
-        "KL at the prior should be 0, got {}",
-        e.kl_term
-    );
+    assert!(e.kl_term.abs() < 1e-9, "KL at the prior should be 0, got {}", e.kl_term);
     assert!((e.neg_elbo - e.data_term).abs() < 1e-9);
     assert!(e.data_term.is_finite() && e.data_term > 0.0);
 }
@@ -342,15 +272,8 @@ fn data_term_collapses_to_fixed_eta_nll_as_q_degenerates() {
 
 #[allow(clippy::too_many_arguments)]
 fn fd_of_neg_elbo_wrt_x(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    x: &[f64],
-    family: Families<'_>,
-    phis: &[Vec<f64>],
-    cfg: &ElboConfig,
-    iter: u64,
-    i: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, x: &[f64],
+    family: Families<'_>, phis: &[Vec<f64>], cfg: &ElboConfig, iter: u64, i: usize,
 ) -> f64 {
     let h = 1e-6 * (1.0 + x[i].abs());
     let mut xp = x.to_vec();
@@ -368,28 +291,18 @@ fn fd_of_neg_elbo_wrt_x(
 
 #[allow(clippy::too_many_arguments)]
 fn fd_of_neg_elbo_wrt_phi(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    x: &[f64],
-    family: Families<'_>,
-    phis: &[Vec<f64>],
-    cfg: &ElboConfig,
-    iter: u64,
-    subj: usize,
-    i: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, x: &[f64],
+    family: Families<'_>, phis: &[Vec<f64>], cfg: &ElboConfig, iter: u64, subj: usize, i: usize,
 ) -> f64 {
     let h = 1e-6 * (1.0 + phis[subj][i].abs());
     let mut pp = phis.to_vec();
     let mut pm = phis.to_vec();
     pp[subj][i] += h;
     pm[subj][i] -= h;
-    let fp = population_neg_elbo(model, population, params, x, family, &pp, cfg, iter)
-        .unwrap()
-        .neg_elbo;
-    let fm = population_neg_elbo(model, population, params, x, family, &pm, cfg, iter)
-        .unwrap()
-        .neg_elbo;
+    let fp =
+        population_neg_elbo(model, population, params, x, family, &pp, cfg, iter).unwrap().neg_elbo;
+    let fm =
+        population_neg_elbo(model, population, params, x, family, &pm, cfg, iter).unwrap().neg_elbo;
     (fp - fm) / (2.0 * h)
 }
 
@@ -426,10 +339,7 @@ fn neg_elbo_gradient_matches_central_fd() {
     };
 
     for (label, family) in [
-        (
-            "full_rank",
-            Box::new(FullRank::new(model.n_eta)) as Box<dyn VariationalFamily>,
-        ),
+        ("full_rank", Box::new(FullRank::new(model.n_eta)) as Box<dyn VariationalFamily>),
         ("mean_field", Box::new(MeanField::new(model.n_eta))),
     ] {
         let phis = perturbed_phis(family.as_ref(), &params.omega, 2);
@@ -499,14 +409,8 @@ fn fd_and_analytic_eta_gradients_agree() {
     let x = pack_params(&params);
 
     let base = cfg_seeded();
-    let analytic = ElboConfig {
-        eta_grad: EtaGradMode::Auto,
-        ..base.clone()
-    };
-    let fd = ElboConfig {
-        eta_grad: EtaGradMode::Fd,
-        ..base
-    };
+    let analytic = ElboConfig { eta_grad: EtaGradMode::Auto, ..base.clone() };
+    let fd = ElboConfig { eta_grad: EtaGradMode::Fd, ..base };
 
     let a = population_neg_elbo(
         &model,
@@ -531,15 +435,9 @@ fn fd_and_analytic_eta_gradients_agree() {
     )
     .unwrap();
 
-    assert_eq!(
-        a.n_fd_subjects, 0,
-        "analytic provider should serve this model"
-    );
+    assert_eq!(a.n_fd_subjects, 0, "analytic provider should serve this model");
     assert_eq!(b.n_fd_subjects, 2, "forced FD should report every subject");
-    assert!(
-        (a.neg_elbo - b.neg_elbo).abs() < 1e-12,
-        "value must not depend on the gradient route"
-    );
+    assert!((a.neg_elbo - b.neg_elbo).abs() < 1e-12, "value must not depend on the gradient route");
 
     for (s, (ga, gb)) in a.grad_phi.iter().zip(b.grad_phi.iter()).enumerate() {
         for (i, (x1, x2)) in ga.iter().zip(gb.iter()).enumerate() {
@@ -565,13 +463,8 @@ fn closed_form_omega_zeroes_the_omega_gradient() {
     let phis = perturbed_phis(&family, &params.omega, 2);
 
     let mut updated = params.clone();
-    updated.omega = closed_form_omega(
-        Families::Uniform(&family),
-        &phis,
-        &vec![0usize; phis.len()],
-        &params,
-    )
-    .0;
+    updated.omega =
+        closed_form_omega(Families::Uniform(&family), &phis, &vec![0usize; phis.len()], &params).0;
     let x = pack_params(&updated);
 
     let e = population_neg_elbo(
@@ -613,11 +506,7 @@ fn structural_zero_omega_slots_get_no_gradient() {
     let cfg = cfg_seeded();
     let layout = PackedLayout::new(&params);
     let zeros = structural_zero_slots(&params);
-    assert_eq!(
-        zeros,
-        vec![2, 4],
-        "fixture must have (2,0) and (2,1) absent"
-    );
+    assert_eq!(zeros, vec![2, 4], "fixture must have (2,0) and (2,1) absent");
 
     let e = population_neg_elbo(
         &model,
@@ -633,10 +522,7 @@ fn structural_zero_omega_slots_get_no_gradient() {
 
     for &slot in &zeros {
         let i = layout.omega_start() + slot;
-        assert_eq!(
-            e.grad_x[i], 0.0,
-            "structural-zero Ω slot {slot} must get no gradient"
-        );
+        assert_eq!(e.grad_x[i], 0.0, "structural-zero Ω slot {slot} must get no gradient");
         // ... and it is a deliberate skip, not an accident of this Ω: the objective
         // really does respond to that coordinate.
         let fd = fd_of_neg_elbo_wrt_x(
@@ -718,10 +604,7 @@ fn fixed_eta_zeroes_its_whole_omega_row_and_column() {
         let touches_fixed = i == 1 || j == 1;
         let got = e.grad_x[layout.omega_start() + slot];
         if touches_fixed {
-            assert_eq!(
-                got, 0.0,
-                "Ω({i},{j}) touches FIXed ETA_V but got a gradient"
-            );
+            assert_eq!(got, 0.0, "Ω({i},{j}) touches FIXed ETA_V but got a gradient");
         } else if params.omega.free_mask[(i, j)] {
             assert!(got != 0.0, "free Ω({i},{j}) lost its gradient");
         }
@@ -738,13 +621,8 @@ fn closed_form_omega_respects_block_structure_and_fixed_rows() {
 
     let family = FullRank::new(3);
     let phis = perturbed_phis(&family, &params.omega, 4);
-    let out = closed_form_omega(
-        Families::Uniform(&family),
-        &phis,
-        &vec![0usize; phis.len()],
-        &params,
-    )
-    .0;
+    let out =
+        closed_form_omega(Families::Uniform(&family), &phis, &vec![0usize; phis.len()], &params).0;
 
     for i in 0..3 {
         for j in 0..3 {
@@ -779,21 +657,15 @@ fn closed_form_omega_respects_block_structure_and_fixed_rows() {
 fn closed_form_omega_respects_structure() {
     let names = vec!["A".into(), "B".into()];
     let omega = OmegaMatrix::from_diagonal(&[0.04, 0.09], names.clone());
-    let mut template = analytical_model(GradientMethod::Auto)
-        .default_params
-        .clone();
+    let mut template = analytical_model(GradientMethod::Auto).default_params.clone();
     template.omega = omega.clone();
     template.omega_fixed = vec![false, true];
 
     let family = FullRank::new(2);
     let phis = perturbed_phis(&family, &omega, 4);
-    let out = closed_form_omega(
-        Families::Uniform(&family),
-        &phis,
-        &vec![0usize; phis.len()],
-        &template,
-    )
-    .0;
+    let out =
+        closed_form_omega(Families::Uniform(&family), &phis, &vec![0usize; phis.len()], &template)
+            .0;
 
     assert_eq!(
         out.matrix[(0, 1)],
@@ -896,10 +768,7 @@ fn eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly() {
     );
 
     // `analytic` mode must refuse rather than degrade silently.
-    let strict = ElboConfig {
-        eta_grad: EtaGradMode::Analytic,
-        ..cfg_seeded()
-    };
+    let strict = ElboConfig { eta_grad: EtaGradMode::Analytic, ..cfg_seeded() };
     let err = population_neg_elbo(
         &shell,
         &population,
@@ -980,9 +849,7 @@ fn mc_kl_kernel_converges_to_the_closed_form() {
     // Off the prior, so nothing is evaluated at a stationary point where the KL and
     // its derivatives are all trivially zero.
     let phi = perturbed_phis(&family, &params.omega, 1).remove(0);
-    let closed = family
-        .kl_to_normal(&phi, &params.omega)
-        .expect("FullRank has a closed form");
+    let closed = family.kl_to_normal(&phi, &params.omega).expect("FullRank has a closed form");
 
     let n = 200_000;
     let mut rng = StdRng::seed_from_u64(4242);
@@ -1093,10 +960,7 @@ fn mc_kl_grad_x_matches_fd_but_phi_is_path_derivative() {
     let family = FullRank::new(model.n_eta);
     let phis = perturbed_phis(&family, &params.omega, 2);
     let x = pack_params(&params);
-    let cfg = ElboConfig {
-        kl: KlMode::Mc,
-        ..cfg_seeded()
-    };
+    let cfg = ElboConfig { kl: KlMode::Mc, ..cfg_seeded() };
     let iter = 11;
     let layout = PackedLayout::new(&params);
 
@@ -1182,17 +1046,11 @@ fn family_without_a_closed_form_kl_falls_back_to_sampling() {
         &x,
         Families::Uniform(&stub),
         &phis,
-        &ElboConfig {
-            kl: KlMode::Analytic,
-            ..cfg_seeded()
-        },
+        &ElboConfig { kl: KlMode::Analytic, ..cfg_seeded() },
         5,
     )
     .expect("a family without a closed-form KL must fall back, not fail");
-    assert_eq!(
-        fell_back.n_kl_fallback_subjects, 2,
-        "every subject's fallback must be reported"
-    );
+    assert_eq!(fell_back.n_kl_fallback_subjects, 2, "every subject's fallback must be reported");
 
     let explicit = population_neg_elbo(
         &model,
@@ -1201,17 +1059,11 @@ fn family_without_a_closed_form_kl_falls_back_to_sampling() {
         &x,
         Families::Uniform(&real),
         &phis,
-        &ElboConfig {
-            kl: KlMode::Mc,
-            ..cfg_seeded()
-        },
+        &ElboConfig { kl: KlMode::Mc, ..cfg_seeded() },
         5,
     )
     .unwrap();
-    assert_eq!(
-        explicit.n_kl_fallback_subjects, 0,
-        "asking for mc outright is not a fallback"
-    );
+    assert_eq!(explicit.n_kl_fallback_subjects, 0, "asking for mc outright is not a fallback");
 
     assert_eq!(fell_back.neg_elbo.to_bits(), explicit.neg_elbo.to_bits());
     assert_eq!(fell_back.kl_term.to_bits(), explicit.kl_term.to_bits());
@@ -1242,11 +1094,7 @@ fn mc_and_analytic_kl_agree_on_the_objective() {
             &x,
             Families::Uniform(&family),
             &phis,
-            &ElboConfig {
-                kl,
-                n_mc_samples: s,
-                ..cfg_seeded()
-            },
+            &ElboConfig { kl, n_mc_samples: s, ..cfg_seeded() },
             9,
         )
         .unwrap()
@@ -1266,10 +1114,7 @@ fn mc_and_analytic_kl_agree_on_the_objective() {
         analytic.kl_term,
         mc.kl_term
     );
-    assert!(
-        analytic.kl_term > 0.0,
-        "a KL away from the prior is positive"
-    );
+    assert!(analytic.kl_term > 0.0, "a KL away from the prior is positive");
 }
 
 /// IOV is no longer a data-term refusal: the variational family covers `(η, κ)` jointly
@@ -1302,25 +1147,16 @@ fn iov_models_are_not_refused_by_the_data_term_predicate() {
 fn packed_layout_covers_the_omega_iov_block() {
     let (_, _, mut template) = fixture();
     // Two kappas, diagonal: two packed coordinates after sigma.
-    template.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[0.04, 0.02],
-        vec!["KAPPA_CL".into(), "KAPPA_V".into()],
-    ));
+    template.omega_iov =
+        Some(OmegaMatrix::from_diagonal(&[0.04, 0.02], vec!["KAPPA_CL".into(), "KAPPA_V".into()]));
     template.kappa_fixed = vec![false, false];
 
     let layout = PackedLayout::new(&template);
     let packed = pack_params(&template);
 
     assert_eq!(layout.n_omega_iov, 2);
-    assert_eq!(
-        layout.total(),
-        packed.len(),
-        "layout must describe pack_params exactly"
-    );
-    assert_eq!(
-        layout.omega_iov_start(),
-        layout.sigma_start() + layout.n_sigma
-    );
+    assert_eq!(layout.total(), packed.len(), "layout must describe pack_params exactly");
+    assert_eq!(layout.omega_iov_start(), layout.sigma_start() + layout.n_sigma);
     assert_eq!(layout.total() - layout.omega_iov_start(), 2);
 
     // Without IOV the layout is unchanged and the IOV range is empty.
@@ -1392,19 +1228,13 @@ fn stacked_prior_keeps_block_structure_and_marks_cross_block_zeros() {
     let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
 
     let sb = stacked_prior(&omega, Some(&iov), 2);
-    assert!(
-        !sb.diagonal,
-        "a block Omega must leave the stack non-diagonal"
-    );
+    assert!(!sb.diagonal, "a block Omega must leave the stack non-diagonal");
     // The declared BSV covariance survives...
     assert!((sb.matrix[(0, 1)] - 0.02).abs() < 1e-15);
     assert!(sb.free_mask[(0, 1)]);
     // ...while eta-to-kappa stays a structural zero.
     assert!(!sb.free_mask[(0, 2)]);
-    assert!(
-        !sb.free_mask[(2, 3)],
-        "distinct occasions must not correlate"
-    );
+    assert!(!sb.free_mask[(2, 3)], "distinct occasions must not correlate");
 }
 
 /// A two-subject IOV population on a closed-form 1-cpt IV model, with a differing
@@ -1414,7 +1244,12 @@ fn stacked_prior_keeps_block_structure_and_marks_cross_block_zeros() {
 /// quantity, so a fixture where every subject agreed would not exercise
 /// [`Families::PerSubject`] or catch an offset computed from the wrong subject's `K`.
 fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
+    iov_fixture_with("")
+}
+
+/// [`iov_fixture`] with `extra` appended to its `[fit_options]` block.
+fn iov_fixture_with(extra: &str) -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(&format!(
         r"
 [parameters]
   theta TVCL(1.0, 0.1, 10.0)
@@ -1436,41 +1271,21 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
 
 [fit_options]
   iov_column = OCC
-",
-    )
+{extra}
+"
+    ))
     .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
-        obs_raw_times: Vec::new(),
-        observations: (0..occ.len())
-            .map(|k| scale * (8.0 - 0.9 * k as f64))
-            .collect(),
+        observations: (0..occ.len()).map(|k| scale * (8.0 - 0.9 * k as f64)).collect(),
         obs_cmts: vec![1; occ.len()],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; occ.len()],
         occasions: occ,
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let population = Population {
@@ -1491,9 +1306,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
 
 /// Per-subject families sized to each subject's stacked vector.
 fn iov_families(
-    model: &CompiledModel,
-    population: &Population,
-    full_rank: bool,
+    model: &CompiledModel, population: &Population, full_rank: bool,
 ) -> Vec<Box<dyn VariationalFamily>> {
     population
         .subjects
@@ -1528,10 +1341,7 @@ fn iov_neg_elbo_gradient_matches_central_fd() {
     assert!(model.n_kappa > 0, "fixture must carry IOV");
     let x = pack_params(&params);
     let layout = PackedLayout::new(&params);
-    assert!(
-        layout.n_omega_iov > 0,
-        "packed vector must carry an Omega_iov block"
-    );
+    assert!(layout.n_omega_iov > 0, "packed vector must carry an Omega_iov block");
     let cfg = cfg_seeded();
     let iter = 5;
     // Forward-FD truncation inside the θ block; everything else is analytic.
@@ -1566,10 +1376,7 @@ fn iov_neg_elbo_gradient_matches_central_fd() {
 
         let e =
             population_neg_elbo(&model, &population, &params, &x, fams, &phis, &cfg, iter).unwrap();
-        assert_eq!(
-            e.n_fd_subjects, 0,
-            "{label}: IOV eta-gradient must be analytic"
-        );
+        assert_eq!(e.n_fd_subjects, 0, "{label}: IOV eta-gradient must be analytic");
 
         for (i, &got) in e.grad_x.iter().enumerate() {
             let want =
@@ -1625,10 +1432,8 @@ fn iov_shell_fixture() -> (CompiledModel, Population, ModelParameters) {
     shell.n_kappa = 1;
     shell.kappa_names = vec!["KAPPA_CL".into()];
     let mut params = shell.default_params.clone();
-    params.omega_iov = Some(crate::types::OmegaMatrix::from_diagonal(
-        &[0.02],
-        vec!["KAPPA_CL".into()],
-    ));
+    params.omega_iov =
+        Some(crate::types::OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]));
     (shell, population, params)
 }
 
@@ -1688,20 +1493,14 @@ fn iov_out_of_scope_model_falls_back_to_fd_loudly() {
     );
     // The fallback has to be *usable*, not merely reported: a decline that returned NaN
     // would satisfy the count above while being useless.
-    assert!(
-        eval.neg_elbo.is_finite(),
-        "the FD fallback must still produce a finite objective"
-    );
+    assert!(eval.neg_elbo.is_finite(), "the FD fallback must still produce a finite objective");
     assert!(
         eval.grad_x.iter().all(|g| g.is_finite()),
         "the FD fallback's packed gradient must be finite"
     );
 
     // And `analytic` mode must refuse rather than degrade silently.
-    let strict = ElboConfig {
-        eta_grad: EtaGradMode::Analytic,
-        ..cfg_seeded()
-    };
+    let strict = ElboConfig { eta_grad: EtaGradMode::Analytic, ..cfg_seeded() };
     let err = population_neg_elbo(
         &shell,
         &population,
@@ -1713,10 +1512,7 @@ fn iov_out_of_scope_model_falls_back_to_fd_loudly() {
         1,
     )
     .expect_err("vi_eta_grad = analytic must error on an out-of-scope IOV model");
-    assert!(
-        err.contains("analytic"),
-        "the error should name the mode that refused: {err}"
-    );
+    assert!(err.contains("analytic"), "the error should name the mode that refused: {err}");
 }
 
 /// The IOV gradient under **`vi_kl = mc`** — the other half of VI_PLAN §10.5(1)'s
@@ -1742,14 +1538,8 @@ fn iov_mc_kl_neg_elbo_gradient_matches_central_fd() {
     let (model, population, params) = iov_fixture();
     let x = pack_params(&params);
     let layout = PackedLayout::new(&params);
-    assert!(
-        layout.n_omega_iov > 0,
-        "packed vector must carry an Omega_iov block"
-    );
-    let cfg = ElboConfig {
-        kl: KlMode::Mc,
-        ..cfg_seeded()
-    };
+    assert!(layout.n_omega_iov > 0, "packed vector must carry an Omega_iov block");
+    let cfg = ElboConfig { kl: KlMode::Mc, ..cfg_seeded() };
     let iter = 7;
     // Same split as the analytic-KL IOV test: forward-FD truncation inside the θ block,
     // everything downstream analytic.
@@ -1783,10 +1573,7 @@ fn iov_mc_kl_neg_elbo_gradient_matches_central_fd() {
 
         let e =
             population_neg_elbo(&model, &population, &params, &x, fams, &phis, &cfg, iter).unwrap();
-        assert_eq!(
-            e.n_fd_subjects, 0,
-            "{label}: IOV eta-gradient must be analytic"
-        );
+        assert_eq!(e.n_fd_subjects, 0, "{label}: IOV eta-gradient must be analytic");
         assert_eq!(
             e.n_kl_fallback_subjects, 0,
             "{label}: this family has a closed-form KL, so `mc` must be the requested \
@@ -1799,10 +1586,7 @@ fn iov_mc_kl_neg_elbo_gradient_matches_central_fd() {
         let iov_peak = (iov_start..iov_start + layout.n_omega_iov)
             .map(|i| e.grad_x[i].abs())
             .fold(0.0f64, f64::max);
-        assert!(
-            iov_peak > 1e-6,
-            "{label}: Omega_iov gradient block is ~zero ({iov_peak:.3e})"
-        );
+        assert!(iov_peak > 1e-6, "{label}: Omega_iov gradient block is ~zero ({iov_peak:.3e})");
 
         for (i, &got) in e.grad_x.iter().enumerate() {
             let want =
@@ -1909,34 +1693,15 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
         }
         let n_obs = obs_times.len();
         Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses,
             obs_times,
-            obs_raw_times: Vec::new(),
             observations,
             obs_cmts: vec![1; n_obs],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
             occasions,
-            obs_l2: Vec::new(),
             dose_occasions,
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     };
 
@@ -2031,19 +1796,13 @@ fn tvcov_iov_fixture() -> (CompiledModel, Population, ModelParameters) {
 /// which makes the objective deterministic in `(x, φ)` and the comparison exact rather
 /// than noisy.
 fn assert_tv_iov_gradient_matches_fd(
-    what: &str,
-    tv_theta: &str,
-    model: &CompiledModel,
-    population: &Population,
+    what: &str, tv_theta: &str, model: &CompiledModel, population: &Population,
     params: &ModelParameters,
 ) {
     assert!(model.n_kappa > 0, "{what}: fixture must carry IOV");
     let x = pack_params(params);
     let layout = PackedLayout::new(params);
-    assert!(
-        layout.n_omega_iov > 0,
-        "{what}: packed vector must carry an Omega_iov block"
-    );
+    assert!(layout.n_omega_iov > 0, "{what}: packed vector must carry an Omega_iov block");
     let cfg = cfg_seeded();
     let iter = 3;
     // Same split as the other IOV parity tests: forward-FD truncation inside the θ block
@@ -2166,10 +1925,8 @@ fn tightness_excess_is_zero_when_the_data_term_is_taken_at_the_means() {
     let (model, population, params) = fixture();
     let family = FullRank::new(model.n_eta);
     let phis = perturbed_phis(&family, &params.omega, 2);
-    let eta_means: Vec<Vec<f64>> = phis
-        .iter()
-        .map(|p| family.moments(p).0.iter().copied().collect())
-        .collect();
+    let eta_means: Vec<Vec<f64>> =
+        phis.iter().map(|p| family.moments(p).0.iter().copied().collect()).collect();
     let kappa_means: Vec<Vec<Vec<f64>>> = vec![Vec::new(); population.subjects.len()];
 
     // Feed it the data term *at the means* rather than the sampled one.
@@ -2200,11 +1957,7 @@ fn tightness_excess_is_zero_when_the_data_term_is_taken_at_the_means() {
 fn tightness_expectation_counts_the_stacked_dimension_under_iov() {
     let (model, population, params) = iov_fixture();
     let n_eta = params.omega.dim();
-    let eta_means: Vec<Vec<f64>> = population
-        .subjects
-        .iter()
-        .map(|_| vec![0.0; n_eta])
-        .collect();
+    let eta_means: Vec<Vec<f64>> = population.subjects.iter().map(|_| vec![0.0; n_eta]).collect();
     let kappa_means: Vec<Vec<Vec<f64>>> = population
         .subjects
         .iter()
@@ -2217,11 +1970,7 @@ fn tightness_expectation_counts_the_stacked_dimension_under_iov() {
         .iter()
         .map(|s| 0.5 * (n_eta + subject_k_occasions(&model, s) * model.n_kappa) as f64)
         .sum();
-    assert!(
-        (t.expected - want).abs() < 1e-12,
-        "expected {want}, got {}",
-        t.expected
-    );
+    assert!((t.expected - want).abs() < 1e-12, "expected {want}, got {}", t.expected);
     // And it must exceed the BSV-only count, or the IOV blocks were ignored.
     assert!(want > 0.5 * (n_eta * population.subjects.len()) as f64);
 }
@@ -2233,10 +1982,8 @@ fn tightness_flags_a_grossly_loose_bound_but_not_a_healthy_one() {
     let (model, population, params) = fixture();
     let family = FullRank::new(model.n_eta);
     let phis = perturbed_phis(&family, &params.omega, 2);
-    let eta_means: Vec<Vec<f64>> = phis
-        .iter()
-        .map(|p| family.moments(p).0.iter().copied().collect())
-        .collect();
+    let eta_means: Vec<Vec<f64>> =
+        phis.iter().map(|p| family.moments(p).0.iter().copied().collect()).collect();
     let kappa_means: Vec<Vec<Vec<f64>>> = vec![Vec::new(); population.subjects.len()];
     let base =
         -super::elbo_tightness(&model, &population, &params, 0.0, &eta_means, &kappa_means).excess;
@@ -2269,11 +2016,7 @@ fn tightness_flags_a_grossly_loose_bound_but_not_a_healthy_one() {
         &eta_means,
         &kappa_means,
     );
-    assert!(
-        broken.is_implausible(),
-        "a 300x excess must be flagged, ratio was {}",
-        broken.ratio()
-    );
+    assert!(broken.is_implausible(), "a 300x excess must be flagged, ratio was {}", broken.ratio());
 }
 
 // ---------------------------------------------------------------------------
@@ -2393,10 +2136,7 @@ fn closed_form_sigma_support_refuses_models_outside_its_scope() {
     .expect("combined fixture parses");
     let err = closed_form_sigma_support(&combined, &combined.default_params)
         .expect_err("combined error must be refused");
-    assert!(
-        err.contains("combined") || err.contains("σ parameters"),
-        "unhelpful reason: {err}"
-    );
+    assert!(err.contains("combined") || err.contains("σ parameters"), "unhelpful reason: {err}");
 
     // A FIXed σ is not an estimated parameter.
     let mut fixed = params.clone();
@@ -2452,10 +2192,7 @@ fn the_data_eta_gradient_is_exact_past_the_closed_forms() {
     let mut worst = 0.0f64;
     for (m, d) in [
         ("examples/warfarin_bloq.ferx", "data/warfarin_bloq.csv"),
-        (
-            "examples/correlated_residual_combined.ferx",
-            "data/correlated_residual_combined.csv",
-        ),
+        ("examples/correlated_residual_combined.ferx", "data/correlated_residual_combined.csv"),
     ] {
         let prep = load(m, d);
         let model = &prep.parsed.model;
@@ -2491,5 +2228,55 @@ fn the_data_eta_gradient_is_exact_past_the_closed_forms() {
     eprintln!("exact data η-gradient vs the central quotient: worst {worst:.2e} of the row");
     // Measured 6.8e-10: the central quotient's truncation at its `1e-5` step. A dropped
     // censored-row weight or residual-η channel misses by O(1).
+    assert!(worst < 1e-6, "{worst:.2e}");
+}
+
+/// Under IOV the data η-gradient is exact past the closed forms too: with M3 censoring the
+/// `Auto` route (`eta_data_grad` → `fixed_theta_data_eta_grad` over the stacked `[η, κ…]`)
+/// reports no FD flag and agrees with the `Fd` route's central quotient. Subject 0 carries a
+/// censored record in each of its two occasions, so the censored-row weight is live on both
+/// occasions' κ columns; subject 1 (uncensored, three occasions) is the control beside it
+/// (#3004).
+#[test]
+fn the_iov_data_eta_gradient_is_exact_past_the_closed_forms() {
+    let (model, mut population, params) = iov_fixture_with("  bloq_method = m3");
+    assert!(model.n_kappa > 0, "fixture must carry IOV");
+    // Censored below the quantification limit: DV is the limit, `cens = 1`.
+    population.subjects[0].cens = vec![0, 1, 0, 1];
+    population.subjects[0].observations[1] = 2.0;
+    population.subjects[0].observations[3] = 1.5;
+    let mut worst = 0.0f64;
+    let mut scratch = EventPkParams::default();
+    for (i, s) in population.subjects.iter().enumerate() {
+        let k = subject_k_occasions(&model, s);
+        let z: Vec<f64> =
+            (0..model.n_eta + k * model.n_kappa).map(|j| 0.05 + 0.03 * j as f64).collect();
+        let prior = stacked_prior(&params.omega, params.omega_iov.as_ref(), k);
+        let run = |mode: EtaGradMode, scratch: &mut EventPkParams| {
+            super::eta_data_grad(
+                &model,
+                s,
+                &params.theta,
+                &params,
+                &prior,
+                &params.sigma.values,
+                &z,
+                &[],
+                k,
+                mode,
+                scratch,
+            )
+        };
+        let (g_e, fd_e) = run(EtaGradMode::Auto, &mut scratch);
+        let (g_f, fd_f) = run(EtaGradMode::Fd, &mut scratch);
+        assert!(!fd_e && fd_f, "subject {i}: Auto must be exact, Fd the quotient");
+        assert!(g_f.iter().all(|v| v.is_finite()), "subject {i}");
+        let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs())); // nan-ok: g_f finite asserted above
+        for (a, b) in g_e.iter().zip(&g_f) {
+            assert!(a.is_finite() && b.is_finite(), "subject {i}");
+            worst = worst.max((a - b).abs() / scale); // nan-ok: a, b finite asserted above; scale >= 1
+        }
+    }
+    eprintln!("IOV exact data η-gradient vs the central quotient: worst {worst:.2e} of the row");
     assert!(worst < 1e-6, "{worst:.2e}");
 }

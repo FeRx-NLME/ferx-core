@@ -67,21 +67,13 @@ fn pop_single_weibull(obs_times: Vec<f64>) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![dose],
-            obs_times,
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", vec![dose], obs_times, vec![0.0; n], vec![1; n])],
     }
 }
 
 #[test]
 fn weibull_curve_recovers_dose_auc_and_has_delayed_peak() {
-    let model = parse_full_model(WEIBULL_MODEL)
-        .expect("Weibull model parses")
-        .model;
+    let model = parse_full_model(WEIBULL_MODEL).expect("Weibull model parses").model;
 
     // 0, 0.25, …, 72.0 — fine enough for trapezoidal AUC, long enough that the
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
@@ -113,10 +105,8 @@ fn weibull_curve_recovers_dose_auc_and_has_delayed_peak() {
     // (3) Mass balance via the absorption-independent invariant ∫A dt = Dose/ke.
     //     Catches a missing forcing (AUC → 0), a double-counted bolus (AUC →
     //     2·Dose/ke), or a mis-normalised Weibull density (∫R_in ≠ Dose).
-    let auc: f64 = preds
-        .windows(2)
-        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-        .sum();
+    let auc: f64 =
+        preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
     let auc_inf = 100.0 * 50.0 / 5.0; // F·Dose/ke = Dose·V/CL with F = 1
     let rel = (auc - auc_inf).abs() / auc_inf;
     assert!(
@@ -133,9 +123,7 @@ fn weibull_normal_dosing_passes_data_checks() {
     // Positive control: ordinary (non-SS, bolus) dosing into the weibull()
     // compartment raises no absorption diagnostic.
     use ferx_core::check_model_data;
-    let model = parse_full_model(WEIBULL_MODEL)
-        .expect("Weibull model parses")
-        .model;
+    let model = parse_full_model(WEIBULL_MODEL).expect("Weibull model parses").model;
     let pop = pop_single_weibull(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -176,12 +164,6 @@ fn weibull_on_analytical_pk_is_rejected_pointing_at_ode_template() {
         Ok(_) => panic!("pk + weibull() must be rejected"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("ode_template"),
-        "error should point at ode_template, got: {err}"
-    );
-    assert!(
-        err.contains("weibull"),
-        "error should name the weibull function, got: {err}"
-    );
+    assert!(err.contains("ode_template"), "error should point at ode_template, got: {err}");
+    assert!(err.contains("weibull"), "error should name the weibull function, got: {err}");
 }

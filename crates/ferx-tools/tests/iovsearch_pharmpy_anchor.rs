@@ -57,9 +57,7 @@ struct Reference {
 }
 
 fn reference() -> Reference {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(ANCHOR)
-        .join("pharmpy_iovsearch.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ANCHOR).join("pharmpy_iovsearch.json");
     let text = std::fs::read_to_string(&path).expect("anchor json");
     serde_json::from_str(&text).expect("anchor json")
 }
@@ -80,10 +78,7 @@ fn run(dir: &Path, distribution: &str) -> IovsearchResult {
     run_iovsearch(
         &config,
         &base,
-        IovsearchRun {
-            dir: Some(dir.join("run")),
-            ..IovsearchRun::default()
-        },
+        IovsearchRun { dir: Some(dir.join("run")), ..IovsearchRun::default() },
     )
     .expect("search")
 }
@@ -152,11 +147,7 @@ fn check(variant: &Variant, result: &IovsearchResult, base_ofv: f64) {
             row.description,
             row.bic,
             ours.criterion,
-            if proper {
-                ""
-            } else {
-                "  (NONMEM: not a proper optimum)"
-            }
+            if proper { "" } else { "  (NONMEM: not a proper optimum)" }
         );
         assert!(ours.ofv.is_some(), "{}: no fit: {:?}", ours.id, ours.error);
         if proper {
@@ -191,33 +182,20 @@ fn check(variant: &Variant, result: &IovsearchResult, base_ofv: f64) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn disjoint_follows_pharmpys_trajectory() {
     let reference = reference();
     let dir = tempfile::tempdir().unwrap();
     let result = run(dir.path(), "disjoint");
     check(&reference.variants["disjoint"], &result, reference.base_ofv);
-    assert!(result
-        .rows
-        .iter()
-        .all(|r| r.structure.kappa_blocks.is_empty()));
+    assert!(result.rows.iter().all(|r| r.structure.kappa_blocks.is_empty()));
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn same_as_iiv_follows_pharmpys_trajectory() {
     let reference = reference();
     let dir = tempfile::tempdir().unwrap();
     let result = run(dir.path(), "same-as-iiv");
-    check(
-        &reference.variants["same_as_iiv"],
-        &result,
-        reference.base_ofv,
-    );
+    check(&reference.variants["same_as_iiv"], &result, reference.base_ofv);
 }

@@ -34,11 +34,17 @@ pub(crate) struct Table {
     #[cfg(test)]
     pub(crate) exps: Vec<Vec<u8>>,
     /// Total degree of each monomial.
+    #[cfg(test)]
     pub(crate) deg: Vec<u8>,
     /// `(i, j, k)`: monomial `i` times monomial `j` is monomial `k` (degree ≤ `ORD`).
     pub(crate) mul: Vec<(u16, u16, u16)>,
     /// The index of `e_v`, the first-degree monomial of each variable.
     pub(crate) var: Vec<u16>,
+    /// Per degree `d`, the products of `mul` that a series division subtracts from the
+    /// quotient's degree-`d` monomials: those `(i, j, k)` with `deg k = d` and `i ≠ k`.
+    pub(crate) div: Vec<Vec<(u16, u16, u16)>>,
+    /// Per degree `d`, the monomials of that degree.
+    pub(crate) by_deg: Vec<Vec<u16>>,
 }
 
 const MAX_P: usize = 12;
@@ -49,10 +55,7 @@ static TABLES: [OnceLock<Table>; (MAX_P + 1) * (MAX_ORD + 1)] =
 
 /// The table of `(p, ord)`, built on first use.
 pub(crate) fn table(p: usize, ord: usize) -> &'static Table {
-    assert!(
-        p <= MAX_P && ord <= MAX_ORD,
-        "Taylor<{p}, {ord}> is past the served range"
-    );
+    assert!(p <= MAX_P && ord <= MAX_ORD, "Taylor<{p}, {ord}> is past the served range");
     TABLES[p * (MAX_ORD + 1) + ord].get_or_init(|| build(p, ord))
 }
 
@@ -76,11 +79,8 @@ fn build(p: usize, ord: usize) -> Table {
         prev = next;
     }
     let deg: Vec<u8> = exps.iter().map(|e| e.iter().sum()).collect();
-    let index: std::collections::HashMap<Vec<u8>, u16> = exps
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.clone(), i as u16))
-        .collect();
+    let index: std::collections::HashMap<Vec<u8>, u16> =
+        exps.iter().enumerate().map(|(i, e)| (e.clone(), i as u16)).collect();
     let mut mul = Vec::new();
     for (i, a) in exps.iter().enumerate() {
         for (j, b) in exps.iter().enumerate() {
@@ -98,12 +98,26 @@ fn build(p: usize, ord: usize) -> Table {
             index[&e]
         })
         .collect();
+    let div = (0..=ord)
+        .map(|d| {
+            mul.iter()
+                .copied()
+                .filter(|&(i, _, k)| deg[k as usize] as usize == d && i != k)
+                .collect()
+        })
+        .collect();
+    let by_deg = (0..=ord)
+        .map(|d| (0..deg.len() as u16).filter(|&k| deg[k as usize] as usize == d).collect())
+        .collect();
     Table {
         #[cfg(test)]
         exps,
+        #[cfg(test)]
         deg,
         mul,
         var,
+        div,
+        by_deg,
     }
 }
 
@@ -196,6 +210,16 @@ impl<const P: usize, const ORD: usize, const L: usize> Mul for Taylor<P, ORD, L>
     #[inline]
     fn mul(self, o: Self) -> Self {
         let mut c = [0.0; L];
+        if P == 1 {
+            // One variable: the monomials are the powers, so the product is the convolution --
+            // the table's products in the table's order (`i` ascending), without the lookups.
+            for i in 0..L {
+                for j in 0..L - i {
+                    c[i + j] += self.c[i] * o.c[j];
+                }
+            }
+            return Taylor { c };
+        }
         for &(i, j, k) in &Self::tab().mul {
             c[k as usize] += self.c[i as usize] * o.c[j as usize];
         }
@@ -209,23 +233,28 @@ impl<const P: usize, const ORD: usize, const L: usize> Div for Taylor<P, ORD, L>
     /// bit, so a solve over this type takes the `f64` solve's steps.
     #[inline]
     fn div(self, o: Self) -> Self {
-        let t = Self::tab();
         let b0 = o.c[0];
         let mut q = [0.0; L];
+        if P == 1 {
+            for k in 0..L {
+                let mut acc = self.c[k];
+                for i in 0..k {
+                    acc -= q[i] * o.c[k - i];
+                }
+                q[k] = acc / b0;
+            }
+            return Taylor { c: q };
+        }
+        let t = Self::tab();
         let mut acc = self.c;
         // A term `q_i b_j` of `q_k` with `i ≠ k` has `deg i < deg k`, so degree by degree
         // every `q_i` it reads is already final.
-        for d in 0..=ORD as u8 {
-            for &(i, j, k) in &t.mul {
-                let (i, j, k) = (i as usize, j as usize, k as usize);
-                if t.deg[k] == d && i != k {
-                    acc[k] -= q[i] * o.c[j];
-                }
+        for d in 0..=ORD {
+            for &(i, j, k) in &t.div[d] {
+                acc[k as usize] -= q[i as usize] * o.c[j as usize];
             }
-            for k in 0..L {
-                if t.deg[k] == d {
-                    q[k] = acc[k] / b0;
-                }
+            for &k in &t.by_deg[d] {
+                q[k as usize] = acc[k as usize] / b0;
             }
         }
         Taylor { c: q }
@@ -375,13 +404,7 @@ impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, 
     fn ln_gamma(self) -> Self {
         use crate::stats::special::{digamma, ln_gamma, pentagamma, tetragamma, trigamma};
         let x = self.c[0];
-        let d = [
-            ln_gamma(x),
-            digamma(x),
-            trigamma(x),
-            tetragamma(x),
-            pentagamma(x),
-        ];
+        let d = [ln_gamma(x), digamma(x), trigamma(x), tetragamma(x), pentagamma(x)];
         self.compose(&d[..=ORD])
     }
     fn jets_finite(self) -> bool {
@@ -461,10 +484,7 @@ impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::vm::VmA
         }
     }
     fn same_bits(&self, other: &Self) -> bool {
-        self.c
-            .iter()
-            .zip(&other.c)
-            .all(|(a, b)| a.to_bits() == b.to_bits())
+        self.c.iter().zip(&other.c).all(|(a, b)| a.to_bits() == b.to_bits())
     }
 }
 
@@ -520,5 +540,29 @@ mod tests {
         assert!((l.c[1] - 0.5).abs() < 1e-15);
         assert!((l.c[2] + 0.125).abs() < 1e-15);
         assert!((l.c[3] - 1.0 / 24.0).abs() < 1e-15);
+    }
+
+    /// The one-variable product and quotient are the convolution, bit for bit the table-driven
+    /// ones: `Taylor<1, 3, 4>` against the pure-`x` coefficients of `Taylor<2, 3, 10>` (the
+    /// second variable never seeded), through a chain of products and quotients.
+    /// Mutation: reversing the accumulation order of either convolution changes the last bits.
+    #[test]
+    fn one_variable_arithmetic_is_the_table_arithmetic_bit_for_bit() {
+        fn chain<
+            T: Copy + Add<Output = T> + Mul<Output = T> + Div<Output = T> + Sub<Output = T>,
+        >(
+            x: T, k: impl Fn(f64) -> T,
+        ) -> T {
+            let u = (k(1.0) + k(2.0) * x + x * x * k(0.3)) / (k(3.0) - x * k(0.7));
+            let v = (u * x + k(1.5)) / (k(0.9) + u * u);
+            (v * u + x) / (k(1.1) + v)
+        }
+        let one = chain(Taylor::<1, 3, 4>::seed(0.37, 0), Taylor::<1, 3, 4>::constant);
+        let two = chain(Taylor::<2, 3, 10>::seed(0.37, 0), Taylor::<2, 3, 10>::constant);
+        let t = table(2, 3);
+        for k in 0..4 {
+            let idx = t.exps.iter().position(|e| e[0] as usize == k && e[1] == 0).unwrap();
+            assert_eq!(one.c[k].to_bits(), two.c[idx].to_bits(), "coefficient {k}");
+        }
     }
 }

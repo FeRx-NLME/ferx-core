@@ -44,12 +44,9 @@ fn minimum_sample_sizes_are_exactly_the_ones_psn_documents() {
     // fall out of "(n+1)p >= 1", i.e. there must be an order statistic at or
     // below the requested quantile rather than an extrapolation past the
     // smallest observation. Pin all four, from both sides.
-    for (interval, n_min) in [
-        ((5.0, 95.0), 19usize),
-        ((2.5, 97.5), 39),
-        ((0.5, 99.5), 199),
-        ((0.05, 99.95), 1999),
-    ] {
+    for (interval, n_min) in
+        [((5.0, 95.0), 19usize), ((2.5, 97.5), 39), ((0.5, 99.5), 199), ((0.05, 99.95), 1999)]
+    {
         let (lo_pct, hi_pct) = interval;
 
         let enough: Vec<f64> = (0..n_min).map(|i| i as f64).collect();
@@ -97,10 +94,7 @@ fn normal_quantile_matches_known_values() {
     ];
     for (p, expected) in cases {
         let got = normal_quantile(p);
-        assert!(
-            (got - expected).abs() < 1e-8,
-            "normal_quantile({p}) = {got}, expected {expected}"
-        );
+        assert!((got - expected).abs() < 1e-8, "normal_quantile({p}) = {got}, expected {expected}");
     }
     // Symmetric tails come out exactly symmetric: the central branch is odd in
     // `p - 0.5`, so this is equality, not a tolerance.
@@ -121,17 +115,11 @@ fn default_filters_drop_terminated_and_boundary_replicates() {
     assert_eq!(exclusion_reason(&r, &options), None);
 
     r.converged = false;
-    assert_eq!(
-        exclusion_reason(&r, &options),
-        Some("minimization terminated")
-    );
+    assert_eq!(exclusion_reason(&r, &options), Some("minimization terminated"));
 
     r.converged = true;
     r.estimate_near_boundary = true;
-    assert_eq!(
-        exclusion_reason(&r, &options),
-        Some("estimate near boundary")
-    );
+    assert_eq!(exclusion_reason(&r, &options), Some("estimate near boundary"));
 
     // A fit that returned Err is excluded regardless of the filters — there is
     // nothing to include.
@@ -147,10 +135,8 @@ fn default_filters_drop_terminated_and_boundary_replicates() {
 
 #[test]
 fn disabling_a_filter_keeps_the_replicate() {
-    let options = BootstrapOptions {
-        skip_minimization_terminated: false,
-        ..BootstrapOptions::default()
-    };
+    let options =
+        BootstrapOptions { skip_minimization_terminated: false, ..BootstrapOptions::default() };
     let mut r = replicate(1, vec![1.0]);
     r.converged = false;
     assert_eq!(exclusion_reason(&r, &options), None);
@@ -168,10 +154,7 @@ fn covariance_filters_only_fire_when_asked_for() {
         skip_covariance_step_terminated: true,
         ..BootstrapOptions::default()
     };
-    assert_eq!(
-        exclusion_reason(&r, &strict),
-        Some("covariance step terminated")
-    );
+    assert_eq!(exclusion_reason(&r, &strict), Some("covariance step terminated"));
 
     let warn = BootstrapOptions {
         keep_covariance: true,
@@ -179,10 +162,7 @@ fn covariance_filters_only_fire_when_asked_for() {
         ..BootstrapOptions::default()
     };
     r.covariance_step_successful = true;
-    assert_eq!(
-        exclusion_reason(&r, &warn),
-        Some("covariance step warnings")
-    );
+    assert_eq!(exclusion_reason(&r, &warn), Some("covariance step warnings"));
 }
 
 // ── the summary table ───────────────────────────────────────────────────────
@@ -197,12 +177,7 @@ fn summary_reports_mean_bias_sd_and_median() {
         .map(|(i, v)| replicate(i + 1, vec![*v]))
         .collect();
 
-    let s = summarize(
-        &names,
-        Some(&original),
-        &replicates,
-        &BootstrapOptions::default(),
-    );
+    let s = summarize(&names, Some(&original), &replicates, &BootstrapOptions::default());
     let p = &s.parameters[0];
 
     assert_eq!(p.original, Some(10.0));
@@ -248,27 +223,15 @@ fn excluded_replicates_do_not_enter_the_statistics() {
         r
     });
 
-    let s = summarize(
-        &names,
-        Some(&original),
-        &replicates,
-        &BootstrapOptions::default(),
-    );
+    let s = summarize(&names, Some(&original), &replicates, &BootstrapOptions::default());
     assert_eq!(s.n_completed, 5);
     assert_eq!(s.n_included, 4);
     assert!((s.parameters[0].mean - 10.0).abs() < 1e-12);
-    assert_eq!(
-        s.excluded_by,
-        vec![("minimization terminated".to_string(), 1)]
-    );
+    assert_eq!(s.excluded_by, vec![("minimization terminated".to_string(), 1)]);
 
     // The diagnostic means describe the whole run, including what was filtered.
-    let converged = s
-        .diagnostic_means
-        .iter()
-        .find(|(k, _)| k == "minimization_successful")
-        .unwrap()
-        .1;
+    let converged =
+        s.diagnostic_means.iter().find(|(k, _)| k == "minimization_successful").unwrap().1;
     assert!((converged - 0.8).abs() < 1e-12);
 }
 
@@ -279,19 +242,15 @@ fn an_out_of_range_confidence_level_drops_the_interval_rather_than_panicking() {
     // no normal-approximation interval, not a panic out of a library.
     let names = vec!["CL".to_string()];
     let original = replicate(0, vec![10.0]);
-    let replicates: Vec<ReplicateResult> = (1..=3)
-        .map(|i| replicate(i, vec![9.0 + i as f64]))
-        .collect();
+    let replicates: Vec<ReplicateResult> =
+        (1..=3).map(|i| replicate(i, vec![9.0 + i as f64])).collect();
 
     for level in [100.0, 0.0, -3.0, 250.0] {
         let s = summarize(
             &names,
             Some(&original),
             &replicates,
-            &BootstrapOptions {
-                confidence_level: level,
-                ..BootstrapOptions::default()
-            },
+            &BootstrapOptions { confidence_level: level, ..BootstrapOptions::default() },
         );
         let p = &s.parameters[0];
         assert_eq!(p.ci_standard_error, None, "level {level}");

@@ -72,16 +72,12 @@ const PRE_FIX_OFV: f64 = 301.450_784_063_187_03;
 const TOL: f64 = 0.5;
 
 fn ferx_ofv() -> f64 {
-    let model = ferx_core::parse_model_file(Path::new(
-        "nonmem_anchor/correlated_residual_rho999_fit.ferx",
-    ))
-    .expect("the anchor twin must parse");
-    let population = read_nonmem_csv(
-        Path::new("data/correlated_residual_combined.csv"),
-        None,
-        None,
-    )
-    .expect("the anchor dataset must load");
+    let model =
+        ferx_core::parse_model_file(Path::new("nonmem_anchor/correlated_residual_rho999_fit.ferx"))
+            .expect("the anchor twin must parse");
+    let population =
+        read_nonmem_csv(Path::new("data/correlated_residual_combined.csv"), None, None)
+            .expect("the anchor dataset must load");
 
     // The model file's own `[fit_options]` are **not** carried by the parse, so
     // `maxiter = 0` is restated here on the `FitOptions` actually passed to
@@ -121,10 +117,7 @@ fn ferx_ofv() -> f64 {
 fn a_fixed_sigma_block_past_the_rail_matches_nonmem() {
     let ofv = ferx_ofv();
     let err = (ofv - NONMEM_OFV).abs();
-    assert!(
-        err < TOL,
-        "ferx OFV {ofv} vs NONMEM {NONMEM_OFV} — |Δ| = {err}, bound {TOL}"
-    );
+    assert!(err < TOL, "ferx OFV {ofv} vs NONMEM {NONMEM_OFV} — |Δ| = {err}, bound {TOL}");
 }
 
 /// The same run, asserted against the **defect** rather than against NONMEM:
@@ -162,9 +155,5 @@ fn the_shipped_anchor_model_file_reaches_the_same_objective() {
     )
     .expect("the shipped anchor model must run end to end");
     let err = (result.ofv - NONMEM_OFV).abs();
-    assert!(
-        err < TOL,
-        "ferx OFV {} vs NONMEM {NONMEM_OFV} — |Δ| = {err}, bound {TOL}",
-        result.ofv
-    );
+    assert!(err < TOL, "ferx OFV {} vs NONMEM {NONMEM_OFV} — |Δ| = {err}, bound {TOL}", result.ofv);
 }

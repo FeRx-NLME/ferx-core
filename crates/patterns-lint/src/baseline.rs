@@ -58,14 +58,8 @@ impl Baseline {
             let count: usize = count.parse().ok().filter(|&c| c > 0).ok_or_else(|| {
                 format!("baseline line {}: `{count}` is not a positive count", n + 1)
             })?;
-            if entries
-                .insert((rule.to_string(), key.trim().to_string()), count)
-                .is_some()
-            {
-                return Err(format!(
-                    "baseline line {}: duplicate entry `{rule} {key}`",
-                    n + 1
-                ));
+            if entries.insert((rule.to_string(), key.trim().to_string()), count).is_some() {
+                return Err(format!("baseline line {}: duplicate entry `{rule} {key}`", n + 1));
             }
         }
         Ok(Self { entries })
@@ -91,9 +85,7 @@ impl Baseline {
     pub fn from_findings(findings: &[Finding]) -> Self {
         let mut entries = BTreeMap::new();
         for f in findings {
-            *entries
-                .entry((f.rule.to_string(), f.key.clone()))
-                .or_insert(0) += 1;
+            *entries.entry((f.rule.to_string(), f.key.clone())).or_insert(0) += 1;
         }
         Self { entries }
     }
@@ -142,18 +134,9 @@ pub fn apply(baseline: &Baseline, findings: Vec<Finding>) -> Applied {
         }
     }
     for ((rule, key), &recorded) in &baseline.entries {
-        let now = current
-            .entries
-            .get(&(rule.clone(), key.clone()))
-            .copied()
-            .unwrap_or(0);
+        let now = current.entries.get(&(rule.clone(), key.clone())).copied().unwrap_or(0);
         if now < recorded {
-            out.stale.push(Stale {
-                rule: rule.clone(),
-                key: key.clone(),
-                recorded,
-                now,
-            });
+            out.stale.push(Stale { rule: rule.clone(), key: key.clone(), recorded, now });
         }
     }
     out

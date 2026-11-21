@@ -57,25 +57,14 @@ fn run(src: &str, data: &str) -> FitResult {
 /// file): without the correlation line the fixture is the kappa-only model, both bounds
 /// pass, and the test no longer tests the route (#2127 review finding 4).
 fn insert_after(src: &str, anchor: &str, line: &str) -> String {
-    assert_eq!(
-        src.matches(anchor).count(),
-        1,
-        "anchor {anchor:?} must occur once"
-    );
+    assert_eq!(src.matches(anchor).count(), 1, "anchor {anchor:?} must occur once");
     src.replacen(anchor, &format!("{anchor}{line}"), 1)
 }
 
 fn mbma_car1(rho0: f64) -> String {
-    let src = insert_after(
-        MBMA_MODEL,
-        "[parameters]\n",
-        &format!("  theta RHO({rho0}, 0.0, 0.95)\n"),
-    );
-    insert_after(
-        &src,
-        "  DV ~ additive(ADD_ERR) weight = SE\n",
-        "  correlation car1(RHO) by OCC\n",
-    )
+    let src =
+        insert_after(MBMA_MODEL, "[parameters]\n", &format!("  theta RHO({rho0}, 0.0, 0.95)\n"));
+    insert_after(&src, "  DV ~ additive(ADD_ERR) weight = SE\n", "  correlation car1(RHO) by OCC\n")
 }
 
 fn exact3_ar1(rho0: f64) -> String {
@@ -84,11 +73,7 @@ fn exact3_ar1(rho0: f64) -> String {
         "  sigma ADD ~ 0.255164\n",
         &format!("  theta RHO({rho0}, -0.99, 0.99)\n"),
     );
-    insert_after(
-        &src,
-        "  DV ~ additive(ADD)\n",
-        "  correlation ar1(RHO) by ARM\n",
-    )
+    insert_after(&src, "  DV ~ additive(ADD)\n", "  correlation ar1(RHO) by ARM\n")
 }
 
 fn rho_hat(r: &FitResult) -> f64 {
@@ -102,11 +87,7 @@ fn rho_hat(r: &FitResult) -> f64 {
 /// regression this file exists to catch) is caught by the numbers first; see each
 /// fixture's constants for what BOBYQA measured.
 fn check(
-    label: &str,
-    fits: &[(f64, FitResult)],
-    nested: &FitResult,
-    spread_tol: f64,
-    nested_tol: f64,
+    label: &str, fits: &[(f64, FitResult)], nested: &FitResult, spread_tol: f64, nested_tol: f64,
 ) {
     assert!(nested.ofv.is_finite(), "{label}: nested OFV {}", nested.ofv);
     for (rho0, r) in fits {
@@ -121,24 +102,10 @@ fn check(
         assert!(r.ofv.is_finite(), "{label}: start {rho0}: OFV {}", r.ofv);
     }
     eprintln!("{label}: nested kappa-only OFV = {:.10}", nested.ofv);
-    let lo = fits
-        .iter()
-        .map(|(_, r)| r.ofv)
-        .fold(f64::INFINITY, f64::min);
-    let hi = fits
-        .iter()
-        .map(|(_, r)| r.ofv)
-        .fold(f64::NEG_INFINITY, f64::max);
-    eprintln!(
-        "{label}: spread = {:.3e}, worst − nested = {:.3e}",
-        hi - lo,
-        hi - nested.ofv
-    );
-    assert!(
-        hi - lo <= spread_tol,
-        "{label}: starts disagree by {}",
-        hi - lo
-    );
+    let lo = fits.iter().map(|(_, r)| r.ofv).fold(f64::INFINITY, f64::min);
+    let hi = fits.iter().map(|(_, r)| r.ofv).fold(f64::NEG_INFINITY, f64::max);
+    eprintln!("{label}: spread = {:.3e}, worst − nested = {:.3e}", hi - lo, hi - nested.ofv);
+    assert!(hi - lo <= spread_tol, "{label}: starts disagree by {}", hi - lo);
     assert!(
         hi <= nested.ofv + nested_tol,
         "{label}: worst start {hi} is above the nested optimum {}",
@@ -169,18 +136,10 @@ const MBMA_NESTED_TOL: f64 = 0.0;
     ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn mbma_placebo_car1_reaches_one_optimum_from_every_start() {
-    let fits: Vec<(f64, FitResult)> = [0.01, 0.3, 0.6]
-        .into_iter()
-        .map(|rho0| (rho0, run(&mbma_car1(rho0), MBMA_DATA)))
-        .collect();
+    let fits: Vec<(f64, FitResult)> =
+        [0.01, 0.3, 0.6].into_iter().map(|rho0| (rho0, run(&mbma_car1(rho0), MBMA_DATA))).collect();
     let nested = run(MBMA_MODEL, MBMA_DATA);
-    check(
-        "mbma_placebo + car1",
-        &fits,
-        &nested,
-        MBMA_SPREAD_TOL,
-        MBMA_NESTED_TOL,
-    );
+    check("mbma_placebo + car1", &fits, &nested, MBMA_SPREAD_TOL, MBMA_NESTED_TOL);
 }
 
 /// Linux aarch64 and x86_64 (`slow-tests.yml` run 39152008553), the same in every printed
@@ -199,16 +158,8 @@ const EXACT3_NESTED_TOL: f64 = 0.0;
     ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
 )]
 fn nested_exact3_ar1_reaches_one_optimum_from_every_start() {
-    let fits: Vec<(f64, FitResult)> = [-0.3, 0.5]
-        .into_iter()
-        .map(|rho0| (rho0, run(&exact3_ar1(rho0), EXACT3_DATA)))
-        .collect();
+    let fits: Vec<(f64, FitResult)> =
+        [-0.3, 0.5].into_iter().map(|rho0| (rho0, run(&exact3_ar1(rho0), EXACT3_DATA))).collect();
     let nested = run(EXACT3_MODEL, EXACT3_DATA);
-    check(
-        "exact3 + ar1",
-        &fits,
-        &nested,
-        EXACT3_SPREAD_TOL,
-        EXACT3_NESTED_TOL,
-    );
+    check("exact3 + ar1", &fits, &nested, EXACT3_SPREAD_TOL, EXACT3_NESTED_TOL);
 }

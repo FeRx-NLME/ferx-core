@@ -34,24 +34,8 @@ fn km_matches_survfit_tie_convention_closed_form() {
     let c = m2();
     let want_t = [1.0, 2.0, 3.0, 5.0, 7.0, 8.0, 10.0];
     let want_n = [10, 9, 8, 6, 4, 3, 1];
-    let want_s = [
-        1.0,
-        8.0 / 9.0,
-        2.0 / 3.0,
-        5.0 / 9.0,
-        5.0 / 12.0,
-        5.0 / 18.0,
-        5.0 / 18.0,
-    ];
-    let want_h = [
-        0.0,
-        1.0 / 9.0,
-        13.0 / 36.0,
-        19.0 / 36.0,
-        7.0 / 9.0,
-        10.0 / 9.0,
-        10.0 / 9.0,
-    ];
+    let want_s = [1.0, 8.0 / 9.0, 2.0 / 3.0, 5.0 / 9.0, 5.0 / 12.0, 5.0 / 18.0, 5.0 / 18.0];
+    let want_h = [0.0, 1.0 / 9.0, 13.0 / 36.0, 19.0 / 36.0, 7.0 / 9.0, 10.0 / 9.0, 10.0 / 9.0];
     assert_eq!(c.time, want_t);
     assert_eq!(c.n_risk, want_n, "risk set: censorings at t stay in it");
     for j in 0..want_t.len() {
@@ -83,16 +67,20 @@ fn km_groups_ties_into_one_row() {
     assert_eq!(c.n_censor, [1, 0, 0, 1, 0, 1, 1]);
 }
 
-/// T3. Past the last time a curve is undefined unless it has reached zero. Always
-/// carrying the last value forward breaks the first assertion; always returning
-/// `None` breaks the second.
+/// T3. Past the last time a curve is undefined, also when it has reached zero
+/// (#2930), and the last time itself is defined. Returning `Some(0.0)` past the end
+/// of a curve that reached zero (the rule before #2930) breaks the `hit_zero.at(3.0)`
+/// assertion; carrying the last value forward breaks `censored_last.at(4.0)`; `>=`
+/// for `>` breaks both last-time assertions.
 #[test]
-fn km_at_past_last_time_is_none_unless_curve_reached_zero() {
+fn km_at_past_last_time_is_none() {
     let censored_last = kaplan_meier(&[1.0, 2.0, 3.0], &[true, true, false]).unwrap();
     assert_eq!(censored_last.at(4.0), None);
     assert!((censored_last.at(3.0).unwrap() - 1.0 / 3.0).abs() < 1e-15);
     let hit_zero = kaplan_meier(&[1.0, 2.0], &[true, true]).unwrap();
-    assert_eq!(hit_zero.at(3.0), Some(0.0));
+    assert_eq!(hit_zero.surv.last(), Some(&0.0), "fixture must reach zero");
+    assert_eq!(hit_zero.at(2.0), Some(0.0), "the last time is defined");
+    assert_eq!(hit_zero.at(3.0), None, "past the last time, even at zero");
     // Before the first time, and between steps.
     assert_eq!(hit_zero.at(0.5), Some(1.0));
     assert_eq!(hit_zero.at(1.5), Some(0.5));
@@ -105,22 +93,13 @@ fn km_at_past_last_time_is_none_unless_curve_reached_zero() {
 fn km_refuses_bad_input() {
     assert_eq!(
         kaplan_meier(&[1.0], &[true, false]),
-        Err(KmInputError::LengthMismatch {
-            times: 1,
-            events: 2
-        })
+        Err(KmInputError::LengthMismatch { times: 1, events: 2 })
     );
     let err = kaplan_meier(&[1.0, f64::NAN], &[true, false]).unwrap_err();
     assert!(matches!(err, KmInputError::BadTime { index: 1, .. }));
     assert!(err.to_string().contains("index 1"), "{err}");
     let err = kaplan_meier(&[-1.0], &[true]).unwrap_err();
-    assert_eq!(
-        err,
-        KmInputError::BadTime {
-            index: 0,
-            value: -1.0
-        }
-    );
+    assert_eq!(err, KmInputError::BadTime { index: 0, value: -1.0 });
     assert!(kaplan_meier(&[], &[]).unwrap().time.is_empty());
 }
 
@@ -137,6 +116,27 @@ fn band_uses_only_curves_defined_at_the_grid_time() {
     let mut v: Vec<f64> = (0..22).map(|i| (i + 1) as f64 / 30.0).collect();
     v.sort_by(f64::total_cmp);
     assert_eq!(band.lo[1], Some(quantile_sorted(&v, 0.05)));
+    assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
+    assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
+}
+
+/// A replicate whose curve reached 0 before the grid time is past its last time
+/// there, so it is left out like any other (#2930): 22 curves are followed to 10,
+/// 3 reach 0 at 2. Counting the 3 as 0 (the rule before #2930) gives `n_used` 25 and
+/// pulls `lo` to 0, a point mass the observed curve can then never fall below.
+#[test]
+fn band_leaves_out_a_replicate_that_reached_zero_before_the_grid_time() {
+    let mut curves: Vec<KmCurve> = (0..22).map(|i| flat((i + 1) as f64 / 30.0, 10.0)).collect();
+    let zero = kaplan_meier(&[1.0, 2.0], &[true, true]).unwrap();
+    assert_eq!(zero.surv.last(), Some(&0.0), "fixture must reach zero");
+    curves.extend((0..3).map(|_| zero.clone()));
+    let band = vpc_band(&curves, &[1.0, 5.0], [0.05, 0.5, 0.95]).unwrap();
+    assert_eq!(band.n_used, [25, 22], "the 3 zero curves count at 1, not at 5");
+    let mut v: Vec<f64> = (0..22).map(|i| (i + 1) as f64 / 30.0).collect();
+    v.sort_by(f64::total_cmp);
+    let lo = band.lo[1].expect("22 curves resolve the band");
+    assert_eq!(lo, quantile_sorted(&v, 0.05));
+    assert!(lo > 0.0, "lo = {lo}: the zero curves must not reach the quantile");
     assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
     assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
 }
@@ -168,22 +168,44 @@ fn min_curves_for_reads_the_smallest_tail() {
     assert_eq!(min_curves_for([0.2, 0.5, 0.95]), 19);
 }
 
+/// The per-probability floor that `min_curves_for` maximises over (#946 PR2): the median
+/// needs one value, 5 % and 95 % need 19, and the two tails of one `p` agree.
+///
+/// Mutations: `max` replaced by `min` in `min_curves_for` (the test above reddens with 1);
+/// the tail taken as `p` instead of `min(p, 1 − p)` (95 % gives 0).
+#[test]
+fn min_n_for_prob_reads_its_own_tail() {
+    assert_eq!(min_n_for_prob(0.5), 1);
+    assert_eq!(min_n_for_prob(0.05), 19);
+    assert_eq!(min_n_for_prob(0.95), 19);
+    assert_eq!(min_n_for_prob(0.25), 3);
+}
+
+/// Each quantile is gated by its own count, and a non-finite value is propagated into every
+/// quantile that is read rather than sorted past (`total_cmp` puts `NaN` last, so without
+/// the guard the lower quantiles would read the finite values only).
+///
+/// Mutations: dropping the `finite` guard (the 5 % and 50 % levels come back finite); one
+/// gate for all three levels.
+#[test]
+fn gated_quantiles_gates_each_level_and_propagates_nan() {
+    let mut v = vec![3.0, 1.0, 2.0];
+    assert_eq!(gated_quantiles(&mut v, [0.05, 0.5, 0.95], [19, 1, 19]), [None, Some(2.0), None]);
+    let mut v = vec![1.0, 2.0, 3.0, f64::NAN];
+    let q = gated_quantiles(&mut v, [0.05, 0.5, 0.95], [1, 1, 1]);
+    assert!(q.iter().all(|x| x.expect("gate passed").is_nan()), "{q:?}");
+}
+
 /// T6. The band is R's type-7 quantile. Against R 4.6 `quantile()`:
 /// `c(.1,.4,.2,.9,.5)` at `.25/.5/.75` is `.20/.40/.50` (type 6: `.15/.40/.70`), and
 /// `(1:20)/21` at `.05/.5/.95` is `0.0928571…/.5/0.9071428…` (type 6: `.05/.5/.95`).
 /// At 5 curves the 5 %/95 % band is below its floor, so it is `None`.
 #[test]
 fn band_is_r_type7_quantile() {
-    let five: Vec<KmCurve> = [0.1, 0.4, 0.2, 0.9, 0.5]
-        .iter()
-        .map(|&s| flat(s, 10.0))
-        .collect();
+    let five: Vec<KmCurve> = [0.1, 0.4, 0.2, 0.9, 0.5].iter().map(|&s| flat(s, 10.0)).collect();
     let b = vpc_band(&five, &[1.0], [0.25, 0.5, 0.75]).unwrap();
     let near = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-15;
-    assert!(
-        near(b.lo[0], 0.2) && near(b.med[0], 0.4) && near(b.hi[0], 0.5),
-        "{b:?}"
-    );
+    assert!(near(b.lo[0], 0.2) && near(b.med[0], 0.4) && near(b.hi[0], 0.5), "{b:?}");
     let b = vpc_band(&five, &[1.0], [0.05, 0.5, 0.95]).unwrap();
     assert_eq!(b.lo[0], None);
 
@@ -197,12 +219,7 @@ fn band_is_r_type7_quantile() {
 /// Probabilities outside (0, 1) or not increasing are refused, naming the values.
 #[test]
 fn band_refuses_bad_probs() {
-    for probs in [
-        [0.0, 0.5, 0.95],
-        [0.05, 0.5, 1.0],
-        [0.5, 0.5, 0.95],
-        [0.95, 0.5, 0.05],
-    ] {
+    for probs in [[0.0, 0.5, 0.95], [0.05, 0.5, 1.0], [0.5, 0.5, 0.95], [0.95, 0.5, 0.05]] {
         let err = vpc_band(&[], &[1.0], probs).unwrap_err();
         assert_eq!(err, KmInputError::BadProbs { probs });
         assert!(err.to_string().contains(&format!("{probs:?}")), "{err}");
@@ -241,12 +258,7 @@ fn r2() -> Vec<(f64, &'static [f64])> {
 /// An MCF that sits at `v` from time 0 to `end`, so [`McfCurve::at`] is `Some(v)` on
 /// `[0, end]` and `None` after it.
 fn flat_mcf(v: f64, end: f64) -> McfCurve {
-    McfCurve {
-        time: vec![0.0, end],
-        n_risk: vec![1, 1],
-        n_event: vec![1, 0],
-        mcf: vec![v, v],
-    }
+    McfCurve { time: vec![0.0, end], n_risk: vec![1, 1], n_event: vec![1, 0], mcf: vec![v, v] }
 }
 
 /// PR2 T1. R1's rows against exact fractions computed outside the engine (Python
@@ -332,22 +344,13 @@ fn mcf_at_is_zero_before_the_first_row_and_none_past_the_last_follow_up_end() {
 #[test]
 fn mcf_refuses_bad_input() {
     let err = mean_cumulative(&[1.0, -2.0], &[5.0]).unwrap_err();
-    assert_eq!(
-        err,
-        McfInputError::BadEventTime {
-            index: 1,
-            value: -2.0
-        }
-    );
+    assert_eq!(err, McfInputError::BadEventTime { index: 1, value: -2.0 });
     assert_eq!(
         err.to_string(),
         "mean_cumulative: event time -2 at index 1 is not a finite, non-negative number"
     );
     let err = mean_cumulative(&[1.0], &[5.0, f64::INFINITY]).unwrap_err();
-    assert!(matches!(
-        err,
-        McfInputError::BadFollowUpEnd { index: 1, .. }
-    ));
+    assert!(matches!(err, McfInputError::BadFollowUpEnd { index: 1, .. }));
     assert_eq!(
         err.to_string(),
         "mean_cumulative: follow-up end inf at index 1 is not a finite, non-negative number"
@@ -379,9 +382,7 @@ fn mcf_refuses_bad_input() {
 #[test]
 fn mcf_band_uses_only_defined_curves_and_keeps_the_floor() {
     let probs = [0.05, 0.5, 0.95];
-    let mut curves: Vec<McfCurve> = (0..22)
-        .map(|i| flat_mcf((i + 1) as f64 / 4.0, 10.0))
-        .collect();
+    let mut curves: Vec<McfCurve> = (0..22).map(|i| flat_mcf((i + 1) as f64 / 4.0, 10.0)).collect();
     curves.extend((0..3).map(|_| flat_mcf(0.9, 2.0)));
     let band = vpc_band_mcf(&curves, &[1.0, 5.0], probs).unwrap();
     assert_eq!(band.n_used, [25, 22]);
@@ -390,9 +391,7 @@ fn mcf_band_uses_only_defined_curves_and_keeps_the_floor() {
     assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
     assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
 
-    let mut curves: Vec<McfCurve> = (0..18)
-        .map(|i| flat_mcf((i + 1) as f64 / 4.0, 10.0))
-        .collect();
+    let mut curves: Vec<McfCurve> = (0..18).map(|i| flat_mcf((i + 1) as f64 / 4.0, 10.0)).collect();
     curves.extend((0..7).map(|_| flat_mcf(0.5, 2.0)));
     let band = vpc_band_mcf(&curves, &[1.0, 5.0], probs).unwrap();
     assert_eq!(band.n_used, [25, 18]);
@@ -402,9 +401,7 @@ fn mcf_band_uses_only_defined_curves_and_keeps_the_floor() {
     }
     assert_eq!(
         vpc_band_mcf(&curves, &[1.0], [0.5, 0.5, 0.95]),
-        Err(KmInputError::BadProbs {
-            probs: [0.5, 0.5, 0.95]
-        })
+        Err(KmInputError::BadProbs { probs: [0.5, 0.5, 0.95] })
     );
 }
 
@@ -442,11 +439,7 @@ fn kmmc_matches_exact_risk_set_means_and_km_risk_sets() {
         assert!(got.is_finite(), "mean at t = {} is {got}", c.time[j]);
         assert!(w.is_finite());
         worst = worst.max((got - w).abs());
-        assert!(
-            (got - w).abs() < 4e-15,
-            "KMMC({}) = {got} != {w}",
-            c.time[j]
-        );
+        assert!((got - w).abs() < 4e-15, "KMMC({}) = {got} != {w}", c.time[j]);
     }
     eprintln!("K1 worst |mean - exact| = {worst:.3e}");
     // The fixture is already in time order, so the sorted order is the identity and a
@@ -459,11 +452,7 @@ fn kmmc_matches_exact_risk_set_means_and_km_risk_sets() {
     let shuffled = kaplan_meier_mean_covariate(&t, &ev, &z).unwrap();
     assert_eq!(shuffled.n_risk, c.n_risk);
     for (j, (&got, &w)) in shuffled.mean.iter().zip(&want).enumerate() {
-        assert!(
-            (got - w).abs() < 4e-15,
-            "shuffled input: KMMC({}) = {got} != {w}",
-            c.time[j]
-        );
+        assert!((got - w).abs() < 4e-15, "shuffled input: KMMC({}) = {got} != {w}", c.time[j]);
     }
 }
 
@@ -506,9 +495,7 @@ fn flat_kmmc(v: f64, n_end: usize) -> KmmcCurve {
 #[test]
 fn kmmc_band_floors_each_curve_on_its_own() {
     let probs = [0.05, 0.5, 0.95];
-    let mut curves: Vec<KmmcCurve> = (0..22)
-        .map(|i| flat_kmmc(1.0 + i as f64 / 4.0, 15))
-        .collect();
+    let mut curves: Vec<KmmcCurve> = (0..22).map(|i| flat_kmmc(1.0 + i as f64 / 4.0, 15)).collect();
     curves.extend((0..3).map(|_| flat_kmmc(0.9, 3)));
     let band = vpc_band_kmmc(&curves, &[0.0, 5.0], probs, 10).unwrap();
     assert_eq!(band.n_used, [25, 22]);
@@ -518,9 +505,7 @@ fn kmmc_band_floors_each_curve_on_its_own() {
     assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
     assert_eq!(
         vpc_band_kmmc(&curves, &[1.0], [0.5, 0.5, 0.95], 10),
-        Err(KmInputError::BadProbs {
-            probs: [0.5, 0.5, 0.95]
-        })
+        Err(KmInputError::BadProbs { probs: [0.5, 0.5, 0.95] })
     );
 }
 
@@ -538,49 +523,23 @@ fn kmmc_refuses_bad_values_and_lengths() {
     );
     assert_eq!(
         kaplan_meier_mean_covariate(&t, &e, &[1.0, f64::INFINITY, 2.0]),
-        Err(KmInputError::BadValue {
-            index: 1,
-            value: f64::INFINITY
-        })
+        Err(KmInputError::BadValue { index: 1, value: f64::INFINITY })
     );
     assert_eq!(
         kaplan_meier_mean_covariate(&t, &e, &[1.0, 2.0]),
-        Err(KmInputError::ValueLengthMismatch {
-            times: 3,
-            values: 2
-        })
+        Err(KmInputError::ValueLengthMismatch { times: 3, values: 2 })
     );
     assert_eq!(
         kaplan_meier_mean_covariate(&t, &e[..2], &[1.0, 2.0, 3.0]),
-        Err(KmInputError::LengthMismatch {
-            times: 3,
-            events: 2
-        })
+        Err(KmInputError::LengthMismatch { times: 3, events: 2 })
     );
     assert_eq!(
         kaplan_meier_mean_covariate(&[1.0, -1.0], &[true, true], &[1.0, 2.0]),
-        Err(KmInputError::BadTime {
-            index: 1,
-            value: -1.0
-        })
+        Err(KmInputError::BadTime { index: 1, value: -1.0 })
     );
-    let msg = KmInputError::BadValue {
-        index: 1,
-        value: f64::NAN,
-    }
-    .to_string();
-    assert!(
-        msg.contains("kaplan_meier_mean_covariate") && msg.contains("index 1"),
-        "{msg}"
-    );
-    let msg = KmInputError::ValueLengthMismatch {
-        times: 3,
-        values: 2,
-    }
-    .to_string();
+    let msg = KmInputError::BadValue { index: 1, value: f64::NAN }.to_string();
+    assert!(msg.contains("kaplan_meier_mean_covariate") && msg.contains("index 1"), "{msg}");
+    let msg = KmInputError::ValueLengthMismatch { times: 3, values: 2 }.to_string();
     assert!(msg.contains("3 times but 2 covariate values"), "{msg}");
-    assert!(kaplan_meier_mean_covariate(&[], &[], &[])
-        .unwrap()
-        .time
-        .is_empty());
+    assert!(kaplan_meier_mean_covariate(&[], &[], &[]).unwrap().time.is_empty());
 }

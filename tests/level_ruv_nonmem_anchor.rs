@@ -75,12 +75,8 @@ fn phi() -> Vec<[f64; 2]> {
         .lines()
         .skip(2)
         .map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .skip(2)
-                .take(2)
-                .map(|v| v.parse().unwrap())
-                .collect();
+            let f: Vec<f64> =
+                l.split_whitespace().skip(2).take(2).map(|v| v.parse().unwrap()).collect();
             [f[0], f[1]]
         })
         .collect()
@@ -92,29 +88,21 @@ fn ipred() -> Vec<f64> {
     let mut lines = text.lines().skip(1);
     let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
     let i = header.iter().position(|h| *h == "IPRED").unwrap();
-    lines
-        .map(|l| l.split_whitespace().nth(i).unwrap().parse().unwrap())
-        .collect()
+    lines.map(|l| l.split_whitespace().nth(i).unwrap().parse().unwrap()).collect()
 }
 
 #[test]
 fn a_residual_level_block_next_to_iiv_on_ruv_matches_nonmem() {
     let est = ext();
     let prep = ferx_core::prepare_run(
-        root()
-            .join("nonmem_anchor/level_ruv_fit.ferx")
-            .to_str()
-            .unwrap(),
+        root().join("nonmem_anchor/level_ruv_fit.ferx").to_str().unwrap(),
         Some(root().join("nonmem_anchor/level_ruv.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{e}"));
 
     // The binder's verdict is part of the anchor: within each study, and ferx's
     // θ are NONMEM's in order.
-    assert_eq!(
-        prep.parsed.bindings.levels["ERRSCALE"].contrast,
-        LevelContrast::SumToZeroWithin
-    );
+    assert_eq!(prep.parsed.bindings.levels["ERRSCALE"].contrast, LevelContrast::SumToZeroWithin);
     assert_eq!(
         prep.parsed.model.theta_names,
         [
@@ -155,12 +143,7 @@ fn a_residual_level_block_next_to_iiv_on_ruv_matches_nonmem() {
     assert_eq!(etas.len(), 4);
     assert_eq!(fit.subjects.len(), 4);
     let d_ofv = (fit.ofv - est["OBJ"]).abs();
-    assert!(
-        d_ofv.is_finite(),
-        "OFV: ferx {} NONMEM {}",
-        fit.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv.is_finite(), "OFV: ferx {} NONMEM {}", fit.ofv, est["OBJ"]);
     let mut d_eta = 0.0f64;
     for (s, want) in fit.subjects.iter().zip(&etas) {
         for (k, w) in want.iter().enumerate() {
@@ -169,11 +152,7 @@ fn a_residual_level_block_next_to_iiv_on_ruv_matches_nonmem() {
             d_eta = d_eta.max(d);
         }
     }
-    let got: Vec<f64> = fit
-        .subjects
-        .iter()
-        .flat_map(|s| s.ipred.iter().copied())
-        .collect();
+    let got: Vec<f64> = fit.subjects.iter().flat_map(|s| s.ipred.iter().copied()).collect();
     assert_eq!(got.len(), rows.len(), "records");
     let mut d_ipred = 0.0f64;
     for (g, w) in got.iter().zip(&rows) {

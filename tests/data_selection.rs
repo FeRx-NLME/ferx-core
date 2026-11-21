@@ -43,25 +43,17 @@ const MODEL_SRC: &str = r"
 
 #[test]
 fn parser_populates_ignore_exprs() {
-    let src = format!(
-        "{}\n[data_selection]\n  ignore = DV < 1.0\n  ignore = EVID != 0\n",
-        MODEL_SRC
-    );
+    let src =
+        format!("{}\n[data_selection]\n  ignore = DV < 1.0\n  ignore = EVID != 0\n", MODEL_SRC);
     let parsed = parse_full_model(&src).expect("parse ok");
-    assert_eq!(
-        parsed.fit_options.ignore_exprs,
-        vec!["DV < 1.0", "EVID != 0"]
-    );
+    assert_eq!(parsed.fit_options.ignore_exprs, vec!["DV < 1.0", "EVID != 0"]);
     assert!(parsed.fit_options.accept_exprs.is_empty());
 }
 
 #[test]
 fn parser_accepts_c_eq_c_and_bare_shorthand() {
     // NONMEM `IGNORE(C.EQ.C)` spellings must parse at the block level.
-    let src = format!(
-        "{}\n[data_selection]\n  ignore = C == C\n  ignore = C\n",
-        MODEL_SRC
-    );
+    let src = format!("{}\n[data_selection]\n  ignore = C == C\n  ignore = C\n", MODEL_SRC);
     let parsed = parse_full_model(&src).expect("parse ok");
     assert_eq!(parsed.fit_options.ignore_exprs, vec!["C == C", "C"]);
 }
@@ -76,20 +68,15 @@ fn parser_populates_accept_exprs() {
 
 #[test]
 fn parser_populates_ignore_subjects() {
-    let src = format!(
-        "{}\n[data_selection]\n  ignore_subjects = [1, 3]\n",
-        MODEL_SRC
-    );
+    let src = format!("{}\n[data_selection]\n  ignore_subjects = [1, 3]\n", MODEL_SRC);
     let parsed = parse_full_model(&src).expect("parse ok");
     assert_eq!(parsed.fit_options.ignore_subjects, vec!["1", "3"]);
 }
 
 #[test]
 fn parser_deduplicates_identical_exprs() {
-    let src = format!(
-        "{}\n[data_selection]\n  ignore = DV < 1.0\n  ignore = DV < 1.0\n",
-        MODEL_SRC
-    );
+    let src =
+        format!("{}\n[data_selection]\n  ignore = DV < 1.0\n  ignore = DV < 1.0\n", MODEL_SRC);
     let parsed = parse_full_model(&src).expect("parse ok");
     // Second identical line must be silently deduplicated.
     assert_eq!(parsed.fit_options.ignore_exprs, vec!["DV < 1.0"]);
@@ -97,23 +84,14 @@ fn parser_deduplicates_identical_exprs() {
 
 #[test]
 fn parser_rejects_pipe_or() {
-    let src = format!(
-        "{}\n[data_selection]\n  ignore = DV < 1.0 || EVID == 0\n",
-        MODEL_SRC
-    );
-    assert!(
-        parse_full_model(&src).is_err(),
-        "expected parse error for ||"
-    );
+    let src = format!("{}\n[data_selection]\n  ignore = DV < 1.0 || EVID == 0\n", MODEL_SRC);
+    assert!(parse_full_model(&src).is_err(), "expected parse error for ||");
 }
 
 #[test]
 fn parser_rejects_unknown_key() {
     let src = format!("{}\n[data_selection]\n  bad_key = something\n", MODEL_SRC);
-    assert!(
-        parse_full_model(&src).is_err(),
-        "expected parse error for unknown key"
-    );
+    assert!(parse_full_model(&src).is_err(), "expected parse error for unknown key");
 }
 
 // ─── SelectionFilter unit tests ──────────────────────────────────────────────
@@ -217,19 +195,13 @@ fn read_filtered_population_excludes_low_dv_obs() {
     let excl = filtered.exclusions.as_ref().expect("exclusions present");
     // one_cpt_iv.csv has 100 non-header rows.
     assert_eq!(excl.n_records_total, 100);
-    assert!(
-        excl.n_obs_excluded > 0,
-        "at least one obs row with DV < 1.0 must be excluded"
-    );
+    assert!(excl.n_obs_excluded > 0, "at least one obs row with DV < 1.0 must be excluded");
     // Dose rows carry DV='.' (missing → NaN), so `DV < 1.0` must NOT catch them.
     assert_eq!(
         excl.n_dose_excluded, 0,
         "dose rows have missing DV and must not match a DV comparison"
     );
-    assert!(
-        filtered.n_obs() < n_obs_all,
-        "filtered population has fewer observations"
-    );
+    assert!(filtered.n_obs() < n_obs_all, "filtered population has fewer observations");
     assert!(
         excl.fired_ignore.iter().any(|s| s.contains("DV < 1.0")),
         "fired_ignore must record the matching clause"
@@ -265,10 +237,7 @@ fn ignore_c_eq_c_drops_comment_rows() {
             "clause `{clause}` must drop exactly the C-labelled comment row"
         );
         let excl = filtered.exclusions.as_ref().expect("exclusions present");
-        assert_eq!(
-            excl.n_obs_excluded, 1,
-            "clause `{clause}`: one obs excluded"
-        );
+        assert_eq!(excl.n_obs_excluded, 1, "clause `{clause}`: one obs excluded");
     }
 
     let _ = std::fs::remove_file(&path);
@@ -318,8 +287,5 @@ fn fit_result_carries_exclusions() {
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit ok");
     let excl = result.exclusions.as_ref().expect("exclusions on FitResult");
-    assert!(
-        excl.n_obs_excluded > 0,
-        "fit result carries positive obs exclusion count"
-    );
+    assert!(excl.n_obs_excluded > 0, "fit result carries positive obs exclusion count");
 }

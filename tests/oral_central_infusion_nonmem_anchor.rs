@@ -62,11 +62,7 @@ fn pop_of(csv: &str) -> Population {
 /// reproduce `PRED` at `η = 0`.
 fn oral_model(cpt: usize, tvf: f64) -> String {
     let (structural, extra_params, extra_indiv) = if cpt == 1 {
-        (
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)".to_string(),
-            String::new(),
-            String::new(),
-        )
+        ("pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)".to_string(), String::new(), String::new())
     } else {
         (
             "pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA, f=F)".to_string(),
@@ -186,78 +182,38 @@ fn assert_close(got: &[f64], nonmem: &[f64], tol: f64, case: &str) {
 fn assert_both_paths_match(src: &str, rate: f64, nonmem: &[f64], case: &str) {
     let walk = walk_preds(src, rate);
     let plain = plain_preds(src, rate);
-    assert_close(
-        &walk,
-        nonmem,
-        NONMEM_TOL,
-        &format!("{case} [event-driven walk]"),
-    );
-    assert_close(
-        &plain,
-        nonmem,
-        NONMEM_TOL,
-        &format!("{case} [default dispatch]"),
-    );
+    assert_close(&walk, nonmem, NONMEM_TOL, &format!("{case} [event-driven walk]"));
+    assert_close(&plain, nonmem, NONMEM_TOL, &format!("{case} [default dispatch]"));
     assert_close(&plain, &walk, NONMEM_TOL, &format!("{case} [paths agree]"));
 }
 
 // ── NONMEM PRED (nonmem_anchor/results/oral_central_inf_*.tab) ────────────────
 
 /// `oral_central_inf_advan2_f1.tab` — 1-cpt oral, `CMT=2` infusion, `F=1`.
-const ADVAN2_F1: [f64; 5] = [
-    4.7581290982e-01,
-    1.2959088966e+00,
-    1.3495955849e+00,
-    9.0466097461e-01,
-    4.9648846959e-01,
-];
+const ADVAN2_F1: [f64; 5] =
+    [4.7581290982e-01, 1.2959088966e+00, 1.3495955849e+00, 9.0466097461e-01, 4.9648846959e-01];
 /// `oral_central_inf_advan2_f06.tab` — 1-cpt oral, `CMT=2` infusion, `F2=0.6`.
-const ADVAN2_F06: [f64; 5] = [
-    4.7581290982e-01,
-    1.0047315645e+00,
-    7.4432344989e-01,
-    4.9893492919e-01,
-    2.7382129479e-01,
-];
+const ADVAN2_F06: [f64; 5] =
+    [4.7581290982e-01, 1.0047315645e+00, 7.4432344989e-01, 4.9893492919e-01, 2.7382129479e-01];
 /// `oral_central_inf_advan4_f1.tab` — 2-cpt oral, `CMT=2` infusion, `F=1`.
-const ADVAN4_F1: [f64; 5] = [
-    4.6222223658e-01,
-    1.1951957279e+00,
-    1.0956488990e+00,
-    6.2303307734e-01,
-    3.1054165440e-01,
-];
+const ADVAN4_F1: [f64; 5] =
+    [4.6222223658e-01, 1.1951957279e+00, 1.0956488990e+00, 6.2303307734e-01, 3.1054165440e-01];
 /// `oral_central_inf_advan4_f06.tab` — 2-cpt oral, `CMT=2` infusion, `F2=0.6`.
-const ADVAN4_F06: [f64; 5] = [
-    4.6222223658e-01,
-    9.0910738405e-01,
-    5.7799283210e-01,
-    3.3374887600e-01,
-    1.7144103343e-01,
-];
+const ADVAN4_F06: [f64; 5] =
+    [4.6222223658e-01, 9.0910738405e-01, 5.7799283210e-01, 3.3374887600e-01, 1.7144103343e-01];
 
 // ── 1. The pure #350 case: 1-cpt oral central infusion, F=1, direct anchor ────
 
 #[test]
 fn one_cpt_oral_central_infusion_f1_matches_nonmem() {
-    assert_both_paths_match(
-        &oral_model(1, 1.0),
-        25.0,
-        &ADVAN2_F1,
-        "ADVAN2 CMT=2 infusion F=1",
-    );
+    assert_both_paths_match(&oral_model(1, 1.0), 25.0, &ADVAN2_F1, "ADVAN2 CMT=2 infusion F=1");
 }
 
 // ── 2. F≠1 on the depot-bypass central route (#327/#349/#419) ─────────────────
 
 #[test]
 fn one_cpt_oral_central_infusion_f06_matches_nonmem() {
-    assert_both_paths_match(
-        &oral_model(1, 0.6),
-        25.0,
-        &ADVAN2_F06,
-        "ADVAN2 CMT=2 infusion F=0.6",
-    );
+    assert_both_paths_match(&oral_model(1, 0.6), 25.0, &ADVAN2_F06, "ADVAN2 CMT=2 infusion F=0.6");
 }
 
 // ── 3-4. 2-cpt oral central infusion — closes the gap the dose_cmt anchors left
@@ -265,22 +221,12 @@ fn one_cpt_oral_central_infusion_f06_matches_nonmem() {
 
 #[test]
 fn two_cpt_oral_central_infusion_f1_matches_nonmem() {
-    assert_both_paths_match(
-        &oral_model(2, 1.0),
-        25.0,
-        &ADVAN4_F1,
-        "ADVAN4 CMT=2 infusion F=1",
-    );
+    assert_both_paths_match(&oral_model(2, 1.0), 25.0, &ADVAN4_F1, "ADVAN4 CMT=2 infusion F=1");
 }
 
 #[test]
 fn two_cpt_oral_central_infusion_f06_matches_nonmem() {
-    assert_both_paths_match(
-        &oral_model(2, 0.6),
-        25.0,
-        &ADVAN4_F06,
-        "ADVAN4 CMT=2 infusion F=0.6",
-    );
+    assert_both_paths_match(&oral_model(2, 0.6), 25.0, &ADVAN4_F06, "ADVAN4 CMT=2 infusion F=0.6");
 }
 
 // ── 5. License-free oracle: ferx (and the committed NONMEM digits) reproduce the
@@ -315,12 +261,7 @@ fn one_cpt_central_infusion_matches_closed_form_and_nonmem() {
         // gap is ~1.6e-11 — both sides are pure 1-cpt closed forms with no
         // root-finder — so this bound is the reference's last-printed-digit
         // resolution, not slack that could hide a real divergence.
-        assert_close(
-            nonmem,
-            &oracle,
-            NONMEM_TOL,
-            &format!("NONMEM vs closed form F={tvf}"),
-        );
+        assert_close(nonmem, &oracle, NONMEM_TOL, &format!("NONMEM vs closed form F={tvf}"));
         // ferx reproduces it too, on both analytical paths.
         assert_both_paths_match(
             &oral_model(1, tvf),

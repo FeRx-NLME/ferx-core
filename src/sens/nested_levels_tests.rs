@@ -75,10 +75,7 @@ fn fixture(walk: Walk) -> (CompiledModel, Subject) {
         }
     };
     assert!(engine, "{walk:?}: the fixture is not on its engine");
-    assert!(
-        crate::sens::ode_provider::adjoint::model_in_scope(&model),
-        "{walk:?}"
-    );
+    assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model), "{walk:?}");
     (model, pop.subjects.remove(0))
 }
 
@@ -99,13 +96,7 @@ struct Fd<'a> {
 
 impl Fd<'_> {
     fn pred(&self, b: &[f64], theta: &[f64]) -> Vec<f64> {
-        predict_iov(
-            self.model,
-            self.subject,
-            theta,
-            &b[..self.model.n_eta],
-            &self.layout.expand(b),
-        )
+        predict_iov(self.model, self.subject, theta, &b[..self.model.n_eta], &self.layout.expand(b))
     }
 
     fn shifted(v: &[f64], moves: &[(usize, f64)]) -> Vec<f64> {
@@ -144,21 +135,13 @@ fn assert_non_degenerate(walk: Walk, model: &CompiledModel, layout: &NestedLayou
     let scale = d.iter().flatten().fold(0.0_f64, |m, v| m.max(v.abs()));
     for i in 0..layout.n_compact() {
         let live = (0..n_obs).any(|j| d[j][i].abs() > 1e-4 * scale);
-        assert!(
-            live,
-            "{walk:?}: {} carries no derivative",
-            fx::axis_label(model, layout, i)
-        );
+        assert!(live, "{walk:?}: {} carries no derivative", fx::axis_label(model, layout, i));
     }
     let k_a = model.kappa_names.iter().position(|n| n == "K_A").unwrap();
     let k_arm = model.kappa_names.iter().position(|n| n == "K_ARM").unwrap();
     // Observations 0..3 are arm 0 (study 1, arm 1), 3..6 arm 1 (study 1, arm 2).
     let study1 = layout.compact_index(0, k_a);
-    assert_eq!(
-        study1,
-        layout.compact_index(1, k_a),
-        "two arms, one study axis"
-    );
+    assert_eq!(study1, layout.compact_index(1, k_a), "two arms, one study axis");
     assert!(d[0][study1] != 0.0 && d[4][study1] != 0.0, "{walk:?}");
     if matches!(walk, Walk::Algebraic) {
         return;
@@ -168,14 +151,8 @@ fn assert_non_degenerate(walk: Walk, model: &CompiledModel, layout: &NestedLayou
     // its drug was dosed in study 1 arm 2.
     let arm0 = layout.compact_index(0, k_arm);
     let arm1 = layout.compact_index(1, k_arm);
-    assert!(
-        d[3][arm0].abs() > 1e-6 * scale,
-        "{walk:?}: no carryover into arm 2"
-    );
-    assert!(
-        d[6][arm1].abs() > 1e-6 * scale,
-        "{walk:?}: no carryover into study 2"
-    );
+    assert!(d[3][arm0].abs() > 1e-6 * scale, "{walk:?}: no carryover into arm 2");
+    assert!(d[6][arm1].abs() > 1e-6 * scale, "{walk:?}: no carryover into study 2");
 }
 
 /// The first-order recording — value and `∂f/∂b` — against FD of the prediction.
@@ -188,18 +165,10 @@ fn check_jacobian(walk: Walk) {
         .unwrap_or_else(|| panic!("{walk:?}: the recording declined"));
     let rows = exact_obs_grads(&model, &subject, &theta, &stacked)
         .unwrap_or_else(|| panic!("{walk:?}: the recording declined"));
-    let fd = Fd {
-        model: &model,
-        subject: &subject,
-        layout: &layout,
-    };
+    let fd = Fd { model: &model, subject: &subject, layout: &layout };
     let f0 = fd.pred(&b, &theta);
     assert_eq!(jac.nrows(), f0.len());
-    assert_eq!(
-        jac.ncols(),
-        n,
-        "{walk:?}: the jet is not over the compact axes"
-    );
+    assert_eq!(jac.ncols(), n, "{walk:?}: the jet is not over the compact axes");
     let mut worst = [0.0_f64; 2];
     for (j, o) in rows.iter().enumerate() {
         let e = margin(o.f, f0[j], 1e-9, 1e-12);
@@ -211,11 +180,7 @@ fn check_jacobian(walk: Walk) {
         let g = fd.grad(&b, &theta, k);
         for j in 0..f0.len() {
             // The two first-order entry points read one recording.
-            assert_eq!(
-                jac[(j, k)].to_bits(),
-                rows[j].df_deta[k].to_bits(),
-                "{walk:?}"
-            );
+            assert_eq!(jac[(j, k)].to_bits(), rows[j].df_deta[k].to_bits(), "{walk:?}");
             let e = margin(jac[(j, k)], g[j], 2e-4, 1e-7);
             worst[1] = worst[1].max(e);
             assert!(
@@ -321,11 +286,7 @@ fn nested_transit_twin_recording_matches_fd_over_the_compact_vector() {
 fn check_fixed_eta_theta(walk: Walk) {
     let (model, subject) = fixture(walk);
     let (layout, b, stacked) = point(&model, &subject);
-    let fd = Fd {
-        model: &model,
-        subject: &subject,
-        layout: &layout,
-    };
+    let fd = Fd { model: &model, subject: &subject, layout: &layout };
     let theta = model.default_params.theta.clone();
     let n_obs = subject.observations.len();
     let x = fixed_eta_theta_adjoint(&model, &subject, &theta, &stacked, true, &vec![1.0; n_obs])
@@ -350,10 +311,7 @@ fn check_fixed_eta_theta(walk: Walk) {
         }
     }
     assert!(live, "{walk:?}: no θ moves a prediction");
-    assert!(
-        worst < 1.0,
-        "{walk:?}: fixed-η θ Jacobian vs FD, margin {worst:.2e}"
-    );
+    assert!(worst < 1.0, "{walk:?}: fixed-η θ Jacobian vs FD, margin {worst:.2e}");
 }
 
 #[test]

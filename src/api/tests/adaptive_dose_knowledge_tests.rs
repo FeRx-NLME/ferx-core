@@ -28,11 +28,8 @@ fn model(kappa: bool, block: &str) -> ParsedModel {
 
 /// [`model`] with the η variance `omega` (`0` draws η = 0 exactly, #1605).
 fn model_with(kappa: bool, omega: &str, block: &str) -> ParsedModel {
-    let (k_decl, k_use) = if kappa {
-        ("  kappa KAPPA_CL ~ 0.5\n", " + KAPPA_CL")
-    } else {
-        ("", "")
-    };
+    let (k_decl, k_use) =
+        if kappa { ("  kappa KAPPA_CL ~ 0.5\n", " + KAPPA_CL") } else { ("", "") };
     parse_full_model(&format!(
         "[parameters]
   theta TVCL({TVCL}, 0.1, 50.0)
@@ -88,16 +85,10 @@ fn csv(subjects: &[(&str, f64)]) -> String {
 
 /// Run with η supplied for `supplied` (`(id, η_CL)`) and every other subject drawn.
 fn run(
-    p: &ParsedModel,
-    population: &Population,
-    supplied: &[(&str, f64)],
-    n_sim: usize,
+    p: &ParsedModel, population: &Population, supplied: &[(&str, f64)], n_sim: usize,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
     let spec = p.adaptive_dosing.as_ref().expect("block present");
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(17),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(17), ..Default::default() };
     let etas = crate::SuppliedEtas::from_table(
         supplied.iter().map(|(id, _)| id.to_string()).collect(),
         p.model.eta_names.clone(),
@@ -113,23 +104,11 @@ fn run(
 /// Run with every subject drawn, through the entry point that takes no supplied η (a
 /// `[mixture]` model refuses a supplied-η table, even an empty one).
 fn run_drawn(
-    p: &ParsedModel,
-    population: &Population,
-    n_sim: usize,
+    p: &ParsedModel, population: &Population, n_sim: usize,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
     let spec = p.adaptive_dosing.as_ref().expect("block present");
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(17),
-        ..Default::default()
-    };
-    simulate_adaptive_from_spec(
-        &p.model,
-        population,
-        &p.model.default_params,
-        n_sim,
-        spec,
-        &opts,
-    )
+    let opts = AdaptiveSimulateOptions { seed: Some(17), ..Default::default() };
+    simulate_adaptive_from_spec(&p.model, population, &p.model.default_params, n_sim, spec, &opts)
 }
 
 fn first_dose(r: &AdaptiveSimulationResult, id: &str, sim: usize) -> f64 {
@@ -178,10 +157,7 @@ fn a_supplied_subject_may_read_cl_and_a_drawn_one_is_refused() {
     let e = run(&p, &population, &[("1", 0.2)], 1).expect_err("subject 2 is drawn");
     assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_KNOWLEDGE"), "{e}");
     assert_eq!(e.message(), K1_CL);
-    assert!(
-        !e.message().contains("'1'"),
-        "a supplied subject is not named"
-    );
+    assert!(!e.message().contains("'1'"), "a supplied subject is not named");
 
     let r = run(&p, &population, &[("1", 0.2), ("2", -0.1)], 1).expect("both supplied");
     for (id, wt, eta) in [("1", 70.0, 0.2), ("2", 50.0, -0.1)] {
@@ -230,35 +206,18 @@ fn an_oracle_run_flags_each_drawn_subject_and_warns_once() {
 
     assert_eq!(r.metrics.len(), 4);
     for m in &r.metrics {
-        assert_eq!(
-            m.dose_oracle,
-            m.subject == "2",
-            "{} sim {}",
-            m.subject,
-            m.sim
-        );
-        assert_eq!(
-            m.eta_supplied,
-            m.subject == "1",
-            "{} sim {}",
-            m.subject,
-            m.sim
-        );
+        assert_eq!(m.dose_oracle, m.subject == "2", "{} sim {}", m.subject, m.sim);
+        assert_eq!(m.eta_supplied, m.subject == "1", "{} sim {}", m.subject, m.sim);
     }
-    let w1: Vec<&String> = r
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE"))
-        .collect();
+    let w1: Vec<&String> =
+        r.warnings.iter().filter(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE")).collect();
     assert_eq!(
         w1,
-        [
-            &"W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated \
+        [&"W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated \
            individual values (dose_knowledge = oracle; start_dose reads CL). This is a \
            perfect-information arm: no prescriber has these values. Each such subject's \
            metrics have dose_oracle = true."
-                .to_string()
-        ]
+            .to_string()]
     );
 
     for sim in [1, 2] {
@@ -277,27 +236,15 @@ fn an_oracle_run_flags_each_drawn_subject_and_warns_once() {
         let d0 = first_dose(&r, "2", sim);
         let cl = backed_out_cl(&r, "2", sim, TVV * 50.0);
         let gap = ((d0 - 400.0 * cl) / (400.0 * cl)).abs();
-        assert!(
-            gap < 1e-12,
-            "replicate {sim}: dose {d0} vs 400·CL {} ({gap:e})",
-            400.0 * cl
-        );
+        assert!(gap < 1e-12, "replicate {sim}: dose {d0} vs 400·CL {} ({gap:e})", 400.0 * cl);
     }
-    assert!(
-        d1 != d2,
-        "the oracle reads each replicate's draw: {d1} {d2}"
-    );
-    assert!(
-        d1 != typical && d2 != typical,
-        "{d1} {d2} vs η = 0 {typical}"
-    );
+    assert!(d1 != d2, "the oracle reads each replicate's draw: {d1} {d2}");
+    assert!(d1 != typical && d2 != typical, "{d1} {d2} vs η = 0 {typical}");
 
     let r = run(&p, &population, &[("1", 0.2), ("2", -0.1)], 1).expect("all supplied");
     assert!(r.metrics.iter().all(|m| !m.dose_oracle));
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE")),
+        !r.warnings.iter().any(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE")),
         "{:?}",
         r.warnings
     );
@@ -324,13 +271,7 @@ fn backed_out_cl(r: &AdaptiveSimulationResult, id: &str, sim: usize, v: f64) -> 
 /// The κ the run draws for `id` in replicate `sim`, occasion `g`: `chol(Ω_IOV)·z` on the
 /// subject's κ substream (the reconstruction `adaptive_auc_tv_tests` pins).
 fn drawn_kappa(p: &ParsedModel, seed: u64, id: &str, sim: usize, g: usize) -> f64 {
-    let chol = p
-        .model
-        .default_params
-        .omega_iov
-        .as_ref()
-        .expect("Ω_IOV")
-        .chol[(0, 0)];
+    let chol = p.model.default_params.omega_iov.as_ref().expect("Ω_IOV").chol[(0, 0)];
     let base = crate::sim::adaptive::subject_kappa_base_seed(seed, id, sim);
     chol * crate::sim::adaptive::kappa_standard_normal(base, g, 0)
 }
@@ -386,22 +327,12 @@ fn under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occ
         assert_eq!(d0, 400.0 * TVCL, "supplied sim {sim}: κ = 0");
 
         let oracle = first_dose(&r, "2", sim);
-        let (k0, k1) = (
-            drawn_kappa(&p, SEED, "2", sim, 0),
-            drawn_kappa(&p, SEED, "2", sim, 1),
-        );
+        let (k0, k1) = (drawn_kappa(&p, SEED, "2", sim, 0), drawn_kappa(&p, SEED, "2", sim, 1));
         let want = 400.0 * (TVCL * (70.0 / 70.0) * (0.0 + k0).exp());
-        assert_eq!(
-            oracle.to_bits(),
-            want.to_bits(),
-            "oracle sim {sim}: {oracle} vs {want}"
-        );
+        assert_eq!(oracle.to_bits(), want.to_bits(), "oracle sim {sim}: {oracle} vs {want}");
         for (label, other) in [("κ = 0", 0.0), ("κ₁", k1)] {
             let alt = 400.0 * TVCL * other.exp();
-            assert!(
-                rel(alt, want) > 1e-2,
-                "sim {sim}: {label} must differ from κ₀"
-            );
+            assert!(rel(alt, want) > 1e-2, "sim {sim}: {label} must differ from κ₀");
         }
     }
 }
@@ -459,21 +390,9 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
     type Piece = (f64, f64, usize);
     let layouts: [(&[f64], &[f64], &[Piece]); 11] = [
         (&[0.0, 24.0], &[0.0, 24.0, 48.0], &[(0.0, 24.0, 1)]),
-        (
-            &[0.0, 24.0],
-            &[0.0, 12.0, 24.0],
-            &[(0.0, 12.0, 0), (12.0, 24.0, 1)],
-        ),
-        (
-            &[0.0, 24.0],
-            &[0.0, 23.0, 47.0],
-            &[(0.0, 23.0, 0), (23.0, 24.0, 1)],
-        ),
-        (
-            &[0.0, 24.0],
-            &[0.0, 23.0, 24.0, 48.0],
-            &[(0.0, 23.0, 0), (23.0, 24.0, 1)],
-        ),
+        (&[0.0, 24.0], &[0.0, 12.0, 24.0], &[(0.0, 12.0, 0), (12.0, 24.0, 1)]),
+        (&[0.0, 24.0], &[0.0, 23.0, 47.0], &[(0.0, 23.0, 0), (23.0, 24.0, 1)]),
+        (&[0.0, 24.0], &[0.0, 23.0, 24.0, 48.0], &[(0.0, 23.0, 0), (23.0, 24.0, 1)]),
         (
             &[0.0, 24.0, 48.0],
             &[0.0, 12.0, 48.0],
@@ -484,16 +403,8 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
             &[0.0, 72.0],
             &[(0.0, 24.0, 1), (24.0, 48.0, 2), (48.0, 72.0, 3)],
         ),
-        (
-            &[0.0, 24.0],
-            &[0.0, 23.0],
-            &[(0.0, 23.0, 0), (23.0, 24.0, 1)],
-        ),
-        (
-            &[0.0, 24.0, 48.0],
-            &[0.0, 23.0],
-            &[(0.0, 23.0, 0), (23.0, 24.0, 1), (24.0, 48.0, 2)],
-        ),
+        (&[0.0, 24.0], &[0.0, 23.0], &[(0.0, 23.0, 0), (23.0, 24.0, 1)]),
+        (&[0.0, 24.0, 48.0], &[0.0, 23.0], &[(0.0, 23.0, 0), (23.0, 24.0, 1), (24.0, 48.0, 2)]),
         // The other three layouts of the #2895 table (records 0, 72 is the row above it).
         (
             &[0.0, 24.0, 48.0, 72.0],
@@ -515,12 +426,7 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
         (
             &[0.0, 24.0, 48.0, 72.0],
             &[0.0, 12.0, 48.0, 72.0],
-            &[
-                (0.0, 12.0, 0),
-                (12.0, 24.0, 1),
-                (24.0, 48.0, 2),
-                (48.0, 72.0, 3),
-            ],
+            &[(0.0, 12.0, 0), (12.0, 24.0, 1), (24.0, 48.0, 2), (48.0, 72.0, 3)],
         ),
     ];
     let mut worst = 0.0_f64;
@@ -576,9 +482,8 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
                 assert!(c.is_finite() && c > 0.0, "{tag}: C({t}) = {c}");
                 c
             };
-            let cl: Vec<f64> = (0..at.len())
-                .map(|g| TVCL * drawn_kappa(&p, SEED, "1", sim, g).exp())
-                .collect();
+            let cl: Vec<f64> =
+                (0..at.len()).map(|g| TVCL * drawn_kappa(&p, SEED, "1", sim, g).exp()).collect();
             for &(a, b, g) in pieces {
                 let backed_out = -v / (b - a) * (conc(b, false) / conc(a, true)).ln();
                 assert!(backed_out.is_finite(), "{tag}: ({a}, {b}] CL {backed_out}");
@@ -630,11 +535,7 @@ fn an_individual_parameter_reads_the_covariate_in_force_at_the_first_decision() 
 ";
     let r = run(&p, &pop(csv), &[("1", 0.1), ("2", 0.1)], 1).expect("runs");
     let dose = |id: &str| {
-        r.ledger
-            .iter()
-            .find(|e| e.subject == id && e.time == 12.0)
-            .expect("a dose at 12")
-            .amt
+        r.ledger.iter().find(|e| e.subject == id && e.time == 12.0).expect("a dose at 12").amt
     };
     assert_eq!(dose("1").to_bits(), dose_400_cl(50.0, 0.1).to_bits());
     assert_eq!(dose("2").to_bits(), dose_400_cl(70.0, 0.1).to_bits());
@@ -684,18 +585,9 @@ fn a_time_dependent_parameter_reads_the_written_time_at_the_first_decision() {
 ");
     let s = &population.subjects[0];
     assert_eq!(s.reset_times, [25.0], "engine reset time");
-    assert_eq!(
-        s.param_time_at(31.0),
-        6.0,
-        "written TIME at the first decision"
-    );
+    assert_eq!(s.param_time_at(31.0), 6.0, "written TIME at the first decision");
     let r = run(&p, &population, &[("1", 0.0)], 1).expect("runs");
-    let d = r
-        .ledger
-        .iter()
-        .find(|e| e.time == 31.0)
-        .expect("a dose at 31")
-        .amt;
+    let d = r.ledger.iter().find(|e| e.time == 31.0).expect("a dose at 31").amt;
     let at = |t: f64| 400.0 * (6.0 * 0.0f64.exp() * (1.0 + 0.01 * t));
     assert_eq!(d.to_bits(), at(6.0).to_bits(), "{d} vs written {}", at(6.0));
     assert!(d != at(31.0), "the engine clock would give {}", at(31.0));
@@ -724,18 +616,11 @@ fn a_model_covariate_missing_from_the_in_force_record_is_refused_before_a_cl_rea
 1,6,0,0,0,1,0,50
 1,24,0,0,0,1,0,50
 ");
-    assert_eq!(
-        full.subjects[0].obs_covariates.len(),
-        3,
-        "per-record snapshots"
-    );
+    assert_eq!(full.subjects[0].obs_covariates.len(), 3, "per-record snapshots");
     let mut gap = full.clone();
     assert_eq!(gap.subjects[0].obs_covariates[1].remove("WT"), Some(50.0));
     let r = run(&p, &full, &[("1", 0.0)], 1).expect("every map carries WT");
-    assert_eq!(
-        first_dose_at(&r, 12.0).to_bits(),
-        dose_400_cl(50.0, 0.0).to_bits()
-    );
+    assert_eq!(first_dose_at(&r, 12.0).to_bits(), dose_400_cl(50.0, 0.0).to_bits());
     let e = run(&p, &gap, &[("1", 0.0)], 1).expect_err("the in-force snapshot lacks WT");
     assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
     assert!(e.message().contains("WT"), "{e}");
@@ -810,10 +695,7 @@ fn a_hand_built_oracle_spec_reading_no_subject_value_is_refused() {
     let mut spec: AdaptiveDosingSpec = p.adaptive_dosing.clone().expect("block");
     spec.dose_knowledge = crate::sim::adaptive::DoseKnowledge::Oracle;
     let population = pop(&csv(&[("1", 70.0)]));
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(7), ..Default::default() };
     let e = simulate_adaptive_from_spec(
         &p.model,
         &population,
@@ -882,17 +764,10 @@ fn a_typical_value_parameter_is_known_for_every_subject() {
     let r = run(&p, &population, &[], 1).expect("TVCLW is known for drawn subjects");
     for (id, wt) in [("1", 70.0), ("2", 50.0)] {
         let want = 400.0 * (TVCL * (wt / 70.0));
-        assert_eq!(
-            first_dose(&r, id, 1).to_bits(),
-            want.to_bits(),
-            "subject {id}"
-        );
+        assert_eq!(first_dose(&r, id, 1).to_bits(), want.to_bits(), "subject {id}");
     }
     assert!(r.metrics.iter().all(|m| !m.dose_oracle && !m.eta_supplied));
-    assert!(!r
-        .warnings
-        .iter()
-        .any(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE")));
+    assert!(!r.warnings.iter().any(|w| w.starts_with("W_ADAPTIVE_DOSE_ORACLE")));
 
     for (expr, name) in [("400 * CL", "CL"), ("400 * CL2", "CL2")] {
         let p = model_tv(&block(expr, ""));
@@ -906,13 +781,12 @@ fn a_typical_value_parameter_is_known_for_every_subject() {
         );
     }
 
-    let err = match parse_full_model(&model_tv_src(&block(
-        "400 * TVCLW",
-        "  dose_knowledge = oracle\n",
-    ))) {
-        Ok(_) => panic!("an oracle reading only TVCLW is refused"),
-        Err(e) => e.to_string(),
-    };
+    let err =
+        match parse_full_model(&model_tv_src(&block("400 * TVCLW", "  dose_knowledge = oracle\n")))
+        {
+            Ok(_) => panic!("an oracle reading only TVCLW is refused"),
+            Err(e) => e.to_string(),
+        };
     assert!(
         err.ends_with(
             "[adaptive_dosing] dose_knowledge = oracle has no effect: no dose expression \
@@ -928,10 +802,8 @@ fn a_typical_value_parameter_is_known_for_every_subject() {
 /// Mutation: the refusal built from `reads[0]` (or `reads.last()`) alone.
 #[test]
 fn a_knowledge_refusal_names_every_read() {
-    let b = block("400 * CL", "").replace(
-        "dose_bounds = [0, 4000]",
-        "dose_bounds = [0, 4000 * exp(ETA_CL)]",
-    );
+    let b = block("400 * CL", "")
+        .replace("dose_bounds = [0, 4000]", "dose_bounds = [0, 4000 * exp(ETA_CL)]");
     let p = model(false, &b);
     let e = run(&p, &pop(&csv(&[("1", 70.0), ("2", 50.0)])), &[], 1).expect_err("drawn");
     assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_KNOWLEDGE"), "{e}");
@@ -1027,8 +899,5 @@ fn an_oracle_reads_the_mixture_class_the_subject_is_simulated_under() {
     let tail = ", replicate 1: start_dose = 100 * MIXNUM evaluates to 200, outside \
                 dose_bounds = [0, 150], which evaluate to [0, 150]. The dose expressions \
                 read MIXNUM = 2, at the first decision (t = 0).";
-    assert!(
-        msg.starts_with("[adaptive_dosing] subject ") && msg.ends_with(tail),
-        "{msg}"
-    );
+    assert!(msg.starts_with("[adaptive_dosing] subject ") && msg.ends_with(tail), "{msg}");
 }

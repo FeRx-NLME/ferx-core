@@ -153,11 +153,17 @@ impl<'de> serde::Deserializer<'de> for NullAsNan {
         use serde_json::Value;
         match self.0 {
             Value::Array(items) => v.visit_seq(NullAsNanSeq(items.into_iter())),
-            Value::Object(map) => v.visit_map(NullAsNanMap {
-                entries: map.into_iter(),
-                value: None,
-            }),
-            other => serde::Deserializer::deserialize_any(other, v),
+            Value::Object(map) => {
+                v.visit_map(NullAsNanMap { entries: map.into_iter(), value: None })
+            }
+            // The scalars as `Value::deserialize_any` reads them. Not delegated to it: that
+            // would instantiate its array/object arms — every visitor's `visit_seq` /
+            // `visit_map` over serde_json's own Seq/MapDeserializer — for each type read
+            // here, a second copy of `FitResult`'s and `FitWire`'s visitors that never runs.
+            Value::Null => v.visit_unit(),
+            Value::Bool(b) => v.visit_bool(b),
+            Value::Number(n) => serde::Deserializer::deserialize_any(n, v),
+            Value::String(s) => v.visit_string(s),
         }
     }
 
@@ -180,18 +186,13 @@ impl<'de> serde::Deserializer<'de> for NullAsNan {
     }
 
     fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
-        self,
-        _name: &'static str,
-        v: V,
+        self, _name: &'static str, v: V,
     ) -> Result<V::Value, Self::Error> {
         v.visit_newtype_struct(self)
     }
 
     fn deserialize_enum<V: serde::de::Visitor<'de>>(
-        self,
-        name: &'static str,
-        variants: &'static [&'static str],
-        v: V,
+        self, name: &'static str, variants: &'static [&'static str], v: V,
     ) -> Result<V::Value, Self::Error> {
         serde::Deserializer::deserialize_enum(self.0, name, variants, v)
     }
@@ -208,13 +209,9 @@ impl<'de> serde::de::SeqAccess<'de> for NullAsNanSeq {
     type Error = serde_json::Error;
 
     fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: T,
+        &mut self, seed: T,
     ) -> Result<Option<T::Value>, Self::Error> {
-        self.0
-            .next()
-            .map(|v| seed.deserialize(NullAsNan(v)))
-            .transpose()
+        self.0.next().map(|v| seed.deserialize(NullAsNan(v))).transpose()
     }
 }
 
@@ -227,8 +224,7 @@ impl<'de> serde::de::MapAccess<'de> for NullAsNanMap {
     type Error = serde_json::Error;
 
     fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
+        &mut self, seed: K,
     ) -> Result<Option<K::Value>, Self::Error> {
         let Some((key, value)) = self.entries.next() else {
             return Ok(None);
@@ -238,8 +234,7 @@ impl<'de> serde::de::MapAccess<'de> for NullAsNanMap {
     }
 
     fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
+        &mut self, seed: V,
     ) -> Result<V::Value, Self::Error> {
         let value = self.value.take().expect("next_key_seed runs first");
         seed.deserialize(NullAsNan(value))

@@ -349,11 +349,7 @@ fn run_family(f: &Family) {
         &format!("{}/bolus", f.label),
         &an,
         &ode,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
-            obs.clone(),
-            oc,
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)], obs.clone(), oc),
         RTOL,
     );
 
@@ -437,11 +433,7 @@ fn run_family(f: &Family) {
         &format!("{}/infusion", f.label),
         &an,
         &ode,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
-            obs.clone(),
-            oc,
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)], obs.clone(), oc),
         if f.is_oral { ACCUM_RTOL } else { RTOL },
     );
 
@@ -473,11 +465,7 @@ fn run_family(f: &Family) {
         &format!("{}/bioavailability_bolus", f.label),
         &an_f,
         &ode_f,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
-            obs.clone(),
-            oc,
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)], obs.clone(), oc),
         RTOL,
     );
 
@@ -489,11 +477,7 @@ fn run_family(f: &Family) {
         &format!("{}/bioavailability_infusion", f.label),
         &an_f,
         &ode_f,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
-            obs.clone(),
-            oc,
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)], obs.clone(), oc),
         if f.is_oral { ACCUM_RTOL } else { RTOL },
     );
 }
@@ -613,14 +597,7 @@ fn covariate_model_equiv() {
     let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
     let mk = |id: &str, wt: f64| {
         let mut s = subject(
-            vec![DoseEvent::new(
-                0.0,
-                100.0,
-                Family::DOSE_CMT,
-                0.0,
-                false,
-                0.0,
-            )],
+            vec![DoseEvent::new(0.0, 100.0, Family::DOSE_CMT, 0.0, false, 0.0)],
             obs.clone(),
             2,
         );

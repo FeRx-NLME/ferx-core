@@ -58,8 +58,9 @@
 
 use super::simulate::simulate_with_options_impl;
 use super::vpc_tte::{
-    build_strata, check_band_options, checked_record, duplicate_id, no_record, refuse, resolve_cmt,
-    stratum_grid, stratum_value, Entry, VpcCensoring, VpcGrid, VpcStratify,
+    build_strata, check_band_options, checked_record, duplicate_id, empty_stratum_warning,
+    no_record, refuse, resolve_cmt, stratum_grid, stratum_value, Entry, VpcCensoring, VpcGrid,
+    VpcStratify,
 };
 use super::{SimulateOptions, SimulationResult};
 use crate::diagnostics::EngineError;
@@ -130,7 +131,7 @@ pub struct RtteOrderBand {
     pub n_subjects: usize,
     pub observed: KmCurve,
     pub grid: Vec<f64>,
-    /// The observed curve on the grid (`None` past its last time unless it reached 0).
+    /// The observed curve on the grid (`None` past its last time, also where it reached 0).
     pub obs_on_grid: Vec<Option<f64>>,
     pub lo: Vec<Option<f64>>,
     pub med: Vec<Option<f64>>,
@@ -182,7 +183,8 @@ pub struct RtteVpc {
     pub strata: Vec<RtteVpcStratum>,
     /// The warning of this check about the data's follow-up on `[0, H]`
     /// (`W_VPC_RTTE_ENDS_ON_EVENT`), then the simulator's (a degenerate recurrent
-    /// hazard, …).
+    /// hazard, …), then `W_VPC_EMPTY_STRATUM` per stratum with no MCF band at any grid
+    /// time.
     pub warnings: Vec<String>,
 }
 
@@ -227,13 +229,10 @@ fn order_mark(events: &[f64], end: f64, order: usize, clock: Clock) -> Option<(f
 /// The Kaplan–Meier curve of order `order` on `clock` over `streams` (event times and
 /// follow-up end per subject), and the number of subjects in it.
 fn order_curve<'a>(
-    streams: impl Iterator<Item = (&'a [f64], f64)>,
-    order: usize,
-    clock: Clock,
+    streams: impl Iterator<Item = (&'a [f64], f64)>, order: usize, clock: Clock,
 ) -> (KmCurve, usize) {
-    let (times, events): (Vec<f64>, Vec<bool>) = streams
-        .filter_map(|(ev, end)| order_mark(ev, end, order, clock))
-        .unzip();
+    let (times, events): (Vec<f64>, Vec<bool>) =
+        streams.filter_map(|(ev, end)| order_mark(ev, end, order, clock)).unzip();
     let curve = kaplan_meier(&times, &events)
         .expect("event times and follow-up ends are finite, non-negative and ordered");
     (curve, times.len())
@@ -263,10 +262,7 @@ fn cut_at(events: &[f64], end: f64, horizon: f64) -> (&[f64], f64) {
 /// `horizon`) that the VPC keeps, and where its follow-up ends, given its observed
 /// follow-up end.
 fn replicate_follow_up(
-    events: &[f64],
-    observed_end: f64,
-    horizon: f64,
-    censoring: VpcCensoring,
+    events: &[f64], observed_end: f64, horizon: f64, censoring: VpcCensoring,
 ) -> (&[f64], f64) {
     match censoring {
         VpcCensoring::Observed => cut_at(events, observed_end, horizon),
@@ -277,9 +273,7 @@ fn replicate_follow_up(
 /// The observed streams on `cmt`, and the strata's values (sorted) and labels.
 #[allow(clippy::type_complexity)]
 fn observed_streams(
-    population: &Population,
-    cmt: usize,
-    stratify: &VpcStratify,
+    population: &Population, cmt: usize, stratify: &VpcStratify,
 ) -> Result<(Vec<Stream>, Vec<Option<f64>>, Vec<String>), EngineError> {
     let mut picked: Vec<(String, Vec<f64>, f64, bool)> = Vec::new();
     let mut per_subject: Vec<Option<f64>> = Vec::new();
@@ -292,13 +286,7 @@ fn observed_streams(
         let mut end: Option<f64> = None;
         let mut ends_on_event = false;
         for r in &s.obs_records {
-            let ObsRecord::Event {
-                time,
-                event_type,
-                entry_time,
-                cmt: rc,
-            } = r
-            else {
+            let ObsRecord::Event { time, event_type, entry_time, cmt: rc } = r else {
                 continue;
             };
             if *rc != cmt {
@@ -347,23 +335,13 @@ fn observed_streams(
 /// however many records the subject was observed with, and closes it with a censoring
 /// row at the horizon, which carries no event and is not read.
 fn replicate_events(
-    results: &[SimulationResult],
-    cmt: usize,
-    streams: &[Stream],
-    n_sim: usize,
+    results: &[SimulationResult], cmt: usize, streams: &[Stream], n_sim: usize,
 ) -> Vec<Vec<Vec<f64>>> {
-    let by_id: HashMap<&str, usize> = streams
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.id.as_str(), i))
-        .collect();
+    let by_id: HashMap<&str, usize> =
+        streams.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
     let mut reps = vec![vec![Vec::new(); streams.len()]; n_sim];
     for row in results {
-        let SimOutcome::Event {
-            time,
-            observed: true,
-        } = row.outcome
-        else {
+        let SimOutcome::Event { time, observed: true } = row.outcome else {
             continue;
         };
         if row.cmt != cmt {
@@ -431,10 +409,7 @@ fn follow_up_warnings(streams: &[Stream], cmt: usize) -> Vec<String> {
 /// lacks or with more than [`VPC_TTE_MAX_STRATA`](super::VPC_TTE_MAX_STRATA) values.
 /// Otherwise any `Err` the simulator returns.
 pub fn vpc_rtte(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    opts: &VpcRtteOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, opts: &VpcRtteOptions,
 ) -> Result<RtteVpc, EngineError> {
     let probs = opts.probs;
     check_band_options(WHO, probs, opts.n_sim, &opts.grid)?;
@@ -447,12 +422,10 @@ pub fn vpc_rtte(
     }
     let cmt = resolve_cmt(WHO, model, opts.cmt)?;
     let (mut streams, values, labels) = observed_streams(population, cmt, &opts.stratify)?;
-    let horizon = opts.sim.horizon.unwrap_or_else(|| {
-        streams
-            .iter()
-            .map(|s| s.end)
-            .fold(f64::NEG_INFINITY, f64::max)
-    });
+    let horizon = opts
+        .sim
+        .horizon
+        .unwrap_or_else(|| streams.iter().map(|s| s.end).fold(f64::NEG_INFINITY, f64::max));
     // The data on [0, H] only (module doc), before anything is read from them: the
     // result is the one for the data cut at H first. A subject followed past H ends at
     // H on no event.
@@ -463,9 +436,7 @@ pub fn vpc_rtte(
         s.ends_on_event &= s.end <= horizon;
         s.end = end;
     }
-    let max_order = opts
-        .max_order
-        .unwrap_or_else(|| default_max_order(&streams));
+    let max_order = opts.max_order.unwrap_or_else(|| default_max_order(&streams));
 
     let mut warnings = follow_up_warnings(&streams, cmt);
 
@@ -479,14 +450,8 @@ pub fn vpc_rtte(
     const PROBS_OK: &str = "the band probabilities were validated above";
     let mut strata = Vec::with_capacity(values.len());
     for (k, (value, label)) in values.into_iter().zip(labels).enumerate() {
-        let members: Vec<usize> = (0..streams.len())
-            .filter(|&i| streams[i].stratum == k)
-            .collect();
-        let observed = || {
-            members
-                .iter()
-                .map(|&i| (streams[i].events.as_slice(), streams[i].end))
-        };
+        let members: Vec<usize> = (0..streams.len()).filter(|&i| streams[i].stratum == k).collect();
+        let observed = || members.iter().map(|&i| (streams[i].events.as_slice(), streams[i].end));
         // One replicate's streams in this stratum, cut to the follow-up the VPC keeps.
         let cut: Vec<Vec<(&[f64], f64)>> = reps
             .iter()
@@ -507,6 +472,17 @@ pub fn vpc_rtte(
             rep_mcf.iter().map(|c| c.time.as_slice()),
         );
         let band = vpc_band_mcf(&rep_mcf, &grid, probs).expect(PROBS_OK);
+        // The MCF band only: every absolute and gap curve ends at or before its
+        // replicate's follow-up end, so they are empty whenever the MCF band is.
+        warnings.extend(empty_stratum_warning(
+            WHO,
+            &label,
+            &grid,
+            &band.n_used,
+            probs,
+            rep_mcf.iter().map(|c| c.time.as_slice()),
+            None,
+        ));
         let mcf = RtteMcfBand {
             obs_on_grid: grid.iter().map(|&t| obs_mcf.at(t)).collect(),
             observed: obs_mcf,
@@ -523,9 +499,7 @@ pub fn vpc_rtte(
             let curves: Vec<KmCurve> = if n_subjects == 0 {
                 Vec::new()
             } else {
-                cut.iter()
-                    .map(|r| order_curve(r.iter().copied(), order, clock).0)
-                    .collect()
+                cut.iter().map(|r| order_curve(r.iter().copied(), order, clock).0).collect()
             };
             let grid = stratum_grid(
                 &opts.grid,
@@ -546,20 +520,9 @@ pub fn vpc_rtte(
                 n_used: band.n_used,
             }
         };
-        let absolute = (1..=max_order)
-            .map(|order| order_band(order, Clock::Absolute))
-            .collect();
-        let gap = (2..=max_order)
-            .map(|order| order_band(order, Clock::Gap))
-            .collect();
-        strata.push(RtteVpcStratum {
-            label,
-            value,
-            n_subjects: members.len(),
-            mcf,
-            absolute,
-            gap,
-        });
+        let absolute = (1..=max_order).map(|order| order_band(order, Clock::Absolute)).collect();
+        let gap = (2..=max_order).map(|order| order_band(order, Clock::Gap)).collect();
+        strata.push(RtteVpcStratum { label, value, n_subjects: members.len(), mcf, absolute, gap });
     }
     Ok(RtteVpc {
         cmt,

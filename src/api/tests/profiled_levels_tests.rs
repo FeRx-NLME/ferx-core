@@ -75,10 +75,7 @@ fn bind(text: &str, pop: &mut Population) -> CompiledModel {
 #[test]
 fn a_subject_constant_index_gives_each_subject_its_one_level() {
     let mut pop = population(3, 4);
-    let model = bind(
-        &mbma("theta PLACEBO[STUDY](0.0) profile", "PLACEBO"),
-        &mut pop,
-    );
+    let model = bind(&mbma("theta PLACEBO[STUDY](0.0) profile", "PLACEBO"), &mut pop);
     assert!(
         pop.subjects.iter().all(|s| s.obs_covariates.is_empty()),
         "the fixture must stay on the baseline-only path"
@@ -86,10 +83,7 @@ fn a_subject_constant_index_gives_each_subject_its_one_level() {
     let active = active_levels(&model, &pop);
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].block, "PLACEBO");
-    assert_eq!(
-        active[0].per_subject,
-        [vec![0], vec![0], vec![1], vec![1], vec![2], vec![2]]
-    );
+    assert_eq!(active[0].per_subject, [vec![0], vec![0], vec![1], vec![1], vec![2], vec![2]]);
 }
 
 /// A block keyed on `[STUDY, TIME]`: the index moves row by row, so each subject
@@ -97,20 +91,14 @@ fn a_subject_constant_index_gives_each_subject_its_one_level() {
 #[test]
 fn a_per_row_index_gives_each_subject_every_cell_it_observes() {
     let mut pop = population(3, 4);
-    let model = bind(
-        &mbma("theta PLACEBO[STUDY, TIME](0.0) profile", "PLACEBO"),
-        &mut pop,
-    );
+    let model = bind(&mbma("theta PLACEBO[STUDY, TIME](0.0) profile", "PLACEBO"), &mut pop);
     assert!(
         pop.subjects.iter().all(|s| !s.obs_covariates.is_empty()),
         "the fixture must take the per-row path"
     );
     let active = active_levels(&model, &pop);
     let study = |s: usize| (4 * s..4 * s + 4).collect::<Vec<usize>>();
-    assert_eq!(
-        active[0].per_subject,
-        [study(0), study(0), study(1), study(1), study(2), study(2)]
-    );
+    assert_eq!(active[0].per_subject, [study(0), study(0), study(1), study(1), study(2), study(2)]);
 }
 
 /// The counted form, read through the user's own plain column, gives the same sets
@@ -118,15 +106,9 @@ fn a_per_row_index_gives_each_subject_every_cell_it_observes() {
 #[test]
 fn the_counted_form_reads_its_plain_index_column_and_unprofiled_blocks_are_skipped() {
     let mut pop = population(3, 2);
-    let model = bind(
-        &mbma("theta PLACEBO[3](0.0) profile", "PLACEBO[STUDY]"),
-        &mut pop,
-    );
+    let model = bind(&mbma("theta PLACEBO[3](0.0) profile", "PLACEBO[STUDY]"), &mut pop);
     let active = active_levels(&model, &pop);
-    assert_eq!(
-        active[0].per_subject,
-        [vec![0], vec![0], vec![1], vec![1], vec![2], vec![2]]
-    );
+    assert_eq!(active[0].per_subject, [vec![0], vec![0], vec![1], vec![1], vec![2], vec![2]]);
 
     let mut pop = population(3, 2);
     let plain = bind(&mbma("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]"), &mut pop);
@@ -145,9 +127,7 @@ fn counted() -> String {
 }
 
 fn model_of(text: &str) -> CompiledModel {
-    parse_full_model(text)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .model
+    parse_full_model(text).unwrap_or_else(|e| panic!("{e}")).model
 }
 
 /// The `E_PROFILE_SCOPE` messages `check_model_options` raises, in order.
@@ -197,14 +177,9 @@ fn profile_refuses_every_method_outside_foce_focei_and_laplace() {
         EstimationMethod::Bayes,
         EstimationMethod::Vi,
     ] {
-        let alone = FitOptions {
-            method: m,
-            ..FitOptions::default()
-        };
-        let chain = FitOptions {
-            methods: vec![EstimationMethod::Laplace, m],
-            ..FitOptions::default()
-        };
+        let alone = FitOptions { method: m, ..FitOptions::default() };
+        let chain =
+            FitOptions { methods: vec![EstimationMethod::Laplace, m], ..FitOptions::default() };
         for opts in [alone, chain] {
             let msg = one_refusal(
                 &scope(&model_of(&counted()), &opts),
@@ -225,15 +200,8 @@ fn profile_refuses_every_method_outside_foce_focei_and_laplace() {
 /// `None`) and which was refused only because `n_agq` used to be read fit-wide.
 #[test]
 fn profile_accepts_foce_focei_and_laplace_at_one_node() {
-    for ok in [
-        EstimationMethod::Foce,
-        EstimationMethod::FoceI,
-        EstimationMethod::Laplace,
-    ] {
-        let opts = FitOptions {
-            method: ok,
-            ..FitOptions::default()
-        };
+    for ok in [EstimationMethod::Foce, EstimationMethod::FoceI, EstimationMethod::Laplace] {
+        let opts = FitOptions { method: ok, ..FitOptions::default() };
         assert!(scope(&model_of(&counted()), &opts).is_empty(), "{ok:?}");
     }
     let chain = FitOptions {
@@ -241,11 +209,7 @@ fn profile_accepts_foce_focei_and_laplace_at_one_node() {
         ..FitOptions::default()
     };
     assert!(scope(&model_of(&counted()), &chain).is_empty());
-    let foce_agq = FitOptions {
-        method: EstimationMethod::Foce,
-        n_agq: 3,
-        ..FitOptions::default()
-    };
+    let foce_agq = FitOptions { method: EstimationMethod::Foce, n_agq: 3, ..FitOptions::default() };
     let msgs = scope(&model_of(&counted()), &foce_agq);
     assert!(msgs.is_empty(), "{msgs:#?}");
 }
@@ -257,11 +221,7 @@ fn profile_accepts_foce_focei_and_laplace_at_one_node() {
 #[test]
 fn profile_accepts_adaptive_quadrature_under_laplace_and_focei() {
     for m in [EstimationMethod::Laplace, EstimationMethod::FoceI] {
-        let opts = FitOptions {
-            method: m,
-            n_agq: 3,
-            ..FitOptions::default()
-        };
+        let opts = FitOptions { method: m, n_agq: 3, ..FitOptions::default() };
         assert_eq!(opts.agq_nodes(), Some(3), "{m:?} runs quadrature");
         let msgs = scope(&model_of(&counted()), &opts);
         assert!(msgs.is_empty(), "{m:?}: {msgs:#?}");
@@ -291,11 +251,7 @@ fn a_profiled_block_over_the_agq_grid_limit_is_refused_by_the_grid_check() {
     let model = model_of(&wide);
     assert_eq!(model.n_eta, 4);
     let codes = |n_agq: usize| -> Vec<String> {
-        let opts = FitOptions {
-            method: EstimationMethod::Laplace,
-            n_agq,
-            ..FitOptions::default()
-        };
+        let opts = FitOptions { method: EstimationMethod::Laplace, n_agq, ..FitOptions::default() };
         crate::api::check_model_options(&model, &opts)
             .into_iter()
             .filter(|d| d.code.starts_with("E_"))
@@ -318,10 +274,7 @@ fn a_profiled_block_over_the_agq_grid_limit_is_refused_by_the_grid_check() {
 #[test]
 fn a_profiled_block_over_the_iov_agq_grid_limit_is_refused_by_fit() {
     let text = counted()
-        .replace(
-            "  omega ETA_E0 ~ 4.0\n",
-            "  omega ETA_E0 ~ 4.0\n  kappa KAPPA_A ~ 1.0\n",
-        )
+        .replace("  omega ETA_E0 ~ 4.0\n", "  omega ETA_E0 ~ 4.0\n  kappa KAPPA_A ~ 1.0\n")
         .replace("+ ETA_E0\n", "+ ETA_E0 + KAPPA_A\n");
     let mut pop = population(2, 6);
     for s in &mut pop.subjects {
@@ -335,17 +288,13 @@ fn a_profiled_block_over_the_iov_agq_grid_limit_is_refused_by_fit() {
         verbose: false,
         ..FitOptions::default()
     };
-    assert!(
-        scope(&model, &opts(6)).is_empty(),
-        "the profile scope accepts it"
-    );
+    assert!(scope(&model, &opts(6)).is_empty(), "the profile scope accepts it");
     let err = crate::api::fit(&model, &pop, &model.default_params, &opts(6))
         .err()
         .expect("refused before the fit");
     assert_eq!(err.code(), Some("E_AGQ_GRID_TOO_LARGE"), "{err}");
     assert!(
-        err.to_string()
-            .starts_with("method = laplace with n_agq = 6 needs a 6^7 = 279936-node"),
+        err.to_string().starts_with("method = laplace with n_agq = 6 needs a 6^7 = 279936-node"),
         "{err}"
     );
     assert!(crate::api::validation::check_agq_grid_iov(&model, &pop, &opts(3)).is_empty());
@@ -384,21 +333,15 @@ fn profile_refuses_a_residual_error_that_is_not_additive() {
         let text = counted()
             .replace("DV ~ additive(ADD_ERR)", error)
             .replace("  sigma ADD_ERR", &format!("{extra_sigma}  sigma ADD_ERR"));
-        one_refusal(
-            &scope(&model_of(&text), &FitOptions::default()),
-            must,
-            REMOVE,
-        );
+        one_refusal(&scope(&model_of(&text), &FitOptions::default()), must, REMOVE);
     }
 }
 
 /// M3 censoring: armed through the options, as `fit()` arms it.
 #[test]
 fn profile_refuses_m3_censoring() {
-    let opts = FitOptions {
-        bloq_method: Some(crate::types::BloqMethod::M3),
-        ..FitOptions::default()
-    };
+    let opts =
+        FitOptions { bloq_method: Some(crate::types::BloqMethod::M3), ..FitOptions::default() };
     one_refusal(
         &scope(&model_of(&counted()), &opts),
         "which scores each Gaussian row by its density; this fit scores censored rows by M3, \
@@ -413,14 +356,8 @@ fn profile_refuses_m3_censoring() {
 fn profile_accepts_a_correlation_line() {
     for kind in ["cs", "ar1", "car1"] {
         let text = counted()
-            .replace(
-                "  omega ETA_E0",
-                "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0",
-            )
-            .replace(
-                "  STUDY categorical",
-                "  STUDY categorical\n  ARM categorical",
-            )
+            .replace("  omega ETA_E0", "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0")
+            .replace("  STUDY categorical", "  STUDY categorical\n  ARM categorical")
             .replace(
                 "DV ~ additive(ADD_ERR)",
                 &format!("DV ~ additive(ADD_ERR)\n  correlation {kind}(RHO) by ARM"),
@@ -443,27 +380,18 @@ fn a_confounded_correlation_is_refused_before_the_profile_scope() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join("tests/data/profile_mbma/f1_profile.ferx"))
         .unwrap()
-        .replace(
-            "  omega ETA_E0",
-            "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0",
-        )
+        .replace("  omega ETA_E0", "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0")
         .replace(
             "DV ~ additive(ADD_ERR) weight = SE",
             "DV ~ additive(ADD_ERR) weight = SE\n  correlation cs(RHO) by OCC",
         );
     assert!(text.contains("correlation cs(RHO)"), "fixture moved");
-    let path = std::env::temp_dir().join(format!(
-        "ferx_profile_confounded_{}.ferx",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ferx_profile_confounded_{}.ferx", std::process::id()));
     std::fs::write(&path, text).unwrap();
     let p = crate::api::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root.join("tests/data/mbma_placebo/mbma_placebo.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root.join("tests/data/mbma_placebo/mbma_placebo.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_file(&path);
@@ -471,31 +399,17 @@ fn a_confounded_correlation_is_refused_before_the_profile_scope() {
         ("default", p.parsed.fit_options.clone()),
         (
             "with a `global_search`",
-            FitOptions {
-                global_search: true,
-                ..p.parsed.fit_options.clone()
-            },
+            FitOptions { global_search: true, ..p.parsed.fit_options.clone() },
         ),
     ] {
-        let opts = FitOptions {
-            verbose: false,
-            outer_maxiter: 0,
-            ..opts
-        };
+        let opts = FitOptions { verbose: false, outer_maxiter: 0, ..opts };
         let err = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &opts)
             .err()
             .unwrap_or_else(|| panic!("{how}: fitted"));
-        assert_eq!(
-            err.code(),
-            Some("E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA"),
-            "{how}: {err}"
-        );
+        assert_eq!(err.code(), Some("E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA"), "{how}: {err}");
     }
     // The straddle: the `global_search` request alone is the profile scope's refusal.
-    let g = FitOptions {
-        global_search: true,
-        ..p.parsed.fit_options.clone()
-    };
+    let g = FitOptions { global_search: true, ..p.parsed.fit_options.clone() };
     assert_eq!(scope(&p.parsed.model, &g).len(), 1);
 }
 
@@ -505,14 +419,8 @@ fn a_confounded_correlation_is_refused_before_the_profile_scope() {
 #[test]
 fn profile_refuses_mixture_diffusion_and_frem() {
     let mix = counted()
-        .replace(
-            "  omega ETA_E0",
-            "  theta MIXL(0.0, -5.0, 5.0)\n  omega ETA_E0",
-        )
-        .replace(
-            "[error_model]",
-            "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\n[error_model]",
-        );
+        .replace("  omega ETA_E0", "  theta MIXL(0.0, -5.0, 5.0)\n  omega ETA_E0")
+        .replace("[error_model]", "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\n[error_model]");
     one_refusal(
         &scope(&model_of(&mix), &FitOptions::default()),
         "which does not yet combine with a `[mixture]`.",
@@ -543,11 +451,8 @@ fn profile_refuses_mixture_diffusion_and_frem() {
 /// `r`, and `s` and `rsr`, which #2103 refused with "computes `r` only for now".
 #[test]
 fn profile_accepts_every_covariance_method() {
-    for m in [
-        CovarianceMethod::Hessian,
-        CovarianceMethod::CrossProduct,
-        CovarianceMethod::Sandwich,
-    ] {
+    for m in [CovarianceMethod::Hessian, CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich]
+    {
         let opts = FitOptions {
             run_covariance_step: true,
             covariance_method: m,
@@ -563,25 +468,13 @@ fn profile_accepts_every_covariance_method() {
 #[test]
 fn every_profiled_block_is_named() {
     let text = counted()
-        .replace(
-            "  omega ETA_E0",
-            "  theta ARMFX[2](0.0) profile\n  omega ETA_E0",
-        )
-        .replace(
-            "  STUDY categorical",
-            "  STUDY categorical\n  ARM categorical",
-        )
+        .replace("  omega ETA_E0", "  theta ARMFX[2](0.0) profile\n  omega ETA_E0")
+        .replace("  STUDY categorical", "  STUDY categorical\n  ARM categorical")
         // Each block read by its own prediction: one may read only one profiled block,
         // and since #2103 review #8 a profiled block must be read by some prediction.
-        .replace(
-            "  y = BASE",
-            "  y[CMT=1] = BASE\n  y[CMT=2] = TVE0 + ARMFX[ARM]",
-        );
+        .replace("  y = BASE", "  y[CMT=1] = BASE\n  y[CMT=2] = TVE0 + ARMFX[ARM]");
     let model = model_of(&text);
-    let saem = FitOptions {
-        method: EstimationMethod::Saem,
-        ..FitOptions::default()
-    };
+    let saem = FitOptions { method: EstimationMethod::Saem, ..FitOptions::default() };
     let msgs = scope(&model, &saem);
     assert!(
         msgs[0].starts_with("theta PLACEBO[...] and ARMFX[...] are `profile`d, "),
@@ -597,11 +490,7 @@ const SCORES: &str = "which scores Gaussian and binary rows only; ";
 /// `text` with a binary endpoint whose predictor is `logit`, beside the Gaussian rows.
 #[cfg(feature = "survival")]
 fn with_binary(text: &str, logit: &str) -> String {
-    text.replace(
-        "  omega ETA_E0",
-        "  theta TH0(0.0, -10.0, 10.0)\n  omega ETA_E0",
-    )
-    .replace(
+    text.replace("  omega ETA_E0", "  theta TH0(0.0, -10.0, 10.0)\n  omega ETA_E0").replace(
         "[error_model]",
         &format!("[binary_model]\n  cmt   = 3\n  logit = {logit}\n\n[error_model]"),
     )
@@ -614,10 +503,7 @@ fn with_binary(text: &str, logit: &str) -> String {
 #[test]
 fn a_binary_endpoint_beside_the_gaussian_rows_is_in_scope() {
     for logit in ["TH0", "TH0 + PLACEBO[STUDY]"] {
-        let msgs = scope(
-            &model_of(&with_binary(&counted(), logit)),
-            &FitOptions::default(),
-        );
+        let msgs = scope(&model_of(&with_binary(&counted(), logit)), &FitOptions::default());
         assert!(msgs.is_empty(), "logit = {logit}: {msgs:#?}");
     }
 }
@@ -681,14 +567,8 @@ fn beside_a_binary_endpoint_the_refusal_names_the_other_endpoint() {
 #[test]
 fn the_parse_time_profile_codes_map_to_their_diagnostics() {
     for (text, code) in [
-        (
-            mbma("theta PLACEBO(0.0) profile", "PLACEBO"),
-            "E_PROFILE_SCOPE",
-        ),
-        (
-            mbma("theta PLACEBO[3](0.0) profile", "exp(PLACEBO[STUDY])"),
-            "E_PROFILE_NOT_LINEAR",
-        ),
+        (mbma("theta PLACEBO(0.0) profile", "PLACEBO"), "E_PROFILE_SCOPE"),
+        (mbma("theta PLACEBO[3](0.0) profile", "exp(PLACEBO[STUDY])"), "E_PROFILE_NOT_LINEAR"),
     ] {
         let err = parse_full_model(&text).err().expect("refused");
         let d = crate::api::validation::parse_error_to_diagnostic(&err);
@@ -712,10 +592,7 @@ fn count_of(model: &CompiledModel, held: &[bool]) -> (usize, crate::types::BicIn
 /// PR2's shape: the optimizer holds every profiled level, the way it holds a FIX θ.
 fn held_like_the_profile_solve(model: &CompiledModel) -> Vec<bool> {
     let mut held = crate::estimation::parameterization::packed_fixed_mask(&model.default_params);
-    let idx = model
-        .indiv_param_partials
-        .theta_blocks
-        .profiled_theta_indices();
+    let idx = model.indiv_param_partials.theta_blocks.profiled_theta_indices();
     assert!(!idx.is_empty(), "the fixture must have profiled levels");
     for i in idx {
         held[i] = true;
@@ -730,11 +607,7 @@ fn held_like_the_profile_solve(model: &CompiledModel) -> Vec<bool> {
 #[test]
 fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
     let pairs = [
-        (
-            "theta PLACEBO[3](0.0) profile",
-            "theta PLACEBO[3](0.0, -10.0, 10.0)",
-            "PLACEBO[STUDY]",
-        ),
+        ("theta PLACEBO[3](0.0) profile", "theta PLACEBO[3](0.0, -10.0, 10.0)", "PLACEBO[STUDY]"),
         (
             "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile",
             "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 10.0)",
@@ -746,16 +619,9 @@ fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
         let u = bind(&mbma(u_decl, read), &mut population(3, 4));
         let u_held = crate::estimation::parameterization::packed_fixed_mask(&u.default_params);
         let want = count_of(&u, &u_held);
-        assert_eq!(
-            count_of(&p, &held_like_the_profile_solve(&p)),
-            want,
-            "{p_decl}"
-        );
+        assert_eq!(count_of(&p, &held_like_the_profile_solve(&p)), want, "{p_decl}");
         // The straddle: held and not counted back, the levels would vanish.
-        let searched = held_like_the_profile_solve(&p)
-            .iter()
-            .filter(|&&h| !h)
-            .count();
+        let searched = held_like_the_profile_solve(&p).iter().filter(|&&h| !h).count();
         assert!(searched < want.0, "{p_decl}: {searched} vs {}", want.0);
 
         // One level frozen (as #1891's `theta_fixed` freezes one) on both sides.
@@ -766,11 +632,7 @@ fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
         let u_held = crate::estimation::parameterization::packed_fixed_mask(&u.default_params);
         let want_frozen = count_of(&u, &u_held);
         assert_eq!(want_frozen.0, want.0 - 1);
-        assert_eq!(
-            count_of(&p, &held_like_the_profile_solve(&p)),
-            want_frozen,
-            "{p_decl}: frozen"
-        );
+        assert_eq!(count_of(&p, &held_like_the_profile_solve(&p)), want_frozen, "{p_decl}: frozen");
     }
 }
 
@@ -783,17 +645,12 @@ fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
 #[test]
 fn a_computed_index_read_gives_every_subject_every_level() {
     let with_d = |read: &str| {
-        mbma("theta PLACEBO[3](0.0) profile", read).replace(
-            "[individual_parameters]\n",
-            "[individual_parameters]\n  D = PLACEBO[STUDY]\n",
-        )
+        mbma("theta PLACEBO[3](0.0) profile", read)
+            .replace("[individual_parameters]\n", "[individual_parameters]\n  D = PLACEBO[STUDY]\n")
     };
     let mut pop = population(3, 2);
     let model = bind(&with_d("PLACEBO[4 - STUDY]"), &mut pop);
-    assert_eq!(
-        active_levels(&model, &pop)[0].per_subject,
-        vec![vec![0, 1, 2]; 6]
-    );
+    assert_eq!(active_levels(&model, &pop)[0].per_subject, vec![vec![0, 1, 2]; 6]);
 
     let mut pop = population(3, 2);
     let model = bind(&with_d("PLACEBO[STUDY]"), &mut pop);
@@ -827,10 +684,7 @@ fn a_defaulted_covariance_method_is_not_refused() {
 fn profile_refuses_an_optimizer_its_outer_loop_does_not_run() {
     use crate::types::Optimizer;
     for opt in [Optimizer::TrustRegion, Optimizer::Mma] {
-        let o = FitOptions {
-            optimizer: opt,
-            ..FitOptions::default()
-        };
+        let o = FitOptions { optimizer: opt, ..FitOptions::default() };
         one_refusal(
             &scope(&model_of(&counted()), &o),
             &format!(
@@ -849,10 +703,7 @@ fn profile_refuses_an_optimizer_its_outer_loop_does_not_run() {
         Optimizer::Lbfgs,
         Optimizer::Bfgs,
     ] {
-        let o = FitOptions {
-            optimizer: opt,
-            ..FitOptions::default()
-        };
+        let o = FitOptions { optimizer: opt, ..FitOptions::default() };
         assert!(scope(&model_of(&counted()), &o).is_empty(), "{opt:?}");
     }
 }
@@ -861,10 +712,7 @@ fn profile_refuses_an_optimizer_its_outer_loop_does_not_run() {
 /// loop, so each is refused rather than silently dropped.
 #[test]
 fn profile_refuses_a_global_search_and_a_prior() {
-    let o = FitOptions {
-        global_search: true,
-        ..FitOptions::default()
-    };
+    let o = FitOptions { global_search: true, ..FitOptions::default() };
     one_refusal(
         &scope(&model_of(&counted()), &o),
         "which does not yet run a `global_search` pre-search.",
@@ -949,9 +797,7 @@ fn f1_prepared(profiled: bool, edit_csv: impl Fn(String) -> String) -> crate::ap
 
 /// [`f1_prepared`] with `edit_model` applied to the model text first.
 fn f1_prepared_with(
-    profiled: bool,
-    edit_model: impl Fn(String) -> String,
-    edit_csv: impl Fn(String) -> String,
+    profiled: bool, edit_model: impl Fn(String) -> String, edit_csv: impl Fn(String) -> String,
 ) -> crate::api::PreparedRun {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let text =
@@ -959,11 +805,7 @@ fn f1_prepared_with(
     let block = "](0.0) profile";
     assert!(text.contains(block), "fixture moved");
     let text = edit_model(text);
-    let text = if profiled {
-        text
-    } else {
-        text.replace(block, "](0.0, -50.0, 50.0)")
-    };
+    let text = if profiled { text } else { text.replace(block, "](0.0, -50.0, 50.0)") };
     let csv = edit_csv(
         std::fs::read_to_string(root.join("tests/data/mbma_placebo/mbma_placebo.csv")).unwrap(),
     );
@@ -1005,9 +847,7 @@ fn study_1_twice(csv: String) -> String {
 fn rsr_names_the_levels_a_single_subject_reads() {
     for profiled in [true, false] {
         let p = f1_prepared(profiled, |c| c);
-        let labels = p.parsed.model.theta_blocks().level_blocks()[0]
-            .labels()
-            .to_vec();
+        let labels = p.parsed.model.theta_blocks().level_blocks()[0].labels().to_vec();
         let n = labels.len();
         let want = |k: usize, e: &str| {
             format!(
@@ -1023,11 +863,8 @@ fn rsr_names_the_levels_a_single_subject_reads() {
         };
         let got = at(&p, Some(CovarianceMethod::Sandwich)).expect("rsr carries the note");
         assert_eq!(got, want(n, &labels[0]), "profiled={profiled}");
-        for silent in [
-            Some(CovarianceMethod::Hessian),
-            Some(CovarianceMethod::CrossProduct),
-            None,
-        ] {
+        for silent in [Some(CovarianceMethod::Hessian), Some(CovarianceMethod::CrossProduct), None]
+        {
             assert_eq!(at(&p, silent), None, "profiled={profiled}, {silent:?}");
         }
         let entry = crate::types::classify_warning(&got);
@@ -1036,10 +873,7 @@ fn rsr_names_the_levels_a_single_subject_reads() {
 
         let shared = f1_prepared(profiled, study_1_twice);
         let study_1 = labels.iter().filter(|l| l.starts_with("STUDY=1,")).count();
-        assert!(
-            study_1 > 0 && study_1 < n,
-            "fixture: study 1 holds some levels"
-        );
+        assert!(study_1 > 0 && study_1 < n, "fixture: study 1 holds some levels");
         let first_single = labels.iter().find(|l| !l.starts_with("STUDY=1,")).unwrap();
         assert_eq!(
             at(&shared, Some(CovarianceMethod::Sandwich)),
@@ -1067,12 +901,7 @@ fn rsr_counts_only_levels_that_have_a_standard_error() {
     };
     let fix = f1_prepared_with(true, |t| t.replace("](0.0) profile", "](0.0) FIX"), |c| c);
     assert!(
-        fix.parsed
-            .model
-            .default_params
-            .theta_fixed
-            .iter()
-            .any(|&f| f),
+        fix.parsed.model.default_params.theta_fixed.iter().any(|&f| f),
         "fixture: the block is FIX"
     );
     assert_eq!(at(&fix), None, "a FIX block has no rsr SE to call unusable");
@@ -1087,9 +916,7 @@ fn rsr_counts_only_levels_that_have_a_standard_error() {
     };
     for profiled in [true, false] {
         let p = f1_prepared_with(profiled, to_ref, |c| c);
-        let labels = p.parsed.model.theta_blocks().level_blocks()[0]
-            .labels()
-            .to_vec();
+        let labels = p.parsed.model.theta_blocks().level_blocks()[0].labels().to_vec();
         assert_eq!(labels.len(), 24);
         let got = at(&p).unwrap_or_else(|| panic!("profiled={profiled}: no note"));
         assert!(
@@ -1158,22 +985,12 @@ fn rsr_is_silent_when_every_level_is_shared() {
         std::fs::read_to_string(root.join("tests/data/profile_mbma/s1_profile.ferx")).unwrap();
     let block = "theta PLACEBO[STUDY, TIME](0.0) profile";
     assert!(text.contains(block), "fixture moved");
-    let path = std::env::temp_dir().join(format!(
-        "ferx_one_subject_visit_{}.ferx",
-        std::process::id()
-    ));
-    std::fs::write(
-        &path,
-        text.replace(block, "theta PLACEBO[TIME](0.0) profile"),
-    )
-    .unwrap();
+    let path =
+        std::env::temp_dir().join(format!("ferx_one_subject_visit_{}.ferx", std::process::id()));
+    std::fs::write(&path, text.replace(block, "theta PLACEBO[TIME](0.0) profile")).unwrap();
     let p = crate::api::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root.join("tests/data/profile_mbma/s100t8.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root.join("tests/data/profile_mbma/s100t8.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_file(&path);
@@ -1223,13 +1040,7 @@ fn binary_reading(read: &str) -> String {
 fn a_profiled_block_in_the_binary_predictor_is_walked_as_a_linked_readout() {
     let parsed = parse_full_model(&binary_reading("PLACEBO[STUDY]"))
         .unwrap_or_else(|e| panic!("an affine binary read passes the walk: {e}"));
-    let decl = parsed
-        .model
-        .theta_blocks()
-        .decls
-        .iter()
-        .find(|d| d.name == "PLACEBO")
-        .unwrap();
+    let decl = parsed.model.theta_blocks().decls.iter().find(|d| d.name == "PLACEBO").unwrap();
     assert!(decl.linked, "the binary predictor's link is implicit");
     let msgs = scope(&parsed.model, &FitOptions::default());
     assert!(msgs.is_empty(), "in scope since #2111: {msgs:#?}");
@@ -1258,9 +1069,7 @@ fn a_profiled_block_in_the_binary_predictor_is_walked_as_a_linked_readout() {
 #[test]
 fn a_profiled_block_read_only_in_a_hazard_reaches_the_endpoint_refusal() {
     let unread = mbma("theta PLACEBO[3](0.0) profile", "0.0");
-    let err = parse_full_model(&unread)
-        .err()
-        .expect("read by nothing, with no endpoint block");
+    let err = parse_full_model(&unread).err().expect("read by nothing, with no endpoint block");
     assert!(err.contains("no prediction reads it"), "{err}");
 
     let text = unread
@@ -1278,8 +1087,6 @@ fn a_profiled_block_read_only_in_a_hazard_reaches_the_endpoint_refusal() {
 
     // An endpoint block that reads something else does not excuse an unread block.
     let elsewhere = text.replace("TVLAMBDA * exp(PLACEBO[STUDY])", "TVLAMBDA");
-    let err = parse_full_model(&elsewhere)
-        .err()
-        .expect("the hazard does not read the block");
+    let err = parse_full_model(&elsewhere).err().expect("the hazard does not read the block");
     assert!(err.contains("no prediction reads it"), "{err}");
 }

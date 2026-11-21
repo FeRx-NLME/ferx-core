@@ -38,10 +38,7 @@ fn a_pinned_fit_never_reports_an_unusable_environment() {
     // The variable is not consulted at all for a pinned fit, so telling the user it "was
     // ignored" would blame a setting that had no say either way.
     let r = resolve_fit_threads(Some(3), 0, Some("x"), AVAILABLE);
-    assert_eq!(
-        (r.n, r.source, r.env_ignored),
-        (3, ThreadSource::Pinned, None)
-    );
+    assert_eq!((r.n, r.source, r.env_ignored), (3, ThreadSource::Pinned, None));
 }
 
 #[test]
@@ -72,10 +69,7 @@ fn the_engine_default_spelling_lets_the_environment_apply() {
 #[test]
 fn no_environment_falls_back_to_the_capped_default() {
     let r = resolve_fit_threads(None, 0, None, AVAILABLE);
-    assert_eq!(
-        (r.n, r.source, r.env_ignored),
-        (AUTO, ThreadSource::Auto, None)
-    );
+    assert_eq!((r.n, r.source, r.env_ignored), (AUTO, ThreadSource::Auto, None));
 }
 
 #[test]
@@ -117,10 +111,7 @@ fn an_ignored_environment_is_reported_by_name_value_and_outcome() {
     assert!(w.contains("was ignored"), "{w}");
     assert!(w.contains("engine default of 7 thread(s)"), "{w}");
     let e = classify_warning(w);
-    assert_eq!(
-        (e.category, e.severity),
-        (WarningCode::Threads, WarningSeverity::Warning)
-    );
+    assert_eq!((e.category, e.severity), (WarningCode::Threads, WarningSeverity::Warning));
 }
 
 #[test]
@@ -140,16 +131,10 @@ fn an_environment_pin_above_the_cpus_warns_and_says_to_change_the_variable() {
     assert!(w.contains("time-share the cores"), "{w}");
     // The advice must be one the user can act on: `threads = 0` cannot lower an env pin,
     // because the env pin *is* what the engine default resolves to.
-    assert!(
-        w.contains("unset RAYON_NUM_THREADS or lower it to at most 8"),
-        "{w}"
-    );
+    assert!(w.contains("unset RAYON_NUM_THREADS or lower it to at most 8"), "{w}");
     assert!(!w.contains("threads = 0"), "{w}");
     let e = classify_warning(w);
-    assert_eq!(
-        (e.category, e.severity),
-        (WarningCode::Threads, WarningSeverity::Warning)
-    );
+    assert_eq!((e.category, e.severity), (WarningCode::Threads, WarningSeverity::Warning));
 }
 
 #[test]
@@ -159,10 +144,7 @@ fn a_pinned_threads_above_the_cpus_warns_and_says_to_change_threads() {
     assert_eq!(w.len(), 1, "{w:?}");
     let w = &w[0];
     assert!(w.contains("(pinned by `threads`)"), "{w}");
-    assert!(
-        w.contains("consider threads = 0 (engine default) or at most 8"),
-        "{w}"
-    );
+    assert!(w.contains("consider threads = 0 (engine default) or at most 8"), "{w}");
     assert!(!w.contains("unset RAYON_NUM_THREADS"), "{w}");
 }
 
@@ -170,11 +152,7 @@ fn a_pinned_threads_above_the_cpus_warns_and_says_to_change_threads() {
 fn a_declared_width_above_the_cpus_names_the_flag() {
     let w = thread_warnings(16, ThreadSource::Declared, None, AVAILABLE, 100, false);
     assert_eq!(w.len(), 1, "{w:?}");
-    assert!(
-        w[0].contains("(pinned process-wide by `--threads`)"),
-        "{}",
-        w[0]
-    );
+    assert!(w[0].contains("(pinned process-wide by `--threads`)"), "{}", w[0]);
     // `threads = 0` resolves to the declared width, so advising it would change nothing
     // (#2813 review row 2): the advice names the flag that set the width instead.
     assert!(w[0].contains("lower --threads to at most 8"), "{}", w[0]);
@@ -207,21 +185,14 @@ fn a_fit_reports_an_ignored_environment_only_when_it_was_consulted() {
     };
     // Dropping `env_ignored` on the way to `thread_warnings` reddens the first; passing it
     // regardless of the pin reddens the second.
-    assert!(
-        env_warned(None),
-        "an unpinned fit read the variable and must say so"
-    );
+    assert!(env_warned(None), "an unpinned fit read the variable and must say so");
     assert!(!env_warned(Some(3)), "a pinned fit never read it");
 }
 
 #[test]
 fn a_count_at_the_cpus_does_not_warn() {
     // The boundary: `n_used == available` is a full machine, not an oversubscribed one.
-    for source in [
-        ThreadSource::Pinned,
-        ThreadSource::Declared,
-        ThreadSource::Env,
-    ] {
+    for source in [ThreadSource::Pinned, ThreadSource::Declared, ThreadSource::Env] {
         let w = thread_warnings(AVAILABLE, source, None, AVAILABLE, 100, false);
         assert!(w.is_empty(), "{source:?}: {w:?}");
     }
@@ -246,10 +217,7 @@ fn the_more_threads_than_subjects_note_names_where_the_count_came_from() {
     );
     assert!(w.contains("consider threads = 3"), "{w}");
     let e = classify_warning(w);
-    assert_eq!(
-        (e.category, e.severity),
-        (WarningCode::Threads, WarningSeverity::Info)
-    );
+    assert_eq!((e.category, e.severity), (WarningCode::Threads, WarningSeverity::Info));
 
     let auto = thread_warnings(7, ThreadSource::Auto, None, AVAILABLE, 3, false);
     assert!(auto[0].contains("(engine default)"), "{}", auto[0]);

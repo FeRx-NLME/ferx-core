@@ -110,22 +110,14 @@ fn fit_fixture(data: &str, outer_maxiter: Option<usize>) -> FitResult {
     if let Some(m) = outer_maxiter {
         opts.outer_maxiter = m;
     }
-    fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect("the fixture fit returns a result")
+    fit(&parsed.model, &population, &parsed.model.default_params, &opts)
+        .expect("the fixture fit returns a result")
 }
 
 /// The OFV a `W_EBE_START_DEPENDENT` basin-shift message quotes as the cold re-solve:
 /// `({cold:.4} vs {best_seen:.4})`.
 fn quoted_pair(message: &str) -> (f64, f64) {
-    let open = message
-        .find(" there (")
-        .expect("message quotes the two objectives")
-        + 8;
+    let open = message.find(" there (").expect("message quotes the two objectives") + 8;
     let close = open + message[open..].find(')').unwrap();
     let mut it = message[open..close].split(" vs ");
     let cold = it.next().unwrap().trim().parse().unwrap();
@@ -178,16 +170,10 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
          objective is ≈ 68.083. Got {}",
         result.ofv
     );
-    assert!(
-        result.converged,
-        "the restarted leg converged on its own terms"
-    );
+    assert!(result.converged, "the restarted leg converged on its own terms");
     // The gap was resolved, so it must not be reported as surviving.
     assert!(
-        !result
-            .warnings_structured
-            .iter()
-            .any(|w| w.category == WarningCode::EbeStartDependent),
+        !result.warnings_structured.iter().any(|w| w.category == WarningCode::EbeStartDependent),
         "no start-dependence warning once the restart resolved the gap: {:?}",
         result.warnings
     );
@@ -199,11 +185,7 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
 /// `converged = true`; the gap must surface as a warning and a non-converged fit.
 #[test]
 fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
-    let result = fit_fixture_with(
-        "tests/fixtures/mm_basin_shift/mm_basin10.csv",
-        Some(3),
-        false,
-    );
+    let result = fit_fixture_with("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(3), false);
 
     let warning = result
         .warnings_structured
@@ -238,19 +220,13 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         (best - cold - 7.0614).abs() < 0.02,
         "measured gap ≈ 7.06 (best-seen ≈ 75.16, cold ≈ 68.10): got {best} vs {cold}"
     );
-    assert!(
-        !result.converged,
-        "a fit optimized under trapped EBEs must not report converged"
-    );
+    assert!(!result.converged, "a fit optimized under trapped EBEs must not report converged");
 }
 
 /// Tier 3: the benchmark the issue was found on, 200 subjects. `main` reported 784.33
 /// converged; the optimum is 775.39 (NONMEM, `MCETA = 200`: 775.414).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn mm_benchmark_reaches_the_optimum() {
     let result = fit_fixture_with("tests/fixtures/mm_basin_shift/mm_n200.csv", None, true);
     assert!(

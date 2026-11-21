@@ -280,10 +280,7 @@ fn probit_record_term_carries_s_to_the_k_on_every_order() {
             let g = neg_log_normal_cdf_jet(s * lp);
             let t = binary_record_nll_g(LinkFn::Probit, T4::seed(lp, 0), y);
             let f = binary_record_nll_g(LinkFn::Probit, lp, y);
-            assert_eq!(
-                t.c[0], f,
-                "lp {lp} y {y}: the jet's value is the f64 kernel's"
-            );
+            assert_eq!(t.c[0], f, "lp {lp} y {y}: the jet's value is the f64 kernel's");
             for k in 0..5 {
                 let want = s.powi(k as i32) * g[k];
                 let got = t.c[k] * fact[k];
@@ -351,12 +348,7 @@ fn probit_sampler_probability_agrees_with_likelihood() {
     for lp in [-3.0_f64, -0.8, 0.0, 0.6, 2.4] {
         let p = binary_prob(LinkFn::Probit, lp);
         for state in [0usize, 1] {
-            let rec = ObsRecord::DiscreteState {
-                time: 0.0,
-                raw_time: 0.0,
-                state,
-                cmt: 3,
-            };
+            let rec = ObsRecord::DiscreteState { time: 0.0, raw_time: 0.0, state, cmt: 3 };
             let from_p = if state == 1 { -p.ln() } else { -(1.0 - p).ln() };
             let from_term =
                 binary_data_term(LinkFn::Probit, &lp_fn(lp), 3, &[rec], &[], &[], None, &cov);
@@ -383,12 +375,8 @@ fn an_overflowing_probit_predictor_is_a_degenerate_draw_not_nan() {
     assert_eq!(binary_prob(LinkFn::Probit, f64::INFINITY), 1.0);
     assert_eq!(binary_prob(LinkFn::Probit, f64::NEG_INFINITY), 0.0);
     assert!(binary_prob(LinkFn::Probit, f64::NAN).is_nan());
-    let rec = |time: f64, state: usize| ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt: 3,
-    };
+    let rec =
+        |time: f64, state: usize| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 3 };
     let subject = Subject {
         id: "1".into(),
         obs_records: vec![rec(0.0, 1), rec(1.0, 0)],
@@ -450,34 +438,16 @@ fn the_nan_predictor_warning_names_either_key() {
     .unwrap();
     let subject = Subject {
         id: "7".into(),
-        obs_records: vec![ObsRecord::DiscreteState {
-            time: 0.0,
-            raw_time: 0.0,
-            state: 1,
-            cmt: 3,
-        }],
+        obs_records: vec![ObsRecord::DiscreteState { time: 0.0, raw_time: 0.0, state: 1, cmt: 3 }],
         ..Default::default()
     };
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(2603);
     let (mut sims, mut warnings) = (Vec::new(), Vec::new());
-    simulate_binary(
-        &model,
-        &subject,
-        &[1.0],
-        &[],
-        0,
-        0,
-        &mut rng,
-        &mut sims,
-        &mut warnings,
-    );
+    simulate_binary(&model, &subject, &[1.0], &[], 0, 0, &mut rng, &mut sims, &mut warnings);
     assert!(sims.is_empty());
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     let w = &warnings[0];
-    assert!(
-        w.contains("subject 7 has 1 record(s) whose linear predictor evaluated to NaN"),
-        "{w}"
-    );
+    assert!(w.contains("subject 7 has 1 record(s) whose linear predictor evaluated to NaN"), "{w}");
     assert!(
         w.contains(
             "Check the linear predictor (`logit =` / `probit =`) and the subject's covariates."
@@ -503,17 +473,9 @@ fn the_nan_predictor_warning_names_either_key() {
 fn the_probit_jet_past_the_normal_cdf_overflow_is_the_certain_record() {
     let control = 1e150;
     assert!((control / std::f64::consts::SQRT_2).powi(2).is_finite());
-    assert_eq!(
-        neg_log_normal_cdf_jet(control),
-        [0.0; 5],
-        "jet({control:e})"
-    );
+    assert_eq!(neg_log_normal_cdf_jet(control), [0.0; 5], "jet({control:e})");
     for x in [1e155, 1e300, f64::INFINITY] {
-        assert_eq!(
-            (x / std::f64::consts::SQRT_2).powi(2),
-            f64::INFINITY,
-            "{x:e}"
-        );
+        assert_eq!((x / std::f64::consts::SQRT_2).powi(2), f64::INFINITY, "{x:e}");
         assert_eq!(neg_log_normal_cdf_jet(x), [0.0; 5], "jet({x:e})");
     }
 }

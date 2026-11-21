@@ -62,24 +62,18 @@ fn assert_structured_sir(f: &FitResult) {
 }
 
 fn low_ess(f: &FitResult) -> Option<&String> {
-    f.warnings
-        .iter()
-        .find(|w| w.starts_with("SIR: effective sample size"))
+    f.warnings.iter().find(|w| w.starts_with("SIR: effective sample size"))
 }
 
 /// A fit with `sir = true` (1000 draws, 250 resamples, seed 1705) and the
 /// covariance step, plus what `run_sir` needs to re-run SIR on it.
 fn fit_with_sir(
-    model: &str,
-    data: &str,
-    tweak: impl Fn(&mut FitOptions),
+    model: &str, data: &str, tweak: impl Fn(&mut FitOptions),
 ) -> (FitResult, FitOptions, PreparedRun) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let prep = prepare_run(
-        root.join(model).to_str().unwrap(),
-        Some(root.join(data).to_str().unwrap()),
-    )
-    .expect("prepare");
+    let prep =
+        prepare_run(root.join(model).to_str().unwrap(), Some(root.join(data).to_str().unwrap()))
+            .expect("prepare");
     let mut opts = FitOptions {
         verbose: false,
         run_covariance_step: true,
@@ -90,22 +84,13 @@ fn fit_with_sir(
         ..prep.parsed.fit_options.clone()
     };
     tweak(&mut opts);
-    let f = fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("fit");
+    let f = fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("fit");
     assert!(f.covariance_matrix.is_some(), "covariance step failed");
     (f, opts, prep)
 }
 
 fn rerun(f: &FitResult, opts: &FitOptions, prep: &PreparedRun, scale: SirScale) -> FitResult {
-    let o = FitOptions {
-        sir_scale: scale,
-        ..opts.clone()
-    };
+    let o = FitOptions { sir_scale: scale, ..opts.clone() };
     run_sir(f, Some(&prep.parsed.model), Some(&prep.population), &o).expect("run_sir")
 }
 
@@ -125,10 +110,7 @@ fn rerun(f: &FitResult, opts: &FitOptions, prep: &PreparedRun, scale: SirScale) 
 /// reads 57.3 (#1723 amendment A0), so the ESS assertion is the re-centre's
 /// run-level kill.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() {
     let (f, opts, prep) =
         fit_with_sir("examples/warfarin_iov.ferx", "data/warfarin_iov.csv", |o| {
@@ -168,10 +150,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert_ess(f.sir_ess, 3.549_036_206_647_439_7, "FOCEI packed");
     let w = low_ess(&f).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", f.warnings));
     assert_eq!(
-        f.warnings
-            .iter()
-            .filter(|x| x.starts_with("SIR: effective"))
-            .count(),
+        f.warnings.iter().filter(|x| x.starts_with("SIR: effective")).count(),
         1,
         "{:?}",
         f.warnings
@@ -184,12 +163,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     ] {
         assert!(w.contains(s), "missing {s:?} in {w}");
     }
-    for s in [
-        "ETA_CL (ΔOFV",
-        "ETA_V (ΔOFV",
-        "KAPPA_CL (ΔOFV",
-        "sir_scale = packed",
-    ] {
+    for s in ["ETA_CL (ΔOFV", "ETA_V (ΔOFV", "KAPPA_CL (ΔOFV", "sir_scale = packed"] {
         assert!(!w.contains(s), "unexpected {s:?} in {w}");
     }
 
@@ -202,16 +176,9 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
 /// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820667781389 since #2786's last wave; 402.3883345788064 from #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn warfarin_iov_foce_carries_no_sir_warning() {
-    let (f, _, _) = fit_with_sir(
-        "examples/warfarin_iov.ferx",
-        "data/warfarin_iov.csv",
-        |_| {},
-    );
+    let (f, _, _) = fit_with_sir("examples/warfarin_iov.ferx", "data/warfarin_iov.csv", |_| {});
     report(&[("FOCE packed", f.sir_ess)]);
     // #2093 moved every ESS literal in this file: the fit reaches the same optimum (OFV equal
     // to six decimals on all three fits, worst θ 4.8e-6 relative, measured against `main`), but the
@@ -294,10 +261,7 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
 /// **with** the warning, which points back to `packed` and carries no box
 /// sentence. Flipping the default to natural reddens the packed half.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
     let (f, opts, prep) = fit_with_sir(
         "tests/data/mbma_placebo/mbma_placebo.ferx",
@@ -346,10 +310,7 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
 
     assert_ess(nat.sir_ess, 43.099_436_650_396_704, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
-    assert!(
-        w.contains("`sir_scale = packed` may sample it better"),
-        "{w}"
-    );
+    assert!(w.contains("`sir_scale = packed` may sample it better"), "{w}");
     assert!(!w.contains("parameter box"), "{w}");
     // Through `run_sir`, whose result rebuilds the structured list.
     assert_structured_sir(&nat);

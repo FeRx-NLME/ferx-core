@@ -25,9 +25,7 @@ use crate::types::{CompiledModel, ModelParameters, Population};
 /// the other starts' objective passes, so a draining `predict()` would delete their
 /// steady-state non-convergence notes (#1652 review r1 #1).
 fn rrmse(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Result<f64, EngineError> {
     let preds = predict_diag_undrained(model, population, params)?.results;
 
@@ -48,11 +46,7 @@ fn rrmse(
         }
     }
 
-    Ok(if n == 0 {
-        f64::INFINITY
-    } else {
-        (sum_sq / n as f64).sqrt()
-    })
+    Ok(if n == 0 { f64::INFINITY } else { (sum_sq / n as f64).sqrt() })
 }
 
 /// Build a log-space grid of `n_pts` values centred on `centre`,
@@ -64,9 +58,7 @@ fn log_grid(centre: f64, factor: f64, n_pts: usize) -> Vec<f64> {
     let log_lo = (centre / factor).ln();
     let log_hi = (centre * factor).ln();
     let step = (log_hi - log_lo) / (n_pts - 1) as f64;
-    (0..n_pts)
-        .map(|i| (log_lo + i as f64 * step).exp())
-        .collect()
+    (0..n_pts).map(|i| (log_lo + i as f64 * step).exp()).collect()
 }
 
 /// Sweep a pair of theta indices jointly over an `n_pts × n_pts` log-space grid.
@@ -76,14 +68,8 @@ fn log_grid(centre: f64, factor: f64, n_pts: usize) -> Vec<f64> {
 ///
 /// `Err` is the first `predict()` refusal on the grid (#898).
 pub fn sweep_slots(
-    model: &CompiledModel,
-    population: &Population,
-    base: &ModelParameters,
-    slot_a: usize,
-    slot_b: usize,
-    n_pts: usize,
-    factor: f64,
-    label: &str,
+    model: &CompiledModel, population: &Population, base: &ModelParameters, slot_a: usize,
+    slot_b: usize, n_pts: usize, factor: f64, label: &str,
 ) -> Result<(ModelParameters, Vec<String>), EngineError> {
     let mut warnings = Vec::new();
 
@@ -100,10 +86,8 @@ pub fn sweep_slots(
     let grid_a = log_grid(base.theta[ia], factor, n_pts);
     let grid_b = log_grid(base.theta[ib], factor, n_pts);
 
-    let pairs: Vec<(f64, f64)> = grid_a
-        .iter()
-        .flat_map(|&a| grid_b.iter().map(move |&b| (a, b)))
-        .collect();
+    let pairs: Vec<(f64, f64)> =
+        grid_a.iter().flat_map(|&a| grid_b.iter().map(move |&b| (a, b))).collect();
 
     let rrmses: Vec<f64> = pairs
         .par_iter()
@@ -139,12 +123,8 @@ pub fn sweep_slots(
 /// `targets` should be the indices of non-fixed thetas that Option A did not
 /// write (still at model default) — see [`crate::suggest_start::inits_from_nca`].
 pub fn sweep_unwritten_thetas(
-    model: &CompiledModel,
-    population: &Population,
-    base: &ModelParameters,
-    targets: &[usize],
-    n_pts: usize,
-    factor: f64,
+    model: &CompiledModel, population: &Population, base: &ModelParameters, targets: &[usize],
+    n_pts: usize, factor: f64,
 ) -> Result<(ModelParameters, Vec<String>), EngineError> {
     if targets.is_empty() {
         return Ok((base.clone(), Vec::new()));
@@ -196,9 +176,7 @@ pub fn sweep_unwritten_thetas(
 /// space (same ordering as `population.subjects`).  Returns (rRMSE, new_etas)
 /// so the caller can thread warm-starts through sequential grid traversal.
 fn rrmse_ebe(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
     prev_etas: Option<&[DVector<f64>]>,
 ) -> (f64, Vec<DVector<f64>>) {
     // Run inner loop with warm-start. 20 iterations and 1e-3 tolerance are
@@ -230,11 +208,7 @@ fn rrmse_ebe(
         }
     }
 
-    let rrmse_val = if n == 0 {
-        f64::INFINITY
-    } else {
-        (sum_sq / n as f64).sqrt()
-    };
+    let rrmse_val = if n == 0 { f64::INFINITY } else { (sum_sq / n as f64).sqrt() };
 
     (rrmse_val, eta_hats)
 }
@@ -244,14 +218,8 @@ fn rrmse_ebe(
 /// Grid traversal is sequential (row-major) so EBEs from each point warm-start
 /// the next; the rayon parallelism is inside `run_inner_loop_warm` (subjects).
 pub fn sweep_slots_ebe(
-    model: &CompiledModel,
-    population: &Population,
-    base: &ModelParameters,
-    slot_a: usize,
-    slot_b: usize,
-    n_pts: usize,
-    factor: f64,
-    label: &str,
+    model: &CompiledModel, population: &Population, base: &ModelParameters, slot_a: usize,
+    slot_b: usize, n_pts: usize, factor: f64, label: &str,
 ) -> (ModelParameters, Vec<String>) {
     let mut warnings = Vec::new();
 
@@ -299,12 +267,8 @@ pub fn sweep_slots_ebe(
 /// Warm-starts EBEs from the final grid point of each sweep as the initial
 /// estimate for the next sweep.
 pub fn sweep_unwritten_thetas_ebe(
-    model: &CompiledModel,
-    population: &Population,
-    base: &ModelParameters,
-    targets: &[usize],
-    n_pts: usize,
-    factor: f64,
+    model: &CompiledModel, population: &Population, base: &ModelParameters, targets: &[usize],
+    n_pts: usize, factor: f64,
 ) -> (ModelParameters, Vec<String>) {
     if targets.is_empty() {
         return (base.clone(), Vec::new());
@@ -403,10 +367,7 @@ mod tests {
             warnings: vec![],
         };
         let r = rrmse(&model, &empty_pop, &model.default_params).unwrap();
-        assert!(
-            r.is_infinite() && r > 0.0,
-            "empty population must give +∞ rRMSE, got {r}"
-        );
+        assert!(r.is_infinite() && r > 0.0, "empty population must give +∞ rRMSE, got {r}");
     }
 
     /// #1652 review r1 #1: the sweep runs inside `fit()`'s SS-sink window, once per start of a
@@ -466,10 +427,7 @@ mod tests {
             warnings: vec![],
         };
         let (r, _etas) = rrmse_ebe(&model, &population, &params, None);
-        assert!(
-            r < 1e-6,
-            "rRMSE={r} — TV covariate ignored in NCA-EBE sweep?"
-        );
+        assert!(r < 1e-6, "rRMSE={r} — TV covariate ignored in NCA-EBE sweep?");
     }
 
     // ── sweep_slots (etas=0) ────────────────────────────────────────────────
@@ -492,15 +450,8 @@ mod tests {
             "CL/Q (synthetic)",
         )
         .unwrap();
-        assert_eq!(
-            out.theta, base.theta,
-            "missing slot must leave base unchanged"
-        );
-        assert_eq!(
-            warnings.len(),
-            1,
-            "exactly one slot-missing warning expected"
-        );
+        assert_eq!(out.theta, base.theta, "missing slot must leave base unchanged");
+        assert_eq!(warnings.len(), 1, "exactly one slot-missing warning expected");
         assert!(
             warnings[0].contains("could not locate theta indices"),
             "warning text must mention missing-slot reason, got: {}",
@@ -577,20 +528,9 @@ mod tests {
         let (model, population) = warfarin();
         let base = model.default_params.clone();
         // 3×3 grid keeps the test fast (~1 s for warfarin's 30 subjects).
-        let (out, warnings) = sweep_slots_ebe(
-            &model,
-            &population,
-            &base,
-            PK_IDX_CL,
-            PK_IDX_V,
-            3,
-            3.0,
-            "CL/V",
-        );
-        assert!(
-            warnings.is_empty(),
-            "happy path must not warn, got: {warnings:?}"
-        );
+        let (out, warnings) =
+            sweep_slots_ebe(&model, &population, &base, PK_IDX_CL, PK_IDX_V, 3, 3.0, "CL/V");
+        assert!(warnings.is_empty(), "happy path must not warn, got: {warnings:?}");
         // Theta bounds must be respected.
         for (i, &t) in out.theta.iter().enumerate() {
             assert!(

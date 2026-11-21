@@ -101,25 +101,15 @@ fn fixture() -> &'static Fixture {
             inner_optimizer: InnerOptimizer::Lbfgs,
             ..prep.parsed.fit_options.clone()
         };
-        let fit_a = fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &lbfgs,
-        )
-        .expect("lbfgs fit");
+        let fit_a = fit(&prep.parsed.model, &prep.population, &prep.init_params, &lbfgs)
+            .expect("lbfgs fit");
         let mut displaced = fit_a.clone();
         for subject in &mut displaced.subjects {
             subject.eta.add_scalar_mut(DISPLACEMENT);
         }
         let displaced_lbfgs = bits(
-            &run_covariance(
-                &displaced,
-                Some(&prep.parsed.model),
-                Some(&prep.population),
-                &lbfgs,
-            )
-            .expect("run_covariance"),
+            &run_covariance(&displaced, Some(&prep.parsed.model), Some(&prep.population), &lbfgs)
+                .expect("run_covariance"),
         );
         // The displaced EBEs must be the step's start, or (i), (iii) and T5 would run from fit
         // A's own EBEs, where the solver need not matter (module doc). `reported_ebe_inputs`
@@ -138,13 +128,7 @@ fn fixture() -> &'static Fixture {
             "(i) premise: the step must start from the displaced EBEs, but it reproduced fit A's \
              inline covariance"
         );
-        Fixture {
-            prep,
-            lbfgs,
-            fit_a,
-            displaced,
-            displaced_lbfgs,
-        }
+        Fixture { prep, lbfgs, fit_a, displaced, displaced_lbfgs }
     })
 }
 
@@ -156,13 +140,8 @@ fn bits(fit: &FitResult) -> Vec<u64> {
 
 fn cov_from(f: &Fixture, start: &FitResult, options: &FitOptions) -> Vec<u64> {
     bits(
-        &run_covariance(
-            start,
-            Some(&f.prep.parsed.model),
-            Some(&f.prep.population),
-            options,
-        )
-        .expect("run_covariance"),
+        &run_covariance(start, Some(&f.prep.parsed.model), Some(&f.prep.population), options)
+            .expect("run_covariance"),
     )
 }
 
@@ -194,13 +173,7 @@ fn nelder_mead_fit(f: &Fixture) {
         outer_maxiter: 2,
         ..f.prep.parsed.fit_options.clone()
     };
-    fit(
-        &f.prep.parsed.model,
-        &f.prep.population,
-        &f.prep.init_params,
-        &nm,
-    )
-    .expect("nm fit");
+    fit(&f.prep.parsed.model, &f.prep.population, &f.prep.init_params, &nm).expect("nm fit");
 }
 
 /// T4, deterministic. (i) premise: the inner solver moves the covariance from the displaced
@@ -221,10 +194,7 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
     let displaced_lbfgs = &f.displaced_lbfgs;
     // The premise uses the solver the leak would bring in. A non-default caller value is
     // scored as given, so the scoring record does not replace it.
-    let nelder_mead = FitOptions {
-        inner_optimizer: InnerOptimizer::NelderMead,
-        ..f.lbfgs.clone()
-    };
+    let nelder_mead = FitOptions { inner_optimizer: InnerOptimizer::NelderMead, ..f.lbfgs.clone() };
     let displaced_nm = cov_from(f, &f.displaced, &nelder_mead);
     let n = n_differing(&displaced_nm, displaced_lbfgs);
     eprintln!(
@@ -250,10 +220,7 @@ fn run_covariance_scores_with_the_callers_inner_solver() {
         "(iii) a later Nelder–Mead fit changed run_covariance's inner solver"
     );
     // (iv) #426 PR 2: default options reproduce the inline step too, from the record.
-    let defaults = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
+    let defaults = FitOptions { verbose: false, ..FitOptions::default() };
     assert_eq!(
         cov_from(f, &f.fit_a, &defaults),
         inline,

@@ -248,8 +248,5 @@ fn a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction() {
     );
     // Non-degeneracy: two wrong-but-equal numbers would satisfy the invariance, so
     // pin the shared value to NONMEM's as well.
-    assert!(
-        (b - 0.846_890).abs() < 1e-4,
-        "B and C agree at {b:.6}, but NONMEM gives 0.846890"
-    );
+    assert!((b - 0.846_890).abs() < 1e-4, "B and C agree at {b:.6}, but NONMEM gives 0.846890");
 }

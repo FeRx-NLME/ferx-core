@@ -51,10 +51,7 @@ mod ctmm_smoke {
 ";
 
     fn smoke_opts() -> FitOptions {
-        FitOptions {
-            outer_maxiter: 3,
-            ..Default::default()
-        }
+        FitOptions { outer_maxiter: 3, ..Default::default() }
     }
 
     fn has_error(diags: &[Diagnostic], code: &str) -> bool {
@@ -67,11 +64,7 @@ mod ctmm_smoke {
     fn ctmm_model_parses() {
         let model = parse_model_string(FIXED_MODEL).expect("FIXED_MODEL must parse");
         match model.endpoints.get(&5) {
-            Some(EndpointLikelihood::Ctmm {
-                n_states,
-                state_codes,
-                ..
-            }) => {
+            Some(EndpointLikelihood::Ctmm { n_states, state_codes, .. }) => {
                 assert_eq!(*n_states, 2);
                 assert_eq!(state_codes, &vec![0, 1]);
             }
@@ -139,10 +132,7 @@ mod ctmm_smoke {
         let fd = parse_model_string(&format!("{MIXED_MODEL}\n[fit_options]\n  gradient = fd\n"))
             .unwrap();
 
-        let opts = FitOptions {
-            outer_maxiter: 12,
-            ..Default::default()
-        };
+        let opts = FitOptions { outer_maxiter: 12, ..Default::default() };
         let ra = fit(&analytic, &pop, &analytic.default_params, &opts).expect("analytic fit");
         let rf = fit(&fd, &pop, &fd.default_params, &opts).expect("fd fit");
 
@@ -190,14 +180,8 @@ mod ctmm_smoke {
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
             .expect_err("DV = 2 on a CTMM CMT must be rejected")
             .to_string();
-        assert!(
-            err.contains("cmt = 5"),
-            "message should name the CMT, got: {err}"
-        );
-        assert!(
-            err.contains("DV 2"),
-            "message should name the code, got: {err}"
-        );
+        assert!(err.contains("cmt = 5"), "message should name the CMT, got: {err}");
+        assert!(err.contains("DV 2"), "message should name the code, got: {err}");
     }
 
     /// The Gauss-Newton gradient is Gaussian-specific, so `method = gn` on a CTMM model is
@@ -205,10 +189,7 @@ mod ctmm_smoke {
     #[test]
     fn ctmm_gauss_newton_rejected() {
         let model = parse_model_string(FIXED_MODEL).unwrap();
-        let opts = FitOptions {
-            method: EstimationMethod::FoceGn,
-            ..Default::default()
-        };
+        let opts = FitOptions { method: EstimationMethod::FoceGn, ..Default::default() };
         assert!(
             has_error(&check_model_options(&model, &opts), "E_CTMM_GN_UNSUPPORTED"),
             "method = gn + CTMM must be rejected"
@@ -517,29 +498,17 @@ mod ctmm_smoke {
             Ok(out) => panic!("predict_diag accepted CTMM: {} rows", out.results.len()),
         };
         assert!(
-            err.to_string()
-                .contains("predict() does not support a [markov_model] (CTMM)"),
+            err.to_string().contains("predict() does not support a [markov_model] (CTMM)"),
             "{err}"
         );
         assert!(err.to_string().contains("#820"), "{err}");
 
-        let opts = SimulateOptions {
-            seed: Some(1),
-            ..Default::default()
-        };
+        let opts = SimulateOptions { seed: Some(1), ..Default::default() };
         let err = simulate_with_options(&model, &pop, params, 1, &opts)
             .expect_err("simulate_with_options must refuse CTMM");
-        assert!(
-            err.to_string()
-                .contains("does not support a [markov_model] (CTMM)"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("does not support a [markov_model] (CTMM)"), "{err}");
         assert!(err.to_string().contains("no simulation path"), "{err}");
-        assert!(
-            err.to_string()
-                .contains("CTMM simulation is a later slice."),
-            "{err}"
-        );
+        assert!(err.to_string().contains("CTMM simulation is a later slice."), "{err}");
     }
 
     /// Out-of-order CTMM observation times are rejected at fit setup (the datareader sorts
@@ -688,11 +657,9 @@ mod ctmm_smoke {
         let model = parse_model_string(DRUG_DRIVEN_MODEL).expect("drug-driven CTMM must parse");
         let ep = model.endpoints.get(&5).expect("CTMM endpoint on CMT 5");
         let (generator_fn, generator_states) = match ep {
-            EndpointLikelihood::Ctmm {
-                generator_fn,
-                generator_states,
-                ..
-            } => (generator_fn, generator_states),
+            EndpointLikelihood::Ctmm { generator_fn, generator_states, .. } => {
+                (generator_fn, generator_states)
+            }
             other => panic!("expected a Ctmm endpoint, got {other:?}"),
         };
         // `central` is ODE state index 1 (states = [depot, central]); it is the only state
@@ -709,14 +676,8 @@ mod ctmm_smoke {
         let q_low = generator_fn(theta, &[], &std::collections::HashMap::new(), &[0.0, 0.0]);
         let q_high = generator_fn(theta, &[], &std::collections::HashMap::new(), &[0.0, 20.0]);
         // central = 0 ⇒ conc 0 ⇒ rate exp(-0.7); central = 20 ⇒ conc 2 ⇒ rate exp(-0.5).
-        assert!(
-            (q_low[(0, 1)] - (-0.7_f64).exp()).abs() < 1e-9,
-            "q_low {q_low}"
-        );
-        assert!(
-            (q_high[(0, 1)] - (-0.5_f64).exp()).abs() < 1e-9,
-            "q_high {q_high}"
-        );
+        assert!((q_low[(0, 1)] - (-0.7_f64).exp()).abs() < 1e-9, "q_low {q_low}");
+        assert!((q_high[(0, 1)] - (-0.5_f64).exp()).abs() < 1e-9, "q_high {q_high}");
         // The state-independent transition (asleep→awake = exp(LQ10)) is unchanged.
         assert!((q_low[(1, 0)] - q_high[(1, 0)]).abs() < 1e-12);
     }
@@ -762,10 +723,7 @@ mod ctmm_smoke {
   transition awake  -> asleep = exp(LQ01 + SLOPE * (central / V))
   transition asleep -> awake  = exp(LQ10)
 ";
-        assert!(
-            parse_model_string(OK).is_ok(),
-            "baseline (no name collision) must parse"
-        );
+        assert!(parse_model_string(OK).is_ok(), "baseline (no name collision) must parse");
 
         // Declaring a covariate named `central` — the same name as an ODE state the
         // intensity references — must be rejected.
@@ -820,19 +778,13 @@ mod ctmm_smoke {
   transition awake  -> asleep = exp(LQ01 + EXTRA * (central / V))
   transition asleep -> awake  = exp(LQ10)
 ";
-        assert!(
-            parse_model_string(OK).is_ok(),
-            "baseline (no name collision) must parse"
-        );
+        assert!(parse_model_string(OK).is_ok(), "baseline (no name collision) must parse");
 
         // Rename the driver theta to `central` — the same name as the referenced ODE state.
         // The transition's `central` then binds to the theta, so the state driver is silently
         // lost; the parser must reject the collision.
         let collide = OK
-            .replace(
-                "theta EXTRA(0.1, -5.0, 5.0)",
-                "theta central(0.1, -5.0, 5.0)",
-            )
+            .replace("theta EXTRA(0.1, -5.0, 5.0)", "theta central(0.1, -5.0, 5.0)")
             .replace("LQ01 + EXTRA * (central / V)", "LQ01 + central");
         let err = parse_model_string(&collide)
             .expect_err("a state/parameter name collision must be rejected");
@@ -900,12 +852,7 @@ mod ctmm_smoke {
         );
         s.obs_records = [(0.2_f64, 0usize), (0.6, 0), (1.5, 0), (2.5, 1)]
             .iter()
-            .map(|&(time, state)| ObsRecord::DiscreteState {
-                time,
-                raw_time: time,
-                state,
-                cmt: 5,
-            })
+            .map(|&(time, state)| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 5 })
             .collect();
 
         let nll = ctmm_subject_nll(&model, &s, theta, &[]);
@@ -967,19 +914,11 @@ mod ctmm_smoke {
         );
         s.obs_records = [(0.2_f64, 0usize), (0.8, 1), (1.6, 0)]
             .iter()
-            .map(|&(time, state)| ObsRecord::DiscreteState {
-                time,
-                raw_time: time,
-                state,
-                cmt: 5,
-            })
+            .map(|&(time, state)| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 5 })
             .collect();
 
         let nll = ctmm_subject_nll(&model, &s, theta, &[]);
-        assert!(
-            nll >= SENTINEL,
-            "a negative off-diagonal intensity must repel (got {nll})"
-        );
+        assert!(nll >= SENTINEL, "a negative off-diagonal intensity must repel (got {nll})");
     }
 
     /// Degenerate anchor for the Slice-3 integration (#817): with `SLOPE = 0` the generator
@@ -996,12 +935,7 @@ mod ctmm_smoke {
         let mut subj = common::subject("1", vec![], vec![], vec![], vec![]);
         subj.obs_records = [(0.0, 0), (0.7, 1), (1.9, 0), (3.1, 1)]
             .iter()
-            .map(|&(time, state)| ObsRecord::DiscreteState {
-                time,
-                raw_time: time,
-                state,
-                cmt: 5,
-            })
+            .map(|&(time, state)| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 5 })
             .collect();
 
         // Drug-driven model, but with SLOPE forced to 0 (index 5: [TVCL,TVV,TVKA,LQ01,LQ10,SLOPE]).
@@ -1043,12 +977,7 @@ mod ctmm_smoke {
         );
         subj.obs_records = [(0.5, 0), (1.0, 1), (2.0, 1), (4.0, 0)]
             .iter()
-            .map(|&(time, state)| ObsRecord::DiscreteState {
-                time,
-                raw_time: time,
-                state,
-                cmt: 5,
-            })
+            .map(|&(time, state)| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 5 })
             .collect();
 
         let drug = parse_model_string(DRUG_DRIVEN_MODEL).unwrap();
@@ -1131,22 +1060,14 @@ mod ctmm_smoke {
         let obs = [(0.5_f64, 0usize), (1.3, 1), (2.6, 0), (5.0, 1)];
         subj.obs_records = obs
             .iter()
-            .map(|&(time, state)| ObsRecord::DiscreteState {
-                time,
-                raw_time: time,
-                state,
-                cmt: 5,
-            })
+            .map(|&(time, state)| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 5 })
             .collect();
 
         // Closed-form 2-state transition matrix expm(Q₀·G) for Q₀=[[-a,a],[b,-b]].
         let exact_2state = |a: f64, b: f64, g: f64| -> [[f64; 2]; 2] {
             let lam = a + b;
             let e = (-lam * g).exp();
-            [
-                [(b + a * e) / lam, (a - a * e) / lam],
-                [(b - b * e) / lam, (a + b * e) / lam],
-            ]
+            [[(b + a * e) / lam, (a - a * e) / lam], [(b - b * e) / lam, (a + b * e) / lam]]
         };
         let mut expected = 0.0_f64;
         for w in obs.windows(2) {
@@ -1233,26 +1154,17 @@ mod ctmm_smoke {
             s
         };
         let good = ctmm_subject_nll(&model, &mk(100.0, &ok_obs), theta, &[]);
-        assert!(
-            good.is_finite() && good < SENTINEL,
-            "baseline NLL {good} must be finite"
-        );
+        assert!(good.is_finite() && good < SENTINEL, "baseline NLL {good} must be finite");
 
         // #6: decreasing time between two same-state records → repel.
         let dec_obs = [(2.6_f64, 0usize), (1.3, 0)];
         let dec = ctmm_subject_nll(&model, &mk(100.0, &dec_obs), theta, &[]);
-        assert!(
-            dec >= SENTINEL,
-            "decreasing-time pair must repel (got {dec})"
-        );
+        assert!(dec >= SENTINEL, "decreasing-time pair must repel (got {dec})");
 
         // #7: an enormous bolus drives C(t)=central/V huge, so the intensity Ai·C diverges
         // (|q·dt| ≫ MAX_EXP_ARG_ABS) → repel rather than integrate a hung/overflowed solve.
         let huge = ctmm_subject_nll(&model, &mk(1e20, &ok_obs), theta, &[]);
-        assert!(
-            huge >= SENTINEL,
-            "diverged intensity must repel (got {huge})"
-        );
+        assert!(huge >= SENTINEL, "diverged intensity must repel (got {huge})");
     }
 
     /// End-to-end: a **mixed-effects** drug-driven CTMM (a random effect on `CL` flows through
@@ -1408,10 +1320,7 @@ mod ctmm_smoke {
         let model =
             parse_model_string(M).expect("a [markov_model] with no `type` defaults to ctmm");
         assert!(
-            matches!(
-                model.endpoints.get(&5),
-                Some(EndpointLikelihood::Ctmm { .. })
-            ),
+            matches!(model.endpoints.get(&5), Some(EndpointLikelihood::Ctmm { .. })),
             "omitting `type` must yield a Ctmm endpoint"
         );
     }
@@ -1481,10 +1390,7 @@ mod mctmm_smoke {
                 assert_eq!(*n_states, 3);
                 assert_eq!(state_codes, &vec![0, 1, 2]);
                 assert!(generator_states.is_empty(), "no ODE state ⇒ homogeneous");
-                assert!(
-                    generator_program.is_some(),
-                    "θ-only generator is dual-evaluable"
-                );
+                assert!(generator_program.is_some(), "θ-only generator is dual-evaluable");
                 let q = generator_fn(&model.default_params.theta, &[], &Default::default(), &[]);
                 assert_eq!(q[(0, 2)], 0.0);
                 assert_eq!(q[(2, 0)], 0.0);
@@ -1507,9 +1413,7 @@ mod mctmm_smoke {
     /// Every malformed mCTMM block is rejected with a message naming the problem.
     #[test]
     fn mctmm_parser_rejections() {
-        let e = err_of(&block(&format!(
-            "{GOOD}  transition none -> mild = exp(LTAU)\n"
-        )));
+        let e = err_of(&block(&format!("{GOOD}  transition none -> mild = exp(LTAU)\n")));
         assert!(e.contains("remove the `transition` lines"), "{e}");
 
         let e = err_of(&block(
@@ -1517,9 +1421,7 @@ mod mctmm_smoke {
         ));
         assert!(e.contains("requires `tau"), "{e}");
 
-        let e = err_of(&block(
-            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n",
-        ));
+        let e = err_of(&block("  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n"));
         assert!(e.contains("requires `cutpoints"), "{e}");
 
         let e = err_of(&block(
@@ -1531,10 +1433,7 @@ mod mctmm_smoke {
         let e = err_of(&block(
             "  states = [none=0, severe=2, mild=1]\n  tau = exp(LTAU)\n  cutpoints = [C1, C1 + exp(LD2)]\n",
         ));
-        assert!(
-            e.contains("increasing code order") && e.contains("severe=2"),
-            "{e}"
-        );
+        assert!(e.contains("increasing code order") && e.contains("severe=2"), "{e}");
 
         let e = err_of(&block(
             "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = C1\n",
@@ -1593,11 +1492,7 @@ mod mctmm_smoke {
 ";
         let model = parse_model_string(src).expect("drug-driven mctmm parses");
         match model.endpoints.get(&5) {
-            Some(EndpointLikelihood::Ctmm {
-                generator_states,
-                generator_program,
-                ..
-            }) => {
+            Some(EndpointLikelihood::Ctmm { generator_states, generator_program, .. }) => {
                 assert_eq!(generator_states.len(), 1, "central drives Q(t)");
                 assert_eq!(generator_states[0].0, "central");
                 // The occupancy-ODE path differentiates the intensities through the dual
@@ -1618,10 +1513,7 @@ mod mctmm_smoke {
             "examples/mctmm_3state.ferx",
             Some("data/mctmm_3state.csv"),
             None,
-            Some(FitOptions {
-                outer_maxiter: 3,
-                ..Default::default()
-            }),
+            Some(FitOptions { outer_maxiter: 3, ..Default::default() }),
         )
         .expect("mctmm fit must return Ok");
         assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);

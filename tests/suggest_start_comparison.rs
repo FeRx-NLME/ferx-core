@@ -75,22 +75,15 @@ fn run_case(case: &Case) {
             println!("    [A] {w}");
         }
     }
-    let b_only: Vec<_> = b
-        .warnings
-        .iter()
-        .filter(|w| !a.warnings.contains(w))
-        .collect();
+    let b_only: Vec<_> = b.warnings.iter().filter(|w| !a.warnings.contains(w)).collect();
     if !b_only.is_empty() {
         println!("  Option B additional warnings:");
         for w in b_only {
             println!("    [B] {w}");
         }
     }
-    let c_only: Vec<_> = c
-        .warnings
-        .iter()
-        .filter(|w| !a.warnings.contains(w) && !b.warnings.contains(w))
-        .collect();
+    let c_only: Vec<_> =
+        c.warnings.iter().filter(|w| !a.warnings.contains(w) && !b.warnings.contains(w)).collect();
     if !c_only.is_empty() {
         println!("  Option C additional warnings:");
         for w in c_only {
@@ -100,10 +93,7 @@ fn run_case(case: &Case) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn suggest_start_comparison_all_models() {
     let cases = vec![
         // ── Analytical models ────────────────────────────────────────────────
@@ -148,12 +138,7 @@ fn suggest_start_comparison_all_models() {
             label: "1-cpt oral with lag time (analytical)",
             model_path: "examples/oral_with_lagtime.ferx",
             data_path: "data/one_cpt_oral_lagtime.csv",
-            truth: vec![
-                ("TVCL", 5.0),
-                ("TVV", 50.0),
-                ("TVKA", 1.5),
-                ("TVLAGTIME", 0.75),
-            ],
+            truth: vec![("TVCL", 5.0), ("TVV", 50.0), ("TVKA", 1.5), ("TVLAGTIME", 0.75)],
         },
         Case {
             label: "1-cpt oral with bioavailability F (warfarin_logit_f)",
@@ -162,12 +147,7 @@ fn suggest_start_comparison_all_models() {
             // THETA_F default 0.80; NCA CL/V are apparent (CL/F, V/F) and are
             // corrected by F_default so TVCL/TVV start in the true-parameter space.
             // F itself stays at default for Option A; Option B sweeps it.
-            truth: vec![
-                ("TVCL", 0.134),
-                ("TVV", 8.1),
-                ("TVKA", 1.0),
-                ("THETA_F", 0.80),
-            ],
+            truth: vec![("TVCL", 0.134), ("TVV", 8.1), ("TVKA", 1.0), ("THETA_F", 0.80)],
         },
         Case {
             label: "1-cpt IV infusion (analytical)",
