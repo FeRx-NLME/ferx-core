@@ -72,12 +72,7 @@ fn model_b() -> String {
 }
 
 fn data(name: &str) -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("data")
-        .join(name)
-        .to_str()
-        .unwrap()
-        .to_string()
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join(name).to_str().unwrap().to_string()
 }
 
 /// `O_NONBLOCK`, which `std` does not export. A non-blocking write-open of a FIFO
@@ -90,11 +85,7 @@ const O_NONBLOCK: i32 = 0x0004;
 
 fn open_nonblocking(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(!write)
-        .write(write)
-        .custom_flags(O_NONBLOCK)
-        .open(path)
+    std::fs::OpenOptions::new().read(!write).write(write).custom_flags(O_NONBLOCK).open(path)
 }
 
 /// A model-file FIFO that serves A on its first open and B on any later one.
@@ -129,10 +120,7 @@ impl ModelFifo {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.ferx");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .expect("run mkfifo");
+        let made = std::process::Command::new("mkfifo").arg(&path).status().expect("run mkfifo");
         assert!(made.success(), "mkfifo");
         let opens = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -147,11 +135,7 @@ impl ModelFifo {
                 }
                 let n = opens.fetch_add(1, Ordering::SeqCst) + 1;
                 // A reader that stops early closes the pipe: not this test's concern.
-                let _ = f.write_all(if n == 1 {
-                    MODEL_A.as_bytes()
-                } else {
-                    b.as_bytes()
-                });
+                let _ = f.write_all(if n == 1 { MODEL_A.as_bytes() } else { b.as_bytes() });
                 drop(f);
                 // Wait for the reader to close before serving the next open.
                 while open_nonblocking(&path, true).is_ok() {
@@ -162,13 +146,7 @@ impl ModelFifo {
                 }
             })
         };
-        Self {
-            path,
-            opens,
-            stop,
-            server: Some(server),
-            _dir: dir,
-        }
+        Self { path, opens, stop, server: Some(server), _dir: dir }
     }
 
     fn path(&self) -> &str {
@@ -184,10 +162,7 @@ impl ModelFifo {
         let server = self.server.take().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !server.is_finished() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the FIFO server did not stop"
-            );
+            assert!(std::time::Instant::now() < deadline, "the FIFO server did not stop");
             drop(open_nonblocking(&self.path, false));
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -233,10 +208,7 @@ fn fit_from_files_reads_the_model_file_once() {
     );
     let opens = fifo.finish();
     let r = r.expect("fit_from_files");
-    assert_eq!(
-        opens, 1,
-        "fit_from_files opened the model file {opens} times"
-    );
+    assert_eq!(opens, 1, "fit_from_files opened the model file {opens} times");
     assert_eq!(r.model_hash.as_deref(), Some(sha_a().as_str()));
     assert_eq!(r.model_text.as_deref(), Some(MODEL_A));
 }
@@ -262,10 +234,7 @@ fn run_model_with_overrides_reads_the_model_file_once() {
     );
     let opens = fifo.finish();
     let (r, _) = r.expect("run_model_with_overrides");
-    assert_eq!(
-        opens, 1,
-        "run_model_with_overrides opened the model file {opens} times"
-    );
+    assert_eq!(opens, 1, "run_model_with_overrides opened the model file {opens} times");
     assert_eq!(r.model_hash.as_deref(), Some(sha_a().as_str()));
     assert_eq!(r.model_text.as_deref(), Some(MODEL_A));
 }
@@ -279,10 +248,7 @@ fn the_simulate_entry_point_reads_the_model_file_once() {
     );
     let opens = fifo.finish();
     let (r, _) = r.expect("run_model_simulate_with_overrides");
-    assert_eq!(
-        opens, 1,
-        "the simulate path opened the model file {opens} times"
-    );
+    assert_eq!(opens, 1, "the simulate path opened the model file {opens} times");
     assert_eq!(r.model_hash.as_deref(), Some(sha_a().as_str()));
     assert_eq!(r.model_text.as_deref(), Some(MODEL_A));
 }
@@ -294,10 +260,7 @@ fn the_check_reads_the_model_file_once() {
     let opens = fifo.finish();
     assert_eq!(opens, 1, "the check opened the model file {opens} times");
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .all(|d| d.severity != crate::diagnostics::Severity::Error),
+        report.diagnostics.iter().all(|d| d.severity != crate::diagnostics::Severity::Error),
         "{:?}",
         report.diagnostics
     );

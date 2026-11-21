@@ -71,10 +71,8 @@ fn free_total_pop(n_subj: usize) -> Population {
                 vec![1.0; obs_times.len()],
                 vec![1; obs_times.len()],
             );
-            s.obs_covariates = free_flags
-                .iter()
-                .map(|&f| HashMap::from([("FREE".to_string(), f)]))
-                .collect();
+            s.obs_covariates =
+                free_flags.iter().map(|&f| HashMap::from([("FREE".to_string(), f)])).collect();
             // The first record's value, as the reader fills it: a covariate is
             // present only when the subject-static map carries it (#2181).
             s.covariates = HashMap::from([("FREE".to_string(), free_flags[0])]);
@@ -110,15 +108,9 @@ fn parses_to_selected_error_spec() {
 fn predictions_finite_and_flag_independent() {
     let model = parse_model_string(FREE_TOTAL).expect("model parses");
     let pop = free_total_pop(1);
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .iter()
-        .map(|p| p.pred)
-        .collect();
-    assert!(
-        preds.iter().all(|v| v.is_finite()),
-        "predictions must be finite, got {preds:?}"
-    );
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().iter().map(|p| p.pred).collect();
+    assert!(preds.iter().all(|v| v.is_finite()), "predictions must be finite, got {preds:?}");
     // Rows 0 (FREE=0) and 1 (FREE=1) are the same time → same prediction.
     assert!((preds[0] - preds[1]).abs() < 1e-9);
 }
@@ -140,10 +132,7 @@ fn missing_selector_covariate_is_rejected() {
     let err = fit(&model, &pop, &model.default_params, &opts)
         .expect_err("missing selector covariate must be rejected")
         .to_string();
-    assert!(
-        err.contains("FREE"),
-        "error should name the missing covariate FREE: {err}"
-    );
+    assert!(err.contains("FREE"), "error should name the missing covariate FREE: {err}");
 }
 
 /// `simulate` must enforce the same selector-covariate presence check as `fit()`
@@ -161,14 +150,9 @@ fn simulate_missing_selector_covariate_is_rejected() {
         s.obs_covariates.clear();
         s.covariates.clear();
     }
-    let err = simulate_with_options(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        &SimulateOptions::default(),
-    )
-    .expect_err("simulate must reject a missing selector covariate");
+    let err =
+        simulate_with_options(&model, &pop, &model.default_params, 1, &SimulateOptions::default())
+            .expect_err("simulate must reject a missing selector covariate");
     assert!(
         err.to_string().contains("FREE"),
         "error should name the missing covariate FREE: {err}"
@@ -280,11 +264,8 @@ fn selected_error_with_block_sigma_fits() {
     let sims = simulate_with_seed(&model, &design, &truth, 1, 669669).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
-        subj.observations = sims
-            .iter()
-            .filter(|r| r.id == subj.id)
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        subj.observations =
+            sims.iter().filter(|r| r.id == subj.id).map(|r| r.outcome.continuous_value()).collect();
     }
 
     let mut opts = FitOptions::default();
@@ -306,10 +287,7 @@ fn selected_error_with_block_sigma_fits() {
 /// proves each row's residual is scored against the correct endpoint — if
 /// dispatch mixed the rows, the two sigmas would collapse toward a common value.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn recovers_free_total_sigma_split() {
     let model = parse_model_string(FREE_TOTAL).expect("model parses");
     let design = free_total_pop(40);
@@ -319,11 +297,8 @@ fn recovers_free_total_sigma_split() {
     let sims = simulate_with_seed(&model, &design, &truth, 1, 658658).unwrap();
     let mut pop = design.clone();
     for subj in pop.subjects.iter_mut() {
-        subj.observations = sims
-            .iter()
-            .filter(|r| r.id == subj.id)
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        subj.observations =
+            sims.iter().filter(|r| r.id == subj.id).map(|r| r.outcome.continuous_value()).collect();
     }
 
     // Refit from a neutral start where both residual sigmas begin equal (0.15).
@@ -360,10 +335,7 @@ fn recovers_free_total_sigma_split() {
         unbound > total,
         "unbound sigma must exceed total sigma (got total={total:.4}, unbound={unbound:.4})"
     );
-    assert!(
-        (0.02..0.12).contains(&total),
-        "PROP_TOTAL should recover near 0.05, got {total:.4}"
-    );
+    assert!((0.02..0.12).contains(&total), "PROP_TOTAL should recover near 0.05, got {total:.4}");
     assert!(
         (0.18..0.45).contains(&unbound),
         "PROP_UNBOUND should recover near 0.30, got {unbound:.4}"

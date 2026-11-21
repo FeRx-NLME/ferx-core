@@ -120,14 +120,8 @@ fn assert_same_model_at(generated: &str, hand_written: &str, outer_maxiter: usiz
     let hand = parse_full_model(hand_written)
         .unwrap_or_else(|e| panic!("the hand-written model must parse: {e}"));
 
-    assert_eq!(
-        gen.model.theta_names, hand.model.theta_names,
-        "the two models declare different θ"
-    );
-    assert_eq!(
-        gen.model.eta_names, hand.model.eta_names,
-        "the two models declare different η"
-    );
+    assert_eq!(gen.model.theta_names, hand.model.theta_names, "the two models declare different θ");
+    assert_eq!(gen.model.eta_names, hand.model.eta_names, "the two models declare different η");
     assert_eq!(
         gen.model.default_params.theta, hand.model.default_params.theta,
         "the two models start from different θ values"
@@ -143,19 +137,12 @@ fn assert_same_model_at(generated: &str, hand_written: &str, outer_maxiter: usiz
         assert_eq!(g.pred, h.pred, "PRED differs for subject {}", g.id);
     }
 
-    let opts = FitOptions {
-        outer_maxiter,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter, run_covariance_step: false, ..FitOptions::default() };
     let gen_fit = fit(&gen.model, &pop, &gen.model.default_params, &opts)
         .expect("short fit of the generated model must not error");
     let hand_fit = fit(&hand.model, &pop, &hand.model.default_params, &opts)
         .expect("short fit of the hand-written model must not error");
-    assert_eq!(
-        gen_fit.ofv, hand_fit.ofv,
-        "the generated model is a different objective function"
-    );
+    assert_eq!(gen_fit.ofv, hand_fit.ofv, "the generated model is a different objective function");
     assert_eq!(gen_fit.theta, hand_fit.theta);
 }
 
@@ -220,11 +207,7 @@ fn narrowing_back_to_one_compartment_restores_the_parent() {
         )),
         ModelEdit::SetStructural(StructuralSpec::new(
             "one_cpt_oral",
-            vec![
-                ("cl".into(), "CL".into()),
-                ("v".into(), "V".into()),
-                ("ka".into(), "KA".into()),
-            ],
+            vec![("cl".into(), "CL".into()), ("v".into(), "V".into()), ("ka".into(), "KA".into())],
             vec![],
         )),
     ]);
@@ -271,10 +254,7 @@ fn adding_a_covariate_relation_is_the_hand_written_block() {
 fn dropping_a_relation_restores_the_model_without_it() {
     let generated = edited(vec![
         ModelEdit::AddCovariateRelation(wt_on_cl()),
-        ModelEdit::DropCovariateRelation {
-            param: "CL".into(),
-            cov: "WT".into(),
-        },
+        ModelEdit::DropCovariateRelation { param: "CL".into(), cov: "WT".into() },
     ]);
     assert_same_model(&generated, PARENT);
 }
@@ -298,10 +278,7 @@ fn adding_an_eta_is_the_hand_written_model_with_it() {
         ModelEdit::DropIiv { param: "KA".into() },
         ModelEdit::AddIiv {
             param: "KA".into(),
-            form: IivForm::Exponential {
-                eta: "ETA_KA".into(),
-                variance: 0.20,
-            },
+            form: IivForm::Exponential { eta: "ETA_KA".into(), variance: 0.20 },
         },
     ]);
     let hand = PARENT.replace("  omega ETA_KA ~ 0.20\n", "").replace(
@@ -315,10 +292,7 @@ fn adding_an_eta_is_the_hand_written_model_with_it() {
 
 #[test]
 fn blocking_two_etas_is_the_hand_written_block_omega() {
-    let generated = edited(vec![ModelEdit::SetOmegaBlock(vec![
-        "ETA_CL".into(),
-        "ETA_V".into(),
-    ])]);
+    let generated = edited(vec![ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into()])]);
     // 0.1 × sqrt(0.15 × 0.15) = 0.015.
     let hand = PARENT.replace(
         "  omega ETA_CL ~ 0.15\n  omega ETA_V  ~ 0.15\n",
@@ -335,16 +309,8 @@ fn switching_to_a_combined_error_model_is_the_hand_written_one() {
         "DV",
         ErrorForm::Combined,
         vec![
-            SigmaDecl {
-                name: "ADD_ERR".into(),
-                init: 0.1,
-                as_sd: true,
-            },
-            SigmaDecl {
-                name: "PROP_ERR".into(),
-                init: 0.04,
-                as_sd: true,
-            },
+            SigmaDecl { name: "ADD_ERR".into(), init: 0.1, as_sd: true },
+            SigmaDecl { name: "PROP_ERR".into(), init: 0.04, as_sd: true },
         ],
     ))]);
     // The σ of a single-endpoint `[error_model]` are consumed *positionally*
@@ -357,10 +323,7 @@ fn switching_to_a_combined_error_model_is_the_hand_written_one() {
             "  sigma PROP_ERR ~ 0.04 (sd)\n",
             "  sigma ADD_ERR ~ 0.1 (sd)\n  sigma PROP_ERR ~ 0.04 (sd)\n",
         )
-        .replace(
-            "DV ~ proportional(PROP_ERR)",
-            "DV ~ combined(ADD_ERR, PROP_ERR)",
-        );
+        .replace("DV ~ proportional(PROP_ERR)", "DV ~ combined(ADD_ERR, PROP_ERR)");
     assert_same_model(&generated, &hand);
 }
 
@@ -374,11 +337,7 @@ fn switching_to_a_power_error_model_is_the_hand_written_one() {
         ErrorSpecText::new(
             "DV",
             ErrorForm::Power,
-            vec![SigmaDecl {
-                name: "PROP_ERR".into(),
-                init: 0.04,
-                as_sd: true,
-            }],
+            vec![SigmaDecl { name: "PROP_ERR".into(), init: 0.04, as_sd: true }],
         )
         .with_exponent(ThetaDecl::new("RUV_POW", 1.3, 0.01, 10.0)),
     )]);
@@ -387,10 +346,7 @@ fn switching_to_a_power_error_model_is_the_hand_written_one() {
             "  sigma PROP_ERR ~ 0.04 (sd)\n",
             "  sigma PROP_ERR ~ 0.04 (sd)\n  theta RUV_POW(1.3, 0.01, 10.0)\n",
         )
-        .replace(
-            "DV ~ proportional(PROP_ERR)",
-            "DV ~ power(PROP_ERR, RUV_POW)",
-        );
+        .replace("DV ~ proportional(PROP_ERR)", "DV ~ power(PROP_ERR, RUV_POW)");
     assert_same_model(&generated, &hand);
 }
 
@@ -400,11 +356,7 @@ fn adding_iiv_on_ruv_is_the_hand_written_one() {
         ErrorSpecText::new(
             "DV",
             ErrorForm::Proportional,
-            vec![SigmaDecl {
-                name: "PROP_ERR".into(),
-                init: 0.04,
-                as_sd: true,
-            }],
+            vec![SigmaDecl { name: "PROP_ERR".into(), init: 0.04, as_sd: true }],
         )
         .with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09)),
     )]);
@@ -426,16 +378,9 @@ fn a_time_varying_error_model_is_the_hand_written_magnitude() {
         ErrorSpecText::new(
             "DV",
             ErrorForm::Proportional,
-            vec![SigmaDecl {
-                name: "PROP_ERR".into(),
-                init: 0.04,
-                as_sd: true,
-            }],
+            vec![SigmaDecl { name: "PROP_ERR".into(), init: 0.04, as_sd: true }],
         )
-        .with_time_varying(TimeVaryingDecl::new(
-            4.0,
-            ThetaDecl::new("RUV_TV", 1.4, 0.01, 10.0),
-        )),
+        .with_time_varying(TimeVaryingDecl::new(4.0, ThetaDecl::new("RUV_TV", 1.4, 0.01, 10.0))),
     )]);
     let hand = PARENT
         .replace(
@@ -455,28 +400,18 @@ fn a_time_varying_error_model_is_the_hand_written_magnitude() {
 fn seeding_inits_starts_the_child_where_the_parent_finished() {
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("dataset must load");
     let parent = parse_full_model(PARENT).expect("parent must parse");
-    let opts = FitOptions {
-        outer_maxiter: 2,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 2, ..FitOptions::default() };
     let parent_fit = fit(&parent.model, &pop, &parent.model.default_params, &opts)
         .expect("short parent fit must not error");
 
     // The child is a *different* model — it has one η fewer — so its θ vector
     // is not the parent's. Name-keyed carry-over is the only thing that can
     // seed it; a positional copy would put `TVKA`'s estimate on `TVV`.
-    let child = edited(vec![
-        ModelEdit::DropIiv { param: "KA".into() },
-        ModelEdit::SeedInits(&parent_fit),
-    ]);
+    let child =
+        edited(vec![ModelEdit::DropIiv { param: "KA".into() }, ModelEdit::SeedInits(&parent_fit)]);
     let child = parse_full_model(&child).expect("the seeded child must parse");
 
-    for (name, init) in child
-        .model
-        .theta_names
-        .iter()
-        .zip(&child.model.default_params.theta)
-    {
+    for (name, init) in child.model.theta_names.iter().zip(&child.model.default_params.theta) {
         let k = parent_fit
             .theta_names
             .iter()
@@ -533,17 +468,10 @@ fn michaelis_menten_elimination_is_the_hand_written_ode_model() {
     let generated = edited(vec![ModelEdit::SetStructural(
         StructuralSpec::new(
             "one_cpt_oral",
-            vec![
-                ("cl".into(), "CL".into()),
-                ("v".into(), "V".into()),
-                ("ka".into(), "KA".into()),
-            ],
+            vec![("cl".into(), "CL".into()), ("v".into(), "V".into()), ("ka".into(), "KA".into())],
             vec![NewParameter::new("KM", "TVKM", 5.0, 0.0, 100.0)],
         )
-        .ode(
-            InputForm::Template,
-            EliminationForm::MichaelisMenten { km: "KM".into() },
-        ),
+        .ode(InputForm::Template, EliminationForm::MichaelisMenten { km: "KM".into() }),
     )]);
     let hand = format!(
         "\
@@ -591,17 +519,11 @@ fn michaelis_menten_elimination_is_the_hand_written_ode_model() {
     // weakly identified KM, the generated one lower). What iterating must show is that the
     // generated model's optimizer path runs and improves the objective.
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("dataset must load");
-    for (name, src) in [
-        ("generated", generated.as_str()),
-        ("hand-written", hand.as_str()),
-    ] {
+    for (name, src) in [("generated", generated.as_str()), ("hand-written", hand.as_str())] {
         let model = parse_full_model(src).expect("model parses").model;
         let at = |outer_maxiter: usize| {
-            let opts = FitOptions {
-                outer_maxiter,
-                run_covariance_step: false,
-                ..FitOptions::default()
-            };
+            let opts =
+                FitOptions { outer_maxiter, run_covariance_step: false, ..FitOptions::default() };
             fit(&model, &pop, &model.default_params, &opts)
                 .unwrap_or_else(|e| panic!("{name}: fit must not error: {e}"))
                 .ofv
@@ -619,11 +541,7 @@ fn mixed_mm_fo_elimination_is_the_hand_written_ode_model() {
     let generated = edited(vec![ModelEdit::SetStructural(
         StructuralSpec::new(
             "one_cpt_oral",
-            vec![
-                ("cl".into(), "CL".into()),
-                ("v".into(), "V".into()),
-                ("ka".into(), "KA".into()),
-            ],
+            vec![("cl".into(), "CL".into()), ("v".into(), "V".into()), ("ka".into(), "KA".into())],
             vec![
                 NewParameter::new("CLMM", "TVCLMM", 2.0, 0.0, 100.0),
                 NewParameter::new("KM", "TVKM", 5.0, 0.0, 100.0),
@@ -631,10 +549,7 @@ fn mixed_mm_fo_elimination_is_the_hand_written_ode_model() {
         )
         .ode(
             InputForm::Template,
-            EliminationForm::MixedFoMm {
-                clmm: "CLMM".into(),
-                km: "KM".into(),
-            },
+            EliminationForm::MixedFoMm { clmm: "CLMM".into(), km: "KM".into() },
         ),
     )]);
     let hand = format!(
@@ -682,10 +597,7 @@ fn zero_order_absorption_is_the_hand_written_ode_model() {
             vec![("cl".into(), "CL".into()), ("v".into(), "V".into())],
             vec![NewParameter::new("DUR", "TVDUR", 2.0, 0.0, 24.0)],
         )
-        .ode(
-            InputForm::ZeroOrder { dur: "DUR".into() },
-            EliminationForm::FirstOrder,
-        ),
+        .ode(InputForm::ZeroOrder { dur: "DUR".into() }, EliminationForm::FirstOrder),
     )]);
     let hand = format!(
         "\
@@ -737,10 +649,7 @@ fn weibull_absorption_is_the_hand_written_ode_model() {
             ],
         )
         .ode(
-            InputForm::Weibull {
-                td: "TD".into(),
-                beta: "BETA".into(),
-            },
+            InputForm::Weibull { td: "TD".into(), beta: "BETA".into() },
             EliminationForm::FirstOrder,
         ),
     )]);
@@ -791,11 +700,7 @@ fn the_default_ode_variant_is_the_generated_disposition() {
     let generated = edited(vec![ModelEdit::SetStructural(
         StructuralSpec::new(
             "one_cpt_oral",
-            vec![
-                ("cl".into(), "CL".into()),
-                ("v".into(), "V".into()),
-                ("ka".into(), "KA".into()),
-            ],
+            vec![("cl".into(), "CL".into()), ("v".into(), "V".into()), ("ka".into(), "KA".into())],
             vec![],
         )
         .ode(InputForm::Template, EliminationForm::FirstOrder),

@@ -10,24 +10,20 @@
 //! no existing test looks. Both halves are pinned below: the declared size, and
 //! a runtime probe that actually touches more stack than the default provides.
 
+use crate::api::fit;
+
 use super::*;
 
 #[test]
 fn cheap_subject_dispatch_requires_enough_rows_per_active_worker() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
     pool.install(|| {
         assert!(!parallelize_cheap_subject_pass(1));
         assert!(!parallelize_cheap_subject_pass(31));
         assert!(parallelize_cheap_subject_pass(32));
     });
 
-    let serial = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .unwrap();
+    let serial = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     serial.install(|| assert!(!parallelize_cheap_subject_pass(20)));
 }
 
@@ -39,17 +35,13 @@ fn cheap_subject_dispatch_bench() {
     use std::time::Instant;
 
     const REPEATS: usize = 100_000;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
     pool.install(|| {
         for n in [1usize, 2, 4, 8] {
             let serial_start = Instant::now();
             for _ in 0..REPEATS {
-                let values: Vec<f64> = (0..n)
-                    .map(|i| black_box(i as f64).mul_add(1.000_001, 0.25))
-                    .collect();
+                let values: Vec<f64> =
+                    (0..n).map(|i| black_box(i as f64).mul_add(1.000_001, 0.25)).collect();
                 black_box(values);
             }
             let serial = serial_start.elapsed();
@@ -71,7 +63,7 @@ fn cheap_subject_dispatch_bench() {
     });
 }
 use crate::parser::model_parser::parse_model_string;
-use std::collections::HashMap;
+use rayon::prelude::*;
 
 // ── budget arithmetic ────────────────────────────────────────────────────────
 
@@ -137,11 +129,7 @@ fn a_plan_is_never_zero_wide_on_either_level() {
 #[test]
 fn the_outer_pool_declares_the_ferx_worker_stack() {
     assert_eq!(FIT_RAYON_STACK_SIZE, 32 * 1024 * 1024);
-    for plan in [
-        PoolPlan::default(),
-        PoolPlan::new(1, 1),
-        PoolPlan::from_budget(8, 200),
-    ] {
+    for plan in [PoolPlan::default(), PoolPlan::new(1, 1), PoolPlan::from_budget(8, 200)] {
         assert_eq!(
             plan.worker_stack_size(),
             FIT_RAYON_STACK_SIZE,
@@ -204,24 +192,15 @@ fn the_outer_pool_really_has_more_than_the_default_stack() {
 #[test]
 fn install_runs_the_closure_on_a_pool_of_replicates_width() {
     let plan = PoolPlan::new(3, 2);
-    let width = plan
-        .install(rayon::current_num_threads)
-        .expect("outer pool");
-    assert_eq!(
-        width, 3,
-        "the outer pool is sized by `replicates`, not by the budget"
-    );
+    let width = plan.install(rayon::current_num_threads).expect("outer pool");
+    assert_eq!(width, 3, "the outer pool is sized by `replicates`, not by the budget");
 }
 
 #[test]
 fn apply_to_pins_the_inner_fit_thread_count() {
     let mut opts = FitOptions::default();
     PoolPlan::from_budget(8, 200).apply_to(&mut opts);
-    assert_eq!(
-        opts.threads,
-        Some(1),
-        "a bootstrap plan asks for single-threaded inner fits"
-    );
+    assert_eq!(opts.threads, Some(1), "a bootstrap plan asks for single-threaded inner fits");
 
     let mut opts = FitOptions::default();
     PoolPlan::from_budget(8, 2).apply_to(&mut opts);
@@ -234,11 +213,7 @@ fn apply_to_pins_the_inner_fit_thread_count() {
 #[test]
 fn identical_overrides_preserve_concurrent_fit_capacity() {
     use std::{sync::mpsc, thread, time::Duration, time::Instant};
-    let options = FitOptions {
-        threads: Some(1),
-        ode_reltol: 1e-11,
-        ..Default::default()
-    };
+    let options = FitOptions { threads: Some(1), ode_reltol: 1e-11, ..Default::default() };
     let (entered_tx, entered_rx) = mpsc::channel();
     thread::scope(|scope| {
         let mut releases = Vec::new();
@@ -283,27 +258,9 @@ fn identical_overrides_preserve_concurrent_fit_capacity() {
 #[test]
 fn fit_routing_rejects_invalid_programmatic_ode_options() {
     for (options, field) in [
-        (
-            FitOptions {
-                ode_reltol: f64::NAN,
-                ..Default::default()
-            },
-            "ode_reltol",
-        ),
-        (
-            FitOptions {
-                ode_abstol: -1.0,
-                ..Default::default()
-            },
-            "ode_abstol",
-        ),
-        (
-            FitOptions {
-                ode_max_steps: 0,
-                ..Default::default()
-            },
-            "ode_max_steps",
-        ),
+        (FitOptions { ode_reltol: f64::NAN, ..Default::default() }, "ode_reltol"),
+        (FitOptions { ode_abstol: -1.0, ..Default::default() }, "ode_abstol"),
+        (FitOptions { ode_max_steps: 0, ..Default::default() }, "ode_max_steps"),
     ] {
         let err = install_on_fit_pool(&options, || panic!("invalid options reached the fit"))
             .expect_err("invalid Rust API options");
@@ -315,78 +272,34 @@ fn fit_routing_rejects_invalid_programmatic_ode_options() {
 #[test]
 fn nested_ode_scope_stays_on_the_enclosing_fit_pool() {
     use std::thread;
-    let options = FitOptions {
-        threads: Some(1),
-        ode_reltol: 1e-11,
-        ..Default::default()
-    };
+    let options = FitOptions { threads: Some(1), ode_reltol: 1e-11, ..Default::default() };
     let ov = options.ode_solver_override();
     let pool = fit_scope_pool(ov.into(), 1).expect("outer override pool");
     pool.install(|| {
         let outer_worker = thread::current().id();
         let nested_worker =
             with_fit_scope(&options, || thread::current().id()).expect("nested ODE scope");
-        assert_eq!(
-            nested_worker, outer_worker,
-            "an internal SIR-style scope leased a second pool"
-        );
+        assert_eq!(nested_worker, outer_worker, "an internal SIR-style scope leased a second pool");
     });
 }
 
 // ── end-to-end: what the inner fit actually does with the plan ───────────────
 
 fn one_cpt_model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
+    parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse")
 }
 
 fn subject(id: &str, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| scale * 10.0 / (1.0 + t)).collect();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1, 1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -394,9 +307,7 @@ fn subject(id: &str, scale: f64) -> Subject {
 /// so a thread-count-dependent reduction would show up.
 fn population() -> Population {
     Population {
-        subjects: (0..6)
-            .map(|i| subject(&format!("{}", i + 1), 0.8 + 0.1 * i as f64))
-            .collect(),
+        subjects: (0..6).map(|i| subject(&format!("{}", i + 1), 0.8 + 0.1 * i as f64)).collect(),
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: Vec::new(),
@@ -406,12 +317,7 @@ fn population() -> Population {
 }
 
 fn short_fit_opts() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 2,
-        run_covariance_step: false,
-        ..Default::default()
-    }
-    .quiet()
+    FitOptions { outer_maxiter: 2, run_covariance_step: false, ..Default::default() }.quiet()
 }
 
 #[test]
@@ -452,9 +358,7 @@ fn a_pinned_plan_also_caps_a_multi_start_fit() {
 
 /// The fit-level verdict that sits beside the #2867 summary when no start converged.
 fn lines_contain_not_converged(warnings: &[String]) -> bool {
-    warnings
-        .iter()
-        .any(|w| w.starts_with("No multi-start run converged (3 starts)"))
+    warnings.iter().any(|w| w.starts_with("No multi-start run converged (3 starts)"))
 }
 
 /// #2867, through `fit()` itself: a multi-start fit returns one row per start, the selected
@@ -465,20 +369,13 @@ fn a_multi_start_fit_reports_every_start_and_a_single_start_fit_none() {
     let model = one_cpt_model();
     let pop = population();
     let summary_lines = |r: &FitResult| -> Vec<String> {
-        r.warnings
-            .iter()
-            .filter(|w| w.starts_with("Multi-start: 3 starts"))
-            .cloned()
-            .collect()
+        r.warnings.iter().filter(|w| w.starts_with("Multi-start: 3 starts")).cloned().collect()
     };
 
     let mut opts = short_fit_opts();
     opts.n_starts = 3;
     let multi = fit(&model, &pop, &model.default_params, &opts).expect("fit");
-    assert_eq!(
-        multi.starts.iter().map(|s| s.start).collect::<Vec<_>>(),
-        vec![0, 1, 2]
-    );
+    assert_eq!(multi.starts.iter().map(|s| s.start).collect::<Vec<_>>(), vec![0, 1, 2]);
     let selected: Vec<_> = multi.starts.iter().filter(|s| s.selected).collect();
     assert_eq!(selected.len(), 1);
     assert!(multi.ofv.is_finite(), "premise: the fixture has an OFV");
@@ -488,34 +385,21 @@ fn a_multi_start_fit_reports_every_start_and_a_single_start_fit_none() {
     // The row's status is the start's own. The returned fit's can list more: the two-iteration
     // budget converges no start, and the fit-level "No multi-start run converged" note is
     // added after the rows are taken.
-    assert!(
-        !multi.converged,
-        "premise: outer_maxiter = 2 converges no start"
-    );
+    assert!(!multi.converged, "premise: outer_maxiter = 2 converges no start");
     assert_eq!(selected[0].status.as_deref(), Some("not_converged"));
     // `convergence` is the start's own "did not converge" warning, a plain string on its
     // result: the row's status has it only because the start's warnings were classified
     // before the status was taken.
-    assert_eq!(
-        selected[0].status_reasons,
-        vec!["budget_spent", "convergence"]
-    );
+    assert_eq!(selected[0].status_reasons, vec!["budget_spent", "convergence"]);
     assert!(lines_contain_not_converged(&multi.warnings));
     assert!(multi.starts.iter().all(|s| s.error.is_none()));
     // Start 0 ran from the model file's values, the others from perturbed ones.
     assert_ne!(multi.starts[0].theta, multi.starts[1].theta);
     let lines = summary_lines(&multi);
     assert_eq!(lines.len(), 1, "{:?}", multi.warnings);
+    assert!(lines[0].contains(&format!("(start {}", selected[0].start)), "{}", lines[0]);
     assert!(
-        lines[0].contains(&format!("(start {}", selected[0].start)),
-        "{}",
-        lines[0]
-    );
-    assert!(
-        !multi
-            .warnings
-            .iter()
-            .any(|w| w.contains("best result from start")),
+        !multi.warnings.iter().any(|w| w.contains("best result from start")),
         "the line this replaces is gone: {:?}",
         multi.warnings
     );
@@ -532,15 +416,8 @@ fn a_multi_start_fit_reports_every_start_and_a_single_start_fit_none() {
     // Reporting only: start 0 of the multi-start fit is the single-start fit, bit for bit.
     let single = fit(&model, &pop, &model.default_params, &short_fit_opts()).expect("fit");
     assert!(single.starts.is_empty());
-    assert!(
-        !single.warnings.iter().any(|w| w.starts_with("Multi-start")),
-        "{:?}",
-        single.warnings
-    );
-    assert_eq!(
-        multi.starts[0].ofv.map(f64::to_bits),
-        Some(single.ofv.to_bits())
-    );
+    assert!(!single.warnings.iter().any(|w| w.starts_with("Multi-start")), "{:?}", single.warnings);
+    assert_eq!(multi.starts[0].ofv.map(f64::to_bits), Some(single.ofv.to_bits()));
     assert_eq!(multi.starts[0].theta, single.theta);
 }
 
@@ -583,21 +460,11 @@ fn a_fit_is_bit_identical_across_thread_counts() {
 
     assert_eq!(one.n_threads_used, 1);
     assert_eq!(four.n_threads_used, 4);
-    assert_eq!(
-        one.ofv.to_bits(),
-        four.ofv.to_bits(),
-        "OFV differs: {} vs {}",
-        one.ofv,
-        four.ofv
-    );
+    assert_eq!(one.ofv.to_bits(), four.ofv.to_bits(), "OFV differs: {} vs {}", one.ofv, four.ofv);
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert_eq!(bits(&one.theta), bits(&four.theta), "theta");
     assert_eq!(bits(&one.sigma), bits(&four.sigma), "sigma");
-    assert_eq!(
-        bits(one.omega.as_slice()),
-        bits(four.omega.as_slice()),
-        "omega"
-    );
+    assert_eq!(bits(one.omega.as_slice()), bits(four.omega.as_slice()), "omega");
     assert_eq!(one.n_iterations, four.n_iterations);
 }
 
@@ -616,13 +483,8 @@ fn a_fit_whose_every_start_is_refused_says_why() {
     );
     let mut opts = short_fit_opts();
     opts.n_starts = 2;
-    let err = fit(&model, &pop, &params, &opts)
-        .expect_err("every start is refused")
-        .to_string();
-    assert!(
-        err.starts_with("All multi-start fits failed: start 0:"),
-        "{err}"
-    );
+    let err = fit(&model, &pop, &params, &opts).expect_err("every start is refused").to_string();
+    assert!(err.starts_with("All multi-start fits failed: start 0:"), "{err}");
     assert!(err.contains("start 1:"), "{err}");
     assert!(
         err.contains("lower bound") || err.contains("rail"),
@@ -655,10 +517,7 @@ fn work_outside_a_fit_runs_on_a_ferx_pool_of_the_requested_width() {
         let (index, width) = install_on_pool_sized(n, || {
             (rayon::current_thread_index(), rayon::current_num_threads())
         });
-        assert!(
-            index.is_some(),
-            "the closure did not run on a Rayon worker at width {n}"
-        );
+        assert!(index.is_some(), "the closure did not run on a Rayon worker at width {n}");
         assert_eq!(width, n, "expected a {n}-worker ferx pool");
     }
 }
@@ -669,15 +528,9 @@ fn work_already_on_a_worker_stays_there_instead_of_nesting_a_pool() {
     // not lease a second pool underneath the caller's budget — a `PoolPlan` that pinned
     // one thread per replicate would otherwise get `threads_per_fit` ignored by every
     // post-fit diagnostic.
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     let width = pool.install(|| install_on_pool_sized(3, rayon::current_num_threads));
-    assert_eq!(
-        width, 1,
-        "an enclosing pool must be kept, not widened to the requested count"
-    );
+    assert_eq!(width, 1, "an enclosing pool must be kept, not widened to the requested count");
 }
 
 // ── the fit scope reaches every worker, and only the call it belongs to (#426) ──
@@ -706,10 +559,7 @@ fn lbfgs_warm() -> crate::estimation::inner_optimizer::InnerSettings {
 #[test]
 fn a_scoped_pool_installs_the_inner_settings_on_every_worker() {
     use crate::estimation::inner_optimizer::current_inner_settings;
-    let scope = FitScope {
-        inner: lbfgs_warm(),
-        ..Default::default()
-    };
+    let scope = FitScope { inner: lbfgs_warm(), ..Default::default() };
     let pool = fit_scope_pool(scope, 3).expect("scoped pool");
     let seen = pool.install(|| jobs_read(current_inner_settings));
     let wrong = seen.iter().filter(|s| **s != lbfgs_warm()).count();
@@ -741,10 +591,7 @@ fn a_nested_fit_scope_runs_inline_only_on_a_worker_carrying_the_same_scope() {
         ebe_warm_start: true,
         ..Default::default()
     };
-    let default_request = FitOptions {
-        threads: Some(width),
-        ..Default::default()
-    };
+    let default_request = FitOptions { threads: Some(width), ..Default::default() };
 
     // (a) inner settings.
     let pool = fit_scope_pool(FitScope::of(&lbfgs), width).expect("outer pool");
@@ -758,21 +605,11 @@ fn a_nested_fit_scope_runs_inline_only_on_a_worker_carrying_the_same_scope() {
         outer.iter().all(|s| *s == lbfgs_warm()),
         "premise: the enclosing pool's jobs read its scope"
     );
-    let leaked = nested
-        .iter()
-        .filter(|s| **s != InnerSettings::default())
-        .count();
-    assert_eq!(
-        leaked, 0,
-        "{leaked}/64 nested jobs read the enclosing inner settings"
-    );
+    let leaked = nested.iter().filter(|s| **s != InnerSettings::default()).count();
+    assert_eq!(leaked, 0, "{leaked}/64 nested jobs read the enclosing inner settings");
 
     // (a), ODE twin.
-    let tight = FitOptions {
-        threads: Some(width),
-        ode_reltol: 1e-11,
-        ..Default::default()
-    };
+    let tight = FitOptions { threads: Some(width), ode_reltol: 1e-11, ..Default::default() };
     let baked = crate::ode::OdeSolverOptions::default();
     let reltol = || effective_solver_options(baked).reltol;
     let pool = fit_scope_pool(FitScope::of(&tight), width).expect("ODE pool");
@@ -783,27 +620,18 @@ fn a_nested_fit_scope_runs_inline_only_on_a_worker_carrying_the_same_scope() {
     });
     assert!(outer.iter().all(|r| *r == 1e-11), "premise: ODE pool");
     let leaked = nested.iter().filter(|r| **r == 1e-11).count();
-    assert_eq!(
-        leaked, 0,
-        "{leaked}/64 nested jobs read the enclosing ode_reltol"
-    );
+    assert_eq!(leaked, 0, "{leaked}/64 nested jobs read the enclosing ode_reltol");
 
     // (b) the same scope stays on the enclosing worker.
     let pool = fit_scope_pool(FitScope::of(&lbfgs), width).expect("same-scope pool");
     pool.install(|| {
         let here = thread::current().id();
         let nested = with_fit_scope(&lbfgs, || thread::current().id()).expect("nested");
-        assert_eq!(
-            nested, here,
-            "a same-scope nested call leased a second pool"
-        );
+        assert_eq!(nested, here, "a same-scope nested call leased a second pool");
     });
 
     // (c) an empty request on a plain one-worker pool keeps its width.
-    let plain = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .unwrap();
+    let plain = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     let kept = plain
         .install(|| with_fit_scope(&default_request, rayon::current_num_threads).expect("nested"));
     assert_eq!(kept, 1, "an enclosing plain pool must be kept");
@@ -815,9 +643,7 @@ fn a_nested_fit_scope_runs_inline_only_on_a_worker_carrying_the_same_scope() {
 /// a cross-pool `install` keeps executing its own pool's queued jobs while it waits, so on a
 /// one-worker pool `read` can only run there, mid-`nested`. Deterministic for that reason.
 fn read_while_blocked<T: Send>(
-    pool: &rayon::ThreadPool,
-    nested: impl FnOnce() + Send,
-    read: impl FnOnce() -> T + Send,
+    pool: &rayon::ThreadPool, nested: impl FnOnce() + Send, read: impl FnOnce() -> T + Send,
 ) -> T {
     pool.install(|| {
         rayon::join(
@@ -853,18 +679,9 @@ fn a_job_stolen_during_a_nested_scoped_call_reads_its_own_pools_scope() {
     let baked = crate::ode::OdeSolverOptions::default();
     let reltol = move || effective_solver_options(baked).reltol;
 
-    let inner_pool = fit_scope_pool(
-        FitScope {
-            inner: lbfgs_warm(),
-            ..Default::default()
-        },
-        1,
-    )
-    .expect("inner pool");
-    let tight = FitOptions {
-        ode_reltol: 1e-11,
-        ..Default::default()
-    };
+    let inner_pool = fit_scope_pool(FitScope { inner: lbfgs_warm(), ..Default::default() }, 1)
+        .expect("inner pool");
+    let tight = FitOptions { ode_reltol: 1e-11, ..Default::default() };
     let ode_pool = fit_scope_pool(FitScope::of(&tight), 1).expect("ODE pool");
 
     let fit_pool_inner = read_while_blocked(

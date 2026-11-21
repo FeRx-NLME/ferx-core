@@ -75,11 +75,7 @@ fn nonmem_scores(file: &str) -> Vec<(String, f64, f64, f64)> {
         .unwrap_or_else(|e| panic!("the committed NONMEM table must be readable: {e}"));
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. line");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header line")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> = lines.next().expect("column header line").split_whitespace().collect();
     let col = |name: &str| {
         header
             .iter()
@@ -101,10 +97,7 @@ fn nonmem_scores(file: &str) -> Vec<(String, f64, f64, f64)> {
 
 fn anchor_model_and_data() -> (CompiledModel, Population) {
     let model = parse_model_file(Path::new(MODEL)).expect("the anchor model parses");
-    assert_eq!(
-        model.n_kappa, 1,
-        "the anchor must declare an occasion kappa"
-    );
+    assert_eq!(model.n_kappa, 1, "the anchor must declare an occasion kappa");
     let pop = read_nonmem_csv(Path::new(DATA), None, Some("OCC")).expect("the anchor data loads");
     assert!(
         pop.subjects.iter().all(|s| !s.occasions.is_empty()),
@@ -121,9 +114,7 @@ fn anchor_model_and_data() -> (CompiledModel, Population) {
 /// the likeliest way to break the thing under test — would leave the accumulators
 /// at whatever the working rows produced and pass.
 fn worst_vs_nonmem(
-    ferx: &[SubjectNpde],
-    pop: &Population,
-    table: &str,
+    ferx: &[SubjectNpde], pop: &Population, table: &str,
 ) -> (f64, f64, (String, f64)) {
     let nm = nonmem_scores(table);
     let mut worst_npd: f64 = 0.0;
@@ -153,11 +144,7 @@ fn worst_vs_nonmem(
             matched += 1;
         }
     }
-    assert_eq!(
-        matched,
-        nm.len(),
-        "every NONMEM observation row must be matched"
-    );
+    assert_eq!(matched, nm.len(), "every NONMEM observation row must be matched");
     assert_eq!(matched, 540, "the anchor design is 60 x 3 x 3 observations");
     (worst_npd, worst_npde, worst_row)
 }
@@ -181,10 +168,7 @@ fn npde_iov_reference_matches_nonmem() {
          reference distribution is not NONMEM's — occasion kappa dropped, or drawn \
          at the wrong scale"
     );
-    assert!(
-        npde < NPDE_TOL,
-        "worst |dNPDE| = {npde:.5} exceeds {NPDE_TOL} (realised 0.28044)"
-    );
+    assert!(npde < NPDE_TOL, "worst |dNPDE| = {npde:.5} exceeds {NPDE_TOL} (realised 0.28044)");
 
     // NPD carries no decorrelation, so it must match NONMEM's *default* table just
     // as well — the two NONMEM runs write bit-identical NPD columns.
@@ -218,10 +202,7 @@ fn npde_iov_zero_omega_iov_control_diverges_from_nonmem() {
     let (model, pop) = anchor_model_and_data();
     let mut zero_iov: ModelParameters = model.default_params.clone();
     {
-        let om = zero_iov
-            .omega_iov
-            .as_mut()
-            .expect("the anchor model carries an Ω_IOV");
+        let om = zero_iov.omega_iov.as_mut().expect("the anchor model carries an Ω_IOV");
         om.chol.fill(0.0);
         om.matrix.fill(0.0);
     }

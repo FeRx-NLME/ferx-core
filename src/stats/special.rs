@@ -105,21 +105,17 @@ pub fn log_normal_cdf(z: f64) -> f64 {
     }
 }
 
-// ── PkNum-generic siblings for the analytical inverse-Gaussian absorption
-//    closed form (#790) ───────────────────────────────────────────────────────
+// ── PkNum-generic siblings for the analytical inverse-Gaussian absorption closed form (#790) ──
 //
-// The `igd()` analytic closed form (exponential tilting of the inverse-Gaussian,
-// `src/pk/analytical_absorption.rs`) needs the normal CDF `Φ` — and, where a huge
-// `exp(2λ/μ*)` prefactor multiplies a vanishing `Φ` in the far tail, its
-// numerically-stable log `ln Φ` — evaluated over `T: PkNum` so the FOCE/FOCEI
-// `Dual2` sensitivities ride through exactly, the same way `regularized_gamma_p`
-// (#604) enabled transit. All three are built on the `erf(x) = sign(x)·P(½, x²)` /
-// `erfc(x) = Q(½, x²)` identities, reusing the already-mutation-tested incomplete
-// gamma [`regularized_gamma_p`] / [`regularized_gamma_q`] so both the value and the
-// exact dual jets come for free. They are the exact-derivative counterparts of the
-// f64 `erf` / `normal_cdf` / `log_normal_cdf` above; those stay on the fast A&S
-// 7.1.26 approximation for the M3/BLOQ likelihood, where the ~1.5e-7 value error is
-// immaterial and speed matters.
+// The `igd()` closed form (exponential tilting of the inverse-Gaussian,
+// `src/pk/analytical_absorption.rs`) needs the normal CDF `Φ` and, where a huge `exp(2λ/μ*)`
+// prefactor multiplies a vanishing `Φ` in the far tail, its stable log `ln Φ`, over
+// `T: PkNum` so FOCE/FOCEI `Dual2` sensitivities ride through exactly (as
+// `regularized_gamma_p`, #604, did for transit). All three use the identities
+// `erf(x) = sign(x)·P(½, x²)` / `erfc(x) = Q(½, x²)`, reusing the tested incomplete gamma
+// [`regularized_gamma_p`] / [`regularized_gamma_q`]. They are the exact-derivative
+// counterparts of the f64 `erf` / `normal_cdf` / `log_normal_cdf` above, which stay on the
+// fast A&S 7.1.26 approximation for the M3/BLOQ likelihood (~1.5e-7 value error is immaterial).
 
 /// `2/√π` — the factor of `erf'(x) = (2/√π)·e^{−x²}` and of the small-argument
 /// `erf(x) ≈ (2/√π)·(x − x³/3 + …)` germ.
@@ -130,25 +126,19 @@ const TWO_OVER_SQRT_PI: f64 = std::f64::consts::FRAC_2_SQRT_PI;
 /// germ's `O(x³)` Hessian error ~1e-9 while sitting far above the `x²` underflow.
 const ERF_GERM_HALF_WIDTH: f64 = 1e-3;
 
-/// Error function `erf(x)` over [`PkNum`], with exact 1st/2nd-order `Dual2`
-/// derivatives — the exact-derivative sibling of the f64 [`erf`].
+/// Error function `erf(x)` over [`PkNum`], with exact 1st/2nd-order `Dual2` derivatives, the
+/// exact-derivative sibling of the f64 [`erf`].
 ///
-/// Built on the identity `erf(x) = sign(x)·P(½, x²)` with `P` the regularized
-/// lower incomplete gamma [`regularized_gamma_p`], so it inherits that function's
-/// convergent series / continued-fraction value accuracy (~1e-12) **and** its
-/// exact dual jets — rather than differentiating a fixed rational approximation
-/// (whose derivative would carry a separate ~1e-5 error). `erf'(x) = (2/√π)e^{−x²}`
-/// then falls out of the chain rule `sign(x)·P_x(½,x²)·2x` (with
-/// `P_x(½,u) = e^{−u}/(√u·√π)`, and `sign(x)·x/√(x²) ≡ 1`), so no hand-written
-/// dual rule is needed.
+/// Built on `erf(x) = sign(x)·P(½, x²)` with `P` the regularized lower incomplete gamma
+/// [`regularized_gamma_p`], so it inherits its value accuracy (~1e-12) **and** exact dual jets,
+/// rather than differentiating a rational approximation (whose derivative carries a separate
+/// ~1e-5 error). `erf'(x) = (2/√π)e^{−x²}` falls out of the chain rule `sign(x)·P_x(½,x²)·2x`.
 ///
-/// Near `x = 0` the identity is replaced by the cubic germ
-/// `erf(x) ≈ (2/√π)·(x − x³/3)`: `P(½, x²)` at `x = 0` hits `regularized_gamma_p`'s
-/// flat `x ≤ 0` clamp (zero jet), which would drop the finite `erf'(0) = 2/√π`; the
-/// germ carries the exact value **and** its 1st/2nd derivatives there (the `O(x⁵)`
-/// remainder touches only 3rd+ order). This is on the live gradient path — `Φ(0)`
-/// (i.e. `x = 0`) is a real point of the IG CDF, reached at observation time
-/// `t = MAT`.
+/// Near `x = 0` the identity is replaced by the cubic germ `erf(x) ≈ (2/√π)·(x − x³/3)`:
+/// `P(½, x²)` at `x = 0` hits `regularized_gamma_p`'s flat `x ≤ 0` clamp (zero jet), dropping
+/// the finite `erf'(0) = 2/√π`; the germ carries the exact value and 1st/2nd derivatives there
+/// (the `O(x⁵)` remainder touches only 3rd+ order). This is on the live gradient path: `Φ(0)` is
+/// a real point of the IG CDF, reached at observation time `t = MAT`.
 pub fn erf_g<T: PkNum>(x: T) -> T {
     if x.br_abs_lt(ERF_GERM_HALF_WIDTH) {
         // erf(x) = (2/√π)(x − x³/3 + …); the cubic germ is accurate in value, grad,
@@ -156,11 +146,7 @@ pub fn erf_g<T: PkNum>(x: T) -> T {
         let c = T::from_f64(TWO_OVER_SQRT_PI);
         return c * (x - x * x * x / T::from_f64(3.0));
     }
-    let sign = if x.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
-        -1.0
-    } else {
-        1.0
-    };
+    let sign = if x.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
     T::from_f64(sign) * regularized_gamma_p(T::from_f64(0.5), x * x)
 }
 
@@ -194,27 +180,24 @@ pub fn normal_cdf_g<T: PkNum>(z: T) -> T {
 }
 
 /// Numerically-stable `ln Φ(z)` over [`PkNum`], with exact `Dual2` derivatives
-/// (`(ln Φ)'(z) = φ(z)/Φ(z)`, the inverse Mills ratio) — the exact-derivative,
-/// tail-safe sibling of the f64 [`log_normal_cdf`].
+/// (`(ln Φ)'(z) = φ(z)/Φ(z)`, the inverse Mills ratio), the tail-safe exact-derivative sibling
+/// of the f64 [`log_normal_cdf`].
 ///
-/// The IG closed form's second CDF term is `exp(2λ/μ*)·Φ(z₂)` with `z₂` deep in the
-/// left tail and `exp(2λ/μ*)` astronomically large for small `CV²`; forming it as
-/// `exp(2λ/μ* + ln Φ(z₂))` (this function) sidesteps the catastrophic cancellation
-/// of a direct `Φ(z₂)` (which underflows to `0`, making the product a spurious `0`
-/// instead of the true `O(1)` value). Because `Φ(z) = ½·erfc(−z/√2)` here evaluates
-/// the lower tail as the direct `Q(½, z²/2)`, `ln Φ` is accurate there down to
-/// `z = −10` (`LOG_NORMAL_CDF_MILLS_SWITCH`). Below it the value is the Mills form
-/// `ln Φ(z) = −z²/2 − ½ln 2π − ln(t + a(t))`, `t = −z`, `a` = `mills_excess`, the
-/// Laplace continued fraction for the Mills ratio
-/// (#2769): no `Φ` is ever formed, so there is no floor — the value goes to `−∞` only
-/// when `z²` overflows — and the jet carries no `grad²/val²` term to underflow.
+/// The IG closed form's second CDF term is `exp(2λ/μ*)·Φ(z₂)` with `z₂` deep in the left tail
+/// and `exp(2λ/μ*)` astronomically large for small `CV²`; forming it as
+/// `exp(2λ/μ* + ln Φ(z₂))` sidesteps a direct `Φ(z₂)` underflowing to `0` (a spurious `0`
+/// instead of the true `O(1)`). `Φ(z) = ½·erfc(−z/√2)` evaluates the lower tail as the direct
+/// `Q(½, z²/2)`, so `ln Φ` is accurate down to `z = −10` (`LOG_NORMAL_CDF_MILLS_SWITCH`). Below
+/// it the value is the Mills form `ln Φ(z) = −z²/2 − ½ln 2π − ln(t + a(t))`, `t = −z`,
+/// `a` = `mills_excess` (Laplace continued fraction, #2769): no `Φ` is formed, so there is no
+/// floor (the value goes to `−∞` only when `z²` overflows) and the jet has no `grad²/val²`
+/// term to underflow.
 ///
 /// Both matter to the IG closed form, which adds `ln Φ(z₂)` to `2λ/μ* ≈ 2/CV²` with
 /// `z₂ ≈ −2/CV` near `t = MAT`: the old `MIN_PROB.ln()` clamp (from `z ≈ −37.5`) left
-/// `exp(2/CV² − 690.8)` standing for `CV ≲ 0.053` (a concentration of `~1e48` at
-/// `CV = 0.05`, `inf` at `0.03`), and the `Dual2` Hessian of `ln Q(½, z²/2)` was
-/// `0/0 = NaN` from `z ≈ −26.5` — i.e. IG Hessians from `CV ≈ 0.075`, where the values
-/// were still right.
+/// `exp(2/CV² − 690.8)` standing for `CV ≲ 0.053` (`~1e48` at `CV = 0.05`, `inf` at `0.03`), and
+/// the `Dual2` Hessian of `ln Q(½, z²/2)` was `0/0 = NaN` from `z ≈ −26.5` (IG Hessians from
+/// `CV ≈ 0.075`, where values were still right).
 pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     // The compare is a recordable branch (`br_cmp_c`), so a compiled plan re-checks it.
     if z.br_cmp_c(crate::sens::num::BranchCmp::Lt, LOG_NORMAL_CDF_MILLS_SWITCH) {
@@ -223,6 +206,41 @@ pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     } else {
         normal_cdf_g(z).ln()
     }
+}
+
+/// [`normal_cdf_g`] for a recording type (#2786) that reads it **inside an ODE step**, where `z`
+/// moves with the stage time: the same value, with every branch of [`erf_g`] and [`erfc_g`] a
+/// selection. Those branches are guards of a recorded body, which fail at any other stage of the
+/// segment than the one recorded (#3004: an infusion into an `igd()` kernel evaluates `Φ` at the
+/// stage time). Each arm is read at a safe argument where it is not taken, the incomplete gamma
+/// off its `x ≤ 0` clamp. Both arms are evaluated, so a caller whose `z` is fixed per recording
+/// keeps the branching form.
+pub(crate) fn normal_cdf_stage<T: PkNum>(z: T) -> T {
+    use crate::sens::num::BranchCmp::{Gt, Lt};
+    let (zero, one, half) = (T::from_f64(0.0), T::from_f64(1.0), T::from_f64(0.5));
+    // Φ(z) = ½·erfc(x), x = −z/√2; erfc = 1 − erf, or Q(½, x²) above x = 1 (`erfc_g`).
+    let x = -z * T::from_f64(INV_SQRT_2);
+    let germ_sq = T::from_f64(ERF_GERM_HALF_WIDTH * ERF_GERM_HALF_WIDTH);
+    let near = x * x;
+    let germ = T::from_f64(TWO_OVER_SQRT_PI) * (x - x * x * x / T::from_f64(3.0));
+    let away = T::select_if(Lt, near, germ_sq, one, x);
+    let sign = T::select_if(Lt, x, zero, T::from_f64(-1.0), one);
+    let erf = T::select_if(Gt, near, germ_sq, sign * regularized_gamma_p(half, away * away), germ);
+    let upper_x = T::select_if(Gt, x, one, x, T::from_f64(2.0));
+    let upper = regularized_gamma_q(half, upper_x * upper_x);
+    half * T::select_if(Gt, x, one, upper, one - erf)
+}
+
+/// [`log_normal_cdf_g`] for a recording type inside an ODE step: [`normal_cdf_stage`]'s
+/// selections, and the Mills switch one too, each arm read at a safe `z` where it is not taken
+/// (the Mills fraction needs `t ≥ 2`, `ln Φ` a `z` above its underflow).
+pub(crate) fn log_normal_cdf_stage<T: PkNum>(z: T) -> T {
+    use crate::sens::num::BranchCmp::Lt;
+    let switch = T::from_f64(LOG_NORMAL_CDF_MILLS_SWITCH);
+    let t = T::select_if(Lt, z, switch, -z, -switch);
+    let mills = T::from_f64(-0.5) * t * t - T::from_f64(HALF_LN_2PI) - (t + mills_excess(t)).ln();
+    let direct = normal_cdf_stage(T::select_if(Lt, z, switch, switch, z)).ln();
+    T::select_if(Lt, z, switch, mills, direct)
 }
 
 /// Below this `z`, [`log_normal_cdf_g`] takes the Mills form instead of `ln Φ(z)` (#2769).
@@ -272,13 +290,7 @@ pub(crate) fn pnorm_jet(x: f64) -> [f64; 5] {
     if d == 0.0 {
         return [pnorm(x), 0.0, 0.0, 0.0, 0.0];
     }
-    [
-        pnorm(x),
-        d,
-        -x * d,
-        (x * x - 1.0) * d,
-        (3.0 * x - x * x * x) * d,
-    ]
+    [pnorm(x), d, -x * d, (x * x - 1.0) * d, (3.0 * x - x * x * x) * d]
 }
 
 /// `softplus(x) = ln(1 + eˣ)` (`max(x, 0) + ln1p(e^{−|x|})`, without overflow) and its
@@ -292,13 +304,7 @@ pub(crate) fn softplus_jet(x: f64) -> [f64; 5] {
 pub(crate) fn tanh_jet(x: f64) -> [f64; 5] {
     let t = x.tanh();
     let d1 = 1.0 - t * t;
-    [
-        t,
-        d1,
-        -2.0 * t * d1,
-        -2.0 * d1 * (1.0 - 3.0 * t * t),
-        8.0 * t * d1 * (2.0 - 3.0 * t * t),
-    ]
+    [t, d1, -2.0 * t * d1, -2.0 * d1 * (1.0 - 3.0 * t * t), 8.0 * t * d1 * (2.0 - 3.0 * t * t)]
 }
 
 /// `[log Φ, (log Φ)′, …, (log Φ)⁗]` at `x`: production's value (`log_normal_cdf`) and the
@@ -364,24 +370,19 @@ pub fn inv_mills(z: f64) -> f64 {
     (ln_phi - log_normal_cdf(z)).exp()
 }
 
-/// Shared M3-censored kernel at a censored row with limit `y`, prediction `f`,
-/// residual variance `v`, `dv_df = ∂v/∂f`, and censoring sign `cens` (NONMEM
-/// convention: `cens > 0` = below-LLOQ / lower tail, `cens < 0` = above-ULOQ /
-/// upper tail). Returns the **signed** `(h, z, m)` where, with `σ = sign(cens)`
-/// (`+1` for left, `−1` for right):
-/// `z = σ·(y − f)/√v` is the tail argument the objective scores
-/// (`−logΦ(z)`, matching `m3_logcdf`),
-/// `h = φ(z)/Φ(z)` ([`inv_mills`]), and the signed
-/// `m = σ·[1/√v + (y − f)·dv_df / (2·v^{3/2})]`.
+/// Shared M3-censored kernel at a censored row with limit `y`, prediction `f`, residual
+/// variance `v`, `dv_df = ∂v/∂f`, and censoring sign `cens` (NONMEM convention: `cens > 0` =
+/// below-LLOQ / lower tail, `cens < 0` = above-ULOQ / upper tail). Returns the **signed**
+/// `(h, z, m)` with `σ = sign(cens)` (`+1` left, `−1` right): `z = σ·(y − f)/√v` is the tail
+/// argument the objective scores (`−logΦ(z)`, matching `m3_logcdf`), `h = φ(z)/Φ(z)`
+/// ([`inv_mills`]), and `m = σ·[1/√v + (y − f)·dv_df / (2·v^{3/2})]`.
 ///
-/// Signing `z` and `m` together keeps every downstream censored derivative
-/// tail-correct with **no** per-caller branch: the data-term f-coefficient
-/// `∂(−logΦ)/∂f = h·m`; the `iiv_on_ruv` residual-η column
-/// `∂(−logΦ)/∂η_ruv = h·z`; and the censored × residual-η cross coefficients via
-/// `C = h·(z² + h·z − 1)` (`C·z`, `C·m`). (The second-order f-curvature `g2` in
-/// [`m3_censored_outer`] also signs its `∂m/∂f` term by the same `σ`.) For the
-/// lower tail (`cens ≥ 0`) `σ = +1` and
-/// these reduce to the historical unsigned forms.
+/// Signing `z` and `m` together keeps every downstream censored derivative tail-correct with
+/// **no** per-caller branch: the data-term f-coefficient `∂(−logΦ)/∂f = h·m`; the `iiv_on_ruv`
+/// residual-η column `∂(−logΦ)/∂η_ruv = h·z`; the censored × residual-η cross coefficients via
+/// `C = h·(z² + h·z − 1)` (`C·z`, `C·m`). (The f-curvature `g2` in [`m3_censored_outer`] signs
+/// its `∂m/∂f` term by the same `σ`.) For the lower tail (`cens ≥ 0`) `σ = +1` and these reduce
+/// to the historical unsigned forms.
 #[inline]
 pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> (f64, f64, f64) {
     let w = v.sqrt();
@@ -393,29 +394,21 @@ pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> (f64,
 }
 
 /// All M3-censored-row coefficients from a **single** [`m3_censored_kernel`] eval:
-/// `(g1, g2, cz, cm)` = `(∂L/∂f, ∂²L/∂f², C·z, C·m)` for `L = −logΦ(z)`,
-/// `z = σ·(y−f)/√v` (`σ = sign(cens)`), `(h, z, m)` the signed kernel,
-/// `C = h(z²+h·z−1)`:
+/// `(g1, g2, cz, cm)` = `(∂L/∂f, ∂²L/∂f², C·z, C·m)` for `L = −logΦ(z)`, `z = σ·(y−f)/√v`
+/// (`σ = sign(cens)`), `(h, z, m)` the signed kernel, `C = h(z²+h·z−1)`:
 /// ```text
 ///   g1 = h·m
 ///   g2 = h(h+z)·m² + h·∂m/∂f,   ∂m/∂f = σ·{[−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵)}
 ///   (cz, cm) = (C·z, C·m)       (residual-eta cross coefficients, `iiv_on_ruv`)
 /// ```
-/// `d = ∂v/∂f`, `d2 = ∂²v/∂f²`. `z` and `m` carry the tail sign from the kernel;
-/// `∂m/∂f` is signed here by the same `σ` so the curvature matches the upper tail
-/// for right-censored (`cens < 0`) rows. One kernel (one `erfc`/`exp` pair) per
-/// censored row. Single-sourced here so the FOCEI marginal
-/// ([`gaussian_foce_accum`](crate::stats::likelihood)) and the analytic outer
-/// gradient ([`sens_outer_gradient`](crate::estimation::sens_outer_gradient))
-/// cannot drift.
+/// `d = ∂v/∂f`, `d2 = ∂²v/∂f²`. `z` and `m` carry the tail sign from the kernel; `∂m/∂f` is
+/// signed by the same `σ` so the curvature matches the upper tail for right-censored rows. One
+/// kernel (one `erfc`/`exp` pair) per censored row, single-sourced so the FOCEI marginal
+/// ([`gaussian_foce_accum`](crate::stats::likelihood)) and the analytic outer gradient
+/// ([`sens_outer_gradient`](crate::estimation::sens_outer_gradient)) cannot drift.
 #[inline]
 pub fn m3_censored_outer(
-    y: f64,
-    f: f64,
-    v: f64,
-    d: f64,
-    d2: f64,
-    cens: i8,
+    y: f64, f: f64, v: f64, d: f64, d2: f64, cens: i8,
 ) -> (f64, f64, f64, f64) {
     let (h, z, m) = m3_censored_kernel(y, f, v, d, cens);
     if h == 0.0 {
@@ -584,9 +577,7 @@ fn ln_rising_over_power_g<T: PkNum>(r: T, k: u32) -> T {
     let c = |v: f64| T::from_f64(v);
     if k <= NEGBIN_SUM_MAX_K {
         let inv_r = c(1.0) / r;
-        (1..k).fold(c(0.0), |acc, j| {
-            acc + (c(1.0) + c(f64::from(j)) * inv_r).ln()
-        })
+        (1..k).fold(c(0.0), |acc, j| acc + (c(1.0) + c(f64::from(j)) * inv_r).ln())
     } else if r.br_cmp_c(BranchCmp::Ge, NEGBIN_STIRLING_MIN_R) {
         let kt = c(f64::from(k));
         let stirling = |z: T| {
@@ -782,38 +773,31 @@ pub(crate) fn pentagamma(x: f64) -> f64 {
         - 2.0 * (q * q + r * dq)
 }
 
-/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
-/// Gamma(shape = `a`, rate = 1) distribution at `x`, defined for `a > 0`,
-/// `x ≥ 0` (returns `0` for `x ≤ 0`).
+/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)`, the CDF of a Gamma(shape =
+/// `a`, rate = 1) at `x`, defined for `a > 0`, `x ≥ 0` (returns `0` for `x ≤ 0`).
 ///
-/// **Boundary `x ≤ 0`** is a flat clamp: value `0` with a **zero** gradient. That is
-/// exact for `a > 1` (the Gamma pdf `∂P/∂x → 0`) and a deliberate clamp for `a ≤ 1`
-/// (where the true `∂P/∂x|_{x→0⁺}` is `1` at `a = 1` and `+∞` for `a < 1`, neither
-/// representable). The transit closed form only reaches `a = n + 1 = 1` (single
-/// transit) at `t = 0`, where the concentration is `0` regardless, so this clamp is
-/// never on a live sensitivity path there.
+/// **Boundary `x ≤ 0`** is a flat clamp: value `0` with a **zero** gradient. Exact for `a > 1`
+/// (`∂P/∂x → 0`) and a deliberate clamp for `a ≤ 1` (the true `∂P/∂x|_{x→0⁺}` is `1` at `a = 1`
+/// and `+∞` for `a < 1`, neither representable). The transit closed form only reaches
+/// `a = n + 1 = 1` at `t = 0`, where the concentration is `0` regardless, so the clamp is never
+/// on a live sensitivity path there.
 ///
-/// Added for the **Phase 3** analytical absorption closed forms (#386): the
-/// exponential-tilting convolution of a Savic transit (Gamma) input with a linear
-/// 1-/2-cpt disposition is `P(n + 1, (KTR − k)·t)` (see `plans/absorption-models.md`
-/// §Phase 3), so this is the special function the `convolve_*` closed forms evaluate.
+/// Added for the **Phase 3** analytical absorption closed forms (#386): the exponential-tilting
+/// convolution of a Savic transit (Gamma) input with a linear 1-/2-cpt disposition is
+/// `P(n + 1, (KTR − k)·t)` (see `plans/absorption-models.md` §Phase 3).
 ///
-/// **Generic over [`PkNum`] on purpose.** Unlike [`ln_gamma`] — whose parameter
-/// derivative has a closed form ([`digamma`] / [`trigamma`]) — the incomplete
-/// gamma's `∂P/∂a` is *not* elementary. So rather than hand-derive a dual rule, the
-/// series / continued-fraction iteration is written **once** over `T: PkNum` and the
-/// dual numbers carry the exact `∂P/∂a`, `∂P/∂x` (and 2nd order) through the very
-/// same arithmetic — the `sens/` `*_g<T>` convention, with no second copy to drift.
-/// Only the branch and convergence *decisions* read `T::val()` (the value part); the
-/// body is `+ − * / .exp() .ln()` and [`PkNum::ln_gamma`], all of which the dual
-/// types already differentiate. `T = f64` yields the plain value; `T = Dual2<N>`
-/// yields the value plus exact 1st/2nd-order sensitivities.
+/// **Generic over [`PkNum`] on purpose.** Unlike [`ln_gamma`], whose parameter derivative is
+/// closed-form ([`digamma`] / [`trigamma`]), `∂P/∂a` is *not* elementary. So the series /
+/// continued-fraction iteration is written **once** over `T: PkNum` and the dual numbers carry
+/// the exact `∂P/∂a`, `∂P/∂x` (and 2nd order) through the same arithmetic (the `sens/`
+/// `*_g<T>` convention, no second copy to drift). Only branch and convergence *decisions* read
+/// `T::val()`; the body is `+ − * / .exp() .ln()` and [`PkNum::ln_gamma`].
 ///
 /// Algorithm (Numerical Recipes §6.2; Abramowitz & Stegun 6.5): the power series for
-/// `x < a + 1`, else Lentz's continued fraction for the complementary upper tail
-/// `Q(a, x)` with `P = 1 − Q` — each form converges fastest on its own side of the
-/// `x = a + 1` switch. Transit fits sit mostly in the continued-fraction regime
-/// (`x = (KTR − k)·t` grows with the dosing interval while `a = n + 1` stays small).
+/// `x < a + 1`, else Lentz's continued fraction for the upper tail `Q(a, x)` with `P = 1 − Q`,
+/// each converging fastest on its own side of the switch. Transit fits sit mostly in the
+/// continued-fraction regime (`x = (KTR − k)·t` grows with the dosing interval while
+/// `a = n + 1` stays small).
 pub fn regularized_gamma_p<T: PkNum>(a: T, x: T) -> T {
     a.gamma_pq(x, false)
 }
@@ -855,11 +839,158 @@ pub(crate) fn gamma_pq_g<T: PkNum>(a: T, x: T, upper: bool) -> T {
 /// `∂^(i+j) P / ∂aⁱ ∂xʲ` at `(a, x)` — of `Q` when `upper`, which is `1 − P`, so every
 /// partial but the value is the negated one of `P` — for `i + j ≤ 3`; `NaN` above, where no
 /// layout differentiates (a misuse shows as a non-finite derivative, which the checks
-/// reject). The primitive's local derivatives (#2786): [`gamma_pq_g`] over a two-variable
-/// Taylor polynomial of the order asked, so they are the derivatives the dual types carry
-/// through the same iteration, rounded once more. The last point's polynomial is kept per
-/// thread, as a recorded program asks for several partials at one point in a row.
+/// reject). The primitive's local derivatives (#2786).
+///
+/// Every partial with an `x` derivative is closed form: `∂P/∂x = h = x^(a−1) e^(−x) / Γ(a)`,
+/// so with `g = ln h` (`g_a = ln x − ψ(a)`, `g_x = (a−1)/x − 1`) the others are polynomials in
+/// `g`'s partials times `h`. Only the pure-`a` partials need the series, which are taken from
+/// [`gamma_pq_g`] over a *one*-variable Taylor polynomial of the order asked (the two-variable
+/// one of the order-3 partials carried ten coefficients for four numbers that were needed).
+/// A point outside `a, x > 0` takes the two-variable polynomial
+/// ([`gamma_pq_partial_taylor`]). The last point's results are kept per thread, as a recorded
+/// program asks for several partials at one point in a row, and the pure-`a` polynomial is
+/// taken to the highest order the previous point needed, so a program asking order 1, 2 then 3
+/// at each point builds it once.
 pub(crate) fn gamma_pq_partial(a: f64, x: f64, upper: bool, i: u8, j: u8) -> f64 {
+    use crate::sens::taylor::Taylor;
+    use std::cell::Cell;
+    let ord = (i + j) as usize;
+    if ord == 0 {
+        return gamma_pq_g(a, x, upper);
+    }
+    if ord > 3 {
+        return f64::NAN;
+    }
+    if !(a > 0.0 && x > 0.0 && a.is_finite() && x.is_finite()) {
+        return gamma_pq_partial_taylor(a, x, upper, i, j);
+    }
+    thread_local! {
+        /// `(a, x)` bits, `h`, `ψ(a)`, `ψ′(a)` (`NaN` until asked).
+        static ANA: Cell<(u64, u64, f64, f64, f64)> = const { Cell::new((0, 0, 0.0, f64::NAN, f64::NAN)) };
+        /// `(a, x)` bits, the order built, `[∂a, ∂aa, ∂aaa]` of `P`, and the order the previous
+        /// point ended at.
+        static PURE: Cell<(u64, u64, usize, [f64; 3], usize)> = const { Cell::new((0, 0, 0, [0.0; 3], 1)) };
+    }
+    let (ka, kx) = (a.to_bits(), x.to_bits());
+    let p = if j == 0 {
+        let (la, lx, lord, mut d, hint) = PURE.get();
+        let (same, mut hint) = (la == ka && lx == kx, hint);
+        if !same || lord < i as usize {
+            // `c_k = ∂ᵏ P / k!`.
+            fn fill<const O: usize, const L: usize>(a: f64, x: f64, d: &mut [f64; 3]) {
+                let p = gamma_pq_g(Taylor::<1, O, L>::seed(a, 0), Taylor::constant(x), false);
+                const FACT: [f64; 3] = [1.0, 2.0, 6.0];
+                for (k, f) in FACT.iter().enumerate().take(L - 1) {
+                    d[k] = p.c[k + 1] * f;
+                }
+            }
+            let want = if same { 3 } else { (i as usize).max(hint) };
+            if x < a + 1.0 {
+                // The power series' own `a`-derivatives, all three at once.
+                d = p_series_a_partials(a, x);
+            } else {
+                match want {
+                    1 => fill::<1, 2>(a, x, &mut d),
+                    2 => fill::<2, 3>(a, x, &mut d),
+                    _ => fill::<3, 4>(a, x, &mut d),
+                }
+            }
+            if !same {
+                hint = lord.max(1);
+            }
+            PURE.set((ka, kx, want.min(3), d, hint));
+        }
+        d[i as usize - 1]
+    } else {
+        let (la, lx, mut h, mut psi, mut psi1) = ANA.get();
+        if la != ka || lx != kx {
+            h = (x.ln() * (a - 1.0) - x - ln_gamma(a)).exp();
+            (psi, psi1) = (f64::NAN, f64::NAN);
+        }
+        let lnx = x.ln();
+        let gx = (a - 1.0) / x - 1.0;
+        let ga = |psi: &mut f64| {
+            if psi.is_nan() {
+                *psi = digamma(a);
+            }
+            lnx - *psi
+        };
+        let v = match (i, j) {
+            (0, 1) => h,
+            (0, 2) => h * gx,
+            (0, 3) => h * (gx * gx - (a - 1.0) / (x * x)),
+            (1, 1) => h * ga(&mut psi),
+            (1, 2) => {
+                let g = ga(&mut psi);
+                h * (g * gx + 1.0 / x)
+            }
+            _ => {
+                // (2, 1): `h (g_a² + g_aa)`, `g_aa = −ψ′(a)`.
+                let g = ga(&mut psi);
+                if psi1.is_nan() {
+                    psi1 = trigamma(a);
+                }
+                h * (g * g - psi1)
+            }
+        };
+        ANA.set((ka, kx, h, psi, psi1));
+        v
+    };
+    if upper {
+        -p
+    } else {
+        p
+    }
+}
+
+/// `[∂P/∂a, ∂²P/∂a², ∂³P/∂a³]` of the power series [`gamma_p_series`] (`x < a + 1`), by the
+/// series' own recurrences instead of a Taylor polynomial through its loop: with
+/// `tₙ = xⁿ / ∏ₖ₌₀ⁿ (a+k)` the derivatives of `tₙ` are `tₙ` times polynomials in the running
+/// sums `Hₘ = Σₖ (a+k)⁻ᵐ` (`t′ = −t H₁`, `t″ = t (H₁² + H₂)`, `t‴ = −t (H₁³ + 3 H₁H₂ + 2 H₃)`),
+/// and the prefactor `u = e^(a ln x − x − ln Γ(a))` has `ln u` derivatives `ln x − ψ(a)`,
+/// `−ψ′(a)`, `−ψ″(a)`. The loop stops on the same value-part test as [`gamma_p_series`].
+fn p_series_a_partials(a: f64, x: f64) -> [f64; 3] {
+    const EPS: f64 = 1e-15;
+    const MAX_ITER: usize = 300;
+    let terms = |t: f64, h1: f64, h2: f64, h3: f64| {
+        [t, -t * h1, t * (h1 * h1 + h2), -t * (h1 * h1 * h1 + 3.0 * h1 * h2 + 2.0 * h3)]
+    };
+    let r = 1.0 / a;
+    let (mut h1, mut h2, mut h3) = (r, r * r, r * r * r);
+    let mut del = r;
+    let mut s = terms(del, h1, h2, h3);
+    let mut ap = a;
+    for _ in 0..MAX_ITER {
+        ap += 1.0;
+        del = del * x / ap;
+        let r = 1.0 / ap;
+        h1 += r;
+        h2 += r * r;
+        h3 += r * r * r;
+        let t = terms(del, h1, h2, h3);
+        for k in 0..4 {
+            s[k] += t[k];
+        }
+        if del.abs() < s[0].abs() * EPS {
+            break;
+        }
+    }
+    let u = gamma_pref(a, x);
+    let (l1, l2, l3) = (x.ln() - digamma(a), -trigamma(a), -tetragamma(a));
+    let u1 = u * l1;
+    let u2 = u * (l1 * l1 + l2);
+    let u3 = u * (l1 * l1 * l1 + 3.0 * l1 * l2 + l3);
+    [
+        u1 * s[0] + u * s[1],
+        u2 * s[0] + 2.0 * u1 * s[1] + u * s[2],
+        u3 * s[0] + 3.0 * u2 * s[1] + 3.0 * u1 * s[2] + u * s[3],
+    ]
+}
+
+/// [`gamma_pq_partial`] over [`gamma_pq_g`]'s two-variable Taylor polynomial of the order asked:
+/// the partials the dual types carry through the same iteration, rounded once more. The
+/// fallback outside `a, x > 0`, and the reference the closed forms are tested against.
+pub(crate) fn gamma_pq_partial_taylor(a: f64, x: f64, upper: bool, i: u8, j: u8) -> f64 {
     use crate::sens::taylor::Taylor;
     use std::cell::Cell;
     let ord = (i + j) as usize;
@@ -913,23 +1044,19 @@ pub(crate) fn gamma_pq_partial(a: f64, x: f64, upper: bool, i: u8, j: u8) -> f64
 /// Largest ν for which [`chi_squared_inv_cdf`] is validated (see its docs).
 pub(crate) const CHI_SQ_INV_MAX_NU: f64 = 1000.0;
 
-/// Inverse CDF (quantile) of the χ² distribution with `nu > 0` degrees of
-/// freedom: the `x ≥ 0` with `P(ν/2, x/2) = p`.
+/// Inverse CDF (quantile) of the χ² distribution with `nu > 0` degrees of freedom: the `x ≥ 0`
+/// with `P(ν/2, x/2) = p`. Maps a quasi-random uniform onto the Student-t scale-mixing variable
+/// in importance sampling (#1965), so the whole t draw comes from the Sobol point. `f64`-only;
+/// not on any gradient path.
 ///
-/// Used to map a quasi-random uniform onto the Student-t scale-mixing variable
-/// in importance sampling (#1965), so the whole t draw — not just its normal
-/// part — comes from the Sobol point. `f64`-only; not on any gradient path.
+/// Safeguarded Newton on `y = x/2`, started from Wilson–Hilferty and kept inside a bracket that
+/// bisection falls back on. The upper half (`p > ½`) solves `Q(a, y) = 1 − p` so the far upper
+/// tail keeps its precision where `1 − P` would cancel.
 ///
-/// Safeguarded Newton on `y = x/2`, started from Wilson–Hilferty and kept inside
-/// a bracket that bisection falls back on. The upper half (`p > ½`) solves
-/// `Q(a, y) = 1 − p` instead of `P = p`, so the far upper tail keeps its
-/// precision where `1 − P` would cancel.
-///
-/// **Valid for `ν ≤` [`CHI_SQ_INV_MAX_NU`].** The incomplete-gamma series and
-/// continued fraction it inverts are capped at 300 iterations and need
-/// `O(√ν)` of them, so above that the residual is a truncated CDF: measured
-/// against Wilson–Hilferty, the median is right to 7e-8 at ν = 1000, drifts at
-/// ν = 1e4, and comes back as `ν + 2` at ν ≥ 3e4. Callers keep ν inside the
+/// **Valid for `ν ≤` [`CHI_SQ_INV_MAX_NU`].** The incomplete-gamma series and continued fraction
+/// it inverts are capped at 300 iterations and need `O(√ν)` of them, so above that the
+/// residual is a truncated CDF: measured against Wilson–Hilferty, the median is right to 7e-8 at
+/// ν = 1000, drifts at ν = 1e4, and comes back as `ν + 2` at ν ≥ 3e4. Callers keep ν inside the
 /// bound (`impmap::check_sobol_config`).
 pub(crate) fn chi_squared_inv_cdf(nu: f64, p: f64) -> f64 {
     if p <= 0.0 {
@@ -956,11 +1083,7 @@ pub(crate) fn chi_squared_inv_cdf(nu: f64, p: f64) -> f64 {
     let z = normal_inv_cdf(p);
     let c = 2.0 / (9.0 * nu);
     let wh = nu * (1.0 - c + z * c.sqrt()).powi(3);
-    let mut y = if wh > 0.0 {
-        0.5 * wh
-    } else {
-        1e-3 * a.max(1e-3)
-    };
+    let mut y = if wh > 0.0 { 0.5 * wh } else { 1e-3 * a.max(1e-3) };
 
     // Bracket [lo, hi] with resid(lo) < 0 < resid(hi).
     let mut lo = 0.0_f64;
@@ -980,16 +1103,9 @@ pub(crate) fn chi_squared_inv_cdf(nu: f64, p: f64) -> f64 {
             hi = y;
         }
         let d = pdf(y);
-        let newton = if d > 0.0 && d.is_finite() {
-            y - r / d
-        } else {
-            f64::NAN
-        };
-        let next = if newton.is_finite() && newton > lo && newton < hi {
-            newton
-        } else {
-            0.5 * (lo + hi)
-        };
+        let newton = if d > 0.0 && d.is_finite() { y - r / d } else { f64::NAN };
+        let next =
+            if newton.is_finite() && newton > lo && newton < hi { newton } else { 0.5 * (lo + hi) };
         if (next - y).abs() <= 1e-14 * y.max(1e-300) {
             y = next;
             break;
@@ -1022,31 +1138,27 @@ fn gamma_p_series<T: PkNum>(a: T, x: T) -> T {
         // Convergence is judged on the value part; the dual jets of `sum` are
         // resolved at least as tightly (the per-term derivatives decay with the
         // term), and the gradient-agreement tests confirm it.
-        if del
-            .abs()
-            .br_cmp(BranchCmp::Lt, sum.abs() * T::from_f64(EPS))
-        {
+        if del.abs().br_cmp(BranchCmp::Lt, sum.abs() * T::from_f64(EPS)) {
             break;
         }
     }
     sum * gamma_pref(a, x)
 }
 
-/// Lentz's continued fraction for the upper incomplete gamma `Q(a, x)`, used when
-/// `x ≥ a + 1`; the caller returns `P = 1 − Q`. `aₙ = −n·(n − a)`,
-/// `bₙ = x + 1 − a + 2n`.
+/// Lentz's continued fraction for the upper incomplete gamma `Q(a, x)`, used when `x ≥ a + 1`;
+/// the caller returns `P = 1 − Q`. `aₙ = −n·(n − a)`, `bₙ = x + 1 − a + 2n`.
 ///
-/// `x = +∞` returns `Q = 0` exactly (and so `P = 1`), with a zero jet — the true limit and
-/// its derivatives, since the Gamma tail and its `a`-sensitivity both vanish there. Without it
-/// the prefactor `exp(−x + a·ln x − ln Γ(a))` is `exp(−∞ + ∞) = NaN`. That is the one gate
-/// behind every `Φ` in this module (#2762): [`erf_g`] / [`erfc_g`] square their argument, so
-/// any `|z| ≳ 1.9e154` reaches here as `x = +∞` and `normal_cdf(±∞)` — or of a merely huge
-/// finite `z` — was `NaN`, taking `log_normal_cdf`, an M3 censored term, and the `pnorm`
-/// expression function with it. Every finite `x` takes the iteration below, unchanged.
+/// `x = +∞` returns `Q = 0` exactly (so `P = 1`) with a zero jet, the true limit (the Gamma tail
+/// and its `a`-sensitivity both vanish). Without it the prefactor `exp(−x + a·ln x − ln Γ(a))`
+/// is `exp(−∞ + ∞) = NaN`. This is the one gate behind every `Φ` here (#2762): [`erf_g`] /
+/// [`erfc_g`] square their argument, so any `|z| ≳ 1.9e154` reaches here as `x = +∞`, and
+/// `normal_cdf(±∞)` (or of a huge finite `z`) was `NaN`, taking `log_normal_cdf`, an M3 censored
+/// term and the `pnorm` expression function with it. Every finite `x` takes the iteration below
+/// unchanged.
 ///
-/// The limit holds only for a shape in the function's domain, `0 < a < ∞`. A `NaN` shape
-/// (a transit `n` gone `NaN`) or `a = ∞` (`P(∞, ∞)` is indeterminate) falls through to the
-/// iteration and stays `NaN`, rather than reporting a confident `P = 1` (#2767 review r1 #3).
+/// The limit holds only for a shape in the domain `0 < a < ∞`: a `NaN` shape (a transit `n` gone
+/// `NaN`) or `a = ∞` (`P(∞, ∞)` is indeterminate) falls through to the iteration and stays
+/// `NaN`, not a confident `P = 1` (#2767).
 fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
     if x.br_cmp_c(BranchCmp::Eq, f64::INFINITY)
         && a.br_cmp_c(BranchCmp::Gt, 0.0)
@@ -1112,11 +1224,7 @@ mod tests {
     #[test]
     fn pentagamma_is_the_derivative_of_tetragamma_and_hits_its_known_value() {
         let want = std::f64::consts::PI.powi(4) / 15.0;
-        assert!(
-            (pentagamma(1.0) - want).abs() < 1e-9 * want,
-            "{}",
-            pentagamma(1.0)
-        );
+        assert!((pentagamma(1.0) - want).abs() < 1e-9 * want, "{}", pentagamma(1.0));
         for x in [-1.3, -0.4, 0.2, 0.7, 1.0, 2.5, 7.0, 31.0] {
             let h = 1e-4 * (1.0 + f64::abs(x));
             let fd = (tetragamma(x + h) - tetragamma(x - h)) / (2.0 * h);
@@ -1249,11 +1357,7 @@ mod tests {
         // tail keeps Φ ≈ 2.8e-89, so log Φ ≈ -203.92.
         let v = log_normal_cdf(-20.0);
         assert!(v.is_finite(), "log_normal_cdf(-20) must be finite");
-        assert!(
-            (v - (-203.917)).abs() < 0.01,
-            "expected ≈ -203.917, got {}",
-            v
-        );
+        assert!((v - (-203.917)).abs() < 0.01, "expected ≈ -203.917, got {}", v);
     }
 
     #[test]
@@ -1261,13 +1365,7 @@ mod tests {
         let mut prev = log_normal_cdf(-30.0);
         for z in [-25.0, -20.0, -10.0, -5.5, -5.01, -4.99, -2.0, 0.0, 2.0].iter() {
             let v = log_normal_cdf(*z);
-            assert!(
-                v >= prev - 1e-6,
-                "non-monotone at z={}: {} < {}",
-                z,
-                v,
-                prev
-            );
+            assert!(v >= prev - 1e-6, "non-monotone at z={}: {} < {}", z, v, prev);
             prev = v;
         }
     }
@@ -1291,11 +1389,7 @@ mod tests {
     #[test]
     fn ln_gamma_half_integers_closed_form() {
         // ln Γ(1/2) = ln √π (main branch, x = 0.5 exactly).
-        assert_relative_eq!(
-            ln_gamma(0.5),
-            0.5 * std::f64::consts::PI.ln(),
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(ln_gamma(0.5), 0.5 * std::f64::consts::PI.ln(), epsilon = 1e-12);
         // ln Γ(3/2) = ln(√π / 2).
         assert_relative_eq!(
             ln_gamma(1.5),
@@ -1480,10 +1574,7 @@ mod tests {
             let eps = 1e-6;
             let below = regularized_gamma_p::<f64>(a, seam - eps); // series
             let above = regularized_gamma_p::<f64>(a, seam + eps); // continued fraction
-            assert!(
-                (below - above).abs() < 1e-5,
-                "branch jump at a={a}: {below} vs {above}"
-            );
+            assert!((below - above).abs() < 1e-5, "branch jump at a={a}: {below} vs {above}");
         }
     }
 
@@ -1556,13 +1647,7 @@ mod tests {
         use crate::sens::dual2::Dual2;
         let p = |av: f64, xv: f64| regularized_gamma_p::<f64>(av, xv);
         // Integer `a` (the aₙ=0 trap) and a non-integer, each just inside the CF branch.
-        for &(av, xv) in &[
-            (1.0, 2.001),
-            (2.0, 3.001),
-            (4.0, 5.02),
-            (1.0, 2.5),
-            (3.0, 4.1),
-        ] {
+        for &(av, xv) in &[(1.0, 2.001), (2.0, 3.001), (4.0, 5.02), (1.0, 2.5), (3.0, 4.1)] {
             assert!(xv >= av + 1.0, "case ({av},{xv}) must be in the CF branch");
             let dual = regularized_gamma_p(Dual2::<2>::var(av, 0), Dual2::<2>::var(xv, 1));
             let h = 1e-6;
@@ -1619,12 +1704,7 @@ mod tests {
             (2.0, 0.977_249_868_051_820_8),
             (-3.0, 0.001_349_898_031_630_1),
         ] {
-            assert_relative_eq!(
-                normal_cdf_g::<f64>(z),
-                want,
-                epsilon = 1e-9,
-                max_relative = 1e-8
-            );
+            assert_relative_eq!(normal_cdf_g::<f64>(z), want, epsilon = 1e-9, max_relative = 1e-8);
         }
     }
 
@@ -1639,9 +1719,9 @@ mod tests {
         use crate::sens::dual2::Dual2;
         // Includes points either side of the germ seam (±1e-3) and both
         // `regularized_gamma_p` branches.
-        for &x in &[
-            0.0_f64, 1e-7, -1e-7, 5e-4, -5e-4, 1.5e-3, -1.5e-3, 0.3, -0.7, 1.0, -1.5, 2.5, -3.0,
-        ] {
+        for &x in
+            &[0.0_f64, 1e-7, -1e-7, 5e-4, -5e-4, 1.5e-3, -1.5e-3, 0.3, -0.7, 1.0, -1.5, 2.5, -3.0]
+        {
             let d = erf_g(Dual2::<1>::var(x, 0));
             let gauss = TWO_OVER_SQRT_PI * (-x * x).exp(); // erf'(x)
             let gauss2 = -2.0 * x * gauss; // erf''(x)
@@ -1702,11 +1782,7 @@ mod tests {
             assert_relative_eq!(erfc_g::<f64>(x), want, max_relative = 1e-9);
         }
         // erfc(−x) = 2 − erfc(x) (odd erf), the well-conditioned near-2 side.
-        assert_relative_eq!(
-            erfc_g::<f64>(-2.0),
-            2.0 - erfc_g::<f64>(2.0),
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(erfc_g::<f64>(-2.0), 2.0 - erfc_g::<f64>(2.0), max_relative = 1e-12);
     }
 
     /// `log_normal_cdf_g` is accurate on moderate `z` (vs `ln` of tabulated `Φ`),
@@ -1779,66 +1855,16 @@ mod tests {
     /// and running past where the old `MIN_PROB` floor (`z ≈ −37.5`) and the old `NaN`
     /// Hessian (`z ≈ −26.5`) began (#2769).
     const LN_PHI_REF: [(f64, f64, f64, f64); 10] = [
-        (
-            -9.5,
-            -48.30601929896523,
-            9.6030500903842821,
-            -0.98959517977888859,
-        ),
-        (
-            -10.0,
-            -53.231285150512471,
-            10.098093233962512,
-            -0.99055462217434374,
-        ),
-        (
-            -10.5,
-            -58.404187061073243,
-            10.593583926132378,
-            -0.9913891756203221,
-        ),
-        (
-            -26.0,
-            -342.17850892992783,
-            26.038348579495471,
-            -0.99853368043156099,
-        ),
-        (
-            -27.0,
-            -368.71614246865635,
-            27.036936116444191,
-            -0.9986394206911267,
-        ),
-        (
-            -28.0,
-            -396.25241451163104,
-            28.035623753469084,
-            -0.99873414894556458,
-        ),
-        (
-            -37.5,
-            -707.66898931750719,
-            37.526628874883654,
-            -0.99929190511457925,
-        ),
-        (
-            -40.0,
-            -804.60844201375379,
-            40.024968847207264,
-            -0.99937733162140861,
-        ),
-        (
-            -100.0,
-            -5005.5242086942051,
-            100.00999800099926,
-            -0.99990005995005174,
-        ),
-        (
-            -1000.0,
-            -500007.82669481218,
-            1000.000999998,
-            -0.99999900000599995,
-        ),
+        (-9.5, -48.30601929896523, 9.6030500903842821, -0.98959517977888859),
+        (-10.0, -53.231285150512471, 10.098093233962512, -0.99055462217434374),
+        (-10.5, -58.404187061073243, 10.593583926132378, -0.9913891756203221),
+        (-26.0, -342.17850892992783, 26.038348579495471, -0.99853368043156099),
+        (-27.0, -368.71614246865635, 27.036936116444191, -0.9986394206911267),
+        (-28.0, -396.25241451163104, 28.035623753469084, -0.99873414894556458),
+        (-37.5, -707.66898931750719, 37.526628874883654, -0.99929190511457925),
+        (-40.0, -804.60844201375379, 40.024968847207264, -0.99937733162140861),
+        (-100.0, -5005.5242086942051, 100.00999800099926, -0.99990005995005174),
+        (-1000.0, -500007.82669481218, 1000.000999998, -0.99999900000599995),
     ];
 
     /// `log_normal_cdf_g`'s value, exact `Dual2` gradient and Hessian against the
@@ -1856,11 +1882,7 @@ mod tests {
                 dv.is_finite() && dg.is_finite() && dh.is_finite(),
                 "ln Φ jet not finite at z = {z}: ({dv}, {dg}, {dh})"
             );
-            assert_eq!(
-                log_normal_cdf_g::<f64>(z),
-                dv,
-                "f64 vs Dual2 value at z = {z}"
-            );
+            assert_eq!(log_normal_cdf_g::<f64>(z), dv, "f64 vs Dual2 value at z = {z}");
             // Measured worst over the ten points (macOS arm64): value 2.7e-16, gradient
             // 1.9e-16, Hessian 2.8e-14 — the last on the `ln Φ` branch at z = −9.5; the
             // Mills branch is exact to the printed digit in all three from −10.5 on. The
@@ -1917,10 +1939,7 @@ mod tests {
             assert_relative_eq!(d.grad[0], -z, max_relative = 1e-15);
             assert_relative_eq!(d.hess[0][0], -1.0, max_relative = 1e-15);
         }
-        assert_eq!(
-            log_normal_cdf_g::<f64>(f64::NEG_INFINITY),
-            f64::NEG_INFINITY
-        );
+        assert_eq!(log_normal_cdf_g::<f64>(f64::NEG_INFINITY), f64::NEG_INFINITY);
     }
 
     /// Dual-vs-FD parity for `log_normal_cdf_g` across the Mills switch and through the
@@ -1938,18 +1957,67 @@ mod tests {
             let gp = log_normal_cdf_g(Dual2::<1>::var(z + h2, 0)).grad[0];
             let gm = log_normal_cdf_g(Dual2::<1>::var(z - h2, 0)).grad[0];
             let fd2 = (gp - gm) / (2.0 * h2);
-            for (name, x) in [
-                ("grad", d.grad[0]),
-                ("hess", d.hess[0][0]),
-                ("fd", fd),
-                ("fd2", fd2),
-            ] {
+            for (name, x) in [("grad", d.grad[0]), ("hess", d.hess[0][0]), ("fd", fd), ("fd2", fd2)]
+            {
                 assert!(x.is_finite(), "{name} not finite at z = {z}: {x}");
             }
             // Measured worst (macOS arm64): gradient 8.4e-11 (z = −26), Hessian 5.9e-11
             // (z = −40) — FD truncation and rounding; 1e-9 leaves ~12× headroom.
             assert_relative_eq!(d.grad[0], fd, max_relative = 1e-9);
             assert_relative_eq!(d.hess[0][0], fd2, max_relative = 1e-9);
+        }
+    }
+
+    /// The `z` grid of the stage-form parity: every arm of `normal_cdf_stage` (the erf germ
+    /// `|z| < √2·1e-3`, the `P` region both signs, the `Q` tail `x > 1` i.e. `z < −√2`, and
+    /// `x < −1`, i.e. `z > √2`, where `Φ = ½(1 + erf)`), the points a relative 1e-9 each side of
+    /// the three seams (not the seams themselves: the two forms compare `x` and `x²` against
+    /// the same threshold, which can round to opposite arms at the exact value), and the Mills switch of `log_normal_cdf_stage` (`z = −10`) with the
+    /// Mills arm well below it.
+    fn stage_parity_grid() -> Vec<f64> {
+        let germ_edge = std::f64::consts::SQRT_2 * ERF_GERM_HALF_WIDTH;
+        let mut zs = vec![
+            0.0, 1e-4, -1e-4, 0.5, -0.5, 1.0, -1.0, 2.5, -2.5, 6.0, -6.0, -9.9, -10.0, -10.1,
+            -15.0, -30.0, -100.0,
+        ];
+        for edge in [germ_edge, std::f64::consts::SQRT_2, LOG_NORMAL_CDF_MILLS_SWITCH] {
+            for e in [edge, -edge] {
+                zs.extend([e * (1.0 + 1e-9), e * (1.0 - 1e-9)]);
+            }
+        }
+        zs
+    }
+
+    /// [`normal_cdf_stage`] / [`log_normal_cdf_stage`] are the branching [`normal_cdf_g`] /
+    /// [`log_normal_cdf_g`] with the branches turned into selections: the same value, gradient
+    /// and Hessian on every arm and across every seam (#3004). Regression caught: an arm of
+    /// the selection form that drifts from its branching twin (a sign, a threshold, the safe
+    /// argument of the arm not taken). Measured over the grid, at `f64` and in `Dual2<1>`
+    /// jets: the two forms are bit-identical (worst relative difference 0, Linux), so the 1e-13
+    /// bound is headroom for another libm, not the observed error.
+    #[test]
+    fn the_stage_cdfs_match_the_branching_forms_on_every_arm() {
+        use crate::sens::dual2::Dual2;
+        let note = |what: &str, z: f64, a: f64, b: f64| {
+            assert!(a.is_finite() && b.is_finite(), "{what} at z = {z}: {a} vs {b}");
+            assert!(
+                (a - b).abs() <= 1e-13 * (1e-300 + a.abs().max(b.abs())),
+                "{what} at z = {z}: stage {a:e} vs branching {b:e}"
+            );
+        };
+        for z in stage_parity_grid() {
+            note("Phi value", z, normal_cdf_stage(z), normal_cdf_g(z));
+            note("ln Phi value", z, log_normal_cdf_stage(z), log_normal_cdf_g(z));
+            let (s, g) =
+                (normal_cdf_stage(Dual2::<1>::var(z, 0)), normal_cdf_g(Dual2::<1>::var(z, 0)));
+            note("Phi grad", z, s.grad[0], g.grad[0]);
+            note("Phi hess", z, s.hess[0][0], g.hess[0][0]);
+            let (s, g) = (
+                log_normal_cdf_stage(Dual2::<1>::var(z, 0)),
+                log_normal_cdf_g(Dual2::<1>::var(z, 0)),
+            );
+            note("ln Phi grad", z, s.grad[0], g.grad[0]);
+            note("ln Phi hess", z, s.hess[0][0], g.hess[0][0]);
         }
     }
 
@@ -2020,17 +2088,7 @@ mod tests {
     fn chi_squared_inv_cdf_matches_closed_form_and_tables() {
         // ν = 2 is exponential with mean 2: F⁻¹(p) = −2·ln(1 − p) exactly, which
         // pins both far tails (the upper one runs through the Q-orientation).
-        for &p in &[
-            1e-12,
-            1e-6,
-            0.01,
-            0.3,
-            0.5,
-            0.7,
-            0.99,
-            1.0 - 1e-6,
-            1.0 - 1e-12,
-        ] {
+        for &p in &[1e-12, 1e-6, 0.01, 0.3, 0.5, 0.7, 0.99, 1.0 - 1e-6, 1.0 - 1e-12] {
             let want = -2.0 * (-p as f64).ln_1p();
             let got = chi_squared_inv_cdf(2.0, p);
             assert_relative_eq!(got, want, max_relative = 1e-9);
@@ -2080,10 +2138,7 @@ mod tests {
                 let got = chi_squared_inv_cdf(nu, p);
                 assert!(got.is_finite() && got > 0.0, "nu={nu} p={p}: {got}");
                 let rel = (got - want).abs() / want;
-                assert!(
-                    rel < 1e-6,
-                    "nu={nu} p={p}: got {got}, want {want} (rel {rel:e})"
-                );
+                assert!(rel < 1e-6, "nu={nu} p={p}: got {got}, want {want} (rel {rel:e})");
             }
         }
         for &tail in &[1e-15_f64, 1e-12, 1e-6] {
@@ -2213,15 +2268,9 @@ mod tests {
             assert!(lo <= log_normal_cdf(-40.0), "ln Φ(−{z:e}) = {lo}");
             assert_eq!(log_normal_cdf(-f64::INFINITY), f64::NEG_INFINITY);
             let lo_g = log_normal_cdf_g::<f64>(-z);
-            assert!(
-                lo_g <= log_normal_cdf_g::<f64>(-40.0),
-                "ln Φ_g(−{z:e}) = {lo_g}"
-            );
+            assert!(lo_g <= log_normal_cdf_g::<f64>(-40.0), "ln Φ_g(−{z:e}) = {lo_g}");
             if z == ungated {
-                assert!(
-                    lo_g.is_finite() && lo_g < -4.9e299,
-                    "ln Φ_g(−{z:e}) = {lo_g}"
-                );
+                assert!(lo_g.is_finite() && lo_g < -4.9e299, "ln Φ_g(−{z:e}) = {lo_g}");
             } else {
                 assert_eq!(lo_g, f64::NEG_INFINITY, "ln Φ_g(−{z:e})");
             }
@@ -2301,11 +2350,7 @@ mod tests {
             if z.is_finite() && z > 0.0 {
                 let step = 1e-6 * z.abs();
                 let fd = |f: &dyn Fn(f64) -> f64| (f(z + step) - f(z - step)) / (2.0 * step);
-                assert_eq!(
-                    fd(&log_normal_cdf_g::<f64>),
-                    l.grad[0],
-                    "ln Φ_g FD at {z:e}"
-                );
+                assert_eq!(fd(&log_normal_cdf_g::<f64>), l.grad[0], "ln Φ_g FD at {z:e}");
             }
         }
         for a in [0.5, 3.7] {
@@ -2334,20 +2379,11 @@ mod tests {
         let (f, v, d, d2) = (1.0, 0.01, 0.02, 0.02);
         for (near, sq_over, inf, cens) in [(1e6, 1e300, 1e308, 1), (-1e6, -1e300, -1e308, -1)] {
             let (h, z, _) = m3_censored_kernel(near, f, v, d, cens);
-            assert!(
-                h == 0.0 && (z * z).is_finite(),
-                "control {near:e}: h={h}, z={z}"
-            );
+            assert!(h == 0.0 && (z * z).is_finite(), "control {near:e}: h={h}, z={z}");
             let (h, z, _) = m3_censored_kernel(sq_over, f, v, d, cens);
-            assert!(
-                h == 0.0 && z.is_finite() && z * z == f64::INFINITY,
-                "{sq_over:e}"
-            );
+            assert!(h == 0.0 && z.is_finite() && z * z == f64::INFINITY, "{sq_over:e}");
             let (h, z, m) = m3_censored_kernel(inf, f, v, d, cens);
-            assert!(
-                h == 0.0 && z == f64::INFINITY && m.is_infinite(),
-                "{inf:e}: m={m}"
-            );
+            assert!(h == 0.0 && z == f64::INFINITY && m.is_infinite(), "{inf:e}: m={m}");
             for y in [near, sq_over, inf] {
                 let (g1, g2, cz, cm) = m3_censored_outer(y, f, v, d, d2, cens);
                 for (name, c) in [("g1", g1), ("g2", g2), ("cz", cz), ("cm", cm)] {
@@ -2355,5 +2391,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The closed-form partials of `P` / `Q` against the two-variable Taylor polynomial they
+    /// replaced, on both sides of the series / continued-fraction switch `x = a + 1`, in every
+    /// call order a program uses (ascending per point, a new point mid-order, order 3 first).
+    /// Mutation: a wrong `g_a` / `g_x` combination in any one arm (e.g. `(1, 2)` without the
+    /// `1/x`) moves that partial by O(1).
+    #[test]
+    fn gamma_pq_partials_match_the_taylor_polynomial() {
+        const ALL: [(u8, u8); 9] =
+            [(1, 0), (0, 1), (2, 0), (1, 1), (0, 2), (3, 0), (2, 1), (1, 2), (0, 3)];
+        let mut worst = 0.0f64;
+        for &a in &[0.3, 1.0, 2.5, 7.0, 25.0] {
+            for &x in &[0.05, 0.9, 2.4, 3.5, 8.0, 30.0] {
+                for upper in [false, true] {
+                    for order in [false, true] {
+                        let mut ks = ALL.to_vec();
+                        if order {
+                            ks.reverse();
+                        }
+                        for (i, j) in ks {
+                            let got = gamma_pq_partial(a, x, upper, i, j);
+                            let want = gamma_pq_partial_taylor(a, x, upper, i, j);
+                            assert!(got.is_finite() && want.is_finite(), "a={a} x={x} ({i},{j})");
+                            let e = (got - want).abs() / (1e-12 + want.abs());
+                            worst = worst.max(e); // nan-ok: both asserted finite above
+                            assert!(
+                                e < 1e-7 || (got - want).abs() < 1e-13,
+                                "a={a} x={x} upper={upper} ({i},{j}): {got:e} vs {want:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("gamma_pq_partial closed form vs Taylor: worst relative gap {worst:.2e}");
+        // Outside a, x > 0 the Taylor polynomial answers (zero derivatives where x <= 0).
+        assert_eq!(gamma_pq_partial(2.0, -1.0, false, 1, 1), 0.0);
+        assert_eq!(gamma_pq_partial(2.0, 1.0, false, 4, 0).is_nan(), true);
     }
 }

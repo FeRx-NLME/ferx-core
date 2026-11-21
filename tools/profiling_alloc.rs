@@ -67,11 +67,7 @@ fn record(bytes: usize, realloc: bool) {
             for line in trace.lines() {
                 if line.contains("ferx_core::") && frames < 10 {
                     let trimmed = line.trim();
-                    selected.push(
-                        trimmed
-                            .split_once(": ")
-                            .map_or(trimmed, |(_, symbol)| symbol),
-                    );
+                    selected.push(trimmed.split_once(": ").map_or(trimmed, |(_, symbol)| symbol));
                     include_location = true;
                     frames += 1;
                 } else if include_location && line.trim().starts_with("at ") {

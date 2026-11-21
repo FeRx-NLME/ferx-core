@@ -14,10 +14,7 @@ use super::run::apply_threads_override;
 use crate::types::{classify_warning, FitOptions, WarningCode, WarningSeverity};
 
 fn with_file_threads(threads: Option<usize>) -> FitOptions {
-    FitOptions {
-        threads,
-        ..Default::default()
-    }
+    FitOptions { threads, ..Default::default() }
 }
 
 #[test]

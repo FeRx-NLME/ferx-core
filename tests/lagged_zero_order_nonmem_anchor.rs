@@ -79,20 +79,10 @@ fn nonmem_column(column: &str) -> HashMap<(String, u64), f64> {
         .expect("the NONMEM table is committed");
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. banner");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> = lines.next().expect("column header").split_whitespace().collect();
     let id_col = header.iter().position(|c| *c == "ID").expect("ID column");
-    let time_col = header
-        .iter()
-        .position(|c| *c == "TIME")
-        .expect("TIME column");
-    let col = header
-        .iter()
-        .position(|c| c == &column)
-        .unwrap_or_else(|| panic!("{column} column"));
+    let time_col = header.iter().position(|c| *c == "TIME").expect("TIME column");
+    let col = header.iter().position(|c| c == &column).unwrap_or_else(|| panic!("{column} column"));
 
     let mut out = HashMap::new();
     for line in lines {
@@ -120,10 +110,7 @@ const TABLE_TOL: f64 = 1e-4;
 /// all-zero ferx series, is exactly the failure mode under test and must not be
 /// allowed to pass as agreement.
 fn assert_matches_table(
-    got: &[(String, f64, f64)],
-    table: &HashMap<(String, u64), f64>,
-    tol: f64,
-    what: &str,
+    got: &[(String, f64, f64)], table: &HashMap<(String, u64), f64>, tol: f64, what: &str,
 ) {
     assert_eq!(
         got.len(),
@@ -154,17 +141,13 @@ fn assert_matches_table(
             "{what}: ID {id} t={time} — ferx {value} vs NONMEM {want} (rel {rel:.3e} > {tol:.1e})"
         );
     }
-    assert!(
-        worst > 0.0,
-        "{what}: bit-identical to NONMEM is implausible"
-    );
+    assert!(worst > 0.0, "{what}: bit-identical to NONMEM is implausible");
 }
 
 /// Evaluate `f` at **η = 0** for every subject, returning `(id, time, value)` rows
 /// aligned with the dataset's observation records.
 fn ferx_rows_at_zero_eta(
-    model: &CompiledModel,
-    pop: &Population,
+    model: &CompiledModel, pop: &Population,
     f: impl Fn(&CompiledModel, &ferx_core::Subject, &[f64], &[f64]) -> Vec<f64>,
 ) -> Vec<(String, f64, f64)> {
     let theta = &model.default_params.theta;
@@ -224,11 +207,7 @@ fn states_path_compartment_amounts_match_the_nonmem_pred_column() {
     // V is fixed (θ₂) and η_V = 0 here, so the scale is the typical value.
     let v = model.default_params.theta[1];
     let rows = ferx_rows_at_zero_eta(&model, &pop, |m, s, th, e| {
-        compute_predictions_with_states(m, s, th, e)
-            .1
-            .iter()
-            .map(|u| u[0] / v)
-            .collect()
+        compute_predictions_with_states(m, s, th, e).1.iter().map(|u| u[0] / v).collect()
     });
     assert_matches_table(
         &rows,
@@ -248,10 +227,7 @@ fn states_path_compartment_amounts_match_the_nonmem_pred_column() {
 fn dense_solve_states_matches_the_nonmem_pred_column() {
     let (model, _) = anchor_model();
     let pop = anchor_population();
-    let ode = model
-        .ode_spec
-        .as_ref()
-        .expect("the anchor model is an [odes] model");
+    let ode = model.ode_spec.as_ref().expect("the anchor model is an [odes] model");
     let v = model.default_params.theta[1];
     let rows = ferx_rows_at_zero_eta(&model, &pop, |m, s, th, e| {
         let pk = ferx_core::pk::compute_event_pk_params(m, s, th, e).obs[0];

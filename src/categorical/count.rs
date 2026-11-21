@@ -40,11 +40,7 @@ use std::collections::HashMap;
 ///
 /// `size` is read only for [`CountFamily::NegBin`].
 pub(crate) fn count_record_nll_g<T: PkNum>(
-    family: CountFamily,
-    scale: CountMeanScale,
-    mean: T,
-    size: T,
-    k: u32,
+    family: CountFamily, scale: CountMeanScale, mean: T, size: T, k: u32,
 ) -> Option<T> {
     let inf = f64::INFINITY;
     if !mean.br_abs_lt(inf) {
@@ -83,9 +79,7 @@ pub(crate) fn count_record_nll_g<T: PkNum>(
 /// law is undefined there (the same points [`count_record_nll_g`] declines). `size` is `None`
 /// for a Poisson endpoint.
 fn natural_params(
-    family: CountFamily,
-    scale: CountMeanScale,
-    raw: [f64; 2],
+    family: CountFamily, scale: CountMeanScale, raw: [f64; 2],
 ) -> Option<(f64, Option<f64>)> {
     let lambda = match scale {
         CountMeanScale::Linear => raw[0],
@@ -111,12 +105,9 @@ fn count_endpoints(
     model: &CompiledModel,
 ) -> impl Iterator<Item = (usize, CountFamily, CountMeanScale, &CountParamFn)> {
     model.endpoints.iter().filter_map(|(cmt, ep)| match ep {
-        EndpointLikelihood::Count {
-            family,
-            scale,
-            param_fn,
-            ..
-        } => Some((*cmt, *family, *scale, param_fn)),
+        EndpointLikelihood::Count { family, scale, param_fn, .. } => {
+            Some((*cmt, *family, *scale, param_fn))
+        }
         _ => None,
     })
 }
@@ -139,24 +130,13 @@ struct CountRecordEval<'a> {
 /// likelihood, the sampler, the predictor and the diagnostics all walk records through here,
 /// so they cannot disagree about which rows belong to the endpoint or what `λ` a row carries.
 fn for_each_count_param<F>(
-    param_fn: &CountParamFn,
-    cmt: usize,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    mut f: F,
+    param_fn: &CountParamFn, cmt: usize, subject: &Subject, theta: &[f64], eta: &[f64], mut f: F,
 ) where
     F: FnMut(CountRecordEval<'_>),
 {
     let snaps = subject.record_covariate_snapshots();
     for (idx, r) in subject.obs_records.iter().enumerate() {
-        let ObsRecord::Count {
-            time,
-            raw_time,
-            count,
-            cmt: c,
-        } = r
-        else {
+        let ObsRecord::Count { time, raw_time, count, cmt: c } = r else {
             continue;
         };
         if *c != cmt {
@@ -178,13 +158,8 @@ fn for_each_count_param<F>(
 /// is undefined (see [`count_record_nll_g`]) adds the `1e20` sentinel, as an overflowed binary
 /// predictor does, so the optimizer is repelled rather than handed a `NaN`.
 fn count_data_term(
-    family: CountFamily,
-    scale: CountMeanScale,
-    param_fn: &CountParamFn,
-    cmt: usize,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    family: CountFamily, scale: CountMeanScale, param_fn: &CountParamFn, cmt: usize,
+    subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> f64 {
     let mut nll = 0.0;
     for_each_count_param(param_fn, cmt, subject, theta, eta, |r| {
@@ -198,10 +173,7 @@ fn count_data_term(
 /// The count half of [`super::discrete_subject_nll`]: every count endpoint's data term,
 /// summed in ascending CMT order. `0.0` without a count endpoint.
 pub(crate) fn count_subject_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> f64 {
     let mut nll = 0.0;
     for (cmt, family, scale, param_fn) in count_endpoints(model) {
@@ -215,32 +187,17 @@ pub(crate) fn count_subject_nll(
 /// the same record kernel. `None` — the caller falls back to FD for the point — when an
 /// endpoint has no program or a record's law is undefined.
 pub(crate) fn count_term_eval<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    th: &[T],
-    et: &[T],
+    model: &CompiledModel, subject: &Subject, th: &[T], et: &[T],
 ) -> Option<T> {
     let mut nll = T::from_f64(0.0);
     let snaps = subject.record_covariate_snapshots();
     for (cmt, ep) in &model.endpoints {
-        let EndpointLikelihood::Count {
-            family,
-            scale,
-            param_program,
-            ..
-        } = ep
-        else {
+        let EndpointLikelihood::Count { family, scale, param_program, .. } = ep else {
             continue;
         };
         let prog = param_program.as_ref()?;
         for (idx, r) in subject.obs_records.iter().enumerate() {
-            let ObsRecord::Count {
-                time,
-                count,
-                cmt: c,
-                ..
-            } = r
-            else {
+            let ObsRecord::Count { time, count, cmt: c, .. } = r else {
                 continue;
             };
             if c != cmt {
@@ -296,15 +253,8 @@ fn draw_count<R: rand::Rng>(lambda: f64, size: Option<f64>, rng: &mut R) -> Opti
 /// and endpoint, never emitted as an arbitrary value.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_count<R: rand::Rng>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    draw: usize,
-    sim: usize,
-    rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>,
-    warnings: &mut Vec<String>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize,
+    rng: &mut R, results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
 ) {
     if subject.obs_records.is_empty() {
         return;
@@ -348,10 +298,7 @@ pub fn simulate_count<R: rand::Rng>(
 /// zeros for a population prediction). A record whose law is undefined predicts
 /// `lambda = NaN`, which is what it is.
 pub fn predict_count(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     results: &mut Vec<EndpointPredictionResult>,
 ) {
     if subject.obs_records.is_empty() {
@@ -359,10 +306,8 @@ pub fn predict_count(
     }
     for (cmt, family, scale, param_fn) in count_endpoints(model) {
         for_each_count_param(param_fn, cmt, subject, theta, eta, |r| {
-            let (lambda, size) = natural_params(family, scale, r.raw).unwrap_or((
-                f64::NAN,
-                (family == CountFamily::NegBin).then_some(f64::NAN),
-            ));
+            let (lambda, size) = natural_params(family, scale, r.raw)
+                .unwrap_or((f64::NAN, (family == CountFamily::NegBin).then_some(f64::NAN)));
             results.push(EndpointPredictionResult {
                 id: subject.id.clone(),
                 cmt,
@@ -391,10 +336,7 @@ pub fn count_pearson_residual(k: f64, lambda: f64, size: Option<f64>) -> f64 {
 /// `η = 0`, `IPRED` the mean at the subject's EBE, `IWRES` the Pearson residual at the EBE
 /// ([`count_pearson_residual`]). Empty without count records.
 pub fn count_diagnostics(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<DiscreteObsDiagnostic> {
     let mut rows = Vec::new();
     if subject.obs_records.is_empty() {
@@ -408,9 +350,8 @@ pub fn count_diagnostics(
                 natural_params(family, scale, param_fn(theta, &zero_eta, r.covariates))
             });
             let k = f64::from(r.count);
-            let (ipred, iwres) = ind.map_or((f64::NAN, f64::NAN), |(l, s)| {
-                (l, count_pearson_residual(k, l, s))
-            });
+            let (ipred, iwres) =
+                ind.map_or((f64::NAN, f64::NAN), |(l, s)| (l, count_pearson_residual(k, l, s)));
             rows.push(DiscreteObsDiagnostic {
                 cmt,
                 time: r.raw_time,

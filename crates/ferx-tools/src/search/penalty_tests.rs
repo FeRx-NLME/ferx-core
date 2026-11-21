@@ -42,10 +42,7 @@ const PARAMETER_CHARGE: f64 = 3.0 * 10.0 + 2.0 * 10.0 + 1.0 * 10.0;
 fn a_clean_fit_is_charged_for_its_parameters_only() {
     let p = Penalties::default();
     let fit = clean();
-    assert_eq!(
-        p.terms(&fit),
-        vec![("theta", 30.0), ("omega", 20.0), ("sigma", 10.0)]
-    );
+    assert_eq!(p.terms(&fit), vec![("theta", 30.0), ("omega", 20.0), ("sigma", 10.0)]);
     assert_eq!(p.score(&fit), 500.0 + PARAMETER_CHARGE);
     // The criterion is the score, and the search reads the schedule back
     // off it.
@@ -66,11 +63,9 @@ fn every_failure_term_is_charged_on_its_own_input() {
     assert_eq!(p.score(&fit), base + 100.0, "convergence");
     assert!(p.terms(&fit).contains(&("convergence", 100.0)));
 
-    for status in [
-        CovarianceStatus::Failed,
-        CovarianceStatus::NotRequested,
-        CovarianceStatus::SirFallback,
-    ] {
+    for status in
+        [CovarianceStatus::Failed, CovarianceStatus::NotRequested, CovarianceStatus::SirFallback]
+    {
         let mut fit = clean();
         fit.covariance_status = status.clone();
         fit.covariance_matrix = None;
@@ -148,44 +143,19 @@ fn a_kappa_is_an_omega_element_and_an_old_tally_charges_at_the_theta_rate() {
     let mut fit = clean();
     fit.bic_inputs = BicInputs::default();
     fit.n_parameters = 4;
-    assert_eq!(
-        p.terms(&fit),
-        vec![("theta", 40.0)],
-        "an unreadable tally is charged as θ"
-    );
+    assert_eq!(p.terms(&fit), vec![("theta", 40.0)], "an unreadable tally is charged as θ");
 }
 
 #[test]
 fn a_schedule_is_validated() {
     assert!(Penalties::default().validate().is_ok());
     for (field, bad) in [
-        (
-            "theta",
-            Penalties {
-                theta: -1.0,
-                ..Penalties::default()
-            },
-        ),
-        (
-            "crash",
-            Penalties {
-                crash: f64::INFINITY,
-                ..Penalties::default()
-            },
-        ),
-        (
-            "max_correlation",
-            Penalties {
-                max_correlation: 0.0,
-                ..Penalties::default()
-            },
-        ),
+        ("theta", Penalties { theta: -1.0, ..Penalties::default() }),
+        ("crash", Penalties { crash: f64::INFINITY, ..Penalties::default() }),
+        ("max_correlation", Penalties { max_correlation: 0.0, ..Penalties::default() }),
         (
             "max_condition_number",
-            Penalties {
-                max_condition_number: f64::NAN,
-                ..Penalties::default()
-            },
+            Penalties { max_condition_number: f64::NAN, ..Penalties::default() },
         ),
     ] {
         let e = bad.validate().unwrap_err();
@@ -196,14 +166,7 @@ fn a_schedule_is_validated() {
 #[test]
 fn a_partial_table_overlays_the_defaults() {
     let p: Penalties = toml::from_str("theta = 1\nconvergence = 250").unwrap();
-    assert_eq!(
-        p,
-        Penalties {
-            theta: 1.0,
-            convergence: 250.0,
-            ..Penalties::default()
-        }
-    );
+    assert_eq!(p, Penalties { theta: 1.0, convergence: 250.0, ..Penalties::default() });
     let e = toml::from_str::<Penalties>("sigma = 1\nsigmas = 2").unwrap_err();
     assert!(e.to_string().contains("unknown field `sigmas`"), "{e}");
 }
@@ -213,26 +176,12 @@ fn the_manifest_key_carries_the_whole_schedule() {
     // Two penalized runs with different charges must not share a journal:
     // the label alone would let one reuse the other's rows.
     let a = Criterion::Penalized(Penalties::default());
-    let b = Criterion::Penalized(Penalties {
-        theta: 11.0,
-        ..Penalties::default()
-    });
+    let b = Criterion::Penalized(Penalties { theta: 11.0, ..Penalties::default() });
     assert_ne!(a.manifest_key(), b.manifest_key());
-    assert!(
-        a.manifest_key().starts_with("penalized{theta=10,"),
-        "{}",
-        a.manifest_key()
-    );
-    assert!(
-        a.manifest_key().ends_with("crash=99999999,gate=100}"),
-        "{}",
-        a.manifest_key()
-    );
+    assert!(a.manifest_key().starts_with("penalized{theta=10,"), "{}", a.manifest_key());
+    assert!(a.manifest_key().ends_with("crash=99999999,gate=100}"), "{}", a.manifest_key());
     // Every other criterion keys on its label, as before — an existing
     // journal still resumes.
     assert_eq!(Criterion::Ofv.manifest_key(), "ofv");
-    assert_eq!(
-        Criterion::Bic(ferx_core::BicType::Mixed).manifest_key(),
-        "bic_mixed"
-    );
+    assert_eq!(Criterion::Bic(ferx_core::BicType::Mixed).manifest_key(), "bic_mixed");
 }

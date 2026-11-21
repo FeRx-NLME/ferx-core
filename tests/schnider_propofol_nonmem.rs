@@ -105,10 +105,7 @@ const NM_OMEGA: [f64; 4] = [0.0948, 0.0757, 0.0193, 0.127];
 const NM_SIGMA_VAR: f64 = 0.0540;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn schnider_propofol_matches_nonmem() {
     let parsed = parse_full_model(SCHNIDER_MODEL).expect("model parses");
     let model = parsed.model;
@@ -136,11 +133,7 @@ fn schnider_propofol_matches_nonmem() {
         fit(&model, &population, &model.default_params, &opts).expect("Schnider fit must succeed");
 
     assert!(result.converged, "fit must converge");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 
     // ── Thetas: tight match to NONMEM (the structural-parameter regression
     //    guard). The pre-fix double-dosing pushed TVCL to ~3.4 — a 15% band

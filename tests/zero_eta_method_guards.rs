@@ -30,12 +30,7 @@ fn pooled() -> (CompiledModel, Population) {
 
 /// A budget small enough that the fit returns immediately and `gn` cannot converge.
 fn budgeted(opts: FitOptions) -> FitOptions {
-    FitOptions {
-        outer_maxiter: 2,
-        run_covariance_step: false,
-        verbose: false,
-        ..opts
-    }
+    FitOptions { outer_maxiter: 2, run_covariance_step: false, verbose: false, ..opts }
 }
 
 const START_SENSITIVE: &str = "start-sensitive"; // W_GN_NO_RANDOM_EFFECTS
@@ -45,10 +40,7 @@ const GENERIC_GN: &str = "max iterations reached without convergence";
 #[test]
 fn standalone_gn_at_zero_eta_surfaces_both_diagnostics_from_fit() {
     let (model, pop) = pooled();
-    let opts = budgeted(FitOptions {
-        method: EstimationMethod::FoceGn,
-        ..Default::default()
-    });
+    let opts = budgeted(FitOptions { method: EstimationMethod::FoceGn, ..Default::default() });
     let res = fit(&model, &pop, &model.default_params, &opts).expect("fit returns");
     assert!(!res.converged, "a 2-iteration GN budget cannot converge");
     // `check_model_options` only produces this as a *warning*, and `first_error`
@@ -74,16 +66,10 @@ fn the_gn_remedy_is_stated_exactly_once() {
     // half) and must appear once, so neither restoring it to the post-fit
     // message nor dropping it from the check passes.
     let (model, pop) = pooled();
-    let opts = budgeted(FitOptions {
-        method: EstimationMethod::FoceGn,
-        ..Default::default()
-    });
+    let opts = budgeted(FitOptions { method: EstimationMethod::FoceGn, ..Default::default() });
     let res = fit(&model, &pop, &model.default_params, &opts).expect("fit returns");
-    let with_remedy: Vec<&String> = res
-        .warnings
-        .iter()
-        .filter(|w| w.contains("gn_hybrid"))
-        .collect();
+    let with_remedy: Vec<&String> =
+        res.warnings.iter().filter(|w| w.contains("gn_hybrid")).collect();
     assert_eq!(
         with_remedy.len(),
         1,
@@ -95,11 +81,8 @@ fn the_gn_remedy_is_stated_exactly_once() {
         "the remedy belongs to W_GN_NO_RANDOM_EFFECTS, in full: {}",
         with_remedy[0]
     );
-    let post_fit = res
-        .warnings
-        .iter()
-        .find(|w| w.contains(BADLY_WRONG))
-        .expect("post-fit warning present");
+    let post_fit =
+        res.warnings.iter().find(|w| w.contains(BADLY_WRONG)).expect("post-fit warning present");
     assert!(
         !post_fit.contains("gn_hybrid") && !post_fit.contains("sigma start"),
         "the post-fit warning states the outcome only: {post_fit}"
@@ -147,9 +130,8 @@ fn an_imp_chain_at_zero_eta_fails_before_the_focei_stage_runs() {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
         ..Default::default()
     };
-    let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("must be rejected")
-        .to_string();
+    let err =
+        fit(&model, &pop, &model.default_params, &opts).expect_err("must be rejected").to_string();
     assert!(
         err.contains("method = imp requires at least one random effect"),
         "expected the up-front check_model_options message, got: {err}"
@@ -184,10 +166,7 @@ fn the_two_no_random_effect_messages_are_unchanged() {
              (naive-pooled) model.",
         ),
     ] {
-        let opts = FitOptions {
-            method,
-            ..Default::default()
-        };
+        let opts = FitOptions { method, ..Default::default() };
         let diags = check_model_options(&model, &opts);
         let hit = diags
             .iter()

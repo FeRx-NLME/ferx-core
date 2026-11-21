@@ -36,21 +36,13 @@ impl DataSource {
     pub fn read(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(|e| format!("{ERR_OPEN_CSV}{e}"))?;
-        Ok(Self {
-            path: Some(path.to_path_buf()),
-            hash: sha256_bytes(&bytes),
-            bytes,
-        })
+        Ok(Self { path: Some(path.to_path_buf()), hash: sha256_bytes(&bytes), bytes })
     }
 
     /// A dataset the caller already holds in memory, hashed.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         let bytes = bytes.into();
-        Self {
-            path: None,
-            hash: sha256_bytes(&bytes),
-            bytes,
-        }
+        Self { path: None, hash: sha256_bytes(&bytes), bytes }
     }
 }
 

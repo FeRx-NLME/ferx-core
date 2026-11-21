@@ -71,39 +71,19 @@ struct Cell {
 fn cells() -> Vec<Cell> {
     let pop = |listed: bool, wtx: [Option<f64>; 2]| Population {
         subjects: vec![subject("1", wtx[0]), subject("2", wtx[1])],
-        covariate_names: if listed {
-            vec!["WTX".to_string()]
-        } else {
-            Vec::new()
-        },
+        covariate_names: if listed { vec!["WTX".to_string()] } else { Vec::new() },
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
         exclusions: None,
         warnings: Vec::new(),
     };
-    let cell = |label, population, accepted| Cell {
-        label,
-        population,
-        accepted,
-    };
+    let cell = |label, population, accepted| Cell { label, population, accepted };
     vec![
         cell("no WTX anywhere", pop(false, [None, None]), false),
         cell("WTX listed, on no subject", pop(true, [None, None]), false),
-        cell(
-            "WTX listed, on subject 1 only",
-            pop(true, [Some(1.0), None]),
-            false,
-        ),
-        cell(
-            "WTX unlisted, on subject 1 only",
-            pop(false, [Some(1.0), None]),
-            false,
-        ),
-        cell(
-            "WTX unlisted, on every subject",
-            pop(false, [Some(1.0), Some(1.2)]),
-            true,
-        ),
+        cell("WTX listed, on subject 1 only", pop(true, [Some(1.0), None]), false),
+        cell("WTX unlisted, on subject 1 only", pop(false, [Some(1.0), None]), false),
+        cell("WTX unlisted, on every subject", pop(false, [Some(1.0), Some(1.2)]), true),
     ]
 }
 
@@ -111,17 +91,9 @@ fn cells() -> Vec<Cell> {
 /// the control's text, never an `Ok` whose predictions read `WTX` as 0.
 fn assert_refused<T>(entry: &str, cell: &Cell, got: Result<T, crate::EngineError>, text: &str) {
     let Err(e) = got else {
-        panic!(
-            "{entry}, {}: accepted, so an uncarried WTX is read as 0",
-            cell.label
-        );
+        panic!("{entry}, {}: accepted, so an uncarried WTX is read as 0", cell.label);
     };
-    assert_eq!(
-        e.code(),
-        Some("E_MISSING_COVARIATE"),
-        "{entry}, {}: {e}",
-        cell.label
-    );
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{entry}, {}: {e}", cell.label);
     assert!(
         e.to_string().ends_with(text),
         "{entry}, {}: text\n  got:  {e}\n  want: …{text}",
@@ -168,10 +140,7 @@ fn per_observation_snapshots_alone_do_not_carry_a_covariate() {
         let w = s.covariates["WTX"];
         s.obs_covariates = vec![HashMap::from([("WTX".to_string(), w)]); 3];
     }
-    assert!(
-        check_covariates(&model, &pop).is_empty(),
-        "control: static + snapshots"
-    );
+    assert!(check_covariates(&model, &pop).is_empty(), "control: static + snapshots");
 
     for s in &mut pop.subjects {
         s.covariates.clear();
@@ -179,11 +148,8 @@ fn per_observation_snapshots_alone_do_not_carry_a_covariate() {
     let diags = check_covariates(&model, &pop);
     assert_eq!(diags.len(), 1, "snapshots only: {diags:?}");
     assert_eq!(diags[0].message, MISSING);
-    let cell = Cell {
-        label: "WTX on the observation snapshots only",
-        population: pop,
-        accepted: false,
-    };
+    let cell =
+        Cell { label: "WTX on the observation snapshots only", population: pop, accepted: false };
     let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
     let got = simulate_adaptive_from_spec(
         &ode,
@@ -218,11 +184,7 @@ fn predict_and_simulate_refuse_an_uncarried_covariate() {
 #[test]
 fn fit_refuses_an_uncarried_covariate() {
     let model = parse_model_string(ONE_CPT_IV_WTX).expect("parse");
-    let options = FitOptions {
-        outer_maxiter: 2,
-        run_covariance_step: false,
-        ..Default::default()
-    };
+    let options = FitOptions { outer_maxiter: 2, run_covariance_step: false, ..Default::default() };
     for cell in cells() {
         let got = fit(&model, &cell.population, &model.default_params, &options);
         if cell.accepted {
@@ -239,10 +201,8 @@ fn fit_refuses_an_uncarried_covariate() {
 /// The TDM example's spec, observing `central / WTX` with no assay error.
 fn observe_wtx_spec() -> crate::sim::adaptive::AdaptiveDosingSpec {
     let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
-    let mut spec = parse_full_model(&tdm)
-        .expect("parse")
-        .adaptive_dosing
-        .expect("has [adaptive_dosing]");
+    let mut spec =
+        parse_full_model(&tdm).expect("parse").adaptive_dosing.expect("has [adaptive_dosing]");
     spec.with_assay_error = false;
     spec.assay_cmt = None;
     spec.observe = Some("central / WTX".to_string());
@@ -251,10 +211,7 @@ fn observe_wtx_spec() -> crate::sim::adaptive::AdaptiveDosingSpec {
 }
 
 fn adaptive_options() -> AdaptiveSimulateOptions {
-    AdaptiveSimulateOptions {
-        seed: Some(1),
-        ..Default::default()
-    }
+    AdaptiveSimulateOptions { seed: Some(1), ..Default::default() }
 }
 
 /// The `observe` covariate check routes through the same predicate, so it refuses the
@@ -308,10 +265,7 @@ fn a_record_snapshot_without_the_covariate_does_not_carry_it() {
         s.reset_covariates = vec![m.clone(); 1];
         s.endpoint_covariates = vec![m; 1];
     }
-    assert!(
-        check_covariates(&model, &pop).is_empty(),
-        "control: every map carries WTX"
-    );
+    assert!(check_covariates(&model, &pop).is_empty(), "control: every map carries WTX");
 
     // `endpoint_covariates` (review r1 row 1): binary / categorical / DTMM rows read it
     // through `record_cov`.
@@ -364,21 +318,14 @@ fn a_header_some_map_holds_is_missing_not_unread() {
     let unread = header(all[1].population.clone());
     let d = check_covariates(&model, &unread);
     assert_eq!(d.len(), 1, "no map holds WTX: {d:?}");
-    assert!(
-        d[0].message.starts_with(UNREAD),
-        "no map holds WTX: {}",
-        d[0].message
-    );
+    assert!(d[0].message.starts_with(UNREAD), "no map holds WTX: {}", d[0].message);
 
     let mut snapshot_gap = header(all[4].population.clone());
     for s in &mut snapshot_gap.subjects {
         let m = HashMap::from([("WTX".to_string(), s.covariates["WTX"])]);
         s.obs_covariates = vec![m; 3];
     }
-    assert!(
-        check_covariates(&model, &snapshot_gap).is_empty(),
-        "control: every map carries WTX"
-    );
+    assert!(check_covariates(&model, &snapshot_gap).is_empty(), "control: every map carries WTX");
     snapshot_gap.subjects[1].obs_covariates[2].remove("WTX");
     let d = check_covariates(&model, &snapshot_gap);
     assert_eq!(d.len(), 1, "one snapshot lacks WTX: {d:?}");

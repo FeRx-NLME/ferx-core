@@ -111,11 +111,7 @@ fn run_iivsearch_command(args: &[String]) -> Result<i32, String> {
     eprintln!(
         "Algorithm:  {}{}, ranked on {}",
         options.algorithm.label(),
-        if options.block_stage() {
-            " + top_down_exhaustive blocks"
-        } else {
-            ""
-        },
+        if options.block_stage() { " + top_down_exhaustive blocks" } else { "" },
         options.criterion().label()
     );
     eprintln!("Directory:  {}", dir.display());
@@ -133,20 +129,12 @@ fn run_iivsearch_command(args: &[String]) -> Result<i32, String> {
             IivsearchEvent::BaseFinished { ofv, criterion } => {
                 eprintln!("Base model: OFV {ofv:.3}, criterion {criterion:.3}")
             }
-            IivsearchEvent::StepStarted {
-                step,
-                kind,
-                candidates,
-            } => eprintln!(
+            IivsearchEvent::StepStarted { step, kind, candidates } => eprintln!(
                 "Step {step} ({}): fitting {candidates} candidate{}...",
                 kind.label(),
                 if candidates == 1 { "" } else { "s" }
             ),
-            IivsearchEvent::StepFinished {
-                step,
-                best,
-                improved,
-            } => eprintln!(
+            IivsearchEvent::StepFinished { step, best, improved } => eprintln!(
                 "Step {step}: {} {} (criterion {:.3})",
                 if improved { "best" } else { "kept" },
                 best.0,
@@ -164,12 +152,7 @@ fn run_iivsearch_command(args: &[String]) -> Result<i32, String> {
     let result = run_iivsearch(
         &config,
         &base,
-        IivsearchRun {
-            dir: Some(dir.clone()),
-            threads,
-            cancel: None,
-            progress: Some(&progress),
-        },
+        IivsearchRun { dir: Some(dir.clone()), threads, cancel: None, progress: Some(&progress) },
     )?;
 
     print!("{}", render_summary(&result));
@@ -293,40 +276,15 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "iivsearch",
-                &config.to_string_lossy(),
-                "--quiet"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "iivsearch", &config.to_string_lossy(), "--quiet"])), 1);
     }
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "iivsearch",
-                "a.ferxsearch",
-                "b.ferxsearch"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "iivsearch", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "iivsearch", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "iivsearch", "-h"])), 0);
         assert_eq!(run(&args(&["ferx", "iivsearch"])), 1);
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "iivsearch",
-                "x.ferxsearch",
-                "--samples",
-                "3"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "iivsearch", "x.ferxsearch", "--samples", "3"])), 1);
     }
 }

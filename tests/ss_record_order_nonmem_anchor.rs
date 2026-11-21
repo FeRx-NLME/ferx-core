@@ -26,10 +26,8 @@ use ferx_core::sens::provider::subject_eta_grad;
 use ferx_core::{parse_full_model_file, predict, read_nonmem_csv, CompiledModel, Population};
 use std::path::Path;
 
-const MODELS: [&str; 2] = [
-    "nonmem_anchor/ss_record_order_fit.ferx",
-    "nonmem_anchor/ss_record_order_ode_fit.ferx",
-];
+const MODELS: [&str; 2] =
+    ["nonmem_anchor/ss_record_order_fit.ferx", "nonmem_anchor/ss_record_order_ode_fit.ferx"];
 
 // Measured worst |ferx − NONMEM|: 1.776e-15 (closed form) and 2.665e-15 (ODE twin, reltol
 // 1e-10, abstol 1e-12) across predict, the dual walk and the state pass — the same digits on
@@ -41,15 +39,9 @@ const MODELS: [&str; 2] = [
 const BOUND: f64 = 1e-11;
 
 fn setup(model: &str) -> (CompiledModel, Population) {
-    let m = parse_full_model_file(Path::new(model))
-        .expect("model")
-        .model;
-    let pop = read_nonmem_csv(
-        Path::new("nonmem_anchor/dtmm_ss_record_order.csv"),
-        None,
-        None,
-    )
-    .expect("data");
+    let m = parse_full_model_file(Path::new(model)).expect("model").model;
+    let pop = read_nonmem_csv(Path::new("nonmem_anchor/dtmm_ss_record_order.csv"), None, None)
+        .expect("data");
     (m, pop)
 }
 
@@ -57,19 +49,14 @@ fn setup(model: &str) -> (CompiledModel, Population) {
 fn nonmem_ipred() -> Vec<(String, f64, f64)> {
     let path = "nonmem_anchor/results/dtmm_ss_record_order.tab";
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
     let header: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let col = |c: &str| header.iter().position(|h| *h == c).expect(c);
     let (id, time, evid, ipred) = (col("ID"), col("TIME"), col("EVID"), col("IPRED"));
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0)
@@ -89,16 +76,10 @@ fn assert_nonmem(leg: &str, got: &[(String, f64, f64)]) -> f64 {
         );
         assert!(v.is_finite(), "{leg} ID {id} TIME {t}: {v}");
         let err = (v - w).abs();
-        assert!(
-            err < BOUND,
-            "{leg} ID {id} TIME {t}: ferx {v} vs NONMEM {w} (|error| {err:.3e})"
-        );
+        assert!(err < BOUND, "{leg} ID {id} TIME {t}: ferx {v} vs NONMEM {w} (|error| {err:.3e})");
         worst = worst.max(err);
     }
-    println!(
-        "{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations",
-        want.len()
-    );
+    println!("{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations", want.len());
     worst
 }
 
@@ -112,9 +93,7 @@ fn via_predict(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
 
 /// Label one value per observation with `predict()`'s `(ID, TIME)`.
 fn label(
-    m: &CompiledModel,
-    pop: &Population,
-    values: Vec<(String, f64)>,
+    m: &CompiledModel, pop: &Population, values: Vec<(String, f64)>,
 ) -> Vec<(String, f64, f64)> {
     let labels = via_predict(m, pop);
     assert_eq!(values.len(), labels.len(), "row count against predict");
@@ -139,24 +118,15 @@ fn nonmem_table_straddles_every_ss_tie() {
         .windows(2)
         .filter(|w| w[0].0 == w[1].0 && w[0].1 == w[1].1)
         .map(|w| {
-            assert!(
-                (w[1].2 - ss).abs() < 1e-12,
-                "post-dose row reads the steady state"
-            );
-            assert!(
-                ss - w[0].2 > 8.8,
-                "pre-dose row {w:?} reads below the steady state"
-            );
+            assert!((w[1].2 - ss).abs() < 1e-12, "post-dose row reads the steady state");
+            assert!(ss - w[0].2 > 8.8, "pre-dose row {w:?} reads below the steady state");
             w[0].2
         })
         .collect();
     assert_eq!(pre.len(), 3, "three SS ties, {nm:?}");
     let want = [0.0, 4.3101276069333299, 5.4881163609402641];
     for (p, w) in pre.iter().zip(want) {
-        assert!(
-            (p - w).abs() < 1e-12,
-            "pre-dose reads {pre:?}, want {want:?}"
-        );
+        assert!((p - w).abs() < 1e-12, "pre-dose reads {pre:?}, want {want:?}");
     }
 }
 
@@ -177,17 +147,9 @@ fn dual_walk_reads_an_observation_before_an_ss_dose_pre_dose() {
         let mut values = Vec::new();
         for s in &pop.subjects {
             let obs = subject_eta_grad(&m, s, &m.default_params.theta, &eta).unwrap_or_else(|| {
-                panic!(
-                    "{model} ID {}: routed to FD, the dual walk is not exercised",
-                    s.id
-                )
+                panic!("{model} ID {}: routed to FD, the dual walk is not exercised", s.id)
             });
-            assert_eq!(
-                obs.len(),
-                s.obs_times.len(),
-                "{model} ID {}: dual rows",
-                s.id
-            );
+            assert_eq!(obs.len(), s.obs_times.len(), "{model} ID {}: dual rows", s.id);
             values.extend(obs.iter().map(|o| (s.id.clone(), o.f)));
         }
         assert_nonmem(&format!("dual {model}"), &label(&m, &pop, values));
@@ -207,12 +169,7 @@ fn state_pass_reads_an_observation_before_an_ss_dose_pre_dose() {
         let mut values = Vec::new();
         for s in &pop.subjects {
             let (_, states) = ferx_core::pk::compute_predictions_with_states(&m, s, theta, &eta);
-            assert_eq!(
-                states.len(),
-                s.obs_times.len(),
-                "{model} ID {}: state rows",
-                s.id
-            );
+            assert_eq!(states.len(), s.obs_times.len(), "{model} ID {}: state rows", s.id);
             values.extend(states.iter().map(|u| (s.id.clone(), u[0] / v)));
         }
         assert_nonmem(&format!("states {model}"), &label(&m, &pop, values));

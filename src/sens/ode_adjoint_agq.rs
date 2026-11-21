@@ -19,29 +19,130 @@ use super::*;
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, wsum3};
 
+/// A quadrature node's plan forward, kept for its one reverse.
+type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
+/// Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
+/// produced them (the predictions', the variances').
+type Node = (Vec<f64>, Fwd, Option<Fwd>);
+
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
+///
+/// Every node's forward is recorded once (a forward that fails declines the subject). The
+/// gradient is formed over every node; only when it does not form is each node's term examined,
+/// and it is re-run (over the same recorded forwards) only when that drops one: a diverged node
+/// (see below) is left out as the objective leaves it out, while a subject with no diverged node
+/// pays nothing for the check.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn agq_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
-    template: &ModelParameters,
-    params: &ModelParameters,
-    x: &[f64],
-    eta: &[f64],
-    ctx: &LikCtx,
-    so: &StackedOmega,
-    pv: &ParT<f64>,
-    grid: &[(Vec<f64>, f64, Vec<f64>)],
-    h_exact: Option<&DMatrix<f64>>,
-    exact: bool,
-    held: bool,
-    ng: Option<&AgqNg>,
-    mut eta_dx: Option<&mut ModeOut>,
+    model: &CompiledModel, subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>, template: &ModelParameters,
+    params: &ModelParameters, x: &[f64], eta: &[f64], ctx: &LikCtx, so: &StackedOmega,
+    pv: &ParT<f64>, grid: &[(Vec<f64>, f64, Vec<f64>)], h_exact: Option<&DMatrix<f64>>,
+    exact: bool, held: bool, ng: Option<&AgqNg>, mut eta_dx: Option<&mut ModeOut>,
     mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
-    var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
-    p1: &PredLanes<&[f64]>,
+    var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>, p1: &PredLanes<&[f64]>,
+) -> Option<Vec<f64>> {
+    let theta = &params.theta;
+    let n_obs = subject.observations.len();
+    let sigma = params.sigma.values.as_slice();
+    // The node predictions, values only, each forward kept for its one reverse: a node's
+    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
+    // `G` itself is never formed.
+    let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
+    let mode_plan = mode_fwd.map(|m| &m.0);
+    for (_, _, b) in grid {
+        if n_obs == 0 {
+            break;
+        }
+        let rec = || -> Option<Node> {
+            let (plan, mut du, f) =
+                plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
+            let var = if var_fwd.is_some() {
+                let (pp, dp, pf) =
+                    plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
+                du.extend(dp);
+                Some((pp, std::sync::Arc::new(pf)))
+            } else {
+                None
+            };
+            Some((du, (plan, std::sync::Arc::new(f)), var))
+        };
+        nodes.push(rec()?);
+    }
+    let kept: Vec<usize> = (0..grid.len()).collect();
+    let mut run = |keep: &[usize]| {
+        agq_planned_over(
+            model,
+            subject,
+            lay,
+            template,
+            params,
+            x,
+            eta,
+            ctx,
+            so,
+            pv,
+            grid,
+            &nodes,
+            keep,
+            h_exact,
+            exact,
+            held,
+            ng,
+            eta_dx.as_deref_mut(),
+            mode_fwd,
+            var_fwd,
+            p1,
+        )
+        .filter(|g| g.iter().all(|v| v.is_finite()))
+    };
+    if let Some(g) = run(&kept) {
+        return Some(g);
+    }
+    // The nodes the objective itself drops. A diverged node scores `individual_nll`'s `1e20`
+    // sentinel (`agq::agq_terms`), a log-term of ~-1e20 that `logsumexp` takes to exactly
+    // zero weight; its derivative is then `0 * d(huge or non-finite)`, which the reverse
+    // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
+    // AGQ, #3004). So a node whose total term (the Gaussian `l` plus the non-Gaussian endpoint
+    // term `q`, the sum the value path scores) is non-finite or the sentinel is left out of the
+    // kernel, as it is out of the sum: the value and every gradient component are unchanged by
+    // it. A finite node whose weight merely underflows stays: its derivative is `0 * finite`.
+    // Only a node with a recorded forward can fail the reverse this way (the endpoint term enters
+    // as numbers, so an unusable `q` alone never does: no reverse runs through it), which is why
+    // a subject with no prediction rows keeps every node.
+    let live: Vec<usize> = kept
+        .iter()
+        .copied()
+        .filter(|&j| {
+            let Some((du, _, _)) = nodes.get(j) else {
+                return true;
+            };
+            inner_l(ctx, du, &grid[j].2, pv, None).is_some_and(|l| {
+                crate::stats::likelihood::is_usable_subject_nll(
+                    l + ng.map_or(0.0, |ng| ng.nodes[j].0),
+                )
+            })
+        })
+        .collect();
+    if live.len() < kept.len() && !live.is_empty() {
+        run(&live)
+    } else {
+        None
+    }
+}
+
+/// [`agq_planned`] over the nodes `keep` names (indices into `grid`; `nodes` holds their recorded
+/// forwards, none when the subject has no prediction rows).
+#[allow(clippy::too_many_arguments)]
+fn agq_planned_over(
+    model: &CompiledModel, subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>, template: &ModelParameters,
+    params: &ModelParameters, x: &[f64], eta: &[f64], ctx: &LikCtx, so: &StackedOmega,
+    pv: &ParT<f64>, grid: &[(Vec<f64>, f64, Vec<f64>)], nodes: &[Node], keep: &[usize],
+    h_exact: Option<&DMatrix<f64>>, exact: bool, held: bool, ng: Option<&AgqNg>,
+    mut eta_dx: Option<&mut ModeOut>, mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>, p1: &PredLanes<&[f64]>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
@@ -58,30 +159,16 @@ pub(super) fn agq_planned(
     let n_rows = p1.rows();
     let n_th = theta.len();
     let n_cols = n_th + if sde { sigma.len() } else { 0 };
-    // The node predictions, values only, each forward kept for its one reverse: a node's
-    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
-    // `G` itself is never formed.
-    type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
-    // Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
-    // produced them (the predictions', the variances').
-    type Node = (Vec<f64>, Fwd, Option<Fwd>);
-    let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
-    let mode_plan = mode_fwd.map(|m| &m.0);
-    for (_, _, b) in grid {
-        if n_obs == 0 {
-            continue;
-        }
-        let (plan, mut du, f) = plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
-        let var = if sde {
-            let (pp, dp, pf) =
-                plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
-            du.extend(dp);
-            Some((pp, std::sync::Arc::new(pf)))
-        } else {
-            None
-        };
-        nodes.push((du, (plan, std::sync::Arc::new(f)), var));
-    }
+    let nodes: Vec<&Node> = keep.iter().filter_map(|&j| nodes.get(j)).collect();
+    let kept_grid;
+    let grid: &[(Vec<f64>, f64, Vec<f64>)] = if keep.len() == grid.len() {
+        grid
+    } else {
+        kept_grid = keep.iter().map(|&j| grid[j].clone()).collect::<Vec<_>>();
+        &kept_grid
+    };
+    let ng_nodes: Vec<&(f64, Vec<f64>)> =
+        ng.map(|ng| keep.iter().map(|&j| &ng.nodes[j]).collect()).unwrap_or_default();
 
     // ---- the objective and ∇_η l from the kernel plan --------------------------------
     // Every input that moves between calls is a leaf: the predictions and their jets at η̂
@@ -91,31 +178,23 @@ pub(super) fn agq_planned(
     use kernel::Leaf;
     let mut inp = kernel::Inputs::default();
     let fr: Vec<Leaf> = (0..n_rows).map(|j| inp.leaf(p1.v(j))).collect();
-    let gr: Vec<Vec<Leaf>> = (0..n_rows)
-        .map(|j| (0..n).map(|k| inp.leaf(p1.g(j, k))).collect())
-        .collect();
+    let gr: Vec<Vec<Leaf>> =
+        (0..n_rows).map(|j| (0..n).map(|k| inp.leaf(p1.g(j, k))).collect()).collect();
     let qr: Vec<Vec<Leaf>> = (0..n_rows)
         .map(|j| {
             (0..n * (n + 1) / 2)
-                .map(|t| {
-                    if exact {
-                        inp.leaf(p1.q(j, t))
-                    } else {
-                        Leaf::c(0.0)
-                    }
-                })
+                .map(|t| if exact { inp.leaf(p1.q(j, t)) } else { Leaf::c(0.0) })
                 .collect()
         })
         .collect();
     let er: Vec<Leaf> = eta.iter().map(|&v| inp.leaf(v)).collect();
     let (pr, om) = param_leaves(pv, so, &mut inp);
     let ng_r = ng.map(|ng| ng_leaves(n, &ng.jets, &mut inp));
-    let node_qr: Vec<Leaf> = ng
-        .map(|ng| ng.nodes.iter().map(|(q, _)| inp.leaf(*q)).collect())
-        .unwrap_or_default();
+    let node_qr: Vec<Leaf> =
+        ng.map(|_| ng_nodes.iter().map(|(q, _)| inp.leaf(*q)).collect()).unwrap_or_default();
     let node_gq: Vec<Vec<Leaf>> = ng
-        .map(|ng| {
-            ng.nodes
+        .map(|_| {
+            ng_nodes
                 .iter()
                 .map(|(_, gq)| gq.iter().take(n_bsv).map(|&v| inp.leaf(v)).collect())
                 .collect()
@@ -132,10 +211,8 @@ pub(super) fn agq_planned(
             )
         })
         .collect();
-    let node_f: Vec<Vec<Leaf>> = nodes
-        .iter()
-        .map(|(fv, _, _)| fv.iter().map(|&v| inp.leaf(v)).collect())
-        .collect();
+    let node_f: Vec<Vec<Leaf>> =
+        nodes.iter().map(|(fv, _, _)| fv.iter().map(|&v| inp.leaf(v)).collect()).collect();
     let n_nodes_b = nodes.len();
     let n_out = 1 + n + n_nodes_b * n;
     let variant = kernel::variant_of(&(
@@ -143,99 +220,84 @@ pub(super) fn agq_planned(
         exact,
         grid.len(),
         n_nodes_b,
-        ng.map(|n| (n.jets.g.len(), n.nodes.len())),
+        ng.map(|n| n.jets.g.len()),
         &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
     ));
     type T = kj_tr::Tr;
-    let kr = kernel::kernel_run(
-        model,
-        subject,
-        variant,
-        Layout::F64,
-        &inp.vals,
-        n_out,
-        &|lv| {
-            use crate::sens::num::PkNum;
-            let t = |l: Leaf| l.tr(lv);
-            let c = T::from_f64;
-            let one = c(1.0);
-            let fr: Vec<T> = fr.iter().map(|&l| t(l)).collect();
-            let gr: Vec<Vec<T>> = gr
-                .iter()
-                .map(|r| r.iter().map(|&l| t(l)).collect())
-                .collect();
-            let qr: Vec<Vec<T>> = qr
-                .iter()
-                .map(|r| r.iter().map(|&l| t(l)).collect())
-                .collect();
-            let er: Vec<T> = er.iter().map(|&l| t(l)).collect();
-            let pr = param_tr(model, subject, &pr, lv)?;
-            let ngr = ng_r.as_ref().map(|n| ng_tr(n, lv));
-            let mut h_a: Vec<Vec<T>> = if exact {
-                crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &fr, &gr, &qr, &er, &pr)?
-            } else {
-                crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
-            };
-            if let Some(ngr) = ngr.as_ref() {
-                for k in 0..n_bsv {
-                    for l in 0..n_bsv {
-                        h_a[k][l] = h_a[k][l] + ngr.h[k][l];
-                    }
+    let kr = kernel::kernel_run(model, subject, variant, Layout::F64, &inp.vals, n_out, &|lv| {
+        use crate::sens::num::PkNum;
+        let t = |l: Leaf| l.tr(lv);
+        let c = T::from_f64;
+        let one = c(1.0);
+        let fr: Vec<T> = fr.iter().map(|&l| t(l)).collect();
+        let gr: Vec<Vec<T>> = gr.iter().map(|r| r.iter().map(|&l| t(l)).collect()).collect();
+        let qr: Vec<Vec<T>> = qr.iter().map(|r| r.iter().map(|&l| t(l)).collect()).collect();
+        let er: Vec<T> = er.iter().map(|&l| t(l)).collect();
+        let pr = param_tr(model, subject, &pr, lv)?;
+        let ngr = ng_r.as_ref().map(|n| ng_tr(n, lv));
+        let mut h_a: Vec<Vec<T>> = if exact {
+            crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &fr, &gr, &qr, &er, &pr)?
+        } else {
+            crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
+        };
+        if let Some(ngr) = ngr.as_ref() {
+            for k in 0..n_bsv {
+                for l in 0..n_bsv {
+                    h_a[k][l] = h_a[k][l] + ngr.h[k][l];
                 }
             }
-            let nh = h_a.len();
-            let lh = factor_anchor(&mut h_a, pr.omega_inv(nh))?;
-            let half_logdet = c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
-            let ng_q = ngr.as_ref().map_or(c(0.0), |n| n.q);
-            let mut bs: Vec<T> = Vec::with_capacity(n_nodes_b * n);
-            let a = if grid_l.is_empty() {
-                inner_l(ctx, &fr, &er, &pr, None)? + ng_q + half_logdet
-            } else {
-                let mut terms: Vec<T> = Vec::with_capacity(grid_l.len());
-                for (j, (z, cw, b0)) in grid_l.iter().enumerate() {
-                    // b = η̂ + √2·L⁻ᵀz.
-                    let mut step = vec![c(0.0); n];
-                    for i in (0..n).rev() {
-                        let mut acc = t(z[i]);
-                        for jj in (i + 1)..n {
-                            acc = acc - lh[jj][i] * step[jj];
-                        }
-                        step[i] = acc / lh[i][i];
+        }
+        let nh = h_a.len();
+        let lh = factor_anchor(&mut h_a, pr.omega_inv(nh))?;
+        let half_logdet = c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
+        let ng_q = ngr.as_ref().map_or(c(0.0), |n| n.q);
+        let mut bs: Vec<T> = Vec::with_capacity(n_nodes_b * n);
+        let a = if grid_l.is_empty() {
+            inner_l(ctx, &fr, &er, &pr, None)? + ng_q + half_logdet
+        } else {
+            let mut terms: Vec<T> = Vec::with_capacity(grid_l.len());
+            for (j, (z, cw, b0)) in grid_l.iter().enumerate() {
+                // b = η̂ + √2·L⁻ᵀz.
+                let mut step = vec![c(0.0); n];
+                for i in (0..n).rev() {
+                    let mut acc = t(z[i]);
+                    for jj in (i + 1)..n {
+                        acc = acc - lh[jj][i] * step[jj];
                     }
-                    let b: Vec<T> = (0..n)
-                        .map(|k| er[k] + c(std::f64::consts::SQRT_2) * step[k])
-                        .collect();
-                    let fb: Vec<T> = match node_f.get(j) {
-                        Some(f) => {
-                            bs.extend(b.iter().copied());
-                            f.iter().map(|&l| t(l)).collect()
-                        }
-                        None => Vec::new(),
-                    };
-                    let qb = match ng {
-                        Some(_) => {
-                            let gq = &node_gq[j];
-                            t(node_qr[j])
-                                + wsum3(0.0, (0..n_bsv).map(|k| (t(gq[k]), b[k] - t(b0[k]), one)))
-                        }
-                        None => c(0.0),
-                    };
-                    terms.push(t(*cw) - (inner_l(ctx, &fb, &b, &pr, None)? + qb));
+                    step[i] = acc / lh[i][i];
                 }
-                c(0.5 * n as f64 * std::f64::consts::PI.ln()) + half_logdet - log_sum_exp(&terms)
-            };
-            let mut lg = inner_grad(ctx, &fr, &gr, &er, &pr, None)?;
-            if let Some(ngr) = ngr.as_ref() {
-                for k in 0..n {
-                    lg[k] = lg[k] + ngr.g[k];
-                }
+                let b: Vec<T> =
+                    (0..n).map(|k| er[k] + c(std::f64::consts::SQRT_2) * step[k]).collect();
+                let fb: Vec<T> = match node_f.get(j) {
+                    Some(f) => {
+                        bs.extend(b.iter().copied());
+                        f.iter().map(|&l| t(l)).collect()
+                    }
+                    None => Vec::new(),
+                };
+                let qb = match ng {
+                    Some(_) => {
+                        let gq = &node_gq[j];
+                        t(node_qr[j])
+                            + wsum3(0.0, (0..n_bsv).map(|k| (t(gq[k]), b[k] - t(b0[k]), one)))
+                    }
+                    None => c(0.0),
+                };
+                terms.push(t(*cw) - (inner_l(ctx, &fb, &b, &pr, None)? + qb));
             }
-            let mut outs = vec![a];
-            outs.extend(lg);
-            outs.extend(bs);
-            Some(outs)
-        },
-    )?;
+            c(0.5 * n as f64 * std::f64::consts::PI.ln()) + half_logdet - log_sum_exp(&terms)
+        };
+        let mut lg = inner_grad(ctx, &fr, &gr, &er, &pr, None)?;
+        if let Some(ngr) = ngr.as_ref() {
+            for k in 0..n {
+                lg[k] = lg[k] + ngr.g[k];
+            }
+        }
+        let mut outs = vec![a];
+        outs.extend(lg);
+        outs.extend(bs);
+        Some(outs)
+    })?;
     // The adjoint rows of `A` and of each `∇_η l` component.
     let unit =
         |o: usize| -> Vec<f64> { (0..n_out).map(|c| if c == o { 1.0 } else { 0.0 }).collect() };
@@ -286,11 +348,7 @@ pub(super) fn agq_planned(
     // second-order layout `Q`), `lf` lanes per row.
     let seed_preds = |c: &[f64], du: &mut [f64], lf: usize| {
         let comb = |v: Leaf| -> f64 {
-            c.iter()
-                .enumerate()
-                .filter(|(_, &k)| k != 0.0)
-                .map(|(o, &k)| k * ba(o, v))
-                .sum()
+            c.iter().enumerate().filter(|(_, &k)| k != 0.0).map(|(o, &k)| k * ba(o, v)).sum()
         };
         for j in 0..n_rows {
             du[j * lf] = comb(fr[j]);
@@ -351,9 +409,7 @@ pub(super) fn agq_planned(
         let mut du = vec![0.0; (1 + n) * w_out];
         du[..w_out].copy_from_slice(&du_bar);
         for o in 0..n {
-            let c: Vec<f64> = (0..=n)
-                .map(|i| if i == 1 + o { 1.0 } else { 0.0 })
-                .collect();
+            let c: Vec<f64> = (0..=n).map(|i| if i == 1 + o { 1.0 } else { 0.0 }).collect();
             seed_preds(&c, &mut du[(1 + o) * w_out..(2 + o) * w_out], lf);
         }
         Some(reverse_at_mode(1 + n, &du, first)?)
@@ -456,11 +512,7 @@ pub(super) fn agq_planned(
     };
     let theta_of = |s: usize| -> Vec<f64> { pb2[s * n_cols..(s + 1) * n_cols].to_vec() };
     let comb_adj = |c: &[f64], v: Leaf| -> f64 {
-        c.iter()
-            .enumerate()
-            .filter(|(_, &k)| k != 0.0)
-            .map(|(o, &k)| k * ba(o, v))
-            .sum()
+        c.iter().enumerate().filter(|(_, &k)| k != 0.0).map(|(o, &k)| k * ba(o, v)).sum()
     };
     let psi_c: Vec<f64> = std::iter::once(1.0).chain(w.iter().map(|v| -v)).collect();
     let psi_of = |v: Leaf| comb_adj(&psi_c, v);
@@ -470,39 +522,16 @@ pub(super) fn agq_planned(
     }
     if let (Some(ngr), Some(_)) = (ng_r.as_ref(), ng) {
         let (a_q, a_g, a_h) = ng_adjoints(ngr, n_bsv, psi_of);
-        let mut parts = vec![NgSeed {
-            eta: &eta[..n_bsv],
-            a_q,
-            a_g: &a_g,
-            a_h: &a_h,
-        }];
+        let mut parts = vec![NgSeed { eta: &eta[..n_bsv], a_q, a_g: &a_g, a_h: &a_h }];
         for ((_, _, b), &q) in grid.iter().zip(&node_qr) {
-            parts.push(NgSeed {
-                eta: &b[..n_bsv],
-                a_q: psi_of(q),
-                a_g: &[],
-                a_h: &[],
-            });
+            parts.push(NgSeed { eta: &b[..n_bsv], a_q: psi_of(q), a_g: &[], a_h: &[] });
         }
-        for (t, d) in theta_adj
-            .iter_mut()
-            .zip(ng_theta_adjoint(model, subject, theta, &parts)?)
-        {
+        for (t, d) in theta_adj.iter_mut().zip(ng_theta_adjoint(model, subject, theta, &parts)?) {
             *t += d;
         }
     }
-    let out = packed_gradient(
-        model,
-        template,
-        params,
-        x.len(),
-        &theta_adj,
-        &psi_of,
-        &pr,
-        &om,
-        so,
-        pv,
-    );
+    let out =
+        packed_gradient(model, template, params, x.len(), &theta_adj, &psi_of, &pr, &om, so, pv);
     if let Some(o) = eta_dx {
         o.eta_dx = None;
         o.hessian = (o.want_hessian && at_mode)

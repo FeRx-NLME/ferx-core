@@ -54,10 +54,7 @@ const ORACLE_TOL: f64 = 1e-8;
 fn dw_of_a_nested_level_fit_is_taken_within_the_innermost_cells() {
     let src = include_str!("../nonmem_anchor/nested_levels_3.ferx");
     let parsed = parse_full_model(src).expect("anchor model parses");
-    assert!(
-        parsed.fit_options.iov_column.is_none(),
-        "a nested model sets no iov_column"
-    );
+    assert!(parsed.fit_options.iov_column.is_none(), "a nested model sets no iov_column");
     let (pop, _) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
@@ -80,11 +77,7 @@ fn dw_of_a_nested_level_fit_is_taken_within_the_innermost_cells() {
     };
     let r = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("evaluation");
     let (_, whole) = iwres_autocorrelation(&r.subjects);
-    assert!(
-        r.dw_statistic.is_finite() && whole.is_finite(),
-        "({}, {whole})",
-        r.dw_statistic
-    );
+    assert!(r.dw_statistic.is_finite() && whole.is_finite(), "({}, {whole})", r.dw_statistic);
     let d_cells = (r.dw_statistic - ORACLE_CELLS).abs();
     let d_whole = (whole - ORACLE_WHOLE).abs();
     eprintln!(
@@ -92,19 +85,11 @@ fn dw_of_a_nested_level_fit_is_taken_within_the_innermost_cells() {
          whole {whole:.16} oracle {ORACLE_WHOLE:.16} |Δ| {d_whole:.3e}",
         r.dw_statistic
     );
-    assert!(
-        d_cells < ORACLE_TOL,
-        "cells: ferx {} vs oracle",
-        r.dw_statistic
-    );
+    assert!(d_cells < ORACLE_TOL, "cells: ferx {} vs oracle", r.dw_statistic);
     assert!(d_whole < ORACLE_TOL, "whole: ferx {whole} vs oracle");
     // The straddle, asserted so the pair cannot quietly agree: the fit's value is the
     // split one, the public ungrouped entry the whole one, and they differ.
-    assert!(
-        (r.dw_statistic - whole).abs() > 0.05,
-        "split {} vs whole {whole}",
-        r.dw_statistic
-    );
+    assert!((r.dw_statistic - whole).abs() > 0.05, "split {} vs whole {whole}", r.dw_statistic);
 }
 
 /// Pair-normalised DW of `series`, written out here rather than called, so the test
@@ -152,16 +137,11 @@ fn iov_column_without_kappa_splits_at_the_column() {
     )
     .expect("data loads");
     assert!(
-        pop.subjects
-            .iter()
-            .all(|s| s.occasions.len() == s.observations.len()),
+        pop.subjects.iter().all(|s| s.occasions.len() == s.observations.len()),
         "the reader fills the occasions from iov_column without a kappa"
     );
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    };
+    let opts =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() };
     let r = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("evaluation");
     let mut by_arm: Vec<Vec<f64>> = Vec::new();
     for (s, res) in pop.subjects.iter().zip(&r.subjects) {
@@ -184,11 +164,7 @@ fn iov_column_without_kappa_splits_at_the_column() {
         r.dw_statistic
     );
     assert!(r.dw_statistic.is_finite() && whole.is_finite());
-    assert!(
-        (r.dw_statistic - want).abs() < 1e-12,
-        "fit DW {} vs split {want}",
-        r.dw_statistic
-    );
+    assert!((r.dw_statistic - want).abs() < 1e-12, "fit DW {} vs split {want}", r.dw_statistic);
     assert!(
         (want - whole).abs() > 0.01,
         "the fixture must tell the split from the whole: {want} vs {whole}"
