@@ -356,14 +356,17 @@ pub(crate) fn lnrel_jet(x: f64) -> [f64; 5] {
 
 /// `ln K₁(x)` (`x > 0`) and its first four derivatives, from `r = K₀/K₁`:
 /// `f′ = −r − 1/x`, `r′ = r² + r/x − 1`, and each further order by differentiating those.
-/// `e^x K_ν(x) = ∫₀^∞ e^{−x(cosh t − 1)} cosh(νt) dt` by the trapezoid rule at step `1/8`:
-/// the integrand is analytic in the strip `|Im t| < π/2`, so the error is `O(e^{−8π²})`,
-/// far below rounding; nodes run until the exponent passes `−750`. `NaN` off `x > 0`.
+/// `e^x K_ν(x) = ∫₀^∞ e^{−x(cosh t − 1)} cosh(νt) dt` by the trapezoid rule at step
+/// `h = min(1/8, ½/√x)`. The integrand is entire, and on the line `Im t = d` it grows by
+/// `e^{x(1 − cos d)} ≈ e^{xd²/2}`, so the rule's error is `O(e^{−2π²/(h²x)})` at the best `d`:
+/// `e^{−8π²}` at this step, far below rounding, where a fixed `1/8` lost every digit by
+/// `x ≈ 10⁴` (its width, `1/√x`, falls below the step). Nodes run until the exponent passes
+/// `−750`. `NaN` off `x > 0`.
 pub(crate) fn ln_bessel_k1_jet(x: f64) -> [f64; 5] {
     if !(x > 0.0 && x.is_finite()) {
         return [f64::NAN; 5];
     }
-    let h = 0.125;
+    let h = 0.125f64.min(0.5 / x.sqrt());
     let (mut k0, mut k1) = (0.5, 0.5);
     for j in 1.. {
         let t = h * j as f64;
@@ -2552,7 +2555,7 @@ mod tests {
             (ln1p_jet, &[-0.6, -0.1, 1e-3, 0.4, 3.0]),
             (atan_jet, &[-4.0, -0.7, 0.0, 0.3, 2.5]),
             (lnrel_jet, &[-0.7, -0.49, -0.1, 0.0, 0.2, 0.499, 0.501, 1.5, 9.0]),
-            (ln_bessel_k1_jet, &[0.01, 0.3, 1.0, 4.0, 25.0]),
+            (ln_bessel_k1_jet, &[0.01, 0.3, 1.0, 4.0, 25.0, 200.0, 1e4]),
             (norm_inv_cdf_jet, &[1e-6, 0.02, 0.3, 0.5, 0.9, 0.999]),
         ];
         let mut worst = 0.0f64;
@@ -2591,6 +2594,20 @@ mod tests {
         {
             let got = ln_bessel_k1_jet(x)[0].exp();
             assert!((got / k1 - 1.0).abs() < 1e-12, "K1({x}) = {got}, want {k1}");
+        }
+        // Large x, where the trapezoid's step must shrink with `1/√x`, against the
+        // asymptotic series `e^x K₁(x) = √(π/2x)·Σ_k a_k`, `a_k = a_{k−1}(4 − (2k−1)²)/(8kx)`,
+        // summed to rounding (an independent formula). A fixed step of 1/8 was off by 3.4e-3
+        // at x = 200 and by 4× at x = 1e4.
+        for x in [100.0, 1e3, 1e4] {
+            let (mut a, mut s) = (1.0, 1.0);
+            for k in 1..30 {
+                a *= (4.0 - ((2 * k - 1) as f64).powi(2)) / (8.0 * k as f64 * x);
+                s += a;
+            }
+            let want = (std::f64::consts::PI / (2.0 * x)).sqrt() * s;
+            let got = (ln_bessel_k1_jet(x)[0] + x).exp();
+            assert!((got / want - 1.0).abs() < 1e-12, "e^x K1({x}) = {got}, want {want}");
         }
         for p in [1e-12, 1e-4, 0.25, 0.5, 0.8, 1.0 - 1e-6] {
             let q = norm_inv_cdf_jet(p)[0];

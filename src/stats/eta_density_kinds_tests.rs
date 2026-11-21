@@ -405,31 +405,6 @@ fn every_sampler_draws_its_density() {
     assert!(worst.0 < 6.0, "worst {:.2} ({})", worst.0, worst.1);
 }
 
-/// `atan_g` is libm's `atan` to rounding across both reduction branches, and `ln K₁` is
-/// the reference at three arguments (Abramowitz & Stegun table 9.8 values,
-/// `K₁(0.1) = 9.853844780870606`, `K₁(1) = 0.6019072301972346`,
-/// `K₁(10) = 1.864877345382558e-5`).
-#[test]
-fn the_special_functions_are_the_references() {
-    let mut worst = 0.0f64;
-    for x in [-37.0, -1.5, -1.0, -0.3, 0.0, 1e-8, 0.2, 0.999, 1.0, 4.0, 1e6] {
-        let (got, want) = (atan_g::<f64>(x), x.atan());
-        assert!(got.is_finite() && want.is_finite(), "atan({x})");
-        worst = worst.max((got - want).abs());
-    }
-    eprintln!("atan: worst {worst:.2e}");
-    // Measured 2.22e-16, one ulp at 1; bound 4 ulp.
-    assert!(worst < 1e-15, "atan {worst:.2e}");
-    for (x, k1) in [
-        (0.1, 9.853_844_780_870_606),
-        (1.0, 0.601_907_230_197_234_6),
-        (10.0, 1.864_877_345_382_558e-5),
-    ] {
-        let got = ln_bessel_k1::<f64>(x).exp();
-        assert!((got - k1).abs() / k1 < 1e-13, "K1({x}) = {got}, want {k1}");
-    }
-}
-
 /// The noncentral χ² density's two forms agree where `ln_ncx2_pdf` switches between
 /// them: the Poisson-mixture series and the Bessel asymptotic, over `√(λy)` from just
 /// below to 3× the switch, for several `k` and λ (`k = 3`, ν = ½, makes the asymptotic
@@ -545,4 +520,27 @@ fn the_t_moment_entry_is_the_textbook_variance() {
     eprintln!("t variance vs quadrature: worst relative {worst:.2e}");
     // Measured 3.69e-14; bound 1e-12.
     assert!(worst < 1e-12, "{worst:e}");
+}
+
+/// The inverse-Gaussian CDF at a small ω, where `e^{2λ}` alone overflows (λ = 1/ω = 500):
+/// finite, and the integral of the kind's own density (Simpson over [0.5, x], below which
+/// the density is far under rounding). Dies under the product form
+/// `e^{2λ}·Φ(−r(x + 1))`, which is `inf·0 = NaN` here.
+#[test]
+fn the_inverse_gaussian_cdf_survives_a_small_omega() {
+    let w = 0.002;
+    for x in [0.95, 1.0, 1.04] {
+        let got = eta_cdf::<f64>(DensityKind::InverseGaussian, x, w, &[]).expect("a CDF");
+        let n = 20_000;
+        let (a, h) = (0.5, (x - 0.5) / n as f64);
+        let f = |t: f64| eta_log_pdf::<f64>(DensityKind::InverseGaussian, t, w, &[]).exp();
+        let mut want = f(a) + f(x);
+        for i in 1..n {
+            want += f(a + h * i as f64) * if i % 2 == 1 { 4.0 } else { 2.0 };
+        }
+        want *= h / 3.0;
+        assert!(got.is_finite() && want.is_finite(), "x = {x}: {got} vs {want}");
+        // Measured 6.0e-14 worst over the three x (Simpson at 20 000 panels); 10× headroom.
+        assert!((got - want).abs() < 1e-12, "x = {x}: CDF {got}, integral {want}");
+    }
 }

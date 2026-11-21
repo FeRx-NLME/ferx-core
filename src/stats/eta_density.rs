@@ -607,6 +607,10 @@ pub(crate) fn effect_quantiles(
 
 /// The inverse and log-determinant of a symmetric positive-definite matrix over `T`, by
 /// Cholesky; `None` when it does not factor.
+///
+/// Its own factor loop, not `sens::focei_kernel::chol`: a second caller of that function from
+/// this module cost the weibull fit 25% (0.40 s against 0.32 s, `ci-test`, medians of 7) — the
+/// likely mechanism is that with LTO off it stops being inlined in the likelihood kernel.
 fn spd_inverse<T: PkNum>(a: &[Vec<T>]) -> Option<(Vec<Vec<T>>, T)> {
     let n = a.len();
     let z = T::from_f64(0.0);

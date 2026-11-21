@@ -2250,37 +2250,28 @@ fn run_mcem(
         omega_mat = new_omega;
         // #1716: a density group's Ω block and shape θ maximise its weighted prior over
         // this iteration's draws (the closed form above is the Gaussian statistic).
+        let bounds: Vec<(f64, f64)> = init_params
+            .theta_lower
+            .iter()
+            .zip(&init_params.theta_upper)
+            .map(|(&l, &h)| (l, h))
+            .collect();
         let density_mstep = crate::estimation::eta_density_mstep::DensityMstep::new(
             model,
             &init_params.omega_fixed,
             &init_params.theta_fixed,
-            &init_params
-                .theta_lower
-                .iter()
-                .zip(&init_params.theta_upper)
-                .map(|(&lo, &hi)| (lo, hi))
-                .collect::<Vec<_>>(),
+            &bounds,
         );
-        let density_owned: Vec<usize> = density_mstep
-            .as_ref()
-            .map(|d| d.owned_thetas())
-            .unwrap_or_default()
+        let kappa_mstep = crate::estimation::eta_density_mstep::DensityMstep::for_kappas(
+            model,
+            &init_params.kappa_fixed,
+            &init_params.theta_fixed,
+            &bounds,
+        );
+        let density_owned: Vec<usize> = [&density_mstep, &kappa_mstep]
             .into_iter()
-            .chain(
-                crate::estimation::eta_density_mstep::DensityMstep::for_kappas(
-                    model,
-                    &init_params.kappa_fixed,
-                    &init_params.theta_fixed,
-                    &init_params
-                        .theta_lower
-                        .iter()
-                        .zip(&init_params.theta_upper)
-                        .map(|(&lo, &hi)| (lo, hi))
-                        .collect::<Vec<_>>(),
-                )
-                .map(|d| d.owned_thetas())
-                .unwrap_or_default(),
-            )
+            .flatten()
+            .flat_map(|d| d.owned_thetas())
             .collect();
         if let Some(dm) = &density_mstep {
             let weighted: Vec<(&[f64], f64)> = draws
@@ -2312,20 +2303,7 @@ fn run_mcem(
         }
         // #1716: a κ density group's Ω_IOV block and shape θ, from every occasion's κ
         // segment of the importance-weighted joint draws.
-        if let (Some(cur), Some(dm)) = (
-            omega_iov_mat.as_mut(),
-            crate::estimation::eta_density_mstep::DensityMstep::for_kappas(
-                model,
-                &init_params.kappa_fixed,
-                &init_params.theta_fixed,
-                &init_params
-                    .theta_lower
-                    .iter()
-                    .zip(&init_params.theta_upper)
-                    .map(|(&lo, &hi)| (lo, hi))
-                    .collect::<Vec<_>>(),
-            ),
-        ) {
+        if let (Some(cur), Some(dm)) = (omega_iov_mat.as_mut(), kappa_mstep.as_ref()) {
             let nk = model.n_kappa;
             let n_occ_total: usize = n_occ_of.iter().sum::<usize>().max(1);
             let segs: Vec<(Vec<f64>, f64)> = draws

@@ -12202,8 +12202,8 @@ fn density_kind_model(params: &str, read: &str) -> CompiledModel {
 }
 
 /// Every kind the FOCE family scores (no kink or edge), each block form, and a truncation
-/// of each CDF family, through the compiled plans: the FOCEI adjoint gradient against the
-/// reconverged-FD oracle, which shares no derivative code with it. Between them the cells
+/// of each CDF family, through the compiled plans: the FOCEI and FOCE adjoint gradients
+/// against the reconverged-FD oracle, which shares no derivative code with them. Between them the cells
 /// record every primitive the port added — `Ln1p` (lognormal, cauchy), `Softplus` (logistic,
 /// betaprime, beta), `Lnrel` and `Exprel` (both GEV arms), `LnBesselK1` (nig), `NormInvCdf`
 /// (the copula), the implied-shape `HostFn`s (weibull, frechet, chi), `gamma_pq` (truncated
@@ -12223,6 +12223,8 @@ fn every_smooth_density_kind_matches_reconverged_fd_through_the_plans() {
         ("t block", "  theta NU(6.0, 3.0, 100.0)\n  block_omega (ETA_CL, ETA_D) = [0.09, 0.02, 0.06] density t(NU)".into(), real, 0.1),
         ("copula", "  theta MU(0.4, 0.01, 0.99)\n  block_omega (ETA_CL, ETA_D) = [0.09, 0.01, 0.03] density copula(ETA_CL = normal, ETA_D = beta(MU))".into(), unit, 0.2),
         ("truncated beta", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.03 density truncated(beta(MU), 0.1, 0.9)"), unit, 0.2),
+        // ζ = 200: the Bessel argument αq ≈ 2.6e3, where a fixed trapezoid step loses K₁.
+        ("nig near-Gaussian", format!("  theta ZETA(200.0, 0.01, 1000.0)\n  theta RHO(0.3, -0.95, 0.95)\n{CL}  omega ETA_D ~ 0.06 density nig(ZETA, RHO)"), real, 0.1),
         ("t", format!("  theta NU(6.0, 3.0, 100.0)\n{CL}  omega ETA_D ~ 0.06 density t(NU)"), real, 0.1),
         ("logistic", format!("{CL}  omega ETA_D ~ 0.06 density logistic"), real, 0.1),
         ("cauchy", format!("{CL}  omega ETA_D ~ 0.02 density cauchy"), real, 0.1),
@@ -12259,7 +12261,7 @@ fn every_smooth_density_kind_matches_reconverged_fd_through_the_plans() {
         ("truncated cauchy", format!("{CL}  omega ETA_D ~ 0.02 density truncated(cauchy, -2, 2)"), real, 0.1),
     ];
     let mut worst = (0.0f64, "");
-    for (label, params, read, z) in oracle_cells(cases, &[0, 1, 2, 3]) {
+    for (label, params, read, z) in oracle_cells(cases, &[0, 1, 2, 3, 4]) {
         let model = density_kind_model(&params, read);
         assert!(model.has_densities(), "{label}: no density group");
         assert!(outer_model_in_scope(&model), "{label}: not in adjoint scope");
@@ -12272,14 +12274,17 @@ fn every_smooth_density_kind_matches_reconverged_fd_through_the_plans() {
             &[0.5, 1.0, 2.0, 4.0, 8.0, 11.0, 13.0, 16.0, 24.0],
             &[0.15, z],
         );
-        let w = fd_oracle(&model, &s, true);
-        eprintln!("{label}: worst {w:.2e}");
-        if w > worst.0 {
-            worst = (w, label);
+        // FOCEI, and FOCE's conditional form under a density (`foce_f_grad_density`).
+        for interaction in [true, false] {
+            let w = fd_oracle(&model, &s, interaction);
+            eprintln!("{label} (interaction {interaction}): worst {w:.2e}");
+            if w > worst.0 {
+                worst = (w, label);
+            }
         }
     }
-    // Measured worst 5.0e-9 (truncated gamma) over the 38 cells, the Richardson FD noise
-    // floor at EBE tolerance 1e-12; the per-PR four 2.6e-9. 10× headroom.
+    // Measured worst 5.0e-9 (truncated gamma, FOCEI) over the 39 cells × FOCEI/FOCE, the
+    // Richardson FD noise floor at EBE tolerance 1e-12; the per-PR five 2.6e-9. 10× headroom.
     assert!(worst.0 < 5e-8, "worst relative gap {:.2e} on {}", worst.0, worst.1);
 }
 

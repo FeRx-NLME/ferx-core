@@ -57,19 +57,9 @@ fn expm1_over<T: PkNum>(u: T, lambda: T) -> T {
     u * (lambda * u).jet_unary(JetFn::Exprel)
 }
 
-/// `atan(x)`.
-pub(super) fn atan_g<T: PkNum>(x: T) -> T {
-    x.jet_unary(JetFn::Atan)
-}
-
 /// Whether `x` is a finite number, decided through the branch API.
 pub(super) fn finite<T: PkNum>(x: T) -> bool {
     x.br_cmp_c(B::Gt, f64::NEG_INFINITY) && x.br_cmp_c(B::Lt, f64::INFINITY)
-}
-
-/// `ln K₁(x)` for `x > 0`.
-pub(super) fn ln_bessel_k1<T: PkNum>(x: T) -> T {
-    x.jet_unary(JetFn::LnBesselK1)
 }
 
 /// `ln B(a, b)`.
@@ -124,8 +114,8 @@ fn nakagami_h<T: PkNum>(m: DualT<1, T>, w: T) -> DualT<1, T> {
 }
 
 /// The `f64` root behind [`implied_shape`]: Newton from the shape's classic first guess,
-/// clamped to its bracket, to convergence or 200 steps. `NaN` when the iteration leaves
-/// the domain.
+/// clamped to its bracket, to convergence. `NaN` when the iteration leaves the domain or
+/// does not converge in 200 steps (the Newton steps over `T` need the root itself).
 pub(crate) fn implied_shape_root(f: HostFn, w: f64) -> f64 {
     let (h, k0, lo, hi): (fn(DualT<1, f64>, f64) -> DualT<1, f64>, f64, f64, f64) = match f {
         // CV ≈ 1.2/k is the classic first guess.
@@ -145,12 +135,14 @@ pub(crate) fn implied_shape_root(f: HostFn, w: f64) -> f64 {
             return f64::NAN;
         }
         let next = (k - r.v / r.g[0]).clamp(lo, hi);
-        if (next - k).abs() <= 1e-15 * k.abs().max(1.0) {
+        // Quadratic convergence: a 1e-12 step leaves k at rounding, which the Newton steps
+        // over `T` finish; a step test tighter than that can wobble at the last ulp forever.
+        if (next - k).abs() <= 1e-12 * k.abs().max(1.0) {
             return next;
         }
         k = next;
     }
-    k
+    f64::NAN
 }
 
 /// Weibull's shape `k` with mean 1 and variance `ω`.
@@ -270,7 +262,9 @@ pub(super) fn latent_neg2_logpdf<T: PkNum>(kind: DensityKind, z: T, w: T, s: &[T
             let mu = -delta * beta / gamma;
             let x = z - mu;
             let q = (delta * delta + x * x).sqrt();
-            let lp = alpha.ln() + delta.ln() - c::<T>(PI).ln() + ln_bessel_k1(alpha * q) - q.ln()
+            let lp = alpha.ln() + delta.ln() - c::<T>(PI).ln()
+                + (alpha * q).jet_unary(JetFn::LnBesselK1)
+                - q.ln()
                 + delta * gamma
                 + beta * x;
             c::<T>(-2.0) * lp
@@ -817,14 +811,18 @@ pub(super) fn ln_ncx2_pdf<T: PkNum>(y: T, k: T, lam: T) -> T {
 /// density meets, so at `x = 1000` sixteen terms leave a remainder far below rounding.
 pub(super) const NCX2_ASYMPTOTIC_FROM: f64 = 1000.0;
 
-/// The terms `j` a noncentral χ² series sums around its peak `center`: they fall like
-/// `e^{−(j − j*)²/(2s²)}` with `s² ≤ j* + 1`, so `10·√(center + 1) + 15` each side reach
-/// `e^{−50}` below the peak. The centre is a guarded floor (`br_floor_div`), so a recording's
-/// window follows the value on every evaluation.
-fn ncx2_window(center: f64) -> std::ops::Range<usize> {
-    let half = (10.0 * (center + 1.0).sqrt()).ceil() as usize + 15;
-    let c = center as usize;
-    c.saturating_sub(half)..c + half + 1
+/// The terms `j` a noncentral χ² series sums around its `peak`: they fall like
+/// `e^{−(j − j*)²/(2s²)}` with `s² ≤ j* + 1`, so `10·√(j* + 1) + 15` each side reach `e^{−50}`
+/// below the peak. The peak's cell on a grid of 16 is a guarded floor (`br_floor_div`), so a
+/// recording's window follows the value, re-recording only when the peak changes cell.
+fn ncx2_window<T: PkNum>(peak: T) -> std::ops::Range<usize> {
+    // The centre on a grid of `NCX2_GRID` (one guarded floor), so a plan serves every peak
+    // in its cell rather than one integer: the window spans the whole cell.
+    const NCX2_GRID: f64 = 16.0;
+    let lo = if peak.br_cmp_c(B::Gt, 0.0) { NCX2_GRID * peak.br_floor_div(NCX2_GRID) } else { 0.0 };
+    let half = (10.0 * (lo + NCX2_GRID + 1.0).sqrt()).ceil() as usize + 15;
+    let c = lo as usize;
+    c.saturating_sub(half)..c + NCX2_GRID as usize + half + 1
 }
 
 /// The series form of [`ln_ncx2_pdf`]: `Σ_j Pois(j; λ/2)·f_{χ²_{k+2j}}(y)`, whose terms are
@@ -847,8 +845,7 @@ pub(super) fn ln_ncx2_series<T: PkNum>(y: T, k: T, lam: T) -> T {
     };
     let hk = k * c(0.5);
     let peak = (((hk - one) * (hk - one) + c::<T>(2.0) * hl * y).sqrt() - (one + hk)) * c(0.5);
-    let center = if peak.br_cmp_c(B::Gt, 0.0) { peak.br_floor_div(1.0) } else { 0.0 };
-    let terms: Vec<T> = ncx2_window(center).map(term).collect();
+    let terms: Vec<T> = ncx2_window(peak).map(term).collect();
     crate::sens::num::log_sum_exp(&terms)
 }
 
@@ -935,7 +932,8 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
     let one = c::<T>(1.0);
     let half = c::<T>(0.5);
     let zero = c::<T>(0.0);
-    let pos = x.br_cmp_c(B::Gt, 0.0);
+    // Asked in the arms on (0, ∞) only: a latent on ℝ crosses 0 during an EBE search.
+    let pos = || x.br_cmp_c(B::Gt, 0.0);
     Some(match kind {
         K::Copula => return None,
         K::Normal => normal_cdf_g(x / w.sqrt()),
@@ -952,24 +950,21 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             let e = half * (-x.abs() / b).exp();
             by_sign(one - e, e)
         }
-        K::Cauchy => half + atan_g(x / w.sqrt()) * c(1.0 / PI),
+        K::Cauchy => half + (x / w.sqrt()).jet_unary(JetFn::Atan) * c(1.0 / PI),
         K::Gumbel => {
             let beta = (c::<T>(6.0) * w).sqrt() * c(1.0 / PI);
             let u = (x + c::<T>(EULER_GAMMA) * beta) / beta;
             (-(-u).exp()).exp()
         }
         K::NormalInverseGaussian => {
-            // F(x) = ∫₀^∞ p(x − e^v·σ₀)·e^v·σ₀ dv over v ∈ [−40, 6] ∪ the tail.
+            // F(x) = ∫ p(x − e^v·σ₀)·e^v·σ₀ dv, by the trapezoid rule over v ∈ [−40, 6].
             let sd = w.sqrt();
-            let h = 0.02;
+            let (h, n) = (0.02, 2300);
             let mut acc = zero;
-            let mut v = -40.0;
-            while v <= 6.0 {
-                let du = sd * c(v.exp());
-                let wt =
-                    if (v + 40.0).abs() < 1e-12 || (v - 6.0).abs() < 1e-12 { 0.5 } else { 1.0 };
+            for i in 0..=n {
+                let du = sd * c((-40.0 + h * i as f64).exp());
+                let wt = if i == 0 || i == n { 0.5 } else { 1.0 };
                 acc = acc + c::<T>(wt * h) * eta_log_pdf(kind, x - du, w, s).exp() * du;
-                v += h;
             }
             acc
         }
@@ -1050,53 +1045,53 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             }
         }
         K::Gamma | K::ChiSq => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let k = one / w;
             regularized_gamma_p(k, k * x)
         }
         K::Exponential => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             one - (-x).exp()
         }
         K::Erlang => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             regularized_gamma_p(s[0], s[0] * x)
         }
         K::InvGamma => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let alpha = c::<T>(2.0) + one / w;
             regularized_gamma_q(alpha, (alpha - one) / x)
         }
         K::LogNormal => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let s2 = ln1p_g(w);
             normal_cdf_g((x.ln() + s2 * half) / s2.sqrt())
         }
         K::Chi => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let m = nakagami_m(w)?;
             regularized_gamma_p(m, m * x * x / (one + w))
         }
         K::Rayleigh => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             one - (-x * x * c(PI / 4.0)).exp()
         }
         K::Weibull => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let k = weibull_k(w)?;
@@ -1104,7 +1099,7 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             one - (-(k * (x.ln() - lam)).exp()).exp()
         }
         K::Frechet => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let a = frechet_alpha(w)?;
@@ -1112,22 +1107,24 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             (-(-a * (x.ln() - ls)).exp()).exp()
         }
         K::InverseGaussian => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let lam = one / w;
             let r = (lam / x).sqrt();
-            normal_cdf_g(r * (x - one)) + (c::<T>(2.0) * lam).exp() * normal_cdf_g(-r * (x + one))
+            // `e^{2λ}·Φ(−r(x + 1))` as one exponent: `e^{2λ}` alone overflows below ω ≈ 2/709.
+            let tail = (-r * (x + one)).jet_unary(JetFn::LogNormCdf);
+            normal_cdf_g(r * (x - one)) + (c::<T>(2.0) * lam + tail).exp()
         }
         K::BetaPrime => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let b = c::<T>(2.0) + c::<T>(2.0) / w;
             inc_beta(b - one, b, x / (one + x))
         }
         K::NoncentralChiSq => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let k = s[0];
@@ -1140,7 +1137,7 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             }
             // Pois(j; λ/2)·P((k + 2j)/2, y/2), peaked at j = λ/2 (see `ncx2_window`).
             let mut acc = zero;
-            for j in ncx2_window(hl.br_floor_div(1.0)) {
+            for j in ncx2_window(hl) {
                 let jf = j as f64;
                 let lp = -hl + c::<T>(jf) * hl.ln() - c::<T>(jf + 1.0).ln_gamma();
                 acc = acc + lp.exp() * regularized_gamma_p((k + c(2.0 * jf)) * half, y * half);
@@ -1148,7 +1145,7 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             acc
         }
         K::Kolmogorov => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             if x.br_cmp_c(B::Lt, 1.0) {
@@ -1169,7 +1166,7 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             }
         }
         K::Levy => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             special::erfc_g((w / (c::<T>(2.0) * x)).sqrt())
@@ -1183,7 +1180,7 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             one - (a * (xm.ln() - x.ln())).exp()
         }
         K::GeneralizedPareto => {
-            if !pos {
+            if !pos() {
                 return Some(zero);
             }
             let xi = (one - one / w) * half;

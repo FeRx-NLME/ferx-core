@@ -402,7 +402,10 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     fn gamma_pq(self, x: Self, upper: bool) -> Self {
         use crate::sens::num::BranchCmp;
         // Decided on the tangents' values, not their structure: a recording does not fold
-        // every `0/x`, and a tangent that is zero by construction keeps this guard true.
+        // every `0/x`, and a tangent that is zero by construction keeps this guard true. Under
+        // a nested dual this reads each tangent's value only, which is exact while the shape
+        // `a` carries no η-direction at any order — true of every density CDF, whose shapes
+        // read θ and Ω alone.
         let a_still = self.g.iter().all(|d| d.br_cmp_c(BranchCmp::Eq, 0.0));
         if !a_still || !x.v.br_cmp_c(BranchCmp::Gt, 0.0) {
             return crate::stats::special::gamma_pq_g(self, x, upper);

@@ -447,7 +447,10 @@ impl<'a> LikCtx<'a> {
 
     /// A density group's `(½∇c, ½∇²c)` at `eta` (#1716): its share of `∇l` and of the
     /// prior curvature in `H̃`. `None` for a Gaussian model.
-    fn density_half_jets<T: PkNum>(&self, eta: &[T], p: &ParT<T>) -> Option<(Vec<T>, Vec<Vec<T>>)> {
+    /// `hessian = false` leaves the curvature empty (the inner gradient reads `½∇c` only).
+    fn density_half_jets<T: PkNum>(
+        &self, eta: &[T], p: &ParT<T>, hessian: bool,
+    ) -> Option<(Vec<T>, Vec<Vec<T>>)> {
         if self.densities.is_empty() {
             return None;
         }
@@ -457,10 +460,10 @@ impl<'a> LikCtx<'a> {
             eta,
             |a, b| oi[a][b],
             |k| p.theta[k],
-            true,
+            hessian,
         );
         let half = T::from_f64(0.5);
-        let h = h.expect("requested");
+        let h = h.unwrap_or_default();
         Some((
             g.iter().map(|&x| half * x).collect(),
             h.iter().map(|r| r.iter().map(|&x| half * x).collect()).collect(),
@@ -902,7 +905,7 @@ fn focei_rows<T: PkNum, const K: usize>(
         }
     }
     // A density group's prior curvature `½∇²c` beside `Ω⁻¹`, and its `½∇c` (#1716).
-    let density = ctx.density_half_jets(eta, p);
+    let density = ctx.density_half_jets(eta, p, true);
     if let Some((_, dh)) = &density {
         add_into(&mut ht, dh);
     }
@@ -1183,7 +1186,7 @@ fn focei_f_dense<T: PkNum>(
             ht[a][b] = ht[a][b] + hrh + if interaction { c(0.5) * bab } else { c(0.0) };
         }
     }
-    if let Some((_, dh)) = ctx.density_half_jets(eta, p) {
+    if let Some((_, dh)) = ctx.density_half_jets(eta, p, true) {
         add_into(&mut ht, &dh);
     }
     let ld = chol(&ht).map(|l| chol_logdet(&l))?;
@@ -1486,7 +1489,7 @@ pub(crate) fn inner_grad<T: PkNum>(
             }
         }
     }
-    let density = ctx.density_half_jets(eta, p);
+    let density = ctx.density_half_jets(eta, p, false);
     let grad = assemble_grad(
         p.omega_inv(eta.len()),
         eta,
