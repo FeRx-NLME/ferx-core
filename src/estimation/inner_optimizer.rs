@@ -43,11 +43,7 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     // Non-log-normal ETA: additive (`tv + eta`), logit (`inv_logit(... + eta)`),
     // logit-probability, or custom/unrecognised. The kernels apply `exp(eta)`
     // unconditionally and ignore `EtaParamType`.
-    if model
-        .eta_param_info
-        .iter()
-        .any(|e| e.param_type != EtaParamType::LogNormal)
-    {
+    if model.eta_param_info.iter().any(|e| e.param_type != EtaParamType::LogNormal) {
         return Some("non-log-normal ETA parameterisation");
     }
     // Log-transform-both-sides (`log_additive`, `log(DV) ~ ...`). The `+100`
@@ -108,8 +104,7 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
 }
 
 pub(crate) fn resolve_gradient_method(
-    model: &CompiledModel,
-    subject: &Subject,
+    model: &CompiledModel, subject: &Subject,
 ) -> InnerGradientMethod {
     if analytic_inner_grad_supported(model, subject) {
         InnerGradientMethod::Analytic
@@ -131,9 +126,7 @@ pub(crate) fn resolve_gradient_method(
 /// request) — the banner should report what the user asked for, not the
 /// post-compatibility value.
 pub(crate) fn gradient_route_summary(
-    model: &CompiledModel,
-    population: &Population,
-    requested: GradientMethod,
+    model: &CompiledModel, population: &Population, requested: GradientMethod,
 ) -> String {
     let (mut analytic, mut fd) = (0usize, 0usize);
     for subject in &population.subjects {
@@ -148,18 +141,10 @@ pub(crate) fn gradient_route_summary(
     let mut parts: Vec<String> = Vec::new();
     for (count, label) in [(analytic, "analytic"), (fd, "FD")] {
         if count > 0 {
-            parts.push(if mixed {
-                format!("{label} ×{count}")
-            } else {
-                label.to_string()
-            });
+            parts.push(if mixed { format!("{label} ×{count}") } else { label.to_string() });
         }
     }
-    let resolved = if parts.is_empty() {
-        "n/a".to_string()
-    } else {
-        parts.join(", ")
-    };
+    let resolved = if parts.is_empty() { "n/a".to_string() } else { parts.join(", ") };
 
     let requested_label = match requested {
         GradientMethod::Auto => "auto",
@@ -171,9 +156,7 @@ pub(crate) fn gradient_route_summary(
 }
 
 fn resolve_gradient_method_for_reporting(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64],
 ) -> InnerGradientMethod {
     if model.n_kappa == 0 {
         return resolve_gradient_method(model, subject);
@@ -186,9 +169,7 @@ fn resolve_gradient_method_for_reporting(
 }
 
 pub(crate) fn iov_inner_subject_route(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
     // The search's own rule (`analytic_iov_inner_supported`): an endpoint term the exact
     // programs serve folds into the BSV block, so such a subject is not an FD one.
@@ -281,9 +262,7 @@ pub(crate) fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'stati
 /// coarse model-level [`resolve_gradient_method`] does not.
 #[cfg(test)]
 pub(crate) fn fd_fallback_warning(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Option<String> {
     fd_fallback_warning_skipping(model, population, theta, false)
 }
@@ -292,10 +271,7 @@ pub(crate) fn fd_fallback_warning(
 /// (`refused_skipped`, [`InnerSolvePolicy::skip_refused`]): that subject runs no gradient, so it
 /// is not counted as finite-difference.
 pub(crate) fn fd_fallback_warning_skipping(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    refused_skipped: bool,
+    model: &CompiledModel, population: &Population, theta: &[f64], refused_skipped: bool,
 ) -> Option<String> {
     if model.n_kappa != 0 {
         return iov_fd_fallback_warning(model, population, theta, refused_skipped);
@@ -379,10 +355,7 @@ enum InnerFdReason {
 
 /// [`subject_inner_runs_fd`] with the cause, for [`fd_fallback_warning`]'s message.
 fn subject_inner_fd_reason(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<InnerFdReason> {
     // `non_gaussian_eta_grad_served`, not `analytic_inner_grad_supported`: a subject whose
     // records are all served but whose model bails for another reason is a shape decline.
@@ -403,10 +376,7 @@ fn subject_inner_fd_reason(
 /// endpoint term; an endpoint-only model has no structural model to record), where the
 /// recorder probe alone had counted every such subject as FD.
 fn subject_inner_runs_fd(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> bool {
     if subject_has_survival_records(subject) {
         if !analytic_inner_grad_supported(model, subject) {
@@ -426,10 +396,7 @@ fn subject_inner_runs_fd(
 }
 
 fn iov_fd_fallback_warning(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    refused_skipped: bool,
+    model: &CompiledModel, population: &Population, theta: &[f64], refused_skipped: bool,
 ) -> Option<String> {
     let n_total = population.subjects.len();
     let mut n_fd = 0usize;
@@ -508,9 +475,7 @@ impl GradientTimings {
     /// atomics per gradient call are not free on a fit that never prints them.
     #[inline]
     pub(crate) fn start(&self) -> Option<std::time::Instant> {
-        self.on
-            .load(Ordering::Relaxed)
-            .then(std::time::Instant::now)
+        self.on.load(Ordering::Relaxed).then(std::time::Instant::now)
     }
     const fn new() -> Self {
         Self {
@@ -529,29 +494,25 @@ impl GradientTimings {
     fn record_analytic(&self, t0: Option<std::time::Instant>) {
         let Some(t0) = t0 else { return };
         self.analytic_calls.fetch_add(1, Ordering::Relaxed);
-        self.analytic_nanos
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.analytic_nanos.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     #[inline]
     fn record_fd(&self, t0: Option<std::time::Instant>) {
         let Some(t0) = t0 else { return };
         self.fd_calls.fetch_add(1, Ordering::Relaxed);
-        self.fd_nanos
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.fd_nanos.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     #[inline]
     fn record_jac_analytic(&self, t0: Option<std::time::Instant>) {
         let Some(t0) = t0 else { return };
         self.jac_analytic_calls.fetch_add(1, Ordering::Relaxed);
-        self.jac_analytic_nanos
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.jac_analytic_nanos.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     #[inline]
     fn record_jac_fd(&self, t0: Option<std::time::Instant>) {
         let Some(t0) = t0 else { return };
         self.jac_fd_calls.fetch_add(1, Ordering::Relaxed);
-        self.jac_fd_nanos
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.jac_fd_nanos.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     pub(crate) fn reset(&self) {
         self.analytic_calls.store(0, Ordering::Relaxed);
@@ -750,11 +711,7 @@ fn analytic_inner_seed_hessian(
                 }
                 // Same rule as the ordinary gradient: a CENS flag is a censored kernel
                 // only under `bloq_method = m3`; otherwise the row scores Gaussian.
-                let cens = if m3 {
-                    subject.cens.get(j).copied().unwrap_or(0)
-                } else {
-                    0
-                };
+                let cens = if m3 { subject.cens.get(j).copied().unwrap_or(0) } else { 0 };
                 let Some((coef, _, coef_p)) = residual_inner_obs(
                     model,
                     err_keys[j],
@@ -851,10 +808,7 @@ fn analytic_inner_seed_hessian(
 /// FD sweep includes, and the objective-only Laplace path would minimise a `½log|H|` that
 /// disagrees with the reported one.
 pub(crate) fn analytic_terminal_work(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta: &[f64],
 ) -> Option<(DMatrix<f64>, DMatrix<f64>)> {
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
         return None;
@@ -880,9 +834,7 @@ pub(crate) fn analytic_terminal_work(
 fn terminal_hessian_reuse_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("FERX_NO_TERMINAL_HESSIAN_REUSE")
-            .map(|v| v != "1")
-            .unwrap_or(true)
+        std::env::var("FERX_NO_TERMINAL_HESSIAN_REUSE").map(|v| v != "1").unwrap_or(true)
     })
 }
 
@@ -918,9 +870,7 @@ impl InnerHessianSeed {
     pub(crate) fn for_options(options: &crate::types::FitOptions) -> Self {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| {
-            std::env::var("FERX_NO_INNER_HESSIAN_SEED")
-                .map(|v| v != "1")
-                .unwrap_or(true)
+            std::env::var("FERX_NO_INNER_HESSIAN_SEED").map(|v| v != "1").unwrap_or(true)
         });
         if !enabled {
             return Self::None;
@@ -979,9 +929,7 @@ impl EbeVariance {
     /// Additive error is `Conditional`: its variance is constant in `f`, so the two
     /// conventions are the same objective and the conditional path stays bit-identical.
     pub(crate) fn for_stage(
-        method: crate::types::EstimationMethod,
-        interaction: bool,
-        n_agq: usize,
+        method: crate::types::EstimationMethod, interaction: bool, n_agq: usize,
         model: &CompiledModel,
     ) -> Self {
         let sheiner_beal =
@@ -1184,10 +1132,7 @@ pub struct InnerLoopStats {
 /// force. Returns plain zeros for a non-FREM model, so every non-FREM caller is
 /// bit-identical.
 fn cold_eta_seed(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    n_eta: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, n_eta: usize,
 ) -> Vec<f64> {
     let mut eta = vec![0.0; n_eta];
     if let Some(fc) = model.frem_config.as_ref() {
@@ -1298,10 +1243,7 @@ impl FallbackCertifier<'_> {
     /// re-centring arm and both runaway-EBE guards recover through this, so no Nelder–Mead
     /// end point reaches a caller with the simplex spread as its certificate.
     fn nelder_mead_recover(
-        &self,
-        obj: &dyn Fn(&[f64]) -> f64,
-        seed: Vec<f64>,
-        admissible: &dyn Fn(&[f64]) -> bool,
+        &self, obj: &dyn Fn(&[f64]) -> f64, seed: Vec<f64>, admissible: &dyn Fn(&[f64]) -> bool,
     ) -> (Vec<f64>, bool) {
         #[cfg(test)]
         NM_FALLBACKS.with(|c| c.set(c.get() + 1));
@@ -1348,9 +1290,7 @@ impl FallbackCertifier<'_> {
     /// fired: the Newton test takes steps too, so "certified by Newton" does not mean
     /// "unmoved".
     pub(crate) fn certify_moved(
-        &self,
-        obj: &dyn Fn(&[f64]) -> f64,
-        x: &mut Vec<f64>,
+        &self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>,
     ) -> Option<Certified> {
         let start: Vec<u64> = x.iter().map(|v| v.to_bits()).collect();
         self.certify(obj, x).then(|| {
@@ -1367,10 +1307,7 @@ impl FallbackCertifier<'_> {
     /// gradient there may not be trustworthy, so a gradient polish that marches back past the
     /// runaway limit must not be the point it returns.
     fn certify_within(
-        &self,
-        obj: &dyn Fn(&[f64]) -> f64,
-        x: &mut Vec<f64>,
-        admissible: &dyn Fn(&[f64]) -> bool,
+        &self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>, admissible: &dyn Fn(&[f64]) -> bool,
     ) -> bool {
         if !x.iter().all(|v| v.is_finite()) {
             return false;
@@ -1450,10 +1387,7 @@ impl FallbackCertifier<'_> {
     /// converges quadratically from there, so the requested `tol` is met wherever the
     /// objective can resolve it, and the resolution arm still certifies the rest.
     fn newton_certifies(
-        &self,
-        obj: &dyn Fn(&[f64]) -> f64,
-        x: &mut Vec<f64>,
-        g: &[f64],
+        &self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>, g: &[f64],
         admissible: &dyn Fn(&[f64]) -> bool,
     ) -> bool {
         let n = x.len();
@@ -1606,10 +1540,7 @@ const NEWTON_CERT_FD_STEP: f64 = 1e-5;
 /// with the partial's point"), and an NM flag certifies an objective spread, not a mode.
 /// A non-finite `obj(partial)` (NaN/∞) makes the partial unusable so the NM result is taken.
 fn argmin_inner_fallback(
-    obj: &dyn Fn(&[f64]) -> f64,
-    partial: &[f64],
-    cold_seed: &[f64],
-    cert: &FallbackCertifier,
+    obj: &dyn Fn(&[f64]) -> f64, partial: &[f64], cold_seed: &[f64], cert: &FallbackCertifier,
 ) -> (Vec<f64>, bool) {
     #[cfg(test)]
     NM_FALLBACKS.with(|c| c.set(c.get() + 1));
@@ -1617,11 +1548,7 @@ fn argmin_inner_fallback(
     let partial_f = obj(partial);
     let partial_usable = partial_f.is_finite();
     let warm = ebe_warm_start_enabled() && partial_usable;
-    let mut eta_nm = if warm {
-        partial.to_vec()
-    } else {
-        cold_seed.to_vec()
-    };
+    let mut eta_nm = if warm { partial.to_vec() } else { cold_seed.to_vec() };
     // NM's own `frange < tol` exit is its stopping rule only; certification is below.
     nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
     let f_nm = obj(&eta_nm);
@@ -1692,10 +1619,7 @@ pub(crate) static STUCK_CERTIFIED: std::sync::atomic::AtomicUsize =
 /// profile's adjoint level gradient (`profile::off_mode`), whose error there the resolution
 /// arm bounds. `used_fallback` stays false: no restart ran.
 fn certified_stuck_partial(
-    exit: InnerExit,
-    cert: &FallbackCertifier,
-    obj: &dyn Fn(&[f64]) -> f64,
-    x: &mut Vec<f64>,
+    exit: InnerExit, cert: &FallbackCertifier, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>,
 ) -> bool {
     #[cfg(test)]
     if STUCK_PARTIAL_CERT_OFF.with(|o| o.get()) {
@@ -1822,10 +1746,7 @@ fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
 /// which is the whole point.
 #[cfg(test)]
 fn inner_stall_enabled_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> bool {
     EvalRoute::at(model, subject, theta, eta).ode
 }
@@ -1848,6 +1769,12 @@ struct EvalRoute {
 
 #[cfg(test)]
 thread_local! {
+    /// Fused IOV gradient-pass values put into the IOV EBE search's objective memo (#3088).
+    pub(crate) static IOV_MEMO_FUSED_PUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// The points [`EvalRoute::at`] decided on this thread, in order (a test asserts the solve
     /// asks once per point, not once per consumer).
     pub(crate) static EVAL_ROUTE_LOG: RefCell<Vec<Vec<u64>>> = const { RefCell::new(Vec::new()) };
@@ -1856,10 +1783,7 @@ thread_local! {
 impl EvalRoute {
     fn at(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) -> Self {
         #[cfg(test)]
-        EVAL_ROUTE_LOG.with(|l| {
-            l.borrow_mut()
-                .push(eta.iter().map(|v| v.to_bits()).collect())
-        });
+        EVAL_ROUTE_LOG.with(|l| l.borrow_mut().push(eta.iter().map(|v| v.to_bits()).collect()));
         let eff = crate::pk::effective_model_for_eval(model, subject, theta, eta);
         let ode = eff.ode_spec.is_some();
         EvalRoute {
@@ -1884,15 +1808,27 @@ impl EvalRoute {
 /// Identical to `effective_for` for every subject the walk cannot take
 /// (`effective_model_for_eval_iov` returns `effective_for` for them), so only a walk-eligible
 /// transit/IG subject changes behaviour.
+#[cfg(test)]
 fn inner_stall_enabled_at_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    stacked_eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
 ) -> bool {
-    crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta)
-        .ode_spec
-        .is_some()
+    iov_eval_route(model, subject, theta, stacked_eta).0
+}
+
+/// `(ode, fused_native)` at one IOV iterate ([`iov_eval_route`]).
+type IovRoute = (bool, bool);
+
+/// The IOV inner solve's route at one stacked iterate `[η_bsv, κ_g0.., κ_g1..]` (η in true
+/// space): `(ode, fused_native)`. `ode` is [`inner_stall_enabled_at_iov`]'s predicate; `fused_native`
+/// whether the fused gradient pass's value is bit-equal to the native objective there — the
+/// model actually evaluated is closed form and one the plan scores bit-equal
+/// ([`crate::stats::likelihood::plan_value_bit_equal`]), as [`EvalRoute`] without IOV.
+fn iov_eval_route(
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
+) -> IovRoute {
+    let eff = crate::pk::effective_model_for_eval_iov(model, subject, theta, stacked_eta);
+    let ode = eff.ode_spec.is_some();
+    (ode, !ode && crate::stats::likelihood::plan_value_bit_equal(eff))
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -1935,8 +1871,7 @@ fn inner_stall_enabled_at_iov(
 /// ([`crate::estimation::agq`]), which both hold `eta` variable over one subject — so the
 /// staleness rules above cannot drift between them.
 pub(crate) fn cacheable_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
+    model: &CompiledModel, subject: &Subject,
 ) -> Option<pk::event_driven::EventSchedule> {
     ((subject.has_tv_covariates() || subject.has_resets() || pk::model_uses_time_anywhere(model))
         && schedule_stays_fresh(model, subject))
@@ -1948,8 +1883,7 @@ pub(crate) fn cacheable_schedule(
 /// funnel (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside
 /// every objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
 pub(crate) fn cacheable_schedule_iov(
-    model: &CompiledModel,
-    subject: &Subject,
+    model: &CompiledModel, subject: &Subject,
 ) -> Option<pk::event_driven::EventSchedule> {
     schedule_stays_fresh(model, subject).then(|| subject_schedule(model, subject))
 }
@@ -1958,17 +1892,11 @@ pub(crate) fn cacheable_schedule_iov(
 /// ([`kernel_jit::prepared`](crate::parser::model_parser::rhs_regcode::kernel_jit::prepared)): it
 /// is a function of the subject and the model's identity alone.
 pub(crate) fn cacheable_schedule_iov_cached(
-    model: &CompiledModel,
-    subject: &Subject,
+    model: &CompiledModel, subject: &Subject,
 ) -> std::sync::Arc<Option<pk::event_driven::EventSchedule>> {
     crate::parser::model_parser::rhs_regcode::kernel_jit::prepared(
         subject,
-        (
-            "iov-schedule",
-            model.n_eta,
-            model.n_kappa,
-            model.plan_id.get(),
-        ),
+        ("iov-schedule", model.n_eta, model.n_kappa, model.plan_id.get()),
         || cacheable_schedule_iov(model, subject),
     )
 }
@@ -2022,11 +1950,7 @@ fn subject_schedule(model: &CompiledModel, subject: &Subject) -> pk::event_drive
 ///
 /// Cost: two `obj` evaluations per non-fixed coordinate, on the cold start only.
 fn weakly_identified_coords(
-    obj: &dyn Fn(&[f64]) -> f64,
-    eta: &[f64],
-    nll: f64,
-    omega: &OmegaMatrix,
-    n_eta: usize,
+    obj: &dyn Fn(&[f64]) -> f64, eta: &[f64], nll: f64, omega: &OmegaMatrix, n_eta: usize,
 ) -> Vec<bool> {
     weakly_identified_axes(obj, eta, nll, &omega_prior_diag(omega, n_eta))
 }
@@ -2040,33 +1964,20 @@ struct AxisPrior {
 
 /// The first `n` coordinates' priors under `omega`.
 fn omega_prior_diag(omega: &OmegaMatrix, n: usize) -> Vec<AxisPrior> {
-    (0..n)
-        .map(|i| AxisPrior {
-            var: omega.matrix[(i, i)],
-            inv: omega.inv[(i, i)],
-        })
-        .collect()
+    (0..n).map(|i| AxisPrior { var: omega.matrix[(i, i)], inv: omega.inv[(i, i)] }).collect()
 }
 
 /// The priors of the IOV inner loop's flat vector, in its order: `Ω` for the BSV block, then
 /// `Ω_iov` for each occasion's κ, or for each group of each level under nested levels
 /// (#1082). A model with no `omega_iov` has no κ prior, so its κ coordinates read as fixed.
 fn iov_prior_diag(
-    n_eta: usize,
-    n_kappa: usize,
-    k_occasions: usize,
-    nested: Option<&crate::stats::nested_levels::NestedLayout>,
-    params: &ModelParameters,
+    n_eta: usize, n_kappa: usize, k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>, params: &ModelParameters,
 ) -> Vec<AxisPrior> {
-    let n_flat = nested.map_or(stacked_width(n_eta, n_kappa, k_occasions), |n| {
-        n.n_compact()
-    });
+    let n_flat = nested.map_or(stacked_width(n_eta, n_kappa, k_occasions), |n| n.n_compact());
     let mut out = omega_prior_diag(&params.omega, n_eta);
     if let Some(oi) = params.omega_iov.as_ref() {
-        let of = |k: usize| AxisPrior {
-            var: oi.matrix[(k, k)],
-            inv: oi.inv[(k, k)],
-        };
+        let of = |k: usize| AxisPrior { var: oi.matrix[(k, k)], inv: oi.inv[(k, k)] };
         match nested {
             Some(n) => {
                 for (l, _) in n.blocks(&vec![0.0; n_flat]) {
@@ -2076,13 +1987,7 @@ fn iov_prior_diag(
             None => (0..k_occasions).for_each(|_| out.extend((0..n_kappa).map(of))),
         }
     }
-    out.resize(
-        n_flat,
-        AxisPrior {
-            var: 0.0,
-            inv: f64::INFINITY,
-        },
-    );
+    out.resize(n_flat, AxisPrior { var: 0.0, inv: f64::INFINITY });
     out
 }
 
@@ -2113,11 +2018,7 @@ fn section_has_barrier(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], seed: &[f64]) -> 
 /// are bit-identical. The IOV scan passes the BSV Ω, which covers the leading η block of its
 /// flat vector: a κ coordinate (past `Ω`'s rows) is neither shifted nor shifts anything.
 fn axis_seed_starts(
-    base: &[f64],
-    centre: &[f64],
-    scan: &[bool],
-    sd: &[f64],
-    restarts: usize,
+    base: &[f64], centre: &[f64], scan: &[bool], sd: &[f64], restarts: usize,
     omega: Option<&DMatrix<f64>>,
 ) -> Vec<Vec<f64>> {
     let mut starts = Vec::new();
@@ -2148,10 +2049,7 @@ fn axis_seed_starts(
 /// [`weakly_identified_coords`] over any search vector, each coordinate against its own
 /// [`AxisPrior`].
 fn weakly_identified_axes(
-    obj: &dyn Fn(&[f64]) -> f64,
-    eta: &[f64],
-    nll: f64,
-    prior: &[AxisPrior],
+    obj: &dyn Fn(&[f64]) -> f64, eta: &[f64], nll: f64, prior: &[AxisPrior],
 ) -> Vec<bool> {
     // Prior variances below this are effectively fixed effects. `from_matrix`
     // floors a zero-variance diagonal to a 1e-8 eigenvalue (it must stay PD for
@@ -2196,14 +2094,8 @@ fn weakly_identified_axes(
 }
 
 pub fn find_ebe(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
 ) -> EbeResult {
     let schedule = cacheable_schedule(model, subject);
     find_ebe_impl(
@@ -2226,15 +2118,8 @@ pub fn find_ebe(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_with_variance(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    ebe_variance: EbeVariance,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize, ebe_variance: EbeVariance,
 ) -> EbeResult {
     let schedule = cacheable_schedule(model, subject);
     find_ebe_impl(
@@ -2247,10 +2132,7 @@ pub(crate) fn find_ebe_with_variance(
         mu_k,
         restarts,
         schedule.as_ref(),
-        InnerSolvePolicy {
-            ebe_variance,
-            ..InnerSolvePolicy::default()
-        },
+        InnerSolvePolicy { ebe_variance, ..InnerSolvePolicy::default() },
     )
 }
 
@@ -2265,14 +2147,8 @@ pub(crate) fn find_ebe_with_variance(
 /// found it. Every production caller uses this, so neither is a value a call site picks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_for_stage(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
     stage: &crate::types::FitOptions,
 ) -> EbeResult {
     find_ebe_for_stage_with_prev(
@@ -2294,16 +2170,9 @@ pub(crate) fn find_ebe_for_stage(
 /// exactly-zero one is not re-solved as a cold start.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_for_stage_with_prev(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    stage: &crate::types::FitOptions,
-    prev: PrevEtas,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
+    stage: &crate::types::FitOptions, prev: PrevEtas,
 ) -> EbeResult {
     let schedule = cacheable_schedule(model, subject);
     find_ebe_impl(
@@ -2339,16 +2208,9 @@ pub(crate) fn find_ebe_for_stage_with_prev(
 /// [`build_schedule_cache`] and passes each subject's entry here instead of paying the merged
 /// dose/event-timeline rebuild on every one of those calls.
 pub(crate) fn find_ebe_cached(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    policy: InnerSolvePolicy,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>, policy: InnerSolvePolicy,
 ) -> EbeResult {
     find_ebe_cached_from(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
@@ -2390,16 +2252,9 @@ impl<'a> PredictedFromAll<'a> {
 /// finite start costs nothing extra and is solved bit for bit as without a fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_ebe_cached_from(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    policy: InnerSolvePolicy,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>, policy: InnerSolvePolicy,
     predicted_from: Option<PredictedFrom<'_>>,
 ) -> EbeResult {
     #[cfg(test)]
@@ -2560,6 +2415,9 @@ pub(crate) struct InnerRecording {
     pub(crate) passes: Vec<PassRecord>,
     /// Every warm-start prediction the outer loop handed a pass (#2549).
     pub(crate) predictions: Vec<PredictionRecord>,
+    /// Every terminal η-Jacobian [`ebe_h_matrix`] recorded afresh on the analytic route (no
+    /// held or captured rows to reuse): its subject.
+    pub(crate) fresh_jacobians: Vec<String>,
     n_passes: usize,
     current_pass: Option<usize>,
 }
@@ -2579,10 +2437,7 @@ pub(crate) struct PredictionRecord {
 /// Record a prediction for the next pass of the recording on this thread, if any.
 #[cfg(test)]
 pub(crate) fn record_prediction(
-    modes: &[DVector<f64>],
-    jac: &[Vec<DVector<f64>>],
-    anchor: &[f64],
-    x: &[f64],
+    modes: &[DVector<f64>], jac: &[Vec<DVector<f64>>], anchor: &[f64], x: &[f64],
 ) {
     with_recording(|r| {
         let pass = r.n_passes;
@@ -2635,8 +2490,7 @@ pub(crate) fn recording_handle() -> Option<RecordingHandle> {
 /// cannot leave its handle armed there (#2379).
 #[cfg(test)]
 pub(crate) fn with_recording_handle<R>(
-    handle: Option<RecordingHandle>,
-    f: impl FnOnce() -> R,
+    handle: Option<RecordingHandle>, f: impl FnOnce() -> R,
 ) -> R {
     struct Restore(Option<RecordingHandle>);
     impl Drop for Restore {
@@ -2705,14 +2559,9 @@ thread_local! {
 /// is fit-invariant (see [`cacheable_schedule`]'s own doc for the staleness analysis), so
 /// building it once here instead of once per `find_ebe` call is always sound.
 pub(crate) fn build_schedule_cache(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Option<pk::event_driven::EventSchedule>> {
-    population
-        .subjects
-        .iter()
-        .map(|subject| cacheable_schedule(model, subject))
-        .collect()
+    population.subjects.iter().map(|subject| cacheable_schedule(model, subject)).collect()
 }
 
 /// `policy.capture_terminal_hessian` asks for `EbeResult::terminal_hessian` — the exact
@@ -2721,16 +2570,9 @@ pub(crate) fn build_schedule_cache(
 /// (see `outer_optimizer::run_inner_loop_and_nll_prepared`); every other caller leaves it off.
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_impl(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    policy: InnerSolvePolicy,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>, policy: InnerSolvePolicy,
 ) -> EbeResult {
     find_ebe_impl_from(
         model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy, None,
@@ -2740,16 +2582,9 @@ fn find_ebe_impl(
 /// [`find_ebe_impl`] with a fallback for a predicted start ([`find_ebe_cached_from`]).
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_impl_from(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    policy: InnerSolvePolicy,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>, policy: InnerSolvePolicy,
     predicted_from: Option<PredictedFrom<'_>>,
 ) -> EbeResult {
     if inner_profile_enabled() {
@@ -2801,11 +2636,7 @@ fn find_ebe_impl_from(
             restarts,
             policy.ebe_variance,
             policy.init_is_mode,
-            if policy.unseeded_iov_warm {
-                InnerHessianSeed::None
-            } else {
-                policy.seed
-            },
+            if policy.unseeded_iov_warm { InnerHessianSeed::None } else { policy.seed },
         );
         #[cfg(test)]
         with_recording(|r| {
@@ -2965,11 +2796,8 @@ fn find_ebe_solve(
     // (issue #406). For general FOCE/FOCEI fits the stop test stays raw L2, so the
     // converged EBE — and the estimates — are independent of H0: preconditioning
     // changes only the path to the mode, not the mode itself.
-    let stop_precond: Option<&[f64]> = if model.frem_config.is_some() {
-        precond.as_deref()
-    } else {
-        None
-    };
+    let stop_precond: Option<&[f64]> =
+        if model.frem_config.is_some() { precond.as_deref() } else { None };
 
     // Per-subject scratch buffers, built once and reused across every
     // BFGS line-search obj call and every Jacobian perturbation. The
@@ -3076,11 +2904,7 @@ fn find_ebe_solve(
     let memo_put = |e: &[f64], v: f64| {
         let mut m = memo.borrow_mut();
         // The evicted entry's key buffer is reused for the new one (#2549 W1).
-        let mut key = if m.len() == OBJ_MEMO {
-            m.remove(0).0
-        } else {
-            Vec::with_capacity(e.len())
-        };
+        let mut key = if m.len() == OBJ_MEMO { m.remove(0).0 } else { Vec::with_capacity(e.len()) };
         key.clear();
         key.extend(e.iter().map(|x| x.to_bits()));
         m.push((key, v));
@@ -3142,9 +2966,7 @@ fn find_ebe_solve(
             eta: DVector::zeros(0),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), 0),
             fd_h_redone: false,
-            terminal_hessian: policy
-                .capture_terminal_hessian
-                .then(|| DMatrix::zeros(0, 0)),
+            terminal_hessian: policy.capture_terminal_hessian.then(|| DMatrix::zeros(0, 0)),
             ipreds: None,
             converged: true,
             used_fallback: false,
@@ -3372,10 +3194,9 @@ fn find_ebe_solve(
     // as the second of the two cold solves it compares. An all-zero "warm" start
     // is a cold placeholder.
     let seed_kind = policy.seed;
-    let dense_bfgs_route = !matches!(
-        inner_optimizer_mode(),
-        crate::types::InnerOptimizer::NelderMead
-    ) && !inner_use_lbfgs(n_eta);
+    let dense_bfgs_route =
+        !matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead)
+            && !inner_use_lbfgs(n_eta);
     let warm_start = policy.is_warm(eta_init);
     // Every Nelder–Mead end point below is certified on stationarity with the gradient,
     // metric and stall predicate this BFGS used — never on NM's own simplex spread (#1527).
@@ -3431,9 +3252,22 @@ fn find_ebe_solve(
             fresh
         })
         .flatten();
-    // The seed wrote its own rows into the buffer.
-    if let Some(k) = rows_at.borrow_mut().as_mut() {
-        k.clear();
+    // A seed that hands back a fused first gradient took it on the light path, whose rows in
+    // the buffer are the `exact_obs_grads_in` recording at exactly this `eta`, the one
+    // `ebe_h_matrix` would repeat. They are held for the terminal Jacobian like an analytic
+    // gradient's, so a warm solve that returns its start records the subject once, not
+    // twice. Any other seed (the carried Hessian, the full one, a light pass that declined
+    // after writing) leaves rows that are not this point's, or none: the key is cleared.
+    {
+        let fused_rows = use_analytic && matches!(seed, Some((_, Some(_))));
+        let mut held = rows_at.borrow_mut();
+        if fused_rows {
+            let key = held.get_or_insert_with(Vec::new);
+            key.clear();
+            key.extend(eta.iter().map(|v| v.to_bits()));
+        } else if let Some(k) = held.as_mut() {
+            k.clear();
+        }
     }
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
@@ -3543,11 +3377,7 @@ fn find_ebe_solve(
         (false, false)
     };
 
-    let mut ebe_exit = if bfgs_converged {
-        result
-    } else {
-        InnerExit::certified(nm_converged)
-    };
+    let mut ebe_exit = if bfgs_converged { result } else { InnerExit::certified(nm_converged) };
     let mut nll = obj(&eta);
 
     // ── Guarded multi-start inner EBE (`[fit_options] inner_restarts`) ──────
@@ -3710,10 +3540,8 @@ fn find_ebe_solve(
         } else {
             weakly_identified_coords(&obj, &eta, nll, &params.omega, n_eta)
         };
-        let sds: Vec<f64> = omega_prior_diag(&params.omega, n_eta)
-            .iter()
-            .map(|p| p.var.max(0.0).sqrt())
-            .collect();
+        let sds: Vec<f64> =
+            omega_prior_diag(&params.omega, n_eta).iter().map(|p| p.var.max(0.0).sqrt()).collect();
         let mut axis_moved = false;
         for mut cand in axis_seed_starts(
             &eta,
@@ -3826,11 +3654,7 @@ fn find_ebe_solve(
             // An empty key holds no rows (η is never empty here: the no-random-effect
             // case returned above).
             .filter(|bits| {
-                !bits.is_empty()
-                    && bits
-                        .iter()
-                        .copied()
-                        .eq(eta_true.iter().map(|v| v.to_bits()))
+                !bits.is_empty() && bits.iter().copied().eq(eta_true.iter().map(|v| v.to_bits()))
             })
             .and_then(|_| {
                 let rows = obs_grad_recycle.borrow();
@@ -3861,10 +3685,8 @@ fn find_ebe_solve(
         Some(pred_recycle.take())
     } else {
         // The last walk was another point (a finite-difference probe beside the mode).
-        let kept = best_walk
-            .take()
-            .filter(|(k, _, p)| at_mode(k) && p.len() == n_obs)
-            .map(|(_, _, p)| p);
+        let kept =
+            best_walk.take().filter(|(k, _, p)| at_mode(k) && p.len() == n_obs).map(|(_, _, p)| p);
         #[cfg(test)]
         BEST_WALK_RESTORES.with(|c| c.set(c.get() + usize::from(kept.is_some())));
         kept
@@ -3903,17 +3725,17 @@ fn find_ebe_solve(
 /// reported (#2026). A `captured_jac` is the same `∂f/∂η` out of the full sensitivity
 /// pass rather than the light one, equal to it to about one ULP, not bit for bit.
 fn ebe_h_matrix(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta: &[f64],
-    captured_jac: Option<DMatrix<f64>>,
-    pk_scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta: &[f64],
+    captured_jac: Option<DMatrix<f64>>, pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
     let n_eta = model.n_eta;
     let t_jac = GRADIENT_TIMINGS.start();
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
+        #[cfg(test)]
+        if captured_jac.is_none() {
+            with_recording(|r| r.fresh_jacobians.push(subject.id.clone()));
+        }
         match captured_jac {
             Some(jac) => Some(jac),
             None => crate::sens::ode_provider::adjoint::exact_obs_grads(
@@ -3978,11 +3800,8 @@ fn ebe_h_matrix(
 /// `kappas` is indexed like the inner loop's own (an empty slot for a subject with no
 /// occasions). A `[mixture]` fit's MIXEST H comes from its class solves, not from here.
 pub(crate) fn ebe_h_matrices_at(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    etas: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    etas: &[DVector<f64>], kappas: &[Vec<DVector<f64>>],
 ) -> Vec<DMatrix<f64>> {
     let subjects = &population.subjects;
     crate::par::map(subjects.len(), |i| {
@@ -3998,10 +3817,7 @@ fn iov_h_route(model: &CompiledModel, subject: &Subject) -> bool {
 /// One subject's `H` at its EBE, by the rule the inner loop finishes with and with no captured
 /// Jacobian. `kappas` is read on the IOV route only.
 fn ebe_h_matrix_of(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta: &[f64],
     kappas: &[DVector<f64>],
 ) -> DMatrix<f64> {
     if iov_h_route(model, subject) {
@@ -4048,15 +3864,8 @@ thread_local! {
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    ebe_variance: EbeVariance,
-    init_is_mode: bool,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, ebe_variance: EbeVariance, init_is_mode: bool,
 ) -> EbeResult {
     find_ebe_iov_seeded(
         model,
@@ -4077,17 +3886,9 @@ fn find_ebe_iov(
 /// [`InnerSolvePolicy::seed`]).
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_iov_seeded(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    eta_init: Option<&[f64]>,
-    mu_k: Option<&[f64]>,
-    restarts: usize,
-    ebe_variance: EbeVariance,
-    init_is_mode: bool,
-    seed: InnerHessianSeed,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, max_iter: usize, tol: f64,
+    eta_init: Option<&[f64]>, mu_k: Option<&[f64]>, restarts: usize, ebe_variance: EbeVariance,
+    init_is_mode: bool, seed: InnerHessianSeed,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -4111,9 +3912,7 @@ fn find_ebe_iov_seeded(
     let to_kappas = |p: &[f64]| -> Vec<Vec<f64>> {
         match &nested {
             Some(n) => n.expand(p),
-            None => (0..k_occasions)
-                .map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec())
-                .collect(),
+            None => (0..k_occasions).map(|k| p[kappa_range(n_eta, n_kappa, k)].to_vec()).collect(),
         }
     };
 
@@ -4134,9 +3933,8 @@ fn find_ebe_iov_seeded(
     );
     let nested_warm: Option<Vec<f64>> = match (&nested, eta_init) {
         (Some(n), Some(w)) if w.len() == joint_width => {
-            let cells: Vec<&[f64]> = (0..k_occasions)
-                .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
-                .collect();
+            let cells: Vec<&[f64]> =
+                (0..k_occasions).map(|k| &w[kappa_range(n_eta, n_kappa, k)]).collect();
             // `compact` refuses only cells off this layout, and the guard above makes them
             // its own by construction: both counts are `iov_occasion_groups(subject)`, and
             // `kappa_level` is parallel to `kappa_names` (#2382). Loud in debug should that
@@ -4194,13 +3992,9 @@ fn find_ebe_iov_seeded(
     let schedule_cached = cacheable_schedule_iov_cached(model, subject);
     let schedule = schedule_cached.as_ref().as_ref();
 
-    let obj = |p: &[f64]| -> f64 {
+    let obj_uncached = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
-        let eta_t: Vec<f64> = p[..n_eta]
-            .iter()
-            .zip(mu.iter())
-            .map(|(pi, mi)| pi - mi)
-            .collect();
+        let eta_t: Vec<f64> = p[..n_eta].iter().zip(mu.iter()).map(|(pi, mi)| pi - mi).collect();
         let Some(layout) = &layout else {
             return SUBJECT_SENTINEL_NLL;
         };
@@ -4222,6 +4016,31 @@ fn find_ebe_iov_seeded(
             schedule,
             frozen,
         )
+    };
+    // The objective memo of `find_ebe_solve` (#3088): the native values the search scored, and
+    // the values the gradient pass scored with them where those are bit-equal to the native
+    // objective (`route_at(..).1` below), so the line search's `obj(x)` after a `grad(x)` is a
+    // lookup instead of a second walk of the subject.
+    let memo: RefCell<Vec<(Vec<u64>, f64)>> = RefCell::new(Vec::with_capacity(OBJ_MEMO));
+    let memo_get = |p: &[f64]| -> Option<f64> {
+        memo.borrow().iter().find_map(|(k, v)| {
+            (k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
+        })
+    };
+    let memo_put = |p: &[f64], v: f64| {
+        let mut m = memo.borrow_mut();
+        let mut key = if m.len() == OBJ_MEMO { m.remove(0).0 } else { Vec::with_capacity(p.len()) };
+        key.clear();
+        key.extend(p.iter().map(|x| x.to_bits()));
+        m.push((key, v));
+    };
+    let obj = |p: &[f64]| -> f64 {
+        if let Some(v) = memo_get(p) {
+            return v;
+        }
+        let v = obj_uncached(p);
+        memo_put(p, v);
+        v
     };
 
     // IOV models are not FREM, so no inner preconditioner (identity H0). Use the exact
@@ -4260,7 +4079,17 @@ fn find_ebe_iov_seeded(
     // cannot serve at this iterate, whose objective is evaluated on the ODE twin (#719/#814,
     // #1560). Evaluated per iterate and latched in the cores: κ moves the walk's per-pair
     // flip-flop domain. See `inner_stall_enabled_at_iov`.
-    let stall_at = |p: &[f64]| {
+    //
+    // One decision per evaluated point ([`iov_eval_route`]), shared by the stall stop and the
+    // fused-value checks, as `find_ebe_solve`'s `route_at`.
+    let route_cache: RefCell<Option<(Vec<u64>, IovRoute)>> = RefCell::new(None);
+    let route_at = |p: &[f64]| -> IovRoute {
+        let mut c = route_cache.borrow_mut();
+        let same =
+            |k: &[u64]| k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits());
+        if let Some((_, r)) = c.as_ref().filter(|(k, _)| same(k)) {
+            return *r;
+        }
         let mut stacked_true = p.to_vec();
         for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
             *st = p[k] - mu[k];
@@ -4270,11 +4099,17 @@ fn find_ebe_iov_seeded(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        inner_stall_enabled_at_iov(model, subject, &params.theta, &stacked_true)
+        let r = iov_eval_route(model, subject, &params.theta, &stacked_true);
+        *c = Some((p.iter().map(|v| v.to_bits()).collect(), r));
+        r
     };
+    let stall_at = |p: &[f64]| route_at(p).0;
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    // The recording's row buffer, reused by every analytic gradient of this search
+    // (#3088), as `find_ebe_solve`'s `obs_grad_recycle`.
+    let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
@@ -4303,7 +4138,21 @@ fn find_ebe_iov_seeded(
             frozen,
         )
     };
+    // The gradient a fused trial ([`PrimeFn`]) took at the exact bits of its point.
+    let primed: RefCell<Option<(Vec<u64>, Vec<f64>)>> = RefCell::new(None);
+    // The gradient pass scores its value against the declared residual correlation; the
+    // objective above scores the live ρ (#847), so the value is asked for only where neither
+    // is dense (the pass's own scope covers the declared one).
+    let want_value = !model.residual_cov_at(params).is_dense();
     let agrad = |p: &[f64]| -> Vec<f64> {
+        {
+            let mut held = primed.borrow_mut();
+            if held.as_ref().is_some_and(|(k, _)| {
+                k.len() == p.len() && k.iter().zip(p).all(|(&b, &x)| b == x.to_bits())
+            }) {
+                return held.take().map(|(_, g)| g).unwrap_or_default();
+            }
+        }
         if !analytic_iov_inner {
             // The kernel's exact gradient where it serves the subject, a cross-row
             // (dense) IOV residual included (#1082 PR5, #2101); central differences else.
@@ -4339,7 +4188,8 @@ fn find_ebe_iov_seeded(
             stacked_true.truncate(n_eta);
             stacked_true.extend(to_kappas(p).into_iter().flatten());
         }
-        match analytic_eta_nll_gradient_iov_frozen(
+        let mut fused_value = None::<f64>;
+        match analytic_eta_nll_value_gradient_iov_frozen(
             model,
             subject,
             layout,
@@ -4350,8 +4200,18 @@ fn find_ebe_iov_seeded(
             &params.sigma.values,
             mult.as_deref(),
             frozen,
+            &mut obs_grad_recycle.borrow_mut(),
+            want_value.then_some(&mut fused_value),
         ) {
             Some(g) => {
+                // The objective's value at `p` from the pass that just took its gradient, where
+                // it is the native value bit for bit (`route_at`): the search's next `obj(p)` is
+                // a memo hit instead of a second walk (#3088).
+                if let Some(v) = fused_value.filter(|_| route_at(p).1) {
+                    #[cfg(test)]
+                    IOV_MEMO_FUSED_PUTS.with(|c| c.set(c.get() + 1));
+                    memo_put(p, v);
+                }
                 #[cfg(test)]
                 IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                 g
@@ -4394,9 +4254,8 @@ fn find_ebe_iov_seeded(
             start_nll = kappa_free_nll;
         }
     }
-    let has_informative_warm_start = eta_init
-        .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
-        .unwrap_or(false);
+    let has_informative_warm_start =
+        eta_init.map(|warm| warm.iter().any(|v| v.abs() > 1e-8)).unwrap_or(false);
     // A certified start (`InnerSolvePolicy::init_is_mode`, the pre-flight EBEs handed to the
     // first outer evaluation since #2202) is not a stale warm start, whatever its NLL. On an
     // IOV subject it is the pre-flight's whole mode (η̂, κ̂) at these `params` (#2217), so
@@ -4407,15 +4266,9 @@ fn find_ebe_iov_seeded(
         && !init_is_mode
         && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
     {
-        let bsv_eta: Vec<f64> = x[..n_eta]
-            .iter()
-            .zip(mu.iter())
-            .map(|(p, m)| p - m)
-            .collect();
-        let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
-            .iter()
-            .map(|k| DVector::from_column_slice(k))
-            .collect();
+        let bsv_eta: Vec<f64> = x[..n_eta].iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
+        let kappas_vec: Vec<DVector<f64>> =
+            to_kappas(&x).iter().map(|k| DVector::from_column_slice(k)).collect();
         // Degenerate placeholder: the η/κ here are the (un-optimized) warm start and the
         // H-matrix is zero — folding them into an OFV would corrupt the FOCEI curvature
         // term. `hard_reject` makes the outer guard reject the whole trial rather than
@@ -4454,18 +4307,11 @@ fn find_ebe_iov_seeded(
     let seeded = seed != InnerHessianSeed::None
         && !analytic_inner_common_bail(model)
         && !model.has_covariate_nn()
-        && !matches!(
-            inner_optimizer_mode(),
-            crate::types::InnerOptimizer::NelderMead
-        )
+        && !matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead)
         && !inner_use_lbfgs(n_flat);
     let iov_seed = (seeded && is_warm_start(eta_init, init_is_mode))
         .then(|| {
-            let mut st: Vec<f64> = x[..n_eta]
-                .iter()
-                .zip(mu.iter())
-                .map(|(p, m)| p - m)
-                .collect();
+            let mut st: Vec<f64> = x[..n_eta].iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
             for k in to_kappas(&x) {
                 st.extend_from_slice(&k);
             }
@@ -4475,8 +4321,43 @@ fn find_ebe_iov_seeded(
         })
         .flatten()
         .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
-    let primary = inner_minimize_with_grad(
+    // Value/gradient fusion on the line search's full-step trial, as in `find_ebe_solve`:
+    // where the gradient pass also scores the value bit-equal to the native objective, the
+    // trial runs that one pass — value for the Armijo test, gradient parked in `primed` for the
+    // driver's next `grad(x)` — instead of the native walk followed by the gradient pass.
+    // Closed-form objectives only, as there: on an ODE objective the gradient integration costs
+    // more than the value integration, and a rejected full step would pay it for nothing.
+    let fuse_eligible = analytic_iov_inner
+        && !opted_out
+        && layout.is_some()
+        && nested.is_none()
+        && !stall_at(&x)
+        && want_value
+        && model.frem_config.is_none()
+        && !model.is_sde()
+        && !matches!(model.bloq_in_force(), crate::types::BloqMethod::M3)
+        && subject.obs_records.is_empty()
+        && subject.fremtype.iter().all(|&ft| ft == 0);
+    let prime_fn = |p: &[f64]| -> Option<f64> {
+        if !route_at(p).1 {
+            return None;
+        }
+        let g = agrad(p);
+        {
+            let mut held = primed.borrow_mut();
+            let key = held.get_or_insert_with(|| (Vec::new(), Vec::new()));
+            key.0.clear();
+            key.0.extend(p.iter().map(|v| v.to_bits()));
+            key.1 = g;
+        }
+        // The value `agrad` just memoised (absent when its pass could not score `p`: the
+        // gradient stays parked for the `grad(p)` the driver takes anyway).
+        memo_get(p)
+    };
+    let prime: Option<&PrimeFn<'_>> = fuse_eligible.then_some(&prime_fn as &PrimeFn<'_>);
+    let primary = inner_minimize_with_prime(
         &obj,
+        prime,
         &agrad,
         &mut x,
         n_flat,
@@ -4552,11 +4433,7 @@ fn find_ebe_iov_seeded(
     // whatever the BFGS returned.
     // One exit for the returned point, as in the non-IOV solve: the runaway swap below
     // replaces it whole, so "converged" and "moved" never describe two different points.
-    let mut ebe_exit = if bfgs_converged {
-        primary
-    } else {
-        InnerExit::certified(nm_converged)
-    };
+    let mut ebe_exit = if bfgs_converged { primary } else { InnerExit::certified(nm_converged) };
     // ── Guarded multi-start, IOV twin (`[fit_options] inner_restarts`, #2730) ───
     // The axis scan of `find_ebe_solve`, on the flat vector `[ψ, κ_1, …, κ_K]`: a mode that
     // differs in one occasion's κ is as invisible to a single descent as one in η, and the
@@ -4624,12 +4501,8 @@ fn find_ebe_iov_seeded(
             if cand.iter().all(|v| v.is_finite()) {
                 let cand_nll = obj(&cand);
                 // The difference, re-centred on `μ` because the metric takes a point in ψ.
-                let gap: Vec<f64> = cand
-                    .iter()
-                    .zip(&x)
-                    .zip(&centre)
-                    .map(|((c, i), m)| c - i + m)
-                    .collect();
+                let gap: Vec<f64> =
+                    cand.iter().zip(&x).zip(&centre).map(|((c, i), m)| c - i + m).collect();
                 let dist =
                     iov_prior_maha(&gap, &mu, n_eta, n_kappa, k_occasions, nested, params).sqrt();
                 if cand_nll + 1e-9 < nll && dist > SCREEN_MIN_OMEGA_DIST {
@@ -4665,15 +4538,9 @@ fn find_ebe_iov_seeded(
 
     let nll = obj(&x);
     // Recover bsv_eta = psi - mu (mean-zero, NONMEM-compatible output).
-    let bsv_eta: Vec<f64> = x[..n_eta]
-        .iter()
-        .zip(mu.iter())
-        .map(|(p, m)| p - m)
-        .collect();
-    let kappas_vec: Vec<DVector<f64>> = to_kappas(&x)
-        .iter()
-        .map(|k| DVector::from_column_slice(k))
-        .collect();
+    let bsv_eta: Vec<f64> = x[..n_eta].iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
+    let kappas_vec: Vec<DVector<f64>> =
+        to_kappas(&x).iter().map(|k| DVector::from_column_slice(k)).collect();
 
     let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
@@ -4722,9 +4589,7 @@ fn refused_iov_ebe(model: &CompiledModel, subject: &Subject) -> EbeResult {
         nm_polished: false,
         grad_norm: 0.0,
         nll: crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
-        kappas: (0..k_occasions)
-            .map(|_| DVector::zeros(model.n_kappa))
-            .collect(),
+        kappas: (0..k_occasions).map(|_| DVector::zeros(model.n_kappa)).collect(),
         hard_reject: false,
         screen_moved: false,
         twin_moved: false,
@@ -4734,9 +4599,7 @@ fn refused_iov_ebe(model: &CompiledModel, subject: &Subject) -> EbeResult {
 /// Is the IOV solve's η-gradient (and its H) analytic for this subject? The guards are
 /// explained where `find_ebe_iov` reads this.
 pub(crate) fn analytic_iov_inner_supported(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters,
 ) -> bool {
     iov_inner_rule(model, subject, params.omega_iov.is_some())
 }
@@ -4763,10 +4626,7 @@ fn iov_inner_rule(model: &CompiledModel, subject: &Subject, has_omega_iov: bool)
 /// η-Jacobian from the adjoint's recording, else the FD Jacobian. Like
 /// [`ebe_h_matrix`], a function of the EBE alone (#2026).
 fn iov_ebe_h_matrix(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    bsv_eta: &[f64],
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, bsv_eta: &[f64],
     kappas: &[DVector<f64>],
 ) -> DMatrix<f64> {
     let n_eta = model.n_eta;
@@ -4805,12 +4665,9 @@ fn iov_ebe_h_matrix(
 /// `η̂` alone when `NestedLayout::compact` refuses `cells` — κ then restarts at 0, as for a
 /// width-only warm start, but the search keeps η̂ rather than starting cold (#2382).
 fn nested_warm_start(
-    n: &crate::stats::nested_levels::NestedLayout,
-    eta_hat: &[f64],
-    cells: &[&[f64]],
+    n: &crate::stats::nested_levels::NestedLayout, eta_hat: &[f64], cells: &[&[f64]],
 ) -> Vec<f64> {
-    n.compact(eta_hat, cells)
-        .unwrap_or_else(|| eta_hat.to_vec())
+    n.compact(eta_hat, cells).unwrap_or_else(|| eta_hat.to_vec())
 }
 
 /// Build the IOV optimizer seed in `[psi_bsv, kappa_1, ..., kappa_K]` order.
@@ -4841,11 +4698,7 @@ fn iov_initial_vector(n_eta: usize, n_flat: usize, mu: &[f64], warm: Option<&[f6
 /// occasion list is recovered inside `predict_iov`, so `occ_groups` is no longer
 /// needed here. See issue #104.
 fn compute_jacobian_fd_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[Vec<f64>],
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -4882,10 +4735,7 @@ fn compute_jacobian_fd_iov(
 /// the correction the FD path performs (#466 review #9). No-op when the model isn't FREM
 /// or the subject carries no pseudo-obs rows.
 pub(crate) fn overwrite_frem_pseudo_obs_rows(
-    h: &mut DMatrix<f64>,
-    model: &CompiledModel,
-    subject: &Subject,
-    n_eta: usize,
+    h: &mut DMatrix<f64>, model: &CompiledModel, subject: &Subject, n_eta: usize,
 ) {
     let Some(ref fc) = model.frem_config else {
         return;
@@ -4915,11 +4765,7 @@ pub(crate) fn overwrite_frem_pseudo_obs_rows(
 /// scalar `γ` initial Hessian with `H₀ = diag(precond)`, so the central scaling
 /// step is per-dimension instead of a single ill-scaled `γ`.
 fn lbfgs_direction(
-    g: &[f64],
-    s_hist: &[Vec<f64>],
-    y_hist: &[Vec<f64>],
-    rho_hist: &[f64],
-    n: usize,
+    g: &[f64], s_hist: &[Vec<f64>], y_hist: &[Vec<f64>], rho_hist: &[f64], n: usize,
     precond: Option<&[f64]>,
 ) -> Vec<f64> {
     let dotp = |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
@@ -4993,7 +4839,7 @@ impl InnerSettings {
 // thread could switch the inner solver of a fit, SIR or covariance step running in another,
 // mid-run. The per-subject solves fan out over rayon, so arming the calling thread is not
 // enough: a call with non-default settings runs on a pool whose workers were started with the
-// same value installed (`api::pool::FitScope`), and a worker of the shared pool installs
+// same value installed (`pool::FitScope`), and a worker of the shared pool installs
 // nothing and reads the default.
 thread_local! {
     /// `None` outside any fit-scoped call (and on every worker of the shared pool), which
@@ -5022,8 +4868,8 @@ pub(crate) fn install_worker_inner_settings(s: InnerSettings) {
 
 /// Arms the inner settings on this thread until the guard drops, restoring whatever was in
 /// force before — on every exit path, a panic included. Arming reaches this thread only; work
-/// that fans out over rayon goes through `api::pool::with_fit_scope` or
-/// `api::pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
+/// that fans out over rayon goes through `pool::with_fit_scope` or
+/// `pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
 #[must_use = "the inner settings are disarmed as soon as this guard drops"]
 pub(crate) struct InnerSettingsGuard {
     prev: Option<InnerSettings>,
@@ -5032,9 +4878,7 @@ pub(crate) struct InnerSettingsGuard {
 /// See [`InnerSettingsGuard`]. A default `s` arms `Some(default)`, so a nested call that
 /// expressed no opinion reads the default, not the enclosing call's settings.
 pub(crate) fn arm_inner_settings(s: InnerSettings) -> InnerSettingsGuard {
-    InnerSettingsGuard {
-        prev: LOCAL_INNER.replace(Some(s)),
-    }
+    InnerSettingsGuard { prev: LOCAL_INNER.replace(Some(s)) }
 }
 
 impl Drop for InnerSettingsGuard {
@@ -5112,11 +4956,7 @@ pub static PROFILE_INNER_FD_FALLBACK: std::sync::atomic::AtomicU64 =
 
 fn inner_profile_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("FERX_PROFILE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    *E.get_or_init(|| std::env::var("FERX_PROFILE").map(|v| v == "1").unwrap_or(false))
 }
 
 /// `FERX_NO_ANALYTIC_INNER=1` forces the FD inner gradient everywhere (A-B toggle).
@@ -5124,11 +4964,7 @@ fn inner_profile_enabled() -> bool {
 /// subject on every inner-loop entry (issue #438 review).
 fn no_analytic_inner_forced() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| {
-        std::env::var("FERX_NO_ANALYTIC_INNER")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    *E.get_or_init(|| std::env::var("FERX_NO_ANALYTIC_INNER").map(|v| v == "1").unwrap_or(false))
 }
 
 /// Print the accumulated inner-loop attribution profile (no-op unless `FERX_PROFILE=1`).
@@ -5296,9 +5132,9 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
                 Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
                 Some(EndpointLikelihood::Count { param_program, .. }) => param_program.is_some(),
                 #[cfg(feature = "markov")]
-                Some(EndpointLikelihood::Ctmm {
-                    generator_program, ..
-                }) => generator_program.is_some(),
+                Some(EndpointLikelihood::Ctmm { generator_program, .. }) => {
+                    generator_program.is_some()
+                }
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Dtmm { prob_program, .. }) => prob_program.is_some(),
                 _ => false,
@@ -5344,10 +5180,7 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
 /// CTMM, each exact — summed. `None` when any term the subject carries declines (the caller
 /// then keeps FD for the point). Zero without the `survival` feature (no such records).
 fn non_gaussian_eta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<Vec<f64>> {
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut g = vec![0.0_f64; eta.len()];
@@ -5358,11 +5191,7 @@ fn non_gaussian_eta_grad(
                 *acc += gi;
             }
         };
-        if subject
-            .obs_records
-            .iter()
-            .any(|r| matches!(r, crate::types::ObsRecord::Event { .. }))
-        {
+        if subject.obs_records.iter().any(|r| matches!(r, crate::types::ObsRecord::Event { .. })) {
             add(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1);
         }
         if model.has_discrete() {
@@ -5483,9 +5312,7 @@ pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
 fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     use crate::types::EndpointLikelihood;
     model.endpoints.iter().all(|(_, ep)| match ep {
-        EndpointLikelihood::Ctmm {
-            generator_program, ..
-        } => generator_program.as_ref().is_some(),
+        EndpointLikelihood::Ctmm { generator_program, .. } => generator_program.as_ref().is_some(),
         _ => true,
     })
 }
@@ -5605,17 +5432,8 @@ pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn residual_inner_obs(
-    model: &CompiledModel,
-    cmt: usize,
-    y: f64,
-    f: f64,
-    sigma: &[f64],
-    mult: Option<&[f64]>,
-    ruv_scale: f64,
-    ruv_active: bool,
-    cens: i8,
-    f_frozen: Option<f64>,
-    p: f64,
+    model: &CompiledModel, cmt: usize, y: f64, f: f64, sigma: &[f64], mult: Option<&[f64]>,
+    ruv_scale: f64, ruv_active: bool, cens: i8, f_frozen: Option<f64>, p: f64,
 ) -> Option<(f64, f64, f64)> {
     let f_var = f_frozen.unwrap_or(f);
     let mut v = match mult {
@@ -5648,25 +5466,13 @@ fn residual_inner_obs(
             // products would be `0·∞` (#2772).
             (0.0, 0.0, 0.0)
         } else {
-            let ruv_term = if ruv_active {
-                h * z * (v_resid / v)
-            } else {
-                0.0
-            };
+            let ruv_term = if ruv_active { h * z * (v_resid / v) } else { 0.0 };
             (h * m, ruv_term, h * z / (2.0 * v))
         }
     } else {
-        let ruv_term = if ruv_active {
-            ruv_data_dterm(y - f, v) * (v_resid / v)
-        } else {
-            0.0
-        };
+        let ruv_term = if ruv_active { ruv_data_dterm(y - f, v) * (v_resid / v) } else { 0.0 };
         let eps = y - f;
-        (
-            obs_gaussian_dterm_coef(y, f, v, dv_df),
-            ruv_term,
-            0.5 * (1.0 / v - eps * eps / (v * v)),
-        )
+        (obs_gaussian_dterm_coef(y, f, v, dv_df), ruv_term, 0.5 * (1.0 / v - eps * eps / (v * v)))
     };
     Some((coef, ruv_term, coef_p))
 }
@@ -5692,12 +5498,8 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
 /// loop is proposing, or it converges to the mode of a different objective than
 /// the one being minimised.
 pub(crate) fn analytic_eta_nll_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &crate::types::OmegaMatrix,
-    sigma: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    omega: &crate::types::OmegaMatrix, sigma: &[f64],
 ) -> Option<Vec<f64>> {
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so a
     // one-off caller like this can just compute it inline (unlike `find_ebe`'s
@@ -5796,20 +5598,12 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 /// `None` otherwise (the caller takes the native objective there).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &crate::types::OmegaMatrix,
-    sigma: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    omega: &crate::types::OmegaMatrix, sigma: &[f64],
     residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
-    mult: Option<&[Vec<f64>]>,
-    err_keys: &[usize],
-    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
-    eta_work: &mut DVector<f64>,
-    prior_work: &mut DVector<f64>,
-    frozen_var_preds: Option<&[f64]>,
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>, mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize], obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    eta_work: &mut DVector<f64>, prior_work: &mut DVector<f64>, frozen_var_preds: Option<&[f64]>,
     mut value_out: Option<&mut Option<f64>>,
 ) -> Option<Vec<f64>> {
     if let Some(v) = value_out.as_deref_mut() {
@@ -5847,15 +5641,12 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
     // TTE: exact, the analytic hazard's parameters over a first-order η-dual through the
     // survival curves; the same 1× scale.
     #[cfg(feature = "survival")]
-    let tte_grad: Option<Vec<f64>> = if subject
-        .obs_records
-        .iter()
-        .any(|r| matches!(r, crate::types::ObsRecord::Event { .. }))
-    {
-        Some(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1)
-    } else {
-        None
-    };
+    let tte_grad: Option<Vec<f64>> =
+        if subject.obs_records.iter().any(|r| matches!(r, crate::types::ObsRecord::Event { .. })) {
+            Some(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1)
+        } else {
+            None
+        };
     #[cfg(feature = "survival")]
     let fold_nongaussian = |grad: &mut [f64]| {
         if let Some(g) = &tte_grad {
@@ -5954,15 +5745,9 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
     // A frozen variance is `R⁰` at every random effect zero, `η_ruv` included, so the
     // residual eta carries no data term under it (and `fit` refuses `iiv_on_ruv` under a
     // non-interaction stage anyway) — #1722.
-    let ruv_idx = model
-        .residual_error_eta
-        .filter(|_| frozen_var_preds.is_none());
+    let ruv_idx = model.residual_error_eta.filter(|_| frozen_var_preds.is_none());
     let ruv_active = ruv_idx.is_some();
-    let ruv_scale = if ruv_active {
-        model.residual_var_scale(eta)
-    } else {
-        1.0
-    };
+    let ruv_scale = if ruv_active { model.residual_var_scale(eta) } else { 1.0 };
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
     // FREM covariate pseudo-observations: the objective scores these rows against the
@@ -5996,11 +5781,7 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
             }
             continue;
         }
-        let cens = if m3 {
-            subject.cens.get(j).copied().unwrap_or(0)
-        } else {
-            0
-        };
+        let cens = if m3 { subject.cens.get(j).copied().unwrap_or(0) } else { 0 };
         let p = p_rows.get(j);
         let (coef, ruv_term, coef_p) = residual_inner_obs(
             model,
@@ -6088,19 +5869,11 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
 /// (`Dual2`) provider, so this one branch serves both inner paths.
 #[allow(clippy::too_many_arguments)]
 fn dense_residual_inner_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    eta: &[f64],
-    omega: &crate::types::OmegaMatrix,
-    sigma: &[f64],
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    sens: &[crate::sens::provider::ObsGrad],
-    p_rows: &[crate::sens::provider::ObsGrad],
-    mult: Option<&[Vec<f64>]>,
-    err_keys: &[usize],
-    eta_work: &mut DVector<f64>,
-    prior_work: &mut DVector<f64>,
-    frozen_var_preds: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, eta: &[f64], omega: &crate::types::OmegaMatrix,
+    sigma: &[f64], residual_cov: crate::stats::residual_error::ResidualCov<'_>,
+    sens: &[crate::sens::provider::ObsGrad], p_rows: &[crate::sens::provider::ObsGrad],
+    mult: Option<&[Vec<f64>]>, err_keys: &[usize], eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>, frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
     let n_eta = model.n_eta;
@@ -6117,14 +5890,8 @@ fn dense_residual_inner_gradient(
     let corr = residual_cov;
     // IIV on the residual (#2656): `R(η) = exp(2η_r)·R₀`, the objective's scale. A frozen
     // variance is `R⁰`, at every random effect zero, `η_r` included.
-    let ruv_idx = model
-        .residual_error_eta
-        .filter(|_| frozen_var_preds.is_none());
-    let ruv_scale = if ruv_idx.is_some() {
-        model.residual_var_scale(eta)
-    } else {
-        1.0
-    };
+    let ruv_idx = model.residual_error_eta.filter(|_| frozen_var_preds.is_none());
+    let ruv_scale = if ruv_idx.is_some() { model.residual_var_scale(eta) } else { 1.0 };
     let mut r = match mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled_cov(
             &model.error_spec,
@@ -6163,24 +5930,14 @@ fn dense_residual_inner_gradient(
     let r_inv = chol.inverse();
     let residuals = DVector::from_iterator(
         n_obs,
-        subject
-            .observations
-            .iter()
-            .zip(ipreds.iter())
-            .map(|(&y, &f)| y - f),
+        subject.observations.iter().zip(ipreds.iter()).map(|(&y, &f)| y - f),
     );
     let s = chol.solve(&residuals); // R⁻¹ r
                                     // The EKF variances' term `½(tr(R⁻¹∂P) − sᵀ∂P s)`, `∂P/∂η_k = diag(∂p_m/∂η_k)` — moved
                                     // by η whether or not the residual variance is frozen.
-    let w_p: Vec<f64> = (0..p_rows.len())
-        .map(|m| r_inv[(m, m)] - s[m] * s[m])
-        .collect();
+    let w_p: Vec<f64> = (0..p_rows.len()).map(|m| r_inv[(m, m)] - s[m] * s[m]).collect();
     let p_term = |k: usize| -> f64 {
-        0.5 * p_rows
-            .iter()
-            .zip(&w_p)
-            .map(|(p, w)| w * p.df_deta[k])
-            .sum::<f64>()
+        0.5 * p_rows.iter().zip(&w_p).map(|(p, w)| w * p.df_deta[k]).sum::<f64>()
     };
     if frozen_var_preds.is_some() {
         let grad = (0..n_eta)
@@ -6261,13 +6018,8 @@ fn dense_residual_inner_gradient(
 /// why this is a caller-supplied parameter rather than computed here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    stacked_true: &[f64],
-    omega_bsv: &crate::types::OmegaMatrix,
-    omega_iov: &crate::types::OmegaMatrix,
-    sigma: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_true: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
     let layout = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)?;
@@ -6282,6 +6034,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
         sigma,
         mult,
         None,
+        &mut Vec::new(),
     )
 }
 
@@ -6294,19 +6047,53 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
 /// [`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of),
 /// built once per EBE search by the caller (#2037); it carries `n_eta`, the κ width and
 /// the group count, so none of them is a parameter that could disagree with it.
+///
+/// `obs_grad_recycle` is the caller's per-subject row buffer, as in the non-IOV
+/// [`analytic_eta_nll_value_gradient_with_schedule`]: the recording fills it in place, so
+/// an EBE search reuses one `∂f/∂η` row per observation across its iterations (#3088).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
-    model: &CompiledModel,
-    subject: &Subject,
-    layout: &crate::stats::stacked_layout::StackedLayout,
-    theta: &[f64],
-    stacked_true: &[f64],
-    omega_bsv: &crate::types::OmegaMatrix,
-    omega_iov: &crate::types::OmegaMatrix,
-    sigma: &[f64],
-    mult: Option<&[Vec<f64>]>,
-    frozen_var_preds: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
 ) -> Option<Vec<f64>> {
+    analytic_eta_nll_value_gradient_iov_frozen(
+        model,
+        subject,
+        layout,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        obs_grad_recycle,
+        None,
+    )
+}
+
+/// [`analytic_eta_nll_gradient_iov_frozen`] that also reports the IOV objective's **value**
+/// through `value_out`, from the same pass (value/gradient fusion, as
+/// [`analytic_eta_nll_value_gradient_with_schedule`] does without IOV): the predictions the
+/// gradient is built from are the ones `individual_nll_iov_frozen_in` scores, so the value
+/// costs a few flops where the native objective re-predicts the whole subject (#3088).
+/// `*value_out` is `Some(l)` only for a plain Gaussian row sum on one IOV level — no nested
+/// levels, dense `R`, censored or FREM row, SDE variance or non-Gaussian record — with a
+/// finite value; `None` otherwise (the caller takes the native objective there). Under
+/// `frozen_var_preds` each row's variance is taken at `f₀[j]`, as the native objective does.
+#[allow(clippy::too_many_arguments)]
+fn analytic_eta_nll_value_gradient_iov_frozen(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    mut value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    if let Some(v) = value_out.as_deref_mut() {
+        *v = None;
+    }
     // A record without an exact η-channel would leave its term out of the gradient: refuse
     // the subject here too, not only at the routing gate (direct callers skip that).
     if !non_gaussian_eta_grad_served(model, subject) {
@@ -6315,22 +6102,64 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // The recording reads the per-cell `stacked_true` and returns the jet over the
     // layout's axes — the compact vector under nested levels (#1082), the stack itself
     // otherwise — so the gradient below is over the vector the EBE search moves.
-    let n_eta = layout.n_eta();
-    let axes = layout.to_axes(stacked_true)?;
+    // One level: the axes are the stack itself, read in place (no copy per call).
+    let axes: std::borrow::Cow<'_, [f64]> = if layout.nested().is_some() {
+        std::borrow::Cow::Owned(layout.to_axes(stacked_true)?)
+    } else if stacked_true.len() == layout.n_stacked() {
+        std::borrow::Cow::Borrowed(stacked_true)
+    } else {
+        return None;
+    };
     // No Gaussian rows ⇒ no Gaussian data term and nothing to record (an endpoint-only
     // subject: its inner gradient is the prior plus the non-Gaussian terms below).
-    let sens = if subject.obs_times.is_empty() {
-        Vec::new()
-    } else {
-        crate::sens::ode_provider::adjoint::exact_obs_grads_in(
-            model,
-            subject,
-            Some(layout),
-            theta,
-            model.is_sde().then_some(sigma),
-            stacked_true,
-        )?
-    };
+    // Otherwise the recording fills the caller's buffer in place, handed back on every exit.
+    let mut rows = std::mem::take(obs_grad_recycle);
+    if subject.obs_times.is_empty() {
+        rows.clear();
+    } else if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
+        model,
+        subject,
+        Some(layout),
+        theta,
+        model.is_sde().then_some(sigma),
+        stacked_true,
+        &mut rows,
+    ) {
+        *obs_grad_recycle = rows;
+        return None;
+    }
+    let grad = iov_gradient_from_rows(
+        model,
+        subject,
+        layout,
+        &rows,
+        theta,
+        stacked_true,
+        &axes,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        value_out,
+    );
+    *obs_grad_recycle = rows;
+    grad
+}
+
+/// The body of [`analytic_eta_nll_gradient_iov_frozen`] over the recorded rows `sens`
+/// (the subject's prediction rows, then an SDE subject's EKF variance rows) and the search
+/// vector `axes`, so the caller hands its row buffer back on every exit. `value_out`: the
+/// fused objective value (see [`analytic_eta_nll_value_gradient_iov_frozen`]).
+#[allow(clippy::too_many_arguments)]
+fn iov_gradient_from_rows(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    sens: &[crate::sens::provider::ObsGrad], theta: &[f64], stacked_true: &[f64], axes: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
+    mult: Option<&[Vec<f64>]>, frozen_var_preds: Option<&[f64]>,
+    value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    let n_eta = layout.n_eta();
     // An SDE subject's EKF variance rows (BSV-only filter: their κ columns are zero).
     let (sens, p_rows) = sens.split_at(sens.len().min(subject.observations.len()));
     let n_stacked = layout.n_axes();
@@ -6344,15 +6173,9 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // Only pay the `exp(2·η_ruv)` scaling + the `η_ruv` column when `iiv_on_ruv` is
     // active; a plain IOV model runs the original op count (no per-obs ×1.0 multiplies
     // and no residual-eta accumulation — #474 review).
-    let ruv_idx = model
-        .residual_error_eta
-        .filter(|_| frozen_var_preds.is_none());
+    let ruv_idx = model.residual_error_eta.filter(|_| frozen_var_preds.is_none());
     let ruv_active = ruv_idx.is_some();
-    let ruv_scale = if ruv_active {
-        model.residual_var_scale(stacked_true)
-    } else {
-        1.0
-    };
+    let ruv_scale = if ruv_active { model.residual_var_scale(stacked_true) } else { 1.0 };
     // M3 BLOQ + IOV (#580): a censored row's data term is `−logΦ(z)`, matching
     // `individual_nll_iov`'s `−2·m3_logcdf` (the inner objective `find_ebe_iov`
     // minimises). `residual_inner_obs` emits its `h·m` f-coefficient over the stacked
@@ -6366,12 +6189,21 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // The value is scored only where `individual_nll_iov_frozen_in` is a plain Gaussian row
+    // sum over these predictions (see `analytic_eta_nll_value_gradient_iov_frozen`).
+    let value_ok = value_out.is_some()
+        && layout.nested().is_none()
+        && p_rows.is_empty()
+        && !model.is_sde()
+        && !model.bloq_in_force().has_censored_row(&subject.cens)
+        && !subject.fremtype.iter().any(|&ft| ft > 0)
+        && subject.obs_records.is_empty()
+        && !model.residual_cov_theta(theta).is_dense()
+        && omega_bsv.log_det.is_finite()
+        && omega_iov.log_det.is_finite();
+    let mut data_ll = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
-        let cens = if m3 {
-            subject.cens.get(j).copied().unwrap_or(0)
-        } else {
-            0
-        };
+        let cens = if m3 { subject.cens.get(j).copied().unwrap_or(0) } else { 0 };
         // The residual logic is shared with the non-IOV inner via `residual_inner_obs`
         // so the two cannot drift (Gaussian coef + `1 − ε²/v`, or the M3-censored `h·m`).
         // The signed `cens` makes right-censored rows use the upper tail.
@@ -6393,6 +6225,18 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
             *g += coef * obs.df_deta[k] + p.map_or(0.0, |p| coef_p * p.df_deta[k]);
         }
         ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
+        if value_ok {
+            // `individual_nll_iov_frozen_in`'s row term, the same expression: the variance at
+            // `f₀[j]` under a frozen variance (where `ruv_scale` is 1, as there).
+            let v = model.residual_variance_at_scaled(
+                err_keys[j],
+                frozen_var_preds.map_or(obs.f, |f0| f0[j]),
+                sigma,
+                mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+            ) * ruv_scale;
+            let resid = subject.observations[j] - obs.f;
+            data_ll += resid * resid / v + v.ln();
+        }
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
@@ -6409,26 +6253,52 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under
     // nested levels one per group of each level, `Ω_L` the rows and columns of its κs.
-    let eta_bsv = DVector::from_column_slice(&axes[..n_eta]);
-    let prior_bsv = &omega_bsv.inv * &eta_bsv;
-    for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
-        *g += prior_bsv[k];
-    }
-    for (ks, base) in layout.kappa_blocks() {
-        let w = ks.len();
-        let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
-        // A block carrying every κ in order (each one-level group) reads `Ω_iov⁻¹` as is;
-        // only a nested level's subset is copied out (#2037).
-        let prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
-            &omega_iov.inv * &kappa_g
-        } else {
-            &omega_iov.inv.select_rows(&ks).select_columns(&ks) * &kappa_g
-        };
-        for c in 0..w {
-            grad[base + c] += prior_kg[c];
+    // Each block's product is read straight off the inverse, with no submatrix or vector
+    // copied out per call (#3088); the sum runs in the column order of a matrix product.
+    add_block_prior(&mut grad, &omega_bsv.inv, 0..n_eta, 0, axes);
+    if layout.nested().is_some() {
+        for (ks, base) in layout.kappa_blocks() {
+            add_block_prior(&mut grad, &omega_iov.inv, ks.iter().copied(), base, axes);
+        }
+    } else {
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            add_block_prior(&mut grad, &omega_iov.inv, 0..layout.n_kappa(), base, axes);
         }
     }
+    if let Some(out) = value_out.filter(|_| value_ok) {
+        // `½(ηᵀΩ⁻¹η + log|Ω| + Σ_g κ_gᵀΩ_IOV⁻¹κ_g + K·log|Ω_IOV| + data)`, the native order.
+        let quad = crate::stats::likelihood::quad_form;
+        let eta_prior = quad(&omega_bsv.inv, &stacked_true[..n_eta]);
+        let mut kappa_prior = 0.0;
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            kappa_prior += quad(&omega_iov.inv, &axes[base..base + layout.n_kappa()]);
+        }
+        let nll = 0.5
+            * (eta_prior
+                + omega_bsv.log_det
+                + kappa_prior
+                + (layout.n_groups() as f64) * omega_iov.log_det
+                + data_ll);
+        *out = nll.is_finite().then_some(nll);
+    }
     Some(grad)
+}
+
+/// `grad[base..base + w] += A·x[base..base + w]` with `A` the rows and columns `idx` of
+/// `inv` (`w = idx.len()`): one block of the block-diagonal stacked prior.
+fn add_block_prior(
+    grad: &mut [f64], inv: &DMatrix<f64>, idx: impl Iterator<Item = usize> + Clone, base: usize,
+    x: &[f64],
+) {
+    for (c, r) in idx.clone().enumerate() {
+        let mut acc = 0.0;
+        for (d, s) in idx.clone().enumerate() {
+            acc += inv[(r, s)] * x[base + d];
+        }
+        grad[base + c] += acc;
+    }
 }
 
 /// Build the diagonal inner-BFGS preconditioner (the search `H0`) for a subject.
@@ -6448,10 +6318,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
 /// (raw L2 never reaches `tol` there); general fits stop on raw L2, so `H0` changes
 /// only the path to the mode, not the converged EBE.
 fn build_inner_preconditioner(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    n_eta: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, n_eta: usize,
 ) -> Option<Vec<f64>> {
     if let Some(fc) = model.frem_config.as_ref() {
         return preconditioner_from_parts(
@@ -6502,11 +6369,7 @@ fn inner_preconditioner_from_omega(omega_inv: &DMatrix<f64>, n_eta: usize) -> Op
 /// dependency, so it is unit-testable in isolation). See that function for the
 /// rationale; `omega_inv` is Ω⁻¹ and `sigma` the σ values.
 fn preconditioner_from_parts(
-    fc: &FremConfig,
-    fremtype: &[u16],
-    omega_inv: &DMatrix<f64>,
-    sigma: &[f64],
-    n_eta: usize,
+    fc: &FremConfig, fremtype: &[u16], omega_inv: &DMatrix<f64>, sigma: &[f64], n_eta: usize,
 ) -> Option<Vec<f64>> {
     if n_eta == 0 {
         return None;
@@ -6589,11 +6452,7 @@ fn cap_curvature_free_step(d: &mut [f64], precond: Option<&[f64]>) {
     let Some(p) = precond else {
         return;
     };
-    let m: f64 = d
-        .iter()
-        .zip(p)
-        .map(|(di, pi)| if *pi > 0.0 { di * di / pi } else { 0.0 })
-        .sum();
+    let m: f64 = d.iter().zip(p).map(|(di, pi)| if *pi > 0.0 { di * di / pi } else { 0.0 }).sum();
     let r2 = RUNAWAY_EBE_MAHA_PER_ETA * d.len() as f64;
     if m.is_finite() && m > r2 {
         let k = (r2 / m).sqrt();
@@ -6620,12 +6479,7 @@ fn init_h_inv(n: usize, precond: Option<&[f64]>, seed_inv: Option<&DMatrix<f64>>
 /// dominated by the sharp covariate dims and never fall below `tol`.
 fn grad_norm_metric(g: &[f64], precond: Option<&[f64]>) -> f64 {
     match precond {
-        Some(p) => g
-            .iter()
-            .zip(p.iter())
-            .map(|(&gi, &pi)| gi * gi * pi)
-            .sum::<f64>()
-            .sqrt(),
+        Some(p) => g.iter().zip(p.iter()).map(|(&gi, &pi)| gi * gi * pi).sum::<f64>().sqrt(),
         None => g.iter().map(|&gi| gi * gi).sum::<f64>().sqrt(),
     }
 }
@@ -6692,17 +6546,9 @@ impl InnerExit {
 /// point under every `inner_optimizer` (#2557, #2571).
 #[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
-    obj: &dyn Fn(&[f64]) -> f64,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, grad: &dyn Fn(&[f64]) -> Vec<f64>, x: &mut [f64], n: usize,
+    max_iter: usize, tol: f64, precond: Option<&[f64]>, hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> InnerExit {
     inner_minimize_with_prime(
         obj,
@@ -6731,37 +6577,18 @@ type PrimeFn<'a> = dyn Fn(&[f64]) -> Option<f64> + 'a;
 /// [`inner_minimize_with_grad`] with a fused value-and-gradient evaluation ([`PrimeFn`]).
 #[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_prime(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>, stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> InnerExit {
-    if matches!(
-        inner_optimizer_mode(),
-        crate::types::InnerOptimizer::NelderMead
-    ) {
+    if matches!(inner_optimizer_mode(), crate::types::InnerOptimizer::NelderMead) {
         // NM's simplex-spread exit is its stopping rule, not a certificate (#1527): measured
         // under `inner_optimizer = nelder_mead`, every cold EBE across twelve bundled examples
         // reported converged, 108 of 177 at a gradient norm above 1e-3 (up to 12.4 on
         // `schnider`). Certify the end point as the fallback does, whatever NM's own flag.
         nelder_mead_minimize(obj, x, n, max_iter, tol);
-        let cert = FallbackCertifier {
-            grad,
-            precond,
-            stop_precond,
-            stall_at,
-            n,
-            max_iter,
-            tol,
-        };
+        let cert = FallbackCertifier { grad, precond, stop_precond, stall_at, n, max_iter, tol };
         let mut end = x.to_vec();
         let exit = match cert.certify_moved(obj, &mut end) {
             None => InnerExit::Failed,
@@ -6812,16 +6639,9 @@ fn inner_minimize_with_prime(
 /// `(s, y, ρ)` history. `grad` supplies the gradient (FD or AD).
 #[allow(clippy::too_many_arguments)]
 fn lbfgs_core(
-    obj: &dyn Fn(&[f64]) -> f64,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, grad: &dyn Fn(&[f64]) -> Vec<f64>, x: &mut [f64], n: usize,
+    max_iter: usize, tol: f64, precond: Option<&[f64]>, stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> bool {
     lbfgs_run(
         obj,
@@ -6842,17 +6662,9 @@ fn lbfgs_core(
 /// [`lbfgs_core`], reporting how the search ended ([`InnerExit`]).
 #[allow(clippy::too_many_arguments)]
 fn lbfgs_run(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> InnerExit {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -6948,11 +6760,7 @@ fn lbfgs_run(
             &mut line_search_point,
             short_line_search,
         ) {
-            StepChoice::Step {
-                alpha,
-                f_new,
-                g_new,
-            } => (alpha, f_new, g_new),
+            StepChoice::Step { alpha, f_new, g_new } => (alpha, f_new, g_new),
             StepChoice::ConvergedAtFloor => return InnerExit::Converged,
             StepChoice::Failed => return InnerExit::Failed,
         };
@@ -6975,16 +6783,7 @@ fn lbfgs_run(
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        if exact_search_stuck(
-            enable_stall,
-            f_old,
-            f_new,
-            &g,
-            &g_new,
-            &s,
-            x,
-            &mut non_moves,
-        ) {
+        if exact_search_stuck(enable_stall, f_old, f_new, &g, &g_new, &s, x, &mut non_moves) {
             return InnerExit::Stuck;
         }
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
@@ -7125,17 +6924,9 @@ fn bfgs_update_small(h: &mut DMatrix<f64>, s: &[f64], y: &[f64], rho: f64) {
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
 #[allow(clippy::too_many_arguments)]
 fn dense_bfgs_core(
-    obj: &dyn Fn(&[f64]) -> f64,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, grad: &dyn Fn(&[f64]) -> Vec<f64>, x: &mut [f64], n: usize,
+    max_iter: usize, tol: f64, precond: Option<&[f64]>, hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>, stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> bool {
     dense_bfgs_run(
         obj,
@@ -7157,18 +6948,10 @@ fn dense_bfgs_core(
 /// [`dense_bfgs_core`], reporting how the search ended ([`InnerExit`]).
 #[allow(clippy::too_many_arguments)]
 fn dense_bfgs_run(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64], n: usize, max_iter: usize, tol: f64, precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>, stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool, short_line_search: bool,
 ) -> InnerExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
@@ -7300,11 +7083,7 @@ fn dense_bfgs_run(
             &mut line_search_point,
             short_line_search,
         ) {
-            StepChoice::Step {
-                alpha,
-                f_new,
-                g_new,
-            } => (alpha, f_new, g_new),
+            StepChoice::Step { alpha, f_new, g_new } => (alpha, f_new, g_new),
             StepChoice::ConvergedAtFloor => return InnerExit::Converged,
             StepChoice::Failed => return InnerExit::Failed,
         };
@@ -7323,16 +7102,7 @@ fn dense_bfgs_run(
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        if exact_search_stuck(
-            enable_stall,
-            f_old,
-            f_new,
-            &g,
-            &g_new,
-            &s,
-            x,
-            &mut non_moves,
-        ) {
+        if exact_search_stuck(enable_stall, f_old, f_new, &g, &g_new, &s, x, &mut non_moves) {
             return InnerExit::Stuck;
         }
         if !reset {
@@ -7382,11 +7152,7 @@ fn dense_bfgs_run(
 
 /// Nelder-Mead simplex minimization (fallback)
 fn nelder_mead_minimize(
-    obj: &dyn Fn(&[f64]) -> f64,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
+    obj: &dyn Fn(&[f64]) -> f64, x: &mut [f64], n: usize, max_iter: usize, tol: f64,
 ) -> bool {
     let alpha = 1.0;
     let gamma = 2.0;
@@ -7397,11 +7163,7 @@ fn nelder_mead_minimize(
     simplex.push(x.to_vec());
     for i in 0..n {
         let mut point = x.to_vec();
-        let delta = if point[i].abs() > 1e-8 {
-            0.05 * point[i].abs()
-        } else {
-            0.00025
-        };
+        let delta = if point[i].abs() > 1e-8 { 0.05 * point[i].abs() } else { 0.00025 };
         point[i] += delta;
         simplex.push(point);
     }
@@ -7422,9 +7184,7 @@ fn nelder_mead_minimize(
         // up at a simplex vertex) sorts as worst rather than panicking on the
         // `None` that `partial_cmp` returns for NaN. See issue #97.
         indices.sort_by(|&a, &b| {
-            fvals[a]
-                .partial_cmp(&fvals[b])
-                .unwrap_or(std::cmp::Ordering::Greater)
+            fvals[a].partial_cmp(&fvals[b]).unwrap_or(std::cmp::Ordering::Greater)
         });
 
         let best = indices[0];
@@ -7588,16 +7348,9 @@ const SCREEN_MIN_OMEGA_DIST: f64 = 0.5;
 /// solves of `find_ebe_impl` share them (`find_ebe_solve`'s `screen_share`).
 #[allow(clippy::too_many_arguments)]
 fn screen_descents(
-    obj: &dyn Fn(&[f64]) -> f64,
-    agrad: &dyn Fn(&[f64]) -> Vec<f64>,
-    omega: &crate::types::OmegaMatrix,
-    n_eta: usize,
-    n: usize,
-    subject_id: &str,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    stop_precond: Option<&[f64]>,
+    obj: &dyn Fn(&[f64]) -> f64, agrad: &dyn Fn(&[f64]) -> Vec<f64>,
+    omega: &crate::types::OmegaMatrix, n_eta: usize, n: usize, subject_id: &str, max_iter: usize,
+    tol: f64, precond: Option<&[f64]>, stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool,
 ) -> Vec<ScreenDescent> {
     screen_starts(obj, omega, n_eta, n, subject_id)
@@ -7630,10 +7383,7 @@ fn screen_descents(
 /// depends neither on the worker thread nor on the subject's position in the data. Empty
 /// when there is nothing to draw, or more random effects than the Sobol table carries.
 fn screen_starts(
-    obj: &dyn Fn(&[f64]) -> f64,
-    omega: &crate::types::OmegaMatrix,
-    n_eta: usize,
-    n: usize,
+    obj: &dyn Fn(&[f64]) -> f64, omega: &crate::types::OmegaMatrix, n_eta: usize, n: usize,
     subject_id: &str,
 ) -> Vec<Vec<f64>> {
     use crate::estimation::importance_sampling::{
@@ -7707,10 +7457,7 @@ const TWIN_LOG_TOL: f64 = 1e-9;
 /// baseline covariates. Also `None` when `ka` and `k` coincide to [`TWIN_LOG_TOL`]: the twin
 /// is then the mode itself.
 fn flip_flop_twin_start(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<Vec<f64>> {
     use crate::types::{PK_IDX_CL, PK_IDX_KA, PK_IDX_V};
     if model.pk_model != PkModel::OneCptOral
@@ -7839,19 +7586,10 @@ fn ebe_prior_maha(eta: &[f64], omega: &crate::types::OmegaMatrix) -> f64 {
 /// with no `omega_iov` contributes only the BSV block (its κ block is not a random effect
 /// with a prior to be far from).
 fn iov_prior_maha(
-    x: &[f64],
-    mu: &[f64],
-    n_eta: usize,
-    n_kappa: usize,
-    k_occasions: usize,
-    nested: Option<&crate::stats::nested_levels::NestedLayout>,
-    params: &ModelParameters,
+    x: &[f64], mu: &[f64], n_eta: usize, n_kappa: usize, k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>, params: &ModelParameters,
 ) -> f64 {
-    let bsv: Vec<f64> = x[..n_eta]
-        .iter()
-        .zip(mu.iter())
-        .map(|(p, m)| p - m)
-        .collect();
+    let bsv: Vec<f64> = x[..n_eta].iter().zip(mu.iter()).map(|(p, m)| p - m).collect();
     let mut q = ebe_prior_maha(&bsv, &params.omega);
     if let Some(oi) = params.omega_iov.as_ref() {
         match nested {
@@ -7928,15 +7666,8 @@ fn step_below_resolution(d: &[f64], g: &[f64], f: f64) -> bool {
 /// same holds for [`curvature_pair_accepted`].
 #[allow(clippy::too_many_arguments)]
 fn exact_step_verified_by_gradient(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &[f64],
-    d: &[f64],
-    f: f64,
-    g: &[f64],
-    stop_precond: Option<&[f64]>,
-    enable_stall: bool,
+    obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64], d: &[f64], f: f64, g: &[f64], stop_precond: Option<&[f64]>, enable_stall: bool,
 ) -> Verdict {
     if enable_stall || !step_below_resolution(d, g, f) {
         return Verdict::Rejected(None);
@@ -7958,18 +7689,9 @@ fn exact_step_verified_by_gradient(
 /// the line search then accepted.
 #[allow(clippy::too_many_arguments)]
 fn choose_step(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &[f64],
-    d: &[f64],
-    g: &[f64],
-    f_cur: f64,
-    stop_precond: Option<&[f64]>,
-    enable_stall: bool,
-    gnorm_improving: bool,
-    line_search_point: &mut [f64],
-    short_line_search: bool,
+    obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64], d: &[f64], g: &[f64], f_cur: f64, stop_precond: Option<&[f64]>, enable_stall: bool,
+    gnorm_improving: bool, line_search_point: &mut [f64], short_line_search: bool,
 ) -> StepChoice {
     let at_full_step = match exact_step_verified_by_gradient(
         obj,
@@ -7983,11 +7705,7 @@ fn choose_step(
         enable_stall,
     ) {
         Verdict::Verified(f_new, g_new) => {
-            return StepChoice::Step {
-                alpha: 1.0,
-                f_new,
-                g_new: Some(g_new),
-            }
+            return StepChoice::Step { alpha: 1.0, f_new, g_new: Some(g_new) }
         }
         Verdict::Rejected(g_full) => g_full,
     };
@@ -8005,11 +7723,9 @@ fn choose_step(
     );
     if alpha == 0.0 && floor {
         return match gradient_verified_step(obj, prime, grad, x, d, f_cur, g, stop_precond) {
-            Verdict::Verified(f_new, g_new) => StepChoice::Step {
-                alpha: 1.0,
-                f_new,
-                g_new: Some(g_new),
-            },
+            Verdict::Verified(f_new, g_new) => {
+                StepChoice::Step { alpha: 1.0, f_new, g_new: Some(g_new) }
+            }
             Verdict::Rejected(_) => StepChoice::ConvergedAtFloor,
         };
     }
@@ -8018,22 +7734,14 @@ fn choose_step(
     }
     // A full step the verification rejected but the line search accepted lands where the
     // verification already took the gradient: `x + 1.0·d` is `x + d` bit for bit.
-    StepChoice::Step {
-        alpha,
-        f_new,
-        g_new: if alpha == 1.0 { at_full_step } else { None },
-    }
+    StepChoice::Step { alpha, f_new, g_new: if alpha == 1.0 { at_full_step } else { None } }
 }
 
 /// [`choose_step`]'s outcome.
 enum StepChoice {
     /// Take `x + alpha·d`, where the objective is `f_new` and, after a verified step, the
     /// gradient `g_new`.
-    Step {
-        alpha: f64,
-        f_new: f64,
-        g_new: Option<Vec<f64>>,
-    },
+    Step { alpha: f64, f_new: f64, g_new: Option<Vec<f64>> },
     /// At an ODE objective's noise floor no step is verifiable: the solve has converged.
     ConvergedAtFloor,
     /// No sufficient-decrease step: the solve has not converged.
@@ -8085,14 +7793,8 @@ fn l2_norm(v: &[f64]) -> f64 {
 /// toward the mode; noise does not halve it repeatedly, so on a noise-floored gradient this
 /// returns `None` and the stop is unchanged. Costs one objective and one gradient.
 fn gradient_verified_step(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &[f64],
-    d: &[f64],
-    f: f64,
-    g: &[f64],
-    stop_precond: Option<&[f64]>,
+    obj: &dyn Fn(&[f64]) -> f64, prime: Option<&PrimeFn<'_>>, grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &[f64], d: &[f64], f: f64, g: &[f64], stop_precond: Option<&[f64]>,
 ) -> Verdict {
     let mut cand: Vec<f64> = crate::scratch::take_with_capacity(x.len());
     cand.extend(x.iter().zip(d).map(|(xi, di)| xi + di));
@@ -8162,26 +7864,15 @@ const INNER_NON_MOVE_STEP_REL: f64 = 1e-10;
 /// stop and is not counted.
 #[allow(clippy::too_many_arguments)]
 fn exact_search_stuck(
-    enable_stall: bool,
-    f_old: f64,
-    f_new: f64,
-    g_old: &[f64],
-    g_new: &[f64],
-    step: &[f64],
-    x_new: &[f64],
-    streak: &mut NonMoveStreak,
+    enable_stall: bool, f_old: f64, f_new: f64, g_old: &[f64], g_new: &[f64], step: &[f64],
+    x_new: &[f64], streak: &mut NonMoveStreak,
 ) -> bool {
     let travelled = streak.travelled + l2_norm(step);
     let unmoved = || {
         if travelled > INNER_NON_MOVE_STEP_REL * (1.0 + l2_norm(x_new)) {
             return false;
         }
-        let dg = g_old
-            .iter()
-            .zip(g_new)
-            .map(|(a, b)| (b - a) * (b - a))
-            .sum::<f64>()
-            .sqrt();
+        let dg = g_old.iter().zip(g_new).map(|(a, b)| (b - a) * (b - a)).sum::<f64>().sqrt();
         dg <= INNER_NON_MOVE_GRAD_REL * l2_norm(g_old)
     };
     if !enable_stall && f_new == f_old && unmoved() {
@@ -8253,11 +7944,7 @@ fn backtracking_line_search(
     }
 
     let mut alpha = 1.0;
-    let trials = if single_trial {
-        1
-    } else {
-        inner_line_search_trials(short_line_search)
-    };
+    let trials = if single_trial { 1 } else { inner_line_search_trials(short_line_search) };
     for trial in 0..trials {
         for i in 0..x.len() {
             x_new[i] = x[i] + alpha * d[i];
@@ -8349,10 +8036,7 @@ fn fd_jacobian_ode_override(
     Some(crate::ode::solver::OdeSolverOverride {
         reltol: Some(eff.reltol.min(ODE_FD_JACOBIAN_RELTOL)),
         abstol: Some(eff.abstol.min(ODE_FD_JACOBIAN_ABSTOL)),
-        max_steps: Some(
-            eff.max_steps
-                .saturating_mul(ODE_FD_JACOBIAN_MAX_STEPS_FACTOR),
-        ),
+        max_steps: Some(eff.max_steps.saturating_mul(ODE_FD_JACOBIAN_MAX_STEPS_FACTOR)),
         method: Some(eff.method),
         stiff_abort_after: Some(eff.stiff_abort_after),
         auto_switch: Some(eff.auto_switch),
@@ -8378,14 +8062,10 @@ fn fd_jacobian_ode_override(
 /// count against it. Otherwise it is redone at the fit's own settings with the same step, and
 /// counted in [`FD_H_REDONE`], which is how the fit reports it to the user.
 fn with_fd_jacobian_integration(
-    model: &CompiledModel,
-    mut difference: impl FnMut(f64) -> DMatrix<f64>,
+    model: &CompiledModel, mut difference: impl FnMut(f64) -> DMatrix<f64>,
 ) -> DMatrix<f64> {
-    let step = if model.integrator_spec().is_some() {
-        ODE_FD_JACOBIAN_STEP
-    } else {
-        FD_JACOBIAN_STEP
-    };
+    let step =
+        if model.integrator_spec().is_some() { ODE_FD_JACOBIAN_STEP } else { FD_JACOBIAN_STEP };
     if let Some(tight) = fd_jacobian_ode_override(model) {
         let stats = crate::ode::solver::SolverStatsScope::enter();
         let h = {
@@ -8427,11 +8107,8 @@ fn fd_h_redone_on_this_thread() -> usize {
 /// `0` without building anything on a model that never integrates. A subject the fit reported
 /// no EBE or no κ̂ for is skipped.
 pub(crate) fn fd_h_subjects_redone(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    etas: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    etas: &[DVector<f64>], kappas: &[Vec<DVector<f64>>],
 ) -> usize {
     use rayon::prelude::*;
     if fd_jacobian_ode_override(model).is_none() {
@@ -8467,12 +8144,8 @@ pub(crate) fn fd_h_subjects_redone(
 /// prediction calls avoids the per-event-param Vec allocation and
 /// the per-call event-merge sort.
 fn compute_jacobian_fd(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -8515,18 +8188,11 @@ fn compute_jacobian_fd(
 
 /// Run inner loop for all subjects (parallel via rayon).
 /// Warm-starts from previous EBEs when available.
-pub fn run_inner_loop(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    max_iter: usize,
+#[cfg(test)]
+pub(crate) fn run_inner_loop(
+    model: &CompiledModel, population: &Population, params: &ModelParameters, max_iter: usize,
     tol: f64,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>) {
     run_inner_loop_warm(model, population, params, max_iter, tol, None, None, 0, 0)
 }
 
@@ -8543,21 +8209,10 @@ pub fn run_inner_loop(
 /// empty for non-IOV subjects or when `model.n_kappa == 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_inner_loop_warm(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    prev_etas: Option<&[DVector<f64>]>,
-    mu_k: Option<&[f64]>,
-    min_obs: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, max_iter: usize,
+    tol: f64, prev_etas: Option<&[DVector<f64>]>, mu_k: Option<&[f64]>, min_obs: usize,
     restarts: usize,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>) {
     // A population handed as read has no level cells under nested levels; give them here, as
     // `fit()` does, rather than have every subject refused (#3004).
     let cells = crate::stats::nested_levels::with_level_cells(model, population);
@@ -8599,12 +8254,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
     stage: &crate::types::FitOptions,
     // What `prev_etas` are: a solve's output keeps an exactly-zero EBE warm.
     prev: PrevEtas,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>) {
     let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
         model,
         population,
@@ -8615,11 +8265,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
         mu_k,
         min_obs,
         restarts,
-        InnerSolvePolicy {
-            seed,
-            ..InnerSolvePolicy::for_stage(stage, model)
-        }
-        .with_prev_etas(prev),
+        InnerSolvePolicy { seed, ..InnerSolvePolicy::for_stage(stage, model) }.with_prev_etas(prev),
         // Not cancellable mid-pass (#574): this entry point feeds final readout passes,
         // Gauss–Newton and the trust region, which would carry a placeholder into a
         // returned result or an accepted state. Those poll at their own boundaries.
@@ -8634,25 +8280,11 @@ pub(crate) fn run_inner_loop_warm_seeded(
 /// marginal without launching another subject pass. Results retain subject order.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    prev_etas: Option<&[DVector<f64>]>,
-    mu_k: Option<&[f64]>,
-    min_obs: usize,
-    restarts: usize,
-    policy: InnerSolvePolicy,
-    cancel: Option<&crate::cancel::CancelFlag>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, max_iter: usize,
+    tol: f64, prev_etas: Option<&[DVector<f64>]>, mu_k: Option<&[f64]>, min_obs: usize,
+    restarts: usize, policy: InnerSolvePolicy, cancel: Option<&crate::cancel::CancelFlag>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-    Vec<T>,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>, Vec<T>) {
     run_inner_loop_warm_map_impl(
         model,
         population,
@@ -8677,27 +8309,12 @@ pub(crate) fn run_inner_loop_warm_map<T: Send + Default>(
 /// outer-loop evaluation. See [`find_ebe_cached`].
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    prev_etas: Option<&[DVector<f64>]>,
-    mu_k: Option<&[f64]>,
-    min_obs: usize,
-    restarts: usize,
-    schedules: &[Option<pk::event_driven::EventSchedule>],
-    policy: InnerSolvePolicy,
-    cancel: Option<&crate::cancel::CancelFlag>,
-    guard_stop: Option<&GuardStop>,
-    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-    Vec<T>,
-) {
+    model: &CompiledModel, population: &Population, params: &ModelParameters, max_iter: usize,
+    tol: f64, prev_etas: Option<&[DVector<f64>]>, mu_k: Option<&[f64]>, min_obs: usize,
+    restarts: usize, schedules: &[Option<pk::event_driven::EventSchedule>],
+    policy: InnerSolvePolicy, cancel: Option<&crate::cancel::CancelFlag>,
+    guard_stop: Option<&GuardStop>, finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>, Vec<T>) {
     run_inner_loop_warm_map_impl(
         model,
         population,
@@ -8730,28 +8347,13 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send + Default>(
 /// changes nothing where the prediction works (#2549 review r2 #3).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn run_inner_loop_predicted_map_cached<T: Send + Default>(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    prev_etas: &[DVector<f64>],
-    predicted_from: PredictedFromAll<'_>,
-    mu_k: Option<&[f64]>,
-    min_obs: usize,
-    restarts: usize,
-    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
-    policy: InnerSolvePolicy,
-    cancel: Option<&crate::cancel::CancelFlag>,
-    guard_stop: Option<&GuardStop>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, max_iter: usize,
+    tol: f64, prev_etas: &[DVector<f64>], predicted_from: PredictedFromAll<'_>,
+    mu_k: Option<&[f64]>, min_obs: usize, restarts: usize,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>, policy: InnerSolvePolicy,
+    cancel: Option<&crate::cancel::CancelFlag>, guard_stop: Option<&GuardStop>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-    Vec<T>,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>, Vec<T>) {
     run_inner_loop_warm_map_impl(
         model,
         population,
@@ -8802,20 +8404,15 @@ fn solve_failed(ebe: &EbeResult) -> bool {
 /// `n_obs × n_eta` zero H, one κ per occasion) so no consumer indexes out of bounds on the
 /// way out; `fit()` returns `Err("cancelled by user")` before any of it is reported.
 fn cancelled_ebe_placeholder(
-    model: &CompiledModel,
-    subject: &Subject,
-    init: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, init: Option<&[f64]>,
 ) -> EbeResult {
     // A joint warm start (`η̂` then each cell's κ̂, #2261) leads with `η̂`.
     let eta = match init {
         Some(e) if e.len() >= model.n_eta => DVector::from_column_slice(&e[..model.n_eta]),
         _ => DVector::zeros(model.n_eta),
     };
-    let n_occ = if model.n_kappa > 0 {
-        crate::stats::stacked_layout::group_count(subject)
-    } else {
-        0
-    };
+    let n_occ =
+        if model.n_kappa > 0 { crate::stats::stacked_layout::group_count(subject) } else { 0 };
     EbeResult {
         eta,
         h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
@@ -8954,13 +8551,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     // #2709). `None`: every subject is solved.
     guard_stop: Option<&GuardStop>,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-    Vec<T>,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats, Vec<Vec<DVector<f64>>>, Vec<T>) {
     #[cfg(test)]
     let mut pass = 0;
     #[cfg(test)]
@@ -8983,18 +8574,12 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
             if cancel.is_some_and(crate::cancel::CancelFlag::is_cancelled)
                 || guard_stop.is_some_and(GuardStop::stopped)
             {
-                return (
-                    cancelled_ebe_placeholder(model, subject, init),
-                    T::default(),
-                );
+                return (cancelled_ebe_placeholder(model, subject, init), T::default());
             }
             // Both arms route through `find_ebe_cached` so the policy reaches the solve
             // either way; the uncached arm just builds its schedule per call.
-            let local_schedule = if schedules.is_none() {
-                cacheable_schedule(model, subject)
-            } else {
-                None
-            };
+            let local_schedule =
+                if schedules.is_none() { cacheable_schedule(model, subject) } else { None };
             let schedule = match schedules {
                 Some(cache) => cache[i].as_ref(),
                 None => local_schedule.as_ref(),

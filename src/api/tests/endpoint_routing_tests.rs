@@ -35,9 +35,7 @@ fn model(path: &str) -> CompiledModel {
 
 /// The model-aware read every fitting entry point is documented to use.
 fn routed(m: &CompiledModel, data: &str) -> Population {
-    read_population_for(m, &None, data, None, None, None, &[])
-        .expect("routed read")
-        .0
+    read_population_for(m, &None, data, None, None, None, &[]).expect("routed read").0
 }
 
 /// The model-blind public reader — the wrong loader for these models.
@@ -90,10 +88,7 @@ fn total_events(pop: &Population) -> usize {
 }
 
 fn gaussian_rows_on(pop: &Population, cmt: usize) -> usize {
-    pop.subjects
-        .iter()
-        .map(|s| s.obs_cmts.iter().filter(|&&c| c == cmt).count())
-        .sum()
+    pop.subjects.iter().map(|s| s.obs_cmts.iter().filter(|&&c| c == cmt).count()).sum()
 }
 
 /// The two reads really do differ in the way the guard relies on — asserted here
@@ -104,11 +99,7 @@ fn the_two_reads_of_the_joint_fixture_differ_by_the_guard_signature() {
     let r = routed(&m, JOINT_DATA);
     let u = unrouted(JOINT_DATA);
     assert!(total_events(&r) > 0, "routed read must carry event records");
-    assert_eq!(
-        gaussian_rows_on(&r, 3),
-        0,
-        "routed read keeps CMT 3 out of the Gaussian grid"
-    );
+    assert_eq!(gaussian_rows_on(&r, 3), 0, "routed read keeps CMT 3 out of the Gaussian grid");
     assert_eq!(total_events(&u), 0, "unrouted read has no event records");
     assert_eq!(
         gaussian_rows_on(&u, 3),
@@ -133,18 +124,9 @@ fn fit_rejects_an_unrouted_joint_population() {
     );
     let msg = message_of(&diags, "E_ENDPOINT_UNROUTED");
     assert!(msg.contains("CMT 3"), "names the CMT: {msg}");
-    assert!(
-        msg.contains("time-to-event"),
-        "names the endpoint kind: {msg}"
-    );
-    assert!(
-        msg.contains("read_population_for"),
-        "names the loader to use: {msg}"
-    );
-    assert!(
-        msg.contains("subject 1)"),
-        "names the first offending subject: {msg}"
-    );
+    assert!(msg.contains("time-to-event"), "names the endpoint kind: {msg}");
+    assert!(msg.contains("read_population_for"), "names the loader to use: {msg}");
+    assert!(msg.contains("subject 1)"), "names the first offending subject: {msg}");
 
     let err = fit(&m, &u, &m.default_params, &FitOptions::default())
         .expect_err("fit() must refuse the unrouted population")
@@ -164,11 +146,7 @@ fn fit_accepts_the_routed_joint_population() {
         "routed population must pass the guard, got {:?}",
         codes(&diags)
     );
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..FitOptions::default() };
     let res = fit(&m, &r, &m.default_params, &opts).expect("routed joint fit runs");
     assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
 }
@@ -181,16 +159,8 @@ fn fit_rejects_a_routed_population_whose_endpoint_has_no_rows() {
     let m = model(JOINT_MODEL);
     let f = without_cmt_column(JOINT_DATA);
     let r = routed(&m, f.path().to_str().unwrap());
-    assert_eq!(
-        total_events(&r),
-        0,
-        "the dropped column leaves no event records"
-    );
-    assert_eq!(
-        gaussian_rows_on(&r, 3),
-        0,
-        "…and no Gaussian row on CMT 3 either"
-    );
+    assert_eq!(total_events(&r), 0, "the dropped column leaves no event records");
+    assert_eq!(gaussian_rows_on(&r, 3), 0, "…and no Gaussian row on CMT 3 either");
 
     let diags = check_model_data(&m, &r);
     assert!(
@@ -200,10 +170,7 @@ fn fit_rejects_a_routed_population_whose_endpoint_has_no_rows() {
     );
     let msg = message_of(&diags, "E_ENDPOINT_NO_RECORDS");
     assert!(msg.contains("CMT=3"), "names the CMT: {msg}");
-    assert!(
-        msg.contains("`CMT` column"),
-        "points at the missing column: {msg}"
-    );
+    assert!(msg.contains("`CMT` column"), "points at the missing column: {msg}");
 
     let err = fit(&m, &r, &m.default_params, &FitOptions::default())
         .expect_err("fit() must refuse an endpoint with no rows")
@@ -228,9 +195,7 @@ fn a_binary_endpoint_gets_the_same_two_codes() {
 
     let ok = routed(&m, BINARY_DATA);
     assert!(
-        !codes(&check_model_data(&m, &ok))
-            .iter()
-            .any(|c| c.starts_with("E_ENDPOINT_")),
+        !codes(&check_model_data(&m, &ok)).iter().any(|c| c.starts_with("E_ENDPOINT_")),
         "routed binary population must pass"
     );
 }
@@ -244,19 +209,11 @@ fn a_markov_endpoint_gets_the_unrouted_code() {
     const DTMM_MODEL: &str = "examples/dtmm_2state.ferx";
     const DTMM_DATA: &str = "nonmem_anchor/dtmm_2state.csv";
     let m = model(DTMM_MODEL);
-    let msg = message_of(
-        &check_model_data(&m, &unrouted(DTMM_DATA)),
-        "E_ENDPOINT_UNROUTED",
-    );
-    assert!(
-        msg.contains("CMT 5") && msg.contains("Markov (`[markov_model]`)"),
-        "{msg}"
-    );
+    let msg = message_of(&check_model_data(&m, &unrouted(DTMM_DATA)), "E_ENDPOINT_UNROUTED");
+    assert!(msg.contains("CMT 5") && msg.contains("Markov (`[markov_model]`)"), "{msg}");
     let ok = routed(&m, DTMM_DATA);
     assert!(
-        !codes(&check_model_data(&m, &ok))
-            .iter()
-            .any(|c| c.starts_with("E_ENDPOINT_")),
+        !codes(&check_model_data(&m, &ok)).iter().any(|c| c.starts_with("E_ENDPOINT_")),
         "routed DTMM population must pass"
     );
 }
@@ -268,10 +225,7 @@ fn predict_errs_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
     let err = predict(&m, &u, &m.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("E_ENDPOINT_UNROUTED"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
 }
 
 /// `inits_from_nca`'s sweep strategies score grid points with `predict()`, which checks
@@ -341,10 +295,7 @@ fn simulate_rejects_an_unrouted_population_but_not_an_event_free_template() {
         },
     )
     .expect_err("simulate() must refuse the unrouted population");
-    assert!(
-        err.to_string().contains("E_ENDPOINT_UNROUTED"),
-        "simulate() error: {err}"
-    );
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "simulate() error: {err}");
 
     let mut template = routed(&m, JOINT_DATA);
     for s in &mut template.subjects {
@@ -374,9 +325,7 @@ fn ferx_check_reports_the_missing_cmt_column() {
 
     let clean = validate_model_file(JOINT_MODEL, Some(JOINT_DATA));
     assert!(
-        !codes(&clean.diagnostics)
-            .iter()
-            .any(|c| c.starts_with("E_ENDPOINT_")),
+        !codes(&clean.diagnostics).iter().any(|c| c.starts_with("E_ENDPOINT_")),
         "the intact fixture must pass `ferx check`: {:?}",
         codes(&clean.diagnostics)
     );
@@ -398,11 +347,7 @@ fn the_shared_reread_is_routed() {
 /// A `FitResult` for the joint model with its file paths and hashes recorded, as
 /// `fit_from_files` produces — the input `run_covariance` / `run_sir` re-read from.
 fn joint_fit_from_files() -> crate::types::FitResult {
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..FitOptions::default() };
     crate::api::fit_from_files(JOINT_MODEL, Some(JOINT_DATA), None, Some(opts))
         .expect("joint fit at the initial estimates")
 }
@@ -497,28 +442,15 @@ fn a_record_of_the_wrong_kind_on_an_endpoint_cmt_is_refused() {
     let m = model(COUNT_MODEL);
     let ok = routed(&m, COUNT_DATA);
     assert!(
-        !codes(&check_model_data(&m, &ok))
-            .iter()
-            .any(|c| c.starts_with("E_ENDPOINT_")),
+        !codes(&check_model_data(&m, &ok)).iter().any(|c| c.starts_with("E_ENDPOINT_")),
         "routed count population must pass"
     );
     let mut bad = ok.clone();
     let mut n = 0;
     for s in &mut bad.subjects {
         for r in &mut s.obs_records {
-            if let ObsRecord::Count {
-                time,
-                raw_time,
-                count,
-                cmt,
-            } = *r
-            {
-                *r = ObsRecord::DiscreteState {
-                    time,
-                    raw_time,
-                    state: count as usize,
-                    cmt,
-                };
+            if let ObsRecord::Count { time, raw_time, count, cmt } = *r {
+                *r = ObsRecord::DiscreteState { time, raw_time, state: count as usize, cmt };
                 n += 1;
             }
         }
@@ -526,20 +458,9 @@ fn a_record_of_the_wrong_kind_on_an_endpoint_cmt_is_refused() {
     assert!(n > 0, "the fixture carries count records");
     let diags = check_model_data(&m, &bad);
     let msg = message_of(&diags, "E_ENDPOINT_RECORD_KIND");
-    assert!(
-        msg.contains("CMT 1 is declared as a count (`[count_model]`) endpoint"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains(&format!(
-            "{n} record(s) on it are `ObsRecord::DiscreteState`"
-        )),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("A count (`[count_model]`) record is `ObsRecord::Count`"),
-        "{msg}"
-    );
+    assert!(msg.contains("CMT 1 is declared as a count (`[count_model]`) endpoint"), "{msg}");
+    assert!(msg.contains(&format!("{n} record(s) on it are `ObsRecord::DiscreteState`")), "{msg}");
+    assert!(msg.contains("A count (`[count_model]`) record is `ObsRecord::Count`"), "{msg}");
     assert!(msg.contains("first: subject 1"), "{msg}");
     assert!(msg.contains("`read_population_for(&model, ...)`"), "{msg}");
     assert!(
@@ -557,19 +478,8 @@ fn a_record_of_the_wrong_kind_on_an_endpoint_cmt_is_refused() {
     let mut bad = routed(&m, BINARY_DATA);
     for s in &mut bad.subjects {
         for r in &mut s.obs_records {
-            if let ObsRecord::DiscreteState {
-                time,
-                raw_time,
-                state,
-                cmt,
-            } = *r
-            {
-                *r = ObsRecord::Count {
-                    time,
-                    raw_time,
-                    count: state as u32,
-                    cmt,
-                };
+            if let ObsRecord::DiscreteState { time, raw_time, state, cmt } = *r {
+                *r = ObsRecord::Count { time, raw_time, count: state as u32, cmt };
             }
         }
     }

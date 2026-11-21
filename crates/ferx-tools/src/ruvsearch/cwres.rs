@@ -62,10 +62,7 @@ impl Screen {
     /// The screening dataset and models for `features`, from the parent's
     /// fit on `population`.
     pub fn build(
-        fit: &FitResult,
-        population: &Population,
-        features: &[RuvFeature],
-        tad_cutoffs: &[f64],
+        fit: &FitResult, population: &Population, features: &[RuvFeature], tad_cutoffs: &[f64],
         iteration: usize,
     ) -> Result<Screen, String> {
         let screening = screening_population(fit, population)?;
@@ -94,20 +91,14 @@ impl Screen {
             candidates.push(Candidate::new(&id, model_text(&src)).parent(base_id.clone()));
             out_features.push((feature, id));
         }
-        Ok(Screen {
-            population: screening,
-            candidates,
-            base_id,
-            features: out_features,
-        })
+        Ok(Screen { population: screening, candidates, base_id, features: out_features })
     }
 }
 
 /// The parent's CWRES as a dataset: one subject per subject, one record per
 /// observation with a finite CWRES and IPRED, the doses kept for `TAD`.
 pub fn screening_population(
-    fit: &FitResult,
-    population: &Population,
+    fit: &FitResult, population: &Population,
 ) -> Result<Population, String> {
     if fit.subjects.len() != population.subjects.len() {
         return Err(format!(
@@ -193,10 +184,7 @@ fn base_model() -> String {
 }
 
 fn iiv_on_ruv_model() -> String {
-    screening_model(
-        "  DV ~ additive(SIG)\n  iiv_on_ruv = ETA_RUV",
-        "  omega ETA_RUV ~ 0.09\n",
-    )
+    screening_model("  DV ~ additive(SIG)\n  iiv_on_ruv = ETA_RUV", "  omega ETA_RUV ~ 0.09\n")
 }
 
 fn power_model() -> String {
@@ -210,11 +198,8 @@ fn power_model() -> String {
 /// inits are `σ_p² = 1` and `σ_a² = |min IPRED| / 2`, so the ratio starts at
 /// `√(|min IPRED| / 2)`.
 fn combined_model(ipred_min: f64) -> String {
-    let ratio = if ipred_min.is_finite() && ipred_min > 0.0 {
-        (ipred_min / 2.0).sqrt()
-    } else {
-        0.1
-    };
+    let ratio =
+        if ipred_min.is_finite() && ipred_min > 0.0 { (ipred_min / 2.0).sqrt() } else { 0.1 };
     screening_model(
         &format!("  DV ~ additive(SIG * sqrt(1.0 + (RUV_ADD / {IPRED_COLUMN})^2))"),
         &format!("  theta RUV_ADD({}, 0.0, 1000000.0)\n", ferx_num(ratio)),
@@ -223,10 +208,7 @@ fn combined_model(ipred_min: f64) -> String {
 
 fn time_varying_model(cutoff: f64) -> String {
     screening_model(
-        &format!(
-            "  DV ~ additive(SIG * (if (TAD < {}) RUV_TV else 1.0))",
-            ferx_num(cutoff)
-        ),
+        &format!("  DV ~ additive(SIG * (if (TAD < {}) RUV_TV else 1.0))", ferx_num(cutoff)),
         "  theta RUV_TV(0.1, 0.001, 100.0)\n",
     )
 }

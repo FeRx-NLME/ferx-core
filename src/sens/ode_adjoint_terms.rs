@@ -18,24 +18,12 @@ pub(super) fn layout2(n: usize) -> Layout {
     if n == 0 {
         return Layout::F64;
     }
-    Layout {
-        n: n as u16,
-        m: (n * (n + 1) / 2) as u16,
-        th: false,
-        wide: false,
-        tan: 0,
-    }
+    Layout { n: n as u16, m: (n * (n + 1) / 2) as u16, th: false, wide: false, tan: 0 }
 }
 
 /// The first-order layout over `n` random effects.
 pub(super) fn layout1(n: usize) -> Layout {
-    Layout {
-        n: n as u16,
-        m: 0,
-        th: false,
-        wide: false,
-        tan: 0,
-    }
+    Layout { n: n as u16, m: 0, th: false, wide: false, tan: 0 }
 }
 
 #[cfg(feature = "survival")]
@@ -66,10 +54,7 @@ pub(super) fn h_lane(n: usize, k: usize, l: usize) -> usize {
 /// The plan (the first of the subject's variants whose guard holds) and its forward at
 /// `layout`: the output's lanes, and the forward kept for the plan's reverse passes.
 fn forward(
-    plans: &kj::Variants,
-    layout: Layout,
-    theta: &[f64],
-    eta: &[f64],
+    plans: &kj::Variants, layout: Layout, theta: &[f64], eta: &[f64],
 ) -> Option<(Arc<kj::Plan>, Vec<f64>, kj::Fwd)> {
     let (u, p) = inputs(layout, theta, eta);
     let l = layout.lanes();
@@ -87,9 +72,7 @@ fn forward(
 /// `(q, ∇q, ∇²q)` from a second-order forward's lanes.
 fn jets2(n: usize, lanes: &[f64]) -> (f64, Vec<f64>, Vec<Vec<f64>>) {
     let g = (0..n).map(|k| lanes[1 + k]).collect();
-    let h = (0..n)
-        .map(|k| (0..n).map(|l| lanes[h_lane(n, k, l)]).collect())
-        .collect();
+    let h = (0..n).map(|k| (0..n).map(|l| lanes[h_lane(n, k, l)]).collect()).collect();
     (lanes[0], g, h)
 }
 
@@ -98,12 +81,7 @@ fn jets2(n: usize, lanes: &[f64]) -> (f64, Vec<f64>, Vec<Vec<f64>>) {
 /// when none of the cached ones does. `None` when the term does not record.
 #[cfg(feature = "survival")]
 pub(crate) fn term_plans<S: crate::survival::SubjectTerm>(
-    model: &CompiledModel,
-    subject: &Subject,
-    kind: TermKind,
-    term: &S,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, kind: TermKind, term: &S, theta: &[f64], eta: &[f64],
 ) -> Option<kj::Kernels> {
     use std::sync::atomic::Ordering::Relaxed;
     if subject.obs_records.is_empty() {
@@ -123,16 +101,8 @@ pub(crate) fn term_plans<S: crate::survival::SubjectTerm>(
         kj::Lookup::Missing => {}
     }
     kj::begin();
-    let th: Vec<kj::Tr> = theta
-        .iter()
-        .enumerate()
-        .map(|(j, &v)| kj::Tr::theta(j, v))
-        .collect();
-    let et: Vec<kj::Tr> = eta
-        .iter()
-        .enumerate()
-        .map(|(k, &v)| kj::Tr::eta(k, v))
-        .collect();
+    let th: Vec<kj::Tr> = theta.iter().enumerate().map(|(j, &v)| kj::Tr::theta(j, v)).collect();
+    let et: Vec<kj::Tr> = eta.iter().enumerate().map(|(k, &v)| kj::Tr::eta(k, v)).collect();
     let y = term.eval(&th, &et);
     let rec = match kj::end(y.map(|v| vec![v.reg()])) {
         Ok(r) => r,
@@ -182,10 +152,7 @@ impl TermKind {
 /// The subject's non-Gaussian term plans.
 #[cfg(feature = "survival")]
 pub(super) fn non_gaussian_plans(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<kj::Kernels> {
     let term = crate::survival::NonGaussianTerm::new(model, subject);
     term_plans(model, subject, TermKind::NonGaussian, &term, theta, eta)
@@ -193,10 +160,7 @@ pub(super) fn non_gaussian_plans(
 
 #[cfg(not(feature = "survival"))]
 pub(super) fn non_gaussian_plans(
-    _: &CompiledModel,
-    _: &Subject,
-    _: &[f64],
-    _: &[f64],
+    _: &CompiledModel, _: &Subject, _: &[f64], _: &[f64],
 ) -> Option<kj::Kernels> {
     None
 }
@@ -204,12 +168,7 @@ pub(super) fn non_gaussian_plans(
 /// `(q, ∇q, ∇²q)` of a subject term from its plan's second-order forward.
 #[cfg(all(test, feature = "survival"))]
 pub(crate) fn term_jets2_planned<S>(
-    model: &CompiledModel,
-    subject: &Subject,
-    kind: TermKind,
-    term: &S,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, kind: TermKind, term: &S, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>, Vec<Vec<f64>>)>
 where
     S: TermEval,
@@ -223,12 +182,7 @@ where
 #[cfg(feature = "survival")]
 /// `(q, ∇q)` of a subject term from its plan's first-order forward.
 pub(crate) fn term_gradient_planned<S>(
-    model: &CompiledModel,
-    subject: &Subject,
-    kind: TermKind,
-    term: &S,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, kind: TermKind, term: &S, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)>
 where
     S: TermEval,
@@ -244,24 +198,14 @@ where
 /// A term the plans can serve: every `SubjectTerm` with `survival`, none without.
 pub(crate) trait TermEval {
     fn plans(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        kind: TermKind,
-        theta: &[f64],
-        eta: &[f64],
+        &self, model: &CompiledModel, subject: &Subject, kind: TermKind, theta: &[f64], eta: &[f64],
     ) -> Option<kj::Kernels>;
 }
 
 #[cfg(feature = "survival")]
 impl<S: crate::survival::SubjectTerm> TermEval for S {
     fn plans(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        kind: TermKind,
-        theta: &[f64],
-        eta: &[f64],
+        &self, model: &CompiledModel, subject: &Subject, kind: TermKind, theta: &[f64], eta: &[f64],
     ) -> Option<kj::Kernels> {
         term_plans(model, subject, kind, self, theta, eta)
     }
@@ -270,10 +214,7 @@ impl<S: crate::survival::SubjectTerm> TermEval for S {
 #[cfg(feature = "survival")]
 /// `(q, ∇q, ∇²q)` of the subject's non-Gaussian term at `(theta, eta)` from its plan.
 pub(crate) fn non_gaussian_jets2_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>, Vec<Vec<f64>>)> {
     let plans = non_gaussian_plans(model, subject, theta, eta)?;
     let n = eta.len();
@@ -284,10 +225,7 @@ pub(crate) fn non_gaussian_jets2_planned(
 #[cfg(feature = "survival")]
 /// `(q, ∇q)` of the subject's non-Gaussian term from its plan's first-order forward.
 pub(crate) fn non_gaussian_gradient_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
     let plans = non_gaussian_plans(model, subject, theta, eta)?;
     let n = eta.len();
@@ -300,10 +238,7 @@ pub(crate) fn non_gaussian_gradient_planned(
 /// `(q, ∇q, ∇²q)` from the plan's second-order forward, kept with the plan: the third order
 /// is only contracted ([`super::NgJets::contract_t`], [`contract_hessian_lanes`]).
 pub(super) fn non_gaussian_jets3_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<NgJets> {
     let plans = non_gaussian_plans(model, subject, theta, eta)?;
     let n = eta.len();
@@ -319,10 +254,7 @@ pub(super) fn non_gaussian_jets3_planned(
 /// `Σ_{k≥l} a_h[k][l]·∂³q/∂η_k∂η_l∂η_m` for every `m`: one reverse of the kept second-order
 /// forward, seeded with `a_h` on the `∇²q` lanes (its η value lanes).
 pub(super) fn contract_hessian_lanes(
-    plan: &kj::Plan,
-    fwd: &kj::Fwd,
-    n: usize,
-    a_h: &[Vec<f64>],
+    plan: &kj::Plan, fwd: &kj::Fwd, n: usize, a_h: &[Vec<f64>],
 ) -> Option<Vec<f64>> {
     let layout = fwd.layout();
     let l = layout.lanes();
@@ -345,10 +277,7 @@ pub(super) fn contract_hessian_lanes(
 /// `Σ_parts ∂/∂θ [a_q·q + Σ_k a_g,k·∂_k q + Σ_{k≥l} a_h,kl·∂²_kl q]` at each part's η, from
 /// the plan's reverse (one per part, θ's value lanes): [`ng_theta_adjoint`]'s quantity.
 pub(super) fn non_gaussian_theta_adjoint_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    parts: &[NgSeed<'_>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], parts: &[NgSeed<'_>],
 ) -> Option<Vec<f64>> {
     let mut out = vec![0.0; theta.len()];
     for part in parts {
@@ -371,10 +300,7 @@ pub(super) fn non_gaussian_theta_adjoint_planned(
 /// one forward and one reverse for every seed, at the value layout when every seed weights
 /// the value alone (an AGQ node's) and the second-order one otherwise.
 pub(super) fn non_gaussian_theta_seeds_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     seeds: &[(f64, &[f64], &[Vec<f64>])],
 ) -> Option<Vec<Vec<f64>>> {
     let n = eta.len();
@@ -382,11 +308,7 @@ pub(super) fn non_gaussian_theta_seeds_planned(
     let value_only = seeds.iter().all(|(_, a_g, a_h)| {
         a_g.iter().all(|&v| v == 0.0) && a_h.iter().flatten().all(|&v| v == 0.0)
     });
-    let layout = if value_only || n == 0 {
-        Layout::F64
-    } else {
-        layout2(n)
-    };
+    let layout = if value_only || n == 0 { Layout::F64 } else { layout2(n) };
     let (plan, _, fw) = forward(&plans, layout, theta, eta)?;
     let l = layout.lanes();
     let mut du_bar = vec![0.0; seeds.len() * l];
@@ -413,11 +335,7 @@ pub(super) fn non_gaussian_theta_seeds_planned(
         return None;
     }
     let out: Vec<Vec<f64>> = (0..seeds.len())
-        .map(|s| {
-            (0..theta.len())
-                .map(|j| p_bar[s * p.len() + j * l])
-                .collect()
-        })
+        .map(|s| (0..theta.len()).map(|j| p_bar[s * p.len() + j * l]).collect())
         .collect();
     out.iter().flatten().all(|v| v.is_finite()).then_some(out)
 }
@@ -426,10 +344,7 @@ pub(super) fn non_gaussian_theta_seeds_planned(
 /// The term's value and θ-gradient at fixed `eta`, from the plan: the value-layout forward and
 /// its reverse seeded on the value ([`non_gaussian_theta_score`]'s quantity).
 pub(super) fn non_gaussian_theta_score_planned(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
     let plans = non_gaussian_plans(model, subject, theta, eta)?;
     let layout = Layout::F64;

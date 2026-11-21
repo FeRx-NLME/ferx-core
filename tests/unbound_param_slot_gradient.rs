@@ -70,11 +70,7 @@ fn eval_only_ofv(src: &str, gradient_method: GradientMethod) -> (f64, Vec<String
         ..FitOptions::default()
     };
     let r = fit(&model, population, &model.default_params, &opts).expect("eval-only fit");
-    assert!(
-        r.ofv.is_finite(),
-        "{gradient_method:?}: OFV must be finite, got {}",
-        r.ofv
-    );
+    assert!(r.ofv.is_finite(), "{gradient_method:?}: OFV must be finite, got {}", r.ofv);
     (r.ofv, r.warnings.clone())
 }
 
@@ -92,14 +88,9 @@ fn an_unbound_parameters_slot_does_not_move_the_objective() {
     // No public fixture reaches either any more, so their wording is pinned where a plan
     // failure can be forced: `fd_fallback_warning_counts_the_route_that_runs`
     // (`estimation/inner_optimizer_tests.rs`) and `outer_fd_fallback_warning_tests.rs`.
-    let fallback: Vec<&String> = warnings
-        .iter()
-        .filter(|w| w.contains("finite-difference"))
-        .collect();
-    assert!(
-        fallback.is_empty(),
-        "the Auto arm must stay on the analytic route: {fallback:?}"
-    );
+    let fallback: Vec<&String> =
+        warnings.iter().filter(|w| w.contains("finite-difference")).collect();
+    assert!(fallback.is_empty(), "the Auto arm must stay on the analytic route: {fallback:?}");
 
     // Measured on the reference platform — `tools/linux-test.sh --jobs 2 -- test
     // --test unbound_param_slot_gradient --no-default-features --features ci`,

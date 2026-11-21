@@ -104,11 +104,7 @@ fn closed_form(t: f64) -> f64 {
     let (k, ka, v) = (0.1_f64, 1.5_f64, 50.0_f64);
     let (d1, d2, lag) = (70.0_f64, 20.0_f64, 2.0_f64);
     let oral = d1 * ka / (ka - k) * ((-k * t).exp() - (-ka * t).exp());
-    let iv = if t >= lag {
-        d2 * (-k * (t - lag)).exp()
-    } else {
-        0.0
-    };
+    let iv = if t >= lag { d2 * (-k * (t - lag)).exp() } else { 0.0 };
     (oral + iv) / v
 }
 
@@ -137,11 +133,7 @@ fn ode_two_cmt_dose_matches_nonmem() {
     assert_eq!(preds.len(), REFERENCE.len());
 
     for (p, &(t, expected)) in preds.iter().zip(REFERENCE) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "prediction time {} != expected {t}",
-            p.time
-        );
+        assert!((p.time - t).abs() < 1e-9, "prediction time {} != expected {t}", p.time);
         let rel = (p.pred - expected).abs() / expected;
         assert!(
             rel < 1e-4,

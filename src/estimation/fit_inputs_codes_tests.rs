@@ -1,5 +1,5 @@
 //! #1774 part b: every input refusal of `run_sir` / `run_covariance` carries a code,
-//! one per cause. The post-hoc codes are assigned in `api/entry_refusals.rs`; the
+//! one per cause. The post-hoc codes are assigned in `entry_refusals.rs`; the
 //! re-reads of `fit.model_path` and `fit.data_path` are coded by `ferx check`'s own
 //! read classifiers (`model_source_diagnostic`, `data_read_diagnostic`,
 //! `selection_filter_diagnostic` in `validation.rs`), so a failure both can reach gets
@@ -57,20 +57,10 @@ fn check_rows(rows: Vec<Row>) {
             bad.push(format!("{}: code {:?}, want {}", r.name, e.code(), r.code));
         }
         if e.block() != r.block {
-            bad.push(format!(
-                "{}: block {:?}, want {:?}",
-                r.name,
-                e.block(),
-                r.block
-            ));
+            bad.push(format!("{}: block {:?}, want {:?}", r.name, e.block(), r.block));
         }
         if e.context() != r.context {
-            bad.push(format!(
-                "{}: context {:?}, want {:?}",
-                r.name,
-                e.context(),
-                r.context
-            ));
+            bad.push(format!("{}: context {:?}, want {:?}", r.name, e.context(), r.context));
         }
         if e.to_string() != r.text {
             bad.push(format!("{}: text\n  got:  {e}\n  want: {}", r.name, r.text));
@@ -80,10 +70,7 @@ fn check_rows(rows: Vec<Row>) {
 }
 
 fn run(
-    entry: &str,
-    c: &Case,
-    fit: &FitResult,
-    model: Option<&CompiledModel>,
+    entry: &str, c: &Case, fit: &FitResult, model: Option<&CompiledModel>,
     population: Option<&Population>,
 ) -> Result<(), EngineError> {
     match entry {
@@ -94,12 +81,8 @@ fn run(
 
 /// A row of `entry`, the entry point's context, `text` after its `"{entry}: "`.
 fn row(
-    name: &str,
-    entry: &'static str,
-    got: Result<(), EngineError>,
-    code: &'static str,
-    block: Option<&'static str>,
-    text: &str,
+    name: &str, entry: &'static str, got: Result<(), EngineError>, code: &'static str,
+    block: Option<&'static str>, text: &str,
 ) -> Row {
     Row {
         name: format!("{entry}/{name}"),
@@ -129,12 +112,7 @@ fn files(c: &Case) -> Files {
     let mut fit = c.fit.clone();
     fit.model_path = Some(model.to_str().unwrap().to_string());
     fit.data_path = Some(data.to_str().unwrap().to_string());
-    Files {
-        _dir: dir,
-        model,
-        data,
-        fit,
-    }
+    Files { _dir: dir, model, data, fit }
 }
 
 fn show(p: &Path) -> String {
@@ -181,10 +159,8 @@ fn raw_read(model: &CompiledModel, settings: &crate::api::ReaderSettings, path: 
             && settings.ignore_subjects.is_empty(),
         "the fixture's recorded settings carry no row filter"
     );
-    let fallback: Option<Vec<&str>> = settings
-        .fallback_columns
-        .as_ref()
-        .map(|cols| cols.iter().map(String::as_str).collect());
+    let fallback: Option<Vec<&str>> =
+        settings.fallback_columns.as_ref().map(|cols| cols.iter().map(String::as_str).collect());
     crate::api::read_population_for(
         model,
         &settings.covariate_decls,
@@ -287,10 +263,7 @@ fn the_post_hoc_input_refusals_carry_their_codes() {
         let stored = fs.fit.model_hash.clone().unwrap();
         std::fs::write(
             &fs.model,
-            format!(
-                "{}\n# edited\n",
-                std::fs::read_to_string(&fs.model).unwrap()
-            ),
+            format!("{}\n# edited\n", std::fs::read_to_string(&fs.model).unwrap()),
         )
         .unwrap();
         let current = crate::io::hash::sha256_file(&fs.model).unwrap();
@@ -385,14 +358,7 @@ fn the_re_reads_carry_ferx_checks_codes() {
         let gone = format!("cannot read the model file {}: {os}.", show(&fs.model));
         let r = run(entry, &c, &fs.fit, None, None);
         assert_check_agrees("model gone", &fs.model, None, r.as_ref().unwrap_err());
-        rows.push(row(
-            "model file gone, rebuilt",
-            entry,
-            r,
-            "E_MODEL_READ",
-            None,
-            &gone,
-        ));
+        rows.push(row("model file gone, rebuilt", entry, r, "E_MODEL_READ", None, &gone));
         let mut legacy = fs.fit.clone();
         legacy.reader_settings = None;
         rows.push(row(
@@ -458,14 +424,7 @@ fn the_re_reads_carry_ferx_checks_codes() {
             Some("E_DATA"),
             "ferx check's code for a data file it cannot read"
         );
-        rows.push(row(
-            "data file gone, recorded settings",
-            entry,
-            r,
-            "E_DATA",
-            None,
-            &read,
-        ));
+        rows.push(row("data file gone, recorded settings", entry, r, "E_DATA", None, &read));
         let mut file_settings = f.clone();
         file_settings.reader_settings = None;
         rows.push(row(
@@ -680,10 +639,7 @@ fn invalid_ode_solver_options_carry_their_code_on_every_entry() {
     for (name, o, text) in &cases {
         let entries: [(&str, Result<(), EngineError>); 3] = [
             ("run_sir", run_sir(&c.fit, None, None, o).map(|_| ())),
-            (
-                "run_covariance",
-                run_covariance(&c.fit, None, None, o).map(|_| ()),
-            ),
+            ("run_covariance", run_covariance(&c.fit, None, None, o).map(|_| ())),
             (
                 "run_sir_core_coded",
                 crate::estimation::sir::run_sir_core_coded(model, pop, params, &etas, &cov, 0.0, o)
@@ -719,11 +675,7 @@ fn invalid_ode_solver_options_carry_their_code_on_every_entry() {
 #[test]
 fn sirs_own_input_refusals_carry_their_codes() {
     let c = super::test_fixtures::sir_case(Kind::Plain);
-    let cov = c
-        .fit
-        .covariance_matrix
-        .as_ref()
-        .expect("the SIR case carries one");
+    let cov = c.fit.covariance_matrix.as_ref().expect("the SIR case carries one");
     let n = cov.nrows();
     let mut wrong = c.fit.clone();
     wrong.covariance_matrix = Some(nalgebra::DMatrix::identity(2, 2));

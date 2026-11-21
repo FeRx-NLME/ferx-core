@@ -74,9 +74,7 @@ type Row = (String, usize, usize, f64, f64, f64);
 fn tuples(rows: &[SimulationResult]) -> Vec<Row> {
     rows.iter()
         .map(|r| {
-            let SimOutcome::Continuous { value } = r.outcome else {
-                panic!("a Gaussian endpoint")
-            };
+            let SimOutcome::Continuous { value } = r.outcome else { panic!("a Gaussian endpoint") };
             (r.id.clone(), r.draw, r.sim, r.time, r.ipred, value)
         })
         .collect()
@@ -105,14 +103,8 @@ fn a_certain_class_2_is_simulated_as_the_class_2_model() {
     assert_eq!(got, rows(&class_twin(2, -1000.0), &pop));
     assert_ne!(got, rows(&class_twin(1, -1000.0), &pop));
     // #2372: every row reports the class it ran under; the twin, with no `[mixture]`, none.
-    assert_eq!(
-        mixnums(&mixture_model(-1000.0), &pop),
-        vec![Some(2); got.len()]
-    );
-    assert_eq!(
-        mixnums(&class_twin(2, -1000.0), &pop),
-        vec![None; got.len()]
-    );
+    assert_eq!(mixnums(&mixture_model(-1000.0), &pop), vec![Some(2); got.len()]);
+    assert_eq!(mixnums(&class_twin(2, -1000.0), &pop), vec![None; got.len()]);
 }
 
 /// The other side: at `logit(1) = +1000` every subject is class 1. Without it, a draw
@@ -123,10 +115,7 @@ fn a_certain_class_1_is_simulated_as_the_class_1_model() {
     let got = rows(&mixture_model(1000.0), &pop);
     assert_eq!(got, rows(&class_twin(1, 1000.0), &pop));
     assert_ne!(got, rows(&class_twin(2, 1000.0), &pop));
-    assert_eq!(
-        mixnums(&mixture_model(1000.0), &pop),
-        vec![Some(1); got.len()]
-    );
+    assert_eq!(mixnums(&mixture_model(1000.0), &pop), vec![Some(1); got.len()]);
 }
 
 /// Class 2's own Ω and Σ.
@@ -196,50 +185,23 @@ fn a_fit_carried_class_zero_is_recovered_from_the_class_declaration() {
     let npde = |m: &CompiledModel, p: &ModelParameters| {
         let r = crate::stats::npde::compute_npde_npd(m, &pop, p, 50, Some(7), None).unwrap();
         r.iter()
-            .map(|s| {
-                s.npd
-                    .iter()
-                    .chain(&s.npde)
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>()
-            })
+            .map(|s| s.npd.iter().chain(&s.npde).map(|x| x.to_bits()).collect::<Vec<_>>())
             .collect::<Vec<_>>()
     };
-    let want = (
-        sim(&twin, &twin.default_params),
-        npde(&twin, &twin.default_params),
-    );
+    let want = (sim(&twin, &twin.default_params), npde(&twin, &twin.default_params));
 
-    let fixed = tiny(source(
-        -1000.0,
-        0.09,
-        "  omega(2) ETA_CL ~ 0.0 FIX",
-        None,
-        false,
-    ));
+    let fixed = tiny(source(-1000.0, 0.09, "  omega(2) ETA_CL ~ 0.0 FIX", None, false));
     let p = fit_carried(&fixed);
-    assert!(
-        want.0 == sim(&fixed, &p),
-        "simulate: a FIX-0 omega(2) drew a nonzero η"
-    );
-    assert!(
-        want.1 == npde(&fixed, &p),
-        "NPDE: a FIX-0 omega(2) drew a nonzero η"
-    );
+    assert!(want.0 == sim(&fixed, &p), "simulate: a FIX-0 omega(2) drew a nonzero η");
+    assert!(want.1 == npde(&fixed, &p), "NPDE: a FIX-0 omega(2) drew a nonzero η");
 
     let estimated = tiny(
         source(-1000.0, 0.09, "  omega(2) ETA_CL ~ 0.0", None, false)
             .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.09 FIX"),
     );
     let p = fit_carried(&estimated);
-    assert!(
-        want.0 != sim(&estimated, &p),
-        "simulate: the base FIX leaked into omega(2)"
-    );
-    assert!(
-        want.1 != npde(&estimated, &p),
-        "NPDE: the base FIX leaked into omega(2)"
-    );
+    assert!(want.0 != sim(&estimated, &p), "simulate: the base FIX leaked into omega(2)");
+    assert!(want.1 != npde(&estimated, &p), "NPDE: the base FIX leaked into omega(2)");
 
     // The override's flag is class 2's alone: class 1 keeps the base `0.0 FIX` and still
     // recovers its zero, although `omega(2)` declares the same η estimated.
@@ -305,14 +267,11 @@ fn a_declared_base_zero_stays_zero_in_every_class() {
 /// 4.49 and class 2's 0.41, so the reported class is checked against that IPRED too.
 fn class_at_t8(rows: &[SimulationResult]) -> Vec<(String, usize, usize, usize)> {
     let reported = |r: &SimulationResult| {
-        r.mixnum
-            .unwrap_or_else(|| panic!("a mixture row without a class: {r:?}"))
+        r.mixnum.unwrap_or_else(|| panic!("a mixture row without a class: {r:?}"))
     };
     let mut per_replicate = std::collections::HashMap::new();
     for r in rows {
-        let first = *per_replicate
-            .entry((r.id.as_str(), r.draw, r.sim))
-            .or_insert(r.mixnum);
+        let first = *per_replicate.entry((r.id.as_str(), r.draw, r.sim)).or_insert(r.mixnum);
         assert_eq!(r.mixnum, first, "one class per subject-replicate: {r:?}");
     }
     rows.iter()
@@ -344,16 +303,10 @@ fn classes_are_drawn_at_the_mixing_probabilities_per_replicate() {
         class_at_t8(&simulate_with_seed(&model, &pop, &model.default_params, 40, 2163).unwrap());
     assert_eq!(seeded.len(), 2000);
     let share = share_of_class_1(&seeded);
-    assert!(
-        (share - 0.3).abs() < 0.035,
-        "class-1 share {share}, want 0.3"
-    );
+    assert!((share - 0.3).abs() < 0.035, "class-1 share {share}, want 0.3");
     for id in 1..=50 {
-        let mine: Vec<usize> = seeded
-            .iter()
-            .filter(|c| c.0 == id.to_string())
-            .map(|c| c.3)
-            .collect();
+        let mine: Vec<usize> =
+            seeded.iter().filter(|c| c.0 == id.to_string()).map(|c| c.3).collect();
         assert!(
             mine.contains(&1) && mine.contains(&2),
             "subject {id} kept one class in all 40 replicates: {mine:?}"
@@ -368,10 +321,7 @@ fn classes_are_drawn_at_the_mixing_probabilities_per_replicate() {
 fn subject_with(id: &str, covariates: &[(&str, f64)]) -> Subject {
     let mut s = population(1).subjects.remove(0);
     s.id = id.to_string();
-    s.covariates = covariates
-        .iter()
-        .map(|&(k, v)| (k.to_string(), v))
-        .collect();
+    s.covariates = covariates.iter().map(|&(k, v)| (k.to_string(), v)).collect();
     s
 }
 
@@ -389,11 +339,7 @@ fn a_subject_draws_its_class_at_its_own_covariates() {
         let subject = subject_with(&format!("g{grp}"), &[("GRP", grp)]);
         for sim in 1..=20 {
             let class = classes.enter(&subject, 1, sim);
-            assert_eq!(
-                current_mixture_class(),
-                want,
-                "GRP = {grp}, replicate {sim}"
-            );
+            assert_eq!(current_mixture_class(), want, "GRP = {grp}, replicate {sim}");
             drop(class);
             assert_eq!(current_mixture_class(), 1, "the guard restores MIXNUM");
         }
@@ -414,11 +360,7 @@ fn the_class_uniform_is_keyed_by_root_id_draw_and_sim() {
         ("draw", u(7, "1", 2, 1)),
         ("sim", u(7, "1", 1, 2)),
     ] {
-        assert_ne!(
-            base.to_bits(),
-            other.to_bits(),
-            "{what} does not key the draw"
-        );
+        assert_ne!(base.to_bits(), other.to_bits(), "{what} does not key the draw");
     }
     // Draw and sim are not interchangeable.
     assert_ne!(u(7, "1", 1, 2).to_bits(), u(7, "1", 2, 1).to_bits());
@@ -455,10 +397,7 @@ fn propensity_matching_is_refused_on_a_mixture_model() {
     let run = |m: &CompiledModel| simulate_with_options(m, &pop, &m.default_params, 1, &opts);
     let model = mixture_model(0.0);
     let err = run(&model).expect_err("refused");
-    assert_eq!(
-        err.diagnostic().map(|d| d.code.as_str()),
-        Some("E_PROPENSITY_INPUT")
-    );
+    assert_eq!(err.diagnostic().map(|d| d.code.as_str()), Some("E_PROPENSITY_INPUT"));
     assert_eq!(
         err.to_string(),
         "propensity-score matching is not supported on a [mixture] model: each subject's \
@@ -468,10 +407,7 @@ fn propensity_matching_is_refused_on_a_mixture_model() {
     );
     assert!(run(&class_twin(1, 0.0)).is_ok(), "the twin is matched");
     // Without matching, the mixture model simulates through `simulate_with_options`.
-    let plain = SimulateOptions {
-        seed: Some(2163),
-        ..Default::default()
-    };
+    let plain = SimulateOptions { seed: Some(2163), ..Default::default() };
     let got = simulate_with_options(&model, &pop, &model.default_params, 3, &plain).unwrap();
     assert_eq!(tuples(&got), rows(&model, &pop));
 }
@@ -497,9 +433,7 @@ fn uncertainty_draws_simulate_each_subject_under_its_class() {
     let got = run(&mixture_model(-1000.0), &opts);
     assert_eq!(got, run(&class_twin(2, -1000.0), &opts));
     assert_ne!(got, run(&class_twin(1, -1000.0), &opts));
-    assert!(raw(&mixture_model(-1000.0), &opts)
-        .iter()
-        .all(|r| r.mixnum == Some(2)));
+    assert!(raw(&mixture_model(-1000.0), &opts).iter().all(|r| r.mixnum == Some(2)));
 
     let even = parse(&source(0.0, 1e-4, "", None, false));
     let opts = SimulateUncertaintyOptions {
@@ -510,11 +444,8 @@ fn uncertainty_draws_simulate_each_subject_under_its_class() {
     };
     let classes = class_at_t8(&raw(&even, &opts));
     for id in 1..=4 {
-        let mine: Vec<usize> = classes
-            .iter()
-            .filter(|c| c.0 == id.to_string())
-            .map(|c| c.3)
-            .collect();
+        let mine: Vec<usize> =
+            classes.iter().filter(|c| c.0 == id.to_string()).map(|c| c.3).collect();
         assert_eq!(mine.len(), 30);
         assert!(
             mine.contains(&1) && mine.contains(&2),
@@ -539,9 +470,7 @@ fn adaptive_runs_each_subject_under_its_class() {
     let hold = || |_: &ControllerCtx| vec![DoseAction::Hold];
     let trajectories = |src: String, n_sim: usize| {
         let m = parse(&src);
-        simulate_adaptive(&m, &pop, &m.default_params, n_sim, hold, &opts)
-            .unwrap()
-            .trajectories
+        simulate_adaptive(&m, &pop, &m.default_params, n_sim, hold, &opts).unwrap().trajectories
     };
     let run = |src: String, n_sim: usize| {
         let m = parse(&src);
@@ -574,11 +503,8 @@ fn adaptive_runs_each_subject_under_its_class() {
 
     let classes = class_at_t8(&trajectories(source(0.0, 1e-4, "", None, true), 20));
     for id in 1..=3 {
-        let mine: Vec<usize> = classes
-            .iter()
-            .filter(|c| c.0 == id.to_string())
-            .map(|c| c.3)
-            .collect();
+        let mine: Vec<usize> =
+            classes.iter().filter(|c| c.0 == id.to_string()).map(|c| c.3).collect();
         assert_eq!(mine.len(), 20);
         assert!(
             mine.contains(&1) && mine.contains(&2),
@@ -665,9 +591,7 @@ fn mixture_params_of_another_shape_are_refused_on_every_path() {
     wide.mixture.as_mut().unwrap().omega[1] =
         crate::types::OmegaMatrix::from_diagonal(&[0.36, 0.1], vec!["ETA_CL".into(), "X".into()]);
     let mut sigma_long = ok.clone();
-    sigma_long.mixture.as_mut().unwrap().sigma[1]
-        .values
-        .push(0.1);
+    sigma_long.mixture.as_mut().unwrap().sigma[1].values.push(0.1);
     let cases = [
         (
             &none,
@@ -706,10 +630,7 @@ fn mixture_params_of_another_shape_are_refused_on_every_path() {
             simulate_with_seed(&model, &pop, params, 1, 1).expect_err("refused"),
             want,
         );
-        let opts = SimulateOptions {
-            seed: Some(1),
-            ..Default::default()
-        };
+        let opts = SimulateOptions { seed: Some(1), ..Default::default() };
         check(
             "simulate_with_options",
             simulate_with_options(&model, &pop, params, 1, &opts).expect_err("refused"),
@@ -721,9 +642,7 @@ fn mixture_params_of_another_shape_are_refused_on_every_path() {
         let hold = || |_: &ControllerCtx| vec![DoseAction::Hold];
         check(
             "simulate_adaptive",
-            simulate_adaptive(&model, &pop, params, 1, hold, &aopts)
-                .err()
-                .expect("refused"),
+            simulate_adaptive(&model, &pop, params, 1, hold, &aopts).err().expect("refused"),
             want,
         );
         check(
@@ -747,25 +666,16 @@ fn mixture_params_of_another_shape_are_refused_on_every_path() {
 fn a_residual_magnitude_reading_mixnum_is_evaluated_under_the_drawn_class() {
     let pop = population(3);
     let with_err = |src: String, mult: &str| {
-        parse(&src.replace(
-            "DV ~ proportional(EPS)",
-            &format!("DV ~ proportional(EPS * {mult})"),
-        ))
+        parse(&src.replace("DV ~ proportional(EPS)", &format!("DV ~ proportional(EPS * {mult})")))
     };
-    let mixture = with_err(
-        source(-1000.0, 0.09, "", None, false),
-        "(1 + 0.5 * (MIXNUM - 1))",
-    );
+    let mixture = with_err(source(-1000.0, 0.09, "", None, false), "(1 + 0.5 * (MIXNUM - 1))");
     let twin =
         |class: usize, mult: &str| with_err(source(-1000.0, 0.09, "", Some(class), false), mult);
     let class_2 = twin(2, "1.5");
     // The straddle: the class-2 twin under class 1's multiplier is a different reference,
     // so the equality below cannot hold by a multiplier that never mattered.
     let class_2_at_class_1_mult = twin(2, "1");
-    assert_ne!(
-        npde_bits(&class_2, &pop),
-        npde_bits(&class_2_at_class_1_mult, &pop)
-    );
+    assert_ne!(npde_bits(&class_2, &pop), npde_bits(&class_2_at_class_1_mult, &pop));
     assert_eq!(npde_bits(&mixture, &pop), npde_bits(&class_2, &pop));
     assert_eq!(rows(&mixture, &pop), rows(&class_2, &pop));
 }
@@ -816,17 +726,14 @@ fn an_override_replacing_the_last_zero_keeps_inherited_variances() {
 fn a_residual_magnitude_reading_mixnum_is_checked_under_every_class() {
     let pop = population(2);
     let with_mult = |mult: &str| {
-        parse(&source(-1000.0, 0.09, "", None, false).replace(
-            "DV ~ proportional(EPS)",
-            &format!("DV ~ proportional(EPS * {mult})"),
-        ))
+        parse(
+            &source(-1000.0, 0.09, "", None, false)
+                .replace("DV ~ proportional(EPS)", &format!("DV ~ proportional(EPS * {mult})")),
+        )
     };
     let model = with_mult("(2 - MIXNUM)");
     let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 1).expect_err("refused");
-    assert_eq!(
-        err.diagnostic().map(|d| d.code.as_str()),
-        Some("E_RUV_MAGNITUDE_NONPOSITIVE")
-    );
+    assert_eq!(err.diagnostic().map(|d| d.code.as_str()), Some("E_RUV_MAGNITUDE_NONPOSITIVE"));
     assert_eq!(
         err.to_string(),
         "[error_model] residual-error magnitude for sigma slot 0 evaluates to 0 at subject \
@@ -867,10 +774,7 @@ fn the_flip_flop_refusal_is_checked_under_every_class() {
     let crossing = model("4");
     let err =
         simulate_with_seed(&crossing, &pop, &crossing.default_params, 1, 1).expect_err("refused");
-    assert_eq!(
-        err.diagnostic().map(|d| d.code.as_str()),
-        Some("E_TRANSIT_FLIP_FLOP")
-    );
+    assert_eq!(err.diagnostic().map(|d| d.code.as_str()), Some("E_TRANSIT_FLIP_FLOP"));
     assert!(
         err.to_string().starts_with(
             "one_cpt_transit starts outside the analytic absorption closed form's convergence \
@@ -878,10 +782,8 @@ fn the_flip_flop_refusal_is_checked_under_every_class() {
         ),
         "{err}"
     );
-    assert!(
-        check_absorption_flip_flop_no_twin(&crossing, &pop, &crossing.default_params.theta)
-            .is_some()
-    );
+    assert!(check_absorption_flip_flop_no_twin(&crossing, &pop, &crossing.default_params.theta)
+        .is_some());
 
     let control = model("1.2");
     assert!(simulate_with_seed(&control, &pop, &control.default_params, 1, 1).is_ok());

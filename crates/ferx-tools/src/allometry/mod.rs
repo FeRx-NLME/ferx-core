@@ -101,10 +101,9 @@ impl AllometryOptions {
     /// from `[allometry]`.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
         let mut statements = config.mfl.features().filter_map(|f| match f {
-            Feature::Allometry {
-                covariate,
-                reference,
-            } => Some((covariate.clone(), reference.clone())),
+            Feature::Allometry { covariate, reference } => {
+                Some((covariate.clone(), reference.clone()))
+            }
             _ => None,
         });
         let Some((covariate, reference)) = statements.next() else {
@@ -210,8 +209,7 @@ pub struct AllometricModel {
 
 /// Build the allometric model from a base model.
 pub fn allometric_model(
-    base: &BaseModel,
-    options: &AllometryOptions,
+    base: &BaseModel, options: &AllometryOptions,
 ) -> Result<AllometricModel, String> {
     options.validate()?;
     let ctx =
@@ -232,11 +230,8 @@ pub fn allometric_model(
             .map(|(i, p)| (p.clone(), options.exponents.as_ref().map(|e| e[i])))
             .collect(),
         None => {
-            let list: Vec<(String, Option<f64>)> = clearances
-                .iter()
-                .chain(volumes.iter())
-                .map(|p| (p.clone(), None))
-                .collect();
+            let list: Vec<(String, Option<f64>)> =
+                clearances.iter().chain(volumes.iter()).map(|p| (p.clone(), None)).collect();
             if list.is_empty() {
                 return Err(
                     "allometry: the template line binds no clearance or volume parameter, so \
@@ -255,10 +250,7 @@ pub fn allometric_model(
         .covariate_model
         .as_ref()
         .map(|spec| {
-            spec.relations
-                .iter()
-                .map(|r| (r.parameter.clone(), r.covariate.clone()))
-                .collect()
+            spec.relations.iter().map(|r| (r.parameter.clone(), r.covariate.clone())).collect()
         })
         .unwrap_or_default();
 
@@ -284,10 +276,7 @@ pub fn allometric_model(
                 ))
             }
         };
-        if existing
-            .iter()
-            .any(|(p, c)| *p == parameter && *c == options.covariate)
-        {
+        if existing.iter().any(|(p, c)| *p == parameter && *c == options.covariate) {
             notes.push(format!(
                 "`{parameter}` already carries a relation on `{}`; left as written",
                 options.covariate
@@ -309,11 +298,7 @@ pub fn allometric_model(
             options.covariate
         ));
     }
-    Ok(AllometricModel {
-        model,
-        scalings,
-        notes,
-    })
+    Ok(AllometricModel { model, scalings, notes })
 }
 
 /// The clearance-like and volume-like individual parameters, from the
@@ -373,9 +358,7 @@ impl AllometryResult {
 
 /// Build the allometric model and fit it beside the base model.
 pub fn run_allometry(
-    base: &BaseModel,
-    options: &AllometryOptions,
-    run: AllometryRun,
+    base: &BaseModel, options: &AllometryOptions, run: AllometryRun,
 ) -> Result<AllometryResult, String> {
     run_allometry_observed(base, options, run, &|_| {})
 }
@@ -384,9 +367,7 @@ pub fn run_allometry(
 /// runner finishes it ([`Runner::run_observed`]) — how AMD reports this
 /// step's candidates (#2512).
 pub(crate) fn run_allometry_observed(
-    base: &BaseModel,
-    options: &AllometryOptions,
-    run: AllometryRun,
+    base: &BaseModel, options: &AllometryOptions, run: AllometryRun,
     on_finished: &(dyn Fn(&CandidateResult) + Sync),
 ) -> Result<AllometryResult, String> {
     let built = allometric_model(base, options)?;
@@ -394,18 +375,12 @@ pub(crate) fn run_allometry_observed(
     for s in &built.scalings {
         features.set(
             format!("{}-{}", s.parameter, options.covariate),
-            if s.fixed {
-                format!("power(fix={})", s.exponent)
-            } else {
-                "power".to_string()
-            },
+            if s.fixed { format!("power(fix={})", s.exponent) } else { "power".to_string() },
         );
     }
     let candidates = vec![
         Candidate::new("base", base.text.clone()),
-        Candidate::new("allometric", built.model.clone())
-            .parent("base")
-            .features(features),
+        Candidate::new("allometric", built.model.clone()).parent("base").features(features),
     ];
     let mut runner = Runner::new();
     if let Some(t) = run.threads {
@@ -419,12 +394,8 @@ pub(crate) fn run_allometry_observed(
     }
     let mut run_options = run.run_options.clone();
     run_options.criterion = Criterion::Ofv;
-    let report = runner.run_observed(
-        &candidates,
-        &base.prepared.population,
-        &run_options,
-        on_finished,
-    )?;
+    let report =
+        runner.run_observed(&candidates, &base.prepared.population, &run_options, on_finished)?;
     let mut notes = built.notes;
     notes.extend(report.warnings.iter().cloned());
     let find = |id: &str| -> Result<CandidateResult, String> {

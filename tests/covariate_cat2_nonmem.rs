@@ -108,10 +108,7 @@ fn se_theta(res: &FitResult, name: &str) -> f64 {
 /// `categorical2` reproduces NONMEM's hand-written `IF (SEX.EQ.1) COVCL =
 /// THETA(4)` model, to the precision NONMEM prints.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn categorical2_matches_the_nonmem_hand_written_twin() {
     let res = anchor_fit("tests/nonmem/covariate_cat2.ferx");
     assert!(res.converged, "the anchor fit must converge");
@@ -122,11 +119,7 @@ fn categorical2_matches_the_nonmem_hand_written_twin() {
     );
 
     // Realised |ΔOFV| = 2.563e-7 against NONMEM's printed 15 digits.
-    assert!(
-        (res.ofv - NM_OFV).abs() < 1e-5,
-        "ferx OFV {} vs NONMEM {NM_OFV}",
-        res.ofv
-    );
+    assert!((res.ofv - NM_OFV).abs() < 1e-5, "ferx OFV {} vs NONMEM {NM_OFV}", res.ofv);
 
     // Realised worst relative error over the structural θ: 3.477e-6 (TVKA);
     // TVCL 2.636e-6, TVV 1.659e-6.
@@ -139,10 +132,7 @@ fn categorical2_matches_the_nonmem_hand_written_twin() {
 
     // The covariate θ itself: realised relative error 7.425e-6.
     let sex = theta(&res, "THETA_CL_SEX_1");
-    assert!(
-        rel(sex, NM_THETA_SEX_CAT2) < 1e-4,
-        "θ(SEX) {sex} vs NONMEM {NM_THETA_SEX_CAT2}"
-    );
+    assert!(rel(sex, NM_THETA_SEX_CAT2) < 1e-4, "θ(SEX) {sex} vs NONMEM {NM_THETA_SEX_CAT2}");
     // Non-degeneracy: the effect is real and large. A factor collapsed to the
     // null (1) would still sit inside a *relative* band around a small θ; it
     // does not sit inside this one, which is ~5 SE away from 1.
@@ -157,10 +147,7 @@ fn categorical2_matches_the_nonmem_hand_written_twin() {
     // estimates, because an SE is a second derivative of the objective and the
     // two engines build it by different quadrature.
     let se = se_theta(&res, "THETA_CL_SEX_1");
-    assert!(
-        rel(se, NM_SE_THETA_SEX) < 1e-2,
-        "SE θ(SEX) {se} vs NONMEM {NM_SE_THETA_SEX}"
-    );
+    assert!(rel(se, NM_SE_THETA_SEX) < 1e-2, "SE θ(SEX) {se} vs NONMEM {NM_SE_THETA_SEX}");
 
     // Random effects. Realised worst relative error 3.009e-5 (ω²(CL)); ω²(V)
     // 1.617e-5, σ² 1.109e-6. ferx reports σ as an SD, NONMEM `$SIGMA` as a
@@ -168,10 +155,7 @@ fn categorical2_matches_the_nonmem_hand_written_twin() {
     assert!(rel(res.omega[(0, 0)], NM_OMEGA_CL) < 1e-3, "{}", res.omega);
     assert!(rel(res.omega[(1, 1)], NM_OMEGA_V) < 1e-3, "{}", res.omega);
     let sigma_var = res.sigma[0] * res.sigma[0];
-    assert!(
-        rel(sigma_var, NM_SIGMA_VAR) < 1e-3,
-        "σ² {sigma_var} vs NONMEM {NM_SIGMA_VAR}"
-    );
+    assert!(rel(sigma_var, NM_SIGMA_VAR) < 1e-3, "σ² {sigma_var} vs NONMEM {NM_SIGMA_VAR}");
 }
 
 /// The reparameterization identity, anchored *outside* ferx.
@@ -181,10 +165,7 @@ fn categorical2_matches_the_nonmem_hand_written_twin() {
 /// `covariate_cat2.ext`). ferx must do the same thing on the same data — and the
 /// two engines must agree on both halves, not only on one.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_two_shapes_are_one_model_in_both_engines() {
     // The claim being anchored is a property of NONMEM's own two runs first.
     assert!(
@@ -199,17 +180,8 @@ fn the_two_shapes_are_one_model_in_both_engines() {
 
     // Same objective, both engines. Realised |ΔOFV| between the two ferx fits:
     // 3.462e-9 — the two optimizer paths differ, the minimum does not.
-    assert!(
-        (cat.ofv - cat2.ofv).abs() < 1e-4,
-        "cat {} vs cat2 {}",
-        cat.ofv,
-        cat2.ofv
-    );
-    assert!(
-        (cat.ofv - NM_OFV).abs() < 1e-5,
-        "cat vs NONMEM: {}",
-        cat.ofv
-    );
+    assert!((cat.ofv - cat2.ofv).abs() < 1e-4, "cat {} vs cat2 {}", cat.ofv, cat2.ofv);
+    assert!((cat.ofv - NM_OFV).abs() < 1e-5, "cat vs NONMEM: {}", cat.ofv);
 
     // …and the θ exactly 1 apart, as NONMEM's pair is. Realised |Δ − 1| = 2.958e-6.
     let t_cat = theta(&cat, "THETA_CL_SEX_1");

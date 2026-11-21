@@ -85,10 +85,7 @@ fn wt_at(base: f64, step: f64, t: f64) -> f64 {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn fit_runs_on_tvcov_oral_dataset() {
     let parsed = parse_full_model(TVCOV_ORAL_MODEL).expect("tvcov model parses");
     let model = parsed.model;
@@ -105,16 +102,8 @@ fn fit_runs_on_tvcov_oral_dataset() {
     let result = fit(&model, &population, &model.default_params, &options)
         .expect("tvcov fit returns a result");
 
-    assert!(
-        result.converged,
-        "tvcov fit did not converge (final OFV = {})",
-        result.ofv
-    );
-    assert!(
-        result.ofv.is_finite(),
-        "OFV = {} should be finite",
-        result.ofv
-    );
+    assert!(result.converged, "tvcov fit did not converge (final OFV = {})", result.ofv);
+    assert!(result.ofv.is_finite(), "OFV = {} should be finite", result.ofv);
 
     let theta = &result.theta;
     assert_eq!(theta.len(), 4);

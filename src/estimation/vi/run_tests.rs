@@ -5,6 +5,7 @@ use crate::types::{
     BloqMethod, DoseEvent, EstimationMethod, GradientMethod, Subject, ViEtaGrad, ViFamily,
     ViFinalOfv, ViKl, ViOmegaUpdate,
 };
+#[cfg(feature = "nn")]
 use std::collections::HashMap;
 
 /// Every other `parameterization` helper this file calls — `pack_params`,
@@ -22,58 +23,18 @@ use crate::estimation::parameterization::compute_bounds;
 /// the model's own initial estimates so the fit has a real optimum to move toward
 /// rather than an arbitrary one.
 fn fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_15)
+        .expect("fixture parses");
     let params = model.default_params.clone();
 
     let make = |id: &str, scale: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![9.0 * scale, 6.7 * scale, 4.5 * scale],
         obs_cmts: vec![1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let population = Population {
@@ -91,29 +52,8 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
 /// shape `examples/warfarin_block_omega.ferx` uses. The `ETA_KA` row is outside the
 /// `(ETA_CL, ETA_V)` block, so `Ω(2,0)` and `Ω(2,1)` are structural zeros.
 fn mixed_omega_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("mixed omega fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_ORAL_1)
+        .expect("mixed omega fixture parses");
     let params = model.default_params.clone();
     let (_, population, _) = fixture();
     (model, population, params)
@@ -139,9 +79,7 @@ fn opts(iters: usize) -> FitOptions {
 fn trace_settles_on_a_flat_noisy_tail_but_not_on_a_drifting_one() {
     // Flat + alternating noise: a single-step test would see a change of 2.0
     // every iteration and never converge; the moving average sees ~0.
-    let flat: Vec<f64> = (0..100)
-        .map(|i| 500.0 + if i % 2 == 0 { 1.0 } else { -1.0 })
-        .collect();
+    let flat: Vec<f64> = (0..100).map(|i| 500.0 + if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
     assert!(trace_has_settled(&flat, 20, 1e-4));
 
     // Steady descent of 1 per iteration: must NOT be reported as settled.
@@ -170,9 +108,8 @@ fn systematic_drift_is_detected_below_the_settling_test_noise_floor() {
     // Descent of 0.01/iteration buried in ±5 alternating noise. The window-to-window
     // difference is ~0.2 against a standard error of several units, so the settling
     // test correctly calls it settled — and would stop the run.
-    let masked: Vec<f64> = (0..200)
-        .map(|i| 500.0 - 0.01 * i as f64 + if i % 2 == 0 { 5.0 } else { -5.0 })
-        .collect();
+    let masked: Vec<f64> =
+        (0..200).map(|i| 500.0 - 0.01 * i as f64 + if i % 2 == 0 { 5.0 } else { -5.0 }).collect();
     assert!(
         trace_has_settled(&masked, 40, 1e-4),
         "the drift must be below the settling test's noise floor for this test to mean anything"
@@ -181,9 +118,7 @@ fn systematic_drift_is_detected_below_the_settling_test_noise_floor() {
 
     // A genuine plateau: same noise, no trend. Must not fire, or every converged VI
     // fit would be demoted.
-    let plateau: Vec<f64> = (0..200)
-        .map(|i| 500.0 + if i % 2 == 0 { 5.0 } else { -5.0 })
-        .collect();
+    let plateau: Vec<f64> = (0..200).map(|i| 500.0 + if i % 2 == 0 { 5.0 } else { -5.0 }).collect();
     assert!(trace_has_settled(&plateau, 40, 1e-4));
     assert!(!trace_still_drifting(&plateau, 40));
 
@@ -212,9 +147,8 @@ fn a_heavy_tail_cannot_mask_systematic_drift() {
     // Steady descent of 0.02/iteration, contaminated by four large spikes per window.
     // The spikes are balanced across the two windows, so they barely move either
     // *location* — only the spread.
-    let contaminated: Vec<f64> = (0..200)
-        .map(|i| 500.0 - 0.02 * i as f64 + if i % 13 == 0 { 150.0 } else { 0.0 })
-        .collect();
+    let contaminated: Vec<f64> =
+        (0..200).map(|i| 500.0 - 0.02 * i as f64 + if i % 13 == 0 { 150.0 } else { 0.0 }).collect();
 
     // The fixture only proves something if the mean/variance criterion it replaces
     // would have been fooled by it. Recompute that criterion here rather than keeping a
@@ -257,10 +191,7 @@ fn a_heavy_tail_cannot_mask_systematic_drift() {
 /// advice, which does not address this failure mode.
 #[test]
 fn bad_basin_guard_demotes_convergence_and_uses_its_own_warning() {
-    let tightness = super::ElboTightness {
-        excess: 260.0,
-        expected: 10.0,
-    };
+    let tightness = super::ElboTightness { excess: 260.0, expected: 10.0 };
     let mut converged = true;
 
     let warning = super::bad_basin_warning(&mut converged, &tightness)
@@ -284,10 +215,7 @@ fn bad_basin_guard_demotes_convergence_and_uses_its_own_warning() {
 /// still gets the iteration-budget warning.
 #[test]
 fn healthy_tightness_does_not_change_convergence_reporting() {
-    let tightness = super::ElboTightness {
-        excess: 10.0,
-        expected: 10.0,
-    };
+    let tightness = super::ElboTightness { excess: 10.0, expected: 10.0 };
     let mut converged = true;
 
     assert!(super::bad_basin_warning(&mut converged, &tightness).is_none());
@@ -346,11 +274,7 @@ fn outer_result_carries_conditional_modes_and_sensitivities() {
     for (i, eta) in out.eta_hats.iter().enumerate() {
         assert_eq!(eta.len(), 2, "eta_hat is per-random-effect");
         // H is n_obs × n_eta: three observations, two random effects.
-        assert_eq!(
-            out.h_matrices[i].nrows(),
-            3,
-            "H has one row per observation"
-        );
+        assert_eq!(out.h_matrices[i].nrows(), 3, "H has one row per observation");
         assert_eq!(out.h_matrices[i].ncols(), 2, "H has one column per eta");
         assert!(out.h_matrices[i].iter().all(|v| v.is_finite()));
 
@@ -369,10 +293,7 @@ fn outer_result_carries_conditional_modes_and_sensitivities() {
     // And the variational covariances are still reported, positive-definite.
     for cov in &vi.eta_covs {
         assert!(cov[0][0] > 0.0 && cov[1][1] > 0.0);
-        assert!(
-            (cov[0][1] - cov[1][0]).abs() < 1e-12,
-            "covariance must be symmetric"
-        );
+        assert!((cov[0][1] - cov[1][0]).abs() < 1e-12, "covariance must be symmetric");
     }
 }
 
@@ -390,11 +311,7 @@ fn runs_are_reproducible_from_the_seed() {
     other.vi_seed = Some(1234);
     let c = run_vi(&model, &population, &params, &other).unwrap();
     assert!(
-        a.params
-            .theta
-            .iter()
-            .zip(c.params.theta.iter())
-            .any(|(x, y)| x != y),
+        a.params.theta.iter().zip(c.params.theta.iter()).any(|(x, y)| x != y),
         "a different seed should draw different common random numbers"
     );
 }
@@ -411,10 +328,7 @@ fn default_leaves_ofv_nan_and_explains_why() {
     let (model, population, params) = fixture();
     let out = run_vi(&model, &population, &params, &opts(20)).unwrap();
 
-    assert!(
-        out.ofv.is_nan(),
-        "default vi_final_ofv must not fabricate an OFV"
-    );
+    assert!(out.ofv.is_nan(), "default vi_final_ofv must not fabricate an OFV");
     assert!(
         out.warnings.iter().any(|w| w.contains("lower bound")),
         "a NaN OFV must be explained; warnings were {:?}",
@@ -433,10 +347,7 @@ fn laplace_final_ofv_reports_a_real_objective() {
     o.vi_final_ofv = ViFinalOfv::Laplace;
     let out = run_vi(&model, &population, &params, &o).unwrap();
 
-    assert!(
-        out.ofv.is_finite(),
-        "laplace mode must produce a finite OFV"
-    );
+    assert!(out.ofv.is_finite(), "laplace mode must produce a finite OFV");
     let elbo = out.vi.as_ref().unwrap().neg_two_elbo;
     assert!(
         (out.ofv - elbo).abs() > 1e-9,
@@ -508,16 +419,8 @@ fn fixed_parameters_do_not_move() {
     let want_sigma = params.sigma.values[0];
 
     let out = run_vi(&model, &population, &params, &opts(40)).unwrap();
-    assert_eq!(
-        out.params.theta[1].to_bits(),
-        want_theta.to_bits(),
-        "a FIXed theta moved"
-    );
-    assert_eq!(
-        out.params.sigma.values[0].to_bits(),
-        want_sigma.to_bits(),
-        "a FIXed sigma moved"
-    );
+    assert_eq!(out.params.theta[1].to_bits(), want_theta.to_bits(), "a FIXed theta moved");
+    assert_eq!(out.params.sigma.values[0].to_bits(), want_sigma.to_bits(), "a FIXed sigma moved");
     assert!(
         out.params.theta[0] != params.theta[0],
         "the free theta should still have been estimated"
@@ -536,10 +439,7 @@ fn fixed_parameters_do_not_move() {
 fn declared_theta_bounds_are_enforced() {
     let (model, population, params) = fixture();
 
-    let free = run_vi(&model, &population, &params, &opts(60))
-        .unwrap()
-        .params
-        .theta[0];
+    let free = run_vi(&model, &population, &params, &opts(60)).unwrap().params.theta[0];
     assert!(
         (free - params.theta[0]).abs() > 1e-6,
         "the free fit must move TVCL for this test to constrain anything (got {free})"
@@ -548,19 +448,12 @@ fn declared_theta_bounds_are_enforced() {
     // A box containing the initial estimate but not `free`, on whichever side of
     // the init the free fit did not travel toward.
     let midpoint = 0.5 * (free + params.theta[0]);
-    let (lo, hi) = if free < params.theta[0] {
-        (midpoint, 10.0)
-    } else {
-        (0.1, midpoint)
-    };
+    let (lo, hi) = if free < params.theta[0] { (midpoint, 10.0) } else { (0.1, midpoint) };
 
     let mut bounded = params.clone();
     bounded.theta_lower[0] = lo;
     bounded.theta_upper[0] = hi;
-    let got = run_vi(&model, &population, &bounded, &opts(60))
-        .unwrap()
-        .params
-        .theta[0];
+    let got = run_vi(&model, &population, &bounded, &opts(60)).unwrap().params.theta[0];
 
     // ULP-scale slack: the box is enforced in *packed* space, exactly as it is for
     // FOCE/FOCEI, so `x` is clamped to `ln(lo)` and `exp(ln(lo))` need not be
@@ -592,10 +485,7 @@ fn covariance_step_runs_at_the_vi_estimate() {
     o.vi_final_ofv = ViFinalOfv::Laplace;
 
     let out = run_vi(&model, &population, &params, &o).unwrap();
-    let cov = out
-        .covariance_matrix
-        .as_ref()
-        .expect("VI must run the covariance step");
+    let cov = out.covariance_matrix.as_ref().expect("VI must run the covariance step");
 
     let n = crate::estimation::parameterization::pack_params(&out.params).len();
     assert_eq!(cov.nrows(), n, "covariance is packed-parameter sized");
@@ -655,10 +545,7 @@ fn mc_kl_route_runs_and_reports_itself() {
     let vi = mc.vi.as_ref().unwrap();
 
     assert_eq!(vi.kl, "mc", "the route actually taken must be reported");
-    assert_eq!(
-        vi.n_kl_fallback_subjects, 0,
-        "asking for mc outright is not a fallback"
-    );
+    assert_eq!(vi.n_kl_fallback_subjects, 0, "asking for mc outright is not a fallback");
     assert!(vi.neg_two_elbo.is_finite());
     assert!(
         !mc.warnings.iter().any(|w| w.contains("no closed-form KL")),
@@ -681,10 +568,7 @@ fn mc_kl_route_runs_and_reports_itself() {
         );
     }
     for k in 0..2 {
-        let (a, m) = (
-            analytic.params.omega.matrix[(k, k)],
-            mc.params.omega.matrix[(k, k)],
-        );
+        let (a, m) = (analytic.params.omega.matrix[(k, k)], mc.params.omega.matrix[(k, k)]);
         assert!(m > 0.0, "omega[{k},{k}] must stay positive under mc-KL");
         assert!(
             (a - m).abs() / a.abs().max(1e-6) < 1.0,
@@ -702,10 +586,7 @@ fn kl_fallback_warning_reports_only_a_real_fallback() {
     let w = kl_fallback_warning(3, 10, "some_flow").expect("a real fallback must warn");
     assert!(w.contains("some_flow"), "the family should be named: {w}");
     assert!(w.contains('3') && w.contains("10"), "counts missing: {w}");
-    assert!(
-        w.contains("vi_kl = mc"),
-        "the warning should name the option that silences it: {w}"
-    );
+    assert!(w.contains("vi_kl = mc"), "the warning should name the option that silences it: {w}");
 }
 
 /// A mixed `block_omega` + standalone-eta `Ω` keeps its declared structure through a
@@ -742,10 +623,7 @@ fn mixed_omega_keeps_its_structural_zeros_through_a_fit() {
             om[(1, 0)] != 0.0,
             "{route:?}: the (ETA_CL, ETA_V) block covariance was not estimated"
         );
-        assert!(
-            (om[(1, 0)] - om[(0, 1)]).abs() < 1e-15,
-            "{route:?}: Ω must stay symmetric"
-        );
+        assert!((om[(1, 0)] - om[(0, 1)]).abs() < 1e-15, "{route:?}: Ω must stay symmetric");
         for k in 0..3 {
             assert!(om[(k, k)] > 0.0, "{route:?}: Ω({k},{k}) must stay positive");
         }
@@ -792,10 +670,7 @@ fn fd_eta_grad_mode_agrees_with_the_analytic_route() {
     assert_eq!(b.vi.as_ref().unwrap().n_fd_subjects, 3);
     for k in 0..2 {
         let (x, y) = (a.params.theta[k], b.params.theta[k]);
-        assert!(
-            (x - y).abs() / x.abs().max(1e-6) < 1e-3,
-            "theta[{k}]: analytic {x:.8}, fd {y:.8}"
-        );
+        assert!((x - y).abs() / x.abs().max(1e-6) < 1e-3, "theta[{k}]: analytic {x:.8}, fd {y:.8}");
     }
 }
 
@@ -833,11 +708,7 @@ fn iov_models_fit_and_report_per_occasion_kappa_means() {
     }
     assert!(vi.neg_two_elbo.is_finite());
     // The closed form must have produced an Omega_iov rather than leaving it untouched.
-    let iov = out
-        .params
-        .omega_iov
-        .as_ref()
-        .expect("an IOV fit must report Omega_iov");
+    let iov = out.params.omega_iov.as_ref().expect("an IOV fit must report Omega_iov");
     assert!(iov.matrix[(0, 0)] > 0.0 && iov.matrix[(0, 0)].is_finite());
 }
 
@@ -967,9 +838,7 @@ fn settling_is_judged_against_noise_not_objective_magnitude() {
 
     // A drift that is small in relative terms but large against the noise must still be
     // rejected: the criterion has to catch slow descent, not just obvious descent.
-    let drifting: Vec<f64> = (0..200)
-        .map(|i| -286.0 + noise(i) - 0.05 * i as f64)
-        .collect();
+    let drifting: Vec<f64> = (0..200).map(|i| -286.0 + noise(i) - 0.05 * i as f64).collect();
     assert!(
         !trace_has_settled(&drifting, 50, CONVERGENCE_REL_TOL),
         "a trace still descending well above its own noise level must not count as settled"
@@ -988,63 +857,19 @@ fn settling_is_judged_against_noise_not_objective_magnitude() {
 /// quantity, so a fixture where every subject agreed would not exercise
 /// [`Families::PerSubject`] or catch an offset computed from the wrong subject's `K`.
 fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  kappa KAPPA_CL ~ 0.02
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL + KAPPA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  iov_column = OCC
-",
-    )
-    .expect("IOV fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_16)
+        .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
-        obs_raw_times: Vec::new(),
-        observations: (0..occ.len())
-            .map(|k| scale * (8.0 - 0.9 * k as f64))
-            .collect(),
+        observations: (0..occ.len()).map(|k| scale * (8.0 - 0.9 * k as f64)).collect(),
         obs_cmts: vec![1; occ.len()],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; occ.len()],
         occasions: occ,
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let population = Population {
@@ -1076,10 +901,7 @@ fn parameter_change_is_relative_with_an_absolute_floor() {
     let near_zero = max_relative_change(&[1e-9], &[0.0]);
     assert!(near_zero.is_finite() && near_zero < 1.0, "got {near_zero}");
     // Identical vectors have not moved.
-    assert_eq!(
-        max_relative_change(&[1.0, -2.0, 3.0], &[1.0, -2.0, 3.0]),
-        0.0
-    );
+    assert_eq!(max_relative_change(&[1.0, -2.0, 3.0], &[1.0, -2.0, 3.0]), 0.0);
 }
 
 /// The stability criterion asks about `φ` as well as `x`, and either one still moving
@@ -1132,11 +954,7 @@ fn parameter_stability_alone_can_certify_convergence() {
     let out = run_vi(&model, &population, &params, &opts(25_000)).expect("VI runs");
     let vi = out.vi.as_ref().expect("VI result present");
     assert!(vi.converged, "a settled fit must report converged");
-    assert!(
-        vi.n_iterations < 25_000,
-        "must stop before the ceiling, ran {}",
-        vi.n_iterations
-    );
+    assert!(vi.n_iterations < 25_000, "must stop before the ceiling, ran {}", vi.n_iterations);
     assert!(
         !out.warnings.iter().any(|w| w.contains("had settled")),
         "a converged run must not warn about settling: {:?}",
@@ -1253,27 +1071,9 @@ fn param_criterion_is_vacuous_when_every_population_parameter_is_fixed() {
         "a model with free θ/Ω/σ must keep the parameter-stability criterion"
     );
 
-    let all_fixed = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0) FIX
-  theta TVV(10.0, 1.0, 100.0) FIX
-  omega ETA_CL ~ 0.09 FIX
-  omega ETA_V  ~ 0.04 FIX
-  sigma PROP_ERR ~ 0.04 FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("all-FIXed fixture parses");
+    let all_fixed =
+        crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_17)
+            .expect("all-FIXed fixture parses");
     assert!(
         !super::param_criterion_applies(&all_fixed.default_params),
         "with every population coordinate FIXed the criterion is vacuous and must be disabled"
@@ -1310,39 +1110,13 @@ fn param_criterion_is_vacuous_when_every_population_parameter_is_fixed() {
 /// And the user is told, because it changes what `converged` is based on.
 #[test]
 fn all_fixed_population_says_convergence_rests_on_the_objective_alone() {
-    let all_fixed = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0) FIX
-  theta TVV(10.0, 1.0, 100.0) FIX
-  omega ETA_CL ~ 0.09 FIX
-  omega ETA_V  ~ 0.04 FIX
-  sigma PROP_ERR ~ 0.04 FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("all-FIXed fixture parses");
+    let all_fixed =
+        crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_17)
+            .expect("all-FIXed fixture parses");
     let (_m, population, _p) = fixture();
-    let out = run_vi(
-        &all_fixed,
-        &population,
-        &all_fixed.default_params,
-        &opts(40),
-    )
-    .unwrap();
+    let out = run_vi(&all_fixed, &population, &all_fixed.default_params, &opts(40)).unwrap();
     assert!(
-        out.warnings
-            .iter()
-            .any(|w| w.contains("every population parameter is FIXed")),
+        out.warnings.iter().any(|w| w.contains("every population parameter is FIXed")),
         "the all-FIXed case must say what convergence now rests on; warnings were {:?}",
         out.warnings
     );
@@ -1351,10 +1125,7 @@ fn all_fixed_population_says_convergence_rests_on_the_objective_alone() {
     let (model, population, params) = fixture();
     let free = run_vi(&model, &population, &params, &opts(40)).unwrap();
     assert!(
-        !free
-            .warnings
-            .iter()
-            .any(|w| w.contains("every population parameter is FIXed")),
+        !free.warnings.iter().any(|w| w.contains("every population parameter is FIXed")),
         "a model with free parameters must not get the all-FIXed warning: {:?}",
         free.warnings
     );
@@ -1433,25 +1204,14 @@ fn gradient_clipping_is_on_by_default() {
 #[test]
 fn vi_grad_clip_reaches_the_adam_config() {
     let mut o = FitOptions::default();
-    let cfg = AdamConfig {
-        lr: o.vi_lr,
-        grad_clip: o.vi_grad_clip,
-        ..Default::default()
-    };
+    let cfg = AdamConfig { lr: o.vi_lr, grad_clip: o.vi_grad_clip, ..Default::default() };
     assert_eq!(cfg.grad_clip, 1e4);
     // A huge gradient is actually rescaled under that config.
     assert!(super::super::adam::grad_clip_scale(&[1e14], cfg.grad_clip) < 1e-9);
 
     o.vi_grad_clip = 0.0;
-    let off = AdamConfig {
-        lr: o.vi_lr,
-        grad_clip: o.vi_grad_clip,
-        ..Default::default()
-    };
-    assert_eq!(
-        super::super::adam::grad_clip_scale(&[1e14], off.grad_clip),
-        1.0
-    );
+    let off = AdamConfig { lr: o.vi_lr, grad_clip: o.vi_grad_clip, ..Default::default() };
+    assert_eq!(super::super::adam::grad_clip_scale(&[1e14], off.grad_clip), 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,42 +1273,18 @@ fn dcm_fixture() -> (CompiledModel, Population, ModelParameters) {
         cov.insert("WT".to_string(), wt);
         cov.insert("CRCL".to_string(), crcl);
         Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 4.0, 8.0, 12.0],
-            obs_raw_times: Vec::new(),
             observations: vec![7.5, 6.0, 3.8, 2.1],
             obs_cmts: vec![1, 1, 1, 1],
             covariates: cov,
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     };
     let population = Population {
-        subjects: vec![
-            subj("1", 72.0, 95.0),
-            subj("2", 60.0, 80.0),
-            subj("3", 85.0, 110.0),
-        ],
+        subjects: vec![subj("1", 72.0, 95.0), subj("2", 60.0, 80.0), subj("3", 85.0, 110.0)],
         covariate_names: vec!["WT".into(), "CRCL".into()],
         dv_column: "DV".into(),
         input_columns: vec![],
@@ -1582,16 +1318,9 @@ fn fold_nn_penalty_adds_half_the_penalty_gradient_only_at_weight_coords() {
     let x = pack_params(&params);
     let n = x.len();
 
-    let o = FitOptions {
-        nn_l2_lambda: 0.3,
-        nn_smooth_lambda: 0.2,
-        ..Default::default()
-    };
+    let o = FitOptions { nn_l2_lambda: 0.3, nn_smooth_lambda: 0.2, ..Default::default() };
     let reg = NnRegularizer::build(&model, &population, &o);
-    assert!(
-        reg.is_active(),
-        "positive λ + a [covariate_nn] block is active"
-    );
+    assert!(reg.is_active(), "positive λ + a [covariate_nn] block is active");
 
     // Independent reference for the penalty gradient and value.
     let mut pen_grad = vec![0.0; n];
@@ -1614,10 +1343,7 @@ fn fold_nn_penalty_adds_half_the_penalty_gradient_only_at_weight_coords() {
     let mut scratch = vec![0.0; n];
     let got_val = fold_nn_penalty(&reg, &x, &mut grad, &mut scratch);
 
-    assert_eq!(
-        got_val, pen_val,
-        "returned penalty value must match the reference"
-    );
+    assert_eq!(got_val, pen_val, "returned penalty value must match the reference");
     for i in 0..n {
         let expected = base[i] + 0.5 * pen_grad[i];
         assert!(
@@ -1662,11 +1388,7 @@ fn vi_nn_l2_shrinks_the_network_weights() {
     let (model, population, params) = dcm_fixture();
     let weights = nn_weight_indices(&model);
     let norm = |p: &ModelParameters| -> f64 {
-        weights
-            .iter()
-            .map(|&i| p.theta[i] * p.theta[i])
-            .sum::<f64>()
-            .sqrt()
+        weights.iter().map(|&i| p.theta[i] * p.theta[i]).sum::<f64>().sqrt()
     };
     let start = norm(&params);
     assert!(start > 0.0, "the probe weights must start non-zero");
@@ -1685,10 +1407,7 @@ fn vi_nn_l2_shrinks_the_network_weights() {
         "regularized weight norm ({r:.4}) must fall below the unregularized norm ({u:.4}); \
          start was {start:.4}"
     );
-    assert!(
-        r < start,
-        "regularization must pull the weight norm below its start ({start:.4})"
-    );
+    assert!(r < start, "regularization must pull the weight norm below its start ({start:.4})");
 }
 
 /// `objective_trace` is the penalized objective the optimizer descends and the
@@ -1705,11 +1424,7 @@ fn vi_objective_trace_is_the_penalized_objective() {
     let mut x0 = pack_params(&params);
     clamp_to_bounds(&mut x0, &compute_bounds(&params));
 
-    let o = FitOptions {
-        nn_l2_lambda: 1e-2,
-        nn_smooth_lambda: 5e-2,
-        ..opts(5)
-    };
+    let o = FitOptions { nn_l2_lambda: 1e-2, nn_smooth_lambda: 5e-2, ..opts(5) };
     let out = run_vi(&model, &population, &params, &o).expect("regularized VI runs");
     let vi = out.vi.as_ref().expect("vi result present");
 
@@ -1721,10 +1436,7 @@ fn vi_objective_trace_is_the_penalized_objective() {
 
     let reg = NnRegularizer::build(&model, &population, &o);
     let penalty0 = reg.penalty_value(&x0);
-    assert!(
-        penalty0 > 0.0,
-        "the probe weights must make the penalty live"
-    );
+    assert!(penalty0 > 0.0, "the probe weights must make the penalty live");
     let gap0 = vi.objective_trace[0] - vi.elbo_trace[0];
     assert!(
         (gap0 - penalty0).abs() < 1e-9,
@@ -1734,10 +1446,7 @@ fn vi_objective_trace_is_the_penalized_objective() {
     // The penalty is non-negative, and strictly positive while weights are non-zero, so
     // the objective the stopping predicate reads sits above the reported bound throughout.
     for (obj, elbo) in vi.objective_trace.iter().zip(vi.elbo_trace.iter()) {
-        assert!(
-            obj > elbo,
-            "objective ({obj}) must exceed the clean bound ({elbo})"
-        );
+        assert!(obj > elbo, "objective ({obj}) must exceed the clean bound ({elbo})");
     }
 }
 
@@ -1782,10 +1491,7 @@ fn the_reported_estimate_is_what_packed_estimate_unpacks_to() {
         assert!(!declares_fix(&params), "{shape}: fixture declares no FIX");
         for iters in 3..=14 {
             let out = run_vi(&model, &population, &params, &opts(iters)).unwrap();
-            let v = out
-                .packed_estimate
-                .as_deref()
-                .expect("VI writes packed_estimate");
+            let v = out.packed_estimate.as_deref().expect("VI writes packed_estimate");
             let p = unpack_params(v, &out.params);
             let bits =
                 |m: &nalgebra::DMatrix<f64>| m.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -1806,10 +1512,7 @@ fn the_reported_estimate_is_what_packed_estimate_unpacks_to() {
             }
         }
     }
-    assert!(
-        off.is_empty(),
-        "reported ≠ unpack(packed_estimate) at: {off:?}"
-    );
+    assert!(off.is_empty(), "reported ≠ unpack(packed_estimate) at: {off:?}");
 }
 
 /// The round trip is skipped under a FIX, so a FIXed value keeps its declared bits (see
@@ -1817,10 +1520,7 @@ fn the_reported_estimate_is_what_packed_estimate_unpacks_to() {
 #[test]
 fn declares_fix_reads_every_fix_flag_and_no_structural_zero() {
     let (_, _, params) = mixed_omega_fixture();
-    assert!(
-        !declares_fix(&params),
-        "a mixed Ω's structural zeros are not FIXes"
-    );
+    assert!(!declares_fix(&params), "a mixed Ω's structural zeros are not FIXes");
     let flip: [(&str, fn(&mut ModelParameters)); 4] = [
         ("theta", |p| p.theta_fixed[0] = true),
         ("sigma", |p| p.sigma_fixed[0] = true),

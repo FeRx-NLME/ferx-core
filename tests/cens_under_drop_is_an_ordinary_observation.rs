@@ -57,10 +57,7 @@ fn csv(flag: &str) -> String {
 }
 
 fn temp(contents: &str, suffix: &str) -> NamedTempFile {
-    let mut f = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(suffix).tempfile().expect("temp file");
     f.write_all(contents.as_bytes()).expect("write");
     f.flush().expect("flush");
     f
@@ -71,9 +68,7 @@ fn fit(data: &str) -> FitResult {
     let d = temp(data, ".csv");
     let mp = m.path().to_str().expect("utf-8 temp path").to_string();
     let dp = d.path().to_str().expect("utf-8 temp path").to_string();
-    run_model_with_data(&mp, Some(&dp))
-        .map(|(r, _)| r)
-        .expect("fit")
+    run_model_with_data(&mp, Some(&dp)).map(|(r, _)| r).expect("fit")
 }
 
 /// `1` is the ordinary below-LLOQ flag and `7` the out-of-range value
@@ -153,9 +148,7 @@ fn the_same_row_under_m3_is_censored() {
     let d = temp(&csv("1"), ".csv");
     let mp = m.path().to_str().expect("utf-8 temp path").to_string();
     let dp = d.path().to_str().expect("utf-8 temp path").to_string();
-    let m3 = run_model_with_data(&mp, Some(&dp))
-        .map(|(r, _)| r)
-        .expect("fit");
+    let m3 = run_model_with_data(&mp, Some(&dp)).map(|(r, _)| r).expect("fit");
 
     let subject1 = &m3.subjects[0];
     assert!(

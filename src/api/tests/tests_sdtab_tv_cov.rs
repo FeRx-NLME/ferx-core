@@ -1,7 +1,7 @@
 use super::*;
 use crate::types::{
-    BloqMethod, CompiledModel, DoseEvent, ErrorModel, ErrorSpec, GradientMethod, ModelParameters,
-    OmegaMatrix, PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject,
+    CompiledModel, DoseEvent, ErrorModel, ErrorSpec, ModelParameters, OmegaMatrix, PkParams,
+    Population, SigmaVector, Subject,
 };
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
@@ -30,100 +30,25 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     // ── Minimal CompiledModel: 1-cpt IV bolus, CL scaled by per-event WT ──
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
-        theta: vec![5.0, 50.0], // TVCL = 5, TVV = 50
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        theta_lower: vec![0.1, 5.0],
-        theta_upper: vec![50.0, 500.0],
-        theta_fixed: vec![false; 2],
-        omega,
-        omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.1],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        sigma: SigmaVector { values: vec![0.1], names: vec!["PROP_ERR".into()] },
+        ..crate::types::test_helpers::bare_params(omega)
     };
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "tv_cov_sdtab_regression".into(),
-        pk_model: PkModel::OneCptIv,
-        error_model: ErrorModel::Proportional,
-        error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         // CL = TVCL · exp(η_CL) · (WT/70) — reads WT from the covariate map
         // that `compute_predictions_with_tv` substitutes per-event from
         // `obs_covariates` / `dose_covariates`. With WT changing per obs
         // the TV path produces a profile that the (broken) no-TV path
         // can't match.
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                let wt = cov.get("WT").copied().unwrap_or(70.0);
-                p.values[0] = theta[0] * eta[0].exp() * (wt / 70.0);
-                p.values[1] = theta[1];
-                p
-            },
-        ),
-        n_theta: 2,
-        n_eta: 1,
-        n_epsilon: 1,
-        n_kappa: 0,
-        kappa_names: Vec::new(),
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        eta_names: vec!["ETA_CL".into()],
-        indiv_param_names: vec!["CL".into(), "V".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        default_params: default_params.clone(),
-        omega_init_as_sd: vec![false],
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
-        eta_map: vec![0],
-        pk_idx_f64: vec![0.0, 1.0],
-        sel_flat: vec![1.0, 0.0],
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            let wt = cov.get("WT").copied().unwrap_or(70.0);
+            p.values[0] = theta[0] * eta[0].exp() * (wt / 70.0);
+            p.values[1] = theta[1];
+            p
+        }),
         referenced_covariates: vec!["WT".into()],
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(default_params.clone())
     };
 
     // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -143,41 +68,23 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     m.insert("WT".to_string(), 70.0);
     dose_covs.push(m);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "TVS".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![10.0, 5.0, 2.5], // placeholders; values don't matter for the IPRED check
+        observations: vec![10.0, 5.0, 2.5],
+        // placeholders; values don't matter for the IPRED check
         obs_cmts: vec![1, 1, 1],
         covariates: subj_cov,
         dose_covariates: dose_covs,
         obs_covariates: obs_covs,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     // Sanity: this subject must be classified TV — that's the regime the
     // bug lived in.
-    assert!(
-        subject.has_tv_covariates(),
-        "test setup wrong: subject must have TV covariates"
-    );
+    assert!(subject.has_tv_covariates(), "test setup wrong: subject must have TV covariates");
 
     let population = Population {
         subjects: vec![subject.clone()],
@@ -212,18 +119,9 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &subject.covariates,
         0.0,
     );
-    let ipred_no_tv = model_preds(
-        &model,
-        &subject,
-        &pk_no_tv,
-        &default_params.theta,
-        eta_hats[0].as_slice(),
-    );
-    let gap: f64 = ipred_reference
-        .iter()
-        .zip(ipred_no_tv.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let ipred_no_tv =
+        model_preds(&model, &subject, &pk_no_tv, &default_params.theta, eta_hats[0].as_slice());
+    let gap: f64 = ipred_reference.iter().zip(ipred_no_tv.iter()).map(|(a, b)| (a - b).abs()).sum();
     assert!(
         gap > 1e-3,
         "test setup wrong: TV and no-TV IPRED paths must differ noticeably \
@@ -268,18 +166,10 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &zero_eta);
     let pk_pred_no_tv =
         (model.pk_param_fn)(&default_params.theta, &zero_eta, &subject.covariates, 0.0);
-    let pred_no_tv = model_preds(
-        &model,
-        &subject,
-        &pk_pred_no_tv,
-        &default_params.theta,
-        &zero_eta,
-    );
-    let pred_gap: f64 = pred_reference
-        .iter()
-        .zip(pred_no_tv.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let pred_no_tv =
+        model_preds(&model, &subject, &pk_pred_no_tv, &default_params.theta, &zero_eta);
+    let pred_gap: f64 =
+        pred_reference.iter().zip(pred_no_tv.iter()).map(|(a, b)| (a - b).abs()).sum();
     assert!(
         pred_gap > 1e-3,
         "test setup wrong: TV and no-TV PRED paths must differ noticeably; \
@@ -322,34 +212,15 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
     assert_eq!(model.residual_correlations.len(), 1);
 
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0],
         obs_cmts: vec![1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let eta = DVector::from_vec(vec![0.0]);
     let ipred = crate::pk::compute_predictions_with_tv(
@@ -403,35 +274,13 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
 #[test]
 fn test_simulate_honours_tv_covariates() {
     let default_params = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
-        theta: vec![5.0, 50.0],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        theta_lower: vec![0.1, 5.0],
-        theta_upper: vec![50.0, 500.0],
-        theta_fixed: vec![false; 2],
-        omega: OmegaMatrix::from_diagonal(&[], vec![]),
         omega_fixed: Vec::new(),
-        sigma: SigmaVector {
-            values: vec![0.0],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        sigma: SigmaVector { values: vec![0.0], names: vec!["PROP_ERR".into()] },
+        ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(&[], vec![]))
     };
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "tv_cov_sim_regression".into(),
-        pk_model: PkModel::OneCptIv,
-        error_model: ErrorModel::Proportional,
         error_spec: ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(
             |theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
                 let mut p = PkParams::default();
@@ -441,57 +290,13 @@ fn test_simulate_honours_tv_covariates() {
                 p
             },
         ),
-        n_theta: 2,
         n_eta: 0,
-        n_epsilon: 1,
-        n_kappa: 0,
-        kappa_names: Vec::new(),
-        theta_names: vec!["TVCL".into(), "TVV".into()],
         eta_names: Vec::new(),
-        indiv_param_names: vec!["CL".into(), "V".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        default_params: default_params.clone(),
         omega_init_as_sd: Vec::new(),
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
         eta_map: Vec::new(),
-        pk_idx_f64: vec![0.0, 1.0],
         sel_flat: Vec::new(),
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
         referenced_covariates: vec!["WT".into()],
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(default_params.clone())
     };
 
     let mut baseline_cov = HashMap::new();
@@ -504,34 +309,18 @@ fn test_simulate_honours_tv_covariates() {
         HashMap::from([("WT".to_string(), 210.0)]),
     ];
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "SIMTV".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0, 0.0],
         obs_cmts: vec![1, 1, 1],
         covariates: baseline_cov,
         dose_covariates,
         obs_covariates,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     assert!(subject.has_tv_covariates());
 
@@ -539,11 +328,7 @@ fn test_simulate_honours_tv_covariates() {
         crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &[]);
     let pk_no_tv = (model.pk_param_fn)(&default_params.theta, &[], &subject.covariates, 0.0);
     let no_tv = model_preds(&model, &subject, &pk_no_tv, &default_params.theta, &[]);
-    let gap: f64 = reference
-        .iter()
-        .zip(no_tv.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let gap: f64 = reference.iter().zip(no_tv.iter()).map(|(a, b)| (a - b).abs()).sum();
     assert!(
         gap > 1e-3,
         "test setup wrong: TV and baseline-only simulation paths must differ; \

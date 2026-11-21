@@ -85,14 +85,9 @@ fn shortened(text: &str) -> String {
 fn anchor_data(model: &Path) -> Option<PathBuf> {
     let dir = model.parent()?;
     let stem = model.file_stem()?.to_str()?;
-    let base = ["_ode_fit", "_fit", "_ode"]
-        .iter()
-        .find_map(|s| stem.strip_suffix(s))
-        .unwrap_or(stem);
-    for ctl in [
-        dir.join(format!("{base}.ctl")),
-        dir.join(format!("{stem}.ctl")),
-    ] {
+    let base =
+        ["_ode_fit", "_fit", "_ode"].iter().find_map(|s| stem.strip_suffix(s)).unwrap_or(stem);
+    for ctl in [dir.join(format!("{base}.ctl")), dir.join(format!("{stem}.ctl"))] {
         if let Ok(t) = std::fs::read_to_string(&ctl) {
             let name = t.lines().find_map(|l| {
                 let l = l.trim_start();
@@ -109,10 +104,7 @@ fn anchor_data(model: &Path) -> Option<PathBuf> {
             }
         }
     }
-    [base, stem]
-        .iter()
-        .map(|s| dir.join(format!("{s}.csv")))
-        .find(|p| p.exists())
+    [base, stem].iter().map(|s| dir.join(format!("{s}.csv"))).find(|p| p.exists())
 }
 
 #[derive(Default)]
@@ -126,28 +118,18 @@ struct Tally {
 impl Tally {
     fn skip(&mut self, why: &str, model: &Path) {
         let why = why.lines().next().unwrap_or("").chars().take(70).collect();
-        self.skipped
-            .entry(why)
-            .or_default()
-            .push(model.display().to_string());
+        self.skipped.entry(why).or_default().push(model.display().to_string());
     }
 }
 
 fn run_one(
-    tally: &std::sync::Mutex<Tally>,
-    tmp: &Path,
-    idx: usize,
-    model: &Path,
-    data: Option<PathBuf>,
+    tally: &std::sync::Mutex<Tally>, tmp: &Path, idx: usize, model: &Path, data: Option<PathBuf>,
     simulate: bool,
 ) {
     let text = std::fs::read_to_string(model).expect("read model");
     let patched = tmp.join(format!("m{idx}.ferx"));
     std::fs::write(&patched, shortened(&text)).expect("write");
-    let overrides = ferx_core::RunOverrides {
-        threads: Some(1),
-        ..Default::default()
-    };
+    let overrides = ferx_core::RunOverrides { threads: Some(1), ..Default::default() };
     let path = patched.to_str().expect("utf8").to_string();
     let data_s = data.as_ref().map(|d| d.to_str().expect("utf8").to_string());
     let res = std::panic::catch_unwind(|| {
@@ -207,9 +189,7 @@ fn no_committed_model_falls_back_to_finite_differences() {
         }
     }
     // Fits are single-threaded (`threads = 1`); the models run side by side.
-    let workers = std::thread::available_parallelism()
-        .map_or(2, |n| n.get())
-        .min(8);
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let shared = std::sync::Mutex::new(tally);
     std::thread::scope(|sc| {

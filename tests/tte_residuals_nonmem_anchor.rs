@@ -41,27 +41,16 @@ fn martingales(r: &FitResult, pop: &Population) -> Vec<(String, f64, f64)> {
     let rows: Vec<(String, f64, f64)> = r
         .subjects
         .iter()
-        .flat_map(|s| {
-            s.tte_rows
-                .iter()
-                .map(move |t| (s.id.clone(), t.time, t.martingale))
-        })
+        .flat_map(|s| s.tte_rows.iter().map(move |t| (s.id.clone(), t.time, t.martingale)))
         .collect();
     let cols = sdtab(r, pop);
     let col = |n: &str| &cols.iter().find(|(c, _)| c == n).expect(n).1;
     let m = col("MARTINGALE");
     let tail = &m[m.len() - rows.len()..];
     for ((_, _, want), got) in rows.iter().zip(tail) {
-        assert_eq!(
-            got.to_bits(),
-            want.to_bits(),
-            "sdtab MARTINGALE vs tte_rows"
-        );
+        assert_eq!(got.to_bits(), want.to_bits(), "sdtab MARTINGALE vs tte_rows");
     }
-    assert!(
-        m[..m.len() - rows.len()].iter().all(|x| x.is_nan()),
-        "no MARTINGALE on a non-TTE row"
-    );
+    assert!(m[..m.len() - rows.len()].iter().all(|x| x.is_nan()), "no MARTINGALE on a non-TTE row");
     rows
 }
 
@@ -86,10 +75,7 @@ fn t10_nonmem() -> Vec<(String, f64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // ID TIME DV CHZ ETA1
             (f.len() >= 5).then(|| (format!("{}", f[0] as i64), f[1], f[2], f[3], f[4]))
         })
@@ -160,10 +146,7 @@ fn t11_nonmem() -> Vec<(String, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // ID TIME EVID CMT DV IPRED CHZ HAZ ETA1 MDV
             (f.len() >= 10 && f[2] == 0.0 && f[3] == 3.0)
                 .then(|| (format!("{}", f[0] as i64), f[1], f[4] - f[6]))
@@ -176,21 +159,11 @@ fn t11_joint_pktte_martingale_matches_nonmem() {
     let src = std::fs::read_to_string("nonmem_anchor/pktte_ebe_fit.ferx").expect("model");
     let parsed = parse_full_model(&src).expect("parse");
     let m = &parsed.model;
-    let (pop, _) = read_population_for(
-        m,
-        &None,
-        "nonmem_anchor/pktte_ebe.csv",
-        None,
-        None,
-        None,
-        &[],
-    )
-    .expect("data");
-    let opts = FitOptions {
-        run_covariance_step: false,
-        inner_tol: 1e-10,
-        ..parsed.fit_options.clone()
-    };
+    let (pop, _) =
+        read_population_for(m, &None, "nonmem_anchor/pktte_ebe.csv", None, None, None, &[])
+            .expect("data");
+    let opts =
+        FitOptions { run_covariance_step: false, inner_tol: 1e-10, ..parsed.fit_options.clone() };
     let r = fit(m, &pop, &m.default_params, &opts).expect("inner-only fit");
     let ms = martingales(&r, &pop);
     let nm = t11_nonmem();
@@ -241,16 +214,9 @@ fn rtte_model(clock: &str) -> String {
 fn t12_rtte_subject_martingale_sum_is_eta_over_omega() {
     for clock in ["forward", "reset"] {
         let m = parse_model_string(&rtte_model(clock)).expect("parse");
-        let (pop, _) = read_population_for(
-            &m,
-            &None,
-            "data/rtte_exponential.csv",
-            None,
-            None,
-            None,
-            &[],
-        )
-        .expect("data");
+        let (pop, _) =
+            read_population_for(&m, &None, "data/rtte_exponential.csv", None, None, None, &[])
+                .expect("data");
         let opts = FitOptions {
             outer_maxiter: 0,
             run_covariance_step: false,
@@ -260,18 +226,12 @@ fn t12_rtte_subject_martingale_sum_is_eta_over_omega() {
         let r = fit(&m, &pop, &m.default_params, &opts).expect("inner-only fit");
         let ms = martingales(&r, &pop);
         let multi = r.subjects.iter().filter(|s| s.tte_rows.len() >= 3).count();
-        assert!(
-            multi > 10,
-            "{clock}: the stream must have multi-record subjects"
-        );
+        assert!(multi > 10, "{clock}: the stream must have multi-record subjects");
         let w = worst_abs(r.subjects.iter().map(|s| {
             let sum: f64 = ms.iter().filter(|(i, ..)| *i == s.id).map(|m| m.2).sum();
             (sum, s.eta[0] / OMEGA_T12)
         }));
-        eprintln!(
-            "T12 {clock}: {} subjects, worst |ΣM − η̂/ω| {w:.3e}",
-            r.subjects.len()
-        );
+        eprintln!("T12 {clock}: {} subjects, worst |ΣM − η̂/ω| {w:.3e}", r.subjects.len());
         assert!(w < BOUND_T12, "{clock}: {w:.3e}");
     }
 }

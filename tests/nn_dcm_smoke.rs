@@ -25,13 +25,7 @@ fn build_mapper() -> NamedMlpMapper {
     NamedMlpMapper::new(
         mlp,
         vec!["WT".into(), "CRCL".into()],
-        vec![
-            "CL".into(),
-            "V1".into(),
-            "Q".into(),
-            "V2".into(),
-            "KA".into(),
-        ],
+        vec!["CL".into(), "V1".into(), "Q".into(), "V2".into(), "KA".into()],
     )
     .expect("output names map to PK slots")
 }

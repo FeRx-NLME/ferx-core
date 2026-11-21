@@ -43,10 +43,7 @@ mod binary_smoke {
 ";
 
     fn smoke_opts() -> FitOptions {
-        FitOptions {
-            outer_maxiter: 3,
-            ..Default::default()
-        }
+        FitOptions { outer_maxiter: 3, ..Default::default() }
     }
 
     /// The parser recognises `[binary_model]` and registers a `Binary` endpoint on its CMT.
@@ -108,14 +105,8 @@ mod binary_smoke {
         let err = fit(&model, &pop, &model.default_params, &smoke_opts())
             .expect_err("state = 2 on a binary CMT must be rejected")
             .to_string();
-        assert!(
-            err.contains("0 or 1"),
-            "expected a fail-loud message, got: {err}"
-        );
-        assert!(
-            err.contains("cmt = 3"),
-            "message should name the CMT, got: {err}"
-        );
+        assert!(err.contains("0 or 1"), "expected a fail-loud message, got: {err}");
+        assert!(err.contains("cmt = 3"), "message should name the CMT, got: {err}");
     }
 
     /// Joint PK + binary model declaring inter-occasion variability (κ) — used to check that
@@ -183,15 +174,9 @@ mod binary_smoke {
     #[test]
     fn binary_gauss_newton_rejected() {
         let model = parse_model_string(MIXED_MODEL).unwrap();
-        let opts = FitOptions {
-            method: EstimationMethod::FoceGn,
-            ..Default::default()
-        };
+        let opts = FitOptions { method: EstimationMethod::FoceGn, ..Default::default() };
         assert!(
-            has_error(
-                &check_model_options(&model, &opts),
-                "E_BINARY_GN_UNSUPPORTED"
-            ),
+            has_error(&check_model_options(&model, &opts), "E_BINARY_GN_UNSUPPORTED"),
             "method = gn + binary must be rejected"
         );
     }
@@ -230,10 +215,8 @@ mod binary_smoke {
         ))
         .is_err());
         // Unknown key.
-        assert!(parse_model_string(&wrap(
-            "[binary_model]\n  cmt = 3\n  logit = TH0\n  bogus = 1"
-        ))
-        .is_err());
+        assert!(parse_model_string(&wrap("[binary_model]\n  cmt = 3\n  logit = TH0\n  bogus = 1"))
+            .is_err());
         // Missing `logit`.
         assert!(parse_model_string(&wrap("[binary_model]\n  cmt = 3")).is_err());
         // Missing `cmt`.
@@ -421,14 +404,8 @@ mod binary_smoke {
             assert_eq!(p.prediction.prob(1), Some(probs[1]));
         }
         // At the default θ = 0 with η = 0 the predictor is 0 ⇒ p = 0.5 exactly.
-        let Prediction::CatProbs { ref probs } = preds[0].prediction else {
-            unreachable!()
-        };
-        assert!(
-            (probs[1] - 0.5).abs() < 1e-12,
-            "θ=0 ⇒ p=0.5, got {}",
-            probs[1]
-        );
+        let Prediction::CatProbs { ref probs } = preds[0].prediction else { unreachable!() };
+        assert!((probs[1] - 0.5).abs() < 1e-12, "θ=0 ⇒ p=0.5, got {}", probs[1]);
     }
 
     /// The plain Gaussian `predict()` returns no rows for a binary-only model (its records
@@ -438,9 +415,7 @@ mod binary_smoke {
     fn gaussian_predict_is_empty_for_a_binary_only_model() {
         let model = parse_model_string(MIXED_MODEL).unwrap();
         let pop = common::binary_pop(&sim_subjects(), 3);
-        assert!(ferx_core::predict(&model, &pop, &model.default_params)
-            .unwrap()
-            .is_empty());
+        assert!(ferx_core::predict(&model, &pop, &model.default_params).unwrap().is_empty());
     }
 
     /// A fit **restored from a `.fitrx` bundle** keeps its per-record discrete diagnostics
@@ -460,9 +435,7 @@ mod binary_smoke {
         let bundle = dir.path().join("fit.fitrx");
         ferx_core::io::fitrx::save_fit(&res, &pop, MIXED_MODEL, &bundle, Default::default())
             .expect("save_fit");
-        let restored = ferx_core::io::fitrx::load_fit(&bundle)
-            .expect("load_fit")
-            .fit;
+        let restored = ferx_core::io::fitrx::load_fit(&bundle).expect("load_fit").fit;
         assert!(restored.restored_from_checkpoint);
         for (live, back) in res.subjects.iter().zip(&restored.subjects) {
             assert_eq!(back.discrete_rows.len(), live.discrete_rows.len());
@@ -511,17 +484,10 @@ mod binary_smoke {
         };
 
         // A binary-only model has no Gaussian rows, so every sdtab row is a discrete one.
-        assert_eq!(
-            get("DV").len(),
-            n_records,
-            "one sdtab row per binary record"
-        );
+        assert_eq!(get("DV").len(), n_records, "one sdtab row per binary record");
         // The endpoint's CMT must survive even with no Gaussian rows to trigger the
         // usual multi-CMT heuristic.
-        assert!(
-            get("CMT").iter().all(|&c| c == 3.0),
-            "CMT column must carry the binary CMT"
-        );
+        assert!(get("CMT").iter().all(|&c| c == 3.0), "CMT column must carry the binary CMT");
 
         for (i, (&dv, &ipred)) in get("DV").iter().zip(get("IPRED").iter()).enumerate() {
             assert!(dv == 0.0 || dv == 1.0, "row {i}: DV must be 0/1, got {dv}");
@@ -530,16 +496,10 @@ mod binary_smoke {
                 "row {i}: IPRED must be a probability, got {ipred}"
             );
         }
-        assert!(
-            get("IWRES").iter().all(|r| r.is_finite()),
-            "IWRES must be finite"
-        );
+        assert!(get("IWRES").iter().all(|r| r.is_finite()), "IWRES must be finite");
         assert!(get("PRED").iter().all(|p| (0.0..=1.0).contains(p)));
         // CWRES is undefined for a Bernoulli outcome → NaN → blank cell on write.
-        assert!(
-            get("CWRES").iter().all(|c| c.is_nan()),
-            "CWRES must be blank for discrete rows"
-        );
+        assert!(get("CWRES").iter().all(|c| c.is_nan()), "CWRES must be blank for discrete rows");
     }
 
     /// **Table-integrity invariant.** Every sdtab column is built by its own pass, and the
@@ -592,14 +552,8 @@ mod binary_smoke {
         let cmts = [3usize, 4, 5, 6, 7];
         let mut src = String::from("[parameters]\n  theta TH0(0.3, -10.0, 10.0)\n");
         for (i, c) in cmts.iter().enumerate() {
-            let name = if i == 0 {
-                String::new()
-            } else {
-                format!(" B{i}")
-            };
-            src.push_str(&format!(
-                "\n[binary_model{name}]\n  cmt   = {c}\n  logit = TH0\n"
-            ));
+            let name = if i == 0 { String::new() } else { format!(" B{i}") };
+            src.push_str(&format!("\n[binary_model{name}]\n  cmt   = {c}\n  logit = TH0\n"));
         }
         let model = parse_model_string(&src).expect("multiple [binary_model] blocks must parse");
         assert_eq!(
@@ -651,18 +605,11 @@ mod binary_smoke {
             &model,
             &pop,
             &model.default_params,
-            &FitOptions {
-                inner_restarts: 3,
-                ..smoke_opts()
-            },
+            &FitOptions { inner_restarts: 3, ..smoke_opts() },
         )
         .expect("multi-start binary fit must return Ok");
 
-        assert!(
-            multi.ofv.is_finite(),
-            "OFV must be finite, got {}",
-            multi.ofv
-        );
+        assert!(multi.ofv.is_finite(), "OFV must be finite, got {}", multi.ofv);
         // Log-concave posterior ⇒ every start reaches the same inner mode ⇒ same objective.
         assert!(
             (multi.ofv - base.ofv).abs() < 1e-6,
@@ -810,20 +757,13 @@ mod binary_smoke {
             "a NaN predictor must emit no rows, got {:?}",
             out.results.len()
         );
-        let w = out
-            .warnings
-            .iter()
-            .find(|w| w.contains("[binary_model]"))
-            .unwrap_or_else(|| panic!("expected a NaN-predictor warning, got {:?}", out.warnings));
+        let w =
+            out.warnings.iter().find(|w| w.contains("[binary_model]")).unwrap_or_else(|| {
+                panic!("expected a NaN-predictor warning, got {:?}", out.warnings)
+            });
         assert!(w.contains("cmt = 3"), "warning must name the CMT: {w}");
-        assert!(
-            w.contains("subject 1"),
-            "warning must name the subject: {w}"
-        );
-        assert!(
-            w.contains("3 record(s)"),
-            "warning must count the records: {w}"
-        );
+        assert!(w.contains("subject 1"), "warning must name the subject: {w}");
+        assert!(w.contains("3 record(s)"), "warning must count the records: {w}");
     }
 
     // ---- Slice 1b: gaps closed after the #900 review -----------------------------------
@@ -903,20 +843,15 @@ mod binary_smoke {
         let sims = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, n, 20260722)
             .unwrap();
         assert_eq!(sims.len(), n, "one row per replicate draw");
-        let ones = sims
-            .iter()
-            .filter(|r| matches!(r.outcome, SimOutcome::Category { state: 1 }))
-            .count();
+        let ones =
+            sims.iter().filter(|r| matches!(r.outcome, SimOutcome::Category { state: 1 })).count();
         let freq = ones as f64 / sims.len() as f64;
         // SE ≈ √(0.8·0.2/4000) ≈ 0.0063; 0.8 vs an inverted 0.2 is ~95 SE apart.
         assert!(
             (freq - 0.8).abs() < 0.03,
             "p = 0.8 but realised frequency {freq}; an inverted `u < p` draws ~0.2"
         );
-        assert!(
-            sims.iter().all(|r| (r.ipred - 0.8).abs() < 1e-9),
-            "ipred must carry p = 0.8"
-        );
+        assert!(sims.iter().all(|r| (r.ipred - 0.8).abs() < 1e-9), "ipred must carry p = 0.8");
     }
 
     /// **`raw_time` ≠ `time`.** The predictor runs on the engine's internal
@@ -1061,18 +996,8 @@ mod binary_smoke {
             vec![1, 1, 1],
         );
         s.obs_records = vec![
-            ObsRecord::DiscreteState {
-                time: 0.5,
-                raw_time: 0.5,
-                state: 0,
-                cmt: 3,
-            },
-            ObsRecord::DiscreteState {
-                time: 2.0,
-                raw_time: 2.0,
-                state: 1,
-                cmt: 3,
-            },
+            ObsRecord::DiscreteState { time: 0.5, raw_time: 0.5, state: 0, cmt: 3 },
+            ObsRecord::DiscreteState { time: 2.0, raw_time: 2.0, state: 1, cmt: 3 },
         ];
         let pop = Population {
             subjects: vec![s],
@@ -1083,24 +1008,18 @@ mod binary_smoke {
             warnings: vec![],
         };
         let rows = ferx_core::simulate(&model, &pop, &model.default_params, 1).unwrap();
-        let n_cont = rows
-            .iter()
-            .filter(|r| matches!(r.outcome, SimOutcome::Continuous { .. }))
-            .count();
-        let n_cat = rows
-            .iter()
-            .filter(|r| matches!(r.outcome, SimOutcome::Category { .. }))
-            .count();
+        let n_cont =
+            rows.iter().filter(|r| matches!(r.outcome, SimOutcome::Continuous { .. })).count();
+        let n_cat =
+            rows.iter().filter(|r| matches!(r.outcome, SimOutcome::Category { .. })).count();
         assert_eq!(n_cont, 3, "the 3 Gaussian rows must still emit");
         assert_eq!(n_cat, 2, "the 2 binary rows must coexist, not be dropped");
         assert!(
-            rows.iter()
-                .any(|r| matches!(r.outcome, SimOutcome::Continuous { .. }) && r.cmt == 1),
+            rows.iter().any(|r| matches!(r.outcome, SimOutcome::Continuous { .. }) && r.cmt == 1),
             "Gaussian rows on CMT 1"
         );
         assert!(
-            rows.iter()
-                .any(|r| matches!(r.outcome, SimOutcome::Category { .. }) && r.cmt == 3),
+            rows.iter().any(|r| matches!(r.outcome, SimOutcome::Category { .. }) && r.cmt == 3),
             "binary rows on CMT 3"
         );
     }

@@ -129,13 +129,12 @@ pub fn bic(result: &FitResult, kind: BicType) -> f64 {
         BicType::Fixed => term(result.n_parameters, &ln_obs),
         BicType::Random => term(result.n_parameters, &ln_subj),
         BicType::Iiv => term(inp.omega, &ln_subj),
-        BicType::Mixed => match (
-            term(inp.n_random_class(), &ln_subj),
-            term(inp.n_fixed_class(), &ln_obs),
-        ) {
-            (Some(r), Some(f)) => Some(r + f),
-            _ => None,
-        },
+        BicType::Mixed => {
+            match (term(inp.n_random_class(), &ln_subj), term(inp.n_fixed_class(), &ln_obs)) {
+                (Some(r), Some(f)) => Some(r + f),
+                _ => None,
+            }
+        }
     };
     match penalty {
         Some(p) => result.ofv + p,
@@ -150,16 +149,10 @@ pub fn bic(result: &FitResult, kind: BicType) -> f64 {
 /// model must report one count. A level FIX-ed in `template` (one ferx froze, #1891)
 /// stays held: it is estimated by neither.
 pub(crate) fn counted_held_mask(
-    model: &CompiledModel,
-    template: &ModelParameters,
-    held_mask: &[bool],
+    model: &CompiledModel, template: &ModelParameters, held_mask: &[bool],
 ) -> Vec<bool> {
     let mut out = held_mask.to_vec();
-    for i in model
-        .indiv_param_partials
-        .theta_blocks
-        .profiled_theta_indices()
-    {
+    for i in model.indiv_param_partials.theta_blocks.profiled_theta_indices() {
         if !template.theta_fixed.get(i).copied().unwrap_or(false) {
             if let Some(h) = out.get_mut(i) {
                 *h = false;
@@ -178,21 +171,16 @@ pub(crate) fn counted_held_mask(
 /// segment's free entries land in one class, except `θ`, whose entries split on
 /// `CompiledModel::theta_eta_linked`.
 pub(crate) fn bic_inputs_for(
-    model: &CompiledModel,
-    template: &ModelParameters,
-    held_mask: &[bool],
-    n_obs: usize,
+    model: &CompiledModel, template: &ModelParameters, held_mask: &[bool], n_obs: usize,
 ) -> BicInputs {
     let n_theta = template.theta.len();
     let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
     let n_sigma = template.sigma.values.len();
-    let n_iov = template
-        .omega_iov
+    let n_iov = template.omega_iov.as_ref().map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
+    let (n_mix_omega, n_mix_sigma) = template
+        .mixture
         .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let (n_mix_omega, n_mix_sigma) = template.mixture.as_ref().map_or((0, 0), |mix| {
-        (mix.omega_override_addr.len(), mix.sigma_override_addr.len())
-    });
+        .map_or((0, 0), |mix| (mix.omega_override_addr.len(), mix.sigma_override_addr.len()));
     let n_rho = template.residual_correlations.len();
     debug_assert_eq!(
         held_mask.len(),
@@ -201,9 +189,7 @@ pub(crate) fn bic_inputs_for(
     );
 
     let free = |range: std::ops::Range<usize>| -> usize {
-        held_mask
-            .get(range)
-            .map_or(0, |seg| seg.iter().filter(|&&h| !h).count())
+        held_mask.get(range).map_or(0, |seg| seg.iter().filter(|&&h| !h).count())
     };
     let mut out = BicInputs {
         n_obs,
@@ -349,8 +335,7 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
     let mut v = StrictnessVerdict::default();
 
     if s.require_converged && !result.converged {
-        v.failures
-            .push("did not converge (`converged = false`)".to_string());
+        v.failures.push("did not converge (`converged = false`)".to_string());
     }
 
     if s.require_covariance {
@@ -389,8 +374,7 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
                 v.failures.push("condition number is NaN".to_string());
             }
             Some(cn) if cn > max_cn => {
-                v.failures
-                    .push(format!("condition number {cn:.4e} exceeds {max_cn:.4e}"));
+                v.failures.push(format!("condition number {cn:.4e} exceeds {max_cn:.4e}"));
             }
             Some(_) => {}
             None => v.skipped.push(
@@ -406,10 +390,7 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
                 let n = result.covariance_matrix.as_ref().map_or(0, |c| c.nrows());
                 let names = crate::io::output::packed_param_names(result, n);
                 let name = |k: usize| {
-                    names
-                        .get(k)
-                        .cloned()
-                        .unwrap_or_else(|| format!("packed coordinate {k}"))
+                    names.get(k).cloned().unwrap_or_else(|| format!("packed coordinate {k}"))
                 };
                 v.failures.push(format!(
                     "parameter correlation |r| = {r:.4} exceeds {max_r:.4} ({} ~ {})",
@@ -455,10 +436,8 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
     }
 
     if s.reject_on_boundary {
-        if let Some(entry) = result
-            .warnings_structured
-            .iter()
-            .find(|w| w.category == WarningCode::BoundaryEstimate)
+        if let Some(entry) =
+            result.warnings_structured.iter().find(|w| w.category == WarningCode::BoundaryEstimate)
         {
             let names: Vec<String> = entry
                 .details
@@ -472,13 +451,8 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
                         .collect()
                 })
                 .unwrap_or_default();
-            let what = if names.is_empty() {
-                entry.message.clone()
-            } else {
-                names.join(", ")
-            };
-            v.failures
-                .push(format!("estimate pinned to a declared bound: {what}"));
+            let what = if names.is_empty() { entry.message.clone() } else { names.join(", ") };
+            v.failures.push(format!("estimate pinned to a declared bound: {what}"));
         }
     }
 
@@ -511,10 +485,7 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
 /// safety limits) is reported as `ParameterAtRunawayGuard` instead and demotes
 /// `converged` (#1118); it is not a boundary estimate in this sense.
 pub fn estimate_near_boundary(result: &FitResult) -> bool {
-    result
-        .warnings_structured
-        .iter()
-        .any(|w| w.category == WarningCode::BoundaryEstimate)
+    result.warnings_structured.iter().any(|w| w.category == WarningCode::BoundaryEstimate)
 }
 
 /// Whether the covariance step's Hessian eigenvalue floor fired on this fit (#1512).
@@ -527,8 +498,7 @@ pub fn estimate_near_boundary(result: &FitResult) -> bool {
 fn covariance_regularized(result: &FitResult) -> bool {
     result.warnings_structured.iter().any(|w| {
         w.category == WarningCode::CovarianceRegularized
-            && w.message
-                .starts_with(crate::estimation::cov_diagnostics::REGULARIZED_PREFIX)
+            && w.message.starts_with(crate::estimation::cov_diagnostics::REGULARIZED_PREFIX)
     })
 }
 
@@ -715,9 +685,8 @@ pub fn natural_scale_covariance(result: &FitResult) -> Option<DMatrix<f64>> {
 fn max_abs_correlation_indexed(result: &FitResult) -> Option<(f64, usize, usize)> {
     let cov = natural_scale_covariance(result)?;
     let n = cov.nrows().min(cov.ncols());
-    let usable: Vec<usize> = (0..n)
-        .filter(|&i| cov[(i, i)] > 0.0 && cov[(i, i)].is_finite())
-        .collect();
+    let usable: Vec<usize> =
+        (0..n).filter(|&i| cov[(i, i)] > 0.0 && cov[(i, i)].is_finite()).collect();
     if usable.len() < 2 {
         return None;
     }

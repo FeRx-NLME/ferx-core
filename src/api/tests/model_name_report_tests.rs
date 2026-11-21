@@ -59,9 +59,7 @@ fn a_malformed_model_line_is_a_parse_error_in_the_report() {
     assert_eq!(report.model, "from_the_stem");
     assert_eq!(report.diagnostics.len(), 1);
     assert!(
-        report.diagnostics[0]
-            .message
-            .contains("Malformed model name declaration"),
+        report.diagnostics[0].message.contains("Malformed model name declaration"),
         "{}",
         report.diagnostics[0].message
     );

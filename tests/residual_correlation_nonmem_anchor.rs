@@ -81,10 +81,7 @@ fn run(src: &str, maxiter: Option<usize>, covariance: bool) -> FitResult {
 
 /// [`run`] with a last edit to the fit options (the covariance-route switches).
 fn run_with(
-    src: &str,
-    maxiter: Option<usize>,
-    covariance: bool,
-    edit: impl FnOnce(&mut FitOptions),
+    src: &str, maxiter: Option<usize>, covariance: bool, edit: impl FnOnce(&mut FitOptions),
 ) -> FitResult {
     let parsed = parse_full_model(src).expect("twin parses");
     let model = parsed.model;
@@ -98,10 +95,7 @@ fn run_with(
         &[],
     )
     .expect("anchor data reads");
-    let mut opts = FitOptions {
-        run_covariance_step: covariance,
-        ..parsed.fit_options
-    };
+    let mut opts = FitOptions { run_covariance_step: covariance, ..parsed.fit_options };
     if let Some(m) = maxiter {
         opts.outer_maxiter = m;
     }
@@ -122,10 +116,7 @@ fn residual_correlation_matches_nonmem_at_fixed_parameters() {
         assert!(ofv.is_finite(), "{probe}: OFV {ofv}");
         let err = (ofv - nm).abs();
         eprintln!("{probe}: ferx {ofv:.12} NONMEM {nm:.12} |Δ| {err:.3e}");
-        assert!(
-            err < PROBE_TOL,
-            "{probe}: ferx {ofv:.10} vs NONMEM {nm:.10} (|Δ| {err:.3e})"
-        );
+        assert!(err < PROBE_TOL, "{probe}: ferx {ofv:.10} vs NONMEM {nm:.10} (|Δ| {err:.3e})");
         worst = worst.max(err);
     }
     eprintln!("worst |Δ| = {worst:.3e}");
@@ -266,23 +257,13 @@ const CAR_EST: [f64; 10] = [
 
 /// The free twin of `kind` started at a NONMEM optimum `est`.
 fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
-    let names = [
-        "TVE0",
-        "TVEMAX",
-        "TVET50",
-        "B_E0_FLARE",
-        "B_EMAX_FLARE",
-        "B_EMAX_TRT",
-        "B_LET50_TRT",
-    ];
+    let names =
+        ["TVE0", "TVEMAX", "TVET50", "B_E0_FLARE", "B_EMAX_FLARE", "B_EMAX_TRT", "B_LET50_TRT"];
     // `free_twin` starts ρ at 0.3, or at 0.5 under `car1`.
     let mut src = free_twin(kind)
         .replace("theta RHO(0.3,", &format!("theta RHO({},", est[7]))
         .replace("theta RHO(0.5,", &format!("theta RHO({},", est[7]));
-    assert!(
-        src.contains(&format!("theta RHO({},", est[7])),
-        "{kind}: ρ moved to NONMEM's optimum"
-    );
+    assert!(src.contains(&format!("theta RHO({},", est[7])), "{kind}: ρ moved to NONMEM's optimum");
     for (i, name) in names.iter().enumerate() {
         let decl = MODEL
             .lines()
@@ -293,16 +274,10 @@ fn at_optimum(kind: &str, est: &[f64; 10]) -> String {
             .trim_end()
             .to_string();
         let init = decl[decl.find('(').unwrap() + 1..decl.find(',').unwrap()].to_string();
-        src = src.replace(
-            &decl,
-            &decl.replacen(&format!("({init},"), &format!("({},", est[i]), 1),
-        );
+        src = src.replace(&decl, &decl.replacen(&format!("({init},"), &format!("({},", est[i]), 1));
     }
     src = src
-        .replace(
-            "ETA_E0   ~ 0.3862622500000001",
-            &format!("ETA_E0   ~ {}", est[8]),
-        )
+        .replace("ETA_E0   ~ 0.3862622500000001", &format!("ETA_E0   ~ {}", est[8]))
         .replace("ETA_EMAX ~ 0.54567769", &format!("ETA_EMAX ~ {}", est[9]));
     src
 }
@@ -328,23 +303,12 @@ fn covariance_at_the_nonmem_optimum_gives_its_se_of_rho() {
     ] {
         assert_eq!(nm.0, kind);
         let r = run(&at_optimum(kind, est), Some(0), true);
-        assert!(
-            (r.ofv - nm.1).abs() < 1e-4,
-            "{kind}: at NONMEM's optimum: {}",
-            r.ofv
-        );
+        assert!((r.ofv - nm.1).abs() < 1e-4, "{kind}: at NONMEM's optimum: {}", r.ofv);
         let se = r.se_theta.as_ref().map(|s| s[7]).unwrap_or(f64::NAN);
         let gap = se / nm.3 - 1.0;
-        eprintln!(
-            "{kind}: OFV {:.9} SE(ρ̂) ferx {se:.7} NONMEM {:.7} ({gap:+.3e})",
-            r.ofv, nm.3
-        );
+        eprintln!("{kind}: OFV {:.9} SE(ρ̂) ferx {se:.7} NONMEM {:.7} ({gap:+.3e})", r.ofv, nm.3);
         assert!(se.is_finite(), "{kind}: SE(ρ̂) {se}");
-        assert!(
-            gap.abs() < 1e-4,
-            "{kind}: SE(ρ̂) ferx {se} vs NONMEM {} ({gap:+.3e})",
-            nm.3
-        );
+        assert!(gap.abs() < 1e-4, "{kind}: SE(ρ̂) ferx {se} vs NONMEM {} ({gap:+.3e})", nm.3);
     }
 }
 
@@ -383,10 +347,7 @@ fn fd_stencil_se_of_rho_runs_low_by_its_truncation_error() {
             o.fd_hessian_step = step;
         });
         let se = r.se_theta.as_ref().map(|s| s[7]).unwrap_or(f64::NAN);
-        assert!(
-            se.is_finite(),
-            "analytic {analytic} step {step}: SE(ρ̂) {se}"
-        );
+        assert!(se.is_finite(), "analytic {analytic} step {step}: SE(ρ̂) {se}");
         se
     };
     let exact = se_rho(true, 1e-2);
@@ -441,10 +402,7 @@ fn fd_stencil_se_of_rho_runs_low_by_its_truncation_error() {
 #[test]
 fn durbin_watson_is_taken_on_decorrelated_residuals() {
     let mut seen = Vec::new();
-    for (kind, est, want_dw) in [
-        ("cs", &CS_EST, 1.634_244_701),
-        ("ar1", &AR1_EST, 1.956_695_864),
-    ] {
+    for (kind, est, want_dw) in [("cs", &CS_EST, 1.634_244_701), ("ar1", &AR1_EST, 1.956_695_864)] {
         let r = run(&at_optimum(kind, est), Some(0), false);
         let raw = ferx_core::stats::residual_error::iwres_autocorrelation(&r.subjects);
         assert!(r.dw_statistic.is_finite() && raw.1.is_finite());
@@ -454,20 +412,13 @@ fn durbin_watson_is_taken_on_decorrelated_residuals() {
             (r.dw_statistic - want_dw).abs(),
             raw.1
         );
-        assert!(
-            (r.dw_statistic - want_dw).abs() < 1e-8,
-            "{kind}: DW {}",
-            r.dw_statistic
-        );
+        assert!((r.dw_statistic - want_dw).abs() < 1e-8, "{kind}: DW {}", r.dw_statistic);
         assert!(raw.1 < 1.5, "{kind}: raw IWRES would warn");
         let dw: Vec<&String> = r.warnings.iter().filter(|w| w.contains("Durbin")).collect();
         assert!(dw.is_empty(), "{kind}: {dw:?}");
         seen.push(r.dw_statistic);
     }
-    assert!(
-        seen[0] < seen[1],
-        "cs leaves more serial dependence than ar1: {seen:?}"
-    );
+    assert!(seen[0] < seen[1], "cs leaves more serial dependence than ar1: {seen:?}");
 }
 
 /// Plan T13, SIR leg (#1081 review r1 #8): a short SIR at NONMEM's `cs` optimum
@@ -499,11 +450,8 @@ fn sir_keeps_every_rho_draw_inside_its_theta_box() {
     let rho: Vec<f64> = draws.iter().map(|d| d[7]).collect();
     assert!(rho.len() >= 100, "{} draws", rho.len());
     assert!(rho.iter().all(|v| v.is_finite()), "non-finite ρ draw");
-    let (lo, hi) = rho
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
-            (a.min(v), b.max(v))
-        });
+    let (lo, hi) =
+        rho.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
     let n = rho.len() as f64;
     let mean = rho.iter().sum::<f64>() / n;
     let sd = (rho.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
@@ -512,19 +460,13 @@ fn sir_keeps_every_rho_draw_inside_its_theta_box() {
         rho.len(),
         r.sir_ess
     );
-    assert!(
-        lo >= -0.24 && hi <= 0.99,
-        "ρ draw outside its box: [{lo}, {hi}]"
-    );
+    assert!(lo >= -0.24 && hi <= 0.99, "ρ draw outside its box: [{lo}, {hi}]");
     assert!(hi - lo > 0.05, "draws do not spread: [{lo}, {hi}]");
     // And they sample the right objective: centred on ρ̂ and spread like SE(ρ̂).
     // Realised (seed 1081): mean 0.4867 against ρ̂ 0.5095 (0.29 SE), sd 0.0818
     // against NONMEM's SE 0.0776 (+5%). Bounds: half an SE, and ±25%.
     let (rho_hat, se) = (CS_EST[7], ESTIMATES[0].3);
-    assert!(
-        (mean - rho_hat).abs() < 0.5 * se,
-        "SIR mean {mean} vs ρ̂ {rho_hat}"
-    );
+    assert!((mean - rho_hat).abs() < 0.5 * se, "SIR mean {mean} vs ρ̂ {rho_hat}");
     assert!((sd / se - 1.0).abs() < 0.25, "SIR sd {sd} vs SE {se}");
 }
 
@@ -574,10 +516,7 @@ fn combined_error_correlation_matches_nonmem_focei() {
         assert!(ofv.is_finite(), "{probe}: OFV {ofv}");
         let err = (ofv - nm).abs();
         eprintln!("{probe}: ferx {ofv:.12} NONMEM {nm:.12} |Δ| {err:.3e}");
-        assert!(
-            err < COMB_TOL,
-            "{probe}: ferx {ofv:.10} vs NONMEM {nm:.10} (|Δ| {err:.3e})"
-        );
+        assert!(err < COMB_TOL, "{probe}: ferx {ofv:.10} vs NONMEM {nm:.10} (|Δ| {err:.3e})");
         worst = worst.max(err);
     }
     eprintln!("combined worst |Δ| = {worst:.3e}");

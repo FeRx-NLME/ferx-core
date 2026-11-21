@@ -34,10 +34,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
-fn warfarin_data_and_model() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn warfarin_data_and_model() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -58,10 +55,7 @@ fn warfarin_data_and_model() -> (
 /// module-level "Baseline history" comment for why this differs from the
 /// pre-#130 Sheiner-Beal baseline (-285.7163).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
     const KNOWN_GOOD_OFV: f64 = -279.1136;
     const TOLERANCE: f64 = 0.25;
@@ -76,11 +70,7 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("GN trust-region fit must succeed");
 
-    assert!(
-        result.ofv.is_finite(),
-        "GN-TR OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "GN-TR OFV must be finite, got {}", result.ofv);
     assert!(
         result.ofv <= KNOWN_GOOD_OFV + TOLERANCE,
         "GN-TR OFV {:.4} regressed above known-good {:.4} (tolerance {:.1})",
@@ -109,10 +99,7 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
 /// "Baseline history" comment for the Almquist Laplace shift from the
 /// pre-#130 SB baseline.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_hybrid_tr_warfarin_ofv_beats_slsqp_baseline() {
     const KNOWN_GOOD_OFV: f64 = -286.0042;
     const TOLERANCE: f64 = 0.25;
@@ -127,11 +114,7 @@ fn gn_hybrid_tr_warfarin_ofv_beats_slsqp_baseline() {
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("GN-hybrid fit must succeed");
 
-    assert!(
-        result.ofv.is_finite(),
-        "GN-hybrid OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "GN-hybrid OFV must be finite, got {}", result.ofv);
     assert!(
         result.ofv <= KNOWN_GOOD_OFV + TOLERANCE,
         "GN-hybrid OFV {:.4} regressed above known-good {:.4} (tolerance {:.1})",
@@ -153,10 +136,7 @@ fn gn_hybrid_tr_warfarin_ofv_beats_slsqp_baseline() {
 /// See the module-level "Baseline history" comment for the shift from the
 /// pre-#130 SB baseline (-1198.3229).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
     const KNOWN_GOOD_OFV: f64 = -1153.0708;
     const TOLERANCE: f64 = 1.0;
@@ -174,11 +154,7 @@ fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("GN trust-region fit must succeed");
 
-    assert!(
-        result.ofv.is_finite(),
-        "GN-TR OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "GN-TR OFV must be finite, got {}", result.ofv);
     assert!(
         result.ofv <= KNOWN_GOOD_OFV + TOLERANCE,
         "GN-TR OFV {:.4} regressed above known-good {:.4} (tolerance {:.1})",
@@ -197,10 +173,7 @@ fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
 /// reference is the NONMEM 7.5.1 LAPLACE M3 fit `bloq_convergence.rs` anchors L-BFGS
 /// to (`tests/nonmem/warfarin_bloq.lst`), at the same tolerances.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_warfarin_bloq_m3_matches_nonmem() {
     let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
         .expect("warfarin BLOQ model must parse");
@@ -214,11 +187,7 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
     opts.verbose = false;
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("GN fit must succeed");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     eprintln!(
         "[#2740] GN warfarin_bloq: OFV {:.6}, θ {:?}, σ {:?}, converged {}",
         result.ofv, result.theta, result.sigma, result.converged
@@ -242,11 +211,7 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
         ("ω²(V)", result.omega[(1, 1)], 0.00954401, 0.05),
         ("ω²(KA)", result.omega[(2, 2)], 0.335772, 0.05),
     ] {
-        assert!(
-            rel(got, want) < tol,
-            "{name} {got} vs NONMEM {want} (rel {:.3e})",
-            rel(got, want)
-        );
+        assert!(rel(got, want) < tol, "{name} {got} vs NONMEM {want} (rel {:.3e})", rel(got, want));
     }
 }
 
@@ -259,10 +224,7 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
 /// gap to FOCEI (1215.98, in a different basin with `TVMTT` on its upper bound) is not
 /// this test's object.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_one_cpt_transit_does_not_collapse_on_the_volume_bound() {
     let model = parse_model_file(Path::new("examples/one_cpt_transit.ferx"))
         .expect("one_cpt_transit model must parse");
@@ -278,20 +240,13 @@ fn gn_one_cpt_transit_does_not_collapse_on_the_volume_bound() {
         .expect("GN fit must return a result");
 
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("trust radius collapsed")),
+        !result.warnings.iter().any(|w| w.contains("trust radius collapsed")),
         "GN collapsed its trust region: {:?}",
         result.warnings
     );
     assert!(result.ofv.is_finite(), "OFV must be finite: {}", result.ofv);
     // Measured 1492.1729 after the fix against 1513.94 before; 5 OFV of headroom.
-    assert!(
-        result.ofv < 1497.0,
-        "GN OFV {} regressed toward the collapsed 1513.94",
-        result.ofv
-    );
+    assert!(result.ofv < 1497.0, "GN OFV {} regressed toward the collapsed 1513.94", result.ofv);
 }
 
 /// #2974: on `pkpd_nonmem`, GN's exact total-derivative rows reach a lower OFV than the
@@ -302,10 +257,7 @@ fn gn_one_cpt_transit_does_not_collapse_on_the_volume_bound() {
 /// BHHH Newton decrement at that point (1.34e-4 OFV) shows nothing left to gain, so it now
 /// stops converged. Mutation: `gn_collapsed_stop_converged` always false -> `converged` false.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn gn_pkpd_nonmem_converges_at_its_optimum() {
     let model = parse_model_file(Path::new("examples/pkpd_nonmem.ferx"))
         .expect("pkpd_nonmem model must parse");
@@ -322,10 +274,7 @@ fn gn_pkpd_nonmem_converges_at_its_optimum() {
         result.ofv, result.converged, result.warnings
     );
     assert!(result.ofv.is_finite(), "OFV {}", result.ofv);
-    assert!(
-        result.converged,
-        "GN must report convergence at its optimum"
-    );
+    assert!(result.converged, "GN must report convergence at its optimum");
     // At or below the fixed-mode rows' stop (−60.097016); 1e-5 is the last printed digit.
     assert!(
         result.ofv < -60.097016 + 1e-5,

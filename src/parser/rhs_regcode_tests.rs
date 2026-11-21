@@ -89,10 +89,7 @@ fn program(odes: &str) -> OdeRhsProgram {
 
 /// [`program`] with `n` states `x1…xn` (observing `x2`).
 fn program_states(n: usize, odes: &str) -> OdeRhsProgram {
-    let states = (1..=n)
-        .map(|i| format!("x{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let states = (1..=n).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ");
     let text = format!(
         "[parameters]
   theta TVA(1.0, 0.01, 10.0)
@@ -159,12 +156,7 @@ fn layout(prog: &OdeRhsProgram) -> RhsLayout<'_> {
         n_vars: prog.n_vars_total,
         state_count: prog.state_count,
         indiv_to_params_slot: &prog.indiv_to_params_slot,
-        seed_slots: [
-            prog.time_slot,
-            prog.tafd_slot,
-            prog.tad_slot,
-            prog.macheps_slot,
-        ],
+        seed_slots: [prog.time_slot, prog.tafd_slot, prog.tad_slot, prog.macheps_slot],
     }
 }
 
@@ -175,14 +167,8 @@ fn bind<T: VmNum>(prog: &OdeRhsProgram, u: &[T], params: &[T], seeds: &[T; 4]) -
     for (i, &slot) in prog.indiv_to_params_slot.iter().enumerate() {
         vars[prog.state_count + i] = params[slot];
     }
-    for (k, slot) in [
-        prog.time_slot,
-        prog.tafd_slot,
-        prog.tad_slot,
-        prog.macheps_slot,
-    ]
-    .into_iter()
-    .enumerate()
+    for (k, slot) in
+        [prog.time_slot, prog.tafd_slot, prog.tad_slot, prog.macheps_slot].into_iter().enumerate()
     {
         if let Some(v) = vars.get_mut(slot) {
             *v = seeds[k];
@@ -197,11 +183,7 @@ fn bits_eq<T: VmNum>(a: &[T], b: &[T]) -> bool {
 
 /// Compiled vs the generic interpreter on one `T`; whether the program compiled.
 fn check_on<T: VmNum>(
-    prog: &OdeRhsProgram,
-    u: &[T],
-    params: &[T],
-    seeds: &[T; 4],
-    label: &str,
+    prog: &OdeRhsProgram, u: &[T], params: &[T], seeds: &[T; 4], label: &str,
 ) -> bool {
     let Ok(reg) = RhsRegProgram::compile(&prog.stmts, &layout(prog)) else {
         return false;
@@ -259,10 +241,7 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
             );
             let mut regs = vec![0.0; reg.n_regs()];
             reg.run(&raw_u, &raw_p, &raw_s, &mut du_reg, &mut regs);
-            assert!(
-                bits_eq(&du_ref, &du_reg),
-                "{label}\nf64: du {du_ref:?} vs {du_reg:?}"
-            );
+            assert!(bits_eq(&du_ref, &du_reg), "{label}\nf64: du {du_ref:?} vs {du_reg:?}");
         }
         // The forward dual `Dual2` (value, tangents and the full Hessian all compared).
         let lift_1 = |x: &[f64]| -> Vec<Dual2<2>> {
@@ -273,13 +252,8 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
         };
         let (u1, p1, s1) = (lift_1(&raw_u), lift_1(&raw_p), lift_1(&raw_s));
         let s1: [Dual2<2>; 4] = [s1[0], s1[1], s1[2], s1[3]];
-        compiled += usize::from(check_on(
-            &prog,
-            &u1,
-            &p1,
-            &s1,
-            &format!("{label}\nfirst-order seeds"),
-        ));
+        compiled +=
+            usize::from(check_on(&prog, &u1, &p1, &s1, &format!("{label}\nfirst-order seeds")));
         let lift_2 = |x: &[f64]| -> Vec<Dual2<2>> {
             x.iter()
                 .enumerate()
@@ -291,13 +265,7 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
         };
         let (u2, p2, s2) = (lift_2(&raw_u), lift_2(&raw_p), lift_2(&raw_s));
         let s2: [Dual2<2>; 4] = [s2[0], s2[1], s2[2], s2[3]];
-        check_on(
-            &prog,
-            &u2,
-            &p2,
-            &s2,
-            &format!("{label}\nsecond-order seeds"),
-        );
+        check_on(&prog, &u2, &p2, &s2, &format!("{label}\nsecond-order seeds"));
     }
     // The generator only emits translatable programs, so they all compile; a collapse
     // here means the compiler started declining and the test checks nothing.
@@ -313,10 +281,7 @@ fn a_program_outside_the_translatable_shape_is_not_compiled() {
         "  d/dt(x1) = logit(x1)\n  d/dt(x2) = -x2\n  d/dt(x3) = 0",
     ] {
         let prog = program(odes);
-        assert!(
-            RhsRegProgram::compile(&prog.stmts, &layout(&prog)).is_err(),
-            "{odes}"
-        );
+        assert!(RhsRegProgram::compile(&prog.stmts, &layout(&prog)).is_err(), "{odes}");
         assert!(prog.reg.is_none(), "{odes}");
     }
     // And the production program carries the compiled form when it translates, an inline
@@ -351,11 +316,7 @@ fn check_native<T: VmNum>(reg: &RhsRegProgram, x: (&[T], &[T], &[T; 4]), label: 
     let mut got = vec![T::from_f64(9.0); 3];
     let mut regs = vec![T::from_f64(0.0); reg.n_regs()];
     reg.run(x.0, x.1, x.2, &mut got, &mut regs);
-    assert!(
-        bits_eq(&want, &got),
-        "{label}: native du differs ({})",
-        std::any::type_name::<T>()
-    );
+    assert!(bits_eq(&want, &got), "{label}: native du differs ({})", std::any::type_name::<T>());
 }
 
 #[test]
@@ -382,10 +343,7 @@ fn native_rhs_is_the_register_code_bit_for_bit_on_random_programs() {
 /// direction at a time), the exact oracle. Returns the worst relative difference against
 /// the oracle.
 fn check_reverse(
-    reg: &RhsRegProgram,
-    layout: super::ir::Layout,
-    rng: &mut Rng,
-    label: &str,
+    reg: &RhsRegProgram, layout: super::ir::Layout, rng: &mut Rng, label: &str,
 ) -> f64 {
     use super::ir;
     let w = layout.lanes();
@@ -393,15 +351,7 @@ fn check_reverse(
     let rev = ir::reverse(&fwd);
     let n_params = crate::types::MAX_PK_PARAMS + 2;
     let lanes_of = |rng: &mut Rng, n: usize, first: &mut dyn FnMut(&mut Rng) -> f64| -> Vec<f64> {
-        (0..n * w)
-            .map(|j| {
-                if j % w == 0 {
-                    first(rng)
-                } else {
-                    rng.unit() * 2.0 - 1.0
-                }
-            })
-            .collect()
+        (0..n * w).map(|j| if j % w == 0 { first(rng) } else { rng.unit() * 2.0 - 1.0 }).collect()
     };
     let u = lanes_of(rng, 3, &mut |r: &mut Rng| r.unit() * 4.0 + 0.1);
     let p = lanes_of(rng, n_params, &mut |r: &mut Rng| r.unit() * 3.0 + 0.2);
@@ -416,9 +366,7 @@ fn check_reverse(
         let mut db = du_bar.clone();
         ir::interpret(
             &rev,
-            &mut [
-                &mut u_, &mut p_, &mut s_, &mut du_, &mut ub, &mut pb, &mut sb, &mut db,
-            ],
+            &mut [&mut u_, &mut p_, &mut s_, &mut du_, &mut ub, &mut pb, &mut sb, &mut db],
         );
     }
     let du = vec![0.0; 3 * w];
@@ -427,12 +375,8 @@ fn check_reverse(
     let groups: [(usize, &Vec<f64>, &Vec<f64>); 3] = [(0, &u, &ub), (1, &p, &pb), (2, &sd, &sb)];
     for (g, xs, bar) in groups {
         for j in 0..xs.len() {
-            let mut d = vec![
-                vec![0.0; u.len()],
-                vec![0.0; p.len()],
-                vec![0.0; sd.len()],
-                vec![0.0; 3 * w],
-            ];
+            let mut d =
+                vec![vec![0.0; u.len()], vec![0.0; p.len()], vec![0.0; sd.len()], vec![0.0; 3 * w]];
             d[g][j] = 1.0;
             ir::interpret_tangent(&fwd, &[&u, &p, &sd, &du], &mut d);
             let want: f64 = d[3].iter().zip(&du_bar).map(|(a, b)| a * b).sum();
@@ -463,34 +407,10 @@ fn the_reverse_pass_is_the_forward_tangents_transposed_on_random_programs() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     let layouts = [
         Layout::F64,
-        Layout {
-            n: 2,
-            m: 0,
-            th: false,
-            wide: false,
-            tan: 0,
-        },
-        Layout {
-            n: 8,
-            m: 0,
-            th: false,
-            wide: true,
-            tan: 0,
-        },
-        Layout {
-            n: 2,
-            m: 3,
-            th: false,
-            wide: false,
-            tan: 0,
-        },
-        Layout {
-            n: 2,
-            m: 2,
-            th: true,
-            wide: false,
-            tan: 0,
-        },
+        Layout { n: 2, m: 0, th: false, wide: false, tan: 0 },
+        Layout { n: 8, m: 0, th: false, wide: true, tan: 0 },
+        Layout { n: 2, m: 3, th: false, wide: false, tan: 0 },
+        Layout { n: 2, m: 2, th: true, wide: false, tan: 0 },
     ];
     let mut worst = 0.0f64;
     for case in 0..60 {
@@ -519,16 +439,7 @@ fn tangent_rows_split_the_primal_from_each_seeds_tangent_on_random_programs() {
     use super::ir::{self, Inst, Layout};
     let mut rng = Rng(0xA076_1D64_78BD_642F);
     let n_params = crate::types::MAX_PK_PARAMS + 2;
-    let layouts = [
-        Layout::F64,
-        Layout {
-            n: 2,
-            m: 0,
-            th: false,
-            wide: false,
-            tan: 0,
-        },
-    ];
+    let layouts = [Layout::F64, Layout { n: 2, m: 0, th: false, wide: false, tan: 0 }];
     let (mut worst, mut checked) = (0.0f64, 0usize);
     for case in 0..60 {
         let odes = random_odes(&mut rng);
@@ -568,21 +479,12 @@ fn tangent_rows_split_the_primal_from_each_seeds_tangent_on_random_programs() {
             for _seed in 0..3 {
                 let tu: Vec<f64> = (0..u.len()).map(|_| rng.unit() * 2.0 - 1.0).collect();
                 let tp: Vec<f64> = (0..pv.len()).map(|_| rng.unit() * 2.0 - 1.0).collect();
-                let mut want = vec![
-                    tu.clone(),
-                    tp.clone(),
-                    vec![0.0; sd.len()],
-                    vec![0.0; 3 * w],
-                ];
+                let mut want = vec![tu.clone(), tp.clone(), vec![0.0; sd.len()], vec![0.0; 3 * w]];
                 ir::interpret_tangent(&fwd, &[&u, &pv, &sd, &vec![0.0; 3 * w]], &mut want);
                 let (mut u_, mut p_, mut s_, mut du) =
                     (u.clone(), pv.clone(), sd.clone(), vec![0.0; 3 * w]);
-                let (mut tu_, mut tp_, mut ts, mut tdu) = (
-                    tu.clone(),
-                    tp.clone(),
-                    vec![0.0; sd.len()],
-                    vec![0.0; 3 * w],
-                );
+                let (mut tu_, mut tp_, mut ts, mut tdu) =
+                    (tu.clone(), tp.clone(), vec![0.0; sd.len()], vec![0.0; 3 * w]);
                 ir::interpret(
                     &rows,
                     &mut [
@@ -607,10 +509,7 @@ fn tangent_rows_split_the_primal_from_each_seeds_tangent_on_random_programs() {
         }
     }
     // Every draw splits, dead-arm masks included (a forward needs none).
-    assert!(
-        checked == 360,
-        "the fixture must exercise the split: {checked} seeds"
-    );
+    assert!(checked == 360, "the fixture must exercise the split: {checked} seeds");
     eprintln!("tangent rows vs forward oracle: worst {worst:e} over {checked} seeds");
     assert!(worst < 1e-12, "worst relative difference {worst:e}");
 }
@@ -650,19 +549,12 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
         }
         {
             let (mut u_, mut p_, mut s_, mut du_) = (u.clone(), p.clone(), sd.clone(), zeros(3));
-            let [d0, d1, d2, d3] = &mut dirs[..] else {
-                unreachable!()
-            };
-            ir::interpret(
-                &t2,
-                &mut [&mut u_, &mut p_, &mut s_, &mut du_, d0, d1, d2, d3],
-            );
+            let [d0, d1, d2, d3] = &mut dirs[..] else { unreachable!() };
+            ir::interpret(&t2, &mut [&mut u_, &mut p_, &mut s_, &mut du_, d0, d1, d2, d3]);
         }
         for j in 0..2 {
-            let mut d: Vec<Vec<f64>> = dirs
-                .iter()
-                .map(|v| v.iter().skip(j).step_by(2).copied().collect())
-                .collect();
+            let mut d: Vec<Vec<f64>> =
+                dirs.iter().map(|v| v.iter().skip(j).step_by(2).copied().collect()).collect();
             d[3] = zeros(3);
             ir::interpret_tangent(&fwd, &[&u, &p, &sd, &zeros(3)], &mut d);
             for (o, want) in d[3].iter().enumerate() {
@@ -671,10 +563,7 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
                     continue;
                 }
                 let rel = (got - want).abs() / (1.0 + want.abs());
-                assert!(
-                    rel < 1e-12,
-                    "case {case} dir {j} out {o}: {got} vs {want}\n{odes}"
-                );
+                assert!(rel < 1e-12, "case {case} dir {j} out {o}: {got} vs {want}\n{odes}");
             }
         }
         // Forward-over-reverse: row `i` of `H = ∂²(ū·f)/∂u²`, the tangent of `ū` along `eᵢ`.
@@ -695,11 +584,8 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
             let mut tans: Vec<Vec<f64>> = bufs.iter().map(|b| zeros(b.len())).collect();
             tans[0][i] = 1.0;
             {
-                let mut a: Vec<&mut [f64]> = bufs
-                    .iter_mut()
-                    .chain(tans.iter_mut())
-                    .map(|v| v.as_mut_slice())
-                    .collect();
+                let mut a: Vec<&mut [f64]> =
+                    bufs.iter_mut().chain(tans.iter_mut()).map(|v| v.as_mut_slice()).collect();
                 ir::interpret(&fr, &mut a);
             }
             for j in 0..3 {
@@ -744,10 +630,7 @@ fn the_jit_switch_reads_the_environment_value() {
 /// `reg` at states `x[..3]` and parameters `A`, `B`, `C` = `x[3..]`, each input lifted to `T`
 /// by `lift(value, index)`; every other parameter slot a constant.
 fn rhs_at<T: VmNum>(
-    prog: &OdeRhsProgram,
-    reg: &RhsRegProgram,
-    x: &[f64; 6],
-    lift: &dyn Fn(f64, usize) -> T,
+    prog: &OdeRhsProgram, reg: &RhsRegProgram, x: &[f64; 6], lift: &dyn Fn(f64, usize) -> T,
 ) -> Vec<T> {
     let u: Vec<T> = (0..3).map(|i| lift(x[i], i)).collect();
     let mut p = vec![T::from_f64(0.9); crate::types::MAX_PK_PARAMS + 2];
@@ -796,31 +679,13 @@ fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
         &mut du_d,
         &mut regs_d,
     );
-    dead.reg
-        .as_ref()
-        .unwrap()
-        .run(&[1.5, 1.0, 1.0], &p0, &s0, &mut du, &mut regs);
-    assert!(
-        du[0].is_nan() && du_d[0].value.is_nan(),
-        "the dead arm must be NaN"
-    );
+    dead.reg.as_ref().unwrap().run(&[1.5, 1.0, 1.0], &p0, &s0, &mut du, &mut regs);
+    assert!(du[0].is_nan() && du_d[0].value.is_nan(), "the dead arm must be NaN");
 
     let layouts = [
         Layout::F64,
-        Layout {
-            n: 2,
-            m: 0,
-            th: false,
-            wide: false,
-            tan: 0,
-        },
-        Layout {
-            n: 2,
-            m: 3,
-            th: false,
-            wide: false,
-            tan: 0,
-        },
+        Layout { n: 2, m: 0, th: false, wide: false, tan: 0 },
+        Layout { n: 2, m: 3, th: false, wide: false, tan: 0 },
     ];
     for layout in layouts {
         let w = layout.lanes();
@@ -828,13 +693,7 @@ fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
             vals.iter()
                 .enumerate()
                 .flat_map(|(i, &v)| {
-                    (0..w).map(move |j| {
-                        if j == 0 {
-                            v
-                        } else {
-                            0.25 + 0.5 * ((i + j) % 3) as f64
-                        }
-                    })
+                    (0..w).map(move |j| if j == 0 { v } else { 0.25 + 0.5 * ((i + j) % 3) as f64 })
                 })
                 .collect()
         };
@@ -852,16 +711,11 @@ fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
             let mut db = du_bar.clone();
             ir::interpret(
                 &rev,
-                &mut [
-                    &mut u_, &mut p_, &mut s_, &mut du_, &mut ub, &mut pb, &mut sb, &mut db,
-                ],
+                &mut [&mut u_, &mut p_, &mut s_, &mut du_, &mut ub, &mut pb, &mut sb, &mut db],
             );
         }
         let all = || ub.iter().chain(&pb).chain(&sb);
-        assert!(
-            all().all(|a| a.is_finite()),
-            "{layout:?}: a non-finite adjoint"
-        );
+        assert!(all().all(|a| a.is_finite()), "{layout:?}: a non-finite adjoint");
         assert!(
             pb[b_slot * w..(b_slot + 1) * w].iter().all(|&a| a == 0.0),
             "{layout:?}: `B` has a derivative through the dead arm"
@@ -883,20 +737,11 @@ fn derivatives_across_an_if_match_finite_differences() {
     let prog = program(odes);
     let reg = prog.reg.as_ref().expect("an `if` compiles");
     // `[x1, x2, x3, A, B, C]`, the two points straddling every condition.
-    let points = [
-        [0.4, 1.2, 0.5, 2.0, 0.7, 1.1],
-        [3.0, 1.4, 1.6, 0.9, 0.6, 1.3],
-    ];
+    let points = [[0.4, 1.2, 0.5, 2.0, 0.7, 1.1], [3.0, 1.4, 1.6, 0.9, 0.6, 1.3]];
     let f = |x: &[f64; 6]| rhs_at(&prog, reg, x, &|v, _| v);
     // Each condition takes each side across the two points.
-    let sides = |x: &[f64; 6]| {
-        [
-            x[0] * x[5] < x[3],
-            x[0] > x[5] && x[1] <= 1.5,
-            x[0] < x[1],
-            x[2] > 1.0,
-        ]
-    };
+    let sides =
+        |x: &[f64; 6]| [x[0] * x[5] < x[3], x[0] > x[5] && x[1] <= 1.5, x[0] < x[1], x[2] > 1.0];
     let (s0, s1) = (sides(&points[0]), sides(&points[1]));
     assert!(s0.iter().zip(&s1).all(|(a, b)| a != b), "{s0:?} vs {s1:?}");
     let h = 1e-5;
@@ -971,10 +816,7 @@ fn the_hoisted_pair_runs_an_if_bit_for_bit() {
             let want = run_without_jit(reg, &u, &p, &s);
             let mut got = vec![9.0; 3];
             assert!(native.run(&u, &p, &s, &mut got, &mut cache));
-            assert!(
-                bits_eq(&want, &got),
-                "A {pa}, B {pb}, x1 {x1}: {want:?} vs {got:?}"
-            );
+            assert!(bits_eq(&want, &got), "A {pa}, B {pb}, x1 {x1}: {want:?} vs {got:?}");
         }
     }
 }
@@ -988,9 +830,7 @@ use super::{rhs_route_note, NativeCause, RhsConstruct, RhsRefusal, RhsRoute, Rhs
 fn note(odes: &str) -> String {
     let prog = program(odes);
     assert!(prog.reg.is_none(), "{odes}");
-    let (code, msg, _) = prog
-        .route_note()
-        .unwrap_or_else(|| panic!("no note: {odes}"));
+    let (code, msg, _) = prog.route_note().unwrap_or_else(|| panic!("no note: {odes}"));
     assert_eq!(code, "W_ODE_RHS_INTERPRETED");
     assert!(msg.starts_with("W_ODE_RHS_INTERPRETED: "), "{msg}");
     msg
@@ -1005,11 +845,7 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
     for (odes, construct, site) in [
         // An inline `if` compiles (#2680), so what an arm cannot translate is named as
         // itself, not as the `if`.
-        (
-            "  d/dt(x1) = if (x1 < 1) tanh(x1) else B",
-            "`tanh`",
-            "`d/dt(x1)`",
-        ),
+        ("  d/dt(x1) = if (x1 < 1) tanh(x1) else B", "`tanh`", "`d/dt(x1)`"),
         ("  d/dt(x1) = inv_logit(x1)", "`inv_logit`", "`d/dt(x1)`"),
         ("  d/dt(x1) = logit(x1)", "`logit`", "`d/dt(x1)`"),
         ("  d/dt(x1) = tanh(x1)", "`tanh`", "`d/dt(x1)`"),
@@ -1018,11 +854,7 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         ("  d/dt(x1) = cos(x1)", "`cos`", "`d/dt(x1)`"),
         ("  d/dt(x1) = pnorm(x1)", "`pnorm`", "`d/dt(x1)`"),
         // The site is the assignment, not the derivative that reads it.
-        (
-            "  E = tanh(A)\n  d/dt(x1) = -E * x1",
-            "`tanh`",
-            "the assignment to `E`",
-        ),
+        ("  E = tanh(A)\n  d/dt(x1) = -E * x1", "`tanh`", "the assignment to `E`"),
         // A later statement: the first refusal in program order is the one named.
         (
             "  d/dt(x1) = -x1\n  d/dt(x2) = logit(x2) + sin(x1)\n  d/dt(x3) = 0",
@@ -1035,16 +867,10 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
             "the [odes] block",
         ),
     ] {
-        let odes = if odes.contains("d/dt(x3)") {
-            odes.to_string()
-        } else {
-            format!("{odes}{REST}")
-        };
+        let odes =
+            if odes.contains("d/dt(x3)") { odes.to_string() } else { format!("{odes}{REST}") };
         let msg = note(&odes);
-        assert!(
-            msg.contains(&format!("because of {construct} in {site}.")),
-            "{odes}\n{msg}"
-        );
+        assert!(msg.contains(&format!("because of {construct} in {site}.")), "{odes}\n{msg}");
     }
     // The other side of the gate, an inline `if` included.
     // `sqrt` among them (#2844), so its removal from the refusals is pinned here too.
@@ -1056,10 +882,7 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
     ] {
         let prog = program(&format!("{odes}{REST}"));
         assert!(prog.reg.is_some(), "{odes}");
-        assert!(
-            prog.route_note().is_none(),
-            "{odes}: a compiled RHS with native code has no note"
-        );
+        assert!(prog.route_note().is_none(), "{odes}: a compiled RHS with native code has no note");
     }
 }
 
@@ -1084,22 +907,13 @@ fn each_unparsable_refusal_names_its_construct() {
         (vec![Op::PushEta(0)], "a read of an η"),
         (vec![Op::PushCov(0)], "a read of a covariate"),
         (vec![Op::PushMixNum], "a read of the mixture class `MIXNUM`"),
-        (
-            vec![Op::PushNnOutput(0, 0)],
-            "a read of a neural-network output",
-        ),
+        (vec![Op::PushNnOutput(0, 0)], "a read of a neural-network output"),
         (vec![Op::PushTime], "a read of the `TIME` built-in"),
-        (
-            vec![Op::PushVar(10_000)],
-            "a read of a variable outside the RHS's slots",
-        ),
+        (vec![Op::PushVar(10_000)], "a read of a variable outside the RHS's slots"),
         // An `if` outside the shape the parser emits: a stray `Jump`, and a `JumpIfFalse`
         // with no `Jump` before its target.
         (vec![x1, Op::Jump(2)], "an inline `if`"),
-        (
-            vec![x1, Op::PushConst(0), Op::CmpLt, Op::JumpIfFalse(9)],
-            "an inline `if`",
-        ),
+        (vec![x1, Op::PushConst(0), Op::CmpLt, Op::JumpIfFalse(9)], "an inline `if`"),
         // Unbalanced: nothing left on the stack.
         (vec![], "a statement the RHS compiler does not translate"),
     ] {
@@ -1109,10 +923,7 @@ fn each_unparsable_refusal_names_its_construct() {
         assert_eq!(named.construct, construct, "{ops:?}");
         assert_eq!(named.site, "`d/dt(v0)`");
         let (_, msg, details) = rhs_route_note(RhsRoute::Interpreter(&named)).unwrap();
-        assert!(
-            msg.contains(&format!("because of {construct} in `d/dt(v0)`.")),
-            "{msg}"
-        );
+        assert!(msg.contains(&format!("because of {construct} in `d/dt(v0)`.")), "{msg}");
         assert_eq!(details["construct"], construct);
     }
 }
@@ -1122,10 +933,7 @@ fn each_unparsable_refusal_names_its_construct() {
 #[test]
 fn a_local_read_before_its_assignment_is_named() {
     let msg = note(&format!("  d/dt(x1) = -L * x1\n  L = A{REST}"));
-    assert!(
-        msg.contains("because of a read of `L` before it is assigned in `d/dt(x1)`."),
-        "{msg}"
-    );
+    assert!(msg.contains("because of a read of `L` before it is assigned in `d/dt(x1)`."), "{msg}");
 }
 
 /// Each sentence of the interpreter note, deleted in turn, reddens one assertion here, on a
@@ -1172,11 +980,7 @@ fn every_native_cause_has_its_own_sentence() {
             "the environment variable `FERX_NO_RHS_JIT=1` switches native code off",
             "disabled",
         ),
-        (
-            NativeCause::Host,
-            "Cranelift cannot generate code for this host",
-            "host",
-        ),
+        (NativeCause::Host, "Cranelift cannot generate code for this host", "host"),
         (
             NativeCause::Declined,
             "the native compiler did not build this program (it builds programs up to a \
@@ -1200,10 +1004,7 @@ fn every_native_cause_has_its_own_sentence() {
                 assert!(!msg.contains(other_why), "{msg}");
             }
         }
-        assert!(
-            msg.ends_with(" The results are identical; only the speed differs."),
-            "{msg}"
-        );
+        assert!(msg.ends_with(" The results are identical; only the speed differs."), "{msg}");
         assert_eq!(details["cause"], token);
         assert_eq!(details["route"], "register_code");
     }
@@ -1223,10 +1024,7 @@ fn a_compiled_rhs_without_native_code_reports_the_register_code() {
     assert_eq!(code, "W_ODE_RHS_NOT_NATIVE");
     // The test switch is neither the environment variable nor the host.
     assert_eq!(details["cause"], "declined");
-    assert!(matches!(
-        RhsConstruct::Function("tanh"),
-        RhsConstruct::Function(_)
-    ));
+    assert!(matches!(RhsConstruct::Function("tanh"), RhsConstruct::Function(_)));
 }
 
 /// The native tangent layout (`OdeRhsProgram::native_jacobian`, one call) against the jet
@@ -1257,10 +1055,7 @@ fn the_native_tangent_jacobian_matches_the_jet_fallback() {
                 if x.is_nan() && y.is_nan() {
                     continue;
                 }
-                assert!(
-                    x.is_finite() == y.is_finite(),
-                    "case {case}:\n{odes}\n{x} vs {y}"
-                );
+                assert!(x.is_finite() == y.is_finite(), "case {case}:\n{odes}\n{x} vs {y}");
                 if x.is_finite() {
                     assert!(x.is_finite() && y.is_finite(), "case {case}: {x} vs {y}");
                     worst = worst.max((x - y).abs() / y.abs().max(1.0));
@@ -1288,10 +1083,7 @@ fn a_reused_native_jacobian_equals_a_fresh_one_bit_for_bit() {
         let odes = random_odes(&mut rng);
         let prog = program(&odes);
         let (u1, u2) = (seed_values(&mut rng, 3), seed_values(&mut rng, 3));
-        let (p1, p2) = (
-            seed_values(&mut rng, n_params),
-            seed_values(&mut rng, n_params),
-        );
+        let (p1, p2) = (seed_values(&mut rng, n_params), seed_values(&mut rng, n_params));
         let (t1, t2) = (rng.unit() * 5.0, rng.unit() * 5.0 + 5.0);
         for clock in [false, true] {
             let (Some(reused), Some(fresh)) =
@@ -1375,19 +1167,10 @@ fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
         };
         assert_eq!(du_lane[0].to_bits(), want.to_bits(), "{label}: sqrt(x1)");
         let lift_2 = |v: &[f64]| -> Vec<Dual2<2>> {
-            v.iter()
-                .enumerate()
-                .map(|(i, &v)| <Dual2<2> as PkNum>::var(v, i % 2))
-                .collect()
+            v.iter().enumerate().map(|(i, &v)| <Dual2<2> as PkNum>::var(v, i % 2)).collect()
         };
         let (u2, p2, s2) = (lift_2(&u), lift_2(&p), lift_2(&s));
-        assert!(check_on(
-            &prog,
-            &u2,
-            &p2,
-            &[s2[0], s2[1], s2[2], s2[3]],
-            &label
-        ));
+        assert!(check_on(&prog, &u2, &p2, &[s2[0], s2[1], s2[2], s2[3]], &label));
         // The jets of `sqrt(x1)` on the register code over `Dual2`: zero where the argument
         // is not positive, live otherwise (the guard's constant has no derivative).
         let s24 = [s2[0], s2[1], s2[2], s2[3]];
@@ -1395,11 +1178,7 @@ fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
         let mut regs2 = vec![<Dual2<2> as PkNum>::from_f64(0.0); reg.n_regs()];
         reg.run(&u2, &p2, &s24, &mut du2, &mut regs2);
         let want2 = if x.is_nan() || x < 0.0 { 0.0 } else { x.sqrt() };
-        assert_eq!(
-            du2[0].value.to_bits(),
-            want2.to_bits(),
-            "{label}: Dual2 value"
-        );
+        assert_eq!(du2[0].value.to_bits(), want2.to_bits(), "{label}: Dual2 value");
         if x > 0.0 {
             assert!(du2[0].grad[0] > 0.0, "{label}: live jet {:?}", du2[0].grad);
         } else {
@@ -1425,10 +1204,7 @@ fn sqrt_derivatives_match_finite_differences() {
     let prog = program(SQRT_ODES);
     let reg = prog.reg.as_ref().expect("`sqrt` compiles");
     // `[x1, x2, x3, A, B, C]`.
-    let points = [
-        [0.4, 1.2, 0.5, 0.3, 0.7, 1.1],
-        [3.0, 2.4, 1.6, 0.9, 0.6, 1.3],
-    ];
+    let points = [[0.4, 1.2, 0.5, 0.3, 0.7, 1.1], [3.0, 2.4, 1.6, 0.9, 0.6, 1.3]];
     let f = |x: &[f64; 6]| rhs_at(&prog, reg, x, &|v, _| v);
     let h = 1e-5;
     let h2 = 1e-4;
@@ -1483,20 +1259,8 @@ fn sqrt_derivatives_match_finite_differences() {
     let mut worst = 0.0f64;
     for l in [
         Layout::F64,
-        Layout {
-            n: 2,
-            m: 0,
-            th: false,
-            wide: false,
-            tan: 0,
-        },
-        Layout {
-            n: 2,
-            m: 2,
-            th: true,
-            wide: false,
-            tan: 0,
-        },
+        Layout { n: 2, m: 0, th: false, wide: false, tan: 0 },
+        Layout { n: 2, m: 2, th: true, wide: false, tan: 0 },
     ] {
         let w = check_reverse(reg, l, &mut rng, &format!("{l:?}"));
         assert!(w.is_finite(), "{l:?}: {w}");

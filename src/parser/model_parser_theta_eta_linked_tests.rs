@@ -31,11 +31,7 @@ fn linked(indiv: &str, extra_params: &str, extra_blocks: &str) -> Vec<bool> {
 
 #[test]
 fn direct_eta_bearing_parameters_link_their_theta() {
-    let l = linked(
-        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n",
-        "",
-        "",
-    );
+    let l = linked("  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n", "", "");
     assert_eq!(l, [true, true, false]);
 }
 
@@ -54,11 +50,8 @@ fn linkage_is_transitive_through_intermediate_assignments() {
 #[test]
 fn a_theta_in_any_eta_bearing_expansion_is_random_class() {
     // TVKA is a scale factor on KA (no eta) *and* on CL (eta): random.
-    let l = linked(
-        "  CL = TVCL * TVKA * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n",
-        "",
-        "",
-    );
+    let l =
+        linked("  CL = TVCL * TVKA * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n", "", "");
     assert_eq!(l, [true, true, true]);
 }
 
@@ -107,16 +100,9 @@ fn negsum_level_group_is_half_open_and_does_not_capture_the_next_theta() {
     // an η-bearing parameter; θ2 is the next declaration, η-free.
     let spec = Arc::new(GatherSpec {
         name: "SITE".into(),
-        levels: vec![
-            LevelRule::Free(0),
-            LevelRule::Free(1),
-            LevelRule::NegSum(0, 2),
-        ],
+        levels: vec![LevelRule::Free(0), LevelRule::Free(1), LevelRule::NegSum(0, 2)],
     });
-    let gather = Expression::ThetaGather {
-        spec,
-        idx: Box::new(Expression::Literal(1.0)),
-    };
+    let gather = Expression::ThetaGather { spec, idx: Box::new(Expression::Literal(1.0)) };
     let stmts = vec![
         Statement::Assign(
             "CL".into(),
@@ -134,18 +120,12 @@ fn negsum_level_group_is_half_open_and_does_not_capture_the_next_theta() {
         name: "SITE".into(),
         levels: vec![LevelRule::NegSum(1, 1), LevelRule::Free(1)],
     });
-    let gather = Expression::ThetaGather {
-        spec,
-        idx: Box::new(Expression::Literal(1.0)),
-    };
+    let gather = Expression::ThetaGather { spec, idx: Box::new(Expression::Literal(1.0)) };
     let stmts = vec![Statement::Assign(
         "CL".into(),
         Expression::BinOp(Box::new(gather), BinOp::Mul, Box::new(Expression::Eta(0))),
     )];
-    assert_eq!(
-        classify_theta_eta_linked(&stmts, 3, &[]),
-        [false, true, false]
-    );
+    assert_eq!(classify_theta_eta_linked(&stmts, 3, &[]), [false, true, false]);
 }
 
 /// A `[covariate_nn]`'s weights are registered as θ after the declared ones,
@@ -257,9 +237,7 @@ fn event_model_theta_meeting_its_eta_there_is_random_class() {
   shape  = TVSHAPE
 "#
         );
-        parse_model_string(&text)
-            .expect("model parses")
-            .theta_eta_linked
+        parse_model_string(&text).expect("model parses").theta_eta_linked
     };
     let direct = legacy("  scale = TVSCALE * exp(ETA_SCALE)", "");
     let via_indiv = legacy("  scale = SCALE", "  SCALE = TVSCALE * exp(ETA_SCALE)");

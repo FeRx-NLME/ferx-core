@@ -94,19 +94,11 @@ fn population() -> Population {
 
 #[test]
 fn analytical_central_init_matches_ode_init() {
-    let an = parse_full_model(&analytical_src())
-        .expect("analytical model parses")
-        .model;
-    let ode = parse_full_model(&ode_src())
-        .expect("ODE model parses")
-        .model;
+    let an = parse_full_model(&analytical_src()).expect("analytical model parses").model;
+    let ode = parse_full_model(&ode_src()).expect("ODE model parses").model;
 
     // The analytical model must actually carry the parsed init.
-    assert_eq!(
-        an.analytical_init.len(),
-        1,
-        "[initial_conditions] should populate analytical_init"
-    );
+    assert_eq!(an.analytical_init.len(), 1, "[initial_conditions] should populate analytical_init");
     assert!(
         ode.analytical_init.is_empty(),
         "ODE model seeds state via init_fn, not analytical_init"
@@ -248,9 +240,7 @@ fn analytical_and_ode_init_agree_when_the_seed_reads_bioavailability() {
 fn predict_iov_carries_analytical_init() {
     use ferx_core::pk::predict_iov;
 
-    let an = parse_full_model(&analytical_src())
-        .expect("analytical model parses")
-        .model;
+    let an = parse_full_model(&analytical_src()).expect("analytical model parses").model;
     let pop = population();
     let subject = &pop.subjects[0];
 
@@ -427,9 +417,7 @@ fn analytical_3cpt_central_init_matches_ode_init() {
 /// applying it to every post-reset occasion).
 #[test]
 fn analytical_init_zeroed_after_reset() {
-    let an = parse_full_model(&analytical_src())
-        .expect("analytical model parses")
-        .model;
+    let an = parse_full_model(&analytical_src()).expect("analytical model parses").model;
 
     // No doses: the only signal is the central baseline (30*V → conc 30 at t=0).
     // A reset at t=5 must wipe it, so obs at t>=5 see 0 baseline.

@@ -203,11 +203,7 @@ fn pop_of(csv: &str) -> Population {
 /// Predicted values for a CSV dataset under `model` at its default parameters.
 fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
     let pop = pop_of(csv);
-    predict(model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect()
+    predict(model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect()
 }
 
 fn assert_close(a: &[f64], b: &[f64], tol: f64, ctx: &str) {
@@ -252,10 +248,7 @@ fn modeled_duration_matches_explicit_infusion() {
     assert_close(&coded, &explicit, 1e-9, "RATE=-2 D1=5 vs explicit RATE=20");
     // And the predictions are non-trivial (a plateau-then-decay infusion, not all
     // zero) — guards against "both happen to be empty/zero".
-    assert!(
-        coded.iter().any(|&c| c > 0.1),
-        "predictions should be nonzero"
-    );
+    assert!(coded.iter().any(|&c| c > 0.1), "predictions should be nonzero");
 }
 
 #[test]
@@ -305,12 +298,7 @@ fn modeled_duration_composes_with_bioavailability_once() {
 
     // (c) Sanity: F1=0.5 reduces exposure vs the no-F model (so F is applied).
     let no_f = preds_of(&model_of(ODE_D1), &coded_csv());
-    assert!(
-        coded[2] < 0.75 * no_f[2],
-        "F1=0.5 must reduce exposure: {} vs {}",
-        coded[2],
-        no_f[2]
-    );
+    assert!(coded[2] < 0.75 * no_f[2], "F1=0.5 must reduce exposure: {} vs {}", coded[2], no_f[2]);
 }
 
 #[test]
@@ -320,20 +308,11 @@ fn modeled_duration_composes_with_lagtime() {
     let model = model_of(ODE_D1_LAG1);
     let coded = preds_of(&model, &coded_csv());
     let explicit = preds_of(&model, &explicit_csv());
-    assert_close(
-        &coded,
-        &explicit,
-        1e-9,
-        "ALAG1 + RATE=-2 vs ALAG1 + explicit",
-    );
+    assert_close(&coded, &explicit, 1e-9, "ALAG1 + RATE=-2 vs ALAG1 + explicit");
     // The lag delays uptake: at t=1 (< lag 2) the central compartment is still
     // empty, unlike the no-lag model where the infusion is already running.
     let no_lag = preds_of(&model_of(ODE_D1), &coded_csv());
-    assert!(
-        coded[0] < 1e-9,
-        "pre-lag prediction must be ~0, got {}",
-        coded[0]
-    );
+    assert!(coded[0] < 1e-9, "pre-lag prediction must be ~0, got {}", coded[0]);
     assert!(no_lag[0] > 1e-3, "no-lag model should have uptake by t=1");
 }
 
@@ -382,17 +361,9 @@ fn modeled_duration_with_reset_matches_explicit() {
                     1,12,0,0,0,1,0,0\n";
     let model = model_of(ODE_D1);
     let coded_p = preds_of(&model, coded);
-    assert_close(
-        &coded_p,
-        &preds_of(&model, explicit),
-        1e-9,
-        "reset: RATE=-2 vs explicit",
-    );
+    assert_close(&coded_p, &preds_of(&model, explicit), 1e-9, "reset: RATE=-2 vs explicit");
     // Post-reset uptake is nonzero (the t=8 sample is mid second infusion).
-    assert!(
-        coded_p.last().is_some_and(|&c| c > 0.01),
-        "post-reset uptake expected"
-    );
+    assert!(coded_p.last().is_some_and(|&c| c > 0.01), "post-reset uptake expected");
 }
 
 #[test]
@@ -439,18 +410,8 @@ fn modeled_duration_resolves_per_compartment() {
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,2,-2,1\n1,2,0,0,0,1,0,0\n1,6,0,0,0,1,0,0\n";
     let expl2 = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,2,12.5,1\n1,2,0,0,0,1,0,0\n1,6,0,0,0,1,0,0\n";
 
-    assert_close(
-        &preds_of(&model, coded1),
-        &preds_of(&model, expl1),
-        1e-9,
-        "CMT=1 -> D1",
-    );
-    assert_close(
-        &preds_of(&model, coded2),
-        &preds_of(&model, expl2),
-        1e-9,
-        "CMT=2 -> D2",
-    );
+    assert_close(&preds_of(&model, coded1), &preds_of(&model, expl1), 1e-9, "CMT=1 -> D1");
+    assert_close(&preds_of(&model, coded2), &preds_of(&model, expl2), 1e-9, "CMT=2 -> D2");
     // D1 != D2 so the two compartments' single-dose curves differ.
     assert!(
         (preds_of(&model, coded1)[0] - preds_of(&model, coded2)[0]).abs() > 1e-6,
@@ -493,11 +454,7 @@ fn modeled_duration_without_matching_param_is_rejected() {
         .find(|d| d.code == "E_MODELED_DURATION_NO_PARAM")
         .expect("RATE=-2 with no D1 must be rejected");
     assert_eq!(d.severity, Severity::Error);
-    assert!(
-        d.message.contains("D1") && d.message.contains("compartment 1"),
-        "{}",
-        d.message
-    );
+    assert!(d.message.contains("D1") && d.message.contains("compartment 1"), "{}", d.message);
 }
 
 #[test]
@@ -613,16 +570,8 @@ fn analytical_modeled_duration_matches_explicit_infusion() {
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let coded = preds_of(&model, &coded_csv());
     let explicit = preds_of(&model, &explicit_csv());
-    assert_close(
-        &coded,
-        &explicit,
-        1e-9,
-        "analytical RATE=-2 D1=5 vs explicit RATE=20",
-    );
-    assert!(
-        coded.iter().any(|&c| c > 0.1),
-        "analytical predictions should be nonzero"
-    );
+    assert_close(&coded, &explicit, 1e-9, "analytical RATE=-2 D1=5 vs explicit RATE=20");
+    assert!(coded.iter().any(|&c| c > 0.1), "analytical predictions should be nonzero");
 }
 
 #[test]
@@ -635,11 +584,8 @@ fn analytical_modeled_duration_matches_nonmem_closed_form() {
     let pop = pop_of(&coded_csv());
     // Observation times in OBS_ROWS: 1, 3, 5, 8, 12, 18, 24.
     let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
     assert_eq!(preds.len(), times.len(), "one prediction per observation");
     for (p, t) in preds.iter().zip(times) {
         let want = one_cpt_infusion_closed_form(t);
@@ -704,22 +650,11 @@ fn analytical_oral_depot_modeled_duration_matches_explicit_and_is_finite() {
     // central concentrations — no parse error, no runtime panic. This is the
     // regression for the lifted `infusable_compartments()` gate.
     let model = model_of(ANALYTICAL_ORAL_DEPOT_D1);
-    assert!(
-        model.ode_spec.is_none(),
-        "model must stay analytical (no ode_spec)"
-    );
+    assert!(model.ode_spec.is_none(), "model must stay analytical (no ode_spec)");
     let coded = preds_of(&model, &oral_depot_coded_csv());
     let explicit = preds_of(&model, &oral_depot_explicit_csv());
-    assert_close(
-        &coded,
-        &explicit,
-        1e-9,
-        "oral depot RATE=-2 D1=5 vs explicit RATE=20",
-    );
-    assert!(
-        coded.iter().all(|c| c.is_finite()),
-        "central concentrations must be finite"
-    );
+    assert_close(&coded, &explicit, 1e-9, "oral depot RATE=-2 D1=5 vs explicit RATE=20");
+    assert!(coded.iter().all(|c| c.is_finite()), "central concentrations must be finite");
     assert!(
         coded.iter().any(|&c| c > 0.01),
         "central concentrations should be nonzero after a depot zero-order input"
@@ -747,10 +682,8 @@ fn analytical_oral_depot_modeled_duration_matches_nonmem() {
         (18.0, 0.47659),
         (24.0, 0.26156),
     ];
-    let obs_rows: String = NONMEM_PRED
-        .iter()
-        .map(|(t, _)| format!("1,{t},1,0,0,2,0,0\n"))
-        .collect();
+    let obs_rows: String =
+        NONMEM_PRED.iter().map(|(t, _)| format!("1,{t},1,0,0,2,0,0\n")).collect();
     let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{obs_rows}");
 
     let model = model_of(ANALYTICAL_ORAL_DEPOT_D1);
@@ -758,10 +691,7 @@ fn analytical_oral_depot_modeled_duration_matches_nonmem() {
     assert_eq!(preds.len(), NONMEM_PRED.len());
     for (p, (t, want)) in preds.iter().zip(NONMEM_PRED) {
         // NONMEM PRED is tabulated to 5 significant figures, so anchor to that.
-        assert!(
-            (p - want).abs() <= 1e-4 * want.max(1.0),
-            "t={t}: ferx {p} vs NONMEM PRED {want}"
-        );
+        assert!((p - want).abs() <= 1e-4 * want.max(1.0), "t={t}: ferx {p} vs NONMEM PRED {want}");
     }
 }
 
@@ -827,16 +757,8 @@ fn analytical_iov_modeled_duration_predicts_and_matches_explicit() {
     let kappas = vec![vec![0.0; model.n_kappa]; 8];
     let coded_p = ferx_core::pk::predict_iov(&model, &pop_c.subjects[0], theta, &eta, &kappas);
     let expl_p = ferx_core::pk::predict_iov(&model, &pop_e.subjects[0], theta, &eta, &kappas);
-    assert_close(
-        &coded_p,
-        &expl_p,
-        1e-9,
-        "analytical IOV RATE=-2 vs explicit",
-    );
-    assert!(
-        coded_p.iter().any(|&c| c > 0.1),
-        "IOV predictions should be nonzero"
-    );
+    assert_close(&coded_p, &expl_p, 1e-9, "analytical IOV RATE=-2 vs explicit");
+    assert!(coded_p.iter().any(|&c| c > 0.1), "IOV predictions should be nonzero");
 }
 
 #[test]
@@ -875,12 +797,7 @@ fn analytical_modeled_duration_resolves_per_compartment_d2() {
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,2,-2,1\n1,2,0,0,0,2,0,0\n1,6,0,0,0,2,0,0\n";
     let expl =
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,2,12.5,1\n1,2,0,0,0,2,0,0\n1,6,0,0,0,2,0,0\n";
-    assert_close(
-        &preds_of(&model, coded),
-        &preds_of(&model, expl),
-        1e-9,
-        "analytical CMT=2 -> D2",
-    );
+    assert_close(&preds_of(&model, coded), &preds_of(&model, expl), 1e-9, "analytical CMT=2 -> D2");
 }
 
 // ODE model with NO `D1` parameter — a `RATE=-2` dose into CMT=1 has no slot to
@@ -922,8 +839,7 @@ fn predict_on_analytical_model_with_modeled_dose_errs() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.to_string()
-            .contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string().contains("RATE=-2 (modeled infusion duration) into compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -938,8 +854,7 @@ fn predict_on_ode_missing_param_errs() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.to_string()
-            .contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string().contains("RATE=-2 (modeled infusion duration) into compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -953,8 +868,7 @@ fn simulate_on_analytical_model_with_modeled_dose_errs() {
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
     assert!(
-        err.to_string()
-            .contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string().contains("RATE=-2 (modeled infusion duration) into compartment"),
         "unexpected Err: {err}"
     );
 }
@@ -981,8 +895,7 @@ fn simulate_propensity_on_analytical_model_with_modeled_dose_errs() {
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect_err("an unbacked RATE=-2 dose must be refused before the EBE pass");
     assert!(
-        err.to_string()
-            .contains("RATE=-2 (modeled infusion duration) into compartment"),
+        err.to_string().contains("RATE=-2 (modeled infusion duration) into compartment"),
         "{err}"
     );
 }
@@ -1008,16 +921,12 @@ fn modeled_duration_nonpositive_at_init_warns() {
     let pop = pop_of(&coded_csv());
     // No hard error — the parameter exists on an ODE model.
     assert!(
-        check_model_data(&model, &pop)
-            .iter()
-            .all(|d| d.severity != Severity::Error),
+        check_model_data(&model, &pop).iter().all(|d| d.severity != Severity::Error),
         "non-positive D is a warning, not an error"
     );
     let diags = check_model_data_warnings(&model, &pop, &model.default_params);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        diags.iter().any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
         "TVD1=-1 must warn; got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
@@ -1031,9 +940,7 @@ fn modeled_duration_positive_at_init_does_not_warn() {
     let pop = pop_of(&coded_csv());
     let diags = check_model_data_warnings(&model, &pop, &model.default_params);
     assert!(
-        !diags
-            .iter()
-            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        !diags.iter().any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
         "TVD1=5 must not warn; got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
@@ -1062,9 +969,7 @@ fn modeled_duration_warnings_are_panic_free_when_param_missing() {
                1,2,0,0,0,1,0,0,0,0\n";
     let diags = check_model_data_warnings(&model, &pop_of(csv), &model.default_params);
     assert!(
-        !diags
-            .iter()
-            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        !diags.iter().any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
         "slot-absent modeled dose raises no modeled-dose warning; got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
@@ -1092,12 +997,7 @@ fn modeled_duration_matches_nonmem_closed_form() {
     assert_eq!(preds.len(), nonmem_ipred.len(), "prediction count mismatch");
 
     for (p, &(t_ref, nm)) in preds.iter().zip(nonmem_ipred) {
-        assert!(
-            (p.time - t_ref).abs() < 1e-9,
-            "time mismatch: got {}, expected {}",
-            p.time,
-            t_ref
-        );
+        assert!((p.time - t_ref).abs() < 1e-9, "time mismatch: got {}, expected {}", p.time, t_ref);
         // Compare against NONMEM IPRED (5 s.f. precision from sdtab1).
         let rel_nm = (p.pred - nm).abs() / nm.max(1e-12);
         assert!(
@@ -1146,25 +1046,16 @@ fn modeled_duration_addl_matches_nonmem() {
         (60.0, 0.85890),
         (72.0, 0.25870),
     ];
-    let obs: String = NONMEM_IPRED
-        .iter()
-        .map(|(t, _)| format!("1,{t},1,0,0,1,0,0,0,0\n"))
-        .collect();
+    let obs: String =
+        NONMEM_IPRED.iter().map(|(t, _)| format!("1,{t},1,0,0,1,0,0,0,0\n")).collect();
     let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,ADDL,II\n1,0,.,1,100,1,-2,1,2,24\n{obs}");
 
     let model = model_of(ODE_D1);
     let preds = preds_of(&model, &csv);
-    assert_eq!(
-        preds.len(),
-        NONMEM_IPRED.len(),
-        "one prediction per observation"
-    );
+    assert_eq!(preds.len(), NONMEM_IPRED.len(), "one prediction per observation");
     for (p, (t, want)) in preds.iter().zip(NONMEM_IPRED) {
         // NONMEM IPRED tabulated to 5 s.f.
-        assert!(
-            (p - want).abs() <= 1e-4 * want.max(1.0),
-            "t={t}: ferx {p} vs NONMEM IPRED {want}"
-        );
+        assert!((p - want).abs() <= 1e-4 * want.max(1.0), "t={t}: ferx {p} vs NONMEM IPRED {want}");
     }
     // Explicit anti-regression guard for #722: the mid-infusion samples (t=26, 50
     // — indices 4 and 8) read the infusion value (~0.92). Had the ADDL doses
@@ -1205,25 +1096,16 @@ fn modeled_rate_addl_matches_nonmem() {
         (60.0, 0.85890),
         (72.0, 0.25870),
     ];
-    let obs: String = NONMEM_IPRED
-        .iter()
-        .map(|(t, _)| format!("1,{t},1,0,0,1,0,0,0,0\n"))
-        .collect();
+    let obs: String =
+        NONMEM_IPRED.iter().map(|(t, _)| format!("1,{t},1,0,0,1,0,0,0,0\n")).collect();
     let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,ADDL,II\n1,0,.,1,100,1,-1,1,2,24\n{obs}");
 
     let model = model_of(ODE_R1);
     let preds = preds_of(&model, &csv);
-    assert_eq!(
-        preds.len(),
-        NONMEM_IPRED.len(),
-        "one prediction per observation"
-    );
+    assert_eq!(preds.len(), NONMEM_IPRED.len(), "one prediction per observation");
     for (p, (t, want)) in preds.iter().zip(NONMEM_IPRED) {
         // NONMEM IPRED tabulated to 5 s.f.
-        assert!(
-            (p - want).abs() <= 1e-4 * want.max(1.0),
-            "t={t}: ferx {p} vs NONMEM IPRED {want}"
-        );
+        assert!((p - want).abs() <= 1e-4 * want.max(1.0), "t={t}: ferx {p} vs NONMEM IPRED {want}");
     }
     // Anti-regression guard for #722 (RATE=-1): the mid-infusion samples (t=26, 50
     // — indices 4 and 8) read the infusion value (~0.92). Had the ADDL doses
@@ -1332,10 +1214,7 @@ fn non_finite_modeled_duration_or_rate_repels_instead_of_serving_a_bolus() {
 
     // What the engine used to serve, hand-computed rather than tolerated: a
     // 100-unit instantaneous bolus into V = 10 with k = CL/V = 0.1.
-    let bolus: Vec<f64> = [1.0_f64, 4.0, 8.0]
-        .iter()
-        .map(|t| 10.0 * (-0.1 * t).exp())
-        .collect();
+    let bolus: Vec<f64> = [1.0_f64, 4.0, 8.0].iter().map(|t| 10.0 * (-0.1 * t).exp()).collect();
 
     for (engine, structural) in [("ODE", ODE_STRUCT), ("analytical", ANALYTIC_STRUCT)] {
         for (attr, rate, finite) in [("D1", -2, "TVD * 2.0"), ("R1", -1, "TVD * 50.0")] {
@@ -1362,10 +1241,7 @@ fn non_finite_modeled_duration_or_rate_repels_instead_of_serving_a_bolus() {
                 bolus[0]
             );
 
-            for (shape, expr) in [
-                ("NaN", "TVD*exp(WT) - TVD*exp(WT)"),
-                ("+inf", "TVD*exp(WT)"),
-            ] {
+            for (shape, expr) in [("NaN", "TVD*exp(WT) - TVD*exp(WT)"), ("+inf", "TVD*exp(WT)")] {
                 let model = model_of(&model_src(structural, attr, expr));
                 let ctx = format!("{engine}/{attr} = {shape}");
 

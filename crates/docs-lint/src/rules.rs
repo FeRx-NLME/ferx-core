@@ -89,9 +89,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            max_chars: DEFAULT_MAX_CHARS,
-        }
+        Self { max_chars: DEFAULT_MAX_CHARS }
     }
 }
 
@@ -99,11 +97,7 @@ fn chunk_chars(doc: &Doc, from_line_idx: usize, to_line_idx: usize) -> usize {
     if from_line_idx >= to_line_idx {
         return 0;
     }
-    doc.lines[from_line_idx..to_line_idx]
-        .join("\n")
-        .trim()
-        .chars()
-        .count()
+    doc.lines[from_line_idx..to_line_idx].join("\n").trim().chars().count()
 }
 
 /// R1: every independently-addressable chunk stays under the limit.
@@ -154,11 +148,7 @@ pub fn check_sizes(doc: &Doc, cfg: &Config) -> Vec<Violation> {
                 h.text,
                 cfg.max_chars
             ),
-            chunk: Some(Chunk {
-                key: format!("{}::{}", doc.rel, h.id),
-                chars,
-                kind,
-            }),
+            chunk: Some(Chunk { key: format!("{}::{}", doc.rel, h.id), chars, kind }),
         });
     }
     out
@@ -221,9 +211,7 @@ pub fn check_duplicate_ids(doc: &Doc) -> Vec<Violation> {
 ///
 /// `ids_by_file` maps an absolute `.qmd` path to the ids that page defines.
 pub fn check_links(
-    doc: &Doc,
-    root: &Path,
-    ids_by_file: &HashMap<PathBuf, HashSet<String>>,
+    doc: &Doc, root: &Path, ids_by_file: &HashMap<PathBuf, HashSet<String>>,
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     let dir = doc.path.parent().unwrap_or(root);
@@ -294,7 +282,7 @@ pub fn check_links(
 }
 
 /// Lexical path normalization (`..`/`.`), without touching the filesystem.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -308,12 +296,15 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// The ids each page defines, keyed on its normalized path — the lookup R4
+/// resolves a link's `#anchor` against.
+pub fn ids_by_file(docs: &[Doc]) -> HashMap<PathBuf, HashSet<String>> {
+    docs.iter().map(|d| (normalize(&d.path), d.ids.clone())).collect()
+}
+
 /// Run every rule over a parsed corpus, sorted by file then line.
 pub fn lint(docs: &[Doc], root: &Path, cfg: &Config) -> Vec<Violation> {
-    let ids_by_file: HashMap<PathBuf, HashSet<String>> = docs
-        .iter()
-        .map(|d| (normalize(&d.path), d.ids.clone()))
-        .collect();
+    let ids_by_file = ids_by_file(docs);
 
     let mut out = Vec::new();
     for doc in docs {
@@ -322,12 +313,7 @@ pub fn lint(docs: &[Doc], root: &Path, cfg: &Config) -> Vec<Violation> {
         out.extend(check_duplicate_ids(doc));
         out.extend(check_links(doc, root, &ids_by_file));
     }
-    out.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then(a.line.cmp(&b.line))
-            .then(a.rule.cmp(&b.rule))
-    });
+    out.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)).then(a.rule.cmp(&b.rule)));
     out
 }
 
@@ -376,10 +362,7 @@ mod tests {
 
     #[test]
     fn page_preamble_counts() {
-        let text = format!(
-            "---\ntitle: x\n---\n\n{}\n\n# Top\n\nshort\n",
-            "x".repeat(80)
-        );
+        let text = format!("---\ntitle: x\n---\n\n{}\n\n# Top\n\nshort\n", "x".repeat(80));
         let v = check_sizes(&doc(&text), &small_cfg());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].chunk.as_ref().unwrap().kind, ChunkKind::Preamble);
@@ -433,23 +416,16 @@ mod tests {
 
     fn link_corpus(pages: &[(&str, &str)]) -> (Vec<Doc>, PathBuf) {
         let root = PathBuf::from("/root");
-        let docs = pages
-            .iter()
-            .map(|(rel, text)| doc_at(text, rel))
-            .collect::<Vec<_>>();
+        let docs = pages.iter().map(|(rel, text)| doc_at(text, rel)).collect::<Vec<_>>();
         (docs, root)
     }
 
     fn check_anchors(docs: &[Doc], root: &Path) -> Vec<Violation> {
         // Keyed exactly as `lint()` keys it, so the helper cannot pass on a
         // corpus the real entry point would fail.
-        let ids: HashMap<PathBuf, HashSet<String>> = docs
-            .iter()
-            .map(|d| (normalize(&d.path), d.ids.clone()))
-            .collect();
-        docs.iter()
-            .flat_map(|d| check_links(d, root, &ids))
-            .collect()
+        let ids: HashMap<PathBuf, HashSet<String>> =
+            docs.iter().map(|d| (normalize(&d.path), d.ids.clone())).collect();
+        docs.iter().flat_map(|d| check_links(d, root, &ids)).collect()
     }
 
     #[test]
@@ -485,10 +461,8 @@ mod tests {
 
     #[test]
     fn explicit_div_anchor_resolves() {
-        let (docs, root) = link_corpus(&[(
-            "docs/x.qmd",
-            "[a](#tip-x)\n\n::: {#tip-x .callout-note}\nhi\n:::\n",
-        )]);
+        let (docs, root) =
+            link_corpus(&[("docs/x.qmd", "[a](#tip-x)\n\n::: {#tip-x .callout-note}\nhi\n:::\n")]);
         assert!(check_anchors(&docs, &root).is_empty());
     }
 

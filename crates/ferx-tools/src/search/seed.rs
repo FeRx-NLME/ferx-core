@@ -67,10 +67,7 @@ fn free_blocks_of(model: &ModelText, keyword: &str, eta_names: &[String]) -> Vec
         let Some(rest) = line.strip_prefix(keyword) else {
             continue;
         };
-        if rest
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|tok| tok.eq_ignore_ascii_case("FIX"))
-        {
+        if rest.split(|c: char| !c.is_alphanumeric()).any(|tok| tok.eq_ignore_ascii_case("FIX")) {
             continue;
         }
         let Some((_, inner)) = rest.split_once('(') else {
@@ -116,8 +113,7 @@ fn floor_variances(fit: &FitResult, blocks: &[Vec<usize>]) -> Option<FitResult> 
 /// [`floor_variances`] on one variance matrix — `omega` or `omega_iov` —
 /// returning the floored matrix, or `None` when nothing had to move.
 fn floor_matrix(
-    matrix: &nalgebra::DMatrix<f64>,
-    blocks: &[Vec<usize>],
+    matrix: &nalgebra::DMatrix<f64>, blocks: &[Vec<usize>],
 ) -> Option<nalgebra::DMatrix<f64>> {
     let n = matrix.nrows();
     let mut omega = matrix.clone();

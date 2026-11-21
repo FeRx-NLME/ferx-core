@@ -23,14 +23,8 @@ const DATA: &str = "nonmem_anchor/nested_levels_3.csv";
 /// `exact3` with `extra` appended to `[parameters]` and `line` under the error model.
 fn exact3_src(extra: &str, line: &str) -> String {
     EXACT3
-        .replace(
-            "  sigma ADD ~ 0.255164\n",
-            &format!("  sigma ADD ~ 0.255164\n{extra}"),
-        )
-        .replace(
-            "  DV ~ additive(ADD)\n",
-            &format!("  DV ~ additive(ADD)\n{line}"),
-        )
+        .replace("  sigma ADD ~ 0.255164\n", &format!("  sigma ADD ~ 0.255164\n{extra}"))
+        .replace("  DV ~ additive(ADD)\n", &format!("  DV ~ additive(ADD)\n{line}"))
 }
 
 /// `exact3` with a free θ `RHO` at `rho` and `correlation <kind>(RHO) by <by>`.
@@ -75,10 +69,7 @@ fn prepared(model: &CompiledModel, pop: &Population) -> Population {
 }
 
 fn eval(
-    model: &CompiledModel,
-    pop: &Population,
-    opts: &FitOptions,
-    method: EstimationMethod,
+    model: &CompiledModel, pop: &Population, opts: &FitOptions, method: EstimationMethod,
 ) -> crate::types::FitResult {
     let opts = FitOptions {
         method,
@@ -112,9 +103,7 @@ fn h_eta(model: &CompiledModel, s: &Subject, eta: &[f64], kappas: &[Vec<f64>]) -
 /// that differs between groups (so each level's column is live and distinct).
 fn linearize(model: &CompiledModel, s: &Subject) -> crate::stats::likelihood::IovLinearization {
     let layout = crate::stats::nested_levels::NestedLayout::of(model, s).expect("prepared");
-    let b: Vec<f64> = (0..layout.n_compact())
-        .map(|i| 0.03 * (i as f64) - 0.05)
-        .collect();
+    let b: Vec<f64> = (0..layout.n_compact()).map(|i| 0.03 * (i as f64) - 0.05).collect();
     let eta = b[..model.n_eta].to_vec();
     let kappas = layout.expand(&b);
     let h = h_eta(model, s, &eta, &kappas);
@@ -171,9 +160,7 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
     // The compact columns of each level: every cell's index for that level's κ.
     let layout = crate::stats::nested_levels::NestedLayout::of(&m, s).unwrap();
     let cols_of = |k: usize| {
-        let mut c: Vec<usize> = (0..layout.n_cells())
-            .map(|g| layout.compact_index(g, k))
-            .collect();
+        let mut c: Vec<usize> = (0..layout.n_cells()).map(|g| layout.compact_index(g, k)).collect();
         c.sort_unstable();
         c.dedup();
         c
@@ -223,10 +210,7 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
 
     let all = &t_eta + &t_study + &t_arm + &r_diag + &r_off;
     let hand = sb_marginal(&all, &resid);
-    eprintln!(
-        "engine {engine:.12}  hand {hand:.12}  |Δ| {:.3e}",
-        (engine - hand).abs()
-    );
+    eprintln!("engine {engine:.12}  hand {hand:.12}  |Δ| {:.3e}", (engine - hand).abs());
     // Measured |Δ| 1.4e-14 (macOS arm64 and Linux aarch64; the two sums associate
     // differently). Each term moves the marginal by 2.1 (η), 11.4 (STUDY), 33.7 (ARM), 4.6
     // (serial R) — so 1e-3 is three orders below the smallest term, and 1e-9 five above the
@@ -245,10 +229,7 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
     .into_iter()
     .filter_map(|(name, t)| {
         let without = sb_marginal(&(&all - t), &resid);
-        eprintln!(
-            "without {name}: {without:.12}  |Δ| {:.3e}",
-            (without - engine).abs()
-        );
+        eprintln!("without {name}: {without:.12}  |Δ| {:.3e}", (without - engine).abs());
         ((without - engine).abs() <= 1e-3).then_some(name)
     })
     .collect();
@@ -257,10 +238,7 @@ fn each_level_term_of_r_tilde_enters_the_iov_foce_marginal() {
         "the IOV FOCE marginal does not carry {missing:?}: engine {engine} equals the \
          marginal without it"
     );
-    assert!(
-        (engine - hand).abs() < 1e-9,
-        "engine {engine} vs hand {hand}"
-    );
+    assert!((engine - hand).abs() < 1e-9, "engine {engine} vs hand {hand}");
 }
 
 /// V1 + V2, and the branch the FOCEI marginal takes.
@@ -283,10 +261,7 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
     let (base, pop, opts) = load(&exact3_src("", ""));
     let (zero, _, _) = load(&with_corr("ar1", 0.0, "ARM"));
     let (half, _, _) = load(&with_corr("ar1", 0.5, "ARM"));
-    assert!(
-        zero.residual_serial.is_some(),
-        "a free ρ at 0 keeps the line"
-    );
+    assert!(zero.residual_serial.is_some(), "a free ρ at 0 keeps the line");
 
     // The discriminator.
     for (m, dense) in [(&base, false), (&zero, true), (&half, true)] {
@@ -333,12 +308,7 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
                     None,
                 )
             };
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "subject {}: dense = {dense}",
-                s.id
-            );
+            assert_eq!(got.to_bits(), want.to_bits(), "subject {}: dense = {dense}", s.id);
         }
     }
 
@@ -348,11 +318,7 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
     let d_ofv = (r_zero.ofv - r_base.ofv).abs();
     let mut d_ebe = 0.0f64;
     for i in 0..r_base.subjects.len() {
-        for (a, b) in r_base.subjects[i]
-            .eta
-            .iter()
-            .zip(r_zero.subjects[i].eta.iter())
-        {
+        for (a, b) in r_base.subjects[i].eta.iter().zip(r_zero.subjects[i].eta.iter()) {
             assert!(a.is_finite() && b.is_finite());
             d_ebe = d_ebe.max((a - b).abs());
         }
@@ -392,32 +358,17 @@ fn rho_zero_composes_with_the_nested_fit_and_rho_moves_it() {
     // The route the line takes (#2101): the same as without it — every subject's EBE
     // search and the outer gradient analytic, so nothing warns about finite differences.
     assert!(
-        !r_zero
-            .warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
+        !r_zero.warnings.iter().any(|w| w.contains("finite-difference")),
         "{:?}",
         r_zero.warnings
     );
-    assert_eq!(
-        r_zero.gradient_method_outer,
-        GradientMethodKind::Analytic.as_str()
-    );
-    assert!(!r_base
-        .warnings
-        .iter()
-        .any(|w| w.contains("finite-difference")));
-    assert_eq!(
-        r_base.gradient_method_outer,
-        GradientMethodKind::Analytic.as_str()
-    );
+    assert_eq!(r_zero.gradient_method_outer, GradientMethodKind::Analytic.as_str());
+    assert!(!r_base.warnings.iter().any(|w| w.contains("finite-difference")));
+    assert_eq!(r_base.gradient_method_outer, GradientMethodKind::Analytic.as_str());
 }
 
 fn codes(d: &[Diagnostic], code: &str) -> Vec<String> {
-    d.iter()
-        .filter(|d| d.code == code)
-        .map(|d| d.message.clone())
-        .collect()
+    d.iter().filter(|d| d.code == code).map(|d| d.message.clone()).collect()
 }
 
 const CONFOUNDED: &str = "E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA";
@@ -452,27 +403,17 @@ fn cs_over_a_kappa_level_is_refused_and_everything_else_is_not() {
             .replace("  kappa K_ST ~ 0.0904362 at STUDY\n", "")
             .replace("ETA_SP + K_ST + K_ARM", "ETA_SP + K_ARM")
     };
-    let additive = with_corr("cs", 0.3, "ARM")
-        .replace("y = TVE0 + EMAX", "y = E0 + EMAX")
-        .replace(
-            "  EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)\n",
-            "  EMAX = TVEMAX * exp(ETA_SP + K_ST)\n  E0 = TVE0 + 0.5 * K_ARM\n",
-        );
+    let additive = with_corr("cs", 0.3, "ARM").replace("y = TVE0 + EMAX", "y = E0 + EMAX").replace(
+        "  EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM)\n",
+        "  EMAX = TVEMAX * exp(ETA_SP + K_ST)\n  E0 = TVE0 + 0.5 * K_ARM\n",
+    );
     assert!(additive.contains("E0 = TVE0 + 0.5 * K_ARM"));
     let cells: Vec<(&str, String, bool)> = vec![
-        (
-            "cs by ARM, multiplicative κ at ARM",
-            with_corr("cs", 0.3, "ARM"),
-            true,
-        ),
+        ("cs by ARM, multiplicative κ at ARM", with_corr("cs", 0.3, "ARM"), true),
         ("cs by ARM, additive κ at ARM", additive, true),
         ("cs by ARMID, κ at ARM", with_corr("cs", 0.3, "ARMID"), true),
         ("ar1 by ARM, κ at ARM", with_corr("ar1", 0.3, "ARM"), false),
-        (
-            "car1 by ARM, κ at ARM",
-            with_corr("car1", 0.3, "ARM"),
-            false,
-        ),
+        ("car1 by ARM, κ at ARM", with_corr("car1", 0.3, "ARM"), false),
         ("cs by STUDY, κ only at ARM", arm_only("cs", "STUDY"), false),
         ("cs by ARM, κ only at ARM", arm_only("cs", "ARM"), true),
     ];
@@ -539,39 +480,23 @@ const AMBIGUOUS: &str = "E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS";
 fn a_level_name_in_by_groups_by_the_level_nested_by_key() {
     let groups = |src: &str| {
         let (m, pop, _) = load(src);
-        prepared(&m, &pop)
-            .subjects
-            .iter()
-            .map(|s| s.obs_rgroup.clone())
-            .collect::<Vec<_>>()
+        prepared(&m, &pop).subjects.iter().map(|s| s.obs_rgroup.clone()).collect::<Vec<_>>()
     };
     let level = groups(&with_corr("ar1", 0.3, "ARM"));
     let arm_id = groups(&with_corr("ar1", 0.3, "ARMID"));
     // A level-free model (η only) reading the columns.
     let flat = |by: &str| {
-        exact3_src(
-            "  theta RHO(0.3, -0.9, 0.9)\n",
-            &format!("  correlation ar1(RHO) by {by}\n"),
-        )
-        .replace(
-            "  level STUDY by STUDY in ID\n  level ARM by ARM in STUDY\n",
-            "",
-        )
-        .replace("  kappa K_ST ~ 0.0904362 at STUDY\n", "")
-        .replace("  kappa K_ARM ~ 3.75478 at ARM weight = NARM\n", "")
-        .replace("ETA_SP + K_ST + K_ARM", "ETA_SP")
+        exact3_src("  theta RHO(0.3, -0.9, 0.9)\n", &format!("  correlation ar1(RHO) by {by}\n"))
+            .replace("  level STUDY by STUDY in ID\n  level ARM by ARM in STUDY\n", "")
+            .replace("  kappa K_ST ~ 0.0904362 at STUDY\n", "")
+            .replace("  kappa K_ARM ~ 3.75478 at ARM weight = NARM\n", "")
+            .replace("ETA_SP + K_ST + K_ARM", "ETA_SP")
     };
     let tuple = groups(&flat("STUDY, ARM"));
     let column = groups(&flat("ARM"));
     assert_eq!(level, arm_id, "by ARM (level) vs by ARMID");
-    assert_eq!(
-        level, tuple,
-        "by ARM (level) vs a level-free by (STUDY, ARM)"
-    );
-    assert_ne!(
-        level, column,
-        "the straddle: the column within ID merges the arms"
-    );
+    assert_eq!(level, tuple, "by ARM (level) vs a level-free by (STUDY, ARM)");
+    assert_ne!(level, column, "the straddle: the column within ID merges the arms");
     assert!(level[0].iter().max() == Some(&4) && column[0].iter().max() == Some(&2));
 
     let (m_level, pop, opts) = load(&with_corr("ar1", 0.4, "ARM"));
@@ -648,30 +573,21 @@ fn ambiguous_groupings_are_refused_and_the_rest_accepted() {
                 .replace("ETA_SP + K_ST + K_ARM", "ETA_SP + K_ARM"),
             &[],
         ),
-        (
-            "a column no level reads",
-            with_corr("ar1", 0.3, "ARMID"),
-            &[],
-        ),
+        ("a column no level reads", with_corr("ar1", 0.3, "ARMID"), &[]),
     ];
     for (label, src, sentences) in &cells {
         let d = check(src);
         let hits = codes(&d, AMBIGUOUS);
         if sentences.is_empty() {
             assert!(
-                d.iter()
-                    .all(|x| x.severity != crate::diagnostics::Severity::Error),
+                d.iter().all(|x| x.severity != crate::diagnostics::Severity::Error),
                 "{label}: {d:?}"
             );
             continue;
         }
         assert_eq!(hits.len(), 1, "{label}: {d:?}");
         for sentence in *sentences {
-            assert!(
-                hits[0].contains(sentence),
-                "{label}: missing {sentence:?} in {}",
-                hits[0]
-            );
+            assert!(hits[0].contains(sentence), "{label}: missing {sentence:?} in {}", hits[0]);
         }
     }
 }
@@ -747,11 +663,7 @@ fn gate_b_applies_a_derived_occasion_rule() {
         &parsed.model,
         &partial,
         &parsed.model.default_params,
-        &FitOptions {
-            outer_maxiter: 0,
-            run_covariance_step: false,
-            ..parsed.fit_options.clone()
-        },
+        &FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() },
     )
     .expect("a partial match fits");
     assert!(
@@ -778,23 +690,14 @@ fn gate_b_applies_a_derived_occasion_rule() {
         model_path.to_str().unwrap(),
         Some(data_path.to_str().unwrap()),
     );
-    let warns = codes(
-        &report.diagnostics,
-        "W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA",
-    );
+    let warns = codes(&report.diagnostics, "W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA");
     assert_eq!(warns.len(), 1, "{:?}", report.diagnostics);
     assert!(warns[0].contains("in 1 of 2 subjects"), "{}", warns[0]);
 
     // Finding 9: two kappas at the grouping are named in the plural.
     let two = src("cs")
-        .replace(
-            "  kappa K ~ 0.04\n",
-            "  kappa K ~ 0.04\n  kappa K2 ~ 0.04\n",
-        )
-        .replace(
-            "  theta TVE0(10.0)\n",
-            "  theta TVE0(10.0)\n  theta TVS(1.0)\n",
-        )
+        .replace("  kappa K ~ 0.04\n", "  kappa K ~ 0.04\n  kappa K2 ~ 0.04\n")
+        .replace("  theta TVE0(10.0)\n", "  theta TVE0(10.0)\n  theta TVS(1.0)\n")
         .replace("  y = E0\n", "  y = E0 * S\n")
         .replace(
             "  E0 = TVE0 * exp(ETA + K)\n",
@@ -808,11 +711,7 @@ fn gate_b_applies_a_derived_occasion_rule() {
     );
     let hits = codes(&d, CONFOUNDED);
     assert_eq!(hits.len(), 1, "{d:?}");
-    assert!(
-        hits[0].contains("where the kappas K, K2 are drawn."),
-        "{}",
-        hits[0]
-    );
+    assert!(hits[0].contains("where the kappas K, K2 are drawn."), "{}", hits[0]);
 }
 
 /// Finding 4 of review round 1 on #2102: a block a level-named `by` defines is named by its
@@ -831,11 +730,7 @@ fn a_level_block_is_named_by_its_key_path() {
     let d = check_model_data(&m, &pop);
     let ties = codes(&d, "E_RESIDUAL_CORRELATION_TIES");
     assert_eq!(ties.len(), 1, "{d:?}");
-    assert!(
-        ties[0].contains("in the block STUDY=1, ARM=1."),
-        "{}",
-        ties[0]
-    );
+    assert!(ties[0].contains("in the block STUDY=1, ARM=1."), "{}", ties[0]);
 }
 
 /// The conditional IOV objective (`conditional_obs_nll_from_preds(.., iov = true)`, the
@@ -885,10 +780,7 @@ fn the_reported_cwres_whiten_by_the_dense_r_tilde() {
     let (mut worst, mut gap) = (0.0f64, f64::INFINITY);
     for (i, s) in pop.subjects.iter().enumerate() {
         let eta: Vec<f64> = r.subjects[i].eta.iter().copied().collect();
-        let kappas: Vec<Vec<f64>> = r.ebe_kappas[i]
-            .iter()
-            .map(|k| k.as_slice().to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> = r.ebe_kappas[i].iter().map(|k| k.as_slice().to_vec()).collect();
         let h = h_eta(&m, s, &eta, &kappas);
         let kv: Vec<DVector<f64>> = kappas.into_iter().map(DVector::from_vec).collect();
         let lin = crate::stats::likelihood::iov_linearization(
@@ -926,11 +818,7 @@ fn the_reported_cwres_whiten_by_the_dense_r_tilde() {
             assert!(got[j].is_finite() && dense[j].is_finite() && diag[j].is_finite());
             worst = worst.max((got[j] - dense[j]).abs());
         }
-        let d: f64 = got
-            .iter()
-            .zip(&diag)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f64::max);
+        let d: f64 = got.iter().zip(&diag).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         gap = gap.min(d);
     }
     eprintln!("worst |CWRES − dense| {worst:.3e}; smallest per-subject gap to diag {gap:.3e}");
@@ -939,10 +827,7 @@ fn the_reported_cwres_whiten_by_the_dense_r_tilde() {
     // smallest per-subject gap of 0.543 to the diagonal-R CWRES. 4e-8 is 12× above the
     // agreement; 0.05 is 10× below the gap.
     assert!(worst < 4e-8, "reported CWRES vs dense: {worst}");
-    assert!(
-        gap > 0.05,
-        "a subject's CWRES are the diagonal-R ones: {gap}"
-    );
+    assert!(gap > 0.05, "a subject's CWRES are the diagonal-R ones: {gap}");
 }
 
 /// Gate B's warning half, every side in one test. `cs by STUDY` next to a kappa only at
@@ -983,10 +868,7 @@ fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
     };
 
     let (e, w) = at(&pop);
-    assert!(
-        e.is_empty() && w.is_empty(),
-        "no sponsor matches: {e:?} {w:?}"
-    );
+    assert!(e.is_empty() && w.is_empty(), "no sponsor matches: {e:?} {w:?}");
 
     let partial = single_armed(3);
     let (e, w) = at(&partial);
@@ -1005,9 +887,7 @@ fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
     // The fit says it too.
     let r = eval(&m, &partial, &opts, EstimationMethod::FoceI);
     assert!(
-        r.warnings
-            .iter()
-            .any(|x| x.contains("in 3 of 12 subjects the blocks")),
+        r.warnings.iter().any(|x| x.contains("in 3 of 12 subjects the blocks")),
         "{:?}",
         r.warnings
     );
@@ -1035,10 +915,7 @@ fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
         p
     };
     let (e, w) = at(&one_obs(&pop, 1));
-    assert!(
-        e.is_empty() && w.is_empty(),
-        "a one-observation sponsor matches nothing: {e:?} {w:?}"
-    );
+    assert!(e.is_empty() && w.is_empty(), "a one-observation sponsor matches nothing: {e:?} {w:?}");
     // Among real matches it changes the count, not the verdict: 11 of 11 is still the
     // refusal.
     let (e, w) = at(&one_obs(&single_armed(12), 1));
@@ -1046,8 +923,5 @@ fn a_partial_kappa_partition_match_warns_and_a_full_one_refuses() {
     assert!(w.is_empty(), "{w:?}");
     // Every subject trivial: `cs` couples nothing, so there is nothing to refuse.
     let (e, w) = at(&one_obs(&pop, 12));
-    assert!(
-        e.is_empty() && w.is_empty(),
-        "every sponsor trivial: {e:?} {w:?}"
-    );
+    assert!(e.is_empty() && w.is_empty(), "every sponsor trivial: {e:?} {w:?}");
 }

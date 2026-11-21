@@ -92,80 +92,24 @@ fn nonmem_refs(focei: bool) -> [SeRef; 7] {
     if focei {
         // FOCEI: $EST METHOD=1 INTER.
         [
-            SeRef {
-                name: "TVCL",
-                nm: 7.09746e-3,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "TVV",
-                nm: 2.40053e-1,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "TVKA",
-                nm: 1.48649e-1,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "PROP_ERR",
-                nm: 8.35411e-4,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "omega_CL",
-                nm: 1.27933e-2,
-                tol: omega_tol,
-            },
-            SeRef {
-                name: "omega_V",
-                nm: 4.30540e-3,
-                tol: omega_tol,
-            },
-            SeRef {
-                name: "omega_KA",
-                nm: 1.50376e-1,
-                tol: omega_tol,
-            },
+            SeRef { name: "TVCL", nm: 7.09746e-3, tol: TIGHT },
+            SeRef { name: "TVV", nm: 2.40053e-1, tol: TIGHT },
+            SeRef { name: "TVKA", nm: 1.48649e-1, tol: TIGHT },
+            SeRef { name: "PROP_ERR", nm: 8.35411e-4, tol: TIGHT },
+            SeRef { name: "omega_CL", nm: 1.27933e-2, tol: omega_tol },
+            SeRef { name: "omega_V", nm: 4.30540e-3, tol: omega_tol },
+            SeRef { name: "omega_KA", nm: 1.50376e-1, tol: omega_tol },
         ]
     } else {
         // FOCE: $EST METHOD=1 (no INTER).
         [
-            SeRef {
-                name: "TVCL",
-                nm: 6.62683e-3,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "TVV",
-                nm: 2.34041e-1,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "TVKA",
-                nm: 1.24489e-1,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "PROP_ERR",
-                nm: 9.41384e-4,
-                tol: TIGHT,
-            },
-            SeRef {
-                name: "omega_CL",
-                nm: 1.27958e-2,
-                tol: omega_tol,
-            },
-            SeRef {
-                name: "omega_V",
-                nm: 4.29747e-3,
-                tol: omega_tol,
-            },
-            SeRef {
-                name: "omega_KA",
-                nm: 1.60641e-1,
-                tol: omega_tol,
-            },
+            SeRef { name: "TVCL", nm: 6.62683e-3, tol: TIGHT },
+            SeRef { name: "TVV", nm: 2.34041e-1, tol: TIGHT },
+            SeRef { name: "TVKA", nm: 1.24489e-1, tol: TIGHT },
+            SeRef { name: "PROP_ERR", nm: 9.41384e-4, tol: TIGHT },
+            SeRef { name: "omega_CL", nm: 1.27958e-2, tol: omega_tol },
+            SeRef { name: "omega_V", nm: 4.29747e-3, tol: omega_tol },
+            SeRef { name: "omega_KA", nm: 1.60641e-1, tol: omega_tol },
         ]
     }
 }
@@ -192,25 +136,15 @@ fn assert_covariance_se_matches_nonmem(method: EstimationMethod, interaction: bo
 
     // The covariance step must succeed (the indefinite fixed-EBE Hessian used to
     // fail or clip here).
-    assert!(
-        result.covariance_matrix.is_some(),
-        "covariance step must produce a matrix"
-    );
+    assert!(result.covariance_matrix.is_some(), "covariance step must produce a matrix");
     let se_theta = result.se_theta.as_ref().expect("theta SEs present");
     let se_omega = result.se_omega.as_ref().expect("omega SEs present");
     let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");
 
     let refs = nonmem_refs(interaction);
     // ferx SEs in the same order as `refs`.
-    let ferx = [
-        se_theta[0],
-        se_theta[1],
-        se_theta[2],
-        se_sigma[0],
-        se_omega[0],
-        se_omega[1],
-        se_omega[2],
-    ];
+    let ferx =
+        [se_theta[0], se_theta[1], se_theta[2], se_sigma[0], se_omega[0], se_omega[1], se_omega[2]];
 
     for (r, &ferx_se) in refs.iter().zip(ferx.iter()) {
         let rel = (ferx_se - r.nm).abs() / r.nm;
@@ -346,36 +280,12 @@ fn covariance_se_matches_nonmem_foce_block_omega() {
     // NONMEM 7.5.1 FOCE (METHOD=1, no INTER), $OMEGA BLOCK(2) on (CL,V) + diag KA,
     // $COVARIANCE MATRIX=R; SEs from the .ext row at ITERATION = -1000000001.
     let refs = [
-        SeRef {
-            name: "TVCL",
-            nm: 6.68028e-3,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "TVV",
-            nm: 2.35936e-1,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "TVKA",
-            nm: 1.24451e-1,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "PROP_ERR",
-            nm: 9.46602e-4,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "omega_CL",
-            nm: 1.27995e-2,
-            tol: OMEGA_FOCE,
-        },
-        SeRef {
-            name: "omega_V",
-            nm: 4.29739e-3,
-            tol: OMEGA_FOCE,
-        },
+        SeRef { name: "TVCL", nm: 6.68028e-3, tol: TIGHT },
+        SeRef { name: "TVV", nm: 2.35936e-1, tol: TIGHT },
+        SeRef { name: "TVKA", nm: 1.24451e-1, tol: TIGHT },
+        SeRef { name: "PROP_ERR", nm: 9.46602e-4, tol: TIGHT },
+        SeRef { name: "omega_CL", nm: 1.27995e-2, tol: OMEGA_FOCE },
+        SeRef { name: "omega_V", nm: 4.29739e-3, tol: OMEGA_FOCE },
         SeRef {
             name: "omega_KA",
             nm: 1.60542e-1,
@@ -499,10 +409,7 @@ fn covariance_se_matches_nonmem_iov() {
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("warfarin IOV fit runs");
 
-    assert!(
-        result.covariance_matrix.is_some(),
-        "IOV covariance step must produce a matrix"
-    );
+    assert!(result.covariance_matrix.is_some(), "IOV covariance step must produce a matrix");
     // This well-identified IOV fit has a PD Hessian, so the real covariance must
     // be returned — not the `covariance_fallback = sir` path (#223). Guards that
     // the SIR fallback stays inert when the covariance step succeeds.
@@ -519,46 +426,14 @@ fn covariance_se_matches_nonmem_iov() {
     // NONMEM 7.5.1 FOCEI $COVARIANCE MATRIX=R SEs (.ext, ITER=-1000000001);
     // PROP_ERR converted from the variance-scale $SIGMA SE (see fn docs).
     let refs = [
-        SeRef {
-            name: "TVCL",
-            nm: 1.33623e-2,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "TVV",
-            nm: 3.41267e-1,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "TVKA",
-            nm: 9.32221e-2,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "PROP_ERR",
-            nm: 1.0138e-2,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "omega_CL",
-            nm: 2.80628e-2,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "omega_V",
-            nm: 6.44076e-3,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "omega_KA",
-            nm: 2.79920e-2,
-            tol: TIGHT,
-        },
-        SeRef {
-            name: "kappa_CL",
-            nm: 1.76108e-2,
-            tol: 0.40,
-        },
+        SeRef { name: "TVCL", nm: 1.33623e-2, tol: TIGHT },
+        SeRef { name: "TVV", nm: 3.41267e-1, tol: TIGHT },
+        SeRef { name: "TVKA", nm: 9.32221e-2, tol: TIGHT },
+        SeRef { name: "PROP_ERR", nm: 1.0138e-2, tol: TIGHT },
+        SeRef { name: "omega_CL", nm: 2.80628e-2, tol: TIGHT },
+        SeRef { name: "omega_V", nm: 6.44076e-3, tol: TIGHT },
+        SeRef { name: "omega_KA", nm: 2.79920e-2, tol: TIGHT },
+        SeRef { name: "kappa_CL", nm: 1.76108e-2, tol: 0.40 },
     ];
     let ferx = [
         se_theta[0],

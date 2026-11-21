@@ -91,7 +91,6 @@
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, GradientMethod, OmegaMatrix, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions, MAX_PK_PARAMS};
-use std::collections::HashMap;
 
 const N_FILLER: usize = 15;
 /// Count of engine-reserved PK slots (`F`, `LAGTIME`). Mirrors
@@ -101,12 +100,7 @@ const RESERVED_PK_SLOTS_LEN: usize = 2;
 
 fn fillers() -> String {
     (1..=N_FILLER)
-        .map(|i| {
-            format!(
-                "  FILLER_{i} = TVCL * {factor:.3}\n",
-                factor = 1.0 + (i as f64) * 0.01
-            )
-        })
+        .map(|i| format!("  FILLER_{i} = TVCL * {factor:.3}\n", factor = 1.0 + (i as f64) * 0.01))
         .collect()
 }
 
@@ -187,34 +181,13 @@ fn template_population(n: usize) -> Population {
     let obs_times = [1.0_f64, 4.0, 12.0];
     let subjects: Vec<Subject> = (1..=n)
         .map(|i| Subject {
-            obs_rgroup: Vec::new(),
             id: format!("{i}"),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.to_vec(),
-            obs_raw_times: vec![],
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![2; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            reset_covariates: vec![],
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: vec![],
-            pk_only_occasions: Vec::new(),
-            fremtype: vec![],
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
 
@@ -251,9 +224,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
 }
 
 fn fit_short_with(
-    model: &mut ferx_core::types::CompiledModel,
-    pop: &Population,
-    gradient: GradientMethod,
+    model: &mut ferx_core::types::CompiledModel, pop: &Population, gradient: GradientMethod,
 ) -> ferx_core::FitResult {
     // Both the inner and outer loops key off the gradient method: `opts`
     // controls the inner loop, but `model.gradient_method` is what
@@ -275,8 +246,7 @@ fn fit_short_with(
 }
 
 fn fit_short(
-    model: &mut ferx_core::types::CompiledModel,
-    pop: &Population,
+    model: &mut ferx_core::types::CompiledModel, pop: &Population,
 ) -> ferx_core::FitResult {
     fit_short_with(model, pop, GradientMethod::Auto)
 }

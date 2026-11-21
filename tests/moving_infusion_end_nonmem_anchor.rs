@@ -111,17 +111,11 @@ fn closed_form_objective_matches_nonmem_with_infusion_ends_crossing_observations
 /// subject's own objective than the one NONMEM evaluated) — and must be: one that matches is a
 /// stale exemption.
 fn objective_matches_nonmem(src: &str, lower: &[&str]) {
-    let model = parse_full_model(src)
-        .expect("the anchor model parses")
-        .model;
+    let model = parse_full_model(src).expect("the anchor model parses").model;
     // The engine the test names: the closed form has no ODE system.
     assert_eq!(model.ode_spec.is_some(), src.contains("[odes]"));
-    let pop = read_nonmem_csv(
-        Path::new("nonmem_anchor/moving_infusion_end.csv"),
-        None,
-        None,
-    )
-    .expect("the anchor data loads");
+    let pop = read_nonmem_csv(Path::new("nonmem_anchor/moving_infusion_end.csv"), None, None)
+        .expect("the anchor data loads");
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
     opts.outer_maxiter = 0;
@@ -130,27 +124,15 @@ fn objective_matches_nonmem(src: &str, lower: &[&str]) {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("the evaluation runs");
 
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !result.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "every subject's inner gradient is the plans': {:?}",
         result.warnings
     );
     let tvd1 = model.default_params.theta[2];
-    let ends: Vec<f64> = result
-        .subjects
-        .iter()
-        .map(|s| tvd1 * s.eta[2].exp())
-        .collect();
-    let (early, late) = (
-        ends.iter().filter(|&&e| e < 2.0).count(),
-        ends.iter().filter(|&&e| e > 2.5).count(),
-    );
-    assert!(
-        early >= 10 && late >= 10,
-        "ends before 2 h: {early}, after 2.5 h: {late}"
-    );
+    let ends: Vec<f64> = result.subjects.iter().map(|s| tvd1 * s.eta[2].exp()).collect();
+    let (early, late) =
+        (ends.iter().filter(|&&e| e < 2.0).count(), ends.iter().filter(|&&e| e > 2.5).count());
+    assert!(early >= 10 && late >= 10, "ends before 2 h: {early}, after 2.5 h: {late}");
 
     let want = nonmem_obj();
     assert_eq!(want.len(), result.subjects.len());
@@ -164,10 +146,7 @@ fn objective_matches_nonmem(src: &str, lower: &[&str]) {
         let gap = (s.ofv_contribution - obj).abs();
         assert!(gap.is_finite(), "subject {id}: {}", s.ofv_contribution);
         if lower.contains(&id.as_str()) {
-            eprintln!(
-                "subject {id}: ferx {:.10} vs NONMEM {obj:.10}",
-                s.ofv_contribution
-            );
+            eprintln!("subject {id}: ferx {:.10} vs NONMEM {obj:.10}", s.ofv_contribution);
             assert!(
                 s.ofv_contribution < obj - 1e-6,
                 "subject {id}: below NONMEM, ferx {:.10} vs {obj:.10}",
@@ -175,19 +154,11 @@ fn objective_matches_nonmem(src: &str, lower: &[&str]) {
             );
             continue;
         }
-        assert!(
-            gap < 1e-6,
-            "subject {id}: ferx {:.10} vs NONMEM {obj:.10}",
-            s.ofv_contribution
-        );
+        assert!(gap < 1e-6, "subject {id}: ferx {:.10} vs NONMEM {obj:.10}", s.ofv_contribution);
         worst = worst.max(gap);
     }
     // The total over the subjects held to equality.
-    let total: f64 = want
-        .iter()
-        .filter(|w| !lower.contains(&w.0.as_str()))
-        .map(|w| w.1)
-        .sum();
+    let total: f64 = want.iter().filter(|w| !lower.contains(&w.0.as_str())).map(|w| w.1).sum();
     let ours: f64 = result
         .subjects
         .iter()
@@ -198,8 +169,5 @@ fn objective_matches_nonmem(src: &str, lower: &[&str]) {
         "worst subject {worst:e}; ferx {ours:.10} vs NONMEM {total:.10} (OFV {:.10}); ends early {early} late {late}",
         result.ofv
     );
-    assert!(
-        (ours - total).abs() < 1e-5,
-        "ferx {ours:.10} vs NONMEM {total:.10}"
-    );
+    assert!((ours - total).abs() < 1e-5, "ferx {ours:.10} vs NONMEM {total:.10}");
 }

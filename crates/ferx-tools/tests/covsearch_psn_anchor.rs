@@ -35,11 +35,8 @@ const PSN_STEP1: &[(&str, &str, f64)] = &[
     ("V1", "WT", -698.37971),
 ];
 /// Step 2, from CL-CRCL.
-const PSN_STEP2: &[(&str, &str, f64)] = &[
-    ("CL", "WT", -709.14359),
-    ("V1", "CRCL", -703.79309),
-    ("V1", "WT", -705.13444),
-];
+const PSN_STEP2: &[(&str, &str, f64)] =
+    &[("CL", "WT", -709.14359), ("V1", "CRCL", -703.79309), ("V1", "WT", -705.13444)];
 /// Step 3, from CL-CRCL + CL-WT: nothing significant.
 const PSN_STEP3: &[(&str, &str, f64)] = &[("V1", "CRCL", -709.38002), ("V1", "WT", -710.72213)];
 /// The backward step: removing either effect costs more than 3.84.
@@ -51,11 +48,8 @@ const PSN_BACKWARD: &[(&str, &str, f64)] = &[("CL", "CRCL", -703.38740), ("CL", 
 const OFV_TOL: f64 = 0.05;
 
 fn check_step(
-    result: &ferx_tools::covsearch::CovsearchResult,
-    step: usize,
-    phase: Phase,
-    expected: &[(&str, &str, f64)],
-    selected: Option<(&str, &str)>,
+    result: &ferx_tools::covsearch::CovsearchResult, step: usize, phase: Phase,
+    expected: &[(&str, &str, f64)], selected: Option<(&str, &str)>,
 ) {
     let rows: Vec<_> = result.step_rows(step).collect();
     assert_eq!(rows.len(), expected.len(), "step {step}: {rows:#?}");
@@ -70,11 +64,7 @@ fn check_step(
             (got - ofv).abs() < OFV_TOL,
             "step {step} {parameter}-{covariate}: ferx OFV {got} vs NONMEM {ofv}"
         );
-        assert!(
-            row.passed,
-            "step {step} {parameter}-{covariate}: {:?}",
-            row.failures
-        );
+        assert!(row.passed, "step {step} {parameter}-{covariate}: {:?}", row.failures);
         assert_eq!(row.converged, Some(true));
         assert_eq!(row.lrt.unwrap().df, 1);
         assert_eq!(
@@ -99,10 +89,7 @@ fn ferx_covsearch_walks_psn_scms_trajectory() {
     let result = run_covsearch(
         &config,
         &base,
-        CovsearchRun {
-            dir: Some(out.path().to_path_buf()),
-            ..CovsearchRun::default()
-        },
+        CovsearchRun { dir: Some(out.path().to_path_buf()), ..CovsearchRun::default() },
     )
     .expect("search");
 
@@ -124,20 +111,11 @@ fn ferx_covsearch_walks_psn_scms_trajectory() {
     let included: Vec<(String, String, &str)> = result
         .included
         .iter()
-        .map(|i| {
-            (
-                i.effect.parameter.clone(),
-                i.effect.covariate.clone(),
-                i.effect.form_label(),
-            )
-        })
+        .map(|i| (i.effect.parameter.clone(), i.effect.covariate.clone(), i.effect.form_label()))
         .collect();
     assert_eq!(
         included,
-        vec![
-            ("CL".into(), "CRCL".into(), "power"),
-            ("CL".into(), "WT".into(), "power")
-        ]
+        vec![("CL".into(), "CRCL".into(), "power"), ("CL".into(), "WT".into(), "power")]
     );
     assert_eq!(result.final_step, 2);
     assert!((result.final_ofv - -709.14359).abs() < OFV_TOL);

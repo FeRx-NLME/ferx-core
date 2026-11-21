@@ -120,21 +120,14 @@ fn an_evaluation_only_fit_is_not_moved_by_rail_completion() {
     let names = coordinate_names(&model.default_params);
     let start = pack_params(&model.default_params);
     let ovr = packed_of(&names, &start, "ETA_CL_MIX2");
-    assert!(
-        (ovr - (-4.8)).abs() < 1e-9,
-        "fixture premise: override starts in the band, got {ovr}"
-    );
+    assert!((ovr - (-4.8)).abs() < 1e-9, "fixture premise: override starts in the band, got {ovr}");
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert_eq!(
         bits(r.packed_estimate.as_deref().expect("packed estimate")),
         bits(&start),
         "an evaluation-only fit reports its start"
     );
-    assert!(
-        r.warnings.iter().all(|w| !w.contains("guard")),
-        "{:?}",
-        r.warnings
-    );
+    assert!(r.warnings.iter().all(|w| !w.contains("guard")), "{:?}", r.warnings);
 }
 
 fn packed_of(names: &[String], packed: &[f64], name: &str) -> f64 {
@@ -143,11 +136,8 @@ fn packed_of(names: &[String], packed: &[f64], name: &str) -> f64 {
 }
 
 fn rail_warning(r: &FitResult) -> &str {
-    let w: Vec<&String> = r
-        .warnings
-        .iter()
-        .filter(|w| w.contains("resumed from just above the guard"))
-        .collect();
+    let w: Vec<&String> =
+        r.warnings.iter().filter(|w| w.contains("resumed from just above the guard")).collect();
     assert_eq!(w.len(), 1, "one rail-completion warning: {:?}", r.warnings);
     w[0]
 }
@@ -155,28 +145,19 @@ fn rail_warning(r: &FitResult) -> &str {
 /// T4. The class-2 override is resumed from just above the guard and ends on it, at an OFV within
 /// the measured bound of the reference optimum; the warning names it with its class.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_mixture_override_stopped_short_of_the_guard_is_resumed_onto_it() {
     let (r, names, packed) = fit_mixture(false);
     assert!(r.ofv.is_finite(), "{}", r.ofv);
     let ovr = packed_of(&names, &packed, "ETA_CL_MIX2");
-    assert!(
-        (ovr - OMEGA_GUARD).abs() <= 1e-12,
-        "override packed {ovr}, not on the guard"
-    );
+    assert!((ovr - OMEGA_GUARD).abs() <= 1e-12, "override packed {ovr}, not on the guard");
     // OFV bound: see the measurement note on `OFV_BOUND_OVERRIDE`.
     assert!(r.ofv <= OFV_BOUND_OVERRIDE, "OFV {:.9}", r.ofv);
     assert!(r.converged);
     assert!(r.status() == FitStatus::Converged, "{:?}", r.status());
     let w = rail_warning(&r);
     assert!(w.contains("the random effect ETA_CL_MIX2 ("), "{w}");
-    assert!(
-        !w.contains("ETA_CL ("),
-        "the bare base name points at the base: {w}"
-    );
+    assert!(!w.contains("ETA_CL ("), "the bare base name points at the base: {w}");
     // Now on the guard, the override is held as #2831 holds it: listed by its own name and
     // class, under the base η's family and index. Before rail completion it was not on the
     // guard, so not collapsed, so not listed at all.
@@ -197,26 +178,18 @@ fn a_mixture_override_stopped_short_of_the_guard_is_resumed_onto_it() {
 /// T5. Labels swapped: the base ω collapses instead, is resumed onto the guard and held;
 /// the warning names `ETA_CL`, never the override.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_base_omega_stopped_short_of_the_guard_is_resumed_onto_it_and_held() {
     let (r, names, packed) = fit_mixture(true);
     assert!(r.ofv.is_finite(), "{}", r.ofv);
     let base = packed_of(&names, &packed, "ETA_CL");
-    assert!(
-        (base - OMEGA_GUARD).abs() <= 1e-12,
-        "base ω packed {base}, not on the guard"
-    );
+    assert!((base - OMEGA_GUARD).abs() <= 1e-12, "base ω packed {base}, not on the guard");
     assert!(r.ofv <= OFV_BOUND_BASE, "OFV {:.9}", r.ofv);
     assert!(r.converged);
     assert!(
-        r.held_at_bound
-            .iter()
-            .any(|h| h.kind == ParameterKind::Omega
-                && h.index == 0
-                && h.reason == HeldReason::CollapsedAtGuard),
+        r.held_at_bound.iter().any(|h| h.kind == ParameterKind::Omega
+            && h.index == 0
+            && h.reason == HeldReason::CollapsedAtGuard),
         "{:?}",
         r.held_at_bound
     );

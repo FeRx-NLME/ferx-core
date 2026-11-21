@@ -55,10 +55,7 @@ fn tests_dir() -> PathBuf {
 /// Add a test here only with its measured CI time. A NONMEM anchor that runs real fits
 /// (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
 const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 6] = [
-    (
-        "tad_lag_nonmem_anchor",
-        "tad_lag_single_dose_matches_nonmem",
-    ),
+    ("tad_lag_nonmem_anchor", "tad_lag_single_dose_matches_nonmem"),
     ("tad_lag_nonmem_anchor", "tad_lag_two_dose_matches_nonmem"),
     (
         "tvcov_lag_saltation_nonmem_anchor",
@@ -72,19 +69,13 @@ const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 6] = [
         "tvcov_lag_saltation_nonmem_anchor",
         "a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction",
     ),
-    (
-        "absorption_iov_carryover_nonmem_anchor",
-        "ipred_at_nonmem_ebes_matches_nonmem",
-    ),
+    ("absorption_iov_carryover_nonmem_anchor", "ipred_at_nonmem_ebes_matches_nonmem"),
 ];
 
 /// Source with `//` lines removed: a file that *describes* a cfg does not compile one.
 /// Same shape as `uses_gated_feature_cfg` in `tests/ci_workflow_endpoint_coverage.rs`.
 fn code_lines(src: &str) -> String {
-    src.lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
 }
 
 /// Does this source compile a `slow-tests` cfg anywhere?
@@ -102,10 +93,7 @@ fn attribute_blocks_of(src: &str, suffix: &str) -> Vec<(String, String)> {
         let Some(rest) = line.strip_prefix("fn ") else {
             continue;
         };
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
+        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
         if !name.ends_with(suffix) {
             continue;
         }
@@ -154,10 +142,7 @@ fn adaptive_anchors_compile_no_slow_tests_gate() {
         "expected at least 8 tests/adaptive_*_anchor.rs, found {}: {files:?}",
         files.len()
     );
-    let gated: Vec<_> = files
-        .iter()
-        .filter(|p| uses_slow_tests_cfg(&read(p)))
-        .collect();
+    let gated: Vec<_> = files.iter().filter(|p| uses_slow_tests_cfg(&read(p))).collect();
     assert!(
         gated.is_empty(),
         "adaptive mrgsolve anchors are one deterministic run against a frozen table and \

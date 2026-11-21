@@ -91,10 +91,7 @@ fn nm_phi(arm: &str) -> HashMap<String, [f64; 3]> {
         .filter(|r| r.len() == header.len() && r[0] != "SUBJECT_NO")
         .map(|r| {
             let id: f64 = r[id_col].parse().expect("ID");
-            (
-                format!("{}", id as i64),
-                eta_cols.map(|c| r[c].parse().expect("ETA")),
-            )
+            (format!("{}", id as i64), eta_cols.map(|c| r[c].parse().expect("ETA")))
         })
         .collect()
 }
@@ -133,17 +130,9 @@ fn assert_arm_matches_nonmem(arm: &str, data: &str) {
     let cells = [
         ("iov_column", IovOccasionRule::Column, true),
         ("dose over iov_column", IovOccasionRule::PerDose, true),
-        (
-            "time(12) over iov_column",
-            IovOccasionRule::TimeWindows(vec![12.0]),
-            true,
-        ),
+        ("time(12) over iov_column", IovOccasionRule::TimeWindows(vec![12.0]), true),
         ("dose, no column", IovOccasionRule::PerDose, false),
-        (
-            "time(12), no column",
-            IovOccasionRule::TimeWindows(vec![12.0]),
-            false,
-        ),
+        ("time(12), no column", IovOccasionRule::TimeWindows(vec![12.0]), false),
     ];
     for (cell, rule, labelled) in cells {
         let r = ferx_fit(data, rule, labelled);
@@ -154,12 +143,7 @@ fn assert_arm_matches_nonmem(arm: &str, data: &str) {
             let want = want_ebe
                 .get(&s.id)
                 .unwrap_or_else(|| panic!("arm {arm}: no .phi row for subject {}", s.id));
-            assert_eq!(
-                kappas.len(),
-                2,
-                "arm {arm}, {cell}: subject {} occasions",
-                s.id
-            );
+            assert_eq!(kappas.len(), 2, "arm {arm}, {cell}: subject {} occasions", s.id);
             let got = [s.eta[0], kappas[0][0], kappas[1][0]];
             for (g, w) in got.iter().zip(want) {
                 assert!(g.is_finite(), "arm {arm}, {cell}: subject {} EBE {g}", s.id);

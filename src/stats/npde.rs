@@ -156,12 +156,8 @@ pub struct SubjectNpde {
 /// labels as given. [`compute_npde_npd_diag`] also reports the subjects left
 /// without a label.
 pub fn compute_npde_npd(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    nsim: usize,
-    seed: Option<u64>,
-    iov_occasion: Option<&IovOccasionRule>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, nsim: usize,
+    seed: Option<u64>, iov_occasion: Option<&IovOccasionRule>,
 ) -> Result<Vec<SubjectNpde>, crate::diagnostics::EngineError> {
     compute_npde_npd_diag(model, population, params, nsim, seed, iov_occasion)
         .map(|(scores, _warnings)| scores)
@@ -182,12 +178,8 @@ pub fn compute_npde_npd(
 ///
 /// As [`compute_npde_npd`].
 pub fn compute_npde_npd_diag(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    nsim: usize,
-    seed: Option<u64>,
-    iov_occasion: Option<&IovOccasionRule>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, nsim: usize,
+    seed: Option<u64>, iov_occasion: Option<&IovOccasionRule>,
 ) -> Result<(Vec<SubjectNpde>, Vec<String>), crate::diagnostics::EngineError> {
     // A model-side occasion rule's labels first (#1980), so the checks and the κ draw
     // below see them: `fit()` derives them on its own copy (`fitted_population`), and a
@@ -204,16 +196,16 @@ pub fn compute_npde_npd_diag(
     )
     .into_iter()
     .collect();
-    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_covariate_levels(
+        model, population,
+    ))?;
     // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
     // record with none is refused as `simulate()` refuses it (review r1 #1), and a
     // derived occasion rule, which would regroup the levels, as `fit()` refuses it.
-    crate::diagnostics::first_error(&crate::api::check_level_labels(model, population))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_level_labels(model, population))?;
     if let Some(levels) = model.nested_levels() {
         if iov_occasion.is_some_and(|r| *r != IovOccasionRule::Column) {
-            return Err(crate::api::level_mixed_with_iov_rule(
-                &levels.levels[0].name,
-            ));
+            return Err(crate::entry_refusals::level_mixed_with_iov_rule(&levels.levels[0].name));
         }
     }
     // An unbound level block gathers `NaN` on every record (#1763); before the θ length,
@@ -225,11 +217,8 @@ pub fn compute_npde_npd_diag(
     // …and Ω / σ / Ω_IOV (#1764): a mis-sized block panicked in the draw. An absent
     // Ω_IOV is not checked: it falls back to κ = 0, as documented above.
     let [omega, sigma, omega_iov] = crate::api::ParamBlock::all_of(params);
-    let blocks = if params.omega_iov.is_some() {
-        vec![omega, sigma, omega_iov]
-    } else {
-        vec![omega, sigma]
-    };
+    let blocks =
+        if params.omega_iov.is_some() { vec![omega, sigma, omega_iov] } else { vec![omega, sigma] };
     crate::api::check_param_shape(model, &blocks)?;
     if let Some(omega_iov) = &params.omega_iov {
         crate::stats::nested_levels::check_cross_level_omega_iov(model, &omega_iov.matrix)?;
@@ -237,10 +226,10 @@ pub fn compute_npde_npd_diag(
     // A bound level block on a population never bound for it gathers `NaN` on every
     // record, and every npd came back `NaN` with `Ok` (#1647); one bound for other levels
     // read the wrong level's θ (#1762).
-    crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+    crate::diagnostics::first_error(&crate::model_checks::check_level_index_columns(
         model,
         population,
-        crate::api::LevelDataEntry::Run,
+        crate::model_checks::LevelDataEntry::Run,
     ))?;
     // A covariate the data lacks reads as 0.0 in the simulated reference (#1763).
     crate::diagnostics::first_error(&crate::api::check_covariates(model, population))?;
@@ -269,7 +258,7 @@ pub fn compute_npde_npd_diag(
     // each replicate first draws the subject's class, keyed off `base_seed` (#2163), so the
     // reference is the fitted mixture's predictive distribution rather than class 1's.
     let classes = crate::api::SimClasses::new(model, params, base_seed)?;
-    let scores = crate::api::install_on_engine_pool(|| {
+    let scores = crate::pool::install_on_engine_pool(|| {
         crate::par::map(population.subjects.len(), |i| {
             let subject = &population.subjects[i];
             let mut rng =
@@ -307,14 +296,12 @@ pub fn compute_npde_npd_diag(
             // level, as `simulate()` draws it: both go through `KappaDraw`, built
             // per subject before the parallel walk so a nested subject without its
             // cells is an `Err` (review r1 #1 on #1082 PR4).
-            let iov: Option<(
-                &crate::types::OmegaMatrix,
-                &crate::stats::nested_levels::KappaDraw,
-            )> = params
-                .omega_iov
-                .as_ref()
-                .filter(|_| model.n_kappa > 0)
-                .map(|om| (om, &kappa_draws[i]));
+            let iov: Option<(&crate::types::OmegaMatrix, &crate::stats::nested_levels::KappaDraw)> =
+                params
+                    .omega_iov
+                    .as_ref()
+                    .filter(|_| model.n_kappa > 0)
+                    .map(|om| (om, &kappa_draws[i]));
             let kappa_factor =
                 iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
             // #1928: this loop draws its own η rather than going through
@@ -350,9 +337,8 @@ pub fn compute_npde_npd_diag(
                 // extra randoms, so their sims are byte-identical.
                 let ipreds = match &iov {
                     Some((_, kappa_draw)) => {
-                        let kappa_factor = kappa_factor
-                            .as_ref()
-                            .expect("kappa_factor is Some whenever iov is");
+                        let kappa_factor =
+                            kappa_factor.as_ref().expect("kappa_factor is Some whenever iov is");
                         let kappas = kappa_draw.draw(kappa_factor, normal, &mut rng);
                         crate::pk::predict_iov(
                             model,
@@ -413,28 +399,12 @@ pub fn compute_npde_npd_diag(
                 }
             }
 
-            let npd = npd_scores(
-                &subject.observations,
-                &subject.cens,
-                &sims,
-                model.bloq_in_force(),
-            );
-            let Decorrelated { npde, pwres } = npde_scores(
-                &subject.observations,
-                &subject.cens,
-                &sims,
-                model.bloq_in_force(),
-            );
+            let npd =
+                npd_scores(&subject.observations, &subject.cens, &sims, model.bloq_in_force());
+            let Decorrelated { npde, pwres } =
+                npde_scores(&subject.observations, &subject.cens, &sims, model.bloq_in_force());
             let epred = epred(&sims);
-            (
-                SubjectNpde {
-                    npd,
-                    npde,
-                    epred,
-                    pwres,
-                },
-                flip_flop,
-            )
+            (SubjectNpde { npd, npde, epred, pwres }, flip_flop)
         })
     });
     let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
@@ -455,10 +425,7 @@ pub fn compute_npde_npd_diag(
 /// yield `NaN`. Under `drop` a flagged row was fitted as an ordinary observation
 /// and is scored like one (#1499).
 fn npd_scores(
-    observed: &[f64],
-    cens: &[i8],
-    sims: &DMatrix<f64>,
-    bloq_method: BloqMethod,
+    observed: &[f64], cens: &[i8], sims: &DMatrix<f64>, bloq_method: BloqMethod,
 ) -> Vec<f64> {
     (0..observed.len())
         .map(|j| {
@@ -484,10 +451,7 @@ struct Decorrelated {
 
 impl Decorrelated {
     fn nan(n: usize) -> Self {
-        Self {
-            npde: vec![f64::NAN; n],
-            pwres: vec![f64::NAN; n],
-        }
+        Self { npde: vec![f64::NAN; n], pwres: vec![f64::NAN; n] }
     }
 }
 
@@ -529,10 +493,7 @@ fn epred(sims: &DMatrix<f64>) -> Vec<f64> {
 /// Under `bloq_method = drop` a `CENS != 0` row is not censored for the fit, so it
 /// neither loses its own score nor voids the subject's (#1499).
 fn npde_scores(
-    observed: &[f64],
-    cens: &[i8],
-    sims: &DMatrix<f64>,
-    bloq_method: BloqMethod,
+    observed: &[f64], cens: &[i8], sims: &DMatrix<f64>, bloq_method: BloqMethod,
 ) -> Decorrelated {
     let n = observed.len();
     let k = sims.ncols();
@@ -568,11 +529,7 @@ fn npde_scores(
         Some(c) => Some(c),
         None => {
             let mean_diag = (0..n).map(|j| cov[(j, j)]).sum::<f64>() / n as f64;
-            let jitter = if mean_diag > 0.0 {
-                mean_diag * 1e-6
-            } else {
-                1e-12
-            };
+            let jitter = if mean_diag > 0.0 { mean_diag * 1e-6 } else { 1e-12 };
             for j in 0..n {
                 cov[(j, j)] += jitter;
             }
@@ -597,9 +554,7 @@ fn npde_scores(
         DMatrix::from_iterator(n, 1, observed.iter().zip(mean.iter()).map(|(y, m)| y - m));
     let obs_d = solve(&obs_centered);
 
-    let npde = (0..n)
-        .map(|j| empirical_score(obs_d[j], sims_d.row(j).iter().copied()))
-        .collect();
+    let npde = (0..n).map(|j| empirical_score(obs_d[j], sims_d.row(j).iter().copied())).collect();
     let pwres = symmetric_whiten(cov, &obs_centered);
     Decorrelated { npde, pwres }
 }
@@ -687,9 +642,7 @@ mod tests {
             CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
             [covariates]\n  GRP categorical(levels = [1, 2, 3])\n[covariate_model]\n  \
             CL ~ GRP categorical(ref = 2)\n[error_model]\n  DV ~ proportional(PROP)\n";
-        let model = crate::parser::model_parser::parse_full_model(text)
-            .expect("parse")
-            .model;
+        let model = crate::parser::model_parser::parse_full_model(text).expect("parse").model;
         let pop = |grp: [f64; 3]| Population {
             subjects: grp
                 .iter()
@@ -713,31 +666,14 @@ mod tests {
         };
         let params = model.default_params.clone();
 
-        let ok = compute_npde_npd(
-            &model,
-            &pop([1.0, 2.0, 2.0]),
-            &params,
-            200,
-            Some(1740),
-            None,
-        )
-        .expect("listed levels only");
+        let ok = compute_npde_npd(&model, &pop([1.0, 2.0, 2.0]), &params, 200, Some(1740), None)
+            .expect("listed levels only");
         assert_eq!(ok.len(), 3);
         assert!(ok.iter().all(|s| s.npd.iter().all(|v| v.is_finite())));
 
-        let e = compute_npde_npd(
-            &model,
-            &pop([1.0, 2.0, 4.0]),
-            &params,
-            200,
-            Some(1740),
-            None,
-        )
-        .expect_err("an unlisted level must be refused");
-        assert!(
-            e.to_string().contains("`GRP` takes [4.0] in this data"),
-            "{e}"
-        );
+        let e = compute_npde_npd(&model, &pop([1.0, 2.0, 4.0]), &params, 200, Some(1740), None)
+            .expect_err("an unlisted level must be refused");
+        assert!(e.to_string().contains("`GRP` takes [4.0] in this data"), "{e}");
         // #1746: the refusal carries `ferx check`'s code.
         assert_eq!(e.code(), Some("E_COV_LEVEL_UNKNOWN"), "{e}");
     }
@@ -767,10 +703,7 @@ mod tests {
             compute_npde_npd(&model, &population, &params, 1000, Some(506), None).expect("npde");
         assert_eq!(out.len(), 1);
         for (j, &npd) in out[0].npd.iter().enumerate() {
-            assert!(
-                npd.abs() < 0.25,
-                "row {j}: NPD={npd} not ≈0 — TV covariate snapshot ignored?"
-            );
+            assert!(npd.abs() < 0.25, "row {j}: NPD={npd} not ≈0 — TV covariate snapshot ignored?");
         }
     }
 
@@ -821,11 +754,7 @@ mod tests {
     #[test]
     fn npd_scores_blank_a_censored_row_only_under_m3() {
         // Two observations, second flagged.
-        let sims = sims_matrix(
-            &(0..=100)
-                .map(|v| vec![v as f64, v as f64])
-                .collect::<Vec<_>>(),
-        );
+        let sims = sims_matrix(&(0..=100).map(|v| vec![v as f64, v as f64]).collect::<Vec<_>>());
         let m3 = npd_scores(&[50.0, 50.0], &[0, 1], &sims, BloqMethod::M3);
         assert!(m3[0].is_finite());
         assert!(m3[1].is_nan(), "M3 must blank the flagged row");
@@ -1070,10 +999,7 @@ mod tests {
     fn npde_reference_spread_includes_occasion_kappa() {
         let (model, population) = iov_npde_model_and_population();
         let params = model.default_params.clone();
-        assert!(
-            params.omega_iov.is_some(),
-            "fixture must carry a fitted Ω_IOV"
-        );
+        assert!(params.omega_iov.is_some(), "fixture must carry a fitted Ω_IOV");
         let nsim = 20_000;
         let seed = Some(734);
 
@@ -1188,15 +1114,9 @@ mod tests {
         let (model, mut population) = iov_npde_model_and_population();
         population.subjects[0].occasions.clear();
         population.subjects[0].dose_occasions.clear();
-        let out = compute_npde_npd(
-            &model,
-            &population,
-            &model.default_params,
-            20_000,
-            Some(734),
-            None,
-        )
-        .expect("npde");
+        let out =
+            compute_npde_npd(&model, &population, &model.default_params, 20_000, Some(734), None)
+                .expect("npde");
         let sd = implied_reference_sd(&out);
         assert!(
             (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,

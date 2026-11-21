@@ -54,12 +54,8 @@ fn adapt_scale(scale: &mut f64, accepted: usize, proposed: usize, target: f64) {
 /// `warm_kappas[i]` is its per-occasion kappa EBEs (empty inner vec for
 /// non-IOV models). Both must have length `n_subjects`.
 pub fn run_conditional_distribution(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    warm_etas: &[DVector<f64>],
-    warm_kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    warm_etas: &[DVector<f64>], warm_kappas: &[Vec<DVector<f64>>], options: &FitOptions,
 ) -> CondDist {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -92,9 +88,8 @@ pub fn run_conditional_distribution(
 
     // Per-coordinate componentwise proposal SDs (√marginal variance), shared
     // across subjects and floored to match the Ω diagonal floor.
-    let cw_sd: Vec<f64> = (0..n_eta)
-        .map(|j| omega.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt())
-        .collect();
+    let cw_sd: Vec<f64> =
+        (0..n_eta).map(|j| omega.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt()).collect();
 
     /// One subject's accumulated conditional distribution.
     struct SubjResult {
@@ -103,10 +98,8 @@ pub fn run_conditional_distribution(
         samples: Vec<Vec<f64>>,
     }
 
-    let results: Vec<SubjResult> = crate::par::map_init(
-        population.subjects.len(),
-        MhScratch::default,
-        |mh_scratch, i| {
+    let results: Vec<SubjResult> =
+        crate::par::map_init(population.subjects.len(), MhScratch::default, |mh_scratch, i| {
             let subject = &population.subjects[i];
             let mut rng = StdRng::seed_from_u64(crate::rng::stream_seed(
                 master_seed,
@@ -123,10 +116,7 @@ pub fn run_conditional_distribution(
             // Warm-start the chain at the EBE mode.
             let mut eta: Vec<f64> = warm_etas[i].iter().copied().collect();
             let mut kappas: Vec<Vec<f64>> = if n_kappa > 0 {
-                warm_kappas[i]
-                    .iter()
-                    .map(|k| k.iter().copied().collect())
-                    .collect()
+                warm_kappas[i].iter().map(|k| k.iter().copied().collect()).collect()
             } else {
                 Vec::new()
             };
@@ -161,11 +151,8 @@ pub fn run_conditional_distribution(
             let mut mean = vec![0.0_f64; n_eta];
             let mut m2 = vec![0.0_f64; n_eta];
             let mut count = 0_usize;
-            let mut samples: Vec<Vec<f64>> = if keep {
-                Vec::with_capacity(nsamp)
-            } else {
-                Vec::new()
-            };
+            let mut samples: Vec<Vec<f64>> =
+                if keep { Vec::with_capacity(nsamp) } else { Vec::new() };
 
             // Acceptance counters within the current adaptation window. The
             // componentwise kernel tracks per-eta acceptance (each eta adapts
@@ -297,18 +284,11 @@ pub fn run_conditional_distribution(
             }
 
             let sd: Vec<f64> = (0..n_eta)
-                .map(|j| {
-                    if count > 1 {
-                        (m2[j] / (count - 1) as f64).sqrt()
-                    } else {
-                        0.0
-                    }
-                })
+                .map(|j| if count > 1 { (m2[j] / (count - 1) as f64).sqrt() } else { 0.0 })
                 .collect();
 
             SubjResult { mean, sd, samples }
-        },
-    );
+        });
 
     let cond_mean: Vec<Vec<f64>> = results.iter().map(|r| r.mean.clone()).collect();
     let cond_sd: Vec<Vec<f64>> = results.iter().map(|r| r.sd.clone()).collect();
@@ -334,14 +314,7 @@ pub fn run_conditional_distribution(
         })
         .collect();
 
-    CondDist {
-        cond_mean,
-        cond_sd,
-        samples,
-        shrinkage,
-        nsamp,
-        burnin,
-    }
+    CondDist { cond_mean, cond_sd, samples, shrinkage, nsamp, burnin }
 }
 
 #[cfg(test)]
@@ -349,38 +322,16 @@ mod tests {
     use super::*;
     use crate::types::test_helpers::analytical_model;
     use crate::types::{DoseEvent, GradientMethod};
-    use std::collections::HashMap;
 
     fn one_subject() -> Subject {
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 4.0, 8.0],
-            obs_raw_times: Vec::new(),
             observations: vec![5.0, 3.0, 1.5],
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 
@@ -529,10 +480,7 @@ mod tests {
             &warm_kappas,
             &opts,
         );
-        assert!(
-            cd.samples[0].is_empty(),
-            "samples retained despite keep=false"
-        );
+        assert!(cd.samples[0].is_empty(), "samples retained despite keep=false");
 
         opts.saem_conddist_keep_samples = true;
         let cd2 = run_conditional_distribution(

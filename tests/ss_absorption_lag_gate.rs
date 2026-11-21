@@ -105,13 +105,8 @@ fn ss_into_absorption_not_blocked_by_lag_on_other_compartment() {
     // doses. The SS dose targets the unlagged CMT=1 absorption compartment and must be
     // accepted — `model.has_lagtime()` is true model-wide, but `has_lagtime_on_cmt(1)`
     // must be false.
-    let model = parse_full_model(TWO_ROUTE_MODEL)
-        .expect("model parses")
-        .model;
-    assert!(
-        model.has_lagtime(),
-        "sanity: model must declare a lag somewhere (ALAG2)"
-    );
+    let model = parse_full_model(TWO_ROUTE_MODEL).expect("model parses").model;
+    assert!(model.has_lagtime(), "sanity: model must declare a lag somewhere (ALAG2)");
     let pop = ss_pop(1);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -160,11 +155,7 @@ fn ss_into_a_lone_zero_order_window_is_accepted_with_either_lag_spelling() {
     for (label, src) in [("route lag", ZERO_ORDER_ONLY), ("ALAG1", alag.as_str())] {
         let model = parse_full_model(src).expect("parses").model;
         let diags = check_model_data(&model, &ss_pop(1));
-        assert!(
-            no_ss_absorption_refusal(&diags),
-            "{label}: {:?}",
-            codes(&diags)
-        );
+        assert!(no_ss_absorption_refusal(&diags), "{label}: {:?}", codes(&diags));
     }
 }
 
@@ -205,11 +196,7 @@ fn ss_into_a_mixed_zero_order_compartment_names_the_mixed_model() {
         .unwrap_or_else(|| panic!("mixed SS must be refused, got {:?}", codes(&diags)));
     assert!(d.message.contains("mixed"), "{}", d.message);
     assert!(!d.message.contains("per-route"), "{}", d.message);
-    assert!(
-        !codes(&diags).contains(&"E_ABSORPTION_SS_ZERO_ORDER_LAG"),
-        "{:?}",
-        codes(&diags)
-    );
+    assert!(!codes(&diags).contains(&"E_ABSORPTION_SS_ZERO_ORDER_LAG"), "{:?}", codes(&diags));
 }
 
 /// A lone zero-order compartment with a per-route `lag=` AND its own `ALAG1`: the two lags add
@@ -223,17 +210,9 @@ fn ss_into_a_zero_order_compartment_with_two_lags_names_the_lags() {
         .iter()
         .find(|d| d.code == "E_ABSORPTION_SS_ZERO_ORDER_LAG")
         .unwrap_or_else(|| panic!("two lags must be refused, got {:?}", codes(&diags)));
-    assert!(
-        d.message.contains("per-route") && d.message.contains("ALAG"),
-        "{}",
-        d.message
-    );
+    assert!(d.message.contains("per-route") && d.message.contains("ALAG"), "{}", d.message);
     assert!(!d.message.contains("mixed"), "{}", d.message);
-    assert!(
-        !codes(&diags).contains(&"E_ABSORPTION_SS_ZERO_ORDER_MIXED"),
-        "{:?}",
-        codes(&diags)
-    );
+    assert!(!codes(&diags).contains(&"E_ABSORPTION_SS_ZERO_ORDER_MIXED"), "{:?}", codes(&diags));
     // The same model without the SS dose is fine: the refusal is the SS combination's.
     let mut plain = ss_pop(1);
     plain.subjects[0].doses[0].ss = false;

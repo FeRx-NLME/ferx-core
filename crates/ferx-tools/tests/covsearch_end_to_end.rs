@@ -94,25 +94,18 @@ fn a_single_point_space_returns_the_base_fit_bit_for_bit() {
     let config = SearchConfig::load(&path).unwrap();
     let base = config.load_base().unwrap();
 
-    let direct = fit(
-        &base.prepared.parsed.model,
-        &base.prepared.population,
-        &base.prepared.init_params,
-        &{
+    let direct =
+        fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &{
             let mut o = base.prepared.parsed.fit_options.clone().quiet();
             o.threads = Some(2);
             o
-        },
-    )
-    .expect("direct evaluation");
+        })
+        .expect("direct evaluation");
 
     let result = run_covsearch(
         &config,
         &base,
-        CovsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..CovsearchRun::default()
-        },
+        CovsearchRun { dir: Some(dir.path().join("run")), ..CovsearchRun::default() },
     )
     .expect("search");
 
@@ -182,10 +175,7 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
             _ => None,
         })
         .collect();
-    let forward: Vec<_> = finished
-        .iter()
-        .filter(|(_, c)| c.step == "forward-1")
-        .collect();
+    let forward: Vec<_> = finished.iter().filter(|(_, c)| c.step == "forward-1").collect();
     assert_eq!(forward.len(), 8, "{finished:?}");
     assert_eq!(
         finished.iter().filter(|(_, c)| c.step == "base").count(),
@@ -198,12 +188,7 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
             .step_rows(1)
             .find(|r| r.candidate == c.id)
             .unwrap_or_else(|| panic!("no row for {}", c.id));
-        assert_eq!(
-            c.ofv.map(f64::to_bits),
-            row.ofv.map(f64::to_bits),
-            "{}",
-            c.id
-        );
+        assert_eq!(c.ofv.map(f64::to_bits), row.ofv.map(f64::to_bits), "{}", c.id);
         assert_eq!(c.passed, row.passed, "{c:?}");
         assert!(c.failed_gate.is_none(), "{c:?}");
         assert!(!c.description.is_empty(), "{c:?}");
@@ -216,20 +201,13 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
     assert_eq!(rows.len(), 8);
     assert_eq!(result.n_steps(), 1);
     assert_eq!(result.final_step, 0);
-    assert!(rows
-        .iter()
-        .all(|r| r.phase == Phase::Forward && !r.selected));
+    assert!(rows.iter().all(|r| r.phase == Phase::Forward && !r.selected));
     for r in &rows {
         let ofv = r.ofv.expect("every candidate compiled and evaluated");
         assert!(ofv.is_finite());
         // The relation reached the engine: a θ of 0.001 on a centred factor
         // moves the objective, if only slightly.
-        assert_ne!(
-            ofv.to_bits(),
-            result.base_ofv.to_bits(),
-            "{}",
-            r.effect.label()
-        );
+        assert_ne!(ofv.to_bits(), result.base_ofv.to_bits(), "{}", r.effect.label());
         let t = r.lrt.expect("a comparison was made");
         assert_eq!(t.df, 1, "{}", r.effect.label());
         assert!(!t.significant);
@@ -244,10 +222,7 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
     assert_eq!(steps.lines().count(), 9);
     assert!(steps.contains("f1-CL-WT-power"));
     assert!(dir.path().join("run/forward-1/candidates.csv").exists());
-    assert!(dir
-        .path()
-        .join("run/forward-1/search_journal.jsonl")
-        .exists());
+    assert!(dir.path().join("run/forward-1/search_journal.jsonl").exists());
 }
 
 /// `data/two_cpt_oral_cov.csv` with every dose coded `RATE=-2`, so its infusion
@@ -283,10 +258,7 @@ fn a_backward_step_removes_a_relation_and_refits_a_model_with_a_modeled_duration
             "  theta TVKA(1.0, 0.01, 10.0)\n",
             "  theta TVKA(1.0, 0.01, 10.0)\n  theta TVD1(0.5, 0.01, 10.0)\n",
         )
-        .replace(
-            "  omega ETA_V1 ~ 0.15\n",
-            "  omega ETA_V1 ~ 0.15\n  omega ETA_D1 ~ 0.1\n",
-        )
+        .replace("  omega ETA_V1 ~ 0.15\n", "  omega ETA_V1 ~ 0.15\n  omega ETA_D1 ~ 0.1\n")
         .replace("  KA = TVKA\n", "  KA = TVKA\n  D1 = TVD1 * exp(ETA_D1)\n");
     std::fs::write(dir.path().join("base.ferx"), &model).unwrap();
     let data = write_modeled_duration_data(dir.path());
@@ -309,42 +281,23 @@ fn a_backward_step_removes_a_relation_and_refits_a_model_with_a_modeled_duration
     let result = run_covsearch(
         &config,
         &base,
-        CovsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..CovsearchRun::default()
-        },
+        CovsearchRun { dir: Some(dir.path().join("run")), ..CovsearchRun::default() },
     )
     .expect("search");
 
-    let backward: Vec<_> = result
-        .steps
-        .iter()
-        .filter(|r| r.phase == Phase::Backward)
-        .collect();
+    let backward: Vec<_> = result.steps.iter().filter(|r| r.phase == Phase::Backward).collect();
     assert!(!backward.is_empty(), "{:?}", result.steps);
     for r in &backward {
-        assert!(
-            r.passed && r.lrt.is_some(),
-            "{} was not refitted: {:?}",
-            r.candidate,
-            r.failures
-        );
+        assert!(r.passed && r.lrt.is_some(), "{} was not refitted: {:?}", r.candidate, r.failures);
         assert!(r.ofv.expect("a refit").is_finite());
     }
     assert!(backward.iter().any(|r| r.selected), "{backward:?}");
-    assert!(
-        result.backward_incomplete.is_none(),
-        "{:?}",
-        result.backward_incomplete
-    );
+    assert!(result.backward_incomplete.is_none(), "{:?}", result.backward_incomplete);
     assert!(result.included.is_empty(), "{:?}", result.included);
 
     // Every removal was taken, and the modeled duration came through them all.
     let final_model = result.final_model.render();
-    assert!(
-        final_model.contains("D1 = TVD1 * exp(ETA_D1)"),
-        "{final_model}"
-    );
+    assert!(final_model.contains("D1 = TVD1 * exp(ETA_D1)"), "{final_model}");
     assert!(final_model.contains("theta TVD1("), "{final_model}");
     assert!(final_model.contains("omega ETA_D1"), "{final_model}");
 }
@@ -372,11 +325,7 @@ fn allometry_scales_clearances_and_volumes_and_fits_both_models() {
     )
     .expect("allometry");
 
-    let scaled: Vec<&str> = result
-        .scalings
-        .iter()
-        .map(|s| s.parameter.as_str())
-        .collect();
+    let scaled: Vec<&str> = result.scalings.iter().map(|s| s.parameter.as_str()).collect();
     assert_eq!(scaled, vec!["CL", "Q", "V1", "V2"]);
     let base_ofv = result.base.ofv.expect("base fit");
     let scaled_ofv = result.scaled.ofv.expect("scaled fit");
@@ -385,10 +334,7 @@ fn allometry_scales_clearances_and_volumes_and_fits_both_models() {
     assert_eq!(result.dofv(), Some(base_ofv - scaled_ofv));
     // Fixed exponents add no free parameter.
     let fit = result.scaled.fit.as_ref().unwrap();
-    assert_eq!(
-        fit.n_parameters,
-        result.base.fit.as_ref().unwrap().n_parameters
-    );
+    assert_eq!(fit.n_parameters, result.base.fit.as_ref().unwrap().n_parameters);
     let relations: Vec<(String, f64)> = fit
         .covariate_relations
         .iter()
@@ -396,12 +342,7 @@ fn allometry_scales_clearances_and_volumes_and_fits_both_models() {
         .collect();
     assert_eq!(
         relations,
-        vec![
-            ("CL".into(), 0.75),
-            ("Q".into(), 0.75),
-            ("V1".into(), 1.0),
-            ("V2".into(), 1.0)
-        ]
+        vec![("CL".into(), 0.75), ("Q".into(), 0.75), ("V1".into(), 1.0), ("V2".into(), 1.0)]
     );
     assert!(fit.covariate_relations.iter().all(|r| r.thetas[0].fixed));
     assert!(dir.path().join("allometry/candidates.csv").exists());

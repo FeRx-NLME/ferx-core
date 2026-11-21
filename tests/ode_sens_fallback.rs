@@ -93,20 +93,14 @@ fn armed_baseline_is_on_the_analytic_path() {
     // Positive control: the in-scope ODE model must be armed and serve a bolus
     // subject — otherwise the fallback assertions below would be vacuous.
     let model = parse(ARMED);
-    assert!(
-        sens_supported(&model),
-        "in-scope ODE model must be armed (#410)"
-    );
+    assert!(sens_supported(&model), "in-scope ODE model must be armed (#410)");
     assert!(
         !declines(&model, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
         "in-scope bolus subject must get analytic sensitivities"
     );
     // A plain finite infusion is in scope too.
     assert!(
-        !declines(
-            &model,
-            vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)]
-        ),
+        !declines(&model, vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)]),
         "in-scope finite-infusion subject must get analytic sensitivities"
     );
 }
@@ -248,10 +242,7 @@ fn expression_obs_scale_is_armed_on_static_walk() {
 fn ltbs_model_is_armed() {
     // LTBS (`log(DV) ~ additive`) is a smooth output transform — armed in Tier 1.
     let model = parse(ODE_LTBS);
-    assert!(
-        sens_supported(&model),
-        "LTBS ODE model must be armed (Tier 1)"
-    );
+    assert!(sens_supported(&model), "LTBS ODE model must be armed (Tier 1)");
     assert!(
         !declines(&model, vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
         "LTBS bolus subject must get analytic sensitivities"

@@ -86,11 +86,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 }
 
 fn read_fit(path: &Path) -> Result<FitResult, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
     match ext.as_str() {
         "fitrx" => ferx_core::io::fitrx::load_fit_without_population(path)
             .map(|l| l.fit)
@@ -120,9 +116,7 @@ fn read_fit(path: &Path) -> Result<FitResult, String> {
 /// `(model text, fit, default output path)` from the arguments.
 fn load(args: &Args) -> Result<(String, FitResult, std::path::PathBuf), String> {
     let first = Path::new(&args.input);
-    let is_fitrx = first
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
+    let is_fitrx = first.extension().is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
     let (text, fit) = if is_fitrx {
         if args.fit.is_some() {
             return Err("--fit is only for a model-file first argument".into());
@@ -131,18 +125,13 @@ fn load(args: &Args) -> Result<(String, FitResult, std::path::PathBuf), String> 
             .map_err(|e| format!("failed to read `{}`: {e}", first.display()))?;
         (loaded.model_source, loaded.fit)
     } else {
-        let fit_path = args
-            .fit
-            .as_deref()
-            .ok_or("a model file needs --fit <run.fitrx|run.json>")?;
+        let fit_path =
+            args.fit.as_deref().ok_or("a model file needs --fit <run.fitrx|run.json>")?;
         let text = std::fs::read_to_string(first)
             .map_err(|e| format!("cannot read the model file `{}`: {e}", first.display()))?;
         (text, read_fit(Path::new(fit_path))?)
     };
-    let stem = first
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model");
+    let stem = first.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let out = first.with_file_name(format!("{stem}-analytic.ferx"));
     Ok((text, fit, out))
 }
@@ -161,11 +150,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let out = parsed
-        .output
-        .clone()
-        .map(std::path::PathBuf::from)
-        .unwrap_or(default_out);
+    let out = parsed.output.clone().map(std::path::PathBuf::from).unwrap_or(default_out);
     let inputs = std::iter::once(&parsed.input).chain(&parsed.fit);
     if let Some(input) = inputs.map(Path::new).find(|i| same_file(i, &out)) {
         eprintln!(
@@ -241,8 +226,7 @@ fn header_of(code: &str) -> Option<String> {
 /// A `key = value` line's key, lower-cased as the `[data]` / `[priors]`
 /// readers fold it.
 fn key_of(code: &str) -> Option<String> {
-    code.split_once('=')
-        .map(|(k, _)| k.trim().to_ascii_lowercase())
+    code.split_once('=').map(|(k, _)| k.trim().to_ascii_lowercase())
 }
 
 /// The `key = value` entries of `[data]` / `[priors]` that name a file.
@@ -270,15 +254,9 @@ fn file_entries(text: &str) -> Vec<(&'static str, String)> {
 /// The directory the model's relative paths resolved against, when known: the
 /// model file's own. A `.fitrx` bundle does not record it.
 fn model_dir(input: &Path) -> Option<&Path> {
-    let bundle = input
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
-    (!bundle).then(|| {
-        input
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-    })
+    let bundle = input.extension().is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
+    (!bundle)
+        .then(|| input.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))
 }
 
 /// What the user should know about the written export that the export cannot
@@ -290,10 +268,7 @@ fn model_dir(input: &Path) -> Option<&Path> {
 /// in the export and are skipped when it loads. `prior_checked` says whether
 /// [`check_prior_import`] could load the export with it.
 fn notes(text: &str, input: &Path, out: &Path, prior_checked: bool) -> Vec<String> {
-    let out_dir = out
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let out_dir = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let canonical = |d: &Path| d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
     let mut notes = Vec::new();
     for (key, value) in file_entries(text) {
@@ -360,9 +335,8 @@ fn with_from_fit(text: &str, path: &Path) -> String {
 /// could not be checked (no `from_fit`, a bundle's unknown directory, a source
 /// not found from here, or a block this build cannot parse).
 fn check_prior_import(exported: &str, model_dir: Option<&Path>) -> Result<bool, String> {
-    let Some((_, value)) = file_entries(exported)
-        .into_iter()
-        .find(|(k, _)| *k == "[priors] from_fit")
+    let Some((_, value)) =
+        file_entries(exported).into_iter().find(|(k, _)| *k == "[priors] from_fit")
     else {
         return Ok(false);
     };
@@ -398,11 +372,7 @@ fn write_replacing(out: &Path, text: &str) -> Result<(), String> {
     let (tmp, mut file) = (0..100)
         .find_map(|k| {
             let tmp = temp_candidate(out, k);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-            {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
                 Ok(f) => Some(Ok((tmp, f))),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
                 Err(e) => Some(Err(e)),
@@ -415,13 +385,10 @@ fn write_replacing(out: &Path, text: &str) -> Result<(), String> {
             ))
         })
         .map_err(fail)?;
-    let result = file
-        .write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
-        .and_then(|()| {
-            drop(file);
-            std::fs::rename(&tmp, out)
-        });
+    let result = file.write_all(text.as_bytes()).and_then(|()| file.sync_all()).and_then(|()| {
+        drop(file);
+        std::fs::rename(&tmp, out)
+    });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -438,11 +405,7 @@ fn temp_candidate(out: &Path, k: u32) -> std::path::PathBuf {
 /// `text` declares — check its prior import, and write it to `out`. Returns
 /// whether the `from_fit` prior was checked.
 fn write_export(
-    text: &str,
-    fit: &FitResult,
-    opts: &DcmExportOptions,
-    out: &Path,
-    model_dir: Option<&Path>,
+    text: &str, fit: &FitResult, opts: &DcmExportOptions, out: &Path, model_dir: Option<&Path>,
 ) -> Result<bool, String> {
     let exported = export_dcm_from_fit(text, fit, opts)?;
     let checked = check_prior_import(&exported, model_dir)?;
@@ -455,10 +418,7 @@ mod tests {
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {
-        std::iter::once("ferx")
-            .chain(v.iter().copied())
-            .map(String::from)
-            .collect()
+        std::iter::once("ferx").chain(v.iter().copied()).map(String::from).collect()
     }
 
     #[test]
@@ -485,30 +445,9 @@ mod tests {
             network_only: false,
         };
         for order in [
-            &[
-                "m.ferx",
-                "--fit",
-                "run.json",
-                "-o",
-                "out.ferx",
-                "--fixed-theta",
-            ][..],
-            &[
-                "-o",
-                "out.ferx",
-                "--fixed-theta",
-                "m.ferx",
-                "--fit",
-                "run.json",
-            ],
-            &[
-                "--fit",
-                "run.json",
-                "m.ferx",
-                "--output",
-                "out.ferx",
-                "--fixed-theta",
-            ],
+            &["m.ferx", "--fit", "run.json", "-o", "out.ferx", "--fixed-theta"][..],
+            &["-o", "out.ferx", "--fixed-theta", "m.ferx", "--fit", "run.json"],
+            &["--fit", "run.json", "m.ferx", "--output", "out.ferx", "--fixed-theta"],
         ] {
             let mut a = vec!["export-dcm"];
             a.extend_from_slice(order);
@@ -516,18 +455,10 @@ mod tests {
         }
         let one = |v: &[&str]| parse_args(&args(&[&["export-dcm"][..], v].concat()));
         assert_eq!(one(&["run.fitrx"]).unwrap().input, "run.fitrx");
-        assert!(one(&["a.ferx", "b.ferx"])
-            .unwrap_err()
-            .contains("unexpected argument `b.ferx`"));
-        assert!(one(&["a.ferx", "-o"])
-            .unwrap_err()
-            .contains("-o requires a value"));
-        assert!(one(&["-o", "--fit", "x"])
-            .unwrap_err()
-            .contains("-o requires a value"));
-        assert!(one(&["--fixed-theta"])
-            .unwrap_err()
-            .contains("expected a .fitrx"));
+        assert!(one(&["a.ferx", "b.ferx"]).unwrap_err().contains("unexpected argument `b.ferx`"));
+        assert!(one(&["a.ferx", "-o"]).unwrap_err().contains("-o requires a value"));
+        assert!(one(&["-o", "--fit", "x"]).unwrap_err().contains("-o requires a value"));
+        assert!(one(&["--fixed-theta"]).unwrap_err().contains("expected a .fitrx"));
     }
 
     /// `-o` naming the model or the fit is refused before anything is written.
@@ -560,11 +491,7 @@ mod tests {
         }
         for out in &outs {
             let o = out.to_str().unwrap();
-            assert_eq!(
-                run(&args(&["export-dcm", m, "--fit", f, "-o", o])),
-                2,
-                "{o}"
-            );
+            assert_eq!(run(&args(&["export-dcm", m, "--fit", f, "-o", o])), 2, "{o}");
             assert_eq!(original(&model), model_bytes, "{o}");
             assert_eq!(original(&fit), fit_bytes, "{o}");
         }
@@ -597,67 +524,34 @@ mod tests {
         let here = Path::new("models/m.ferx");
         let same = notes(text, here, Path::new("models/m-analytic.ferx"), true);
         assert_eq!(same.len(), 1, "{same:?}");
-        assert!(
-            same[0].contains("the other entries still import"),
-            "{same:?}"
-        );
+        assert!(same[0].contains("the other entries still import"), "{same:?}");
         let unchecked = notes(text, here, Path::new("models/m-analytic.ferx"), false);
-        assert!(
-            unchecked[0].contains("could not be loaded from here"),
-            "{unchecked:?}"
-        );
+        assert!(unchecked[0].contains("could not be loaded from here"), "{unchecked:?}");
         let moved = notes(text, here, Path::new("out/m.ferx"), true);
         assert!(
-            moved
-                .iter()
-                .any(|n| n.contains("\"../data/pk.csv\" is relative")
-                    && n.contains(
-                        "now resolves against `out`, not the model's directory `models`"
-                    )),
+            moved.iter().any(|n| n.contains("\"../data/pk.csv\" is relative")
+                && n.contains("now resolves against `out`, not the model's directory `models`")),
             "{moved:?}"
         );
-        assert!(
-            moved
-                .iter()
-                .any(|n| n.contains("\"prev.fitrx\" is relative")),
-            "{moved:?}"
-        );
+        assert!(moved.iter().any(|n| n.contains("\"prev.fitrx\" is relative")), "{moved:?}");
         // A bundle does not know the original directory, and says so rather than
         // claiming the path moved.
-        let bundle = notes(
-            text,
-            Path::new("run.fitrx"),
-            Path::new("run-analytic.ferx"),
-            false,
-        );
-        let rel: Vec<_> = bundle
-            .iter()
-            .filter(|n| n.contains("is relative"))
-            .collect();
+        let bundle = notes(text, Path::new("run.fitrx"), Path::new("run-analytic.ferx"), false);
+        let rel: Vec<_> = bundle.iter().filter(|n| n.contains("is relative")).collect();
         assert_eq!(rel.len(), 2, "{bundle:?}");
         assert!(
-            rel.iter().all(
-                |n| n.contains("does not record the original model's directory")
-                    && n.contains("against `.`")
-                    && !n.contains("now resolves")
-            ),
+            rel.iter().all(|n| n.contains("does not record the original model's directory")
+                && n.contains("against `.`")
+                && !n.contains("now resolves")),
             "{bundle:?}"
         );
         let spelled = "[Data] // c\n  PATH = \"a.csv\" // c\n[PRIORS]\n  From_Fit = b.json # c\n";
         assert_eq!(
             file_entries(spelled),
-            vec![
-                ("[data] path", "a.csv".to_string()),
-                ("[priors] from_fit", "b.json".to_string())
-            ]
+            vec![("[data] path", "a.csv".to_string()), ("[priors] from_fit", "b.json".to_string())]
         );
         // A bare model file name and the default output beside it: no move.
-        let bare = notes(
-            text,
-            Path::new("m.ferx"),
-            Path::new("m-analytic.ferx"),
-            true,
-        );
+        let bare = notes(text, Path::new("m.ferx"), Path::new("m-analytic.ferx"), true);
         assert_eq!(bare.len(), 1, "{bare:?}");
         assert_eq!(model_dir(Path::new("m.ferx")), Some(Path::new(".")));
         let absolute = "[data]\n  path = \"/abs/pk.csv\"\n";
@@ -714,12 +608,8 @@ mod tests {
     }
 
     fn text_export(model: &str, fit_path: &Path) -> String {
-        export_dcm_from_fit(
-            model,
-            &read_fit(fit_path).unwrap(),
-            &DcmExportOptions::default(),
-        )
-        .unwrap()
+        export_dcm_from_fit(model, &read_fit(fit_path).unwrap(), &DcmExportOptions::default())
+            .unwrap()
     }
 
     #[test]
@@ -749,9 +639,6 @@ mod tests {
         // A model whose network is not the fit's is an error, not a file.
         let other = model.replace("activation = tanh", "activation = relu");
         let err = write_export(&other, &fit, &DcmExportOptions::default(), &out, None).unwrap_err();
-        assert!(
-            err.contains("not the network the fit was made with"),
-            "{err}"
-        );
+        assert!(err.contains("not the network the fit was made with"), "{err}");
     }
 }

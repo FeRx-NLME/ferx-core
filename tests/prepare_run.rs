@@ -48,24 +48,14 @@ fn prepare_run_and_run_model_with_data_read_the_same_population() {
     let prepared = prepare_run(MODEL, Some(DATA)).expect("prepare");
     let (_, population) = run_model_with_data(MODEL, Some(DATA)).expect("fit");
 
-    assert_eq!(
-        prepared.population.subjects.len(),
-        population.subjects.len()
-    );
+    assert_eq!(prepared.population.subjects.len(), population.subjects.len());
     assert_eq!(prepared.population.n_obs(), population.n_obs());
-    let prepared_ids: Vec<&str> = prepared
-        .population
-        .subjects
-        .iter()
-        .map(|s| s.id.as_str())
-        .collect();
+    let prepared_ids: Vec<&str> =
+        prepared.population.subjects.iter().map(|s| s.id.as_str()).collect();
     let fitted_ids: Vec<&str> = population.subjects.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(prepared_ids, fitted_ids);
     assert_eq!(prepared.population.dv_column, population.dv_column);
-    assert_eq!(
-        prepared.population.covariate_names,
-        population.covariate_names
-    );
+    assert_eq!(prepared.population.covariate_names, population.covariate_names);
 }
 
 /// `PreparedRun` holds a `CompiledModel` of closures and so cannot be `Debug`,

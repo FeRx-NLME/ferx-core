@@ -36,10 +36,7 @@ fn gam_screening_does_not_initialise_rayons_global_pool() {
     assert_eq!(out.eta_results.len(), 2, "both etas must be screened");
 
     assert!(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build_global()
-            .is_ok(),
+        rayon::ThreadPoolBuilder::new().num_threads(1).build_global().is_ok(),
         "GAM screening initialised Rayon's global pool: its par_iter ran at one worker \
          per logical CPU instead of on the engine's pool (#1460)"
     );
