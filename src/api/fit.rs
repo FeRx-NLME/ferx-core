@@ -265,8 +265,8 @@ pub fn fit_from_files(
 /// itself dispatches on — and not a second copy of the rule (#1540). `auto` is reported
 /// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model replaces an
 /// explicit optimizer that cannot carry the mixture objective (built-in BFGS/L-BFGS,
-/// trust-region) with NLopt L-BFGS; that replacement is reported as `nlopt_lbfgs`,
-/// and the outer loop's downgrade warning says why. `has_mixture` is the same
+/// trust-region) with what `auto` resolves to (#3025); that replacement is reported under
+/// its own label (e.g. `nlopt_lbfgs`), and the outer loop's downgrade warning says why. `has_mixture` is the same
 /// `init_params.mixture.is_some()` the outer loop keys on.
 pub(crate) fn reported_optimizer_label(
     method: EstimationMethod, options: &FitOptions, model: &CompiledModel, has_mixture: bool,

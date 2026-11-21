@@ -9002,8 +9002,8 @@ pub struct FitResult {
     /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
     /// the setting and what actually ran. An explicit choice is reported as what
     /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
-    /// mixture objective with what `auto` resolves to, reported as such (`"nlopt_lbfgs"`
-    /// on the exact gradient, `"bobyqa"` without one; #1540, #3025). SAEM/GN/IMP
+    /// mixture objective with what [`Optimizer::Auto`] resolves to, reported as such
+    /// (e.g. `"nlopt_lbfgs"` on the exact gradient; #1540, #3025). SAEM/GN/IMP
     /// report their own fixed labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa").
     /// Always populated; the label is the same regardless of method chain length.
     /// Consumers that
