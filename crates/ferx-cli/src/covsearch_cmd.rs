@@ -74,9 +74,7 @@ const BOOL_FLAGS: &[&str] = &["--resume", "--quiet", "-h", "--help"];
 /// positionals — skipping each value flag's argument so `--threads 4
 /// search.ferxsearch` does not read `4` as the file.
 pub(crate) fn scan_args<'a>(
-    args: &'a [String],
-    value_flags: &[&str],
-    bool_flags: &[&str],
+    args: &'a [String], value_flags: &[&str], bool_flags: &[&str],
 ) -> Result<Vec<&'a str>, String> {
     let mut positionals = Vec::new();
     let mut i = 2; // skip `ferx`, the subcommand
@@ -178,28 +176,16 @@ fn run_covsearch_command(args: &[String]) -> Result<i32, String> {
             CovsearchEvent::BaseFinished { ofv, n_parameters } => {
                 eprintln!("Base model: OFV {ofv:.3}, {n_parameters} free parameters")
             }
-            CovsearchEvent::StepStarted {
-                step,
-                phase,
-                candidates,
-            } => eprintln!(
+            CovsearchEvent::StepStarted { step, phase, candidates } => eprintln!(
                 "Step {step} ({}): fitting {candidates} candidate{}...",
                 phase.label(),
                 if candidates == 1 { "" } else { "s" }
             ),
-            CovsearchEvent::StepFinished {
-                step,
-                phase,
-                selected,
-            } => match selected {
+            CovsearchEvent::StepFinished { step, phase, selected } => match selected {
                 Some((effect, ofv)) => eprintln!(
                     "Step {step} ({}): {} {} (OFV {ofv:.3})",
                     phase.label(),
-                    if phase == Phase::Backward {
-                        "removed"
-                    } else {
-                        "added"
-                    },
+                    if phase == Phase::Backward { "removed" } else { "added" },
                     effect.label()
                 ),
                 None => eprintln!("Step {step} ({}): nothing accepted", phase.label()),
@@ -213,12 +199,7 @@ fn run_covsearch_command(args: &[String]) -> Result<i32, String> {
     let result = run_covsearch(
         &config,
         &base,
-        CovsearchRun {
-            dir: Some(dir.clone()),
-            threads,
-            cancel: None,
-            progress: Some(&progress),
-        },
+        CovsearchRun { dir: Some(dir.clone()), threads, cancel: None, progress: Some(&progress) },
     )?;
 
     print!("{}", render_summary(&result));
@@ -247,33 +228,16 @@ mod tests {
 
     #[test]
     fn scan_args_skips_value_flags_and_rejects_unknown_ones() {
-        let a = args(&[
-            "ferx",
-            "covsearch",
-            "--threads",
-            "4",
-            "s.ferxsearch",
-            "--resume",
-        ]);
-        assert_eq!(
-            scan_args(&a, VALUE_FLAGS, BOOL_FLAGS).unwrap(),
-            vec!["s.ferxsearch"]
-        );
+        let a = args(&["ferx", "covsearch", "--threads", "4", "s.ferxsearch", "--resume"]);
+        assert_eq!(scan_args(&a, VALUE_FLAGS, BOOL_FLAGS).unwrap(), vec!["s.ferxsearch"]);
         assert_eq!(parse_threads(&a).unwrap(), Some(4));
-        let e = scan_args(
-            &args(&["ferx", "covsearch", "--samples", "3"]),
-            VALUE_FLAGS,
-            BOOL_FLAGS,
-        )
-        .unwrap_err();
+        let e = scan_args(&args(&["ferx", "covsearch", "--samples", "3"]), VALUE_FLAGS, BOOL_FLAGS)
+            .unwrap_err();
         assert_eq!(e, "unknown flag: --samples");
         let e = parse_threads(&args(&["ferx", "covsearch", "--threads", "0"])).unwrap_err();
         assert!(e.contains("positive integer"), "{e}");
-        let e = value(
-            &args(&["ferx", "covsearch", "--directory", "--resume"]),
-            "--directory",
-        )
-        .unwrap_err();
+        let e = value(&args(&["ferx", "covsearch", "--directory", "--resume"]), "--directory")
+            .unwrap_err();
         assert!(e.contains("requires a value but got '--resume'"), "{e}");
         let e = value(&args(&["ferx", "covsearch", "--directory"]), "--directory").unwrap_err();
         assert!(e.contains("requires a value"), "{e}");
@@ -281,15 +245,7 @@ mod tests {
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file() {
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "covsearch",
-                "a.ferxsearch",
-                "b.ferxsearch"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "covsearch", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "covsearch", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "covsearch", "-h"])), 0);
     }

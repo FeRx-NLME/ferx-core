@@ -43,10 +43,7 @@ fn no_filter() -> FitOptions {
 
 /// Options carrying one `[data_selection]` clause.
 fn ignoring(expr: &str) -> FitOptions {
-    FitOptions {
-        ignore_exprs: vec![expr.to_string()],
-        ..FitOptions::default()
-    }
+    FitOptions { ignore_exprs: vec![expr.to_string()], ..FitOptions::default() }
 }
 
 /// A two-state `[odes]` model — `depot` + `central`, the shape the probe uses.
@@ -67,10 +64,7 @@ fn one_state_ode() -> CompiledModel {
 fn analytical(pk_model: PkModel) -> CompiledModel {
     let mut m = analytical_model(GradientMethod::Fd);
     m.pk_model = pk_model;
-    assert!(
-        !m.is_algebraic(),
-        "fixture must route to the topology branch, not the algebraic one"
-    );
+    assert!(!m.is_algebraic(), "fixture must route to the topology branch, not the algebraic one");
     m
 }
 
@@ -340,10 +334,7 @@ fn an_endpoint_at_the_default_compartment_still_reports_when_gaussian_rows_exist
     // warning from every `cmt = 1` endpoint model that has ordinary observations too.
     let gaussian_and_endpoint = with_tte_endpoint(analytical(PkModel::OneCptIv), 1);
     assert!(
-        matches!(
-            gaussian_and_endpoint.error_spec,
-            crate::types::ErrorSpec::Single(_)
-        ),
+        matches!(gaussian_and_endpoint.error_spec, crate::types::ErrorSpec::Single(_)),
         "fixture must score Gaussian observations, or it is the endpoint-only case"
     );
     assert!(
@@ -430,10 +421,7 @@ fn cmt_defaulted_is_reported_on_a_one_state_ode_model_with_per_cmt_readouts() {
         reader_warning_suppressed(&m, &no_filter(), MSG),
         "control: the same model with a uniform readout is suppressed"
     );
-    m.ode_spec
-        .as_mut()
-        .expect("one_state_ode builds an ode_spec")
-        .readout = per_cmt_readout();
+    m.ode_spec.as_mut().expect("one_state_ode builds an ode_spec").readout = per_cmt_readout();
     assert!(
         !reader_warning_suppressed(&m, &no_filter(), MSG),
         "an observation's CMT selects which ODE readout expression it reads"
@@ -450,28 +438,12 @@ fn the_cmt_arm_does_not_swallow_the_no_doses_arm() {
     // return must not change how `W_NO_DOSES` is decided (#811). An algebraic
     // model still suppresses `W_NO_DOSES`; a two-state ODE model still does not.
     let no_doses = "W_NO_DOSES: no dose records were parsed from the dataset.";
-    assert!(reader_warning_suppressed(
-        &algebraic(),
-        &no_filter(),
-        no_doses
-    ));
-    assert!(!reader_warning_suppressed(
-        &two_state_ode(),
-        &no_filter(),
-        no_doses
-    ));
+    assert!(reader_warning_suppressed(&algebraic(), &no_filter(), no_doses));
+    assert!(!reader_warning_suppressed(&two_state_ode(), &no_filter(), no_doses));
     // And an unrelated reader warning is suppressed for nobody.
     let other = "W_MISSING_DV: 3 observation row(s) (EVID=0) had a missing DV.";
-    assert!(!reader_warning_suppressed(
-        &algebraic(),
-        &no_filter(),
-        other
-    ));
-    assert!(!reader_warning_suppressed(
-        &two_state_ode(),
-        &no_filter(),
-        other
-    ));
+    assert!(!reader_warning_suppressed(&algebraic(), &no_filter(), other));
+    assert!(!reader_warning_suppressed(&two_state_ode(), &no_filter(), other));
 }
 
 // ---------------------------------------------------------------------------
@@ -532,10 +504,8 @@ fn the_data_selection_arm_reads_the_clause_the_way_the_filter_does() {
             "`{expr}` compares the CMT column"
         );
     }
-    let accept_only = FitOptions {
-        accept_exprs: vec!["CMT == 1".to_string()],
-        ..FitOptions::default()
-    };
+    let accept_only =
+        FitOptions { accept_exprs: vec!["CMT == 1".to_string()], ..FitOptions::default() };
     assert!(
         !reader_warning_suppressed(&m, &accept_only, MSG),
         "an `accept` clause filters on the resolved CMT exactly as an `ignore` one does"
@@ -546,10 +516,7 @@ fn the_data_selection_arm_reads_the_clause_the_way_the_filter_does() {
     );
     // `ignore_subjects` compares `Subject::id` and reads no row column, so it is not
     // a consumer however many entries it has.
-    let by_subject = FitOptions {
-        ignore_subjects: vec!["3".to_string()],
-        ..FitOptions::default()
-    };
+    let by_subject = FitOptions { ignore_subjects: vec!["3".to_string()], ..FitOptions::default() };
     assert!(
         reader_warning_suppressed(&m, &by_subject, MSG),
         "dropping whole subjects by ID reads no compartment"
@@ -602,11 +569,7 @@ fn cmt_consumer_all_is_generated_from_the_enum_itself() {
             "{c:?} appears more than once in CmtConsumer::ALL: {all:?}"
         );
     }
-    assert_eq!(
-        all.len(),
-        CmtConsumer::ALL.len(),
-        "iter() must visit every entry of ALL"
-    );
+    assert_eq!(all.len(), CmtConsumer::ALL.len(), "iter() must visit every entry of ALL");
     for expected in [
         CmtConsumer::DoseCompartment,
         CmtConsumer::PerCmtScaling,
@@ -615,10 +578,7 @@ fn cmt_consumer_all_is_generated_from_the_enum_itself() {
         CmtConsumer::EndpointRouting,
         CmtConsumer::DataSelectionFilter,
     ] {
-        assert!(
-            all.contains(&expected),
-            "{expected:?} is missing from CmtConsumer::ALL: {all:?}"
-        );
+        assert!(all.contains(&expected), "{expected:?} is missing from CmtConsumer::ALL: {all:?}");
     }
 }
 
@@ -657,16 +617,13 @@ fn only_live(c: CmtConsumer) -> (CompiledModel, FitOptions) {
         }
         CmtConsumer::PerCmtReadout => {
             let mut m = one_state_ode();
-            m.ode_spec
-                .as_mut()
-                .expect("one_state_ode builds an ode_spec")
-                .readout = per_cmt_readout();
+            m.ode_spec.as_mut().expect("one_state_ode builds an ode_spec").readout =
+                per_cmt_readout();
             (m, no_filter())
         }
-        CmtConsumer::EndpointRouting => (
-            with_tte_endpoint(analytical(PkModel::OneCptIv), 2),
-            no_filter(),
-        ),
+        CmtConsumer::EndpointRouting => {
+            (with_tte_endpoint(analytical(PkModel::OneCptIv), 2), no_filter())
+        }
         CmtConsumer::DataSelectionFilter => (analytical(PkModel::OneCptIv), ignoring("CMT == 2")),
     }
 }
@@ -682,9 +639,8 @@ fn every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one() {
     // green the suite is.)
     for c in CmtConsumer::iter() {
         let (model, options) = only_live(c);
-        let live: Vec<CmtConsumer> = CmtConsumer::iter()
-            .filter(|x| x.is_live(&model, &options))
-            .collect();
+        let live: Vec<CmtConsumer> =
+            CmtConsumer::iter().filter(|x| x.is_live(&model, &options)).collect();
         assert_eq!(
             live,
             vec![c],
@@ -704,14 +660,9 @@ fn a_model_that_reads_cmt_for_nothing_is_suppressed_on_every_channel() {
     // The control for the loop above: with no channel live the warning is withheld.
     // Without it, every assertion there passes for a predicate hard-wired to `true`.
     let (model, options) = (analytical(PkModel::OneCptIv), no_filter());
-    let live: Vec<CmtConsumer> = CmtConsumer::iter()
-        .filter(|x| x.is_live(&model, &options))
-        .collect();
-    assert_eq!(
-        live,
-        Vec::new(),
-        "the control fixture must read CMT nowhere"
-    );
+    let live: Vec<CmtConsumer> =
+        CmtConsumer::iter().filter(|x| x.is_live(&model, &options)).collect();
+    assert_eq!(live, Vec::new(), "the control fixture must read CMT nowhere");
     assert!(reader_warning_suppressed(&model, &options, MSG));
 }
 

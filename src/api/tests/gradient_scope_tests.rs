@@ -4,7 +4,7 @@
 //! entry points stamped from the options. `fit` takes `&CompiledModel` (not `Clone`), so it
 //! could not stamp, and a direct `fit()` with `FitOptions { gradient_method: Fd, .. }` on a
 //! parsed model ran on the analytic `Dual2` gradient — bit-identical to the run without the
-//! setting, with no warning. Now `fit` arms the call's flag (`api::pool::FitScope`) and every
+//! setting, with no warning. Now `fit` arms the call's flag (`pool::FitScope`) and every
 //! reader asks `GradientMethod::forced_fd`, a union with the model's own flag.
 //!
 //! Every case reads **which engine ran** — the `gradient_method_inner` / `_outer` labels,
@@ -136,10 +136,7 @@ fn pool_workers_carry_the_calls_gradient_fd() {
     // An odd width other tests do not pin, so the idle pool this test leaves is the one its
     // next fit finds.
     const WIDTH: usize = 5;
-    let pinned = |g| FitOptions {
-        threads: Some(WIDTH),
-        ..opts(g)
-    };
+    let pinned = |g| FitOptions { threads: Some(WIDTH), ..opts(g) };
     let fit_with = |stamp, g| {
         let (model, population) = warfarin(stamp);
         fit(&model, &population, &model.default_params, &pinned(g)).expect("fit")
@@ -177,32 +174,19 @@ fn pool_workers_carry_the_calls_gradient_fd() {
 /// gradient clause) with a covariance matrix, so `run_sir` has a proposal.
 fn posthoc_base() -> (CompiledModel, Population, FitResult) {
     let (model, population) = warfarin(GradientMethod::Auto);
-    let o = FitOptions {
-        run_covariance_step: true,
-        ..posthoc_opts(GradientMethod::Auto)
-    };
+    let o = FitOptions { run_covariance_step: true, ..posthoc_opts(GradientMethod::Auto) };
     let base = fit(&model, &population, &model.default_params, &o).expect("base fit");
-    assert!(
-        base.covariance_matrix.is_some(),
-        "premise: the base fit has a covariance"
-    );
+    assert!(base.covariance_matrix.is_some(), "premise: the base fit has a covariance");
     (model, population, base)
 }
 
 fn posthoc_opts(gradient: GradientMethod) -> FitOptions {
-    FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        ..opts(gradient)
-    }
+    FitOptions { method: EstimationMethod::FoceI, interaction: true, ..opts(gradient) }
 }
 
 fn cov_bits(r: &FitResult) -> Vec<u64> {
     let m = r.covariance_matrix.as_ref().expect("covariance");
-    assert!(
-        m.iter().all(|v| v.is_finite()),
-        "non-finite covariance entry"
-    );
+    assert!(m.iter().all(|v| v.is_finite()), "non-finite covariance entry");
     m.iter().map(|v| v.to_bits()).collect()
 }
 
@@ -244,12 +228,8 @@ fn a_posthoc_run_sir_honours_the_options_gradient_fd() {
     let (model, population, base) = posthoc_base();
     let (stamped, _) = warfarin(GradientMethod::Fd);
     let sir = |m: &CompiledModel, g| {
-        let o = FitOptions {
-            sir_samples: 40,
-            sir_resamples: 20,
-            sir_seed: Some(7),
-            ..posthoc_opts(g)
-        };
+        let o =
+            FitOptions { sir_samples: 40, sir_resamples: 20, sir_seed: Some(7), ..posthoc_opts(g) };
         let r = crate::run_sir(&base, Some(m), Some(&population), &o).expect("run_sir");
         let ess = r.sir_ess.expect("ess");
         assert!(ess.is_finite(), "ess {ess}");
@@ -279,10 +259,8 @@ fn a_posthoc_run_sir_honours_the_options_gradient_fd() {
 /// the same estimates with only the recorded route changed.
 fn with_recorded_gradient(fit: &FitResult, g: GradientMethod) -> FitResult {
     let mut f = fit.clone();
-    f.scoring_settings
-        .as_mut()
-        .expect("premise: a fit carries its stage record")
-        .gradient_method = g;
+    f.scoring_settings.as_mut().expect("premise: a fit carries its stage record").gradient_method =
+        g;
     f
 }
 
@@ -290,16 +268,10 @@ fn with_recorded_gradient(fit: &FitResult, g: GradientMethod) -> FitResult {
 /// so `run_sir` has a proposal.
 fn direct_fd_fit() -> (CompiledModel, Population, FitResult) {
     let (model, population) = warfarin(GradientMethod::Auto);
-    let o = FitOptions {
-        run_covariance_step: true,
-        ..posthoc_opts(GradientMethod::Fd)
-    };
+    let o = FitOptions { run_covariance_step: true, ..posthoc_opts(GradientMethod::Fd) };
     let f = fit(&model, &population, &model.default_params, &o).expect("fd fit");
     assert_eq!(f.gradient_method_inner, FD, "premise: the fit ran FD");
-    assert!(
-        f.covariance_matrix.is_some(),
-        "premise: the fd fit has a covariance"
-    );
+    assert!(f.covariance_matrix.is_some(), "premise: the fd fit has a covariance");
     (model, population, f)
 }
 
@@ -332,10 +304,7 @@ fn a_direct_fd_fits_posthoc_run_sir_with_default_options_stays_fd() {
     };
     let default = sir(&f, GradientMethod::Auto);
     let reference = sir(&f, GradientMethod::Fd);
-    let analytic = sir(
-        &with_recorded_gradient(&f, GradientMethod::Auto),
-        GradientMethod::Auto,
-    );
+    let analytic = sir(&with_recorded_gradient(&f, GradientMethod::Auto), GradientMethod::Auto);
     assert_ne!(
         analytic, reference,
         "premise: the analytic and FD inner routes weight the draws differently"
@@ -377,10 +346,7 @@ fn a_posthoc_run_sir_with_retired_ad_records_auto_and_its_bundle_loads() {
     let loaded = crate::io::fitrx::load_fit(&bundle)
         .unwrap_or_else(|e| panic!("a bundle from run_sir(Ad) must load: {e}"))
         .fit;
-    assert_eq!(
-        loaded.sir_settings.map(|s| s.scoring.gradient_method),
-        Some(GradientMethod::Auto)
-    );
+    assert_eq!(loaded.sir_settings.map(|s| s.scoring.gradient_method), Some(GradientMethod::Auto));
 }
 
 // ── #1862: a fit recording `auto` for an FD run warns that the post-hoc step goes analytic ──
@@ -394,17 +360,10 @@ fn reloaded_recording_auto(fit: &FitResult, population: &Population) -> FitResul
     crate::io::fitrx::save_fit(fit, population, "src\n", &saved, Default::default())
         .expect("save_fit");
     let mut loaded = crate::io::fitrx::load_fit(&saved).expect("load_fit").fit;
-    loaded
-        .scoring_settings
-        .as_mut()
-        .expect("premise: the stage record")
-        .gradient_method = GradientMethod::Auto;
-    loaded
-        .sir_settings
-        .as_mut()
-        .expect("premise: the SIR record")
-        .scoring
-        .gradient_method = GradientMethod::Auto;
+    loaded.scoring_settings.as_mut().expect("premise: the stage record").gradient_method =
+        GradientMethod::Auto;
+    loaded.sir_settings.as_mut().expect("premise: the SIR record").scoring.gradient_method =
+        GradientMethod::Auto;
     loaded
 }
 
@@ -444,26 +403,14 @@ fn warns(r: &FitResult) -> bool {
 #[test]
 fn an_fd_fit_recording_auto_warns_that_posthoc_goes_analytic() {
     let (model, population, f) = direct_fd_fit();
-    assert_ne!(
-        f.gradient_method_outer, ANALYTIC,
-        "premise: the outer ran FD"
-    );
+    assert_ne!(f.gradient_method_outer, ANALYTIC, "premise: the outer ran FD");
     let fd_record = with_sir_record(&f, &model, &population);
-    assert!(
-        !warns(&fd_record),
-        "a fit that records gradient_method = fd is silent"
-    );
+    assert!(!warns(&fd_record), "a fit that records gradient_method = fd is silent");
     let loaded = reloaded_recording_auto(&fd_record, &population);
-    assert_eq!(
-        loaded.gradient_method_inner, FD,
-        "premise: the label survives"
-    );
+    assert_eq!(loaded.gradient_method_inner, FD, "premise: the label survives");
 
     let cov = |fit: &FitResult, g| {
-        let o = FitOptions {
-            gradient_method: g,
-            ..FitOptions::default()
-        };
+        let o = FitOptions { gradient_method: g, ..FitOptions::default() };
         crate::run_covariance(fit, Some(&model), Some(&population), &o).expect("run_covariance")
     };
     let sir = |fit: &FitResult, g| {
@@ -477,11 +424,7 @@ fn an_fd_fit_recording_auto_warns_that_posthoc_goes_analytic() {
         crate::run_sir(fit, Some(&model), Some(&population), &o).expect("run_sir")
     };
     let cov_default = cov(&loaded, GradientMethod::Auto);
-    assert!(
-        warns(&cov_default),
-        "run_covariance: {:?}",
-        cov_default.warnings
-    );
+    assert!(warns(&cov_default), "run_covariance: {:?}", cov_default.warnings);
     assert!(
         !warns(&cov(&loaded, GradientMethod::Fd)),
         "run_covariance with gradient_method = fd runs as the fit did"
@@ -490,15 +433,9 @@ fn an_fd_fit_recording_auto_warns_that_posthoc_goes_analytic() {
         !warns(&cov(&cov_default, GradientMethod::Fd)),
         "a carried-over note is taken off when it no longer applies"
     );
-    assert!(
-        warns(&cov(&cov_default, GradientMethod::Auto)),
-        "and kept once"
-    );
+    assert!(warns(&cov(&cov_default, GradientMethod::Auto)), "and kept once");
     assert!(warns(&sir(&loaded, GradientMethod::Auto)), "run_sir");
-    assert!(
-        !warns(&sir(&loaded, GradientMethod::Fd)),
-        "run_sir with gradient_method = fd"
-    );
+    assert!(!warns(&sir(&loaded, GradientMethod::Fd)), "run_sir with gradient_method = fd");
 }
 
 /// **#1862 control — an analytic fit recording `auto` stays analytic and is silent.** The
@@ -509,13 +446,8 @@ fn an_analytic_fit_recording_auto_is_silent() {
     let (model, population, base) = posthoc_base();
     assert_eq!(base.gradient_method_inner, ANALYTIC, "premise");
     let loaded = reloaded_recording_auto(&with_sir_record(&base, &model, &population), &population);
-    let r = crate::run_covariance(
-        &loaded,
-        Some(&model),
-        Some(&population),
-        &FitOptions::default(),
-    )
-    .expect("run_covariance");
+    let r = crate::run_covariance(&loaded, Some(&model), Some(&population), &FitOptions::default())
+        .expect("run_covariance");
     assert!(!warns(&r), "run_covariance: {:?}", r.warnings);
     let r = crate::run_sir(
         &loaded,

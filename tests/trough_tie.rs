@@ -72,11 +72,7 @@ const DOSE: f64 = 2.0;
 
 /// The concentration at `t` with the seed at 0 and a dose at each of `doses` already applied.
 fn conc(t: f64, doses: &[f64]) -> f64 {
-    SEED * (-K * t).exp()
-        + doses
-            .iter()
-            .map(|td| DOSE * (-K * (t - td)).exp())
-            .sum::<f64>()
+    SEED * (-K * t).exp() + doses.iter().map(|td| DOSE * (-K * (t - td)).exp()).sum::<f64>()
 }
 
 /// `(ID, TIME, closed form)` for every observation of `nonmem_anchor/trough_tie.csv`, in file order.
@@ -141,10 +137,7 @@ fn assert_closed_form(leg: &str, got: &[(String, f64, f64)]) -> f64 {
         );
         worst = worst.max(err);
     }
-    println!(
-        "{leg}: worst |ferx − closed form| {worst:.3e} over {} observations",
-        want.len()
-    );
+    println!("{leg}: worst |ferx − closed form| {worst:.3e} over {} observations", want.len());
     worst
 }
 
@@ -164,9 +157,7 @@ fn via_predict(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
 
 /// Label one value per observation with `predict()`'s `(ID, TIME)`.
 fn label(
-    m: &CompiledModel,
-    pop: &Population,
-    values: Vec<(String, f64)>,
+    m: &CompiledModel, pop: &Population, values: Vec<(String, f64)>,
 ) -> Vec<(String, f64, f64)> {
     let labels = via_predict(m, pop);
     assert_eq!(values.len(), labels.len(), "row count against predict");
@@ -185,19 +176,14 @@ fn label(
 fn nonmem_ipred() -> Vec<(String, f64, f64)> {
     let path = "nonmem_anchor/results/trough_tie.tab";
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
     let header: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let col = |c: &str| header.iter().position(|h| *h == c).expect(c);
     let (id, time, evid, ipred) = (col("ID"), col("TIME"), col("EVID"), col("IPRED"));
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0)
@@ -220,11 +206,7 @@ const NONMEM_BOUND: f64 = 1e-7;
 fn nonmem_reads_every_cell_as_the_closed_form() {
     let got = nonmem_ipred();
     let want = expected();
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "NONMEM table rows vs fixture observations"
-    );
+    assert_eq!(got.len(), want.len(), "NONMEM table rows vs fixture observations");
     let mut worst = 0.0_f64;
     for ((id, t, v), (wid, wt, w)) in got.iter().zip(&want) {
         assert!(
@@ -239,10 +221,7 @@ fn nonmem_reads_every_cell_as_the_closed_form() {
         );
         worst = worst.max(err);
     }
-    println!(
-        "nonmem: worst |NONMEM − closed form| {worst:.3e} over {} observations",
-        want.len()
-    );
+    println!("nonmem: worst |NONMEM − closed form| {worst:.3e} over {} observations", want.len());
 }
 
 #[test]
@@ -295,10 +274,7 @@ fn adaptive_driver_reads_a_trough_before_its_co_timed_record() {
     let (m, pop) = setup();
     let mut got = Vec::new();
     for s in &pop.subjects {
-        let one = Population {
-            subjects: vec![s.clone()],
-            ..pop.clone()
-        };
+        let one = Population { subjects: vec![s.clone()], ..pop.clone() };
         let mut opts = AdaptiveSimulateOptions::default();
         opts.seed = Some(1);
         // Inside the subject's span: a decision before its first record (IDs 8 / 9 start at
@@ -321,16 +297,8 @@ fn adaptive_driver_reads_a_trough_before_its_co_timed_record() {
             &opts,
         )
         .unwrap_or_else(|e| panic!("ID {}: adaptive run refused: {e}", s.id));
-        assert!(
-            res.ledger.is_empty(),
-            "ID {}: the no-op controller dosed",
-            s.id
-        );
-        got.extend(
-            res.trajectories
-                .into_iter()
-                .map(|r| (r.id, r.time, r.ipred)),
-        );
+        assert!(res.ledger.is_empty(), "ID {}: the no-op controller dosed", s.id);
+        got.extend(res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)));
     }
     assert_closed_form("adaptive", &got);
 }

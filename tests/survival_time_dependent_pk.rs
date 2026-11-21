@@ -155,11 +155,7 @@ fn assert_is_the_1853_refusal(entry: &str, msg: &str) {
 /// the same model. Mutation — route any one entry point back through the `Option<String>`
 /// check and its test dies here with `code() == None`.
 fn assert_is_coded(entry: &str, err: &ferx_core::EngineError) {
-    assert_eq!(
-        err.code(),
-        Some("E_ENDPOINT_TIME_DEPENDENT_PK"),
-        "{entry}: {err}"
-    );
+    assert_eq!(err.code(), Some("E_ENDPOINT_TIME_DEPENDENT_PK"), "{entry}: {err}");
     assert_eq!(err.block(), Some("event_model"), "{entry}: {err}");
 }
 
@@ -217,16 +213,11 @@ fn simulate_refuses_a_time_dependent_disposition_on_an_ode_hazard() {
 /// refused every joint PK-TTE model would die too.
 #[test]
 fn ferx_check_reports_a_time_dependent_disposition_without_data() {
-    for (cl, refused) in [
-        ("TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)", true),
-        ("TVCL * exp(ETA_CL)", false),
-    ] {
-        let mut f = tempfile::Builder::new()
-            .suffix(".ferx")
-            .tempfile()
-            .expect("create temp model");
-        f.write_all(MODEL.replace("CL_EXPR", cl).as_bytes())
-            .expect("write temp model");
+    for (cl, refused) in
+        [("TVCL * (1.0 + TVKT * TIME) * exp(ETA_CL)", true), ("TVCL * exp(ETA_CL)", false)]
+    {
+        let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
+        f.write_all(MODEL.replace("CL_EXPR", cl).as_bytes()).expect("write temp model");
         let report = validate_model_file(f.path().to_str().expect("utf-8 path"), None);
         let hits: Vec<_> = report
             .diagnostics
@@ -238,10 +229,7 @@ fn ferx_check_reports_a_time_dependent_disposition_without_data() {
             assert_eq!(hits.len(), 1, "{cl}: {:?}", report.diagnostics);
             assert!(hits[0].is_error());
             assert_eq!(hits[0].block.as_deref(), Some("event_model"));
-            assert!(
-                hits[0].line.is_some(),
-                "the [event_model] header line is attached"
-            );
+            assert!(hits[0].line.is_some(), "the [event_model] header line is attached");
             assert_is_the_1853_refusal("ferx check", &hits[0].message);
         } else {
             assert!(report.valid, "{cl}: {:?}", report.diagnostics);
@@ -274,10 +262,7 @@ fn the_time_free_control_is_accepted_by_every_entry_point() {
 
     let rows = predict_survival(&m, &pop, &m.default_params, &[20.0])
         .expect("the control must predict survival");
-    let row = rows
-        .iter()
-        .find(|r| r.cmt == 2 && r.time == 20.0)
-        .expect("a CMT 2 row at t = 20");
+    let row = rows.iter().find(|r| r.cmt == 2 && r.time == 20.0).expect("a CMT 2 row at t = 20");
     assert!(
         row.cum_hazard.is_finite() && row.hazard.is_finite(),
         "control H(20) = {}, h(20) = {} must be finite",

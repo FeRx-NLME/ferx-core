@@ -150,11 +150,7 @@ fn population(doses: Vec<DoseEvent>, obs_times: Vec<f64>, obs_cmt: usize) -> Pop
 }
 
 fn assert_equiv(
-    label: &str,
-    analytical_src: &str,
-    template_src: &str,
-    pop: &Population,
-    rtol: f64,
+    label: &str, analytical_src: &str, template_src: &str, pop: &Population, rtol: f64,
 ) {
     let an = parse_full_model(analytical_src)
         .unwrap_or_else(|e| panic!("[{label}] analytical model did not parse: {e}"))
@@ -197,11 +193,7 @@ fn ode_template_matches_analytical_all_models() {
             &format!("{}/bolus", m.name),
             &an,
             &tm,
-            &population(
-                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs.clone(),
-                oc,
-            ),
+            &population(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], obs.clone(), oc),
             RTOL,
         );
 
@@ -241,11 +233,7 @@ fn ode_template_matches_analytical_all_models() {
                 &format!("{}/infusion", m.name),
                 &an,
                 &tm,
-                &population(
-                    vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)],
-                    obs.clone(),
-                    oc,
-                ),
+                &population(vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)], obs.clone(), oc),
                 RTOL,
             );
         }
@@ -271,11 +259,7 @@ fn ode_template_matches_analytical_all_models() {
                 &format!("{}/bioavailability", m.name),
                 &an_f,
                 &tm_f,
-                &population(
-                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                    obs.clone(),
-                    oc,
-                ),
+                &population(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], obs.clone(), oc),
                 RTOL,
             );
         }
@@ -325,9 +309,7 @@ fn ode_template_user_obs_scale_takes_precedence() {
         2,
     );
     let preds = |src: &str| {
-        let m = parse_full_model(src)
-            .unwrap_or_else(|e| panic!("did not parse: {e}"))
-            .model;
+        let m = parse_full_model(src).unwrap_or_else(|e| panic!("did not parse: {e}")).model;
         predict(&m, &pop, &m.default_params)
             .unwrap()
             .into_iter()
@@ -349,10 +331,7 @@ fn ode_template_user_obs_scale_takes_precedence() {
     }
     // (c) != (a): the user's obs_scale = 1.0 is what's applied (amounts), proving
     // the user value wins over the injected V1. With V1 = 15 the gap is large.
-    let differ = a
-        .iter()
-        .zip(c.iter())
-        .any(|(x, y)| (x - y).abs() > 1e-3 * x.abs().max(1e-6));
+    let differ = a.iter().zip(c.iter()).any(|(x, y)| (x - y).abs() > 1e-3 * x.abs().max(1e-6));
     assert!(
         differ,
         "user obs_scale=1.0 must take precedence over the injected V1 (amount vs \
@@ -398,9 +377,7 @@ fn ode_template_conditional_override_keeps_generated_default() {
         2,
     );
     let preds = |src: &str| {
-        let m = parse_full_model(src)
-            .unwrap_or_else(|e| panic!("did not parse: {e}"))
-            .model;
+        let m = parse_full_model(src).unwrap_or_else(|e| panic!("did not parse: {e}")).model;
         predict(&m, &pop, &m.default_params)
             .unwrap()
             .into_iter()
@@ -411,10 +388,7 @@ fn ode_template_conditional_override_keeps_generated_default() {
     let cond = preds(&conditional);
     // The generated central is kept → matches the analytical oral curve, and is
     // clearly non-zero (would be ~0 if the conditional override had suppressed it).
-    assert!(
-        an.iter().any(|&p| p > 1e-3),
-        "analytical curve should be non-trivial"
-    );
+    assert!(an.iter().any(|&p| p > 1e-3), "analytical curve should be non-trivial");
     for (x, y) in an.iter().zip(cond.iter()) {
         let tol = ATOL + RTOL * x.abs();
         assert!(
@@ -430,9 +404,8 @@ fn ode_template_conditional_override_keeps_generated_default() {
 fn transit_ode_template_example_parses() {
     let src = std::fs::read_to_string("examples/transit_ode_template.ferx")
         .expect("read examples/transit_ode_template.ferx");
-    let model = parse_full_model(&src)
-        .expect("examples/transit_ode_template.ferx should parse")
-        .model;
+    let model =
+        parse_full_model(&src).expect("examples/transit_ode_template.ferx should parse").model;
     let ode = model.ode_spec.expect("ODE model");
     assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
     assert_eq!(ode.input_rate.len(), 1, "one transit forcing on the depot");

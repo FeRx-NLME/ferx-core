@@ -85,10 +85,7 @@ struct Scripted {
 
 impl Scripted {
     fn new() -> Self {
-        Scripted {
-            start_ofv: 1000.0,
-            ..Default::default()
-        }
+        Scripted { start_ofv: 1000.0, ..Default::default() }
     }
 
     fn calls(&self) -> Vec<Call> {
@@ -114,12 +111,7 @@ fn last_ofv(scripted: &Scripted) -> f64 {
 
 impl StepRunner for Scripted {
     fn run_step(
-        &self,
-        index: usize,
-        step: Step,
-        dir_name: &str,
-        config: &SearchConfig,
-        model: &ModelText,
+        &self, index: usize, step: Step, dir_name: &str, config: &SearchConfig, model: &ModelText,
     ) -> Result<StepOutput, String> {
         self.calls.lock().unwrap().push(Call {
             kind: "step",
@@ -130,9 +122,7 @@ impl StepRunner for Scripted {
             stall_gate: config.strictness.strictness().reject_init_stall,
         });
         if self.fail_at == Some(index) {
-            return Err(format!(
-                "{dir_name}: `WT` is not a covariate of the dataset"
-            ));
+            return Err(format!("{dir_name}: `WT` is not a covariate of the dataset"));
         }
         let ofv = self.step_ofv(index);
         let derived = ModelText::parse(&format!("{}\n# selected by {dir_name}\n", model.render()))?;
@@ -193,13 +183,8 @@ impl StepRunner for Scripted {
     }
 
     fn fit_one(
-        &self,
-        index: usize,
-        tool: &'static str,
-        dir_name: &str,
-        config: &SearchConfig,
-        model: &ModelText,
-        n_starts: usize,
+        &self, index: usize, tool: &'static str, dir_name: &str, config: &SearchConfig,
+        model: &ModelText, n_starts: usize,
     ) -> Result<StepOutput, String> {
         self.calls.lock().unwrap().push(Call {
             kind: if tool == "start" { "start" } else { "retries" },
@@ -241,11 +226,7 @@ impl StepRunner for Scripted {
                 rank: None,
                 converged,
                 passed: has_fit,
-                failures: if has_fit {
-                    vec![]
-                } else {
-                    vec!["no fit".into()]
-                },
+                failures: if has_fit { vec![] } else { vec!["no fit".into()] },
                 error: None,
                 note: None,
                 seconds: 0.5,
@@ -266,9 +247,7 @@ fn fit_converged(fit: &Option<FitResult>) -> Option<bool> {
 }
 
 fn run<R: StepRunner>(scripted: &R, options: &AmdOptions, config: &SearchConfig) -> AmdResult {
-    let ctx = Context {
-        iov_column: Some("OCC".into()),
-    };
+    let ctx = Context { iov_column: Some("OCC".into()) };
     let plan = plan(options, &config.mfl, &ctx).expect("plan");
     drive(scripted, config, options, &plan, &warfarin(), None).expect("drive")
 }
@@ -303,13 +282,8 @@ fn strategy_orders_match_pharmpy() {
 /// step as a rerun, so its directory cannot collide with the first's.
 #[test]
 fn the_plan_numbers_its_steps_and_marks_the_rerun() {
-    let options = AmdOptions {
-        strategy: Strategy::Reevaluation,
-        ..Default::default()
-    };
-    let ctx = Context {
-        iov_column: Some("OCC".into()),
-    };
+    let options = AmdOptions { strategy: Strategy::Reevaluation, ..Default::default() };
+    let ctx = Context { iov_column: Some("OCC".into()) };
     let plan = plan(&options, &config().mfl, &ctx).unwrap();
     assert_eq!(
         plan.iter().map(|p| p.dir.clone()).collect::<Vec<_>>(),
@@ -334,17 +308,9 @@ fn the_plan_numbers_its_steps_and_marks_the_rerun() {
 #[test]
 fn a_step_the_space_is_silent_about_is_skipped_with_its_reason() {
     let config = config_with("ABSORPTION([INST,FO])", "");
-    let ctx = Context {
-        iov_column: Some("OCC".into()),
-    };
+    let ctx = Context { iov_column: Some("OCC".into()) };
     let plan = plan(&AmdOptions::default(), &config.mfl, &ctx).unwrap();
-    let by_step = |step: Step| {
-        plan.iter()
-            .find(|p| p.step == step)
-            .unwrap()
-            .skipped
-            .clone()
-    };
+    let by_step = |step: Step| plan.iter().find(|p| p.step == step).unwrap().skipped.clone();
     assert_eq!(by_step(Step::Structural), None);
     // The residual search has no space at all, so silence is not a skip.
     assert_eq!(by_step(Step::Residual), None);
@@ -371,41 +337,19 @@ fn iovsearch_needs_an_occasion_column_but_not_a_space() {
         .expect("skipped without an occasion column");
     assert!(reason.contains("iov_column"), "{reason}");
 
-    let with = plan(
-        &AmdOptions::default(),
-        &config.mfl,
-        &Context {
-            iov_column: Some("OCC".into()),
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        with.iter()
-            .find(|p| p.step == Step::Iovsearch)
-            .unwrap()
-            .skipped,
-        None
-    );
+    let with =
+        plan(&AmdOptions::default(), &config.mfl, &Context { iov_column: Some("OCC".into()) })
+            .unwrap();
+    assert_eq!(with.iter().find(|p| p.step == Step::Iovsearch).unwrap().skipped, None);
 }
 
 /// `[amd] skip` leaves a step out and says so in the plan.
 #[test]
 fn skip_leaves_a_step_out_and_records_it() {
-    let options = AmdOptions {
-        skip: vec![Step::Covariates],
-        ..Default::default()
-    };
-    let ctx = Context {
-        iov_column: Some("OCC".into()),
-    };
+    let options = AmdOptions { skip: vec![Step::Covariates], ..Default::default() };
+    let ctx = Context { iov_column: Some("OCC".into()) };
     let plan = plan(&options, &config().mfl, &ctx).unwrap();
-    let reason = plan
-        .iter()
-        .find(|p| p.step == Step::Covariates)
-        .unwrap()
-        .skipped
-        .clone()
-        .unwrap();
+    let reason = plan.iter().find(|p| p.step == Step::Covariates).unwrap().skipped.clone().unwrap();
     assert!(reason.contains("[amd] skip"), "{reason}");
 }
 
@@ -413,17 +357,11 @@ fn skip_leaves_a_step_out_and_records_it() {
 /// and skipping everything leaves nothing to run.
 #[test]
 fn skip_is_checked_against_the_strategy() {
-    let error = AmdOptions {
-        strategy: Strategy::Sir,
-        skip: vec![Step::Covariates],
-        ..Default::default()
-    }
-    .validate()
-    .unwrap_err();
-    assert!(
-        error.contains("covariates") && error.contains("SIR"),
-        "{error}"
-    );
+    let error =
+        AmdOptions { strategy: Strategy::Sir, skip: vec![Step::Covariates], ..Default::default() }
+            .validate()
+            .unwrap_err();
+    assert!(error.contains("covariates") && error.contains("SIR"), "{error}");
 
     let error = AmdOptions {
         strategy: Strategy::Sir,
@@ -469,14 +407,8 @@ fn the_amd_section_is_read_from_the_file() {
 #[test]
 fn the_pipeline_runs_its_steps_in_order() {
     let scripted = Scripted::new();
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Skip,
-            ..Default::default()
-        },
-        &config(),
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Skip, ..Default::default() }, &config());
     assert_eq!(
         scripted.dirs(),
         vec![
@@ -510,32 +442,18 @@ fn the_pipeline_runs_its_steps_in_order() {
 #[test]
 fn each_step_starts_from_the_previous_step_s_selection_seeded() {
     let scripted = Scripted::new();
-    run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Skip,
-            ..Default::default()
-        },
-        &config(),
-    );
+    run(&scripted, &AmdOptions { retries: Retries::Skip, ..Default::default() }, &config());
     let calls = scripted.calls();
 
     // Step 1 gets the input, seeded from the start fit.
     let mut expected = warfarin();
     crate::search::seed::seed_from(&mut expected, &moved_fit(scripted.start_ofv)).unwrap();
     assert_eq!(calls[1].model, expected.render());
-    assert_ne!(
-        calls[1].model,
-        warfarin().render(),
-        "the start fit's estimates were not seeded"
-    );
+    assert_ne!(calls[1].model, warfarin().render(), "the start fit's estimates were not seeded");
 
     // Step 2 gets step 1's selection, seeded from step 1's fit.
-    let mut expected = ModelText::parse(&format!(
-        "{}\n# selected by 01-modelsearch\n",
-        calls[1].model
-    ))
-    .unwrap();
+    let mut expected =
+        ModelText::parse(&format!("{}\n# selected by 01-modelsearch\n", calls[1].model)).unwrap();
     crate::search::seed::seed_from(&mut expected, &moved_fit(scripted.step_ofv(1))).unwrap();
     assert_eq!(calls[2].model, expected.render());
     assert!(
@@ -549,26 +467,9 @@ fn each_step_starts_from_the_previous_step_s_selection_seeded() {
 #[test]
 fn each_step_is_handed_only_its_own_subspace() {
     let scripted = Scripted::new();
-    run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Skip,
-            ..Default::default()
-        },
-        &config(),
-    );
-    let space_of = |dir: &str| {
-        scripted
-            .calls()
-            .into_iter()
-            .find(|c| c.dir == dir)
-            .unwrap()
-            .space
-    };
-    assert_eq!(
-        space_of("01-modelsearch"),
-        "ABSORPTION([INST,FO]);PERIPHERALS(0..1)"
-    );
+    run(&scripted, &AmdOptions { retries: Retries::Skip, ..Default::default() }, &config());
+    let space_of = |dir: &str| scripted.calls().into_iter().find(|c| c.dir == dir).unwrap().space;
+    assert_eq!(space_of("01-modelsearch"), "ABSORPTION([INST,FO]);PERIPHERALS(0..1)");
     assert_eq!(space_of("02-iivsearch"), "IIV?([CL,V],EXP)");
     assert_eq!(space_of("04-iovsearch"), "IOV?(CL,EXP)");
     assert_eq!(space_of("05-allometry"), "ALLOMETRY(WT,70)");
@@ -584,27 +485,13 @@ fn each_step_is_handed_only_its_own_subspace() {
 fn the_retries_policy_decides_which_selected_models_get_the_pass() {
     let retries_dirs = |policy: Retries| {
         let scripted = Scripted::new();
-        run(
-            &scripted,
-            &AmdOptions {
-                retries: policy,
-                ..Default::default()
-            },
-            &config(),
-        );
+        run(&scripted, &AmdOptions { retries: policy, ..Default::default() }, &config());
         let calls = scripted.calls();
         assert!(
-            calls
-                .iter()
-                .filter(|c| c.kind == "retries")
-                .all(|c| c.starts == 3),
+            calls.iter().filter(|c| c.kind == "retries").all(|c| c.starts == 3),
             "the pass must take [run] retries + 1 starts"
         );
-        calls
-            .into_iter()
-            .filter(|c| c.kind == "retries")
-            .map(|c| c.dir)
-            .collect::<Vec<_>>()
+        calls.into_iter().filter(|c| c.kind == "retries").map(|c| c.dir).collect::<Vec<_>>()
     };
     assert_eq!(
         retries_dirs(Retries::AllFinal),
@@ -628,34 +515,16 @@ fn the_retries_policy_decides_which_selected_models_get_the_pass() {
 fn the_retries_pass_keeps_the_better_of_the_two_fits() {
     let mut scripted = Scripted::new();
     scripted.retry_delta = -4.0;
-    let improved = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config(),
-    );
-    assert_eq!(
-        improved.final_fit.as_ref().map(|f| f.ofv),
-        Some(scripted.step_ofv(6) - 4.0)
-    );
+    let improved =
+        run(&scripted, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config());
+    assert_eq!(improved.final_fit.as_ref().map(|f| f.ofv), Some(scripted.step_ofv(6) - 4.0));
     assert!(!improved.notes.iter().any(|n| n.contains("did not improve")));
 
     let mut scripted = Scripted::new();
     scripted.retry_delta = 7.0;
-    let kept = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config(),
-    );
-    assert_eq!(
-        kept.final_fit.as_ref().map(|f| f.ofv),
-        Some(scripted.step_ofv(6))
-    );
+    let kept =
+        run(&scripted, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config());
+    assert_eq!(kept.final_fit.as_ref().map(|f| f.ofv), Some(scripted.step_ofv(6)));
     let note = kept
         .notes
         .iter()
@@ -673,20 +542,10 @@ fn a_single_start_makes_the_retries_pass_pointless_and_it_says_so() {
     let config = config_with(SPACE, "");
     let mut config = config;
     config.run.retries = 0;
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config,
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config);
     assert!(scripted.calls().iter().all(|c| c.kind != "retries"));
-    assert!(
-        result.notes.iter().any(|n| n.contains("retries = 0")),
-        "{:?}",
-        result.notes
-    );
+    assert!(result.notes.iter().any(|n| n.contains("retries = 0")), "{:?}", result.notes);
 
     // The note is the pipeline's, said once, not each step's. Under the default
     // `all_final` policy the pass is attempted once per step, and pushing the
@@ -694,11 +553,7 @@ fn a_single_start_makes_the_retries_pass_pointless_and_it_says_so() {
     // — eight under `reevaluation`.
     let result = run(&Scripted::new(), &AmdOptions::default(), &config);
     assert_eq!(
-        result
-            .notes
-            .iter()
-            .filter(|n| n.contains("retries = 0"))
-            .count(),
+        result.notes.iter().filter(|n| n.contains("retries = 0")).count(),
         1,
         "{:?}",
         result.notes
@@ -714,31 +569,19 @@ fn a_single_start_makes_the_retries_pass_pointless_and_it_says_so() {
 #[test]
 fn the_final_retries_row_is_filed_past_the_last_step_and_printed() {
     let scripted = Scripted::new();
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config(),
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config());
     let last = result.steps.iter().map(|s| s.index).max().expect("steps");
     let rows: Vec<&CandidateRow> = result.rows.iter().filter(|r| r.tool == "retries").collect();
     assert_eq!(rows.len(), 1, "one pass, one row");
-    assert_eq!(
-        rows[0].step,
-        last + 1,
-        "the final pass must not be filed under the start fit"
-    );
+    assert_eq!(rows[0].step, last + 1, "the final pass must not be filed under the start fit");
     let printed = render_summary(&result);
     assert!(
         printed.contains("Final model — retries pass"),
         "the final pass has no section:\n{printed}"
     );
     assert_eq!(
-        printed
-            .matches(&format!("{} starts", config().run.retries + 1))
-            .count(),
+        printed.matches(&format!("{} starts", config().run.retries + 1)).count(),
         1,
         "the pass's row is printed exactly once:\n{printed}"
     );
@@ -751,42 +594,22 @@ fn the_final_retries_row_is_filed_past_the_last_step_and_printed() {
 /// something other than `final.ferx`.
 #[test]
 fn a_step_that_cannot_fit_its_selection_drops_the_previous_fit() {
-    let scripted = Scripted {
-        no_fit_at: Some(2),
-        ..Scripted::new()
-    };
-    let options = AmdOptions {
-        retries: Retries::Skip,
-        ..Default::default()
-    };
+    let scripted = Scripted { no_fit_at: Some(2), ..Scripted::new() };
+    let options = AmdOptions { retries: Retries::Skip, ..Default::default() };
     let result = run(&scripted, &options, &config());
-    let after = result
-        .steps
-        .iter()
-        .find(|s| s.index == 3)
-        .expect("step 3 ran");
+    let after = result.steps.iter().find(|s| s.index == 3).expect("step 3 ran");
     assert_eq!(
         after.ofv_before, None,
         "step 3's Δ was taken against a model it did not start from"
     );
     assert_eq!(after.value_before, None);
-    assert!(
-        result.notes.iter().any(|n| n.contains("no fit for")),
-        "{:?}",
-        result.notes
-    );
+    assert!(result.notes.iter().any(|n| n.contains("no fit for")), "{:?}", result.notes);
 
     // And when it is the last step, the run ends with no final fit rather than
     // with `final-fit.yaml` describing a different model than `final.ferx`.
-    let scripted = Scripted {
-        no_fit_at: Some(6),
-        ..Scripted::new()
-    };
+    let scripted = Scripted { no_fit_at: Some(6), ..Scripted::new() };
     let result = run(&scripted, &options, &config());
-    assert!(
-        result.final_fit.is_none(),
-        "the fit beside `final.ferx` is another model's"
-    );
+    assert!(result.final_fit.is_none(), "the fit beside `final.ferx` is another model's");
 }
 
 /// A run cancelled during its start fit still writes `final.ferx`, whose
@@ -795,10 +618,7 @@ fn a_step_that_cannot_fit_its_selection_drops_the_previous_fit() {
 /// `final-fit` they do not reproduce.
 #[test]
 fn a_cancelled_start_still_leaves_a_seeded_final_model() {
-    let scripted = Scripted {
-        start_cancel: true,
-        ..Scripted::new()
-    };
+    let scripted = Scripted { start_cancel: true, ..Scripted::new() };
     let result = run(&scripted, &AmdOptions::default(), &config());
     assert!(result.cancelled);
     let mut expected = warfarin();
@@ -820,10 +640,7 @@ fn a_skipped_step_is_reported_rather_than_dropped() {
     let config = config_with("ABSORPTION([INST,FO])", "");
     let ctx = Context::default();
     let plan = plan(&AmdOptions::default(), &config.mfl, &ctx).unwrap();
-    let options = AmdOptions {
-        retries: Retries::Skip,
-        ..Default::default()
-    };
+    let options = AmdOptions { retries: Retries::Skip, ..Default::default() };
     let result = drive(&scripted, &config, &options, &plan, &warfarin(), None).unwrap();
     assert_eq!(result.steps.len(), 6);
     assert_eq!(result.ran().count(), 2, "structural and residual only");
@@ -834,10 +651,7 @@ fn a_skipped_step_is_reported_rather_than_dropped() {
         assert_eq!(s.candidates, 0);
         assert!(s.selected.is_empty());
     }
-    assert!(result
-        .rows
-        .iter()
-        .all(|r| r.tool != "iivsearch" && r.tool != "covsearch"));
+    assert!(result.rows.iter().all(|r| r.tool != "iivsearch" && r.tool != "covsearch"));
 }
 
 /// A cancelled step stops the pipeline where it is: the steps after it never
@@ -851,17 +665,10 @@ fn a_cancelled_step_stops_the_pipeline() {
     assert_eq!(result.steps.len(), 2);
     assert_eq!(
         scripted.dirs(),
-        vec![
-            "00-start",
-            "01-modelsearch",
-            "01-modelsearch-retries",
-            "02-iivsearch"
-        ]
+        vec!["00-start", "01-modelsearch", "01-modelsearch-retries", "02-iivsearch"]
     );
     // No retries pass on the step that was cancelled.
-    assert!(!scripted
-        .dirs()
-        .contains(&"02-iivsearch-retries".to_string()));
+    assert!(!scripted.dirs().contains(&"02-iivsearch-retries".to_string()));
 }
 
 /// A start model that produces no fit is an error, not a pipeline that runs
@@ -872,19 +679,10 @@ fn a_start_model_that_cannot_be_fitted_is_an_error() {
     let mut scripted = Scripted::new();
     scripted.no_start_fit = true;
     let config = config();
-    let ctx = Context {
-        iov_column: Some("OCC".into()),
-    };
+    let ctx = Context { iov_column: Some("OCC".into()) };
     let plan = plan(&AmdOptions::default(), &config.mfl, &ctx).unwrap();
-    let error = drive(
-        &scripted,
-        &config,
-        &AmdOptions::default(),
-        &plan,
-        &warfarin(),
-        None,
-    )
-    .unwrap_err();
+    let error =
+        drive(&scripted, &config, &AmdOptions::default(), &plan, &warfarin(), None).unwrap_err();
     assert!(error.contains("no baseline"), "{error}");
     assert_eq!(scripted.dirs(), vec!["00-start"], "no step ran");
 }
@@ -911,19 +709,8 @@ fn progress_reports_the_plan_and_every_step() {
     };
     let config = config_with("ABSORPTION([INST,FO])", "");
     let plan = plan(&AmdOptions::default(), &config.mfl, &Context::default()).unwrap();
-    let options = AmdOptions {
-        retries: Retries::Final,
-        ..Default::default()
-    };
-    drive(
-        &scripted,
-        &config,
-        &options,
-        &plan,
-        &warfarin(),
-        Some(&progress),
-    )
-    .unwrap();
+    let options = AmdOptions { retries: Retries::Final, ..Default::default() };
+    drive(&scripted, &config, &options, &plan, &warfarin(), Some(&progress)).unwrap();
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen[0], "planned 6");
     assert_eq!(&seen[1..3], ["start", "start done"]);
@@ -1054,19 +841,10 @@ fn the_init_stall_gate_is_off_inside_a_step_and_said_so() {
     // estimates, which is exactly what #751 is about — so the fit is made from
     // the file's own config, not from a step's narrowed one.
     let scripted = Scripted::new();
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Skip,
-            ..Default::default()
-        },
-        &config,
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Skip, ..Default::default() }, &config);
     assert_eq!(scripted.calls()[0].kind, "start");
-    assert!(
-        scripted.calls()[0].stall_gate,
-        "the start fit lost the init-stall gate"
-    );
+    assert!(scripted.calls()[0].stall_gate, "the start fit lost the init-stall gate");
     assert!(
         result.notes.iter().any(|n| n == INIT_STALL_NOTE),
         "the relaxation is not in the notes: {:?}",
@@ -1081,27 +859,16 @@ fn a_starting_model_that_fails_the_gate_is_reported() {
     struct BadStart(Scripted);
     impl StepRunner for BadStart {
         fn run_step(
-            &self,
-            index: usize,
-            step: Step,
-            dir_name: &str,
-            config: &SearchConfig,
+            &self, index: usize, step: Step, dir_name: &str, config: &SearchConfig,
             model: &ModelText,
         ) -> Result<StepOutput, String> {
             self.0.run_step(index, step, dir_name, config, model)
         }
         fn fit_one(
-            &self,
-            index: usize,
-            tool: &'static str,
-            dir_name: &str,
-            config: &SearchConfig,
-            model: &ModelText,
-            n_starts: usize,
+            &self, index: usize, tool: &'static str, dir_name: &str, config: &SearchConfig,
+            model: &ModelText, n_starts: usize,
         ) -> Result<StepOutput, String> {
-            let mut out = self
-                .0
-                .fit_one(index, tool, dir_name, config, model, n_starts)?;
+            let mut out = self.0.fit_one(index, tool, dir_name, config, model, n_starts)?;
             if tool == "start" {
                 out.passed = false;
                 out.rows[0].passed = false;
@@ -1112,10 +879,7 @@ fn a_starting_model_that_fails_the_gate_is_reported() {
     }
     let result = run(
         &BadStart(Scripted::new()),
-        &AmdOptions {
-            retries: Retries::Skip,
-            ..Default::default()
-        },
+        &AmdOptions { retries: Retries::Skip, ..Default::default() },
         &config(),
     );
     let note = result
@@ -1150,14 +914,8 @@ fn the_residual_step_is_handed_no_space() {
 fn a_failed_step_is_reported_and_the_pipeline_carries_on() {
     let mut scripted = Scripted::new();
     scripted.fail_at = Some(2);
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Skip,
-            ..Default::default()
-        },
-        &config(),
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Skip, ..Default::default() }, &config());
     assert!(!result.cancelled);
     assert_eq!(result.steps.len(), 6, "every planned step is reported");
     let failed: Vec<&StepOutcome> = result.failures().collect();
@@ -1166,10 +924,7 @@ fn a_failed_step_is_reported_and_the_pipeline_carries_on() {
     assert_eq!(failed[0].status(), "failed");
     assert!(failed[0].reason().unwrap().contains("not a covariate"));
     assert!(!failed[0].ok() && failed[0].ran());
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("failed and was skipped over")));
+    assert!(result.notes.iter().any(|n| n.contains("failed and was skipped over")));
 
     // The next step starts from the model the failed one was handed, not from
     // nothing.
@@ -1194,49 +949,27 @@ fn a_failed_retries_pass_keeps_the_selected_model() {
     struct NoRetries(Scripted);
     impl StepRunner for NoRetries {
         fn run_step(
-            &self,
-            index: usize,
-            step: Step,
-            dir_name: &str,
-            config: &SearchConfig,
+            &self, index: usize, step: Step, dir_name: &str, config: &SearchConfig,
             model: &ModelText,
         ) -> Result<StepOutput, String> {
             self.0.run_step(index, step, dir_name, config, model)
         }
         fn fit_one(
-            &self,
-            index: usize,
-            tool: &'static str,
-            dir_name: &str,
-            config: &SearchConfig,
-            model: &ModelText,
-            n_starts: usize,
+            &self, index: usize, tool: &'static str, dir_name: &str, config: &SearchConfig,
+            model: &ModelText, n_starts: usize,
         ) -> Result<StepOutput, String> {
             if tool == "retries" {
                 return Err("the run directory is not writable".into());
             }
-            self.0
-                .fit_one(index, tool, dir_name, config, model, n_starts)
+            self.0.fit_one(index, tool, dir_name, config, model, n_starts)
         }
     }
     let runner = NoRetries(Scripted::new());
-    let result = run(
-        &runner,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config(),
-    );
-    assert_eq!(
-        result.final_fit.as_ref().map(|f| f.ofv),
-        Some(runner.0.step_ofv(6))
-    );
+    let result =
+        run(&runner, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config());
+    assert_eq!(result.final_fit.as_ref().map(|f| f.ofv), Some(runner.0.step_ofv(6)));
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("could not be run") && n.contains("not writable")),
+        result.notes.iter().any(|n| n.contains("could not be run") && n.contains("not writable")),
         "{:?}",
         result.notes
     );
@@ -1253,24 +986,15 @@ fn a_retries_pass_that_fails_the_gate_is_not_adopted() {
     let mut scripted = Scripted::new();
     scripted.retries_fail_gate = true;
     scripted.retry_delta = -50.0;
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config(),
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config());
     assert_eq!(
         result.final_fit.as_ref().map(|f| f.ofv),
         Some(scripted.step_ofv(6)),
         "a fit the gate rejected was adopted because its OFV was lower"
     );
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("did not pass the strictness gate")),
+        result.notes.iter().any(|n| n.contains("did not pass the strictness gate")),
         "{:?}",
         result.notes
     );
@@ -1311,10 +1035,7 @@ fn an_improved_all_final_retry_updates_the_step_it_belongs_to() {
             );
         }
     }
-    assert_eq!(
-        result.final_fit.as_ref().map(|f| f.ofv),
-        ran.last().unwrap().ofv_after
-    );
+    assert_eq!(result.final_fit.as_ref().map(|f| f.ofv), ran.last().unwrap().ofv_after);
 }
 
 /// A pass that is **not** adopted leaves the step's numbers alone — the other
@@ -1345,18 +1066,11 @@ fn a_retry_row_is_selected_only_when_its_fit_is_adopted() {
     let retry_row = |scripted: Scripted| {
         let result = run(
             &scripted,
-            &AmdOptions {
-                retries: Retries::Final,
-                ..Default::default()
-            },
+            &AmdOptions { retries: Retries::Final, ..Default::default() },
             &config(),
         );
-        let row = result
-            .rows
-            .iter()
-            .find(|r| r.tool == "retries")
-            .expect("the pass has a row")
-            .clone();
+        let row =
+            result.rows.iter().find(|r| r.tool == "retries").expect("the pass has a row").clone();
         (row, result)
     };
 
@@ -1379,10 +1093,7 @@ fn a_retry_row_is_selected_only_when_its_fit_is_adopted() {
     scripted.retry_delta = -50.0;
     let (row, result) = retry_row(scripted);
     assert!(!row.selected, "a rejected retry was marked selected");
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("did not pass the strictness gate")));
+    assert!(result.notes.iter().any(|n| n.contains("did not pass the strictness gate")));
     // And the summary does not print SELECTED for it.
     let rendered = crate::amd::report::render_summary(&result);
     assert!(
@@ -1405,23 +1116,14 @@ fn cancellation_during_a_retries_pass_stops_the_pipeline() {
     let result = run(&scripted, &AmdOptions::default(), &config());
     assert!(result.cancelled, "the cancellation was swallowed");
     assert_eq!(result.steps.len(), 1, "a step ran after the cancellation");
-    assert_eq!(
-        scripted.dirs(),
-        vec!["00-start", "01-modelsearch", "01-modelsearch-retries"]
-    );
+    assert_eq!(scripted.dirs(), vec!["00-start", "01-modelsearch", "01-modelsearch-retries"]);
 
     // During the final pass: nothing follows it, but the run is still
     // cancelled and the CLI's exit code depends on saying so.
     let mut scripted = Scripted::new();
     scripted.retries_cancel = true;
-    let result = run(
-        &scripted,
-        &AmdOptions {
-            retries: Retries::Final,
-            ..Default::default()
-        },
-        &config(),
-    );
+    let result =
+        run(&scripted, &AmdOptions { retries: Retries::Final, ..Default::default() }, &config());
     assert!(result.cancelled);
     assert_eq!(result.ran().count(), 6, "every step ran before the pass");
 }
@@ -1484,13 +1186,7 @@ fn the_production_allometry_step_reports_both_of_its_fits() {
     };
     let model = ModelText::parse(TWO_CPT_WT).expect("model text");
     let output = runner
-        .run_step(
-            5,
-            Step::Allometry,
-            "5-allometry",
-            &config_with("ALLOMETRY(WT,70)", ""),
-            &model,
-        )
+        .run_step(5, Step::Allometry, "5-allometry", &config_with("ALLOMETRY(WT,70)", ""), &model)
         .expect("the allometry step runs");
 
     let mut heard: Vec<_> = seen
@@ -1498,33 +1194,20 @@ fn the_production_allometry_step_reports_both_of_its_fits() {
         .unwrap()
         .into_iter()
         .map(|e| match e {
-            AmdEvent::CandidateFinished {
-                index,
-                tool,
-                candidate,
-            } => (index, tool, candidate),
+            AmdEvent::CandidateFinished { index, tool, candidate } => (index, tool, candidate),
             other => panic!("only candidate events are forwarded, got {other:?}"),
         })
         .collect();
     heard.sort_by(|a, b| a.2.id.cmp(&b.2.id));
     assert_eq!(
-        heard
-            .iter()
-            .map(|(i, t, c)| (*i, *t, c.step.as_str(), c.id.as_str()))
-            .collect::<Vec<_>>(),
-        [
-            (5, "allometry", "5-allometry", "allometric"),
-            (5, "allometry", "5-allometry", "base"),
-        ]
+        heard.iter().map(|(i, t, c)| (*i, *t, c.step.as_str(), c.id.as_str())).collect::<Vec<_>>(),
+        [(5, "allometry", "5-allometry", "allometric"), (5, "allometry", "5-allometry", "base"),]
     );
     // The events describe the fits the step's rows report.
     for (_, _, c) in &heard {
         let ofv = c.ofv.expect("a fitted candidate reports its OFV");
         assert!(
-            output
-                .rows
-                .iter()
-                .any(|r| r.ofv.map(f64::to_bits) == Some(ofv.to_bits())),
+            output.rows.iter().any(|r| r.ofv.map(f64::to_bits) == Some(ofv.to_bits())),
             "{} at {ofv} matches no row: {:?}",
             c.id,
             output.rows

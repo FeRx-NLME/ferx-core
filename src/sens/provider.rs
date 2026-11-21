@@ -72,8 +72,7 @@ const N_PK: usize = crate::types::MAX_PK_PARAMS;
 /// `const_pk_slots`, and seeded as a constant by the recorders, so it is covered too.
 /// The parser leaves no third case: an argument that is neither is a parse error.
 fn prog_covers_required_pk_slots(
-    model: &CompiledModel,
-    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel, prog: &crate::parser::model_parser::IndivParamProgram,
 ) -> bool {
     let prog_slots = prog.pk_slots_ref();
     let literal = model.indiv_param_partials.const_pk_slots();
@@ -113,30 +112,21 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 /// these predictions, the outer gradient 100 % off).
 #[inline]
 fn ss_lag_past_ii<T: PkNum>(
-    dose: &DoseEvent,
-    t_obs: f64,
-    lag_val: f64,
-    lag_d: T,
+    dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T,
 ) -> Option<(T, Option<T>)> {
     use crate::sens::num::BranchCmp as B;
     if !(dose.ss && dose.ii > 0.0 && t_obs >= dose.time && lag_d.br_cmp_c(B::Gt, dose.ii)) {
         return None;
     }
     let since = T::from_f64(t_obs - dose.time);
-    Some((
-        since,
-        arrived(dose, t_obs, lag_val, lag_d).then(|| since - lag_d),
-    ))
+    Some((since, arrived(dose, t_obs, lag_val, lag_d).then(|| since - lag_d)))
 }
 
 /// The elapsed times `dose` is superposed at by `t_obs`: [`ss_lag_past_ii`]'s pair past
 /// `lag = II`, else [`lagged_elapsed`]'s one term (the only route to it). `None`: no term.
 #[inline]
 fn lagged_terms<T: PkNum>(
-    dose: &DoseEvent,
-    t_obs: f64,
-    lag_val: f64,
-    lag_d: T,
+    dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T,
 ) -> Option<(T, Option<T>)> {
     ss_lag_past_ii(dose, t_obs, lag_val, lag_d)
         .or_else(|| lagged_elapsed(dose, t_obs, lag_val, lag_d).map(|e| (e, None)))
@@ -232,9 +222,7 @@ impl<T: PkNum> SeededPkDuals<T> {
                 self.cl_d, self.v1_d, self.q_d, self.v2_d, self.q3_d, self.v3_d,
             ));
         } else if flags.two_cpt {
-            self.two = Some(super::two_cpt::TwoCpt::new(
-                self.cl_d, self.v1_d, self.q_d, self.v2_d,
-            ));
+            self.two = Some(super::two_cpt::TwoCpt::new(self.cl_d, self.v1_d, self.q_d, self.v2_d));
         }
         self
     }
@@ -264,12 +252,7 @@ impl<T: PkNum> SeededPkDuals<T> {
 /// walker's `event_reset_floor`.
 #[inline]
 fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
-    subject
-        .reset_times
-        .iter()
-        .copied()
-        .filter(|&r| r <= t_obs)
-        .fold(f64::NEG_INFINITY, f64::max)
+    subject.reset_times.iter().copied().filter(|&r| r <= t_obs).fold(f64::NEG_INFINITY, f64::max)
 }
 
 /// Superpose one observation's dose contributions through the closed-form PK kernel the
@@ -283,11 +266,7 @@ fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
 /// `analytic_static_predictions` shares the one dispatch ladder.
 #[inline]
 fn superpose_doses<T: PkNum>(
-    d: &SeededPkDuals<T>,
-    flags: PkClassFlags,
-    subject: &Subject,
-    t_obs: f64,
-    reset_floor: f64,
+    d: &SeededPkDuals<T>, flags: PkClassFlags, subject: &Subject, t_obs: f64, reset_floor: f64,
 ) -> T {
     let mut fd = T::from_f64(0.0);
     // The value path's `SS=1` reset (#1576): `crate::pk::predict_concentration`.
@@ -347,7 +326,9 @@ fn superpose_doses<T: PkNum>(
 
 /// The model-level closed-form scope check behind `tvcov_analytical_supported` (and,
 /// before #2093, the retired `analytical_supported`) — everything except the
-/// `TIME`-routing clause (#637 review #1).
+/// `TIME`-routing clause (#637 review #1). It decides only whether the transit/IG absorption
+/// walk serves a subject or the exact ODE twin does (`walk_eligible`); a model it declines
+/// is differentiated by the twin, not by finite differences.
 fn analytical_supported_core(model: &CompiledModel) -> bool {
     // A compartment-free model (#811) carries a *placeholder* `pk_model` that the
     // `matches!` below would happily admit — and then every walk here would
@@ -375,16 +356,13 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         && scaling_supported(model)
         && init_supported(model)
         // Every individual-parameter slot must be one we differentiate; a slot outside
-        // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
+        // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) is not served by
+        // the absorption walk: `walk_eligible` keeps such a subject on the exact ODE twin.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
         && closed_form_slot_count_supported(model)
 }
 
-/// Widest differentiated-slot count the closed-form scope admits. Historically (before
-/// #2093) the forward provider's outer (`subject_sensitivities` → `run_obs`) and inner
-/// (`run_obs_grad`) dispatch tables enumerated `1..=9` and a wider model fell through their
-/// `_ => None` arm; the bound is kept so the absorption-walk scope
-/// (`absorption_walk_sens_in_scope`) is unchanged.
+/// Widest differentiated-slot count `closed_form_slot_count_supported` admits.
 const MAX_CLOSED_FORM_SLOTS: usize = 9;
 
 const ANALYTIC_MIXED_N: [usize; 2] = [4, 6];
@@ -401,22 +379,11 @@ thread_local! {
 
 /// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
 ///
-/// Without this the count is unbounded: `analytical_supported_core` checks only that every
-/// slot *maps* via `slot_to_dim`, never how many there are. A readout that claims several
-/// spare slots (`allocate_readout_extra_slots` — text-referenced parameters, and synthetic
-/// direct θ/η as of #486) can push `pk_slots_ref()` past 9 on top of the structural set, so
-/// (before #2093) the then-predicate `analytical_supported` returned `true`, `build_info::gradient_method{,_inner}` persisted
-/// "analytic", and then *every* subject fell through `const_dispatch!`'s `_ => None` to
-/// finite differences at ~10× the cost — precisely the "claim analytic then FD every
-/// subject" drift the route predicates exist to prevent (#637). Declining
-/// here changes no numbers (those subjects already ran on FD); it makes the reported method
-/// match the route (PR #950 review #2).
-///
-/// Bounds the **program** slot list, which is what the readout allocator grows. (From #1899
-/// until its retirement in #2093 the `lognormal_param_derivatives` fallback dispatched on the
-/// same list — `CompiledModel::pk_slot_rows` is the program's `(pk_slot, var_slot)` pairs
-/// whenever a program exists — so the bound covered both routes; before #1899 it keyed on
-/// `model.pk_indices`, which this gate never saw.)
+/// `analytical_supported_core` checks only that every slot *maps* via `slot_to_dim`, never how
+/// many there are; a readout that claims several spare slots (`allocate_readout_extra_slots`)
+/// can push `pk_slots_ref()` past 9 on top of the structural set. Bounds the **program** slot
+/// list, which is what the readout allocator grows. Past the cap the walk declines and
+/// `walk_eligible` keeps the exact ODE twin (no finite differences).
 fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
     model
         .indiv_param_partials
@@ -431,9 +398,7 @@ fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
 /// readout an observation whose CMT has no entry is a `NaN` prediction, as
 /// `OdeReadout::eval` serves it.
 pub(crate) fn readout_program_at<'a>(
-    ar: &'a crate::types::AnalyticReadout,
-    subject: &Subject,
-    j: usize,
+    ar: &'a crate::types::AnalyticReadout, subject: &Subject, j: usize,
 ) -> Option<Option<&'a crate::parser::model_parser::OdeOutputProgram>> {
     match &ar.readout {
         crate::ode::OdeReadout::Single(_) => ar.program.as_ref().map(Some),
@@ -460,10 +425,7 @@ pub(crate) fn readout_program_at<'a>(
 /// `obs_params(j)` is the flat PK-slot vector at observation `j`. `None` for a readout with no
 /// compiled program (see [`readout_program_at`]).
 pub(crate) fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    conc: Vec<T>,
-    depot: Option<&[T]>,
+    model: &CompiledModel, subject: &Subject, conc: Vec<T>, depot: Option<&[T]>,
     obs_params: &dyn Fn(usize) -> std::borrow::Cow<'p, [T; N_PK]>,
     leaves: crate::sens::ode_provider::ReadoutLeaves<'_, T>,
 ) -> Option<Vec<T>> {
@@ -516,9 +478,7 @@ pub(crate) fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
 /// resets, a dose off the default compartment), so none reaches here.
 /// `dual_of(slot, value)` seeds each PK slot.
 pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
-    subject: &Subject,
-    pk: &crate::types::PkParams,
-    dual_of: &dyn Fn(usize, f64) -> T,
+    subject: &Subject, pk: &crate::types::PkParams, dual_of: &dyn Fn(usize, f64) -> T,
 ) -> Vec<T> {
     let d = SeededPkDuals::<T>::seed_with(pk, dual_of);
     subject
@@ -568,20 +528,17 @@ pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
 /// walks differentiate exactly (#524): every init carries a compiled
 /// `amount_deriv` program and the `(θ, η)` axis count fits the init dispatch
 /// table (`1..=MAX_SCALE_AXES`, shared with the scale program). An init-free
-/// model is trivially supported; a hand-built init with no program routes to FD.
+/// model is trivially supported; a hand-built init with no program is not served by the walk.
 fn init_supported(model: &CompiledModel) -> bool {
     model.analytical_init.is_empty()
-        || (model
-            .analytical_init
-            .iter()
-            .all(|i| i.amount_deriv.is_some()))
+        || (model.analytical_init.iter().all(|i| i.amount_deriv.is_some()))
 }
 
 /// Whether the model's output scaling is one the closed-form walks differentiate exactly:
 /// `None` / constant `ScalarScale` (a per-jet divisor, `∂k/∂η = ∂k/∂θ = 0`), or an
 /// `ExpressionScale` carrying a `Dual2`-differentiable program whose axis counts
 /// match the model. `ExpressionScale` without a program
-/// and `PerCmt` route to FD.
+/// and `PerCmt` are not served by the walk.
 fn scaling_supported(model: &CompiledModel) -> bool {
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => true,
@@ -624,9 +581,8 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
 /// forced?" — off the *same* predicate the live decision uses, rather than a second
 /// copy of the scope list that would drift from it.
 pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
-    // The adjoint gradient's model scope: it carries none of the retired (pre-#2093) forward
-    // provider's width or slot limits, and serves kappa with a residual `correlation … by` line (#1082 PR5,
-    // #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
+    // The adjoint gradient's model scope: it serves kappa with a residual `correlation … by`
+    // line (#1082 PR5, #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
     crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
 }
 
@@ -637,7 +593,7 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
 // boundary, then the carried-over amount continues with occasion-2 params. Dose
 // superposition with a single per-subject `pk` (the static path)
 // cannot represent that, so IOV runs through the **event-driven sensitivity
-// walk** (`crate::sens::propagate::event_driven_sens_one_cpt_g`) instead — the
+// walk** (`crate::sens::propagate::event_driven_sens_g`) instead — the
 // same engine production's `predict_iov` uses for the f64 prediction, here over
 // `Dual2`.
 //
@@ -645,9 +601,8 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
 // with `K = iov_occasion_groups(subject).len()`. The adjoint differentiates over that
 // stacked vector (the subject's own `[η, κ]` width, uncapped), so the caller's block-Ω
-// (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the clause-by-clause history
-// below describes the pre-#2093 forward provider; the predicate now only gates the
-// absorption-walk routing, `absorption_walk_sens_in_scope`.)
+// (BSV ⊕ K·IOV) assembly consumes it directly. (The clause-by-clause predicates below now
+// only gate the absorption-walk routing, `absorption_walk_sens_in_scope`.)
 
 /// Dual width of one IOV program evaluation on the outer builder: the declared θ, the
 /// combined `[η_bsv, κ]`, and — for a `[covariate_nn]` model — one axis per network
@@ -763,11 +718,7 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     // would otherwise silently drop it), so require every init to carry its amount program; the
     // stacked axis count `n_theta + n_stacked` is bounded by the walk's `1..=24` dispatch (out
     // of range → the walk returns `None` → FD).
-    if model
-        .analytical_init
-        .iter()
-        .any(|i| i.amount_deriv.is_none())
-    {
+    if model.analytical_init.iter().any(|i| i.amount_deriv.is_none()) {
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;
@@ -841,7 +792,8 @@ pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Sub
 /// same shape as IOV, handled by the event-driven Dual2 walk rather than dose
 /// superposition).
 ///
-/// First cut (the rest routes to FD until the per-event dual walk is extended):
+/// First cut (the rest stays on the exact ODE twin, `walk_eligible`, until the per-event dual
+/// walk is extended):
 /// no IOV (the analytical gate already requires `n_kappa == 0`), no dose lagtime,
 /// no LTBS, and only `None` / constant `ScalarScale` output scaling. A constant
 /// `ScalarScale` divisor is covariate-independent, so it divides the whole jet
@@ -868,9 +820,9 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // the subject-static `t = 0` snapshot — BEFORE scaling, matching production's
     // `add_analytical_init` on `compute_predictions_with_tv` (which uses that same snapshot for
     // both amount and decay, so the impulse is independent of the TV-cov switching). Require
-    // `init_supported`: a hand-built init with no `amount_deriv` program still routes to FD
-    // there (before #2093 it also bounded the `(θ,η)` axis count to the retired
-    // `dispatch_init_impulse!` table).
+    // `init_supported`: a hand-built init with no `amount_deriv` program is not walk-served
+    // there (the subject stays on the exact ODE twin; before #2093 it also bounded the
+    // `(θ,η)` axis count to the retired `dispatch_init_impulse!` table).
     if !init_supported(model) {
         return false;
     }
@@ -892,7 +844,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     }
     // A model that reads a generated weight θ *directly* (`… + B_TYPICAL_PK_2_1`) breaks
     // the output-channel factorization the weight chain relies on; the parser records it
-    // and the model routes to FD, loudly (same predicate `nn_theta_gradient` uses).
+    // and the model is not walk-served (same predicate `nn_theta_gradient` uses).
     if nn_weight_theta_count(model) > 0 && !nn_output_chain_supported(model) {
         return false;
     }
@@ -900,7 +852,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // η-dependent `ExpressionScale` whose subject-static quotient is applied post-walk by
     // the adjoint's `closed_form_finish` (the same output stage the dose-superposition path
     // uses, #486 — closes the TV-cov + expression-scale gap). `scaling_supported` bounds the
-    // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is now admitted
+    // scale program to the dispatch table; `PerCmt` is still not walk-served. LTBS is now admitted
     // (#486): `closed_form_finish` applies the `ln(f)` transform LAST, after any
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
     // whole transform is post-walk on the closed-form path, unlike the ODE in-walk log). The
@@ -927,11 +879,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
 /// network (and always `0` without the `nn` feature, where the field does not exist).
 #[cfg(feature = "nn")]
 pub(crate) fn nn_weight_theta_count(model: &CompiledModel) -> usize {
-    model
-        .covariate_nns
-        .iter()
-        .map(|nn| nn.mapper.mlp().n_weights())
-        .sum()
+    model.covariate_nns.iter().map(|nn| nn.mapper.mlp().n_weights()).sum()
 }
 
 #[cfg(not(feature = "nn"))]
@@ -944,11 +892,7 @@ pub(crate) fn nn_weight_theta_count(_model: &CompiledModel) -> usize {
 /// declaration order). `0` without a network.
 #[cfg(feature = "nn")]
 fn nn_output_count(model: &CompiledModel) -> usize {
-    model
-        .covariate_nns
-        .iter()
-        .map(|nn| nn.mapper.mlp().n_outputs())
-        .sum()
+    model.covariate_nns.iter().map(|nn| nn.mapper.mlp().n_outputs()).sum()
 }
 
 #[cfg(not(feature = "nn"))]
@@ -1022,9 +966,7 @@ fn modeled_doses_resolvable(model: &CompiledModel, subject: &Subject) -> bool {
 /// re-run here, #486 review). The matching derivative twin is
 /// `modeled_dose_inf_duals`.
 fn resolve_eff_doses<'a>(
-    model: &CompiledModel,
-    subject: &'a Subject,
-    dose_pk: impl Fn(usize) -> crate::types::PkParams,
+    model: &CompiledModel, subject: &'a Subject, dose_pk: impl Fn(usize) -> crate::types::PkParams,
 ) -> std::borrow::Cow<'a, [crate::types::DoseEvent]> {
     let bio = model.has_bioavailability() && subject.doses.iter().any(|d| d.is_infusion());
     if subject.all_doses_fixed() && !bio {
@@ -1085,16 +1027,12 @@ fn dose_lagtime_values(model: &CompiledModel, dose_pk: &[crate::types::PkParams]
 /// `slot_dual(dose_k, pk_slot)` is the same seeder `modeled_dose_inf_duals` takes, so both
 /// read the identical per-dose snapshot.
 fn dose_lag_duals<T: crate::sens::num::PkNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    slot_dual: impl Fn(usize, usize) -> T,
+    model: &CompiledModel, subject: &Subject, slot_dual: impl Fn(usize, usize) -> T,
 ) -> Vec<T> {
     if !model.has_lagtime() {
         return Vec::new();
     }
-    (0..subject.doses.len())
-        .map(|k| slot_dual(k, PK_IDX_LAGTIME))
-        .collect()
+    (0..subject.doses.len()).map(|k| slot_dual(k, PK_IDX_LAGTIME)).collect()
 }
 
 /// Per-dose infusion duals `(rate, window)` for the event walk
@@ -1109,9 +1047,7 @@ fn dose_lag_duals<T: crate::sens::num::PkNum>(
 /// non-positive `D`/`R` is clamped to its floor, mirroring the f64
 /// `DoseEvent::resolve_rate`.
 fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    slot_dual: impl Fn(usize, usize) -> T,
+    model: &CompiledModel, subject: &Subject, slot_dual: impl Fn(usize, usize) -> T,
 ) -> Vec<Option<(T, T)>> {
     let bio = model.has_bioavailability() && subject.doses.iter().any(|d| d.is_infusion());
     if subject.all_doses_fixed() && !bio {
@@ -1176,10 +1112,7 @@ thread_local! {
 /// timing and infusion fields, the lag times, and the observation, pk-only and reset
 /// times), so a hit is exactly a rebuild's result; a mutated subject or a moved lag misses.
 fn cached_event_schedule(
-    subject: &Subject,
-    pk_model: PkModel,
-    doses: &[DoseEvent],
-    lagtimes: &[f64],
+    subject: &Subject, pk_model: PkModel, doses: &[DoseEvent], lagtimes: &[f64],
 ) -> std::rc::Rc<crate::pk::event_driven::EventSchedule> {
     SCHEDULE_CACHE.with(|cell| {
         let (scratch, entry) = &mut *cell.borrow_mut();
@@ -1218,10 +1151,7 @@ fn cached_event_schedule(
         let schedule = std::rc::Rc::new(crate::pk::event_driven::EventSchedule::for_subject(
             subject, pk_model, doses, lagtimes,
         ));
-        *entry = Some(ScheduleCacheEntry {
-            key: scratch.clone(),
-            schedule: schedule.clone(),
-        });
+        *entry = Some(ScheduleCacheEntry { key: scratch.clone(), schedule: schedule.clone() });
         schedule
     })
 }
@@ -1238,13 +1168,10 @@ fn cached_event_schedule(
 /// moving breaks, or an absorption walk the closed form declines).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    dose_pk: &[crate::types::PkParams],
+    model: &CompiledModel, subject: &Subject, dose_pk: &[crate::types::PkParams],
     pk_at_dose: &[crate::sens::propagate::PkDual<T>],
     pk_at_obs: &[crate::sens::propagate::PkDual<T>],
-    pk_at_pk_only: &[crate::sens::propagate::PkDual<T>],
-    slot_dual: &dyn Fn(usize, usize) -> T,
+    pk_at_pk_only: &[crate::sens::propagate::PkDual<T>], slot_dual: &dyn Fn(usize, usize) -> T,
 ) -> Option<Vec<T>> {
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
     // schedule's break times, and build the per-dose duals so the injected rate and
@@ -1296,26 +1223,17 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
 /// models alike — or `None` for a subject no recorder serves. FREM pseudo-observation rows
 /// carry their exact `θ_i + η_e`.
 pub fn subject_eta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta)
 }
 
 /// `subject_eta_grad`'s `∂f/∂η` as a row-major `n_obs × n_eta` matrix.
 pub fn subject_eta_jacobian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<Vec<f64>> {
     Some(
-        subject_eta_grad(model, subject, theta, eta)?
-            .into_iter()
-            .flat_map(|o| o.df_deta)
-            .collect(),
+        subject_eta_grad(model, subject, theta, eta)?.into_iter().flat_map(|o| o.df_deta).collect(),
     )
 }
 
@@ -1334,27 +1252,14 @@ pub struct ObsGrad {
 /// one observation `j` decays with (`None`: `amount`'s, the non-IOV convention). `None`
 /// when an init has no compiled amount program.
 pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[T],
-    eta: &[T],
-    amount: &[T],
-    decay: Option<&[Vec<T>]>,
-    preds: &mut [T],
+    model: &CompiledModel, subject: &Subject, theta: &[T], eta: &[T], amount: &[T],
+    decay: Option<&[Vec<T>]>, preds: &mut [T],
 ) -> Option<()> {
-    let first_reset = subject
-        .reset_times
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let first_reset = subject.reset_times.iter().copied().fold(f64::INFINITY, f64::min);
     let slot = |p: &[T], s: usize| p.get(s).copied().unwrap_or(T::from_f64(0.0));
     for init in &model.analytical_init {
         let prog = init.amount_deriv.as_ref()?;
-        let vars: Vec<T> = prog
-            .var_to_pk_slot()
-            .iter()
-            .map(|&s| slot(amount, s))
-            .collect();
+        let vars: Vec<T> = prog.var_to_pk_slot().iter().map(|&s| slot(amount, s)).collect();
         let a0 = prog.eval_scale_g(theta, eta, &subject.covariates, &vars);
         // Only a non-finite amount is skipped. A zero one still carries `∂A₀/∂(θ, η)`, which
         // reaches `∂C` as `kernel · ∂A₀` (#527): skipping it zeroes that gradient.
@@ -1365,9 +1270,7 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
             if t < 0.0 || t >= first_reset {
                 continue;
             }
-            let p: &[T] = decay
-                .and_then(|d| d.get(j))
-                .map_or(amount, |v| v.as_slice());
+            let p: &[T] = decay.and_then(|d| d.get(j)).map_or(amount, |v| v.as_slice());
             let c = crate::pk::analytical_init_concentration_g(
                 model.pk_model,
                 init.cmt,
@@ -1422,12 +1325,8 @@ pub(crate) fn closed_form_model_scope(model: &CompiledModel) -> bool {
 /// adjoint divides by it as its own leaf). FREM pseudo-observation rows are
 /// predicted here like any row; the adjoint's likelihood kernel replaces them.
 pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    pk: &crate::types::PkParams,
-    slot_dual: impl Fn(usize) -> Option<T>,
-    theta: &[T],
-    eta: &[T],
+    model: &CompiledModel, subject: &Subject, pk: &crate::types::PkParams,
+    slot_dual: impl Fn(usize) -> Option<T>, theta: &[T], eta: &[T],
 ) -> Option<Vec<T>> {
     if model.is_algebraic()
         || model.ode_spec.is_some()
@@ -1464,13 +1363,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
     let mut conc: Vec<T> = crate::scratch::take_for(subject.obs_times.len());
     conc.extend(subject.obs_times.iter().map(|&t_obs| {
         T::chunk_mark();
-        let fd = superpose_doses(
-            &seeded,
-            flags,
-            subject,
-            t_obs,
-            reset_floor_at(subject, t_obs),
-        );
+        let fd = superpose_doses(&seeded, flags, subject, t_obs, reset_floor_at(subject, t_obs));
         // Mirror production's `conc.max(0.0)`.
         if fd.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
             T::from_f64(0.0)
@@ -1488,9 +1381,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
     let Some(ar) = model.analytic_readout.as_ref() else {
         return Some(conc);
     };
-    let depot = ar
-        .references_depot()
-        .then(|| closed_form_depot_amounts_g(subject, pk, &dual_of));
+    let depot = ar.references_depot().then(|| closed_form_depot_amounts_g(subject, pk, &dual_of));
     let ro_pk: [T; N_PK] =
         std::array::from_fn(|s| dual_of(s, pk.values.get(s).copied().unwrap_or(0.0)));
     apply_closed_form_readout_g(
@@ -1524,10 +1415,8 @@ pub(crate) fn analytic_param_program(
 /// production's `compute_predictions` routes oral-depot infusion to the
 /// event-driven path (`subject_routes_to_event_walk`).
 pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject) -> bool {
-    matches!(
-        model.pk_model,
-        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-    ) && subject.doses.iter().any(|d| d.is_infusion())
+    matches!(model.pk_model, PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral)
+        && subject.doses.iter().any(|d| d.is_infusion())
 }
 
 /// True when a subject must be served by the event-driven per-event walk rather than

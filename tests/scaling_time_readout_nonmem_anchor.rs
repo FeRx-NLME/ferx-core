@@ -105,9 +105,8 @@ const FERX: &str = r#"
 /// (The tabled `t = 0` dose row, `IPRED = 2.0000`, is the pure baseline `A(1)/V`
 /// with the time term identically zero — it carries no information about which time
 /// the readout saw, and ferx returns no prediction for an `MDV=1` record.)
-const NONMEM_IPRED: [f64; 7] = [
-    2.2358E+00, 2.4097E+00, 2.6375E+00, 2.8406E+00, 2.8987E+00, 2.8524E+00, 2.7529E+00,
-];
+const NONMEM_IPRED: [f64; 7] =
+    [2.2358E+00, 2.4097E+00, 2.6375E+00, 2.8406E+00, 2.8987E+00, 2.8524E+00, 2.7529E+00];
 
 /// The observation times `NONMEM_IPRED` is indexed by.
 const TIMES: [f64; 7] = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
@@ -126,30 +125,18 @@ fn ferx_form_c_time_readout_matches_nonmem_error_block() {
     write!(f, "{CSV}").expect("write csv");
     f.flush().expect("flush csv");
     let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
-    let model = parse_full_model(FERX)
-        .expect("TIME in a Form C readout parses")
-        .model;
+    let model = parse_full_model(FERX).expect("TIME in a Form C readout parses").model;
 
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
-    assert_eq!(
-        preds.len(),
-        NONMEM_IPRED.len(),
-        "one prediction per observation"
-    );
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
+    assert_eq!(preds.len(), NONMEM_IPRED.len(), "one prediction per observation");
 
     // 1e-4 relative: NONMEM's table carries 5 significant figures, so this sits just
     // above the reference's own precision — tight enough that a wrong time anchor
     // (off by an observation, or stuck at 0) cannot slip through.
     for (i, (&got, &want)) in preds.iter().zip(NONMEM_IPRED.iter()).enumerate() {
         let rel = (got - want).abs() / want;
-        assert!(
-            rel < 1e-4,
-            "obs {i}: ferx {got:.6} vs NONMEM {want:.6} (rel {rel:.2e})"
-        );
+        assert!(rel < 1e-4, "obs {i}: ferx {got:.6} vs NONMEM {want:.6} (rel {rel:.2e})");
     }
 }
 

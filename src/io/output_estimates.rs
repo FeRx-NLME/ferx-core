@@ -123,9 +123,8 @@ pub(crate) fn yaml_flow_names<S: AsRef<str>>(names: &[S]) -> String {
 
 /// Whether `name` must be quoted to round-trip as that string in YAML block context.
 fn needs_quotes_in_block(name: &str) -> bool {
-    const IMPLICIT: &[&str] = &[
-        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", "",
-    ];
+    const IMPLICIT: &[&str] =
+        &["y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", ""];
     // Characters that start a non-plain node, or are reserved, at the head of a scalar.
     const INDICATORS: &[char] = &[
         '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@',
@@ -151,10 +150,7 @@ pub(crate) struct Entry {
 
 impl Entry {
     fn new(name: impl Into<String>) -> Self {
-        Entry {
-            name: name.into(),
-            fields: Vec::new(),
-        }
+        Entry { name: name.into(), fields: Vec::new() }
     }
 
     fn push(&mut self, key: &'static str, value: Value) {
@@ -211,11 +207,7 @@ pub(crate) struct Section {
 
 impl Section {
     fn new(key: &'static str) -> Self {
-        Section {
-            key,
-            comment: None,
-            entries: Vec::new(),
-        }
+        Section { key, comment: None, entries: Vec::new() }
     }
 
     /// The section as a top-level YAML key, from the blank line before its header to its
@@ -283,13 +275,9 @@ pub(crate) fn listed_theta_indices(result: &FitResult) -> Vec<usize> {
         .collect();
     #[cfg(not(feature = "nn"))]
     let nn: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let blocked: std::collections::HashSet<usize> = compact_theta_blocks(&result.theta_names)
-        .into_iter()
-        .flat_map(|(_, r)| r)
-        .collect();
-    (0..result.theta_names.len())
-        .filter(|i| !nn.contains(i) && !blocked.contains(i))
-        .collect()
+    let blocked: std::collections::HashSet<usize> =
+        compact_theta_blocks(&result.theta_names).into_iter().flat_map(|(_, r)| r).collect();
+    (0..result.theta_names.len()).filter(|i| !nn.contains(i) && !blocked.contains(i)).collect()
 }
 
 /// The spread field of a random-effect variance on its η type's scale: `cv_pct` for
@@ -309,8 +297,7 @@ pub(crate) fn spread_field(t: Option<EtaParamType>, var: f64) -> Option<(&'stati
 /// `100 · sd_at_typical_weight` (#1858), while for the other types that SD already is
 /// the console's figure.
 pub(crate) fn typical_cv_field(
-    t: Option<EtaParamType>,
-    var_at: f64,
+    t: Option<EtaParamType>, var_at: f64,
 ) -> Option<(&'static str, Value)> {
     matches!(t, None | Some(EtaParamType::LogNormal))
         .then(|| ("cv_pct_at_typical_weight", Value::Cv(cv_pct(var_at))))
@@ -375,13 +362,8 @@ pub(crate) fn omega_section(result: &FitResult) -> Section {
         e.push_se(SeState::of(result, ParameterKind::Omega, i, fixed, se));
         section.entries.push(e);
     }
-    let eta = |i: usize| {
-        result
-            .eta_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("eta_{}", i + 1))
-    };
+    let eta =
+        |i: usize| result.eta_names.get(i).cloned().unwrap_or_else(|| format!("eta_{}", i + 1));
     for i in 0..n_eta {
         for j in 0..i {
             let cov = result.omega[(i, j)];
@@ -426,11 +408,7 @@ pub(crate) fn sigma_section(result: &FitResult) -> Section {
     for (i, &s) in result.sigma.iter().enumerate() {
         let fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
         let se = result.se_sigma.as_ref().and_then(|v| v.get(i).copied());
-        let name = result
-            .sigma_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("sigma_{}", i + 1));
+        let name = result.sigma_names.get(i).cloned().unwrap_or_else(|| format!("sigma_{}", i + 1));
         let sigma_type = result.sigma_types.get(i).copied();
         let mut e = Entry::new(name);
         e.push("estimate", Value::Num(s));
@@ -464,38 +442,22 @@ pub(crate) fn block_sigma_section(result: &FitResult) -> Result<Option<Section>,
     let mut section = Section::new("block_sigma");
     for (k, corr) in result.residual_correlations.iter().enumerate() {
         let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_i index {} is out of bounds",
-                corr.sigma_i
-            )
+            format!("residual correlation sigma_i index {} is out of bounds", corr.sigma_i)
         })?;
         let name_j = result.sigma_names.get(corr.sigma_j).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_j index {} is out of bounds",
-                corr.sigma_j
-            )
+            format!("residual correlation sigma_j index {} is out of bounds", corr.sigma_j)
         })?;
         let sigma_i = result.sigma.get(corr.sigma_i).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_i index {} has no estimate",
-                corr.sigma_i
-            )
+            format!("residual correlation sigma_i index {} has no estimate", corr.sigma_i)
         })?;
         let sigma_j = result.sigma.get(corr.sigma_j).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_j index {} has no estimate",
-                corr.sigma_j
-            )
+            format!("residual correlation sigma_j index {} has no estimate", corr.sigma_j)
         })?;
         // Since #847 a bare `block_sigma (...) = [...]` **estimates** the off-diagonal
         // (NONMEM `$SIGMA BLOCK(n)`); only `... FIX` pins it. A pre-#847 `FitResult`
         // carries no flags at all, and back then every correlation was fixed by
         // construction — hence the `true` default.
-        let correlation_fixed = result
-            .residual_correlation_fixed
-            .get(k)
-            .copied()
-            .unwrap_or(true);
+        let correlation_fixed = result.residual_correlation_fixed.get(k).copied().unwrap_or(true);
         // The covariance `rho·sigma_i·sigma_j` is fixed only when *all three* factors
         // are: a free rho or a free SD moves it during the fit.
         let sigma_is_fixed = |i: usize| result.sigma_fixed.get(i).copied().unwrap_or(false);
@@ -506,11 +468,7 @@ pub(crate) fn block_sigma_section(result: &FitResult) -> Result<Option<Section>,
         let corr_se = if correlation_fixed {
             None
         } else {
-            result
-                .se_residual_correlations
-                .as_ref()
-                .and_then(|v| v.get(k))
-                .copied()
+            result.se_residual_correlations.as_ref().and_then(|v| v.get(k)).copied()
         };
         let mut e = Entry::new(format!("{name_i}__{name_j}"));
         e.push("covariance", Value::Num(corr.rho * sigma_i * sigma_j));
@@ -529,13 +487,8 @@ pub(crate) fn omega_iov_section(result: &FitResult) -> Option<Section> {
     let iov = result.omega_iov.as_ref()?;
     let mut section = Section::new("omega_iov");
     let n_kappa = iov.nrows();
-    let kappa = |i: usize| {
-        result
-            .kappa_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("kappa_{}", i + 1))
-    };
+    let kappa =
+        |i: usize| result.kappa_names.get(i).cloned().unwrap_or_else(|| format!("kappa_{}", i + 1));
     for i in 0..n_kappa {
         let var = iov[(i, i)];
         let fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
@@ -634,11 +587,7 @@ pub(crate) fn mixture_overrides_section(result: &FitResult) -> Option<Section> {
 
 /// Every estimate section of `result`, in the order the fit YAML writes them.
 pub(crate) fn estimate_sections(result: &FitResult) -> Result<Vec<Section>, String> {
-    let mut out = vec![
-        theta_section(result),
-        omega_section(result),
-        sigma_section(result),
-    ];
+    let mut out = vec![theta_section(result), omega_section(result), sigma_section(result)];
     out.extend(block_sigma_section(result)?);
     out.extend(omega_iov_section(result));
     out.extend(mixture_overrides_section(result));
@@ -664,10 +613,7 @@ pub(crate) fn estimates_yaml(result: &FitResult) -> Result<String, String> {
 pub(crate) fn estimates_json(result: &FitResult) -> serde_json::Value {
     match estimate_sections(result) {
         Ok(sections) => serde_json::Value::Object(
-            sections
-                .iter()
-                .map(|s| (s.key.to_string(), s.json()))
-                .collect(),
+            sections.iter().map(|s| (s.key.to_string(), s.json())).collect(),
         ),
         Err(_) => serde_json::Value::Null,
     }

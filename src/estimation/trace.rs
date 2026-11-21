@@ -46,12 +46,7 @@ impl TraceWriter {
             header.push_str(&csv_field(&format!("grad:{}", name)));
         }
         writeln!(writer, "{}", header)?;
-        Ok(Self {
-            path,
-            writer,
-            start: Instant::now(),
-            n_coords: coord_names.len(),
-        })
+        Ok(Self { path, writer, start: Instant::now(), n_coords: coord_names.len() })
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -72,28 +67,15 @@ impl TraceWriter {
             let _ = write!(self.writer, ",{}", fmt_opt_sci(values.get(i).copied()));
         }
         for i in 0..self.n_coords {
-            let _ = write!(
-                self.writer,
-                ",{}",
-                fmt_opt_sci(grads.and_then(|g| g.get(i).copied()))
-            );
+            let _ = write!(self.writer, ",{}", fmt_opt_sci(grads.and_then(|g| g.get(i).copied())));
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn write_foce_row(
-        &mut self,
-        iter: usize,
-        method: &str,
-        phase: &str,
-        ofv: f64,
-        grad_norm: Option<f64>,
-        step_norm: Option<f64>,
-        optimizer: &str,
-        n_ebe_unconverged: Option<usize>,
-        n_ebe_fallback: Option<usize>,
-        values: &[f64],
-        grads: Option<&[f64]>,
+        &mut self, iter: usize, method: &str, phase: &str, ofv: f64, grad_norm: Option<f64>,
+        step_norm: Option<f64>, optimizer: &str, n_ebe_unconverged: Option<usize>,
+        n_ebe_fallback: Option<usize>, values: &[f64], grads: Option<&[f64]>,
     ) {
         let wall_ms = self.elapsed_ms();
         let _ = write!(
@@ -120,19 +102,9 @@ impl TraceWriter {
 
     #[allow(clippy::too_many_arguments)]
     pub fn write_gn_row(
-        &mut self,
-        iter: usize,
-        method: &str,
-        phase: &str,
-        ofv: f64,
-        grad_norm: Option<f64>,
-        lm_lambda: f64,
-        ofv_delta: f64,
-        step_accepted: bool,
-        n_ebe_unconverged: Option<usize>,
-        n_ebe_fallback: Option<usize>,
-        values: &[f64],
-        grads: Option<&[f64]>,
+        &mut self, iter: usize, method: &str, phase: &str, ofv: f64, grad_norm: Option<f64>,
+        lm_lambda: f64, ofv_delta: f64, step_accepted: bool, n_ebe_unconverged: Option<usize>,
+        n_ebe_fallback: Option<usize>, values: &[f64], grads: Option<&[f64]>,
     ) {
         let wall_ms = self.elapsed_ms();
         // grad_norm (position 6) is now populated for GN: the scaled BHHH
@@ -159,12 +131,7 @@ impl TraceWriter {
     }
 
     pub fn write_saem_row(
-        &mut self,
-        iter: usize,
-        phase: &str,
-        cond_nll: f64,
-        gamma: f64,
-        mh_accept_rate: f64,
+        &mut self, iter: usize, phase: &str, cond_nll: f64, gamma: f64, mh_accept_rate: f64,
         values: &[f64],
     ) {
         let wall_ms = self.elapsed_ms();
@@ -315,16 +282,9 @@ pub(crate) fn method_label(options: &crate::types::FitOptions) -> &'static str {
 ///                      derivative-free optimizers; matches `grad_norm`)
 #[allow(clippy::too_many_arguments)]
 pub fn write_foce(
-    iter: usize,
-    method: &str,
-    ofv: f64,
-    grad_norm: Option<f64>,
-    step_norm: Option<f64>,
-    optimizer: &str,
-    n_ebe_unconverged: Option<usize>,
-    n_ebe_fallback: Option<usize>,
-    values: &[f64],
-    grads: Option<&[f64]>,
+    iter: usize, method: &str, ofv: f64, grad_norm: Option<f64>, step_norm: Option<f64>,
+    optimizer: &str, n_ebe_unconverged: Option<usize>, n_ebe_fallback: Option<usize>,
+    values: &[f64], grads: Option<&[f64]>,
 ) {
     TRACE.with(|t| {
         let mut s = t.borrow_mut();
@@ -356,18 +316,9 @@ pub fn write_foce(
 /// `n_ebe_fallback`   — subjects whose returned EBE is a fallback's point (None = unavailable)
 #[allow(clippy::too_many_arguments)]
 pub fn write_gn(
-    iter: usize,
-    method: &str,
-    phase: &str,
-    ofv: f64,
-    grad_norm: Option<f64>,
-    lm_lambda: f64,
-    ofv_delta: f64,
-    step_accepted: bool,
-    n_ebe_unconverged: Option<usize>,
-    n_ebe_fallback: Option<usize>,
-    values: &[f64],
-    grads: Option<&[f64]>,
+    iter: usize, method: &str, phase: &str, ofv: f64, grad_norm: Option<f64>, lm_lambda: f64,
+    ofv_delta: f64, step_accepted: bool, n_ebe_unconverged: Option<usize>,
+    n_ebe_fallback: Option<usize>, values: &[f64], grads: Option<&[f64]>,
 ) {
     TRACE.with(|t| {
         let mut s = t.borrow_mut();
@@ -396,12 +347,7 @@ pub fn write_gn(
 /// Write one SAEM trace row. `values` are per-coordinate estimates (natural
 /// scale); SAEM has no OFV gradient so every `grad:*` column is written `NA`.
 pub fn write_saem(
-    iter: usize,
-    phase: &str,
-    cond_nll: f64,
-    gamma: f64,
-    mh_accept_rate: f64,
-    values: &[f64],
+    iter: usize, phase: &str, cond_nll: f64, gamma: f64, mh_accept_rate: f64, values: &[f64],
 ) {
     TRACE.with(|t| {
         let mut s = t.borrow_mut();
@@ -465,19 +411,7 @@ mod tests {
     fn test_na_for_missing_grad() {
         let path = format!("/tmp/ferx_trace_na_{}.csv", std::process::id());
         let mut w = TraceWriter::new(path.clone(), &[]).unwrap();
-        w.write_foce_row(
-            1,
-            "focei",
-            "",
-            99.0,
-            None,
-            None,
-            "bobyqa",
-            None,
-            None,
-            &[],
-            None,
-        );
+        w.write_foce_row(1, "focei", "", 99.0, None, None, "bobyqa", None, None, &[], None);
         w.flush();
         let contents = read_file(&path);
         // grad_norm and step_norm should be NA
@@ -492,20 +426,7 @@ mod tests {
     fn test_gn_row_format() {
         let path = format!("/tmp/ferx_trace_gn_{}.csv", std::process::id());
         let mut w = TraceWriter::new(path.clone(), &[]).unwrap();
-        w.write_gn_row(
-            3,
-            "gn",
-            "",
-            200.0,
-            Some(0.5),
-            0.01,
-            -5.0,
-            true,
-            None,
-            None,
-            &[],
-            None,
-        );
+        w.write_gn_row(3, "gn", "", 200.0, Some(0.5), 0.01, -5.0, true, None, None, &[], None);
         w.flush();
         let contents = read_file(&path);
         let row = contents.lines().nth(1).unwrap();
@@ -534,16 +455,8 @@ mod tests {
     // need to be unique on disk.
     fn unique_path(tag: &str) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!(
-            "/tmp/ferx_trace_{}_{}_{}.csv",
-            tag,
-            std::process::id(),
-            nanos
-        )
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        format!("/tmp/ferx_trace_{}_{}_{}.csv", tag, std::process::id(), nanos)
     }
 
     #[test]
@@ -580,18 +493,7 @@ mod tests {
     fn test_write_foce_via_thread_local() {
         let path = unique_path("tl_foce");
         init(path.clone(), &[]).unwrap();
-        write_foce(
-            7,
-            "focei",
-            42.5,
-            Some(0.125),
-            None,
-            "bobyqa",
-            None,
-            None,
-            &[],
-            None,
-        );
+        write_foce(7, "focei", 42.5, Some(0.125), None, "bobyqa", None, None, &[], None);
         finish();
 
         let contents = read_file(&path);
@@ -609,20 +511,7 @@ mod tests {
         // can call trace::write_* unconditionally.
         assert!(!is_active());
         write_foce(1, "foce", 1.0, None, None, "slsqp", None, None, &[], None);
-        write_gn(
-            1,
-            "gn",
-            "",
-            1.0,
-            None,
-            0.0,
-            0.0,
-            true,
-            None,
-            None,
-            &[],
-            None,
-        );
+        write_gn(1, "gn", "", 1.0, None, 0.0, 0.0, true, None, None, &[], None);
         write_saem(1, "explore", 1.0, 1.0, 0.5, &[]);
         // No assertion on files — the assertion is "didn't panic".
     }
@@ -633,32 +522,10 @@ mod tests {
         init(path.clone(), &[]).unwrap();
         // Caller passes "foce" but override forces "gn_hybrid" + phase "focei".
         set_overrides(Some("gn_hybrid"), Some("focei"));
-        write_foce(
-            2,
-            "foce",
-            10.0,
-            Some(0.1),
-            Some(0.01),
-            "slsqp",
-            None,
-            None,
-            &[],
-            None,
-        );
+        write_foce(2, "foce", 10.0, Some(0.1), Some(0.01), "slsqp", None, None, &[], None);
         set_overrides(None, None);
         // After clearing, caller-supplied method/phase apply.
-        write_foce(
-            3,
-            "foce",
-            9.0,
-            Some(0.05),
-            Some(0.005),
-            "slsqp",
-            None,
-            None,
-            &[],
-            None,
-        );
+        write_foce(3, "foce", 9.0, Some(0.05), Some(0.005), "slsqp", None, None, &[], None);
         finish();
 
         let contents = read_file(&path);
@@ -785,12 +652,7 @@ mod tests {
         assert_eq!(cols.len(), 21);
         assert_eq!(
             &cols[17..],
-            &[
-                "2.500000000e0",
-                "9.000000000e-2",
-                "4.000000000e-1",
-                "-3.000000000e-1"
-            ]
+            &["2.500000000e0", "9.000000000e-2", "4.000000000e-1", "-3.000000000e-1"]
         );
         std::fs::remove_file(&path).ok();
     }
@@ -801,31 +663,11 @@ mod tests {
         let path = unique_path("foce_nograd");
         let names = vec!["TVCL".to_string(), "ETA_CL".to_string()];
         let mut w = TraceWriter::new(path.clone(), &names).unwrap();
-        w.write_foce_row(
-            1,
-            "focei",
-            "",
-            9.0,
-            None,
-            None,
-            "bobyqa",
-            None,
-            None,
-            &[2.5, 0.09],
-            None,
-        );
+        w.write_foce_row(1, "focei", "", 9.0, None, None, "bobyqa", None, None, &[2.5, 0.09], None);
         w.flush();
-        let cols: Vec<String> = read_file(&path)
-            .lines()
-            .nth(1)
-            .unwrap()
-            .split(',')
-            .map(String::from)
-            .collect();
-        assert_eq!(
-            &cols[17..],
-            &["2.500000000e0", "9.000000000e-2", "NA", "NA"]
-        );
+        let cols: Vec<String> =
+            read_file(&path).lines().nth(1).unwrap().split(',').map(String::from).collect();
+        assert_eq!(&cols[17..], &["2.500000000e0", "9.000000000e-2", "NA", "NA"]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -836,17 +678,9 @@ mod tests {
         let mut w = TraceWriter::new(path.clone(), &names).unwrap();
         w.write_saem_row(3, "explore", 55.0, 1.0, 0.4, &[2.5, 0.09]);
         w.flush();
-        let cols: Vec<String> = read_file(&path)
-            .lines()
-            .nth(1)
-            .unwrap()
-            .split(',')
-            .map(String::from)
-            .collect();
-        assert_eq!(
-            &cols[17..],
-            &["2.500000000e0", "9.000000000e-2", "NA", "NA"]
-        );
+        let cols: Vec<String> =
+            read_file(&path).lines().nth(1).unwrap().split(',').map(String::from).collect();
+        assert_eq!(&cols[17..], &["2.500000000e0", "9.000000000e-2", "NA", "NA"]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -895,13 +729,8 @@ mod tests {
         let mut w = TraceWriter::new(path.clone(), &names).unwrap();
         w.write_saem_row(1, "explore", 1.0, 1.0, 0.5, &[1.0]);
         w.flush();
-        let cols: Vec<String> = read_file(&path)
-            .lines()
-            .nth(1)
-            .unwrap()
-            .split(',')
-            .map(String::from)
-            .collect();
+        let cols: Vec<String> =
+            read_file(&path).lines().nth(1).unwrap().split(',').map(String::from).collect();
         // 17 fixed + 3 val + 3 grad = 23.
         assert_eq!(cols.len(), 23);
         assert_eq!(&cols[17..20], &["1.000000000e0", "NA", "NA"]);
@@ -912,20 +741,7 @@ mod tests {
     fn test_gn_step_rejected_serialised_as_zero() {
         let path = unique_path("gn_reject");
         let mut w = TraceWriter::new(path.clone(), &[]).unwrap();
-        w.write_gn_row(
-            5,
-            "gn",
-            "",
-            100.0,
-            None,
-            1.0,
-            2.0,
-            false,
-            None,
-            None,
-            &[],
-            None,
-        );
+        w.write_gn_row(5, "gn", "", 100.0, None, 1.0, 2.0, false, None, None, &[], None);
         w.flush();
         let row = read_file(&path).lines().nth(1).unwrap().to_string();
         // step_accepted is the column right before cond_nll's NA stretch.

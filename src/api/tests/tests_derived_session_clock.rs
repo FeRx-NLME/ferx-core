@@ -8,12 +8,11 @@
 
 use super::*;
 use crate::types::{
-    AggFunction, BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind,
-    ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, IntegralStep, IntegralWindow,
-    ModelParameters, OmegaMatrix, PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject,
+    AggFunction, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, ErrorModel,
+    ErrorSpec, IndivParamPartials, IntegralStep, IntegralWindow, ModelParameters, OmegaMatrix,
+    PkParams, Population, SigmaVector, Subject,
 };
 use nalgebra::DVector;
-use std::collections::HashMap;
 
 // ── shared helpers ────────────────────────────────────────────────────────
 
@@ -21,86 +20,34 @@ use std::collections::HashMap;
 /// Caller supplies `derived_exprs`.
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "test_session".into(),
-        pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Additive,
         error_spec: ErrorSpec::Single(ErrorModel::Additive),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
         n_theta: 0,
         n_eta: 0,
-        n_epsilon: 1,
-        n_kappa: 0,
-        kappa_names: Vec::new(),
         theta_names: Vec::new(),
         eta_names: Vec::new(),
         indiv_param_names: Vec::new(),
         indiv_param_partials: IndivParamPartials::empty(),
-        default_params: ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            theta: Vec::new(),
-            theta_names: Vec::new(),
-            theta_lower: Vec::new(),
-            theta_upper: Vec::new(),
-            theta_fixed: Vec::new(),
-            omega: OmegaMatrix::from_diagonal(&[], vec![]),
-            omega_fixed: Vec::new(),
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["ERR".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
-        },
         omega_init_as_sd: Vec::new(),
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
         tv_fn: Some(Box::new(|_t, _c| vec![])),
         pk_indices: Vec::new(),
         eta_map: Vec::new(),
         pk_idx_f64: Vec::new(),
         sel_flat: Vec::new(),
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
         derived_exprs,
         output_columns: Vec::new(),
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(ModelParameters {
+            theta: Vec::new(),
+            theta_names: Vec::new(),
+            theta_lower: Vec::new(),
+            theta_upper: Vec::new(),
+            theta_fixed: Vec::new(),
+            omega_fixed: Vec::new(),
+            sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(&[], vec![]))
+        })
     }
 }
 
@@ -113,35 +60,16 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// `reset_times[0] = 5.0` marks the boundary.
 fn two_session_subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".into(),
-        doses: Vec::new(),
         // Session 0 at 0,1,4 — Session 1 shifted by 5 to 5,6,9
         obs_times: vec![0.0, 1.0, 4.0, 5.0, 6.0, 9.0],
         obs_raw_times: vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0],
         observations: vec![1.0; 6],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: vec![5.0], // boundary at shifted t=5
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
+        reset_times: vec![5.0],
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -182,9 +110,7 @@ fn sr_for(n_obs: usize) -> SubjectResult {
 fn derived_per_row_time_is_raw_clock() {
     let derived_exprs = vec![DerivedExprSpec {
         name: "T".into(),
-        kind: DerivedKind::PerRow {
-            eval: Box::new(|ctx: &DerivedContext| ctx.time),
-        },
+        kind: DerivedKind::PerRow { eval: Box::new(|ctx: &DerivedContext| ctx.time) },
         uses_compartments: false,
     }];
     let model = minimal_model(derived_exprs);
@@ -247,10 +173,7 @@ fn derived_aggregate_tmax_returns_raw_time() {
     let col = &subjects_results[0].extra_columns[0].1;
     // All entries should be 1.0 (raw time of peak at j=4).
     for &v in col {
-        assert!(
-            (v - 1.0).abs() < 1e-12,
-            "Tmax should be raw time 1.0, got {v}"
-        );
+        assert!((v - 1.0).abs() < 1e-12, "Tmax should be raw time 1.0, got {v}");
     }
 }
 
@@ -319,10 +242,7 @@ fn derived_integral_periodic_uses_raw_clock() {
             condition: None,
             data_based: true,
             uses_compartments: false,
-            window: IntegralWindow::Periodic {
-                period: 5.0,
-                anchor: 0.0,
-            },
+            window: IntegralWindow::Periodic { period: 5.0, anchor: 0.0 },
             step: IntegralStep::ObsTimes,
         },
         uses_compartments: false,
@@ -343,10 +263,7 @@ fn derived_integral_periodic_uses_raw_clock() {
     // All obs land in the raw-clock window [0,5); all three per-session
     // points contribute → AUC=8.0 for every row.
     for (j, &v) in col.iter().enumerate() {
-        assert!(
-            (v - 8.0).abs() < 1e-12,
-            "Periodic integral at obs {j}: got {v}, expected 8.0"
-        );
+        assert!((v - 8.0).abs() < 1e-12, "Periodic integral at obs {j}: got {v}, expected 8.0");
     }
 }
 
@@ -370,34 +287,14 @@ fn derived_integral_single_session_unchanged() {
     }];
     let model = minimal_model(derived_exprs);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "SINGLE".into(),
-        doses: Vec::new(),
         obs_times: vec![0.0, 1.0, 4.0],
         obs_raw_times: vec![0.0, 1.0, 4.0],
         observations: vec![1.0; 3],
         obs_cmts: vec![1; 3],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -412,9 +309,6 @@ fn derived_integral_single_session_unchanged() {
     let col = &subjects_results[0].extra_columns[0].1;
     // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
     for &v in col {
-        assert!(
-            (v - 8.0).abs() < 1e-12,
-            "Single-session AUC should be 8.0, got {v}"
-        );
+        assert!((v - 8.0).abs() < 1e-12, "Single-session AUC should be 8.0, got {v}");
     }
 }

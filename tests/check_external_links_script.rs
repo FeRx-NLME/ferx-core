@@ -53,11 +53,7 @@ fn run(docs: &Path, args: &[&str]) -> Output {
 }
 
 fn text(out: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
 /// Index of each counted route in the hit counters `server()` returns.
@@ -109,11 +105,7 @@ fn server() -> (String, Arc<[AtomicUsize; 4]>) {
                 }
                 "/busy" => {
                     h[BUSY].fetch_add(1, Ordering::SeqCst);
-                    (
-                        "429 Too Many Requests",
-                        "Retry-After: 0\r\n".to_string(),
-                        "",
-                    )
+                    ("429 Too Many Requests", "Retry-After: 0\r\n".to_string(), "")
                 }
                 "/garbage" => {
                     h[GARBAGE].fetch_add(1, Ordering::SeqCst);
@@ -138,10 +130,7 @@ fn the_script_is_executable() {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(script()).unwrap().permissions().mode();
-        assert!(
-            mode & 0o111 != 0,
-            "tools/check-external-links.py is not executable"
-        );
+        assert!(mode & 0o111 != 0, "tools/check-external-links.py is not executable");
     }
 }
 
@@ -161,25 +150,14 @@ fn list_collects_urls_with_locations() {
          Plain http too: http://example.org/insecure\n",
     )
     .unwrap();
-    std::fs::write(
-        docs.join("sub").join("b.qmd"),
-        "Again: https://example.org/plain\n",
-    )
-    .unwrap();
-    std::fs::write(
-        docs.join("_site").join("c.qmd"),
-        "https://example.org/rendered\n",
-    )
-    .unwrap();
+    std::fs::write(docs.join("sub").join("b.qmd"), "Again: https://example.org/plain\n").unwrap();
+    std::fs::write(docs.join("_site").join("c.qmd"), "https://example.org/rendered\n").unwrap();
     std::fs::write(docs.join("d.md"), "https://example.org/not-qmd\n").unwrap();
 
     let out = run(&docs, &["--list"]);
     assert!(out.status.success(), "{}", text(&out));
     let listed = String::from_utf8(out.stdout).unwrap();
-    let urls: Vec<&str> = listed
-        .lines()
-        .map(|l| l.split('\t').next().unwrap())
-        .collect();
+    let urls: Vec<&str> = listed.lines().map(|l| l.split('\t').next().unwrap()).collect();
     assert_eq!(
         urls,
         [
@@ -191,10 +169,7 @@ fn list_collects_urls_with_locations() {
         ],
         "full listing:\n{listed}"
     );
-    let plain = listed
-        .lines()
-        .find(|l| l.starts_with("https://example.org/plain\t"))
-        .unwrap();
+    let plain = listed.lines().find(|l| l.starts_with("https://example.org/plain\t")).unwrap();
     assert!(
         plain.contains("a.qmd:2") && plain.contains("b.qmd:1"),
         "both locations of a repeated URL must be listed: {plain}"
@@ -210,25 +185,13 @@ fn a_present_anchor_passes_and_a_missing_one_fails() {
 
     let good = format!("{base}/page {base}/page#present {base}/page#named {base}/moved#present");
     let out = run(&docs, &["--url", &good]);
-    assert!(
-        out.status.success(),
-        "all present must pass:\n{}",
-        text(&out)
-    );
-    assert!(
-        text(&out).contains("4 URLs checked, 0 failed"),
-        "{}",
-        text(&out)
-    );
+    assert!(out.status.success(), "all present must pass:\n{}", text(&out));
+    assert!(text(&out).contains("4 URLs checked, 0 failed"), "{}", text(&out));
 
     let bad = format!("{base}/page#present {base}/moved#absent");
     let out = run(&docs, &["--url", &bad]);
     let t = text(&out);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "a missing anchor must fail:\n{t}"
-    );
+    assert_eq!(out.status.code(), Some(1), "a missing anchor must fail:\n{t}");
     assert!(t.contains(&format!("ok   {base}/page#present")), "{t}");
     assert!(
         t.contains(&format!("FAIL {base}/moved#absent"))
@@ -252,29 +215,11 @@ fn a_404_fails_without_retry_and_a_500_or_429_after_retries() {
     assert_eq!(out.status.code(), Some(1), "{t}");
     assert!(t.contains(&format!("ok   {base}/page")), "{t}");
     assert!(t.contains(&format!("FAIL {base}/gone -- HTTP 404")), "{t}");
-    assert!(
-        t.contains(&format!("FAIL {base}/down -- HTTP 500 (after 3 attempts)")),
-        "{t}"
-    );
-    assert!(
-        t.contains(&format!("FAIL {base}/busy -- HTTP 429 (after 3 attempts)")),
-        "{t}"
-    );
-    assert_eq!(
-        hits[GONE].load(Ordering::SeqCst),
-        1,
-        "404 must not be retried"
-    );
-    assert_eq!(
-        hits[DOWN].load(Ordering::SeqCst),
-        3,
-        "500 must be retried twice"
-    );
-    assert_eq!(
-        hits[BUSY].load(Ordering::SeqCst),
-        3,
-        "429 must be retried twice"
-    );
+    assert!(t.contains(&format!("FAIL {base}/down -- HTTP 500 (after 3 attempts)")), "{t}");
+    assert!(t.contains(&format!("FAIL {base}/busy -- HTTP 429 (after 3 attempts)")), "{t}");
+    assert_eq!(hits[GONE].load(Ordering::SeqCst), 1, "404 must not be retried");
+    assert_eq!(hits[DOWN].load(Ordering::SeqCst), 3, "500 must be retried twice");
+    assert_eq!(hits[BUSY].load(Ordering::SeqCst), 3, "429 must be retried twice");
 }
 
 /// A reply with no valid status line (`http.client.BadStatusLine`, not an `OSError`) is
@@ -286,10 +231,7 @@ fn a_malformed_reply_is_a_failure_not_a_crash() {
     let docs = scratch("garbage");
     let summary = docs.join("report.md");
     let urls = format!("{base}/garbage {base}/page");
-    let out = run(
-        &docs,
-        &["--url", &urls, "--summary", summary.to_str().unwrap()],
-    );
+    let out = run(&docs, &["--url", &urls, "--summary", summary.to_str().unwrap()]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "{t}");
     assert!(!t.contains("Traceback"), "{t}");
@@ -319,17 +261,11 @@ fn summary_names_the_failing_link_and_its_location() {
     let (base, _) = server();
     let docs = scratch("summary");
     // Line 2 ends in a bare `#`: its location must survive the page/fragment split.
-    std::fs::write(
-        docs.join("p.qmd"),
-        format!("ok [a]({base}/page)\nbroken [b]({base}/gone#)\n"),
-    )
-    .unwrap();
+    std::fs::write(docs.join("p.qmd"), format!("ok [a]({base}/page)\nbroken [b]({base}/gone#)\n"))
+        .unwrap();
     let summary = docs.join("report.md");
     let urls = format!("{base}/down");
-    let out = run(
-        &docs,
-        &["--url", &urls, "--summary", summary.to_str().unwrap()],
-    );
+    let out = run(&docs, &["--url", &urls, "--summary", summary.to_str().unwrap()]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "{t}");
     let gone_block = t
@@ -347,15 +283,10 @@ fn summary_names_the_failing_link_and_its_location() {
         .lines()
         .find(|l| l.starts_with(&format!("| <{base}/gone#> | HTTP 404 |")))
         .unwrap_or_else(|| panic!("no row for the docs link:\n{rep}"));
-    assert!(
-        row.ends_with("p.qmd:2 |") && !row.contains("`--url`"),
-        "{row}"
-    );
+    assert!(row.ends_with("p.qmd:2 |") && !row.contains("`--url`"), "{row}");
     // The `--url` twin is the only row attributed to `--url`.
     assert!(
-        rep.contains(&format!(
-            "| <{base}/down> | HTTP 500 (after 3 attempts) | `--url` |"
-        )),
+        rep.contains(&format!("| <{base}/down> | HTTP 500 (after 3 attempts) | `--url` |")),
         "{rep}"
     );
     assert!(!rep.contains(&format!("<{base}/page>")), "{rep}");
@@ -390,14 +321,8 @@ fn github_heading_and_line_anchors_are_recognised_only_on_github() {
     assert!(!check_fragment("github.com", "slow-start", body));
 
     for line in ["L10", "L10-L20", "L10C3-L12C8"] {
-        assert!(
-            check_fragment("github.com", line, "<html></html>"),
-            "{line}"
-        );
-        assert!(
-            !check_fragment("example.org", line, "<html></html>"),
-            "{line}"
-        );
+        assert!(check_fragment("github.com", line, "<html></html>"), "{line}");
+        assert!(!check_fragment("example.org", line, "<html></html>"), "{line}");
     }
     assert!(!check_fragment("github.com", "L10x", "<html></html>"));
 }
@@ -453,19 +378,10 @@ fn workflow_is_scheduled_dispatchable_and_off_the_pr_path() {
         .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
         .map(|l| l.trim().trim_end_matches(':'))
         .collect();
-    assert_eq!(
-        triggers,
-        ["schedule", "workflow_dispatch"],
-        "external-links.yml triggers"
-    );
+    assert_eq!(triggers, ["schedule", "workflow_dispatch"], "external-links.yml triggers");
     assert!(
-        on_block
-            .iter()
-            .any(|l| l.trim_start().starts_with("- cron:")),
+        on_block.iter().any(|l| l.trim_start().starts_with("- cron:")),
         "no cron line under schedule"
     );
-    assert!(
-        wf.contains("tools/check-external-links.py"),
-        "workflow must run the script"
-    );
+    assert!(wf.contains("tools/check-external-links.py"), "workflow must run the script");
 }

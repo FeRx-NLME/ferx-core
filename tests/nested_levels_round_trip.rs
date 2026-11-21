@@ -26,51 +26,24 @@ const REPEATS: usize = 20;
 /// The anchor model with its initial estimates replaced by the generator's truth.
 fn truth_model() -> String {
     MODEL
-        .replace(
-            "theta TVE0(10.1818, 0.0, 1000.0)",
-            "theta TVE0(10.0, 0.0, 1000.0)",
-        )
-        .replace(
-            "theta TVEMAX(22.0140, 0.0, 1000.0)",
-            "theta TVEMAX(20.0, 0.0, 1000.0)",
-        )
-        .replace(
-            "theta ED50(33.4048, 0.1, 10000.0)",
-            "theta ED50(30.0, 0.1, 10000.0)",
-        )
-        .replace(
-            "theta ET50(3.20150, 0.01, 1000.0)",
-            "theta ET50(3.0, 0.01, 1000.0)",
-        )
+        .replace("theta TVE0(10.1818, 0.0, 1000.0)", "theta TVE0(10.0, 0.0, 1000.0)")
+        .replace("theta TVEMAX(22.0140, 0.0, 1000.0)", "theta TVEMAX(20.0, 0.0, 1000.0)")
+        .replace("theta ED50(33.4048, 0.1, 10000.0)", "theta ED50(30.0, 0.1, 10000.0)")
+        .replace("theta ET50(3.20150, 0.01, 1000.0)", "theta ET50(3.0, 0.01, 1000.0)")
         .replace("omega ETA_SP ~ 0.0699388", "omega ETA_SP ~ 0.09")
-        .replace(
-            "kappa K_ST ~ 0.0904362 at STUDY",
-            "kappa K_ST ~ 0.04 at STUDY",
-        )
+        .replace("kappa K_ST ~ 0.0904362 at STUDY", "kappa K_ST ~ 0.04 at STUDY")
         .replace("kappa K_ARM ~ 3.75478 at ARM", "kappa K_ARM ~ 4.0 at ARM")
         .replace("sigma ADD ~ 0.255164", "sigma ADD ~ 0.25")
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn nested_variance_components_are_recovered_from_simulated_data() {
     let truth_src = truth_model();
     assert_ne!(truth_src, MODEL);
     let truth = parse_full_model(&truth_src).expect("truth model parses");
     let start = parse_full_model(MODEL).expect("anchor model parses");
-    assert_eq!(
-        truth
-            .model
-            .default_params
-            .omega_iov
-            .as_ref()
-            .unwrap()
-            .matrix[(1, 1)],
-        4.0
-    );
+    assert_eq!(truth.model.default_params.omega_iov.as_ref().unwrap().matrix[(1, 1)], 4.0);
 
     let (design, _) = read_population_for(
         &truth.model,
@@ -90,19 +63,10 @@ fn nested_variance_components_are_recovered_from_simulated_data() {
             subjects.push(s);
         }
     }
-    let mut population = Population {
-        subjects,
-        ..design.clone()
-    };
+    let mut population = Population { subjects, ..design.clone() };
 
-    let rows = simulate_with_seed(
-        &truth.model,
-        &population,
-        &truth.model.default_params,
-        1,
-        1082,
-    )
-    .expect("simulates");
+    let rows = simulate_with_seed(&truth.model, &population, &truth.model.default_params, 1, 1082)
+        .expect("simulates");
     for s in &mut population.subjects {
         s.observations = rows
             .iter()
@@ -120,13 +84,7 @@ fn nested_variance_components_are_recovered_from_simulated_data() {
         run_covariance_step: false,
         ..start.fit_options.clone()
     };
-    let r = fit(
-        &start.model,
-        &population,
-        &start.model.default_params,
-        &opts,
-    )
-    .expect("refits");
+    let r = fit(&start.model, &population, &start.model.default_params, &opts).expect("refits");
     let iov = r.omega_iov.as_ref().unwrap();
     let got = [
         ("TVE0", r.theta[0], 10.0, BAND_THETA),
@@ -141,19 +99,13 @@ fn nested_variance_components_are_recovered_from_simulated_data() {
     ];
     eprintln!("converged {}  OFV {:.6}", r.converged, r.ofv);
     for (what, v, want, _) in got {
-        eprintln!(
-            "{what}: {v:.6} (truth {want}, relative error {:+.4})",
-            (v - want) / want
-        );
+        eprintln!("{what}: {v:.6} (truth {want}, relative error {:+.4})", (v - want) / want);
     }
     assert!(r.converged, "the refit converged");
     for (what, v, want, band) in got {
         assert!(v.is_finite(), "{what}: {v}");
         let rel = ((v - want) / want).abs();
-        assert!(
-            rel < band,
-            "{what}: {v} vs truth {want}, |relative error| {rel:.4} ≥ {band}"
-        );
+        assert!(rel < band, "{what}: {v} vs truth {want}, |relative error| {rel:.4} ≥ {band}");
     }
 }
 

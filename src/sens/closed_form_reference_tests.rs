@@ -28,15 +28,9 @@ struct Case {
 
 fn cases() -> Vec<Case> {
     let nums = |s: &str| -> Vec<f64> {
-        s.split(',')
-            .filter(|x| !x.is_empty())
-            .map(|x| x.parse().expect("number"))
-            .collect()
+        s.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().expect("number")).collect()
     };
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/closed_form_mpmath.txt"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/closed_form_mpmath.txt");
     std::fs::read_to_string(path)
         .expect("fixture")
         .lines()
@@ -62,9 +56,8 @@ fn cases() -> Vec<Case> {
 /// case's parameters.
 fn closed_form(c: &Case) -> D {
     use crate::sens::{one_cpt as o, three_cpt as h, two_cpt as w};
-    let x: Vec<D> = (0..7)
-        .map(|i| c.p.get(i).map_or(D::constant(0.0), |&v| D::var(v, i)))
-        .collect();
+    let x: Vec<D> =
+        (0..7).map(|i| c.p.get(i).map_or(D::constant(0.0), |&v| D::var(v, i))).collect();
     let (t, one, amt) = (D::constant(c.t), D::constant(1.0), 100.0);
     let rate = if c.dur > 0.0 { amt / c.dur } else { 0.0 };
     match c.kind.as_str() {
@@ -90,9 +83,8 @@ fn closed_form(c: &Case) -> D {
 /// propagator, from the dose in the depot.
 fn propagated(c: &Case) -> Option<D> {
     use crate::sens::propagate as p;
-    let x: Vec<D> = (0..7)
-        .map(|i| c.p.get(i).map_or(D::constant(0.0), |&v| D::var(v, i)))
-        .collect();
+    let x: Vec<D> =
+        (0..7).map(|i| c.p.get(i).map_or(D::constant(0.0), |&v| D::var(v, i))).collect();
     let (dt, z) = (D::constant(c.t), D::constant(0.0));
     let mut s = [D::constant(100.0), z, z, z];
     match c.kind.as_str() {
@@ -123,9 +115,7 @@ fn peripherals(c: &Case) -> Vec<f64> {
     let dose = DoseEvent::new(0.0, amt, 1, rate, ss, c.ii);
     match c.kind.as_str() {
         "oral2" | "oral2ss" => {
-            vec![w::two_cpt_oral_peripheral(
-                &dose, c.t, p[0], p[1], p[2], p[3], p[4], 1.0,
-            )]
+            vec![w::two_cpt_oral_peripheral(&dose, c.t, p[0], p[1], p[2], p[3], p[4], 1.0)]
         }
         "bolus2" | "inf2" => vec![w::two_cpt_iv_peripheral(&dose, c.t, p[0], p[1], p[2], p[3])],
         "oral3" | "oral3ss" => {
@@ -165,11 +155,7 @@ fn errors(c: &Case, d: &D) -> [f64; 3] {
             h.push(d.hess[i][j]);
         }
     }
-    [
-        rel(&[d.value], &[c.value]),
-        rel(&d.grad[..n], &c.grad),
-        rel(&h, &c.hess),
-    ]
+    [rel(&[d.value], &[c.value]), rel(&d.grad[..n], &c.grad), rel(&h, &c.hess)]
 }
 
 /// Worst value / gradient / Hessian error over the grid, measured on Linux x86_64 (the table
@@ -203,9 +189,7 @@ fn closed_forms_match_the_mpmath_reference_through_every_confluence() {
     let mut worst: std::collections::BTreeMap<String, ([f64; 3], String)> = Default::default();
     let mut fails = Vec::new();
     let mut note = |fam: String, e: [f64; 3], c: &Case, bound: [f64; 3]| {
-        let w = worst
-            .entry(fam.clone())
-            .or_insert(([0.0; 3], String::new()));
+        let w = worst.entry(fam.clone()).or_insert(([0.0; 3], String::new()));
         for k in 0..3 {
             // `NaN` (a non-finite result) is the worst error there is.
             if e[k].is_nan() || e[k] > w.0[k] {
@@ -215,19 +199,13 @@ fn closed_forms_match_the_mpmath_reference_through_every_confluence() {
                 }
             }
             if e[k].is_nan() || e[k] > bound[k] {
-                fails.push(format!(
-                    "{fam} [{k}] err {:.2e} at {:?} t={}",
-                    e[k], c.p, c.t
-                ));
+                fails.push(format!("{fam} [{k}] err {:.2e} at {:?} t={}", e[k], c.p, c.t));
             }
         }
     };
     for c in &cs {
-        let (bound, periph_bound) = if corner(c) {
-            (CORNER_BOUNDS, CORNER_PERIPH_BOUND)
-        } else {
-            (BOUNDS, PERIPH_BOUND)
-        };
+        let (bound, periph_bound) =
+            if corner(c) { (CORNER_BOUNDS, CORNER_PERIPH_BOUND) } else { (BOUNDS, PERIPH_BOUND) };
         note(c.kind.clone(), errors(c, &closed_form(c)), c, bound);
         if let Some(d) = propagated(c) {
             note(format!("{}-propagator", c.kind), errors(c, &d), c, bound);
@@ -235,12 +213,7 @@ fn closed_forms_match_the_mpmath_reference_through_every_confluence() {
         let got = peripherals(c);
         if !got.is_empty() {
             let e = rel(&got, &c.periph);
-            note(
-                format!("{}-periph", c.kind),
-                [e, 0.0, 0.0],
-                c,
-                [periph_bound, 1.0, 1.0],
-            );
+            note(format!("{}-periph", c.kind), [e, 0.0, 0.0], c, [periph_bound, 1.0, 1.0]);
         }
     }
     for (fam, (e, at)) in &worst {
@@ -249,10 +222,5 @@ fn closed_forms_match_the_mpmath_reference_through_every_confluence() {
             e[0], e[1], e[2]
         );
     }
-    assert!(
-        fails.is_empty(),
-        "{} failures:\n{}",
-        fails.len(),
-        fails.join("\n")
-    );
+    assert!(fails.is_empty(), "{} failures:\n{}", fails.len(), fails.join("\n"));
 }

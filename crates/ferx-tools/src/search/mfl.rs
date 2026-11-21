@@ -158,10 +158,7 @@ pub trait Mode: Copy + PartialEq + fmt::Debug + 'static {
     fn label(&self) -> &'static str;
     /// Parse one spelling, case-insensitively.
     fn parse(word: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|m| m.label().eq_ignore_ascii_case(word))
+        Self::ALL.iter().copied().find(|m| m.label().eq_ignore_ascii_case(word))
     }
     /// What the grammar calls this set, for error messages.
     const WHAT: &'static str;
@@ -342,11 +339,7 @@ impl Mfl {
     /// features always render to the same string, whatever the source
     /// spacing or casing was.
     pub fn render(&self) -> String {
-        self.statements
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(";")
+        self.statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";")
     }
 
     /// The feature statements, `LET` definitions skipped.
@@ -397,22 +390,13 @@ impl fmt::Display for Feature {
                 }
             }
             Feature::Lagtime(m) => write!(f, "{}", render_modes(m))?,
-            Feature::Covariate {
-                parameters,
-                covariates,
-                effects,
-                op,
-                ..
-            } => {
+            Feature::Covariate { parameters, covariates, effects, op, .. } => {
                 write!(f, "{parameters},{covariates},{}", render_modes(effects))?;
                 if *op == CovariateOp::Add {
                     write!(f, ",+")?;
                 }
             }
-            Feature::Allometry {
-                covariate,
-                reference,
-            } => {
+            Feature::Allometry { covariate, reference } => {
                 write!(f, "{covariate}")?;
                 if let Some(r) = reference {
                     write!(f, ",{r}")?;
@@ -424,19 +408,12 @@ impl fmt::Display for Feature {
                 write!(f, "{},{}", render_modes(mode), render_modes(production))?
             }
             Feature::Metabolite(m) => write!(f, "{}", render_modes(m))?,
-            Feature::Iiv {
-                parameters,
-                effects,
-                ..
+            Feature::Iiv { parameters, effects, .. } | Feature::Iov { parameters, effects, .. } => {
+                write!(f, "{parameters},{}", render_modes(effects))?
             }
-            | Feature::Iov {
-                parameters,
-                effects,
-                ..
-            } => write!(f, "{parameters},{}", render_modes(effects))?,
-            Feature::Covariance {
-                level, parameters, ..
-            } => write!(f, "{},{parameters}", render_modes(level))?,
+            Feature::Covariance { level, parameters, .. } => {
+                write!(f, "{},{parameters}", render_modes(level))?
+            }
         }
         write!(f, ")")
     }
@@ -689,9 +666,7 @@ impl Parser {
         match self.next() {
             Some(t) if t == want => Ok(()),
             Some(t) => Err(format!("MFL: in {context}: expected {want}, found {t}")),
-            None => Err(format!(
-                "MFL: in {context}: expected {want}, found end of input"
-            )),
+            None => Err(format!("MFL: in {context}: expected {want}, found end of input")),
         }
     }
 
@@ -717,11 +692,7 @@ impl Parser {
         } else {
             false
         };
-        let context = if optional {
-            format!("{upper}?")
-        } else {
-            upper.clone()
-        };
+        let context = if optional { format!("{upper}?") } else { upper.clone() };
         self.expect(Token::LParen, &context)?;
         let args = self.args(&context)?;
         self.expect(Token::RParen, &context)?;
@@ -764,9 +735,9 @@ impl Parser {
             Some(Token::Plus) => Ok(Arg::Plus),
             Some(Token::At) => match self.next() {
                 Some(Token::Word(w)) => Ok(Arg::Symbol(w)),
-                Some(t) => Err(format!(
-                    "MFL: in {context}: expected a symbol name after `@`, found {t}"
-                )),
+                Some(t) => {
+                    Err(format!("MFL: in {context}: expected a symbol name after `@`, found {t}"))
+                }
                 None => Err(format!(
                     "MFL: in {context}: expected a symbol name after `@`, found end of input"
                 )),
@@ -835,9 +806,7 @@ impl Parser {
                     }
                 }
             }
-            Some(t) => Err(format!(
-                "MFL: in {context}: unexpected {t} in argument list"
-            )),
+            Some(t) => Err(format!("MFL: in {context}: unexpected {t} in argument list")),
             None => Err(format!("MFL: in {context}: unclosed `(` at end of input")),
         }
     }
@@ -863,34 +832,19 @@ fn names_of(arg: &Arg, context: &str, want: &str) -> Result<Vec<String>, String>
         Arg::Number(n) => Ok(vec![n.clone()]),
         Arg::List(items) => {
             if items.is_empty() {
-                return Err(format!(
-                    "MFL: in {context}: an empty array `[]` names nothing"
-                ));
+                return Err(format!("MFL: in {context}: an empty array `[]` names nothing"));
             }
             Ok(items.iter().map(|i| i.text().to_string()).collect())
         }
-        other => Err(format!(
-            "MFL: in {context}: expected {want}, found {}",
-            other.describe()
-        )),
+        other => Err(format!("MFL: in {context}: expected {want}, found {}", other.describe())),
     }
 }
 
 fn modes_of<M: Mode>(arg: &Arg, context: &str) -> Result<Modes<M>, String> {
-    let known = || {
-        M::ALL
-            .iter()
-            .map(|m| m.label())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let known = || M::ALL.iter().map(|m| m.label()).collect::<Vec<_>>().join(", ");
     let one = |word: &str| -> Result<M, String> {
         M::parse(word).ok_or_else(|| {
-            format!(
-                "MFL: in {context}: `{word}` is not a known {}; known: {}",
-                M::WHAT,
-                known()
-            )
+            format!("MFL: in {context}: `{word}` is not a known {}; known: {}", M::WHAT, known())
         })
     };
     match arg {
@@ -898,10 +852,7 @@ fn modes_of<M: Mode>(arg: &Arg, context: &str) -> Result<Modes<M>, String> {
         Arg::Word(w) => Ok(Modes::List(vec![one(w)?])),
         Arg::List(items) => {
             if items.is_empty() {
-                return Err(format!(
-                    "MFL: in {context}: an empty array `[]` names no {}",
-                    M::WHAT
-                ));
+                return Err(format!("MFL: in {context}: an empty array `[]` names no {}", M::WHAT));
             }
             let mut list = Vec::with_capacity(items.len());
             for item in items {
@@ -942,9 +893,7 @@ fn counts_of(arg: &Arg, context: &str) -> Result<Counts, String> {
         Arg::Range(a, b) => Ok(Counts::Range(*a, *b)),
         Arg::List(items) => {
             if items.is_empty() {
-                return Err(format!(
-                    "MFL: in {context}: an empty array `[]` gives no count"
-                ));
+                return Err(format!("MFL: in {context}: an empty array `[]` gives no count"));
             }
             let mut list = Vec::with_capacity(items.len());
             for item in items {
@@ -979,16 +928,9 @@ fn arity(context: &str, args: &[Arg], min: usize, max: usize, shape: &str) -> Re
 }
 
 fn build_feature(
-    upper: &str,
-    optional: bool,
-    args: Vec<Arg>,
-    as_written: &str,
+    upper: &str, optional: bool, args: Vec<Arg>, as_written: &str,
 ) -> Result<Feature, String> {
-    let ctx = if optional {
-        format!("{upper}?")
-    } else {
-        upper.to_string()
-    };
+    let ctx = if optional { format!("{upper}?") } else { upper.to_string() };
     let no_optional = |feature: Feature| -> Result<Feature, String> {
         if optional {
             Err(format!(
@@ -1001,33 +943,15 @@ fn build_feature(
     };
     match upper {
         "ABSORPTION" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                1,
-                "one argument (a mode, an array of modes, or `*`)",
-            )?;
+            arity(&ctx, &args, 1, 1, "one argument (a mode, an array of modes, or `*`)")?;
             no_optional(Feature::Absorption(modes_of(&args[0], &ctx)?))
         }
         "ELIMINATION" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                1,
-                "one argument (a mode, an array of modes, or `*`)",
-            )?;
+            arity(&ctx, &args, 1, 1, "one argument (a mode, an array of modes, or `*`)")?;
             no_optional(Feature::Elimination(modes_of(&args[0], &ctx)?))
         }
         "PERIPHERALS" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                2,
-                "a count and an optional DRUG/MET argument",
-            )?;
+            arity(&ctx, &args, 1, 2, "a count and an optional DRUG/MET argument")?;
             let counts = counts_of(&args[0], &ctx)?;
             let kind = match args.get(1) {
                 Some(a) => Some(modes_of(a, &ctx)?),
@@ -1036,13 +960,7 @@ fn build_feature(
             no_optional(Feature::Peripherals { counts, kind })
         }
         "TRANSITS" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                2,
-                "a count (or `N`) and an optional DEPOT/NODEPOT argument",
-            )?;
+            arity(&ctx, &args, 1, 2, "a count (or `N`) and an optional DEPOT/NODEPOT argument")?;
             let counts = match &args[0] {
                 Arg::Word(w) if w.eq_ignore_ascii_case("N") => {
                     // Pharmpy's grammar: `TRANSITS(N)` takes no depot option.
@@ -1063,13 +981,7 @@ fn build_feature(
             no_optional(Feature::Transits { counts, depot })
         }
         "LAGTIME" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                1,
-                "one argument (ON, OFF, an array of them, or `*`)",
-            )?;
+            arity(&ctx, &args, 1, 1, "one argument (ON, OFF, an array of them, or `*`)")?;
             no_optional(Feature::Lagtime(modes_of(&args[0], &ctx)?))
         }
         "COVARIATE" => {
@@ -1103,22 +1015,10 @@ fn build_feature(
                     ))
                 }
             };
-            Ok(Feature::Covariate {
-                optional,
-                parameters,
-                covariates,
-                effects,
-                op,
-            })
+            Ok(Feature::Covariate { optional, parameters, covariates, effects, op })
         }
         "ALLOMETRY" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                2,
-                "a covariate name and an optional reference value",
-            )?;
+            arity(&ctx, &args, 1, 2, "a covariate name and an optional reference value")?;
             let covariate = match &args[0] {
                 Arg::Word(w) => w.clone(),
                 other => {
@@ -1138,29 +1038,14 @@ fn build_feature(
                     ))
                 }
             };
-            no_optional(Feature::Allometry {
-                covariate,
-                reference,
-            })
+            no_optional(Feature::Allometry { covariate, reference })
         }
         "DIRECTEFFECT" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                1,
-                "one argument (a type, an array of types, or `*`)",
-            )?;
+            arity(&ctx, &args, 1, 1, "one argument (a type, an array of types, or `*`)")?;
             no_optional(Feature::DirectEffect(modes_of(&args[0], &ctx)?))
         }
         "EFFECTCOMP" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                1,
-                "one argument (a type, an array of types, or `*`)",
-            )?;
+            arity(&ctx, &args, 1, 1, "one argument (a type, an array of types, or `*`)")?;
             no_optional(Feature::EffectComp(modes_of(&args[0], &ctx)?))
         }
         "INDIRECTEFFECT" => {
@@ -1171,13 +1056,7 @@ fn build_feature(
             })
         }
         "METABOLITE" => {
-            arity(
-                &ctx,
-                &args,
-                1,
-                1,
-                "one argument (BASIC, PSC, an array of them, or `*`)",
-            )?;
+            arity(&ctx, &args, 1, 1, "one argument (BASIC, PSC, an array of them, or `*`)")?;
             no_optional(Feature::Metabolite(modes_of(&args[0], &ctx)?))
         }
         "IIV" | "IOV" => {
@@ -1185,17 +1064,9 @@ fn build_feature(
             let parameters = operand_of(&args[0], &ctx, "parameter")?;
             let effects = modes_of(&args[1], &ctx)?;
             Ok(if upper == "IIV" {
-                Feature::Iiv {
-                    optional,
-                    parameters,
-                    effects,
-                }
+                Feature::Iiv { optional, parameters, effects }
             } else {
-                Feature::Iov {
-                    optional,
-                    parameters,
-                    effects,
-                }
+                Feature::Iov { optional, parameters, effects }
             })
         }
         "COVARIANCE" => {
@@ -1204,11 +1075,7 @@ fn build_feature(
             // array and `*` are as valid as a bare level.
             let level = modes_of(&args[0], &ctx)?;
             let parameters = operand_of(&args[1], &ctx, "parameter")?;
-            Ok(Feature::Covariance {
-                optional,
-                level,
-                parameters,
-            })
+            Ok(Feature::Covariance { optional, level, parameters })
         }
         _ => Err(format!(
             "MFL: `{as_written}` is not a feature keyword; known: ABSORPTION, ELIMINATION, \

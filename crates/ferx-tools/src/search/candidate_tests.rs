@@ -9,12 +9,8 @@ use crate::search::test_support::{converged_fit, model_text, same_model_two_ways
 
 #[test]
 fn features_render_in_key_order_whatever_order_they_were_set_in() {
-    let a = FeatureVector::new()
-        .with("PERIPHERALS", "1")
-        .with("ABSORPTION", "FO");
-    let b = FeatureVector::new()
-        .with("ABSORPTION", "FO")
-        .with("PERIPHERALS", "1");
+    let a = FeatureVector::new().with("PERIPHERALS", "1").with("ABSORPTION", "FO");
+    let b = FeatureVector::new().with("ABSORPTION", "FO").with("PERIPHERALS", "1");
     assert_eq!(a.render(), "ABSORPTION=FO;PERIPHERALS=1");
     assert_eq!(a, b, "insertion order leaked into the value");
 }
@@ -39,10 +35,7 @@ fn features_round_trip_through_serde() {
     assert_eq!(json, r#"{"CL-WT":"pow","V-SEX":"cat"}"#);
     let back: FeatureVector = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, features);
-    assert_eq!(
-        back.iter().collect::<Vec<_>>(),
-        vec![("CL-WT", "pow"), ("V-SEX", "cat")]
-    );
+    assert_eq!(back.iter().collect::<Vec<_>>(), vec![("CL-WT", "pow"), ("V-SEX", "cat")]);
 }
 
 // ── identity ─────────────────────────────────────────────────────────────────
@@ -56,10 +49,7 @@ fn the_hash_ignores_comments_and_whitespace_but_not_tokens() {
     assert_eq!(plain.hash().len(), 64, "not a hex sha-256");
     assert!(plain.hash().chars().all(|c| c.is_ascii_hexdigit()));
 
-    let edited = Candidate::new(
-        "c",
-        model_text("[parameters]\ntheta CL = 2\ntheta V = 10\n"),
-    );
+    let edited = Candidate::new("c", model_text("[parameters]\ntheta CL = 2\ntheta V = 10\n"));
     assert_ne!(
         plain.hash(),
         edited.hash(),
@@ -88,21 +78,13 @@ fn each_criterion_reads_the_field_it_names() {
     let fit = converged_fit(123.0);
     assert_eq!(Criterion::Ofv.of(&fit), fit.ofv);
     assert_eq!(Criterion::Aic.of(&fit), fit.aic.unwrap());
-    for kind in [
-        BicType::Mixed,
-        BicType::Iiv,
-        BicType::Random,
-        BicType::Fixed,
-    ] {
+    for kind in [BicType::Mixed, BicType::Iiv, BicType::Random, BicType::Fixed] {
         assert_eq!(Criterion::Bic(kind).of(&fit), bic(&fit, kind));
     }
     // The variants are genuinely different numbers on this fit, so a criterion
     // that silently fell back to another one would show here.
     assert_ne!(Criterion::Ofv.of(&fit), Criterion::Aic.of(&fit));
-    assert_ne!(
-        Criterion::Bic(BicType::Mixed).of(&fit),
-        Criterion::Bic(BicType::Fixed).of(&fit)
-    );
+    assert_ne!(Criterion::Bic(BicType::Mixed).of(&fit), Criterion::Bic(BicType::Fixed).of(&fit));
 }
 
 #[test]
@@ -123,10 +105,7 @@ fn criterion_labels_are_distinct_and_serde_round_trips() {
     );
     for criterion in all {
         let json = serde_json::to_string(&criterion).expect("serialize");
-        assert_eq!(
-            serde_json::from_str::<Criterion>(&json).expect("deserialize"),
-            criterion
-        );
+        assert_eq!(serde_json::from_str::<Criterion>(&json).expect("deserialize"), criterion);
     }
     assert_eq!(Criterion::default(), Criterion::Bic(BicType::Mixed));
 }
@@ -143,10 +122,7 @@ fn two_candidates_differing_only_inside_a_quoted_path_are_not_one_candidate() {
     assert_ne!(a.hash(), b.hash(), "{}", a.model.canonical_form());
     // The spelling that *is* one candidate still is, so the fix did not simply
     // stop canonicalising.
-    let reflowed = Candidate::new(
-        "a2",
-        model_text("[data]\npath=\"s3://bucket/a.csv\"  # x\n"),
-    );
+    let reflowed = Candidate::new("a2", model_text("[data]\npath=\"s3://bucket/a.csv\"  # x\n"));
     assert_eq!(a.hash(), reflowed.hash());
 }
 
@@ -161,11 +137,7 @@ fn result_with(criterion: f64, passed: bool, error: Option<&str>) -> CandidateRe
         fit: None,
         ofv: None,
         converged: None,
-        verdict: StrictnessVerdict {
-            passed,
-            failures: vec![],
-            skipped: vec![],
-        },
+        verdict: StrictnessVerdict { passed, failures: vec![], skipped: vec![] },
         criterion,
         seconds: 0.0,
         error: error.map(CandidateError::model),

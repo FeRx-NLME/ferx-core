@@ -38,9 +38,9 @@ EBEs agree with the FD route to the inner tolerance.
 
 The predictor is replayed on an η-only dual, so the number of θ does not cap it. A subject
 keeps the FD inner gradient for its whole objective when any record it carries has no
-analytic term: a predictor that cannot be
-compiled exactly (an identifier the compiler cannot bind). A [count](../model-file/count.qmd)
-record beside the binary ones has an exact term of its own and does not do this. The "*N* of *M* subjects use
+analytic term, which only a predictor supplied as an opaque Rust closure through the API
+lacks: every parsed predictor compiles exactly, and a [count](../model-file/count.qmd)
+record beside the binary ones has an exact term of its own. The "*N* of *M* subjects use
 finite-difference inner gradients" warning counts those subjects and names the cause. A
 time-to-event record beside the binary ones has an analytic term of its own
 ([TTE](tte.qmd#estimation)), so a joint binary + TTE subject stays analytic.

@@ -19,27 +19,20 @@ const DATA: &str = "ID,TIME,DV,EVID,AMT,CMT,CENS\n\
                     1,8,2.2,0,.,1,0\n";
 
 fn temp(contents: &str, suffix: &str) -> tempfile::NamedTempFile {
-    let mut f = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(suffix).tempfile().expect("temp file");
     f.write_all(contents.as_bytes()).expect("write temp file");
     f
 }
 
 fn check(bloq: &str) -> CheckReport {
-    let m = temp(
-        &format!("{MODEL}[fit_options]\n  method = focei\n  bloq_method = {bloq}\n"),
-        ".ferx",
-    );
+    let m =
+        temp(&format!("{MODEL}[fit_options]\n  method = focei\n  bloq_method = {bloq}\n"), ".ferx");
     let d = temp(DATA, ".csv");
     validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()))
 }
 
 fn has_code(r: &CheckReport) -> bool {
-    r.diagnostics
-        .iter()
-        .any(|d| d.code == "W_ZERO_DV_MAGNITUDE_ONLY")
+    r.diagnostics.iter().any(|d| d.code == "W_ZERO_DV_MAGNITUDE_ONLY")
 }
 
 #[test]
@@ -51,10 +44,6 @@ fn check_report_follows_the_model_files_bloq_method() {
     // The m3 silence must come from the skip, not from a check that stopped before the
     // data warnings: neither report may carry an error.
     for r in [&drop, &m3] {
-        assert!(
-            !r.diagnostics.iter().any(|d| d.is_error()),
-            "{:?}",
-            r.diagnostics
-        );
+        assert!(!r.diagnostics.iter().any(|d| d.is_error()), "{:?}", r.diagnostics);
     }
 }

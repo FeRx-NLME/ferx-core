@@ -67,9 +67,8 @@ itself `.is_finite()` before the fold, in the same block or an enclosing one \
 `xs`, `assert!(xs.iter().all(|e| e.is_finite()))`), or put `// nan-ok: <reason>` \
 on the line. See tools/lint-rules/nan-fold.md.";
 
-const INT_TYPES: &[&str] = &[
-    "usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128",
-];
+const INT_TYPES: &[&str] =
+    &["usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128"];
 
 const INT_METHODS: &[&str] = &[
     "len",
@@ -188,10 +187,9 @@ impl FnCtx {
 
 fn type_is_int(ty: &syn::Type) -> bool {
     match ty {
-        syn::Type::Path(p) => p
-            .path
-            .get_ident()
-            .is_some_and(|i| INT_TYPES.contains(&i.to_string().as_str())),
+        syn::Type::Path(p) => {
+            p.path.get_ident().is_some_and(|i| INT_TYPES.contains(&i.to_string().as_str()))
+        }
         syn::Type::Reference(r) => type_is_int(&r.elem),
         _ => false,
     }
@@ -208,10 +206,8 @@ fn expr_is_int(e: &Expr, int_locals: &dyn Fn(&str) -> bool) -> bool {
         Expr::MethodCall(m) => {
             let method = m.method.to_string();
             INT_METHODS.contains(&method.as_str())
-                || (matches!(
-                    method.as_str(),
-                    "max" | "min" | "saturating_sub" | "saturating_add"
-                ) && expr_is_int(&m.receiver, int_locals))
+                || (matches!(method.as_str(), "max" | "min" | "saturating_sub" | "saturating_add")
+                    && expr_is_int(&m.receiver, int_locals))
         }
         Expr::Path(p) => {
             if let Some(i) = p.path.get_ident() {
@@ -236,12 +232,7 @@ fn expr_is_int(e: &Expr, int_locals: &dyn Fn(&str) -> bool) -> bool {
 /// catch is swallowed exactly there (review 3). `assert_eq!(x.is_finite(), false)` and friends
 /// guarantee nothing, so they do not count.
 fn assert_facts(m: &syn::Macro) -> Vec<Fact> {
-    let name = m
-        .path
-        .segments
-        .last()
-        .map(|s| s.ident.to_string())
-        .unwrap_or_default();
+    let name = m.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
     let mut out = Vec::new();
     if matches!(name.as_str(), "assert" | "prop_assert") {
         if let Ok(args) = m.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
@@ -270,11 +261,7 @@ fn collect_finite(cond: &Expr, out: &mut Vec<Fact>) {
     // call and folds another (review 5).
     let value = |e: &Expr, out: &mut Vec<Fact>| {
         if is_stable(e) {
-            out.push(Fact {
-                chain: false,
-                key: value_key(e),
-                roots: roots_of(e),
-            });
+            out.push(Fact { chain: false, key: value_key(e), roots: roots_of(e) });
         }
     };
     match cond {
@@ -573,10 +560,7 @@ fn local_is_int(local: &syn::Local, int_locals: &dyn Fn(&str) -> bool) -> bool {
         _ => return false,
     };
     ty.is_some_and(type_is_int)
-        || local
-            .init
-            .as_ref()
-            .is_some_and(|i| expr_is_int(&i.expr, int_locals))
+        || local.init.as_ref().is_some_and(|i| expr_is_int(&i.expr, int_locals))
 }
 
 /// Identifiers bound by `let` patterns in an `if`/`while` condition.
@@ -596,23 +580,13 @@ fn let_bindings(cond: &Expr) -> BTreeSet<String> {
 /// A path `f64::<anything>` or `f32::<anything>`.
 fn is_float_assoc_fn(e: &Expr) -> bool {
     let Expr::Path(p) = e else { return false };
-    let segs: Vec<String> = p
-        .path
-        .segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect();
+    let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
     segs.len() == 2 && (segs[0] == "f64" || segs[0] == "f32")
 }
 
 fn is_float_assoc_path(e: &Expr, name: &str) -> bool {
     let Expr::Path(p) = e else { return false };
-    let segs: Vec<String> = p
-        .path
-        .segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect();
+    let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
     segs.len() == 2 && (segs[0] == "f64" || segs[0] == "f32") && segs[1] == name
 }
 
@@ -800,17 +774,9 @@ fn place_key(e: &Expr) -> String {
 
 fn is_float_max_min_path(e: &Expr) -> bool {
     let Expr::Path(p) = e else { return false };
-    let segs: Vec<String> = p
-        .path
-        .segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect();
+    let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
     matches!(
-        segs.iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice(),
+        segs.iter().map(String::as_str).collect::<Vec<_>>().as_slice(),
         ["f64" | "f32", "max" | "min"]
     )
 }
@@ -1155,11 +1121,7 @@ impl Linter<'_> {
     /// no type known, so not as integers).
     fn push_scope(&mut self, masked: BTreeSet<String>, bound: BTreeSet<String>) {
         if let Some(ctx) = self.ctx.last_mut() {
-            ctx.scopes.push(Scope {
-                masked,
-                bound,
-                ..Scope::default()
-            });
+            ctx.scopes.push(Scope { masked, bound, ..Scope::default() });
         }
     }
 

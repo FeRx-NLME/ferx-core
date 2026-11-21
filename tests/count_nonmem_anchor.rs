@@ -72,12 +72,7 @@ fn prep(fam: &str, edit: impl Fn(String) -> String) -> ferx_core::PreparedRun {
     std::fs::write(&path, text).unwrap();
     let p = ferx_core::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root()
-                .join(format!("nonmem_anchor/count_{fam}.csv"))
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join(format!("nonmem_anchor/count_{fam}.csv")).to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("count_{fam} loads: {e}"));
     let _ = std::fs::remove_file(&path);
@@ -86,12 +81,8 @@ fn prep(fam: &str, edit: impl Fn(String) -> String) -> ferx_core::PreparedRun {
 
 /// The fixed-effects-only model: the random effect removed from the file.
 fn no_eta(t: String) -> String {
-    assert!(
-        t.contains("  omega ETA_C ~ 0.1\n") && t.contains(" + ETA_C"),
-        "fixture moved"
-    );
-    t.replace("  omega ETA_C ~ 0.1\n", "")
-        .replace(" + ETA_C", "")
+    assert!(t.contains("  omega ETA_C ~ 0.1\n") && t.contains(" + ETA_C"), "fixture moved");
+    t.replace("  omega ETA_C ~ 0.1\n", "").replace(" + ETA_C", "")
 }
 
 fn options(p: &ferx_core::PreparedRun, method: EstimationMethod, maxiter: usize) -> FitOptions {
@@ -107,23 +98,15 @@ fn options(p: &ferx_core::PreparedRun, method: EstimationMethod, maxiter: usize)
 }
 
 fn evaluate(
-    p: &ferx_core::PreparedRun,
-    theta: &[f64],
-    omega: Option<f64>,
-    method: EstimationMethod,
+    p: &ferx_core::PreparedRun, theta: &[f64], omega: Option<f64>, method: EstimationMethod,
 ) -> FitResult {
     let mut params: ModelParameters = p.init_params.clone();
     params.theta = theta.to_vec();
     if let Some(w) = omega {
         params.omega = OmegaMatrix::from_diagonal(&[w], vec!["ETA_C".into()]);
     }
-    ferx_core::fit(
-        &p.parsed.model,
-        &p.population,
-        &params,
-        &options(p, method, 0),
-    )
-    .unwrap_or_else(|e| panic!("{method:?}: {e}"))
+    ferx_core::fit(&p.parsed.model, &p.population, &params, &options(p, method, 0))
+        .unwrap_or_else(|e| panic!("{method:?}: {e}"))
 }
 
 /// No warning may say a gradient or Hessian left the exact path: every fixture here must run
@@ -162,10 +145,7 @@ fn assert_reproduces_nonmem(method: EstimationMethod) {
                 evaluate(&prep(fam, |t| t), &theta, Some(omega), method)
             };
             let d = f.ofv - obj;
-            eprintln!(
-                "A-count {name} {method:?}: ferx {:.10}, NONMEM {obj:.10}, Δ {d:.3e}",
-                f.ofv
-            );
+            eprintln!("A-count {name} {method:?}: ferx {:.10}, NONMEM {obj:.10}, Δ {d:.3e}", f.ofv);
             assert!(f.ofv.is_finite(), "{name}: {}", f.ofv);
             assert!(d.abs() <= NONMEM_OFV, "{name} {method:?}: Δ {d:.3e}");
             assert_no_fd(&name, &f);
@@ -241,19 +221,12 @@ const R_REFS: [RRef; 3] = [
 #[test]
 fn count_endpoint_matches_r_glm_and_glmer() {
     for r in &R_REFS {
-        let p = if r.fixed {
-            prep(r.fam, no_eta)
-        } else {
-            prep(r.fam, |t| t)
-        };
+        let p = if r.fixed { prep(r.fam, no_eta) } else { prep(r.fam, |t| t) };
         let mut theta = vec![r.beta[0].exp(), r.beta[1], r.beta[2]];
         theta.extend(r.r);
         let f = evaluate(&p, &theta, r.omega, EstimationMethod::Laplace);
         let d = f.ofv - r.m2ll;
-        eprintln!(
-            "R {} fixed={}: ferx {:.10}, R {:.10}, Δ {d:.3e}",
-            r.fam, r.fixed, f.ofv, r.m2ll
-        );
+        eprintln!("R {} fixed={}: ferx {:.10}, R {:.10}, Δ {d:.3e}", r.fam, r.fixed, f.ofv, r.m2ll);
         assert!(d.abs() <= r.tol, "{} fixed={}: Δ {d:.3e}", r.fam, r.fixed);
     }
 }
@@ -281,10 +254,7 @@ fn the_anchor_tells_negbin_from_poisson() {
 /// the OFV bound is one-sided (ferx may not be worse by more than 1e-4) and the parameter
 /// bound is 2e-3 relative, the precision a stop that flat pins θ and ω to.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn count_endpoint_converges_to_nonmem_optimum() {
     for (fam, n_theta) in [("pois", 3), ("nb", 4)] {
         let p = prep(fam, |t| t);
@@ -293,22 +263,13 @@ fn count_endpoint_converges_to_nonmem_optimum() {
         opts.outer_maxiter = 300;
         let f = ferx_core::fit(&p.parsed.model, &p.population, &p.init_params, &opts).unwrap();
         let d = f.ofv - obj;
-        eprintln!(
-            "count_{fam} converged: ferx {:.8}, NONMEM {obj:.8}, Δ {d:.3e}",
-            f.ofv
-        );
+        eprintln!("count_{fam} converged: ferx {:.8}, NONMEM {obj:.8}, Δ {d:.3e}", f.ofv);
         assert!(d <= 1e-4, "count_{fam}: ferx worse than NONMEM by {d:.3e}");
         for (k, (a, b)) in f.theta.iter().zip(&theta).enumerate() {
-            assert!(
-                (a - b).abs() <= 2e-3 * b.abs(),
-                "count_{fam} θ{k}: {a} vs {b}"
-            );
+            assert!((a - b).abs() <= 2e-3 * b.abs(), "count_{fam} θ{k}: {a} vs {b}");
         }
         let w = f.omega[(0, 0)];
-        assert!(
-            (w - omega).abs() <= 2e-3 * omega,
-            "count_{fam} ω: {w} vs {omega}"
-        );
+        assert!((w - omega).abs() <= 2e-3 * omega, "count_{fam} ω: {w} vs {omega}");
         assert_no_fd(fam, &f);
     }
 }

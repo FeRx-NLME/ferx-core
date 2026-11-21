@@ -61,16 +61,8 @@ const A_B1_OFV: f64 = 5e-8;
 
 fn evaluate(method: EstimationMethod, interaction: bool) -> (f64, f64, Vec<String>) {
     let p = ferx_core::prepare_run(
-        root()
-            .join("nonmem_anchor/profile_logit_b1.ferx")
-            .to_str()
-            .unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/profile_logit_b1.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        root().join("nonmem_anchor/profile_logit_b1.ferx").to_str().unwrap(),
+        Some(root().join("nonmem_anchor/profile_logit_b1.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("B1 loads: {e}"));
     assert_eq!(
@@ -139,37 +131,23 @@ const PROFILED: &str = "](0.0) profile\n";
 fn prep(profiled: bool) -> ferx_core::PreparedRun {
     let text = std::fs::read_to_string(root().join("nonmem_anchor/profile_logit_b1.ferx")).unwrap();
     assert!(text.contains(UNPROFILED), "the fixture moved");
-    let text = if profiled {
-        text.replace(UNPROFILED, PROFILED)
-    } else {
-        text
-    };
+    let text = if profiled { text.replace(UNPROFILED, PROFILED) } else { text };
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ferx_binary_levels_{}_{n}.ferx",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ferx_binary_levels_{}_{n}.ferx", std::process::id()));
     std::fs::write(&path, text).unwrap();
     ferx_core::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/profile_logit_b1.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("nonmem_anchor/profile_logit_b1.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("B1 loads: {e}"))
 }
 
 /// One evaluation (`outer_maxiter = 0`) of `p` at `params` under `method`.
 fn evaluate_at(
-    p: &ferx_core::PreparedRun,
-    params: &ferx_core::types::ModelParameters,
-    method: EstimationMethod,
-    interaction: bool,
-    covariance: bool,
+    p: &ferx_core::PreparedRun, params: &ferx_core::types::ModelParameters,
+    method: EstimationMethod, interaction: bool, covariance: bool,
 ) -> ferx_core::types::FitResult {
     let options = FitOptions {
         verbose: false,
@@ -187,9 +165,7 @@ fn evaluate_at(
 /// The profiled B1 at NONMEM's structural point (TVL, EMAX, ω), its levels at their
 /// initial 0 for the profile solve to find.
 fn profiled_at_nonmem(
-    method: EstimationMethod,
-    interaction: bool,
-    covariance: bool,
+    method: EstimationMethod, interaction: bool, covariance: bool,
 ) -> (ferx_core::types::FitResult, Vec<f64>, f64) {
     let (theta, omega, obj) = nonmem_optimum();
     let p = prep(true);
@@ -270,14 +246,10 @@ fn the_profiled_binary_covariance_is_the_unprofiled_one_at_the_same_point() {
     params.theta.clone_from(&fp.theta);
     params.omega = OmegaMatrix::from_diagonal(&[omega], vec!["ETA_S".into()]);
     let fu = evaluate_at(&pu, &params, EstimationMethod::Laplace, true, true);
-    let sp = fp
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("profiled covariance: {:?}", fp.warnings));
-    let su = fu
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("unprofiled covariance: {:?}", fu.warnings));
+    let sp =
+        fp.se_theta.as_ref().unwrap_or_else(|| panic!("profiled covariance: {:?}", fp.warnings));
+    let su =
+        fu.se_theta.as_ref().unwrap_or_else(|| panic!("unprofiled covariance: {:?}", fu.warnings));
     assert_eq!(sp.len(), su.len(), "one SE per θ on both sides");
     let mut worst = 0.0_f64;
     for (a, b) in sp.iter().zip(su) {
@@ -297,27 +269,18 @@ fn the_profiled_binary_covariance_is_the_unprofiled_one_at_the_same_point() {
 /// unprofiled tests above). Measured: profiled −9.2e-9 from NONMEM, `converged`; the
 /// unprofiled fit from there −8.8e-11 (macOS arm64).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_profiled_binary_fit_lands_on_nonmems_optimum() {
     let (_, _, obj) = nonmem_optimum();
     let p = prep(true);
-    let o = FitOptions {
-        verbose: false,
-        ..p.parsed.fit_options.clone()
-    };
+    let o = FitOptions { verbose: false, ..p.parsed.fit_options.clone() };
     let fp = ferx_core::fit(&p.parsed.model, &p.population, &p.init_params, &o)
         .unwrap_or_else(|e| panic!("{e}"));
     let pu = prep(false);
     let mut start = pu.init_params.clone();
     start.theta.clone_from(&fp.theta);
     start.omega = OmegaMatrix::from_diagonal(&[fp.omega[(0, 0)]], vec!["ETA_S".into()]);
-    let ou = FitOptions {
-        verbose: false,
-        ..pu.parsed.fit_options.clone()
-    };
+    let ou = FitOptions { verbose: false, ..pu.parsed.fit_options.clone() };
     let fu = ferx_core::fit(&pu.parsed.model, &pu.population, &start, &ou)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(

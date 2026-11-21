@@ -36,19 +36,14 @@ const NAME: &str = "reset_trough_tie";
 fn nonmem_column(column: &str) -> Vec<(String, f64, f64)> {
     let path = format!("nonmem_anchor/results/{NAME}.tab");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
     let header: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let col = |c: &str| header.iter().position(|h| *h == c).expect(c);
     let (id, time, evid, value) = (col("ID"), col("TIME"), col("EVID"), col(column));
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0)
@@ -95,10 +90,7 @@ fn assert_matches(leg: &str, got: &[(String, f64, f64)], bound: f64) -> f64 {
         );
         worst = worst.max(err);
     }
-    println!(
-        "{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations",
-        nm.len()
-    );
+    println!("{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations", nm.len());
     worst
 }
 
@@ -126,16 +118,8 @@ fn predict_scores_an_obs_between_a_reset_and_a_dose_on_the_reset_state() {
     // The straddle itself, on NONMEM's own table: ID 1 (after the reset) and ID 2 (before
     // it) differ at the tie, so this fixture can tell the two orders apart.
     let nm = nonmem_column("PRED");
-    let at_tie = |id: &str| {
-        nm.iter()
-            .find(|r| r.0 == id && r.1 == 30.0)
-            .map(|r| r.2)
-            .unwrap()
-    };
-    assert!(
-        (at_tie("1") - at_tie("2")).abs() > 1.0,
-        "the pair no longer straddles the reset"
-    );
+    let at_tie = |id: &str| nm.iter().find(|r| r.0 == id && r.1 == 30.0).map(|r| r.2).unwrap();
+    assert!((at_tie("1") - at_tie("2")).abs() > 1.0, "the pair no longer straddles the reset");
 }
 
 /// The dual ODE walk (the adjoint's recorder) at η = 0, rows labelled with `predict()`'s.
@@ -178,15 +162,9 @@ fn fit_objective_with_an_obs_between_a_reset_and_a_dose_matches_nonmem() {
     assert!(r.ofv.is_finite(), "OFV {}", r.ofv);
     let err = (r.ofv - want).abs();
     println!("ferx OFV {:.10}, NONMEM {want:.10}, |Δ| {err:.3e}", r.ofv);
+    assert!(err < OFV_BOUND, "ferx OFV {} vs NONMEM #OBJV {want} (|Δ| {err:.3e})", r.ofv);
     assert!(
-        err < OFV_BOUND,
-        "ferx OFV {} vs NONMEM #OBJV {want} (|Δ| {err:.3e})",
-        r.ofv
-    );
-    assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "a subject routed to FD, so the dual path was not exercised: {:?}",
         r.warnings
     );

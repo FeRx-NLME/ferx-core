@@ -61,14 +61,7 @@ fn model_with_method(method: &str) -> ferx_core::CompiledModel {
     let src = BINDING_MODEL.replace("METHOD", method);
     let parsed = parse_full_model(&src).unwrap_or_else(|e| panic!("{method}: parse: {e}"));
     assert_eq!(
-        parsed
-            .model
-            .ode_spec
-            .as_ref()
-            .expect("ODE model")
-            .solver_opts
-            .method
-            .as_str(),
+        parsed.model.ode_spec.as_ref().expect("ODE model").solver_opts.method.as_str(),
         method,
         "the `[fit_options] ode_method` value must reach the solver"
     );
@@ -141,10 +134,7 @@ fn auto_predicts_what_the_named_stiff_method_predicts() {
     // above would pass even if `auto` had quietly stayed on `rk45`.
     let explicit = model_with_method("rk45");
     let explicit_pred = predict(&explicit, &pop, &explicit.default_params).unwrap();
-    let moved = auto_pred
-        .iter()
-        .zip(&explicit_pred)
-        .any(|(a, e)| a.pred != e.pred);
+    let moved = auto_pred.iter().zip(&explicit_pred).any(|(a, e)| a.pred != e.pred);
     assert!(
         moved,
         "auto reproduced rk45 bit-for-bit — the escalation never happened, so this test \
@@ -160,17 +150,9 @@ fn auto_reaches_the_estimation_path_and_returns_a_finite_objective() {
     let times = [0.1, 0.5, 1.0, 4.0, 12.0, 24.0];
     let pop = population(&times);
     let model = model_with_method("auto");
-    let options = FitOptions {
-        outer_maxiter: 2,
-        run_covariance_step: false,
-        ..Default::default()
-    };
+    let options = FitOptions { outer_maxiter: 2, run_covariance_step: false, ..Default::default() };
     let result = fit(&model, &pop, &model.default_params, &options).expect("fit under auto");
-    assert!(
-        result.ofv.is_finite(),
-        "auto produced a non-finite OFV: {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "auto produced a non-finite OFV: {}", result.ofv);
 }
 
 #[test]
@@ -205,27 +187,19 @@ fn an_unknown_ode_method_is_rejected_with_auto_in_the_expected_values() {
 /// probe escalates to `rodas5p` rather than `rodas4`, so the tolerance-dependent choice is on
 /// the tested path too.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn auto_converges_to_the_same_optimum_as_the_named_stiff_method() {
     // The fixture at NONMEM-equivalent accuracy, so the two fits differ by their stepper
     // choice and not by their tolerance.
     fn tight(method: &str) -> ferx_core::CompiledModel {
         let src = BINDING_MODEL.replace("METHOD", method)
             + "  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n";
-        parse_full_model(&src)
-            .unwrap_or_else(|e| panic!("{method}: parse: {e}"))
-            .model
+        parse_full_model(&src).unwrap_or_else(|e| panic!("{method}: parse: {e}")).model
     }
 
     let times = [0.05, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
     let pop = population(&times);
-    let options = FitOptions {
-        run_covariance_step: false,
-        ..Default::default()
-    };
+    let options = FitOptions { run_covariance_step: false, ..Default::default() };
 
     let auto = tight("auto");
     let auto_fit = fit(&auto, &pop, &auto.default_params, &options).expect("fit under auto");
@@ -240,9 +214,6 @@ fn auto_converges_to_the_same_optimum_as_the_named_stiff_method() {
         named_fit.ofv
     );
     for (i, (a, b)) in auto_fit.theta.iter().zip(&named_fit.theta).enumerate() {
-        assert!(
-            (a - b).abs() <= 1e-3 * b.abs().max(1e-6),
-            "theta[{i}] differs: {a} vs {b}"
-        );
+        assert!((a - b).abs() <= 1e-3 * b.abs().max(1e-6), "theta[{i}] differs: {a} vs {b}");
     }
 }

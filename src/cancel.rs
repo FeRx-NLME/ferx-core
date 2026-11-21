@@ -46,10 +46,7 @@ impl CancelFlag {
     /// next one (`trip_after(0)` is a pre-cancelled flag).
     #[cfg(test)]
     pub(crate) fn trip_after(polls: usize) -> Self {
-        Self(
-            Arc::default(),
-            Some(Arc::new(std::sync::atomic::AtomicUsize::new(polls))),
-        )
+        Self(Arc::default(), Some(Arc::new(std::sync::atomic::AtomicUsize::new(polls))))
     }
 }
 

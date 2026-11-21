@@ -36,7 +36,7 @@
 50 lib:api
 50 lib:estimation::bayes
 47 lib:ode::predictions
-36 lib:api::levels
+36 lib:levels
 25 lib:estimation::run_covariance::from_fit_bindings
 24 lib:estimation::vi::elbo
 18 lib:api::fit
@@ -53,7 +53,7 @@
 2 lib:api::sde_integration::sde_steady_state_scores_like_the_explicit_train
 2 lib:parser::model_parser
 2 lib:pk::analytical_absorption
-1 lib:api::pool
+1 lib:pool
 1 lib:api::validation
 1 lib:estimation::run_sir::from_fit_bindings
 1 lib:markov::endpoint

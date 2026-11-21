@@ -28,11 +28,7 @@ fn tte_term_sums_endpoints_in_ascending_cmt_order() {
         .map(|s| {
             singles
                 .iter()
-                .map(|ms| {
-                    TteTerm::new(ms, s)
-                        .eval_shared::<f64>(&theta, &ETA, None)
-                        .expect("term")
-                })
+                .map(|ms| TteTerm::new(ms, s).eval_shared::<f64>(&theta, &ETA, None).expect("term"))
                 .collect()
         })
         .collect();
@@ -46,9 +42,7 @@ fn tte_term_sums_endpoints_in_ascending_cmt_order() {
         let (m, pop) = fx.compile();
         for (s, t) in pop.subjects.iter().zip(&terms) {
             let want = fold(0.0, t);
-            let got = TteTerm::new(&m, s)
-                .eval_shared::<f64>(&theta, &ETA, None)
-                .expect("term");
+            let got = TteTerm::new(&m, s).eval_shared::<f64>(&theta, &ETA, None).expect("term");
             assert_eq!(
                 got.to_bits(),
                 want.to_bits(),

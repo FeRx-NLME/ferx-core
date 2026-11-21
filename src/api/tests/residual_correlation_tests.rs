@@ -25,9 +25,7 @@ fn src(kind: &str, rho: &str, extra_params: &str, extra_fit: &str) -> String {
 }
 
 fn model(kind: &str, rho: &str) -> CompiledModel {
-    parse_full_model(&src(kind, rho, "", ""))
-        .expect("parse")
-        .model
+    parse_full_model(&src(kind, rho, "", "")).expect("parse").model
 }
 
 /// One subject per `arms` entry; each row is `(ARM, TIME)`.
@@ -77,10 +75,7 @@ fn scope_for(model_src: &str, opts: &FitOptions) -> Vec<Diagnostic> {
 }
 
 fn focei() -> FitOptions {
-    FitOptions {
-        method: crate::types::EstimationMethod::FoceI,
-        ..FitOptions::default()
-    }
+    FitOptions { method: crate::types::EstimationMethod::FoceI, ..FitOptions::default() }
 }
 
 /// The method gate, both sides: `foce` and `focei` pass, `saem` (and a chain that
@@ -88,20 +83,11 @@ fn focei() -> FitOptions {
 #[test]
 fn scope_names_an_unsupported_method_and_the_supported_set() {
     let s = src("cs", "(0.3, -0.4, 0.95)", "", "");
-    for m in [
-        crate::types::EstimationMethod::Foce,
-        crate::types::EstimationMethod::FoceI,
-    ] {
-        let opts = FitOptions {
-            method: m,
-            ..FitOptions::default()
-        };
+    for m in [crate::types::EstimationMethod::Foce, crate::types::EstimationMethod::FoceI] {
+        let opts = FitOptions { method: m, ..FitOptions::default() };
         assert!(with_code(&scope_for(&s, &opts), "E_RESIDUAL_CORRELATION_SCOPE").is_empty());
     }
-    let saem = FitOptions {
-        method: crate::types::EstimationMethod::Saem,
-        ..FitOptions::default()
-    };
+    let saem = FitOptions { method: crate::types::EstimationMethod::Saem, ..FitOptions::default() };
     let d = scope_for(&s, &saem);
     let msg = one(&d, "E_RESIDUAL_CORRELATION_SCOPE");
     assert!(
@@ -113,16 +99,10 @@ fn scope_names_an_unsupported_method_and_the_supported_set() {
         "{msg}"
     );
     // The block_sigma refusal must not speak for a `correlation` line.
-    assert!(
-        d.iter().all(|x| !x.code.starts_with("E_BLOCK_SIGMA")),
-        "{d:#?}"
-    );
+    assert!(d.iter().all(|x| !x.code.starts_with("E_BLOCK_SIGMA")), "{d:#?}");
     // A chain that ends in a supported method but passes through saem is refused too.
     let chain = FitOptions {
-        methods: vec![
-            crate::types::EstimationMethod::Saem,
-            crate::types::EstimationMethod::FoceI,
-        ],
+        methods: vec![crate::types::EstimationMethod::Saem, crate::types::EstimationMethod::FoceI],
         ..FitOptions::default()
     };
     assert!(one(&scope_for(&s, &chain), "E_RESIDUAL_CORRELATION_SCOPE").contains("saem"));
@@ -132,10 +112,7 @@ fn scope_names_an_unsupported_method_and_the_supported_set() {
 #[test]
 fn scope_refuses_quadrature() {
     let s = src("ar1", "(0.3, -0.4, 0.95)", "", "");
-    let agq = FitOptions {
-        n_agq: 3,
-        ..focei()
-    };
+    let agq = FitOptions { n_agq: 3, ..focei() };
     let msg = one(&scope_for(&s, &agq), "E_RESIDUAL_CORRELATION_SCOPE").to_string();
     assert!(
         msg.contains("`correlation ar1(RHO) by ARM` is not supported with n_agq = 3."),
@@ -150,13 +127,8 @@ fn scope_refuses_quadrature() {
 #[test]
 fn scope_accepts_kappa() {
     for kind in ["cs", "ar1", "car1"] {
-        let s = src(
-            kind,
-            "(0.3, 0.0, 0.95)",
-            "  kappa K_CL ~ 0.04\n",
-            "  iov_column = OCC\n",
-        )
-        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + K_CL)");
+        let s = src(kind, "(0.3, 0.0, 0.95)", "  kappa K_CL ~ 0.04\n", "  iov_column = OCC\n")
+            .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + K_CL)");
         assert!(
             with_code(&scope_for(&s, &focei()), "E_RESIDUAL_CORRELATION_SCOPE").is_empty(),
             "{kind}"
@@ -174,20 +146,15 @@ fn scope_refuses_m3_and_sde() {
     );
     // `block_sigma` refuses M3 too (`E_BLOCK_SIGMA_M3_UNSUPPORTED`); that refusal is
     // about a different object and must not be reported for a `correlation` line.
-    assert!(
-        d.iter().all(|x| !x.code.starts_with("E_BLOCK_SIGMA")),
-        "{d:#?}"
-    );
+    assert!(d.iter().all(|x| !x.code.starts_with("E_BLOCK_SIGMA")), "{d:#?}");
     let sde = src("cs", "(0.3, -0.4, 0.95)", "", "")
         .replace("pk one_cpt_iv(cl=CL, v=V)", "ode(obs_cmt=central, states=[central])")
         .replace(
             "[error_model]",
             "[odes]\n  d/dt(central) = -(CL / V) * central\n[diffusion]\n  central ~ 0.01\n[error_model]",
         );
-    assert!(
-        one(&scope_for(&sde, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
-            .contains("is not supported with an SDE ([diffusion]) model.")
-    );
+    assert!(one(&scope_for(&sde, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
+        .contains("is not supported with an SDE ([diffusion]) model."));
 }
 
 // ── range ───────────────────────────────────────────────────────────────────
@@ -207,10 +174,7 @@ fn cs_range_names_the_largest_block_and_its_interval() {
         msg.contains("`correlation cs(RHO) by ARM`: the lower bound of theta RHO is -0.6"),
         "{msg}"
     );
-    assert!(
-        msg.contains("but subject S2 has 3 rows in the block ARM=7"),
-        "{msg}"
-    );
+    assert!(msg.contains("but subject S2 has 3 rows in the block ARM=7"), "{msg}");
     assert!(
         msg.contains(
             "compound symmetry over 3 rows is a valid covariance only for ρ in (−1/(3−1), 1) = \
@@ -223,36 +187,23 @@ fn cs_range_names_the_largest_block_and_its_interval() {
     let at_floor = check_model_data(&model("cs", "(0.3, -0.5, 0.95)"), &pop);
     assert!(one(&at_floor, "E_RESIDUAL_CORRELATION_RANGE").contains("is -0.5, but"));
     let accepted = check_model_data(&model("cs", "(0.3, -0.4, 0.95)"), &pop);
-    assert!(
-        with_code(&accepted, "E_RESIDUAL_CORRELATION_RANGE").is_empty(),
-        "{accepted:#?}"
-    );
+    assert!(with_code(&accepted, "E_RESIDUAL_CORRELATION_RANGE").is_empty(), "{accepted:#?}");
     // The CS floor is a CS rule: `ar1` at −0.6 is a valid correlation.
     let ar1 = check_model_data(&model("ar1", "(0.3, -0.6, 0.95)"), &pop);
-    assert!(
-        with_code(&ar1, "E_RESIDUAL_CORRELATION_RANGE").is_empty(),
-        "{ar1:#?}"
-    );
+    assert!(with_code(&ar1, "E_RESIDUAL_CORRELATION_RANGE").is_empty(), "{ar1:#?}");
 }
 
 /// A `FIX`ed ρ is checked at its value, and says so.
 #[test]
 fn cs_range_checks_a_fixed_value() {
     let pop = population(&[&[(1.0, 0.0), (1.0, 1.0), (1.0, 2.0)]]);
-    let msg = one(
-        &check_model_data(&model("cs", "(-0.6) FIX"), &pop),
-        "E_RESIDUAL_CORRELATION_RANGE",
-    )
-    .to_string();
-    assert!(
-        msg.contains("theta RHO is fixed at -0.6, but subject S1"),
-        "{msg}"
-    );
-    let msg = one(
-        &check_model_data(&model("ar1", "(1.0) FIX"), &pop),
-        "E_RESIDUAL_CORRELATION_RANGE",
-    )
-    .to_string();
+    let msg =
+        one(&check_model_data(&model("cs", "(-0.6) FIX"), &pop), "E_RESIDUAL_CORRELATION_RANGE")
+            .to_string();
+    assert!(msg.contains("theta RHO is fixed at -0.6, but subject S1"), "{msg}");
+    let msg =
+        one(&check_model_data(&model("ar1", "(1.0) FIX"), &pop), "E_RESIDUAL_CORRELATION_RANGE")
+            .to_string();
     assert!(
         msg.contains(
             "`correlation ar1(RHO) by ARM`: theta RHO is fixed at 1; a correlation must lie \
@@ -288,10 +239,7 @@ fn the_rail_binds_a_free_rho_and_fix_lifts_it() {
         "{msg}"
     );
     let fixed = check_model_data(&model("cs", "(0.999) FIX"), &pop);
-    assert!(
-        with_code(&fixed, "E_RESIDUAL_CORRELATION_RANGE").is_empty(),
-        "{fixed:#?}"
-    );
+    assert!(with_code(&fixed, "E_RESIDUAL_CORRELATION_RANGE").is_empty(), "{fixed:#?}");
     let lower = check_model_data(&model("ar1", "(0.3, -0.999, 0.9)"), &pop);
     assert!(one(&lower, "E_RESIDUAL_CORRELATION_RANGE")
         .contains("the lower bound of theta RHO is -0.999."));
@@ -326,21 +274,12 @@ fn ar1_refuses_tied_times_within_a_block() {
         ),
         "{msg}"
     );
-    assert!(
-        msg.contains("Give them distinct times, or use `cs`."),
-        "{msg}"
-    );
+    assert!(msg.contains("Give them distinct times, or use `cs`."), "{msg}");
     let split = population(&[&[(1.0, 0.0), (1.0, 2.0), (2.0, 2.0)]]);
     let ok = check_model_data(&model("ar1", "(0.3, -0.4, 0.95)"), &split);
-    assert!(
-        with_code(&ok, "E_RESIDUAL_CORRELATION_TIES").is_empty(),
-        "{ok:#?}"
-    );
+    assert!(with_code(&ok, "E_RESIDUAL_CORRELATION_TIES").is_empty(), "{ok:#?}");
     let cs = check_model_data(&model("cs", "(0.3, -0.4, 0.95)"), &tied);
-    assert!(
-        with_code(&cs, "E_RESIDUAL_CORRELATION_TIES").is_empty(),
-        "{cs:#?}"
-    );
+    assert!(with_code(&cs, "E_RESIDUAL_CORRELATION_TIES").is_empty(), "{cs:#?}");
 }
 
 /// `car1` and a tie: `ρ^0 = 1` makes the two rows perfectly correlated, which is the
@@ -368,16 +307,10 @@ fn car1_refuses_tied_times_within_a_block() {
         "{msg}"
     );
     assert!(!msg.contains("`ar1` orders"), "{msg}");
-    assert!(
-        msg.contains("Give them distinct times, or use `cs`."),
-        "{msg}"
-    );
+    assert!(msg.contains("Give them distinct times, or use `cs`."), "{msg}");
     let split = population(&[&[(1.0, 0.0), (1.0, 2.0), (2.0, 2.0)]]);
     let ok = check_model_data(&model("car1", "(0.3, 0.0, 0.95)"), &split);
-    assert!(
-        with_code(&ok, "E_RESIDUAL_CORRELATION_TIES").is_empty(),
-        "{ok:#?}"
-    );
+    assert!(with_code(&ok, "E_RESIDUAL_CORRELATION_TIES").is_empty(), "{ok:#?}");
 }
 
 /// #1974 review r1 #3: a block spanning a stacked reset occasion. The datareader
@@ -398,11 +331,9 @@ fn time_keyed_structures_refuse_a_block_across_a_time_reset() {
     };
     let spanning = pop_with([1.0; 6]);
     for (kind, rho) in [("ar1", "(0.3, -0.4, 0.95)"), ("car1", "(0.3, 0.0, 0.95)")] {
-        let msg = one(
-            &check_model_data(&model(kind, rho), &spanning),
-            "E_RESIDUAL_CORRELATION_RESET",
-        )
-        .to_string();
+        let msg =
+            one(&check_model_data(&model(kind, rho), &spanning), "E_RESIDUAL_CORRELATION_RESET")
+                .to_string();
         assert!(
             msg.contains(&format!(
                 "`correlation {kind}(RHO) by ARM`: subject S1 has rows at TIME 0 and TIME 1 in \
@@ -427,16 +358,10 @@ fn time_keyed_structures_refuse_a_block_across_a_time_reset() {
         );
         let split = pop_with([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
         let ok = check_model_data(&model(kind, rho), &split);
-        assert!(
-            with_code(&ok, "E_RESIDUAL_CORRELATION_RESET").is_empty(),
-            "{kind}: {ok:#?}"
-        );
+        assert!(with_code(&ok, "E_RESIDUAL_CORRELATION_RESET").is_empty(), "{kind}: {ok:#?}");
     }
     let cs = check_model_data(&model("cs", "(0.3, -0.4, 0.95)"), &spanning);
-    assert!(
-        with_code(&cs, "E_RESIDUAL_CORRELATION_RESET").is_empty(),
-        "{cs:#?}"
-    );
+    assert!(with_code(&cs, "E_RESIDUAL_CORRELATION_RESET").is_empty(), "{cs:#?}");
 }
 
 /// `car1` needs ρ ≥ 0: a free lower bound of −0.2 and a `FIX` at −0.2 are refused
@@ -462,24 +387,16 @@ fn car1_range_refuses_a_negative_rho() {
         msg.contains("For a negative correlation between consecutive rows, use `ar1`."),
         "{msg}"
     );
-    let fixed = one(
-        &check_model_data(&model("car1", "(-0.2) FIX"), &pop),
-        "E_RESIDUAL_CORRELATION_RANGE",
-    )
-    .to_string();
-    assert!(
-        fixed.contains("theta RHO is fixed at -0.2, but `car1` correlates"),
-        "{fixed}"
-    );
+    let fixed =
+        one(&check_model_data(&model("car1", "(-0.2) FIX"), &pop), "E_RESIDUAL_CORRELATION_RANGE")
+            .to_string();
+    assert!(fixed.contains("theta RHO is fixed at -0.2, but `car1` correlates"), "{fixed}");
     for ok in [
         check_model_data(&model("car1", "(0.3, 0.0, 0.95)"), &pop),
         check_model_data(&model("car1", "(0.5) FIX"), &pop),
         check_model_data(&model("ar1", "(0.3, -0.2, 0.95)"), &pop),
     ] {
-        assert!(
-            with_code(&ok, "E_RESIDUAL_CORRELATION_RANGE").is_empty(),
-            "{ok:#?}"
-        );
+        assert!(with_code(&ok, "E_RESIDUAL_CORRELATION_RANGE").is_empty(), "{ok:#?}");
     }
     // The ±0.995 rail still binds a free `car1` ρ.
     let rail = check_model_data(&model("car1", "(0.3, 0.0, 0.999)"), &pop);
@@ -504,20 +421,14 @@ fn a_line_that_couples_nothing_is_reported() {
         ),
         "{msg}"
     );
-    assert!(
-        msg.contains("it cannot be estimated and stays at its initial value."),
-        "{msg}"
-    );
+    assert!(msg.contains("it cannot be estimated and stays at its initial value."), "{msg}");
     assert!(
         msg.contains("Check that the `by` column(s) group the rows you meant to correlate."),
         "{msg}"
     );
     let paired = population(&[&[(1.0, 0.0), (2.0, 1.0)], &[(1.0, 0.0), (1.0, 1.0)]]);
     let d = check_model_data_warnings(&m, &paired, &m.default_params);
-    assert!(
-        with_code(&d, "W_RESIDUAL_CORRELATION_INERT").is_empty(),
-        "{d:#?}"
-    );
+    assert!(with_code(&d, "W_RESIDUAL_CORRELATION_INERT").is_empty(), "{d:#?}");
 }
 
 /// FREM and a mixture each get their own refusal; the plain model gets neither.
@@ -531,10 +442,8 @@ fn scope_refuses_frem_and_mixture() {
         "",
         "  frem_predictions = TVV/ETA_CL:100\n  frem_sigma = ADD_ERR\n",
     );
-    assert!(
-        one(&scope_for(&frem, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
-            .contains("is not supported with FREM covariate pseudo-observations.")
-    );
+    assert!(one(&scope_for(&frem, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
+        .contains("is not supported with FREM covariate pseudo-observations."));
     let mixture = base
         .replace(
             "  omega ETA_CL ~ 0.09\n",
@@ -544,11 +453,8 @@ fn scope_refuses_frem_and_mixture() {
             "[individual_parameters]",
             "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.4\n[individual_parameters]",
         );
-    assert!(one(
-        &scope_for(&mixture, &focei()),
-        "E_RESIDUAL_CORRELATION_SCOPE"
-    )
-    .contains("is not supported with a mixture model."));
+    assert!(one(&scope_for(&mixture, &focei()), "E_RESIDUAL_CORRELATION_SCOPE")
+        .contains("is not supported with a mixture model."));
 }
 
 /// A non-Gaussian endpoint (`[binary_model]` needs the `survival` feature, which the
@@ -557,15 +463,11 @@ fn scope_refuses_frem_and_mixture() {
 #[test]
 fn scope_refuses_a_non_gaussian_endpoint() {
     let base = src("cs", "(0.3, -0.4, 0.95)", "", "");
-    let binary = base.replace(
-        "[fit_options]",
-        "[binary_model]\n  cmt   = 3\n  logit = TVCL - 1\n[fit_options]",
-    );
-    assert!(one(
-        &scope_for(&binary, &focei()),
-        "E_RESIDUAL_CORRELATION_SCOPE"
-    )
-    .contains("is not supported with a time-to-event, binary, categorical or Markov endpoint."));
+    let binary = base
+        .replace("[fit_options]", "[binary_model]\n  cmt   = 3\n  logit = TVCL - 1\n[fit_options]");
+    assert!(one(&scope_for(&binary, &focei()), "E_RESIDUAL_CORRELATION_SCOPE").contains(
+        "is not supported with a time-to-event, binary, categorical or Markov endpoint."
+    ));
 }
 
 /// #1081 review r1 #3: ρ's range is checked at the parameter set the fit starts
@@ -588,9 +490,7 @@ fn rho_range_is_checked_at_the_fits_init_params() {
     assert!(
         one(&at_init, "E_RESIDUAL_CORRELATION_RANGE").contains("lower bound of theta RHO is -0.6")
     );
-    let err = crate::api::fit(&m, &pop, &init, &focei())
-        .expect_err("refused")
-        .to_string();
+    let err = crate::api::fit(&m, &pop, &init, &focei()).expect_err("refused").to_string();
     assert!(err.contains("lower bound of theta RHO is -0.6"), "{err}");
 }
 
@@ -634,19 +534,14 @@ fn compute_npde_npd_assigns_blocks_on_a_caller_population() {
         s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         s.observations = vec![9.0, 8.5, 7.1, 5.2];
     }
-    assert!(
-        pop.subjects.iter().all(|s| s.obs_rgroup.is_empty()),
-        "precondition"
-    );
+    assert!(pop.subjects.iter().all(|s| s.obs_rgroup.is_empty()), "precondition");
     let run = |p: &Population| {
         crate::stats::npde::compute_npde_npd(&m, p, &m.default_params, 200, Some(7), None)
             .expect("runs")
     };
     let given = run(&pop);
-    let values: Vec<f64> = given
-        .iter()
-        .flat_map(|s| s.npde.iter().chain(s.npd.iter()).copied())
-        .collect();
+    let values: Vec<f64> =
+        given.iter().flat_map(|s| s.npde.iter().chain(s.npd.iter()).copied()).collect();
     assert_eq!(values.len(), 16);
     assert!(values.iter().all(|v| v.is_finite()), "{values:?}");
     let mut prepared = pop.clone();

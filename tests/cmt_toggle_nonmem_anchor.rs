@@ -44,17 +44,13 @@ const BOUND: f64 = 1e-9;
 const OFV_BOUND: f64 = 1e-3;
 
 fn anchor(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("nonmem_anchor")
-        .join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("nonmem_anchor").join(name)
 }
 
 /// The anchor model with `options` appended to `[fit_options]`.
 fn model(options: &str) -> CompiledModel {
     let source = std::fs::read_to_string(anchor("cmt_toggle.ferx")).unwrap();
-    parse_full_model(&format!("{source}{options}\n"))
-        .expect("the anchor model parses")
-        .model
+    parse_full_model(&format!("{source}{options}\n")).expect("the anchor model parses").model
 }
 
 fn population() -> Population {
@@ -69,9 +65,7 @@ fn nonmem_obs() -> Vec<(String, f64, usize, f64)> {
     text.lines()
         .skip(2)
         .map(|l| {
-            l.split_whitespace()
-                .map(|x| x.parse::<f64>().expect("number"))
-                .collect::<Vec<f64>>()
+            l.split_whitespace().map(|x| x.parse::<f64>().expect("number")).collect::<Vec<f64>>()
         })
         .filter(|c| c[2] == 0.0)
         .map(|c| (format!("{}", c[0] as i64), c[1], c[3] as usize, c[7]))
@@ -94,9 +88,7 @@ fn assert_preds(label: &str, got: &[(String, f64, f64)], bound: f64) {
         let rel = (g - w).abs() / (1.0 + w.abs());
         assert!(rel.is_finite(), "{label}: ID {id} t={t} rel {rel}");
         if !(rel < bound) {
-            bad.push(format!(
-                "ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {rel:.3e})"
-            ));
+            bad.push(format!("ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {rel:.3e})"));
         }
         worst = worst.max(rel);
     }
@@ -106,13 +98,8 @@ fn assert_preds(label: &str, got: &[(String, f64, f64)], bound: f64) {
 
 fn via_predict(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let preds = ferx_core::predict(m, pop, &m.default_params).expect("predict");
-    let ids = pop
-        .subjects
-        .iter()
-        .flat_map(|s| s.obs_times.iter().map(|_| s.id.clone()));
-    ids.zip(preds.iter())
-        .map(|(id, p)| (id, p.time, p.pred))
-        .collect()
+    let ids = pop.subjects.iter().flat_map(|s| s.obs_times.iter().map(|_| s.id.clone()));
+    ids.zip(preds.iter()).map(|(id, p)| (id, p.time, p.pred)).collect()
 }
 
 #[test]
@@ -161,16 +148,9 @@ fn the_objective_matches_nonmem() {
     )
     .expect("the anchor evaluates");
     let delta = (result.ofv - NM_OFV).abs();
-    println!(
-        "#2732 OFV: ferx {:.6} vs NONMEM {NM_OFV:.6} (Δ {delta:.3e})",
-        result.ofv
-    );
+    println!("#2732 OFV: ferx {:.6} vs NONMEM {NM_OFV:.6} (Δ {delta:.3e})", result.ofv);
     assert!(result.ofv.is_finite(), "OFV {}", result.ofv);
-    assert!(
-        delta < OFV_BOUND,
-        "OFV {} vs {NM_OFV} (Δ {delta:.3e})",
-        result.ofv
-    );
+    assert!(delta < OFV_BOUND, "OFV {} vs {NM_OFV} (Δ {delta:.3e})", result.ofv);
 }
 
 /// `compute_predictions_ode` is public and takes one flat parameter vector, so it has its
@@ -218,10 +198,7 @@ fn a_subject_built_in_memory_predicts_what_the_reader_predicts() {
         let got = ferx_core::pk::compute_predictions_with_tv(&m, &built, theta, &eta);
         assert_eq!(got.len(), want.len(), "ID {id}");
         for (g, w) in got.iter().zip(&want) {
-            assert!(
-                g.is_finite() && (g - w).abs() < 1e-9,
-                "ID {id}: {got:?} vs {want:?}"
-            );
+            assert!(g.is_finite() && (g - w).abs() < 1e-9, "ID {id}: {got:?} vs {want:?}");
         }
         let (_, states) = compute_predictions_with_states(&m, &built, theta, &eta);
         let (_, read_states) = compute_predictions_with_states(&m, read, theta, &eta);

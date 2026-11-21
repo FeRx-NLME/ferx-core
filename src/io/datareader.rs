@@ -24,35 +24,22 @@ impl SelectionFilter {
     /// Build from the raw expression strings stored in `FitOptions`.
     /// Returns `Err` if any expression fails to parse.
     pub fn from_opts(
-        ignore_exprs: &[String],
-        accept_exprs: &[String],
-        ignore_subjects: &[String],
+        ignore_exprs: &[String], accept_exprs: &[String], ignore_subjects: &[String],
     ) -> Result<Self, String> {
-        let ignore = ignore_exprs
-            .iter()
-            .map(|s| FilterClause::parse(s))
-            .collect::<Result<Vec<_>, _>>()?;
-        let accept = accept_exprs
-            .iter()
-            .map(|s| FilterClause::parse(s))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(SelectionFilter {
-            ignore,
-            accept,
-            ignore_subject_ids: ignore_subjects.to_vec(),
-        })
+        let ignore =
+            ignore_exprs.iter().map(|s| FilterClause::parse(s)).collect::<Result<Vec<_>, _>>()?;
+        let accept =
+            accept_exprs.iter().map(|s| FilterClause::parse(s)).collect::<Result<Vec<_>, _>>()?;
+        Ok(SelectionFilter { ignore, accept, ignore_subject_ids: ignore_subjects.to_vec() })
     }
 
     pub fn is_empty(&self) -> bool {
         self.ignore.is_empty() && self.accept.is_empty() && self.ignore_subject_ids.is_empty()
     }
 
-    /// De-duplicated, lowercased covariate column names referenced by any
-    /// ignore/accept clause (standard NONMEM columns excluded). The declared
-    /// `[covariates]` reader uses this to guarantee a filtered column is read
-    /// into each subject's covariate map even when the model file did not
-    /// declare it — otherwise `ignore = STUDY == 2` against an undeclared
-    /// `STUDY` column would silently never fire.
+    /// De-duplicated, lowercased covariate columns referenced by any ignore/accept
+    /// clause (standard NONMEM columns excluded), so the reader reads an undeclared
+    /// filtered column instead of the clause silently never firing.
     pub fn referenced_covariate_columns(&self) -> Vec<String> {
         let mut cols: Vec<String> = Vec::new();
         for clause in self.ignore.iter().chain(self.accept.iter()) {
@@ -66,13 +53,8 @@ impl SelectionFilter {
     }
 
     /// True when any ignore/accept clause reads `col` (case-insensitive; standard
-    /// NONMEM columns included).
-    ///
-    /// `api::validation` asks this for `cmt`: the filter's `RowContext` is fed the
-    /// compartment the reader *resolved*, so on a dataset with no usable `CMT` cell
-    /// a clause naming `CMT` selects rows on an invented value and `W_CMT_DEFAULTED`
-    /// has to fire (#1409). `ignore_subject_ids` is not consulted — it compares
-    /// `Subject::id` and reads no row column at all.
+    /// columns included). Asked for `cmt` by `api::validation`: a clause naming a
+    /// defaulted `CMT` must raise `W_CMT_DEFAULTED` (#1409).
     pub(crate) fn references_column(&self, col: &str) -> bool {
         self.ignore
             .iter()
@@ -82,10 +64,8 @@ impl SelectionFilter {
     }
 
     /// True when any ignore/accept clause compares `col` as a number
-    /// (case-insensitive). The `W_COVARIATE_MISSING` gate asks this: a numeric
-    /// comparison reads the parsed cell, so a missing one is `NaN` there, while a
-    /// string comparison reads the raw text — `FLAG == DROP` on a `KEEP` label is
-    /// not a missing value, though the numeric map holds it as `NaN` (#2599).
+    /// (case-insensitive). Gates `W_COVARIATE_MISSING`: a string comparison reads
+    /// the raw text, so a non-numeric label is not a missing value (#2599).
     pub(crate) fn reads_column_numerically(&self, col: &str) -> bool {
         self.ignore
             .iter()
@@ -98,27 +78,13 @@ impl SelectionFilter {
     /// string, so the reader must build the per-row `str_covariates` map. Lets a
     /// purely numeric filter (the common case) skip that per-row allocation.
     pub fn needs_str_covariates(&self) -> bool {
-        self.ignore
-            .iter()
-            .chain(self.accept.iter())
-            .any(|c| c.needs_str_covariates())
+        self.ignore.iter().chain(self.accept.iter()).any(|c| c.needs_str_covariates())
     }
 
-    /// Returns `(excluded, which)`:
-    /// - `excluded = true` when the row should be dropped.
-    /// - `which` is the source string of the first clause that fired (for logging).
-    ///
-    /// Checks short-circuit on the first match, so a record is attributed to the
-    /// first rule that excludes it. A rule that only ever matches records already
-    /// removed by an earlier rule therefore never appears in the fired-condition
-    /// summary — see `docs/model-file/data-selection.qmd`.
-    ///
-    /// A thin wrapper over the crate-internal `first_excluding_rule`, which is also
-    /// what the reader asks "did a `CMT`-reading rule remove this row" — one
-    /// implementation of the ordering, two questions, so the two cannot come to
-    /// disagree about which rule fired (#1409 review). Inline code rather than an
-    /// intra-doc link on purpose: the target is `pub(crate)` and this method is not,
-    /// so a link would render with its brackets intact and fail the `Rustdoc` gate.
+    /// Returns `(excluded, which)`: whether the row is dropped, and the source of
+    /// the first clause that fired. Short-circuits, so a record is attributed to
+    /// the first excluding rule (see `docs/model-file/data-selection.qmd`).
+    /// Wraps the crate-internal `first_excluding_rule` so the two cannot disagree.
     pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
         match self.first_excluding_rule(ctx) {
             None => (false, None),
@@ -153,9 +119,7 @@ impl SelectionFilter {
     /// filter keeps was kept by every clause, so this is the clause that first
     /// decided it on those columns (#1501).
     pub(crate) fn first_clause_depending_on(
-        &self,
-        ctx: &RowContext<'_>,
-        cols: &[&str],
+        &self, ctx: &RowContext<'_>, cols: &[&str],
     ) -> Option<Excluder<'_>> {
         let depends = |c: &&FilterClause| c.depends_on(ctx, cols);
         self.ignore
@@ -179,14 +143,9 @@ pub(crate) enum Excluder<'a> {
 }
 
 impl Excluder<'_> {
-    /// Whether the rule that fired reads `col` (case-insensitive).
-    ///
-    /// Asked for `cmt`: a record the filter removed *on the strength of a compartment
-    /// the reader had to invent* is a record the dataset's silence deleted from the
-    /// fit, and the `W_CMT_DEFAULTED` summary has to count it — it never reaches the
-    /// dose / observation arms that do the counting. Scoped to the rule that actually
-    /// fired, so an exclusion decided by `DV < 0.001` stays silent even when some
-    /// other clause in the same block does read `CMT`.
+    /// Whether the rule that fired reads `col` (case-insensitive). Asked for `cmt`:
+    /// a record removed on a defaulted compartment counts toward `W_CMT_DEFAULTED`;
+    /// scoped to the firing rule only.
     pub(crate) fn reads_column(&self, col: &str) -> bool {
         match self {
             Excluder::Subject => false,
@@ -220,32 +179,20 @@ impl Excluder<'_> {
 pub(crate) struct SubjectExclusion {
     pub n_obs_excluded: usize,
     /// The **resolved** compartments of the excluded rows counted in
-    /// [`Self::n_obs_excluded`] — `resolve_row_cmt` feeds the filter's `RowContext` the
-    /// defaulted value, so these are on the same footing as `Subject::obs_cmts` even
-    /// though they are not the same *set*: a row classified here can still fail to
-    /// become an observation later (`DV = .` under `MissingDvPolicy::Skip`, or a row
-    /// routed to an endpoint). See `ExclusionSummary::obs_cmts_excluded`.
+    /// [`Self::n_obs_excluded`] (defaulted values, as `Subject::obs_cmts`). See
+    /// `ExclusionSummary::obs_cmts_excluded`.
     pub obs_cmts: std::collections::BTreeSet<usize>,
     pub n_dose_excluded: usize,
-    /// Records excluded that are neither scored obs nor doses (EVID 2/3, or
-    /// missing-DV obs), and records whose type the reader could not read (an
-    /// unparseable `EVID`, `MDV` on `EVID=0`, or `AMT` with no `EVID` column)
-    /// that a rule removed without reading that cell (#1501, #1541 review).
+    /// Records excluded that are neither scored obs nor doses (EVID 2/3, missing-DV
+    /// obs), or whose type the reader could not read (#1501, #1541).
     pub n_other_excluded: usize,
     /// Sources that matched at least one row ("ignore: DV < 0.001", etc.).
     pub fired: Vec<String>,
 }
 
-/// The clause the `W_CMT_DEFAULTED` summary uses to say that a `[data_selection]`
-/// rule reading `CMT` **deleted** rows from the fit (#1409).
-///
-/// Shared rather than spelled twice because `api::validation` matches on it: a
-/// warning carrying this clause is self-evidently about a live `CMT` consumer — the
-/// reader only counts such a row when the rule that removed it actually read `CMT` —
-/// so it must never be suppressed, including on the entry points that have no
-/// `&FitOptions` to answer the question with (`predict`, `simulate`, the adaptive
-/// driver). Matching the reader's own constant, not a prose guess, is what keeps the
-/// two from drifting.
+/// The clause the `W_CMT_DEFAULTED` summary uses when a `[data_selection]` rule
+/// reading `CMT` deleted rows (#1409). Shared because `api::validation` matches on
+/// it: such a warning is never suppressed, even on entry points with no `FitOptions`.
 pub(crate) const CMT_FILTER_DELETED_MARKER: &str =
     "row(s) were removed from the fit by a [data_selection] condition that reads CMT";
 
@@ -257,13 +204,9 @@ pub(crate) const ERR_COV_MISSING_COLUMNS: &str =
 /// Leading text of the "declared covariate value is not numeric" error.
 pub(crate) const ERR_COV_NON_NUMERIC: &str = "[covariates]: non-numeric value";
 
-/// Wall-clock gap inserted between reset-delimited occasion segments when a
-/// subject's TIME column restarts (see the segmentation logic in
-/// `parse_subject`). The reset zeros every compartment at the boundary, so no
-/// drug carries across the gap and its magnitude is numerically irrelevant
-/// (it cancels in every dose/observation time difference within a segment); a
-/// small positive value simply keeps the two occasions from colliding on the
-/// sorted absolute timeline.
+/// Wall-clock gap between reset-delimited occasion segments when a subject's TIME
+/// restarts. The reset zeros every compartment, so the magnitude is numerically
+/// irrelevant; it only keeps the occasions from colliding on the sorted timeline.
 const RESET_SEGMENT_GAP: f64 = 1.0;
 
 /// True when a CSV cell represents a missing value (blank / `.` / `NA` / `NaN`).
@@ -275,31 +218,20 @@ fn is_missing_cell(s: &str) -> bool {
 
 /// Read a NONMEM-format CSV file into a Population.
 ///
-/// Expected columns (case-insensitive):
-///   ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS, CENS, [covariates...]
+/// Columns (case-insensitive): ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS,
+/// CENS, [covariates...]. EVID: 0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose.
+/// CENS: 1 = below LLOQ, -1 = above ULOQ (DV carries the limit).
 ///
-/// EVID: 0=observation, 1=dose, 2=other event (covariate change),
-///       3=system reset (zero all compartments), 4=reset + dose
-/// MDV: 1=missing dependent variable
-/// CENS: 1=observation is below LLOQ (DV carries LLOQ), -1=above ULOQ (DV carries ULOQ); 0 otherwise
+/// `iov_column`: read as the occasion index into `Subject::occasions` /
+/// `Subject::dose_occasions`, and excluded from covariate auto-detection.
 ///
-/// `iov_column`: when `Some(name)`, that column is read as the occasion index
-/// (integer) and stored in `Subject::occasions` / `Subject::dose_occasions`.
-/// The column is excluded from the covariate auto-detection list.
-///
-/// **Model-blind — no endpoint routing.** This reader (and its `_with_covariates`
-/// / `_filtered` variants) does not know the model, so every `EVID=0` row is a
-/// Gaussian observation. A model with a non-Gaussian endpoint (`[event_model]`,
-/// `[binary_model]`, a Markov block) needs those rows routed to
-/// `Subject::obs_records`, which only the model-aware
-/// [`read_population_for`](crate::api::read_population_for) does. `fit()`,
-/// `simulate()` and `predict()` reject a population read here for such a model
-/// with `E_ENDPOINT_UNROUTED` rather than scoring the Gaussian half alone (#1199).
-/// Use this reader for Gaussian-only models.
+/// **Model-blind — no endpoint routing**: every `EVID=0` row is Gaussian. Models
+/// with non-Gaussian endpoints need
+/// [`read_population_for`](crate::api::read_population_for); `fit()` /
+/// `simulate()` / `predict()` reject such a population with `E_ENDPOINT_UNROUTED`
+/// (#1199).
 pub fn read_nonmem_csv(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
 ) -> Result<Population, String> {
     read_nonmem_csv_mapped(path, covariate_columns, iov_column, &[])
 }
@@ -308,9 +240,7 @@ pub fn read_nonmem_csv(
 /// a `[data]` canonical-role → header remapping (#730). `column_map` entries are `(canonical_role, actual_header)`;
 /// an empty slice is the no-remap identity used by the public wrapper.
 pub(crate) fn read_nonmem_csv_mapped(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
     column_map: &[(String, String)],
 ) -> Result<Population, String> {
     read_nonmem_csv_routed(
@@ -328,22 +258,12 @@ pub(crate) fn read_nonmem_csv_mapped(
 
 /// Read a NONMEM-format CSV with a `[covariates]` declaration.
 ///
-/// `decls` are the declared covariates: each must exist as a column and be
-/// numerically coded (a non-numeric value is a hard error, not a silent `0.0`),
-/// and they populate the returned [`CovariateTable`].
-///
-/// `extra_columns` are covariates *used by the model but not declared*. They are
-/// still read into the [`Population`] (leniently, like the auto-detect path) so
-/// the model works, but they are not strictly validated and do not appear in the
-/// table. The parser emits a warning recommending they be declared.
-///
-/// The table echoes the declared columns: one row per input record (including
-/// dose / EVID rows), with `f64::NAN` for missing values.
+/// `decls` must exist as numerically coded columns (non-numeric is a hard error)
+/// and populate the returned [`CovariateTable`] (one row per input record, `NaN`
+/// for missing). `extra_columns` (used but undeclared) are read leniently into
+/// the [`Population`] only.
 pub fn read_nonmem_csv_with_covariates(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
 ) -> Result<(Population, CovariateTable), String> {
     read_nonmem_csv_with_covariates_mapped(path, decls, extra_columns, iov_column, &[])
 }
@@ -365,10 +285,8 @@ fn union_exact(mut union: Vec<String>, extra: &[String]) -> Vec<String> {
     union
 }
 
-/// Ensure every covariate column referenced by a `[data_selection]` filter is
-/// present in `cols`, so a filter on an otherwise-unread column still fires.
-/// Case-insensitive dedup: referenced names are lowercased, declared names may
-/// not be. No-op when `filter` is `None`.
+/// Add every covariate column a `[data_selection]` filter references to `cols`
+/// (case-insensitive dedup), so a filter on an unread column still fires.
 fn augment_with_filter(cols: &mut Vec<String>, filter: Option<&SelectionFilter>) {
     if let Some(f) = filter {
         for c in f.referenced_covariate_columns() {
@@ -382,10 +300,7 @@ fn augment_with_filter(cols: &mut Vec<String>, filter: Option<&SelectionFilter>)
 /// Like [`read_nonmem_csv_with_covariates`] but with a `[data]` column
 /// remapping (#730). See [`read_nonmem_csv_mapped`].
 pub(crate) fn read_nonmem_csv_with_covariates_mapped(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
@@ -400,19 +315,14 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
         &ObsRouting::default(),
         column_map,
     )?;
-    Ok((
-        pop,
-        table.expect("covariate table is built whenever table_decls is Some"),
-    ))
+    Ok((pop, table.expect("covariate table is built whenever table_decls is Some")))
 }
 
 /// Like [`read_nonmem_csv`] (model-blind: no endpoint routing, see there) but
 /// applies `[data_selection]` filtering at read time. Called from
 /// `api::read_population_for` when `FitOptions` carries selection rules.
 pub fn read_nonmem_csv_filtered(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
     filter: &SelectionFilter,
 ) -> Result<Population, String> {
     read_nonmem_csv_filtered_mapped(path, covariate_columns, iov_column, filter, &[])
@@ -421,17 +331,11 @@ pub fn read_nonmem_csv_filtered(
 /// Like [`read_nonmem_csv_filtered`] but with a `[data]` column remapping
 /// (#730). See [`read_nonmem_csv_mapped`].
 pub(crate) fn read_nonmem_csv_filtered_mapped(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: &SelectionFilter,
-    column_map: &[(String, String)],
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
+    filter: &SelectionFilter, column_map: &[(String, String)],
 ) -> Result<Population, String> {
-    // When an explicit covariate list is supplied, `read_nonmem_csv_routed` makes
-    // sure every covariate the filter references is in it — otherwise a filtered
-    // column outside the list would not be read and the condition would silently
-    // never fire. (With `None`, the auto-detect path already reads every
-    // non-standard column, so no augmentation is needed.)
+    // `read_nonmem_csv_routed` adds filter-referenced columns to an explicit list
+    // (auto-detect already reads every non-standard column).
     read_nonmem_csv_routed(
         path,
         covariate_columns,
@@ -447,11 +351,9 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
 
 /// Like [`read_nonmem_csv_with_covariates`] (model-blind: no endpoint routing, see
 /// [`read_nonmem_csv`]) but applies `[data_selection]` filtering.
-pub fn read_nonmem_csv_with_covariates_filtered(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
+#[cfg(test)]
+pub(crate) fn read_nonmem_csv_with_covariates_filtered(
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
     filter: &SelectionFilter,
 ) -> Result<(Population, CovariateTable), String> {
     read_nonmem_csv_with_covariates_filtered_mapped(
@@ -464,20 +366,14 @@ pub fn read_nonmem_csv_with_covariates_filtered(
     )
 }
 
-/// Like [`read_nonmem_csv_with_covariates_filtered`] but with a `[data]` column
+/// Like `read_nonmem_csv_with_covariates_filtered` but with a `[data]` column
 /// remapping (#730). See [`read_nonmem_csv_mapped`].
+#[cfg(test)]
 pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: &SelectionFilter,
-    column_map: &[(String, String)],
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
+    filter: &SelectionFilter, column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
-    // `read_nonmem_csv_routed` also reads any covariate column referenced by an
-    // ignore/accept clause but never declared — without that, a filter on an
-    // undeclared column would silently never fire on this path (the declared
-    // union would lack the column, so it would be absent from `locf_state`).
+    // `read_nonmem_csv_routed` also reads filter-referenced undeclared columns.
     let (pop, table) = read_nonmem_csv_routed(
         path,
         None,
@@ -488,18 +384,12 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
         &ObsRouting::default(),
         column_map,
     )?;
-    Ok((
-        pop,
-        table.expect("covariate table is built whenever table_decls is Some"),
-    ))
+    Ok((pop, table.expect("covariate table is built whenever table_decls is Some")))
 }
 
-/// How an `EVID=0`, `MDV=0` record whose `DV` cell is missing (`.` / `NA` /
-/// blank) is read.
-///
-/// The two readings are both right, for different callers: when the `DV` is an
-/// *input* (fitting) a missing one means "nothing to score here"; when it is the
-/// *output* (simulation) it means "produce a value here" (#957).
+/// How an `EVID=0`, `MDV=0` record with a missing `DV` (`.` / `NA` / blank) is
+/// read: for fitting it means "nothing to score", for simulation "produce a
+/// value here" (#957).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum MissingDvPolicy {
     /// Skip the row and count it for the single `W_MISSING_DV` summary (#258) —
@@ -507,29 +397,17 @@ pub(crate) enum MissingDvPolicy {
     /// likelihood. The default, and the only policy on every fitting path.
     #[default]
     Skip,
-    /// Keep the row as a design point: the sampling time is real, only the
-    /// observation is absent because it has not been generated yet. The DV is a
-    /// placeholder (`NaN` for a Gaussian row, `0` for an integer-coded one) and
-    /// is overwritten by the simulated value. Used by the simulation readers
-    /// (#957) so a `DV = .` template — the natural way to write a design —
-    /// simulates instead of returning zero rows. `MDV=1` still excludes the row:
-    /// that is the user explicitly saying it is not an observation.
+    /// Keep the row as a design point with a placeholder DV (`NaN` Gaussian, `0`
+    /// integer-coded) that simulation overwrites (#957). `MDV=1` still excludes it.
     KeepAsDesign,
 }
 
-/// How each `EVID=0` observation row is turned into an observation record:
-/// which non-Gaussian [`ObsRecord`](crate::types::ObsRecord) variant the row's
-/// CMT routes to, plus the missing-DV policy. Empty sets ⇒ every observation row
-/// takes the Gaussian parallel-Vec path (the all-Gaussian default).
+/// How each `EVID=0` row becomes an observation record: the non-Gaussian
+/// [`ObsRecord`](crate::types::ObsRecord) variant its CMT routes to, plus the
+/// missing-DV policy. Empty sets ⇒ every row is Gaussian.
 ///
-/// The three sets must be pairwise disjoint — a CMT has exactly one endpoint kind
-/// (§8.1: routing is by the CMT's declared endpoint, never guessed from the DV).
-/// [`ObsRouting::validate`] enforces disjointness before any row is read.
-///
-/// Phase 4.0 introduces the discrete/count routing but no parser yet populates
-/// those sets; `discrete`/`count` are reachable only through
-/// [`read_nonmem_csv_filtered_routed`] (used by the reader unit tests). The
-/// production `api::read_population_for` path still builds a TTE-only routing.
+/// The sets must be pairwise disjoint (§8.1: routing is by the CMT's declared
+/// endpoint, never guessed from the DV); [`ObsRouting::validate`] enforces it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ObsRouting {
     /// CMTs whose rows become `ObsRecord::Event` (TTE / RTTE; `survival` feature).
@@ -542,26 +420,17 @@ pub(crate) struct ObsRouting {
     pub count: HashSet<usize>,
     /// What a missing `DV` on a scored row means — see [`MissingDvPolicy`].
     pub missing_dv: MissingDvPolicy,
-    /// Placeholder DV code to write on an integer-coded design-point row, per
-    /// CMT. Only consulted under [`MissingDvPolicy::KeepAsDesign`]; a CMT absent
-    /// from the map falls back to `0`. Endpoints whose declared `state_codes`
-    /// are not 0-based (e.g. `1`/`2`) would otherwise get an out-of-range `0`
-    /// placeholder that no `state_codes` lookup can map back to a generator
-    /// index (#957 review).
+    /// Placeholder DV code per CMT for integer-coded design-point rows under
+    /// [`MissingDvPolicy::KeepAsDesign`] (default `0`), so endpoints whose
+    /// `state_codes` are not 0-based get a decodable placeholder (#957).
     pub design_states: HashMap<usize, usize>,
-    /// Covariate columns a missing cell is **not** carried forward in (#1082): the row's
-    /// snapshot holds `NaN` there instead of the previous record's value. The level
-    /// columns of a nested-level model, whose value names the record's group, so a blank
-    /// cell must be seen as missing rather than silently joining the group before it.
-    /// Empty for every other model, which keeps the ordinary carry-forward.
+    /// Covariate columns a missing cell is **not** carried forward in (#1082): the
+    /// snapshot holds `NaN`. Used for nested-level columns, where a blank must not
+    /// silently join the previous group.
     pub no_carry_forward: HashSet<String>,
     /// The covariate columns `W_COVARIATE_MISSING` may be raised for (#2599).
-    /// `None` — a model-blind read — warns for every covariate column with a
-    /// missing value, since the reader cannot tell which ones a relation reads.
-    /// `Some(reads)` — a model-aware read — warns only for a column `reads` names,
-    /// or one the `[data_selection]` filter reads: a column nothing reads cannot
-    /// make the objective `NaN`, so a warning that says it does is false and
-    /// buries the ones that matter.
+    /// `None` (model-blind) warns for every column; `Some(reads)` only for a
+    /// column `reads` names or the `[data_selection]` filter reads.
     pub warn_missing_covariates: Option<CovariateReads>,
 }
 
@@ -594,16 +463,10 @@ impl CovariateReads {
 }
 
 impl ObsRouting {
-    /// Routing for a model with TTE and/or binary/categorical endpoints: `tte` →
-    /// `ObsRecord::Event`, `discrete` → `ObsRecord::DiscreteState` (binary/categorical,
-    /// #760). Count CMTs are added with [`Self::with_count`]. Pass an empty `discrete` set
-    /// for the pre-Phase-4.0 TTE-only behaviour.
+    /// Routing for TTE (`ObsRecord::Event`) and binary/categorical
+    /// (`ObsRecord::DiscreteState`, #760) CMTs. Count CMTs: [`Self::with_count`].
     pub(crate) fn tte_and_discrete(tte: &HashSet<usize>, discrete: &HashSet<usize>) -> Self {
-        Self {
-            tte: tte.clone(),
-            discrete: discrete.clone(),
-            ..Default::default()
-        }
+        Self { tte: tte.clone(), discrete: discrete.clone(), ..Default::default() }
     }
 
     /// Route `count` CMTs' rows to `ObsRecord::Count` (builder form) — the `[count_model]`
@@ -613,11 +476,9 @@ impl ObsRouting {
         self
     }
 
-    /// Register the per-CMT placeholder DV code used for integer-coded design
-    /// rows (builder form). `codes` maps a CMT to the DV value written when its
-    /// `DV` cell is missing under [`MissingDvPolicy::KeepAsDesign`] — normally
-    /// the endpoint's first declared state code, so the placeholder is always a
-    /// value the endpoint can decode. CMTs left out keep the `0` default.
+    /// Register the per-CMT placeholder DV for integer-coded design rows under
+    /// [`MissingDvPolicy::KeepAsDesign`] — normally the endpoint's first declared
+    /// state code. CMTs left out keep `0`.
     pub(crate) fn with_design_states(mut self, codes: HashMap<usize, usize>) -> Self {
         self.design_states = codes;
         self
@@ -637,10 +498,8 @@ impl ObsRouting {
         self
     }
 
-    /// Whether `W_COVARIATE_MISSING` may be raised for covariate column `name`.
-    /// `filter` is the read's `[data_selection]` filter, itself a reader of the
-    /// columns its clauses compare as numbers — resolved case-insensitively, as the
-    /// reader does. A string comparison reads the raw cell, not the parsed `NaN`.
+    /// Whether `W_COVARIATE_MISSING` may be raised for column `name`; `filter`'s
+    /// numeric comparisons count as readers (case-insensitive).
     fn warns_missing_covariate(&self, name: &str, filter: Option<&SelectionFilter>) -> bool {
         self.warn_missing_covariates.as_ref().map_or(true, |reads| {
             reads.reads(name) || filter.is_some_and(|f| f.reads_column_numerically(name))
@@ -655,26 +514,15 @@ impl ObsRouting {
         self
     }
 
-    /// Whether **any** observation row's endpoint is chosen by its `CMT` — i.e.
-    /// whether this routing is something other than "every row is Gaussian".
-    ///
-    /// The empty-sets default means the reader takes the Gaussian parallel-Vec path
-    /// for every row and never consults the routing tables, so a compartment it had
-    /// to invent cannot move a row between endpoints. Any non-empty set and it can:
-    /// this is what `api::validation::CmtConsumer::EndpointRouting` asks, so the
-    /// `W_CMT_DEFAULTED` scope rests on the routing sets themselves rather than on
-    /// the side-effect of an endpoint-only model carrying an empty `ErrorSpec` map
-    /// (#1409).
+    /// Whether any observation row's endpoint is chosen by its `CMT` (any routing
+    /// set non-empty). Backs `api::validation::CmtConsumer::EndpointRouting` for
+    /// the `W_CMT_DEFAULTED` scope (#1409).
     pub(crate) fn routes_by_cmt(&self) -> bool {
         !self.tte.is_empty() || !self.discrete.is_empty() || !self.count.is_empty()
     }
 
-    /// Whether every routed CMT is `cmt` — i.e. the routing tables name exactly one
-    /// compartment, and it is this one.
-    ///
-    /// Asked with [`DEFAULT_CMT`]: an endpoint model that routes **only** the
-    /// compartment the reader falls back to has nowhere else to send a defaulted row,
-    /// so the guess is provably the right answer rather than an ambiguity (#1409).
+    /// Whether every routed CMT is `cmt`. Asked with [`DEFAULT_CMT`]: a model
+    /// routing only the fallback compartment makes the default unambiguous (#1409).
     pub(crate) fn routes_only(&self, cmt: usize) -> bool {
         let only = |set: &HashSet<usize>| set.iter().all(|c| *c == cmt);
         self.routes_by_cmt() && only(&self.tte) && only(&self.discrete) && only(&self.count)
@@ -720,10 +568,8 @@ impl ObsRouting {
     }
 }
 
-/// An integer-coded non-Gaussian observation endpoint: a discrete-state index
-/// (binary / ordinal / Markov state — unbounded `usize`) or a `u32` count
-/// (Poisson / negative-binomial). Selects the DV upper bound and the error
-/// wording in [`checked_integer_dv`].
+/// An integer-coded non-Gaussian endpoint: a discrete-state index (`usize`) or a
+/// count (`u32`). Selects the DV bound and error wording in [`checked_integer_dv`].
 #[derive(Debug, Clone, Copy)]
 enum IntDvKind {
     DiscreteState,
@@ -745,15 +591,10 @@ impl IntDvKind {
         }
     }
 
-    /// Exclusive upper bound on the rounded DV: a value `>=` this overflows the
-    /// `as usize` / `as u32` cast and is rejected (no domain cap in Phase 4.0 —
-    /// the bound only rejects values the cast could not represent). `type::MAX as
-    /// f64 + 1.0` is exact on both 32- and 64-bit: when `type::MAX` is
-    /// f64-representable the `+1` lands on the next integer; when it rounds up
-    /// (`usize::MAX` on 64-bit: `2^64 - 1` → `2^64`) the `+1` is absorbed, leaving
-    /// exactly the first saturating value. So `u32::MAX` / `usize::MAX` themselves
-    /// are accepted and only genuine overflow is rejected. Non-finite DVs are
-    /// rejected earlier.
+    /// Exclusive upper bound on the rounded DV (values the cast cannot represent).
+    /// `type::MAX as f64 + 1.0` is exact on 32- and 64-bit: either the `+1` lands
+    /// on the next integer or (`usize::MAX` → `2^64`) is absorbed, so `MAX` itself
+    /// is accepted and only overflow rejected.
     fn exclusive_max(self) -> f64 {
         match self {
             IntDvKind::DiscreteState => usize::MAX as f64 + 1.0,
@@ -771,22 +612,12 @@ impl IntDvKind {
     }
 }
 
-/// Validate a non-Gaussian integer-coded DV (discrete-state index or count) and
-/// return the rounded, non-negative magnitude. Rejects — with a caller-shaped
-/// message — non-finite, fractional, negative, and out-of-range (cast-overflowing)
-/// DVs (§8.1 integer-code rule, #192).
-///
-/// A **missing** DV (`.`/`NA`/blank) is skipped by the caller as MDV=1 (#258) and
-/// never reaches here. This function is the guard that stops the three silent
-/// mis-records a raw `dv.round() as usize`/`as u32` cast would otherwise produce:
-/// a `.`-coerced `0.0` → phantom `state:0`/`count:0`; an `inf` → saturated
-/// `usize::MAX`/`u32::MAX`; a `NaN` (whose every comparison is false) → `0`.
+/// Validate a non-Gaussian integer-coded DV and return its rounded magnitude.
+/// Rejects non-finite, fractional, negative and cast-overflowing DVs (§8.1, #192)
+/// that a raw `as usize`/`as u32` cast would silently mis-record. Missing DVs are
+/// skipped by the caller as MDV=1 (#258).
 fn checked_integer_dv(
-    dv: f64,
-    kind: IntDvKind,
-    id: &str,
-    cmt: usize,
-    time: f64,
+    dv: f64, kind: IntDvKind, id: &str, cmt: usize, time: f64,
 ) -> Result<f64, String> {
     let (label, unit) = (kind.label(), kind.unit());
     if !dv.is_finite() {
@@ -812,50 +643,28 @@ fn checked_integer_dv(
     Ok(dv_rounded)
 }
 
-/// Covariate-free shorthand for [`read_nonmem_csv_routed`]. Phase 4.0 exposes it
-/// so the discrete-state / count routing can be exercised directly from unit
-/// tests (no parser produces those sets yet). Disjointness is validated inside
-/// [`read_nonmem_csv_impl`].
+/// Covariate-free shorthand for [`read_nonmem_csv_routed`], for unit tests of the
+/// discrete-state / count routing.
 #[cfg(test)]
 pub(crate) fn read_nonmem_csv_filtered_routed(
-    path: &Path,
-    routing: &ObsRouting,
+    path: &Path, routing: &ObsRouting,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(
-        CsvInput::Path(path),
-        None,
-        &[],
-        &[],
-        None,
-        None,
-        None,
-        routing,
-        &[],
-    )
-    .map(|(pop, _)| pop)
+    read_nonmem_csv_impl(CsvInput::Path(path), None, &[], &[], None, None, None, routing, &[])
+        .map(|(pop, _)| pop)
 }
 
-/// The one reader every wrapper above delegates to: it builds the covariate
-/// read set (declared union, or the explicit lenient list) and augments it with
-/// any `[data_selection]`-referenced column before calling
-/// [`read_nonmem_csv_impl`].
+/// The one reader every wrapper delegates to: builds the covariate read set
+/// (declared union or the explicit lenient list), adds filter-referenced columns,
+/// and calls [`read_nonmem_csv_impl`].
 ///
-/// `decls` is `Some` on the strict `[covariates]` path — declared columns are
-/// validated and a [`CovariateTable`] is returned; `None` returns no table and
-/// reads `covariate_columns` leniently (`None` in turn is auto-detect).
-/// `routing` carries both the per-CMT endpoint routing and the missing-DV
-/// policy, so a caller that needs a non-default policy (simulation, #957) can
-/// reach every covariate/filter combination through this single entry point.
+/// `decls = Some` is the strict `[covariates]` path (validated, returns a
+/// [`CovariateTable`]); `None` reads `covariate_columns` leniently (`None` =
+/// auto-detect). `routing` carries endpoint routing and the missing-DV policy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_nonmem_csv_routed(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    decls: Option<&[CovariateDecl]>,
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    routing: &ObsRouting,
-    column_map: &[(String, String)],
+    path: &Path, covariate_columns: Option<&[&str]>, decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String], iov_column: Option<&str>, filter: Option<&SelectionFilter>,
+    routing: &ObsRouting, column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     read_nonmem_csv_routed_from(
         CsvInput::Path(path),
@@ -882,19 +691,12 @@ pub(crate) enum CsvInput<'a> {
 /// share, so a read of bytes and a read of the file holding them agree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_nonmem_csv_routed_from(
-    input: CsvInput<'_>,
-    covariate_columns: Option<&[&str]>,
-    decls: Option<&[CovariateDecl]>,
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    routing: &ObsRouting,
-    column_map: &[(String, String)],
+    input: CsvInput<'_>, covariate_columns: Option<&[&str]>, decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String], iov_column: Option<&str>, filter: Option<&SelectionFilter>,
+    routing: &ObsRouting, column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    // Declared covariates come first (so the table's column order matches the
-    // declaration); otherwise the caller's explicit list, or `None` for
-    // auto-detect. Either way, a filter's referenced columns must be read or the
-    // condition would silently never fire.
+    // Declared covariates first (table column order); else the explicit list or
+    // `None` for auto-detect. Filter-referenced columns are always added.
     let cols: Option<Vec<String>> = match decls {
         Some(d) => {
             let mut union = declared_union(d, extra_columns);
@@ -910,9 +712,7 @@ pub(crate) fn read_nonmem_csv_routed_from(
             v
         }),
     };
-    let cols_ref: Option<Vec<&str>> = cols
-        .as_ref()
-        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    let cols_ref: Option<Vec<&str>> = cols.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
     let exact = exact_case_extras(
         // The declared branch ignores the caller's list, so it exempts nothing there.
         covariate_columns.filter(|_| decls.is_none()),
@@ -932,29 +732,17 @@ pub(crate) fn read_nonmem_csv_routed_from(
     )
 }
 
-/// The model extras that must bind a header by exact case (#1946): every
-/// `extra_columns` entry the caller did not name in its explicit list (exact
-/// spelling) and no `[data_selection]` filter references (case-insensitively; a
-/// filter lowercases its column names). On the `[covariates]` path the extras are
-/// the referenced-but-*undeclared* columns, so no declared name is ever among
-/// them and a declaration needs no exemption here; the caller passes `None` for
-/// `covariate_columns` on that path, since declarations take precedence over a
-/// fallback list and that list is never read there.
-///
-/// The one rule across all three read paths: a column the *model* references
-/// binds only the header it spells exactly, so a case-differing reference stays
-/// unread (and `check_covariates` reports it) instead of binding a header the
-/// caller left out. The case-insensitive fallback in `cov_indices` is kept for the
-/// names a caller or filter supplied. On the auto-detect path the extras are
-/// already matched against headers exactly, so the list is inert there.
+/// The model extras that must bind a header by exact case (#1946): `extra_columns`
+/// entries neither named in the caller's list nor referenced by a filter. A
+/// column the model references binds only the header it spells exactly, so a
+/// case-differing reference stays unread (`check_covariates` reports it). Inert
+/// on the auto-detect path. On the `[covariates]` path the extras are the
+/// referenced-but-*undeclared* columns, so no declared name is among them, and the
+/// caller passes `None` for `covariate_columns` (declarations take precedence).
 fn exact_case_extras(
-    covariate_columns: Option<&[&str]>,
-    extra_columns: &[String],
-    filter: Option<&SelectionFilter>,
+    covariate_columns: Option<&[&str]>, extra_columns: &[String], filter: Option<&SelectionFilter>,
 ) -> Vec<String> {
-    let filter_cols = filter
-        .map(|f| f.referenced_covariate_columns())
-        .unwrap_or_default();
+    let filter_cols = filter.map(|f| f.referenced_covariate_columns()).unwrap_or_default();
     extra_columns
         .iter()
         .filter(|e| {
@@ -966,36 +754,18 @@ fn exact_case_extras(
         .collect()
 }
 
-/// Shared CSV reader. `table_decls`, when `Some`, requests building a
-/// [`CovariateTable`] over exactly those declared covariates — each must exist
-/// as a column and is validated as numeric (non-numeric → hard error). The
-/// columns in `covariate_columns` (a superset, including referenced-but-
-/// undeclared covariates) are read into the [`Population`] leniently. `None` on
-/// both is the legacy auto-detect [`read_nonmem_csv`] path.
+/// Shared CSV reader. `table_decls = Some` builds a [`CovariateTable`] over those
+/// declared (strictly numeric) covariates; `covariate_columns` (a superset) is
+/// read leniently. `None` on both is the auto-detect [`read_nonmem_csv`] path.
 ///
-/// `auto_extras`: on the auto-detect path (`covariate_columns = None`), columns
-/// the model reads that auto-detection would otherwise skip — a role column or
-/// the `iov_column` (#1936). Matched to headers exactly (case-sensitive), so a
-/// case-differing spelling stays unread rather than silently binding.
-///
-/// `exact_extras`: on an explicit-list or declared read, the listed names that
-/// must resolve to a header by exact case — the model extras the caller did not
-/// name (see [`exact_case_extras`]). Every other listed name keeps the
-/// case-insensitive fallback, so the auto-detect rule above holds on every path.
-///
-/// `routing`: per-CMT non-Gaussian endpoint routing (`ObsRecord::Event` /
-/// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
-/// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
+/// `auto_extras`: on auto-detect, columns the model reads that detection would
+/// skip (role / `iov_column`, #1936), matched exactly. `exact_extras`: listed
+/// names that must match a header by exact case (see [`exact_case_extras`]).
+/// `routing`: per-CMT endpoint routing, validated for disjointness up front.
 fn read_nonmem_csv_impl(
-    input: CsvInput<'_>,
-    covariate_columns: Option<&[&str]>,
-    auto_extras: &[String],
-    exact_extras: &[String],
-    iov_column: Option<&str>,
-    table_decls: Option<&[CovariateDecl]>,
-    filter: Option<&SelectionFilter>,
-    routing: &ObsRouting,
-    column_map: &[(String, String)],
+    input: CsvInput<'_>, covariate_columns: Option<&[&str]>, auto_extras: &[String],
+    exact_extras: &[String], iov_column: Option<&str>, table_decls: Option<&[CovariateDecl]>,
+    filter: Option<&SelectionFilter>, routing: &ObsRouting, column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     routing.validate()?;
     // `ReaderBuilder::from_path` is `File::open` + `from_reader`, and a csv I/O
@@ -1007,10 +777,7 @@ fn read_nonmem_csv_impl(
         }
         CsvInput::Bytes(bytes) => Box::new(bytes),
     };
-    let mut rdr = csv::ReaderBuilder::new()
-        .flexible(true)
-        .has_headers(true)
-        .from_reader(source);
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).has_headers(true).from_reader(source);
 
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
@@ -1022,23 +789,17 @@ fn read_nonmem_csv_impl(
         .map(|h| h.trim().to_string())
         .collect();
 
-    // Apply `[data]` column remapping (#730, #742): rename each mapped actual
-    // header to its target name (case-insensitive match on the actual header).
-    // Downstream canonical lookups (`col_idx_ci("time")`) and covariate
-    // auto-detection (`is_standard`) then treat a renamed column as that role /
-    // covariate with no further special-casing, and the original header no
-    // longer leaks in under its old name. Resolve every actual header against
-    // the *original* headers first, then apply the renames, so one mapping can
-    // never shadow another's lookup.
+    // `[data]` column remapping (#730, #742): rename each mapped header (matched
+    // case-insensitively) to its target, so canonical lookups and covariate
+    // auto-detection treat it as that role. All lookups resolve against the
+    // original headers first, so one mapping cannot shadow another.
     if !column_map.is_empty() {
         let mut planned: Vec<(usize, String)> = Vec::with_capacity(column_map.len());
         for (target, actual) in column_map {
             // A mapped header that is absent is a hard error — the mapping would
             // silently do nothing (e.g. TIME would still be reported missing).
-            let idx = headers
-                .iter()
-                .position(|h| h.eq_ignore_ascii_case(actual))
-                .ok_or_else(|| {
+            let idx =
+                headers.iter().position(|h| h.eq_ignore_ascii_case(actual)).ok_or_else(|| {
                     format!(
                         "[data]: mapped column `{actual}` (renamed to `{target}`) not found in \
                          dataset headers: {}",
@@ -1106,10 +867,7 @@ fn read_nonmem_csv_impl(
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
     if iov_column.is_some() && occ_col.is_none() {
-        return Err(format!(
-            "iov_column '{}' not found in dataset headers",
-            iov_column.unwrap()
-        ));
+        return Err(format!("iov_column '{}' not found in dataset headers", iov_column.unwrap()));
     }
 
     const STANDARD_COLS: &[&str] = &[
@@ -1135,11 +893,9 @@ fn read_nonmem_csv_impl(
     let cov_indices: Vec<(String, usize)> = cov_names
         .iter()
         .filter_map(|name| {
-            // Prefer an exact header match; fall back to case-insensitive so a
-            // filter-injected lowercase name (e.g. "study" from
-            // `referenced_covariate_columns`) still resolves to a "STUDY" header.
-            // A model extra the caller did not name gets no fallback (#1946).
-            // Store the actual header name so covariate keys match the dataset.
+            // Exact header match, else case-insensitive (filter names are
+            // lowercased) — except model extras the caller did not name (#1946).
+            // Store the actual header name.
             let exact_only = exact_extras.iter().any(|e| e == name);
             col_idx_cs(name)
                 .or_else(|| (!exact_only).then(|| col_idx_ci(name)).flatten())
@@ -1147,13 +903,9 @@ fn read_nonmem_csv_impl(
         })
         .collect();
 
-    // A filter that references a covariate column absent from the data can never
-    // fire (the column is missing from every row's covariate map, so the clause
-    // is a silent no-op). This commonly means a typo in the column name — e.g.
-    // `ignore = Coment` instead of `Comment`, or the bare `ignore = C` shorthand
-    // naming a column the file does not have. Collect those names here and warn
-    // once below so the user is not left with an unfiltered fit. ID is handled
-    // separately and is never a covariate, so exclude it.
+    // A filter on a covariate column absent from the data can never fire (often a
+    // typo, e.g. `ignore = Coment`); collect those names and warn once below.
+    // ID is never a covariate.
     let filter_absent_cols: Vec<String> = filter
         .map(|f| {
             f.referenced_covariate_columns()
@@ -1179,10 +931,7 @@ fn read_nonmem_csv_impl(
                 headers.join(", ")
             ));
         }
-        decls
-            .iter()
-            .map(|d| (d.name.clone(), col_idx_cs(&d.name).unwrap()))
-            .collect()
+        decls.iter().map(|d| (d.name.clone(), col_idx_cs(&d.name).unwrap())).collect()
     } else {
         Vec::new()
     };
@@ -1203,13 +952,9 @@ fn read_nonmem_csv_impl(
         let id = fields.get(id_col).cloned().unwrap_or_default();
 
         if build_table {
-            // The table echoes every input record, including one `[data_selection]`
-            // removes — which the reader never checks (#1501, NONMEM's `IGNORE`
-            // boundary). A `TIME` cell that is not a number is echoed as `NaN`, the
-            // table's missing encoding, rather than as a fabricated `0`; a record the
-            // filter keeps with such a cell fails the read, so it never gets here.
-            // `EVID` is an integer and has no such encoding: an unreadable one on a
-            // removed record is echoed as `effective_evid`'s fallback, 0.
+            // The table echoes every input record, including filter-removed ones the
+            // reader never checks (#1501): an unreadable `TIME` is echoed as `NaN`;
+            // an unreadable `EVID` as `effective_evid`'s fallback, 0.
             let time = if unreadable_cell(&fields, Some(time_col), &TIME_CELL).is_some() {
                 f64::NAN
             } else {
@@ -1241,12 +986,7 @@ fn read_nonmem_csv_impl(
                     }
                 }
             }
-            table_rows.push(CovariateRow {
-                id: id.clone(),
-                time,
-                evid,
-                values,
-            });
+            table_rows.push(CovariateRow { id: id.clone(), time, evid, values });
         }
 
         if id != current_id {
@@ -1276,10 +1016,7 @@ fn read_nonmem_csv_impl(
         ));
     }
     let n_records_total: usize = rows_by_id.iter().map(|(_, rows)| rows.len()).sum();
-    let mut excl_summary = ExclusionSummary {
-        n_records_total,
-        ..Default::default()
-    };
+    let mut excl_summary = ExclusionSummary { n_records_total, ..Default::default() };
     // Union across subjects, sorted and deduplicated by the set; assigned once after
     // the loop rather than pushed into the summary's `Vec` per subject.
     let mut excl_obs_cmts_all: std::collections::BTreeSet<usize> =
@@ -1362,13 +1099,9 @@ fn read_nonmem_csv_impl(
             ));
         }
 
-        // Only drop a subject as "excluded by data selection" when the filter
-        // actually removed at least one of its records and that left it empty.
-        // Without this guard we would also drop subjects that are empty for
-        // unrelated reasons (e.g. only EVID=2/3 rows) on the no-filter path,
-        // which is a behavior change vs. the pre-feature reader (it pushed every
-        // subject unconditionally). `had_exclusions` is only ever > 0 when a
-        // filter is active.
+        // Drop a subject as "excluded by data selection" only when the filter
+        // removed at least one of its records and left it empty; subjects empty
+        // for other reasons (only EVID=2/3) are kept as before.
         let had_exclusions =
             subj_excl.n_obs_excluded + subj_excl.n_dose_excluded + subj_excl.n_other_excluded > 0;
         if had_exclusions && subject.doses.is_empty() && subject.observations.is_empty() {
@@ -1379,15 +1112,10 @@ fn read_nonmem_csv_impl(
         subjects.push(subject);
     }
 
-    // Hard error (#753): dose rows are present (EVID=1/4 classified as doses) but
-    // the dataset has no `AMT` column, so every dose was created with `amt = 0`.
-    // The fit would run silently with no drug in the system — a flat objective
-    // that pins every parameter at its initial estimate. This most often means the
-    // amount column is named something other than `AMT` (e.g. a NONMEM export using
-    // `DOSE`); rename it in the [data] block or the CSV header. Scoped to dose rows
-    // present + no AMT column: dose-free models (#262) and TTE/survival have no dose
-    // events, and the EVID-absent path infers no doses without an AMT column, so
-    // none of them trip this.
+    // Hard error (#753): dose rows but no `AMT` column, so every dose has
+    // `amt = 0` and the fit would silently pin every parameter. Usually the
+    // amount column has another name (e.g. `DOSE`). Dose-free models (#262) and
+    // TTE never trip this.
     if amt_col.is_none() && subjects.iter().any(|s| !s.doses.is_empty()) {
         return Err(
             "E_DOSE_NO_AMT: the dataset has dose records (EVID=1/4) but no `AMT` column, so \
@@ -1488,12 +1216,8 @@ fn read_nonmem_csv_impl(
             }
             parts.join(" and ")
         };
-        // Rows the filter deleted are named separately rather than folded into the
-        // dose / observation counts: "assigned compartment 1" is true of them, but
-        // the consequence is the opposite one — they are not in the fit at all, so a
-        // reader who fixes the cells gets *more* data rather than differently-placed
-        // data. Silent when no `[data_selection]` rule reads CMT, which is the usual
-        // case.
+        // Filter-deleted rows are named separately: they are not in the fit at all.
+        // Silent when no `[data_selection]` rule reads CMT.
         let filtered = if *n_filtered > 0 {
             format!(
                 ", and {n_filtered} {CMT_FILTER_DELETED_MARKER} — had the compartment been \
@@ -1515,10 +1239,8 @@ fn read_nonmem_csv_impl(
         ));
     }
 
-    // Dose-coverage warnings (#262), surfaced via FitResult.warnings. Most
-    // specific wins so a dataset never gets both: W_AMT_NOT_DOSED pinpoints AMT
-    // that was dropped; W_NO_DOSES is the generic "no doses parsed at all"
-    // backstop for datasets that carry no AMT signal to begin with.
+    // Dose-coverage warnings (#262). Most specific wins: W_AMT_NOT_DOSED for
+    // dropped AMT, else the generic W_NO_DOSES backstop.
     if total_amt_ignored > 0 {
         population_warnings.push(format!(
             "W_AMT_NOT_DOSED: {} record(s) across {} subject(s) carry AMT != 0 but were not \
@@ -1528,12 +1250,8 @@ fn read_nonmem_csv_impl(
             total_amt_ignored, subjects_with_amt_ignored
         ));
     } else if subjects.iter().all(|s| s.doses.is_empty()) {
-        // Zero dose events across the whole population. Warn only when scored
-        // observations are present (an all-EVID=2 / covariate-only dataset is not
-        // a fit) and the dataset carries no non-Gaussian observations — TTE/survival
-        // and discrete/count endpoints legitimately have no PK doses, so suppressing
-        // the warning for them avoids a noisy false positive. `obs_records` is
-        // unconditional since Phase 4.0, so this needs no feature split.
+        // Zero dose events: warn only with scored observations and no non-Gaussian
+        // observations (TTE / discrete / count endpoints legitimately have no doses).
         let total_scored_obs: usize = subjects.iter().map(|s| s.observations.len()).sum();
         let any_nongaussian_obs = subjects.iter().any(|s| !s.obs_records.is_empty());
         if total_scored_obs > 0 && !any_nongaussian_obs {
@@ -1546,17 +1264,12 @@ fn read_nonmem_csv_impl(
         }
     }
 
-    // All-zero-dose warning (#753): an `AMT` column exists (so E_DOSE_NO_AMT did not
-    // fire) but every parsed dose amount is exactly zero — e.g. a placebo-only typo
-    // or a mis-scaled amount column. Like the `E_DOSE_NO_AMT` error above, this yields a flat
-    // objective; here we warn rather than error because the column is present and a
-    // genuinely dose-free-but-AMT-columned dataset is conceivable. Only fires when at
-    // least one dose event exists (else W_NO_DOSES already covered it).
+    // All-zero-dose warning (#753): an `AMT` column exists but every dose amount is
+    // zero — a flat objective like `E_DOSE_NO_AMT`, but only a warning since the
+    // column is present. Fires only when a dose event exists.
     if amt_col.is_some() {
         let any_dose = subjects.iter().any(|s| !s.doses.is_empty());
-        let all_zero = subjects
-            .iter()
-            .all(|s| s.doses.iter().all(|d| d.amt == 0.0));
+        let all_zero = subjects.iter().all(|s| s.doses.iter().all(|d| d.amt == 0.0));
         if any_dose && all_zero {
             population_warnings.push(
                 "W_ALL_DOSES_ZERO: every dose record has AMT = 0, so no drug enters the system \
@@ -1568,11 +1281,7 @@ fn read_nonmem_csv_impl(
     }
 
     excl_summary.obs_cmts_excluded = excl_obs_cmts_all.into_iter().collect();
-    let exclusions = if filter.is_some() {
-        Some(excl_summary)
-    } else {
-        None
-    };
+    let exclusions = if filter.is_some() { Some(excl_summary) } else { None };
 
     let table = if let Some(decls) = table_decls {
         // `table_indices` (and hence each row's `values`) is in declaration
@@ -1586,28 +1295,17 @@ fn read_nonmem_csv_impl(
         None
     };
 
-    // `covariate_names` reports only columns that actually exist in the data
-    // (derived from `cov_indices`). A requested column that isn't in the CSV —
-    // e.g. a referenced-but-undeclared covariate passed in the union that turns
-    // out to be absent — must NOT appear here, otherwise `check_covariates`
-    // would treat it as present and let the fit run with that covariate at 0.0
-    // instead of failing with E_MISSING_COVARIATE. (For the auto-detect path
-    // `cov_names` is already existing-only, so this is a no-op there.)
+    // Report only columns that exist in the data: an absent requested column must
+    // fail `check_covariates` with E_MISSING_COVARIATE, not run at 0.0.
     let existing_cov_names: Vec<String> = cov_indices.iter().map(|(n, _)| n.clone()).collect();
 
-    // A covariate column that exists but carries no finite value for some
-    // subjects is stored as `NaN` (see the per-subject reader). Report it once
-    // per covariate. The message does not promise a `NaN` outcome: `/`, `^`,
-    // `exp` keep it (non-finite objective), but `log` / `sqrt` floor it and
-    // `min` / `max` / comparisons return a finite value, so for those relations
-    // this warning is the only sign anything is wrong (#2041).
+    // A column with no finite value for some subjects is stored as `NaN`; report
+    // it once per covariate. Not every relation propagates `NaN` (`log`, `min`,
+    // comparisons stay finite), so this may be the only sign (#2041).
     let mut population_warnings = population_warnings;
     // Only for a column the model reads (#2599): on a model-aware read an unread
     // column with gaps is not a problem, and the warning's claim would be false.
-    for name in existing_cov_names
-        .iter()
-        .filter(|n| routing.warns_missing_covariate(n, filter))
-    {
+    for name in existing_cov_names.iter().filter(|n| routing.warns_missing_covariate(n, filter)) {
         let missing: Vec<&str> = subjects
             .iter()
             .filter(|s| s.covariates.get(name).is_some_and(|v| v.is_nan()))
@@ -1649,11 +1347,8 @@ pub(crate) fn covariate_missing_warning(name: &str, missing: &[&str], n_subjects
 }
 
 /// A numeric cell, with every missing spelling (`.`, blank, `NA`, `NaN`) read as
-/// `0.0`, the default the numeric columns document. `NaN` used to parse to IEEE
-/// `NaN` here, so `RATE=NaN` was rejected as non-finite and `TIME=NaN` put the
-/// record at an undefined time, while `.` read as the default (#1501 review). A
-/// present cell that is not a number also reads as `0.0`; the caller rejects it
-/// first where the record reads the column (`unreadable_cell`).
+/// `0.0` (#1501). A non-number also reads as `0.0`; callers that read the column
+/// reject it first (`unreadable_cell`).
 fn parse_f64(s: &str) -> f64 {
     if is_missing_cell(s) {
         return 0.0;
@@ -1661,11 +1356,9 @@ fn parse_f64(s: &str) -> f64 {
     s.trim().parse::<f64>().unwrap_or(0.0)
 }
 
-/// Parse a numeric cell for the data-selection filter, mapping missing/blank
-/// cells (`.`, `NA`, empty) to `NaN`. Because every IEEE comparison against
-/// `NaN` is false (see `cmp_f64`), a record whose value for a referenced column
-/// is missing never matches that condition — so `ignore = DV < 0.001` skips
-/// dose rows (where `DV` is `.`) instead of silently treating them as `0`.
+/// Parse a numeric cell for the data-selection filter, mapping missing cells to
+/// `NaN` so a condition on a missing value never matches (`ignore = DV < 0.001`
+/// skips dose rows with `DV = .`).
 fn parse_f64_or_nan(s: &str) -> f64 {
     let t = s.trim();
     if is_missing_cell(t) {
@@ -1675,15 +1368,10 @@ fn parse_f64_or_nan(s: &str) -> f64 {
     }
 }
 
-/// Parse an `L2` grouping-id cell. NONMEM writes an integer, but a pandas export
-/// float-formats the whole column (`"10.0"`, `"11.0"`) once any row is blank — so a
-/// strict `i64` parse would silently ungroup every record and discard the user's
-/// block_sigma pairing (#830). Accept an integer literal
-/// or a *float-formatted integer* (fractional part exactly 0, within `i64`
-/// range). A genuinely non-integer value (`"2.4"`), an out-of-range magnitude, a
-/// blank, or an unparseable cell means "ungrouped" (`None` → 0) — left ungrouped
-/// rather than silently rounded/saturated into a group, which would mis-pair the
-/// residual correlation in a hard-to-debug way.
+/// Parse an `L2` grouping-id cell: an integer or a float-formatted integer
+/// (`"10.0"`, pandas exports, #830). A fractional, out-of-range, blank or
+/// unparseable value means "ungrouped" (`None`) rather than being rounded into a
+/// group.
 fn parse_l2_id(s: &str) -> Option<i64> {
     let t = s.trim();
     if is_missing_cell(t) {
@@ -1700,32 +1388,17 @@ fn parse_l2_id(s: &str) -> Option<i64> {
     }
 }
 
-/// A cell that should hold an integer but was written with a fractional part by
-/// the exporter: `"10.0"`, `"2.0"`, `"2e0"`.
-///
-/// pandas float-formats a whole integer column once any cell in it is blank, which
-/// is why both [`parse_l2_id`] (#830) and [`parse_cmt_cell`] (#1009) need it.
-/// Those two grew the same parse independently and the second one was written
-/// *because* the first's lesson had not reached `CMT` — so it lives here once, and
-/// the next export quirk lands in one place. Returns the value as `f64`; each
-/// caller applies its own range and sign policy, which is the part that genuinely
-/// differs (`L2` accepts negatives, a compartment index does not).
-///
-/// `None` for a genuinely fractional value (`"2.4"`), an infinity, or anything that
-/// is not a number at all.
+/// A whole number written with a fractional part (`"10.0"`, `"2e0"`), as pandas
+/// does once an integer column has a blank. Shared by [`parse_l2_id`] (#830) and
+/// [`parse_cmt_cell`] (#1009); each caller applies its own range and sign policy.
+/// `None` for a fractional value, an infinity, or a non-number.
 fn parse_float_formatted_integer(t: &str) -> Option<f64> {
     let f = t.parse::<f64>().ok()?;
     (f.is_finite() && f.fract() == 0.0).then_some(f)
 }
 
-/// A cell of an integer-typed column, classified.
-///
-/// `L2` (#830) and `CMT` (#1009) each had to learn on their own that an exporter
-/// float-formats a whole integer column. `CENS`, `EVID`, `MDV`, `ADDL`, the
-/// occasion column, `SS` in the `[data_selection]` context and `FREMTYPE` had not,
-/// and read `"1.0"` as 0 — all but `EVID` and the occasion column without any
-/// warning (#1496). This is the classification they share; what each does with a
-/// class stays with the caller.
+/// A cell of an integer-typed column, classified, so every integer column reads
+/// `"1.0"` as 1 rather than 0 (#1496). What each class means stays with the caller.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WholeCell {
     /// A whole number, however it was spelled: `"1"`, `"+1"`, `"1.0"`, `"1e0"`,
@@ -1748,15 +1421,11 @@ fn parse_whole_number_cell(s: &str) -> WholeCell {
     parse_float_formatted_integer(t).map_or(WholeCell::NotWhole, WholeCell::Value)
 }
 
-/// Read a cell of an unsigned integer column — `EVID`, `MDV`, `ADDL`, the occasion
-/// column, `SS` in the `[data_selection]` context, `FREMTYPE` — as a `T`.
-///
-/// The column's own integer parse runs first, so every cell it accepted reads
-/// exactly as before; a count past 2^53 would otherwise round through `f64`. Only a
-/// cell that parse rejected can read differently, and only when it is a whole
-/// number within `T`'s range (#1496). `None` for a missing, fractional, negative
-/// (`"-0"` included, as in [`parse_cmt_cell`]) or out-of-range cell: each caller
-/// keeps the fallback it always had for those.
+/// Read a cell of an unsigned integer column (`EVID`, `MDV`, `ADDL`, occasion,
+/// filter-context `SS`, `FREMTYPE`) as a `T`. The integer parse runs first (no
+/// `f64` rounding past 2^53); only a rejected cell may still read as a whole number
+/// in range (#1496). `None` for missing, fractional, negative (incl. `"-0"`) or
+/// out-of-range cells.
 fn parse_unsigned_cell<T: std::str::FromStr + TryFrom<u64>>(s: &str) -> Option<T> {
     let t = s.trim();
     if let Ok(n) = t.parse::<T>() {
@@ -1847,24 +1516,16 @@ fn negative_cmt(row: &[String], cmt_col: Option<usize>) -> Option<usize> {
     }
 }
 
-/// Put the records sharing a `TIME` with a compartment on/off row into file order on the
-/// engines' timeline (#2732).
+/// Put records sharing a `TIME` with a compartment on/off row into file order on
+/// the engines' timeline (#2732), by moving them one ULP as #614 and #1810 do (the
+/// engines order a tie by kind, `Dose < PkOnly < Obs`). Doses never move; an
+/// on/off row always leaves a dose's `TIME` so `cmt_off_times` can order them by
+/// time alone.
 ///
-/// Which side of an on/off row a co-timed record falls on changes the answer: an
-/// observation before an off row reads the amount, one after it reads zero, and a dose
-/// before it is wiped. The engines order a tie by kind (`Dose < PkOnly < Obs`), so where
-/// that disagrees with the file the records are moved by one ULP, as #614 and #1810 do.
-/// Those two passes then find nothing to do at such a time. Doses never move. Records before
-/// the first dose go below it, and records after the last dose stay at the tie unless
-/// the kind order needs them above it. An on/off row always leaves a dose's `TIME`, so
-/// that `cmt_off_times` can tell which side of it the dose's record is on by time alone.
-///
-/// `Err` holds the time of a tie no such move can order: an on/off row between two doses,
-/// or between a reset and a dose.
+/// `Err` holds the time of a tie no such move can order: an on/off row between two
+/// doses, or between a reset and a dose.
 fn order_cmt_toggle_ties(
-    toggles: &[crate::types::CmtToggle],
-    doses: &[(f64, usize)],
-    resets: &[f64],
+    toggles: &[crate::types::CmtToggle], doses: &[(f64, usize)], resets: &[f64],
     (obs_times, obs_rec): (&mut [f64], &[usize]),
     (pk_only_times, pk_only_rec): (&mut [f64], &[usize]),
 ) -> Result<(), f64> {
@@ -1885,20 +1546,15 @@ fn order_cmt_toggle_ties(
     tie_times.sort_by(f64::total_cmp);
     tie_times.dedup();
     for t in tie_times {
-        let mut tie: Vec<(usize, Item)> = doses
-            .iter()
-            .filter(|d| d.0 == t)
-            .map(|d| (d.1, Item::Dose))
-            .collect();
+        let mut tie: Vec<(usize, Item)> =
+            doses.iter().filter(|d| d.0 == t).map(|d| (d.1, Item::Dose)).collect();
         tie.extend(
             (0..pk_only_times.len())
                 .filter(|&m| pk_only_times[m] == t)
                 .map(|m| (pk_only_rec[m], Item::PkOnly(m))),
         );
         tie.extend(
-            (0..obs_times.len())
-                .filter(|&j| obs_times[j] == t)
-                .map(|j| (obs_rec[j], Item::Obs(j))),
+            (0..obs_times.len()).filter(|&j| obs_times[j] == t).map(|j| (obs_rec[j], Item::Obs(j))),
         );
         tie.sort_by_key(|e| e.0);
         let items: Vec<Item> = tie.into_iter().map(|e| e.1).collect();
@@ -1928,11 +1584,9 @@ fn order_cmt_toggle_ties(
             place(item, at);
             last_rank = rank(item);
         }
-        // Downward from the first dose. Not past a reset: #614 moves a reset with the
-        // observations it precedes (#2728), and an observation moved here would leave that
-        // pass nothing to find, so it would land below the reset and read the state before
-        // it. With a reset at the tie no on/off row is in this stretch, `below_a_reset`
-        // having refused one, so nothing here needs this pass.
+        // Downward from the first dose, but not past a reset: #614 moves a reset
+        // with its observations (#2728), and `below_a_reset` already refused an
+        // on/off row at a reset tie.
         if resets.contains(&t) {
             continue;
         }
@@ -1960,19 +1614,12 @@ enum CmtDefaultCause {
     UnparseableCell(String),
 }
 
-/// Resolve a row's `CMT` to a 1-based compartment index, saying when the reader
-/// had to choose it. Shared by the dose row, the observation row and the `[data]`
-/// selection filter's [`RowContext`] so the three cannot disagree about what a
-/// given cell means (#1009).
+/// Resolve a row's `CMT` to a 1-based compartment, saying when the reader chose
+/// it. Shared by the dose row, observation row and filter [`RowContext`] (#1009).
 fn resolve_row_cmt(row: &[String], cmt_col: Option<usize>) -> (usize, Option<CmtDefaultCause>) {
-    // `NoColumn` is reserved for a dataset with no CMT header at all, because that
-    // is the only case the summary cannot describe from the per-row counters. A
-    // row that is merely *shorter* than its header is a missing cell: the reader
-    // is built with `.flexible(true)` (see `read_nonmem_csv_impl`) and never pads,
-    // so `row.get(c)` returning `None` on a dataset that does declare CMT is a
-    // ragged row, not an absent column. Conflating the two emitted a summary with
-    // an empty cause clause — `W_CMT_DEFAULTED: , so 1 dose row(s) …` — because
-    // the cause was chosen from `cmt_col` while the counters came from the rows.
+    // `NoColumn` only when the dataset has no CMT header: a row shorter than its
+    // header (`.flexible(true)`, never padded) is a missing cell, not an absent
+    // column — conflating them produced an empty cause clause in the summary.
     let Some(col) = cmt_col else {
         return (DEFAULT_CMT, Some(CmtDefaultCause::NoColumn));
     };
@@ -1982,10 +1629,9 @@ fn resolve_row_cmt(row: &[String], cmt_col: Option<usize>) -> (usize, Option<Cmt
     match parse_cmt_cell(cell) {
         CmtCell::Value(n) => (n, None),
         CmtCell::Missing => (DEFAULT_CMT, Some(CmtDefaultCause::MissingCell)),
-        CmtCell::Unparseable => (
-            DEFAULT_CMT,
-            Some(CmtDefaultCause::UnparseableCell(truncate_example(cell))),
-        ),
+        CmtCell::Unparseable => {
+            (DEFAULT_CMT, Some(CmtDefaultCause::UnparseableCell(truncate_example(cell))))
+        }
     }
 }
 
@@ -1993,25 +1639,16 @@ fn resolve_row_cmt(row: &[String], cmt_col: Option<usize>) -> (usize, Option<Cmt
 /// `CENS` messages (#1496).
 const MAX_CMT_EXAMPLE_LEN: usize = 24;
 
-/// A cell rendered safe to interpolate into a message: trimmed, any embedded
-/// quote or control character replaced, and cut to [`MAX_CMT_EXAMPLE_LEN`] with an
-/// ellipsis.
-///
-/// The cell is arbitrary user text that ends up in `FitResult.warnings`, the fit
-/// YAML and the `ferx check` report. Un-truncated, a mis-mapped free-text column
-/// puts a whole sentence in each; unescaped, a cell containing `"` produces
-/// `"a"b"`. Char-boundary safe, so a multi-byte cell cannot panic the reader.
+/// A cell made safe to interpolate into a message (warnings, fit YAML, `ferx
+/// check`): trimmed, quotes and control characters replaced, and cut to
+/// [`MAX_CMT_EXAMPLE_LEN`] with an ellipsis on a char boundary.
 fn truncate_example(cell: &str) -> String {
     let cleaned: String = cell
         .trim()
         .chars()
         .map(|c| {
-            // `is_control` is the Cc category only, which leaves the Unicode line
-            // separators U+2028 / U+2029 intact — and this string lands in a
-            // one-line warning and in the fit YAML, both of which a line break
-            // would split. Named explicitly rather than widened to
-            // `!is_ascii_graphic()`, which would also mangle the non-ASCII cells
-            // the truncation test deliberately keeps legible.
+            // `is_control` misses U+2028 / U+2029, which would split a one-line
+            // warning; named explicitly so non-ASCII cells stay legible.
             if c == '"' || c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
                 '\u{fffd}'
             } else {
@@ -2022,46 +1659,25 @@ fn truncate_example(cell: &str) -> String {
     if cleaned.chars().count() <= MAX_CMT_EXAMPLE_LEN {
         return cleaned;
     }
-    cleaned
-        .chars()
-        .take(MAX_CMT_EXAMPLE_LEN)
-        .chain(std::iter::once('…'))
-        .collect()
+    cleaned.chars().take(MAX_CMT_EXAMPLE_LEN).chain(std::iter::once('…')).collect()
 }
 
 /// Rows whose compartment the reader chose because the dataset did not say
-/// (#1009). Summed across subjects into one `W_CMT_DEFAULTED` line, which
-/// [`crate::api::validation::reader_warning_suppressed`] then withholds from
-/// models that have only one compartment to choose.
+/// (#1009), summed into one `W_CMT_DEFAULTED` line that
+/// [`crate::api::validation::reader_warning_suppressed`] withholds from
+/// single-compartment models.
 #[derive(Debug, Default, Clone)]
 struct CmtDefaults {
     /// Dose rows (EVID 1/4) assigned the default compartment.
     n_dose: usize,
-    /// Dose *events* those rows produced — `ADDL` expansions included. Always
-    /// `>= n_dose`, and strictly greater whenever a defaulted row carried `ADDL`.
-    /// Reported separately because the two answer different questions: the row
-    /// count says how many cells to fix, the event count how much drug went to the
-    /// guessed compartment. An `ADDL = 30` row is one cell and thirty-one doses.
+    /// Dose *events* those rows produced, `ADDL` expansions included (`>= n_dose`):
+    /// the row count says how many cells to fix, this how much drug was misplaced.
     n_dose_events: usize,
     /// Scored observation rows (EVID=0, MDV=0) likewise.
     n_obs: usize,
-    /// Rows a `[data_selection]` rule **removed** on the strength of the compartment
-    /// the reader chose (#1409 review).
-    ///
-    /// Counted separately, and at the filter rather than in the dose / observation
-    /// arms, because such a row never reaches those arms: the filter's `continue`
-    /// runs first, so `n_dose`/`n_obs` cannot see it and a dataset whose *only*
-    /// defaulted row is the one the filter deleted would produce no warning at all.
-    /// That is the mirror of the case #1409 was filed for — there the defaulted
-    /// compartment made a clause stop matching and the row was wrongly **kept**
-    /// (and so counted normally); here it makes a clause start matching and the row
-    /// is wrongly **dropped**.
-    ///
-    /// Every record type is counted here, `EVID` 2/3 included, unlike `n_dose` /
-    /// `n_obs`. Those two deliberately count only rows the fit actually uses, and a
-    /// kept `EVID=2` row changes nothing about which compartment anything lands in;
-    /// a *deleted* one removes a covariate-change marker from the fit, which is a
-    /// number the guessed compartment moved.
+    /// Rows (any record type, EVID 2/3 included) a `[data_selection]` rule removed
+    /// on the strength of the defaulted compartment (#1409). Counted at the filter
+    /// because such a row never reaches the dose / observation arms.
     n_filtered: usize,
     /// Of the rows counted above, those whose `CMT` cell was present but missing.
     /// Zero when the column is absent — there is no cell to blame.
@@ -2070,22 +1686,15 @@ struct CmtDefaults {
     n_unparseable_cell: usize,
     /// Up to [`MAX_CMT_EXAMPLES`] distinct unparseable spellings, first seen first.
     examples: Vec<String>,
-    /// Whether a *distinct* spelling was seen that [`Self::examples`] had no room
-    /// for — the one thing that licenses the trailing `…`.
-    ///
-    /// Tracked rather than inferred from the counters. Comparing
-    /// `n_unparseable_cell` (a count of **rows**) against `examples.len()` (a count
-    /// of **spellings**) answers a different question, and gets it wrong in the
-    /// commonest case there is: five rows that all say `x` are one spelling, and the
-    /// row comparison printed `("x", …)` — claiming spellings it had not withheld.
+    /// Whether a *distinct* spelling was turned away by [`Self::examples`]'s cap —
+    /// the one thing that licenses the trailing `…`. Tracked, not inferred from
+    /// the row counter (five rows of `x` are one spelling).
     examples_capped: bool,
 }
 
 impl CmtDefaults {
-    /// Remember one distinct offending spelling, up to the cap, and record whether
-    /// anything was turned away. The single owner of that policy: `record_*` and
-    /// `absorb` both route here, so raising the cap or changing the ordering cannot
-    /// land in the per-subject path and miss the cross-subject one.
+    /// Remember one distinct offending spelling up to the cap, recording whether
+    /// any was turned away. The single owner of that policy (`record_*`, `absorb`).
     fn push_example(&mut self, text: &str) {
         if self.examples.iter().any(|e| e == text) {
             return;
@@ -2146,17 +1755,10 @@ impl CmtDefaults {
         self.n_dose > 0 || self.n_obs > 0 || self.n_filtered > 0
     }
 
-    /// The offending spellings, quoted, with an ellipsis when a spelling was
-    /// withheld. Without it a message reading `9 row(s) … ("-1", "2.5", "x")`
-    /// presents three spellings as if they were all that occurred; with it keyed on
-    /// the row count instead, `5 row(s) … ("x", …)` invents two more.
+    /// The offending spellings, quoted, with an ellipsis only when a spelling was
+    /// withheld.
     fn example_list(&self) -> String {
-        let mut s = self
-            .examples
-            .iter()
-            .map(|e| format!("\"{e}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut s = self.examples.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
         if self.examples_capped {
             s.push_str(", …");
         }
@@ -2175,10 +1777,9 @@ enum CensCell<'a> {
 }
 
 impl CensCell<'_> {
-    /// The flag a `[data_selection]` rule compares. A cell that is not a whole
-    /// number is 0 here, as it always was: the observation row rejects it only
-    /// once the filter has kept the row, which is where NONMEM rejects it too — it
-    /// accepts `abc` on a record its `IGNORE` removes (#1496).
+    /// The flag a `[data_selection]` rule compares. A non-whole cell is 0 here; the
+    /// observation row rejects it only once the filter keeps the row, as NONMEM
+    /// does (#1496).
     fn selection_flag(self) -> i8 {
         match self {
             CensCell::Flag(flag, _) => flag,
@@ -2187,17 +1788,12 @@ impl CensCell<'_> {
     }
 }
 
-/// Read a `CENS` cell: `-1` (above the ULOQ), `0` (quantified), `1` (below the
-/// LLOQ).
+/// Read a `CENS` cell: `-1` (above ULOQ), `0` (quantified), `1` (below LLOQ).
 ///
-/// A float-formatted whole number is that number (#1496): ferx's own sdtab writes
-/// the flag as `1.000000`, and before this read it as 0, scoring the row as a
-/// quantified measurement. Every `i8` literal is exactly an `f64` whole number, so
-/// a cell the old `i8` parse accepted reads as before. A whole number outside `i8`
-/// saturates and keeps its sign — every consumer routes on the sign, while
-/// `200i64 as i8` would wrap to `-56` and flip the tail. A missing cell is 0. A
-/// cell that is not a whole number is [`CensCell::NotWhole`]; what that means is
-/// the caller's to say.
+/// A float-formatted whole number is that number (#1496; ferx's sdtab writes
+/// `1.000000`). A whole number outside `i8` saturates keeping its sign (consumers
+/// route on the sign; `as i8` would wrap). Missing is 0; a non-whole cell is
+/// [`CensCell::NotWhole`].
 fn parse_cens(s: &str) -> CensCell<'_> {
     let t = s.trim();
     match parse_whole_number_cell(t) {
@@ -2209,28 +1805,17 @@ fn parse_cens(s: &str) -> CensCell<'_> {
     }
 }
 
-/// Resolve a row's `CENS` cell; an absent column, or a row shorter than its
-/// header, is flag 0 (quantified). One resolver for the observation row and the
-/// `[data_selection]` filter's [`RowContext`], so a rule on `CENS` sees the flag the
-/// likelihood scores (#1496) — as [`resolve_row_cmt`] does for `CMT`.
+/// Resolve a row's `CENS` cell (absent column or short row = 0). Shared by the
+/// observation row and the filter [`RowContext`] (#1496), as [`resolve_row_cmt`].
 fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> CensCell<'_> {
-    cens_col
-        .and_then(|c| row.get(c))
-        .map_or(CensCell::Flag(0, ""), |s| parse_cens(s))
+    cens_col.and_then(|c| row.get(c)).map_or(CensCell::Flag(0, ""), |s| parse_cens(s))
 }
 
-/// The error for a `CENS` cell that is not a whole number, on an observation row
-/// that reads the flag (#1496).
-///
-/// NONMEM 7.6.0 rejects `abc` on an observation record and accepts it on a record
-/// its `IGNORE` removes. ferx rejects it only on the rows that read the flag:
-/// Gaussian observation rows that carry a `DV` and that the `[data_selection]` filter
-/// keeps, whether the fit reader or the simulation reader reads the file. Unlike
-/// NONMEM, ferx therefore accepts `abc` on a dose record, since a dose row never reads
-/// the flag. `1.5` is rejected too, although NONMEM reads it as a number: NONMEM
-/// leaves its meaning to the user's code, while ferx gives `CENS` a fixed meaning,
-/// and `SS=1.5` is already an error ([`validate_ss`]). The shape follows
-/// [`validate_ss`]; `time` is the row's `raw_time`, the value the user wrote.
+/// The error for a non-whole `CENS` cell on an observation row that reads the
+/// flag (#1496): Gaussian rows with a `DV` that the filter keeps. Unlike NONMEM a
+/// dose row's `abc` is accepted (it never reads the flag), and `1.5` is rejected
+/// since ferx gives `CENS` a fixed meaning (as `SS=1.5`, [`validate_ss`]). `time`
+/// is the row's `raw_time`.
 fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
     format!(
         "subject {id}, time {time}: CENS=\"{}\" is not a whole number; expected -1 \
@@ -2241,17 +1826,10 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
     )
 }
 
-/// `W_CENS_UNEXPECTED`: an observation row's `CENS` cell is a whole number other
-/// than -1, 0 or 1 (#1496).
-///
-/// Every engine routes on the flag's sign alone — `cens < 0` picks the upper tail
-/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `focei_kernel::m3_terms`,
-/// and nothing compares against `1` or `-1` — so under `bloq_method = m3` a
-/// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
-/// see `bloq_method`, so the message states both methods. `cell` is quoted as
-/// written, since a whole number outside `i8` has already saturated: `200` is not
-/// `127`. The caller raises it only on a row that carries a `DV`; a simulation
-/// design row is scored under neither method.
+/// `W_CENS_UNEXPECTED`: an observation row's `CENS` is a whole number other than
+/// -1, 0 or 1 (#1496). Every engine routes on the sign alone, so under M3 it is
+/// scored as ±1; the reader cannot see `bloq_method`, so the message states both.
+/// `cell` is quoted as written (the flag may have saturated).
 fn cens_unexpected_warning(id: &str, flag: i8, cell: &str) -> String {
     let (sign, tail) = if flag < 0 {
         ("negative", "upper tail, like CENS=-1 (above the ULOQ)")
@@ -2266,10 +1844,8 @@ fn cens_unexpected_warning(id: &str, flag: i8, cell: &str) -> String {
     )
 }
 
-/// Parse an EVID cell. A missing / blank / unparseable value maps to 0
-/// (observation) — NONMEM's documented default. A float-formatted whole number
-/// (`"1.0"`) is that code (#1496); before, it read as 0, so every dose row was taken
-/// for an observation record and no dose was given.
+/// Parse an EVID cell; missing / unparseable is 0 (observation, NONMEM's default).
+/// A float-formatted whole number (`"1.0"`) is that code (#1496).
 fn parse_evid(s: &str) -> u32 {
     parse_unsigned_cell::<u32>(s).unwrap_or(0)
 }
@@ -2281,34 +1857,18 @@ fn is_dose_evid(evid: u32) -> bool {
     evid == 1 || evid == 4
 }
 
-/// True when an `AMT` value denotes an actual dose: **finite and nonzero**. A
-/// missing cell (or absent column) parses to `0.0` — not a dose; since #1501 a
-/// literal `nan`/`NA` is a missing spelling too ([`is_missing_cell`], which
-/// [`parse_f64`] checks first), so it reads as `0.0` here, not as IEEE NaN. A
-/// literal `inf`/`infinity` still parses to a non-finite value (Rust's
-/// `f64::from_str` accepts it), which is malformed and is rejected here — so a
-/// stray non-finite AMT never silently becomes an infinite-amount dose (#262).
+/// True when an `AMT` value denotes a dose: **finite and nonzero**. Missing cells
+/// (incl. `nan`/`NA`, [`is_missing_cell`]) parse to `0.0`; a literal `inf` parses
+/// non-finite and is rejected here, never becoming an infinite dose (#262).
 fn is_dosing_amt(amt: f64) -> bool {
     amt.is_finite() && amt != 0.0
 }
 
-/// Classify (and validate) the `RATE` cell of a *dose* record into the
-/// [`RateMode`] its [`DoseEvent`] should carry.
-///
-/// NONMEM overloads `RATE` with coded values:
-///   - `0`  → bolus (route set by the dose compartment)
-///   - `>0` → constant-rate infusion (duration = `AMT/RATE`)
-///   - `-1` → infusion **rate** is *modeled* (a `$PK` `R{n}` parameter)
-///   - `-2` → infusion **duration** is *modeled* (a `$PK` `D{n}` parameter)
-///
-/// `-1` is accepted as [`RateMode::ModeledRate`] and `-2` as
-/// [`RateMode::ModeledDuration`] (#324). The datareader has no model, so it
-/// cannot yet know whether a matching `R{cmt}`/`D{cmt}` parameter exists or
-/// whether the model can infuse into that compartment — those checks move to the
-/// model+data join ([`crate::api::check_model_data`]). Any other negative and
-/// non-finite values are rejected here: they are unconditionally invalid
-/// regardless of the model. (Previously `-1`/`-2` fell through to `rate > 0.0`
-/// and were silently treated as boluses — #324.)
+/// Classify and validate the `RATE` cell of a dose record into its [`RateMode`]:
+/// `0` bolus, `>0` constant-rate infusion, `-1` [`RateMode::ModeledRate`] (`R{n}`),
+/// `-2` [`RateMode::ModeledDuration`] (`D{n}`) (#324). Whether the model has the
+/// matching parameter is checked at [`crate::api::check_model_data`]; any other
+/// negative or non-finite value is rejected here.
 fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String> {
     if !rate.is_finite() {
         return Err(format!(
@@ -2320,18 +1880,10 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     if rate >= 0.0 {
         return Ok(RateMode::Fixed);
     }
-    // rate < 0 → a NONMEM coded value, which is always an *exact negative
-    // integer*. Match on the integer form so the arms read as the codes they are
-    // and a new code is one more arm. A non-integer negative (e.g. -1.5) is not a
-    // code: `fract() != 0.0` rejects it rather than rounding it into one (`round()`
-    // would map -1.5 → -2 and silently accept it as modeled duration). Comparison
-    // against `0.0` is exempt from clippy::float_cmp; `rate as i64` saturates, so
-    // an out-of-range integer can't alias -1/-2.
-    let code = if rate.fract() == 0.0 {
-        Some(rate as i64)
-    } else {
-        None
-    };
+    // A coded value is an exact negative integer: `fract() != 0.0` rejects -1.5
+    // rather than rounding it into a code, and `as i64` saturates so an
+    // out-of-range integer cannot alias -1/-2.
+    let code = if rate.fract() == 0.0 { Some(rate as i64) } else { None };
     let detail = match code {
         Some(-2) => return Ok(RateMode::ModeledDuration),
         Some(-1) => return Ok(RateMode::ModeledRate),
@@ -2344,38 +1896,18 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     ))
 }
 
-/// Validate a `SS` (steady-state) dataset cell.
-///
-/// NONMEM overloads `SS`: `0` = not steady state, `1` = reset the dose
-/// compartment to zero and initialise it at the steady state of the given
-/// regimen, `2` = *superimpose* that steady state on top of the compartment's
-/// pre-existing amounts (no reset). ferx implements `SS=1` only.
-///
-/// The engine carries steady state as a single `DoseEvent.ss: bool`, so once a
-/// cell is reduced to that flag the `1`-vs-`2` distinction is gone. Previously
-/// any `SS >= 0.5` — including `SS=2` — was collapsed to `ss = true` and run
-/// with `SS=1` (reset) semantics, so an `SS=2` record produced a wrong (reset)
-/// profile with no error. `0` maps to `false`, `1` to `true`; every other value
-/// (including `SS=2`) is rejected here. Full `SS=2` support is tracked in #694.
-///
-/// A missing / blank / non-numeric cell arrives as `0.0` (via [`parse_f64`]) and
-/// is treated as "not steady state", matching the NONMEM default. `time` is the
-/// user-written (`raw_time`) value so the message names the row's own time.
+/// Validate a `SS` cell: `0` → `false`, `1` → `true` (reset + steady state).
+/// `SS=2` (superimpose, #694) and every other value are rejected rather than run
+/// with `SS=1` semantics, since `DoseEvent.ss` is a bool. Missing reads as `0.0`.
+/// `time` is the user-written `raw_time`.
 fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
     if !ss.is_finite() {
         return Err(format!(
             "subject {id}, time {time}: SS={ss} is not finite; expected {SS_CODES}."
         ));
     }
-    // `SS` is a NONMEM integer code. Match on the integer form (mirrors
-    // `validate_dose_rate`); a non-integer `SS` is not a code. `ss as i64`
-    // saturates, so an out-of-range integer can't alias 0/1. Comparison against
-    // `0.0` is exempt from clippy::float_cmp.
-    let code = if ss.fract() == 0.0 {
-        Some(ss as i64)
-    } else {
-        None
-    };
+    // Integer code match as in `validate_dose_rate`; `as i64` saturates.
+    let code = if ss.fract() == 0.0 { Some(ss as i64) } else { None };
     match code {
         Some(0) => Ok(false),
         Some(1) => Ok(true),
@@ -2387,36 +1919,18 @@ fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
             } else {
                 ""
             };
-            Err(format!(
-                "subject {id}, time {time}: SS={ss} is not {NOT_AN_SS_CODE}.{hint}"
-            ))
+            Err(format!("subject {id}, time {time}: SS={ss} is not {NOT_AN_SS_CODE}.{hint}"))
         }
     }
 }
 
-/// Build a dose that honors the row's `RATE` classification (#324/#722).
-///
-/// A coded `RATE=-1`/`-2` row yields a *modeled* infusion ([`DoseEvent::modeled`],
-/// whose concrete rate/duration are resolved per iteration from `R{cmt}`/`D{cmt}`);
-/// an ordinary row yields a [`RateMode::Fixed`] dose. Passing the raw `-1`/`-2`
-/// sentinel to [`DoseEvent::new`] instead would set `rate_mode = Fixed` with
-/// `duration = 0` (since `rate <= 0`), so `is_infusion()` is false and the dose
-/// silently collapses to an instantaneous bolus — and `check_modeled_dose_rates`
-/// skips `Fixed` doses, so the missing slot is never caught.
-///
-/// **Single construction site** for the primary dose *and* its `ADDL`-expanded
-/// copies, so the two cannot diverge — that divergence is exactly what silently
-/// collapsed `ADDL` modeled infusions to boluses (#722). `ADDL` doses pass
-/// `ss = false` (an expanded dose is never steady-state itself); everything else
-/// is identical to the primary row.
+/// Build a dose honoring the row's `RATE` classification (#324/#722): a coded
+/// `-1`/`-2` row yields a modeled infusion ([`DoseEvent::modeled`]), else a
+/// [`RateMode::Fixed`] dose. (Passing the sentinel to [`DoseEvent::new`] would
+/// silently make a bolus.) Single construction site for the primary dose and its
+/// `ADDL` copies (`ss = false`), so they cannot diverge (#722).
 fn dose_for_rate_mode(
-    time: f64,
-    amt: f64,
-    cmt: usize,
-    rate: f64,
-    ss: bool,
-    ii: f64,
-    rate_mode: RateMode,
+    time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64, rate_mode: RateMode,
 ) -> DoseEvent {
     match rate_mode {
         RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
@@ -2428,32 +1942,16 @@ fn dose_for_rate_mode(
 
 /// Compute a record's effective EVID.
 ///
-/// When an `EVID` column is present its value governs (a blank / `.` /
-/// unparseable cell is the documented NONMEM default of 0 = observation, via
-/// [`parse_evid`]).
-///
-/// When the `EVID` column is **absent**, NONMEM infers the record type from
-/// `AMT`: a row with a nonzero `AMT` is a dose (EVID 1); everything else is an
-/// observation (EVID 0). Without this, an EVID-less dataset silently drops every
-/// `AMT` row — it is neither a dose (needs EVID 1/4) nor an observation (needs
-/// EVID 0 and MDV 0, but dose rows carry MDV=1) — and fits a degenerate
-/// dose-free model (#262). Inference keys on `AMT` only: a NONMEM dose always
-/// carries a nonzero `AMT` (infusions too — `RATE` is the rate, `AMT` the
-/// amount), so a `RATE`-only row would just create a no-op zero-amount dose.
-///
-/// Only a finite, nonzero `AMT` infers a dose: a missing cell (`.`, blank, `NA`,
-/// `nan`) parses to `0.0` and a non-finite `inf` is rejected, both via
-/// [`is_dosing_amt`]. Any other text that is not a number also parses to `0.0`
-/// and is rejected after the `[data_selection]` filter has kept the record
-/// (#1501): with no `EVID` column every record reads `AMT`.
+/// With an `EVID` column its value governs (missing = 0, via [`parse_evid`]).
+/// Without one, NONMEM infers it from `AMT`: a finite nonzero `AMT`
+/// ([`is_dosing_amt`]) is a dose (1), everything else an observation (0) (#262).
+/// A non-number `AMT` reads as `0.0` and is rejected once the filter keeps the
+/// record (#1501).
 fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize>) -> u32 {
     match evid_col {
         Some(c) => row.get(c).map(|s| parse_evid(s)).unwrap_or(0),
         None => {
-            let amt = amt_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+            let amt = amt_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
             if is_dosing_amt(amt) {
                 1
             } else {
@@ -2463,30 +1961,19 @@ fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize
     }
 }
 
-/// Parse an occasion-column cell. Returns `None` for blank / `.` / NA / non-integer
-/// values so the caller can warn about silently dropped rows. NONMEM convention
-/// uses `.` for missing. A float-formatted whole number (`"2.0"`) is that occasion
-/// (#1496).
+/// Parse an occasion cell; `None` for missing / non-integer values so the caller
+/// can warn. A float-formatted whole number (`"2.0"`) is that occasion (#1496).
 fn parse_occ(s: &str) -> Option<u32> {
     parse_unsigned_cell::<u32>(s)
 }
 
 /// What a numeric data column accepts, for the unreadable-cell check (#1501).
 ///
-/// Before #1501 each of these columns read a cell it could not parse as `0` —
-/// `DV = abc` was scored as a measured `0.0`, `EVID = abc` made a dose record an
-/// observation, `ADDL = abc` dropped the additional doses — with no warning. NONMEM
-/// rejects such a record (`(DATA ERROR)`; measured on 7.6.0 for `DV`/`CENS` and on
-/// 7.5.1 for every column here, plus `EVID=1.5`/`-1`, `MDV=1.5` and `ADDL=1.5`), and
-/// so does ferx now, on a record that reads the column and that `[data_selection]`
-/// keeps. NONMEM rejects the cell on every record it keeps; ferx, like the `CENS`
-/// check (#1496), only where the column is read.
-///
-/// A missing cell (blank, `.`, `NA`, `NaN`) is never unreadable: each column keeps
-/// its documented default for it. `CMT`, the occasion column and `L2` are not
-/// listed: an unreadable `CMT` is defaulted and counted (`W_CMT_DEFAULTED`, #1009),
-/// an unreadable occasion is counted (`W_IOV_OCC_MISSING`), and an unreadable `L2`
-/// is documented as "ungrouped" (#830).
+/// A cell that does not parse is rejected on a record that reads the column and
+/// that `[data_selection]` keeps (NONMEM `(DATA ERROR)`, measured on 7.5.1/7.6.0),
+/// instead of silently reading as `0`. A missing cell keeps its default. `CMT`,
+/// occasion and `L2` are not listed: they are defaulted and counted
+/// (`W_CMT_DEFAULTED`, `W_IOV_OCC_MISSING`) or "ungrouped" (#830).
 #[derive(Debug, Clone, Copy)]
 struct CellSpec {
     /// The column, as the message names it.
@@ -2497,10 +1984,9 @@ struct CellSpec {
     holds: fn(&str) -> bool,
 }
 
-/// A cell `f64::from_str` accepts. `inf` / `infinity` parse, and keep the
-/// per-column guards they already had (`validate_dose_rate`, `validate_ss`,
-/// `is_dosing_amt`, `checked_integer_dv`): this check is about the text that
-/// silently read as `0`, not about the values those guards judge.
+/// A cell `f64::from_str` accepts. `inf` / `infinity` parse and are left to the
+/// per-column guards (`validate_dose_rate`, `validate_ss`, `is_dosing_amt`,
+/// `checked_integer_dv`).
 fn holds_number(t: &str) -> bool {
     t.parse::<f64>().is_ok()
 }
@@ -2536,38 +2022,14 @@ const NOT_A_U16: &str = "a whole number from 0 to 65535";
 /// the maximum — the same measured edge [`parse_cmt_cell`] documents.
 const NOT_A_USIZE: &str = "a whole number from 0 to 18446744073709551615";
 
-const TIME_CELL: CellSpec = CellSpec {
-    name: "TIME",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const DV_CELL: CellSpec = CellSpec {
-    name: "DV",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const AMT_CELL: CellSpec = CellSpec {
-    name: "AMT",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const RATE_CELL: CellSpec = CellSpec {
-    name: "RATE",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const II_CELL: CellSpec = CellSpec {
-    name: "II",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
+const TIME_CELL: CellSpec = CellSpec { name: "TIME", what: NOT_A_NUMBER, holds: holds_number };
+const DV_CELL: CellSpec = CellSpec { name: "DV", what: NOT_A_NUMBER, holds: holds_number };
+const AMT_CELL: CellSpec = CellSpec { name: "AMT", what: NOT_A_NUMBER, holds: holds_number };
+const RATE_CELL: CellSpec = CellSpec { name: "RATE", what: NOT_A_NUMBER, holds: holds_number };
+const II_CELL: CellSpec = CellSpec { name: "II", what: NOT_A_NUMBER, holds: holds_number };
 /// `SS` on a dose row: [`validate_ss`] already rejects `1.5`, `-1` and `2`, so
 /// only the text that is no number at all is new here.
-const SS_DOSE_CELL: CellSpec = CellSpec {
-    name: "SS",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
+const SS_DOSE_CELL: CellSpec = CellSpec { name: "SS", what: NOT_A_NUMBER, holds: holds_number };
 /// What `SS` accepts, as every message about the cell spells it: [`validate_ss`]
 /// on a dose record and [`SS_FILTER_CELL`] in the `[data_selection]` context, so
 /// the two cannot drift.
@@ -2575,50 +2037,20 @@ const SS_CODES: &str = "0 (not steady state) or 1 (reset then dose to steady sta
 /// The `is not …` phrase for an `SS` cell outside [`SS_CODES`].
 const NOT_AN_SS_CODE: &str = "a supported steady-state code; expected 0 (not steady \
                               state) or 1 (reset then dose to steady state)";
-/// `SS` as the `[data_selection]` context reads it (`parse_unsigned_cell`), so
-/// `holds` is the count predicate. The message names what `SS` *accepts*, as
-/// [`validate_ss`] does, not the type the context reads it in (#1541 review): on
-/// a dose record with a rule that reads `SS`, this check runs before
-/// `validate_ss`, and `SS="1.5" is not a whole number from 0 to 2^64-1` told the
-/// user less than the message the same cell gets with no rule. A cell the
-/// predicate refuses (`1.5`, `-1`, `abc`) is never a code, so the phrase holds.
-const SS_FILTER_CELL: CellSpec = CellSpec {
-    name: "SS",
-    what: NOT_AN_SS_CODE,
-    holds: holds_count,
-};
-const EVID_CELL: CellSpec = CellSpec {
-    name: "EVID",
-    what: NOT_A_U32,
-    holds: holds_evid,
-};
-const MDV_CELL: CellSpec = CellSpec {
-    name: "MDV",
-    what: NOT_A_USIZE,
-    holds: holds_count,
-};
-const ADDL_CELL: CellSpec = CellSpec {
-    name: "ADDL",
-    what: NOT_A_USIZE,
-    holds: holds_count,
-};
-const FREMTYPE_CELL: CellSpec = CellSpec {
-    name: "FREMTYPE",
-    what: NOT_A_U16,
-    holds: holds_fremtype,
-};
+/// `SS` as the filter context reads it (`parse_unsigned_cell`). The message names
+/// what `SS` *accepts*, as [`validate_ss`] does (#1541); a refused cell is never a
+/// code.
+const SS_FILTER_CELL: CellSpec = CellSpec { name: "SS", what: NOT_AN_SS_CODE, holds: holds_count };
+const EVID_CELL: CellSpec = CellSpec { name: "EVID", what: NOT_A_U32, holds: holds_evid };
+const MDV_CELL: CellSpec = CellSpec { name: "MDV", what: NOT_A_USIZE, holds: holds_count };
+const ADDL_CELL: CellSpec = CellSpec { name: "ADDL", what: NOT_A_USIZE, holds: holds_count };
+const FREMTYPE_CELL: CellSpec =
+    CellSpec { name: "FREMTYPE", what: NOT_A_U16, holds: holds_fremtype };
 /// `CENS` in the `[data_selection]` context. The observation row keeps its own
 /// message ([`cens_not_whole_error`], #1496).
-const CENS_FILTER_CELL: CellSpec = CellSpec {
-    name: "CENS",
-    what: "a whole number",
-    holds: holds_whole,
-};
-const TENTRY_CELL: CellSpec = CellSpec {
-    name: "TENTRY",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
+const CENS_FILTER_CELL: CellSpec =
+    CellSpec { name: "CENS", what: "a whole number", holds: holds_whole };
+const TENTRY_CELL: CellSpec = CellSpec { name: "TENTRY", what: NOT_A_NUMBER, holds: holds_number };
 
 /// The row's cell in `col`, trimmed, when it is present, not missing, and not
 /// readable as `spec` says; `None` otherwise — including for an absent column and
@@ -2638,11 +2070,9 @@ fn row_label(time: f64, time_unreadable: bool, row_seq: usize) -> String {
     }
 }
 
-/// The error for a cell that a record reads and cannot parse (#1501).
-///
-/// `reads` names the columns a `[data_selection]` rule must avoid to remove the
-/// record without reading the cell: the cell's own column, and for `AMT` on a
-/// dataset with no `EVID` column also `EVID`, which ferx infers from it.
+/// The error for a cell that a record reads and cannot parse (#1501). `reads`
+/// names the columns a rule must avoid to remove the record without reading the
+/// cell (the cell's column, plus `EVID` for `AMT` when `EVID` is inferred).
 fn unreadable_cell_error(id: &str, at: &str, spec: &CellSpec, cell: &str, reads: &str) -> String {
     format!(
         "subject {id}, {at}: {}=\"{}\" is not {}. Correct the cell, or remove the \
@@ -2654,20 +2084,11 @@ fn unreadable_cell_error(id: &str, at: &str, spec: &CellSpec, cell: &str, reads:
 }
 
 /// The error for a `[data_selection]` rule that decided a record on a cell the
-/// reader could not parse (#1501, and the fourth row of the table in its
-/// discussion).
-///
-/// The filter context reads such a cell as the reader's fallback (`0` for `EVID`,
-/// `MDV`, `SS`, `CENS` and `TIME`; missing for `DV`, `AMT`, `RATE`, `II`), so
-/// `ignore = CENS == 0` would remove a `CENS = abc` record as an ordinary
-/// exclusion, and `accept = DV > 0` a `DV = abc` one. `rule` is the rule's
-/// fired-condition string (`ignore: CENS == 0`).
+/// reader could not parse (#1501): the context holds the reader's fallback, so
+/// `ignore = CENS == 0` would otherwise remove a `CENS = abc` record as an
+/// ordinary exclusion. `rule` is the fired-condition string.
 fn filter_reads_unreadable_cell_error(
-    id: &str,
-    at: &str,
-    rule: &str,
-    spec: &CellSpec,
-    cell: &str,
+    id: &str, at: &str, rule: &str, spec: &CellSpec, cell: &str,
 ) -> String {
     format!(
         "subject {id}, {at}: the [data_selection] rule \"{rule}\" decides this record \
@@ -2682,19 +2103,14 @@ fn filter_reads_unreadable_cell_error(
 /// The finite number in cell `idx` of `row`, or `None` for a missing, unparseable or
 /// non-finite cell: the cells the LOCF update reads no value from.
 fn finite_cell(row: &[String], idx: usize) -> Option<f64> {
-    row.get(idx)
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
+    row.get(idx).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite())
 }
 
 /// Record, for each column of `watch` this record has no value in, the record's
 /// `TIME` as written, unless the column already has an entry: see
 /// [`Subject::filled_cells`] (#2036).
 fn note_filled_cells(
-    filled: &mut Vec<(String, f64)>,
-    watch: &[(&str, usize)],
-    row: &[String],
-    raw_time: f64,
+    filled: &mut Vec<(String, f64)>, watch: &[(&str, usize)], row: &[String], raw_time: f64,
 ) {
     for &(name, idx) in watch {
         if finite_cell(row, idx).is_none() && !filled.iter().any(|(c, _)| c == name) {
@@ -2737,18 +2153,7 @@ fn parse_subject(
     routing: &ObsRouting,
     // Column index of the TENTRY (left-truncation time) column, if present.
     _tentry_col: Option<usize>,
-) -> Result<
-    (
-        Subject,
-        usize,
-        usize,
-        SubjectExclusion,
-        Vec<String>,
-        usize,
-        CmtDefaults,
-    ),
-    String,
-> {
+) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize, CmtDefaults), String> {
     let mut doses = Vec::new();
     // File-order record index (position in `rows`) of each dose / observation,
     // parallel to `doses` (pre-sort) and `obs_times`. Used after the loop to
@@ -2772,11 +2177,9 @@ fn parse_subject(
     let mut fremtype: Vec<u16> = Vec::new();
     let mut obs_l2: Vec<i64> = Vec::new();
     let mut occ_parse_failures: usize = 0;
-    // EVID=0/MDV=0 rows whose DV cell was missing, counted under **both**
-    // policies: skipped under `Skip` (issue #258, `W_MISSING_DV`) and kept as
-    // design points under `KeepAsDesign` (#957, `W_DESIGN_DV`). Either reading
-    // changes how many rows the dataset contributes, so either one is worth a
-    // summary line.
+    // EVID=0/MDV=0 rows with a missing DV, under both policies: skipped (`Skip`,
+    // #258, `W_MISSING_DV`) or kept as design points (`KeepAsDesign`, #957,
+    // `W_DESIGN_DV`).
     let mut missing_dv_rows: usize = 0;
     // Dose / observation rows this subject contributed whose compartment the
     // reader chose (#1009).
@@ -2791,28 +2194,20 @@ fn parse_subject(
     // One `W_CENS_UNEXPECTED` per subject for each sign, since the two signs are
     // scored on different tails (#1496): `[positive, negative]`.
     let mut cens_unexpected_warned = [false; 2];
-    // Rows that survived the data-selection filter, carry a nonzero AMT, yet
-    // were not classified as a dose (EVID not 1/4) — their AMT was silently
-    // dropped. Reported as a population summary so a degenerate dose-free fit
-    // can't pass unnoticed (#262). Counted post-filter so deliberately excluded
-    // dose rows don't trip the warning.
+    // Filter-kept rows with a dosing AMT that are not doses: their AMT was silently
+    // dropped (#262, reported as a population summary).
     let mut amt_ignored_rows: usize = 0;
 
-    // Non-Gaussian observation records for this subject. Holds TTE `Event`s
-    // (pushed only under `survival`) and, unconditionally, discrete-state / count
-    // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
-    // (Track D) endpoints share one stream on the default build.
+    // Non-Gaussian observation records: TTE `Event`s (under `survival`) and
+    // discrete-state / count rows (unconditional since Phase 4.0).
     let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
     // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
     // only trace those rows leave of their covariates (#1854; see the field's doc).
     let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
-    // tte_pending: per-CMT pending DV=0 row (may be a left-bound for an interval
-    //   or a right-censored event, depending on whether the next row is DV=2).
-    //   Entries are (cmt, (time, entry_time)), at most one per CMT, in the order their
-    //   rows appeared: the end-of-subject flush emits them in that order, so two causes
-    //   censored at the same time keep a deterministic record order (a `HashMap` here
-    //   made competing-risks simulation irreproducible under a fixed seed, #2569).
-    //   TTE-only, hence `survival`-gated.
+    // tte_pending: per-CMT pending DV=0 row (an interval left-bound or a
+    //   right-censored event, depending on whether a DV=2 row follows), as
+    //   (cmt, (time, entry_time)) in row order, so the end-of-subject flush is
+    //   deterministic (a `HashMap` broke seeded competing-risks simulation, #2569).
     #[cfg(feature = "survival")]
     let mut tte_pending: Vec<(usize, (f64, f64))> = Vec::new();
 
@@ -2858,10 +2253,7 @@ fn parse_subject(
         let mut first_val: Option<f64> = None;
         let mut is_tv = false;
         for row in rows {
-            let v_opt = row
-                .get(*idx)
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|v| v.is_finite());
+            let v_opt = row.get(*idx).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
             if let Some(v) = v_opt {
                 match first_val {
                     None => first_val = Some(v),
@@ -2878,9 +2270,7 @@ fn parse_subject(
         // missing record would read the subject-static value.
         let gapped = || {
             first_val.is_some()
-                && rows
-                    .iter()
-                    .any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
+                && rows.iter().any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
         };
         if is_tv || (routing.no_carry_forward.contains(name) && gapped()) {
             tv_names.push(name.as_str());
@@ -2904,10 +2294,8 @@ fn parse_subject(
     // Per-event covariate snapshots (only populated when any_tv is true).
     let mut dose_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut obs_covariates: Vec<HashMap<String, f64>> = Vec::new();
-    // Non-dose, unscored records: EVID=2 ("other event") rows — typically
-    // covariate-change markers — and EVID=0/MDV=1 rows. The time is kept for
-    // every subject, because it can be where the integration starts (#1809);
-    // the snapshot only when there are TV covariates.
+    // Non-dose, unscored records (EVID=2, EVID=0/MDV=1). The time is always kept
+    // (it can start the integration, #1809); the snapshot only with TV covariates.
     let mut pk_only_times: Vec<f64> = Vec::new();
     let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut pk_only_occasions: Vec<u32> = Vec::new();
@@ -2922,20 +2310,13 @@ fn parse_subject(
     // Compartment on/off rows (#2732), in file order.
     let mut cmt_toggles: Vec<crate::types::CmtToggle> = Vec::new();
 
-    // Reset-delimited occasion segmentation. NONMEM processes records
-    // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
-    // running timeline begins a fresh occasion that reuses the previous
-    // occasion's wall-clock (e.g. two infusion occasions both timed from 0,
-    // stacked under one ID). Our event engine sorts events by absolute time,
-    // which would interleave such occasions and double the administered dose.
-    // We instead shift each restarting segment — and every event after it,
-    // until the next restart — past the prior segment onto a single monotonic
-    // timeline. The reset zeros all compartments at the boundary, so the
-    // inserted gap carries no drug: predictions are identical to integrating
-    // each occasion independently, while the subject keeps one shared set of
-    // random effects (matching NONMEM's EVID=4 semantics). `time_offset` is
-    // the running shift; `max_eff_time` is the largest effective (shifted)
-    // event time emitted so far.
+    // Reset-delimited occasion segmentation. An EVID=3/4 reset whose TIME restarts
+    // at/below the running timeline begins a fresh occasion; sorting by absolute
+    // time would interleave such occasions and double the dose. Each restarting
+    // segment is shifted past the previous one onto one monotonic timeline. The
+    // reset zeros every compartment, so predictions equal integrating each occasion
+    // separately while keeping one set of random effects (NONMEM's EVID=4).
+    // `time_offset` is the running shift; `max_eff_time` the latest shifted time.
     let mut time_offset = 0.0f64;
     let mut max_eff_time = f64::NEG_INFINITY;
     // `(engine time, TIME as written)` of every dose and reset row once `time_offset`
@@ -2952,10 +2333,8 @@ fn parse_subject(
         // with this record's covariate values" semantics.
         if any_tv {
             for (name, idx) in tv_names.iter().zip(tv_indices.iter()) {
-                let value = row
-                    .get(*idx)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|v| v.is_finite());
+                let value =
+                    row.get(*idx).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
                 match value {
                     Some(v) => {
                         locf_state.insert((*name).to_string(), v);
@@ -2981,30 +2360,22 @@ fn parse_subject(
         // With no EVID column the record type is inferred from AMT, so every record
         // reads AMT; with one, only a dose record does (checked in the dose arm).
         let amt_unreadable = unreadable_cell(row, amt_col, &AMT_CELL);
-        let amt_cols: &[&str] = if evid_col.is_none() {
-            &["amt", "evid"]
-        } else {
-            &["amt"]
-        };
+        let amt_cols: &[&str] = if evid_col.is_none() { &["amt", "evid"] } else { &["amt"] };
         let row_at = |t: f64| row_label(t, time_unreadable.is_some(), row_seq);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
             .and_then(|s| parse_unsigned_cell::<usize>(s))
             .unwrap_or(0);
         let mdv_unreadable = unreadable_cell(row, mdv_col, &MDV_CELL);
-        // Whether `evid`/`mdv` say what the record *is*, or hold the reader's
-        // fallback for a cell it could not parse: the type rests on `EVID` (on
-        // `AMT` when `EVID` is inferred from it) and, for an `EVID=0` record, on
-        // `MDV`. A rule that reads none of those may still remove the record, and
-        // the exclusion tally must not then file it as the fallback says (#1541
-        // review); a kept record is rejected below.
+        // Whether `evid`/`mdv` describe the record or hold the fallback for an
+        // unparseable cell (`EVID`, `AMT` when EVID is inferred, `MDV` on EVID=0).
+        // The exclusion tally must not then file a removed record by the fallback
+        // (#1541); a kept record is rejected below.
         let record_type_unreadable = evid_unreadable.is_some()
             || (evid_col.is_none() && amt_unreadable.is_some())
             || (evid == 0 && mdv_unreadable.is_some());
-        // Parse OCC. When iov_column is set but a row's value is missing or
-        // unparseable, count it (caller emits a single summary warning) and
-        // fall back to 0 — matching pre-warning behavior so existing fits
-        // don't change. With no iov_column, parse failures are not tracked.
+        // OCC: with an iov_column, a missing / unparseable value is counted (one
+        // summary warning) and falls back to 0.
         let occ = if let Some(c) = occ_col {
             match row.get(c).and_then(|s| parse_occ(s)) {
                 Some(n) => n,
@@ -3024,41 +2395,28 @@ fn parse_subject(
             // Missing-sensitive numeric columns map `.`/blank to NaN so the
             // filter never matches them (see `parse_f64_or_nan`).
             let dv_for_ctx = parse_f64_or_nan(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
-            let amt_for_ctx = amt_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64_or_nan(s))
-                .unwrap_or(f64::NAN);
-            // Resolved exactly as the dose and observation arms below resolve it,
-            // so a `select`/`ignore` on CMT filters the same compartment the row
-            // is actually assigned (#1009). The cause is **kept**: if a CMT-reading
-            // rule then deletes the row, this is the only place that can count it —
-            // the arms that call `record_dose`/`record_obs` are past the `continue`
-            // below (#1409 review).
+            let amt_for_ctx =
+                amt_col.and_then(|c| row.get(c)).map(|s| parse_f64_or_nan(s)).unwrap_or(f64::NAN);
+            // Resolved as the dose / observation arms do (#1009). The cause is kept:
+            // if a CMT-reading rule deletes the row, only here can it be counted.
             let (cmt_for_ctx, cmt_cause_for_filter) = resolve_row_cmt(row, cmt_col);
-            let rate_for_ctx = rate_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64_or_nan(s))
-                .unwrap_or(f64::NAN);
-            let ii_for_ctx = ii_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64_or_nan(s))
-                .unwrap_or(f64::NAN);
+            let rate_for_ctx =
+                rate_col.and_then(|c| row.get(c)).map(|s| parse_f64_or_nan(s)).unwrap_or(f64::NAN);
+            let ii_for_ctx =
+                ii_col.and_then(|c| row.get(c)).map(|s| parse_f64_or_nan(s)).unwrap_or(f64::NAN);
             let ss_for_ctx = ss_col
                 .and_then(|c| row.get(c))
                 .and_then(|s| parse_unsigned_cell::<usize>(s))
                 .is_some_and(|ss| ss > 0);
             let cens_for_ctx = resolve_row_cens(row, cens_col).selection_flag();
-            // Raw (unparsed) covariate cell strings for this row, keyed
-            // lowercased. Lets string filters compare a non-numeric label column
-            // (NONMEM's `IGNORE(C.EQ.C)`) that the numeric `locf_state` map drops.
-            // Built only when a string-covariate filter is active; an empty
-            // `HashMap` does not allocate, so numeric-only filters pay nothing.
+            // Raw covariate cells, keyed lowercased, for string filters on label
+            // columns (NONMEM `IGNORE(C.EQ.C)`). Only built when a string filter is
+            // active.
             let str_covariates: HashMap<String, String> = if needs_str_cov {
                 cov_indices
                     .iter()
                     .filter_map(|(name, idx)| {
-                        row.get(*idx)
-                            .map(|cell| (name.to_lowercase(), cell.trim().to_string()))
+                        row.get(*idx).map(|cell| (name.to_lowercase(), cell.trim().to_string()))
                     })
                     .collect()
             } else {
@@ -3081,61 +2439,29 @@ fn parse_subject(
             };
             let fired = sel.first_excluding_rule(&ctx);
             // A rule must not decide a record on a cell the reader could not parse
-            // (#1501): `ctx` holds the reader's fallback for it, not the dataset's
-            // value. When a rule removed the record, that rule decided it; when the
-            // record survived, every clause did. A clause decided it *on* the cell
-            // only when its outcome rests on it (`FilterClause::depends_on`):
-            // `EVID == 2 && RATE == 0` on an observation is decided by `EVID`. A
-            // rule whose outcome does not rest on these cells may still remove the
-            // record without error — NONMEM checks only the records its `IGNORE`
-            // keeps. `CMT` is left to `W_CMT_DEFAULTED` (`record_filtered` below).
-            // `FREMTYPE` and `TENTRY` have no `RowContext` field: a clause reads them
-            // from the covariate map, where an unparseable cell leaves the previous
-            // record's value in place — a fallback all the same.
+            // (#1501): `ctx` holds the fallback. A removed record was decided by the
+            // firing rule, a kept one by every clause; a clause decides on a cell only
+            // when its outcome rests on it (`FilterClause::depends_on`). `CMT` is left
+            // to `W_CMT_DEFAULTED`. `FREMTYPE`/`TENTRY` are read from the covariate
+            // map, where an unparseable cell carries the previous value forward.
             let filter_cells: [(&CellSpec, Option<&str>, &[&str]); 11] = [
                 (&TIME_CELL, time_unreadable, &["time"]),
-                (
-                    &DV_CELL,
-                    unreadable_cell(row, Some(dv_col), &DV_CELL),
-                    &["dv"],
-                ),
+                (&DV_CELL, unreadable_cell(row, Some(dv_col), &DV_CELL), &["dv"]),
                 (&EVID_CELL, evid_unreadable, &["evid"]),
                 (&AMT_CELL, amt_unreadable, amt_cols),
-                (
-                    &RATE_CELL,
-                    unreadable_cell(row, rate_col, &RATE_CELL),
-                    &["rate"],
-                ),
+                (&RATE_CELL, unreadable_cell(row, rate_col, &RATE_CELL), &["rate"]),
                 (&II_CELL, unreadable_cell(row, ii_col, &II_CELL), &["ii"]),
                 (&MDV_CELL, mdv_unreadable, &["mdv"]),
-                (
-                    &SS_FILTER_CELL,
-                    unreadable_cell(row, ss_col, &SS_FILTER_CELL),
-                    &["ss"],
-                ),
-                (
-                    &CENS_FILTER_CELL,
-                    unreadable_cell(row, cens_col, &CENS_FILTER_CELL),
-                    &["cens"],
-                ),
-                (
-                    &FREMTYPE_CELL,
-                    unreadable_cell(row, fremtype_col, &FREMTYPE_CELL),
-                    &["fremtype"],
-                ),
-                (
-                    &TENTRY_CELL,
-                    unreadable_cell(row, _tentry_col, &TENTRY_CELL),
-                    &["tentry"],
-                ),
+                (&SS_FILTER_CELL, unreadable_cell(row, ss_col, &SS_FILTER_CELL), &["ss"]),
+                (&CENS_FILTER_CELL, unreadable_cell(row, cens_col, &CENS_FILTER_CELL), &["cens"]),
+                (&FREMTYPE_CELL, unreadable_cell(row, fremtype_col, &FREMTYPE_CELL), &["fremtype"]),
+                (&TENTRY_CELL, unreadable_cell(row, _tentry_col, &TENTRY_CELL), &["tentry"]),
             ];
             for (spec, cell, cols) in filter_cells {
                 let Some(cell) = cell else { continue };
                 let decider = match &fired {
                     Some(rule) => rule.depends_on(&ctx, cols).then(|| rule.source(id)),
-                    None => sel
-                        .first_clause_depending_on(&ctx, cols)
-                        .map(|r| r.source(id)),
+                    None => sel.first_clause_depending_on(&ctx, cols).map(|r| r.source(id)),
                 };
                 if let Some(src) = decider {
                     return Err(filter_reads_unreadable_cell_error(
@@ -3152,32 +2478,23 @@ fn parse_subject(
                 if !excl_fired.contains(&src) {
                     excl_fired.push(src);
                 }
-                // The row is about to vanish. If the rule that removed it reads CMT
-                // and the reader had to choose that CMT, this is the last point at
-                // which the choice can be reported (#1409 review). Scoped to the
-                // rule that actually fired, so an exclusion decided by another
-                // column stays silent even when a CMT clause sits beside it.
+                // Last chance to report a defaulted CMT on a row deleted by a rule
+                // that reads CMT (#1409); scoped to the rule that fired.
                 if let Some(cause) = &cmt_cause_for_filter {
                     if rule.reads_column("cmt") {
                         cmt_defaults.record_filtered(cause);
                     }
                 }
-                // Count by record type for the summary. The catch-all `other`
-                // bucket (EVID 2/3, missing-DV obs, and a record whose type the
-                // reader could not read) ensures every excluded record is
-                // reflected in some counter.
+                // Count by record type; `other` catches EVID 2/3, missing-DV obs and
+                // unreadable record types.
                 if record_type_unreadable {
                     excl_n_other += 1;
                 } else if is_dose_evid(evid) {
                     excl_n_dose += 1;
                 } else if evid == 0 && mdv == 0 {
                     excl_n_obs += 1;
-                    // Which compartment, not just how many. A count alone cannot say
-                    // whether a `[data_selection]` clause is why some declared per-CMT
-                    // entry looks unmatched — `ignore = CMT == 3` removing CMT-3 rows
-                    // is no explanation at all for a dead `[CMT=2]` entry (#1456
-                    // review r1) — and the row is about to vanish, so this is the last
-                    // point at which the compartment is known.
+                    // Record which compartment (#1456): a count alone cannot explain
+                    // an unmatched per-CMT entry, and this is the last point it is known.
                     excl_obs_cmts.insert(cmt_for_ctx);
                 } else {
                     excl_n_other += 1;
@@ -3190,22 +2507,10 @@ fn parse_subject(
         // TIME and its record type; MDV decides whether an EVID=0 record is an
         // observation. The dose and observation arms check the cells only they read.
         if let Some(cell) = time_unreadable {
-            return Err(unreadable_cell_error(
-                id,
-                &row_at(time),
-                &TIME_CELL,
-                cell,
-                "TIME",
-            ));
+            return Err(unreadable_cell_error(id, &row_at(time), &TIME_CELL, cell, "TIME"));
         }
         if let Some(cell) = evid_unreadable {
-            return Err(unreadable_cell_error(
-                id,
-                &row_at(time),
-                &EVID_CELL,
-                cell,
-                "EVID",
-            ));
+            return Err(unreadable_cell_error(id, &row_at(time), &EVID_CELL, cell, "EVID"));
         }
         if evid_col.is_none() {
             if let Some(cell) = amt_unreadable {
@@ -3220,47 +2525,27 @@ fn parse_subject(
         }
         if evid == 0 {
             if let Some(cell) = mdv_unreadable {
-                return Err(unreadable_cell_error(
-                    id,
-                    &row_at(time),
-                    &MDV_CELL,
-                    cell,
-                    "MDV",
-                ));
+                return Err(unreadable_cell_error(id, &row_at(time), &MDV_CELL, cell, "MDV"));
             }
         }
 
         // AMT for this row (parsed once, post-filter; reused by the dose arm).
         // A missing column or `.` cell parses to 0.0 (see `parse_f64`).
-        let row_amt = amt_col
-            .and_then(|c| row.get(c))
-            .map(|s| parse_f64(s))
-            .unwrap_or(0.0);
-        // Track AMT that won't be administered: a dose-like AMT (finite,
-        // nonzero) on a record that is neither a dose (EVID 1/4) nor a *scored*
-        // observation (`mdv != 0`). The `mdv != 0` gate is what keeps this from
-        // false-firing: a scored observation (MDV=0) that merely carries a
-        // redundant / forward-filled AMT is benign — a real dropped dose is a
-        // non-scored record (a NONMEM dose row is MDV=1). With no EVID column
-        // `effective_evid` already promoted dose rows to doses, so this fires
-        // mainly on an EVID-present dataset whose dose row was mistyped (e.g.
-        // EVID=0, MDV=1, AMT=5000). Surfaced as a population warning. #262
+        let row_amt = amt_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
+        // AMT that won't be administered: a dosing AMT on a record that is neither a
+        // dose nor a *scored* observation. The `mdv != 0` gate avoids false fires on
+        // a scored row with a forward-filled AMT; mostly catches mistyped dose rows
+        // (e.g. EVID=0, MDV=1, AMT=5000). #262
         if is_dosing_amt(row_amt) && !is_dose_evid(evid) && mdv != 0 {
             amt_ignored_rows += 1;
         }
 
-        // Raw (unshifted) TIME for this row, preserved before the occasion
-        // shift below so the user-clock diagnostics (sdtab/covtab TIME and
-        // predict/simulate TIME) report the value the user wrote, while the
-        // engine uses the shifted monotonic `time`.
+        // Raw (unshifted) TIME, reported by the user-clock diagnostics; the engine
+        // uses the shifted monotonic `time`.
         let raw_time = time;
 
-        // Reset-delimited occasion segmentation (see `time_offset` above).
-        // When an EVID=3/4 reset's TIME would land at or before the running
-        // timeline, start a new segment by shifting it (and the rest of this
-        // occasion) just past the latest event seen so far. `time` is then the
-        // effective, monotonic event time used everywhere downstream; `raw_time`
-        // keeps the original column value for the diagnostic outputs.
+        // Occasion segmentation (see `time_offset`): a reset at or before the
+        // running timeline starts a new segment shifted past the latest event.
         if (evid == 3 || evid == 4) && time + time_offset <= max_eff_time {
             time_offset = max_eff_time + RESET_SEGMENT_GAP - time;
         }
@@ -3281,13 +2566,9 @@ fn parse_subject(
             if time_offset != 0.0 {
                 reset_period_times.push((time, raw_time));
             }
-            // A reset row is a data record: NONMEM runs `$PK` at it, so an
-            // `[odes] init(...)` re-seeded here is evaluated with THIS row's
-            // covariates (#1133). `locf_state` was refreshed from this row at the
-            // top of the loop, so it is already the reset row's own snapshot.
-            // Skipped without TV covariates, exactly like `pk_only_covariates`:
-            // every snapshot is then the subject-static map and `reset_cov`'s
-            // fallback returns it.
+            // A reset row runs `$PK`, so an `[odes] init(...)` re-seeded here uses
+            // this row's covariates (#1133). Skipped without TV covariates, where
+            // `reset_cov` falls back to the static map.
             if any_tv {
                 reset_covariates.push(locf_state.clone());
             }
@@ -3299,12 +2580,9 @@ fn parse_subject(
             }
         }
 
-        // A negative `CMT` turns a compartment off, and only an `EVID=2` row may do that
-        // (#2732). NONMEM 7.5.1 stops the run on one on a dose ("CAN NOT TURN OFF A
-        // COMPARTMENT RECEIVING A DOSE") or an observation, `MDV=1` included ("SPECIFIED
-        // COMPARTMENT MAY NOT BE TURNED OFF WITH AN OBSERVATION RECORD"). It accepts one on
-        // an `EVID=3` reset and leaves the compartment off afterwards, which ferx refuses
-        // rather than half-supports: write the reset, then an `EVID=2` row.
+        // A negative `CMT` turns a compartment off, only on an `EVID=2` row (#2732).
+        // NONMEM 7.5.1 stops on one on a dose or observation; one on an `EVID=3`
+        // reset is refused here rather than half-supported.
         let off_cmt = negative_cmt(row, cmt_col);
         if let (Some(n), true) = (off_cmt, evid != 2) {
             return Err(format!(
@@ -3344,31 +2622,13 @@ fn parse_subject(
             // expansion below, so remember where this row's doses start and record
             // the finding once the row is fully expanded.
             let doses_before_this_row = doses.len();
-            let rate = rate_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
-            // Classify the RATE cell (#324): >=0 -> Fixed (data-driven rate),
-            // -2 -> ModeledDuration (duration is a `D{cmt}` parameter), -1 ->
-            // ModeledRate (rate is an `R{cmt}` parameter) — both resolved at the
-            // model+data join; other negative / non-finite are rejected. Uses
-            // `raw_time` so the message names the value the user wrote, not the
-            // occasion-shifted engine time. `?` bubbles up through `parse_subject`.
+            let rate = rate_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
+            // Classify RATE (#324); `raw_time` names the value the user wrote.
             let rate_mode = validate_dose_rate(rate, id, raw_time)?;
-            let ii = ii_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
-            // Validate the `SS` cell: only `SS=0`/`SS=1` are supported. A missing
-            // or blank cell parses to `0.0` (not steady state). `SS=2` and other
-            // codes are rejected here (via `validate_ss`) rather than silently
-            // collapsed into the single `ss = true` flag and run with `SS=1`
-            // (reset) semantics. `raw_time` names the value the user wrote.
+            let ii = ii_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
+            // Only `SS=0`/`SS=1` are supported (`validate_ss`); `raw_time` as above.
             let ss = validate_ss(
-                ss_col
-                    .and_then(|c| row.get(c))
-                    .map(|s| parse_f64(s.trim()))
-                    .unwrap_or(0.0),
+                ss_col.and_then(|c| row.get(c)).map(|s| parse_f64(s.trim())).unwrap_or(0.0),
                 id,
                 raw_time,
             )?;
@@ -3390,14 +2650,8 @@ fn parse_subject(
                 dose_covariates.push(locf_state.clone());
             }
             // Advance the occasion watermark past this dose's *end* (start +
-            // infusion duration), not just its start. A later reset-restarting
-            // occasion is shifted past `max_eff_time`; if a dose here ends after
-            // the last observation, the watermark must reflect that so the next
-            // occasion doesn't land inside this one's dosing window. Reuses the
-            // duration `DoseEvent::new` already computed (single source of truth).
-            // NOTE: dose lagtime (ALAG) is a model parameter unknown at parse
-            // time, so the watermark uses unlagged times; a heavily-lagged dose
-            // whose effective start crosses an occasion boundary is not covered.
+            // duration), so the next restarting occasion does not land inside its
+            // dosing window. Uses unlagged times: ALAG is unknown at parse time.
             let dose_end = {
                 let d = doses.last().unwrap();
                 d.time + d.duration
@@ -3424,11 +2678,8 @@ fn parse_subject(
                 } else {
                     for k in 1..=(addl as u32) {
                         let addl_time = time + (k as f64) * ii;
-                        // Same construction as the primary dose (see
-                        // `dose_for_rate_mode`): an expanded dose of a coded
-                        // `RATE=-1`/`-2` row stays a modeled infusion rather than
-                        // collapsing to a `Fixed` bolus, and is never steady-state
-                        // itself (`ss = false`).
+                        // Same construction as the primary dose (`dose_for_rate_mode`),
+                        // never steady-state itself.
                         doses.push(dose_for_rate_mode(
                             addl_time, amt, cmt, rate, false, ii, rate_mode,
                         ));
@@ -3446,12 +2697,9 @@ fn parse_subject(
                         if any_tv {
                             dose_covariates.push(locf_state.clone());
                         }
-                        // Fold each expanded dose's end into the watermark so a
-                        // following reset-restarting occasion is shifted past the
-                        // whole ADDL train (issue #195 review): ADDL bolus doses
-                        // landing after the next occasion's reset would otherwise
-                        // fire onto it, since boluses aren't gated by reset_floor.
-                        // Reuses the just-pushed dose's stored duration.
+                        // Fold each expanded dose's end into the watermark so the next
+                        // restarting occasion is shifted past the whole ADDL train
+                        // (#195): boluses aren't gated by reset_floor.
                         let addl_end = {
                             let d = doses.last().unwrap();
                             d.time + d.duration
@@ -3463,54 +2711,32 @@ fn parse_subject(
                 }
             }
 
-            // Record the finding now that the row's full dose train exists (#1009).
-            // `doses.len() - doses_before_this_row` is `1 + ADDL` for an expanded
-            // row, so the summary can say both how many *cells* to fix and how much
-            // drug actually went to the guessed compartment.
+            // Record the defaulted CMT now that the dose train exists (#1009):
+            // `1 + ADDL` doses for this row.
             if let Some(cause) = &cmt_default_cause {
                 cmt_defaults.record_dose(cause, doses.len() - doses_before_this_row);
             }
         } else if evid == 0 && mdv == 0 {
             // Observation record
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
-            // Resolved exactly as the dose path resolves it: a missing or
-            // unparseable cell defaults to compartment 1 and is counted, rather
-            // than falling to a bare integer parse's 0 (an invalid compartment). The
-            // count is deferred until `skip_missing_dv` is known below, so a row
-            // the reader drops is not reported as one it routed.
+            // Resolved as the dose path does; counted only after `skip_missing_dv`
+            // is known, so a dropped row is not reported.
             let (cmt, cmt_default_cause) = resolve_row_cmt(row, cmt_col);
 
-            // A missing DV cell (`.` / `NA` / blank) means "no observation" when
-            // the DV is an input: `parse_f64` coerced it to `0.0` above, so
-            // without a guard a forgotten MDV would inject a phantom scored row.
-            // NONMEM convention marks such rows MDV=1; treat a forgotten one the
-            // same way — skip it and count it for the single W_MISSING_DV summary
-            // (#258). Under `MissingDvPolicy::KeepAsDesign` the DV is instead the
-            // *output* (simulation, #957) and the row is kept as a design point
-            // with a placeholder DV. Applied to every scored endpoint below
-            // (Gaussian, discrete-state, count); the TTE `Event` arm keeps its own
-            // DV-code semantics and does not use it.
+            // A missing DV means "no observation" for fitting: `parse_f64` gave `0.0`,
+            // so a forgotten MDV would inject a phantom row. Skip and count it for
+            // W_MISSING_DV (#258); under `KeepAsDesign` (#957) keep it as a design
+            // point. Applies to every scored endpoint except the TTE `Event` arm.
             let dv_missing = is_missing_cell(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
             let skip_missing_dv = dv_missing && routing.missing_dv == MissingDvPolicy::Skip;
-            // A DV that is present but no number read as `0.0` (#1501): a measured
-            // zero on a Gaussian row, a right-censored event on a TTE row, state 0
-            // or count 0 on an integer row. Every endpoint reads DV, so this sits
-            // before the routing.
+            // A present non-number DV (#1501): every endpoint reads DV, so check it
+            // before routing.
             if let Some(cell) = unreadable_cell(row, Some(dv_col), &DV_CELL) {
-                return Err(unreadable_cell_error(
-                    id,
-                    &row_at(raw_time),
-                    &DV_CELL,
-                    cell,
-                    "DV",
-                ));
+                return Err(unreadable_cell_error(id, &row_at(raw_time), &DV_CELL, cell, "DV"));
             }
 
-            // Non-Gaussian row routing: when this CMT belongs to a declared TTE /
-            // discrete-state / count endpoint, route the row to `obs_records`
-            // instead of the Gaussian parallel Vecs. The routing `.contains`
-            // checks are always compiled; only the TTE `Event` construction is
-            // `survival`-gated. The routing sets are disjoint (validated up front).
+            // Route a TTE / discrete-state / count CMT to `obs_records` (disjoint
+            // sets, validated up front); only the TTE arm is `survival`-gated.
             if routing.tte.contains(&cmt) {
                 #[cfg(feature = "survival")]
                 {
@@ -3623,12 +2849,8 @@ fn parse_subject(
                 // `survival` feature is off (its only producer is a TTE endpoint),
                 // so this branch is never entered in that build.
             } else if let Some(kind) = routing.integer_kind(cmt) {
-                // Non-Gaussian integer-coded observation (discrete-state index or
-                // count). A missing DV is skipped as MDV=1 — the same #258
-                // phantom-zero guard the Gaussian branch uses — so a forgotten MDV
-                // never records a spurious `state:0` / `count:0`. Otherwise the DV
-                // must be a finite, non-negative, in-range integer (`checked_integer_dv`,
-                // #192); no endpoint math here (Phase 4.0).
+                // Integer-coded observation (discrete state or count): a missing DV is
+                // skipped as MDV=1 (#258); otherwise `checked_integer_dv` (#192).
                 if dv_missing {
                     missing_dv_rows += 1;
                 }
@@ -3638,14 +2860,9 @@ fn parse_subject(
                 if any_tv {
                     endpoint_covariates.push(locf_state.clone());
                 }
-                // Design-point row under `KeepAsDesign`: there is no user DV, so
-                // write the endpoint's registered placeholder code (its first
-                // declared state code; `0` for a count or an unregistered CMT).
-                // The simulated outcome overwrites it. Skipping `checked_integer_dv`
-                // here is deliberate — it is the *user's* DV that must be a valid
-                // integer, and there isn't one — but the placeholder must still be
-                // a code the endpoint can decode, so that a mis-routed design
-                // population cannot silently score as an out-of-range state.
+                // Design row under `KeepAsDesign`: write the endpoint's registered
+                // placeholder code (no user DV to check), which must still be
+                // decodable by the endpoint.
                 let magnitude = if dv_missing {
                     routing.design_states.get(&cmt).copied().unwrap_or(0) as f64
                 } else {
@@ -3675,24 +2892,12 @@ fn parse_subject(
                 if skip_missing_dv {
                     continue;
                 }
-                // Design-point row under `KeepAsDesign` (#957): the sampling time
-                // is real, the observation does not exist yet. `NaN` rather than
-                // the `0.0` the missing cell parsed to, so the placeholder can
-                // never be mistaken for a measured zero — the simulator reads only
-                // the times, and every downstream |DV| consumer already guards on
-                // `is_finite`.
+                // Design row under `KeepAsDesign` (#957): `NaN`, never a measured zero.
                 let dv = if dv_missing { f64::NAN } else { dv };
-                // The row the filter kept and the likelihood scores, so the one
-                // place a `CENS` cell holding no flag is an error (#1496). A dose
-                // row, a non-Gaussian row, a row the filter removed and a row the
-                // fit reader skips for its missing DV never get here, and never read
-                // the cell. A design row with no DV, which the simulation reader
-                // keeps (`MissingDvPolicy::KeepAsDesign`), does get here. It has no
-                // observation to censor and is never scored, so a cell that holds
-                // no flag is read as 0 there rather than rejected, and an
-                // out-of-domain flag is not warned about below. Both readers
-                // therefore accept the same rows, and a file that fits can be
-                // simulated from.
+                // Where a non-flag `CENS` is an error (#1496): a filter-kept scored
+                // Gaussian row. A design row with no DV (`KeepAsDesign`) is never
+                // scored, so there the cell reads as 0 and is not warned about, and
+                // a file that fits can be simulated from.
                 let (cens_flag, cens_cell) = match resolve_row_cens(row, cens_col) {
                     CensCell::Flag(flag, cell) => (flag, cell),
                     CensCell::NotWhole(cell) if dv_missing => (0, cell),
@@ -3706,13 +2911,8 @@ fn parse_subject(
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
-                // Only -1 (above the ULOQ), 0 (quantified) and 1 (below the LLOQ)
-                // are codes. Under M3 any other whole number is scored by its sign
-                // alone — a positive flag on the lower tail, like 1, a negative one
-                // on the upper tail, like -1 — so say so rather than score the row
-                // silently. Once per subject for each sign, since the tails differ.
-                // Not on a design row with no DV: nothing scores it, so every claim
-                // the warning makes about scoring would be false there.
+                // Only -1/0/1 are codes; under M3 other whole numbers are scored by
+                // sign, so warn once per subject per sign. Not on a design row.
                 if !dv_missing && !matches!(cens_flag, -1 | 0 | 1) {
                     let warned = &mut cens_unexpected_warned[usize::from(cens_flag < 0)];
                     if !*warned {
@@ -3744,10 +2944,8 @@ fn parse_subject(
                 if l2_col.is_some() {
                     // NONMEM writes L2 as an integer id; a blank / unparsable
                     // cell means "ungrouped" (0), matching the empty-vector case.
-                    let l2 = l2_col
-                        .and_then(|c| row.get(c))
-                        .and_then(|s| parse_l2_id(s))
-                        .unwrap_or(0);
+                    let l2 =
+                        l2_col.and_then(|c| row.get(c)).and_then(|s| parse_l2_id(s)).unwrap_or(0);
                     obs_l2.push(l2);
                 }
                 if any_tv {
@@ -3755,49 +2953,29 @@ fn parse_subject(
                 }
             }
 
-            // Count the chosen compartment **last** (#1009). Every arm above either
-            // pushed a row or `continue`d, so reaching this line is exactly "the
-            // row became an observation" — which is what the summary claims its
-            // counts mean. Counting before the branch instead swept up two kinds of
-            // row the fit never sees: a missing-DV row skipped under #258 (already
-            // reported by `W_MISSING_DV`, so it would be one row reported as two
-            // findings) and a TTE row the `TENTRY > TIME` guard drops as malformed.
+            // Count the defaulted compartment **last** (#1009): reaching here means
+            // the row became an observation (missing-DV and malformed TTE rows
+            // `continue`d above).
             if let Some(cause) = &cmt_default_cause {
                 cmt_defaults.record_obs(cause);
             }
         } else if evid == 2 || (evid == 0 && mdv != 0) {
-            // A non-dose record that is not scored: EVID=2 "other event" —
-            // typically a covariate-change marker — or an EVID=0 row with
-            // MDV=1. NONMEM/nlmixr2 run $PK at this time with this row's
-            // covariate values, so the rate matrix switches at this
-            // time even though the row is neither a dose nor an obs.
-            // We capture it as a pk-only event; the analytical / AD /
-            // ODE event walkers will refresh `current_pk` from this
-            // row's covariates without mutating the compartment state.
+            // A non-dose unscored record (EVID=2, or EVID=0 with MDV=1): NONMEM runs
+            // $PK here with this row's covariates, so it becomes a pk-only event the
+            // walkers use to refresh `current_pk` without touching the state.
             //
             // The time is kept for every subject, the snapshot only with TV
-            // covariates (#1809). With constant covariates re-evaluating $PK
-            // gives the same values, so no snapshot is needed — `pk_only_cov`
-            // falls back to the subject-static map, the shape
-            // `prune_irrelevant_tv_covariates` already leaves. The time is not
-            // a no-op: NONMEM starts the system at the subject's first record
-            // of any type, and `subject_integration_start` reads it from
-            // `pk_only_times`. Dropping the row moved an ODE subject's clock to
-            // its first observation or dose. NONMEM 7.6.0 starts the clock at
-            // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
-            // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
+            // covariates (#1809): NONMEM starts the system at the first record of
+            // any type, and `subject_integration_start` reads `pk_only_times`.
             //
-            // An `EVID=2` row with a `CMT` is also a compartment on/off record (#2732),
-            // `CMT=0` and no `CMT` being neither. It stays a pk-only row: `$PK` runs at it
-            // like any other, and the #1810 ordering applies to it.
+            // An `EVID=2` row with a `CMT` is also a compartment on/off record
+            // (#2732); it stays a pk-only row.
             if evid == 2 {
                 let on_cmt =
-                    cmt_col
-                        .and_then(|c| row.get(c))
-                        .and_then(|s| match parse_cmt_cell(s) {
-                            CmtCell::Value(n) if n > 0 => Some(n),
-                            _ => None,
-                        });
+                    cmt_col.and_then(|c| row.get(c)).and_then(|s| match parse_cmt_cell(s) {
+                        CmtCell::Value(n) if n > 0 => Some(n),
+                        _ => None,
+                    });
                 if let Some((n, on)) = off_cmt.map(|n| (n, false)).or(on_cmt.map(|n| (n, true))) {
                     cmt_toggles.push(crate::types::CmtToggle {
                         pk_only: pk_only_times.len(),
@@ -3813,20 +2991,14 @@ fn parse_subject(
             if any_tv {
                 pk_only_covariates.push(locf_state.clone());
             }
-            // The row's own `OCC` (#1876): NONMEM runs `$PK` here under it, and the
-            // snapshot governs the interval ending at this row. Gated like
-            // `reset_occasions`. The #1810 pass below only moves a time in place, so the
-            // labels stay parallel to `pk_only_times`.
+            // The row's own `OCC` (#1876), parallel to `pk_only_times`.
             if occ_col.is_some() {
                 pk_only_occasions.push(occ);
             }
         }
     }
 
-    // Sort doses by time (keeping dose_occasions and dose_covariates in sync).
-    // Stable sort would be safer when two events share a time, but PartialOrd
-    // sort_by gives us a stable answer for f64 ordered times, and matches
-    // pre-existing behavior.
+    // Sort doses by time, keeping dose_occasions and dose_covariates in sync.
     let n_doses = doses.len();
     let mut perm: Vec<usize> = (0..n_doses).collect();
     perm.cold_sort_by(&|&a, &b| doses[a].time.partial_cmp(&doses[b].time).unwrap());
@@ -3843,38 +3015,20 @@ fn parse_subject(
         Vec::new()
     };
 
-    // ADDL trains extend past later rows of their period, so the table is filled out
-    // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
-    // reset and a dose at one `(engine, written)` pair, kept once. Sorted here, ahead of
-    // the #1909 pass, which reads it.
+    // ADDL trains make the table out of engine order; `param_time_at` binary-searches
+    // it. An EVID=4 row is kept once. Sorted before the #1909 pass reads it.
     reset_period_times.cold_sort_by(&|a, b| a.0.total_cmp(&b.0));
     reset_period_times.dedup();
 
     // ── An ADDL-implied dose runs under the `$PK` of the record that governs it (#1909) ──
-    // NONMEM does not run `$PK` at a dose implied by `ADDL`: it is not an event record. The
-    // advance across it runs under the values of the next event record, the first one at
-    // or after the dose in (TIME, file order), and the implied dose only adds its mass on
-    // the way (before a co-timed observation, which sees it). The dose's `F` and the `TIME`
-    // its `$PK` sees are that record's too; only its lag is the parent row's, fixed when
-    // that row scheduled the train (measured in `nonmem_anchor/addl_*`). `OCC` is a data
-    // item of that record like any covariate. NONMEM has no occasion object of its own, so
-    // there is nothing separate to measure: an `OCC`-indexed κ is a covariate there.
-    // ferx's engines treat every dose as a record whose snapshot governs the interval
-    // ending at it, and the reader gave an implied dose its parent row's snapshot, so the
-    // parent's covariates governed up to each dose of the train — in
-    // `nonmem_anchor/addl_tie`, 10–30 % on every later observation once a covariate changed
-    // after the parent row. Giving the implied dose the governing record's covariates,
-    // `OCC` and `TIME` makes the engines' rule NONMEM's: the interval ending at it and the
-    // one after it both run under that record. Which of the co-timed records the engines
-    // reach first then no longer matters, which is why the #1810 pass below may keep
-    // ranking an implied dose by its parent's row. The parent's index goes on the dose
-    // (`DoseEvent::implied`), and the per-dose builders take the lag from it
-    // (`pk::inherit_parent_dose_attrs`).
-    //
-    // A reset row is a record like any other here. The occasion shift puts every reset
-    // past the end of any train recorded before it, so one can govern only the interval
-    // ending at a train's last dose, never tie with it. An implied dose with no record at
-    // or after it keeps its parent's inputs; nothing observes it.
+    // NONMEM runs no `$PK` at an implied dose: the advance across it uses the next
+    // event record at or after it in (TIME, file order), whose `F`, `TIME` and `OCC`
+    // the dose takes; only its lag is the parent row's (`nonmem_anchor/addl_*`).
+    // Giving the implied dose that record's snapshot makes the engines' rule match
+    // NONMEM's (the parent's snapshot was 10–30 % off in `nonmem_anchor/addl_tie`).
+    // The parent's index goes on the dose (`DoseEvent::implied`) for the lag
+    // (`pk::inherit_parent_dose_attrs`). Resets are records like any other here; an
+    // implied dose with no later record keeps its parent's inputs.
     let sorted_implied: Vec<bool> = perm.iter().map(|&i| dose_implied[i]).collect();
     // Implied doses governed by an observation / pk-only row, as `(dose, record)`: the
     // #1810 / #614 passes below may still move that record's engine time one ULP, so
@@ -3930,11 +3084,8 @@ fn parse_subject(
                 Rec::PkOnly(m) => (pk_only_raw_times[m], pk_only_times[m]),
                 Rec::Reset(r) => (written_at(reset_times[r]), reset_times[r]),
             };
-            sorted_doses[k].implied = Some(crate::types::ImpliedDose {
-                parent,
-                param_time,
-                gov_time,
-            });
+            sorted_doses[k].implied =
+                Some(crate::types::ImpliedDose { parent, param_time, gov_time });
             match rec {
                 Rec::Obs(j) => gov_by_obs.push((k, j)),
                 Rec::PkOnly(m) => gov_by_pk_only.push((k, m)),
@@ -3964,19 +3115,13 @@ fn parse_subject(
         }
     }
 
-    // Reset events are recorded in row order. The occasion shift above already forces
-    // every reset past `max_eff_time`, so `reset_times` leaves the row loop strictly
-    // ascending and this permutation is the identity today — it is kept because the
-    // covariate snapshots must ride whatever permutation the sort produces (#1133):
-    // sorting the times alone would silently pair each reset with another reset's `$PK`
-    // row if that invariant ever changed. Skipped outright while the order already holds,
-    // so the common path does not deep-clone one `HashMap` per reset for nothing.
+    // Resets are already ascending (the occasion shift), so this permutation is the
+    // identity today; kept so the covariate snapshots ride any reorder (#1133), and
+    // skipped while the order holds.
     if !reset_times.windows(2).all(|w| w[0] <= w[1]) {
         let mut rperm: Vec<usize> = (0..reset_times.len()).collect();
         rperm.cold_sort_by(&|&a, &b| {
-            reset_times[a]
-                .partial_cmp(&reset_times[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            reset_times[a].partial_cmp(&reset_times[b]).unwrap_or(std::cmp::Ordering::Equal)
         });
         reset_times = rperm.iter().map(|&i| reset_times[i]).collect();
         if any_tv {
@@ -3993,11 +3138,8 @@ fn parse_subject(
     if cmt_toggles.iter().all(|c| c.on) {
         cmt_toggles.clear();
     }
-    let dose_ties: Vec<(f64, usize)> = sorted_doses
-        .iter()
-        .zip(&sorted_dose_rec)
-        .map(|(d, &r)| (d.time, r))
-        .collect();
+    let dose_ties: Vec<(f64, usize)> =
+        sorted_doses.iter().zip(&sorted_dose_rec).map(|(d, &r)| (d.time, r)).collect();
     order_cmt_toggle_ties(
         &cmt_toggles,
         &dose_ties,
@@ -4014,37 +3156,17 @@ fn parse_subject(
     })?;
 
     // ── Honor NONMEM record order for the record that ends an interval (#1810) ──
-    // NONMEM advances the system into a shared TIME once, at the first record there in
-    // file order, under that record's `$PK` values; every later record at that TIME
-    // advances by zero. ferx's engines order co-timed records by kind (`kind_order`:
-    // Reset < DoseRecord < Dose < PkOnly < Obs, a stable sort within a kind), and the
-    // first event at a tie integrates `(t_prev, t]` under its own snapshot. The two
-    // agree whenever the file lists the kinds in that order. The #614 pass below covers
-    // an observation listed before a dose. This one covers the two ties it leaves out,
-    // both involving a pk-only row (EVID=2, or EVID=0/MDV=1):
+    // NONMEM advances into a shared TIME once, at the first record there in file
+    // order, under its `$PK`. The engines order ties by kind (`kind_order`: Reset <
+    // DoseRecord < Dose < PkOnly < Obs). This pass covers the two pk-only ties #614
+    // leaves out: an observation listed before a pk-only row, and a pk-only row
+    // listed before a dose. The first record moves one ULP below the tie (enough,
+    // since an observation sorts last); two observations may then sit one ULP apart
+    // (`ode::predictions::segment_saveat`).
     //
-    // - an observation listed before it, which the engines put after it, so the
-    //   pk-only row's covariates governed the segment the observation should;
-    // - it listed before a dose, which the engines put ahead of it, so the dose row's
-    //   covariates governed the segment instead.
-    //
-    // The remedy is #614's: the first record moves one ULP below the tie, so every
-    // engine reaches it first. Only the first record needs moving, since the later
-    // records at the tie advance by zero in NONMEM and by the sub-ULP remainder here.
-    // That leaves two observations one ULP apart whenever the tie holds more than one,
-    // which the ODE engines must save as two points (`ode::predictions::segment_saveat`).
-    // One ULP is always enough, too: the #614 pass below moves only observations, and an
-    // observation sorts last among the kinds, so a pk-only row sharing its ULP still
-    // goes first.
-    //
-    // A tie that carries a reset is left alone: the reset replaces the state at the tie,
-    // so which record governs the advance into it does not matter. An SS dose is not
-    // exempt (#2510). A record listed before it reads the state carried from the previous
-    // record (NONMEM 7.5.1, `nonmem_anchor/dtmm_ss_record_order.ctl`), and that state
-    // depends on which record advanced the system there. Doses are never moved.
-    // `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
-    // This runs before #614, which then finds no dose at a moved observation's time
-    // and leaves it alone.
+    // Ties carrying a reset are left alone. SS doses are not exempt (#2510,
+    // `nonmem_anchor/dtmm_ss_record_order.ctl`). Doses never move; `obs_raw_times`
+    // keep the written TIME. Runs before #614.
     if !pk_only_times.is_empty() {
         let mut tie_times = pk_only_times.clone();
         tie_times.sort_by(f64::total_cmp);
@@ -4073,11 +3195,8 @@ fn parse_subject(
                 Some(j) if obs_rec[j] < pk_rec && before_doses(obs_rec[j]) => {
                     obs_times[j] = t.next_down();
                 }
-                // The pk-only row is ahead of a dose: the engines would put the dose
-                // ahead of it. (Without a dose it is already first.) It is then the first
-                // record, without testing the observations: an observation listed before
-                // it took the arm above, unless a dose precedes that observation, and then
-                // `before_doses(pk_rec)` fails too.
+                // The pk-only row precedes a dose, so it is the first record (an
+                // earlier observation took the arm above).
                 _ if dose_first_rec.is_some() && before_doses(pk_rec) => {
                     pk_only_times[m] = t.next_down();
                 }
@@ -4087,42 +3206,19 @@ fn parse_subject(
     }
 
     // ── Honor NONMEM record order for a same-TIME observation/dose ──────────
-    // NONMEM processes data records in file order: an observation listed BEFORE
-    // a dose at the *same* TIME is a pre-dose (trough) sample and must not see
-    // that dose; one listed AFTER is a post-dose sample that does. ferx's
-    // solvers instead order events by time, and at equal time place the dose
-    // first — both the event-driven sort (`kind_order`: Dose < Obs) and the
-    // analytical superposition gate (`t_eff <= t`, so a dose at exactly the obs
-    // time contributes). That turns every coincident trough into a post-dose
-    // peak (e.g. infliximab run55: eval OFV 3751 vs NONMEM 662), railing fits to
-    // their bounds.
+    // An observation listed BEFORE a dose at the same TIME is a trough and must not
+    // see it; the solvers place the dose first (`kind_order`, and `t_eff <= t` in
+    // superposition), which turned troughs into peaks (infliximab run55: OFV 3751 vs
+    // NONMEM 662). A "pure trough" (every coincident dose after it in the file) is
+    // nudged one ULP below the dose; `obs_raw_times` are untouched.
     //
-    // We restore record-order semantics by nudging a pre-dose observation one
-    // ULP below the coincident dose time, so both solver paths evaluate it just
-    // before the dose. The change is numerically inert for the prediction (a
-    // single ULP) and leaves `obs_raw_times` — the user-clock value reported in
-    // sdtab/covtab and by predict()/simulate() — untouched.
+    // SS doses are included (#2510, `nonmem_anchor/dtmm_ss_record_order.ctl`): one
+    // ULP below reads the carried state, as NONMEM does.
     //
-    // Only a "pure trough" is nudged: every coincident dose comes *after* the
-    // observation in the file. If any coincident dose precedes the observation (a
-    // genuine post-dose sample, or a rare dose/obs/dose straddle) it is left alone.
-    //
-    // Steady-state doses are included (#2510). NONMEM 7.5.1
-    // (`nonmem_anchor/dtmm_ss_record_order.ctl`) reads a record listed before an SS=1
-    // dose from the amounts carried from the previous record: the initial state (0, or the
-    // `init()` value) before a first SS dose, the prior history before a later one. The SS dose's implied pulse train contributes
-    // nothing before its own record (`docs/model-file/steady-state.qmd`), so one ULP
-    // below the dose is exactly that carried state. Until #2510 SS doses were excluded,
-    // and such an observation read the post-dose steady state.
-    //
-    // A reset at the tie moves with the observation (#2728). The reader shifts a reset
-    // past every record before it (`time_offset` above), so a reset at the tie is always
-    // its first record, and an observation there was listed after it: NONMEM scores it on
-    // the reset state. Moved alone, one ULP below the tie, it would sit below the reset
-    // too and read the state from before it (on #2728's fixture, OFV 1007 against
-    // NONMEM's 38.8). Moving the reset to the same ULP keeps it first there, since the
-    // engines order a reset ahead of an observation at one time (`kind_order`). The reset
-    // keeps the `TIME` it was written at for its `$PK` (`reset_period_times`, below).
+    // A reset at the tie moves with the observation (#2728): it is always the tie's
+    // first record, and moved alone the observation would read the pre-reset state
+    // (#2728 fixture: OFV 1007 vs NONMEM 38.8). The reset keeps its written `TIME`
+    // for `$PK` (`reset_period_times`).
     let mut moved_reset_ties: Vec<f64> = Vec::new();
     for j in 0..obs_times.len() {
         let t = obs_times[j];
@@ -4144,10 +3240,8 @@ fn parse_subject(
             }
         }
     }
-    // The engine time moves and the written time does not, so both the reset's new engine
-    // time and the tie's (where the doses stay) need a row in `reset_period_times`:
-    // without the second, `period_written_time` would read a dose at the tie through the
-    // reset's one-ULP offset, one ULP late.
+    // Both the reset's new engine time and the tie's need a `reset_period_times` row,
+    // else a dose at the tie would be read one ULP late.
     for t in moved_reset_ties {
         let written = crate::types::period_written_time(&reset_period_times, t);
         for r in reset_times.iter_mut().filter(|r| **r == t) {
@@ -4159,10 +3253,8 @@ fn parse_subject(
         reset_period_times.dedup();
     }
 
-    // The engine time an implied dose's occasion is read at is its governing record's as
-    // the subject holds it (#2371): after the two passes above, which move times in place,
-    // so the indices recorded by the #1909 pass still name the same records. Doses are
-    // never moved; a reset moves only with a trough at its tie (#2728).
+    // An implied dose's occasion is read at its governing record's engine time
+    // after the passes above (#2371), which only move times in place.
     for (k, j) in gov_by_obs {
         if let Some(i) = sorted_doses[k].implied.as_mut() {
             i.gov_time = obs_times[j];
@@ -4179,10 +3271,8 @@ fn parse_subject(
         }
     }
 
-    // Flush any remaining pending TTE left-bounds as right-censored events.
-    // This handles the common case: final row is a right-censored DV=0 with no
-    // following DV=2 — the subject was censored at its last observation time.
-    // Emitted in data-row order (see `tte_pending`), never in CMT or hash order.
+    // Flush pending TTE left-bounds as right-censored events (censored at the last
+    // observation), in data-row order.
     #[cfg(feature = "survival")]
     for (cmt, (t_left, e_left)) in tte_pending {
         obs_records.push(crate::types::ObsRecord::Event {

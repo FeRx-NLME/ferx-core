@@ -105,9 +105,7 @@ fn first_order_alag_focei_matches_nonmem() {
     const NONMEM_OFV: f64 = -1046.6853;
     const OFV_TOLERANCE: f64 = 0.5;
 
-    let model = parse_full_model(MODEL)
-        .expect("first_order()+ALAG1 model must parse")
-        .model;
+    let model = parse_full_model(MODEL).expect("first_order()+ALAG1 model must parse").model;
     let pop = read_nonmem_csv(Path::new("data/first_order_alag.csv"), None, None)
         .expect("first_order_alag data must load");
 

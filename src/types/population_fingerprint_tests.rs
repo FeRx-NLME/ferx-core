@@ -15,13 +15,9 @@ fn cov(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
 fn subject() -> Subject {
     let mut modeled = DoseEvent::modeled(12.0, 50.0, 2, true, 24.0, RateMode::ModeledRate);
     modeled.rate = 0.0;
-    modeled.implied = Some(crate::types::ImpliedDose {
-        parent: 0,
-        param_time: 12.0,
-        gov_time: 12.0,
-    });
+    modeled.implied =
+        Some(crate::types::ImpliedDose { parent: 0, param_time: 12.0, gov_time: 12.0 });
     Subject {
-        obs_rgroup: Vec::new(),
         id: "7".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0), modeled],
         obs_times: vec![1.0, 2.0],
@@ -32,12 +28,9 @@ fn subject() -> Subject {
         dose_covariates: vec![cov(&[("WT", 70.0)]), cov(&[("WT", 71.0)])],
         obs_covariates: vec![cov(&[("WT", 70.0)]), cov(&[("WT", 72.0)])],
         pk_only_times: vec![5.0],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
         pk_only_covariates: vec![cov(&[("WT", 73.0)])],
         reset_times: vec![30.0],
         reset_covariates: vec![cov(&[("WT", 74.0)])],
-        cmt_toggles: Vec::new(),
         cens: vec![0, 1],
         occasions: vec![1, 2],
         obs_l2: vec![0, 3],
@@ -46,32 +39,19 @@ fn subject() -> Subject {
         pk_only_occasions: vec![2],
         fremtype: vec![0, 100],
         obs_records: vec![
-            ObsRecord::DiscreteState {
-                time: 4.0,
-                raw_time: 4.0,
-                state: 1,
-                cmt: 3,
-            },
-            ObsRecord::Count {
-                time: 6.0,
-                raw_time: 6.0,
-                count: 2,
-                cmt: 4,
-            },
+            ObsRecord::DiscreteState { time: 4.0, raw_time: 4.0, state: 1, cmt: 3 },
+            ObsRecord::Count { time: 6.0, raw_time: 6.0, count: 2, cmt: 4 },
             #[cfg(feature = "survival")]
             ObsRecord::Event {
                 time: 8.0,
-                event_type: EventType::IntervalCensored {
-                    left: 7.0,
-                    right: 8.0,
-                },
+                event_type: EventType::IntervalCensored { left: 7.0, right: 8.0 },
                 entry_time: 0.5,
                 cmt: 5,
             },
         ],
         endpoint_covariates: vec![cov(&[("WT", 76.0)])],
         filled_cells: vec![("WT".to_string(), 3.0)],
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -162,58 +142,30 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
             },
             Row::Covariates,
         ),
-        (
-            "filled_cells",
-            |s| s.filled_cells[0].1 = 4.0,
-            Row::Covariates,
-        ),
+        ("filled_cells", |s| s.filled_cells[0].1 = 4.0, Row::Covariates),
         ("cens", |s| s.cens[1] = -1, Row::Records),
         ("occasions", |s| s.occasions[1] = 3, Row::Records),
         ("obs_l2", |s| s.obs_l2[1] = 4, Row::Records),
         ("dose_occasions", |s| s.dose_occasions[1] = 3, Row::Doses),
-        (
-            "reset_occasions",
-            |s| s.reset_occasions[0] = 3,
-            Row::Records,
-        ),
-        (
-            "pk_only_occasions",
-            |s| s.pk_only_occasions[0] = 3,
-            Row::Records,
-        ),
+        ("reset_occasions", |s| s.reset_occasions[0] = 3, Row::Records),
+        ("pk_only_occasions", |s| s.pk_only_occasions[0] = 3, Row::Records),
         ("fremtype", |s| s.fremtype[1] = 200, Row::Records),
-        (
-            "obs_records (count)",
-            |s| s.obs_records.truncate(1),
-            Row::Records,
-        ),
+        ("obs_records (count)", |s| s.obs_records.truncate(1), Row::Records),
         // DoseEvent, one row per field, on the second (modeled) dose.
         ("DoseEvent.time", |s| s.doses[1].time = 13.0, Row::Doses),
         ("DoseEvent.amt", |s| s.doses[1].amt = 51.0, Row::Doses),
         ("DoseEvent.cmt", |s| s.doses[1].cmt = 1, Row::Doses),
         ("DoseEvent.rate", |s| s.doses[1].rate = 1.0, Row::Doses),
-        (
-            "DoseEvent.duration",
-            |s| s.doses[1].duration = 1.0,
-            Row::Doses,
-        ),
+        ("DoseEvent.duration", |s| s.doses[1].duration = 1.0, Row::Doses),
         ("DoseEvent.ss", |s| s.doses[1].ss = false, Row::Doses),
         ("DoseEvent.ii", |s| s.doses[1].ii = 12.0, Row::Doses),
-        (
-            "DoseEvent.rate_mode",
-            |s| s.doses[1].rate_mode = RateMode::ModeledDuration,
-            Row::Doses,
-        ),
+        ("DoseEvent.rate_mode", |s| s.doses[1].rate_mode = RateMode::ModeledDuration, Row::Doses),
         (
             "DoseEvent.infusion_def",
             |s| s.doses[1].infusion_def = InfusionDef::DurationDefined,
             Row::Doses,
         ),
-        (
-            "DoseEvent.implied (presence)",
-            |s| s.doses[1].implied = None,
-            Row::Doses,
-        ),
+        ("DoseEvent.implied (presence)", |s| s.doses[1].implied = None, Row::Doses),
         (
             "DoseEvent.implied.parent",
             |s| s.doses[1].implied.as_mut().unwrap().parent = 1,
@@ -225,66 +177,23 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
             Row::Doses,
         ),
         // ObsRecord, one row per field of each variant.
-        (
-            "DiscreteState.time",
-            |s| set_discrete(s, |t, _, _, _| *t = 4.5),
-            Row::Records,
-        ),
-        (
-            "DiscreteState.raw_time",
-            |s| set_discrete(s, |_, r, _, _| *r = 4.5),
-            Row::Records,
-        ),
-        (
-            "DiscreteState.state",
-            |s| set_discrete(s, |_, _, x, _| *x = 0),
-            Row::Records,
-        ),
-        (
-            "DiscreteState.cmt",
-            |s| set_discrete(s, |_, _, _, c| *c = 9),
-            Row::Records,
-        ),
-        (
-            "Count.time",
-            |s| set_count(s, |t, _, _, _| *t = 6.5),
-            Row::Records,
-        ),
-        (
-            "Count.raw_time",
-            |s| set_count(s, |_, r, _, _| *r = 6.5),
-            Row::Records,
-        ),
-        (
-            "Count.count",
-            |s| set_count(s, |_, _, x, _| *x = 3),
-            Row::Records,
-        ),
-        (
-            "Count.cmt",
-            |s| set_count(s, |_, _, _, c| *c = 9),
-            Row::Records,
-        ),
+        ("DiscreteState.time", |s| set_discrete(s, |t, _, _, _| *t = 4.5), Row::Records),
+        ("DiscreteState.raw_time", |s| set_discrete(s, |_, r, _, _| *r = 4.5), Row::Records),
+        ("DiscreteState.state", |s| set_discrete(s, |_, _, x, _| *x = 0), Row::Records),
+        ("DiscreteState.cmt", |s| set_discrete(s, |_, _, _, c| *c = 9), Row::Records),
+        ("Count.time", |s| set_count(s, |t, _, _, _| *t = 6.5), Row::Records),
+        ("Count.raw_time", |s| set_count(s, |_, r, _, _| *r = 6.5), Row::Records),
+        ("Count.count", |s| set_count(s, |_, _, x, _| *x = 3), Row::Records),
+        ("Count.cmt", |s| set_count(s, |_, _, _, c| *c = 9), Row::Records),
         (
             "DiscreteState → Count (variant tag)",
-            |s| {
-                s.obs_records[0] = ObsRecord::Count {
-                    time: 4.0,
-                    raw_time: 4.0,
-                    count: 1,
-                    cmt: 3,
-                }
-            },
+            |s| s.obs_records[0] = ObsRecord::Count { time: 4.0, raw_time: 4.0, count: 1, cmt: 3 },
             Row::Records,
         ),
     ];
     #[cfg(feature = "survival")]
     rows.extend::<[(&'static str, Perturb, Row); 6]>([
-        (
-            "Event.time",
-            |s| set_event(s, |t, _, _, _| *t = 8.5),
-            Row::Records,
-        ),
+        ("Event.time", |s| set_event(s, |t, _, _, _| *t = 8.5), Row::Records),
         (
             "Event.event_type (variant)",
             |s| set_event(s, |_, e, _, _| *e = EventType::Exact),
@@ -294,10 +203,7 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
             "Event.event_type (left)",
             |s| {
                 set_event(s, |_, e, _, _| {
-                    *e = EventType::IntervalCensored {
-                        left: 6.0,
-                        right: 8.0,
-                    }
+                    *e = EventType::IntervalCensored { left: 6.0, right: 8.0 }
                 })
             },
             Row::Records,
@@ -306,37 +212,20 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
             "Event.event_type (right)",
             |s| {
                 set_event(s, |_, e, _, _| {
-                    *e = EventType::IntervalCensored {
-                        left: 7.0,
-                        right: 9.0,
-                    }
+                    *e = EventType::IntervalCensored { left: 7.0, right: 9.0 }
                 })
             },
             Row::Records,
         ),
-        (
-            "Event.entry_time",
-            |s| set_event(s, |_, _, en, _| *en = 0.25),
-            Row::Records,
-        ),
-        (
-            "Event.cmt",
-            |s| set_event(s, |_, _, _, c| *c = 9),
-            Row::Records,
-        ),
+        ("Event.entry_time", |s| set_event(s, |_, _, en, _| *en = 0.25), Row::Records),
+        ("Event.cmt", |s| set_event(s, |_, _, _, c| *c = 9), Row::Records),
     ]);
     rows
 }
 
 fn set_discrete(s: &mut Subject, f: impl FnOnce(&mut f64, &mut f64, &mut usize, &mut usize)) {
     for o in &mut s.obs_records {
-        if let ObsRecord::DiscreteState {
-            time,
-            raw_time,
-            state,
-            cmt,
-        } = o
-        {
+        if let ObsRecord::DiscreteState { time, raw_time, state, cmt } = o {
             return f(time, raw_time, state, cmt);
         }
     }
@@ -345,13 +234,7 @@ fn set_discrete(s: &mut Subject, f: impl FnOnce(&mut f64, &mut f64, &mut usize, 
 
 fn set_count(s: &mut Subject, f: impl FnOnce(&mut f64, &mut f64, &mut u32, &mut usize)) {
     for o in &mut s.obs_records {
-        if let ObsRecord::Count {
-            time,
-            raw_time,
-            count,
-            cmt,
-        } = o
-        {
+        if let ObsRecord::Count { time, raw_time, count, cmt } = o {
             return f(time, raw_time, count, cmt);
         }
     }
@@ -361,13 +244,7 @@ fn set_count(s: &mut Subject, f: impl FnOnce(&mut f64, &mut f64, &mut u32, &mut 
 #[cfg(feature = "survival")]
 fn set_event(s: &mut Subject, f: impl FnOnce(&mut f64, &mut EventType, &mut f64, &mut usize)) {
     for o in &mut s.obs_records {
-        if let ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            cmt,
-        } = o
-        {
+        if let ObsRecord::Event { time, event_type, entry_time, cmt } = o {
             return f(time, event_type, entry_time, cmt);
         }
     }
@@ -419,15 +296,10 @@ fn differences_report_their_counts() {
     let fp = PopulationFingerprint::of(&base);
 
     let mut s = subject();
-    s.doses
-        .push(DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0));
+    s.doses.push(DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0));
     assert_eq!(
         fp.first_difference(&population(vec![s])),
-        Some(Difference::Doses {
-            id: "7".into(),
-            population: 3,
-            fit: 2
-        })
+        Some(Difference::Doses { id: "7".into(), population: 3, fit: 2 })
     );
 
     let mut s = subject();
@@ -437,19 +309,12 @@ fn differences_report_their_counts() {
     let n = 2 + subject().obs_records.len();
     assert_eq!(
         fp.first_difference(&population(vec![s])),
-        Some(Difference::Records {
-            id: "7".into(),
-            population: n + 1,
-            fit: n
-        })
+        Some(Difference::Records { id: "7".into(), population: n + 1, fit: n })
     );
 
     assert_eq!(
         fp.first_difference(&population(vec![subject(), subject()])),
-        Some(Difference::SubjectCount {
-            population: 2,
-            fit: 1
-        })
+        Some(Difference::SubjectCount { population: 2, fit: 1 })
     );
 
     let mut renamed = population(vec![subject()]);
@@ -468,31 +333,18 @@ fn differences_report_their_counts() {
     s.observations[0] = 9.0;
     s.doses[0].amt = 1.0;
     s.covariates.insert("WT".into(), 1.0);
-    assert!(matches!(
-        fp.first_difference(&population(vec![s])),
-        Some(Difference::Records { .. })
-    ));
+    assert!(matches!(fp.first_difference(&population(vec![s])), Some(Difference::Records { .. })));
     let mut s = subject();
     s.doses[0].amt = 1.0;
     s.covariates.insert("WT".into(), 1.0);
-    assert!(matches!(
-        fp.first_difference(&population(vec![s])),
-        Some(Difference::Doses { .. })
-    ));
+    assert!(matches!(fp.first_difference(&population(vec![s])), Some(Difference::Doses { .. })));
 
     // An edited dose leaves the count equal, and equal counts are not a
     // contradiction: "differ: 2 … 2" was the #1813 wording (P6).
     let mut s = subject();
     s.doses[0].amt = 1.0;
     let d = fp.first_difference(&population(vec![s])).unwrap();
-    assert_eq!(
-        d,
-        Difference::Doses {
-            id: "7".into(),
-            population: 2,
-            fit: 2
-        }
-    );
+    assert_eq!(d, Difference::Doses { id: "7".into(), population: 2, fit: 2 });
     assert_eq!(
         d.to_string(),
         "the doses of subject `7` differ with the same 2 doses: a dose time, amount, \
@@ -596,11 +448,7 @@ fn derived_occasion_labels_are_left_out_only_when_the_fit_derives_them() {
     for (name, relabel) in relabellings {
         let mut one = base.clone();
         relabel(&mut one.subjects[0]);
-        assert_eq!(
-            derived.first_difference(&one),
-            None,
-            "{name}: derived rule leaves it out"
-        );
+        assert_eq!(derived.first_difference(&one), None, "{name}: derived rule leaves it out");
         assert!(
             matches!(
                 column.first_difference(&one),
@@ -619,10 +467,7 @@ fn derived_occasion_labels_are_left_out_only_when_the_fit_derives_them() {
     let mut other = relabelled.clone();
     other.subjects[0].observations[0] = 9.0;
     assert!(
-        matches!(
-            derived.first_difference(&other),
-            Some(Difference::Records { .. })
-        ),
+        matches!(derived.first_difference(&other), Some(Difference::Records { .. })),
         "the rest of the records still count"
     );
 }

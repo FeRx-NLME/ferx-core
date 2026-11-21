@@ -84,18 +84,11 @@ fn model(grouping: Grouping, line: &str) -> String {
             "",
         ),
     };
-    let kappa = if levels.contains("kappa") {
-        " + K_E0"
-    } else {
-        ""
-    };
+    let kappa = if levels.contains("kappa") { " + K_E0" } else { "" };
     let (rho, line) = if line.is_empty() {
         (String::new(), String::new())
     } else {
-        (
-            "  theta RHO(0.3, 0.0, 0.95)\n".to_string(),
-            format!("  {line}\n"),
-        )
+        ("  theta RHO(0.3, 0.0, 0.95)\n".to_string(), format!("  {line}\n"))
     };
     format!(
         "model seq\n[parameters]\n  theta TVE0(10.0, 0.1, 100.0)\n  theta TVSL(0.5, -10.0, 10.0)\n\
@@ -109,10 +102,7 @@ fn model(grouping: Grouping, line: &str) -> String {
 
 fn run(src: &str, data: &str, outer_maxiter: usize) -> (Population, FitResult) {
     let parsed = parse_full_model(src).unwrap_or_else(|e| panic!("model parses: {e}\n{src}"));
-    assert!(
-        parsed.model.is_algebraic(),
-        "the fixture is compartment-free"
-    );
+    assert!(parsed.model.is_algebraic(), "the fixture is compartment-free");
     let (pop, _) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
@@ -123,18 +113,13 @@ fn run(src: &str, data: &str, outer_maxiter: usize) -> (Population, FitResult) {
         &parsed.column_map,
     )
     .expect("data loads");
-    let opts = FitOptions {
-        outer_maxiter,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    };
+    let opts =
+        FitOptions { outer_maxiter, run_covariance_step: false, ..parsed.fit_options.clone() };
     let r = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
         .unwrap_or_else(|e| panic!("the model must fit: {e}\n{src}"));
     assert!(r.ofv.is_finite(), "OFV {}", r.ofv);
     assert!(
-        r.subjects
-            .iter()
-            .all(|s| s.iwres.iter().all(|e| e.is_finite())),
+        r.subjects.iter().all(|s| s.iwres.iter().all(|e| e.is_finite())),
         "every IWRES must be finite"
     );
     (pop, r)
@@ -156,10 +141,7 @@ fn dw_warnings(r: &FitResult) -> Vec<&String> {
 /// ULP here (measured 1.8e-14 on −13.84488). A live line moves it by 36 or more.
 fn assert_same_objective(with: f64, without: f64, label: &str) {
     assert!(with.is_finite() && without.is_finite(), "{label}");
-    assert!(
-        (with - without).abs() < 1e-10,
-        "{label}: {with} vs {without}"
-    );
+    assert!((with - without).abs() < 1e-10, "{label}: {with} vs {without}");
 }
 
 /// The one Durbin–Watson warning of `r`.
@@ -222,10 +204,7 @@ fn occasions_in_time_are_advised_a_line_by_the_subject() {
                 assert!(occasions_follow_in_time(&pop), "{label}");
             }
             assert_eq!(
-                pop.subjects
-                    .iter()
-                    .map(|s| s.observations.len())
-                    .sum::<usize>(),
+                pop.subjects.iter().map(|s| s.observations.len()).sum::<usize>(),
                 rows,
                 "{label}"
             );
@@ -235,10 +214,7 @@ fn occasions_in_time_are_advised_a_line_by_the_subject() {
             assert!((r.dw_statistic - want).abs() < 1e-12, "{label}: {want}");
             assert!(r.dw_statistic < 1.5, "{label}: DW {}", r.dw_statistic);
             let msg = the_dw_warning(&r, &label);
-            eprintln!(
-                "{label}: OFV {:.6} DW {:.6}\n  {msg}",
-                r.ofv, r.dw_statistic
-            );
+            eprintln!("{label}: OFV {:.6} DW {:.6}\n  {msg}", r.ofv, r.dw_statistic);
             for must in [
                 "Positive IWRES autocorrelation detected",
                 "across its occasions too",
@@ -249,14 +225,7 @@ fn occasions_in_time_are_advised_a_line_by_the_subject() {
             ] {
                 assert!(msg.contains(must), "{label}: missing `{must}`: {msg}");
             }
-            for banned in [
-                "by OCC",
-                "by PER",
-                "by COL",
-                "kappa",
-                "`level`",
-                "labels the group",
-            ] {
+            for banned in ["by OCC", "by PER", "by COL", "kappa", "`level`", "labels the group"] {
                 assert!(!msg.contains(banned), "{label}: `{banned}` in {msg}");
             }
         }
@@ -283,20 +252,13 @@ fn a_line_by_the_occasions_is_inert_and_the_warning_names_the_subject_line() {
         let without = evaluate(&model(g, ""), SPARSE);
         for kind in ["ar1", "car1"] {
             let label = format!("{g:?} {kind}");
-            let with = evaluate(
-                &model(g, &format!("correlation {kind}(RHO) by OCC")),
-                SPARSE,
-            );
+            let with = evaluate(&model(g, &format!("correlation {kind}(RHO) by OCC")), SPARSE);
             eprintln!(
                 "sparse {label} by OCC: OFV {:.6} (no line {:.6}) DW {}",
                 with.ofv, without.ofv, with.dw_statistic
             );
             assert_same_objective(with.ofv, without.ofv, &label);
-            assert!(
-                with.dw_statistic.is_finite(),
-                "{label}: {}",
-                with.dw_statistic
-            );
+            assert!(with.dw_statistic.is_finite(), "{label}: {}", with.dw_statistic);
             // Measured: the two agree in every printed digit (0.9363753830495355).
             assert!(
                 (with.dw_statistic - without.dw_statistic).abs() < 1e-9,
@@ -322,10 +284,7 @@ fn a_line_by_the_occasions_is_inert_and_the_warning_names_the_subject_line() {
                 with.warnings
             );
         }
-        assert!(
-            without.dw_statistic < 1.5,
-            "{g:?}: the model without it warns"
-        );
+        assert!(without.dw_statistic < 1.5, "{g:?}: the model without it warns");
     }
 }
 
@@ -372,18 +331,12 @@ fn the_advised_line_fits_and_keeps_the_warning_live() {
             assert!(with.dw_statistic.is_finite(), "{label}");
             assert!(with.dw_statistic < 1.5, "{label}: DW {}", with.dw_statistic);
             assert_eq!(
-                with.subjects
-                    .iter()
-                    .map(|s| s.iwres.len() - 1)
-                    .sum::<usize>(),
+                with.subjects.iter().map(|s| s.iwres.len() - 1).sum::<usize>(),
                 pairs,
                 "{label}: one block per subject keeps every pair"
             );
             let msg = the_dw_warning(&with, &label);
-            assert!(
-                msg.contains(&format!("decorrelated by `{line}`")),
-                "{label}: {msg}"
-            );
+            assert!(msg.contains(&format!("decorrelated by `{line}`")), "{label}: {msg}");
             assert!(
                 !with
                     .warnings
@@ -423,16 +376,8 @@ fn with_several_rows_per_occasion_the_subject_line_reaches_further() {
             "rich {g:?}: no line {:.6}, by OCC {:.6} (DW {:.6}), by ID {:.6} (DW {:.6})",
             without.ofv, by_occ.ofv, by_occ.dw_statistic, by_id.ofv, by_id.dw_statistic
         );
-        assert!(
-            by_occ.ofv < without.ofv - 10.0,
-            "{g:?}: `by OCC` is live here"
-        );
-        assert!(
-            by_id.ofv < by_occ.ofv - 5.0,
-            "{g:?}: {} vs {}",
-            by_id.ofv,
-            by_occ.ofv
-        );
+        assert!(by_occ.ofv < without.ofv - 10.0, "{g:?}: `by OCC` is live here");
+        assert!(by_id.ofv < by_occ.ofv - 5.0, "{g:?}: {} vs {}", by_id.ofv, by_occ.ofv);
         assert!(by_occ.dw_statistic.is_finite() && by_id.dw_statistic.is_finite());
         // 0.16 separates the two splits; the bound leaves the platform 0.02.
         assert!(
@@ -468,13 +413,7 @@ fn a_text_id_is_advised_a_numeric_subject_column() {
     let rows: Vec<String> = text
         .lines()
         .enumerate()
-        .map(|(i, l)| {
-            if i == 0 {
-                l.to_string()
-            } else {
-                format!("S{l}")
-            }
-        })
+        .map(|(i, l)| if i == 0 { l.to_string() } else { format!("S{l}") })
         .collect();
     let dir = std::env::temp_dir().join(format!(
         "ferx_dw_advice_text_id_{}_{:?}",
@@ -502,24 +441,13 @@ fn a_text_id_is_advised_a_numeric_subject_column() {
     let by_id = evaluate(&model(g, "correlation ar1(RHO) by ID"), data);
     assert_same_objective(by_id.ofv, without.ofv, "`by ID` on a text id is inert");
     assert!(
-        by_id
-            .warnings
-            .iter()
-            .any(|w| w.contains("no block holds more than one observation")),
+        by_id.warnings.iter().any(|w| w.contains("no block holds more than one observation")),
         "{:#?}",
         by_id.warnings
     );
     let by_unit = evaluate(&model(g, "correlation ar1(RHO) by UNIT"), data);
-    eprintln!(
-        "text id: no line {:.6}, by UNIT {:.6}",
-        without.ofv, by_unit.ofv
-    );
-    assert!(
-        by_unit.ofv < without.ofv - 10.0,
-        "{} vs {}",
-        by_unit.ofv,
-        without.ofv
-    );
+    eprintln!("text id: no line {:.6}, by UNIT {:.6}", without.ofv, by_unit.ofv);
+    assert!(by_unit.ofv < without.ofv - 10.0, "{} vs {}", by_unit.ofv, without.ofv);
     assert!(by_unit.dw_statistic.is_finite());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -534,10 +462,7 @@ fn a_text_id_is_advised_a_numeric_subject_column() {
 /// ρ̂ 0.8152 (the data were drawn at 0.7), DW 2.1623. The bounds below leave the
 /// estimate ±0.15 and the drop 36 of its 86 points.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_advised_line_converges_and_resolves_the_warning() {
     let g = Grouping::IovColumn;
     let (_, without) = run(&model(g, ""), SPARSE, 200);
@@ -570,22 +495,10 @@ fn the_advised_line_converges_and_resolves_the_warning() {
         without.dw_statistic
     );
     let msg = the_dw_warning(&by_occ, "converged by OCC");
-    assert!(
-        msg.contains("A line `by ID` correlates all rows of one subject."),
-        "{msg}"
-    );
-    assert!(
-        by_id.ofv < without.ofv - 50.0,
-        "{} vs {}",
-        by_id.ofv,
-        without.ofv
-    );
+    assert!(msg.contains("A line `by ID` correlates all rows of one subject."), "{msg}");
+    assert!(by_id.ofv < without.ofv - 50.0, "{} vs {}", by_id.ofv, without.ofv);
     assert!((rho(&by_id) - 0.8152).abs() < 0.15, "rho {}", rho(&by_id));
-    assert!(
-        (1.5..=2.5).contains(&by_id.dw_statistic),
-        "DW {}",
-        by_id.dw_statistic
-    );
+    assert!((1.5..=2.5).contains(&by_id.dw_statistic), "DW {}", by_id.dw_statistic);
     assert!(dw_warnings(&by_id).is_empty(), "{:#?}", by_id.warnings);
 
     // Three rows per occasion: `by OCC` is live, and `by ID` still reaches further
@@ -605,12 +518,7 @@ fn the_advised_line_converges_and_resolves_the_warning() {
         rho(&rich_id)
     );
     assert!(rich_occ.converged && rich_id.converged);
-    assert!(
-        rich_id.ofv < rich_occ.ofv - 15.0,
-        "{} vs {}",
-        rich_id.ofv,
-        rich_occ.ofv
-    );
+    assert!(rich_id.ofv < rich_occ.ofv - 15.0, "{} vs {}", rich_id.ofv, rich_occ.ofv);
     assert!(dw_warnings(&rich_id).is_empty(), "{:#?}", rich_id.warnings);
 
     // Without a kappa nothing absorbs what an occasion shares, and the margin is
@@ -659,12 +567,7 @@ fn the_advised_line_converges_and_resolves_the_warning() {
         cs_id.ofv,
         no_line.ofv
     );
-    assert!(
-        cs_occ.ofv < cs_id.ofv - 30.0,
-        "{} vs {}",
-        cs_occ.ofv,
-        cs_id.ofv
-    );
+    assert!(cs_occ.ofv < cs_id.ofv - 30.0, "{} vs {}", cs_occ.ofv, cs_id.ofv);
     let msg = the_dw_warning(&cs_occ, "converged, rich, no kappa, cs by OCC");
     assert!(
         msg.contains("between consecutive blocks of `correlation cs(RHO) by OCC`")
@@ -680,10 +583,7 @@ fn the_advised_line_converges_and_resolves_the_warning() {
 fn sparse_with_id_header(test: &str, header: &str) -> (std::path::PathBuf, String) {
     let text = std::fs::read_to_string(SPARSE).expect("fixture");
     let text = text.replacen("ID,", &format!("{header},"), 1);
-    assert!(
-        text.starts_with(&format!("{header},TIME")),
-        "the header row"
-    );
+    assert!(text.starts_with(&format!("{header},TIME")), "the header row");
     let dir = std::env::temp_dir().join(format!("ferx_dw_advice_{test}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("sparse.csv");
@@ -704,21 +604,10 @@ fn the_advice_names_the_subject_column_as_the_data_spell_it() {
     let g = Grouping::IovColumn;
     let without = evaluate(&model(g, ""), &data);
     let msg = the_dw_warning(&without, "header `id`");
-    assert!(
-        msg.contains("`correlation ar1(RHO) by id` line") && !msg.contains("by ID"),
-        "{msg}"
-    );
+    assert!(msg.contains("`correlation ar1(RHO) by id` line") && !msg.contains("by ID"), "{msg}");
     let by_id = evaluate(&model(g, "correlation ar1(RHO) by id"), &data);
-    eprintln!(
-        "header `id`: no line {:.6}, by id {:.6}",
-        without.ofv, by_id.ofv
-    );
-    assert!(
-        by_id.ofv < without.ofv - 10.0,
-        "{} vs {}",
-        by_id.ofv,
-        without.ofv
-    );
+    eprintln!("header `id`: no line {:.6}, by id {:.6}", without.ofv, by_id.ofv);
+    assert!(by_id.ofv < without.ofv - 10.0, "{} vs {}", by_id.ofv, without.ofv);
 
     // The straddle: the spelling the advice must not use is refused on this file.
     let parsed = parse_full_model(&model(g, "correlation ar1(RHO) by ID")).expect("parses");
@@ -732,11 +621,8 @@ fn the_advice_names_the_subject_column_as_the_data_spell_it() {
         &parsed.column_map,
     )
     .expect("data loads");
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    };
+    let opts =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() };
     let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
         .err()
         .expect("`by ID` must be refused on a file whose header is `id`");
@@ -759,27 +645,11 @@ fn a_mapped_subject_column_is_read_by_id() {
     };
     let without = evaluate(&mapped(""), &data);
     let msg = the_dw_warning(&without, "mapped");
-    assert!(
-        msg.contains("`correlation ar1(RHO) by ID` line") && !msg.contains("SUBJ"),
-        "{msg}"
-    );
+    assert!(msg.contains("`correlation ar1(RHO) by ID` line") && !msg.contains("SUBJ"), "{msg}");
     let by_id = evaluate(&mapped("correlation ar1(RHO) by ID"), &data);
     let reference = evaluate(&model(g, "correlation ar1(RHO) by ID"), SPARSE);
-    eprintln!(
-        "mapped ID = SUBJ: by ID {:.6}, on the ID file {:.6}",
-        by_id.ofv, reference.ofv
-    );
-    assert!(
-        by_id.ofv < without.ofv - 10.0,
-        "{} vs {}",
-        by_id.ofv,
-        without.ofv
-    );
-    assert!(
-        (by_id.ofv - reference.ofv).abs() < 1e-9,
-        "{} vs {}",
-        by_id.ofv,
-        reference.ofv
-    );
+    eprintln!("mapped ID = SUBJ: by ID {:.6}, on the ID file {:.6}", by_id.ofv, reference.ofv);
+    assert!(by_id.ofv < without.ofv - 10.0, "{} vs {}", by_id.ofv, without.ofv);
+    assert!((by_id.ofv - reference.ofv).abs() < 1e-9, "{} vs {}", by_id.ofv, reference.ofv);
     let _ = std::fs::remove_dir_all(&dir);
 }
