@@ -2705,6 +2705,8 @@ pub fn ferx_core::stats::vine_copula::VineCopulaOmega::from_init_params(init_par
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::is_selected(&self) -> bool
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::is_zero_fixed(&self, j: usize) -> bool
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::n_free_params(&self) -> usize
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::pack_free_psi(&self) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::vine_copula::VineCopulaOmega::parameter_score(&self, eta: &[f64]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::pit_samples(&self, etas: &[alloc::vec::Vec<f64>]) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::select_structure_and_families(&mut self, pooled_etas: &[alloc::vec::Vec<f64>], n_subjects: usize, weight: f64)
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::to_fit_params(&self, eta_names: &[alloc::string::String]) -> ferx_core::stats::vine_copula::VineFitParams
@@ -2721,8 +2723,10 @@ pub fn ferx_core::stats::vine_copula::VineCopulaOmega::sample(&self, n: usize, r
 pub fn ferx_core::stats::vine_copula::VineCopulaOmega::to_omega_matrix(&self) -> &ferx_core::OmegaMatrix
 pub struct ferx_core::stats::vine_copula::VineFitParams
 pub ferx_core::stats::vine_copula::VineFitParams::marginals: alloc::vec::Vec<ferx_core::stats::marginals::MarginalSummary>
+pub ferx_core::stats::vine_copula::VineFitParams::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::stats::vine_copula::VineFitParams::rvine: ferx_core::stats::vine_copula::RVine
 pub ferx_core::stats::vine_copula::VineFitParams::trees: alloc::vec::Vec<ferx_core::stats::vine_copula::VineTreeSummary>
+pub ferx_core::stats::vine_copula::VineFitParams::zero_fixed: alloc::vec::Vec<bool>
 impl ferx_core::stats::vine_copula::VineFitParams
 pub fn ferx_core::stats::vine_copula::VineFitParams::n_free_params(&self) -> usize
 pub struct ferx_core::stats::vine_copula::VinePairEntry

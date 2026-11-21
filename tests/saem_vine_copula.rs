@@ -168,9 +168,236 @@ fn refusal_guards_reject_invalid_vine_combinations() {
     opts.saem_omega_dist = OmegaDist::VineCopula;
     let err = fit(&mix_model, &pop, &mix_model.default_params, &opts).unwrap_err();
     assert_eq!(err.code(), Some("E_OMEGA_DIST_MIXTURE"), "{err}");
+
+    // 5. n_exploration = 0 with omega_dist = vine -> E_OMEGA_DIST_OPTIONS.
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Saem;
+    opts.saem_omega_dist = OmegaDist::VineCopula;
+    opts.saem_n_exploration = 0;
+    let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+    assert_eq!(err.code(), Some("E_OMEGA_DIST_OPTIONS"), "{err}");
+
+    // 6. saem_ofv = agq with omega_dist = vine -> E_OMEGA_DIST_OPTIONS.
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Saem;
+    opts.saem_omega_dist = OmegaDist::VineCopula;
+    opts.saem_ofv = SaemOfv::Agq;
+    let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+    assert_eq!(err.code(), Some("E_OMEGA_DIST_OPTIONS"), "{err}");
+}
+
+/// NONMEM 7.5.1 `METHOD=IMP` (`#OBJV = -285.685` on `examples/warfarin.ferx` + `data/warfarin.csv`)
+/// reduction anchor for `run_importance_sampling_vine` under Gaussian marginals + Independence
+/// R-vine, PLUS regression guard for `omega ETA_ZERO ~ 0 FIX` (`log_density` normalization and
+/// `from_fit_params` post-fit simulation invariance).
+///
+/// Tier-2 single-evaluation / fast anchor (ungated; runs on every PR).
+#[test]
+fn nonmem_reduction_anchor_vine_is_matches_nonmem_warfarin_imp_and_zero_fix_eta() {
+    const NM_IMP_OBJV: f64 = -285.685;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pop = ferx_core::read_nonmem_csv(&root.join("data/warfarin.csv"), None, None)
+        .expect("read warfarin.csv");
+
+    // Evaluate `fit(..., method = saem, omega_dist = vine, vine_marginals = gaussian)` with
+    // `(theta, omega, sigma)` held FIX at NONMEM 7.5.1's `METHOD=IMP` point (`tests/warfarin_imp_nonmem.rs`):
+    // exercises `run_saem_vine` -> `compute_vine_map_ebes` (`eta_hats` + `h_matrices`) ->
+    // `run_importance_sampling_vine` end-to-end against NONMEM's `#OBJV = -285.685`.
+    let warfarin_nm_fix_src = r#"
+[parameters]
+  theta TVCL(0.12640, 0.001, 10.0) FIX
+  theta TVV(7.7234,   0.1,   100.0) FIX
+  theta TVKA(0.88565, 0.01,  20.0) FIX
+  omega ETA_CL ~ 0.030443 FIX
+  omega ETA_V  ~ 0.0095858 FIX
+  omega ETA_KA ~ 0.34052 FIX
+  sigma PROP_ERR ~ 0.010468 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model_3 = parse_model_string(warfarin_nm_fix_src).expect("parse fixed warfarin");
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Saem;
+    opts.saem_omega_dist = OmegaDist::VineCopula;
+    opts.vine_marginals = VineMarginals::Gaussian;
+    opts.saem_ofv = SaemOfv::Imp;
+    opts.saem_n_exploration = 2;
+    opts.saem_n_convergence = 2;
+    opts.saem_ofv_samples = 1500;
+    opts.saem_ofv_pilot_samples = 250;
+    opts.imp_seed = Some(12345);
+    opts.saem_seed = Some(12345);
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_3 = fit(&model_3, &pop, &model_3.default_params, &opts).expect("warfarin vine eval");
+    let is_3 = fit_3.importance_sampling.as_ref().expect("vine IS populated");
+    assert!(
+        (fit_3.ofv - NM_IMP_OBJV).abs() < 0.8,
+        "Gaussian-vine QMC IS −2 log L ({:.4} ± {:.4}) must match NONMEM 7.5.1 METHOD=IMP #OBJV ({NM_IMP_OBJV})",
+        fit_3.ofv,
+        is_3.mc_standard_error
+    );
+
+    // Regression for Review Findings #1 & #3: add a 4th `omega ETA_ZERO ~ 0.0 FIX` coordinate.
+    // Neither `vine.log_density` / IS OFV (previously off by +N * ln(2*pi) = +18.38!) nor
+    // post-fit simulation after `VineFitParams` reconstruction may drift!
+    let warfarin_zero_fix_src = r#"
+[parameters]
+  theta TVCL(0.12640, 0.001, 10.0) FIX
+  theta TVV(7.7234,   0.1,   100.0) FIX
+  theta TVKA(0.88565, 0.01,  20.0) FIX
+  omega ETA_CL   ~ 0.030443 FIX
+  omega ETA_V    ~ 0.0095858 FIX
+  omega ETA_KA   ~ 0.34052 FIX
+  omega ETA_ZERO ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.010468 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + 0.0 * ETA_ZERO)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model_z = parse_model_string(warfarin_zero_fix_src).expect("parse zero-fix warfarin");
+    let fit_4 = fit(&model_z, &pop, &model_z.default_params, &opts).expect("zero-fix vine eval");
+    assert!(
+        (fit_4.ofv - fit_3.ofv).abs() < 0.4,
+        "0-FIX ETA must not shift vine IS −2 log L by N*ln(2*pi): got {:.4} vs {:.4}",
+        fit_4.ofv,
+        fit_3.ofv
+    );
+
+    let params_z = fitted_params_from_result(&fit_4, &model_z).expect("reconstruct zero-fix vine");
+    let sim_opts = ferx_core::SimulateOptions { seed: Some(42), ..Default::default() };
+    let sim_z = ferx_core::simulate_with_options_diag(&model_z, &pop, &params_z, 5, &sim_opts)
+        .expect("simulate zero-fix vine");
+    for sp in &sim_z.parameters.rows {
+        assert_eq!(sp.eta[3], 0.0, "reconstructed 0-FIX ETA_ZERO must simulate exact 0.0");
+    }
+}
+
+/// Fast Tier-2 end-to-end smoke test exercising the full `omega_dist = vine` pipeline on PRs
+/// (Phase 1a -> BIC selection -> Robbins-Monro SA -> Vine MAP EBEs -> unconditional joint
+/// Louis/BHHH covariance -> QMC IS OFV -> `saem_ofv = saem` warning & `saem_ofv = focei` BIC
+/// parameter count -> `n_convergence = 0` non-convergence gate -> `.fitrx` + YAML + NPDE +
+/// `conddist`).
+#[test]
+fn vine_tier2_fast_smoke_pipeline_cov_conddist_fitrx_and_ofv_modes() {
+    let model = parse_model_string(ONE_CPT_IV_BLOCK_MODEL).expect("parse");
+    let template = iv_bolus_template(14); // 14 > n_total (3 fixed + ~5 vine) -> unconditional joint S^-1!
+    let mut truth = model.default_params.clone();
+    truth.theta = vec![4.0, 50.0];
+    truth.sigma.values = vec![0.01];
+    let mut rv = RVine::independence_dvine(2);
+    rv.set_edge_copula(1, 0, CopulaFamily::clayton(2.2, CopulaRotation::R0));
+    let mut tvine = VineCopulaOmega::from_init_params(&truth, true);
+    tvine.marginals = vec![MarginalDist::skew_normal(0.35, 2.0), MarginalDist::normal(0.30)];
+    tvine.rvine = rv;
+    truth.vine_dist = Some(Arc::new(tvine));
+
+    let sim = simulate_with_seed(&model, &template, &truth, 1, 20261121).expect("sim");
+    let pop = fill_simulated_dvs(&template, &sim);
+
+    // 1. Default `saem_ofv = SaemOfv::Saem` promotes to `Imp` with an explicit warning, runs
+    //    unconditional joint `(theta, sigma, vine)` Louis/BHHH covariance, and populates `conddist`.
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Saem;
+    opts.saem_omega_dist = OmegaDist::VineCopula;
+    opts.vine_marginals = VineMarginals::Auto;
+    opts.saem_n_exploration = 6;
+    opts.saem_n_convergence = 4;
+    opts.saem_omega_burnin = 2;
+    opts.saem_ofv_samples = 120;
+    opts.saem_ofv_pilot_samples = 60;
+    opts.saem_conddist = true;
+    opts.saem_conddist_nsamp = 10;
+    opts.saem_conddist_burnin = 4;
+    opts.run_covariance_step = true;
+    opts.saem_seed = Some(3114);
+    opts.verbose = false;
+
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("fast vine fit");
+    assert!(res.converged, "smoke vine fit with k2 > 0 should converge: {:?}", res.warnings);
+    assert!(
+        res.warnings.iter().any(|w| w.contains("saem_ofv = saem unavailable")),
+        "expected explicit warning when default saem_ofv = saem promotes to imp: {:?}",
+        res.warnings
+    );
+    let vp = res.vine_params.as_ref().expect("vine_params");
+    assert_eq!(res.vine_corrected_ofv, Some(res.ofv));
+    assert_eq!(res.bic_inputs.omega, vp.n_free_params());
+    assert!(res.se_theta.as_ref().is_some_and(|v| v.iter().all(|x| x.is_finite() && *x > 0.0)));
+    assert!(res.se_sigma.as_ref().is_some_and(|v| v.iter().all(|x| x.is_finite() && *x > 0.0)));
+    assert!(res.se_omega.is_none());
+    assert!(res.cond_dist.is_some());
+
+    // `.fitrx`, console summary, YAML output, and NPDE from reconstructed parameters.
+    let bytes = save_fit_to_bytes(&res, &pop, ONE_CPT_IV_BLOCK_MODEL, SaveFitOptions::default())
+        .expect("save fitrx");
+    let loaded = load_fit_from_bytes(&bytes).expect("load fitrx");
+    assert_eq!(loaded.fit.vine_params, res.vine_params);
+    assert!(format_summary(&res).contains("VINE COPULA"));
+    let tmp_yaml = tempfile::NamedTempFile::new().expect("tmp yaml");
+    write_estimates_yaml(&res, tmp_yaml.path().to_str().unwrap()).expect("write yaml");
+
+    let fitted_p = fitted_params_from_result(&res, &model).expect("fitted_params_from_result");
+    let npde =
+        ferx_core::stats::npde::compute_npde_npd(&model, &pop, &fitted_p, 20, Some(99), None)
+            .expect("vine npde");
+    assert_eq!(npde.len(), pop.subjects.len());
+
+    // 2. `saem_ofv = focei`: `ofv` stays Gaussian FOCE while `vine_corrected_ofv` holds QMC IS,
+    //    and `bic_inputs.omega` counts the 3 Gaussian block_omega parameters rather than vine params!
+    let mut focei_opts = opts.clone();
+    focei_opts.saem_ofv = SaemOfv::Focei;
+    focei_opts.saem_conddist = false;
+    focei_opts.run_covariance_step = false;
+    let focei_res = fit(&model, &pop, &model.default_params, &focei_opts).expect("focei ofv fit");
+    assert!(focei_res.vine_corrected_ofv.is_some());
+    assert_eq!(
+        focei_res.bic_inputs.omega, 3,
+        "Gaussian FOCE OFV must pair with Gaussian omega count"
+    );
+
+    // 3. `n_convergence = 0`: `converged` must be `false` (Review Finding #9).
+    let mut k2_zero_opts = focei_opts.clone();
+    k2_zero_opts.saem_n_convergence = 0;
+    let k2_zero_res =
+        fit(&model, &pop, &model.default_params, &k2_zero_opts).expect("k2 = 0 vine fit");
+    assert!(!k2_zero_res.converged, "n_convergence = 0 must report converged = false");
+
+    // 4. Small-N conditional SE fallback (`n_contrib <= n_total`) emits explicit advisory warning.
+    let mut small_pop = pop.clone();
+    small_pop.subjects.truncate(4);
+    let mut small_opts = opts.clone();
+    small_opts.saem_conddist = false;
+    let small_res =
+        fit(&model, &small_pop, &model.default_params, &small_opts).expect("small-N vine fit");
+    assert!(
+        small_res.warnings.iter().any(|w| w.contains("conditional on the fitted vine parameters")),
+        "expected conditional SE advisory when n_contrib <= n_total: {:?}",
+        small_res.warnings
+    );
 }
 
 #[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn rung1_gaussian_vine_matches_gaussian_saem_and_imp_ofv() {
     let model = parse_model_string(ONE_CPT_IV_BLOCK_MODEL).expect("parse");
     let template = iv_bolus_template(80);
@@ -240,6 +467,7 @@ fn rung1_gaussian_vine_matches_gaussian_saem_and_imp_ofv() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn rung2_flexible_zero_mean_skew_and_heavy_tail_marginals_no_theta_bias() {
     let model = parse_model_string(ONE_CPT_IV_MODEL).expect("parse");
     let template = iv_bolus_template(110);
@@ -323,6 +551,7 @@ fn rung2_flexible_zero_mean_skew_and_heavy_tail_marginals_no_theta_bias() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn rung3_vine_tail_iv_clayton_rotated_clayton90_and_3d_rvine() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let vine_path = root.join("examples/vine_tail_iv.ferx");
@@ -472,6 +701,7 @@ fn rung3_vine_tail_iv_clayton_rotated_clayton90_and_3d_rvine() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn rung4_uninformative_subject_zero_ofv_fitrx_roundtrip_and_three_uses_consistency() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let vine_path = root.join("examples/vine_tail_iv.ferx");

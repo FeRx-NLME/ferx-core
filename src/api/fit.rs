@@ -2788,38 +2788,57 @@ fn fit_inner(
                 &prev.kappas,
                 &o,
             ) {
-                Ok(is) if is.minus2_log_likelihood.is_finite() => {
-                    if let Some(msg) =
-                        crate::estimation::importance_sampling::marginal_reliability_warning(&is)
-                    {
-                        accumulated_warnings.push(msg);
-                    }
-                    let foce_ofv = prev.ofv;
-                    let vine_ll = is.minus2_log_likelihood;
-                    prev.vine_corrected_ofv = Some(vine_ll);
-                    if stage_opts.saem_ofv != SaemOfv::Focei {
-                        prev.ofv = vine_ll;
-                        saem_objective = Some(SaemObjective {
-                            kind: SaemOfv::Imp,
-                            mc_standard_error: Some(is.mc_standard_error),
-                            n_samples: Some(is.n_samples),
-                            n_nodes: None,
-                            foce_ofv,
-                        });
-                    }
-                    is_result = Some(is);
-                }
                 Ok(is) => {
-                    accumulated_warnings.push(format!(
-                        "SAEM vine objective: importance-sampled −2 log L was not finite ({}); \
-                         reporting the Gaussian-equivalent FOCE/Laplace OFV.",
-                        is.minus2_log_likelihood
-                    ));
+                    if let Some(gate_w) =
+                        crate::estimation::impmap::gate_converged_on_mcem_objective(
+                            &mut prev.converged,
+                            is.minus2_log_likelihood,
+                        )
+                    {
+                        accumulated_warnings.push(gate_w);
+                        accumulated_warnings.push(format!(
+                            "SAEM vine objective: importance-sampled −2 log L was unusable ({}); \
+                             reporting the Gaussian-equivalent FOCE/Laplace OFV.",
+                            is.minus2_log_likelihood
+                        ));
+                    } else {
+                        if let Some(msg) =
+                            crate::estimation::importance_sampling::marginal_reliability_warning(
+                                &is,
+                            )
+                        {
+                            accumulated_warnings.push(msg);
+                        }
+                        if stage_opts.saem_ofv == SaemOfv::Saem {
+                            accumulated_warnings.push(
+                                "saem_ofv = saem unavailable (omega_dist = vine evaluates the QMC \
+                                 importance-sampled marginal −2 log L); reporting the \
+                                 importance-sampled −2 log L instead."
+                                    .to_string(),
+                            );
+                        }
+                        let foce_ofv = prev.ofv;
+                        let vine_ll = is.minus2_log_likelihood;
+                        prev.vine_corrected_ofv = Some(vine_ll);
+                        if stage_opts.saem_ofv != SaemOfv::Focei {
+                            prev.ofv = vine_ll;
+                            saem_objective = Some(SaemObjective {
+                                kind: SaemOfv::Imp,
+                                mc_standard_error: Some(is.mc_standard_error),
+                                n_samples: Some(is.n_samples),
+                                n_nodes: None,
+                                foce_ofv,
+                            });
+                        }
+                        is_result = Some(is);
+                    }
                 }
                 Err(e) => {
+                    prev.converged = false;
                     accumulated_warnings.push(format!(
                         "SAEM vine objective: importance-sampled −2 log L skipped ({e}); \
-                         reporting the Gaussian-equivalent FOCE/Laplace OFV."
+                         demoting converged to false and reporting the Gaussian-equivalent \
+                         FOCE/Laplace OFV."
                     ));
                 }
             }
@@ -3129,11 +3148,12 @@ fn fit_inner(
     // (#225), `bic_inputs.omega` counts the free marginal + pair-copula parameters.
     let mut bic_inputs =
         crate::model_selection::bic_inputs_for(model, init_params, &counted_mask, n_for_bic);
-    let n_params = if let Some(vine) = &result.params.vine_dist {
-        bic_inputs.omega = vine.n_free_params();
-        bic_inputs.n_free()
-    } else {
-        counted_mask.iter().filter(|&&b| !b).count()
+    let n_params = match (&result.params.vine_dist, &saem_objective) {
+        (Some(vine), Some(obj)) if obj.kind == SaemOfv::Imp => {
+            bic_inputs.omega = vine.n_free_params();
+            bic_inputs.n_free()
+        }
+        _ => counted_mask.iter().filter(|&&b| !b).count(),
     };
 
     // Parameter priors (#254). `result.ofv` is the clean −2LL that every

@@ -3219,6 +3219,30 @@ pub(crate) fn check_omega_dist_options(
             .with_block("fit_options"),
         );
     }
+    if options.saem_n_exploration == 0 {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_OPTIONS",
+                "`omega_dist = vine` requires `n_exploration >= 1` (got 0): vine marginal and \
+                 pair-copula BIC selection requires conditional MCMC draws from the exploration \
+                 phase (`n_exploration = 0` would select on all-zero initial ETAs). Set \
+                 `n_exploration` to at least 1.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+    if options.saem_ofv == crate::types::SaemOfv::Agq {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_OPTIONS",
+                "`omega_dist = vine` is incompatible with `saem_ofv = agq`: adaptive \
+                 Gauss–Hermite quadrature integrates a multivariate normal `N(0, Omega)` prior \
+                 rather than the fitted regular-vine copula. Use `saem_ofv = imp` (the QMC \
+                 marginal likelihood reported for vine models) or `saem_ofv = focei`.",
+            )
+            .with_block("fit_options"),
+        );
+    }
     diags
 }
 

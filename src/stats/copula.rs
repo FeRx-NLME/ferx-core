@@ -963,10 +963,9 @@ impl CopulaFamily {
     }
 }
 
-/// Robbins-Monro score & observed-information stochastic approximation state for one pair-copula.
+/// Robbins-Monro Fisher-scoring & observed-information stochastic approximation state for one pair-copula.
 #[derive(Debug, Clone, Default)]
 pub struct CopulaSaState {
-    avg_score: Vec<f64>,
     avg_info: Vec<Vec<f64>>,
     initialized: bool,
 }
@@ -974,12 +973,12 @@ pub struct CopulaSaState {
 impl CopulaSaState {
     /// Reset state when pair-copula families are selected at `k = K_select`.
     pub fn reset(&mut self) {
-        self.avg_score.clear();
         self.avg_info.clear();
         self.initialized = false;
     }
 
-    /// Apply one Robbins-Monro score & Fisher-information stochastic approximation step.
+    /// Apply one Robbins-Monro Fisher-scoring stochastic approximation step:
+    /// `I_bar_k = (1 - gamma) * I_bar_{k-1} + gamma * I_k`, `psi_k = psi_{k-1} + gamma * I_bar_k^-1 * g_k`.
     pub fn step(&mut self, cop: &mut CopulaFamily, u: &[f64], v: &[f64], gamma: f64) {
         if matches!(cop, CopulaFamily::Independence) || u.len() < 4 || gamma <= 0.0 {
             return;
@@ -989,20 +988,19 @@ impl CopulaSaState {
         if p == 0 {
             return;
         }
-        if !self.initialized || self.avg_score.len() != p {
-            self.avg_score = g.iter().map(|&x| gamma * x).collect();
+        if !self.initialized || self.avg_info.len() != p {
             self.avg_info = info;
             self.initialized = true;
         } else {
             for i in 0..p {
-                self.avg_score[i] = (1.0 - gamma) * self.avg_score[i] + gamma * g[i];
                 for j in 0..p {
                     self.avg_info[i][j] = (1.0 - gamma) * self.avg_info[i][j] + gamma * info[i][j];
                 }
             }
         }
         make_spd_small(&mut self.avg_info);
-        if let Some(mut delta) = solve_small(&self.avg_info, &self.avg_score) {
+        let scaled_g: Vec<f64> = g.iter().map(|&x| gamma * x).collect();
+        if let Some(mut delta) = solve_small(&self.avg_info, &scaled_g) {
             let max_step = 0.25_f64;
             let norm_inf = delta.iter().fold(0.0_f64, |acc, &d| acc.max(d.abs()));
             if norm_inf > max_step {
@@ -1189,5 +1187,56 @@ mod tests {
         let sel_neg = CopulaFamily::select_bic(&u_neg, &v_neg, 1.0, n);
         assert_eq!(sel_neg.family_name(), "clayton_90");
         assert!(sel_neg.kendall_tau() < -0.40);
+    }
+
+    #[test]
+    fn copula_sa_step_does_not_overshoot_stationary_mle_with_stale_score_memory() {
+        let mut rng = StdRng::seed_from_u64(3114);
+        let truth = CopulaFamily::clayton(2.2, CopulaRotation::R0);
+        let mut u_vec = Vec::with_capacity(300);
+        let mut v_vec = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let u = rng.random::<f64>().clamp(1e-5, 1.0 - 1e-5);
+            let w = rng.random::<f64>().clamp(1e-5, 1.0 - 1e-5);
+            u_vec.push(u);
+            v_vec.push(truth.h2_inv(w, u));
+        }
+        let mle = CopulaFamily::clayton(1.0, CopulaRotation::R0).fit_mle(&u_vec, &v_vec);
+        let mle_psi = mle.pack_psi();
+
+        // Prime `CopulaSaState` far from the MLE so step 1 observes a large non-zero gradient.
+        let mut sa = CopulaSaState::default();
+        let mut cur = CopulaFamily::clayton(0.05, CopulaRotation::R0);
+        sa.step(&mut cur, &u_vec, &v_vec, 0.25);
+
+        // At the stationary MLE (`g ~ 0`), the next step must not carry forward step 1's gradient.
+        let mut at_mle = mle;
+        sa.step(&mut at_mle, &u_vec, &v_vec, 0.25);
+        assert!(
+            (at_mle.pack_psi()[0] - mle_psi[0]).abs() < 1e-4,
+            "stationary Clayton MLE drifted from {} to {}",
+            mle_psi[0],
+            at_mle.pack_psi()[0]
+        );
+
+        // Exercise `score_and_obs_info`, `observed_se` (including 2x2 StudentT), and `step` across
+        // every copula family and rotation for Tier-1 coverage.
+        for mut c in [
+            CopulaFamily::gaussian(0.45),
+            CopulaFamily::student_t(0.50, 5.0),
+            CopulaFamily::frank(-3.0),
+            CopulaFamily::clayton(1.8, CopulaRotation::R180),
+            CopulaFamily::clayton(1.8, CopulaRotation::R270),
+            CopulaFamily::gumbel(1.9, CopulaRotation::R0),
+            CopulaFamily::gumbel(1.9, CopulaRotation::R90),
+            CopulaFamily::gumbel(1.9, CopulaRotation::R180),
+            CopulaFamily::gumbel(1.9, CopulaRotation::R270),
+        ] {
+            let se = c.observed_se(&u_vec[..80], &v_vec[..80], 1.0);
+            assert_eq!(se.len(), c.n_params());
+            let mut st = CopulaSaState::default();
+            st.step(&mut c, &u_vec[..80], &v_vec[..80], 0.15);
+            assert!(c.kendall_tau().is_finite());
+        }
     }
 }

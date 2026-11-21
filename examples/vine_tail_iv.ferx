@@ -39,6 +39,7 @@
   method         = saem
   omega_dist     = vine
   vine_marginals = gaussian
+  saem_ofv       = imp
   n_exploration  = 300
   n_convergence  = 400
   seed           = 12345

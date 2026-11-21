@@ -177,7 +177,7 @@ impl RVine {
         if log_c.is_finite() {
             log_c
         } else {
-            -1e20
+            -crate::stats::likelihood::SUBJECT_SENTINEL_NLL
         }
     }
 
@@ -679,12 +679,28 @@ pub struct VineFitParams {
     pub trees: Vec<VineTreeSummary>,
     /// Exact R-vine structure for lossless simulation/density reconstruction across FFI and `.fitrx`.
     pub rvine: RVine,
+    /// Per-ETA `FIX` flags preserved across `.fitrx` and post-fit consumers (`simulate`, `npde`).
+    #[serde(default)]
+    pub omega_fixed: Vec<bool>,
+    /// Per-ETA `0 FIX` flags (`omega ETA_X ~ 0 FIX`) preserved across `.fitrx` and post-fit consumers.
+    #[serde(default)]
+    pub zero_fixed: Vec<bool>,
 }
 
 impl VineFitParams {
-    /// Total number of free estimated parameters across all marginals and pair-copulas.
+    /// Total number of free estimated parameters across all non-fixed marginals and pair-copulas.
     pub fn n_free_params(&self) -> usize {
-        let m_free: usize = self.marginals.iter().map(|m| m.params.len()).sum();
+        let m_free: usize = self
+            .marginals
+            .iter()
+            .enumerate()
+            .filter(|&(j, m)| {
+                !self.omega_fixed.get(j).copied().unwrap_or(false)
+                    && !self.zero_fixed.get(j).copied().unwrap_or(false)
+                    && m.sd > 0.0
+            })
+            .map(|(_, m)| m.params.len())
+            .sum();
         let c_free: usize =
             self.trees.iter().flat_map(|t| t.pairs.iter()).map(|p| p.copula.params.len()).sum();
         m_free + c_free
@@ -734,12 +750,13 @@ impl VineCopulaOmega {
     pub fn from_init_params(init_params: &ModelParameters, allow_flexible_marginals: bool) -> Self {
         let omega = init_params.omega.clone();
         let d = omega.dim();
+        let struct_zeros = omega.structural_zeros();
         let mut zero_fixed = vec![false; d];
         let marginals: Vec<MarginalDist> = (0..d)
             .map(|i| {
                 let v = omega.matrix[(i, i)];
                 let fixed = init_params.omega_fixed.get(i).copied().unwrap_or(false);
-                if fixed && v <= 1e-12 {
+                if fixed && (struct_zeros.get(i).copied().unwrap_or(false) || v <= 1e-12) {
                     zero_fixed[i] = true;
                 }
                 MarginalDist::normal(v.max(MARGINAL_SCALE_FLOOR * MARGINAL_SCALE_FLOOR).sqrt())
@@ -852,7 +869,7 @@ impl VineCopulaOmega {
         // Stage 2: Exact PIT -> Dissmann R-vine MST + pair-copula BIC selection.
         let u_pooled = self.pit_samples(pooled_etas);
         let (rvine, pair_obs) =
-            select_rvine_dissmann(&u_pooled, weight, n_subjects, &self.zero_fixed, false);
+            select_rvine_dissmann(&u_pooled, weight, n_subjects, &self.omega_fixed, false);
         self.rvine = rvine;
         self.copula_sa = (0..self.d).map(|i| vec![CopulaSaState::default(); i]).collect();
         self.last_pair_obs = pair_obs;
@@ -884,7 +901,9 @@ impl VineCopulaOmega {
                 for t in 0..i {
                     let orig_i = self.rvine.perm[i];
                     let orig_m = self.rvine.perm[self.rvine.columns[i][t].var2_int];
-                    if !self.zero_fixed[orig_i] && !self.zero_fixed[orig_m] {
+                    let fixed_i = self.omega_fixed.get(orig_i).copied().unwrap_or(false);
+                    let fixed_m = self.omega_fixed.get(orig_m).copied().unwrap_or(false);
+                    if !fixed_i && !fixed_m {
                         self.rvine.columns[i][t].copula = CopulaFamily::gaussian(0.0);
                     }
                 }
@@ -894,7 +913,7 @@ impl VineCopulaOmega {
         self.last_pair_obs = self.rvine.forward_pseudo_obs_and_step(
             &u_samples,
             Some((&mut self.copula_sa, gamma)),
-            &self.zero_fixed,
+            &self.omega_fixed,
         );
     }
 
@@ -959,6 +978,100 @@ impl VineCopulaOmega {
         self.log_density(eta).exp()
     }
 
+    /// Pack all free unconstrained parameters `(psi_marginals, psi_copulas)` of `self`
+    /// in canonical order for parameter-trajectory settling checks and joint Louis/BHHH covariance.
+    pub fn pack_free_psi(&self) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.n_free_params());
+        for j in 0..self.d {
+            if !self.omega_fixed.get(j).copied().unwrap_or(false) && !self.zero_fixed[j] {
+                out.extend(self.marginals[j].pack_psi());
+            }
+        }
+        for i in 1..self.d {
+            for edge in &self.rvine.columns[i] {
+                if edge.copula != CopulaFamily::Independence {
+                    out.extend(edge.copula.pack_psi());
+                }
+            }
+        }
+        out
+    }
+
+    /// Evaluate `log_density(eta)` at a perturbed free unconstrained parameter vector `psi`
+    /// without cloning `sample_s2` or observation buffers.
+    fn log_density_at_free_psi(&self, eta: &[f64], psi: &[f64]) -> f64 {
+        if self.d == 0 {
+            return 0.0;
+        }
+        let mut pos = 0usize;
+        let mut lp = 0.0_f64;
+        let mut u = vec![0.5_f64; self.d];
+        for j in 0..self.d {
+            if self.zero_fixed[j] {
+                continue;
+            }
+            let m = if !self.omega_fixed.get(j).copied().unwrap_or(false) {
+                let k = self.marginals[j].n_params();
+                let next = self.marginals[j].from_psi(&psi[pos..pos + k]);
+                pos += k;
+                next
+            } else {
+                self.marginals[j]
+            };
+            lp += m.log_pdf(eta[j]);
+            u[j] = m.cdf(eta[j]).clamp(U_CLAMP, 1.0 - U_CLAMP);
+        }
+        if self.d > 1 {
+            let u_int: Vec<f64> =
+                (0..self.d).map(|a| u[self.rvine.perm[a]].clamp(U_CLAMP, 1.0 - U_CLAMP)).collect();
+            let mut h1_out: Vec<Vec<f64>> = (0..self.d).map(|i| vec![0.0; i]).collect();
+            let mut h2_out: Vec<Vec<f64>> = (0..self.d).map(|i| vec![0.0; i]).collect();
+            for i in 1..self.d {
+                let mut v_curr = u_int[i];
+                for (t, edge) in self.rvine.columns[i].iter().enumerate() {
+                    let cop = if edge.copula != CopulaFamily::Independence {
+                        let k = edge.copula.n_params();
+                        let next = edge.copula.from_psi(&psi[pos..pos + k]);
+                        pos += k;
+                        next
+                    } else {
+                        CopulaFamily::Independence
+                    };
+                    let v_part = RVine::read_partner(edge.partner_src, &u_int, &h1_out, &h2_out);
+                    lp += cop.log_density(v_curr, v_part);
+                    let next_h1 = cop.h1(v_curr, v_part);
+                    let next_h2 = cop.h2(v_part, v_curr);
+                    h1_out[i][t] = next_h1;
+                    h2_out[i][t] = next_h2;
+                    v_curr = next_h1;
+                }
+            }
+        }
+        lp
+    }
+
+    /// Total gradient `grad_psi ln p_vine(eta; psi)` with respect to [`Self::pack_free_psi`],
+    /// including the Jacobian `du_j / dpsi_j` through the R-vine copula density.
+    pub fn parameter_score(&self, eta: &[f64]) -> Vec<f64> {
+        let mut psi = self.pack_free_psi();
+        let n = psi.len();
+        let mut score = vec![0.0_f64; n];
+        for q in 0..n {
+            let orig = psi[q];
+            let h = 1e-5 * (1.0 + orig.abs());
+            psi[q] = orig + h;
+            let lp = self.log_density_at_free_psi(eta, &psi);
+            psi[q] = orig - h;
+            let lm = self.log_density_at_free_psi(eta, &psi);
+            psi[q] = orig;
+            let deriv = (lp - lm) / (2.0 * h);
+            if deriv.is_finite() {
+                score[q] = deriv;
+            }
+        }
+        score
+    }
+
     /// Extract a complete [`VineFitParams`] summary for `FitResult`, YAML, `.fitrx`, and R.
     pub fn to_fit_params(&self, eta_names: &[String]) -> VineFitParams {
         let name_of = |orig_idx: usize| -> String {
@@ -967,8 +1080,26 @@ impl VineCopulaOmega {
 
         let marginals: Vec<MarginalSummary> = (0..self.d)
             .map(|j| {
-                let obs = self.last_marginal_obs.get(j).map_or(&[][..], Vec::as_slice);
-                self.marginals[j].to_summary(&name_of(j), obs, self.last_obs_weight)
+                if self.zero_fixed[j] {
+                    MarginalSummary {
+                        eta: name_of(j),
+                        family: "normal".to_string(),
+                        mean: 0.0,
+                        sd: 0.0,
+                        skewness: Some(0.0),
+                        excess_kurtosis: Some(0.0),
+                        params: vec![("sd".to_string(), 0.0)],
+                        se: Vec::new(),
+                    }
+                } else {
+                    let obs = self.last_marginal_obs.get(j).map_or(&[][..], Vec::as_slice);
+                    let mut s =
+                        self.marginals[j].to_summary(&name_of(j), obs, self.last_obs_weight);
+                    if self.omega_fixed.get(j).copied().unwrap_or(false) {
+                        s.se.clear();
+                    }
+                    s
+                }
             })
             .collect();
 
@@ -1013,7 +1144,13 @@ impl VineCopulaOmega {
             trees.push(VineTreeSummary { tree: t + 1, pairs });
         }
 
-        VineFitParams { marginals, trees, rvine: self.rvine.clone() }
+        VineFitParams {
+            marginals,
+            trees,
+            rvine: self.rvine.clone(),
+            omega_fixed: self.omega_fixed.clone(),
+            zero_fixed: self.zero_fixed.clone(),
+        }
     }
 
     /// Reconstruct a usable [`VineCopulaOmega`] from its [`VineFitParams`] summary
@@ -1026,10 +1163,25 @@ impl VineCopulaOmega {
         let rvine =
             if params.rvine.d == d { params.rvine.clone() } else { RVine::independence_dvine(d) };
 
+        let zero_fixed: Vec<bool> = if params.zero_fixed.len() == d {
+            params.zero_fixed.clone()
+        } else {
+            params.marginals.iter().map(|m| m.sd == 0.0).collect()
+        };
+        let omega_fixed: Vec<bool> = if params.omega_fixed.len() == d {
+            params.omega_fixed.clone()
+        } else {
+            zero_fixed.clone()
+        };
+
         let mut diag = DMatrix::zeros(d, d);
         for i in 0..d {
-            let sd = marginals[i].sd();
-            diag[(i, i)] = sd * sd;
+            diag[(i, i)] = if zero_fixed[i] {
+                0.0
+            } else {
+                let sd = marginals[i].sd();
+                sd * sd
+            };
         }
         let omega = OmegaMatrix::from_matrix(diag.clone(), eta_names, true);
 
@@ -1044,8 +1196,8 @@ impl VineCopulaOmega {
             sample_s2: diag,
             omega_equiv: omega.clone(),
             initial_omega: omega,
-            omega_fixed: vec![false; d],
-            zero_fixed: vec![false; d],
+            omega_fixed,
+            zero_fixed,
             last_pair_obs: vec![Vec::new(); d],
             last_marginal_obs: vec![Vec::new(); d],
             last_obs_weight: 1.0,
@@ -1082,7 +1234,31 @@ impl RandomEffectDistribution for VineCopulaOmega {
         if nll.is_finite() {
             nll
         } else {
-            1e20
+            crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+        }
+    }
+
+    fn log_density(&self, eta: &[f64]) -> f64 {
+        let d = self.d;
+        if d == 0 {
+            return 0.0;
+        }
+        let mut lp = 0.0_f64;
+        let mut u = vec![0.5_f64; d];
+        for j in 0..d {
+            if self.zero_fixed[j] {
+                continue;
+            }
+            lp += self.marginals[j].log_pdf(eta[j]);
+            u[j] = self.marginals[j].cdf(eta[j]).clamp(U_CLAMP, 1.0 - U_CLAMP);
+        }
+        if d > 1 {
+            lp += self.rvine.log_density(&u);
+        }
+        if lp.is_finite() {
+            lp
+        } else {
+            -crate::stats::likelihood::SUBJECT_SENTINEL_NLL
         }
     }
 
@@ -1163,7 +1339,7 @@ impl RandomEffectDistribution for VineCopulaOmega {
         self.last_pair_obs = self.rvine.forward_pseudo_obs_and_step(
             &u_samples,
             Some((&mut self.copula_sa, gamma)),
-            &self.zero_fixed,
+            &self.omega_fixed,
         );
         self.last_marginal_obs = marg_obs;
         self.last_obs_weight = 1.0;
@@ -1364,6 +1540,78 @@ mod tests {
                     "{d}-D Jacobian |det DR(u)| = {det_jac} != c_rvine(u) = {dens}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn zero_fixed_eta_log_density_and_from_fit_params_roundtrip() {
+        let names = vec!["ETA_CL".to_string(), "ETA_ZERO".to_string(), "ETA_V".to_string()];
+        let mut mat = DMatrix::zeros(3, 3);
+        mat[(0, 0)] = 0.09;
+        mat[(1, 1)] = 0.0;
+        mat[(2, 2)] = 0.04;
+        let om = OmegaMatrix::from_matrix(mat, names.clone(), true);
+        let mut init = crate::types::test_helpers::bare_params(om);
+        init.omega_fixed = vec![false, true, true]; // ETA_ZERO is `0 FIX`, ETA_V is `0.04 FIX`
+
+        let mut vine = VineCopulaOmega::from_init_params(&init, true);
+        vine.marginals[0] = MarginalDist::skew_t(0.32, 1.8, 5.5);
+        vine.rvine.set_edge_copula(2, 0, CopulaFamily::clayton(1.7, CopulaRotation::R0));
+        vine.selected = true;
+
+        let eta = [0.21, 0.0, -0.14];
+        // Active dimension count is 2 (ETA_CL and ETA_V; ETA_ZERO is `0 FIX`).
+        let expected_half_d_ln_2pi = 0.5 * 2.0 * std::f64::consts::TAU.ln();
+        let lp = vine.log_density(&eta);
+        let pnll = vine.prior_nll(&eta);
+        assert!(
+            (lp - (-pnll - expected_half_d_ln_2pi)).abs() < 1e-13,
+            "log_density ({lp}) and prior_nll ({pnll}) must agree on d_active = 2"
+        );
+        assert_eq!(vine.n_free_params(), 4); // SkewT (3) + Clayton (1); ETA_ZERO and ETA_V are FIX
+
+        // Round-trip through `VineFitParams` + serde JSON (including legacy JSON without flags).
+        let summary = vine.to_fit_params(&names);
+        assert_eq!(summary.n_free_params(), 4);
+        assert_eq!(summary.marginals[1].sd, 0.0);
+
+        let rebuilt = VineCopulaOmega::from_fit_params(&summary);
+        assert!(rebuilt.is_zero_fixed(1));
+        assert!(!rebuilt.is_zero_fixed(0));
+        assert!(!rebuilt.is_zero_fixed(2));
+        assert_eq!(rebuilt.n_free_params(), 4);
+        assert!((rebuilt.log_density(&eta) - lp).abs() < 1e-13);
+
+        let mut rng = StdRng::seed_from_u64(99);
+        for draw in rebuilt.sample(25, &mut rng) {
+            assert_eq!(draw[1], 0.0, "rebuilt 0-FIX ETA must sample exact 0.0");
+            assert_ne!(draw[2], 0.0, "non-zero FIX ETA must retain its 0.2 SD");
+        }
+
+        // Also test legacy JSON missing `omega_fixed`/`zero_fixed` -> inferred from `sd == 0.0`.
+        let mut legacy = summary;
+        legacy.omega_fixed.clear();
+        legacy.zero_fixed.clear();
+        let rebuilt_legacy = VineCopulaOmega::from_fit_params(&legacy);
+        assert!(rebuilt_legacy.is_zero_fixed(1));
+        for draw in rebuilt_legacy.sample(10, &mut rng) {
+            assert_eq!(draw[1], 0.0);
+        }
+
+        // Verify `parameter_score` matches central FD of `log_density`.
+        let score = vine.parameter_score(&eta);
+        assert_eq!(score.len(), 4);
+        let base_psi = vine.pack_free_psi();
+        for q in 0..score.len() {
+            let mut p_up = base_psi.clone();
+            let mut p_dn = base_psi.clone();
+            let h = 1e-6;
+            p_up[q] += h;
+            p_dn[q] -= h;
+            let fd = (vine.log_density_at_free_psi(&eta, &p_up)
+                - vine.log_density_at_free_psi(&eta, &p_dn))
+                / (2.0 * h);
+            assert!((score[q] - fd).abs() < 1e-5 * (1.0 + fd.abs()));
         }
     }
 }

@@ -867,7 +867,6 @@ impl MarginalDist {
 /// Robbins-Monro score & observed-information stochastic approximation state for one marginal.
 #[derive(Debug, Clone)]
 pub struct MarginalSaState {
-    avg_score: Vec<f64>,
     avg_info: Vec<Vec<f64>>,
     initialized: bool,
 }
@@ -875,22 +874,23 @@ pub struct MarginalSaState {
 impl MarginalSaState {
     /// Create an uninitialized SA state.
     pub fn new() -> Self {
-        Self { avg_score: Vec::new(), avg_info: Vec::new(), initialized: false }
+        Self { avg_info: Vec::new(), initialized: false }
     }
 
     /// Reset state when the marginal family changes at `k = K_select`.
     pub fn reset(&mut self) {
-        self.avg_score.clear();
         self.avg_info.clear();
         self.initialized = false;
     }
 
-    /// Apply one Robbins-Monro score & Fisher-information stochastic approximation update.
+    /// Apply one Robbins-Monro Fisher-scoring stochastic approximation update:
+    /// `I_bar_k = (1 - gamma) * I_bar_{k-1} + gamma * I_k`, `psi_k = psi_{k-1} + gamma * I_bar_k^-1 * g_k`.
     ///
     /// For `Normal`, the exact sufficient-statistic variance update
     /// `s2_k = (1 - gamma) * s2_{k-1} + gamma * mean(eta^2)` is equivalent and closed-form;
-    /// for all non-exponential families (`StudentT`, `SkewNormal`, `SkewT`), `avg_score -> 0`
-    /// solves `E_{eta | y}[grad_psi ln f(eta; psi)] = 0` without single-draw MLE Jensen bias.
+    /// for non-exponential families (`StudentT`, `SkewNormal`, `SkewT`), stepping on the current
+    /// iteration's scaled score `gamma * g_k` (never carrying pre-step `avg_score` momentum)
+    /// solves `E_{eta | y}[grad_psi ln f(eta; psi)] = 0` without overshoot or Jensen bias.
     pub fn step(&mut self, dist: &mut MarginalDist, samples: &[f64], gamma: f64) {
         if samples.is_empty() || gamma <= 0.0 {
             return;
@@ -904,20 +904,19 @@ impl MarginalSaState {
 
         let (g, info) = dist.score_and_obs_info(samples, 1.0);
         let p = g.len();
-        if !self.initialized || self.avg_score.len() != p {
-            self.avg_score = g.iter().map(|&v| gamma * v).collect();
+        if !self.initialized || self.avg_info.len() != p {
             self.avg_info = info;
             self.initialized = true;
         } else {
             for i in 0..p {
-                self.avg_score[i] = (1.0 - gamma) * self.avg_score[i] + gamma * g[i];
                 for j in 0..p {
                     self.avg_info[i][j] = (1.0 - gamma) * self.avg_info[i][j] + gamma * info[i][j];
                 }
             }
         }
         make_spd_small(&mut self.avg_info);
-        if let Some(mut delta) = solve_small(&self.avg_info, &self.avg_score) {
+        let scaled_g: Vec<f64> = g.iter().map(|&v| gamma * v).collect();
+        if let Some(mut delta) = solve_small(&self.avg_info, &scaled_g) {
             // Trust-region cap on unconstrained step so exploration outliers never jump wildly.
             let max_step = 0.25_f64;
             let norm_inf = delta.iter().fold(0.0_f64, |acc, &d| acc.max(d.abs()));
@@ -1248,5 +1247,39 @@ mod tests {
             "expected non-Gaussian selection on strongly skewed heavy-tailed data"
         );
         assert!((sel_s.sd() - skew_truth.sd()).abs() / skew_truth.sd() < 0.20);
+    }
+
+    #[test]
+    fn sa_step_does_not_overshoot_stationary_mle_with_stale_score_memory() {
+        let mut rng = StdRng::seed_from_u64(3114);
+        let truth = MarginalDist::skew_t(0.40, 2.5, 6.0);
+        let samples: Vec<f64> =
+            (0..250).map(|_| truth.quantile(rng.random::<f64>().clamp(1e-5, 1.0 - 1e-5))).collect();
+        let mle = fit_marginal_weighted(MarginalDist::skew_t(0.35, 1.0, 8.0), &samples, 1.0);
+        let mle_psi = mle.pack_psi();
+
+        // Prime `MarginalSaState` far from the MLE so the first step has a large non-zero gradient.
+        let mut sa = MarginalSaState::new();
+        let mut cur = MarginalDist::skew_t(0.15, -2.0, 20.0);
+        sa.step(&mut cur, &samples, 0.25);
+
+        // Place `cur` right at the stationary MLE (`g ~ 0`) and take another step: without stale
+        // score momentum, `cur` must remain stationary rather than jumping ~0.75 * prev_step away.
+        let mut at_mle = mle;
+        sa.step(&mut at_mle, &samples, 0.25);
+        for (a, b) in at_mle.pack_psi().iter().zip(mle_psi.iter()) {
+            assert!((a - b).abs() < 5e-4, "stationary MLE drifted from {b} to {a}");
+        }
+
+        // Exercise `score_and_obs_info`, `to_summary` (`observed_se`), and `from_summary` across
+        // every marginal family for Tier-1 coverage.
+        for dist in test_distributions() {
+            let summary = dist.to_summary("ETA_TEST", &samples, 1.0);
+            assert_eq!(summary.mean, 0.0);
+            assert!(summary.sd > 0.0 && summary.sd.is_finite());
+            assert_eq!(summary.se.len(), summary.params.len());
+            let round = MarginalDist::from_summary(&summary);
+            assert_eq!(round.family_name(), dist.family_name());
+        }
     }
 }

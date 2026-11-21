@@ -77,7 +77,7 @@ impl RandomEffectDistribution for GaussianOmega {
 
     fn prior_nll(&self, eta: &[f64]) -> f64 {
         if !self.omega.log_det.is_finite() {
-            return 1e20;
+            return crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
         }
         let ev = DVector::from_column_slice(eta);
         let quad = ev.dot(&(&self.omega.inv * &ev));

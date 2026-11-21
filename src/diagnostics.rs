@@ -212,6 +212,7 @@
 //! | `E_OMEGA_DIST_CHAIN` | `omega_dist = vine` chained with a non-SAEM stage (`foce`, `focei`, `laplace`, `gn`, `gn_hybrid`, `imp`, `impmap`, `vi`, `bayes`), which scores a Gaussian prior (#225). Block `fit_options` |
 //! | `E_OMEGA_DIST_SIR` | `omega_dist = vine` combined with `sir = true`, `covariance_fallback = sir`, or post-hoc `run_sir`, whose packed parameter resampler assumes Cholesky Gaussian `Omega` (#225). Block `fit_options` |
 //! | `E_OMEGA_DIST_MIXTURE` | `omega_dist = vine` on a model declaring a `[mixture]` block (#225). Block `fit_options` |
+//! | `E_OMEGA_DIST_OPTIONS` | `omega_dist = vine` combined with `n_exploration = 0` (no exploration draws to select marginal/copula families on) or `saem_ofv = agq` (Gauss–Hermite quadrature integrates a Gaussian prior) (#225). Block `fit_options` |
 //! | `W_VINE_MULTIMODAL_EBE` | under `omega_dist = vine`, multi-start individual MAP EBE optimization detected secondary local posterior modes within 3 NLL units or a non-positive-definite posterior Hessian at the mode (#225) |
 //! | `E_ABSORPTION_DOMAIN` | a built-in absorption input-rate parameter (e.g. transit `mtt ≤ 0` / `n < 0`, igd `mat`/`cv2 ≤ 0`, a non-finite per-route `lag=`) is out of domain at typical values at some dose record |
 //! | `E_ABSORPTION_FRACTION` | a pathway fraction (`FR*fn(...)`) on a built-in absorption term is outside (0, 1], or the fractions on one compartment do not sum to 1 (±1e-4), at typical values at some dose record (#388) |

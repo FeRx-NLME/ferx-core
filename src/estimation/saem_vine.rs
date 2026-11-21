@@ -28,7 +28,9 @@
 use crate::estimation::inner_optimizer::{cacheable_schedule, ebe_h_matrix_of};
 use crate::estimation::mstep_newton::NewtonTally;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
-use crate::estimation::parameterization::{pack_params, packed_fixed_mask, theta_packs_log};
+use crate::estimation::parameterization::{
+    pack_params, packed_fixed_mask, theta_packs_log, unpack_params,
+};
 use crate::estimation::saem::{
     cholesky_perturbation_into, classify_mu_ref_pairs, componentwise_sweeps, damp_mstep,
     damp_mstep_sigma_variance, mh_steps_report, resolve_mstep_optimizer, resolve_n_mh_steps,
@@ -694,24 +696,24 @@ fn compute_vine_louis_covariance(
     }
     let start = Instant::now();
     let mut held_template = params.clone();
+    // Gaussian `omega` is replaced by `vine_dist` (whose marginal + copula score blocks are
+    // appended explicitly below so cross-information with `(theta, sigma, omega_iov)` is preserved).
     held_template.omega_fixed.fill(true);
-    held_template.kappa_fixed.fill(true);
+    held_template.residual_correlation_fixed.fill(true);
     let packed = pack_params(params);
     let mask = packed_fixed_mask(&held_template);
     let n_packed = packed.len();
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
     let n_eta = model.n_eta;
+    let n_iov = model.n_kappa;
 
-    // Locate packed indices of free theta and free sigma coordinates.
     let omega_packed_len = if params.omega.diagonal { n_eta } else { n_eta * (n_eta + 1) / 2 };
     let sigma_offset = n_theta + omega_packed_len;
-    let free_indices: Vec<usize> = (0..n_packed)
-        .filter(|&p| {
-            !mask.get(p).copied().unwrap_or(true)
-                && (p < n_theta || (p >= sigma_offset && p < sigma_offset + n_sigma))
-        })
-        .collect();
+    let res_corr_offset = sigma_offset + n_sigma;
+    let iov_offset = res_corr_offset + params.residual_correlations.len();
+    let free_indices: Vec<usize> =
+        (0..n_packed).filter(|&p| !mask.get(p).copied().unwrap_or(true)).collect();
     if free_indices.is_empty() {
         return (
             Some(DMatrix::zeros(n_packed, n_packed)),
@@ -721,11 +723,34 @@ fn compute_vine_louis_covariance(
         );
     }
 
+    let vine_ref = params.vine_dist.as_deref();
+    let n_vine_free = vine_ref.map_or(0, VineCopulaOmega::n_free_params);
+    let n_free = free_indices.len();
+    let n_total = n_free + n_vine_free;
+
+    // Pre-unpack perturbed `omega_iov` matrices outside the parallel subject loop so IOV score
+    // columns cost zero matrix decompositions per subject/draw.
+    let iov_perturbations: Vec<Option<(OmegaMatrix, OmegaMatrix, f64)>> = free_indices
+        .iter()
+        .map(|&p_idx| {
+            if p_idx < iov_offset || params.omega_iov.is_none() {
+                return None;
+            }
+            let h = 1e-5 * (1.0 + packed[p_idx].abs());
+            let mut p_up = packed.clone();
+            let mut p_dn = packed.clone();
+            p_up[p_idx] += h;
+            p_dn[p_idx] -= h;
+            let om_up = unpack_params(&p_up, &held_template).omega_iov?;
+            let om_dn = unpack_params(&p_dn, &held_template).omega_iov?;
+            Some((om_up, om_dn, h))
+        })
+        .collect();
+
     let k_cov = 200usize;
     let seed = options.imp_seed.or(options.saem_seed).unwrap_or(42) ^ 0x51CE_C07A;
     let packs_log: Vec<bool> = params.theta_lower.iter().map(|&lo| theta_packs_log(lo)).collect();
 
-    let n_free = free_indices.len();
     let scores: Vec<Option<DVector<f64>>> =
         crate::par::map_init(population.subjects.len(), EventPkParams::default, |scratch, i| {
             let subject = &population.subjects[i];
@@ -751,7 +776,7 @@ fn compute_vine_louis_covariance(
                     subj_seed,
                     scratch,
                 )?;
-            let n_occ = if model.n_kappa > 0 && !kap.is_empty() {
+            let n_occ = if n_iov > 0 && !kap.is_empty() {
                 crate::stats::stacked_layout::group_count(subject)
             } else {
                 0
@@ -775,7 +800,25 @@ fn compute_vine_louis_covariance(
                 }
             };
 
-            let mut s_i = DVector::<f64>::zeros(n_free);
+            let eval_iov_log_p = |om: &OmegaMatrix, b: &[f64]| -> f64 {
+                if n_occ == 0 || n_iov == 0 || !om.log_det.is_finite() {
+                    return 0.0;
+                }
+                let mut quad = 0.0_f64;
+                for o in 0..n_occ {
+                    let base = n_eta + o * n_iov;
+                    for r in 0..n_iov {
+                        let mut row = 0.0;
+                        for c in 0..n_iov {
+                            row += om.inv[(r, c)] * b[base + c];
+                        }
+                        quad += row * b[base + r];
+                    }
+                }
+                -0.5 * (n_occ as f64) * om.log_det - 0.5 * quad
+            };
+
+            let mut s_i = DVector::<f64>::zeros(n_total);
             let mut th_work = params.theta.clone();
             let mut sg_work = params.sigma.values.clone();
 
@@ -801,7 +844,7 @@ fn compute_vine_louis_covariance(
                         }
                     }
                     th_work[p_idx] = orig;
-                } else {
+                } else if p_idx < res_corr_offset {
                     let s_idx = p_idx - sigma_offset;
                     let orig = sg_work[s_idx];
                     let p0 = packed[p_idx];
@@ -821,16 +864,42 @@ fn compute_vine_louis_covariance(
                         }
                     }
                     sg_work[s_idx] = orig;
+                } else if let Some((om_up, om_dn, h_iov)) = &iov_perturbations[f_pos] {
+                    for (b, &w) in draws.iter().zip(weights.iter()) {
+                        if w <= 1e-15 {
+                            continue;
+                        }
+                        let lp = eval_iov_log_p(om_up, b);
+                        let lm = eval_iov_log_p(om_dn, b);
+                        let deriv = (lp - lm) / (2.0 * *h_iov);
+                        if deriv.is_finite() {
+                            acc += w * deriv;
+                        }
+                    }
                 }
                 s_i[f_pos] = acc;
+            }
+
+            if let Some(vine) = vine_ref {
+                if n_vine_free > 0 {
+                    for (b, &w) in draws.iter().zip(weights.iter()) {
+                        if w <= 1e-15 {
+                            continue;
+                        }
+                        let vs = vine.parameter_score(&b[..n_eta]);
+                        for (q, &val) in vs.iter().enumerate() {
+                            s_i[n_free + q] += w * val;
+                        }
+                    }
+                }
             }
             Some(s_i)
         });
 
-    let mut s_mat = DMatrix::<f64>::zeros(n_free, n_free);
+    let mut s_full = DMatrix::<f64>::zeros(n_total, n_total);
     let mut n_contrib = 0usize;
     for s_opt in scores.into_iter().flatten() {
-        s_mat += &s_opt * s_opt.transpose();
+        s_full += &s_opt * s_opt.transpose();
         n_contrib += 1;
     }
 
@@ -847,24 +916,60 @@ fn compute_vine_louis_covariance(
         );
     }
 
-    let eig = s_mat.symmetric_eigen();
-    let max_ev = eig.eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    if !(max_ev > 1e-12) {
-        return (
-            None,
-            None,
-            elapsed,
-            vec!["Covariance step failed: empirical vine score matrix S is zero or non-finite."
-                .to_string()],
-        );
-    }
-    let floor = (1e-8 * max_ev).max(1e-10);
-    let mut inv_free = DMatrix::<f64>::zeros(n_free, n_free);
-    for k in 0..n_free {
-        let lam = eig.eigenvalues[k].max(floor);
-        let col = eig.eigenvectors.column(k);
-        inv_free += (1.0 / lam) * (&col * col.transpose());
-    }
+    let mut cov_notes = Vec::new();
+    let inv_free =
+        if n_vine_free > 0 && n_contrib > n_total {
+            // Unconditional joint BHHH inverse: invert the full `(packed, vine)` cross-product S and
+            // extract the `(packed, packed)` Schur-complement block so `(theta, sigma, omega_iov)` SEs
+            // reflect co-estimation uncertainty with the marginal and pair-copula parameters.
+            let eig = s_full.symmetric_eigen();
+            let max_ev = eig.eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+            if !(max_ev > 1e-12) {
+                return (
+                None,
+                None,
+                elapsed,
+                vec!["Covariance step failed: empirical vine score matrix S is zero or non-finite."
+                    .to_string()],
+            );
+            }
+            let floor = (1e-8 * max_ev).max(1e-10);
+            let mut inv_all = DMatrix::<f64>::zeros(n_total, n_total);
+            for k in 0..n_total {
+                let lam = eig.eigenvalues[k].max(floor);
+                let col = eig.eigenvectors.column(k);
+                inv_all += (1.0 / lam) * (&col * col.transpose());
+            }
+            inv_all.view((0, 0), (n_free, n_free)).into_owned()
+        } else {
+            if n_vine_free > 0 {
+                cov_notes.push(format!(
+                "SAEM vine covariance: {n_contrib} informative subjects cannot jointly span all \
+                 {n_total} model + vine parameters ({n_free} fixed/residual/IOV + {n_vine_free} \
+                 vine); reporting standard errors conditional on the fitted vine parameters."
+            ));
+            }
+            let s_mat = s_full.view((0, 0), (n_free, n_free)).into_owned();
+            let eig = s_mat.symmetric_eigen();
+            let max_ev = eig.eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+            if !(max_ev > 1e-12) {
+                return (
+                None,
+                None,
+                elapsed,
+                vec!["Covariance step failed: empirical vine score matrix S is zero or non-finite."
+                    .to_string()],
+            );
+            }
+            let floor = (1e-8 * max_ev).max(1e-10);
+            let mut inv_sub = DMatrix::<f64>::zeros(n_free, n_free);
+            for k in 0..n_free {
+                let lam = eig.eigenvalues[k].max(floor);
+                let col = eig.eigenvectors.column(k);
+                inv_sub += (1.0 / lam) * (&col * col.transpose());
+            }
+            inv_sub
+        };
 
     let mut full_cov = DMatrix::<f64>::zeros(n_packed, n_packed);
     for (a, &pa) in free_indices.iter().enumerate() {
@@ -872,7 +977,7 @@ fn compute_vine_louis_covariance(
             full_cov[(pa, pb)] = inv_free[(a, b)];
         }
     }
-    (Some(full_cov), Some(CovarianceMethod::CrossProduct), elapsed, Vec::new())
+    (Some(full_cov), Some(CovarianceMethod::CrossProduct), elapsed, cov_notes)
 }
 
 /// Execute the SAEM-Copula (`omega_dist = vine`) algorithm and return an [`OuterResult`].
@@ -893,10 +998,15 @@ pub(crate) fn run_saem_vine(
 
     let n_kappa = model.n_kappa;
     let k1 = options.saem_n_exploration;
+    if k1 == 0 {
+        return Err("E_OMEGA_DIST_OPTIONS: `omega_dist = vine` requires `n_exploration >= 1` \
+             (vine marginal and pair-copula BIC selection requires exploration draws)."
+            .to_string());
+    }
     let k2 = options.saem_n_convergence;
     let n_iter = k1 + k2;
     let omega_burnin = options.saem_omega_burnin.min(k1);
-    let k_select = if k1 == 0 { 0 } else { omega_burnin.max(k1 / 2).min(k1) };
+    let k_select = omega_burnin.max(k1 / 2).clamp(1, k1);
 
     let n_mh_steps =
         resolve_n_mh_steps(options.saem_n_mh_steps, population.n_obs(), n_subjects, n_eta);
@@ -1103,11 +1213,6 @@ pub(crate) fn run_saem_vine(
         eprintln!("{}", mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps));
     }
 
-    if k_select == 0 {
-        // K1 == 0 edge case: select immediately at initialization.
-        dist.select_structure_and_families(&etas, n_subjects, 1.0);
-    }
-
     struct SubjStepOut {
         eta: Vec<f64>,
         kappa: Vec<Vec<f64>>,
@@ -1118,6 +1223,9 @@ pub(crate) fn run_saem_vine(
         acc_k: usize,
         prop_k: usize,
     }
+
+    let mid_k2_iter = (k2 > 0).then(|| k1 + (k2 / 2).max(1));
+    let mut mid_phase2_state: Option<(Vec<f64>, Vec<f64>, Vec<f64>)> = None;
 
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -1550,11 +1658,16 @@ pub(crate) fn run_saem_vine(
                 damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
             }
         }
+
+        if mid_k2_iter == Some(k) {
+            mid_phase2_state = Some((log_theta.clone(), log_sigma.clone(), dist.pack_free_psi()));
+        }
     }
 
     // Assemble final ModelParameters carrying `omega_equiv` AND `Arc<VineCopulaOmega>`.
     let final_theta: Vec<f64> = (0..n_theta).map(|i| unpack_theta(i, log_theta[i])).collect();
     let final_sigma: Vec<f64> = log_sigma.iter().map(|&v| v.exp()).collect();
+    let final_vine_psi = dist.pack_free_psi();
     let vine_summary = dist.to_fit_params(&init_params.omega.eta_names);
     let omega_equiv = dist.to_omega_matrix().clone();
     let vine_arc = Arc::new(dist);
@@ -1586,6 +1699,8 @@ pub(crate) fn run_saem_vine(
 
     // Gaussian-equivalent FOCE/Laplace OFV baseline (stored as `SaemObjective::foce_ofv`;
     // `fit.rs` replaces `ofv` and `vine_corrected_ofv` with the exact Vine QMC IS `-2 log L`).
+    let resolved_interaction =
+        crate::types::interaction_for(EstimationMethod::Saem, options.interaction);
     let foce_ofv = 2.0
         * pop_nll(
             model,
@@ -1594,7 +1709,7 @@ pub(crate) fn run_saem_vine(
             &eta_hats,
             &h_matrices,
             &final_kappas,
-            options.interaction,
+            resolved_interaction,
         );
     if verbose {
         eprintln!("{}", saem_final_ofv_report(foce_ofv));
@@ -1638,6 +1753,60 @@ pub(crate) fn run_saem_vine(
         (tail_proposed > 0).then_some(tail_accepted as f64 / tail_proposed as f64);
 
     let mut converged = true;
+    if k2 == 0 {
+        converged = false;
+        warnings.push(
+            "SAEM vine: `n_convergence = 0` skips the stochastic-approximation accumulation \
+             phase; reporting converged = false."
+                .to_string(),
+        );
+    } else if tail_proposed > 0 && tail_accepted == 0 {
+        converged = false;
+        warnings.push(
+            "SAEM vine: 0 Metropolis–Hastings proposals accepted during the convergence phase; \
+             reporting converged = false."
+                .to_string(),
+        );
+    }
+    if final_params.theta.iter().any(|x| !x.is_finite())
+        || final_params.sigma.values.iter().any(|x| !x.is_finite())
+        || final_vine_psi.iter().any(|x| !x.is_finite())
+    {
+        converged = false;
+        warnings.push(
+            "SAEM vine: non-finite parameter estimate at termination; reporting converged = false."
+                .to_string(),
+        );
+    }
+    if k2 >= 20 {
+        if let Some((mid_th, mid_sg, mid_vp)) = &mid_phase2_state {
+            let mut max_drift = 0.0_f64;
+            for (i, (&a, &b)) in log_theta.iter().zip(mid_th.iter()).enumerate() {
+                if !init_params.theta_fixed.get(i).copied().unwrap_or(false) {
+                    max_drift = max_drift.max((a - b).abs());
+                }
+            }
+            for (i, (&a, &b)) in log_sigma.iter().zip(mid_sg.iter()).enumerate() {
+                if !init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
+                    max_drift = max_drift.max((a - b).abs());
+                }
+            }
+            if final_vine_psi.len() == mid_vp.len() {
+                for (&a, &b) in final_vine_psi.iter().zip(mid_vp.iter()) {
+                    max_drift = max_drift.max((a - b).abs());
+                }
+            }
+            // Under `1/k` Robbins–Monro averaging, a >1.0 unconstrained jump across the second half
+            // of the convergence phase (>2.7x fold move) indicates an unsettled runaway trajectory.
+            if !max_drift.is_finite() || max_drift > 1.0 {
+                converged = false;
+                warnings.push(format!(
+                    "SAEM vine: convergence-phase parameter trajectory did not settle (max second-half \
+                     unconstrained drift = {max_drift:.3} > 1.0); reporting converged = false."
+                ));
+            }
+        }
+    }
     if let Some(w) =
         crate::estimation::impmap::gate_converged_on_mcem_objective(&mut converged, foce_ofv)
     {
