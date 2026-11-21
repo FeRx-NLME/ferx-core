@@ -163,19 +163,18 @@ fn worst_errors(result: &FitResult, pop: &Population, stem: &str) -> (f64, f64) 
 
 /// One shaped arm against NONMEM: ΔOFV vs the null, posthoc η, `IPRED`. Also
 /// asserts the evaluation ran on the analytic gradient, not an FD fallback —
-/// the dual path is what a shaped ETA must not lose.
+/// the compiled plan is what a shaped ETA must not lose.
 ///
 /// Unlike `additive_covariate_nonmem_anchor`'s dataset, this one shows no
 /// absolute-objective offset between the engines, so the absolute OFV is
 /// checked too, not only the difference.
 ///
-/// Measured worst over the three arms (Linux aarch64 via `tools/linux-test.sh`
-/// and macOS arm64 print the same digits): ΔOFV
-/// 1.9e-7, absolute OFV 1.3e-7, posthoc η 2.7e-8, `IPRED` 4.3e-8 relative — the
-/// null twin alone reads η 1.3e-8 / `IPRED` 2.5e-8, so the transform adds
-/// nothing measurable. Bounds 2e-6 (OFV) / 3e-7 (η) / 5e-7 (`IPRED`): ~10×
-/// headroom, and six orders below the smallest shape effect anchored (ΔOFV
-/// 0.72).
+/// Measured worst over the three arms after the port to compiled plans (#2939), the same
+/// digits on Linux aarch64 (`tools/linux-test.sh`) and macOS arm64: ΔOFV 4.8e-8, absolute
+/// OFV 3.3e-8, posthoc η 2.2e-8, `IPRED` 3.0e-8 relative — the null twin alone reads η
+/// 1.5e-8 / `IPRED` 2.3e-8, so the transform adds nothing measurable. Bounds 5e-7 (OFV) /
+/// 3e-7 (η) / 5e-7 (`IPRED`): 10–17× headroom, and six orders below the smallest shape
+/// effect anchored (ΔOFV 0.72).
 fn check_arm(src: &str, stem: &str, nm_ofv: f64) {
     let (null, _) = evaluate(&null_model());
     let (arm, pop) = evaluate(src);
@@ -191,8 +190,8 @@ fn check_arm(src: &str, stem: &str, nm_ofv: f64) {
         (d_ferx - d_nm).abs(),
         arm.ofv
     );
-    assert!((d_ferx - d_nm).abs() < 2e-6, "{stem}: ΔOFV {d_ferx} vs {d_nm}");
-    assert!((arm.ofv - nm_ofv).abs() < 2e-6, "{stem}: OFV {} vs {nm_ofv}", arm.ofv);
+    assert!((d_ferx - d_nm).abs() < 5e-7, "{stem}: ΔOFV {d_ferx} vs {d_nm}");
+    assert!((arm.ofv - nm_ofv).abs() < 5e-7, "{stem}: OFV {} vs {nm_ofv}", arm.ofv);
     assert!(eta < 3e-7, "{stem}: worst η error {eta:e}");
     assert!(ipred < 5e-7, "{stem}: worst IPRED error {ipred:e}");
 }
@@ -235,7 +234,7 @@ fn the_null_twin_matches_nonmem() {
         r.ofv
     );
     assert!(
-        eta < 3e-7 && ipred < 5e-7 && (r.ofv - NM_OFV_NULL).abs() < 2e-6,
+        eta < 3e-7 && ipred < 5e-7 && (r.ofv - NM_OFV_NULL).abs() < 5e-7,
         "null: η {eta:e}, IPRED {ipred:e}"
     );
 }
