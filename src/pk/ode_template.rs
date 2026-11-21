@@ -146,15 +146,9 @@ impl EliminationForm {
 /// (matching the analytical `pk` model's required/unknown-parameter rules), so
 /// the generated equations never reference an unmapped name.
 pub fn generate(
-    model_name: &str,
-    params: &HashMap<String, String>,
+    model_name: &str, params: &HashMap<String, String>,
 ) -> Result<GeneratedDisposition, String> {
-    generate_variant(
-        model_name,
-        params,
-        &InputForm::Template,
-        &EliminationForm::FirstOrder,
-    )
+    generate_variant(model_name, params, &InputForm::Template, &EliminationForm::FirstOrder)
 }
 
 /// [`generate`], with the central compartment's input and elimination terms
@@ -172,9 +166,7 @@ pub fn generate(
 /// Only the `central` equation changes; the depot and peripheral equations are
 /// the template's own, which is why a caller writes exactly one override line.
 pub fn generate_variant(
-    model_name: &str,
-    params: &HashMap<String, String>,
-    input: &InputForm,
+    model_name: &str, params: &HashMap<String, String>, input: &InputForm,
     elimination: &EliminationForm,
 ) -> Result<GeneratedDisposition, String> {
     // Name → model and the required-role set both come from the shared analytical
@@ -190,11 +182,8 @@ pub fn generate_variant(
         )
     })?;
     let name = model.canonical_name();
-    let required: Vec<&'static str> = model
-        .required_pk_params()
-        .iter()
-        .map(|(_, role)| *role)
-        .collect();
+    let required: Vec<&'static str> =
+        model.required_pk_params().iter().map(|(_, role)| *role).collect();
 
     for &role in &required {
         if !params.contains_key(role) {
@@ -206,11 +195,8 @@ pub fn generate_variant(
             ));
         }
     }
-    let mut extra: Vec<&str> = params
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !required.contains(k))
-        .collect();
+    let mut extra: Vec<&str> =
+        params.keys().map(String::as_str).filter(|k| !required.contains(k)).collect();
     if !extra.is_empty() {
         extra.sort_unstable();
         return Err(format!(
@@ -243,31 +229,15 @@ pub fn generate_variant(
         // transit (#386) and Freijer & Post inverse-Gaussian (#790) forcings
         // delivered straight into central — the ODE analogue of their
         // exponential-tilting closed forms.
-        PkModel::OneCptTransit => (
-            None,
-            format!("transit(n={}, mtt={})", g("n"), g("mtt")),
-            g("v"),
-            vec![],
-        ),
-        PkModel::OneCptIg => (
-            None,
-            format!("igd(mat={}, cv2={})", g("mat"), g("cv2")),
-            g("v"),
-            vec![],
-        ),
+        PkModel::OneCptTransit => {
+            (None, format!("transit(n={}, mtt={})", g("n"), g("mtt")), g("v"), vec![])
+        }
+        PkModel::OneCptIg => {
+            (None, format!("igd(mat={}, cv2={})", g("mat"), g("cv2")), g("v"), vec![])
+        }
         PkModel::OneCptIv => (None, String::new(), g("v"), vec![]),
-        PkModel::OneCptOral => (
-            Some(g("ka")),
-            format!("{} * depot", g("ka")),
-            g("v"),
-            vec![],
-        ),
-        PkModel::TwoCptIv => (
-            None,
-            String::new(),
-            g("v1"),
-            vec![("periph", g("q"), g("v2"))],
-        ),
+        PkModel::OneCptOral => (Some(g("ka")), format!("{} * depot", g("ka")), g("v"), vec![]),
+        PkModel::TwoCptIv => (None, String::new(), g("v1"), vec![("periph", g("q"), g("v2"))]),
         PkModel::TwoCptOral => (
             Some(g("ka")),
             format!("{} * depot", g("ka")),
@@ -380,10 +350,7 @@ pub fn generate_variant(
     odes.push(dt("central", central));
     for (state, q, vp) in &periphs {
         states.push((*state).to_string());
-        odes.push(dt(
-            state,
-            format!("({q}/{vc}) * central - ({q}/{vp}) * {state}"),
-        ));
+        odes.push(dt(state, format!("({q}/{vc}) * central - ({q}/{vp}) * {state}")));
     }
 
     Ok(GeneratedDisposition {
@@ -399,10 +366,7 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     #[test]
@@ -420,13 +384,7 @@ mod tests {
         // Non-default names exercise the substitution (clearance is CLP here).
         let g = generate(
             "two_cpt_oral",
-            &map(&[
-                ("cl", "CLP"),
-                ("v1", "VC"),
-                ("q", "QQ"),
-                ("v2", "VP"),
-                ("ka", "KABS"),
-            ]),
+            &map(&[("cl", "CLP"), ("v1", "VC"), ("q", "QQ"), ("v2", "VP"), ("ka", "KABS")]),
         )
         .unwrap();
         assert_eq!(g.states, vec!["depot", "central", "periph"]);
@@ -437,10 +395,7 @@ mod tests {
             lines[1],
             "d/dt(central) = KABS * depot - (CLP/VC + QQ/VC) * central + (QQ/VP) * periph"
         );
-        assert_eq!(
-            lines[2],
-            "d/dt(periph) = (QQ/VC) * central - (QQ/VP) * periph"
-        );
+        assert_eq!(lines[2], "d/dt(periph) = (QQ/VC) * central - (QQ/VP) * periph");
     }
 
     #[test]
@@ -467,24 +422,16 @@ mod tests {
             lines[0],
             "d/dt(central) = -(CL/V1 + Q2/V1 + Q3/V1) * central + (Q2/V2) * periph1 + (Q3/V3) * periph2"
         );
-        assert_eq!(
-            lines[1],
-            "d/dt(periph1) = (Q2/V1) * central - (Q2/V2) * periph1"
-        );
-        assert_eq!(
-            lines[2],
-            "d/dt(periph2) = (Q3/V1) * central - (Q3/V3) * periph2"
-        );
+        assert_eq!(lines[1], "d/dt(periph1) = (Q2/V1) * central - (Q2/V2) * periph1");
+        assert_eq!(lines[2], "d/dt(periph2) = (Q3/V1) * central - (Q3/V3) * periph2");
     }
 
     #[test]
     fn compartment_aliases_resolve() {
         // The long `*_compartment_*` aliases generate the same disposition.
-        let a = generate(
-            "two_cpt_iv",
-            &map(&[("cl", "CL"), ("v1", "V1"), ("q", "Q"), ("v2", "V2")]),
-        )
-        .unwrap();
+        let a =
+            generate("two_cpt_iv", &map(&[("cl", "CL"), ("v1", "V1"), ("q", "Q"), ("v2", "V2")]))
+                .unwrap();
         let b = generate(
             "two_compartment_iv",
             &map(&[("cl", "CL"), ("v1", "V1"), ("q", "Q"), ("v2", "V2")]),
@@ -497,21 +444,16 @@ mod tests {
     fn missing_required_role_errors() {
         // Oral model without `ka` — the generated central eqn would reference an
         // unmapped transfer constant, so this must be rejected (not silently run).
-        let err = generate(
-            "two_cpt_oral",
-            &map(&[("cl", "CL"), ("v1", "V1"), ("q", "Q"), ("v2", "V2")]),
-        )
-        .unwrap_err();
+        let err =
+            generate("two_cpt_oral", &map(&[("cl", "CL"), ("v1", "V1"), ("q", "Q"), ("v2", "V2")]))
+                .unwrap_err();
         assert!(err.contains("requires `ka`"), "got: {err}");
     }
 
     #[test]
     fn unknown_role_errors() {
-        let err = generate(
-            "one_cpt_iv",
-            &map(&[("cl", "CL"), ("v", "V"), ("ka", "KA")]),
-        )
-        .unwrap_err();
+        let err =
+            generate("one_cpt_iv", &map(&[("cl", "CL"), ("v", "V"), ("ka", "KA")])).unwrap_err();
         assert!(err.contains("unknown parameter"), "got: {err}");
         assert!(err.contains("ka"), "got: {err}");
     }
@@ -549,11 +491,8 @@ mod tests {
 
             // Drop each required role in turn → a parse error naming that role.
             for omit in &roles {
-                let partial: Vec<(&str, &str)> = roles
-                    .iter()
-                    .filter(|r| *r != omit)
-                    .map(|r| (*r, "X"))
-                    .collect();
+                let partial: Vec<(&str, &str)> =
+                    roles.iter().filter(|r| *r != omit).map(|r| (*r, "X")).collect();
                 let err = generate(name, &map(&partial)).unwrap_err();
                 assert!(
                     err.contains(&format!("requires `{omit}`")),
@@ -695,13 +634,8 @@ mod tests {
             let params = owned(&roles_of(name));
             assert_eq!(
                 generate(name, &params).unwrap(),
-                generate_variant(
-                    name,
-                    &params,
-                    &InputForm::Template,
-                    &EliminationForm::FirstOrder
-                )
-                .unwrap(),
+                generate_variant(name, &params, &InputForm::Template, &EliminationForm::FirstOrder)
+                    .unwrap(),
                 "{name}"
             );
         }
@@ -734,18 +668,12 @@ mod tests {
         let g = generate_variant(
             "two_cpt_iv",
             &owned(&roles_of("two_cpt_iv")),
-            &InputForm::Weibull {
-                td: "TD".into(),
-                beta: "BETA".into(),
-            },
+            &InputForm::Weibull { td: "TD".into(), beta: "BETA".into() },
             &EliminationForm::FirstOrder,
         )
         .unwrap();
         assert_eq!(g.states, vec!["central", "periph"]);
-        assert_eq!(
-            g.odes[1].1,
-            "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph"
-        );
+        assert_eq!(g.odes[1].1, "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph");
     }
 
     /// A replacement input on a template that already absorbs is refused —
@@ -768,10 +696,7 @@ mod tests {
             let err = generate_variant(
                 name,
                 &owned(&roles_of(name)),
-                &InputForm::Weibull {
-                    td: "TD".into(),
-                    beta: "BETA".into(),
-                },
+                &InputForm::Weibull { td: "TD".into(), beta: "BETA".into() },
                 &EliminationForm::FirstOrder,
             )
             .unwrap_err();
@@ -806,10 +731,7 @@ mod tests {
             central_of(
                 "two_cpt_oral",
                 &InputForm::Template,
-                &EliminationForm::MixedFoMm {
-                    clmm: "CLMM".into(),
-                    km: "KM".into(),
-                },
+                &EliminationForm::MixedFoMm { clmm: "CLMM".into(), km: "KM".into() },
             ),
             "d/dt(central) = KA * depot \
              - ((CL + CLMM * KM / (KM + central / V1)) / V1) * central \

@@ -30,16 +30,8 @@ fn assert_same(left: &[PredictionResult], right: &[PredictionResult]) {
     assert_eq!(left.len(), right.len());
     for (index, (left, right)) in left.iter().zip(right).enumerate() {
         assert_eq!(left.id, right.id, "ID differs at row {index}");
-        assert_eq!(
-            left.time.to_bits(),
-            right.time.to_bits(),
-            "TIME differs at row {index}"
-        );
-        assert_eq!(
-            left.pred.to_bits(),
-            right.pred.to_bits(),
-            "PRED differs at row {index}"
-        );
+        assert_eq!(left.time.to_bits(), right.time.to_bits(), "TIME differs at row {index}");
+        assert_eq!(left.pred.to_bits(), right.pred.to_bits(), "PRED differs at row {index}");
     }
 }
 
@@ -70,9 +62,7 @@ fn ode_predict_is_ordered_and_deterministic_across_worker_counts() {
 }
 
 fn timed_prediction(
-    pool: &PoolPlan,
-    model: &ferx_core::CompiledModel,
-    population: &ferx_core::Population,
+    pool: &PoolPlan, model: &ferx_core::CompiledModel, population: &ferx_core::Population,
 ) -> Duration {
     let start = Instant::now();
     pool.install(|| black_box(predict(model, population, &model.default_params).unwrap()))
@@ -90,10 +80,9 @@ fn report_predict_subject_parallel_speedups() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16);
-    for (label, path, repetitions) in [
-        ("analytical", "examples/warfarin.ferx", 15),
-        ("ode", "examples/warfarin_ode.ferx", 7),
-    ] {
+    for (label, path, repetitions) in
+        [("analytical", "examples/warfarin.ferx", 15), ("ode", "examples/warfarin_ode.ferx", 7)]
+    {
         let (model, population) = fixture(path, copies);
         let serial_pool = PoolPlan::new(1, 1);
         let parallel_pool = PoolPlan::new(4, 1);

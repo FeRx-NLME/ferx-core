@@ -40,10 +40,7 @@ fn run(model_src: &str, data: &str) -> FitResult {
 /// `src` with its `iov_column = OCC` line replaced by an explicit level, and the kappa
 /// line `kappa_line` replaced by `explicit`.
 fn explicit(src: &str, kappa_line: &str, explicit: &str) -> String {
-    assert!(
-        src.contains("  iov_column = OCC\n"),
-        "fixture has an iov_column line"
-    );
+    assert!(src.contains("  iov_column = OCC\n"), "fixture has an iov_column line");
     assert!(src.contains(kappa_line), "fixture has `{kappa_line}`");
     src.replace("  iov_column = OCC\n", "")
         .replace(kappa_line, &format!("level OCC by OCC in ID\n  {explicit}"))
@@ -55,27 +52,15 @@ fn bits(m: &nalgebra::DMatrix<f64>) -> Vec<u64> {
 
 fn assert_same_bits(label: &str, a: &FitResult, b: &FitResult) {
     assert!(a.ofv.is_finite(), "{label}: OFV {}", a.ofv);
-    assert_eq!(
-        a.ofv.to_bits(),
-        b.ofv.to_bits(),
-        "{label}: OFV {} vs {}",
-        a.ofv,
-        b.ofv
-    );
+    assert_eq!(a.ofv.to_bits(), b.ofv.to_bits(), "{label}: OFV {} vs {}", a.ofv, b.ofv);
     let tb = |r: &FitResult| r.theta.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     assert_eq!(tb(a), tb(b), "{label}: θ");
     assert_eq!(bits(&a.omega), bits(&b.omega), "{label}: Ω");
-    assert_eq!(
-        a.omega_iov.as_ref().map(bits),
-        b.omega_iov.as_ref().map(bits),
-        "{label}: Ω_IOV"
-    );
+    assert_eq!(a.omega_iov.as_ref().map(bits), b.omega_iov.as_ref().map(bits), "{label}: Ω_IOV");
     assert_eq!(a.ebe_kappas.len(), b.ebe_kappas.len(), "{label}: subjects");
     for (i, (ka, kb)) in a.ebe_kappas.iter().zip(&b.ebe_kappas).enumerate() {
         let f = |k: &Vec<nalgebra::DVector<f64>>| {
-            k.iter()
-                .flat_map(|v| v.iter().map(|x| x.to_bits()))
-                .collect::<Vec<_>>()
+            k.iter().flat_map(|v| v.iter().map(|x| x.to_bits())).collect::<Vec<_>>()
         };
         assert!(!ka.is_empty(), "{label}: subject {i} has κ̂");
         assert_eq!(f(ka), f(kb), "{label}: κ̂ of subject {i}");
@@ -90,14 +75,8 @@ fn one_explicit_level_is_iov_column_bit_for_bit_on_warfarin_iov() {
     let line = "kappa KAPPA_CL ~ 0.01\n";
     for (label, tail) in [
         ("at OCC", "kappa KAPPA_CL ~ 0.01 at OCC\n"),
-        (
-            "at OCC weight = 1",
-            "kappa KAPPA_CL ~ 0.01 at OCC weight = 1\n",
-        ),
-        (
-            "weight = 1 at OCC",
-            "kappa KAPPA_CL ~ 0.01 weight = 1 at OCC\n",
-        ),
+        ("at OCC weight = 1", "kappa KAPPA_CL ~ 0.01 at OCC weight = 1\n"),
+        ("weight = 1 at OCC", "kappa KAPPA_CL ~ 0.01 weight = 1 at OCC\n"),
     ] {
         let model = explicit(&src, line, tail);
         assert_same_bits(label, &today, &run(&model, data));
@@ -109,27 +88,15 @@ fn one_explicit_level_is_iov_column_bit_for_bit_on_kappa_weight_iov() {
     let src = std::fs::read_to_string("tests/nonmem/kappa_weight_iov.ferx").unwrap();
     let data = "tests/nonmem/kappa_weight_iov.csv";
     let today = run(&src, data);
-    assert!(
-        today.kappa_weights.iter().any(|w| w.is_some()),
-        "the fixture is weighted"
-    );
+    assert!(today.kappa_weights.iter().any(|w| w.is_some()), "the fixture is weighted");
     let line = "kappa KAPPA_CL ~ 0.01 weight = NARM\n";
     for (label, tail) in [
-        (
-            "at OCC weight = NARM",
-            "kappa KAPPA_CL ~ 0.01 at OCC weight = NARM\n",
-        ),
-        (
-            "weight = NARM at OCC",
-            "kappa KAPPA_CL ~ 0.01 weight = NARM at OCC\n",
-        ),
+        ("at OCC weight = NARM", "kappa KAPPA_CL ~ 0.01 at OCC weight = NARM\n"),
+        ("weight = NARM at OCC", "kappa KAPPA_CL ~ 0.01 weight = NARM at OCC\n"),
     ] {
         let model = explicit(&src, line, tail);
         let r = run(&model, data);
-        assert_eq!(
-            r.kappa_weights, today.kappa_weights,
-            "{label}: the weight is kept"
-        );
+        assert_eq!(r.kappa_weights, today.kappa_weights, "{label}: the weight is kept");
         assert_same_bits(label, &today, &r);
     }
 }

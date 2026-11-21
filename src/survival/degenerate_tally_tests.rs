@@ -68,9 +68,7 @@ fn every_cell_of_the_degenerate_hazard_text() {
     let ten: Vec<(usize, usize)> = (1..=10).map(|s| (1, 2 * s)).collect();
     assert_eq!(
         tally(1, 50, &ten).warnings_by_replicate(),
-        vec![line(
-            " in 10 of 50 replicates (sim 2, 4, 6, 8, 10, 12, 14, 16, 18, 20)"
-        )]
+        vec![line(" in 10 of 50 replicates (sim 2, 4, 6, 8, 10, 12, 14, 16, 18, 20)")]
     );
 
     // Cell 3: more than 10. Dies if: the cap or "and m more" is dropped, or `k` becomes the
@@ -78,17 +76,12 @@ fn every_cell_of_the_degenerate_hazard_text() {
     let twelve: Vec<(usize, usize)> = (1..=12).map(|s| (1, s)).collect();
     assert_eq!(
         tally(1, 50, &twelve).warnings_by_replicate(),
-        vec![line(
-            " in 12 of 50 replicates (sim 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more)"
-        )]
+        vec![line(" in 12 of 50 replicates (sim 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more)")]
     );
 
     // Cell 4: every replicate. Dies if: "all" falls back to "k of n" or an index list.
     let all: Vec<(usize, usize)> = (1..=4).map(|s| (1, s)).collect();
-    assert_eq!(
-        tally(1, 4, &all).warnings_by_replicate(),
-        vec![line(" in all 4 replicates")]
-    );
+    assert_eq!(tally(1, 4, &all).warnings_by_replicate(), vec![line(" in all 4 replicates")]);
 
     // Cell 5: uncertainty draws, some replicates. The affected **draws** are named, each
     // once, never a bare `sim` list. Dies if: the draws clause is dropped, `sim` is named,
@@ -119,18 +112,14 @@ fn every_cell_of_the_degenerate_hazard_text() {
     let every: Vec<(usize, usize)> = (1..=3).flat_map(|d| (1..=2).map(move |s| (d, s))).collect();
     assert_eq!(
         tally(3, 2, &every).warnings_by_draw(),
-        vec![line(
-            " in all 6 replicates of all 3 simulated uncertainty draws"
-        )]
+        vec![line(" in all 6 replicates of all 3 simulated uncertainty draws")]
     );
 
     // Cell 7: `n` and `D` are what `count_draw` counted, so a skipped draw (never counted)
     // is in neither. 18 draws ran of a requested 20.
     assert_eq!(
         tally(18, 5, &[(4, 2)]).warnings_by_draw(),
-        vec![line(
-            " in 1 of 90 replicates, in 1 of 18 simulated uncertainty draws (draw 4)"
-        )]
+        vec![line(" in 1 of 90 replicates, in 1 of 18 simulated uncertainty draws (draw 4)")]
     );
 
     // An uncertainty run of a single draw has no ambiguous `sim`: it reads by replicate.
@@ -168,10 +157,7 @@ fn every_cell_of_the_degenerate_hazard_text() {
     t.record(2, "A", 2, 1, 4);
     assert_eq!(
         t.warnings_by_replicate(),
-        vec![
-            line(" in 1 of 4 replicates (sim 1)"),
-            line(" in 2 of 4 replicates (sim 1, 4)"),
-        ]
+        vec![line(" in 1 of 4 replicates (sim 1)"), line(" in 2 of 4 replicates (sim 1, 4)"),]
     );
 
     // Nothing degenerate: no line.
@@ -203,10 +189,7 @@ fn absorb_continues_the_replicates_of_an_earlier_run() {
     // A subject hit in every replicate of every run reads as all of them.
     let mut whole = tally(1, 2, &[(1, 1), (1, 2)]);
     whole.absorb(tally(1, 1, &[(1, 1)]), 2);
-    assert_eq!(
-        whole.warnings_by_replicate(),
-        vec![line(" in all 3 replicates")]
-    );
+    assert_eq!(whole.warnings_by_replicate(), vec![line(" in all 3 replicates")]);
 }
 
 const ZERO_RATE: &str = "
@@ -256,13 +239,8 @@ fn censored_subject(cmts: &[usize]) -> Subject {
 /// then `(rows, warnings, degenerate CMTs)` of the reporting one, from the same seed.
 #[allow(clippy::type_complexity)]
 fn both_forms(
-    src: &str,
-    cmts: &[usize],
-    eta: f64,
-) -> (
-    (Vec<String>, Vec<String>),
-    (Vec<String>, Vec<String>, Vec<usize>),
-) {
+    src: &str, cmts: &[usize], eta: f64,
+) -> ((Vec<String>, Vec<String>), (Vec<String>, Vec<String>, Vec<usize>)) {
     let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
     let subject = censored_subject(cmts);
     let theta = model.default_params.theta.clone();
@@ -274,18 +252,7 @@ fn both_forms(
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(1648);
     let (mut rows, mut warnings) = (Vec::new(), Vec::new());
-    simulate_tte(
-        &model,
-        &subject,
-        &theta,
-        &[eta],
-        1,
-        1,
-        None,
-        &mut rng,
-        &mut rows,
-        &mut warnings,
-    );
+    simulate_tte(&model, &subject, &theta, &[eta], 1, 1, None, &mut rng, &mut rows, &mut warnings);
     let public = (rows_of(&rows), warnings);
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(1648);
@@ -330,10 +297,7 @@ fn the_public_simulate_tte_keeps_its_per_call_line() {
 
     // Competing risks, both causes degenerate: one line per CMT, in record order.
     let (public, reporting) = both_forms(ZERO_RATE_TWO_CAUSES, &[2, 3], -0.2);
-    assert_eq!(
-        public.1,
-        vec![line(""), line("").replace("(CMT=2)", "(CMT=3)"),]
-    );
+    assert_eq!(public.1, vec![line(""), line("").replace("(CMT=2)", "(CMT=3)"),]);
     assert_eq!(reporting.0, public.0);
     assert!(reporting.1.is_empty());
     assert_eq!(reporting.2, vec![2, 3]);

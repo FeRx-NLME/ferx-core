@@ -197,11 +197,7 @@ impl VariationalFamily for MeanField {
             d_phi[d + k] = s_kk * oinv[(k, k)] - 1.0;
         }
 
-        Some(KlTerm {
-            value,
-            d_phi,
-            d_omega: d_kl_d_omega(oinv, &self.moments(phi).1, &mu),
-        })
+        Some(KlTerm { value, d_phi, d_omega: d_kl_d_omega(oinv, &self.moments(phi).1, &mu) })
     }
 
     fn log_density(&self, phi: &[f64], eta: &[f64]) -> (f64, Vec<f64>) {
@@ -297,11 +293,8 @@ impl VariationalFamily for FullRank {
         for i in 0..d {
             for j in 0..=i {
                 let v = omega.chol[(i, j)];
-                phi[d + tril_index(i, j)] = if i == j {
-                    v.max(MIN_INIT_VAR.sqrt()).ln()
-                } else {
-                    v
-                };
+                phi[d + tril_index(i, j)] =
+                    if i == j { v.max(MIN_INIT_VAR.sqrt()).ln() } else { v };
             }
         }
         phi
@@ -365,11 +358,7 @@ impl VariationalFamily for FullRank {
             }
         }
 
-        Some(KlTerm {
-            value,
-            d_phi,
-            d_omega: d_kl_d_omega(oinv, &s, &mu),
-        })
+        Some(KlTerm { value, d_phi, d_omega: d_kl_d_omega(oinv, &s, &mu) })
     }
 
     fn log_density(&self, phi: &[f64], eta: &[f64]) -> (f64, Vec<f64>) {

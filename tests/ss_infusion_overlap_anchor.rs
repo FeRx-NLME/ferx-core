@@ -85,13 +85,7 @@ fn worst_against(model: &str, want: &Table, ids: &[&str]) -> f64 {
     for p in preds.iter().filter(|p| ids.contains(&p.id.as_str())) {
         let w = want[&(p.id.clone(), p.time.to_bits())];
         let rel = (p.pred - w).abs() / w.abs();
-        assert!(
-            rel.is_finite(),
-            "{model} ID {} t={}: {} vs {w}",
-            p.id,
-            p.time,
-            p.pred
-        );
+        assert!(rel.is_finite(), "{model} ID {} t={}: {} vs {w}", p.id, p.time, p.pred);
         worst = worst.max(rel);
         n += 1;
     }
@@ -142,14 +136,8 @@ fn overlapping_ss_infusion_matches_nonmem() {
         let w_flat = worst_against(&closed, &want, FLAT);
         let w_step = worst_against(&closed, &want, STEPPED);
         let w_ode = worst_against(&ode, &want, ALL);
-        assert!(
-            w_flat < BOUND_CLOSED,
-            "{closed} superposition vs NONMEM: {w_flat:.3e}"
-        );
-        assert!(
-            w_step < BOUND_CLOSED,
-            "{closed} event walk vs NONMEM: {w_step:.3e}"
-        );
+        assert!(w_flat < BOUND_CLOSED, "{closed} superposition vs NONMEM: {w_flat:.3e}");
+        assert!(w_step < BOUND_CLOSED, "{closed} event walk vs NONMEM: {w_step:.3e}");
         assert!(w_ode < 1e-11, "{ode} vs NONMEM: {w_ode:.3e}");
     }
 }

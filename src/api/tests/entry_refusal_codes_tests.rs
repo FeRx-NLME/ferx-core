@@ -1,5 +1,5 @@
 //! Tier-1 tests for #1774: the predict / simulate / adaptive refusals `ferx check` cannot
-//! reach carry a code, one per cause, assigned in `api/entry_refusals.rs`.
+//! reach carry a code, one per cause, assigned in `entry_refusals.rs`.
 //!
 //! One row per refusal **text**, through the public entry point that raises it. Each row
 //! asserts three things, and each has its own mutation:
@@ -32,19 +32,10 @@ struct Row {
 }
 
 fn row<T>(
-    name: &'static str,
-    got: Result<T, crate::EngineError>,
-    code: &'static str,
-    block: Option<&'static str>,
-    text: &'static str,
+    name: &'static str, got: Result<T, crate::EngineError>, code: &'static str,
+    block: Option<&'static str>, text: &'static str,
 ) -> Row {
-    Row {
-        name,
-        got: got.map(|_| ()),
-        code,
-        block,
-        text,
-    }
+    Row { name, got: got.map(|_| ()), code, block, text }
 }
 
 /// Every mismatch at once, so one run names every row that moved rather than the first.
@@ -59,12 +50,7 @@ fn check_rows(rows: Vec<Row>) {
             bad.push(format!("{}: code {:?}, want {}", r.name, e.code(), r.code));
         }
         if e.block() != r.block {
-            bad.push(format!(
-                "{}: block {:?}, want {:?}",
-                r.name,
-                e.block(),
-                r.block
-            ));
+            bad.push(format!("{}: block {:?}, want {:?}", r.name, e.block(), r.block));
         }
         if e.to_string() != r.text {
             bad.push(format!("{}: text\n  got:  {e}\n  want: {}", r.name, r.text));
@@ -98,11 +84,7 @@ fn observed(id: &str, dvs: &[f64]) -> Subject {
 }
 
 fn opts(horizon: Option<f64>) -> SimulateOptions {
-    SimulateOptions {
-        seed: Some(1),
-        horizon,
-        ..Default::default()
-    }
+    SimulateOptions { seed: Some(1), horizon, ..Default::default() }
 }
 
 /// Zero uncertainty draws, so a refusal it returns preceded any draw.
@@ -252,10 +234,7 @@ fn simulate_option_and_input_refusals_carry_their_codes() {
         ),
         row(
             "propensity, a non-finite DV",
-            matched(&population_of(
-                vec![observed("1", &[1.0]), observed("8", &[f64::NAN])],
-                &[],
-            )),
+            matched(&population_of(vec![observed("1", &[1.0]), observed("8", &[f64::NAN])], &[])),
             "E_PROPENSITY_INPUT",
             None,
             "propensity-score matching requires finite observations for every subject (to \
@@ -265,12 +244,7 @@ fn simulate_option_and_input_refusals_carry_their_codes() {
         ),
         row(
             "Ω_IOV missing (#1019)",
-            simulate(
-                &iov,
-                &population_of(vec![observed("1", &[1.0])], &[]),
-                &no_iov,
-                1,
-            ),
+            simulate(&iov, &population_of(vec![observed("1", &[1.0])], &[]), &no_iov, 1),
             "E_PARAM_SHAPE",
             None,
             "model declares 1 kappa (IOV) but the supplied parameters carry no omega_iov; \
@@ -310,10 +284,9 @@ fn tte_simulation_refusals_carry_their_codes() {
 
     let rtte = parse_model_string(&read("examples/rtte_exponential.ferx")).expect("parse");
     let competing = read("examples/tte_competing_risks.ferx");
-    let two_rtte = parse_model_string(&competing.replace(
-        "family = exponential",
-        "type   = rtte\n  family = exponential",
-    ))
+    let two_rtte = parse_model_string(
+        &competing.replace("family = exponential", "type   = rtte\n  family = exponential"),
+    )
     .expect("parse");
     let rtte_and_single = parse_model_string(&competing.replacen(
         "family = exponential",
@@ -345,11 +318,7 @@ fn tte_simulation_refusals_carry_their_codes() {
         ),
         row(
             "RTTE on two CMTs",
-            sim(
-                &two_rtte,
-                one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])),
-                Some(20.0),
-            ),
+            sim(&two_rtte, one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])), Some(20.0)),
             "E_TTE_NOT_SIMULATABLE",
             Some("event_model"),
             "RTTE simulation supports one recurrent stream per subject, but subject '4' \
@@ -358,11 +327,7 @@ fn tte_simulation_refusals_carry_their_codes() {
         ),
         row(
             "RTTE beside a single-event cause",
-            sim(
-                &rtte_and_single,
-                one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])),
-                Some(20.0),
-            ),
+            sim(&rtte_and_single, one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])), Some(20.0)),
             "E_TTE_NOT_SIMULATABLE",
             Some("event_model"),
             "RTTE simulation does not support an RTTE cause combined with a competing \
@@ -370,11 +335,7 @@ fn tte_simulation_refusals_carry_their_codes() {
         ),
         row(
             "RTTE with a reset",
-            sim(
-                &rtte,
-                one(with_reset(tte_subject(vec![event(2, 0.0)]))),
-                Some(20.0),
-            ),
+            sim(&rtte, one(with_reset(tte_subject(vec![event(2, 0.0)]))), Some(20.0)),
             "E_TTE_NOT_SIMULATABLE",
             Some("event_model"),
             "RTTE simulation does not support EVID=3/4 resets (a reset would disturb the \
@@ -393,11 +354,7 @@ fn tte_simulation_refusals_carry_their_codes() {
         ),
         row(
             "ODE-accumulated TTE with a reset",
-            sim(
-                &ode_tte,
-                one(with_reset(tte_subject(vec![event(3, 0.0)]))),
-                Some(20.0),
-            ),
+            sim(&ode_tte, one(with_reset(tte_subject(vec![event(3, 0.0)]))), Some(20.0)),
             "E_TTE_NOT_SIMULATABLE",
             Some("event_model"),
             "ODE-accumulated TTE simulation does not support EVID=3/4 resets (a full \
@@ -463,11 +420,7 @@ fn tte_simulation_refusals_carry_their_codes() {
         // cannot draw is still refused, with the text of the options path.
         row(
             "uncertainty, RTTE on two CMTs, valid horizon",
-            unc(
-                &two_rtte,
-                one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])),
-                Some(20.0),
-            ),
+            unc(&two_rtte, one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])), Some(20.0)),
             "E_TTE_NOT_SIMULATABLE",
             Some("event_model"),
             "RTTE simulation supports one recurrent stream per subject, but subject '4' \
@@ -483,13 +436,7 @@ fn tte_simulation_refusals_carry_their_codes() {
 fn ctmm_refusals_carry_their_code() {
     let src = std::fs::read_to_string("examples/ctmm_2state.ferx").expect("example");
     let model = parse_model_string(&src).expect("parse");
-    let pop = population_of(
-        vec![Subject {
-            id: "1".to_string(),
-            ..Default::default()
-        }],
-        &[],
-    );
+    let pop = population_of(vec![Subject { id: "1".to_string(), ..Default::default() }], &[]);
     let p = &model.default_params;
     check_rows(vec![
         row(
@@ -531,19 +478,13 @@ fn adaptive_refusals_carry_their_codes() {
     let pop = population_of(vec![observed("1", &[1.0])], &[]);
     let bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
     let programmatic = |m: &CompiledModel, decision_times: Vec<f64>| {
-        let o = AdaptiveSimulateOptions {
-            seed: Some(1),
-            decision_times,
-            ..Default::default()
-        };
+        let o = AdaptiveSimulateOptions { seed: Some(1), decision_times, ..Default::default() };
         simulate_adaptive(m, &pop, &m.default_params, 1, bolus, &o)
     };
     // The TDM example's spec, edited one field at a time.
     let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
-    let spec = parse_full_model(&tdm)
-        .expect("parse")
-        .adaptive_dosing
-        .expect("has [adaptive_dosing]");
+    let spec =
+        parse_full_model(&tdm).expect("parse").adaptive_dosing.expect("has [adaptive_dosing]");
     let from_spec = |m: &CompiledModel,
                      pop: &Population,
                      edit: &dyn Fn(&mut crate::sim::adaptive::AdaptiveDosingSpec),
@@ -553,30 +494,20 @@ fn adaptive_refusals_carry_their_codes() {
         simulate_adaptive_from_spec(m, pop, &m.default_params, 1, &s, &o)
     };
     let none = |_: &mut crate::sim::adaptive::AdaptiveDosingSpec| {};
-    let seeded = || AdaptiveSimulateOptions {
-        seed: Some(1),
-        ..Default::default()
-    };
+    let seeded = || AdaptiveSimulateOptions { seed: Some(1), ..Default::default() };
     // An IOV twin of `ode`. Since #943 `auc_target` is accepted under IOV, and since the
     // #932 follow-up so is a base regimen × EVID=3 reset: the two together must run.
     let ode_iov = parse_model_string(
         &ODE_ADAPTIVE
-            .replace(
-                "omega ETA_CL ~ 0.09",
-                "omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04",
-            )
+            .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04")
             .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)"),
     )
     .expect("parse");
     let mut base_reset_iov = observed("1", &[1.0, 40.0]);
     base_reset_iov.reset_times = vec![30.0];
     let base_reset_iov = population_of(vec![base_reset_iov], &[]);
-    let ok = from_spec(
-        &ode_iov,
-        &base_reset_iov,
-        &|s| s.auc_target = Some((300.0, 500.0)),
-        seeded(),
-    );
+    let ok =
+        from_spec(&ode_iov, &base_reset_iov, &|s| s.auc_target = Some((300.0, 500.0)), seeded());
     assert!(
         ok.is_ok(),
         "from_spec, auc_target on an IOV model with a base regimen × reset must run: {:?}",
@@ -620,10 +551,7 @@ fn adaptive_refusals_carry_their_codes() {
                 &ode,
                 &pop,
                 &none,
-                AdaptiveSimulateOptions {
-                    decision_times: vec![0.0],
-                    ..seeded()
-                },
+                AdaptiveSimulateOptions { decision_times: vec![0.0], ..seeded() },
             ),
             "E_ADAPTIVE_OPTIONS",
             None,
@@ -652,10 +580,7 @@ fn adaptive_refusals_carry_their_codes() {
                 &ode,
                 &pop,
                 &none,
-                AdaptiveSimulateOptions {
-                    start_interval: Some(24.0),
-                    ..seeded()
-                },
+                AdaptiveSimulateOptions { start_interval: Some(24.0), ..seeded() },
             ),
             "E_ADAPTIVE_OPTIONS",
             None,
@@ -739,15 +664,9 @@ fn adaptive_model_refusal_texts() {
         );
     // An SDE takes no Form C readout, so the observable is the state itself.
     let sde = ODE_ADAPTIVE
-        .replace(
-            "ode(states=[central])",
-            "ode(obs_cmt=central, states=[central])",
-        )
+        .replace("ode(states=[central])", "ode(obs_cmt=central, states=[central])")
         .replace("[scaling]\n  y = central / V\n", "")
-        .replace(
-            "[error_model]",
-            "[diffusion]\n  central ~ 0.01\n[error_model]",
-        );
+        .replace("[error_model]", "[diffusion]\n  central ~ 0.01\n[error_model]");
     let selected = parse_model_string(&selected).expect("parse");
     let sde = parse_model_string(&sde).expect("parse");
     let pop = population_of(vec![observed("1", &[1.0])], &[]);
@@ -841,10 +760,8 @@ fn adaptive_entry_refusals_simulate_no_subject() {
         decision_times,
         ..Default::default()
     };
-    let monitored = |monitors: Vec<MonitorSpec>| AdaptiveSimulateOptions {
-        monitors,
-        ..schedule(vec![0.0])
-    };
+    let monitored =
+        |monitors: Vec<MonitorSpec>| AdaptiveSimulateOptions { monitors, ..schedule(vec![0.0]) };
     let one = population_of(vec![dose_free("1", &[12.0])], &[]);
     // Subject '1' is valid; subject '2' carries a base dose and an EVID=3 reset.
     let mut base_reset = observed("2", &[1.0, 40.0]);
@@ -854,10 +771,8 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     // The spec path: no factory to count, so `n_sim = 0` — a refusal that still fires there
     // cannot be the driver's, which runs only inside a replicate.
     let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
-    let mut spec = parse_full_model(&tdm)
-        .expect("parse")
-        .adaptive_dosing
-        .expect("has [adaptive_dosing]");
+    let mut spec =
+        parse_full_model(&tdm).expect("parse").adaptive_dosing.expect("has [adaptive_dosing]");
     assert!(spec.with_assay_error, "the TDM example draws an assay");
     let mut spec_on = |cmt: usize| {
         spec.assay_cmt = Some(cmt);
@@ -880,10 +795,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
                 "max_decisions",
                 &ode,
                 &one,
-                AdaptiveSimulateOptions {
-                    max_decisions: 1,
-                    ..schedule(vec![0.0, 24.0])
-                },
+                AdaptiveSimulateOptions { max_decisions: 1, ..schedule(vec![0.0, 24.0]) },
             ),
             "E_ADAPTIVE_OPTIONS",
             None,
@@ -946,13 +858,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
         ),
         (
             "base × reset under IOV (#932 follow-up)",
-            run(
-                "ok: base × reset, IOV",
-                &iov,
-                &two,
-                schedule(vec![0.0, 24.0]),
-            )
-            .err(),
+            run("ok: base × reset, IOV", &iov, &two, schedule(vec![0.0, 24.0])).err(),
         ),
         (
             "two decisions under max_decisions = 2",
@@ -960,10 +866,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
                 "ok: max_decisions",
                 &ode,
                 &one,
-                AdaptiveSimulateOptions {
-                    max_decisions: 2,
-                    ..schedule(vec![0.0, 24.0])
-                },
+                AdaptiveSimulateOptions { max_decisions: 2, ..schedule(vec![0.0, 24.0]) },
             )
             .err(),
         ),
@@ -997,10 +900,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
             )
             .err(),
         ),
-        (
-            "from_spec, assay_cmt with an [error_model]",
-            spec_dv_cmt2.err(),
-        ),
+        ("from_spec, assay_cmt with an [error_model]", spec_dv_cmt2.err()),
     ];
     for (what, err) in &accepted {
         assert!(err.is_none(), "{what} must run: {err:?}");
@@ -1056,10 +956,8 @@ fn adaptive_spec_route_refusals_carry_the_spec_code() {
     let lagged = lagged_model();
     let input_rate = input_rate_model();
     let tdm = std::fs::read_to_string("examples/adaptive_tdm_titration.ferx").expect("example");
-    let spec = parse_full_model(&tdm)
-        .expect("parse")
-        .adaptive_dosing
-        .expect("has [adaptive_dosing]");
+    let spec =
+        parse_full_model(&tdm).expect("parse").adaptive_dosing.expect("has [adaptive_dosing]");
     let pop = population_of(vec![dose_free("1", &[12.0])], &[]);
     let run = |m: &CompiledModel, route: AdaptiveRoute, n_sim: usize| {
         let mut s = spec.clone();
@@ -1071,10 +969,7 @@ fn adaptive_spec_route_refusals_carry_the_spec_code() {
             &m.default_params,
             n_sim,
             &s,
-            &AdaptiveSimulateOptions {
-                seed: Some(1),
-                ..Default::default()
-            },
+            &AdaptiveSimulateOptions { seed: Some(1), ..Default::default() },
         )
     };
     let bolus = |cmt: usize| AdaptiveRoute::Bolus { cmt };
@@ -1215,11 +1110,7 @@ fn adaptive_driver_refusals_carry_their_codes() {
                pop: &Population,
                decision_times: Vec<f64>,
                actions: Vec<DoseAction>| {
-        let o = AdaptiveSimulateOptions {
-            seed: Some(1),
-            decision_times,
-            ..Default::default()
-        };
+        let o = AdaptiveSimulateOptions { seed: Some(1), decision_times, ..Default::default() };
         simulate_adaptive(
             m,
             pop,
@@ -1245,12 +1136,7 @@ fn adaptive_driver_refusals_carry_their_codes() {
     check_rows(vec![
         row(
             "base SS dose under IOV",
-            run(
-                &iov,
-                &population_of(vec![ss_base], &[]),
-                vec![0.0, 24.0],
-                bolus(100.0, 1),
-            ),
+            run(&iov, &population_of(vec![ss_base], &[]), vec![0.0, 24.0], bolus(100.0, 1)),
             "E_ADAPTIVE_UNSUPPORTED",
             None,
             "subject '1' (sim 1): ode_predictions_adaptive: a pre-scheduled base dose (index 0) \
@@ -1275,12 +1161,7 @@ fn adaptive_driver_refusals_carry_their_codes() {
         ),
         row(
             "IOV: observation within 1e-15 after a reset",
-            run(
-                &iov,
-                &population_of(vec![obs_after_reset], &[]),
-                vec![0.0],
-                bolus(100.0, 1),
-            ),
+            run(&iov, &population_of(vec![obs_after_reset], &[]), vec![0.0], bolus(100.0, 1)),
             "E_ADAPTIVE_OPTIONS",
             None,
             "subject '1' (sim 1): adaptive-dosing (time-varying) event time 1.0000000000000002 \
@@ -1291,12 +1172,7 @@ fn adaptive_driver_refusals_carry_their_codes() {
         ),
         row(
             "constant path: decision within 1e-15 of a reset",
-            run(
-                &ode,
-                &population_of(vec![reset_at_1], &[]),
-                vec![next_up(1.0)],
-                bolus(100.0, 1),
-            ),
+            run(&ode, &population_of(vec![reset_at_1], &[]), vec![next_up(1.0)], bolus(100.0, 1)),
             "E_ADAPTIVE_OPTIONS",
             None,
             "subject '1' (sim 1): adaptive-dosing decision time 1.0000000000000002 lies within \
@@ -1348,16 +1224,7 @@ fn adaptive_driver_refusals_carry_their_codes() {
         ),
         row(
             "controller infusion with a zero rate",
-            run(
-                &ode,
-                &one,
-                vec![0.0],
-                vec![DoseAction::Infuse {
-                    amt: 100.0,
-                    cmt: 1,
-                    rate: 0.0,
-                }],
-            ),
+            run(&ode, &one, vec![0.0], vec![DoseAction::Infuse { amt: 100.0, cmt: 1, rate: 0.0 }]),
             "E_ADAPTIVE_CONTROLLER_ACTION",
             None,
             "subject '1' (sim 1): decision 0 at t=0: Infuse requires a positive, finite rate; \
@@ -1478,11 +1345,7 @@ fn ferx_check_reports_what_fit_refuses() {
     let reset = "1,2,.,3,.,.,1\n";
     for (name, data, want) in [
         ("no reset", format!("{header}{rows}"), None),
-        (
-            "a reset",
-            format!("{header}{rows}{reset}"),
-            Some("E_READOUT_DEPOT_UNSUPPORTED"),
-        ),
+        ("a reset", format!("{header}{rows}{reset}"), Some("E_READOUT_DEPOT_UNSUPPORTED")),
     ] {
         let path = dir.path().join(format!("{}.csv", name.replace(' ', "_")));
         std::fs::write(&path, data).expect("write data");
@@ -1490,12 +1353,8 @@ fn ferx_check_reports_what_fit_refuses() {
             model.to_str().expect("utf-8 path"),
             Some(path.to_str().expect("utf-8 path")),
         );
-        let codes: Vec<&str> = report
-            .diagnostics
-            .iter()
-            .filter(|d| d.is_error())
-            .map(|d| d.code.as_str())
-            .collect();
+        let codes: Vec<&str> =
+            report.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.code.as_str()).collect();
         match want {
             None => assert!(report.valid, "{name}: {:?}", report.diagnostics),
             Some(code) => {
@@ -1503,10 +1362,7 @@ fn ferx_check_reports_what_fit_refuses() {
                 assert_eq!(codes, [code], "{name}");
                 let d = report.diagnostics.iter().find(|d| d.code == code).unwrap();
                 assert_eq!(d.block.as_deref(), Some("scaling"), "{name}");
-                assert!(
-                    d.line.is_some(),
-                    "{name}: the [scaling] header line is attached"
-                );
+                assert!(d.line.is_some(), "{name}: the [scaling] header line is attached");
             }
         }
     }
@@ -1524,11 +1380,7 @@ fn adaptive_still_refuses_an_observation_of_a_compartment_the_data_leave_off() {
     let run = |off_at: f64| {
         let mut subject = observed("1", &[1.0]);
         subject.pk_only_times = vec![off_at];
-        subject.cmt_toggles = vec![crate::types::CmtToggle {
-            pk_only: 0,
-            state: 0,
-            on: false,
-        }];
+        subject.cmt_toggles = vec![crate::types::CmtToggle { pk_only: 0, state: 0, on: false }];
         let pop = population_of(vec![subject], &[]);
         let bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
         let options = AdaptiveSimulateOptions {

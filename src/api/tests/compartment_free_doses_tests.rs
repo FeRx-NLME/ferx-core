@@ -12,7 +12,6 @@ use crate::api::validation::{
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{CompiledModel, DoseEvent, Population, RateMode, Subject};
-use std::collections::HashMap;
 
 /// An Emax time-course with no compartments — the #811 base case.
 fn compartment_free_model() -> CompiledModel {
@@ -42,34 +41,13 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
             .into_iter()
             .enumerate()
             .map(|(i, doses)| Subject {
-                obs_rgroup: Vec::new(),
                 id: format!("{}", i + 1),
                 doses,
                 obs_times: vec![1.0],
-                obs_raw_times: Vec::new(),
                 observations: vec![8.0],
                 obs_cmts: vec![1],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             })
             .collect(),
         covariate_names: Vec::new(),
@@ -97,11 +75,7 @@ fn coded_rate(cmt: usize) -> DoseEvent {
 }
 
 fn fatal_codes(model: &CompiledModel, pop: &Population) -> Vec<String> {
-    check_model_data(model, pop)
-        .into_iter()
-        .filter(|d| d.is_error())
-        .map(|d| d.code)
-        .collect()
+    check_model_data(model, pop).into_iter().filter(|d| d.is_error()).map(|d| d.code).collect()
 }
 
 fn warning_codes(model: &CompiledModel, pop: &Population) -> Vec<String> {
@@ -121,10 +95,7 @@ fn compartment_free_model_with_dose_records_warns_once_with_counts() {
     let model = compartment_free_model();
     let pop = population(vec![vec![bolus(1), bolus(2)], vec![bolus(2)], vec![]]);
     let diags = check_model_data_warnings(&model, &pop, &model.default_params);
-    let hits: Vec<_> = diags
-        .iter()
-        .filter(|d| d.code == "W_COMPARTMENT_FREE_DOSES")
-        .collect();
+    let hits: Vec<_> = diags.iter().filter(|d| d.code == "W_COMPARTMENT_FREE_DOSES").collect();
     assert_eq!(hits.len(), 1, "one model-wide warning, got {diags:?}");
     let msg = &hits[0].message;
     assert!(
@@ -143,10 +114,7 @@ fn compartment_free_model_with_dose_records_warns_once_with_counts() {
     // not a code prefix: a prefix filter is how the first version of this test
     // missed that validator.
     let fatal = fatal_codes(&model, &pop);
-    assert!(
-        fatal.is_empty(),
-        "a compartment-free model has no dose to reject: {fatal:?}"
-    );
+    assert!(fatal.is_empty(), "a compartment-free model has no dose to reject: {fatal:?}");
 }
 
 /// `fit()` pushes the message without its `W_` code, so the warning's category on
@@ -186,9 +154,7 @@ fn compartment_free_model_without_dose_records_is_silent() {
     let model = compartment_free_model();
     let pop = population(vec![vec![], vec![]]);
     assert!(
-        !warning_codes(&model, &pop)
-            .iter()
-            .any(|c| c == "W_COMPARTMENT_FREE_DOSES"),
+        !warning_codes(&model, &pop).iter().any(|c| c == "W_COMPARTMENT_FREE_DOSES"),
         "no dose records, no warning"
     );
 }
@@ -222,9 +188,7 @@ fn compartment_free_model_coded_rate_is_not_a_missing_parameter_error() {
     let fatal = fatal_codes(&model, &pop);
     assert!(fatal.is_empty(), "got {fatal:?}");
     assert!(
-        warning_codes(&model, &pop)
-            .iter()
-            .any(|c| c == "W_COMPARTMENT_FREE_DOSES"),
+        warning_codes(&model, &pop).iter().any(|c| c == "W_COMPARTMENT_FREE_DOSES"),
         "the coded rows are still reported, as ignored doses"
     );
 }
@@ -252,20 +216,14 @@ fn analytical_model_coded_rate_without_parameter_still_errors() {
     .expect("parses");
     assert!(!model.is_algebraic());
     let pop = population(vec![vec![coded_rate(1), bolus(2)]]);
-    let codes: Vec<String> = check_modeled_dose_rates(&model, &pop)
-        .into_iter()
-        .map(|d| d.code)
-        .collect();
+    let codes: Vec<String> =
+        check_modeled_dose_rates(&model, &pop).into_iter().map(|d| d.code).collect();
     assert_eq!(codes, vec!["E_MODELED_RATE_NO_PARAM".to_string()]);
-    let routing: Vec<String> = check_dose_compartments(&model, &pop)
-        .into_iter()
-        .map(|d| d.code)
-        .collect();
+    let routing: Vec<String> =
+        check_dose_compartments(&model, &pop).into_iter().map(|d| d.code).collect();
     assert_eq!(routing, vec!["E_DOSE_CMT_OUT_OF_RANGE".to_string()]);
     assert!(
-        !warning_codes(&model, &pop)
-            .iter()
-            .any(|c| c == "W_COMPARTMENT_FREE_DOSES"),
+        !warning_codes(&model, &pop).iter().any(|c| c == "W_COMPARTMENT_FREE_DOSES"),
         "the ignored-doses warning is for compartment-free models only"
     );
 }
@@ -315,10 +273,8 @@ fn readout_tad_is_a_data_column_refused_when_absent_and_read_when_present() {
     with.subjects[0].covariates.insert("TAD".into(), 6.0);
 
     let params = &model.default_params;
-    let eval_only = crate::types::FitOptions {
-        outer_maxiter: 0,
-        ..crate::types::FitOptions::default()
-    };
+    let eval_only =
+        crate::types::FitOptions { outer_maxiter: 0, ..crate::types::FitOptions::default() };
 
     // Absent: both entry points refuse, naming the column and the `[odes]` scope.
     let predict_err = crate::api::predict(&model, &without, params)

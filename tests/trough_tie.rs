@@ -72,11 +72,7 @@ const DOSE: f64 = 2.0;
 
 /// The concentration at `t` with the seed at 0 and a dose at each of `doses` already applied.
 fn conc(t: f64, doses: &[f64]) -> f64 {
-    SEED * (-K * t).exp()
-        + doses
-            .iter()
-            .map(|td| DOSE * (-K * (t - td)).exp())
-            .sum::<f64>()
+    SEED * (-K * t).exp() + doses.iter().map(|td| DOSE * (-K * (t - td)).exp()).sum::<f64>()
 }
 
 /// `(ID, TIME, closed form)` for every observation of `nonmem_anchor/trough_tie.csv`, in file order.
@@ -141,10 +137,7 @@ fn assert_closed_form(leg: &str, got: &[(String, f64, f64)]) -> f64 {
         );
         worst = worst.max(err);
     }
-    println!(
-        "{leg}: worst |ferx − closed form| {worst:.3e} over {} observations",
-        want.len()
-    );
+    println!("{leg}: worst |ferx − closed form| {worst:.3e} over {} observations", want.len());
     worst
 }
 
@@ -164,9 +157,7 @@ fn via_predict(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
 
 /// Label one value per observation with `predict()`'s `(ID, TIME)`.
 fn label(
-    m: &CompiledModel,
-    pop: &Population,
-    values: Vec<(String, f64)>,
+    m: &CompiledModel, pop: &Population, values: Vec<(String, f64)>,
 ) -> Vec<(String, f64, f64)> {
     let labels = via_predict(m, pop);
     assert_eq!(values.len(), labels.len(), "row count against predict");
@@ -185,19 +176,14 @@ fn label(
 fn nonmem_ipred(stem: &str) -> Vec<(String, f64, f64)> {
     let path = format!("nonmem_anchor/results/{stem}.tab");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
     let header: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let col = |c: &str| header.iter().position(|h| *h == c).expect(c);
     let (id, time, evid, ipred) = (col("ID"), col("TIME"), col("EVID"), col("IPRED"));
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0)
@@ -220,11 +206,7 @@ const NONMEM_BOUND: f64 = 1e-7;
 fn nonmem_reads_every_cell_as_the_closed_form() {
     let got = nonmem_ipred("trough_tie");
     let want = expected();
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "NONMEM table rows vs fixture observations"
-    );
+    assert_eq!(got.len(), want.len(), "NONMEM table rows vs fixture observations");
     let mut worst = 0.0_f64;
     for ((id, t, v), (wid, wt, w)) in got.iter().zip(&want) {
         assert!(
@@ -239,10 +221,7 @@ fn nonmem_reads_every_cell_as_the_closed_form() {
         );
         worst = worst.max(err);
     }
-    println!(
-        "nonmem: worst |NONMEM − closed form| {worst:.3e} over {} observations",
-        want.len()
-    );
+    println!("nonmem: worst |NONMEM − closed form| {worst:.3e} over {} observations", want.len());
 }
 
 #[test]
@@ -300,10 +279,7 @@ fn adaptive_driver_reads_a_trough_before_its_co_timed_record() {
 fn via_adaptive(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let mut got = Vec::new();
     for s in &pop.subjects {
-        let one = Population {
-            subjects: vec![s.clone()],
-            ..pop.clone()
-        };
+        let one = Population { subjects: vec![s.clone()], ..pop.clone() };
         let mut opts = AdaptiveSimulateOptions::default();
         opts.seed = Some(1);
         // Inside the subject's span: a decision before its first record (IDs 8 / 9 start at
@@ -326,16 +302,8 @@ fn via_adaptive(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> 
             &opts,
         )
         .unwrap_or_else(|e| panic!("ID {}: adaptive run refused: {e}", s.id));
-        assert!(
-            res.ledger.is_empty(),
-            "ID {}: the no-op controller dosed",
-            s.id
-        );
-        got.extend(
-            res.trajectories
-                .into_iter()
-                .map(|r| (r.id, r.time, r.ipred)),
-        );
+        assert!(res.ledger.is_empty(), "ID {}: the no-op controller dosed", s.id);
+        got.extend(res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)));
     }
     got
 }
@@ -372,33 +340,18 @@ fn a_trough_on_a_derived_break_reads_before_its_co_timed_dose_2534() {
     let legs = [
         (
             "predict",
-            predict(m, &pop, &m.default_params)
-                .expect("predict")
-                .iter()
-                .map(|p| p.pred)
-                .collect(),
+            predict(m, &pop, &m.default_params).expect("predict").iter().map(|p| p.pred).collect(),
         ),
         ("dual", dual),
         ("states", states),
-        (
-            "adaptive",
-            via_adaptive(m, &pop).into_iter().map(|r| r.2).collect(),
-        ),
-        (
-            "nonmem",
-            nonmem_ipred("derived_break_tie")
-                .into_iter()
-                .map(|r| r.2)
-                .collect(),
-        ),
+        ("adaptive", via_adaptive(m, &pop).into_iter().map(|r| r.2).collect()),
+        ("nonmem", nonmem_ipred("derived_break_tie").into_iter().map(|r| r.2).collect()),
     ];
     // Measured worst |leg − closed form| on macOS arm64: 1.7e-13 on the engines,
     // 9.5e-8 on NONMEM's table (`TOL=9`), so ~10× headroom. The smallest defect is 100.
     assert_legs(&legs, &want, 1e-6);
     let ext = std::fs::read_to_string("nonmem_anchor/results/derived_break_tie.ext").expect("ext");
-    let mut lines = ext
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ITERATION"));
+    let mut lines = ext.lines().skip_while(|l| !l.trim_start().starts_with("ITERATION"));
     let head: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let obj = head.iter().position(|h| *h == "OBJ").expect("OBJ column");
     let objv: f64 = lines
@@ -407,9 +360,7 @@ fn a_trough_on_a_derived_break_reads_before_its_co_timed_dose_2534() {
         .expect("#OBJV row")[obj]
         .parse()
         .expect("OBJ");
-    let ofv = ferx_core::fit(m, &pop, &m.default_params, &parsed.fit_options)
-        .expect("fit")
-        .ofv;
+    let ofv = ferx_core::fit(m, &pop, &m.default_params, &parsed.fit_options).expect("fit").ofv;
     // Measured |ferx − NONMEM #OBJV| on macOS arm64: 3.1e-8. The defect was 5.4.
     let d = (ofv - objv).abs();
     println!("fit: OFV {ofv:.8}, |Δ #OBJV| {d:.3e}");
@@ -425,9 +376,7 @@ fn a_trough_on_a_derived_break_reads_before_its_co_timed_dose_2534() {
 /// driver re-seeds an `SS=1` base dose before its decision hook (`reseed_prescheduled_states_at`).
 #[test]
 fn a_lag_tie_reads_pre_dose_on_the_reset_and_steady_state_walks_2534() {
-    let m = parse_full_model_file(Path::new(TIE_MODEL))
-        .expect("model")
-        .model;
+    let m = parse_full_model_file(Path::new(TIE_MODEL)).expect("model").model;
     let head = "ID,TIME,DV,MDV,EVID,AMT,RATE,CMT,SS,II\n";
     let tie = |id: u32, ss: &str, reset: bool| {
         let mut r = format!(
@@ -439,47 +388,21 @@ fn a_lag_tie_reads_pre_dose_on_the_reset_and_steady_state_walks_2534() {
         }
         r
     };
-    let csv = [
-        head.into(),
-        tie(5, "2,0,0", true),
-        tie(6, "1,1,24", false),
-        tie(7, "1,1,24", true),
-    ];
+    let csv = [head.into(), tie(5, "2,0,0", true), tie(6, "1,1,24", false), tie(7, "1,1,24", true)];
     let path = std::env::temp_dir().join(format!("ferx_2534_walks_{}.csv", std::process::id()));
     std::fs::write(&path, csv.concat()).expect("write");
     let pop = read_nonmem_csv(&path, None, None).expect("data");
     let _ = std::fs::remove_file(&path);
     let (dual, states) = dual_and_states(&m, &pop);
     let trough = 100.0 * e(8.06);
-    for (k, want) in [
-        (0, trough),
-        (1, 100.0 * (e(10.0) + e(10.0 - 8.06)) + lagged_depot()),
-    ] {
-        assert!(
-            (dual[k] - want).abs() < 1e-6,
-            "dual ID 5 row {k}: {} vs {want}",
-            dual[k]
-        );
+    for (k, want) in [(0, trough), (1, 100.0 * (e(10.0) + e(10.0 - 8.06)) + lagged_depot())] {
+        assert!((dual[k] - want).abs() < 1e-6, "dual ID 5 row {k}: {} vs {want}", dual[k]);
     }
-    assert!(
-        (dual[2] - trough).abs() < 1e-6 && (dual[4] - trough).abs() < 1e-6,
-        "{dual:?}"
-    );
-    let pred = predict(&m, &pop, &m.default_params)
-        .expect("predict")
-        .iter()
-        .map(|p| p.pred)
-        .collect();
+    assert!((dual[2] - trough).abs() < 1e-6 && (dual[4] - trough).abs() < 1e-6, "{dual:?}");
+    let pred =
+        predict(&m, &pop, &m.default_params).expect("predict").iter().map(|p| p.pred).collect();
     let adaptive = via_adaptive(&m, &pop).into_iter().map(|r| r.2).collect();
-    assert_legs(
-        &[
-            ("predict", pred),
-            ("states", states),
-            ("adaptive", adaptive),
-        ],
-        &dual,
-        1e-6,
-    );
+    assert_legs(&[("predict", pred), ("states", states), ("adaptive", adaptive)], &dual, 1e-6);
 }
 
 const TIE_MODEL: &str = "nonmem_anchor/derived_break_tie_fit.ferx";
@@ -531,31 +454,20 @@ fn the_band_only_walks_read_an_infusion_end_tie_pre_dose_2534() {
         .expect("model")
         .replace("  theta TVLAG(2.96, 0.0, 1e15)\n", "")
         .replace("  ALAG1 = TVLAG\n", "");
-    let sde = ode.replace(
-        "[error_model]",
-        "[diffusion]\n  central ~ 1e-6\n[error_model]",
-    );
+    let sde = ode.replace("[error_model]", "[diffusion]\n  central ~ 1e-6\n[error_model]");
     let mut pop = read_nonmem_csv(Path::new("nonmem_anchor/derived_break_tie.csv"), None, None)
         .expect("data");
     pop.subjects.truncate(2);
     let inf = 10.0 * (1.0 - e(2.96));
     let at10 = 100.0 * (e(10.0) + e(10.0 - 8.06)) + inf * e(10.0 - 8.06);
-    let want = [
-        100.0 * e(8.06) + inf,
-        at10,
-        100.0 * e(8.06) + inf + 100.0,
-        at10,
-    ];
+    let want = [100.0 * e(8.06) + inf, at10, 100.0 * e(8.06) + inf + 100.0, at10];
     for src in [&ode, &sde] {
         let m = ferx_core::parse_model_string(src).expect("twin");
         assert!(!m.has_lagtime());
         let pred = predict(&m, &pop, &m.default_params).expect("predict");
         let (dual, _) = dual_and_states(&m, &pop);
         assert_legs(
-            &[
-                ("predict", pred.iter().map(|p| p.pred).collect()),
-                ("dual", dual),
-            ],
+            &[("predict", pred.iter().map(|p| p.pred).collect()), ("dual", dual)],
             &want,
             1e-9,
         );

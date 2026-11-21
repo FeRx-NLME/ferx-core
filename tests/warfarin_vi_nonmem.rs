@@ -81,21 +81,12 @@ fn warfarin() -> (CompiledModel, Population) {
 
 /// Assert one fit against the NONMEM FOCEI column, with per-block tolerances.
 fn assert_matches_nonmem(
-    label: &str,
-    theta: &[f64],
-    omega_diag: &[f64],
-    sigma_sd: f64,
-    ofv: f64,
-    tol_theta: f64,
-    tol_omega: f64,
-    tol_sigma: f64,
-    tol_ofv: f64,
+    label: &str, theta: &[f64], omega_diag: &[f64], sigma_sd: f64, ofv: f64, tol_theta: f64,
+    tol_omega: f64, tol_sigma: f64, tol_ofv: f64,
 ) {
-    for (name, got, want) in [
-        ("TVCL", theta[0], NM_TVCL),
-        ("TVV", theta[1], NM_TVV),
-        ("TVKA", theta[2], NM_TVKA),
-    ] {
+    for (name, got, want) in
+        [("TVCL", theta[0], NM_TVCL), ("TVV", theta[1], NM_TVV), ("TVKA", theta[2], NM_TVKA)]
+    {
         let e = rel(got, want);
         assert!(
             e < tol_theta,
@@ -348,10 +339,7 @@ fn ferx_vi_recovers_nonmem_from_the_testdata_start() {
          guard, which is the #1097 freeze",
         f.sigma[0]
     );
-    assert!(
-        f.converged,
-        "VI should converge from the testdata start once gradients are clipped"
-    );
+    assert!(f.converged, "VI should converge from the testdata start once gradients are clipped");
 
     assert_matches_nonmem(
         "ferx VI (testdata start)",

@@ -141,9 +141,7 @@ const MODEL: &str = r"
 /// brittle to any unrelated stepper or `inner_tol` change, so it gets its own, looser bound
 /// that still rejects its own pre-#1070 delta of 0.107.
 fn run_anchor(data: &str, nonmem_ofv: f64, tolerance: f64) {
-    let model = parse_full_model(MODEL)
-        .expect("TAD + lagtime model must parse")
-        .model;
+    let model = parse_full_model(MODEL).expect("TAD + lagtime model must parse").model;
     let pop = read_nonmem_csv(Path::new(data), None, None).expect("anchor data must load");
 
     let opts = FitOptions {
@@ -173,9 +171,7 @@ fn run_anchor(data: &str, nonmem_ofv: f64, tolerance: f64) {
     // "the analytic chain carries the lagtime term" from "something quietly stopped
     // claiming the model" (#1070).
     assert!(
-        res.gradient_method_inner
-            .to_lowercase()
-            .contains("analytic"),
+        res.gradient_method_inner.to_lowercase().contains("analytic"),
         "#1070: a TAD-reading RHS under an estimated lagtime must be served analytically, \
          but the inner gradient reports `{}`",
         res.gradient_method_inner

@@ -42,18 +42,13 @@ fn model(readout: &str) -> CompiledModel {
 "#
     );
     let m = parse_model_string(&src).expect("parse");
-    assert!(
-        m.frem_config.is_some() && m.ode_spec.is_some(),
-        "ODE FREM fixture"
-    );
+    assert!(m.frem_config.is_some() && m.ode_spec.is_some(), "ODE FREM fixture");
     m
 }
 
 /// Form A (a divisor `[scaling]` applies) and Form C (the readout runs in the engine).
-const FORMS: [(&str, &str); 2] = [
-    ("A: obs_scale = V", "  obs_scale = V"),
-    ("C: y = central / V", "  y = central / V"),
-];
+const FORMS: [(&str, &str); 2] =
+    [("A: obs_scale = V", "  obs_scale = V"), ("C: y = central / V", "  y = central / V")];
 
 const OBS: [f64; 5] = [0.5, 1.0, 4.0, 14.0, 20.0];
 const FREMTYPE: [u16; 5] = [100, 0, 0, 100, 0];
@@ -70,11 +65,7 @@ fn subject(tv: bool) -> Subject {
     let snapshot = |k: usize| vec![HashMap::from([("X".to_string(), 1.0)]); k];
     Subject {
         id: "1".to_string(),
-        dose_covariates: if tv {
-            snapshot(doses.len())
-        } else {
-            Vec::new()
-        },
+        dose_covariates: if tv { snapshot(doses.len()) } else { Vec::new() },
         obs_covariates: if tv { snapshot(n) } else { Vec::new() },
         doses,
         obs_times: OBS.to_vec(),
@@ -126,11 +117,7 @@ fn ode_states_ipred_matches_the_full_pk_sink_on_frem_rows() {
             assert_frem_rows_are_theta_plus_eta(&m, &want, &label);
             assert_eq!(got.len(), want.len(), "{label}: row count");
             for (j, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert_eq!(
-                    g.to_bits(),
-                    w.to_bits(),
-                    "{label}: row {j}: {g} vs sink {w}"
-                );
+                assert_eq!(g.to_bits(), w.to_bits(), "{label}: row {j}: {g} vs sink {w}");
             }
         }
     }

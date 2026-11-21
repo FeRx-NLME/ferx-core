@@ -28,24 +28,15 @@ fn warfarin_at(tvcl: f64) -> (CompiledModel, Population) {
 fn warfarin_at_bounded(tvcl: f64, lower: f64) -> (CompiledModel, Population) {
     let src = std::fs::read_to_string("examples/warfarin.ferx").expect("model file");
     let src = src
-        .replace(
-            "theta TVCL(0.2, 0.001, 10.0)",
-            &format!("theta TVCL({tvcl:?}, {lower:?}, 10.0)"),
-        )
+        .replace("theta TVCL(0.2, 0.001, 10.0)", &format!("theta TVCL({tvcl:?}, {lower:?}, 10.0)"))
         .replace("theta TVV(10.0,", "theta TVV(7.737706,")
         .replace("theta TVKA(1.5,", "theta TVKA(0.810796,")
         .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.028590")
         .replace("omega ETA_V  ~ 0.04", "omega ETA_V  ~ 0.009592")
         .replace("omega ETA_KA ~ 0.30", "omega ETA_KA ~ 0.335871")
-        .replace(
-            "sigma PROP_ERR ~ 0.02 (sd)",
-            "sigma PROP_ERR ~ 0.010565 (sd)",
-        );
+        .replace("sigma PROP_ERR ~ 0.02 (sd)", "sigma PROP_ERR ~ 0.010565 (sd)");
     let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
-    assert_eq!(
-        model.default_params.theta[0], tvcl,
-        "the TVCL replacement must have applied"
-    );
+    assert_eq!(model.default_params.theta[0], tvcl, "the TVCL replacement must have applied");
     let (pop, _) =
         crate::api::read_population_for(&model, &None, "data/warfarin.csv", None, None, None, &[])
             .expect("data");
@@ -85,33 +76,20 @@ fn cov(model: &CompiledModel, pop: &Population, method: M) -> (Vec<f64>, Covaria
 }
 
 fn stationarity_warnings(out: &CovarianceOutput) -> Vec<&String> {
-    out.warnings
-        .iter()
-        .filter(|w| w.starts_with(NON_STATIONARY_TOKEN))
-        .collect()
+    out.warnings.iter().filter(|w| w.starts_with(NON_STATIONARY_TOKEN)).collect()
 }
 
 /// The decrement the warning prints, read back from its text.
 fn printed_decrement(w: &str) -> f64 {
-    let tail = w
-        .split("by an estimated ")
-        .nth(1)
-        .expect("the decrement clause");
-    tail.split(" OFV units")
-        .next()
-        .unwrap()
-        .parse()
-        .expect("a number")
+    let tail = w.split("by an estimated ").nth(1).expect("the decrement clause");
+    tail.split(" OFV units").next().unwrap().parse().expect("a number")
 }
 
 /// The squared Mahalanobis distance `δᵀ C⁻¹ δ` from the minimum to `x`, in the minimum's own
 /// `R⁻¹` — what the Newton decrement estimates under a quadratic model, computed without it.
 fn mahalanobis_sq(c_hat: &DMatrix<f64>, x_hat: &[f64], x: &[f64]) -> f64 {
     let d = DVector::from_iterator(x.len(), x.iter().zip(x_hat).map(|(a, b)| a - b));
-    let c_inv = c_hat
-        .clone()
-        .try_inverse()
-        .expect("R⁻¹ at the minimum inverts");
+    let c_inv = c_hat.clone().try_inverse().expect("R⁻¹ at the minimum inverts");
     d.dot(&(&c_inv * &d))
 }
 
@@ -133,11 +111,7 @@ fn mahalanobis_sq(c_hat: &DMatrix<f64>, x_hat: &[f64], x: &[f64]) -> f64 {
 fn a_positive_definite_r_at_a_non_stationary_sampler_estimate_warns() {
     let (model, pop) = warfarin_at(TVCL_HAT);
     let (x_hat, at_min) = cov(&model, &pop, M::FoceI);
-    assert!(
-        stationarity_warnings(&at_min).is_empty(),
-        "{:?}",
-        at_min.warnings
-    );
+    assert!(stationarity_warnings(&at_min).is_empty(), "{:?}", at_min.warnings);
     let (_, saem_at_min) = cov(&model, &pop, M::Saem);
     assert!(
         stationarity_warnings(&saem_at_min).is_empty(),
@@ -177,16 +151,8 @@ fn a_positive_definite_r_at_a_non_stationary_sampler_estimate_warns() {
     let (_, vi) = cov(&model, &pop, M::Vi);
     let w_vi = stationarity_warnings(&vi);
     assert_eq!(w_vi.len(), 1, "VI: {:?}", vi.warnings);
-    assert!(
-        w_vi[0].contains("the VI estimate is not a stationary point"),
-        "{}",
-        w_vi[0]
-    );
-    assert_eq!(
-        printed_decrement(w_vi[0]),
-        printed,
-        "same point, same objective"
-    );
+    assert!(w_vi[0].contains("the VI estimate is not a stationary point"), "{}", w_vi[0]);
+    assert_eq!(printed_decrement(w_vi[0]), printed, "same point, same objective");
 
     let (_, focei) = cov(&model, &pop, M::FoceI);
     assert!(
@@ -206,10 +172,7 @@ fn a_positive_definite_r_at_a_non_stationary_sampler_estimate_warns() {
     assert_eq!(w_fd.len(), 1, "FD leg: {:?}", saem_fd.warnings);
     let printed_fd = printed_decrement(w_fd[0]);
     eprintln!("far, FD: printed decrement {printed_fd}");
-    assert!(
-        (printed_fd / printed - 1.0).abs() < 0.02,
-        "FD {printed_fd} vs exact {printed}"
-    );
+    assert!((printed_fd / printed - 1.0).abs() < 0.02, "FD {printed_fd} vs exact {printed}");
 
     // Near: under the threshold, no warning — and close enough to it that a decrement doubled
     // by the R / H_ofv factor would cross it.
@@ -221,18 +184,11 @@ fn a_positive_definite_r_at_a_non_stationary_sampler_estimate_warns() {
         near_m2 < NON_STATIONARY_DECREMENT_OFV && 2.0 * near_m2 > NON_STATIONARY_DECREMENT_OFV,
         "fixture: the near point must straddle the threshold under a factor of 2: {near_m2}"
     );
-    assert!(
-        stationarity_warnings(&saem_near).is_empty(),
-        "{:?}",
-        saem_near.warnings
-    );
+    assert!(stationarity_warnings(&saem_near).is_empty(), "{:?}", saem_near.warnings);
 }
 
 fn optimum_warnings(out: &CovarianceOutput) -> Vec<&String> {
-    out.warnings
-        .iter()
-        .filter(|w| w.starts_with(NON_STATIONARY_OPTIMUM_TOKEN))
-        .collect()
+    out.warnings.iter().filter(|w| w.starts_with(NON_STATIONARY_OPTIMUM_TOKEN)).collect()
 }
 
 /// #2785: the same test on an estimate whose method *did* minimise the objective — FOCEI —
@@ -254,17 +210,11 @@ fn optimum_warnings(out: &CovarianceOutput) -> Vec<&String> {
 fn a_non_stationary_focei_estimate_is_demoted_unless_a_bound_holds_it() {
     let (model, pop) = warfarin_at(TVCL_HAT);
     let (_, at_min) = cov(&model, &pop, M::FoceI);
-    let d_min = at_min
-        .newton_decrement
-        .expect("FOCEI on an unclipped R is tested");
+    let d_min = at_min.newton_decrement.expect("FOCEI on an unclipped R is tested");
     eprintln!("at the minimum: decrement {d_min:e}");
     assert!(d_min.is_finite() && d_min < 1e-3, "{d_min}");
     assert!(!at_min.non_stationary_optimum);
-    assert!(
-        optimum_warnings(&at_min).is_empty(),
-        "{:?}",
-        at_min.warnings
-    );
+    assert!(optimum_warnings(&at_min).is_empty(), "{:?}", at_min.warnings);
 
     let (model, pop) = warfarin_at(TVCL_HAT * 1.06);
     let (_, focei) = cov(&model, &pop, M::FoceI);
@@ -280,21 +230,10 @@ fn a_non_stationary_focei_estimate_is_demoted_unless_a_bound_holds_it() {
         w[0]
     );
     // The sampler's gate, not this one, owns `W_COV_NON_STATIONARY_ESTIMATE`.
-    assert!(
-        stationarity_warnings(&focei).is_empty(),
-        "{:?}",
-        focei.warnings
-    );
+    assert!(stationarity_warnings(&focei).is_empty(), "{:?}", focei.warnings);
     let (_, saem) = cov(&model, &pop, M::Saem);
-    assert!(
-        !saem.non_stationary_optimum,
-        "a sampler is warned, never demoted"
-    );
-    assert_eq!(
-        saem.newton_decrement,
-        Some(d_far),
-        "same point, same objective"
-    );
+    assert!(!saem.non_stationary_optimum, "a sampler is warned, never demoted");
+    assert_eq!(saem.newton_decrement, Some(d_far), "same point, same objective");
 
     let (model, pop) = warfarin_at_bounded(TVCL_HAT * 1.06, TVCL_HAT * 1.06);
     let (_, held) = cov(&model, &pop, M::FoceI);
@@ -313,10 +252,7 @@ fn a_non_stationary_optimum_demotes_converged_once() {
     assert!(converged && warnings.is_empty(), "nothing to demote");
     demote(true, &mut converged, &mut warnings);
     assert!(!converged);
-    assert_eq!(
-        warnings,
-        vec!["Outer optimization did not converge".to_string()]
-    );
+    assert_eq!(warnings, vec!["Outer optimization did not converge".to_string()]);
     // Already unconverged: the generic line is not pushed a second time.
     demote(true, &mut converged, &mut warnings);
     assert_eq!(warnings.len(), 1);
@@ -326,11 +262,7 @@ fn a_non_stationary_optimum_demotes_converged_once() {
 /// stops on a raw gradient norm `|g| < outer_gtol` (#2785).
 fn bfgs_fit(outer_gtol: f64) -> crate::types::FitResult {
     let (model, pop) = warfarin_at(0.2);
-    let o = FitOptions {
-        optimizer: crate::types::Optimizer::Bfgs,
-        outer_gtol,
-        ..opts(M::FoceI)
-    };
+    let o = FitOptions { optimizer: crate::types::Optimizer::Bfgs, outer_gtol, ..opts(M::FoceI) };
     crate::api::fit(&model, &pop, &model.default_params, &o).expect("fit")
 }
 
@@ -354,23 +286,12 @@ fn bfgs_fit(outer_gtol: f64) -> crate::types::FitResult {
 #[test]
 fn a_bfgs_stop_on_a_raw_gradient_norm_short_of_the_minimum_is_not_converged() {
     let loose = bfgs_fit(100.0);
-    let d = loose
-        .newton_decrement
-        .expect("FOCEI, covariance step on an unclipped R");
-    eprintln!(
-        "outer_gtol = 100: decrement {d:e}, {} iterations",
-        loose.n_iterations
-    );
-    assert!(
-        d > NON_STATIONARY_DECREMENT_OFV,
-        "fixture: stops short ({d})"
-    );
+    let d = loose.newton_decrement.expect("FOCEI, covariance step on an unclipped R");
+    eprintln!("outer_gtol = 100: decrement {d:e}, {} iterations", loose.n_iterations);
+    assert!(d > NON_STATIONARY_DECREMENT_OFV, "fixture: stops short ({d})");
     assert!(!loose.converged, "{:?}", loose.warnings);
-    let tokens: Vec<_> = loose
-        .warnings
-        .iter()
-        .filter(|w| w.contains(NON_STATIONARY_OPTIMUM_TOKEN))
-        .collect();
+    let tokens: Vec<_> =
+        loose.warnings.iter().filter(|w| w.contains(NON_STATIONARY_OPTIMUM_TOKEN)).collect();
     assert_eq!(tokens.len(), 1, "{:?}", loose.warnings);
     assert!(tokens[0].contains("the FOCEI estimate"), "{}", tokens[0]);
     assert_eq!(
@@ -400,10 +321,7 @@ fn a_bfgs_stop_on_a_raw_gradient_norm_short_of_the_minimum_is_not_converged() {
     assert!(d < 1e-3, "{d}");
     assert!(tight.converged, "{:?}", tight.warnings);
     assert!(
-        !tight
-            .warnings
-            .iter()
-            .any(|w| w.contains(NON_STATIONARY_OPTIMUM_TOKEN)),
+        !tight.warnings.iter().any(|w| w.contains(NON_STATIONARY_OPTIMUM_TOKEN)),
         "{:?}",
         tight.warnings
     );

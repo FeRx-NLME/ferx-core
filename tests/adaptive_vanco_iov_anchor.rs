@@ -48,7 +48,6 @@ use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{
     simulate_adaptive_from_spec, AdaptiveSimulateOptions, DoseEvent, Population, Subject,
 };
-use std::collections::HashMap;
 use std::path::Path;
 
 mod common;
@@ -103,34 +102,14 @@ const DOSE_TOL: f64 = 1e-3;
 fn anchor_subject(decision_times: &[f64]) -> Subject {
     let n = decision_times.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: Vec::<DoseEvent>::new(),
         obs_times: decision_times.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: vec![],
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -150,10 +129,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
         "exactly one IOV effect (κ on CL) — the #701 surface under test"
     );
     assert_eq!(parsed.model.n_eta, 1, "one (negligible) BSV η on CL");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 500.0, "empiric start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
     assert_eq!(
@@ -167,11 +143,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
     );
     assert_eq!(spec.at.len(), 14, "14 daily decisions, t = 0..=312 h");
     assert_eq!(spec.levels, None, "continuous (percentage) titration");
-    assert_eq!(
-        spec.rules.len(),
-        2,
-        "increase / decrease rungs (the per-occasion κ drives both)"
-    );
+    assert_eq!(spec.rules.len(), 2, "increase / decrease rungs (the per-occasion κ drives both)");
 
     // A short seeded reactive run must pass the default frozen-replay verifier.
     let pop = Population {
@@ -206,10 +178,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
 fn vanco_iov_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
         .expect("vanco IOV model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
 
     let pop = Population {
         subjects: vec![anchor_subject(&spec.at)],
@@ -245,11 +214,7 @@ fn vanco_iov_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - trough_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
@@ -313,10 +278,7 @@ fn vanco_iov_window_aucs_match_mrgsolve() {
 fn windows_in(band: (f64, f64)) -> usize {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
         .expect("model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     spec.auc_target = Some(band);
     let pop = Population {
         subjects: vec![anchor_subject(&spec.at)],

@@ -65,7 +65,7 @@
 33 lib:estimation::mixture
 31 lib:api::iov_integration
 29 lib:estimation::run_sir
-26 lib:api::levels
+26 lib:levels
 18 lib:api
 17 lib:estimation::run_covariance
 16 lib:estimation::run_sir::from_fit_bindings
@@ -85,4 +85,4 @@
 1 lib:bootstrap
 1 lib:api::tests_sir_fallback
 1 lib:estimation::vi::run
-1 lib:api::pool
+1 lib:pool

@@ -88,12 +88,7 @@ pub(super) struct MuFold {
 /// 0 along `θ_i` and lane 1 along `θ_j` (`usize::MAX`: no lane), from one program run: a mu
 /// line is a few operations, so this is cheaper than recording one.
 fn mu_dual(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    n_eta: usize,
-    i: usize,
-    j: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize, i: usize, j: usize,
 ) -> Option<Vec<crate::sens::dual2::Dual2<2>>> {
     use crate::sens::dual2::Dual2;
     let spec = &model.indiv_param_partials.mu_fold;
@@ -134,10 +129,7 @@ impl MuFold {
     /// subject's covariates vary over its records (`μ` would be per record), or where the
     /// program does not reproduce `g⁻¹(μ + η)` at this `η`. One program run per folded θ.
     pub(super) fn at(
-        model: &CompiledModel,
-        subject: &Subject,
-        theta: &[f64],
-        eta: &[f64],
+        model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     ) -> Option<Self> {
         let spec = &model.indiv_param_partials.mu_fold;
         if spec.thetas.is_empty()
@@ -191,10 +183,7 @@ impl MuFold {
                 }
             }
         }
-        (d1.iter().any(|d| !d.is_empty())).then_some(MuFold {
-            d1,
-            d2: std::cell::OnceCell::new(),
-        })
+        (d1.iter().any(|d| !d.is_empty())).then_some(MuFold { d1, d2: std::cell::OnceCell::new() })
     }
 
     /// θ `i`'s lines, if the fold carries it.
@@ -206,11 +195,7 @@ impl MuFold {
     /// per pair, a pair of folded θ taking one run for both entries. `None`: a non-finite
     /// derivative, where the caller declines.
     pub(super) fn d2(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        theta: &[f64],
-        n_eta: usize,
+        &self, model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize,
     ) -> Option<&Vec<Vec<Vec<(usize, f64)>>>> {
         self.d2
             .get_or_init(|| {
@@ -362,11 +347,7 @@ impl CovPlan<'_> {
     /// Before the passes: the axes some direction moves, so each plan's basis covers every axis
     /// a row is read along — not only the current pass's.
     pub(super) fn prepare(&self, dirs: &[Dir]) {
-        let mut m = Moved {
-            x: vec![false; self.nx],
-            z: vec![false; self.nz],
-            n_dirs: dirs.len(),
-        };
+        let mut m = Moved { x: vec![false; self.nx], z: vec![false; self.nz], n_dirs: dirs.len() };
         for d in dirs {
             if let Some(i) = d.x.filter(|&i| i < self.nx) {
                 m.x[i] = true;
@@ -428,21 +409,12 @@ impl CovPlan<'_> {
     /// η slot `k`, `eta_up` whether the plan's η adjoints are read (its η slots then axes).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn plan_run(
-        &self,
-        key: PlanKey,
-        dirs: &[Dir],
-        n_eta: usize,
-        n_par: usize,
-        eta_up: bool,
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        width: usize,
+        &self, key: PlanKey, dirs: &[Dir], n_eta: usize, n_par: usize, eta_up: bool,
+        eta_t: &dyn Fn(usize, usize) -> f64, width: usize,
         run: &dyn Fn(Lanes<'_>, &dyn Fn(usize, usize) -> f64, usize) -> Option<Vec<Kept>>,
     ) -> Option<PlanRun> {
-        let direct = || {
-            run(Lanes::Dirs(dirs), eta_t, width)
-                .and_then(|mut v| v.pop())
-                .map(PlanRun::Direct)
-        };
+        let direct =
+            || run(Lanes::Dirs(dirs), eta_t, width).and_then(|mut v| v.pop()).map(PlanRun::Direct);
         let moved = self.moved.borrow();
         let Some(m) = moved.as_ref().filter(|_| {
             !dirs.is_empty() && !plan_per_direction() && !super::reverse_per_direction()
@@ -514,12 +486,7 @@ impl CovPlan<'_> {
         }
         drop(moved);
         // A basis cached along other axes (another `eta_up`, another moved set) is rebuilt.
-        if self
-            .bases
-            .borrow()
-            .get(&key)
-            .is_some_and(|b| b.axes != axes)
-        {
+        if self.bases.borrow().get(&key).is_some_and(|b| b.axes != axes) {
             self.bases.borrow_mut().remove(&key);
         }
         if !self.bases.borrow().contains_key(&key) {
@@ -567,14 +534,7 @@ impl CovPlan<'_> {
         drop(bases);
         #[cfg(test)]
         BASIS_PLANS.with(|c| c.set(c.get() + 1));
-        Some(PlanRun::Basis(BasisUse {
-            key,
-            coef,
-            folded,
-            lb,
-            vals,
-            tan,
-        }))
+        Some(PlanRun::Basis(BasisUse { key, coef, folded, lb, vals, tan }))
     }
 
     /// Output `o`'s base lane `x` of a pass's plan: its value, or its tangent along the pass's
@@ -601,14 +561,8 @@ impl CovPlan<'_> {
     /// tangent) as [`Self::plan_reverse_lanes`] does.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn basis_reverse(
-        &self,
-        u: &BasisUse,
-        r: &CovRun,
-        adj: &[Vec<f64>],
-        slot: &dyn Fn(usize, usize) -> usize,
-        n_out: usize,
-        nl: usize,
-        rows: &mut [Vec<f64>],
+        &self, u: &BasisUse, r: &CovRun, adj: &[Vec<f64>], slot: &dyn Fn(usize, usize) -> usize,
+        n_out: usize, nl: usize, rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
         let (kt, lk) = (r.kt, 1 + r.kt);
         let a0 = adj.first()?;
@@ -637,10 +591,7 @@ impl CovPlan<'_> {
             // each axis's tangent of it (#2980).
             if let Some(super::KeptFwd::Rows(rf)) = b.runs.first().map(|k| &k.fwd) {
                 let kept = &b.runs[0];
-                let base = Layout {
-                    tan: 0,
-                    ..kept.layout
-                };
+                let base = Layout { tan: 0, ..kept.layout };
                 let lb = base.lanes();
                 let mut du_bar = vec![0.0; n_out * lb];
                 for j in 0..n_out {
@@ -677,11 +628,8 @@ impl CovPlan<'_> {
                     }
                 }
             }
-            for (c, kept) in b
-                .runs
-                .iter()
-                .enumerate()
-                .filter(|(_, k)| matches!(k.fwd, super::KeptFwd::One(_)))
+            for (c, kept) in
+                b.runs.iter().enumerate().filter(|(_, k)| matches!(k.fwd, super::KeptFwd::One(_)))
             {
                 let (l, lb) = (kept.layout.lanes(), kept.layout.base_lanes());
                 let w = n_out * l;
@@ -696,10 +644,7 @@ impl CovPlan<'_> {
                 }
                 let (ne, np) = (kept.plan.n_eta(), kept.plan.n_theta());
                 let (mut ub, mut pb) = (kj::Buf::new(ne * l), kj::Buf::new(np * l));
-                if !kept
-                    .plan
-                    .reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar)
-                {
+                if !kept.plan.reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar) {
                     return None;
                 }
                 for tl in 0..b.w.min(b.axes.len() - c * b.w) {
@@ -793,12 +738,8 @@ impl CovPlan<'_> {
                 (None, Input::Eta(_)) => return 0.0,
             };
             let ti = &ba.t[b.idx(inp)];
-            let curv: f64 = c
-                .iter()
-                .enumerate()
-                .filter(|(_, &v)| v != 0.0)
-                .map(|(ax, &v)| v * ti[ax])
-                .sum();
+            let curv: f64 =
+                c.iter().enumerate().filter(|(_, &v)| v != 0.0).map(|(ax, &v)| v * ti[ax]).sum();
             // The fold moved θ_i along `∂μ/∂θ_i` frozen at this point; the true direction's
             // curvature also carries that vector's own θ-derivative, read off the η value
             // adjoints (the plan sees θ_i only through those lines).

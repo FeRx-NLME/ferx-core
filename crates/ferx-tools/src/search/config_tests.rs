@@ -51,11 +51,7 @@ fn load_err(text: &str) -> String {
 fn the_issue_example_loads_and_maps_onto_the_runner() {
     let cfg = load(&issue_example());
     assert_eq!(cfg.dir, Path::new("/cfg"));
-    assert!(
-        cfg.base.ends_with("two_cpt_oral_cov.ferx"),
-        "{:?}",
-        cfg.base
-    );
+    assert!(cfg.base.ends_with("two_cpt_oral_cov.ferx"), "{:?}", cfg.base);
     assert!(cfg.data.as_ref().unwrap().ends_with("two_cpt_oral_cov.csv"));
     assert_eq!(cfg.mfl.features().count(), 4);
     assert!(cfg.mfl_source.contains("COVARIATE?(@IIV"));
@@ -63,10 +59,7 @@ fn the_issue_example_loads_and_maps_onto_the_runner() {
     assert_eq!(cfg.rank.cutoff, Some(3.84));
     assert_eq!(cfg.run.threads, Some(8));
     assert_eq!(cfg.run.retries, 3);
-    assert_eq!(
-        cfg.run.cache_dir.as_deref(),
-        Some(Path::new(".ferx-search"))
-    );
+    assert_eq!(cfg.run.cache_dir.as_deref(), Some(Path::new(".ferx-search")));
     assert!(cfg.tools.is_empty());
 
     let opts = cfg.run_options();
@@ -117,10 +110,7 @@ fn defaults_when_sections_are_omitted() {
     let defaults = RunOptions::default();
     assert_eq!(opts.criterion, defaults.criterion);
     assert_eq!(opts.n_starts, defaults.n_starts);
-    assert_eq!(
-        opts.strictness.require_converged,
-        Strictness::default().require_converged
-    );
+    assert_eq!(opts.strictness.require_converged, Strictness::default().require_converged);
 }
 
 #[test]
@@ -143,20 +133,13 @@ fn every_rank_type_maps_to_a_criterion() {
     let cfg = load(
         "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"penalized\"\n",
     );
-    assert_eq!(
-        cfg.run_options().criterion,
-        Criterion::Penalized(Penalties::default())
-    );
+    assert_eq!(cfg.run_options().criterion, Criterion::Penalized(Penalties::default()));
     // …with `[rank.penalties]` overlaying only what it names…
     let cfg = load(
         "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"penalized\"\n\
          [rank.penalties]\ntheta = 5\ncrash = 1e6\n",
     );
-    let want = Penalties {
-        theta: 5.0,
-        crash: 1e6,
-        ..Penalties::default()
-    };
+    let want = Penalties { theta: 5.0, crash: 1e6, ..Penalties::default() };
     assert_eq!(cfg.run_options().criterion, Criterion::Penalized(want));
     assert_eq!(cfg.rank.penalties(), want);
     // …a misspelt key refused…
@@ -179,10 +162,7 @@ fn every_rank_type_maps_to_a_criterion() {
 #[test]
 fn unsupported_feature_is_a_load_error_naming_it() {
     let e = load_err("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION([FO,SEQ-ZO-FO])\"\n");
-    assert!(
-        e.starts_with("[space] mfl: the search space asks for 1 feature"),
-        "{e}"
-    );
+    assert!(e.starts_with("[space] mfl: the search space asks for 1 feature"), "{e}");
     assert!(e.contains("ABSORPTION(SEQ-ZO-FO)"), "{e}");
     assert!(e.contains(super::super::coverage::COVERAGE_DOCS), "{e}");
 }
@@ -190,10 +170,7 @@ fn unsupported_feature_is_a_load_error_naming_it() {
 #[test]
 fn mfl_syntax_error_is_prefixed_with_the_key() {
     let e = load_err("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FAST)\"\n");
-    assert!(
-        e.starts_with("[space] mfl: MFL: in ABSORPTION: `FAST` is not a known"),
-        "{e}"
-    );
+    assert!(e.starts_with("[space] mfl: MFL: in ABSORPTION: `FAST` is not a known"), "{e}");
     let e = load_err("base = \"m.ferx\"\n[space]\nmfl = \"LET(X,[A])\"\n");
     assert!(e.contains("the search space is empty"), "{e}");
 }
@@ -245,9 +222,7 @@ fn a_misspelt_core_section_is_an_error_not_a_tool_section() {
     assert!(e.contains("[strictness]"), "{e}");
     assert!(e.contains("[covsearch]"), "{e}");
     for tool in TOOL_SECTIONS {
-        load(&format!(
-            "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[{tool}]\nx = 1\n"
-        ));
+        load(&format!("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[{tool}]\nx = 1\n"));
     }
 }
 
@@ -266,9 +241,7 @@ fn retries_are_pharmpys_perturbed_starts_on_top_of_the_exact_one() {
     // The default stays the runner's default: three starts.
     assert_eq!(RunConfig::default().retries, 2);
     assert_eq!(
-        load("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n")
-            .run_options()
-            .n_starts,
+        load("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n").run_options().n_starts,
         RunOptions::default().n_starts
     );
 }
@@ -277,20 +250,12 @@ fn retries_are_pharmpys_perturbed_starts_on_top_of_the_exact_one() {
 fn load_reads_the_file_and_names_it_in_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("warfarin.ferxsearch");
-    std::fs::write(
-        &path,
-        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(SEQ-ZO-FO)\"\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(SEQ-ZO-FO)\"\n").unwrap();
     let e = SearchConfig::load(&path).expect_err("coverage gap");
     assert!(e.starts_with(&path.display().to_string()), "{e}");
     let e = SearchConfig::load(dir.path().join("missing.ferxsearch")).expect_err("no file");
     assert!(e.contains("cannot read"), "{e}");
-    std::fs::write(
-        &path,
-        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n").unwrap();
     let cfg = SearchConfig::load(&path).expect("loads");
     assert_eq!(cfg.dir, dir.path());
     assert_eq!(cfg.base, dir.path().join("m.ferx"));
@@ -328,10 +293,7 @@ fn end_to_end_categorical_symbol_on_a_model_without_the_block_is_loud() {
     let cfg = load(&text);
     let base = cfg.load_base().expect("base model + data");
     let e = cfg.resolve_space(&base).expect_err("no block");
-    assert!(
-        e.contains("`@CATEGORICAL` needs a `[covariates]` block"),
-        "{e}"
-    );
+    assert!(e.contains("`@CATEGORICAL` needs a `[covariates]` block"), "{e}");
 }
 
 /// The shipped example file loads and resolves; it is what the docs page

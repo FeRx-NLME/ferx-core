@@ -28,11 +28,7 @@ fn valid_min() -> Vec<&'static str> {
 
 /// `valid_min` with every line starting with `prefix` removed.
 fn without(prefix: &str) -> Vec<String> {
-    valid_min()
-        .into_iter()
-        .filter(|l| !l.starts_with(prefix))
-        .map(String::from)
-        .collect()
+    valid_min().into_iter().filter(|l| !l.starts_with(prefix)).map(String::from).collect()
 }
 
 fn perr(body: &[&str]) -> String {
@@ -75,10 +71,7 @@ fn full_continuous_block_parses() {
             interval: None,
         }
     );
-    assert_eq!(
-        spec.rules[1].action,
-        AdaptiveAction::Decrease(DoseStep::Percent(25.0))
-    );
+    assert_eq!(spec.rules[1].action, AdaptiveAction::Decrease(DoseStep::Percent(25.0)));
     assert_eq!(spec.rules[1].op, Comparison::Gt);
     assert_eq!(spec.rules[2].action, AdaptiveAction::Hold);
     assert_eq!(spec.rules[3].action, AdaptiveAction::Stop);
@@ -92,7 +85,7 @@ fn minimal_block_parses_with_defaults() {
     assert!(!spec.with_assay_error);
     assert_eq!(spec.assay_cmt, None);
     assert_eq!(spec.levels, None);
-    // No `target_window` declared ⇒ `None` (metrics leave `pct_time_in_window`
+    // No `target_window` declared ⇒ `None` (metrics leave `pct_readings_in_window`
     // unreported rather than guessing a band).
     assert_eq!(spec.target_window, None);
 }
@@ -228,13 +221,7 @@ fn all_comparison_operators_parse() {
     let ops: Vec<Comparison> = spec.rules.iter().map(|r| r.op).collect();
     assert_eq!(
         ops,
-        vec![
-            Comparison::Lt,
-            Comparison::Le,
-            Comparison::Gt,
-            Comparison::Ge,
-            Comparison::Eq,
-        ]
+        vec![Comparison::Lt, Comparison::Le, Comparison::Gt, Comparison::Ge, Comparison::Eq,]
     );
 }
 
@@ -251,18 +238,9 @@ fn discrete_levels_block_parses() {
         "when signal > 3 : decrease",
     ]))
     .expect("discrete levels block parses");
-    assert_eq!(
-        spec.levels,
-        crate::sim::adaptive::literal_levels(&[50.0, 100.0, 150.0, 200.0])
-    );
-    assert_eq!(
-        spec.rules[0].action,
-        AdaptiveAction::Increase(DoseStep::Level)
-    );
-    assert_eq!(
-        spec.rules[1].action,
-        AdaptiveAction::Decrease(DoseStep::Level)
-    );
+    assert_eq!(spec.levels, crate::sim::adaptive::literal_levels(&[50.0, 100.0, 150.0, 200.0]));
+    assert_eq!(spec.rules[0].action, AdaptiveAction::Increase(DoseStep::Level));
+    assert_eq!(spec.rules[1].action, AdaptiveAction::Decrease(DoseStep::Level));
 }
 
 #[test]
@@ -340,25 +318,16 @@ fn signal_source_matrix_errors() {
     let mut both = without("nothing"); // full valid block (observe present)…
     both.push("with_assay_error = true".into());
     both.push("assay_cmt = 1".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&both).unwrap_err(),
-        "remove `observe`",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&both).unwrap_err(), "remove `observe`");
     // Assay error without naming the measured output.
     let mut no_cmt = without("observe");
     no_cmt.push("with_assay_error = true".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&no_cmt).unwrap_err(),
-        "requires `assay_cmt",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&no_cmt).unwrap_err(), "requires `assay_cmt");
 }
 
 #[test]
 fn no_rules_errors() {
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&without("when")).unwrap_err(),
-        "rule",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&without("when")).unwrap_err(), "rule");
 }
 
 #[test]
@@ -377,10 +346,7 @@ fn dose_bounds_problems_error() {
 fn start_dose_outside_bounds_errors() {
     let mut b = without("start_dose");
     b.push("start_dose = 500".into()); // bounds are [0, 400]
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "outside dose_bounds",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "outside dose_bounds");
 }
 
 #[test]
@@ -430,37 +396,24 @@ fn schedule_every_keeps_inclusive_endpoint_for_decimal_step() {
         parse_adaptive_dosing_block(&b).expect("schedule parses").at
     };
     let decimal = mk("every 0.1 from 0 to 0.3");
-    assert_eq!(
-        decimal.len(),
-        4,
-        "expected the inclusive 0.3, got {decimal:?}"
-    );
+    assert_eq!(decimal.len(), 4, "expected the inclusive 0.3, got {decimal:?}");
     assert!((decimal.last().unwrap() - 0.3).abs() < 1e-12);
     // A non-multiple endpoint stays excluded (last point < t1, no spurious add).
-    assert_eq!(
-        mk("every 24 from 0 to 100"),
-        vec![0.0, 24.0, 48.0, 72.0, 96.0]
-    );
+    assert_eq!(mk("every 24 from 0 to 100"), vec![0.0, 24.0, 48.0, 72.0, 96.0]);
 }
 
 #[test]
 fn confirm_zero_errors() {
     let mut b = without("nothing");
     b.push("confirm = 0".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "confirm must be >= 1",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "confirm must be >= 1");
 }
 
 #[test]
 fn assay_cmt_without_assay_error_errors() {
     let mut b = without("nothing");
     b.push("assay_cmt = 2".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "with_assay_error = false",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "with_assay_error = false");
 }
 
 #[test]
@@ -511,50 +464,35 @@ fn levels_not_strictly_increasing_errors() {
     b.push("when signal < 10 : increase".into()); // make it a level block
                                                   // valid_min already has a percentage rule; drop it so only level steps remain.
     let b: Vec<String> = b.into_iter().filter(|l| !l.contains("25%")).collect();
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "strictly increasing",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "strictly increasing");
 }
 
 #[test]
 fn rule_condition_must_compare_signal() {
     let mut b = without("when");
     b.push("when conc < 10 : hold".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "compare `signal`",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "compare `signal`");
 }
 
 #[test]
 fn rule_missing_operator_errors() {
     let mut b = without("when");
     b.push("when signal 10 : hold".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "comparison operator",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "comparison operator");
 }
 
 #[test]
 fn rule_missing_action_colon_errors() {
     let mut b = without("when");
     b.push("when signal < 10".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "when <signal>",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "when <signal>");
 }
 
 #[test]
 fn unknown_action_errors() {
     let mut b = without("when");
     b.push("when signal < 10 : obliterate".into());
-    assert_adaptive_err(
-        &parse_adaptive_dosing_block(&b).unwrap_err(),
-        "unknown action",
-    );
+    assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "unknown action");
 }
 
 #[test]
@@ -590,10 +528,7 @@ fn at_problems_error() {
     };
     assert_adaptive_err(&mk("every 24 from 24"), "every <"); // missing `to`
     assert_adaptive_err(&mk("[48, 24]"), "strictly increasing"); // out of order
-    assert_adaptive_err(
-        &mk("every 0 from 24 to 96"),
-        "interval must be finite and > 0",
-    );
+    assert_adaptive_err(&mk("every 0 from 24 to 96"), "interval must be finite and > 0");
 }
 
 // ── End-to-end wiring: the block reaches ParsedModel ──
@@ -619,9 +554,7 @@ fn parsed_model_carries_adaptive_dosing_block() {
             "{MODEL_HEAD}\n[adaptive_dosing]\n  observe = central / V\n  at = every 24 from 24 to 96\n  start_dose = 100\n  route = bolus(cmt = 1)\n  dose_bounds = [0, 400]\n  when signal < 10 : increase 25%\n"
         );
     let parsed = parse_full_model(&with_block).expect("model with [adaptive_dosing] parses");
-    let spec = parsed
-        .adaptive_dosing
-        .expect("the block must attach to ParsedModel");
+    let spec = parsed.adaptive_dosing.expect("the block must attach to ParsedModel");
     assert_eq!(spec.start_dose, 100.0);
     assert_eq!(spec.at.len(), 4);
 }
@@ -637,10 +570,8 @@ fn parsed_model_without_block_is_none() {
 /// `valid_min` on a q12 grid, with `extra` lines appended and its rule replaced by
 /// `rules`.
 fn interval_block(extra: &[&str], rules: &[&str]) -> Vec<String> {
-    let mut b: Vec<String> = without("when")
-        .into_iter()
-        .filter(|l| !l.starts_with("at "))
-        .collect();
+    let mut b: Vec<String> =
+        without("when").into_iter().filter(|l| !l.starts_with("at ")).collect();
     b.push("at = every 12 from 0 to 96".into());
     b.extend(extra.iter().map(|s| s.to_string()));
     b.extend(rules.iter().map(|s| s.to_string()));
@@ -663,26 +594,16 @@ fn interval_ladder_block_parses() {
     .expect("interval ladder parses");
     assert_eq!(spec.intervals, Some(vec![12.0, 24.0, 36.0]));
     assert_eq!(spec.start_interval, Some(24.0));
-    let effects: Vec<_> = spec
-        .rules
-        .iter()
-        .map(|r| (r.action.clone(), r.interval))
-        .collect();
+    let effects: Vec<_> = spec.rules.iter().map(|r| (r.action.clone(), r.interval)).collect();
     assert_eq!(
         effects,
         vec![
             (AdaptiveAction::Hold, Some(IntervalStep::Lengthen)),
-            (
-                AdaptiveAction::Decrease(DoseStep::Percent(25.0)),
-                Some(IntervalStep::Lengthen)
-            ),
+            (AdaptiveAction::Decrease(DoseStep::Percent(25.0)), Some(IntervalStep::Lengthen)),
             // An interval-only rule re-issues the running dose.
             (AdaptiveAction::Maintain, Some(IntervalStep::Lengthen)),
             // Either order.
-            (
-                AdaptiveAction::Increase(DoseStep::Percent(10.0)),
-                Some(IntervalStep::Shorten)
-            ),
+            (AdaptiveAction::Increase(DoseStep::Percent(10.0)), Some(IntervalStep::Shorten)),
         ]
     );
     // A block without the keys is unchanged.
@@ -696,27 +617,18 @@ fn interval_ladder_block_parses() {
 /// refused by the shared validator.
 #[test]
 fn interval_rule_effect_errors() {
-    let e = perr_owned(interval_block(
-        &LADDER,
-        &["when signal > 20 : lengthen, shorten"],
-    ));
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : lengthen, shorten"]));
     assert_adaptive_err(
         &e,
         "a rule takes at most one interval effect (`lengthen` or `shorten`): lengthen, shorten",
     );
-    let e = perr_owned(interval_block(
-        &LADDER,
-        &["when signal > 20 : hold, decrease 10%"],
-    ));
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : hold, decrease 10%"]));
     assert_adaptive_err(
         &e,
         "a rule takes at most one dose effect (`increase`, `decrease`, `hold` or `stop`): \
          hold, decrease 10%",
     );
-    let e = perr_owned(interval_block(
-        &LADDER,
-        &["when signal > 20 : stop, lengthen"],
-    ));
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : stop, lengthen"]));
     assert_adaptive_err(
         &e,
         "`stop` cannot be combined with `lengthen` / `shorten` (a stopped course has no next \
@@ -745,10 +657,7 @@ fn interval_rule_malformed_effect_errors() {
         "`lengthen` steps the `intervals` ladder one rung and takes no operand: lengthen 2",
     );
     assert!(!e.contains("percentage"), "{e}");
-    let e = perr_owned(interval_block(
-        &LADDER,
-        &["when signal > 20 : hold, shorten 12"],
-    ));
+    let e = perr_owned(interval_block(&LADDER, &["when signal > 20 : hold, shorten 12"]));
     assert_adaptive_err(&e, "`shorten` steps the `intervals` ladder");
 }
 
@@ -757,33 +666,18 @@ fn interval_keys_must_come_together() {
     let rule = ["when signal > 20 : lengthen"];
     let e = perr_owned(interval_block(&["intervals = [12, 24]"], &rule));
     assert_adaptive_err(&e, "`intervals` requires a `start_interval`");
-    let e = perr_owned(interval_block(
-        &["start_interval = 12"],
-        &["when signal > 20 : hold"],
-    ));
-    assert_adaptive_err(
-        &e,
-        "`start_interval` requires an `intervals = [...]` ladder",
-    );
+    let e = perr_owned(interval_block(&["start_interval = 12"], &["when signal > 20 : hold"]));
+    assert_adaptive_err(&e, "`start_interval` requires an `intervals = [...]` ladder");
     let e = perr_owned(interval_block(&[], &rule));
     assert_adaptive_err(
         &e,
         "`lengthen` / `shorten` require an `intervals = [...]` ladder and a `start_interval`",
     );
-    let e = perr_owned(interval_block(
-        &["intervals = [12, q24]", "start_interval = 12"],
-        &rule,
-    ));
+    let e = perr_owned(interval_block(&["intervals = [12, q24]", "start_interval = 12"], &rule));
     assert_adaptive_err(&e, "bad intervals:");
-    let e = perr_owned(interval_block(
-        &["intervals = [24, 12]", "start_interval = 12"],
-        &rule,
-    ));
+    let e = perr_owned(interval_block(&["intervals = [24, 12]", "start_interval = 12"], &rule));
     assert_adaptive_err(&e, "intervals must be strictly increasing");
-    let e = perr_owned(interval_block(
-        &["intervals = [12, 24]", "start_interval = q12"],
-        &rule,
-    ));
+    let e = perr_owned(interval_block(&["intervals = [12, 24]", "start_interval = q12"], &rule));
     assert_adaptive_err(&e, "bad start_interval: q12");
 }
 
@@ -794,31 +688,19 @@ fn interval_keys_must_come_together() {
 #[test]
 fn intervals_must_be_multiples_of_the_every_step() {
     let rule = ["when signal > 20 : lengthen"];
-    let e = perr_owned(interval_block(
-        &["intervals = [12, 18]", "start_interval = 12"],
-        &rule,
-    ));
+    let e = perr_owned(interval_block(&["intervals = [12, 18]", "start_interval = 12"], &rule));
     assert_adaptive_err(
         &e,
         "interval 18 is not a whole multiple of the `at` step 12, so its due times would \
          fall between decision times",
     );
     // Half the step rounds to one step and fails on the residual.
-    let e = perr_owned(interval_block(
-        &["intervals = [6, 12]", "start_interval = 12"],
-        &rule,
-    ));
+    let e = perr_owned(interval_block(&["intervals = [6, 12]", "start_interval = 12"], &rule));
     assert_adaptive_err(&e, "interval 6 is not a whole multiple of the `at` step 12");
     // Far below the step the residual is inside the tolerance and only `k < 1` refuses it
     // (the driver would refuse it too, at the first decision).
-    let e = perr_owned(interval_block(
-        &["intervals = [1e-10, 12]", "start_interval = 12"],
-        &rule,
-    ));
-    assert_adaptive_err(
-        &e,
-        "interval 0.0000000001 is not a whole multiple of the `at` step 12",
-    );
+    let e = perr_owned(interval_block(&["intervals = [1e-10, 12]", "start_interval = 12"], &rule));
+    assert_adaptive_err(&e, "interval 0.0000000001 is not a whole multiple of the `at` step 12");
 
     let mut decimal = interval_block(&["intervals = [0.3, 0.6]", "start_interval = 0.3"], &rule);
     decimal.retain(|l| !l.starts_with("at "));
@@ -878,10 +760,7 @@ fn dose_values_parse_as_numbers_or_expressions() {
     assert_eq!(spec.start_dose, DoseValue::Expr("15 * WT".to_string()));
     assert_eq!(
         spec.dose_bounds,
-        (
-            DoseValue::Literal(0.0),
-            DoseValue::Expr("min(30 * WT, 4000)".to_string())
-        )
+        (DoseValue::Literal(0.0), DoseValue::Expr("min(30 * WT, 4000)".to_string()))
     );
     assert_eq!(
         spec.levels,
@@ -893,10 +772,7 @@ fn dose_values_parse_as_numbers_or_expressions() {
     );
     let lit = parse_adaptive_dosing_block(&lines(&valid_min())).expect("literal block");
     assert_eq!(lit.start_dose, DoseValue::Literal(100.0));
-    assert_eq!(
-        lit.dose_bounds,
-        (DoseValue::Literal(0.0), DoseValue::Literal(400.0))
-    );
+    assert_eq!(lit.dose_bounds, (DoseValue::Literal(0.0), DoseValue::Literal(400.0)));
 }
 
 /// The shape errors a dose key can still have: no value, a list that is not a pair, a
@@ -909,10 +785,7 @@ fn dose_value_shape_errors() {
     let mut b = without("start_dose");
     b.push("start_dose =".to_string());
     let refs: Vec<&str> = b.iter().map(String::as_str).collect();
-    assert_eq!(
-        perr(&refs),
-        "[adaptive_dosing]: start_dose requires a number or an expression"
-    );
+    assert_eq!(perr(&refs), "[adaptive_dosing]: start_dose requires a number or an expression");
 
     let mut b = without("dose_bounds");
     b.push("dose_bounds = [0, 30 * WT, 4000]".to_string());
@@ -925,19 +798,13 @@ fn dose_value_shape_errors() {
     let mut b = without("dose_bounds");
     b.push("dose_bounds = 0, 30 * WT".to_string());
     let refs: Vec<&str> = b.iter().map(String::as_str).collect();
-    assert_eq!(
-        perr(&refs),
-        "[adaptive_dosing]: dose_bounds must be a list `[...]`: 0, 30 * WT"
-    );
+    assert_eq!(perr(&refs), "[adaptive_dosing]: dose_bounds must be a list `[...]`: 0, 30 * WT");
 }
 
 /// A 1-cpt model with a WT covariate, an η on CL, and — when `kappa` — a κ on CL.
 fn dose_model(kappa: bool, start_dose: &str) -> String {
-    let (k_decl, k_use) = if kappa {
-        ("  kappa KAPPA_CL ~ 0.09\n", " + KAPPA_CL")
-    } else {
-        ("", "")
-    };
+    let (k_decl, k_use) =
+        if kappa { ("  kappa KAPPA_CL ~ 0.09\n", " + KAPPA_CL") } else { ("", "") };
     format!(
         "[parameters]
   theta TVCL(6.0, 0.1, 50.0)
@@ -1024,10 +891,7 @@ fn dose_expression_reads_are_refused_at_parse_time() {
             assert!(got.starts_with(want), "{expr}: {got}");
         } else {
             assert!(got.ends_with(want), "{expr}:\n got {got}\nwant {want}");
-            assert!(
-                !got.contains("Form C") && !got.contains("per observation"),
-                "{got}"
-            );
+            assert!(!got.contains("Form C") && !got.contains("per observation"), "{got}");
         }
     }
     for ok in ["15 * WT * TVCL", "400 * CL", "1000 * exp(ETA_CL)"] {
@@ -1177,16 +1041,10 @@ fn a_dose_expression_refusal_names_its_own_key() {
     let src =
         dose_model(false, "500").replace("dose_bounds = [0, 4000]", "dose_bounds = [0, 2 * CENT]");
     let got = full_err(&src);
-    assert!(
-        got.contains("[adaptive_dosing] dose_bounds reads CENT"),
-        "{got}"
-    );
+    assert!(got.contains("[adaptive_dosing] dose_bounds reads CENT"), "{got}");
     assert!(!got.contains("start_dose"), "{got}");
     let src = dose_model(false, "500")
-        .replace(
-            "dose_bounds = [0, 4000]",
-            "dose_bounds = [0, 4000]\n  levels = [500, 400 * CENT]",
-        )
+        .replace("dose_bounds = [0, 4000]", "dose_bounds = [0, 4000]\n  levels = [500, 400 * CENT]")
         .replace("increase 25%", "increase");
     let got = full_err(&src);
     assert!(got.contains("[adaptive_dosing] levels reads CENT"), "{got}");

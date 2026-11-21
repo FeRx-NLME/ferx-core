@@ -60,10 +60,7 @@ fn nonmem_tte_rows() -> Vec<(i64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV
             (f.len() >= 9 && f[2] == 3.0 && f[8] == 0.0).then(|| (f[0] as i64, f[1], f[5], f[6]))
         })
@@ -76,13 +73,7 @@ fn nonmem_obj() -> Vec<f64> {
         .lines()
         .skip(2)
         .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            l.split_whitespace()
-                .nth(4)
-                .expect("OBJ column")
-                .parse()
-                .expect("OBJ is numeric")
-        })
+        .map(|l| l.split_whitespace().nth(4).expect("OBJ column").parse().expect("OBJ is numeric"))
         .collect()
 }
 
@@ -146,11 +137,7 @@ fn per_subject_objective_matches_nonmem_for_a_time_dependent_hazard() {
         let ferx = 2.0 * individual_nll(&m, s, &p.theta, &[], &p.omega, &p.sigma.values);
         // See the note in the sibling test: a NaN folded through `.max()` vanishes
         // and leaves `worst` at 0, so the bound below would pass on a broken solve.
-        assert!(
-            ferx.is_finite(),
-            "subject {}: ferx objective is not finite ({ferx})",
-            s.id
-        );
+        assert!(ferx.is_finite(), "subject {}: ferx objective is not finite ({ferx})", s.id);
         worst = worst.max((ferx - o).abs());
         total += ferx;
     }
@@ -197,10 +184,7 @@ fn the_time_term_in_the_hazard_is_live_at_every_record() {
         // Same NaN trap as the sibling tests, and worse here: `f64::min` discards a
         // NaN too, so an all-NaN run would leave `smallest` at INFINITY and pass
         // the "the term is live" bound while proving nothing at all.
-        assert!(
-            rel.is_finite(),
-            "subject {id} at t={t}: relative gap is {rel}"
-        );
+        assert!(rel.is_finite(), "subject {id} at t={t}: relative gap is {rel}");
         smallest = smallest.min(rel);
         largest = largest.max(rel);
     }
@@ -209,8 +193,5 @@ fn the_time_term_in_the_hazard_is_live_at_every_record() {
         "the earliest TTE record must still see the time term: {smallest:.3e} \
          (measured 5.5e-3, against a 5e-8 anchor bound)"
     );
-    assert!(
-        largest > 0.5,
-        "and the latest must see it plainly: {largest:.3e} (measured 0.85)"
-    );
+    assert!(largest > 0.5, "and the latest must see it plainly: {largest:.3e} (measured 0.85)");
 }

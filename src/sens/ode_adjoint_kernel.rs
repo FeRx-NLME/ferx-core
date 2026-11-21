@@ -35,10 +35,7 @@ impl KernelRun {
 
     /// `plan` run forward at `layout` on `inputs` (as [`kernel_run`]'s run).
     pub(super) fn of_plan(
-        plan: &Arc<kj::Plan>,
-        layout: Layout,
-        inputs: &[f64],
-        n_out: usize,
+        plan: &Arc<kj::Plan>, layout: Layout, inputs: &[f64], n_out: usize,
     ) -> Option<Self> {
         let l = layout.lanes();
         let mut out = kj::Buf::new((n_out + 1) * l);
@@ -46,14 +43,7 @@ impl KernelRun {
         if out[n_out * l] != 1.0 {
             return None;
         }
-        Some(KernelRun {
-            plan: plan.clone(),
-            fwd,
-            layout,
-            n_in: inputs.len() / l,
-            n_out,
-            out,
-        })
+        Some(KernelRun { plan: plan.clone(), fwd, layout, n_in: inputs.len() / l, n_out, out })
     }
 
     /// Output `o`'s value.
@@ -68,9 +58,7 @@ impl KernelRun {
         let nt = self.n_in * self.layout.lanes();
         let mut p_bar = kj::Buf::new(rows * nt);
         if seeds.len() != rows * self.n_out * self.layout.lanes()
-            || !self
-                .plan
-                .reverse_from(&self.fwd, self.layout, rows, &mut [], &mut p_bar, seeds)
+            || !self.plan.reverse_from(&self.fwd, self.layout, rows, &mut [], &mut p_bar, seeds)
         {
             return None;
         }
@@ -90,9 +78,7 @@ impl KernelRun {
     pub(super) fn reverse_tangent_flat(&self, seeds: &[f64], rows: usize) -> Option<kj::Buf> {
         let mut p_bar = kj::Buf::new(rows * self.n_in * self.layout.lanes());
         if seeds.len() != rows * self.n_out * self.layout.lanes()
-            || !self
-                .plan
-                .reverse_tangent_from(&self.fwd, rows, &mut [], &mut p_bar, seeds)
+            || !self.plan.reverse_tangent_from(&self.fwd, rows, &mut [], &mut p_bar, seeds)
         {
             return None;
         }
@@ -116,12 +102,7 @@ impl KernelRun {
         }
         let p = self.reverse_flat(&flat, seeds.len())?;
         let nt = (self.n_in * self.layout.lanes()).max(1);
-        Some(
-            p.chunks_exact(nt)
-                .take(seeds.len())
-                .map(<[f64]>::to_vec)
-                .collect(),
-        )
+        Some(p.chunks_exact(nt).take(seeds.len()).map(<[f64]>::to_vec).collect())
     }
 
     /// [`Self::reverse`] at the value layout with one seed per output combination: per row
@@ -139,13 +120,8 @@ impl KernelRun {
 /// that fails — declines this call only, never the subject.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn kernel_run(
-    model: &CompiledModel,
-    subject: &Subject,
-    variant: kj::Desc,
-    layout: Layout,
-    inputs: &[f64],
-    n_out: usize,
-    f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
+    model: &CompiledModel, subject: &Subject, variant: kj::Desc, layout: Layout, inputs: &[f64],
+    n_out: usize, f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
 ) -> Option<KernelRun> {
     let l = layout.lanes();
     if inputs.len() % l != 0 {
@@ -163,14 +139,7 @@ pub(super) fn kernel_run(
         if out[n_out * l] != 1.0 {
             return None;
         }
-        Some(KernelRun {
-            plan: plan.clone(),
-            fwd,
-            layout,
-            n_in,
-            n_out,
-            out,
-        })
+        Some(KernelRun { plan: plan.clone(), fwd, layout, n_in, n_out, out })
     };
     // The one lookup-and-record path of every plan kind ([`plan_or_record`]): a failed recording
     // settles by its scope, and a variant that does not run at its own point is marked.
@@ -230,13 +199,8 @@ pub(super) fn kernel_run(
 /// a subject neither records nor first-tier runs it (#2980: the structured covariance kernel's
 /// reduce). A thread's plans are kept in a small table, oldest dropped first.
 pub(super) fn kernel_run_shared(
-    model: &CompiledModel,
-    subject: &Subject,
-    variant: kj::Desc,
-    layout: Layout,
-    inputs: &[f64],
-    n_out: usize,
-    f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
+    model: &CompiledModel, subject: &Subject, variant: kj::Desc, layout: Layout, inputs: &[f64],
+    n_out: usize, f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
 ) -> Option<KernelRun> {
     const KEEP: usize = 64;
     thread_local! {
@@ -254,13 +218,8 @@ pub(super) fn kernel_run_shared(
         .family();
     // Every plan recorded under the key: a recorded program carries the branches its recording
     // point took as guards, so a point on another branch is served by the plan recorded there.
-    let cached: Vec<Arc<kj::Plan>> = SHARED.with(|c| {
-        c.borrow()
-            .iter()
-            .filter(|(k, _)| *k == key)
-            .map(|(_, p)| p.clone())
-            .collect()
-    });
+    let cached: Vec<Arc<kj::Plan>> = SHARED
+        .with(|c| c.borrow().iter().filter(|(k, _)| *k == key).map(|(_, p)| p.clone()).collect());
     for plan in &cached {
         if let Some(kr) = KernelRun::of_plan(plan, layout, inputs, n_out) {
             return Some(kr);
@@ -268,9 +227,7 @@ pub(super) fn kernel_run_shared(
     }
     let rec = kj::recorded(&key, || {
         let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
-        f(&leaves)
-            .filter(|y| y.len() == n_out)
-            .map(|y| y.iter().map(|x| x.reg()).collect())
+        f(&leaves).filter(|y| y.len() == n_out).map(|y| y.iter().map(|x| x.reg()).collect())
     })
     .ok()?;
     let p = Arc::new(rec.plan(Layout::F64, 0, n_in)?);
@@ -329,10 +286,7 @@ impl Inputs {
     /// A new leaf at `v`.
     pub(super) fn leaf(&mut self, v: f64) -> Leaf {
         self.vals.push(v);
-        Leaf {
-            v,
-            i: Some((self.vals.len() - 1) as u32),
-        }
+        Leaf { v, i: Some((self.vals.len() - 1) as u32) }
     }
 }
 
@@ -360,11 +314,7 @@ mod tests {
                 .expect("runs");
             let want = x[0] * x[1] + x[2].exp();
             assert_eq!(r.value(0), want, "value at {x:?}");
-            let g = r
-                .reverse_values(&[vec![1.0]])
-                .expect("reverses")
-                .pop()
-                .unwrap();
+            let g = r.reverse_values(&[vec![1.0]]).expect("reverses").pop().unwrap();
             assert_eq!(g, vec![x[1], x[0], x[2].exp()], "gradient at {x:?}");
         }
     }
@@ -403,10 +353,7 @@ mod tests {
             Some(vec![lv[0] * lv[0]])
         };
         assert!(at(2.0, &fails).is_none());
-        assert!(
-            matches!(kj::lookup(&key), kj::Lookup::Missing),
-            "not condemned"
-        );
+        assert!(matches!(kj::lookup(&key), kj::Lookup::Missing), "not condemned");
         let ok = |lv: &[kj::Tr]| Some(vec![lv[0] * lv[0]]);
         let r = at(3.0, &ok).expect("re-served");
         assert_eq!(r.value(0), 9.0);
@@ -429,10 +376,7 @@ mod tests {
             Some(vec![lv[0]])
         };
         assert!(run(&va, &fails).is_none());
-        assert!(matches!(
-            kj::lookup(&key_of(&model, &subject, &va)),
-            kj::Lookup::Bad
-        ));
+        assert!(matches!(kj::lookup(&key_of(&model, &subject, &va)), kj::Lookup::Bad));
         let key_b = key_of(&model, &subject, &vb);
         assert!(kj::model_bad(&key_b).is_some(), "the model is marked");
         let ok = |lv: &[kj::Tr]| Some(vec![lv[0] * lv[0]]);
@@ -459,16 +403,11 @@ mod tests {
             if lv[0].recorded() == 0.0 {
                 None
             } else {
-                Some(vec![
-                    <kj::Tr as crate::sens::num::PkNum>::from_f64(1.0) / lv[0],
-                ])
+                Some(vec![<kj::Tr as crate::sens::num::PkNum>::from_f64(1.0) / lv[0]])
             }
         };
         assert!(at(0.0, &f).is_none());
-        assert!(
-            matches!(kj::lookup(&key), kj::Lookup::Missing),
-            "nothing kept, nothing condemned"
-        );
+        assert!(matches!(kj::lookup(&key), kj::Lookup::Missing), "nothing kept, nothing condemned");
         let r = at(4.0, &f).expect("served at a valid point");
         assert_eq!(r.value(0), 0.25);
         assert!(

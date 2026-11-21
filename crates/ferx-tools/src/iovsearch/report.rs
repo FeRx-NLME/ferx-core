@@ -92,12 +92,7 @@ fn write_models(path: &Path, result: &IovsearchResult) -> Result<(), String> {
                 r.structure.description(),
                 r.structure.etas.join(";"),
                 r.structure.kappas.join(";"),
-                r.structure
-                    .kappa_blocks
-                    .iter()
-                    .map(|b| b.join(","))
-                    .collect::<Vec<_>>()
-                    .join(";"),
+                r.structure.kappa_blocks.iter().map(|b| b.join(",")).collect::<Vec<_>>().join(";"),
                 r.n_parameters.map(|n| n.to_string()).unwrap_or_default(),
                 opt_number(r.ofv),
                 number(r.criterion),
@@ -106,19 +101,14 @@ fn write_models(path: &Path, result: &IovsearchResult) -> Result<(), String> {
                 r.converged.map(|c| c.to_string()).unwrap_or_default(),
                 r.passed.to_string(),
                 r.failures.join("; "),
-                r.error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_default(),
+                r.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
                 r.starts.to_string(),
                 number(r.seconds),
                 r.selected.to_string(),
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// A human-readable rendering of the search: the input, each step's
@@ -128,20 +118,14 @@ pub fn render_summary(result: &IovsearchResult) -> String {
     let mut out = String::new();
     let label = result.criterion.label();
     let describe_id = |id: &str| -> String {
-        result
-            .row(id)
-            .map(|r| r.structure.description())
-            .unwrap_or_default()
+        result.row(id).map(|r| r.structure.description()).unwrap_or_default()
     };
     if let Some(input) = result.row("input") {
         let _ = writeln!(
             out,
             "Input model: {} — OFV {}, {label} {}",
             input.structure.description(),
-            input
-                .ofv
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_else(|| "-".into()),
+            input.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
             number_or_dash(input.criterion)
         );
     }
@@ -151,11 +135,7 @@ pub fn render_summary(result: &IovsearchResult) -> String {
         result.options.distribution.label(),
         result.rows.len(),
         if result.rows.len() == 1 { "" } else { "s" },
-        if result.cancelled {
-            " (search cancelled)"
-        } else {
-            ""
-        }
+        if result.cancelled { " (search cancelled)" } else { "" }
     );
     for step in &result.steps {
         let _ = writeln!(
@@ -207,13 +187,9 @@ pub fn render_summary(result: &IovsearchResult) -> String {
                 row.and_then(|r| r.n_parameters)
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "-".into()),
-                row.and_then(|r| r.ofv)
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
+                row.and_then(|r| r.ofv).map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
                 number_or_dash(r.criterion),
-                r.d_criterion
-                    .map(|v| format!("{v:+.3}"))
-                    .unwrap_or_else(|| "-".into()),
+                r.d_criterion.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "-".into()),
                 r.rank.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
                 status,
                 decision

@@ -36,6 +36,11 @@ mod matrix;
 #[path = "kernel_jit_loop.rs"]
 mod ode_loop;
 #[cfg(test)]
+pub(crate) use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
+#[cfg(test)]
+#[path = "kernel_jit_lanes.rs"]
+mod lanes;
+#[cfg(test)]
 #[path = "kernel_jit_plan_tests.rs"]
 mod plan_tests;
 #[path = "kernel_jit_simd.rs"]
@@ -278,8 +283,7 @@ impl Rec {
                         .find(|o| meets(o) && o.trace.get(..at) == t.trace.get(..at))
                         .cloned();
                     if next.is_none() {
-                        self.failed
-                            .get_or_insert((TEMPLATE_MISMATCH.into(), FailScope::Subject));
+                        self.failed.get_or_insert((TEMPLATE_MISMATCH.into(), FailScope::Subject));
                     }
                     self.replay = next;
                 }
@@ -371,11 +375,7 @@ thread_local! {
 }
 
 fn rec<R>(f: impl FnOnce(&mut Rec) -> R) -> R {
-    REC.with(|r| {
-        f(r.borrow_mut()
-            .as_mut()
-            .expect("a kernel_jit recording is open"))
-    })
+    REC.with(|r| f(r.borrow_mut().as_mut().expect("a kernel_jit recording is open")))
 }
 
 /// Whose failure a failed recording is: the point's alone (a record-time run that failed at
@@ -446,8 +446,7 @@ fn node(key: Option<Key>, mk: impl FnOnce(u32) -> Flat) -> u32 {
         }
         let d = r.n_regs;
         if d >= u32::MAX - 2 {
-            r.failed
-                .get_or_insert(("register file full".into(), FailScope::Subject));
+            r.failed.get_or_insert(("register file full".into(), FailScope::Subject));
             return 0;
         }
         r.n_regs += 1;
@@ -469,8 +468,7 @@ fn node_v(key: Key, v: f64, mk: impl FnOnce(u32) -> Flat) -> Tr {
             None => {
                 let d = r.n_regs;
                 if d >= u32::MAX - 2 {
-                    r.failed
-                        .get_or_insert(("register file full".into(), FailScope::Subject));
+                    r.failed.get_or_insert(("register file full".into(), FailScope::Subject));
                     return 0;
                 }
                 r.n_regs += 1;
@@ -493,19 +491,11 @@ fn guard_reg(c: u32, holds: bool) {
     if !rec(|r| r.guarded.insert((c, holds))) {
         return;
     }
-    let c = if holds {
-        c
-    } else {
-        node(None, |d| Flat::Not { d, a: c as u32 })
-    };
+    let c = if holds { c } else { node(None, |d| Flat::Not { d, a: c as u32 }) };
     let g = rec(|r| r.guard);
     let g = match g {
         None => c,
-        Some(p) => node(None, |d| Flat::And {
-            d,
-            a: p as u32,
-            b: c as u32,
-        }),
+        Some(p) => node(None, |d| Flat::And { d, a: p as u32, b: c as u32 }),
     };
     rec(|r| r.guard = Some(g));
 }
@@ -596,8 +586,7 @@ impl Tr {
                 None => {
                     let d = r.n_regs;
                     if d >= u32::MAX - 2 {
-                        r.failed
-                            .get_or_insert(("register file full".into(), FailScope::Subject));
+                        r.failed.get_or_insert(("register file full".into(), FailScope::Subject));
                         0
                     } else {
                         r.n_regs += 1;
@@ -613,11 +602,7 @@ impl Tr {
             r.store(d, c);
             d
         });
-        Tr {
-            v: c,
-            r,
-            dep: false,
-        }
+        Tr { v: c, r, dep: false }
     }
     /// η direction `i`: a state input (`u[i]`).
     pub(crate) fn eta(i: usize, v: f64) -> Self {
@@ -641,11 +626,7 @@ impl Tr {
             return None;
         }
         // Not a value on the state variables of the affine check: its guard would read them.
-        if rec(|r| {
-            r.on_u
-                .as_ref()
-                .is_some_and(|o| o.get(x.r as usize) == Some(&true))
-        }) {
+        if rec(|r| r.on_u.as_ref().is_some_and(|o| o.get(x.r as usize) == Some(&true))) {
             return None;
         }
         x.br_abs_lt(f64::INFINITY).then(|| Self::k(z.v * x.v))
@@ -680,17 +661,14 @@ impl Tr {
         }
         let (a, b) = (self.r as u32, x.r as u32);
         let tag = T_GAMMA + upper as u8;
-        let r = node(
-            Some((tag, self.r, x.r, ((i as u64) << 8) | j as u64)),
-            |d| Flat::GammaPq {
-                d,
-                a,
-                x: b,
-                upper,
-                i,
-                j,
-            },
-        );
+        let r = node(Some((tag, self.r, x.r, ((i as u64) << 8) | j as u64)), |d| Flat::GammaPq {
+            d,
+            a,
+            x: b,
+            upper,
+            i,
+            j,
+        });
         Tr::mk(v, r, true)
     }
     /// A host call on `args`: run now for the values, and recorded to run again on every
@@ -736,12 +714,8 @@ impl Tr {
             return take;
         }
         let (ar, br) = (skip.r as u32, take.r as u32);
-        let r = node(Some((T_GATE, skip.r, take.r, k as u64)), |d| Flat::Gate {
-            d,
-            a: ar,
-            b: br,
-            k,
-        });
+        let r =
+            node(Some((T_GATE, skip.r, take.r, k as u64)), |d| Flat::Gate { d, a: ar, b: br, k });
         Tr::mk(take.v, r, true)
     }
     /// `a / b` with the interpreter's guard: `0` where `|b| < 1e-30`.
@@ -751,11 +725,7 @@ impl Tr {
             return Self::k(v);
         }
         let (x, y) = (a.r as u32, b.r as u32);
-        let r = node(Some((T_VMDIV, a.r, b.r, 0)), |d| Flat::Div {
-            d,
-            a: x,
-            b: y,
-        });
+        let r = node(Some((T_VMDIV, a.r, b.r, 0)), |d| Flat::Div { d, a: x, b: y });
         Tr::mk(v, r, true)
     }
     fn sin(self) -> Self {
@@ -764,21 +734,15 @@ impl Tr {
     /// The `k`-th derivative of `f` at `self` ([`crate::sens::num::JetFn`]): a different-route
     /// derivative, so the recording is not `exact`.
     fn jet_k_node(self, f: crate::sens::num::JetFn, k: u8) -> Self {
-        let v = if k > 4 {
-            f64::NAN
-        } else {
-            f.jet(self.v)[k as usize]
-        };
+        let v = if k > 4 { f64::NAN } else { f.jet(self.v)[k as usize] };
         if !self.dep {
             return Self::k(v);
         }
         let a = self.r as u32;
-        let r = node(Some((T_JET, self.r, f.index() as u32, k as u64)), |d| {
-            Flat::Unary {
-                d,
-                op: Unary::Jet(f, k),
-                a,
-            }
+        let r = node(Some((T_JET, self.r, f.index() as u32, k as u64)), |d| Flat::Unary {
+            d,
+            op: Unary::Jet(f, k),
+            a,
         });
         Tr::mk(v, r, true)
     }
@@ -798,25 +762,13 @@ impl Tr {
         Tr::mk(v, r, true)
     }
     fn digamma(self) -> Self {
-        self.unary(
-            T_DIGAMMA,
-            Unary::Digamma,
-            crate::stats::special::digamma(self.v),
-        )
+        self.unary(T_DIGAMMA, Unary::Digamma, crate::stats::special::digamma(self.v))
     }
     fn trigamma(self) -> Self {
-        self.unary(
-            T_TRIGAMMA,
-            Unary::Trigamma,
-            crate::stats::special::trigamma(self.v),
-        )
+        self.unary(T_TRIGAMMA, Unary::Trigamma, crate::stats::special::trigamma(self.v))
     }
     fn tetragamma(self) -> Self {
-        self.unary(
-            T_TETRAGAMMA,
-            Unary::Tetragamma,
-            crate::stats::special::tetragamma(self.v),
-        )
+        self.unary(T_TETRAGAMMA, Unary::Tetragamma, crate::stats::special::tetragamma(self.v))
     }
     /// A branch on values, recorded as a check: `a cc b` must come out as it did here.
     pub(super) fn guard_cmp(a: Self, cc: ir::Cc, b: Self) -> bool {
@@ -931,12 +883,7 @@ impl PkNum for Tr {
             let a = d.abs();
             let t = Self::k(tol);
             let (x, y) = (a.r as u32, t.r as u32);
-            let c = node(None, |dd| Flat::Cmp {
-                d: dd,
-                cc: ir::Cc::Lt,
-                a: x,
-                b: y,
-            });
+            let c = node(None, |dd| Flat::Cmp { d: dd, cc: ir::Cc::Lt, a: x, b: y });
             guard_reg(c, out);
         }
         out
@@ -1004,12 +951,7 @@ impl PkNum for Tr {
         }
         let cc = cc_of(cc);
         let (xr, yr) = (x.r as u32, y.r as u32);
-        let c = node(Some((T_CMP + cc as u8, x.r, y.r, 0)), |d| Flat::Cmp {
-            d,
-            cc,
-            a: xr,
-            b: yr,
-        });
+        let c = node(Some((T_CMP + cc as u8, x.r, y.r, 0)), |d| Flat::Cmp { d, cc, a: xr, b: yr });
         Self::select_reg(Tr::mk(holds as u8 as f64, c, true), a, b)
     }
     fn jet_unary(self, f: crate::sens::num::JetFn) -> Self {
@@ -1041,11 +983,7 @@ impl PkNum for Tr {
         self.unary(T_ACOS, Unary::Acos, self.v.acos())
     }
     fn ln_gamma(self) -> Self {
-        self.unary(
-            T_LNGAMMA,
-            Unary::LnGamma,
-            crate::stats::special::ln_gamma(self.v),
-        )
+        self.unary(T_LNGAMMA, Unary::LnGamma, crate::stats::special::ln_gamma(self.v))
     }
     /// the forward dual's `guard_floor`: `!(v ≥ lo)` (a `NaN` included) is the constant `lo`. The test
     /// is a value branch, so it is recorded as a guard and the taken arm is kept.
@@ -1104,18 +1042,10 @@ impl RecHooks for Tr {
         });
     }
     fn ode_segment(
-        rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        u0: &[Self],
-        t_span: (f64, f64),
-        params: &[Self],
-        saveat: &[f64],
-        interp_at: &[f64],
-        opts: &crate::ode::OdeSolverOptions,
+        rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]), u0: &[Self], t_span: (f64, f64),
+        params: &[Self], saveat: &[f64], interp_at: &[f64], opts: &crate::ode::OdeSolverOptions,
         auto: &mut dyn std::any::Any,
-    ) -> Option<(
-        Vec<crate::ode::SolPointG<Self>>,
-        Vec<crate::ode::SolPointG<Self>>,
-    )> {
+    ) -> Option<(Vec<crate::ode::SolPointG<Self>>, Vec<crate::ode::SolPointG<Self>>)> {
         let auto = auto.downcast_mut::<crate::ode::solver::OdeAutoSwitchState>()?;
         ode_loop::record_segment(rhs, u0, t_span, params, saveat, interp_at, opts, auto)
     }
@@ -1124,18 +1054,7 @@ impl RecHooks for Tr {
     }
     fn take_span() -> Option<(Self, Self)> {
         SPAN.with(|s| s.take()).map(|(r0, v0, d0, r1, v1, d1)| {
-            (
-                Tr {
-                    v: v0,
-                    r: r0,
-                    dep: d0,
-                },
-                Tr {
-                    v: v1,
-                    r: r1,
-                    dep: d1,
-                },
-            )
+            (Tr { v: v0, r: r0, dep: d0 }, Tr { v: v1, r: r1, dep: d1 })
         })
     }
     fn span_value(self) -> f64 {
@@ -1162,10 +1081,7 @@ impl RecHooks for Tr {
     }
     #[allow(clippy::type_complexity)]
     fn ss_fixed_point(
-        n: usize,
-        held: &[usize],
-        u0: &[f64],
-        maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
+        n: usize, held: &[usize], u0: &[f64], maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
         solve: Box<SolveFn>,
     ) -> Option<Option<Vec<Self>>> {
         let out = record_fixed(n, held, u0, maps, solve);
@@ -1178,9 +1094,7 @@ impl RecHooks for Tr {
         Some(out)
     }
     fn repeat(
-        x0: &[Self],
-        count: Self,
-        body: &dyn Fn(&[Self]) -> Vec<Self>,
+        x0: &[Self], count: Self, body: &dyn Fn(&[Self]) -> Vec<Self>,
     ) -> Option<Option<Vec<Self>>> {
         Some(record_repeat(x0, count, body))
     }
@@ -1219,23 +1133,15 @@ impl RecHooks for Tr {
         rec(|r| r.declined += 1);
     }
     fn affine_parts(
-        rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        params: &[Self],
-        t: f64,
-        a: &mut [Self],
+        rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]), params: &[Self], t: f64, a: &mut [Self],
         b: &mut [Self],
     ) -> bool {
         affine_parts(rhs, params, t, a, b)
     }
     #[allow(clippy::too_many_arguments)]
     fn rhs_jacobian(
-        rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        u: &[Self],
-        params: &[Self],
-        t: Self,
-        f: &mut [Self],
-        jac: &mut [Self],
-        ft: &mut [Self],
+        rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]), u: &[Self], params: &[Self], t: Self,
+        f: &mut [Self], jac: &mut [Self], ft: &mut [Self],
     ) -> bool {
         jacobian(rhs, u, params, t, f, jac, ft);
         true
@@ -1303,10 +1209,7 @@ pub(crate) fn recording_open() -> bool {
 /// subject ([`note_model_failure`]).
 #[allow(clippy::type_complexity)]
 pub(crate) fn derivs(
-    model: &crate::types::CompiledModel,
-    x: &[f64],
-    n_out: usize,
-    second: bool,
+    model: &crate::types::CompiledModel, x: &[f64], n_out: usize, second: bool,
     f: &dyn Fn(&[Tr]) -> Option<Vec<Tr>>,
 ) -> Option<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
     derivs_of(x, n_out, second, f)
@@ -1316,21 +1219,12 @@ pub(crate) fn derivs(
 
 #[allow(clippy::type_complexity)]
 fn derivs_of(
-    x: &[f64],
-    n_out: usize,
-    second: bool,
-    f: &dyn Fn(&[Tr]) -> Option<Vec<Tr>>,
+    x: &[f64], n_out: usize, second: bool, f: &dyn Fn(&[Tr]) -> Option<Vec<Tr>>,
 ) -> Result<(Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>), String> {
     let n = x.len();
     begin();
-    let y = f(&x
-        .iter()
-        .enumerate()
-        .map(|(j, &v)| Tr::theta(j, v))
-        .collect::<Vec<_>>());
-    let y = y
-        .filter(|y| y.len() == n_out)
-        .map(|y| y.iter().map(|v| v.reg()).collect());
+    let y = f(&x.iter().enumerate().map(|(j, &v)| Tr::theta(j, v)).collect::<Vec<_>>());
+    let y = y.filter(|y| y.len() == n_out).map(|y| y.iter().map(|v| v.reg()).collect());
     let plan = end(y)
         .map_err(|e| e.0)?
         .plan(Layout::F64, 0, n)
@@ -1349,9 +1243,7 @@ fn derivs_of(
         }
     }
     let mut du = vec![0.0; (n_out + 1) * l];
-    let fwd = plan
-        .forward_layout(layout, &[], &p, &mut du)
-        .ok_or("the forward failed")?;
+    let fwd = plan.forward_layout(layout, &[], &p, &mut du).ok_or("the forward failed")?;
     let vals = (0..n_out).map(|o| du[o * l]).collect();
     let (mut grad, mut hess) = (Vec::with_capacity(n_out), Vec::with_capacity(n_out));
     if second {
@@ -1404,13 +1296,7 @@ fn derivs_of(
 /// Open a recording on this thread.
 pub(crate) fn begin() {
     let (cse, guarded) = SPARE.take();
-    REC.with(|r| {
-        *r.borrow_mut() = Some(Rec {
-            cse,
-            guarded,
-            ..Rec::default()
-        })
-    });
+    REC.with(|r| *r.borrow_mut() = Some(Rec { cse, guarded, ..Rec::default() }));
     SPAN.with(|s| s.set(None));
 }
 
@@ -1456,9 +1342,7 @@ pub(crate) struct Tie {
 /// subject would fail the same way).
 pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScope)> {
     STATS.records.fetch_add(1, Relaxed);
-    let mut r = REC
-        .with(|r| r.borrow_mut().take())
-        .expect("a kernel_jit recording is open");
+    let mut r = REC.with(|r| r.borrow_mut().take()).expect("a kernel_jit recording is open");
     // The next recording reuses the maps' tables: no growing and rehashing them again.
     r.cse.clear();
     r.guarded.clear();
@@ -1470,19 +1354,12 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
     // A point whose recorded values overflowed is one nothing can differentiate or score: its
     // failure (a record-time run, a predictor bailing) is the point's, whatever it names.
     if let Some((why, scope)) = r.failed.take() {
-        let scope = if scope == FailScope::Point && r.nonfinite {
-            FailScope::Repelled
-        } else {
-            scope
-        };
+        let scope =
+            if scope == FailScope::Point && r.nonfinite { FailScope::Repelled } else { scope };
         return Err((why, scope));
     }
     let outs = outs.ok_or_else(|| {
-        let scope = if r.nonfinite {
-            FailScope::Repelled
-        } else {
-            FailScope::Subject
-        };
+        let scope = if r.nonfinite { FailScope::Repelled } else { FailScope::Subject };
         ("the recorder returned None".to_string(), scope)
     })?;
     if let Some(t) = r.replay.take() {
@@ -1515,11 +1392,7 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
             dense: false,
             declined: r.declined,
             finite: !r.nonfinite,
-            tie: Tie {
-                family: r.family,
-                replayed: Some(t),
-                ..Tie::default()
-            },
+            tie: Tie { family: r.family, replayed: Some(t), ..Tie::default() },
         });
     }
     let (code, marks) = live_code(&r.code, &r.marks, r.n_regs as usize, &outs, r.guard);
@@ -1533,10 +1406,7 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
             replayed: None,
             transient: false,
         },
-        None => Tie {
-            transient: r.transient,
-            ..Tie::default()
-        },
+        None => Tie { transient: r.transient, ..Tie::default() },
     };
     Ok(Recording {
         code,
@@ -1564,16 +1434,13 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
 /// is that template's with this recording's literals and loop calls — else, and wherever the
 /// subject turns out to have another structure, by recording afresh.
 pub(crate) fn recorded(
-    family: &SubjectKey,
-    f: impl Fn() -> Option<Vec<u32>>,
+    family: &SubjectKey, f: impl Fn() -> Option<Vec<u32>>,
 ) -> Result<Recording, (String, FailScope)> {
     #[cfg(test)]
     let off = TEMPLATE_PROBE.with(|p| p.get().0);
     #[cfg(not(test))]
     let off = false;
-    let known = (!off)
-        .then(|| lock_families().get(family).cloned())
-        .flatten();
+    let known = (!off).then(|| lock_families().get(family).cloned()).flatten();
     // A family whose structure keeps changing (an event time that moves with η: a modeled
     // infusion duration crossing its observations) would keep a template per structure it
     // meets, and replay against each of them first: recorded afresh, it keeps none.
@@ -1629,9 +1496,7 @@ fn missed(family: &SubjectKey) -> bool {
         std::mem::take(&mut k.alts)
     };
     if !alts.is_empty() {
-        let mut t = templates()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut t = templates().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         t.retain(|_, v| {
             v.retain(|o| !alts.iter().any(|a| Arc::ptr_eq(a, o)));
             !v.is_empty()
@@ -1660,9 +1525,7 @@ const TEMPLATE_MISMATCH: &str = "another structure than its template";
 pub(crate) const UNSTABLE_AFTER: u32 = 2;
 fn lock_families() -> std::sync::MutexGuard<'static, Families> {
     static F: OnceLock<Mutex<Families>> = OnceLock::new();
-    F.get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    F.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// `code` without the instructions nothing reads — not an output, not the guard, nor an
@@ -1670,11 +1533,7 @@ fn lock_families() -> std::sync::MutexGuard<'static, Families> {
 /// pure, so dropping one changes no result; what it drops is mostly a call `affine_parts`
 /// made only to differentiate. The inputs' loads stay: the plan lays slots out from them.
 fn live_code(
-    code: &[Flat],
-    marks: &[usize],
-    n_regs: usize,
-    outs: &[u32],
-    guard: Option<u32>,
+    code: &[Flat], marks: &[usize], n_regs: usize, outs: &[u32], guard: Option<u32>,
 ) -> (Vec<Flat>, Vec<usize>) {
     let mut live = vec![false; n_regs];
     for &o in outs.iter().chain(guard.iter()) {
@@ -1706,11 +1565,7 @@ fn live_code(
     }
     let mut marks: Vec<usize> = marks.iter().map(|m| before[(*m).min(code.len())]).collect();
     marks.dedup();
-    let code = code
-        .iter()
-        .zip(keep)
-        .filter_map(|(f, k)| k.then_some(*f))
-        .collect();
+    let code = code.iter().zip(keep).filter_map(|(f, k)| k.then_some(*f)).collect();
     (code, marks)
 }
 
@@ -1722,11 +1577,7 @@ fn live_code(
 /// affine in them: the call's recording is undone and `false` returned, a decline of the exact
 /// linear path (the caller integrates the segment), not a failure of the recording.
 pub(crate) fn affine_parts(
-    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]),
-    params: &[Tr],
-    t: f64,
-    a: &mut [Tr],
-    b: &mut [Tr],
+    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), params: &[Tr], t: f64, a: &mut [Tr], b: &mut [Tr],
 ) -> bool {
     rec(|r| r.fold_zero = true);
     let ok = affine_parts_folding(rhs, params, t, a, b);
@@ -1735,11 +1586,7 @@ pub(crate) fn affine_parts(
 }
 
 fn affine_parts_folding(
-    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]),
-    params: &[Tr],
-    t: f64,
-    a: &mut [Tr],
-    b: &mut [Tr],
+    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), params: &[Tr], t: f64, a: &mut [Tr], b: &mut [Tr],
 ) -> bool {
     let n = b.len();
     rec(|r| r.ode = true);
@@ -1747,9 +1594,8 @@ fn affine_parts_folding(
     rhs(&zeros, params, Tr::k(t), b);
     let start = rec(|r| r.code.len());
     let before = rec(|r| r.snapshot());
-    let u: Vec<Tr> = (0..n)
-        .map(|_| Tr::mk(0.0, node(None, |d| Flat::LoadK { d, c: 0.0 }), true))
-        .collect();
+    let u: Vec<Tr> =
+        (0..n).map(|_| Tr::mk(0.0, node(None, |d| Flat::LoadK { d, c: 0.0 }), true)).collect();
     rec(|r| {
         let mut o = vec![false; r.n_regs as usize];
         for x in &u {
@@ -1800,12 +1646,8 @@ fn tangents(start: usize) -> impl Fn(u32) -> HashMap<u32, Tr, FxBuild> {
     // stiff segment's Jacobians quadratic in the recording. A register the region reads was
     // written before this call, and a register's value is never rewritten.
     let h = move |r: u32| {
-        let (v, lit) = rec(|rc| {
-            (
-                rc.vals.get(r as usize).copied().unwrap_or(f64::NAN),
-                rc.lits.contains(&r),
-            )
-        });
+        let (v, lit) =
+            rec(|rc| (rc.vals.get(r as usize).copied().unwrap_or(f64::NAN), rc.lits.contains(&r)));
         // A literal stays one, so a tangent through a literal `0` is a literal `0` and the
         // linear path sees a structural zero where the `f64` objective does.
         if lit {
@@ -1830,9 +1672,7 @@ fn tangents(start: usize) -> impl Fn(u32) -> HashMap<u32, Tr, FxBuild> {
 /// `x`'s tangent in `tan` (an exact zero where it has none).
 fn tangent_of(tan: &HashMap<u32, Tr, FxBuild>, x: Tr) -> Tr {
     if x.dep {
-        tan.get(&(x.r as u32))
-            .copied()
-            .unwrap_or_else(|| Tr::k(0.0))
+        tan.get(&(x.r as u32)).copied().unwrap_or_else(|| Tr::k(0.0))
     } else {
         Tr::k(0.0)
     }
@@ -1845,13 +1685,8 @@ fn tangent_of(tan: &HashMap<u32, Tr, FxBuild>, x: Tr) -> Tr {
 /// downstream still depends on them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn jacobian(
-    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]),
-    u: &[Tr],
-    params: &[Tr],
-    t: Tr,
-    f: &mut [Tr],
-    jac: &mut [Tr],
-    ft: &mut [Tr],
+    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), u: &[Tr], params: &[Tr], t: Tr, f: &mut [Tr],
+    jac: &mut [Tr], ft: &mut [Tr],
 ) {
     let n = u.len();
     let var = |x: Tr| {
@@ -1903,11 +1738,7 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
         // `q = a/b`: `(ȧ − q·ḃ)/b`, through the same division, so its guard zeroes both.
         Flat::Div { d, a, b } | Flat::DivRaw { d, a, b } => {
             let num = add(t(a), t(b).map(|y| -(h(d) * y)))?;
-            Some(if matches!(g, Flat::Div { .. }) {
-                Tr::vm_div(num, h(b))
-            } else {
-                num / h(b)
-            })
+            Some(if matches!(g, Flat::Div { .. }) { Tr::vm_div(num, h(b)) } else { num / h(b) })
         }
         Flat::AddK { a, .. } | Flat::SubK { a, .. } => t(a),
         Flat::RSubK { a, .. } => neg(t(a)),
@@ -1928,9 +1759,7 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
             });
             add(base, expo)
         }
-        Flat::GammaPq {
-            a, x, upper, i, j, ..
-        } => {
+        Flat::GammaPq { a, x, upper, i, j, .. } => {
             let p = |di: u8, dj: u8| h(a).gamma_part(h(x), upper, i + di, j + dj);
             add(t(a).map(|y| p(1, 0) * y), t(x).map(|y| p(0, 1) * y))
         }
@@ -2056,9 +1885,9 @@ impl Recording {
                     }
                 }
                 Flat::Gate { b, .. } => v(b),
-                Flat::GammaPq {
-                    a, x, upper, i, j, ..
-                } => crate::stats::special::gamma_pq_partial(v(a), v(x), upper, i, j),
+                Flat::GammaPq { a, x, upper, i, j, .. } => {
+                    crate::stats::special::gamma_pq_partial(v(a), v(x), upper, i, j)
+                }
                 Flat::Unary { a, op, .. } => match op {
                     Unary::Exp => v(a).exp(),
                     Unary::Ln => (if v(a) >= 1e-30 { v(a) } else { 1e-30 }).ln(),
@@ -2216,17 +2045,9 @@ fn fold_with(src: &Func, known: impl Fn(u8, u32) -> Option<f64>) -> Func {
             Inst::HostArg(a) => push(&mut out, &mut konst, Inst::HostArg(m(a))),
             Inst::Host(_) | Inst::HostOut(_) => push(&mut out, &mut konst, i),
             Inst::StopGrad(a) => push(&mut out, &mut konst, Inst::StopGrad(m(a))),
-            Inst::Gamma { upper, i, j, a, x } => push(
-                &mut out,
-                &mut konst,
-                Inst::Gamma {
-                    upper,
-                    i,
-                    j,
-                    a: m(a),
-                    x: m(x),
-                },
-            ),
+            Inst::Gamma { upper, i, j, a, x } => {
+                push(&mut out, &mut konst, Inst::Gamma { upper, i, j, a: m(a), x: m(x) })
+            }
             Inst::Cmp(cc, a, b) => push(&mut out, &mut konst, Inst::Cmp(cc, m(a), m(b))),
             Inst::And(a, b) => push(&mut out, &mut konst, Inst::And(m(a), m(b))),
             Inst::Or(a, b) => push(&mut out, &mut konst, Inst::Or(m(a), m(b))),
@@ -2262,17 +2083,10 @@ impl Desc {
         let mut h = Fx::default();
         std::hash::Hasher::write(&mut h, &c.0);
         #[cfg(test)]
-        let hash = if COLLIDE.with(std::cell::Cell::get) {
-            0
-        } else {
-            h.0
-        };
+        let hash = if COLLIDE.with(std::cell::Cell::get) { 0 } else { h.0 };
         #[cfg(not(test))]
         let hash = h.0;
-        Desc {
-            hash,
-            bytes: c.0.into(),
-        }
+        Desc { hash, bytes: c.0.into() }
     }
     /// What `v`'s `Hash` writes.
     pub(crate) fn of_value(v: &impl std::hash::Hash) -> Self {
@@ -2372,8 +2186,7 @@ impl std::hash::Hash for Who {
 impl SubjectKey {
     /// The plan recorded under the subject's stacked IOV layout `lay`.
     pub(crate) fn with_layout(
-        mut self,
-        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        mut self, lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     ) -> Self {
         self.layout = lay.map(|l| Desc::of(|c| l.canon(c)));
         self
@@ -2389,11 +2202,7 @@ impl SubjectKey {
     /// subject's data. It keeps the fit's scope, so the templates a fit planned leave with it
     /// ([`drop_scope`]).
     pub(crate) fn family(&self) -> Self {
-        SubjectKey {
-            subject: Desc::of(|_| {}),
-            observed: None,
-            ..self.clone()
-        }
+        SubjectKey { subject: Desc::of(|_| {}), observed: None, ..self.clone() }
     }
     /// The same subject's plan of another computation (`1`: its non-Gaussian term).
     pub(crate) fn with_kind(mut self, kind: u8) -> Self {
@@ -2406,9 +2215,7 @@ impl SubjectKey {
         self
     }
     pub(crate) fn new(
-        model: &crate::types::CompiledModel,
-        subject: &crate::types::Subject,
-        n: usize,
+        model: &crate::types::CompiledModel, subject: &crate::types::Subject, n: usize,
         n_theta: usize,
     ) -> Self {
         let m = registered(model as *const _ as usize);
@@ -2417,11 +2224,7 @@ impl SubjectKey {
         SubjectKey {
             // A registered subject keys under its own fit's scope; anything else under the
             // model's (a cut copy no fit registered).
-            scope: s
-                .as_ref()
-                .map(|e| e.1)
-                .or_else(|| m.as_ref().map(|e| e.1))
-                .unwrap_or(0),
+            scope: s.as_ref().map(|e| e.1).or_else(|| m.as_ref().map(|e| e.1)).unwrap_or(0),
             model: model.plan_id.get(),
             solver: m.map_or_else(|| solver_desc(model), |e| e.0[0].clone()),
             subject: s.map_or_else(|| subject_desc(subject), |e| e.0[0].clone()),
@@ -2479,12 +2282,7 @@ pub(crate) type PrepKey = (&'static str, usize, usize, u64);
 type PrintMap = HashMap<usize, Vec<PrintEntry>, FxBuild>;
 impl Clone for PrintEntry {
     fn clone(&self) -> Self {
-        Self {
-            fit: self.fit,
-            descs: self.descs.clone(),
-            refs: self.refs,
-            prep: self.prep.clone(),
-        }
+        Self { fit: self.fit, descs: self.descs.clone(), refs: self.refs, prep: self.prep.clone() }
     }
 }
 static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2553,21 +2351,15 @@ pub(crate) fn in_fit<R>(fit: u64, f: impl FnOnce() -> R) -> R {
 /// with. A call made inside a fit of the model (the covariance step, SIR) joins it. The model's closed-form
 /// absorption model's ODE twin, which subjects rerouted to it plan under, is registered too.
 pub(crate) fn register<'a>(
-    model: &'a crate::types::CompiledModel,
-    subjects: &'a [crate::types::Subject],
+    model: &'a crate::types::CompiledModel, subjects: &'a [crate::types::Subject],
 ) -> Prints<'a> {
     let none = Desc::of(|_| {});
-    let mut add = vec![(
-        model as *const _ as usize,
-        [solver_desc(model), none.clone()],
-    )];
+    let mut add = vec![(model as *const _ as usize, [solver_desc(model), none.clone()])];
     if let Some(twin) = model.absorption_ode_equivalent.as_ref().map(|t| t.built()) {
         add.push((twin as *const _ as usize, [solver_desc(twin), none]));
     }
     add.extend(
-        subjects
-            .iter()
-            .map(|s| (s as *const _ as usize, [subject_desc(s), observed_desc(s)])),
+        subjects.iter().map(|s| (s as *const _ as usize, [subject_desc(s), observed_desc(s)])),
     );
     // A call inside a fit of this model joins it (the covariance step over a cut copy of the
     // fit's population: one scope, one set of plans); anything else is a fit of its own. A
@@ -2577,14 +2369,8 @@ pub(crate) fn register<'a>(
     let probe = add[0].0;
     let mut fit = 0;
     edit_prints(|m| {
-        let joins = open != 0
-            && m.get(&probe)
-                .is_some_and(|v| v.iter().any(|e| e.fit == open));
-        fit = if joins {
-            open
-        } else {
-            NEXT_SCOPE.fetch_add(1, Relaxed)
-        };
+        let joins = open != 0 && m.get(&probe).is_some_and(|v| v.iter().any(|e| e.fit == open));
+        fit = if joins { open } else { NEXT_SCOPE.fetch_add(1, Relaxed) };
         for (a, d) in &add {
             let v = m.entry(*a).or_default();
             match v.iter_mut().find(|e| e.fit == fit) {
@@ -2600,10 +2386,7 @@ pub(crate) fn register<'a>(
     });
     if open != 0 && open != fit {
         let run = run_of(open);
-        RUN_OF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((fit, run));
+        RUN_OF.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((fit, run));
     }
     let prev = CUR_FIT.replace(fit);
     Prints {
@@ -2649,9 +2432,7 @@ impl Drop for Prints<'_> {
 }
 
 fn edit_prints(f: impl FnOnce(&mut PrintMap)) {
-    let mut g = PRINTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut g = PRINTS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut m: PrintMap = g.as_deref().cloned().unwrap_or_default();
     f(&mut m);
     *g = (!m.is_empty()).then(|| Arc::new(m));
@@ -2667,16 +2448,11 @@ fn registered(addr: usize) -> Option<(Arc<[Desc; 2]>, u64)> {
     PRINTS_SEEN.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != v {
-            let g = PRINTS
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = PRINTS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             *c = (v, g.clone());
         }
         c.1.as_ref().and_then(|m| m.get(&addr)).and_then(|v| {
-            v.iter()
-                .find(|e| e.fit == fit)
-                .or_else(|| v.first())
-                .map(|e| (e.descs.clone(), e.fit))
+            v.iter().find(|e| e.fit == fit).or_else(|| v.first()).map(|e| (e.descs.clone(), e.fit))
         })
     })
 }
@@ -2688,21 +2464,14 @@ fn registered(addr: usize) -> Option<(Arc<[Desc; 2]>, u64)> {
 /// Registered subjects are borrowed by their registration, so what is derived from one cannot go
 /// stale meanwhile; `key` names the rest of what the structure is a function of.
 pub(crate) fn prepared<T: Send + Sync + 'static>(
-    subject: &crate::types::Subject,
-    key: PrepKey,
-    build: impl FnOnce() -> T,
+    subject: &crate::types::Subject, key: PrepKey, build: impl FnOnce() -> T,
 ) -> Arc<T> {
     let Some(prep) = prep_of(subject as *const _ as usize) else {
         return Arc::new(build());
     };
-    let mut kept = prep
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(v) = kept
-        .iter()
-        .find(|(k, _)| *k == key)
-        .and_then(|(_, v)| v.clone().downcast::<T>().ok())
+    let mut kept = prep.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(v) =
+        kept.iter().find(|(k, _)| *k == key).and_then(|(_, v)| v.clone().downcast::<T>().ok())
     {
         return v;
     }
@@ -2718,16 +2487,11 @@ fn prep_of(addr: usize) -> Option<Arc<Prep>> {
     PRINTS_SEEN.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != v {
-            let g = PRINTS
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = PRINTS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             *c = (v, g.clone());
         }
         c.1.as_ref().and_then(|m| m.get(&addr)).and_then(|v| {
-            v.iter()
-                .find(|e| e.fit == fit)
-                .or_else(|| v.first())
-                .map(|e| e.prep.clone())
+            v.iter().find(|e| e.fit == fit).or_else(|| v.first()).map(|e| e.prep.clone())
         })
     })
 }
@@ -2802,9 +2566,7 @@ fn subject_desc(s: &crate::types::Subject) -> Desc {
             // `implied_dose_parent`), a state walk's cut is `off_at`, and `evid4` marks the reset.
             d.evid4.hash(h);
             d.off_at.to_bits().hash(h);
-            d.implied
-                .map(|i| (i.parent, i.param_time.to_bits(), i.gov_time.to_bits()))
-                .hash(h);
+            d.implied.map(|i| (i.parent, i.param_time.to_bits(), i.gov_time.to_bits())).hash(h);
         }
         maps(h, std::slice::from_ref(&s.covariates));
         maps(h, &s.dose_covariates);
@@ -2861,9 +2623,7 @@ impl Variants {
     /// mostly stay in one regime from call to call.
     pub(crate) fn order(&self) -> impl Iterator<Item = (usize, &Entry)> {
         let m = self.mru.load(Relaxed);
-        (m..self.plans.len())
-            .chain(0..m)
-            .map(|i| (i, &self.plans[i]))
+        (m..self.plans.len()).chain(0..m).map(|i| (i, &self.plans[i]))
     }
 
     /// Variant `i` served.
@@ -2880,10 +2640,7 @@ impl Variants {
             plans.remove(usize::from(self.mru.load(Relaxed) == 0));
         }
         plans.push(plan);
-        Variants {
-            mru: AtomicUsize::new(plans.len() - 1),
-            plans,
-        }
+        Variants { mru: AtomicUsize::new(plans.len() - 1), plans }
     }
 }
 
@@ -2946,11 +2703,7 @@ fn failures() -> &'static Mutex<Failures> {
 /// Note that `k`'s subject fell back to finite differences because its plan failed (`why`): the
 /// plan is condemned for its design, so every subject sharing it fell back.
 pub(crate) fn note_failure(k: &SubjectKey, why: &str) {
-    note_plan_failure(
-        k,
-        why,
-        FailedPlan::Design(k.subject.clone(), k.observed.clone()),
-    );
+    note_plan_failure(k, why, FailedPlan::Design(k.subject.clone(), k.observed.clone()));
 }
 
 /// Note that the registered subject `k` was made for fell back for this call alone (a point
@@ -2967,11 +2720,7 @@ pub(crate) fn note_point_failure(k: &SubjectKey, why: &str) {
 fn note_plan_failure(k: &SubjectKey, why: &str, who: FailedPlan) {
     // The covariance step's reduced basis (kind 9) feeds no fit gradient; every other plan
     // is read by the inner and the outer gradient alike.
-    let q = if k.kind == 9 {
-        Q_COV
-    } else {
-        Q_INNER | Q_OUTER
-    };
+    let q = if k.kind == 9 { Q_COV } else { Q_INNER | Q_OUTER };
     *failures()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3027,37 +2776,20 @@ pub(crate) struct PlanFailureCounts {
 /// model's or its ODE twin's; a model-level failure ([`note_model_failure`]) counts them all, on
 /// the outer route.
 pub(crate) fn plan_failure_counts(
-    model: &crate::types::CompiledModel,
-    subjects: &[crate::types::Subject],
+    model: &crate::types::CompiledModel, subjects: &[crate::types::Subject],
 ) -> Option<PlanFailureCounts> {
-    let f = failures()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = failures().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let model_scope = registered(model as *const _ as usize).map_or(0, |e| e.1);
     let ids: Vec<u64> = std::iter::once(model.plan_id.get())
-        .chain(
-            model
-                .absorption_ode_equivalent
-                .as_ref()
-                .map(|t| t.built().plan_id.get()),
-        )
+        .chain(model.absorption_ode_equivalent.as_ref().map(|t| t.built().plan_id.get()))
         .collect();
     let wide = model_wide();
-    let mut counts = PlanFailureCounts {
-        any: 0,
-        inner: 0,
-        outer: 0,
-        why: String::new(),
-    };
+    let mut counts = PlanFailureCounts { any: 0, inner: 0, outer: 0, why: String::new() };
     for s in subjects {
         let reg = registered(s as *const _ as usize);
         let scope = reg.as_ref().map_or(model_scope, |e| e.1);
-        let design = reg
-            .as_ref()
-            .map_or_else(|| subject_desc(s), |e| e.0[0].clone());
-        let observed = reg
-            .as_ref()
-            .map_or_else(|| observed_desc(s), |e| e.0[1].clone());
+        let design = reg.as_ref().map_or_else(|| subject_desc(s), |e| e.0[0].clone());
+        let observed = reg.as_ref().map_or_else(|| observed_desc(s), |e| e.0[1].clone());
         // A plan fails under its design alone or under its design and observed values, so two
         // `get`s find every failure of this subject.
         let own = [
@@ -3079,10 +2811,7 @@ pub(crate) fn plan_failure_counts(
                 let Some((failed, why)) = f.get(&(sc, id)) else {
                     continue;
                 };
-                let hit = own
-                    .iter()
-                    .filter_map(|k| failed.get(k))
-                    .fold(0u8, |m, q| m | q);
+                let hit = own.iter().filter_map(|k| failed.get(k)).fold(0u8, |m, q| m | q);
                 if hit != 0 && counts.why.is_empty() {
                     counts.why = why.clone();
                 }
@@ -3099,8 +2828,7 @@ pub(crate) fn plan_failure_counts(
 /// [`plan_failure_counts`]'s total and first reason.
 #[cfg(test)]
 pub(crate) fn plan_failures(
-    model: &crate::types::CompiledModel,
-    subjects: &[crate::types::Subject],
+    model: &crate::types::CompiledModel, subjects: &[crate::types::Subject],
 ) -> Option<(usize, String)> {
     plan_failure_counts(model, subjects).map(|c| (c.any, c.why))
 }
@@ -3110,21 +2838,16 @@ pub(crate) fn plan_failures(
 /// them).
 fn prune_caches(gone: impl Fn(u64, u64) -> bool) {
     {
-        let mut t = templates()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut t = templates().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         t.retain(|_, v| {
             v.retain(|t| t.owner.is_none_or(|(sc, m)| !gone(sc, m)));
             !v.is_empty()
         });
     }
-    chunk_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|_, v| {
-            v.retain(|w| w.strong_count() > 0);
-            !v.is_empty()
-        });
+    chunk_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, v| {
+        v.retain(|w| w.strong_count() > 0);
+        !v.is_empty()
+    });
 }
 
 /// How many plans, bad marks and failure sets the model `id` holds, whatever their scope (test
@@ -3169,15 +2892,18 @@ pub(crate) fn templates_of(id: u64) -> usize {
 thread_local! {
     /// Native kernels this thread has freed ([`ChunkKernel`]'s drop).
     pub(crate) static KERNELS_FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Native code bytes this thread's kernel compiles emitted (`lower_chunk_opt`), for the
+    /// lane-loop prototype's size comparison (#3080).
+    pub(crate) static NATIVE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Cranelift instructions of the same compiles.
+    pub(crate) static NATIVE_CLIF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Forget the plans of every subject and model in scope `scope`: under the subjects' lock, with
 /// the generation bumped there, so a thread that read the new generation sees them gone.
 fn drop_scope(scope: u64) {
     clear_kept(|k| k.scope == scope);
-    let mut s = subjects()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
     s.retain(|k, _| k.scope != scope);
     GENERATION.fetch_add(1, Relaxed);
     drop(s);
@@ -3197,13 +2923,98 @@ fn drop_scope(scope: u64) {
     }
 }
 
+/// Release the plans the fit this thread runs holds — at a boundary between two of its phases
+/// (#3077): estimation, the covariance step, the post-fit sensitivity sweep, the ODE tolerance
+/// settle check. Each phase records plans of its own (another layout, another solver override),
+/// which would otherwise all live until the fit's scope ends ([`drop_scope`]), so every later
+/// phase's peak would stack on the estimation plateau instead of replacing it.
+///
+/// Plans are a cache — a template replays what planning would build, bit for bit, and a kept
+/// forward is the forward its plan would run again — so a release costs a later phase a
+/// re-recording, never a value. What is released: the scope's plans, its families' templates,
+/// its kept forwards, and through them the chunk programs (IR and native code) only they ran
+/// ([`ChunkCache`] holds them weakly). What stays: the scope's bad marks and model bad marks
+/// (a subject that failed to plan does not try again) and its failure records, which the fit
+/// reports at its end ([`plan_failure_counts`]).
+///
+/// Then every worker of the pool this thread runs on drops its thread-local buffers and plan
+/// handles ([`release_thread_caches`]), which keep the largest a pass ever needed. Off a pool,
+/// only this thread's. A fit sharing the pool (another start of a multi-start) loses only cached
+/// buffers, which its next pass allocates again. A phase that ran on another pool — the tighter
+/// ODE scope of the covariance step or the settle check — cleared that pool's workers as it
+/// left it (`crate::pool::with_fit_scope_ode`), so no worker anywhere keeps these plans alive.
+///
+/// A no-op outside a registered fit: scope `0`'s plans leave with their model ([`drop_model`]).
+pub(crate) fn release_fit_plans() {
+    let scope = current_fit();
+    if scope == 0 {
+        return;
+    }
+    clear_kept(|k| k.scope == scope);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A bad mark (`None`) stays: the subject's plan failed, and re-trying it each phase would
+    // only fail again.
+    s.retain(|k, v| k.scope != scope || v.is_none());
+    GENERATION.fetch_add(1, Relaxed);
+    drop(s);
+    lock_families().retain(|k, _| k.scope != scope);
+    prune_caches(|sc, _| sc == scope);
+    crate::pool::release_pool_thread_caches();
+}
+
+/// [`release_fit_plans`] when dropped: the fit's last phase boundary, whatever its last plan
+/// consumer was and on every return path. Declared after the fit's registration ([`register`]),
+/// so it drops first, while the thread still runs the fit. Ending the scope ([`drop_scope`])
+/// prunes the shared maps but reaches no worker, whose `LAST` entry and buffers would otherwise
+/// outlive the fit on a cached pool. Not while unwinding: a panic leaves the caches to the
+/// scope's end.
+pub(crate) struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            release_fit_plans();
+        }
+    }
+}
+
+/// How many cached buffers and plan handles this thread holds (test seam): the pass pool,
+/// `LAST`, the hot table's entries and the ODE loop's pools.
+#[cfg(test)]
+pub(crate) fn thread_cache_count() -> usize {
+    POOL.with(|p| p.borrow().len())
+        + LAST.with(|l| usize::from(l.borrow().is_some()))
+        + HOT.with(|h| h.borrow().filled.len())
+        + BUF.with(|b| usize::from(!b.borrow().is_empty()))
+        + VBUF.with(|b| usize::from(!b.borrow().is_empty()))
+        + ode_loop::pooled_buffers()
+}
+
+/// Drop this thread's cached buffers and plan handles: the pass buffers (`BUF`, `VBUF`, `ADJ`,
+/// the pool [`take`] serves), the ODE loop's slot buffers and run logs, and the last-subject and
+/// hot lookup entries, which hold plans. Each is a cache its next user refills. A cell borrowed
+/// right now — a worker that picked this up while waiting inside a pass that holds it — is left
+/// as it is, and so is what depends on it (`LAST_RUN` describes `BUF`).
+pub(crate) fn release_thread_caches() {
+    let freed =
+        BUF.try_with(|b| b.try_borrow_mut().map(|mut b| *b = Vec::new()).is_ok()).unwrap_or(false);
+    if freed {
+        LAST_RUN.with(|c| c.set(None));
+    }
+    for cell in [&VBUF, &ADJ] {
+        let _ = cell.try_with(|c| c.try_borrow_mut().map(|mut v| *v = Vec::new()));
+    }
+    let _ = POOL.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+    let _ = LAST.try_with(|l| l.try_borrow_mut().map(|mut l| *l = None));
+    let _ = HOT.try_with(|h| h.try_borrow_mut().map(|mut h| *h = HotTable::default()));
+    ode_loop::release_thread_buffers();
+}
+
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
 pub(crate) fn drop_model(id: u64) {
     // A live fit borrows its model, so what a dropped model's plans leave kept is unregistered.
     clear_kept(|k| k.model == id);
-    let mut s = subjects()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
     s.retain(|k, _| k.model != id);
     GENERATION.fetch_add(1, Relaxed);
     drop(s);
@@ -3263,9 +3074,7 @@ static FAILING_SUBJECTS: std::sync::Mutex<Vec<Desc>> = std::sync::Mutex::new(Vec
 /// Make every plan of `subject` fail ([`FAILING_SUBJECTS`]).
 #[cfg(test)]
 pub(crate) fn fail_plans_of(subject: &crate::types::Subject) {
-    let mut f = FAILING_SUBJECTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut f = FAILING_SUBJECTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let d = subject_desc(subject);
     if !f.contains(&d) {
         f.push(d);
@@ -3301,11 +3110,7 @@ pub(crate) fn lookup(k: &SubjectKey) -> Lookup {
     if let Some(ks) = hit {
         return Lookup::Found(ks);
     }
-    let found = match subjects()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(k)
-    {
+    let found = match subjects().read().unwrap_or_else(std::sync::PoisonError::into_inner).get(k) {
         None => return Lookup::Missing,
         Some(None) => return Lookup::Bad,
         Some(Some(ks)) => ks.clone(),
@@ -3334,11 +3139,8 @@ pub(crate) struct HotKey {
 
 impl HotKey {
     pub(crate) fn new(
-        model: &crate::types::CompiledModel,
-        subject: &crate::types::Subject,
-        n: usize,
-        n_in: usize,
-        kind: u8,
+        model: &crate::types::CompiledModel, subject: &crate::types::Subject, n: usize,
+        n_in: usize, kind: u8,
     ) -> Self {
         HotKey {
             model: model as *const _ as usize,
@@ -3395,10 +3197,7 @@ struct HotTable {
 impl HotTable {
     /// Drop every entry when the table was filled under a stamp other than `now`.
     fn release_stale(&mut self, now: HotStamp) {
-        if self
-            .stamp
-            .is_some_and(|s| s.prints != now.prints || s.gen != now.gen)
-        {
+        if self.stamp.is_some_and(|s| s.prints != now.prints || s.gen != now.gen) {
             for i in self.filled.drain(..) {
                 self.slots[usize::from(i)] = None;
             }
@@ -3409,9 +3208,7 @@ impl HotTable {
     /// The entry for `k` under `now`, releasing the stale ones on a miss: under another stamp
     /// every lookup misses, so the hit path pays nothing for the release.
     fn get(
-        &mut self,
-        k: &HotKey,
-        now: HotStamp,
+        &mut self, k: &HotKey, now: HotStamp,
         lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     ) -> Option<Kernels> {
         let hit = self.lookup(k, now, lay);
@@ -3422,10 +3219,7 @@ impl HotTable {
     }
 
     fn lookup(
-        &self,
-        k: &HotKey,
-        now: HotStamp,
-        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        &self, k: &HotKey, now: HotStamp, lay: Option<&crate::stats::stacked_layout::StackedLayout>,
     ) -> Option<Kernels> {
         match self.slots.get(k.slot()) {
             Some(Some(e)) if e.0 == *k && e.1.prints == now.prints && e.1.gen == now.gen => {
@@ -3434,10 +3228,7 @@ impl HotTable {
                 let same = match (want, lay) {
                     (None, None) => true,
                     (Some(w), Some(l)) => {
-                        let mut c = SameBytes {
-                            rest: w.bytes(),
-                            same: true,
-                        };
+                        let mut c = SameBytes { rest: w.bytes(), same: true };
                         l.canon(&mut c);
                         c.same && c.rest.is_empty()
                     }
@@ -3497,17 +3288,12 @@ impl std::hash::Hasher for SameBytes<'_> {
 
 /// The registry's state now, read before the lookup a [`hot_put`] follows.
 pub(crate) fn hot_stamp() -> HotStamp {
-    HotStamp {
-        prints: PRINTS_VERSION.load(Relaxed),
-        gen: GENERATION.load(Relaxed),
-    }
+    HotStamp { prints: PRINTS_VERSION.load(Relaxed), gen: GENERATION.load(Relaxed) }
 }
 
 /// The variants this thread last found for `k`, when nothing they depend on has changed.
 pub(crate) fn hot_get(
-    k: &HotKey,
-    now: HotStamp,
-    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    k: &HotKey, now: HotStamp, lay: Option<&crate::stats::stacked_layout::StackedLayout>,
 ) -> Option<Kernels> {
     #[cfg(test)]
     if !hot_allowed_in_test() {
@@ -3519,12 +3305,8 @@ pub(crate) fn hot_get(
 /// Keep `ks`, found for `k` under `stamp`, for [`hot_get`] — only for a model and a subject
 /// the registry holds, whose addresses then name them for as long as it is unchanged.
 pub(crate) fn hot_put(
-    k: HotKey,
-    stamp: HotStamp,
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    key: &SubjectKey,
-    ks: &Kernels,
+    k: HotKey, stamp: HotStamp, model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject, key: &SubjectKey, ks: &Kernels,
 ) {
     #[cfg(test)]
     if !hot_allowed_in_test() {
@@ -3541,10 +3323,7 @@ pub(crate) fn hot_put(
 #[cfg(test)]
 fn hot_allowed_in_test() -> bool {
     !FORCE_PLAN_FAIL.get()
-        && FAILING_SUBJECTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+        && FAILING_SUBJECTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
 }
 
 /// Mark `k` as failing to plan (`why`): its callers take the finite-difference path, and the
@@ -3557,9 +3336,7 @@ pub(crate) fn mark_bad(k: &SubjectKey, why: &str) {
         FORCED_BAD.with(|b| b.borrow_mut().insert(k.clone()));
         return;
     }
-    let mut s = subjects()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
     s.insert(k.clone(), None);
     // Under the lock, like [`drop_scope`]: every thread's last-subject entry (this one's too)
     // may hold the plans of `k` that were good a moment ago, and must look the mark up.
@@ -3573,9 +3350,7 @@ pub(crate) const MAX_VARIANTS: usize = 8;
 /// The variants of `k` with `kernel` added, as stored (a bad mark is never replaced). A caller serves from them and never looks
 /// `k` up again: a model dropped on another thread may have emptied the table.
 pub(crate) fn add(k: &SubjectKey, kernel: Entry) -> Kernels {
-    let mut s = subjects()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
     let ks = match s.get(k) {
         Some(Some(ks)) => ks.with(kernel),
         // A bad mark stands: this caller serves from its own plan and nothing is stored, so the
@@ -3634,12 +3409,12 @@ pub(crate) fn report() {
             s.record_us.load(Relaxed) as f64 / 1e3,
             s.compile_us.load(Relaxed) as f64 / 1e3,
         );
-        let c = chunk_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let c = chunk_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        eprintln!("kjit: {} distinct chunk kernels", c.values().map(Vec::len).sum::<usize>());
+        let (sets, bytes) = ode_loop::table_stats();
         eprintln!(
-            "kjit: {} distinct chunk kernels",
-            c.values().map(Vec::len).sum::<usize>()
+            "kjit: {sets} distinct ODE loop slot-table sets ({:.1} KiB)",
+            bytes as f64 / 1024.0
         );
     }
 }
@@ -3694,7 +3469,15 @@ unsafe impl Sync for ChunkKernel {}
 /// tiers agree bit for bit (`NaN` and the sign of a zero included); only the cost moves. A
 /// kernel the fit calls a few dozen times is never compiled, one it calls millions of times is optimized.
 pub(crate) struct Tiered {
-    f: Func,
+    /// The folded scalar function (#3076): read by the interpreter, by each tier's compile and
+    /// once by [`SegPlan::new`], so it is dropped (`None`) once the kernel's final tier
+    /// ([`Self::final_tier`]) is compiled — nothing reads it after that. An interpreting call
+    /// holds its own `Arc` for the length of the call, so a compile that swaps the final entry
+    /// point in on another thread cannot free the function under it. Kept while the kernel is
+    /// still below its final tier, including after a failed or panicked compile.
+    f: Mutex<Option<Arc<Func>>>,
+    /// The function's instruction count, which outlives it: what picks the last tier.
+    n_insts: usize,
     layout: Layout,
     n_in: usize,
     rev: bool,
@@ -3777,13 +3560,15 @@ const TIER3_MAX_INSTS: usize = 4096;
 impl Tiered {
     fn new(f: Func, layout: Layout, n_in: usize, rev: bool, prefix: usize) -> Arc<Self> {
         let f = f.into_kernel();
+        let n_insts = f.insts.len();
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             spill: OnceLock::new(),
             want: std::sync::atomic::AtomicU8::new(0),
             queued: std::sync::atomic::AtomicBool::new(false),
             prefix,
-            f,
+            f: Mutex::new(Some(Arc::new(f))),
+            n_insts,
             layout,
             n_in,
             rev,
@@ -3799,13 +3584,15 @@ impl Tiered {
     /// [`Self::new`] for a rows reverse kernel splitting its slot table at `entries`.
     fn new_rows(f: Func, layout: Layout, n_in: usize, prefix: usize, entries: usize) -> Arc<Self> {
         let f = f.into_kernel();
+        let n_insts = f.insts.len();
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             spill: OnceLock::new(),
             want: std::sync::atomic::AtomicU8::new(0),
             queued: std::sync::atomic::AtomicBool::new(false),
             prefix,
-            f,
+            f: Mutex::new(Some(Arc::new(f))),
+            n_insts,
             layout,
             n_in,
             rev: true,
@@ -3843,10 +3630,15 @@ impl Tiered {
     #[inline]
     unsafe fn call(&self, base: *mut f64, adj: *mut f64, idx: *const u32, lits: *const f64) {
         self.count(1);
-        let p = self.native.load(std::sync::atomic::Ordering::Acquire);
+        let mut p = self.native.load(std::sync::atomic::Ordering::Acquire);
         if p == 0 {
-            self.interpret(base, adj, idx, lits, 1, 0);
-        } else if p & SEGMENTED != 0 {
+            if self.interpret(base, adj, idx, lits, 1, 0) {
+                return;
+            }
+            // The final tier landed (and dropped the function) since the load above.
+            p = self.native_after_drop();
+        }
+        if p & SEGMENTED != 0 {
             self.run_segments(p, base, adj, idx, lits, 1, 0);
         } else if self.rev {
             let f: ChunkRevFn = std::mem::transmute(p);
@@ -3870,10 +3662,7 @@ impl Tiered {
         self.calls.store(n1, Relaxed);
         // Only a call that crosses a tier's point promotes: between them nothing changes, and
         // the shared `want` stays untouched.
-        if [TIER1_CALLS, TIER2_CALLS, TIER3_CALLS]
-            .iter()
-            .any(|&t| n0 < t && n1 >= t)
-        {
+        if [TIER1_CALLS, TIER2_CALLS, TIER3_CALLS].iter().any(|&t| n0 < t && n1 >= t) {
             self.promote_to(n1);
         }
     }
@@ -3881,7 +3670,7 @@ impl Tiered {
     /// Compile every tier `n` calls have reached and this kernel has not.
     #[cold]
     fn promote_to(&self, n: usize) {
-        let want = if n >= TIER3_CALLS && self.f.insts.len() <= TIER3_MAX_INSTS {
+        let want = if n >= TIER3_CALLS && self.n_insts <= TIER3_MAX_INSTS {
             3
         } else if n >= TIER2_CALLS {
             2
@@ -3912,12 +3701,18 @@ impl Tiered {
                 }
                 return;
             }
-            match want {
+            let compiled = match want {
                 1 => self.promote(true, "none"),
                 2 => self.promote(true, "speed"),
                 _ => self.promote(false, "speed"),
-            }
+            };
             self.tier.store(want, Relaxed);
+            // The final tier's entry point is in: nothing reads the function again (#3076).
+            // A failed compile leaves the kernel on its previous entry point, which may be the
+            // interpreter, so it keeps the function.
+            if compiled && want >= self.final_tier() {
+                *self.f.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
         }
     }
 
@@ -3930,23 +3725,14 @@ impl Tiered {
     /// As [`Self::call_seeds`]; `native` is a segmented kernel's [`ChunkKernel::f`], tagged.
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_segments(
-        &self,
-        native: usize,
-        base: *mut f64,
-        adj: *mut f64,
-        idx: *const u32,
-        lits: *const f64,
-        seeds: usize,
-        stride: usize,
+        &self, native: usize, base: *mut f64, adj: *mut f64, idx: *const u32, lits: *const f64,
+        seeds: usize, stride: usize,
     ) {
         thread_local! {
             static SCRATCH: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
         }
-        let plan = self
-            .spill
-            .get()
-            .and_then(Option::as_ref)
-            .expect("a segmented kernel has its plan");
+        let plan =
+            self.spill.get().and_then(Option::as_ref).expect("a segmented kernel has its plan");
         let segs = native & !SEGMENTED;
         let mut buf = SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
         if buf.len() < plan.slots {
@@ -3982,70 +3768,82 @@ impl Tiered {
     /// # Safety
     /// As [`Self::call`], for each seed's `adj` block.
     unsafe fn call_seeds(
-        &self,
-        base: *mut f64,
-        adj: *mut f64,
-        stride: usize,
-        seeds: usize,
-        idx: *const u32,
+        &self, base: *mut f64, adj: *mut f64, stride: usize, seeds: usize, idx: *const u32,
         lits: *const f64,
     ) {
         self.count(seeds);
-        let p = self.native.load(std::sync::atomic::Ordering::Acquire);
+        let mut p = self.native.load(std::sync::atomic::Ordering::Acquire);
         if p == 0 {
-            self.interpret(base, adj, idx, lits, seeds, stride);
-        } else {
-            if p & SEGMENTED != 0 {
-                return self.run_segments(p, base, adj, idx, lits, seeds, stride);
+            if self.interpret(base, adj, idx, lits, seeds, stride) {
+                return;
             }
-            let f: ChunkRevFn = std::mem::transmute(p);
-            f(base, adj, idx, lits, seeds, stride);
+            p = self.native_after_drop();
+        }
+        if p & SEGMENTED != 0 {
+            return self.run_segments(p, base, adj, idx, lits, seeds, stride);
+        }
+        let f: ChunkRevFn = std::mem::transmute(p);
+        f(base, adj, idx, lits, seeds, stride);
+    }
+
+    /// The function, while the kernel still holds it (until its final tier is compiled).
+    fn ir(&self) -> Option<Arc<Func>> {
+        self.f.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The last tier this kernel is ever compiled to: the backtracking allocator's only up to
+    /// [`TIER3_MAX_INSTS`].
+    fn final_tier(&self) -> u8 {
+        if self.n_insts <= TIER3_MAX_INSTS {
+            3
+        } else {
+            2
         }
     }
 
-    /// Compile the next tier and switch to it; a failed compile keeps the current one.
-    fn promote(&self, quick: bool, opt: &str) {
+    /// The native entry point of a kernel whose function is gone: the final tier's, stored
+    /// (`Release`) before the function was dropped under the lock this caller just took.
+    fn native_after_drop(&self) -> usize {
+        let p = self.native.load(std::sync::atomic::Ordering::Acquire);
+        assert!(p != 0, "a kernel dropped its function before its final entry point landed");
+        p
+    }
+
+    /// Compile the next tier and switch to it; a failed compile keeps the current one
+    /// (`false`).
+    fn promote(&self, quick: bool, opt: &str) -> bool {
         let t = std::time::Instant::now();
-        let plan = self
-            .spill
-            .get_or_init(|| SegPlan::new(&self.f, self.rev, self.prefix))
-            .as_ref();
-        let Some(k) = lower_chunk_opt(
-            &self.f,
-            self.layout,
-            self.n_in,
-            self.rev,
-            self.prefix,
-            quick,
-            opt,
-            plan,
-        ) else {
-            return;
+        let Some(f) = self.ir() else {
+            return false;
+        };
+        let plan = self.spill.get_or_init(|| SegPlan::new(&f, self.rev, self.prefix)).as_ref();
+        let Some(k) =
+            lower_chunk_opt(&f, self.layout, self.n_in, self.rev, self.prefix, quick, opt, plan)
+        else {
+            return false;
         };
         // A segmented kernel's entry point is tagged (a function's address is aligned).
         let p = k.f as usize | if k.segs.is_some() { SEGMENTED } else { 0 };
         self.modules.lock().unwrap().push(k);
         self.native.store(p, std::sync::atomic::Ordering::Release);
         STATS.compiled.fetch_add(1, Relaxed);
-        STATS
-            .compile_us
-            .fetch_add(t.elapsed().as_micros() as usize, Relaxed);
+        STATS.compile_us.fetch_add(t.elapsed().as_micros() as usize, Relaxed);
+        true
     }
 
     /// The chunk's scalar function run in Rust ([`interpret_func`]): the cold tier. A reverse's
     /// seeds share its forward. It is the function the compiled tiers lower, so every tier of
-    /// a kernel gives the same bits.
+    /// a kernel gives the same bits. `false`, running nothing, once the function is dropped
+    /// (the final tier's entry point serves instead).
     unsafe fn interpret(
-        &self,
-        base: *mut f64,
-        adj: *mut f64,
-        idx: *const u32,
-        lits: *const f64,
-        seeds: usize,
+        &self, base: *mut f64, adj: *mut f64, idx: *const u32, lits: *const f64, seeds: usize,
         stride: usize,
-    ) {
+    ) -> bool {
+        let Some(f) = self.ir() else {
+            return false;
+        };
         interpret_func(
-            &self.f,
+            &f,
             self.layout.lanes(),
             self.n_in,
             self.rev,
@@ -4057,6 +3855,7 @@ impl Tiered {
             seeds,
             stride,
         );
+        true
     }
 }
 
@@ -4138,10 +3937,7 @@ fn resolve_gates(code: &[Flat], n_regs: usize, g: usize) -> Option<Vec<Flat>> {
     let mut live = vec![false; n_regs];
     let mut keep = vec![false; out.len()];
     for (i, f) in out.iter().enumerate().rev() {
-        let effect = matches!(
-            f,
-            Flat::Deriv { .. } | Flat::HostArg { .. } | Flat::Host { .. }
-        );
+        let effect = matches!(f, Flat::Deriv { .. } | Flat::HostArg { .. } | Flat::Host { .. });
         if effect || def(f).is_some_and(|d| live[d as usize]) {
             keep[i] = true;
             for a in uses(f).into_iter().flatten() {
@@ -4149,12 +3945,7 @@ fn resolve_gates(code: &[Flat], n_regs: usize, g: usize) -> Option<Vec<Flat>> {
             }
         }
     }
-    Some(
-        out.into_iter()
-            .zip(keep)
-            .filter_map(|(f, k)| k.then_some(f))
-            .collect(),
-    )
+    Some(out.into_iter().zip(keep).filter_map(|(f, k)| k.then_some(f)).collect())
 }
 
 impl ChunkProgram {
@@ -4199,11 +3990,7 @@ impl ChunkProgram {
                         _ => None,
                     })
                     .collect();
-                let hosts = f
-                    .insts
-                    .iter()
-                    .filter(|i| matches!(i, Inst::Host(_)))
-                    .count();
+                let hosts = f.insts.iter().filter(|i| matches!(i, Inst::Host(_))).count();
                 eprintln!(
                     "kjit: no rows reverse: n_args {} reverse args {args:?}, {hosts} host calls",
                     f.n_args
@@ -4218,13 +4005,10 @@ impl ChunkProgram {
         }
         if sweep == Sweep::TangentRows {
             // At a base layout only: the seeds are the directions.
-            let k = (layout.tan == 0)
-                .then(|| ir::tangent_rows(&f))
-                .flatten()
-                .map(|(g, prefix)| {
-                    let (g, prefix) = ir::dedup_calls(&g, prefix);
-                    Tiered::new(g, layout, self.n_in, true, prefix)
-                });
+            let k = (layout.tan == 0).then(|| ir::tangent_rows(&f)).flatten().map(|(g, prefix)| {
+                let (g, prefix) = ir::dedup_calls(&g, prefix);
+                Tiered::new(g, layout, self.n_in, true, prefix)
+            });
             c.insert((layout, sweep), k.clone());
             return k;
         }
@@ -4234,11 +4018,7 @@ impl ChunkProgram {
             // kernel's buffers are laid out as the reverse over forward's. The reverse's forward
             // recomputation reads no adjoint, and neither does its tangent, so that stays the
             // prefix every seed shares.
-            let prefix = f
-                .insts
-                .iter()
-                .filter(|i| !matches!(i, Inst::Store { .. }))
-                .count();
+            let prefix = f.insts.iter().filter(|i| !matches!(i, Inst::Store { .. })).count();
             let (f, prefix) = ir::tangent_packed_prefix(
                 &ir::reverse(&f),
                 layout.tan as usize,
@@ -4258,10 +4038,7 @@ impl ChunkProgram {
         };
         // `ir::reverse` emits each forward instruction but a store first, once.
         let prefix = if rev {
-            f.insts
-                .iter()
-                .filter(|i| !matches!(i, Inst::Store { .. }))
-                .count()
+            f.insts.iter().filter(|i| !matches!(i, Inst::Store { .. })).count()
         } else {
             0
         };
@@ -4295,16 +4072,7 @@ impl Interp {
     /// buffers are as [`Tiered::call_seeds`] requires.
     #[inline(never)]
     unsafe fn run(self, from: usize, to: usize, adjp: *mut f64) {
-        let Interp {
-            base,
-            idx,
-            lits,
-            x,
-            insts,
-            lanes,
-            n_in,
-            rev,
-        } = self;
+        let Interp { base, idx, lits, x, insts, lanes, n_in, rev } = self;
         let slot = |e: usize| *idx.add(e) as usize * lanes;
         for at in from..to {
             let r = |v: ir::V| {
@@ -4335,13 +4103,7 @@ impl Interp {
                 Inst::Call1(ir::Shim1::Sqrt, a) => r(a).sqrt(),
                 Inst::Call1(s, a) => (s.f())(r(a)),
                 Inst::Powf(a, b) => r(a).powf(r(b)),
-                Inst::Gamma {
-                    upper,
-                    i,
-                    j,
-                    a,
-                    x: y,
-                } => (ir::gamma_shim(upper, i, j))(r(a), r(y)),
+                Inst::Gamma { upper, i, j, a, x: y } => (ir::gamma_shim(upper, i, j))(r(a), r(y)),
                 Inst::Cmp(cc, a, b) => f64::from(u8::from(cc.holds(r(a), r(b)))),
                 Inst::And(a, b) => f64::from(u8::from(r(a) != 0.0 && r(b) != 0.0)),
                 Inst::Or(a, b) => f64::from(u8::from(r(a) != 0.0 || r(b) != 0.0)),
@@ -4389,17 +4151,8 @@ thread_local! {
 /// As [`Tiered::call_seeds`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn interpret_func(
-    f: &Func,
-    lanes: usize,
-    n_in: usize,
-    rev: bool,
-    prefix: usize,
-    base: *mut f64,
-    adj: *mut f64,
-    idx: *const u32,
-    lits: *const f64,
-    seeds: usize,
-    stride: usize,
+    f: &Func, lanes: usize, n_in: usize, rev: bool, prefix: usize, base: *mut f64, adj: *mut f64,
+    idx: *const u32, lits: *const f64, seeds: usize, stride: usize,
 ) {
     FUNC_VALS.with(|vals| {
         let mut x = vals.borrow_mut();
@@ -4532,23 +4285,15 @@ fn chunk_cache() -> &'static Mutex<ChunkCache> {
 /// ([`chunk_cache`]); returns the program and where in the recording's literal pool each of
 /// this chunk's literals is.
 fn build_chunk(
-    body: &[Flat],
-    ins: &[u32],
-    outs: &[u32],
-    spec: Vec<(DirMask, u16)>,
-    cache: &mut ChunkCache,
+    body: &[Flat], ins: &[u32], outs: &[u32], spec: Vec<(DirMask, u16)>, cache: &mut ChunkCache,
 ) -> (Arc<ChunkProgram>, Vec<u32>) {
     let mut local: HashMap<u32, u32, FxBuild> = HashMap::default();
     for (i, &r) in ins.iter().enumerate() {
         local.insert(r, i as u32);
     }
     let mut next = ins.len() as u32;
-    let mut code: Vec<Flat> = (0..ins.len())
-        .map(|i| Flat::LoadState {
-            d: i as u32,
-            i: i as u32,
-        })
-        .collect();
+    let mut code: Vec<Flat> =
+        (0..ins.len()).map(|i| Flat::LoadState { d: i as u32, i: i as u32 }).collect();
     let mut lits: Vec<u32> = Vec::new();
     for f in body {
         let d = def(f);
@@ -4559,20 +4304,14 @@ fn build_chunk(
         let g = match *f {
             Flat::LoadSeed { k, .. } => {
                 lits.push(k);
-                Flat::LoadSeed {
-                    d: local[&d.unwrap()],
-                    k: (lits.len() - 1) as u32,
-                }
+                Flat::LoadSeed { d: local[&d.unwrap()], k: (lits.len() - 1) as u32 }
             }
             _ => rename(f, &mut |r| local[&r]),
         };
         code.push(g);
     }
     for (j, &o) in outs.iter().enumerate() {
-        code.push(Flat::Deriv {
-            state: j as u32,
-            a: local[&o],
-        });
+        code.push(Flat::Deriv { state: j as u32, a: local[&o] });
     }
     // Keyed by the program's structure, a hit confirmed instruction by instruction.
     let key = {
@@ -4768,23 +4507,11 @@ pub(super) struct DirMask {
 impl DirMask {
     const FREE_BIT: u64 = 1 << 63;
     /// No direction, not FREE.
-    pub(super) const NONE: DirMask = DirMask {
-        lo: 0,
-        hi: Vec::new(),
-        all_hi: false,
-    };
+    pub(super) const NONE: DirMask = DirMask { lo: 0, hi: Vec::new(), all_hi: false };
     /// Depends on θ or η, but on no particular direction.
-    pub(super) const FREE: DirMask = DirMask {
-        lo: Self::FREE_BIT,
-        hi: Vec::new(),
-        all_hi: false,
-    };
+    pub(super) const FREE: DirMask = DirMask { lo: Self::FREE_BIT, hi: Vec::new(), all_hi: false };
     /// Every direction, and FREE.
-    pub(super) const ALL: DirMask = DirMask {
-        lo: !0,
-        hi: Vec::new(),
-        all_hi: true,
-    };
+    pub(super) const ALL: DirMask = DirMask { lo: !0, hi: Vec::new(), all_hi: true };
 
     /// Direction `k` alone, and FREE.
     fn eta(k: usize) -> DirMask {
@@ -4815,11 +4542,7 @@ impl DirMask {
     /// Whether any of the first `n` directions is live.
     #[cfg(test)]
     pub(super) fn any_below(&self, n: usize) -> bool {
-        let low = if n >= 63 {
-            !Self::FREE_BIT
-        } else {
-            (1 << n) - 1
-        };
+        let low = if n >= 63 { !Self::FREE_BIT } else { (1 << n) - 1 };
         self.lo & low != 0 || (63..n).any(|k| self.hi_bit(k - 63))
     }
 
@@ -4864,16 +4587,11 @@ impl std::ops::BitAnd<&DirMask> for &DirMask {
     type Output = DirMask;
     fn bitand(self, o: &DirMask) -> DirMask {
         // A word past one side's `hi` is that side's `all_hi` (all ones) or zero.
-        let word = |m: &DirMask, i: usize| {
-            m.hi.get(i)
-                .copied()
-                .unwrap_or(if m.all_hi { !0 } else { 0 })
-        };
+        let word =
+            |m: &DirMask, i: usize| m.hi.get(i).copied().unwrap_or(if m.all_hi { !0 } else { 0 });
         DirMask {
             lo: self.lo & o.lo,
-            hi: (0..self.hi.len().max(o.hi.len()))
-                .map(|i| word(self, i) & word(o, i))
-                .collect(),
+            hi: (0..self.hi.len().max(o.hi.len())).map(|i| word(self, i) & word(o, i)).collect(),
             all_hi: self.all_hi && o.all_hi,
         }
         .trim()
@@ -4884,10 +4602,7 @@ impl std::ops::BitAnd<&DirMask> for &DirMask {
 /// [`DirMask::FREE`] when it depends on any input. A lane outside it is an exact zero, whatever the
 /// inputs' values.
 fn direction_masks(
-    code: &[Flat],
-    n_regs: usize,
-    eta_regs: &[(u32, usize)],
-    dense: bool,
+    code: &[Flat], n_regs: usize, eta_regs: &[(u32, usize)], dense: bool,
 ) -> Vec<DirMask> {
     let mut m = vec![DirMask::NONE; n_regs];
     for &(r, k) in eta_regs {
@@ -4924,10 +4639,7 @@ fn direction_masks(
             | Flat::Not { .. }
             | Flat::Present { .. }
             | Flat::HostOut { .. } => DirMask::NONE,
-            _ => uses(f)
-                .iter()
-                .flatten()
-                .fold(DirMask::NONE, |acc, &u| acc | &m[u as usize]),
+            _ => uses(f).iter().flatten().fold(DirMask::NONE, |acc, &u| acc | &m[u as usize]),
         };
         m[d as usize] = v;
     }
@@ -5014,9 +4726,7 @@ impl Recording {
             .iter()
             .zip(src)
             .map(|(c, src)| match c {
-                Call::Chunk {
-                    prog, idx, guard, ..
-                } => Call::Chunk {
+                Call::Chunk { prog, idx, guard, .. } => Call::Chunk {
                     prog: prog.clone(),
                     idx: idx.clone(),
                     lits: src.iter().map(|&k| self.pool[k as usize]).collect(),
@@ -5066,20 +4776,15 @@ impl Recording {
         let transient = self.tie.transient;
         let owner = family.as_ref().map(|f| (f.scope, f.model));
         let key = self.shape(layout, n_eta, n_theta);
-        let lock = || {
-            templates()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        };
+        let lock = || templates().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(test)]
         let off = TEMPLATE_PROBE.with(|p| p.get().0);
         #[cfg(not(test))]
         let off = false;
-        let hit = lock().get(&key).filter(|_| !off).and_then(|v| {
-            v.iter()
-                .find(|t| self.fits(t, layout, n_eta, n_theta))
-                .cloned()
-        });
+        let hit = lock()
+            .get(&key)
+            .filter(|_| !off)
+            .and_then(|v| v.iter().find(|t| self.fits(t, layout, n_eta, n_theta)).cloned());
         #[cfg(test)]
         TEMPLATE_PROBE.with(|p| {
             let (o, n, k) = p.get();
@@ -5147,10 +4852,7 @@ impl Recording {
     /// [`Self::plan`] by planning, with per call where its literals sit in the pool (a loop
     /// call: its id).
     fn plan_fresh(
-        &self,
-        layout: Layout,
-        n_eta: usize,
-        n_theta: usize,
+        &self, layout: Layout, n_eta: usize, n_theta: usize,
     ) -> Option<(Plan, Vec<Box<[u32]>>)> {
         let lanes = layout.lanes();
         let n_regs = self.n_regs as usize;
@@ -5195,12 +4897,7 @@ impl Recording {
         // Chunk boundaries: the marks, after dropping the inputs' loads.
         let mut bounds: Vec<usize> = vec![0];
         // Every mark: a chunk is one event, so subjects with the same event kinds share it.
-        bounds.extend(
-            self.marks
-                .iter()
-                .copied()
-                .filter(|&m| m > 0 && m < self.code.len()),
-        );
+        bounds.extend(self.marks.iter().copied().filter(|&m| m > 0 && m < self.code.len()));
         // A loop call is a step of its own: `LoopArg`s, `Loop`, `LoopOut`s.
         for (i, f) in self.code.iter().enumerate() {
             let prev_arg = i > 0 && matches!(self.code[i - 1], Flat::LoopArg { .. });
@@ -5218,9 +4915,7 @@ impl Recording {
         bounds.sort_unstable();
         bounds.dedup();
         let (mut calls, mut src) = (Vec::new(), Vec::new());
-        let mut cache = chunk_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = chunk_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for w in bounds.windows(2) {
             let (s, e) = (w[0], w[1]);
             if matches!(self.code[s], Flat::LoopArg { .. }) {
@@ -5282,10 +4977,8 @@ impl Recording {
                 outs.push(g);
             }
             // The inputs' structure: live directions, and the exact one of a seed.
-            let spec: Vec<(DirMask, u16)> = ins
-                .iter()
-                .map(|&r| (masks[r as usize].clone(), eta_of[r as usize]))
-                .collect();
+            let spec: Vec<(DirMask, u16)> =
+                ins.iter().map(|&r| (masks[r as usize].clone(), eta_of[r as usize])).collect();
             let body: Vec<Flat> = body.into_iter().copied().collect();
             let (prog, lits) = build_chunk(&body, &ins, &outs, spec, &mut cache);
             src.push(lits.into_boxed_slice());
@@ -5428,9 +5121,7 @@ struct Kept {
 /// The kept forwards' table; a panic while it was held leaves it usable (it is also locked
 /// from `Drop`).
 fn kept_lock() -> std::sync::MutexGuard<'static, HashMap<usize, Kept, FxBuild>> {
-    kept_table()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    kept_table().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn kept_table() -> &'static Mutex<HashMap<usize, Kept, FxBuild>> {
@@ -5441,14 +5132,8 @@ fn kept_table() -> &'static Mutex<HashMap<usize, Kept, FxBuild>> {
 /// The slot lanes of `buf` hold the forward at `(theta, eta)`: lane 0 of each input slot.
 fn inputs_match(buf: &[f64], l: usize, n_eta: usize, theta: &[f64], eta: &[f64]) -> bool {
     eta.len() == n_eta
-        && eta
-            .iter()
-            .enumerate()
-            .all(|(k, v)| buf[k * l].to_bits() == v.to_bits())
-        && theta
-            .iter()
-            .enumerate()
-            .all(|(j, v)| buf[(n_eta + j) * l].to_bits() == v.to_bits())
+        && eta.iter().enumerate().all(|(k, v)| buf[k * l].to_bits() == v.to_bits())
+        && theta.iter().enumerate().all(|(j, v)| buf[(n_eta + j) * l].to_bits() == v.to_bits())
 }
 
 /// Keep, for `owner` (the subject), the forward this thread's last [`Plan::run`] left in
@@ -5502,11 +5187,7 @@ pub(crate) fn adopts() -> usize {
 /// plans they belong to may go). Another fit's and another model's stay.
 fn clear_kept(gone_if: impl Fn(&Kept) -> bool) {
     let mut t = kept_lock();
-    let gone: Vec<usize> = t
-        .iter()
-        .filter(|(_, k)| gone_if(k))
-        .map(|(&o, _)| o)
-        .collect();
+    let gone: Vec<usize> = t.iter().filter(|(_, k)| gone_if(k)).map(|(&o, _)| o).collect();
     for o in gone {
         if let Some(k) = t.remove(&o) {
             give(k.buf);
@@ -5532,13 +5213,7 @@ thread_local! {
 /// adjoints' tangents]` `tsd` packed as that kernel reads them; the adjoints' tangents back into
 /// `tsd`'s second half, and the adjoints' values returned (every seed's: the caller takes one).
 fn per_direction(
-    n_slots: usize,
-    l: usize,
-    sh: &[f64],
-    tsd: &mut [f64],
-    ktr: &Tiered,
-    idx: &[u32],
-    lits: &[f64],
+    n_slots: usize, l: usize, sh: &[f64], tsd: &mut [f64], ktr: &Tiered, idx: &[u32], lits: &[f64],
 ) -> Vec<f64> {
     let need = n_slots * l;
     let w = 2 * l;
@@ -5634,9 +5309,7 @@ fn prefix_layout(lo: Layout, hi: Layout) -> bool {
 
 /// `v`'s blocks of `hi` lanes cut to their leading `lo` lanes.
 fn compact(v: &[f64], hi: usize, lo: usize) -> Vec<f64> {
-    v.chunks_exact(hi)
-        .flat_map(|c| c[..lo].iter().copied())
-        .collect()
+    v.chunks_exact(hi).flat_map(|c| c[..lo].iter().copied()).collect()
 }
 
 impl Plan {
@@ -5708,11 +5381,7 @@ impl Plan {
     /// (`buf` is then only partly written: the guard's own slot still reads `0` if `buf`
     /// started zeroed).
     fn forward_logged(
-        &self,
-        fns: &[Kern],
-        buf: &mut [f64],
-        layout: Layout,
-        mut logs: Option<&mut Vec<CallLog>>,
+        &self, fns: &[Kern], buf: &mut [f64], layout: Layout, mut logs: Option<&mut Vec<CallLog>>,
     ) -> Option<bool> {
         if let Some(lg) = logs.as_deref_mut() {
             lg.clear();
@@ -5729,12 +5398,7 @@ impl Plan {
         let mut auto = crate::ode::solver::OdeAutoSwitchState::default();
         for (c, k) in self.calls.iter().zip(fns) {
             match (c, k) {
-                (
-                    Call::Chunk {
-                        idx, lits, guard, ..
-                    },
-                    Kern::Chunk(k),
-                ) => {
+                (Call::Chunk { idx, lits, guard, .. }, Kern::Chunk(k)) => {
                     #[cfg(test)]
                     CALLS_RUN.with(|n| n.set(n.get() + 1));
                     debug_assert!(
@@ -5748,12 +5412,7 @@ impl Plan {
                     // inputs' live lanes and its literals, and writes its outputs' lanes, at
                     // the layout it was built for, which is `buf`'s.
                     unsafe {
-                        k.call(
-                            buf.as_mut_ptr(),
-                            std::ptr::null_mut(),
-                            idx.as_ptr(),
-                            lits.as_ptr(),
-                        )
+                        k.call(buf.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), lits.as_ptr())
                     };
                     if guard.is_some_and(|g| buf[g as usize * l] != 1.0) {
                         return Some(false);
@@ -5793,14 +5452,7 @@ impl Plan {
                             .copy_from_slice(&out[j * l..(j + 1) * l]);
                     }
                 }
-                (
-                    Call::Loop {
-                        spec: CallKind::Ode(spec),
-                        args,
-                        outs,
-                    },
-                    Kern::Loop(lk),
-                ) => {
+                (Call::Loop { spec: CallKind::Ode(spec), args, outs }, Kern::Loop(lk)) => {
                     #[cfg(test)]
                     CALLS_RUN.with(|n| n.set(n.get() + 1));
                     let mut inputs = take(0);
@@ -5811,11 +5463,8 @@ impl Plan {
                     );
                     let mut out = take(outs.len() * l);
                     let want = logs.is_some();
-                    let mut log = if want {
-                        ode_loop::Log::take()
-                    } else {
-                        ode_loop::Log::default()
-                    };
+                    let mut log =
+                        if want { ode_loop::Log::take() } else { ode_loop::Log::default() };
                     let ok = ode_loop::run_loop(
                         spec,
                         lk,
@@ -5936,11 +5585,7 @@ impl Plan {
     /// one; taken, so one gradient reads it. Its slots are the ones [`Self::forward_kept`] would
     /// compute (the same chunks over the same inputs), a chunk-only plan having no run logs.
     pub(crate) fn adopt(
-        &self,
-        owner: usize,
-        layout: Layout,
-        theta: &[f64],
-        eta: &[f64],
+        &self, owner: usize, layout: Layout, theta: &[f64], eta: &[f64],
     ) -> Option<Fwd> {
         if !self.chunky || layout != self.layout {
             return None;
@@ -5958,12 +5603,7 @@ impl Plan {
         let k = t.remove(&owner)?;
         #[cfg(test)]
         ADOPTS.with(|c| c.set(c.get() + 1));
-        Some(Fwd {
-            plan: me,
-            layout,
-            buf: k.buf,
-            logs: Vec::new(),
-        })
+        Some(Fwd { plan: me, layout, buf: k.buf, logs: Vec::new() })
     }
 
     /// The forward over any `layout`: η's and θ's lanes from `u` and `params` (laid out at
@@ -5971,11 +5611,7 @@ impl Plan {
     /// the guard (`1` when it holds) into `du`, and the forward kept for reverse passes.
     /// `None` when some chunk cannot be built or a loop call fails.
     pub(crate) fn forward_layout(
-        &self,
-        layout: Layout,
-        u: &[f64],
-        params: &[f64],
-        du: &mut [f64],
+        &self, layout: Layout, u: &[f64], params: &[f64], du: &mut [f64],
     ) -> Option<Fwd> {
         let f = self.forward_kept(layout, u, params)?;
         let l = layout.lanes();
@@ -5995,12 +5631,7 @@ impl Plan {
     /// tangent. Kept for [`Self::reverse_rows`] and read through [`Self::rows_out`]. `None`
     /// where a chunk has no such kernel or a loop call fails.
     pub(crate) fn forward_rows(
-        &self,
-        layout: Layout,
-        u: &[f64],
-        params: &[f64],
-        tu: &[f64],
-        seeds: usize,
+        &self, layout: Layout, u: &[f64], params: &[f64], tu: &[f64], seeds: usize,
     ) -> Option<RowsFwd> {
         if layout.tan != 0 {
             return None;
@@ -6020,14 +5651,7 @@ impl Plan {
         self.forward_rows_into(&fns, &mut buf, &mut tb, layout, seeds, &mut logs)?;
         #[cfg(test)]
         note_rows(0);
-        Some(RowsFwd {
-            plan: self as *const Plan as usize,
-            layout,
-            seeds,
-            buf,
-            tb,
-            logs,
-        })
+        Some(RowsFwd { plan: self as *const Plan as usize, layout, seeds, buf, tb, logs })
     }
 
     /// Whether this plan's rows forward and its rows reverse both have kernels at `layout`: what
@@ -6041,24 +5665,17 @@ impl Plan {
 
     /// Output `o`'s lanes in a kept rows forward: its values, and seed `sd`'s tangents.
     pub(crate) fn rows_out<'a>(
-        &self,
-        r: &'a RowsFwd,
-        o: usize,
-        sd: usize,
+        &self, r: &'a RowsFwd, o: usize, sd: usize,
     ) -> (&'a [f64], &'a [f64]) {
         let l = r.layout.lanes();
         let s = self.outs[o] as usize;
         let stride = self.n_slots * l;
-        (
-            &r.buf[s * l..(s + 1) * l],
-            &r.tb[sd * stride + s * l..sd * stride + (s + 1) * l],
-        )
+        (&r.buf[s * l..(s + 1) * l], &r.tb[sd * stride + s * l..sd * stride + (s + 1) * l])
     }
 
     /// Whether the guard holds in a kept rows forward.
     pub(crate) fn rows_guard(&self, r: &RowsFwd) -> bool {
-        self.guard
-            .is_none_or(|g| r.buf[g as usize * r.layout.lanes()] == 1.0)
+        self.guard.is_none_or(|g| r.buf[g as usize * r.layout.lanes()] == 1.0)
     }
 
     /// Forward over reverse from a kept rows forward with the adjoint seed `du_bar` every seed
@@ -6069,14 +5686,8 @@ impl Plan {
     /// tangent, its own log). `false` where a chunk has no such kernel or a loop call fails.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reverse_rows(
-        &self,
-        r: &RowsFwd,
-        du_bar: &[f64],
-        dut_bar: Option<&[f64]>,
-        u_bar: &mut [f64],
-        p_bar: &mut [f64],
-        ut_bar: &mut [f64],
-        pt_bar: &mut [f64],
+        &self, r: &RowsFwd, du_bar: &[f64], dut_bar: Option<&[f64]>, u_bar: &mut [f64],
+        p_bar: &mut [f64], ut_bar: &mut [f64], pt_bar: &mut [f64],
     ) -> bool {
         if r.plan != self as *const Plan as usize {
             return false;
@@ -6115,12 +5726,7 @@ impl Plan {
         let mut idx2: Vec<u32> = Vec::new();
         for (c, k) in self.calls.iter().zip(fns.iter()).rev() {
             match (c, k) {
-                (
-                    Call::Chunk {
-                        idx, lits, prog, ..
-                    },
-                    Kern::Chunk(k),
-                ) => {
+                (Call::Chunk { idx, lits, prog, .. }, Kern::Chunk(k)) => {
                     // A chunk without a rows reverse (`ir::tangent_reverse_rows` declined it):
                     // its per-direction forward over reverse at one tangent, each seed from the
                     // state before the chunk; the adjoints' values are every seed's, taken once.
@@ -6157,9 +5763,7 @@ impl Plan {
                     #[cfg(test)]
                     if let Some((sh0, mut ts0)) = before {
                         let lt = Layout { tan: 1, ..layout };
-                        let ktr = prog
-                            .get(lt, Sweep::TangentReverse)
-                            .expect("a reverse kernel");
+                        let ktr = prog.get(lt, Sweep::TangentReverse).expect("a reverse kernel");
                         let mut worst = 0.0f64;
                         for sd in 0..seeds {
                             let t0 = &mut ts0[sd * 2 * need..(sd + 1) * 2 * need];
@@ -6182,18 +5786,13 @@ impl Plan {
                         assert!(
                             worst < 1e-12,
                             "rows reverse vs per-direction on a {}-instruction chunk: {worst:e}",
-                            k.f.insts.len()
+                            k.n_insts
                         );
                     }
                 }
-                (
-                    Call::Loop {
-                        spec: CallKind::Ode(spec),
-                        args,
-                        outs,
-                    },
-                    Kern::Loop(rk),
-                ) if li > 0 => {
+                (Call::Loop { spec: CallKind::Ode(spec), args, outs }, Kern::Loop(rk))
+                    if li > 0 =>
+                {
                     li -= 1;
                     // Every seed in one reverse: block 0 the adjoints' values, block `1 + s`
                     // seed `s`'s tangents of them.
@@ -6328,10 +5927,7 @@ impl Plan {
             for (x, y) in ut_bar[sd * ne..(sd + 1) * ne].iter_mut().zip(&t[..ne]) {
                 *x += *y;
             }
-            for (x, y) in pt_bar[sd * nt..(sd + 1) * nt]
-                .iter_mut()
-                .zip(&t[ne..ne + nt])
-            {
+            for (x, y) in pt_bar[sd * nt..(sd + 1) * nt].iter_mut().zip(&t[ne..ne + nt]) {
                 *x += *y;
             }
         }
@@ -6343,12 +5939,7 @@ impl Plan {
     }
 
     fn forward_rows_into(
-        &self,
-        fns: &[Kern],
-        buf: &mut [f64],
-        tb: &mut [f64],
-        layout: Layout,
-        seeds: usize,
+        &self, fns: &[Kern], buf: &mut [f64], tb: &mut [f64], layout: Layout, seeds: usize,
         logs: &mut [Vec<CallLog>],
     ) -> Option<()> {
         if let Some(ov) = self.ode_override {
@@ -6361,15 +5952,7 @@ impl Plan {
         let mut auto = crate::ode::solver::OdeAutoSwitchState::default();
         for (c, k) in self.calls.iter().zip(fns) {
             match (c, k) {
-                (
-                    Call::Chunk {
-                        idx,
-                        lits,
-                        guard,
-                        prog,
-                    },
-                    Kern::Chunk(k),
-                ) => {
+                (Call::Chunk { idx, lits, guard, prog }, Kern::Chunk(k)) => {
                     #[cfg(test)]
                     let before = (buf.to_vec(), tb.to_vec());
                     #[cfg(not(test))]
@@ -6431,21 +6014,14 @@ impl Plan {
                         assert!(
                             worst < 1e-12,
                             "rows forward vs one tangent on a {}-instruction chunk: {worst:e}",
-                            k.f.insts.len()
+                            k.n_insts
                         );
                     }
                     if guard.is_some_and(|g| buf[g as usize * l] != 1.0) {
                         return Some(());
                     }
                 }
-                (
-                    Call::Loop {
-                        spec: CallKind::Ode(spec),
-                        args,
-                        outs,
-                    },
-                    Kern::Loop(lk),
-                ) => {
+                (Call::Loop { spec: CallKind::Ode(spec), args, outs }, Kern::Loop(lk)) => {
                     // Every seed in one run: the steps are the values', each body the primal
                     // once and each seed's tangent.
                     let mut inputs = Vec::with_capacity(args.len() * l);
@@ -6552,11 +6128,7 @@ impl Plan {
     /// (`layout.tan` directions seeded in `params`). `None` when a call cannot run (the plan
     /// itself may still serve another layout); `Some(held)` otherwise, `held` the guard.
     pub(crate) fn forward_unkept(
-        &self,
-        layout: Layout,
-        u: &[f64],
-        params: &[f64],
-        du: &mut [f64],
+        &self, layout: Layout, u: &[f64], params: &[f64], du: &mut [f64],
     ) -> Option<bool> {
         let fwd = self.fns(layout, Sweep::Forward)?;
         let l = layout.lanes();
@@ -6590,12 +6162,7 @@ impl Plan {
         // A failed guard stops the forward early: `buf` started zeroed, so the guard's slot
         // still reads `0` ([`Self::kept_guard`]).
         match self.forward_logged(&fwd, &mut buf, layout, Some(&mut logs)) {
-            Some(_) => Some(Fwd {
-                plan: self as *const Plan as usize,
-                layout,
-                buf,
-                logs,
-            }),
+            Some(_) => Some(Fwd { plan: self as *const Plan as usize, layout, buf, logs }),
             None => {
                 give(buf);
                 None
@@ -6612,8 +6179,7 @@ impl Plan {
 
     /// Whether the recording's guard holds in a kept forward.
     pub(crate) fn kept_guard(&self, f: &Fwd) -> bool {
-        self.guard
-            .is_none_or(|g| f.buf[g as usize * f.layout.lanes()] == 1.0)
+        self.guard.is_none_or(|g| f.buf[g as usize * f.layout.lanes()] == 1.0)
     }
 
     /// The reverse over `layout` from a kept forward at `layout` or at a layout whose lanes
@@ -6622,12 +6188,7 @@ impl Plan {
     /// chunk's (and each loop step's) recomputed forward prefix is shared by every seed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reverse_from(
-        &self,
-        f: &Fwd,
-        layout: Layout,
-        seeds: usize,
-        u_bar: &mut [f64],
-        p_bar: &mut [f64],
+        &self, f: &Fwd, layout: Layout, seeds: usize, u_bar: &mut [f64], p_bar: &mut [f64],
         du_bar: &[f64],
     ) -> bool {
         self.sweep_back(f, layout, Sweep::Reverse, seeds, u_bar, p_bar, du_bar)
@@ -6643,12 +6204,7 @@ impl Plan {
     /// layout needs one seed per direction for. `seeds` such sweeps at once, each a block of
     /// `du_bar`, `u_bar` and `p_bar`, share the recomputed forward as [`Self::reverse_from`]'s do.
     pub(crate) fn reverse_tangent_from(
-        &self,
-        f: &Fwd,
-        seeds: usize,
-        u_bar: &mut [f64],
-        p_bar: &mut [f64],
-        du_bar: &[f64],
+        &self, f: &Fwd, seeds: usize, u_bar: &mut [f64], p_bar: &mut [f64], du_bar: &[f64],
     ) -> bool {
         let sweep = Sweep::TangentReverse.at(f.layout);
         self.sweep_back(f, f.layout, sweep, seeds, u_bar, p_bar, du_bar)
@@ -6658,14 +6214,8 @@ impl Plan {
     /// walk back through the calls, the chunks' kernels and the loops' bodies those of `sweep`.
     #[allow(clippy::too_many_arguments)]
     fn sweep_back(
-        &self,
-        f: &Fwd,
-        layout: Layout,
-        sweep: Sweep,
-        seeds: usize,
-        u_bar: &mut [f64],
-        p_bar: &mut [f64],
-        du_bar: &[f64],
+        &self, f: &Fwd, layout: Layout, sweep: Sweep, seeds: usize, u_bar: &mut [f64],
+        p_bar: &mut [f64], du_bar: &[f64],
     ) -> bool {
         if f.plan != self as *const Plan as usize || !prefix_layout(layout, f.layout) {
             return false;
@@ -6792,10 +6342,7 @@ impl Plan {
                 for (x, y) in u_bar[sd * ne..(sd + 1) * ne].iter_mut().zip(&blk[..ne]) {
                     *x += *y;
                 }
-                for (x, y) in p_bar[sd * nt..(sd + 1) * nt]
-                    .iter_mut()
-                    .zip(&blk[ne..ne + nt])
-                {
+                for (x, y) in p_bar[sd * nt..(sd + 1) * nt].iter_mut().zip(&blk[ne..ne + nt]) {
                     *x += *y;
                 }
             }
@@ -6810,9 +6357,15 @@ impl Plan {
 /// [`fold`] for a chunk: input `i`'s lanes outside its directions are zero, a seed's own
 /// lane is one; literals carry no tangent.
 fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
+    fold_with(src, chunk_known(layout, spec))
+}
+
+/// The loaded lanes a chunk's inputs fix ([`fold_chunk`]'s `known`): `Some(c)` for a lane that
+/// is the constant `c` at every call.
+fn chunk_known(layout: Layout, spec: &[(DirMask, u16)]) -> impl Fn(u8, u32) -> Option<f64> + '_ {
     let lanes = layout.lanes();
     let n = layout.n as usize;
-    let lane_dir = |lane: usize| -> Option<(usize, usize)> {
+    let lane_dir = move |lane: usize| -> Option<(usize, usize)> {
         // lane 1..=n: direction k; payload lanes: the pair (k, l) of `ir::pairs`' order.
         if lane == 0 {
             None
@@ -6831,7 +6384,7 @@ fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
             None
         }
     };
-    let known = |arg: u8, off: u32| -> Option<f64> {
+    move |arg: u8, off: u32| -> Option<f64> {
         let (idx, lane) = (off as usize / lanes, off as usize % lanes);
         if lane == 0 {
             return None;
@@ -6855,8 +6408,7 @@ fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
             return Some(0.0);
         }
         None
-    };
-    fold_with(src, known)
+    }
 }
 
 /// Kernels above this many instructions are lowered as a chain of segments ([`SegPlan`]). Below
@@ -6912,11 +6464,7 @@ impl SegPlan {
         let split = if rev { prefix.min(n) } else { n };
         let mut segs = Vec::new();
         for (lo, hi) in [(0, split), (split, n)] {
-            segs.extend(
-                (lo..hi)
-                    .step_by(SEG_INSTS)
-                    .map(|a| (a, (a + SEG_INSTS).min(hi))),
-            );
+            segs.extend((lo..hi).step_by(SEG_INSTS).map(|a| (a, (a + SEG_INSTS).min(hi))));
         }
         let nfwd = segs.iter().take_while(|&&(_, hi)| hi <= split).count();
         let mut seg_of = vec![0usize; n];
@@ -6964,20 +6512,11 @@ impl SegPlan {
             slot[at] = s;
             // A forward value the seed loop's body reads is read again on every seed: its slot
             // is never handed to a value the body defines.
-            let until = if rev && at < prefix && last[at] >= prefix {
-                usize::MAX
-            } else {
-                last[at]
-            };
+            let until =
+                if rev && at < prefix && last[at] >= prefix { usize::MAX } else { last[at] };
             busy.push(std::cmp::Reverse((until, s)));
         }
-        Some(SegPlan {
-            segs,
-            nfwd,
-            slot,
-            cond,
-            slots: slots as usize,
-        })
+        Some(SegPlan { segs, nfwd, slot, cond, slots: slots as usize })
     }
 }
 
@@ -6996,33 +6535,19 @@ fn plan_isa(quick: bool, opt: &str) -> Option<cranelift_codegen::isa::OwnedTarge
     if quick {
         flags.set("regalloc_algorithm", "single_pass").ok()?;
     }
-    cranelift_native::builder()
-        .ok()?
-        .finish(settings::Flags::new(flags))
-        .ok()
+    cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn lower_chunk_opt(
-    f: &Func,
-    layout: Layout,
-    n_in: usize,
-    rev: bool,
-    prefix: usize,
-    quick: bool,
-    opt: &str,
+    f: &Func, layout: Layout, n_in: usize, rev: bool, prefix: usize, quick: bool, opt: &str,
     spill: Option<&SegPlan>,
 ) -> Option<ChunkKernel> {
-    use super::ir::{Cc, Shim1};
-    use cranelift_codegen::ir::condcodes::FloatCC;
-    let _ = Shim1::Nan;
+    use super::ir::Shim1;
     use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{default_libcall_names, Linkage, Module};
-    extern "C" fn sh_powf(x: f64, e: f64) -> f64 {
-        x.powf(e)
-    }
     let lanes = layout.lanes();
     // The target, per tier: built once (host feature detection, the flags' parse), shared.
     type Isa = Option<cranelift_codegen::isa::OwnedTargetIsa>;
@@ -7129,11 +6654,7 @@ fn lower_chunk_opt(
                     let s = b.ins().uextend(types::I64, s);
                     b.ins().imul_imm_u(s, (lanes * 8) as i64)
                 });
-                let buf = if in_adj {
-                    adjp.expect("an adjoint buffer")
-                } else {
-                    base
-                };
+                let buf = if in_adj { adjp.expect("an adjoint buffer") } else { base };
                 let a = b.ins().iadd(buf, off);
                 addr.insert((e, in_adj), a);
                 a
@@ -7141,11 +6662,7 @@ fn lower_chunk_opt(
             // The lane-parallel operations as `f64x2` ones ([`simd`]), every other instruction as
             // it is, in the packs' order.
             // A segment is lowered scalar, over its own instructions.
-            let packs = if seg {
-                None
-            } else {
-                simd::packs(f, lanes, rev, prefix)
-            };
+            let packs = if seg { None } else { simd::packs(f, lanes, rev, prefix) };
             let order: Vec<simd::Node> = match &packs {
                 Some(p) => p.order.clone(),
                 None => (lo as ir::V..hi as ir::V).map(simd::Node::Scalar).collect(),
@@ -7155,12 +6672,8 @@ fn lower_chunk_opt(
             let mut splats: HashMap<ir::V, Value, FxBuild> = HashMap::default();
             // An instruction's scalar value: a packed one's lane (a store's, its stored value's).
             fn scalar(
-                b: &mut FunctionBuilder,
-                f: &Func,
-                pk: Option<&simd::Packs>,
-                v: &mut [Option<Value>],
-                pv: &[Option<Value>],
-                x: ir::V,
+                b: &mut FunctionBuilder, f: &Func, pk: Option<&simd::Packs>,
+                v: &mut [Option<Value>], pv: &[Option<Value>], x: ir::V,
             ) -> Value {
                 if let Some(y) = v[x as usize] {
                     return y;
@@ -7331,11 +6844,7 @@ fn lower_chunk_opt(
                         } else {
                             let s = plan.slot[o as usize];
                             debug_assert_ne!(s, SegPlan::NONE, "a crossing operand has a slot");
-                            let ty = if plan.cond[o as usize] {
-                                types::I8
-                            } else {
-                                types::F64
-                            };
+                            let ty = if plan.cond[o as usize] { types::I8 } else { types::F64 };
                             b.ins().load(ty, fl, scratch, (s as i32) * 8)
                         };
                         v[o as usize] = Some(val);
@@ -7376,91 +6885,19 @@ fn lower_chunk_opt(
                             _ => return None,
                         }
                     }
-                    Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
-                    Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
-                    Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
-                    Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
-                    Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
-                    Inst::Neg(x) => b.ins().fneg(r(x)),
-                    Inst::Abs(x) => b.ins().fabs(r(x)),
-                    Inst::Floor(x) => b.ins().floor(r(x)),
-                    Inst::Ceil(x) => b.ins().ceil(r(x)),
-                    Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
-                    Inst::Call1(s, x) => {
-                        let fp = s.f();
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(uref, callee, &[r(x)]);
-                        b.inst_results(call)[0]
-                    }
-                    Inst::Powf(x, y) => {
-                        let fp: extern "C" fn(f64, f64) -> f64 = sh_powf;
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
-                        b.inst_results(call)[0]
-                    }
-                    Inst::Gamma {
-                        upper,
-                        i,
-                        j,
-                        a: x,
-                        x: y,
-                    } => {
-                        let fp = ir::gamma_shim(upper, i, j);
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
-                        b.inst_results(call)[0]
-                    }
-                    Inst::Cmp(cc, x, y) => {
-                        let cc = match cc {
-                            Cc::Lt => FloatCC::LessThan,
-                            Cc::Le => FloatCC::LessThanOrEqual,
-                            Cc::Gt => FloatCC::GreaterThan,
-                            Cc::Ge => FloatCC::GreaterThanOrEqual,
-                            Cc::Eq => FloatCC::Equal,
-                            Cc::Ne => FloatCC::NotEqual,
-                        };
-                        b.ins().fcmp(cc, r(x), r(y))
-                    }
-                    Inst::And(x, y) => b.ins().band(r(x), r(y)),
-                    Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
-                    Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
-                    Inst::StopGrad(x) => r(x),
-                    Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) => {
-                        let (fp, arg): (extern "C" fn(f64) -> f64, Value) = match *inst {
-                            Inst::HostArg(x) => (ir::host::arg_native, r(x)),
-                            Inst::Host(f) => {
-                                (ir::host::call_native, b.ins().f64const(f.index() as f64))
-                            }
-                            Inst::HostOut(k) => (ir::host::out_native, b.ins().f64const(k as f64)),
-                            _ => unreachable!(),
-                        };
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(uref, callee, &[arg]);
-                        b.inst_results(call)[0]
-                    }
                     Inst::Store { arg, off, v: x } => {
                         let (j, lane) = (off as usize / lanes, off as usize % lanes);
                         let a = match arg {
-                            3 => Some(slot_addr(
-                                &mut b,
-                                &mut offs,
-                                &mut addr,
-                                adjp,
-                                n_in + j,
-                                false,
-                            )),
+                            3 => {
+                                Some(slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + j, false))
+                            }
                             4 if rev => {
                                 Some(slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true))
                             }
                             // A tangent-rows kernel's output tangents (#2980).
-                            7 if rev => Some(slot_addr(
-                                &mut b,
-                                &mut offs,
-                                &mut addr,
-                                adjp,
-                                n_in + j,
-                                true,
-                            )),
+                            7 if rev => {
+                                Some(slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + j, true))
+                            }
                             // The literals' adjoints: discarded.
                             6 if rev => None,
                             _ => return None,
@@ -7470,6 +6907,7 @@ fn lower_chunk_opt(
                         }
                         r(x)
                     }
+                    _ => super::jit::lower_value_inst(&mut b, inst, &r, ptr, uref, bref)?,
                 };
                 v[at] = Some(out);
                 if let Some(plan) = spill {
@@ -7508,26 +6946,27 @@ fn lower_chunk_opt(
         for o in reloaded.drain(..) {
             v[o] = None;
         }
+        #[cfg(test)]
+        NATIVE_CLIF.with(|c| c.set(c.get() + ctx.func.dfg.num_insts()));
         module.define_function(id, &mut ctx).ok()?;
+        #[cfg(test)]
+        NATIVE_BYTES.with(|c| {
+            let size = ctx.compiled_code().map_or(0, |cc| cc.code_info().total_size as usize);
+            c.set(c.get() + size)
+        });
         module.clear_context(&mut ctx);
         ids.push(id);
     }
     module.finalize_definitions().ok()?;
     // SAFETY: defined with `ChunkFn`'s (`ChunkRevFn`'s) signature, or each with `SegFn`'s.
     let (p, segs) = if seg {
-        let fns: Box<[*const u8]> = ids
-            .iter()
-            .map(|&id| module.get_finalized_function(id))
-            .collect();
+        let fns: Box<[*const u8]> =
+            ids.iter().map(|&id| module.get_finalized_function(id)).collect();
         (fns.as_ptr() as *const u8, Some(fns))
     } else {
         (module.get_finalized_function(ids[0]), None)
     };
-    Some(ChunkKernel {
-        f: p,
-        segs,
-        module: Some(module),
-    })
+    Some(ChunkKernel { f: p, segs, module: Some(module) })
 }
 
 #[cfg(test)]
@@ -7543,10 +6982,7 @@ mod compile_guard_tests {
         compile_guarded(&queued, || {});
         assert!(queued.load(Relaxed));
         compile_guarded(&queued, || panic!("compile failed"));
-        assert!(
-            !queued.load(Relaxed),
-            "a panicked compile must release `queued`"
-        );
+        assert!(!queued.load(Relaxed), "a panicked compile must release `queued`");
     }
 }
 
@@ -7559,13 +6995,7 @@ mod seg_tests {
     const M: usize = 40_000;
 
     fn layout() -> Layout {
-        Layout {
-            n: 2,
-            m: 3,
-            th: false,
-            wide: false,
-            tan: 0,
-        }
+        Layout { n: 2, m: 3, th: false, wide: false, tan: 0 }
     }
 
     /// `M` inputs loaded first and summed last (every value live across the kernel), the sum
@@ -7578,10 +7008,7 @@ mod seg_tests {
     fn sum_func_n(m: usize, l: usize) -> Func {
         let mut f = Func::new(4);
         for i in 0..m {
-            f.insts.push(Inst::Load {
-                arg: 0,
-                off: (i * l) as u32,
-            });
+            f.insts.push(Inst::Load { arg: 0, off: (i * l) as u32 });
         }
         // Input `i` times input `m − 1 − i`: at the middle every input is still live.
         let mut acc = 0 as ir::V;
@@ -7595,11 +7022,7 @@ mod seg_tests {
                 acc = (f.insts.len() - 1) as ir::V;
             }
         }
-        f.insts.push(Inst::Store {
-            arg: 3,
-            off: 0,
-            v: acc,
-        });
+        f.insts.push(Inst::Store { arg: 3, off: 0, v: acc });
         f.live = vec![None; f.insts.len()];
         f
     }
@@ -7609,10 +7032,7 @@ mod seg_tests {
     fn rev_func(l: usize) -> (Func, usize) {
         let mut f = Func::new(8);
         for i in 0..M {
-            f.insts.push(Inst::Load {
-                arg: 0,
-                off: (i * l) as u32,
-            });
+            f.insts.push(Inst::Load { arg: 0, off: (i * l) as u32 });
         }
         let prefix = f.insts.len();
         f.insts.push(Inst::Load { arg: 7, off: 0 });
@@ -7620,11 +7040,7 @@ mod seg_tests {
         for i in 0..M {
             f.insts.push(Inst::Mul(a, i as ir::V));
             let m = (f.insts.len() - 1) as ir::V;
-            f.insts.push(Inst::Store {
-                arg: 4,
-                off: (i * l) as u32,
-                v: m,
-            });
+            f.insts.push(Inst::Store { arg: 4, off: (i * l) as u32, v: m });
         }
         f.live = vec![None; f.insts.len()];
         (f, prefix)
@@ -7652,9 +7068,7 @@ mod seg_tests {
     }
 
     fn inputs(l: usize) -> Vec<f64> {
-        (0..(M + 1) * l)
-            .map(|k| 0.5 + (k as f64 * 0.37).sin())
-            .collect()
+        (0..(M + 1) * l).map(|k| 0.5 + (k as f64 * 0.37).sin()).collect()
     }
 
     /// A rows reverse kernel keeps what runs it, as every kernel does (#3010): no `live`, its
@@ -7666,8 +7080,8 @@ mod seg_tests {
         f.insts.reserve(64);
         assert!(!f.live.is_empty() && f.insts.capacity() > f.insts.len());
         let t = Tiered::new_rows(f, layout(), 8, 0, 8);
-        assert!(t.f.live.is_empty());
-        assert_eq!(t.f.insts.capacity(), t.f.insts.len());
+        assert!(t.ir().unwrap().live.is_empty());
+        assert_eq!(t.ir().unwrap().insts.capacity(), t.ir().unwrap().insts.len());
     }
 
     #[test]
@@ -7677,10 +7091,7 @@ mod seg_tests {
         // Every input is read ~M instructions after its definition, in a later segment; a
         // running sum only where a segment boundary cuts the chain.
         assert!(plan.slot[..M].iter().all(|&s| s != SegPlan::NONE));
-        let cut = plan.slot[M..]
-            .iter()
-            .filter(|&&s| s != SegPlan::NONE)
-            .count();
+        let cut = plan.slot[M..].iter().filter(|&&s| s != SegPlan::NONE).count();
         // Only the boundaries inside the chain.
         assert!((1..=2 * plan.segs.len()).contains(&cut), "{cut}");
         assert!(plan.slots >= M && plan.slots <= M + cut);
@@ -7694,23 +7105,13 @@ mod seg_tests {
     fn a_promoted_large_kernel_runs_on_a_small_stack_at_every_tier() {
         let l = layout().lanes();
         let t = Tiered::new(sum_func(l), layout(), M, false, 0);
-        assert!(t
-            .spill
-            .get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix))
-            .is_some());
+        assert!(t.spill.get_or_init(|| SegPlan::new(&t.ir().unwrap(), t.rev, t.prefix)).is_some());
         let idx: Vec<u32> = (0..=M as u32).collect();
         let inp = inputs(l);
         let mut want = inp.clone();
         // SAFETY: `idx` names `M + 1` lane blocks of `want`.
         unsafe {
-            t.interpret(
-                want.as_mut_ptr(),
-                std::ptr::null_mut(),
-                idx.as_ptr(),
-                [].as_ptr(),
-                1,
-                0,
-            )
+            t.interpret(want.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), [].as_ptr(), 1, 0)
         };
         let want = want[M * l];
         assert!(want.is_finite() && want != inp[M * l]);
@@ -7725,14 +7126,73 @@ mod seg_tests {
             t.promote(quick, opt);
             assert_ne!(t.native.load(Relaxed), 0, "{opt} compiled");
             on_small_stack(256 << 10, 64, move || unsafe {
-                tr.call(
-                    bp as *mut f64,
-                    std::ptr::null_mut(),
-                    ip as *const u32,
-                    [].as_ptr(),
-                );
+                tr.call(bp as *mut f64, std::ptr::null_mut(), ip as *const u32, [].as_ptr());
             });
             assert_eq!(buf[M * l].to_bits(), want.to_bits(), "{opt}");
+        }
+    }
+
+    /// A kernel drops its function once its final tier is compiled, and not before (#3076):
+    /// the function is dead after that (nothing interprets, compiles or plans from it again),
+    /// and on a fit's ODE loop kernels it was over a gigabyte. Driven through its calls — the
+    /// production promotion path — each kernel gives the interpreter's bits at every call,
+    /// before and after the drop. Two sizes, because the final tier differs: the optimizing
+    /// allocator's (3) for a small kernel, the quick tier's (2) for one past
+    /// [`TIER3_MAX_INSTS`], which never compiles further.
+    /// Mutations: never drop → the `is_none` checks fail; drop at any compiled tier → the small
+    /// kernel's `is_some` after tier 2 fails; drop by `TIER3_MAX_INSTS` on the wrong side → one
+    /// of the two kernels fails.
+    #[test]
+    fn a_kernel_drops_its_function_at_its_final_tier_and_computes_the_same_bits() {
+        let l = layout().lanes();
+        for (m, last, last_calls) in [(8, 3u8, TIER3_CALLS), (1500, 2u8, TIER2_CALLS)] {
+            let t = Tiered::new(sum_func_n(m, l), layout(), m, false, 0);
+            assert_eq!(t.n_insts > TIER3_MAX_INSTS, last == 2, "the {m}-input kernel's size");
+            assert_eq!(t.final_tier(), last);
+            let idx: Vec<u32> = (0..=m as u32).collect();
+            let inp: Vec<f64> = (0..(m + 1) * l).map(|k| 0.5 + (k as f64 * 0.37).sin()).collect();
+            let mut want = inp.clone();
+            // SAFETY: `idx` names `m + 1` lane blocks of `want`.
+            assert!(unsafe {
+                t.interpret(
+                    want.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    idx.as_ptr(),
+                    [].as_ptr(),
+                    1,
+                    0,
+                )
+            });
+            let want = want[m * l];
+            assert!(want.is_finite() && want != inp[m * l]);
+            let mut buf = inp.clone();
+            for n in 1..=last_calls + 16 {
+                buf[m * l] = 0.0;
+                // SAFETY: as above, for `buf`.
+                unsafe {
+                    t.call(buf.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), [].as_ptr())
+                };
+                assert_eq!(buf[m * l].to_bits(), want.to_bits(), "{m} inputs, call {n}");
+                if n == TIER2_CALLS {
+                    assert_eq!(t.tier.load(Relaxed), 2, "{m} inputs at tier 2");
+                    assert_eq!(t.ir().is_none(), last == 2, "{m} inputs: function after tier 2");
+                }
+            }
+            assert_eq!(t.tier.load(Relaxed), last, "{m} inputs reached their final tier");
+            assert_ne!(t.native.load(Relaxed), 0);
+            assert!(t.ir().is_none(), "{m} inputs: the function outlived the final tier");
+            // The interpreter declines rather than run a function that is gone.
+            let mut again = inp.clone();
+            assert!(!unsafe {
+                t.interpret(
+                    again.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    idx.as_ptr(),
+                    [].as_ptr(),
+                    1,
+                    0,
+                )
+            });
         }
     }
 
@@ -7745,26 +7205,17 @@ mod seg_tests {
         let m = SEG_MIN_INSTS / 3;
         let l = layout().lanes();
         let t = Tiered::new(sum_func_n(m, l), layout(), m, false, 0);
-        assert!(t.f.insts.len() <= SEG_MIN_INSTS && t.f.insts.len() + 3 > SEG_MIN_INSTS);
-        assert!(t
-            .spill
-            .get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix))
-            .is_none());
+        assert!(
+            t.ir().unwrap().insts.len() <= SEG_MIN_INSTS
+                && t.ir().unwrap().insts.len() + 3 > SEG_MIN_INSTS
+        );
+        assert!(t.spill.get_or_init(|| SegPlan::new(&t.ir().unwrap(), t.rev, t.prefix)).is_none());
         let idx: Vec<u32> = (0..=m as u32).collect();
-        let inp: Vec<f64> = (0..(m + 1) * l)
-            .map(|k| 0.5 + (k as f64 * 0.37).sin())
-            .collect();
+        let inp: Vec<f64> = (0..(m + 1) * l).map(|k| 0.5 + (k as f64 * 0.37).sin()).collect();
         let mut want = inp.clone();
         // SAFETY: `idx` names `m + 1` lane blocks of `want`.
         unsafe {
-            t.interpret(
-                want.as_mut_ptr(),
-                std::ptr::null_mut(),
-                idx.as_ptr(),
-                [].as_ptr(),
-                1,
-                0,
-            )
+            t.interpret(want.as_mut_ptr(), std::ptr::null_mut(), idx.as_ptr(), [].as_ptr(), 1, 0)
         };
         let want = want[m * l];
         assert!(want.is_finite() && want != inp[m * l]);
@@ -7774,12 +7225,7 @@ mod seg_tests {
             let mut buf = inp.clone();
             let (bp, ip, tr) = (buf.as_mut_ptr() as usize, idx.as_ptr() as usize, &t);
             on_small_stack(512 << 10, 64, move || unsafe {
-                tr.call(
-                    bp as *mut f64,
-                    std::ptr::null_mut(),
-                    ip as *const u32,
-                    [].as_ptr(),
-                );
+                tr.call(bp as *mut f64, std::ptr::null_mut(), ip as *const u32, [].as_ptr());
             });
             assert_eq!(buf[m * l].to_bits(), want.to_bits(), "{opt}");
         }
@@ -7790,17 +7236,12 @@ mod seg_tests {
         let l = layout().lanes();
         let (f, prefix) = rev_func(l);
         let t = Tiered::new(f, layout(), M, true, prefix);
-        assert!(t
-            .spill
-            .get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix))
-            .is_some());
+        assert!(t.spill.get_or_init(|| SegPlan::new(&t.ir().unwrap(), t.rev, t.prefix)).is_some());
         let idx: Vec<u32> = (0..=M as u32).collect();
         let inp = inputs(l);
         let stride = (M + 1) * l;
         let seeds = 3;
-        let adj0: Vec<f64> = (0..stride * seeds)
-            .map(|k| 1.0 + (k as f64 * 0.11).cos())
-            .collect();
+        let adj0: Vec<f64> = (0..stride * seeds).map(|k| 1.0 + (k as f64 * 0.11).cos()).collect();
         let mut want = adj0.clone();
         let mut base = inp.clone();
         // SAFETY: `seeds` adjoint buffers `stride` apart.
@@ -7818,12 +7259,8 @@ mod seg_tests {
         for (quick, opt) in [(true, "none"), (true, "speed")] {
             let mut got = adj0.clone();
             let mut base = inp.clone();
-            let (bp, gp, ip, tr) = (
-                base.as_mut_ptr() as usize,
-                got.as_mut_ptr() as usize,
-                idx.as_ptr() as usize,
-                &t,
-            );
+            let (bp, gp, ip, tr) =
+                (base.as_mut_ptr() as usize, got.as_mut_ptr() as usize, idx.as_ptr() as usize, &t);
             t.promote(quick, opt);
             on_small_stack(256 << 10, 64, move || unsafe {
                 assert_ne!(tr.native.load(Relaxed), 0, "{opt} compiled");
@@ -7836,12 +7273,7 @@ mod seg_tests {
                     [].as_ptr(),
                 );
             });
-            assert!(
-                got.iter()
-                    .zip(&want)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "{opt}"
-            );
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{opt}");
         }
     }
 }

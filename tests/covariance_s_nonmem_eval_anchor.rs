@@ -34,19 +34,13 @@ use ferx_core::{fit, read_nonmem_csv, CovarianceMethod, EstimationMethod, FitOpt
 use std::path::Path;
 
 const NAMES: [&str; 7] = ["TVCL", "TVV", "TVKA", "PROP_ERR", "w2CL", "w2V", "w2KA"];
-const NAMES_IOV: [&str; 8] = [
-    "TVCL", "TVV", "TVKA", "PROP_ERR", "w2CL", "w2V", "w2KA", "k2CL",
-];
+const NAMES_IOV: [&str; 8] = ["TVCL", "TVV", "TVKA", "PROP_ERR", "w2CL", "w2V", "w2KA", "k2CL"];
 
 fn warfarin_src(theta: [f64; 4], omega: [f64; 3], kappa: Option<f64>) -> String {
     let [cl, v, ka, prop] = theta;
     let [ocl, ov, oka] = omega;
     let (kap_line, kap_term, iov_opt) = match kappa {
-        Some(k) => (
-            format!("  kappa KAPPA_CL ~ {k:?}\n"),
-            " + KAPPA_CL",
-            "  iov_column = OCC\n",
-        ),
+        Some(k) => (format!("  kappa KAPPA_CL ~ {k:?}\n"), " + KAPPA_CL", "  iov_column = OCC\n"),
         None => (String::new(), "", ""),
     };
     format!(
@@ -81,11 +75,7 @@ fn ferx_ses(src: &str, data: &str, iov: bool, focei: bool, method: CovarianceMet
     let model = parse_model_string(src).expect("model parses");
     let pop = read_nonmem_csv(Path::new(data), None, iov.then_some("OCC")).expect("data loads");
     let opts = FitOptions {
-        method: if focei {
-            EstimationMethod::FoceI
-        } else {
-            EstimationMethod::Foce
-        },
+        method: if focei { EstimationMethod::FoceI } else { EstimationMethod::Foce },
         interaction: focei,
         outer_maxiter: 0,
         run_covariance_step: true,
@@ -94,10 +84,7 @@ fn ferx_ses(src: &str, data: &str, iov: bool, focei: bool, method: CovarianceMet
         ..Default::default()
     };
     let r = fit(&model, &pop, &model.default_params, &opts).expect("eval-only fit");
-    let t = r
-        .se_theta
-        .clone()
-        .unwrap_or_else(|| panic!("{method:?}: no SEs: {:?}", r.warnings));
+    let t = r.se_theta.clone().unwrap_or_else(|| panic!("{method:?}: no SEs: {:?}", r.warnings));
     let om = r.se_omega.clone().expect("omega SEs");
     let sg = r.se_sigma.clone().expect("sigma SEs");
     let mut v = vec![t[0], t[1], t[2], sg[0], om[0], om[1], om[2]];
@@ -125,25 +112,13 @@ fn nonmem_ses(stem: &str, iov: bool) -> Vec<f64> {
         .split_whitespace()
         .map(|v| v.parse().unwrap())
         .collect();
-    let mut cols = vec![
-        "THETA1",
-        "THETA2",
-        "THETA3",
-        "THETA4",
-        "OMEGA(1,1)",
-        "OMEGA(2,2)",
-        "OMEGA(3,3)",
-    ];
+    let mut cols =
+        vec!["THETA1", "THETA2", "THETA3", "THETA4", "OMEGA(1,1)", "OMEGA(2,2)", "OMEGA(3,3)"];
     if iov {
         cols.push("OMEGA(4,4)");
     }
     cols.iter()
-        .map(|c| {
-            row[header
-                .iter()
-                .position(|h| h == c)
-                .unwrap_or_else(|| panic!("{c}"))]
-        })
+        .map(|c| row[header.iter().position(|h| h == c).unwrap_or_else(|| panic!("{c}"))])
         .collect()
 }
 
@@ -169,14 +144,7 @@ const IOV_OMEGA: [f64; 3] = [0.039936, 0.0107779, 0.0254341];
 const IOV_KAPPA: f64 = 0.0357079;
 
 fn check(
-    label: &str,
-    src: &str,
-    data: &str,
-    iov: bool,
-    focei: bool,
-    stem: &str,
-    s_tol: f64,
-    r_tol: f64,
+    label: &str, src: &str, data: &str, iov: bool, focei: bool, stem: &str, s_tol: f64, r_tol: f64,
     rsr_tol: f64,
 ) {
     let names: &[&str] = if iov { &NAMES_IOV } else { &NAMES };

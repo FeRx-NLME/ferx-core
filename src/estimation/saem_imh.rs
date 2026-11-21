@@ -242,11 +242,7 @@ impl ImhProposal {
     /// the factors it normalises, so no caller can pair a factor with another
     /// factor's constant.
     fn from_parts(
-        eta_hat: Vec<f64>,
-        chol_l: DMatrix<f64>,
-        inflate: f64,
-        defensive: f64,
-        omega: &OmegaMatrix,
+        eta_hat: Vec<f64>, chol_l: DMatrix<f64>, inflate: f64, defensive: f64, omega: &OmegaMatrix,
     ) -> Self {
         // One gate for the weight: `saem::imh_knobs` sanitises it before a run
         // starts, so a value outside [0, 0.5] here is a caller bug, not input.
@@ -401,11 +397,7 @@ fn floored_cholesky(p: &DMatrix<f64>) -> Option<DMatrix<f64>> {
         return Some(c.l());
     }
     let eig = sym.symmetric_eigen();
-    let max_ev = eig
-        .eigenvalues
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let max_ev = eig.eigenvalues.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max_ev.is_finite() {
         return None;
     }
@@ -435,14 +427,8 @@ fn floored_cholesky(p: &DMatrix<f64>) -> Option<DMatrix<f64>> {
 /// the caller then keeps the random-walk kernel for this subject.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_proposal(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    eta_warm: &[f64],
-    max_steps: usize,
-    defensive: f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], omega: &OmegaMatrix,
+    sigma_values: &[f64], eta_warm: &[f64], max_steps: usize, defensive: f64,
     counters: &ImhCounters,
 ) -> Option<ImhProposal> {
     let n_eta = eta_warm.len();
@@ -485,13 +471,9 @@ pub(crate) fn refresh_proposal(
         g
     };
 
-    let Some((eta_hat, precision)) = gn_map_refine(
-        &gradient_at,
-        &curvature_at,
-        eta_warm,
-        omega,
-        max_steps.max(1),
-    ) else {
+    let Some((eta_hat, precision)) =
+        gn_map_refine(&gradient_at, &curvature_at, eta_warm, omega, max_steps.max(1))
+    else {
         counters.decline();
         return None;
     };
@@ -501,13 +483,7 @@ pub(crate) fn refresh_proposal(
     };
 
     bump(&counters.refreshes, 1);
-    Some(ImhProposal::from_parts(
-        eta_hat,
-        chol_l,
-        IMH_INFLATE,
-        defensive,
-        omega,
-    ))
+    Some(ImhProposal::from_parts(eta_hat, chol_l, IMH_INFLATE, defensive, omega))
 }
 
 /// One subject's IMH state, carried across SAEM iterations: the cached proposal
@@ -540,15 +516,8 @@ impl ImhSlot {
     ///   iterations, not every iteration on top of its random-walk fallback.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn refresh_if_due(
-        &mut self,
-        k: usize,
-        refresh: usize,
-        model: &CompiledModel,
-        subject: &Subject,
-        theta: &[f64],
-        omega: &OmegaMatrix,
-        sigma_values: &[f64],
-        defensive: f64,
+        &mut self, k: usize, refresh: usize, model: &CompiledModel, subject: &Subject,
+        theta: &[f64], omega: &OmegaMatrix, sigma_values: &[f64], defensive: f64,
         counters: &ImhCounters,
     ) {
         self.refresh_if_due_with(k, refresh, model.n_eta, |warm| {
@@ -570,22 +539,14 @@ impl ImhSlot {
     /// warm start without a model. Production reaches it only through
     /// `refresh_if_due`, whose signature carries no η of the chain.
     pub(crate) fn refresh_if_due_with(
-        &mut self,
-        k: usize,
-        refresh: usize,
-        n_eta: usize,
+        &mut self, k: usize, refresh: usize, n_eta: usize,
         build: impl FnOnce(&[f64]) -> Option<ImhProposal>,
     ) {
-        let due = self
-            .attempted_at
-            .is_none_or(|a| k.saturating_sub(a) >= refresh.max(1));
+        let due = self.attempted_at.is_none_or(|a| k.saturating_sub(a) >= refresh.max(1));
         if !due {
             return;
         }
-        let warm = self
-            .prop
-            .as_ref()
-            .map_or_else(|| vec![0.0; n_eta], |p| p.eta_hat.clone());
+        let warm = self.prop.as_ref().map_or_else(|| vec![0.0; n_eta], |p| p.eta_hat.clone());
         self.prop = build(&warm);
         self.attempted_at = Some(k);
     }
@@ -597,11 +558,7 @@ impl ImhSlot {
 /// them off one plan run spares the refresh a second solve. `None` when the
 /// recording is out of scope or any entry is non-finite.
 pub(crate) fn eta_jacobian_and_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: Option<&[f64]>,
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: Option<&[f64]>, eta: &[f64],
 ) -> Option<(DMatrix<f64>, Vec<f64>, Vec<f64>)> {
     let rows = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
         model, subject, None, theta, sigma, eta,
@@ -654,9 +611,7 @@ fn chol_solve(l: &DMatrix<f64>, g: &[f64]) -> Vec<f64> {
 /// returned is always one built within `GN_RECURVE_MAHA` of the returned η̂.
 fn gn_map_refine(
     gradient_at: &dyn Fn(&[f64]) -> Option<Vec<f64>>,
-    curvature_at: &dyn Fn(&[f64]) -> Option<DMatrix<f64>>,
-    eta_warm: &[f64],
-    omega: &OmegaMatrix,
+    curvature_at: &dyn Fn(&[f64]) -> Option<DMatrix<f64>>, eta_warm: &[f64], omega: &OmegaMatrix,
     steps: usize,
 ) -> Option<(Vec<f64>, DMatrix<f64>)> {
     let n_eta = eta_warm.len();
@@ -681,11 +636,7 @@ fn gn_map_refine(
         if len < GN_CONVERGED_MAHA {
             break;
         }
-        let scale = if len > GN_STEP_MAHA_CAP {
-            GN_STEP_MAHA_CAP / len
-        } else {
-            1.0
-        };
+        let scale = if len > GN_STEP_MAHA_CAP { GN_STEP_MAHA_CAP / len } else { 1.0 };
         let cand: Vec<f64> = (0..n_eta).map(|j| eta[j] - scale * delta[j]).collect();
         if !cand.iter().all(|v| v.is_finite()) || quad_form(&omega.inv, &cand) > runaway {
             break;
@@ -742,10 +693,7 @@ pub(crate) const IMH_COST_WARN_RATIO: f64 = 1.5;
 ///
 /// Returns `None` without a complete measurement (no refresh, no proposal).
 pub(crate) fn estimate_imh_cost(
-    d: &ImhSnapshot,
-    n_proposals: usize,
-    refresh_interval: usize,
-    n_mh_steps: usize,
+    d: &ImhSnapshot, n_proposals: usize, refresh_interval: usize, n_mh_steps: usize,
 ) -> Option<ImhCostEstimate> {
     if d.refreshes == 0 || d.proposals == 0 || d.imh_nll_ns == 0 {
         return None;
@@ -846,18 +794,9 @@ pub(crate) fn imh_stuck_warning(accepts: u64, proposals: u64, stuck: f64) -> Opt
 /// and share one cached `nll` per subject.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn imh_steps(
-    eta: &mut [f64],
-    nll_current: f64,
-    prop: &ImhProposal,
-    subject: &Subject,
-    model: &CompiledModel,
-    theta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    rng: &mut impl Rng,
-    n_steps: usize,
-    scratch: &mut MhScratch,
-    schedule: Option<&EventSchedule>,
+    eta: &mut [f64], nll_current: f64, prop: &ImhProposal, subject: &Subject,
+    model: &CompiledModel, theta: &[f64], omega: &OmegaMatrix, sigma_values: &[f64],
+    rng: &mut impl Rng, n_steps: usize, scratch: &mut MhScratch, schedule: Option<&EventSchedule>,
     counters: &ImhCounters,
 ) -> (usize, f64) {
     let n = eta.len();
@@ -873,15 +812,8 @@ pub(crate) fn imh_steps(
     for _ in 0..n_steps {
         prop.draw_into(rng, &mut z, &mut eta_prop);
         let t0 = std::time::Instant::now();
-        let nll_prop = scratch.score(
-            model,
-            subject,
-            theta,
-            &eta_prop,
-            omega,
-            sigma_values,
-            schedule,
-        );
+        let nll_prop =
+            scratch.score(model, subject, theta, &eta_prop, omega, sigma_values, schedule);
         nll_ns += t0.elapsed().as_nanos() as u64;
         let log_q_prop = prop.log_q(&eta_prop);
         let log_alpha = (nll - nll_prop) + (log_q_cur - log_q_prop);
@@ -907,22 +839,13 @@ impl ImhProposal {
     /// defaults to the identity when `None`. Goes through the production
     /// constructor, so a test of its densities is a test of the real ones.
     pub(crate) fn from_precision(
-        eta_hat: Vec<f64>,
-        precision: &DMatrix<f64>,
-        inflate: f64,
-        defensive: f64,
+        eta_hat: Vec<f64>, precision: &DMatrix<f64>, inflate: f64, defensive: f64,
         omega: Option<&OmegaMatrix>,
     ) -> Option<Self> {
         let n = eta_hat.len();
         let chol_l = floored_cholesky(precision)?;
         let identity = OmegaMatrix::from_diagonal(&vec![1.0; n], vec![String::new(); n]);
-        Some(Self::from_parts(
-            eta_hat,
-            chol_l,
-            inflate,
-            defensive,
-            omega.unwrap_or(&identity),
-        ))
+        Some(Self::from_parts(eta_hat, chol_l, inflate, defensive, omega.unwrap_or(&identity)))
     }
 
     /// The proposal's main-component covariance `c · H̃⁻¹`.

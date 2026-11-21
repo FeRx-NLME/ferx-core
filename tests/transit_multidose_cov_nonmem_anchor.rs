@@ -82,12 +82,8 @@ fn transit_multidose_cov_objective_matches_nonmem() {
     );
 
     let model = parse_model_string(&fixed).expect("fixed-param transit multidose+cov model parses");
-    let pop = read_nonmem_csv(
-        Path::new("data/transit_multidose_cov.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("transit_multidose_cov data loads");
+    let pop = read_nonmem_csv(Path::new("data/transit_multidose_cov.csv"), Some(&["WT"]), None)
+        .expect("transit_multidose_cov data loads");
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;

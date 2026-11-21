@@ -115,9 +115,7 @@ fn strip_inline_markup(text: &str) -> String {
                 i += 1;
             }
             '<' if open_run.is_none()
-                && chars
-                    .get(i + 1)
-                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
+                && chars.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
                 && chars[i..].contains(&'>') =>
             {
                 // Raw inline HTML (`<br>`, `<span class="x">`): pandoc builds
@@ -196,11 +194,7 @@ impl IdAssigner {
         }
         let base = slug(heading_text);
         let n = self.seen.entry(base.clone()).or_insert(0);
-        let assigned = if *n == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{n}")
-        };
+        let assigned = if *n == 0 { base.clone() } else { format!("{base}-{n}") };
         *n += 1;
         (assigned, base)
     }
@@ -291,10 +285,7 @@ mod tests {
     #[test]
     fn raw_inline_html_contributes_no_tag_text() {
         assert_eq!(slug("Line<br>break"), "linebreak");
-        assert_eq!(
-            slug("<span class=\"x\">Tagged</span> title"),
-            "tagged-title"
-        );
+        assert_eq!(slug("<span class=\"x\">Tagged</span> title"), "tagged-title");
         // A bare `<` that is not a tag is deleted like any other punctuation,
         // and must not swallow the text after it.
         assert_eq!(slug("When x < y holds"), "when-x-y-holds");
@@ -335,20 +326,14 @@ mod tests {
         // Pandoc emits an author-written id verbatim, and a LATER auto id that
         // collides with it is the one that gets the suffix.
         assert_eq!(ids.assign("Syntax"), ("syntax".into(), "syntax".into()));
-        assert_eq!(
-            ids.assign("Anything {#syntax}"),
-            ("syntax".into(), "syntax".into())
-        );
+        assert_eq!(ids.assign("Anything {#syntax}"), ("syntax".into(), "syntax".into()));
         assert_eq!(ids.assign("Syntax"), ("syntax-2".into(), "syntax".into()));
     }
 
     #[test]
     fn an_auto_id_colliding_with_an_earlier_explicit_one_is_suffixed() {
         let mut ids = IdAssigner::new();
-        assert_eq!(
-            ids.assign("Anything {#syntax}"),
-            ("syntax".into(), "syntax".into())
-        );
+        assert_eq!(ids.assign("Anything {#syntax}"), ("syntax".into(), "syntax".into()));
         assert_eq!(ids.assign("Syntax"), ("syntax-1".into(), "syntax".into()));
     }
 

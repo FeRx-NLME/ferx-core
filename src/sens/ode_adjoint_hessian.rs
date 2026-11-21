@@ -57,29 +57,17 @@ pub(super) struct Dir {
 
 impl Dir {
     fn x(i: usize, eta: Vec<f64>) -> Self {
-        Dir {
-            x: Some(i),
-            z: None,
-            eta,
-        }
+        Dir { x: Some(i), z: None, eta }
     }
 
     #[cfg(feature = "nn")]
     fn eta(k: usize, n: usize) -> Self {
-        Dir {
-            x: None,
-            z: None,
-            eta: (0..n).map(|m| if m == k { 1.0 } else { 0.0 }).collect(),
-        }
+        Dir { x: None, z: None, eta: (0..n).map(|m| if m == k { 1.0 } else { 0.0 }).collect() }
     }
 
     #[cfg(feature = "nn")]
     fn z(k: usize) -> Self {
-        Dir {
-            x: None,
-            z: Some(k),
-            eta: Vec::new(),
-        }
+        Dir { x: None, z: Some(k), eta: Vec::new() }
     }
 }
 
@@ -89,12 +77,8 @@ impl Dir {
 /// `[η, κ]` under IOV) for `unpack_params(x)`.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_cov_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hat: &[f64],
-    objective: Objective,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
+    eta_hat: &[f64], objective: Objective,
 ) -> Option<DMatrix<f64>> {
     let pt = PackedPoint::new(template, x)?;
     subject_adjoint_cov_hessian_at(model, subject, &pt, eta_hat, objective)
@@ -103,10 +87,7 @@ pub(crate) fn subject_adjoint_cov_hessian(
 /// `subject_adjoint_cov_hessian` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`] the caller unpacked once for its
 /// population.
 pub(crate) fn subject_adjoint_cov_hessian_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
     match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Full)? {
@@ -120,24 +101,13 @@ pub(crate) fn subject_adjoint_cov_hessian_at(
 /// without the dense block — what the #2159 identity-scale pre-flight reads its candidates'
 /// curvature from. `None` outside the adjoint's scope or for an axis past `x`.
 pub(crate) fn subject_adjoint_cov_diag_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    axes: &[usize],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, axes: &[usize],
 ) -> Option<Vec<f64>> {
     if axes.iter().any(|&i| i >= pt.x.len()) {
         return None;
     }
-    match cov_hessian(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        objective,
-        HessianSel::Diag(axes),
-    )? {
+    match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Diag(axes))? {
         HessianOut::Diag(d) => Some(d),
         HessianOut::Full(_) | HessianOut::Block(..) => None,
     }
@@ -148,12 +118,8 @@ pub(crate) fn subject_adjoint_cov_diag_at(
 /// instead of `x.len()` — what a profiled fit's covariance step reads its structural and
 /// level blocks from (#2109). `None` outside the adjoint's scope or for an axis past `x`.
 pub(crate) fn subject_adjoint_cov_block_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    axes: &[usize],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, axes: &[usize],
 ) -> Option<DMatrix<f64>> {
     subject_adjoint_cov_block_with_gradient_at(model, subject, pt, eta_hat, objective, axes)
         .map(|(_, h)| h)
@@ -164,24 +130,13 @@ pub(crate) fn subject_adjoint_cov_block_at(
 /// that needs both (a log-packed coordinate's second derivative takes `−∂/∂x` on its diagonal)
 /// records one pass, not a Hessian and a second gradient.
 pub(crate) fn subject_adjoint_cov_block_with_gradient_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    axes: &[usize],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, axes: &[usize],
 ) -> Option<(Vec<f64>, DMatrix<f64>)> {
     if axes.iter().any(|&i| i >= pt.x.len()) {
         return None;
     }
-    match cov_hessian(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        objective,
-        HessianSel::Block(axes),
-    )? {
+    match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Block(axes))? {
         HessianOut::Block(g, h) => Some((g, h)),
         HessianOut::Full(_) | HessianOut::Diag(_) => None,
     }
@@ -221,12 +176,8 @@ impl HessianOut {
 /// The dispatch shared by [`subject_adjoint_cov_hessian_at`] and
 /// [`subject_adjoint_cov_diag_at`].
 fn cov_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    sel: HessianSel<'_>,
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, sel: HessianSel<'_>,
 ) -> Option<HessianOut> {
     if super::marginal_refused(model, subject, objective) {
         // The refusal sentinel is constant: its Hessian is the zero matrix.
@@ -249,12 +200,8 @@ fn cov_hessian(
 /// predictor's Jacobian (Almquist Eq. 48), FOCE's frozen-variance mode included.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_eta_dx(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hat: &[f64],
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
+    eta_hat: &[f64], interaction: bool,
 ) -> Option<Vec<DVector<f64>>> {
     let pt = PackedPoint::new(template, x)?;
     subject_adjoint_eta_dx_at(model, subject, &pt, eta_hat, interaction)
@@ -263,29 +210,19 @@ pub(crate) fn subject_adjoint_eta_dx(
 /// `subject_adjoint_eta_dx` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
 #[cfg(test)]
 fn subject_adjoint_eta_dx_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<DVector<f64>>> {
     let (template, x) = (pt.template, pt.x);
-    let objective = if interaction {
-        Objective::Focei
-    } else {
-        Objective::Foce
-    };
+    let objective = if interaction { Objective::Focei } else { Objective::Foce };
     let sc = super::scope(model, subject, pt, eta_hat)?;
     let ctx = LikCtx::new(sc.model, subject, sc.params);
     let so = stacked_omega(sc.model, subject, template, sc.params, sc.width);
     let plan = CovPlan::new(&ctx, &sc, subject, template, x, objective, &so, None);
     let (_, eta_x) = mode_response(&plan, &x_dirs(x.len()))?;
-    let cols: Vec<DVector<f64>> = (0..x.len())
-        .map(|i| DVector::from_fn(sc.width, |k, _| eta_x[(k, i)]))
-        .collect();
-    cols.iter()
-        .all(|c| c.iter().all(|v| v.is_finite()))
-        .then_some(cols)
+    let cols: Vec<DVector<f64>> =
+        (0..x.len()).map(|i| DVector::from_fn(sc.width, |k, _| eta_x[(k, i)])).collect();
+    cols.iter().all(|c| c.iter().all(|v| v.is_finite())).then_some(cols)
 }
 
 /// Whether the profile Hessian serves a model's non-Gaussian endpoints (TTE, binary, CTMM)
@@ -371,11 +308,7 @@ thread_local! {
 }
 
 fn hessian_with(
-    sc: &Scoped,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    objective: Objective,
+    sc: &Scoped, subject: &Subject, template: &ModelParameters, x: &[f64], objective: Objective,
     sel: HessianSel<'_>,
 ) -> Option<HessianOut> {
     let (model, params) = (sc.model, sc.params);
@@ -387,16 +320,8 @@ fn hessian_with(
     if let Some(red) = NnReduction::build(model, subject, template, &params.theta)
         .filter(|_| !nn_reduce_off() && !matches!(sel, HessianSel::Block(_)))
     {
-        let plan = CovPlan::new(
-            &ctx,
-            sc,
-            subject,
-            template,
-            x,
-            objective,
-            &so,
-            Some(red.z.as_slice()),
-        );
+        let plan =
+            CovPlan::new(&ctx, sc, subject, template, x, objective, &so, Some(red.z.as_slice()));
         if let Some(h) = red.hessian(model, &plan, template, x, sc.width, sel) {
             #[cfg(test)]
             NN_REDUCED_HITS.with(|c| c.set(c.get() + 1));
@@ -457,9 +382,7 @@ fn psi_diag(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<Vec<f64>> {
 /// switch, a reverse per direction), then `lane(i, ∂Ψ_w/∂u_i, along)` for each direction `i`
 /// in the pass, where `along(d)` reads `d`'s component of the column `∇²Ψ_w u_i`.
 fn psi_lanes(
-    plan: &CovPlan<'_>,
-    w: &[f64],
-    dirs: &[Dir],
+    plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir],
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let declined = plan.st_declined.get();
@@ -473,9 +396,7 @@ fn psi_lanes(
 
 /// [`psi_lanes`]' passes at the width the plan's kernel takes.
 fn psi_passes(
-    plan: &CovPlan<'_>,
-    w: &[f64],
-    dirs: &[Dir],
+    plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir],
     lane: &mut impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
@@ -580,10 +501,7 @@ impl<'s> NnReduction<'s> {
     /// `None` when the reduction does not hold (a weight read directly, an input that
     /// varies over the subject's records) or does not pay (fewer weights than outputs).
     pub(super) fn build(
-        model: &CompiledModel,
-        subject: &'s Subject,
-        template: &ModelParameters,
-        theta: &[f64],
+        model: &CompiledModel, subject: &'s Subject, template: &ModelParameters, theta: &[f64],
     ) -> Option<Self> {
         if model.covariate_nns.is_empty()
             || !crate::sens::provider::nn_output_chain_supported(model)
@@ -602,17 +520,10 @@ impl<'s> NnReduction<'s> {
             let rep = crate::estimation::nn_theta_gradient::static_nn_input_map(subject, names)?;
             // Every recording reads the subject-static map or a per-record one; both must
             // give these outputs.
-            if names
-                .iter()
-                .any(|k| rep.get(k) != subject.covariates.get(k))
-            {
+            if names.iter().any(|k| rep.get(k) != subject.covariates.get(k)) {
                 return None;
             }
-            z.push(
-                nn.mapper
-                    .forward_raw(&theta[nn.weights_offset..end], rep)
-                    .ok()?,
-            );
+            z.push(nn.mapper.forward_raw(&theta[nn.weights_offset..end], rep).ok()?);
             nets.push((nn.weights_offset, n_w, rep));
         }
         let n_w: usize = nets.iter().map(|n| n.1).sum();
@@ -621,13 +532,8 @@ impl<'s> NnReduction<'s> {
     }
 
     fn hessian(
-        &self,
-        model: &CompiledModel,
-        plan: &CovPlan<'_>,
-        template: &ModelParameters,
-        x: &[f64],
-        width: usize,
-        sel: HessianSel<'_>,
+        &self, model: &CompiledModel, plan: &CovPlan<'_>, template: &ModelParameters, x: &[f64],
+        width: usize, sel: HessianSel<'_>,
     ) -> Option<HessianOut> {
         let n = x.len();
         let n_z: usize = self.z.iter().map(Vec::len).sum();
@@ -640,11 +546,8 @@ impl<'s> NnReduction<'s> {
         let (jz, hz) = self.network_jets(model, plan.subject, template, x)?;
 
         // The mode's response along the rest axes and the outputs.
-        let along: Vec<Dir> = rest
-            .iter()
-            .map(|&i| Dir::x(i, Vec::new()))
-            .chain((0..n_z).map(Dir::z))
-            .collect();
+        let along: Vec<Dir> =
+            rest.iter().map(|&i| Dir::x(i, Vec::new())).chain((0..n_z).map(Dir::z)).collect();
         let (w, resp) = mode_response(plan, &along)?;
         let basis: Vec<Dir> = rest
             .iter()
@@ -711,11 +614,7 @@ impl<'s> NnReduction<'s> {
     /// nonzero `∂²z_k/∂x_a∂x_b` over its network's weights, through θ's packing chain.
     #[allow(clippy::type_complexity)]
     fn network_jets(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        template: &ModelParameters,
-        x: &[f64],
+        &self, model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     ) -> Option<(Vec<(usize, Vec<f64>)>, Vec<Vec<((usize, usize), f64)>>)> {
         let n_z: usize = self.z.iter().map(Vec::len).sum();
         let mut jz: Vec<(usize, Vec<f64>)> = Vec::new();
@@ -732,9 +631,7 @@ impl<'s> NnReduction<'s> {
             // pass (as `psi_lanes`, #2980).
             let record = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
                 let th = unpack_theta(template, |m| lv[m]);
-                let out = model.covariate_nns[net]
-                    .mapper
-                    .forward_raw_g(&th[off..off + n_w], cov);
+                let out = model.covariate_nns[net].mapper.forward_raw_g(&th[off..off + n_w], cov);
                 (out.len() == mlp_out).then_some(out)
             };
             let variant = super::kernel::variant_of(&(7u8, net, off, n_w));
@@ -743,13 +640,7 @@ impl<'s> NnReduction<'s> {
                 let (layout, l) = if dirs.is_empty() {
                     (Layout::F64, 1)
                 } else {
-                    (
-                        Layout {
-                            tan: width as u8,
-                            ..Layout::F64
-                        },
-                        1 + width,
-                    )
+                    (Layout { tan: width as u8, ..Layout::F64 }, 1 + width)
                 };
                 let mut inputs = vec![0.0; n_th * l];
                 for (m, &v) in x[..n_th].iter().enumerate() {
@@ -770,9 +661,7 @@ impl<'s> NnReduction<'s> {
             };
             let kr = run(&[])?;
             let unit = |o: usize| -> Vec<f64> {
-                (0..mlp_out)
-                    .map(|c| if c == o { 1.0 } else { 0.0 })
-                    .collect()
+                (0..mlp_out).map(|c| if c == o { 1.0 } else { 0.0 }).collect()
             };
             let rows = kr.reverse_values(&(0..mlp_out).map(unit).collect::<Vec<_>>())?;
             for (o, row) in rows.iter().enumerate() {
@@ -898,14 +787,8 @@ struct Slots {
 impl Slots {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        n: usize,
-        n_obs: usize,
-        n_rows: usize,
-        lb: usize,
-        has_pop: bool,
-        nb: Option<usize>,
-        nx: usize,
-        n_nodes: usize,
+        n: usize, n_obs: usize, n_rows: usize, lb: usize, has_pop: bool, nb: Option<usize>,
+        nx: usize, n_nodes: usize,
     ) -> Self {
         let pop = n_rows * lb;
         let ng = pop + if has_pop { n_obs } else { 0 };
@@ -950,10 +833,7 @@ impl Slots {
 /// where some chunk has no such kernel — one forward per axis. Either way one [`Kept`] per axis,
 /// as a one-tangent run keeps it; `None` where a run fails or the guard does not hold.
 fn rows_or_each(
-    pl: &PlanArc,
-    n: usize,
-    inputs: impl Fn(usize) -> (Vec<f64>, Vec<f64>),
-    base: Layout,
+    pl: &PlanArc, n: usize, inputs: impl Fn(usize) -> (Vec<f64>, Vec<f64>), base: Layout,
     n_obs: usize,
 ) -> Option<Vec<Kept>> {
     let lt = Layout { tan: 1, ..base };
@@ -961,10 +841,7 @@ fn rows_or_each(
     // The packed inputs' values (the base lanes) and, per axis, their tangents.
     let packed: Vec<(Vec<f64>, Vec<f64>)> = (0..n).map(&inputs).collect();
     let split = |v: &[f64], tan: bool| -> Vec<f64> {
-        v.chunks(w)
-            .flat_map(|s| if tan { &s[l..] } else { &s[..l] })
-            .copied()
-            .collect()
+        v.chunks(w).flat_map(|s| if tan { &s[l..] } else { &s[..l] }).copied().collect()
     };
     if let Some(&(ref u0, ref p0)) = packed.first().filter(|_| pl.rows_serve(base)) {
         let (u, p) = (split(u0, false), split(p0, false));
@@ -992,12 +869,7 @@ fn rows_or_each(
                             du[o * w + l..(o + 1) * w].copy_from_slice(t);
                         }
                         du[n_obs * w] = 1.0;
-                        Kept {
-                            plan: pl.clone(),
-                            fwd: KeptFwd::Rows(rf.clone()),
-                            layout: lt,
-                            du,
-                        }
+                        Kept { plan: pl.clone(), fwd: KeptFwd::Rows(rf.clone()), layout: lt, du }
                     })
                     .collect(),
             );
@@ -1084,27 +956,16 @@ impl CovRun {
 impl<'a> CovPlan<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        ctx: &'a LikCtx<'a>,
-        sc: &'a Scoped<'a>,
-        subject: &'a Subject,
-        template: &'a ModelParameters,
-        x: &'a [f64],
-        objective: Objective,
-        so: &'a StackedOmega,
+        ctx: &'a LikCtx<'a>, sc: &'a Scoped<'a>, subject: &'a Subject,
+        template: &'a ModelParameters, x: &'a [f64], objective: Objective, so: &'a StackedOmega,
         nn_z: Option<&'a [Vec<f64>]>,
     ) -> Self {
         let nz = nn_z.map_or(0, |z| z.iter().map(Vec::len).sum());
         let n_th = template.theta.len();
         let logp = |m: usize| theta_packs_log(template.theta_lower[m]);
-        let th: Vec<f64> = (0..n_th)
-            .map(|m| if logp(m) { x[m].exp() } else { x[m] })
-            .collect();
-        let d1: Vec<f64> = (0..n_th)
-            .map(|m| if logp(m) { th[m] } else { 1.0 })
-            .collect();
-        let d2: Vec<f64> = (0..n_th)
-            .map(|m| if logp(m) { th[m] } else { 0.0 })
-            .collect();
+        let th: Vec<f64> = (0..n_th).map(|m| if logp(m) { x[m].exp() } else { x[m] }).collect();
+        let d1: Vec<f64> = (0..n_th).map(|m| if logp(m) { th[m] } else { 1.0 }).collect();
+        let d2: Vec<f64> = (0..n_th).map(|m| if logp(m) { th[m] } else { 0.0 }).collect();
         let second = matches!(objective, Objective::Agq { exact: true, .. });
         let (ka, n_agq) = match objective {
             Objective::Foce => (0u8, 0),
@@ -1117,11 +978,8 @@ impl<'a> CovPlan<'a> {
             sc.width,
             &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
         ));
-        let fold = if basis::mu_fold_off() {
-            None
-        } else {
-            MuFold::at(sc.model, subject, &th, &sc.eta)
-        };
+        let fold =
+            if basis::mu_fold_off() { None } else { MuFold::at(sc.model, subject, &th, &sc.eta) };
         CovPlan {
             ctx,
             sc,
@@ -1180,12 +1038,8 @@ impl<'a> CovPlan<'a> {
     /// `p_t(i, a)`).
     #[allow(clippy::too_many_arguments)]
     fn plan_inputs(
-        layout: Layout,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        params: &[f64],
-        p_t: &dyn Fn(usize, usize) -> f64,
-        kt: usize,
+        layout: Layout, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64, params: &[f64],
+        p_t: &dyn Fn(usize, usize) -> f64, kt: usize,
     ) -> (Vec<f64>, Vec<f64>) {
         let (l, lb) = (layout.lanes(), layout.base_lanes());
         let mut u = vec![0.0; eta.len() * l];
@@ -1230,18 +1084,10 @@ impl<'a> CovPlan<'a> {
     /// Run a subject's prediction plan at `(θ, eta)` along `eta_t` (base layout `base`).
     #[allow(clippy::too_many_arguments)]
     fn run_pred(
-        &self,
-        model: &CompiledModel,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        lanes: Lanes<'_>,
-        base: Layout,
-        kt: usize,
+        &self, model: &CompiledModel, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64,
+        lanes: Lanes<'_>, base: Layout, kt: usize,
     ) -> Option<Vec<Kept>> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
+        let layout = Layout { tan: kt as u8, ..base };
         let params = self.pred_values();
         let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
@@ -1265,14 +1111,8 @@ impl<'a> CovPlan<'a> {
             let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[n_obs * layout.lanes()] == 1.0).then(|| {
-                vec![Kept {
-                    plan: pl.clone(),
-                    fwd: KeptFwd::One(fwd),
-                    layout,
-                    du,
-                }]
-            })
+            (du[n_obs * layout.lanes()] == 1.0)
+                .then(|| vec![Kept { plan: pl.clone(), fwd: KeptFwd::One(fwd), layout, du }])
         };
         match self.nn_z {
             Some(z) => super::with_plan_nn(model, self.subject, &self.th, eta, z, None, &mut serve),
@@ -1291,11 +1131,7 @@ impl<'a> CovPlan<'a> {
     /// plan's — θ, and under the reduced basis the network outputs — then σ) at `(θ, σ, eta)`
     /// along `eta_t`; σ's tangent along a direction moving its packed coordinate is `dσ/dx = σ`.
     fn run_var(
-        &self,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        lanes: Lanes<'_>,
-        base: Layout,
+        &self, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64, lanes: Lanes<'_>, base: Layout,
         kt: usize,
     ) -> Option<Vec<Kept>> {
         // Several axes: one run each (a single axis is the one-tangent run below).
@@ -1310,10 +1146,7 @@ impl<'a> CovPlan<'a> {
                     .collect();
             }
         }
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
+        let layout = Layout { tan: kt as u8, ..base };
         let sigma = self.sc.params.sigma.values.as_slice();
         let mut params = self.pred_values();
         params.extend_from_slice(sigma);
@@ -1323,14 +1156,8 @@ impl<'a> CovPlan<'a> {
             let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[n_obs * layout.lanes()] == 1.0).then(|| {
-                vec![Kept {
-                    plan: pl.clone(),
-                    fwd: KeptFwd::One(fwd),
-                    layout,
-                    du,
-                }]
-            })
+            (du[n_obs * layout.lanes()] == 1.0)
+                .then(|| vec![Kept { plan: pl.clone(), fwd: KeptFwd::One(fwd), layout, du }])
         };
         match self.nn_z {
             Some(z) => super::with_plan_nn(
@@ -1356,11 +1183,7 @@ impl<'a> CovPlan<'a> {
 
     /// Run the subject's non-Gaussian term plan at `(θ, eta)` along `eta_t` (base `base`).
     fn run_term(
-        &self,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        lanes: Lanes<'_>,
-        base: Layout,
+        &self, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64, lanes: Lanes<'_>, base: Layout,
         kt: usize,
     ) -> Option<Vec<Kept>> {
         // Several axes: one run each (a single axis is the one-tangent run below).
@@ -1375,24 +1198,15 @@ impl<'a> CovPlan<'a> {
                     .collect();
             }
         }
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
+        let layout = Layout { tan: kt as u8, ..base };
         let plans = super::terms::non_gaussian_plans(self.sc.model, self.subject, &self.th, eta)?;
         let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let (u, p) = Self::plan_inputs(layout, eta, eta_t, &self.th, &p_t, kt);
         plans.iter().find_map(|pl| {
             let mut du = vec![0.0; 2 * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[layout.lanes()] == 1.0).then(|| {
-                vec![Kept {
-                    plan: pl.clone(),
-                    fwd: KeptFwd::One(fwd),
-                    layout,
-                    du,
-                }]
-            })
+            (du[layout.lanes()] == 1.0)
+                .then(|| vec![Kept { plan: pl.clone(), fwd: KeptFwd::One(fwd), layout, du }])
         })
     }
 
@@ -1410,20 +1224,10 @@ impl<'a> CovPlan<'a> {
         let pn = sc.width;
         let nq = if self.second { pn * (pn + 1) / 2 } else { 0 };
         let eta = &sc.eta[..pn];
-        let eta_t = |k: usize, a: usize| {
-            dirs.get(a)
-                .and_then(|d| d.eta.get(k))
-                .copied()
-                .unwrap_or(0.0)
-        };
+        let eta_t =
+            |k: usize, a: usize| dirs.get(a).and_then(|d| d.eta.get(k)).copied().unwrap_or(0.0);
         // The predictions with their η-jets, and an SDE's variance rows beside them.
-        let base = Layout {
-            n: pn as u16,
-            m: nq as u16,
-            th: false,
-            wide: false,
-            tan: 0,
-        };
+        let base = Layout { n: pn as u16, m: nq as u16, th: false, wide: false, tan: 0 };
         let n_par = self.th.len() + self.nz;
         let n_sig = self.sc.params.sigma.values.len();
         let pred = if n_obs > 0 {
@@ -1502,11 +1306,7 @@ impl<'a> CovPlan<'a> {
         } else {
             None
         };
-        let n_nodes = if is_agq && n_agq > 1 {
-            agq_grid(n_agq, sc.width).len()
-        } else {
-            0
-        };
+        let n_nodes = if is_agq && n_agq > 1 { agq_grid(n_agq, sc.width).len() } else { 0 };
         let slots = Slots::new(
             pn,
             n_obs,
@@ -1535,54 +1335,29 @@ impl<'a> CovPlan<'a> {
         if let Some(pk) = pred.as_ref() {
             for j in 0..n_obs {
                 for x in 0..lb {
-                    put!(slots.f(j, x), po(pk, j, x, None), &|a| po(
-                        pk,
-                        j,
-                        x,
-                        Some(a)
-                    ));
+                    put!(slots.f(j, x), po(pk, j, x, None), &|a| po(pk, j, x, Some(a)));
                 }
             }
         }
         if let Some(vk) = var.as_ref() {
             for j in 0..n_obs {
                 for x in 0..lb {
-                    put!(slots.f(n_obs + j, x), po(vk, j, x, None), &|a| po(
-                        vk,
-                        j,
-                        x,
-                        Some(a)
-                    ));
+                    put!(slots.f(n_obs + j, x), po(vk, j, x, None), &|a| po(vk, j, x, Some(a)));
                 }
             }
         }
         if let Some(pp) = pop.as_ref() {
             for j in 0..n_obs {
-                put!(slots.pop + j, po(pp, j, 0, None), &|a| po(
-                    pp,
-                    j,
-                    0,
-                    Some(a)
-                ));
+                put!(slots.pop + j, po(pp, j, 0, None), &|a| po(pp, j, 0, Some(a)));
             }
         }
         if let Some(t) = ng.as_ref() {
             put!(slots.ng, po(t, 0, 0, None), &|a| po(t, 0, 0, Some(a)));
             for k in 0..nb {
-                put!(slots.ng_g(k), po(t, 0, 1 + k, None), &|a| po(
-                    t,
-                    0,
-                    1 + k,
-                    Some(a)
-                ));
+                put!(slots.ng_g(k), po(t, 0, 1 + k, None), &|a| po(t, 0, 1 + k, Some(a)));
                 for l in 0..=k {
                     let h = super::terms::h_lane(nb, k, l);
-                    put!(slots.ng_h(k, l), po(t, 0, h, None), &|a| po(
-                        t,
-                        0,
-                        h,
-                        Some(a)
-                    ));
+                    put!(slots.ng_h(k, l), po(t, 0, h, None), &|a| po(t, 0, h, Some(a)));
                 }
             }
         }
@@ -1600,14 +1375,7 @@ impl<'a> CovPlan<'a> {
         }
         let record_k1 = |lv: &[kj::Tr]| self.record(&slots, lv, true);
         let record_k2 = |lv: &[kj::Tr]| self.record(&slots, lv, false);
-        let layout_k = if kt > 0 {
-            Layout {
-                tan: kt as u8,
-                ..Layout::F64
-            }
-        } else {
-            Layout::F64
-        };
+        let layout_k = if kt > 0 { Layout { tan: kt as u8, ..Layout::F64 } } else { Layout::F64 };
         // The quadrature's nodes: stage 1, then the node predictions (and term values) there.
         let mut nodes = Vec::new();
         // A structured quadrature subject's pass takes its nodes from the structured stage 1.
@@ -1672,11 +1440,12 @@ impl<'a> CovPlan<'a> {
                         &|lanes, et, k| self.run_var(&bv, et, lanes, Layout::F64, k),
                     )?;
                     for j in 0..n_obs {
-                        put!(
-                            slots.nf + nd * n_rows + n_obs + j,
-                            po(&fv, j, 0, None),
-                            &|a| po(&fv, j, 0, Some(a))
-                        );
+                        put!(slots.nf + nd * n_rows + n_obs + j, po(&fv, j, 0, None), &|a| po(
+                            &fv,
+                            j,
+                            0,
+                            Some(a)
+                        ));
                     }
                     Some(fv)
                 } else {
@@ -1694,12 +1463,7 @@ impl<'a> CovPlan<'a> {
                         kt,
                         &|lanes, et, k| self.run_term(&bb, et, lanes, Layout::F64, k),
                     )?;
-                    put!(slots.nq_node + nd, po(&t, 0, 0, None), &|a| po(
-                        &t,
-                        0,
-                        0,
-                        Some(a)
-                    ));
+                    put!(slots.nq_node + nd, po(&t, 0, 0, None), &|a| po(&t, 0, 0, Some(a)));
                     Some(t)
                 } else {
                     None
@@ -1765,34 +1529,23 @@ impl<'a> CovPlan<'a> {
         let n_rows = sl.n_rows;
         let pn = sc.width;
         let f: Vec<T> = (0..n_rows).map(|j| lv[sl.f(j, 0)]).collect();
-        let g: Vec<Vec<T>> = (0..n_rows)
-            .map(|j| (0..pn).map(|k| lv[sl.f(j, 1 + k)]).collect())
-            .collect();
+        let g: Vec<Vec<T>> =
+            (0..n_rows).map(|j| (0..pn).map(|k| lv[sl.f(j, 1 + k)]).collect()).collect();
         let eo: Vec<T> = (0..pn).map(|k| lv[sl.eta + k]).collect();
         let xl = &lv[sl.x..sl.x + self.nx];
         let xo = |i: usize| xl[i];
         let theta: Vec<T> = unpack_theta(template, xo);
         let p = population_params(model, subject, template, sc.params, self.so, &theta, xo)?;
-        let fpop: Option<Vec<T>> = sl
-            .has_pop
-            .then(|| (0..n_obs).map(|j| lv[sl.pop + j]).collect());
+        let fpop: Option<Vec<T>> = sl.has_pop.then(|| (0..n_obs).map(|j| lv[sl.pop + j]).collect());
         let ng = sl.has_ng.then(|| {
             let nb = sl.nb;
             crate::sens::focei_kernel::NonGauss {
                 q: lv[sl.ng],
-                g: (0..pn)
-                    .map(|k| if k < nb { lv[sl.ng_g(k)] } else { c(0.0) })
-                    .collect(),
+                g: (0..pn).map(|k| if k < nb { lv[sl.ng_g(k)] } else { c(0.0) }).collect(),
                 h: (0..pn)
                     .map(|k| {
                         (0..pn)
-                            .map(|l| {
-                                if k < nb && l < nb {
-                                    lv[sl.ng_h(k, l)]
-                                } else {
-                                    c(0.0)
-                                }
-                            })
+                            .map(|l| if k < nb && l < nb { lv[sl.ng_h(k, l)] } else { c(0.0) })
                             .collect()
                     })
                     .collect(),
@@ -1820,11 +1573,7 @@ impl<'a> CovPlan<'a> {
                 // FOCEI's H̃ — jittered as production's proposal is.
                 let mut h_a: Vec<Vec<T>> = if exact {
                     let q: Vec<Vec<T>> = (0..n_rows)
-                        .map(|j| {
-                            (0..pn * (pn + 1) / 2)
-                                .map(|t| lv[sl.f(j, 1 + pn + t)])
-                                .collect()
-                        })
+                        .map(|j| (0..pn * (pn + 1) / 2).map(|t| lv[sl.f(j, 1 + pn + t)]).collect())
                         .collect();
                     crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &f, &g, &q, &eo, &p)?
                 } else {
@@ -1876,11 +1625,7 @@ impl<'a> CovPlan<'a> {
                             .map(|k| eo[k] + c(std::f64::consts::SQRT_2) * step[k])
                             .collect();
                         let fb: Vec<T> = (0..n_rows).map(|j| lv[sl.nf + nd * n_rows + j]).collect();
-                        let qb = if sl.has_ng {
-                            lv[sl.nq_node + nd]
-                        } else {
-                            c(0.0)
-                        };
+                        let qb = if sl.has_ng { lv[sl.nq_node + nd] } else { c(0.0) };
                         terms.push(c(*cw) - (inner_l(ctx, &fb, &b, &p, None)? + qb));
                     }
                     half_logdet - log_sum_exp(&terms)
@@ -2060,14 +1805,8 @@ impl<'a> CovPlan<'a> {
     /// its reverse seeded with the kernel's adjoints of them; θ, network outputs and η into
     /// `rows`. Returns the η-input adjoints per seed (all lanes), for a node's location.
     fn plan_reverse(
-        &self,
-        kept: &PlanRun,
-        r: &CovRun,
-        adj: &[Vec<f64>],
-        slot: &dyn Fn(usize) -> usize,
-        n_out: usize,
-        tangent: bool,
-        rows: &mut [Vec<f64>],
+        &self, kept: &PlanRun, r: &CovRun, adj: &[Vec<f64>], slot: &dyn Fn(usize) -> usize,
+        n_out: usize, tangent: bool, rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
         let s2 = |j: usize, x: usize| if x == 0 { slot(j) } else { usize::MAX };
         self.plan_reverse_lanes(kept, r, adj, &s2, n_out, 1, tangent, rows)
@@ -2079,15 +1818,8 @@ impl<'a> CovPlan<'a> {
     /// the plan's adjoints come back in the same form.
     #[allow(clippy::too_many_arguments)]
     fn plan_reverse_lanes(
-        &self,
-        pr: &PlanRun,
-        r: &CovRun,
-        adj: &[Vec<f64>],
-        slot: &dyn Fn(usize, usize) -> usize,
-        n_out: usize,
-        nl: usize,
-        tangent: bool,
-        rows: &mut [Vec<f64>],
+        &self, pr: &PlanRun, r: &CovRun, adj: &[Vec<f64>], slot: &dyn Fn(usize, usize) -> usize,
+        n_out: usize, nl: usize, tangent: bool, rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
         let kept = match pr {
             PlanRun::Direct(k) => k,
@@ -2120,11 +1852,9 @@ impl<'a> CovPlan<'a> {
         let (nu, np) = (n_eta * l, n_par * l);
         let (mut ub, mut pb) = (kj::Buf::new(ns * nu), kj::Buf::new(ns * np));
         let swept = if tangent {
-            kept.plan
-                .reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar)
+            kept.plan.reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar)
         } else {
-            kept.plan
-                .reverse_from(kept.fwd.one()?, kept.layout, ns, &mut ub, &mut pb, &du_bar)
+            kept.plan.reverse_from(kept.fwd.one()?, kept.layout, ns, &mut ub, &mut pb, &du_bar)
         };
         if !swept {
             return None;
@@ -2233,12 +1963,7 @@ fn untri(t: usize) -> (usize, usize) {
 }
 /// `(F, ∇_η l)` for FOCE / FOCEI (`objective`).
 fn objective_terms<T: PkNum>(
-    ctx: &LikCtx,
-    interaction: bool,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    fpop: Option<&[T]>,
+    ctx: &LikCtx, interaction: bool, f: &[T], g: &[Vec<T>], eta: &[T], fpop: Option<&[T]>,
     p: &ParT<T>,
 ) -> Option<(T, Vec<T>)> {
     objective(ctx, interaction, f, g, eta, fpop, p)
@@ -2247,25 +1972,13 @@ fn objective_terms<T: PkNum>(
 /// Ω (Cholesky entries), σ, ρ, the serial ρ and the custom residual magnitude as the
 /// kernel reads them, from the packed coordinates `xo` through their packing chains.
 fn population_params<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    params: &ModelParameters,
-    so: &StackedOmega,
-    theta: &[T],
-    xo: impl Fn(usize) -> T,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, params: &ModelParameters,
+    so: &StackedOmega, theta: &[T], xo: impl Fn(usize) -> T,
 ) -> Option<ParT<T>> {
-    let mut l: Vec<Vec<T>> = so
-        .chol
-        .iter()
-        .map(|r| r.iter().map(|&v| T::from_f64(v)).collect())
-        .collect();
+    let mut l: Vec<Vec<T>> =
+        so.chol.iter().map(|r| r.iter().map(|&v| T::from_f64(v)).collect()).collect();
     for (idx, at, _) in &so.placed {
-        let e = if at[0].0 == at[0].1 {
-            xo(*idx).exp()
-        } else {
-            xo(*idx)
-        };
+        let e = if at[0].0 == at[0].1 { xo(*idx).exp() } else { xo(*idx) };
         for &(i, j) in at {
             l[i][j] = e;
         }
@@ -2282,9 +1995,7 @@ fn population_params<T: crate::sens::num::vm::VmNum>(
     };
     Some(ParT {
         omega: OmegaT::from_chol(l)?,
-        sigma: (0..params.sigma.values.len())
-            .map(|k| xo(seg.sigma_start() + k).exp())
-            .collect(),
+        sigma: (0..params.sigma.values.len()).map(|k| xo(seg.sigma_start() + k).exp()).collect(),
         // ρ = tanh(z), the Fisher-z packing (`rho_chain` = 1 − ρ²).
         rho: (0..params.residual_correlations.len())
             .map(|k| {
@@ -2301,12 +2012,6 @@ fn population_params<T: crate::sens::num::vm::VmNum>(
 /// θ from its packed coordinates on any number type: `exp(x)` when log-packed.
 fn unpack_theta<T: PkNum>(template: &ModelParameters, xd: impl Fn(usize) -> T) -> Vec<T> {
     (0..template.theta.len())
-        .map(|m| {
-            if theta_packs_log(template.theta_lower[m]) {
-                xd(m).exp()
-            } else {
-                xd(m)
-            }
-        })
+        .map(|m| if theta_packs_log(template.theta_lower[m]) { xd(m).exp() } else { xd(m) })
         .collect()
 }

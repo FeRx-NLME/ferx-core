@@ -91,11 +91,7 @@ fn arm_a5(entry: f64) -> String {
 /// this arm runs the dedicated engine. Unlike A4's reset at 15, it cannot zero the hazard
 /// accumulated before the event, so the record's `[5, 10]` window reaches `H(20)`.
 fn arm_a6(record: bool) -> String {
-    let record_row = if record {
-        "1,5,.,0,.,2,0,1,0,0,0\n"
-    } else {
-        ""
-    };
+    let record_row = if record { "1,5,.,0,.,2,0,1,0,0,0\n" } else { "" };
     format!(
         "{HEADER}{record_row}\
          1,10,.,1,100,1,0,1,0,0,0\n\
@@ -173,10 +169,7 @@ fn prestart_entry_matches_no_entry_on_the_shared_engine() {
     // file would notice. The first record is the dose at 10, so 12 is post-start and must move
     // the objective by `H(12) > 0`.
     let post = ofv(&arm_a1(12.0));
-    assert!(
-        post.is_finite(),
-        "A1 with a post-start TENTRY must be finite: {post}"
-    );
+    assert!(post.is_finite(), "A1 with a post-start TENTRY must be finite: {post}");
     assert!(
         (post - none).abs() > 1e-6,
         "A1: a post-start TENTRY must change the objective — TENTRY=12 {post} vs TENTRY=0 {none}"

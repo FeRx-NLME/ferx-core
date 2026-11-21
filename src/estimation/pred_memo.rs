@@ -110,9 +110,7 @@ impl PredMemo {
     /// [`MemoMode::Fixed`]; θ free under `newton` is [`MemoMode::Track`]; free θ under a
     /// solver that never revisits a point has no memo.
     pub(crate) fn for_solve(
-        samples: impl IntoIterator<Item = usize>,
-        theta_free: bool,
-        newton: bool,
+        samples: impl IntoIterator<Item = usize>, theta_free: bool, newton: bool,
     ) -> Option<Self> {
         let mode = match (theta_free, newton) {
             (false, _) => MemoMode::Fixed,
@@ -126,10 +124,7 @@ impl PredMemo {
             retired: AtomicBool::new(false),
             #[cfg(test)]
             seen: Default::default(),
-            key: Mutex::new(ThetaKey {
-                theta: None,
-                generation: 0,
-            }),
+            key: Mutex::new(ThetaKey { theta: None, generation: 0 }),
             subjects: samples
                 .into_iter()
                 .map(|k| {
@@ -148,9 +143,7 @@ impl PredMemo {
     /// test reads to see which samples were scored.
     #[cfg(test)]
     pub(crate) fn scored(&self, subject: usize) -> usize {
-        let g = self.subjects[subject]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let g = self.subjects[subject].lock().unwrap_or_else(|e| e.into_inner());
         g.start.iter().filter(|&&s| s != NOT_STORED).count()
     }
 
@@ -200,10 +193,7 @@ impl PredMemo {
                 key.generation += 1;
             }
         }
-        Some(EvalMemo {
-            memo: self,
-            generation: key.generation,
-        })
+        Some(EvalMemo { memo: self, generation: key.generation })
     }
 }
 
@@ -211,12 +201,8 @@ impl PredMemo {
 impl Drop for PredMemo {
     fn drop(&mut self) {
         let [opened, declined] = &self.seen;
-        LAST_SOLVE.with(|c| {
-            c.set((
-                opened.load(Ordering::Relaxed),
-                declined.load(Ordering::Relaxed),
-            ))
-        });
+        LAST_SOLVE
+            .with(|c| c.set((opened.load(Ordering::Relaxed), declined.load(Ordering::Relaxed))));
     }
 }
 
@@ -230,11 +216,7 @@ pub(crate) struct EvalMemo<'a> {
 impl<'a> EvalMemo<'a> {
     /// The slot of `subject`'s `sample`-th sample.
     pub(crate) fn slot(&self, subject: usize, sample: usize) -> MemoSlot<'a> {
-        MemoSlot {
-            eval: *self,
-            subject,
-            sample,
-        }
+        MemoSlot { eval: *self, subject, sample }
     }
 }
 
@@ -250,10 +232,7 @@ pub(crate) struct MemoSlot<'a> {
 /// the borrow's lifetime — a subject has one user at a time, so nothing waits on it).
 pub(crate) enum Preds<'a> {
     Owned(Vec<f64>),
-    Stored {
-        guard: MutexGuard<'a, SubjectPreds>,
-        range: Range<usize>,
-    },
+    Stored { guard: MutexGuard<'a, SubjectPreds>, range: Range<usize> },
 }
 
 impl Deref for Preds<'_> {
@@ -271,15 +250,12 @@ impl Deref for Preds<'_> {
 /// slot holds them, else `compute()`'s, which are then stored. Without a slot, just
 /// `compute()`.
 pub(crate) fn memoized<'a>(
-    slot: Option<MemoSlot<'a>>,
-    compute: impl FnOnce() -> Vec<f64>,
+    slot: Option<MemoSlot<'a>>, compute: impl FnOnce() -> Vec<f64>,
 ) -> Preds<'a> {
     let Some(s) = slot else {
         return Preds::Owned(compute());
     };
-    let mut g = s.eval.memo.subjects[s.subject]
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut g = s.eval.memo.subjects[s.subject].lock().unwrap_or_else(|e| e.into_inner());
     if g.generation != s.eval.generation {
         g.generation = s.eval.generation;
         g.start.fill(NOT_STORED);
@@ -303,10 +279,7 @@ pub(crate) fn memoized<'a>(
     }
     let n_obs = g.n_obs.unwrap_or(0);
     let at = g.start[s.sample] as usize;
-    Preds::Stored {
-        range: at..at + n_obs,
-        guard: g,
-    }
+    Preds::Stored { range: at..at + n_obs, guard: g }
 }
 
 #[cfg(test)]
@@ -366,10 +339,8 @@ mod tests {
         let calls = std::cell::Cell::new(0u32);
         let get = |theta: &[f64]| {
             let ev = memo.begin(theta).expect("a tracking memo always opens");
-            memoized(Some(ev.slot(0, 0)), || {
-                count(&calls, vec![theta[0] * 2.0, theta[0] * 3.0])
-            })
-            .to_vec()
+            memoized(Some(ev.slot(0, 0)), || count(&calls, vec![theta[0] * 2.0, theta[0] * 3.0]))
+                .to_vec()
         };
         let a = get(&[1.0, 5.0]);
         assert_eq!(get(&[1.0, 5.0]), a);
@@ -423,14 +394,8 @@ mod tests {
             capacity < 1000 * 3 / 10,
             "no room is reserved for the 998 samples nobody scored: {capacity}"
         );
-        assert_eq!(
-            memoized(Some(ev.slot(0, 700)), || unreachable!()).to_vec(),
-            [7.0, 7.5, 8.0]
-        );
-        assert_eq!(
-            memoized(Some(ev.slot(0, 3)), || unreachable!()).to_vec(),
-            [3.0, 3.5, 4.0]
-        );
+        assert_eq!(memoized(Some(ev.slot(0, 700)), || unreachable!()).to_vec(), [7.0, 7.5, 8.0]);
+        assert_eq!(memoized(Some(ev.slot(0, 3)), || unreachable!()).to_vec(), [3.0, 3.5, 4.0]);
         assert_eq!(held(), 2 * 3, "a hit stores nothing");
         // A moved θ starts the buffer over: one sample scored, one sample held.
         let moved = memo.begin(&[2.0]).unwrap();
@@ -486,17 +451,10 @@ mod tests {
             assert_eq!(get(&[0.0]).unwrap(), [f64::INFINITY]);
             assert_eq!(calls.get(), 1, "the same bits are served");
             if free {
-                assert_eq!(
-                    get(&[-0.0]).unwrap(),
-                    [f64::NEG_INFINITY],
-                    "Track recomputes"
-                );
+                assert_eq!(get(&[-0.0]).unwrap(), [f64::NEG_INFINITY], "Track recomputes");
                 assert_eq!(calls.get(), 2);
             } else {
-                assert!(
-                    get(&[-0.0]).is_none(),
-                    "Fixed declines another θ, -0.0 included"
-                );
+                assert!(get(&[-0.0]).is_none(), "Fixed declines another θ, -0.0 included");
                 assert_eq!(calls.get(), 1);
             }
             let nan = f64::NAN;

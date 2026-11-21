@@ -81,9 +81,7 @@ fn saem_ofv_defaults_to_saem_and_parses_each_spelling() {
     let parsed = with("saem_ofv_nodes = 13").unwrap();
     assert_eq!(parsed.fit_options.saem_ofv_nodes, 13);
 
-    let err = with("saem_ofv = bogus")
-        .err()
-        .expect("bogus value is rejected");
+    let err = with("saem_ofv = bogus").err().expect("bogus value is rejected");
     assert!(err.contains("saem_ofv must be"), "{err}");
     assert!(with("saem_ofv_samples = 1").is_err());
     assert!(with("saem_ofv_nodes = 1").is_err());
@@ -104,34 +102,18 @@ fn imp_readout_reports_the_is_objective_with_the_foce_value_beside_it() {
 
     // The same seeded SAEM run: the estimates, hence the FOCE value, do not depend on the
     // readout.
-    assert_eq!(
-        imp.theta, focei.theta,
-        "the readout must not move estimates"
-    );
+    assert_eq!(imp.theta, focei.theta, "the readout must not move estimates");
 
-    let obj = imp
-        .saem_objective
-        .as_ref()
-        .expect("imp reports a SAEM objective");
-    let is = imp
-        .importance_sampling
-        .as_ref()
-        .expect("IS result is published");
+    let obj = imp.saem_objective.as_ref().expect("imp reports a SAEM objective");
+    let is = imp.importance_sampling.as_ref().expect("IS result is published");
     assert_eq!(obj.kind, SaemOfv::Imp);
     assert_eq!(imp.ofv.to_bits(), is.minus2_log_likelihood.to_bits());
     assert_eq!(obj.mc_standard_error, Some(is.mc_standard_error));
-    assert_eq!(
-        obj.n_samples,
-        Some(500),
-        "saem_ofv_samples, not imp_samples"
-    );
+    assert_eq!(obj.n_samples, Some(500), "saem_ofv_samples, not imp_samples");
     assert_eq!(is.n_samples, 500);
     assert!(is.mc_standard_error > 0.0 && is.mc_standard_error.is_finite());
 
-    assert!(
-        focei.saem_objective.is_none(),
-        "saem_ofv = focei keeps today's behaviour"
-    );
+    assert!(focei.saem_objective.is_none(), "saem_ofv = focei keeps today's behaviour");
     assert!(focei.importance_sampling.is_none());
     assert_eq!(obj.foce_ofv.to_bits(), focei.ofv.to_bits());
     assert!(
@@ -163,17 +145,11 @@ fn default_saem_fit_reports_the_saem_objective_and_has_no_aic_bic() {
     let focei = warfarin_fit(&short_saem(SaemOfv::Focei));
     let imp = warfarin_fit(&short_saem(SaemOfv::Imp));
 
-    assert_eq!(
-        saem.theta, focei.theta,
-        "the readout must not move estimates"
-    );
+    assert_eq!(saem.theta, focei.theta, "the readout must not move estimates");
     let obj = saem.saem_objective.as_ref().expect("a SAEM objective");
     assert_eq!(obj.kind, SaemOfv::Saem);
     assert!(obj.mc_standard_error.is_none() && obj.n_samples.is_none() && obj.n_nodes.is_none());
-    assert!(
-        saem.importance_sampling.is_none(),
-        "no importance sampling is run"
-    );
+    assert!(saem.importance_sampling.is_none(), "no importance sampling is run");
     assert_eq!(obj.foce_ofv.to_bits(), focei.ofv.to_bits());
     assert!(
         (saem.ofv - focei.ofv).abs() > 1e-6 && (saem.ofv - imp.ofv).abs() > 1e-6,
@@ -202,15 +178,9 @@ fn imp_saem_objective_is_deterministic() {
 /// η and κ draws, averaged inside the log. No fallback, no warning.
 #[test]
 fn iov_models_report_the_saem_objective_with_no_fallback() {
-    let prep = prepare_run(
-        "examples/warfarin_iov_saem.ferx",
-        Some("data/warfarin_iov_saem.csv"),
-    )
-    .expect("prepare");
-    let mut o = FitOptions {
-        saem_ofv: SaemOfv::Saem,
-        ..prep.parsed.fit_options.clone()
-    };
+    let prep = prepare_run("examples/warfarin_iov_saem.ferx", Some("data/warfarin_iov_saem.csv"))
+        .expect("prepare");
+    let mut o = FitOptions { saem_ofv: SaemOfv::Saem, ..prep.parsed.fit_options.clone() };
     o.saem_n_exploration = 10;
     o.saem_n_convergence = 10;
     o.saem_ofv_samples = 200;
@@ -222,11 +192,7 @@ fn iov_models_report_the_saem_objective_with_no_fallback() {
     assert_eq!(obj.kind, SaemOfv::Saem);
     assert!(r.importance_sampling.is_none());
     assert!(r.ofv.is_finite());
-    assert!(
-        !r.warnings.iter().any(|w| w.contains("saem_ofv")),
-        "{:?}",
-        r.warnings
-    );
+    assert!(!r.warnings.iter().any(|w| w.contains("saem_ofv")), "{:?}", r.warnings);
 }
 
 /// `agq`: deterministic, labelled, no Monte-Carlo SE, no IS result; its value agrees with the
@@ -256,12 +222,7 @@ fn agq_readout_is_deterministic_and_agrees_with_is_within_its_se() {
     let mut oi = short_saem(SaemOfv::Imp);
     oi.saem_ofv_samples = 20_000;
     let imp = warfarin_fit(&oi);
-    let se = imp
-        .saem_objective
-        .as_ref()
-        .unwrap()
-        .mc_standard_error
-        .unwrap();
+    let se = imp.saem_objective.as_ref().unwrap().mc_standard_error.unwrap();
     let gap = (eleven.ofv - imp.ofv).abs();
     eprintln!(
         "agq11 {:.5}  agq15 {:.5}  (node gap {node_gap:.2e})  imp(K=20000) {:.5} (SE {se:.4})  \
@@ -269,12 +230,7 @@ fn agq_readout_is_deterministic_and_agrees_with_is_within_its_se() {
         a.ofv, eleven.ofv, imp.ofv
     );
     assert!(node_gap < 0.05, "AGQ is not converged in nodes: {node_gap}");
-    assert!(
-        gap < 3.0 * se,
-        "AGQ {} vs IS {} (SE {se})",
-        eleven.ofv,
-        imp.ofv
-    );
+    assert!(gap < 3.0 * se, "AGQ {} vs IS {} (SE {se})", eleven.ofv, imp.ofv);
     assert!((a.foce_diag() - imp.saem_objective.as_ref().unwrap().foce_ofv).abs() < 1e-9);
 }
 
@@ -319,17 +275,8 @@ fn agq_falls_back_to_imp_beyond_three_random_effects() {
 "#;
     let model = ferx_core::parse_model_string(src).expect("model");
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data");
-    let r = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &short_saem(SaemOfv::Agq),
-    )
-    .expect("fit");
-    let obj = r
-        .saem_objective
-        .as_ref()
-        .expect("falls back to a reported objective");
+    let r = fit(&model, &pop, &model.default_params, &short_saem(SaemOfv::Agq)).expect("fit");
+    let obj = r.saem_objective.as_ref().expect("falls back to a reported objective");
     assert_eq!(obj.kind, SaemOfv::Imp);
     assert!(
         r.warnings
@@ -361,19 +308,10 @@ fn explicit_evaluator_chains_follow_saem_ofv() {
         imp.ofv.to_bits(),
         "the explicit IMP stage is the reported objective under the default too"
     );
-    assert_eq!(
-        by_default.saem_objective.as_ref().map(|o| o.kind),
-        Some(SaemOfv::Imp)
-    );
-    let obj = imp
-        .saem_objective
-        .as_ref()
-        .expect("explicit imp stage is the reported objective");
+    assert_eq!(by_default.saem_objective.as_ref().map(|o| o.kind), Some(SaemOfv::Imp));
+    let obj = imp.saem_objective.as_ref().expect("explicit imp stage is the reported objective");
     let is = imp.importance_sampling.as_ref().unwrap();
-    assert_eq!(
-        is.n_samples, 400,
-        "the chain's own imp_samples, not saem_ofv_samples"
-    );
+    assert_eq!(is.n_samples, 400, "the chain's own imp_samples, not saem_ofv_samples");
     assert_eq!(obj.n_samples, Some(400));
     assert_eq!(imp.ofv.to_bits(), is.minus2_log_likelihood.to_bits());
     // The chain's IS value is a likelihood: AIC / BIC exist and are built from it, also
@@ -389,11 +327,7 @@ fn explicit_evaluator_chains_follow_saem_ofv() {
     let focei = chained(SaemOfv::Focei);
     assert!((focei.aic.unwrap() - (focei.ofv + 2.0 * k)).abs() < 1e-9);
     assert!(focei.saem_objective.is_none());
-    assert_eq!(
-        focei.ofv.to_bits(),
-        obj.foce_ofv.to_bits(),
-        "ofv stays FOCE/Laplace"
-    );
+    assert_eq!(focei.ofv.to_bits(), obj.foce_ofv.to_bits(), "ofv stays FOCE/Laplace");
     assert!(
         focei.importance_sampling.is_some(),
         "the explicit stage still publishes its IS result"
@@ -405,10 +339,7 @@ fn explicit_evaluator_chains_follow_saem_ofv() {
     o.n_agq = 7;
     let agq_stage = warfarin_fit(&o);
     assert!(agq_stage.saem_objective.is_none());
-    assert!(
-        agq_stage.importance_sampling.is_none(),
-        "no second readout on an explicit chain"
-    );
+    assert!(agq_stage.importance_sampling.is_none(), "no second readout on an explicit chain");
 }
 
 /// The pilot passes that fit the proposal draw `imp_adapt_samples` (`saem_ofv_pilot_samples` for
@@ -440,16 +371,10 @@ fn pilot_samples_shape_the_proposal_and_never_the_readout_size() {
     };
     let full = eval(0);
     for same in [eval(400), eval(10_000)] {
-        assert_eq!(
-            same.minus2_log_likelihood.to_bits(),
-            full.minus2_log_likelihood.to_bits()
-        );
+        assert_eq!(same.minus2_log_likelihood.to_bits(), full.minus2_log_likelihood.to_bits());
     }
     let small = eval(60);
-    assert_ne!(
-        small.minus2_log_likelihood.to_bits(),
-        full.minus2_log_likelihood.to_bits()
-    );
+    assert_ne!(small.minus2_log_likelihood.to_bits(), full.minus2_log_likelihood.to_bits());
     assert_eq!(small.n_samples, 400, "the readout still draws imp_samples");
     // Both are unbiased estimates of one integral: within a few combined SEs.
     let se = (small.mc_standard_error.powi(2) + full.mc_standard_error.powi(2)).sqrt();
@@ -471,17 +396,9 @@ fn saem_readout_reads_saem_ofv_pilot_samples() {
         warfarin_fit(&o)
     };
     let full = run(0);
-    assert_eq!(
-        run(500).ofv.to_bits(),
-        full.ofv.to_bits(),
-        "a pilot of K is the full-K pilot"
-    );
+    assert_eq!(run(500).ofv.to_bits(), full.ofv.to_bits(), "a pilot of K is the full-K pilot");
     let small = run(80);
-    assert_ne!(
-        small.ofv.to_bits(),
-        full.ofv.to_bits(),
-        "the option reaches the evaluation"
-    );
+    assert_ne!(small.ofv.to_bits(), full.ofv.to_bits(), "the option reaches the evaluation");
     assert_eq!(small.saem_objective.as_ref().unwrap().n_samples, Some(500));
     assert_eq!(FitOptions::default().saem_ofv_pilot_samples, 300);
 }
@@ -505,10 +422,7 @@ fn outputs_label_the_objective_and_carry_the_foce_diagnostic() {
     let yaml = std::fs::read_to_string(&yaml_path).unwrap();
     assert!(yaml.contains("  ofv_type: saem_objective\n"), "{yaml}");
     assert!(yaml.contains("  ofv_foce_laplace: "), "{yaml}");
-    assert!(
-        !yaml.contains("ofv_mc_standard_error") && !yaml.contains("ofv_n_samples"),
-        "{yaml}"
-    );
+    assert!(!yaml.contains("ofv_mc_standard_error") && !yaml.contains("ofv_n_samples"), "{yaml}");
     let report = ferx_core::io::output::format_summary(&saem);
     assert!(
         report.contains("OFV (SAEM objective, NONMEM SAEMOBJ convention; not a likelihood):"),
@@ -519,10 +433,7 @@ fn outputs_label_the_objective_and_carry_the_foce_diagnostic() {
     let focei = warfarin_fit(&short_saem(SaemOfv::Focei));
     ferx_core::io::output::write_estimates_yaml(&focei, yaml_path.to_str().unwrap()).expect("yaml");
     let yaml = std::fs::read_to_string(&yaml_path).unwrap();
-    assert!(
-        !yaml.contains("ofv_type:") && !yaml.contains("ofv_foce_laplace"),
-        "{yaml}"
-    );
+    assert!(!yaml.contains("ofv_type:") && !yaml.contains("ofv_foce_laplace"), "{yaml}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -588,11 +499,7 @@ fn sd(v: &[f64]) -> f64 {
 
 /// ferx's importance-sampled −2 log L at NONMEM's SAEM estimates.
 fn ferx_is_at(
-    model: &str,
-    data: &str,
-    est: &HashMap<String, f64>,
-    k: usize,
-    pilot: usize,
+    model: &str, data: &str, est: &HashMap<String, f64>, k: usize, pilot: usize,
 ) -> (f64, f64) {
     let prep = prepare_run(
         root().join("nonmem_anchor").join(model).to_str().unwrap(),
@@ -633,16 +540,8 @@ const ANCHORS: &[(&str, &str, &str)] = &[
         "nonmem_anchor/covmuref_shared.csv",
         "covmuref_shared_saem.ext",
     ),
-    (
-        "covmuref_additive_saem_fit.ferx",
-        "data/covmuref_additive.csv",
-        "covmuref_additive_saem.ext",
-    ),
-    (
-        "covmuref_power_saem_fit.ferx",
-        "data/covmuref_power.csv",
-        "covmuref_power_saem.ext",
-    ),
+    ("covmuref_additive_saem_fit.ferx", "data/covmuref_additive.csv", "covmuref_additive_saem.ext"),
+    ("covmuref_power_saem_fit.ferx", "data/covmuref_power.csv", "covmuref_power_saem.ext"),
     (
         "covmuref_anchor_a_saem_fit.ferx",
         "nonmem_anchor/covmuref_shared.csv",
@@ -653,11 +552,7 @@ const ANCHORS: &[(&str, &str, &str)] = &[
         "nonmem_anchor/covmuref_shared.csv",
         "covmuref_anchor_b_saem.ext",
     ),
-    (
-        "logit_fraction_saem_fit.ferx",
-        "data/logit_fraction_oral.csv",
-        "logit_fraction_saem.ext",
-    ),
+    ("logit_fraction_saem_fit.ferx", "data/logit_fraction_oral.csv", "logit_fraction_saem.ext"),
 ];
 
 /// ferx's IS objective at NONMEM's SAEM estimates against NONMEM's `IMP EONLY=1` objective,
@@ -736,15 +631,9 @@ fn an_inert_eval_only_flag_does_not_disable_the_readout() {
 /// Mutation: drop the IOV grid check (the fit reports `agq`, slowly).
 #[test]
 fn agq_readout_counts_iov_occasions_in_the_grid_and_falls_back() {
-    let prep = prepare_run(
-        "examples/warfarin_iov_saem.ferx",
-        Some("data/warfarin_iov_saem.csv"),
-    )
-    .expect("prepare");
-    let mut o = FitOptions {
-        saem_ofv: SaemOfv::Agq,
-        ..prep.parsed.fit_options.clone()
-    };
+    let prep = prepare_run("examples/warfarin_iov_saem.ferx", Some("data/warfarin_iov_saem.csv"))
+        .expect("prepare");
+    let mut o = FitOptions { saem_ofv: SaemOfv::Agq, ..prep.parsed.fit_options.clone() };
     o.saem_n_exploration = 10;
     o.saem_n_convergence = 10;
     o.saem_ofv_samples = 200;
@@ -755,9 +644,7 @@ fn agq_readout_counts_iov_occasions_in_the_grid_and_falls_back() {
     let obj = r.saem_objective.as_ref().expect("a reported objective");
     assert_eq!(obj.kind, SaemOfv::Imp);
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("saem_ofv = agq unavailable") && w.contains("IOV")),
+        r.warnings.iter().any(|w| w.contains("saem_ofv = agq unavailable") && w.contains("IOV")),
         "{:?}",
         r.warnings
     );
@@ -773,24 +660,15 @@ fn out_of_range_readout_options_from_the_api_warn_instead_of_panicking() {
     let mut o = short_saem(SaemOfv::Agq);
     o.saem_ofv_nodes = 0;
     let r = warfarin_fit(&o);
-    assert_eq!(
-        r.saem_objective.as_ref().map(|s| s.kind),
-        Some(SaemOfv::Imp)
-    );
-    assert!(
-        r.warnings.iter().any(|w| w.contains("saem_ofv_nodes")),
-        "{:?}",
-        r.warnings
-    );
+    assert_eq!(r.saem_objective.as_ref().map(|s| s.kind), Some(SaemOfv::Imp));
+    assert!(r.warnings.iter().any(|w| w.contains("saem_ofv_nodes")), "{:?}", r.warnings);
 
     let mut o = short_saem(SaemOfv::Imp);
     o.saem_ofv_samples = 1;
     let r = warfarin_fit(&o);
     assert!(r.saem_objective.is_none());
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("importance-sampled −2 log L skipped")),
+        r.warnings.iter().any(|w| w.contains("importance-sampled −2 log L skipped")),
         "{:?}",
         r.warnings
     );

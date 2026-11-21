@@ -106,16 +106,10 @@ fn setup_frem(dir: &Path) -> FremPrepareResult {
 fn rename_time_dv_headers(src: &Path, dst: &Path) {
     let text = std::fs::read_to_string(src).unwrap();
     let mut lines = text.lines();
-    let header = lines
-        .next()
-        .unwrap()
-        .replace("TIME", "TAFD")
-        .replace("DV", "CONC");
+    let header = lines.next().unwrap().replace("TIME", "TAFD").replace("DV", "CONC");
     let body: Vec<&str> = lines.collect();
-    let out = std::iter::once(header.as_str())
-        .chain(body.iter().copied())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let out =
+        std::iter::once(header.as_str()).chain(body.iter().copied()).collect::<Vec<_>>().join("\n");
     std::fs::write(dst, out).unwrap();
 }
 
@@ -178,21 +172,11 @@ fn frem_prepare_produces_correct_metadata() {
     assert_eq!(result.fremtype_map[1], ("AGE".to_string(), 200));
 
     // Covariate means: WT mean = (70+80+65+90+55+75+85+60+72+68)/10 = 72.0
-    let wt_mean = result
-        .covariate_means
-        .iter()
-        .find(|(n, _)| n == "WT")
-        .unwrap()
-        .1;
+    let wt_mean = result.covariate_means.iter().find(|(n, _)| n == "WT").unwrap().1;
     assert!((wt_mean - 72.0).abs() < 0.01, "WT mean = {wt_mean}");
 
     // AGE mean = (35+45+28+55+22+40+50+30+38+33)/10 = 37.6
-    let age_mean = result
-        .covariate_means
-        .iter()
-        .find(|(n, _)| n == "AGE")
-        .unwrap()
-        .1;
+    let age_mean = result.covariate_means.iter().find(|(n, _)| n == "AGE").unwrap().1;
     assert!((age_mean - 37.6).abs() < 0.01, "AGE mean = {age_mean}");
 
     // Check output files exist.
@@ -216,10 +200,7 @@ fn frem_generated_model_parses() {
 
     // Covariate thetas should be fixed.
     assert!(model.default_params.theta_fixed[3], "TV_WT should be fixed");
-    assert!(
-        model.default_params.theta_fixed[4],
-        "TV_AGE should be fixed"
-    );
+    assert!(model.default_params.theta_fixed[4], "TV_AGE should be fixed");
 
     // Omega should be 5x5.
     let omega = &model.default_params.omega;
@@ -248,10 +229,7 @@ fn frem_dataset_row_count() {
 
     // Verify FREMTYPE column exists and has correct values.
     let header = content.lines().next().unwrap();
-    let ft_col = header
-        .split(',')
-        .position(|h| h == "FREMTYPE")
-        .expect("FREMTYPE column missing");
+    let ft_col = header.split(',').position(|h| h == "FREMTYPE").expect("FREMTYPE column missing");
 
     let mut ft_100_count = 0;
     let mut ft_200_count = 0;
@@ -290,11 +268,7 @@ fn frem_impmap_rao_blackwell_runs_finite() {
     let fit_result =
         fit(&model, &pop, &model.default_params, &opts).expect("FREM IMPMAP fit should not error");
 
-    assert!(
-        fit_result.ofv.is_finite(),
-        "IMPMAP OFV should be finite, got {}",
-        fit_result.ofv
-    );
+    assert!(fit_result.ofv.is_finite(), "IMPMAP OFV should be finite, got {}", fit_result.ofv);
     let omega = &fit_result.omega;
     assert_eq!(omega.nrows(), 5);
     assert_eq!(omega.ncols(), 5);
@@ -480,11 +454,7 @@ fn frem_fit_completes_with_finite_ofv() {
     let fit_result =
         fit(&model, &pop, &model.default_params, &opts).expect("FREM fit should not error");
 
-    assert!(
-        fit_result.ofv.is_finite(),
-        "OFV should be finite, got {}",
-        fit_result.ofv
-    );
+    assert!(fit_result.ofv.is_finite(), "OFV should be finite, got {}", fit_result.ofv);
 
     // Final omega should be 5x5.
     let omega = &fit_result.omega;
@@ -517,10 +487,7 @@ fn frem_fit_completes_with_finite_ofv() {
 /// covariate thetas are fixed at the sample mean and the only "data" for
 /// covariate observations is the subject's own value.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn frem_covariate_omega_matches_sample_variance() {
     let tmp = tempfile::tempdir().unwrap();
     let result = setup_frem(tmp.path());
@@ -570,10 +537,7 @@ fn frem_covariate_omega_matches_sample_variance() {
 /// the fit stays bounded, the "sampler not mixing" warning is NOT emitted, and
 /// the residual sigma never rides the ridge to its cap.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn frem_iiv_on_ruv_saem_stays_bounded() {
     let tmp = tempfile::tempdir().unwrap();
     let result = setup_frem(tmp.path());
@@ -581,16 +545,8 @@ fn frem_iiv_on_ruv_saem_stays_bounded() {
     // Inject an IIV-on-RUV random effect into the generated FREM model.
     let gen = std::fs::read_to_string(&result.model_path).unwrap();
     let m = gen
-        .replacen(
-            "[individual_parameters]",
-            "  omega ETA_RUV ~ 0.28\n\n[individual_parameters]",
-            1,
-        )
-        .replacen(
-            "[fit_options]",
-            "  iiv_on_ruv = ETA_RUV\n\n[fit_options]",
-            1,
-        );
+        .replacen("[individual_parameters]", "  omega ETA_RUV ~ 0.28\n\n[individual_parameters]", 1)
+        .replacen("[fit_options]", "  iiv_on_ruv = ETA_RUV\n\n[fit_options]", 1);
     let ruv_model = tmp.path().join("frem_ruv.ferx");
     std::fs::write(&ruv_model, &m).unwrap();
 
@@ -633,10 +589,7 @@ fn frem_iiv_on_ruv_saem_stays_bounded() {
     // With the runaway fixed, neither the "not mixing" nor the cap-binding
     // warnings should fire on this well-behaved fit.
     assert!(
-        !fit_result
-            .warnings
-            .iter()
-            .any(|w| w.contains("not mixing") || w.contains("growth cap")),
+        !fit_result.warnings.iter().any(|w| w.contains("not mixing") || w.contains("growth cap")),
         "unexpected instability warning: {:?}",
         fit_result.warnings
     );
@@ -673,10 +626,7 @@ fn frem_iiv_on_ruv_saem_stays_bounded() {
 /// at −174.91 (macOS) / −220.71 (Linux) after #833 stopped the reported OFV being read off
 /// a cold EBE restart. The bound's own comment carries the current measurements.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn frem_covariate_omega_matches_sample_variance_under_focei() {
     let tmp = tempfile::tempdir().unwrap();
     let result = setup_frem(tmp.path());
@@ -745,10 +695,7 @@ fn frem_covariate_omega_matches_sample_variance_under_focei() {
 /// and without FREM (both SAEM, same seed) and require the PK residual error to
 /// be essentially unchanged.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn frem_saem_does_not_collapse_pk_residual_error() {
     let tmp = tempfile::tempdir().unwrap();
 
@@ -778,26 +725,16 @@ fn frem_saem_does_not_collapse_pk_residual_error() {
     let base_data = write_warfarin_with_covariates(tmp.path());
     let base_model = parse_model_file(&base_model_path).unwrap();
     let base_pop = read_nonmem_csv(&base_data, None, None).unwrap();
-    let base_fit = fit(
-        &base_model,
-        &base_pop,
-        &base_model.default_params,
-        &saem_opts(),
-    )
-    .expect("base SAEM fit should succeed");
+    let base_fit = fit(&base_model, &base_pop, &base_model.default_params, &saem_opts())
+        .expect("base SAEM fit should succeed");
     let base_prop = prop_err(&base_fit);
 
     // FREM fit (same PK model + 2 covariates).
     let frem = setup_frem(tmp.path());
     let frem_model = parse_model_file(&frem.model_path).unwrap();
     let frem_pop = read_nonmem_csv(&frem.data_path, None, None).unwrap();
-    let frem_fit = fit(
-        &frem_model,
-        &frem_pop,
-        &frem_model.default_params,
-        &saem_opts(),
-    )
-    .expect("FREM SAEM fit should succeed");
+    let frem_fit = fit(&frem_model, &frem_pop, &frem_model.default_params, &saem_opts())
+        .expect("FREM SAEM fit should succeed");
     let frem_prop = prop_err(&frem_fit);
 
     assert!(base_prop.is_finite() && base_prop > 0.0);
@@ -815,10 +752,7 @@ fn frem_saem_does_not_collapse_pk_residual_error() {
 /// produces a finite OFV. This exercises the multi-start MAP helper
 /// (`run_map_multistart`) in a high-dimensional setting (5 ETAs).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn frem_impmap_mceta_produces_finite_ofv() {
     let tmp = tempfile::tempdir().unwrap();
     let frem = setup_frem(tmp.path());
@@ -836,20 +770,13 @@ fn frem_impmap_mceta_produces_finite_ofv() {
 
     let result =
         fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP+MCETA fit should succeed");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV should be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV should be finite, got {}", result.ofv);
 }
 
 /// Cross-method comparison on the 5-ETA FREM warfarin model: FOCEI, SAEM,
 /// IMPMAP (mceta=0), IMPMAP (mceta=3).  Prints a comparison table.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn frem_estimation_method_comparison() {
     let tmp = tempfile::tempdir().unwrap();
     let frem = setup_frem(tmp.path());
