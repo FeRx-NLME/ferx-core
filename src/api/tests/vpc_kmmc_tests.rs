@@ -698,3 +698,80 @@ fn horizon_and_cut_without_a_horizon_is_the_latest_record_and_cuts_nothing() {
     assert_eq!(got.iter().map(key).collect::<Vec<_>>(), rows.iter().map(key).collect::<Vec<_>>());
     assert!(got.iter().any(|r| r.id == "X20" && r.event), "the event at H is kept");
 }
+
+// ── #2947: a stratum with no band ────────────────────────────────────────────
+
+use super::super::vpc_tte::empty_stratum_warnings;
+
+/// Fixture P3 (#2947 plan §0): 30 subjects at `0.1·i`, a third censored, `Z = i`; the
+/// horizon is the latest record, 3.
+fn p3() -> Population {
+    pop((1..=30).map(|i| subj(&i.to_string(), 0.1 * i as f64, i % 3 != 0, i as f64)).collect())
+}
+
+fn p3_on(grid: Vec<f64>, min_at_risk: usize) -> KmmcVpc {
+    let mut o = opts(20);
+    o.vpc.grid = VpcGrid::Times(grid);
+    o.min_at_risk = min_at_risk;
+    run(&exp_model(0.5), &p3(), &o).unwrap()
+}
+
+/// D-k1. Fixture P2: arms of 30 and 5 subjects, `min_at_risk = 10`, `Auto` grid. Only
+/// the arm of 5 is empty, at every grid time, and the warning names it.
+#[test]
+fn vpc_kmmc_warns_a_stratum_below_min_at_risk_only() {
+    let arm = |mut s: Subject, a: f64| {
+        s.covariates.insert("ARM".into(), a);
+        s
+    };
+    let mut subjects: Vec<Subject> = p3().subjects.into_iter().map(|s| arm(s, 1.0)).collect();
+    subjects
+        .extend((1..=5).map(|i| arm(subj(&format!("s{i}"), 0.5 * i as f64, true, i as f64), 2.0)));
+    let mut p = pop(subjects);
+    p.covariate_names.push("ARM".into());
+    let mut o = opts(20);
+    o.vpc.stratify = VpcStratify::Covariate("ARM".into());
+    let v = run(&exp_model(0.5), &p, &o).unwrap();
+    assert!(v.strata[0].n_used.iter().any(|&n| n >= 19));
+    assert!(v.strata[1].n_used.iter().all(|&n| n == 0));
+    assert_eq!(
+        empty_stratum_warnings(&v.warnings),
+        ["W_VPC_EMPTY_STRATUM: stratum `ARM=2` has no band at any grid time. It has 5 \
+          subjects, fewer than `min_at_risk = 10`, so no risk set reaches the at-risk floor. \
+          Lower `min_at_risk`, or use larger strata."]
+    );
+}
+
+/// D-k2. At t = 2.8, inside follow-up (every replicate is followed to 3), no replicate
+/// has 10 subjects at risk: the stratum is empty for the at-risk floor of the curves,
+/// not for follow-up, and the message says so. With `min_at_risk = 1` all 20 curves
+/// are defined there and nothing is raised (the differential pair).
+#[test]
+fn vpc_kmmc_at_risk_floor_inside_follow_up() {
+    let v = p3_on(vec![2.8], 10);
+    assert_eq!(v.horizon, 3.0);
+    assert_eq!(v.strata[0].n_used, [0]);
+    assert_eq!(
+        empty_stratum_warnings(&v.warnings),
+        ["W_VPC_EMPTY_STRATUM: stratum `all` has no band at any grid time. At most 0 of the \
+          20 replicate curves are defined at any grid time, and a band point needs 19. A \
+          replicate curve counts at a time only while at least `min_at_risk = 10` subjects \
+          are at risk there."]
+    );
+    let v = p3_on(vec![2.8], 1);
+    assert_eq!(v.strata[0].n_used, [20]);
+    assert_eq!(empty_stratum_warnings(&v.warnings), Vec::<&str>::new());
+}
+
+/// D-k3. Past H = 3 every replicate has ended; a KMMC curve does not end on reaching 0,
+/// so the zero sentence is absent.
+#[test]
+fn vpc_kmmc_warns_past_follow_up_without_reaching_zero() {
+    let v = p3_on(vec![3.5], 10);
+    assert_eq!(
+        empty_stratum_warnings(&v.warnings),
+        ["W_VPC_EMPTY_STRATUM: stratum `all` has no band at any grid time. Every grid time is \
+          past the last time of every replicate curve; the latest is 3. Grid times after 3 can \
+          never have a band."]
+    );
+}
