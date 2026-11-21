@@ -281,8 +281,10 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
+            // The stage's request, not the raw setting: a Laplace stage hands `auto` to the
+            // outer loop as NLopt L-BFGS, and the label must name what ran.
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
-                options.optimizer,
+                stage_optimizer_request(method, options.optimizer),
                 model,
                 has_mixture,
                 crate::sens::provider::analytic_outer_gradient_available(model),

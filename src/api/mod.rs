@@ -197,13 +197,13 @@ pub(crate) use adaptive::{
     pk_bits_eq, reject_selected_error_for_adaptive, reject_unsupported_adaptive,
     verify_adaptive_snapshots,
 };
-pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     dw_autocorrelation_warning, multistart_prefers, per_start_options, per_start_seed,
     perturb_init, saem_active_covariate_group_etas, saem_active_mixture_switched_etas,
     saem_non_mu_referenced_individual_params_warning, select_start, DwAdvice, SubjectLine,
 };
+pub(crate) use fit::{fitted_population, stage_optimizer_request};
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,

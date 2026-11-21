@@ -192,3 +192,32 @@ fn fit_reports_the_mixture_rule_for_a_mixture_model() {
         assert_eq!(result.optimizer, want, "{optimizer:?}, mixture = {}", model.mixture.is_some());
     }
 }
+
+/// A Laplace stage hands `auto` to the outer loop as NLopt L-BFGS
+/// (`stage_optimizer_request`), so the report must resolve that request, not the raw
+/// `auto`. The fixture is off the analytic gradient (`gradient = fd`), where the raw
+/// `auto` resolves to BOBYQA: the label then said `auto (bobyqa)` while L-BFGS ran.
+/// And an explicit BOBYQA Laplace stage has no outer gradient to report.
+#[test]
+fn laplace_reports_its_stage_optimizer_and_gradient() {
+    use crate::build_info::{gradient_method_outer, GradientMethodKind, BUILD_INFO};
+
+    let mut model = parse(NO_MIXTURE);
+    assert_analytic_scope(&model);
+    let method = EstimationMethod::Laplace;
+    assert_eq!(
+        gradient_method_outer(&BUILD_INFO, method, Optimizer::Bobyqa, &model),
+        GradientMethodKind::NotApplicable
+    );
+
+    model.gradient_method = crate::types::GradientMethod::Fd;
+    // The straddle: off the analytic gradient the raw `auto` resolves to BOBYQA, so a
+    // report that ignores the stage's request would say so.
+    assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::Bobyqa);
+    let options = FitOptions { method, optimizer: Optimizer::Auto, ..Default::default() };
+    assert_eq!(reported_optimizer_label(method, &options, &model, false), "auto (nlopt_lbfgs)");
+    assert_eq!(
+        gradient_method_outer(&BUILD_INFO, method, options.optimizer, &model),
+        GradientMethodKind::FiniteDifferences
+    );
+}

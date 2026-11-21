@@ -139,8 +139,19 @@ pub fn gradient_method_outer(
         // where it reaches, finite-differenced at fixed η where the adjoint declines a subject
         // (a model no recorder serves, a plan failure at a point). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.
+        // Unlike AGQ, a Laplace stage runs the outer optimizer it resolves from the stage's
+        // request (`stage_optimizer_request`), and BOBYQA there takes no gradient at all.
         EstimationMethod::Laplace => {
-            if crate::estimation::agq::analytic_score_supported_model(model) {
+            let analytic = crate::estimation::agq::analytic_score_supported_model(model);
+            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                crate::api::stage_optimizer_request(method, optimizer),
+                model,
+                model.mixture.is_some(),
+                analytic,
+            );
+            if resolved == Optimizer::Bobyqa {
+                GradientMethodKind::NotApplicable
+            } else if analytic {
                 GradientMethodKind::Analytic
             } else {
                 GradientMethodKind::FiniteDifferences
