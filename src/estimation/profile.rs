@@ -52,7 +52,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
+    find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats,
+    InnerSolvePolicy, PrevEtas,
 };
 use crate::estimation::outer_optimizer::{
     bobyqa_initial_step, bobyqa_stop_needs_polish, drive_legs, ebe_guard_rejects,
@@ -1336,11 +1337,19 @@ impl ProfileCtx<'_> {
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
+            // Every `Some` start is a solve's modes (`ProfileWarm::from_solve`, the step's and
+            // held re-solve's, the covariance step's from the fit's EBEs), so an exactly-zero
+            // one is warm, not the cold placeholder (#2691, #2899).
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
                 unseeded_iov_warm: true,
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
-            },
+            }
+            .with_prev_etas(if warm.etas.is_some() {
+                PrevEtas::Solved
+            } else {
+                PrevEtas::Placeholder
+            }),
             None,
             |subject, ebe| {
                 (
