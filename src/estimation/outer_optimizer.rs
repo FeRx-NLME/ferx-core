@@ -5577,6 +5577,37 @@ pub(crate) fn unprofiled_leg_settles(
 /// leg may still be descending.
 pub(crate) const UNPROFILED_FIRST_LEG_GAIN: f64 = POLISH_MIN_GAIN;
 
+/// The BHHH-predicted gain ([`predicted_remaining_gain`]) at or below which a #2462 leg ends
+/// at its first point instead of running to its own stop. Such a leg spent five or more
+/// evaluations at `UNPROFILED_VERIFY_INNER_TOL` to gain nothing: on the six FOCE/FOCEI
+/// examples at the default `inner_tol` every leg gained at most 5.3e-9 and ran 5 to 14
+/// evaluations, 5% to 40% of the fit.
+///
+/// The prediction is not a bound. BHHH's outer-product curvature can exceed the Hessian,
+/// and a leg then gains far more than predicted. On A2 (`profile_mbma`), unprofiled from 48
+/// starts on the 4 × 4 × 3 grid around (42, 8, 3.2), the legs gained a median 13× and at
+/// most 735× their prediction (1.6e-9 predicted, 1.2e-6 gained), and a threshold of 1e-7
+/// left fits up to 2.9e-6 above NONMEM. The threshold therefore sits below every A2
+/// prediction (the smallest 1.4e-10) and keeps a 735× miss under 7.4e-8. Measured at the
+/// legs' first points (macOS arm64):
+///
+/// | leg | predicted | gained |
+/// |---|---|---|
+/// | `warfarin`, `two_cpt_oral_cov`, `three_cpt_iv`, `transit_2cpt`, default `inner_tol` | 1.1e-15 to 2.6e-11 | 0 |
+/// | `warfarin_ode_lagtime`, default `inner_tol` | 1.5e-8 | 5.3e-9 |
+/// | `mm_oral`, default `inner_tol` | 1.2e-4 | 2.8e-9 |
+/// | A2, 48 starts around (42, 8, 3.2) | 1.4e-10 to 1.68 | up to 7.1e-6 |
+///
+/// The first four end their legs at their first point; `warfarin_ode_lagtime` and `mm_oral`
+/// run theirs as before.
+pub(crate) const UNPROFILED_LEG_SETTLED_PREDICTION: f64 = 1e-10;
+
+/// Does a leg end at its first point ([`UNPROFILED_LEG_SETTLED_PREDICTION`])? Not without a
+/// prediction: a model the decrement is not formed for runs its leg as before.
+pub(crate) fn leg_settles_on_prediction(predicted_gain: Option<f64>) -> bool {
+    predicted_gain.is_some_and(|g| g <= UNPROFILED_LEG_SETTLED_PREDICTION)
+}
+
 /// One unprofiled verification leg as the loop judges it (#2462).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UnprofiledLeg {
@@ -5828,6 +5859,11 @@ const UNPROFILED_VERIFY_LEG: bool = true;
 thread_local! {
     /// `optimize_nlopt_attempt` calls on this thread, for the tests.
     pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Turns [`leg_settles_on_prediction`] off on this thread: every leg runs to its own stop.
+    pub(crate) static LEG_SETTLE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Feasible evaluations the #2462 legs ran on this thread, for the tests.
+    pub(crate) static LEG_FEASIBLE_EVALS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -6860,11 +6896,44 @@ fn optimize_nlopt_attempt_probed(
         // at its own tolerance; the leg copies it into `best_seen` when it ends. Mixing the
         // two tolerances in one tracker would keep a loose objective that is lower only by
         // its noise, and the next leg would restart from it.
+        // Set when this is a leg's first point and the leg ends on its prediction; applied
+        // after the basin probe below, which a latch would otherwise skip.
+        let mut leg_settled: Option<f64> = None;
         if in_verify_leg {
             if !guarded {
+                #[cfg(test)]
+                LEG_FEASIBLE_EVALS.with(|c| c.set(c.get() + 1));
                 leg_best.borrow_mut().observe(state.n_evals, xs, ofv, ofv_clean);
                 if leg_first.get().is_none() {
                     leg_first.set(Some(ofv));
+                    // A leg whose first point is predicted to gain at most
+                    // `UNPROFILED_LEG_SETTLED_PREDICTION` ends here: latched below, the
+                    // optimizer is answered with this point and a zero gradient and
+                    // stops within a couple of free evaluations, and the leg settles
+                    // on its zero gain as it would have after its own stop.
+                    let predicted = best_solve_cl.lock().unwrap().as_ref().and_then(|inc| {
+                        (inc.xs.as_slice() == xs).then(|| {
+                            let x_inc: Vec<f64> =
+                                inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                            predicted_remaining_gain(
+                                model,
+                                population,
+                                init_params,
+                                &x_inc,
+                                &inc.etas,
+                                &inc.kappas,
+                                &bounds,
+                                options,
+                                &nn_reg,
+                                &priors,
+                            )
+                        })?
+                    });
+                    #[cfg(test)]
+                    let predicted = predicted.filter(|_| !LEG_SETTLE_OFF.with(|o| o.get()));
+                    if leg_settles_on_prediction(predicted) {
+                        leg_settled = predicted;
+                    }
                 }
             }
         } else {
@@ -6912,8 +6981,9 @@ fn optimize_nlopt_attempt_probed(
             }
             descending
         };
-        // A #2462 leg does not latch: its gains sit far below the guard's 1e-3 window, and
-        // its own stop and the gain test are what end it.
+        // A #2462 leg does not latch on the guard's window: its gains sit far below 1e-3, and
+        // its own stop and the gain test are what end it (or its first point's prediction,
+        // `leg_settled`).
         if !in_verify_leg
             && stagnation_after_eval(
                 state,
@@ -7076,8 +7146,18 @@ fn optimize_nlopt_attempt_probed(
                 }
             }
         }
-        // The basin probe prints its own reason; this one would misstate it.
-        if state.stagnation_stopped && verbose && !basin_probe_stopped {
+        if let Some(gain) = leg_settled.filter(|_| !state.stagnation_stopped) {
+            state.stagnation_stopped = true;
+            if verbose {
+                eprintln!(
+                    "Eval {:>4}: verification leg ends at its first point — a Newton step \
+                     from it is predicted to gain {gain:.2e} (BHHH Newton decrement, max \
+                     {UNPROFILED_LEG_SETTLED_PREDICTION:e}).",
+                    state.n_evals,
+                );
+            }
+        } else if state.stagnation_stopped && verbose && !basin_probe_stopped {
+            // The basin probe prints its own reason; this one would misstate it.
             eprintln!(
                 "Eval {:>4}: stopping early — no OFV improvement above 1e-3 in the \
                  last window. Whether this is convergence is decided after the \
