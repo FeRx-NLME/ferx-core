@@ -1,0 +1,64 @@
+# ferx-core
+
+> ferx is an open-source nonlinear mixed-effects (NLME) modeling engine for population pharmacokinetics and pharmacodynamics, written in Rust, with FOCE/FOCEI, Laplace, SAEM, IMP and Bayesian estimation, a `ferx` command-line tool and an R package (ferx-r).
+
+Notes for language models and coding agents:
+
+- Read "Using ferx from an agent" first. It gives the recommended loop: validate with `ferx check --json`, edit models one section at a time, fit with `--output-format json`, and judge the result from `status` and `warnings_structured`.
+- A `.ferx` model file is its own DSL, not a NONMEM control stream. Do not translate `$PK` / `$ERROR` blocks from memory; follow the model file reference.
+- The data file is NONMEM-format CSV (ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS).
+- Branch on the stable codes (`E_*` / `W_*` check codes, snake_case warning `category` tokens), never on message text.
+- Every page below has a Markdown twin at the same URL with `.html` replaced by `.llms.md`. `llms-full.txt` at the site root concatenates all of them.
+
+## Start here
+
+- [Using ferx from an agent](https://ferx-nlme.org/ferx-core/agents.html): the machine-readable surfaces and the validate, fit, judge loop
+- [Quick start](https://ferx-nlme.org/ferx-core/quick-start.html): a complete one-compartment oral model, fitted from the CLI
+- [Installation](https://ferx-nlme.org/ferx-core/installation.html): building the `ferx` binary and the R package
+- [Feature maturity](https://ferx-nlme.org/ferx-core/maturity.html): which features are stable, experimental or validated against NONMEM
+
+## Model file syntax
+
+- [Model file reference](https://ferx-nlme.org/ferx-core/model-file/index.html): the `[section]` blocks of a `.ferx` file
+- [Parameters](https://ferx-nlme.org/ferx-core/model-file/parameters.html): `theta`, `omega`, `block_omega`, `sigma`, bounds and fixing
+- [Individual parameters](https://ferx-nlme.org/ferx-core/model-file/individual-parameters.html): the expression language
+- [Structural model](https://ferx-nlme.org/ferx-core/model-file/structural-model.html): the analytical PK models
+- [ODE models](https://ferx-nlme.org/ferx-core/model-file/ode-models.html): `[odes]` blocks and solver choice
+- [Error model](https://ferx-nlme.org/ferx-core/model-file/error-model.html): additive, proportional and combined residual error
+- [Covariates](https://ferx-nlme.org/ferx-core/model-file/covariates.html): reading covariates from the data
+- [Fit options](https://ferx-nlme.org/ferx-core/model-file/fit-options.html): every `[fit_options]` key, including `method`
+- [Data format](https://ferx-nlme.org/ferx-core/data-format.html): the NONMEM-format CSV columns
+
+## Validate, fit and read results
+
+- [CLI reference](https://ferx-nlme.org/ferx-core/cli.html): `ferx`, `ferx check`, `ferx summary`, the tools, and exit codes
+- [Check report](https://ferx-nlme.org/ferx-core/file-formats/check-report.html): the `ferx check --json` schema and every `E_*` / `W_*` code
+- [Warnings](https://ferx-nlme.org/ferx-core/warnings.html): `warnings_structured`, severities, every warning code with a typical agent response
+- [Fit status](https://ferx-nlme.org/ferx-core/output.html#fit-status): `FitResult::status()` and its reasons
+- [Fit JSON](https://ferx-nlme.org/ferx-core/output.html#fit-json-modelfitjson): the `--output-format json` schema, `schema_version`, `null` for non-finite values
+- [Output files](https://ferx-nlme.org/ferx-core/output.html): sdtab, covtab, YAML and JSON fit files
+- [The .fitrx bundle](https://ferx-nlme.org/ferx-core/file-formats/fitrx.html): the portable saved-fit format read by `ferx summary` and R
+
+## Estimation methods
+
+- [Estimation methods overview](https://ferx-nlme.org/ferx-core/estimation/index.html): choosing a method
+- [FOCE / FOCEI](https://ferx-nlme.org/ferx-core/estimation/foce.html): the default estimator
+- [SAEM](https://ferx-nlme.org/ferx-core/estimation/saem.html): stochastic approximation EM
+- [Optimizers](https://ferx-nlme.org/ferx-core/estimation/optimizers.html): the outer optimizers and their stopping rules
+
+## Examples and tools
+
+- [Examples](https://ferx-nlme.org/ferx-core/examples/index.html): worked models with data
+- [Tools](https://ferx-nlme.org/ferx-core/tools/index.html): bootstrap, covariate search, model search and other multi-fit tools
+
+## R package
+
+- [ferx book](https://ferx-nlme.org/ferx-book/): using ferx from R
+- [ferx R reference](https://ferx-nlme.org/reference/): every R function, including `ferx_model_validate()`, `ferx_model_set_section()`, `ferx_get_warnings()` and `check_strictness()`
+
+## Optional
+
+- [FAQ](https://ferx-nlme.org/ferx-core/faq.html): comparisons with NONMEM and nlmixr2
+- [Rust API](https://ferx-nlme.org/ferx-core/api/index.html): calling ferx-core as a library
+- [Development](https://ferx-nlme.org/ferx-core/development/index.html): contributing to ferx-core
+- [Docs lint](https://ferx-nlme.org/ferx-core/development/docs-lint.html): how these pages are kept chunked for retrieval

@@ -241,14 +241,10 @@ fn nonmem_2cpt_iv_compartment_amounts() {
     let v2 = 20.0;
     let obs = IV_A_CENTRAL.iter().map(|a| a / v1).collect();
     let pop = single_subject_pop(IV_TIMES.to_vec(), obs, 1);
-    let central_amt: Vec<f64> = derived_col(MODEL, &pop, "C_central")
-        .iter()
-        .map(|c| c * v1)
-        .collect();
-    let periph_amt: Vec<f64> = derived_col(MODEL, &pop, "C_periph")
-        .iter()
-        .map(|c| c * v2)
-        .collect();
+    let central_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_central").iter().map(|c| c * v1).collect();
+    let periph_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_periph").iter().map(|c| c * v2).collect();
     assert_matches("2cpt-iv central A(1)", &central_amt, &IV_A_CENTRAL);
     assert_matches("2cpt-iv peripheral A(2)", &periph_amt, &IV_A_PERIPH);
 }
@@ -295,18 +291,12 @@ fn nonmem_3cpt_iv_compartment_amounts() {
     let (v1, v2, v3) = (10.0, 20.0, 30.0);
     let obs = IV3_A_CENTRAL.iter().map(|a| a / v1).collect();
     let pop = single_subject_pop(IV_TIMES.to_vec(), obs, 1);
-    let central_amt: Vec<f64> = derived_col(MODEL, &pop, "C_central")
-        .iter()
-        .map(|c| c * v1)
-        .collect();
-    let periph1_amt: Vec<f64> = derived_col(MODEL, &pop, "C_periph1")
-        .iter()
-        .map(|c| c * v2)
-        .collect();
-    let periph2_amt: Vec<f64> = derived_col(MODEL, &pop, "C_periph2")
-        .iter()
-        .map(|c| c * v3)
-        .collect();
+    let central_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_central").iter().map(|c| c * v1).collect();
+    let periph1_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_periph1").iter().map(|c| c * v2).collect();
+    let periph2_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_periph2").iter().map(|c| c * v3).collect();
     assert_matches("3cpt-iv central A(1)", &central_amt, &IV3_A_CENTRAL);
     assert_matches("3cpt-iv periph1 A(2)", &periph1_amt, &IV3_A_PERIPH1);
     assert_matches("3cpt-iv periph2 A(3)", &periph2_amt, &IV3_A_PERIPH2);
@@ -355,14 +345,10 @@ fn nonmem_2cpt_oral_compartment_amounts() {
     let obs = ORAL2_A_CENTRAL.iter().map(|a| a / v1).collect();
     let pop = single_subject_pop(ORAL_TIMES.to_vec(), obs, 1);
     let depot_amt = derived_col(MODEL, &pop, "A_depot");
-    let central_amt: Vec<f64> = derived_col(MODEL, &pop, "C_central")
-        .iter()
-        .map(|c| c * v1)
-        .collect();
-    let periph_amt: Vec<f64> = derived_col(MODEL, &pop, "C_periph")
-        .iter()
-        .map(|c| c * v2)
-        .collect();
+    let central_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_central").iter().map(|c| c * v1).collect();
+    let periph_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_periph").iter().map(|c| c * v2).collect();
     assert_matches("2cpt-oral depot A(1)", &depot_amt, &ORAL2_A_DEPOT);
     assert_matches("2cpt-oral central A(2)", &central_amt, &ORAL2_A_CENTRAL);
     assert_matches("2cpt-oral peripheral A(3)", &periph_amt, &ORAL2_A_PERIPH);
@@ -414,18 +400,12 @@ fn nonmem_3cpt_oral_compartment_amounts() {
     let obs = ORAL3_A_CENTRAL.iter().map(|a| a / v1).collect();
     let pop = single_subject_pop(ORAL_TIMES.to_vec(), obs, 1);
     let depot_amt = derived_col(MODEL, &pop, "A_depot");
-    let central_amt: Vec<f64> = derived_col(MODEL, &pop, "C_central")
-        .iter()
-        .map(|c| c * v1)
-        .collect();
-    let periph1_amt: Vec<f64> = derived_col(MODEL, &pop, "C_periph1")
-        .iter()
-        .map(|c| c * v2)
-        .collect();
-    let periph2_amt: Vec<f64> = derived_col(MODEL, &pop, "C_periph2")
-        .iter()
-        .map(|c| c * v3)
-        .collect();
+    let central_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_central").iter().map(|c| c * v1).collect();
+    let periph1_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_periph1").iter().map(|c| c * v2).collect();
+    let periph2_amt: Vec<f64> =
+        derived_col(MODEL, &pop, "C_periph2").iter().map(|c| c * v3).collect();
     assert_matches("3cpt-oral depot A(1)", &depot_amt, &ORAL3_A_DEPOT);
     assert_matches("3cpt-oral central A(2)", &central_amt, &ORAL3_A_CENTRAL);
     assert_matches("3cpt-oral periph1 A(3)", &periph1_amt, &ORAL3_A_PERIPH1);

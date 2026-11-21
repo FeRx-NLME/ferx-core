@@ -97,12 +97,7 @@ fn tab() -> Vec<(f64, f64)> {
 fn evaluate(model: &str, theta: &[f64]) -> (ferx_core::PreparedRun, ferx_core::types::FitResult) {
     let prep = ferx_core::prepare_run(
         root().join("nonmem_anchor").join(model).to_str().unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/level_two_block.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("nonmem_anchor/level_two_block.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{model}: {e}"));
     let mut params = prep.init_params.clone();
@@ -156,12 +151,7 @@ fn two_level_blocks_match_nonmem_and_the_hand_spelling() {
     assert_eq!(etas.len(), 6);
     assert_eq!(level.subjects.len(), 6);
     let d_ofv = (level.ofv - est["OBJ"]).abs();
-    assert!(
-        d_ofv.is_finite(),
-        "OFV: ferx {} NONMEM {}",
-        level.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv.is_finite(), "OFV: ferx {} NONMEM {}", level.ofv, est["OBJ"]);
     let mut d_eta = 0.0f64;
     for (s, want) in level.subjects.iter().zip(&etas) {
         let d = (s.eta[0] - want).abs();
@@ -177,10 +167,7 @@ fn two_level_blocks_match_nonmem_and_the_hand_spelling() {
     let (mut d_pred, mut d_ipred) = (0.0f64, 0.0f64);
     for ((p, i), (wp, wi)) in preds.iter().zip(&rows) {
         let (dp, di) = ((p - wp).abs(), (i - wi).abs());
-        assert!(
-            dp.is_finite() && di.is_finite(),
-            "PRED {p}/{wp}, IPRED {i}/{wi}"
-        );
+        assert!(dp.is_finite() && di.is_finite(), "PRED {p}/{wp}, IPRED {i}/{wi}");
         d_pred = d_pred.max(dp);
         d_ipred = d_ipred.max(di);
     }
@@ -220,14 +207,8 @@ fn two_level_blocks_match_nonmem_and_the_hand_spelling() {
         );
         assert_eq!(a.eta[0].to_bits(), b.eta[0].to_bits(), "{}: η̂", a.id);
         assert!(
-            a.pred
-                .iter()
-                .zip(&b.pred)
-                .all(|(x, y)| x.to_bits() == y.to_bits())
-                && a.ipred
-                    .iter()
-                    .zip(&b.ipred)
-                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+            a.pred.iter().zip(&b.pred).all(|(x, y)| x.to_bits() == y.to_bits())
+                && a.ipred.iter().zip(&b.ipred).all(|(x, y)| x.to_bits() == y.to_bits()),
             "{}: PRED / IPRED differ",
             a.id
         );

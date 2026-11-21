@@ -88,17 +88,10 @@ fn run_chain(optimizer: Optimizer) -> FitResult {
 
 /// SLSQP FOCEI on warfarin_iov returns a finite OFV (smoke).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_slsqp_converges() {
     let result = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
-    assert!(
-        result.ofv.is_finite(),
-        "SLSQP IOV OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "SLSQP IOV OFV must be finite, got {}", result.ofv);
 }
 
 /// The `saem → focei` chain reaches the FOCEI marginal minimum and, crucially,
@@ -106,10 +99,7 @@ fn iov_slsqp_converges() {
 /// gradient (issue #101 rec #2). Before that fix the fixed-EBE gradient left
 /// FOCEI pinned at SAEM's point; now it descends to a strictly better OFV.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_chain_improves_on_saem_and_reaches_reference() {
     let saem = run_single(EstimationMethod::Saem, Optimizer::Slsqp);
     assert!(
@@ -119,11 +109,7 @@ fn iov_chain_improves_on_saem_and_reaches_reference() {
     );
 
     let chain = run_chain(Optimizer::Slsqp);
-    assert!(
-        chain.ofv.is_finite(),
-        "chain OFV must be finite, got {}",
-        chain.ofv
-    );
+    assert!(chain.ofv.is_finite(), "chain OFV must be finite, got {}", chain.ofv);
     // FOCEI polish reaches the reference minimum...
     assert!(
         (chain.ofv - IOV_FOCEI_OFV).abs() < 2.0,
@@ -155,10 +141,7 @@ fn iov_chain_improves_on_saem_and_reaches_reference() {
 /// reconverged gradient are optimizer-independent. BFGS may report
 /// `converged = false` while sitting on the minimum, so this asserts on OFV.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_chain_slsqp_and_bfgs_agree() {
     let slsqp = run_chain(Optimizer::Slsqp);
     let bfgs = run_chain(Optimizer::Bfgs);
@@ -196,10 +179,7 @@ fn iov_saem_smoke_returns_finite_ofv() {
         "SAEM IOV smoke OFV must be finite after 5 iter, got {}",
         result.ofv
     );
-    assert!(
-        result.omega_iov.is_some(),
-        "omega_iov must be present in SAEM IOV result"
-    );
+    assert!(result.omega_iov.is_some(), "omega_iov must be present in SAEM IOV result");
 }
 
 /// Pure FOCEI/SLSQP from the model's cold default start reaches the FOCEI
@@ -223,10 +203,7 @@ fn iov_saem_smoke_returns_finite_ofv() {
 // `resolve_scaling`): with it, pure FOCEI/SLSQP from the cold default start reaches
 // OFV 307.84 and omega_iov climbs to ≈0.046, matching the default BOBYQA.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
     let focei = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
     assert!(
@@ -240,11 +217,7 @@ fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
     // The fix is specifically about moving the IOV variance off its init: Ω_iov
     // starts at 0.01 and must climb toward ≈0.036.
     let iov = focei.omega_iov.expect("omega_iov present")[(0, 0)];
-    assert!(
-        iov > 0.02,
-        "omega_iov must move off its 0.01 init toward ≈0.036, got {:.4}",
-        iov
-    );
+    assert!(iov > 0.02, "omega_iov must move off its 0.01 init toward ≈0.036, got {:.4}", iov);
 }
 
 /// Estimate-level validation for **IOV + `iiv_on_ruv`** (#4b/#486): the new analytic
@@ -256,10 +229,7 @@ fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
 /// analytic fit inherits the FD path's NONMEM anchoring at the estimate level (not just
 /// the per-point gradient agreement the `*_matches_fd` unit tests already pin).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_iiv_on_ruv_analytic_matches_fd_estimates() {
     let src = r#"
 [parameters]
@@ -333,10 +303,7 @@ fn iov_iiv_on_ruv_analytic_matches_fd_estimates() {
 /// optimum. Data: `data/warfarin_iov_bloq.csv` = warfarin_iov with a CENS column
 /// (LLOQ = 1.5 left-censors the 23 sub-limit observations, ~10%).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_m3_analytic_matches_fd_estimates() {
     let src = r#"
 [parameters]
@@ -364,10 +331,7 @@ fn iov_m3_analytic_matches_fd_estimates() {
 "#;
     let model =
         ferx_core::parser::model_parser::parse_model_string(src).expect("IOV + M3 model parses");
-    assert!(matches!(
-        model.bloq_method,
-        ferx_core::types::BloqMethod::M3
-    ));
+    assert!(matches!(model.bloq_method, ferx_core::types::BloqMethod::M3));
     // Gate: M3 + IOV (no iiv_on_ruv) is analytic on both loops.
     assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&model));
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
@@ -415,10 +379,7 @@ fn iov_m3_analytic_matches_fd_estimates() {
 /// BLOQ) anchors; the analytic fit inherits both by landing on the same optimum. Data:
 /// `data/warfarin_iov_bloq.csv` (LLOQ = 1.5, ~10% left-censored).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_m3_iiv_on_ruv_analytic_matches_fd_estimates() {
     let src = r#"
 [parameters]
@@ -449,10 +410,7 @@ fn iov_m3_iiv_on_ruv_analytic_matches_fd_estimates() {
     let model = ferx_core::parser::model_parser::parse_model_string(src)
         .expect("triple M3 + IOV + iiv_on_ruv model parses");
     assert_eq!(model.residual_error_eta, Some(3));
-    assert!(matches!(
-        model.bloq_method,
-        ferx_core::types::BloqMethod::M3
-    ));
+    assert!(matches!(model.bloq_method, ferx_core::types::BloqMethod::M3));
     // Gate: the closed-form triple is analytic on both loops as of #591.
     assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&model));
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
@@ -499,10 +457,7 @@ fn iov_m3_iiv_on_ruv_analytic_matches_fd_estimates() {
 /// warfarin-BLOQ FOCE-vs-FOCEI split, `tests/bloq_convergence.rs`). Data:
 /// `data/warfarin_iov_bloq.csv`.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_m3_foce_analytic_matches_fd_estimates() {
     let src = r#"
 [parameters]
@@ -530,10 +485,7 @@ fn iov_m3_foce_analytic_matches_fd_estimates() {
 "#;
     let model = ferx_core::parser::model_parser::parse_model_string(src)
         .expect("FOCE IOV + M3 model parses");
-    assert!(matches!(
-        model.bloq_method,
-        ferx_core::types::BloqMethod::M3
-    ));
+    assert!(matches!(model.bloq_method, ferx_core::types::BloqMethod::M3));
     assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&model));
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
         .expect("warfarin_iov_bloq data loads");
@@ -594,10 +546,7 @@ fn iov_m3_foce_analytic_matches_fd_estimates() {
 /// catch a genuinely broken ODE path. Data: `data/warfarin_iov_bloq.csv` (LLOQ = 1.5,
 /// ~10% left-censored).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_m3_ode_matches_closed_form_estimates() {
     const CLOSED_FORM: &str = r#"
 [parameters]
@@ -656,10 +605,7 @@ fn iov_m3_ode_matches_closed_form_estimates() {
         .expect("closed-form M3 + IOV model parses");
     let ode_model = ferx_core::parser::model_parser::parse_model_string(ODE)
         .expect("ODE M3 + IOV model parses");
-    assert!(
-        ode_model.is_ode_based(),
-        "ODE model must be on the ODE path"
-    );
+    assert!(ode_model.is_ode_based(), "ODE model must be on the ODE path");
     // Both legs must be on the analytic gradient path (the thing the cross-check guards).
     assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&cf_model));
     assert!(ferx_core::sens::provider::analytic_outer_gradient_available(&ode_model));
@@ -696,10 +642,7 @@ fn iov_m3_ode_matches_closed_form_estimates() {
     let cf = run(&cf_model);
     let ode = run(&ode_model);
 
-    eprintln!(
-        "M3+IOV closed-form vs ODE: OFV {:.5} vs {:.5}",
-        cf.ofv, ode.ofv
-    );
+    eprintln!("M3+IOV closed-form vs ODE: OFV {:.5} vs {:.5}", cf.ofv, ode.ofv);
     for k in 0..cf.theta.len() {
         eprintln!(
             "  theta[{k}]: {:.6} vs {:.6}  ({:.2}%)",
@@ -764,10 +707,7 @@ fn iov_m3_ode_matches_closed_form_estimates() {
 /// *route*, not the objective or the estimates. (Per-point gradient exactness is pinned
 /// separately by the `lagtime_*_matches_fd_*` unit tests.)
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_lagtime_analytic_matches_fd_estimates() {
     let src = r#"
 [parameters]
@@ -869,10 +809,7 @@ fn iov_lagtime_analytic_matches_fd_estimates() {
 /// L-BFGS runs in the same test on the same objective, so the bound is a difference rather
 /// than a platform-specific constant.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iov_pure_gn_reaches_the_lbfgs_optimum() {
     let gn = run_single(EstimationMethod::FoceGn, Optimizer::Lbfgs);
     let lbfgs = run_single(EstimationMethod::FoceI, Optimizer::Lbfgs);

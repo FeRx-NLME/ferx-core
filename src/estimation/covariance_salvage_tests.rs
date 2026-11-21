@@ -21,24 +21,7 @@ use crate::types::{CompiledModel, DoseEvent, ModelParameters, Subject};
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 
-const WARFARIN: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const WARFARIN: &str = crate::test_models::ONE_CPT_ORAL_4;
 
 fn warfarin_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
     let n = times.len();
@@ -62,20 +45,13 @@ fn warfarin_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subj
 /// The EBE to the inner search's tightest tolerance on the adjoint's exact inner gradient, so a
 /// reconverged-FD reference is free of inner-solver noise.
 fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> Vec<f64> {
-    find_ebe(model, subject, params, 500, 1e-12, None, None, 0)
-        .eta
-        .iter()
-        .copied()
-        .collect()
+    find_ebe(model, subject, params, 500, 1e-12, None, None, 0).eta.iter().copied().collect()
 }
 
 /// `n` warfarin subjects whose observations differ (so no subject's term copies another's),
 /// with ids `{tag}{k}` — test-unique, since [`super::forced_cov_decline`] is keyed by id.
 fn salvage_population(
-    model: &CompiledModel,
-    params: &ModelParameters,
-    n: usize,
-    tag: &str,
+    model: &CompiledModel, params: &ModelParameters, n: usize, tag: &str,
 ) -> crate::types::Population {
     let times = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0];
     let subjects: Vec<Subject> = (0..n)
@@ -105,14 +81,8 @@ fn decline(subject: &Subject) {
 
 fn iov_cov_fixture(occasions: usize, block: bool) -> (CompiledModel, Subject) {
     let mut source = WARFARIN
-        .replace(
-            "sigma PROP_ERR ~ 0.04",
-            "kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.15",
-        )
-        .replace(
-            "CL = TVCL * exp(ETA_CL)",
-            "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
-        );
+        .replace("sigma PROP_ERR ~ 0.04", "kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.15")
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + KAPPA_CL)");
     if block {
         source = source
             .replace(
@@ -128,35 +98,27 @@ fn iov_cov_fixture(occasions: usize, block: bool) -> (CompiledModel, Subject) {
             .replace("V  = TVV  * exp(ETA_V)", "V  = TVV  * exp(ETA_V + KAPPA_V)");
     }
     let model = parse_model_string(&source).unwrap();
-    let times: Vec<_> = (0..occasions)
-        .flat_map(|k| [0.5, 2.0, 6.0, 12.0].map(|t| t + 24.0 * k as f64))
-        .collect();
+    let times: Vec<_> =
+        (0..occasions).flat_map(|k| [0.5, 2.0, 6.0, 12.0].map(|t| t + 24.0 * k as f64)).collect();
     let mut subject = warfarin_subject(&model, &model.default_params.theta, &times);
     subject.doses = (0..occasions)
         .map(|k| DoseEvent::new(24.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
         .collect();
-    subject.occasions = (0..occasions)
-        .flat_map(|k| vec![(k + 1) as u32; 4])
-        .collect();
+    subject.occasions = (0..occasions).flat_map(|k| vec![(k + 1) as u32; 4]).collect();
     subject.dose_occasions = (1..=occasions).map(|k| k as u32).collect();
     let eta = vec![0.1; model.n_eta];
     let kappas: Vec<_> = (0..occasions)
         .map(|k| vec![if k % 2 == 0 { 0.12 } else { -0.08 }; model.n_kappa])
         .collect();
     let pred = crate::pk::predict_iov(&model, &subject, &model.default_params.theta, &eta, &kappas);
-    subject.observations = pred
-        .iter()
-        .enumerate()
-        .map(|(i, p)| p * (0.91 + 0.02 * (i % 3) as f64))
-        .collect();
+    subject.observations =
+        pred.iter().enumerate().map(|(i, p)| p * (0.91 + 0.02 * (i % 3) as f64)).collect();
     (model, subject)
 }
 
 /// Standard errors from a packed covariance, as a user reads them.
 fn se_of(cov: &DMatrix<f64>) -> Vec<f64> {
-    (0..cov.nrows())
-        .map(|i| cov[(i, i)].max(0.0).sqrt())
-        .collect()
+    (0..cov.nrows()).map(|i| cov[(i, i)].max(0.0).sqrt()).collect()
 }
 
 /// Worst relative difference between two SE vectors over the coordinates that carry one,
@@ -175,10 +137,7 @@ fn worst_relative_se_diff(a: &[f64], b: &[f64], label: &str) -> f64 {
             worst = worst.max(((y - x) / x).abs());
         }
     }
-    assert!(
-        compared >= 3,
-        "{label}: only {compared} coordinate(s) carried a comparable SE"
-    );
+    assert!(compared >= 3, "{label}: only {compared} coordinate(s) carried a comparable SE");
     worst
 }
 
@@ -268,13 +227,8 @@ fn one_declining_subject_reproduces_the_pure_analytic_covariance() {
         // R-matrix as interchangeable estimators of one matrix, so the gap between them is
         // the difference a user is already expected to tolerate — and routing one subject
         // in ten through the FD estimator *for its own term* has to be a fraction of it.
-        let population_fd = run_with(
-            &plain_pop,
-            &FitOptions {
-                analytic_cov_hessian: false,
-                ..opts.clone()
-            },
-        );
+        let population_fd =
+            run_with(&plain_pop, &FitOptions { analytic_cov_hessian: false, ..opts.clone() });
         let reference_se = se_of(&reference.matrix);
         let estimator_gap = worst_relative_se_diff(
             &reference_se,
@@ -308,20 +262,14 @@ fn one_declining_subject_reproduces_the_pure_analytic_covariance() {
 
         // The informational note is emitted on the salvage route and on neither pure one.
         let note = |o: &crate::estimation::covariance::CovarianceOutput| {
-            o.warnings
-                .iter()
-                .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+            o.warnings.iter().any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
         };
         assert!(note(&hybrid), "{label}: the salvage must be reported");
         assert!(
             !note(&reference),
             "{label}: a fully analytic run must say nothing about salvaging"
         );
-        let msg = hybrid
-            .warnings
-            .iter()
-            .find(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
-            .unwrap();
+        let msg = hybrid.warnings.iter().find(|w| w.contains("W_COV_ANALYTIC_SALVAGE")).unwrap();
         assert!(
             msg.contains("1 of 10 subjects") && msg.contains("salv-one-declined"),
             "{label}: the note must name the count and the subject: {msg}"
@@ -370,13 +318,7 @@ fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
         warnings: Vec::new(),
     };
 
-    let cases: [(
-        &str,
-        &CompiledModel,
-        &Population,
-        &ModelParameters,
-        FitOptions,
-    ); 4] = [
+    let cases: [(&str, &CompiledModel, &Population, &ModelParameters, FitOptions); 4] = [
         (
             "FOCE",
             &plain,
@@ -433,10 +375,7 @@ fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
             .map(|s| {
                 DVector::from_iterator(
                     model.n_eta,
-                    find_ebe(model, s, params, 200, 1e-10, None, None, 0)
-                        .eta
-                        .iter()
-                        .copied(),
+                    find_ebe(model, s, params, 200, 1e-10, None, None, 0).eta.iter().copied(),
                 )
             })
             .collect();
@@ -454,10 +393,7 @@ fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
                 2.0 * pop_nll_opts(model, &sub, &p, &e, &h, &k, &opts)
             };
             let f0 = ofv(&x_hat);
-            assert!(
-                f0.is_finite(),
-                "{label}: subset {idx:?} has a non-finite base OFV"
-            );
+            assert!(f0.is_finite(), "{label}: subset {idx:?} has a non-finite base OFV");
             fd_ofv_stencil(
                 n,
                 &x_hat,
@@ -557,11 +493,8 @@ fn a_fully_declining_population_takes_the_population_stencil() {
         decline(s);
     }
     let x_hat = pack_params(&params);
-    let eta_hats: Vec<DVector<f64>> = pop
-        .subjects
-        .iter()
-        .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
-        .collect();
+    let eta_hats: Vec<DVector<f64>> =
+        pop.subjects.iter().map(|s| DVector::from_vec(precise_ebe(&model, s, &params))).collect();
     let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); pop.subjects.len()];
     let kappas = vec![vec![]; pop.subjects.len()];
     let opts = FitOptions {
@@ -595,10 +528,7 @@ fn a_fully_declining_population_takes_the_population_stencil() {
         ),
     };
     let with_analytic = run(&opts);
-    let forced_fd = run(&FitOptions {
-        analytic_cov_hessian: false,
-        ..opts.clone()
-    });
+    let forced_fd = run(&FitOptions { analytic_cov_hessian: false, ..opts.clone() });
 
     // Bit-identical, not merely close: the short-circuit is supposed to take the *same*
     // route `analytic_cov_hessian = false` takes, so any difference at all means it took
@@ -608,10 +538,7 @@ fn a_fully_declining_population_takes_the_population_stencil() {
         "the short-circuit must be the population stencil, bit for bit"
     );
     assert!(
-        !with_analytic
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
+        !with_analytic.warnings.iter().any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
         "nothing was salvaged, so nothing may be reported as salvaged: {:?}",
         with_analytic.warnings
     );
@@ -652,11 +579,8 @@ fn the_salvage_note_is_gated_on_the_estimator_that_uses_the_r_matrix() {
     decline(&pop.subjects[3]);
 
     let x_hat = pack_params(&params);
-    let eta_hats: Vec<DVector<f64>> = pop
-        .subjects
-        .iter()
-        .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
-        .collect();
+    let eta_hats: Vec<DVector<f64>> =
+        pop.subjects.iter().map(|s| DVector::from_vec(precise_ebe(&model, s, &params))).collect();
     // Real `a = ∂f/∂η` matrices (`n_obs × n_eta`), not the zero placeholders the
     // Hessian-only fixtures above can get away with: `s` and `rsr` route through
     // `assemble_score_cross_product`, which reads `h_matrix.row(j)` for every observation.
@@ -703,13 +627,9 @@ fn the_salvage_note_is_gated_on_the_estimator_that_uses_the_r_matrix() {
     }
 
     let run = |method: CovarianceMethod| {
-        let opts = FitOptions {
-            covariance_method: method,
-            ..base.clone()
-        };
-        match compute_covariance(
-            &x_hat, &params, &model, &pop, &eta_hats, &h_mats, &kappas, &opts,
-        ) {
+        let opts = FitOptions { covariance_method: method, ..base.clone() };
+        match compute_covariance(&x_hat, &params, &model, &pop, &eta_hats, &h_mats, &kappas, &opts)
+        {
             CovarianceStepResult::Success(out) => out,
             other => panic!(
                 "{method:?}: covariance step must succeed; got {}",
@@ -722,9 +642,7 @@ fn the_salvage_note_is_gated_on_the_estimator_that_uses_the_r_matrix() {
         }
     };
     let note = |o: &crate::estimation::covariance::CovarianceOutput| {
-        o.warnings
-            .iter()
-            .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+        o.warnings.iter().any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
     };
 
     for method in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
@@ -794,20 +712,8 @@ fn the_fd_covariance_is_bit_identical_across_thread_counts() {
         verbose: false,
         ..FitOptions::default()
     };
-    let cases: [(
-        &str,
-        &CompiledModel,
-        &Population,
-        &ModelParameters,
-        FitOptions,
-    ); 4] = [
-        (
-            "non-IOV stencil",
-            &plain,
-            &plain_pop,
-            &plain_params,
-            opts(false),
-        ),
+    let cases: [(&str, &CompiledModel, &Population, &ModelParameters, FitOptions); 4] = [
+        ("non-IOV stencil", &plain, &plain_pop, &plain_params, opts(false)),
         (
             // AGQ scores through `agq_population_nll`, whose subject `par_iter` is not
             // size-gated, so this is the cell where the probe's point loop always nests a
@@ -816,25 +722,10 @@ fn the_fd_covariance_is_bit_identical_across_thread_counts() {
             &plain,
             &plain_pop,
             &plain_params,
-            FitOptions {
-                n_agq: 3,
-                ..opts(false)
-            },
+            FitOptions { n_agq: 3, ..opts(false) },
         ),
-        (
-            "IOV stencil",
-            &iov_model,
-            &iov_pop,
-            &iov_params,
-            opts(false),
-        ),
-        (
-            "salvage route",
-            &plain,
-            &salvage_pop,
-            &plain_params,
-            opts(true),
-        ),
+        ("IOV stencil", &iov_model, &iov_pop, &iov_params, opts(false)),
+        ("salvage route", &plain, &salvage_pop, &plain_params, opts(true)),
     ];
 
     for (label, model, pop, params, o) in cases {
@@ -845,10 +736,7 @@ fn the_fd_covariance_is_bit_identical_across_thread_counts() {
             .map(|s| {
                 DVector::from_iterator(
                     model.n_eta,
-                    find_ebe(model, s, params, 200, 1e-10, None, None, 0)
-                        .eta
-                        .iter()
-                        .copied(),
+                    find_ebe(model, s, params, 200, 1e-10, None, None, 0).eta.iter().copied(),
                 )
             })
             .collect();
@@ -867,21 +755,15 @@ fn the_fd_covariance_is_bit_identical_across_thread_counts() {
         }
 
         let run = |threads: usize| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-                .install(|| {
-                    match compute_covariance(
-                        &x_hat, params, model, pop, &etas, &h_mats, &kappas, &o,
-                    ) {
-                        CovarianceStepResult::Success(out) => out.matrix,
-                        CovarianceStepResult::Unusable(m) => panic!("{label}: {m}"),
-                        CovarianceStepResult::FailedNonPd { reason, .. } => {
-                            panic!("{label}: {reason}")
-                        }
+            rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| {
+                match compute_covariance(&x_hat, params, model, pop, &etas, &h_mats, &kappas, &o) {
+                    CovarianceStepResult::Success(out) => out.matrix,
+                    CovarianceStepResult::Unusable(m) => panic!("{label}: {m}"),
+                    CovarianceStepResult::FailedNonPd { reason, .. } => {
+                        panic!("{label}: {reason}")
                     }
-                })
+                }
+            })
         };
         let one = run(1);
         let four = run(4);
@@ -927,10 +809,7 @@ fn the_covariance_step_runs_one_parallel_base_and_2nf2_serial_points() {
         let packed = pack_with_bounds(&params);
         (0..x_hat.len()).filter(|&i| !packed.fixed[i]).count()
     };
-    assert!(
-        nf >= 3,
-        "the fixture must have a real off-diagonal block: nf = {nf}"
-    );
+    assert!(nf >= 3, "the fixture must have a real off-diagonal block: nf = {nf}");
 
     // Unique id prefixes: the log is process-global and tests run concurrently.
     let tagged =
@@ -986,21 +865,13 @@ fn the_covariance_step_runs_one_parallel_base_and_2nf2_serial_points() {
         "whole: the step must be sized by the probe, through `fd_ofv_hessian`"
     );
     let calls = reconverge_log::take("t1935-whole-");
-    assert_eq!(
-        tally(&calls, 4, true),
-        1,
-        "whole: one parallel base point: {calls:?}"
-    );
+    assert_eq!(tally(&calls, 4, true), 1, "whole: one parallel base point: {calls:?}");
     assert_eq!(
         tally(&calls, 4, false),
         2 * nf * nf,
         "whole: 2·n_free² serial stencil + probe points (n_free = {nf})"
     );
-    assert_eq!(
-        calls.len(),
-        1 + 2 * nf * nf,
-        "whole: nothing else: {calls:?}"
-    );
+    assert_eq!(calls.len(), 1 + 2 * nf * nf, "whole: nothing else: {calls:?}");
 
     run(&salvage_pop, &opts(true));
     assert_eq!(
@@ -1025,11 +896,7 @@ fn the_covariance_step_runs_one_parallel_base_and_2nf2_serial_points() {
         2 * nf * nf,
         "salvage: 2·n_free² serial points over the declined subjects (n_free = {nf})"
     );
-    assert_eq!(
-        subset_calls.len(),
-        1 + 2 * nf * nf,
-        "salvage: {subset_calls:?}"
-    );
+    assert_eq!(subset_calls.len(), 1 + 2 * nf * nf, "salvage: {subset_calls:?}");
 }
 
 /// The premise the off-diagonal warning describes (#1514 review §1): `fd_ofv_stencil`
@@ -1069,16 +936,8 @@ fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
         "the fixture must keep both diagonals finite: {:?}",
         stencil.diag_nan
     );
-    assert!(
-        (stencil.hess[(0, 0)] - 2.0).abs() < 1e-6,
-        "{}",
-        stencil.hess[(0, 0)]
-    );
-    assert!(
-        (stencil.hess[(1, 1)] - 4.0).abs() < 1e-6,
-        "{}",
-        stencil.hess[(1, 1)]
-    );
+    assert!((stencil.hess[(0, 0)] - 2.0).abs() < 1e-6, "{}", stencil.hess[(0, 0)]);
+    assert!((stencil.hess[(1, 1)] - 4.0).abs() < 1e-6, "{}", stencil.hess[(1, 1)]);
 
     // Both coordinates are named, and the entry is left at its initial value rather than
     // at some `NaN` that would poison the whole inverse.
@@ -1102,9 +961,8 @@ fn fd_objective_evals_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
 /// factor of exactly 1 on CL, so the likelihood does not depend on `n_fix` while the
 /// `θ + η` count the retired forward provider capped at 24 does.
 fn padded_ode_model(n_fix: usize) -> crate::types::CompiledModel {
-    let thetas: String = (0..n_fix)
-        .map(|k| format!("  theta TH_{k}(0.0, -3.0, 3.0) FIX\n"))
-        .collect();
+    let thetas: String =
+        (0..n_fix).map(|k| format!("  theta TH_{k}(0.0, -3.0, 3.0) FIX\n")).collect();
     let factors: String = (0..n_fix).map(|k| format!(" * (1 + TH_{k})")).collect();
     crate::parser::model_parser::parse_model_string(&format!(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n\
@@ -1151,21 +1009,17 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             );
         }
         assert_eq!(
-            super::analytic_cov_declines(&m, &options, false),
+            super::analytic_cov_declines(&m, &options),
             vec![CovScopeDecline::PerSubjectBail],
             "{axes} axes: no model-level clause may decline the analytic R-matrix"
         );
-        assert!(super::analytic_r_expected(&m, &options, false));
+        assert!(super::analytic_r_expected(&m, &options));
 
         let mut fd = model(n_fix);
         fd.gradient_method = GradientMethod::Fd;
         assert!(!analytic_outer_gradient_available(&fd), "{axes} axes, FD");
-        assert_eq!(
-            Optimizer::Auto.resolve_auto(&fd),
-            Optimizer::Bobyqa,
-            "{axes} axes, FD"
-        );
-        assert!(!super::analytic_r_expected(&fd, &options, false));
+        assert_eq!(Optimizer::Auto.resolve_auto(&fd), Optimizer::Bobyqa, "{axes} axes, FD");
+        assert!(!super::analytic_r_expected(&fd, &options));
     }
 }
 
@@ -1188,10 +1042,7 @@ fn an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject
     .expect("two_cpt_oral_cov.csv loads");
     population.subjects.truncate(6);
     let options = FitOptions::default();
-    let off = FitOptions {
-        analytic_cov_hessian: false,
-        ..FitOptions::default()
-    };
+    let off = FitOptions { analytic_cov_hessian: false, ..FitOptions::default() };
     for n_fix in [20, 21] {
         let model = padded_ode_model(n_fix);
         let axes = model.n_theta + model.n_eta;
@@ -1226,10 +1077,7 @@ fn an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject
             matches!(out, super::CovarianceStepResult::Success(_)),
             "{axes} axes: analytic step"
         );
-        assert_eq!(
-            evals, 0,
-            "{axes} axes: the analytic step differences no objective"
-        );
+        assert_eq!(evals, 0, "{axes} axes: the analytic step differences no objective");
 
         let (out, evals) = step(&model, &off);
         assert!(matches!(out, super::CovarianceStepResult::Success(_)));
@@ -1271,16 +1119,9 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
     use crate::types::{EstimationMethod, FitOptions, Population};
     let (model, narrow) = iov_cov_fixture(1, false);
     let (_, wide) = iov_cov_fixture(6, false);
-    let subject = |s: &Subject, id: &str| Subject {
-        id: id.into(),
-        ..s.clone()
-    };
+    let subject = |s: &Subject, id: &str| Subject { id: id.into(), ..s.clone() };
     let mixed = Population {
-        subjects: vec![
-            subject(&narrow, "n1"),
-            subject(&narrow, "n2"),
-            subject(&wide, "w1"),
-        ],
+        subjects: vec![subject(&narrow, "n1"), subject(&narrow, "n2"), subject(&wide, "w1")],
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
@@ -1292,18 +1133,9 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
         run_covariance_step: true,
         ..FitOptions::default()
     };
-    assert_eq!(
-        predicted_r_route(&model, &options, false),
-        PredictedRRoute::Analytic
-    );
-    let disabled = FitOptions {
-        analytic_cov_hessian: false,
-        ..options.clone()
-    };
-    assert_eq!(
-        predicted_r_route(&model, &disabled, false),
-        PredictedRRoute::Stencil
-    );
+    assert_eq!(predicted_r_route(&model, &options), PredictedRRoute::Analytic);
+    let disabled = FitOptions { analytic_cov_hessian: false, ..options.clone() };
+    assert_eq!(predicted_r_route(&model, &disabled), PredictedRRoute::Stencil);
     assert_eq!(
         pre_fit_covariance_cost(31, &options, false, PredictedRRoute::Analytic),
         None,
@@ -1313,11 +1145,8 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
     // The assembly serves every subject, the wide one included.
     let params = model.default_params.clone();
     let x_hat = pack_params(&params);
-    let eta_hats: Vec<DVector<f64>> = mixed
-        .subjects
-        .iter()
-        .map(|_| DVector::from_element(model.n_eta, 0.1))
-        .collect();
+    let eta_hats: Vec<DVector<f64>> =
+        mixed.subjects.iter().map(|_| DVector::from_element(model.n_eta, 0.1)).collect();
     let kappas: Vec<Vec<DVector<f64>>> = mixed
         .subjects
         .iter()
@@ -1329,9 +1158,7 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
                 .collect()
         })
         .collect();
-    match analytic_cov_assembly(
-        &model, &mixed, &params, &x_hat, &eta_hats, &kappas, &options,
-    ) {
+    match analytic_cov_assembly(&model, &mixed, &params, &x_hat, &eta_hats, &kappas, &options) {
         AnalyticCovAssembly::Full(_) => {}
         AnalyticCovAssembly::Partial { declined, .. } => {
             panic!("expected Full, declined {declined:?}")
@@ -1396,10 +1223,7 @@ fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
         ("pk, y = central / V * 2", "  y = central / V * 2"),
     ] {
         let m = closed(&format!("[scaling]\n{body}\n"));
-        assert!(
-            m.analytic_readout.is_some(),
-            "{label}: Form-C on a pk model"
-        );
+        assert!(m.analytic_readout.is_some(), "{label}: Form-C on a pk model");
         cases.push((label, m));
     }
     let ode_y = ode("", "  y = central / V");
@@ -1414,15 +1238,8 @@ fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
     cases.push(("odes, obs_scale = V", ode_os));
 
     for (label, model) in &cases {
-        assert_eq!(
-            super::analytic_cov_model_declines(model, &options, false),
-            Vec::new(),
-            "{label}"
-        );
-        assert!(
-            super::analytic_r_expected(model, &options, false),
-            "{label}"
-        );
+        assert_eq!(super::analytic_cov_model_declines(model, &options), Vec::new(), "{label}");
+        assert!(super::analytic_r_expected(model, &options), "{label}");
     }
 }
 
@@ -1459,7 +1276,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             other => unreachable!("{other:?} has a remedy but no fixture applying it"),
         }
         assert_eq!(
-            super::analytic_cov_model_declines(&model, &options, false),
+            super::analytic_cov_model_declines(&model, &options),
             vec![decline],
             "{decline:?}: the fixture hits only its own clause"
         );
@@ -1469,7 +1286,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             _ => unreachable!(),
         }
         assert_eq!(
-            super::analytic_cov_model_declines(&model, &options, false),
+            super::analytic_cov_model_declines(&model, &options),
             Vec::new(),
             "{decline:?}: {} must clear the walk",
             decline.remedy().unwrap()
@@ -1523,17 +1340,13 @@ fn cov_520_population(tag: &str) -> crate::types::Population {
 }
 
 /// A covariance step's modes, `H` and κ̂, one entry per subject.
-type Modes = (
-    Vec<nalgebra::DVector<f64>>,
-    Vec<nalgebra::DMatrix<f64>>,
-    Vec<Vec<nalgebra::DVector<f64>>>,
-);
+type Modes =
+    (Vec<nalgebra::DVector<f64>>, Vec<nalgebra::DMatrix<f64>>, Vec<Vec<nalgebra::DVector<f64>>>);
 
 /// The modes, `H` and κ̂ a fit of `model` would hand the covariance step: each subject's EBE
 /// found from scratch at `model`'s own tolerance.
 fn fit_modes(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
+    model: &crate::types::CompiledModel, population: &crate::types::Population,
     options: &crate::types::FitOptions,
 ) -> Modes {
     let p = &model.default_params;
@@ -1554,10 +1367,8 @@ fn fit_modes(
 /// covariance step builds every matrix at, computed here on a model pinned to the plateau, with
 /// no override armed.
 fn modes_reconverged(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
-    options: &crate::types::FitOptions,
-    warm: &[nalgebra::DVector<f64>],
+    model: &crate::types::CompiledModel, population: &crate::types::Population,
+    options: &crate::types::FitOptions, warm: &[nalgebra::DVector<f64>],
 ) -> Modes {
     let p = &model.default_params;
     let x = crate::estimation::parameterization::pack_params(p);
@@ -1577,22 +1388,17 @@ fn modes_reconverged(
 /// The covariance matrix of a step that must succeed without falling back from the tight
 /// scope.
 fn cov_520(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
-    modes: &Modes,
+    model: &crate::types::CompiledModel, population: &crate::types::Population, modes: &Modes,
     options: &crate::types::FitOptions,
 ) -> nalgebra::DMatrix<f64> {
     let p = &model.default_params;
     let x = crate::estimation::parameterization::pack_params(p);
     let method = options.covariance_method;
-    match super::compute_covariance(
-        &x, p, model, population, &modes.0, &modes.1, &modes.2, options,
-    ) {
+    match super::compute_covariance(&x, p, model, population, &modes.0, &modes.1, &modes.2, options)
+    {
         super::CovarianceStepResult::Success(out) => {
             assert!(
-                !out.warnings
-                    .iter()
-                    .any(|w| w.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED")),
+                !out.warnings.iter().any(|w| w.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED")),
                 "{method:?}: the tight scope was built, so nothing fell back: {:?}",
                 out.warnings
             );
@@ -1626,10 +1432,7 @@ fn cov_520(
 fn the_fd_covariance_step_runs_whole_at_the_plateau_tolerance() {
     use crate::types::{CovarianceMethod, FitOptions};
     let population = cov_520_population("cov520-fd");
-    let options = FitOptions {
-        analytic_cov_hessian: false,
-        ..FitOptions::default()
-    };
+    let options = FitOptions { analytic_cov_hessian: false, ..FitOptions::default() };
 
     let default = ode_model_at(None);
     let ov = super::cov_ode_override(&default, &options)
@@ -1658,18 +1461,10 @@ fn the_fd_covariance_step_runs_whole_at_the_plateau_tolerance() {
     ] {
         let mut population = population.clone();
         population.subjects.truncate(n_subj);
-        let cut = |m: &Modes| {
-            (
-                m.0[..n_subj].to_vec(),
-                m.1[..n_subj].to_vec(),
-                m.2[..n_subj].to_vec(),
-            )
-        };
+        let cut =
+            |m: &Modes| (m.0[..n_subj].to_vec(), m.1[..n_subj].to_vec(), m.2[..n_subj].to_vec());
         let (loose, at_plateau_modes) = (cut(&loose), cut(&at_plateau_modes));
-        let options = FitOptions {
-            covariance_method: method,
-            ..options.clone()
-        };
+        let options = FitOptions { covariance_method: method, ..options.clone() };
         let at_default = cov_520(&default, &population, &loose, &options);
         let at_plateau = cov_520(&plateau, &population, &at_plateau_modes, &options);
         assert_eq!(
@@ -1708,7 +1503,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
     assert!(options.analytic_cov_hessian);
     assert!(super::cov_ode_override(&default, &options).is_some());
     assert_eq!(
-        super::predicted_r_route(&default, &options, false),
+        super::predicted_r_route(&default, &options),
         super::PredictedRRoute::Analytic,
         "fixture: every subject is on the analytic R-matrix"
     );
@@ -1716,22 +1511,9 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
     let loose = fit_modes(&default, &population, &options);
     let at_plateau_modes = modes_reconverged(&plateau, &population, &options, &loose.0);
 
-    let with = |method| FitOptions {
-        covariance_method: method,
-        ..options.clone()
-    };
-    let r_inv = cov_520(
-        &default,
-        &population,
-        &loose,
-        &with(CovarianceMethod::Hessian),
-    );
-    let rsr = cov_520(
-        &default,
-        &population,
-        &loose,
-        &with(CovarianceMethod::Sandwich),
-    );
+    let with = |method| FitOptions { covariance_method: method, ..options.clone() };
+    let r_inv = cov_520(&default, &population, &loose, &with(CovarianceMethod::Hessian));
+    let rsr = cov_520(&default, &population, &loose, &with(CovarianceMethod::Sandwich));
     let p = &default.default_params;
     let x = crate::estimation::parameterization::pack_params(p);
     let n = x.len();
@@ -1749,6 +1531,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
             &bounds,
             &options,
             &free_idx,
+            None,
         )
         .expect("S assembles");
         super::combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s, &units)
@@ -1784,17 +1567,14 @@ fn the_hybrid_covariance_step_runs_whole_at_the_plateau_tolerance() {
     let tight = ode_model_at(Some((1e-9, 1e-11)));
     let options = FitOptions::default();
     assert_eq!(
-        super::predicted_r_route(&default, &options, false),
+        super::predicted_r_route(&default, &options),
         super::PredictedRRoute::Analytic,
         "fixture: the decline is invisible to the route walk"
     );
     let loose = fit_modes(&default, &population, &options);
     let at_plateau_modes = modes_reconverged(&plateau, &population, &options, &loose.0);
     for method in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
-        let options = FitOptions {
-            covariance_method: method,
-            ..options.clone()
-        };
+        let options = FitOptions { covariance_method: method, ..options.clone() };
         let p = &default.default_params;
         let x = crate::estimation::parameterization::pack_params(p);
         let super::CovarianceStepResult::Success(out) = super::compute_covariance(
@@ -1810,9 +1590,7 @@ fn the_hybrid_covariance_step_runs_whole_at_the_plateau_tolerance() {
             panic!("{method:?}: the hybrid step succeeds");
         };
         assert!(
-            out.warnings
-                .iter()
-                .any(|w| w.contains(&population.subjects[0].id)),
+            out.warnings.iter().any(|w| w.contains(&population.subjects[0].id)),
             "{method:?}: fixture — the step took the hybrid route: {:?}",
             out.warnings
         );
@@ -1849,31 +1627,20 @@ fn the_fd_stencil_override_covers_a_segment_the_matrix_exponential_declines() {
     )
     .expect("two_cpt_oral_cov.csv loads");
     population.subjects.truncate(6);
-    let options = FitOptions {
-        analytic_cov_hessian: false,
-        threads: Some(1),
-        ..FitOptions::default()
-    };
+    let options =
+        FitOptions { analytic_cov_hessian: false, threads: Some(1), ..FitOptions::default() };
     let linear = |tol| one_state_ode_at("-(CL/V) * central", tol);
     let default = linear(None);
     let plateau = linear(Some((1e-6, 1e-8)));
     assert_eq!(
-        default
-            .ode_spec
-            .as_ref()
-            .expect("an [odes] model")
-            .effective_solver_opts()
-            .method,
+        default.ode_spec.as_ref().expect("an [odes] model").effective_solver_opts().method,
         crate::ode::OdeMethod::Linear,
         "fixture: `auto` solves this model by matrix exponential"
     );
 
     // On the one worker of a one-thread pool, so a step with no override to arm (the pinned
     // cells) runs its `par_iter`s where the seam is set too, and no other test sees it.
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("one-thread pool");
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("one-thread pool");
     let seamed = |f: &(dyn Fn() -> super::CovarianceStepResult + Sync)| {
         pool.install(|| {
             FORCE_LINEAR_DECLINE.set(true);
@@ -1982,16 +1749,8 @@ fn the_stencil_scope_failure_warning_names_the_fallback_and_the_remedy() {
     // Its own token, classified as a covariance-step warning, so a `run_covariance` re-run
     // replaces it rather than leaving a stale copy beside a clean step (#520 review round 2).
     let entry = crate::types::classify_warning(&msg);
-    assert_eq!(
-        entry.category,
-        crate::types::WarningCode::CovarianceStep,
-        "{msg}"
-    );
-    assert_eq!(
-        entry.severity,
-        crate::types::WarningSeverity::Warning,
-        "{msg}"
-    );
+    assert_eq!(entry.category, crate::types::WarningCode::CovarianceStep, "{msg}");
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning, "{msg}");
     for part in [
         "W_COV_ODE_TOLERANCE_NOT_TIGHTENED:",
         "ode_reltol = 1e-6 / ode_abstol = 1e-8",
@@ -2026,10 +1785,7 @@ fn a_scope_failure_is_reported_on_every_step_outcome() {
         panic!("a success stays a success");
     };
     assert_eq!(o.warnings.len(), 2, "{:?}", o.warnings);
-    assert_eq!(
-        o.warnings[0],
-        super::stencil_scope_failure_warning("no pool")
-    );
+    assert_eq!(o.warnings[0], super::stencil_scope_failure_warning("no pool"));
     assert_eq!(o.warnings[1], "an existing note");
 
     let failures = [
@@ -2052,10 +1808,7 @@ fn a_scope_failure_is_reported_on_every_step_outcome() {
         ] {
             assert!(msg.contains(part), "{label}: missing {part:?} in {msg}");
         }
-        assert!(
-            !msg.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED"),
-            "{label}: {msg}"
-        );
+        assert!(!msg.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED"), "{label}: {msg}");
         assert_eq!(
             classify_warning(&msg).category,
             WarningCode::CovarianceFailed,
@@ -2095,10 +1848,7 @@ fn a_covariance_step_whose_tight_scope_fails_runs_at_the_fit_tolerance_and_says_
         ..FitOptions::default()
     };
     let loose = fit_modes(&model, &population, &options);
-    let refused = FitOptions {
-        ode_stiff_abort_after: Some(0),
-        ..options.clone()
-    };
+    let refused = FitOptions { ode_stiff_abort_after: Some(0), ..options.clone() };
     assert!(super::cov_ode_override(&model, &refused)
         .expect("fixture: a default-tolerance ODE model is tightened")
         .validate()
@@ -2143,10 +1893,7 @@ fn a_covariance_step_whose_tight_scope_fails_runs_at_the_fit_tolerance_and_says_
         Some(super::CovarianceStepResult::Success(o)) => o.matrix,
         _ => panic!("the loose step succeeds"),
     };
-    assert_eq!(
-        out.matrix, at_fit,
-        "the fallback is the step at the fit's tolerance"
-    );
+    assert_eq!(out.matrix, at_fit, "the fallback is the step at the fit's tolerance");
     assert_ne!(
         out.matrix,
         cov_520(&model, &population, &loose, &options),
@@ -2203,21 +1950,14 @@ fn the_analytic_r_matrix_skips_held_axes_and_keeps_the_free_block_bit_identical(
     assert_eq!(analytic_cov_axes(&model, &params, n), Some(free.clone()));
     let plain = parse_model_string(WARFARIN).expect("parse");
     assert_eq!(
-        analytic_cov_axes(
-            &plain,
-            &plain.default_params,
-            pack_params(&plain.default_params).len()
-        ),
+        analytic_cov_axes(&plain, &plain.default_params, pack_params(&plain.default_params).len()),
         None,
         "nothing held: the full Hessian"
     );
 
     let pop = salvage_population(&model, &params, 4, "held-axes-");
-    let eta_hats: Vec<DVector<f64>> = pop
-        .subjects
-        .iter()
-        .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
-        .collect();
+    let eta_hats: Vec<DVector<f64>> =
+        pop.subjects.iter().map(|s| DVector::from_vec(precise_ebe(&model, s, &params))).collect();
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,

@@ -1,0 +1,21 @@
+{
+ "cases": {
+  "eval": {
+   "peak_rss_bytes": 214867968,
+   "wall_s": 94.4
+  },
+  "fit": {
+   "peak_rss_bytes": 1008562176,
+   "wall_s": 1420.3
+  }
+ },
+ "created": "2026-11-20T06:13:59Z",
+ "data_sha256": "0079ccb6a5a7784a5ea7fa98bf604943083c5991689984600fbbef227802d130",
+ "measured": "64b3afd7+3081 Linux/x86_64 (OrbStack Rosetta)",
+ "model_sha256": "301923c139dab077979cdae4a98a23fa7a7d06652a99f02fba8e46905c7c3c3a",
+ "platform": "Linux/x86_64",
+ "runner": "local",
+ "reason": "#3081: first baseline, release build of 64b3afd7 + this branch, 4 threads, Linux/x86_64 under OrbStack (Rosetta) on Apple silicon, not a CI runner: provisional (runner `local`): the first nightly fails until its peak-memory-results are accepted. A repeat eval run read 189 MB (-8%). model_sha256 later re-pointed for a comment-only edit of stiff_pkpd.ferx (its regeneration command), not re-measured.",
+ "schema": 1,
+ "threads": 4
+}

@@ -195,14 +195,8 @@ fn form_c_amount_ode_matches_concentration_ode() {
     // swaps to a Single output_fn readout.
     let ode_conc = conc.ode_spec.as_ref().expect("conc ODE present");
     let ode_amt = amt.ode_spec.as_ref().expect("amt ODE present");
-    assert!(matches!(
-        ode_conc.readout,
-        ferx_core::ode::OdeReadout::ObsCmt(_)
-    ));
-    assert!(matches!(
-        ode_amt.readout,
-        ferx_core::ode::OdeReadout::Single(_)
-    ));
+    assert!(matches!(ode_conc.readout, ferx_core::ode::OdeReadout::ObsCmt(_)));
+    assert!(matches!(ode_amt.readout, ferx_core::ode::OdeReadout::Single(_)));
 
     let pop = one_subject_pop();
     let conc_preds = predict(&conc, &pop, &conc.default_params).unwrap();
@@ -348,11 +342,7 @@ fn per_cmt_scaling_works_with_ad_gradient() {
     opts.verbose = false;
     let res = fit(&model, &pop, &model.default_params, &opts)
         .expect("PerCmt + AD fit must complete without errors");
-    assert!(
-        res.ofv.is_finite(),
-        "PerCmt + AD OFV must be finite, got {}",
-        res.ofv
-    );
+    assert!(res.ofv.is_finite(), "PerCmt + AD OFV must be finite, got {}", res.ofv);
     // `gradient = ad` is retired (`E_AD_RETIRED` at the option level; a model that
     // hardcodes it in source falls through to the analytic/FD inner route). The
     // point of this test is that a PerCmt-scaling model still parses and fits.
@@ -375,9 +365,5 @@ fn form_b_expression_scaling_works_with_ad_gradient() {
     opts.verbose = false;
     let res = fit(&model, &pop, &model.default_params, &opts)
         .expect("ExpressionScale + AD fit must complete without errors");
-    assert!(
-        res.ofv.is_finite(),
-        "ExpressionScale + AD OFV must be finite, got {}",
-        res.ofv
-    );
+    assert!(res.ofv.is_finite(), "ExpressionScale + AD OFV must be finite, got {}", res.ofv);
 }

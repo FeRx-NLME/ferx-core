@@ -72,11 +72,7 @@ fn analytical_1cpt_iv_compartments_equals_ipred() {
             .iter()
             .find(|(n, _)| n == "C_central")
             .expect("C_central column must exist");
-        assert_eq!(
-            c_central.1.len(),
-            sr.ipred.len(),
-            "C_central must have same length as IPRED"
-        );
+        assert_eq!(c_central.1.len(), sr.ipred.len(), "C_central must have same length as IPRED");
         for (j, (&cmpt, &ip)) in c_central.1.iter().zip(sr.ipred.iter()).enumerate() {
             assert!(
                 (cmpt - ip).abs() < 1e-10,
@@ -247,27 +243,15 @@ fn analytical_1cpt_oral_depot_and_central() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
 
     for sr in &result.subjects {
-        let depot_col = sr
-            .extra_columns
-            .iter()
-            .find(|(n, _)| n == "A_depot")
-            .expect("A_depot must exist");
-        let central_col = sr
-            .extra_columns
-            .iter()
-            .find(|(n, _)| n == "C_central")
-            .expect("C_central must exist");
+        let depot_col =
+            sr.extra_columns.iter().find(|(n, _)| n == "A_depot").expect("A_depot must exist");
+        let central_col =
+            sr.extra_columns.iter().find(|(n, _)| n == "C_central").expect("C_central must exist");
         for (j, &d) in depot_col.1.iter().enumerate() {
-            assert!(
-                d >= 0.0,
-                "depot amount at obs {j} must be non-negative, got {d}"
-            );
+            assert!(d >= 0.0, "depot amount at obs {j} must be non-negative, got {d}");
         }
         for (j, (&c, &ip)) in central_col.1.iter().zip(sr.ipred.iter()).enumerate() {
-            assert!(
-                (c - ip).abs() < 1e-10,
-                "C_central at obs {j}: {c:.6} != ipred {ip:.6}"
-            );
+            assert!((c - ip).abs() < 1e-10, "C_central at obs {j}: {c:.6} != ipred {ip:.6}");
         }
     }
 }
@@ -300,31 +284,16 @@ fn parse_integral_compartment_subscript_sets_uses_compartments() {
     let result = parse_model_string(MODEL).expect("model must parse");
     let derived = &result.derived_exprs;
 
-    let auc_c0 = derived
-        .iter()
-        .find(|s| s.name == "AUC_C0")
-        .expect("AUC_C0 must be present");
-    if let ferx_core::types::DerivedKind::Integral {
-        uses_compartments, ..
-    } = &auc_c0.kind
-    {
+    let auc_c0 = derived.iter().find(|s| s.name == "AUC_C0").expect("AUC_C0 must be present");
+    if let ferx_core::types::DerivedKind::Integral { uses_compartments, .. } = &auc_c0.kind {
         assert!(uses_compartments, "AUC_C0 must have uses_compartments=true");
     } else {
         panic!("AUC_C0 must be Integral kind");
     }
 
-    let auc_ip = derived
-        .iter()
-        .find(|s| s.name == "AUC_IP")
-        .expect("AUC_IP must be present");
-    if let ferx_core::types::DerivedKind::Integral {
-        uses_compartments, ..
-    } = &auc_ip.kind
-    {
-        assert!(
-            !uses_compartments,
-            "AUC_IP must have uses_compartments=false"
-        );
+    let auc_ip = derived.iter().find(|s| s.name == "AUC_IP").expect("AUC_IP must be present");
+    if let ferx_core::types::DerivedKind::Integral { uses_compartments, .. } = &auc_ip.kind {
+        assert!(!uses_compartments, "AUC_IP must have uses_compartments=false");
     } else {
         panic!("AUC_IP must be Integral kind");
     }
@@ -400,22 +369,15 @@ fn ode_2cpt_effect_compartment_derived() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
 
     for sr in &result.subjects {
-        let ce_col = sr
-            .extra_columns
-            .iter()
-            .find(|(n, _)| n == "Ce")
-            .expect("Ce column must exist");
+        let ce_col =
+            sr.extra_columns.iter().find(|(n, _)| n == "Ce").expect("Ce column must exist");
         let ce_named_col = sr
             .extra_columns
             .iter()
             .find(|(n, _)| n == "Ce_named")
             .expect("Ce_named column must exist");
 
-        assert_eq!(
-            ce_col.1.len(),
-            sr.ipred.len(),
-            "Ce must have same length as IPRED"
-        );
+        assert_eq!(ce_col.1.len(), sr.ipred.len(), "Ce must have same length as IPRED");
 
         for (j, (&by_idx, &by_name)) in ce_col.1.iter().zip(ce_named_col.1.iter()).enumerate() {
             assert!(
@@ -457,10 +419,7 @@ fn ode_integral_over_compartment() {
     // Parse-time check: both integrands reference a compartment state, so
     // uses_compartments must be true for each.
     for spec in &model.derived_exprs {
-        if let ferx_core::types::DerivedKind::Integral {
-            uses_compartments, ..
-        } = &spec.kind
-        {
+        if let ferx_core::types::DerivedKind::Integral { uses_compartments, .. } = &spec.kind {
             assert!(
                 uses_compartments,
                 "{} integral must have uses_compartments=true (references ODE state)",
@@ -475,11 +434,8 @@ fn ode_integral_over_compartment() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
 
     for sr in &result.subjects {
-        let auc_col = sr
-            .extra_columns
-            .iter()
-            .find(|(n, _)| n == "AUC_Ce")
-            .expect("AUC_Ce column must exist");
+        let auc_col =
+            sr.extra_columns.iter().find(|(n, _)| n == "AUC_Ce").expect("AUC_Ce column must exist");
         let auc_named_col = sr
             .extra_columns
             .iter()
@@ -598,11 +554,7 @@ fn analytical_2cpt_oral_peripheral_states() {
         let periph_n = col!("periph_named");
 
         for (j, &d) in depot.iter().enumerate() {
-            assert!(
-                d >= 0.0,
-                "subject {}: depot at obs {j} must be >= 0, got {d}",
-                sr.id
-            );
+            assert!(d >= 0.0, "subject {}: depot at obs {j} must be >= 0, got {d}", sr.id);
         }
         for (j, (&c, &ip)) in central.iter().zip(sr.ipred.iter()).enumerate() {
             assert!(
@@ -612,11 +564,7 @@ fn analytical_2cpt_oral_peripheral_states() {
             );
         }
         for (j, &p) in periph.iter().enumerate() {
-            assert!(
-                p >= 0.0,
-                "subject {}: peripheral at obs {j} must be >= 0, got {p}",
-                sr.id
-            );
+            assert!(p >= 0.0, "subject {}: peripheral at obs {j} must be >= 0, got {p}", sr.id);
         }
         // Named access must equal subscript access.
         for (j, (&d0, &dn)) in depot.iter().zip(depot_n.iter()).enumerate() {
@@ -718,18 +666,10 @@ fn analytical_3cpt_iv_peripheral_states() {
             );
         }
         for (j, &p) in periph1.iter().enumerate() {
-            assert!(
-                p >= 0.0,
-                "subject {}: peripheral1 at obs {j} must be >= 0, got {p}",
-                sr.id
-            );
+            assert!(p >= 0.0, "subject {}: peripheral1 at obs {j} must be >= 0, got {p}", sr.id);
         }
         for (j, &p) in periph2.iter().enumerate() {
-            assert!(
-                p >= 0.0,
-                "subject {}: peripheral2 at obs {j} must be >= 0, got {p}",
-                sr.id
-            );
+            assert!(p >= 0.0, "subject {}: peripheral2 at obs {j} must be >= 0, got {p}", sr.id);
         }
         // Named access must equal subscript access.
         for (j, (&c0, &cn)) in central.iter().zip(cent_n.iter()).enumerate() {
@@ -830,11 +770,7 @@ fn analytical_3cpt_oral_peripheral_states() {
         let p2_n = col!("p2_n");
 
         for (j, &d) in depot.iter().enumerate() {
-            assert!(
-                d >= 0.0,
-                "subject {}: depot at obs {j} must be >= 0, got {d}",
-                sr.id
-            );
+            assert!(d >= 0.0, "subject {}: depot at obs {j} must be >= 0, got {d}", sr.id);
         }
         for (j, (&c, &ip)) in central.iter().zip(sr.ipred.iter()).enumerate() {
             assert!(
@@ -844,18 +780,10 @@ fn analytical_3cpt_oral_peripheral_states() {
             );
         }
         for (j, &p) in periph1.iter().enumerate() {
-            assert!(
-                p >= 0.0,
-                "subject {}: peripheral1 at obs {j} must be >= 0, got {p}",
-                sr.id
-            );
+            assert!(p >= 0.0, "subject {}: peripheral1 at obs {j} must be >= 0, got {p}", sr.id);
         }
         for (j, &p) in periph2.iter().enumerate() {
-            assert!(
-                p >= 0.0,
-                "subject {}: peripheral2 at obs {j} must be >= 0, got {p}",
-                sr.id
-            );
+            assert!(p >= 0.0, "subject {}: peripheral2 at obs {j} must be >= 0, got {p}", sr.id);
         }
         // Named access must equal subscript access.
         for (j, (&d0, &dn)) in depot.iter().zip(depot_n.iter()).enumerate() {
@@ -1091,10 +1019,7 @@ const TWO_CPT_IV_ODE_EFFECT_MODEL: &str = "
 ";
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn auc_ce_2cpt_iv_effect_convergence_and_analytical_ref() {
     let model = parse_model_string(TWO_CPT_IV_ODE_EFFECT_MODEL).expect("model must parse");
     let population = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None)
@@ -1106,11 +1031,7 @@ fn auc_ce_2cpt_iv_effect_convergence_and_analytical_ref() {
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("fit must not error");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 
     let mut auc_ce_vec: Vec<f64> = Vec::new();
     let mut auc_central_vec: Vec<f64> = Vec::new();
@@ -1304,11 +1225,7 @@ fn ode_integral_over_compartment_with_evid3_reset() {
 
         let n_obs = sr.ipred.len();
         assert_eq!(auc_pre_vals.len(), n_obs, "AUC_pre must have n_obs values");
-        assert_eq!(
-            auc_post_vals.len(),
-            n_obs,
-            "AUC_post must have n_obs values"
-        );
+        assert_eq!(auc_post_vals.len(), n_obs, "AUC_post must have n_obs values");
         assert_eq!(c_cmt0_vals.len(), n_obs, "C_cmt0 must have n_obs values");
 
         // ── Session 0: observations at t ≤ 12 (indices 0..=3 in obs_times) ──
@@ -1318,11 +1235,8 @@ fn ode_integral_over_compartment_with_evid3_reset() {
         // At initial theta (CL=2, V=10) the expected trapezoidal AUC_pre ≈ 452
         // (see module-level comment). We allow a wide range to accommodate any
         // parameter movement over 2 outer iterations.
-        let auc_pre_finite: Vec<f64> = auc_pre_vals
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
+        let auc_pre_finite: Vec<f64> =
+            auc_pre_vals.iter().copied().filter(|v| v.is_finite()).collect();
         assert!(
             !auc_pre_finite.is_empty(),
             "subject {}: at least one finite AUC_pre expected (session 0 observations)",
@@ -1344,11 +1258,8 @@ fn ode_integral_over_compartment_with_evid3_reset() {
         // Key regression assertion: after an EVID=3 reset at t=12 the ODE
         // state is zeroed, so the integral over [12,24] must be ≈0.
         // Without fdbbc95 the integral returns ≈41 mg·h (reset ignored).
-        let auc_post_finite: Vec<f64> = auc_post_vals
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
+        let auc_post_finite: Vec<f64> =
+            auc_post_vals.iter().copied().filter(|v| v.is_finite()).collect();
         assert!(
             !auc_post_finite.is_empty(),
             "subject {}: at least one finite AUC_post expected (session 1 observations)",
@@ -1482,11 +1393,8 @@ fn ode_integral_over_compartment_with_evid4_reset() {
         let auc_post_vals = col!("AUC_post");
 
         // ── Session 0 (t ≤ 12) — AUC_pre is finite ───────────────────────
-        let auc_pre_finite: Vec<f64> = auc_pre_vals
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
+        let auc_pre_finite: Vec<f64> =
+            auc_pre_vals.iter().copied().filter(|v| v.is_finite()).collect();
         assert!(
             !auc_pre_finite.is_empty(),
             "subject {}: at least one finite AUC_pre expected",
@@ -1502,11 +1410,8 @@ fn ode_integral_over_compartment_with_evid4_reset() {
         }
 
         // ── Session 1 (t > 12) — AUC_post must be > 0 (new 50 mg dose) ──
-        let auc_post_finite: Vec<f64> = auc_post_vals
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
+        let auc_post_finite: Vec<f64> =
+            auc_post_vals.iter().copied().filter(|v| v.is_finite()).collect();
         assert!(
             !auc_post_finite.is_empty(),
             "subject {}: at least one finite AUC_post expected (EVID=4 re-dose should \
@@ -1576,16 +1481,9 @@ fn out_of_range_compartment_index_returns_nan() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
 
     for sr in &result.subjects {
-        let c_valid = sr
-            .extra_columns
-            .iter()
-            .find(|(n, _)| n == "C_valid")
-            .expect("C_valid must exist");
-        let c_oor = sr
-            .extra_columns
-            .iter()
-            .find(|(n, _)| n == "C_oor")
-            .expect("C_oor must exist");
+        let c_valid =
+            sr.extra_columns.iter().find(|(n, _)| n == "C_valid").expect("C_valid must exist");
+        let c_oor = sr.extra_columns.iter().find(|(n, _)| n == "C_oor").expect("C_oor must exist");
 
         // C_valid should equal IPRED (not NaN)
         for &v in &c_valid.1 {
@@ -1683,10 +1581,7 @@ fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
 
     // W_DERIVED_CMT_RESET_ANALYTICAL must be emitted
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_RESET_ANALYTICAL")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_RESET_ANALYTICAL")),
         "expected W_DERIVED_CMT_RESET_ANALYTICAL warning; got: {:?}",
         result.warnings
     );
@@ -1824,10 +1719,7 @@ fn analytical_tv_covariate_with_compartments_derived_emits_warning() {
 
     // Warning must be emitted.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_TV_ANALYTICAL")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_TV_ANALYTICAL")),
         "expected W_DERIVED_CMT_TV_ANALYTICAL warning; got: {:?}",
         result.warnings
     );
@@ -1896,10 +1788,7 @@ fn ode_tv_covariate_with_compartments_derived_emits_warning() {
 
     // Warning must be emitted.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_TV_ODE")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_TV_ODE")),
         "expected W_DERIVED_CMT_TV_ODE warning; got: {:?}",
         result.warnings
     );
@@ -1976,10 +1865,7 @@ fn analytical_tv_covariate_integral_of_compartment_is_nan() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
 
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_TV_ANALYTICAL")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_TV_ANALYTICAL")),
         "expected W_DERIVED_CMT_TV_ANALYTICAL; got: {:?}",
         result.warnings
     );
@@ -2084,10 +1970,7 @@ fn analytical_oral_depot_infusion_integral_of_compartment_is_nan() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
 
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
         "expected W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL; got: {:?}",
         result.warnings
     );
@@ -2218,10 +2101,7 @@ fn iov_analytical_integral_of_compartment_is_nan() {
 
     // W_DERIVED_CMT_IOV_UNSUPPORTED must be emitted when kappas are present.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
         "expected W_DERIVED_CMT_IOV_UNSUPPORTED warning; got: {:?}",
         result.warnings
     );
@@ -2368,11 +2248,7 @@ fn ode_with_scaling_ipred_is_correctly_scaled() {
             .1
             .as_slice();
 
-        assert_eq!(
-            cmt0_col.len(),
-            sr.ipred.len(),
-            "cmt0 and ipred must have the same length"
-        );
+        assert_eq!(cmt0_col.len(), sr.ipred.len(), "cmt0 and ipred must have the same length");
 
         for (j, (&raw, &ip)) in cmt0_col.iter().zip(sr.ipred.iter()).enumerate() {
             assert!(
@@ -2557,26 +2433,12 @@ fn twin_served_transit_subject_reads_nan_compartments() {
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
     let col = |i: usize, name: &str| {
         let sr = &result.subjects[i];
-        sr.extra_columns
-            .iter()
-            .find(|(n, _)| n == name)
-            .expect("column")
-            .1
-            .clone()
+        sr.extra_columns.iter().find(|(n, _)| n == name).expect("column").1.clone()
     };
-    assert!(col(0, "DEP")
-        .iter()
-        .chain(&col(0, "AUC"))
-        .all(|x| x.is_finite()));
-    assert!(col(1, "DEP")
-        .iter()
-        .chain(&col(1, "AUC"))
-        .all(|x| x.is_nan()));
+    assert!(col(0, "DEP").iter().chain(&col(0, "AUC")).all(|x| x.is_finite()));
+    assert!(col(1, "DEP").iter().chain(&col(1, "AUC")).all(|x| x.is_nan()));
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_DERIVED_CMT_TWIN_ANALYTICAL")),
+        result.warnings.iter().any(|w| w.starts_with("W_DERIVED_CMT_TWIN_ANALYTICAL")),
         "{:?}",
         result.warnings
     );

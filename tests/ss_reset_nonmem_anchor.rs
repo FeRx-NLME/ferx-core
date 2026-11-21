@@ -132,10 +132,7 @@ fn nonmem_obs(path: &str) -> Vec<(String, f64, f64)> {
     text.lines()
         .skip(2) // "TABLE NO.  1" and the header
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
             (c[0], c[1], c[2], c[3])
         })
         .filter(|&(_, _, evid, _)| evid == 0.0)
@@ -147,12 +144,7 @@ fn nonmem_obs(path: &str) -> Vec<(String, f64, f64)> {
 /// outside `skip_ids`, listing every row that misses rather than stopping at the first.
 /// Every prediction is asserted finite before it is folded (`f64::max` discards `NaN`).
 fn assert_matches(
-    label: &str,
-    model_src: &str,
-    data: &str,
-    table: &str,
-    bound: f64,
-    skip_ids: &[&str],
+    label: &str, model_src: &str, data: &str, table: &str, bound: f64, skip_ids: &[&str],
 ) {
     let model = parse_full_model(model_src).expect("model parses").model;
     let pop = read_nonmem_csv(std::path::Path::new(data), None, None).expect("dataset loads");
@@ -176,25 +168,13 @@ fn assert_matches(
         assert!(p.pred.is_finite(), "{label}: ID {id} t={t} non-finite");
         let rel = (p.pred - w).abs() / w.abs();
         if !(rel < bound) {
-            bad.push(format!(
-                "ID {id} t={t}: ferx {} vs NONMEM {w} (rel {rel:.3e})",
-                p.pred
-            ));
+            bad.push(format!("ID {id} t={t}: ferx {} vs NONMEM {w} (rel {rel:.3e})", p.pred));
         }
         worst = worst.max(rel);
     }
-    assert_eq!(
-        skipped > 0,
-        !skip_ids.is_empty(),
-        "{label}: a skipped ID is not in the data"
-    );
+    assert_eq!(skipped > 0, !skip_ids.is_empty(), "{label}: a skipped ID is not in the data");
     println!("#1576 {label}: worst rel vs NONMEM {worst:.3e} (bound {bound:.0e})");
-    assert!(
-        bad.is_empty(),
-        "{label}: {} rows off:\n{}",
-        bad.len(),
-        bad.join("\n")
-    );
+    assert!(bad.is_empty(), "{label}: {} rows off:\n{}", bad.len(), bad.join("\n"));
 }
 
 const ADVAN2_DATA: &str = "nonmem_anchor/ss_reset.csv";
@@ -203,27 +183,13 @@ const ADVAN2_TABLE: &str = "nonmem_anchor/results/ss_reset.sdtab";
 /// D4. Measured 2.7e-15 (the NONMEM-vs-closed-form floor itself); the bound carries ~40x.
 #[test]
 fn analytic_superposition_resets_at_an_ss_record_like_nonmem() {
-    assert_matches(
-        "analytic one_cpt_oral",
-        ANALYTIC,
-        ADVAN2_DATA,
-        ADVAN2_TABLE,
-        1e-13,
-        &[],
-    );
+    assert_matches("analytic one_cpt_oral", ANALYTIC, ADVAN2_DATA, ADVAN2_TABLE, 1e-13, &[]);
 }
 
 /// D1 + D2. Measured 2.1e-9 at `ode_reltol = 1e-11`; the bound carries ~5x.
 #[test]
 fn an_ode_absorption_forcing_resets_at_an_ss_record_like_nonmem() {
-    assert_matches(
-        "ODE first_order forcing",
-        ODE_FORCING,
-        ADVAN2_DATA,
-        ADVAN2_TABLE,
-        1e-8,
-        &[],
-    );
+    assert_matches("ODE first_order forcing", ODE_FORCING, ADVAN2_DATA, ADVAN2_TABLE, 1e-8, &[]);
 }
 
 /// The control: an explicit depot state was already reset by the SS equilibration, and
@@ -233,14 +199,7 @@ fn an_ode_absorption_forcing_resets_at_an_ss_record_like_nonmem() {
 /// Measured 3.1e-9, unchanged from `a1084260`; the bound carries ~3x.
 #[test]
 fn an_ode_depot_state_was_already_reset_and_still_is() {
-    assert_matches(
-        "ODE depot state (control)",
-        ODE_DEPOT,
-        ADVAN2_DATA,
-        ADVAN2_TABLE,
-        1e-8,
-        &[],
-    );
+    assert_matches("ODE depot state (control)", ODE_DEPOT, ADVAN2_DATA, ADVAN2_TABLE, 1e-8, &[]);
 }
 
 /// D1 + D2 through a transit chain (ADVAN13). Measured 9.6e-12; the bound carries ~10x.

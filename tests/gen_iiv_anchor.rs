@@ -58,11 +58,8 @@ fn replicate(base: &Population, copies: usize) -> Population {
 
 fn inject(pop: &mut Population, sims: &[SimulationResult]) {
     for subj in pop.subjects.iter_mut() {
-        let v: Vec<f64> = sims
-            .iter()
-            .filter(|r| r.id == subj.id)
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        let v: Vec<f64> =
+            sims.iter().filter(|r| r.id == subj.id).map(|r| r.outcome.continuous_value()).collect();
         subj.observations = v;
     }
 }
@@ -74,10 +71,8 @@ fn inject(pop: &mut Population, sims: &[SimulationResult]) {
 )]
 fn generate_iiv_on_ruv_anchor() {
     let model = model();
-    let design = replicate(
-        &read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap(),
-        5,
-    );
+    let design =
+        replicate(&read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap(), 5);
     let sims = simulate_with_seed(&model, &design, &model.default_params, 1, 409409).unwrap();
     let mut pop = design.clone();
     inject(&mut pop, &sims);
@@ -109,10 +104,7 @@ fn generate_iiv_on_ruv_anchor() {
     }
     std::fs::create_dir_all("nonmem_anchor").unwrap();
     std::fs::write("nonmem_anchor/iiv_on_ruv.csv", csv).unwrap();
-    println!(
-        "WROTE nonmem_anchor/iiv_on_ruv.csv ({} subjects)",
-        pop.subjects.len()
-    );
+    println!("WROTE nonmem_anchor/iiv_on_ruv.csv ({} subjects)", pop.subjects.len());
 
     // ferx FOCEI fit on the same data.
     let mut opts = FitOptions::default();

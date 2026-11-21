@@ -37,17 +37,11 @@ fn two_cpt_oral_model(structural: &str, extra_indiv: &str, odes: &str) -> String
 
 #[test]
 fn ode_template_desugars_to_ode_model() {
-    let src = two_cpt_oral_model(
-        "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
-        "",
-        "",
-    );
-    let model = parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("ode_template should parse: {e}"))
-        .model;
-    let ode = model
-        .ode_spec
-        .expect("ode_template must produce an ODE model");
+    let src =
+        two_cpt_oral_model("ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)", "", "");
+    let model =
+        parse_full_model(&src).unwrap_or_else(|e| panic!("ode_template should parse: {e}")).model;
+    let ode = model.ode_spec.expect("ode_template must produce an ODE model");
     assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
     // Pure disposition — no built-in input-rate forcing without an override.
     assert!(ode.input_rate.is_empty());
@@ -68,9 +62,8 @@ fn ode_template_override_replaces_only_named_compartment() {
         "  NTR = 3.0\n  MTT = 1.0\n",
         "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
     );
-    let model = parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("override should parse: {e}"))
-        .model;
+    let model =
+        parse_full_model(&src).unwrap_or_else(|e| panic!("override should parse: {e}")).model;
     let ode = model.ode_spec.expect("ODE model");
     assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
     assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
@@ -85,20 +78,13 @@ fn ode_template_override_unknown_compartment_errors() {
         "[odes]\n  d/dt(gut) = -KA*gut\n\n",
     );
     let err = parse_err(&src);
-    assert!(
-        err.contains("d/dt(gut)") && err.contains("generated states"),
-        "got: {err}"
-    );
+    assert!(err.contains("d/dt(gut)") && err.contains("generated states"), "got: {err}");
 }
 
 #[test]
 fn ode_template_missing_required_role_errors() {
     // Surfaced through the full-model parse, not just the generator.
-    let src = two_cpt_oral_model(
-        "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)",
-        "",
-        "",
-    );
+    let src = two_cpt_oral_model("ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)", "", "");
     let err = parse_err(&src);
     assert!(err.contains("requires `ka`"), "got: {err}");
 }
@@ -153,25 +139,16 @@ fn transit_time_desugars_to_ode_equivalent() {
         PkModel::OneCptTransit,
         "primary model is still the closed-form transit"
     );
-    assert!(
-        model.ode_spec.is_none(),
-        "the primary transit model is not itself an ODE model"
-    );
+    assert!(model.ode_spec.is_none(), "the primary transit model is not itself an ODE model");
     let eq = model
         .absorption_ode_equivalent
         .as_ref()
         .expect("transit + TIME must carry an ODE equivalent")
         .built();
-    let ode = eq
-        .ode_spec
-        .as_ref()
-        .expect("the equivalent is an ODE model");
+    let ode = eq.ode_spec.as_ref().expect("the equivalent is an ODE model");
     assert_eq!(ode.state_names, vec!["central"]);
     assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
-    assert!(
-        compiled_model_uses_time_builtin(&model),
-        "the TIME switch is on the model"
-    );
+    assert!(compiled_model_uses_time_builtin(&model), "the TIME switch is on the model");
 
     // A transit model WITHOUT a TIME switch keeps the fast, exact closed form as its
     // primary representation (the equivalent is still built, but the dispatch never uses
@@ -259,10 +236,7 @@ fn error_rule_analytical_pk_plus_transit() {
         "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
     );
     let err = parse_err(&src);
-    assert!(
-        err.contains("ode_template"),
-        "should point at ode_template: {err}"
-    );
+    assert!(err.contains("ode_template"), "should point at ode_template: {err}");
     assert!(err.contains("transit"), "should name the function: {err}");
 }
 
@@ -277,20 +251,14 @@ fn error_rule_analytical_pk_plus_weibull() {
         "[odes]\n  d/dt(depot) = weibull(td=TD, beta=BETA) - KA*depot\n\n",
     );
     let err = parse_err(&src);
-    assert!(
-        err.contains("ode_template"),
-        "should point at ode_template: {err}"
-    );
+    assert!(err.contains("ode_template"), "should point at ode_template: {err}");
     assert!(err.contains("weibull"), "should name the function: {err}");
 }
 
 #[test]
 fn ode_only_absorption_fn_detection() {
     let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
-    assert_eq!(
-        ode_only_absorption_fn_in_odes(Some(&transit)),
-        Some("transit")
-    );
+    assert_eq!(ode_only_absorption_fn_in_odes(Some(&transit)), Some("transit"));
     // `igd` is implemented as of #347, so the error rule now recognises it
     // (routing an analytical `pk` + `igd()` to `ode_template`).
     let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
@@ -299,19 +267,13 @@ fn ode_only_absorption_fn_detection() {
     // it. Unlike `transit`/`igd`, it has no closed form, so it stays on the
     // ODE-only list permanently (it can never route to an analytical `pk`).
     let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
-    assert_eq!(
-        ode_only_absorption_fn_in_odes(Some(&weibull)),
-        Some("weibull")
-    );
+    assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), Some("weibull"));
     // `zero_order` is implemented as of #504. It has a closed form (an
     // infusion), but #504 ships it ODE-only, so the error rule lists it until
     // the analytical acceleration lands (keeps `pk ... + zero_order(...)` from
     // silently dropping the absorption).
     let zero_order = vec!["d/dt(central) = zero_order(dur=DUR) - (CL/V)*central".to_string()];
-    assert_eq!(
-        ode_only_absorption_fn_in_odes(Some(&zero_order)),
-        Some("zero_order")
-    );
+    assert_eq!(ode_only_absorption_fn_in_odes(Some(&zero_order)), Some("zero_order"));
     // A plain disposition ODE has no ODE-only absorption call.
     let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
     assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
@@ -334,11 +296,8 @@ fn ode_template_rejects_mixing_with_ode() {
 #[test]
 fn ode_template_trailing_comma_ok() {
     // A trailing comma yields an empty `role=VAR` pair, which is skipped.
-    let src = two_cpt_oral_model(
-        "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, )",
-        "",
-        "",
-    );
+    let src =
+        two_cpt_oral_model("ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, )", "", "");
     assert!(
         parse_full_model(&src).is_ok(),
         "a trailing comma in the parameter list should be tolerated"
@@ -430,10 +389,7 @@ fn extract_transit_input_rate_basic() {
     assert_eq!(cleaned[1], "d/dt(central) = KA*depot - (CL/V)*central");
     assert_eq!(forcings.len(), 1);
     assert_eq!(forcings[0].cmt, 0); // depot
-    assert!(matches!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::Transit
-    ));
+    assert!(matches!(forcings[0].kind, crate::pk::absorption::InputRateKind::Transit));
     assert_eq!(forcings[0].arg_slots, vec![10, 11]); // [n=NTR slot, mtt=MTT slot]
 }
 
@@ -447,15 +403,11 @@ fn extract_transit_input_rate_rejects_bad_specs() {
     assert!(go("d/dt(depot) = transit(n=NTR, mtt=ZZZ)")
         .unwrap_err()
         .contains("not a declared individual parameter"));
-    assert!(go("d/dt(depot) = transit(n=NTR, foo=MTT)")
-        .unwrap_err()
-        .contains("no argument `foo`"));
+    assert!(go("d/dt(depot) = transit(n=NTR, foo=MTT)").unwrap_err().contains("no argument `foo`"));
     assert!(go("d/dt(depot) = transit(n=NTR)")
         .unwrap_err()
         .contains("missing required argument `mtt`"));
-    assert!(go("x = transit(n=NTR, mtt=MTT)")
-        .unwrap_err()
-        .contains("d/dt"));
+    assert!(go("x = transit(n=NTR, mtt=MTT)").unwrap_err().contains("d/dt"));
     // A leading multiplier that is not a declared individual parameter is not a
     // valid pathway fraction (#388): `FR` is undeclared here.
     assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
@@ -472,15 +424,9 @@ fn extract_transit_input_rate_rejects_bad_specs() {
         .contains("bare additive"));
     // Parenthesised + scaled outside the group: the old adjacency check saw
     // only the flanking `(`/`)`, so the `/V` was silently dropped — now rejected.
-    assert!(go("d/dt(depot) = (transit(n=NTR, mtt=MTT))/V")
-        .unwrap_err()
-        .contains("bare additive"));
-    assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT")
-        .unwrap_err()
-        .contains("unbalanced"));
-    assert!(go("d/dt(depot) = transit(NTR, mtt=MTT)")
-        .unwrap_err()
-        .contains("name=parameter"));
+    assert!(go("d/dt(depot) = (transit(n=NTR, mtt=MTT))/V").unwrap_err().contains("bare additive"));
+    assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT").unwrap_err().contains("unbalanced"));
+    assert!(go("d/dt(depot) = transit(NTR, mtt=MTT)").unwrap_err().contains("name=parameter"));
     // Two bare transit terms now PARSE — parallel/biphasic absorption is allowed
     // at the parser layer (#388); the "must be fractioned" rule is a fit-init
     // check (see `check_absorption_dosing` / `E_ABSORPTION_FRACTION`).
@@ -517,21 +463,13 @@ fn extract_igd_input_rate_basic() {
     // resolved to the [mat, cv2] slots in order; the rest of the RHS untouched.
     let lines = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central".to_string()];
     let states = vec!["depot".to_string(), "central".to_string()];
-    let names = vec![
-        "MAT".to_string(),
-        "CV2".to_string(),
-        "CL".to_string(),
-        "V".to_string(),
-    ];
+    let names = vec!["MAT".to_string(), "CV2".to_string(), "CL".to_string(), "V".to_string()];
     let slots = vec![4, 5, 0, 1];
     let (cleaned, forcings) = extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
     assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
     assert_eq!(forcings.len(), 1);
     assert_eq!(forcings[0].cmt, 1); // central
-    assert!(matches!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::InverseGaussian
-    ));
+    assert!(matches!(forcings[0].kind, crate::pk::absorption::InputRateKind::InverseGaussian));
     assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [mat=MAT slot, cv2=CV2 slot]
 }
 
@@ -591,10 +529,7 @@ fn extract_fraction_must_be_a_declared_parameter() {
     // the user must declare a complementary parameter.
     let err =
         go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2) + (1-FR)*igd(mat=MAT, cv2=CV2)").unwrap_err();
-    assert!(
-        err.contains("parentheses") || err.contains("pathway"),
-        "got: {err}"
-    );
+    assert!(err.contains("parentheses") || err.contains("pathway"), "got: {err}");
 
     // An undeclared multiplier names the offender and points at the fix.
     let err2 = go("d/dt(central) = ZZ*igd(mat=MAT, cv2=CV2)").unwrap_err();
@@ -605,10 +540,7 @@ fn extract_fraction_must_be_a_declared_parameter() {
     // defect is the leading `-`. Report it as the sign/scale rejection so the
     // message is not misleading (regression for the misattributed diagnostic).
     let err3 = go("d/dt(central) = MAT*central - FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
-    assert!(
-        err3.contains("bare additive") && err3.contains("negated"),
-        "got: {err3}"
-    );
+    assert!(err3.contains("bare additive") && err3.contains("negated"), "got: {err3}");
     // A compound multiplier (`K*FR*`) where both names are declared is likewise a
     // scale rejection, not a non-parameter one.
     let err4 = go("d/dt(central) = MAT*FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
@@ -657,15 +589,10 @@ fn extract_igd_input_rate_rejects_bad_specs() {
     assert!(go("d/dt(central) = igd(mat=MAT, cv2=ZZZ)")
         .unwrap_err()
         .contains("not a declared individual parameter"));
-    assert!(go("d/dt(central) = igd(mat=MAT, foo=CV2)")
-        .unwrap_err()
-        .contains("no argument `foo`"));
+    assert!(go("d/dt(central) = igd(mat=MAT, foo=CV2)").unwrap_err().contains("no argument `foo`"));
     // Missing arg names the offender and lists the expected names generically.
     let err = go("d/dt(central) = igd(mat=MAT)").unwrap_err();
-    assert!(
-        err.contains("missing required argument `cv2`"),
-        "got: {err}"
-    );
+    assert!(err.contains("missing required argument `cv2`"), "got: {err}");
     // `FR*igd(...)` is a pathway-fraction multiplier (#388), but `FR` is not a
     // declared individual parameter here, so it is rejected as a non-parameter
     // fraction; the message names `igd`, not `transit`.
@@ -674,12 +601,8 @@ fn extract_igd_input_rate_rejects_bad_specs() {
         scaled.contains("pathway-fraction multiplier") && scaled.contains("igd"),
         "got: {scaled}"
     );
-    assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2")
-        .unwrap_err()
-        .contains("unbalanced"));
-    assert!(go("d/dt(central) = igd(MAT, cv2=CV2)")
-        .unwrap_err()
-        .contains("name=parameter"));
+    assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2").unwrap_err().contains("unbalanced"));
+    assert!(go("d/dt(central) = igd(MAT, cv2=CV2)").unwrap_err().contains("name=parameter"));
     // Two bare igd calls on one equation now PARSE (biphasic sum, #388) into two
     // unfractioned forcings; the "each term needs a fraction" rule is enforced at
     // fit-init (`check_absorption_dosing`), not here.
@@ -702,21 +625,13 @@ fn extract_weibull_input_rate_basic() {
     // untouched.
     let lines = vec!["d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central".to_string()];
     let states = vec!["depot".to_string(), "central".to_string()];
-    let names = vec![
-        "TD".to_string(),
-        "BETA".to_string(),
-        "CL".to_string(),
-        "V".to_string(),
-    ];
+    let names = vec!["TD".to_string(), "BETA".to_string(), "CL".to_string(), "V".to_string()];
     let slots = vec![4, 5, 0, 1];
     let (cleaned, forcings) = extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
     assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
     assert_eq!(forcings.len(), 1);
     assert_eq!(forcings[0].cmt, 1); // central
-    assert!(matches!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::Weibull
-    ));
+    assert!(matches!(forcings[0].kind, crate::pk::absorption::InputRateKind::Weibull));
     assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [td=TD slot, beta=BETA slot]
 }
 
@@ -734,10 +649,7 @@ fn extract_weibull_input_rate_rejects_bad_specs() {
         .unwrap_err()
         .contains("no argument `foo`"));
     let err = go("d/dt(central) = weibull(td=TD)").unwrap_err();
-    assert!(
-        err.contains("missing required argument `beta`"),
-        "got: {err}"
-    );
+    assert!(err.contains("missing required argument `beta`"), "got: {err}");
     // `FR*weibull(...)` is a pathway-fraction multiplier (#388) but `FR` is
     // undeclared, so it is rejected as a non-parameter fraction naming `weibull`.
     let scaled = go("d/dt(central) = FR*weibull(td=TD, beta=BETA)").unwrap_err();
@@ -762,10 +674,7 @@ fn extract_zero_order_input_rate_basic() {
     assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
     assert_eq!(forcings.len(), 1);
     assert_eq!(forcings[0].cmt, 1); // central
-    assert!(matches!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::ZeroOrder
-    ));
+    assert!(matches!(forcings[0].kind, crate::pk::absorption::InputRateKind::ZeroOrder));
     assert_eq!(forcings[0].arg_slots, vec![4]); // single [dur=DUR slot]
 }
 
@@ -779,12 +688,7 @@ fn extract_zero_order_into_depot_for_sequential() {
         "d/dt(central) = KA*depot - CL/V*central".to_string(),
     ];
     let states = vec!["depot".to_string(), "central".to_string()];
-    let names = vec![
-        "DUR".to_string(),
-        "KA".to_string(),
-        "CL".to_string(),
-        "V".to_string(),
-    ];
+    let names = vec!["DUR".to_string(), "KA".to_string(), "CL".to_string(), "V".to_string()];
     let slots = vec![4, 5, 0, 1];
     let (cleaned, forcings) = extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
     assert_eq!(cleaned[0], "d/dt(depot) = 0 - KA*depot");
@@ -804,23 +708,16 @@ fn extract_zero_order_input_rate_rejects_bad_specs() {
     assert!(go("d/dt(central) = zero_order(dur=ZZZ)")
         .unwrap_err()
         .contains("not a declared individual parameter"));
-    assert!(go("d/dt(central) = zero_order(foo=DUR)")
-        .unwrap_err()
-        .contains("no argument `foo`"));
+    assert!(go("d/dt(central) = zero_order(foo=DUR)").unwrap_err().contains("no argument `foo`"));
     // Empty parens: the single (empty) argument is rejected as not a
     // `name=parameter` pair — `dur` is required, so the call cannot be bare.
-    assert!(go("d/dt(central) = zero_order()")
-        .unwrap_err()
-        .contains("name=parameter"));
+    assert!(go("d/dt(central) = zero_order()").unwrap_err().contains("name=parameter"));
     // A pathway fraction on zero_order with a *declared* `FZO` now parses (#505):
     // the zero-order channel carries the fraction (`mixed` model). The
     // `FZO` multiplier resolves to its slot and the term is a ZeroOrder forcing.
     let (_, frac_forcings) = go("d/dt(central) = FZO*zero_order(dur=DUR)").unwrap();
     assert_eq!(frac_forcings.len(), 1);
-    assert_eq!(
-        frac_forcings[0].kind,
-        crate::pk::absorption::InputRateKind::ZeroOrder
-    );
+    assert_eq!(frac_forcings[0].kind, crate::pk::absorption::InputRateKind::ZeroOrder);
     assert_eq!(frac_forcings[0].frac_slot, Some(6)); // FZO @ slot 6
     assert!(go("x = zero_order(dur=DUR)").unwrap_err().contains("d/dt"));
     // Positive control: a bare additive zero_order() is accepted.
@@ -833,25 +730,14 @@ fn extract_accepts_two_different_input_rate_fns_on_one_equation() {
     // two forcings on the same compartment, table order (transit before igd). The
     // "each must be fractioned" rule is a fit-init check, not a parser one.
     let states = vec!["central".to_string()];
-    let names = vec![
-        "NTR".to_string(),
-        "MTT".to_string(),
-        "MAT".to_string(),
-        "CV2".to_string(),
-    ];
+    let names = vec!["NTR".to_string(), "MTT".to_string(), "MAT".to_string(), "CV2".to_string()];
     let slots = vec![10, 11, 4, 5];
     let line = "d/dt(central) = transit(n=NTR, mtt=MTT) + igd(mat=MAT, cv2=CV2)".to_string();
     let (cleaned, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
     assert_eq!(cleaned[0], "d/dt(central) = 0 + 0");
     assert_eq!(forcings.len(), 2);
-    assert!(matches!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::Transit
-    ));
-    assert!(matches!(
-        forcings[1].kind,
-        crate::pk::absorption::InputRateKind::InverseGaussian
-    ));
+    assert!(matches!(forcings[0].kind, crate::pk::absorption::InputRateKind::Transit));
+    assert!(matches!(forcings[1].kind, crate::pk::absorption::InputRateKind::InverseGaussian));
     assert!(forcings.iter().all(|f| f.cmt == 0 && f.frac_slot.is_none()));
 }
 
@@ -868,10 +754,7 @@ fn extract_first_order_single_input_rate() {
     let (cleaned, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
     assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
     assert_eq!(forcings.len(), 1);
-    assert_eq!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::FirstOrder
-    );
+    assert_eq!(forcings[0].kind, crate::pk::absorption::InputRateKind::FirstOrder);
     assert_eq!(forcings[0].arg_slots, vec![4]); // ka @ 4
     assert_eq!(forcings[0].frac_slot, None);
 }
@@ -881,12 +764,7 @@ fn extract_parallel_dual_first_order() {
     // parallel: FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) — two FirstOrder
     // forcings on one compartment, each carrying a declared pathway fraction.
     let states = vec!["central".to_string()];
-    let names = vec![
-        "FR1".to_string(),
-        "FR2".to_string(),
-        "KA1".to_string(),
-        "KA2".to_string(),
-    ];
+    let names = vec!["FR1".to_string(), "FR2".to_string(), "KA1".to_string(), "KA2".to_string()];
     let slots = vec![2, 3, 4, 5];
     let line = "d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central"
         .to_string();
@@ -907,12 +785,7 @@ fn extract_mixed_first_plus_zero_order() {
     // first-order term and a Channel-B zero-order term on one compartment, both
     // fractioned. Table order puts zero_order before first_order.
     let states = vec!["central".to_string()];
-    let names = vec![
-        "FZO1".to_string(),
-        "FZO".to_string(),
-        "KA".to_string(),
-        "DUR".to_string(),
-    ];
+    let names = vec!["FZO1".to_string(), "FZO".to_string(), "KA".to_string(), "DUR".to_string()];
     let slots = vec![2, 3, 4, 6];
     let line = "d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central"
         .to_string();
@@ -982,10 +855,7 @@ fn extract_zero_order_with_per_route_lag() {
     let line = "d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central".to_string();
     let (_, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
     assert_eq!(forcings.len(), 1);
-    assert_eq!(
-        forcings[0].kind,
-        crate::pk::absorption::InputRateKind::ZeroOrder
-    );
+    assert_eq!(forcings[0].kind, crate::pk::absorption::InputRateKind::ZeroOrder);
     assert_eq!(forcings[0].arg_slots, vec![4]); // dur @ 4
     assert_eq!(forcings[0].lag_slot, Some(7)); // LAG @ 7
 }
@@ -997,10 +867,7 @@ fn extract_rejects_duplicate_lag_arg() {
     let slots = vec![4, 6, 7];
     let line = "d/dt(central) = first_order(ka=KA, lag=L1, lag=L2) - CL/V*central".to_string();
     let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
-    assert!(
-        err.contains("duplicate") && err.contains("lag"),
-        "got: {err}"
-    );
+    assert!(err.contains("duplicate") && err.contains("lag"), "got: {err}");
 }
 
 #[test]
@@ -1012,10 +879,7 @@ fn extract_unknown_arg_message_mentions_lag() {
     let slots = vec![4, 6];
     let line = "d/dt(central) = first_order(ka=KA, foo=X) - CL/V*central".to_string();
     let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
-    assert!(
-        err.contains("no argument `foo`") && err.contains("lag"),
-        "got: {err}"
-    );
+    assert!(err.contains("no argument `foo`") && err.contains("lag"), "got: {err}");
 }
 
 #[test]
@@ -1025,9 +889,7 @@ fn extract_first_order_rejects_bad_specs() {
     let slots = vec![4, 2];
     let go = |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
     // Unknown / wrong argument name.
-    assert!(go("d/dt(central) = first_order(mtt=KA)")
-        .unwrap_err()
-        .contains("no argument `mtt`"));
+    assert!(go("d/dt(central) = first_order(mtt=KA)").unwrap_err().contains("no argument `mtt`"));
     // Undeclared parameter as the argument.
     assert!(go("d/dt(central) = first_order(ka=ZZZ)")
         .unwrap_err()
@@ -1086,10 +948,7 @@ fn unknown_pk_model_name_errors() {
     // model" error — the `None`/`other` arm of the name resolution.
     let lines = vec!["pk four_cpt_iv(cl=CL, v=V)".to_string()];
     let err = parse_structural_model(&lines).unwrap_err();
-    assert!(
-        err.contains("Unknown PK model") && err.contains("four_cpt_iv"),
-        "got: {err}"
-    );
+    assert!(err.contains("Unknown PK model") && err.contains("four_cpt_iv"), "got: {err}");
 }
 
 // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
@@ -1152,17 +1011,9 @@ fn canonical_name_round_trips_through_parser() {
     ] {
         let lines = vec![format!("pk {}(cl=CL, v=V)", model.canonical_name())];
         let (parsed, _) = parse_structural_model(&lines).unwrap_or_else(|e| {
-            panic!(
-                "canonical_name `{}` did not parse: {e}",
-                model.canonical_name()
-            )
+            panic!("canonical_name `{}` did not parse: {e}", model.canonical_name())
         });
-        assert_eq!(
-            parsed,
-            model,
-            "canonical_name `{}` did not round-trip",
-            model.canonical_name()
-        );
+        assert_eq!(parsed, model, "canonical_name `{}` did not round-trip", model.canonical_name());
     }
 }
 
@@ -1295,21 +1146,11 @@ fn test_unused_pk_param_warns() {
 ";
     let parsed =
         super::parse_full_model(model_str).expect("unused params are a warning, not a parse error");
-    let warn = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .find(|w| w.contains("does not use"))
-        .unwrap_or_else(|| {
-            panic!(
-                "expected an unused-param warning, got: {:?}",
-                parsed.model.parse_warnings
-            )
-        });
-    assert!(
-        warn.contains("`ka`"),
-        "ka should be flagged unused on IV: {warn}"
-    );
+    let warn =
+        parsed.model.parse_warnings.iter().find(|w| w.contains("does not use")).unwrap_or_else(
+            || panic!("expected an unused-param warning, got: {:?}", parsed.model.parse_warnings),
+        );
+    assert!(warn.contains("`ka`"), "ka should be flagged unused on IV: {warn}");
     assert!(
         !warn.contains("`f`"),
         "f is applied to IV bolus/infusion (#327) and must not be flagged: {warn}"
@@ -1362,30 +1203,19 @@ fn test_f_lagtime_warning_matrix() {
     // (1) IV + `f` mapped → NOT flagged. F scales the bioavailable amount
     // on every route — IV bolus and infusion included (#327) — so it is
     // used, not inert, on IV models.
-    let ws = warns(
-        &format!("{clv}\n  F = 0.8"),
-        "pk one_cpt_iv(cl=CL, v=V, f=F)",
-    );
+    let ws = warns(&format!("{clv}\n  F = 0.8"), "pk one_cpt_iv(cl=CL, v=V, f=F)");
     assert!(
         !has(&ws, "does not use"),
         "IV + mapped f must not warn now that F applies to IV doses (#327): {ws:?}"
     );
 
     // (2) IV + `lagtime` mapped → NOT flagged (every model applies lagtime).
-    let ws = warns(
-        &format!("{clv}\n  LAG = 0.5"),
-        "pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)",
-    );
-    assert!(
-        !has(&ws, "does not use"),
-        "IV + lagtime must not warn: {ws:?}"
-    );
+    let ws = warns(&format!("{clv}\n  LAG = 0.5"), "pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)");
+    assert!(!has(&ws, "does not use"), "IV + lagtime must not warn: {ws:?}");
 
     // (3) Oral + `f` mapped (defined) → no warning.
-    let ws = warns(
-        &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
-        "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
-    );
+    let ws =
+        warns(&format!("{clv}\n  KA = 1.0\n  F = 0.8"), "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)");
     assert!(
         !has(&ws, "does not use") && !has(&ws, "computed but never used"),
         "oral + used f must not warn: {ws:?}"
@@ -1402,10 +1232,7 @@ fn test_f_lagtime_warning_matrix() {
     );
 
     // (5) Oral + `F` declared but NOT mapped → "computed but never used `F`".
-    let ws = warns(
-        &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
-        "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
-    );
+    let ws = warns(&format!("{clv}\n  KA = 1.0\n  F = 0.8"), "pk one_cpt_oral(cl=CL, v=V, ka=KA)");
     assert!(
         has(&ws, "computed but never used") && has(&ws, "`F`"),
         "oral + declared-not-mapped F should warn dead: {ws:?}"
@@ -1450,10 +1277,7 @@ fn test_param_used_only_in_derived_not_flagged_dead() {
     // KEL is referenced in [derived] → used → no dead warning.
     let p = super::parse_full_model(&model("\n[derived]\n  RATE = KEL * 2\n")).expect("parse ok");
     assert!(
-        !p.model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("computed but never used")),
+        !p.model.parse_warnings.iter().any(|w| w.contains("computed but never used")),
         "KEL is used in [derived] and must not be flagged dead: {:?}",
         p.model.parse_warnings
     );
@@ -1499,10 +1323,7 @@ fn direct_pk_time_synth_param_not_flagged_unused() {
 ";
     let p = super::parse_full_model(src).expect("parse ok");
     assert!(
-        !p.model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("computed but never used")),
+        !p.model.parse_warnings.iter().any(|w| w.contains("computed but never used")),
         "direct pk(q=TIME) must not flag the synthetic __ferx_pktime_q as dead: {:?}",
         p.model.parse_warnings
     );
@@ -1528,13 +1349,8 @@ fn reserved_pktime_prefix_rejected_with_correct_message() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let err = super::parse_full_model(src)
-        .err()
-        .expect("reserved prefix must be rejected");
-    assert!(
-        err.contains(PKTIME_SYNTH_PREFIX),
-        "message must name the pktime prefix: {err}"
-    );
+    let err = super::parse_full_model(src).err().expect("reserved prefix must be rejected");
+    assert!(err.contains(PKTIME_SYNTH_PREFIX), "message must name the pktime prefix: {err}");
     assert!(
         err.contains("pk(...=TIME)"),
         "message must name the pk(...=TIME) feature, not Form-C readout: {err}"
@@ -1574,22 +1390,12 @@ fn test_ode_dead_indiv_param_warns() {
         .expect("a dead ODE param is a warning, not an error")
         .model
         .parse_warnings;
-    let dead: Vec<&String> = ws
-        .iter()
-        .filter(|w| w.contains("computed but never used"))
-        .collect();
-    assert_eq!(
-        dead.len(),
-        1,
-        "exactly one dead-param warning expected, got: {ws:?}"
-    );
+    let dead: Vec<&String> = ws.iter().filter(|w| w.contains("computed but never used")).collect();
+    assert_eq!(dead.len(), 1, "exactly one dead-param warning expected, got: {ws:?}");
     let w = dead[0];
     assert!(w.contains("`KE`"), "warning must name KE: {w}");
     // The params actually used in the RHS must not be flagged.
-    assert!(
-        !w.contains("`CL`") && !w.contains("`V`"),
-        "used params must not be flagged dead: {w}"
-    );
+    assert!(!w.contains("`CL`") && !w.contains("`V`"), "used params must not be flagged dead: {w}");
     // ODE-flavored guidance points at [odes], not the analytical pk(...) map.
     assert!(
         w.contains("[odes]") && !w.contains("pk(...)"),
@@ -1648,13 +1454,9 @@ fn indexed_dose_attributes_are_not_flagged_dead_on_the_engine_that_reads_them() 
         );
     }
     // The control: the census is live on this fixture.
-    let ws = super::parse_full_model(&model(ode, "  UNUSED = TVX"))
-        .unwrap()
-        .model
-        .parse_warnings;
+    let ws = super::parse_full_model(&model(ode, "  UNUSED = TVX")).unwrap().model.parse_warnings;
     assert!(
-        ws.iter()
-            .any(|w| w.contains("`UNUSED`") && w.contains("computed but never used")),
+        ws.iter().any(|w| w.contains("`UNUSED`") && w.contains("computed but never used")),
         "{ws:?}"
     );
 }
@@ -1765,10 +1567,7 @@ fn dose_attr_read_in_odes_rhs_is_rejected() {
         );
         // The remediation is the half a user acts on, and the sentinel
         // `parse_error_to_diagnostic` keys `E_DOSE_ATTR_DOUBLE_USE` off.
-        assert!(
-            err.contains("reserved dose-attribute name"),
-            "must offer the rename, got: {err}"
-        );
+        assert!(err.contains("reserved dose-attribute name"), "must offer the rename, got: {err}");
     }
 }
 
@@ -1915,20 +1714,15 @@ fn coded_rate_param_read_in_odes_init_is_not_recorded() {
     use crate::types::DoseAttr;
     let parsed = parse_full_model(&dose_attr_init_model("D1")).expect("`D1` in an init parses");
     assert_eq!(
-        parsed
-            .model
-            .active_dose_attr_map()
-            .prediction_path_read(DoseAttr::Duration, 1),
+        parsed.model.active_dose_attr_map().prediction_path_read(DoseAttr::Duration, 1),
         None,
         "an init-only `D1` read is not a prediction-path read"
     );
 
     // Control: the same parameter read in the RHS *is* recorded, so the assertion
     // above cannot pass for a map that simply never marks anything.
-    let rhs = dose_attr_init_model("D1").replace(
-        "d/dt(central) = -(CL/V) * central",
-        "d/dt(central) = -(CL/V) * D1 * central",
-    );
+    let rhs = dose_attr_init_model("D1")
+        .replace("d/dt(central) = -(CL/V) * central", "d/dt(central) = -(CL/V) * D1 * central");
     assert_eq!(
         parse_full_model(&rhs)
             .expect("`D1` in the RHS parses — it is data-gated, not rejected")
@@ -1946,10 +1740,8 @@ fn dose_attr_read_in_both_odes_init_and_rhs_is_still_rejected() {
     // walk: a model that seeds from `F` *and* folds `F` into the flux still applies
     // it twice on the dose-driven term, which is exactly the #993 defect. Pins that
     // the fix dropped the init walk only.
-    let src = dose_attr_init_model("F").replace(
-        "d/dt(central) = -(CL/V) * central",
-        "d/dt(central) = -(CL/V) * F * central",
-    );
+    let src = dose_attr_init_model("F")
+        .replace("d/dt(central) = -(CL/V) * central", "d/dt(central) = -(CL/V) * F * central");
     let err = expect_parse_err(&src);
     assert!(
         err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
@@ -1992,9 +1784,9 @@ fn ordinary_names_read_in_odes_rhs_are_accepted() {
     // `S{n}` is not routed at all; `D{n}`/`R{n}` are dose attributes but inert
     // unless the *data* codes RATE, so they are not a parse error (see
     // `tests/modeled_rate.rs` for the data-gated half).
-    for name in [
-        "KA", "Q", "V2", "Q3", "V3", "N", "MTT", "MAT", "CV2", "S1", "S2", "D1", "R1", "KEL", "ZQ",
-    ] {
+    for name in
+        ["KA", "Q", "V2", "Q3", "V3", "N", "MTT", "MAT", "CV2", "S1", "S2", "D1", "R1", "KEL", "ZQ"]
+    {
         assert!(
             parse_full_model(&dose_attr_rhs_model(name)).is_ok(),
             "`{name}` in the [odes] RHS is not a dose-attribute double use and must parse"
@@ -2050,15 +1842,11 @@ fn dose_attr_read_in_adaptive_observe_is_rejected() {
     // wrong: `observe` does not merely report a number, it is what the `when` rules
     // compare against, so a double-applied `F` biases the titration decision and
     // every dose the controller then emits.
-    for (name, noun) in [
-        ("F", "bioavailability"),
-        ("LAGTIME", "absorption lag"),
-        ("F1", "bioavailability"),
-    ] {
-        let err = expect_parse_err(&adaptive_observe_model(
-            name,
-            &format!("central / (V * {name})"),
-        ));
+    for (name, noun) in
+        [("F", "bioavailability"), ("LAGTIME", "absorption lag"), ("F1", "bioavailability")]
+    {
+        let err =
+            expect_parse_err(&adaptive_observe_model(name, &format!("central / (V * {name})")));
         assert!(
             err.contains("[adaptive_dosing]:") && err.contains(&format!("`{name}`")),
             "must name the block and the parameter, got: {err}"
@@ -2077,10 +1865,7 @@ fn ordinary_name_read_in_adaptive_observe_is_accepted() {
     // until the data codes a RATE, so they are not a parse error either.
     for name in ["KEL", "ZQ", "D1", "R1"] {
         let src = adaptive_observe_model(name, &format!("central / (V * {name})"));
-        assert!(
-            parse_full_model(&src).is_ok(),
-            "`{name}` in [adaptive_dosing] observe must parse"
-        );
+        assert!(parse_full_model(&src).is_ok(), "`{name}` in [adaptive_dosing] observe must parse");
     }
 }
 
@@ -2109,10 +1894,7 @@ fn coded_rate_param_read_in_adaptive_observe_is_recorded() {
     let parsed = parse_full_model(&adaptive_observe_model("R1", "central / (V * R1)"))
         .expect("an R1 controller signal parses");
     assert_eq!(
-        parsed
-            .model
-            .active_dose_attr_map()
-            .prediction_path_read(DoseAttr::Rate, 1),
+        parsed.model.active_dose_attr_map().prediction_path_read(DoseAttr::Rate, 1),
         Some("R1"),
         "an `R1` read by [adaptive_dosing] observe must be recorded for the data check"
     );
@@ -2121,10 +1903,7 @@ fn coded_rate_param_read_in_adaptive_observe_is_recorded() {
     let clean = parse_full_model(&adaptive_observe_model("R1", "central / V"))
         .expect("the control model parses");
     assert_eq!(
-        clean
-            .model
-            .active_dose_attr_map()
-            .prediction_path_read(DoseAttr::Rate, 1),
+        clean.model.active_dose_attr_map().prediction_path_read(DoseAttr::Rate, 1),
         None,
         "an unread `R1` must not be marked"
     );
@@ -2179,10 +1958,9 @@ fn dose_attr_param_reused_as_a_disposition_role_is_rejected_before_the_twin() {
     );
     // Control: the same model with its own volume parses and builds its twin — the
     // rejection above is the binding, not the transit form.
-    let ok = src.replace("v=F,", "v=V,").replace(
-        "  F   = inv_logit(THETA_F)",
-        "  V   = 50.0\n  F   = inv_logit(THETA_F)",
-    );
+    let ok = src
+        .replace("v=F,", "v=V,")
+        .replace("  F   = inv_logit(THETA_F)", "  V   = 50.0\n  F   = inv_logit(THETA_F)");
     let parsed = parse_full_model(&ok).expect("the control parses");
     assert!(
         parsed.model.absorption_ode_equivalent.is_some(),
@@ -2353,11 +2131,7 @@ fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
         // and infusion exactly like it loses the TV-covariate reroute, and an author who hits
         // one of those first must not be told the form is unrecognised either.
         for (feature, marker, population) in [
-            (
-                "steady-state",
-                "steady-state (SS) doses",
-                ss_dose_population(),
-            ),
+            ("steady-state", "steady-state (SS) doses", ss_dose_population()),
             ("infusion", "infusion doses", infusion_population()),
         ] {
             let msg = crate::api::check_absorption_closed_form_support(&parsed.model, &population)
@@ -2401,9 +2175,7 @@ fn infusion_population() -> crate::types::Population {
     let s = &mut pop.subjects[0];
     s.id = "INF1".to_string();
     s.obs_covariates = Vec::new(); // drop the TV covariate so the infusion arm is what fires
-    s.doses = vec![crate::types::DoseEvent::new(
-        0.0, 100.0, 1, 50.0, false, 0.0,
-    )];
+    s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
     pop
 }
 
@@ -2414,34 +2186,16 @@ fn infusion_population() -> crate::types::Population {
 fn tv_cov_population() -> crate::types::Population {
     crate::types::Population {
         subjects: vec![crate::types::Subject {
-            obs_rgroup: Vec::new(),
             id: "TV1".to_string(),
             doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![10.0],
             obs_cmts: vec![1],
-            covariates: std::collections::HashMap::new(),
-            dose_covariates: Vec::new(),
             obs_covariates: vec![std::collections::HashMap::from([("WT".to_string(), 80.0)])],
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".to_string(),
@@ -2490,11 +2244,7 @@ fn an_ordinary_transit_model_keeps_its_twin_and_warns_about_nothing() {
         parsed.model.parse_warnings
     );
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
         "nothing to decline here; warnings: {:?}",
         parsed.model.parse_warnings
     );
@@ -2600,10 +2350,7 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
         "the twin source must not re-emit the controller block, got:\n{twin_src}"
     );
     let twin = eq.built();
-    assert!(
-        twin.ode_spec.is_some(),
-        "the twin must be a working ODE model"
-    );
+    assert!(twin.ode_spec.is_some(), "the twin must be a working ODE model");
 }
 
 #[test]
@@ -2685,11 +2432,7 @@ fn dose_attr_read_only_for_reporting_is_accepted() {
     let parsed = parse_full_model(src)
         .expect("reading F only for reporting is not a double use and must parse");
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("computed but never used")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("computed but never used")),
         "a reported F is used, not dead: {:?}",
         parsed.model.parse_warnings
     );
@@ -2746,11 +2489,7 @@ fn analytical_dose_attr_read_in_scaling_is_rejected() {
     // The readouts deliberately do NOT mention `V`: `obs_scale = V * F` (what this
     // test pinned before) trips the pre-existing volume double-divide warning in
     // `build_obs_scale_spec`, which masks how quiet the general case is.
-    for readout in [
-        "obs_scale = 50.0 * F",
-        "obs_scale = 1.0 / F",
-        "y = central * F",
-    ] {
+    for readout in ["obs_scale = 50.0 * F", "obs_scale = 1.0 / F", "y = central * F"] {
         let src = analytical_dose_attr_src("f=F", "F  = TVF", &format!("[scaling]\n  {readout}"));
         let err = expect_parse_err(&src);
         assert!(
@@ -2837,10 +2576,7 @@ fn analytical_dose_attr_read_in_initial_conditions_is_accepted() {
         "TLAG = TVLAG",
         "[initial_conditions]\n  init(central) = TLAG * 100.0",
     );
-    assert!(
-        parse_full_model(&lag).is_ok(),
-        "the init impulse carries no lag either"
-    );
+    assert!(parse_full_model(&lag).is_ok(), "the init impulse carries no lag either");
 }
 
 #[test]
@@ -2992,12 +2728,7 @@ fn case_distinct_names_under_two_roles_keep_their_own_slots() {
             m.pk_indices[i]
         };
         assert_eq!(slot_of("X"), crate::types::PK_IDX_F, "{:?}", m.pk_indices);
-        assert_eq!(
-            slot_of("x"),
-            crate::types::PK_IDX_LAGTIME,
-            "{:?}",
-            m.pk_indices
-        );
+        assert_eq!(slot_of("x"), crate::types::PK_IDX_LAGTIME, "{:?}", m.pk_indices);
         assert!(m.has_lagtime() && m.has_bioavailability());
     }
 }
@@ -3017,14 +2748,8 @@ fn pk_slot_noun_names_every_slot_name_to_index_hands_out() {
         let slot = crate::types::PkParams::name_to_index(name)
             .unwrap_or_else(|| panic!("`{name}` must be a role key"));
         let noun = super::pk_slot_noun(slot);
-        assert_ne!(
-            noun, "the same PK parameter",
-            "slot {slot} (`{name}`) has no noun"
-        );
-        assert!(
-            noun.starts_with("the "),
-            "`{noun}` must read as a noun phrase"
-        );
+        assert_ne!(noun, "the same PK parameter", "slot {slot} (`{name}`) has no noun");
+        assert!(noun.starts_with("the "), "`{noun}` must read as a noun phrase");
         seen.insert(slot);
     }
     // Every slot name_to_index can produce was visited (13 distinct slots).
@@ -3045,12 +2770,7 @@ fn one_variable_under_two_spellings_of_one_role_stays_legal() {
     assert!(parsed.model.has_lagtime());
     assert!(!parsed.model.has_bioavailability());
     assert_eq!(
-        parsed
-            .model
-            .pk_indices
-            .iter()
-            .filter(|&&s| s == crate::types::PK_IDX_LAGTIME)
-            .count(),
+        parsed.model.pk_indices.iter().filter(|&&s| s == crate::types::PK_IDX_LAGTIME).count(),
         1
     );
 }
@@ -3081,10 +2801,7 @@ fn analytical_unbound_lagtime_and_f_are_not_a_lag_or_bioavailability() {
     );
     assert!(!m.has_lagtime(), "unbound analytical LAGTIME is not a lag");
     assert!(!m.has_lagtime_on_cmt(1), "…nor on the dosed compartment");
-    assert!(
-        !m.has_bioavailability(),
-        "unbound analytical F is not a bioavailability"
-    );
+    assert!(!m.has_bioavailability(), "unbound analytical F is not a bioavailability");
     // The parser still tells the user the declarations are dead.
     let unused = m.parse_warnings.join("\n");
     assert!(
@@ -3160,10 +2877,7 @@ fn analytical_unmapped_f_named_parameter_is_not_a_double_use() {
     // And the mapped-but-unread case: `f=F` with a readout that does not mention
     // `F` is the ordinary bioavailability model, which must stay silent.
     let ok = analytical_dose_attr_src("f=F", "F  = TVF", "[scaling]\n  obs_scale = 50.0");
-    assert!(
-        parse_full_model(&ok).is_ok(),
-        "a mapped-but-unread F is the ordinary model"
-    );
+    assert!(parse_full_model(&ok).is_ok(), "a mapped-but-unread F is the ordinary model");
 }
 
 #[test]
@@ -3249,16 +2963,12 @@ fn transit_twin_with_reserved_f_name_still_builds() {
         // The twin is built during that parse (#1008). Assert it is *present*: a twin
         // whose source fails to parse is now declined rather than panicking, so
         // "didn't panic" alone would pass vacuously for a broken reconstruction.
-        let eq = parsed
-            .model
-            .absorption_ode_equivalent
-            .as_ref()
-            .unwrap_or_else(|| {
-                panic!(
-                    "transit model with {mapping} must keep its ODE twin; warnings: {:?}",
-                    parsed.model.parse_warnings
-                )
-            });
+        let eq = parsed.model.absorption_ode_equivalent.as_ref().unwrap_or_else(|| {
+            panic!(
+                "transit model with {mapping} must keep its ODE twin; warnings: {:?}",
+                parsed.model.parse_warnings
+            )
+        });
         assert!(
             eq.built().ode_spec.is_some(),
             "the twin for {mapping} must be a working ODE model"
@@ -3299,25 +3009,12 @@ fn test_ode_multiple_dead_params_use_plural_message() {
         .expect("dead ODE params are a warning, not an error")
         .model
         .parse_warnings;
-    let dead: Vec<&String> = ws
-        .iter()
-        .filter(|w| w.contains("computed but never used"))
-        .collect();
-    assert_eq!(
-        dead.len(),
-        1,
-        "both dead params share a single warning, got: {ws:?}"
-    );
+    let dead: Vec<&String> = ws.iter().filter(|w| w.contains("computed but never used")).collect();
+    assert_eq!(dead.len(), 1, "both dead params share a single warning, got: {ws:?}");
     let w = dead[0];
     // Both names listed (sorted, comma-joined), neither used param flagged.
-    assert!(
-        w.contains("`KE`") && w.contains("`KE2`"),
-        "both dead params must be named: {w}"
-    );
-    assert!(
-        !w.contains("`CL`") && !w.contains("`V`"),
-        "used params not flagged: {w}"
-    );
+    assert!(w.contains("`KE`") && w.contains("`KE2`"), "both dead params must be named: {w}");
+    assert!(!w.contains("`CL`") && !w.contains("`V`"), "used params not flagged: {w}");
     // Plural grammar + ODE-flavored guidance.
     assert!(
         w.contains("are computed but never used") && w.contains("remove them"),
@@ -3360,11 +3057,7 @@ fn test_undeclared_name_in_derived_is_accepted_silently() {
 ";
     let parsed = super::parse_full_model(src).expect("undeclared name in [derived] should parse");
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("MYSTERY_NAME")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("MYSTERY_NAME")),
         "undeclared name in [derived] is a silent Variable, no warning: {:?}",
         parsed.model.parse_warnings
     );
@@ -3482,11 +3175,8 @@ fn test_pk_key_relevance_matrix() {
                 }
             })
             .collect();
-        let pk = keys
-            .iter()
-            .map(|k| format!("{k}={}", k.to_uppercase()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let pk =
+            keys.iter().map(|k| format!("{k}={}", k.to_uppercase())).collect::<Vec<_>>().join(", ");
         format!(
             "
 [parameters]
@@ -3644,10 +3334,7 @@ fn test_parse_nn_regularization_lambdas() {
 #[test]
 fn test_parse_method_chain() {
     let opts = parse_fit_options(&["method = [saem, focei]".to_string()]).unwrap();
-    assert_eq!(
-        opts.methods,
-        vec![EstimationMethod::Saem, EstimationMethod::FoceI]
-    );
+    assert_eq!(opts.methods, vec![EstimationMethod::Saem, EstimationMethod::FoceI]);
     assert_eq!(opts.method, EstimationMethod::FoceI);
     assert!(opts.interaction);
 }
@@ -3669,16 +3356,10 @@ fn test_parse_single_method_foce_clears_interaction() {
     assert_eq!(foce.method, EstimationMethod::Foce);
     assert!(!foce.interaction, "method = foce must clear interaction");
     assert!(
-        parse_fit_options(&["method = saem".to_string()])
-            .unwrap()
-            .interaction,
+        parse_fit_options(&["method = saem".to_string()]).unwrap().interaction,
         "a pass-through method keeps the default"
     );
-    assert!(
-        parse_fit_options(&["method = focei".to_string()])
-            .unwrap()
-            .interaction
-    );
+    assert!(parse_fit_options(&["method = focei".to_string()]).unwrap().interaction);
 }
 
 /// #1415: a chain whose final stage is neither `foce` nor `focei` keeps the
@@ -3695,16 +3376,8 @@ fn test_parse_method_chain_final_non_foce_keeps_interaction_default() {
         );
     }
     // The single-method forms it has to agree with.
-    assert!(
-        parse_fit_options(&["method = saem".to_string()])
-            .unwrap()
-            .interaction
-    );
-    assert!(
-        parse_fit_options(&["method = imp".to_string()])
-            .unwrap()
-            .interaction
-    );
+    assert!(parse_fit_options(&["method = saem".to_string()]).unwrap().interaction);
+    assert!(parse_fit_options(&["method = imp".to_string()]).unwrap().interaction);
 }
 
 #[test]
@@ -3742,10 +3415,7 @@ fn test_method_chain_helper_default() {
 fn test_method_chain_helper_populated() {
     let mut opts = FitOptions::default();
     opts.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
-    assert_eq!(
-        opts.method_chain(),
-        vec![EstimationMethod::Saem, EstimationMethod::FoceI]
-    );
+    assert_eq!(opts.method_chain(), vec![EstimationMethod::Saem, EstimationMethod::FoceI]);
 }
 
 #[test]
@@ -3825,16 +3495,10 @@ fn test_parse_mu_referencing_invalid_rejected() {
 #[test]
 fn test_apply_fit_option_known_applies() {
     let mut opts = FitOptions::default();
-    assert_eq!(
-        apply_fit_option(&mut opts, "n_exploration", "200"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "n_exploration", "200"), Ok(true));
     assert_eq!(opts.saem_n_exploration, 200);
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "n_convergence", "400"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "n_convergence", "400"), Ok(true));
     assert_eq!(opts.saem_n_convergence, 400);
 
     assert_eq!(apply_fit_option(&mut opts, "omega_burnin", "30"), Ok(true));
@@ -3859,16 +3523,10 @@ fn test_n_mh_steps_accepts_auto_and_a_count() {
     );
 
     assert_eq!(apply_fit_option(&mut opts, "n_mh_steps", "12"), Ok(true));
-    assert_eq!(
-        opts.saem_n_mh_steps, 12,
-        "an explicit count is stored as-is"
-    );
+    assert_eq!(opts.saem_n_mh_steps, 12, "an explicit count is stored as-is");
 
     for spelling in ["auto", "AUTO", "Auto"] {
-        assert_eq!(
-            apply_fit_option(&mut opts, "n_mh_steps", spelling),
-            Ok(true)
-        );
+        assert_eq!(apply_fit_option(&mut opts, "n_mh_steps", spelling), Ok(true));
         assert_eq!(
             opts.saem_n_mh_steps,
             crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
@@ -3897,24 +3555,15 @@ fn test_mstep_damping_round_trips_and_validates() {
         "unset must stay None so the MSTEP_SA_MAX_STEP default applies"
     );
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "mstep_damping", "0.01"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "mstep_damping", "0.01"), Ok(true));
     assert_eq!(opts.saem_mstep_damping, Some(0.01));
 
     // The `saem_`-prefixed spelling writes the same field.
-    assert_eq!(
-        apply_fit_option(&mut opts, "saem_mstep_damping", "0.5"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "saem_mstep_damping", "0.5"), Ok(true));
     assert_eq!(opts.saem_mstep_damping, Some(0.5));
 
     // 1.0 disables the damping and is in range.
-    assert_eq!(
-        apply_fit_option(&mut opts, "mstep_damping", "1.0"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "mstep_damping", "1.0"), Ok(true));
     assert_eq!(opts.saem_mstep_damping, Some(1.0));
 
     for bad in ["0", "-0.1", "1.5"] {
@@ -3945,22 +3594,10 @@ fn test_mstep_solver_and_draws_round_trip_and_validate() {
     );
     assert_eq!(opts.saem_mstep_draws, 1, "the default must stay one draw");
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "mstep_solver", "score_sa"),
-        Ok(true)
-    );
-    assert_eq!(
-        opts.saem_mstep_solver,
-        crate::types::SaemMstepSolver::ScoreSa
-    );
-    assert_eq!(
-        apply_fit_option(&mut opts, "saem_mstep_solver", "BOBYQA"),
-        Ok(true)
-    );
-    assert_eq!(
-        opts.saem_mstep_solver,
-        crate::types::SaemMstepSolver::Bobyqa
-    );
+    assert_eq!(apply_fit_option(&mut opts, "mstep_solver", "score_sa"), Ok(true));
+    assert_eq!(opts.saem_mstep_solver, crate::types::SaemMstepSolver::ScoreSa);
+    assert_eq!(apply_fit_option(&mut opts, "saem_mstep_solver", "BOBYQA"), Ok(true));
+    assert_eq!(opts.saem_mstep_solver, crate::types::SaemMstepSolver::Bobyqa);
     let err = apply_fit_option(&mut opts, "mstep_solver", "newton")
         .expect_err("an unknown solver must be rejected");
     assert!(err.contains("bobyqa/score_sa"), "got: {err}");
@@ -3968,16 +3605,54 @@ fn test_mstep_solver_and_draws_round_trip_and_validate() {
 
     assert_eq!(apply_fit_option(&mut opts, "mstep_draws", "3"), Ok(true));
     assert_eq!(opts.saem_mstep_draws, 3);
-    assert_eq!(
-        apply_fit_option(&mut opts, "saem_mstep_draws", "1"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "saem_mstep_draws", "1"), Ok(true));
     assert_eq!(opts.saem_mstep_draws, 1);
     let err =
         apply_fit_option(&mut opts, "mstep_draws", "0").expect_err("zero draws must be rejected");
     assert!(err.contains("at least 1"), "got: {err}");
     // A rejected value must not have clobbered the last good one.
     assert_eq!(opts.saem_mstep_draws, 1);
+}
+
+/// `mstep_optimizer` round-trips, defaults to `auto` (#3001), rejects
+/// what it cannot act on without clobbering the last good value, is accepted by the
+/// three estimators whose numerical M-step it drives and warns under any other.
+#[test]
+fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
+    use crate::types::MstepOptimizer;
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Auto);
+    assert_eq!(apply_fit_option(&mut opts, "mstep_optimizer", "newton"), Ok(true));
+    assert_eq!(apply_fit_option(&mut opts, "mstep_optimizer", "AUTO"), Ok(true));
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Auto);
+    assert_eq!(apply_fit_option(&mut opts, "mstep_optimizer", "LBFGS"), Ok(true));
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Lbfgs);
+    assert_eq!(apply_fit_option(&mut opts, "mstep_optimizer", "bobyqa"), Ok(true));
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Bobyqa);
+    assert_eq!(apply_fit_option(&mut opts, "mstep_optimizer", "lbfgs"), Ok(true));
+    let err = apply_fit_option(&mut opts, "mstep_optimizer", "adam")
+        .expect_err("an unknown optimizer must be rejected");
+    assert!(err.contains("auto/bobyqa/lbfgs/newton") && err.contains("adam"), "got: {err}");
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Lbfgs);
+
+    for method in ["saem", "imp", "impmap"] {
+        let opts = parse_fit_options(&[
+            format!("method = {method}"),
+            "mstep_optimizer = lbfgs".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            !opts.unsupported_keys_warnings().iter().any(|w| w.contains("mstep_optimizer")),
+            "{method} drives the key and must not warn"
+        );
+    }
+    let opts =
+        parse_fit_options(&["method = focei".to_string(), "mstep_optimizer = lbfgs".to_string()])
+            .unwrap();
+    assert!(
+        opts.unsupported_keys_warnings().iter().any(|w| w.contains("mstep_optimizer")),
+        "mstep_optimizer under FOCEI must warn"
+    );
 }
 
 /// The f-SAEM keys (#1449) round-trip, default to the random walk, reject what
@@ -3988,11 +3663,7 @@ fn test_saem_imh_options_round_trip_validate_and_warn() {
     use crate::types::SaemKernel;
     let mut opts = FitOptions::default();
     assert_eq!(opts.saem_kernel, SaemKernel::RandomWalk);
-    assert_eq!(
-        (opts.saem_imh_proposals, opts.saem_imh_refresh),
-        (2, 5),
-        "defaults moved"
-    );
+    assert_eq!((opts.saem_imh_proposals, opts.saem_imh_refresh), (2, 5), "defaults moved");
     assert_eq!(opts.saem_imh_defensive, 0.05);
     assert_eq!(opts.saem_imh_min_obs_per_eta, 2.0);
 
@@ -4089,16 +3760,11 @@ fn test_mstep_solver_and_draws_under_focei_warn() {
 /// than silently doing nothing.
 #[test]
 fn test_mstep_damping_under_focei_warns() {
-    let opts = parse_fit_options(&[
-        "method = focei".to_string(),
-        "mstep_damping = 0.01".to_string(),
-    ])
-    .unwrap();
+    let opts =
+        parse_fit_options(&["method = focei".to_string(), "mstep_damping = 0.01".to_string()])
+            .unwrap();
     let warnings = opts.unsupported_keys_warnings();
-    assert!(
-        warnings.iter().any(|w| w.contains("mstep_damping")),
-        "got: {warnings:?}"
-    );
+    assert!(warnings.iter().any(|w| w.contains("mstep_damping")), "got: {warnings:?}");
 }
 
 /// Conditional-distribution keys (#257) round-trip into FitOptions, both the
@@ -4113,28 +3779,16 @@ fn test_apply_fit_option_conddist_keys() {
 
     // The `saem_conddist` alias sets the same field.
     opts.saem_conddist = false;
-    assert_eq!(
-        apply_fit_option(&mut opts, "saem_conddist", "true"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "saem_conddist", "true"), Ok(true));
     assert!(opts.saem_conddist);
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "conddist_nsamp", "500"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "conddist_nsamp", "500"), Ok(true));
     assert_eq!(opts.saem_conddist_nsamp, 500);
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "conddist_burnin", "75"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "conddist_burnin", "75"), Ok(true));
     assert_eq!(opts.saem_conddist_burnin, 75);
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "conddist_keep_samples", "true"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "conddist_keep_samples", "true"), Ok(true));
     assert!(opts.saem_conddist_keep_samples);
 }
 
@@ -4142,10 +3796,7 @@ fn test_apply_fit_option_conddist_keys() {
 fn test_apply_fit_option_unknown_key_returns_false() {
     let mut opts = FitOptions::default();
     // Typo / unknown → Ok(false). Caller decides whether to error out.
-    assert_eq!(
-        apply_fit_option(&mut opts, "n_exploraton", "200"),
-        Ok(false)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "n_exploraton", "200"), Ok(false));
     // `method` is deliberately excluded (list-chain syntax is handled
     // in the block parser); treat it as unknown here.
     assert_eq!(apply_fit_option(&mut opts, "method", "focei"), Ok(false));
@@ -4176,10 +3827,7 @@ fn test_apply_fit_option_ode_solver_tolerances() {
 
     assert_eq!(apply_fit_option(&mut opts, "ode_reltol", "1e-10"), Ok(true));
     assert_eq!(apply_fit_option(&mut opts, "ode_abstol", "1e-12"), Ok(true));
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_max_steps", "200000"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_max_steps", "200000"), Ok(true));
     assert_eq!(opts.ode_reltol, 1e-10);
     assert_eq!(opts.ode_abstol, 1e-12);
     assert_eq!(opts.ode_max_steps, 200_000);
@@ -4208,31 +3856,18 @@ fn test_apply_fit_option_ode_method() {
     assert_eq!(apply_fit_option(&mut opts, "ode_method", "auto"), Ok(true));
     assert_eq!(opts.ode_method, OdeMethod::Auto);
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_method", "rodas5p"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "rodas5p"), Ok(true));
     assert_eq!(opts.ode_method, OdeMethod::Rodas5P);
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_method", "ode23s"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "ode23s"), Ok(true));
     assert_eq!(opts.ode_method, OdeMethod::Rosenbrock23);
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_method", "Rodas4"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "Rodas4"), Ok(true));
     assert_eq!(opts.ode_method, OdeMethod::Rodas4);
 
     // An unknown stepper is an error, not a silent fallback to RK45 (which would run the
     // stiff model on the method the user was trying to get away from).
     let err = apply_fit_option(&mut opts, "ode_method", "lsoda").unwrap_err();
     assert!(err.contains("ode_method"), "unexpected message: {err}");
-    assert_eq!(
-        opts.ode_method,
-        OdeMethod::Rodas4,
-        "failed apply must not mutate"
-    );
+    assert_eq!(opts.ode_method, OdeMethod::Rodas4, "failed apply must not mutate");
 }
 
 /// `ode_stiff_abort_after` (#708 / #1080 Part B): opt-in, disable-able without deleting the
@@ -4242,20 +3877,14 @@ fn test_apply_fit_option_ode_stiff_abort_after() {
     let mut opts = FitOptions::default();
     assert_eq!(opts.ode_stiff_abort_after, None, "must be opt-in");
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_stiff_abort_after", "25"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_stiff_abort_after", "25"), Ok(true));
     assert_eq!(opts.ode_stiff_abort_after, Some(25));
 
     // `0` / `off` / `none` turn the budget back off, so a settings list can disable it
     // without removing the key.
     for off in ["0", "off", "none", "false"] {
         opts.ode_stiff_abort_after = Some(25);
-        assert_eq!(
-            apply_fit_option(&mut opts, "ode_stiff_abort_after", off),
-            Ok(true)
-        );
+        assert_eq!(apply_fit_option(&mut opts, "ode_stiff_abort_after", off), Ok(true));
         assert_eq!(opts.ode_stiff_abort_after, None, "{off}");
     }
 
@@ -4286,15 +3915,7 @@ fn test_ode_stiff_abort_after_reaches_ode_spec() {
   ode_stiff_abort_after = 40
 "#;
     let p = parse_full_model(src).unwrap();
-    assert_eq!(
-        p.model
-            .ode_spec
-            .as_ref()
-            .unwrap()
-            .solver_opts
-            .stiff_abort_after,
-        Some(40)
-    );
+    assert_eq!(p.model.ode_spec.as_ref().unwrap().solver_opts.stiff_abort_after, Some(40));
     assert!(!p
         .fit_options
         .unsupported_keys_warnings()
@@ -4309,15 +3930,9 @@ fn test_apply_fit_option_ode_auto_switch() {
     let mut opts = FitOptions::default();
     assert!(opts.ode_auto_switch, "mid-segment switching is the default");
 
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_auto_switch", "false"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_auto_switch", "false"), Ok(true));
     assert!(!opts.ode_auto_switch);
-    assert_eq!(
-        apply_fit_option(&mut opts, "ode_auto_switch", "true"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "ode_auto_switch", "true"), Ok(true));
     assert!(opts.ode_auto_switch);
     assert!(apply_fit_option(&mut opts, "ode_auto_switch", "sometimes").is_err());
 }
@@ -4397,11 +4012,7 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     // integrates with the requested stepper.
     assert_eq!(s2.method, crate::ode::OdeMethod::Rodas4);
     // …and it is framework-level, so it must not be flagged as an ignored key.
-    assert!(!p
-        .fit_options
-        .unsupported_keys_warnings()
-        .iter()
-        .any(|w| w.contains("ode_method")));
+    assert!(!p.fit_options.unsupported_keys_warnings().iter().any(|w| w.contains("ode_method")));
 }
 
 #[test]
@@ -4420,10 +4031,7 @@ fn test_imp_method_and_imp_options_parse() {
         "verbose = false".to_string(),
     ])
     .expect("parse must succeed");
-    assert_eq!(
-        opts.methods,
-        vec![EstimationMethod::FoceI, EstimationMethod::Imp]
-    );
+    assert_eq!(opts.methods, vec![EstimationMethod::FoceI, EstimationMethod::Imp]);
     // #1965: `imp_sobol` lands on its own field, not IMPMAP's.
     assert!(opts.imp_sobol && !opts.impmap_sobol);
     assert_eq!(opts.imp_samples, 500);
@@ -4509,17 +4117,9 @@ fn test_legacy_is_prefixed_imp_options_are_not_accepted() {
 
 #[test]
 fn test_impmap_method_tokens_parse() {
-    for tok in [
-        "impmap",
-        "importance_sampling_map",
-        "importance-sampling-map",
-    ] {
+    for tok in ["impmap", "importance_sampling_map", "importance-sampling-map"] {
         let opts = parse_fit_options(&[format!("method = {tok}")]).expect("parse must succeed");
-        assert_eq!(
-            opts.method,
-            EstimationMethod::Impmap,
-            "token `{tok}` must map to Impmap"
-        );
+        assert_eq!(opts.method, EstimationMethod::Impmap, "token `{tok}` must map to Impmap");
     }
     // `imp` must still resolve to the evaluation-only stage, not Impmap.
     let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse");
@@ -4548,10 +4148,7 @@ fn test_impmap_options_parse_and_validate() {
     assert_eq!(opts.impmap_seed, Some(77));
     assert_eq!(opts.impmap_low_ess_threshold, 0.2);
     assert_eq!(opts.impmap_mceta, 3);
-    assert!(
-        !opts.impmap_sobol && !opts.imp_sobol,
-        "Sobol is opt-in for both methods"
-    );
+    assert!(!opts.impmap_sobol && !opts.imp_sobol, "Sobol is opt-in for both methods");
     // All keys are method-specific to Impmap and Impmap is selected.
     assert!(opts.unsupported_keys_warnings().is_empty());
 
@@ -4601,15 +4198,8 @@ fn test_sir_scale_valid_and_invalid() {
     assert!(apply_fit_option(&mut opts, "sir_scale", "Packed").is_ok());
     assert_eq!(opts.sir_scale, SirScale::Packed);
     let err = apply_fit_option(&mut opts, "sir_scale", "variance").unwrap_err();
-    assert!(
-        err.contains("`packed` or `natural`") && err.contains("`variance`"),
-        "{err}"
-    );
-    assert_eq!(
-        opts.sir_scale,
-        SirScale::Packed,
-        "a refused value left a change"
-    );
+    assert!(err.contains("`packed` or `natural`") && err.contains("`variance`"), "{err}");
+    assert_eq!(opts.sir_scale, SirScale::Packed, "a refused value left a change");
 }
 
 #[test]
@@ -4638,16 +4228,10 @@ fn test_apply_fit_option_adaptive_sampling_flags() {
 
     assert_eq!(opts.imp_max_time, None, "no limit by default");
     assert_eq!(opts.impmap_max_time, None, "no limit by default");
-    assert_eq!(
-        apply_fit_option(&mut opts, "imp_max_time", "3000"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "imp_max_time", "3000"), Ok(true));
     assert_eq!(opts.imp_max_time, Some(3000.0));
     assert_eq!(opts.impmap_max_time, None);
-    assert_eq!(
-        apply_fit_option(&mut opts, "impmap_max_time", "60.5"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "impmap_max_time", "60.5"), Ok(true));
     assert_eq!(opts.impmap_max_time, Some(60.5));
     assert_eq!(opts.imp_max_time, Some(3000.0));
     for bad in ["0", "-1", "inf", "NaN"] {
@@ -4708,10 +4292,7 @@ fn test_apply_fit_option_optimizer_and_bloq() {
     assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
     assert_eq!(apply_fit_option(&mut opts, "optimizer", "bfgs"), Ok(true));
     assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
-    assert_eq!(
-        apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"), Ok(true));
     assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
 
     assert_eq!(apply_fit_option(&mut opts, "bloq", "m3"), Ok(true));
@@ -4743,11 +4324,9 @@ fn test_apply_fit_option_inner_optimizer() {
 
 #[test]
 fn test_unsupported_saem_key_under_focei_warns() {
-    let opts = parse_fit_options(&[
-        "method = focei".to_string(),
-        "n_convergence = 300".to_string(),
-    ])
-    .unwrap();
+    let opts =
+        parse_fit_options(&["method = focei".to_string(), "n_convergence = 300".to_string()])
+            .unwrap();
     let warnings = opts.unsupported_keys_warnings();
     assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
     let w = &warnings[0];
@@ -4805,11 +4384,7 @@ fn test_common_keys_never_warn() {
         ])
         .unwrap();
         let w = opts.unsupported_keys_warnings();
-        assert!(
-            w.is_empty(),
-            "method={method} produced unexpected warnings: {:?}",
-            w
-        );
+        assert!(w.is_empty(), "method={method} produced unexpected warnings: {:?}", w);
     }
 }
 
@@ -4819,11 +4394,9 @@ fn test_unsupported_warning_omits_framework_keys() {
     // are exposed as top-level wrapper args, not as method-specific settings.
     // The warning's "Method-specific options" list must not include them —
     // listing `covariance` next to `optimizer` would conflate the layers.
-    let opts = parse_fit_options(&[
-        "method = focei".to_string(),
-        "n_convergence = 300".to_string(),
-    ])
-    .unwrap();
+    let opts =
+        parse_fit_options(&["method = focei".to_string(), "n_convergence = 300".to_string()])
+            .unwrap();
     let w = &opts.unsupported_keys_warnings()[0];
     for framework in [
         "covariance",
@@ -4865,9 +4438,8 @@ fn every_advertised_fit_option_key_has_an_apply_fit_option_arm() {
     use crate::types::{framework_keys, method_specific_keys, EstimationMethod};
 
     // Values chosen to cover the parser's shapes: bool, integer, float, enum-ish, free text.
-    const CANDIDATES: &[&str] = &[
-        "true", "1", "0.5", "1e-3", "auto", "column", "", "r", "none", "focei",
-    ];
+    const CANDIDATES: &[&str] =
+        &["true", "1", "0.5", "1e-3", "auto", "column", "", "r", "none", "focei"];
 
     let mut keys: Vec<&'static str> = framework_keys().to_vec();
     for m in [
@@ -4935,27 +4507,11 @@ fn test_cov_inner_tol_does_not_warn() {
     // `fit-options.qmd` entry while appearing in *neither* advertised key list, so
     // `unsupported_keys_warnings` reported that a value it had just applied would
     // be ignored. Every estimator that runs a covariance step advertises the key.
-    for method in [
-        "focei",
-        "foce",
-        "laplace",
-        "saem",
-        "imp",
-        "impmap",
-        "gn",
-        "gn_hybrid",
-        "vi",
-    ] {
-        let opts = parse_fit_options(&[
-            format!("method = {method}"),
-            "cov_inner_tol = 1e-11".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(
-            opts.cov_inner_tol,
-            Some(1e-11),
-            "method={method} did not apply it"
-        );
+    for method in ["focei", "foce", "laplace", "saem", "imp", "impmap", "gn", "gn_hybrid", "vi"] {
+        let opts =
+            parse_fit_options(&[format!("method = {method}"), "cov_inner_tol = 1e-11".to_string()])
+                .unwrap();
+        assert_eq!(opts.cov_inner_tol, Some(1e-11), "method={method} did not apply it");
         assert!(
             opts.unsupported_keys_warnings().is_empty(),
             "method={method} spuriously warned on cov_inner_tol: {:?}",
@@ -4971,27 +4527,15 @@ fn test_cov_inner_tol_reports_no_effect_for_bayes() {
     // *covariance* key, not a key FOCEI happens to have and Bayes happens to lack, so
     // it says so in those terms rather than "not used by method `Bayes`". The group rule
     // and its per-key text are pinned in `types_tests`; this is the parser end of it.
-    let opts = parse_fit_options(&[
-        "method = bayes".to_string(),
-        "cov_inner_tol = 1e-11".to_string(),
-    ])
-    .unwrap();
-    assert_eq!(
-        opts.cov_inner_tol,
-        Some(1e-11),
-        "the value is still applied"
-    );
+    let opts =
+        parse_fit_options(&["method = bayes".to_string(), "cov_inner_tol = 1e-11".to_string()])
+            .unwrap();
+    assert_eq!(opts.cov_inner_tol, Some(1e-11), "the value is still applied");
     let warnings = opts.unsupported_keys_warnings();
     assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
     assert!(warnings[0].contains("cov_inner_tol"), "got: {warnings:?}");
-    assert!(
-        warnings[0].contains("runs no covariance step"),
-        "got: {warnings:?}"
-    );
-    assert!(
-        !warnings[0].contains("is not used by method"),
-        "got: {warnings:?}"
-    );
+    assert!(warnings[0].contains("runs no covariance step"), "got: {warnings:?}");
+    assert!(!warnings[0].contains("is not used by method"), "got: {warnings:?}");
 }
 
 #[test]
@@ -5012,9 +4556,7 @@ fn test_cov_inner_tol_rejects_non_positive_and_non_finite() {
     }
     // The neighbouring valid range is untouched.
     assert_eq!(
-        parse_fit_options(&["cov_inner_tol = 1e-11".to_string()])
-            .unwrap()
-            .cov_inner_tol,
+        parse_fit_options(&["cov_inner_tol = 1e-11".to_string()]).unwrap().cov_inner_tol,
         Some(1e-11)
     );
 }
@@ -5227,21 +4769,16 @@ fn test_nn_regularization_keys_do_not_warn_on_foce_family() {
         parse_fit_options(&["method = saem".to_string(), "nn_l2 = 1e-2".to_string()]).unwrap();
     let w = saem.unsupported_keys_warnings();
     assert_eq!(w.len(), 1, "saem must warn once on nn_l2: {w:?}");
-    assert!(
-        w[0].contains("`nn_l2` is not used by method `SAEM`"),
-        "{w:?}"
-    );
+    assert!(w[0].contains("`nn_l2` is not used by method `SAEM`"), "{w:?}");
 }
 
 #[test]
 fn test_inner_optimizer_under_focei_does_not_warn() {
     // `inner_optimizer` drives the per-subject EBE loop, which FOCEI uses —
     // it must be in the method's recognized keys and not flagged "ignored".
-    let opts = parse_fit_options(&[
-        "method = focei".to_string(),
-        "inner_optimizer = lbfgs".to_string(),
-    ])
-    .unwrap();
+    let opts =
+        parse_fit_options(&["method = focei".to_string(), "inner_optimizer = lbfgs".to_string()])
+            .unwrap();
     assert_eq!(opts.inner_optimizer, crate::types::InnerOptimizer::Lbfgs);
     let warnings = opts.unsupported_keys_warnings();
     assert!(
@@ -5264,10 +4801,7 @@ fn gn_lambda_draws_the_deprecation_notice_on_every_method() {
         assert_eq!(warnings.len(), 1, "method {method}: {warnings:?}");
         let w = &warnings[0];
         // Sentence 1: the key, that it does nothing, and why.
-        assert!(
-            w.contains("`gn_lambda` has no effect"),
-            "method {method}: {w}"
-        );
+        assert!(w.contains("`gn_lambda` has no effect"), "method {method}: {w}");
         assert!(
             w.contains("Gauss-Newton has used a trust region")
                 && w.contains("not Levenberg-Marquardt damping")
@@ -5289,10 +4823,7 @@ fn gn_lambda_set_twice_draws_one_notice() {
     apply_fit_option(&mut opts, "gn_lambda", "0.05").unwrap();
     apply_fit_option(&mut opts, "gn_lambda", "0.01").unwrap();
     assert_eq!(
-        opts.user_set_keys
-            .iter()
-            .filter(|k| k.as_str() == "gn_lambda")
-            .count(),
+        opts.user_set_keys.iter().filter(|k| k.as_str() == "gn_lambda").count(),
         2,
         "fixture must reach the dedup with the key recorded twice: {:?}",
         opts.user_set_keys
@@ -5309,10 +4840,7 @@ fn gn_lambda_notice_is_absent_when_the_key_is_unset() {
     for method in ["gn", "gn_hybrid", "focei"] {
         let opts = parse_fit_options(&[format!("method = {method}")]).unwrap();
         let warnings = opts.unsupported_keys_warnings();
-        assert!(
-            !warnings.iter().any(|w| w.contains("gn_lambda")),
-            "method {method}: {warnings:?}"
-        );
+        assert!(!warnings.iter().any(|w| w.contains("gn_lambda")), "method {method}: {warnings:?}");
     }
 }
 
@@ -5362,21 +4890,17 @@ fn test_stagnation_guard_recognized_by_nlopt_methods() {
 #[test]
 fn test_ebe_warm_start_parses_and_is_framework_key() {
     // Parses to the bool, defaults to false (opt-in).
-    let opts = parse_fit_options(&[
-        "method = focei".to_string(),
-        "ebe_warm_start = true".to_string(),
-    ])
-    .unwrap();
+    let opts =
+        parse_fit_options(&["method = focei".to_string(), "ebe_warm_start = true".to_string()])
+            .unwrap();
     assert!(opts.ebe_warm_start);
     assert!(!FitOptions::default().ebe_warm_start, "default is off");
     // Framework key: the inner NM fallback exists under every method, so it
     // must not warn as unsupported for any of them.
     for method in ["foce", "focei", "gn", "saem"] {
-        let opts = parse_fit_options(&[
-            format!("method = {method}"),
-            "ebe_warm_start = true".to_string(),
-        ])
-        .unwrap();
+        let opts =
+            parse_fit_options(&[format!("method = {method}"), "ebe_warm_start = true".to_string()])
+                .unwrap();
         assert!(
             opts.unsupported_keys_warnings().is_empty(),
             "method={method} should accept the framework key ebe_warm_start"
@@ -5459,19 +4983,13 @@ fn test_parse_fit_options_gradient_method() {
 fn test_parse_fit_options_reconverge_gradient_interval() {
     // Defaults to 0 (off) so the cheap fixed-EBE path stays the non-IOV
     // default.
-    assert_eq!(
-        parse_fit_options(&[]).unwrap().reconverge_gradient_interval,
-        0
-    );
+    assert_eq!(parse_fit_options(&[]).unwrap().reconverge_gradient_interval, 0);
 
     // Parses as a non-negative integer and is recorded as user-set (so it
     // isn't flagged as ignored downstream).
     let opts = parse_fit_options(&["reconverge_gradient_interval = 5".to_string()]).unwrap();
     assert_eq!(opts.reconverge_gradient_interval, 5);
-    assert!(opts
-        .user_set_keys
-        .iter()
-        .any(|k| k == "reconverge_gradient_interval"));
+    assert!(opts.user_set_keys.iter().any(|k| k == "reconverge_gradient_interval"));
 
     // 0 is a valid explicit value (disables reconverging), not an error.
     assert_eq!(
@@ -5517,8 +5035,7 @@ fn test_parse_all_example_ferx_files() {
         // Line-start checks so a comment like "# Note: [structural_model] ..." in an
         // example header does not falsely count as a block.
         let block_at_line_start = |src: &str, block: &str| {
-            src.lines()
-                .any(|l| l.trim_start().starts_with(&format!("[{block}")))
+            src.lines().any(|l| l.trim_start().starts_with(&format!("[{block}")))
         };
         if !cfg!(feature = "survival") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
@@ -5551,11 +5068,7 @@ fn test_parse_all_example_ferx_files() {
             panic!("failed to parse {}: {}", path.display(), e);
         }
     }
-    assert!(
-        seen > 0,
-        "no .ferx files found in {}",
-        examples_dir.display()
-    );
+    assert!(seen > 0, "no .ferx files found in {}", examples_dir.display());
 }
 
 // ─── #1390: `[fit_options]` and `[error_model]` reject an unmatched line ────
@@ -5574,10 +5087,7 @@ fn fit_option_missing_its_equals_is_rejected_and_never_applied() {
     let err = parse_fit_options(&["method saem".to_string()])
         .err()
         .expect("`method saem` must be rejected, not dropped");
-    assert!(
-        err.contains("method = saem"),
-        "the message must name the repair: {err}"
-    );
+    assert!(err.contains("method = saem"), "the message must name the repair: {err}");
     assert!(err.contains("method saem"), "it must quote the line: {err}");
 
     // Same shape on a non-`method` key, so the arm is not `method`-special.
@@ -5587,17 +5097,14 @@ fn fit_option_missing_its_equals_is_rejected_and_never_applied() {
     assert!(err.contains("maxiter = 42"), "{err}");
 
     // A key with no value at all still gets a repair, with a placeholder.
-    let err = parse_fit_options(&["method".to_string()])
-        .err()
-        .expect("a bare `method` must be rejected");
+    let err =
+        parse_fit_options(&["method".to_string()]).err().expect("a bare `method` must be rejected");
     assert!(err.contains("method = <value>"), "{err}");
 
     // And the accepted spelling is untouched — the reject arm must not be
     // reachable from a line that parses.
     assert_eq!(
-        parse_fit_options(&["method = saem".to_string()])
-            .unwrap()
-            .method,
+        parse_fit_options(&["method = saem".to_string()]).unwrap().method,
         EstimationMethod::Saem
     );
 }
@@ -5612,12 +5119,8 @@ fn fit_option_missing_its_equals_is_rejected_and_never_applied() {
 /// update.
 #[test]
 fn fit_option_reject_distinguishes_a_known_key_from_an_unknown_one() {
-    let known = parse_fit_options(&["maxiter 42".to_string()])
-        .err()
-        .expect("rejected");
-    let unknown = parse_fit_options(&["banana 42".to_string()])
-        .err()
-        .expect("rejected");
+    let known = parse_fit_options(&["maxiter 42".to_string()]).err().expect("rejected");
+    let unknown = parse_fit_options(&["banana 42".to_string()]).err().expect("rejected");
     assert!(known.contains("did you mean"), "{known}");
     assert!(
         !unknown.contains("did you mean"),
@@ -5630,9 +5133,7 @@ fn fit_option_reject_distinguishes_a_known_key_from_an_unknown_one() {
 
     // A recognised key with a *malformed* value is still a recognised key: the
     // repair is the one the user wants, and the value error comes on the retry.
-    let bad_value = parse_fit_options(&["maxiter lots".to_string()])
-        .err()
-        .expect("rejected");
+    let bad_value = parse_fit_options(&["maxiter lots".to_string()]).err().expect("rejected");
     assert!(bad_value.contains("maxiter = lots"), "{bad_value}");
 }
 
@@ -5650,27 +5151,18 @@ fn fit_option_reject_distinguishes_a_known_key_from_an_unknown_one() {
 /// problem a line like `banana ; x` does not have (#1388 review round 3 #9).
 #[test]
 fn a_semicolon_comment_in_fit_options_is_named_as_such() {
-    for line in [
-        "; method = saem",
-        "method = saem ; run 3",
-        "maxiter = 100 ; TeunP",
-    ] {
+    for line in ["; method = saem", "method = saem ; run 3", "maxiter = 100 ; TeunP"] {
         let err = parse_fit_options(&[line.to_string()])
             .err()
             .unwrap_or_else(|| panic!("`{line}` must be rejected"));
         assert!(err.contains("does not start a comment"), "`{line}`: {err}");
         assert!(err.contains("use `#` or `//`"), "`{line}`: {err}");
-        assert!(
-            err.contains("[fit_options]"),
-            "the block must be named: {err}"
-        );
+        assert!(err.contains("[fit_options]"), "the block must be named: {err}");
     }
 
     // A `;` after something that is not a complete `key = value` pair is not a
     // comment the author meant, so it falls through to the ordinary diagnostic.
-    let err = parse_fit_options(&["banana ; x".to_string()])
-        .err()
-        .expect("rejected");
+    let err = parse_fit_options(&["banana ; x".to_string()]).err().expect("rejected");
     assert!(
         !err.contains("does not start a comment"),
         "a `;` alone must not earn the comment message: {err}"
@@ -5696,14 +5188,10 @@ fn every_listed_error_model_form_actually_parses() {
         });
     }
 
-    let err = parse_error_model(&["banana".to_string()])
-        .err()
-        .expect("a lone `banana` must be rejected");
+    let err =
+        parse_error_model(&["banana".to_string()]).err().expect("a lone `banana` must be rejected");
     for (spelling, _) in ERROR_MODEL_FORMS {
-        assert!(
-            err.contains(spelling),
-            "the real diagnostic omits `{spelling}`: {err}"
-        );
+        assert!(err.contains(spelling), "the real diagnostic omits `{spelling}`: {err}");
     }
 }
 
@@ -5725,10 +5213,7 @@ fn an_unrecognized_error_model_line_is_rejected_quoting_the_source_line() {
             .err()
             .unwrap_or_else(|| panic!("`{line}` must be rejected, not dropped"));
         assert!(err.contains("unrecognized line"), "`{line}`: {err}");
-        assert!(
-            err.contains(line),
-            "the message must quote the source line `{line}`, got: {err}"
-        );
+        assert!(err.contains(line), "the message must quote the source line `{line}`, got: {err}");
     }
 
     // The companion half: a valid block still parses, so the arm is not simply
@@ -5741,12 +5226,9 @@ fn an_unrecognized_error_model_line_is_rejected_quoting_the_source_line() {
 /// defect: the user's second thought is silently discarded.
 #[test]
 fn a_stray_line_beside_a_valid_error_model_statement_is_rejected() {
-    let err = parse_error_model(&[
-        "DV ~ proportional(PROP_ERR)".to_string(),
-        "banana".to_string(),
-    ])
-    .err()
-    .expect("the stray line must be rejected, not dropped");
+    let err = parse_error_model(&["DV ~ proportional(PROP_ERR)".to_string(), "banana".to_string()])
+        .err()
+        .expect("the stray line must be rejected, not dropped");
     assert!(err.contains("banana"), "{err}");
 }
 
@@ -5792,9 +5274,8 @@ fn a_semicolon_in_error_model_is_named_a_comment_only_when_it_is_one() {
         // An example may itself be multi-line (`iiv_on_ruv` needs a statement
         // above it); the `;` lands on the last line either way.
         let lines: Vec<String> = case.lines().map(|l| l.trim().to_string()).collect();
-        let err = parse_error_model(&lines)
-            .err()
-            .unwrap_or_else(|| panic!("`{case}` must be rejected"));
+        let err =
+            parse_error_model(&lines).err().unwrap_or_else(|| panic!("`{case}` must be rejected"));
         assert!(err.contains("does not start a comment"), "`{case}`: {err}");
     }
 
@@ -5804,9 +5285,7 @@ fn a_semicolon_in_error_model_is_named_a_comment_only_when_it_is_one() {
     // reject arm — measured, and it is why this test first read green on a
     // message it never produced. This spelling does reach the arm, and its head
     // (`DV ~ additive`) is not a statement, so it must get the form list.
-    let err = parse_error_model(&["DV ~ additive; (ADD)".to_string()])
-        .err()
-        .expect("rejected");
+    let err = parse_error_model(&["DV ~ additive; (ADD)".to_string()]).err().expect("rejected");
     assert!(
         !err.contains("does not start a comment"),
         "a `;` with an incomplete statement before it is not a comment: {err}"
@@ -5816,9 +5295,7 @@ fn a_semicolon_in_error_model_is_named_a_comment_only_when_it_is_one() {
     // `banana ; x` is the same side of the gate, via a different route: deleting
     // the tail leaves a line matching no form, so the form list is what the user
     // needs to see.
-    let err = parse_error_model(&["banana ; x".to_string()])
-        .err()
-        .expect("rejected");
+    let err = parse_error_model(&["banana ; x".to_string()]).err().expect("rejected");
     assert!(!err.contains("does not start a comment"), "{err}");
 
     // The rule's boundary, pinned rather than assumed — and measured, because
@@ -5875,9 +5352,8 @@ fn a_model_file_with_a_missing_equals_no_longer_parses_clean() {
     let bad = format!(
         "{base}[error_model]\n  DV ~ additive(ADD)\n  banana\n[fit_options]\n  method = saem\n"
     );
-    let err = parse_full_model(&bad)
-        .err()
-        .expect("a stray `[error_model]` line must fail the parse");
+    let err =
+        parse_full_model(&bad).err().expect("a stray `[error_model]` line must fail the parse");
     assert!(err.contains("banana"), "{err}");
 }
 
@@ -5917,10 +5393,7 @@ fn test_parse_data_block_without_path_keeps_column_map() {
     assert_eq!(path, None);
     assert_eq!(
         map,
-        vec![
-            ("TIME".to_string(), "TAFD".to_string()),
-            ("DV".to_string(), "CONC".to_string())
-        ]
+        vec![("TIME".to_string(), "TAFD".to_string()), ("DV".to_string(), "CONC".to_string())]
     );
     let (path, map) = parse_data_block(&[]).unwrap();
     assert_eq!(path, None);
@@ -5955,10 +5428,7 @@ fn test_parse_data_block_column_mapping() {
     assert_eq!(path.as_deref(), Some("mydata.csv"));
     assert_eq!(
         map,
-        vec![
-            ("TIME".to_string(), "TAFD".to_string()),
-            ("DV".to_string(), "CONC".to_string()),
-        ]
+        vec![("TIME".to_string(), "TAFD".to_string()), ("DV".to_string(), "CONC".to_string()),]
     );
 }
 
@@ -6008,10 +5478,7 @@ fn test_data_block_populates_parsed_model_column_map() {
     assert_eq!(parsed.data_path.as_deref(), Some("warfarin.csv"));
     assert_eq!(
         parsed.column_map,
-        vec![
-            ("TIME".to_string(), "TAFD".to_string()),
-            ("DV".to_string(), "CONC".to_string()),
-        ]
+        vec![("TIME".to_string(), "TAFD".to_string()), ("DV".to_string(), "CONC".to_string()),]
     );
 }
 
@@ -6083,14 +5550,8 @@ fn test_no_omega_model_still_requires_sigma() {
         Ok(_) => panic!("a continuous endpoint with no sigma must still be rejected"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("sigma"),
-        "the sigma error must name sigma, not Omega: {err}"
-    );
-    assert!(
-        !err.contains("omega parameters"),
-        "must not report this as an Omega problem: {err}"
-    );
+    assert!(err.contains("sigma"), "the sigma error must name sigma, not Omega: {err}");
+    assert!(!err.contains("omega parameters"), "must not report this as an Omega problem: {err}");
 }
 
 #[test]
@@ -6172,9 +5633,7 @@ fn test_parse_imp_defensive_alpha() {
     let opts = parse_fit_options(&["imp_defensive_alpha = 0.25".to_string()]).unwrap();
     assert_eq!(opts.imp_defensive_alpha, 0.25);
     assert_eq!(
-        parse_fit_options(&["imp_defensive_alpha = 0.0".to_string()])
-            .unwrap()
-            .imp_defensive_alpha,
+        parse_fit_options(&["imp_defensive_alpha = 0.0".to_string()]).unwrap().imp_defensive_alpha,
         0.0
     );
     // `impmap_defensive_alpha` is an accepted alias for the same field.
@@ -6283,10 +5742,7 @@ fn detect_groups(src: &str, theta_names: &[&str], eta_names: &[&str]) -> Vec<Cov
 /// [`detect_groups`] with the identifier set of the model's *other* blocks, the
 /// second route by which a theta escapes a typical value.
 fn detect_groups_outside(
-    src: &str,
-    theta_names: &[&str],
-    eta_names: &[&str],
-    outside: &[&str],
+    src: &str, theta_names: &[&str], eta_names: &[&str], outside: &[&str],
 ) -> Vec<CovariateMuRef> {
     let tn: Vec<String> = theta_names.iter().map(|s| s.to_string()).collect();
     let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
@@ -6408,30 +5864,12 @@ fn covariate_mu_ref_rejects_what_it_cannot_evaluate_per_subject() {
     let tn = ["TVCL", "TH_X"];
     let en = ["ETA_CL", "ETA_V"];
     for (src, why) in [
-        (
-            "CL = TVCL * (WT / 70.0) ^ 0.75 * exp(ETA_CL)",
-            "single theta: plain mu-ref territory",
-        ),
-        (
-            "CL = (TVCL + TH_X * TIME) * exp(ETA_CL)",
-            "TIME makes the mu vary within a subject",
-        ),
-        (
-            "CL = (TVCL + TH_X * exp(ETA_V)) * exp(ETA_CL)",
-            "a second eta inside the typical value",
-        ),
-        (
-            "CL = TVCL * exp(ETA_CL + TH_X * WT)",
-            "the exp factor is not a bare eta",
-        ),
-        (
-            "CL = (TVCL + TH_X * WT) * exp(ETA_CL) * exp(ETA_V)",
-            "two eta factors",
-        ),
-        (
-            "CL = TVCL + TH_X * WT + ETA_CL",
-            "additive link is never recorded",
-        ),
+        ("CL = TVCL * (WT / 70.0) ^ 0.75 * exp(ETA_CL)", "single theta: plain mu-ref territory"),
+        ("CL = (TVCL + TH_X * TIME) * exp(ETA_CL)", "TIME makes the mu vary within a subject"),
+        ("CL = (TVCL + TH_X * exp(ETA_V)) * exp(ETA_CL)", "a second eta inside the typical value"),
+        ("CL = TVCL * exp(ETA_CL + TH_X * WT)", "the exp factor is not a bare eta"),
+        ("CL = (TVCL + TH_X * WT) * exp(ETA_CL) * exp(ETA_V)", "two eta factors"),
+        ("CL = TVCL + TH_X * WT + ETA_CL", "additive link is never recorded"),
         (
             "if (SEX == 1) { TV = TVCL } else { TV = TH_X }\nCL = TV * exp(ETA_CL)",
             "a local an if assigns from a theta is not inlined (#1422)",
@@ -6447,9 +5885,7 @@ fn covariate_mu_ref_rejects_what_it_cannot_evaluate_per_subject() {
 /// every assigned name in `defined_vars`, so a local reads as `Variable`, not
 /// as a data covariate of the same name.
 fn detect_groups_with_locals(
-    src: &str,
-    theta_names: &[&str],
-    eta_names: &[&str],
+    src: &str, theta_names: &[&str], eta_names: &[&str],
 ) -> (Vec<CovariateMuRef>, Vec<Statement>) {
     let tn: Vec<String> = theta_names.iter().map(|s| s.to_string()).collect();
     let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
@@ -6467,16 +5903,7 @@ fn detect_groups_with_locals(
 fn block_value(stmts: &[Statement], theta: &[f64], covs: &[(&str, f64)], name: &str) -> f64 {
     let covariates: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let mut vars: HashMap<String, f64> = HashMap::new();
-    eval_statements(
-        stmts,
-        theta,
-        &[0.0],
-        &covariates,
-        &mut vars,
-        None,
-        None,
-        &[],
-    );
+    eval_statements(stmts, theta, &[0.0], &covariates, &mut vars, None, None, &[]);
     vars[name]
 }
 
@@ -6508,11 +5935,7 @@ CL = TVCL * (FFM / 25) ^ 0.75 * (CRCLM / 100) ^ CL_CRCL * exp(ETA_CL)";
     assert_eq!(g[0].theta_names, vec!["TVCL", "CL_CRCL"]);
     assert_eq!(g[0].transform, MuTransform::Log);
     for c in ["FFM", "AGE", "WT", "SCR", "SEX", "HT"] {
-        assert!(
-            g[0].covariate_names.iter().any(|n| n == c),
-            "{c} in {:?}",
-            g[0].covariate_names
-        );
+        assert!(g[0].covariate_names.iter().any(|n| n == c), "{c} in {:?}", g[0].covariate_names);
     }
     // The stored typical value is the model's CL at eta = 0 in every cell of
     // (adult / paediatric arm) × (under / over the 120 cap). A typical value
@@ -6566,11 +5989,7 @@ CL = TVCL * (FFM / 25) ^ 0.75 * (CRCLM / 100) ^ CL_CRCL * exp(ETA_CL)";
     ];
     for (covs, capped) in cells {
         let crclm = block_value(&stmts, &theta, covs, "CRCLM");
-        assert_eq!(
-            crclm == 120.0,
-            capped,
-            "fixture cell {covs:?}: CRCLM = {crclm}"
-        );
+        assert_eq!(crclm == 120.0, capped, "fixture cell {covs:?}: CRCLM = {crclm}");
         let want = block_value(&stmts, &theta, covs, "CL");
         assert!(want.is_finite() && want > 0.0, "{covs:?}: {want}");
         assert_eq!(group_typical(&g[0], &theta, covs), want, "{covs:?}");
@@ -6636,11 +6055,7 @@ fn covariate_mu_ref_sees_through_a_min_or_max_of_a_local() {
         for crcl in [60.0, 150.0] {
             let covs = [("CRCL", crcl)];
             let want = block_value(&stmts, &theta, &covs, "CL");
-            assert_eq!(
-                group_typical(&g[0], &theta, &covs),
-                want,
-                "{f}, CRCL = {crcl}"
-            );
+            assert_eq!(group_typical(&g[0], &theta, &covs), want, "{f}, CRCL = {crcl}");
         }
     }
 }
@@ -6670,11 +6085,7 @@ CL = TVCL * F * (WT / 70) ^ TH_WT * exp(ETA_CL)";
     let (g, stmts) = detect_groups_with_locals(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
     assert_eq!(g.len(), 1, "{g:?}");
     for c in ["WT", "AGE", "CRCL"] {
-        assert!(
-            g[0].covariate_names.iter().any(|n| n == c),
-            "{c} in {:?}",
-            g[0].covariate_names
-        );
+        assert!(g[0].covariate_names.iter().any(|n| n == c), "{c} in {:?}", g[0].covariate_names);
     }
     let theta = [5.0, 0.75];
     let (mut raised, mut plain) = (0, 0);
@@ -6711,10 +6122,7 @@ fn a_folded_if_local_is_recorded_only_when_eta_free() {
     let en: Vec<String> = vec!["ETA_CL".into()];
     for (src, want) in [
         ("if (WT > 0) { X = WT / 70 } else { X = 1 }", true),
-        (
-            "if (WT > 0) { X = WT / 70 * exp(ETA_CL) } else { X = 1 }",
-            false,
-        ),
+        ("if (WT > 0) { X = WT / 70 * exp(ETA_CL) } else { X = 1 }", false),
         ("if (ETA_CL > 0) { X = WT / 70 } else { X = 1 }", false),
     ] {
         let locals = vec!["X".to_string()];
@@ -6781,11 +6189,7 @@ fn covariate_mu_ref_rejects_an_if_local_it_cannot_fold() {
             leaked.push(format!("{why}: {src}\n  → {:?}", g[0].theta_names));
         }
     }
-    assert!(
-        leaked.is_empty(),
-        "recorded a group for:\n{}",
-        leaked.join("\n")
-    );
+    assert!(leaked.is_empty(), "recorded a group for:\n{}", leaked.join("\n"));
 }
 
 #[test]
@@ -6814,9 +6218,7 @@ fn covariate_mu_ref_retires_when_the_overwrite_is_a_plain_mu_ref() {
         "the two-theta group is dead once CL is rewritten without TH_X"
     );
     assert_eq!(
-        detect_plain(src, &tn, &en)
-            .get("ETA_CL")
-            .map(|r| r.theta_name.as_str()),
+        detect_plain(src, &tn, &en).get("ETA_CL").map(|r| r.theta_name.as_str()),
         Some("TVCL"),
         "and the scalar mu-ref the model does evaluate is what survives"
     );
@@ -6898,11 +6300,7 @@ fn covariate_mu_ref_reports_a_theta_shared_through_a_local_or_a_branch() {
     let via_local = "HELPER = TH_X * 2.0\nCL = (TVCL + TH_X * WT) * exp(ETA_CL)\nV = TVV + HELPER";
     let g = detect_groups_outside(via_local, &tn, &en, &["CL", "V"]);
     assert_eq!(g.len(), 1);
-    assert_eq!(
-        g[0].shared_thetas,
-        vec!["TH_X"],
-        "through a local definition"
-    );
+    assert_eq!(g[0].shared_thetas, vec!["TH_X"], "through a local definition");
 
     let via_branch =
         "CL = (TVCL + TH_X * WT) * exp(ETA_CL)\nV = TVV\nif (SEX == 1.0) {\n  V = TVV + TH_X\n}";
@@ -6930,9 +6328,7 @@ fn covariate_mu_ref_reports_a_theta_another_block_reads() {
     let en = ["ETA_CL"];
     let src = "CL = (TVCL + TH_X * WT) * exp(ETA_CL)";
     assert!(
-        detect_groups_outside(src, &tn, &en, &["CL", "V"])[0]
-            .shared_thetas
-            .is_empty(),
+        detect_groups_outside(src, &tn, &en, &["CL", "V"])[0].shared_thetas.is_empty(),
         "control: another block naming the individual parameter is the ordinary case"
     );
     assert_eq!(
@@ -6948,9 +6344,7 @@ fn covariate_mu_ref_reports_a_theta_another_block_reads() {
         "another block reading a local definition reads the thetas behind it"
     );
     assert!(
-        detect_groups_outside(via_local, &tn, &en, &["CL"])[0]
-            .shared_thetas
-            .is_empty(),
+        detect_groups_outside(via_local, &tn, &en, &["CL"])[0].shared_thetas.is_empty(),
         "control: the same local read by nothing outside stays the group's own"
     );
 }
@@ -7019,35 +6413,19 @@ fn covariate_mu_ref_taint_stops_at_the_defining_statement_not_the_name() {
     assert_eq!(g.len(), 2);
     assert_eq!(g[0].eta_name, "ETA_CL");
     assert_eq!(g[0].shared_thetas, vec!["TH_X"], "(a) shared_thetas");
-    assert_eq!(
-        g[0].read_outside_groups,
-        vec!["TH_X"],
-        "(a) read_outside_groups"
-    );
+    assert_eq!(g[0].read_outside_groups, vec!["TH_X"], "(a) read_outside_groups");
 
     let own_owner = format!("CL = TH_X * 2.0\nQ = CL * 0.5\n{group}");
     let g = detect_groups_outside(&own_owner, &tn, &en, &["CL", "Q"]);
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].shared_thetas, vec!["TH_X"], "(b) shared_thetas");
-    assert_eq!(
-        g[0].read_outside_groups,
-        vec!["TH_X"],
-        "(b) read_outside_groups"
-    );
+    assert_eq!(g[0].read_outside_groups, vec!["TH_X"], "(b) read_outside_groups");
 
     let dead = format!("CL = TH_X * 2.0\n{group}");
     let g = detect_groups_outside(&dead, &tn, &en, &["CL"]);
     assert_eq!(g.len(), 1);
-    assert!(
-        g[0].shared_thetas.is_empty(),
-        "(c) {:?}",
-        g[0].shared_thetas
-    );
-    assert!(
-        g[0].read_outside_groups.is_empty(),
-        "(c) {:?}",
-        g[0].read_outside_groups
-    );
+    assert!(g[0].shared_thetas.is_empty(), "(c) {:?}", g[0].shared_thetas);
+    assert!(g[0].read_outside_groups.is_empty(), "(c) {:?}", g[0].read_outside_groups);
 }
 
 /// A group records the single anchors whose theta it reads (#1630), with the
@@ -7093,10 +6471,7 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
     assert_eq!(g.len(), 2, "(a')");
     assert_eq!(g[0].eta_name, "ETA_V1");
     let etas = |g: &CovariateMuRef| -> Vec<String> {
-        g.colliding_anchors
-            .iter()
-            .map(|a| a.eta_name.clone())
-            .collect()
+        g.colliding_anchors.iter().map(|a| a.eta_name.clone()).collect()
     };
     assert_eq!(etas(&g[0]), vec!["ETA_V2"], "(a')");
     // `ETA_KA`'s plain line is overwritten by its group, so it is no anchor.
@@ -7105,11 +6480,7 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
     let third = format!("{base}\nQ = TVV2 * 0.1");
     let g = detect_groups_outside(&third, &tn, &en, &["V1", "V2", "KA", "Q"]);
     assert_eq!(g[0].read_outside_groups_and_anchors, vec!["TVV2"], "(b)");
-    assert_eq!(
-        g[0].colliding_anchors[0].read_outside_groups_and_anchors,
-        vec!["TVV2"],
-        "(b)"
-    );
+    assert_eq!(g[0].colliding_anchors[0].read_outside_groups_and_anchors, vec!["TVV2"], "(b)");
 
     let retired = format!("{base}\nV2 = TVV2 + ETA_V2");
     let g = detect_groups_outside(&retired, &tn, &en, &["V1", "V2", "KA"]);
@@ -7122,34 +6493,13 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
 
 #[test]
 fn covariate_mu_ref_reaches_the_compiled_model() {
-    let src = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let src = crate::test_models::ONE_CPT_IV_19;
     let m = parse_model_string(src).expect("parses");
     assert_eq!(m.covariate_mu_refs.len(), 1);
     assert_eq!(m.covariate_mu_refs[0].eta_name, "ETA_CL");
     assert_eq!(m.covariate_mu_refs[0].theta_names, vec!["TVCL", "TH_CRCL"]);
     assert!(!m.mu_refs.contains_key("ETA_CL"));
-    assert_eq!(
-        m.mu_refs.get("ETA_V").map(|r| r.theta_name.as_str()),
-        Some("TVV")
-    );
+    assert_eq!(m.mu_refs.get("ETA_V").map(|r| r.theta_name.as_str()), Some("TVV"));
 }
 
 #[test]
@@ -7193,12 +6543,8 @@ fn test_detect_mu_ref_product_chain_with_covariate() {
     // exp(eta) factor; the Power sub-expression is opaque (neither a
     // Theta nor an exp(Eta)), so it is simply skipped. As long as there
     // is exactly one bare Theta factor, detection still succeeds.
-    let m = detect_one(
-        "CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)",
-        &["TVCL"],
-        &["ETA_CL"],
-    )
-    .expect("should still detect mu-ref through opaque covariate term");
+    let m = detect_one("CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)", &["TVCL"], &["ETA_CL"])
+        .expect("should still detect mu-ref through opaque covariate term");
     assert_eq!(m.theta_name, "TVCL");
     assert!(m.log_transformed());
 }
@@ -7206,11 +6552,7 @@ fn test_detect_mu_ref_product_chain_with_covariate() {
 #[test]
 fn test_detect_mu_ref_rejects_two_thetas() {
     // Two thetas in the product → ambiguous anchor, pattern rejected.
-    let m = detect_one(
-        "CL = TVCL * TVCL2 * exp(ETA_CL)",
-        &["TVCL", "TVCL2"],
-        &["ETA_CL"],
-    );
+    let m = detect_one("CL = TVCL * TVCL2 * exp(ETA_CL)", &["TVCL", "TVCL2"], &["ETA_CL"]);
     assert!(m.is_none());
 }
 
@@ -7226,11 +6568,7 @@ fn test_detect_mu_ref_rejects_compound_eta_expression() {
     // exp(ETA_CL + ETA_OCC) — IIV+IOV combined pattern. Since Fix 1,
     // find_exp_eta_in_mul recognises this and returns the min-index eta
     // (ETA_CL, index 0), so a mu-ref IS detected for ETA_CL → TVCL.
-    let m = detect_one(
-        "CL = TVCL * exp(ETA_CL + ETA_OCC)",
-        &["TVCL"],
-        &["ETA_CL", "ETA_OCC"],
-    );
+    let m = detect_one("CL = TVCL * exp(ETA_CL + ETA_OCC)", &["TVCL"], &["ETA_CL", "ETA_OCC"]);
     let m = m.expect("IIV+IOV combined pattern should detect mu-ref for ETA_CL");
     assert_eq!(m.theta_name, "TVCL");
     assert!(m.log_transformed());
@@ -7248,11 +6586,7 @@ fn test_detect_mu_ref_multiple_parameters() {
     // Detect across several lines; each eta maps to its own theta.
     let block = "CL = TVCL * exp(ETA_CL)\nV  = TVV  * exp(ETA_V)\nKA = TVKA * exp(ETA_KA)";
     let tn = vec!["TVCL".to_string(), "TVV".to_string(), "TVKA".to_string()];
-    let en = vec![
-        "ETA_CL".to_string(),
-        "ETA_V".to_string(),
-        "ETA_KA".to_string(),
-    ];
+    let en = vec!["ETA_CL".to_string(), "ETA_V".to_string(), "ETA_KA".to_string()];
     let ctx = ParseCtx::new(&tn, &en, &[]);
     let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
     let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
@@ -7307,10 +6641,7 @@ fn test_detect_mu_ref_inv_logit_theta_plus_eta() {
 
 #[test]
 fn test_detect_mu_ref_inv_logit_reversed_and_expit_alias() {
-    for line in [
-        "F = inv_logit(ETA_F + LOGIT_F)",
-        "F = expit(LOGIT_F + ETA_F)",
-    ] {
+    for line in ["F = inv_logit(ETA_F + LOGIT_F)", "F = expit(LOGIT_F + ETA_F)"] {
         let m = detect_one(line, &["LOGIT_F"], &["ETA_F"]).unwrap_or_else(|| panic!("{line}"));
         assert_eq!(m.theta_name, "LOGIT_F");
         assert_eq!(m.transform, MuTransform::Logit, "{line}");
@@ -7343,12 +6674,8 @@ fn test_detect_mu_ref_hand_written_inv_logit() {
 
 #[test]
 fn test_detect_mu_ref_hand_written_inv_logit_probability_scale() {
-    let m = detect_one(
-        "F = 1.0 / (1.0 + exp(-(logit(TVF) + ETA_F)))",
-        &["TVF"],
-        &["ETA_F"],
-    )
-    .expect("hand-written inv_logit of a probability-scale theta");
+    let m = detect_one("F = 1.0 / (1.0 + exp(-(logit(TVF) + ETA_F)))", &["TVF"], &["ETA_F"])
+        .expect("hand-written inv_logit of a probability-scale theta");
     assert_eq!(m.theta_name, "TVF");
     assert_eq!(m.transform, MuTransform::LogitProbability);
 }
@@ -7471,11 +6798,7 @@ fn test_logit_mu_ref_full_model_parse_and_no_warning() {
   DV ~ proportional(PROP_ERR)
 "#;
     let parsed = parse_full_model(content).expect("model should parse");
-    let f_ref = parsed
-        .model
-        .mu_refs
-        .get("ETA_F")
-        .expect("ETA_F should be mu-referenced");
+    let f_ref = parsed.model.mu_refs.get("ETA_F").expect("ETA_F should be mu-referenced");
     assert_eq!(f_ref.theta_name, "LOGIT_F");
     assert_eq!(f_ref.transform, MuTransform::Logit);
     let warning = crate::api::saem_non_mu_referenced_individual_params_warning(&parsed.model, &[]);
@@ -7487,10 +6810,7 @@ fn test_logit_mu_ref_full_model_parse_and_no_warning() {
 
 #[test]
 fn test_parse_diagonal_omega() {
-    let lines = vec![
-        "omega ETA_CL ~ 0.07".to_string(),
-        "omega ETA_V  ~ 0.02".to_string(),
-    ];
+    let lines = vec!["omega ETA_CL ~ 0.07".to_string(), "omega ETA_V  ~ 0.02".to_string()];
     let (_, omegas, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 2);
@@ -7533,10 +6853,8 @@ fn test_parse_block_omega_multiline() {
 #[test]
 fn test_parse_block_omega_multiline_fix() {
     // FIX keyword on the closing-bracket line must still be honored.
-    let lines = vec![
-        "block_omega (ETA_CL, ETA_V) = [0.09,".to_string(),
-        "0.02, 0.04] FIX".to_string(),
-    ];
+    let lines =
+        vec!["block_omega (ETA_CL, ETA_V) = [0.09,".to_string(), "0.02, 0.04] FIX".to_string()];
     let (_, _, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas.len(), 1);
@@ -7606,10 +6924,7 @@ fn test_reject_eta_in_two_block_omega_declarations() {
     let err = parse_parameters(&lines, &Default::default())
         .err()
         .expect("an eta in two block_omega declarations must be refused");
-    assert!(
-        err.contains("ETA_V") && err.contains("more than one block_omega"),
-        "{err}"
-    );
+    assert!(err.contains("ETA_V") && err.contains("more than one block_omega"), "{err}");
 }
 
 #[test]
@@ -7621,17 +6936,14 @@ fn test_reject_eta_in_both_omega_and_block_omega() {
     let err = parse_parameters(&lines, &Default::default())
         .err()
         .expect("an eta in both omega and block_omega must be refused");
-    assert!(
-        err.contains("ETA_V") && err.contains("both omega and block_omega"),
-        "{err}"
-    );
+    assert!(err.contains("ETA_V") && err.contains("both omega and block_omega"), "{err}");
 }
 
 #[test]
 fn test_parse_block_omega_3x3() {
-    let lines = vec![
-        "block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.01, 0.04, 0.005, 0.002, 0.16]".to_string(),
-    ];
+    let lines =
+        vec!["block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.01, 0.04, 0.005, 0.002, 0.16]"
+            .to_string()];
     let (_, _, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas[0].names.len(), 3);
@@ -7699,18 +7011,8 @@ fn test_build_omega_matrix_empty_is_naive_pooled_not_an_error() {
 #[test]
 fn test_build_omega_matrix_diagonal_only() {
     let diag = vec![
-        OmegaSpec {
-            name: "ETA_CL".into(),
-            variance: 0.09,
-            fixed: false,
-            init_as_sd: false,
-        },
-        OmegaSpec {
-            name: "ETA_V".into(),
-            variance: 0.04,
-            fixed: false,
-            init_as_sd: false,
-        },
+        OmegaSpec { name: "ETA_CL".into(), variance: 0.09, fixed: false, init_as_sd: false },
+        OmegaSpec { name: "ETA_V".into(), variance: 0.04, fixed: false, init_as_sd: false },
     ];
     let names = vec!["ETA_CL".into(), "ETA_V".into()];
     let omega = build_omega_matrix(&diag, &[], &names).unwrap();
@@ -7738,12 +7040,8 @@ fn test_build_omega_matrix_block() {
 
 #[test]
 fn test_build_omega_matrix_mixed() {
-    let diag = vec![OmegaSpec {
-        name: "ETA_KA".into(),
-        variance: 0.16,
-        fixed: false,
-        init_as_sd: false,
-    }];
+    let diag =
+        vec![OmegaSpec { name: "ETA_KA".into(), variance: 0.16, fixed: false, init_as_sd: false }];
     let block = vec![BlockOmegaSpec {
         names: vec!["ETA_CL".into(), "ETA_V".into()],
         lower_triangle: vec![0.09, 0.02, 0.04],
@@ -8128,10 +7426,8 @@ fn test_omega_sd_annotation_squares_value() {
 #[test]
 fn test_omega_variance_annotation_is_noop() {
     // `(variance)` and `(var)` are explicit no-ops.
-    let lines = vec![
-        "omega ETA_CL ~ 0.07 (variance)".to_string(),
-        "omega ETA_V  ~ 0.04 (var)".to_string(),
-    ];
+    let lines =
+        vec!["omega ETA_CL ~ 0.07 (variance)".to_string(), "omega ETA_V  ~ 0.04 (var)".to_string()];
     let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
@@ -8356,27 +7652,16 @@ fn test_unknown_scale_tag_is_rejected() {
 #[test]
 fn block_scale_tag_is_rejected_on_every_block_form() {
     let forms = [
-        (
-            "block_omega",
-            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
-        ),
-        (
-            "block_sigma",
-            "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]",
-        ),
-        (
-            "block_kappa",
-            "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]",
-        ),
+        ("block_omega", "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]"),
+        ("block_sigma", "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]"),
+        ("block_kappa", "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]"),
     ];
     let mut rows = 0;
     for (kw, body) in forms {
         for tag in ["(sd)", "(variance)", "(var)"] {
-            for line in [
-                format!("{body} {tag}"),
-                format!("{body} FIX {tag}"),
-                format!("{body} {tag} FIX"),
-            ] {
+            for line in
+                [format!("{body} {tag}"), format!("{body} FIX {tag}"), format!("{body} {tag} FIX")]
+            {
                 rows += 1;
                 let err = parse_parameters(&[line.clone()], &Default::default())
                     .err()
@@ -8389,10 +7674,7 @@ fn block_scale_tag_is_rejected_on_every_block_form() {
             }
         }
     }
-    assert_eq!(
-        rows, 27,
-        "the table must stay 3 block forms x 3 tags x 3 FIX placements"
-    );
+    assert_eq!(rows, 27, "the table must stay 3 block forms x 3 tags x 3 FIX placements");
 }
 
 /// Trailing text is rejected on all seven declaration forms.
@@ -8406,18 +7688,9 @@ fn trailing_text_is_rejected_on_every_parameters_form() {
         ("omega", "omega ETA_CL ~ 0.09"),
         ("sigma", "sigma PROP_ERR ~ 0.04"),
         ("kappa", "kappa KAPPA_CL ~ 0.04"),
-        (
-            "block_omega",
-            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
-        ),
-        (
-            "block_sigma",
-            "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]",
-        ),
-        (
-            "block_kappa",
-            "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]",
-        ),
+        ("block_omega", "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]"),
+        ("block_sigma", "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]"),
+        ("block_kappa", "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]"),
     ];
     for (form, body) in forms {
         let line = format!("{body} banana");
@@ -8432,10 +7705,7 @@ fn trailing_text_is_rejected_on_every_parameters_form() {
     // Two shapes from the issue that read as a scale tag but are not one. A
     // misspelt tag used to mean "no tag", i.e. the value silently became a
     // variance; text after a good tag used to be dropped outright.
-    for line in [
-        "omega ETA_CL ~ 0.09 (sdx)",
-        "sigma PROP_ERR ~ 0.04 (sd) banana",
-    ] {
+    for line in ["omega ETA_CL ~ 0.09 (sdx)", "sigma PROP_ERR ~ 0.04 (sd) banana"] {
         let err = parse_parameters(&[line.to_string()], &Default::default())
             .err()
             .unwrap_or_else(|| panic!("`{line}` must be rejected"));
@@ -8472,11 +7742,7 @@ fn every_listed_parameter_form_actually_parses() {
             *takes_prior,
             "`{spelling}`: the diagnostic says takes_prior={takes_prior}, but \
              `{with_prior}` {}",
-            if got.is_ok() {
-                "parsed"
-            } else {
-                "was rejected"
-            }
+            if got.is_ok() { "parsed" } else { "was rejected" }
         );
     }
 
@@ -8488,10 +7754,7 @@ fn every_listed_parameter_form_actually_parses() {
         .err()
         .expect("a lone `banana` must be rejected");
     for (spelling, _, _) in PARAMETER_FORMS {
-        assert!(
-            err.contains(spelling),
-            "the real diagnostic omits `{spelling}`: {err}"
-        );
+        assert!(err.contains(spelling), "the real diagnostic omits `{spelling}`: {err}");
     }
 }
 
@@ -8547,9 +7810,7 @@ fn a_semicolon_line_is_told_it_is_not_a_comment() {
     }
     // A `;` after text that is *not* a declaration says nothing about comments:
     // the line is wrong before the `;` is reached.
-    let err = parse_parameters(&["banana ; note".to_string()], &Default::default())
-        .err()
-        .unwrap();
+    let err = parse_parameters(&["banana ; note".to_string()], &Default::default()).err().unwrap();
     assert!(err.contains("unrecognized line"), "{err}");
 }
 
@@ -8649,10 +7910,7 @@ fn a_non_ascii_scale_tag_is_not_a_scale_tag() {
 /// and the positive row reddens if the fold's gate stops matching blocks.
 #[test]
 fn the_own_line_fold_attaches_only_to_a_block_declaration() {
-    for prev in [
-        "block_omegas (A) = [0.1]",
-        "block_omega\u{00e9} (A) = [0.1]",
-    ] {
+    for prev in ["block_omegas (A) = [0.1]", "block_omega\u{00e9} (A) = [0.1]"] {
         let err = parse_parameters(&[prev.to_string(), "FIX".to_string()], &Default::default())
             .err()
             .unwrap_or_else(|| panic!("`{prev}` is not a declaration"));
@@ -8679,14 +7937,8 @@ fn the_own_line_fold_attaches_only_to_a_block_declaration() {
 #[test]
 fn a_non_ascii_parameters_line_is_rejected_not_a_panic() {
     for lines in [
-        vec![
-            "theta PLAC\u{00c9}B[3](0.1, -1.0, 1.0)".to_string(),
-            "FIX".to_string(),
-        ],
-        vec![
-            "theta PLAC\u{00c9}B[3](0.1, -1.0, 1.0)".to_string(),
-            "(sd)".to_string(),
-        ],
+        vec!["theta PLAC\u{00c9}B[3](0.1, -1.0, 1.0)".to_string(), "FIX".to_string()],
+        vec!["theta PLAC\u{00c9}B[3](0.1, -1.0, 1.0)".to_string(), "(sd)".to_string()],
         vec!["bl\u{00f6}ck_omega (A, B) = [0.09, 0.02, 0.04]".to_string()],
         vec!["\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9} ]".to_string()],
     ] {
@@ -8715,57 +7967,17 @@ fn leading_text_is_rejected_on_every_parameters_form() {
     // of its lines and the generic wording never says the word "comment"
     // (#1388 review).
     for (line, was, sentinel) in [
-        (
-            "block_sigma PROP ~ 0.04",
-            "a diagonal sigma",
-            "unrecognized line",
-        ),
-        (
-            "block_omega ETA_CL ~ 0.09",
-            "a diagonal omega",
-            "unrecognized line",
-        ),
-        (
-            "block_kappa KAPPA_CL ~ 0.04",
-            "a diagonal kappa",
-            "unrecognized line",
-        ),
-        (
-            "; theta TVCL(1, 0.1, 100)",
-            "a live theta",
-            "does not start a comment",
-        ),
+        ("block_sigma PROP ~ 0.04", "a diagonal sigma", "unrecognized line"),
+        ("block_omega ETA_CL ~ 0.09", "a diagonal omega", "unrecognized line"),
+        ("block_kappa KAPPA_CL ~ 0.04", "a diagonal kappa", "unrecognized line"),
+        ("; theta TVCL(1, 0.1, 100)", "a live theta", "does not start a comment"),
         ("xtheta CL(1, 0, 10)", "theta CL", "unrecognized line"),
-        (
-            "x = block_omega (A, B) = [0.09, 0.02, 0.04]",
-            "a block_omega",
-            "unrecognized line",
-        ),
-        (
-            "junk omega ETA_CL ~ 0.09",
-            "a diagonal omega",
-            "unrecognized line",
-        ),
-        (
-            "junk sigma PROP ~ 0.04",
-            "a diagonal sigma",
-            "unrecognized line",
-        ),
-        (
-            "junk kappa KAPPA_CL ~ 0.04",
-            "a diagonal kappa",
-            "unrecognized line",
-        ),
-        (
-            "junk block_sigma (A, B) = [0.04, 0.10, 1.00]",
-            "a block_sigma",
-            "unrecognized line",
-        ),
-        (
-            "junk block_kappa (A, B) = [0.09, 0.02, 0.04]",
-            "a block_kappa",
-            "unrecognized line",
-        ),
+        ("x = block_omega (A, B) = [0.09, 0.02, 0.04]", "a block_omega", "unrecognized line"),
+        ("junk omega ETA_CL ~ 0.09", "a diagonal omega", "unrecognized line"),
+        ("junk sigma PROP ~ 0.04", "a diagonal sigma", "unrecognized line"),
+        ("junk kappa KAPPA_CL ~ 0.04", "a diagonal kappa", "unrecognized line"),
+        ("junk block_sigma (A, B) = [0.04, 0.10, 1.00]", "a block_sigma", "unrecognized line"),
+        ("junk block_kappa (A, B) = [0.09, 0.02, 0.04]", "a block_kappa", "unrecognized line"),
     ] {
         let err = parse_parameters(&[line.to_string()], &Default::default())
             .err()
@@ -8773,19 +7985,13 @@ fn leading_text_is_rejected_on_every_parameters_form() {
         assert!(err.contains(sentinel), "`{line}` (was {was}): {err}");
         // Quote what the user wrote, so the offending line can be found in the
         // file (#1388 review). Every branch of the `else` arm owes this.
-        assert!(
-            err.contains(line),
-            "`{line}` (was {was}): the message must quote the line: {err}"
-        );
+        assert!(err.contains(line), "`{line}` (was {was}): the message must quote the line: {err}");
     }
 
     // A doubled declaration is the same hole seen from the other side: with the
     // head open the match simply started later and the *second* one won, with no
     // diagnostic either way.
-    for line in [
-        "theta CL(1, 0, 10) theta V(2, 0, 20)",
-        "omega A ~ 0.1 omega B ~ 0.2",
-    ] {
+    for line in ["theta CL(1, 0, 10) theta V(2, 0, 20)", "omega A ~ 0.1 omega B ~ 0.2"] {
         parse_parameters(&[line.to_string()], &Default::default())
             .err()
             .unwrap_or_else(|| panic!("`{line}` declares two parameters and must be rejected"));
@@ -8815,40 +8021,19 @@ fn a_block_without_a_scale_tag_never_claims_the_variance_only_code() {
     for (line, why) in [
         // `SD` is a *name* here; the defect is the doubled FIX.
         ("block_kappa (SD) = [0.1] FIX FIX", "`SD` is an eta name"),
-        (
-            "block_omega (VAR, B) = [0.09, 0.02, 0.04] banana",
-            "`VAR` is an eta name",
-        ),
-        (
-            "block_sigma (VARIANCE) = [0.04] banana",
-            "`VARIANCE` is a sigma name",
-        ),
+        ("block_omega (VAR, B) = [0.09, 0.02, 0.04] banana", "`VAR` is an eta name"),
+        ("block_sigma (VARIANCE) = [0.04] banana", "`VARIANCE` is a sigma name"),
         // A real tag *plus* other text: deleting the tag still leaves a line
         // that fails, so the tag is not the problem to report.
-        (
-            "block_omega (A, B) = [0.09, 0.02, 0.04] (sd) banana",
-            "the line also carries `banana`",
-        ),
-        (
-            "block_kappa (A) = [0.1] FIX (sd) FIX FIX",
-            "the line also carries a doubled `FIX`",
-        ),
+        ("block_omega (A, B) = [0.09, 0.02, 0.04] (sd) banana", "the line also carries `banana`"),
+        ("block_kappa (A) = [0.1] FIX (sd) FIX FIX", "the line also carries a doubled `FIX`"),
         // A doubled `FIX` with no tag, on the two forms the `(SD)` row above
         // does not cover. The trailing `FIX` group sits inside the tag group,
         // so it cannot match without a tag; moved outside it, `FIX FIX` would
         // parse on that form (the mutation that survived the first sweep).
-        (
-            "block_omega (A, B) = [0.09, 0.02, 0.04] FIX FIX",
-            "a doubled `FIX` with no tag",
-        ),
-        (
-            "block_sigma (A, B) = [0.04, 0.10, 1.00] FIX FIX",
-            "a doubled `FIX` with no tag",
-        ),
-        (
-            "block_sigma (A) = [0.04] banana (sd)",
-            "the tag does not follow the `]`",
-        ),
+        ("block_omega (A, B) = [0.09, 0.02, 0.04] FIX FIX", "a doubled `FIX` with no tag"),
+        ("block_sigma (A, B) = [0.04, 0.10, 1.00] FIX FIX", "a doubled `FIX` with no tag"),
+        ("block_sigma (A) = [0.04] banana (sd)", "the tag does not follow the `]`"),
     ] {
         let err = parse_parameters(&[line.to_string()], &Default::default())
             .err()
@@ -8865,26 +8050,14 @@ fn a_block_without_a_scale_tag_never_claims_the_variance_only_code() {
     // the line has parsed; each row reports its other defect first (#1388 review
     // round 4 #1, measured: all five used to claim E_BLOCK_VARIANCE_ONLY).
     for (lines, other) in [
-        (
-            vec!["block_omega (A, B) = [banana, 0.02, 0.04] (sd)"],
-            "Bad block_omega value",
-        ),
-        (
-            vec!["block_omega (A, B) = [0.09, 0.02] (sd)"],
-            "expects 3 lower-triangle values",
-        ),
+        (vec!["block_omega (A, B) = [banana, 0.02, 0.04] (sd)"], "Bad block_omega value"),
+        (vec!["block_omega (A, B) = [0.09, 0.02] (sd)"], "expects 3 lower-triangle values"),
         (
             vec!["block_omega (A, B) = [0.09, 0.02, 0.04] (sd) prior(0.1, rse = 25%)"],
             "`prior(...)` is only supported",
         ),
-        (
-            vec!["block_kappa (A) = [0.1] (sd) weight = NARM"],
-            "`weight = NARM` is only supported",
-        ),
-        (
-            vec!["block_sigma (A, B) = [-0.04, 0.10, 1.00] (sd)"],
-            "negative initial variance",
-        ),
+        (vec!["block_kappa (A) = [0.1] (sd) weight = NARM"], "`weight = NARM` is only supported"),
+        (vec!["block_sigma (A, B) = [-0.04, 0.10, 1.00] (sd)"], "negative initial variance"),
     ] {
         let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         let err = parse_parameters(&lines, &Default::default())
@@ -8903,9 +8076,7 @@ fn a_block_without_a_scale_tag_never_claims_the_variance_only_code() {
         "block_sigma (A, B) = [0.04, 0.10, 1.00] (sd)",
         "block_kappa (A) = [0.1] (sd)",
     ] {
-        let err = parse_parameters(&[line.to_string()], &Default::default())
-            .err()
-            .unwrap();
+        let err = parse_parameters(&[line.to_string()], &Default::default()).err().unwrap();
         assert!(err.contains("is variance-only"), "`{line}`: {err}");
     }
 
@@ -8952,28 +8123,20 @@ fn unrecognized_parameters_line_is_rejected() {
     let err = parse_parameters(&["banana".to_string()], &Default::default())
         .err()
         .expect("a lone `banana` line must not be dropped");
-    assert!(
-        err.contains("unrecognized line") && err.contains("banana"),
-        "{err}"
-    );
+    assert!(err.contains("unrecognized line") && err.contains("banana"), "{err}");
 
     // A bare `FIX` after a *level-block theta* must not fold onto it. The theta
     // line carries a `]` from `[3]`, so the fold's old `.contains(']')` test
     // attached it and silently fixed every level -- measured as
     // `theta_fixed = [.., true, true, true]`, no diagnostic (#1388 review §2).
-    let lines = vec![
-        "theta PLACEBO[3](0.1, -1.0, 1.0)".to_string(),
-        "FIX".to_string(),
-    ];
+    let lines = vec!["theta PLACEBO[3](0.1, -1.0, 1.0)".to_string(), "FIX".to_string()];
     let err = parse_parameters(&lines, &Default::default())
         .err()
         .expect("a bare `FIX` after a level-block theta must not silently fix its levels");
     assert!(err.contains("unrecognized line"), "{err}");
 
-    let lines = vec![
-        "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
-        "(sd)".to_string(),
-    ];
+    let lines =
+        vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(), "(sd)".to_string()];
     let err = parse_parameters(&lines, &Default::default())
         .err()
         .expect("a scale tag on its own line must not be dropped");
@@ -9033,22 +8196,13 @@ fn anchored_forms_still_accept_every_documented_tail() {
     // ...and the spaced spelling is read as the tag on sigma/kappa too, not
     // merely tolerated.
     let (_, _, _, sig, _, _, kap, _, _, _, _) = parse_parameters(
-        &[
-            "sigma SS ~ 0.01 (  sd  )".to_string(),
-            "kappa KS ~ 0.30 ( sd )".to_string(),
-        ],
+        &["sigma SS ~ 0.01 (  sd  )".to_string(), "kappa KS ~ 0.30 ( sd )".to_string()],
         &Default::default(),
     )
     .expect("spaced tags must parse");
-    assert!(
-        sig[0].init_as_sd,
-        "sigma spaced `( sd )` must set init_as_sd"
-    );
+    assert!(sig[0].init_as_sd, "sigma spaced `( sd )` must set init_as_sd");
     assert!((sig[0].value - 0.01).abs() < 1e-12);
-    assert!(
-        kap.diagonal[0].init_as_sd,
-        "kappa spaced `( sd )` must set init_as_sd"
-    );
+    assert!(kap.diagonal[0].init_as_sd, "kappa spaced `( sd )` must set init_as_sd");
     assert!(
         (kap.diagonal[0].variance - 0.09).abs() < 1e-12,
         "kappa `( sd )` must square: {}",
@@ -9062,17 +8216,13 @@ fn anchored_forms_still_accept_every_documented_tail() {
     assert!(sigmas[0].init_as_sd);
 
     // #1031: `weight =` is peeled before the match, so the anchor never sees it.
-    let (_, _, _, _, _, _, kappas, _, _, _, _) = parse_parameters(
-        &["kappa K ~ 0.1 weight = NARM".to_string()],
-        &Default::default(),
-    )
-    .expect("a weighted kappa must still parse");
+    let (_, _, _, _, _, _, kappas, _, _, _, _) =
+        parse_parameters(&["kappa K ~ 0.1 weight = NARM".to_string()], &Default::default())
+            .expect("a weighted kappa must still parse");
     assert_eq!(kappas.diagonal.len(), 1);
     assert!(
         kappas.weights.len() == 1
-            && kappas.weights[0]
-                .as_deref()
-                .is_some_and(|w| w.contains("NARM")),
+            && kappas.weights[0].as_deref().is_some_and(|w| w.contains("NARM")),
         "the peeled weight must survive the anchoring: {:?}",
         kappas.weights
     );
@@ -9114,18 +8264,9 @@ fn anchored_forms_still_accept_every_documented_tail() {
         ("omega", "omega ETA_CL ~ 0.09 (sd)  "),
         ("sigma", "sigma PROP_ERR ~ 0.04 FIX \t"),
         ("kappa", "kappa KAPPA_CL ~ 0.04 (var)  "),
-        (
-            "block_omega",
-            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX  ",
-        ),
-        (
-            "block_sigma",
-            "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]  ",
-        ),
-        (
-            "block_kappa",
-            "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04] \t",
-        ),
+        ("block_omega", "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX  "),
+        ("block_sigma", "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]  "),
+        ("block_kappa", "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04] \t"),
     ] {
         parse_parameters(&[line.to_string()], &Default::default()).unwrap_or_else(|e| {
             panic!("trailing whitespace must not make a `{form}` declaration unrecognized: {e}")
@@ -9158,10 +8299,7 @@ fn the_quoted_line_is_the_source_line_not_the_peeled_remainder() {
             "junk kappa KAPPA_CL ~ 0.04 weight = NARM",
             "the generic branch, with a weight peeled off",
         ),
-        (
-            "; omega ETA_CL ~ 0.09 prior(0.1, rse = 25%)",
-            "the `;`-is-not-a-comment branch",
-        ),
+        ("; omega ETA_CL ~ 0.09 prior(0.1, rse = 25%)", "the `;`-is-not-a-comment branch"),
         // No E_BLOCK_VARIANCE_ONLY row any more, and not by omission: that code
         // now waits for the rest of the line to parse, and a peeled `prior(...)`
         // or `weight =` tail on a block is itself an error reported first
@@ -9240,15 +8378,10 @@ fn a_spaced_scale_tag_means_what_the_unspaced_one_means() {
     }
 
     let kappa_var = kappa("kappa KS ~ 0.04 (var)");
-    assert!(
-        !kappa_var.1,
-        "`(var)` must leave init_as_sd false: {kappa_var:?}"
-    );
-    for line in [
-        "kappa KS ~ 0.04 ( var )",
-        "kappa KS ~ 0.04 (  var  )",
-        "kappa KS ~ 0.04 ( variance )",
-    ] {
+    assert!(!kappa_var.1, "`(var)` must leave init_as_sd false: {kappa_var:?}");
+    for line in
+        ["kappa KS ~ 0.04 ( var )", "kappa KS ~ 0.04 (  var  )", "kappa KS ~ 0.04 ( variance )"]
+    {
         assert_eq!(kappa(line), kappa_var, "`{line}` must mean `(var)`");
     }
 
@@ -9514,10 +8647,7 @@ fn collect_forward_refs_detects_order_and_respects_branches() {
         Statement::Assign("A".to_string(), Expression::Literal(1.0)),
     ];
     let refs = collect_forward_refs(&bad, &in_block);
-    assert_eq!(
-        refs,
-        vec![("A".to_string(), "B".to_string(), UnassignedRead::Forward)]
-    );
+    assert_eq!(refs, vec![("A".to_string(), "B".to_string(), UnassignedRead::Forward)]);
 
     // A assigned on both arms of an if, then read — no violation.
     let ok = vec![
@@ -9526,10 +8656,7 @@ fn collect_forward_refs_detects_order_and_respects_branches() {
                 Condition::Compare(Expression::Time, CmpOp::Gt, Expression::Literal(0.0)),
                 vec![Statement::Assign("A".to_string(), Expression::Literal(1.0))],
             )],
-            else_body: Some(vec![Statement::Assign(
-                "A".to_string(),
-                Expression::Literal(2.0),
-            )]),
+            else_body: Some(vec![Statement::Assign("A".to_string(), Expression::Literal(2.0))]),
         },
         Statement::Assign("C".to_string(), Expression::Variable("A".to_string())),
     ];
@@ -9559,33 +8686,19 @@ fn test_ruv_magnitude_theta_not_flagged_as_unused() {
 "#;
     let model = parse_model_string(content).unwrap();
     assert!(model.has_custom_ruv_magnitude());
-    let warns: Vec<_> = model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("RUV_LATE"))
-        .collect();
-    assert!(
-        warns.is_empty(),
-        "RUV_LATE is used by the magnitude expression, got: {:?}",
-        warns
-    );
+    let warns: Vec<_> = model.parse_warnings.iter().filter(|w| w.contains("RUV_LATE")).collect();
+    assert!(warns.is_empty(), "RUV_LATE is used by the magnitude expression, got: {:?}", warns);
 }
 
 /// `∂(program)/∂θ` through the live generic evaluator (`RuvMagDerivProgram::eval_g`,
 /// the one the adjoint tape records), seeded with `Dual2` θ leaves.
 fn deriv_theta_grad<const N: usize>(
-    p: &RuvMagDerivProgram,
-    theta: &[f64; N],
-    cov: &std::collections::HashMap<String, f64>,
-    time: f64,
-    tad: f64,
+    p: &RuvMagDerivProgram, theta: &[f64; N], cov: &std::collections::HashMap<String, f64>,
+    time: f64, tad: f64,
 ) -> Vec<f64> {
     use crate::sens::dual2::Dual2;
     let th: Vec<Dual2<N>> = (0..N).map(|m| Dual2::var(theta[m], m)).collect();
-    p.eval_g(&th, cov, time, tad)
-        .expect("θ count matches")
-        .grad
-        .to_vec()
+    p.eval_g(&th, cov, time, tad).expect("θ count matches").grad.to_vec()
 }
 
 /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
@@ -9616,9 +8729,7 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
 "#;
     let model = parse_model_string(content).unwrap();
     let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
-    let deriv = rm.per_sigma_deriv[0]
-        .as_ref()
-        .expect("prop slot has a deriv program");
+    let deriv = rm.per_sigma_deriv[0].as_ref().expect("prop slot has a deriv program");
 
     let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
     let grad = deriv_theta_grad(deriv, &[0.2, 10.0, 1.5], &cov_zero, 10.0, 10.0);
@@ -9757,12 +8868,7 @@ fn ruv_indiv_mults(model_str: &str, wts: &[f64]) -> Vec<f64> {
     let rows: Vec<(usize, f64)> = wts.iter().map(|w| (1, *w)).collect();
     let s = magnitude_rows_subject(&rows, "WT");
     let theta = model.default_params.theta.clone();
-    model
-        .ruv_obs_mult(&s, &theta)
-        .unwrap()
-        .into_iter()
-        .map(|r| r[0])
-        .collect()
+    model.ruv_obs_mult(&s, &theta).unwrap().into_iter().map(|r| r[0]).collect()
 }
 
 /// The issue's case: a name assigned in [individual_parameters] is read as its
@@ -9809,10 +8915,7 @@ fn ruv_indiv_scope_refuses_a_self_reference_instead_of_recursing() {
     )];
     let scope = RuvIndivScope::new(&stmts);
     let why = scope.verdict("WT").unwrap_err();
-    assert!(
-        why.contains("reads `WT`, which is defined in terms of itself"),
-        "{why}"
-    );
+    assert!(why.contains("reads `WT`, which is defined in terms of itself"), "{why}");
 }
 
 /// Review round 1 (#2915): a refused name must refuse every name that reads
@@ -9822,10 +8925,8 @@ fn ruv_indiv_scope_refuses_a_self_reference_instead_of_recursing() {
 /// every other block, `TAD` here, with no message.
 #[test]
 fn ruv_magnitude_refusal_propagates_through_a_wrapper_of_a_reassigned_name() {
-    let err = expect_parse_err(&ruv_indiv_model(
-        "  TAD = 2\n  ISPK = TAD\n  TAD = 3",
-        "PROP_ERR * ISPK",
-    ));
+    let err =
+        expect_parse_err(&ruv_indiv_model("  TAD = 2\n  ISPK = TAD\n  TAD = 3", "PROP_ERR * ISPK"));
     assert!(
         err.contains("`ISPK`, which [individual_parameters] assigns but which reads `TAD`, which is assigned more than once"),
         "{err}"
@@ -9849,10 +8950,7 @@ fn ruv_magnitude_refuses_a_builtin_name_the_block_assigns() {
 fn ruv_indiv_diamond(n: usize) -> String {
     let mut s = String::from("  X0 = RUV_K\n");
     for i in 0..n {
-        s += &format!(
-            "  B{i} = X{i} + 2\n  C{i} = X{i} + 3\n  X{} = B{i} + C{i}\n",
-            i + 1
-        );
+        s += &format!("  B{i} = X{i} + 2\n  C{i} = X{i} + 3\n  X{} = B{i} + C{i}\n", i + 1);
     }
     s
 }
@@ -9876,10 +8974,7 @@ fn ruv_magnitude_diamond_is_judged_linearly() {
     );
     // A shallow diamond is substituted, with the value of the expanded tree:
     // X1 = 2·X0 + 5 = 8, X2 = 2·X1 + 5 = 21 at RUV_K = 1.5.
-    let m = ruv_indiv_mults(
-        &ruv_indiv_model(&ruv_indiv_diamond(2), "PROP_ERR * X2"),
-        &[70.0],
-    );
+    let m = ruv_indiv_mults(&ruv_indiv_model(&ruv_indiv_diamond(2), "PROP_ERR * X2"), &[70.0]);
     assert_eq!(m, vec![21.0]);
 }
 
@@ -9916,11 +9011,7 @@ fn ruv_gather_model_with(indiv: &str, mag: &str) -> String {
 
 /// The gather index columns the pre-fit check will walk.
 fn ruv_gather_index_columns(model: &CompiledModel) -> Vec<(String, String)> {
-    model
-        .theta_blocks()
-        .index_columns()
-        .map(|(b, c, _)| (b.to_string(), c.to_string()))
-        .collect()
+    model.theta_blocks().index_columns().map(|(b, c, _)| (b.to_string(), c.to_string())).collect()
 }
 
 /// Review 2 (#2915): the parse records `RUV[IDX]` as a gather over a data
@@ -9931,14 +9022,8 @@ fn ruv_gather_index_columns(model: &CompiledModel) -> Vec<(String, String)> {
 /// recorded.
 #[test]
 fn ruv_magnitude_assigned_literal_gather_index_folds_and_records_no_column() {
-    let model = parse_full_model(&ruv_gather_model("  IDX = 2"))
-        .unwrap()
-        .model;
-    assert!(
-        ruv_gather_index_columns(&model).is_empty(),
-        "{:?}",
-        ruv_gather_index_columns(&model)
-    );
+    let model = parse_full_model(&ruv_gather_model("  IDX = 2")).unwrap().model;
+    assert!(ruv_gather_index_columns(&model).is_empty(), "{:?}", ruv_gather_index_columns(&model));
     let s = magnitude_rows_subject(&[(1, 1.0)], "GRP");
     let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
     assert_eq!(rows[0][0], 2.2);
@@ -9949,13 +9034,8 @@ fn ruv_magnitude_assigned_literal_gather_index_folds_and_records_no_column() {
 /// and each row reads its own level.
 #[test]
 fn ruv_magnitude_assigned_column_gather_index_records_the_substituted_column() {
-    let model = parse_full_model(&ruv_gather_model("  IDX = GRP"))
-        .unwrap()
-        .model;
-    assert_eq!(
-        ruv_gather_index_columns(&model),
-        vec![("RUV".to_string(), "GRP".to_string())]
-    );
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP")).unwrap().model;
+    assert_eq!(ruv_gather_index_columns(&model), vec![("RUV".to_string(), "GRP".to_string())]);
     let s = magnitude_rows_subject(&[(1, 1.0), (1, 3.0)], "GRP");
     let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
     assert_eq!((rows[0][0], rows[1][0]), (1.1, 3.3));
@@ -9965,14 +9045,9 @@ fn ruv_magnitude_assigned_column_gather_index_records_the_substituted_column() {
 #[test]
 fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
     // Read twice: the walk stops at the first refusal and skips the second.
-    let err = expect_parse_err(&ruv_gather_model_with(
-        "  IDX = 5",
-        "PROP_ERR * RUV[IDX] * RUV[IDX]",
-    ));
-    assert!(
-        err.contains("`RUV[5]`: level index must be an integer in 1..=3"),
-        "{err}"
-    );
+    let err =
+        expect_parse_err(&ruv_gather_model_with("  IDX = 5", "PROP_ERR * RUV[IDX] * RUV[IDX]"));
+    assert!(err.contains("`RUV[5]`: level index must be an integer in 1..=3"), "{err}");
 }
 
 /// A substituted index that is neither a column nor a literal (`GRP + 0`)
@@ -9981,9 +9056,7 @@ fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
 /// their own level.
 #[test]
 fn ruv_magnitude_assigned_computed_gather_index_records_no_column() {
-    let model = parse_full_model(&ruv_gather_model("  IDX = GRP + 0"))
-        .unwrap()
-        .model;
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP + 0")).unwrap().model;
     assert!(ruv_gather_index_columns(&model).is_empty());
     let s = magnitude_rows_subject(&[(1, 2.0)], "GRP");
     let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
@@ -9994,15 +9067,11 @@ fn ruv_magnitude_assigned_computed_gather_index_records_no_column() {
 /// is not a recorded gather site, before or after substitution.
 #[test]
 fn ruv_magnitude_substitution_leaves_a_data_driven_block_unrecorded() {
-    let src = ruv_gather_model_with("  ISPK = 2", "PROP_ERR * ERRSCALE * ISPK").replace(
-        "  theta RUV[3](1.0, 0.0, 10.0)\n",
-        "  theta ERRSCALE[GRP](1.0, 0.1, 10.0)\n",
-    );
+    let src = ruv_gather_model_with("  ISPK = 2", "PROP_ERR * ERRSCALE * ISPK")
+        .replace("  theta RUV[3](1.0, 0.0, 10.0)\n", "  theta ERRSCALE[GRP](1.0, 0.1, 10.0)\n");
     let model = parse_full_model(&src).unwrap().model;
     assert!(
-        ruv_gather_index_columns(&model)
-            .iter()
-            .all(|(b, _)| b != "ERRSCALE"),
+        ruv_gather_index_columns(&model).iter().all(|(b, _)| b != "ERRSCALE"),
         "{:?}",
         ruv_gather_index_columns(&model)
     );
@@ -10011,10 +9080,7 @@ fn ruv_magnitude_substitution_leaves_a_data_driven_block_unrecorded() {
 /// A name read twice is substituted at both sites and reported once.
 #[test]
 fn ruv_magnitude_reads_the_same_assigned_name_twice() {
-    let m = ruv_indiv_mults(
-        &ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK * ISPK"),
-        &[70.0],
-    );
+    let m = ruv_indiv_mults(&ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK * ISPK"), &[70.0]);
     assert_eq!(m, vec![9.0]);
     let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE", "PROP_ERR * ISPK * ISPK"));
     assert!(err.contains("definition of `ISPK`)"), "{err}");
@@ -10059,13 +9125,7 @@ fn ruv_magnitude_substitutes_through_every_expression_shape() {
 fn ruv_indiv_scope_refuses_mixnum_nn_and_unknown_variables() {
     let stmts = vec![
         Statement::Assign("M".to_string(), Expression::MixNum),
-        Statement::Assign(
-            "N".to_string(),
-            Expression::NnOutput {
-                nn_idx: 0,
-                output_idx: 0,
-            },
-        ),
+        Statement::Assign("N".to_string(), Expression::NnOutput { nn_idx: 0, output_idx: 0 }),
         Statement::Assign("U".to_string(), Expression::Variable("ZZZ".to_string())),
     ];
     let scope = RuvIndivScope::new(&stmts);
@@ -10295,10 +9355,7 @@ fn single_error_model_combined_transposed_args_err() {
         "DV ~ combined(PROP_ERR, ADD_ERR)",
     );
     let err = expect_parse_err(&content);
-    assert!(
-        err.contains("consumed positionally") && err.contains("PROP_ERR"),
-        "got: {err}"
-    );
+    assert!(err.contains("consumed positionally") && err.contains("PROP_ERR"), "got: {err}");
 }
 
 #[test]
@@ -10410,10 +9467,7 @@ fn single_error_model_magnitude_expression_respects_declaration_order() {
         "DV ~ proportional(S_SMALL * 2.0)",
     );
     let err = expect_parse_err(&content);
-    assert!(
-        err.contains("consumed positionally") && err.contains("S_SMALL"),
-        "got: {err}"
-    );
+    assert!(err.contains("consumed positionally") && err.contains("S_SMALL"), "got: {err}");
 }
 
 #[test]
@@ -10425,10 +9479,7 @@ fn single_error_model_ltbs_respects_declaration_order() {
         "log(DV) ~ additive(ADD_LOG)",
     );
     let err = expect_parse_err(&content);
-    assert!(
-        err.contains("consumed positionally") && err.contains("ADD_LOG"),
-        "got: {err}"
-    );
+    assert!(err.contains("consumed positionally") && err.contains("ADD_LOG"), "got: {err}");
 }
 
 // ── #1022: a single-endpoint block takes exactly one plain `DV ~ ...` line ────
@@ -10486,10 +9537,7 @@ fn single_error_model_duplicate_identical_lines_errs() {
         "DV ~ proportional(S_PROP)\n  DV ~ proportional(S_PROP)",
     );
     let err = expect_parse_err(&content);
-    assert!(
-        err.contains("more than one plain `DV ~ ...` line"),
-        "got: {err}"
-    );
+    assert!(err.contains("more than one plain `DV ~ ...` line"), "got: {err}");
 }
 
 #[test]
@@ -10504,10 +9552,7 @@ fn single_error_model_ltbs_plus_plain_line_errs() {
         "log(DV) ~ additive(S_ADD)\n  DV ~ proportional(S_PROP)",
     );
     let err = expect_parse_err(&content);
-    assert!(
-        err.contains("more than one plain `DV ~ ...` line"),
-        "got: {err}"
-    );
+    assert!(err.contains("more than one plain `DV ~ ...` line"), "got: {err}");
 }
 
 #[test]
@@ -10572,18 +9617,8 @@ fn test_parse_full_model_duplicate_sigma_name_errs() {
 #[test]
 fn test_build_omega_fixed_diagonal() {
     let diag = vec![
-        OmegaSpec {
-            name: "ETA_CL".into(),
-            variance: 0.09,
-            fixed: true,
-            init_as_sd: false,
-        },
-        OmegaSpec {
-            name: "ETA_V".into(),
-            variance: 0.04,
-            fixed: false,
-            init_as_sd: false,
-        },
+        OmegaSpec { name: "ETA_CL".into(), variance: 0.09, fixed: true, init_as_sd: false },
+        OmegaSpec { name: "ETA_V".into(), variance: 0.04, fixed: false, init_as_sd: false },
     ];
     let names = vec!["ETA_CL".into(), "ETA_V".into()];
     let flags = build_omega_fixed(&diag, &[], &names).unwrap();
@@ -10606,12 +9641,8 @@ fn test_build_omega_fixed_block() {
 fn test_build_omega_fixed_rejects_diag_fix_inside_free_block() {
     // ETA_CL is in a non-FIX block but also declared FIX as a diagonal —
     // the parser must reject this as ambiguous.
-    let diag = vec![OmegaSpec {
-        name: "ETA_CL".into(),
-        variance: 0.09,
-        fixed: true,
-        init_as_sd: false,
-    }];
+    let diag =
+        vec![OmegaSpec { name: "ETA_CL".into(), variance: 0.09, fixed: true, init_as_sd: false }];
     let block = vec![BlockOmegaSpec {
         names: vec!["ETA_CL".into(), "ETA_V".into()],
         lower_triangle: vec![0.09, 0.02, 0.04],
@@ -10663,9 +9694,7 @@ fn model_with_covariates(cov_block: Option<&str>, cl_uses_wt: bool) -> String {
     } else {
         "CL = TVCL * exp(ETA_CL)"
     };
-    let cov = cov_block
-        .map(|b| format!("\n[covariates]\n{}\n", b))
-        .unwrap_or_default();
+    let cov = cov_block.map(|b| format!("\n[covariates]\n{}\n", b)).unwrap_or_default();
     format!(
         r#"
 [parameters]
@@ -10697,11 +9726,9 @@ fn test_covariates_absent_is_none() {
 
 #[test]
 fn test_covariates_per_line_form() {
-    let parsed = parse_full_model(&model_with_covariates(
-        Some("WT continuous\nSEX categorical"),
-        true,
-    ))
-    .unwrap();
+    let parsed =
+        parse_full_model(&model_with_covariates(Some("WT continuous\nSEX categorical"), true))
+            .unwrap();
     let decls = parsed.covariate_decls.expect("declared");
     assert_eq!(decls.len(), 2);
     assert_eq!(decls[0].name, "WT");
@@ -10726,11 +9753,8 @@ fn test_covariates_colon_form_and_order() {
 
 #[test]
 fn test_covariates_type_aliases() {
-    let parsed = parse_full_model(&model_with_covariates(
-        Some("WT cont\nSEX cat\ncont: HT"),
-        true,
-    ))
-    .unwrap();
+    let parsed =
+        parse_full_model(&model_with_covariates(Some("WT cont\nSEX cat\ncont: HT"), true)).unwrap();
     let decls = parsed.covariate_decls.expect("declared");
     assert_eq!(decls[0].kind, CovariateKind::Continuous);
     assert_eq!(decls[1].kind, CovariateKind::Categorical);
@@ -10739,20 +9763,15 @@ fn test_covariates_type_aliases() {
 
 #[test]
 fn test_covariates_duplicate_errors() {
-    let err = parse_full_model(&model_with_covariates(
-        Some("WT continuous\nWT categorical"),
-        true,
-    ))
-    .err()
-    .unwrap();
+    let err = parse_full_model(&model_with_covariates(Some("WT continuous\nWT categorical"), true))
+        .err()
+        .unwrap();
     assert!(err.contains("more than once"), "got: {err}");
 }
 
 #[test]
 fn test_covariates_unknown_type_errors() {
-    let err = parse_full_model(&model_with_covariates(Some("WT numeric"), true))
-        .err()
-        .unwrap();
+    let err = parse_full_model(&model_with_covariates(Some("WT numeric"), true)).err().unwrap();
     assert!(err.contains("unknown covariate type"), "got: {err}");
 }
 
@@ -10817,11 +9836,7 @@ fn test_covariates_referenced_but_undeclared_warns_not_errors() {
     assert_eq!(decls[0].name, "SEX");
     // A warning names the undeclared covariate.
     assert!(
-        parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("WT") && w.contains("not declared")),
+        parsed.model.parse_warnings.iter().any(|w| w.contains("WT") && w.contains("not declared")),
         "expected a warning about undeclared WT, got: {:?}",
         parsed.model.parse_warnings
     );
@@ -10938,14 +9953,8 @@ fn model_with_error_block(error_block: &str) -> Result<crate::types::CompiledMod
 fn test_ltbs_log_dv_additive_case2() {
     // `log(DV) ~ additive(...)`: engine logs DV (natural-scale data).
     let m = model_with_error_block("  log(DV) ~ additive(SIG1)").unwrap();
-    assert!(
-        m.log_transform,
-        "log(DV) ~ additive should set log_transform"
-    );
-    assert!(
-        !m.dv_pre_logged,
-        "log(DV) ~ additive: engine logs DV, so dv_pre_logged must be false"
-    );
+    assert!(m.log_transform, "log(DV) ~ additive should set log_transform");
+    assert!(!m.dv_pre_logged, "log(DV) ~ additive: engine logs DV, so dv_pre_logged must be false");
     assert_eq!(m.error_model, ErrorModel::Additive);
 }
 
@@ -10954,10 +9963,7 @@ fn test_ltbs_log_additive_case1() {
     // `DV ~ log_additive(...)`: DV already log; only the prediction is logged.
     let m = model_with_error_block("  DV ~ log_additive(SIG1)").unwrap();
     assert!(m.log_transform, "log_additive should set log_transform");
-    assert!(
-        m.dv_pre_logged,
-        "log_additive: DV is already log, so dv_pre_logged must be true"
-    );
+    assert!(m.dv_pre_logged, "log_additive: DV is already log, so dv_pre_logged must be true");
     assert_eq!(m.error_model, ErrorModel::Additive);
 }
 
@@ -10971,19 +9977,13 @@ fn test_non_ltbs_additive_unaffected() {
 #[test]
 fn test_ltbs_rejects_proportional() {
     let err = model_with_error_block("  log(DV) ~ proportional(SIG1)").unwrap_err();
-    assert!(
-        err.contains("additive"),
-        "expected additive-only message, got: {err}"
-    );
+    assert!(err.contains("additive"), "expected additive-only message, got: {err}");
 }
 
 #[test]
 fn test_ltbs_rejects_double_log() {
     let err = model_with_error_block("  log(DV) ~ log_additive(SIG1)").unwrap_err();
-    assert!(
-        err.contains("double-log"),
-        "expected double-log rejection, got: {err}"
-    );
+    assert!(err.contains("double-log"), "expected double-log rejection, got: {err}");
 }
 
 #[test]
@@ -10991,10 +9991,7 @@ fn test_ltbs_rejects_non_dv_lhs() {
     // `log(<not DV>) ~ additive(...)` would parse silently but the engine
     // always log-transforms the `DV` column, so the LHS is misleading.
     let err = model_with_error_block("  log(CONC) ~ additive(SIG1)").unwrap_err();
-    assert!(
-        err.contains("DV"),
-        "expected DV-required rejection, got: {err}"
-    );
+    assert!(err.contains("DV"), "expected DV-required rejection, got: {err}");
 }
 
 // ── #2729: combined proportional + additive under LTBS ───────────────────
@@ -11006,10 +10003,7 @@ fn test_ltbs_log_dv_combined_is_log_combined() {
     let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2)").unwrap();
     assert!(m.log_transform && !m.dv_pre_logged);
     assert_eq!(m.error_model, ErrorModel::LogCombined);
-    assert!(matches!(
-        m.error_spec,
-        crate::types::ErrorSpec::Single(ErrorModel::LogCombined)
-    ));
+    assert!(matches!(m.error_spec, crate::types::ErrorSpec::Single(ErrorModel::LogCombined)));
 }
 
 #[test]
@@ -11057,10 +10051,7 @@ fn test_log_combined_rejects_the_forms_it_cannot_take() {
 fn test_log_combined_weight_scales_the_additive_slot() {
     let m = model_with_error_block("  log(DV) ~ combined(SIG1, SIG2) weight = TVV").unwrap();
     assert_eq!(m.error_model, ErrorModel::LogCombined);
-    let mag = m
-        .ruv_magnitude
-        .as_ref()
-        .expect("weight desugars to a magnitude");
+    let mag = m.ruv_magnitude.as_ref().expect("weight desugars to a magnitude");
     let row = mag.eval_obs(&m.default_params.theta, &HashMap::new(), 1.0, 1.0);
     assert_eq!(row[0], 1.0, "proportional slot untouched: {row:?}");
     assert_eq!(row[1], 10.0, "additive slot carries W = TVV: {row:?}");
@@ -11137,26 +10128,17 @@ fn test_ltbs_per_cmt_lines_must_agree() {
         "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ proportional(PROP_U)",
     )
     .unwrap_err();
-    assert!(
-        err.contains("every endpoint or none") && !err.contains("scale of `DV`"),
-        "got: {err}"
-    );
+    assert!(err.contains("every endpoint or none") && !err.contains("scale of `DV`"), "got: {err}");
     let err = ltbs_per_cmt_model(
         "  CMT=2: DV ~ proportional(PROP_U)\n  CMT=3: log(DV) ~ combined(PROP_P, ADD_P)",
     )
     .unwrap_err();
-    assert!(
-        err.contains("every endpoint or none"),
-        "order-independent: {err}"
-    );
+    assert!(err.contains("every endpoint or none"), "order-independent: {err}");
     let err = ltbs_per_cmt_model(
         "  CMT=2: log(DV) ~ combined(PROP_P, ADD_P)\n  CMT=3: DV ~ log_combined(PROP_U, ADD_U)",
     )
     .unwrap_err();
-    assert!(
-        err.contains("scale of `DV`") && !err.contains("every endpoint or none"),
-        "got: {err}"
-    );
+    assert!(err.contains("scale of `DV`") && !err.contains("every endpoint or none"), "got: {err}");
     // Proportional on the log scale is still refused per line.
     let err = ltbs_per_cmt_model("  CMT=2: log(DV) ~ proportional(PROP_P)").unwrap_err();
     assert!(err.contains("log(DV) ~ combined(PROP, ADD)"), "got: {err}");
@@ -11392,20 +10374,14 @@ fn test_apply_fit_option_optimizer_bobyqa() {
 #[test]
 fn test_apply_fit_option_optimizer_trust_region() {
     let mut opts = FitOptions::default();
-    assert_eq!(
-        apply_fit_option(&mut opts, "optimizer", "trust_region"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "optimizer", "trust_region"), Ok(true));
     assert_eq!(opts.optimizer, Optimizer::TrustRegion);
 }
 
 #[test]
 fn test_apply_fit_option_steihaug_max_iters() {
     let mut opts = FitOptions::default();
-    assert_eq!(
-        apply_fit_option(&mut opts, "steihaug_max_iters", "30"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "steihaug_max_iters", "30"), Ok(true));
     assert_eq!(opts.steihaug_max_iters, Some(30));
     // Reject malformed (e.g. negative) value.
     assert!(apply_fit_option(&mut opts, "steihaug_max_iters", "-1").is_err());
@@ -11437,13 +10413,7 @@ fn test_apply_fit_option_bayes_keys() {
     // All Bayes keys are recognised by method_specific_keys (no spurious
     // "unsupported key" warning when method = bayes).
     opts.method = EstimationMethod::Bayes;
-    for k in [
-        "bayes_warmup",
-        "bayes_iters",
-        "bayes_chains",
-        "bayes_thin",
-        "bayes_seed",
-    ] {
+    for k in ["bayes_warmup", "bayes_iters", "bayes_chains", "bayes_thin", "bayes_seed"] {
         assert!(
             crate::types::method_specific_keys(EstimationMethod::Bayes).contains(&k),
             "method_specific_keys(Bayes) missing `{k}`"
@@ -11469,10 +10439,7 @@ fn test_apply_fit_option_cov_inner_tol() {
     let mut opts = FitOptions::default();
     // Default is None (falls back to inner_tol via effective_cov_inner_tol).
     assert_eq!(FitOptions::default().cov_inner_tol, None);
-    assert_eq!(
-        apply_fit_option(&mut opts, "cov_inner_tol", "1e-9"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "cov_inner_tol", "1e-9"), Ok(true));
     assert_eq!(opts.cov_inner_tol, Some(1e-9));
     assert!(opts.user_set_keys.iter().any(|k| k == "cov_inner_tol"));
     assert!(apply_fit_option(&mut opts, "cov_inner_tol", "not_a_num").is_err());
@@ -11498,10 +10465,7 @@ fn test_apply_fit_option_outer_xtol_ftol() {
 #[test]
 fn test_apply_fit_option_fd_hessian_step_valid() {
     let mut opts = FitOptions::default();
-    assert_eq!(
-        apply_fit_option(&mut opts, "fd_hessian_step", "0.05"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "fd_hessian_step", "0.05"), Ok(true));
     assert!((opts.fd_hessian_step - 0.05).abs() < 1e-15);
 }
 
@@ -11509,20 +10473,14 @@ fn test_apply_fit_option_fd_hessian_step_valid() {
 fn test_apply_fit_option_fd_hessian_step_zero_rejected() {
     let mut opts = FitOptions::default();
     let err = apply_fit_option(&mut opts, "fd_hessian_step", "0").unwrap_err();
-    assert!(
-        err.contains("positive"),
-        "error must mention 'positive': {err}"
-    );
+    assert!(err.contains("positive"), "error must mention 'positive': {err}");
 }
 
 #[test]
 fn test_apply_fit_option_fd_hessian_step_negative_rejected() {
     let mut opts = FitOptions::default();
     let err = apply_fit_option(&mut opts, "fd_hessian_step", "-0.01").unwrap_err();
-    assert!(
-        err.contains("positive"),
-        "error must mention 'positive': {err}"
-    );
+    assert!(err.contains("positive"), "error must mention 'positive': {err}");
 }
 
 // ── IOV: kappa keyword and iov_column ──────────────────────────────────
@@ -11570,10 +10528,7 @@ fn test_kappa_fix_before_sd_annotation() {
 fn test_kappa_appended_after_bsv_etas() {
     // kappa names must NOT appear in the BSV eta_names list returned
     // as the 5th element; they only appear in the 6th (kappas) element.
-    let lines = vec![
-        "omega ETA_CL ~ 0.09".to_string(),
-        "kappa KAPPA_CL ~ 0.01".to_string(),
-    ];
+    let lines = vec!["omega ETA_CL ~ 0.09".to_string(), "kappa KAPPA_CL ~ 0.01".to_string()];
     let (_, _, _, _, _, bsv_etas, ki, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(bsv_etas, vec!["ETA_CL"]);
@@ -11638,10 +10593,7 @@ fn test_iov_column_parsed_from_fit_options_block() {
 #[test]
 fn test_iov_occasion_dose_and_column() {
     let mut opts = FitOptions::default();
-    assert_eq!(
-        apply_fit_option(&mut opts, "iov_occasion", "dose"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "iov_occasion", "dose"), Ok(true));
     assert_eq!(opts.iov_occasion, IovOccasionRule::PerDose);
     apply_fit_option(&mut opts, "iov_occasion", "column").unwrap();
     assert_eq!(opts.iov_occasion, IovOccasionRule::Column);
@@ -11651,10 +10603,7 @@ fn test_iov_occasion_dose_and_column() {
 fn test_iov_occasion_time_windows() {
     let mut opts = FitOptions::default();
     apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
-    assert_eq!(
-        opts.iov_occasion,
-        IovOccasionRule::TimeWindows(vec![24.0, 48.0])
-    );
+    assert_eq!(opts.iov_occasion, IovOccasionRule::TimeWindows(vec![24.0, 48.0]));
 }
 
 #[test]
@@ -11680,10 +10629,7 @@ fn test_iov_occasion_rejects_zero_breakpoint() {
     let mut opts = FitOptions::default();
     let err = apply_fit_option(&mut opts, "iov_occasion", "time(0, 24, 48)")
         .expect_err("a 0 breakpoint must be rejected");
-    assert!(
-        err.contains("must not include `0`") && err.contains("implied"),
-        "got: {err}"
-    );
+    assert!(err.contains("must not include `0`") && err.contains("implied"), "got: {err}");
     // Also rejected as the sole breakpoint.
     assert!(apply_fit_option(&mut opts, "iov_occasion", "time(0)").is_err());
     // The non-zero form is still accepted.
@@ -11694,10 +10640,7 @@ fn test_iov_occasion_rejects_zero_breakpoint() {
 fn test_iov_occasion_parsed_from_fit_options_block() {
     let content = minimal_model_with_fit_options("  iov_occasion = time(24)");
     let parsed = parse_full_model(&content).unwrap();
-    assert_eq!(
-        parsed.fit_options.iov_occasion,
-        IovOccasionRule::TimeWindows(vec![24.0])
-    );
+    assert_eq!(parsed.fit_options.iov_occasion, IovOccasionRule::TimeWindows(vec![24.0]));
 }
 
 // ── block_kappa (Option B) ─────────────────────────────────────────────
@@ -11765,10 +10708,7 @@ fn test_parse_full_model_with_block_kappa() {
     assert_eq!(m.kappa_names, vec!["KAPPA_CL", "KAPPA_V"]);
     let iov = m.default_params.omega_iov.as_ref().unwrap();
     assert_eq!(iov.dim(), 2);
-    assert!(
-        !iov.diagonal,
-        "block_kappa should produce non-diagonal omega_iov"
-    );
+    assert!(!iov.diagonal, "block_kappa should produce non-diagonal omega_iov");
     assert!((iov.matrix[(0, 0)] - 0.01).abs() < 1e-12);
     assert!((iov.matrix[(0, 1)] - 0.002).abs() < 1e-12);
     assert!((iov.matrix[(1, 0)] - 0.002).abs() < 1e-12);
@@ -11828,12 +10768,9 @@ fn test_inline_if_expression_parses_and_evaluates() {
     let tn = vec!["TVCL".to_string()];
     let en: Vec<String> = vec![];
     let ctx = ParseCtx::new(&tn, &en, &[]);
-    let stmts = parse_block_statements(
-        "CL = if (WT > 70) TVCL * 1.2 else TVCL",
-        ctx,
-        StatementMode::Plain,
-    )
-    .unwrap();
+    let stmts =
+        parse_block_statements("CL = if (WT > 70) TVCL * 1.2 else TVCL", ctx, StatementMode::Plain)
+            .unwrap();
     assert_eq!(stmts.len(), 1);
 
     let mut vars = HashMap::new();
@@ -11841,18 +10778,12 @@ fn test_inline_if_expression_parses_and_evaluates() {
     let mut covs = HashMap::new();
     covs.insert("WT".to_string(), 80.0);
     eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
-    assert!(
-        (vars["CL"] - 6.0).abs() < 1e-12,
-        "CL should pick the then-branch"
-    );
+    assert!((vars["CL"] - 6.0).abs() < 1e-12, "CL should pick the then-branch");
 
     covs.insert("WT".to_string(), 60.0);
     let mut vars2 = HashMap::new();
     eval_statements(&stmts, &theta, &[], &covs, &mut vars2, None, None, &[]);
-    assert!(
-        (vars2["CL"] - 5.0).abs() < 1e-12,
-        "CL should pick the else-branch"
-    );
+    assert!((vars2["CL"] - 5.0).abs() < 1e-12, "CL should pick the else-branch");
 }
 
 #[test]
@@ -11875,12 +10806,7 @@ if (WT > 70) {
         covs.insert("WT".to_string(), wt);
         let mut vars = HashMap::new();
         eval_statements(&stmts, &theta, &[], &covs, &mut vars, None, None, &[]);
-        assert!(
-            (vars["CL"] - expected).abs() < 1e-12,
-            "WT={} → expected CL={}",
-            wt,
-            expected
-        );
+        assert!((vars["CL"] - expected).abs() < 1e-12, "WT={} → expected CL={}", wt, expected);
     }
 }
 
@@ -12108,11 +11034,7 @@ fn test_ode_block_supports_if_statements() {
     let u_zero = vec![0.0, 0.0];
     let mut du_zero = vec![999.0, 999.0];
     (ode.rhs)(&u_zero, &params, 0.0, &mut du_zero);
-    assert!(
-        du_zero[1].abs() < 1e-12,
-        "else-branch should emit 0, got {}",
-        du_zero[1]
-    );
+    assert!(du_zero[1].abs() < 1e-12, "else-branch should emit 0, got {}", du_zero[1]);
 }
 
 #[test]
@@ -12298,11 +11220,7 @@ if (WT > 70) {
     let ctx = empty_ctx();
     let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
     let uncond = unconditionally_assigned_vars(&stmts);
-    assert_eq!(
-        uncond,
-        vec!["CL"],
-        "V lacks an else branch — not unconditional"
-    );
+    assert_eq!(uncond, vec!["CL"], "V lacks an else branch — not unconditional");
 }
 
 #[test]
@@ -12322,10 +11240,7 @@ fn test_duplicate_diffeq_in_same_scope_errors() {
                             return Err(format!("duplicate d/dt({})", name));
                         }
                     }
-                    Statement::If {
-                        branches,
-                        else_body,
-                    } => {
+                    Statement::If { branches, else_body } => {
                         for (_, b) in branches {
                             check(b)?;
                         }
@@ -12360,10 +11275,7 @@ fn test_duplicate_diffeq_in_different_branches_allowed() {
     ];
     let state_names = vec!["central".to_string()];
     let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[], &[]);
-    assert!(
-        result.is_ok(),
-        "same state in different branches must be allowed"
-    );
+    assert!(result.is_ok(), "same state in different branches must be allowed");
 }
 
 #[test]
@@ -12375,14 +11287,8 @@ fn test_ode_rhs_undefined_name_errors() {
     // individual parameter, but `V` is undeclared.
     let ode_lines: Vec<String> = vec!["d/dt(central) = -(CL/V) * central".into()];
     let state_names = vec!["central".to_string()];
-    let result = build_ode_spec(
-        &ode_lines,
-        &state_names,
-        Some("central"),
-        &["CL".to_string()],
-        &[0],
-        &[],
-    );
+    let result =
+        build_ode_spec(&ode_lines, &state_names, Some("central"), &["CL".to_string()], &[0], &[]);
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("undefined RHS name `V` must error"),
@@ -12414,21 +11320,15 @@ fn test_ode_rhs_undefined_name_walks_all_nodes() {
             "}".into(),
         ];
     let state_names = vec!["central".to_string()];
-    let result = build_ode_spec(
-        &ode_lines,
-        &state_names,
-        Some("central"),
-        &["CL".to_string()],
-        &[0],
-        &[],
-    );
+    let result =
+        build_ode_spec(&ode_lines, &state_names, Some("central"), &["CL".to_string()], &[0], &[]);
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("undefined names in nested expressions must error"),
     };
-    for bad in [
-        "V1", "BADIF", "BADEXP", "BADPOW", "BADAND1", "BADAND2", "BADOR1", "BADOR2", "BADNOT",
-    ] {
+    for bad in
+        ["V1", "BADIF", "BADEXP", "BADPOW", "BADAND1", "BADAND2", "BADOR1", "BADOR2", "BADNOT"]
+    {
         assert!(err.contains(bad), "error should name `{bad}`, got: {err}");
     }
 }
@@ -12438,10 +11338,8 @@ fn test_ode_rhs_defined_names_ok() {
     // Regression guard against false positives: an intermediate (`k`),
     // individual parameters (`CL`, `V`), a state (`central`), and the
     // reserved `TIME` variable must all resolve and parse cleanly.
-    let ode_lines: Vec<String> = vec![
-        "k = CL / V".into(),
-        "d/dt(central) = if (TIME < 24.0) -k * central else 0.0".into(),
-    ];
+    let ode_lines: Vec<String> =
+        vec!["k = CL / V".into(), "d/dt(central) = if (TIME < 24.0) -k * central else 0.0".into()];
     let state_names = vec!["central".to_string()];
     let result = build_ode_spec(
         &ode_lines,
@@ -12451,11 +11349,7 @@ fn test_ode_rhs_defined_names_ok() {
         &[0, 1],
         &[],
     );
-    assert!(
-        result.is_ok(),
-        "intermediate + params + TIME must parse, got: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "intermediate + params + TIME must parse, got: {:?}", result.err());
 }
 
 #[test]
@@ -12472,11 +11366,7 @@ fn test_ode_rhs_macheps_resolves_to_epsilon() {
     let params = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
     let mut du = vec![0.0_f64];
     (spec.rhs)(&[0.0], &params, 0.0, &mut du);
-    assert_eq!(
-        du[0],
-        f64::EPSILON,
-        "d/dt(central) = MACHEPS must evaluate to machine epsilon"
-    );
+    assert_eq!(du[0], f64::EPSILON, "d/dt(central) = MACHEPS must evaluate to machine epsilon");
 }
 
 #[test]
@@ -12527,10 +11417,7 @@ fn test_mu_ref_warning_for_conditional_param() {
     );
     let w = &parsed.model.parse_warnings[0];
     assert!(w.contains("CL"), "warning should mention CL");
-    assert!(
-        w.contains("Mu-referencing disabled"),
-        "warning should mention mu-referencing"
-    );
+    assert!(w.contains("Mu-referencing disabled"), "warning should mention mu-referencing");
 }
 
 #[test]
@@ -12604,10 +11491,7 @@ fn test_indiv_param_names_populated_in_declaration_order() {
     );
     // The list must be parallel to pk_indices so the FFI can route each
     // name to its PkParams slot for analytical models.
-    assert_eq!(
-        parsed.model.indiv_param_names.len(),
-        parsed.model.pk_indices.len()
-    );
+    assert_eq!(parsed.model.indiv_param_names.len(), parsed.model.pk_indices.len());
 }
 
 fn minimal_model_with_indiv(indiv_block: &str) -> crate::types::CompiledModel {
@@ -12658,11 +11542,7 @@ fn test_inv_logit_evaluates() {
     let model = minimal_logit_model();
     let tv = model.tv_fn.as_ref().unwrap()(&[0.0], &Default::default());
     let expected = 0.5_f64; // inv_logit(0) = 0.5
-    assert!(
-        (tv[0] - expected).abs() < 1e-10,
-        "inv_logit(0) should be 0.5, got {}",
-        tv[0]
-    );
+    assert!((tv[0] - expected).abs() < 1e-10, "inv_logit(0) should be 0.5, got {}", tv[0]);
 }
 
 #[test]
@@ -12671,11 +11551,7 @@ fn test_classify_lognormal_multiplicative() {
     // CL = TVCL * exp(ETA_CL)
     let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)");
     assert_eq!(model.eta_param_info.len(), 2);
-    let cl_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_CL")
-        .unwrap();
+    let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
     assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
     // Anchor is the theta TVCL — linked_theta is now populated.
     assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
@@ -12782,11 +11658,7 @@ fn test_classify_lognormal_log_scale() {
     use crate::types::{EtaParamType, ThetaTransform};
     // CL = exp(TVCL + ETA_CL)  — theta is on log scale
     let model = minimal_model_with_indiv("  CL = exp(TVCL + ETA_CL)\n  V = TVV * exp(ETA_V)");
-    let cl_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_CL")
-        .unwrap();
+    let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
     assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
     assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
     assert_eq!(model.theta_transform[0], ThetaTransform::Log);
@@ -12797,11 +11669,7 @@ fn test_classify_additive() {
     use crate::types::{EtaParamType, ThetaTransform};
     // CL = TVCL + ETA_CL  — additive
     let model = minimal_model_with_indiv("  CL = TVCL + ETA_CL\n  V = TVV * exp(ETA_V)");
-    let cl_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_CL")
-        .unwrap();
+    let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
     assert_eq!(cl_info.param_type, EtaParamType::Additive);
     assert_eq!(model.theta_transform[0], ThetaTransform::Identity);
 }
@@ -12811,11 +11679,7 @@ fn test_classify_logit_scale() {
     // inv_logit(THETA_F + ETA_F) — THETA_F on logit scale
     use crate::types::{EtaParamType, ThetaTransform};
     let model = minimal_logit_model();
-    let f_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_F")
-        .unwrap();
+    let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
     assert_eq!(f_info.param_type, EtaParamType::Logit);
     assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
     assert_eq!(model.theta_transform[0], ThetaTransform::Logit);
@@ -12825,27 +11689,9 @@ fn test_classify_logit_scale() {
 fn test_classify_logit_probability_scale() {
     // inv_logit(logit(THETA_F) + ETA_F) — THETA_F on probability scale (0,1)
     use crate::types::{EtaParamType, ThetaTransform};
-    let model_str = r"
-[parameters]
-  theta THETA_F(0.70, 0.001, 0.999)
-  sigma EPS ~ 0.01
-  omega ETA_F  ~ 0.1
-
-[individual_parameters]
-  F = inv_logit(logit(THETA_F) + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=1, v=1)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let model_str = crate::test_models::ONE_CPT_IV_20;
     let model = super::parse_full_model(model_str).unwrap().model;
-    let f_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_F")
-        .unwrap();
+    let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
     assert_eq!(f_info.param_type, EtaParamType::LogitProbability);
     assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
     assert_eq!(model.theta_transform[0], ThetaTransform::LogitProbability);
@@ -12854,28 +11700,10 @@ fn test_classify_logit_probability_scale() {
 #[test]
 fn test_inv_logit_logit_theta_evaluates() {
     // inv_logit(logit(0.70) + 0) should equal 0.70
-    let model_str = r"
-[parameters]
-  theta THETA_F(0.70, 0.001, 0.999)
-  sigma EPS ~ 0.01
-  omega ETA_F  ~ 0.1
-
-[individual_parameters]
-  F = inv_logit(logit(THETA_F) + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=1, v=1)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let model_str = crate::test_models::ONE_CPT_IV_20;
     let model = super::parse_full_model(model_str).unwrap().model;
     let tv = model.tv_fn.as_ref().unwrap()(&[0.70], &Default::default());
-    assert!(
-        (tv[0] - 0.70).abs() < 1e-10,
-        "inv_logit(logit(0.70)) should be 0.70, got {}",
-        tv[0]
-    );
+    assert!((tv[0] - 0.70).abs() < 1e-10, "inv_logit(logit(0.70)) should be 0.70, got {}", tv[0]);
 }
 
 #[test]
@@ -12883,10 +11711,7 @@ fn test_sigma_types_proportional() {
     use crate::types::SigmaType;
     let model = minimal_logit_model();
     // sigma_types is on FitResult, not CompiledModel — verify via ErrorModel::sigma_types().
-    assert_eq!(
-        model.error_model.sigma_types(),
-        vec![SigmaType::Proportional]
-    );
+    assert_eq!(model.error_model.sigma_types(), vec![SigmaType::Proportional]);
 }
 
 // ── Per-CMT (multi-endpoint) error models (issue #14) ───────────────────
@@ -12956,10 +11781,7 @@ fn magnitude_rows_subject(rows: &[(usize, f64)], cov: &str) -> Subject {
         obs_cmts: rows.iter().map(|r| r.0).collect(),
         obs_times: (0..rows.len()).map(|j| 1.0 + j as f64).collect(),
         observations: vec![1.0; rows.len()],
-        obs_covariates: rows
-            .iter()
-            .map(|r| HashMap::from([(cov.to_string(), r.1)]))
-            .collect(),
+        obs_covariates: rows.iter().map(|r| HashMap::from([(cov.to_string(), r.1)])).collect(),
         ..Subject::default()
     };
     s.cens = vec![0; rows.len()];
@@ -13058,10 +11880,7 @@ fn endpoint_magnitude_keeps_the_plain_line_rules() {
         ("PROP_ERR_PK * ADD_ERR_PD", "references multiple sigmas"),
         ("ADD_ERR_PD * ETA_CL", "random effect"),
         // `CL` is η-bearing in [individual_parameters] (#2915), not undeclared.
-        (
-            "ADD_ERR_PD * CL",
-            "`CL`, which [individual_parameters] assigns",
-        ),
+        ("ADD_ERR_PD * CL", "`CL`, which [individual_parameters] assigns"),
         ("ADD_ERR_PD * IPRED", "may not reference `IPRED`"),
         ("ADD_ERR_PD * NOPE", "undeclared covariate `NOPE`"),
     ] {
@@ -13112,10 +11931,7 @@ fn bare_typo_on_a_cmt_line_is_still_an_unknown_sigma() {
     let err = expect_parse_err(&pkpd_magnitude_str(
         "  CMT=1: DV ~ additive(ADD_ERR_PD)\n  CMT=2: DV ~ additive(NOPE)\n",
     ));
-    assert!(
-        err.contains("[error_model] CMT=2: references unknown sigma 'NOPE'"),
-        "{err}"
-    );
+    assert!(err.contains("[error_model] CMT=2: references unknown sigma 'NOPE'"), "{err}");
 }
 
 /// A row holds one multiplier per sigma slot, so a statement whose two arguments share a
@@ -13123,10 +11939,7 @@ fn bare_typo_on_a_cmt_line_is_still_an_unknown_sigma() {
 /// arguments have no factor to misplace and parse as they always did.
 #[test]
 fn one_statement_cannot_share_a_sigma_with_a_magnitude() {
-    for args in [
-        "ADD_ERR_PD * TPF, ADD_ERR_PD",
-        "ADD_ERR_PD, ADD_ERR_PD * TPF",
-    ] {
+    for args in ["ADD_ERR_PD * TPF, ADD_ERR_PD", "ADD_ERR_PD, ADD_ERR_PD * TPF"] {
         let err = expect_parse_err(&pkpd_magnitude_str(&format!(
             "  CMT=1: DV ~ combined({args})\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n"
         )));
@@ -13146,25 +11959,16 @@ fn weight_and_power_stay_refused_on_endpoint_forms() {
     let err = expect_parse_err(&pkpd_magnitude_str(
         "  CMT=1: DV ~ additive(ADD_ERR_PD * TPF) weight = EARLY\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
     ));
-    assert!(
-        err.contains("`weight = …` is not supported with per-CMT"),
-        "{err}"
-    );
+    assert!(err.contains("`weight = …` is not supported with per-CMT"), "{err}");
     let err = expect_parse_err(&pkpd_magnitude_str(
         "  CMT=1: DV ~ power(ADD_ERR_PD * TPF, TPF)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n",
     ));
-    assert!(
-        err.contains("`power(...)` is not supported with per-CMT"),
-        "{err}"
-    );
+    assert!(err.contains("`power(...)` is not supported with per-CMT"), "{err}");
     let err = expect_parse_err(&selected_magnitude_str(
         "  if (FREE == 0) {\n    DV ~ power(PROP_TOTAL * TPF, TPF)\n  } else {\n    \
          DV ~ proportional(PROP_UNBOUND)\n  }",
     ));
-    assert!(
-        err.contains("`power(...)` is not supported inside"),
-        "{err}"
-    );
+    assert!(err.contains("`power(...)` is not supported inside"), "{err}");
 }
 
 #[test]
@@ -13194,13 +11998,9 @@ fn test_per_cmt_error_model_parses() {
 #[test]
 fn test_single_error_model_stays_single() {
     // A plain (unprefixed) line must still yield ErrorSpec::Single.
-    let model = parse_full_model(&pkpd_model_str("  DV ~ proportional(PROP_ERR_PK)"))
-        .unwrap()
-        .model;
-    assert!(matches!(
-        model.error_spec,
-        ErrorSpec::Single(ErrorModel::Proportional)
-    ));
+    let model =
+        parse_full_model(&pkpd_model_str("  DV ~ proportional(PROP_ERR_PK)")).unwrap().model;
+    assert!(matches!(model.error_spec, ErrorSpec::Single(ErrorModel::Proportional)));
 }
 
 // ── Covariate-selected error models (`if/else`, issue #658) ─────────────
@@ -13244,10 +12044,7 @@ fn test_selected_error_model_parses() {
         .model;
 
     match &model.error_spec {
-        ErrorSpec::Selected {
-            selector,
-            endpoints,
-        } => {
+        ErrorSpec::Selected { selector, endpoints } => {
             assert_eq!(endpoints.len(), 2);
             // Branch 0 (FREE == 0) → PROP_TOTAL (sigma idx 0).
             let total = endpoints.get(&0).expect("branch 0 endpoint");
@@ -13281,10 +12078,7 @@ fn test_selected_error_model_else_if_chain() {
         .unwrap()
         .model;
     match &model.error_spec {
-        ErrorSpec::Selected {
-            selector,
-            endpoints,
-        } => {
+        ErrorSpec::Selected { selector, endpoints } => {
             assert_eq!(endpoints.len(), 3);
             let m = |v: f64| -> usize {
                 let cov: std::collections::HashMap<String, f64> =
@@ -13304,10 +12098,7 @@ fn test_selected_error_model_requires_else() {
     let err = expect_parse_err(&selected_err_model_str(
         "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  }",
     ));
-    assert!(
-        err.contains("must end with a final"),
-        "expected a missing-else error, got: {err}"
-    );
+    assert!(err.contains("must end with a final"), "expected a missing-else error, got: {err}");
 }
 
 #[test]
@@ -13326,10 +12117,7 @@ fn test_selected_error_unknown_sigma_rejected() {
     let err = expect_parse_err(&selected_err_model_str(
             "  if (FREE == 0) {\n    DV ~ proportional(NOPE)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
         ));
-    assert!(
-        err.contains("unknown sigma"),
-        "expected an unknown-sigma error, got: {err}"
-    );
+    assert!(err.contains("unknown sigma"), "expected an unknown-sigma error, got: {err}");
 }
 
 /// Shared free/total covariate-selected model with the two branch sigmas in
@@ -13370,10 +12158,7 @@ fn test_selected_error_model_accepts_block_sigma() {
     // One off-diagonal correlation between the two branch sigmas (idx 0,1).
     assert_eq!(model.residual_correlations.len(), 1);
     let corr = model.residual_correlations[0];
-    let pair = (
-        corr.sigma_i.min(corr.sigma_j),
-        corr.sigma_i.max(corr.sigma_j),
-    );
+    let pair = (corr.sigma_i.min(corr.sigma_j), corr.sigma_i.max(corr.sigma_j));
     assert_eq!(pair, (0, 1));
     // rho = cov / (sd_i · sd_j) = 0.005 / sqrt(0.01·0.09).
     let expected_rho = 0.005 / (0.01f64 * 0.09).sqrt();
@@ -13426,37 +12211,19 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
     let model = parse_full_model(SELECTED_BLOCK_SIGMA_MODEL).unwrap().model;
 
     let subject = crate::types::Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
-        obs_raw_times: Vec::new(),
         observations: vec![10.0, 10.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     // sigma = [SD_total, SD_unbound] from the block diagonal.
@@ -13505,37 +12272,19 @@ fn test_selected_error_obs_keys_dispatch() {
 
     // Two rows in the *same* CMT (=1) but different `FREE` flags.
     let subject = crate::types::Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
-        obs_raw_times: Vec::new(),
         observations: vec![10.0, 10.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let keys = model.error_spec.obs_keys(&subject);
@@ -13657,10 +12406,8 @@ fn statement_prefilters_accept_every_line_their_regex_matches() {
         (r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$", "iiv_on_ruv"),
         (r"(?i)^\s*correlation\b", "correlation"),
     ];
-    let cs = [
-        (r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$", "CMT"),
-        (r"^\s*log\s*\(\s*(\w+)\s*\)\s*~", "log"),
-    ];
+    let cs =
+        [(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$", "CMT"), (r"^\s*log\s*\(\s*(\w+)\s*\)\s*~", "log")];
     let lines = [
         "iiv_on_ruv = ETA_RUV",
         "   IIV_On_Ruv=ETA",
@@ -13722,10 +12469,7 @@ fn test_iiv_on_ruv_eta_not_flagged_unused() {
     .unwrap()
     .model;
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("ETA_RUV") && w.contains("not referenced")),
+        !model.parse_warnings.iter().any(|w| w.contains("ETA_RUV") && w.contains("not referenced")),
         "iiv_on_ruv eta must not be flagged unused; got: {:?}",
         model.parse_warnings
     );
@@ -13733,22 +12477,17 @@ fn test_iiv_on_ruv_eta_not_flagged_unused() {
 
 #[test]
 fn test_iiv_on_ruv_absent_is_none() {
-    let model = parse_full_model(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)"))
-        .unwrap()
-        .model;
+    let model =
+        parse_full_model(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)")).unwrap().model;
     assert_eq!(model.residual_error_eta, None);
     assert!((model.residual_var_scale(&[0.7, 0.9]) - 1.0).abs() < 1e-12);
 }
 
 #[test]
 fn test_iiv_on_ruv_unknown_eta_rejected() {
-    let err = expect_parse_err(&iiv_ruv_model_str(
-        "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = NOPE",
-    ));
-    assert!(
-        err.contains("iiv_on_ruv") && err.contains("NOPE"),
-        "got: {err}"
-    );
+    let err =
+        expect_parse_err(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = NOPE"));
+    assert!(err.contains("iiv_on_ruv") && err.contains("NOPE"), "got: {err}");
 }
 
 #[test]
@@ -13854,10 +12593,7 @@ fn test_per_cmt_endpoint_sigma_count_mismatch_rejected() {
     let err = expect_parse_err(&pkpd_3sigma_model_str(
         "  CMT=1: DV ~ combined(S_PROP)\n  CMT=2: DV ~ additive(S_PD)",
     ));
-    assert!(
-        err.contains("expects 2 sigma") || err.contains("2 sigma(s)"),
-        "got: {err}"
-    );
+    assert!(err.contains("expects 2 sigma") || err.contains("2 sigma(s)"), "got: {err}");
 }
 
 #[test]
@@ -13919,11 +12655,7 @@ fn test_classify_if_else_unanimous_lognormal() {
     let model = minimal_model_with_indiv(
             "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }\n  V = TVV * exp(ETA_V)",
         );
-    let cl_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_CL")
-        .unwrap();
+    let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
     assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
     assert_eq!(cl_info.individual_param_name, "CL");
     // The unanimous pattern still names its θ (#1669 review finding 4).
@@ -13944,11 +12676,7 @@ fn test_classify_if_else_disagreement_custom() {
     let model = minimal_model_with_indiv(
             "  if (TVCL > 1) {\n    CL = TVCL * exp(ETA_CL)\n  } else {\n    CL = TVCL + ETA_CL\n  }\n  V = TVV * exp(ETA_V)",
         );
-    let cl_info = model
-        .eta_param_info
-        .iter()
-        .find(|i| i.eta_name == "ETA_CL")
-        .unwrap();
+    let cl_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
     assert_eq!(cl_info.param_type, EtaParamType::Custom);
 }
 
@@ -13971,16 +12699,9 @@ fn test_classify_multi_eta_additive() {
     // matching no whole-expression pattern made both `Custom`).
     use crate::types::EtaParamType;
     let model = minimal_model_with_indiv("  CL = TVCL + ETA_CL + ETA_V\n  V = 10.0");
-    let additive: Vec<_> = model
-        .eta_param_info
-        .iter()
-        .filter(|i| i.param_type == EtaParamType::Additive)
-        .collect();
-    assert_eq!(
-        additive.len(),
-        2,
-        "both ETAs in the expression should be Additive"
-    );
+    let additive: Vec<_> =
+        model.eta_param_info.iter().filter(|i| i.param_type == EtaParamType::Additive).collect();
+    assert_eq!(additive.len(), 2, "both ETAs in the expression should be Additive");
 }
 
 #[test]
@@ -14054,10 +12775,7 @@ fn test_alag_alias_in_structural_model_block() {
   DV ~ proportional(EPS)
 ";
     let parsed = super::parse_full_model(model_str).unwrap();
-    assert!(parsed
-        .model
-        .pk_indices
-        .contains(&crate::types::PK_IDX_LAGTIME));
+    assert!(parsed.model.pk_indices.contains(&crate::types::PK_IDX_LAGTIME));
 
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
@@ -14166,17 +12884,13 @@ fn pk_alias_spellings_binding_one_parameter_are_accepted() {
     // redundant rather than wrong. Keeping it legal is what leaves
     // `analytical_role_binding` a tie to break (`lagtime=X, alag=X`), and the
     // de-duplication that skips the second write must not drop the slot entirely.
-    let pk = alias_model_pk(&alias_model_src(
-        "  VA = 2.0 * TVV",
-        "pk one_cpt_iv(cl=CL, v=VA, v1=VA)",
-    ));
+    let pk =
+        alias_model_pk(&alias_model_src("  VA = 2.0 * TVV", "pk one_cpt_iv(cl=CL, v=VA, v1=VA)"));
     assert_eq!(pk.v(), 100.0, "both spellings must still write the slot");
     // Non-degenerate: the assertion above would also pass on a slot left at some
     // default that happens to match, so pin that the value tracks the parameter.
-    let moved = alias_model_pk(&alias_model_src(
-        "  VA = 3.0 * TVV",
-        "pk one_cpt_iv(cl=CL, v=VA, v1=VA)",
-    ));
+    let moved =
+        alias_model_pk(&alias_model_src("  VA = 3.0 * TVV", "pk one_cpt_iv(cl=CL, v=VA, v1=VA)"));
     assert_eq!(moved.v(), 150.0, "the slot must follow the bound parameter");
     // And `lagtime=X, alag=X` — the pair `analytical_role_binding` tie-breaks —
     // still parses, on the slot whose two spellings sort in the other order.
@@ -14193,10 +12907,8 @@ fn pk_alias_spellings_with_literal_values_follow_the_same_rule() {
     // every constant AFTER every variable — so when the two spellings disagree it
     // is the constant that reaches the engine whatever the role keys sort to, and
     // the message must name that one rather than the later key.
-    let err = expect_parse_err(&alias_model_src(
-        "  VA = TVV",
-        "pk one_cpt_iv(cl=CL, v1=VA, v=100.0)",
-    ));
+    let err =
+        expect_parse_err(&alias_model_src("  VA = TVV", "pk one_cpt_iv(cl=CL, v1=VA, v=100.0)"));
     assert!(
         err.contains("only `v=100.0` would be applied") && err.contains("`VA` silently discarded"),
         "a constant beats a variable on the same slot regardless of key order, got: {err}"
@@ -14213,17 +12925,12 @@ fn pk_alias_spellings_bound_to_time_are_not_a_conflict() {
     // named after the ROLE KEY (#486), so `v=TIME, v1=TIME` arrives at the slot
     // check as two different variable names carrying one value. Compared as plain
     // variables that reads as a conflict the model file does not contain.
-    let pk = alias_model_pk(&alias_model_src(
-        "",
-        "pk one_cpt_iv(cl=CL, v=TIME, v1=TIME)",
-    ));
+    let pk = alias_model_pk(&alias_model_src("", "pk one_cpt_iv(cl=CL, v=TIME, v1=TIME)"));
     assert_eq!(pk.v(), 0.0, "evaluated at t = 0");
     // A genuine conflict against a TIME binding is still rejected — and must quote
     // the `TIME` the user wrote, never the internal `__ferx_pktime_*` name.
-    let err = expect_parse_err(&alias_model_src(
-        "  VB = TVV",
-        "pk one_cpt_iv(cl=CL, v=TIME, v1=VB)",
-    ));
+    let err =
+        expect_parse_err(&alias_model_src("  VB = TVV", "pk one_cpt_iv(cl=CL, v=TIME, v1=VB)"));
     assert!(
         err.contains("`v=TIME`") && !err.contains("__ferx_pktime"),
         "the diagnostic must quote `TIME`, not the synthetic parameter, got: {err}"
@@ -14261,10 +12968,7 @@ fn test_undefined_structural_param_errors() {
         "expected an undefined-variable error naming CL, got: {err}"
     );
     // The message should list the defined parameters to make the fix obvious.
-    assert!(
-        err.contains("KE"),
-        "error should list defined params: {err}"
-    );
+    assert!(err.contains("KE"), "error should list defined params: {err}");
 }
 
 #[test]
@@ -14324,11 +13028,7 @@ fn test_literal_pk_param_binds_constant() {
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
     assert_eq!(pk.ka(), 2.5, "literal ka should bind as the constant 2.5");
-    assert!(
-        pk.cl() > 0.0,
-        "cl should still bind to the defined variable, got {}",
-        pk.cl()
-    );
+    assert!(pk.cl() > 0.0, "cl should still bind to the defined variable, got {}", pk.cl());
 }
 
 #[test]
@@ -14498,10 +13198,7 @@ fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
     // A bare LAGTIME is a canonical name, so `ode_param_slots` routes it to
     // PK_IDX_LAGTIME and `pk_indices` carries the slot on the ODE layout too.
     assert!(
-        parsed
-            .model
-            .pk_indices
-            .contains(&crate::types::PK_IDX_LAGTIME),
+        parsed.model.pk_indices.contains(&crate::types::PK_IDX_LAGTIME),
         "pk_indices must carry PK_IDX_LAGTIME on the ODE layout: {:?}",
         parsed.model.pk_indices
     );
@@ -14513,11 +13210,7 @@ fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
-    assert_eq!(
-        pk.lagtime(),
-        0.5,
-        "LAGTIME must be routed to PK_IDX_LAGTIME for ODE models"
-    );
+    assert_eq!(pk.lagtime(), 0.5, "LAGTIME must be routed to PK_IDX_LAGTIME for ODE models");
 }
 
 #[test]
@@ -14555,11 +13248,7 @@ fn test_bioavailability_in_ode_model_routes_to_canonical_slot() {
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
-    assert_eq!(
-        pk.f_bio(),
-        0.7,
-        "F must be routed to PK_IDX_F for ODE models"
-    );
+    assert_eq!(pk.f_bio(), 0.7, "F must be routed to PK_IDX_F for ODE models");
 }
 
 #[test]
@@ -14615,27 +13304,12 @@ fn test_ode_structural_param_does_not_alias_bioavailability_slot() {
     // assigns it a free, non-reserved slot, pk_param_fn writes its value
     // there, and the RHS reads it back from the same slot. Assert it lands
     // off the engine-reserved F/lagtime slots and carries its value (7.0).
-    let ke0_pos = parsed
-        .model
-        .indiv_param_names
-        .iter()
-        .position(|n| n == "KE0")
-        .expect("KE0 declared");
+    let ke0_pos =
+        parsed.model.indiv_param_names.iter().position(|n| n == "KE0").expect("KE0 declared");
     let ke0_slot = parsed.model.pk_indices[ke0_pos];
-    assert_ne!(
-        ke0_slot,
-        crate::types::PK_IDX_F,
-        "KE0 must not alias F slot"
-    );
-    assert_ne!(
-        ke0_slot,
-        crate::types::PK_IDX_LAGTIME,
-        "KE0 must not alias lagtime slot"
-    );
-    assert_eq!(
-        pk.values[ke0_slot], 7.0,
-        "KE0 value must round-trip to its assigned slot"
-    );
+    assert_ne!(ke0_slot, crate::types::PK_IDX_F, "KE0 must not alias F slot");
+    assert_ne!(ke0_slot, crate::types::PK_IDX_LAGTIME, "KE0 must not alias lagtime slot");
+    assert_eq!(pk.values[ke0_slot], 7.0, "KE0 value must round-trip to its assigned slot");
 }
 
 // ── [diffusion] block parsing ─────────────────────────────────────────
@@ -14744,32 +13418,16 @@ fn test_ode_pk_indices_are_name_slotted_not_positional() {
     assert_eq!(m.indiv_param_names, vec!["V", "KA", "KE", "LAGTIME"]);
     assert_eq!(
         m.pk_indices,
-        vec![
-            crate::types::PK_IDX_V,
-            crate::types::PK_IDX_KA,
-            0,
-            crate::types::PK_IDX_LAGTIME
-        ],
+        vec![crate::types::PK_IDX_V, crate::types::PK_IDX_KA, 0, crate::types::PK_IDX_LAGTIME],
         "V/KA/LAGTIME take their canonical slots; KE takes the lowest free slot"
     );
     let eta = vec![0.0; m.n_eta];
-    let pk = (m.pk_param_fn)(
-        &m.default_params.theta,
-        &eta,
-        &std::collections::HashMap::new(),
-        0.0,
-    );
+    let pk = (m.pk_param_fn)(&m.default_params.theta, &eta, &std::collections::HashMap::new(), 0.0);
     let expected = [20.0, 1.5, 0.2, 0.7];
     for (i, &want) in expected.iter().enumerate() {
         let name = &m.indiv_param_names[i];
-        assert_eq!(
-            pk.values[m.pk_indices[i]], want,
-            "{name} read through pk_indices"
-        );
-        assert_ne!(
-            pk.values[i], want,
-            "{name} must not be readable at its positional slot {i}"
-        );
+        assert_eq!(pk.values[m.pk_indices[i]], want, "{name} read through pk_indices");
+        assert_ne!(pk.values[i], want, "{name} must not be readable at its positional slot {i}");
     }
 }
 
@@ -14788,11 +13446,7 @@ fn test_init_directive_builds_init_fn() {
     params[1] = 2.0;
     let u0 = ode.initial_state(&params);
     assert_eq!(u0.len(), 1);
-    assert!(
-        (u0[0] - 5.0).abs() < 1e-9,
-        "init(response) = KIN/KOUT = 5, got {}",
-        u0[0]
-    );
+    assert!((u0[0] - 5.0).abs() < 1e-9, "init(response) = KIN/KOUT = 5, got {}", u0[0]);
 }
 
 // ── [initial_conditions] on analytical models (issue #521) ──
@@ -15011,10 +13665,7 @@ fn test_init_undefined_name_errors() {
         Err(e) => e,
         Ok(_) => panic!("expected undefined-name error for init(response)"),
     };
-    assert!(
-        err.contains("init(response)"),
-        "error should reference init(response), got: {err}"
-    );
+    assert!(err.contains("init(response)"), "error should reference init(response), got: {err}");
     // Only BASE is flagged — KIN resolves to the declared parameter.
     assert!(
         err.contains("undefined name(s): BASE."),
@@ -15061,10 +13712,7 @@ fn test_init_time_builtin_rejected() {
                 && err.contains("evaluated at the time origin"),
             "error should name init(response) and the TIME built-in, got: {err}"
         );
-        assert!(
-            err.contains("#994"),
-            "error should cite the issue, got: {err}"
-        );
+        assert!(err.contains("#994"), "error should cite the issue, got: {err}");
     }
 }
 
@@ -15108,13 +13756,9 @@ fn test_init_reports_clock_and_undefined_name_together() {
     // an undefined name at once, and reporting them one per parse costs the user
     // two round-trips for a single line.
     let src = turnover_ode_model("  init(response) = TIME + BASE");
-    let err = parse_full_model(&src)
-        .err()
-        .expect("`init(response) = TIME + BASE` must be rejected");
-    assert!(
-        err.contains("time built-in(s): TIME"),
-        "error should name the clock, got: {err}"
-    );
+    let err =
+        parse_full_model(&src).err().expect("`init(response) = TIME + BASE` must be rejected");
+    assert!(err.contains("time built-in(s): TIME"), "error should name the clock, got: {err}");
     assert!(
         err.contains("undefined name(s): BASE"),
         "error should name the undefined BASE in the same message, got: {err}"
@@ -15128,9 +13772,7 @@ fn test_init_undefined_name_message_lists_the_real_scope() {
     // which is in scope and was absent from the message — and say that the time
     // built-ins are not.
     let src = turnover_ode_model("  init(response) = BASE");
-    let err = parse_full_model(&src)
-        .err()
-        .expect("undefined name must be rejected");
+    let err = parse_full_model(&src).err().expect("undefined name must be rejected");
     for builtin in ODE_INIT_SCOPE_BUILTINS {
         assert!(
             err.contains(builtin),
@@ -15202,10 +13844,7 @@ fn test_analytical_init_time_builtin_rejected() {
             err.contains("[initial_conditions] init") && err.contains("`TIME` built-in"),
             "error should name the block and the TIME built-in, got: {err}"
         );
-        assert!(
-            err.contains("#994"),
-            "error should cite the issue, got: {err}"
-        );
+        assert!(err.contains("#994"), "error should cite the issue, got: {err}");
     }
 }
 
@@ -15248,11 +13887,7 @@ fn test_diffusion_block_parsed_into_theta() {
         "expected DIFF_CENTRAL in theta_names, got {:?}",
         m.theta_names
     );
-    let idx = m
-        .theta_names
-        .iter()
-        .position(|n| n == "DIFF_CENTRAL")
-        .unwrap();
+    let idx = m.theta_names.iter().position(|n| n == "DIFF_CENTRAL").unwrap();
     assert!(
         (m.default_params.theta[idx] - 0.05).abs() < 1e-9,
         "initial diffusion variance should be 0.05"
@@ -15264,10 +13899,7 @@ fn test_diffusion_block_sets_diffusion_theta_start() {
     let src = minimal_ode_model_with_diffusion("  central ~ 0.01");
     let parsed = parse_full_model(&src).unwrap();
     let m = &parsed.model;
-    assert!(
-        m.diffusion_theta_start.is_some(),
-        "diffusion_theta_start must be set"
-    );
+    assert!(m.diffusion_theta_start.is_some(), "diffusion_theta_start must be set");
     assert_eq!(m.diffusion_state_indices.len(), 1);
     assert!(m.is_sde());
 }
@@ -15277,24 +13909,14 @@ fn test_diffusion_block_fix_flag() {
     let src = minimal_ode_model_with_diffusion("  central ~ 0.02 FIX");
     let parsed = parse_full_model(&src).unwrap();
     let m = &parsed.model;
-    let idx = m
-        .theta_names
-        .iter()
-        .position(|n| n == "DIFF_CENTRAL")
-        .unwrap();
-    assert!(
-        m.default_params.theta_fixed[idx],
-        "DIFF_CENTRAL should be FIX"
-    );
+    let idx = m.theta_names.iter().position(|n| n == "DIFF_CENTRAL").unwrap();
+    assert!(m.default_params.theta_fixed[idx], "DIFF_CENTRAL should be FIX");
 }
 
 #[test]
 fn test_diffusion_block_unknown_state_error() {
     let src = minimal_ode_model_with_diffusion("  depot ~ 0.01");
-    assert!(
-        parse_full_model(&src).is_err(),
-        "unknown state in [diffusion] must be an error"
-    );
+    assert!(parse_full_model(&src).is_err(), "unknown state in [diffusion] must be an error");
 }
 
 #[test]
@@ -15315,10 +13937,7 @@ fn test_diffusion_on_analytical_model_is_error() {
 [error_model]
   DV ~ additive(ADD)
 "#;
-    assert!(
-        parse_full_model(src).is_err(),
-        "[diffusion] on an analytical model must be an error"
-    );
+    assert!(parse_full_model(src).is_err(), "[diffusion] on an analytical model must be an error");
 }
 
 // ─── [covariate_nn NAME] block parsing ──────────────────────────────
@@ -15390,10 +14009,7 @@ fn test_covariate_nn_block_rejects_unknown_pk_output() {
             "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [NOT_A_PK_PARAM]\n  layers = [3]\n  activation = relu\n",
         );
     let err = parse_model_string(&src).expect_err("unknown PK output must error");
-    assert!(
-        err.contains("NOT_A_PK_PARAM"),
-        "error should name the bad output, got: {err}"
-    );
+    assert!(err.contains("NOT_A_PK_PARAM"), "error should name the bad output, got: {err}");
 }
 
 #[cfg(feature = "nn")]
@@ -15403,10 +14019,7 @@ fn test_covariate_nn_block_rejects_unknown_activation() {
             "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [3]\n  activation = quack\n",
         );
     let err = parse_model_string(&src).expect_err("bad activation must error");
-    assert!(
-        err.contains("quack"),
-        "error should name the bad activation, got: {err}"
-    );
+    assert!(err.contains("quack"), "error should name the bad activation, got: {err}");
 }
 
 #[cfg(feature = "nn")]
@@ -15416,10 +14029,7 @@ fn test_covariate_nn_block_rejects_unknown_key() {
             "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [3]\n  activation = relu\n  not_a_real_key = 42\n",
         );
     let err = parse_model_string(&src).expect_err("unknown key must error");
-    assert!(
-        err.contains("not_a_real_key"),
-        "error should name the bad key, got: {err}"
-    );
+    assert!(err.contains("not_a_real_key"), "error should name the bad key, got: {err}");
 }
 
 #[cfg(feature = "nn")]
@@ -15430,10 +14040,7 @@ fn test_covariate_nn_block_missing_required_field() {
         "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  activation = relu\n",
     );
     let err = parse_model_string(&src).expect_err("missing layers must error");
-    assert!(
-        err.contains("layers"),
-        "error should mention `layers`, got: {err}"
-    );
+    assert!(err.contains("layers"), "error should mention `layers`, got: {err}");
 }
 
 #[cfg(feature = "nn")]
@@ -15465,10 +14072,7 @@ fn test_covariate_nn_block_without_nn_feature_errors() {
             "[covariate_nn FOO]\n  inputs = [WT]\n  outputs = [CL]\n  layers = [2]\n  activation = tanh\n",
         );
     let err = parse_model_string(&src).expect_err("must error without --features nn");
-    assert!(
-        err.contains("nn"),
-        "error should mention the nn feature, got: {err}"
-    );
+    assert!(err.contains("nn"), "error should mention the nn feature, got: {err}");
 }
 
 /// Sanity for the named-block parser extension itself (independent of the
@@ -15488,10 +14092,7 @@ fn test_extract_blocks_recognizes_named_block_form() {
     // Unnamed block intact.
     assert!(extracted.unnamed.contains_key("parameters"));
     // Named block captured by type + instance.
-    let by_inst = extracted
-        .named
-        .get("covariate_nn")
-        .expect("named block extracted");
+    let by_inst = extracted.named.get("covariate_nn").expect("named block extracted");
     let lines = by_inst.get("FOO").expect("instance FOO present");
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0], "key = value");
@@ -15590,10 +14191,7 @@ fn test_uppercase_block_name_is_not_unknown() {
 fn test_instance_name_on_unnamed_only_block_is_rejected() {
     let src = model_with_extra_block("[fit_options DOSE]\n  maxiter = 5\n");
     let err = parse_model_string(&src).expect_err("instance name must be an error");
-    assert!(
-        err.contains("`[fit_options DOSE]` (line 16) does not take an instance name"),
-        "{err}"
-    );
+    assert!(err.contains("`[fit_options DOSE]` (line 16) does not take an instance name"), "{err}");
     assert!(err.contains("write `[fit_options]`"), "{err}");
 }
 
@@ -15603,10 +14201,7 @@ fn test_instance_name_on_unnamed_only_block_is_rejected() {
 fn test_named_only_block_without_instance_name_is_rejected() {
     let src = model_with_extra_block("[covariate_nn]\n  inputs = [WT]\n");
     let err = parse_model_string(&src).expect_err("missing instance name must be an error");
-    assert!(
-        err.contains("`[covariate_nn]` (line 16) requires an instance name"),
-        "{err}"
-    );
+    assert!(err.contains("`[covariate_nn]` (line 16) requires an instance name"), "{err}");
     assert!(err.contains("write `[covariate_nn NAME]`"), "{err}");
 }
 
@@ -15700,17 +14295,11 @@ fn test_deprecated_block_is_a_warning_with_its_remediation() {
     assert_eq!(nearest_block_name("initial_values"), None);
     let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
     let model = parse_model_string(&src).expect("a deprecated block must not fail the parse");
-    let hits: Vec<&String> = model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("W_DEPRECATED_BLOCK"))
-        .collect();
+    let hits: Vec<&String> =
+        model.parse_warnings.iter().filter(|w| w.contains("W_DEPRECATED_BLOCK")).collect();
     assert_eq!(hits.len(), 1, "{:?}", model.parse_warnings);
     let w = hits[0];
-    assert!(
-        w.starts_with("Deprecated block `[initial_values]` (line 16) is ignored:"),
-        "{w}"
-    );
+    assert!(w.starts_with("Deprecated block `[initial_values]` (line 16) is ignored:"), "{w}");
     assert!(w.contains("declared inline in `[parameters]`"), "{w}");
     assert!(w.contains("delete it"), "{w}");
     assert!(w.contains("never affected the fit"), "{w}");
@@ -15892,10 +14481,7 @@ fn test_dot_access_rejects_unknown_output() {
   DV ~ additive(ADD)
 "#;
     let err = parse_model_string(src).expect_err("unknown output must error");
-    assert!(
-        err.contains("GARBAGE"),
-        "error should name the bad output, got: {err}"
-    );
+    assert!(err.contains("GARBAGE"), "error should name the bad output, got: {err}");
 }
 
 #[cfg(feature = "nn")]
@@ -15935,15 +14521,9 @@ fn test_dot_access_on_unknown_nn_name_falls_back_to_parse_error() {
 fn test_detect_mu_refs_recognises_nn_anchored_lognormal() {
     let src = covariate_nn_dotted_model_src();
     let model = parse_model_string(&src).expect("model parses");
-    let cl_ref = model
-        .mu_refs
-        .get("ETA_CL")
-        .expect("ETA_CL must be detected as mu-referenced");
+    let cl_ref = model.mu_refs.get("ETA_CL").expect("ETA_CL must be detected as mu-referenced");
     assert_eq!(cl_ref.theta_name, "TYPICAL_PK.CL");
-    assert!(
-        cl_ref.log_transformed(),
-        "TYPICAL_PK.CL * exp(ETA_CL) is lognormal"
-    );
+    assert!(cl_ref.log_transformed(), "TYPICAL_PK.CL * exp(ETA_CL) is lognormal");
     let v_ref = model.mu_refs.get("ETA_V").expect("ETA_V mu-referenced");
     assert_eq!(v_ref.theta_name, "TYPICAL_PK.V");
     assert!(v_ref.log_transformed());
@@ -15988,10 +14568,7 @@ fn test_tv_fn_dispatches_through_nn() {
     cov.insert("WT".to_string(), 70.0);
     cov.insert("CRCL".to_string(), 95.0);
 
-    let tv_fn = model
-        .tv_fn
-        .as_ref()
-        .expect("analytical model -> Some(tv_fn)");
+    let tv_fn = model.tv_fn.as_ref().expect("analytical model -> Some(tv_fn)");
     let tvs = tv_fn(&theta, &cov);
 
     // tv_fn returns values in `indiv_param_names` declaration order:
@@ -16187,11 +14764,7 @@ fn test_parse_scaling_expression_uses_indiv_param() {
             // with the subject's theta/eta/covariates to materialize V.
             let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
             let s = scale_fn(&theta, &eta, &cov, &pk);
-            assert!(
-                (s - 20.0).abs() < 1e-12,
-                "expected 20.0 (= 1000/50), got {}",
-                s
-            );
+            assert!((s - 20.0).abs() < 1e-12, "expected 20.0 (= 1000/50), got {}", s);
         }
         other => panic!("expected ExpressionScale, got {:?}", other),
     }
@@ -16223,10 +14796,7 @@ fn test_obs_scale_scalar_constant_on_pk_block_does_not_warn() {
     let src = analytical_model_with_scaling(Some("  obs_scale = 1000\n"));
     let model = parse_model_string(&src).expect("scalar obs_scale parses");
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("volume parameter")),
+        !model.parse_warnings.iter().any(|w| w.contains("volume parameter")),
         "scalar obs_scale must not warn, got {:?}",
         model.parse_warnings
     );
@@ -16240,10 +14810,7 @@ fn test_obs_scale_referencing_non_volume_indiv_param_does_not_warn() {
     let src = analytical_model_with_scaling(Some("  obs_scale = CL / 10\n"));
     let model = parse_model_string(&src).expect("CL-referencing obs_scale parses");
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("volume parameter")),
+        !model.parse_warnings.iter().any(|w| w.contains("volume parameter")),
         "obs_scale referencing a non-volume indiv param must not warn, got {:?}",
         model.parse_warnings
     );
@@ -16261,10 +14828,7 @@ fn test_obs_scale_referencing_volume_on_ode_model_does_not_warn() {
     );
     let model = parse_model_string(&src).expect("ODE obs_scale = V parses");
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("volume parameter")),
+        !model.parse_warnings.iter().any(|w| w.contains("volume parameter")),
         "ODE obs_scale = V must not warn, got {:?}",
         model.parse_warnings
     );
@@ -16277,10 +14841,7 @@ fn test_parse_scaling_y_form_c_on_analytical_accepted() {
     // `None` (the readout, not a divisor, carries the output map).
     let src = analytical_model_with_scaling(Some("  y = central / V\n"));
     let model = parse_model_string(&src).expect("analytic Form C readout must parse");
-    assert!(
-        model.analytic_readout.is_some(),
-        "analytic Form C must populate analytic_readout"
-    );
+    assert!(model.analytic_readout.is_some(), "analytic Form C must populate analytic_readout");
     assert!(matches!(model.scaling, ScalingSpec::None));
 }
 
@@ -16418,10 +14979,7 @@ fn test_scaling_intermediates_two_sided_clamp() {
     pk[1] = 100.0; // V — so y = central / 100
     for (central, want) in [(0.0, 0.01), (5.0, 0.05), (500.0, 0.99)] {
         let y = f(&vec![0.0, central], &pk, &[], &[], &cov);
-        assert!(
-            (y - want).abs() < 1e-12,
-            "central={central} → expected {want}, got {y}"
-        );
+        assert!((y - want).abs() < 1e-12, "central={central} → expected {want}, got {y}");
     }
 }
 
@@ -16448,10 +15006,7 @@ fn test_scaling_intermediate_in_obs_scale() {
     let src = analytical_model_with_scaling(Some("  K = MW * 1000\n  obs_scale = K\n"));
     let model = parse_model_string(&src).expect("model parses");
     assert!(
-        matches!(
-            model.scaling,
-            crate::types::ScalingSpec::ExpressionScale { .. }
-        ),
+        matches!(model.scaling, crate::types::ScalingSpec::ExpressionScale { .. }),
         "obs_scale built from an intermediate must be a Form B expression scale"
     );
     assert!(
@@ -16468,33 +15023,21 @@ fn test_scaling_intermediate_in_obs_scale() {
 fn test_scaling_intermediate_forward_reference_rejected() {
     let src = analytical_model_with_scaling(Some("  A = B * 2\n  B = 3\n  y = A\n"));
     let err = parse_model_string(&src).expect_err("forward reference must be rejected");
-    assert!(
-        err.contains("declared on or below"),
-        "expected forward-reference error, got: {}",
-        err
-    );
+    assert!(err.contains("declared on or below"), "expected forward-reference error, got: {}", err);
 }
 
 #[test]
 fn test_scaling_intermediate_self_reference_rejected() {
     let src = analytical_model_with_scaling(Some("  A = A + 1\n  y = A\n"));
     let err = parse_model_string(&src).expect_err("self reference must be rejected");
-    assert!(
-        err.contains("declared on or below"),
-        "expected self-reference error, got: {}",
-        err
-    );
+    assert!(err.contains("declared on or below"), "expected self-reference error, got: {}", err);
 }
 
 #[test]
 fn test_scaling_intermediate_duplicate_rejected() {
     let src = analytical_model_with_scaling(Some("  A = 2\n  A = 3\n  y = A\n"));
     let err = parse_model_string(&src).expect_err("duplicate intermediate must be rejected");
-    assert!(
-        err.contains("duplicate named intermediate"),
-        "expected duplicate error, got: {}",
-        err
-    );
+    assert!(err.contains("duplicate named intermediate"), "expected duplicate error, got: {}", err);
 }
 
 /// A binding named after something already in scope would never be read — the
@@ -16502,11 +15045,9 @@ fn test_scaling_intermediate_duplicate_rejected() {
 /// rejected rather than left silently dead.
 #[test]
 fn test_scaling_intermediate_shadowing_rejected() {
-    for (name, what) in [
-        ("V", "an individual parameter"),
-        ("TVCL", "a theta"),
-        ("ETA_CL", "an eta"),
-    ] {
+    for (name, what) in
+        [("V", "an individual parameter"), ("TVCL", "a theta"), ("ETA_CL", "an eta")]
+    {
         let src = analytical_model_with_scaling(Some(&format!("  {name} = 2\n  y = {name}\n")));
         let err = parse_model_string(&src)
             .expect_err("a name already in scope must be rejected as an intermediate");
@@ -16559,10 +15100,7 @@ fn test_scaling_intermediate_keeps_the_analytic_readout_path() {
     ] {
         let model = parse_model_string(&model_src(scaling)).expect("model parses");
         assert!(
-            !model
-                .parse_warnings
-                .iter()
-                .any(|w| w.contains("finite-difference")),
+            !model.parse_warnings.iter().any(|w| w.contains("finite-difference")),
             "readout `{scaling}` must stay on the analytic path, warnings: {:?}",
             model.parse_warnings
         );
@@ -16587,11 +15125,7 @@ fn test_scaling_intermediate_cannot_smuggle_time_into_obs_scale() {
 fn test_scaling_intermediate_reserved_name_rejected() {
     let src = analytical_model_with_scaling(Some("  TIME = 2\n  y = TIME\n"));
     let err = parse_model_string(&src).expect_err("`TIME` must be rejected as an intermediate");
-    assert!(
-        err.contains("model-time built-in"),
-        "expected reserved-name error, got: {}",
-        err
-    );
+    assert!(err.contains("model-time built-in"), "expected reserved-name error, got: {}", err);
 }
 
 /// `TAD` / `TAFD` / `MACHEPS` are supplied by the evaluator, so a binding under one
@@ -16709,20 +15243,13 @@ fn test_min_max_two_args_in_individual_parameters() {
 
     covs.insert("WT".to_string(), 70.0);
     let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
-    assert!(
-        (p.values[0] - 2.0).abs() < 1e-12,
-        "WT=70 → CL = max(2, 1) = 2"
-    );
+    assert!((p.values[0] - 2.0).abs() < 1e-12, "WT=70 → CL = max(2, 1) = 2");
     assert!((p.values[1] - 10.0).abs() < 1e-12, "V = min(10, 20) = 10");
 
     // Below the floor: the clamp bites.
     covs.insert("WT".to_string(), 7.0);
     let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
-    assert!(
-        (p.values[0] - 1.0).abs() < 1e-12,
-        "WT=7 → CL = max(0.2, 1) = 1, got {}",
-        p.values[0]
-    );
+    assert!((p.values[0] - 1.0).abs() < 1e-12, "WT=7 → CL = max(0.2, 1) = 1, got {}", p.values[0]);
 }
 
 /// The arity diagnostic the issue called out: a one-argument `max` used to be
@@ -16757,9 +15284,8 @@ fn parse_indexed_expr(src: &str) -> Expression {
     let ctx = ParseCtx::new(&[], &[], &defined);
     let (mut expr, p) = parse_add_sub(&toks, 0, ctx).expect("parses");
     assert_eq!(p, toks.len(), "trailing tokens in `{src}`");
-    let var_idx: HashMap<String, usize> = [("X".to_string(), 0), ("Y".to_string(), 1)]
-        .into_iter()
-        .collect();
+    let var_idx: HashMap<String, usize> =
+        [("X".to_string(), 0), ("Y".to_string(), 1)].into_iter().collect();
     resolve_expr_indices(&mut expr, &var_idx, &HashMap::new());
     expr
 }
@@ -16778,11 +15304,7 @@ fn clamp_matches_nested_min_max_on_every_finite_x() {
         let vars = [x, 0.0];
         let a = eval_expression_indexed(&clamped, &[], &[], &[], &vars, &nn);
         let b = eval_expression_indexed(&nested, &[], &[], &[], &vars, &nn);
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "clamp != min(max(..)) at x = {x}: {a} vs {b}"
-        );
+        assert_eq!(a.to_bits(), b.to_bits(), "clamp != min(max(..)) at x = {x}: {a} vs {b}");
         assert_eq!(a, x.clamp(0.01, 0.99), "at x = {x}");
     }
 }
@@ -16861,16 +15383,8 @@ fn clamp_derivative_convention_on_the_bounds() {
         let mut s: Vec<Dual2<2>> = Vec::new();
         eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut s).grad[0]
     };
-    assert_eq!(
-        grad_at(0.2),
-        0.0,
-        "on the lower bound the `lo` branch is taken"
-    );
-    assert_eq!(
-        grad_at(0.8),
-        0.0,
-        "on the upper bound the `hi` branch is taken"
-    );
+    assert_eq!(grad_at(0.2), 0.0, "on the lower bound the `lo` branch is taken");
+    assert_eq!(grad_at(0.8), 0.0, "on the upper bound the `hi` branch is taken");
     assert_eq!(grad_at(0.5), 1.0, "strictly inside, clamp is the identity");
     assert_eq!(grad_at(0.1), 0.0, "below the lower bound");
     assert_eq!(grad_at(0.9), 0.0, "above the upper bound");
@@ -16906,15 +15420,9 @@ fn test_clamp_in_individual_parameters() {
         covs.insert("WT".to_string(), wt);
         (parsed.model.pk_param_fn)(&theta, &eta, covs, 0.0).values[0]
     };
-    assert!(
-        (cl_at(70.0, &mut covs) - 2.0).abs() < 1e-12,
-        "inside: CL = 2"
-    );
+    assert!((cl_at(70.0, &mut covs) - 2.0).abs() < 1e-12, "inside: CL = 2");
     assert!((cl_at(7.0, &mut covs) - 1.0).abs() < 1e-12, "floor bites");
-    assert!(
-        (cl_at(700.0, &mut covs) - 3.0).abs() < 1e-12,
-        "ceiling bites"
-    );
+    assert!((cl_at(700.0, &mut covs) - 3.0).abs() < 1e-12, "ceiling bites");
 }
 
 /// `clamp` with one, two or four arguments must be a hard error naming the
@@ -16961,11 +15469,7 @@ fn test_clamp_arity_diagnostics() {
 fn test_clamp_rejects_inverted_literal_bounds() {
     let src = analytical_model_with_scaling(Some("  y = clamp(central, 0.9, 0.1)\n"));
     let err = parse_model_string(&src).expect_err("inverted literal bounds must be rejected");
-    assert!(
-        err.contains("bounds inverted"),
-        "expected the inverted-bounds error, got: {}",
-        err
-    );
+    assert!(err.contains("bounds inverted"), "expected the inverted-bounds error, got: {}", err);
 
     // Equal bounds are a degenerate but well-defined constant, not an error.
     let src = analytical_model_with_scaling(Some("  y = clamp(central, 0.5, 0.5)\n"));
@@ -16999,10 +15503,7 @@ fn test_join_continuation_lines() {
     // for the statement parser to reject with its own message.
     assert_eq!(join(&["+ C"]), vec!["+ C".to_string()]);
     // Ordinary lines are untouched.
-    assert_eq!(
-        join(&["A = B", "C = D"]),
-        vec!["A = B".to_string(), "C = D".to_string()]
-    );
+    assert_eq!(join(&["A = B", "C = D"]), vec!["A = B".to_string(), "C = D".to_string()]);
 }
 
 /// The additive-on-logit covariate model from the issue: one covariate per line,
@@ -17040,11 +15541,7 @@ fn test_individual_parameters_operator_continuation_lines() {
     covs.insert("ADALI".to_string(), 0.0);
     let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
     let want = 0.5 + 1.5f64.ln() + 0.25;
-    assert!(
-        (p.values[0] - want).abs() < 1e-12,
-        "expected {want}, got {}",
-        p.values[0]
-    );
+    assert!((p.values[0] - want).abs() < 1e-12, "expected {want}, got {}", p.values[0]);
     assert!((p.values[1] - 20.0).abs() < 1e-12, "trailing `*` continues");
 }
 
@@ -17109,10 +15606,7 @@ fn test_initial_conditions_continuation_lines() {
     let eta = vec![0.0];
     let pk = (model.pk_param_fn)(&theta, &eta, &covs, 0.0);
     let amount = (model.analytical_init[0].amount_fn)(&theta, &eta, &covs, &pk);
-    assert!(
-        (amount - 25.0).abs() < 1e-12,
-        "expected 2*10 + 5 = 25, got {amount}"
-    );
+    assert!((amount - 25.0).abs() < 1e-12, "expected 2*10 + 5 = 25, got {amount}");
 }
 
 #[test]
@@ -17256,10 +15750,8 @@ fn test_parse_scaling_y_form_c_resolves_covariates() {
     // silently turned `WT` into a `Variable` and returned 0.0. With the
     // fix (ParseCtx::new), unknown identifiers resolve as Covariate and
     // get looked up in the per-call covariate map.
-    let src = ode_model_with_scaling(
-        "ode(states=[depot, central])",
-        Some("  y = central / V * WT\n"),
-    );
+    let src =
+        ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V * WT\n"));
     let model = parse_model_string(&src).expect("Form C with covariate parses");
     assert!(
         model.referenced_covariates.contains(&"WT".to_string()),
@@ -17281,11 +15773,7 @@ fn test_parse_scaling_y_form_c_resolves_covariates() {
     let y = out_fn(&state, &pk, &[], &[], &cov);
     // central/V * WT = 50/50 * 70 = 70. With the bug, WT was treated as
     // a Variable and read 0 from the empty vars map → y = 0.
-    assert!(
-        (y - 70.0).abs() < 1e-12,
-        "expected 70.0 (covariate WT must resolve), got {}",
-        y
-    );
+    assert!((y - 70.0).abs() < 1e-12, "expected 70.0 (covariate WT must resolve), got {}", y);
 }
 
 #[test]
@@ -17297,10 +15785,8 @@ fn test_parse_scaling_y_form_c_resolves_theta() {
     // Covariate("TVCL") → 0.0). Phase 1.5 fix: pass theta_names/eta_names
     // into ParseCtx so identifiers resolve as Theta(i) / Eta(i) and
     // thread theta/eta through OdeOutputFn at runtime.
-    let src = ode_model_with_scaling(
-        "ode(states=[depot, central])",
-        Some("  y = central / V * TVCL\n"),
-    );
+    let src =
+        ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V * TVCL\n"));
     let model = parse_model_string(&src).expect("Form C with theta ref parses");
     let ode = model.ode_spec.as_ref().unwrap();
     let out_fn = match &ode.readout {
@@ -17319,11 +15805,7 @@ fn test_parse_scaling_y_form_c_resolves_theta() {
     let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
     let y = out_fn(&state, &pk.values, &theta, &eta, &cov);
     // central/V * TVCL = 50/50 * 3 = 3.
-    assert!(
-        (y - 3.0).abs() < 1e-12,
-        "expected 3.0 (TVCL must resolve to theta[0]=3), got {}",
-        y
-    );
+    assert!((y - 3.0).abs() < 1e-12, "expected 3.0 (TVCL must resolve to theta[0]=3), got {}", y);
 }
 
 /// #486: a Form-C readout referencing θ/η directly is desugared into synthetic
@@ -17340,38 +15822,24 @@ fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
     let model = parse_model_string(&src).expect("direct θ/η readout parses");
 
     // Two synthetic individual parameters were appended (θ and η source).
-    let synth: Vec<&String> = model
-        .indiv_param_names
-        .iter()
-        .filter(|n| is_synthetic_readout_param(n))
-        .collect();
+    let synth: Vec<&String> =
+        model.indiv_param_names.iter().filter(|n| is_synthetic_readout_param(n)).collect();
     assert_eq!(synth.len(), 2, "one synthetic param per distinct θ/η ref");
     assert_eq!(model.indiv_param_names.len(), model.pk_indices.len());
 
     // The desugared readout carries no bare θ/η ops.
     let ode = model.ode_spec.as_ref().unwrap();
-    let prog = ode
-        .readout_program
-        .as_ref()
-        .expect("uniform Form-C readout has a sensitivity program");
-    assert!(
-        !prog.reads_leaves(),
-        "a θ/η readout must read no leaf after desugaring (#486)"
-    );
+    let prog =
+        ode.readout_program.as_ref().expect("uniform Form-C readout has a sensitivity program");
+    assert!(!prog.reads_leaves(), "a θ/η readout must read no leaf after desugaring (#486)");
 
     // The `ETA_CL` reference reuses the existing random effect — no new omega.
-    assert_eq!(
-        model.n_eta, 1,
-        "desugaring an η reference adds no random effect"
-    );
+    assert_eq!(model.n_eta, 1, "desugaring an η reference adds no random effect");
 
     // The synthetic parameters are load-bearing (read by the readout), so the
     // "computed but never used" census must not flag them.
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("computed but never used")),
+        !model.parse_warnings.iter().any(|w| w.contains("computed but never used")),
         "synthetic readout params must not trip the unused-parameter census, got: {:?}",
         model.parse_warnings
     );
@@ -17386,10 +15854,7 @@ fn ode_free_slot_count_reports_headroom() {
     let usable = MAX_PK_PARAMS - RESERVED_PK_SLOTS.len();
     assert_eq!(ode_free_slot_count(&[]), usable);
     // CL→0, V→1 are non-reserved canonical slots, leaving `usable - 2`.
-    assert_eq!(
-        ode_free_slot_count(&["CL".to_string(), "V".to_string()]),
-        usable - 2
-    );
+    assert_eq!(ode_free_slot_count(&["CL".to_string(), "V".to_string()]), usable - 2);
     // `usable` non-canonical params exactly fill the layout → 0 free; one more
     // still 0 (`ode_param_slots` errors, and the headroom is reported as full).
     let full: Vec<String> = (0..usable).map(|i| format!("EXTRA{i}")).collect();
@@ -17425,9 +15890,7 @@ fn test_form_c_direct_readout_stays_a_direct_read_when_slots_full() {
     // would need one more.
     let usable = MAX_PK_PARAMS - RESERVED_PK_SLOTS.len();
     let n_extras = usable - 3;
-    let extras: String = (0..n_extras)
-        .map(|i| format!("  EXTRA{i} = TVV\n"))
-        .collect();
+    let extras: String = (0..n_extras).map(|i| format!("  EXTRA{i} = TVV\n")).collect();
     let src = format!(
         "\
 [parameters]
@@ -17466,10 +15929,7 @@ fn test_form_c_direct_readout_stays_a_direct_read_when_slots_full() {
 
     // No synthetic param was injected — desugaring stood down for lack of a slot.
     assert!(
-        !model
-            .indiv_param_names
-            .iter()
-            .any(|n| is_synthetic_readout_param(n)),
+        !model.indiv_param_names.iter().any(|n| is_synthetic_readout_param(n)),
         "desugaring must not consume a slot it does not have"
     );
     // The θ read stays in the readout, and no warning claims a lost gradient.
@@ -17479,10 +15939,7 @@ fn test_form_c_direct_readout_stays_a_direct_read_when_slots_full() {
         .and_then(|o| o.readout_program.as_ref())
         .is_some_and(|p| p.reads_leaves()));
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
+        !model.parse_warnings.iter().any(|w| w.contains("finite-difference")),
         "no finite-difference note: {:?}",
         model.parse_warnings
     );
@@ -17533,10 +15990,7 @@ fn ode_form_c_output_referencing_kappa_is_rejected_under_iov() {
     let src = iov_ode_model_with_y("y = central / V * exp(KAPPA_CL)");
     let err = parse_model_string(&src)
         .expect_err("Form C output referencing KAPPA_* must be rejected under IOV");
-    assert!(
-        err.contains("KAPPA") && err.contains("#107"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("KAPPA") && err.contains("#107"), "unexpected error: {err}");
 }
 
 #[test]
@@ -17555,10 +16009,7 @@ fn ode_form_c_output_referencing_kappa_in_condition_is_rejected_under_iov() {
     let src = iov_ode_model_with_y("y = if (KAPPA_CL > 0) central / V else central / V");
     let err = parse_model_string(&src)
         .expect_err("KAPPA_* in a Form C output condition must be rejected under IOV");
-    assert!(
-        err.contains("KAPPA") && err.contains("#107"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("KAPPA") && err.contains("#107"), "unexpected error: {err}");
 }
 
 #[test]
@@ -17591,10 +16042,7 @@ fn init_amount_referencing_kappa_is_rejected_under_iov() {
 "#;
     let err = parse_model_string(src)
         .expect_err("init expression referencing KAPPA_* must be rejected under IOV");
-    assert!(
-        err.contains("KAPPA") && err.contains("IOV"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("KAPPA") && err.contains("IOV"), "unexpected error: {err}");
 }
 
 #[test]
@@ -17780,10 +16228,7 @@ fn test_parse_scaling_per_cmt_mixed_forms() {
         ScalingSpec::PerCmt(map) => {
             assert_eq!(map.len(), 2);
             assert!(matches!(map.get(&1), Some(ScalingSpec::ScalarScale(_))));
-            assert!(matches!(
-                map.get(&2),
-                Some(ScalingSpec::ExpressionScale { .. })
-            ));
+            assert!(matches!(map.get(&2), Some(ScalingSpec::ExpressionScale { .. })));
         }
         other => panic!("expected PerCmt, got {:?}", other),
     }
@@ -17794,11 +16239,7 @@ fn test_parse_scaling_rejects_mixing_uniform_and_per_cmt() {
     let src = analytical_model_with_scaling(Some("  obs_scale = 1000\n  obs_scale[CMT=2] = 1\n"));
     let err =
         parse_model_string(&src).expect_err("mixing uniform + per-CMT obs_scale must be rejected");
-    assert!(
-        err.to_lowercase().contains("cannot mix"),
-        "expected cannot-mix error, got: {}",
-        err
-    );
+    assert!(err.to_lowercase().contains("cannot mix"), "expected cannot-mix error, got: {}", err);
 }
 
 #[test]
@@ -17841,10 +16282,7 @@ fn scaling_obs_scale_registers_covariate_references() {
     let src = analytical_model_with_scaling(Some("  obs_scale = V / TOTALLY_UNDEFINED_NAME\n"));
     let model = parse_model_string(&src).expect("obs_scale expression parses");
     assert!(
-        model
-            .referenced_covariates
-            .iter()
-            .any(|c| c == "TOTALLY_UNDEFINED_NAME"),
+        model.referenced_covariates.iter().any(|c| c == "TOTALLY_UNDEFINED_NAME"),
         "an unbindable `obs_scale` identifier must become a required data column, \
          got {:?}",
         model.referenced_covariates
@@ -17906,10 +16344,8 @@ fn scaling_obs_scale_rejects_the_time_builtin() {
 /// register it as a data column.
 #[test]
 fn scaling_y_readout_accepts_the_time_builtin() {
-    let src = ode_model_with_scaling(
-        "ode(states=[depot, central])",
-        Some("  y = central / V * TIME\n"),
-    );
+    let src =
+        ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V * TIME\n"));
     let model = parse_model_string(&src).expect("Form C readout may reference TIME");
     assert!(
         model.referenced_covariates.is_empty(),
@@ -17927,12 +16363,7 @@ fn readout_reads_time(model: &CompiledModel) -> bool {
         .ode_spec
         .as_ref()
         .and_then(|o| o.readout_program.as_ref())
-        .or_else(|| {
-            model
-                .analytic_readout
-                .as_ref()
-                .and_then(|a| a.program.as_ref())
-        })
+        .or_else(|| model.analytic_readout.as_ref().and_then(|a| a.program.as_ref()))
         .expect("uniform Form C readout carries a program");
     program.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
 }
@@ -17957,10 +16388,7 @@ fn scaling_y_readout_accepts_the_t_time_alias() {
              column; got {:?}",
             model.referenced_covariates
         );
-        assert!(
-            readout_reads_time(&model),
-            "`{alias}` must compile to the model-time read"
-        );
+        assert!(readout_reads_time(&model), "`{alias}` must compile to the model-time read");
     }
 }
 
@@ -18004,10 +16432,7 @@ fn scaling_y_readout_folds_the_t_alias_under_every_node_kind() {
          got {:?}",
         model.referenced_covariates
     );
-    assert!(
-        readout_reads_time(&model),
-        "the folded readout must compile to the model-time read"
-    );
+    assert!(readout_reads_time(&model), "the folded readout must compile to the model-time read");
 }
 
 /// A `[scaling]` `y` covariate has been a required data column since #540, so a
@@ -18085,32 +16510,22 @@ fn obs_scale_time_rejection_respects_a_case_mismatched_declaration() {
 /// declare the column.
 #[test]
 fn scaling_y_readout_t_alias_fold_warns() {
-    let src = ode_model_with_scaling(
-        "ode(states=[depot, central])",
-        Some("  y = central / V * T\n"),
-    );
+    let src =
+        ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V * T\n"));
     let model = parse_model_string(&src).expect("the T alias parses");
     let note = model
         .parse_warnings
         .iter()
         .find(|w| w.contains("model-time built-in"))
         .unwrap_or_else(|| panic!("expected a fold warning, got {:?}", model.parse_warnings));
-    assert!(
-        note.contains("[covariates]"),
-        "warning must name the escape hatch: {note}"
-    );
+    assert!(note.contains("[covariates]"), "warning must name the escape hatch: {note}");
 
     // Spelling it `TIME` is unambiguous and must not warn.
-    let src_time = ode_model_with_scaling(
-        "ode(states=[depot, central])",
-        Some("  y = central / V * TIME\n"),
-    );
+    let src_time =
+        ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V * TIME\n"));
     let model_time = parse_model_string(&src_time).expect("TIME parses");
     assert!(
-        !model_time
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("model-time built-in")),
+        !model_time.parse_warnings.iter().any(|w| w.contains("model-time built-in")),
         "the unambiguous `TIME` spelling must not warn, got {:?}",
         model_time.parse_warnings
     );
@@ -18249,11 +16664,7 @@ fn bc_g_f64_matches(expr: &Expression, vars: &[f64]) {
     let f = eval_bytecode(&bc, &[], &[], &[], vars, &nn, &mut s1);
     let mut s2: Vec<f64> = Vec::new();
     let g = eval_bytecode_g::<f64>(&bc, &[], &[], &[], vars, &nn, &mut s2);
-    assert_eq!(
-        f.to_bits(),
-        g.to_bits(),
-        "f64 generic VM drift: expr={expr:?} f={f} g={g}"
-    );
+    assert_eq!(f.to_bits(), g.to_bits(), "f64 generic VM drift: expr={expr:?} f={f} g={g}");
 }
 
 /// Vars 0 and 1 are seeded as `Dual2<2>` variables; check value/grad/Hessian
@@ -18273,50 +16684,17 @@ fn bc_g_dual2_fd(expr: &Expression, x: f64, y: f64, gtol: f64, htol: f64) {
     let h = 1e-5;
     let gx = (v(x + h, y) - v(x - h, y)) / (2.0 * h);
     let gy = (v(x, y + h) - v(x, y - h)) / (2.0 * h);
-    assert!(
-        close(d.grad[0], gx, gtol, 1e-7),
-        "grad0 {:?}: {} vs {}",
-        expr,
-        d.grad[0],
-        gx
-    );
-    assert!(
-        close(d.grad[1], gy, gtol, 1e-7),
-        "grad1 {:?}: {} vs {}",
-        expr,
-        d.grad[1],
-        gy
-    );
+    assert!(close(d.grad[0], gx, gtol, 1e-7), "grad0 {:?}: {} vs {}", expr, d.grad[0], gx);
+    assert!(close(d.grad[1], gy, gtol, 1e-7), "grad1 {:?}: {} vs {}", expr, d.grad[1], gy);
     let hh = 1e-4;
     let hxx = (v(x + hh, y) - 2.0 * v(x, y) + v(x - hh, y)) / (hh * hh);
     let hyy = (v(x, y + hh) - 2.0 * v(x, y) + v(x, y - hh)) / (hh * hh);
     let hxy = (v(x + hh, y + hh) - v(x + hh, y - hh) - v(x - hh, y + hh) + v(x - hh, y - hh))
         / (4.0 * hh * hh);
-    assert!(
-        close(d.hess[0][0], hxx, htol, 1e-4),
-        "hxx {:?}: {} vs {}",
-        expr,
-        d.hess[0][0],
-        hxx
-    );
-    assert!(
-        close(d.hess[1][1], hyy, htol, 1e-4),
-        "hyy {:?}: {} vs {}",
-        expr,
-        d.hess[1][1],
-        hyy
-    );
-    assert!(
-        close(d.hess[0][1], hxy, htol, 1e-4),
-        "hxy {:?}: {} vs {}",
-        expr,
-        d.hess[0][1],
-        hxy
-    );
-    assert!(
-        close(d.hess[0][1], d.hess[1][0], 1e-12, 1e-12),
-        "hess symmetry"
-    );
+    assert!(close(d.hess[0][0], hxx, htol, 1e-4), "hxx {:?}: {} vs {}", expr, d.hess[0][0], hxx);
+    assert!(close(d.hess[1][1], hyy, htol, 1e-4), "hyy {:?}: {} vs {}", expr, d.hess[1][1], hyy);
+    assert!(close(d.hess[0][1], hxy, htol, 1e-4), "hxy {:?}: {} vs {}", expr, d.hess[0][1], hxy);
+    assert!(close(d.hess[0][1], d.hess[1][0], 1e-12, 1e-12), "hess symmetry");
 }
 
 #[test]
@@ -18347,10 +16725,7 @@ fn bytecode_g_f64_bit_identical() {
     // Guard branches: zero divisor, ln/sqrt of a non-positive argument.
     bc_g_f64_matches(&binop(BinOp::Div, varidx(0), lit(0.0)), &vars);
     bc_g_f64_matches(&unary("ln", binop(BinOp::Sub, lit(0.0), varidx(0))), &vars);
-    bc_g_f64_matches(
-        &unary("sqrt", binop(BinOp::Sub, lit(0.0), varidx(0))),
-        &vars,
-    );
+    bc_g_f64_matches(&unary("sqrt", binop(BinOp::Sub, lit(0.0), varidx(0))), &vars);
 }
 
 /// #2149: `x mod 0` must mean the same thing in all three evaluators. The
@@ -18365,14 +16740,7 @@ fn mod_zero_divisor_agrees_across_all_three_evaluators() {
     use crate::sens::dual2::Dual2;
     let nn: Vec<Vec<f64>> = Vec::new();
     // (divisor, expected `7.25 mod divisor`)
-    let cases = [
-        (0.0, 0.0),
-        (-0.0, 0.0),
-        (1e-31, 0.0),
-        (-1e-31, 0.0),
-        (2.0, 1.25),
-        (-2.0, 1.25),
-    ];
+    let cases = [(0.0, 0.0), (-0.0, 0.0), (1e-31, 0.0), (-1e-31, 0.0), (2.0, 1.25), (-2.0, 1.25)];
     for (b, want) in cases {
         let e = binop(BinOp::Mod, varidx(0), varidx(1));
         let vars = [7.25, b];
@@ -18388,22 +16756,12 @@ fn mod_zero_divisor_agrees_across_all_three_evaluators() {
         assert_eq!(dual.value, want, "Dual2 VM: 7.25 mod {b:e}");
         // Inside the guard the result is a constant; outside it carries the
         // `a' − q·b'` jet of #2150.
-        let want_grad = if b.abs() < 1e-30 {
-            [0.0; 2]
-        } else {
-            [1.0, -7.25_f64.div_euclid(b)]
-        };
+        let want_grad = if b.abs() < 1e-30 { [0.0; 2] } else { [1.0, -7.25_f64.div_euclid(b)] };
         assert_eq!(dual.grad, want_grad, "Dual2 VM grad: 7.25 mod {b:e}");
     }
     // The literal-divisor spelling the issue reproduced (`TIME mod 0`) goes
     // through the same arms; pin it bit-for-bit against the bytecode too.
-    bc_vs_ast(
-        binop(BinOp::Mod, varidx(0), lit(0.0)),
-        &[7.25],
-        &[],
-        &[],
-        &[],
-    );
+    bc_vs_ast(binop(BinOp::Mod, varidx(0), lit(0.0)), &[7.25], &[], &[], &[]);
 }
 
 /// The `Dual2` VM's `Op::Mod` carries the jet `a' − q·b'` (`q = div_euclid(a, b)`)
@@ -18416,23 +16774,13 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     use crate::sens::dual2::Dual2;
     let expr = binop(BinOp::Mod, varidx(0), varidx(1));
     let bc = compile_bytecode(&expr);
-    for (x, y) in [
-        (1.3, 2.5),
-        (7.1, 2.5),
-        (-3.4, 2.5),
-        (7.1, -2.5),
-        (-3.4, -2.5),
-    ] {
+    for (x, y) in [(1.3, 2.5), (7.1, 2.5), (-3.4, 2.5), (7.1, -2.5), (-3.4, -2.5)] {
         bc_g_dual2_fd(&expr, x, y, 1e-6, 1e-3);
         bc_g_f64_matches(&expr, &[x, y]);
         let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
         let mut sd: Vec<Dual2<2>> = Vec::new();
         let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &[], &mut sd);
-        assert_eq!(
-            d.value.to_bits(),
-            x.rem_euclid(y).to_bits(),
-            "value of {x} mod {y}"
-        );
+        assert_eq!(d.value.to_bits(), x.rem_euclid(y).to_bits(), "value of {x} mod {y}");
         assert_eq!(d.grad, [1.0, -x.div_euclid(y)], "grad of {x} mod {y}");
         assert_eq!(d.hess, [[0.0; 2]; 2], "hess of {x} mod {y}");
     }
@@ -18466,10 +16814,7 @@ fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
         Expression::CovariateIdx(i) => Dm::constant(covs[*i]),
         Expression::Time => Dm::constant(time),
         Expression::BinOp(l, op, r) => {
-            let (a, b) = (
-                dm_reference(l, vars, covs, time),
-                dm_reference(r, vars, covs, time),
-            );
+            let (a, b) = (dm_reference(l, vars, covs, time), dm_reference(r, vars, covs, time));
             match op {
                 BinOp::Add => a + b,
                 BinOp::Sub => a - b,
@@ -18540,12 +16885,7 @@ fn assert_dm_matches_reference(e: &Expression) {
     };
     // Bit for bit, any `NaN` matching any `NaN`.
     let eq = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
-    assert!(
-        eq(got.value, want.value),
-        "value {e:?}: {} vs {}",
-        got.value,
-        want.value
-    );
+    assert!(eq(got.value, want.value), "value {e:?}: {} vs {}", got.value, want.value);
     for i in 0..3 {
         assert!(
             eq(got.grad[i], want.grad[i]),
@@ -18600,11 +16940,7 @@ fn bytecode_g_operand_fusion_matches_by_value_dual_evaluation() {
         binop(BinOp::Div, x(), y()),
         binop(BinOp::Div, x(), zero()),
         // Both operands computed (stack path), incl. the guard on a computed zero.
-        binop(
-            BinOp::Mul,
-            binop(BinOp::Add, x(), y()),
-            binop(BinOp::Sub, y(), z()),
-        ),
+        binop(BinOp::Mul, binop(BinOp::Add, x(), y()), binop(BinOp::Sub, y(), z())),
         binop(BinOp::Div, unary("exp", x()), binop(BinOp::Sub, y(), y())),
         binop(BinOp::Div, unary("exp", x()), binop(BinOp::Add, y(), z())),
         // The busulfan `FTIME` shape, `1 + DROP·exp(−SHAPE·t)`, and an ODE-RHS term.
@@ -18614,23 +16950,12 @@ fn bytecode_g_operand_fusion_matches_by_value_dual_evaluation() {
             binop(
                 BinOp::Mul,
                 x(),
-                unary(
-                    "exp",
-                    binop(
-                        BinOp::Mul,
-                        binop(BinOp::Sub, lit(0.0), y()),
-                        Expression::Time,
-                    ),
-                ),
+                unary("exp", binop(BinOp::Mul, binop(BinOp::Sub, lit(0.0), y()), Expression::Time)),
             ),
         ),
         binop(
             BinOp::Add,
-            binop(
-                BinOp::Mul,
-                binop(BinOp::Sub, lit(0.0), binop(BinOp::Div, x(), y())),
-                z(),
-            ),
+            binop(BinOp::Mul, binop(BinOp::Sub, lit(0.0), binop(BinOp::Div, x(), y())), z()),
             binop(BinOp::Mul, binop(BinOp::Div, y(), z()), x()),
         ),
         // Signed-zero and infinite jets through every fused scalar form, both operand
@@ -18703,28 +17028,13 @@ fn bytecode_g_underflow_fallback_keeps_the_operand_order() {
 #[test]
 fn literal_left_operand_compiles_to_the_top_of_the_stack() {
     let ops = |e: &Expression| format!("{:?}", compile_bytecode(e).ops);
-    assert_eq!(
-        ops(&binop(BinOp::Sub, lit(0.0), varidx(0))),
-        "[PushVar(0), PushConst(0), RSub]"
-    );
-    assert_eq!(
-        ops(&binop(BinOp::Add, lit(2.0), varidx(0))),
-        "[PushVar(0), PushConst(0), Add]"
-    );
-    assert_eq!(
-        ops(&binop(BinOp::Mul, lit(2.0), varidx(0))),
-        "[PushVar(0), PushConst(0), Mul]"
-    );
+    assert_eq!(ops(&binop(BinOp::Sub, lit(0.0), varidx(0))), "[PushVar(0), PushConst(0), RSub]");
+    assert_eq!(ops(&binop(BinOp::Add, lit(2.0), varidx(0))), "[PushVar(0), PushConst(0), Add]");
+    assert_eq!(ops(&binop(BinOp::Mul, lit(2.0), varidx(0))), "[PushVar(0), PushConst(0), Mul]");
     // Not swapped: `/` is not commutative, and a literal on both sides has nothing
     // to gain.
-    assert_eq!(
-        ops(&binop(BinOp::Div, lit(2.0), varidx(0))),
-        "[PushConst(0), PushVar(0), Div]"
-    );
-    assert_eq!(
-        ops(&binop(BinOp::Sub, lit(2.0), lit(3.0))),
-        "[PushConst(0), PushConst(1), Sub]"
-    );
+    assert_eq!(ops(&binop(BinOp::Div, lit(2.0), varidx(0))), "[PushConst(0), PushVar(0), Div]");
+    assert_eq!(ops(&binop(BinOp::Sub, lit(2.0), lit(3.0))), "[PushConst(0), PushConst(1), Sub]");
 }
 
 /// The swap and `RSub` must leave every `f64` result bit-identical, on both the
@@ -18740,16 +17050,9 @@ fn literal_left_operand_order_keeps_f64_bit_identical() {
         binop(BinOp::Sub, lit(0.0), varidx(1)),
         binop(BinOp::Sub, lit(0.0), varidx(2)),
         binop(BinOp::Mul, lit(-1.0), varidx(2)),
-        binop(
-            BinOp::Div,
-            varidx(0),
-            binop(BinOp::Sub, lit(0.0), varidx(3)),
-        ),
+        binop(BinOp::Div, varidx(0), binop(BinOp::Sub, lit(0.0), varidx(3))),
         binop(BinOp::Div, lit(1.0), binop(BinOp::Sub, lit(0.0), varidx(1))),
-        unary(
-            "exp",
-            binop(BinOp::Sub, lit(0.0), binop(BinOp::Mul, lit(0.5), varidx(0))),
-        ),
+        unary("exp", binop(BinOp::Sub, lit(0.0), binop(BinOp::Mul, lit(0.5), varidx(0)))),
     ];
     for e in &exprs {
         bc_vs_ast(e.clone(), &vars, &[], &[], &[]);
@@ -18763,10 +17066,7 @@ fn eval_statements_g_matches_f64_and_fd() {
     // vars: slot0=u (state), slot1=k (param), slot2=tmp (intermediate).
     //   tmp = k·u ;  d/dt(u) = −tmp.
     let stmts = vec![
-        Statement::AssignBc(
-            2,
-            compile_bytecode(&binop(BinOp::Mul, varidx(1), varidx(0))),
-        ),
+        Statement::AssignBc(2, compile_bytecode(&binop(BinOp::Mul, varidx(1), varidx(0)))),
         Statement::DiffEqBc(0, compile_bytecode(&binop(BinOp::Sub, lit(0.0), varidx(2)))),
     ];
 
@@ -18785,11 +17085,8 @@ fn eval_statements_g_matches_f64_and_fd() {
     );
 
     // Seed k (slot 1) as the differentiated variable.
-    let mut vd = vec![
-        Dual2::<1>::constant(2.0),
-        Dual2::<1>::var(0.3, 0),
-        Dual2::<1>::constant(0.0),
-    ];
+    let mut vd =
+        vec![Dual2::<1>::constant(2.0), Dual2::<1>::var(0.3, 0), Dual2::<1>::constant(0.0)];
     let mut dud = vec![Dual2::<1>::constant(0.0)];
     let mut sd: Vec<Dual2<1>> = Vec::new();
     eval_statements_g::<Dual2<1>>(
@@ -18813,22 +17110,10 @@ fn eval_statements_g_matches_f64_and_fd() {
 
 #[test]
 fn bytecode_g_dual2_matches_fd() {
-    bc_g_dual2_fd(
-        &unary("ln", binop(BinOp::Mul, varidx(0), varidx(1))),
-        1.7,
-        0.8,
-        1e-6,
-        1e-3,
-    );
+    bc_g_dual2_fd(&unary("ln", binop(BinOp::Mul, varidx(0), varidx(1))), 1.7, 0.8, 1e-6, 1e-3);
     bc_g_dual2_fd(&power_expr(varidx(0), lit(2.5)), 1.7, 0.8, 1e-6, 1e-3);
     bc_g_dual2_fd(&power_expr(varidx(0), varidx(1)), 1.7, 0.8, 1e-6, 2e-3);
-    bc_g_dual2_fd(
-        &unary("sqrt", binop(BinOp::Add, varidx(0), varidx(1))),
-        1.7,
-        0.8,
-        1e-6,
-        1e-3,
-    );
+    bc_g_dual2_fd(&unary("sqrt", binop(BinOp::Add, varidx(0), varidx(1))), 1.7, 0.8, 1e-6, 1e-3);
     bc_g_dual2_fd(
         &unary("inv_logit", binop(BinOp::Sub, varidx(0), varidx(1))),
         0.6,
@@ -18837,14 +17122,7 @@ fn bytecode_g_dual2_matches_fd() {
         1e-3,
     );
     bc_g_dual2_fd(
-        &unary(
-            "abs",
-            binop(
-                BinOp::Sub,
-                binop(BinOp::Mul, varidx(0), varidx(0)),
-                varidx(1),
-            ),
-        ),
+        &unary("abs", binop(BinOp::Sub, binop(BinOp::Mul, varidx(0), varidx(0)), varidx(1))),
         2.0,
         1.0,
         1e-6,
@@ -18855,14 +17133,7 @@ fn bytecode_g_dual2_matches_fd() {
         &binop(
             BinOp::Mul,
             binop(BinOp::Div, lit(1.0), varidx(1)),
-            unary(
-                "exp",
-                binop(
-                    BinOp::Sub,
-                    lit(0.0),
-                    binop(BinOp::Div, varidx(0), varidx(1)),
-                ),
-            ),
+            unary("exp", binop(BinOp::Sub, lit(0.0), binop(BinOp::Div, varidx(0), varidx(1)))),
         ),
         3.0,
         5.0,
@@ -18899,36 +17170,24 @@ fn pnorm_value_matches_reference_in_both_tails() {
     for (x, want) in reference {
         let got = crate::stats::special::pnorm(x);
         let ast = eval_at(&unary("pnorm", lit(x)), &[], &[], &[], &[]);
-        assert_eq!(
-            got.to_bits(),
-            ast.to_bits(),
-            "x {x}: eval_expr is special::pnorm"
-        );
+        assert_eq!(got.to_bits(), ast.to_bits(), "x {x}: eval_expr is special::pnorm");
         assert!(got.is_finite(), "x {x}: {got}");
         let rel = ((got - want) / want).abs();
         assert!(rel < 1e-12, "x {x}: {got} vs {want} (rel {rel:.2e})");
     }
     // Continuous across the switch at −37: the two sides differ by Φ′/Φ·Δ ≈ 37·Δ.
-    let (lo, hi) = (
-        crate::stats::special::pnorm(-37.0 - 1e-9),
-        crate::stats::special::pnorm(-37.0 + 1e-9),
-    );
+    let (lo, hi) =
+        (crate::stats::special::pnorm(-37.0 - 1e-9), crate::stats::special::pnorm(-37.0 + 1e-9));
     assert!(lo > 0.0 && hi > lo, "{lo} {hi}");
     assert!((hi / lo - 1.0).abs() < 1e-7, "jump at −37: {lo} vs {hi}");
     // Below −37.5: positive, non-increasing to 0, through the subnormals.
-    assert!(
-        crate::stats::special::pnorm(-38.3) > 0.0,
-        "Φ(−38.3) is a subnormal, not 0"
-    );
+    assert!(crate::stats::special::pnorm(-38.3) > 0.0, "Φ(−38.3) is a subnormal, not 0");
     assert!(crate::stats::special::pnorm(-38.3) < f64::MIN_POSITIVE);
     let mut prev = crate::stats::special::pnorm(-36.0);
     for i in 1..=400 {
         let x = -36.0 - 0.01 * i as f64;
         let v = crate::stats::special::pnorm(x);
-        assert!(
-            v.is_finite() && v >= 0.0 && v <= prev,
-            "x {x}: {v} after {prev}"
-        );
+        assert!(v.is_finite() && v >= 0.0 && v <= prev, "x {x}: {v} after {prev}");
         prev = v;
     }
     assert_eq!(crate::stats::special::pnorm(-40.0), 0.0);
@@ -18951,11 +17210,7 @@ fn pnorm_jet_carries_four_exact_orders() {
     let fact = [1.0, 1.0, 2.0, 6.0, 24.0];
     for x in [-37.5, -8.0, -2.2, -0.6, 0.0, 0.3, 1.7, 5.0] {
         let t = pnorm_g(T4::seed(x, 0));
-        assert_eq!(
-            t.c[0].to_bits(),
-            crate::stats::special::pnorm(x).to_bits(),
-            "x {x}"
-        );
+        assert_eq!(t.c[0].to_bits(), crate::stats::special::pnorm(x).to_bits(), "x {x}");
         let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
         let want = [
             crate::stats::special::pnorm(x),
@@ -18987,20 +17242,12 @@ fn pnorm_jet_carries_four_exact_orders() {
             + crate::stats::special::pnorm(x - hh))
             / (hh * hh);
         assert!(fd2.is_finite());
-        assert!(
-            (2.0 * t.c[2] - fd2).abs() < 1e-6,
-            "x {x}: {} vs FD {fd2}",
-            2.0 * t.c[2]
-        );
+        assert!((2.0 * t.c[2] - fd2).abs() < 1e-6, "x {x}: {} vs FD {fd2}", 2.0 * t.c[2]);
     }
     // Review r1 #10: where `φ` is 0 the jet is exactly zero, not `0 · ∞ = NaN` from `x²`
     // overflowing (±1e200) or from `±∞` itself, and the value is still the tail's 0 / 1.
-    for (x, value) in [
-        (1e200, 1.0),
-        (-1e200, 0.0),
-        (f64::INFINITY, 1.0),
-        (f64::NEG_INFINITY, 0.0),
-    ] {
+    for (x, value) in [(1e200, 1.0), (-1e200, 0.0), (f64::INFINITY, 1.0), (f64::NEG_INFINITY, 0.0)]
+    {
         let t = pnorm_g(T4::seed(x, 0));
         assert_eq!(t.c[0], value, "x {x}");
         assert_eq!(t.c[1..], [0.0; 4], "x {x}: {:?}", t.c);
@@ -19017,11 +17264,7 @@ fn bytecode_g_pnorm_dual2_matches_fd_with_eta_in_the_argument() {
     // arg = A·(0.4 + η) − 0.3, with A = vars[0] and η = Eta(0).
     let arg = binop(
         BinOp::Sub,
-        binop(
-            BinOp::Mul,
-            varidx(0),
-            binop(BinOp::Add, lit(0.4), Expression::Eta(0)),
-        ),
+        binop(BinOp::Mul, varidx(0), binop(BinOp::Add, lit(0.4), Expression::Eta(0))),
         lit(0.3),
     );
     let expr = binop(BinOp::Mul, lit(2.0), unary("pnorm", arg));
@@ -19085,10 +17328,7 @@ fn bytecode_g_pnorm_dual2_matches_fd_with_eta_in_the_argument() {
         (d.hess[1][1], hfd_ee, "∂²/∂η²"),
         (d.hess[0][1], hfd_ae, "∂²/∂A∂η"),
     ] {
-        assert!(
-            got.is_finite() && fd.is_finite(),
-            "{what}: {got} vs FD {fd}"
-        );
+        assert!(got.is_finite() && fd.is_finite(), "{what}: {got} vs FD {fd}");
         assert!(close(got, fd, 1e-6, 1e-6), "{what}: {got} vs FD {fd}");
     }
 }
@@ -19109,11 +17349,7 @@ fn bytecode_g_sin_cos_dual2_matches_fd_with_eta_in_the_argument() {
             BinOp::Sub,
             binop(
                 BinOp::Div,
-                binop(
-                    BinOp::Mul,
-                    lit(k * two_pi),
-                    binop(BinOp::Add, lit(7.0), Expression::Eta(0)),
-                ),
+                binop(BinOp::Mul, lit(k * two_pi), binop(BinOp::Add, lit(7.0), Expression::Eta(0))),
                 lit(24.0),
             ),
             lit(phi),
@@ -19144,18 +17380,12 @@ fn bytecode_g_sin_cos_dual2_matches_fd_with_eta_in_the_argument() {
     assert!(close(d.value, v(amp, eta), 1e-13, 1e-13), "value vs f64 VM");
     // Closed forms, so a sign error in a lifted derivative cannot hide in FD noise:
     // ∂/∂A = cos(a₁), ∂/∂η = −A·sin(a₁)·2π/24 + 0.04·cos(a₂)·4π/24.
-    let (a1, a2) = (
-        two_pi * (7.0 + eta) / 24.0 - 0.9,
-        2.0 * two_pi * (7.0 + eta) / 24.0 - 0.5,
-    );
+    let (a1, a2) = (two_pi * (7.0 + eta) / 24.0 - 0.9, 2.0 * two_pi * (7.0 + eta) / 24.0 - 0.5);
     let (c1, c2) = (two_pi / 24.0, 2.0 * two_pi / 24.0);
     let want_g = [a1.cos(), -amp * a1.sin() * c1 + 0.04 * a2.cos() * c2];
     let want_h = [
         [0.0, -a1.sin() * c1],
-        [
-            -a1.sin() * c1,
-            -amp * a1.cos() * c1 * c1 - 0.04 * a2.sin() * c2 * c2,
-        ],
+        [-a1.sin() * c1, -amp * a1.cos() * c1 * c1 - 0.04 * a2.sin() * c2 * c2],
     ];
     for i in 0..2 {
         assert!(
@@ -19190,10 +17420,7 @@ fn bytecode_g_sin_cos_dual2_matches_fd_with_eta_in_the_argument() {
         (d.hess[1][1], hfd_ee, "∂²/∂η²"),
         (d.hess[0][1], hfd_ae, "∂²/∂A∂η"),
     ] {
-        assert!(
-            got.is_finite() && fd.is_finite(),
-            "{what}: {got} vs FD {fd}"
-        );
+        assert!(got.is_finite() && fd.is_finite(), "{what}: {got} vs FD {fd}");
         assert!(close(got, fd, 1e-6, 1e-6), "{what}: {got} vs FD {fd}");
     }
 }
@@ -19208,11 +17435,7 @@ fn compute_max_stack_allows_branching_bytecode() {
     // panicked here under debug-assertions ("bytecode ends at depth 2").
     let expr = cond(cmp(lit(2.0), CmpOp::Lt, lit(3.0)), lit(1.0), lit(-1.0));
     let bc = compile_bytecode(&expr); // would panic pre-fix
-    assert!(
-        bc.max_stack >= 1,
-        "max_stack must be >= 1, got {}",
-        bc.max_stack
-    );
+    assert!(bc.max_stack >= 1, "max_stack must be >= 1, got {}", bc.max_stack);
 
     // The reserved size must actually be sufficient to evaluate correctly:
     // 2 < 3 ⇒ the `then` arm (1.0).
@@ -19233,17 +17456,12 @@ fn compute_max_stack_allows_branching_bytecode() {
     // The jump-free path is unchanged: `1 + 2` pushes two operands before
     // `Add`, so the peak (the returned size) is 2 — and its end-depth of 1
     // still satisfies the (retained) jump-free assertion.
-    assert_eq!(
-        compute_max_stack(&compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops),
-        2
-    );
+    assert_eq!(compute_max_stack(&compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops), 2);
 
     // `bytecode_has_branch` (which gates the assertion) — true for
     // conditional bytecode, false for a jump-free arithmetic expression.
     assert!(bytecode_has_branch(&compile_bytecode(&expr).ops));
-    assert!(!bytecode_has_branch(
-        &compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops
-    ));
+    assert!(!bytecode_has_branch(&compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops));
 
     // `ends_at_expected_depth` — the returnable predicate the `debug_assert!`
     // consumes. Exercised directly (with hard-coded depths) so its branching
@@ -19287,28 +17505,18 @@ fn compute_max_stack_jumpfree_bytecode_ends_at_depth_one() {
         );
         let (peak, end_depth) = scan_stack_depth(&ops);
         // A well-formed expression leaves exactly one result on the stack.
-        assert_eq!(
-            end_depth, 1,
-            "jump-free expr must end at depth 1, got {end_depth}: {ops:?}"
-        );
+        assert_eq!(end_depth, 1, "jump-free expr must end at depth 1, got {end_depth}: {ops:?}");
         // `peak` (the reserved stack size) never under-counts the end depth,
         // and `compute_max_stack` returns exactly `peak.max(1)`.
-        assert!(
-            peak >= end_depth,
-            "peak {peak} < end_depth {end_depth}: {ops:?}"
-        );
+        assert!(peak >= end_depth, "peak {peak} < end_depth {end_depth}: {ops:?}");
         assert_eq!(compute_max_stack(&ops), peak.max(1) as usize);
     }
 
     // Counterpart to the exemption: branchy bytecode genuinely ends ABOVE
     // depth 1 (the linear scan walks both arms), which is exactly why
     // `compute_max_stack` skips the end-depth assert when jumps are present.
-    let cond_ops = compile_bytecode(&cond(
-        cmp(lit(2.0), CmpOp::Lt, lit(3.0)),
-        lit(1.0),
-        lit(-1.0),
-    ))
-    .ops;
+    let cond_ops =
+        compile_bytecode(&cond(cmp(lit(2.0), CmpOp::Lt, lit(3.0)), lit(1.0), lit(-1.0))).ops;
     assert!(bytecode_has_branch(&cond_ops));
     assert!(
         scan_stack_depth(&cond_ops).1 > 1,
@@ -19336,20 +17544,8 @@ fn bytecode_matches_ast_on_arithmetic_and_literals() {
     bc_vs_ast(binop(BinOp::Div, lit(1.0), lit(1e-40)), v, t, e, c);
     bc_vs_ast(binop(BinOp::Div, lit(1.0), lit(0.0)), v, t, e, c);
     // Power
-    bc_vs_ast(
-        Expression::Power(Box::new(lit(2.0)), Box::new(lit(3.0))),
-        v,
-        t,
-        e,
-        c,
-    );
-    bc_vs_ast(
-        Expression::Power(Box::new(lit(4.0)), Box::new(lit(0.5))),
-        v,
-        t,
-        e,
-        c,
-    );
+    bc_vs_ast(Expression::Power(Box::new(lit(2.0)), Box::new(lit(3.0))), v, t, e, c);
+    bc_vs_ast(Expression::Power(Box::new(lit(4.0)), Box::new(lit(0.5))), v, t, e, c);
 }
 
 #[test]
@@ -19395,41 +17591,12 @@ fn bytecode_matches_ast_on_conditional_and_logic() {
     let e = &[];
     let c = &[];
     // Simple compare arms
-    for op in [
-        CmpOp::Lt,
-        CmpOp::Le,
-        CmpOp::Gt,
-        CmpOp::Ge,
-        CmpOp::Eq,
-        CmpOp::Ne,
-    ] {
-        bc_vs_ast(
-            cond(cmp(lit(2.0), op, lit(3.0)), lit(1.0), lit(-1.0)),
-            v,
-            t,
-            e,
-            c,
-        );
-        bc_vs_ast(
-            cond(cmp(lit(3.0), op, lit(3.0)), lit(1.0), lit(-1.0)),
-            v,
-            t,
-            e,
-            c,
-        );
+    for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne] {
+        bc_vs_ast(cond(cmp(lit(2.0), op, lit(3.0)), lit(1.0), lit(-1.0)), v, t, e, c);
+        bc_vs_ast(cond(cmp(lit(3.0), op, lit(3.0)), lit(1.0), lit(-1.0)), v, t, e, c);
     }
     // NaN-comparison sanity (NaN compares as false everywhere)
-    bc_vs_ast(
-        cond(
-            cmp(lit(f64::NAN), CmpOp::Eq, lit(f64::NAN)),
-            lit(1.0),
-            lit(-1.0),
-        ),
-        v,
-        t,
-        e,
-        c,
-    );
+    bc_vs_ast(cond(cmp(lit(f64::NAN), CmpOp::Eq, lit(f64::NAN)), lit(1.0), lit(-1.0)), v, t, e, c);
     // And / Or / Not over compound conditions
     bc_vs_ast(
         cond(
@@ -19460,11 +17627,7 @@ fn bytecode_matches_ast_on_conditional_and_logic() {
         c,
     );
     bc_vs_ast(
-        cond(
-            Condition::Not(Box::new(cmp(lit(1.0), CmpOp::Lt, lit(2.0)))),
-            lit(7.0),
-            lit(0.0),
-        ),
+        cond(Condition::Not(Box::new(cmp(lit(1.0), CmpOp::Lt, lit(2.0)))), lit(7.0), lit(0.0)),
         v,
         t,
         e,
@@ -19473,11 +17636,8 @@ fn bytecode_matches_ast_on_conditional_and_logic() {
     // Nested Conditional — exercises both then- and else-branch bytecode
     // bookkeeping (the compute_max_stack-over-counts case).
     let inner = cond(cmp(lit(1.0), CmpOp::Lt, lit(0.5)), lit(11.0), lit(22.0));
-    let outer = cond(
-        cmp(lit(0.0), CmpOp::Lt, lit(1.0)),
-        inner.clone(),
-        binop(BinOp::Add, lit(1.0), inner),
-    );
+    let outer =
+        cond(cmp(lit(0.0), CmpOp::Lt, lit(1.0)), inner.clone(), binop(BinOp::Add, lit(1.0), inner));
     bc_vs_ast(outer, v, t, e, c);
 }
 
@@ -19491,10 +17651,7 @@ fn bytecode_matches_ast_on_nn_output_fallback() {
     let vars = &[];
     // Valid index
     let ast_ok = eval_expression_indexed(
-        &Expression::NnOutput {
-            nn_idx: 0,
-            output_idx: 1,
-        },
+        &Expression::NnOutput { nn_idx: 0, output_idx: 1 },
         theta,
         eta,
         covs,
@@ -19502,10 +17659,7 @@ fn bytecode_matches_ast_on_nn_output_fallback() {
         &nn_outputs,
     );
     let bc_ok = {
-        let bc = compile_bytecode(&Expression::NnOutput {
-            nn_idx: 0,
-            output_idx: 1,
-        });
+        let bc = compile_bytecode(&Expression::NnOutput { nn_idx: 0, output_idx: 1 });
         let mut stack = Vec::new();
         eval_bytecode(&bc, theta, eta, covs, vars, &nn_outputs, &mut stack)
     };
@@ -19531,12 +17685,7 @@ fn eval_at(expr: &Expression, theta: &[f64], eta: &[f64], vars: &[f64], covs: &[
 /// Caller mutates the point's slot for the axis to compute f(x±h); we
 /// take a vec for each slice and indirect the mutation.
 fn fd_along(
-    expr: &Expression,
-    axis: DiffAxis,
-    theta: &[f64],
-    eta: &[f64],
-    vars: &[f64],
-    covs: &[f64],
+    expr: &Expression, axis: DiffAxis, theta: &[f64], eta: &[f64], vars: &[f64], covs: &[f64],
 ) -> f64 {
     let h = 1e-5;
     let plus = |slot: usize, base: &[f64]| -> Vec<f64> {
@@ -19553,26 +17702,17 @@ fn fd_along(
         DiffAxis::Theta(k) => {
             let tp = plus(k, theta);
             let tm = minus(k, theta);
-            (
-                eval_at(expr, &tp, eta, vars, covs),
-                eval_at(expr, &tm, eta, vars, covs),
-            )
+            (eval_at(expr, &tp, eta, vars, covs), eval_at(expr, &tm, eta, vars, covs))
         }
         DiffAxis::Eta(k) => {
             let ep = plus(k, eta);
             let em = minus(k, eta);
-            (
-                eval_at(expr, theta, &ep, vars, covs),
-                eval_at(expr, theta, &em, vars, covs),
-            )
+            (eval_at(expr, theta, &ep, vars, covs), eval_at(expr, theta, &em, vars, covs))
         }
         DiffAxis::Variable(k) => {
             let vp = plus(k, vars);
             let vm = minus(k, vars);
-            (
-                eval_at(expr, theta, eta, &vp, covs),
-                eval_at(expr, theta, eta, &vm, covs),
-            )
+            (eval_at(expr, theta, eta, &vp, covs), eval_at(expr, theta, eta, &vm, covs))
         }
     };
     (fp - fm) / (2.0 * h)
@@ -19581,12 +17721,7 @@ fn fd_along(
 /// Assert that the symbolic derivative matches central FD to ~FD-noise
 /// tolerance.
 fn assert_diff_matches_fd(
-    expr: Expression,
-    axis: DiffAxis,
-    theta: &[f64],
-    eta: &[f64],
-    vars: &[f64],
-    covs: &[f64],
+    expr: Expression, axis: DiffAxis, theta: &[f64], eta: &[f64], vars: &[f64], covs: &[f64],
 ) {
     let dexpr = differentiate(&expr, axis);
     let sym = eval_at(&dexpr, theta, eta, vars, covs);
@@ -19616,13 +17751,7 @@ fn differentiate_constants_zero_against_every_axis() {
         assert_eq!(eval_at(&d, theta, eta, vars, covs), 0.0);
         let d2 = differentiate(&Expression::CovariateIdx(0), axis);
         assert_eq!(eval_at(&d2, theta, eta, vars, covs), 0.0);
-        let d3 = differentiate(
-            &Expression::NnOutput {
-                nn_idx: 0,
-                output_idx: 0,
-            },
-            axis,
-        );
+        let d3 = differentiate(&Expression::NnOutput { nn_idx: 0, output_idx: 0 }, axis);
         assert_eq!(eval_at(&d3, theta, eta, vars, covs), 0.0);
     }
 }
@@ -19672,12 +17801,7 @@ fn differentiate_arithmetic_matches_fd() {
         ),
         binop(BinOp::Div, Expression::VariableIdx(0), Expression::Theta(0)),
     );
-    for axis in [
-        DiffAxis::Theta(0),
-        DiffAxis::Theta(1),
-        DiffAxis::Eta(0),
-        DiffAxis::Variable(0),
-    ] {
+    for axis in [DiffAxis::Theta(0), DiffAxis::Theta(1), DiffAxis::Eta(0), DiffAxis::Variable(0)] {
         assert_diff_matches_fd(expr.clone(), axis, theta, eta, vars, covs);
     }
 }
@@ -19699,10 +17823,7 @@ fn differentiate_unary_fn_matches_fd() {
     );
     // ln(θ_0 * v_0)
     assert_diff_matches_fd(
-        unary(
-            "ln",
-            binop(BinOp::Mul, Expression::Theta(0), Expression::VariableIdx(0)),
-        ),
+        unary("ln", binop(BinOp::Mul, Expression::Theta(0), Expression::VariableIdx(0))),
         DiffAxis::Theta(0),
         theta,
         eta,
@@ -19710,10 +17831,7 @@ fn differentiate_unary_fn_matches_fd() {
         covs,
     );
     assert_diff_matches_fd(
-        unary(
-            "ln",
-            binop(BinOp::Mul, Expression::Theta(0), Expression::VariableIdx(0)),
-        ),
+        unary("ln", binop(BinOp::Mul, Expression::Theta(0), Expression::VariableIdx(0))),
         DiffAxis::Variable(0),
         theta,
         eta,
@@ -19738,10 +17856,7 @@ fn differentiate_unary_fn_matches_fd() {
     );
     // inv_logit(η_0 + θ_1)
     assert_diff_matches_fd(
-        unary(
-            "inv_logit",
-            binop(BinOp::Add, Expression::Eta(0), Expression::Theta(1)),
-        ),
+        unary("inv_logit", binop(BinOp::Add, Expression::Eta(0), Expression::Theta(1))),
         DiffAxis::Eta(0),
         theta,
         eta,
@@ -19749,10 +17864,7 @@ fn differentiate_unary_fn_matches_fd() {
         covs,
     );
     assert_diff_matches_fd(
-        unary(
-            "expit",
-            binop(BinOp::Add, Expression::Eta(0), Expression::Theta(1)),
-        ),
+        unary("expit", binop(BinOp::Add, Expression::Eta(0), Expression::Theta(1))),
         DiffAxis::Theta(1),
         theta,
         eta,
@@ -19808,13 +17920,7 @@ fn differentiate_floor_ceil_round_is_zero_away_from_a_step() {
         let v = eval_at(&expr, theta, eta, vars, covs);
         assert_eq!(v, want, "`{name}(6.9)` must round to {want}, got {v}");
         assert_eq!(
-            eval_at(
-                &differentiate(&expr, DiffAxis::Theta(0)),
-                theta,
-                eta,
-                vars,
-                covs
-            ),
+            eval_at(&differentiate(&expr, DiffAxis::Theta(0)), theta, eta, vars, covs),
             0.0,
             "d/dθ₀ {name}(3·θ₀) must be 0, not the argument's derivative (3)"
         );
@@ -19838,38 +17944,15 @@ fn differentiate_mod_matches_fd_in_both_operands() {
     let covs = &[];
     let expr = binop(BinOp::Mod, Expression::Theta(0), Expression::Theta(1));
     // (a, b, q = div_euclid(a, b)): q = 0, positive and negative q, negative b.
-    for (a, b, q) in [
-        (1.3, 2.5, 0.0),
-        (7.1, 2.5, 2.0),
-        (-3.4, 2.5, -2.0),
-        (7.1, -2.5, -2.0),
-        (-3.4, -2.5, 2.0),
-    ] {
+    for (a, b, q) in
+        [(1.3, 2.5, 0.0), (7.1, 2.5, 2.0), (-3.4, 2.5, -2.0), (7.1, -2.5, -2.0), (-3.4, -2.5, 2.0)]
+    {
         let theta = &[a, b];
         assert_eq!(f64::div_euclid(a, b), q, "fixture q for ({a}, {b})");
-        let d_a = eval_at(
-            &differentiate(&expr, DiffAxis::Theta(0)),
-            theta,
-            eta,
-            vars,
-            covs,
-        );
-        let d_b = eval_at(
-            &differentiate(&expr, DiffAxis::Theta(1)),
-            theta,
-            eta,
-            vars,
-            covs,
-        );
-        assert!(
-            (d_a - 1.0).abs() < 1e-12,
-            "∂/∂a ({a} mod {b}) = {d_a}, want 1"
-        );
-        assert!(
-            (d_b + q).abs() < 1e-12,
-            "∂/∂b ({a} mod {b}) = {d_b}, want {}",
-            -q
-        );
+        let d_a = eval_at(&differentiate(&expr, DiffAxis::Theta(0)), theta, eta, vars, covs);
+        let d_b = eval_at(&differentiate(&expr, DiffAxis::Theta(1)), theta, eta, vars, covs);
+        assert!((d_a - 1.0).abs() < 1e-12, "∂/∂a ({a} mod {b}) = {d_a}, want 1");
+        assert!((d_b + q).abs() < 1e-12, "∂/∂b ({a} mod {b}) = {d_b}, want {}", -q);
         assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(0), theta, eta, vars, covs);
         assert_diff_matches_fd(expr.clone(), DiffAxis::Theta(1), theta, eta, vars, covs);
     }
@@ -19877,34 +17960,18 @@ fn differentiate_mod_matches_fd_in_both_operands() {
     // (the `b' = 0` short arm), equal to `η` on `[-5, 5)`.
     let wrapped = binop(
         BinOp::Sub,
-        binop(
-            BinOp::Mod,
-            binop(BinOp::Add, Expression::Eta(0), lit(5.0)),
-            lit(10.0),
-        ),
+        binop(BinOp::Mod, binop(BinOp::Add, Expression::Eta(0), lit(5.0)), lit(10.0)),
         lit(5.0),
     );
     for eta0 in [-0.7, 0.3, 12.4] {
-        let d = eval_at(
-            &differentiate(&wrapped, DiffAxis::Eta(0)),
-            &[],
-            &[eta0],
-            vars,
-            covs,
-        );
+        let d = eval_at(&differentiate(&wrapped, DiffAxis::Eta(0)), &[], &[eta0], vars, covs);
         assert_eq!(d, 1.0, "d/dη ((η + 5) mod 10 − 5) at η = {eta0}");
         assert_diff_matches_fd(wrapped.clone(), DiffAxis::Eta(0), &[], &[eta0], vars, covs);
     }
     // A zero divisor: the VM returns the constant `0`, so the derivative is `0`,
     // through a literal divisor and through a θ one.
     let zero_lit = binop(BinOp::Mod, Expression::Theta(0), lit(0.0));
-    let d = eval_at(
-        &differentiate(&zero_lit, DiffAxis::Theta(0)),
-        &[1.3],
-        eta,
-        vars,
-        covs,
-    );
+    let d = eval_at(&differentiate(&zero_lit, DiffAxis::Theta(0)), &[1.3], eta, vars, covs);
     assert_eq!(d, 0.0, "∂/∂a (a mod 0)");
     for axis in [DiffAxis::Theta(0), DiffAxis::Theta(1)] {
         let d = eval_at(&differentiate(&expr, axis), &[1.3, 0.0], eta, vars, covs);
@@ -19964,11 +18031,7 @@ fn differentiate_conditional_picks_taken_branch() {
     let vars = &[];
     let covs = &[];
     let expr = Expression::Conditional(
-        Box::new(Condition::Compare(
-            Expression::Theta(0),
-            CmpOp::Gt,
-            lit(0.0),
-        )),
+        Box::new(Condition::Compare(Expression::Theta(0), CmpOp::Gt, lit(0.0))),
         Box::new(binop(BinOp::Mul, lit(2.0), Expression::Theta(0))),
         Box::new(binop(BinOp::Mul, lit(3.0), Expression::Theta(0))),
     );
@@ -20012,11 +18075,7 @@ fn differentiate_emax_pkpd_readout_matches_fd() {
 #[test]
 fn simplify_collapses_zero_and_one() {
     // 0 + (1 * x) → x
-    let raw = binop(
-        BinOp::Add,
-        lit(0.0),
-        binop(BinOp::Mul, lit(1.0), Expression::Theta(0)),
-    );
+    let raw = binop(BinOp::Add, lit(0.0), binop(BinOp::Mul, lit(1.0), Expression::Theta(0)));
     let simp = simplify_expr(&raw);
     assert!(matches!(simp, Expression::Theta(0)));
     // x * 0 → 0
@@ -20044,11 +18103,7 @@ fn simplify_collapses_zero_and_one() {
 /// values fill their slots and every earlier row's partial along `axis` fills
 /// its tangent slot, in declaration order, before row `row` is read.
 fn eval_partial(
-    partials: &IndivParamPartials,
-    row: usize,
-    axis: DiffAxis,
-    theta: &[f64],
-    eta: &[f64],
+    partials: &IndivParamPartials, row: usize, axis: DiffAxis, theta: &[f64], eta: &[f64],
     cov: &HashMap<String, f64>,
 ) -> f64 {
     eval_partials_along(partials, axis, theta, eta, cov)[row]
@@ -20057,10 +18112,7 @@ fn eval_partial(
 /// Every row's partial along `axis`, by running the derivative program
 /// (`eval_partial`).
 fn eval_partials_along(
-    partials: &IndivParamPartials,
-    axis: DiffAxis,
-    theta: &[f64],
-    eta: &[f64],
+    partials: &IndivParamPartials, axis: DiffAxis, theta: &[f64], eta: &[f64],
     cov: &HashMap<String, f64>,
 ) -> Vec<f64> {
     // Build a deterministic cov ordering matching the partial's
@@ -20096,11 +18148,7 @@ fn eval_partials_along(
 
 /// Central-FD reference for ∂(pk_param_fn output at slot i)/∂θ_k.
 fn fd_d_theta(
-    model: &crate::types::CompiledModel,
-    i: usize,
-    k: usize,
-    theta: &[f64],
-    eta: &[f64],
+    model: &crate::types::CompiledModel, i: usize, k: usize, theta: &[f64], eta: &[f64],
     cov: &HashMap<String, f64>,
 ) -> f64 {
     let h = 1e-5 * theta[k].abs().max(1.0);
@@ -20116,11 +18164,7 @@ fn fd_d_theta(
 
 /// Central-FD reference for ∂(pk_param_fn output at slot i)/∂η_k.
 fn fd_d_eta(
-    model: &crate::types::CompiledModel,
-    i: usize,
-    k: usize,
-    theta: &[f64],
-    eta: &[f64],
+    model: &crate::types::CompiledModel, i: usize, k: usize, theta: &[f64], eta: &[f64],
     cov: &HashMap<String, f64>,
 ) -> f64 {
     let h = 1e-5_f64.max(eta[k].abs() * 1e-5);
@@ -20235,22 +18279,12 @@ fn indiv_partials_zero_for_cross_axis() {
     // Cross-η partials (indiv i, η k ≠ i).
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
         let v = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
-        assert!(
-            v.abs() < 1e-12,
-            "∂{}/∂η_{} should be 0, got {v}",
-            partials.names[i],
-            k
-        );
+        assert!(v.abs() < 1e-12, "∂{}/∂η_{} should be 0, got {v}", partials.names[i], k);
     }
     // Cross-θ partials.
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
         let v = eval_partial(partials, i, DiffAxis::Theta(k), theta, eta, &cov);
-        assert!(
-            v.abs() < 1e-12,
-            "∂{}/∂θ_{} should be 0, got {v}",
-            partials.names[i],
-            k
-        );
+        assert!(v.abs() < 1e-12, "∂{}/∂θ_{} should be 0, got {v}", partials.names[i], k);
     }
 }
 
@@ -20425,17 +18459,9 @@ fn test_unused_theta_warns() {
         "PROP",
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let warns: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("UNUSED"))
-        .collect();
-    assert_eq!(
-        warns.len(),
-        1,
-        "expected exactly one warning for UNUSED theta"
-    );
+    let warns: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("UNUSED")).collect();
+    assert_eq!(warns.len(), 1, "expected exactly one warning for UNUSED theta");
     assert!(warns[0].contains("theta"), "warning should mention 'theta'");
 }
 
@@ -20447,17 +18473,9 @@ fn test_unused_omega_warns() {
         "PROP",
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let warns: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("ETA_UNUSED"))
-        .collect();
-    assert_eq!(
-        warns.len(),
-        1,
-        "expected exactly one warning for ETA_UNUSED omega"
-    );
+    let warns: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("ETA_UNUSED")).collect();
+    assert_eq!(warns.len(), 1, "expected exactly one warning for ETA_UNUSED omega");
     assert!(warns[0].contains("omega"), "warning should mention 'omega'");
 }
 
@@ -20469,17 +18487,9 @@ fn test_unused_sigma_warns() {
         "PROP",
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let warns: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("ADD_UNUSED"))
-        .collect();
-    assert_eq!(
-        warns.len(),
-        1,
-        "expected exactly one warning for ADD_UNUSED sigma"
-    );
+    let warns: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("ADD_UNUSED")).collect();
+    assert_eq!(warns.len(), 1, "expected exactly one warning for ADD_UNUSED sigma");
     assert!(warns[0].contains("sigma"), "warning should mention 'sigma'");
 }
 
@@ -20492,12 +18502,8 @@ fn test_commented_out_usage_warns() {
         "PROP",
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let warns: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("ETA_CL"))
-        .collect();
+    let warns: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("ETA_CL")).collect();
     assert_eq!(warns.len(), 1, "ETA_CL not used → should warn");
 }
 
@@ -20509,12 +18515,8 @@ fn test_multiple_unused_all_reported() {
             "PROP",
         );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let unused: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("UNUSED"))
-        .collect();
+    let unused: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("UNUSED")).collect();
     assert_eq!(
         unused.len(),
         3,
@@ -20552,18 +18554,9 @@ fn test_unused_kappa_warns() {
 "#
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let warns: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("KAPPA_CL"))
-        .collect();
-    assert_eq!(
-        warns.len(),
-        1,
-        "expected one warning for unused KAPPA_CL; got: {:?}",
-        warns
-    );
+    let warns: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("KAPPA_CL")).collect();
+    assert_eq!(warns.len(), 1, "expected one warning for unused KAPPA_CL; got: {:?}", warns);
     assert!(warns[0].contains("kappa"), "warning should mention 'kappa'");
 }
 
@@ -20690,26 +18683,13 @@ fn test_block_omega_one_unused_warns() {
 "#
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    let warns: Vec<_> = parsed
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| w.contains("ETA_V"))
-        .collect();
-    assert_eq!(
-        warns.len(),
-        1,
-        "ETA_V unused in block_omega should warn; got: {:?}",
-        warns
-    );
+    let warns: Vec<_> =
+        parsed.model.parse_warnings.iter().filter(|w| w.contains("ETA_V")).collect();
+    assert_eq!(warns.len(), 1, "ETA_V unused in block_omega should warn; got: {:?}", warns);
     assert!(warns[0].contains("omega"), "warning should mention 'omega'");
     // ETA_CL IS used — must not appear in warnings
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("ETA_CL")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("ETA_CL")),
         "ETA_CL is used and must not warn"
     );
 }
@@ -20799,10 +18779,7 @@ fn parse_derived_per_row() {
     let parsed = parse_full_model(&src).expect("parse ok");
     assert_eq!(parsed.model.derived_exprs.len(), 1);
     assert_eq!(parsed.model.derived_exprs[0].name, "KE");
-    assert!(matches!(
-        parsed.model.derived_exprs[0].kind,
-        DerivedKind::PerRow { .. }
-    ));
+    assert!(matches!(parsed.model.derived_exprs[0].kind, DerivedKind::PerRow { .. }));
 
     // Evaluate the closure
     let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
@@ -20937,10 +18914,7 @@ fn parse_derived_aggregate_rejects_a_third_argument() {
 fn parse_derived_aggregate_filter_still_parses() {
     let src = minimal_model_with_derived("CMAX = max(IPRED, TIME > 0)");
     let parsed = parse_full_model(&src).expect("aggregate with a row filter parses");
-    assert!(matches!(
-        parsed.model.derived_exprs[0].kind,
-        DerivedKind::Aggregate { .. }
-    ));
+    assert!(matches!(parsed.model.derived_exprs[0].kind, DerivedKind::Aggregate { .. }));
 }
 
 /// Trailing tokens after a row aggregate's `)` used to be dropped in silence, so
@@ -21009,10 +18983,7 @@ fn parse_derived_sequential_reference() {
         };
         let t_half = eval(&ctx);
         let expected = 0.693 / 0.1;
-        assert!(
-            (t_half - expected).abs() < 1e-8,
-            "T_HALF = 0.693/KE = {expected}, got {t_half}"
-        );
+        assert!((t_half - expected).abs() < 1e-8, "T_HALF = 0.693/KE = {expected}, got {t_half}");
     } else {
         panic!("expected PerRow for T_HALF");
     }
@@ -21024,11 +18995,7 @@ fn parse_derived_max_with_filter() {
     let parsed = parse_full_model(&src).expect("parse ok");
     assert!(matches!(
         parsed.model.derived_exprs[0].kind,
-        DerivedKind::Aggregate {
-            func: AggFunction::Max,
-            filter: Some(_),
-            ..
-        }
+        DerivedKind::Aggregate { func: AggFunction::Max, filter: Some(_), .. }
     ));
 }
 
@@ -21038,11 +19005,7 @@ fn parse_derived_min_no_filter() {
     let parsed = parse_full_model(&src).expect("parse ok");
     assert!(matches!(
         parsed.model.derived_exprs[0].kind,
-        DerivedKind::Aggregate {
-            func: AggFunction::Min,
-            filter: None,
-            ..
-        }
+        DerivedKind::Aggregate { func: AggFunction::Min, filter: None, .. }
     ));
 }
 
@@ -21052,11 +19015,7 @@ fn parse_derived_tmax() {
     let parsed = parse_full_model(&src).expect("parse ok");
     assert!(matches!(
         parsed.model.derived_exprs[0].kind,
-        DerivedKind::Aggregate {
-            func: AggFunction::Tmax,
-            filter: None,
-            ..
-        }
+        DerivedKind::Aggregate { func: AggFunction::Tmax, filter: None, .. }
     ));
 }
 
@@ -21086,11 +19045,8 @@ fn parse_derived_integral_explicit() {
 fn parse_derived_integral_dv() {
     let src = minimal_model_with_derived("AUC_DV = integral(DV, from=0, to=24)");
     let parsed = parse_full_model(&src).expect("parse ok");
-    if let DerivedKind::Integral {
-        data_based,
-        step: IntegralStep::ObsTimes,
-        ..
-    } = &parsed.model.derived_exprs[0].kind
+    if let DerivedKind::Integral { data_based, step: IntegralStep::ObsTimes, .. } =
+        &parsed.model.derived_exprs[0].kind
     {
         assert!(*data_based, "DV is data_based");
     } else {
@@ -21102,10 +19058,8 @@ fn parse_derived_integral_dv() {
 fn parse_derived_integral_periodic() {
     let src = minimal_model_with_derived("AUC_TAU = integral(IPRED, window=24, anchor=0)");
     let parsed = parse_full_model(&src).expect("parse ok");
-    if let DerivedKind::Integral {
-        window: IntegralWindow::Periodic { period, anchor },
-        ..
-    } = &parsed.model.derived_exprs[0].kind
+    if let DerivedKind::Integral { window: IntegralWindow::Periodic { period, anchor }, .. } =
+        &parsed.model.derived_exprs[0].kind
     {
         assert!((period - 24.0).abs() < 1e-10);
         assert!((anchor - 0.0).abs() < 1e-10);
@@ -21119,10 +19073,7 @@ fn parse_derived_name_conflict_error() {
     // IPRED is a built-in sdtab column — should error
     let src = minimal_model_with_derived("IPRED = CL / V");
     let result = parse_full_model(&src);
-    assert!(
-        result.is_err(),
-        "expected parse error for IPRED name conflict"
-    );
+    assert!(result.is_err(), "expected parse error for IPRED name conflict");
     let msg = match result {
         Err(e) => e,
         Ok(_) => panic!("expected Err"),
@@ -21143,11 +19094,7 @@ CL V KA WT
         minimal_model_with_derived("")
     );
     let parsed = parse_full_model(&src).expect("parse ok");
-    assert_eq!(
-        parsed.model.output_columns,
-        vec!["CL", "V", "KA", "WT"],
-        "output_columns mismatch"
-    );
+    assert_eq!(parsed.model.output_columns, vec!["CL", "V", "KA", "WT"], "output_columns mismatch");
 }
 
 #[test]
@@ -21215,11 +19162,7 @@ fn mod_operator_euclidean() {
 
 #[test]
 fn floor_ceil_round_functions() {
-    let tests = [
-        ("floor(-2.3)", -3.0),
-        ("ceil(-2.3)", -2.0),
-        ("round(2.5)", 3.0),
-    ];
+    let tests = [("floor(-2.3)", -3.0), ("ceil(-2.3)", -2.0), ("round(2.5)", 3.0)];
     for (expr_str, expected) in &tests {
         let src = minimal_model_with_derived(&format!("VAL = {expr_str}"));
         let parsed = parse_full_model(&src).expect("parse ok");
@@ -21311,12 +19254,7 @@ fn ode_compartment_indexed_dose_attrs_populate_map() {
   DV ~ proportional(PROP)
 "#;
     let parsed = parse_full_model(src).expect("parse ok");
-    let map = &parsed
-        .model
-        .ode_spec
-        .as_ref()
-        .expect("ode spec")
-        .dose_attr_map;
+    let map = &parsed.model.ode_spec.as_ref().expect("ode spec").dose_attr_map;
     assert!(
         map.indexed_slot(crate::types::DoseAttr::F, 2).is_some(),
         "F2 must map for compartment 2"
@@ -21360,9 +19298,7 @@ fn ode_dose_attr_compartment_out_of_range_errors() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let err = parse_full_model(src)
-        .err()
-        .expect("F3 with 2 compartments must error");
+    let err = parse_full_model(src).err().expect("F3 with 2 compartments must error");
     assert!(
         err.contains("compartment 3") && err.contains("F3"),
         "error must name the attribute and compartment, got: {err}"
@@ -21399,21 +19335,13 @@ fn ode_modeled_duration_param_populates_map() {
   DV ~ proportional(PROP)
 "#;
     let parsed = parse_full_model(src).expect("D2 parses (engine-applied, not dead)");
-    let map = &parsed
-        .model
-        .ode_spec
-        .as_ref()
-        .expect("ode spec")
-        .dose_attr_map;
+    let map = &parsed.model.ode_spec.as_ref().expect("ode spec").dose_attr_map;
     assert!(
-        map.indexed_slot(crate::types::DoseAttr::Duration, 2)
-            .is_some(),
+        map.indexed_slot(crate::types::DoseAttr::Duration, 2).is_some(),
         "D2 must map as modeled duration for compartment 2"
     );
     // It bound nothing else (no D1, no F2).
-    assert!(map
-        .indexed_slot(crate::types::DoseAttr::Duration, 1)
-        .is_none());
+    assert!(map.indexed_slot(crate::types::DoseAttr::Duration, 1).is_none());
     assert!(map.indexed_slot(crate::types::DoseAttr::F, 2).is_none());
 }
 
@@ -21445,9 +19373,7 @@ fn ode_modeled_duration_out_of_range_compartment_errors() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let err = parse_full_model(src)
-        .err()
-        .expect("D5 on a 2-state model must error");
+    let err = parse_full_model(src).err().expect("D5 on a 2-state model must error");
     assert!(
         err.contains("compartment 5") && err.contains("D5"),
         "error must name the attribute and compartment, got: {err}"
@@ -21480,10 +19406,7 @@ fn analytical_modeled_duration_param_populates_map() {
   DV ~ proportional(PROP)
 "#;
     let parsed = parse_full_model(src).expect("D1 parses on analytical model");
-    assert!(
-        parsed.model.ode_spec.is_none(),
-        "model must be analytical (no ode_spec)"
-    );
+    assert!(parsed.model.ode_spec.is_none(), "model must be analytical (no ode_spec)");
     let slot = parsed
         .model
         .dose_attr_map
@@ -21498,11 +19421,7 @@ fn analytical_modeled_duration_param_populates_map() {
         crate::types::MAX_PK_PARAMS
     );
     // Nothing else bound.
-    assert!(parsed
-        .model
-        .dose_attr_map
-        .indexed_slot(crate::types::DoseAttr::Duration, 2)
-        .is_none());
+    assert!(parsed.model.dose_attr_map.indexed_slot(crate::types::DoseAttr::Duration, 2).is_none());
 }
 
 #[test]
@@ -21529,9 +19448,8 @@ fn analytical_modeled_duration_out_of_range_compartment_errors() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let err = parse_full_model(src)
-        .err()
-        .expect("D2 on a 1-compartment analytical model must error");
+    let err =
+        parse_full_model(src).err().expect("D2 on a 1-compartment analytical model must error");
     assert!(
         err.contains("compartment 2") && err.contains("D2"),
         "error must name the attribute and compartment, got: {err}"
@@ -21567,10 +19485,7 @@ fn analytical_modeled_duration_into_oral_depot_parses() {
   DV ~ proportional(PROP)
 "#;
     let parsed = parse_full_model(src).expect("D1 into the oral depot must parse (#400)");
-    assert!(
-        parsed.model.ode_spec.is_none(),
-        "model must stay analytical (no ode_spec)"
-    );
+    assert!(parsed.model.ode_spec.is_none(), "model must stay analytical (no ode_spec)");
     parsed
         .model
         .dose_attr_map
@@ -21642,9 +19557,7 @@ fn analytical_modeled_duration_beyond_oral_state_count_is_rejected() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let err = parse_full_model(src)
-        .err()
-        .expect("D4 on a 3-state oral model must error");
+    let err = parse_full_model(src).err().expect("D4 on a 3-state oral model must error");
     assert!(
         err.contains("compartment 4") && err.contains("D4"),
         "error should name the offending slot: {err}"
@@ -21691,12 +19604,10 @@ fn analytical_indexed_f_and_alag_unmapped_are_rejected() {
     // case is accepted — see `analytical_indexed_f_and_alag_mapped_are_accepted`.)
 
     // Unmapped `F1`.
-    let err = parse_full_model(&indexed_attr_model(
-        "F1 = TVATTR",
-        "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
-    ))
-    .err()
-    .expect("unmapped F1 on an analytical oral model must error, not be silently ignored");
+    let err =
+        parse_full_model(&indexed_attr_model("F1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA)"))
+            .err()
+            .expect("unmapped F1 on an analytical oral model must error, not be silently ignored");
     assert!(
         err.contains("F1")
             && err.contains("reads as a per-compartment")
@@ -21738,12 +19649,10 @@ fn analytical_indexed_f_and_alag_unmapped_are_rejected() {
 
     // A higher index (`F2` — a compartment the 1-cpt model doesn't even have)
     // is rejected the same way: an unmapped per-compartment F with no effect.
-    let err = parse_full_model(&indexed_attr_model(
-        "F2 = TVATTR",
-        "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
-    ))
-    .err()
-    .expect("unmapped F2 on an analytical oral model must error");
+    let err =
+        parse_full_model(&indexed_attr_model("F2 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA)"))
+            .err()
+            .expect("unmapped F2 on an analytical oral model must error");
     assert!(
         err.contains("F2") && err.contains("bioavailability"),
         "F2 must be rejected and named: {err}"
@@ -21761,19 +19670,10 @@ fn analytical_indexed_f_and_alag_mapped_are_accepted() {
     // previously-working, numerically-correct models.
     for (indiv, pk) in [
         ("F1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F1)"),
-        (
-            "ALAG1 = TVATTR",
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG1)",
-        ),
+        ("ALAG1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG1)"),
         // `alag=` alias for the mapping key, and the `LAGTIME{n}` param spelling.
-        (
-            "ALAG1 = TVATTR",
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=ALAG1)",
-        ),
-        (
-            "LAGTIME1 = TVATTR",
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME1)",
-        ),
+        ("ALAG1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=ALAG1)"),
+        ("LAGTIME1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME1)"),
     ] {
         let res = parse_full_model(&indexed_attr_model(indiv, pk));
         assert!(
@@ -21810,10 +19710,7 @@ fn analytical_modeled_rate_param_populates_map() {
   DV ~ proportional(PROP)
 "#;
     let parsed = parse_full_model(src).expect("R1 parses on analytical model");
-    assert!(
-        parsed.model.ode_spec.is_none(),
-        "model must be analytical (no ode_spec)"
-    );
+    assert!(parsed.model.ode_spec.is_none(), "model must be analytical (no ode_spec)");
     let slot = parsed
         .model
         .dose_attr_map
@@ -21826,11 +19723,7 @@ fn analytical_modeled_rate_param_populates_map() {
         crate::types::MAX_PK_PARAMS
     );
     // It is a Rate, not a Duration.
-    assert!(parsed
-        .model
-        .dose_attr_map
-        .indexed_slot(crate::types::DoseAttr::Duration, 1)
-        .is_none());
+    assert!(parsed.model.dose_attr_map.indexed_slot(crate::types::DoseAttr::Duration, 1).is_none());
 }
 
 #[test]
@@ -21857,9 +19750,8 @@ fn analytical_modeled_rate_out_of_range_compartment_errors() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let err = parse_full_model(src)
-        .err()
-        .expect("R2 on a 1-compartment analytical model must error");
+    let err =
+        parse_full_model(src).err().expect("R2 on a 1-compartment analytical model must error");
     assert!(
         err.contains("compartment 2")
             && err.contains("R2")
@@ -21897,11 +19789,7 @@ fn ode_modeled_rate_param_populates_map() {
   DV ~ proportional(PROP)
 "#;
     let parsed = parse_full_model(src).expect("R1 parses on ODE model");
-    let ode = parsed
-        .model
-        .ode_spec
-        .as_ref()
-        .expect("model must be an ODE model");
+    let ode = parsed.model.ode_spec.as_ref().expect("model must be an ODE model");
     ode.dose_attr_map
         .indexed_slot(crate::types::DoseAttr::Rate, 1)
         .expect("R1 must map as modeled rate for compartment 1 in the ode_spec");
@@ -21936,11 +19824,7 @@ fn analytical_modeled_dose_param_not_flagged_as_dead() {
 "#;
     let parsed = parse_full_model(rate_src).expect("R1 parses");
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("never used") && w.contains("R1")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("never used") && w.contains("R1")),
         "analytical R1 must not be flagged as dead: {:?}",
         parsed.model.parse_warnings
     );
@@ -21949,11 +19833,7 @@ fn analytical_modeled_dose_param_not_flagged_as_dead() {
     let dur_src = rate_src.replace("TVR1", "TVD1").replace("R1 =", "D1 =");
     let parsed = parse_full_model(&dur_src).expect("D1 parses");
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("never used") && w.contains("D1")),
+        !parsed.model.parse_warnings.iter().any(|w| w.contains("never used") && w.contains("D1")),
         "analytical D1 must not be flagged as dead: {:?}",
         parsed.model.parse_warnings
     );
@@ -21965,11 +19845,7 @@ fn analytical_modeled_dose_param_not_flagged_as_dead() {
     let dead_src = rate_src.replace("  R1 = TVR1\n", "  R1 = TVR1\n  JUNK = TVCL * 2.0\n");
     let parsed = parse_full_model(&dead_src).expect("parses");
     assert!(
-        parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("never used") && w.contains("JUNK")),
+        parsed.model.parse_warnings.iter().any(|w| w.contains("never used") && w.contains("JUNK")),
         "a genuinely unused analytical param must still be flagged: {:?}",
         parsed.model.parse_warnings
     );
@@ -22004,11 +19880,7 @@ fn derived_resolves_covariate_case_insensitively() {
             compartments: &[],
             compartment_names: &[],
         };
-        assert_eq!(
-            eval(&ctx),
-            140.0,
-            "lowercase `wt` must resolve to covariate header `WT` (=70)"
-        );
+        assert_eq!(eval(&ctx), 140.0, "lowercase `wt` must resolve to covariate header `WT` (=70)");
     } else {
         panic!("expected PerRow derived kind");
     }
@@ -22034,10 +19906,7 @@ fn test_apply_fit_option_frem_predictions() {
 #[test]
 fn test_apply_fit_option_frem_sigma() {
     let mut opts = FitOptions::default();
-    assert_eq!(
-        apply_fit_option(&mut opts, "frem_sigma", "EPSCOV"),
-        Ok(true)
-    );
+    assert_eq!(apply_fit_option(&mut opts, "frem_sigma", "EPSCOV"), Ok(true));
     assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
 }
 
@@ -22070,9 +19939,8 @@ fn cov_static_fold_fixture() -> (CompiledModel, Vec<f64>, Vec<f64>, HashMap<Stri
     let model = parse_model_string(COV_STATIC_FOLD_MODEL).expect("model compiles");
     let theta = vec![5.0, 2.0];
     let eta = vec![0.3_f64];
-    let cov: HashMap<String, f64> = [("WT".to_string(), 70.0), ("AGE".to_string(), 5.0)]
-        .into_iter()
-        .collect();
+    let cov: HashMap<String, f64> =
+        [("WT".to_string(), 70.0), ("AGE".to_string(), 5.0)].into_iter().collect();
     (model, theta, eta, cov)
 }
 
@@ -22085,10 +19953,7 @@ fn cov_static_mask_classifies_kernel_and_dynamic_tail() {
         .as_ref()
         .expect("indiv param program present");
     // Some slots fold (the covariate/FIXED-θ kernel) …
-    assert!(
-        prog.cov_static_mask.iter().any(|&b| b),
-        "expected some cov-static slots"
-    );
+    assert!(prog.cov_static_mask.iter().any(|&b| b), "expected some cov-static slots");
     // … and at least one does not (the free-θ × exp(η) CL slot).
     assert!(
         prog.cov_static_mask.iter().any(|&b| !b),
@@ -22106,38 +19971,22 @@ fn cov_static_classifier_helpers_cover_all_arms() {
     let dv = [true, false];
 
     // ── bytecode_is_dynamic ──
-    let bc = |ops: Vec<Op>| Bytecode {
-        ops,
-        constants: vec![0.0],
-        max_stack: 2,
-        gathers: Vec::new(),
-    };
+    let bc =
+        |ops: Vec<Op>| Bytecode { ops, constants: vec![0.0], max_stack: 2, gathers: Vec::new() };
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushEta(0)]), &dv));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushTheta(0)]), &dv));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushNnOutput(0, 0)]), &dv));
     // #1628: a gather reads θ, even though its own index is a covariate.
-    assert!(bytecode_is_dynamic(
-        &bc(vec![Op::PushCov(0), Op::PushThetaGather(0)]),
-        &dv
-    ));
+    assert!(bytecode_is_dynamic(&bc(vec![Op::PushCov(0), Op::PushThetaGather(0)]), &dv));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushVar(0)]), &dv)); // slot 0 dynamic
     assert!(!bytecode_is_dynamic(&bc(vec![Op::PushVar(1)]), &dv)); // slot 1 static
-    assert!(!bytecode_is_dynamic(
-        &bc(vec![Op::PushCov(0), Op::PushConst(0), Op::Add]),
-        &dv
-    ));
+    assert!(!bytecode_is_dynamic(&bc(vec![Op::PushCov(0), Op::PushConst(0), Op::Add]), &dv));
 
     // ── expr_is_dynamic ──
     let lit = || Expression::Literal(1.0);
     assert!(expr_is_dynamic(&Expression::Eta(0), &dv));
     assert!(expr_is_dynamic(&Expression::Theta(0), &dv));
-    assert!(expr_is_dynamic(
-        &Expression::NnOutput {
-            nn_idx: 0,
-            output_idx: 0
-        },
-        &dv
-    ));
+    assert!(expr_is_dynamic(&Expression::NnOutput { nn_idx: 0, output_idx: 0 }, &dv));
     assert!(expr_is_dynamic(&Expression::Variable("x".into()), &dv));
     assert!(expr_is_dynamic(&Expression::VariableIdx(0), &dv)); // dynamic slot
     assert!(!expr_is_dynamic(&Expression::VariableIdx(1), &dv)); // static slot
@@ -22150,21 +19999,12 @@ fn cov_static_classifier_helpers_cover_all_arms() {
         &dv
     ));
     assert!(!expr_is_dynamic(
-        &Expression::Power(
-            Box::new(Expression::Covariate("WT".into())),
-            Box::new(lit())
-        ),
+        &Expression::Power(Box::new(Expression::Covariate("WT".into())), Box::new(lit())),
         &dv
     ));
     // UnaryFn recurses into its argument.
-    assert!(expr_is_dynamic(
-        &Expression::UnaryFn("exp".into(), Box::new(Expression::Eta(0))),
-        &dv
-    ));
-    assert!(!expr_is_dynamic(
-        &Expression::UnaryFn("log".into(), Box::new(lit())),
-        &dv
-    ));
+    assert!(expr_is_dynamic(&Expression::UnaryFn("exp".into(), Box::new(Expression::Eta(0))), &dv));
+    assert!(!expr_is_dynamic(&Expression::UnaryFn("log".into(), Box::new(lit())), &dv));
 
     // ── cond_is_dynamic ──
     let static_cmp = Condition::Compare(Expression::Covariate("AGE".into()), CmpOp::Lt, lit());
@@ -22179,14 +20019,8 @@ fn cov_static_classifier_helpers_cover_all_arms() {
         &Condition::Or(Box::new(static_cmp.clone()), Box::new(static_cmp.clone())),
         &dv
     ));
-    assert!(cond_is_dynamic(
-        &Condition::Not(Box::new(dyn_cmp.clone())),
-        &dv
-    ));
-    assert!(!cond_is_dynamic(
-        &Condition::Not(Box::new(static_cmp.clone())),
-        &dv
-    ));
+    assert!(cond_is_dynamic(&Condition::Not(Box::new(dyn_cmp.clone())), &dv));
+    assert!(!cond_is_dynamic(&Condition::Not(Box::new(static_cmp.clone())), &dv));
 
     // ── inline conditional (expr_is_dynamic::Conditional) ──
     assert!(expr_is_dynamic(
@@ -22364,11 +20198,7 @@ fn cov_static_else_if_governed_by_earlier_dynamic_condition() {
         prog.cov_static_mask
     );
     // `CL` is read through the pk slot list.
-    let cl_row = prog
-        .pk_var_slots()
-        .iter()
-        .position(|&(_, vs)| vs == cl)
-        .expect("CL is a pk slot");
+    let cl_row = prog.pk_var_slots().iter().position(|&(_, vs)| vs == cl).expect("CL is a pk slot");
 
     let cov: HashMap<String, f64> = [("WT".to_string(), 80.0)].into_iter().collect();
     let theta = [5.0_f64];
@@ -22443,13 +20273,9 @@ fn simulation_short_form_aliases_apply() {
     // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
     // documented spelling) remain valid aliases for the same fields, and the
     // defaults hold for the keys we omit (seed = 42).
-    let spec = parse_sim_block(&sim_lines(&[
-        "subjects = 3",
-        "dose = 25",
-        "cmt = 4",
-        "times = [1.0]",
-    ]))
-    .expect("short-form aliases parse");
+    let spec =
+        parse_sim_block(&sim_lines(&["subjects = 3", "dose = 25", "cmt = 4", "times = [1.0]"]))
+            .expect("short-form aliases parse");
     assert_eq!(spec.n_subjects, 3);
     assert_eq!(spec.dose_amt, 25.0);
     assert_eq!(spec.dose_cmt, 4);
@@ -22478,10 +20304,7 @@ fn simulation_malformed_line_errors() {
     // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
     // error rather than being silently skipped into the default.
     let err = parse_sim_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
-    assert!(
-        err.starts_with("[simulation]:") && err.contains("malformed line"),
-        "got: {err}"
-    );
+    assert!(err.starts_with("[simulation]:") && err.contains("malformed line"), "got: {err}");
 }
 
 // Every value-parsing arm must report a clear, prefixed error on a bad value —
@@ -22533,27 +20356,16 @@ fn simulation_horizon_satisfies_observe_requirement() {
 
 #[test]
 fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
-    for bad in [
-        "horizon = 0",
-        "horizon = -3",
-        "horizon = inf",
-        "horizon = nan",
-    ] {
+    for bad in ["horizon = 0", "horizon = -3", "horizon = inf", "horizon = nan"] {
         let err = parse_sim_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
-        assert!(
-            err.starts_with("[simulation]:") && err.contains("horizon"),
-            "`{bad}` gave: {err}"
-        );
+        assert!(err.starts_with("[simulation]:") && err.contains("horizon"), "`{bad}` gave: {err}");
     }
 }
 
 #[test]
 fn simulation_horizon_bad_value_errors() {
     let err = parse_sim_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
-    assert!(
-        err.starts_with("[simulation]:") && err.contains("horizon"),
-        "got: {err}"
-    );
+    assert!(err.starts_with("[simulation]:") && err.contains("horizon"), "got: {err}");
 }
 
 // ── [simulation] per-subject covariates (#1083) ──────────────────────────
@@ -22572,20 +20384,14 @@ fn simulation_covariate_list_is_read_per_subject() {
         "covariate NARM = [400, 200, 50]",
     ]))
     .expect("per-subject covariate list parses");
-    assert_eq!(
-        spec.covariates,
-        vec![("NARM".to_string(), vec![400.0, 200.0, 50.0])]
-    );
+    assert_eq!(spec.covariates, vec![("NARM".to_string(), vec![400.0, 200.0, 50.0])]);
 }
 
 #[test]
 fn simulation_covariate_scalar_broadcasts_to_every_subject() {
-    let spec = parse_sim_block(&sim_lines(&[
-        "n_subjects = 4",
-        "times = [1.0]",
-        "covariate WT = 70",
-    ]))
-    .expect("scalar covariate parses");
+    let spec =
+        parse_sim_block(&sim_lines(&["n_subjects = 4", "times = [1.0]", "covariate WT = 70"]))
+            .expect("scalar covariate parses");
     assert_eq!(spec.covariates, vec![("WT".to_string(), vec![70.0; 4])]);
 }
 
@@ -22620,10 +20426,7 @@ fn simulation_covariate_must_be_declared_when_a_covariates_block_exists() {
         &declared,
     )
     .unwrap_err();
-    assert!(
-        err.contains("NARN") && err.contains("not declared in [covariates]"),
-        "got: {err}"
-    );
+    assert!(err.contains("NARN") && err.contains("not declared in [covariates]"), "got: {err}");
     // …and the correctly-spelled one is accepted against the same list.
     parse_simulation_block(
         &sim_lines(&["n_subjects = 2", "times = [1.0]", "covariate NARM = 100"]),
@@ -22643,16 +20446,10 @@ fn simulation_covariate_rejects_duplicates_and_bad_values() {
     .unwrap_err();
     assert!(dup.contains("declared twice"), "got: {dup}");
 
-    let bad = parse_sim_block(&sim_lines(&[
-        "n_subjects = 1",
-        "times = [1.0]",
-        "covariate NARM = many",
-    ]))
-    .unwrap_err();
-    assert!(
-        bad.starts_with("[simulation]:") && bad.contains("NARM"),
-        "got: {bad}"
-    );
+    let bad =
+        parse_sim_block(&sim_lines(&["n_subjects = 1", "times = [1.0]", "covariate NARM = many"]))
+            .unwrap_err();
+    assert!(bad.starts_with("[simulation]:") && bad.contains("NARM"), "got: {bad}");
 
     let nameless = parse_sim_block(&sim_lines(&["times = [1.0]", "covariate = 100"])).unwrap_err();
     assert!(nameless.contains("needs a name"), "got: {nameless}");
@@ -22727,9 +20524,7 @@ fn mixture_block_parses_into_spec() {
 /// Build a mixture model with `nsub = k` and the given `[individual_parameters]`
 /// body, using thetas TVCL1/TVCL2/TVCL3/TVV/MIXL1/MIXL2 and eta ETA_CL/ETA_V.
 fn mixture_model_with_indiv(n_classes: usize, indiv: &str) -> crate::types::CompiledModel {
-    let mixing: String = (1..n_classes)
-        .map(|c| format!("  logit({c}) = MIXL{c}\n"))
-        .collect();
+    let mixing: String = (1..n_classes).map(|c| format!("  logit({c}) = MIXL{c}\n")).collect();
     let src = format!(
         r"
 [parameters]
@@ -22800,11 +20595,7 @@ fn class_aware_mu_ref_detects_three_class_chain() {
     );
     assert_eq!(
         class_anchors(&model, "ETA_CL"),
-        Some(vec![
-            "TVCL1".to_string(),
-            "TVCL2".to_string(),
-            "TVCL3".to_string()
-        ])
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string(), "TVCL3".to_string()])
     );
 }
 
@@ -22818,11 +20609,7 @@ fn class_aware_mu_ref_trailing_else_covers_every_unnamed_class() {
     );
     assert_eq!(
         class_anchors(&model, "ETA_CL"),
-        Some(vec![
-            "TVCL1".to_string(),
-            "TVCL2".to_string(),
-            "TVCL2".to_string()
-        ])
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string(), "TVCL2".to_string()])
     );
 }
 
@@ -22924,10 +20711,7 @@ fn class_aware_mu_ref_class_shared_param_stays_in_plain_mu_refs() {
          V = TVV * exp(ETA_V)",
     );
     assert_eq!(class_anchors(&model, "ETA_V"), None);
-    assert_eq!(
-        model.mu_refs.get("ETA_V").map(|m| m.theta_name.as_str()),
-        Some("TVV")
-    );
+    assert_eq!(model.mu_refs.get("ETA_V").map(|m| m.theta_name.as_str()), Some("TVV"));
 }
 
 #[test]
@@ -22953,10 +20737,7 @@ fn class_aware_mu_ref_success_emits_no_warning() {
         "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
     );
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        !model.parse_warnings.iter().any(|w| w.contains("Class-aware mu-referencing not applied")),
         "unexpected fallback warning: {:?}",
         model.parse_warnings
     );
@@ -22972,10 +20753,7 @@ fn class_aware_mu_ref_no_warning_for_a_class_switched_value_without_iiv() {
         "  CL = TVCL1 * exp(ETA_CL)\n  V = if (MIXNUM == 1) TVV else TVV * 2.0",
     );
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        !model.parse_warnings.iter().any(|w| w.contains("Class-aware mu-referencing not applied")),
         "an eta-free MIXNUM expression must not be flagged: {:?}",
         model.parse_warnings
     );
@@ -22990,10 +20768,7 @@ fn class_aware_mu_ref_no_warning_for_an_intermediate_class_flag() {
          CL = TVCL1 * exp(ETA_CL)\n  V = TVV",
     );
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        !model.parse_warnings.iter().any(|w| w.contains("Class-aware mu-referencing not applied")),
         "a MIXNUM flag variable must not be flagged: {:?}",
         model.parse_warnings
     );
@@ -23088,11 +20863,7 @@ fn mixnum_resolves_to_class_1_by_default() {
     cov.insert("WT".to_string(), 70.0);
     let tv = model.tv_fn.as_ref().unwrap()(theta, &cov);
     // indiv_param_names order: CL then V.
-    let cl_idx = model
-        .indiv_param_names
-        .iter()
-        .position(|n| n == "CL")
-        .unwrap();
+    let cl_idx = model.indiv_param_names.iter().position(|n| n == "CL").unwrap();
     assert!(
         (tv[cl_idx] - 1.0).abs() < 1e-9,
         "class-1 branch → CL = TVCL1 = 1.0, got {}",
@@ -23104,10 +20875,7 @@ fn mixnum_resolves_to_class_1_by_default() {
 fn mixnum_in_non_mixture_model_rejected() {
     let err = minimal_model_str_result("  CL = if (MIXNUM == 1) TVCL else TVCL\n  V = TVV")
         .expect_err("MIXNUM without [mixture] must be rejected");
-    assert!(
-        err.contains("MIXNUM") && err.contains("mixture"),
-        "got: {err}"
-    );
+    assert!(err.contains("MIXNUM") && err.contains("mixture"), "got: {err}");
 }
 
 #[test]
@@ -23137,10 +20905,7 @@ fn mixnum_outside_indiv_params_rejected() {
 ";
     let err = parse_model_string(src)
         .expect_err("MIXNUM in [derived] without [mixture] must be rejected");
-    assert!(
-        err.contains("MIXNUM") && err.contains("mixture"),
-        "got: {err}"
-    );
+    assert!(err.contains("MIXNUM") && err.contains("mixture"), "got: {err}");
 }
 
 #[test]
@@ -23162,10 +20927,7 @@ fn mixnum_assignment_rejected() {
     // `MIXNUM = …` in [individual_parameters] of an otherwise-valid mixture model.
     let src = MIXTURE_2CLASS.replace("  V = TVV", "  V = TVV\n  MIXNUM = 2");
     let err = parse_model_string(&src).expect_err("assigning MIXNUM must be rejected");
-    assert!(
-        err.contains("MIXNUM") && err.contains("reserved"),
-        "got: {err}"
-    );
+    assert!(err.contains("MIXNUM") && err.contains("reserved"), "got: {err}");
 }
 
 #[test]
@@ -23263,10 +21025,7 @@ fn fit_on_mixture_model_rejects_unsupported_method() {
     let err = crate::api::fit(&model, &pop, &params, &opts)
         .expect_err("Gauss-Newton on a mixture model must be rejected")
         .to_string();
-    assert!(
-        err.contains("mixture") && err.contains("FOCE"),
-        "got: {err}"
-    );
+    assert!(err.contains("mixture") && err.contains("FOCE"), "got: {err}");
 }
 
 /// Helper: parse a full model whose `[individual_parameters]` body is `indiv`,
@@ -23328,11 +21087,7 @@ const MIXTURE_2ETA: &str = r"
 #[test]
 fn mixture_params_built_from_overrides() {
     let model = parse_model_string(MIXTURE_2ETA).expect("parses");
-    let mp = model
-        .default_params
-        .mixture
-        .as_ref()
-        .expect("mixture params");
+    let mp = model.default_params.mixture.as_ref().expect("mixture params");
     assert_eq!(mp.omega.len(), 2);
     assert_eq!(mp.sigma.len(), 2);
     // Class 1 == base.
@@ -23372,29 +21127,14 @@ fn mixture_pack_unpack_roundtrip() {
     let v2 = pack_params(&rt);
     assert_eq!(v.len(), v2.len());
     for (a, b) in v.iter().zip(&v2) {
-        assert!(
-            (a - b).abs() < 1e-12,
-            "pack∘unpack∘pack not identity: {a} vs {b}"
-        );
+        assert!((a - b).abs() < 1e-12, "pack∘unpack∘pack not identity: {a} vs {b}");
     }
     // Numeric per-class values survive the round trip.
     let mp = rt.mixture.as_ref().expect("mixture survives unpack");
-    assert!(
-        (mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10,
-        "class-2 ETA_CL override"
-    );
-    assert!(
-        (mp.omega[1].matrix[(1, 1)] - 0.2).abs() < 1e-10,
-        "class-2 ETA_V tracks base"
-    );
-    assert!(
-        (mp.sigma[1].values[0] - 0.3).abs() < 1e-10,
-        "class-2 EPS override"
-    );
-    assert!(
-        (mp.omega[0].matrix[(0, 0)] - 0.1).abs() < 1e-10,
-        "class-1 == base"
-    );
+    assert!((mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10, "class-2 ETA_CL override");
+    assert!((mp.omega[1].matrix[(1, 1)] - 0.2).abs() < 1e-10, "class-2 ETA_V tracks base");
+    assert!((mp.sigma[1].values[0] - 0.3).abs() < 1e-10, "class-2 EPS override");
+    assert!((mp.omega[0].matrix[(0, 0)] - 0.1).abs() < 1e-10, "class-1 == base");
 }
 
 #[test]
@@ -23407,29 +21147,17 @@ fn mixture_unpack_tracks_perturbed_base() {
     let model = parse_model_string(MIXTURE_2ETA).expect("parses");
     let p = &model.default_params;
     let names = coordinate_names(p);
-    let etav_idx = names
-        .iter()
-        .position(|n| n == "ETA_V")
-        .expect("ETA_V coord");
+    let etav_idx = names.iter().position(|n| n == "ETA_V").expect("ETA_V coord");
     let mut v = pack_params(p);
     // Base ETA_V is packed as ln(sqrt(var)); set var := 0.5 → chol_diag = sqrt(0.5).
     v[etav_idx] = 0.5_f64.sqrt().ln();
     let rt = unpack_params(&v, p);
     // Base updated.
-    assert!(
-        (rt.omega.matrix[(1, 1)] - 0.5).abs() < 1e-10,
-        "base ETA_V perturbed"
-    );
+    assert!((rt.omega.matrix[(1, 1)] - 0.5).abs() < 1e-10, "base ETA_V perturbed");
     let mp = rt.mixture.as_ref().unwrap();
     // Class 2 ETA_V tracks the new base; ETA_CL override unchanged.
-    assert!(
-        (mp.omega[1].matrix[(1, 1)] - 0.5).abs() < 1e-10,
-        "class-2 ETA_V tracks base"
-    );
-    assert!(
-        (mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10,
-        "class-2 ETA_CL override held"
-    );
+    assert!((mp.omega[1].matrix[(1, 1)] - 0.5).abs() < 1e-10, "class-2 ETA_V tracks base");
+    assert!((mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10, "class-2 ETA_CL override held");
 }
 
 #[test]
@@ -23443,14 +21171,8 @@ fn mixture_fixed_override_pinned_in_mask() {
     // The FIX flag must land at the override's packed coordinate.
     let names = coordinate_names(p);
     let mask = packed_fixed_mask(p);
-    let mix_idx = names
-        .iter()
-        .position(|n| n == "ETA_CL_MIX2")
-        .expect("mixture coord name");
-    assert!(
-        mask[mix_idx],
-        "fixed omega override must be pinned in the mask"
-    );
+    let mix_idx = names.iter().position(|n| n == "ETA_CL_MIX2").expect("mixture coord name");
+    assert!(mask[mix_idx], "fixed omega override must be pinned in the mask");
 }
 
 #[test]
@@ -23462,10 +21184,8 @@ fn mixture_negative_override_rejected() {
 
 #[test]
 fn mixture_duplicate_override_rejected() {
-    let src = MIXTURE_2ETA.replace(
-        "omega(2) ETA_CL ~ 0.4",
-        "omega(2) ETA_CL ~ 0.4\n  omega(2) ETA_CL ~ 0.6",
-    );
+    let src = MIXTURE_2ETA
+        .replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4\n  omega(2) ETA_CL ~ 0.6");
     let err = parse_model_string(&src).expect_err("duplicate override must be rejected");
     assert!(err.contains("duplicate"), "got: {err}");
 }
@@ -23516,10 +21236,7 @@ fn unknown_gradient_value_does_not_advertise_the_retired_ad_route() {
         err.contains("expected 'auto' or 'fd'"),
         "message must list only the values a fit accepts, got: {err}"
     );
-    assert!(
-        !err.contains("'ad'"),
-        "the retired AD route must not be advertised, got: {err}"
-    );
+    assert!(!err.contains("'ad'"), "the retired AD route must not be advertised, got: {err}");
 
     // `ad` still parses — the engine, not the parser, owns its retirement message.
     assert!(
@@ -23585,20 +21302,13 @@ fn weighted_add_model_str(error_block: &str) -> String {
 
 #[test]
 fn test_weight_modifier_scales_the_additive_slot() {
-    let model = parse_model_string(&weighted_add_model_str(
-        "  DV ~ additive(ADD_ERR) weight = WPSE",
-    ))
-    .unwrap();
-    let rm = model
-        .ruv_magnitude
-        .as_ref()
-        .expect("`weight =` compiles to a residual magnitude");
+    let model =
+        parse_model_string(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight = WPSE"))
+            .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("`weight =` compiles to a residual magnitude");
     assert!(rm.is_active());
     assert_eq!(rm.per_sigma.len(), 1);
-    assert!(
-        rm.per_sigma[0].is_some(),
-        "additive slot carries the weight"
-    );
+    assert!(rm.per_sigma[0].is_some(), "additive slot carries the weight");
 
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
@@ -23619,10 +21329,7 @@ fn test_weight_modifier_on_combined_leaves_the_proportional_slot_bare() {
     let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
     assert_eq!(rm.per_sigma.len(), 2);
     assert!(rm.per_sigma[0].is_none(), "proportional slot stays bare");
-    assert!(
-        rm.per_sigma[1].is_some(),
-        "additive slot carries the weight"
-    );
+    assert!(rm.per_sigma[1].is_some(), "additive slot carries the weight");
 
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
@@ -23652,10 +21359,9 @@ fn test_weight_modifier_accepts_an_expression_with_its_own_parens() {
 fn test_weight_modifier_composes_with_a_custom_magnitude() {
     // `weight =` multiplies whatever magnitude expression the slot already
     // carries (#484) rather than replacing it.
-    let model = parse_model_string(&weighted_add_model_str(
-        "  DV ~ additive(ADD_ERR * 3.0) weight = WPSE",
-    ))
-    .unwrap();
+    let model =
+        parse_model_string(&weighted_add_model_str("  DV ~ additive(ADD_ERR * 3.0) weight = WPSE"))
+            .unwrap();
     let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
@@ -23670,10 +21376,7 @@ fn test_weight_modifier_rejected_on_proportional_error() {
         W_SIGMA_PROP,
         "  DV ~ proportional(PROP_ERR) weight = WPSE",
     ));
-    assert!(
-        err.contains("no effect on a purely proportional"),
-        "got: {err}"
-    );
+    assert!(err.contains("no effect on a purely proportional"), "got: {err}");
 }
 
 #[test]
@@ -23689,37 +21392,29 @@ fn test_weight_modifier_rejected_inside_a_covariate_selected_block() {
     let err = expect_parse_err(&weighted_add_model_str(
         "  if (WPSE > 1.0) { DV ~ additive(ADD_ERR) weight = WPSE }\n  else { DV ~ additive(ADD_ERR) }",
     ));
-    assert!(
-        err.contains("not supported inside a covariate-selected"),
-        "got: {err}"
-    );
+    assert!(err.contains("not supported inside a covariate-selected"), "got: {err}");
 }
 
 #[test]
 fn test_weight_modifier_rejects_an_undeclared_covariate() {
     // Inherits #484's guard: an undeclared name would silently evaluate to 0
     // and collapse every observation's weight to zero.
-    let err = expect_parse_err(&weighted_add_model_str(
-        "  DV ~ additive(ADD_ERR) weight = NOTACOV",
-    ));
+    let err =
+        expect_parse_err(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight = NOTACOV"));
     assert!(err.contains("undeclared covariate"), "got: {err}");
 }
 
 #[test]
 fn test_weight_modifier_rejects_an_empty_right_hand_side() {
     let err = expect_parse_err(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight ="));
-    assert!(
-        err.contains("no expression on its right-hand side"),
-        "got: {err}"
-    );
+    assert!(err.contains("no expression on its right-hand side"), "got: {err}");
 }
 
 #[test]
 fn test_weight_modifier_rejects_eta_dependence() {
     // A weight is a property of the datum, never of the individual.
-    let err = expect_parse_err(&weighted_add_model_str(
-        "  DV ~ additive(ADD_ERR) weight = exp(ETA_CL)",
-    ));
+    let err =
+        expect_parse_err(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight = exp(ETA_CL)"));
     assert!(!err.is_empty(), "an eta-dependent weight must not parse");
 }
 
@@ -23769,10 +21464,7 @@ fn test_split_weight_modifier_requires_a_statement_before_it() {
         "a `DV ~ TYPE(...)` statement",
     )
     .unwrap_err();
-    assert!(
-        err.contains("must follow a `DV ~ TYPE(...)` statement"),
-        "got: {err}"
-    );
+    assert!(err.contains("must follow a `DV ~ TYPE(...)` statement"), "got: {err}");
 }
 
 /// A covariate that appears *only* in a `weight =` / magnitude expression is
@@ -23783,10 +21475,9 @@ fn test_split_weight_modifier_requires_a_statement_before_it() {
 /// point of the feature, lost with no diagnostic (#484 / #1029).
 #[test]
 fn test_weight_covariate_is_registered_as_model_referenced() {
-    let model = parse_model_string(&weighted_add_model_str(
-        "  DV ~ additive(ADD_ERR) weight = WPSE",
-    ))
-    .unwrap();
+    let model =
+        parse_model_string(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight = WPSE"))
+            .unwrap();
     assert!(
         model.referenced_covariates.contains(&"WPSE".to_string()),
         "got: {:?}",
@@ -23798,10 +21489,9 @@ fn test_weight_covariate_is_registered_as_model_referenced() {
 fn test_weight_covariate_survives_tv_snapshot_pruning() {
     use crate::types::{Population, Subject};
 
-    let model = parse_model_string(&weighted_add_model_str(
-        "  DV ~ additive(ADD_ERR) weight = WPSE",
-    ))
-    .unwrap();
+    let model =
+        parse_model_string(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight = WPSE"))
+            .unwrap();
 
     // One subject whose only time-varying column is the weight.
     let snap = |w: f64| -> std::collections::HashMap<String, f64> {
@@ -23843,10 +21533,7 @@ fn test_weight_modifier_still_reports_a_sigma_order_mismatch() {
         "  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 1.0 (variance) FIX\n",
         "  DV ~ additive(ADD_ERR) weight = WPSE",
     ));
-    assert!(
-        err.contains("consumed positionally") && err.contains("ADD_ERR"),
-        "got: {err}"
-    );
+    assert!(err.contains("consumed positionally") && err.contains("ADD_ERR"), "got: {err}");
 }
 
 /// The weight expression itself must not name a sigma — that would make the
@@ -23905,11 +21592,9 @@ fn weighted_kappa_model_str(kappa_line: &str, extra_block: &str) -> String {
 /// of the feature.
 #[test]
 fn test_weighted_kappa_divides_the_kappa_by_sqrt_of_the_weight() {
-    let weighted = parse_model_string(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
-        "",
-    ))
-    .unwrap();
+    let weighted =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", ""))
+            .unwrap();
     let plain =
         parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
     let theta = weighted.default_params.theta.clone();
@@ -23931,11 +21616,9 @@ fn test_weighted_kappa_divides_the_kappa_by_sqrt_of_the_weight() {
 /// scales each occasion by its own arm size.
 #[test]
 fn test_weighted_kappa_reads_the_weight_at_the_record() {
-    let model = parse_model_string(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
-        "",
-    ))
-    .unwrap();
+    let model =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", ""))
+            .unwrap();
     let theta = model.default_params.theta.clone();
     let big: std::collections::HashMap<String, f64> =
         [("NARM".to_string(), 100.0)].into_iter().collect();
@@ -23957,11 +21640,7 @@ fn test_weighted_kappa_leaves_omega_iov_on_the_unweighted_scale() {
         "",
     ))
     .unwrap();
-    let iov = model
-        .default_params
-        .omega_iov
-        .as_ref()
-        .expect("IOV present");
+    let iov = model.default_params.omega_iov.as_ref().expect("IOV present");
     approx::assert_relative_eq!(iov.matrix[(0, 0)], 4.0, max_relative = 1e-12);
 }
 
@@ -23969,11 +21648,9 @@ fn test_weighted_kappa_leaves_omega_iov_on_the_unweighted_scale() {
 /// evaluator, so a fit can print the effective SD `γ/√W` at a typical arm size.
 #[test]
 fn test_weighted_kappa_is_reported_on_the_compiled_model() {
-    let model = parse_model_string(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
-        "",
-    ))
-    .unwrap();
+    let model =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", ""))
+            .unwrap();
     assert!(model.has_weighted_kappa());
     let w = model.kappa_weights[0].as_ref().expect("weight recorded");
     assert_eq!(w.expr, "NARM");
@@ -24002,11 +21679,9 @@ fn test_unweighted_kappa_carries_no_weight() {
 /// (the #484 / #1029 trap).
 #[test]
 fn test_weighted_kappa_registers_its_covariate() {
-    let model = parse_model_string(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
-        "",
-    ))
-    .unwrap();
+    let model =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", ""))
+            .unwrap();
     assert!(
         model.referenced_covariates.contains(&"NARM".to_string()),
         "got: {:?}",
@@ -24018,18 +21693,14 @@ fn test_weighted_kappa_registers_its_covariate() {
 /// mu-reference — that would silently drop SAEM/IMP to the general θ step.
 #[test]
 fn test_weighted_kappa_preserves_the_bsv_mu_reference() {
-    let weighted = parse_model_string(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
-        "",
-    ))
-    .unwrap();
+    let weighted =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", ""))
+            .unwrap();
     let plain =
         parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
     let plain_ref = plain.mu_refs.get("ETA_CL").expect("baseline mu-ref");
-    let weighted_ref = weighted
-        .mu_refs
-        .get("ETA_CL")
-        .expect("BSV mu-ref survives the kappa rewrite");
+    let weighted_ref =
+        weighted.mu_refs.get("ETA_CL").expect("BSV mu-ref survives the kappa rewrite");
     assert_eq!(weighted_ref.theta_name, plain_ref.theta_name);
     assert_eq!(weighted_ref.log_transformed(), plain_ref.log_transformed());
 }
@@ -24045,14 +21716,8 @@ fn test_weighted_kappa_rejects_a_random_effect_in_the_weight() {
 
 #[test]
 fn test_weighted_kappa_rejects_an_empty_right_hand_side() {
-    let err = expect_parse_err(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight =",
-        "",
-    ));
-    assert!(
-        err.contains("no expression on its right-hand side"),
-        "got: {err}"
-    );
+    let err = expect_parse_err(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight =", ""));
+    assert!(err.contains("no expression on its right-hand side"), "got: {err}");
 }
 
 /// A weight on anything but a `kappa` is rejected rather than ignored -- before
@@ -24065,10 +21730,7 @@ fn test_weight_modifier_rejected_on_a_non_kappa_declaration() {
         "  kappa KAPPA_CL ~ 0.09\n  omega ETA_V ~ 0.04 weight = NARM",
         "",
     ));
-    assert!(
-        err.contains("only supported on a `kappa NAME ~ VALUE` declaration"),
-        "got: {err}"
-    );
+    assert!(err.contains("only supported on a `kappa NAME ~ VALUE` declaration"), "got: {err}");
 }
 
 /// A `block_kappa` cannot carry a weight: the divisor would have to apply to
@@ -24404,10 +22066,7 @@ fn test_weighted_kappa_rejects_an_estimated_theta_in_the_weight() {
         "  kappa KAPPA_CL ~ 0.09 weight = TVCL * NARM",
         "",
     ));
-    assert!(
-        err.contains("references estimated theta(s) `TVCL`"),
-        "got: {err}"
-    );
+    assert!(err.contains("references estimated theta(s) `TVCL`"), "got: {err}");
 }
 
 /// A FIXed theta is a known constant, so it is as safe as a covariate column
@@ -24455,10 +22114,7 @@ fn test_weighted_kappa_outside_error_names_the_block_type() {
   iov_column = OCC
 ";
     let err = expect_parse_err(model_str);
-    assert!(
-        err.contains("[event_model armA] references `KAPPA_CL`"),
-        "got: {err}"
-    );
+    assert!(err.contains("[event_model armA] references `KAPPA_CL`"), "got: {err}");
 }
 
 /// Mu-reference detection runs on the *rewritten* statements, so the declared
@@ -24468,11 +22124,9 @@ fn test_weighted_kappa_outside_error_names_the_block_type() {
 /// `method = bayes` then rejects while accepting the hand-written twin.
 #[test]
 fn test_weighted_kappa_mu_refs_match_the_hand_written_form() {
-    let declared = parse_model_string(&weighted_kappa_model_str(
-        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
-        "",
-    ))
-    .unwrap();
+    let declared =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", ""))
+            .unwrap();
     let hand_written = parse_model_string(
         &weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")
             .replace("ETA_CL + KAPPA_CL", "ETA_CL + KAPPA_CL / sqrt(NARM)"),
@@ -24495,15 +22149,10 @@ fn test_weighted_kappa_mu_refs_match_the_hand_written_form() {
 /// rewrite — and with it SAEM/IMP's closed-form θ step.
 #[test]
 fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
-    let model_str = weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", "").replace(
-        "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
-        "CL = TVCL * exp(KAPPA_CL) * exp(ETA_CL)",
-    );
+    let model_str = weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", "")
+        .replace("CL = TVCL * exp(ETA_CL + KAPPA_CL)", "CL = TVCL * exp(KAPPA_CL) * exp(ETA_CL)");
     let model = parse_model_string(&model_str).unwrap();
-    let mu = model
-        .mu_refs
-        .get("ETA_CL")
-        .expect("BSV mu-ref survives a kappa written to its left");
+    let mu = model.mu_refs.get("ETA_CL").expect("BSV mu-ref survives a kappa written to its left");
     assert_eq!(mu.theta_name, "TVCL");
     assert!(mu.log_transformed());
 }
@@ -24611,48 +22260,25 @@ fn covariate_nn_reads_time_varying_covariate_values() {
     let times = vec![1.0, 4.0, 8.0, 16.0, 24.0];
     // `obs_covariates` carries the per-observation snapshot the engine reads.
     let make = |zcov: &[f64]| -> Subject {
-        let per_obs: Vec<HashMap<String, f64>> = zcov
-            .iter()
-            .map(|&z| HashMap::from([("ZCOV".to_string(), z)]))
-            .collect();
+        let per_obs: Vec<HashMap<String, f64>> =
+            zcov.iter().map(|&z| HashMap::from([("ZCOV".to_string(), z)])).collect();
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![1.0; times.len()],
             obs_cmts: vec![1; times.len()],
             covariates: HashMap::from([("ZCOV".to_string(), zcov[0])]),
             dose_covariates: vec![HashMap::from([("ZCOV".to_string(), zcov[0])])],
             obs_covariates: per_obs,
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     };
 
     // Same baseline, but one subject's covariate swings hard after the second sample.
     let mut pop = crate::types::Population {
-        subjects: vec![
-            make(&[-1.0, -1.0, -1.0, -1.0, -1.0]),
-            make(&[-1.0, -1.0, 1.5, 1.5, 1.5]),
-        ],
+        subjects: vec![make(&[-1.0, -1.0, -1.0, -1.0, -1.0]), make(&[-1.0, -1.0, 1.5, 1.5, 1.5])],
         covariate_names: vec!["ZCOV".to_string()],
         dv_column: "DV".into(),
         input_columns: vec![],
@@ -24743,34 +22369,14 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
 
     let population = Population {
         subjects: vec![Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0],
             obs_cmts: vec![1],
             covariates: HashMap::from([("WT".to_string(), 70.0)]),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".into(),
@@ -24782,9 +22388,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
     // A typo'd covariate name.
     let diags = crate::api::check_covariates(&parse("ZCOV"), &population);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("ZCOV")),
+        diags.iter().any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("ZCOV")),
         "an NN input absent from the data must be rejected, got {diags:?}"
     );
 
@@ -24792,18 +22396,13 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
     // silently zero-filling the network's only input.
     let diags = crate::api::check_covariates(&parse("TIME"), &population);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("TIME")),
+        diags.iter().any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("TIME")),
         "`inputs = [TIME]` must be rejected, got {diags:?}"
     );
 
     // A present covariate must not be flagged.
     let diags = crate::api::check_covariates(&parse("WT"), &population);
-    assert!(
-        diags.is_empty(),
-        "a present covariate must pass, got {diags:?}"
-    );
+    assert!(diags.is_empty(), "a present covariate must pass, got {diags:?}");
 }
 
 /// `center` / `scale` must reach the network: the forward pass sees `(x - center)/scale`.
@@ -24853,10 +22452,7 @@ fn covariate_nn_center_and_scale_normalize_the_inputs() {
     // Same auto-generated Glorot weights in both (the init is deterministic).
     let w_norm = &normalized.default_params.theta[2..];
     let w_raw = &raw.default_params.theta[2..];
-    assert_eq!(
-        w_norm, w_raw,
-        "weight init must be identical across the two fixtures"
-    );
+    assert_eq!(w_norm, w_raw, "weight init must be identical across the two fixtures");
 
     let nn_norm = &normalized.covariate_nns[0];
     let nn_raw = &raw.covariate_nns[0];
@@ -25061,16 +22657,8 @@ fn covariate_nn_init_sets_the_starting_outputs_exactly() {
     for (wt, crcl) in [(70.0, 95.0), (45.0, 150.0)] {
         let cov = HashMap::from([("WT".to_string(), wt), ("CRCL".to_string(), crcl)]);
         let out = nn.mapper.forward_raw(w, &cov).expect("forward");
-        assert!(
-            (out[0] - 1.25).abs() < 1e-12,
-            "CL init at WT={wt}: got {}, want 1.25",
-            out[0]
-        );
-        assert!(
-            (out[1] - 18.0).abs() < 1e-12,
-            "V init at WT={wt}: got {}, want 18.0",
-            out[1]
-        );
+        assert!((out[0] - 1.25).abs() < 1e-12, "CL init at WT={wt}: got {}, want 1.25", out[0]);
+        assert!((out[1] - 18.0).abs() < 1e-12, "V init at WT={wt}: got {}, want 18.0", out[1]);
     }
 }
 
@@ -25119,10 +22707,7 @@ fn covariate_nn_init_rejects_values_outside_the_activation_range() {
 fn covariate_nn_init_requires_one_entry_per_output() {
     let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0]\n"))
         .expect_err("a short init list must be rejected");
-    assert!(
-        err.contains("one entry per output"),
-        "error should explain the arity: {err}"
-    );
+    assert!(err.contains("one entry per output"), "error should explain the arity: {err}");
 }
 
 // ── #811: compartment-free (`$PRED`-equivalent) structural model ─────────────
@@ -25153,19 +22738,12 @@ fn algebraic_model_str(equations: &str) -> String {
 /// layout is empty.
 #[test]
 fn algebraic_structural_model_parses_without_pk_or_ode() {
-    let model = parse_model_string(&algebraic_model_str(
-        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
-    ))
-    .expect("a compartment-free [structural_model] parses");
-    assert!(
-        model.is_algebraic(),
-        "must be recognised as compartment-free"
-    );
+    let model =
+        parse_model_string(&algebraic_model_str("  y = E0 - EMAX * TIME / (ET50 + TIME)\n"))
+            .expect("a compartment-free [structural_model] parses");
+    assert!(model.is_algebraic(), "must be recognised as compartment-free");
     assert!(model.ode_spec.is_none(), "no ODE spec");
-    let ar = model
-        .analytic_readout
-        .as_ref()
-        .expect("the equation compiles to a Form C readout");
+    let ar = model.analytic_readout.as_ref().expect("the equation compiles to a Form C readout");
     assert!(
         ar.state_names.is_empty(),
         "a compartment-free readout reconstructs no amounts, got {:?}",
@@ -25184,10 +22762,7 @@ fn algebraic_structural_model_accepts_named_intermediates() {
     .expect("intermediates are usable in a compartment-free model");
     assert!(model.is_algebraic());
     assert!(
-        model
-            .analytic_readout
-            .as_ref()
-            .is_some_and(|ar| ar.program.is_some()),
+        model.analytic_readout.as_ref().is_some_and(|ar| ar.program.is_some()),
         "the readout carries a sensitivity program"
     );
 }
@@ -25198,20 +22773,14 @@ fn algebraic_structural_model_accepts_named_intermediates() {
 #[test]
 fn algebraic_structural_model_requires_a_y_entry() {
     let err = expect_parse_err(&algebraic_model_str("  EFF = EMAX * TIME\n"));
-    assert!(
-        err.contains("[structural_model]") && err.contains("`y = <expr>`"),
-        "got: {err}"
-    );
+    assert!(err.contains("[structural_model]") && err.contains("`y = <expr>`"), "got: {err}");
 }
 
 /// `obs_scale` divides a *built-in* prediction; a compartment-free model has none.
 #[test]
 fn algebraic_structural_model_rejects_obs_scale() {
     let err = expect_parse_err(&algebraic_model_str("  y = E0\n  obs_scale = 1000\n"));
-    assert!(
-        err.contains("obs_scale") && err.contains("compartment-free"),
-        "got: {err}"
-    );
+    assert!(err.contains("obs_scale") && err.contains("compartment-free"), "got: {err}");
 }
 
 /// A compartment amount cannot be referenced when there are no compartments. The
@@ -25221,10 +22790,7 @@ fn algebraic_structural_model_rejects_obs_scale() {
 fn algebraic_structural_model_rejects_a_compartment_reference() {
     for name in ["central", "depot", "peripheral"] {
         let err = expect_parse_err(&algebraic_model_str(&format!("  y = {name} / E0\n")));
-        assert!(
-            err.contains(name) && err.contains("no compartments"),
-            "for `{name}`, got: {err}"
-        );
+        assert!(err.contains(name) && err.contains("no compartments"), "for `{name}`, got: {err}");
     }
 }
 
@@ -25263,15 +22829,9 @@ fn algebraic_structural_model_registers_free_names_as_covariates() {
 /// readout or divide the equation's own output.
 #[test]
 fn algebraic_structural_model_rejects_a_scaling_block() {
-    let src = format!(
-        "{}\n[scaling]\n  y = E0\n",
-        algebraic_model_str("  y = E0 - EMAX\n")
-    );
+    let src = format!("{}\n[scaling]\n  y = E0\n", algebraic_model_str("  y = E0 - EMAX\n"));
     let err = expect_parse_err(&src);
-    assert!(
-        err.contains("[scaling]") && err.contains("compartment-free"),
-        "got: {err}"
-    );
+    assert!(err.contains("[scaling]") && err.contains("compartment-free"), "got: {err}");
 }
 
 /// Blocks that only mean something with compartments underneath are rejected by
@@ -25294,10 +22854,7 @@ fn algebraic_structural_model_rejects_compartment_only_blocks() {
              when signal < 10 : increase 25%\n",
         ),
     ] {
-        let src = format!(
-            "{}\n[{block}]\n{body}",
-            algebraic_model_str("  y = E0 - EMAX\n")
-        );
+        let src = format!("{}\n[{block}]\n{body}", algebraic_model_str("  y = E0 - EMAX\n"));
         let err = expect_parse_err(&src);
         assert!(
             err.contains(&format!("[{block}]")) && err.contains("compartment-free"),
@@ -25311,13 +22868,8 @@ fn algebraic_structural_model_rejects_compartment_only_blocks() {
 /// silently became a one-compartment IV fit (#811).
 #[test]
 fn structural_model_rejects_a_mistyped_pk_line() {
-    let err = expect_parse_err(&algebraic_model_str(
-        "  zpk one_cpt_iv(cl=E0, v=EMAX)\n  y = E0\n",
-    ));
-    assert!(
-        err.contains("unrecognized line") && err.contains("zpk"),
-        "got: {err}"
-    );
+    let err = expect_parse_err(&algebraic_model_str("  zpk one_cpt_iv(cl=E0, v=EMAX)\n  y = E0\n"));
+    assert!(err.contains("unrecognized line") && err.contains("zpk"), "got: {err}");
 }
 
 /// Every line in the block is now classified, so a stray one errors instead of
@@ -25342,10 +22894,7 @@ fn structural_model_rejects_mixing_a_compartment_model_with_an_equation() {
         \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  y = central / V\n\
         \n[error_model]\n  DV ~ additive(1.0)\n";
     let err = expect_parse_err(src);
-    assert!(
-        err.contains("cannot mix") && err.contains("[scaling]"),
-        "got: {err}"
-    );
+    assert!(err.contains("cannot mix") && err.contains("[scaling]"), "got: {err}");
 }
 
 /// Two dispositions in one block used to be silently resolved as "first one wins".
@@ -25373,10 +22922,7 @@ fn structural_model_rejects_an_empty_block() {
         \n[structural_model]\n\
         \n[error_model]\n  DV ~ additive(1.0)\n";
     let err = expect_parse_err(src);
-    assert!(
-        err.contains("Missing [structural_model] block"),
-        "got: {err}"
-    );
+    assert!(err.contains("Missing [structural_model] block"), "got: {err}");
 }
 
 /// A compartment-free model lays its parameters out like an ODE model — every
@@ -25448,13 +22994,7 @@ fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartm
 /// compartment-free models, so it cannot fire here either way.)
 #[test]
 fn algebraic_structural_model_accepts_dose_attribute_shaped_parameter_names() {
-    for (name, value) in [
-        ("F1", 0.25),
-        ("ALAG1", 0.5),
-        ("D1", 1.5),
-        ("D2", 2.0),
-        ("R1", 3.0),
-    ] {
+    for (name, value) in [("F1", 0.25), ("ALAG1", 0.5), ("D1", 1.5), ("D2", 2.0), ("R1", 3.0)] {
         let src = format!(
             "[parameters]\n\
             \x20 theta TVE0(10.0, 0.1, 100.0)\n\
@@ -25509,16 +23049,10 @@ fn algebraic_structural_model_warns_on_an_unused_parameter() {
     let model = parse_model_string(&algebraic_model_str("  y = E0 * ET50\n"))
         .expect("an unused parameter is a warning, not an error");
     assert!(model.is_algebraic());
-    let w = model
-        .parse_warnings
-        .iter()
-        .find(|w| w.contains("computed but never used"))
-        .unwrap_or_else(|| {
-            panic!(
-                "expected a dead-parameter warning, got {:?}",
-                model.parse_warnings
-            )
-        });
+    let w =
+        model.parse_warnings.iter().find(|w| w.contains("computed but never used")).unwrap_or_else(
+            || panic!("expected a dead-parameter warning, got {:?}", model.parse_warnings),
+        );
     assert!(
         w.contains("`EMAX`") && !w.contains("`E0`") && !w.contains("`ET50`"),
         "names the dead parameter only: {w}"
@@ -25669,10 +23203,7 @@ mod theta_vector_blocks {
   DV ~ proportional(PROP_ERR)
 "#;
         let parsed = parse_full_model(content).unwrap();
-        assert_eq!(
-            parsed.model.default_params.theta_fixed,
-            vec![false, true, true, true, false]
-        );
+        assert_eq!(parsed.model.default_params.theta_fixed, vec![false, true, true, true, false]);
     }
 
     #[test]
@@ -25779,10 +23310,7 @@ mod theta_vector_blocks {
   DV ~ proportional(PROP_ERR)
 "#;
         let err = parse_full_model(content).err().unwrap();
-        assert!(
-            err.contains("is a vector of 4 θ levels"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("is a vector of 4 θ levels"), "unexpected error: {err}");
     }
 
     #[test]
@@ -25814,17 +23342,14 @@ mod theta_vector_blocks {
 // ── #1064: the level-block primitives, branch by branch ────────────────────
 //
 // The declaration surface and the end-to-end binding are covered by
-// `theta_vector_blocks` above and `api::levels`. What is left here are the
+// `theta_vector_blocks` above and `levels`. What is left here are the
 // error and edge branches of the primitives themselves — reachable directly,
 // and several of them not reachable at all through a well-formed model file.
 mod theta_level_primitives {
     use super::*;
 
     fn spec(levels: Vec<LevelRule>) -> GatherSpec {
-        GatherSpec {
-            name: "PLACEBO".to_string(),
-            levels,
-        }
+        GatherSpec { name: "PLACEBO".to_string(), levels }
     }
 
     fn binding(labels: &[&str], groups: &[usize], contrast: LevelContrast) -> LevelBinding {
@@ -25839,10 +23364,7 @@ mod theta_level_primitives {
 
     #[test]
     fn a_digits_only_bracket_is_a_level_count() {
-        assert_eq!(
-            parse_theta_block_spec("P", " 12 ").unwrap(),
-            ThetaBlockSpec::Count(12)
-        );
+        assert_eq!(parse_theta_block_spec("P", " 12 ").unwrap(), ThetaBlockSpec::Count(12));
     }
 
     #[test]
@@ -25946,10 +23468,7 @@ mod theta_level_primitives {
     fn unconstrained_bindings_estimate_every_level() {
         let b = binding(&["a", "b", "c"], &[0, 0, 0], LevelContrast::Unconstrained);
         let (rules, names) = build_level_rules("P", &b, 5).unwrap();
-        assert_eq!(
-            rules,
-            vec![LevelRule::Free(5), LevelRule::Free(6), LevelRule::Free(7)]
-        );
+        assert_eq!(rules, vec![LevelRule::Free(5), LevelRule::Free(6), LevelRule::Free(7)]);
         assert_eq!(names, vec!["P[a]", "P[b]", "P[c]"]);
     }
 
@@ -25970,15 +23489,7 @@ mod theta_level_primitives {
     fn eval_gather_rejects_every_ill_formed_index() {
         let s = spec(vec![LevelRule::Free(0), LevelRule::Free(1)]);
         let theta = [1.0, 2.0];
-        for bad in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            0.0,
-            3.0,
-            1.5,
-            -1.0,
-        ] {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 3.0, 1.5, -1.0] {
             assert!(
                 eval_gather(&s, &theta, bad).is_nan(),
                 "index {bad} must be NaN, never a silent value"
@@ -26002,11 +23513,7 @@ mod theta_level_primitives {
 
     #[test]
     fn eval_gather_sums_the_dependent_level() {
-        let s = spec(vec![
-            LevelRule::Free(0),
-            LevelRule::Free(1),
-            LevelRule::NegSum(0, 2),
-        ]);
+        let s = spec(vec![LevelRule::Free(0), LevelRule::Free(1), LevelRule::NegSum(0, 2)]);
         let theta = [0.25, -0.75];
         assert_eq!(eval_gather(&s, &theta, 3.0), 0.5);
     }
@@ -26030,11 +23537,7 @@ mod theta_level_primitives {
             for raw in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1.0, 2.0, 3.0, 1.5] {
                 let a = eval_gather(s, &theta, raw);
                 let b = gather_g::<f64>(s, &theta, raw);
-                assert_eq!(
-                    a.is_nan(),
-                    b.is_nan(),
-                    "NaN disagreement on {s:?} at index {raw}"
-                );
+                assert_eq!(a.is_nan(), b.is_nan(), "NaN disagreement on {s:?} at index {raw}");
                 if !a.is_nan() {
                     assert_eq!(a, b, "value disagreement on {s:?} at index {raw}");
                 }
@@ -26046,11 +23549,7 @@ mod theta_level_primitives {
 
     #[test]
     fn axes_for_theta_finds_the_free_and_dependent_levels() {
-        let s = spec(vec![
-            LevelRule::Free(0),
-            LevelRule::Free(1),
-            LevelRule::NegSum(0, 2),
-        ]);
+        let s = spec(vec![LevelRule::Free(0), LevelRule::Free(1), LevelRule::NegSum(0, 2)]);
         // θ_0 is read directly by level 1 and through the contrast by level 3.
         assert_eq!(s.axes_for_theta(0), (Some(1), Some(3)));
         assert_eq!(s.axes_for_theta(1), (Some(2), Some(3)));
@@ -26333,11 +23832,7 @@ fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
 "#
         );
         let m = parse_model_string(&src).expect("parse");
-        let p = m
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.rhs_program.as_ref())
-            .expect("rhs program");
+        let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
         (
             p.uses_time_vars(),
             p.reads_time_builtin(),
@@ -26349,27 +23844,15 @@ fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
     // `TIME` sets ONLY the built-in flag; the slot-backed names set ONLY the
     // broad flag. Neither flag alone covers all four — that disjointness is the
     // whole reason `reads_model_time` exists.
-    assert_eq!(
-        flags("*(1.0 + 0.01*TIME)"),
-        (false, true, true, true),
-        "TIME"
-    );
+    assert_eq!(flags("*(1.0 + 0.01*TIME)"), (false, true, true, true), "TIME");
     assert_eq!(flags("*(1.0 + 0.01*T)"), (true, false, true, true), "T");
     // The lowercase aliases resolve to the same slot (`var_idx` binds `TIME`/`time`/`T`/`t`),
     // and nothing else pins that — a `T`-only fixture cannot tell the alias set apart.
     assert_eq!(flags("*(1.0 + 0.01*t)"), (true, false, true, true), "t");
-    assert_eq!(
-        flags("*(1.0 + 0.01*TAFD)"),
-        (true, false, true, true),
-        "TAFD"
-    );
+    assert_eq!(flags("*(1.0 + 0.01*TAFD)"), (true, false, true, true), "TAFD");
     // The discriminating row: `TAD` is model time but **not** an absolute clock, so it is
     // the only spelling on which the two predicates disagree.
-    assert_eq!(
-        flags("*(1.0 + 0.01*TAD)"),
-        (true, false, true, false),
-        "TAD"
-    );
+    assert_eq!(flags("*(1.0 + 0.01*TAD)"), (true, false, true, false), "TAD");
     // …and mentioning `TAD` must not mask an absolute read sitting beside it: the flags are
     // a union over the block, not a classification of it.
     assert_eq!(
@@ -26377,11 +23860,7 @@ fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
         (true, false, true, true),
         "TAD and T together"
     );
-    assert_eq!(
-        flags(""),
-        (false, false, false, false),
-        "autonomous control"
-    );
+    assert_eq!(flags(""), (false, false, false, false), "autonomous control");
 }
 
 /// The two halves of [`OdeRhsProgram::pk_reads_absolute_time`], asserted **separately**.
@@ -26419,11 +23898,7 @@ fn the_two_absolute_clock_spellings_are_tracked_separately() {
 "#
         );
         let m = parse_model_string(&src).expect("parse");
-        let p = m
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.rhs_program.as_ref())
-            .expect("rhs program");
+        let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
         assert_eq!(
             p.pk_reads_absolute_time(),
             p.pk_reads_tafd() || p.pk_reads_solver_time(),
@@ -26436,11 +23911,7 @@ fn the_two_absolute_clock_spellings_are_tracked_separately() {
     assert_eq!(split("*(1.0 + 0.01*TAFD)"), (true, false), "TAFD alone");
     assert_eq!(split("*(1.0 + 0.01*T)"), (false, true), "T alone");
     assert_eq!(split("*(1.0 + 0.01*TIME)"), (false, true), "TIME alone");
-    assert_eq!(
-        split("*(1.0 + 0.01*TAFD + 0.01*TIME)"),
-        (true, true),
-        "both spellings"
-    );
+    assert_eq!(split("*(1.0 + 0.01*TAFD + 0.01*TIME)"), (true, true), "both spellings");
     // `TAD` sets neither, which is what keeps the diagnostic off a model #1139 T2 fixed.
     assert_eq!(split("*(1.0 + 0.01*TAD)"), (false, false), "TAD alone");
     assert_eq!(split(""), (false, false), "autonomous control");
@@ -26488,11 +23959,7 @@ fn joint_src(pk: &str, pre: &str, haz: &str) -> String {
 #[cfg(feature = "survival")]
 fn joint_flags(pk: &str, pre: &str, haz: &str) -> (bool, bool, bool, bool, bool) {
     let m = parse_model_string(&joint_src(pk, pre, haz)).expect("joint model must parse");
-    let p = m
-        .ode_spec
-        .as_ref()
-        .and_then(|o| o.rhs_program.as_ref())
-        .expect("rhs program");
+    let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
     (
         p.uses_time_vars(),
         p.reads_time_builtin(),
@@ -26558,11 +24025,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
     // was a top-level `AssignBc` the kind filter kept, and this read `(.., true, true)`.
     const HAZ_TT: &str = "H0 * exp(0.05*TT) * exp(BETA * (central / V))";
     let inline = joint_flags("", "", "H0 * exp(0.05*TIME) * exp(BETA * (central / V))");
-    assert_eq!(
-        inline,
-        (false, true, true, false, false),
-        "inline `TIME` in the hazard"
-    );
+    assert_eq!(inline, (false, true, true, false, false), "inline `TIME` in the hazard");
     assert_eq!(
         joint_flags("", "TT = TIME", HAZ_TT),
         inline,
@@ -26570,11 +24033,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
     );
     // Transitive, not one-hop: `UU` is what the hazard reads, `TT` only `UU` does.
     assert_eq!(
-        joint_flags(
-            "",
-            "TT = TIME\n  UU = TT",
-            "H0 * exp(0.05*UU) * exp(BETA * (central / V))"
-        ),
+        joint_flags("", "TT = TIME\n  UU = TT", "H0 * exp(0.05*UU) * exp(BETA * (central / V))"),
         inline,
         "a chain of intermediates read only by the hazard is cut as a whole"
     );
@@ -26587,11 +24046,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
         ("TT = TAFD", (true, false, true, true, true)),
         ("TT = TAD", (true, false, true, true, false)),
     ] {
-        let pk = if pre.contains("UU") {
-            " * (1.0 + 0.01*UU)"
-        } else {
-            " * (1.0 + 0.01*TT)"
-        };
+        let pk = if pre.contains("UU") { " * (1.0 + 0.01*UU)" } else { " * (1.0 + 0.01*TT)" };
         assert_eq!(
             joint_flags(pk, pre, AUTO),
             want,
@@ -26601,11 +24056,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
     // An `if` guarding a retained derivative keeps its condition, so a time-reading
     // intermediate read only *there* still counts.
     assert_eq!(
-        joint_flags(
-            " * K",
-            "TT = TIME\n  K = 1.0\n  if (TT > 5.0) {\n    K = 2.0\n  }",
-            AUTO
-        ),
+        joint_flags(" * K", "TT = TIME\n  K = 1.0\n  if (TT > 5.0) {\n    K = 2.0\n  }", AUTO),
         (false, true, true, true, true),
         "a time-reading intermediate in an `if` condition the PK RHS depends on"
     );
@@ -26645,11 +24096,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
         "an earlier condition governs a later PK arm"
     );
     assert_eq!(
-        joint_flags(
-            " * K",
-            &ladder("CL > 5.0", "TT > 5.0", " else {\n    K = 3.0\n  }"),
-            HAZ_G
-        ),
+        joint_flags(" * K", &ladder("CL > 5.0", "TT > 5.0", " else {\n    K = 3.0\n  }"), HAZ_G),
         (false, true, true, true, true),
         "an `else` keeping a PK statement depends on every condition before it"
     );
@@ -26682,26 +24129,16 @@ fn without_an_event_model_the_narrow_flag_equals_the_wide_one() {
 "
         );
         let m = parse_model_string(&src).expect("parse");
-        let p = m
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.rhs_program.as_ref())
-            .expect("rhs program");
-        (
-            p.reads_model_time(),
-            p.pk_reads_model_time(),
-            p.pk_reads_absolute_time(),
-        )
+        let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
+        (p.reads_model_time(), p.pk_reads_model_time(), p.pk_reads_absolute_time())
     }
     // `want_absolute` is asserted here rather than derived, because this is the arm of the
     // `pk_view` selection that a model *with* an `[event_model]` never reaches: with no
     // injected slots the filter is skipped entirely, so a mutation to it is invisible from
     // this side and a mutation to the selection is invisible from the other.
-    for (term, want_absolute) in [
-        ("", false),
-        ("*(1.0 + 0.01*TIME)", true),
-        ("*(1.0 + 0.01*TAD)", false),
-    ] {
+    for (term, want_absolute) in
+        [("", false), ("*(1.0 + 0.01*TIME)", true), ("*(1.0 + 0.01*TAD)", false)]
+    {
         let (wide, narrow, absolute) = flags(term);
         assert_eq!(
             wide, narrow,
@@ -26741,11 +24178,7 @@ fn a_user_state_named_like_the_accumulator_is_not_excluded() {
   DV ~ proportional(PROP_ERR)
 ";
     let m = parse_model_string(src).expect("`__chz_1` is a legal user state with no [event_model]");
-    let p = m
-        .ode_spec
-        .as_ref()
-        .and_then(|o| o.rhs_program.as_ref())
-        .expect("rhs program");
+    let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
     assert!(
         p.reads_model_time() && p.pk_reads_model_time(),
         "a user's own `__chz_1` derivative reading TIME must still read as non-autonomous"
@@ -26772,11 +24205,7 @@ fn a_second_chz_named_user_state_is_walked_because_it_was_not_injected() {
             "  d/dt(depot)   = -KA * depot\n  d/dt(__chz_9) = 0.01 * TIME",
         );
     let m = parse_model_string(&src).expect("`__chz_9` is not the injected accumulator");
-    let p = m
-        .ode_spec
-        .as_ref()
-        .and_then(|o| o.rhs_program.as_ref())
-        .expect("rhs program");
+    let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
     assert!(
         p.pk_reads_model_time(),
         "a user state whose name merely looks like the accumulator is still a PK \
@@ -26811,17 +24240,11 @@ fn a_time_reading_form_c_readout_does_not_widen_the_predicate() {
     // time. Without this the two assertions below would also hold for a model where
     // the `[scaling]` substitution silently did nothing.
     assert!(
-        spec.readout_program
-            .as_ref()
-            .expect("Form C readout")
-            .reads_time_builtin(),
+        spec.readout_program.as_ref().expect("Form C readout").reads_time_builtin(),
         "the readout must actually read the TIME built-in"
     );
     let prog = spec.rhs_program.as_ref().expect("rhs program");
-    assert!(
-        !prog.reads_model_time(),
-        "the RHS itself is autonomous — only the readout reads time"
-    );
+    assert!(!prog.reads_model_time(), "the RHS itself is autonomous — only the readout reads time");
     assert!(
         !crate::pk::model_uses_time_anywhere(&m),
         "a time-reading readout must not route the model off the dense driver"
@@ -26838,20 +24261,14 @@ fn a_time_reading_form_c_readout_does_not_widen_the_predicate() {
 fn reading_the_hazard_accumulator_is_rejected_everywhere_it_could_feed_back() {
     let cases = [
         // From a PK derivative — the read that would actually couple the systems.
-        (
-            joint_src(" + 0.0*__chz_3", "", "H0 * exp(BETA * (central / V))"),
-            "PK derivative",
-        ),
+        (joint_src(" + 0.0*__chz_3", "", "H0 * exp(BETA * (central / V))"), "PK derivative"),
         // Case-insensitively: the aliases resolve to the same slot.
         (
             joint_src(" + 0.0*__CHZ_3", "", "H0 * exp(BETA * (central / V))"),
             "PK derivative, upper case",
         ),
         // From an intermediate.
-        (
-            joint_src("", "Z = __chz_3", "H0 * exp(BETA * (central / V))"),
-            "intermediate",
-        ),
+        (joint_src("", "Z = __chz_3", "H0 * exp(BETA * (central / V))"), "intermediate"),
         // From inside an `if` condition — `stmts_read_slots` recurses into both
         // the condition and the body, and a gate that only walked bodies would
         // miss this.
@@ -26887,9 +24304,7 @@ fn reading_the_hazard_accumulator_is_rejected_everywhere_it_could_feed_back() {
 #[cfg(feature = "survival")]
 fn seeding_the_hazard_accumulator_with_init_is_rejected() {
     let src = joint_src("", "init(__chz_3) = 0.5", "H0 * exp(BETA * (central / V))");
-    let err = parse_model_string(&src)
-        .err()
-        .expect("init(__chz_3) must be rejected");
+    let err = parse_model_string(&src).err().expect("init(__chz_3) must be rejected");
     assert!(
         err.contains("init(__chz_3)") && err.contains("H(0) = 0"),
         "error must name the init and the definition it violates: {err}"
@@ -26910,15 +24325,8 @@ fn a_scaling_readout_may_read_the_hazard_accumulator() {
         )
         .replace("[event_model]", "[scaling]\n  y = __chz_3\n\n[event_model]");
     let m = parse_model_string(&src).expect("a readout reading __chz_3 must parse");
-    let p = m
-        .ode_spec
-        .as_ref()
-        .and_then(|o| o.rhs_program.as_ref())
-        .expect("rhs program");
-    assert!(
-        !p.pk_reads_model_time(),
-        "a readout does not make the PK block non-autonomous"
-    );
+    let p = m.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
+    assert!(!p.pk_reads_model_time(), "a readout does not make the PK block non-autonomous");
 }
 
 /// As [`cl_at`], but with a *constant* then-branch — so a branch taken while
@@ -26984,13 +24392,8 @@ fn present_is_only_special_in_condition_position() {
 #[test]
 fn an_unclosed_present_is_a_parse_error() {
     let src = present_model("present(WT").replace("else 1.0)", "else 1.0)");
-    let e = parse_full_model(&src)
-        .map(|_| ())
-        .expect_err("unbalanced `present(` must not parse");
-    assert!(
-        e.to_lowercase().contains("present") || e.contains(')'),
-        "{e}"
-    );
+    let e = parse_full_model(&src).map(|_| ()).expect_err("unbalanced `present(` must not parse");
+    assert!(e.to_lowercase().contains("present") || e.contains(')'), "{e}");
 }
 
 // ── #1182: `power(SIGMA, P)` and the `TAD` magnitude built-in ───────────────
@@ -27029,10 +24432,7 @@ fn power_form_parses_as_proportional_with_an_exponent_slot() {
     let row = rm.eval_obs(&theta, &cov, 1.0, 1.0);
     assert_eq!(row, vec![1.0, 1.3], "multiplier half then exponent half");
     let th = [0.2, 10.0, 1.3];
-    assert!(
-        rm.per_sigma_deriv[0].is_none(),
-        "the bare multiplier has no θ-derivative program"
-    );
+    assert!(rm.per_sigma_deriv[0].is_none(), "the bare multiplier has no θ-derivative program");
     let p = rm.per_sigma_exponent_deriv[0].as_ref().unwrap();
     assert_eq!(
         deriv_theta_grad(p, &th, &cov, 1.0, 1.0),
@@ -27047,14 +24447,8 @@ fn power_form_parses_as_proportional_with_an_exponent_slot() {
     );
     // The row reaches the variance: σ²·|f|^{2p} at f = 2.
     let sigma = &model.default_params.sigma.values;
-    let v = model
-        .error_spec
-        .variance_at_scaled(1, 2.0, sigma, &[], &row);
-    approx::assert_relative_eq!(
-        v,
-        sigma[0] * sigma[0] * 2.0f64.powf(2.6),
-        max_relative = 1e-12
-    );
+    let v = model.error_spec.variance_at_scaled(1, 2.0, sigma, &[], &row);
+    approx::assert_relative_eq!(v, sigma[0] * sigma[0] * 2.0f64.powf(2.6), max_relative = 1e-12);
 }
 
 /// An exponent of exactly `1` is the proportional model, on the legacy
@@ -27071,9 +24465,7 @@ fn power_form_with_unit_exponent_is_the_proportional_variance_bit_for_bit() {
     for f in [0.0, 0.37, 2.0, 15.5, -3.0] {
         assert_eq!(
             model.error_spec.variance_at_scaled(1, f, sigma, &[], &row),
-            model
-                .error_spec
-                .variance_at_scaled(1, f, sigma, &[], &row[..1]),
+            model.error_spec.variance_at_scaled(1, f, sigma, &[], &row[..1]),
             "f = {f}"
         );
         assert_eq!(
@@ -27112,14 +24504,8 @@ fn magnitude_expression_reads_tad() {
     assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 20.0), vec![1.0]);
     let p = rm.per_sigma_deriv[0].as_ref().unwrap();
     let th = [0.2, 10.0, 1.5];
-    assert_eq!(
-        deriv_theta_grad(p, &th, &cov, 100.0, 5.0),
-        vec![0.0, 0.0, 1.0]
-    );
-    assert_eq!(
-        deriv_theta_grad(p, &th, &cov, 100.0, 20.0),
-        vec![0.0, 0.0, 0.0]
-    );
+    assert_eq!(deriv_theta_grad(p, &th, &cov, 100.0, 5.0), vec![0.0, 0.0, 1.0]);
+    assert_eq!(deriv_theta_grad(p, &th, &cov, 100.0, 20.0), vec![0.0, 0.0, 0.0]);
 }
 
 /// `Subject::time_after_dose` is the data TAD with Pharmpy's `get_doseid`
@@ -27153,13 +24539,8 @@ fn subject_time_after_dose_is_the_data_tad() {
         "Pharmpy grouping: the lone pre-dose sample is group 0 at offset 0; \
          obs@24 belongs to dose@0; obs@0 keeps the first dose"
     );
-    let nonmem: Vec<f64> = (0..6)
-        .map(|j| subject.time_after_dose_at_or_before(j))
-        .collect();
-    assert!(
-        nonmem[0].is_nan(),
-        "sdtab fallback: NaN before the first dose"
-    );
+    let nonmem: Vec<f64> = (0..6).map(|j| subject.time_after_dose_at_or_before(j)).collect();
+    assert!(nonmem[0].is_nan(), "sdtab fallback: NaN before the first dose");
     assert_eq!(
         nonmem[1..],
         [0.0, 2.0, 23.9, 0.0, 6.0],
@@ -27187,17 +24568,10 @@ fn subject_time_after_dose_is_the_data_tad() {
     assert_eq!(tad, [1.0, 3.0, 0.0, 2.0]);
     // A subject with no dose at all is one group-0 run: time since its first
     // record, never NaN.
-    let undosed = Subject {
-        id: "5".into(),
-        obs_times: vec![0.0, 4.0, 9.0],
-        ..Default::default()
-    };
+    let undosed = Subject { id: "5".into(), obs_times: vec![0.0, 4.0, 9.0], ..Default::default() };
     let tad: Vec<f64> = (0..3).map(|j| undosed.time_after_dose(j)).collect();
     assert_eq!(tad, [0.0, 4.0, 9.0]);
-    assert!(
-        undosed.time_after_dose(3).is_nan(),
-        "out of range stays NaN"
-    );
+    assert!(undosed.time_after_dose(3).is_nan(), "out of range stays NaN");
 
     let ss = Subject {
         id: "2".into(),
@@ -27210,11 +24584,7 @@ fn subject_time_after_dose_is_the_data_tad() {
         0.0,
         "an observation at an SS dose's time stays with that dose (no swap)"
     );
-    assert_eq!(
-        ss.time_after_dose(1),
-        2.0,
-        "SS with II=12: last implied dose at 24"
-    );
+    assert_eq!(ss.time_after_dose(1), 2.0, "SS with II=12: last implied dose at 24");
     // An SS dose at the observation's time counts under Pharmpy's rule even
     // when a non-SS dose precedes it.
     let ss_later = Subject {
@@ -27279,10 +24649,9 @@ fn ruv_magnitude_records_whether_it_reads_tad() {
         assert!(with.ruv_magnitude.as_ref().unwrap().uses_tad, "{spelling}");
     }
     // The exponent is an expression too.
-    let in_exponent = parse_model_string(&POWER_MODEL.replace(
-        "power(PROP_ERR, RUV_POW)",
-        "power(PROP_ERR, RUV_POW + 0.01 * TAD)",
-    ))
+    let in_exponent = parse_model_string(
+        &POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR, RUV_POW + 0.01 * TAD)"),
+    )
     .unwrap();
     assert!(in_exponent.ruv_magnitude.as_ref().unwrap().uses_tad);
 }
@@ -27299,51 +24668,39 @@ fn power_form_rejects_the_wrong_argument_count() {
 
 #[test]
 fn power_form_rejects_a_sigma_in_the_exponent() {
-    let err = expect_parse_err(&POWER_MODEL.replace(
-        "power(PROP_ERR, RUV_POW)",
-        "power(PROP_ERR, RUV_POW * PROP_ERR)",
-    ));
+    let err = expect_parse_err(
+        &POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR, RUV_POW * PROP_ERR)"),
+    );
     assert!(err.contains("references sigma `PROP_ERR`"), "got: {err}");
 }
 
 #[test]
 fn power_form_rejects_an_eta_in_the_exponent() {
-    let err = expect_parse_err(&POWER_MODEL.replace(
-        "power(PROP_ERR, RUV_POW)",
-        "power(PROP_ERR, RUV_POW * exp(ETA_CL))",
-    ));
-    assert!(
-        err.contains("power exponent may not depend on a random effect"),
-        "got: {err}"
+    let err = expect_parse_err(
+        &POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR, RUV_POW * exp(ETA_CL))"),
     );
+    assert!(err.contains("power exponent may not depend on a random effect"), "got: {err}");
 }
 
 #[test]
 fn power_form_rejects_the_forms_it_cannot_combine_with() {
-    let err = expect_parse_err(&POWER_MODEL.replace(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "log(DV) ~ power(PROP_ERR, RUV_POW)",
-    ));
+    let err = expect_parse_err(
+        &POWER_MODEL.replace("DV ~ power(PROP_ERR, RUV_POW)", "log(DV) ~ power(PROP_ERR, RUV_POW)"),
+    );
     assert!(
         err.contains("log-transform-both-sides supports additive error on the log scale"),
         "got: {err}"
     );
-    let err = expect_parse_err(&POWER_MODEL.replace(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "DV ~ power(PROP_ERR, RUV_POW) weight = TVV",
-    ));
-    assert!(
-        err.contains("`weight = …` has no effect on a `power(...)`"),
-        "got: {err}"
+    let err = expect_parse_err(
+        &POWER_MODEL
+            .replace("DV ~ power(PROP_ERR, RUV_POW)", "DV ~ power(PROP_ERR, RUV_POW) weight = TVV"),
     );
+    assert!(err.contains("`weight = …` has no effect on a `power(...)`"), "got: {err}");
     let err = expect_parse_err(&POWER_MODEL.replace(
         "DV ~ power(PROP_ERR, RUV_POW)",
         "if (TVV > 1.0) { DV ~ power(PROP_ERR, RUV_POW) } else { DV ~ proportional(PROP_ERR) }",
     ));
-    assert!(
-        err.contains("not supported inside a covariate-selected"),
-        "got: {err}"
-    );
+    assert!(err.contains("not supported inside a covariate-selected"), "got: {err}");
 }
 
 #[test]
@@ -27460,14 +24817,8 @@ fn unknown_fn_probe_sources(fname: &str) -> Vec<(&'static str, String)> {
                 prop,
             ),
         ),
-        (
-            "[scaling]",
-            unknown_fn_probe_model("", "", &format!(" * {fname}(CL)"), "", prop),
-        ),
-        (
-            "[derived]",
-            unknown_fn_probe_model("", "", "", &format!("\n  CLd = {fname}(CL)"), prop),
-        ),
+        ("[scaling]", unknown_fn_probe_model("", "", &format!(" * {fname}(CL)"), "", prop)),
+        ("[derived]", unknown_fn_probe_model("", "", "", &format!("\n  CLd = {fname}(CL)"), prop)),
         (
             "[error_model] magnitude expression",
             unknown_fn_probe_model(
@@ -27534,12 +24885,7 @@ fn unknown_function_name_is_a_parse_error_in_every_block() {
 /// (`test_clamp_arity_diagnostics` pins the rest).
 #[test]
 fn an_unknown_name_is_rejected_at_every_arity() {
-    for call in [
-        "pow(TVCL, 2.0)",
-        "atan2(TVCL, TVV)",
-        "fma(TVCL, TVV, 1.0)",
-        "sinh()",
-    ] {
+    for call in ["pow(TVCL, 2.0)", "atan2(TVCL, TVV)", "fma(TVCL, TVV, 1.0)", "sinh()"] {
         let src = unknown_fn_probe_model(
             &format!("  KE = {call}\n"),
             "",
@@ -27625,10 +24971,7 @@ fn function_name_matching_is_case_insensitive_on_both_sides() {
             "proportional(PROP_ERR)",
         );
         let err = parse_model_string(&src).expect_err(&format!("`{bad}` must be rejected"));
-        assert!(
-            err.contains("unknown function"),
-            "`{bad}`: got the wrong error: {err}"
-        );
+        assert!(err.contains("unknown function"), "`{bad}`: got the wrong error: {err}");
     }
 }
 
@@ -27722,27 +25065,15 @@ fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
         // 1. `eval_expr` has an arm: the value is not the argument.
         let v = eval_at(&expr, theta, eta, vars, covs);
         assert!(v.is_finite(), "`{name}({x})` must be finite, got {v}");
-        assert_ne!(
-            v, x,
-            "`{name}({x})` returned its argument — the identity fallthrough is back"
-        );
+        assert_ne!(v, x, "`{name}({x})` returned its argument — the identity fallthrough is back");
 
         // 2. `compile_expr_into` has an arm: the bytecode agrees bit-for-bit.
         bc_vs_ast(expr.clone(), vars, theta, eta, covs);
 
         // 3. `differentiate_with_chain` has an arm: the derivative is neither
         //    the argument's derivative (2) nor NaN, and it matches FD.
-        let d = eval_at(
-            &differentiate(&expr, DiffAxis::Theta(0)),
-            theta,
-            eta,
-            vars,
-            covs,
-        );
-        assert!(
-            d.is_finite(),
-            "d/dθ₀ `{name}(2·θ₀)` must be finite, got {d}"
-        );
+        let d = eval_at(&differentiate(&expr, DiffAxis::Theta(0)), theta, eta, vars, covs);
+        assert!(d.is_finite(), "d/dθ₀ `{name}(2·θ₀)` must be finite, got {d}");
         assert_ne!(
             d, 2.0,
             "d/dθ₀ `{name}(2·θ₀)` is the argument's derivative — the `_ => da` fallthrough is back"
@@ -27849,9 +25180,8 @@ fn prior_tail_parses_on_theta_omega_and_sigma() {
          omega ETA_CL ~ 0.09 prior(0.09, rse = 40%)\n  \
          sigma PROP_ERR ~ 0.04 prior(0.04, sd = 0.01)\n\n",
     );
-    let model = parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("priored model should parse: {e}"))
-        .model;
+    let model =
+        parse_full_model(&src).unwrap_or_else(|e| panic!("priored model should parse: {e}")).model;
 
     let names: Vec<&str> = model.priors.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["TVCL", "TVV", "ETA_CL", "PROP_ERR"]);
@@ -27869,9 +25199,8 @@ fn prior_tail_parses_on_theta_omega_and_sigma() {
 /// attached a prior to everything.
 #[test]
 fn a_model_without_priors_declares_none() {
-    let model = parse_full_model(&priored_model(PRIOR_BASE_PARAMS))
-        .expect("base model should parse")
-        .model;
+    let model =
+        parse_full_model(&priored_model(PRIOR_BASE_PARAMS)).expect("base model should parse").model;
     assert!(model.priors.is_empty());
 }
 
@@ -27886,9 +25215,7 @@ fn prior_tail_coexists_with_fix_and_scale_annotations() {
          omega ETA_CL ~ 0.3 (sd) prior(0.3, rse = 20%)\n  \
          sigma PROP_ERR ~ 0.04\n\n",
     );
-    let model = parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("should parse: {e}"))
-        .model;
+    let model = parse_full_model(&src).unwrap_or_else(|e| panic!("should parse: {e}")).model;
     assert_eq!(model.priors.len(), 2);
     // The `(sd)` annotation still reached the omega parser: without the peel,
     // `omega_re` would have matched a line ending in `prior(...)` and the
@@ -27909,10 +25236,7 @@ fn a_bare_rse_above_one_is_rejected_as_ambiguous() {
     ));
     assert!(err.contains("ambiguous"), "got: {err}");
     assert!(err.contains("25%"), "must name the percent spelling: {err}");
-    assert!(
-        err.contains("0.25"),
-        "must name the fraction spelling: {err}"
-    );
+    assert!(err.contains("0.25"), "must name the fraction spelling: {err}");
 
     // The straddle: a fraction at or below 1 is accepted, so the check rejects
     // the ambiguous case rather than every bare number.
@@ -27958,10 +25282,7 @@ fn a_malformed_prior_call_is_rejected() {
              omega ETA_CL ~ 0.09\n  \
              sigma PROP_ERR ~ 0.04\n\n"
         )));
-        assert!(
-            err.contains(needle),
-            "`{call}` should mention `{needle}`: {err}"
-        );
+        assert!(err.contains(needle), "`{call}` should mention `{needle}`: {err}");
     }
 }
 
@@ -28054,9 +25375,7 @@ fn a_prior_after_a_kappa_weight_modifier_is_still_seen() {
          pk one_cpt_iv(cl=CL, v=V)\n\n\
          [error_model]\n  \
          DV ~ proportional(PROP_ERR)\n";
-    let model = parse_full_model(src)
-        .unwrap_or_else(|e| panic!("should parse: {e}"))
-        .model;
+    let model = parse_full_model(src).unwrap_or_else(|e| panic!("should parse: {e}")).model;
     assert_eq!(model.priors.len(), 1);
     assert_eq!(model.priors[0].name, "K_CL");
     // Both modifiers survived: the weight went to the kappa, the prior to the
@@ -28143,9 +25462,7 @@ fn an_identifier_containing_prior_is_not_the_modifier() {
          sigma PROP_ERR ~ 0.04\n\n",
     )
     .replace("CL = TVCL", "CL = MY_prior");
-    let model = parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("should parse: {e}"))
-        .model;
+    let model = parse_full_model(&src).unwrap_or_else(|e| panic!("should parse: {e}")).model;
     assert!(model.priors.is_empty());
     assert!(model.theta_names.iter().any(|n| n == "MY_prior"));
 }
@@ -28202,11 +25519,7 @@ fn priors_block_reads_the_from_fit_path_in_every_spelling() {
         assert_eq!(model.priors.len(), 4, "`{line}`: {:?}", model.priors);
         // …and each imported prior knows which family it is on, which is what
         // lets it resolve in a model that reuses a name across two.
-        assert!(
-            model.priors.iter().all(|p| p.kind.is_some()),
-            "`{line}`: {:?}",
-            model.priors
-        );
+        assert!(model.priors.iter().all(|p| p.kind.is_some()), "`{line}`: {:?}", model.priors);
     }
 }
 
@@ -28250,14 +25563,10 @@ fn an_unknown_priors_key_is_an_error() {
 
 #[test]
 fn a_malformed_priors_line_is_an_error() {
-    let err = parse_full_model(&from_fit_model("  parent-fit.yaml"))
-        .map(|_| ())
-        .unwrap_err();
+    let err = parse_full_model(&from_fit_model("  parent-fit.yaml")).map(|_| ()).unwrap_err();
     assert!(err.contains("key = value"), "{err}");
 
-    let err = parse_full_model(&from_fit_model("  from_fit ="))
-        .map(|_| ())
-        .unwrap_err();
+    let err = parse_full_model(&from_fit_model("  from_fit =")).map(|_| ()).unwrap_err();
     assert!(err.contains("empty `from_fit`"), "{err}");
 
     let err = parse_full_model(&from_fit_model("  from_fit = a.yaml\n  from_fit = b.yaml"))
@@ -28446,10 +25755,7 @@ fn model_name_is_read_in_both_spellings() {
     assert_eq!(parsed_name("model warfarin_pk"), "warfarin_pk");
     assert_eq!(parsed_name("model = warfarin_pk"), "warfarin_pk");
     assert_eq!(parsed_name("model=warfarin_pk"), "warfarin_pk");
-    assert_eq!(
-        parsed_name("  model =  warfarin_pk   # the name"),
-        "warfarin_pk"
-    );
+    assert_eq!(parsed_name("  model =  warfarin_pk   # the name"), "warfarin_pk");
     assert_eq!(parsed_name(""), UNNAMED_MODEL);
     assert_eq!(parsed_name("# model = commented_out"), UNNAMED_MODEL);
 }
@@ -28502,16 +25808,8 @@ fn a_model_declaration_inside_any_block_is_rejected_naming_the_block() {
     let cases = [
         ("", "[data]\n  path = x.csv\n  model inside\n", "data"),
         ("", "[odes]\n  model inside\n", "odes"),
-        (
-            "[parameters]\n",
-            "[parameters]\n  model inside\n",
-            "parameters",
-        ),
-        (
-            "[parameters]\n",
-            "[parameters]\n  model = inside\n",
-            "parameters",
-        ),
+        ("[parameters]\n", "[parameters]\n  model inside\n", "parameters"),
+        ("[parameters]\n", "[parameters]\n  model = inside\n", "parameters"),
         ("", "[covariates WT]\n  model inside\n", "covariates WT"),
     ];
     for (needle, replacement, block) in cases {
@@ -28568,10 +25866,7 @@ fn an_in_block_model_assignment_is_not_a_declaration() {
 /// that merely starts with the keyword (`modelled`) is not a `model` line.
 #[test]
 fn preamble_prose_and_model_prefixed_words_are_not_model_lines() {
-    assert_eq!(
-        parsed_name("; ferx side of the anchor\n; second line"),
-        UNNAMED_MODEL
-    );
+    assert_eq!(parsed_name("; ferx side of the anchor\n; second line"), UNNAMED_MODEL);
     assert_eq!(parsed_name("modelled = 3\nmodel real_name"), "real_name");
 }
 
@@ -28733,18 +26028,13 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
             // fallback path; there is nothing to compare here.
             continue;
         };
-        assert!(
-            !split.prefix.is_empty(),
-            "{name}: split returned Some with an empty prefix"
-        );
+        assert!(!split.prefix.is_empty(), "{name}: split returned Some with an empty prefix");
         n_split += 1;
 
         let n_cov = model.referenced_covariates.len();
         let mut seed = 0x2545_F491_4F6C_DD1D_u64;
         for trial in 0..64 {
-            let theta: Vec<f64> = (0..model.n_theta)
-                .map(|_| 1.0 + e6_rng(&mut seed))
-                .collect();
+            let theta: Vec<f64> = (0..model.n_theta).map(|_| 1.0 + e6_rng(&mut seed)).collect();
             let eta: Vec<f64> = (0..model.n_eta).map(|_| e6_rng(&mut seed) * 0.4).collect();
             let cov: Vec<f64> = (0..n_cov).map(|_| 1.0 + e6_rng(&mut seed)).collect();
             let time = 10.0 * (1.0 + e6_rng(&mut seed));
@@ -28829,9 +26119,7 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         let mut inputs: Vec<(Vec<f64>, Vec<f64>, HashMap<String, f64>, f64)> = Vec::new();
         for i in 0..24 {
-            let theta: Vec<f64> = (0..model.n_theta)
-                .map(|_| 1.0 + e6_rng(&mut seed))
-                .collect();
+            let theta: Vec<f64> = (0..model.n_theta).map(|_| 1.0 + e6_rng(&mut seed)).collect();
             let eta: Vec<f64> = (0..model.n_eta).map(|_| e6_rng(&mut seed) * 0.4).collect();
             let mut cov = HashMap::new();
             for (j, n) in cov_names.iter().enumerate() {
@@ -28854,10 +26142,8 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
             .iter()
             .map(|(theta, eta, cov, time)| {
                 let _guard = ModelTimeGuard::enter(*time);
-                let cov_vec: Vec<f64> = cov_names
-                    .iter()
-                    .map(|n| cov.get(n).copied().unwrap_or(0.0))
-                    .collect();
+                let cov_vec: Vec<f64> =
+                    cov_names.iter().map(|n| cov.get(n).copied().unwrap_or(0.0)).collect();
                 let mut vars = vec![0.0f64; program.n_vars];
                 let mut stack: Vec<f64> = Vec::new();
                 eval_statements_indexed_with_stack(
@@ -28939,11 +26225,7 @@ fn eta_dependent_statements_shed_their_eta_independent_powers() {
         .map(|(_, b)| b)
         .expect("zoo entry");
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
-    let program = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("program");
+    let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
         &program.stmts,
         program.n_vars,
@@ -28954,28 +26236,13 @@ fn eta_dependent_statements_shed_their_eta_independent_powers() {
     // Whole statements: HILL and KA are η-independent and hoist whole; V's `(WT/70)`
     // is too cheap to lift (cost < 20) so V stays whole in the suffix.
     assert_eq!(split.n_subexpr, 1, "lifted sub-expressions");
-    assert_eq!(
-        split.n_vars,
-        program.n_vars + 1,
-        "one synthetic slot per lift"
-    );
-    assert!(
-        !split.key_time,
-        "no TIME reader may be lifted, so TIME stays out of the key"
-    );
+    assert_eq!(split.n_vars, program.n_vars + 1, "one synthetic slot per lift");
+    assert!(!split.key_time, "no TIME reader may be lifted, so TIME stays out of the key");
     // Powers: original program has 1 (KA) + 4 (CL) = 5; the suffix keeps the two
     // `TIME^HILL` and `TI50^HILL`.
     assert_eq!(count_pow_ops(&program.stmts), 5);
-    assert_eq!(
-        count_pow_ops(&split.suffix),
-        3,
-        "TIME readers and the η reader stay"
-    );
-    assert_eq!(
-        count_pow_ops(&split.prefix),
-        2,
-        "KA's and CL's lifted allometric power"
-    );
+    assert_eq!(count_pow_ops(&split.suffix), 3, "TIME readers and the η reader stay");
+    assert_eq!(count_pow_ops(&split.prefix), 2, "KA's and CL's lifted allometric power");
     // The synthetic slot is the tail of `writes`, so the cache entry's `vals` stays
     // parallel to it.
     assert_eq!(split.writes.last().copied(), Some(program.n_vars));
@@ -28994,11 +26261,7 @@ fn a_literal_left_subtraction_is_lifted_out_of_an_eta_statement() {
         .map(|(_, b)| b)
         .expect("zoo entry");
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
-    let program = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("program");
+    let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
         &program.stmts,
         program.n_vars,
@@ -29031,11 +26294,7 @@ fn a_tainted_slot_blocks_the_sub_expression_lift() {
                 \x20 V     = TVV * SCALE^0.5 * exp(ETA_V)\n\
                 \x20 KA    = TVKA\n";
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
-    let program = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("program");
+    let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
         &program.stmts,
         program.n_vars,
@@ -29056,17 +26315,8 @@ fn a_tainted_slot_blocks_the_sub_expression_lift() {
 #[test]
 fn an_nn_output_read_is_never_hoistable() {
     let mut d = IpStmtDeps::default();
-    ip_deps_expr(
-        &Expression::NnOutput {
-            nn_idx: 0,
-            output_idx: 0,
-        },
-        &mut d,
-    );
-    assert!(
-        d.dynamic,
-        "an NN output read must mark the statement dynamic"
-    );
+    ip_deps_expr(&Expression::NnOutput { nn_idx: 0, output_idx: 0 }, &mut d);
+    assert!(d.dynamic, "an NN output read must mark the statement dynamic");
     // And the same for an unresolved name, which carries no slot index.
     let mut d = IpStmtDeps::default();
     ip_deps_expr(&Expression::Variable("X".into()), &mut d);
@@ -29095,12 +26345,8 @@ fn an_nn_output_read_is_never_hoistable() {
 /// One `pk_param_fn` evaluation, returned as raw bits so a comparison cannot
 /// quietly become a tolerance.
 fn ip_eval_bits(
-    model: &CompiledModel,
-    theta: &[f64],
-    eta: &[f64],
-    cov: &std::collections::HashMap<String, f64>,
-    time: f64,
-    class: Option<usize>,
+    model: &CompiledModel, theta: &[f64], eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>, time: f64, class: Option<usize>,
 ) -> Vec<u64> {
     let _class_guard = class.map(MixtureClassGuard::enter);
     let p = (model.pk_param_fn)(theta, eta, cov, time);
@@ -29117,18 +26363,8 @@ fn ip_unhoisted_model(src: &str) -> CompiledModel {
     let model = parse_model_string(src).expect("unhoisted parse");
     assert!(
         split_ip_eta_independent_prefix(
-            &model
-                .indiv_param_partials
-                .indiv_param_program
-                .as_ref()
-                .expect("program")
-                .stmts,
-            model
-                .indiv_param_partials
-                .indiv_param_program
-                .as_ref()
-                .expect("program")
-                .n_vars,
+            &model.indiv_param_partials.indiv_param_program.as_ref().expect("program").stmts,
+            model.indiv_param_partials.indiv_param_program.as_ref().expect("program").n_vars,
             model.n_theta,
             model.referenced_covariates.len(),
         )
@@ -29192,12 +26428,7 @@ fn hoist_cache_key_covers_every_prefix_input() {
 
     // Each probe changes exactly one keyed input.
     let probes: Vec<(&str, Vec<f64>, HashMap<String, f64>, f64)> = vec![
-        (
-            "theta MATSLOPE",
-            vec![3.0, 20.0, 2.25],
-            base_cov.clone(),
-            base_time,
-        ),
+        ("theta MATSLOPE", vec![3.0, 20.0, 2.25], base_cov.clone(), base_time),
         (
             "covariate WT",
             base_theta.clone(),
@@ -29236,10 +26467,7 @@ fn hoist_cache_key_covers_every_prefix_input() {
     // runs against a resident entry rather than an empty cache.
     let base = ip_eval_bits(&hoisted, &base_theta, &eta, &base_cov, base_time, None);
     let base_again = ip_eval_bits(&hoisted, &base_theta, &eta, &base_cov, base_time, None);
-    assert_eq!(
-        base, base_again,
-        "a repeated identical input must be stable"
-    );
+    assert_eq!(base, base_again, "a repeated identical input must be stable");
     let (hits_after_base, _) = ip_cache_counters();
     assert!(
         hits_after_base >= 1,
@@ -29257,17 +26485,11 @@ fn hoist_cache_key_covers_every_prefix_input() {
              a key that omits it"
         );
         let want = ip_eval_bits(&cold, theta, &eta, cov, *time, None);
-        assert_eq!(
-            got, want,
-            "{name}: hoisted result differs from the unsplit program"
-        );
+        assert_eq!(got, want, "{name}: hoisted result differs from the unsplit program");
         // And the base entry must still be served correctly afterwards — a key
         // collision that overwrote it would show up here.
         let back = ip_eval_bits(&hoisted, &base_theta, &eta, &base_cov, base_time, None);
-        assert_eq!(
-            back, base,
-            "{name}: the base entry did not survive the probe"
-        );
+        assert_eq!(back, base, "{name}: the base entry did not survive the probe");
     }
 }
 
@@ -29317,10 +26539,7 @@ fn hoist_cache_key_covers_mixnum() {
     let c1_again = ip_eval_bits(&hoisted, &theta, &eta, &cov, 0.0, Some(1));
     assert_eq!(c1, c1_again);
     let (hits, _) = ip_cache_counters();
-    assert!(
-        hits >= 1,
-        "class 1 never hit the cache; the probe below is inert"
-    );
+    assert!(hits >= 1, "class 1 never hit the cache; the probe below is inert");
 
     let c2 = ip_eval_bits(&hoisted, &theta, &eta, &cov, 0.0, Some(2));
     assert_ne!(
@@ -29367,18 +26586,12 @@ fn hoist_cache_is_per_thread_not_per_subject() {
     ]
     .iter()
     .map(|&(wt, ht, age)| {
-        HashMap::from([
-            ("WT".to_string(), wt),
-            ("HT".to_string(), ht),
-            ("AGE".to_string(), age),
-        ])
+        HashMap::from([("WT".to_string(), wt), ("HT".to_string(), ht), ("AGE".to_string(), age)])
     })
     .collect();
 
-    let want: Vec<Vec<u64>> = subjects
-        .iter()
-        .map(|c| ip_eval_bits(&cold, &theta, &eta, c, 2.0, None))
-        .collect();
+    let want: Vec<Vec<u64>> =
+        subjects.iter().map(|c| ip_eval_bits(&cold, &theta, &eta, c, 2.0, None)).collect();
     // The occasion pair must actually differ, else "occasion-varying covariate"
     // is not being tested.
     assert_ne!(want[2], want[3], "the two occasions are indistinguishable");
@@ -29386,10 +26599,8 @@ fn hoist_cache_is_per_thread_not_per_subject() {
     ip_cache_reset();
     // Round-robin twice, then reverse: every lookup finds some *other*
     // subject's entry resident in the way it hashes to.
-    let order: Vec<usize> = (0..subjects.len())
-        .chain(0..subjects.len())
-        .chain((0..subjects.len()).rev())
-        .collect();
+    let order: Vec<usize> =
+        (0..subjects.len()).chain(0..subjects.len()).chain((0..subjects.len()).rev()).collect();
     for &i in &order {
         assert_eq!(
             ip_eval_bits(&hoisted, &theta, &eta, &subjects[i], 2.0, None),
@@ -29452,10 +26663,8 @@ fn hoist_cache_never_serves_another_models_entry() {
     // be chosen.
     let n_models = IP_CACHE_WAYS + 8;
     let exps: Vec<f64> = (0..n_models).map(|i| 0.5 + i as f64 * 0.01).collect();
-    let models: Vec<CompiledModel> = exps
-        .iter()
-        .map(|&e| parse_model_string(&mk(e)).expect("model parses"))
-        .collect();
+    let models: Vec<CompiledModel> =
+        exps.iter().map(|&e| parse_model_string(&mk(e)).expect("model parses")).collect();
     // One unhoisted twin is enough to confirm the fixture is one the hoist
     // applies to at all; the per-model references come from the closed form
     // below, which is cheaper than re-parsing 129 models.
@@ -29482,11 +26691,7 @@ fn hoist_cache_never_serves_another_models_entry() {
     let mut distinct: Vec<&Vec<u64>> = want.iter().collect();
     distinct.sort();
     distinct.dedup();
-    assert_eq!(
-        distinct.len(),
-        want.len(),
-        "the models are not all distinguishable"
-    );
+    assert_eq!(distinct.len(), want.len(), "the models are not all distinguishable");
 
     ip_cache_reset();
     for _ in 0..3 {
@@ -29507,10 +26712,7 @@ fn hoist_cache_never_serves_another_models_entry() {
         }
     }
     let (hits, _) = ip_cache_counters();
-    assert!(
-        hits >= 1,
-        "no model ever hit the cache, so `model_id` was never consulted"
-    );
+    assert!(hits >= 1, "no model ever hit the cache, so `model_id` was never consulted");
 }
 
 /// The hoist must be invisible to the analytic-sensitivity chain: `pk_param_fn`
@@ -29520,16 +26722,8 @@ fn hoist_cache_never_serves_another_models_entry() {
 fn hoist_leaves_the_indiv_param_program_unsplit() {
     let hoisted = parse_model_string(IP_KEY_PROBE_MODEL).expect("hoisted parse");
     let cold = ip_unhoisted_model(IP_KEY_PROBE_MODEL);
-    let hp = hoisted
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("program");
-    let cp = cold
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .expect("program");
+    let hp = hoisted.indiv_param_partials.indiv_param_program.as_ref().expect("program");
+    let cp = cold.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     assert_eq!(
         hp.stmts.len(),
         cp.stmts.len(),
@@ -29613,10 +26807,7 @@ fn a_level_blocks_own_undeclared_column_is_still_reported_alone() {
         "E0 = TVE0 + PLACEBO",
         LEVEL_BLOCK_STUDY_UNDECLARED,
     );
-    assert_eq!(
-        undeclared_covariates(&text),
-        Some(vec!["STUDY".to_string()])
-    );
+    assert_eq!(undeclared_covariates(&text), Some(vec!["STUDY".to_string()]));
 }
 
 /// T3. Two blocks, and a TIME-only block (`TIME` is the record time, not a
@@ -29646,10 +26837,7 @@ fn a_counted_gathers_undeclared_index_column_is_reported() {
         "E0 = TVE0 + PLACEBO[STUDY]",
         LEVEL_BLOCK_STUDY_UNDECLARED,
     );
-    assert_eq!(
-        undeclared_covariates(&text),
-        Some(vec!["STUDY".to_string()])
-    );
+    assert_eq!(undeclared_covariates(&text), Some(vec!["STUDY".to_string()]));
 }
 
 /// T5. The producer and the predicate share one prefix.
@@ -29682,10 +26870,7 @@ fn nested_levels_3_with(covariates: &str, emax: &str) -> String {
 }
 
 fn referenced(text: &str) -> Vec<String> {
-    parse_full_model(text)
-        .expect("model parses")
-        .model
-        .referenced_covariates
+    parse_full_model(text).expect("model parses").model.referenced_covariates
 }
 
 /// Both sides of the gate on one fixture: ARM read only by its `level` line is not
@@ -29708,10 +26893,7 @@ fn a_nested_level_column_is_reported_only_when_an_expression_also_reads_it() {
     for text in [&level_only, &also_read] {
         let covs = referenced(text);
         for col in ["ARM", "STUDY", "NARM"] {
-            assert!(
-                covs.iter().any(|c| c == col),
-                "{col} not a data column: {covs:?}"
-            );
+            assert!(covs.iter().any(|c| c == col), "{col} not a data column: {covs:?}");
         }
     }
 }
@@ -29720,17 +26902,10 @@ fn a_nested_level_column_is_reported_only_when_an_expression_also_reads_it() {
 /// level columns, and the read set is what it was before #2166.
 #[test]
 fn a_nested_level_model_without_a_covariates_block_is_unchanged() {
-    for emax in [
-        NESTED_EMAX,
-        "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + 0.01 * ARM)",
-    ] {
+    for emax in [NESTED_EMAX, "EMAX = TVEMAX * exp(ETA_SP + K_ST + K_ARM + 0.01 * ARM)"] {
         let text = nested_levels_3_with("", emax);
         assert_eq!(undeclared_covariates(&text), None, "{emax}");
-        assert_eq!(
-            referenced(&text),
-            ["ARM", "DOSE", "NARM", "STUDY"],
-            "{emax}"
-        );
+        assert_eq!(referenced(&text), ["ARM", "DOSE", "NARM", "STUDY"], "{emax}");
     }
 }
 
@@ -29768,10 +26943,7 @@ fn a_derived_column_named_after_a_nested_level_column_still_shadows_it() {
         "{}\n[derived]\n  ARM = IPRED\n",
         nested_levels_3_with(OTHER_COVS_DECLARED, NESTED_EMAX)
     );
-    let warnings = parse_full_model(&text)
-        .expect("model parses")
-        .model
-        .parse_warnings;
+    let warnings = parse_full_model(&text).expect("model parses").model.parse_warnings;
     assert!(
         warnings
             .iter()
@@ -29799,10 +26971,9 @@ fn gather_readout_model(engine: &str, extra_theta: &str, extra_ip: &str, readout
             "  ode(states=[central])\n\n[odes]\n  d/dt(central) = -CL / V * central\n".to_string(),
             format!("[scaling]\n  y = {readout}\n"),
         ),
-        "analytical" => (
-            "  pk one_cpt_iv(cl=CL, v=V)\n".to_string(),
-            format!("[scaling]\n  y = {readout}\n"),
-        ),
+        "analytical" => {
+            ("  pk one_cpt_iv(cl=CL, v=V)\n".to_string(), format!("[scaling]\n  y = {readout}\n"))
+        }
         "compartment-free" => (format!("  y = {readout}\n"), String::new()),
         other => panic!("unknown engine {other}"),
     };
@@ -29831,11 +27002,7 @@ fn gather_readout_program(m: &CompiledModel) -> &OdeOutputProgram {
 }
 
 fn readout_has_gather_op(m: &CompiledModel) -> bool {
-    gather_readout_program(m)
-        .bc
-        .ops
-        .iter()
-        .any(|op| matches!(op, Op::PushThetaGather(_)))
+    gather_readout_program(m).bc.ops.iter().any(|op| matches!(op, Op::PushThetaGather(_)))
 }
 
 fn readout_synth_names(m: &CompiledModel) -> Vec<&str> {
@@ -29858,11 +27025,7 @@ fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
             readout,
         ))
         .unwrap_or_else(|e| panic!("[{engine}] parse: {e}"));
-        assert_eq!(
-            readout_synth_names(&m),
-            ["__ferx_ro_g0"],
-            "[{engine}] one gather synth"
-        );
+        assert_eq!(readout_synth_names(&m), ["__ferx_ro_g0"], "[{engine}] one gather synth");
         assert_eq!(
             m.indiv_param_names.len(),
             m.pk_indices.len(),
@@ -29902,12 +27065,7 @@ fn readout_gather_synths_follow_the_theta_eta_synths() {
     let slope = m.theta_names.iter().position(|n| n == "SLOPE").unwrap();
     assert_eq!(
         readout_synth_names(&m),
-        [
-            format!("__ferx_ro_th{slope}").as_str(),
-            "__ferx_ro_eta0",
-            "__ferx_ro_g0",
-            "__ferx_ro_g1",
-        ],
+        [format!("__ferx_ro_th{slope}").as_str(), "__ferx_ro_eta0", "__ferx_ro_g0", "__ferx_ro_g1",],
     );
     assert!(!readout_has_gather_op(&m));
     assert!(!gather_readout_program(&m).reads_leaves());
@@ -29947,10 +27105,7 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
         "a state-indexed gather must not be lifted: {:?}",
         m.indiv_param_names
     );
-    assert!(
-        readout_has_gather_op(&m),
-        "premise: the gather is still in the readout"
-    );
+    assert!(readout_has_gather_op(&m), "premise: the gather is still in the readout");
     assert!(
         !gather_readout_program(&m)
             .bc
@@ -29969,9 +27124,7 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
         m.referenced_covariates
     );
     assert!(
-        !m.parse_warnings
-            .iter()
-            .any(|w| w.contains("but not referenced")),
+        !m.parse_warnings.iter().any(|w| w.contains("but not referenced")),
         "a block read only in the readout is still referenced: {:?}",
         m.parse_warnings
     );
@@ -29996,10 +27149,7 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
         "a `T`-indexed gather must not be lifted: {:?}",
         m.indiv_param_names
     );
-    assert!(
-        readout_has_gather_op(&m),
-        "premise: the gather is still in the readout"
-    );
+    assert!(readout_has_gather_op(&m), "premise: the gather is still in the readout");
     assert!(gather_readout_program(&m).reads_leaves());
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "T"),
@@ -30049,10 +27199,7 @@ fn an_overflowing_readout_gather_stays_in_the_readout_and_warns_of_nothing() {
         "an overflowing synth set is dropped whole: {:?}",
         m.indiv_param_names
     );
-    assert!(
-        readout_has_gather_op(&m),
-        "premise: the gathers stay in the readout"
-    );
+    assert!(readout_has_gather_op(&m), "premise: the gathers stay in the readout");
     assert!(gather_readout_program(&m).reads_leaves());
     assert!(
         !m.parse_warnings
@@ -30062,9 +27209,7 @@ fn an_overflowing_readout_gather_stays_in_the_readout_and_warns_of_nothing() {
         m.parse_warnings
     );
     assert!(
-        !m.parse_warnings
-            .iter()
-            .any(|w| w.contains("but not referenced")),
+        !m.parse_warnings.iter().any(|w| w.contains("but not referenced")),
         "levels read only by an unlifted readout gather are still referenced: {:?}",
         m.parse_warnings
     );
@@ -30086,12 +27231,7 @@ fn an_overflowing_readout_gather_stays_in_the_readout_and_warns_of_nothing() {
 /// index), `KZ` a named `ref` block — the shape whose free-θ count can be zero
 /// once bound (#1624), which is why the gate is a field, not a θ-range proxy.
 fn level_read_model(
-    ip_extra: &str,
-    odes_extra: &str,
-    init: &str,
-    event_model: &str,
-    scaling: &str,
-    err: &str,
+    ip_extra: &str, odes_extra: &str, init: &str, event_model: &str, scaling: &str, err: &str,
     derived: &str,
 ) -> String {
     format!(
@@ -30112,21 +27252,14 @@ fn level_read_model(
 const LEVEL_READ_ERR: &str = "DV ~ proportional(PROP_ERR)";
 
 /// The four spellings of one read: `(block, read)`.
-const LEVEL_READ_SPELLINGS: [(&str, &str); 4] = [
-    ("KM", "KM[K]"),
-    ("KM", "KM[2]"),
-    ("KMN", "KMN"),
-    ("KZ", "KZ"),
-];
+const LEVEL_READ_SPELLINGS: [(&str, &str); 4] =
+    [("KM", "KM[K]"), ("KM", "KM[2]"), ("KMN", "KMN"), ("KZ", "KZ")];
 
 /// The two refusing scopes, each with its parsed error. `[odes]`-side contexts:
 /// the RHS, `init(...)`, and (survival) the hazard.
 fn level_read_refusals(read: &str) -> Vec<(&'static str, String)> {
     let mut out = vec![
-        (
-            "d/dt",
-            level_read_model("", &format!(" * {read}"), "", "", "", LEVEL_READ_ERR, ""),
-        ),
+        ("d/dt", level_read_model("", &format!(" * {read}"), "", "", "", LEVEL_READ_ERR, "")),
         (
             "init",
             level_read_model(
@@ -30196,13 +27329,7 @@ fn a_level_block_read_where_theta_is_not_in_scope_is_refused() {
                 err.contains(&format!("`{block}` is a θ level block")),
                 "{tag} names the block: {err}"
             );
-            for bad in [
-                "__level_",
-                "covariate",
-                "vector of",
-                "d/dt(__chz",
-                "not found",
-            ] {
+            for bad in ["__level_", "covariate", "vector of", "d/dt(__chz", "not found"] {
                 assert!(!err.contains(bad), "{tag} must not say `{bad}`: {err}");
             }
             if ctx == "selector" {
@@ -30223,11 +27350,7 @@ fn a_level_block_read_where_theta_is_not_in_scope_is_refused() {
                     "{tag}: a selector cannot read an individual parameter either: {err}"
                 );
             } else {
-                let place = if ctx == "hazard" {
-                    "an ODE-accumulated `hazard`"
-                } else {
-                    "[odes]"
-                };
+                let place = if ctx == "hazard" { "an ODE-accumulated `hazard`" } else { "[odes]" };
                 assert!(
                     err.contains(&format!("and {place} cannot read a θ directly.")),
                     "{tag} says where and why: {err}"
@@ -30313,15 +27436,8 @@ fn a_level_block_read_where_theta_is_in_scope_parses() {
     // only a *declared* block's index column passes. A typed `__level_TYPO` must stay
     // an undeclared covariate, or it would read 0 with no diagnostic. The declared
     // block's own column, written out, is the positive control.
-    let typo = level_read_model(
-        "",
-        "",
-        "",
-        "",
-        "",
-        "DV ~ proportional(PROP_ERR * __level_TYPO)",
-        "",
-    );
+    let typo =
+        level_read_model("", "", "", "", "", "DV ~ proportional(PROP_ERR * __level_TYPO)", "");
     let err = expect_parse_err(&typo);
     assert!(
         err.contains("references undeclared covariate `__level_TYPO`"),
@@ -30377,10 +27493,7 @@ fn a_gathered_residual_magnitude_is_theta_dependent() {
                 "[{tag}] the level read is referenced: {unreferenced:?}"
             );
         } else {
-            assert!(
-                unreferenced.is_empty(),
-                "[{tag}] no level is unreferenced: {unreferenced:?}"
-            );
+            assert!(unreferenced.is_empty(), "[{tag}] no level is unreferenced: {unreferenced:?}");
         }
     }
 }
@@ -30416,11 +27529,7 @@ fn a_kappa_weight_reading_an_estimated_level_block_is_refused() {
         "  theta W[3](20.0, 1.0, 100.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = W[STUDY]",
         "  STUDY continuous\n",
     ));
-    assert!(
-        fixed.is_ok(),
-        "a FIXed block is a known constant: {:?}",
-        fixed.err()
-    );
+    assert!(fixed.is_ok(), "a FIXed block is a known constant: {:?}", fixed.err());
 }
 
 /// The remedy echoes the index as written (`KM_I = KM[...]`), so a computed index
@@ -30495,10 +27604,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
 
 /// A model declaring kappas `kappas` and the given `[individual_parameters]`.
 fn kappa_scale_model(kappas: &[&str], indiv: &str) -> CompiledModel {
-    let decls: String = kappas
-        .iter()
-        .map(|k| format!("  kappa {k} ~ 0.04\n"))
-        .collect();
+    let decls: String = kappas.iter().map(|k| format!("  kappa {k} ~ 0.04\n")).collect();
     let src = format!(
         "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
          omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n{decls}  sigma EPS ~ 0.01\n\n\
@@ -30628,11 +27734,7 @@ fn kappa_scale_walk_agrees_with_eta_patterns() {
                 Logit | LogitProbability => Logit,
                 Custom => continue,
             };
-            let slot = m
-                .eta_names
-                .iter()
-                .position(|n| *n == info.eta_name)
-                .unwrap();
+            let slot = m.eta_names.iter().position(|n| *n == info.eta_name).unwrap();
             let mut got = Vec::new();
             for s in &stmts {
                 if let Statement::Assign(n, e) = s {
@@ -30655,14 +27757,8 @@ fn kappa_scale_walk_agrees_with_eta_patterns() {
         }
     }
     // Non-vacuous: both kinds the walk most often decides were actually compared.
-    assert!(
-        compared.get("LogNormal").copied().unwrap_or(0) >= 1,
-        "{compared:?}"
-    );
-    assert!(
-        compared.get("Additive").copied().unwrap_or(0) >= 1,
-        "{compared:?}"
-    );
+    assert!(compared.get("LogNormal").copied().unwrap_or(0) >= 1, "{compared:?}");
+    assert!(compared.get("Additive").copied().unwrap_or(0) >= 1, "{compared:?}");
 }
 
 /// The issue's own shape: a sample-size-weighted additive kappa (#1031) in an
@@ -30785,10 +27881,7 @@ fn level_contrast_serializes_as_its_dsl_token() {
     }
     // No alias on read: only the DSL token names a contrast.
     for alias in ["\"unconstrained\"", "\"Unconstrained\"", "\"SumToZero\""] {
-        assert!(
-            serde_json::from_str::<LevelContrast>(alias).is_err(),
-            "{alias} must not read"
-        );
+        assert!(serde_json::from_str::<LevelContrast>(alias).is_err(), "{alias} must not read");
     }
 }
 
@@ -30838,16 +27931,8 @@ fn an_eta_beside_a_third_additive_term_is_additive() {
     ];
     for (label, line) in cases {
         let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n  {line}"), "");
-        assert_eq!(
-            eta_entries(&m, "ETA_V"),
-            [("V".into(), Additive)],
-            "{label}"
-        );
-        let info = m
-            .eta_param_info
-            .iter()
-            .find(|i| i.eta_name == "ETA_V")
-            .unwrap();
+        assert_eq!(eta_entries(&m, "ETA_V"), [("V".into(), Additive)], "{label}");
+        let info = m.eta_param_info.iter().find(|i| i.eta_name == "ETA_V").unwrap();
         assert_eq!(info.linked_theta, None, "{label}: no pattern names a θ");
     }
 }
@@ -30861,51 +27946,25 @@ fn an_eta_beside_a_third_additive_term_is_additive() {
 #[test]
 fn the_pattern_three_pair_straddles_the_old_gate() {
     use crate::types::EtaParamType::Additive;
-    let two = Expression::BinOp(
-        Box::new(Expression::Theta(1)),
-        BinOp::Add,
-        Box::new(Expression::Eta(1)),
-    );
-    let three = Expression::BinOp(
-        Box::new(two.clone()),
-        BinOp::Add,
-        Box::new(Expression::Eta(2)),
-    );
+    let two =
+        Expression::BinOp(Box::new(Expression::Theta(1)), BinOp::Add, Box::new(Expression::Eta(1)));
+    let three = Expression::BinOp(Box::new(two.clone()), BinOp::Add, Box::new(Expression::Eta(2)));
     assert_eq!(
         classify_expr(&two, 4).map(|c| c.param_type),
         Some(Additive),
         "twin 1 must be the old Pattern 3"
     );
-    assert_eq!(
-        classify_expr(&three, 4),
-        None,
-        "twin 2 must miss every pattern"
-    );
+    assert_eq!(classify_expr(&three, 4), None, "twin 2 must miss every pattern");
 
     let base = "  CL = TVCL * exp(ETA_CL)\n";
     let m1 = eta_scale_model(&format!("{base}  V = TVV + ETA_V"), "");
     let m2 = eta_scale_model(&format!("{base}  V = TVV + ETA_V + K"), "");
-    assert_eq!(
-        eta_entries(&m1, "ETA_V"),
-        [("V".into(), Additive)],
-        "twin 1 (pattern side)"
-    );
-    assert_eq!(
-        eta_entries(&m2, "ETA_V"),
-        [("V".into(), Additive)],
-        "twin 2 (positional side)"
-    );
+    assert_eq!(eta_entries(&m1, "ETA_V"), [("V".into(), Additive)], "twin 1 (pattern side)");
+    assert_eq!(eta_entries(&m2, "ETA_V"), [("V".into(), Additive)], "twin 2 (positional side)");
     let linked = |m: &CompiledModel| {
-        m.eta_param_info
-            .iter()
-            .find(|i| i.eta_name == "ETA_V")
-            .and_then(|i| i.linked_theta.clone())
+        m.eta_param_info.iter().find(|i| i.eta_name == "ETA_V").and_then(|i| i.linked_theta.clone())
     };
-    assert_eq!(
-        linked(&m1).as_deref(),
-        Some("TVV"),
-        "the pattern names the θ"
-    );
+    assert_eq!(linked(&m1).as_deref(), Some("TVV"), "the pattern names the θ");
 }
 
 /// #1656 control: an ETA under a `*` is not additive on its parameter, however
@@ -30913,11 +27972,7 @@ fn the_pattern_three_pair_straddles_the_old_gate() {
 #[test]
 fn an_eta_under_a_product_stays_custom() {
     use crate::types::EtaParamType::Custom;
-    for line in [
-        "V = TVV + ETA_V * WT",
-        "V = (TVV + ETA_V) * WT",
-        "V = TVV + ETA_V * WT + K",
-    ] {
+    for line in ["V = TVV + ETA_V * WT", "V = (TVV + ETA_V) * WT", "V = TVV + ETA_V * WT + K"] {
         let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n  {line}"), "");
         assert_eq!(eta_entries(&m, "ETA_V"), [("V".into(), Custom)], "{line}");
     }
@@ -30987,28 +28042,14 @@ fn eta_scale_cells_the_patterns_missed() {
     // contradiction. Dies under: dropping the reset in `emit_eta_infos`.
     use crate::types::ThetaTransform;
     let inline = eta_scale_model("  CL = exp(TVCL + ETA_CL)\n  V = TVV * exp(ETA_V)", "");
-    let alias = eta_scale_model(
-        "  ECL = TVCL + ETA_CL\n  CL = exp(ECL)\n  V = TVV * exp(ETA_V)",
-        "",
-    );
+    let alias =
+        eta_scale_model("  ECL = TVCL + ETA_CL\n  CL = exp(ECL)\n  V = TVV * exp(ETA_V)", "");
     let cl = |m: &CompiledModel| {
-        let i = m
-            .eta_param_info
-            .iter()
-            .find(|i| i.eta_name == "ETA_CL")
-            .unwrap();
+        let i = m.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
         (i.param_type, i.linked_theta.clone(), m.theta_transform[0])
     };
-    assert_eq!(
-        cl(&inline),
-        (LogNormal, Some("TVCL".into()), ThetaTransform::Log),
-        "inline"
-    );
-    assert_eq!(
-        cl(&alias),
-        (LogNormal, None, ThetaTransform::Identity),
-        "alias"
-    );
+    assert_eq!(cl(&inline), (LogNormal, Some("TVCL".into()), ThetaTransform::Log), "inline");
+    assert_eq!(cl(&alias), (LogNormal, None, ThetaTransform::Identity), "alias");
 
     // The same rule from the other side, and the one cell where an answer went
     // from `Additive` to `Custom`: `V = TVV + ETA_V` that no block reads, only
@@ -31021,11 +28062,7 @@ fn eta_scale_cells_the_patterns_missed() {
          [odes]\n  d/dt(central) = -K10 * central\n\n[scaling]\n  y = central\n\n\
          [error_model]\n  DV ~ proportional(EPS)\n",
     );
-    assert_eq!(
-        eta_entries(&m, "ETA_V"),
-        [("V".into(), Custom)],
-        "V read only by K10"
-    );
+    assert_eq!(eta_entries(&m, "ETA_V"), [("V".into(), Custom)], "V read only by K10");
 }
 
 /// #1662: the walk stops at a variable a block reads **as a parameter**, and is
@@ -31047,13 +28084,8 @@ fn the_param_consumer_stop_set() {
                    [scaling]\n  y = central / V * S\n\n\
                    [error_model]\n  DV ~ proportional(EPS)\n";
     // (label, indiv, tail, kappa type, (ETA, its parameter, its type))
-    type Row<'a> = (
-        &'a str,
-        &'a str,
-        &'a str,
-        EtaParamType,
-        Option<(&'a str, &'a str, EtaParamType)>,
-    );
+    type Row<'a> =
+        (&'a str, &'a str, &'a str, EtaParamType, Option<(&'a str, &'a str, EtaParamType)>);
     let rows: [Row; 5] = [
         (
             // Dies under: "derived" added to PARAM_CONSUMER_BLOCKS.
@@ -31102,10 +28134,8 @@ fn the_param_consumer_stop_set() {
         let m = eta_scale_model(indiv, tail);
         assert_eq!(m.kappa_param_types, [kappa], "{label}: kappa");
         if let Some((eta, param, want)) = eta {
-            let got: Vec<_> = eta_entries(&m, eta)
-                .into_iter()
-                .filter(|(p, _)| p == param)
-                .collect();
+            let got: Vec<_> =
+                eta_entries(&m, eta).into_iter().filter(|(p, _)| p == param).collect();
             assert_eq!(got, [(param.to_string(), want)], "{label}: {eta}");
         }
     }
@@ -31125,11 +28155,7 @@ fn a_named_event_model_consumes_a_parameter() {
          [error_model]\n  DV ~ proportional(EPS)\n\n\
          [event_model death]\n  cmt    = 2\n  family = exponential\n  scale  = LAM\n",
     );
-    assert_eq!(
-        eta_entries(&m, "ETA_CL"),
-        [("LAM".into(), Additive)],
-        "ETA_CL on LAM"
-    );
+    assert_eq!(eta_entries(&m, "ETA_CL"), [("LAM".into(), Additive)], "ETA_CL on LAM");
 }
 
 /// #1662: every registered block is sorted into exactly one of the consumer
@@ -31141,16 +28167,8 @@ fn every_block_is_sorted_into_param_consumer_or_not() {
     let yes: BTreeSet<&str> = PARAM_CONSUMER_BLOCKS.iter().copied().collect();
     let no: BTreeSet<&str> = NON_PARAM_CONSUMER_BLOCKS.iter().copied().collect();
     assert_eq!(yes.len(), PARAM_CONSUMER_BLOCKS.len(), "duplicate consumer");
-    assert_eq!(
-        no.len(),
-        NON_PARAM_CONSUMER_BLOCKS.len(),
-        "duplicate non-consumer"
-    );
-    assert!(
-        yes.is_disjoint(&no),
-        "{:?}",
-        yes.intersection(&no).collect::<Vec<_>>()
-    );
+    assert_eq!(no.len(), NON_PARAM_CONSUMER_BLOCKS.len(), "duplicate non-consumer");
+    assert!(yes.is_disjoint(&no), "{:?}", yes.intersection(&no).collect::<Vec<_>>());
     let sorted: BTreeSet<&str> = yes.union(&no).copied().collect();
     assert_eq!(sorted, registry);
 }
@@ -31162,15 +28180,10 @@ fn every_block_is_sorted_into_param_consumer_or_not() {
 /// (`kappa_param_types`), so every row is checked on both classifiers.
 fn re_scale_twins(
     indiv: &str,
-) -> (
-    Vec<(String, crate::types::EtaParamType)>,
-    crate::types::EtaParamType,
-) {
+) -> (Vec<(String, crate::types::EtaParamType)>, crate::types::EtaParamType) {
     let eta = eta_scale_model(&indiv.replace("RE", "ETA_CL"), "");
-    let kappa = eta_scale_model(
-        &format!("  CL0 = TVCL * exp(ETA_CL)\n{}", indiv.replace("RE", "K")),
-        "",
-    );
+    let kappa =
+        eta_scale_model(&format!("  CL0 = TVCL * exp(ETA_CL)\n{}", indiv.replace("RE", "K")), "");
     (eta_entries(&eta, "ETA_CL"), kappa.kappa_param_types[0])
 }
 
@@ -31196,47 +28209,19 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
         ("one exp, was Additive", "  CL = exp(CL)", LogNormal),
         // Dies under: following a reassignment's leaf without recursing into
         // the reassignment's own definition.
-        (
-            "chained + then *, was Additive",
-            "  CL = CL + TH_WT\n  CL = CL * TVV",
-            Custom,
-        ),
-        (
-            "chained * then +, was Additive",
-            "  CL = CL * TVV\n  CL = CL + TH_WT",
-            Custom,
-        ),
-        (
-            "reads itself twice, one under *, was Additive",
-            "  CL = CL + CL * TVV",
-            Custom,
-        ),
+        ("chained + then *, was Additive", "  CL = CL + TH_WT\n  CL = CL * TVV", Custom),
+        ("chained * then +, was Additive", "  CL = CL * TVV\n  CL = CL + TH_WT", Custom),
+        ("reads itself twice, one under *, was Additive", "  CL = CL + CL * TVV", Custom),
         // `CL = 2·TVCL + 2·RE`: the random effect enters twice (#1724).
-        (
-            "reads itself twice, both +, was Additive",
-            "  CL = CL + CL",
-            Custom,
-        ),
+        ("reads itself twice, both +, was Additive", "  CL = CL + CL", Custom),
         // Dies under: a consumed variable following its other readers once a
         // reassignment replaces it — `K10` is not the parameter either way.
-        (
-            "a reader between, then +, unchanged",
-            "  K10 = CL / V\n  CL = CL + TH_WT",
-            Additive,
-        ),
-        (
-            "a reader between, then *, was Additive",
-            "  K10 = CL / V\n  CL = CL * TVV",
-            Custom,
-        ),
+        ("a reader between, then +, unchanged", "  K10 = CL / V\n  CL = CL + TH_WT", Additive),
+        ("a reader between, then *, was Additive", "  K10 = CL / V\n  CL = CL * TVV", Custom),
         // Dies under: a reassignment inside an `if` replacing the definition —
         // where `WT <= 70` the consumer still sees `TVCL + RE`, so the two
         // scales disagree.
-        (
-            "conditional exp, was Additive",
-            "  if (WT > 70) {\n    CL = exp(CL)\n  }",
-            Custom,
-        ),
+        ("conditional exp, was Additive", "  if (WT > 70) {\n    CL = exp(CL)\n  }", Custom),
         // Dies under: an `if` whose every branch reassigns not replacing the
         // definition (#1689: the fall-through `Additive` was pushed). Was Custom.
         (
@@ -31397,13 +28382,7 @@ fn walk_stmts(src: &str) -> Vec<Statement> {
 
 /// `(ETA_CL's types, K's type, root_scale calls)` for `src`, with `CL` the one
 /// consumed variable.
-fn walk_counted(
-    src: &str,
-) -> (
-    Vec<crate::types::EtaParamType>,
-    crate::types::EtaParamType,
-    usize,
-) {
+fn walk_counted(src: &str) -> (Vec<crate::types::EtaParamType>, crate::types::EtaParamType, usize) {
     let stmts = walk_stmts(src);
     let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
     let consumers: HashSet<String> = ["CL".to_string()].into();
@@ -31411,11 +28390,7 @@ fn walk_counted(
     let (infos, _) = classify_indiv_params(&stmts, &tn, &["ETA_CL".to_string()], &consumers);
     let kappa = classify_kappa_params(&stmts, 1, &["K".to_string()], &consumers);
     let calls = super::ROOT_SCALE_CALLS.with(|c| c.get());
-    (
-        infos.iter().map(|i| i.param_type).collect(),
-        kappa[0],
-        calls,
-    )
+    (infos.iter().map(|i| i.param_type).collect(), kappa[0], calls)
 }
 
 /// A diamond of intermediates `depth` levels deep below the random effect `re`:
@@ -31424,10 +28399,7 @@ fn walk_counted(
 fn diamond(depth: usize, re: &str) -> String {
     let mut s = format!("X0 = {re}\n");
     for i in 0..depth {
-        s += &format!(
-            "B{i} = X{i} + 1\nC{i} = X{i} + 2\nX{n} = B{i} + C{i}\n",
-            n = i + 1
-        );
+        s += &format!("B{i} = X{i} + 1\nC{i} = X{i} + 2\nX{n} = B{i} + C{i}\n", n = i + 1);
     }
     s + &format!("CL = TVCL * exp(X{depth})\n")
 }
@@ -31512,43 +28484,19 @@ fn a_random_effect_entering_its_scale_twice_is_custom() {
     use crate::types::EtaParamType::Custom;
     let v = "  V = TVV * exp(ETA_V)\n";
     let rows: Vec<(String, &str)> = [
-        (
-            "two exp factors, was LogNormal",
-            "  CL = TVCL * exp(RE) * exp(RE)",
-        ),
-        (
-            "two negated exp factors, was LogNormal",
-            "  CL = TVCL * -exp(RE) * -exp(RE)",
-        ),
-        (
-            "a negated product times an exp, was LogNormal",
-            "  CL = -(TVCL * exp(RE)) * exp(RE)",
-        ),
-        (
-            "one exp, read twice, was LogNormal",
-            "  CL = exp(RE + RE) * TVCL",
-        ),
+        ("two exp factors, was LogNormal", "  CL = TVCL * exp(RE) * exp(RE)"),
+        ("two negated exp factors, was LogNormal", "  CL = TVCL * -exp(RE) * -exp(RE)"),
+        ("a negated product times an exp, was LogNormal", "  CL = -(TVCL * exp(RE)) * exp(RE)"),
+        ("one exp, read twice, was LogNormal", "  CL = exp(RE + RE) * TVCL"),
         ("one root, was Additive", "  CL = TVCL + RE + RE"),
-        (
-            "one inv_logit, was Logit",
-            "  CL = inv_logit(TVCL + RE + RE)",
-        ),
-        (
-            "an alias read twice, was LogNormal",
-            "  ECL = RE\n  CL = TVCL * exp(ECL) * exp(ECL)",
-        ),
+        ("one inv_logit, was Logit", "  CL = inv_logit(TVCL + RE + RE)"),
+        ("an alias read twice, was LogNormal", "  ECL = RE\n  CL = TVCL * exp(ECL) * exp(ECL)"),
         (
             "a diamond, was LogNormal",
             "  A = RE\n  B = A + 1\n  C = A + 2\n  CL = TVCL * exp(B + C)",
         ),
-        (
-            "two statements reach one exp, was LogNormal",
-            "  A = TVCL + RE\n  CL = exp(A + RE)",
-        ),
-        (
-            "a reassignment adds it again, was Additive",
-            "  CL = TVCL + RE\n  CL = CL + RE",
-        ),
+        ("two statements reach one exp, was LogNormal", "  A = TVCL + RE\n  CL = exp(A + RE)"),
+        ("a reassignment adds it again, was Additive", "  CL = TVCL + RE\n  CL = CL + RE"),
         (
             "an exp intermediate multiplied in twice, was LogNormal",
             "  EV = exp(RE)\n  CL = TVCL * EV * EV",
@@ -31602,21 +28550,9 @@ fn a_random_effect_entering_its_scale_once_keeps_its_label() {
         // never changes the CV (#1724 item 2) — and, for the two minus signs
         // inside the product, `leaf_scales` folding unary minus as `+`/`-`.
         ("a leading minus", "  CL = -TVCL * exp(RE)", LogNormal),
-        (
-            "a minus on the exp factor",
-            "  CL = TVCL * -exp(RE)",
-            LogNormal,
-        ),
-        (
-            "subtracted from zero",
-            "  CL = 0 - TVCL * exp(RE)",
-            LogNormal,
-        ),
-        (
-            "a negated exp argument",
-            "  CL = TVCL * exp(-RE)",
-            LogNormal,
-        ),
+        ("a minus on the exp factor", "  CL = TVCL * -exp(RE)", LogNormal),
+        ("subtracted from zero", "  CL = 0 - TVCL * exp(RE)", LogNormal),
+        ("a negated exp argument", "  CL = TVCL * exp(-RE)", LogNormal),
         ("a subtracted root", "  CL = TVCL - RE", Additive),
         // Dies under: the constant test dropped — `V`'s coefficient on the log
         // scale is `CL / V`, which varies; `A` is an intermediate, so every
@@ -31649,21 +28585,13 @@ fn a_random_effect_entering_its_scale_once_keeps_its_label() {
             "  EV = exp(RE)\n  CL = TVCL * EV\n  V2 = TVV * EV",
             LogNormal,
         ),
-        (
-            "an exp intermediate multiplied in once",
-            "  EV = exp(RE)\n  CL = TVCL / EV",
-            LogNormal,
-        ),
+        ("an exp intermediate multiplied in once", "  EV = exp(RE)\n  CL = TVCL / EV", LogNormal),
         (
             "an inline if of exps in a product",
             "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE))",
             LogNormal,
         ),
-        (
-            "read twice, already custom",
-            "  CL = TVCL * RE * RE",
-            Custom,
-        ),
+        ("read twice, already custom", "  CL = TVCL * RE * RE", Custom),
         // A variable assigned inside an `if` statement has no partials, so
         // nothing the check sees is right there; the label it was given stands.
         // Dies under: a top-level row of a name an `if` reassigns kept as
@@ -31717,24 +28645,12 @@ fn a_withdrawn_label_drops_its_linked_theta() {
     use crate::types::EtaParamType::*;
     let cl = |indiv: &str| {
         let m = eta_scale_model(&format!("{indiv}\n  V = TVV * exp(ETA_V)"), "");
-        let i = m
-            .eta_param_info
-            .iter()
-            .find(|i| i.eta_name == "ETA_CL")
-            .unwrap();
+        let i = m.eta_param_info.iter().find(|i| i.eta_name == "ETA_CL").unwrap();
         (i.param_type, i.linked_theta.clone())
     };
     let tvcl = || Some("TVCL".to_string());
-    assert_eq!(
-        cl("  CL = TVCL * exp(ETA_CL)"),
-        (LogNormal, tvcl()),
-        "read once"
-    );
-    assert_eq!(
-        cl("  CL = TVCL * exp(ETA_CL) * exp(ETA_CL)"),
-        (Custom, None),
-        "read twice"
-    );
+    assert_eq!(cl("  CL = TVCL * exp(ETA_CL)"), (LogNormal, tvcl()), "read once");
+    assert_eq!(cl("  CL = TVCL * exp(ETA_CL) * exp(ETA_CL)"), (Custom, None), "read twice");
 }
 
 // ── #1684 / #1676: diamonds of intermediates ────────────────────────────────
@@ -31745,10 +28661,7 @@ fn a_withdrawn_label_drops_its_linked_theta() {
 fn op_diamond(depth: usize, x0: &str, op: &str) -> String {
     let mut s = format!("X0 = {x0}\n");
     for i in 0..depth {
-        s += &format!(
-            "B{i} = X{i} {op} 2\nC{i} = X{i} {op} 3\nX{n} = B{i} {op} C{i}\n",
-            n = i + 1
-        );
+        s += &format!("B{i} = X{i} {op} 2\nC{i} = X{i} {op} 3\nX{n} = B{i} {op} C{i}\n", n = i + 1);
     }
     s
 }
@@ -31814,34 +28727,12 @@ fn inline_counted(src: &str) -> (HashMap<String, MuRef>, Vec<CovariateMuRef>, us
 fn the_inliner_is_linear_on_a_diamond() {
     type Want = fn(usize) -> Option<&'static str>;
     let cases: [(&str, &str, &str, &str, Want); 4] = [
-        (
-            "+ diamond",
-            "TVV",
-            "+",
-            "CL = TVCL * exp(ETA_CL + X{d})\n",
-            |_| Some("TVCL"),
-        ),
-        (
-            "+ under inv_logit",
-            "TVV",
-            "+",
-            "CL = inv_logit(X{d} + ETA_CL)\n",
-            |_| None,
-        ),
-        (
-            "* over a covariate",
-            "WT",
-            "*",
-            "T = TVCL\nCL = X{d} * T * exp(ETA_CL)\n",
-            |_| Some("TVCL"),
-        ),
-        (
-            "* over a theta",
-            "TVV",
-            "*",
-            "CL = X{d} * exp(ETA_CL)\n",
-            |d| (d == 0).then_some("TVV"),
-        ),
+        ("+ diamond", "TVV", "+", "CL = TVCL * exp(ETA_CL + X{d})\n", |_| Some("TVCL")),
+        ("+ under inv_logit", "TVV", "+", "CL = inv_logit(X{d} + ETA_CL)\n", |_| None),
+        ("* over a covariate", "WT", "*", "T = TVCL\nCL = X{d} * T * exp(ETA_CL)\n", |_| {
+            Some("TVCL")
+        }),
+        ("* over a theta", "TVV", "*", "CL = X{d} * exp(ETA_CL)\n", |d| (d == 0).then_some("TVV")),
     ];
     for (label, x0, op, tail, want) in cases {
         let count = |d: usize| {
@@ -31853,25 +28744,15 @@ fn the_inliner_is_linear_on_a_diamond() {
                 want(d),
                 "inliner, {label}, depth {d}: mu-ref"
             );
-            assert!(
-                groups.is_empty(),
-                "inliner, {label}, depth {d}: one theta, no group"
-            );
+            assert!(groups.is_empty(), "inliner, {label}, depth {d}: one theta, no group");
             nodes
         };
         // From depth 1: level 0 reads `X0` directly, a different first step.
         let c1 = count(1);
         let per_level = count(2) - c1;
-        assert!(
-            per_level > 0,
-            "inliner, {label}: the diamond reaches the scans"
-        );
+        assert!(per_level > 0, "inliner, {label}: the diamond reaches the scans");
         for d in [10, 20, 30] {
-            assert_eq!(
-                count(d) - c1,
-                (d - 1) * per_level,
-                "inliner, {label}: depth {d} is linear"
-            );
+            assert_eq!(count(d) - c1, (d - 1) * per_level, "inliner, {label}: depth {d} is linear");
         }
     }
 }
@@ -31910,11 +28791,7 @@ fn a_recorded_covariate_group_is_linear_on_a_diamond() {
         let (_, _, groups) = measure(3);
         let mut x: f64 = 1.1 * 0.9;
         for _ in 0..3 {
-            x = if op == "+" {
-                2.0 * x + 5.0
-            } else {
-                6.0 * x * x
-            };
+            x = if op == "+" { 2.0 * x + 5.0 } else { 6.0 * x * x };
         }
         let got = group_typical(&groups[0], &[1.3, 1.1], &[("WT", 0.9)]);
         assert!(
@@ -31926,22 +28803,11 @@ fn a_recorded_covariate_group_is_linear_on_a_diamond() {
         let (s1, p1, _) = measure(1);
         let (s2, p2, _) = measure(2);
         let (scan_level, prog_level) = (s2 - s1, p2 - p1);
-        assert!(
-            scan_level > 0 && prog_level > 0,
-            "{op} diamond: the levels are read"
-        );
+        assert!(scan_level > 0 && prog_level > 0, "{op} diamond: the levels are read");
         for d in [10, 20, 30] {
             let (s, p, _) = measure(d);
-            assert_eq!(
-                s - s1,
-                (d - 1) * scan_level,
-                "{op} diamond: depth {d} scans are linear"
-            );
-            assert_eq!(
-                p - p1,
-                (d - 1) * prog_level,
-                "{op} diamond: depth {d} program is linear"
-            );
+            assert_eq!(s - s1, (d - 1) * scan_level, "{op} diamond: depth {d} scans are linear");
+            assert_eq!(p - p1, (d - 1) * prog_level, "{op} diamond: depth {d} program is linear");
         }
     }
 }
@@ -31972,11 +28838,8 @@ fn diamond_partials(src: &str) -> IndivParamPartials {
     let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
     let stmts = stmts_of(src, &tn, &en);
     let names = assigned_vars_in_order(&stmts);
-    let var_idx: HashMap<String, usize> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.clone(), i))
-        .collect();
+    let var_idx: HashMap<String, usize> =
+        names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
     build_indiv_param_partials(&stmts, &var_idx, &HashMap::new(), 2, 2)
 }
 
@@ -31994,36 +28857,21 @@ fn diamond_partials(src: &str) -> IndivParamPartials {
 /// partial itself (`s.clone()`) for every shape, i.e. inlining it.
 #[test]
 fn the_symbolic_partials_are_linear_on_a_diamond() {
-    let cases: [(&str, &str); 2] = [
-        ("+", "CL = TVCL * exp(ETA_CL + X{d})\n"),
-        ("*", "CL = TVCL * X{d} * exp(ETA_CL)\n"),
-    ];
+    let cases: [(&str, &str); 2] =
+        [("+", "CL = TVCL * exp(ETA_CL + X{d})\n"), ("*", "CL = TVCL * X{d} * exp(ETA_CL)\n")];
     for (op, tail) in cases {
         let count = |d: usize| {
             let src = op_diamond(d, "TVV * exp(ETA_V)", op) + &tail.replace("{d}", &d.to_string());
             let p = diamond_partials(&src);
-            assert_eq!(
-                p.names.len(),
-                3 * d + 2,
-                "{op} diamond, depth {d}: one row per line"
-            );
-            p.d_d_theta
-                .iter()
-                .chain(&p.d_d_eta)
-                .flatten()
-                .map(expr_nodes)
-                .sum::<usize>()
+            assert_eq!(p.names.len(), 3 * d + 2, "{op} diamond, depth {d}: one row per line");
+            p.d_d_theta.iter().chain(&p.d_d_eta).flatten().map(expr_nodes).sum::<usize>()
         };
         // From depth 1: level 0 reads `X0`, whose partials are leaves.
         let c1 = count(1);
         let per_level = count(2) - c1;
         assert!(per_level > 0, "{op} diamond: the levels carry partials");
         for d in [10, 20, 30] {
-            assert_eq!(
-                count(d) - c1,
-                (d - 1) * per_level,
-                "{op} diamond: depth {d} is linear"
-            );
+            assert_eq!(count(d) - c1, (d - 1) * per_level, "{op} diamond: depth {d} is linear");
         }
     }
 }
@@ -32061,12 +28909,7 @@ fn the_symbolic_partials_on_a_diamond_match_fd() {
                 .collect()
         };
         let mut worst = 0.0_f64;
-        for axis in [
-            DiffAxis::Theta(0),
-            DiffAxis::Theta(1),
-            DiffAxis::Eta(0),
-            DiffAxis::Eta(1),
-        ] {
+        for axis in [DiffAxis::Theta(0), DiffAxis::Theta(1), DiffAxis::Eta(0), DiffAxis::Eta(1)] {
             let sym = eval_partials_along(&p, axis, &theta, &eta, &cov);
             let (mut tp, mut tm, mut ep, mut em) = (theta, theta, eta, eta);
             let h = 1e-6;
@@ -32086,11 +28929,7 @@ fn the_symbolic_partials_on_a_diamond_match_fd() {
                 let fd = (plus[i] - minus[i]) / (2.0 * h);
                 assert!(s.is_finite() && fd.is_finite(), "{op}: row {i} {axis:?}");
                 let rel = (s - fd).abs() / s.abs().max(fd.abs()).max(1e-8);
-                assert!(
-                    rel < 1e-6,
-                    "{op} diamond: ∂{}/∂{axis:?}: sym={s}, fd={fd}",
-                    p.names[i]
-                );
+                assert!(rel < 1e-6, "{op} diamond: ∂{}/∂{axis:?}: sym={s}, fd={fd}", p.names[i]);
                 worst = worst.max(rel);
             }
         }
@@ -32110,19 +28949,13 @@ fn if_block_model(body: &str) -> crate::types::CompiledModel {
          [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
          [error_model]\n  DV ~ proportional(EPS)\n"
     );
-    super::parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("parses:\n{body}\n{e:?}"))
-        .model
+    super::parse_full_model(&src).unwrap_or_else(|e| panic!("parses:\n{body}\n{e:?}")).model
 }
 
 /// Run `m`'s derivative program along `axis` with covariate `WT = wt`: the
 /// final `(value, partial)` of `name`, read off its last row (#2471).
 fn program_final(
-    m: &crate::types::CompiledModel,
-    name: &str,
-    axis: DiffAxis,
-    theta: &[f64],
-    eta: &[f64],
+    m: &crate::types::CompiledModel, name: &str, axis: DiffAxis, theta: &[f64], eta: &[f64],
     wt: f64,
 ) -> (f64, f64) {
     let p = &m.indiv_param_partials;
@@ -32156,11 +28989,7 @@ fn program_final(
 
 /// `name`'s value from the production `pk_param_fn` at `WT = wt`.
 fn pk_value(
-    m: &crate::types::CompiledModel,
-    name: &str,
-    theta: &[f64],
-    eta: &[f64],
-    wt: f64,
+    m: &crate::types::CompiledModel, name: &str, theta: &[f64], eta: &[f64], wt: f64,
 ) -> f64 {
     let cov: HashMap<String, f64> = [("WT".to_string(), wt)].into_iter().collect();
     let pos = m.indiv_param_names.iter().position(|n| n == name).unwrap();
@@ -32302,19 +29131,10 @@ fn the_selector_fixture_straddles_its_condition() {
     let eta = [0.1, -0.2];
     let hi = [7.5, 75.0, 1.05];
     let lo = [3.0, 75.0, 1.05];
-    assert!(
-        pk_value(&m, "CL", &hi, &eta, 70.0) < 5.0,
-        "the branch crosses its own gate"
-    );
+    assert!(pk_value(&m, "CL", &hi, &eta, 70.0) < 5.0, "the branch crosses its own gate");
     let d = |theta: &[f64], k| program_final(&m, "KA", DiffAxis::Eta(k), theta, &eta, 70.0).1;
-    assert!(
-        d(&hi, 0) != 0.0 && d(&hi, 1) == 0.0,
-        "TVCL = 7.5 takes the if"
-    );
-    assert!(
-        d(&lo, 0) == 0.0 && d(&lo, 1) != 0.0,
-        "TVCL = 3 takes the else"
-    );
+    assert!(d(&hi, 0) != 0.0 && d(&hi, 1) == 0.0, "TVCL = 7.5 takes the if");
+    assert!(d(&lo, 0) == 0.0 && d(&lo, 1) != 0.0, "TVCL = 3 takes the else");
 }
 
 /// #2471: the coefficient a random effect carries on its labelled scale, read
@@ -32334,12 +29154,7 @@ fn the_selector_fixture_straddles_its_condition() {
 fn statement_if_coefficients_per_branch() {
     // (fixture, log scale?, coefficient at WT = 60, at WT = 80)
     let rows: [(&str, bool, f64, f64); 8] = [
-        (
-            "  CL = TVCL + ETA_CL\n  if (WT > 70) {\n    CL = CL + ETA_CL\n  }",
-            false,
-            1.0,
-            2.0,
-        ),
+        ("  CL = TVCL + ETA_CL\n  if (WT > 70) {\n    CL = CL + ETA_CL\n  }", false, 1.0, 2.0),
         (
             "  CL = TVCL + ETA_CL\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD + ETA_CL\n  }",
             false,
@@ -32493,30 +29308,18 @@ fn the_coupling_walk_is_linear_on_a_diamond() {
         let src = op_diamond(d, "TVE0 * WT", "+") + &format!("E0 = X{d} + ETA_E0\n");
         let (c, calls) = coupling_counted(&src);
         let want = vec![Funnel {
-            site: ScaleShare {
-                param: None,
-                eta_via: Some("E0".to_string()),
-                endpoint: None,
-            },
+            site: ScaleShare { param: None, eta_via: Some("E0".to_string()), endpoint: None },
             covariates: vec!["WT".to_string()],
         }];
         assert_eq!(c.funnels, want, "coupling, depth {d}: funnels");
-        assert_eq!(
-            c.reach,
-            Some(EtaRoute::Via("E0".to_string())),
-            "coupling, depth {d}"
-        );
+        assert_eq!(c.reach, Some(EtaRoute::Via("E0".to_string())), "coupling, depth {d}");
         calls
     };
     let c0 = count(0);
     let per_level = count(1) - c0;
     assert!(per_level > 0, "coupling: the diamond reaches def_constant");
     for d in [10, 20, 30] {
-        assert_eq!(
-            count(d) - c0,
-            d * per_level,
-            "coupling: depth {d} is linear"
-        );
+        assert_eq!(count(d) - c0, d * per_level, "coupling: depth {d} is linear");
     }
 }
 
@@ -32570,19 +29373,11 @@ fn funnels_1712(e0: &str, y: &str) -> Vec<Funnel> {
 fn a_funnel_records_only_its_operands_covariates() {
     let fac = "(1 + 0.1 * OCC)";
     let param = |covs: &[&str]| Funnel {
-        site: ScaleShare {
-            param: Some("E0".to_string()),
-            eta_via: None,
-            endpoint: None,
-        },
+        site: ScaleShare { param: Some("E0".to_string()), eta_via: None, endpoint: None },
         covariates: covs.iter().map(|s| s.to_string()).collect(),
     };
     let readout = |covs: &[&str]| Funnel {
-        site: ScaleShare {
-            param: None,
-            eta_via: Some("E0".to_string()),
-            endpoint: None,
-        },
+        site: ScaleShare { param: None, eta_via: Some("E0".to_string()), endpoint: None },
         covariates: covs.iter().map(|s| s.to_string()).collect(),
     };
     let cases: [(&str, String, String, Vec<Funnel>); 4] = [
@@ -32629,11 +29424,7 @@ fn a_funnel_records_only_its_operands_covariates() {
 fn the_coupling_walk_terminates_on_a_self_reassignment() {
     let (c, calls) = coupling_counted("E0 = TVE0 + ETA_E0\nE0 = E0 + 1\n");
     let want = vec![Funnel {
-        site: ScaleShare {
-            param: None,
-            eta_via: Some("E0".to_string()),
-            endpoint: None,
-        },
+        site: ScaleShare { param: None, eta_via: Some("E0".to_string()), endpoint: None },
         covariates: vec![],
     }];
     assert_eq!(c.funnels, want, "coupling: the readout is a funnel");
@@ -32645,11 +29436,7 @@ fn the_coupling_walk_terminates_on_a_self_reassignment() {
 /// the reach at each condition's if)` per assignment plus the reach at the
 /// end, sorted by name so the comparison is order-free.
 type ReachShape = (
-    Vec<(
-        String,
-        Vec<(String, Vec<usize>)>,
-        Vec<Vec<(String, Vec<usize>)>>,
-    )>,
+    Vec<(String, Vec<(String, Vec<usize>)>, Vec<Vec<(String, Vec<usize>)>>)>,
     Vec<(String, Vec<usize>)>,
 );
 
@@ -32694,83 +29481,36 @@ fn reach_shape(src: &str) -> ReachShape {
 #[test]
 fn reaching_definitions_per_shape() {
     let r = |pairs: &[(&str, &[usize])]| -> Vec<(String, Vec<usize>)> {
-        pairs
-            .iter()
-            .map(|(n, d)| (n.to_string(), d.to_vec()))
-            .collect()
+        pairs.iter().map(|(n, d)| (n.to_string(), d.to_vec())).collect()
     };
     // kill
     let (defs, out) = reach_shape("A = 1\nA = A + 1\nB = A\n");
-    assert_eq!(
-        defs[1].1,
-        r(&[("A", &[0])]),
-        "kill: A's second def reads the first"
-    );
-    assert_eq!(
-        defs[2].1,
-        r(&[("A", &[1])]),
-        "kill: B reads only A's last def"
-    );
+    assert_eq!(defs[1].1, r(&[("A", &[0])]), "kill: A's second def reads the first");
+    assert_eq!(defs[2].1, r(&[("A", &[1])]), "kill: B reads only A's last def");
     assert_eq!(out, r(&[("A", &[1]), ("B", &[2])]), "kill: at the end");
 
     // if / else
     let (defs, out) = reach_shape("A = 1\nif (X > 1) {\n  A = 2\n} else {\n  A = 3\n}\nB = A\n");
-    assert_eq!(
-        defs[2].1,
-        r(&[("A", &[0])]),
-        "if/else: the else starts from the incoming set"
-    );
-    assert_eq!(
-        defs[3].1,
-        r(&[("A", &[1, 2])]),
-        "if/else: B reads both branches"
-    );
-    assert_eq!(
-        out,
-        r(&[("A", &[1, 2]), ("B", &[3])]),
-        "if/else: at the end"
-    );
+    assert_eq!(defs[2].1, r(&[("A", &[0])]), "if/else: the else starts from the incoming set");
+    assert_eq!(defs[3].1, r(&[("A", &[1, 2])]), "if/else: B reads both branches");
+    assert_eq!(out, r(&[("A", &[1, 2]), ("B", &[3])]), "if/else: at the end");
 
     // no else
     let (defs, _) = reach_shape("A = 1\nif (X > 1) {\n  A = 2\n}\nB = A\n");
-    assert_eq!(
-        defs[2].1,
-        r(&[("A", &[0, 1])]),
-        "no else: B reads the incoming def too"
-    );
+    assert_eq!(defs[2].1, r(&[("A", &[0, 1])]), "no else: B reads the incoming def too");
 
     // nested if
     let (defs, out) = reach_shape(
         "A = 1\nif (X > 1) {\n  A = 2\n  if (X > 2) {\n    A = 3\n  }\n  C = A\n}\nB = A\n",
     );
-    assert_eq!(
-        defs[3].1,
-        r(&[("A", &[1, 2])]),
-        "nested: C reads the inner union"
-    );
-    assert_eq!(
-        defs[4].1,
-        r(&[("A", &[0, 1, 2]), ("C", &[3])]),
-        "nested: B reads the outer union"
-    );
-    assert_eq!(
-        out,
-        r(&[("A", &[0, 1, 2]), ("B", &[4]), ("C", &[3])]),
-        "nested: at the end"
-    );
+    assert_eq!(defs[3].1, r(&[("A", &[1, 2])]), "nested: C reads the inner union");
+    assert_eq!(defs[4].1, r(&[("A", &[0, 1, 2]), ("C", &[3])]), "nested: B reads the outer union");
+    assert_eq!(out, r(&[("A", &[0, 1, 2]), ("B", &[4]), ("C", &[3])]), "nested: at the end");
 
     // conditions
     let (defs, _) = reach_shape("A = 1\nif (A > 1) {\n  A = 2\n  B = A\n}\n");
-    assert_eq!(
-        defs[2].1,
-        r(&[("A", &[1])]),
-        "conditions: B itself reads A's branch def"
-    );
-    assert_eq!(
-        defs[2].2,
-        vec![r(&[("A", &[0])])],
-        "conditions: B's condition reads A at its if"
-    );
+    assert_eq!(defs[2].1, r(&[("A", &[1])]), "conditions: B itself reads A's branch def");
+    assert_eq!(defs[2].2, vec![r(&[("A", &[0])])], "conditions: B's condition reads A at its if");
 }
 
 /// The pre-#1684 inliner, kept as the oracle for [`InlineScope`] (and taught
@@ -32827,11 +29567,7 @@ fn eager_inlined(stmts: &[Statement]) -> Vec<Option<Expression>> {
 /// same covariate group, the same eta for retirement. Returns `(right-hand
 /// sides compared, right-hand sides inlining changed)`.
 fn assert_inliner_matches_eager(
-    label: &str,
-    stmts: &[Statement],
-    tn: &[String],
-    en: &[String],
-    n_bsv: usize,
+    label: &str, stmts: &[Statement], tn: &[String], en: &[String], n_bsv: usize,
 ) -> (usize, usize) {
     let eager = eager_inlined(stmts);
     let mut scope = InlineScope::new(stmts);
@@ -32844,16 +29580,8 @@ fn assert_inliner_matches_eager(
         let view = scope.view(at, raw);
         let mut defs = ProgramDefs::default();
         let root = view.materialise(&mut defs);
-        let got = TypicalProgram {
-            defs: defs.defs,
-            root,
-        }
-        .inlined();
-        assert_eq!(
-            format!("{got:?}"),
-            format!("{want:?}"),
-            "{label}: `{name}` tree"
-        );
+        let got = TypicalProgram { defs: defs.defs, root }.inlined();
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{label}: `{name}` tree");
         n += 1;
         changed += usize::from(format!("{raw:?}") != format!("{want:?}"));
         assert_eq!(
@@ -32881,11 +29609,8 @@ fn assert_inliner_matches_eager(
         );
         if let (Some((_, got_t, names)), Some((_, want_t, _))) = (&got_group, &want_group) {
             let theta: Vec<f64> = (0..tn.len()).map(|i| 1.1 + 0.07 * i as f64).collect();
-            let covs: HashMap<String, f64> = names
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.clone(), 0.8 + 0.13 * i as f64))
-                .collect();
+            let covs: HashMap<String, f64> =
+                names.iter().enumerate().map(|(i, c)| (c.clone(), 0.8 + 0.13 * i as f64)).collect();
             let (g, w) = (got_t.eval(&theta, &covs), want_t.eval(&theta, &covs));
             assert!(
                 g.is_finite() && (g - w).abs() <= 1e-12 * w.abs().max(1.0),
@@ -32940,10 +29665,7 @@ fn the_inliner_matches_the_eager_one() {
         seen += n;
         changed += ch;
     }
-    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"].iter().map(|s| s.to_string()).collect();
     let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
     let shapes = [
         "A = TVV\nB = if (WT > 70) A else TVCL\nCL = B * exp(ETA_CL)",
@@ -32963,10 +29685,7 @@ fn the_inliner_matches_the_eager_one() {
     // Not vacuous: models were replayed, and inlining changed many right-hand sides.
     assert!(models >= 60, "{models} example models replayed");
     // Measured: 12 of 366 under `--features ci`.
-    assert!(
-        changed >= 12,
-        "{changed} of {seen} right-hand sides changed by inlining"
-    );
+    assert!(changed >= 12, "{changed} of {seen} right-hand sides changed by inlining");
 }
 
 // ── #1857: a name assigned on only some paths of an `if` is refused ──────────
@@ -33015,11 +29734,7 @@ fn cond_pk_model(ip: &str, pk_args: &str, extra: &str) -> String {
 /// `src` with `else { name = 0.5 }` added to its first top-level `if`.
 fn else_twin(src: &str, name: &str) -> String {
     let close = src.find("\n  }\n").expect("fixture has a top-level `if`") + "\n  }".len();
-    format!(
-        "{} else {{\n    {name} = 0.5\n  }}{}",
-        &src[..close],
-        &src[close..]
-    )
+    format!("{} else {{\n    {name} = 0.5\n  }}{}", &src[..close], &src[close..])
 }
 
 /// Parse `src`, which must be refused, after checking that its `else` twin
@@ -33054,16 +29769,8 @@ fn assert_conditional_read(err: &str, name: &str, reader: &str) {
     }
     // The reader's own label may hold one of these words (`[covariate_nn …]`).
     let rest = err.replace(&format!("`{name}` ({reader})"), "");
-    for never in [
-        "covariate",
-        "not found in data",
-        "declared later",
-        "undefined",
-    ] {
-        assert!(
-            !rest.to_lowercase().contains(never),
-            "must not say {never:?}: {err}"
-        );
+    for never in ["covariate", "not found in data", "declared later", "undefined"] {
+        assert!(!rest.to_lowercase().contains(never), "must not say {never:?}: {err}");
     }
 }
 
@@ -33071,10 +29778,8 @@ fn assert_conditional_read(err: &str, name: &str, reader: &str) {
 /// `E0` data column (or silently read one if the data carried it).
 #[test]
 fn conditional_name_read_by_the_structural_readout_is_refused() {
-    let err = refused_with_valid_twin(
-        &cond_model(COND_E0, "E0 + EMAX * TIME / (TIME + ET50)", ""),
-        "E0",
-    );
+    let err =
+        refused_with_valid_twin(&cond_model(COND_E0, "E0 + EMAX * TIME / (TIME + ET50)", ""), "E0");
     assert_conditional_read(&err, "E0", "named in `[structural_model]`");
     assert!(err.contains("(e.g. `E0 = 0`)"), "{err}");
 }
@@ -33096,10 +29801,9 @@ fn conditional_dose_attribute_is_refused_on_both_engines() {
     let top = "  CL = TVCL * exp(ETA_CL)\n";
     // Each suggests the engine's own default: `F = 0` would zero the dose on
     // the skipped path, the defect being refused.
-    for (attr, name, theta, dflt) in [
-        (", f=F", "F", "TVF", "1"),
-        (", lagtime=ALAG", "ALAG", "TVLAG", "0"),
-    ] {
+    for (attr, name, theta, dflt) in
+        [(", f=F", "F", "TVF", "1"), (", lagtime=ALAG", "ALAG", "TVLAG", "0")]
+    {
         let ip = format!("{top}  if (WT > 70) {{\n    {name} = {theta}\n  }}");
         let err = refused_with_valid_twin(&cond_pk_model(&ip, attr, ""), name);
         assert_conditional_read(
@@ -33180,16 +29884,8 @@ fn conditional_name_read_by_each_downstream_block_is_refused() {
     let s = format!("{top}{}", cond("S"));
     let rhs = "-(CL/V) * central";
     let cases: Vec<(&str, &str, String)> = vec![
-        (
-            "[scaling]",
-            "S",
-            cond_pk_model(&s, "", "[scaling]\n  obs_scale = V * S\n"),
-        ),
-        (
-            "[derived]",
-            "S",
-            cond_pk_model(&s, "", "[derived]\n  X = S * 2\n"),
-        ),
+        ("[scaling]", "S", cond_pk_model(&s, "", "[scaling]\n  obs_scale = V * S\n")),
+        ("[derived]", "S", cond_pk_model(&s, "", "[derived]\n  X = S * 2\n")),
         (
             "[initial_conditions]",
             "S",
@@ -33304,10 +30000,7 @@ fn event_model_keys_and_words_are_not_reads_of_a_helper() {
         ("SHAPE", format!("{weibull}  scale  = 20\n")),
         ("WEIBULL", format!("{weibull}  scale  = 20\n")),
         ("RENAMED", format!("{weibull}  rate   = 20\n")),
-        (
-            "TTE",
-            "  cmt = 3\n  family = exponential\n  type = tte\n  scale = 20\n".to_string(),
-        ),
+        ("TTE", "  cmt = 3\n  family = exponential\n  type = tte\n  scale = 20\n".to_string()),
         (
             "RESET",
             "  cmt = 3\n  family = exponential\n  type = rtte\n  clock = reset\n  scale = 20\n"
@@ -33432,18 +30125,9 @@ fn word_valued_keys_reject_an_identifier_value() {
     #[cfg(feature = "survival")]
     {
         let event = |lines: &str| {
-            cond_pk_model(
-                ip,
-                "",
-                &format!("[event_model]\n  cmt = 3\n  scale = 20\n{lines}"),
-            )
+            cond_pk_model(ip, "", &format!("[event_model]\n  cmt = 3\n  scale = 20\n{lines}"))
         };
-        cases.push((
-            "event_model",
-            "family",
-            event("  family = V\n"),
-            "unknown family `V`",
-        ));
+        cases.push(("event_model", "family", event("  family = V\n"), "unknown family `V`"));
         cases.push((
             "event_model",
             "type",
@@ -33459,21 +30143,13 @@ fn word_valued_keys_reject_an_identifier_value() {
         cases.push((
             "binary_model",
             "link",
-            cond_ode_model(
-                ip,
-                rhs,
-                "[binary_model]\n  cmt = 3\n  logit = 0.5\n  link = V\n",
-            ),
+            cond_ode_model(ip, rhs, "[binary_model]\n  cmt = 3\n  logit = 0.5\n  link = V\n"),
             "link `V` is not supported",
         ));
         cases.push((
             "count_model",
             "type",
-            cond_ode_model(
-                ip,
-                rhs,
-                "[count_model]\n  cmt = 3\n  lambda = 2.0\n  type = V\n",
-            ),
+            cond_ode_model(ip, rhs, "[count_model]\n  cmt = 3\n  lambda = 2.0\n  type = V\n"),
             "type `V` is not supported",
         ));
     }
@@ -33550,12 +30226,7 @@ fn word_valued_keys_reject_an_identifier_value() {
             nn("V", "softplus"),
             "unknown hidden activation `v`",
         ));
-        cases.push((
-            "covariate_nn",
-            "output",
-            nn("tanh", "V"),
-            "unknown output activation `v`",
-        ));
+        cases.push(("covariate_nn", "output", nn("tanh", "V"), "unknown output activation `v`"));
     }
     for (block, key, src, want) in &cases {
         let err = parse_err(src);
@@ -33589,28 +30260,16 @@ fn a_word_valued_line_drops_only_its_words() {
     for (block, line, want) in [
         ("adaptive_dosing", "at = every 12 from 0 to 96", vec![]),
         ("adaptive_dosing", "at = every DT from 0 to 96", vec!["DT"]),
-        (
-            "adaptive_dosing",
-            "route = infuse(cmt = 1, over = DUR)",
-            vec!["DUR"],
-        ),
+        ("adaptive_dosing", "route = infuse(cmt = 1, over = DUR)", vec!["DUR"]),
         ("adaptive_dosing", "with_assay_error = FALSE", vec![]),
-        (
-            "adaptive_dosing",
-            "observe = central / EVERY",
-            vec!["CENTRAL", "EVERY"],
-        ),
+        ("adaptive_dosing", "observe = central / EVERY", vec!["CENTRAL", "EVERY"]),
         ("covariate_nn", "activation = TANH", vec![]),
         ("covariate_nn", "activation = tanh(X)", vec!["X"]),
         ("covariate_nn", "inputs = [WT, TANH]", vec!["TANH", "WT"]),
         ("markov_model", "states = [awake=0, asleep=1]", vec![]),
         ("event_model", "family = weibull", vec![]),
         ("event_model", "link = logit", vec!["LOGIT"]),
-        (
-            "scaling",
-            "at = every 12 from 0 to 96",
-            vec!["EVERY", "FROM", "TO"],
-        ),
+        ("scaling", "at = every 12 from 0 to 96", vec!["EVERY", "FROM", "TO"]),
     ] {
         assert_eq!(read(block, line), want, "[{block}] {line}");
     }
@@ -33629,12 +30288,8 @@ fn ode_and_initial_condition_targets_are_not_reads_of_a_helper() {
         assert_conditional_read(&err, h, "named in `[odes]`");
     }
     let ic = "[initial_conditions]\n  init(central) = 1\n";
-    let cases = [(
-        "INIT",
-        ic.to_string(),
-        ic.replace("= 1", "= INIT"),
-        "[initial_conditions]".to_string(),
-    )];
+    let cases =
+        [("INIT", ic.to_string(), ic.replace("= 1", "= INIT"), "[initial_conditions]".to_string())];
     assert_target_is_not_a_read(&cases, false);
 }
 
@@ -33663,11 +30318,7 @@ fn split_assignment_target_recognises_only_write_forms() {
         ("transition 0 -> 1 = Q", "transition 0 -> 1", " Q"),
         ("CL = if (M == 1) A else B", "CL", " if (M == 1) A else B"),
     ] {
-        assert_eq!(
-            split_assignment_target(line),
-            Some((target, rhs)),
-            "{line:?}"
-        );
+        assert_eq!(split_assignment_target(line), Some((target, rhs)), "{line:?}");
     }
     for line in [
         "pk one_cpt_oral(cl=CL, v=V)",
@@ -33754,19 +30405,12 @@ fn definitely_assigned_names_still_parse_and_agree() {
     };
     let preds = |ip: &str| -> Vec<f64> {
         let m = parse_model_string(&cond_model(ip, y, "")).unwrap();
-        crate::api::predict(&m, &pop, &m.default_params)
-            .unwrap()
-            .iter()
-            .map(|r| r.pred)
-            .collect()
+        crate::api::predict(&m, &pop, &m.default_params).unwrap().iter().map(|r| r.pred).collect()
     };
     let a = preds(&prior);
     let b = preds(with_else);
     assert_eq!(a, b, "prior default and `else` must agree bit for bit");
-    assert!(
-        (a[0] - 1.45).abs() < 1e-12 && (a[1] - 2.7).abs() < 1e-12,
-        "{a:?}"
-    );
+    assert!((a[0] - 1.45).abs() < 1e-12 && (a[1] - 2.7).abs() < 1e-12, "{a:?}");
 }
 
 /// Two conditional names in one refusal: each is listed with its own reader,
@@ -33804,10 +30448,8 @@ fn compartment_free_dose_attribute_names_are_plain_names() {
 /// #1026's third consumer: a controller's `observe` signal.
 #[test]
 fn conditional_name_read_by_adaptive_observe_is_refused() {
-    let src = adaptive_observe_model("KEL", "central / (V * S)").replace(
-        "  KEL = TVX\n",
-        "  KEL = TVX\n  if (WT > 70) {\n    S = TVX\n  }\n",
-    );
+    let src = adaptive_observe_model("KEL", "central / (V * S)")
+        .replace("  KEL = TVX\n", "  KEL = TVX\n  if (WT > 70) {\n    S = TVX\n  }\n");
     let err = refused_with_valid_twin(&src, "S");
     assert_conditional_read(&err, "S", "named in `[adaptive_dosing]`");
 }
@@ -33839,10 +30481,8 @@ const ALL_ARM_H0: &str = "  if (WT > 70) {\n    H0 = 0.01\n  } else {\n    H0 = 
 #[test]
 fn all_arm_name_read_by_an_ode_hazard_is_promoted() {
     for header in ["[event_model]", "[event_model DEATH]"] {
-        let src = all_arm_endpoint_model(
-            ALL_ARM_H0,
-            &format!("{header}\n  cmt    = 2\n  hazard = H0\n"),
-        );
+        let src =
+            all_arm_endpoint_model(ALL_ARM_H0, &format!("{header}\n  cmt    = 2\n  hazard = H0\n"));
         let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{header}: {e}"));
         assert!(
             m.indiv_param_names.iter().any(|n| n == "H0"),
@@ -33914,20 +30554,14 @@ fn unbound_reader_preds(ip: &str, extra: &str) -> Vec<f64> {
 fn an_unbound_parameter_read_by_init_or_obs_scale_predicts_like_its_value() {
     let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
     let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
-    for (label, block) in [
-        ("init", &init as &dyn Fn(&str) -> String),
-        ("obs_scale", &scale),
-    ] {
+    for (label, block) in [("init", &init as &dyn Fn(&str) -> String), ("obs_scale", &scale)] {
         let via_name = unbound_reader_preds("  S = 2", &block("S"));
         let inline = unbound_reader_preds("", &block("2"));
         assert_eq!(via_name, inline, "{label}: S = 2 must read 2");
 
         let via_wt = unbound_reader_preds("  S = WT", &block("S"));
         let inline_wt = unbound_reader_preds("", &block("WT"));
-        assert_eq!(
-            via_wt, inline_wt,
-            "{label}: S = WT must read WT per subject"
-        );
+        assert_eq!(via_wt, inline_wt, "{label}: S = WT must read WT per subject");
         assert!(
             (via_wt[0] - via_wt[1]).abs() > 1e-3,
             "{label}: the two subjects must differ (WT 60 vs 80): {via_wt:?}"
@@ -33962,10 +30596,7 @@ fn too_many_unbound_parameters_for_the_free_slots_is_refused() {
         &ip,
         &format!("[scaling]\n  y = central / V + {sum} + S12\n"),
     ));
-    assert!(
-        err.contains("[scaling] y: together these reference 12 individual"),
-        "{err}"
-    );
+    assert!(err.contains("[scaling] y: together these reference 12 individual"), "{err}");
 }
 
 // ---- #1853: per-parameter `TIME` dependence, and which reads are the disposition ----
@@ -34055,10 +30686,7 @@ fn the_time_mask_flags_only_the_parameter_that_reads_time() {
     );
     assert!(reads_time(&mask, "CL"), "CL reads TIME: {mask:?}");
     for free in ["V", "KA", "H0", "BETA"] {
-        assert!(
-            !reads_time(&mask, free),
-            "{free} does not read TIME: {mask:?}"
-        );
+        assert!(!reads_time(&mask, free), "{free} does not read TIME: {mask:?}");
     }
 }
 
@@ -34077,10 +30705,7 @@ fn the_time_mask_propagates_through_an_intermediate() {
          \x20 BETA  = TVBETA\n",
     );
     assert!(reads_time(&mask, "DECAY"), "DECAY reads TIME: {mask:?}");
-    assert!(
-        reads_time(&mask, "CL"),
-        "CL reads TIME through DECAY: {mask:?}"
-    );
+    assert!(reads_time(&mask, "CL"), "CL reads TIME through DECAY: {mask:?}");
     assert!(!reads_time(&mask, "V"), "V is time-free: {mask:?}");
 }
 
@@ -34102,14 +30727,8 @@ fn the_time_mask_taints_an_assignment_under_a_time_reading_condition() {
          \x20 H0   = TVH0\n\
          \x20 BETA = TVBETA\n",
     );
-    assert!(
-        reads_time(&mask, "CL"),
-        "CL is assigned under a TIME condition: {mask:?}"
-    );
-    assert!(
-        reads_time(&mask, "V"),
-        "V is assigned under the same TIME condition: {mask:?}"
-    );
+    assert!(reads_time(&mask, "CL"), "CL is assigned under a TIME condition: {mask:?}");
+    assert!(reads_time(&mask, "V"), "V is assigned under the same TIME condition: {mask:?}");
     assert!(
         !reads_time(&mask, "KA"),
         "KA is outside the if: {mask:?} — the taint must be the condition's, not the block's"
@@ -34149,10 +30768,7 @@ fn the_time_mask_taints_an_else_if_body_governed_by_an_earlier_time_condition() 
         reads_time(&mask, "CL"),
         "CL is assigned in an `else if` body an earlier TIME condition governs: {mask:?}"
     );
-    assert!(
-        reads_time(&mask, "AUX"),
-        "AUX is assigned under the TIME condition itself: {mask:?}"
-    );
+    assert!(reads_time(&mask, "AUX"), "AUX is assigned under the TIME condition itself: {mask:?}");
     assert!(
         !reads_time(&mask, "KA"),
         "KA is outside the if: {mask:?} — the taint must not spill past the block"
@@ -34170,10 +30786,7 @@ fn the_time_mask_is_empty_for_a_time_free_block() {
               \x20 H0   = TVH0\n\
               \x20 BETA = TVBETA\n";
     let mask = time_mask_of(ip);
-    assert!(
-        mask.iter().all(|(_, t)| !t),
-        "no parameter reads TIME: {mask:?}"
-    );
+    assert!(mask.iter().all(|(_, t)| !t), "no parameter reads TIME: {mask:?}");
     assert!(
         !compiled_model_uses_time_builtin(&time_taint_model(ip)),
         "and the whole-block flag agrees"
@@ -34232,10 +30845,8 @@ fn only_a_read_the_accumulator_depends_on_counts() {
     let model = parse_model_string(M).expect("the #1575-shaped model compiles");
     let ode = model.ode_spec.as_ref().expect("ODE model");
     let rhs = ode.rhs_program.as_ref().expect("RHS program present");
-    let chz = *ode
-        .chz_state_slots
-        .first()
-        .expect("the [event_model] hazard injects an accumulator");
+    let chz =
+        *ode.chz_state_slots.first().expect("the [event_model] hazard injects an accumulator");
     let slice = rhs.chz_dependency_slice(chz);
     let idx = |name: &str| {
         model
@@ -34471,10 +31082,7 @@ fn every_indiv_param_name_is_in_scope_for_the_compiled_odes_block() {
     // The straddle: this fixture must actually carry a name appended by the readout
     // desugaring, or it pins nothing.
     assert!(
-        model
-            .indiv_param_names
-            .iter()
-            .any(|n| n.starts_with("__ferx_ro_")),
+        model.indiv_param_names.iter().any(|n| n.starts_with("__ferx_ro_")),
         "fixture must carry a [scaling] Form C synthetic: {:?}",
         model.indiv_param_names
     );
@@ -34642,10 +31250,7 @@ fn hoist_stmt_reads(stmts: &[Statement], out: &mut Vec<usize>) {
                     _ => None,
                 }))
             }
-            Statement::If {
-                branches,
-                else_body,
-            } => {
+            Statement::If { branches, else_body } => {
                 for (_, body) in branches {
                     hoist_stmt_reads(body, out);
                 }
@@ -34682,24 +31287,12 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
-    let h = prog
-        .hoist
-        .as_ref()
-        .expect("the two-cpt RHS has liftable subtrees");
+    let h = prog.hoist.as_ref().expect("the two-cpt RHS has liftable subtrees");
     // `0 − SH` (unary minus), `Q/V1` and `Q/V2` — each of the last two read twice in
     // the source and lifted once.
-    let lifted: Vec<String> = h
-        .lifted
-        .iter()
-        .map(|(_, bc)| format!("{:?}", bc.ops))
-        .collect();
+    let lifted: Vec<String> = h.lifted.iter().map(|(_, bc)| format!("{:?}", bc.ops)).collect();
     assert_eq!(lifted.len(), 3, "lifted subtrees: {lifted:?}");
-    assert!(
-        lifted
-            .iter()
-            .all(|s| s.contains("RSub") || s.contains("Div")),
-        "{lifted:?}"
-    );
+    assert!(lifted.iter().all(|s| s.contains("RSub") || s.contains("Div")), "{lifted:?}");
     // The two `Div`s are distinct subtrees: deduplication must not merge `Q/V1`
     // with `Q/V2`.
     assert_eq!(lifted.iter().filter(|s| s.contains("Div")).count(), 2);
@@ -34709,29 +31302,20 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
     let mut eval_reads = Vec::new();
     hoist_stmt_reads(&h.stmts, &mut eval_reads);
     for (slot, _) in &h.lifted {
-        assert!(
-            eval_reads.contains(slot),
-            "lifted slot {slot} is never read"
-        );
+        assert!(eval_reads.contains(slot), "lifted slot {slot} is never read");
     }
     assert_eq!(h.key_slots.len(), 4, "key slots: {:?}", h.key_slots);
     let mut analysis_reads = Vec::new();
     hoist_stmt_reads(&prog.stmts, &mut analysis_reads);
     assert!(analysis_reads.iter().all(|&s| s < prog.n_vars_total));
     for &k in &h.key_slots {
-        assert!(
-            analysis_reads.contains(&k),
-            "analysis program lost read of slot {k}"
-        );
+        assert!(analysis_reads.contains(&k), "analysis program lost read of slot {k}");
     }
 
     // The straddle: `CL/V` is lifted, `(0 − central)·CL` has nothing to lift — and a
     // program with nothing to lift carries no cache at all.
     let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
-    assert_eq!(
-        hoist_program(&ratio).hoist.as_ref().map(|h| h.lifted.len()),
-        Some(1)
-    );
+    assert_eq!(hoist_program(&ratio).hoist.as_ref().map(|h| h.lifted.len()), Some(1));
     let none = hoist_model(HOIST_ONE_CPT_NONE);
     assert!(hoist_program(&none).hoist.is_none());
 }
@@ -34801,14 +31385,8 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         let mut got_c = [0.0; 2];
         (spec.rhs)(u, &params, *t, &mut got_c);
         for j in 0..2 {
-            assert!(
-                hoist_bits_eq(got_g[j], want[j]),
-                "call {k} du[{j}] eval_rhs_g"
-            );
-            assert!(
-                hoist_bits_eq(got_c[j], want[j]),
-                "call {k} du[{j}] f64 closure"
-            );
+            assert!(hoist_bits_eq(got_g[j], want[j]), "call {k} du[{j}] eval_rhs_g");
+            assert!(hoist_bits_eq(got_c[j], want[j]), "call {k} du[{j}] f64 closure");
         }
     }
 
@@ -34872,10 +31450,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             "a first-order dual uses the lift"
         );
         for j in 0..2 {
-            assert!(
-                hoist_bits_eq(got[j].v, want[j].v),
-                "dual call {k} du[{j}] value"
-            );
+            assert!(hoist_bits_eq(got[j].v, want[j].v), "dual call {k} du[{j}] value");
             for a in 0..3 {
                 assert!(
                     hoist_bits_eq(got[j].g[a], want[j].g[a]),
@@ -34915,11 +31490,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         &mut vars_m,
         &mut stack_m,
     );
-    assert_eq!(
-        vars_m.len(),
-        prog.n_vars_total,
-        "Dual2 must not use the lift"
-    );
+    assert_eq!(vars_m.len(), prog.n_vars_total, "Dual2 must not use the lift");
     let mut want = [M::constant(0.0); 2];
     plain.eval_rhs_g::<M>(
         &ud,
@@ -35037,11 +31608,7 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
         &mut vars,
         &mut stack,
     );
-    assert!(
-        hoist_bits_eq(du[0], 1.0e6 * 50.0),
-        "hit did not reuse the cache: {}",
-        du[0]
-    );
+    assert!(hoist_bits_eq(du[0], 1.0e6 * 50.0), "hit did not reuse the cache: {}", du[0]);
 
     // A moved parameter: a miss, so the poison is replaced by the fresh value.
     vars[slot] = 1.0e6;
@@ -35056,11 +31623,7 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
         &mut vars,
         &mut stack,
     );
-    assert!(
-        hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0),
-        "miss did not recompute: {}",
-        du[0]
-    );
+    assert!(hoist_bits_eq(du[0], (0.0 - 3.5 / 30.0) * 50.0), "miss did not recompute: {}", du[0]);
     // And back: a miss again, giving the first call's value.
     prog.eval_rhs_g::<f64>(
         &u,
@@ -35130,12 +31693,7 @@ fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
     let mut got = [0.0; 2];
     (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got);
     for j in 0..2 {
-        assert!(
-            hoist_bits_eq(got[j], want[j]),
-            "du[{j}]: {} vs {}",
-            got[j],
-            want[j]
-        );
+        assert!(hoist_bits_eq(got[j], want[j]), "du[{j}]: {} vs {}", got[j], want[j]);
     }
 }
 
@@ -35181,10 +31739,7 @@ fn rhs_hoist_taint_rule_is_unreachable_while_odes_cannot_reassign_a_parameter() 
         ),
         Err(e) => e,
     };
-    assert!(
-        err.contains("collides with a previously-declared individual parameter"),
-        "{err}"
-    );
+    assert!(err.contains("collides with a previously-declared individual parameter"), "{err}");
 }
 
 /// `MIXNUM` can differ between two RHS calls on identical parameters — the mixture
@@ -35226,10 +31781,7 @@ fn rhs_hoist_never_lifts_a_mixnum_reader() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_MIXNUM);
     let prog = hoist_program(&model);
-    let h = prog
-        .hoist
-        .as_ref()
-        .expect("KIN/KOUT is liftable, so the cache is live");
+    let h = prog.hoist.as_ref().expect("KIN/KOUT is liftable, so the cache is live");
     for (_, bc) in &h.lifted {
         assert!(
             !bc.ops.iter().any(|o| matches!(o, Op::PushMixNum)),
@@ -35272,10 +31824,7 @@ fn rhs_hoist_never_lifts_a_mixnum_reader() {
         let mut got_c = [0.0];
         (model.ode_spec.as_ref().unwrap().rhs)(&u, &params, 1.0, &mut got_c);
         assert!(hoist_bits_eq(got_g[0], want[0]), "class {class} eval_rhs_g");
-        assert!(
-            hoist_bits_eq(got_c[0], want[0]),
-            "class {class} f64 closure"
-        );
+        assert!(hoist_bits_eq(got_c[0], want[0]), "class {class} f64 closure");
         seen.push(want[0]);
     }
     // The two classes must actually differ, or this cannot see a stale replay.
@@ -35423,10 +31972,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
                 want[j]
             );
             // Entry by entry: `same_bits` is part of the code under test.
-            assert!(
-                hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "call {k} du[{j}] Dual2 value"
-            );
+            assert!(hoist_bits_eq(dgot[j].value, dwant[j].value), "call {k} du[{j}] Dual2 value");
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
@@ -35443,12 +31989,7 @@ fn rhs_hoist_never_lifts_a_bare_time_reader() {
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_BARE_TIME);
-    for (_, bc) in &hoist_program(&model)
-        .hoist
-        .as_ref()
-        .expect("CL/V lifts")
-        .lifted
-    {
+    for (_, bc) in &hoist_program(&model).hoist.as_ref().expect("CL/V lifts").lifted {
         assert!(
             !bc.ops.iter().any(|o| matches!(o, Op::PushTime)),
             "a lifted subtree reads TIME: {:?}",
@@ -35458,11 +31999,7 @@ fn rhs_hoist_never_lifts_a_bare_time_reader() {
     assert_hoist_matches_unlifted_over_calls(
         HOIST_BARE_TIME,
         2,
-        &[
-            (vec![1.0, 5.0], 0.5),
-            (vec![1.0, 5.0], 2.0),
-            (vec![2.0, 4.0], 7.5),
-        ],
+        &[(vec![1.0, 5.0], 0.5), (vec![1.0, 5.0], 2.0), (vec![2.0, 4.0], 7.5)],
     );
 }
 
@@ -35472,12 +32009,7 @@ fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     // Taken, then skipped twice (cache hits), then taken again.
-    let calls = [
-        (vec![50.0], 0.5),
-        (vec![50.0], 2.0),
-        (vec![40.0], 3.0),
-        (vec![40.0], 0.25),
-    ];
+    let calls = [(vec![50.0], 0.5), (vec![50.0], 2.0), (vec![40.0], 3.0), (vec![40.0], 0.25)];
     assert_hoist_matches_unlifted_over_calls(HOIST_BRANCH_ONLY_WRITE, 1, &calls);
     // The skipped calls really do read the zero-fill.
     let plain_model = hoist_model_unlifted(HOIST_BRANCH_ONLY_WRITE);
@@ -35521,11 +32053,7 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
 
     poison();
     rhs(&u, &p1, 2.0, &mut du);
-    assert!(
-        hoist_bits_eq(du[0], 1.0e6 * 50.0),
-        "closure hit did not reuse the cache: {}",
-        du[0]
-    );
+    assert!(hoist_bits_eq(du[0], 1.0e6 * 50.0), "closure hit did not reuse the cache: {}", du[0]);
 
     poison();
     rhs(&u, &p2, 2.0, &mut du);
@@ -35625,14 +32153,8 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             &mut dstack,
         );
         for j in 0..2 {
-            assert!(
-                hoist_bits_eq(got_g[j], want[j]),
-                "set {c} {p:?} du[{j}] eval_rhs_g"
-            );
-            assert!(
-                hoist_bits_eq(got_c[j], want[j]),
-                "set {c} {p:?} du[{j}] f64 closure"
-            );
+            assert!(hoist_bits_eq(got_g[j], want[j]), "set {c} {p:?} du[{j}] eval_rhs_g");
+            assert!(hoist_bits_eq(got_c[j], want[j]), "set {c} {p:?} du[{j}] f64 closure");
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
                 "set {c} {p:?} du[{j}] Dual2 value"
@@ -35715,21 +32237,9 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
         );
         let mut got_c = [0.0];
         rhs(&u, &params, 1.0, &mut got_c);
-        assert_eq!(
-            want[0].is_sign_negative(),
-            cl.is_sign_negative(),
-            "fixture keeps the sign"
-        );
-        assert_eq!(
-            got_g[0].to_bits(),
-            want[0].to_bits(),
-            "CL = {cl:?}: eval_rhs_g"
-        );
-        assert_eq!(
-            got_c[0].to_bits(),
-            want[0].to_bits(),
-            "CL = {cl:?}: f64 closure"
-        );
+        assert_eq!(want[0].is_sign_negative(), cl.is_sign_negative(), "fixture keeps the sign");
+        assert_eq!(got_g[0].to_bits(), want[0].to_bits(), "CL = {cl:?}: eval_rhs_g");
+        assert_eq!(got_c[0].to_bits(), want[0].to_bits(), "CL = {cl:?}: f64 closure");
     }
 }
 
@@ -35821,11 +32331,7 @@ fn lean_spec(lines: &[&str]) -> crate::ode::OdeSpec {
 }
 
 fn lean_plan(lines: &[&str]) -> RhsBindingPlan {
-    lean_spec(lines)
-        .rhs_program
-        .as_ref()
-        .expect("ODE spec carries its RHS program")
-        .binding
+    lean_spec(lines).rhs_program.as_ref().expect("ODE spec carries its RHS program").binding
 }
 
 /// Each fixture with the plan it must get. `zero = false` only where every read
@@ -36169,12 +32675,8 @@ fn compiled_rhs_dual2_matches_fd_of_the_f64_rhs() {
 fn lean_rhs_dual2_vs_fd(compiled: bool) {
     type D2 = crate::sens::dual2::Dual2<3>;
     let (first, last) = (0.25, 0.4);
-    let points: [([f64; 2], f64); 4] = [
-        ([100.0, 3.0], 0.5),
-        ([80.0, 9.0], 1.25),
-        ([40.0, 9.0], 1.75),
-        ([30.0, 12.0], 2.5),
-    ];
+    let points: [([f64; 2], f64); 4] =
+        [([100.0, 3.0], 0.5), ([80.0, 9.0], 1.25), ([40.0, 9.0], 1.75), ([30.0, 12.0], 2.5)];
     // x = [CL, Q, lag]; V fixed.
     let x0 = [4.0, 0.7, 0.0];
     let v = 40.0;
@@ -36269,9 +32771,7 @@ fn lean_rhs_dual2_vs_fd(compiled: bool) {
             }
         }
         // A TAD read only by a condition has no derivative; an arithmetic one must.
-        let want_live = lines
-            .iter()
-            .any(|l| l.starts_with("d/dt") && l.contains("TAD"));
+        let want_live = lines.iter().any(|l| l.starts_with("d/dt") && l.contains("TAD"));
         assert_eq!(lag_live, want_live, "{name}: ∂/∂lag liveness");
     }
     // Non-vacuity: the compiled run must reach the register code, the interpreter run
@@ -36279,10 +32779,7 @@ fn lean_rhs_dual2_vs_fd(compiled: bool) {
     if compiled {
         assert!(n_compiled > 0, "no fixture compiled");
     } else {
-        assert_eq!(
-            n_compiled, 0,
-            "RhsRegcodeOff must keep every fixture interpreted"
-        );
+        assert_eq!(n_compiled, 0, "RhsRegcodeOff must keep every fixture interpreted");
     }
     eprintln!(
         "dual2 vs fd (compiled = {compiled}, {n_compiled} compiled): worst grad rel \
@@ -36318,16 +32815,10 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
         let _off = RhsLeanBindingOff::enter();
         lean_spec(&large_lines)
     };
-    let (sp, lp) = (
-        small.rhs_program.as_ref().unwrap(),
-        large.rhs_program.as_ref().unwrap(),
-    );
+    let (sp, lp) = (small.rhs_program.as_ref().unwrap(), large.rhs_program.as_ref().unwrap());
     for (name, p) in [("small", sp), ("large", lp)] {
         assert!(p.hoist.is_none(), "{name}: must take the no-hoist reset");
-        assert!(
-            !p.binding.zero,
-            "{name}: must be a lean (no re-zero) binding"
-        );
+        assert!(!p.binding.zero, "{name}: must be a lean (no re-zero) binding");
     }
     // The straddle: an intermediate the large model writes lies past the end of
     // the small model's buffer.
@@ -36414,38 +32905,18 @@ fn lean_rhs_walk_checks_every_operand_position() {
     type Ex = fn(Expression) -> Expression;
     let exprs: &[(&str, Ex)] = &[
         ("bare read", |x| x),
-        ("BinOp left", |x| {
-            binop(BinOp::Add, x, Expression::VariableIdx(0))
-        }),
-        ("BinOp right", |x| {
-            binop(BinOp::Mul, Expression::VariableIdx(0), x)
-        }),
-        ("Power base", |x| {
-            Expression::Power(Box::new(x), Box::new(lit(2.0)))
-        }),
-        ("Power exponent", |x| {
-            Expression::Power(Box::new(lit(2.0)), Box::new(x))
-        }),
+        ("BinOp left", |x| binop(BinOp::Add, x, Expression::VariableIdx(0))),
+        ("BinOp right", |x| binop(BinOp::Mul, Expression::VariableIdx(0), x)),
+        ("Power base", |x| Expression::Power(Box::new(x), Box::new(lit(2.0)))),
+        ("Power exponent", |x| Expression::Power(Box::new(lit(2.0)), Box::new(x))),
         ("UnaryFn", |x| unary("exp", x)),
-        ("Conditional condition", |x| {
-            cond(cmp(x, CmpOp::Gt, lit(0.0)), lit(1.0), lit(2.0))
-        }),
-        ("Conditional then", |x| {
-            cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), x, lit(2.0))
-        }),
-        ("Conditional else", |x| {
-            cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), lit(1.0), x)
-        }),
+        ("Conditional condition", |x| cond(cmp(x, CmpOp::Gt, lit(0.0)), lit(1.0), lit(2.0))),
+        ("Conditional then", |x| cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), x, lit(2.0))),
+        ("Conditional else", |x| cond(cmp(lit(1.0), CmpOp::Gt, lit(0.0)), lit(1.0), x)),
     ];
     for (name, f) in exprs {
-        assert!(
-            expr_reads_defined(&f(d()), &defined),
-            "{name}: defined read must pass"
-        );
-        assert!(
-            !expr_reads_defined(&f(u()), &defined),
-            "{name}: undefined read must fail"
-        );
+        assert!(expr_reads_defined(&f(d()), &defined), "{name}: defined read must pass");
+        assert!(!expr_reads_defined(&f(u()), &defined), "{name}: undefined read must fail");
     }
     type Cx = fn(Expression) -> Condition;
     let conds: &[(&str, Cx)] = &[
@@ -36475,32 +32946,18 @@ fn lean_rhs_walk_checks_every_operand_position() {
                 Box::new(cmp(x, CmpOp::Gt, lit(0.0))),
             )
         }),
-        ("Not", |x| {
-            Condition::Not(Box::new(cmp(x, CmpOp::Gt, lit(0.0))))
-        }),
+        ("Not", |x| Condition::Not(Box::new(cmp(x, CmpOp::Gt, lit(0.0))))),
         ("Present", Condition::Present),
     ];
     for (name, f) in conds {
-        assert!(
-            cond_reads_defined(&f(d()), &defined),
-            "{name}: defined read must pass"
-        );
-        assert!(
-            !cond_reads_defined(&f(u()), &defined),
-            "{name}: undefined read must fail"
-        );
+        assert!(cond_reads_defined(&f(d()), &defined), "{name}: defined read must pass");
+        assert!(!cond_reads_defined(&f(u()), &defined), "{name}: undefined read must fail");
     }
     // Bytecode: any PushVar of an undefined slot fails, wherever it sits.
     let bc = |e: Expression| compile_bytecode(&e);
     assert!(bc_reads_defined(&bc(binop(BinOp::Add, d(), d())), &defined));
-    assert!(!bc_reads_defined(
-        &bc(binop(BinOp::Add, d(), u())),
-        &defined
-    ));
-    assert!(!bc_reads_defined(
-        &bc(binop(BinOp::Add, u(), d())),
-        &defined
-    ));
+    assert!(!bc_reads_defined(&bc(binop(BinOp::Add, d(), u())), &defined));
+    assert!(!bc_reads_defined(&bc(binop(BinOp::Add, u(), d())), &defined));
     // Out of range is undefined, never a panic.
     assert!(!expr_reads_defined(&Expression::VariableIdx(7), &defined));
 }
@@ -36522,17 +32979,12 @@ fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
         let spec = lean_spec(lines);
         spec.rhs_program.as_ref().unwrap().hoist.is_some()
     };
-    for name in [
-        "no hoist, R defined only inside an if without else",
-        "no hoist, R defined on both arms",
-    ] {
+    for name in
+        ["no hoist, R defined only inside an if without else", "no hoist, R defined on both arms"]
+    {
         assert!(!has_hoist(name), "{name}: must take the no-hoist reset");
     }
-    let spec = lean_spec(&[
-        "K = CL / V + MACHEPS",
-        "d/dt(a) = -K * a",
-        "d/dt(b) = K * a - Q * b",
-    ]);
+    let spec = lean_spec(&["K = CL / V + MACHEPS", "d/dt(a) = -K * a", "d/dt(b) = K * a - Q * b"]);
     let p = spec.rhs_program.as_ref().unwrap();
     let h = p.hoist.as_ref().expect("MACHEPS fixture is hoisted");
     let slot = [p.macheps_slot];
@@ -36615,12 +33067,8 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
     }
 
     fn run_g<T: crate::sens::num::vm::VmNum>(
-        name: &str,
-        lean: &OdeRhsProgram,
-        full: &OdeRhsProgram,
-        seq: &[(Vec<T>, [f64; 2], f64)],
-        tafd_of: impl Fn(f64) -> f64,
-        tad_of: impl Fn(f64) -> T,
+        name: &str, lean: &OdeRhsProgram, full: &OdeRhsProgram, seq: &[(Vec<T>, [f64; 2], f64)],
+        tafd_of: impl Fn(f64) -> f64, tad_of: impl Fn(f64) -> T,
     ) {
         let (mut vl, mut sl, mut vf, mut sf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (k, (params, u, t)) in seq.iter().enumerate() {
@@ -36651,10 +33099,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 &mut sl,
             );
             for j in 0..2 {
-                assert!(
-                    want[j].plain().is_finite(),
-                    "{name} call {k}: oracle du[{j}] not finite"
-                );
+                assert!(want[j].plain().is_finite(), "{name} call {k}: oracle du[{j}] not finite");
                 assert!(
                     got[j].same_bits(&want[j]),
                     "{name} call {k} du[{j}]: lean {} vs full {}",
@@ -36697,10 +33142,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             });
             (lean_s.rhs)(u, &params, *t, &mut got);
             for j in 0..2 {
-                assert!(
-                    want[j].is_finite(),
-                    "{name} call {k}: oracle du[{j}] not finite"
-                );
+                assert!(want[j].is_finite(), "{name} call {k}: oracle du[{j}] not finite");
                 assert!(
                     hoist_bits_eq(got[j], want[j]),
                     "{name} call {k} du[{j}] f64 closure: lean {} vs full {}",
@@ -36726,9 +33168,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 (v, *u, *t)
             })
             .collect();
-        run_g::<D1>(name, lean, full, &seq, tafd_of, |t| {
-            D1::constant(t - last) - D1::var(0.0, 0)
-        });
+        run_g::<D1>(name, lean, full, &seq, tafd_of, |t| D1::constant(t - last) - D1::var(0.0, 0));
         // Dual2: second order takes the un-hoisted arm of `eval_rhs_g`.
         let seq: Vec<(Vec<D2>, [f64; 2], f64)> = calls
             .iter()
@@ -36793,27 +33233,14 @@ fn profile_is_accepted_on_every_level_block_form() {
         ", contrast = sum_to_zero_within",
         ", contrast = sum_to_zero",
     ] {
-        let text = profile_model(
-            &format!("theta PLACEBO[STUDY, TIME{contrast}](0.0) profile"),
-            "PLACEBO",
-        );
+        let text =
+            profile_model(&format!("theta PLACEBO[STUDY, TIME{contrast}](0.0) profile"), "PLACEBO");
         let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{contrast}: {e}"));
-        assert_eq!(
-            profiled_decls(&parsed),
-            [("PLACEBO".to_string(), true)],
-            "{contrast}"
-        );
+        assert_eq!(profiled_decls(&parsed), [("PLACEBO".to_string(), true)], "{contrast}");
     }
-    for decl in [
-        "theta PLACEBO[3](0.0) profile",
-        "theta PLACEBO[3](0.0)   PROFILE",
-    ] {
+    for decl in ["theta PLACEBO[3](0.0) profile", "theta PLACEBO[3](0.0)   PROFILE"] {
         let parsed = parse_full_model(&profile_model(decl, "PLACEBO[STUDY]")).unwrap();
-        assert_eq!(
-            profiled_decls(&parsed),
-            [("PLACEBO".to_string(), true)],
-            "{decl}"
-        );
+        assert_eq!(profiled_decls(&parsed), [("PLACEBO".to_string(), true)], "{decl}");
     }
     let control =
         parse_full_model(&profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")).unwrap();
@@ -36824,22 +33251,14 @@ fn profile_is_accepted_on_every_level_block_form() {
 /// select log-packing; an unprofiled block keeps the `1e-9 … 1e9` default box.
 #[test]
 fn a_profiled_block_is_unbounded_and_never_log_packed() {
-    let p = parse_full_model(&profile_model(
-        "theta PLACEBO[3](0.5) profile",
-        "PLACEBO[STUDY]",
-    ))
-    .unwrap()
-    .model;
-    let u = parse_full_model(&profile_model("theta PLACEBO[3](0.5)", "PLACEBO[STUDY]"))
+    let p = parse_full_model(&profile_model("theta PLACEBO[3](0.5) profile", "PLACEBO[STUDY]"))
         .unwrap()
         .model;
+    let u =
+        parse_full_model(&profile_model("theta PLACEBO[3](0.5)", "PLACEBO[STUDY]")).unwrap().model;
     // θ 0 is TVE0; the three levels follow.
     for l in 1..=3 {
-        assert_eq!(
-            p.default_params.theta_lower[l],
-            f64::NEG_INFINITY,
-            "level {l}"
-        );
+        assert_eq!(p.default_params.theta_lower[l], f64::NEG_INFINITY, "level {l}");
         assert_eq!(p.default_params.theta_upper[l], f64::INFINITY, "level {l}");
         assert!(!crate::estimation::parameterization::theta_packs_log(
             p.default_params.theta_lower[l]
@@ -36856,9 +33275,7 @@ fn a_profiled_block_is_unbounded_and_never_log_packed() {
 #[test]
 fn profile_refuses_a_single_theta_and_fix() {
     let err = |decl: &str, read: &str| {
-        parse_full_model(&profile_model(decl, read))
-            .err()
-            .expect("refused")
+        parse_full_model(&profile_model(decl, read)).err().expect("refused")
     };
     let single = err("theta PLACEBO(0.0) profile", "PLACEBO");
     for must in [
@@ -36919,9 +33336,7 @@ fn a_profiled_block_keeps_its_bounds_on_the_block() {
         for l in 1..=3 {
             assert_eq!(d.theta_lower[l], f64::NEG_INFINITY, "{decl}: level {l}");
             assert_eq!(d.theta_upper[l], f64::INFINITY, "{decl}: level {l}");
-            assert!(!crate::estimation::parameterization::theta_packs_log(
-                d.theta_lower[l]
-            ));
+            assert!(!crate::estimation::parameterization::theta_packs_log(d.theta_lower[l]));
         }
     }
     assert_eq!(profile_box(&parse("theta PLACEBO[3](0.0) profile")), None);
@@ -36953,10 +33368,8 @@ fn a_profiled_block_refuses_a_point_an_empty_or_a_missed_box() {
         ),
         (
             "theta PLACEBO[3](0.0, 5.0, -5.0) profile",
-            &[
-                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has lower = 5 above \
-                 upper = -5, so the box is empty.",
-            ],
+            &["E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has lower = 5 above \
+                 upper = -5, so the box is empty."],
             &["point", "init"],
         ),
         (
@@ -37002,14 +33415,9 @@ fn profile_is_peeled_off_a_theta_line_only() {
         split_profile_modifier("theta A[3](0.0) profile FIX"),
         ("theta A[3](0.0) FIX".to_string(), true)
     );
-    assert_eq!(
-        split_profile_modifier("theta A[3](0.0)"),
-        ("theta A[3](0.0)".to_string(), false)
-    );
-    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]").replace(
-        "omega ETA_E0 ~ 4.0",
-        "omega ETA_E0 ~ 4.0 (variance) profile",
-    );
+    assert_eq!(split_profile_modifier("theta A[3](0.0)"), ("theta A[3](0.0)".to_string(), false));
+    let text = profile_model("theta PLACEBO[3](0.0)", "PLACEBO[STUDY]")
+        .replace("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 4.0 (variance) profile");
     assert!(parse_full_model(&text).is_err());
 }
 
@@ -37076,22 +33484,13 @@ fn profile_accepts_every_affine_route_with_a_data_coefficient() {
     for (indiv, y) in [
         ("  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0", "BASE"),
         ("  BASE = (TVE0 + PLACEBO[STUDY]) / WPSE + ETA_E0", "BASE"),
-        (
-            "  BASE = TVE0 + 2.0 * DOSE * PLACEBO[STUDY] + ETA_E0",
-            "BASE",
-        ),
-        (
-            "  PL = 0 - PLACEBO[STUDY] / 2\n  BASE = TVE0 + PL + ETA_E0",
-            "BASE",
-        ),
+        ("  BASE = TVE0 + 2.0 * DOSE * PLACEBO[STUDY] + ETA_E0", "BASE"),
+        ("  PL = 0 - PLACEBO[STUDY] / 2\n  BASE = TVE0 + PL + ETA_E0", "BASE"),
         (
             "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  EM = EMAX * exp(ETA_EM)",
             "BASE - EM * DOSE / (DOSE + 10)",
         ),
-        (
-            "  BASE = TVE0 + ETA_E0 + ETA_EM",
-            "BASE + PLACEBO[STUDY] * WPSE",
-        ),
+        ("  BASE = TVE0 + ETA_E0 + ETA_EM", "BASE + PLACEBO[STUDY] * WPSE"),
         // A branch assignment the block reaches but `y` never reads is off the route.
         (
             "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0\n  if (DOSE > 0) {\n    Z = PLACEBO[STUDY] * \
@@ -37107,10 +33506,8 @@ fn profile_accepts_every_affine_route_with_a_data_coefficient() {
     let f1 = std::fs::read_to_string("tests/data/mbma_placebo/mbma_placebo.ferx").unwrap();
     let decl = "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0)";
     assert!(f1.contains(decl), "fixture moved");
-    let f1 = f1.replace(
-        decl,
-        "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile",
-    );
+    let f1 =
+        f1.replace(decl, "theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile");
     parse_full_model(&f1).unwrap_or_else(|e| panic!("F1: {e}"));
 }
 
@@ -37251,10 +33648,7 @@ fn profile_refuses_a_residual_error_that_reads_the_block() {
 
 /// `route_model` with `ARMFX` profiled as well.
 fn two_profiled(text: &str) -> String {
-    text.replace(
-        "theta ARMFX[3](0.0, -10.0, 10.0)",
-        "theta ARMFX[3](0.0) profile",
-    )
+    text.replace("theta ARMFX[3](0.0, -10.0, 10.0)", "theta ARMFX[3](0.0) profile")
 }
 
 /// #2103 review #8: a profiled block no prediction reads has nothing to be solved
@@ -37264,9 +33658,8 @@ fn two_profiled(text: &str) -> String {
 #[test]
 fn profile_refuses_a_block_no_prediction_reads() {
     let indiv = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
-    let msg = parse_full_model(&two_profiled(&route_model(indiv, "BASE", ADD)))
-        .err()
-        .expect("refused");
+    let msg =
+        parse_full_model(&two_profiled(&route_model(indiv, "BASE", ADD))).err().expect("refused");
     assert_eq!(
         msg,
         "E_PROFILE_NOT_LINEAR: [parameters] theta ARMFX[...] is `profile`d, but no prediction \
@@ -37371,23 +33764,11 @@ fn profile_accepts_one_outermost_logit_link_and_marks_the_block_linked() {
         (inline_if.as_str(), "P"),
         (unread_arm.as_str(), "P"),
         (base, "inv_logit(BASE)"),
-        (
-            "  BASE = TVE0 + ETA_E0",
-            "expit(BASE + 2.0 * DOSE * PLACEBO[STUDY])",
-        ),
-        (
-            "  P = inv_logit(TVE0 + PLACEBO[STUDY] / WPSE + ETA_E0)",
-            "P",
-        ),
-        (
-            "  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  P = inv_logit(LP)\n  Q = P",
-            "Q",
-        ),
+        ("  BASE = TVE0 + ETA_E0", "expit(BASE + 2.0 * DOSE * PLACEBO[STUDY])"),
+        ("  P = inv_logit(TVE0 + PLACEBO[STUDY] / WPSE + ETA_E0)", "P"),
+        ("  LP = TVE0 + PLACEBO[STUDY] + ETA_E0\n  P = inv_logit(LP)\n  Q = P", "Q"),
     ] {
-        assert!(
-            linked_of(&route_model(indiv, y, ADD), "PLACEBO"),
-            "{indiv} / y = {y}"
-        );
+        assert!(linked_of(&route_model(indiv, y, ADD), "PLACEBO"), "{indiv} / y = {y}");
     }
     assert!(!linked_of(&route_model(base, "BASE", ADD), "PLACEBO"));
     assert!(!linked_of(&route_model(base, "BASE", ADD), "ARMFX"));
@@ -37439,11 +33820,7 @@ fn profile_refuses_a_logit_link_that_is_not_the_whole_prediction() {
 /// straddles the walk inside the link.
 #[test]
 fn profile_names_a_function_inside_the_link_and_keeps_other_functions_refused() {
-    let msg = route_err(
-        "  BASE = TVE0 + ETA_E0",
-        "inv_logit(BASE + exp(PLACEBO[STUDY]))",
-        ADD,
-    );
+    let msg = route_err("  BASE = TVE0 + ETA_E0", "inv_logit(BASE + exp(PLACEBO[STUDY]))", ADD);
     assert_route_frame(&msg);
     assert!(
         msg.contains("Here `PLACEBO` reaches `y` through `exp(...)` in the `y` readout."),
@@ -37458,11 +33835,7 @@ fn profile_names_a_function_inside_the_link_and_keeps_other_functions_refused() 
     ))
     .unwrap_or_else(|e| panic!("{e}"));
     for f in ["logit", "log"] {
-        let msg = route_err(
-            "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
-            &format!("{f}(BASE)"),
-            ADD,
-        );
+        let msg = route_err("  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0", &format!("{f}(BASE)"), ADD);
         assert_route_frame(&msg);
         assert!(
             msg.contains(&format!(
@@ -37522,21 +33895,9 @@ fn profile_refuses_a_block_in_an_obs_scale_divisor() {
     assert!(control.contains("but no prediction reads it"), "{control}");
     assert!(!control.contains("divisor"), "{control}");
     for (sc, scaling, label) in [
-        (
-            "V + PLACEBO[STUDY]",
-            "obs_scale = SC",
-            "`[scaling] obs_scale`",
-        ),
-        (
-            "V",
-            "obs_scale = SC + PLACEBO[STUDY]",
-            "`[scaling] obs_scale`",
-        ),
-        (
-            "V",
-            "obs_scale[CMT=1] = V + PLACEBO[STUDY]",
-            "`[scaling] obs_scale[CMT=1]`",
-        ),
+        ("V + PLACEBO[STUDY]", "obs_scale = SC", "`[scaling] obs_scale`"),
+        ("V", "obs_scale = SC + PLACEBO[STUDY]", "`[scaling] obs_scale`"),
+        ("V", "obs_scale[CMT=1] = V + PLACEBO[STUDY]", "`[scaling] obs_scale[CMT=1]`"),
     ] {
         let msg = parse_full_model(&obs_scale_model(sc, scaling))
             .err()
@@ -37691,10 +34052,7 @@ fn profile_accepts_a_data_branch_a_data_inline_if_and_a_sum_of_reads() {
             .unwrap_or_else(|e| panic!("{ok} / y = {y_ok}: {e}"));
         let msg = route_err(&twin, y_twin, ADD);
         assert_route_frame(&msg);
-        assert!(
-            msg.contains(&here),
-            "{twin} / y = {y_twin}: missing {here:?} in {msg}"
-        );
+        assert!(msg.contains(&here), "{twin} / y = {y_twin}: missing {here:?} in {msg}");
     }
 }
 
@@ -37732,10 +34090,7 @@ fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
         "a desugared THETA/ETA must leave the readout reading no leaf"
     );
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
+        !model.parse_warnings.iter().any(|w| w.contains("finite-difference")),
         "no FD-fallback warning should be emitted, got {:?}",
         model.parse_warnings
     );
@@ -37746,16 +34101,9 @@ fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
     // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
     // path a compartment-free model takes; a second append from the analytical
     // allocator would double them and silently consume two PK slots each.
-    let synths: Vec<&String> = model
-        .indiv_param_names
-        .iter()
-        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
-        .collect();
-    assert_eq!(
-        synths.len(),
-        2,
-        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
-    );
+    let synths: Vec<&String> =
+        model.indiv_param_names.iter().filter(|n| n.starts_with(READOUT_SYNTH_PREFIX)).collect();
+    assert_eq!(synths.len(), 2, "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}");
 }
 
 /// An all-arm name read only by an analytical `[initial_conditions]` is
@@ -37771,11 +34119,7 @@ fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
     let ternary = "  S = if (WT > 70) 50 else 100";
     let init = "[initial_conditions]\n  init(central) = S\n";
     let m = parse_model_string(&unbound_reader_model(all_arm, init)).expect("parses");
-    assert!(
-        m.indiv_param_names.iter().any(|n| n == "S"),
-        "{:?}",
-        m.indiv_param_names
-    );
+    assert!(m.indiv_param_names.iter().any(|n| n == "S"), "{:?}", m.indiv_param_names);
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "S"),
         "S is no longer a required data column: {:?}",
@@ -37783,11 +34127,7 @@ fn all_arm_name_read_only_by_an_analytical_init_is_promoted() {
     );
     assert!(crate::sens::ode_provider::adjoint::model_in_scope(&m));
     let got = unbound_reader_preds(all_arm, init);
-    assert_eq!(
-        got,
-        unbound_reader_preds(ternary, init),
-        "all-arm == ternary"
-    );
+    assert_eq!(got, unbound_reader_preds(ternary, init), "all-arm == ternary");
     assert!((got[0] - got[1]).abs() > 1e-3, "both arms live: {got:?}");
 }
 
@@ -37801,18 +34141,13 @@ fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
     let init = |e: &str| format!("[initial_conditions]\n  init(central) = {e}\n");
     let scale = |e: &str| format!("[scaling]\n  obs_scale = {e}\n");
     for name in ["D1", "R1"] {
-        for (label, block) in [
-            ("init", &init as &dyn Fn(&str) -> String),
-            ("obs_scale", &scale),
-        ] {
+        for (label, block) in [("init", &init as &dyn Fn(&str) -> String), ("obs_scale", &scale)] {
             let via_name = unbound_reader_preds(&format!("  {name} = 2"), &block(name));
             let inline = unbound_reader_preds(&format!("  {name} = 2"), &block("2"));
             assert_eq!(via_name, inline, "{name} read by {label}");
-            let m = parse_model_string(&unbound_reader_model(
-                &format!("  {name} = 2"),
-                &block(name),
-            ))
-            .unwrap();
+            let m =
+                parse_model_string(&unbound_reader_model(&format!("  {name} = 2"), &block(name)))
+                    .unwrap();
             assert!(
                 crate::sens::ode_provider::adjoint::model_in_scope(&m),
                 "{name} read by {label}: the read slot keeps the analytic path"
@@ -37826,30 +34161,17 @@ fn a_modeled_dose_parameter_read_by_init_or_obs_scale_reads_its_value() {
 /// provider keeps serving the model.
 #[test]
 fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
-    for extra in [
-        "[initial_conditions]\n  init(central) = S\n",
-        "[scaling]\n  obs_scale = S\n",
-    ] {
+    for extra in ["[initial_conditions]\n  init(central) = S\n", "[scaling]\n  obs_scale = S\n"] {
         let m = parse_model_string(&unbound_reader_model("  S = 2", extra)).unwrap();
         let i = m.indiv_param_names.iter().position(|n| n == "S").unwrap();
         let slot = m.pk_indices[i];
-        assert_ne!(
-            slot,
-            crate::types::PK_IDX_CL,
-            "{extra}: S must not alias CL"
-        );
-        assert!(
-            slot <= crate::types::PK_IDX_MTT,
-            "{extra}: slot {slot} differentiable"
-        );
+        assert_ne!(slot, crate::types::PK_IDX_CL, "{extra}: S must not alias CL");
+        assert!(slot <= crate::types::PK_IDX_MTT, "{extra}: slot {slot} differentiable");
         assert!(
             !m.pk_model.consumes_pk_slot(slot),
             "{extra}: slot {slot} is read by the closed form"
         );
-        assert!(
-            crate::sens::ode_provider::adjoint::model_in_scope(&m),
-            "{extra}"
-        );
+        assert!(crate::sens::ode_provider::adjoint::model_in_scope(&m), "{extra}");
     }
 }
 
@@ -37860,11 +34182,7 @@ fn an_unbound_parameter_read_by_init_or_obs_scale_gets_its_own_slot() {
 fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
     let e = binop(
         BinOp::Add,
-        binop(
-            BinOp::Div,
-            power_expr(varidx(0), lit(1.7)),
-            binop(BinOp::Sub, varidx(1), lit(0.3)),
-        ),
+        binop(BinOp::Div, power_expr(varidx(0), lit(1.7)), binop(BinOp::Sub, varidx(1), lit(0.3))),
         cond(
             cmp(varidx(1), CmpOp::Gt, lit(-100.0)),
             unary("exp", binop(BinOp::Mul, varidx(0), lit(-0.4))),
@@ -37872,25 +34190,13 @@ fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
         ),
     );
     let bc = compile_bytecode(&e);
-    let lanes = [
-        [1.3, 0.3],
-        [2.0, 5.0],
-        [0.0, -1.0],
-        [7.5, 0.30000000000000004],
-    ];
-    let vars: Vec<[f64; 4]> = (0..2)
-        .map(|v| std::array::from_fn(|l| lanes[l][v]))
-        .collect();
+    let lanes = [[1.3, 0.3], [2.0, 5.0], [0.0, -1.0], [7.5, 0.30000000000000004]];
+    let vars: Vec<[f64; 4]> = (0..2).map(|v| std::array::from_fn(|l| lanes[l][v])).collect();
     let mut stack = Vec::new();
     let got = eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).expect("agree");
     for (l, inputs) in lanes.iter().enumerate() {
         let want = eval_bytecode(&bc, &[], &[], &[], inputs, &[], &mut Vec::new());
-        assert_eq!(
-            got[l].to_bits(),
-            want.to_bits(),
-            "lane {l}: {} vs {want}",
-            got[l]
-        );
+        assert_eq!(got[l].to_bits(), want.to_bits(), "lane {l}: {} vs {want}", got[l]);
     }
     // A branch the lanes take differently: lane 2's `v1` falls below the threshold.
     let split = cond(cmp(varidx(1), CmpOp::Gt, lit(0.0)), varidx(0), varidx(1));
@@ -37939,18 +34245,10 @@ fn lognormal_eta_chain_skips_only_an_unconditionally_replaced_eta_free_definitio
             false,
         ),
         // Exact (∂CL/∂η = CL) but `CL` reads a carrying variable: conservative.
-        (
-            "direct then rescaled",
-            "  CL = TVCL * exp(ETA_CL)\n  CL = CL * 2",
-            false,
-        ),
+        ("direct then rescaled", "  CL = TVCL * exp(ETA_CL)\n  CL = CL * 2", false),
         // Inexact (truth 0): the η-free reassignment is the row's value.
         // Dies under: `unconditionally_replaced` counting the definition itself.
-        (
-            "direct then eta-free",
-            "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL",
-            false,
-        ),
+        ("direct then eta-free", "  CL = TVCL * exp(ETA_CL)\n  CL = TVCL", false),
         // Inexact on the WT ≤ 70 path. Dies under: dropping the scope-prefix
         // test, so a reassignment inside a later `if` counts as a replacement.
         (
@@ -38003,11 +34301,7 @@ fn lognormal_eta_chain_skips_only_an_unconditionally_replaced_eta_free_definitio
     ];
     for (label, indiv, want) in cases {
         let m = eta_scale_model(&format!("{indiv}{V}"), "");
-        assert_eq!(
-            m.indiv_param_partials.lognormal_eta_chain,
-            Some(*want),
-            "{label}"
-        );
+        assert_eq!(m.indiv_param_partials.lognormal_eta_chain, Some(*want), "{label}");
     }
 }
 
@@ -38094,10 +34388,7 @@ mod analytic_hazard_time_1919 {
         );
         let ip = format!("{BASE_IP}  LAM = TVLAMBDA * (1.0 + TVKT * TIME)");
         let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
-        assert!(
-            !err.contains("through"),
-            "direct read has no witness clause: {err}"
-        );
+        assert!(!err.contains("through"), "direct read has no witness clause: {err}");
     }
 
     /// Path correlation (round-2 review): `K` is time-free on the arm where `LAM` reads it,
@@ -38135,10 +34426,7 @@ mod analytic_hazard_time_1919 {
             "  family = exponential\n  scale = TVLAMBDA\n  loghr = BETA * PT",
         ] {
             let err = expect_parse_err(&model(&ip, em, ""));
-            assert!(
-                err.contains("value `PT`, whose value depends"),
-                "{em}: got: {err}"
-            );
+            assert!(err.contains("value `PT`, whose value depends"), "{em}: got: {err}");
         }
     }
 
@@ -38205,10 +34493,7 @@ mod analytic_hazard_time_1919 {
                 "else arm",
                 "  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  } else {\n    LAM = TVLAMBDA * TIME\n  }",
             ),
-            (
-                "fall-through",
-                "  LAM = TVLAMBDA * TIME\n  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  }",
-            ),
+            ("fall-through", "  LAM = TVLAMBDA * TIME\n  if (TVKT > 0) {\n    LAM = TVLAMBDA\n  }"),
         ] {
             let ip = format!("{BASE_IP}{branch}");
             let err = expect_parse_err(&model(&ip, "  family = exponential\n  scale = LAM", ""));
@@ -38236,16 +34521,9 @@ mod analytic_hazard_time_1919 {
     /// block does read `TIME`, on a path the hazard's value never takes.
     #[test]
     fn a_dependency_split_across_identically_conditioned_ifs_is_not_refused() {
-        let src = model(
-            &split_ifs("SW > 0", ""),
-            "  family = exponential\n  scale = LAM",
-            "",
-        );
+        let src = model(&split_ifs("SW > 0", ""), "  family = exponential\n  scale = LAM", "");
         let model = parse_model_string(&src).expect("identical conditions must correlate");
-        assert!(
-            compiled_model_uses_time_builtin(&model),
-            "straddle: the block must read TIME"
-        );
+        assert!(compiled_model_uses_time_builtin(&model), "straddle: the block must read TIME");
     }
 
     /// The correlation is what decides it, not the shape: on either side of the gate the
@@ -38302,10 +34580,7 @@ mod analytic_hazard_time_1919 {
             "",
         );
         let err = expect_parse_err(&src);
-        assert!(
-            err.contains("(through `K`)"),
-            "merge drops facts: got: {err}"
-        );
+        assert!(err.contains("(through `K`)"), "merge drops facts: got: {err}");
     }
 
     /// `TIME` written directly in a hazard parameter expression.
@@ -38316,10 +34591,7 @@ mod analytic_hazard_time_1919 {
             "  family = exponential\n  scale = TVLAMBDA * (1.0 + TVKT * TIME)",
             "",
         ));
-        assert_message(
-            &err,
-            "a hazard parameter expression references the `TIME` built-in",
-        );
+        assert_message(&err, "a hazard parameter expression references the `TIME` built-in");
     }
 
     /// Control, with the straddle asserted: the block reads `TIME` (`CL`), but the hazard
@@ -38384,14 +34656,9 @@ fn the_covariate_mask_flags_only_parameters_reading_the_named_covariates() {
               \x20 H0   = TVH0\n\
               \x20 BETA = TVBETA\n";
     let wt = cov_mask_of(ip, &["WT"]);
-    for (name, want) in [
-        ("CL", true),
-        ("VW", true),
-        ("V", true),
-        ("KA", false),
-        ("H0", false),
-        ("BETA", false),
-    ] {
+    for (name, want) in
+        [("CL", true), ("VW", true), ("V", true), ("KA", false), ("H0", false), ("BETA", false)]
+    {
         assert_eq!(reads_time(&wt, name), want, "{name} under WT: {wt:?}");
     }
     let age = cov_mask_of(ip, &["AGE"]);
@@ -38446,11 +34713,7 @@ fn eta_v_rows(indiv: &str, eta: &str) -> Vec<(String, crate::types::EtaParamType
 fn an_exp_reaches_its_parameter_only_through_products() {
     use crate::types::EtaParamType::{Custom, LogNormal};
     let cases = [
-        (
-            "covariate power beside",
-            "V = TVV * exp(ETA_V) * (WT / 70)^0.75",
-            LogNormal,
-        ),
+        ("covariate power beside", "V = TVV * exp(ETA_V) * (WT / 70)^0.75", LogNormal),
         ("divided", "V = TVV / exp(ETA_V)", LogNormal),
         ("negated inside", "V = TVV * exp(-ETA_V)", LogNormal),
         (
@@ -38495,41 +34758,13 @@ fn an_exp_reaches_its_parameter_only_through_products() {
             "V = if (WT > 70) TVV * exp((exp(ETA_V)^TH_WT - 1) / TH_WT) else TVV * exp(ETA_V)",
             Custom,
         ),
-        (
-            "(b) constant power (was LogNormal)",
-            "V = TVV * exp(ETA_V)^2",
-            Custom,
-        ),
-        (
-            "(b) theta power (was LogNormal)",
-            "V = TVV * exp(ETA_V)^TH_WT",
-            Custom,
-        ),
-        (
-            "(c) shifted (was LogNormal)",
-            "V = TVV * exp(ETA_V) + TVCL",
-            Custom,
-        ),
-        (
-            "(c) one plus exp (was LogNormal)",
-            "V = TVV / (1 + exp(ETA_V))",
-            Custom,
-        ),
-        (
-            "(d) exp of exp (was LogNormal)",
-            "V = TVV * exp(exp(ETA_V))",
-            Custom,
-        ),
-        (
-            "sqrt above (was LogNormal)",
-            "V = sqrt(TVV^2 * exp(ETA_V))",
-            Custom,
-        ),
-        (
-            "log above (was LogNormal)",
-            "V = log(TVV * exp(ETA_V))",
-            Custom,
-        ),
+        ("(b) constant power (was LogNormal)", "V = TVV * exp(ETA_V)^2", Custom),
+        ("(b) theta power (was LogNormal)", "V = TVV * exp(ETA_V)^TH_WT", Custom),
+        ("(c) shifted (was LogNormal)", "V = TVV * exp(ETA_V) + TVCL", Custom),
+        ("(c) one plus exp (was LogNormal)", "V = TVV / (1 + exp(ETA_V))", Custom),
+        ("(d) exp of exp (was LogNormal)", "V = TVV * exp(exp(ETA_V))", Custom),
+        ("sqrt above (was LogNormal)", "V = sqrt(TVV^2 * exp(ETA_V))", Custom),
+        ("log above (was LogNormal)", "V = log(TVV * exp(ETA_V))", Custom),
     ];
     for (label, line, want) in cases {
         assert_eq!(
@@ -38575,53 +34810,25 @@ fn a_product_path_is_followed_through_variables() {
             "ETAT",
             Custom,
         ),
-        (
-            "bare exp times a theta",
-            "  EV = exp(ETA_V)\n  V = TVV * EV",
-            "EV",
-            LogNormal,
-        ),
-        (
-            "product by reassignment",
-            "  V = TVV * exp(ETA_V)\n  V = V * 2",
-            "V",
-            LogNormal,
-        ),
-        (
-            "bare exp read by nothing",
-            "  A2 = exp(ETA_V)\n  V = TVV",
-            "A2",
-            LogNormal,
-        ),
+        ("bare exp times a theta", "  EV = exp(ETA_V)\n  V = TVV * EV", "EV", LogNormal),
+        ("product by reassignment", "  V = TVV * exp(ETA_V)\n  V = V * 2", "V", LogNormal),
+        ("bare exp read by nothing", "  A2 = exp(ETA_V)\n  V = TVV", "A2", LogNormal),
     ];
     for (label, indiv, param, want) in cases {
-        assert_eq!(
-            eta_v_rows(indiv, "ETA_V"),
-            [(param.into(), want)],
-            "{label}"
-        );
+        assert_eq!(eta_v_rows(indiv, "ETA_V"), [(param.into(), want)], "{label}");
     }
     // The docs' λ = 0 claim, measured: the hand-written Box-Cox at λ = 0
     // exactly is `0 / 0`, which `BinOp::Div` returns as 0, so `ETAT` carries
     // no variability (not the limit η). At λ = 0.01 it is ≈ η.
-    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"].iter().map(|s| s.to_string()).collect();
     let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
     let stmts = stmts_of("ETAT = (exp(ETA_V)^TH_WT - 1) / TH_WT\n", &tn, &en);
-    let Statement::Assign(_, etat) = &stmts[0] else {
-        panic!("an assignment")
-    };
+    let Statement::Assign(_, etat) = &stmts[0] else { panic!("an assignment") };
     let none = HashMap::new();
     let at =
         |lambda: f64| eval_expression(etat, &[1.0, 10.0, lambda], &[0.0, 0.3], &none, &none, &[]);
     assert_eq!(at(0.0), 0.0, "λ = 0: no variability");
-    assert!(
-        (at(0.01) - 0.3).abs() < 1e-2,
-        "λ = 0.01: ≈ η, got {}",
-        at(0.01)
-    );
+    assert!((at(0.01) - 0.3).abs() < 1e-2, "λ = 0.01: ≈ η, got {}", at(0.01));
 }
 
 /// T3: a `LogNormal` pattern answer is resolved by use, like the `Additive`
@@ -38639,10 +34846,7 @@ fn a_log_normal_pattern_is_resolved_by_use() {
     let mul = Expression::BinOp(
         Box::new(Expression::Theta(1)),
         BinOp::Mul,
-        Box::new(Expression::UnaryFn(
-            "exp".into(),
-            Box::new(Expression::Eta(1)),
-        )),
+        Box::new(Expression::UnaryFn("exp".into(), Box::new(Expression::Eta(1)))),
     );
     let sum = Expression::UnaryFn(
         "exp".into(),
@@ -38661,18 +34865,8 @@ fn a_log_normal_pattern_is_resolved_by_use() {
     }
     let row = |indiv: &str| {
         let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n{indiv}"), "");
-        let i = m
-            .eta_param_info
-            .iter()
-            .find(|i| i.eta_name == "ETA_V")
-            .unwrap()
-            .clone();
-        (
-            i.individual_param_name,
-            i.param_type,
-            i.linked_theta,
-            m.theta_transform[1],
-        )
+        let i = m.eta_param_info.iter().find(|i| i.eta_name == "ETA_V").unwrap().clone();
+        (i.individual_param_name, i.param_type, i.linked_theta, m.theta_transform[1])
     };
     assert_eq!(
         row("  VI = TVV * exp(ETA_V)\n  V = VI^0.5"),
@@ -38681,12 +34875,7 @@ fn a_log_normal_pattern_is_resolved_by_use() {
     );
     assert_eq!(
         row("  V = TVV * exp(ETA_V)"),
-        (
-            "V".into(),
-            LogNormal,
-            Some("TVV".into()),
-            ThetaTransform::Identity
-        ),
+        ("V".into(), LogNormal, Some("TVV".into()), ThetaTransform::Identity),
         "control: the pattern stands"
     );
     assert_eq!(
@@ -38733,16 +34922,10 @@ fn kappa_in_a_box_cox_sum_is_custom() {
 #[test]
 fn the_memo_is_keyed_by_pending_kind() {
     use crate::types::EtaParamType::{Custom, LogNormal};
-    for x in [
-        "X = if (WT > 70) ETA_CL else exp(ETA_V)",
-        "X = if (WT > 70) exp(ETA_V) else ETA_CL",
-    ] {
+    for x in ["X = if (WT > 70) ETA_CL else exp(ETA_V)", "X = if (WT > 70) exp(ETA_V) else ETA_CL"]
+    {
         let indiv = format!("  {x}\n  CL = TVCL * exp(X)\n  V = TVV");
-        assert_eq!(
-            eta_v_rows(&indiv, "ETA_CL"),
-            [("X".into(), LogNormal)],
-            "{x}"
-        );
+        assert_eq!(eta_v_rows(&indiv, "ETA_CL"), [("X".into(), LogNormal)], "{x}");
         assert_eq!(eta_v_rows(&indiv, "ETA_V"), [("X".into(), Custom)], "{x}");
     }
 }
@@ -38781,19 +34964,9 @@ fn the_product_walk_is_linear_on_a_diamond() {
 /// and dotless i (which it does not), and Unicode `White_Space` beyond ASCII.
 #[test]
 fn keyword_gate_is_the_case_insensitive_prefix_regex() {
-    let kws = [
-        "theta",
-        "omega",
-        "sigma",
-        "kappa",
-        "level",
-        "block_omega",
-        "block_sigma",
-        "block_kappa",
-    ];
-    let leads = [
-        "", " ", "\t", "\n ", "\u{a0}", "\u{2003}", "\u{85}", "\u{200b}", "x ",
-    ];
+    let kws =
+        ["theta", "omega", "sigma", "kappa", "level", "block_omega", "block_sigma", "block_kappa"];
+    let leads = ["", " ", "\t", "\n ", "\u{a0}", "\u{2003}", "\u{85}", "\u{200b}", "x "];
     let mut checked = 0usize;
     for kw in kws {
         let re = regex::Regex::new(&format!(r"(?i)^\s*{kw}")).unwrap();
@@ -38862,11 +35035,7 @@ fn slot_resolved_ctmm_generator_is_the_map_walk() {
     let r1 = rate(stmts.pop().unwrap());
     let transitions = vec![(0, 1, r1), (1, 0, r2), (1, 2, Expression::Literal(0.25))];
     // `EFF` is also a covariate column; the state overlay must win, as the insert did.
-    let states = vec![
-        ("CONC".to_string(), 0),
-        ("EFF".to_string(), 1),
-        ("AUX".to_string(), 7),
-    ];
+    let states = vec![("CONC".to_string(), 0), ("EFF".to_string(), 1), ("AUX".to_string(), 7)];
     let tree = CtmmGeneratorTree::new(&stmts, &transitions, &states, 3);
     let by_map = |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, state: &[f64]| {
         let mut c = cov.clone();
@@ -38891,11 +35060,8 @@ fn slot_resolved_ctmm_generator_is_the_map_walk() {
             if let Some(w) = wt {
                 cov.insert("WT".into(), w);
             }
-            for (theta, eta) in [
-                ([0.3, -1.2], [0.0]),
-                ([1.7, 0.4], [-0.35]),
-                ([0.05, 2.5], [1.1]),
-            ] {
+            for (theta, eta) in [([0.3, -1.2], [0.0]), ([1.7, 0.4], [-0.35]), ([0.05, 2.5], [1.1])]
+            {
                 for state in [vec![0.0, 0.0], vec![3.25, 0.125], vec![1e-9, 47.0]] {
                     let got = tree.generator(&theta, &eta, &cov, &state);
                     let want = by_map(&theta, &eta, &cov, &state);
@@ -38942,9 +35108,7 @@ fn additive_mu_model(indiv: &str, extra: &str) -> CompiledModel {
 
 /// The anchor `mu_refs` records for `ETA_E0`, as `"THETA:Transform"`.
 fn e0_anchor(m: &CompiledModel) -> Option<String> {
-    m.mu_refs
-        .get("ETA_E0")
-        .map(|r| format!("{}:{:?}", r.theta_name, r.transform))
+    m.mu_refs.get("ETA_E0").map(|r| format!("{}:{:?}", r.theta_name, r.transform))
 }
 
 /// T1 (#2544): the one-line additive sum over its input space. Accepted rows
@@ -38965,32 +35129,17 @@ fn a_one_line_additive_sum_is_an_identity_mu_ref() {
             "  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA",
         ),
         ("θ·covariate summand", "  BASE = TVE0 + B * FLARE + ETA_E0"),
-        (
-            "θ through a definition in scope",
-            "  TV = TVE0\n  BASE = TV + PLACEBO + ETA_E0",
-        ),
+        ("θ through a definition in scope", "  TV = TVE0\n  BASE = TV + PLACEBO + ETA_E0"),
     ];
     for (label, indiv) in accepted {
         let m = additive_mu_model(&format!("{indiv}\n  ETAX_USE = ETA_X"), "");
         assert_eq!(e0_anchor(&m).as_deref(), Some("TVE0:Identity"), "{label}");
     }
     let rejected = [
-        (
-            "second BSV η",
-            "  BASE = TVE0 + PLACEBO + ETA_E0 + ETA_X\n  ETAX_USE = 0",
-        ),
-        (
-            "η in a summand",
-            "  BASE = TVE0 + PLACEBO + 0.5 * ETA_X + ETA_E0\n  ETAX_USE = 0",
-        ),
-        (
-            "two bare θ",
-            "  BASE = TVE0 + TH2 + ETA_E0\n  ETAX_USE = ETA_X",
-        ),
-        (
-            "θ twice",
-            "  BASE = TVE0 + 0 * TVE0 + ETA_E0\n  ETAX_USE = ETA_X",
-        ),
+        ("second BSV η", "  BASE = TVE0 + PLACEBO + ETA_E0 + ETA_X\n  ETAX_USE = 0"),
+        ("η in a summand", "  BASE = TVE0 + PLACEBO + 0.5 * ETA_X + ETA_E0\n  ETAX_USE = 0"),
+        ("two bare θ", "  BASE = TVE0 + TH2 + ETA_E0\n  ETAX_USE = ETA_X"),
+        ("θ twice", "  BASE = TVE0 + 0 * TVE0 + ETA_E0\n  ETAX_USE = ETA_X"),
         (
             "θ through a definition",
             "  X = 2 * TVE0\n  BASE = TVE0 + X + ETA_E0\n  ETAX_USE = ETA_X",
@@ -39009,10 +35158,7 @@ fn a_one_line_additive_sum_is_an_identity_mu_ref() {
             "η through a local",
             "  X = 0.5 * ETA_X\n  BASE = TVE0 + PLACEBO + X + ETA_E0\n  ETAX_USE = 0",
         ),
-        (
-            "non-bare θ",
-            "  BASE = 2 * TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X",
-        ),
+        ("non-bare θ", "  BASE = 2 * TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X"),
     ];
     for (label, indiv) in rejected {
         let m = additive_mu_model(indiv, "");
@@ -39029,11 +35175,7 @@ fn a_one_line_additive_sum_is_an_identity_mu_ref() {
 #[test]
 fn an_additive_mu_ref_needs_its_theta_and_eta_exclusive() {
     for (label, base, reassigned) in [
-        (
-            "one-line",
-            "  BASE = TVE0 + PLACEBO + ETA_E0",
-            "  BASE = BASE + 0.5 * ETA_E0",
-        ),
+        ("one-line", "  BASE = TVE0 + PLACEBO + ETA_E0", "  BASE = BASE + 0.5 * ETA_E0"),
         (
             "two-term",
             "  E0 = TVE0 + ETA_E0\n  BASE = E0 + PLACEBO",
@@ -39045,33 +35187,13 @@ fn an_additive_mu_ref_needs_its_theta_and_eta_exclusive() {
         };
         let kept = Some("TVE0:Identity".to_string());
         assert_eq!(case("  ETAX_USE = ETA_X", ""), kept, "{label} (a)");
-        assert_eq!(
-            case("  ETAX_USE = ETA_X", " + 0 * TVE0"),
-            None,
-            "{label} (b)"
-        );
-        assert_eq!(
-            case("  ETAX_USE = ETA_X + 0 * TVE0", ""),
-            None,
-            "{label} (c)"
-        );
-        assert_eq!(
-            case("  DEAD = 2 * TVE0\n  ETAX_USE = ETA_X", ""),
-            kept,
-            "{label} (d)"
-        );
-        assert_eq!(
-            case("  ETAX_USE = ETA_X + 0 * ETA_E0", ""),
-            None,
-            "{label} (e)"
-        );
+        assert_eq!(case("  ETAX_USE = ETA_X", " + 0 * TVE0"), None, "{label} (b)");
+        assert_eq!(case("  ETAX_USE = ETA_X + 0 * TVE0", ""), None, "{label} (c)");
+        assert_eq!(case("  DEAD = 2 * TVE0\n  ETAX_USE = ETA_X", ""), kept, "{label} (d)");
+        assert_eq!(case("  ETAX_USE = ETA_X + 0 * ETA_E0", ""), None, "{label} (e)");
         // (f) a later assignment to the *owner's name* that reads the eta again: a second
         // use like (e), so the gate compares statements, not names (#2553 review r1 §2).
-        assert_eq!(
-            case(&format!("{reassigned}\n  ETAX_USE = ETA_X"), ""),
-            None,
-            "{label} (f)"
-        );
+        assert_eq!(case(&format!("{reassigned}\n  ETAX_USE = ETA_X"), ""), None, "{label} (f)");
     }
 }
 
@@ -39087,10 +35209,7 @@ fn a_later_one_line_additive_mu_ref_clears_the_class_aware_entry() {
          CL = TVCL3 + 0.1 * WT + ETA_CL\n  V = TVV",
     );
     assert_eq!(
-        model
-            .mu_refs
-            .get("ETA_CL")
-            .map(|m| (m.theta_name.clone(), m.transform)),
+        model.mu_refs.get("ETA_CL").map(|m| (m.theta_name.clone(), m.transform)),
         Some(("TVCL3".to_string(), MuTransform::Identity))
     );
     assert_eq!(class_anchors(&model, "ETA_CL"), None);
@@ -39104,10 +35223,7 @@ fn a_later_one_line_additive_mu_ref_clears_the_class_aware_entry() {
          TV = TVCL3\n  CL = TV + 0.1 * WT + ETA_CL\n  V = TVV",
     );
     assert_eq!(
-        via_local
-            .mu_refs
-            .get("ETA_CL")
-            .map(|m| m.theta_name.clone()),
+        via_local.mu_refs.get("ETA_CL").map(|m| m.theta_name.clone()),
         Some("TVCL3".to_string()),
         "via a local"
     );
@@ -39140,9 +35256,7 @@ fn the_additive_exclusivity_gate_leaves_kappa_anchors_alone() {
         "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KX = TVCL + K",
     );
     assert_eq!(
-        m.kappa_mu_refs
-            .get("K")
-            .map(|r| (r.theta_name.clone(), r.transform)),
+        m.kappa_mu_refs.get("K").map(|r| (r.theta_name.clone(), r.transform)),
         Some(("TVCL".to_string(), MuTransform::Identity))
     );
 }
@@ -39163,20 +35277,14 @@ fn the_not_mu_referenced_advice_over_the_additive_input_space() {
         )
     };
     let named = |w: &str, name: &str| {
-        let list = w
-            .split("not mu-referenced: ")
-            .nth(1)
-            .and_then(|r| r.split('.').next())
-            .unwrap_or("");
+        let list =
+            w.split("not mu-referenced: ").nth(1).and_then(|r| r.split('.').next()).unwrap_or("");
         list.split(", ").any(|n| n == name)
     };
     // The fixture's `ETAX_USE = ETA_X` is never mu-referenced, so a warning exists;
     // it must not name BASE.
     let w = warn("  BASE = TVE0 + PLACEBO + ETA_E0\n  ETAX_USE = ETA_X", "").unwrap();
-    assert!(
-        named(&w, "ETAX_USE") && !named(&w, "BASE"),
-        "one-line, exclusive: {w}"
-    );
+    assert!(named(&w, "ETAX_USE") && !named(&w, "BASE"), "one-line, exclusive: {w}");
     let rows = [
         (
             "second BSV eta",
@@ -39199,16 +35307,9 @@ fn the_not_mu_referenced_advice_over_the_additive_input_space() {
     ];
     for (label, indiv, extra, says) in rows {
         let w = warn(indiv, extra).unwrap_or_else(|| panic!("{label}: no warning"));
-        let owner = if label.starts_with("two-term") {
-            "E0"
-        } else {
-            "BASE"
-        };
+        let owner = if label.starts_with("two-term") { "E0" } else { "BASE" };
         assert!(named(&w, owner), "{label}: names {owner}: {w}");
-        assert!(
-            w.contains("prefer forms such as `CL = TVCL * exp(ETA_CL)`"),
-            "{label}: {w}"
-        );
+        assert!(w.contains("prefer forms such as `CL = TVCL * exp(ETA_CL)`"), "{label}: {w}");
         assert!(
             w.contains("An additive ETA is mu-referenced when its line adds one bare THETA"),
             "{label}: {w}"
@@ -39241,36 +35342,19 @@ fn binary_model_link_cells() {
     assert_eq!(link_of("  link = probit\n  probit = TH0"), LinkFn::Probit);
 
     let err = |block: &str| {
-        parse_model_string(&wrap(block))
-            .err()
-            .unwrap_or_else(|| panic!("{block} parsed"))
+        parse_model_string(&wrap(block)).err().unwrap_or_else(|| panic!("{block} parsed"))
     };
     // `link` disagreeing with the key, both ways round: each names the declared link, the key
     // used and the key to write.
     let e = err("  logit = TH0\n  link = probit");
-    assert!(
-        e.contains("`link = probit` but the predictor is written `logit = …`"),
-        "{e}"
-    );
-    assert!(
-        e.contains("under `link = probit` write the predictor as `probit = …`"),
-        "{e}"
-    );
+    assert!(e.contains("`link = probit` but the predictor is written `logit = …`"), "{e}");
+    assert!(e.contains("under `link = probit` write the predictor as `probit = …`"), "{e}");
     let e = err("  probit = TH0\n  link = logit");
-    assert!(
-        e.contains("`link = logit` but the predictor is written `probit = …`"),
-        "{e}"
-    );
-    assert!(
-        e.contains("under `link = logit` write the predictor as `logit = …`"),
-        "{e}"
-    );
+    assert!(e.contains("`link = logit` but the predictor is written `probit = …`"), "{e}");
+    assert!(e.contains("under `link = logit` write the predictor as `logit = …`"), "{e}");
     // Both keys in one block.
     let e = err("  logit = TH0\n  probit = TH0");
-    assert!(
-        e.contains("the predictor is given twice (`logit` and `probit`)"),
-        "{e}"
-    );
+    assert!(e.contains("the predictor is given twice (`logit` and `probit`)"), "{e}");
     assert!(
         e.contains("a block has one linear predictor, written under the key that names its link"),
         "{e}"
@@ -39291,18 +35375,12 @@ fn binary_model_link_cells() {
     // An unknown link lists the two that exist.
     let e = err("  logit = TH0\n  link = cloglog");
     assert!(e.contains("link `cloglog` is not supported"), "{e}");
-    assert!(
-        e.contains("the links are `logit` (the default) and `probit`"),
-        "{e}"
-    );
+    assert!(e.contains("the links are `logit` (the default) and `probit`"), "{e}");
     assert!(!e.contains("planned"), "{e}");
     // No predictor at all names both keys.
     let e = err("  link = probit");
     assert!(e.contains("missing the linear predictor"), "{e}");
-    assert!(
-        e.contains("write `logit = …` (logit link) or `probit = …` (probit link)"),
-        "{e}"
-    );
+    assert!(e.contains("write `logit = …` (logit link) or `probit = …` (probit link)"), "{e}");
     // The unknown-key message lists `probit`.
     let e = err("  logit = TH0\n  bogus = 1");
     assert!(e.contains("valid keys: cmt, logit, probit, link"), "{e}");
@@ -39317,20 +35395,11 @@ fn binary_model_link_cells() {
 #[test]
 fn profile_accepts_an_outermost_pnorm_link_and_refuses_it_elsewhere() {
     let base = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
-    for (indiv, y) in [
-        (base, "pnorm(BASE)"),
-        ("  P = pnorm(TVE0 + PLACEBO[STUDY] + ETA_E0)", "P"),
-    ] {
-        assert!(
-            linked_of(&route_model(indiv, y, ADD), "PLACEBO"),
-            "{indiv} / y = {y}"
-        );
+    for (indiv, y) in [(base, "pnorm(BASE)"), ("  P = pnorm(TVE0 + PLACEBO[STUDY] + ETA_E0)", "P")]
+    {
+        assert!(linked_of(&route_model(indiv, y, ADD), "PLACEBO"), "{indiv} / y = {y}");
     }
-    let msg = route_err(
-        "  BASE = TVE0 + ETA_E0",
-        "pnorm(BASE + exp(PLACEBO[STUDY]))",
-        ADD,
-    );
+    let msg = route_err("  BASE = TVE0 + ETA_E0", "pnorm(BASE + exp(PLACEBO[STUDY]))", ADD);
     assert_route_frame(&msg);
     assert!(
         msg.contains("Here `PLACEBO` reaches `y` through `exp(...)` in the `y` readout."),
@@ -39399,22 +35468,14 @@ fn level_read_sites(decl: &str, read: &str) -> Vec<(&'static str, String)> {
     };
     #[allow(unused_mut)]
     let mut sites = vec![
-        (
-            "[individual_parameters]",
-            gaussian(&format!(" + {read}"), ""),
-        ),
+        ("[individual_parameters]", gaussian(&format!(" + {read}"), "")),
         ("y", gaussian("", &format!(" + {read}"))),
         (
             "residual-error magnitude",
-            gaussian("", "").replace(
-                "DV ~ additive(ADD)",
-                &format!("DV ~ additive(ADD * exp({read}))"),
-            ),
+            gaussian("", "")
+                .replace("DV ~ additive(ADD)", &format!("DV ~ additive(ADD * exp({read}))")),
         ),
-        (
-            "[derived]",
-            gaussian("", "") + &format!("[derived]\n  D = E0 + {read}\n"),
-        ),
+        ("[derived]", gaussian("", "") + &format!("[derived]\n  D = E0 + {read}\n")),
         (
             "[scaling]",
             format!(
@@ -39503,10 +35564,7 @@ fn a_subscripted_read_of_a_data_driven_block_is_refused_at_every_site() {
     {
         let err = expect_parse_err(src);
         for sentence in &want {
-            assert!(
-                err.contains(sentence.as_str()),
-                "{site}: missing {sentence:?} in {err}"
-            );
+            assert!(err.contains(sentence.as_str()), "{site}: missing {sentence:?} in {err}");
         }
         if let Err(e) = parse_full_model(bare_src) {
             panic!("{site}: the bare read must parse: {e}");
@@ -39533,16 +35591,13 @@ fn every_index_shape_is_refused_with_its_own_spelling() {
     for (cols, other) in [("STUDY", "STUDY, TIME"), ("STUDY, TIME", "STUDY]")] {
         for index in ["STUDY", "GRP", "TIME", "STUDY + 0", "2"] {
             let spelling = format!("PLACEBO[{index}]");
-            let src = level_read_sites(cols, &spelling).swap_remove(0).1.replace(
-                "STUDY categorical",
-                "STUDY categorical\n  GRP   categorical",
-            );
+            let src = level_read_sites(cols, &spelling)
+                .swap_remove(0)
+                .1
+                .replace("STUDY categorical", "STUDY categorical\n  GRP   categorical");
             let err = expect_parse_err(&src);
             for sentence in data_driven_subscript_sentences(&spelling, cols) {
-                assert!(
-                    err.contains(&sentence),
-                    "{cols} / {index}: missing {sentence:?} in {err}"
-                );
+                assert!(err.contains(&sentence), "{cols} / {index}: missing {sentence:?} in {err}");
             }
             assert!(
                 !err.contains(&format!("theta PLACEBO[{other}")) && !err.contains("1..=0"),
@@ -39593,10 +35648,7 @@ fn an_ode_scope_remedy_reads_a_data_driven_block_bare() {
         "[odes], data-driven: {data_driven}"
     );
     let counted = expect_parse_err(&odes("3"));
-    assert!(
-        counted.contains("(e.g. `PLACEBO_I = PLACEBO[STUDY]`)"),
-        "[odes], counted: {counted}"
-    );
+    assert!(counted.contains("(e.g. `PLACEBO_I = PLACEBO[STUDY]`)"), "[odes], counted: {counted}");
 
     #[cfg(feature = "survival")]
     for (index_covariate, want) in [
@@ -39780,33 +35832,18 @@ fn every_theta_of_every_mixing_expression_is_used() {
 #[test]
 fn ferx_check_reports_only_the_truly_unused_theta_of_a_mixture() {
     use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
-    f.write_all(THREE_CLASS_MIXING_MODEL.as_bytes())
-        .expect("write temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
+    f.write_all(THREE_CLASS_MIXING_MODEL.as_bytes()).expect("write temp model");
     f.flush().expect("flush temp model");
     let report = crate::api::validate_model_file(f.path().to_str().expect("utf-8 path"), None);
     let mut flagged: Vec<String> = report
         .diagnostics
         .iter()
         .filter(|d| d.code == "W_UNUSED_PARAM")
-        .map(|d| {
-            d.message
-                .split('\'')
-                .nth(1)
-                .unwrap_or(&d.message)
-                .to_string()
-        })
+        .map(|d| d.message.split('\'').nth(1).unwrap_or(&d.message).to_string())
         .collect();
     flagged.sort();
-    assert_eq!(
-        flagged,
-        vec!["UNUSED".to_string()],
-        "{:?}",
-        report.diagnostics
-    );
+    assert_eq!(flagged, vec!["UNUSED".to_string()], "{:?}", report.diagnostics);
 }
 
 /// A gather index that follows θ or η is no level index, so the recording holds it as a value and
@@ -39866,11 +35903,8 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         // `k` chained definitions, each reading the one before and a covariate.
         let defs: Vec<Expression> = (0..k)
             .map(|j| {
-                let prev = if j == 0 {
-                    Expression::Theta(0)
-                } else {
-                    Expression::VariableIdx(j - 1)
-                };
+                let prev =
+                    if j == 0 { Expression::Theta(0) } else { Expression::VariableIdx(j - 1) };
                 bin(prev, BinOp::Add, bin(cov("AGE"), BinOp::Mul, cov("WT")))
             })
             .collect();
@@ -39893,9 +35927,8 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
             );
         }
     }
-    let swapped: HashMap<String, f64> = [("WT", 41.0), ("AGE", 83.5)]
-        .map(|(k, v)| (k.to_string(), v))
-        .into();
+    let swapped: HashMap<String, f64> =
+        [("WT", 41.0), ("AGE", 83.5)].map(|(k, v)| (k.to_string(), v)).into();
     let prog = TypicalProgram::of(root);
     assert_ne!(
         prog.eval(&[0.3], &swapped).to_bits(),
@@ -39995,24 +36028,12 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
 
     // TVCL also read by the right-hand side (through K2, which the ODE reads): it reaches the
     // data around CL.
-    let m = model(
-        "",
-        &format!("{plain}\n  K2 = 0.001 * TVCL"),
-        "-(CL/V) * central - K2 * central",
-    );
+    let m = model("", &format!("{plain}\n  K2 = 0.001 * TVCL"), "-(CL/V) * central - K2 * central");
     assert_eq!(names(&m), ["TVV"], "θ read by the right-hand side");
 
     // ETA_CL also on V: neither line is exclusive, so neither θ folds.
-    let m = model(
-        "",
-        "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V + 0.5 * ETA_CL)",
-        rhs,
-    );
-    assert!(
-        !names(&m).contains(&"TVCL".to_string()),
-        "an η read by two lines: {:?}",
-        names(&m)
-    );
+    let m = model("", "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V + 0.5 * ETA_CL)", rhs);
+    assert!(!names(&m).contains(&"TVCL".to_string()), "an η read by two lines: {:?}", names(&m));
 
     // V's line reads a second η no other line reads: each η has one reader, so only the
     // one-η rule keeps V's line (and TVV) out.
@@ -40041,11 +36062,7 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
         "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  if (TVV > 1) {\n    Q = 1\n  } else {\n    Q = 2\n  }",
         rhs,
     );
-    assert!(
-        names(&m).is_empty(),
-        "a conditional statement: {:?}",
-        names(&m)
-    );
+    assert!(names(&m).is_empty(), "a conditional statement: {:?}", names(&m));
 
     // A covariate exponent shared by both lines folds: both lines are exclusive, so every
     // route TH_WT takes ends at one of them.
@@ -40054,41 +36071,26 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
         "  CL = TVCL * (WT / 70)^TH_WT * exp(ETA_CL)\n  V  = TVV * (WT / 70)^TH_WT * exp(ETA_V)",
         rhs,
     );
-    assert_eq!(
-        names(&m),
-        ["TVCL", "TVV", "TH_WT"],
-        "a shared covariate exponent"
-    );
+    assert_eq!(names(&m), ["TVCL", "TVV", "TH_WT"], "a shared covariate exponent");
     // Per line, the θ that reach it: the pairs whose cross derivative the Hessian forms. TH_WT
     // reaches both lines, each typical value only its own — a pair left out here would drop a
     // nonzero `∂²μ/∂θ_i∂θ_j`, one put in costs a program run.
     let f = &m.indiv_param_partials.mu_fold;
-    let reach: Vec<Vec<&str>> = f
-        .reach
-        .iter()
-        .map(|r| r.iter().map(|&i| m.theta_names[i].as_str()).collect())
-        .collect();
+    let reach: Vec<Vec<&str>> =
+        f.reach.iter().map(|r| r.iter().map(|&i| m.theta_names[i].as_str()).collect()).collect();
     assert_eq!(reach, [vec!["TVCL", "TH_WT"], vec!["TVV", "TH_WT"]]);
 
     // A dose attribute the engine reads by name (#993), with no reader in any other block: a
     // mu-referenced lag folds its θ; the same θ also read by `F1` does not (code review r2).
     let lag = "  theta TVLAG(0.5, 0.01, 5.0)\n  omega ETA_LAG ~ 0.1";
-    let m = model(
-        lag,
-        &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)"),
-        rhs,
-    );
+    let m = model(lag, &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)"), rhs);
     assert_eq!(names(&m), ["TVCL", "TVV", "TVLAG"], "a mu-referenced lag");
     let m = model(
         lag,
         &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)\n  F1 = 1 - 0.01 * TVLAG"),
         rhs,
     );
-    assert_eq!(
-        names(&m),
-        ["TVCL", "TVV"],
-        "θ also read by a dose attribute"
-    );
+    assert_eq!(names(&m), ["TVCL", "TVV"], "θ also read by a dose attribute");
 
     // An additive line (identity link).
     let m = model("", "  CL = TVCL * exp(ETA_CL)\n  V  = TVV + ETA_V", rhs);
@@ -40117,19 +36119,12 @@ fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_c
         thetas: Vec<String>,
         mu_refs: Vec<(String, String)>,
         groups: Vec<(String, Vec<String>, Vec<String>, Vec<String>)>,
-        fold: (
-            Vec<(usize, usize, crate::types::MuTransform)>,
-            Vec<usize>,
-            Vec<Vec<usize>>,
-        ),
+        fold: (Vec<(usize, usize, crate::types::MuTransform)>, Vec<usize>, Vec<Vec<usize>>),
     }
     let seen = |t: &str| {
         let m = parse_full_model(t).expect("model must parse").model;
-        let mut mu_refs: Vec<(String, String)> = m
-            .mu_refs
-            .iter()
-            .map(|(e, r)| (e.clone(), r.theta_name.clone()))
-            .collect();
+        let mut mu_refs: Vec<(String, String)> =
+            m.mu_refs.iter().map(|(e, r)| (e.clone(), r.theta_name.clone())).collect();
         mu_refs.sort();
         let groups = m
             .covariate_mu_refs
@@ -40153,11 +36148,7 @@ fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_c
     };
 
     let (h, b) = (seen(&hand("")), seen(&block("")));
-    assert_eq!(
-        h.groups.len(),
-        2,
-        "both lines are covariate mu-ref groups: {h:?}"
-    );
+    assert_eq!(h.groups.len(), 2, "both lines are covariate mu-ref groups: {h:?}");
     assert!(
         h.groups.iter().all(|g| g.3.is_empty()),
         "the hand form's relation θ are read by nothing outside the groups: {h:?}"
@@ -40168,20 +36159,9 @@ fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_c
     // The straddle: a real outside reader of THETA_CL_WT.
     let reader = "[initial_conditions]\n  init(central) = THETA_CL_WT * 0.001\n";
     let (h, b) = (seen(&hand(reader)), seen(&block(reader)));
-    let cl = b
-        .groups
-        .iter()
-        .find(|g| g.0 == "ETA_CL")
-        .expect("the CL group is recorded");
-    assert_eq!(
-        cl.3,
-        vec!["THETA_CL_WT"],
-        "an [initial_conditions] read is outside every group"
-    );
-    assert!(
-        !b.fold.1.contains(&2),
-        "a θ read outside is not folded: {b:?}"
-    );
+    let cl = b.groups.iter().find(|g| g.0 == "ETA_CL").expect("the CL group is recorded");
+    assert_eq!(cl.3, vec!["THETA_CL_WT"], "an [initial_conditions] read is outside every group");
+    assert!(!b.fold.1.contains(&2), "a θ read outside is not folded: {b:?}");
     assert_eq!(h, b, "both spellings see the outside read alike");
 }
 
@@ -40233,24 +36213,13 @@ fn every_block_is_sorted_into_outside_reader_or_not() {
     let yes: BTreeSet<&str> = OUTSIDE_READER_BLOCKS.iter().copied().collect();
     let no: BTreeSet<&str> = NON_OUTSIDE_READER_BLOCKS.iter().copied().collect();
     assert_eq!(yes.len(), OUTSIDE_READER_BLOCKS.len(), "duplicate reader");
-    assert_eq!(
-        no.len(),
-        NON_OUTSIDE_READER_BLOCKS.len(),
-        "duplicate non-reader"
-    );
-    assert!(
-        yes.is_disjoint(&no),
-        "{:?}",
-        yes.intersection(&no).collect::<Vec<_>>()
-    );
+    assert_eq!(no.len(), NON_OUTSIDE_READER_BLOCKS.len(), "duplicate non-reader");
+    assert!(yes.is_disjoint(&no), "{:?}", yes.intersection(&no).collect::<Vec<_>>());
     let sorted: BTreeSet<&str> = yes.union(&no).copied().collect();
     assert_eq!(sorted, registry);
     // Every parameter consumer turns a parameter into a prediction, so it reads too.
     for b in PARAM_CONSUMER_BLOCKS {
-        assert!(
-            yes.contains(b),
-            "[{b}] consumes a parameter but is no reader"
-        );
+        assert!(yes.contains(b), "[{b}] consumes a parameter but is no reader");
     }
 }
 
@@ -40267,10 +36236,7 @@ fn the_outside_scan_reads_reader_blocks_of_either_spelling_and_nothing_else() {
     for (ty, body) in [
         ("odes", lines(&["d/dt(central) = -IN_ODES * central"])),
         ("event_model", lines(&["scale = IN_UNNAMED"])),
-        (
-            "covariate_model",
-            lines(&["CL ~ WT power(center = 70) => COV_THETA(0.6)"]),
-        ),
+        ("covariate_model", lines(&["CL ~ WT power(center = 70) => COV_THETA(0.6)"])),
         ("output", lines(&["REPORTED"])),
         ("derived", lines(&["COLUMN = DERIVED_IN * 2"])),
         (
@@ -40287,49 +36253,20 @@ fn the_outside_scan_reads_reader_blocks_of_either_spelling_and_nothing_else() {
         extracted.unnamed.insert(ty.to_string(), body);
     }
     for (ty, inst, body) in [
-        (
-            "event_model",
-            "death",
-            lines(&["scale = IN_NAMED * exp(ETA_HAZ)"]),
-        ),
+        ("event_model", "death", lines(&["scale = IN_NAMED * exp(ETA_HAZ)"])),
         ("markov_model", "sleep", lines(&["rate = IN_MARKOV"])),
-        (
-            "covariate_nn",
-            "TYPICAL_PK",
-            lines(&["inputs = [NN_IN]", "outputs = [NN_OUT]"]),
-        ),
+        ("covariate_nn", "TYPICAL_PK", lines(&["inputs = [NN_IN]", "outputs = [NN_OUT]"])),
     ] {
-        extracted
-            .named
-            .entry(ty.to_string())
-            .or_default()
-            .insert(inst.to_string(), body);
+        extracted.named.entry(ty.to_string()).or_default().insert(inst.to_string(), body);
     }
     let seen = identifiers_of_blocks(&extracted, OUTSIDE_READER_BLOCKS);
-    for read in [
-        "IN_ODES",
-        "IN_UNNAMED",
-        "IN_NAMED",
-        "ETA_HAZ",
-        "IN_MARKOV",
-        "MIX_THETA",
-    ] {
+    for read in ["IN_ODES", "IN_UNNAMED", "IN_NAMED", "ETA_HAZ", "IN_MARKOV", "MIX_THETA"] {
         assert!(seen.contains(read), "{read} is read: {seen:?}");
     }
-    for declared in [
-        "NN_IN",
-        "NN_OUT",
-        "COV_THETA",
-        "REPORTED",
-        "DERIVED_IN",
-        "SIM_COV",
-        "MIX_ETA",
-        "MIX_EPS",
-    ] {
-        assert!(
-            !seen.contains(declared),
-            "{declared} is only declared or reported: {seen:?}"
-        );
+    for declared in
+        ["NN_IN", "NN_OUT", "COV_THETA", "REPORTED", "DERIVED_IN", "SIM_COV", "MIX_ETA", "MIX_EPS"]
+    {
+        assert!(!seen.contains(declared), "{declared} is only declared or reported: {seen:?}");
     }
 }
 
@@ -40356,10 +36293,7 @@ fn a_reported_typical_value_is_no_outside_read() {
             .clone()
     };
     assert!(shared("").is_empty(), "control: the group is exclusive");
-    assert!(
-        shared("[output]\n  TVCL CL\n").is_empty(),
-        "a reported typical value is no read"
-    );
+    assert!(shared("[output]\n  TVCL CL\n").is_empty(), "a reported typical value is no read");
     assert!(
         shared("[derived]\n  TV_REPORT = TVCL * 1\n").is_empty(),
         "a [derived] column of it is no read either"
@@ -40369,6 +36303,52 @@ fn a_reported_typical_value_is_no_outside_read() {
         ["THETA_CL", "THETA_WT"],
         "an initial amount computed from it is"
     );
+}
+
+/// #3004: the endpoint program builders are total. Each leaf with no slot binds to what the
+/// `f64` closure reads (`MACHEPS` is epsilon, an unassigned `Variable` is `0.0`, a covariate
+/// the caller left out of the list is read from the map), and a zero `(θ, η)` width is a
+/// constant program, not a missing one. One test per binding, so a mutation of one arm of
+/// `compile_endpoint_exprs` names itself.
+#[cfg(feature = "survival")]
+fn leaf_program(e: Expression, stmts: &[Statement]) -> EndpointExprProgram {
+    build_endpoint_expr_program(&[&e], stmts, &[], 0, 0)
+}
+
+#[cfg(feature = "survival")]
+fn leaf_value(p: &EndpointExprProgram, cov: &[(&str, f64)]) -> f64 {
+    let cov: HashMap<String, f64> = cov.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    p.eval_g::<f64>(&[], &[], &cov).expect("zero width")[0]
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn endpoint_program_binds_macheps_to_epsilon() {
+    let p = leaf_program(Expression::Variable("macheps".into()), &[]);
+    assert_eq!(leaf_value(&p, &[]).to_bits(), f64::EPSILON.to_bits());
+    // Even when a statement assigns the name, the closure reads epsilon.
+    let assigned = [Statement::Assign("MACHEPS".into(), Expression::Literal(7.0))];
+    let p = leaf_program(Expression::Variable("MACHEPS".into()), &assigned);
+    assert_eq!(leaf_value(&p, &[]).to_bits(), f64::EPSILON.to_bits());
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn endpoint_program_binds_an_unassigned_variable_to_zero() {
+    let sum = Expression::BinOp(
+        Box::new(Expression::Variable("Z".into())),
+        BinOp::Add,
+        Box::new(Expression::Literal(1.0)),
+    );
+    assert_eq!(leaf_value(&leaf_program(sum, &[]), &[]), 1.0);
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn endpoint_program_reads_a_covariate_missing_from_its_list_by_name() {
+    let p = leaf_program(Expression::Covariate("X".into()), &[]);
+    assert_eq!(leaf_value(&p, &[("X", 5.0)]), 5.0);
+    assert_eq!(leaf_value(&p, &[]), 0.0);
 }
 
 /// The η side of the exclusivity check reads the other blocks too (#3014 review): an
@@ -40395,11 +36375,7 @@ fn an_eta_read_by_another_block_is_a_second_use() {
             .eta_shared;
         (cl, m.mu_refs.contains_key("ETA_V"))
     };
-    assert_eq!(
-        seen(""),
-        (false, true),
-        "control: both η are exclusive to their line"
-    );
+    assert_eq!(seen(""), (false, true), "control: both η are exclusive to their line");
     assert_eq!(
         seen("[derived]\n  SHRINK_CL = ETA_CL * 2\n  SHRINK_V = ETA_V * 2\n"),
         (false, true),
@@ -40459,4 +36435,13 @@ fn an_eta_read_by_a_named_hazard_is_a_second_use_like_its_unnamed_spelling() {
             "{header}: no θ of the group is read outside it: {cl:?}"
         );
     }
+}
+
+#[test]
+fn mstep_optimizer_accepts_newton_and_names_it_in_the_error() {
+    let mut opts = FitOptions::default();
+    apply_fit_option(&mut opts, "mstep_optimizer", "newton").unwrap();
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Newton);
+    let err = apply_fit_option(&mut opts, "mstep_optimizer", "adam").unwrap_err();
+    assert!(err.contains("bobyqa/lbfgs/newton"), "{err}");
 }

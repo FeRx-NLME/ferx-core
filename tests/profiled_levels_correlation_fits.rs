@@ -54,14 +54,8 @@ fn f1_text(kind: &str, lo: &str) -> String {
             && text.contains("weight = SE\n"),
         "fixture moved"
     );
-    text.replace(
-        "  omega ETA_E0",
-        &format!("  theta RHO(0.3, {lo}, 0.95)\n  omega ETA_E0"),
-    )
-    .replace(
-        "weight = SE\n",
-        &format!("weight = SE\n  correlation {kind}(RHO) by OCC\n"),
-    )
+    text.replace("  omega ETA_E0", &format!("  theta RHO(0.3, {lo}, 0.95)\n  omega ETA_E0"))
+        .replace("weight = SE\n", &format!("weight = SE\n  correlation {kind}(RHO) by OCC\n"))
 }
 
 /// `nested_levels_3` (sponsor > study > arm; the study and arm kappas inside an `exp`, so
@@ -77,44 +71,29 @@ fn f1_text(kind: &str, lo: &str) -> String {
 /// where nothing is estimated.
 fn nested_text() -> String {
     let text = std::fs::read_to_string(root().join(NESTED)).unwrap();
-    assert!(
-        text.contains("  omega ETA_SP") && text.contains("  y = TVE0 + "),
-        "fixture moved"
-    );
+    assert!(text.contains("  omega ETA_SP") && text.contains("  y = TVE0 + "), "fixture moved");
     text.replace(
         "  omega ETA_SP",
         "  theta PLACEBO[STUDYID](0.0) profile\n  theta RHO(0.3, -0.95, 0.95)\n  omega ETA_SP",
     )
     .replace("  y = TVE0 + ", "  y = TVE0 + PLACEBO + ")
-    .replace(
-        "DV ~ additive(ADD)",
-        "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM",
-    )
+    .replace("DV ~ additive(ADD)", "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM")
 }
 
 /// `text` (a profiled model) on `data`, profiled or not.
 fn prep(text: &str, data: &str, profiled: bool) -> ferx_core::PreparedRun {
-    let text = if profiled {
-        text.to_string()
-    } else {
-        text.replace(PROFILED, UNPROFILED)
-    };
+    let text = if profiled { text.to_string() } else { text.replace(PROFILED, UNPROFILED) };
     let path = unique_temp("ferx_profiled_corr_fits");
     std::fs::write(&path, text).unwrap();
-    let p = ferx_core::prepare_run(
-        path.to_str().unwrap(),
-        Some(root().join(data).to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
+    let p =
+        ferx_core::prepare_run(path.to_str().unwrap(), Some(root().join(data).to_str().unwrap()))
+            .unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_file(&path);
     p
 }
 
 fn fit(
-    p: &ferx_core::PreparedRun,
-    params: &ModelParameters,
-    cov: bool,
-    evaluate: bool,
+    p: &ferx_core::PreparedRun, params: &ModelParameters, cov: bool, evaluate: bool,
 ) -> (FitResult, f64) {
     // `r` on both sides, named: past 100 packed coordinates the unprofiled step would
     // otherwise route itself to `s`, which the nested fixture's block takes it past.
@@ -160,11 +139,10 @@ fn start_at(template: &ModelParameters, f: &FitResult) -> ModelParameters {
 /// The worst relative gap over `idx` between two vectors, every term checked finite
 /// before the fold (`f64::max` drops a NaN).
 fn worst_rel(a: &[f64], b: &[f64], idx: impl Iterator<Item = usize>) -> f64 {
-    idx.map(|k| ((a[k] - b[k]) / b[k]).abs())
-        .fold(0.0_f64, |acc, v| {
-            assert!(v.is_finite(), "{a:?} vs {b:?}");
-            acc.max(v)
-        })
+    idx.map(|k| ((a[k] - b[k]) / b[k]).abs()).fold(0.0_f64, |acc, v| {
+        assert!(v.is_finite(), "{a:?} vs {b:?}");
+        acc.max(v)
+    })
 }
 
 /// Returns the profiled fit, for a case that asserts on where it landed. `d_se` bounds
@@ -189,17 +167,13 @@ fn d1_corr(kind: &str, text: &str, data: &str, d_se: f64) -> FitResult {
     }
     let diag = |m: &nalgebra::DMatrix<f64>| (0..m.nrows()).map(|i| m[(i, i)]).collect::<Vec<_>>();
     let start_iov = t.omega_iov.as_ref();
-    let names = t
-        .omega
-        .eta_names
-        .iter()
-        .chain(start_iov.map(|o| o.eta_names.iter()).into_iter().flatten());
+    let names =
+        t.omega.eta_names.iter().chain(start_iov.map(|o| o.eta_names.iter()).into_iter().flatten());
     let at_start = diag(&t.omega.matrix)
         .into_iter()
         .chain(start_iov.map(|o| diag(&o.matrix)).unwrap_or_default());
-    let fitted = diag(&prof.omega)
-        .into_iter()
-        .chain(prof.omega_iov.as_ref().map(diag).unwrap_or_default());
+    let fitted =
+        diag(&prof.omega).into_iter().chain(prof.omega_iov.as_ref().map(diag).unwrap_or_default());
     for ((name, v0), v) in names.zip(at_start).zip(fitted) {
         assert!(
             v.is_finite() && v > 1e-3 * v0,
@@ -209,10 +183,7 @@ fn d1_corr(kind: &str, text: &str, data: &str, d_se: f64) -> FitResult {
     let plain_prep = prep(text, data, false);
     let start = start_at(&plain_prep.init_params, &prof);
     let rho = prof.theta.len() - 1;
-    assert_eq!(
-        plain_prep.parsed.model.theta_names[rho], "RHO",
-        "RHO is the last θ"
-    );
+    assert_eq!(plain_prep.parsed.model.theta_names[rho], "RHO", "RHO is the last θ");
     // The unprofiled objective at the profiled estimate, with its covariance step:
     // attributes a failure to a side, and is the point the SEs are compared at.
     let (at_prof, _) = fit(&plain_prep, &start, true, true);
@@ -258,10 +229,7 @@ fn d1_corr(kind: &str, text: &str, data: &str, d_se: f64) -> FitResult {
          moved the OFV by {improvement:.3e} (to {})",
         plain.ofv
     );
-    assert!(
-        worst_theta < D_THETA,
-        "{kind}: structural θ {worst_theta:.3e}"
-    );
+    assert!(worst_theta < D_THETA, "{kind}: structural θ {worst_theta:.3e}");
     assert!(rho_gap < D_RHO, "{kind}: ρ {rho_gap:.3e}");
 
     let (sp, su) = (
@@ -294,9 +262,8 @@ fn d1_corr(kind: &str, text: &str, data: &str, d_se: f64) -> FitResult {
     };
     let (vp, vu) = (var_se(&prof), var_se(&at_prof));
     assert_eq!(vp.len(), vu.len(), "{kind}");
-    let estimated: Vec<usize> = (0..vu.len())
-        .filter(|&k| vu[k].is_finite() && vu[k] > 0.0)
-        .collect();
+    let estimated: Vec<usize> =
+        (0..vu.len()).filter(|&k| vu[k].is_finite() && vu[k] > 0.0).collect();
     assert!(!estimated.is_empty(), "{kind}: no variance SE to compare");
     let worst_var_se = worst_rel(&vp, &vu, estimated.into_iter());
     eprintln!("D1-corr {kind}: SE (θ, ρ) {worst_se:.3e}, SE (ω, κ) {worst_var_se:.3e}");

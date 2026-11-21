@@ -33,10 +33,7 @@ fn data_dir() -> PathBuf {
 /// a copy of the data in a fresh temporary directory.
 fn spelled(indiv: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     let text = std::fs::read_to_string(data_dir().join("mbma_placebo.ferx")).unwrap();
-    assert!(
-        text.contains(ONE_LINE),
-        "the shipped model is the one-line spelling"
-    );
+    assert!(text.contains(ONE_LINE), "the shipped model is the one-line spelling");
     let dir = tempfile::tempdir().unwrap();
     let model = dir.path().join("m.ferx");
     let data = dir.path().join("d.csv");
@@ -46,9 +43,7 @@ fn spelled(indiv: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 fn fit(
-    model: &Path,
-    data: &Path,
-    tweak: impl Fn(&mut ferx_core::types::FitOptions),
+    model: &Path, data: &Path, tweak: impl Fn(&mut ferx_core::types::FitOptions),
 ) -> ferx_core::types::FitResult {
     let prep = ferx_core::prepare_run(model.to_str().unwrap(), Some(data.to_str().unwrap()))
         .expect("prepare");
@@ -58,13 +53,7 @@ fn fit(
         ..prep.parsed.fit_options.clone()
     };
     tweak(&mut opts);
-    ferx_core::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("fit")
+    ferx_core::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("fit")
 }
 
 fn both(
@@ -75,11 +64,7 @@ fn both(
         let prep = ferx_core::prepare_run(model.to_str().unwrap(), Some(data.to_str().unwrap()))
             .expect("prepare");
         assert_eq!(
-            prep.parsed
-                .model
-                .mu_refs
-                .get("ETA_E0")
-                .map(|r| r.theta_name.as_str()),
+            prep.parsed.model.mu_refs.get("ETA_E0").map(|r| r.theta_name.as_str()),
             Some("TVE0"),
             "{indiv}: ETA_E0 → TVE0"
         );
@@ -90,15 +75,14 @@ fn both(
 #[test]
 fn focei_on_the_two_spellings_agrees() {
     let [one, split] = both(|o| o.method = ferx_core::types::EstimationMethod::FoceI);
-    let theta_gap = one
-        .theta
-        .iter()
-        .zip(&split.theta)
-        .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-        .fold(0.0f64, |m, g| {
-            assert!(g.is_finite(), "theta gap {g}");
-            m.max(g)
-        });
+    let theta_gap =
+        one.theta.iter().zip(&split.theta).map(|(a, b)| (a - b).abs() / b.abs().max(1.0)).fold(
+            0.0f64,
+            |m, g| {
+                assert!(g.is_finite(), "theta gap {g}");
+                m.max(g)
+            },
+        );
     let ofv_gap = (one.ofv - split.ofv).abs();
     assert!(ofv_gap.is_finite());
     eprintln!(
@@ -116,10 +100,7 @@ const OFV_BOUND: f64 = 1e-10;
 const THETA_BOUND: f64 = 1e-6;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_on_the_one_line_spelling_lands_with_the_split_one() {
     let seeds = [12345u64, 2, 3, 7, 11];
     let ofvs = |indiv: &str| -> Vec<f64> {
@@ -156,12 +137,19 @@ fn saem_on_the_one_line_spelling_lands_with_the_split_one() {
          split {split:?}",
         median(&one)
     );
-    for (s, o) in seeds.iter().zip(&one) {
-        assert!(*o < WORST_BOUND, "one-line seed {s}: {o}");
-    }
+    assert!(
+        median(&one) < MEDIAN_BOUND,
+        "one-line median {} not below {MEDIAN_BOUND}: one-line {one:?}",
+        median(&one)
+    );
 }
 
-// Linux aarch64: one-line 97.28–97.85, split 97.34–98.05; macOS arm64: one-line
-// 97.21–98.88, split 97.33–98.39. 99.5 is 1.65 above the Linux worst and 0.6 above the
-// macOS one; before #2544 all five seeds were above it (100.97–107.92, macOS).
-const WORST_BOUND: f64 = 99.5;
+// Before #3021 the per-subject SAEM streams were `seed + i`: Linux aarch64 gave one-line
+// 97.28–97.85, split 97.34–98.05; macOS arm64 one-line 97.21–98.88, split 97.33–98.39, and
+// the bound was 99.5 on every seed. Hashing the streams (#3021) moved the five runs on
+// Linux x86_64 to one-line 97.41–101.22 (median 98.74), split 97.30–100.53 (median
+// 98.76): a run at 100–101 appears under *both* spellings, so the old all-seeds bound was
+// a property of that stream set, not of the spelling. The median of the five is the
+// robust form: 99.5 is 0.76 above the one-line median, and before #2544 all five seeds
+// were above 100.97 (macOS, so the median was too).
+const MEDIAN_BOUND: f64 = 99.5;

@@ -31,15 +31,8 @@ const TVV: f64 = 50.670449;
 const W_CL: f64 = 0.068897;
 const W_VS: f64 = 116.938296;
 const C_CL_VS: f64 = -0.147595;
-const NAMES: [&str; 7] = [
-    "TVCL",
-    "TH_WEAK",
-    "TVV_S/k",
-    "omega_CL",
-    "omega_CL,VS/k",
-    "omega_VS/k^2",
-    "PROP_ERR",
-];
+const NAMES: [&str; 7] =
+    ["TVCL", "TH_WEAK", "TVV_S/k", "omega_CL", "omega_CL,VS/k", "omega_VS/k^2", "PROP_ERR"];
 
 fn model_src(k: f64) -> String {
     let tvv_s = TVV * k;

@@ -30,10 +30,7 @@ fn fit_demotes_converged_when_sigma_sits_on_the_internal_ceiling() {
     // demotion below is attributable to the guard and not to the eval-only path.
     let interior = fit(&model, &population, &model.default_params, &opts)
         .expect("eval-only IMP must succeed at the inits");
-    assert!(
-        interior.converged,
-        "control: an interior evaluation must not be demoted"
-    );
+    assert!(interior.converged, "control: an interior evaluation must not be demoted");
 
     // exp(5) is the literal packed upper guard on a log-packed sigma.
     let mut params = model.default_params.clone();
@@ -51,10 +48,7 @@ fn fit_demotes_converged_when_sigma_sits_on_the_internal_ceiling() {
         .find(|w| w.category == WarningCode::ParameterAtRunawayGuard)
         .expect("the guard hit must be reported");
     assert_eq!(entry.severity, WarningSeverity::Critical);
-    assert_eq!(
-        entry.details.as_ref().unwrap()["parameters"][0]["side"],
-        "upper"
-    );
+    assert_eq!(entry.details.as_ref().unwrap()["parameters"][0]["side"], "upper");
 }
 
 /// #1328: the coordinate that ran away on the busulfan DCM subset was an Ω
@@ -103,10 +97,7 @@ fn fit_demotes_converged_when_a_block_omega_off_diagonal_sits_on_either_rail() {
     // is attributable to the rail and not to the block or to the eval-only path.
     let interior = fit(&model, &population, &model.default_params, &opts)
         .expect("eval-only IMP must succeed at the inits");
-    assert!(
-        interior.converged,
-        "control: an interior block Ω must not be demoted"
-    );
+    assert!(interior.converged, "control: an interior block Ω must not be demoted");
     assert!(
         !interior
             .warnings_structured
@@ -140,10 +131,7 @@ fn fit_demotes_converged_when_a_block_omega_off_diagonal_sits_on_either_rail() {
             pinned.ofv
         );
         assert!(
-            !pinned
-                .warnings
-                .iter()
-                .any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
+            !pinned.warnings.iter().any(|w| w.contains("W_NONFINITE_OBJECTIVE")),
             "rail {rail}: #1303's gate must not be the one firing: {:#?}",
             pinned.warnings
         );
@@ -162,11 +150,7 @@ fn fit_demotes_converged_when_a_block_omega_off_diagonal_sits_on_either_rail() {
         let hit = &entry.details.as_ref().unwrap()["parameters"][0];
         assert_eq!(hit["parameter"], "ETA_V~ETA_CL", "rail {rail}");
         assert_eq!(hit["verdict"], "runaway", "rail {rail}: either rail is one");
-        assert_eq!(
-            hit["side"],
-            if rail > 0.0 { "upper" } else { "lower" },
-            "rail {rail}"
-        );
+        assert_eq!(hit["side"], if rail > 0.0 { "upper" } else { "lower" }, "rail {rail}");
         // The coordinate the fit-end walk reports is the literal rail, bit for
         // bit — it re-reads the cached Cholesky factor rather than
         // re-factorising the covariance matrix a few ULPs off it. (What it does

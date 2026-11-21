@@ -133,10 +133,7 @@ fn levels(pop: &Population) -> Vec<f64> {
 /// the parameters as given. Tier-2 by construction — there is no outer loop to
 /// converge.
 fn eval_only_opts() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    }
+    FitOptions { outer_maxiter: 0, ..FitOptions::default() }
 }
 
 #[test]
@@ -164,10 +161,7 @@ fn categorical2_is_categorical_at_the_matching_theta() {
     // Both arms spend exactly one θ: this is a reparameterization, not a
     // cheaper test.
     assert_eq!(cat.model.theta_names, cat2.model.theta_names);
-    assert_eq!(
-        cat.model.theta_names.len(),
-        plain.model.theta_names.len() + 1
-    );
+    assert_eq!(cat.model.theta_names.len(), plain.model.theta_names.len() + 1);
 
     let pred_cat = predict(&cat.model, &pop, &cat.model.default_params).unwrap();
     let pred_cat2 = predict(&cat2.model, &pop, &cat2.model.default_params).unwrap();
@@ -176,10 +170,7 @@ fn categorical2_is_categorical_at_the_matching_theta() {
     // Non-degeneracy 2: the covariate is live — a factor of 1 would make the
     // identity below hold against a model that ignores SEX entirely.
     assert!(
-        pred_cat
-            .iter()
-            .zip(&pred_plain)
-            .any(|(a, b)| a.pred != b.pred),
+        pred_cat.iter().zip(&pred_plain).any(|(a, b)| a.pred != b.pred),
         "SEX must change the prediction, or this test compares two null models"
     );
 
@@ -189,11 +180,7 @@ fn categorical2_is_categorical_at_the_matching_theta() {
     for (a, b) in pred_cat.iter().zip(&pred_cat2) {
         assert_eq!(a.id, b.id);
         assert_eq!(a.time, b.time);
-        assert_eq!(
-            a.pred, b.pred,
-            "PRED differs for subject {} at t = {}",
-            a.id, a.time
-        );
+        assert_eq!(a.pred, b.pred, "PRED differs for subject {} at t = {}", a.id, a.time);
     }
 }
 
@@ -209,12 +196,10 @@ fn categorical2_is_the_same_objective_function_at_the_matching_theta() {
         fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("evaluation")
     };
 
-    let f_cat = eval_block(&format!(
-        "  CL ~ SEX categorical(ref = 0) => T_SEX({THETA_CAT}, -1.0, 5.0)"
-    ));
-    let f_cat2 = eval_block(&format!(
-        "  CL ~ SEX categorical2(ref = 0) => T_SEX({THETA_CAT2}, 0.0, 6.0)"
-    ));
+    let f_cat =
+        eval_block(&format!("  CL ~ SEX categorical(ref = 0) => T_SEX({THETA_CAT}, -1.0, 5.0)"));
+    let f_cat2 =
+        eval_block(&format!("  CL ~ SEX categorical2(ref = 0) => T_SEX({THETA_CAT2}, 0.0, 6.0)"));
     let f_plain = eval_block("  CL ~ SEX none");
 
     // The objective actually ran: a sentinel or a diverged solve would satisfy
@@ -231,10 +216,7 @@ fn categorical2_is_the_same_objective_function_at_the_matching_theta() {
         f_cat.ofv, f_plain.ofv,
         "the covariate must move the objective, or the identity is vacuous"
     );
-    assert_eq!(
-        f_cat.ofv, f_cat2.ofv,
-        "cat at θ and cat2 at 1 + θ are the same objective function"
-    );
+    assert_eq!(f_cat.ofv, f_cat2.ofv, "cat at θ and cat2 at 1 + θ are the same objective function");
     // The two θ vectors are the same but for the covariate coordinate, which
     // is the reparameterization itself — and it is *live*, not a coincidence
     // of two identical vectors.

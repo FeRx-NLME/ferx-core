@@ -75,21 +75,13 @@ impl FeatureVector {
     /// Display only — the journal round-trips the vector through serde, which
     /// has no separator to collide with, so nothing has to parse this back.
     pub fn render(&self) -> String {
-        self.iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(";")
+        self.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(";")
     }
 }
 
 impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for FeatureVector {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        Self {
-            entries: iter
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
-        }
+        Self { entries: iter.into_iter().map(|(k, v)| (k.into(), v.into())).collect() }
     }
 }
 
@@ -380,7 +372,7 @@ impl Default for RunOptions {
 /// arrive here are not the same statement. A model that does not compile will
 /// not compile on the next machine either — remembering that saves the parse
 /// and, more importantly, keeps the candidate in the report. A fit that died
-/// because `install_on_fit_pool` could not build a pool (`api/pool.rs`) says
+/// because `install_on_fit_pool` could not build a pool (`pool.rs`) says
 /// nothing about the model at all, and writing *that* down as final would let
 /// one bad minute mark a fittable model dead for the rest of the search's life.
 ///
@@ -401,10 +393,7 @@ impl CandidateError {
     /// not compile, or does not bind against this run's data. Deterministic, so
     /// a resume reuses it.
     pub fn model(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: false,
-        }
+        Self { message: message.into(), retryable: false }
     }
 
     /// A failure raised by the run rather than by the candidate. A resume
@@ -417,10 +406,7 @@ impl CandidateError {
     /// journalled and reused like any other result. An `Err` out of `fit()` is
     /// the pathological case, and refitting it is cheap because it is rare.
     pub fn environment(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: true,
-        }
+        Self { message: message.into(), retryable: true }
     }
 }
 

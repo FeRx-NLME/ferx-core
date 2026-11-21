@@ -111,21 +111,14 @@ fn degenerate_lines(warnings: &[String]) -> Vec<&String> {
 /// Per subject, the `(draw, sim)` replicates whose drawn `LAM` is non-positive: what the
 /// sampler calls degenerate, read off the run's parameter table and not off the tally.
 fn expected_from_parameters(out: &SimulationOutput) -> BTreeMap<String, Vec<(usize, usize)>> {
-    let lam = out
-        .parameters
-        .individual_names
-        .iter()
-        .position(|n| n == "LAM")
-        .expect("LAM is reported");
+    let lam =
+        out.parameters.individual_names.iter().position(|n| n == "LAM").expect("LAM is reported");
     let mut by_subject: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     for row in &out.parameters.rows {
         let rate = row.individual[lam];
         assert!(rate.is_finite(), "LAM of {}: {rate}", row.id);
         if rate <= 0.0 {
-            by_subject
-                .entry(row.id.clone())
-                .or_default()
-                .push((row.draw, row.sim));
+            by_subject.entry(row.id.clone()).or_default().push((row.draw, row.sim));
         }
     }
     by_subject
@@ -136,12 +129,8 @@ fn expected_from_parameters(out: &SimulationOutput) -> BTreeMap<String, Vec<(usi
 /// each replicate is a chunk of `n_subjects` rows; this reads a subject by where it is, not
 /// by its id, which two subjects may share.
 fn expected_by_position(out: &SimulationOutput, ids: &[&str]) -> Vec<Vec<(usize, usize)>> {
-    let lam = out
-        .parameters
-        .individual_names
-        .iter()
-        .position(|n| n == "LAM")
-        .expect("LAM is reported");
+    let lam =
+        out.parameters.individual_names.iter().position(|n| n == "LAM").expect("LAM is reported");
     let mut by_position = vec![Vec::new(); ids.len()];
     for replicate in out.parameters.rows.chunks(ids.len()) {
         let got: Vec<&str> = replicate.iter().map(|r| r.id.as_str()).collect();
@@ -181,25 +170,13 @@ fn expected_line(id: &str, cmt: usize, censored_in: &str) -> String {
 fn row_bits(rows: &[SimulationResult]) -> Vec<String> {
     rows.iter()
         .map(|r| {
-            format!(
-                "{} {} {} {} {} {:?}",
-                r.draw,
-                r.sim,
-                r.id,
-                r.cmt,
-                r.time.to_bits(),
-                r.outcome
-            )
+            format!("{} {} {} {} {} {:?}", r.draw, r.sim, r.id, r.cmt, r.time.to_bits(), r.outcome)
         })
         .collect()
 }
 
 fn options() -> SimulateOptions {
-    SimulateOptions {
-        seed: Some(1),
-        horizon: Some(20.0),
-        ..Default::default()
-    }
+    SimulateOptions { seed: Some(1), horizon: Some(20.0), ..Default::default() }
 }
 
 fn uncertainty(draws: usize, per_draw: usize) -> SimulateUncertaintyOptions {
@@ -247,11 +224,7 @@ fn options_run_reports_each_subject_once_with_its_replicates() {
             expected_line(
                 id,
                 2,
-                &format!(
-                    " in {} of 50 replicates ({})",
-                    at.len(),
-                    listed("sim", &sims)
-                ),
+                &format!(" in {} of 50 replicates ({})", at.len(), listed("sim", &sims)),
             )
         })
         .collect();
@@ -266,11 +239,7 @@ fn options_run_reports_each_subject_once_with_its_replicates() {
     // `tests/tte_smoke.rs` and the tally reading no random number).
     for (id, at) in &expected {
         for (_, sim) in at {
-            let row = out
-                .results
-                .iter()
-                .find(|r| &r.id == id && r.sim == *sim)
-                .expect("row");
+            let row = out.results.iter().find(|r| &r.id == id && r.sim == *sim).expect("row");
             assert_eq!(
                 format!("{:?}", row.outcome),
                 "Event { time: 20.0, observed: false }",
@@ -309,9 +278,7 @@ fn uncertainty_run_reports_each_subject_once_with_its_draws() {
         d
     };
     assert!(
-        expected
-            .values()
-            .any(|at| distinct_draws(at).len() < at.len()),
+        expected.values().any(|at| distinct_draws(at).len() < at.len()),
         "the fixture must hit one draw twice: {expected:?}"
     );
 
@@ -361,11 +328,7 @@ fn competing_causes_are_reported_per_cmt() {
     let mut want = Vec::new();
     for (id, at) in &expected {
         let sims: Vec<usize> = at.iter().map(|(_, sim)| *sim).collect();
-        let extent = format!(
-            " in {} of 50 replicates ({})",
-            at.len(),
-            listed("sim", &sims)
-        );
+        let extent = format!(" in {} of 50 replicates ({})", at.len(), listed("sim", &sims));
         for cmt in [2, 3] {
             want.push(expected_line(id, cmt, &extent));
         }
@@ -414,14 +377,9 @@ fn skipped_uncertainty_draws_are_not_counted() {
     ran.sort_unstable();
     ran.dedup();
     let d = ran.len();
+    assert!(1 < d && d < 30, "some draws must be skipped and several must run: {d} of 30");
     assert!(
-        1 < d && d < 30,
-        "some draws must be skipped and several must run: {d} of 30"
-    );
-    assert!(
-        out.warnings
-            .iter()
-            .any(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")),
+        out.warnings.iter().any(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")),
         "{:#?}",
         out.warnings
     );
@@ -433,10 +391,7 @@ fn skipped_uncertainty_draws_are_not_counted() {
             expected_line(
                 id,
                 2,
-                &format!(
-                    " in all {} replicates of all {d} simulated uncertainty draws",
-                    2 * d
-                ),
+                &format!(" in all {} replicates of all {d} simulated uncertainty draws", 2 * d),
             )
         })
         .collect();
@@ -446,16 +401,8 @@ fn skipped_uncertainty_draws_are_not_counted() {
     );
     // Order: after the per-subject lines, before the two run-level findings.
     let at = |needle: &str| out.warnings.iter().position(|w| w.contains(needle));
-    let last_line = out
-        .warnings
-        .iter()
-        .rposition(|w| w.starts_with(CODE))
-        .expect("a line");
-    assert!(
-        Some(last_line) < at("W_UNCERTAINTY_DRAWS_SKIPPED"),
-        "{:#?}",
-        out.warnings
-    );
+    let last_line = out.warnings.iter().rposition(|w| w.starts_with(CODE)).expect("a line");
+    assert!(Some(last_line) < at("W_UNCERTAINTY_DRAWS_SKIPPED"), "{:#?}", out.warnings);
 }
 
 /// A single replicate keeps the per-call text, with no count, on both entry points: the
@@ -475,22 +422,10 @@ fn one_replicate_keeps_the_text_without_a_count() {
     let want: Vec<String> = ["1", "2", "3"].iter().map(|id| today(id)).collect();
 
     let out = simulate_with_options_diag(&m, &pop, &m.default_params, 1, &options()).expect("sim");
-    assert_eq!(
-        degenerate_lines(&out.warnings)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>(),
-        want
-    );
+    assert_eq!(degenerate_lines(&out.warnings).into_iter().cloned().collect::<Vec<_>>(), want);
     let fit = synthetic_fit(&m.default_params);
     let out = simulate_with_uncertainty_diag(&m, &pop, &fit, &uncertainty(1, 1)).expect("sim");
-    assert_eq!(
-        degenerate_lines(&out.warnings)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>(),
-        want
-    );
+    assert_eq!(degenerate_lines(&out.warnings).into_iter().cloned().collect::<Vec<_>>(), want);
 }
 
 /// Two causes on one subject where only cause A can degenerate; cause B fires at a fixed
@@ -544,48 +479,27 @@ fn a_degenerate_cause_beside_a_live_one_counts_only_censored_replicates() {
         out.results
             .iter()
             .filter(|r| r.id == id && r.sim == sim)
-            .all(|r| {
-                matches!(
-                    r.outcome,
-                    crate::types::SimOutcome::Event {
-                        observed: false,
-                        ..
-                    }
-                )
-            })
+            .all(|r| matches!(r.outcome, crate::types::SimOutcome::Event { observed: false, .. }))
     };
     let mut fired_anyway = 0;
     let mut want = Vec::new();
     for (id, at) in &drew {
-        let sims: Vec<usize> = at
-            .iter()
-            .map(|(_, sim)| *sim)
-            .filter(|sim| censored(id, *sim))
-            .collect();
+        let sims: Vec<usize> =
+            at.iter().map(|(_, sim)| *sim).filter(|sim| censored(id, *sim)).collect();
         fired_anyway += at.len() - sims.len();
         if !sims.is_empty() {
             want.push(expected_line(
                 id,
                 2,
-                &format!(
-                    " in {} of 50 replicates ({})",
-                    sims.len(),
-                    listed("sim", &sims)
-                ),
+                &format!(" in {} of 50 replicates ({})", sims.len(), listed("sim", &sims)),
             ));
         }
     }
     // The straddle: some degenerate draws were followed by cause B firing (not counted),
     // and some left the subject censored (counted). Either half alone cannot tell the two
     // rules apart.
-    assert!(
-        fired_anyway > 0,
-        "the fixture must let cause B fire after A degenerates"
-    );
-    assert!(
-        !want.is_empty(),
-        "the fixture must leave some subject censored: {drew:?}"
-    );
+    assert!(fired_anyway > 0, "the fixture must let cause B fire after A degenerates");
+    assert!(!want.is_empty(), "the fixture must leave some subject censored: {drew:?}");
 
     let lines = degenerate_lines(&out.warnings);
     assert_eq!(
@@ -621,11 +535,7 @@ fn subjects_sharing_an_id_keep_their_own_lines() {
             expected_line(
                 id,
                 2,
-                &format!(
-                    " in {} of 50 replicates ({})",
-                    at.len(),
-                    listed("sim", &sims)
-                ),
+                &format!(" in {} of 50 replicates ({})", at.len(), listed("sim", &sims)),
             )
         })
         .collect();

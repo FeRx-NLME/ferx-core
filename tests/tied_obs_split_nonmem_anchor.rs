@@ -40,42 +40,19 @@ const NONMEM_OBJ: f64 = 2.672_681_311_519_760_1;
 fn nonmem_rows() -> Vec<(String, f64, f64, f64, f64)> {
     let path = "nonmem_anchor/results/tied_obs_split.tab";
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
-    let header: Vec<&str> = lines
-        .next()
-        .expect(".tab header")
-        .split_whitespace()
-        .collect();
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
+    let header: Vec<&str> = lines.next().expect(".tab header").split_whitespace().collect();
     let col = |name: &str| header.iter().position(|h| *h == name).unwrap();
-    let (id, time, evid, pred, ipred, eta) = (
-        col("ID"),
-        col("TIME"),
-        col("EVID"),
-        col("PRED"),
-        col("IPRED"),
-        col("ETA1"),
-    );
+    let (id, time, evid, pred, ipred, eta) =
+        (col("ID"), col("TIME"), col("EVID"), col("PRED"), col("IPRED"), col("ETA1"));
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0)
-        .map(|r| {
-            (
-                format!("{}", r[id] as u32),
-                r[time],
-                r[pred],
-                r[ipred],
-                r[eta],
-            )
-        })
+        .map(|r| (format!("{}", r[id] as u32), r[time], r[pred], r[ipred], r[eta]))
         .collect()
 }
 
@@ -89,20 +66,10 @@ fn a_reader_split_tie_matches_nonmem() {
     // The fixture reaches the split, and only where the table above says: without it the
     // anchor would pass on the bit-identical pair every engine always handled.
     let four = 4.0_f64;
-    for (id, split) in [
-        ("1", true),
-        ("2", true),
-        ("3", false),
-        ("4", true),
-        ("5", false),
-    ] {
+    for (id, split) in [("1", true), ("2", true), ("3", false), ("4", true), ("5", false)] {
         let s = pop.subjects.iter().find(|s| s.id == id).expect("subject");
-        let tie: Vec<f64> = s
-            .obs_times
-            .iter()
-            .copied()
-            .filter(|t| (t - four).abs() < 1e-9)
-            .collect();
+        let tie: Vec<f64> =
+            s.obs_times.iter().copied().filter(|t| (t - four).abs() < 1e-9).collect();
         assert_eq!(tie.len(), 2, "subject {id}: the tie holds two observations");
         assert_eq!(
             tie[0].to_bits() != tie[1].to_bits(),
@@ -118,13 +85,8 @@ fn a_reader_split_tie_matches_nonmem() {
         }
     }
 
-    let result = fit(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        &parsed.fit_options,
-    )
-    .unwrap_or_else(|e| panic!("fit: {e}"));
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &parsed.fit_options)
+        .unwrap_or_else(|e| panic!("fit: {e}"));
 
     // Finite first: a NaN fails every `<` below, but say so by name.
     assert!(result.ofv.is_finite(), "objective {}", result.ofv);
@@ -156,11 +118,8 @@ fn a_reader_split_tie_matches_nonmem() {
             "ID {id} TIME {t}: PRED {pred}, IPRED {ipred}"
         );
         let eta = result.subjects.iter().find(|s| s.id == id).unwrap().eta[0];
-        let (e_pred, e_ipred, e_eta) = (
-            (pred - nm_pred).abs(),
-            (ipred - nm_ipred).abs(),
-            (eta - nm_eta).abs(),
-        );
+        let (e_pred, e_ipred, e_eta) =
+            ((pred - nm_pred).abs(), (ipred - nm_ipred).abs(), (eta - nm_eta).abs());
         assert!(
             e_pred < PRED_TOL && e_ipred < IPRED_TOL && e_eta < ETA_TOL,
             "ID {id} TIME {t}: ferx PRED {pred} / IPRED {ipred} / η {eta} vs NONMEM \

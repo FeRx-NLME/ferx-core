@@ -14,7 +14,6 @@ use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
     DoseAction, DoseStep, MonitorSpec, ObserveMode,
 };
-use std::collections::HashMap;
 
 /// 1-cpt ODE plus an independent second state (so Form B has two observed CMTs), with
 /// one FREM covariate `WT`: `TV_WT` + `ETA_WT` predict the `FREMTYPE = 100` rows. With
@@ -62,11 +61,7 @@ const PER_CMT_ERR: &str = "  CMT=1: DV ~ proportional(S)\n  CMT=2: DV ~ proporti
 /// model. Form A divides by an η-dependent `V`, Form B per CMT, Form C is the twin.
 const FORMS: [(&str, &str, [usize; 6]); 3] = [
     ("A: obs_scale = V", "  obs_scale = V", [1; 6]),
-    (
-        "B: obs_scale[CMT=n]",
-        "  obs_scale[CMT=1] = V\n  obs_scale[CMT=2] = 10",
-        [1, 1, 2, 1, 1, 2],
-    ),
+    ("B: obs_scale[CMT=n]", "  obs_scale[CMT=1] = V\n  obs_scale[CMT=2] = 10", [1, 1, 2, 1, 1, 2]),
     ("C: y = central / V", "  y = central / V", [1; 6]),
 ];
 
@@ -90,9 +85,7 @@ const DECISIONS: [f64; 2] = [4.0, 12.0];
 /// (`occasion_of`), `0` before the first decision. Used only by the sink parity test,
 /// so `predict_iov` reads each row under the κ the adaptive driver reads it with.
 fn window_occasions() -> Vec<u32> {
-    OBS.iter()
-        .map(|&t| crate::pk::occasion_of(&DECISIONS, t).map_or(0, |g| g as u32 + 1))
-        .collect()
+    OBS.iter().map(|&t| crate::pk::occasion_of(&DECISIONS, t).map_or(0, |g| g as u32 + 1)).collect()
 }
 
 fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
@@ -102,34 +95,16 @@ fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
     ];
     let n = OBS.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
         dose_occasions: vec![occasions[0]; doses.len()],
         doses,
         obs_times: OBS.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: cmts.to_vec(),
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions,
-        obs_l2: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         fremtype: FREMTYPE.to_vec(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -217,11 +192,7 @@ fn assert_values_are_ipreds(r: &AdaptiveSimulationResult, label: &str) {
 /// left on the readout cannot be within 1 of 70 unless η_WT ≈ -68, i.e. 6.8 SD.
 fn assert_frem_rows_are_not_the_readout(rows: &[f64], label: &str) {
     for j in FREM_ROWS {
-        assert!(
-            rows[j] > 20.0,
-            "{label}: FREM row {j} = {} is the readout, not θ + η",
-            rows[j]
-        );
+        assert!(rows[j] > 20.0, "{label}: FREM row {j} = {} is the readout, not θ + η", rows[j]);
     }
 }
 
@@ -251,10 +222,9 @@ fn holding_controller_matches_simulate_on_frem_rows() {
         let declarative =
             simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec_hold(), &spec_opts())
                 .expect("from spec");
-        for (entry, run) in [
-            ("simulate_adaptive", &programmatic),
-            ("simulate_adaptive_from_spec", &declarative),
-        ] {
+        for (entry, run) in
+            [("simulate_adaptive", &programmatic), ("simulate_adaptive_from_spec", &declarative)]
+        {
             let label = format!("{label}, {entry}");
             let got = ipreds(run);
             assert_eq!(got.len(), want.len(), "{label}: row count");
@@ -358,11 +328,7 @@ fn row_conversion_matches_the_full_pk_sink() {
             stripped.scaling = crate::types::ScalingSpec::None;
             stripped.frem_config = None;
 
-            let occasions = if iov {
-                window_occasions()
-            } else {
-                vec![1u32; OBS.len()]
-            };
+            let occasions = if iov { window_occasions() } else { vec![1u32; OBS.len()] };
             let s = subject("1", cmts, occasions);
             let mut eta_slice = eta_bsv.to_vec();
             eta_slice.resize(m.n_eta + m.n_kappa, 0.0);
@@ -465,10 +431,7 @@ const ADAPTIVE_REMEDY: &str = "A controller reading `ControllerCtx::covariates` 
      covariate rows.";
 
 fn drawn_warnings(warnings: &[String]) -> Vec<&String> {
-    warnings
-        .iter()
-        .filter(|w| w.starts_with(DRAWN_CODE))
-        .collect()
+    warnings.iter().filter(|w| w.starts_with(DRAWN_CODE)).collect()
 }
 
 /// A FREM fixture subject with no `FREMTYPE` column at all.
@@ -491,15 +454,9 @@ fn frem_drawn_eta_warning_gates_and_text() {
     let without_rows = subject_without_frem_rows("2");
 
     let got = crate::api::frem_drawn_eta_warning(&m, 3, [&with_rows, &without_rows], "R.");
-    assert_eq!(
-        got.as_deref(),
-        Some(format!("{}R.", drawn_head(2, 3, true)).as_str())
-    );
+    assert_eq!(got.as_deref(), Some(format!("{}R.", drawn_head(2, 3, true)).as_str()));
     let got = crate::api::frem_drawn_eta_warning(&m, 3, [&without_rows], "R.");
-    assert_eq!(
-        got.as_deref(),
-        Some(format!("{}R.", drawn_head(1, 3, false)).as_str())
-    );
+    assert_eq!(got.as_deref(), Some(format!("{}R.", drawn_head(1, 3, false)).as_str()));
 
     assert_eq!(
         crate::api::frem_drawn_eta_warning(&m, 3, std::iter::empty(), "R."),
@@ -536,10 +493,7 @@ fn simulate_with_options_diag_reports_a_drawn_frem_eta() {
         &pop,
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(7), ..Default::default() },
     )
     .expect("simulate");
     let want = format!("{}{SIMULATE_REMEDY}", drawn_head(1, 1, true));

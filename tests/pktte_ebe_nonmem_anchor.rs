@@ -48,10 +48,7 @@ fn nonmem_rows() -> Vec<(String, f64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // ID TIME EVID CMT DV IPRED CHZ HAZ ETA1 MDV
             let keep = f.len() >= 10 && (f[2] == 2.0 || (f[2] == 0.0 && f[3] == 3.0));
             keep.then(|| (format!("{}", f[0] as i64), f[1], f[6], f[7], f[8]))
@@ -77,10 +74,7 @@ fn grid(rows: &[(String, f64, f64, f64, f64)]) -> Vec<f64> {
 }
 
 fn curve(
-    parsed: &ParsedModel,
-    pop: &Population,
-    etas: &[(String, f64)],
-    grid: &[f64],
+    parsed: &ParsedModel, pop: &Population, etas: &[(String, f64)], grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
     // Supplied in the reverse of population order: a positional mix-up fails here.
     let rev: Vec<&(String, f64)> = etas.iter().rev().collect();
@@ -119,36 +113,20 @@ fn worst(pred: &[SurvivalPredictionResult], rows: &[(String, f64, f64, f64, f64)
 
 /// ferx's η̂: a fit with everything FIX and `maxiter = 0`.
 fn ferx_eta(parsed: &ParsedModel, pop: &Population) -> (Vec<(String, f64)>, Vec<String>) {
-    let opts = FitOptions {
-        run_covariance_step: false,
-        inner_tol: 1e-10,
-        ..parsed.fit_options.clone()
-    };
+    let opts =
+        FitOptions { run_covariance_step: false, inner_tol: 1e-10, ..parsed.fit_options.clone() };
     let m = &parsed.model;
     let r = fit(m, pop, &m.default_params, &opts).expect("inner-only fit");
-    (
-        r.subjects
-            .iter()
-            .map(|s| (s.id.clone(), s.eta[0]))
-            .collect(),
-        r.warnings,
-    )
+    (r.subjects.iter().map(|s| (s.id.clone(), s.eta[0])).collect(), r.warnings)
 }
 
 #[test]
 fn individual_curve_at_nonmems_eta_matches_nonmem() {
     let (parsed, pop) = load();
     let rows = nonmem_rows();
-    assert_eq!(
-        rows.len(),
-        8 * 25,
-        "24 grid rows and one event row per subject"
-    );
+    assert_eq!(rows.len(), 8 * 25, "24 grid rows and one event row per subject");
     let eta = nonmem_eta(&rows);
-    assert!(
-        eta.iter().all(|(_, e)| e.abs() > 1e-3),
-        "every ETA1 is live: {eta:?}"
-    );
+    assert!(eta.iter().all(|(_, e)| e.abs() > 1e-3), "every ETA1 is live: {eta:?}");
     let g = grid(&rows);
 
     // (i)
@@ -156,14 +134,8 @@ fn individual_curve_at_nonmems_eta_matches_nonmem() {
     eprintln!("T10(i) worst rel H {wh:.3e}, h {wz:.3e}");
     // Measured 4.42e-9 (H) and 6.07e-9 (h) on Linux aarch64 (`tools/linux-test.sh`) and
     // macOS arm64, the same digits; bound ~10x above.
-    assert!(
-        wh < 5e-8,
-        "(i) H vs NONMEM CHZ: worst rel {wh:.3e} (measured 4.42e-9)"
-    );
-    assert!(
-        wz < 5e-8,
-        "(i) h vs NONMEM HAZ: worst rel {wz:.3e} (measured 6.07e-9)"
-    );
+    assert!(wh < 5e-8, "(i) H vs NONMEM CHZ: worst rel {wh:.3e} (measured 4.42e-9)");
+    assert!(wz < 5e-8, "(i) h vs NONMEM HAZ: worst rel {wz:.3e} (measured 6.07e-9)");
 
     // Non-degeneracy: the η = 0 curve misses by far more than (i)'s bound.
     let zero: Vec<(String, f64)> = eta.iter().map(|(i, _)| (i.clone(), 0.0)).collect();
@@ -192,10 +164,7 @@ fn ebes_and_the_curve_at_them_match_nonmem() {
     eprintln!("T10(ii) worst |η̂ − ETA1| {worst_eta:.3e}");
     // Measured 4.32e-10 on Linux aarch64 (4.69e-10 on macOS arm64) at inner_tol 1e-10: no
     // live-η gap on this model.
-    assert!(
-        worst_eta < 1e-8,
-        "(ii) worst |η̂ − ETA1| {worst_eta:.3e} (measured 4.32e-10, Linux)"
-    );
+    assert!(worst_eta < 1e-8, "(ii) worst |η̂ − ETA1| {worst_eta:.3e} (measured 4.32e-10, Linux)");
 
     // (iii)
     let (wh, wz) = worst(&curve(&parsed, &pop, &fx, &grid(&rows)), &rows);

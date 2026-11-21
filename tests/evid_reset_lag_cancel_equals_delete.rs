@@ -150,9 +150,7 @@ const FORMS: &[Form] = &[
 
 fn model(form: &Form) -> CompiledModel {
     let src = format!("{PARAMS}{IND}{}{TAIL}", form.model);
-    parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("{}: model parses: {e:?}", form.name))
-        .model
+    parse_full_model(&src).unwrap_or_else(|e| panic!("{}: model parses: {e:?}", form.name)).model
 }
 
 const OBS: &[f64] = &[11.0, 11.5, 12.5, 14.0, 16.0, 20.0];
@@ -231,12 +229,7 @@ fn sens(m: &CompiledModel, form: &Form, s: &Subject, eta: &[f64]) -> Vec<ObsGrad
     // One recorder serves both engines; `form` still picks the model.
     let _ = form.analytic;
     let r = subject_eta_grad(m, s, theta, eta);
-    r.unwrap_or_else(|| {
-        panic!(
-            "{}: routed to FD, the dual walk is not exercised",
-            form.name
-        )
-    })
+    r.unwrap_or_else(|| panic!("{}: routed to FD, the dual walk is not exercised", form.name))
 }
 
 fn production(m: &CompiledModel, s: &Subject, eta: &[f64]) -> Vec<f64> {
@@ -247,11 +240,7 @@ fn via_predict(m: &CompiledModel, pop: &Population) -> Vec<f64> {
     let mut p = m.default_params.clone();
     // `predict` evaluates at η = 0; the value checks read it there.
     p.theta = m.default_params.theta.clone();
-    predict(m, pop, &p)
-        .expect("predict")
-        .into_iter()
-        .map(|r| r.pred)
-        .collect()
+    predict(m, pop, &p).expect("predict").into_iter().map(|r| r.pred).collect()
 }
 
 /// `|a − b| ≤ tol · (1 + |b|)`, every element, both finite.
@@ -261,10 +250,7 @@ fn close(label: &str, a: &[f64], b: &[f64], tol: f64) -> f64 {
     for (j, (x, y)) in a.iter().zip(b).enumerate() {
         assert!(x.is_finite() && y.is_finite(), "{label}[{j}]: {x} vs {y}");
         let e = (x - y).abs() / (1.0 + y.abs());
-        assert!(
-            e <= tol,
-            "{label}[{j}]: {x} vs {y} (err {e:.3e} > {tol:.0e})"
-        );
+        assert!(e <= tol, "{label}[{j}]: {x} vs {y} (err {e:.3e} > {tol:.0e})");
         worst = worst.max(e);
     }
     worst
@@ -305,37 +291,22 @@ fn check(form: &Form, v: Variant) {
     // (its `LAGF` is 1 in every variant: its record is before t = 10).
     let lag = m.default_params.theta[3] * e[1].exp();
     let arrival = CANCELLED + lag;
-    assert!(
-        CANCELLED < 10.0 && arrival > 10.0,
-        "{label}: arrival {arrival}"
-    );
+    assert!(CANCELLED < 10.0 && arrival > 10.0, "{label}: arrival {arrival}");
     if v == Variant::AtObs {
-        assert_eq!(
-            arrival, OBS[0],
-            "{label}: the cancelled arrival must sit on an observation"
-        );
+        assert_eq!(arrival, OBS[0], "{label}: the cancelled arrival must sit on an observation");
     }
     if matches!(v, Variant::Residual | Variant::AtObs) {
         // The first live dose arrives (10.5 + 0.2·lag ≈ 10.92) before the cancelled one, so
         // drug is present there: the 11.0 read, just before `arrival`, is non-zero (least:
         // transit, whose onset is smooth, 3.0e-3).
         let first_live = LIVE[0] + 0.2 * lag;
-        assert!(
-            first_live < OBS[0] && OBS[0] <= arrival,
-            "{label}: {first_live} / {arrival}"
-        );
+        assert!(first_live < OBS[0] && OBS[0] <= arrival, "{label}: {first_live} / {arrival}");
         // The third live dose arrives inside the cancelled dose's window (it opens at
         // `arrival`; the shortest, the 0.8 h infusion, closes at `arrival + 0.8`).
         let inside = LIVE[1] + 0.2 * lag;
-        assert!(
-            arrival < inside && inside < arrival + 0.8,
-            "{label}: {inside}"
-        );
+        assert!(arrival < inside && inside < arrival + 0.8, "{label}: {inside}");
         let f = production(&m, sd, &e);
-        assert!(
-            f[0] > 1e-3,
-            "{label}: no residual drug at the cancelled arrival: {f:?}"
-        );
+        assert!(f[0] > 1e-3, "{label}: no residual drug at the cancelled arrival: {f:?}");
     }
 
     // (1) cancel ≡ delete on every value path.
@@ -355,20 +326,13 @@ fn check(form: &Form, v: Variant) {
     let fa: Vec<f64> = a.iter().map(|o| o.f).collect();
     let fb: Vec<f64> = b.iter().map(|o| o.f).collect();
     let w_dual = close(&format!("{label}: dual value"), &fa, &fb, SAME_TOL);
-    assert!(
-        fb.iter().any(|&v| v > 0.05),
-        "{label}: the live doses must be seen: {fb:?}"
-    );
+    assert!(fb.iter().any(|&v| v > 0.05), "{label}: the live doses must be seen: {fb:?}");
 
     // (2) the derivatives of a cancelled dose are those of a deleted one.
     let mut w_grad = 0.0_f64;
     for (j, (x, y)) in a.iter().zip(&b).enumerate() {
-        w_grad = w_grad.max(close(
-            &format!("{label}: ∂f/∂η obs {j}"),
-            &x.df_deta,
-            &y.df_deta,
-            SAME_TOL,
-        ));
+        w_grad =
+            w_grad.max(close(&format!("{label}: ∂f/∂η obs {j}"), &x.df_deta, &y.df_deta, SAME_TOL));
     }
     // θ and the second-order blocks, since #2093 through the adjoint's exact FOCEI outer
     // gradient at the same η: it carries ∂f/∂θ directly, and ∂²f/∂η² and ∂²f/∂η∂θ through
@@ -382,11 +346,8 @@ fn check(form: &Form, v: Variant) {
     let with_data = |s: &Subject| {
         let f = production(&m, sd, &e);
         let mut out = s.clone();
-        out.observations = f
-            .iter()
-            .enumerate()
-            .map(|(j, p)| p * (1.0 + 0.1 * (1.7 * j as f64).sin()))
-            .collect();
+        out.observations =
+            f.iter().enumerate().map(|(j, p)| p * (1.0 + 0.1 * (1.7 * j as f64).sin())).collect();
         out
     };
     let (gc, gd) = (with_data(sc), with_data(sd));
@@ -405,15 +366,9 @@ fn check(form: &Form, v: Variant) {
         &gb,
         SAME_TOL,
     ));
-    assert!(
-        gb.iter().any(|g| g.abs() > 1e-3),
-        "{label}: the outer gradient must be live: {gb:?}"
-    );
+    assert!(gb.iter().any(|g| g.abs() > 1e-3), "{label}: the outer gradient must be live: {gb:?}");
     // The lag axis is live on the live doses, so (2) is not comparing zeros.
-    assert!(
-        b.iter().any(|o| o.df_deta[1].abs() > 1e-3),
-        "{label}: ∂f/∂η_LAG must be live"
-    );
+    assert!(b.iter().any(|o| o.df_deta[1].abs() > 1e-3), "{label}: ∂f/∂η_LAG must be live");
 
     // (3) Dual2 vs central FD of the production predictor, on the cancelling subject.
     let h = 1e-5;
@@ -423,28 +378,15 @@ fn check(form: &Form, v: Variant) {
         ep[k] += h;
         em[k] -= h;
         let (fp, fm) = (production(&m, sc, &ep), production(&m, sc, &em));
-        let fd: Vec<f64> = fp
-            .iter()
-            .zip(&fm)
-            .map(|(p, q)| (p - q) / (2.0 * h))
-            .collect();
+        let fd: Vec<f64> = fp.iter().zip(&fm).map(|(p, q)| (p - q) / (2.0 * h)).collect();
         let dual: Vec<f64> = a.iter().map(|o| o.df_deta[k]).collect();
-        w_fd = w_fd.max(close(
-            &format!("{label}: dual vs FD ∂f/∂η[{k}]"),
-            &dual,
-            &fd,
-            FD_TOL,
-        ));
+        w_fd = w_fd.max(close(&format!("{label}: dual vs FD ∂f/∂η[{k}]"), &dual, &fd, FD_TOL));
     }
 
     // (4) the straddle: the dose live (reset before its record), everything else equal.
     let fl = production(&m, &live.subjects[0], &e);
     let fdel = production(&m, sd, &e);
-    let gap = fl
-        .iter()
-        .zip(&fdel)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max);
+    let gap = fl.iter().zip(&fdel).map(|(x, y)| (x - y).abs()).fold(0.0_f64, f64::max);
     assert!(
         fl.iter().all(|v| v.is_finite()) && gap > STRADDLE_MIN,
         "{label}: with the reset before the record the dose must be live (gap {gap})"
@@ -458,12 +400,7 @@ fn check(form: &Form, v: Variant) {
 #[test]
 fn a_dose_recorded_before_the_reset_is_deleted_on_every_absorption_form() {
     for form in FORMS {
-        for v in [
-            Variant::Flat,
-            Variant::TvWt,
-            Variant::Residual,
-            Variant::AtObs,
-        ] {
+        for v in [Variant::Flat, Variant::TvWt, Variant::Residual, Variant::AtObs] {
             check(form, v);
         }
     }

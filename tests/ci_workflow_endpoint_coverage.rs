@@ -61,14 +61,9 @@ const GATED_FEATURES: [&str; 3] = ["survival", "markov", "nn"];
 /// of 120-odd `tests/*.rs`, exactly two change classification under this rule, and both
 /// are CI guard tests that compile nothing gated (this file and the one above).
 fn uses_gated_feature_cfg(src: &str) -> bool {
-    let code: String = src
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    GATED_FEATURES
-        .iter()
-        .any(|f| code.contains(&format!(r#"feature = "{f}""#)))
+    let code: String =
+        src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    GATED_FEATURES.iter().any(|f| code.contains(&format!(r#"feature = "{f}""#)))
 }
 
 /// Every `tests/*.rs` that [`uses_gated_feature_cfg`].
@@ -80,10 +75,8 @@ fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
     // skip this file would match itself and demand a `--test` entry for a binary that
     // compiles nothing gated. `file!()` rather than a hard-coded name so a rename cannot
     // silently re-introduce that.
-    let self_stem = Path::new(file!())
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .expect("file!() has a UTF-8 stem");
+    let self_stem =
+        Path::new(file!()).file_stem().and_then(|s| s.to_str()).expect("file!() has a UTF-8 stem");
 
     let mut found = BTreeSet::new();
     for entry in std::fs::read_dir(tests_dir).expect("tests/ is readable") {
@@ -96,10 +89,8 @@ fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
         }
         let src = std::fs::read_to_string(&path).expect("test file is valid UTF-8");
         if uses_gated_feature_cfg(&src) {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("test file has a UTF-8 stem");
+            let stem =
+                path.file_stem().and_then(|s| s.to_str()).expect("test file has a UTF-8 stem");
             found.insert(stem.to_string());
         }
     }
@@ -115,9 +106,7 @@ fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
 /// `endpoints` suite, or the list below would be a file nothing reads.
 fn workflow_test_selection(workflow: &str, list: &str) -> BTreeSet<String> {
     const STEP: &str = "- name: Generate TTE/CTMM endpoint coverage report";
-    let step_start = workflow
-        .find(STEP)
-        .expect("ci.yml still has the endpoint coverage step");
+    let step_start = workflow.find(STEP).expect("ci.yml still has the endpoint coverage step");
     let rest = &workflow[step_start + STEP.len()..];
     // The step's `run:` block ends at the next step in the same job.
     let step_body = match rest.find("\n      - ") {
@@ -226,7 +215,5 @@ fn a_cfg_named_only_in_a_comment_is_not_a_gate() {
 /// "drop any line containing `//`" rule would lose it, and that is a false negative.
 #[test]
 fn a_trailing_comment_does_not_hide_the_gate_on_its_own_line() {
-    assert!(uses_gated_feature_cfg(
-        "#[cfg(feature = \"survival\")] // TTE only\nfn a() {}"
-    ));
+    assert!(uses_gated_feature_cfg("#[cfg(feature = \"survival\")] // TTE only\nfn a() {}"));
 }

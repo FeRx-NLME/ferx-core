@@ -12,14 +12,7 @@ fn ran(start: usize, ofv: f64, converged: bool) -> StartRecord {
         penalized: false,
         objective: None,
         converged,
-        status: Some(
-            if converged {
-                "converged"
-            } else {
-                "not_converged"
-            }
-            .to_string(),
-        ),
+        status: Some(if converged { "converged" } else { "not_converged" }.to_string()),
         status_reasons: Vec::new(),
         n_iterations: 10,
         wall_time_secs: 0.5,
@@ -46,13 +39,7 @@ fn failed(start: usize) -> StartRecord {
 
 /// Converged starts at the given OFVs, `selected` marked.
 fn converged(ofvs: &[f64], selected: usize) -> Vec<StartRecord> {
-    select(
-        ofvs.iter()
-            .enumerate()
-            .map(|(k, v)| ran(k, *v, true))
-            .collect(),
-        selected,
-    )
+    select(ofvs.iter().enumerate().map(|(k, v)| ran(k, *v, true)).collect(), selected)
 }
 
 fn select(mut starts: Vec<StartRecord>, selected: usize) -> Vec<StartRecord> {
@@ -82,17 +69,11 @@ fn all_starts_agreeing_is_said_in_so_many_words() {
         6,
     );
     let s = StartSpread::of(&starts);
-    assert_eq!(
-        (s.n_starts, s.n_converged, s.n_compared, s.n_within),
-        (8, 8, 8, 8)
-    );
+    assert_eq!((s.n_starts, s.n_converged, s.n_compared, s.n_within), (8, 8, 8, 8));
     assert_eq!((s.n_not_converged, s.n_failed, s.n_unusable), (0, 0, 0));
     assert!(s.above.is_empty() && s.lower_not_converged.is_empty());
     let range = s.range.expect("eight compared starts have a range");
-    assert!(
-        range.is_finite() && (range - 9.5e-8).abs() < 1e-12,
-        "{range}"
-    );
+    assert!(range.is_finite() && (range - 9.5e-8).abs() < 1e-12, "{range}");
     assert_eq!(
         s.line(),
         "Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 6); \
@@ -123,10 +104,7 @@ fn one_converged_stray_is_named_with_its_distance() {
     assert_eq!(s.above.len(), 1);
     assert_eq!(s.above[0].0, 4);
     let range = s.range.expect("range");
-    assert!(
-        range.is_finite() && (range - 5.273826).abs() < 1e-9,
-        "{range}"
-    );
+    assert!(range.is_finite() && (range - 5.273826).abs() < 1e-9, "{range}");
     assert!((s.above[0].1 - range).abs() < 1e-12);
     assert_eq!(
         s.line(),
@@ -192,18 +170,10 @@ fn not_converged_and_failed_starts_are_counted_and_not_compared() {
 #[test]
 fn a_nan_or_sentinel_ofv_is_counted_apart_and_kept_out_of_the_range() {
     let starts = select(
-        vec![
-            ran(0, 5.0, true),
-            ran(1, f64::NAN, true),
-            ran(2, 1e20, true),
-            ran(3, 5.5, true),
-        ],
+        vec![ran(0, 5.0, true), ran(1, f64::NAN, true), ran(2, 1e20, true), ran(3, 5.5, true)],
         0,
     );
-    assert_eq!(
-        starts[1].ofv, None,
-        "premise: a NaN OFV is recorded as None"
-    );
+    assert_eq!(starts[1].ofv, None, "premise: a NaN OFV is recorded as None");
     let s = StartSpread::of(&starts);
     assert_eq!((s.n_converged, s.n_unusable, s.n_compared), (4, 2, 2));
     let range = s.range.expect("range");
@@ -220,12 +190,7 @@ fn a_nan_or_sentinel_ofv_is_counted_apart_and_kept_out_of_the_range() {
 #[test]
 fn no_converged_start_compares_all_starts_and_marks_the_returned_one() {
     let starts = select(
-        vec![
-            ran(0, 10.5, false),
-            ran(1, 10.25, false),
-            ran(2, 10.0, false),
-            ran(3, 17.5, false),
-        ],
+        vec![ran(0, 10.5, false), ran(1, 10.25, false), ran(2, 10.0, false), ran(3, 17.5, false)],
         2,
     );
     let s = StartSpread::of(&starts);
@@ -242,14 +207,7 @@ fn no_converged_start_compares_all_starts_and_marks_the_returned_one() {
 /// start that was returned. Both sides of the gate: below is named, above is not.
 #[test]
 fn a_not_converged_start_below_the_returned_one_is_named() {
-    let below = select(
-        vec![
-            ran(0, 100.0, true),
-            ran(1, 100.0, true),
-            ran(2, 96.79, false),
-        ],
-        0,
-    );
+    let below = select(vec![ran(0, 100.0, true), ran(1, 100.0, true), ran(2, 96.79, false)], 0);
     let s = StartSpread::of(&below);
     assert_eq!(s.lower_not_converged.len(), 1);
     assert_eq!(s.lower_not_converged[0].0, 2);
@@ -259,14 +217,7 @@ fn a_not_converged_start_below_the_returned_one_is_named() {
          all 2 converged starts within 1.0 of best (range 0.0000); \
          1 not converged at a lower OFV: start 2 (-3.21)"
     );
-    let above = select(
-        vec![
-            ran(0, 100.0, true),
-            ran(1, 100.0, true),
-            ran(2, 103.21, false),
-        ],
-        0,
-    );
+    let above = select(vec![ran(0, 100.0, true), ran(1, 100.0, true), ran(2, 103.21, false)], 0);
     assert_eq!(
         line(&above),
         "Multi-start: 3 starts, 2 converged, 1 not converged; best OFV 100.0000 (start 0); \
@@ -294,10 +245,7 @@ fn no_usable_ofv_on_the_returned_start_says_there_is_nothing_to_compare() {
 #[test]
 fn a_penalized_fit_is_compared_on_the_objective_that_ranked_it() {
     let mut starts = converged(&[-1292.5264, -1292.5264, -1292.5264, -1292.0264], 1);
-    for (s, objective) in starts
-        .iter_mut()
-        .zip([-1265.3763, -1265.3763, -1265.3763, -1240.1363])
-    {
+    for (s, objective) in starts.iter_mut().zip([-1265.3763, -1265.3763, -1265.3763, -1240.1363]) {
         s.penalized = true;
         s.objective = Some(objective);
     }
@@ -345,11 +293,7 @@ fn a_penalized_table_with_no_finite_objective_is_not_compared_on_ofv() {
     let s = StartSpread::of(&starts);
     assert!(!s.penalized);
     assert_eq!(s.best, Some(10.0));
-    assert!(
-        s.line().contains("best OFV 10.0000 (start 0)"),
-        "{}",
-        s.line()
-    );
+    assert!(s.line().contains("best OFV 10.0000 (start 0)"), "{}", s.line());
 }
 
 /// More strays than the line names: the first three by start index, then a count. Both

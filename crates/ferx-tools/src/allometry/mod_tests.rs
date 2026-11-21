@@ -60,28 +60,17 @@ fn two_cpt() -> BaseModel {
     let path = dir.path().join("two_cpt.ferx");
     std::fs::write(&path, TWO_CPT).unwrap();
     let prepared = prepare_run(path.to_str().unwrap(), Some(DATA)).expect("base model + data");
-    BaseModel {
-        prepared,
-        text: ModelText::parse(TWO_CPT).unwrap(),
-    }
+    BaseModel { prepared, text: ModelText::parse(TWO_CPT).unwrap() }
 }
 
 #[test]
 fn default_scaling_is_075_on_clearances_and_1_on_volumes_fixed() {
     let built = allometric_model(&two_cpt(), &AllometryOptions::default()).unwrap();
-    let got: Vec<(&str, f64, bool)> = built
-        .scalings
-        .iter()
-        .map(|s| (s.parameter.as_str(), s.exponent, s.fixed))
-        .collect();
+    let got: Vec<(&str, f64, bool)> =
+        built.scalings.iter().map(|s| (s.parameter.as_str(), s.exponent, s.fixed)).collect();
     assert_eq!(
         got,
-        vec![
-            ("CL", 0.75, true),
-            ("Q", 0.75, true),
-            ("V1", 1.0, true),
-            ("V2", 1.0, true)
-        ]
+        vec![("CL", 0.75, true), ("Q", 0.75, true), ("V1", 1.0, true), ("V2", 1.0, true)]
     );
     let lines = built.model.block_lines("covariate_model");
     assert_eq!(
@@ -138,15 +127,10 @@ fn explicit_parameters_and_exponents_override_the_roles() {
 
 #[test]
 fn a_parameter_without_a_role_needs_an_explicit_exponent() {
-    let options = AllometryOptions {
-        parameters: Some(vec!["KA".into()]),
-        ..AllometryOptions::default()
-    };
+    let options =
+        AllometryOptions { parameters: Some(vec!["KA".into()]), ..AllometryOptions::default() };
     let e = allometric_model(&two_cpt(), &options).unwrap_err();
-    assert!(
-        e.contains("`KA` is bound to neither a clearance nor a volume role"),
-        "{e}"
-    );
+    assert!(e.contains("`KA` is bound to neither a clearance nor a volume role"), "{e}");
 }
 
 #[test]
@@ -159,10 +143,7 @@ fn unknown_parameter_and_unknown_covariate_are_named() {
     let e = allometric_model(&two_cpt(), &options).unwrap_err();
     assert!(e.contains("`VMAX` is not an individual parameter"), "{e}");
 
-    let options = AllometryOptions {
-        covariate: "BMI".into(),
-        ..AllometryOptions::default()
-    };
+    let options = AllometryOptions { covariate: "BMI".into(), ..AllometryOptions::default() };
     let e = allometric_model(&two_cpt(), &options).unwrap_err();
     assert!(e.contains("`BMI` is not a covariate"), "{e}");
 }
@@ -170,16 +151,9 @@ fn unknown_parameter_and_unknown_covariate_are_named() {
 #[test]
 fn a_parameter_already_scaled_on_the_covariate_is_left_alone() {
     // The shipped example declares CL ~ WT and V1 ~ WT (and CL ~ CRCL).
-    let built = allometric_model(
-        &base("two_cpt_oral_covmodel.ferx"),
-        &AllometryOptions::default(),
-    )
-    .unwrap();
-    let scaled: Vec<&str> = built
-        .scalings
-        .iter()
-        .map(|s| s.parameter.as_str())
-        .collect();
+    let built = allometric_model(&base("two_cpt_oral_covmodel.ferx"), &AllometryOptions::default())
+        .unwrap();
+    let scaled: Vec<&str> = built.scalings.iter().map(|s| s.parameter.as_str()).collect();
     assert_eq!(scaled, vec!["Q", "V2"]);
     assert_eq!(built.notes.len(), 2, "{:?}", built.notes);
     assert!(built.notes[0].contains("`CL` already carries a relation on `WT`"));
@@ -216,10 +190,7 @@ fn a_run_cancelled_before_it_starts_names_the_fit_it_never_made() {
         },
     )
     .unwrap_err();
-    assert!(
-        e.contains("the base model was not fitted (run cancelled)"),
-        "{e}"
-    );
+    assert!(e.contains("the base model was not fitted (run cancelled)"), "{e}");
 }
 
 #[test]
@@ -229,26 +200,13 @@ fn options_validate_their_shape() {
         exponents: Some(vec![0.75, 1.0]),
         ..AllometryOptions::default()
     };
-    assert!(bad
-        .validate()
-        .unwrap_err()
-        .contains("1 parameter but 2 exponents"));
-    let bad = AllometryOptions {
-        exponents: Some(vec![0.75]),
-        ..AllometryOptions::default()
-    };
+    assert!(bad.validate().unwrap_err().contains("1 parameter but 2 exponents"));
+    let bad = AllometryOptions { exponents: Some(vec![0.75]), ..AllometryOptions::default() };
     assert!(bad.validate().unwrap_err().contains("needs `parameters`"));
-    let bad = AllometryOptions {
-        reference: 0.0,
-        ..AllometryOptions::default()
-    };
+    let bad = AllometryOptions { reference: 0.0, ..AllometryOptions::default() };
     assert!(bad.validate().unwrap_err().contains("positive number"));
-    let bad = AllometryOptions {
-        fixed: false,
-        lower: 2.0,
-        upper: 1.0,
-        ..AllometryOptions::default()
-    };
+    let bad =
+        AllometryOptions { fixed: false, lower: 2.0, upper: 1.0, ..AllometryOptions::default() };
     assert!(bad.validate().unwrap_err().contains("must be below"));
 }
 

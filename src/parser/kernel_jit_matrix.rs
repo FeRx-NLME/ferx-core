@@ -100,12 +100,7 @@ fn at(n: usize, l: usize, i: usize, j: usize, p: usize) -> usize {
 /// `accumulate`: `i`, then `k`, then `j`), and skips a zero factor only where it does — when
 /// the row of `B` it multiplies is finite, so `0·∞ = NaN` reaches the result as it does there.
 fn mul_lanes(
-    n: usize,
-    l: usize,
-    kap: &[(usize, usize, usize, f64)],
-    a: &[f64],
-    b: &[f64],
-    c: &mut [f64],
+    n: usize, l: usize, kap: &[(usize, usize, usize, f64)], a: &[f64], b: &[f64], c: &mut [f64],
 ) {
     // Per lane `q` and row `m` of `B`: whether every entry is finite.
     let row_finite: Vec<bool> = (0..l * n)
@@ -186,7 +181,16 @@ impl MatSpec {
                 }
             }
         }
-        out[..nn * l].iter().all(|v| v.is_finite())
+        if out[..nn * l].iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        // An overflowed result is a point the value path cannot score either; a recording this
+        // call runs inside (a repeat body's record-time run) is told, so a failure it causes is
+        // repelled, while a singular solve (above) stays the point's.
+        if super::recording_open() {
+            super::note_nonfinite();
+        }
+        false
     }
 
     /// The reverse: `out_adj` the result's adjoints per seed, into `in_adj` per seed the two
@@ -194,12 +198,7 @@ impl MatSpec {
     /// [`Sweep::TangentReverse`] (one seed) the base layout's reverse with its tangents along
     /// `layout`'s blocks.
     pub(super) fn run_rev(
-        &self,
-        layout: Layout,
-        sweep: Sweep,
-        inputs: &[f64],
-        seeds: usize,
-        out_adj: &[f64],
+        &self, layout: Layout, sweep: Sweep, inputs: &[f64], seeds: usize, out_adj: &[f64],
         in_adj: &mut [f64],
     ) -> bool {
         let (n, l) = (self.n, layout.lanes());
@@ -248,14 +247,8 @@ impl MatSpec {
 /// `Ā_p += κ·C̄_L·B_qᵀ`, `B̄_q += κ·A_pᵀ·C̄_L` over `kap`: the reverse of [`mul_lanes`].
 #[allow(clippy::too_many_arguments)]
 fn mul_rev(
-    n: usize,
-    l: usize,
-    kap: &[(usize, usize, usize, f64)],
-    a: &[f64],
-    b: &[f64],
-    cb: &[f64],
-    abar: &mut [f64],
-    bbar: &mut [f64],
+    n: usize, l: usize, kap: &[(usize, usize, usize, f64)], a: &[f64], b: &[f64], cb: &[f64],
+    abar: &mut [f64], bbar: &mut [f64],
 ) {
     for &(ll, p, q, k) in kap {
         for i in 0..n {
@@ -278,15 +271,8 @@ fn mul_rev(
 /// and `Ā_{t,p} += κ·(C̄_{t,L}·B_{0,q} + C̄_{0,L}·B_{t,q})`, `B̄` alike.
 #[allow(clippy::too_many_arguments)]
 fn mul_rev_tangent(
-    n: usize,
-    l: usize,
-    lb: usize,
-    kap: &[(usize, usize, usize, f64)],
-    a: &[f64],
-    b: &[f64],
-    cb: &[f64],
-    abar: &mut [f64],
-    bbar: &mut [f64],
+    n: usize, l: usize, lb: usize, kap: &[(usize, usize, usize, f64)], a: &[f64], b: &[f64],
+    cb: &[f64], abar: &mut [f64], bbar: &mut [f64],
 ) {
     let tan = l / lb - 1;
     // The base table: the entries of `kap` inside block 0.
@@ -295,21 +281,15 @@ fn mul_rev_tangent(
         for i in 0..n {
             for j in 0..n {
                 for m in 0..n {
-                    let (cv, av, bv) = (
-                        cb[at(n, l, i, j, ll)],
-                        a[at(n, l, i, m, p)],
-                        b[at(n, l, m, j, q)],
-                    );
+                    let (cv, av, bv) =
+                        (cb[at(n, l, i, j, ll)], a[at(n, l, i, m, p)], b[at(n, l, m, j, q)]);
                     abar[at(n, l, i, m, p)] += k * cv * bv;
                     bbar[at(n, l, m, j, q)] += k * av * cv;
                     for t in 1..=tan {
                         let (tll, tp, tq) =
                             (tl(lb, tan, t, ll), tl(lb, tan, t, p), tl(lb, tan, t, q));
-                        let (ct, at_, bt) = (
-                            cb[at(n, l, i, j, tll)],
-                            a[at(n, l, i, m, tp)],
-                            b[at(n, l, m, j, tq)],
-                        );
+                        let (ct, at_, bt) =
+                            (cb[at(n, l, i, j, tll)], a[at(n, l, i, m, tp)], b[at(n, l, m, j, tq)]);
                         abar[at(n, l, i, m, tp)] += k * (ct * bv + cv * bt);
                         bbar[at(n, l, m, j, tq)] += k * (at_ * cv + av * ct);
                     }
@@ -369,14 +349,8 @@ fn transpose_lu(m: &[f64], n: usize, l: usize, lane: usize) -> Option<Lu> {
 /// over the equations `L' ≠ L` reading `X_L`), then `P̄_L = Λ_L` and `Q̄_p −= κ·Λ_{L'}·X_qᵀ`.
 #[allow(clippy::too_many_arguments)]
 fn solve_rev(
-    n: usize,
-    l: usize,
-    kap: &[(usize, usize, usize, f64)],
-    q: &[f64],
-    x: &[f64],
-    xb: &[f64],
-    qbar: &mut [f64],
-    pbar: &mut [f64],
+    n: usize, l: usize, kap: &[(usize, usize, usize, f64)], q: &[f64], x: &[f64], xb: &[f64],
+    qbar: &mut [f64], pbar: &mut [f64],
 ) -> bool {
     let nn = n * n;
     let Some(lu) = transpose_lu(q, n, l, 0) else {
@@ -435,15 +409,8 @@ fn solve_rev(
 /// then `P̄`, `Q̄` by the product rule.
 #[allow(clippy::too_many_arguments)]
 fn solve_rev_tangent(
-    n: usize,
-    l: usize,
-    lb: usize,
-    layout: Layout,
-    q: &[f64],
-    x: &[f64],
-    xb: &[f64],
-    qbar: &mut [f64],
-    pbar: &mut [f64],
+    n: usize, l: usize, lb: usize, layout: Layout, q: &[f64], x: &[f64], xb: &[f64],
+    qbar: &mut [f64], pbar: &mut [f64],
 ) -> bool {
     let nn = n * n;
     let tan = l / lb - 1;
@@ -455,9 +422,7 @@ fn solve_rev_tangent(
     let mut rhs = vec![0.0; nn];
     // `Σ_m Q[m][i]·Λ[m][j]` of two lanes.
     let qt_lam = |qo: usize, lo: usize, lam: &[f64], i: usize, j: usize| -> f64 {
-        (0..n)
-            .map(|m| q[at(n, l, m, i, qo)] * lam[at(n, l, m, j, lo)])
-            .sum()
+        (0..n).map(|m| q[at(n, l, m, i, qo)] * lam[at(n, l, m, j, lo)]).sum()
     };
     let lt_ = |blk: usize, i: usize| tl(lb, tan, blk, i);
     for blk in 0..=tan {
