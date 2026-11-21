@@ -52,24 +52,14 @@ fn accepted(prescreen: bool) -> (Vec<String>, f64, Vec<String>) {
     let result = run_ruvsearch(
         &config,
         &base,
-        RuvsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..RuvsearchRun::default()
-        },
+        RuvsearchRun { dir: Some(dir.path().join("run")), ..RuvsearchRun::default() },
     )
     .expect("search");
-    (
-        result.features.iter().map(|f| pair_key(*f)).collect(),
-        result.final_ofv,
-        result.notes.clone(),
-    )
+    (result.features.iter().map(|f| pair_key(*f)).collect(), result.final_ofv, result.notes.clone())
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_prescreen_and_the_full_refit_select_the_same_feature() {
     let (full, full_ofv, full_notes) = accepted(false);
     let (screened, screened_ofv, screened_notes) = accepted(true);
@@ -82,8 +72,5 @@ fn the_prescreen_and_the_full_refit_select_the_same_feature() {
     );
     // Near-equivalent in shape: the two members of the pair land within a
     // couple of OFV units of each other.
-    assert!(
-        (full_ofv - screened_ofv).abs() < 2.0,
-        "{full_ofv} vs {screened_ofv}"
-    );
+    assert!((full_ofv - screened_ofv).abs() < 2.0, "{full_ofv} vs {screened_ofv}");
 }

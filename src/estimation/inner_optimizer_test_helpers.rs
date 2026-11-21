@@ -10,9 +10,7 @@ use crate::types::{CompiledModel, FitOptions, Optimizer, Population};
 
 /// A model file and its data, loaded as `fit` would, cut to the first `n_subj` subjects.
 pub(crate) fn load_iov_fixture(
-    src: &str,
-    data: &str,
-    n_subj: usize,
+    src: &str, data: &str, n_subj: usize,
 ) -> (CompiledModel, Population, FitOptions) {
     let parsed = crate::parser::model_parser::parse_full_model(src).expect("model parses");
     let (mut pop, _) = crate::api::read_population_for(
@@ -71,10 +69,7 @@ pub(crate) fn warfarin_iov_ode_fixture() -> (CompiledModel, Population, FitOptio
         1,
     );
     let (model, mut pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 2);
-    assert!(
-        model.ode_spec.is_some() && model.n_kappa > 0,
-        "fixture: must be an ODE + IOV model"
-    );
+    assert!(model.ode_spec.is_some() && model.n_kappa > 0, "fixture: must be an ODE + IOV model");
     let mut no_occ = pop.subjects[0].clone();
     no_occ.id = "NO_OCC".into();
     no_occ.occasions.clear();
@@ -99,21 +94,17 @@ pub(crate) fn nested_levels_fixture() -> (CompiledModel, Population, FitOptions)
 /// debug build, so its test drives the first evaluation directly.
 pub(crate) fn kappa_correlation_fixture() -> (CompiledModel, Population, FitOptions) {
     let src = include_str!("../../examples/warfarin_iov.ferx");
-    let (sigma, error) = (
-        "  sigma PROP_ERR ~ 0.2 (sd)\n",
-        "  DV ~ proportional(PROP_ERR)\n",
-    );
+    let (sigma, error) = ("  sigma PROP_ERR ~ 0.2 (sd)\n", "  DV ~ proportional(PROP_ERR)\n");
     for anchor in [sigma, error] {
         assert_eq!(src.matches(anchor).count(), 1, "anchor {anchor:?} moved");
     }
-    let src = src
-        .replacen(sigma, &format!("{sigma}  theta RHO(0.3, -0.99, 0.99)\n"), 1)
-        .replacen(error, &format!("{error}  correlation ar1(RHO) by OCC\n"), 1);
-    let (model, pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 3);
-    assert!(
-        model.residual_serial.is_some(),
-        "fixture: the correlation line must reach the model"
+    let src = src.replacen(sigma, &format!("{sigma}  theta RHO(0.3, -0.99, 0.99)\n"), 1).replacen(
+        error,
+        &format!("{error}  correlation ar1(RHO) by OCC\n"),
+        1,
     );
+    let (model, pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 3);
+    assert!(model.residual_serial.is_some(), "fixture: the correlation line must reach the model");
     // ...and the data: with every `obs_rgroup` 0 the correlation is inert and this is
     // plain `warfarin_iov` again (measured: 11 rows in group 1, 11 in group 2).
     for s in &pop.subjects {
@@ -152,20 +143,10 @@ pub(crate) fn on_one_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 ///
 /// `label` names the call site, so a failure says which site lost κ̂.
 pub(crate) fn assert_starts_at_modes(
-    label: &str,
-    rec: &InnerRecording,
-    select: impl Fn(&IovStart) -> bool,
-    pop: &Population,
-    etas: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
+    label: &str, rec: &InnerRecording, select: impl Fn(&IovStart) -> bool, pop: &Population,
+    etas: &[DVector<f64>], kappas: &[Vec<DVector<f64>>],
 ) -> usize {
-    assert_these_start_at_modes(
-        label,
-        rec.starts.iter().filter(|s| select(s)),
-        pop,
-        etas,
-        kappas,
-    )
+    assert_these_start_at_modes(label, rec.starts.iter().filter(|s| select(s)), pop, etas, kappas)
 }
 
 /// #2261, the invariant over a whole fit: every population pass of `rec` that is handed
@@ -174,9 +155,7 @@ pub(crate) fn assert_starts_at_modes(
 /// number of such (pass, subject) pairs, which must be positive. A site that hands `η̂`
 /// alone fails here, naming the pass.
 pub(crate) fn assert_every_warm_pass_is_joint(
-    label: &str,
-    rec: &InnerRecording,
-    model: &CompiledModel,
+    label: &str, rec: &InnerRecording, model: &CompiledModel,
 ) -> usize {
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let n_eta = model.n_eta;
@@ -203,10 +182,7 @@ pub(crate) fn assert_every_warm_pass_is_joint(
             .iter()
             .find(|s| s.pass == Some(p.pass) && s.subject == p.subject)
             .unwrap_or_else(|| {
-                panic!(
-                    "{label}: pass {} subject {}: no IOV start",
-                    p.pass, p.subject
-                )
+                panic!("{label}: pass {} subject {}: no IOV start", p.pass, p.subject)
             });
         let got: Vec<u64> = start.kappas.iter().flat_map(|c| bits(c)).collect();
         assert_eq!(
@@ -229,10 +205,7 @@ pub(crate) fn assert_every_warm_pass_is_joint(
 /// run at `stage_tol`, which is neither. Returns the number of solves at the stencil
 /// tolerance, which must be positive.
 pub(crate) fn assert_solves_at_stencil_tol(
-    label: &str,
-    rec: &InnerRecording,
-    select: impl Fn(&str) -> bool,
-    stage_tol: f64,
+    label: &str, rec: &InnerRecording, select: impl Fn(&str) -> bool, stage_tol: f64,
 ) -> usize {
     let want = super::stencil_inner_tol(stage_tol);
     let twin = crate::estimation::fd_resolution::tight_tol(want);
@@ -260,26 +233,18 @@ pub(crate) fn assert_solves_at_stencil_tol(
 /// earlier mode while its κ block matches none is the defect this exists to catch, and the
 /// message says so.
 pub(crate) fn assert_starts_at_previous_modes(
-    label: &str,
-    rec: &InnerRecording,
-    select: impl Fn(&IovStart) -> bool,
+    label: &str, rec: &InnerRecording, select: impl Fn(&IovStart) -> bool,
 ) -> usize {
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let mut checked = 0;
     for s in rec.starts.iter().filter(|s| select(s)) {
-        let earlier: Vec<_> = rec.ends[..s.ends_before]
-            .iter()
-            .filter(|e| e.subject == s.subject)
-            .collect();
+        let earlier: Vec<_> =
+            rec.ends[..s.ends_before].iter().filter(|e| e.subject == s.subject).collect();
         let eta_matches: Vec<_> = earlier
             .iter()
             .filter(|e| {
-                let psi: Vec<u64> = e
-                    .eta
-                    .iter()
-                    .zip(&s.mu)
-                    .map(|(a, m)| (a + m).to_bits())
-                    .collect();
+                let psi: Vec<u64> =
+                    e.eta.iter().zip(&s.mu).map(|(a, m)| (a + m).to_bits()).collect();
                 psi == bits(&s.psi)
             })
             .collect();
@@ -317,11 +282,8 @@ pub(crate) fn assert_starts_at_previous_modes(
 /// [`assert_starts_at_modes`] over an explicit list of starts, for a caller that selects
 /// them by position.
 pub(crate) fn assert_these_start_at_modes<'a>(
-    label: &str,
-    starts: impl IntoIterator<Item = &'a IovStart>,
-    pop: &Population,
-    etas: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
+    label: &str, starts: impl IntoIterator<Item = &'a IovStart>, pop: &Population,
+    etas: &[DVector<f64>], kappas: &[Vec<DVector<f64>>],
 ) -> usize {
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let mut checked = 0;
@@ -340,11 +302,8 @@ pub(crate) fn assert_these_start_at_modes<'a>(
             "{label}: subject {}: fixture: every κ̂ is 0, so a dropped κ block cannot show",
             s.subject
         );
-        let want_psi: Vec<u64> = etas[i]
-            .iter()
-            .zip(&s.mu)
-            .map(|(e, m)| (e + m).to_bits())
-            .collect();
+        let want_psi: Vec<u64> =
+            etas[i].iter().zip(&s.mu).map(|(e, m)| (e + m).to_bits()).collect();
         assert_eq!(
             bits(&s.psi),
             want_psi,

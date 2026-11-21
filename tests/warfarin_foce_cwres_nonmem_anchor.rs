@@ -31,17 +31,9 @@ use ferx_core::{fit, prepare_run, EstimationMethod, FitOptions, FitResult, Omega
 
 /// NONMEM's final `.ext` row (`-1000000000`), anchor build. Column order there is THETA,
 /// SIGMA(1,1), then the OMEGA lower triangle.
-const NM_THETA: [f64; 3] = [
-    1.3296190773543662E-01,
-    7.7305172240926252E+00,
-    7.2537506677117802E-01,
-];
+const NM_THETA: [f64; 3] = [1.3296190773543662E-01, 7.7305172240926252E+00, 7.2537506677117802E-01];
 const NM_SIGMA_VAR: f64 = 1.1548425869877831E-04;
-const NM_OMEGA: [f64; 3] = [
-    2.8596520575084699E-02,
-    9.5781911176013226E-03,
-    3.4881225592887283E-01,
-];
+const NM_OMEGA: [f64; 3] = [2.8596520575084699E-02, 9.5781911176013226E-03, 3.4881225592887283E-01];
 const NM_OFV: f64 = -280.35950111582304;
 
 /// Bounds, from the realised errors since #1722 (macOS arm64; the PR's Linux CI runs this
@@ -65,10 +57,7 @@ fn nonmem_obs() -> Vec<(String, f64, f64)> {
     text.lines()
         .skip(2)
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
             assert_eq!(c.len(), 5, "ID TIME EVID CWRES PRED");
             c
         })
@@ -85,19 +74,13 @@ fn run_at_nonmem_point(opts: FitOptions) -> FitResult {
     init.omega = OmegaMatrix::from_diagonal(&NM_OMEGA, init.omega.eta_names.clone());
     // ferx's proportional sigma is an SD; NONMEM's SIGMA is the variance.
     init.sigma.values = vec![NM_SIGMA_VAR.sqrt()];
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..opts
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..opts };
     fit(&prep.parsed.model, &prep.population, &init, &opts).expect("fit must run")
 }
 
 fn assert_matches_nonmem(label: &str, r: &FitResult) {
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "{label}: fixture left the analytic path: {:?}",
         r.warnings
     );
@@ -106,12 +89,7 @@ fn assert_matches_nonmem(label: &str, r: &FitResult) {
     let got: Vec<(String, f64, f64)> = r
         .subjects
         .iter()
-        .flat_map(|s| {
-            s.cwres
-                .iter()
-                .zip(&s.pred)
-                .map(move |(&c, &p)| (s.id.clone(), c, p))
-        })
+        .flat_map(|s| s.cwres.iter().zip(&s.pred).map(move |(&c, &p)| (s.id.clone(), c, p)))
         .collect();
     assert_eq!(got.len(), want.len(), "{label}: observation count");
     let (mut worst_c, mut worst_p) = (0.0_f64, 0.0_f64);
@@ -135,33 +113,20 @@ fn assert_matches_nonmem(label: &str, r: &FitResult) {
         worst_p < PRED_TOL,
         "{label}: PRED off NONMEM by {worst_p:e} — the point or row order is wrong"
     );
-    assert!(
-        r.ofv.is_finite() && d_ofv < OFV_TOL,
-        "{label}: OFV {} vs NONMEM {NM_OFV}",
-        r.ofv
-    );
+    assert!(r.ofv.is_finite() && d_ofv < OFV_TOL, "{label}: OFV {} vs NONMEM {NM_OFV}", r.ofv);
     assert!(
         worst_c < CWRES_TOL,
         "{label}: CWRES off NONMEM FOCE by {worst_c:e} (> {CWRES_TOL}): the residual pass is \
          not scoring the FOCE marginal"
     );
-    assert!(
-        !r.interaction,
-        "{label}: a FOCE fit must record interaction = false"
-    );
+    assert!(!r.interaction, "{label}: a FOCE fit must record interaction = false");
 }
 
 /// Arm (b): API-built FOCE options, `interaction` left at the `true` default.
 #[test]
 fn foce_cwres_matches_nonmem_api_options() {
-    let opts = FitOptions {
-        method: EstimationMethod::Foce,
-        ..FitOptions::default()
-    };
-    assert!(
-        opts.interaction,
-        "fixture premise: API default interaction = true"
-    );
+    let opts = FitOptions { method: EstimationMethod::Foce, ..FitOptions::default() };
+    assert!(opts.interaction, "fixture premise: API default interaction = true");
     assert_matches_nonmem("api", &run_at_nonmem_point(opts));
 }
 

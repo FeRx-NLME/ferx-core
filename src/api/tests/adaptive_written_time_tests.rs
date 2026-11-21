@@ -65,11 +65,7 @@ fn assert_restart_premise(pop: &Population) {
     let s = &pop.subjects[0];
     assert_eq!(s.reset_times, [SHIFT], "engine reset time");
     assert_eq!(s.obs_times, [6.0, 24.0, 31.0], "engine observation times");
-    assert_eq!(
-        s.obs_raw_times,
-        [6.0, 24.0, 6.0],
-        "written observation times"
-    );
+    assert_eq!(s.obs_raw_times, [6.0, 24.0, 6.0], "written observation times");
 }
 
 /// The decision hook (`[scaling]` readout arm). Decisions at 6 (first period, both clocks
@@ -144,11 +140,7 @@ fn window_auc_integrates_the_written_time_after_a_restart() {
     let decisions = [0.0, 10.0, SHIFT, 37.0];
     let spec = fixed_dose_spec(Some("1000.0 * TIME"), &decisions, 100.0);
     let half_sq = |a: f64, b: f64| 1000.0 * (b * b - a * a) / 2.0;
-    let want = [
-        half_sq(0.0, 10.0),
-        half_sq(10.0, 25.0),
-        half_sq(0.0, 37.0 - SHIFT),
-    ];
+    let want = [half_sq(0.0, 10.0), half_sq(10.0, 25.0), half_sq(0.0, 37.0 - SHIFT)];
     let engine_clock = [half_sq(0.0, 10.0), half_sq(10.0, 25.0), half_sq(25.0, 37.0)];
     assert_distinct(
         &want[2..],
@@ -156,15 +148,7 @@ fn window_auc_integrates_the_written_time_after_a_restart() {
         AUC_TOL,
         "the restarted window, written vs engine clock",
     );
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        1,
-        &want,
-        AUC_TOL,
-        "observe = 1000·TIME across a restart",
-    );
+    assert_window_aucs(&m, &pop, &spec, 1, &want, AUC_TOL, "observe = 1000·TIME across a restart");
 }
 
 /// The same readout with the restart **strictly inside** a window, and the next window
@@ -237,29 +221,13 @@ fn observe_reads_the_written_time_at_decisions_including_one_on_the_reset() {
     assert_restart_premise(&pop);
     let decisions = [0.0, SHIFT, 31.0];
     let spec = fixed_dose_spec(Some("1000.0 * TIME"), &decisions, 100.0);
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(1),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(1), ..Default::default() };
     let res = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &opts)
         .expect("spec run");
-    let got: Vec<f64> = res
-        .decisions
-        .iter()
-        .map(|d| d.observed_signals[0].value)
-        .collect();
+    let got: Vec<f64> = res.decisions.iter().map(|d| d.observed_signals[0].value).collect();
     let want = [0.0, 0.0, 6000.0];
     let engine_clock = [0.0, 25_000.0, 31_000.0];
-    assert_eq!(
-        want[0], engine_clock[0],
-        "the control decision: both clocks agree"
-    );
-    assert!(want[1..]
-        .iter()
-        .zip(&engine_clock[1..])
-        .all(|(w, e)| w != e));
-    assert_eq!(
-        got, want,
-        "observe = 1000·TIME at decisions 0 / 25 (the reset) / 31"
-    );
+    assert_eq!(want[0], engine_clock[0], "the control decision: both clocks agree");
+    assert!(want[1..].iter().zip(&engine_clock[1..]).all(|(w, e)| w != e));
+    assert_eq!(got, want, "observe = 1000·TIME at decisions 0 / 25 (the reset) / 31");
 }

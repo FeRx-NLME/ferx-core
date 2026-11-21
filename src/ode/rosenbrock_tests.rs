@@ -111,12 +111,7 @@ fn observed_order(method: OdeMethod, coarse: usize, refinements: usize) -> f64 {
 fn interpolant_local_error(method: OdeMethod, h: f64) -> f64 {
     let mut stepper = crate::ode::solver::make_stepper::<f64>(2, method);
     stepper.set_dense_required(true);
-    let opts = OdeSolverOptions {
-        abstol: 1e-14,
-        reltol: 1e-12,
-        method,
-        ..Default::default()
-    };
+    let opts = OdeSolverOptions { abstol: 1e-14, reltol: 1e-12, method, ..Default::default() };
     // Start away from t = 0 so the problem's non-autonomous terms are active.
     let t0 = 0.3;
     let u = order_exact(t0).to_vec();
@@ -178,16 +173,10 @@ fn interpolant_orders_pin_the_dense_output_blocks() {
 #[test]
 fn rodas4_converges_at_fourth_order() {
     let order = observed_order(OdeMethod::Rodas4, 50, 3);
-    assert!(
-        (3.3..4.6).contains(&order),
-        "Rodas4 observed order {order:.2} outside [3.3, 4.6]"
-    );
+    assert!((3.3..4.6).contains(&order), "Rodas4 observed order {order:.2} outside [3.3, 4.6]");
     // Absolute accuracy pins the coefficients themselves, not just their order.
     let (err, _) = fixed_step_run(OdeMethod::Rodas4, 100);
-    assert!(
-        err < 5e-8,
-        "Rodas4 error at h=0.02 was {err:.3e}, expected < 5e-8"
-    );
+    assert!(err < 5e-8, "Rodas4 error at h=0.02 was {err:.3e}, expected < 5e-8");
 }
 
 /// Rodas5P must converge at ~5th order and be sharply more accurate than Rodas4 at the same
@@ -195,10 +184,7 @@ fn rodas4_converges_at_fourth_order() {
 #[test]
 fn rodas5p_converges_at_fifth_order() {
     let order = observed_order(OdeMethod::Rodas5P, 25, 3);
-    assert!(
-        (4.0..5.7).contains(&order),
-        "Rodas5P observed order {order:.2} outside [4.0, 5.7]"
-    );
+    assert!((4.0..5.7).contains(&order), "Rodas5P observed order {order:.2} outside [4.0, 5.7]");
     let (err5p, _) = fixed_step_run(OdeMethod::Rodas5P, 100);
     let (err4, _) = fixed_step_run(OdeMethod::Rodas4, 100);
     assert!(err5p < 1e-9, "Rodas5P error at h=0.02 was {err5p:.3e}");
@@ -250,18 +236,12 @@ fn vern7_converges_at_seventh_order() {
     // Two refinements only, because an order-7 method reaches round-off almost immediately.
     // Measures 7.69 on this problem; the band is set around that rather than left wide.
     let order = observed_order(OdeMethod::Vern7, 60, 2);
-    assert!(
-        (6.5..8.2).contains(&order),
-        "Vern7 observed order {order:.2} outside [6.5, 8.2]"
-    );
+    assert!((6.5..8.2).contains(&order), "Vern7 observed order {order:.2} outside [6.5, 8.2]");
     // At a step size where RK45 is still far off, the higher order must already show: this is
     // the accuracy-per-step advantage the tight-tolerance regime buys.
     let (err7, _) = fixed_step_run(OdeMethod::Vern7, 50);
     let (err45, _) = fixed_step_run(OdeMethod::Rk45, 50);
-    assert!(
-        err7 < err45,
-        "Vern7 ({err7:.3e}) should beat RK45 ({err45:.3e}) per step at h=0.04"
-    );
+    assert!(err7 < err45, "Vern7 ({err7:.3e}) should beat RK45 ({err45:.3e}) per step at h=0.04");
 }
 
 /// **Structural** verification of the transcribed Rosenbrock tableaus, independent of any
@@ -340,11 +320,7 @@ fn stiff_methods_match_rk45_on_a_nonstiff_pk_model() {
         (0.0, 24.0),
         &PK_PARAMS,
         &saveat,
-        &OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..Default::default()
-        },
+        &OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..Default::default() },
     );
 
     // (method, reltol, abstol, max_steps, tolerance vs RK45). Rosenbrock23 is 2nd order, so
@@ -361,13 +337,7 @@ fn stiff_methods_match_rk45_on_a_nonstiff_pk_model() {
             (0.0, 24.0),
             &PK_PARAMS,
             &saveat,
-            &OdeSolverOptions {
-                abstol,
-                reltol,
-                max_steps,
-                method,
-                ..Default::default()
-            },
+            &OdeSolverOptions { abstol, reltol, max_steps, method, ..Default::default() },
         );
         assert_eq!(got.len(), saveat.len(), "{method:?} lost save points");
         for (g, r) in got.iter().zip(reference.iter()) {
@@ -384,32 +354,15 @@ fn stiff_methods_match_rk45_on_a_nonstiff_pk_model() {
 #[test]
 fn saveat_contract_matches_rk45() {
     let saveat = pk_saveat();
-    let opts = OdeSolverOptions {
-        method: OdeMethod::Rodas4,
-        ..Default::default()
-    };
-    let got = solve_ode(
-        &pk_rhs::<f64>,
-        &PK_U0,
-        (0.0, 24.0),
-        &PK_PARAMS,
-        &saveat,
-        &opts,
-    );
+    let opts = OdeSolverOptions { method: OdeMethod::Rodas4, ..Default::default() };
+    let got = solve_ode(&pk_rhs::<f64>, &PK_U0, (0.0, 24.0), &PK_PARAMS, &saveat, &opts);
     assert_eq!(got.len(), saveat.len());
     for (g, &t) in got.iter().zip(saveat.iter()) {
         assert_relative_eq!(g.t, t, epsilon = 1e-12);
         assert_eq!(g.u.len(), PK_U0.len());
     }
 
-    let zero_span = solve_ode(
-        &pk_rhs::<f64>,
-        &PK_U0,
-        (3.0, 3.0),
-        &PK_PARAMS,
-        &saveat,
-        &opts,
-    );
+    let zero_span = solve_ode(&pk_rhs::<f64>, &PK_U0, (3.0, 3.0), &PK_PARAMS, &saveat, &opts);
     assert_eq!(zero_span.len(), saveat.len());
     for p in &zero_span {
         assert_eq!(p.u, PK_U0.to_vec());
@@ -431,18 +384,8 @@ fn scalar_and_generic_drivers_agree_bit_for_bit() {
         OdeMethod::Rodas4,
         OdeMethod::Rodas5P,
     ] {
-        let opts = OdeSolverOptions {
-            method,
-            ..Default::default()
-        };
-        let scalar = solve_ode(
-            &pk_rhs::<f64>,
-            &PK_U0,
-            (0.0, 24.0),
-            &PK_PARAMS,
-            &saveat,
-            &opts,
-        );
+        let opts = OdeSolverOptions { method, ..Default::default() };
+        let scalar = solve_ode(&pk_rhs::<f64>, &PK_U0, (0.0, 24.0), &PK_PARAMS, &saveat, &opts);
         let generic = crate::ode::solver::solve_ode_g::<f64>(
             &pk_rhs::<f64>,
             &PK_U0,
@@ -472,10 +415,7 @@ fn interpolant_is_continuous_with_the_saved_states() {
         OdeMethod::Rodas4,
         OdeMethod::Rodas5P,
     ] {
-        let opts = OdeSolverOptions {
-            method,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method, ..Default::default() };
         let (hard, soft) = crate::ode::solver::solve_ode_dense(
             &pk_rhs::<f64>,
             &PK_U0,
@@ -512,10 +452,7 @@ fn soft_sampling_does_not_perturb_the_step_sequence() {
         OdeMethod::Rodas4,
         OdeMethod::Rodas5P,
     ] {
-        let opts = OdeSolverOptions {
-            method,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method, ..Default::default() };
         let (hard_with, soft) = crate::ode::solver::solve_ode_dense(
             &pk_rhs::<f64>,
             &PK_U0,
@@ -526,19 +463,9 @@ fn soft_sampling_does_not_perturb_the_step_sequence() {
             &opts,
             None,
         );
-        let without = solve_ode(
-            &pk_rhs::<f64>,
-            &PK_U0,
-            (0.0, 24.0),
-            &PK_PARAMS,
-            &saveat,
-            &opts,
-        );
+        let without = solve_ode(&pk_rhs::<f64>, &PK_U0, (0.0, 24.0), &PK_PARAMS, &saveat, &opts);
         for (a, b) in hard_with.iter().zip(without.iter()) {
-            assert_eq!(
-                a.u, b.u,
-                "{method:?}: requesting soft samples changed the hard saves"
-            );
+            assert_eq!(a.u, b.u, "{method:?}: requesting soft samples changed the hard saves");
         }
 
         assert_eq!(soft.len(), interp_at.len());
@@ -546,12 +473,7 @@ fn soft_sampling_does_not_perturb_the_step_sequence() {
         // Accuracy of the interpolant itself, isolated from solver error: run *both* sides at
         // a tight tolerance, so what remains is the continuous extension's own error against a
         // solve that lands on those times exactly.
-        let tight = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            method,
-            ..Default::default()
-        };
+        let tight = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, method, ..Default::default() };
         let (_, soft_tight) = crate::ode::solver::solve_ode_dense(
             &pk_rhs::<f64>,
             &PK_U0,
@@ -562,14 +484,7 @@ fn soft_sampling_does_not_perturb_the_step_sequence() {
             &tight,
             None,
         );
-        let landed = solve_ode(
-            &pk_rhs::<f64>,
-            &PK_U0,
-            (0.0, 24.0),
-            &PK_PARAMS,
-            &interp_at,
-            &tight,
-        );
+        let landed = solve_ode(&pk_rhs::<f64>, &PK_U0, (0.0, 24.0), &PK_PARAMS, &interp_at, &tight);
         // Interpolant accuracy is a property of the *continuous extension*, not of the step.
         // Rodas4/Rodas5P carry order-matched extensions and RK45's cubic Hermite matches its
         // own order well enough; Vern7 reads through the same cubic Hermite while its steps
@@ -666,11 +581,7 @@ fn rosenbrock_solves_a_stiff_binding_system_that_exhausts_rk45() {
          premise of this test no longer holds"
     );
 
-    for method in [
-        OdeMethod::Rosenbrock23,
-        OdeMethod::Rodas4,
-        OdeMethod::Rodas5P,
-    ] {
+    for method in [OdeMethod::Rosenbrock23, OdeMethod::Rodas4, OdeMethod::Rodas5P] {
         let mut stats = OdeSolverStats::default();
         let got = solve_ode_with_stats(
             &binding_rhs,
@@ -678,12 +589,7 @@ fn rosenbrock_solves_a_stiff_binding_system_that_exhausts_rk45() {
             (0.0, 24.0),
             &[],
             &saveat,
-            &OdeSolverOptions {
-                abstol: 1e-10,
-                reltol: 1e-8,
-                method,
-                ..Default::default()
-            },
+            &OdeSolverOptions { abstol: 1e-10, reltol: 1e-8, method, ..Default::default() },
             Some(&mut stats),
         );
         assert!(
@@ -720,14 +626,7 @@ fn dual_value_part_matches_the_scalar_solve() {
         method: OdeMethod::Rodas4,
         ..Default::default()
     };
-    let scalar = solve_ode(
-        &pk_rhs::<f64>,
-        &PK_U0,
-        (0.0, 24.0),
-        &PK_PARAMS,
-        &saveat,
-        &opts,
-    );
+    let scalar = solve_ode(&pk_rhs::<f64>, &PK_U0, (0.0, 24.0), &PK_PARAMS, &saveat, &opts);
 
     let params: Vec<Dual2<2>> = vec![
         Dual2::<2>::var(PK_PARAMS[0], 0),
@@ -796,12 +695,7 @@ fn dual_gradients_match_finite_differences_of_the_scalar_solve() {
         for (k, d) in dual.iter().enumerate() {
             for state in 0..PK_U0.len() {
                 let fd = (sol_hi[k].u[state] - sol_lo[k].u[state]) / (2.0 * h);
-                assert_relative_eq!(
-                    d.u[state].grad[dim],
-                    fd,
-                    max_relative = 1e-4,
-                    epsilon = 1e-8
-                );
+                assert_relative_eq!(d.u[state].grad[dim], fd, max_relative = 1e-4, epsilon = 1e-8);
             }
         }
     }
@@ -816,12 +710,7 @@ fn dual_dense_path_interpolates_values_and_derivatives() {
     let saveat = pk_saveat();
     let interp_at = vec![0.9, 5.5, 17.25];
     for method in [OdeMethod::Rk45, OdeMethod::Rodas5P] {
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            method,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, method, ..Default::default() };
         let params: Vec<Dual2<2>> = vec![
             Dual2::<2>::var(PK_PARAMS[0], 0),
             Dual2::<2>::from_f64(PK_PARAMS[1]),
@@ -913,27 +802,16 @@ fn non_finite_rhs_terminates_and_pads_the_tail() {
         (0.0, 2.0),
         &[],
         &saveat,
-        &OdeSolverOptions {
-            method: OdeMethod::Rodas4,
-            ..Default::default()
-        },
+        &OdeSolverOptions { method: OdeMethod::Rodas4, ..Default::default() },
         Some(&mut stats),
     );
     assert_eq!(got.len(), saveat.len(), "tail must still be padded");
-    assert!(
-        stats.attempted_steps < 10_000,
-        "expected an early break, not a full step budget"
-    );
+    assert!(stats.attempted_steps < 10_000, "expected an early break, not a full step budget");
     // The pre-divergence save is still the correct decay value.
     assert_relative_eq!(got[0].u[0], (-0.25_f64).exp(), max_relative = 1e-4);
     // The padded points carry a state (NaN lanes, a diverged stop), not an empty one.
     for p in &got[1..] {
-        assert_eq!(
-            p.u.len(),
-            1,
-            "t = {}: a padded point carries the state",
-            p.t
-        );
+        assert_eq!(p.u.len(), 1, "t = {}: a padded point carries the state", p.t);
         assert!(p.u[0].is_nan(), "t = {}: diverged pads with NaN", p.t);
     }
 }
@@ -954,20 +832,14 @@ fn a_step_budget_stop_pads_the_unreached_saveat_times_with_the_last_state() {
         (0.0, 2000.0),
         &[],
         &saveat,
-        &OdeSolverOptions {
-            max_steps: 3,
-            ..Default::default()
-        },
+        &OdeSolverOptions { max_steps: 3, ..Default::default() },
     );
     assert_eq!(got.len(), saveat.len());
     for p in &got {
         assert_eq!(p.u.len(), 1, "t = {}: one entry per component", p.t);
         assert!(p.u[0].is_finite(), "t = {}: {}", p.t, p.u[0]);
     }
-    assert_eq!(
-        got[1].u[0], got[2].u[0],
-        "the unreached times carry the same last state"
-    );
+    assert_eq!(got[1].u[0], got[2].u[0], "the unreached times carry the same last state");
 }
 
 /// A zero-state system is a degenerate but reachable configuration (a model whose ODE block
@@ -982,10 +854,7 @@ fn empty_state_vector_is_handled() {
         (0.0, 2.0),
         &[],
         &saveat,
-        &OdeSolverOptions {
-            method: OdeMethod::Rodas5P,
-            ..Default::default()
-        },
+        &OdeSolverOptions { method: OdeMethod::Rodas5P, ..Default::default() },
     );
     assert_eq!(got.len(), saveat.len());
     assert!(got.iter().all(|p| p.u.is_empty()));
@@ -1014,13 +883,8 @@ fn fit_option_reaches_the_compiled_solver_options() {
 [fit_options]
   ode_method = rodas4
 ";
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("model must parse")
-        .model;
-    assert_eq!(
-        model.ode_spec.as_ref().unwrap().solver_opts.method,
-        OdeMethod::Rodas4
-    );
+    let model = crate::parser::model_parser::parse_full_model(src).expect("model must parse").model;
+    assert_eq!(model.ode_spec.as_ref().unwrap().solver_opts.method, OdeMethod::Rodas4);
 }
 
 /// The TTE **event-time sampler** localizes a hazard crossing *inside* a step. It now does so
@@ -1041,10 +905,7 @@ fn event_time_sampler_works_for_every_method() {
         OdeMethod::Rodas4,
         OdeMethod::Rodas5P,
     ] {
-        let opts = OdeSolverOptions {
-            method,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method, ..Default::default() };
         let mut u = [0.0];
         match solve_ode_until_threshold(&rhs, &mut u, (0.0, 10.0), &[], &opts, 0, 1.0) {
             ThresholdCrossing::Crossed(t) => {
@@ -1114,11 +975,7 @@ fn nan_rhs(_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
 /// clean `min_step_clamped_steps == 0` a healthy one does.
 #[test]
 fn a_stalled_rosenbrock_step_reports_a_min_step_clamp() {
-    for method in [
-        OdeMethod::Rosenbrock23,
-        OdeMethod::Rodas4,
-        OdeMethod::Rodas5P,
-    ] {
+    for method in [OdeMethod::Rosenbrock23, OdeMethod::Rodas4, OdeMethod::Rodas5P] {
         let mut stats = OdeSolverStats::default();
         let saveat = [0.5, 1.0];
         let got = solve_ode_with_stats(
@@ -1127,10 +984,7 @@ fn a_stalled_rosenbrock_step_reports_a_min_step_clamp() {
             (0.0, 1.0),
             &[],
             &saveat,
-            &OdeSolverOptions {
-                method,
-                ..Default::default()
-            },
+            &OdeSolverOptions { method, ..Default::default() },
             Some(&mut stats),
         );
 
@@ -1163,18 +1017,11 @@ fn counting_rhs<'a>(
 #[test]
 fn a_rejected_step_reuses_the_jacobian() {
     const N: usize = 2;
-    for method in [
-        OdeMethod::Rosenbrock23,
-        OdeMethod::Rodas4,
-        OdeMethod::Rodas5P,
-    ] {
+    for method in [OdeMethod::Rosenbrock23, OdeMethod::Rodas4, OdeMethod::Rodas5P] {
         let calls = std::cell::Cell::new(0usize);
         let rhs = counting_rhs(&calls);
         let mut stepper = crate::ode::solver::make_stepper::<f64>(N, method);
-        let opts = OdeSolverOptions {
-            method,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method, ..Default::default() };
         let u = order_exact(0.3).to_vec();
 
         stepper.attempt(&rhs, &u, &[], 0.3, 1e-3, &opts);
@@ -1206,10 +1053,7 @@ fn vern7_carries_its_end_derivative_across_an_accepted_dense_step() {
     let rhs = counting_rhs(&calls);
     let mut stepper = crate::ode::solver::make_stepper::<f64>(2, OdeMethod::Vern7);
     stepper.set_dense_required(true);
-    let opts = OdeSolverOptions {
-        method: OdeMethod::Vern7,
-        ..Default::default()
-    };
+    let opts = OdeSolverOptions { method: OdeMethod::Vern7, ..Default::default() };
 
     let mut u = order_exact(0.3).to_vec();
     stepper.attempt(&rhs, &u, &[], 0.3, 1e-3, &opts);

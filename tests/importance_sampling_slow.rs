@@ -35,10 +35,8 @@ fn downsample_population(population: &mut ferx_core::types::Population, keep_per
         let obs_times: Vec<f64> = keep_idx.iter().map(|&i| subj.obs_times[i]).collect();
         let observations: Vec<f64> = keep_idx.iter().map(|&i| subj.observations[i]).collect();
         let obs_cmts: Vec<usize> = keep_idx.iter().map(|&i| subj.obs_cmts[i]).collect();
-        let cens: Vec<i8> = keep_idx
-            .iter()
-            .map(|&i| subj.cens.get(i).copied().unwrap_or(0))
-            .collect();
+        let cens: Vec<i8> =
+            keep_idx.iter().map(|&i| subj.cens.get(i).copied().unwrap_or(0)).collect();
 
         subj.obs_times = obs_times;
         subj.observations = observations;
@@ -53,28 +51,18 @@ fn downsample_population(population: &mut ferx_core::types::Population, keep_per
 /// OFV gap vs FOCEI. Joint sampling closes that gap: ferx IMP should land near
 /// the NONMEM 7.5.1 IMP reference of 310.18.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn warfarin_iov_joint_sampling_matches_nonmem() {
     let model = parse_model_file(std::path::Path::new("examples/warfarin_iov.ferx"))
         .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(
-        std::path::Path::new("data/warfarin_iov.csv"),
-        None,
-        Some("OCC"),
-    )
-    .expect("warfarin_iov data must load");
+    let population =
+        read_nonmem_csv(std::path::Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+            .expect("warfarin_iov data must load");
 
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
-    opts.methods = vec![
-        EstimationMethod::Saem,
-        EstimationMethod::FoceI,
-        EstimationMethod::Imp,
-    ];
+    opts.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI, EstimationMethod::Imp];
     opts.imp_samples = 3000;
     opts.imp_seed = Some(2026);
     opts.imp_eval_only = true; // scoring the chain's −2 log L, not re-estimating
@@ -108,10 +96,7 @@ fn warfarin_iov_joint_sampling_matches_nonmem() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn sparse_warfarin_focei_imp_runs_and_reports_finite_ll() {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");

@@ -43,10 +43,7 @@ impl std::fmt::Display for Finding {
 /// The repo root: two levels above this crate's manifest.
 pub fn repo_root() -> PathBuf {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    here.ancestors()
-        .nth(2)
-        .map(Path::to_path_buf)
-        .unwrap_or(here)
+    here.ancestors().nth(2).map(Path::to_path_buf).unwrap_or(here)
 }
 
 pub fn default_baseline_path(root: &Path) -> PathBuf {
@@ -84,14 +81,10 @@ pub fn scan(root: &Path) -> Result<Scan, String> {
     use std::sync::{mpsc, Arc};
 
     let paths = scope::source_paths(root)?;
-    let index: BTreeMap<PathBuf, usize> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, (_, abs))| (abs.clone(), i))
-        .collect();
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .clamp(1, paths.len().max(1));
+    let index: BTreeMap<PathBuf, usize> =
+        paths.iter().enumerate().map(|(i, (_, abs))| (abs.clone(), i)).collect();
+    let workers =
+        std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, paths.len().max(1));
 
     type Edges = Result<Vec<(PathBuf, bool)>, String>;
     let (edge_tx, edge_rx) = mpsc::channel::<(usize, Edges)>();
@@ -136,12 +129,7 @@ pub fn scan(root: &Path) -> Result<Scan, String> {
                 let mut out = Vec::new();
                 for (i, text, ast) in &mine {
                     out.extend(nan_fold::lint_file(&paths[*i].0, text, ast, flags[*i]));
-                    out.extend(recorded_value_read::lint_file(
-                        &paths[*i].0,
-                        text,
-                        ast,
-                        flags[*i],
-                    ));
+                    out.extend(recorded_value_read::lint_file(&paths[*i].0, text, ast, flags[*i]));
                 }
                 Ok(out)
             }));
@@ -162,10 +150,7 @@ pub fn scan(root: &Path) -> Result<Scan, String> {
             }
         }
         let flags = (errors.is_empty()).then(|| {
-            let initial = paths
-                .iter()
-                .map(|(rel, _)| scope::path_is_test_by_name(rel))
-                .collect();
+            let initial = paths.iter().map(|(rel, _)| scope::path_is_test_by_name(rel)).collect();
             Arc::new(scope::propagate(initial, &edges))
         });
         for tx in &flag_txs {
@@ -191,11 +176,7 @@ pub fn scan(root: &Path) -> Result<Scan, String> {
     let files = paths
         .into_iter()
         .zip(flags.iter())
-        .map(|((rel, abs), &whole_test)| scope::SourceFile {
-            rel,
-            abs,
-            whole_test,
-        })
+        .map(|((rel, abs), &whole_test)| scope::SourceFile { rel, abs, whole_test })
         .collect();
     Ok(Scan { files, findings })
 }

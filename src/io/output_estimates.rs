@@ -77,22 +77,67 @@ impl Value {
 }
 
 /// A name the model file chose (a θ, η, σ or κ name, an `A__B` off-diagonal, a base
-/// name) as a YAML key or scalar: always quoted when `always` (under `estimates:`),
-/// otherwise only when YAML 1.1 — which R's `yaml` package implements — would read it
-/// bare as something other than that string. Every legal identifier is a plain scalar
-/// except the boolean and null spellings: `YES`, `no`, `On`, `OFF`, `y`, `N`, `TRUE`,
-/// `NULL`, … would come back as `TRUE` / `FALSE` / `NULL` and address a different key than
-/// the JSON's `"YES"` (#2911). The check is case-insensitive, so it also quotes a few
-/// mixed-case spellings YAML would read as strings; that costs only the quotes.
+/// name) as a YAML **block** key or scalar: always quoted when `always` (under
+/// `estimates:`), otherwise only when YAML 1.1 — which R's `yaml` package implements —
+/// would read it bare as something other than that string, or could not read it at all.
+///
+/// Every legal identifier is a plain scalar except the boolean and null spellings: `YES`,
+/// `no`, `On`, `OFF`, `y`, `N`, `TRUE`, `NULL`, … would come back as `TRUE` / `FALSE` /
+/// `NULL` and address a different key than the JSON's `"YES"` (#2911). The check is
+/// case-insensitive, so it also quotes a few mixed-case spellings YAML would read as
+/// strings; that costs only the quotes.
+///
+/// A level name (`TEFF[TIME=0.5]`) is not an identifier, but in block context a plain
+/// scalar may contain `[`, `]`, `=` and `,` as long as it does not *start* with an
+/// indicator, so it stays bare. What is quoted is anything that would change the
+/// document's shape: a leading indicator or space, `: ` or ` #` inside, a trailing `:`
+/// or space, or a control character ([`needs_quotes_in_block`]). In a flow sequence
+/// (`[a, b]`) more characters are structural — use [`yaml_flow_name`] there (#3006).
 pub(crate) fn yaml_name(name: &str, always: bool) -> String {
-    const IMPLICIT: &[&str] = &[
-        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", "",
-    ];
-    if always || IMPLICIT.contains(&name.to_ascii_lowercase().as_str()) {
+    if always || needs_quotes_in_block(name) {
         yaml_quote(name)
     } else {
         name.to_string()
     }
+}
+
+/// [`yaml_name`] for an element of a YAML **flow** sequence (`parameters: [A, B]`). Inside
+/// `[...]` the flow indicators `[`, `]`, `{`, `}` and `,` are structural even mid-scalar,
+/// so `[INT, TEFF[TIME=0.5]]` opens a nested sequence and the document fails to parse
+/// (#3006). Such a name — and one holding `:`, which YAML 1.1 parsers treat
+/// inconsistently inside flow context — is quoted; a plain identifier stays bare.
+pub(crate) fn yaml_flow_name(name: &str) -> String {
+    const FLOW: &[char] = &['[', ']', '{', '}', ',', ':'];
+    if needs_quotes_in_block(name) || name.contains(FLOW) {
+        yaml_quote(name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// A comma-joined YAML flow sequence of names, each through [`yaml_flow_name`].
+pub(crate) fn yaml_flow_names<S: AsRef<str>>(names: &[S]) -> String {
+    let items: Vec<String> = names.iter().map(|n| yaml_flow_name(n.as_ref())).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Whether `name` must be quoted to round-trip as that string in YAML block context.
+fn needs_quotes_in_block(name: &str) -> bool {
+    const IMPLICIT: &[&str] =
+        &["y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", ""];
+    // Characters that start a non-plain node, or are reserved, at the head of a scalar.
+    const INDICATORS: &[char] = &[
+        '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@',
+        '`',
+    ];
+    IMPLICIT.contains(&name.to_ascii_lowercase().as_str())
+        || name.starts_with(INDICATORS)
+        || name.starts_with(char::is_whitespace)
+        || name.ends_with(char::is_whitespace)
+        || name.ends_with(':')
+        || name.contains(": ")
+        || name.contains(" #")
+        || name.contains(char::is_control)
 }
 
 /// One named entry of a section: a parameter (`CL`), or an off-diagonal (`A__B`).
@@ -105,10 +150,7 @@ pub(crate) struct Entry {
 
 impl Entry {
     fn new(name: impl Into<String>) -> Self {
-        Entry {
-            name: name.into(),
-            fields: Vec::new(),
-        }
+        Entry { name: name.into(), fields: Vec::new() }
     }
 
     fn push(&mut self, key: &'static str, value: Value) {
@@ -165,11 +207,7 @@ pub(crate) struct Section {
 
 impl Section {
     fn new(key: &'static str) -> Self {
-        Section {
-            key,
-            comment: None,
-            entries: Vec::new(),
-        }
+        Section { key, comment: None, entries: Vec::new() }
     }
 
     /// The section as a top-level YAML key, from the blank line before its header to its
@@ -237,13 +275,9 @@ pub(crate) fn listed_theta_indices(result: &FitResult) -> Vec<usize> {
         .collect();
     #[cfg(not(feature = "nn"))]
     let nn: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let blocked: std::collections::HashSet<usize> = compact_theta_blocks(&result.theta_names)
-        .into_iter()
-        .flat_map(|(_, r)| r)
-        .collect();
-    (0..result.theta_names.len())
-        .filter(|i| !nn.contains(i) && !blocked.contains(i))
-        .collect()
+    let blocked: std::collections::HashSet<usize> =
+        compact_theta_blocks(&result.theta_names).into_iter().flat_map(|(_, r)| r).collect();
+    (0..result.theta_names.len()).filter(|i| !nn.contains(i) && !blocked.contains(i)).collect()
 }
 
 /// The spread field of a random-effect variance on its η type's scale: `cv_pct` for
@@ -263,8 +297,7 @@ pub(crate) fn spread_field(t: Option<EtaParamType>, var: f64) -> Option<(&'stati
 /// `100 · sd_at_typical_weight` (#1858), while for the other types that SD already is
 /// the console's figure.
 pub(crate) fn typical_cv_field(
-    t: Option<EtaParamType>,
-    var_at: f64,
+    t: Option<EtaParamType>, var_at: f64,
 ) -> Option<(&'static str, Value)> {
     matches!(t, None | Some(EtaParamType::LogNormal))
         .then(|| ("cv_pct_at_typical_weight", Value::Cv(cv_pct(var_at))))
@@ -329,13 +362,8 @@ pub(crate) fn omega_section(result: &FitResult) -> Section {
         e.push_se(SeState::of(result, ParameterKind::Omega, i, fixed, se));
         section.entries.push(e);
     }
-    let eta = |i: usize| {
-        result
-            .eta_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("eta_{}", i + 1))
-    };
+    let eta =
+        |i: usize| result.eta_names.get(i).cloned().unwrap_or_else(|| format!("eta_{}", i + 1));
     for i in 0..n_eta {
         for j in 0..i {
             let cov = result.omega[(i, j)];
@@ -380,11 +408,7 @@ pub(crate) fn sigma_section(result: &FitResult) -> Section {
     for (i, &s) in result.sigma.iter().enumerate() {
         let fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
         let se = result.se_sigma.as_ref().and_then(|v| v.get(i).copied());
-        let name = result
-            .sigma_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("sigma_{}", i + 1));
+        let name = result.sigma_names.get(i).cloned().unwrap_or_else(|| format!("sigma_{}", i + 1));
         let sigma_type = result.sigma_types.get(i).copied();
         let mut e = Entry::new(name);
         e.push("estimate", Value::Num(s));
@@ -418,38 +442,22 @@ pub(crate) fn block_sigma_section(result: &FitResult) -> Result<Option<Section>,
     let mut section = Section::new("block_sigma");
     for (k, corr) in result.residual_correlations.iter().enumerate() {
         let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_i index {} is out of bounds",
-                corr.sigma_i
-            )
+            format!("residual correlation sigma_i index {} is out of bounds", corr.sigma_i)
         })?;
         let name_j = result.sigma_names.get(corr.sigma_j).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_j index {} is out of bounds",
-                corr.sigma_j
-            )
+            format!("residual correlation sigma_j index {} is out of bounds", corr.sigma_j)
         })?;
         let sigma_i = result.sigma.get(corr.sigma_i).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_i index {} has no estimate",
-                corr.sigma_i
-            )
+            format!("residual correlation sigma_i index {} has no estimate", corr.sigma_i)
         })?;
         let sigma_j = result.sigma.get(corr.sigma_j).ok_or_else(|| {
-            format!(
-                "residual correlation sigma_j index {} has no estimate",
-                corr.sigma_j
-            )
+            format!("residual correlation sigma_j index {} has no estimate", corr.sigma_j)
         })?;
         // Since #847 a bare `block_sigma (...) = [...]` **estimates** the off-diagonal
         // (NONMEM `$SIGMA BLOCK(n)`); only `... FIX` pins it. A pre-#847 `FitResult`
         // carries no flags at all, and back then every correlation was fixed by
         // construction — hence the `true` default.
-        let correlation_fixed = result
-            .residual_correlation_fixed
-            .get(k)
-            .copied()
-            .unwrap_or(true);
+        let correlation_fixed = result.residual_correlation_fixed.get(k).copied().unwrap_or(true);
         // The covariance `rho·sigma_i·sigma_j` is fixed only when *all three* factors
         // are: a free rho or a free SD moves it during the fit.
         let sigma_is_fixed = |i: usize| result.sigma_fixed.get(i).copied().unwrap_or(false);
@@ -460,11 +468,7 @@ pub(crate) fn block_sigma_section(result: &FitResult) -> Result<Option<Section>,
         let corr_se = if correlation_fixed {
             None
         } else {
-            result
-                .se_residual_correlations
-                .as_ref()
-                .and_then(|v| v.get(k))
-                .copied()
+            result.se_residual_correlations.as_ref().and_then(|v| v.get(k)).copied()
         };
         let mut e = Entry::new(format!("{name_i}__{name_j}"));
         e.push("covariance", Value::Num(corr.rho * sigma_i * sigma_j));
@@ -483,13 +487,8 @@ pub(crate) fn omega_iov_section(result: &FitResult) -> Option<Section> {
     let iov = result.omega_iov.as_ref()?;
     let mut section = Section::new("omega_iov");
     let n_kappa = iov.nrows();
-    let kappa = |i: usize| {
-        result
-            .kappa_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("kappa_{}", i + 1))
-    };
+    let kappa =
+        |i: usize| result.kappa_names.get(i).cloned().unwrap_or_else(|| format!("kappa_{}", i + 1));
     for i in 0..n_kappa {
         let var = iov[(i, i)];
         let fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
@@ -588,11 +587,7 @@ pub(crate) fn mixture_overrides_section(result: &FitResult) -> Option<Section> {
 
 /// Every estimate section of `result`, in the order the fit YAML writes them.
 pub(crate) fn estimate_sections(result: &FitResult) -> Result<Vec<Section>, String> {
-    let mut out = vec![
-        theta_section(result),
-        omega_section(result),
-        sigma_section(result),
-    ];
+    let mut out = vec![theta_section(result), omega_section(result), sigma_section(result)];
     out.extend(block_sigma_section(result)?);
     out.extend(omega_iov_section(result));
     out.extend(mixture_overrides_section(result));
@@ -618,10 +613,7 @@ pub(crate) fn estimates_yaml(result: &FitResult) -> Result<String, String> {
 pub(crate) fn estimates_json(result: &FitResult) -> serde_json::Value {
     match estimate_sections(result) {
         Ok(sections) => serde_json::Value::Object(
-            sections
-                .iter()
-                .map(|s| (s.key.to_string(), s.json()))
-                .collect(),
+            sections.iter().map(|s| (s.key.to_string(), s.json())).collect(),
         ),
         Err(_) => serde_json::Value::Null,
     }

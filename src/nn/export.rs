@@ -113,10 +113,7 @@ pub struct DcmExportOptions {
 /// or non-finite, a generated name that collides with one the model already
 /// uses, or a block the parser would itself reject.
 pub fn export_dcm_as_analytic(
-    model_text: &str,
-    theta_names: &[String],
-    theta: &[f64],
-    opts: &DcmExportOptions,
+    model_text: &str, theta_names: &[String], theta: &[f64], opts: &DcmExportOptions,
 ) -> Result<String, String> {
     export_networks(model_text, theta_names, theta, opts, OTHERS_AS_WRITTEN)
 }
@@ -127,11 +124,7 @@ const OTHERS_AS_WRITTEN: &str =
 const OTHERS_FITTED: &str = "# Every other theta / omega / sigma is the fit's estimate.\n";
 
 fn export_networks(
-    model_text: &str,
-    theta_names: &[String],
-    theta: &[f64],
-    opts: &DcmExportOptions,
-    others: &str,
+    model_text: &str, theta_names: &[String], theta: &[f64], opts: &DcmExportOptions, others: &str,
 ) -> Result<String, String> {
     if theta_names.len() != theta.len() {
         return Err(format!(
@@ -145,7 +138,7 @@ fn export_networks(
     let layout = BlockLayout::scan(&lines);
     if layout.nn_blocks.is_empty() {
         return Err(
-            "the model has no [covariate_nn] block; there is no network to export".to_string(),
+            "the model has no [covariate_nn] block; there is no network to export".to_string()
         );
     }
 
@@ -166,10 +159,7 @@ fn export_networks(
         "# Exported by `ferx export-dcm` (#1331): the [covariate_nn] block(s) {} written\n\
          # out as plain equations at the fitted weights. Predictions equal the fitted\n\
          # network's; the weights are {}, not estimated — do not refit them.\n",
-        nets.iter()
-            .map(|(s, _)| s.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
+        nets.iter().map(|(s, _)| s.name.as_str()).collect::<Vec<_>>().join(", "),
         match opts.weight_form {
             DcmWeightForm::Literal => "inlined as constants",
             DcmWeightForm::FixedTheta => "FIXed thetas",
@@ -222,9 +212,7 @@ fn export_networks(
 /// show for it. `check_exportable` refuses the names that cannot work at all;
 /// this catches the ones only the whole model can.
 fn check_exported(
-    text: &str,
-    nets: &[(NnBlockSpec, Vec<f64>)],
-    names: &NameTable,
+    text: &str, nets: &[(NnBlockSpec, Vec<f64>)], names: &NameTable,
 ) -> Result<(), String> {
     let model = parse_for_validation(text)?;
     // A `NAME.OUTPUT` read where the generated statements are not in scope (a
@@ -262,12 +250,7 @@ fn check_exported(
     let p = &model.default_params;
     let mut shadowing: Vec<(&str, &str)> = Vec::new();
     shadowing.extend(p.theta_names.iter().map(|n| (n.as_str(), "a theta")));
-    shadowing.extend(
-        p.omega
-            .eta_names
-            .iter()
-            .map(|n| (n.as_str(), "a random effect")),
-    );
+    shadowing.extend(p.omega.eta_names.iter().map(|n| (n.as_str(), "a random effect")));
     if let Some(iov) = &p.omega_iov {
         shadowing.extend(iov.eta_names.iter().map(|n| (n.as_str(), "a kappa")));
     }
@@ -353,9 +336,7 @@ fn parse_for_validation(text: &str) -> Result<crate::types::CompiledModel, Strin
 /// separately (`ferx export-dcm model.ferx --fit run.json`). A fit that carries
 /// no model text cannot be checked and is refused.
 pub fn export_dcm_from_fit(
-    model_text: &str,
-    fit: &crate::types::FitResult,
-    opts: &DcmExportOptions,
+    model_text: &str, fit: &crate::types::FitResult, opts: &DcmExportOptions,
 ) -> Result<String, String> {
     let fitted = fit.model_text.as_deref().ok_or(
         "the fit carries no model text, so the network it was made with cannot be \
@@ -366,18 +347,10 @@ pub fn export_dcm_from_fit(
     if opts.network_only {
         return export_dcm_as_analytic(model_text, &fit.theta_names, &fit.theta, opts);
     }
-    let networks = export_networks(
-        model_text,
-        &fit.theta_names,
-        &fit.theta,
-        opts,
-        OTHERS_FITTED,
-    )?;
+    let networks = export_networks(model_text, &fit.theta_names, &fit.theta, opts, OTHERS_FITTED)?;
     let exported = values::write_fitted_values(&networks, fit);
-    let weights: HashSet<String> = network_specs(model_text)?
-        .iter()
-        .flat_map(NnBlockSpec::weight_theta_names)
-        .collect();
+    let weights: HashSet<String> =
+        network_specs(model_text)?.iter().flat_map(NnBlockSpec::weight_theta_names).collect();
     values::check_fitted_values(&parse_for_validation(&exported)?, fit, &weights)?;
     Ok(exported)
 }
@@ -407,11 +380,7 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
         ));
     }
     let bits = |v: &Option<Vec<f64>>, n: usize, id: f64| -> Vec<u64> {
-        v.clone()
-            .unwrap_or_else(|| vec![id; n])
-            .iter()
-            .map(|x| x.to_bits())
-            .collect()
+        v.clone().unwrap_or_else(|| vec![id; n]).iter().map(|x| x.to_bits()).collect()
     };
     for (a, b) in ours.iter().zip(&theirs) {
         let n = a.inputs.len();
@@ -421,18 +390,8 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
                 differences.push(format!("{field}: model `{model}`, fit `{fitted}`"));
             }
         };
-        differ(
-            "inputs",
-            a.inputs == b.inputs,
-            a.inputs.join(", "),
-            b.inputs.join(", "),
-        );
-        differ(
-            "outputs",
-            a.outputs == b.outputs,
-            a.outputs.join(", "),
-            b.outputs.join(", "),
-        );
+        differ("inputs", a.inputs == b.inputs, a.inputs.join(", "), b.inputs.join(", "));
+        differ("outputs", a.outputs == b.outputs, a.outputs.join(", "), b.outputs.join(", "));
         differ(
             "layers",
             a.hidden == b.hidden,
@@ -763,20 +722,13 @@ impl BlockLayout {
                 }
             }
         }
-        BlockLayout {
-            role,
-            nn_blocks,
-            indiv_header,
-            parameters_last,
-        }
+        BlockLayout { role, nn_blocks, indiv_header, parameters_last }
     }
 }
 
 /// The block's weights out of the fit, in the network's flat order.
 fn lookup_weights(
-    spec: &NnBlockSpec,
-    theta_names: &[String],
-    theta: &[f64],
+    spec: &NnBlockSpec, theta_names: &[String], theta: &[f64],
 ) -> Result<Vec<f64>, String> {
     spec.weight_theta_names()
         .iter()
@@ -907,10 +859,7 @@ fn output_var(name: &str, out: &str) -> String {
 
 impl NameTable {
     fn build(
-        nets: &[(NnBlockSpec, Vec<f64>)],
-        layout: &BlockLayout,
-        lines: &[&str],
-        form: DcmWeightForm,
+        nets: &[(NnBlockSpec, Vec<f64>)], layout: &BlockLayout, lines: &[&str], form: DcmWeightForm,
     ) -> Result<Self, String> {
         // Every identifier the retained model text already uses, case-folded:
         // a generated name may not shadow or be shadowed by any of them.
@@ -987,10 +936,7 @@ impl NameTable {
 /// inside one.
 fn quoted_span_end(bytes: &[u8], i: usize) -> usize {
     let q = bytes[i];
-    bytes[i + 1..]
-        .iter()
-        .position(|&b| b == q)
-        .map_or(bytes.len(), |k| i + 1 + k + 1)
+    bytes[i + 1..].iter().position(|&b| b == q).map_or(bytes.len(), |k| i + 1 + k + 1)
 }
 
 /// The identifiers in a line of code (letters, digits, `_`, not starting with a
@@ -1026,9 +972,7 @@ fn identifiers(code: &str) -> impl Iterator<Item = &str> {
 /// `weight_literals` by its value. Quoted strings and the comment, if any, are
 /// kept verbatim.
 fn rewrite_refs(
-    line: &str,
-    nets: &[(NnBlockSpec, Vec<f64>)],
-    names: &NameTable,
+    line: &str, nets: &[(NnBlockSpec, Vec<f64>)], names: &NameTable,
     weight_literals: &HashMap<String, f64>,
 ) -> Result<String, String> {
     let code_len = strip_line_comment(line).len();
@@ -1093,16 +1037,13 @@ fn rewrite_refs(
             j += 1;
         }
         let output = &code[out_start..j];
-        let var = names
-            .outputs
-            .get(&(spec.name.clone(), output.to_string()))
-            .ok_or_else(|| {
-                format!(
-                    "`{word}.{output}` is not declared as an output of [covariate_nn {word}]. \
+        let var = names.outputs.get(&(spec.name.clone(), output.to_string())).ok_or_else(|| {
+            format!(
+                "`{word}.{output}` is not declared as an output of [covariate_nn {word}]. \
                      Known outputs: {}",
-                    spec.outputs.join(", ")
-                )
-            })?;
+                spec.outputs.join(", ")
+            )
+        })?;
         out.push_str(var);
         i = j;
     }
@@ -1140,9 +1081,7 @@ fn magnitude(v: f64) -> String {
 /// bit. The first term keeps its sign on the literal, which the tokenizer reads
 /// as one negative number. The opening `(` is the caller's ([`act_call`]).
 fn preactivation(
-    terms: &[(Coefficient<'_>, String)],
-    bias: Coefficient<'_>,
-    indent: &str,
+    terms: &[(Coefficient<'_>, String)], bias: Coefficient<'_>, indent: &str,
 ) -> String {
     let mut s = String::new();
     for (k, (c, a)) in terms.iter().enumerate() {
@@ -1198,9 +1137,7 @@ fn activate(out: &mut String, act: Activation, var: &str, pre: &str, pre_var: &s
         // `z >= 0`, which differs at `z = -0.0`. Spell the network's own branch.
         Activation::Relu => {
             out.push_str(&format!("{BODY}{pre_var} = ({pre}\n"));
-            out.push_str(&format!(
-                "{BODY}{var} = if ({pre_var} > 0) {pre_var} else 0\n"
-            ));
+            out.push_str(&format!("{BODY}{var} = if ({pre_var} > 0) {pre_var} else 0\n"));
         }
         _ => out.push_str(&format!("{BODY}{var} = {}{pre}\n", act_call(act))),
     }
@@ -1230,20 +1167,12 @@ const BODY: &str = "    ";
 /// arm assigns exactly those — a name read after an `if` must be assigned in
 /// every arm. The arm is never taken; it exists to satisfy that rule.
 fn emit_network(
-    out: &mut String,
-    spec: &NnBlockSpec,
-    weights: &[f64],
-    names: &NameTable,
-    form: DcmWeightForm,
+    out: &mut String, spec: &NnBlockSpec, weights: &[f64], names: &NameTable, form: DcmWeightForm,
 ) {
     let name = spec.name.as_str();
     let sizes = spec.layer_sizes();
     let n_layers = sizes.len() - 1;
-    let shape = sizes
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(" -> ");
+    let shape = sizes.iter().map(usize::to_string).collect::<Vec<_>>().join(" -> ");
     out.push_str(&format!(
         "  # --- [covariate_nn {name}] expanded: {shape}, {} hidden / {} output ---\n\
          \x20 # Always taken: the `if` keeps the network's units out of the individual\n\
@@ -1268,11 +1197,8 @@ fn emit_network(
             } else {
                 format!("{input} - {}", magnitude(c))
             };
-            let div = if s.is_sign_negative() {
-                format!("(-{})", magnitude(s))
-            } else {
-                magnitude(s)
-            };
+            let div =
+                if s.is_sign_negative() { format!("(-{})", magnitude(s)) } else { magnitude(s) };
             out.push_str(&format!("{BODY}{var} = ({shift}) / {div}\n"));
         }
     }
@@ -1285,11 +1211,7 @@ fn emit_network(
         let w_at = offset;
         let b_at = offset + n_l * n_lm1;
         let is_output = l == n_layers;
-        let act = if is_output {
-            spec.output_activation
-        } else {
-            spec.hidden_activation
-        };
+        let act = if is_output { spec.output_activation } else { spec.hidden_activation };
         let mut next = Vec::with_capacity(n_l);
         for i in 0..n_l {
             let var = if is_output {
@@ -1301,10 +1223,7 @@ fn emit_network(
             let terms: Vec<(Coefficient<'_>, String)> = (0..n_lm1)
                 .map(|j| {
                     let k = w_at + i * n_lm1 + j;
-                    (
-                        coefficient(form, &theta_names[k], weights[k]),
-                        prev[j].clone(),
-                    )
+                    (coefficient(form, &theta_names[k], weights[k]), prev[j].clone())
                 })
                 .collect();
             let k = b_at + i;
@@ -1315,11 +1234,8 @@ fn emit_network(
             } else {
                 act_call(act)
             };
-            let lead = if act == Activation::Relu {
-                preact_var(name, l, i + 1)
-            } else {
-                var.clone()
-            };
+            let lead =
+                if act == Activation::Relu { preact_var(name, l, i + 1) } else { var.clone() };
             let indent = " ".repeat(BODY.len() + lead.len() + 3 + call.len());
             let pre = preactivation(&terms, bias, &indent);
             activate(out, act, &var, &pre, &preact_var(name, l, i + 1));

@@ -54,22 +54,14 @@ fn fit_source(src: &str, gradient: GradientMethod) -> ferx_core::FitResult {
 /// subject's EBE at each FD perturbation on every outer evaluation — the reconverged
 /// FD gradient, i.e. the exact marginal gradient the analytic one must equal.
 fn fit_source_reconverging(
-    src: &str,
-    gradient: GradientMethod,
-    interval: usize,
+    src: &str, gradient: GradientMethod, interval: usize,
 ) -> ferx_core::FitResult {
     let mut model = parse_model_string(src).expect("block_sigma model must parse");
-    assert!(
-        !model.residual_correlations.is_empty(),
-        "model must carry a residual correlation"
-    );
+    assert!(!model.residual_correlations.is_empty(), "model must carry a residual correlation");
     model.gradient_method = gradient;
-    let population = read_nonmem_csv(
-        Path::new("data/correlated_residual_combined.csv"),
-        None,
-        None,
-    )
-    .expect("correlated residual data must load");
+    let population =
+        read_nonmem_csv(Path::new("data/correlated_residual_combined.csv"), None, None)
+            .expect("correlated residual data must load");
 
     let mut opts = FitOptions::default();
     opts.optimizer = Optimizer::Lbfgs;
@@ -112,10 +104,7 @@ fn fit_source_reconverging(
 ///   reconverged FD gradient at Tier 1 (e.g. `kernel_block_sigma_matches_reconverged_fd`
 ///   in `sens/ode_adjoint_tests.rs`); this convergence fixture cannot see an ω error.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn dense_residual_analytic_and_fd_fits_agree() {
     let analytic = fit_with(GradientMethod::Auto);
     let reconverged = fit_source_reconverging(MODEL, GradientMethod::Fd, 1);
@@ -179,10 +168,7 @@ fn dense_residual_analytic_and_fd_fits_agree() {
 /// `sens/ode_adjoint_tests.rs`), which pin the rho gradient itself against Richardson
 /// reconverged FD.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn dense_residual_free_rho_beats_fixed_rho() {
     let free_src = MODEL.replace("1.00] FIX", "1.00]");
     let free = fit_source(&free_src, GradientMethod::Auto);
@@ -205,10 +191,7 @@ fn dense_residual_free_rho_beats_fixed_rho() {
         (free_rho - declared).abs() > 1e-3,
         "free rho should move off the {declared} init, got {free_rho}"
     );
-    assert!(
-        free_rho.abs() < 1.0,
-        "the Fisher-z box must keep rho admissible, got {free_rho}"
-    );
+    assert!(free_rho.abs() < 1.0, "the Fisher-z box must keep rho admissible, got {free_rho}");
 
     // Widening the feasible set cannot make the optimum worse.
     assert!(

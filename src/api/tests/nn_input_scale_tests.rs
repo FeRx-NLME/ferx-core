@@ -24,10 +24,7 @@ fn raw_inputs_warn_and_declared_normalisation_does_not() {
     let d = check_nn_input_scale(&m, &pop);
     assert_eq!(d.len(), 1, "{d:?}");
     let msg = &d[0].message;
-    assert!(
-        msg.starts_with("W_NN_UNSCALED_INPUT: [covariate_nn TYPICAL_PK]"),
-        "{msg}"
-    );
+    assert!(msg.starts_with("W_NN_UNSCALED_INPUT: [covariate_nn TYPICAL_PK]"), "{msg}");
     assert!(msg.contains("WT (") && msg.contains("CRCL ("), "{msg}");
     assert!(msg.contains("tanh"), "{msg}");
 
@@ -35,10 +32,7 @@ fn raw_inputs_warn_and_declared_normalisation_does_not() {
         "  inputs     = [WT, CRCL]\n",
         "  inputs     = [WT, CRCL]\n  center     = [70, 86]\n  scale      = [12, 23]\n",
     );
-    assert_ne!(
-        normalised, raw,
-        "fixture: the normalisation lines were inserted"
-    );
+    assert_ne!(normalised, raw, "fixture: the normalisation lines were inserted");
     let (m, pop) = prepared(&normalised);
     assert!(check_nn_input_scale(&m, &pop).is_empty());
 }
@@ -53,15 +47,9 @@ fn a_record_level_covariate_value_is_checked() {
         "  inputs     = [WT, CRCL]\n",
         "  inputs     = [WT, CRCL]\n  center     = [70, 86]\n  scale      = [12, 23]\n",
     );
-    assert_ne!(
-        normalised, raw,
-        "fixture: the normalisation lines were inserted"
-    );
+    assert_ne!(normalised, raw, "fixture: the normalisation lines were inserted");
     let (m, mut pop) = prepared(&normalised);
-    assert!(
-        check_nn_input_scale(&m, &pop).is_empty(),
-        "fixture: clean as shipped"
-    );
+    assert!(check_nn_input_scale(&m, &pop).is_empty(), "fixture: clean as shipped");
     let s = &mut pop.subjects[0];
     let n_obs = s.obs_times.len();
     let mut snapshots = vec![s.covariates.clone(); n_obs];
@@ -69,11 +57,7 @@ fn a_record_level_covariate_value_is_checked() {
     s.obs_covariates = snapshots;
     let d = check_nn_input_scale(&m, &pop);
     assert_eq!(d.len(), 1, "{d:?}");
-    assert!(
-        d[0].message.contains("WT (|z| up to 40.000)"),
-        "{}",
-        d[0].message
-    );
+    assert!(d[0].message.contains("WT (|z| up to 40.000)"), "{}", d[0].message);
     assert!(!d[0].message.contains("CRCL ("), "{}", d[0].message);
 }
 
@@ -91,10 +75,7 @@ fn ferx_check_reports_the_unscaled_input() {
         crate::api::validate_model_file(path.to_str().unwrap(), Some("data/warfarin_dcm.csv"));
     std::fs::remove_dir_all(&dir).ok();
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "W_NN_UNSCALED_INPUT"),
+        report.diagnostics.iter().any(|d| d.code == "W_NN_UNSCALED_INPUT"),
         "{:?}",
         report.diagnostics
     );

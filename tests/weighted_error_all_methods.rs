@@ -70,10 +70,7 @@ fn weighted_population() -> Population {
 }
 
 fn smoke_opts(method: EstimationMethod) -> FitOptions {
-    let mut o = FitOptions {
-        outer_maxiter: 2,
-        ..Default::default()
-    };
+    let mut o = FitOptions { outer_maxiter: 2, ..Default::default() };
     o.method = method;
     // Keep the stochastic estimators to a couple of cheap passes.
     o.saem_n_exploration = 2;
@@ -110,11 +107,7 @@ fn every_estimator_fits_a_weighted_error_model() {
     ] {
         let res = fit(&model, &pop, &model.default_params, &smoke_opts(method))
             .unwrap_or_else(|e| panic!("{method:?} must fit a `weight =` model: {e}"));
-        assert!(
-            res.ofv.is_finite(),
-            "{method:?} returned a non-finite OFV: {}",
-            res.ofv
-        );
+        assert!(res.ofv.is_finite(), "{method:?} returned a non-finite OFV: {}", res.ofv);
     }
 }
 

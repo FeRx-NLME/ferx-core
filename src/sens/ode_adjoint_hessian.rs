@@ -22,10 +22,11 @@
 //! - The plan's value forward and one reverse seeded with each output give the gradients of
 //!   `F` and of every `g_k` with respect to every input: `∇_η F`, `H` and `∂g` along any
 //!   direction at once (`mode_response`).
-//! - The plan's forward along `u_1 … u_K` (its tangent layout) and one reverse seeded with
-//!   each tangent component `∂Ψ_w/∂u_a` give the `K` Hessian columns
-//!   `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted with every `u_b` (`psi_along`): reverse over
-//!   forward, so the Hessian costs `⌈n/K⌉` passes of one compiled program.
+//! - Per pass, the plan's forward along the pass's directions `u_a` (its tangent layout) and
+//!   one forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on the
+//!   adjoints' tangent lanes, their Hessian columns `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted
+//!   with every `u_b` (`psi_along`). A structured subject ([`st`]) takes one pass of every
+//!   direction; the recorded kernel one pass per direction ([`pass_width`], #2980).
 //!
 //! There are no third-order sensitivity tables and no finite differences, and FOCE's
 //! frozen-variance mode (whose `R⁰` moves with θ through `f(η = 0)`) is just another term
@@ -39,14 +40,11 @@ use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, PkNum};
 
-/// Directions per pass: the plan's tangent lanes, and the seeds of each reverse.
-///
-/// A pass's reverse runs `K` seeds over `1 + K` lanes, so its cost grows as `K²` while the
-/// `⌈n/K⌉` passes each repeat the forward. 4, not 8: measured on #1564's bench kit (exact
-/// R-matrix, interleaved, release, one core): 1-cpt oral (8 packed coordinates, one pass at 8)
-/// 0.14 → 0.11 s, 2-cpt oral (13) 0.39 → 0.33 s, their ODE twins 1.28 → 1.04 s and 5.45 → 3.94
-/// s. `K = 2` measured within ±8% of 4 either way.
-const K: usize = 4;
+#[path = "ode_adjoint_hessian_basis.rs"]
+pub(super) mod basis;
+use basis::{Basis, Lanes, Moved, MuFold, PlanKey, PlanRun};
+#[path = "ode_adjoint_hessian_struct.rs"]
+pub(super) mod st;
 
 /// A direction of a pass: the packed coordinate it moves, the `[covariate_nn]` raw output
 /// it moves (the reduced basis, [`NnReduction`]), and its η tangent (empty: none).
@@ -59,29 +57,17 @@ pub(super) struct Dir {
 
 impl Dir {
     fn x(i: usize, eta: Vec<f64>) -> Self {
-        Dir {
-            x: Some(i),
-            z: None,
-            eta,
-        }
+        Dir { x: Some(i), z: None, eta }
     }
 
     #[cfg(feature = "nn")]
     fn eta(k: usize, n: usize) -> Self {
-        Dir {
-            x: None,
-            z: None,
-            eta: (0..n).map(|m| if m == k { 1.0 } else { 0.0 }).collect(),
-        }
+        Dir { x: None, z: None, eta: (0..n).map(|m| if m == k { 1.0 } else { 0.0 }).collect() }
     }
 
     #[cfg(feature = "nn")]
     fn z(k: usize) -> Self {
-        Dir {
-            x: None,
-            z: Some(k),
-            eta: Vec::new(),
-        }
+        Dir { x: None, z: Some(k), eta: Vec::new() }
     }
 }
 
@@ -91,12 +77,8 @@ impl Dir {
 /// `[η, κ]` under IOV) for `unpack_params(x)`.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_cov_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hat: &[f64],
-    objective: Objective,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
+    eta_hat: &[f64], objective: Objective,
 ) -> Option<DMatrix<f64>> {
     let pt = PackedPoint::new(template, x)?;
     subject_adjoint_cov_hessian_at(model, subject, &pt, eta_hat, objective)
@@ -105,15 +87,12 @@ pub(crate) fn subject_adjoint_cov_hessian(
 /// `subject_adjoint_cov_hessian` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`] the caller unpacked once for its
 /// population.
 pub(crate) fn subject_adjoint_cov_hessian_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     objective: Objective,
 ) -> Option<DMatrix<f64>> {
     match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Full)? {
         HessianOut::Full(h) => Some(h),
-        HessianOut::Diag(_) => None,
+        HessianOut::Diag(_) | HessianOut::Block(..) => None,
     }
 }
 
@@ -122,26 +101,15 @@ pub(crate) fn subject_adjoint_cov_hessian_at(
 /// without the dense block — what the #2159 identity-scale pre-flight reads its candidates'
 /// curvature from. `None` outside the adjoint's scope or for an axis past `x`.
 pub(crate) fn subject_adjoint_cov_diag_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    axes: &[usize],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, axes: &[usize],
 ) -> Option<Vec<f64>> {
     if axes.iter().any(|&i| i >= pt.x.len()) {
         return None;
     }
-    match cov_hessian(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        objective,
-        HessianSel::Diag(axes),
-    )? {
+    match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Diag(axes))? {
         HessianOut::Diag(d) => Some(d),
-        HessianOut::Full(_) => None,
+        HessianOut::Full(_) | HessianOut::Block(..) => None,
     }
 }
 
@@ -150,26 +118,27 @@ pub(crate) fn subject_adjoint_cov_diag_at(
 /// instead of `x.len()` — what a profiled fit's covariance step reads its structural and
 /// level blocks from (#2109). `None` outside the adjoint's scope or for an axis past `x`.
 pub(crate) fn subject_adjoint_cov_block_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    axes: &[usize],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, axes: &[usize],
 ) -> Option<DMatrix<f64>> {
+    subject_adjoint_cov_block_with_gradient_at(model, subject, pt, eta_hat, objective, axes)
+        .map(|(_, h)| h)
+}
+
+/// [`subject_adjoint_cov_block_at`] and, from the same pass, the total packed gradient along
+/// `axes` (`dFᵢ/dx_a`, in `axes` order): the `∇Ψ_w` the block's sweeps form anyway. A caller
+/// that needs both (a log-packed coordinate's second derivative takes `−∂/∂x` on its diagonal)
+/// records one pass, not a Hessian and a second gradient.
+pub(crate) fn subject_adjoint_cov_block_with_gradient_at(
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, axes: &[usize],
+) -> Option<(Vec<f64>, DMatrix<f64>)> {
     if axes.iter().any(|&i| i >= pt.x.len()) {
         return None;
     }
-    match cov_hessian(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        objective,
-        HessianSel::Block(axes),
-    )? {
-        HessianOut::Full(h) => Some(h),
-        HessianOut::Diag(_) => None,
+    match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Block(axes))? {
+        HessianOut::Block(g, h) => Some((g, h)),
+        HessianOut::Full(_) | HessianOut::Diag(_) => None,
     }
 }
 
@@ -184,10 +153,12 @@ enum HessianSel<'a> {
     Block(&'a [usize]),
 }
 
-/// A covariance Hessian, or the diagonal a [`HessianSel::Diag`] asked for.
+/// A covariance Hessian, the diagonal a [`HessianSel::Diag`] asked for, or the block a
+/// [`HessianSel::Block`] asked for with the total gradient along its axes.
 enum HessianOut {
     Full(DMatrix<f64>),
     Diag(Vec<f64>),
+    Block(Vec<f64>, DMatrix<f64>),
 }
 
 impl HessianOut {
@@ -195,6 +166,9 @@ impl HessianOut {
         match self {
             HessianOut::Full(h) => h.iter().all(|v| v.is_finite()),
             HessianOut::Diag(d) => d.iter().all(|v| v.is_finite()),
+            HessianOut::Block(g, h) => {
+                g.iter().all(|v| v.is_finite()) && h.iter().all(|v| v.is_finite())
+            }
         }
     }
 }
@@ -202,12 +176,8 @@ impl HessianOut {
 /// The dispatch shared by [`subject_adjoint_cov_hessian_at`] and
 /// [`subject_adjoint_cov_diag_at`].
 fn cov_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-    sel: HessianSel<'_>,
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
+    objective: Objective, sel: HessianSel<'_>,
 ) -> Option<HessianOut> {
     if super::marginal_refused(model, subject, objective) {
         // The refusal sentinel is constant: its Hessian is the zero matrix.
@@ -215,9 +185,10 @@ fn cov_hessian(
         return match sel {
             HessianSel::Full => Some(HessianOut::Full(DMatrix::zeros(n, n))),
             HessianSel::Diag(axes) => Some(HessianOut::Diag(vec![0.0; axes.len()])),
-            HessianSel::Block(axes) => {
-                Some(HessianOut::Full(DMatrix::zeros(axes.len(), axes.len())))
-            }
+            HessianSel::Block(axes) => Some(HessianOut::Block(
+                vec![0.0; axes.len()],
+                DMatrix::zeros(axes.len(), axes.len()),
+            )),
         };
     }
     let sc = super::scope(model, subject, pt, eta_hat)?;
@@ -229,12 +200,8 @@ fn cov_hessian(
 /// predictor's Jacobian (Almquist Eq. 48), FOCE's frozen-variance mode included.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_eta_dx(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hat: &[f64],
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
+    eta_hat: &[f64], interaction: bool,
 ) -> Option<Vec<DVector<f64>>> {
     let pt = PackedPoint::new(template, x)?;
     subject_adjoint_eta_dx_at(model, subject, &pt, eta_hat, interaction)
@@ -243,29 +210,19 @@ pub(crate) fn subject_adjoint_eta_dx(
 /// `subject_adjoint_eta_dx` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
 #[cfg(test)]
 fn subject_adjoint_eta_dx_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<DVector<f64>>> {
     let (template, x) = (pt.template, pt.x);
-    let objective = if interaction {
-        Objective::Focei
-    } else {
-        Objective::Foce
-    };
+    let objective = if interaction { Objective::Focei } else { Objective::Foce };
     let sc = super::scope(model, subject, pt, eta_hat)?;
     let ctx = LikCtx::new(sc.model, subject, sc.params);
     let so = stacked_omega(sc.model, subject, template, sc.params, sc.width);
     let plan = CovPlan::new(&ctx, &sc, subject, template, x, objective, &so, None);
     let (_, eta_x) = mode_response(&plan, &x_dirs(x.len()))?;
-    let cols: Vec<DVector<f64>> = (0..x.len())
-        .map(|i| DVector::from_fn(sc.width, |k, _| eta_x[(k, i)]))
-        .collect();
-    cols.iter()
-        .all(|c| c.iter().all(|v| v.is_finite()))
-        .then_some(cols)
+    let cols: Vec<DVector<f64>> =
+        (0..x.len()).map(|i| DVector::from_fn(sc.width, |k, _| eta_x[(k, i)])).collect();
+    cols.iter().all(|c| c.iter().all(|v| v.is_finite())).then_some(cols)
 }
 
 /// Whether the profile Hessian serves a model's non-Gaussian endpoints (TTE, binary, CTMM)
@@ -292,13 +249,23 @@ fn x_dirs(n: usize) -> Vec<Dir> {
 /// (`F`, `g_k`).
 fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix<f64>)> {
     let n = plan.pn();
-    let run = plan.run(&[])?;
-    let unit = |o: usize| -> Vec<f64> { (0..=n).map(|c| if c == o { 1.0 } else { 0.0 }).collect() };
-    let rows = plan.reverse(&run, &(0..=n).map(unit).collect::<Vec<_>>())?;
-    // ∇_η F, H = ∂g/∂η and ∂g along `along`, from the inputs' adjoints.
-    let grad_f = DVector::from_fn(n, |k, _| rows[0][plan.eta_slot(k)]);
-    let h = DMatrix::from_fn(n, n, |o, k| rows[1 + o][plan.eta_slot(k)]);
-    let gx = DMatrix::from_fn(n, along.len(), |o, j| plan.along(&rows[1 + o], &along[j]));
+    // ∇_η F, H = ∂g/∂η and ∂g along `along`: from the structured kernel where it serves, else
+    // from the recorded composition's inputs' adjoints.
+    let (grad_f, h, gx) = match plan.struct_mode(along) {
+        Some((g, h, gx)) => (DVector::from_vec(g), h, gx),
+        None => {
+            let run = plan.run(&[], 0)?;
+            let unit = |o: usize| -> Vec<f64> {
+                (0..=n).map(|c| if c == o { 1.0 } else { 0.0 }).collect()
+            };
+            let rows = plan.reverse(&run, &(0..=n).map(unit).collect::<Vec<_>>())?;
+            (
+                DVector::from_fn(n, |k, _| rows[0][plan.eta_slot(k)]),
+                DMatrix::from_fn(n, n, |o, k| rows[1 + o][plan.eta_slot(k)]),
+                DMatrix::from_fn(n, along.len(), |o, j| plan.along(&rows[1 + o], &along[j])),
+            )
+        }
+    };
     // Nonsingular, not necessarily definite: see `mode_solve`.
     let hs = h.symmetric_part();
     let solve: Box<dyn Fn(&DMatrix<f64>) -> Option<DMatrix<f64>>> = match hs.clone().cholesky() {
@@ -317,31 +284,31 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
         .then(|| (wv.iter().copied().collect(), eta_x))
 }
 
-/// Directions per `psi_along` pass: 1, or (tests) the width `PASS_WIDTH_CAP` sets, up to `K`.
-/// One direction per pass is measured 2-2.5x cheaper than `K`-wide passes: a single-tangent
-/// pass carries 2 lanes where a `K`-wide one carries `1 + K` forward and `K` seeds of `1 + K`
-/// lanes in the reverse.
-fn pass_width() -> usize {
+/// Directions per pass of `n_dirs`. A structured subject's pass carries all of them: its
+/// compiled kernels are the reduce's, one tangent per run, and the plans' bases, run once
+/// whatever the directions. A recorded kernel's pass carries one: that kernel's code grows with
+/// the width a pass carries while its arithmetic does not (#2980).
+fn pass_width(structured: bool, n_dirs: usize) -> usize {
     #[cfg(test)]
-    return PASS_WIDTH_CAP
-        .with(|c| c.get())
-        .map_or(1, |w| w.clamp(1, K));
-    #[cfg(not(test))]
-    1
+    if let Some(w) = PASS_WIDTH.with(std::cell::Cell::get) {
+        return w.max(1);
+    }
+    if structured {
+        // A layout carries at most `u8::MAX` tangents (`Layout::tan`).
+        n_dirs.clamp(1, usize::from(u8::MAX))
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Test switch: cap `psi_along`'s directions per pass.
-    pub(crate) static PASS_WIDTH_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test switch: every pass carries exactly this many directions (the last one fewer).
+    pub(crate) static PASS_WIDTH: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn hessian_with(
-    sc: &Scoped,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    objective: Objective,
+    sc: &Scoped, subject: &Subject, template: &ModelParameters, x: &[f64], objective: Objective,
     sel: HessianSel<'_>,
 ) -> Option<HessianOut> {
     let (model, params) = (sc.model, sc.params);
@@ -353,16 +320,8 @@ fn hessian_with(
     if let Some(red) = NnReduction::build(model, subject, template, &params.theta)
         .filter(|_| !nn_reduce_off() && !matches!(sel, HessianSel::Block(_)))
     {
-        let plan = CovPlan::new(
-            &ctx,
-            sc,
-            subject,
-            template,
-            x,
-            objective,
-            &so,
-            Some(red.z.as_slice()),
-        );
+        let plan =
+            CovPlan::new(&ctx, sc, subject, template, x, objective, &so, Some(red.z.as_slice()));
         if let Some(h) = red.hessian(model, &plan, template, x, sc.width, sel) {
             #[cfg(test)]
             NN_REDUCED_HITS.with(|c| c.set(c.get() + 1));
@@ -383,16 +342,20 @@ fn hessian_with(
         .map(|(c, &i)| Dir::x(i, (0..sc.width).map(|k| eta_x[(k, c)]).collect()))
         .collect();
     let out = match sel {
-        HessianSel::Full | HessianSel::Block(_) => HessianOut::Full(psi_along(&plan, &w, &dirs)?.1),
+        HessianSel::Full => HessianOut::Full(psi_along(&plan, &w, &dirs)?.1),
+        HessianSel::Block(_) => {
+            let (g, h) = psi_along(&plan, &w, &dirs)?;
+            HessianOut::Block(g.as_slice().to_vec(), h)
+        }
         HessianSel::Diag(_) => HessianOut::Diag(psi_diag(&plan, &w, &dirs)?),
     };
     out.all_finite().then_some(out)
 }
 
-/// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by reverse over forward: per pass,
-/// `width` (≤ `K`) of the directions as the forward tangents, and one sweep whose lane `a`
-/// is `∂Ψ_w/∂u_a`, so its leaf adjoints are the column `∇²Ψ_w u_a`, read along every
-/// direction. Symmetrised: the two triangles agree to rounding.
+/// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by forward over reverse: per pass, the
+/// directions as the forward tangents, and one sweep of `Ψ_w` whose adjoints' tangent `a` is
+/// the column `∇²Ψ_w u_a`, read along every direction. Symmetrised: the two triangles agree
+/// to rounding.
 fn psi_along(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<(DVector<f64>, DMatrix<f64>)> {
     let n = dirs.len();
     let mut grad = DVector::<f64>::zeros(n);
@@ -414,41 +377,82 @@ fn psi_diag(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<Vec<f64>> {
     Some(diag)
 }
 
-/// The passes [`psi_along`] and [`psi_diag`] share: per pass `pass_width()` (≤ `K`) of `dirs`
-/// as the plan's tangents, and one reverse seeded with each tangent component of
-/// `Ψ_w = F − wᵀg`, then `lane(i, ∂Ψ_w/∂u_i, along)` for each direction `i` in the pass,
-/// where `along(d)` reads `d`'s component of the column `∇²Ψ_w u_i` off that seed's
-/// reverse.
+/// The passes [`psi_along`] and [`psi_diag`] share: per pass [`pass_width`] of `dirs` as the
+/// plan's tangents and one forward-over-reverse sweep of `Ψ_w = F − wᵀg` (under the test
+/// switch, a reverse per direction), then `lane(i, ∂Ψ_w/∂u_i, along)` for each direction `i`
+/// in the pass, where `along(d)` reads `d`'s component of the column `∇²Ψ_w u_i`.
 fn psi_lanes(
-    plan: &CovPlan<'_>,
-    w: &[f64],
-    dirs: &[Dir],
+    plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir],
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
+    let declined = plan.st_declined.get();
+    match psi_passes(plan, w, dirs, &mut lane) {
+        // The structured form did not hold at this point ([`CovPlan::run`]): every pass again,
+        // on the recorded kernels.
+        None if !declined && plan.st_declined.get() => psi_passes(plan, w, dirs, &mut lane),
+        r => r,
+    }
+}
+
+/// [`psi_lanes`]' passes at the width the plan's kernel takes.
+fn psi_passes(
+    plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir],
+    lane: &mut impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
+) -> Option<()> {
     let n = plan.pn();
-    let width = pass_width().clamp(1, K);
+    let width = pass_width(plan.structured(), dirs.len());
+    let l = 1 + width;
+    plan.prepare(dirs);
     for (c, chunk) in dirs.chunks(width).enumerate() {
-        let run = plan.run(chunk)?;
-        let l = 1 + run.kt;
+        let run = plan.run(chunk, width)?;
         let out = run.out();
-        // Seed `a`: `F`'s tangent lane `a` and `−w_k` on each `g_k`'s.
-        let seeds: Vec<Vec<f64>> = (0..chunk.len())
-            .map(|a| {
-                let mut s = vec![0.0; (1 + n) * l];
-                s[1 + a] = 1.0;
-                for k in 0..n {
-                    s[(1 + k) * l + 1 + a] = -w[k];
-                }
-                s
-            })
-            .collect();
-        let rows = plan.reverse(&run, &seeds)?;
+        let rows = if reverse_per_direction() {
+            // Seed `a`: `F`'s tangent lane `a` and `−w_k` on each `g_k`'s.
+            let seeds: Vec<Vec<f64>> = (0..chunk.len())
+                .map(|a| {
+                    let mut s = vec![0.0; (1 + n) * l];
+                    s[1 + a] = 1.0;
+                    for k in 0..n {
+                        s[(1 + k) * l + 1 + a] = -w[k];
+                    }
+                    s
+                })
+                .collect();
+            plan.reverse(&run, &seeds)?
+        } else {
+            // One sweep: `Ψ_w`'s seed on the value lanes, every direction's column on the
+            // adjoints' tangent lanes.
+            let mut s = vec![0.0; (1 + n) * l];
+            s[0] = 1.0;
+            for k in 0..n {
+                s[(1 + k) * l] = -w[k];
+            }
+            plan.reverse_tangent(&run, &s)?
+        };
         for a in 0..chunk.len() {
-            let psi_a = out[1 + a] - (0..n).map(|k| w[k] * out[(1 + k) * l + 1 + a]).sum::<f64>();
+            let psi_a = match run.psi.borrow().as_ref() {
+                Some(p) => p[a],
+                None => out[1 + a] - (0..n).map(|k| w[k] * out[(1 + k) * l + 1 + a]).sum::<f64>(),
+            };
             lane(c * width + a, psi_a, &|d: &Dir| plan.along(&rows[a], d));
         }
     }
     Some(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch (#2980): the columns by a reverse per direction (reverse over forward), the
+    /// forward-over-reverse sweep's oracle.
+    pub(crate) static REVERSE_PER_DIRECTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn reverse_per_direction() -> bool {
+    #[cfg(test)]
+    return REVERSE_PER_DIRECTION.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
 }
 
 #[cfg(all(test, feature = "nn"))]
@@ -497,10 +501,7 @@ impl<'s> NnReduction<'s> {
     /// `None` when the reduction does not hold (a weight read directly, an input that
     /// varies over the subject's records) or does not pay (fewer weights than outputs).
     pub(super) fn build(
-        model: &CompiledModel,
-        subject: &'s Subject,
-        template: &ModelParameters,
-        theta: &[f64],
+        model: &CompiledModel, subject: &'s Subject, template: &ModelParameters, theta: &[f64],
     ) -> Option<Self> {
         if model.covariate_nns.is_empty()
             || !crate::sens::provider::nn_output_chain_supported(model)
@@ -519,17 +520,10 @@ impl<'s> NnReduction<'s> {
             let rep = crate::estimation::nn_theta_gradient::static_nn_input_map(subject, names)?;
             // Every recording reads the subject-static map or a per-record one; both must
             // give these outputs.
-            if names
-                .iter()
-                .any(|k| rep.get(k) != subject.covariates.get(k))
-            {
+            if names.iter().any(|k| rep.get(k) != subject.covariates.get(k)) {
                 return None;
             }
-            z.push(
-                nn.mapper
-                    .forward_raw(&theta[nn.weights_offset..end], rep)
-                    .ok()?,
-            );
+            z.push(nn.mapper.forward_raw(&theta[nn.weights_offset..end], rep).ok()?);
             nets.push((nn.weights_offset, n_w, rep));
         }
         let n_w: usize = nets.iter().map(|n| n.1).sum();
@@ -538,13 +532,8 @@ impl<'s> NnReduction<'s> {
     }
 
     fn hessian(
-        &self,
-        model: &CompiledModel,
-        plan: &CovPlan<'_>,
-        template: &ModelParameters,
-        x: &[f64],
-        width: usize,
-        sel: HessianSel<'_>,
+        &self, model: &CompiledModel, plan: &CovPlan<'_>, template: &ModelParameters, x: &[f64],
+        width: usize, sel: HessianSel<'_>,
     ) -> Option<HessianOut> {
         let n = x.len();
         let n_z: usize = self.z.iter().map(Vec::len).sum();
@@ -557,11 +546,8 @@ impl<'s> NnReduction<'s> {
         let (jz, hz) = self.network_jets(model, plan.subject, template, x)?;
 
         // The mode's response along the rest axes and the outputs.
-        let along: Vec<Dir> = rest
-            .iter()
-            .map(|&i| Dir::x(i, Vec::new()))
-            .chain((0..n_z).map(Dir::z))
-            .collect();
+        let along: Vec<Dir> =
+            rest.iter().map(|&i| Dir::x(i, Vec::new())).chain((0..n_z).map(Dir::z)).collect();
         let (w, resp) = mode_response(plan, &along)?;
         let basis: Vec<Dir> = rest
             .iter()
@@ -628,11 +614,7 @@ impl<'s> NnReduction<'s> {
     /// nonzero `∂²z_k/∂x_a∂x_b` over its network's weights, through θ's packing chain.
     #[allow(clippy::type_complexity)]
     fn network_jets(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        template: &ModelParameters,
-        x: &[f64],
+        &self, model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     ) -> Option<(Vec<(usize, Vec<f64>)>, Vec<Vec<((usize, usize), f64)>>)> {
         let n_z: usize = self.z.iter().map(Vec::len).sum();
         let mut jz: Vec<(usize, Vec<f64>)> = Vec::new();
@@ -645,26 +627,20 @@ impl<'s> NnReduction<'s> {
             let mut jcols: Vec<Vec<f64>> = vec![vec![0.0; n_z]; n_w];
             // The network as a plan over θ's packed coordinates (#2786): its outputs' rows from
             // one reverse per output, and per output the Hessian columns along the weights in
-            // blocks of `K` (reverse over forward, as `psi_along`).
+            // passes of [`pass_width`] (a recorded kernel's), one forward-over-reverse sweep per
+            // pass (as `psi_lanes`, #2980).
             let record = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
                 let th = unpack_theta(template, |m| lv[m]);
-                let out = model.covariate_nns[net]
-                    .mapper
-                    .forward_raw_g(&th[off..off + n_w], cov);
+                let out = model.covariate_nns[net].mapper.forward_raw_g(&th[off..off + n_w], cov);
                 (out.len() == mlp_out).then_some(out)
             };
             let variant = super::kernel::variant_of(&(7u8, net, off, n_w));
+            let width = pass_width(false, n_w);
             let run = |dirs: &[usize]| {
                 let (layout, l) = if dirs.is_empty() {
                     (Layout::F64, 1)
                 } else {
-                    (
-                        Layout {
-                            tan: K as u8,
-                            ..Layout::F64
-                        },
-                        1 + K,
-                    )
+                    (Layout { tan: width as u8, ..Layout::F64 }, 1 + width)
                 };
                 let mut inputs = vec![0.0; n_th * l];
                 for (m, &v) in x[..n_th].iter().enumerate() {
@@ -685,9 +661,7 @@ impl<'s> NnReduction<'s> {
             };
             let kr = run(&[])?;
             let unit = |o: usize| -> Vec<f64> {
-                (0..mlp_out)
-                    .map(|c| if c == o { 1.0 } else { 0.0 })
-                    .collect()
+                (0..mlp_out).map(|c| if c == o { 1.0 } else { 0.0 }).collect()
             };
             let rows = kr.reverse_values(&(0..mlp_out).map(unit).collect::<Vec<_>>())?;
             for (o, row) in rows.iter().enumerate() {
@@ -695,21 +669,40 @@ impl<'s> NnReduction<'s> {
                     jcols[i - off][z0 + o] = row[i];
                 }
             }
-            let l = 1 + K;
-            for blk in (off..off + n_w).collect::<Vec<_>>().chunks(K) {
+            let l = 1 + width;
+            for blk in (off..off + n_w).collect::<Vec<_>>().chunks(width) {
                 let kr = run(blk)?;
+                // One forward-over-reverse sweep, a seed per output on its value lane: tangent
+                // `p` of each weight's adjoint in row `o` is output `o`'s column along `blk[p]`.
+                let rows = if reverse_per_direction() {
+                    None
+                } else {
+                    let mut seeds = vec![0.0; mlp_out * mlp_out * l];
+                    for o in 0..mlp_out {
+                        seeds[o * mlp_out * l + o * l] = 1.0;
+                    }
+                    Some(kr.reverse_tangent_flat(&seeds, mlp_out)?)
+                };
+                let row_w = n_th * l;
                 for o in 0..mlp_out {
-                    let seeds: Vec<Vec<f64>> = (0..blk.len())
-                        .map(|p| {
-                            let mut s = vec![0.0; mlp_out * l];
-                            s[o * l + 1 + p] = 1.0;
-                            s
-                        })
-                        .collect();
-                    let adj = kr.reverse(&seeds)?;
+                    // Under the oracle switch, a reverse per direction seeded on tangent lane
+                    // `p`, whose value lanes are the same column.
+                    let column: Box<dyn Fn(usize, usize) -> f64 + '_> = if let Some(r) = &rows {
+                        Box::new(move |p, j| r[o * row_w + j * l + 1 + p])
+                    } else {
+                        let seeds: Vec<Vec<f64>> = (0..blk.len())
+                            .map(|p| {
+                                let mut s = vec![0.0; mlp_out * l];
+                                s[o * l + 1 + p] = 1.0;
+                                s
+                            })
+                            .collect();
+                        let adj = kr.reverse(&seeds)?;
+                        Box::new(move |p, j| adj[p][j * l])
+                    };
                     for (p, &i) in blk.iter().enumerate() {
                         for j in off..off + n_w {
-                            let v = adj[p][j * l];
+                            let v = column(p, j);
                             if v != 0.0 {
                                 hz[z0 + o].push(((i, j), v));
                             }
@@ -730,9 +723,9 @@ impl<'s> NnReduction<'s> {
 /// the quadrature (more than one node) the kernel runs in two stages: the first returns the
 /// nodes `b_j` (a function of the anchor), the node predictions (and term values) are the
 /// plans' at `b_j`, and the second scores them. Every plan runs at the value layout
-/// (`mode_response`) or along up to `K` directions (`psi_lanes`, the plans' tangent layout);
-/// one multi-seed reverse runs back through every stage, θ's packing chain closed by hand
-/// (its second derivative included).
+/// (`mode_response`) or along a pass's directions (`psi_lanes`, the plans' tangent layout);
+/// one reverse — multi-seed, or forward over reverse — runs back through every stage, θ's
+/// packing chain closed by hand (its second derivative included).
 pub(super) struct CovPlan<'a> {
     ctx: &'a LikCtx<'a>,
     sc: &'a Scoped<'a>,
@@ -750,6 +743,22 @@ pub(super) struct CovPlan<'a> {
     d2: Vec<f64>,
     second: bool,
     variant: kj::Desc,
+    /// The θ the prediction plans carry on their η axes ([`MuFold`], #2982).
+    fold: Option<MuFold>,
+    /// The axes the Hessian's directions move ([`Self::prepare`]); `None`: every plan along
+    /// the passes' directions.
+    moved: std::cell::RefCell<Option<Moved>>,
+    /// Each plan's run along its input axes, kept for every pass ([`basis`]).
+    bases: std::cell::RefCell<std::collections::HashMap<PlanKey, Basis>>,
+    /// The structured kernel's rows at this point ([`st`]), formed on the first pass.
+    st_rows: std::cell::RefCell<Option<st::Rows>>,
+    /// The structured kernel's reduce plan, once looked up.
+    st_reduce: std::cell::RefCell<[Option<std::sync::Arc<kj::Plan>>; 2]>,
+    /// A quadrature subject's rows at its nodes ([`st::NodeRows`]).
+    st_node_rows: std::cell::RefCell<Option<st::NodeRows>>,
+    /// Set where the structured form does not hold at this point ([`Self::run`]): every later
+    /// pass takes the recorded kernel, one direction a pass ([`pass_width`]).
+    st_declined: std::cell::Cell<bool>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -778,14 +787,8 @@ struct Slots {
 impl Slots {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        n: usize,
-        n_obs: usize,
-        n_rows: usize,
-        lb: usize,
-        has_pop: bool,
-        nb: Option<usize>,
-        nx: usize,
-        n_nodes: usize,
+        n: usize, n_obs: usize, n_rows: usize, lb: usize, has_pop: bool, nb: Option<usize>,
+        nx: usize, n_nodes: usize,
     ) -> Self {
         let pop = n_rows * lb;
         let ng = pop + if has_pop { n_obs } else { 0 };
@@ -825,9 +828,87 @@ impl Slots {
 }
 
 /// A plan run kept for its reverse: the plan, its forward, its layout.
+/// A plan's runs along `n` input axes at one tangent each (`inputs(a)`: axis `a`'s inputs at
+/// that layout): one forward with the primal shared ([`kj::Plan::forward_rows`], #2980), or —
+/// where some chunk has no such kernel — one forward per axis. Either way one [`Kept`] per axis,
+/// as a one-tangent run keeps it; `None` where a run fails or the guard does not hold.
+fn rows_or_each(
+    pl: &PlanArc, n: usize, inputs: impl Fn(usize) -> (Vec<f64>, Vec<f64>), base: Layout,
+    n_obs: usize,
+) -> Option<Vec<Kept>> {
+    let lt = Layout { tan: 1, ..base };
+    let (l, w) = (base.lanes(), lt.lanes());
+    // The packed inputs' values (the base lanes) and, per axis, their tangents.
+    let packed: Vec<(Vec<f64>, Vec<f64>)> = (0..n).map(&inputs).collect();
+    let split = |v: &[f64], tan: bool| -> Vec<f64> {
+        v.chunks(w).flat_map(|s| if tan { &s[l..] } else { &s[..l] }).copied().collect()
+    };
+    if let Some(&(ref u0, ref p0)) = packed.first().filter(|_| pl.rows_serve(base)) {
+        let (u, p) = (split(u0, false), split(p0, false));
+        let tu: Vec<f64> = packed
+            .iter()
+            .flat_map(|(u1, p1)| {
+                let mut t = split(u1, true);
+                t.extend(split(p1, true));
+                t
+            })
+            .collect();
+        if let Some(rf) = pl.forward_rows(base, &u, &p, &tu, n) {
+            if !pl.rows_guard(&rf) {
+                return None;
+            }
+            let rf = std::rc::Rc::new(rf);
+            return Some(
+                (0..n)
+                    .map(|sd| {
+                        // Each output's values, then this axis's tangents: a one-tangent run's.
+                        let mut du = vec![0.0; (n_obs + 1) * w];
+                        for o in 0..n_obs {
+                            let (v, t) = pl.rows_out(&rf, o, sd);
+                            du[o * w..o * w + l].copy_from_slice(v);
+                            du[o * w + l..(o + 1) * w].copy_from_slice(t);
+                        }
+                        du[n_obs * w] = 1.0;
+                        Kept { plan: pl.clone(), fwd: KeptFwd::Rows(rf.clone()), layout: lt, du }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    packed
+        .into_iter()
+        .map(|(u, p)| {
+            let mut du = vec![0.0; (n_obs + 1) * w];
+            let fwd = pl.forward_layout(lt, &u, &p, &mut du)?;
+            (du[n_obs * w] == 1.0).then(|| Kept {
+                plan: pl.clone(),
+                fwd: KeptFwd::One(fwd),
+                layout: lt,
+                du,
+            })
+        })
+        .collect()
+}
+
+/// A kept run's forward: its own, or its share of a forward along several axes at once.
+enum KeptFwd {
+    One(kj::Fwd),
+    Rows(std::rc::Rc<kj::RowsFwd>),
+}
+
+impl KeptFwd {
+    /// Its own forward (a run along a pass's directions always has one).
+    fn one(&self) -> Option<&kj::Fwd> {
+        match self {
+            KeptFwd::One(f) => Some(f),
+            KeptFwd::Rows(_) => None,
+        }
+    }
+}
+
 struct Kept {
     plan: PlanArc,
-    fwd: kj::Fwd,
+    fwd: KeptFwd,
     layout: Layout,
     du: Vec<f64>,
 }
@@ -836,8 +917,8 @@ impl Kept {
     /// Output `o`'s base lane `x` along tangent `a` (`None`: the value).
     fn out(&self, o: usize, x: usize, a: Option<usize>) -> f64 {
         let (l, lb) = (self.layout.lanes(), self.layout.base_lanes());
-        let tan = self.layout.tan as usize;
-        self.du[o * l + a.map_or(x, |a| lb + x * tan + a)]
+        let kt = self.layout.tan as usize;
+        self.du[o * l + a.map_or(x, |a| lb + x * kt + a)]
     }
 }
 
@@ -847,49 +928,44 @@ pub(super) struct CovRun {
     kt: usize,
     /// The packed axis each tangent moves.
     dir_x: Vec<Option<usize>>,
-    pred: Option<Kept>,
+    pred: Option<PlanRun>,
     /// An SDE subject's EKF variance rows, a plan over θ then σ.
-    var: Option<Kept>,
-    pop: Option<Kept>,
-    ng: Option<Kept>,
+    var: Option<PlanRun>,
+    pop: Option<PlanRun>,
+    ng: Option<PlanRun>,
     /// Per node: its predictions', its term's and its variance rows' plans.
-    nodes: Vec<(Option<Kept>, Option<Kept>, Option<Kept>)>,
+    nodes: Vec<(Option<PlanRun>, Option<PlanRun>, Option<PlanRun>)>,
     k1: Option<super::kernel::KernelRun>,
-    k2: super::kernel::KernelRun,
+    /// The recorded likelihood kernel; `None` where the pass takes the structured kernel.
+    k2: Option<super::kernel::KernelRun>,
+    /// The structured kernel's inputs (every kernel input's value, then its tangents): the
+    /// pass's [`st`] form instead of `k2`.
+    st_inputs: Option<Vec<f64>>,
+    /// The structured pass's `ψ_a`, set by its sweep.
+    psi: std::cell::RefCell<Option<Vec<f64>>>,
 }
 
 impl CovRun {
-    /// The kernel's outputs: per output (`F`, then each `g_k`), its value and `K` tangents
+    /// The kernel's outputs: per output (`F`, then each `g_k`), its value and `kt` tangents
     /// (the value alone at the value layout).
     pub(super) fn out(&self) -> &[f64] {
-        &self.k2.out
+        self.k2.as_ref().map_or(&[][..], |k| &k.out[..])
     }
 }
 
 impl<'a> CovPlan<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        ctx: &'a LikCtx<'a>,
-        sc: &'a Scoped<'a>,
-        subject: &'a Subject,
-        template: &'a ModelParameters,
-        x: &'a [f64],
-        objective: Objective,
-        so: &'a StackedOmega,
+        ctx: &'a LikCtx<'a>, sc: &'a Scoped<'a>, subject: &'a Subject,
+        template: &'a ModelParameters, x: &'a [f64], objective: Objective, so: &'a StackedOmega,
         nn_z: Option<&'a [Vec<f64>]>,
     ) -> Self {
         let nz = nn_z.map_or(0, |z| z.iter().map(Vec::len).sum());
         let n_th = template.theta.len();
         let logp = |m: usize| theta_packs_log(template.theta_lower[m]);
-        let th: Vec<f64> = (0..n_th)
-            .map(|m| if logp(m) { x[m].exp() } else { x[m] })
-            .collect();
-        let d1: Vec<f64> = (0..n_th)
-            .map(|m| if logp(m) { th[m] } else { 1.0 })
-            .collect();
-        let d2: Vec<f64> = (0..n_th)
-            .map(|m| if logp(m) { th[m] } else { 0.0 })
-            .collect();
+        let th: Vec<f64> = (0..n_th).map(|m| if logp(m) { x[m].exp() } else { x[m] }).collect();
+        let d1: Vec<f64> = (0..n_th).map(|m| if logp(m) { th[m] } else { 1.0 }).collect();
+        let d2: Vec<f64> = (0..n_th).map(|m| if logp(m) { th[m] } else { 0.0 }).collect();
         let second = matches!(objective, Objective::Agq { exact: true, .. });
         let (ka, n_agq) = match objective {
             Objective::Foce => (0u8, 0),
@@ -902,6 +978,8 @@ impl<'a> CovPlan<'a> {
             sc.width,
             &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
         ));
+        let fold =
+            if basis::mu_fold_off() { None } else { MuFold::at(sc.model, subject, &th, &sc.eta) };
         CovPlan {
             ctx,
             sc,
@@ -918,6 +996,13 @@ impl<'a> CovPlan<'a> {
             d2,
             second,
             variant,
+            fold,
+            moved: std::cell::RefCell::new(None),
+            bases: std::cell::RefCell::new(std::collections::HashMap::new()),
+            st_rows: std::cell::RefCell::new(None),
+            st_reduce: std::cell::RefCell::new([None, None]),
+            st_node_rows: std::cell::RefCell::new(None),
+            st_declined: std::cell::Cell::new(false),
         }
     }
 
@@ -953,12 +1038,8 @@ impl<'a> CovPlan<'a> {
     /// `p_t(i, a)`).
     #[allow(clippy::too_many_arguments)]
     fn plan_inputs(
-        layout: Layout,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        params: &[f64],
-        p_t: &dyn Fn(usize, usize) -> f64,
-        kt: usize,
+        layout: Layout, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64, params: &[f64],
+        p_t: &dyn Fn(usize, usize) -> f64, kt: usize,
     ) -> (Vec<f64>, Vec<f64>) {
         let (l, lb) = (layout.lanes(), layout.base_lanes());
         let mut u = vec![0.0; eta.len() * l];
@@ -991,55 +1072,47 @@ impl<'a> CovPlan<'a> {
     }
 
     /// The parameter slots of a prediction plan: θ, and under the reduced basis the network
-    /// outputs after it; tangent `a` along `dirs[a]`.
-    fn pred_params(&self, dirs: &[Dir]) -> (Vec<f64>, Box<dyn Fn(usize, usize) -> f64 + '_>) {
-        let n_th = self.th.len();
+    /// outputs after it (their tangents: [`Self::param_t`]).
+    fn pred_values(&self) -> Vec<f64> {
         let mut p = self.th.clone();
         if let Some(z) = self.nn_z {
             p.extend(z.iter().flatten());
         }
-        let dirs = dirs.to_vec();
-        (
-            p,
-            Box::new(move |i, a| {
-                if i < n_th {
-                    self.theta_t(&dirs, i, a)
-                } else if dirs.get(a).and_then(|d| d.z) == Some(i - n_th) {
-                    1.0
-                } else {
-                    0.0
-                }
-            }),
-        )
+        p
     }
 
     /// Run a subject's prediction plan at `(θ, eta)` along `eta_t` (base layout `base`).
     #[allow(clippy::too_many_arguments)]
     fn run_pred(
-        &self,
-        model: &CompiledModel,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        dirs: &[Dir],
-        base: Layout,
-        kt: usize,
-    ) -> Option<Kept> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
-        let (params, p_t) = self.pred_params(dirs);
+        &self, model: &CompiledModel, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64,
+        lanes: Lanes<'_>, base: Layout, kt: usize,
+    ) -> Option<Vec<Kept>> {
+        let layout = Layout { tan: kt as u8, ..base };
+        let params = self.pred_values();
+        let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
-        let mut serve = |pl: &PlanArc| -> Option<Kept> {
-            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &*p_t, kt);
+        let mut serve = |pl: &PlanArc| -> Option<Vec<Kept>> {
+            // Along input axes: every axis's run at once, the primal shared (#2980) — or, where a
+            // chunk has no such kernel, one run per axis.
+            if let Lanes::Axes(ax) = lanes {
+                return rows_or_each(
+                    pl,
+                    ax.len(),
+                    |a| {
+                        let ax1 = &ax[a..a + 1];
+                        let et1 = |k: usize, _: usize| eta_t(k, a);
+                        let p1 = |i: usize, _: usize| self.param_t(Lanes::Axes(ax1), i, 0);
+                        Self::plan_inputs(Layout { tan: 1, ..base }, eta, &et1, &params, &p1, 1)
+                    },
+                    base,
+                    n_obs,
+                );
+            }
+            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
-                plan: pl.clone(),
-                fwd,
-                layout,
-                du,
-            })
+            (du[n_obs * layout.lanes()] == 1.0)
+                .then(|| vec![Kept { plan: pl.clone(), fwd: KeptFwd::One(fwd), layout, du }])
         };
         match self.nn_z {
             Some(z) => super::with_plan_nn(model, self.subject, &self.th, eta, z, None, &mut serve),
@@ -1058,42 +1131,33 @@ impl<'a> CovPlan<'a> {
     /// plan's — θ, and under the reduced basis the network outputs — then σ) at `(θ, σ, eta)`
     /// along `eta_t`; σ's tangent along a direction moving its packed coordinate is `dσ/dx = σ`.
     fn run_var(
-        &self,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        dirs: &[Dir],
-        base: Layout,
+        &self, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64, lanes: Lanes<'_>, base: Layout,
         kt: usize,
-    ) -> Option<Kept> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
-        let sigma = self.sc.params.sigma.values.as_slice();
-        let s0 = packed_segments(self.template).sigma_start();
-        let (mut params, pred_t) = self.pred_params(dirs);
-        let n_p = params.len();
-        params.extend_from_slice(sigma);
-        let p_t = |i: usize, a: usize| -> f64 {
-            if i < n_p {
-                pred_t(i, a)
-            } else if dirs.get(a).and_then(|d| d.x) == Some(s0 + i - n_p) {
-                sigma[i - n_p]
-            } else {
-                0.0
+    ) -> Option<Vec<Kept>> {
+        // Several axes: one run each (a single axis is the one-tangent run below).
+        if let Lanes::Axes(ax) = lanes {
+            if ax.len() > 1 {
+                return (0..ax.len())
+                    .map(|a| {
+                        let et1 = |k: usize, _: usize| eta_t(k, a);
+                        self.run_var(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
+                            .and_then(|mut v| v.pop())
+                    })
+                    .collect();
             }
-        };
+        }
+        let layout = Layout { tan: kt as u8, ..base };
+        let sigma = self.sc.params.sigma.values.as_slice();
+        let mut params = self.pred_values();
+        params.extend_from_slice(sigma);
+        let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
-        let mut serve = |pl: &PlanArc| -> Option<Kept> {
+        let mut serve = |pl: &PlanArc| -> Option<Vec<Kept>> {
             let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
-                plan: pl.clone(),
-                fwd,
-                layout,
-                du,
-            })
+            (du[n_obs * layout.lanes()] == 1.0)
+                .then(|| vec![Kept { plan: pl.clone(), fwd: KeptFwd::One(fwd), layout, du }])
         };
         match self.nn_z {
             Some(z) => super::with_plan_nn(
@@ -1119,71 +1183,78 @@ impl<'a> CovPlan<'a> {
 
     /// Run the subject's non-Gaussian term plan at `(θ, eta)` along `eta_t` (base `base`).
     fn run_term(
-        &self,
-        eta: &[f64],
-        eta_t: &dyn Fn(usize, usize) -> f64,
-        dirs: &[Dir],
-        base: Layout,
+        &self, eta: &[f64], eta_t: &dyn Fn(usize, usize) -> f64, lanes: Lanes<'_>, base: Layout,
         kt: usize,
-    ) -> Option<Kept> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
+    ) -> Option<Vec<Kept>> {
+        // Several axes: one run each (a single axis is the one-tangent run below).
+        if let Lanes::Axes(ax) = lanes {
+            if ax.len() > 1 {
+                return (0..ax.len())
+                    .map(|a| {
+                        let et1 = |k: usize, _: usize| eta_t(k, a);
+                        self.run_term(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
+                            .and_then(|mut v| v.pop())
+                    })
+                    .collect();
+            }
+        }
+        let layout = Layout { tan: kt as u8, ..base };
         let plans = super::terms::non_gaussian_plans(self.sc.model, self.subject, &self.th, eta)?;
-        let p_t = |i: usize, a: usize| self.theta_t(dirs, i, a);
+        let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let (u, p) = Self::plan_inputs(layout, eta, eta_t, &self.th, &p_t, kt);
         plans.iter().find_map(|pl| {
             let mut du = vec![0.0; 2 * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[layout.lanes()] == 1.0).then(|| Kept {
-                plan: pl.clone(),
-                fwd,
-                layout,
-                du,
-            })
+            (du[layout.lanes()] == 1.0)
+                .then(|| vec![Kept { plan: pl.clone(), fwd: KeptFwd::One(fwd), layout, du }])
         })
     }
 
-    /// One forward of the composition along `dirs` (the value layout with none).
-    pub(super) fn run(&self, dirs: &[Dir]) -> Option<CovRun> {
+    /// One forward of the composition along `dirs` as `width` tangent lanes (the value layout
+    /// with none; a pass's lanes past its directions carry zeros, so a ragged last pass runs
+    /// at the same layout as the others).
+    pub(super) fn run(&self, dirs: &[Dir], width: usize) -> Option<CovRun> {
         let (model, subject, sc) = (self.sc.model, self.subject, self.sc);
-        // One direction (a covariance-Hessian pass) runs the single-tangent layout: its forward
-        // and reverse carry 2 lanes instead of `1 + K`. Production runs only 0, 1 or `K`
-        // directions; `2..K` (a test's `PASS_WIDTH_CAP`) runs the `K`-tangent layout with the
-        // unused tangents zero (`dirs.get(a)` is `None` there), which is exact, only wider.
-        assert!(dirs.len() <= K, "{} directions > K = {K}", dirs.len());
-        let kt = match dirs.len() {
-            0 => 0,
-            1 => 1,
-            _ => K,
-        };
+        let kt = if dirs.is_empty() { 0 } else { width };
+        if dirs.len() > kt {
+            return None;
+        }
         let lk = 1 + kt;
         let n_obs = subject.observations.len();
         let pn = sc.width;
         let nq = if self.second { pn * (pn + 1) / 2 } else { 0 };
         let eta = &sc.eta[..pn];
-        let eta_t = |k: usize, a: usize| {
-            dirs.get(a)
-                .and_then(|d| d.eta.get(k))
-                .copied()
-                .unwrap_or(0.0)
-        };
+        let eta_t =
+            |k: usize, a: usize| dirs.get(a).and_then(|d| d.eta.get(k)).copied().unwrap_or(0.0);
         // The predictions with their η-jets, and an SDE's variance rows beside them.
-        let base = Layout {
-            n: pn as u16,
-            m: nq as u16,
-            th: false,
-            wide: false,
-            tan: 0,
-        };
+        let base = Layout { n: pn as u16, m: nq as u16, th: false, wide: false, tan: 0 };
+        let n_par = self.th.len() + self.nz;
+        let n_sig = self.sc.params.sigma.values.len();
         let pred = if n_obs > 0 {
-            Some(self.run_pred(model, eta, &eta_t, dirs, base, kt)?)
+            Some(self.plan_run(
+                PlanKey::Pred,
+                dirs,
+                pn,
+                n_par,
+                true,
+                &eta_t,
+                kt,
+                &|lanes, et, k| self.run_pred(model, eta, et, lanes, base, k),
+            )?)
         } else {
             None
         };
         let var = if n_obs > 0 && model.is_sde() {
-            Some(self.run_var(eta, &eta_t, dirs, base, kt)?)
+            Some(self.plan_run(
+                PlanKey::Var,
+                dirs,
+                pn,
+                n_par + n_sig,
+                true,
+                &eta_t,
+                kt,
+                &|lanes, et, k| self.run_var(eta, et, lanes, base, k),
+            )?)
         } else {
             None
         };
@@ -1205,7 +1276,16 @@ impl<'a> CovPlan<'a> {
         {
             let zero_t = |_: usize, _: usize| 0.0;
             let zeros = vec![0.0; pn];
-            Some(self.run_pred(sc.pop_model, &zeros, &zero_t, dirs, Layout::F64, kt)?)
+            Some(self.plan_run(
+                PlanKey::Pop,
+                dirs,
+                pn,
+                n_par,
+                false,
+                &zero_t,
+                kt,
+                &|lanes, et, k| self.run_pred(sc.pop_model, &zeros, et, lanes, Layout::F64, k),
+            )?)
         } else {
             None
         };
@@ -1213,15 +1293,20 @@ impl<'a> CovPlan<'a> {
         let nb = model.n_eta;
         let ng = if has_ng {
             let base = super::terms::layout2(nb);
-            Some(self.run_term(&sc.eta[..nb], &eta_t, dirs, base, kt)?)
+            Some(self.plan_run(
+                PlanKey::Term,
+                dirs,
+                nb,
+                self.th.len(),
+                true,
+                &eta_t,
+                kt,
+                &|lanes, et, k| self.run_term(&sc.eta[..nb], et, lanes, base, k),
+            )?)
         } else {
             None
         };
-        let n_nodes = if is_agq && n_agq > 1 {
-            agq_grid(n_agq, sc.width).len()
-        } else {
-            0
-        };
+        let n_nodes = if is_agq && n_agq > 1 { agq_grid(n_agq, sc.width).len() } else { 0 };
         let slots = Slots::new(
             pn,
             n_obs,
@@ -1246,52 +1331,33 @@ impl<'a> CovPlan<'a> {
                 put_in(&mut inputs, lk, $slot, $v, $t)
             };
         }
+        let po = |pr: &PlanRun, j: usize, x: usize, a: Option<usize>| self.plan_out(pr, j, x, a);
         if let Some(pk) = pred.as_ref() {
             for j in 0..n_obs {
                 for x in 0..lb {
-                    put!(slots.f(j, x), pk.out(j, x, None), &|a| pk.out(
-                        j,
-                        x,
-                        Some(a)
-                    ));
+                    put!(slots.f(j, x), po(pk, j, x, None), &|a| po(pk, j, x, Some(a)));
                 }
             }
         }
         if let Some(vk) = var.as_ref() {
             for j in 0..n_obs {
                 for x in 0..lb {
-                    put!(slots.f(n_obs + j, x), vk.out(j, x, None), &|a| vk.out(
-                        j,
-                        x,
-                        Some(a)
-                    ));
+                    put!(slots.f(n_obs + j, x), po(vk, j, x, None), &|a| po(vk, j, x, Some(a)));
                 }
             }
         }
         if let Some(pp) = pop.as_ref() {
             for j in 0..n_obs {
-                put!(slots.pop + j, pp.out(j, 0, None), &|a| pp.out(
-                    j,
-                    0,
-                    Some(a)
-                ));
+                put!(slots.pop + j, po(pp, j, 0, None), &|a| po(pp, j, 0, Some(a)));
             }
         }
         if let Some(t) = ng.as_ref() {
-            put!(slots.ng, t.out(0, 0, None), &|a| t.out(0, 0, Some(a)));
+            put!(slots.ng, po(t, 0, 0, None), &|a| po(t, 0, 0, Some(a)));
             for k in 0..nb {
-                put!(slots.ng_g(k), t.out(0, 1 + k, None), &|a| t.out(
-                    0,
-                    1 + k,
-                    Some(a)
-                ));
+                put!(slots.ng_g(k), po(t, 0, 1 + k, None), &|a| po(t, 0, 1 + k, Some(a)));
                 for l in 0..=k {
                     let h = super::terms::h_lane(nb, k, l);
-                    put!(slots.ng_h(k, l), t.out(0, h, None), &|a| t.out(
-                        0,
-                        h,
-                        Some(a)
-                    ));
+                    put!(slots.ng_h(k, l), po(t, 0, h, None), &|a| po(t, 0, h, Some(a)));
                 }
             }
         }
@@ -1309,33 +1375,50 @@ impl<'a> CovPlan<'a> {
         }
         let record_k1 = |lv: &[kj::Tr]| self.record(&slots, lv, true);
         let record_k2 = |lv: &[kj::Tr]| self.record(&slots, lv, false);
-        let layout_k = if kt > 0 {
-            Layout {
-                tan: kt as u8,
-                ..Layout::F64
-            }
-        } else {
-            Layout::F64
-        };
+        let layout_k = if kt > 0 { Layout { tan: kt as u8, ..Layout::F64 } } else { Layout::F64 };
         // The quadrature's nodes: stage 1, then the node predictions (and term values) there.
         let mut nodes = Vec::new();
+        // A structured quadrature subject's pass takes its nodes from the structured stage 1.
+        let st_nodes = if kt > 0 && slots.n_nodes > 0 && self.structured() {
+            self.struct_nodes(&inputs[..n_base * lk], &slots, kt)
+        } else {
+            None
+        };
         let k1 = if slots.n_nodes > 0 {
-            let k1 = super::kernel::kernel_run(
-                model,
-                subject,
-                super::kernel::variant_of(&(self.variant.bytes(), 1u8, slots.end)),
-                layout_k,
-                &inputs[..n_base * lk],
-                slots.n_nodes * pn,
-                &record_k1,
-            )?;
+            let k1 = match st_nodes {
+                Some(_) => None,
+                None => Some(super::kernel::kernel_run(
+                    model,
+                    subject,
+                    super::kernel::variant_of(&(self.variant.bytes(), 1u8, slots.end)),
+                    layout_k,
+                    &inputs[..n_base * lk],
+                    slots.n_nodes * pn,
+                    &record_k1,
+                )?),
+            };
+            let bout: &[f64] = match (&st_nodes, &k1) {
+                (Some(b), _) => b,
+                (None, Some(k)) => &k.out,
+                (None, None) => return None,
+            };
             for nd in 0..slots.n_nodes {
-                let bv: Vec<f64> = (0..pn).map(|k| k1.out[(nd * pn + k) * lk]).collect();
-                let bt = |k: usize, a: usize| k1.out[(nd * pn + k) * lk + 1 + a];
+                let bv: Vec<f64> = (0..pn).map(|k| bout[(nd * pn + k) * lk]).collect();
+                let bt = |k: usize, a: usize| bout[(nd * pn + k) * lk + 1 + a];
                 let fb = if n_obs > 0 {
-                    let fb = self.run_pred(model, &bv, &bt, dirs, Layout::F64, kt)?;
+                    let fb = self.plan_run(
+                        PlanKey::Node(nd),
+                        dirs,
+                        pn,
+                        n_par,
+                        true,
+                        &bt,
+                        kt,
+                        &|lanes, et, k| self.run_pred(model, &bv, et, lanes, Layout::F64, k),
+                    )?;
                     for j in 0..n_obs {
-                        put!(slots.nf + nd * n_rows + j, fb.out(j, 0, None), &|a| fb.out(
+                        put!(slots.nf + nd * n_rows + j, po(&fb, j, 0, None), &|a| po(
+                            &fb,
                             j,
                             0,
                             Some(a)
@@ -1346,13 +1429,23 @@ impl<'a> CovPlan<'a> {
                     None
                 };
                 let fv = if n_obs > 0 && model.is_sde() {
-                    let fv = self.run_var(&bv, &bt, dirs, Layout::F64, kt)?;
+                    let fv = self.plan_run(
+                        PlanKey::NodeVar(nd),
+                        dirs,
+                        pn,
+                        n_par + n_sig,
+                        true,
+                        &bt,
+                        kt,
+                        &|lanes, et, k| self.run_var(&bv, et, lanes, Layout::F64, k),
+                    )?;
                     for j in 0..n_obs {
-                        put!(
-                            slots.nf + nd * n_rows + n_obs + j,
-                            fv.out(j, 0, None),
-                            &|a| fv.out(j, 0, Some(a))
-                        );
+                        put!(slots.nf + nd * n_rows + n_obs + j, po(&fv, j, 0, None), &|a| po(
+                            &fv,
+                            j,
+                            0,
+                            Some(a)
+                        ));
                     }
                     Some(fv)
                 } else {
@@ -1360,31 +1453,55 @@ impl<'a> CovPlan<'a> {
                 };
                 let qb = if ng.is_some() {
                     let bb: Vec<f64> = bv[..nb].to_vec();
-                    let t = self.run_term(&bb, &bt, dirs, Layout::F64, kt)?;
-                    put!(slots.nq_node + nd, t.out(0, 0, None), &|a| t.out(
-                        0,
-                        0,
-                        Some(a)
-                    ));
+                    let t = self.plan_run(
+                        PlanKey::NodeTerm(nd),
+                        dirs,
+                        nb,
+                        self.th.len(),
+                        true,
+                        &bt,
+                        kt,
+                        &|lanes, et, k| self.run_term(&bb, et, lanes, Layout::F64, k),
+                    )?;
+                    put!(slots.nq_node + nd, po(&t, 0, 0, None), &|a| po(&t, 0, 0, Some(a)));
                     Some(t)
                 } else {
                     None
                 };
                 nodes.push((fb, qb, fv));
             }
-            Some(k1)
+            k1
         } else {
             None
         };
-        let k2 = super::kernel::kernel_run(
-            model,
-            subject,
-            super::kernel::variant_of(&(self.variant.bytes(), 2u8, slots.end)),
-            layout_k,
-            &inputs,
-            1 + pn,
-            &record_k2,
-        )?;
+        // A tangent pass of a structured subject keeps the kernel's inputs for [`st`] instead of
+        // running the recorded kernel — where its rows hold at this point. Where they do not (a
+        // row off its domain, FOCE past its Woodbury gate, where production factors `R̃` itself,
+        // or a structured stage 1 that did not form), this pass is laid out at the structured
+        // width and, under quadrature, has no recorded stage 1: it is declined here and
+        // [`psi_lanes`] reruns every pass on the recorded kernels, one direction each.
+        let structured = kt > 0 && self.structured();
+        if structured
+            && !((slots.n_nodes == 0 || st_nodes.is_some())
+                && self.struct_rows_hold(&inputs, &slots, kt))
+        {
+            self.st_declined.set(true);
+            return None;
+        }
+        let k2 = if structured {
+            None
+        } else {
+            Some(super::kernel::kernel_run(
+                model,
+                subject,
+                super::kernel::variant_of(&(self.variant.bytes(), 2u8, slots.end)),
+                layout_k,
+                &inputs,
+                1 + pn,
+                &record_k2,
+            )?)
+        };
+        let st_inputs = structured.then(|| inputs.clone());
         Some(CovRun {
             slots,
             kt,
@@ -1396,6 +1513,8 @@ impl<'a> CovPlan<'a> {
             nodes,
             k1,
             k2,
+            st_inputs,
+            psi: std::cell::RefCell::new(None),
         })
     }
 
@@ -1410,34 +1529,23 @@ impl<'a> CovPlan<'a> {
         let n_rows = sl.n_rows;
         let pn = sc.width;
         let f: Vec<T> = (0..n_rows).map(|j| lv[sl.f(j, 0)]).collect();
-        let g: Vec<Vec<T>> = (0..n_rows)
-            .map(|j| (0..pn).map(|k| lv[sl.f(j, 1 + k)]).collect())
-            .collect();
+        let g: Vec<Vec<T>> =
+            (0..n_rows).map(|j| (0..pn).map(|k| lv[sl.f(j, 1 + k)]).collect()).collect();
         let eo: Vec<T> = (0..pn).map(|k| lv[sl.eta + k]).collect();
         let xl = &lv[sl.x..sl.x + self.nx];
         let xo = |i: usize| xl[i];
         let theta: Vec<T> = unpack_theta(template, xo);
         let p = population_params(model, subject, template, sc.params, self.so, &theta, xo)?;
-        let fpop: Option<Vec<T>> = sl
-            .has_pop
-            .then(|| (0..n_obs).map(|j| lv[sl.pop + j]).collect());
+        let fpop: Option<Vec<T>> = sl.has_pop.then(|| (0..n_obs).map(|j| lv[sl.pop + j]).collect());
         let ng = sl.has_ng.then(|| {
             let nb = sl.nb;
             crate::sens::focei_kernel::NonGauss {
                 q: lv[sl.ng],
-                g: (0..pn)
-                    .map(|k| if k < nb { lv[sl.ng_g(k)] } else { c(0.0) })
-                    .collect(),
+                g: (0..pn).map(|k| if k < nb { lv[sl.ng_g(k)] } else { c(0.0) }).collect(),
                 h: (0..pn)
                     .map(|k| {
                         (0..pn)
-                            .map(|l| {
-                                if k < nb && l < nb {
-                                    lv[sl.ng_h(k, l)]
-                                } else {
-                                    c(0.0)
-                                }
-                            })
+                            .map(|l| if k < nb && l < nb { lv[sl.ng_h(k, l)] } else { c(0.0) })
                             .collect()
                     })
                     .collect(),
@@ -1465,11 +1573,7 @@ impl<'a> CovPlan<'a> {
                 // FOCEI's H̃ — jittered as production's proposal is.
                 let mut h_a: Vec<Vec<T>> = if exact {
                     let q: Vec<Vec<T>> = (0..n_rows)
-                        .map(|j| {
-                            (0..pn * (pn + 1) / 2)
-                                .map(|t| lv[sl.f(j, 1 + pn + t)])
-                                .collect()
-                        })
+                        .map(|j| (0..pn * (pn + 1) / 2).map(|t| lv[sl.f(j, 1 + pn + t)]).collect())
                         .collect();
                     crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &f, &g, &q, &eo, &p)?
                 } else {
@@ -1521,11 +1625,7 @@ impl<'a> CovPlan<'a> {
                             .map(|k| eo[k] + c(std::f64::consts::SQRT_2) * step[k])
                             .collect();
                         let fb: Vec<T> = (0..n_rows).map(|j| lv[sl.nf + nd * n_rows + j]).collect();
-                        let qb = if sl.has_ng {
-                            lv[sl.nq_node + nd]
-                        } else {
-                            c(0.0)
-                        };
+                        let qb = if sl.has_ng { lv[sl.nq_node + nd] } else { c(0.0) };
                         terms.push(c(*cw) - (inner_l(ctx, &fb, &b, &p, None)? + qb));
                     }
                     half_logdet - log_sum_exp(&terms)
@@ -1546,20 +1646,56 @@ impl<'a> CovPlan<'a> {
     /// outputs, `1 + kt` lanes each): per seed, the adjoint of every packed coordinate,
     /// network output and η (`nx + nz + N`).
     pub(super) fn reverse(&self, r: &CovRun, seeds: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+        self.sweep(r, seeds, false)
+    }
+
+    /// Forward over reverse (#2980): one sweep of `run` seeded with `seed` (laid out as the
+    /// kernel's outputs; its value lanes `ū`, its tangent lanes zero) carrying every adjoint's
+    /// tangents along the run's directions. Per direction `a`, the row [`Self::reverse`] gives
+    /// for the seed `ū` on the outputs' tangent lane `a`: the second derivative of `ūᵀ·out`
+    /// along direction `a`, one sweep for every direction.
+    ///
+    /// Each kernel input's adjoint lanes stand in for that reverse's seeds: tangent `a` of the
+    /// value lane's adjoint is seed `a`'s value-lane adjoint, and the value lane's adjoint is
+    /// seed `a`'s adjoint on tangent lane `a` (zero on the others — tangent lanes do not mix).
+    pub(super) fn reverse_tangent(&self, r: &CovRun, seed: &[f64]) -> Option<Vec<Vec<f64>>> {
+        if r.kt == 0 {
+            return None;
+        }
+        self.sweep(r, &[seed.to_vec()], true)
+    }
+
+    /// [`Self::reverse`] (`tangent` false: a reverse per seed) and [`Self::reverse_tangent`]
+    /// (`tangent`: one seed, its adjoints' tangents carried; a row per direction).
+    fn sweep(&self, r: &CovRun, seeds: &[Vec<f64>], tangent: bool) -> Option<Vec<Vec<f64>>> {
         let sl = &r.slots;
         let lk = 1 + r.kt;
-        let ns = seeds.len();
+        let ns = if tangent { r.kt } else { seeds.len() };
         let pn = self.pn();
         let width = self.nx + self.nz + pn;
         let mut rows = vec![vec![0.0; width]; ns];
         // Stage 2, then the nodes back to their locations, then stage 1.
-        let mut adj = r.k2.reverse(seeds)?;
-        if let Some(k1) = r.k1.as_ref() {
-            let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; ns];
+        let mut pending = None;
+        let mut adj = if tangent {
+            match r.st_inputs.as_ref() {
+                Some(_) => {
+                    let (adj, psi, pend) = self.struct_adjoint(r, &seeds[0])?;
+                    *r.psi.borrow_mut() = Some(psi);
+                    pending = Some(pend);
+                    vec![adj]
+                }
+                None => vec![r.k2.as_ref()?.reverse_tangent(&seeds[0])?.to_vec()],
+            }
+        } else {
+            r.k2.as_ref()?.reverse(seeds)?
+        };
+        if sl.n_nodes > 0 {
+            let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; adj.len()];
             for (nd, (fb, qb, fv)) in r.nodes.iter().enumerate() {
                 let mut node =
-                    |kept: &Kept, slot: &dyn Fn(usize) -> usize, n_out: usize| -> Option<()> {
-                        let back = self.plan_reverse(kept, r, &adj, slot, n_out, &mut rows)?;
+                    |kept: &PlanRun, slot: &dyn Fn(usize) -> usize, n_out: usize| -> Option<()> {
+                        let back =
+                            self.plan_reverse(kept, r, &adj, slot, n_out, tangent, &mut rows)?;
                         for (sd, ub) in back.iter().enumerate() {
                             for k in 0..ub.len() / lk {
                                 for x in 0..lk {
@@ -1579,19 +1715,34 @@ impl<'a> CovPlan<'a> {
                     node(qb, &|_| sl.nq_node + nd, 1)?;
                 }
             }
-            let adj1 = k1.reverse(&b_seeds)?;
-            for (a2, a1) in adj.iter_mut().zip(&adj1) {
-                for (x, y) in a2.iter_mut().zip(a1) {
-                    *x += y;
+            match (pending.take(), r.k1.as_ref()) {
+                // Stage 1 structured: its forward over reverse, then the anchor rows.
+                (Some(pend), _) => self.struct_finish(r, &mut adj[0], pend, Some(&b_seeds[0]))?,
+                (None, Some(k1)) => {
+                    let adj1 = if tangent {
+                        vec![k1.reverse_tangent(&b_seeds[0])?.to_vec()]
+                    } else {
+                        k1.reverse(&b_seeds)?
+                    };
+                    for (a2, a1) in adj.iter_mut().zip(&adj1) {
+                        for (x, y) in a2.iter_mut().zip(a1) {
+                            *x += y;
+                        }
+                    }
                 }
+                (None, None) => return None,
             }
+        }
+        if let Some(pend) = pending.take() {
+            self.struct_finish(r, &mut adj[0], pend, None)?;
         }
         // The predictions, FOCE's population predictions and the term, back to θ and η.
         if let Some(pk) = r.pred.as_ref() {
             let lb = sl.lb;
+            let slot = |j, x| sl.f(j, x);
             let e =
-                self.plan_reverse_lanes(pk, r, &adj, &|j, x| sl.f(j, x), sl.n_obs, lb, &mut rows)?;
-            self.eta_into(&e, lk, &mut rows);
+                self.plan_reverse_lanes(pk, r, &adj, &slot, sl.n_obs, lb, tangent, &mut rows)?;
+            self.eta_into(&e, lk, tangent, &mut rows);
         }
         if let Some(vk) = r.var.as_ref() {
             let lb = sl.lb;
@@ -1602,16 +1753,18 @@ impl<'a> CovPlan<'a> {
                 &|j, x| sl.f(sl.n_obs + j, x),
                 sl.n_obs,
                 lb,
+                tangent,
                 &mut rows,
             )?;
-            self.eta_into(&e, lk, &mut rows);
+            self.eta_into(&e, lk, tangent, &mut rows);
         }
         if let Some(pp) = r.pop.as_ref() {
-            self.plan_reverse(pp, r, &adj, &|j| sl.pop + j, sl.n_obs, &mut rows)?;
+            self.plan_reverse(pp, r, &adj, &|j| sl.pop + j, sl.n_obs, tangent, &mut rows)?;
         }
         if let Some(t) = r.ng.as_ref() {
             let nb = sl.nb;
-            let lb = t.layout.base_lanes();
+            // The term plan's base layout (`run`): value, gradient and Hessian over the BSV block.
+            let lb = super::terms::layout2(nb).base_lanes();
             let slot = |_: usize, x: usize| -> usize {
                 if x == 0 {
                     sl.ng
@@ -1622,26 +1775,28 @@ impl<'a> CovPlan<'a> {
                     sl.ng_h(k, l)
                 }
             };
-            let e = self.plan_reverse_lanes(t, r, &adj, &slot, 1, lb, &mut rows)?;
-            self.eta_into(&e, lk, &mut rows);
+            let e = self.plan_reverse_lanes(t, r, &adj, &slot, 1, lb, tangent, &mut rows)?;
+            self.eta_into(&e, lk, tangent, &mut rows);
         }
         // The kernel's own η and packed coordinates.
         for (sd, row) in rows.iter_mut().enumerate() {
             for k in 0..pn {
-                row[self.eta_slot(k)] += adj[sd][(sl.eta + k) * lk];
+                row[self.eta_slot(k)] += seed_value(&adj, tangent, sd, (sl.eta + k) * lk);
             }
             for i in 0..self.nx {
-                row[i] += adj[sd][(sl.x + i) * lk];
+                row[i] += seed_value(&adj, tangent, sd, (sl.x + i) * lk);
             }
         }
         rows.iter().flatten().all(|v| v.is_finite()).then_some(rows)
     }
 
-    /// The value lanes of a plan's η adjoints (`e`, per seed, `lk` lanes per η) into `rows`.
-    fn eta_into(&self, e: &[Vec<f64>], lk: usize, rows: &mut [Vec<f64>]) {
-        for (row, e) in rows.iter_mut().zip(e) {
-            for k in 0..e.len() / lk {
-                row[self.eta_slot(k)] += e[k * lk];
+    /// The value lanes of a plan's η adjoints (`e`, per seed, `lk` lanes per η) into `rows`
+    /// (under `tangent`, each direction's: see [`seed_value`]).
+    fn eta_into(&self, e: &[Vec<f64>], lk: usize, tangent: bool, rows: &mut [Vec<f64>]) {
+        let Some(first) = e.first() else { return };
+        for (sd, row) in rows.iter_mut().enumerate() {
+            for k in 0..first.len() / lk {
+                row[self.eta_slot(k)] += seed_value(e, tangent, sd, k * lk);
             }
         }
     }
@@ -1650,31 +1805,30 @@ impl<'a> CovPlan<'a> {
     /// its reverse seeded with the kernel's adjoints of them; θ, network outputs and η into
     /// `rows`. Returns the η-input adjoints per seed (all lanes), for a node's location.
     fn plan_reverse(
-        &self,
-        kept: &Kept,
-        r: &CovRun,
-        adj: &[Vec<f64>],
-        slot: &dyn Fn(usize) -> usize,
-        n_out: usize,
-        rows: &mut [Vec<f64>],
+        &self, kept: &PlanRun, r: &CovRun, adj: &[Vec<f64>], slot: &dyn Fn(usize) -> usize,
+        n_out: usize, tangent: bool, rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
         let s2 = |j: usize, x: usize| if x == 0 { slot(j) } else { usize::MAX };
-        self.plan_reverse_lanes(kept, r, adj, &s2, n_out, 1, rows)
+        self.plan_reverse_lanes(kept, r, adj, &s2, n_out, 1, tangent, rows)
     }
 
     /// The general case of [`Self::plan_reverse`]: output `j`'s base lane `x < nl` is kernel
-    /// input `slot(j, x)` (`usize::MAX`: not an input).
+    /// input `slot(j, x)` (`usize::MAX`: not an input). Under `tangent`, `adj` is the one
+    /// forward-over-reverse buffer and the plan's reverse is its own forward over reverse, so
+    /// the plan's adjoints come back in the same form.
     #[allow(clippy::too_many_arguments)]
     fn plan_reverse_lanes(
-        &self,
-        kept: &Kept,
-        r: &CovRun,
-        adj: &[Vec<f64>],
-        slot: &dyn Fn(usize, usize) -> usize,
-        n_out: usize,
-        nl: usize,
-        rows: &mut [Vec<f64>],
+        &self, pr: &PlanRun, r: &CovRun, adj: &[Vec<f64>], slot: &dyn Fn(usize, usize) -> usize,
+        n_out: usize, nl: usize, tangent: bool, rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
+        let kept = match pr {
+            PlanRun::Direct(k) => k,
+            // A basis is only built for forward-over-reverse passes ([`CovPlan::plan_run`]).
+            PlanRun::Basis(u) if tangent => {
+                return self.basis_reverse(u, r, adj, slot, n_out, nl, rows);
+            }
+            PlanRun::Basis(_) => return None,
+        };
         let (kt, lk) = (r.kt, 1 + r.kt);
         let (l, lb) = (kept.layout.lanes(), kept.layout.base_lanes());
         let ns = adj.len();
@@ -1697,15 +1851,49 @@ impl<'a> CovPlan<'a> {
         let (n_eta, n_par) = (kept.plan.n_eta(), kept.plan.n_theta());
         let (nu, np) = (n_eta * l, n_par * l);
         let (mut ub, mut pb) = (kj::Buf::new(ns * nu), kj::Buf::new(ns * np));
-        if !kept
-            .plan
-            .reverse_from(&kept.fwd, kept.layout, ns, &mut ub, &mut pb, &du_bar)
-        {
+        let swept = if tangent {
+            kept.plan.reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar)
+        } else {
+            kept.plan.reverse_from(kept.fwd.one()?, kept.layout, ns, &mut ub, &mut pb, &du_bar)
+        };
+        if !swept {
             return None;
         }
         let n_th = self.th.len();
         let s0 = packed_segments(self.template).sigma_start();
         let sigma = self.sc.params.sigma.values.as_slice();
+        if tangent {
+            // Per direction `a`: θ's value adjoint's tangent `a` through dθ/dx, and (on the
+            // axis `a` moves) its value adjoint through d²θ/dx² — the reverse over forward's
+            // two terms, each seed's lanes read off the one buffer ([`seed_value`]).
+            for (a, row) in rows.iter_mut().enumerate() {
+                for i in 0..n_par {
+                    let (pv, pa) = (pb[i * l], pb[i * l + lb + a]);
+                    if i < n_th {
+                        row[i] += pa * self.d1[i];
+                        if r.dir_x[a] == Some(i) {
+                            row[i] += pv * self.d2[i];
+                        }
+                    } else if i - n_th < self.nz {
+                        row[self.nx + (i - n_th)] += pa;
+                    } else {
+                        let k = i - n_th - self.nz;
+                        row[s0 + k] += pa * sigma[k];
+                        if r.dir_x[a] == Some(s0 + k) {
+                            row[s0 + k] += pv * sigma[k];
+                        }
+                    }
+                }
+            }
+            let mut e = vec![0.0; n_eta * lk];
+            for k in 0..n_eta {
+                e[k * lk] = ub[k * l];
+                for t in 0..kt {
+                    e[k * lk + 1 + t] = ub[k * l + lb + t];
+                }
+            }
+            return Some(vec![e]);
+        }
         let mut eta_back = Vec::with_capacity(ns);
         for (sd, row) in rows.iter_mut().enumerate() {
             let pb = &pb[sd * np..(sd + 1) * np];
@@ -1750,6 +1938,18 @@ impl<'a> CovPlan<'a> {
     }
 }
 
+/// Seed `sd`'s value-lane adjoint at lane offset `at` (a location's `lk` lanes start there):
+/// row `sd` of a reverse per seed, or — from one forward-over-reverse buffer (`tangent`),
+/// whose tangent `sd` is that seed's value-lane adjoint ([`CovPlan::reverse_tangent`]) —
+/// the value adjoint's tangent along direction `sd`.
+fn seed_value(adj: &[Vec<f64>], tangent: bool, sd: usize, at: usize) -> f64 {
+    if tangent {
+        adj[0][at + 1 + sd]
+    } else {
+        adj[sd][at]
+    }
+}
+
 /// `(k, l)`, `l ≤ k`, of the packed lower-triangle index `t = k(k+1)/2 + l`.
 fn untri(t: usize) -> (usize, usize) {
     let mut k = (((8 * t + 1) as f64).sqrt() as usize).saturating_sub(1) / 2;
@@ -1763,12 +1963,7 @@ fn untri(t: usize) -> (usize, usize) {
 }
 /// `(F, ∇_η l)` for FOCE / FOCEI (`objective`).
 fn objective_terms<T: PkNum>(
-    ctx: &LikCtx,
-    interaction: bool,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    fpop: Option<&[T]>,
+    ctx: &LikCtx, interaction: bool, f: &[T], g: &[Vec<T>], eta: &[T], fpop: Option<&[T]>,
     p: &ParT<T>,
 ) -> Option<(T, Vec<T>)> {
     objective(ctx, interaction, f, g, eta, fpop, p)
@@ -1777,25 +1972,13 @@ fn objective_terms<T: PkNum>(
 /// Ω (Cholesky entries), σ, ρ, the serial ρ and the custom residual magnitude as the
 /// kernel reads them, from the packed coordinates `xo` through their packing chains.
 fn population_params<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    params: &ModelParameters,
-    so: &StackedOmega,
-    theta: &[T],
-    xo: impl Fn(usize) -> T,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, params: &ModelParameters,
+    so: &StackedOmega, theta: &[T], xo: impl Fn(usize) -> T,
 ) -> Option<ParT<T>> {
-    let mut l: Vec<Vec<T>> = so
-        .chol
-        .iter()
-        .map(|r| r.iter().map(|&v| T::from_f64(v)).collect())
-        .collect();
+    let mut l: Vec<Vec<T>> =
+        so.chol.iter().map(|r| r.iter().map(|&v| T::from_f64(v)).collect()).collect();
     for (idx, at, _) in &so.placed {
-        let e = if at[0].0 == at[0].1 {
-            xo(*idx).exp()
-        } else {
-            xo(*idx)
-        };
+        let e = if at[0].0 == at[0].1 { xo(*idx).exp() } else { xo(*idx) };
         for &(i, j) in at {
             l[i][j] = e;
         }
@@ -1812,9 +1995,7 @@ fn population_params<T: crate::sens::num::vm::VmNum>(
     };
     Some(ParT {
         omega: OmegaT::from_chol(l)?,
-        sigma: (0..params.sigma.values.len())
-            .map(|k| xo(seg.sigma_start() + k).exp())
-            .collect(),
+        sigma: (0..params.sigma.values.len()).map(|k| xo(seg.sigma_start() + k).exp()).collect(),
         // ρ = tanh(z), the Fisher-z packing (`rho_chain` = 1 − ρ²).
         rho: (0..params.residual_correlations.len())
             .map(|k| {
@@ -1831,12 +2012,6 @@ fn population_params<T: crate::sens::num::vm::VmNum>(
 /// θ from its packed coordinates on any number type: `exp(x)` when log-packed.
 fn unpack_theta<T: PkNum>(template: &ModelParameters, xd: impl Fn(usize) -> T) -> Vec<T> {
     (0..template.theta.len())
-        .map(|m| {
-            if theta_packs_log(template.theta_lower[m]) {
-                xd(m).exp()
-            } else {
-                xd(m)
-            }
-        })
+        .map(|m| if theta_packs_log(template.theta_lower[m]) { xd(m).exp() } else { xd(m) })
         .collect()
 }

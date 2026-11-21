@@ -144,10 +144,9 @@ impl GlobalsearchOptions {
              statements",
         )?;
         let section = match config.tools.get("globalsearch") {
-            Some(table) => table
-                .clone()
-                .try_into::<Section>()
-                .map_err(|e| format!("[globalsearch]: {e}"))?,
+            Some(table) => {
+                table.clone().try_into::<Section>().map_err(|e| format!("[globalsearch]: {e}"))?
+            }
             None => Section::default(),
         };
         let options = GlobalsearchOptions {
@@ -208,10 +207,7 @@ impl GlobalsearchOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Axis {
     /// One structural category; the alleles are its values in the space.
-    Structural {
-        category: &'static str,
-        keys: Vec<FeatureKey>,
-    },
+    Structural { category: &'static str, keys: Vec<FeatureKey> },
     /// One `COVARIATE?` pair; allele 0 is `none`, the rest its forms.
     Covariate { pair: String, forms: Vec<Effect> },
 }
@@ -273,9 +269,7 @@ pub(crate) struct Space {
 /// Split a space into its structural statements and its covariate
 /// effects, refusing anything else by name.
 fn partition(mfl: &Mfl) -> Result<(Mfl, bool), String> {
-    let mut structural = Mfl {
-        statements: Vec::new(),
-    };
+    let mut structural = Mfl { statements: Vec::new() };
     let mut has_covariate = false;
     for statement in &mfl.statements {
         match statement {
@@ -320,10 +314,7 @@ impl Space {
             .covariate_model
             .as_ref()
             .map(|spec| {
-                spec.relations
-                    .iter()
-                    .map(|r| (r.parameter.clone(), r.covariate.clone()))
-                    .collect()
+                spec.relations.iter().map(|r| (r.parameter.clone(), r.covariate.clone())).collect()
             })
             .unwrap_or_default();
         let structural_base = if keys.is_empty() {
@@ -363,12 +354,9 @@ impl Space {
 
     /// The grid from its parts — the seam the unit tests use.
     pub(crate) fn build(
-        input_model: ModelText,
-        structural: Option<(Structure, Defaults, PkTemplate)>,
-        keys: &[FeatureKey],
-        covariate_effects: &[crate::search::CovariateEffectSpec],
-        existing: &[(String, String)],
-        mut notes: Vec<String>,
+        input_model: ModelText, structural: Option<(Structure, Defaults, PkTemplate)>,
+        keys: &[FeatureKey], covariate_effects: &[crate::search::CovariateEffectSpec],
+        existing: &[(String, String)], mut notes: Vec<String>,
     ) -> Result<Space, String> {
         let mut axes: Vec<Axis> = Vec::new();
         // `space_features` sorts by category, so the axes come out in a
@@ -378,18 +366,14 @@ impl Space {
                 |a| matches!(a, Axis::Structural { category, .. } if *category == key.category()),
             ) {
                 Some(Axis::Structural { keys, .. }) => keys.push(*key),
-                _ => axes.push(Axis::Structural {
-                    category: key.category(),
-                    keys: vec![*key],
-                }),
+                _ => axes.push(Axis::Structural { category: key.category(), keys: vec![*key] }),
             }
         }
         let mut forced: Vec<Effect> = Vec::new();
         for spec in covariate_effects {
             let effect = Effect::from_spec(spec)?;
-            let in_base = existing
-                .iter()
-                .any(|(p, c)| *p == effect.parameter && *c == effect.covariate);
+            let in_base =
+                existing.iter().any(|(p, c)| *p == effect.parameter && *c == effect.covariate);
             if in_base {
                 notes.push(format!(
                     "not explored: {} — the base model already declares `{} ~ {}`, which the \
@@ -410,18 +394,12 @@ impl Space {
                 .find(|a| matches!(a, Axis::Covariate { pair: p, .. } if *p == pair))
             {
                 Some(Axis::Covariate { forms, .. }) => forms.push(effect),
-                _ => axes.push(Axis::Covariate {
-                    pair,
-                    forms: vec![effect],
-                }),
+                _ => axes.push(Axis::Covariate { pair, forms: vec![effect] }),
             }
         }
         for f in &forced {
             let pair = f.pair_key();
-            if axes
-                .iter()
-                .any(|a| matches!(a, Axis::Covariate { pair: p, .. } if *p == pair))
-            {
+            if axes.iter().any(|a| matches!(a, Axis::Covariate { pair: p, .. } if *p == pair)) {
                 return Err(format!(
                     "globalsearch: `{pair}` is both forced (COVARIATE) and searched \
                      (COVARIATE?). A forced relation occupies the pair's [covariate_model] \
@@ -442,16 +420,7 @@ impl Space {
             None => (None, None, None),
         };
         let lines = input_model.block_lines("individual_parameters");
-        Ok(Space {
-            input_model,
-            base_structure,
-            defaults,
-            template,
-            lines,
-            axes,
-            forced,
-            notes,
-        })
+        Ok(Space { input_model, base_structure, defaults, template, lines, axes, forced, notes })
     }
 
     /// The allele count per axis, for the GA and the enumeration.
@@ -613,10 +582,7 @@ impl GlobalsearchResult {
 
     /// Models actually fitted (not duplicates, not unbuildable).
     pub fn n_fitted(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|r| r.duplicate_of.is_none() && r.ofv.is_some())
-            .count()
+        self.rows.iter().filter(|r| r.duplicate_of.is_none() && r.ofv.is_some()).count()
     }
 }
 
@@ -638,9 +604,7 @@ pub struct GlobalsearchRun<'a> {
 /// Run a global search from a loaded `.ferxsearch` file and its base model.
 /// Writes `models.csv` and `final.ferx` into `run.dir` when given.
 pub fn run_globalsearch(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: GlobalsearchRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: GlobalsearchRun<'_>,
 ) -> Result<GlobalsearchResult, String> {
     let options = GlobalsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
@@ -658,12 +622,7 @@ pub fn run_globalsearch(
         data: &base.prepared.population,
         options: run_options,
         on_candidate: sink.map(|_| &on_candidate as crate::search::CandidateFn<'_>),
-        reuse_from: run
-            .reuse_from
-            .iter()
-            .cloned()
-            .chain(config.reuse_dirs())
-            .collect(),
+        reuse_from: run.reuse_from.iter().cloned().chain(config.reuse_dirs()).collect(),
     };
     let space = Space::from_config(config, base)?;
     let result = search(&fitter, space, &options, run.progress)?;
@@ -873,10 +832,7 @@ impl<'a> Evaluator<'a> {
                 // The structural choice removed the parameter: the gene
                 // changes nothing, and pyDarwin charges it for that.
                 non_influential += 1;
-                features.set(
-                    pair.clone(),
-                    format!("{} (non-influential)", effect.form_label()),
-                );
+                features.set(pair.clone(), format!("{} (non-influential)", effect.form_label()));
             }
         }
         Ok(Decoded {
@@ -894,10 +850,7 @@ impl<'a> Evaluator<'a> {
     /// The fitness of a fitted candidate: criterion, plus the search-level
     /// charges. Finite by construction.
     fn fitness_of(
-        &self,
-        result: &CandidateResult,
-        fit: Option<&FitResult>,
-        non_influential: usize,
+        &self, result: &CandidateResult, fit: Option<&FitResult>, non_influential: usize,
     ) -> (f64, f64) {
         let p = self.options.penalties;
         if result.error.is_some() {
@@ -918,11 +871,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn row_of(
-        &self,
-        result: &CandidateResult,
-        step: &str,
-        genome: Option<Genome>,
-        decoded: &Decoded,
+        &self, result: &CandidateResult, step: &str, genome: Option<Genome>, decoded: &Decoded,
     ) -> ModelRow {
         let fit = result.fit.as_ref();
         let (criterion, fitness) = self.fitness_of(result, fit, decoded.non_influential);
@@ -966,8 +915,7 @@ impl<'a> Evaluator<'a> {
             self.best_fitness = row.fitness;
         }
         if let Some(fit) = fit {
-            self.fits
-                .insert(row.hash.clone(), (row.criterion, fit.clone()));
+            self.fits.insert(row.hash.clone(), (row.criterion, fit.clone()));
         }
     }
 
@@ -982,16 +930,9 @@ impl<'a> Evaluator<'a> {
 enum Entry {
     /// Already answered: an unbuildable point, or a model an earlier batch
     /// fitted. `store` is the model text to keep, when there is one.
-    Ready {
-        row: ModelRow,
-        store: Option<(String, ModelText)>,
-    },
+    Ready { row: ModelRow, store: Option<(String, ModelText)> },
     /// To be fitted.
-    Fit {
-        genome: Genome,
-        candidate: Candidate,
-        decoded: Decoded,
-    },
+    Fit { genome: Genome, candidate: Candidate, decoded: Decoded },
 }
 
 impl ga::Oracle for Evaluator<'_> {
@@ -1096,11 +1037,7 @@ impl ga::Oracle for Evaluator<'_> {
                 });
                 continue;
             }
-            entries.push(Entry::Fit {
-                genome: genome.clone(),
-                candidate,
-                decoded,
-            });
+            entries.push(Entry::Fit { genome: genome.clone(), candidate, decoded });
         }
         let submitted: Vec<Candidate> = entries
             .iter()
@@ -1134,15 +1071,10 @@ impl ga::Oracle for Evaluator<'_> {
                         self.models.insert(id, text);
                     }
                     self.keep(&row, None);
-                    self.by_genome
-                        .insert(row.genome.clone().expect("a grid row"), self.rows.len());
+                    self.by_genome.insert(row.genome.clone().expect("a grid row"), self.rows.len());
                     self.rows.push(row);
                 }
-                Entry::Fit {
-                    genome,
-                    candidate,
-                    decoded,
-                } => {
+                Entry::Fit { genome, candidate, decoded } => {
                     let report = report.as_ref().expect("a batch with candidates was fitted");
                     let Some(result) = report.results.iter().find(|r| r.id == candidate.id) else {
                         // Cancelled before this candidate was reached: no
@@ -1169,10 +1101,7 @@ impl ga::Oracle for Evaluator<'_> {
             if report.cancelled {
                 self.cancelled = true;
             }
-            self.emit(GlobalsearchEvent::BatchFinished {
-                step: what.to_string(),
-                best,
-            });
+            self.emit(GlobalsearchEvent::BatchFinished { step: what.to_string(), best });
         }
         Ok(genomes
             .iter()
@@ -1193,9 +1122,7 @@ impl ga::Oracle for Evaluator<'_> {
 
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
-    fitter: &dyn StepFitter,
-    space: Space,
-    options: &GlobalsearchOptions,
+    fitter: &dyn StepFitter, space: Space, options: &GlobalsearchOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<GlobalsearchResult, String> {
     let emit = |event: GlobalsearchEvent| {
@@ -1205,13 +1132,8 @@ pub(crate) fn search(
     };
     let criterion = options.criterion();
     let alleles = space.alleles();
-    let size = space
-        .size()
-        .ok_or("globalsearch: the grid is too large to count")?;
-    emit(GlobalsearchEvent::Space {
-        axes: alleles.len(),
-        size,
-    });
+    let size = space.size().ok_or("globalsearch: the grid is too large to count")?;
+    emit(GlobalsearchEvent::Space { axes: alleles.len(), size });
     if options.algorithm == Algorithm::Exhaustive && size > options.max_models {
         return Err(format!(
             "globalsearch: the grid has {size} points, above [globalsearch] max_models = {}; \
@@ -1222,10 +1144,7 @@ pub(crate) fn search(
 
     // ── the input ────────────────────────────────────────────────────────
     emit(GlobalsearchEvent::InputStarted);
-    let mut input_features = space
-        .base_structure
-        .map(|s| s.feature_vector())
-        .unwrap_or_default();
+    let mut input_features = space.base_structure.map(|s| s.feature_vector()).unwrap_or_default();
     for axis in &space.axes {
         if let Axis::Covariate { pair, .. } = axis {
             input_features.set(pair.clone(), "none");
@@ -1235,10 +1154,7 @@ pub(crate) fn search(
     let report = fitter.fit_step(INPUT_ID, std::slice::from_ref(&candidate))?;
     let mut notes = space.notes.clone();
     notes.extend(report.warnings.iter().cloned());
-    let result = report
-        .results
-        .first()
-        .ok_or("the input model was not fitted")?;
+    let result = report.results.first().ok_or("the input model was not fitted")?;
     if let Some(e) = &result.error {
         return Err(format!("the input model could not be fitted: {e}"));
     }
@@ -1291,9 +1207,7 @@ pub(crate) fn search(
             input_row.failures.join("; ")
         ));
     }
-    evaluator
-        .models
-        .insert(INPUT_ID.to_string(), space.input_model.clone());
+    evaluator.models.insert(INPUT_ID.to_string(), space.input_model.clone());
     evaluator.rows.push(input_row);
 
     // ── the grid ─────────────────────────────────────────────────────────
@@ -1319,14 +1233,7 @@ pub(crate) fn search(
     }
 
     // ── ranking and selection ────────────────────────────────────────────
-    let Evaluator {
-        mut rows,
-        models,
-        mut fits,
-        mut notes,
-        cancelled,
-        ..
-    } = evaluator;
+    let Evaluator { mut rows, models, mut fits, mut notes, cancelled, .. } = evaluator;
     let mut order: Vec<usize> = (0..rows.len()).filter(|i| rows[*i].eligible()).collect();
     order.sort_by(|a, b| rows[*a].fitness.total_cmp(&rows[*b].fitness));
     for (rank, i) in order.iter().enumerate() {
@@ -1367,15 +1274,9 @@ pub(crate) fn search(
                 .into(),
         );
     }
-    let final_model = models
-        .get(&final_id)
-        .cloned()
-        .unwrap_or_else(|| space.input_model.clone());
-    let final_fit = if winner == 0 {
-        input_fit
-    } else {
-        fits.remove(&rows[winner].hash).map(|(_, f)| f)
-    };
+    let final_model = models.get(&final_id).cloned().unwrap_or_else(|| space.input_model.clone());
+    let final_fit =
+        if winner == 0 { input_fit } else { fits.remove(&rows[winner].hash).map(|(_, f)| f) };
     let models: BTreeMap<String, ModelText> = models.into_iter().collect();
     if final_fit.is_none() {
         notes.push(format!(

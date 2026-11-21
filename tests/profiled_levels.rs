@@ -48,17 +48,10 @@ fn prep(model: &str, data: &str, profiled: bool) -> ferx_core::PreparedRun {
     let text = std::fs::read_to_string(root().join(model)).unwrap();
     assert!(text.contains(PROFILED), "fixture moved");
     let path = unique_temp("ferx_profiled_levels");
-    let text = if profiled {
-        text
-    } else {
-        text.replace(PROFILED, UNPROFILED)
-    };
+    let text = if profiled { text } else { text.replace(PROFILED, UNPROFILED) };
     std::fs::write(&path, text).unwrap();
-    ferx_core::prepare_run(
-        path.to_str().unwrap(),
-        Some(root().join(data).to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("{e}"))
+    ferx_core::prepare_run(path.to_str().unwrap(), Some(root().join(data).to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The final estimates and standard errors of a NONMEM `.ext`, by column name.
@@ -112,10 +105,7 @@ fn cov_thetas(name: &str, n: usize) -> DMatrix<f64> {
             _ => {}
         }
     }
-    assert!(
-        m.iter().all(|v| v.is_finite()),
-        "{name}: THETA block incomplete"
-    );
+    assert!(m.iter().all(|v| v.is_finite()), "{name}: THETA block incomplete");
     m
 }
 
@@ -124,11 +114,7 @@ type Step = fn(FitOptions) -> FitOptions;
 
 /// `covariance_method = r`, the fixture's own settings.
 fn r(o: FitOptions) -> FitOptions {
-    FitOptions {
-        covariance_method: CovarianceMethod::Hessian,
-        covariance_method_set: true,
-        ..o
-    }
+    FitOptions { covariance_method: CovarianceMethod::Hessian, covariance_method_set: true, ..o }
 }
 
 /// `covariance_method = s`, EBEs to [`EVAL_INNER_TOL`]: `S` is scored at the modes each side
@@ -168,19 +154,14 @@ const EVAL_INNER_TOL: f64 = 1e-8;
 /// F2 evaluated at NONMEM's structural optimum (levels left at their initial 0, for the
 /// profile solve to find), with the covariance step `step`.
 fn at_nonmem_optimum(
-    profiled: bool,
-    theta: Option<&[f64]>,
-    step: Step,
+    profiled: bool, theta: Option<&[f64]>, step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     at_ext_optimum("profile_mbma.ext", profiled, theta, step)
 }
 
 /// [`at_nonmem_optimum`] at the structural optimum and Ω of the NONMEM run `ext_name`.
 fn at_ext_optimum(
-    ext_name: &str,
-    profiled: bool,
-    theta: Option<&[f64]>,
-    step: Step,
+    ext_name: &str, profiled: bool, theta: Option<&[f64]>, step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     let (est, _) = ext(ext_name);
     let p = prep(F2, F2_DATA, profiled);
@@ -194,10 +175,8 @@ fn at_ext_optimum(
         }
     }
     params.omega = OmegaMatrix::from_diagonal(&[est["OMEGA(1,1)"]], vec!["ETA_EM".into()]);
-    params.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[est["OMEGA(2,2)"]],
-        vec!["KAPPA_ARM".into()],
-    ));
+    params.omega_iov =
+        Some(OmegaMatrix::from_diagonal(&[est["OMEGA(2,2)"]], vec!["KAPPA_ARM".into()]));
     let opts = FitOptions {
         verbose: false,
         outer_maxiter: 0,
@@ -245,10 +224,8 @@ fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
 
     // Structural SEs, from the profiled R, against NONMEM's own profile likelihood
     // (`profile_curvature_se`): NONMEM's `$COV` R is not the reference here.
-    let se_theta = f
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
+    let se_theta =
+        f.se_theta.as_ref().unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
     let mut worst_struct = 0.0_f64;
     for (k, name) in ["TVE0", "EMAX", "ET50"].iter().enumerate() {
         let want = profile_curvature_se("profile_mbma_profiles.txt", name);
@@ -291,12 +268,7 @@ fn a_profiled_evaluation_reproduces_nonmem_with_every_level_a_theta() {
         "A2: ΔOFV {d_ofv:.3e}, worst level {worst_level:.3e} SE, structural SE {worst_struct:.3e}, \
          free-level SE {worst_free:.3e}, dependent-level SE {worst_dep:.3e}"
     );
-    assert!(
-        d_ofv.abs() < A2_OFV,
-        "OFV ferx {} vs NONMEM {}",
-        f.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv.abs() < A2_OFV, "OFV ferx {} vs NONMEM {}", f.ofv, est["OBJ"]);
     assert!(worst_level < A2_LEVEL, "{worst_level}");
     assert!(worst_struct < A2_STRUCT_SE, "{worst_struct}");
     assert!(worst_free < A2_LEVEL_SE, "{worst_free}");
@@ -320,11 +292,7 @@ fn profile_curvature_se(file: &str, name: &str) -> f64 {
         .lines()
         .filter(|l| l.starts_with(name))
         .map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .skip(1)
-                .map(|v| v.parse().unwrap())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().skip(1).map(|v| v.parse().unwrap()).collect();
             (f[0], f[1])
         })
         .collect();
@@ -378,10 +346,7 @@ fn f2b_text(profiled: bool) -> String {
 /// levels left at 0 for the profile solve — or at `theta` (levels included) with the θ in
 /// `fixed` FIXed — with the covariance step `step`.
 fn f2b_evaluated(
-    profiled: bool,
-    theta: Option<&[f64]>,
-    fixed: &[usize],
-    step: Step,
+    profiled: bool, theta: Option<&[f64]>, fixed: &[usize], step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     let (est, _) = ext("profile_mbma_bound.ext");
     let path = unique_temp("ferx_profiled_levels_a3");
@@ -404,10 +369,8 @@ fn f2b_evaluated(
         params.theta_fixed[k] = true;
     }
     params.omega = OmegaMatrix::from_diagonal(&[est["OMEGA(1,1)"]], vec!["ETA_EM".into()]);
-    params.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[est["OMEGA(2,2)"]],
-        vec!["KAPPA_ARM".into()],
-    ));
+    params.omega_iov =
+        Some(OmegaMatrix::from_diagonal(&[est["OMEGA(2,2)"]], vec!["KAPPA_ARM".into()]));
     let opts = step(FitOptions {
         verbose: false,
         outer_maxiter: 0,
@@ -441,10 +404,8 @@ fn a_profiled_fit_lists_a_collapse_even_when_its_step_fails() {
         params.theta[k] = est[&format!("THETA{}", k + 1)];
     }
     params.omega = OmegaMatrix::from_diagonal(&[(-12.0_f64).exp()], vec!["ETA_EM".into()]);
-    params.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[est["OMEGA(2,2)"]],
-        vec!["KAPPA_ARM".into()],
-    ));
+    params.omega_iov =
+        Some(OmegaMatrix::from_diagonal(&[est["OMEGA(2,2)"]], vec!["KAPPA_ARM".into()]));
     let opts = r(FitOptions {
         verbose: false,
         outer_maxiter: 0,
@@ -461,11 +422,8 @@ fn a_profiled_fit_lists_a_collapse_even_when_its_step_fails() {
         "{:?}",
         f.warnings
     );
-    let held: Vec<(&str, HeldReason)> = f
-        .held_at_bound
-        .iter()
-        .map(|h| (h.name.as_str(), h.reason))
-        .collect();
+    let held: Vec<(&str, HeldReason)> =
+        f.held_at_bound.iter().map(|h| (h.name.as_str(), h.reason)).collect();
     assert_eq!(
         held,
         [
@@ -477,10 +435,7 @@ fn a_profiled_fit_lists_a_collapse_even_when_its_step_fails() {
     // #2799, the status's step-failed arm (plan cell F): a collapse beside a failed step is
     // `collapsed_at_guard`, the failure is read once from `covariance_status` (its Critical
     // warning is not counted again), and the profiled level on its box is not a reason.
-    assert_eq!(
-        f.covariance_status,
-        ferx_core::types::CovarianceStatus::Failed
-    );
+    assert_eq!(f.covariance_status, ferx_core::types::CovarianceStatus::Failed);
     assert_eq!(
         f.status(),
         ferx_core::types::FitStatus::NotConverged {
@@ -530,11 +485,7 @@ fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
     let pinned = A3_PINNED;
     assert_eq!(p.init_params.theta_names[pinned], "PLACEBO[STUDY=7,TIME=4]");
     assert_eq!(est["THETA24"], 2.5);
-    assert_eq!(
-        f.theta[pinned].to_bits(),
-        2.5_f64.to_bits(),
-        "held on its bound"
-    );
+    assert_eq!(f.theta[pinned].to_bits(), 2.5_f64.to_bits(), "held on its bound");
     assert!(
         f.warnings.iter().any(|w| w.starts_with(
             "Profiled level(s) on a declared bound: PLACEBO[STUDY=7,TIME=4] (2.5000 at upper bound)."
@@ -546,13 +497,7 @@ fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
     // #2797: the same level is the one `held_at_bound` entry, as a `ProfiledBound` — no
     // collapse is listed beside it (none of this model's coordinates is on a rail), and the
     // matrix below is unchanged by the field's arrival (the NONMEM comparison is the pin).
-    let held: Vec<(
-        &str,
-        ferx_core::types::ParameterKind,
-        usize,
-        usize,
-        HeldReason,
-    )> = f
+    let held: Vec<(&str, ferx_core::types::ParameterKind, usize, usize, HeldReason)> = f
         .held_at_bound
         .iter()
         .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason))
@@ -578,15 +523,10 @@ fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
     }
 
     // The covariance: the pinned level's row is zero, as NONMEM's FIXed THETA24's.
-    let c = f
-        .covariance_matrix
-        .as_ref()
-        .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
+    let c =
+        f.covariance_matrix.as_ref().unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
     assert!((0..c.ncols()).all(|j| c[(pinned, j)] == 0.0 && c[(j, pinned)] == 0.0));
-    assert!(
-        (0..39).all(|j| cov[(pinned, j)] == 0.0),
-        "NONMEM holds it too"
-    );
+    assert!((0..39).all(|j| cov[(pinned, j)] == 0.0), "NONMEM holds it too");
     // Level SEs: a free level's is its THETA's; a dependent level's is the delta method
     // over its study's three THETAs in NONMEM's `.cov`, whose THETA24 row is zero.
     let levels = &ferx_core::theta_level_values(&p.parsed.model, &f.theta, Some(c), None).unwrap()
@@ -668,12 +608,7 @@ const A3_LEVEL_SE: f64 = A2_LEVEL_SE;
 fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     let (_, prof) = profiled_at_nonmem_optimum();
     let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), r);
-    assert!(
-        (prof.ofv - plain.ofv).abs() < 1e-6,
-        "the same point: {} vs {}",
-        prof.ofv,
-        plain.ofv
-    );
+    assert!((prof.ofv - plain.ofv).abs() < 1e-6, "the same point: {} vs {}", prof.ofv, plain.ofv);
     let (a, b) = (
         prof.se_theta.as_ref().expect("profiled SE"),
         plain.se_theta.as_ref().expect("unprofiled SE"),
@@ -698,10 +633,8 @@ fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     // level × level covariances, in the published packed matrix, as a correlation gap
     // `|C_p − C_u| / sqrt(C_u,ii · C_u,jj)` against the unprofiled one. Over every θ
     // pair — structural × level and level × level — each off its own diagonal.
-    let (cp, cu) = (
-        prof.covariance_matrix.as_ref().unwrap(),
-        plain.covariance_matrix.as_ref().unwrap(),
-    );
+    let (cp, cu) =
+        (prof.covariance_matrix.as_ref().unwrap(), plain.covariance_matrix.as_ref().unwrap());
     assert_eq!(cp.shape(), cu.shape());
     let (mut worst_cross, mut worst_bb) = (0.0_f64, 0.0_f64);
     for i in 0..a.len() {
@@ -758,15 +691,9 @@ fn run_covariance_replays_the_profiled_step() {
 /// repeats that step bit for bit, in memory and after a `.fitrx` round trip of `f` saved with
 /// `model_text`: the same covariance matrix, levels included, the same SEs and label.
 fn assert_replays_bit_for_bit(
-    p: &ferx_core::PreparedRun,
-    f: &FitResult,
-    model_text: &str,
-    step: Step,
+    p: &ferx_core::PreparedRun, f: &FitResult, model_text: &str, step: Step,
 ) {
-    let opts = step(FitOptions {
-        verbose: false,
-        ..p.parsed.fit_options.clone()
-    });
+    let opts = step(FitOptions { verbose: false, ..p.parsed.fit_options.clone() });
     let method = opts.covariance_method;
     assert_eq!(f.covariance_method, Some(method), "{:?}", f.warnings);
     let want = f.covariance_matrix.as_ref().expect("inline covariance");
@@ -779,11 +706,8 @@ fn assert_replays_bit_for_bit(
             .as_ref()
             .unwrap_or_else(|| panic!("{how}: no replayed covariance: {:?}", r.warnings));
         assert_eq!(got.shape(), want.shape(), "{how}");
-        let differing = got
-            .iter()
-            .zip(want.iter())
-            .filter(|(g, w)| g.to_bits() != w.to_bits())
-            .count();
+        let differing =
+            got.iter().zip(want.iter()).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
         assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
         assert_eq!(r.se_theta, f.se_theta, "{how}");
         assert_eq!(r.covariance_method, Some(method), "{how}");
@@ -792,18 +716,9 @@ fn assert_replays_bit_for_bit(
 
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ferx_profiled_replay_{}_{n}.fitrx",
-        std::process::id()
-    ));
-    save_fit(
-        f,
-        &p.population,
-        model_text,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .expect("saves");
+    let path =
+        std::env::temp_dir().join(format!("ferx_profiled_replay_{}_{n}.fitrx", std::process::id()));
+    save_fit(f, &p.population, model_text, &path, SaveFitOptions::default()).expect("saves");
     let loaded = load_fit(&path).expect("loads");
     let _ = std::fs::remove_file(&path);
     replay(&loaded.fit, "after .fitrx reload");
@@ -821,29 +736,19 @@ fn assert_replays_bit_for_bit(
 #[test]
 fn run_covariance_on_moved_levels_re_profiles_them() {
     let (p, f) = profiled_at_nonmem_optimum();
-    let opts = FitOptions {
-        verbose: false,
-        ..p.parsed.fit_options.clone()
-    };
+    let opts = FitOptions { verbose: false, ..p.parsed.fit_options.clone() };
     let want = f.covariance_matrix.as_ref().expect("inline covariance");
     let mut moved = f.clone();
     moved.theta[3] += 1.0;
     let r = ferx_core::run_covariance(&moved, Some(&p.parsed.model), Some(&p.population), &opts)
         .unwrap_or_else(|e| panic!("{e}"));
-    let got = r
-        .covariance_matrix
-        .as_ref()
-        .unwrap_or_else(|| panic!("{:?}", r.warnings));
+    let got = r.covariance_matrix.as_ref().unwrap_or_else(|| panic!("{:?}", r.warnings));
     assert_eq!(got.shape(), want.shape());
     // The straddle (#2388 review row 4): the move reached the replay. Were the edited fit
     // taken as carrying its own packed point, the replay would unpack the unmoved `x̂` and
     // repeat the inline step bit for bit, with or without the overwrite. Measured: 1681
     // entries differ, every one outside σ's zero row and column (macOS arm64).
-    let differing = got
-        .iter()
-        .zip(want.iter())
-        .filter(|(g, w)| g.to_bits() != w.to_bits())
-        .count();
+    let differing = got.iter().zip(want.iter()).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
     assert!(differing > 0, "the replay ran at the unmoved levels");
     let mut worst = 0.0_f64;
     for i in 0..want.nrows() {
@@ -855,12 +760,7 @@ fn run_covariance_on_moved_levels_re_profiles_them() {
                 continue;
             }
             let g = ((got[(i, j)] - want[(i, j)]) / s).abs();
-            assert!(
-                g.is_finite(),
-                "({i}, {j}): {} vs {}",
-                got[(i, j)],
-                want[(i, j)]
-            );
+            assert!(g.is_finite(), "({i}, {j}): {} vs {}", got[(i, j)], want[(i, j)]);
             worst = worst.max(g);
         }
     }
@@ -889,12 +789,7 @@ fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
     std::fs::write(&path, text.replace(UNPROFILED, PROFILED)).unwrap();
     let p = ferx_core::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root()
-                .join("tests/data/mbma_placebo/mbma_placebo.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("tests/data/mbma_placebo/mbma_placebo.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let model = &p.parsed.model;
@@ -913,10 +808,8 @@ fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
     let f = ferx_core::fit(model, &p.population, &params, &opts).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(f.profiled_blocks, ["PLACEBO"]);
     let d_ofv = f.ofv - est_a["OBJ"];
-    let cov = f
-        .covariance_matrix
-        .as_ref()
-        .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
+    let cov =
+        f.covariance_matrix.as_ref().unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
     let levels =
         &ferx_core::theta_level_values(model, &f.theta, Some(cov), None).unwrap()["PLACEBO"];
     assert_eq!(levels.len(), 24);
@@ -942,12 +835,7 @@ fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
     eprintln!(
         "A1: ΔOFV {d_ofv:.3e}, free-level SE {worst_free:.3e}, dependent-level SE {worst_dep:.3e}"
     );
-    assert!(
-        d_ofv.abs() < A1_OFV,
-        "ferx {} vs NONMEM {}",
-        f.ofv,
-        est_a["OBJ"]
-    );
+    assert!(d_ofv.abs() < A1_OFV, "ferx {} vs NONMEM {}", f.ofv, est_a["OBJ"]);
     assert!(worst_free < A1_SE, "{worst_free}");
     assert!(worst_dep < A1_SE, "{worst_dep}");
 }
@@ -993,11 +881,7 @@ fn a_profiled_fit_counts_and_guards_unconverged_ebes() {
     );
     assert_eq!(open.ebe_convergence_warnings, 0);
     let shut = run(0.0);
-    assert!(
-        !shut.ofv.is_finite(),
-        "the guard rejects the evaluation: {}",
-        shut.ofv
-    );
+    assert!(!shut.ofv.is_finite(), "the guard rejects the evaluation: {}", shut.ofv);
     assert!(shut.ebe_convergence_warnings >= 1);
     assert!(!shut.converged);
 }
@@ -1083,11 +967,7 @@ fn s1_auto_contrast_splits_per_study_only_when_a_both_arm_eta_is_absorbed() {
         assert_eq!(f.profiled_blocks, ["PLACEBO"]);
         f.n_parameters
     };
-    assert_eq!(
-        count(true),
-        76,
-        "3 θ, 70 levels (sum_to_zero_within), 2 ω, σ"
-    );
+    assert_eq!(count(true), 76, "3 θ, 70 levels (sum_to_zero_within), 2 ω, σ");
     assert_eq!(count(false), 84, "3 θ, 79 levels (sum_to_zero), ω, σ");
 }
 
@@ -1097,19 +977,10 @@ fn s1_auto_contrast_splits_per_study_only_when_a_both_arm_eta_is_absorbed() {
 /// smoke step 13 shape, profiled or not), as text.
 fn f1_car1_text(profiled: bool) -> String {
     let text = std::fs::read_to_string(root().join(F1)).unwrap();
-    assert!(
-        text.contains(PROFILED) && text.contains("weight = SE\n"),
-        "fixture moved"
-    );
+    assert!(text.contains(PROFILED) && text.contains("weight = SE\n"), "fixture moved");
     let text = text
-        .replace(
-            "  omega ETA_E0",
-            "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_E0",
-        )
-        .replace(
-            "weight = SE\n",
-            "weight = SE\n  correlation car1(RHO) by OCC\n",
-        );
+        .replace("  omega ETA_E0", "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_E0")
+        .replace("weight = SE\n", "weight = SE\n  correlation car1(RHO) by OCC\n");
     if profiled {
         text
     } else {
@@ -1118,9 +989,7 @@ fn f1_car1_text(profiled: bool) -> String {
 }
 
 fn f1_car1_evaluated(
-    profiled: bool,
-    theta: Option<&[f64]>,
-    step: Step,
+    profiled: bool, theta: Option<&[f64]>, step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     let path = unique_temp("ferx_profiled_levels_car1");
     std::fs::write(&path, f1_car1_text(profiled)).unwrap();
@@ -1139,10 +1008,8 @@ fn f1_car1_evaluated(
         }
     }
     params.omega = OmegaMatrix::from_diagonal(&[CAR1_OPTIMUM[5]], vec!["ETA_E0".into()]);
-    params.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[CAR1_OPTIMUM[6]],
-        vec!["KAPPA_ARM".into()],
-    ));
+    params.omega_iov =
+        Some(OmegaMatrix::from_diagonal(&[CAR1_OPTIMUM[6]], vec!["KAPPA_ARM".into()]));
     let opts = FitOptions {
         verbose: false,
         outer_maxiter: 0,
@@ -1160,9 +1027,8 @@ fn f1_car1_evaluated(
 /// ED50, ET50, RHO, then the variances of ETA_E0 and KAPPA_ARM. A point near the
 /// minimum, so the profile Hessian is positive definite there — at F1's inits it is not
 /// (three negative eigenvalues), and the step reports no SEs.
-const CAR1_OPTIMUM: [f64; 7] = [
-    48.553123, 14.149350, 35.822851, 4.508109, 0.759796, 4.826057, 141.219036,
-];
+const CAR1_OPTIMUM: [f64; 7] =
+    [48.553123, 14.149350, 35.822851, 4.508109, 0.759796, 4.826057, 141.219036];
 
 fn profiled_car1() -> &'static (ferx_core::PreparedRun, FitResult) {
     static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
@@ -1177,28 +1043,17 @@ fn profiled_car1() -> &'static (ferx_core::PreparedRun, FitResult) {
 fn the_correlated_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     let (_, prof) = profiled_car1();
     let (_, plain) = f1_car1_evaluated(false, Some(&prof.theta), r);
-    assert!(
-        (prof.ofv - plain.ofv).abs() < 1e-6,
-        "the same point: {} vs {}",
-        prof.ofv,
-        plain.ofv
-    );
+    assert!((prof.ofv - plain.ofv).abs() < 1e-6, "the same point: {} vs {}", prof.ofv, plain.ofv);
     let (a, b) = (
-        prof.se_theta
-            .as_ref()
-            .unwrap_or_else(|| panic!("profiled SE: {:?}", prof.warnings)),
-        plain
-            .se_theta
-            .as_ref()
-            .unwrap_or_else(|| panic!("unprofiled SE: {:?}", plain.warnings)),
+        prof.se_theta.as_ref().unwrap_or_else(|| panic!("profiled SE: {:?}", prof.warnings)),
+        plain.se_theta.as_ref().unwrap_or_else(|| panic!("unprofiled SE: {:?}", plain.warnings)),
     );
     let rho = a.len() - 1;
     let worst = |idx: &mut dyn Iterator<Item = usize>| {
-        idx.map(|k| (a[k] - b[k]).abs() / b[k])
-            .fold(0.0_f64, |acc, v| {
-                assert!(v.is_finite(), "{a:?} vs {b:?}");
-                acc.max(v)
-            })
+        idx.map(|k| (a[k] - b[k]).abs() / b[k]).fold(0.0_f64, |acc, v| {
+            assert!(v.is_finite(), "{a:?} vs {b:?}");
+            acc.max(v)
+        })
     };
     let worst_struct = worst(&mut (0..4).chain([rho]));
     let worst_level = worst(&mut (4..rho));
@@ -1257,12 +1112,7 @@ fn worst_cov_gap(cp: &DMatrix<f64>, cu: &DMatrix<f64>) -> f64 {
                 continue;
             }
             let g = ((cp[(i, j)] - cu[(i, j)]) / s).abs();
-            assert!(
-                g.is_finite(),
-                "({i}, {j}): {} vs {}",
-                cp[(i, j)],
-                cu[(i, j)]
-            );
+            assert!(g.is_finite(), "({i}, {j}): {} vs {}", cp[(i, j)], cu[(i, j)]);
             worst = worst.max(g);
         }
     }
@@ -1275,19 +1125,9 @@ fn worst_cov_gap(cp: &DMatrix<f64>, cu: &DMatrix<f64>) -> f64 {
 fn parity(prof: &FitResult, plain: &FitResult, structural: &[usize], step: Step) -> [f64; 4] {
     let method = step(FitOptions::default()).covariance_method;
     for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
-        assert_eq!(
-            f.covariance_method,
-            Some(method),
-            "{side}: {:?}",
-            f.warnings
-        );
+        assert_eq!(f.covariance_method, Some(method), "{side}: {:?}", f.warnings);
     }
-    assert!(
-        (prof.ofv - plain.ofv).abs() < 1e-6,
-        "the same point: {} vs {}",
-        prof.ofv,
-        plain.ofv
-    );
+    assert!((prof.ofv - plain.ofv).abs() < 1e-6, "the same point: {} vs {}", prof.ofv, plain.ofv);
     let se = |f: &FitResult| f.se_theta.clone().unwrap();
     let (a, b) = (se(prof), se(plain));
     let levels = (0..a.len()).filter(|k| !structural.contains(k));
@@ -1331,11 +1171,7 @@ fn c4_the_profiled_sandwich_is_the_unprofiled_one_at_the_same_point() {
     let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), rsr);
     let [structural, level, variance, matrix] = parity(prof, &plain, &[0, 1, 2], rsr);
     let (_, r_fit) = profiled_at_nonmem_optimum();
-    let off_r = worst_rel(
-        prof.se_theta.as_ref().unwrap(),
-        r_fit.se_theta.as_ref().unwrap(),
-        0..3,
-    );
+    let off_r = worst_rel(prof.se_theta.as_ref().unwrap(), r_fit.se_theta.as_ref().unwrap(), 0..3);
     eprintln!(
         "C4: structural SE {structural:.3e}, level SE {level:.3e}, variance SE {variance:.3e}, \
          matrix {matrix:.3e}; rsr against r {off_r:.3e}"
@@ -1368,16 +1204,12 @@ fn c4_the_correlated_profiled_sandwich_is_the_unprofiled_one_at_the_same_point()
 
 /// The profiled F1 fit's optimum (`ferx` CLI, release, macOS arm64, OFV 97.070036,
 /// converged): TVE0, EMAX, ED50, ET50, then the variances of ETA_E0 and KAPPA_ARM.
-const F1_OPTIMUM: [f64; 6] = [
-    48.576414, 13.603909, 33.243705, 4.293363, 4.813371, 156.038443,
-];
+const F1_OPTIMUM: [f64; 6] = [48.576414, 13.603909, 33.243705, 4.293363, 4.813371, 156.038443];
 
 /// F1 (`mbma_placebo`: η and the arm κ on the block's rows) at [`F1_OPTIMUM`], its levels
 /// profiled there, or at `theta` (levels included), with the covariance step `step`.
 fn f1_evaluated(
-    profiled: bool,
-    theta: Option<&[f64]>,
-    step: Step,
+    profiled: bool, theta: Option<&[f64]>, step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     let p = prep(F1, F1_DATA, profiled);
     let mut params = p.init_params.clone();
@@ -1386,10 +1218,7 @@ fn f1_evaluated(
         None => params.theta[..4].copy_from_slice(&F1_OPTIMUM[..4]),
     }
     params.omega = OmegaMatrix::from_diagonal(&[F1_OPTIMUM[4]], vec!["ETA_E0".into()]);
-    params.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[F1_OPTIMUM[5]],
-        vec!["KAPPA_ARM".into()],
-    ));
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(&[F1_OPTIMUM[5]], vec!["KAPPA_ARM".into()]));
     let opts = step(FitOptions {
         verbose: false,
         outer_maxiter: 0,
@@ -1458,20 +1287,13 @@ fn nested_at_optimum_text(profiled: bool) -> String {
 /// [`nested_at_optimum_text`] evaluated at its initial estimates, or at `theta` (levels
 /// included), with the covariance step `step`.
 fn nested_evaluated(
-    profiled: bool,
-    theta: Option<&[f64]>,
-    step: Step,
+    profiled: bool, theta: Option<&[f64]>, step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     let path = unique_temp("ferx_profiled_levels_nested");
     std::fs::write(&path, nested_at_optimum_text(profiled)).unwrap();
     let p = ferx_core::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/nested_levels_3.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("nonmem_anchor/nested_levels_3.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let mut params = p.init_params.clone();
@@ -1499,10 +1321,7 @@ fn nested_evaluated(
 /// `RSR_FD_STEP`, 8.9e-4 at 3e-3 and 8.6e-2 at 3e-4 (macOS arm64), the re-solved
 /// objectives' noise over `h²` taking over below 1e-3.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn c4_the_nested_profiled_sandwich_is_the_unprofiled_one() {
     let (_, prof) = nested_evaluated(true, None, rsr);
     let (_, plain) = nested_evaluated(false, Some(&prof.theta), rsr);
@@ -1571,9 +1390,7 @@ const S1_DATA_100: &str = "tests/data/profile_mbma/s100t8.csv";
 /// [`s1_visit_text`] evaluated at its initial estimates, or at `theta` (levels included),
 /// with the covariance step `step`.
 fn s1_visit_evaluated(
-    profiled: bool,
-    theta: Option<&[f64]>,
-    step: Step,
+    profiled: bool, theta: Option<&[f64]>, step: Step,
 ) -> (ferx_core::PreparedRun, FitResult) {
     let path = unique_temp("ferx_profiled_levels_s1_visit");
     std::fs::write(&path, s1_visit_text(profiled)).unwrap();
@@ -1645,11 +1462,7 @@ fn a_rank_deficient_profiled_cross_product_is_refused_as_unprofiled() {
     let reason = "With 12 subjects and 41 free parameters S has rank at most 12";
     for (side, f) in [("profiled", &prof), ("unprofiled", &plain)] {
         assert!(f.covariance_matrix.is_none(), "{side}");
-        assert!(
-            f.warnings.iter().any(|w| w.contains(reason)),
-            "{side}: {:?}",
-            f.warnings
-        );
+        assert!(f.warnings.iter().any(|w| w.contains(reason)), "{side}: {:?}", f.warnings);
     }
 }
 
@@ -1657,10 +1470,7 @@ fn a_rank_deficient_profiled_cross_product_is_refused_as_unprofiled() {
 
 /// How many warnings of `f` carry the one-subject-level note.
 fn one_subject_notes(f: &FitResult) -> usize {
-    f.warnings
-        .iter()
-        .filter(|w| w.contains("W_COV_RSR_ONE_SUBJECT_LEVELS"))
-        .count()
+    f.warnings.iter().filter(|w| w.contains("W_COV_RSR_ONE_SUBJECT_LEVELS")).count()
 }
 
 /// F1 has one subject per study, so every level of its block is read by one subject.
@@ -1686,21 +1496,14 @@ fn rsr_on_one_subject_levels_warns_through_fit_and_run_covariance() {
             fit,
             Some(&p.parsed.model),
             Some(&p.population),
-            &step(FitOptions {
-                verbose: false,
-                ..p.parsed.fit_options.clone()
-            }),
+            &step(FitOptions { verbose: false, ..p.parsed.fit_options.clone() }),
         )
         .unwrap_or_else(|e| panic!("{e}"))
     };
     assert_eq!(one_subject_notes(&rerun(&prof, &p, r)), 0, "rsr → r");
     assert_eq!(one_subject_notes(&rerun(&r_fit, &p, rsr)), 1, "r → rsr");
     assert_eq!(one_subject_notes(&rerun(&prof, &p, rsr)), 1, "rsr → rsr");
-    assert_eq!(
-        one_subject_notes(&rerun(&plain, &plain_p, r)),
-        0,
-        "unprofiled rsr → r"
-    );
+    assert_eq!(one_subject_notes(&rerun(&plain, &plain_p, r)), 0, "unprofiled rsr → r");
 }
 
 // ── C1b, C3: a level on its bound is held, as a FIX θ (#2112) ──────────────────────
@@ -1717,12 +1520,7 @@ fn rsr_on_one_subject_levels_warns_through_fit_and_run_covariance() {
 fn a_held_level_is_the_unprofiled_step_with_that_level_fixed() {
     let (p, prof) = bounded_at_nonmem_optimum();
     let (_, held) = f2b_evaluated(false, Some(&prof.theta), &[A3_PINNED], r);
-    assert!(
-        (prof.ofv - held.ofv).abs() < 1e-6,
-        "the same point: {} vs {}",
-        prof.ofv,
-        held.ofv
-    );
+    assert!((prof.ofv - held.ofv).abs() < 1e-6, "the same point: {} vs {}", prof.ofv, held.ofv);
     let (a, b) = (
         prof.se_theta.as_ref().expect("profiled SE"),
         held.se_theta.as_ref().expect("unprofiled SE"),
@@ -1743,10 +1541,8 @@ fn a_held_level_is_the_unprofiled_step_with_that_level_fixed() {
     // entries are not compared, as in C1: two FD stencils of different shape differ there
     // by 6.9e-3 with no level held at all (C1's own pair, macOS arm64), 6.3e-3 here, both
     // past `C1_CORR_BOUND`.
-    let (cp, cu) = (
-        prof.covariance_matrix.as_ref().unwrap(),
-        held.covariance_matrix.as_ref().unwrap(),
-    );
+    let (cp, cu) =
+        (prof.covariance_matrix.as_ref().unwrap(), held.covariance_matrix.as_ref().unwrap());
     assert_eq!(cp.shape(), cu.shape());
     let mut matrix = 0.0_f64;
     for i in 0..a.len() {
@@ -1762,12 +1558,8 @@ fn a_held_level_is_the_unprofiled_step_with_that_level_fixed() {
     }
 
     let (_, all_free) = f2b_evaluated(false, Some(&prof.theta), &[], r);
-    let mate = p
-        .init_params
-        .theta_names
-        .iter()
-        .position(|n| n == "PLACEBO[STUDY=7,TIME=1]")
-        .unwrap();
+    let mate =
+        p.init_params.theta_names.iter().position(|n| n == "PLACEBO[STUDY=7,TIME=1]").unwrap();
     let se = |f: &FitResult| f.se_theta.as_ref().unwrap()[mate];
     // The all-free convention's gap on the pinned level's study-mate, as a fraction.
     let shrink = 1.0 - se(prof) / se(&all_free);
@@ -1783,10 +1575,7 @@ fn a_held_level_is_the_unprofiled_step_with_that_level_fixed() {
     assert!(level < C1_BOUND, "{level}");
     assert!(variance < C1_BOUND, "{variance}");
     assert!(matrix < C1_CORR_BOUND, "{matrix}");
-    assert!(
-        shrink > C3_SHRINK,
-        "the held SE is the all-free one: {shrink}"
-    );
+    assert!(shrink > C3_SHRINK, "the held SE is the all-free one: {shrink}");
 }
 
 /// The held SE of `PLACEBO[STUDY=7,TIME=1]` below the all-free one: realised 7.780e-2
@@ -1851,25 +1640,12 @@ fn a_bounded_profiled_cross_product_holds_the_level_as_fixed() {
         (p, f)
     };
     let (p, prof) = evaluated(true, None, None);
-    let k = p
-        .init_params
-        .theta_names
-        .iter()
-        .position(|n| n == "PLACEBO[TIME=2]")
-        .unwrap();
-    assert_eq!(
-        prof.theta[k].to_bits(),
-        0.1_f64.to_bits(),
-        "held on its bound"
-    );
+    let k = p.init_params.theta_names.iter().position(|n| n == "PLACEBO[TIME=2]").unwrap();
+    assert_eq!(prof.theta[k].to_bits(), 0.1_f64.to_bits(), "held on its bound");
     assert_eq!(prof.profiled_levels_at_bound, [k]);
     let (_, held) = evaluated(false, Some(&prof.theta), Some(k));
     let (_, all_free) = evaluated(false, Some(&prof.theta), None);
-    for (side, f) in [
-        ("profiled", &prof),
-        ("held", &held),
-        ("all-free", &all_free),
-    ] {
+    for (side, f) in [("profiled", &prof), ("held", &held), ("all-free", &all_free)] {
         assert_eq!(
             f.covariance_method,
             Some(CovarianceMethod::CrossProduct),
@@ -1900,10 +1676,7 @@ fn a_bounded_profiled_cross_product_holds_the_level_as_fixed() {
     }
     eprintln!("s held: matrix {matrix:.3e} against FIX; {off_free:.3e} against all-free");
     assert!(matrix < S_SE, "{matrix}");
-    assert!(
-        off_free > S_HELD_STRADDLE,
-        "the held S⁻¹ is the all-free one: {off_free}"
-    );
+    assert!(off_free > S_HELD_STRADDLE, "the held S⁻¹ is the all-free one: {off_free}");
 }
 
 /// [`s1_visit_text`] profiled, at its inits, with ETA_EMAX (the second ETA) moved onto the
@@ -1960,10 +1733,7 @@ fn a_collapse_is_held_by_the_profiled_cross_product_as_fixed() {
     }
     let listed: Vec<_> = held.held_at_bound.iter().map(|h| h.packed_index).collect();
     assert_eq!(listed, [S1_ETA_EMAX_ROW], "the collapse is listed");
-    assert!(
-        fix.held_at_bound.is_empty(),
-        "a FIX parameter is not listed"
-    );
+    assert!(fix.held_at_bound.is_empty(), "a FIX parameter is not listed");
     assert_eq!(held.covariance_matrix, fix.covariance_matrix);
     assert!(held.cov_fixed[S1_ETA_EMAX_ROW], "{:?}", held.cov_fixed);
     let se = held.se_omega.as_ref().expect("SEs");
@@ -2007,21 +1777,14 @@ const S_HELD_STRADDLE: f64 = 0.1;
 fn fd_fallback_warnings(warnings: &[String]) -> Vec<&String> {
     warnings
         .iter()
-        .filter(|w| {
-            w.to_lowercase()
-                .replace('-', " ")
-                .contains("finite differen")
-        })
+        .filter(|w| w.to_lowercase().replace('-', " ").contains("finite differen"))
         .collect()
 }
 
 /// `method = laplace`, as a step's edit: what `method = laplace` in the file gives, since
 /// the file's `interaction` (the default, `true`) is inherited by Laplace either way.
 fn laplace(o: FitOptions) -> FitOptions {
-    FitOptions {
-        method: EstimationMethod::Laplace,
-        ..o
-    }
+    FitOptions { method: EstimationMethod::Laplace, ..o }
 }
 
 fn laplace_r(o: FitOptions) -> FitOptions {
@@ -2040,11 +1803,7 @@ fn laplace_s(o: FitOptions) -> FitOptions {
 fn assert_laplace_on_the_adjoint(prof: &FitResult, plain: &FitResult) {
     for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
         assert_eq!(f.method, EstimationMethod::Laplace, "{side}");
-        assert!(
-            fd_fallback_warnings(&f.warnings).is_empty(),
-            "{side}: {:?}",
-            f.warnings
-        );
+        assert!(fd_fallback_warnings(&f.warnings).is_empty(), "{side}: {:?}", f.warnings);
     }
 }
 
@@ -2060,11 +1819,8 @@ fn c1_l_the_profiled_laplace_covariance_is_the_unprofiled_one() {
     assert_laplace_on_the_adjoint(&prof, &plain);
     let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], laplace_r);
     let (_, focei) = profiled_at_nonmem_optimum();
-    let off_focei = worst_rel(
-        prof.se_theta.as_ref().unwrap(),
-        focei.se_theta.as_ref().unwrap(),
-        0..3,
-    );
+    let off_focei =
+        worst_rel(prof.se_theta.as_ref().unwrap(), focei.se_theta.as_ref().unwrap(), 0..3);
     eprintln!(
         "C1-L: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
          {variance:.3e}, matrix {matrix:.3e}; Laplace against FOCEI {off_focei:.3e}"
@@ -2073,10 +1829,7 @@ fn c1_l_the_profiled_laplace_covariance_is_the_unprofiled_one() {
     assert!(level < CL_BOUND, "{level}");
     assert!(variance < CL_BOUND, "{variance}");
     assert!(matrix < CL_BOUND, "{matrix}");
-    assert!(
-        off_focei > C1L_STRADDLE,
-        "Laplace ≠ FOCEI here: {off_focei}"
-    );
+    assert!(off_focei > C1L_STRADDLE, "Laplace ≠ FOCEI here: {off_focei}");
 }
 
 /// The structural SEs under Laplace against FOCEI's: realised 7.40e-3 under `r` on F2 at
@@ -2105,12 +1858,7 @@ fn c3_l_a_held_level_is_the_unprofiled_laplace_step_with_that_level_fixed() {
         held.se_theta.as_ref().expect("unprofiled SE"),
     );
     assert_eq!((a[A3_PINNED], b[A3_PINNED]), (0.0, 0.0));
-    assert!(
-        (prof.ofv - held.ofv).abs() < 1e-6,
-        "{} vs {}",
-        prof.ofv,
-        held.ofv
-    );
+    assert!((prof.ofv - held.ofv).abs() < 1e-6, "{} vs {}", prof.ofv, held.ofv);
     let structural = worst_rel(a, b, 0..3);
     let level = worst_rel(a, b, (3..a.len()).filter(|&k| k != A3_PINNED));
     let var = |f: &FitResult| {
@@ -2158,11 +1906,8 @@ fn c4_l_the_profiled_laplace_sandwich_and_cross_product_are_the_unprofiled_ones(
     assert_laplace_on_the_adjoint(&prof, &plain);
     let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], laplace_s);
     let (_, focei) = profiled_s1_visit_s();
-    let off_focei = worst_rel(
-        prof.se_theta.as_ref().unwrap(),
-        focei.se_theta.as_ref().unwrap(),
-        0..3,
-    );
+    let off_focei =
+        worst_rel(prof.se_theta.as_ref().unwrap(), focei.se_theta.as_ref().unwrap(), 0..3);
     eprintln!(
         "C4-L s: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
          {variance:.3e}, matrix {matrix:.3e}; Laplace against FOCEI {off_focei:.3e}"
@@ -2171,10 +1916,7 @@ fn c4_l_the_profiled_laplace_sandwich_and_cross_product_are_the_unprofiled_ones(
     assert!(level < S_SE, "{level}");
     assert!(variance < S_SE, "{variance}");
     assert!(matrix < S_SE, "{matrix}");
-    assert!(
-        off_focei > C1L_STRADDLE,
-        "Laplace ≠ FOCEI here: {off_focei}"
-    );
+    assert!(off_focei > C1L_STRADDLE, "Laplace ≠ FOCEI here: {off_focei}");
 }
 
 // ── #2107 PR-A: the profiled covariance under adaptive quadrature, `n_agq = 3` ────────
@@ -2188,11 +1930,7 @@ fn c4_l_the_profiled_laplace_sandwich_and_cross_product_are_the_unprofiled_ones(
 
 /// `n_agq = 3` on a step's options, `method` the stage's estimator.
 fn agq3(method: EstimationMethod, o: FitOptions) -> FitOptions {
-    FitOptions {
-        method,
-        n_agq: 3,
-        ..o
-    }
+    FitOptions { method, n_agq: 3, ..o }
 }
 
 fn agq3_laplace_r(o: FitOptions) -> FitOptions {
@@ -2219,11 +1957,7 @@ fn agq3_focei_s(o: FitOptions) -> FitOptions {
 fn assert_agq3_on_the_adjoint(prof: &FitResult, plain: &FitResult, method: EstimationMethod) {
     for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
         assert_eq!(f.method, method, "{side}");
-        assert!(
-            fd_fallback_warnings(&f.warnings).is_empty(),
-            "{side}: {:?}",
-            f.warnings
-        );
+        assert!(fd_fallback_warnings(&f.warnings).is_empty(), "{side}: {:?}", f.warnings);
     }
 }
 
@@ -2242,11 +1976,8 @@ fn c1_a_the_profiled_quadrature_covariance_is_the_unprofiled_one() {
         let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), step);
         assert_agq3_on_the_adjoint(&prof, &plain, method);
         let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2], step);
-        let off_one = worst_rel(
-            prof.se_theta.as_ref().unwrap(),
-            one.se_theta.as_ref().unwrap(),
-            0..3,
-        );
+        let off_one =
+            worst_rel(prof.se_theta.as_ref().unwrap(), one.se_theta.as_ref().unwrap(), 0..3);
         eprintln!(
             "C1-A {method:?}: structural SE {structural:.3e}, level SE {level:.3e}, variance \
              SE {variance:.3e}, matrix {matrix:.3e}; against one node {off_one:.3e}"
@@ -2255,10 +1986,7 @@ fn c1_a_the_profiled_quadrature_covariance_is_the_unprofiled_one() {
         assert!(level < CA_BOUND, "{method:?}: {level}");
         assert!(variance < CA_BOUND, "{method:?}: {variance}");
         assert!(matrix < CA_BOUND, "{method:?}: {matrix}");
-        assert!(
-            off_one > CA_STRADDLE,
-            "{method:?}: three nodes ≠ one here: {off_one}"
-        );
+        assert!(off_one > CA_STRADDLE, "{method:?}: three nodes ≠ one here: {off_one}");
     }
 }
 
@@ -2291,12 +2019,7 @@ fn c3_a_a_held_level_is_the_unprofiled_quadrature_step_with_that_level_fixed() {
             held.se_theta.as_ref().expect("unprofiled SE"),
         );
         assert_eq!((a[A3_PINNED], b[A3_PINNED]), (0.0, 0.0));
-        assert!(
-            (prof.ofv - held.ofv).abs() < 1e-6,
-            "{method:?}: {} vs {}",
-            prof.ofv,
-            held.ofv
-        );
+        assert!((prof.ofv - held.ofv).abs() < 1e-6, "{method:?}: {} vs {}", prof.ofv, held.ofv);
         let structural = worst_rel(a, b, 0..3);
         let level = worst_rel(a, b, (3..a.len()).filter(|&k| k != A3_PINNED));
         let var = |f: &FitResult| {
@@ -2326,16 +2049,8 @@ fn c3_a_a_held_level_is_the_unprofiled_quadrature_step_with_that_level_fixed() {
 #[test]
 fn c4_a_the_profiled_quadrature_sandwich_and_cross_product_are_the_unprofiled_ones() {
     for (method, rsr_step, s_step) in [
-        (
-            EstimationMethod::Laplace,
-            agq3_laplace_rsr as Step,
-            agq3_laplace_s as Step,
-        ),
-        (
-            EstimationMethod::FoceI,
-            agq3_focei_rsr as Step,
-            agq3_focei_s as Step,
-        ),
+        (EstimationMethod::Laplace, agq3_laplace_rsr as Step, agq3_laplace_s as Step),
+        (EstimationMethod::FoceI, agq3_focei_rsr as Step, agq3_focei_s as Step),
     ] {
         let (_, prof) = at_nonmem_optimum(true, None, rsr_step);
         let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), rsr_step);
@@ -2404,10 +2119,8 @@ fn a2_l_a_profiled_laplace_evaluation_reproduces_nonmem() {
         worst_level = worst_level.max(gap);
     }
 
-    let se_theta = f
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
+    let se_theta =
+        f.se_theta.as_ref().unwrap_or_else(|| panic!("covariance step: {:?}", f.warnings));
     let mut worst_struct = 0.0_f64;
     for (k, name) in ["TVE0", "EMAX", "ET50"].iter().enumerate() {
         let want = profile_curvature_se("profile_mbma_laplace_profiles.txt", name);
@@ -2454,12 +2167,7 @@ fn a2_l_a_profiled_laplace_evaluation_reproduces_nonmem() {
          {worst_level:.3e} SE, structural SE {worst_struct:.3e}, free-level SE {worst_free:.3e}, \
          dependent-level SE {worst_dep:.3e}"
     );
-    assert!(
-        d_ofv.abs() < A2L_OFV,
-        "OFV ferx {} vs NONMEM {}",
-        f.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv.abs() < A2L_OFV, "OFV ferx {} vs NONMEM {}", f.ofv, est["OBJ"]);
     assert!(laplace_vs_focei > 1e4 * A2L_OFV, "{laplace_vs_focei}");
     assert!(worst_level < A2_LEVEL, "{worst_level}");
     assert!(worst_struct < A2_STRUCT_SE, "{worst_struct}");

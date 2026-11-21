@@ -132,17 +132,10 @@ const AUC_REL_TOL: f64 = 1e-5;
 fn vanco_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))
         .expect("vanco model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 500.0, "empiric start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
-    assert_eq!(
-        spec.target_window,
-        Some((10.0, 15.0)),
-        "trough target band (point metric)"
-    );
+    assert_eq!(spec.target_window, Some((10.0, 15.0)), "trough target band (point metric)");
     assert_eq!(
         spec.auc_target,
         Some((400.0, 600.0)),
@@ -168,11 +161,7 @@ fn vanco_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(sig.is_finite(), "decision {i}: trough {sig}");
         let gap = (sig - trough_ref).abs();
         worst = worst.max(gap);
@@ -231,9 +220,9 @@ fn vanco_titration_matches_mrgsolve() {
 
     // Point metric: troughs in [10, 15] on 7 of 14 decisions (decisions 7..=13).
     assert!(
-        (m.pct_time_in_window.expect("trough window declared") - 7.0 / 14.0).abs() < 1e-9,
-        "pct_time_in_window {:?}",
-        m.pct_time_in_window
+        (m.pct_readings_in_window.expect("trough window declared") - 7.0 / 14.0).abs() < 1e-9,
+        "pct_readings_in_window {:?}",
+        m.pct_readings_in_window
     );
 
     // Exposure metric (the S2.5b headline): AUC24 in [400, 600] on 8 of the 13
@@ -250,19 +239,13 @@ fn vanco_titration_matches_mrgsolve() {
 fn run(band: Option<(f64, f64)>) -> AdaptiveSimulationResult {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))
         .expect("vanco model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     if let Some(band) = band {
         spec.auc_target = Some(band);
     }
-    let pop = read_nonmem_csv(
-        Path::new("tests/reference/vanco_mrgsolve/vanco_subject.csv"),
-        None,
-        None,
-    )
-    .expect("vanco subject data must load");
+    let pop =
+        read_nonmem_csv(Path::new("tests/reference/vanco_mrgsolve/vanco_subject.csv"), None, None)
+            .expect("vanco subject data must load");
     common::simulate_from_spec_at_typical_value(&parsed.model, &pop, &spec)
 }
 
@@ -271,9 +254,7 @@ fn run(band: Option<(f64, f64)>) -> AdaptiveSimulationResult {
 /// API gives.
 fn windows_in(band: (f64, f64)) -> usize {
     let res = run(Some(band));
-    let attain = res.metrics[0]
-        .auc_target_attainment
-        .expect("auc_target declared");
+    let attain = res.metrics[0].auc_target_attainment.expect("auc_target declared");
     let n = attain * REF_AUC_WINDOWS as f64;
     assert!((n - n.round()).abs() < 1e-9, "attainment {attain} is k/13");
     n.round() as usize
@@ -307,10 +288,7 @@ fn vanco_window_aucs_match_mrgsolve() {
     }
     for (i, &r) in REF_AUC24.iter().enumerate() {
         let band = band_of(r);
-        let want = REF_AUC24
-            .iter()
-            .filter(|&&x| band.0 <= x && x <= band.1)
-            .count();
+        let want = REF_AUC24.iter().filter(|&&x| band.0 <= x && x <= band.1).count();
         assert_eq!(want, 1, "window {i}: the bands are disjoint, checked above");
         assert_eq!(
             windows_in(band),

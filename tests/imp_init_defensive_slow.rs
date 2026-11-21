@@ -115,13 +115,8 @@ fn template() -> Population {
         };
         let n = obs_times.len();
         let doses = vec![DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0)];
-        let mut s = common::subject(
-            &format!("{}", i + 1),
-            doses,
-            obs_times,
-            vec![0.0; n],
-            vec![2; n],
-        );
+        let mut s =
+            common::subject(&format!("{}", i + 1), doses, obs_times, vec![0.0; n], vec![2; n]);
         s.covariates.insert("CONC0".to_string(), conc0);
         subjects.push(s);
     }
@@ -137,8 +132,7 @@ fn template() -> Population {
 
 /// Replace each subject's observations with one simulated replicate (fixed seed).
 fn simulate_dv(
-    model: &ferx_core::types::CompiledModel,
-    template: &Population,
+    model: &ferx_core::types::CompiledModel, template: &Population,
     params: &ferx_core::types::ModelParameters,
 ) -> Population {
     let sims = simulate_with_seed(model, template, params, 1, 528).unwrap();
@@ -204,8 +198,7 @@ fn max_rel_err(theta: &[f64], ref_cl: f64, ref_v: f64) -> f64 {
 /// truth wide enough to admit the MLE would also admit a fit that never moved
 /// from its starting values.
 fn focei_reference(
-    model: &ferx_core::types::CompiledModel,
-    pop: &Population,
+    model: &ferx_core::types::CompiledModel, pop: &Population,
 ) -> ferx_core::types::FitResult {
     let mut opts = FitOptions::default();
     opts.verbose = false;
@@ -215,10 +208,7 @@ fn focei_reference(
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     let parsed = parse_full_model(MODEL_SRC).expect("init model parses");
     let model = parsed.model;
@@ -244,13 +234,8 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     // --- Part 1: default config (ISCALE pilot search on) — the shipped path. The
     // mixture recovers the FOCEI optimum: the #528 core, the IMP phase stays
     // identifiable.
-    let with_mix = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &saem_imp_opts(0.1, false),
-    )
-    .expect("saem → imp on the init model must produce a fit");
+    let with_mix = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.1, false))
+        .expect("saem → imp on the init model must produce a fit");
     assert!(with_mix.converged, "defensive-mixture fit must converge");
     assert!(
         with_mix.ofv.is_finite() && with_mix.ofv.abs() < 1e6,
@@ -285,13 +270,8 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
 
     // --- Part 2: the legacy single-proposal sampler (alpha = 0) in the **default**
     // config. It reaches the same optimum as the mixture (#2650).
-    let legacy_default = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &saem_imp_opts(0.0, false),
-    )
-    .expect("legacy imp (default ISCALE) must produce a fit");
+    let legacy_default = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.0, false))
+        .expect("legacy imp (default ISCALE) must produce a fit");
     let err_legacy_default = max_rel_err(&legacy_default.theta, ref_cl, ref_v);
     assert!(
         err_legacy_default < 0.10,
@@ -306,27 +286,14 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     // (#961). ISCALE is a *separate*, general safeguard; pinning it to 1.0 (its
     // documented "disabled" setting) removes that overlapping rescue, so a future
     // ISCALE change cannot silently become the reason Part 2 passes.
-    let no_mix = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &saem_imp_opts(0.0, true),
-    )
-    .expect("legacy imp (ISCALE pinned) must produce a fit");
-    let with_mix_pinned = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &saem_imp_opts(0.1, true),
-    )
-    .expect("mixture imp (ISCALE pinned) must produce a fit");
+    let no_mix = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.0, true))
+        .expect("legacy imp (ISCALE pinned) must produce a fit");
+    let with_mix_pinned = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.1, true))
+        .expect("mixture imp (ISCALE pinned) must produce a fit");
     // The pinned mixture must be a genuine, healthy recovery — not just a θ that
     // happens to land near truth. Guard convergence and OFV too, so a partial
     // regression (the fit fails to converge, or the objective blows up) still trips.
-    assert!(
-        with_mix_pinned.converged,
-        "defensive mixture (ISCALE pinned) must converge"
-    );
+    assert!(with_mix_pinned.converged, "defensive mixture (ISCALE pinned) must converge");
     assert!(
         with_mix_pinned.ofv.is_finite() && with_mix_pinned.ofv.abs() < 1e6,
         "defensive mixture (ISCALE pinned) OFV must be finite/sane: {}",

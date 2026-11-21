@@ -11,9 +11,7 @@ fn worker(pool: &rayon::ThreadPool) -> thread::ThreadId {
 }
 
 fn workers(pool: &rayon::ThreadPool) -> HashSet<thread::ThreadId> {
-    pool.broadcast(|_| thread::current().id())
-        .into_iter()
-        .collect()
+    pool.broadcast(|_| thread::current().id()).into_iter().collect()
 }
 
 #[test]
@@ -31,44 +29,20 @@ fn completed_leases_reuse_workers_but_live_leases_are_exclusive() {
 #[test]
 fn settings_and_width_are_part_of_the_key() {
     let cache = PoolCache::new(16);
-    let base = OdeSolverOverride {
-        reltol: Some(1e-9),
-        ..Default::default()
-    };
+    let base = OdeSolverOverride { reltol: Some(1e-9), ..Default::default() };
     let id = {
         let p = cache.acquire(1, base.into()).unwrap();
         worker(&p)
     };
     for ov in [
         OdeSolverOverride::default(),
-        OdeSolverOverride {
-            reltol: Some(1e-10),
-            ..base
-        },
-        OdeSolverOverride {
-            abstol: Some(1e-12),
-            ..base
-        },
-        OdeSolverOverride {
-            max_steps: Some(13),
-            ..base
-        },
-        OdeSolverOverride {
-            method: Some(OdeMethod::Vern7),
-            ..base
-        },
-        OdeSolverOverride {
-            stiff_abort_after: Some(None),
-            ..base
-        },
-        OdeSolverOverride {
-            stiff_abort_after: Some(Some(1)),
-            ..base
-        },
-        OdeSolverOverride {
-            auto_switch: Some(false),
-            ..base
-        },
+        OdeSolverOverride { reltol: Some(1e-10), ..base },
+        OdeSolverOverride { abstol: Some(1e-12), ..base },
+        OdeSolverOverride { max_steps: Some(13), ..base },
+        OdeSolverOverride { method: Some(OdeMethod::Vern7), ..base },
+        OdeSolverOverride { stiff_abort_after: Some(None), ..base },
+        OdeSolverOverride { stiff_abort_after: Some(Some(1)), ..base },
+        OdeSolverOverride { auto_switch: Some(false), ..base },
     ] {
         let p = cache.acquire(1, ov.into()).unwrap();
         assert_ne!(id, worker(&p));
@@ -94,10 +68,7 @@ fn settings_and_width_are_part_of_the_key() {
 fn idle_worker_budget_evicts_oldest_settings_and_keeps_one_oversized_pool() {
     let cache = PoolCache::new(2);
     for n in 1..=5 {
-        let ov = OdeSolverOverride {
-            max_steps: Some(n),
-            ..Default::default()
-        };
+        let ov = OdeSolverOverride { max_steps: Some(n), ..Default::default() };
         drop(cache.acquire(1, ov.into()).unwrap());
     }
     {
@@ -127,10 +98,7 @@ fn idle_worker_budget_evicts_oldest_settings_and_keeps_one_oversized_pool() {
 #[test]
 fn shared_cache_reuses_one_live_pool_for_identical_unpinned_calls() {
     let cache = SharedPoolCache::new(4);
-    let ov = OdeSolverOverride {
-        reltol: Some(1e-9),
-        ..Default::default()
-    };
+    let ov = OdeSolverOverride { reltol: Some(1e-9), ..Default::default() };
     let first = cache.acquire(2, ov.into()).unwrap();
     let second = cache.acquire(2, ov.into()).unwrap();
     assert!(std::sync::Arc::ptr_eq(&first, &second));
@@ -146,10 +114,7 @@ fn inner_settings_are_part_of_the_key() {
     use crate::estimation::inner_optimizer::{current_inner_settings, InnerSettings};
     use crate::types::InnerOptimizer;
     let lbfgs = FitScope {
-        inner: InnerSettings {
-            mode: InnerOptimizer::Lbfgs,
-            warm: true,
-        },
+        inner: InnerSettings { mode: InnerOptimizer::Lbfgs, warm: true },
         ..Default::default()
     };
     let cache = PoolCache::new(16);
@@ -160,38 +125,19 @@ fn inner_settings_are_part_of_the_key() {
     };
     for other in [
         FitScope::default(),
-        FitScope {
-            inner: InnerSettings {
-                warm: false,
-                ..lbfgs.inner
-            },
-            ..lbfgs
-        },
-        FitScope {
-            inner: InnerSettings {
-                mode: InnerOptimizer::Bfgs,
-                ..lbfgs.inner
-            },
-            ..lbfgs
-        },
+        FitScope { inner: InnerSettings { warm: false, ..lbfgs.inner }, ..lbfgs },
+        FitScope { inner: InnerSettings { mode: InnerOptimizer::Bfgs, ..lbfgs.inner }, ..lbfgs },
     ] {
         let p = cache.acquire(1, other).unwrap();
         assert_ne!(id, worker(&p), "{other:?} reused the {lbfgs:?} pool");
         assert_eq!(p.install(current_inner_settings), other.inner);
     }
-    assert_eq!(
-        worker(&cache.acquire(1, lbfgs).unwrap()),
-        id,
-        "same key reuses"
-    );
+    assert_eq!(worker(&cache.acquire(1, lbfgs).unwrap()), id, "same key reuses");
 
     let shared = SharedPoolCache::new(8);
     let a = shared.acquire(2, lbfgs).unwrap();
     let b = shared.acquire(2, FitScope::default()).unwrap();
-    assert!(
-        !Arc::ptr_eq(&a, &b),
-        "shared cache collapsed two inner keys"
-    );
+    assert!(!Arc::ptr_eq(&a, &b), "shared cache collapsed two inner keys");
 }
 
 #[test]
@@ -253,27 +199,9 @@ fn shared_cold_miss_benchmark() {
 fn invalid_rust_api_overrides_are_rejected_before_pool_build() {
     let cache = PoolCache::new(4);
     for (ov, field) in [
-        (
-            OdeSolverOverride {
-                reltol: Some(f64::NAN),
-                ..Default::default()
-            },
-            "ode_reltol",
-        ),
-        (
-            OdeSolverOverride {
-                abstol: Some(0.0),
-                ..Default::default()
-            },
-            "ode_abstol",
-        ),
-        (
-            OdeSolverOverride {
-                max_steps: Some(0),
-                ..Default::default()
-            },
-            "ode_max_steps",
-        ),
+        (OdeSolverOverride { reltol: Some(f64::NAN), ..Default::default() }, "ode_reltol"),
+        (OdeSolverOverride { abstol: Some(0.0), ..Default::default() }, "ode_abstol"),
+        (OdeSolverOverride { max_steps: Some(0), ..Default::default() }, "ode_max_steps"),
     ] {
         let err = cache.acquire(1, ov.into()).err().expect("invalid override");
         assert!(err.contains(field), "{err}");
@@ -307,12 +235,5 @@ fn poisoned_cache_lock_is_recovered() {
         panic!("poison the idle list");
     });
     drop(cache.acquire(1, Default::default()).unwrap());
-    assert_eq!(
-        cache
-            .idle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1
-    );
+    assert_eq!(cache.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 1);
 }

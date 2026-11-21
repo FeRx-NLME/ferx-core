@@ -15,9 +15,7 @@ fn warfarin_ode_time_fits_without_an_fd_fallback() {
     let r = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit");
     assert!(r.ofv.is_finite(), "OFV {}", r.ofv);
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "{:?}",
         r.warnings
     );

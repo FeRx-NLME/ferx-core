@@ -84,20 +84,13 @@ fn files(selection: Option<&str>, csv: &str) -> (tempfile::TempDir, String, Stri
     };
     std::fs::write(&model, text).unwrap();
     std::fs::write(&data, csv).unwrap();
-    let (m, d) = (
-        model.to_str().unwrap().to_string(),
-        data.to_str().unwrap().to_string(),
-    );
+    let (m, d) = (model.to_str().unwrap().to_string(), data.to_str().unwrap().to_string());
     (dir, m, d)
 }
 
 /// The check report's findings with this code.
 fn coded(report: &CheckReport) -> Vec<&Diagnostic> {
-    report
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == CODE)
-        .collect()
+    report.diagnostics.iter().filter(|d| d.code == CODE).collect()
 }
 
 /// `ferx check --data` and the file-path fit on one cell: returns the single diagnostic's
@@ -108,12 +101,7 @@ fn refused(selection: Option<&str>, csv: &str) -> (String, String) {
     let report = validate_model_file(&model, Some(&data));
     let hits = coded(&report);
     assert!(!report.valid, "check must fail: {:?}", report.diagnostics);
-    assert_eq!(
-        hits.len(),
-        1,
-        "{CODE} exactly once: {:?}",
-        report.diagnostics
-    );
+    assert_eq!(hits.len(), 1, "{CODE} exactly once: {:?}", report.diagnostics);
     assert_eq!(hits[0].severity, crate::diagnostics::Severity::Error);
     let err = run_model_with_data(&model, Some(&data))
         .map(|(r, _)| r.ofv)
@@ -134,19 +122,13 @@ fn refused(selection: Option<&str>, csv: &str) -> (String, String) {
 #[test]
 fn doses_only_and_filtered_out_observations_are_refused_with_the_right_branch() {
     let (r1, _) = refused(None, DOSES_ONLY);
-    assert!(
-        r1.contains(S1) && r1.contains("has 2 subject(s)"),
-        "R1 S1: {r1}"
-    );
+    assert!(r1.contains(S1) && r1.contains("has 2 subject(s)"), "R1 S1: {r1}");
     assert!(r1.contains(S3), "R1 S3: {r1}");
     assert!(r1.contains(S3_ENDPOINT), "R1 S3's endpoint clause: {r1}");
     assert!(!r1.contains("[data_selection]"), "R1 has no filter: {r1}");
 
     let (r3, _) = refused(Some("ignore = EVID == 0"), WITH_OBS);
-    assert!(
-        r3.contains(S1) && r3.contains("has 2 subject(s)"),
-        "R3 S1: {r3}"
-    );
+    assert!(r3.contains(S1) && r3.contains("has 2 subject(s)"), "R3 S1: {r3}");
     assert!(r3.contains(S2), "R3 S2: {r3}");
     assert!(r3.contains(S2_ACTION), "R3 S2's action: {r3}");
     assert!(
@@ -165,10 +147,7 @@ fn doses_only_and_filtered_out_observations_are_refused_with_the_right_branch() 
 #[test]
 fn a_filter_that_empties_every_subject_is_refused_naming_the_filter() {
     let (r2, _) = refused(Some("ignore = TIME >= 0"), WITH_OBS);
-    assert!(
-        r2.contains(S1) && r2.contains("has 0 subject(s)"),
-        "R2 S1: {r2}"
-    );
+    assert!(r2.contains(S1) && r2.contains("has 0 subject(s)"), "R2 S1: {r2}");
     assert!(r2.contains(S2), "R2 S2: {r2}");
     assert!(r2.contains("2 subject(s) entirely"), "R2 S2 subjects: {r2}");
     assert!(!r2.contains(S3), "R2: {r2}");
@@ -183,10 +162,7 @@ fn a_filter_that_empties_every_subject_is_refused_naming_the_filter() {
 #[test]
 fn a_filter_that_removed_only_doses_is_not_named() {
     let (r7, _) = refused(Some("ignore = TIME >= 0"), DOSES_ONLY);
-    assert!(
-        r7.contains(S1) && r7.contains("has 0 subject(s)"),
-        "R7 S1: {r7}"
-    );
+    assert!(r7.contains(S1) && r7.contains("has 0 subject(s)"), "R7 S1: {r7}");
     assert!(r7.contains(S3), "R7 S3: {r7}");
     assert!(!r7.contains("[data_selection]"), "R7: {r7}");
 }
@@ -209,11 +185,8 @@ fn an_empty_in_memory_population_is_refused_by_fit() {
     let mut population = prepared.population;
     population.subjects.clear();
     population.exclusions = None;
-    let diags = check_model_data_rule(
-        &prepared.parsed.model,
-        &population,
-        &IovOccasionRule::Column,
-    );
+    let diags =
+        check_model_data_rule(&prepared.parsed.model, &population, &IovOccasionRule::Column);
     let hits: Vec<_> = diags.iter().filter(|d| d.code == CODE).collect();
     assert_eq!(hits.len(), 1, "{diags:?}");
     let err = fit(
@@ -228,14 +201,8 @@ fn an_empty_in_memory_population_is_refused_by_fit() {
     let err = err.to_string();
     assert_eq!(err, hits[0].message);
     assert!(err.contains(S1_CONSEQUENCE), "R6 S1's consequence: {err}");
-    assert!(
-        err.contains(S1) && err.contains("has 0 subject(s)"),
-        "R6 S1: {err}"
-    );
-    assert!(
-        err.contains(S3) && !err.contains("[data_selection]"),
-        "R6: {err}"
-    );
+    assert!(err.contains(S1) && err.contains("has 0 subject(s)"), "R6 S1: {err}");
+    assert!(err.contains(S3) && !err.contains("[data_selection]"), "R6: {err}");
 }
 
 /// **Z2 — R4, one observation: the control.** Fits, and the code is absent; the straddle
@@ -262,18 +229,10 @@ fn tte_only_and_binary_only_populations_are_not_refused() {
         ("examples/binary_logistic.ferx", "data/binary_logistic.csv"),
     ] {
         let report = validate_model_file(model, Some(data));
-        assert!(
-            coded(&report).is_empty(),
-            "{model}: {:?}",
-            report.diagnostics
-        );
+        assert!(coded(&report).is_empty(), "{model}: {:?}", report.diagnostics);
         let prepared = prepare_run(model, Some(data)).expect("prepare");
         assert!(
-            prepared
-                .population
-                .subjects
-                .iter()
-                .all(|s| s.observations.is_empty()),
+            prepared.population.subjects.iter().all(|s| s.observations.is_empty()),
             "premise: {model} carries no Gaussian observation"
         );
         let opts = FitOptions {
@@ -282,13 +241,8 @@ fn tte_only_and_binary_only_populations_are_not_refused() {
             verbose: false,
             ..prepared.parsed.fit_options.clone()
         };
-        let r = fit(
-            &prepared.parsed.model,
-            &prepared.population,
-            &prepared.init_params,
-            &opts,
-        )
-        .unwrap_or_else(|e| panic!("{model} must fit: {e}"));
+        let r = fit(&prepared.parsed.model, &prepared.population, &prepared.init_params, &opts)
+            .unwrap_or_else(|e| panic!("{model} must fit: {e}"));
         assert!(r.ofv.is_finite(), "{model}: ofv {}", r.ofv);
     }
 }

@@ -139,22 +139,15 @@ fn floor_message(r: &FitResult) -> Option<&str> {
 
 /// `<key> = <number>` out of the floor message.
 fn field(msg: &str, key: &str) -> f64 {
-    let tail = &msg[msg
-        .find(key)
-        .unwrap_or_else(|| panic!("no `{key}` in {msg}"))
-        + key.len()..];
+    let tail = &msg[msg.find(key).unwrap_or_else(|| panic!("no `{key}` in {msg}")) + key.len()..];
     let end = tail.find([',', ';']).unwrap_or(tail.len());
-    tail[..end]
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("`{key}` in {msg}: {e}"))
+    tail[..end].trim().parse().unwrap_or_else(|e| panic!("`{key}` in {msg}: {e}"))
 }
 
 /// `r` with the eigenvalue-floor warning removed: the fit as the numeric gates alone see it.
 fn without_floor_warning(r: &FitResult) -> FitResult {
     let mut bare = r.clone();
-    bare.warnings_structured
-        .retain(|w| w.category != WarningCode::CovarianceRegularized);
+    bare.warnings_structured.retain(|w| w.category != WarningCode::CovarianceRegularized);
     bare
 }
 
@@ -166,10 +159,7 @@ fn cites_regularization(r: &FitResult) -> bool {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
     let (_, _, r) = fit_under(CovarianceMethod::Hessian);
 
@@ -246,23 +236,16 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
 /// `CovarianceRegularized` from `run_covariance`'s superseded set reddens it (re-run under
 /// FOCEI).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_regularization_failure_follows_the_covariance_step() {
     let (model, pop, r) = fit_under(CovarianceMethod::Hessian);
     assert!(cites_regularization(&r), "r: {:?}", r.warnings);
     let (_, _, rsr) = fit_under(CovarianceMethod::Sandwich);
     assert!(cites_regularization(&rsr), "rsr: {:?}", rsr.warnings);
 
-    let rerun = run_covariance(
-        &r,
-        Some(&model),
-        Some(&pop),
-        &options(CovarianceMethod::CrossProduct),
-    )
-    .expect("s re-run");
+    let rerun =
+        run_covariance(&r, Some(&model), Some(&pop), &options(CovarianceMethod::CrossProduct))
+            .expect("s re-run");
     assert!(
         rerun.covariance_matrix.is_none(),
         "the premise changed: `s` now succeeds on this fixture, so add a fresh-`s`-fit leg \

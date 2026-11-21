@@ -55,10 +55,7 @@ impl Baseline {
                 ));
             }
             let chars: usize = chars.parse().map_err(|_| {
-                format!(
-                    "baseline line {}: `{chars}` is not a character count",
-                    n + 1
-                )
+                format!("baseline line {}: `{chars}` is not a character count", n + 1)
             })?;
             entries.insert(key.to_string(), chars);
         }
@@ -132,18 +129,9 @@ pub fn apply(baseline: &Baseline, violations: Vec<Violation>) -> Filtered {
         }
     }
 
-    let stale = baseline
-        .entries
-        .keys()
-        .filter(|k| !matched.contains(k))
-        .cloned()
-        .collect();
+    let stale = baseline.entries.keys().filter(|k| !matched.contains(k)).cloned().collect();
 
-    Filtered {
-        failing,
-        baselined,
-        stale,
-    }
+    Filtered { failing, baselined, stale }
 }
 
 #[cfg(test)]
@@ -157,11 +145,7 @@ mod tests {
             file: key.split("::").next().unwrap().to_string(),
             line: 1,
             message: "too long".into(),
-            chunk: Some(Chunk {
-                key: key.to_string(),
-                chars,
-                kind: ChunkKind::Terminal,
-            }),
+            chunk: Some(Chunk { key: key.to_string(), chars, kind: ChunkKind::Terminal }),
         }
     }
 
@@ -176,17 +160,12 @@ mod tests {
     }
 
     fn baseline_of(pairs: &[(&str, usize)]) -> Baseline {
-        Baseline {
-            entries: pairs.iter().map(|(k, c)| (k.to_string(), *c)).collect(),
-        }
+        Baseline { entries: pairs.iter().map(|(k, c)| (k.to_string(), *c)).collect() }
     }
 
     #[test]
     fn a_baselined_chunk_at_the_same_size_is_excused() {
-        let f = apply(
-            &baseline_of(&[("docs/x.qmd::a", 9000)]),
-            vec![r1("docs/x.qmd::a", 9000)],
-        );
+        let f = apply(&baseline_of(&[("docs/x.qmd::a", 9000)]), vec![r1("docs/x.qmd::a", 9000)]);
         assert!(f.failing.is_empty());
         assert_eq!(f.baselined, 1);
         assert!(f.stale.is_empty());
@@ -194,19 +173,13 @@ mod tests {
 
     #[test]
     fn a_shrunk_but_still_oversized_chunk_is_excused() {
-        let f = apply(
-            &baseline_of(&[("docs/x.qmd::a", 9000)]),
-            vec![r1("docs/x.qmd::a", 8000)],
-        );
+        let f = apply(&baseline_of(&[("docs/x.qmd::a", 9000)]), vec![r1("docs/x.qmd::a", 8000)]);
         assert!(f.failing.is_empty());
     }
 
     #[test]
     fn a_grown_chunk_fails_and_says_by_how_much() {
-        let f = apply(
-            &baseline_of(&[("docs/x.qmd::a", 9000)]),
-            vec![r1("docs/x.qmd::a", 9001)],
-        );
+        let f = apply(&baseline_of(&[("docs/x.qmd::a", 9000)]), vec![r1("docs/x.qmd::a", 9001)]);
         assert_eq!(f.failing.len(), 1);
         assert!(f.failing[0].message.contains("baselined at 9000"));
         assert!(f.failing[0].message.contains("now 9001"));
