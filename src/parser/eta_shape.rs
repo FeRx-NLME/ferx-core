@@ -12,7 +12,7 @@
 //! value: John-Draper's sign is a selection the recorded plan re-makes.
 
 use crate::sens::dual2::Dual2;
-use crate::sens::num::{BranchCmp, JetFn, PkNum};
+use crate::sens::num::{BranchCmp, PkNum};
 
 /// Which shape transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,10 +71,10 @@ pub(crate) enum ShapeOut {
 
 /// `expm1(λ·u)/λ = u·exprel(λu)`: exact through λ = 0, where it is `u` bit for bit, and
 /// free of the quotient cancellation the closed form's jets would carry (`∂/∂λ` of
-/// `expm1(x)/λ` cancels to `eps/x²`). `exprel` is one [`JetFn`], so a recording type keeps
-/// it as one primitive and every type reads the same value.
+/// `expm1(x)/λ` cancels to `eps/x²`). [`PkNum::exprel`] computes only the orders a type
+/// carries (the value alone on `f64`) and is one recorded primitive on a recording type.
 fn expm1_over<T: PkNum>(u: T, lambda: T) -> T {
-    u * (lambda * u).jet_unary(JetFn::Exprel)
+    u * (lambda * u).exprel(4)
 }
 
 /// The transform `h(η; s)` of kind `kind`.
@@ -130,6 +130,31 @@ pub(crate) struct EtaShapeContext<'a> {
     pub(crate) kappa_names: &'a [String],
     /// Every declared θ name.
     pub(crate) theta_names: &'a [String],
+}
+
+/// A block a shaped ETA must not be read raw in: its label as a header writes it
+/// (`event_model cause_b`), its type, and the lines that read names.
+pub(crate) struct Reader<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) ty: &'a str,
+    pub(crate) lines: &'a [String],
+}
+
+/// What to do instead of reading a shaped ETA raw in a block of type `ty`. An individual
+/// parameter can be read in a prediction block, but not where the block takes an ETA by
+/// name (`iiv_on_ruv`) or reads none at all (a `[mixture]` mixing expression, #977).
+fn raw_read_remedy(ty: &str) -> &'static str {
+    match ty {
+        "error_model" => {
+            "`iiv_on_ruv` takes an unshaped ETA: give it its own, or remove this one from \
+             [eta_shape]"
+        }
+        "mixture" => "a mixing expression cannot read an ETA",
+        _ => {
+            "the shape applies in [individual_parameters] only, so read it through an \
+              individual parameter there"
+        }
+    }
 }
 
 /// Whether `line` reads the identifier `name` as a whole word.
@@ -193,13 +218,12 @@ fn parse_shape_line(line: &str) -> Result<ShapeLine, String> {
 /// `[parameters]` at [`ShapeKind::default_theta`]. The rest of the parser then
 /// sees an ordinary model, so the two spellings cannot drift.
 ///
-/// `readers` are the other blocks whose text can carry an η into the objective, as
-/// `(block type, lines)`: a shaped ETA read raw in one of them would see η where
+/// `readers` are the other blocks whose text can carry an η into the objective: a shaped ETA read raw in one of them would see η where
 /// `[individual_parameters]` sees `h(η)`, so it is refused. `[derived]` / `[output]`
 /// are not among them, and reporting the random effect itself there is meaningful.
 pub(crate) fn apply_eta_shape(
     block: &[String], parameters: &mut Vec<String>, individual_parameters: &mut [String],
-    readers: &[(&str, &[String])], cx: &EtaShapeContext<'_>,
+    readers: &[Reader<'_>], cx: &EtaShapeContext<'_>,
 ) -> Result<(), String> {
     let mut seen: Vec<String> = Vec::new();
     let mut rewrites: Vec<(String, String)> = Vec::new();
@@ -249,13 +273,13 @@ pub(crate) fn apply_eta_shape(
         };
         rewrites.push((l.eta, format!("{}({{}}, {shape})", l.kind.name())));
     }
-    for &(key, lines) in readers {
+    for r in readers {
         for (eta, _) in &rewrites {
-            if let Some(line) = lines.iter().find(|l| reads_word(l, eta)) {
+            if let Some(line) = r.lines.iter().find(|l| reads_word(l, eta)) {
                 return Err(format!(
-                    "[eta_shape]: `{eta}` is shaped, but [{key}] reads it directly (`{line}`); \
-                     the shape applies in [individual_parameters] only, so read it through an \
-                     individual parameter there"
+                    "[eta_shape]: `{eta}` is shaped, but [{}] reads it directly (`{line}`); {}",
+                    r.label,
+                    raw_read_remedy(r.ty)
                 ));
             }
         }

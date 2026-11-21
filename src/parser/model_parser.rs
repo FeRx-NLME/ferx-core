@@ -3449,17 +3449,23 @@ fn every_block_body(
     unnamed.chain(named)
 }
 
+/// The lines of a block of type `ty` that read the names they mention: all of them, but a
+/// `[mixture]` class-variance line, which names an ETA without reading it. The one filter
+/// behind every scan of what the other blocks read (`identifiers_of_blocks`, the
+/// `[eta_shape]` raw-read refusal).
+fn reading_lines(ty: &str, lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| ty != "mixture" || !is_mixture_class_variance_line(l))
+        .cloned()
+        .collect()
+}
+
 /// Upper-cased identifiers of every block in `kinds`, unnamed and named.
 fn identifiers_of_blocks(extracted: &ExtractedBlocks, kinds: &[&str]) -> HashSet<String> {
     let mut out = HashSet::new();
     for (ty, _, lines) in every_block_body(extracted).filter(|(ty, _, _)| kinds.contains(ty)) {
-        if ty == "mixture" {
-            let reads: Vec<String> =
-                lines.iter().filter(|l| !is_mixture_class_variance_line(l)).cloned().collect();
-            collect_referenced_identifiers(&reads, &mut out);
-        } else {
-            collect_referenced_identifiers(lines, &mut out);
-        }
+        collect_referenced_identifiers(&reading_lines(ty, lines), &mut out);
     }
     out
 }
@@ -8131,17 +8137,20 @@ fn apply_eta_shape_block(
         theta_names: &theta_names,
     };
     // The other blocks whose text can carry an η into the objective, unnamed and named
-    // (`[event_model NAME]`): a shaped ETA read raw there would see η, not h(η). A
-    // `[mixture]` class-variance line names an ETA without reading it.
-    let readers: Vec<(&str, Vec<String>)> = every_block_body(extracted)
+    // (`[event_model NAME]`, labelled with its name): a shaped ETA read raw there would see
+    // η, not h(η). Sorted, so the block a refusal names does not follow hash order.
+    let mut readers: Vec<(String, &str, Vec<String>)> = every_block_body(extracted)
         .filter(|(ty, _, _)| OUTSIDE_READER_BLOCKS.contains(ty))
-        .map(|(ty, _, lines)| {
-            let reads = lines.iter().filter(|l| !is_mixture_class_variance_line(l));
-            (ty, reads.cloned().collect())
+        .map(|(ty, inst, lines)| {
+            let label = inst.map_or_else(|| ty.to_string(), |i| format!("{ty} {i}"));
+            (label, ty, reading_lines(ty, lines))
         })
         .collect();
-    let readers: Vec<(&str, &[String])> =
-        readers.iter().map(|(ty, lines)| (*ty, lines.as_slice())).collect();
+    readers.sort();
+    let readers: Vec<crate::parser::eta_shape::Reader<'_>> = readers
+        .iter()
+        .map(|(label, ty, lines)| crate::parser::eta_shape::Reader { label, ty, lines })
+        .collect();
     let applied = crate::parser::eta_shape::apply_eta_shape(
         &block_lines,
         &mut parameters,

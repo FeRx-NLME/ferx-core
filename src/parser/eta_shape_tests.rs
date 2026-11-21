@@ -401,9 +401,33 @@ fn a_shaped_eta_read_raw_in_a_prediction_block_is_refused() {
     let base = src("");
     assert!(base.is_ok(), "the unshaped model parses: {:?}", base.err());
     let err = src("[eta_shape]\n  ETA_E ~ boxcox(L)\n").err().expect("refused");
-    for phrase in ["[error_model] reads it directly", "read it through an individual parameter"] {
+    // `iiv_on_ruv` takes an ETA by name, so the advice is its own, not the
+    // individual-parameter one, which cannot be followed there.
+    for phrase in ["[error_model] reads it directly", "`iiv_on_ruv` takes an unshaped ETA"] {
         assert!(err.contains(phrase), "`{err}` lacks `{phrase}`");
     }
+    assert!(!err.contains("individual parameter"), "{err}");
+}
+
+/// A `[mixture]` mixing expression reads no ETA (#977), so its refusal does not
+/// tell the user to read one through an individual parameter.
+#[test]
+fn a_shaped_eta_read_in_a_mixing_expression_is_refused_without_the_parameter_advice() {
+    let err = parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  \
+         omega ETA_CL ~ 0.1\n  sigma EPS ~ 0.01\n\n\
+         [mixture]\n  nsub = 2\n  logit(1) = MIXL + ETA_CL\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = 10\n\n\
+         [eta_shape]\n  ETA_CL ~ boxcox()\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .err()
+    .expect("refused");
+    for phrase in ["[mixture] reads it directly", "a mixing expression cannot read an ETA"] {
+        assert!(err.contains(phrase), "`{err}` lacks `{phrase}`");
+    }
+    assert!(!err.contains("individual parameter") && !err.contains("iiv_on_ruv"), "{err}");
 }
 
 /// The refusal reads the blocks that carry an η into the objective, and a
@@ -489,7 +513,35 @@ fn a_shaped_eta_read_raw_in_a_named_block_is_refused() {
     let base = src("");
     assert!(base.is_ok(), "the unshaped model parses: {:?}", base.err());
     let err = src("[eta_shape]\n  ETA_F ~ boxcox(L)\n").err().expect("refused");
-    assert!(err.contains("[event_model] reads it directly"), "{err}");
+    // The block is named as its header writes it, and a hazard can read an
+    // individual parameter, so that is the advice.
+    for phrase in
+        ["[event_model cause_b] reads it directly", "read it through an individual parameter"]
+    {
+        assert!(err.contains(phrase), "`{err}` lacks `{phrase}`");
+    }
+    assert!(!err.contains("iiv_on_ruv"), "{err}");
+}
+
+/// With two blocks reading shaped ETAs, the refusal names the first in a fixed
+/// order, whatever the hash order of the blocks: one message over repeated parses
+/// (each parse builds its own `HashMap`, with its own seed). Both blocks are
+/// unnamed, so they share that map. Dies under: the sort of the readers removed.
+#[test]
+fn the_refusal_names_the_same_block_every_time() {
+    let src = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  \
+               theta L(0.3, -3.0, 3.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_E ~ 0.1\n  \
+               sigma EPS ~ 0.01\n\n\
+               [mixture]\n  nsub = 2\n  logit(1) = MIXL + ETA_CL\n\n\
+               [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = 10\n\n\
+               [eta_shape]\n  ETA_CL ~ boxcox(L)\n  ETA_E ~ boxcox(L)\n\n\
+               [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+               [error_model]\n  DV ~ proportional(EPS)\n  iiv_on_ruv = ETA_E\n";
+    let first = parse_model_string(src).err().expect("refused");
+    assert!(first.contains("[error_model]"), "{first}");
+    for _ in 0..16 {
+        assert_eq!(parse_model_string(src).err().expect("refused"), first);
+    }
 }
 
 /// #1721 review r1, finding 1: the absorption ODE twin carries the shape.
@@ -590,7 +642,7 @@ fn box_cox_overflows_to_infinity_not_nan() {
     assert!(v.is_infinite() && v > 0.0, "boxcox(800, 1) = {v}");
     let d = shape_g(ShapeKind::BoxCox, Dual2::<2>::var(800.0, 0), Dual2::<2>::var(1.0, 1));
     assert!(d.value.is_infinite() && d.value > 0.0, "dual value {}", d.value);
-    // Just below the overflow the split still holds: finite and exact.
+    // Just below the overflow it is still finite and exact.
     let x: f64 = 700.0;
     assert_eq!(shape_g(ShapeKind::BoxCox, x, 1.0), x.exp_m1());
 }
