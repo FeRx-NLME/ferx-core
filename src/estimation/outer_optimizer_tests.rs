@@ -13806,12 +13806,12 @@ fn a_leg_predicted_to_gain_nothing_ends_at_its_first_point() {
 }
 
 /// [`leg_settles_on_prediction`]: at or below the threshold, never without a prediction or
-/// on a `NaN` one, and not at A2's smallest needed leg (predicted 1.3e-6).
+/// on a `NaN` one, and not at A2's worst-predicted leg (1.6e-9 predicted, 1.2e-6 gained).
 #[test]
 fn a_leg_settles_only_on_a_small_finite_prediction() {
     assert!(leg_settles_on_prediction(Some(0.0)));
     assert!(leg_settles_on_prediction(Some(UNPROFILED_LEG_SETTLED_PREDICTION)));
-    assert!(!leg_settles_on_prediction(Some(1.3e-6)));
+    assert!(!leg_settles_on_prediction(Some(1.6e-9)));
     assert!(!leg_settles_on_prediction(Some(f64::NAN)));
     assert!(!leg_settles_on_prediction(None));
 }

@@ -5319,22 +5319,29 @@ pub(crate) fn unprofiled_leg_settles(
 pub(crate) const UNPROFILED_FIRST_LEG_GAIN: f64 = POLISH_MIN_GAIN;
 
 /// The BHHH-predicted gain ([`predicted_remaining_gain`]) at or below which a #2462 leg ends
-/// at its first point instead of running to its own stop. Such a leg spent ten or more
+/// at its first point instead of running to its own stop. Such a leg spent five or more
 /// evaluations at `UNPROFILED_VERIFY_INNER_TOL` to gain nothing: on the six FOCE/FOCEI
 /// examples at the default `inner_tol` every leg gained at most 5.3e-9 and ran 5 to 14
-/// evaluations, 5% to 40% of the fit. Measured at the legs' first points (macOS arm64):
+/// evaluations, 5% to 40% of the fit.
+///
+/// The prediction is not a bound. BHHH's outer-product curvature can exceed the Hessian,
+/// and a leg then gains far more than predicted. On A2 (`profile_mbma`), unprofiled from 48
+/// starts on the 4 × 4 × 3 grid around (42, 8, 3.2), the legs gained a median 13× and at
+/// most 735× their prediction (1.6e-9 predicted, 1.2e-6 gained), and a threshold of 1e-7
+/// left fits up to 2.9e-6 above NONMEM. The threshold therefore sits below every A2
+/// prediction (the smallest 1.4e-10) and keeps a 735× miss under 7.4e-8. Measured at the
+/// legs' first points (macOS arm64):
 ///
 /// | leg | predicted | gained |
 /// |---|---|---|
-/// | examples, default and `1e-2` `inner_tol` (11 of 12) | 1e-15 to 7.9e-8 | 0 to 1.5e-8 |
-/// | `mm_oral` (the 12th) | 1.2e-4 | 3.0e-9 |
-/// | A2 from (42, 8, 3.2), `an_unprofiled_leg_ranks_its_own_incumbent` | 1.3e-6 | 4.0e-6 |
-/// | A2 from (60, 6, 3.2), `a_stuck_unprofiled_stop_is_verified_into_the_band` | 1.98 | 4.1e-4 |
+/// | `warfarin`, `two_cpt_oral_cov`, `three_cpt_iv`, `transit_2cpt`, default `inner_tol` | 1.1e-15 to 2.6e-11 | 0 |
+/// | `warfarin_ode_lagtime`, default `inner_tol` | 1.5e-8 | 5.3e-9 |
+/// | `mm_oral`, default `inner_tol` | 1.2e-4 | 2.8e-9 |
+/// | A2, 48 starts around (42, 8, 3.2) | 1.4e-10 to 1.68 | up to 7.1e-6 |
 ///
-/// The smallest gain a leg is needed for, A2's 4.0e-6 (that test's band is 1e-6), was
-/// predicted 3× low, and the threshold sits 13× below its prediction. An over-prediction,
-/// as on `mm_oral`, only lets the leg run as before.
-pub(crate) const UNPROFILED_LEG_SETTLED_PREDICTION: f64 = 1e-7;
+/// The first four end their legs at their first point; `warfarin_ode_lagtime` and `mm_oral`
+/// run theirs as before.
+pub(crate) const UNPROFILED_LEG_SETTLED_PREDICTION: f64 = 1e-10;
 
 /// Does a leg end at its first point ([`UNPROFILED_LEG_SETTLED_PREDICTION`])? Not without a
 /// prediction: a model the decrement is not formed for runs its leg as before.
