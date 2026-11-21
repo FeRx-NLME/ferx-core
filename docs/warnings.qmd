@@ -347,8 +347,11 @@ Ahead of the bundle, `predict_diag()`, `predict_survival_diag()`, both `simulate
 adaptive driver (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) also
 carry the **steady-state non-convergence note** of the pass that just ran: the
 uncoded message beginning "Steady-state (SS=1) equilibration…", which `fit()`
-reports too. It fires when an `SS=1` dose on a nonlinear `[odes]` model reaches
-the equilibration cycle cap short of steady state, so the returned trough is
+reports too, from its pass at the estimates only: a trial point of its search can
+have no steady state where the estimates have one
+([#1522](https://github.com/FeRx-NLME/ferx-core/issues/1522)). A multi-start fit
+reports the winning start's. It fires when an `SS=1` dose on a nonlinear `[odes]`
+model reaches the equilibration cycle cap short of steady state, so the returned trough is
 unreliable or biased low. Before
 [#1652](https://github.com/FeRx-NLME/ferx-core/issues/1652), `predict_diag()` and
 the adaptive driver ran the same capped equilibration and said nothing. Each of

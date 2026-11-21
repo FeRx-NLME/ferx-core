@@ -760,20 +760,11 @@ fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
     );
     assert!(r.ofv.is_finite(), "SS-dosed joint fit OFV is not finite: {}", r.ofv);
 
-    // **Deliberately NOT asserted here: the absence of an SS non-convergence warning.**
-    // It is asserted at `maxiter = 0` instead, by
-    // `ss_chz_nonmem_anchor::a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective`,
-    // and that is the right place for it. Measured here: a run-to-convergence fit *does*
-    // collect the #867 warning, because the optimizer legitimately visits theta where no
-    // periodic steady state exists at `II = 12` —
-    //
-    //   "per-cycle carryover is not contracting (ratio ~ 1.000), indicating no periodic
-    //    steady state exists — the mean input rate meets or exceeds the maximum elimination"
-    //
-    // — which is a true statement about that theta, not #1210's spurious one. The two are
-    // indistinguishable by message text, so asserting emptiness across an optimization would
-    // be asserting that the optimizer never explores a slow-elimination corner. The final
-    // estimates are healthy (`ke = 0.102`, `KA = 1.01`), which is what this arm checks.
+    // No SS non-convergence warning: the optimizer visits theta where no periodic steady state
+    // exists at `II = 12`, which collected the #867 warning until a fit reported only the notes
+    // of its pass at the estimates (#1522); the final estimates have one (`ke = 0.102`).
+    let ss: Vec<_> = r.warnings.iter().filter(|w| w.contains("(SS=1)")).collect();
+    assert!(ss.is_empty(), "{ss:?}");
 
     // Measured, then banded around the measurement with truth inside:
     // CL/V = 0.101679 (truth 0.1), KA = 1.0121 (1.0), omega^2 = 0.0932 (0.09).
