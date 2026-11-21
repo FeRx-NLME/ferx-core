@@ -91,12 +91,13 @@ pub(crate) fn ctmm_unsupported(message: impl Into<String>) -> EngineError {
     coded("E_CTMM_UNSUPPORTED", Some("markov_model"), message.into())
 }
 
-/// `E_VPC_TTE_INPUT`: an input `vpc_tte`, `vpc_rtte` or `vpc_kmmc` would draw a wrong
-/// curve or band from (#1886) — several TTE endpoints and no `cmt`, an endpoint of the
-/// wrong kind (repeated events for `vpc_tte` and `vpc_kmmc`, a single event for
-/// `vpc_rtte`), left truncation, an interval-censored record, bad band probabilities,
-/// too few replicates, too many strata, a missing KMMC covariate, and the like. `ferx
-/// check` has no VPC options, so only those three entry points raise it.
+/// `E_VPC_TTE_INPUT`: an input `vpc_tte`, `vpc_rtte`, `vpc_kmmc` or `vpc_cif` would draw
+/// a wrong curve or band from (#1886, #1887) — several TTE endpoints and no `cmt`, an
+/// endpoint of the wrong kind (repeated events for `vpc_tte`, `vpc_kmmc` and `vpc_cif`, a
+/// single event for `vpc_rtte`), left truncation, an interval-censored record, bad band
+/// probabilities, too few replicates, too many strata, a missing KMMC covariate, a subject
+/// without a record on every cause, and the like. `ferx check` has no VPC options, so only
+/// those four entry points raise it.
 #[cfg(feature = "survival")]
 pub(crate) fn vpc_tte_input(message: impl Into<String>) -> EngineError {
     coded("E_VPC_TTE_INPUT", None, message.into())

@@ -21,11 +21,11 @@
 
 use std::collections::HashMap;
 
-use crate::api::apply_iov_occasion_rule;
-use crate::api::postfit::theta_se_from_packed;
 use crate::diagnostics::{Diagnostic, EngineError};
+use crate::estimation::parameterization::theta_se_from_packed;
 use crate::estimation::parameterization::{theta_from_packed, theta_packing_jacobian};
 use crate::estimation::sir::percentile_ci;
+use crate::occasions::apply_iov_occasion_rule;
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,
     LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
@@ -52,7 +52,7 @@ const TIME_COLUMN: &str = "TIME";
 /// parse would: the contrast an `auto` block resolved to there is not carried over.
 /// Covariate statistics `parsed` was bound with are kept only when `population`
 /// gives the same summary of every covariate they cover. Otherwise they are dropped,
-/// and the relations are left for [`bind_covariate_stats`](crate::api::bind_covariate_stats)
+/// and the relations are left for [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats)
 /// to bind on `population`.
 ///
 /// Refused, with nothing written, on a model laid out on a fit's bindings
@@ -99,7 +99,7 @@ fn bind_levels_on_data(
     // The bindings this layout is re-parsed on: no level binding of `parsed`'s,
     // and its statistics only while they are still `population`'s.
     let mut base = unbound_bindings(parsed);
-    if crate::api::covariate_stats::stats_hold_on(&parsed.bindings.covariate_stats, population) {
+    if crate::covariate_stats::stats_hold_on(&parsed.bindings.covariate_stats, population) {
         base.covariate_stats = parsed.bindings.covariate_stats.clone();
     }
 
@@ -156,9 +156,7 @@ fn bind_levels_on_data(
     // and the rank check would refuse it for that. The binding keeps `base`.
     let mut measure_base = base.clone();
     if measure_base.covariate_stats.is_empty() {
-        if let Some(stats) =
-            crate::api::covariate_stats::stats_on_data(parsed, model_text, population)
-        {
+        if let Some(stats) = crate::covariate_stats::stats_on_data(parsed, model_text, population) {
             measure_base.covariate_stats = stats;
         }
     }
@@ -379,7 +377,7 @@ fn bind_levels_from_fit_layout(
 /// out and writes nothing.
 ///
 /// After this call the model records that its bindings are the fit's (#1730), so
-/// [`bind_covariate_stats`](crate::api::bind_covariate_stats) on it is a no-op — the
+/// [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats) on it is a no-op — the
 /// fitted θ was estimated against the fit's centres — and [`bind_theta_levels`]
 /// refuses it, since the population's own levels would read the fitted θ at other
 /// positions.
@@ -468,7 +466,7 @@ pub(crate) fn bind_from_fit_on(
 /// Whether the model needs the fit's bindings is decided from `model_text`, not from
 /// `parsed`, so a model already bound to other data (a simulation design, by
 /// [`prepare_run`](crate::api::prepare_run) or
-/// [`bind_covariate_stats`](crate::api::bind_covariate_stats)) is laid out on the
+/// [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats)) is laid out on the
 /// fit's statistics, or refused when the fit carries none (#1686). Refused, with
 /// `parsed` left as it was: everything [`bind_from_fit`] refuses except a level the
 /// fit never observed, with the same codes (#1773).
@@ -596,7 +594,7 @@ impl FitLayout {
 fn lay_out_on_fit(
     parsed: &ParsedModel, model_text: &str, fitted: &DataBindings,
 ) -> Result<Option<FitLayout>, Diagnostic> {
-    use crate::api::covariate_stats::stats_binding_error;
+    use crate::covariate_stats::stats_binding_error;
     // What the model needs comes from its text, parsed with no data-derived binding
     // (#1686): both halves are read here.
     // A refusal that is not one half's alone is the level half's when the model has
@@ -613,13 +611,13 @@ fn lay_out_on_fit(
     let declared = declared_model(parsed, model_text, Reads::Both)
         .map_err(|message| either_on(has_levels, message))?;
     let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
-    let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
+    let symbolic = crate::covariate_stats::symbolic_covariates(&declared);
     let either = |message: String| either_on(!decls.is_empty(), message);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
         return Err(either(no_fit_bindings_message(&decls, &symbolic)));
     }
     validate_fitted_levels(&decls, &fitted.levels).map_err(level_binding_error)?;
-    crate::api::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)
+    crate::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)
         .map_err(stats_binding_error)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
         return Ok(None);
@@ -634,9 +632,9 @@ fn lay_out_on_fit(
     // so that claim is measured; it would fire if a relation came to need more
     // than a `CovariateSummary` to resolve.
     debug_assert!(
-        crate::api::assert_covariate_model_bound(&model).is_ok(),
+        crate::covariate_stats::assert_covariate_model_bound(&model).is_ok(),
         "a from-fit layout left a relation unresolved: {:?}",
-        crate::api::assert_covariate_model_bound(&model)
+        crate::covariate_stats::assert_covariate_model_bound(&model)
     );
     Ok(Some(FitLayout { decls, model, bindings }))
 }
@@ -2942,7 +2940,7 @@ fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
 /// `(t, misfit)` pairs. A dropped column lies in the span to [`DROP_TOL`] of its
 /// norm, so a representable combination leaves a misfit of that order; one that
 /// is not leaves one of the order of the functional. Measured over the 2464
-/// bases the `api::levels` tests build in [`carried`], macOS arm64 debug: a
+/// bases the `levels` tests build in [`carried`], macOS arm64 debug: a
 /// representable combination reaches at most 4.2e-11, one that is not at least
 /// 8.5e-2; the constant sits 4.4 decades above the one and 4.9 below the other.
 /// In the same run the loose rank count's direction test ([`SPAN_TOL`] on a
@@ -3422,7 +3420,7 @@ fn coded_aliased(
 /// initialised at 0 that switches the intercept off at the initial estimates
 /// is seen at the moved point.
 ///
-/// Measured over every call the `api::levels` tests make, macOS arm64 debug:
+/// Measured over every call the `levels` tests make, macOS arm64 debug:
 /// a unit set the verdict holds on reaches at most 2.1e-10 (its largest unit
 /// residual; `a_common_factor_does_not_count_in_a_parameter_funnel` under
 /// `ref`), an identified one at least 1.4e-2 (the kappa twin of
@@ -3437,7 +3435,7 @@ fn coded_aliased(
 /// Each coded column must keep at least [`SPAN_TOL`] of its norm against the
 /// other θ and the coded columns before it, counted on the basis the residual
 /// is measured in, beyond any deficiency the other θ have among themselves.
-/// Measured over every guard the `api::levels` tests reach (2334 with the
+/// Measured over every guard the `levels` tests reach (2334 with the
 /// two-block tests of #1963, macOS arm64 debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
 /// one at least 3.4e-4, so [`SPAN_TOL`] sits 2.9 decades above the one and 2.5
 /// below the other. Under sum-to-zero the count is taken on the raw levels and
@@ -6490,9 +6488,9 @@ fn subject_levels(
 }
 
 #[cfg(test)]
-#[path = "tests/theta_levels_tests.rs"]
+#[path = "api/tests/theta_levels_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/profiled_levels_tests.rs"]
+#[path = "api/tests/profiled_levels_tests.rs"]
 mod profiled_levels_tests;

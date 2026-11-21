@@ -155,13 +155,25 @@ pub(crate) struct ControllerDecision {
 }
 
 /// The value a monitored signal presented to the controller at a decision and its mode,
-/// recorded on each [`DoseLedgerEntry`] for decision-audit replay (#391 Part E).
+/// recorded on each [`DoseLedgerEntry`] for decision-audit replay (#391 Part E), next to
+/// the latent value it was read from (#946).
+///
+/// `#[non_exhaustive]`: built only by the engine, so a field added later is not a
+/// breaking change for readers.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ObservedSignal {
     /// Matches the [`MonitorSpec::name`] that produced it.
     pub name: String,
-    /// The resolved value (latent or assay-noised per the monitor's mode).
+    /// The value the controller saw: the latent readout under [`ObserveMode::Ipred`],
+    /// the assay-noised reading (clamped at 0 where the readout cannot be negative) under
+    /// [`ObserveMode::Dv`]. Kept for decision audit; the outcome metrics do not read it.
     pub value: f64,
+    /// The latent (noise-free) readout at the decision, before any assay draw or clamp.
+    /// Equal to `value` bit-for-bit under [`ObserveMode::Ipred`]. The outcome metrics
+    /// ([`AdaptiveSubjectMetrics::signal_min`] … `pct_readings_in_window`) are scored on it,
+    /// since assay error is not part of the patient's outcome (#946).
+    pub latent: f64,
     /// The mode it was resolved under.
     pub mode: ObserveMode,
 }
@@ -203,7 +215,10 @@ impl ControllerCtx<'_> {
 
 /// One realized dose, with the provenance the Part-D ledger output and the
 /// Part-E verifier need. Emitted for every dose a controller actually issues.
+/// `#[non_exhaustive]` since the assay replicate tag (`rep`, #946): read the rows; a new
+/// field is additive.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DoseLedgerEntry {
     /// Subject id.
     pub subject: String,
@@ -212,6 +227,11 @@ pub struct DoseLedgerEntry {
     pub draw: usize,
     /// Replicate index within the draw — matches [`crate::SimulationResult::sim`].
     pub sim: usize,
+    /// Assay replicate within the `(draw, sim)`, 1-based (#946): with
+    /// [`crate::AdaptiveSimulateOptions::n_reps`] `= R`, each subject's η (and mixture
+    /// class) is held fixed across reps `1..=R` while IOV κ and the `Dv` assay noise are
+    /// redrawn. `1` in a run with the default `R = 1`.
+    pub rep: usize,
     /// 0-based index of this dose among the subject's realized doses.
     pub dose_idx: usize,
     /// Time the dose was applied.
@@ -227,7 +247,8 @@ pub struct DoseLedgerEntry {
     /// Human-readable tag for the action/rule that fired (e.g. `"bolus"`, or a
     /// named ladder rule once S2 lands).
     pub rule_fired: String,
-    /// What the controller observed at this decision (per-analyte value + mode).
+    /// The signals at this decision, per analyte: the value the controller saw, its
+    /// latent readout (which the controller did not see, #946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// State immediately before / after the dose discontinuity, for the mass-balance
     /// checks (S6). `None` when snapshots are not retained.
@@ -284,8 +305,8 @@ impl DecisionOutcome {
 
 /// One decision the controller made, recorded for every decision time (holds included):
 /// the Part-D decision log and the input to the Part-E audit replay (S1.6). It pins what
-/// the controller saw (`observed_signals`, which under `Dv` holds the realized assay
-/// draw) and what it did. `state`, covariates and history are re-derivable from the
+/// the controller saw (`observed_signals`, whose `value` under `Dv` holds the realized
+/// assay draw, next to the `latent` readout the controller did not see) and what it did. `state`, covariates and history are re-derivable from the
 /// frozen inputs, so they are not stored. Nothing is logged after a `Stop`.
 /// `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -297,12 +318,17 @@ pub struct DecisionLogEntry {
     pub draw: usize,
     /// Replicate index within the draw — matches [`crate::SimulationResult::sim`].
     pub sim: usize,
+    /// Assay replicate within the `(draw, sim)`, 1-based (#946): with
+    /// [`crate::AdaptiveSimulateOptions::n_reps`] `= R`, each subject's η (and mixture
+    /// class) is held fixed across reps `1..=R` while IOV κ and the `Dv` assay noise are
+    /// redrawn. `1` in a run with the default `R = 1`.
+    pub rep: usize,
     /// 0-based index of this decision in the schedule.
     pub decision_idx: usize,
     /// Decision time on the subject's clock.
     pub time: f64,
-    /// What the controller observed at this decision (per-analyte value + mode) —
-    /// the exact inputs to reproduce the decision.
+    /// The signals at this decision, per analyte: the value the controller saw (the
+    /// exact input to reproduce the decision), its latent readout (#946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// What the controller did (dose / hold / stop), or `NotDue`.
     pub outcome: DecisionOutcome,
@@ -342,6 +368,11 @@ pub struct AdaptiveSubjectMetrics {
     pub draw: usize,
     /// Replicate index within the draw (matches [`crate::SimulationResult::sim`]).
     pub sim: usize,
+    /// Assay replicate within the `(draw, sim)`, 1-based (#946): with
+    /// [`crate::AdaptiveSimulateOptions::n_reps`] `= R`, each subject's η (and mixture
+    /// class) is held fixed across reps `1..=R` while IOV κ and the `Dv` assay noise are
+    /// redrawn. `1` in a run with the default `R = 1`.
+    pub rep: usize,
     /// Total nominal dose delivered — Σ `amt` over the run's ledger rows
     /// (pre-bioavailability: the prescribed amount, matching the ledger).
     pub cumulative_dose: f64,
@@ -364,17 +395,23 @@ pub struct AdaptiveSubjectMetrics {
     pub discontinued: bool,
     /// Time of the `Stop` decision, or `None` if the run never discontinued.
     pub time_to_discontinuation: Option<f64>,
-    /// Lowest observed signal across the decisions that recorded one (the deepest
-    /// trough the monitor saw), or `None` if no decision recorded a signal.
+    /// Lowest latent signal ([`ObservedSignal::latent`] of the first monitor) across the
+    /// decisions that recorded one, or `None` if no decision recorded a signal. Scored on
+    /// the latent value, not the assay-noised reading, so a `Dv` monitor's noise moves
+    /// it only through the doses it changed (#946).
     pub signal_min: Option<f64>,
-    /// Highest observed signal across the decisions that recorded one.
+    /// Highest latent signal across the decisions that recorded one (see `signal_min`).
     pub signal_max: Option<f64>,
-    /// Mean observed signal across the decisions that recorded one.
+    /// Mean latent signal across the decisions that recorded one (see `signal_min`).
     pub signal_mean: Option<f64>,
-    /// Fraction of the signal-bearing decisions whose observed value fell within
-    /// `target_window` `[lo, hi]` (inclusive). Decisions without a signal are excluded.
-    /// `None` when no `target_window` is declared or no signal was recorded (#584).
-    pub pct_time_in_window: Option<f64>,
+    /// Fraction of the signal-bearing **decision readings** whose latent value
+    /// ([`ObservedSignal::latent`] of the first monitor) fell within `target_window`
+    /// `[lo, hi]` (inclusive), a fraction in `[0, 1]`. It counts readings, not elapsed
+    /// time: on an uneven grid each reading weighs the same. Decisions without a signal
+    /// are excluded. `None` when no `target_window` is declared or no signal was recorded
+    /// (#584). Latent, like `auc_target_attainment`, since #946, which also renamed it
+    /// from `pct_time_in_window`.
+    pub pct_readings_in_window: Option<f64>,
     /// Fraction of the closed inter-decision windows whose exposure (AUC of the latent
     /// signal) fell within `auc_target` `[lo, hi]` (inclusive), e.g. vancomycin AUC₂₄
     /// (#391 S2.5b). The denominator is `realized_decisions − 1`; `None` with fewer than
@@ -431,18 +468,27 @@ pub(crate) fn compute_subject_metrics(
     let discontinued = stop.is_some();
     let time_to_discontinuation = stop.map(|d| d.time);
 
-    // Over the first monitor's observed values; decisions without one are skipped.
+    // Over the first monitor's latent values (#946): the outcome is the patient's, and
+    // assay error is not part of it. Decisions without a signal are skipped.
     let signal_vals: Vec<f64> =
-        decisions.iter().filter_map(|d| d.observed_signals.first().map(|s| s.value)).collect();
+        decisions.iter().filter_map(|d| d.observed_signals.first().map(|s| s.latent)).collect();
     let (signal_min, signal_max, signal_mean) = if signal_vals.is_empty() {
         (None, None, None)
     } else {
-        let min = signal_vals.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = signal_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // NaN-propagating, unlike `f64::min`/`f64::max`, which drop a NaN. Unreachable
+        // through the engine (the monitor loop refuses a non-finite readout, #1578), but a
+        // NaN must surface here rather than vanish if that guard ever moves.
+        let nan_min = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) };
+        let nan_max = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) };
+        let min = signal_vals.iter().copied().fold(f64::INFINITY, nan_min);
+        let max = signal_vals.iter().copied().fold(f64::NEG_INFINITY, nan_max);
         let mean = signal_vals.iter().sum::<f64>() / signal_vals.len() as f64;
         (Some(min), Some(max), Some(mean))
     };
-    let pct_time_in_window = match target_window {
+    let pct_readings_in_window = match target_window {
+        // A NaN reading fails both comparisons and would count as a miss; surface it
+        // instead, as the min/max fold above does (same unreachable-today guard, #1578).
+        Some(_) if signal_vals.iter().any(|v| v.is_nan()) => Some(f64::NAN),
         Some((lo, hi)) if !signal_vals.is_empty() => {
             let n_in = signal_vals.iter().filter(|&&v| v >= lo && v <= hi).count();
             Some(n_in as f64 / signal_vals.len() as f64)
@@ -463,6 +509,8 @@ pub(crate) fn compute_subject_metrics(
         subject: subject.to_string(),
         draw,
         sim,
+        // Stamped by the caller, which knows the assay replicate; the ledger does not.
+        rep: 1,
         cumulative_dose,
         n_doses,
         n_increases,
@@ -474,7 +522,7 @@ pub(crate) fn compute_subject_metrics(
         signal_min,
         signal_max,
         signal_mean,
-        pct_time_in_window,
+        pct_readings_in_window,
         auc_target_attainment,
         // The caller knows where the η came from; the ledger does not.
         eta_supplied: false,
@@ -549,23 +597,26 @@ pub(crate) struct ReplicateTag {
     /// The parameter draw, `None` when the run draws no parameter uncertainty.
     pub(crate) draw: Option<usize>,
     pub(crate) sim: usize,
+    /// The assay replicate, `None` when the run has one (`n_reps = 1`, the default), so
+    /// every message keeps the text it had before replicates existed.
+    pub(crate) rep: Option<usize>,
 }
 
 impl ReplicateTag {
-    /// `"sim 3"`, or `"draw 2, sim 3"` under uncertainty.
+    /// `"sim 3"`, `"draw 2, sim 3"` under uncertainty, then `", rep 2"` with replicates.
     pub(crate) fn sim_label(self) -> String {
-        match self.draw {
-            None => format!("sim {}", self.sim),
-            Some(d) => format!("draw {d}, sim {}", self.sim),
-        }
+        self.label("sim")
     }
 
-    /// `"replicate 3"`, or `"draw 2, replicate 3"` under uncertainty.
+    /// `"replicate 3"`, `"draw 2, replicate 3"` under uncertainty, then `", rep 2"`.
     pub(crate) fn replicate_label(self) -> String {
-        match self.draw {
-            None => format!("replicate {}", self.sim),
-            Some(d) => format!("draw {d}, replicate {}", self.sim),
-        }
+        self.label("replicate")
+    }
+
+    fn label(self, noun: &str) -> String {
+        let draw = self.draw.map(|d| format!("draw {d}, ")).unwrap_or_default();
+        let rep = self.rep.map(|r| format!(", rep {r}")).unwrap_or_default();
+        format!("{draw}{noun} {}{rep}", self.sim)
     }
 }
 
@@ -701,7 +752,8 @@ pub struct AdaptiveDosingSpec {
     /// the LOCF row either way.
     pub decision_covariates: DecisionCovariates,
     /// Optional target band `[low, high]` (inclusive, `high` may be `+∞`) for the signal.
-    /// Feeds only `pct_time_in_window`, never dosing; `None` leaves it unreported. See
+    /// Feeds only `pct_readings_in_window` (scored on the latent signal, #946), never dosing;
+    /// `None` leaves it unreported. See
     /// [`crate::AdaptiveSubjectMetrics`].
     pub target_window: Option<(f64, f64)>,
     /// Optional exposure band `[low, high]` (inclusive; `low` finite `≥ 0`, `high` may be
@@ -864,11 +916,40 @@ fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
     (if lo > 0.0 { kl.max(1.0) } else { kl }, snapped_integer(qh).unwrap_or_else(|| qh.floor()))
 }
 
-/// `x` rounded to the nearest multiple of `s`, ties up: the half is nudged up by
-/// [`GRID_SNAP`] (relative), since `x / s` misses a tie by an ulp (`0.35 / 0.1`).
+/// How far, in units of `ε·|q|` (one to two ulps of `q`), the quotient `q = x / s` may miss
+/// a tie `k + 0.5` and still count as one (#2927). Measured on sweeps of 22 to 26 decimal
+/// steps (0.1, 0.25, 0.05, 1e-3, 1e-4, 1e-6, 1e-9, 2.5, 250, ...): a tie written as a decimal
+/// (`0.35 / 0.1 = 3.4999999999999996`) misses by at most 1 `ε·|q|`, and an exact multiple
+/// misses `k` by at most 1. A tie reached by a percent step (`d · (1 ± p/100)`, every integer
+/// `p` from 1 to 99 plus 0.001 to 33.3) misses by at most 4.41 on 11.8 million ties and 4.45
+/// on the review's 3.4 million, which sample larger indices; the worst come from a large
+/// decrease, where `1 − p/100` cancels: `decrease 93%` from 28.65 at `s = 0.001` is
+/// `2.0054999999999983`, 8 ulps (4.08 `ε·|q|`) short of `2.0055` (review r1 of #3106; the
+/// first sweep had no `p` above 75 and reported 3). 8 is 1.8× the worst. A decrease of more
+/// than about 95% at a non-integer `p` misses by more, without bound as `p → 100`: `p`'s own
+/// decimal error grows through the cancellation, so no constant here covers it.
+const TIE_ULPS: f64 = 8.0;
+
+/// `x` rounded to the nearest multiple of `s`, ties up. `x / s` misses a tie by a few ulps
+/// (`0.35 / 0.1`), so a fraction within `w = TIE_ULPS · ε · |q|` below a half still goes up.
+/// The tolerance is capped at `0.5 − w`, so the threshold never comes within `w` of `k`
+/// and an exact multiple stays put at every grid index (#2927). The relative nudge it
+/// replaces, `1e-9 · |q|`, reached a half at `q = 5e8` and moved a multiple up one step
+/// each time it was placed. Past `w = 0.25` (`q ≈ 1.4e14`) the cap shrinks the tolerance,
+/// and from `q ≈ 3.4e14` (measured, the first decimal tie lost on the sweep) a tie that
+/// misses can go down: there a few ulps are a sizeable part of a step, and a missed tie and
+/// a multiple can no longer both be told apart. The floor at 0 keeps an exact tie going up.
+///
+/// A tie reached by a decrease of more than about 95% at a non-integer percentage can miss by
+/// more than the tolerance and go down ([`TIE_ULPS`]): `decrease 96.2%` from 250 at
+/// `round_to = 1` gives `9.49999999999998`, placed at 9.
 pub(crate) fn round_to_grid(x: f64, s: f64) -> f64 {
     let q = x / s;
-    grid_point((q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor(), s)
+    // Exact: `k <= q < k + 1 <= 2k` (Sterbenz) for `k >= 1`, and `q - 0` for `k = 0`.
+    let k = q.floor();
+    let w = TIE_ULPS * f64::EPSILON * q.abs();
+    let tol = w.min(0.5 - w).max(0.0);
+    grid_point(if q - k >= 0.5 - tol { k + 1.0 } else { k }, s)
 }
 
 /// The `k`-th multiple of `s`: `k / n` when `1 / s` is within [`GRID_SNAP`] of an integer
@@ -921,7 +1002,7 @@ impl DoseGrid {
 
     /// The lowest multiple of `step` that `increase p%` raises on an unbounded grid
     /// (#2810); `None` if none up to index 2^52. Found by bisection on
-    /// [`Self::step_percent`], since the relative tie nudge makes `50 / p` inexact (#2890).
+    /// [`Self::step_percent`], since the tie tolerance makes `50 / p` inexact (#2890).
     pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
         const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
         let open = Self { step, low: 0.0, high: f64::INFINITY };
@@ -1772,6 +1853,92 @@ mod tests {
         assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
     }
 
+    /// A dose on the grid is a fixed point of [`DoseGrid::place`] at every grid index (#2927).
+    /// The relative nudge before the fix reached a half at index `5e8`, so from there each
+    /// placement moved a multiple up one step (`5e8 + 0.5 + 0.5`). Indices: small, `5e4`,
+    /// around `5e8`, and the largest where `k · s` is exact (`2^53` at `s = 1` and
+    /// `s = 0.25`, `floor(2^53 / 125)` at `s = 250`). A decimal step is never exact; its
+    /// multiples are checked up to `1e15`, where `x / s` still rounds to `k`, which is asserted
+    /// first, and at `s = 1e-6` also at `2^50 + 2`, where `q` is one ulp (0.25) above `k`: the
+    /// cap has taken the tolerance to 0 there, so the threshold is the half itself. An exact
+    /// tie keeps going up where it is representable (`2^52 − 0.5` at `s = 1`), past the index
+    /// where the cap takes the tolerance to 0.
+    ///
+    /// Mutations: the old nudge moves `5e8` at every step; the cap at the half
+    /// (`w.min(0.5)`) moves every multiple from `q ≈ 2.8e14`, so `2^53`; a constant cap
+    /// (`w.min(0.25)`) moves the multiple at `2^50 + 2` (review r1 of #3106); the tolerance
+    /// without its floor at 0 sends the exact tie at `2^51 + 0.5` down.
+    #[test]
+    fn a_dose_on_the_grid_is_a_fixed_point_of_place_at_every_index() {
+        const TWO_53: f64 = 9_007_199_254_740_992.0;
+        let open = |s: f64| DoseGrid { step: s, low: 0.0, high: f64::INFINITY };
+        let around = |k: f64| [k - 1.0, k, k + 1.0];
+        let common =
+            [1.0, 3.0, 49_999.0, 50_000.0].into_iter().chain(around(5e8)).chain(around(1e12));
+        for (s, top) in [(1.0, TWO_53), (0.25, TWO_53), (250.0, (TWO_53 / 125.0).floor())] {
+            for k in common.clone().chain(around(top - 1.0)) {
+                let x = k * s;
+                assert_eq!(x / s, k, "premise: s = {s}, k = {k} is exact");
+                let placed = open(s).place(x);
+                assert_eq!(placed.to_bits(), x.to_bits(), "s = {s}, k = {k}: {x} -> {placed}");
+            }
+        }
+        for s in [0.1, 0.05, 1e-3, 1e-6, 0.3] {
+            for k in common.clone().chain(around(1e15)) {
+                let x = grid_point(k, s);
+                assert_eq!((x / s).round(), k, "premise: s = {s}, k = {k} is recoverable");
+                let placed = open(s).place(x);
+                assert_eq!(placed.to_bits(), x.to_bits(), "s = {s}, k = {k}: {x} -> {placed}");
+                assert_eq!(open(s).place(placed).to_bits(), x.to_bits(), "s = {s}, k = {k}");
+            }
+        }
+        let k = 2f64.powi(50) + 2.0;
+        let x = grid_point(k, 1e-6);
+        assert_eq!(x / 1e-6 - k, 0.25, "premise: q is one ulp above k = {k}");
+        assert_eq!(open(1e-6).place(x).to_bits(), x.to_bits(), "s = 1e-6, k = {k}");
+        for k in [5e8, 2f64.powi(49), 2f64.powi(51), TWO_53 / 2.0 - 1.0] {
+            let tie = k + 0.5;
+            assert_eq!(tie - k, 0.5, "premise: {tie} is an exact tie");
+            assert_eq!(round_to_grid(tie, 1.0).to_bits(), (k + 1.0).to_bits(), "tie {tie}");
+        }
+    }
+
+    /// A tie reached by a percent step goes up though `q` misses it: `decrease 33%` from 2.405
+    /// at `s = 0.0001` is `1.6113499999999996`, 3 ulps short of 16113.5, and `decrease 93%`
+    /// from 28.65 at `s = 0.001` is `2.0054999999999983`, 8 ulps (4.08 `ε·|q|`) short of
+    /// 2005.5, the large-decrease case behind [`TIE_ULPS`] (#2927, review r1 of #3106). Just
+    /// below a tie by more than the tolerance still goes down. Past the tolerance, the
+    /// documented limit: `decrease 96.2%` from 250 at `s = 1` (`9.49999999999998`, a tie in
+    /// decimal) goes down to 9.
+    ///
+    /// Mutations: `TIE_ULPS` at 4 sends the 93% tie down (this test; before the review only
+    /// the 1e-6% start in `lowest_raised_by_is_the_first_multiple_the_step_moves` died); at 1
+    /// also the 33% tie; at 0 the decimal tie goes down too
+    /// (`round_to_grid_sends_ties_up_on_a_decimal_grid`).
+    #[test]
+    fn a_percent_step_tie_short_by_the_measured_miss_goes_up() {
+        let x = percent_step(2.405, 33.0, false);
+        assert_eq!(x, 1.6113499999999996, "premise: the step misses the tie");
+        let q = x / 0.0001;
+        let ulps = (16113.5 - q) / (q.next_up() - q);
+        assert!((2.5..=3.0).contains(&ulps), "premise: 3 ulps short, got {ulps}");
+        assert!((round_to_grid(x, 0.0001) - 1.6114).abs() < 1e-15, "{}", round_to_grid(x, 0.0001));
+        // 1e-4 of a step short (8e7 ulps of `q`) is not a tie.
+        assert!((round_to_grid(1.61134999, 0.0001) - 1.6113).abs() < 1e-15);
+
+        let open = DoseGrid { step: 0.001, low: 0.0, high: f64::INFINITY };
+        let x = percent_step(28.65, 93.0, false);
+        assert_eq!(x, 2.0054999999999983, "premise: the 93% step misses the tie");
+        let q = x / 0.001;
+        let ulps = (2005.5 - q) / (q.next_up() - q);
+        assert!((7.5..=8.0).contains(&ulps), "premise: 8 ulps short, got {ulps}");
+        assert_eq!(open.place(x).to_bits(), 2.006f64.to_bits(), "{}", open.place(x));
+
+        let x = percent_step(250.0, 96.2, false);
+        assert_eq!(x, 9.49999999999998, "premise: the 96.2% step misses the tie by 2e-14");
+        assert_eq!(round_to_grid(x, 1.0).to_bits(), 9.0f64.to_bits(), "the documented limit");
+    }
+
     /// A step that divides 1 gives the decimal multiple, not `k * s`: `7 * 0.1` is
     /// `0.7000000000000001`, but the grid dose for 0.7 at `s = 0.1` is `0.7` exactly, as
     /// are `0.3` (`3 * 0.1 = 0.30000000000000004`) and the multiples of 0.25. An integer
@@ -1948,16 +2115,24 @@ mod tests {
     /// does not (372.5), so it starts at 500. On a decimal grid, `0.1` under 25%: 0.1
     /// gives 0.125 (back to 0.1), 0.2 gives 0.25, a tie, up to 0.3.
     ///
-    /// Small percentages (#2890 review r1 rows 1 and 2): the tie nudge is relative, so
-    /// the engine raises a dose below `50 * s / p`. At `s = 1` the reviewer's bisection
-    /// gave 16667 for 0.003%, 49996 for 0.001% (not 50000) and 45454546 for 1e-6% (not
-    /// 50000000). `1e-310%` must return: `50 / p` is infinite there.
+    /// Small percentages (#2890 review r1 rows 1 and 2, #2927). At `s = 1`, 0.003% starts
+    /// at 16667 and 0.001% at 50000, a half step exactly (the relative nudge before #2927
+    /// gave 49996). 1e-6% starts at 49999992, not 50000000 (the old nudge gave 45454546).
+    /// There the step misses the half by 8.2e-8, 7.4 `ε·|q|`, inside the tolerance of 8; at
+    /// 49999991 it misses by 8.05 and is not raised. 49999996 to 49999999 (4.03, 2.68, 2.01,
+    /// 1.34 `ε·|q|`) lie within the measured tie miss (4.45, [`TIE_ULPS`]) and cannot be told
+    /// from a tie; 49999992 to 49999995 (7.38, 6.71, 5.37, 4.70) are raised by the tolerance's
+    /// headroom over that miss alone (review r1 and r2 of #3106). Exactly 50000000 would need a
+    /// tolerance under 1.34 `ε·|q|`, which sends the measured percent-step ties down. `1e-310%` raises
+    /// nothing up to index 2^52, since `1 + 1e-312` is 1 (the old nudge raised every
+    /// multiple from `5e8` up, so it returned there), and it must return: `50 / p` is
+    /// infinite.
     ///
     /// Each value is also checked against the engine: it is raised and the multiple
     /// below it is not.
     ///
     /// Mutations: returning `50 * s / p` unrounded gives 510.2 for 49%; ties down gives
-    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000 for 0.001% and
+    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000000 for 1e-6% and
     /// does not return for 1e-310%.
     #[test]
     fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
@@ -1969,14 +2144,13 @@ mod tests {
             (250.0, 49.0, Some(500.0)),
             (0.1, 25.0, Some(0.2)),
             (1.0, 0.003, Some(16667.0)),
-            (1.0, 0.001, Some(49996.0)),
-            (1.0, 1e-6, Some(45_454_546.0)),
+            (1.0, 0.001, Some(50000.0)),
+            (1.0, 1e-6, Some(49_999_992.0)),
             (1.0, 1e-310, None),
         ] {
-            let got = DoseGrid::lowest_raised_by(s, p).expect("a multiple is raised");
-            if let Some(want) = want {
-                assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
-            }
+            let got = DoseGrid::lowest_raised_by(s, p);
+            assert_eq!(got.map(f64::to_bits), want.map(f64::to_bits), "s = {s}, p = {p}");
+            let Some(got) = got else { continue };
             let below = got - s;
             assert!(open(s).step_percent(got, p, true) > got, "s = {s}, p = {p}: {got}");
             assert_eq!(
@@ -2296,11 +2470,17 @@ mod tests {
 
     #[test]
     fn ledger_entry_and_observed_signal_round_trip() {
-        let obs = ObservedSignal { name: "CONC".to_string(), value: 12.5, mode: ObserveMode::Dv };
+        let obs = ObservedSignal {
+            name: "CONC".to_string(),
+            value: 12.5,
+            latent: 11.0,
+            mode: ObserveMode::Dv,
+        };
         let entry = DoseLedgerEntry {
             subject: "1".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             dose_idx: 2,
             time: 48.0,
             amt: 75.0,
@@ -2322,11 +2502,17 @@ mod tests {
 
     #[test]
     fn decision_log_entry_round_trips_and_outcomes_are_distinct() {
-        let obs = ObservedSignal { name: "A".to_string(), value: 0.0, mode: ObserveMode::Ipred };
+        let obs = ObservedSignal {
+            name: "A".to_string(),
+            value: 0.0,
+            latent: 0.0,
+            mode: ObserveMode::Ipred,
+        };
         let entry = DecisionLogEntry {
             subject: "1".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             decision_idx: 3,
             time: 72.0,
             observed_signals: vec![obs.clone()],
@@ -2519,6 +2705,7 @@ mod tests {
             subject: "S".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             dose_idx: 0,
             time: 0.0,
             amt,
@@ -2538,6 +2725,7 @@ mod tests {
             subject: "S".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             decision_idx: 0,
             time,
             observed_signals: signal
@@ -2545,12 +2733,80 @@ mod tests {
                     vec![ObservedSignal {
                         name: "signal".to_string(),
                         value: v,
+                        latent: v,
                         mode: ObserveMode::Ipred,
                     }]
                 })
                 .unwrap_or_default(),
             outcome,
             interval: None,
+        }
+    }
+
+    /// A `Dv` decision whose controller saw `value` while the latent readout was `latent`.
+    fn dv_decision(time: f64, value: f64, latent: f64) -> DecisionLogEntry {
+        DecisionLogEntry {
+            observed_signals: vec![ObservedSignal {
+                name: "signal".to_string(),
+                value,
+                latent,
+                mode: ObserveMode::Dv,
+            }],
+            ..decision(time, None, DecisionOutcome::Dosed { n: 1 })
+        }
+    }
+
+    #[test]
+    fn metrics_are_scored_on_latent_not_on_the_noised_value_946() {
+        // The noised values (8, 30, 15) and the latent ones (12, 18, 25) give different
+        // answers on every metric, so scoring on `value` again reddens each line.
+        let ledger = vec![ledger_entry(100.0)];
+        let decisions = vec![
+            dv_decision(0.0, 8.0, 12.0),
+            dv_decision(24.0, 30.0, 18.0),
+            dv_decision(48.0, 15.0, 25.0),
+        ];
+        let m =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
+        assert_eq!(m.signal_min, Some(12.0), "latent min, not the noised 8");
+        assert_eq!(m.signal_max, Some(25.0), "latent max, not the noised 30");
+        assert_eq!(m.signal_mean, Some(55.0 / 3.0), "latent mean, not the noised 53/3");
+        // Latent 12 and 18 are in [10, 20]; the noised values would put only 15 there.
+        assert_eq!(m.pct_readings_in_window, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn metrics_signal_summary_and_window_propagate_nan_946() {
+        // Unreachable through the engine (#1578 refuses a non-finite readout), so the
+        // signal is hand-built. `f64::min`/`f64::max` would drop the NaN and report the
+        // finite readings' 5 and 9 as if nothing happened; the window count would score
+        // it as a miss (2/3, since the band [5, 9] holds every finite reading).
+        let ledger = vec![ledger_entry(100.0)];
+        for nan_at in 0..3 {
+            let mut latents = [5.0, 7.0, 9.0];
+            latents[nan_at] = f64::NAN;
+            let decisions: Vec<_> = latents
+                .iter()
+                .enumerate()
+                .map(|(k, &l)| dv_decision(24.0 * k as f64, 1.0, l))
+                .collect();
+            let m = compute_subject_metrics(
+                "S",
+                1,
+                1,
+                &ledger,
+                &decisions,
+                Some((5.0, 9.0)),
+                None,
+                &[],
+            );
+            assert!(
+                m.pct_readings_in_window.is_some_and(f64::is_nan),
+                "NaN at {nan_at}: window {m:?}"
+            );
+            assert!(m.signal_min.is_some_and(f64::is_nan), "NaN at {nan_at}: min {m:?}");
+            assert!(m.signal_max.is_some_and(f64::is_nan), "NaN at {nan_at}: max {m:?}");
+            assert!(m.signal_mean.is_some_and(f64::is_nan), "NaN at {nan_at}: mean");
         }
     }
 
@@ -2586,12 +2842,12 @@ mod tests {
         assert_eq!(m.signal_min, Some(5.0));
         assert_eq!(m.signal_max, Some(45.0));
         assert_eq!(m.signal_mean, Some(19.0)); // (8+5+22+15+45)/5
-        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.pct_readings_in_window, None, "no target_window declared");
         assert_eq!(m.auc_target_attainment, None, "no auc_target declared");
     }
 
     #[test]
-    fn metrics_pct_time_in_window_counts_signals_in_band() {
+    fn metrics_pct_readings_in_window_counts_signals_in_band() {
         let ledger = vec![ledger_entry(100.0)];
         let decisions = vec![
             decision(0.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }),
@@ -2603,7 +2859,7 @@ mod tests {
         // Two-sided band [10, 20]: only 15 is in band ⇒ 1/5.
         let band =
             compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
-        assert_eq!(band.pct_time_in_window, Some(0.2));
+        assert_eq!(band.pct_readings_in_window, Some(0.2));
         // One-sided "at or above 10" ([10, +∞]): 22, 15, 45 ⇒ 3/5.
         let one_sided = compute_subject_metrics(
             "S",
@@ -2615,7 +2871,7 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(one_sided.pct_time_in_window, Some(0.6));
+        assert_eq!(one_sided.pct_readings_in_window, Some(0.6));
     }
 
     #[test]
@@ -2653,7 +2909,7 @@ mod tests {
         assert_eq!(m.signal_min, None);
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
-        assert_eq!(m.pct_time_in_window, None);
+        assert_eq!(m.pct_readings_in_window, None);
         // An `auc_target` was set, but the driver integrated no windows (no run), so
         // the exposure metric is `None` rather than a 0/0 NaN.
         assert_eq!(m.auc_target_attainment, None);
@@ -2661,7 +2917,7 @@ mod tests {
 
     #[test]
     fn metrics_signalless_decisions_are_excluded_not_counted_as_misses() {
-        // A mixed decision log: the signal summary and `pct_time_in_window` are over the
+        // A mixed decision log: the signal summary and `pct_readings_in_window` are over the
         // signal-bearing decisions only.
         let ledger = vec![ledger_entry(100.0), ledger_entry(100.0)];
         let decisions = vec![
@@ -2680,7 +2936,7 @@ mod tests {
         assert_eq!(m.signal_mean, Some(10.0));
         // Denominator = 2 signal-bearing decisions, of which one (12) is in band:
         // 1/2 = 0.5 — not 1/4 (raw decision count) and not 1/3.
-        assert_eq!(m.pct_time_in_window, Some(0.5));
+        assert_eq!(m.pct_readings_in_window, Some(0.5));
         // Holds are counted over all decisions, independent of whether a signal
         // was recorded, so the signal-less Hold still registers.
         assert_eq!(m.n_holds, 1);
@@ -2705,7 +2961,7 @@ mod tests {
             &window_aucs,
         );
         assert_eq!(m.auc_target_attainment, Some(0.5));
-        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.pct_readings_in_window, None, "no target_window declared");
 
         // One-sided "at or above 400" ([400, +∞]): 450, 520, 610 ⇒ 3/4.
         let one_sided = compute_subject_metrics(

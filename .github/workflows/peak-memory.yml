@@ -1,0 +1,82 @@
+name: Peak memory
+
+# Peak-memory probe (#3081). The #2939 compiled-plan regression took one evaluation of
+# a 9-state stiff PK/PD model from 86 MB to 3-4 GB, and a full fit to 11 GB; nothing
+# tracked peak memory, so it was found by hand. This job measures the SHIPPED `ferx`
+# binary (release profile, fat LTO, mimalloc) on the synthetic stand-in
+# tools/peak-memory/stiff_pkpd.ferx under GNU `/usr/bin/time -v`, for one evaluation
+# and for a short fit with the covariance step, and fails when a peak grows more than
+# peakmem.py's TOLERANCE over tools/peak-memory/baseline.json.
+#
+# Linux only: it is the reference platform (AGENTS.md, #1688), and the baseline records
+# the platform it was taken on — a run elsewhere is shown, not judged.
+#
+# Deliberately not on pull_request or push: a fat-LTO release build plus two stiff-ODE
+# runs per PR is the cost the nightly split exists to avoid. Dispatch it on a branch to
+# see a change's effect. See docs/development/peak-memory.qmd; tests/peak_memory_probe.rs
+# pins this file's shape.
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # daily 05:00 UTC, between golden-fits (04:30) and slow-tests (06:00)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peak-memory-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: nightly
+
+jobs:
+  peak-memory:
+    name: Peak memory (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: peak-memory
+
+      # The shipped binary: `--release` is the profile release.yml builds (fat LTO) and
+      # crates/ferx-cli installs mimalloc as the global allocator, so this measures what
+      # a user runs — not the `ci-test` build the other nightlies use.
+      - name: Build the shipped ferx
+        run: cargo build --release -p ferx-cli
+
+      - name: Measure
+        # GNU time, for `-v`'s "Maximum resident set size". The runner image ships it;
+        # install it if an image ever does not, rather than reading a shell builtin.
+        run: |
+          [ -x /usr/bin/time ] || { sudo apt-get update && sudo apt-get install -y time; }
+          mkdir -p peak-memory
+          python3 -I tools/peak-memory/peakmem.py run \
+            --ferx target/release/ferx \
+            --label "${GITHUB_REF_NAME}@${GITHUB_SHA::8}" --out peak-memory/results.json
+
+      - name: Report
+        run: |
+          python3 -I tools/peak-memory/peakmem.py report \
+            --results peak-memory/results.json --summary "$GITHUB_STEP_SUMMARY"
+
+      # The input of `peakmem.py accept` when the baseline has to move: download this
+      # artifact, accept it with a reason, commit baseline.json.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: peak-memory-results
+          path: peak-memory/
+          retention-days: 90
+          if-no-files-found: warn

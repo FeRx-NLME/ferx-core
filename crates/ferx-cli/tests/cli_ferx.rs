@@ -1345,3 +1345,106 @@ fn a_fit_with_output_opens_the_model_file_once() {
     let n = opens.load(Ordering::SeqCst);
     assert_eq!(n, 1, "the CLI opened the model file {n} times");
 }
+
+// ── ferx summary --json (#3074) ───────────────────────────────────────────────
+
+/// Write `<name>.fitrx` into `dir` from a fast simulated fit (analytical PK, five
+/// subjects — the `simulate_writes_outputs` model) and return its path.
+fn simulated_bundle(dir: &std::path::Path, name: &str) -> PathBuf {
+    let model_src = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[simulation]
+  n_subjects = 5
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0]
+  seed       = 1
+";
+    let model = dir.join(format!("{name}.ferx"));
+    std::fs::write(&model, model_src).expect("write model");
+    let bundle = dir.join(format!("{name}.fitrx"));
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(dir)
+        .arg(&model)
+        .arg("--simulate")
+        .arg("--output")
+        .arg(&bundle)
+        .output()
+        .expect("run ferx --simulate");
+    assert!(out.status.success(), "simulate: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(bundle.exists());
+    bundle
+}
+
+fn summary_json_doc(args: &[&std::ffi::OsStr]) -> (Option<i32>, serde_json::Value) {
+    let out = ferx().arg("summary").arg("--json").args(args).output().expect("run ferx summary");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let doc = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}):\n{stdout}"));
+    (out.status.code(), doc)
+}
+
+#[test]
+fn summary_json_one_bundle_is_one_document_on_stdout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let b = simulated_bundle(tmp.path(), "run1");
+    let (code, doc) = summary_json_doc(&[b.as_os_str()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(doc["schema_version"], 1);
+    let run = &doc["runs"][0];
+    assert_eq!(run["label"], "run1");
+    assert!(run["ofv"].is_number(), "{run}");
+    assert!(run["converged"].is_boolean());
+    assert!(run["status"].is_object() || run["status"].is_string(), "{}", run["status"]);
+    assert!(run["estimates"]["theta"]["TVCL"]["estimate"].is_number(), "{}", run["estimates"]);
+    assert!(run["estimates"]["omega"]["ETA_CL"].is_object());
+    assert!(run["estimates"]["sigma"]["PROP_ERR"].is_object());
+    assert!(run["warnings_structured"].is_array());
+    assert!(run.get("delta_ofv").is_none(), "one bundle is not a comparison");
+}
+
+#[test]
+fn summary_json_several_bundles_and_a_failed_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = simulated_bundle(tmp.path(), "a");
+    let b = simulated_bundle(tmp.path(), "b");
+    let (code, doc) = summary_json_doc(&[a.as_os_str(), b.as_os_str()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(doc["reference_run"], 0);
+    let runs = doc["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["delta_ofv"].as_f64(), Some(0.0));
+    let want = runs[1]["ofv"].as_f64().unwrap() - runs[0]["ofv"].as_f64().unwrap();
+    assert_eq!(runs[1]["delta_ofv"].as_f64(), Some(want));
+
+    // A missing bundle: exit 1, but still a JSON document, with an error entry
+    // for that bundle and the loaded one reported in full.
+    let missing = tmp.path().join("missing.fitrx");
+    let (code, doc) = summary_json_doc(&[a.as_os_str(), missing.as_os_str()]);
+    assert_eq!(code, Some(1));
+    let runs = doc["runs"].as_array().unwrap();
+    assert!(runs[0]["ofv"].is_number());
+    assert_eq!(runs[1]["label"], "missing");
+    let err = runs[1]["error"].as_str().expect("error entry");
+    assert!(err.contains("missing.fitrx"), "{err}");
+}
+
+#[test]
+fn summary_json_with_help_prints_usage() {
+    let out = ferx().args(["summary", "--json", "--help"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Usage: ferx summary") && stdout.contains("--json"), "{stdout}");
+}

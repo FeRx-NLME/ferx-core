@@ -27,8 +27,8 @@
 
 use std::collections::HashSet;
 
-use crate::api::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
 use crate::diagnostics::{Diagnostic, EngineError};
+use crate::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::parser::model_parser::parse_full_model_with;
 use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
@@ -45,7 +45,7 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// declares, so a `parsed` already bound to other data is re-centred on
 /// `population` exactly as a fresh parse would be. Level bindings `parsed` was
 /// bound with are kept only when they are `population`'s: every subject carries
-/// each block's index column, which [`bind_theta_levels`](crate::api::bind_theta_levels)
+/// each block's index column, which [`bind_theta_levels`](crate::levels::bind_theta_levels)
 /// writes, and `population` shows exactly the bound levels, so the column was
 /// written for this layout. Otherwise they are dropped, and the blocks are left for
 /// `bind_theta_levels` to bind on `population`.
@@ -59,8 +59,8 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// contrast on `population`.
 ///
 /// Also a no-op on a model laid out on a fit's bindings
-/// ([`bind_from_fit`](crate::api::bind_from_fit),
-/// [`layout_from_fit`](crate::api::layout_from_fit)): its centres are the fit's,
+/// ([`bind_from_fit`](crate::levels::bind_from_fit),
+/// [`layout_from_fit`](crate::levels::layout_from_fit)): its centres are the fit's,
 /// which the fitted θ was estimated against, and are never re-taken from the data
 /// at hand. A model the deprecated `bind_theta_levels_from_fit` laid out without
 /// the fit's statistics has no fit centre to keep, and is refused.
@@ -431,5 +431,5 @@ fn distinct(sorted: &[f64]) -> Vec<f64> {
 }
 
 #[cfg(test)]
-#[path = "tests/covariate_stats_tests.rs"]
+#[path = "api/tests/covariate_stats_tests.rs"]
 mod tests;

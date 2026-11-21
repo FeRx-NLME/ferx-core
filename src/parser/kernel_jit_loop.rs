@@ -99,6 +99,19 @@ impl LoopSpec {
     }
 }
 
+#[cfg(test)]
+impl LoopSpec {
+    /// Each method's step body (`[u, carried, t, dt] → carried`), for the lane-loop prototype's
+    /// measurements (#3080).
+    pub(super) fn step_programs(&self) -> Vec<(OdeMethod, Arc<ChunkProgram>)> {
+        self.methods.iter().map(|m| (m.method, m.step.prog.clone())).collect()
+    }
+    /// The right-hand side body, `[u, t] → f(u, t)`.
+    pub(super) fn rhs_program(&self) -> Arc<ChunkProgram> {
+        self.rhs.prog.clone()
+    }
+}
+
 /// The methods the driver may ask for under `opts`.
 fn methods_for(opts: &OdeSolverOptions) -> Vec<OdeMethod> {
     let mut m = vec![OdeMethod::EXPLICIT_FALLBACK];
@@ -956,6 +969,29 @@ impl Log {
     pub(crate) fn full_bytes(&self) -> usize {
         self.entries.len() * std::mem::size_of::<Entry>() + self.full.len() * 8
     }
+}
+
+/// Free this thread's pooled slot buffers, run logs and reverse offset tables
+/// (`kernel_jit::release_thread_caches`, #3077): each keeps the largest run it ever served. A pool borrowed right now is left.
+pub(super) fn release_thread_buffers() {
+    let _ = BUFS.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+    let _ = LOGS.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+    let _ = IDX.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+}
+
+/// How many slot buffers, run logs and reverse offset tables this thread's pools hold (test
+/// seam).
+#[cfg(test)]
+pub(super) fn pooled_buffers() -> usize {
+    BUFS.with(|p| p.borrow().len())
+        + LOGS.with(|p| p.borrow().len())
+        + IDX.with(|p| p.borrow().len())
+}
+
+/// Pool one reverse offset table on this thread (test seam).
+#[cfg(test)]
+pub(super) fn pool_an_offset_table() {
+    give_idx(vec![0; 64]);
 }
 
 /// A loop call running over one layout's kernels.

@@ -6120,3 +6120,115 @@ fn an_iov_dose_only_subject_is_not_counted_as_finite_differences() {
     );
     assert_eq!(fd_fallback_warning(&model, &pop, theta), None);
 }
+
+/// IOV value/gradient fusion (#3088): the value [`analytic_eta_nll_value_gradient_iov_frozen`]
+/// scores off the recording's predictions is the native IOV objective
+/// (`individual_nll_iov_frozen_in`) bit for bit, under the conditional (FOCEI) and the frozen
+/// (FOCE) variance, and its gradient is the plain gradient bit for bit. The EBE search puts the
+/// value in its objective memo, where the line search compares it with native values, so any
+/// rounding gap would be read as a step's gain.
+#[test]
+fn iov_fused_value_is_the_native_objective_bit_for_bit() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let (m, p) = (&prep.parsed.model, &prep.init_params);
+    let omega_iov = p.omega_iov.as_ref().expect("IOV model");
+    let mut n_points = 0usize;
+    for s in prep.population.subjects.iter().take(6) {
+        let layout = crate::stats::stacked_layout::StackedLayout::sens_of(m, s).unwrap();
+        let k = crate::stats::stacked_layout::group_count(s);
+        let f0 = crate::stats::likelihood::population_variance_preds_iov(
+            m, s, &p.theta, m.n_eta, m.n_kappa, k,
+        )
+        .expect("population predictions");
+        let mult = m.ruv_obs_mult(s, &p.theta);
+        for scale in [0.0, 0.3, -0.5] {
+            let b: Vec<f64> =
+                (0..layout.n_stacked()).map(|c| scale * (1.0 + 0.1 * c as f64)).collect();
+            assert!(iov_eval_route(m, s, &p.theta, &b).1, "closed form: the value is native");
+            for frozen in [None, Some(f0.as_slice())] {
+                let mut v = None;
+                let g = analytic_eta_nll_value_gradient_iov_frozen(
+                    m,
+                    s,
+                    &layout,
+                    &p.theta,
+                    &b,
+                    &p.omega,
+                    omega_iov,
+                    &p.sigma.values,
+                    mult.as_deref(),
+                    frozen,
+                    &mut Vec::new(),
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let g0 = analytic_eta_nll_gradient_iov_frozen(
+                    m,
+                    s,
+                    &layout,
+                    &p.theta,
+                    &b,
+                    &p.omega,
+                    omega_iov,
+                    &p.sigma.values,
+                    mult.as_deref(),
+                    frozen,
+                    &mut Vec::new(),
+                )
+                .expect("in scope");
+                assert_eq!(
+                    g.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    g0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "the fused pass must return the plain gradient bit for bit"
+                );
+                let kappas: Vec<Vec<f64>> =
+                    b[m.n_eta..].chunks(m.n_kappa).map(<[f64]>::to_vec).collect();
+                let want = individual_nll_iov_frozen_in(
+                    m,
+                    s,
+                    &layout,
+                    &p.theta,
+                    &b[..m.n_eta],
+                    &kappas,
+                    &p.omega,
+                    Some(omega_iov),
+                    &p.sigma.values,
+                    m.residual_cov_at(p),
+                    &mut crate::pk::EventPkParams::default(),
+                    None,
+                    frozen,
+                );
+                let v = v.expect("a plain Gaussian IOV subject is scored");
+                assert_eq!(
+                    v.to_bits(),
+                    want.to_bits(),
+                    "subject {} at {scale} (frozen: {}): fused {v} vs native {want}",
+                    s.id,
+                    frozen.is_some()
+                );
+                n_points += 1;
+            }
+        }
+    }
+    assert_eq!(n_points, 36);
+}
+
+/// The IOV EBE search takes the fused value (#3088): on a closed-form IOV model, under both
+/// variance conventions, gradient passes land their value in the objective memo, and every
+/// subject still converges.
+#[test]
+fn iov_ebe_search_memoises_the_fused_value() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let p = &prep.init_params;
+    for variance in [EbeVariance::Conditional, EbeVariance::Population] {
+        IOV_MEMO_FUSED_PUTS.with(|c| c.set(0));
+        for s in prep.population.subjects.iter().take(4) {
+            let r = find_ebe_iov(&prep.parsed.model, s, p, 200, 1e-6, None, None, variance, false);
+            assert!(r.converged, "subject {} ({variance:?})", s.id);
+        }
+        let puts = IOV_MEMO_FUSED_PUTS.with(|c| c.get());
+        assert!(puts > 0, "{variance:?}: no fused value reached the memo");
+    }
+}

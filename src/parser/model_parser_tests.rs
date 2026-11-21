@@ -23342,7 +23342,7 @@ mod theta_vector_blocks {
 // ── #1064: the level-block primitives, branch by branch ────────────────────
 //
 // The declaration surface and the end-to-end binding are covered by
-// `theta_vector_blocks` above and `api::levels`. What is left here are the
+// `theta_vector_blocks` above and `levels`. What is left here are the
 // error and edge branches of the primitives themselves — reachable directly,
 // and several of them not reachable at all through a well-formed model file.
 mod theta_level_primitives {
