@@ -99,9 +99,7 @@ ID,TIME,DV,EVID,AMT,CMT,MDV,OCC
 /// every one of them.
 fn pads(n: usize, fix: bool) -> (String, String) {
     let fix = if fix { " FIX" } else { "" };
-    let thetas = (0..n)
-        .map(|i| format!("  theta PAD{i}(0.5, 0.01, 10.0){fix}\n"))
-        .collect();
+    let thetas = (0..n).map(|i| format!("  theta PAD{i}(0.5, 0.01, 10.0){fix}\n")).collect();
     let terms: String = (0..n).map(|i| format!(" + 0.0 * PAD{i}")).collect();
     (thetas, format!(" * (1.0{terms})"))
 }
@@ -205,14 +203,8 @@ fn assert_straddle(engine: &str, model: fn(usize, bool) -> String, n_at_cap: usi
             "{engine}, {label}: a pad is not in the program: {:?}",
             r.warnings
         );
-        assert_eq!(
-            r.gradient_method_inner, "analytic",
-            "{engine}, {label}: inner route"
-        );
-        assert_eq!(
-            r.gradient_method_outer, "analytic",
-            "{engine}, {label}: outer route"
-        );
+        assert_eq!(r.gradient_method_inner, "analytic", "{engine}, {label}: inner route");
+        assert_eq!(r.gradient_method_outer, "analytic", "{engine}, {label}: outer route");
         assert_eq!(
             r.optimizer, "auto (nlopt_lbfgs)",
             "{engine}, {label}: `auto` takes L-BFGS on an analytic outer gradient"
@@ -255,11 +247,7 @@ fn assert_straddle(engine: &str, model: fn(usize, bool) -> String, n_at_cap: usi
                 "{engine}, {label}, subject {}: per-subject OFV vs 24 axes",
                 a.id
             );
-            assert_eq!(
-                a.eta, b.eta,
-                "{engine}, {label}, subject {}: η̂ vs 24 axes",
-                a.id
-            );
+            assert_eq!(a.eta, b.eta, "{engine}, {label}, subject {}: η̂ vs 24 axes", a.id);
         }
         assert_eq!(at_cap.ofv, r.ofv, "{engine}, {label}: OFV vs 24 axes");
     }

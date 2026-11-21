@@ -41,19 +41,14 @@ use std::path::Path;
 fn nonmem_ipred(name: &str) -> Vec<(String, f64, f64)> {
     let path = format!("nonmem_anchor/results/{name}.tab");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
     let header: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let col = |c: &str| header.iter().position(|h| *h == c).expect(c);
     let (id, time, evid, ipred) = (col("ID"), col("TIME"), col("EVID"), col("IPRED"));
     lines
         .map(|l| {
             l.split_whitespace()
-                .map(|v| {
-                    v.parse::<f64>()
-                        .unwrap_or_else(|e| panic!("{path}: {v}: {e}"))
-                })
+                .map(|v| v.parse::<f64>().unwrap_or_else(|e| panic!("{path}: {v}: {e}")))
                 .collect::<Vec<f64>>()
         })
         .filter(|r| r[evid] == 0.0)
@@ -87,20 +82,10 @@ fn data(name: &str) -> Population {
 /// worst absolute error. Every compared value is checked finite first (`f64::max` would
 /// drop a NaN) and against `bound` individually, so the message names the row.
 fn assert_matches(
-    leg: &str,
-    got: &[(String, f64, f64)],
-    nm: &[(String, f64, f64)],
-    skip: &[&str],
-    bound: f64,
+    leg: &str, got: &[(String, f64, f64)], nm: &[(String, f64, f64)], skip: &[&str], bound: f64,
 ) -> f64 {
-    let nm: Vec<_> = nm
-        .iter()
-        .filter(|r| !skip.contains(&r.0.as_str()))
-        .collect();
-    let got: Vec<_> = got
-        .iter()
-        .filter(|r| !skip.contains(&r.0.as_str()))
-        .collect();
+    let nm: Vec<_> = nm.iter().filter(|r| !skip.contains(&r.0.as_str())).collect();
+    let got: Vec<_> = got.iter().filter(|r| !skip.contains(&r.0.as_str())).collect();
     assert_eq!(got.len(), nm.len(), "{leg}: observation count");
     let mut worst = 0.0_f64;
     for ((id, t, v), (nid, nt, want)) in got.iter().zip(&nm) {
@@ -116,10 +101,7 @@ fn assert_matches(
         );
         worst = worst.max(err);
     }
-    println!(
-        "{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations",
-        nm.len()
-    );
+    println!("{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations", nm.len());
     worst
 }
 
@@ -163,15 +145,8 @@ fn via_dual(m: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
 /// this leg is judged against NONMEM, not against the replay.
 fn via_adaptive(m: &CompiledModel, pop: &Population, skip: &[&str]) -> Vec<(String, f64, f64)> {
     let mut out = Vec::new();
-    for s in pop
-        .subjects
-        .iter()
-        .filter(|s| !skip.contains(&s.id.as_str()))
-    {
-        let one = Population {
-            subjects: vec![s.clone()],
-            ..pop.clone()
-        };
+    for s in pop.subjects.iter().filter(|s| !skip.contains(&s.id.as_str())) {
+        let one = Population { subjects: vec![s.clone()], ..pop.clone() };
         let mut opts = AdaptiveSimulateOptions::default();
         opts.seed = Some(1);
         opts.decision_times = vec![2.5];
@@ -185,16 +160,8 @@ fn via_adaptive(m: &CompiledModel, pop: &Population, skip: &[&str]) -> Vec<(Stri
             &opts,
         )
         .unwrap_or_else(|e| panic!("ID {}: adaptive run refused: {e}", s.id));
-        assert!(
-            res.ledger.is_empty(),
-            "ID {}: the no-op controller dosed",
-            s.id
-        );
-        out.extend(
-            res.trajectories
-                .into_iter()
-                .map(|r| (r.id, r.time, r.ipred)),
-        );
+        assert!(res.ledger.is_empty(), "ID {}: the no-op controller dosed", s.id);
+        out.extend(res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)));
     }
     out
 }
@@ -280,19 +247,14 @@ fn fit_objective_at_an_evid2_obs_tie_matches_nonmem() {
         let want = nonmem_objv(arm);
         assert!(r.ofv.is_finite(), "{arm}: OFV {}", r.ofv);
         let err = (r.ofv - want).abs();
-        println!(
-            "{arm}: ferx OFV {:.8}, NONMEM {want:.8}, |Δ| {err:.3e}",
-            r.ofv
-        );
+        println!("{arm}: ferx OFV {:.8}, NONMEM {want:.8}, |Δ| {err:.3e}", r.ofv);
         assert!(
             err < OFV_BOUND,
             "{arm}: ferx OFV {} vs NONMEM #OBJV {want} (|Δ| {err:.3e})",
             r.ofv
         );
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("finite-difference inner gradients")),
+            !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
             "{arm}: a subject routed to FD, so the dual seed was not exercised: {:?}",
             r.warnings
         );
@@ -352,8 +314,7 @@ const STATES_SKIP: &[&str] = &[];
 fn state_pass_seeds_init_from_the_first_record_and_each_reset_matches_nonmem() {
     let m = model("init_seed_tie_fit").0;
     let mut pop = data("init_seed_tie");
-    pop.subjects
-        .retain(|s| !STATES_SKIP.contains(&s.id.as_str()));
+    pop.subjects.retain(|s| !STATES_SKIP.contains(&s.id.as_str()));
     assert_matches(
         "states, init_seed_tie",
         &via_states(&m, &pop),

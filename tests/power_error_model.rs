@@ -69,14 +69,8 @@ fn evaluate(m: &ferx_core::types::CompiledModel, method: EstimationMethod) -> fe
 #[test]
 fn a_unit_exponent_is_the_proportional_model_bit_for_bit_and_another_is_not() {
     let prop = model("DV ~ proportional(PROP_ERR)", "");
-    let unit = model(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "  theta RUV_POW(1.0, 0.01, 10.0) FIX",
-    );
-    let other = model(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "  theta RUV_POW(1.3, 0.01, 10.0) FIX",
-    );
+    let unit = model("DV ~ power(PROP_ERR, RUV_POW)", "  theta RUV_POW(1.0, 0.01, 10.0) FIX");
+    let other = model("DV ~ power(PROP_ERR, RUV_POW)", "  theta RUV_POW(1.3, 0.01, 10.0) FIX");
     // The exponent rides the residual-magnitude channel, whose variance is
     // built as `((f·f)·σ)·σ` where the bare proportional path builds
     // `(f·σ)·(f·σ)` — a documented ~1-ULP reassociation (`residual_error.rs`).
@@ -102,10 +96,7 @@ fn a_unit_exponent_is_the_proportional_model_bit_for_bit_and_another_is_not() {
             a.ofv,
             b.ofv
         );
-        assert_ne!(
-            a.ofv, c.ofv,
-            "{method:?}: P = 1.3 must be a different model"
-        );
+        assert_ne!(a.ofv, c.ofv, "{method:?}: P = 1.3 must be a different model");
         for (ss, sb) in s.subjects.iter().zip(&b.subjects) {
             assert_eq!(ss.iwres, sb.iwres);
             assert_eq!(ss.cwres, sb.cwres);
@@ -118,30 +109,20 @@ fn a_unit_exponent_is_the_proportional_model_bit_for_bit_and_another_is_not() {
             .zip(&c.subjects)
             .any(|(sa, sc)| sa.iwres.iter().zip(&sc.iwres).any(|(x, y)| x != y));
         assert!(some_differ, "{method:?}: IWRES did not see the exponent");
-        assert!(c
-            .subjects
-            .iter()
-            .all(|s| s.iwres.iter().chain(&s.cwres).all(|v| v.is_finite())));
+        assert!(c.subjects.iter().all(|s| s.iwres.iter().chain(&s.cwres).all(|v| v.is_finite())));
     }
 }
 
 #[test]
 fn a_free_exponent_is_estimated_by_every_estimator() {
-    let m = model(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "  theta RUV_POW(1.0, 0.01, 10.0)",
-    );
+    let m = model("DV ~ power(PROP_ERR, RUV_POW)", "  theta RUV_POW(1.0, 0.01, 10.0)");
     assert!(m.has_ruv_exponent());
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
     // FOCEI and FOCE take the analytic exponent-aware gradients; SAEM
     // differences the magnitude-aware data term (the Gauss-Newton and IMP
     // paths are covered at the unit level and in the slow tier — their
     // finite-difference fallbacks are minutes in a debug build).
-    for method in [
-        EstimationMethod::FoceI,
-        EstimationMethod::Foce,
-        EstimationMethod::Saem,
-    ] {
+    for method in [EstimationMethod::FoceI, EstimationMethod::Foce, EstimationMethod::Saem] {
         // Tier-2: a handful of outer iterations, and the Monte-Carlo
         // estimators on a few dozen samples — enough to exercise their
         // exponent-aware paths, never a convergence run.
@@ -171,10 +152,7 @@ fn a_free_exponent_is_estimated_by_every_estimator() {
 fn simulate_draws_with_the_power_variance() {
     // σ = 0.1, P = 2: at f ≈ 10 the residual SD is 0.1·100 = 10, an order of
     // magnitude above the proportional 1.0 — the two draws cannot be confused.
-    let power = model(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "  theta RUV_POW(2.0, 0.01, 10.0) FIX",
-    );
+    let power = model("DV ~ power(PROP_ERR, RUV_POW)", "  theta RUV_POW(2.0, 0.01, 10.0) FIX");
     let prop = model("DV ~ proportional(PROP_ERR)", "");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
     let spread = |m: &ferx_core::types::CompiledModel| -> f64 {
@@ -192,18 +170,12 @@ fn simulate_draws_with_the_power_variance() {
     };
     let cv_power = spread(&power);
     let cv_prop = spread(&prop);
-    assert!(
-        cv_power > 3.0 * cv_prop,
-        "power CV {cv_power} should dwarf proportional CV {cv_prop}"
-    );
+    assert!(cv_power > 3.0 * cv_prop, "power CV {cv_power} should dwarf proportional CV {cv_prop}");
 }
 
 #[test]
 fn a_non_positive_exponent_is_refused_before_fitting() {
-    let m = model(
-        "DV ~ power(PROP_ERR, RUV_POW)",
-        "  theta RUV_POW(0.0, -1.0, 10.0)",
-    );
+    let m = model("DV ~ power(PROP_ERR, RUV_POW)", "  theta RUV_POW(0.0, -1.0, 10.0)");
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("data");
     let err = fit(&m, &pop, &m.default_params, &FitOptions::default())
         .err()

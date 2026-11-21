@@ -102,11 +102,8 @@ fn linear_pkpd_parses_to_per_cmt_error_spec() {
 fn per_cmt_predictions_finite_for_cotemporal_obs() {
     let model = parse_model_string(LINEAR_PKPD).expect("model parses");
     let pop = pkpd_pop(); // obs on CMT 1 and 2 share each timepoint
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().iter().map(|p| p.pred).collect();
     assert!(
         preds.iter().all(|v| v.is_finite()),
         "co-temporal multi-CMT predictions must all be finite, got {preds:?}"
@@ -118,10 +115,7 @@ fn per_cmt_predictions_finite_for_cotemporal_obs() {
 /// SAEM fit is too heavy for the per-PR job. The per-CMT M-step gradient is
 /// unit-tested against finite differences in `estimation::saem`.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn per_cmt_saem_fit_runs() {
     let model = parse_model_string(LINEAR_PKPD).expect("model parses");
     let pop = pkpd_pop();
@@ -135,11 +129,7 @@ fn per_cmt_saem_fit_runs() {
 
     let result =
         fit(&model, &pop, &model.default_params, &opts).expect("per-CMT SAEM fit must run");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert_eq!(result.sigma.len(), 2);
     for (name, s) in result.sigma_names.iter().zip(result.sigma.iter()) {
         assert!(

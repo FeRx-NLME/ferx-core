@@ -82,10 +82,7 @@ fn nonmem(file: &str) -> Table {
 /// stream observes `CMT 2` (the central of `ADVAN2`); the kernel twin has the central only,
 /// as its `CMT 1`.
 fn preds(
-    model: &str,
-    ids: &[&str],
-    zero_order_bolus: bool,
-    observe_cmt1: bool,
+    model: &str, ids: &[&str], zero_order_bolus: bool, observe_cmt1: bool,
 ) -> Vec<(String, f64, f64)> {
     let parsed = ferx_core::parse_full_model_file(&anchor(model)).expect("model parses");
     let (mut population, _) = ferx_core::read_nonmem_csv_with_covariates(
@@ -97,11 +94,7 @@ fn preds(
     .expect("dataset loads");
     // Each twin models one stream: the other's subjects would read its columns as zeros.
     population.subjects.retain(|s| ids.contains(&s.id.as_str()));
-    assert_eq!(
-        population.subjects.len(),
-        ids.len(),
-        "{model}: a subject is missing"
-    );
+    assert_eq!(population.subjects.len(), ids.len(), "{model}: a subject is missing");
     for s in &mut population.subjects {
         if zero_order_bolus {
             for d in &mut s.doses {
@@ -125,18 +118,12 @@ fn preds(
 /// Worst relative error of `got` against `want` over the rows of `ids` that pass `keep`;
 /// panics on a missing or non-finite row, and on an empty comparison.
 fn worst(
-    label: &str,
-    got: &[(String, f64, f64)],
-    want: &Table,
-    ids: &[&str],
+    label: &str, got: &[(String, f64, f64)], want: &Table, ids: &[&str],
     keep: impl Fn(&str, f64) -> bool,
 ) -> f64 {
     let mut worst = 0.0_f64;
     let mut n = 0;
-    for (id, t, p) in got
-        .iter()
-        .filter(|(id, t, _)| ids.contains(&id.as_str()) && keep(id, *t))
-    {
+    for (id, t, p) in got.iter().filter(|(id, t, _)| ids.contains(&id.as_str()) && keep(id, *t)) {
         let w = want[&(id.clone(), t.to_bits())];
         let rel = (p - w).abs() / w.abs();
         assert!(rel.is_finite(), "{label} ID {id} t={t}: {p} vs {w}");
@@ -163,10 +150,9 @@ fn all(_: &str, _: f64) -> bool {
 #[test]
 fn zero_order_ss_lag_matches_the_reference_in_both_spellings() {
     let want = reference("ss_absorption_lag_ref_zo.csv");
-    for (model, bound) in [
-        ("ss_zero_order_lag_fit.ferx", 1e-11),
-        ("ss_zero_order_lag_alag_fit.ferx", 1e-11),
-    ] {
+    for (model, bound) in
+        [("ss_zero_order_lag_fit.ferx", 1e-11), ("ss_zero_order_lag_alag_fit.ferx", 1e-11)]
+    {
         let got = preds(model, ZO_ALL, true, false);
         let w = worst(model, &got, &want, ZO_ALL, all);
         assert!(w < bound, "{model}: {w:.3e}");
@@ -177,10 +163,7 @@ fn zero_order_ss_lag_matches_the_reference_in_both_spellings() {
 #[test]
 fn zero_order_ss_lag_matches_nonmem() {
     let want = nonmem("ss_zero_order_lag.tab");
-    for model in [
-        "ss_zero_order_lag_fit.ferx",
-        "ss_zero_order_lag_alag_fit.ferx",
-    ] {
+    for model in ["ss_zero_order_lag_fit.ferx", "ss_zero_order_lag_alag_fit.ferx"] {
         let got = preds(model, ZO_ALL, true, false);
         let w = worst(model, &got, &want, ZO_NONMEM, all);
         // Measured on Linux at ode_reltol = 1e-12: 6.0e-13 (both spellings), ~17x headroom.
@@ -207,10 +190,7 @@ fn zero_order_ss_lag_beyond_ii_is_the_documented_convention_split() {
     // PRED (34.66 at t = 0.5) is neither train's (wrapped 47.48, clamped 55.15).
     let got = preds("ss_zero_order_lag_fit.ferx", ZO_ALL, true, false);
     let split = worst("ferx vs NONMEM", &got, &nm, &["7"], |_, t| t >= 1.0);
-    assert!(
-        split > 0.05,
-        "ID 7 no longer differs from NONMEM: {split:.3e}"
-    );
+    assert!(split > 0.05, "ID 7 no longer differs from NONMEM: {split:.3e}");
 }
 
 /// The first-order kernel with a per-route lag (`first_order(ka, lag=)`), the bolus IDs.
@@ -241,13 +221,7 @@ fn first_order_depot_ss_lag_matches_the_reference() {
 fn first_order_ss_lag_matches_nonmem() {
     let want = nonmem("ss_first_order_lag.tab");
     let kernel = preds("ss_first_order_lag_fit.ferx", FO_BOLUS, false, true);
-    let w = worst(
-        "kernel vs NONMEM",
-        &kernel,
-        &want,
-        &["11", "12", "13", "14", "16"],
-        all,
-    );
+    let w = worst("kernel vs NONMEM", &kernel, &want, &["11", "12", "13", "14", "16"], all);
     // Measured 6.8e-11 (kernel) and 3.0e-13 (depot); NONMEM vs the reference 4e-16.
     assert!(w < 1e-9, "kernel vs NONMEM: {w:.3e}");
     let depot = preds("ss_first_order_lag_alag_fit.ferx", FO_ALL, false, false);
@@ -282,16 +256,11 @@ fn first_order_ss_lag_beyond_ii_is_the_documented_convention_split() {
         !nm_early.is_empty() && nm_early.iter().all(|p| *p < 0.0),
         "NONMEM's ID 15 PRED before t = LG - II is no longer negative: {nm_early:?}"
     );
-    for model in [
-        "ss_first_order_lag_fit.ferx",
-        "ss_first_order_lag_alag_fit.ferx",
-    ] {
+    for model in ["ss_first_order_lag_fit.ferx", "ss_first_order_lag_alag_fit.ferx"] {
         let kernel = !model.contains("alag");
         let got = preds(model, if kernel { FO_BOLUS } else { FO_ALL }, false, kernel);
         assert!(
-            got.iter()
-                .filter(|(id, t, _)| early(id, *t))
-                .all(|(_, _, p)| *p > 0.0),
+            got.iter().filter(|(id, t, _)| early(id, *t)).all(|(_, _, p)| *p > 0.0),
             "{model}: ferx's ID 15 PRED before t = LG - II must be a concentration"
         );
         // From t = 3 on the two trains differ (measured 0.34 at t = 7.9...), so the divergence

@@ -91,12 +91,8 @@ fn generate_npde_iov_anchor() {
     );
 
     // The ferx reference distribution on the committed data.
-    let pop = read_nonmem_csv(
-        Path::new("nonmem_anchor/npde_iov_anchor.csv"),
-        None,
-        Some("OCC"),
-    )
-    .expect("the anchor data loads");
+    let pop = read_nonmem_csv(Path::new("nonmem_anchor/npde_iov_anchor.csv"), None, Some("OCC"))
+        .expect("the anchor data loads");
     let out = ferx_core::stats::npde::compute_npde_npd(
         &model,
         &pop,

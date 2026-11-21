@@ -20,11 +20,7 @@ use std::collections::HashMap;
 /// compartments. `V` and the error model are spliced in per case; a `KAPPA_V` model
 /// declares the κ (and so is an IOV model) only when `V` reads it.
 fn model_src(readout: &str, v: &str, error: &str) -> String {
-    let kappa = if v.contains("KAPPA_V") {
-        "  kappa KAPPA_V ~ 0.04"
-    } else {
-        ""
-    };
+    let kappa = if v.contains("KAPPA_V") { "  kappa KAPPA_V ~ 0.04" } else { "" };
     format!(
         r#"
 [parameters]
@@ -70,38 +66,21 @@ fn population(cmts: [usize; 4], tv_wt: bool) -> Population {
     ];
     let n = OBS.len();
     let s = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         dose_occasions: vec![1u32; doses.len()],
         doses,
         obs_times: OBS.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: cmts.to_vec(),
         covariates: wt(70.0),
-        dose_covariates: Vec::new(),
         obs_covariates: if tv_wt {
             vec![wt(70.0), wt(90.0), wt(90.0), wt(90.0)]
         } else {
             Vec::new()
         },
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
-        obs_l2: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     Population {
         subjects: vec![s],
@@ -141,10 +120,7 @@ fn values(r: &AdaptiveSimulationResult) -> Vec<f64> {
 }
 
 fn signals(r: &AdaptiveSimulationResult) -> Vec<f64> {
-    r.decisions
-        .iter()
-        .map(|d| d.observed_signals[0].value)
-        .collect()
+    r.decisions.iter().map(|d| d.observed_signals[0].value).collect()
 }
 
 /// Worst relative error of `got` against `want`, refusing a non-finite entry rather than
@@ -183,20 +159,8 @@ fn holding_controller_matches_simulate_under_every_scaling_form() {
     let per_cmt_err = "  CMT=1: DV ~ proportional(S)\n  CMT=2: DV ~ proportional(S)";
     let cases: [(&str, &str, &str, [usize; 4], bool); 7] = [
         ("A: obs_scale = V", "  obs_scale = V", "TVV", [1; 4], true),
-        (
-            "A: obs_scale = 1000",
-            "  obs_scale = 1000",
-            "TVV",
-            [1; 4],
-            true,
-        ),
-        (
-            "A: obs_scale = TVV / 25",
-            "  obs_scale = TVV / 25",
-            "TVV",
-            [1; 4],
-            true,
-        ),
+        ("A: obs_scale = 1000", "  obs_scale = 1000", "TVV", [1; 4], true),
+        ("A: obs_scale = TVV / 25", "  obs_scale = TVV / 25", "TVV", [1; 4], true),
         (
             "A: obs_scale = V, V = TVV·exp(ETA_V)",
             "  obs_scale = V",
@@ -205,13 +169,7 @@ fn holding_controller_matches_simulate_under_every_scaling_form() {
             true,
         ),
         ("B: obs_scale[CMT=n]", per_cmt_b, "TVV", [1, 2, 1, 2], true),
-        (
-            "C: y = central / V",
-            "  y = central / V",
-            "TVV",
-            [1; 4],
-            false,
-        ),
+        ("C: y = central / V", "  y = central / V", "TVV", [1; 4], false),
         ("C: y[CMT=n]", per_cmt_c, "TVV", [1, 2, 1, 2], false),
     ];
     for tv_wt in [false, true] {
@@ -233,11 +191,7 @@ fn holding_controller_matches_simulate_under_every_scaling_form() {
             if divides {
                 // The bare readout of the same run: the identical model with no divisor.
                 let bare = model("  y = central", v, PROP);
-                let raw = ipreds(&run_hold(
-                    &bare,
-                    &population([1; 4], tv_wt),
-                    ObserveMode::Ipred,
-                ));
+                let raw = ipreds(&run_hold(&bare, &population([1; 4], tv_wt), ObserveMode::Ipred));
                 for (j, (s, r)) in ipreds(&adaptive).iter().zip(&raw).enumerate() {
                     assert!(
                         (s - r).abs() > 0.01 * r.abs(),
@@ -296,10 +250,7 @@ fn monitor_signal_reads_the_scaled_readout() {
 fn observe_expression_is_not_divided_by_obs_scale() {
     let m = model("  obs_scale = V", "TVV", PROP);
     let spec = from_spec_hold(Some("central / V"), false);
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(7), ..Default::default() };
     let pop = population([1; 4], false);
     let r = simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &opts)
         .expect("observe run");
@@ -354,10 +305,7 @@ fn from_spec_hold(observe: Option<&str>, with_assay_error: bool) -> AdaptiveDosi
 #[test]
 fn assay_signal_and_auc_target_use_the_scaled_readout() {
     let pop = population([1; 4], false);
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(7), ..Default::default() };
     let mut spec = from_spec_hold(None, true);
     spec.auc_target = Some((1.0, 10.0));
     let run = |readout: &str| {
@@ -365,19 +313,11 @@ fn assay_signal_and_auc_target_use_the_scaled_readout() {
         simulate_adaptive_from_spec(&m, &pop, &m.default_params, 1, &spec, &opts)
             .expect("assay run")
     };
-    let (a, c, bare) = (
-        run("  obs_scale = V"),
-        run("  y = central / V"),
-        run("  y = central"),
-    );
+    let (a, c, bare) = (run("  obs_scale = V"), run("  y = central / V"), run("  y = central"));
     let w = worst_rel(&signals(&a), &signals(&c), "with_assay_error");
     assert!(w <= TOL, "Form A assay signal vs Form C twin {w:e}");
     let attain = |r: &AdaptiveSimulationResult| r.metrics[0].auc_target_attainment;
-    assert_eq!(
-        attain(&c),
-        Some(1.0),
-        "the band holds the concentration AUC"
-    );
+    assert_eq!(attain(&c), Some(1.0), "the band holds the concentration AUC");
     assert_eq!(attain(&bare), Some(0.0), "the band excludes the amount AUC");
     assert_eq!(attain(&a), attain(&c), "Form A AUC is on the Form C scale");
 }
@@ -400,10 +340,7 @@ fn iov_divisor_follows_the_decision_window() {
         let w = worst_rel(&ipreds(&a), &ipreds(&c), mlabel);
         assert!(w <= TOL, "{mlabel}: IOV Form A rows vs Form C twin {w:e}");
         let w = worst_rel(&signals(&a), &signals(&c), mlabel);
-        assert!(
-            w <= TOL,
-            "{mlabel}: IOV Form A signals vs Form C twin {w:e}"
-        );
+        assert!(w <= TOL, "{mlabel}: IOV Form A signals vs Form C twin {w:e}");
 
         let bare = ipreds(&run_hold(&model("  y = central", v, PROP), &pop, mode));
         let implied_v: Vec<f64> = bare.iter().zip(ipreds(&a)).map(|(r, s)| r / s).collect();
@@ -438,10 +375,7 @@ fn log_transformed_error_model_is_refused() {
     let err = simulate_adaptive(&m, &pop, &m.default_params, 1, hold, &opts)
         .expect_err("LTBS is refused");
     assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
-    assert!(
-        err.to_string().contains("log-transformed error model"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("log-transformed error model"), "{err}");
     let err = simulate_adaptive_from_spec(
         &m,
         &pop,

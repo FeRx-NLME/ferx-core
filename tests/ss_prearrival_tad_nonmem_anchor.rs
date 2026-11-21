@@ -81,9 +81,7 @@ fn anchor(name: &str) -> std::path::PathBuf {
 
 fn model(file: &str) -> CompiledModel {
     let src = std::fs::read_to_string(anchor(file)).expect("the ferx twin is committed");
-    parse_full_model(&src)
-        .expect("the anchor model must parse")
-        .model
+    parse_full_model(&src).expect("the anchor model must parse").model
 }
 
 /// Parsed once per process and shared. Every test in this file reads two or three datasets
@@ -112,12 +110,8 @@ fn nonmem_ipred(stream: &str) -> Vec<(f64, f64)> {
         .expect("the NONMEM table is committed");
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. banner");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header")
-        .split(',')
-        .map(str::trim)
-        .collect();
+    let header: Vec<&str> =
+        lines.next().expect("column header").split(',').map(str::trim).collect();
     let col = |name: &str| {
         header
             .iter()
@@ -179,12 +173,7 @@ fn ferx_dense_states(m: &CompiledModel, pop: &Population) -> Vec<(f64, f64)> {
             "ferx_dense_states reads u[0] as the observed compartment; this twin is no \
              longer single-state"
         );
-        out.extend(
-            s.obs_times
-                .iter()
-                .copied()
-                .zip(states.iter().map(|u| u[0] / v)),
-        );
+        out.extend(s.obs_times.iter().copied().zip(states.iter().map(|u| u[0] / v)));
     }
     out
 }
@@ -196,28 +185,19 @@ fn ferx_dense_states(m: &CompiledModel, pop: &Population) -> Vec<(f64, f64)> {
 /// range" and the bound passes on the strength of the rows that worked. The entire defect this
 /// file anchors is that these predictions used to be `NaN`, so that guard is not decoration.
 fn worst_rel(
-    got: &[(f64, f64)],
-    want: &[(f64, f64)],
-    what: &str,
-    keep: impl Fn(f64) -> bool,
+    got: &[(f64, f64)], want: &[(f64, f64)], what: &str, keep: impl Fn(f64) -> bool,
 ) -> f64 {
     assert_eq!(got.len(), want.len(), "{what}: row count");
     let mut worst = 0.0_f64;
     let mut n = 0usize;
     for (&(tg, g), &(tw, w)) in got.iter().zip(want) {
-        assert!(
-            (tg - tw).abs() < 1e-9,
-            "{what}: time misalignment {tg} vs {tw}"
-        );
+        assert!((tg - tw).abs() < 1e-9, "{what}: time misalignment {tg} vs {tw}");
         if !keep(tg) {
             continue;
         }
         n += 1;
         assert!(g.is_finite(), "{what}: ferx returned {g} at t={tg}");
-        assert!(
-            w.is_finite() && w != 0.0,
-            "{what}: bad reference {w} at t={tw}"
-        );
+        assert!(w.is_finite() && w != 0.0, "{what}: bad reference {w} at t={tw}");
         worst = worst.max((g - w).abs() / w.abs());
     }
     assert!(n > 0, "{what}: the row filter selected nothing to compare");
@@ -278,11 +258,8 @@ fn tau_of(t: f64, t_rec: f64, lag: f64, ii: f64) -> f64 {
 #[test]
 fn fixture_constants_are_what_the_closed_form_assumes() {
     let m = model("ss_tadlag_fit.ferx");
-    let (cl, v, lag) = (
-        m.default_params.theta[0],
-        m.default_params.theta[1],
-        m.default_params.theta[2],
-    );
+    let (cl, v, lag) =
+        (m.default_params.theta[0], m.default_params.theta[1], m.default_params.theta[2]);
     assert_eq!((cl, v, lag), (1.0, 20.0, 3.0), "TVCL / TVV / TVLAG");
 
     let pop = population("ss_tadlag.csv");
@@ -330,11 +307,7 @@ fn closed_form(t: f64, lag: f64, c: f64) -> f64 {
 
 /// Reference rows for a stream, from the closed form, aligned to that dataset's own times.
 fn closed_form_rows(csv: &str, lag: f64, c: f64) -> Vec<(f64, f64)> {
-    population(csv).subjects[0]
-        .obs_times
-        .iter()
-        .map(|&t| (t, closed_form(t, lag, c)))
-        .collect()
+    population(csv).subjects[0].obs_times.iter().map(|&t| (t, closed_form(t, lag, c))).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -366,10 +339,7 @@ fn ferx_lagged_ss_lands_on_the_explicit_lagged_train() {
     let vs_own = worst_rel_all(&ss, &train, "SS vs ferx's own train");
 
     assert!(vs_closed < 5e-9, "SS vs closed form: {vs_closed:.3e}");
-    assert!(
-        vs_nonmem < 1e-7,
-        "SS vs NONMEM's lagged train: {vs_nonmem:.3e}"
-    );
+    assert!(vs_nonmem < 1e-7, "SS vs NONMEM's lagged train: {vs_nonmem:.3e}");
     assert!(vs_own < 1e-9, "SS vs ferx's own lagged train: {vs_own:.3e}");
     assert!(
         vs_closed < vs_nonmem,
@@ -380,12 +350,10 @@ fn ferx_lagged_ss_lands_on_the_explicit_lagged_train() {
 
     // The pre-arrival window on its own, so a regression confined to it cannot hide behind
     // three correct post-arrival rows.
-    let pre = worst_rel(
-        &ss,
-        &closed_form_rows("ss_tadlag.csv", 3.0, C),
-        "pre-arrival window",
-        |t| t < 483.0,
-    );
+    let pre =
+        worst_rel(&ss, &closed_form_rows("ss_tadlag.csv", 3.0, C), "pre-arrival window", |t| {
+            t < 483.0
+        });
     assert!(pre < 5e-9, "inside [480, 483): {pre:.3e}");
 }
 
@@ -508,10 +476,7 @@ fn a_periodic_limit_exists_for_the_lagged_tad_train() {
         worst < 1e-6,
         "the lagged TAD train must converge over a doubling; realised 7.09e-7, got {worst:.3e}"
     );
-    assert!(
-        worst > 0.0,
-        "bit-identical would mean the two tables are the same file"
-    );
+    assert!(worst > 0.0, "bit-identical would mean the two tables are the same file");
 }
 
 /// The **discriminator**: an inert `0.0*TAD` must return the autonomous steady state exactly.
@@ -524,11 +489,7 @@ fn a_periodic_limit_exists_for_the_lagged_tad_train() {
 fn a_zero_coefficient_tad_term_returns_the_autonomous_steady_state() {
     for (twin, csv, tag) in [
         ("ss_tadlag_fit.ferx", "ss_tadlag.csv", "bolus lag=3"),
-        (
-            "ss_inf_tadlag_fit.ferx",
-            "ss_inf_tadlag.csv",
-            "infusion lag=3 (active + quiet windows)",
-        ),
+        ("ss_inf_tadlag_fit.ferx", "ss_inf_tadlag.csv", "infusion lag=3 (active + quiet windows)"),
         (
             "ss_inf_tadlag_resid_fit.ferx",
             "ss_inf_tadlag_resid.csv",
@@ -616,10 +577,7 @@ fn lagged_ss_infusions_land_on_their_explicit_infusion_trains() {
         // The pre-arrival window on its own: for `lag = 3` that is the quiet window's
         // contribution, for `lag = 10` the residual infusion's.
         let pre = worst_rel(&ss, &nonmem_ipred(nm_train), twin, |t| t < arrival);
-        assert!(
-            pre < bound,
-            "{twin}: inside the pre-arrival window {pre:.3e}"
-        );
+        assert!(pre < bound, "{twin}: inside the pre-arrival window {pre:.3e}");
     }
 }
 
@@ -684,16 +642,11 @@ fn a_lagtime_of_a_full_interval_or_more_follows_the_clamped_phase() {
 #[test]
 fn tafd_stays_nan_under_a_lagged_ss_dose() {
     let src = std::fs::read_to_string(anchor("ss_tadlag_fit.ferx")).expect("twin");
-    let m = parse_full_model(&src.replace("0.03*TAD", "0.003*TAFD"))
-        .expect("parses")
-        .model;
+    let m = parse_full_model(&src.replace("0.03*TAD", "0.003*TAFD")).expect("parses").model;
     let got = ferx_event_driven(&m, &population("ss_tadlag.csv"));
     // `all()` on an empty iterator is `true`: without this the test passes for a fixture
     // that produced no predictions at all, which is not the property it claims to pin.
-    assert!(
-        !got.is_empty(),
-        "the lagged SS fixture produced no predictions to check"
-    );
+    assert!(!got.is_empty(), "the lagged SS fixture produced no predictions to check");
     assert!(
         got.iter().all(|(_, v)| v.is_nan()),
         "TAFD under SS reads NaN by decision (#1139 T3); it must still. Got {got:?}"
@@ -721,11 +674,7 @@ fn simulate_and_predict_reach_the_pre_arrival_referent() {
     assert_eq!(preds.len(), want.len(), "predict() row count");
     let mut worst_pred = 0.0_f64;
     for (p, &(t, w)) in preds.iter().zip(&want) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "predict() time {} vs {t}",
-            p.time
-        );
+        assert!((p.time - t).abs() < 1e-9, "predict() time {} vs {t}", p.time);
         assert!(p.pred.is_finite(), "predict() returned {} at t={t}", p.pred);
         worst_pred = worst_pred.max((p.pred - w).abs() / w.abs());
     }
@@ -742,10 +691,7 @@ fn simulate_and_predict_reach_the_pre_arrival_referent() {
         assert!(got.is_finite(), "simulate() ipred is {got} at t={t}");
         worst_sim = worst_sim.max((got - w).abs() / w.abs());
     }
-    assert!(
-        worst_sim < 1e-7,
-        "simulate() ipred vs NONMEM's lagged train: {worst_sim:.3e}"
-    );
+    assert!(worst_sim < 1e-7, "simulate() ipred vs NONMEM's lagged train: {worst_sim:.3e}");
 }
 
 /// The sdtab `TAD` column reads the same referent the integrator does.
@@ -770,10 +716,7 @@ fn the_sdtab_tad_column_reads_the_pre_arrival_referent() {
         for (j, (t, w)) in want.iter().enumerate() {
             let (_, tad) = ferx_core::api::tafd_tad_for_subject(s, j, &lags);
             assert_eq!(s.obs_times[j], *t, "{csv}: observation order");
-            assert!(
-                (tad - w).abs() < 1e-9,
-                "{csv} t={t}: TAD column reads {tad}, want {w}"
-            );
+            assert!((tad - w).abs() < 1e-9, "{csv} t={t}: TAD column reads {tad}, want {w}");
         }
     }
 }

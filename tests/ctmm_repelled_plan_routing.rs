@@ -31,22 +31,13 @@ fn a_repelled_ctmm_trial_point_does_not_report_a_failed_plan() {
         assert!(text.contains(from), "fixture: {from}");
         text = text.replace(from, to);
     }
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("temp model");
     f.write_all(text.as_bytes()).expect("write model");
     let data = format!("{root}/data/ctmm_pd_2state.csv");
     let (fit, _) = run_model_with_data(f.path().to_str().unwrap(), Some(&data)).expect("fit runs");
+    assert!(fit.ofv >= 1e19, "fixture: the start is a repelled point ({})", fit.ofv);
     assert!(
-        fit.ofv >= 1e19,
-        "fixture: the start is a repelled point ({})",
-        fit.ofv
-    );
-    assert!(
-        !fit.warnings
-            .iter()
-            .any(|w| w.contains("W_PLAN_FD_FALLBACK")),
+        !fit.warnings.iter().any(|w| w.contains("W_PLAN_FD_FALLBACK")),
         "no failed plan at a repelled trial point: {:?}",
         fit.warnings
     );

@@ -77,22 +77,11 @@ const LOADING_DOSE_MG: f64 = 1500.0;
 fn vanco_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_loading.ferx"))
         .expect("vanco loading model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 750.0, "empiric maintenance start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
-    assert_eq!(
-        spec.target_window,
-        Some((10.0, 15.0)),
-        "trough target band (point metric)"
-    );
-    assert_eq!(
-        spec.at.len(),
-        6,
-        "6 daily maintenance decisions, t = 24..=144 h"
-    );
+    assert_eq!(spec.target_window, Some((10.0, 15.0)), "trough target band (point metric)");
+    assert_eq!(spec.at.len(), 6, "6 daily maintenance decisions, t = 24..=144 h");
     assert_eq!(spec.levels, None, "continuous (percentage) titration");
     assert_eq!(spec.rules.len(), 2, "increase / decrease rungs");
 
@@ -116,11 +105,7 @@ fn vanco_loading_titration_matches_mrgsolve() {
     // Six maintenance decisions, each dosed (no hold/stop here). The loading dose is a
     // BASE dose — it drives the trajectory but never enters the reactive ledger.
     assert_eq!(res.decisions.len(), 6, "one decision per day, t = 24..=144");
-    assert_eq!(
-        res.ledger.len(),
-        6,
-        "every decision issued a maintenance dose"
-    );
+    assert_eq!(res.ledger.len(), 6, "every decision issued a maintenance dose");
     assert!(
         res.ledger.iter().all(|e| e.amt != LOADING_DOSE_MG),
         "the loading dose is a base dose, not a reactive ledger entry"
@@ -128,11 +113,8 @@ fn vanco_loading_titration_matches_mrgsolve() {
 
     // The #702 assertion: the day-1 trough is the decayed loading dose (~5.6 mg/L), not
     // ~0. A dropped base regimen would fail this by a wide margin.
-    let first_trough = res.decisions[0]
-        .observed_signals
-        .first()
-        .map(|s| s.value)
-        .unwrap_or(f64::NAN);
+    let first_trough =
+        res.decisions[0].observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
     assert!(
         first_trough > 5.0,
         "day-1 trough {first_trough:.6} must reflect the integrated loading dose (>5 mg/L); \
@@ -145,11 +127,7 @@ fn vanco_loading_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(sig.is_finite(), "decision {i}: trough {sig}");
         let gap = (sig - trough_ref).abs();
         worst = worst.max(gap);
@@ -204,13 +182,8 @@ fn vanco_loading_titration_matches_mrgsolve() {
 /// mrgsolve's AUC24 of each closed inter-decision window (#943), frozen in
 /// `tests/reference/vanco_loading_mrgsolve/expected.md`: an AUC compartment `dxdt_AUC = CENT/V` reset at the
 /// start of each window, integrated on the same piecewise-constant CL as the troughs above.
-const REF_AUC24: [f64; 5] = [
-    242.711203568,
-    277.831467910,
-    339.591552808,
-    422.170913604,
-    527.015314969,
-];
+const REF_AUC24: [f64; 5] =
+    [242.711203568, 277.831467910, 339.591552808, 422.170913604, 527.015314969];
 
 /// Relative band of each ferx AUC24 against mrgsolve's (#943), at η = 0.
 /// Measured on Linux aarch64 (`tools/linux-test.sh`), identical in
@@ -241,10 +214,7 @@ fn windows_in(band: (f64, f64)) -> usize {
 fn run(band: Option<(f64, f64)>) -> AdaptiveSimulationResult {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_loading.ferx"))
         .expect("vanco loading model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     if let Some(band) = band {
         spec.auc_target = Some(band);
     }

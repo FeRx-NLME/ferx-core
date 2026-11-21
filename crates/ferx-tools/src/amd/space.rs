@@ -62,22 +62,14 @@ fn owner(feature: &Feature) -> Result<Option<Step>, String> {
 /// add up to the whole: `iivsearch` reads the η blocks and `iovsearch` the κ,
 /// and neither is handed a statement mentioning the other's level.
 fn narrowed(feature: &Feature, level: VariabilityLevel) -> Option<Feature> {
-    let Feature::Covariance {
-        optional,
-        level: levels,
-        parameters,
-    } = feature
-    else {
+    let Feature::Covariance { optional, level: levels, parameters } = feature else {
         return None;
     };
-    levels
-        .expand()
-        .contains(&level)
-        .then(|| Feature::Covariance {
-            optional: *optional,
-            level: Modes::List(vec![level]),
-            parameters: parameters.clone(),
-        })
+    levels.expand().contains(&level).then(|| Feature::Covariance {
+        optional: *optional,
+        level: Modes::List(vec![level]),
+        parameters: parameters.clone(),
+    })
 }
 
 /// The subspace `step` is handed: its own statements, every `LET`, and nothing
@@ -107,10 +99,7 @@ pub(crate) fn subspace(mfl: &Mfl, step: Step) -> Result<Mfl, String> {
     }
     // A subspace of `LET`s only is empty: a definition nothing refers to is
     // not a search.
-    if !statements
-        .iter()
-        .any(|s| matches!(s, Statement::Feature(_)))
-    {
+    if !statements.iter().any(|s| matches!(s, Statement::Feature(_))) {
         statements.clear();
     }
     Ok(Mfl { statements })

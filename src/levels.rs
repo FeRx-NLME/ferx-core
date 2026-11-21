@@ -21,11 +21,11 @@
 
 use std::collections::HashMap;
 
-use crate::api::apply_iov_occasion_rule;
-use crate::api::postfit::theta_se_from_packed;
 use crate::diagnostics::{Diagnostic, EngineError};
+use crate::estimation::parameterization::theta_se_from_packed;
 use crate::estimation::parameterization::{theta_from_packed, theta_packing_jacobian};
 use crate::estimation::sir::percentile_ci;
+use crate::occasions::apply_iov_occasion_rule;
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,
     LevelBinding, LevelBindings, LevelBlockDecl, LevelContrast, LevelRule, ParseBindings,
@@ -52,7 +52,7 @@ const TIME_COLUMN: &str = "TIME";
 /// parse would: the contrast an `auto` block resolved to there is not carried over.
 /// Covariate statistics `parsed` was bound with are kept only when `population`
 /// gives the same summary of every covariate they cover. Otherwise they are dropped,
-/// and the relations are left for [`bind_covariate_stats`](crate::api::bind_covariate_stats)
+/// and the relations are left for [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats)
 /// to bind on `population`.
 ///
 /// Refused, with nothing written, on a model laid out on a fit's bindings
@@ -62,9 +62,7 @@ const TIME_COLUMN: &str = "TIME";
 /// Every refusal carries the code `E_THETA_LEVEL_BINDING` on block `parameters`
 /// (#1773), the code `ferx check --data` reports for it.
 pub fn bind_theta_levels(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &mut Population,
+    parsed: &mut ParsedModel, model_text: &str, population: &mut Population,
 ) -> Result<(), EngineError> {
     bind_theta_levels_diag(parsed, model_text, population).map_err(EngineError::from_diagnostic)
 }
@@ -72,9 +70,7 @@ pub fn bind_theta_levels(
 /// [`bind_theta_levels`], refusing with the [`Diagnostic`] itself: what
 /// `ferx check`'s binding step reads.
 pub(crate) fn bind_theta_levels_diag(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &mut Population,
+    parsed: &mut ParsedModel, model_text: &str, population: &mut Population,
 ) -> Result<(), Diagnostic> {
     bind_levels_on_data(parsed, model_text, population).map_err(level_binding_error)
 }
@@ -88,28 +84,22 @@ pub(crate) fn level_binding_error(message: impl Into<String>) -> Diagnostic {
 
 /// The body of [`bind_theta_levels`]; every refusal is the level half's.
 fn bind_levels_on_data(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &mut Population,
+    parsed: &mut ParsedModel, model_text: &str, population: &mut Population,
 ) -> Result<(), String> {
     // Every level-block name and column is the declared one, whatever contrast a
     // binding stamped: the refusal reads them before a re-parse is spent.
     if parsed.model.bound_from_fit() && !parsed.model.theta_blocks().level_blocks().is_empty() {
-        return Err(fit_bound_message(
-            parsed.model.theta_blocks().level_blocks(),
-        ));
+        return Err(fit_bound_message(parsed.model.theta_blocks().level_blocks()));
     }
-    let decls: Vec<LevelBlockDecl> = declared_model(parsed, model_text, Reads::Levels)?
-        .theta_blocks()
-        .level_blocks()
-        .to_vec();
+    let decls: Vec<LevelBlockDecl> =
+        declared_model(parsed, model_text, Reads::Levels)?.theta_blocks().level_blocks().to_vec();
     if decls.is_empty() {
         return Ok(());
     }
     // The bindings this layout is re-parsed on: no level binding of `parsed`'s,
     // and its statistics only while they are still `population`'s.
     let mut base = unbound_bindings(parsed);
-    if crate::api::covariate_stats::stats_hold_on(&parsed.bindings.covariate_stats, population) {
+    if crate::covariate_stats::stats_hold_on(&parsed.bindings.covariate_stats, population) {
         base.covariate_stats = parsed.bindings.covariate_stats.clone();
     }
 
@@ -122,11 +112,8 @@ fn bind_levels_on_data(
     let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
     for decl in &decls {
         let levels = discover_levels(decl, &bound)?;
-        let table: Vec<(Level, usize)> = levels
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (l.clone(), i + 1))
-            .collect();
+        let table: Vec<(Level, usize)> =
+            levels.iter().enumerate().map(|(i, l)| (l.clone(), i + 1)).collect();
         write_index_column(decl, &table, &mut bound.subjects)?;
         discovered.push(levels);
         tables.push(table);
@@ -169,19 +156,11 @@ fn bind_levels_on_data(
     // and the rank check would refuse it for that. The binding keeps `base`.
     let mut measure_base = base.clone();
     if measure_base.covariate_stats.is_empty() {
-        if let Some(stats) =
-            crate::api::covariate_stats::stats_on_data(parsed, model_text, population)
-        {
+        if let Some(stats) = crate::covariate_stats::stats_on_data(parsed, model_text, population) {
             measure_base.covariate_stats = stats;
         }
     }
-    let measured = measure_levels(
-        &measure_base,
-        model_text,
-        &decls,
-        &discovered,
-        with_occasions,
-    )?;
+    let measured = measure_levels(&measure_base, model_text, &decls, &discovered, with_occasions)?;
 
     // Two passes (#1963). A block's certificate counts every other block as it
     // will be coded, so the blocks that absorb no random effect — whose
@@ -236,14 +215,7 @@ fn bind_levels_on_data(
     let mut rank_refusal = None;
     if let Some(m) = measured.first() {
         let rank = RankColumns::measure(&m.rank_model, &decls, &discovered, with_occasions);
-        let moved = settle_auto(
-            &rank,
-            &decls,
-            &discovered,
-            &measured,
-            &absorbing,
-            &mut coded,
-        );
+        let moved = settle_auto(&rank, &decls, &discovered, &measured, &absorbing, &mut coded);
         if moved && absorbing.contains(&true) {
             let settled: Vec<Coded> = (0..decls.len())
                 .filter(|&i| !absorbing[i])
@@ -300,13 +272,7 @@ fn bind_levels_on_data(
     let rebound = parse_full_model_with(model_text, &all)?;
     // #1797: on the model as it will be fitted, so the measurement is the contrast the
     // block resolved to.
-    refuse_read_unindexed(
-        &rebound.model,
-        &decls,
-        &tables,
-        population,
-        LevelSource::Data,
-    )?;
+    refuse_read_unindexed(&rebound.model, &decls, &tables, population, LevelSource::Data)?;
     if let Some(e) = rank_refusal {
         return Err(e);
     }
@@ -356,10 +322,7 @@ fn bind_levels_on_data(
             covariate statistics from the fit"
 )]
 pub fn bind_theta_levels_from_fit(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &mut Population,
-    fitted: &LevelBindings,
+    parsed: &mut ParsedModel, model_text: &str, population: &mut Population, fitted: &LevelBindings,
 ) -> Result<(), EngineError> {
     bind_levels_from_fit_layout(parsed, model_text, population, fitted)
         .map_err(|e| EngineError::from_diagnostic(level_binding_error(e)))
@@ -367,15 +330,10 @@ pub fn bind_theta_levels_from_fit(
 
 /// The body of [`bind_theta_levels_from_fit`]; every refusal is the level half's.
 fn bind_levels_from_fit_layout(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &mut Population,
-    fitted: &LevelBindings,
+    parsed: &mut ParsedModel, model_text: &str, population: &mut Population, fitted: &LevelBindings,
 ) -> Result<(), String> {
-    let decls: Vec<LevelBlockDecl> = declared_model(parsed, model_text, Reads::Levels)?
-        .theta_blocks()
-        .level_blocks()
-        .to_vec();
+    let decls: Vec<LevelBlockDecl> =
+        declared_model(parsed, model_text, Reads::Levels)?.theta_blocks().level_blocks().to_vec();
     validate_fitted_levels(&decls, fitted)?;
     if decls.is_empty() {
         return Ok(());
@@ -389,13 +347,7 @@ fn bind_levels_from_fit_layout(
     bindings.covariate_stats = parsed.bindings.covariate_stats.clone();
     bindings.levels = fitted.clone();
     let rebound = parse_full_model_with(model_text, &bindings)?;
-    refuse_read_unindexed(
-        &rebound.model,
-        &decls,
-        &tables,
-        population,
-        LevelSource::Fit,
-    )?;
+    refuse_read_unindexed(&rebound.model, &decls, &tables, population, LevelSource::Fit)?;
     for (decl, table) in decls.iter().zip(&tables) {
         write_index_column(decl, table, &mut population.subjects)?;
     }
@@ -425,7 +377,7 @@ fn bind_levels_from_fit_layout(
 /// out and writes nothing.
 ///
 /// After this call the model records that its bindings are the fit's (#1730), so
-/// [`bind_covariate_stats`](crate::api::bind_covariate_stats) on it is a no-op — the
+/// [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats) on it is a no-op — the
 /// fitted θ was estimated against the fit's centres — and [`bind_theta_levels`]
 /// refuses it, since the population's own levels would read the fitted θ at other
 /// positions.
@@ -453,10 +405,7 @@ fn bind_levels_from_fit_layout(
 /// never observed has no `ferx check` counterpart, since `check` binds data to its
 /// own levels.
 pub fn bind_from_fit(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: &mut Population,
-    fitted: &DataBindings,
+    parsed: &mut ParsedModel, model_text: &str, population: &mut Population, fitted: &DataBindings,
 ) -> Result<(), EngineError> {
     bind_from_fit_on(parsed, model_text, Some(population), fitted)
         .map_err(EngineError::from_diagnostic)
@@ -472,9 +421,7 @@ pub fn bind_from_fit(
 /// `parsed` and the population as they were. The first two are
 /// [`layout_from_fit`]'s, run by the same function.
 pub(crate) fn bind_from_fit_on(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    population: Option<&mut Population>,
+    parsed: &mut ParsedModel, model_text: &str, population: Option<&mut Population>,
     fitted: &DataBindings,
 ) -> Result<(), Diagnostic> {
     let Some(layout) = lay_out_on_fit(parsed, model_text, fitted)? else {
@@ -493,14 +440,8 @@ pub(crate) fn bind_from_fit_on(
         }
     };
     if let Some(population) = population {
-        refuse_read_unindexed(
-            &layout.model,
-            &layout.decls,
-            &tables,
-            population,
-            LevelSource::Fit,
-        )
-        .map_err(level_binding_error)?;
+        refuse_read_unindexed(&layout.model, &layout.decls, &tables, population, LevelSource::Fit)
+            .map_err(level_binding_error)?;
         for (decl, table) in layout.decls.iter().zip(&tables) {
             write_index_column(decl, table, &mut population.subjects)
                 .map_err(level_binding_error)?;
@@ -525,14 +466,12 @@ pub(crate) fn bind_from_fit_on(
 /// Whether the model needs the fit's bindings is decided from `model_text`, not from
 /// `parsed`, so a model already bound to other data (a simulation design, by
 /// [`prepare_run`](crate::api::prepare_run) or
-/// [`bind_covariate_stats`](crate::api::bind_covariate_stats)) is laid out on the
+/// [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats)) is laid out on the
 /// fit's statistics, or refused when the fit carries none (#1686). Refused, with
 /// `parsed` left as it was: everything [`bind_from_fit`] refuses except a level the
 /// fit never observed, with the same codes (#1773).
 pub fn layout_from_fit(
-    parsed: &mut ParsedModel,
-    model_text: &str,
-    fitted: &DataBindings,
+    parsed: &mut ParsedModel, model_text: &str, fitted: &DataBindings,
 ) -> Result<(), EngineError> {
     if let Some(layout) =
         lay_out_on_fit(parsed, model_text, fitted).map_err(EngineError::from_diagnostic)?
@@ -593,9 +532,7 @@ pub(crate) fn unbound_bindings(parsed: &ParsedModel) -> ParseBindings {
 /// stamps no contrast — so the second binder of `prepare_run`'s pair (levels, then
 /// statistics) borrows too.
 pub(crate) fn declared_model<'a>(
-    parsed: &'a ParsedModel,
-    model_text: &str,
-    reads: Reads,
+    parsed: &'a ParsedModel, model_text: &str, reads: Reads,
 ) -> Result<Declared<'a>, String> {
     let bound = parsed.model.data_bindings();
     let unbound = match reads {
@@ -617,9 +554,7 @@ pub(crate) fn declared_model<'a>(
 /// column was written for this layout. A column present but written for other
 /// levels, or a block `population` cannot show, counts as differing.
 pub(crate) fn levels_hold_on(
-    model: &CompiledModel,
-    levels: &LevelBindings,
-    population: &Population,
+    model: &CompiledModel, levels: &LevelBindings, population: &Population,
 ) -> bool {
     let decls = model.theta_blocks().level_blocks();
     levels.iter().all(|(name, binding)| {
@@ -627,15 +562,9 @@ pub(crate) fn levels_hold_on(
             return false;
         };
         let column = level_index_column(name);
-        population
-            .subjects
-            .iter()
-            .all(|s| s.covariates.contains_key(&column))
+        population.subjects.iter().all(|s| s.covariates.contains_key(&column))
             && discover_levels(decl, population).is_ok_and(|found| {
-                found
-                    .iter()
-                    .map(|l| l.label(decl.columns()))
-                    .eq(binding.labels.iter().cloned())
+                found.iter().map(|l| l.label(decl.columns())).eq(binding.labels.iter().cloned())
             })
     })
 }
@@ -663,11 +592,9 @@ impl FitLayout {
 /// the fit carries nothing, which leaves `parsed` as it is. Reads `parsed` only for
 /// its non-data bindings and name, and writes nothing.
 fn lay_out_on_fit(
-    parsed: &ParsedModel,
-    model_text: &str,
-    fitted: &DataBindings,
+    parsed: &ParsedModel, model_text: &str, fitted: &DataBindings,
 ) -> Result<Option<FitLayout>, Diagnostic> {
-    use crate::api::covariate_stats::stats_binding_error;
+    use crate::covariate_stats::stats_binding_error;
     // What the model needs comes from its text, parsed with no data-derived binding
     // (#1686): both halves are read here.
     // A refusal that is not one half's alone is the level half's when the model has
@@ -684,13 +611,13 @@ fn lay_out_on_fit(
     let declared = declared_model(parsed, model_text, Reads::Both)
         .map_err(|message| either_on(has_levels, message))?;
     let decls: Vec<LevelBlockDecl> = declared.theta_blocks().level_blocks().to_vec();
-    let symbolic = crate::api::covariate_stats::symbolic_covariates(&declared);
+    let symbolic = crate::covariate_stats::symbolic_covariates(&declared);
     let either = |message: String| either_on(!decls.is_empty(), message);
     if fitted.is_empty() && (!decls.is_empty() || !symbolic.is_empty()) {
         return Err(either(no_fit_bindings_message(&decls, &symbolic)));
     }
     validate_fitted_levels(&decls, &fitted.levels).map_err(level_binding_error)?;
-    crate::api::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)
+    crate::covariate_stats::validate_fitted_stats(&declared, &fitted.covariate_stats)
         .map_err(stats_binding_error)?;
     if decls.is_empty() && fitted.covariate_stats.is_empty() {
         return Ok(None);
@@ -698,24 +625,18 @@ fn lay_out_on_fit(
     let mut bindings = unbound_bindings(parsed);
     bindings.levels = fitted.levels.clone();
     bindings.covariate_stats = fitted.covariate_stats.clone();
-    let model = parse_full_model_with(model_text, &bindings)
-        .map_err(either)?
-        .model;
+    let model = parse_full_model_with(model_text, &bindings).map_err(either)?.model;
     // Not a gate (#1728 review): `validate_fitted_stats` has already required a
     // statistic for every covariate a symbolic relation reads, and given one, the
     // parser resolves the relation or refuses it. Asserted on every from-fit fixture
     // so that claim is measured; it would fire if a relation came to need more
     // than a `CovariateSummary` to resolve.
     debug_assert!(
-        crate::api::assert_covariate_model_bound(&model).is_ok(),
+        crate::covariate_stats::assert_covariate_model_bound(&model).is_ok(),
         "a from-fit layout left a relation unresolved: {:?}",
-        crate::api::assert_covariate_model_bound(&model)
+        crate::covariate_stats::assert_covariate_model_bound(&model)
     );
-    Ok(Some(FitLayout {
-        decls,
-        model,
-        bindings,
-    }))
+    Ok(Some(FitLayout { decls, model, bindings }))
 }
 
 /// Write the level index columns of a model **already** bound to a fit's level
@@ -724,9 +645,7 @@ fn lay_out_on_fit(
 /// The validation and unseen-level refusal of [`bind_from_fit`]; no re-parse, since
 /// the model in hand already carries the layout.
 pub(crate) fn write_fitted_level_columns(
-    model: &crate::types::CompiledModel,
-    population: &mut Population,
-    fitted: &LevelBindings,
+    model: &crate::types::CompiledModel, population: &mut Population, fitted: &LevelBindings,
 ) -> Result<(), Diagnostic> {
     let decls: Vec<LevelBlockDecl> = model.theta_blocks().level_blocks().to_vec();
     (|| -> Result<(), String> {
@@ -761,11 +680,7 @@ fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> Str
         needs.push(format!(
             "its [covariate_model] relations state a statistic of {} symbolically, so their \
              centres come from the data it was fitted on",
-            symbolic
-                .iter()
-                .map(|c| format!("`{c}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            symbolic.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
         ));
     }
     format!(
@@ -812,11 +727,7 @@ fn validate_fitted_levels(decls: &[LevelBlockDecl], fitted: &LevelBindings) -> R
         return Err(format!(
             "the fit's level bindings carry the block(s) {}, which this model does not \
              declare: the bindings belong to a different model",
-            extra
-                .iter()
-                .map(|b| format!("`{b}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            extra.iter().map(|b| format!("`{b}`")).collect::<Vec<_>>().join(", ")
         ));
     }
     for decl in decls {
@@ -900,9 +811,7 @@ fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<
 /// refusal leaves `population` untouched. `fitted` has passed
 /// [`validate_fitted_levels`], so every block has an entry.
 fn fitted_level_tables(
-    decls: &[LevelBlockDecl],
-    population: &Population,
-    fitted: &LevelBindings,
+    decls: &[LevelBlockDecl], population: &Population, fitted: &LevelBindings,
 ) -> Result<Vec<Vec<(Level, usize)>>, String> {
     let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
     for decl in decls {
@@ -921,9 +830,7 @@ fn fitted_level_tables(
 /// [`level_index_finding`] re-derives from it the index each record should carry, so
 /// the binder and the check cannot disagree about what a label is.
 fn match_level_table(
-    decl: &LevelBlockDecl,
-    population: &Population,
-    labels: &[String],
+    decl: &LevelBlockDecl, population: &Population, labels: &[String],
 ) -> Result<(Vec<(Level, usize)>, Vec<String>), String> {
     // Keyed, not `position`: at MBMA scale (thousands of levels) a linear search per level
     // made the check on every run call quadratic (#1762, measured). A repeated label keeps
@@ -964,11 +871,7 @@ pub(crate) enum LevelIndexFinding {
     NeverBound,
     /// `unbound` of the population's `of` subjects carry no index column; `first_id`
     /// is the first of them.
-    SomeSubjectsUnbound {
-        unbound: usize,
-        of: usize,
-        first_id: String,
-    },
+    SomeSubjectsUnbound { unbound: usize, of: usize, first_id: String },
     /// Subject `id` carries the index but no finite value in the level column
     /// `column`, so the level its index names cannot be checked.
     ColumnMissing { id: String, column: String },
@@ -979,13 +882,7 @@ pub(crate) enum LevelIndexFinding {
     /// subject `id` at record time `time` is level `label`, position `want`, and
     /// carries `got` (`None`: no index on that record). `time` is `None` for a subject
     /// with no Gaussian observation, whose level is its baseline columns' (#1797).
-    Misindexed {
-        id: String,
-        time: Option<f64>,
-        label: String,
-        want: usize,
-        got: Option<f64>,
-    },
+    Misindexed { id: String, time: Option<f64>, label: String, want: usize, got: Option<f64> },
 }
 
 /// Whether `population`'s index column for the bound block `decl` is the index the
@@ -1005,15 +902,11 @@ pub(crate) enum LevelIndexFinding {
 /// binder and is not re-checked, so an edit to only such a snapshot is out of this
 /// check's reach.
 pub(crate) fn level_index_finding(
-    decl: &LevelBlockDecl,
-    population: &Population,
+    decl: &LevelBlockDecl, population: &Population,
 ) -> Option<LevelIndexFinding> {
     let column = level_index_column(decl.name());
-    let unbound: Vec<&Subject> = population
-        .subjects
-        .iter()
-        .filter(|s| !s.covariates.contains_key(&column))
-        .collect();
+    let unbound: Vec<&Subject> =
+        population.subjects.iter().filter(|s| !s.covariates.contains_key(&column)).collect();
     if unbound.len() == population.subjects.len() {
         return Some(LevelIndexFinding::NeverBound);
     }
@@ -1037,11 +930,7 @@ pub(crate) fn level_index_finding(
             }
         }
     }
-    if population
-        .subjects
-        .iter()
-        .all(|s| level_rows(decl, s).next().is_none())
-    {
+    if population.subjects.iter().all(|s| level_rows(decl, s).next().is_none()) {
         // No record defines a level, so no index can be wrong.
         return None;
     }
@@ -1053,10 +942,8 @@ pub(crate) fn level_index_finding(
     if !unseen.is_empty() {
         return Some(LevelIndexFinding::Unseen { labels: unseen });
     }
-    let index: HashMap<Vec<u64>, (usize, &Level)> = table
-        .iter()
-        .map(|(level, i)| (level_key(&level.values), (*i, level)))
-        .collect();
+    let index: HashMap<Vec<u64>, (usize, &Level)> =
+        table.iter().map(|(level, i)| (level_key(&level.values), (*i, level))).collect();
     for subject in &population.subjects {
         let snaps = subject.record_covariate_snapshots();
         for row in level_rows(decl, subject) {
@@ -1089,25 +976,14 @@ pub(crate) fn level_index_finding(
 /// first whose baseline columns name a level of the model's table but whose index is not
 /// that level's position. The level is matched by label, as [`match_level_table`] does.
 fn no_gaussian_misindexed(
-    decl: &LevelBlockDecl,
-    population: &Population,
-    column: &str,
+    decl: &LevelBlockDecl, population: &Population, column: &str,
 ) -> Option<LevelIndexFinding> {
-    for subject in population
-        .subjects
-        .iter()
-        .filter(|s| level_rows(decl, s).next().is_none())
-    {
+    for subject in population.subjects.iter().filter(|s| level_rows(decl, s).next().is_none()) {
         let Ok(values) = baseline_level(decl, subject) else {
             continue;
         };
         let label = Level { values }.label(decl.columns());
-        let Some(want) = decl
-            .labels()
-            .iter()
-            .position(|l| *l == label)
-            .map(|i| i + 1)
-        else {
+        let Some(want) = decl.labels().iter().position(|l| *l == label).map(|i| i + 1) else {
             continue;
         };
         let got = subject.covariates.get(column).copied();
@@ -1150,11 +1026,7 @@ fn repeated_labels_message(decl: &LevelBlockDecl, repeated: &[&str]) -> String {
         decl.name(),
         decl.columns().join(", "),
         repeated.len(),
-        repeated
-            .iter()
-            .map(|l| format!("`{l}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        repeated.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ")
     )
 }
 
@@ -1168,17 +1040,9 @@ fn unseen_levels_message(decl: &LevelBlockDecl, unseen: &[String]) -> String {
         decl.name(),
         decl.columns().join(", "),
         unseen.len(),
-        unseen
-            .iter()
-            .map(|l| format!("`{l}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        unseen.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ")
     );
-    if decl
-        .columns()
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(TIME_COLUMN))
-    {
+    if decl.columns().iter().any(|c| c.eq_ignore_ascii_case(TIME_COLUMN)) {
         message.push_str(&format!(
             " `{TIME_COLUMN}` is a level column of this block, so the design can only be \
              simulated at the fit's observation times; a denser or different time grid has \
@@ -1253,8 +1117,7 @@ enum LevelRow {
 /// The rows of `subject` that define `decl`'s levels: every Gaussian observation, then
 /// every discrete-state record on one of the block's [`LevelBlockDecl::record_cmts`].
 fn level_rows<'a>(
-    decl: &'a LevelBlockDecl,
-    subject: &'a Subject,
+    decl: &'a LevelBlockDecl, subject: &'a Subject,
 ) -> impl Iterator<Item = LevelRow> + 'a {
     rows_on(&decl.record_cmts, subject)
 }
@@ -1262,24 +1125,17 @@ fn level_rows<'a>(
 /// [`level_rows`] for a block whose discrete-state readers are the endpoints on
 /// `record_cmts`.
 fn rows_on<'a>(
-    record_cmts: &'a [usize],
-    subject: &'a Subject,
+    record_cmts: &'a [usize], subject: &'a Subject,
 ) -> impl Iterator<Item = LevelRow> + 'a {
-    let records = subject
-        .obs_records
-        .iter()
-        .enumerate()
-        .filter_map(|(r, rec)| match rec {
-            ObsRecord::DiscreteState { cmt, .. } | ObsRecord::Count { cmt, .. }
-                if record_cmts.contains(cmt) =>
-            {
-                Some(LevelRow::Record(r))
-            }
-            _ => None,
-        });
-    (0..subject.obs_times.len())
-        .map(LevelRow::Obs)
-        .chain(records)
+    let records = subject.obs_records.iter().enumerate().filter_map(|(r, rec)| match rec {
+        ObsRecord::DiscreteState { cmt, .. } | ObsRecord::Count { cmt, .. }
+            if record_cmts.contains(cmt) =>
+        {
+            Some(LevelRow::Record(r))
+        }
+        _ => None,
+    });
+    (0..subject.obs_times.len()).map(LevelRow::Obs).chain(records)
 }
 
 /// The value of one level column on `row` of `subject`: [`column_value`] for a Gaussian
@@ -1287,10 +1143,7 @@ fn rows_on<'a>(
 /// clock [`column_value`] keys on too) or the column in its own covariate snapshot
 /// (`snaps`, the subject's [`Subject::record_covariate_snapshots`]), else the baseline.
 fn row_value(
-    subject: &Subject,
-    snaps: Option<&[HashMap<String, f64>]>,
-    column: &str,
-    row: LevelRow,
+    subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, column: &str, row: LevelRow,
 ) -> Option<f64> {
     match row {
         LevelRow::Obs(j) => column_value(subject, column, j),
@@ -1312,10 +1165,7 @@ fn row_value(
 /// The level index the predictors read on `row`: the observation's snapshot
 /// ([`Subject::obs_cov`]) or the record's ([`Subject::record_cov`]).
 fn row_index(
-    subject: &Subject,
-    snaps: Option<&[HashMap<String, f64>]>,
-    column: &str,
-    row: LevelRow,
+    subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, column: &str, row: LevelRow,
 ) -> Option<f64> {
     match row {
         LevelRow::Obs(j) => subject.obs_cov(j).get(column).copied(),
@@ -1520,9 +1370,7 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
             // Not "drop the block": the bare `NAME` would then read as a covariate (#2819
             // review r1 #1).
             message.push_str(NO_DEFINING_RECORDS);
-            message.push_str(&format!(
-                " Declare it as one `theta {name}` without the index, or "
-            ));
+            message.push_str(&format!(" Declare it as one `theta {name}` without the index, or "));
             message.push_str(ADD_DEFINING_ROWS);
         }
     }
@@ -1558,10 +1406,7 @@ enum Unit {
 /// label — so a kappa counts nowhere there (`fit()` reports the missing
 /// occasions or labels later).
 fn unit_of(
-    subject: &Subject,
-    unit: Unit,
-    j: usize,
-    nested: Option<&NestedLevels>,
+    subject: &Subject, unit: Unit, j: usize, nested: Option<&NestedLevels>,
 ) -> Option<Vec<u64>> {
     match unit {
         Unit::Subject => Some(Vec::new()),
@@ -1577,10 +1422,7 @@ fn unit_of(
 /// [`Unit::Occasion`] it lies in none, and a kappa counts nowhere there; under nested
 /// levels its label path is read off its own snapshot (#2562).
 fn unit_of_row(
-    subject: &Subject,
-    snaps: Option<&[HashMap<String, f64>]>,
-    unit: Unit,
-    row: LevelRow,
+    subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, unit: Unit, row: LevelRow,
     nested: Option<&NestedLevels>,
 ) -> Option<Vec<u64>> {
     match row {
@@ -1607,10 +1449,7 @@ fn unit_of_row(
 /// two subjects of one study on disjoint times nest a `[STUDY, TIME]` block in
 /// subjects while sharing its `STUDY` key.
 fn levels_nest_in_units(
-    decl: &LevelBlockDecl,
-    population: &Population,
-    unit: Unit,
-    nested: Option<&NestedLevels>,
+    decl: &LevelBlockDecl, population: &Population, unit: Unit, nested: Option<&NestedLevels>,
 ) -> bool {
     let mut owner: HashMap<Vec<u64>, (usize, Vec<u64>)> = HashMap::new();
     for (s, subject) in population.subjects.iter().enumerate() {
@@ -1656,11 +1495,8 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged:
         let snaps = subject.record_covariate_snapshots();
         let mut seen: Vec<(Vec<f64>, LevelRow)> = Vec::new();
         level_rows(decl, subject).all(|row| {
-            let level: Vec<f64> = decl
-                .columns()
-                .iter()
-                .filter_map(|c| row_value(subject, snaps, c, row))
-                .collect();
+            let level: Vec<f64> =
+                decl.columns().iter().filter_map(|c| row_value(subject, snaps, c, row)).collect();
             match seen.iter().find(|(l, _)| *l == level) {
                 // Replicates, so a random effect moves both alike (#2131).
                 Some(&(_, first)) => match (first, row) {
@@ -1687,25 +1523,12 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged:
 /// gives a random effect no way to move one and not the other. A record carries no
 /// occasion and no lag acts on it.
 fn records_replicate(
-    subject: &Subject,
-    snaps: Option<&[HashMap<String, f64>]>,
-    r0: usize,
-    r: usize,
+    subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, r0: usize, r: usize,
 ) -> bool {
     let key = |r: usize| match subject.obs_records.get(r) {
         Some(
-            ObsRecord::DiscreteState {
-                time,
-                raw_time,
-                cmt,
-                ..
-            }
-            | ObsRecord::Count {
-                time,
-                raw_time,
-                cmt,
-                ..
-            },
+            ObsRecord::DiscreteState { time, raw_time, cmt, .. }
+            | ObsRecord::Count { time, raw_time, cmt, .. },
         ) => Some((raw_time.to_bits(), time.to_bits(), *cmt)),
         _ => None,
     };
@@ -1756,10 +1579,7 @@ fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
 /// occasion of a subject for a kappa, and within each group of its level for a
 /// kappa of a nested model.
 fn constant_within_units(
-    decl: &LevelBlockDecl,
-    covariates: &[String],
-    population: &Population,
-    unit: Unit,
+    decl: &LevelBlockDecl, covariates: &[String], population: &Population, unit: Unit,
     nested: Option<&NestedLevels>,
 ) -> bool {
     population.subjects.iter().all(|subject| {
@@ -1931,9 +1751,7 @@ fn unit_of_random_effect(decl: &LevelBlockDecl, k: usize, nested: Option<&Nested
 /// for a kappa, a group of its level for a kappa of a nested model — or `None`
 /// when they do not, and the block cannot absorb it.
 fn nesting_units(
-    decl: &LevelBlockDecl,
-    population: &Population,
-    nested: Option<&NestedLevels>,
+    decl: &LevelBlockDecl, population: &Population, nested: Option<&NestedLevels>,
 ) -> Vec<Option<Unit>> {
     let mut verdicts: Vec<(Unit, bool)> = Vec::new();
     (0..decl.eta_couplings.len())
@@ -1958,12 +1776,8 @@ fn nesting_units(
 /// `y`. `None` when the walk names no site, which is where the span certificate
 /// is measured ([`spanned`]).
 fn structural_site<'a>(
-    decl: &LevelBlockDecl,
-    c: &'a EtaCoupling,
-    population: &Population,
-    unit: Unit,
-    nested: Option<&NestedLevels>,
-    resolving: bool,
+    decl: &LevelBlockDecl, c: &'a EtaCoupling, population: &Population, unit: Unit,
+    nested: Option<&NestedLevels>, resolving: bool,
 ) -> Option<How<'a>> {
     let funnel = c
         .funnels
@@ -1996,10 +1810,7 @@ enum Placement<'a> {
 /// site from the walk and where from the measurement — so the two cannot
 /// disagree on which random effects are silent (#1874 review, F12).
 fn placements<'a>(
-    decl: &'a LevelBlockDecl,
-    population: &Population,
-    lagged: bool,
-    nested: Option<&NestedLevels>,
+    decl: &'a LevelBlockDecl, population: &Population, lagged: bool, nested: Option<&NestedLevels>,
 ) -> Vec<Placement<'a>> {
     let units = nesting_units(decl, population, nested);
     let resolving = resolves_observations(decl, population, lagged);
@@ -2023,9 +1834,7 @@ fn placements<'a>(
 /// the absorption. A named site is preferred: it tells the user where to look.
 /// An η and a kappa follow the same rule, each on its own unit.
 fn absorbed<'a>(
-    decl: &'a LevelBlockDecl,
-    population: &Population,
-    measured: &Measured,
+    decl: &'a LevelBlockDecl, population: &Population, measured: &Measured,
 ) -> Vec<Absorbed<'a>> {
     let spanned = &measured.spanned;
     let nested = measured.nested.as_ref();
@@ -2038,11 +1847,8 @@ fn absorbed<'a>(
                 Placement::Site(how, unit) => (how, unit),
                 Placement::Silent(unit) => {
                     let found = spanned.get(k).cloned().flatten()?;
-                    let with = found
-                        .with
-                        .iter()
-                        .map(|&j| decl.eta_couplings[j].eta.clone())
-                        .collect();
+                    let with =
+                        found.with.iter().map(|&j| decl.eta_couplings[j].eta.clone()).collect();
                     (How::Measured(found.span, with, found.residual), unit)
                 }
             };
@@ -2095,11 +1901,7 @@ const RE_STEP: f64 = 0.1;
 /// not cancel at the moved point (#1852); random effect `bump` (an η index, or
 /// `n_eta` + a κ index, on every occasion group) is moved by `RE_STEP` more.
 fn record_values(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    re: f64,
-    bump: Option<usize>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], re: f64, bump: Option<usize>,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let groups = match model.n_kappa {
         0 => 1,
@@ -2117,11 +1919,7 @@ fn record_values(
 /// [`record_values`] at explicit random effects: `eta`, and `kappa` per
 /// occasion group in [`crate::stats::likelihood::iov_occasion_groups`] order.
 fn values_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappa: &[Vec<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let mult = model.ruv_obs_mult(subject, theta).unwrap_or_default();
     (predictions_at(model, subject, theta, eta, kappa), mult)
@@ -2129,11 +1927,7 @@ fn values_at(
 
 /// The predictions of [`values_at`] alone.
 fn predictions_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappa: &[Vec<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> Vec<f64> {
     if model.n_kappa > 0 {
         crate::pk::predict_iov(model, subject, theta, eta, kappa)
@@ -2154,11 +1948,7 @@ fn predictions_at(
 /// likelihood substitutes a constant there, which no level reaches, so the
 /// random effect's 2 on it is the guard's and not the model's (#1879 review, F1).
 fn residual_values(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    pred: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], pred: &[f64],
 ) -> Vec<f64> {
     let params = &model.default_params;
     let (sigma, correlations) = (&params.sigma.values, &params.residual_correlations);
@@ -2170,21 +1960,15 @@ fn residual_values(
             let m = mult.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice);
             let cmt = model.error_spec.obs_key(subject, j);
             let raw = match m {
-                Some(m) => model
-                    .error_spec
-                    .variance_at_scaled_raw(cmt, f, sigma, correlations, m),
+                Some(m) => model.error_spec.variance_at_scaled_raw(cmt, f, sigma, correlations, m),
                 None => {
-                    model
-                        .error_spec
-                        .variance_at_with_correlations_raw(cmt, f, sigma, correlations)
+                    model.error_spec.variance_at_with_correlations_raw(cmt, f, sigma, correlations)
                 }
             };
             if crate::stats::residual_error::variance_is_guarded(raw) {
                 return 0.0;
             }
-            model
-                .sim_residual_variance(subject, j, f, sigma, correlations, scale, m)
-                .ln()
+            model.sim_residual_variance(subject, j, f, sigma, correlations, scale, m).ln()
         })
         .collect()
 }
@@ -2193,11 +1977,7 @@ fn residual_values(
 /// class of a mixture in turn, as the likelihood scores them (#2421 review),
 /// so a random effect is held only where every class holds it.
 fn mean_values(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappa: &[Vec<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> Vec<f64> {
     let Some(spec) = &model.mixture else {
         return predictions_at(model, subject, theta, eta, kappa);
@@ -2224,11 +2004,7 @@ fn mean_values(
 /// alone. A diffusion variance θ moves the EKF variance alone, so it has a
 /// column of its own there.
 fn likelihood_values(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappa: &[Vec<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> Vec<f64> {
     // Everything a class can change, evaluated under that class as the
     // production likelihood scores it (#2421 review, round 2).
@@ -2289,10 +2065,7 @@ fn likelihood_values(
 /// non-Gaussian endpoint.
 #[allow(unused_variables)]
 fn non_gaussian_record_values(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     #[cfg(feature = "survival")]
     if model.has_non_gaussian() && !subject.obs_records.is_empty() {
@@ -2323,9 +2096,7 @@ fn non_gaussian_record_values(
 /// record when `None`), every value finite. A non-finite value is not an
 /// agreement: it measures nothing.
 fn same_records(
-    a: &(Vec<f64>, Vec<Vec<f64>>),
-    b: &(Vec<f64>, Vec<Vec<f64>>),
-    rows: Option<&[usize]>,
+    a: &(Vec<f64>, Vec<Vec<f64>>), b: &(Vec<f64>, Vec<Vec<f64>>), rows: Option<&[usize]>,
 ) -> bool {
     let same = |x: &f64, y: &f64| x.is_finite() && y.is_finite() && x.to_bits() == y.to_bits();
     if a.0.len() != b.0.len() || a.1.len() != b.1.len() {
@@ -2357,12 +2128,7 @@ fn same_records(
 /// The level indices (1-based) a subject's records carry for `column`, on
 /// every kind of record: a level's θ is read by exactly these subjects.
 fn indices_read(subject: &Subject, column: &str) -> Vec<f64> {
-    let mut out: Vec<f64> = subject
-        .covariates
-        .get(column)
-        .copied()
-        .into_iter()
-        .collect();
+    let mut out: Vec<f64> = subject.covariates.get(column).copied().into_iter().collect();
     for maps in [
         &subject.obs_covariates,
         &subject.dose_covariates,
@@ -2452,9 +2218,7 @@ fn probe_etas(re: f64, n_eta: usize) -> Vec<f64> {
 /// direction for the data to estimate. Shared by [`dead_levels`] and
 /// [`spanned`], so the two checks read the same levels (#1874 review, F12).
 fn free_level_thetas(
-    model: &CompiledModel,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
+    model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level],
 ) -> Vec<Option<usize>> {
     let p = &model.default_params;
     level_theta_indices(model, decl, levels)
@@ -2466,9 +2230,7 @@ fn free_level_thetas(
 /// [`free_level_thetas`] with the `FIX` levels kept: `None` only for a level
 /// with no θ in `model`.
 fn level_theta_indices(
-    model: &CompiledModel,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
+    model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level],
 ) -> Vec<Option<usize>> {
     levels
         .iter()
@@ -2497,35 +2259,22 @@ fn level_theta_indices(
 /// summed into an objective under a tiny step: a live level whose effect is
 /// small against the rest of `y` must still move its own record.
 fn dead_levels(
-    model: &CompiledModel,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    population: &Population,
+    model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
 ) -> DeadLevels {
     let p = &model.default_params;
     let points = probe_points(model);
     let column = level_index_column(decl.name());
-    let readers: Vec<Vec<f64>> = population
-        .subjects
-        .iter()
-        .map(|s| indices_read(s, &column))
-        .collect();
+    let readers: Vec<Vec<f64>> =
+        population.subjects.iter().map(|s| indices_read(s, &column)).collect();
     let base: Vec<Vec<_>> = points
         .iter()
         .map(|(th, re)| {
-            population
-                .subjects
-                .iter()
-                .map(|s| record_values(model, s, th, *re, None))
-                .collect()
+            population.subjects.iter().map(|s| record_values(model, s, th, *re, None)).collect()
         })
         .collect();
 
     let mut out = DeadLevels::default();
-    for (i, theta_k) in free_level_thetas(model, decl, levels)
-        .into_iter()
-        .enumerate()
-    {
+    for (i, theta_k) in free_level_thetas(model, decl, levels).into_iter().enumerate() {
         let Some(k) = theta_k else {
             continue;
         };
@@ -2601,12 +2350,8 @@ const SPAN_STEP: f64 = 1e-5;
 /// stacked under its predictions, and so do the levels it is compared with
 /// (#1879, [`residual_values`]).
 fn record_diffs(plus: &[f64], minus: &[f64], h: f64) -> Option<Vec<f64>> {
-    (plus.len() == minus.len()).then(|| {
-        plus.iter()
-            .zip(minus)
-            .map(|(a, b)| (a - b) / (2.0 * h))
-            .collect()
-    })
+    (plus.len() == minus.len())
+        .then(|| plus.iter().zip(minus).map(|(a, b)| (a - b) / (2.0 * h)).collect())
 }
 
 /// `‖g − P g‖ / ‖g‖`, `P` the orthogonal projection onto the span of `cols`;
@@ -2719,10 +2464,7 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// A random effect inside those is [`Span::Within`], absorbed under every
 /// contrast; one only inside the full span is [`Span::Levels`].
 fn spanned(
-    model: &CompiledModel,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    population: &Population,
+    model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
     silent: &[(usize, Unit)],
 ) -> Vec<Option<Absorption>> {
     let tree = model.nested_levels();
@@ -2747,15 +2489,9 @@ fn spanned(
     let mut partnered: Vec<bool> = vec![false; silent.len()];
     // Per silent random effect: whether it is the engine's random effect on the
     // residual error (#1879), measured in the residual channel as well.
-    let on_ruv: Vec<bool> = silent
-        .iter()
-        .map(|&(k, _)| model.residual_error_eta == Some(k))
-        .collect();
-    let channels: &[bool] = if on_ruv.contains(&true) {
-        &[false, true]
-    } else {
-        &[false]
-    };
+    let on_ruv: Vec<bool> =
+        silent.iter().map(|&(k, _)| model.residual_error_eta == Some(k)).collect();
+    let channels: &[bool] = if on_ruv.contains(&true) { &[false, true] } else { &[false] };
     for (theta, re) in probe_points(model) {
         if holds.iter().all(|h| !h) {
             break;
@@ -2803,10 +2539,7 @@ fn spanned(
             };
             // Per channel, the central difference of `at` between two points.
             let diffs_of = |plus: Vec<Vec<f64>>, minus: Vec<Vec<f64>>, h: f64| {
-                plus.iter()
-                    .zip(&minus)
-                    .map(|(p, m)| record_diffs(p, m, h))
-                    .collect::<Vec<_>>()
+                plus.iter().zip(&minus).map(|(p, m)| record_diffs(p, m, h)).collect::<Vec<_>>()
             };
             let n_obs = subject.obs_times.len();
             let level_of = |j: usize| {
@@ -2867,11 +2600,7 @@ fn spanned(
                         ka_down[g][k - model.n_eta] -= SPAN_STEP;
                     }
                 }
-                diffs_of(
-                    at(&theta, &eta_up, &ka_up),
-                    at(&theta, &eta_down, &ka_down),
-                    SPAN_STEP,
-                )
+                diffs_of(at(&theta, &eta_up, &ka_up), at(&theta, &eta_down, &ka_down), SPAN_STEP)
             };
             // The units of `unit` in this subject: those its records lie in,
             // in record order, then every other κ group of its layout — a
@@ -3015,11 +2744,7 @@ fn spanned(
         if !holds[s] {
             continue;
         }
-        let span = if within[s] {
-            Span::Within
-        } else {
-            Span::Levels
-        };
+        let span = if within[s] { Span::Within } else { Span::Levels };
         // The partners: the others of its unit absorbed with it, or failing
         // that every other silent random effect there.
         let with = if partnered[s] {
@@ -3040,11 +2765,7 @@ fn spanned(
         } else {
             Vec::new()
         };
-        out[k] = Some(Absorption {
-            span,
-            with,
-            residual: on_ruv[s],
-        });
+        out[k] = Some(Absorption { span, with, residual: on_ruv[s] });
     }
     out
 }
@@ -3070,19 +2791,13 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
 /// cell, so every cell of one group reads the same value: the probe is a point
 /// the model can take, where a study's κ is one number shared by its arms.
 fn subject_probe_res(
-    re: f64,
-    model: &CompiledModel,
-    cells: Option<&NestedLayout>,
-    n_groups: usize,
+    re: f64, model: &CompiledModel, cells: Option<&NestedLayout>, n_groups: usize,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let (eta, mut kappa) = probe_res(re, model, n_groups.max(1));
     let (Some(levels), Some(cells)) = (model.nested_levels(), cells) else {
         return (eta, kappa);
     };
-    let widest = (0..levels.levels.len())
-        .map(|l| cells.level_count(l))
-        .max()
-        .unwrap_or(1);
+    let widest = (0..levels.levels.len()).map(|l| cells.level_count(l)).max().unwrap_or(1);
     let (_, by_group) = probe_res(re, model, widest.max(1));
     for (g, row) in kappa.iter_mut().enumerate().take(cells.n_cells()) {
         for (q, v) in row.iter_mut().enumerate() {
@@ -3100,9 +2815,7 @@ fn subject_probe_res(
 /// (#1082), a cell with no observation in it too. Empty when the key names no
 /// group.
 fn unit_groups(
-    layout: &crate::stats::stacked_layout::StackedLayout,
-    cells: Option<&NestedLayout>,
-    unit: Unit,
+    layout: &crate::stats::stacked_layout::StackedLayout, cells: Option<&NestedLayout>, unit: Unit,
     key: &[u64],
 ) -> Vec<usize> {
     match unit {
@@ -3129,10 +2842,7 @@ fn unit_groups(
 /// nested levels the cells of each group of the kappa's level. `None` for a
 /// nested model whose subject has no cells, which measures nothing.
 fn kappa_units(
-    model: &CompiledModel,
-    cells: Option<&NestedLayout>,
-    n_groups: usize,
-    q: usize,
+    model: &CompiledModel, cells: Option<&NestedLayout>, n_groups: usize, q: usize,
 ) -> Option<Vec<Vec<usize>>> {
     let Some(levels) = model.nested_levels() else {
         return Some((0..n_groups.max(1)).map(|g| vec![g]).collect());
@@ -3141,9 +2851,7 @@ fn kappa_units(
     Some(
         (0..cells.level_count(l))
             .map(|group| {
-                (0..cells.n_cells())
-                    .filter(|&g| cells.cell_group(g, l) == group)
-                    .collect()
+                (0..cells.n_cells()).filter(|&g| cells.cell_group(g, l) == group).collect()
             })
             .collect(),
     )
@@ -3232,7 +2940,7 @@ fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
 /// `(t, misfit)` pairs. A dropped column lies in the span to [`DROP_TOL`] of its
 /// norm, so a representable combination leaves a misfit of that order; one that
 /// is not leaves one of the order of the functional. Measured over the 2464
-/// bases the `api::levels` tests build in [`carried`], macOS arm64 debug: a
+/// bases the `levels` tests build in [`carried`], macOS arm64 debug: a
 /// representable combination reaches at most 4.2e-11, one that is not at least
 /// 8.5e-2; the constant sits 4.4 decades above the one and 4.9 below the other.
 /// In the same run the loose rank count's direction test ([`SPAN_TOL`] on a
@@ -3331,10 +3039,7 @@ impl BlockBasis {
     /// a group that crosses subjects has at least one population-wide
     /// difference column, so `T` never costs more than those did.
     fn grouped(
-        cols: &[Pieces],
-        groups: &[Option<usize>],
-        lens: &[usize],
-        offsets: &[usize],
+        cols: &[Pieces], groups: &[Option<usize>], lens: &[usize], offsets: &[usize],
     ) -> Self {
         // Per group: its last column, and whether every column sits on one
         // subject (a zero column sits anywhere).
@@ -3372,10 +3077,7 @@ impl BlockBasis {
 
     /// [`BlockBasis::grouped`] with every group taken through `T`.
     fn grouped_raw(
-        cols: &[Pieces],
-        groups: &[Option<usize>],
-        lens: &[usize],
-        offsets: &[usize],
+        cols: &[Pieces], groups: &[Option<usize>], lens: &[usize], offsets: &[usize],
     ) -> Self {
         let n_rows: usize = lens.iter().sum();
         let norm_of = |c: &Pieces| c.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
@@ -3455,12 +3157,7 @@ impl BlockBasis {
             if added.is_some() {
                 dense.push(v.into_iter().map(|x| x / n).collect());
             }
-            taken.push(Taken {
-                coefs,
-                added,
-                norm: c_norm,
-                group: groups[j],
-            });
+            taken.push(Taken { coefs, added, norm: c_norm, group: groups[j] });
         }
         let mut basis = BlockBasis {
             local,
@@ -3483,11 +3180,7 @@ impl BlockBasis {
     /// `T` (see [`BlockBasis`]) and the grouped columns' shift of
     /// [`BlockBasis::aliased`], from the columns as Gram–Schmidt `taken` them.
     fn remove_groups(
-        &mut self,
-        cols: &[Pieces],
-        groups: &[Option<usize>],
-        taken: &[Taken],
-        dense_at: usize,
+        &mut self, cols: &[Pieces], groups: &[Option<usize>], taken: &[Taken], dense_at: usize,
     ) {
         let dim = dense_at + self.dense.len();
         // Per group, in order of first appearance: its columns.
@@ -3511,20 +3204,16 @@ impl BlockBasis {
         let mut shift: isize = 0;
         for (_, js) in &members {
             let last = &cols[*js.last().expect("a group has a column")];
-            let coded = js[..js.len() - 1]
-                .iter()
-                .filter(|&&j| !pieces_equal(&cols[j], last))
-                .count();
+            let coded =
+                js[..js.len() - 1].iter().filter(|&&j| !pieces_equal(&cols[j], last)).count();
             let raw = js.iter().filter(|&&j| nonzero(&cols[j])).count();
             shift += coded as isize - raw as isize;
         }
         // A group with a zero column leaves its constraint nothing to act on:
         // that column's equation forces `λ_g = 0`, and the group removes no
         // direction.
-        let live: Vec<&(usize, Vec<usize>)> = members
-            .iter()
-            .filter(|(_, js)| js.iter().all(|&j| nonzero(&cols[j])))
-            .collect();
+        let live: Vec<&(usize, Vec<usize>)> =
+            members.iter().filter(|(_, js)| js.iter().all(|&j| nonzero(&cols[j]))).collect();
         #[cfg(test)]
         {
             self.joint = live.len();
@@ -3538,11 +3227,7 @@ impl BlockBasis {
             let mut misfit = Vec::new();
             for col in taken {
                 let rhs = if col.group == Some(*g) { 1.0 } else { 0.0 };
-                let acc: f64 = col
-                    .coefs
-                    .iter()
-                    .map(|(at, c)| dot(c, &t[*at..*at + c.len()]))
-                    .sum();
+                let acc: f64 = col.coefs.iter().map(|(at, c)| dot(c, &t[*at..*at + c.len()])).sum();
                 match col.added {
                     Some((k, n)) => t[k] = (rhs - acc) / n,
                     None => misfit.push((acc - rhs) / col.norm),
@@ -3605,11 +3290,7 @@ impl BlockBasis {
             let d = &cols[*js.last().expect("a group has a column")];
             let d_norm = d.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
             let (coords, _) = self.project(d);
-            let mut s: Vec<f64> = self
-                .removed
-                .iter()
-                .map(|t| dot_coords(t, &coords))
-                .collect();
+            let mut s: Vec<f64> = self.removed.iter().map(|t| dot_coords(t, &coords)).collect();
             project_out(&mut s, &held);
             let n = dot(&s, &s).sqrt();
             if n >= SPAN_TOL * d_norm {
@@ -3629,10 +3310,7 @@ impl BlockBasis {
         let mut r = vec![0.0; self.n_rows];
         for (s, piece) in z {
             let mut piece = piece.clone();
-            coords.push((
-                self.local_at[*s],
-                project_out_coefs(&mut piece, &self.local[*s]),
-            ));
+            coords.push((self.local_at[*s], project_out_coefs(&mut piece, &self.local[*s])));
             r[self.offsets[*s]..self.offsets[*s] + piece.len()].copy_from_slice(&piece);
         }
         let dense_at =
@@ -3662,11 +3340,7 @@ impl BlockBasis {
             return None;
         }
         let (coords, r) = self.project(z);
-        let removed: f64 = self
-            .removed
-            .iter()
-            .map(|t| dot_coords(t, &coords).powi(2))
-            .sum();
+        let removed: f64 = self.removed.iter().map(|t| dot_coords(t, &coords).powi(2)).sum();
         Some((dot(&r, &r) + removed).sqrt() / z_norm)
     }
 }
@@ -3681,10 +3355,7 @@ fn coded_differences(cols: &[Pieces], groups: &[Option<usize>]) -> Vec<Pieces> {
         match g {
             None => out.push(c.clone()),
             Some(g) => {
-                let last = (0..cols.len())
-                    .rev()
-                    .find(|&k| groups[k] == Some(*g))
-                    .unwrap();
+                let last = (0..cols.len()).rev().find(|&k| groups[k] == Some(*g)).unwrap();
                 if j != last {
                     out.push(pieces_minus(c, &cols[last]));
                 }
@@ -3711,10 +3382,7 @@ fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
 /// the coded model is full rank. Only a count the grouped basis already found
 /// nonzero pays for the difference columns, which cross subjects (#1962).
 fn coded_aliased(
-    cols: &[Pieces],
-    tags: &[Option<usize>],
-    lens: &[usize],
-    offsets: &[usize],
+    cols: &[Pieces], tags: &[Option<usize>], lens: &[usize], offsets: &[usize],
 ) -> usize {
     match BlockBasis::grouped(cols, tags, lens, offsets).aliased() {
         n if n == 0 || tags.iter().all(Option::is_none) => n,
@@ -3752,7 +3420,7 @@ fn coded_aliased(
 /// initialised at 0 that switches the intercept off at the initial estimates
 /// is seen at the moved point.
 ///
-/// Measured over every call the `api::levels` tests make, macOS arm64 debug:
+/// Measured over every call the `levels` tests make, macOS arm64 debug:
 /// a unit set the verdict holds on reaches at most 2.1e-10 (its largest unit
 /// residual; `a_common_factor_does_not_count_in_a_parameter_funnel` under
 /// `ref`), an identified one at least 1.4e-2 (the kappa twin of
@@ -3767,7 +3435,7 @@ fn coded_aliased(
 /// Each coded column must keep at least [`SPAN_TOL`] of its norm against the
 /// other θ and the coded columns before it, counted on the basis the residual
 /// is measured in, beyond any deficiency the other θ have among themselves.
-/// Measured over every guard the `api::levels` tests reach (2334 with the
+/// Measured over every guard the `levels` tests reach (2334 with the
 /// two-block tests of #1963, macOS arm64 debug): an aliased column keeps at most 1.3e-9 of its norm, an independent
 /// one at least 3.4e-4, so [`SPAN_TOL`] sits 2.9 decades above the one and 2.5
 /// below the other. Under sum-to-zero the count is taken on the raw levels and
@@ -3883,11 +3551,8 @@ impl Probe<'_> {
     /// `point` (θ, and the spread around which the random effects sit) on
     /// `population`.
     fn at<'a>(
-        model: &CompiledModel,
-        population: &'a Population,
-        (theta, re): (Vec<f64>, f64),
-        lens: &'a [usize],
-        values: &'a Values<'a>,
+        model: &CompiledModel, population: &'a Population, (theta, re): (Vec<f64>, f64),
+        lens: &'a [usize], values: &'a Values<'a>,
     ) -> Probe<'a> {
         let res = population
             .subjects
@@ -3898,13 +3563,7 @@ impl Probe<'_> {
                 subject_probe_res(re, model, cell.as_ref(), layout.n_groups())
             })
             .collect();
-        Probe {
-            population,
-            theta,
-            res,
-            lens,
-            values,
-        }
+        Probe { population, theta, res, lens, values }
     }
 
     /// One population-wide column: per subject, the central difference of
@@ -3912,9 +3571,7 @@ impl Probe<'_> {
     /// effects by ±h, kept where it is not exactly zero; `None` when anything
     /// is non-finite.
     fn diff_col(
-        &self,
-        subjects: &[usize],
-        h: f64,
+        &self, subjects: &[usize], h: f64,
         perturb: &dyn Fn(f64, &mut Vec<f64>, &mut Vec<f64>, &mut Vec<Vec<f64>>),
     ) -> Option<Pieces> {
         let mut col = Pieces::new();
@@ -3947,9 +3604,7 @@ impl Probe<'_> {
     /// Per level of `decl`, its θ's column (`None` for a level with no θ in
     /// `all_thetas`), taken over the subjects that read it.
     fn level_cols(
-        &self,
-        decl: &LevelBlockDecl,
-        all_thetas: &[Option<usize>],
+        &self, decl: &LevelBlockDecl, all_thetas: &[Option<usize>],
     ) -> Option<Vec<Option<Pieces>>> {
         let column = level_index_column(decl.name());
         // Per level, the subjects that read it.
@@ -3972,8 +3627,7 @@ impl Probe<'_> {
                 None => Some(None),
                 Some(k) => {
                     let h = SPAN_STEP * self.theta[k].abs().max(1.0);
-                    self.diff_col(readers, h, &|d, th, _, _| th[k] += d)
-                        .map(Some)
+                    self.diff_col(readers, h, &|d, th, _, _| th[k] += d).map(Some)
                 }
             })
             .collect()
@@ -3993,10 +3647,7 @@ impl Probe<'_> {
 /// `−last` there would add a column for a θ that does not exist. `None` when
 /// a dependent level has no column.
 fn code_levels(
-    raw: &[Option<Pieces>],
-    free: &[bool],
-    groups: &[usize],
-    contrast: LevelContrast,
+    raw: &[Option<Pieces>], free: &[bool], groups: &[usize], contrast: LevelContrast,
 ) -> Option<Vec<(Pieces, Option<usize>)>> {
     let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
     let last = |i: usize| i + 1 == groups.len() || groups[i + 1] != groups[i];
@@ -4035,9 +3686,7 @@ fn code_levels(
 /// Append a block's coded columns to `cols`, numbering its sum-to-zero groups
 /// after every group already in `tags`.
 fn push_coded(
-    coded: Vec<(Pieces, Option<usize>)>,
-    cols: &mut Vec<Pieces>,
-    tags: &mut Vec<Option<usize>>,
+    coded: Vec<(Pieces, Option<usize>)>, cols: &mut Vec<Pieces>, tags: &mut Vec<Option<usize>>,
 ) {
     let base = tags.iter().flatten().map(|g| g + 1).max().unwrap_or(0);
     for (c, g) in coded {
@@ -4049,9 +3698,7 @@ fn push_coded(
 /// Per subject, how many `values` it gives at the initial estimates, and the
 /// offset of its first one in a population-wide column.
 fn value_lens(
-    model: &CompiledModel,
-    population: &Population,
-    values: &Values,
+    model: &CompiledModel, population: &Population, values: &Values,
 ) -> (Vec<usize>, Vec<usize>) {
     let lens: Vec<usize> = population
         .subjects
@@ -4094,14 +3741,8 @@ fn value_lens(
 /// ([`RankColumns`]) reads every likelihood value instead.
 #[allow(clippy::too_many_arguments)]
 fn carried(
-    model: &CompiledModel,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    population: &Population,
-    name: &str,
-    kappa: bool,
-    contrast: LevelContrast,
-    others: &[Coded],
+    model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
+    name: &str, kappa: bool, contrast: LevelContrast, others: &[Coded],
 ) -> Carried {
     let index = match kappa {
         false => model.eta_names.iter().position(|n| n == name),
@@ -4113,20 +3754,12 @@ fn carried(
     let level_thetas = free_level_thetas(model, decl, levels);
     let all_level_thetas = level_theta_indices(model, decl, levels);
     // The θ that enter coded: this block's, and every block's in `others`.
-    let other_levels: Vec<Vec<Option<usize>>> = others
-        .iter()
-        .map(|o| free_level_thetas(model, o.decl, o.levels))
-        .collect();
-    let other_all_levels: Vec<Vec<Option<usize>>> = others
-        .iter()
-        .map(|o| level_theta_indices(model, o.decl, o.levels))
-        .collect();
-    let coded: Vec<usize> = level_thetas
-        .iter()
-        .chain(other_levels.iter().flatten())
-        .flatten()
-        .copied()
-        .collect();
+    let other_levels: Vec<Vec<Option<usize>>> =
+        others.iter().map(|o| free_level_thetas(model, o.decl, o.levels)).collect();
+    let other_all_levels: Vec<Vec<Option<usize>>> =
+        others.iter().map(|o| level_theta_indices(model, o.decl, o.levels)).collect();
+    let coded: Vec<usize> =
+        level_thetas.iter().chain(other_levels.iter().flatten()).flatten().copied().collect();
     let p = &model.default_params;
     let other_thetas: Vec<usize> = (0..model.n_theta)
         .filter(|k| !p.theta_fixed.get(*k).copied().unwrap_or(false) && !coded.contains(k))
@@ -4168,11 +3801,8 @@ fn carried(
             .iter()
             .map(|s| crate::stats::stacked_layout::StackedLayout::of(model, s))
             .collect();
-        let cells: Vec<Option<NestedLayout>> = population
-            .subjects
-            .iter()
-            .map(|s| NestedLayout::of(model, s))
-            .collect();
+        let cells: Vec<Option<NestedLayout>> =
+            population.subjects.iter().map(|s| NestedLayout::of(model, s)).collect();
         let probe = Probe::at(model, population, point, &lens, &values);
 
         // The columns, and per column its sum-to-zero group, numbered across
@@ -4201,14 +3831,9 @@ fn carried(
             other_ranges.push(at..cols.len());
         }
         let n_other = cols.len();
-        let Some(own_coded) = code(
-            &probe,
-            decl,
-            &level_thetas,
-            &all_level_thetas,
-            &groups,
-            contrast,
-        ) else {
+        let Some(own_coded) =
+            code(&probe, decl, &level_thetas, &all_level_thetas, &groups, contrast)
+        else {
             held = true;
             unmeasured = true;
             continue;
@@ -4266,10 +3891,7 @@ fn carried(
         // columns `keep` leaves.
         let excess = |keep: &dyn Fn(usize) -> bool| -> usize {
             let pick = |n: usize| -> (Vec<Pieces>, Vec<Option<usize>>) {
-                (0..n)
-                    .filter(|&i| keep(i))
-                    .map(|i| (cols[i].clone(), tags[i]))
-                    .unzip()
+                (0..n).filter(|&i| keep(i)).map(|i| (cols[i].clone(), tags[i])).unzip()
             };
             let (all_c, all_t) = pick(cols.len());
             let (oth_c, oth_t) = pick(n_other);
@@ -4312,10 +3934,7 @@ fn carried(
             let mut removed = vec![true; members.len()];
             let without = |removed: &[bool]| {
                 excess(&|i| {
-                    !members
-                        .iter()
-                        .zip(removed)
-                        .any(|((_, range), &r)| r && range.contains(&i))
+                    !members.iter().zip(removed).any(|((_, range), &r)| r && range.contains(&i))
                 })
             };
             // Whether removing every member gives the rank back: when not —
@@ -4465,26 +4084,16 @@ struct RankColumns {
 
 impl RankColumns {
     fn measure(
-        model: &CompiledModel,
-        decls: &[LevelBlockDecl],
-        discovered: &[Vec<Level>],
+        model: &CompiledModel, decls: &[LevelBlockDecl], discovered: &[Vec<Level>],
         population: &Population,
     ) -> Self {
         let p = &model.default_params;
-        let all_levels: Vec<Vec<Option<usize>>> = decls
-            .iter()
-            .zip(discovered)
-            .map(|(d, l)| level_theta_indices(model, d, l))
-            .collect();
+        let all_levels: Vec<Vec<Option<usize>>> =
+            decls.iter().zip(discovered).map(|(d, l)| level_theta_indices(model, d, l)).collect();
         let free: Vec<Vec<bool>> = decls
             .iter()
             .zip(discovered)
-            .map(|(d, l)| {
-                free_level_thetas(model, d, l)
-                    .iter()
-                    .map(Option::is_some)
-                    .collect()
-            })
+            .map(|(d, l)| free_level_thetas(model, d, l).iter().map(Option::is_some).collect())
             .collect();
         let in_block: Vec<usize> = all_levels.iter().flatten().flatten().copied().collect();
         let thetas: Vec<usize> = (0..model.n_theta)
@@ -4498,10 +4107,8 @@ impl RankColumns {
             .into_iter()
             .map(|point| {
                 let probe = Probe::at(model, population, point, &lens, &values);
-                let theta_cols = thetas
-                    .iter()
-                    .map(|&k| probe.theta_col(k))
-                    .collect::<Option<Vec<_>>>()?;
+                let theta_cols =
+                    thetas.iter().map(|&k| probe.theta_col(k)).collect::<Option<Vec<_>>>()?;
                 let level_cols = decls
                     .iter()
                     .zip(&all_levels)
@@ -4510,13 +4117,7 @@ impl RankColumns {
                 Some((theta_cols, level_cols))
             })
             .collect();
-        RankColumns {
-            points,
-            thetas,
-            free,
-            lens,
-            offsets,
-        }
+        RankColumns { points, thetas, free, lens, offsets }
     }
 
     /// Every member, in order: the free θ outside the blocks, then the blocks.
@@ -4567,10 +4168,8 @@ impl RankColumns {
         }
         // The coded columns proper — a grouped column taken against its
         // group's last — and how many of them are zero at every point.
-        let diffs: Vec<Vec<Pieces>> = per_point
-            .iter()
-            .map(|(c, t)| coded_differences(c, t))
-            .collect();
+        let diffs: Vec<Vec<Pieces>> =
+            per_point.iter().map(|(c, t)| coded_differences(c, t)).collect();
         let width = diffs.first().map_or(0, Vec::len);
         let dead = (0..width)
             .filter(|&j| diffs.iter().all(|d| d.get(j).is_none_or(Vec::is_empty)))
@@ -4581,10 +4180,7 @@ impl RankColumns {
             .map(|((cols, tags), diffs)| {
                 // A zero grouped raw column is no zero coded one, which the
                 // grouped count does not tell apart: count on the differences.
-                let grouped_zero = cols
-                    .iter()
-                    .zip(tags)
-                    .any(|(c, t)| t.is_some() && c.is_empty());
+                let grouped_zero = cols.iter().zip(tags).any(|(c, t)| t.is_some() && c.is_empty());
                 let aliased = match grouped_zero {
                     true => BlockBasis::new(diffs, &self.lens, &self.offsets).aliased(),
                     false => coded_aliased(cols, tags, &self.lens, &self.offsets),
@@ -4709,9 +4305,7 @@ struct Measured {
 /// together over every spelling.
 fn lagged_arrivals(model: &CompiledModel) -> bool {
     model.has_lagtime()
-        || model
-            .dose_attr_map
-            .has_indexed_attr(crate::types::DoseAttr::Lag)
+        || model.dose_attr_map.has_indexed_attr(crate::types::DoseAttr::Lag)
         || model.has_route_absorption_lag()
 }
 
@@ -4723,10 +4317,7 @@ fn lagged_arrivals(model: &CompiledModel) -> bool {
 /// names each random effect some class moves with it. Without a mixture,
 /// [`spanned`] itself.
 fn spanned_per_class(
-    model: &CompiledModel,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    population: &Population,
+    model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
     silent: &[(usize, Unit)],
 ) -> Vec<Option<Absorption>> {
     let Some(spec) = &model.mixture else {
@@ -4769,10 +4360,7 @@ fn spanned_per_class(
 /// likelihood reads a channel the check does not compare is not measured:
 /// every block comes back with no dead level and no measured absorption.
 fn measure_levels(
-    base: &ParseBindings,
-    model_text: &str,
-    decls: &[LevelBlockDecl],
-    discovered: &[Vec<Level>],
+    base: &ParseBindings, model_text: &str, decls: &[LevelBlockDecl], discovered: &[Vec<Level>],
     population: &Population,
 ) -> Result<Vec<Measured>, String> {
     let mut none = base.clone();
@@ -4842,10 +4430,7 @@ enum DeadFailure {
 /// level per group under sum-to-zero, are coded through the other levels, so a
 /// dead one there loses nothing.
 fn dead_failure(
-    groups: &[usize],
-    contrast: LevelContrast,
-    dead: &DeadLevels,
-    absorbed: Option<&Absorbed>,
+    groups: &[usize], contrast: LevelContrast, dead: &DeadLevels, absorbed: Option<&Absorbed>,
 ) -> Option<DeadFailure> {
     if dead.dead.is_empty() {
         return None;
@@ -4867,12 +4452,8 @@ fn dead_failure(
     }
     if contrast == LevelContrast::SumToZeroWithin {
         if let Some(found) = absorbed {
-            let slack: Vec<usize> = dead
-                .dead
-                .iter()
-                .copied()
-                .filter(|&i| !dead.reads(i, found.name()))
-                .collect();
+            let slack: Vec<usize> =
+                dead.dead.iter().copied().filter(|&i| !dead.reads(i, found.name())).collect();
             if !slack.is_empty() {
                 return Some(DeadFailure::Slack(slack));
             }
@@ -4891,14 +4472,8 @@ const DEAD_LABELS_SHOWN: usize = 5;
 /// listed level holds only records at `TIME = 0`.
 #[allow(clippy::too_many_arguments)]
 fn dead_levels_message(
-    block: &str,
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    dead: &DeadLevels,
-    failure: &DeadFailure,
-    contrast: LevelContrast,
-    alt: Option<LevelContrast>,
-    absorbed: Option<&Absorbed>,
+    block: &str, decl: &LevelBlockDecl, levels: &[Level], dead: &DeadLevels, failure: &DeadFailure,
+    contrast: LevelContrast, alt: Option<LevelContrast>, absorbed: Option<&Absorbed>,
     population: &Population,
 ) -> String {
     if dead.dead.len() == levels.len() {
@@ -4940,17 +4515,11 @@ fn dead_levels_message(
         )),
         _ => message.push_str(" That leaves θ the data cannot estimate under any contrast."),
     }
-    let listed_values: Vec<&[f64]> = listed
-        .iter()
-        .map(|&i| levels[i].values.as_slice())
-        .collect();
+    let listed_values: Vec<&[f64]> = listed.iter().map(|&i| levels[i].values.as_slice()).collect();
     let at_time_zero = population.subjects.iter().all(|subject| {
         (0..subject.obs_times.len()).all(|j| {
-            let values: Option<Vec<f64>> = decl
-                .columns()
-                .iter()
-                .map(|c| column_value(subject, c, j))
-                .collect();
+            let values: Option<Vec<f64>> =
+                decl.columns().iter().map(|c| column_value(subject, c, j)).collect();
             let is_listed = values.is_some_and(|v| listed_values.contains(&v.as_slice()));
             // The message names `TIME = 0` as written (#1959).
             !is_listed || subject.readout_time(j) == 0.0
@@ -5001,10 +4570,7 @@ fn dead_levels_message(
 /// [`bind_levels_on_data`] resolves first and which never reads the
 /// certificate; for an absorbing block, the blocks resolved that way (#1963).
 fn resolve_contrast(
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    measured: &Measured,
-    population: &Population,
+    decl: &LevelBlockDecl, levels: &[Level], measured: &Measured, population: &Population,
     others: Option<&[Coded]>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
@@ -5021,17 +4587,9 @@ fn resolve_contrast(
     // unit; so each is resolved on its own, as when within parts them.
     let combined = decl.columns().len() >= 2 && absorbed.iter().all(Absorbed::combined);
     if !combined
-        && !within_parts_them(
-            decl,
-            levels,
-            &absorbed,
-            population,
-            measured.nested.as_ref(),
-        )
+        && !within_parts_them(decl, levels, &absorbed, population, measured.nested.as_ref())
     {
-        return Err(jointly_absorbed_message(
-            &block, decl, &absorbed, population,
-        ));
+        return Err(jointly_absorbed_message(&block, decl, &absorbed, population));
     }
     let mut resolved = None;
     for one in absorbed {
@@ -5045,10 +4603,7 @@ fn resolve_contrast(
 /// `sum_to_zero`, `sum_to_zero_within` (a nested block only), `ref`, `none` —
 /// each leaving a free θ and carrying the block's dead levels (#2421).
 fn alternatives(
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    measured: &Measured,
-    current: LevelContrast,
+    decl: &LevelBlockDecl, levels: &[Level], measured: &Measured, current: LevelContrast,
 ) -> Vec<LevelContrast> {
     let nested = decl.columns().len() >= 2;
     [
@@ -5075,12 +4630,8 @@ fn alternatives(
 /// A move that lowers nothing is not made. An absorbing block keeps the
 /// contrast its certificate resolved it to. Whether any block moved.
 fn settle_auto(
-    rank: &RankColumns,
-    decls: &[LevelBlockDecl],
-    discovered: &[Vec<Level>],
-    measured: &[Measured],
-    absorbing: &[bool],
-    layout: &mut [(LevelContrast, Vec<usize>)],
+    rank: &RankColumns, decls: &[LevelBlockDecl], discovered: &[Vec<Level>], measured: &[Measured],
+    absorbing: &[bool], layout: &mut [(LevelContrast, Vec<usize>)],
 ) -> bool {
     let members = rank.members();
     let mut moved = false;
@@ -5128,12 +4679,8 @@ fn settle_auto(
 /// model had to prove the result identified (#1991). The advice now does not
 /// have to: whatever the user does next meets this check again.
 fn refuse_rank_deficient(
-    rank: &RankColumns,
-    decls: &[LevelBlockDecl],
-    discovered: &[Vec<Level>],
-    measured: &[Measured],
-    absorbing: &[bool],
-    layout: &[(LevelContrast, Vec<usize>)],
+    rank: &RankColumns, decls: &[LevelBlockDecl], discovered: &[Vec<Level>], measured: &[Measured],
+    absorbing: &[bool], layout: &[(LevelContrast, Vec<usize>)],
 ) -> Result<(), String> {
     let Some(set) = rank.dependent(layout) else {
         return Ok(());
@@ -5153,21 +4700,12 @@ fn refuse_rank_deficient(
             })
             .map(|c| (b, c))
     });
-    Err(rank_message(
-        &set,
-        rank_model_names(measured),
-        decls,
-        layout,
-        alt,
-    ))
+    Err(rank_message(&set, rank_model_names(measured), decls, layout, alt))
 }
 
 /// The θ names of the model the rank check measured on.
 fn rank_model_names(measured: &[Measured]) -> &[String] {
-    measured
-        .first()
-        .map(|m| m.rank_model.theta_names.as_slice())
-        .unwrap_or_default()
+    measured.first().map(|m| m.rank_model.theta_names.as_slice()).unwrap_or_default()
 }
 
 /// `theta NAME[COLS]`, as every level refusal names a block.
@@ -5179,11 +4717,8 @@ fn block_label(decl: &LevelBlockDecl) -> String {
 /// do — remove a member, or change a block's contrast, naming `alt` (a block
 /// and a contrast under which the layout keeps its rank) when there is one.
 fn rank_message(
-    set: &[Member],
-    theta_names: &[String],
-    decls: &[LevelBlockDecl],
-    layout: &[(LevelContrast, Vec<usize>)],
-    alt: Option<(usize, LevelContrast)>,
+    set: &[Member], theta_names: &[String], decls: &[LevelBlockDecl],
+    layout: &[(LevelContrast, Vec<usize>)], alt: Option<(usize, LevelContrast)>,
 ) -> String {
     let names: Vec<String> = set
         .iter()
@@ -5261,10 +4796,7 @@ fn rank_message(
 /// which a kappa does with an η on one occasion per subject (K3′), or with the
 /// kappa of an outer level whose groups each hold one group of its level.
 fn within_parts_them(
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    absorbed: &[Absorbed],
-    population: &Population,
+    decl: &LevelBlockDecl, levels: &[Level], absorbed: &[Absorbed], population: &Population,
     nested: Option<&NestedLevels>,
 ) -> bool {
     if decl.columns().len() < 2 {
@@ -5305,14 +4837,8 @@ fn within_parts_them(
     });
     let apart = (0..absorbed.len()).all(|a| {
         (0..a).all(|b| {
-            let ab: Vec<_> = records
-                .iter()
-                .map(|(_, u)| (u[a].clone(), u[b].clone()))
-                .collect();
-            let ba: Vec<_> = records
-                .iter()
-                .map(|(_, u)| (u[b].clone(), u[a].clone()))
-                .collect();
+            let ab: Vec<_> = records.iter().map(|(_, u)| (u[a].clone(), u[b].clone())).collect();
+            let ba: Vec<_> = records.iter().map(|(_, u)| (u[b].clone(), u[a].clone())).collect();
             !(determines(&ab) && determines(&ba))
         })
     });
@@ -5322,12 +4848,8 @@ fn within_parts_them(
 /// [`resolve_contrast`] for a block that absorbs at most the one random effect
 /// `absorbed`.
 fn resolve_absorbing(
-    decl: &LevelBlockDecl,
-    levels: &[Level],
-    measured: &Measured,
-    population: &Population,
-    others: Option<&[Coded]>,
-    absorbed: Option<Absorbed>,
+    decl: &LevelBlockDecl, levels: &[Level], measured: &Measured, population: &Population,
+    others: Option<&[Coded]>, absorbed: Option<Absorbed>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
     let nested = decl.columns().len() >= 2;
     let block = format!("theta {}[{}]", decl.name(), decl.columns().join(", "));
@@ -5338,9 +4860,8 @@ fn resolve_absorbing(
     // Measured in combination, dropping it breaks only its own: there can be
     // several independent combinations (`ETA_A`/`ETA_B` and `ETA_C`/`ETA_D`,
     // #1878 review r7), as in `jointly_absorbed_message`.
-    if let Some(found) = absorbed
-        .as_ref()
-        .filter(|a| matches!(a.how, How::Measured(Span::Within, ..)))
+    if let Some(found) =
+        absorbed.as_ref().filter(|a| matches!(a.how, How::Measured(Span::Within, ..)))
     {
         let drop = if found.combined() {
             "drop one random effect from each combination"
@@ -5436,9 +4957,8 @@ fn resolve_absorbing(
         // A one-column block with no free θ is the plain single-level case
         // below: there is no level left for the random effect to be confused with.
         if !nested && free > 0 && !identified(resolved) {
-            let alt = [LevelContrast::SumToZero, LevelContrast::Ref]
-                .into_iter()
-                .find(|&c| rescues(c));
+            let alt =
+                [LevelContrast::SumToZero, LevelContrast::Ref].into_iter().find(|&c| rescues(c));
             // #1991: a coded block aliased with other θ is refused for that,
             // not for the random effect, under whichever contrast the user
             // picked, since the refusal then speaks for every contrast. With a
@@ -5477,9 +4997,9 @@ fn resolve_absorbing(
             // advice to drop the random effect holds only with a global
             // contrast: without one, the block binds aliased (#1991 review).
             let none_alias = match (alt, resolved) {
-                (None, LevelContrast::Unconstrained) => certificate
-                    .as_ref()
-                    .and_then(|k| k.aliased(LevelContrast::Unconstrained)),
+                (None, LevelContrast::Unconstrained) => {
+                    certificate.as_ref().and_then(|k| k.aliased(LevelContrast::Unconstrained))
+                }
                 _ => None,
             };
             let mut message = one_column_message(&block, decl, found, resolved, alt);
@@ -5537,9 +5057,8 @@ fn resolve_absorbing(
                         None => "Drop the random effect".to_string(),
                     }
                 )
-            } else if let Some(within) = certificate
-                .as_ref()
-                .and_then(|k| k.aliased(LevelContrast::SumToZeroWithin))
+            } else if let Some(within) =
+                certificate.as_ref().and_then(|k| k.aliased(LevelContrast::SumToZeroWithin))
             {
                 // The within-group contrast carries the random effect, but its
                 // coded levels are aliased too (#1991 review, round 3): advised
@@ -5566,10 +5085,7 @@ fn resolve_absorbing(
                 )
             };
             let aliased = alias.map_or(String::new(), |with| {
-                format!(
-                    " {}",
-                    alias_sentence(contrast_token(resolved), &with, found.name())
-                )
+                format!(" {}", alias_sentence(contrast_token(resolved), &with, found.name()))
             });
             let why = match found.how {
                 How::Site(_) => format!("{} at that grouping", found.clause()),
@@ -5712,10 +5228,7 @@ fn within_held_message(block: &str, found: &Absorbed) -> String {
 /// contrast that does (#1840), the refusal names what `resolved` loses and
 /// that contrast.
 fn one_column_message(
-    block: &str,
-    decl: &LevelBlockDecl,
-    found: &Absorbed,
-    resolved: LevelContrast,
+    block: &str, decl: &LevelBlockDecl, found: &Absorbed, resolved: LevelContrast,
     alt: Option<LevelContrast>,
 ) -> String {
     let (unit, whose) = if found.kappa() {
@@ -5724,10 +5237,7 @@ fn one_column_message(
             format!("that {}'s", found.unit),
         )
     } else {
-        (
-            "belongs to a single subject".to_string(),
-            "that subject's".to_string(),
-        )
+        ("belongs to a single subject".to_string(), "that subject's".to_string())
     };
     let column = &decl.columns()[0];
     let Some(alt) = alt else {
@@ -5801,10 +5311,7 @@ fn alias_measured(both: bool) -> &'static str {
 /// as what to remove — the θ by name, or generically when none is named.
 fn alias_names(with: &[String]) -> (String, String) {
     match with.is_empty() {
-        true => (
-            "those θ".to_string(),
-            "the θ that duplicate the levels".to_string(),
-        ),
+        true => ("those θ".to_string(), "the θ that duplicate the levels".to_string()),
         false => (and_list(with), and_list(with)),
     }
 }
@@ -5817,10 +5324,7 @@ fn alias_names(with: &[String]) -> (String, String) {
 fn alias_remedy(alias: &Alias) -> String {
     match alias.alone {
         true => "remove the block".to_string(),
-        false => format!(
-            "remove {} and drop the random effect",
-            alias_names(&alias.with).1
-        ),
+        false => format!("remove {} and drop the random effect", alias_names(&alias.with).1),
     }
 }
 
@@ -5912,16 +5416,12 @@ fn aliased_message(block: &str, found: &Absorbed, aliased: &[(LevelContrast, Ali
 /// another name, so the model is unidentified with or without the block, and
 /// the refusal says so instead of blaming it.
 fn jointly_absorbed_message(
-    block: &str,
-    decl: &LevelBlockDecl,
-    absorbed: &[Absorbed],
-    population: &Population,
+    block: &str, decl: &LevelBlockDecl, absorbed: &[Absorbed], population: &Population,
 ) -> String {
-    let one_occasion = population.subjects.iter().all(|s| {
-        s.occasions
-            .first()
-            .is_some_and(|o| s.occasions.iter().all(|x| x == o))
-    });
+    let one_occasion = population
+        .subjects
+        .iter()
+        .all(|s| s.occasions.first().is_some_and(|o| s.occasions.iter().all(|x| x == o)));
     if one_occasion {
         // The same site is the same readers: the individual parameters that
         // read each random effect directly (#1702 review, F4). Comparing the
@@ -5929,10 +5429,7 @@ fn jointly_absorbed_message(
         // effect, and two random effects on different parameters can share a
         // route.
         let twin = absorbed.iter().filter(|k| k.kappa()).find_map(|k| {
-            absorbed
-                .iter()
-                .find(|e| !e.kappa() && e.readers == k.readers)
-                .map(|e| (k, e))
+            absorbed.iter().find(|e| !e.kappa() && e.readers == k.readers).map(|e| (k, e))
         });
         if let Some((k, e)) = twin {
             // On a one-column block dropping either one still leaves a
@@ -6036,11 +5533,7 @@ fn free_count(groups: &[usize], contrast: LevelContrast) -> usize {
 
 /// The expression where a block meets a random effect, as a diagnostic clause.
 fn share_site(share: &ScaleShare) -> String {
-    let via = share
-        .eta_via
-        .as_ref()
-        .map(|v| format!(" (through `{v}`)"))
-        .unwrap_or_default();
+    let via = share.eta_via.as_ref().map(|v| format!(" (through `{v}`)")).unwrap_or_default();
     match &share.param {
         Some(p) => {
             format!(
@@ -6109,9 +5602,7 @@ fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContras
 /// such level (or the block is keyed on `TIME`, which such a subject cannot name) it
 /// gets index 1 and is returned, for [`refuse_read_unindexed`] to measure.
 fn write_index_column(
-    decl: &LevelBlockDecl,
-    table: &[(Level, usize)],
-    subjects: &mut [Subject],
+    decl: &LevelBlockDecl, table: &[(Level, usize)], subjects: &mut [Subject],
 ) -> Result<Vec<Unindexed>, String> {
     let column = level_index_column(decl.name());
     // Keyed on `level_key`, the one spelling of level equality the level-table check
@@ -6187,10 +5678,7 @@ fn write_index_column(
                     1.0
                 }),
                 Err(why) => {
-                    unindexed.push(Unindexed {
-                        id: subject.id.clone(),
-                        why,
-                    });
+                    unindexed.push(Unindexed { id: subject.id.clone(), why });
                     1.0
                 }
             },
@@ -6298,12 +5786,8 @@ fn write_index_column(
 /// cannot carry one index per record, so it is refused rather than scored at its first
 /// level.
 fn write_record_index(
-    decl: &LevelBlockDecl,
-    subject: &mut Subject,
-    column: &str,
-    first: f64,
-    record_index: &[(usize, f64)],
-    table: &[(Level, usize)],
+    decl: &LevelBlockDecl, subject: &mut Subject, column: &str, first: f64,
+    record_index: &[(usize, f64)], table: &[(Level, usize)],
 ) -> Result<(), String> {
     let Some(&(r, other)) = record_index.iter().find(|&&(_, i)| i != first) else {
         // Constant within the subject: the baseline is exact, but snapshots that already
@@ -6434,18 +5918,11 @@ enum LevelSource {
 /// Reads `population` and writes nothing: only the subjects with no Gaussian
 /// observation are copied, so a binder can call this before it writes any column.
 fn refuse_read_unindexed(
-    model: &CompiledModel,
-    decls: &[LevelBlockDecl],
-    tables: &[Vec<(Level, usize)>],
-    population: &Population,
-    source: LevelSource,
+    model: &CompiledModel, decls: &[LevelBlockDecl], tables: &[Vec<(Level, usize)>],
+    population: &Population, source: LevelSource,
 ) -> Result<(), String> {
-    let mut subjects: Vec<Subject> = population
-        .subjects
-        .iter()
-        .filter(|s| s.obs_times.is_empty())
-        .cloned()
-        .collect();
+    let mut subjects: Vec<Subject> =
+        population.subjects.iter().filter(|s| s.obs_times.is_empty()).cloned().collect();
     if subjects.is_empty() {
         return Ok(());
     }
@@ -6538,9 +6015,7 @@ fn set_index(subject: &mut Subject, column: &str, index: f64) {
 /// The refusal for subjects with no Gaussian observation that read a level block at a
 /// level it has no θ for (#1797). Every subject is listed, as for unseen levels.
 fn unindexed_read_message(
-    decl: &LevelBlockDecl,
-    read: &[&Unindexed],
-    source: LevelSource,
+    decl: &LevelBlockDecl, read: &[&Unindexed], source: LevelSource,
 ) -> String {
     let items: Vec<String> = read.iter().map(|u| u.why.item(&u.id)).collect();
     let mut message = format!(
@@ -6560,10 +6035,7 @@ fn unindexed_read_message(
         [] => String::new(),
         cmts => format!(
             " and the records on CMT {}",
-            cmts.iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            cmts.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
         ),
     };
     message.push_str(&match source {
@@ -6679,10 +6151,8 @@ pub struct ThetaLevelValue {
 /// Unbound level blocks and counted `theta NAME[N]` blocks are omitted, as in
 /// [`theta_level_map`](crate::theta_level_map); a model with neither gives an empty map.
 pub fn theta_level_values(
-    model: &crate::types::CompiledModel,
-    theta: &[f64],
-    covariance: Option<&nalgebra::DMatrix<f64>>,
-    sir_resamples_packed: Option<&[Vec<f64>]>,
+    model: &crate::types::CompiledModel, theta: &[f64],
+    covariance: Option<&nalgebra::DMatrix<f64>>, sir_resamples_packed: Option<&[Vec<f64>]>,
 ) -> Result<HashMap<String, Vec<ThetaLevelValue>>, String> {
     let expected = model.default_params.theta.len();
     if theta.len() != expected {
@@ -6703,11 +6173,7 @@ pub fn theta_level_values(
             ));
         }
     }
-    if let Some(short) = sir_resamples_packed
-        .into_iter()
-        .flatten()
-        .find(|d| d.len() < expected)
-    {
+    if let Some(short) = sir_resamples_packed.into_iter().flatten().find(|d| d.len() < expected) {
         return Err(format!(
             "a supplied SIR draw has {} values but must hold at least the model's \
              {expected} theta; level intervals are read from it by position",
@@ -6718,16 +6184,11 @@ pub fn theta_level_values(
     // Each draw's θ, through the one back-transform `unpack_params` uses, so a free
     // level's interval is the `sir_ci_theta` the SIR step reports. No draws is no
     // interval: `percentile_ci` of an empty set is `(NaN, NaN)`, not an answer.
-    let draw_thetas: Option<Vec<Vec<f64>>> = sir_resamples_packed
-        .filter(|draws| !draws.is_empty())
-        .map(|draws| {
+    let draw_thetas: Option<Vec<Vec<f64>>> =
+        sir_resamples_packed.filter(|draws| !draws.is_empty()).map(|draws| {
             draws
                 .iter()
-                .map(|d| {
-                    (0..expected)
-                        .map(|k| theta_from_packed(d[k], lower[k]))
-                        .collect()
-                })
+                .map(|d| (0..expected).map(|k| theta_from_packed(d[k], lower[k])).collect())
                 .collect()
         });
     let blocks = model.theta_blocks();
@@ -6739,16 +6200,9 @@ pub fn theta_level_values(
         // Unreachable by construction: the parser pushes a gather for every declared
         // level block, and its rules are built from the same binding as the labels, one
         // per label. Kept as an `Err` rather than a panic since this is a library entry.
-        let gather = blocks
-            .decls
-            .iter()
-            .find(|d| d.name == decl.name())
-            .ok_or_else(|| {
-                format!(
-                    "theta {}: the level block is bound but has no level-to-theta map",
-                    decl.name()
-                )
-            })?;
+        let gather = blocks.decls.iter().find(|d| d.name == decl.name()).ok_or_else(|| {
+            format!("theta {}: the level block is bound but has no level-to-theta map", decl.name())
+        })?;
         debug_assert_eq!(decl.labels().len(), gather.spec.levels.len());
         let values = decl
             .labels()
@@ -6774,10 +6228,8 @@ pub fn theta_level_values(
                     },
                     sir_ci: match &draw_thetas {
                         Some(draws) if !constant => {
-                            let v: Vec<f64> = draws
-                                .iter()
-                                .map(|t| eval_gather(&gather.spec, t, index))
-                                .collect();
+                            let v: Vec<f64> =
+                                draws.iter().map(|t| eval_gather(&gather.spec, t, index)).collect();
                             Some(percentile_ci(&v))
                         }
                         _ => None,
@@ -6798,10 +6250,7 @@ pub fn theta_level_values(
 /// it is not clamped to `0`, which would report a certainty the matrix does not
 /// carry. Whether `se_theta`'s own `0.0` convention should change is #1895.
 fn level_se(
-    rule: LevelRule,
-    c: &nalgebra::DMatrix<f64>,
-    theta: &[f64],
-    lower: &[f64],
+    rule: LevelRule, c: &nalgebra::DMatrix<f64>, theta: &[f64], lower: &[f64],
 ) -> Option<f64> {
     match rule {
         LevelRule::Free(k) => {
@@ -6848,8 +6297,7 @@ pub(crate) fn active_levels(model: &CompiledModel, population: &Population) -> V
 /// [`ActiveLevels`] for every θ block of `model` that `keep` selects, in declaration
 /// order, by the rule [`active_levels`] states.
 fn levels_read(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
     keep: impl Fn(&crate::parser::model_parser::VectorThetaDecl) -> bool,
 ) -> Vec<ActiveLevels> {
     let blocks = &model.indiv_param_partials.theta_blocks;
@@ -6859,20 +6307,13 @@ fn levels_read(
         .filter(|d| keep(d))
         .map(|d| {
             let n_levels = d.spec.levels.len();
-            let column = blocks
-                .read_index
-                .iter()
-                .find(|(b, _)| *b == d.name)
-                .and_then(|(_, c)| c.clone());
+            let column =
+                blocks.read_index.iter().find(|(b, _)| *b == d.name).and_then(|(_, c)| c.clone());
             // The discrete-state records that read the block (#2111): a column-keyed
             // block's own `record_cmts`; for a counted block (`PLACEBO[3]` read as
             // `PLACEBO[STUDY]`), the endpoints whose expression reads its plain column.
             let record_cmts: Vec<usize> = match (
-                model
-                    .theta_blocks()
-                    .level_blocks()
-                    .iter()
-                    .find(|b| b.name() == d.name),
+                model.theta_blocks().level_blocks().iter().find(|b| b.name() == d.name),
                 &column,
             ) {
                 (Some(decl), _) => decl.record_cmts.clone(),
@@ -6888,10 +6329,7 @@ fn levels_read(
                     None => (0..n_levels).collect(),
                 })
                 .collect();
-            ActiveLevels {
-                block: d.name.clone(),
-                per_subject,
-            }
+            ActiveLevels { block: d.name.clone(), per_subject }
         })
         .collect()
 }
@@ -6900,52 +6338,43 @@ fn levels_read(
 /// one subject of `population` reads, and the block's level count; blocks with none are
 /// left out. Profiled or not: the count is a property of the data, not of the solve.
 pub(crate) fn one_subject_levels(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<(String, Vec<String>, usize)> {
     let blocks = model.theta_blocks();
     let level_blocks = blocks.level_blocks();
-    levels_read(model, population, |d| {
-        level_blocks.iter().any(|b| b.name() == d.name)
-    })
-    .into_iter()
-    .filter_map(|a| {
-        let labels = level_blocks.iter().find(|b| b.name() == a.block)?.labels();
-        let rules = &blocks.decls.iter().find(|d| d.name == a.block)?.spec.levels;
-        // A level has an SE only when it depends on some free θ: a FIX block's levels and a
-        // `ref` contrast's reference level (an empty `NegSum`) are constants, reported with
-        // SE 0 or none, so there is no `rsr` SE to call unusable (#2415 review rows 1, 2).
-        let fixed = |k: u32| {
-            model
-                .default_params
-                .theta_fixed
-                .get(k as usize)
-                .copied()
-                .unwrap_or(false)
-        };
-        let estimated = |l: usize| match rules.get(l) {
-            Some(LevelRule::Free(k)) => !fixed(*k),
-            Some(LevelRule::NegSum(a, b)) => (*a..*b).any(|k| !fixed(k)),
-            None => false,
-        };
-        let mut readers = vec![0usize; labels.len()];
-        for levels in &a.per_subject {
-            for &l in levels {
-                if let Some(n) = readers.get_mut(l) {
-                    *n += 1;
+    levels_read(model, population, |d| level_blocks.iter().any(|b| b.name() == d.name))
+        .into_iter()
+        .filter_map(|a| {
+            let labels = level_blocks.iter().find(|b| b.name() == a.block)?.labels();
+            let rules = &blocks.decls.iter().find(|d| d.name == a.block)?.spec.levels;
+            // A level has an SE only when it depends on some free θ: a FIX block's levels and a
+            // `ref` contrast's reference level (an empty `NegSum`) are constants, reported with
+            // SE 0 or none, so there is no `rsr` SE to call unusable (#2415 review rows 1, 2).
+            let fixed =
+                |k: u32| model.default_params.theta_fixed.get(k as usize).copied().unwrap_or(false);
+            let estimated = |l: usize| match rules.get(l) {
+                Some(LevelRule::Free(k)) => !fixed(*k),
+                Some(LevelRule::NegSum(a, b)) => (*a..*b).any(|k| !fixed(k)),
+                None => false,
+            };
+            let mut readers = vec![0usize; labels.len()];
+            for levels in &a.per_subject {
+                for &l in levels {
+                    if let Some(n) = readers.get_mut(l) {
+                        *n += 1;
+                    }
                 }
             }
-        }
-        let single: Vec<String> = readers
-            .iter()
-            .zip(labels)
-            .enumerate()
-            .filter(|&(l, (&n, _))| n == 1 && estimated(l))
-            .map(|(_, (_, label))| label.clone())
-            .collect();
-        (!single.is_empty()).then(|| (a.block, single, labels.len()))
-    })
-    .collect()
+            let single: Vec<String> = readers
+                .iter()
+                .zip(labels)
+                .enumerate()
+                .filter(|&(l, (&n, _))| n == 1 && estimated(l))
+                .map(|(_, (_, label))| label.clone())
+                .collect();
+            (!single.is_empty()).then(|| (a.block, single, labels.len()))
+        })
+        .collect()
 }
 
 /// The note a successful `covariance_method = rsr` step carries when some θ level is read
@@ -6955,9 +6384,7 @@ pub(crate) fn one_subject_levels(
 /// SEs are 1.5–4.8× below `r`'s, profiled and unprofiled alike. `fit()` and
 /// `run_covariance` both call it, on the method their step published.
 pub(crate) fn rsr_one_subject_levels_warning(
-    model: &CompiledModel,
-    population: &Population,
-    method: Option<crate::types::CovarianceMethod>,
+    model: &CompiledModel, population: &Population, method: Option<crate::types::CovarianceMethod>,
 ) -> Option<String> {
     if method != Some(crate::types::CovarianceMethod::Sandwich) {
         return None;
@@ -7011,10 +6438,7 @@ fn chained_cmts(model: &CompiledModel, record_cmts: &[usize]) -> Vec<usize> {
         .iter()
         .copied()
         .filter(|c| {
-            matches!(
-                model.endpoints.get(c),
-                Some(crate::types::EndpointLikelihood::Dtmm { .. })
-            )
+            matches!(model.endpoints.get(c), Some(crate::types::EndpointLikelihood::Dtmm { .. }))
         })
         .collect();
     #[cfg(not(feature = "markov"))]
@@ -7033,11 +6457,7 @@ fn chained_cmts(model: &CompiledModel, record_cmts: &[usize]) -> Vec<usize> {
 /// Unlike [`level_rows`], whose records *define* levels (a chain's first record names a
 /// level the data hold), these are the levels the subject's objective *reads*.
 fn subject_levels(
-    record_cmts: &[usize],
-    chained: &[usize],
-    subject: &Subject,
-    column: &str,
-    n_levels: usize,
+    record_cmts: &[usize], chained: &[usize], subject: &Subject, column: &str, n_levels: usize,
 ) -> Vec<usize> {
     let snaps = subject.record_covariate_snapshots();
     let mut started: Vec<usize> = Vec::new();
@@ -7068,9 +6488,9 @@ fn subject_levels(
 }
 
 #[cfg(test)]
-#[path = "tests/theta_levels_tests.rs"]
+#[path = "api/tests/theta_levels_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/profiled_levels_tests.rs"]
+#[path = "api/tests/profiled_levels_tests.rs"]
 mod profiled_levels_tests;

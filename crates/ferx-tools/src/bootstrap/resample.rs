@@ -54,9 +54,7 @@ impl SampleSize {
                 format!("--sample-size: `{part}` has a non-numeric count after `=>`")
             })?;
             if map.insert(stratum.clone(), count).is_some() {
-                return Err(format!(
-                    "--sample-size: stratum `{stratum}` is listed more than once"
-                ));
+                return Err(format!("--sample-size: stratum `{stratum}` is listed more than once"));
             }
         }
         Ok(SampleSize::PerStratum(map))
@@ -80,10 +78,7 @@ impl Strata {
     pub fn unstratified(n_subjects: usize) -> Self {
         let mut groups = BTreeMap::new();
         groups.insert(String::new(), (0..n_subjects).collect());
-        Strata {
-            groups,
-            column: None,
-        }
+        Strata { groups, column: None }
     }
 
     /// Group subjects by a per-subject label.
@@ -97,10 +92,7 @@ impl Strata {
         for (i, label) in labels.iter().enumerate() {
             groups.entry(label.clone()).or_default().push(i);
         }
-        Strata {
-            groups,
-            column: Some(column.to_string()),
-        }
+        Strata { groups, column: Some(column.to_string()) }
     }
 
     fn n_subjects(&self) -> usize {
@@ -113,19 +105,14 @@ impl Strata {
     pub fn allocation(&self, size: &SampleSize) -> Result<Vec<(String, usize)>, String> {
         let total_subjects = self.n_subjects();
         match size {
-            SampleSize::Original => Ok(self
-                .groups
-                .iter()
-                .map(|(k, g)| (k.clone(), g.len()))
-                .collect()),
+            SampleSize::Original => {
+                Ok(self.groups.iter().map(|(k, g)| (k.clone(), g.len())).collect())
+            }
             SampleSize::Total(m) => {
                 // Proportional allocation. With one stratum this is just `m`, so
                 // the unstratified path needs no special case.
                 if self.groups.len() == 1 {
-                    return Ok(vec![(
-                        self.groups.keys().next().cloned().unwrap_or_default(),
-                        *m,
-                    )]);
+                    return Ok(vec![(self.groups.keys().next().cloned().unwrap_or_default(), *m)]);
                 }
                 Ok(self
                     .groups
@@ -161,11 +148,8 @@ impl Strata {
                 // than silently falling back to its own size — an unmentioned
                 // stratum in an explicit list is far more likely a typo than an
                 // intent to include it whole.
-                let missing: Vec<&String> = self
-                    .groups
-                    .keys()
-                    .filter(|k| !map.contains_key(*k))
-                    .collect();
+                let missing: Vec<&String> =
+                    self.groups.keys().filter(|k| !map.contains_key(*k)).collect();
                 if !missing.is_empty() {
                     return Err(format!(
                         "--sample-size lists per-stratum counts but omits {missing:?}. List every \

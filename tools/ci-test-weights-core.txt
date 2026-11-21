@@ -65,7 +65,7 @@
 50 lib:api
 49 lib:estimation::bayes
 36 lib:estimation::run_covariance
-35 lib:api::levels
+35 lib:levels
 25 lib:estimation::vi::elbo
 20 lib:estimation::mixture
 18 lib:api::fit
@@ -88,7 +88,7 @@
 2 lib:iovsearch_cmd
 2 lib:pk::analytical_absorption
 2 lib:pk::three_compartment
-1 lib:api::pool
+1 lib:pool
 1 lib:estimation::run_sir::from_fit_bindings
 1 lib:parser::model_parser
 1 lib:tests

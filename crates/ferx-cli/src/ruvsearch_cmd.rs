@@ -112,22 +112,13 @@ fn run_ruvsearch_command(args: &[String]) -> Result<i32, String> {
         options.p_value,
         options.groups,
         options.max_iter,
-        if options.cwres_prescreen {
-            ", CWRES pre-screen"
-        } else {
-            ""
-        },
+        if options.cwres_prescreen { ", CWRES pre-screen" } else { "" },
         if options.skip.is_empty() {
             String::new()
         } else {
             format!(
                 ", skipping {}",
-                options
-                    .skip
-                    .iter()
-                    .map(|f| f.label())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                options.skip.iter().map(|f| f.label()).collect::<Vec<_>>().join(", ")
             )
         }
     );
@@ -146,11 +137,7 @@ fn run_ruvsearch_command(args: &[String]) -> Result<i32, String> {
             RuvsearchEvent::BaseFinished { ofv } => {
                 eprintln!("Proportional base: OFV {ofv:.3}")
             }
-            RuvsearchEvent::IterationStarted {
-                iteration,
-                candidates,
-                screening,
-            } => eprintln!(
+            RuvsearchEvent::IterationStarted { iteration, candidates, screening } => eprintln!(
                 "Iteration {iteration}: {} {candidates} candidate{}...",
                 if screening { "screening" } else { "fitting" },
                 if candidates == 1 { "" } else { "s" }
@@ -159,15 +146,9 @@ fn run_ruvsearch_command(args: &[String]) -> Result<i32, String> {
                 Some(f) => eprintln!("Iteration {iteration}: refitting {} on the data", f.label()),
                 None => eprintln!("Iteration {iteration}: no candidate beat the cutoff on CWRES"),
             },
-            RuvsearchEvent::IterationFinished {
-                iteration,
-                selected,
-            } => match selected {
+            RuvsearchEvent::IterationFinished { iteration, selected } => match selected {
                 Some((feature, ofv)) => {
-                    eprintln!(
-                        "Iteration {iteration}: added {} (OFV {ofv:.3})",
-                        feature.label()
-                    )
+                    eprintln!("Iteration {iteration}: added {} (OFV {ofv:.3})", feature.label())
                 }
                 None => eprintln!("Iteration {iteration}: nothing accepted"),
             },
@@ -183,12 +164,7 @@ fn run_ruvsearch_command(args: &[String]) -> Result<i32, String> {
     let result = run_ruvsearch(
         &config,
         &base,
-        RuvsearchRun {
-            dir: Some(dir.clone()),
-            threads,
-            cancel: None,
-            progress: Some(&progress),
-        },
+        RuvsearchRun { dir: Some(dir.clone()), threads, cancel: None, progress: Some(&progress) },
     )?;
 
     print!("{}", render_summary(&result));
@@ -268,27 +244,10 @@ mod tests {
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "ruvsearch",
-                "a.ferxsearch",
-                "b.ferxsearch"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "ruvsearch", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "ruvsearch", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "ruvsearch", "-h"])), 0);
         assert_eq!(run(&args(&["ferx", "ruvsearch"])), 1);
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "ruvsearch",
-                "x.ferxsearch",
-                "--samples",
-                "3"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "ruvsearch", "x.ferxsearch", "--samples", "3"])), 1);
     }
 }

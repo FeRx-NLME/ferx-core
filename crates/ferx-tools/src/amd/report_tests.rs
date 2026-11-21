@@ -42,11 +42,7 @@ fn result() -> AmdResult {
     broken.rank = None;
     broken.error = Some("does not compile: unknown parameter `Q`".into());
     AmdResult {
-        options: AmdOptions {
-            strategy: Strategy::Default,
-            retries: Retries::Final,
-            skip: vec![],
-        },
+        options: AmdOptions { strategy: Strategy::Default, retries: Retries::Final, skip: vec![] },
         input_model: model_text("[parameters]\ntheta CL = 1\n"),
         input_fit: Some(converged_fit(1010.0)),
         steps: vec![
@@ -163,16 +159,10 @@ fn the_summary_shows_every_step_every_candidate_and_the_estimates() {
     assert!(out.contains("Start model: OFV 1010.000"));
     // The step table, with the skip explained rather than omitted.
     assert!(out.contains("structural"));
-    assert!(
-        out.contains("skipped: the search space has no COVARIATE statement"),
-        "{out}"
-    );
+    assert!(out.contains("skipped: the search space has no COVARIATE statement"), "{out}");
     // Every candidate, with the reason a failed one was not selected.
     assert!(out.contains("cand1") && out.contains("SELECTED"));
-    assert!(
-        out.contains("excluded: stalled at the initial estimates (#751)"),
-        "{out}"
-    );
+    assert!(out.contains("excluded: stalled at the initial estimates (#751)"), "{out}");
     assert!(out.contains("failed: does not compile"), "{out}");
     // Notes, from the pipeline and from the steps.
     assert!(out.contains("did not improve the fit"));
@@ -181,9 +171,7 @@ fn the_summary_shows_every_step_every_candidate_and_the_estimates() {
     assert!(out.contains("Final model: OFV 990.000 (-20.000 against the start model)"));
     // The estimates table, which is what carries the standard errors.
     assert!(
-        out.contains(&ferx_core::io::output::parameter_table(
-            result().final_fit.as_ref().unwrap()
-        )),
+        out.contains(&ferx_core::io::output::parameter_table(result().final_fit.as_ref().unwrap())),
         "the estimates table is missing"
     );
 }
@@ -207,15 +195,9 @@ fn the_final_model_table_names_omega_and_sigma_and_shows_their_ses() {
             .to_string()
     };
     let eta_ka = row("ETA_KA");
-    assert!(
-        eta_ka.contains("0.067800") && eta_ka.ends_with("OMEGA var"),
-        "{eta_ka}"
-    );
+    assert!(eta_ka.contains("0.067800") && eta_ka.ends_with("OMEGA var"), "{eta_ka}");
     let sigma = row("PROP_ERR");
-    assert!(
-        sigma.contains("0.001900") && sigma.ends_with("SIGMA SD"),
-        "{sigma}"
-    );
+    assert!(sigma.contains("0.001900") && sigma.ends_with("SIGMA SD"), "{sigma}");
     assert!(!out.contains("OMEGA(") && !out.contains("SIGMA("), "{out}");
     // A diagonal Ω has no covariance rows.
     assert!(!out.contains("OMEGA cov"), "{out}");
@@ -233,10 +215,7 @@ fn a_selected_row_that_failed_the_gate_still_says_so() {
     result.rows[0].passed = false;
     result.rows[0].failures = vec!["condition number 1e9 exceeds 1e3".into()];
     let out = render_summary(&result);
-    assert!(
-        out.contains("SELECTED (failed the gate: condition number 1e9 exceeds 1e3)"),
-        "{out}"
-    );
+    assert!(out.contains("SELECTED (failed the gate: condition number 1e9 exceeds 1e3)"), "{out}");
     // With a note as well, both are kept.
     result.rows[0].note = Some("p = 0.0010 (df 1)".into());
     let out = render_summary(&result);
@@ -262,10 +241,7 @@ fn a_failed_step_is_told_apart_from_a_skipped_one() {
     assert!(row.contains(",failed,"), "{row}");
     assert!(row.contains("not a covariate"), "{row}");
     let out = render_summary(&result);
-    assert!(
-        out.contains("failed: `WT` is not a covariate of the dataset"),
-        "{out}"
-    );
+    assert!(out.contains("failed: `WT` is not a covariate of the dataset"), "{out}");
 }
 
 /// A cancelled run says so, so a short table is not read as a finished

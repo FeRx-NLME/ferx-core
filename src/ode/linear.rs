@@ -302,20 +302,11 @@ impl<T: PkNum> Expm<T> {
                 } else {
                     Vec::new()
                 };
-                self.cache.push(PadeEntry {
-                    key,
-                    reusable,
-                    powers,
-                });
+                self.cache.push(PadeEntry { key, reusable, powers });
                 self.cache.len() - 1
             }
         };
-        let Expm {
-            cache,
-            row_finite,
-            spare,
-            ..
-        } = self;
+        let Expm { cache, row_finite, spare, .. } = self;
         let entry = &mut cache[idx];
         if entry.powers.is_empty() {
             return None;
@@ -380,12 +371,7 @@ impl<T: PkNum> Expm<T> {
         );
         matmul_into(&self.a6, &self.t1, n, &mut self.t2, rf);
         lincomb_into(
-            &[
-                (1.0, &self.t2),
-                (b[7], &self.a6),
-                (b[5], &self.a4),
-                (b[3], &self.a2),
-            ],
+            &[(1.0, &self.t2), (b[7], &self.a6), (b[5], &self.a4), (b[3], &self.a2)],
             b[1],
             n,
             &mut self.t1,
@@ -400,12 +386,7 @@ impl<T: PkNum> Expm<T> {
         );
         matmul_into(&self.a6, &self.t1, n, &mut self.t2, rf);
         lincomb_into(
-            &[
-                (1.0, &self.t2),
-                (b[6], &self.a6),
-                (b[4], &self.a4),
-                (b[2], &self.a2),
-            ],
+            &[(1.0, &self.t2), (b[6], &self.a6), (b[4], &self.a4), (b[2], &self.a2)],
             b[0],
             n,
             &mut self.v,
@@ -446,9 +427,7 @@ impl<T: PkNum> Expm<T> {
 pub(crate) fn forcing_scale(args: &[f64], out: &mut Vec<f64>) {
     let n = args[args.len() - 1] as usize;
     let a_max = args[..n * n].iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-    let b_max = args[n * n..n * n + n]
-        .iter()
-        .fold(0.0_f64, |m, x| m.max(x.abs()));
+    let b_max = args[n * n..n * n + n].iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     out.clear();
     out.push((b_max / a_max.max(1.0)).max(1.0));
 }
@@ -465,9 +444,8 @@ pub(crate) fn pade_squarings(args: &[f64], out: &mut Vec<f64>) {
         return;
     }
     // ‖A‖₁ — max absolute column sum of the value part.
-    let norm1 = (0..n)
-        .map(|j| (0..n).map(|i| a[i * n + j].abs()).sum::<f64>())
-        .fold(0.0_f64, f64::max);
+    let norm1 =
+        (0..n).map(|j| (0..n).map(|i| a[i * n + j].abs()).sum::<f64>()).fold(0.0_f64, f64::max);
     let s = if norm1 > THETA13 {
         let s = (norm1 / THETA13).log2().ceil();
         if !(s <= MAX_SQUARINGS as f64) {
@@ -493,9 +471,7 @@ const POOL_MAX_WORKSPACES: usize = 16;
 /// ([`PkNum::same_bits_untaped`]): a reused result would drop the records a taped type's
 /// recomputation writes.
 fn pade_shared<T: PkNum>() -> bool {
-    T::from_f64(0.0)
-        .same_bits_untaped(&T::from_f64(0.0))
-        .is_some()
+    T::from_f64(0.0).same_bits_untaped(&T::from_f64(0.0)).is_some()
 }
 
 /// The Padé approximants this thread's workspace for `T` holds, over every size.
@@ -552,12 +528,8 @@ const SELF_CHECK_RTOL: f64 = 1e-9;
 /// term whose `Km` is far above every state it reaches is affine to rounding at every checked
 /// point — and then the exact answer is the right one to that same precision.
 pub(crate) fn linear_segment_g<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
+    rhs: &crate::ode::solver::RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T],
+    saveat: &[f64], interp_at: &[f64],
 ) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
     with_workspace(|ws: &mut LinWs<T>| segment_in(ws, rhs, u0, t_span, params, saveat, interp_at))
 }
@@ -822,11 +794,8 @@ fn projectors<U: PkNum>(a: &[U], lambda: &[U], masks: &[(u8, u8)], n: usize) -> 
                 for col in 0..n {
                     let mut s = zero;
                     for l in 0..n {
-                        let alc = if l == col {
-                            a[l * n + col] - lambda[j]
-                        } else {
-                            a[l * n + col]
-                        };
+                        let alc =
+                            if l == col { a[l * n + col] - lambda[j] } else { a[l * n + col] };
                         s = s + p[r * n + l] * alc;
                     }
                     tmp[r * n + col] = s * inv;
@@ -938,10 +907,7 @@ fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
     if lam_f.len() != n || !lam_f.iter().all(|l| l.is_finite()) {
         return None;
     }
-    let lmax = lam_f
-        .iter()
-        .fold(0.0_f64, |s, x| s.max(x.abs()))
-        .max(scale * 1e-12);
+    let lmax = lam_f.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(scale * 1e-12);
     let mut sorted = lam_f.clone();
     sorted.sort_by(|x, y| x.total_cmp(y));
     for w in sorted.windows(2) {
@@ -952,9 +918,7 @@ fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
     let masks: Vec<(u8, u8)> = (0..n)
         .map(|k| {
             let b = block[k];
-            let rows = (0..n)
-                .filter(|&s| b & (1 << s) != 0)
-                .fold(0u8, |m, s| m | down[s]);
+            let rows = (0..n).filter(|&s| b & (1 << s) != 0).fold(0u8, |m, s| m | down[s]);
             let cols = (0..n).fold(0u8, |m, c| if down[c] & b != 0 { m | (1 << c) } else { m });
             (rows, cols)
         })
@@ -1027,14 +991,7 @@ fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
             }
         }
     }
-    Some(SpectralF64 {
-        lam: lam_f,
-        exact,
-        masks,
-        pf,
-        v0: v0s,
-        jinv: jinvs,
-    })
+    Some(SpectralF64 { lam: lam_f, exact, masks, pf, v0: v0s, jinv: jinvs })
 }
 
 /// The spectral form in `T` from [`spectral_analysis`]'s outputs `out` (each a `T`: a
@@ -1218,14 +1175,8 @@ fn exprel_closed(z: f64, e: f64, m: usize) -> f64 {
 /// [`AffinePieces`].
 #[allow(clippy::too_many_arguments)]
 fn affine_generator<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    params: &[T],
-    t: f64,
-    u0: &[T],
-    probe: &mut [T],
-    a: &mut [T],
-    b: &mut [T],
-    col: &mut [T],
+    rhs: &crate::ode::solver::RhsG<'_, T>, params: &[T], t: f64, u0: &[T], probe: &mut [T],
+    a: &mut [T], b: &mut [T], col: &mut [T],
 ) -> bool {
     let n = u0.len();
     let zero = T::from_f64(0.0);
@@ -1237,10 +1188,8 @@ fn affine_generator<T: PkNum>(
             return false;
         }
         rhs(probe, params, T::from_f64(t), b);
-        let magnitude = b
-            .iter()
-            .chain(u0)
-            .fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
+        let magnitude =
+            b.iter().chain(u0).fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
         if !magnitude.is_finite() {
             return false;
         }
@@ -1258,10 +1207,7 @@ fn affine_generator<T: PkNum>(
         }
     }
     // `|x| < ∞`: the value finite (a `NaN` fails it too).
-    if a.iter()
-        .chain(b.iter())
-        .any(|x| !x.br_abs_lt(f64::INFINITY))
-    {
+    if a.iter().chain(b.iter()).any(|x| !x.br_abs_lt(f64::INFINITY)) {
         return false;
     }
     true
@@ -1271,12 +1217,7 @@ fn affine_generator<T: PkNum>(
 /// In the value and in the derivative components alike: a column whose jets were lost to
 /// cancellation reproduces the RHS's value exactly and its gradient not at all.
 fn reproduces_affine<T: PkNum>(
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    params: &[T],
-    a: &[T],
-    b: &[T],
-    x: &[T],
-    t: f64,
+    rhs: &crate::ode::solver::RhsG<'_, T>, params: &[T], a: &[T], b: &[T], x: &[T], t: f64,
     direct: &mut [T],
 ) -> bool {
     let n = x.len();
@@ -1294,9 +1235,7 @@ fn reproduces_affine<T: PkNum>(
             }
             let tol = scale * T::from_f64(SELF_CHECK_RTOL) + T::from_f64(1e-300);
             return direct[i].br_abs_lt(f64::INFINITY)
-                && (direct[i] - assembled)
-                    .abs()
-                    .br_cmp(crate::sens::num::BranchCmp::Le, tol);
+                && (direct[i] - assembled).abs().br_cmp(crate::sens::num::BranchCmp::Le, tol);
         }
         let mut assembled = b[i];
         let mut scale = b[i].plain().abs();
@@ -1347,10 +1286,7 @@ pub(crate) struct AffinePieces<T> {
 impl<T: PkNum> AffinePieces<T> {
     /// `None` where the right-hand side is not affine or a part is not finite.
     pub(crate) fn new(
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u0: &[T],
-        t_ref: f64,
-        params: &[T],
+        rhs: &crate::ode::solver::RhsG<'_, T>, u0: &[T], t_ref: f64, params: &[T],
     ) -> Option<Self> {
         // The test seam every exact linear segment honours (`FORCE_LINEAR_DECLINE`): a decline a
         // model file cannot produce on finite values, for the caller's fallback to be seen.
@@ -1372,19 +1308,10 @@ impl<T: PkNum> AffinePieces<T> {
         {
             return None;
         }
-        let sp = if spectral_enabled() {
-            spectral(&a, n)
-        } else {
-            None
-        };
+        let sp = if spectral_enabled() { spectral(&a, n) } else { None };
         // A length with derivatives needs every order the type carries, whatever `A`'s.
         let jet_orders = if T::JET_ORDER == 0 { 4 } else { T::JET_ORDER };
-        Some(AffinePieces {
-            a,
-            b,
-            sp,
-            jet_orders,
-        })
+        Some(AffinePieces { a, b, sp, jet_orders })
     }
 
     /// The state `h ≥ 0` on from `u0`, with `extra` added to `b` (a rate into one compartment
@@ -1447,22 +1374,15 @@ impl<T: PkNum> AffinePieces<T> {
                 })
                 .collect()
         };
-        out.iter()
-            .all(|x| x.br_abs_lt(f64::INFINITY))
-            .then_some(out)
+        out.iter().all(|x| x.br_abs_lt(f64::INFINITY)).then_some(out)
     }
 }
 
 /// [`linear_segment_g`] on a reused workspace: every buffer a segment needs, so a fit's
 /// thousands of segments allocate their outputs and nothing else.
 fn segment_in<T: PkNum>(
-    ws: &mut LinWs<T>,
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
+    ws: &mut LinWs<T>, rhs: &crate::ode::solver::RhsG<'_, T>, u0: &[T], t_span: (f64, f64),
+    params: &[T], saveat: &[f64], interp_at: &[f64],
 ) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
     // The walk's moving span (`RecHooks::span_hint`), or the values; handed back on a decline,
     // so the integration the walk falls back to takes it.
@@ -1478,14 +1398,8 @@ fn segment_in<T: PkNum>(
 
 #[allow(clippy::too_many_arguments)]
 fn segment_span<T: PkNum>(
-    ws: &mut LinWs<T>,
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    span: Option<(T, T)>,
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
+    ws: &mut LinWs<T>, rhs: &crate::ode::solver::RhsG<'_, T>, u0: &[T], t_span: (f64, f64),
+    span: Option<(T, T)>, params: &[T], saveat: &[f64], interp_at: &[f64],
 ) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
     use crate::sens::num::BranchCmp::{Eq, Gt, Lt};
     let n = u0.len();
@@ -1766,8 +1680,7 @@ fn segment_span<T: PkNum>(
         if dt_t.br_cmp_c(Gt, 0.0) {
             // A gap that moves with the inputs is its own exponential.
             let key = if dt_t.is_constant() {
-                dt_t.nonrec_val()
-                    .map_or(u64::MAX - step as u64, f64::to_bits)
+                dt_t.nonrec_val().map_or(u64::MAX - step as u64, f64::to_bits)
             } else {
                 u64::MAX - step as u64
             };
@@ -1829,21 +1742,14 @@ fn segment_span<T: PkNum>(
 /// The save points of a propagation: request `i` (`saveat`, then `interp_at`) reads the state
 /// at its time's position `pos[i]` in `states` (`n` per time).
 fn points<T: PkNum>(
-    saveat: &[f64],
-    interp_at: &[f64],
-    pos: &[usize],
-    states: &[T],
-    n: usize,
+    saveat: &[f64], interp_at: &[f64], pos: &[usize], states: &[T], n: usize,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let at = |ts: &[f64], base: usize| -> Vec<SolPointG<T>> {
         ts.iter()
             .enumerate()
             .map(|(k, &t)| {
                 let i = pos[base + k];
-                SolPointG {
-                    t,
-                    u: states[i * n..(i + 1) * n].to_vec(),
-                }
+                SolPointG { t, u: states[i * n..(i + 1) * n].to_vec() }
             })
             .collect()
     };
@@ -1931,13 +1837,10 @@ thread_local! {
 fn with_workspace<T: PkNum, R>(f: impl FnOnce(&mut LinWs<T>) -> R) -> R {
     let taken = LIN_WS.with(|p| {
         let mut p = p.borrow_mut();
-        p.iter()
-            .position(|w| w.is::<LinWs<T>>())
-            .map(|i| p.swap_remove(i))
+        p.iter().position(|w| w.is::<LinWs<T>>()).map(|i| p.swap_remove(i))
     });
-    let mut ws: Box<LinWs<T>> = taken
-        .and_then(|b| b.downcast::<LinWs<T>>().ok())
-        .unwrap_or_else(|| Box::new(LinWs::new()));
+    let mut ws: Box<LinWs<T>> =
+        taken.and_then(|b| b.downcast::<LinWs<T>>().ok()).unwrap_or_else(|| Box::new(LinWs::new()));
     let r = f(&mut ws);
     LIN_WS.with(|p| p.borrow_mut().push(ws));
     r

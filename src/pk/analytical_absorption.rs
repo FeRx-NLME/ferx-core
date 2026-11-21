@@ -103,9 +103,7 @@ impl<T: PkNum> TiltedAbsorption<T> for TransitAbsorption<T> {
         // A debug check on values: skipped on a dependent recorded value (nothing to check
         // there that a guard would not over-constrain).
         debug_assert!(
-            k.nonrec_val()
-                .zip(ktr.nonrec_val())
-                .is_none_or(|(a, b)| a < b),
+            k.nonrec_val().zip(ktr.nonrec_val()).is_none_or(|(a, b)| a < b),
             "transit MGF diverges for k ≥ KTR; caller must guard ke < KTR"
         );
         (ktr / (ktr - k)).pow(self.n + T::from_f64(1.0))
@@ -174,9 +172,7 @@ impl<T: PkNum> TiltedAbsorption<T> for IgAbsorption<T> {
         // dispatch still guards `ke < 1/(2·MAT·CV²)` upstream (routing to the ODE
         // `igd()` twin otherwise). The assert catches a guard regression in tests.
         debug_assert!(
-            (self.two_mu2_over_lambda() * k)
-                .nonrec_val()
-                .is_none_or(|p| p < 1.0),
+            (self.two_mu2_over_lambda() * k).nonrec_val().is_none_or(|p| p < 1.0),
             "IG MGF diverges for k ≥ λ/(2μ²); caller must guard ke < 1/(2·MAT·CV²)"
         );
         (self.lambda_over_mu() * (T::from_f64(1.0) - self.tilt_r(k))).exp()
@@ -217,10 +213,7 @@ impl<T: PkNum> TiltedAbsorption<T> for IgAbsorption<T> {
 /// transit, `ke < KTR`) — the caller guards this upstream.
 #[inline]
 pub fn convolve_1cpt<T: PkNum, A: TiltedAbsorption<T>>(
-    abs: &A,
-    t: T,
-    ke: T,
-    f_dose_over_v: T,
+    abs: &A, t: T, ke: T, f_dose_over_v: T,
 ) -> T {
     f_dose_over_v * abs.mgf(ke) * (-(ke * t)).exp() * abs.tilted_cdf(t, ke)
 }
@@ -243,10 +236,7 @@ pub fn convolve_1cpt<T: PkNum, A: TiltedAbsorption<T>>(
 /// Same domain requirement as [`convolve_1cpt`] (`k` below `abs`'s MGF abscissa).
 #[inline]
 pub(crate) fn windowed_tilted_term<T: PkNum, A: TiltedAbsorption<T>>(
-    abs: &A,
-    t0: T,
-    t1: T,
-    k: T,
+    abs: &A, t0: T, t1: T, k: T,
 ) -> T {
     abs.mgf(k) * (-(k * t1)).exp() * (abs.tilted_cdf(t1, k) - abs.tilted_cdf(t0, k))
 }
@@ -276,12 +266,7 @@ pub(crate) fn windowed_tilted_term<T: PkNum, A: TiltedAbsorption<T>>(
 /// excludes the confluent `α = β` case (`diff → 0`).
 #[inline]
 pub fn convolve_2cpt<T: PkNum, A: TiltedAbsorption<T>>(
-    abs: &A,
-    t: T,
-    alpha: T,
-    beta: T,
-    k21: T,
-    f_dose_over_v1: T,
+    abs: &A, t: T, alpha: T, beta: T, k21: T, f_dose_over_v1: T,
 ) -> T {
     let diff = alpha - beta;
     let c_alpha = (alpha - k21) / diff;
@@ -308,12 +293,7 @@ pub fn convolve_2cpt<T: PkNum, A: TiltedAbsorption<T>>(
 /// Same domain requirement and `α ≠ β` exclusion as [`convolve_2cpt`].
 #[inline]
 pub(crate) fn convolve_2cpt_peripheral<T: PkNum, A: TiltedAbsorption<T>>(
-    abs: &A,
-    t: T,
-    alpha: T,
-    beta: T,
-    k12: T,
-    f_dose_over_v2: T,
+    abs: &A, t: T, alpha: T, beta: T, k12: T, f_dose_over_v2: T,
 ) -> T {
     let coeff = f_dose_over_v2 * k12 / (alpha - beta);
     convolve_1cpt(abs, t, beta, coeff) - convolve_1cpt(abs, t, alpha, coeff)
@@ -335,10 +315,7 @@ mod tests {
     /// Same concentration with `n`, `mtt`, `ke` seeded as the three `Dual2`
     /// variables (dims 0, 1, 2), so `.grad`/`.hess` carry the exact derivatives.
     fn dual_conc(n: f64, mtt: f64, t: f64, ke: f64, f_dose_over_v: f64) -> Dual2<3> {
-        let abs = TransitAbsorption {
-            n: Dual2::<3>::var(n, 0),
-            mtt: Dual2::<3>::var(mtt, 1),
-        };
+        let abs = TransitAbsorption { n: Dual2::<3>::var(n, 0), mtt: Dual2::<3>::var(mtt, 1) };
         convolve_1cpt(
             &abs,
             Dual2::<3>::from_f64(t),
@@ -397,11 +374,7 @@ mod tests {
                 for i in 0..=steps {
                     let u = i as f64 * h;
                     // f(0)=0 for n>0; the u^n factor handles the u=0 endpoint.
-                    let integrand = if u == 0.0 {
-                        0.0
-                    } else {
-                        dens(u) * (-ke * (t - u)).exp()
-                    };
+                    let integrand = if u == 0.0 { 0.0 } else { dens(u) * (-ke * (t - u)).exp() };
                     let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
                     acc += w * integrand;
                 }
@@ -520,15 +493,11 @@ mod tests {
     fn convolve_1cpt_t_and_dose_sensitivities() {
         let h = 1e-6;
         let h2 = 1e-4;
-        for &(n, mtt, ke, t) in &[
-            (2.5, 1.0, 0.10, 1.5),
-            (1.3, 0.7, 0.20, 3.0),
-            (0.4, 3.0, 0.15, 2.0),
-        ] {
-            let abs = TransitAbsorption {
-                n: Dual2::<1>::from_f64(n),
-                mtt: Dual2::<1>::from_f64(mtt),
-            };
+        for &(n, mtt, ke, t) in
+            &[(2.5, 1.0, 0.10, 1.5), (1.3, 0.7, 0.20, 3.0), (0.4, 3.0, 0.15, 2.0)]
+        {
+            let abs =
+                TransitAbsorption { n: Dual2::<1>::from_f64(n), mtt: Dual2::<1>::from_f64(mtt) };
             let ke_c = Dual2::<1>::from_f64(ke);
             let fdv_c = Dual2::<1>::from_f64(2.0);
             let d = convolve_1cpt(&abs, Dual2::<1>::var(t, 0), ke_c, fdv_c);
@@ -547,21 +516,15 @@ mod tests {
         }
         // C is exactly linear in F·Dose/V: ∂C/∂fdv = C/fdv, ∂²C/∂fdv² = 0.
         let fdv = 2.0;
-        let abs = TransitAbsorption {
-            n: Dual2::<1>::from_f64(2.5),
-            mtt: Dual2::<1>::from_f64(1.0),
-        };
+        let abs =
+            TransitAbsorption { n: Dual2::<1>::from_f64(2.5), mtt: Dual2::<1>::from_f64(1.0) };
         let d = convolve_1cpt(
             &abs,
             Dual2::<1>::from_f64(1.5),
             Dual2::<1>::from_f64(0.1),
             Dual2::<1>::var(fdv, 0),
         );
-        assert_relative_eq!(
-            d.grad[0],
-            conc(2.5, 1.0, 1.5, 0.1, fdv) / fdv,
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(d.grad[0], conc(2.5, 1.0, 1.5, 0.1, fdv) / fdv, max_relative = 1e-12);
         assert_relative_eq!(d.hess[0][0], 0.0, epsilon = 1e-12);
     }
 
@@ -588,14 +551,7 @@ mod tests {
         let mttd = Dual2::<6>::var(mtt, 5);
         let (a, b, k21) = macro_rates_g(cld, v1d, qd, v2d);
         let abs = TransitAbsorption { n: nd, mtt: mttd };
-        convolve_2cpt(
-            &abs,
-            Dual2::<6>::from_f64(t),
-            a,
-            b,
-            k21,
-            Dual2::<6>::from_f64(amt) / v1d,
-        )
+        convolve_2cpt(&abs, Dual2::<6>::from_f64(t), a, b, k21, Dual2::<6>::from_f64(amt) / v1d)
     }
 
     /// With `n = 0` the transit chain is first-order absorption with
@@ -710,10 +666,9 @@ mod tests {
     #[test]
     fn convolve_2cpt_peripheral_matches_numerical() {
         let amt = 100.0;
-        for &(cl, v1, q, v2, n, mtt) in &[
-            (5.0, 20.0, 10.0, 40.0, 2.5, 1.0),
-            (3.0, 30.0, 6.0, 60.0, 1.3, 0.7),
-        ] {
+        for &(cl, v1, q, v2, n, mtt) in
+            &[(5.0, 20.0, 10.0, 40.0, 2.5, 1.0), (3.0, 30.0, 6.0, 60.0, 1.3, 0.7)]
+        {
             let (alpha, beta, _k21) = macro_rates_g::<f64>(cl, v1, q, v2);
             let k12 = q / v1;
             let abs = TransitAbsorption { n, mtt };
@@ -762,10 +717,7 @@ mod tests {
 
     /// Same, with `mat`, `lambda`, `ke` seeded as `Dual2` vars (dims 0, 1, 2).
     fn ig_dual_conc(mat: f64, lambda: f64, t: f64, ke: f64, fdv: f64) -> Dual2<3> {
-        let abs = IgAbsorption {
-            mat: Dual2::<3>::var(mat, 0),
-            lambda: Dual2::<3>::var(lambda, 1),
-        };
+        let abs = IgAbsorption { mat: Dual2::<3>::var(mat, 0), lambda: Dual2::<3>::var(lambda, 1) };
         convolve_1cpt(
             &abs,
             Dual2::<3>::from_f64(t),
@@ -778,10 +730,7 @@ mod tests {
     /// concentration starts at 0 and is positive after, and `G` is a monotone CDF.
     #[test]
     fn ig_mgf_and_tilted_cdf_sanity() {
-        let abs = IgAbsorption {
-            mat: 2.0,
-            lambda: 6.0,
-        };
+        let abs = IgAbsorption { mat: 2.0, lambda: 6.0 };
         assert_relative_eq!(abs.mgf(0.0), 1.0, max_relative = 1e-12);
         assert_relative_eq!(abs.tilted_cdf(0.0, 0.1), 0.0, epsilon = 1e-12);
         assert_relative_eq!(abs.tilted_cdf(1e6, 0.1), 1.0, max_relative = 1e-9);
@@ -915,11 +864,9 @@ mod tests {
     fn convolve_1cpt_ig_t_and_dose_sensitivities() {
         let h = 1e-6;
         let h2 = 1e-4;
-        for &(mat, lambda, ke, t) in &[
-            (2.0, 6.0, 0.10, 1.5),
-            (1.0, 4.0, 0.30, 3.0),
-            (4.0, 20.0, 0.05, 6.0),
-        ] {
+        for &(mat, lambda, ke, t) in
+            &[(2.0, 6.0, 0.10, 1.5), (1.0, 4.0, 0.30, 3.0), (4.0, 20.0, 0.05, 6.0)]
+        {
             let abs = IgAbsorption {
                 mat: Dual2::<1>::from_f64(mat),
                 lambda: Dual2::<1>::from_f64(lambda),
@@ -941,10 +888,8 @@ mod tests {
         }
         // Exactly linear in F·Dose/V.
         let fdv = 2.0;
-        let abs = IgAbsorption {
-            mat: Dual2::<1>::from_f64(2.0),
-            lambda: Dual2::<1>::from_f64(6.0),
-        };
+        let abs =
+            IgAbsorption { mat: Dual2::<1>::from_f64(2.0), lambda: Dual2::<1>::from_f64(6.0) };
         let d = convolve_1cpt(
             &abs,
             Dual2::<1>::from_f64(1.5),
@@ -968,14 +913,7 @@ mod tests {
     /// Same with all six PK params seeded as `Dual2<6>` (cl,v1,q,v2,mat,lambda).
     #[allow(clippy::too_many_arguments)]
     fn ig_tc_dual(
-        cl: f64,
-        v1: f64,
-        q: f64,
-        v2: f64,
-        mat: f64,
-        lambda: f64,
-        t: f64,
-        amt: f64,
+        cl: f64, v1: f64, q: f64, v2: f64, mat: f64, lambda: f64, t: f64, amt: f64,
     ) -> Dual2<6> {
         let (a, b, k21) = macro_rates_g(
             Dual2::<6>::var(cl, 0),
@@ -983,10 +921,7 @@ mod tests {
             Dual2::<6>::var(q, 2),
             Dual2::<6>::var(v2, 3),
         );
-        let abs = IgAbsorption {
-            mat: Dual2::<6>::var(mat, 4),
-            lambda: Dual2::<6>::var(lambda, 5),
-        };
+        let abs = IgAbsorption { mat: Dual2::<6>::var(mat, 4), lambda: Dual2::<6>::var(lambda, 5) };
         convolve_2cpt(
             &abs,
             Dual2::<6>::from_f64(t),
@@ -1009,10 +944,7 @@ mod tests {
             (8.0, 50.0, 20.0, 30.0, 1.0, 5.0),
         ] {
             let (alpha, beta, k21) = macro_rates_g::<f64>(cl, v1, q, v2);
-            assert!(
-                alpha < ig_abscissa(mat, lambda),
-                "α must be inside the abscissa"
-            );
+            assert!(alpha < ig_abscissa(mat, lambda), "α must be inside the abscissa");
             let diff = alpha - beta;
             let c_alpha = (alpha - k21) / diff;
             let c_beta = (k21 - beta) / diff;
@@ -1078,10 +1010,9 @@ mod tests {
     #[test]
     fn convolve_2cpt_ig_peripheral_matches_numerical() {
         let amt = 100.0;
-        for &(cl, v1, q, v2, mat, lambda) in &[
-            (5.0, 20.0, 10.0, 40.0, 1.0, 3.333),
-            (3.0, 30.0, 6.0, 60.0, 1.5, 6.0),
-        ] {
+        for &(cl, v1, q, v2, mat, lambda) in
+            &[(5.0, 20.0, 10.0, 40.0, 1.0, 3.333), (3.0, 30.0, 6.0, 60.0, 1.5, 6.0)]
+        {
             let (alpha, beta, _k21) = macro_rates_g::<f64>(cl, v1, q, v2);
             let k12 = q / v1;
             let abs = IgAbsorption { mat, lambda };
@@ -1139,18 +1070,11 @@ mod tests {
         // (KTR = 3.5).
         let windows = [(1.5, 4.0, 0.12), (6.0, 9.5, 0.3), (0.4, 1.1, 0.9 * 3.5)];
         let transit = TransitAbsorption { n: 2.5, mtt: 1.0 };
-        let ig = IgAbsorption {
-            mat: 2.0,
-            lambda: 2.0 / 0.4,
-        };
+        let ig = IgAbsorption { mat: 2.0, lambda: 2.0 / 0.4 };
         for &(t0, t1, k) in &windows {
             let got_tr = windowed_tilted_term(&transit, t0, t1, k);
-            let want_tr = simpson(
-                |u| transit_density(2.5, 1.0, u) * (-k * (t1 - u)).exp(),
-                t0,
-                t1,
-                20_000,
-            );
+            let want_tr =
+                simpson(|u| transit_density(2.5, 1.0, u) * (-k * (t1 - u)).exp(), t0, t1, 20_000);
             assert!(got_tr.is_finite() && want_tr > 0.0);
             assert_relative_eq!(got_tr, want_tr, max_relative = 1e-10);
             let from_zero = convolve_1cpt(&transit, t1, k, 1.0);
@@ -1191,11 +1115,7 @@ mod tests {
         let (tm, t1, k) = (1.7, 5.0, 0.2);
         let composed = windowed_tilted_term(&transit, 0.0, tm, k) * (-k * (t1 - tm)).exp()
             + windowed_tilted_term(&transit, tm, t1, k);
-        assert_relative_eq!(
-            composed,
-            convolve_1cpt(&transit, t1, k, 1.0),
-            max_relative = 1e-13
-        );
+        assert_relative_eq!(composed, convolve_1cpt(&transit, t1, k, 1.0), max_relative = 1e-13);
     }
 
     /// T2 (#1560): the windowed term's `Dual2` jets against central differences of its
@@ -1211,22 +1131,11 @@ mod tests {
             windowed_tilted_term(&TransitAbsorption { n: x[0], mtt: x[1] }, x[3], x[4], x[2])
         };
         let eval_ig = |x: [f64; 5]| {
-            windowed_tilted_term(
-                &IgAbsorption {
-                    mat: x[0],
-                    lambda: x[1],
-                },
-                x[3],
-                x[4],
-                x[2],
-            )
+            windowed_tilted_term(&IgAbsorption { mat: x[0], lambda: x[1] }, x[3], x[4], x[2])
         };
         let dual_tr = |x: [f64; 5]| {
             windowed_tilted_term(
-                &TransitAbsorption {
-                    n: D::var(x[0], 0),
-                    mtt: D::var(x[1], 1),
-                },
+                &TransitAbsorption { n: D::var(x[0], 0), mtt: D::var(x[1], 1) },
                 D::var(x[3], 3),
                 D::var(x[4], 4),
                 D::var(x[2], 2),
@@ -1234,10 +1143,7 @@ mod tests {
         };
         let dual_ig = |x: [f64; 5]| {
             windowed_tilted_term(
-                &IgAbsorption {
-                    mat: D::var(x[0], 0),
-                    lambda: D::var(x[1], 1),
-                },
+                &IgAbsorption { mat: D::var(x[0], 0), lambda: D::var(x[1], 1) },
                 D::var(x[3], 3),
                 D::var(x[4], 4),
                 D::var(x[2], 2),
@@ -1386,10 +1292,7 @@ mod tests {
         // `r = √(1 − 2μ²k/λ)`, at CV 0.06, t = 1.1, k = ke = 0.2 (the shallowest cell).
         let (lam, t, k) = (1.0 / (0.06_f64 * 0.06), 1.1_f64, 0.2_f64);
         let z2 = -(lam / t).sqrt() * (t * (1.0 - 2.0 * k / lam).sqrt() + 1.0);
-        assert!(
-            z2 < -26.5,
-            "fixture no longer reaches the old NaN zone: z₂ = {z2}"
-        );
+        assert!(z2 < -26.5, "fixture no longer reaches the old NaN zone: z₂ = {z2}");
         assert!(worst.0.is_finite() && worst.1.is_finite());
     }
 
@@ -1400,21 +1303,13 @@ mod tests {
     /// finite first, so a `NaN` jet fails naming the entry. Returns the worst
     /// `(gradient, Hessian)` scaled error.
     fn check_ig_jet<const N: usize>(
-        label: &str,
-        x: &[f64; N],
-        f: &dyn Fn([f64; N]) -> f64,
-        grad: [f64; N],
-        hess: [[f64; N]; N],
-        dual_grad: &dyn Fn([f64; N]) -> [f64; N],
+        label: &str, x: &[f64; N], f: &dyn Fn([f64; N]) -> f64, grad: [f64; N],
+        hess: [[f64; N]; N], dual_grad: &dyn Fn([f64; N]) -> [f64; N],
     ) -> (f64, f64) {
         for i in 0..N {
             assert!(grad[i].is_finite(), "{label}: grad[{i}] = {}", grad[i]);
             for j in 0..N {
-                assert!(
-                    hess[i][j].is_finite(),
-                    "{label}: hess[{i}][{j}] = {}",
-                    hess[i][j]
-                );
+                assert!(hess[i][j].is_finite(), "{label}: hess[{i}][{j}] = {}", hess[i][j]);
             }
         }
         let gscale = grad.iter().fold(0.0_f64, |m, g| m.max(g.abs())); // nan-ok: grad asserted finite above
@@ -1426,10 +1321,7 @@ mod tests {
             xm[j] -= h;
             let fd = (f(xp) - f(xm)) / (2.0 * h);
             let eg = (grad[j] - fd).abs() / gscale;
-            assert!(
-                eg.is_finite(),
-                "{label}: grad[{j}] FD error not finite (fd {fd})"
-            );
+            assert!(eg.is_finite(), "{label}: grad[{j}] FD error not finite (fd {fd})");
             assert!(
                 eg <= IG_FD_TOL,
                 "{label}: grad[{j}] {} vs FD {fd} (scaled error {eg:.2e})",
@@ -1445,10 +1337,7 @@ mod tests {
                 let fd2 = (gp[i] - gm[i]) / (2.0 * h2);
                 let hscale = hess[i].iter().fold(0.0_f64, |m, v| m.max(v.abs())); // nan-ok: hess asserted finite above
                 let eh = (hess[i][j] - fd2).abs() / hscale;
-                assert!(
-                    eh.is_finite(),
-                    "{label}: hess[{i}][{j}] FD error not finite (fd {fd2})"
-                );
+                assert!(eh.is_finite(), "{label}: hess[{i}][{j}] FD error not finite (fd {fd2})");
                 assert!(
                     eh <= IG_FD_TOL,
                     "{label}: hess[{i}][{j}] {} vs FD {fd2} (scaled error {eh:.2e})",

@@ -146,11 +146,7 @@ fn pop() -> Population {
 /// The reference: the `ADVAN2` table, with the `ADVAN13` value on `ADVAN13_REFERENCE` IDs.
 fn nonmem_obs() -> Vec<(String, f64, f64)> {
     let (a2, a13) = (read_table(TABLE), read_table(TABLE_ADVAN13));
-    assert_eq!(
-        a2.len(),
-        a13.len(),
-        "the two NONMEM tables must cover the same rows"
-    );
+    assert_eq!(a2.len(), a13.len(), "the two NONMEM tables must cover the same rows");
     a2.into_iter()
         .zip(a13)
         .map(|(r2, r13)| {
@@ -169,10 +165,7 @@ fn read_table(path: &str) -> Vec<(String, f64, f64)> {
     text.lines()
         .skip(2)
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
             (c[0], c[1], c[2], c[3])
         })
         .filter(|&(_, _, evid, _)| evid == 0.0)
@@ -203,23 +196,14 @@ fn assert_matches(label: &str, got: &[(String, f64, f64)], bound: f64, skip: &[&
         let err = (g - w).abs() / (1.0 + w.abs());
         // An `ADVAN13` reference is itself an ODE solve (`TOL=12`, measured 2.4e-12 from the
         // closed form here), so it cannot judge the analytic engines to `ANALYTIC_BOUND`.
-        let bound = if ADVAN13_REFERENCE.contains(&id.as_str()) {
-            bound.max(ODE_BOUND)
-        } else {
-            bound
-        };
+        let bound =
+            if ADVAN13_REFERENCE.contains(&id.as_str()) { bound.max(ODE_BOUND) } else { bound };
         if !(err < bound) {
-            bad.push(format!(
-                "ID {id} t={t}: ferx {g} vs NONMEM {w} (err {err:.3e})"
-            ));
+            bad.push(format!("ID {id} t={t}: ferx {g} vs NONMEM {w} (err {err:.3e})"));
         }
         worst = worst.max(err);
     }
-    assert_eq!(
-        skipped.len(),
-        skip.len(),
-        "{label}: a skipped ID is not in the data"
-    );
+    assert_eq!(skipped.len(), skip.len(), "{label}: a skipped ID is not in the data");
     println!(
         "#1587 {label}: worst err vs NONMEM {worst:.3e} (bound {bound:.0e}, skipped {skip:?})"
     );
@@ -248,10 +232,7 @@ fn raw_times() -> Vec<f64> {
 fn with_raw(rows: Vec<(String, f64)>) -> Vec<(String, f64, f64)> {
     let raw = raw_times();
     assert_eq!(rows.len(), raw.len(), "row count vs predict");
-    rows.into_iter()
-        .zip(raw)
-        .map(|((id, v), t)| (id, t, v))
-        .collect()
+    rows.into_iter().zip(raw).map(|((id, v), t)| (id, t, v)).collect()
 }
 
 /// `compute_predictions_with_states`: `ode_predictions_event_driven_with_states` on a reset
@@ -304,10 +285,7 @@ fn via_adaptive(model: &CompiledModel) -> Vec<(String, f64, f64)> {
     )
     .expect("adaptive sim runs and passes the frozen-replay verifier");
     assert!(res.ledger.is_empty(), "the no-op controller dosed");
-    res.trajectories
-        .into_iter()
-        .map(|r| (r.id, r.time, r.ipred))
-        .collect()
+    res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)).collect()
 }
 
 // Measured at the fix (err = |ferx − NONMEM| / (1 + |NONMEM|)): ODE predict / with-states /
@@ -328,10 +306,7 @@ const ANALYTIC_BOUND: f64 = 1e-13;
 fn the_nonmem_table_straddles_the_record_gate() {
     let want = nonmem_obs();
     let late = |id: &str| -> Vec<f64> {
-        want.iter()
-            .filter(|(i, t, _)| i == id && *t >= 16.0)
-            .map(|r| r.2)
-            .collect()
+        want.iter().filter(|(i, t, _)| i == id && *t >= 16.0).map(|r| r.2).collect()
     };
     for &(dead, live) in STRADDLES {
         let (d, l) = (late(dead), late(live));
@@ -357,9 +332,7 @@ fn ode_with_states_cancels_a_dose_recorded_before_the_reset() {
 fn ode_dual_walk_value_cancels_a_dose_recorded_before_the_reset() {
     let m = ode();
     let eta = vec![0.0; m.n_eta];
-    let got = via_dual(&m, |s| {
-        subject_eta_grad(&m, s, &m.default_params.theta, &eta)
-    });
+    let got = via_dual(&m, |s| subject_eta_grad(&m, s, &m.default_params.theta, &eta));
     assert_matches("ODE dual", &got, ODE_BOUND, &[]);
 }
 
@@ -370,20 +343,13 @@ fn adaptive_driver_cancels_a_dose_recorded_before_the_reset() {
 
 #[test]
 fn analytic_event_walk_cancels_a_dose_recorded_before_the_reset() {
-    assert_matches(
-        "analytic",
-        &via_predict(&analytic()),
-        ANALYTIC_BOUND,
-        CENTRAL_DOSE,
-    );
+    assert_matches("analytic", &via_predict(&analytic()), ANALYTIC_BOUND, CENTRAL_DOSE);
 }
 
 #[test]
 fn analytic_dual_cancels_a_dose_recorded_before_the_reset() {
     let m = analytic();
     let eta = vec![0.0; m.n_eta];
-    let got = via_dual(&m, |s| {
-        subject_eta_grad(&m, s, &m.default_params.theta, &eta)
-    });
+    let got = via_dual(&m, |s| subject_eta_grad(&m, s, &m.default_params.theta, &eta));
     assert_matches("analytic dual", &got, ANALYTIC_BOUND, ANALYTIC_DUAL_SKIP);
 }

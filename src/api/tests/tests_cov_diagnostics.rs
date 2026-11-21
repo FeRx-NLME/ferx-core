@@ -32,10 +32,7 @@ fn test_cov_diagnostics_excludes_fixed_params_zero_diagonal() {
     let ev = ev.expect("eigenvalues must be Some");
     let cn = cn.expect("condition_number must be Some");
     assert_eq!(ev.len(), 2, "must have 2 eigenvalues (one per free param)");
-    assert!(
-        cn.is_finite(),
-        "condition_number must be finite for non-singular subblock"
-    );
+    assert!(cn.is_finite(), "condition_number must be finite for non-singular subblock");
     assert!(cn > 0.0);
     // Eigenvalues must be sorted descending
     assert!(ev[0] >= ev[1]);
@@ -53,15 +50,9 @@ fn test_cov_diagnostics_inf_condition_number_for_non_positive_eigenvalue() {
     m[(1, 1)] = 1.0;
     let (ev, cn) = cov_diagnostics(Some(&m));
     let cn = cn.expect("condition_number must be Some");
-    assert!(
-        cn.is_infinite(),
-        "condition_number must be Inf when min eigenvalue ≤ 0, got {cn}"
-    );
+    assert!(cn.is_infinite(), "condition_number must be Inf when min eigenvalue ≤ 0, got {cn}");
     let ev = ev.expect("eigenvalues must be Some");
-    assert!(
-        ev.last().copied().unwrap_or(1.0) <= 0.0,
-        "min eigenvalue must be ≤ 0"
-    );
+    assert!(ev.last().copied().unwrap_or(1.0) <= 0.0, "min eigenvalue must be ≤ 0");
 }
 
 #[test]
@@ -92,10 +83,7 @@ fn test_cov_diagnostics_identity_covariance() {
     for &e in &ev {
         assert!((e - 1.0).abs() < 1e-12, "eigenvalue must be 1.0, got {e}");
     }
-    assert!(
-        (cn - 1.0).abs() < 1e-12,
-        "condition_number must be 1.0, got {cn}"
-    );
+    assert!((cn - 1.0).abs() < 1e-12, "condition_number must be 1.0, got {cn}");
 }
 
 // ── resolve_covariance_status ────────────────────────────────────────────
@@ -104,45 +92,27 @@ fn test_cov_diagnostics_identity_covariance() {
 fn cov_status_not_requested_when_step_off() {
     // When the covariance step is off, neither a (stale) covariance matrix
     // nor a fallback result can change the reported status.
-    assert_eq!(
-        resolve_covariance_status(false, true, true),
-        CovarianceStatus::NotRequested
-    );
-    assert_eq!(
-        resolve_covariance_status(false, false, false),
-        CovarianceStatus::NotRequested
-    );
+    assert_eq!(resolve_covariance_status(false, true, true), CovarianceStatus::NotRequested);
+    assert_eq!(resolve_covariance_status(false, false, false), CovarianceStatus::NotRequested);
 }
 
 #[test]
 fn cov_status_computed_takes_precedence_over_fallback() {
     // A real covariance matrix always wins, even if a fallback also ran.
-    assert_eq!(
-        resolve_covariance_status(true, true, false),
-        CovarianceStatus::Computed
-    );
-    assert_eq!(
-        resolve_covariance_status(true, true, true),
-        CovarianceStatus::Computed
-    );
+    assert_eq!(resolve_covariance_status(true, true, false), CovarianceStatus::Computed);
+    assert_eq!(resolve_covariance_status(true, true, true), CovarianceStatus::Computed);
 }
 
 #[test]
 fn cov_status_sir_fallback_when_no_matrix_but_fallback_ran() {
     // The branch the SIR-fallback wiring depends on: no H⁻¹ covariance, but
     // the |eigenvalue|-rectified SIR fallback produced a result.
-    assert_eq!(
-        resolve_covariance_status(true, false, true),
-        CovarianceStatus::SirFallback
-    );
+    assert_eq!(resolve_covariance_status(true, false, true), CovarianceStatus::SirFallback);
 }
 
 #[test]
 fn cov_status_failed_when_requested_but_nothing_produced() {
-    assert_eq!(
-        resolve_covariance_status(true, false, false),
-        CovarianceStatus::Failed
-    );
+    assert_eq!(resolve_covariance_status(true, false, false), CovarianceStatus::Failed);
 }
 
 // ── is_last_estimating_stage: covariance runs once, at chain end (#615) ──

@@ -168,13 +168,8 @@ pub(crate) fn writes() -> usize {
 /// being resumed from is preserved until a newer state replaces it.
 #[allow(clippy::too_many_arguments)]
 pub fn init(
-    path: String,
-    ferx_version: String,
-    model_hash: Option<String>,
-    data_hash: Option<String>,
-    method_chain: Vec<String>,
-    coord_names: Vec<String>,
-    interval_secs: u64,
+    path: String, ferx_version: String, model_hash: Option<String>, data_hash: Option<String>,
+    method_chain: Vec<String>, coord_names: Vec<String>, interval_secs: u64,
 ) {
     SINK.with(|s| {
         *s.borrow_mut() = Some(Sink {
@@ -395,10 +390,7 @@ mod tests {
         assert!(!is_due(), "not due immediately with a 1h interval");
         maybe_write(1, 1.0, &[0.5]);
         maybe_write(2, 0.9, &[0.4]);
-        assert!(
-            load(&path).is_none(),
-            "no checkpoint should exist for a sub-interval run"
-        );
+        assert!(load(&path).is_none(), "no checkpoint should exist for a sub-interval run");
         abandon();
         remove(&path);
     }
@@ -447,10 +439,7 @@ mod tests {
         assert!(load(&path).is_some());
         abandon();
         assert!(!is_active());
-        assert!(
-            load(&path).is_some(),
-            "abandon must leave the checkpoint for later resume"
-        );
+        assert!(load(&path).is_some(), "abandon must leave the checkpoint for later resume");
         remove(&path);
     }
 

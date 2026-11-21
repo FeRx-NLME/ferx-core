@@ -57,9 +57,7 @@ const BASE: &str = "\
 fn write_config(dir: &Path, base: &str, space: Option<&str>, extra: &str) -> PathBuf {
     std::fs::write(dir.join("base.ferx"), base).unwrap();
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(DATA);
-    let space = space
-        .map(|m| format!("[space]\nmfl = \"{m}\"\n\n"))
-        .unwrap_or_default();
+    let space = space.map(|m| format!("[space]\nmfl = \"{m}\"\n\n")).unwrap_or_default();
     let config = format!(
         "base = \"base.ferx\"\ndata = \"{}\"\n\n{space}\
          [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
@@ -77,10 +75,7 @@ fn run(dir: &Path, path: &Path) -> (SearchConfig, IovsearchResult) {
     let result = run_iovsearch(
         &config,
         &base,
-        IovsearchRun {
-            dir: Some(dir.join("run")),
-            ..IovsearchRun::default()
-        },
+        IovsearchRun { dir: Some(dir.join("run")), ..IovsearchRun::default() },
     )
     .expect("search");
     (config, result)
@@ -90,13 +85,8 @@ fn evaluate(text: &str, base: &ferx_tools::search::BaseModel) -> ferx_core::FitR
     let parsed = parse_full_model(text).expect("the model parses");
     let mut o = parsed.fit_options.clone().quiet();
     o.threads = Some(2);
-    fit(
-        &parsed.model,
-        &base.prepared.population,
-        &parsed.model.default_params,
-        &o,
-    )
-    .expect("evaluation")
+    fit(&parsed.model, &base.prepared.population, &parsed.model.default_params, &o)
+        .expect("evaluation")
 }
 
 #[test]
@@ -109,24 +99,17 @@ fn the_input_row_is_the_direct_evaluation_and_one_parameter_means_two_fits() {
         base.prepared.population.subjects[0].occasions.len() > 1,
         "the base's iov_column read the occasions"
     );
-    let direct = fit(
-        &base.prepared.parsed.model,
-        &base.prepared.population,
-        &base.prepared.init_params,
-        &{
+    let direct =
+        fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &{
             let mut o = base.prepared.parsed.fit_options.clone().quiet();
             o.threads = Some(2);
             o
-        },
-    )
-    .expect("direct evaluation");
+        })
+        .expect("direct evaluation");
     let result = run_iovsearch(
         &config,
         &base,
-        IovsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..IovsearchRun::default()
-        },
+        IovsearchRun { dir: Some(dir.path().join("run")), ..IovsearchRun::default() },
     )
     .expect("search");
     let input = result.row("input").unwrap();
@@ -140,26 +123,12 @@ fn the_input_row_is_the_direct_evaluation_and_one_parameter_means_two_fits() {
     assert_eq!(input.n_parameters, Some(direct.n_parameters));
     // One candidate parameter: the full-IOV model and no proper subset, and
     // the IIV step from it (when it wins) tries the one η.
-    let step1: Vec<&str> = result
-        .rows
-        .iter()
-        .filter(|r| r.step == 1)
-        .map(|r| r.id.as_str())
-        .collect();
+    let step1: Vec<&str> =
+        result.rows.iter().filter(|r| r.step == 1).map(|r| r.id.as_str()).collect();
     assert_eq!(step1, vec!["run1"]);
-    assert_eq!(
-        result.row("run1").unwrap().structure.description(),
-        "IIV([CL]+[KA]+[V]);IOV([CL])"
-    );
-    assert_eq!(
-        result.row("run1").unwrap().n_parameters,
-        Some(direct.n_parameters + 1)
-    );
-    assert!(
-        result.rows.iter().all(|r| r.error.is_none()),
-        "{:?}",
-        result.rows
-    );
+    assert_eq!(result.row("run1").unwrap().structure.description(), "IIV([CL]+[KA]+[V]);IOV([CL])");
+    assert_eq!(result.row("run1").unwrap().n_parameters, Some(direct.n_parameters + 1));
+    assert!(result.rows.iter().all(|r| r.error.is_none()), "{:?}", result.rows);
     let table = std::fs::read_to_string(dir.path().join("run/models.csv")).unwrap();
     assert_eq!(table.lines().count(), 1 + result.rows.len());
     assert!(dir.path().join("run/models/run1.ferx").exists());
@@ -186,20 +155,12 @@ fn every_candidate_compiles_and_evaluates_under_each_distribution() {
             .collect();
         assert!(failed.is_empty(), "{distribution}: {failed:?}");
         // The full model plus the six proper subsets of three κ.
-        assert_eq!(
-            result.rows.iter().filter(|r| r.step == 1).count(),
-            7,
-            "{distribution}"
-        );
+        assert_eq!(result.rows.iter().filter(|r| r.step == 1).count(), 7, "{distribution}");
         for r in &result.rows {
             let text = result.models[&r.id].render();
             parse_full_model(&text).unwrap_or_else(|e| panic!("{distribution} {}: {e}", r.id));
-            let n_kappa_cov: usize = r
-                .structure
-                .kappa_blocks
-                .iter()
-                .map(|b| b.len() * (b.len() - 1) / 2)
-                .sum();
+            let n_kappa_cov: usize =
+                r.structure.kappa_blocks.iter().map(|b| b.len() * (b.len() - 1) / 2).sum();
             assert_eq!(
                 r.n_parameters.unwrap(),
                 4 + r.structure.etas.len() + r.structure.kappas.len() + n_kappa_cov,
@@ -231,14 +192,8 @@ fn the_full_iov_candidate_is_the_hand_written_model() {
     // A tenth of the η's variance as the input evaluation left it — the
     // init itself — declared as `kappa`, and the κ beside the η.
     let hand_written = BASE
-        .replace(
-            "  CL = TVCL * exp(ETA_CL)",
-            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
-        )
-        .replace(
-            "  sigma PROP_ERR",
-            "  kappa KAPPA_CL ~ 0.009\n  sigma PROP_ERR",
-        );
+        .replace("  CL = TVCL * exp(ETA_CL)", "  CL = TVCL * exp(ETA_CL + KAPPA_CL)")
+        .replace("  sigma PROP_ERR", "  kappa KAPPA_CL ~ 0.009\n  sigma PROP_ERR");
     let ours = evaluate(&generated, &base);
     let theirs = evaluate(&hand_written, &base);
     assert_eq!(

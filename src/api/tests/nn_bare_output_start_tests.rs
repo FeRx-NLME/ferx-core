@@ -96,37 +96,21 @@ fn fit_and_ferx_check_both_report_it() {
         let parsed = parse_full_model(text).expect("DCM fixture parses");
         let mut options = parsed.fit_options.clone();
         options.outer_maxiter = 0;
-        let r = crate::fit(
-            &parsed.model,
-            &population,
-            &parsed.model.default_params,
-            &options,
-        )
-        .expect("maxiter = 0 fit runs");
-        r.warnings
-            .iter()
-            .any(|w| w.starts_with("W_NN_BARE_OUTPUT_START"))
+        let r = crate::fit(&parsed.model, &population, &parsed.model.default_params, &options)
+            .expect("maxiter = 0 fit runs");
+        r.warnings.iter().any(|w| w.starts_with("W_NN_BARE_OUTPUT_START"))
     };
     assert!(warned(&dcm_fixture_without_init()), "fit() must carry it");
     assert!(!warned(DCM), "fit() from a declared init must not");
 
     let checked = |text: &str| {
         use std::io::Write;
-        let mut f = tempfile::Builder::new()
-            .suffix(".ferx")
-            .tempfile()
-            .expect("create temp model");
+        let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
         f.write_all(text.as_bytes()).expect("write temp model");
         f.flush().expect("flush temp model");
         let report = crate::api::validate_model_file(f.path().to_str().expect("utf-8"), None);
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "W_NN_BARE_OUTPUT_START")
+        report.diagnostics.iter().any(|d| d.code == "W_NN_BARE_OUTPUT_START")
     };
-    assert!(
-        checked(&dcm_fixture_without_init()),
-        "ferx check must report it"
-    );
+    assert!(checked(&dcm_fixture_without_init()), "ferx check must report it");
     assert!(!checked(DCM), "ferx check on a declared init must not");
 }

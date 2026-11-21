@@ -112,10 +112,7 @@ fn a_design_with_the_level_columns_and_no_twin_runs_end_to_end() {
     assert!(result.ofv.is_finite(), "a finite objective: {}", result.ofv);
     assert_eq!(population.subjects.len(), 4);
     for (subject, (study, arm)) in
-        population
-            .subjects
-            .iter()
-            .zip([(1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (2.0, 2.0)])
+        population.subjects.iter().zip([(1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (2.0, 2.0)])
     {
         assert_eq!(subject.observations.len(), 4);
         assert!(subject.observations.iter().all(|v| v.is_finite()));

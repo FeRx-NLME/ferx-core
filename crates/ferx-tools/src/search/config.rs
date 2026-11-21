@@ -349,11 +349,7 @@ impl SearchConfig {
                 }
                 toml::Value::Table(_) => {
                     let sections = |names: &[&str]| {
-                        names
-                            .iter()
-                            .map(|s| format!("[{s}]"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        names.iter().map(|s| format!("[{s}]")).collect::<Vec<_>>().join(", ")
                     };
                     return Err(format!(
                         "unknown section `[{key}]`; the file takes {} and the tool sections {}",
@@ -374,18 +370,13 @@ impl SearchConfig {
                 let mfl = Mfl::parse(&space.mfl).map_err(|e| format!("[space] mfl: {e}"))?;
                 if mfl.features().next().is_none() {
                     return Err(
-                        "[space] mfl: the search space is empty — no feature statement".into(),
+                        "[space] mfl: the search space is empty — no feature statement".into()
                     );
                 }
                 check_coverage(&mfl).map_err(|e| format!("[space] mfl: {e}"))?;
                 (space.mfl, mfl)
             }
-            None => (
-                String::new(),
-                Mfl {
-                    statements: Vec::new(),
-                },
-            ),
+            None => (String::new(), Mfl { statements: Vec::new() }),
         };
         // A bad penalty schedule fails at load, not after the first fit.
         raw.rank.criterion()?;
@@ -424,10 +415,7 @@ impl SearchConfig {
     /// The runner options this file asks for.
     pub fn run_options(&self) -> RunOptions {
         RunOptions {
-            criterion: self
-                .rank
-                .criterion()
-                .expect("rank config validated at load"),
+            criterion: self.rank.criterion().expect("rank config validated at load"),
             strictness: self.strictness.strictness(),
             // Pharmpy's retries are on top of the exact-initials fit.
             n_starts: self.run.retries + 1,
@@ -454,11 +442,7 @@ impl SearchConfig {
 
     /// `[run] reuse_from`, resolved against the file's directory.
     pub fn reuse_dirs(&self) -> Vec<PathBuf> {
-        self.run
-            .reuse_from
-            .iter()
-            .map(|d| self.dir.join(d))
-            .collect()
+        self.run.reuse_from.iter().map(|d| self.dir.join(d)).collect()
     }
 
     /// Read the base model and its dataset.

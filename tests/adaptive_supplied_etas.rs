@@ -54,10 +54,8 @@ const OBS_TIMES: [f64; 6] = [2.0, 8.0, 20.0, 26.0, 32.0, 44.0];
 
 fn population(ids: &[&str]) -> Population {
     let k = OBS_TIMES.len();
-    let doses: Vec<DoseEvent> = [0.0, 24.0]
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
+    let doses: Vec<DoseEvent> =
+        [0.0, 24.0].iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
     Population {
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -67,13 +65,7 @@ fn population(ids: &[&str]) -> Population {
         subjects: ids
             .iter()
             .map(|id| {
-                common::subject(
-                    id,
-                    doses.clone(),
-                    OBS_TIMES.to_vec(),
-                    vec![0.0; k],
-                    vec![1; k],
-                )
+                common::subject(id, doses.clone(), OBS_TIMES.to_vec(), vec![0.0; k], vec![1; k])
             })
             .collect(),
     }
@@ -91,10 +83,7 @@ fn fitted() -> (ferx_core::ParsedModel, ferx_core::FitResult) {
         &data,
         &model.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(21),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(21), ..Default::default() },
     )
     .expect("data simulation");
     let mut rows = sim.iter();
@@ -126,11 +115,7 @@ fn supplied_ebes_reproduce_the_fits_own_ipred() {
 
     // Non-degenerate: every subject's η̂ differs from every other's, so a mix-up of
     // subjects cannot pass.
-    let ebes: Vec<u64> = fit_result
-        .subjects
-        .iter()
-        .map(|s| s.eta[0].to_bits())
-        .collect();
+    let ebes: Vec<u64> = fit_result.subjects.iter().map(|s| s.eta[0].to_bits()).collect();
     for i in 0..ebes.len() {
         for j in i + 1..ebes.len() {
             assert_ne!(ebes[i], ebes[j], "subjects {i} and {j} share η̂");
@@ -151,12 +136,8 @@ fn supplied_ebes_reproduce_the_fits_own_ipred() {
     // segments at the same η̂, so there is no solver gap to leave room for.
     let mut compared = 0;
     for s in &fit_result.subjects {
-        let rows: Vec<(f64, f64)> = res
-            .trajectories
-            .iter()
-            .filter(|r| r.id == s.id)
-            .map(|r| (r.time, r.ipred))
-            .collect();
+        let rows: Vec<(f64, f64)> =
+            res.trajectories.iter().filter(|r| r.id == s.id).map(|r| (r.time, r.ipred)).collect();
         assert_eq!(rows.len(), s.ipred.len(), "subject {}", s.id);
         for ((t, got), want) in rows.iter().zip(&s.ipred) {
             assert_eq!(
@@ -175,14 +156,10 @@ fn supplied_ebes_reproduce_the_fits_own_ipred() {
 #[test]
 fn from_fit_refuses_a_fit_of_another_model() {
     let (_, fit_result) = fitted();
-    let other = parse_full_model(&MODEL.replace("ETA_CL", "ETA_K"))
-        .expect("renamed model parses")
-        .model;
+    let other =
+        parse_full_model(&MODEL.replace("ETA_CL", "ETA_K")).expect("renamed model parses").model;
     let err = SuppliedEtas::from_fit(&fit_result, &other).expect_err("refused");
-    assert_eq!(
-        err.diagnostic().map(|d| d.code.as_str()),
-        Some("E_SUPPLIED_ETAS")
-    );
+    assert_eq!(err.diagnostic().map(|d| d.code.as_str()), Some("E_SUPPLIED_ETAS"));
     assert_eq!(
         err.to_string(),
         "the fit's η are named [ETA_CL] but the model's are [ETA_K]; the fit is of another \

@@ -106,25 +106,22 @@ fn unknown_vi_option_values_are_rejected_with_a_useful_message() {
         Ok(_) => panic!("expected a parse error for: {src}"),
     };
 
-    let err = parse_err(&format!(
-        "{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_family = banana\n"
-    ));
+    let err =
+        parse_err(&format!("{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_family = banana\n"));
     assert!(
         err.contains("full_rank") && err.contains("mean_field"),
         "the error should name the valid values, got: {err}"
     );
 
-    let err = parse_err(&format!(
-        "{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_final_ofv = imp\n"
-    ));
+    let err =
+        parse_err(&format!("{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_final_ofv = imp\n"));
     assert!(
         err.contains("imp_eval_only"),
         "the error should point at the chain that does give an IS likelihood, got: {err}"
     );
 
-    let err = parse_err(&format!(
-        "{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_kl = laplace\n"
-    ));
+    let err =
+        parse_err(&format!("{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_kl = laplace\n"));
     assert!(
         err.contains("analytic") && err.contains("mc"),
         "the error should name the valid values, got: {err}"
@@ -148,10 +145,7 @@ fn vi_runs_and_populates_its_result() {
     assert_eq!(vi.eta_means.len(), population.subjects.len());
     assert_eq!(vi.eta_means[0].len(), 3);
     assert_eq!(vi.eta_covs[0].len(), 3);
-    assert_eq!(
-        vi.n_fd_subjects, 0,
-        "warfarin is inside the analytic eta-gradient scope"
-    );
+    assert_eq!(vi.n_fd_subjects, 0, "warfarin is inside the analytic eta-gradient scope");
 
     // Estimates come back on the natural scale, positive, and finite.
     assert!(result.theta.iter().all(|t| t.is_finite() && *t > 0.0));
@@ -167,10 +161,7 @@ fn ofv_is_nan_by_default_and_finite_when_requested() {
     let (model, population) = (warfarin_model(), warfarin_data());
 
     let default = run(&model, &population, &vi_opts(10));
-    assert!(
-        default.ofv.is_nan(),
-        "the ELBO must not be reported as an OFV"
-    );
+    assert!(default.ofv.is_nan(), "the ELBO must not be reported as an OFV");
     assert!(
         default.warnings.iter().any(|w| w.contains("lower bound")),
         "a NaN OFV must be explained; warnings were {:?}",
@@ -180,10 +171,7 @@ fn ofv_is_nan_by_default_and_finite_when_requested() {
     let mut opts = vi_opts(10);
     opts.vi_final_ofv = ViFinalOfv::Laplace;
     let with_ofv = run(&model, &population, &opts);
-    assert!(
-        with_ofv.ofv.is_finite(),
-        "vi_final_ofv = laplace must produce an OFV"
-    );
+    assert!(with_ofv.ofv.is_finite(), "vi_final_ofv = laplace must produce an OFV");
     assert!(
         (with_ofv.ofv - with_ofv.vi.as_ref().unwrap().neg_two_elbo).abs() > 1e-9,
         "the Laplace objective and the ELBO bound must be distinguishable"
@@ -262,10 +250,7 @@ fn mc_kl_with_adam_omega_warns_but_still_fits() {
     // The default pair is silent.
     let quiet = run(&model, &population, &vi_opts(10));
     assert!(
-        !quiet
-            .warnings
-            .iter()
-            .any(|w| w.contains("vi_omega_update = adam")),
+        !quiet.warnings.iter().any(|w| w.contains("vi_omega_update = adam")),
         "the default configuration must not warn; warnings were {:?}",
         quiet.warnings
     );
@@ -290,10 +275,7 @@ fn covariance_step_produces_standard_errors() {
         "VI must run the covariance step; warnings were {:?}",
         result.warnings
     );
-    let se = result
-        .se_theta
-        .as_ref()
-        .expect("a computed covariance must yield theta SEs");
+    let se = result.se_theta.as_ref().expect("a computed covariance must yield theta SEs");
     assert_eq!(se.len(), 3);
     assert!(
         se.iter().all(|s| s.is_finite() && *s > 0.0),
@@ -357,14 +339,8 @@ fn vi_chains_into_focei() {
     };
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("vi → focei chain runs");
-    assert!(
-        result.vi.is_some(),
-        "the VI stage's result must survive the chain"
-    );
-    assert!(
-        result.ofv.is_finite(),
-        "the terminal FOCEI stage must report a real OFV"
-    );
+    assert!(result.vi.is_some(), "the VI stage's result must survive the chain");
+    assert!(result.ofv.is_finite(), "the terminal FOCEI stage must report a real OFV");
 }
 
 /// And as a later stage: VI must accept another estimator's parameters as its
@@ -384,10 +360,7 @@ fn focei_chains_into_vi() {
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("focei → vi chain runs");
     assert!(result.vi.is_some());
-    assert!(
-        result.ofv.is_nan(),
-        "a terminal VI stage reports no OFV by default"
-    );
+    assert!(result.ofv.is_nan(), "a terminal VI stage reports no OFV by default");
 }
 
 // ---------------------------------------------------------------------------
@@ -508,28 +481,16 @@ fn vi_fit_round_trips_through_a_fitrx_bundle() {
     let population = warfarin_data();
     let model = warfarin_model();
     let r = run(&model, &population, &vi_opts(5));
-    assert!(
-        r.ofv.is_nan(),
-        "premise: vi_final_ofv = none leaves ofv NaN"
-    );
+    assert!(r.ofv.is_nan(), "premise: vi_final_ofv = none leaves ofv NaN");
     let vi = r.vi.as_ref().expect("premise: a VI fit carries `vi`");
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vi.fitrx");
-    save_fit(
-        &r,
-        &population,
-        WARFARIN_SRC,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .unwrap();
+    save_fit(&r, &population, WARFARIN_SRC, &path, SaveFitOptions::default()).unwrap();
     let l = load_fit(&path).expect("a VI bundle must load").fit;
 
     assert!(l.ofv.is_nan() && l.aic.is_none() && l.bic.is_none());
-    let lv =
-        l.vi.as_ref()
-            .expect("the VI result must survive the round trip");
+    let lv = l.vi.as_ref().expect("the VI result must survive the round trip");
     assert_eq!(format!("{lv:?}"), format!("{vi:?}"));
     assert_eq!(lv.eta_means.len(), population.subjects.len());
 }

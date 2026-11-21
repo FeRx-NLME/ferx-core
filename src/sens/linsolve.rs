@@ -201,20 +201,13 @@ fn lu_factor_f64(m: &mut [f64], piv: &mut [f64], n: usize) -> bool {
 #[inline(always)]
 fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> bool {
     debug_assert_eq!(m.len(), n * n, "coefficient matrix must be n×n row-major");
-    debug_assert_eq!(
-        piv.len(),
-        lu_piv_len::<T>(n),
-        "pivot storage must be `lu_piv_len` long"
-    );
+    debug_assert_eq!(piv.len(), lu_piv_len::<T>(n), "pivot storage must be `lu_piv_len` long");
     if T::RECORDS_BRANCHES {
         return lu_factor_recorded(m, piv, n);
     }
     // Singular tolerance relative to the largest value-part magnitude, floored at 1.0 so a
     // uniformly small-entry system is not spuriously rejected.
-    let tol = 1e-12
-        * m.iter()
-            .fold(0.0_f64, |s, x| s.max(x.plain().abs()))
-            .max(1.0);
+    let tol = 1e-12 * m.iter().fold(0.0_f64, |s, x| s.max(x.plain().abs())).max(1.0);
     for col in 0..n {
         // Partial pivot: largest value-part magnitude in this column, at or below the
         // diagonal.
@@ -309,11 +302,7 @@ fn lu_factor_recorded<T: PkNum>(m: &[T], piv: &mut [T], n: usize) -> bool {
 /// computes finite values whose reverse carries no `0 · ∞`.
 pub(crate) fn lu_factor_flag_g<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> T {
     if !T::RECORDS_BRANCHES {
-        return T::from_f64(if lu_factor_in_place_g(m, piv, n) {
-            1.0
-        } else {
-            0.0
-        });
+        return T::from_f64(if lu_factor_in_place_g(m, piv, n) { 1.0 } else { 0.0 });
     }
     use crate::sens::num::BranchCmp::Eq;
     let mut args = m[..n * n].to_vec();
@@ -368,11 +357,7 @@ const REFINE_STEPS: usize = 4;
 /// values' LU the step's derivative in `x` is `I − LU⁻¹A`, which has no value part, so each
 /// step makes one more derivative order exact; the value stays `x₀`'s.
 fn lu_solve_recorded<T: PkNum>(piv: &[T], n: usize, b: &mut [T]) {
-    let (pv, lu, a) = (
-        &piv[..n],
-        &piv[n..n + n * n],
-        &piv[n + n * n..n + 2 * n * n],
-    );
+    let (pv, lu, a) = (&piv[..n], &piv[n..n + n * n], &piv[n + n * n..n + 2 * n * n]);
     let mut x0: Vec<T> = b.iter().map(|v| v.value_only()).collect();
     lu_substitute(lu, pv, n, &mut x0);
     // Refinement against the value factorization makes one more derivative order exact per
@@ -487,10 +472,7 @@ mod tests {
     fn lu_reference<T: PkNum>(m: &[T], n: usize, b: &[T]) -> Option<Vec<T>> {
         let mut m = m.to_vec();
         let mut piv = vec![0usize; n];
-        let scale = m
-            .iter()
-            .fold(0.0_f64, |s, x| s.max(x.plain().abs()))
-            .max(1.0);
+        let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.plain().abs())).max(1.0);
         for col in 0..n {
             let mut p = col;
             let mut best = m[col * n + col].plain().abs();
@@ -551,10 +533,7 @@ mod tests {
         use crate::sens::dual2::Dual2;
         let n = 4;
         let c = |v: f64| Dual2::<2>::constant(v);
-        let d = |v: f64, g0: f64, g1: f64| Dual2::<2> {
-            grad: [g0, g1],
-            ..Dual2::constant(v)
-        };
+        let d = |v: f64, g0: f64, g1: f64| Dual2::<2> { grad: [g0, g1], ..Dual2::constant(v) };
         let mut m = vec![c(0.0); n * n];
         m[0] = d(1.0, 1.0, 0.2); // pivot-swap: row 1 has the larger column-0 entry
         m[n] = d(3.0, 0.0, 0.5);
@@ -594,10 +573,7 @@ mod tests {
         assert!(lu_factor_in_place_g(&mut m, &mut piv, n));
         assert_eq!(piv[0], 0.0, "premise: no swap");
         let want = 0.0_f64 / -2.0;
-        assert!(
-            want.is_sign_negative(),
-            "premise: the dense multiplier is −0"
-        );
+        assert!(want.is_sign_negative(), "premise: the dense multiplier is −0");
         assert_eq!(m[2].to_bits(), want.to_bits(), "multiplier {}", m[2]);
     }
 
@@ -619,10 +595,7 @@ mod tests {
         let mut b = vec![0.0, 1.0];
         lu_solve_in_place_g(&mm, &piv, n, &mut b);
         let want = lu_reference_solve_only(&mm, &piv, n, &[0.0, 1.0]);
-        assert!(
-            want.iter().any(|v| v.is_nan()),
-            "premise: the dense solve is NaN"
-        );
+        assert!(want.iter().any(|v| v.is_nan()), "premise: the dense solve is NaN");
         assert!(b.iter().any(|v| v.is_nan()), "the skip hid a NaN: {b:?}");
     }
 
@@ -644,10 +617,7 @@ mod tests {
         // Column 2's pivot is then NaN, so the factor rejects; what it wrote must match dense.
         let _ = lu_factor_in_place_g(&mut m, &mut piv, n);
         assert_eq!(piv[..2], [0.0, 1.0], "premise: no swaps");
-        assert!(
-            m[5].is_infinite(),
-            "premise: row 1's U entry overflowed: {m:?}"
-        );
+        assert!(m[5].is_infinite(), "premise: row 1's U entry overflowed: {m:?}");
         assert!(m[8].is_nan(), "the skip hid 1e300 − 0·inf: {m:?}");
     }
 
@@ -677,10 +647,7 @@ mod tests {
         let mut b = vec![1.0, 1e10];
         lu_solve_in_place_g(&m, &piv, n, &mut b);
         let want = lu_reference_solve_only(&m, &piv, n, &[1.0, 1e10]);
-        assert!(
-            want[1].is_infinite() && want[0].is_nan(),
-            "premise: dense {want:?}"
-        );
+        assert!(want[1].is_infinite() && want[0].is_nan(), "premise: dense {want:?}");
         assert!(b[0].is_nan(), "the skip hid 0·inf: {b:?}");
     }
 
@@ -709,12 +676,7 @@ mod tests {
     /// `p` and the Hessian is nonzero), built generically so the same source runs at `f64`
     /// (finite-difference reference) and `Dual2` (analytic grad + Hessian under test).
     fn build<T: PkNum>(p0: T, p1: T) -> ([T; 4], [T; 2]) {
-        let a = [
-            T::from_f64(2.0) + p0,
-            T::from_f64(1.0),
-            p1 * p1,
-            T::from_f64(3.0) + p0 * p1,
-        ];
+        let a = [T::from_f64(2.0) + p0, T::from_f64(1.0), p1 * p1, T::from_f64(3.0) + p0 * p1];
         let b = [p0, T::from_f64(1.0) + p1];
         (a, b)
     }

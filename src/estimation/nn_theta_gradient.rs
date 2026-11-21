@@ -121,20 +121,14 @@ impl NnGradPlan {
     /// own — they keep exactly the FD loop they had.
     #[cfg(not(feature = "nn"))]
     pub(crate) fn build(
-        _model: &CompiledModel,
-        _subject: &Subject,
-        _theta: &[f64],
-        _n_theta: usize,
+        _model: &CompiledModel, _subject: &Subject, _theta: &[f64], _n_theta: usize,
     ) -> Option<Self> {
         None
     }
 
     #[cfg(feature = "nn")]
     pub(crate) fn build(
-        model: &CompiledModel,
-        subject: &Subject,
-        theta: &[f64],
-        n_theta: usize,
+        model: &CompiledModel, subject: &Subject, theta: &[f64], n_theta: usize,
     ) -> Option<Self> {
         if model.covariate_nns.is_empty() {
             return None;
@@ -165,10 +159,7 @@ impl NnGradPlan {
             }
             let covariates = static_nn_input_map(subject, nn.mapper.input_names())?;
             let weights = &theta[nn.weights_offset..end];
-            let jz = nn
-                .mapper
-                .jacobian_preactivation_raw(weights, covariates)
-                .ok()?;
+            let jz = nn.mapper.jacobian_preactivation_raw(weights, covariates).ok()?;
 
             let bias_theta_idx = (0..nn.mapper.mlp().n_outputs())
                 .map(|k| nn.weights_offset + nn.mapper.mlp().output_bias_index(k))
@@ -225,13 +216,8 @@ impl NnGradPlan {
     /// reported gradient entry, it does not make `∂NLL/∂z_k` — which every
     /// other weight in the block needs — cease to exist.
     pub(crate) fn accumulate(
-        &self,
-        mut signed_deriv: impl FnMut(usize, f64) -> f64,
-        theta: &[f64],
-        theta_packs_log_mask: &[bool],
-        lower: &[f64],
-        upper: &[f64],
-        grad: &mut [f64],
+        &self, mut signed_deriv: impl FnMut(usize, f64) -> f64, theta: &[f64],
+        theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], grad: &mut [f64],
     ) {
         for block in &self.blocks {
             let range = block.weights_offset..block.weights_offset + block.n_weights;
@@ -251,16 +237,8 @@ impl NnGradPlan {
                 if lower[g] == upper[g] {
                     continue;
                 }
-                let raw: f64 = dz
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &d)| d * block.jz[(k, j)])
-                    .sum();
-                grad[g] = if theta_packs_log_mask[g] {
-                    theta[g] * raw
-                } else {
-                    raw
-                };
+                let raw: f64 = dz.iter().enumerate().map(|(k, &d)| d * block.jz[(k, j)]).sum();
+                grad[g] = if theta_packs_log_mask[g] { theta[g] * raw } else { raw };
             }
         }
     }
@@ -286,8 +264,7 @@ impl NnGradPlan {
 /// correct regardless of which prediction path the subject ends up on.
 #[cfg(feature = "nn")]
 pub(crate) fn static_nn_input_map<'a>(
-    subject: &'a Subject,
-    input_names: &[String],
+    subject: &'a Subject, input_names: &[String],
 ) -> Option<&'a HashMap<String, f64>> {
     let base = &subject.covariates;
     let snapshots = subject
