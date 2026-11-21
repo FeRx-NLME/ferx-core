@@ -294,7 +294,7 @@ pub(crate) fn model_source_diagnostic(e: crate::io::model_source::ModelSourceErr
     match e {
         ModelSourceError::Read(m) => Diagnostic::error("E_MODEL_READ", m),
         ModelSourceError::Hash(m) => crate::entry_refusals::fit_input_changed_diag(m),
-        ModelSourceError::Parse(m) => parse_error_to_diagnostic(&m),
+        ModelSourceError::Parse { raw, .. } => parse_error_to_diagnostic(&raw),
     }
 }
 

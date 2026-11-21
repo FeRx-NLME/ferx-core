@@ -40,20 +40,25 @@ pub(crate) enum ModelSourceError {
     /// The file's hash is not the one the caller expected.
     Hash(String),
     /// The text does not parse.
-    Parse(String),
+    Parse {
+        /// The message, naming the file (#1807).
+        text: String,
+        /// The parser's own message, which the classifier keys on from its first byte.
+        raw: String,
+    },
 }
 
 impl ModelSourceError {
     /// The read's own text, before any classifier rewords it.
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::Read(m) | Self::Hash(m) | Self::Parse(m) => m,
+            Self::Read(m) | Self::Hash(m) | Self::Parse { text: m, .. } => m,
         }
     }
 
     pub(crate) fn into_message(self) -> String {
         match self {
-            Self::Read(m) | Self::Hash(m) | Self::Parse(m) => m,
+            Self::Read(m) | Self::Hash(m) | Self::Parse { text: m, .. } => m,
         }
     }
 }
@@ -62,7 +67,7 @@ impl ModelSource {
     /// Read `path` once, hash its bytes and parse its text.
     ///
     /// An unreadable file fails with `cannot read the model file {path}: {e}`; a
-    /// file that does not parse fails with the parser's message.
+    /// file that does not parse with `error parsing the model file {path}: {e}`.
     pub fn read(path: impl AsRef<Path>) -> Result<Self, String> {
         Self::load(path.as_ref(), None, "", "").map_err(ModelSourceError::into_message)
     }
@@ -80,10 +85,11 @@ impl ModelSource {
     pub fn read_verified(
         path: impl AsRef<Path>, expected_hash: Option<&str>, entry: &str,
     ) -> Result<Self, EngineError> {
-        // Classify the unprefixed read: several parse codes are keyed on the
-        // parser's message from byte zero (`Missing [`, `Unknown block`), so a
-        // prefix in the message would downgrade them to `E_PARSE`. The entry is
-        // the error's context instead, which `Display` prints as `{entry}: `.
+        // Several parse codes are keyed on the parser's message from byte zero
+        // (`Missing [`, `Unknown block`), which the classifier reads from
+        // `ModelSourceError::Parse::raw`, not from the text that names the file
+        // (#1807). The entry is the error's context, which `Display` prints as
+        // `{entry}: `.
         Self::load(path.as_ref(), expected_hash, "", "")
             .map_err(|e| crate::api::model_source_refusal(e).in_context(entry))
     }
@@ -113,8 +119,11 @@ impl ModelSource {
         let text = String::from_utf8(bytes).map_err(|e| {
             ModelSourceError::Read(format!("{prefix}the model file {shown} is not UTF-8: {e}"))
         })?;
-        let parsed = crate::parser::model_parser::parse_full_model_source(&text, path)
-            .map_err(|e| ModelSourceError::Parse(format!("{prefix}{e}")))?;
+        let parsed =
+            crate::parser::model_parser::parse_full_model_source(&text, path).map_err(|e| {
+                let text = format!("{prefix}error parsing the model file {shown}: {e}");
+                ModelSourceError::Parse { text, raw: e }
+            })?;
         Ok(Self { path: path.to_path_buf(), text, hash, parsed })
     }
 }
@@ -208,8 +217,14 @@ mod tests {
         assert_eq!(err.code(), Some("E_MISSING_BLOCK"), "{err}");
         assert_eq!(err.block(), Some("error_model"));
         assert_eq!(err.context(), Some("ferx_sir"));
-        assert!(err.message().starts_with("Missing [error_model]"), "{err}");
+        // #1807: the text names the file, as the read and hash failures do; the code above
+        // is still keyed on the parser's own message.
+        let want =
+            format!("error parsing the model file {}: Missing [error_model]", path.display());
+        assert!(err.message().starts_with(&want), "{err}");
         assert_eq!(err.to_string(), format!("ferx_sir: {}", err.message()));
+        let err = ModelSource::read(&path).err().expect("no [error_model]");
+        assert!(err.starts_with(&want), "{err}");
     }
 
     /// An unreadable file names the path and the OS's reason; `read` carries no
