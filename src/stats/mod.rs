@@ -1,5 +1,6 @@
 pub mod cif;
 pub mod convergence;
+pub mod eta_density;
 pub mod km;
 pub mod likelihood;
 pub(crate) mod nested_levels;

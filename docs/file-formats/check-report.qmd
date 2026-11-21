@@ -560,6 +560,14 @@ A missing Ω~IOV~ on `simulate()` reuses an existing code, since the cause is th
 | `E_NPDE_TTE_INPUT` | error | An input the TTE npde (`compute_tte_npde()`) would score wrongly: no TTE endpoint, more than one (competing risks), a repeated-events endpoint, left truncation, an interval-censored record, more than one record per subject on the endpoint, a time that is not finite and non-negative, a duplicated subject id, no record on the endpoint, or `nsim = 0`. A fit with `npde_nsim > 0` reports the same input as the warning `W_NPDE_TTE_SKIPPED` and still succeeds. |
 | `W_NPDE_TTE_SKIPPED` | warning | A fit with `npde_nsim > 0` could not score its time-to-event records: a repeated-events endpoint, competing risks, left truncation, an interval-censored record, or a failed reference simulation. The warning quotes the reason. The `NPDE` / `NPD` cells of the TTE rows are blank; every other row is scored as usual and the fit succeeds. |
 
+#### Fit refusals {#codes-fit-refusals}
+
+Refusals only `fit()` raises, from the model and options it is handed.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_DENSITY_UNSUPPORTED` | error | A `density` random effect ([Random-effect distributions](../model-file/random-effect-distributions.qmd), [#1716](https://github.com/FeRx-NLME/ferx-core/issues/1716)) with a kink or a positive-density edge (`laplace`, `symtriangular`, `uniform`, `arcsine`, `loguniform`, `pareto`, `gpd`) under FOCE, FOCEI, FOCE-GN, Laplace or VI's Laplace objective, or on IOV κs that span two nested levels in one block. Raised by `fit()`. Block `parameters`. |
+
 #### File entry points {#codes-file-entry-points}
 
 Refusals of the file entry points (`fit_from_files()`, `prepare_run()`, `run_model_with_data()`, `run_model_simulate()` and their variants, which `ferx` runs) and of `fit()` itself, for inputs `ferx check` does not read ([#1788](https://github.com/FeRx-NLME/ferx-core/issues/1788)).

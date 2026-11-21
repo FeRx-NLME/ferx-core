@@ -768,6 +768,14 @@ fn analytic_inner_seed_hessian(
                 for (g, p) in gradient.iter_mut().zip(prior.iter()) {
                     *g += p;
                 }
+                crate::stats::eta_density::add_half_grad_hess(
+                    &model.eta_densities,
+                    eta,
+                    &params.omega.inv,
+                    &params.theta,
+                    &mut gradient,
+                    &mut htilde,
+                );
                 for (g, q) in gradient.iter_mut().zip(&endpoints) {
                     *g += q;
                 }
@@ -5673,6 +5681,13 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
     if subject.obs_times.is_empty() {
         eta_work.as_mut_slice().copy_from_slice(eta);
         prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
+        crate::stats::eta_density::add_half_grad(
+            &model.eta_densities,
+            eta,
+            &omega.inv,
+            theta,
+            prior_work.as_mut_slice(),
+        );
         // `mut` is only exercised by the non-Gaussian fold below.
         #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
         let mut grad: Vec<f64> = crate::scratch::take_with_capacity(prior_work.len());
@@ -5717,6 +5732,7 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
         let result = dense_residual_inner_gradient(
             model,
             subject,
+            theta,
             eta,
             omega,
             sigma,
@@ -5832,16 +5848,25 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
     }
-    // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
+    // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η, plus a density group's ½∇c (#1716).
     eta_work.as_mut_slice().copy_from_slice(eta);
     prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
+    let eta_prior = eta_work.dot(prior_work);
+    crate::stats::eta_density::add_half_grad(
+        &model.eta_densities,
+        eta,
+        &omega.inv,
+        theta,
+        prior_work.as_mut_slice(),
+    );
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior_work[k];
     }
     if let Some(out) = value_out {
         if value_ok {
-            let eta_prior = eta_work.dot(prior_work);
-            let nll = 0.5 * (eta_prior + omega.log_det + data_ll);
+            let density =
+                crate::stats::eta_density::correction(&model.eta_densities, eta, &omega.inv, theta);
+            let nll = 0.5 * (eta_prior + density + omega.log_det + data_ll);
             *out = nll.is_finite().then_some(nll);
         }
     }
@@ -5869,8 +5894,9 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
 /// (`Dual2`) provider, so this one branch serves both inner paths.
 #[allow(clippy::too_many_arguments)]
 fn dense_residual_inner_gradient(
-    model: &CompiledModel, subject: &Subject, eta: &[f64], omega: &crate::types::OmegaMatrix,
-    sigma: &[f64], residual_cov: crate::stats::residual_error::ResidualCov<'_>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    omega: &crate::types::OmegaMatrix, sigma: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     sens: &[crate::sens::provider::ObsGrad], p_rows: &[crate::sens::provider::ObsGrad],
     mult: Option<&[Vec<f64>]>, err_keys: &[usize], eta_work: &mut DVector<f64>,
     prior_work: &mut DVector<f64>, frozen_var_preds: Option<&[f64]>,
@@ -5879,6 +5905,13 @@ fn dense_residual_inner_gradient(
     let n_eta = model.n_eta;
     eta_work.as_mut_slice().copy_from_slice(eta);
     prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
+    crate::stats::eta_density::add_half_grad(
+        &model.eta_densities,
+        eta,
+        &omega.inv,
+        theta,
+        prior_work.as_mut_slice(),
+    );
     let n_obs = sens.len();
     if n_obs == 0 {
         return Some(prior_work.as_slice().to_vec());
@@ -6266,14 +6299,36 @@ fn iov_gradient_from_rows(
             add_block_prior(&mut grad, &omega_iov.inv, 0..layout.n_kappa(), base, axes);
         }
     }
+    // #1716: each density group's `½∇c`: the BSV groups against `Ω⁻¹`, each κ group in every
+    // block of the layout that holds it against that block of `Ω_IOV⁻¹`.
+    let eta_density = crate::stats::eta_density::add_half_grad;
+    eta_density(&model.eta_densities, &axes[..n_eta], &omega_bsv.inv, theta, &mut grad[..n_eta]);
+    if !model.kappa_densities.is_empty() {
+        for (ks, base) in layout.kappa_blocks() {
+            let w = ks.len();
+            let groups = crate::stats::eta_density::layout_groups(model, &[(ks.clone(), 0)]);
+            let inv = omega_iov.inv.select_rows(&ks).select_columns(&ks);
+            let local = &groups[model.eta_densities.len()..];
+            eta_density(local, &axes[base..base + w], &inv, theta, &mut grad[base..base + w]);
+        }
+    }
     if let Some(out) = value_out.filter(|_| value_ok) {
-        // `½(ηᵀΩ⁻¹η + log|Ω| + Σ_g κ_gᵀΩ_IOV⁻¹κ_g + K·log|Ω_IOV| + data)`, the native order.
+        // `½(ηᵀΩ⁻¹η + log|Ω| + Σ_g κ_gᵀΩ_IOV⁻¹κ_g + K·log|Ω_IOV| + data)`, the native order,
+        // each prior with its density correction (#1716) where `individual_nll_iov` adds it.
         let quad = crate::stats::likelihood::quad_form;
-        let eta_prior = quad(&omega_bsv.inv, &stacked_true[..n_eta]);
+        let density = crate::stats::eta_density::correction;
+        let mut eta_prior = quad(&omega_bsv.inv, &stacked_true[..n_eta]);
+        if !model.eta_densities.is_empty() {
+            eta_prior +=
+                density(&model.eta_densities, &stacked_true[..n_eta], &omega_bsv.inv, theta);
+        }
         let mut kappa_prior = 0.0;
         for g in 0..layout.n_groups() {
-            let base = layout.kappa_offset(g);
-            kappa_prior += quad(&omega_iov.inv, &axes[base..base + layout.n_kappa()]);
+            let kap = &axes[layout.kappa_offset(g)..layout.kappa_offset(g) + layout.n_kappa()];
+            kappa_prior += quad(&omega_iov.inv, kap);
+            if !model.kappa_densities.is_empty() {
+                kappa_prior += density(&model.kappa_densities, kap, &omega_iov.inv, theta);
+            }
         }
         let nll = 0.5
             * (eta_prior

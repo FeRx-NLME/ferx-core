@@ -2180,6 +2180,14 @@ fn objective<T: crate::sens::num::PkNum>(
 ) -> Option<(T, Vec<T>)> {
     if interaction {
         focei_f_grad(ctx, f, g, eta, p)
+    } else if !ctx.densities.is_empty() {
+        // FOCE under a density (#1716): the conditional form, and the EBE's inner gradient
+        // under FOCE's frozen variance where it has one (as `objective_ng`).
+        let (fv, lg) = crate::sens::focei_kernel::foce_f_grad_density(ctx, f, g, eta, p)?;
+        match fpop {
+            Some(_) => Some((fv, inner_grad(ctx, f, g, eta, p, fpop)?)),
+            None => Some((fv, lg)),
+        }
     } else {
         Some((foce_f(ctx, f, g, eta, fpop, p)?, inner_grad(ctx, f, g, eta, p, fpop)?))
     }

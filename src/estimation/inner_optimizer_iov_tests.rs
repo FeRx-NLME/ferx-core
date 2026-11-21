@@ -1983,6 +1983,7 @@ fn analytical_ad_unsupported_flags_each_class() {
         param_type: crate::types::EtaParamType::Additive,
         linked_theta: None,
         individual_param_name: "CL".into(),
+        distribution: None,
     }];
     assert!(analytical_ad_unsupported(&model).is_some());
     model.eta_param_info.clear();
@@ -5980,8 +5981,15 @@ fn an_iov_dose_only_subject_is_not_counted_as_finite_differences() {
 /// rounding gap would be read as a step's gain.
 #[test]
 fn iov_fused_value_is_the_native_objective_bit_for_bit() {
-    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
-        .expect("prepare");
+    // The Gaussian model, and one with a BSV and a κ density (#1716): the fused value carries
+    // both corrections, as the native objective does.
+    for mf in ["examples/warfarin_iov.ferx", "examples/warfarin_iov_eta_density.ferx"] {
+        iov_fused_value_case(mf);
+    }
+}
+
+fn iov_fused_value_case(mf: &str) {
+    let prep = crate::prepare_run(mf, Some("data/warfarin_iov.csv")).expect("prepare");
     let (m, p) = (&prep.parsed.model, &prep.init_params);
     let omega_iov = p.omega_iov.as_ref().expect("IOV model");
     let mut n_points = 0usize;
@@ -6082,4 +6090,72 @@ fn iov_ebe_search_memoises_the_fused_value() {
         let puts = IOV_MEMO_FUSED_PUTS.with(|c| c.get());
         assert!(puts > 0, "{variance:?}: no fused value reached the memo");
     }
+}
+
+/// #1716: the stacked IOV inner gradient under a BSV and a κ density is the derivative of the
+/// native IOV objective, against a central difference of it at three stacked points.
+/// Dies under: a density group's `½∇c` left out of either block (BSV or every κ occasion).
+#[test]
+fn iov_inner_gradient_under_densities_matches_fd() {
+    let prep =
+        crate::prepare_run("examples/warfarin_iov_eta_density.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+    let (m, p) = (&prep.parsed.model, &prep.init_params);
+    assert!(!m.eta_densities.is_empty() && !m.kappa_densities.is_empty());
+    let omega_iov = p.omega_iov.as_ref().expect("IOV model");
+    let mut worst = 0.0_f64;
+    for s in prep.population.subjects.iter().take(3) {
+        let layout = crate::stats::stacked_layout::StackedLayout::sens_of(m, s).unwrap();
+        let mult = m.ruv_obs_mult(s, &p.theta);
+        let nll = |b: &[f64]| {
+            let kappas: Vec<Vec<f64>> =
+                b[m.n_eta..].chunks(m.n_kappa).map(<[f64]>::to_vec).collect();
+            individual_nll_iov_frozen_in(
+                m,
+                s,
+                &layout,
+                &p.theta,
+                &b[..m.n_eta],
+                &kappas,
+                &p.omega,
+                Some(omega_iov),
+                &p.sigma.values,
+                m.residual_cov_at(p),
+                &mut crate::pk::EventPkParams::default(),
+                None,
+                None,
+            )
+        };
+        for scale in [0.3, -0.5] {
+            let b: Vec<f64> =
+                (0..layout.n_stacked()).map(|c| scale * (1.0 + 0.1 * c as f64)).collect();
+            let g = analytic_eta_nll_gradient_iov_frozen(
+                m,
+                s,
+                &layout,
+                &p.theta,
+                &b,
+                &p.omega,
+                omega_iov,
+                &p.sigma.values,
+                mult.as_deref(),
+                None,
+                &mut Vec::new(),
+            )
+            .expect("in scope");
+            for (c, gc) in g.iter().enumerate() {
+                let h = 1e-6;
+                let (mut up, mut dn) = (b.clone(), b.clone());
+                up[c] += h;
+                dn[c] -= h;
+                let fd = (nll(&up) - nll(&dn)) / (2.0 * h);
+                let rel = (gc - fd).abs() / (1.0 + fd.abs());
+                assert!(rel.is_finite(), "subject {} coord {c}: {gc} vs {fd}", s.id);
+                worst = worst.max(rel); // nan-ok: rel asserted finite above
+            }
+        }
+    }
+    eprintln!("IOV inner gradient under densities vs FD: worst {worst:.2e}");
+    // Measured 3.0e-8 (the central difference's truncation at h = 1e-6); 30× headroom.
+    assert!(worst < 1e-6, "worst {worst:.2e}");
 }

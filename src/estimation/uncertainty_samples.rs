@@ -1002,6 +1002,7 @@ mod tests {
             environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: vec![],
             kappa_param_types: Vec::new(),
+            kappa_distributions: Vec::new(),
             data_bindings: Default::default(),
             theta_transform: vec![],
             sigma_types: vec![],

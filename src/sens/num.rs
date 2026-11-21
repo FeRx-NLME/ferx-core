@@ -60,16 +60,27 @@ pub enum HostFn {
     /// `[a.rem_euclid(b), a.div_euclid(b)]` of the model language's `mod`: the value and the
     /// quotient its jet `a′ − q·b′` is built with.
     RemEuclid,
+    /// The shape `k` of the Weibull with mean 1 and variance `ω` (#1716): the root the
+    /// density kernel then refines by Newton steps over its own type.
+    WeibullShape,
+    /// The shape `α` of the Fréchet with mean 1 and variance `ω` (#1716), as [`Self::WeibullShape`].
+    FrechetShape,
+    /// The shape `m` of the scaled chi (Nakagami) with mean 1 and variance `ω` (#1716), as
+    /// [`Self::WeibullShape`].
+    NakagamiShape,
 }
 
 impl HostFn {
     /// Every analysis, by index (a native call passes the index).
-    pub(crate) const ALL: [HostFn; 5] = [
+    pub(crate) const ALL: [HostFn; 8] = [
         HostFn::Spectral,
         HostFn::PadeSquarings,
         HostFn::LuFactor,
         HostFn::ForcingScale,
         HostFn::RemEuclid,
+        HostFn::WeibullShape,
+        HostFn::FrechetShape,
+        HostFn::NakagamiShape,
     ];
     /// Exhaustive on purpose: a new analysis does not compile until it has an index (and
     /// [`Self::compute`] an arm), so it cannot be added half-wired.
@@ -80,6 +91,9 @@ impl HostFn {
             HostFn::LuFactor => 2,
             HostFn::ForcingScale => 3,
             HostFn::RemEuclid => 4,
+            HostFn::WeibullShape => 5,
+            HostFn::FrechetShape => 6,
+            HostFn::NakagamiShape => 7,
         }
     }
     pub(crate) fn from_index(i: u16) -> HostFn {
@@ -144,6 +158,10 @@ impl HostFn {
                 out.push(args[0].rem_euclid(args[1]));
                 out.push(args[0].div_euclid(args[1]));
             }
+            HostFn::WeibullShape | HostFn::FrechetShape | HostFn::NakagamiShape => {
+                out.clear();
+                out.push(crate::stats::eta_density::implied_shape_root(self, args[0]));
+            }
         }
     }
 }
@@ -173,6 +191,16 @@ pub enum JetFn {
     Exprel,
     /// `ln Γ(x)` (`[lnΓ, ψ, ψ′, ψ″, ψ‴]`).
     LnGamma,
+    /// `ln(1 + x)` (a random-effect density's log-terms, #1716).
+    Ln1p,
+    /// `atan x` (the Cauchy CDF, #1716).
+    Atan,
+    /// `ln(1 + x)/x`, through its removable point (`ln(1 + λu)/λ = u·lnrel(λu)`, #1716).
+    Lnrel,
+    /// `ln K₁(x)`, the modified Bessel function of the second kind (the NIG density, #1716).
+    LnBesselK1,
+    /// `Φ⁻¹(p)`, the standard normal quantile (a Gaussian copula's scores, #1716).
+    NormInvCdf,
 }
 
 impl JetFn {
@@ -205,6 +233,11 @@ impl JetFn {
                     sp::pentagamma(x),
                 ]
             }
+            JetFn::Ln1p => crate::stats::special::ln1p_jet(x),
+            JetFn::Atan => crate::stats::special::atan_jet(x),
+            JetFn::Lnrel => crate::stats::special::lnrel_jet(x),
+            JetFn::LnBesselK1 => crate::stats::special::ln_bessel_k1_jet(x),
+            JetFn::NormInvCdf => crate::stats::special::norm_inv_cdf_jet(x),
         }
     }
     /// Exhaustive on purpose: a new function does not compile until it has an index and a
@@ -221,10 +254,15 @@ impl JetFn {
             JetFn::ExpM1 => 7,
             JetFn::Exprel => 8,
             JetFn::LnGamma => 9,
+            JetFn::Ln1p => 10,
+            JetFn::Atan => 11,
+            JetFn::Lnrel => 12,
+            JetFn::LnBesselK1 => 13,
+            JetFn::NormInvCdf => 14,
         }
     }
     /// Every function, in index order (see the test pinning it to [`Self::index`]).
-    pub(crate) const ALL: [JetFn; 10] = [
+    pub(crate) const ALL: [JetFn; 15] = [
         JetFn::NegLogNormCdf,
         JetFn::Softplus,
         JetFn::Pnorm,
@@ -235,6 +273,11 @@ impl JetFn {
         JetFn::ExpM1,
         JetFn::Exprel,
         JetFn::LnGamma,
+        JetFn::Ln1p,
+        JetFn::Atan,
+        JetFn::Lnrel,
+        JetFn::LnBesselK1,
+        JetFn::NormInvCdf,
     ];
     /// The function of [`Self::index`] `i`.
     pub(crate) const fn from_index(i: u8) -> JetFn {

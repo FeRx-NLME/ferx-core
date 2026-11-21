@@ -1,0 +1,109 @@
+{
+  "provenance": "CmdStan (2, 40), cmdstanpy 1.3.2; 4 chains x 6000 draws after 2000 warmup, adapt_delta 0.95, seed 1716",
+  "divergences": {
+    "density": 0,
+    "gaussian_twin": 0
+  },
+  "density": {
+    "TVCL": {
+      "mean": 0.135322,
+      "sd": 0.00839743,
+      "mcse": 0.000129148,
+      "ess_bulk": 4316.81,
+      "rhat": 1.0003
+    },
+    "TVV": {
+      "mean": 7.73737,
+      "sd": 0.292727,
+      "mcse": 0.00475267,
+      "ess_bulk": 3838.88,
+      "rhat": 1.00101
+    },
+    "TVKA": {
+      "mean": 0.826514,
+      "sd": 0.161219,
+      "mcse": 0.00238612,
+      "ess_bulk": 4522.13,
+      "rhat": 1.00059
+    },
+    "OMEGA_CL": {
+      "mean": 0.037745,
+      "sd": 0.0190355,
+      "mcse": 0.000150054,
+      "ess_bulk": 26267.9,
+      "rhat": 1.00002
+    },
+    "OMEGA_V": {
+      "mean": 0.0137078,
+      "sd": 0.00690023,
+      "mcse": 5.54274e-05,
+      "ess_bulk": 23290.2,
+      "rhat": 1.00015
+    },
+    "OMEGA_KA": {
+      "mean": 0.364535,
+      "sd": 0.182327,
+      "mcse": 0.00147862,
+      "ess_bulk": 24008.2,
+      "rhat": 1.0002
+    },
+    "PROP_ERR": {
+      "mean": 0.0106594,
+      "sd": 0.000861974,
+      "mcse": 5.85231e-06,
+      "ess_bulk": 22310.5,
+      "rhat": 1.00018
+    }
+  },
+  "gaussian_twin": {
+    "TVCL": {
+      "mean": 0.132971,
+      "sd": 0.00799758,
+      "mcse": 0.000160598,
+      "ess_bulk": 2420.41,
+      "rhat": 1.00227
+    },
+    "TVV": {
+      "mean": 7.12874,
+      "sd": 1.67305,
+      "mcse": 0.749215,
+      "ess_bulk": 14.6699,
+      "rhat": 1.4434
+    },
+    "TVKA": {
+      "mean": 0.75961,
+      "sd": 0.223589,
+      "mcse": 0.081271,
+      "ess_bulk": 16.7679,
+      "rhat": 1.17794
+    },
+    "OMEGA_CL": {
+      "mean": 0.0375361,
+      "sd": 0.0183278,
+      "mcse": 0.000168175,
+      "ess_bulk": 16976.0,
+      "rhat": 1.00044
+    },
+    "OMEGA_V": {
+      "mean": 0.50585,
+      "sd": 1.01212,
+      "mcse": 0.621762,
+      "ess_bulk": 7.07446,
+      "rhat": 1.52781
+    },
+    "OMEGA_KA": {
+      "mean": 0.718337,
+      "sd": 0.788441,
+      "mcse": 0.450002,
+      "ess_bulk": 7.21283,
+      "rhat": 1.50724
+    },
+    "PROP_ERR": {
+      "mean": 0.0106723,
+      "sd": 0.000856158,
+      "mcse": 6.90076e-06,
+      "ess_bulk": 15739.9,
+      "rhat": 1.0001
+    }
+  }
+}

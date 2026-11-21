@@ -174,11 +174,29 @@ fn jet_shim(f: crate::sens::num::JetFn, k: u8) -> NativeUnary {
                     ($i, 3) => j::<$i, 3>,
                     ($i, 4) => j::<$i, 4>,
                 )*
-                _ => j::<0, 5>,
+                (_, k) if k > 4 => j::<0, 5>,
+                // A `JetFn` added without its row here would otherwise run as `NaN` in every
+                // compiled plan (#1716 review): `jet_shim_covers_every_jet_fn` pins the list.
+                (i, _) => unreachable!("JetFn index {i} has no native shim"),
             }
         };
     }
-    entries!(f.index(), k, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+    entries!(f.index(), k, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+}
+
+#[cfg(test)]
+#[test]
+fn jet_shim_covers_every_jet_fn() {
+    for f in crate::sens::num::JetFn::ALL {
+        for k in 0..=4u8 {
+            let (x, want) = (0.37, f.jet(0.37)[k as usize]);
+            let got = jet_shim(f, k)(x);
+            assert!(
+                got == want || (got.is_nan() && want.is_nan()),
+                "{f:?} order {k}: {got} vs {want}"
+            );
+        }
+    }
 }
 
 /// The host calls' runtime: the queued arguments and the last call's outputs, per thread. The

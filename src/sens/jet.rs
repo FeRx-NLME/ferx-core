@@ -394,6 +394,23 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         let d = self.v.jet_k(crate::sens::num::JetFn::LnGamma, 1);
         self.chain(self.v.ln_gamma(), d)
     }
+    /// `P(a, x)` (`Q` when `upper`) as the base's own `gamma_pq`, with the tangent in `x` from
+    /// its closed form `∂P/∂x = x^{a−1}e^{−x}/Γ(a)`: no value-dependent iteration over this
+    /// type, so a recording base records one primitive and never guards the series' regime
+    /// (#1716: a density CDF under the kernel's η-jets). A tangent in `a`, or `x ≤ 0`, takes
+    /// the generic body, exact as before.
+    fn gamma_pq(self, x: Self, upper: bool) -> Self {
+        use crate::sens::num::BranchCmp;
+        // Decided on the tangents' values, not their structure: a recording does not fold
+        // every `0/x`, and a tangent that is zero by construction keeps this guard true.
+        let a_still = self.g.iter().all(|d| d.br_cmp_c(BranchCmp::Eq, 0.0));
+        if !a_still || !x.v.br_cmp_c(BranchCmp::Gt, 0.0) {
+            return crate::stats::special::gamma_pq_g(self, x, upper);
+        }
+        let a = self.v;
+        let dens = ((a - B::from_f64(1.0)) * x.v.ln() - x.v - a.ln_gamma()).exp();
+        x.chain(a.gamma_pq(x.v, upper), if upper { -dens } else { dens })
+    }
     fn jets_finite(self) -> bool {
         self.g.iter().all(|x| x.br_abs_lt(f64::INFINITY))
     }

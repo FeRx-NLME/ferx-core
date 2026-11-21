@@ -11922,3 +11922,404 @@ fn box_cox_through_lambda_zero_matches_reconverged_fd() {
 /// Measured worst 9.5e-15 over the ten cases above (closed form, IOV and ODE; FOCEI and
 /// FOCE): rounding, since neither side is FD. About 10× headroom.
 const SHAPE_TWIN_TOL: f64 = 1e-13;
+
+// ---- #1716: non-Gaussian random-effect densities ---------------------------------------
+
+/// A closed-form 1-cpt oral model whose three ETAs follow a t (ν = `NU`), a gamma (mean
+/// 1, so `CL = TVCL·ETA_CL`) and a beta (mean `MU`, on a fraction of `KA`).
+const DENSITY_1CPT: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta NU(6.0, 2.5, 100.0)
+  theta MU(0.4, 0.01, 0.99)
+  omega ETA_V ~ 0.06 density t(NU)
+  omega ETA_CL ~ 0.09 density gamma
+  omega ETA_KA ~ 0.03 density beta(MU)
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * ETA_CL
+  V = TVV * exp(ETA_V)
+  KA = TVKA * 2 * ETA_KA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+fn density_subject(model: &CompiledModel) -> Subject {
+    subject(
+        model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.5, 1.0, 2.0, 4.0, 8.0, 11.0, 13.0, 16.0, 24.0],
+        &[0.2, -0.15, 0.3],
+    )
+}
+
+/// #1716: the kernel's subject objective under densities is production's, FOCEI and
+/// FOCE alike, at a latent away from the mode (every density term live). FOCE takes the
+/// conditional form under a density (`foce_f_grad_density`), not the Sheiner–Beal one.
+/// Dies under: the correction left out of the kernel's prior, its `½∇²c` left out of `H̃`
+/// on one side, or FOCE routed to the Gaussian marginal on one side.
+#[test]
+fn the_kernel_objective_under_densities_is_production() {
+    let model = parse_model_string(DENSITY_1CPT).unwrap();
+    assert_eq!(model.eta_densities.len(), 3);
+    let s = density_subject(&model);
+    let params = moved_params(&model);
+    let eta = [0.25, -0.2, 0.35];
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, &eta);
+    let hm = exact_eta_jacobian(&model, &s, &params.theta, &eta).expect("η-Jacobian");
+    let ev = nalgebra::DVector::from_column_slice(&eta);
+    let ctx = crate::sens::focei_kernel::LikCtx::new(&model, &s, &params);
+    let p = crate::sens::focei_kernel::ParT::of(&model, &s, &params);
+    let g: Vec<Vec<f64>> = (0..hm.nrows()).map(|j| (0..3).map(|k| hm[(j, k)]).collect()).collect();
+    let e = eta.to_vec();
+    let mut worst = 0.0f64;
+    for interaction in [true, false] {
+        let f_prod = crate::stats::likelihood::foce_subject_nll_cov(
+            &model,
+            &s,
+            &params.theta,
+            &ev,
+            &hm,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_with(&params.residual_correlations, &params.theta),
+            interaction,
+        );
+        let fk = if interaction {
+            crate::sens::focei_kernel::focei_f_grad::<f64>(&ctx, &preds, &g, &e, &p)
+        } else {
+            crate::sens::focei_kernel::foce_f_grad_density::<f64>(&ctx, &preds, &g, &e, &p)
+        }
+        .expect("kernel F")
+        .0;
+        let gap = (fk - f_prod).abs() / (1.0 + f_prod.abs());
+        eprintln!("interaction = {interaction}: F = {f_prod}, gap {gap:.2e}");
+        assert!(
+            f_prod.is_finite() && f_prod < 1e10 && fk.is_finite(),
+            "a real objective: {f_prod} (kernel {fk})"
+        );
+        worst = worst.max((fk - f_prod).abs() / (1.0 + f_prod.abs()));
+    }
+    // Measured 0 (the same arithmetic on both sides); dropping the correction from
+    // production's prior gives 2.3e-2.
+    assert!(worst < 1e-14, "worst {worst:.2e}");
+}
+
+/// #1716: at production's EBE (the minimiser of the `f64` inner objective, density
+/// included) the kernel's inner gradient vanishes, so the inner objective and the gradient
+/// the adjoint differentiates are one function.
+/// Dies under: the density's `½∇c` left out of `assemble_grad`, or the correction left
+/// out of the `f64` inner objective (the EBE would then be another function's mode).
+#[test]
+fn the_kernel_inner_gradient_vanishes_at_the_density_ebe() {
+    let model = tight(parse_model_string(DENSITY_1CPT).unwrap());
+    let s = density_subject(&model);
+    let params = moved_params(&model);
+    let mut worst = 0.0f64;
+    for interaction in [true, false] {
+        let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+        let preds =
+            crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, eta.as_slice());
+        let hm = exact_eta_jacobian(&model, &s, &params.theta, eta.as_slice()).unwrap();
+        let ctx = crate::sens::focei_kernel::LikCtx::new(&model, &s, &params);
+        let p = crate::sens::focei_kernel::ParT::of(&model, &s, &params);
+        let g: Vec<Vec<f64>> =
+            (0..hm.nrows()).map(|j| (0..3).map(|k| hm[(j, k)]).collect()).collect();
+        let e = eta.as_slice().to_vec();
+        let frozen = if interaction {
+            None
+        } else {
+            crate::stats::likelihood::population_variance_preds(&model, &s, &params.theta, 3)
+        };
+        let gr = crate::sens::focei_kernel::inner_grad::<f64>(
+            &ctx,
+            &preds,
+            &g,
+            &e,
+            &p,
+            frozen.as_deref(),
+        )
+        .expect("inner gradient");
+        let n = gr.iter().map(|v| v * v).sum::<f64>().sqrt();
+        eprintln!("interaction = {interaction}: η̂ = {:?}, |∇l| = {n:.2e}", eta.as_slice());
+        assert!(n.is_finite());
+        worst = worst.max(n);
+    }
+    // Measured 7.4e-13 (FOCE) and 2.0e-13 (FOCEI), the EBE tolerance 1e-12; 13× headroom.
+    assert!(worst < 1e-11, "|∇l| at the EBE: {worst:.2e}");
+}
+
+/// #1716: a logit-normal density is a Gaussian translated by `logit μ`. Its latent is
+/// `z ~ N(logit μ, ω)` and the model reads `inv_logit(z)`, so it is the Gaussian
+/// `η ~ N(0, ω)` read as `inv_logit(logit(MU) + η)` under `z = η + logit μ`. A translation
+/// leaves the Laplace / FOCE objective unchanged (unit Jacobian, same Hessian), so the two
+/// models' FOCEI adjoint gradients — through Ω, through `MU` and through the EBE's
+/// response to both — are one number to rounding. Neither side is FD.
+/// Dies under: the density's θ-jets dropped (`∂/∂MU` loses the prior's share), its Ω
+/// derivative dropped, or the EBE response missing the correction's curvature.
+#[test]
+fn the_adjoint_of_a_logit_normal_density_is_its_translated_gaussian() {
+    let dens_src = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta MU(0.4, 0.01, 0.99)
+  omega ETA_CL ~ 0.09
+  omega ETA_KA ~ 0.3 density logitnormal(MU)
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA * 2 * ETA_KA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let twin_src = dens_src
+        .replace(" density logitnormal(MU)", "")
+        .replace("KA = TVKA * 2 * ETA_KA", "KA = TVKA * 2 * inv_logit(logit(MU) + ETA_KA)");
+    let dens = parse_model_string(dens_src).unwrap();
+    let twin = parse_model_string(&twin_src).unwrap();
+    assert_eq!(dens.eta_densities.len(), 1);
+    let s = subject(
+        &dens,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.5, 1.0, 2.0, 4.0, 8.0, 11.0, 13.0, 16.0, 24.0],
+        &[0.15, 0.2],
+    );
+    let params = moved_params(&dens);
+    let x = pack_params(&params);
+    let mu = params.theta[3];
+    let shift = (mu / (1.0 - mu)).ln();
+    let mut worst = 0.0f64;
+    // FOCEI only: FOCE without interaction scores a density in its conditional form and
+    // the Gaussian twin in Sheiner–Beal's, which are different objectives.
+    {
+        let interaction = true;
+        let z = ebe_for(&dens, &s, &params, 1e-12, interaction);
+        let eta = [z[0], z[1] - shift];
+        let a = subject_adjoint_packed_gradient(&dens, &s, &params, &x, z.as_slice(), interaction)
+            .expect("the density model is in adjoint scope");
+        let b = subject_adjoint_packed_gradient(&twin, &s, &params, &x, &eta, interaction)
+            .expect("the twin is in adjoint scope");
+        for (k, (ak, bk)) in a.iter().zip(&b).enumerate() {
+            assert!(ak.is_finite() && bk.is_finite(), "x[{k}]: {ak} {bk}");
+            worst = worst.max((ak - bk).abs() / (1.0 + bk.abs()));
+        }
+        eprintln!("FOCEI gradient {a:?}");
+        assert!(a[3].abs() > 1e-6, "∂/∂MU is live: {}", a[3]);
+    }
+    // Measured 1.1e-15 (rounding: the two models run different arithmetic); 10× headroom.
+    assert!(worst < 1e-14, "worst relative gap {worst:.2e}");
+}
+
+/// #1716, IOV: a logit-normal κ density is a translated Gaussian κ, so the FOCEI adjoint
+/// gradient of `KA = TVKA·2·KAPPA_KA` under `density logitnormal(MU)` equals that of the
+/// Gaussian twin `KA = TVKA·2·inv_logit(logit(MU) + KAPPA_KA)`, with every occasion's κ
+/// shifted by `logit μ`. Checks the stacked κ groups through the kernel, the IOV
+/// objective and the adjoint (including `∂/∂MU`) without FD.
+/// Dies under: a κ group left out of the stacked prior, or its θ jets dropped.
+#[test]
+fn the_iov_adjoint_of_a_logit_normal_kappa_is_its_translated_gaussian() {
+    let dens_src = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta MU(0.4, 0.01, 0.99)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  kappa KAPPA_CL ~ 0.03
+  kappa KAPPA_KA ~ 0.2 density logitnormal(MU)
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * 2 * KAPPA_KA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+    let twin_src = dens_src
+        .replace(" density logitnormal(MU)", "")
+        .replace("KA = TVKA * 2 * KAPPA_KA", "KA = TVKA * 2 * inv_logit(logit(MU) + KAPPA_KA)");
+    let dens = parse_model_string(dens_src).unwrap();
+    let twin = parse_model_string(&twin_src).unwrap();
+    assert_eq!(dens.kappa_densities.len(), 1);
+    let s = iov_subject(&twin);
+    let params = moved_params(&dens);
+    let x = pack_params(&params);
+    let mu = params.theta[3];
+    let shift = (mu / (1.0 - mu)).ln();
+    let b = ebe_for(&dens, &s, &params, 1e-12, true);
+    // Stacked [η_CL, η_V, κ_CL⁰, κ_KA⁰, κ_CL¹, κ_KA¹, …]: shift every κ_KA.
+    let mut bt: Vec<f64> = b.iter().copied().collect();
+    for g in 0..(bt.len() - 2) / 2 {
+        bt[2 + 2 * g + 1] -= shift;
+    }
+    let a = subject_adjoint_packed_gradient(&dens, &s, &params, &x, b.as_slice(), true)
+        .expect("the κ-density model is in adjoint scope");
+    let t =
+        subject_adjoint_packed_gradient(&twin, &s, &params, &x, &bt, true).expect("twin in scope");
+    assert!(a.iter().chain(&t).all(|v| v.is_finite()), "{a:?} vs {t:?}");
+    let mut worst = 0.0f64;
+    for (p, q) in a.iter().zip(&t) {
+        assert!(p.is_finite() && q.is_finite());
+        worst = worst.max((p - q).abs() / (1.0 + q.abs()));
+    }
+    eprintln!("IOV κ twin: worst {worst:.2e}, ∂/∂MU {}", a[3]);
+    assert!(a[3].abs() > 1e-6, "∂/∂MU is live");
+    // Measured 2.39e-15 (the twin is the same arithmetic up to association); 400×.
+    assert!(worst < 1e-12, "worst {worst:.2e}");
+}
+
+/// A 1-cpt oral model whose `ETA_D` carries one density (#1716): `params` the extra
+/// `[parameters]` lines (shape θs, the omega line), `read` how `V` reads `ETA_D`.
+fn density_kind_model(params: &str, read: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n{params}\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * {read}\n  KA = TVKA\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    );
+    parse_model_string(&src).unwrap_or_else(|e| panic!("{params}: {e}"))
+}
+
+/// Every kind the FOCE family scores (no kink or edge), each block form, and a truncation
+/// of each CDF family, through the compiled plans: the FOCEI adjoint gradient against the
+/// reconverged-FD oracle, which shares no derivative code with it. Between them the cells
+/// record every primitive the port added — `Ln1p` (lognormal, cauchy), `Softplus` (logistic,
+/// betaprime, beta), `Lnrel` and `Exprel` (both GEV arms), `LnBesselK1` (nig), `NormInvCdf`
+/// (the copula), the implied-shape `HostFn`s (weibull, frechet, chi), `gamma_pq` (truncated
+/// gamma) and the fixed-count `inc_beta` (truncated beta and t) — and the guarded window of
+/// the noncentral χ² series.
+/// Dies under: a wrong jet in any of them, a branch decided on a recorded value, or a
+/// density term left out of the kernel's prior or `H̃`.
+#[test]
+fn every_smooth_density_kind_matches_reconverged_fd_through_the_plans() {
+    const CL: &str = "  omega ETA_CL ~ 0.09\n";
+    let real = "exp(ETA_D)";
+    let pos = "ETA_D";
+    let unit = "2 * ETA_D";
+    // (label, [parameters] lines, read, latent reference value of ETA_D)
+    let cases: Vec<(&str, String, &str, f64)> = vec![
+        ("gamma", format!("{CL}  omega ETA_D ~ 0.06 density gamma"), pos, 0.1),
+        ("t block", "  theta NU(6.0, 3.0, 100.0)\n  block_omega (ETA_CL, ETA_D) = [0.09, 0.02, 0.06] density t(NU)".into(), real, 0.1),
+        ("copula", "  theta MU(0.4, 0.01, 0.99)\n  block_omega (ETA_CL, ETA_D) = [0.09, 0.01, 0.03] density copula(ETA_CL = normal, ETA_D = beta(MU))".into(), unit, 0.2),
+        ("truncated beta", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.03 density truncated(beta(MU), 0.1, 0.9)"), unit, 0.2),
+        ("t", format!("  theta NU(6.0, 3.0, 100.0)\n{CL}  omega ETA_D ~ 0.06 density t(NU)"), real, 0.1),
+        ("logistic", format!("{CL}  omega ETA_D ~ 0.06 density logistic"), real, 0.1),
+        ("cauchy", format!("{CL}  omega ETA_D ~ 0.02 density cauchy"), real, 0.1),
+        ("gumbel", format!("{CL}  omega ETA_D ~ 0.06 density gumbel"), real, 0.1),
+        ("nig", format!("  theta ZETA(1.5, 0.01, 100.0)\n  theta RHO(0.3, -0.95, 0.95)\n{CL}  omega ETA_D ~ 0.06 density nig(ZETA, RHO)"), real, 0.1),
+        ("pgg", format!("  theta P(3.0, 0.5, 20.0)\n{CL}  omega ETA_D ~ 0.06 density pgg(P)"), real, 0.1),
+        ("gev closed", format!("  theta XI(0.2, -0.45, 0.45)\n{CL}  omega ETA_D ~ 0.06 density gev(XI)"), real, 0.1),
+        ("gev series", format!("  theta XI(0.02, -0.45, 0.45)\n{CL}  omega ETA_D ~ 0.06 density gev(XI)"), real, 0.1),
+        ("biweight", format!("{CL}  omega ETA_D ~ 0.06 density biweight"), real, 0.1),
+        ("triweight", format!("{CL}  omega ETA_D ~ 0.06 density triweight"), real, 0.1),
+        ("epanechnikov", format!("{CL}  omega ETA_D ~ 0.06 density epanechnikov"), real, 0.1),
+        ("cosine", format!("{CL}  omega ETA_D ~ 0.06 density cosine"), real, 0.1),
+        ("semicircle", format!("{CL}  omega ETA_D ~ 0.06 density semicircle"), real, 0.1),
+        ("chisq", format!("{CL}  omega ETA_D ~ 0.06 density chisq"), pos, 0.1),
+        ("invgamma", format!("{CL}  omega ETA_D ~ 0.06 density invgamma"), pos, 0.1),
+        ("lognormal", format!("{CL}  omega ETA_D ~ 0.06 density lognormal"), pos, 0.1),
+        ("chi", format!("{CL}  omega ETA_D ~ 0.06 density chi"), pos, 0.1),
+        ("weibull", format!("{CL}  omega ETA_D ~ 0.06 density weibull"), pos, 0.1),
+        ("frechet", format!("{CL}  omega ETA_D ~ 0.06 density frechet"), pos, 0.1),
+        ("inversegaussian", format!("{CL}  omega ETA_D ~ 0.06 density inversegaussian"), pos, 0.1),
+        ("betaprime", format!("{CL}  omega ETA_D ~ 0.06 density betaprime"), pos, 0.1),
+        ("noncentralchisq", format!("  theta K(3.0, 0.1, 100.0)\n{CL}  omega ETA_D ~ 0.06 density noncentralchisq(K)"), pos, 0.1),
+        ("levy", format!("{CL}  omega ETA_D ~ 0.3 density levy"), pos, 0.1),
+        ("exponential", format!("{CL}  omega ETA_D ~ 1 FIX density exponential"), pos, 0.1),
+        ("rayleigh", format!("{CL}  omega ETA_D ~ 1 FIX density rayleigh"), pos, 0.1),
+        ("erlang", format!("  theta K(3.0, 1.0, 50.0)\n{CL}  omega ETA_D ~ 1 FIX density erlang(K)"), pos, 0.1),
+        ("kolmogorov", format!("{CL}  omega ETA_D ~ 1 FIX density kolmogorov"), pos, 0.1),
+        ("beta", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.03 density beta(MU)"), unit, 0.2),
+        ("logitnormal", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.3 density logitnormal(MU)"), unit, 0.2),
+        ("lognormal block", "  block_omega (ETA_CL, ETA_D) = [0.09, 0.02, 0.06] density lognormal".into(), pos, 0.1),
+        ("truncated gamma", format!("{CL}  omega ETA_D ~ 0.06 density truncated(gamma, 0.5, 2)"), pos, 0.1),
+        ("truncated weibull", format!("{CL}  omega ETA_D ~ 0.06 density truncated(weibull, 0.3, inf)"), pos, 0.1),
+        ("truncated t", format!("  theta NU(6.0, 3.0, 100.0)\n{CL}  omega ETA_D ~ 0.06 density truncated(t(NU), -1, inf)"), real, 0.1),
+        ("truncated cauchy", format!("{CL}  omega ETA_D ~ 0.02 density truncated(cauchy, -2, 2)"), real, 0.1),
+    ];
+    let mut worst = (0.0f64, "");
+    for (label, params, read, z) in oracle_cells(cases, &[0, 1, 2, 3]) {
+        let model = density_kind_model(&params, read);
+        assert!(model.has_densities(), "{label}: no density group");
+        assert!(outer_model_in_scope(&model), "{label}: not in adjoint scope");
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[0.5, 1.0, 2.0, 4.0, 8.0, 11.0, 13.0, 16.0, 24.0],
+            &[0.15, z],
+        );
+        let w = fd_oracle(&model, &s, true);
+        eprintln!("{label}: worst {w:.2e}");
+        if w > worst.0 {
+            worst = (w, label);
+        }
+    }
+    // Measured worst 5.0e-9 (truncated gamma) over the 38 cells, the Richardson FD noise
+    // floor at EBE tolerance 1e-12; the per-PR four 2.6e-9. 10× headroom.
+    assert!(worst.0 < 5e-8, "worst relative gap {:.2e} on {}", worst.0, worst.1);
+}
+
+/// #1716: the covariance step's exact R-matrix under a density, FOCEI and Laplace, against
+/// the reconverged-FD Hessian of the adjoint gradient — for a univariate density, a copula
+/// (the normal quantile and the gamma CDF under the nested η-jets) and a truncation (the
+/// fixed-count incomplete beta). The structured kernel's reduce holds `Ω⁻¹ + Σ αGGᵀ` only,
+/// so a density routes past it (`structured_rows_supported`).
+/// Dies under: that route removed (the density's `½∇²c` drops out of `H̃` and the Hessian
+/// leaves FD), or a density term left out of the recorded kernel's prior.
+#[test]
+fn density_cov_hessian_matches_reconverged_fd() {
+    const CL: &str = "  omega ETA_CL ~ 0.09\n";
+    let cases = [
+        ("gamma", format!("{CL}  omega ETA_D ~ 0.06 density gamma"), "ETA_D", 0.1),
+        ("copula", "  block_omega (ETA_CL, ETA_D) = [0.09, 0.01, 0.06] density copula(ETA_CL = normal, ETA_D = gamma)".to_string(), "ETA_D", 0.1),
+        ("truncated beta", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.03 density truncated(beta(MU), 0.1, 0.9)"), "2 * ETA_D", 0.2),
+    ];
+    let mut worst = (0.0f64, "");
+    for (label, params, read, z) in cases.iter() {
+        let model = density_kind_model(params, read);
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[0.5, 1.0, 2.0, 4.0, 8.0, 11.0, 13.0, 16.0, 24.0],
+            &[0.15, *z],
+        );
+        for objective in [Objective::Focei, Objective::Agq { n_agq: 1, exact: true }] {
+            let (fd, _) = hessian_gaps_for(&model, &s, objective);
+            eprintln!("{label} {objective:?}: vs FD {fd:.2e}");
+            assert!(fd.is_finite(), "{label}: {fd}");
+            if fd > worst.0 {
+                worst = (fd, label);
+            }
+        }
+    }
+    // Measured worst 8.2e-10 (truncated beta under Laplace); the univariate and copula cells
+    // 1.6e-11. 10× headroom.
+    assert!(worst.0 < 1e-8, "worst {:.2e} on {}", worst.0, worst.1);
+}

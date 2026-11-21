@@ -7,6 +7,10 @@ description-meta: "Box-Cox, heavy-tailed (t-distribution) and John-Draper shapes
 
 > **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
 
+To give an ETA another distribution outright (a Gamma clearance, a Beta
+bioavailability, a Student-t), see [Random-effect distributions](random-effect-distributions.qmd).
+This block is the one place a transform is declared: the `omega` line takes a `density` (a random effect that *follows* a distribution, [Random-effect distributions](random-effect-distributions.qmd)), not a transform.
+
 A random effect is normal on the scale it is written on: `CL = TVCL * exp(ETA_CL)`
 makes `CL` log-normal. When the empirical Bayes estimates are visibly skewed or
 heavy-tailed, a **shape transform** bends that distribution while `ETA_CL` itself

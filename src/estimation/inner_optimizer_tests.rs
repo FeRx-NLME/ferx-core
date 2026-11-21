@@ -6499,6 +6499,9 @@ fn fused_value_is_the_native_objective_value() {
     // (model, data, bound): closed form and a nonlinear (Michaelis-Menten) ODE.
     let cases = [
         ("examples/warfarin.ferx", "data/warfarin.csv", 1e-12),
+        // Non-Gaussian random effects (#1716): the fused value carries the density's
+        // correction, as the native objective does.
+        ("examples/warfarin_eta_density.ferx", "data/warfarin.csv", 1e-12),
         ("examples/two_cpt_iv_ode.ferx", "data/two_cpt_iv.csv", 1e-12),
         ("examples/mm_oral.ferx", "data/mm_oral.csv", 1e-6),
         ("examples/mm_iv.ferx", "data/mm_iv.csv", 1e-6),

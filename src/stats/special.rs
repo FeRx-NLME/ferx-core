@@ -293,6 +293,117 @@ pub(crate) fn pnorm_jet(x: f64) -> [f64; 5] {
     [pnorm(x), d, -x * d, (x * x - 1.0) * d, (3.0 * x - x * x * x) * d]
 }
 
+/// `ln(1 + x)` and its first four derivatives (`u = 1/(1 + x)`: `u`, `−u²`, `2u³`, `−6u⁴`).
+pub(crate) fn ln1p_jet(x: f64) -> [f64; 5] {
+    let u = 1.0 / (1.0 + x);
+    [x.ln_1p(), u, -u * u, 2.0 * u * u * u, -6.0 * u * u * u * u]
+}
+
+/// `atan x` and its first four derivatives (`s = 1/(1 + x²)`).
+pub(crate) fn atan_jet(x: f64) -> [f64; 5] {
+    let s = 1.0 / (1.0 + x * x);
+    let s2 = s * s;
+    [x.atan(), s, -2.0 * x * s2, (6.0 * x * x - 2.0) * s2 * s, 24.0 * x * (1.0 - x * x) * s2 * s2]
+}
+
+/// `lnrel(x) = ln(1 + x)/x` (`1` at `x = 0`) and its first four derivatives. Below
+/// `|x| = ½` the series `Σ_m (−x)^m/(m + 1)` differentiated term by term (90 terms leave
+/// `½⁸⁶·86⁴ ≈ 7e-19`); above, Leibniz's rule on `ln(1 + x)·x⁻¹`, whose terms no longer
+/// cancel.
+pub(crate) fn lnrel_jet(x: f64) -> [f64; 5] {
+    let mut out = [0.0; 5];
+    if x.abs() < 0.5 {
+        for (n, o) in out.iter_mut().enumerate() {
+            // Σ_{m≥n} (−1)^m·m!/(m − n)!·x^{m−n}/(m + 1), by Horner from the top.
+            let mut acc = 0.0;
+            for m in (n..90).rev() {
+                let fall: f64 = (m - n + 1..=m).map(|i| i as f64).product();
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                acc = acc * x + sign * fall / (m + 1) as f64;
+            }
+            *o = acc;
+        }
+        return out;
+    }
+    // L⁽ᵏ⁾ = (−1)^{k−1}(k − 1)!·uᵏ (k ≥ 1), (x⁻¹)⁽ᵐ⁾ = (−1)^m·m!·x^{−m−1}.
+    let u = 1.0 / (1.0 + x);
+    let l = |k: usize| -> f64 {
+        if k == 0 {
+            x.ln_1p()
+        } else {
+            let fact: f64 = (1..k).map(|i| i as f64).product();
+            let sign = if k % 2 == 1 { 1.0 } else { -1.0 };
+            sign * fact * u.powi(k as i32)
+        }
+    };
+    let w = |m: usize| -> f64 {
+        let fact: f64 = (1..=m).map(|i| i as f64).product();
+        let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+        sign * fact * x.powi(-(m as i32) - 1)
+    };
+    let binom = [
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0, 0.0, 0.0],
+        [1.0, 2.0, 1.0, 0.0, 0.0],
+        [1.0, 3.0, 3.0, 1.0, 0.0],
+        [1.0, 4.0, 6.0, 4.0, 1.0],
+    ];
+    for (n, o) in out.iter_mut().enumerate() {
+        *o = (0..=n).map(|k| binom[n][k] * l(k) * w(n - k)).sum();
+    }
+    out
+}
+
+/// `ln K₁(x)` (`x > 0`) and its first four derivatives, from `r = K₀/K₁`:
+/// `f′ = −r − 1/x`, `r′ = r² + r/x − 1`, and each further order by differentiating those.
+/// `e^x K_ν(x) = ∫₀^∞ e^{−x(cosh t − 1)} cosh(νt) dt` by the trapezoid rule at step `1/8`:
+/// the integrand is analytic in the strip `|Im t| < π/2`, so the error is `O(e^{−8π²})`,
+/// far below rounding; nodes run until the exponent passes `−750`. `NaN` off `x > 0`.
+pub(crate) fn ln_bessel_k1_jet(x: f64) -> [f64; 5] {
+    if !(x > 0.0 && x.is_finite()) {
+        return [f64::NAN; 5];
+    }
+    let h = 0.125;
+    let (mut k0, mut k1) = (0.5, 0.5);
+    for j in 1.. {
+        let t = h * j as f64;
+        let e = x * (t.cosh() - 1.0);
+        if e > 750.0 {
+            break;
+        }
+        let w = (-e).exp();
+        k0 += w;
+        k1 += w * t.cosh();
+    }
+    let r = k0 / k1;
+    let r1 = r * r + r / x - 1.0;
+    let r2 = 2.0 * r * r1 + r1 / x - r / (x * x);
+    let r3 = 2.0 * r1 * r1 + 2.0 * r * r2 + r2 / x - 2.0 * r1 / (x * x) + 2.0 * r / x.powi(3);
+    [
+        (h * k1).ln() - x,
+        -r - 1.0 / x,
+        -r1 + 1.0 / (x * x),
+        -r2 - 2.0 / x.powi(3),
+        -r3 + 6.0 / x.powi(4),
+    ]
+}
+
+/// `Φ⁻¹(p)` and its first four derivatives in `p`: [`normal_inv_cdf`] polished by two Newton
+/// steps on the accurate [`normal_cdf`], then `q′ = 1/φ`, `q″ = q/φ²`, `q‴ = (1 + 2q²)/φ³`,
+/// `q⁗ = q(7 + 6q²)/φ⁴` at `φ = φ(q)`. `∓∞` (and `NaN` derivatives) off `(0, 1)`.
+pub(crate) fn norm_inv_cdf_jet(p: f64) -> [f64; 5] {
+    let mut q = normal_inv_cdf(p);
+    if !q.is_finite() {
+        return [q, f64::NAN, f64::NAN, f64::NAN, f64::NAN];
+    }
+    let phi = |q: f64| (-0.5 * q * q).exp() * INV_SQRT_2PI;
+    for _ in 0..2 {
+        q -= (normal_cdf(q) - p) / phi(q);
+    }
+    let f = phi(q);
+    [q, 1.0 / f, q / (f * f), (1.0 + 2.0 * q * q) / f.powi(3), q * (7.0 + 6.0 * q * q) / f.powi(4)]
+}
+
 /// `softplus(x) = ln(1 + eˣ)` (`max(x, 0) + ln1p(e^{−|x|})`, without overflow) and its
 /// first four derivatives: the logistic `p` and its own first three.
 pub(crate) fn softplus_jet(x: f64) -> [f64; 5] {
@@ -2430,5 +2541,66 @@ mod tests {
         // Outside a, x > 0 the Taylor polynomial answers (zero derivatives where x <= 0).
         assert_eq!(gamma_pq_partial(2.0, -1.0, false, 1, 1), 0.0);
         assert_eq!(gamma_pq_partial(2.0, 1.0, false, 4, 0).is_nan(), true);
+    }
+
+    /// The density kernels' jets (#1716): each derivative of `ln1p`, `atan`, `lnrel`,
+    /// `ln K₁` and `Φ⁻¹` matches a central difference of the order below, across both of
+    /// `lnrel`'s arms. Dies under a wrong coefficient in any order of any of the five.
+    #[test]
+    fn density_jets_match_central_differences() {
+        let cases: [(fn(f64) -> [f64; 5], &[f64]); 5] = [
+            (ln1p_jet, &[-0.6, -0.1, 1e-3, 0.4, 3.0]),
+            (atan_jet, &[-4.0, -0.7, 0.0, 0.3, 2.5]),
+            (lnrel_jet, &[-0.7, -0.49, -0.1, 0.0, 0.2, 0.499, 0.501, 1.5, 9.0]),
+            (ln_bessel_k1_jet, &[0.01, 0.3, 1.0, 4.0, 25.0]),
+            (norm_inv_cdf_jet, &[1e-6, 0.02, 0.3, 0.5, 0.9, 0.999]),
+        ];
+        let mut worst = 0.0f64;
+        for (i, (jet, xs)) in cases.into_iter().enumerate() {
+            for &x in xs {
+                // A step on the scale of `x`, and for `Φ⁻¹` of the distance to the nearer
+                // edge of `(0, 1)`.
+                let scale = match (i, x) {
+                    (4, p) => p.min(1.0 - p),
+                    (_, 0.0) => 1.0,
+                    (_, x) => x.abs(),
+                };
+                let h = 1e-5 * scale;
+                let (up, dn) = (jet(x + h), jet(x - h));
+                let at = jet(x);
+                for k in 0..4 {
+                    let fd = (up[k] - dn[k]) / (2.0 * h);
+                    let rel = (at[k + 1] - fd).abs() / (1.0 + fd.abs());
+                    assert!(rel.is_finite(), "x = {x}, order {k}: jet {} fd {fd}", at[k + 1]);
+                    worst = worst.max(rel);
+                }
+            }
+        }
+        eprintln!("worst relative gap {worst:.2e}");
+        // Measured 1.0e-8 (the difference's own truncation and rounding); 10× headroom.
+        assert!(worst < 1e-7, "worst {worst:.2e}");
+    }
+
+    /// The jets' values against independent references: `K₁` from Abramowitz & Stegun
+    /// table 9.8, `Φ⁻¹` through the accurate [`normal_cdf`], `lnrel` continuous across its
+    /// switch at `½` in every order.
+    #[test]
+    fn density_jet_values_match_references() {
+        for (x, k1) in
+            [(0.1, 9.853_844_780_870_6), (1.0, 0.601_907_230_197_2), (10.0, 1.864_877_345_382_6e-5)]
+        {
+            let got = ln_bessel_k1_jet(x)[0].exp();
+            assert!((got / k1 - 1.0).abs() < 1e-12, "K1({x}) = {got}, want {k1}");
+        }
+        for p in [1e-12, 1e-4, 0.25, 0.5, 0.8, 1.0 - 1e-6] {
+            let q = norm_inv_cdf_jet(p)[0];
+            assert!((normal_cdf(q) / p - 1.0).abs() < 1e-13, "Φ(Φ⁻¹({p})) = {}", normal_cdf(q));
+        }
+        let (lo, hi) = (lnrel_jet(0.5 - 1e-12), lnrel_jet(0.5 + 1e-12));
+        for k in 0..5 {
+            assert!((lo[k] - hi[k]).abs() < 1e-9 * (1.0 + lo[k].abs()), "order {k}: {lo:?} {hi:?}");
+        }
+        assert_eq!(lnrel_jet(0.0)[0], 1.0);
+        assert!((lnrel_jet(0.3)[0] - 0.3f64.ln_1p() / 0.3).abs() < 1e-15);
     }
 }

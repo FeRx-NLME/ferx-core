@@ -1,0 +1,30 @@
+# One-compartment oral PK model (warfarin) with non-Gaussian random effects (#1716):
+# a Gamma-distributed clearance multiplier (mean 1) and a Student-t volume effect.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta NU(8.0, 3.0, 100.0)
+
+  omega ETA_CL ~ 0.09 density gamma
+  omega ETA_V  ~ 0.04 density t(NU)
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * ETA_CL
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true

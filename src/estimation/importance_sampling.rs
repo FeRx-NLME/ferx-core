@@ -694,16 +694,19 @@ pub fn run_importance_sampling(
 
     // FREM: Rao-Blackwellise (integrate covariate etas, sample only PK etas) when
     // a clean PK/cov partition exists. `None` → full-dimensional IS (unchanged).
-    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
-        None
-    } else {
-        model
-            .frem_config
-            .as_ref()
-            .filter(|_| model.n_kappa == 0)
-            .map(|fc| frem_pk_cov_partition(fc, n_eta))
-            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
-    };
+    // A density (#1716) makes the covariate block's conditional prior non-Gaussian, which
+    // the Rao–Blackwell split integrates in closed form: full-dimensional IS instead.
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> =
+        if !options.frem_rao_blackwell || model.has_densities() {
+            None
+        } else {
+            model
+                .frem_config
+                .as_ref()
+                .filter(|_| model.n_kappa == 0)
+                .map(|fc| frem_pk_cov_partition(fc, n_eta))
+                .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+        };
 
     let per_subject: Vec<SubjectIsOutput> =
         crate::par::map_init(population.subjects.len(), EventPkParams::default, |scratch, i| {
@@ -1244,7 +1247,7 @@ fn subject_is_estimate(
             model.residual_cov_theta(theta),
             eta,
             scratch,
-        )
+        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
     };
     subject_is_marginal_with(
         &obs_nll,
@@ -1666,6 +1669,7 @@ pub(crate) fn subject_is_draws(
     nu: f64, seed: u64, scratch: &mut EventPkParams, iscale: f64, use_sobol: bool,
     mixture: Option<&DefensiveMixture>, schedule: Option<&EventSchedule>,
 ) -> SubjectDraws {
+    // #1716: a density group's `½c` joins the per-draw data term (see `subject_is_estimate`).
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
         obs_nll_subject_into_with_schedule(
             model,
@@ -1676,7 +1680,7 @@ pub(crate) fn subject_is_draws(
             eta,
             scratch,
             schedule,
-        )
+        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
     };
     subject_is_draws_with(
         &obs_nll,
@@ -1959,6 +1963,7 @@ pub(crate) fn find_optimal_iscale(
     scratch: &mut EventPkParams, iscale_min: f64, iscale_max: f64,
     schedule: Option<&EventSchedule>,
 ) -> f64 {
+    // #1716: a density group's `½c` joins the per-draw data term (see `subject_is_estimate`).
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
         obs_nll_subject_into_with_schedule(
             model,
@@ -1969,7 +1974,7 @@ pub(crate) fn find_optimal_iscale(
             eta,
             scratch,
             schedule,
-        )
+        ) + crate::stats::eta_density::half_correction_stacked(model, eta, omega_inv, theta)
     };
     find_optimal_iscale_with(
         &obs_nll,
@@ -2238,8 +2243,11 @@ fn subject_is_estimate_joint(
     k_samples: usize, nu: f64, seed: u64, scratch: &mut EventPkParams,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
-    let obs_nll =
-        |b: &[f64], sc: &mut EventPkParams| draw_obs_nll(model, subject, theta, sigma, b, None, sc);
+    // #1716: the density's `½c`, over the BSV block of the joint draw.
+    let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
+        draw_obs_nll(model, subject, theta, sigma, b, None, sc)
+            + crate::stats::eta_density::half_correction_stacked(model, b, omega_joint_inv, theta)
+    };
     subject_is_marginal_with(
         &obs_nll,
         &DVector::from_column_slice(mode_joint),

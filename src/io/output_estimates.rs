@@ -39,6 +39,9 @@ pub(crate) enum Value {
     Name(String),
     /// Free-form text, quoted in the YAML ([`yaml_quote`]).
     Text(String),
+    /// A flow sequence (`[a, b]`): a JSON array. A [`Value::Name`] item is quoted as a
+    /// flow element ([`yaml_flow_name`]).
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -60,6 +63,16 @@ impl Value {
             Value::Token(s) => s.clone(),
             Value::Name(s) => yaml_name(s, quote_names),
             Value::Text(s) => yaml_quote(s),
+            Value::List(items) => {
+                let items: Vec<String> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Name(s) if !quote_names => yaml_flow_name(s),
+                        v => v.yaml(quote_names),
+                    })
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
         }
     }
 
@@ -72,6 +85,7 @@ impl Value {
             Value::Bool(b) => (*b).into(),
             Value::Int(n) => (*n).into(),
             Value::Token(s) | Value::Name(s) | Value::Text(s) => s.clone().into(),
+            Value::List(items) => items.iter().map(Value::json).collect(),
         }
     }
 }
@@ -359,6 +373,9 @@ pub(crate) fn omega_section(result: &FitResult) -> Section {
         if let Some((k, v)) = spread_field(eta_type(result, &name), var) {
             e.push(k, v);
         }
+        if let Some(d) = eta_distribution(result, &name) {
+            push_distribution(&mut e, result, d, var, eta_effect_quantiles(result, i));
+        }
         e.push_se(SeState::of(result, ParameterKind::Omega, i, fixed, se));
         section.entries.push(e);
     }
@@ -389,6 +406,38 @@ pub(crate) fn omega_section(result: &FitResult) -> Section {
         }
     }
     section
+}
+
+/// A non-Gaussian ETA's fields (#1716): its kind, form, shape θs and truncation, the
+/// 5/50/95% percentiles of its effect, and the effect's exact mean, SD and CV% where they
+/// exist in closed form.
+fn push_distribution(
+    e: &mut Entry, result: &FitResult, d: &crate::types::EtaDistribution, var: f64,
+    quantiles: Option<[f64; 3]>,
+) {
+    e.push("distribution", Value::Token(d.kind.to_string()));
+    e.push("distribution_form", Value::Token(d.form.to_string()));
+    if !d.shape_thetas.is_empty() {
+        e.push(
+            "distribution_shapes",
+            Value::List(d.shape_thetas.iter().cloned().map(Value::Name).collect()),
+        );
+    }
+    if let Some((lo, hi)) = d.truncation {
+        e.push("truncation", Value::List(vec![Value::num_or_null(lo), Value::num_or_null(hi)]));
+    }
+    if let Some(q) = quantiles {
+        e.push("effect_quantiles_5_50_95", Value::List(q.map(Value::Num).to_vec()));
+    }
+    if let Some((m, v)) = distribution_shapes(result, d)
+        .and_then(|sh| crate::stats::eta_density::effect_moments_of(d, var, &sh))
+    {
+        e.push("effect_mean", Value::Num(m));
+        e.push("effect_sd", Value::Num(v.sqrt()));
+        if m.abs() > 1e-12 {
+            e.push("effect_cv_pct", Value::Cv(100.0 * v.sqrt() / m.abs()));
+        }
+    }
 }
 
 /// The `sigma:` section. σ is stored as an SD, so `estimate` is the SD and `variance` its

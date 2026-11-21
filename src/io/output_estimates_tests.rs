@@ -47,12 +47,14 @@ pub(super) fn rich_result() -> FitResult {
             param_type: EtaParamType::LogNormal,
             linked_theta: Some("CL".into()),
             individual_param_name: "CL".into(),
+            distribution: None,
         },
         EtaParamInfo {
             eta_name: "eta_V".into(),
             param_type: EtaParamType::Additive,
             linked_theta: Some("V".into()),
             individual_param_name: "V".into(),
+            distribution: None,
         },
     ];
     r.sigma = vec![0.12, 0.5];

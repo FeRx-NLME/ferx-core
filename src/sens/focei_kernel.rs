@@ -265,6 +265,9 @@ pub(crate) struct LikCtx<'a> {
     /// the EKF's per-observation process-noise variances `p_obs` with their η-jets, and each
     /// row's variance is the residual one plus its `p_obs` (`ekf_p_obs`).
     pub(crate) sde: bool,
+    /// The density groups over the vector the kernel's prior reads (#1716): the BSV groups,
+    /// and under IOV each κ group per occasion of this subject (`stacked_groups`).
+    pub(crate) densities: std::borrow::Cow<'a, [crate::stats::eta_density::EtaDensity]>,
 }
 
 /// The most σ loadings one row has: the residual-error owner's bound.
@@ -276,7 +279,18 @@ impl<'a> LikCtx<'a> {
     ) -> Self {
         let keys = model.error_spec.obs_keys(subject);
         let cov = model.residual_cov_with(&params.residual_correlations, &params.theta);
-        LikCtx { model, subject, params, cov, keys, sde: model.is_sde() }
+        // The κ groups over this subject's stacked (or, under nested levels, compact) axes.
+        let layout = (!model.kappa_densities.is_empty())
+            .then(|| crate::stats::stacked_layout::StackedLayout::sens_of(model, subject))
+            .flatten();
+        let densities = match layout {
+            Some(l) => std::borrow::Cow::Owned(crate::stats::eta_density::layout_groups(
+                model,
+                &l.kappa_blocks(),
+            )),
+            None => std::borrow::Cow::Borrowed(model.eta_densities.as_slice()),
+        };
+        LikCtx { model, subject, params, cov, keys, sde: model.is_sde(), densities }
     }
 
     /// The subject's observation rows (the kernel's `f` holds `2n` under an SDE).
@@ -409,16 +423,48 @@ impl<'a> LikCtx<'a> {
         }
     }
 
-    /// `ηᵀΩ⁻¹η + log|Ω|`.
+    /// `ηᵀΩ⁻¹η + log|Ω|`, plus a density group's correction `c` (#1716): `−2 ln p(η)`.
     fn prior<T: PkNum>(&self, eta: &[T], p: &ParT<T>) -> T {
         let n = eta.len();
         let oi = p.omega_inv(n);
-        wsum3(
+        let gauss = wsum3(
             0.0,
             (0..n)
                 .flat_map(|k| (0..n).map(move |l| (k, l)))
                 .map(|(k, l)| (oi[k][l], eta[k], eta[l])),
-        ) + p.omega.log_det
+        ) + p.omega.log_det;
+        if self.densities.is_empty() {
+            return gauss;
+        }
+        gauss
+            + crate::stats::eta_density::correction_g(
+                &self.densities,
+                eta,
+                |a, b| oi[a][b],
+                |k| p.theta[k],
+            )
+    }
+
+    /// A density group's `(½∇c, ½∇²c)` at `eta` (#1716): its share of `∇l` and of the
+    /// prior curvature in `H̃`. `None` for a Gaussian model.
+    fn density_half_jets<T: PkNum>(&self, eta: &[T], p: &ParT<T>) -> Option<(Vec<T>, Vec<Vec<T>>)> {
+        if self.densities.is_empty() {
+            return None;
+        }
+        let oi = p.omega_inv(eta.len());
+        let (_, g, h) = crate::stats::eta_density::correction_jets_g(
+            &self.densities,
+            eta,
+            |a, b| oi[a][b],
+            |k| p.theta[k],
+            true,
+        );
+        let half = T::from_f64(0.5);
+        let h = h.expect("requested");
+        Some((
+            g.iter().map(|&x| half * x).collect(),
+            h.iter().map(|r| r.iter().map(|&x| half * x).collect()).collect(),
+        ))
     }
 
     /// The residual covariance over `T` (the dense path), with its coupling blocks: the
@@ -501,7 +547,10 @@ pub(crate) fn focei_f_grad<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<(T, Vec<T>)> {
     if ctx.dense() {
-        return Some((focei_f_dense(ctx, f, g, eta, p)?.0, inner_grad(ctx, f, g, eta, p, None)?));
+        return Some((
+            focei_f_dense(ctx, f, g, eta, p, true)?.0,
+            inner_grad(ctx, f, g, eta, p, None)?,
+        ));
     }
     let (fv, grad, _) = focei_parts(ctx, f, g, eta, p)?;
     Some((fv, grad))
@@ -534,6 +583,22 @@ pub(crate) fn focei_f_grad_ng<T: PkNum>(
     Some((fv, grad))
 }
 
+/// FOCE's (no interaction) `(F, ∇_η l)` under a density (#1716): the conditional rows with
+/// `½·c̃ᵀc̃` and the censored curvature left out of `H̃` — production's
+/// `foce_subject_nll_interaction_with_tte` with no endpoint term. The Sheiner–Beal marginal
+/// ([`foce_f`]) integrates η as `N(0, Ω)` and has no density form. A dense residual takes
+/// the dense conditional form without `½·B`.
+pub(crate) fn foce_f_grad_density<T: PkNum>(
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
+) -> Option<(T, Vec<T>)> {
+    if ctx.dense() {
+        let fv = focei_f_dense(ctx, f, g, eta, p, false)?.0;
+        return Some((fv, inner_grad(ctx, f, g, eta, p, None)?));
+    }
+    let (fv, grad, _) = focei_rows_k(ctx, f, g, eta, p, None, false)?;
+    Some((fv, grad))
+}
+
 /// FOCEI's Gauss–Newton Hessian `H̃` (the AGQ Gauss–Newton anchor).
 pub(crate) fn focei_htilde<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
@@ -547,7 +612,7 @@ fn focei_parts<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
     if ctx.dense() {
-        let (fv, ht) = focei_f_dense(ctx, f, g, eta, p)?;
+        let (fv, ht) = focei_f_dense(ctx, f, g, eta, p, true)?;
         return Some((fv, vec![T::from_f64(0.0); eta.len()], ht));
     }
     focei_rows_k(ctx, f, g, eta, p, None, true)
@@ -601,12 +666,14 @@ pub(crate) fn gauss_row_l<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
 /// Whether a subject's FOCEI objective is the row-and-reduce form [`focei_gauss_row`] and the
 /// reduce `½·[ηᵀΩ⁻¹η + log|Ω| + log|Ω⁻¹ + Σ αGGᵀ|]` describe exactly: the diagonal path with
 /// every row an uncensored Gaussian one, no RUV IIV, no SDE, no FREM rows, no non-Gaussian
-/// records, no custom residual magnitude and a diagonal residual covariance — asked of
+/// records, no custom residual magnitude, a diagonal residual covariance — asked of
 /// `ResidualCov::is_dense` (`stats::residual_error`), which sees every correlation source,
-/// not only `block_sigma` pairs (#1081).
+/// not only `block_sigma` pairs (#1081) — and a Gaussian prior: a density group (#1716) adds
+/// `½∇²c` to `H̃`, which the reduce's `Ω⁻¹ + Σ αGGᵀ` does not hold.
 pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
     let m = ctx.model;
-    !ctx.cov.is_dense()
+    ctx.densities.is_empty()
+        && !ctx.cov.is_dense()
         && m.residual_error_eta.is_none()
         && !ctx.sde
         && m.frem_config.is_none()
@@ -834,9 +901,15 @@ fn focei_rows<T: PkNum, const K: usize>(
             }
         }
     }
+    // A density group's prior curvature `½∇²c` beside `Ω⁻¹`, and its `½∇c` (#1716).
+    let density = ctx.density_half_jets(eta, p);
+    if let Some((_, dh)) = &density {
+        add_into(&mut ht, dh);
+    }
     let ld = chol(&ht).map(|l| chol_logdet(&l))?;
     let fv = c(0.5) * (data + ctx.prior(eta, p) + ld + bloq);
-    let mut grad = assemble_grad(oi, eta, g, &dl, &explicit);
+    let mut grad =
+        assemble_grad(oi, eta, g, &dl, &explicit, density.as_ref().map(|d| d.0.as_slice()));
     if let Some(ng) = ng {
         for k in 0..nn {
             grad[k] = grad[k] + ng.g[k];
@@ -845,9 +918,19 @@ fn focei_rows<T: PkNum, const K: usize>(
     Some((fv, grad, ht))
 }
 
-/// `∇_k l = Σ_l Ω⁻¹_kl η_l + ½·Σ_j (∂ℓ_j/∂f)·G_jk + ½·explicit_k`.
+/// `a += b`, entry by entry: a density's `½∇²c` added to `H̃` (#1716).
+fn add_into<T: PkNum>(a: &mut [Vec<T>], b: &[Vec<T>]) {
+    for (ra, rb) in a.iter_mut().zip(b) {
+        for (x, &y) in ra.iter_mut().zip(rb) {
+            *x = *x + y;
+        }
+    }
+}
+
+/// `∇_k l = Σ_l Ω⁻¹_kl η_l + ½·Σ_j (∂ℓ_j/∂f)·G_jk + ½·explicit_k`, plus a density group's
+/// `½∂c/∂η_k` (#1716).
 fn assemble_grad<T: PkNum>(
-    oi: &[Vec<T>], eta: &[T], g: &[Vec<T>], dl: &[T], explicit: &[T],
+    oi: &[Vec<T>], eta: &[T], g: &[Vec<T>], dl: &[T], explicit: &[T], density: Option<&[T]>,
 ) -> Vec<T> {
     let one = T::from_f64(1.0);
     let half = T::from_f64(0.5);
@@ -855,7 +938,8 @@ fn assemble_grad<T: PkNum>(
         .map(|k| {
             let prior = (0..eta.len()).map(|l| (oi[k][l], eta[l], one));
             let rows = (0..dl.len()).map(|j| (half, dl[j], g[j][k]));
-            wsum3(0.0, prior.chain(rows)) + half * explicit[k]
+            let v = wsum3(0.0, prior.chain(rows)) + half * explicit[k];
+            density.map_or(v, |d| v + d[k])
         })
         .collect()
 }
@@ -1038,7 +1122,7 @@ fn direction_duals<T: PkNum>(
 
 /// Dense-`R` FOCEI `F`: `½(rᵀR⁻¹r + log|R| + ηᵀΩ⁻¹η + log|Ω| + log|H̃|)`.
 fn focei_f_dense<T: PkNum>(
-    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>, interaction: bool,
 ) -> Option<(T, Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
     let n = ctx.n();
@@ -1095,8 +1179,12 @@ fn focei_f_dense<T: PkNum>(
                     bab = bab + rd_k[a][jj][i] * rd_k[b][i][jj];
                 }
             }
-            ht[a][b] = ht[a][b] + hrh + c(0.5) * bab;
+            // FOCE's conditional form under a density (#1716) leaves `½·B` out.
+            ht[a][b] = ht[a][b] + hrh + if interaction { c(0.5) * bab } else { c(0.0) };
         }
+    }
+    if let Some((_, dh)) = ctx.density_half_jets(eta, p) {
+        add_into(&mut ht, &dh);
     }
     let ld = chol(&ht).map(|l| chol_logdet(&l))?;
     Some((c(0.5) * (data + ctx.prior(eta, p) + ld), ht))
@@ -1244,7 +1332,9 @@ fn note_inner_hessian_route(subject: &Subject, generic: bool) {
 pub(crate) fn exact_inner_hessian_kernel<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], q: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
-    if reads_eta_directly(ctx) {
+    // A density's prior curvature depends on η, which the through-predictions form does not
+    // read: the generic route differentiates the prior, density included (#1716).
+    if reads_eta_directly(ctx) || !ctx.densities.is_empty() {
         inner_hessian_generic(ctx, f, g, q, eta, p)
     } else {
         inner_hessian_through_predictions(ctx, f, g, q, p)
@@ -1396,7 +1486,15 @@ pub(crate) fn inner_grad<T: PkNum>(
             }
         }
     }
-    let grad = assemble_grad(p.omega_inv(eta.len()), eta, g, &dl, &explicit);
+    let density = ctx.density_half_jets(eta, p);
+    let grad = assemble_grad(
+        p.omega_inv(eta.len()),
+        eta,
+        g,
+        &dl,
+        &explicit,
+        density.as_ref().map(|d| d.0.as_slice()),
+    );
     Some(grad)
 }
 
