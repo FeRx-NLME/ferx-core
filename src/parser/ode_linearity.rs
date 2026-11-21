@@ -71,11 +71,7 @@ impl Classifier<'_> {
                     return Affine;
                 }
                 let key = name.to_ascii_uppercase();
-                scope
-                    .get(&key)
-                    .or_else(|| self.prior.get(&key))
-                    .copied()
-                    .unwrap_or(Const)
+                scope.get(&key).or_else(|| self.prior.get(&key)).copied().unwrap_or(Const)
             }
             // Only produced by `resolve_variable_indices`, which runs after this pass. Met here
             // it means the caller handed in a resolved program, whose names are gone — so the
@@ -146,10 +142,7 @@ impl Classifier<'_> {
                     scope.insert(name.to_ascii_uppercase(), d);
                 }
                 Statement::DiffEq(_, e) => worst = worst.max(self.expr(e, scope)),
-                Statement::If {
-                    branches,
-                    else_body,
-                } => {
+                Statement::If { branches, else_body } => {
                     // Each arm sees the scope as it was before the `if`; afterwards a variable
                     // has the worst degree any path can leave it with — including the
                     // fall-through path when there is no `else`.
@@ -194,11 +187,7 @@ pub(super) fn stmts_affine_in_states(stmts: &[Statement], states: &[String]) -> 
     // Degrees only rise, over a finite lattice, so this terminates; the cap is a backstop.
     let mut prior = Scope::new();
     for _ in 0..8 {
-        let mut c = Classifier {
-            states,
-            prior: &prior,
-            state_in_condition: false,
-        };
+        let mut c = Classifier { states, prior: &prior, state_in_condition: false };
         let mut scope = Scope::new();
         let worst = c.stmts(stmts, &mut scope);
         if c.state_in_condition || worst == Degree::Nonlinear {

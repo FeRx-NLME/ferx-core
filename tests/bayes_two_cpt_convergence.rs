@@ -150,10 +150,7 @@ fn run(src: &str, focei: &[(&str, f64)]) -> ferx_core::types::BayesResult {
             .iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("{name} summarised"));
-        assert!(
-            s.mean.is_finite() && s.sd.is_finite() && s.sd > 0.0,
-            "{name}"
-        );
+        assert!(s.mean.is_finite() && s.sd.is_finite() && s.sd > 0.0, "{name}");
         let in_sd = (s.mean - want).abs() / s.sd;
         // Measured (Linux, seed 3): θ and σ ≤ 0.110 (base) / 0.118 (cov)
         // posterior SD from FOCEI, Ω ≤ 0.27 / 0.31 (above the MLE, as
@@ -174,10 +171,7 @@ fn run(src: &str, focei: &[(&str, f64)]) -> ferx_core::types::BayesResult {
     eprintln!(
         "max_rhat {:.4}  min ess_bulk {:.0}  |mean − FOCEI| / sd: θ,σ {:.3}  Ω {:.3}",
         b.max_rhat,
-        b.summaries
-            .iter()
-            .map(|s| s.ess_bulk)
-            .fold(f64::INFINITY, f64::min),
+        b.summaries.iter().map(|s| s.ess_bulk).fold(f64::INFINITY, f64::min),
         worst_theta,
         worst_omega
     );
@@ -198,20 +192,14 @@ fn assert_converged(b: &ferx_core::types::BayesResult) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bayes_converges_on_two_cpt_oral_base() {
     let b = run(BASE_MODEL, FOCEI_BASE);
     assert_converged(&b);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bayes_converges_on_two_cpt_oral_cov() {
     let b = run(COV_MODEL, FOCEI_COV);
     assert_converged(&b);
@@ -219,11 +207,6 @@ fn bayes_converges_on_two_cpt_oral_cov() {
     // #1626 their 2.5% quantiles reached 5e-9 and 1e-8.
     for name in ["THETA_WT", "THETA_CRCL"] {
         let s = b.summaries.iter().find(|s| s.name == name).expect(name);
-        assert!(
-            s.q025 >= 0.01 && s.q975 <= 5.0,
-            "{name}: [{}, {}]",
-            s.q025,
-            s.q975
-        );
+        assert!(s.q025 >= 0.01 && s.q975 <= 5.0, "{name}: [{}, {}]", s.q025, s.q975);
     }
 }

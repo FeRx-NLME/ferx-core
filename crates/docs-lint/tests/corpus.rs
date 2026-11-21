@@ -19,13 +19,7 @@ fn docs_tree_passes_all_four_rules() {
 
     let mut report = String::new();
     for v in &filtered.failing {
-        report.push_str(&format!(
-            "{}:{}: {}: {}\n",
-            v.file,
-            v.line,
-            v.rule.as_str(),
-            v.message
-        ));
+        report.push_str(&format!("{}:{}: {}: {}\n", v.file, v.line, v.rule.as_str(), v.message));
     }
     for key in &filtered.stale {
         report.push_str(&format!(
@@ -49,14 +43,8 @@ fn baseline_entries_all_name_a_live_section() {
         return;
     }
     // A very large limit yields every chunk in the corpus, keyed the same way.
-    let all = lint_tree(
-        &root.join("docs"),
-        &root,
-        &Config {
-            max_chars: usize::MAX,
-        },
-    )
-    .expect("read docs/");
+    let all = lint_tree(&root.join("docs"), &root, &Config { max_chars: usize::MAX })
+        .expect("read docs/");
     // With no size violations possible, anything left is another rule; the keys
     // we need come from a zero-limit run instead.
     assert!(all.iter().all(|v| v.chunk.is_none()));
@@ -183,5 +171,30 @@ fn computed_ids_match_the_rendered_site() {
     assert!(
         checked > 0,
         "no ids checked ({stale} page(s) skipped as newer than their render) — re-render first"
+    );
+}
+
+/// `llms.txt` sends a model to the agent page before anything else (#3073), and
+/// that page is reachable from the site's own navigation, not only from the
+/// index. Whether every link in `llms.txt` resolves is the corpus run above.
+#[test]
+fn llms_txt_links_the_agent_page_first_and_the_sidebar_lists_it() {
+    let root = repo_root();
+    let docs = root.join("docs");
+    let llms = std::fs::read_to_string(docs.join("llms.txt")).expect("read docs/llms.txt");
+    let site = docs_lint::llms::site_url(&docs).expect("site-url in docs/_quarto.yml");
+
+    assert!(llms.starts_with("# "), "llms.txt must open with an H1 (llmstxt.org)");
+    let first = docs_lint::parse::parse_str(&llms, &docs.join("llms.txt"), &root)
+        .links
+        .into_iter()
+        .next()
+        .expect("llms.txt has links");
+    assert_eq!(first.target, format!("{site}agents.html"), "first link in llms.txt");
+
+    let quarto = std::fs::read_to_string(docs.join("_quarto.yml")).expect("read _quarto.yml");
+    assert!(
+        quarto.lines().any(|l| l.trim() == "href: agents.qmd"),
+        "docs/agents.qmd is missing from the sidebar in docs/_quarto.yml"
     );
 }

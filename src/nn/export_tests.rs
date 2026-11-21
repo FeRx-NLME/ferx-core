@@ -33,10 +33,7 @@ fn fixture_theta() -> (Vec<String>, Vec<f64>) {
 }
 
 fn export(
-    text: &str,
-    names: &[String],
-    theta: &[f64],
-    form: DcmWeightForm,
+    text: &str, names: &[String], theta: &[f64], form: DcmWeightForm,
 ) -> Result<String, String> {
     let mut opts = DcmExportOptions::default();
     opts.weight_form = form;
@@ -51,11 +48,7 @@ fn export_fixture(form: DcmWeightForm) -> String {
 /// The lines the export generated: every output line that is not an input line.
 fn generated_lines(exported: &str, original: &str) -> Vec<String> {
     let orig: HashSet<&str> = original.lines().collect();
-    exported
-        .lines()
-        .filter(|l| !orig.contains(l))
-        .map(str::to_string)
-        .collect()
+    exported.lines().filter(|l| !orig.contains(l)).map(str::to_string).collect()
 }
 
 // ── Emission (every build) ──────────────────────────────────────────────────
@@ -72,10 +65,7 @@ fn generated_lines(exported: &str, original: &str) -> Vec<String> {
 fn fixture_export_matches_the_committed_text() {
     let got = export_fixture(DcmWeightForm::Literal);
     if got != FIXTURE_EXPECTED {
-        let first = got
-            .lines()
-            .zip(FIXTURE_EXPECTED.lines())
-            .position(|(a, b)| a != b);
+        let first = got.lines().zip(FIXTURE_EXPECTED.lines()).position(|(a, b)| a != b);
         panic!(
             "export of tests/data/dcm_export/model.ferx drifted from expected_analytic.ferx \
              (first differing line: {first:?})\n--- got ---\n{got}"
@@ -94,10 +84,7 @@ fn exported_model_parses_without_a_network_block() {
             .unwrap_or_else(|e| panic!("{form:?} export does not parse: {e}\n{text}"));
         for line in text.lines() {
             let code = strip_line_comment(line);
-            assert!(
-                !code.contains("[covariate_nn"),
-                "{form:?}: block left behind: {line}"
-            );
+            assert!(!code.contains("[covariate_nn"), "{form:?}: block left behind: {line}");
             assert!(
                 !code.contains("TYPICAL_PK.") && !code.contains("TYPICAL_PK ."),
                 "{form:?}: a network reference survived the rewrite: {line}"
@@ -125,14 +112,8 @@ fn every_emitted_function_is_a_parser_builtin() {
     // Every activation, as hidden and as output, so each spelling is checked.
     for act in ALL_ACTIVATIONS {
         let model = FIXTURE_MODEL
-            .replace(
-                "activation = tanh",
-                &format!("activation = {}", act.as_str()),
-            )
-            .replace(
-                "output     = softplus",
-                &format!("output     = {}", act.as_str()),
-            );
+            .replace("activation = tanh", &format!("activation = {}", act.as_str()))
+            .replace("output     = softplus", &format!("output     = {}", act.as_str()));
         texts.push(export(&model, &names, &theta, DcmWeightForm::Literal).unwrap());
     }
     let mut seen = HashSet::new();
@@ -187,10 +168,7 @@ fn every_weight_is_printed_at_round_trip_precision() {
             );
         }
     }
-    assert_eq!(
-        n_weights, 23,
-        "the fixture's 2-3-2-2 network has 23 weights"
-    );
+    assert_eq!(n_weights, 23, "the fixture's 2-3-2-2 network has 23 weights");
 }
 
 /// `FixedTheta` declares every weight as a FIXed θ holding its exact value, and
@@ -215,10 +193,7 @@ fn fixed_theta_form_declares_each_weight_once_at_its_value() {
         assert_eq!(text.matches(&format!("theta {n}(")).count(), 1, "{n}");
     }
     let generated = generated_lines(&text, FIXTURE_MODEL).join("\n");
-    assert!(
-        generated.contains("W_TYPICAL_PK_3_2_1 * H2_TYPICAL_PK_1"),
-        "{generated}"
-    );
+    assert!(generated.contains("W_TYPICAL_PK_3_2_1 * H2_TYPICAL_PK_1"), "{generated}");
 }
 
 #[test]
@@ -235,16 +210,10 @@ fn a_model_without_a_network_is_an_error() {
 #[test]
 fn a_weight_missing_from_the_fit_is_named() {
     let (mut names, theta) = fixture_theta();
-    let i = names
-        .iter()
-        .position(|n| n == "W_TYPICAL_PK_2_1_3")
-        .unwrap();
+    let i = names.iter().position(|n| n == "W_TYPICAL_PK_2_1_3").unwrap();
     names[i] = "SOMETHING_ELSE".into();
     let err = export(FIXTURE_MODEL, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("W_TYPICAL_PK_2_1_3") && err.contains("not among"),
-        "{err}"
-    );
+    assert!(err.contains("W_TYPICAL_PK_2_1_3") && err.contains("not among"), "{err}");
 }
 
 #[test]
@@ -253,10 +222,7 @@ fn a_non_finite_weight_is_refused() {
     let i = names.iter().position(|n| n == "B_TYPICAL_PK_3_2").unwrap();
     theta[i] = f64::NAN;
     let err = export(FIXTURE_MODEL, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("B_TYPICAL_PK_3_2") && err.contains("non-finite"),
-        "{err}"
-    );
+    assert!(err.contains("B_TYPICAL_PK_3_2") && err.contains("non-finite"), "{err}");
 }
 
 #[test]
@@ -276,10 +242,7 @@ fn a_generated_name_the_model_already_uses_is_refused() {
         "  H1_TYPICAL_PK_2 = 1.0\n  V  = TVV * exp(ETA_V) * H1_TYPICAL_PK_2",
     );
     let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("`H1_TYPICAL_PK_2`") && err.contains("already uses"),
-        "{err}"
-    );
+    assert!(err.contains("`H1_TYPICAL_PK_2`") && err.contains("already uses"), "{err}");
     // Case-folded: a differently cased spelling collides too.
     let model = FIXTURE_MODEL.replace("TVV", "typical_pk_cl");
     let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
@@ -291,10 +254,7 @@ fn a_reference_to_an_undeclared_output_is_refused() {
     let (names, theta) = fixture_theta();
     let model = FIXTURE_MODEL.replace("TYPICAL_PK . KA", "TYPICAL_PK.V2");
     let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("TYPICAL_PK.V2") && err.contains("Known outputs: CL, KA"),
-        "{err}"
-    );
+    assert!(err.contains("TYPICAL_PK.V2") && err.contains("Known outputs: CL, KA"), "{err}");
 }
 
 #[test]
@@ -314,63 +274,33 @@ fn a_time_input_is_refused() {
 fn an_input_that_would_not_read_the_data_column_is_refused() {
     let (names, theta) = fixture_theta();
     let with_inputs = |inputs: &str| {
-        FIXTURE_MODEL.replace(
-            "inputs     = [WT, CRCL]",
-            &format!("inputs     = [{inputs}]"),
-        )
+        FIXTURE_MODEL.replace("inputs     = [WT, CRCL]", &format!("inputs     = [{inputs}]"))
     };
     // A built-in the parser resolves before any data column.
-    let err = export(
-        &with_inputs("WT, MIXNUM"),
-        &names,
-        &theta,
-        DcmWeightForm::Literal,
-    )
-    .unwrap_err();
+    let err =
+        export(&with_inputs("WT, MIXNUM"), &names, &theta, DcmWeightForm::Literal).unwrap_err();
     assert!(err.contains("`MIXNUM`") && err.contains("mixture"), "{err}");
     // Not an identifier at all.
-    let err = export(
-        &with_inputs("WT, CRCL.MLMIN"),
-        &names,
-        &theta,
-        DcmWeightForm::Literal,
-    )
-    .unwrap_err();
-    assert!(
-        err.contains("`CRCL.MLMIN`") && err.contains("not an identifier"),
-        "{err}"
-    );
+    let err =
+        export(&with_inputs("WT, CRCL.MLMIN"), &names, &theta, DcmWeightForm::Literal).unwrap_err();
+    assert!(err.contains("`CRCL.MLMIN`") && err.contains("not an identifier"), "{err}");
     // A θ of the same name: the equation would read the θ.
-    let model = FIXTURE_MODEL.replace(
-        "  theta TVV(30, 1, 100)",
-        "  theta TVV(30, 1, 100)\n  theta CRCL(1, 0.1, 10)",
-    );
+    let model = FIXTURE_MODEL
+        .replace("  theta TVV(30, 1, 100)", "  theta TVV(30, 1, 100)\n  theta CRCL(1, 0.1, 10)");
     let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("input `CRCL` is also the name of a theta"),
-        "{err}"
-    );
+    assert!(err.contains("input `CRCL` is also the name of a theta"), "{err}");
     // A variable the model assigns: the generated normalisation comes first, so
     // the parse refuses it as a forward reference.
     let assigned = FIXTURE_MODEL
         .replace("inputs     = [WT, CRCL]", "inputs     = [WT, XR]")
-        .replace(
-            "  V  = TVV * exp(ETA_V)",
-            "  XR = 2\n  V  = TVV * exp(ETA_V)",
-        );
+        .replace("  V  = TVV * exp(ETA_V)", "  XR = 2\n  V  = TVV * exp(ETA_V)");
     let err = export(&assigned, &names, &theta, DcmWeightForm::Literal).unwrap_err();
-    assert!(
-        err.contains("forward reference") && err.contains("`XR`"),
-        "{err}"
-    );
+    assert!(err.contains("forward reference") && err.contains("`XR`"), "{err}");
     // The control: the fixture's own inputs are read as columns, so the check
     // above is not refusing everything.
     let model = parse_model_string(&export_fixture(DcmWeightForm::Literal)).unwrap();
     for input in ["WT", "CRCL"] {
-        assert!(
-            model.referenced_covariates.iter().any(|c| c == input),
-            "{input}"
-        );
+        assert!(model.referenced_covariates.iter().any(|c| c == input), "{input}");
     }
 }
 
@@ -379,10 +309,8 @@ fn an_input_that_would_not_read_the_data_column_is_refused() {
 #[test]
 fn an_input_the_model_assigns_is_refused() {
     let (names, theta) = fixture_theta();
-    let model = FIXTURE_MODEL.replace(
-        "  V  = TVV * exp(ETA_V)",
-        "  WT = 70\n  V  = TVV * exp(ETA_V)",
-    );
+    let model =
+        FIXTURE_MODEL.replace("  V  = TVV * exp(ETA_V)", "  WT = 70\n  V  = TVV * exp(ETA_V)");
     let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
     assert!(err.contains("WT"), "{err}");
 }
@@ -404,17 +332,9 @@ fn an_output_read_outside_individual_parameters_is_refused() {
     };
     let control = export(&with_kappa("NARM"), &names, &theta, DcmWeightForm::Literal);
     assert!(control.is_ok(), "{control:?}");
-    let err = export(
-        &with_kappa("TYPICAL_PK.CL"),
-        &names,
-        &theta,
-        DcmWeightForm::Literal,
-    )
-    .unwrap_err();
-    assert!(
-        err.contains("`TYPICAL_PK.CL` is read outside [individual_parameters]"),
-        "{err}"
-    );
+    let err =
+        export(&with_kappa("TYPICAL_PK.CL"), &names, &theta, DcmWeightForm::Literal).unwrap_err();
+    assert!(err.contains("`TYPICAL_PK.CL` is read outside [individual_parameters]"), "{err}");
     assert!(err.contains("`TYPICAL_PK_CL` as a data column"), "{err}");
 }
 
@@ -427,10 +347,7 @@ fn a_model_without_a_parameters_block_is_refused_for_the_missing_block() {
     let model = FIXTURE_MODEL.replace("[parameters]\n", "");
     for form in [DcmWeightForm::Literal, DcmWeightForm::FixedTheta] {
         let err = export(&model, &names, &theta, form).unwrap_err();
-        assert!(
-            err.contains("Missing [parameters] block"),
-            "{form:?}: {err}"
-        );
+        assert!(err.contains("Missing [parameters] block"), "{form:?}: {err}");
     }
 }
 
@@ -440,13 +357,11 @@ fn a_model_without_a_parameters_block_is_refused_for_the_missing_block() {
 /// such a network parses, and the units are absent from the parameter list.
 #[test]
 fn a_wide_network_on_an_ode_model_exports_to_a_model_that_parses() {
-    let model = FIXTURE_MODEL
-        .replace("layers     = [3, 2]", "layers     = [64, 64]")
-        .replace(
-            "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
-            "  ode(obs_cmt=central, states=[depot, central])\n\n[odes]\n  \
+    let model = FIXTURE_MODEL.replace("layers     = [3, 2]", "layers     = [64, 64]").replace(
+        "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        "  ode(obs_cmt=central, states=[depot, central])\n\n[odes]\n  \
              d/dt(depot)   = -KA * depot\n  d/dt(central) = KA * depot / V - CL/V * central",
-        );
+    );
     let names = parse_nn_block_fields(
         "TYPICAL_PK",
         &[
@@ -459,9 +374,7 @@ fn a_wide_network_on_an_ode_model_exports_to_a_model_that_parses() {
     .unwrap()
     .weight_theta_names();
     assert_eq!(names.len(), 2 * 64 + 64 + 64 * 64 + 64 + 64 * 2 + 2);
-    let theta: Vec<f64> = (0..names.len())
-        .map(|k| ((k as f64) * 0.37).sin())
-        .collect();
+    let theta: Vec<f64> = (0..names.len()).map(|k| ((k as f64) * 0.37).sin()).collect();
     let text = export(&model, &names, &theta, DcmWeightForm::Literal).expect("exports");
     let plain = parse_model_string(&text).expect("the export parses");
     assert!(plain.ode_spec.is_some(), "the fixture must be an ODE model");
@@ -486,29 +399,17 @@ fn a_direct_read_of_a_weight_theta_survives_the_export() {
         "  V  = TVV * exp(ETA_V + 0.01 * B_TYPICAL_PK_3_1 - W_TYPICAL_PK_1_1_1)",
     );
     let b = theta[names.iter().position(|n| n == "B_TYPICAL_PK_3_1").unwrap()];
-    let w = theta[names
-        .iter()
-        .position(|n| n == "W_TYPICAL_PK_1_1_1")
-        .unwrap()];
-    assert!(
-        b < 0.0 && w > 0.0,
-        "one negative and one positive reference"
-    );
+    let w = theta[names.iter().position(|n| n == "W_TYPICAL_PK_1_1_1").unwrap()];
+    assert!(b < 0.0 && w > 0.0, "one negative and one positive reference");
 
     let literal = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap();
     assert!(
-        literal.contains(&format!(
-            "  V  = TVV * exp(ETA_V + 0.01 * (-{:?}) - {w:?})",
-            b.abs()
-        )),
+        literal.contains(&format!("  V  = TVV * exp(ETA_V + 0.01 * (-{:?}) - {w:?})", b.abs())),
         "{literal}"
     );
     let plain = parse_model_string(&literal).unwrap();
     assert!(
-        plain
-            .referenced_covariates
-            .iter()
-            .all(|c| !c.starts_with("W_") && !c.starts_with("B_")),
+        plain.referenced_covariates.iter().all(|c| !c.starts_with("W_") && !c.starts_with("B_")),
         "{:?}",
         plain.referenced_covariates
     );
@@ -516,10 +417,7 @@ fn a_direct_read_of_a_weight_theta_survives_the_export() {
     let fixed = export(&model, &names, &theta, DcmWeightForm::FixedTheta).unwrap();
     assert!(fixed.contains("exp(ETA_V + 0.01 * B_TYPICAL_PK_3_1 - W_TYPICAL_PK_1_1_1)"));
     let plain = parse_model_string(&fixed).unwrap();
-    assert!(plain
-        .referenced_covariates
-        .iter()
-        .all(|c| !c.starts_with("B_")));
+    assert!(plain.referenced_covariates.iter().all(|c| !c.starts_with("B_")));
 }
 
 /// The validation parse does not read a `[priors] from_fit` file: the path is
@@ -533,10 +431,7 @@ fn a_from_fit_prior_is_kept_and_not_read() {
         format!("{FIXTURE_MODEL}\n[priors]\n  from_fit = \"no/such/dir/parent-fit.json\"\n");
     let text = export(&model, &names, &theta, DcmWeightForm::Literal)
         .expect("a prior file that does not resolve here does not block the export");
-    assert!(
-        text.contains("[priors]\n  from_fit = \"no/such/dir/parent-fit.json\"\n"),
-        "{text}"
-    );
+    assert!(text.contains("[priors]\n  from_fit = \"no/such/dir/parent-fit.json\"\n"), "{text}");
     // Control: the parser itself does read the file, so the strip is what lets
     // the export through.
     assert!(parse_model_string(&text).is_err());
@@ -558,31 +453,21 @@ fn quoted_paths_are_never_rewritten() {
     }
     // Unquoted, only the block rule protects it: `[data]` is copied whole.
     let tail = "\n[data]\n  path = TYPICAL_PK.CL.csv\n";
-    let text = export(
-        &format!("{FIXTURE_MODEL}{tail}"),
-        &names,
-        &theta,
-        DcmWeightForm::Literal,
-    )
-    .unwrap();
+    let text =
+        export(&format!("{FIXTURE_MODEL}{tail}"), &names, &theta, DcmWeightForm::Literal).unwrap();
     assert!(text.ends_with(tail), "unquoted path changed:\n{text}");
     // A quoted span inside an expression block is skipped as well.
     let mut weight_literals = HashMap::new();
     weight_literals.insert("W_TYPICAL_PK_1_1_1".to_string(), 0.5);
     let nets: Vec<(NnBlockSpec, Vec<f64>)> = Vec::new();
-    let names_table = NameTable {
-        outputs: BTreeMap::new(),
-    };
+    let names_table = NameTable { outputs: BTreeMap::new() };
     let line = r#"  X = W_TYPICAL_PK_1_1_1 * 2   # "W_TYPICAL_PK_1_1_1""#;
     let got = rewrite_refs(line, &nets, &names_table, &weight_literals).unwrap();
     assert_eq!(got, r#"  X = 0.5 * 2   # "W_TYPICAL_PK_1_1_1""#);
     let line = r#"  label = "W_TYPICAL_PK_1_1_1 'x'" W_TYPICAL_PK_1_1_1"#;
     let got = rewrite_refs(line, &nets, &names_table, &weight_literals).unwrap();
     assert_eq!(got, r#"  label = "W_TYPICAL_PK_1_1_1 'x'" 0.5"#);
-    assert_eq!(
-        identifiers(r#"a "b c" d 'e'"#).collect::<Vec<_>>(),
-        vec!["a", "d"]
-    );
+    assert_eq!(identifiers(r#"a "b c" d 'e'"#).collect::<Vec<_>>(), vec!["a", "d"]);
 }
 
 /// The fixture's fit: its θ, and Ω / Σ estimates that differ from every value the
@@ -623,35 +508,17 @@ fn a_fit_made_with_a_different_network_is_refused() {
     assert_eq!(got, FIXTURE_EXPECTED);
     // Comments, layout and `init` do not define the network.
     let cosmetic = FIXTURE_MODEL
-        .replace(
-            "inputs     = [WT, CRCL]   # both normalised",
-            "inputs = [WT,CRCL]",
-        )
-        .replace(
-            "  output     = softplus",
-            "  output     = softplus\n  init       = [2.0, 1.0]",
-        );
+        .replace("inputs     = [WT, CRCL]   # both normalised", "inputs = [WT,CRCL]")
+        .replace("  output     = softplus", "  output     = softplus\n  init       = [2.0, 1.0]");
     export_dcm_from_fit(&cosmetic, &fit, &DcmExportOptions::default()).unwrap();
 
     for (what, from, to) in [
-        (
-            "inputs",
-            "inputs     = [WT, CRCL]",
-            "inputs     = [WT, AGE]",
-        ),
-        (
-            "inputs",
-            "inputs     = [WT, CRCL]",
-            "inputs     = [CRCL, WT]",
-        ),
+        ("inputs", "inputs     = [WT, CRCL]", "inputs     = [WT, AGE]"),
+        ("inputs", "inputs     = [WT, CRCL]", "inputs     = [CRCL, WT]"),
         ("outputs", "outputs    = [CL, KA]", "outputs    = [CL, V]"),
         ("activation", "activation = tanh", "activation = sigmoid"),
         ("output", "output     = softplus", "output     = exp"),
-        (
-            "center",
-            "center     = [70, -5]",
-            "center     = [70, -5.000000001]",
-        ),
+        ("center", "center     = [70, -5]", "center     = [70, -5.000000001]"),
         ("scale", "scale      = [12, 23.5]", "scale      = [12, 23]"),
         ("center", "  center     = [70, -5]\n", ""),
     ] {
@@ -669,17 +536,10 @@ fn a_fit_made_with_a_different_network_is_refused() {
     }
     let renamed = FIXTURE_MODEL.replace("covariate_nn TYPICAL_PK", "covariate_nn OTHER");
     let err = export_dcm_from_fit(&renamed, &fit, &DcmExportOptions::default()).unwrap_err();
-    assert!(
-        err.contains("[OTHER]") && err.contains("[TYPICAL_PK]"),
-        "{err}"
-    );
+    assert!(err.contains("[OTHER]") && err.contains("[TYPICAL_PK]"), "{err}");
     // A fit without model text cannot be checked.
-    let err = export_dcm_from_fit(
-        FIXTURE_MODEL,
-        &fixture_fit(None),
-        &DcmExportOptions::default(),
-    )
-    .unwrap_err();
+    let err = export_dcm_from_fit(FIXTURE_MODEL, &fixture_fit(None), &DcmExportOptions::default())
+        .unwrap_err();
     assert!(err.contains("no model text"), "{err}");
 }
 
@@ -693,42 +553,16 @@ fn a_model_changed_outside_the_networks_is_refused() {
     let fit = fixture_fit(Some(FIXTURE_MODEL));
     let opts = DcmExportOptions::default();
     let cosmetic = FIXTURE_MODEL
-        .replace(
-            "  theta TVV(30, 1, 100)",
-            "  theta TVV ( 25 , -0.5, 200 )  # moved",
-        )
+        .replace("  theta TVV(30, 1, 100)", "  theta TVV ( 25 , -0.5, 200 )  # moved")
         .replace("omega ETA_KA ~ 0.2", "omega ETA_KA ~ 2.5e-1")
-        .replace(
-            "[parameters]",
-            "[data]\n  path = \"elsewhere.csv\"\n\n[parameters]",
-        );
+        .replace("[parameters]", "[data]\n  path = \"elsewhere.csv\"\n\n[parameters]");
     export_dcm_from_fit(&cosmetic, &fit, &opts).unwrap();
     for (from, to, shown) in [
-        (
-            "V  = TVV * exp(ETA_V)",
-            "V  = 2 * TVV * exp(ETA_V)",
-            "`V  = 2 * TVV * exp(ETA_V)`",
-        ),
-        (
-            "proportional(PROP_ERR)",
-            "additive(PROP_ERR)",
-            "`DV ~ additive(PROP_ERR)`",
-        ),
-        (
-            "theta TVV(30, 1, 100)",
-            "theta TVV(30, 1, 100) FIX",
-            "`theta TVV(30, 1, 100) FIX`",
-        ),
-        (
-            "one_cpt_oral",
-            "one_cpt_iv_bolus",
-            "`pk one_cpt_iv_bolus(cl=CL, v=V, ka=KA)`",
-        ),
-        (
-            "  sigma PROP_ERR",
-            "  theta TVX(1, 0, 9)\n  sigma PROP_ERR",
-            "`theta TVX(1, 0, 9)`",
-        ),
+        ("V  = TVV * exp(ETA_V)", "V  = 2 * TVV * exp(ETA_V)", "`V  = 2 * TVV * exp(ETA_V)`"),
+        ("proportional(PROP_ERR)", "additive(PROP_ERR)", "`DV ~ additive(PROP_ERR)`"),
+        ("theta TVV(30, 1, 100)", "theta TVV(30, 1, 100) FIX", "`theta TVV(30, 1, 100) FIX`"),
+        ("one_cpt_oral", "one_cpt_iv_bolus", "`pk one_cpt_iv_bolus(cl=CL, v=V, ka=KA)`"),
+        ("  sigma PROP_ERR", "  theta TVX(1, 0, 9)\n  sigma PROP_ERR", "`theta TVX(1, 0, 9)`"),
     ] {
         let model = FIXTURE_MODEL.replace(from, to);
         assert_ne!(model, FIXTURE_MODEL);
@@ -741,10 +575,7 @@ fn a_model_changed_outside_the_networks_is_refused() {
     // A line the model lacks is named as missing.
     let shorter = FIXTURE_MODEL.replace("  V  = TVV * exp(ETA_V)\n", "");
     let err = export_dcm_from_fit(&shorter, &fit, &opts).unwrap_err();
-    assert!(
-        err.contains("`KA = TYPICAL_PK . KA * exp(ETA_KA)` where"),
-        "{err}"
-    );
+    assert!(err.contains("`KA = TYPICAL_PK . KA * exp(ETA_KA)` where"), "{err}");
     assert!(err.contains("`V  = TVV * exp(ETA_V)`"), "{err}");
 }
 
@@ -758,14 +589,8 @@ fn parameter_numbers_that_define_the_model_are_compared() {
         mask("kappaK~0.09weight=2*NARMprior(0.1,rse=30%)"),
         mask("kappaK~0.5weight=2*NARMprior(0.3,rse=10%)")
     );
-    assert_ne!(
-        mask("kappaK~0.09weight=2*NARM"),
-        mask("kappaK~0.09weight=3*NARM")
-    );
-    assert_ne!(
-        mask("kappaK~0.09WEIGHT=2*NARM"),
-        mask("kappaK~0.09WEIGHT=3*NARM")
-    );
+    assert_ne!(mask("kappaK~0.09weight=2*NARM"), mask("kappaK~0.09weight=3*NARM"));
+    assert_ne!(mask("kappaK~0.09WEIGHT=2*NARM"), mask("kappaK~0.09WEIGHT=3*NARM"));
     assert_eq!(mask("thetaP[800](1,0,9)"), mask("thetaP[800](2,-1,8)"));
     assert_ne!(mask("thetaP[800](1,0,9)"), mask("thetaP[801](1,0,9)"));
     assert_ne!(mask("thetaP(1,0,9)"), mask("thetaP(1,0,9)FIX"));
@@ -833,10 +658,7 @@ fn an_input_named_like_a_parameter_is_refused_even_when_the_column_is_read() {
             .replace("TYPICAL_PK.CL", "1")
             .replace("TYPICAL_PK . KA", "1");
         let parsed = parse_model_string(&plain).unwrap_or_else(|e| panic!("{what}: {e}"));
-        assert!(
-            parsed.referenced_covariates.iter().any(|c| c == "ARM"),
-            "{what}"
-        );
+        assert!(parsed.referenced_covariates.iter().any(|c| c == "ARM"), "{what}");
         let err = export(&colliding, &names, &theta, DcmWeightForm::Literal).unwrap_err();
         assert!(
             err.contains(&format!("input `ARM` is also the name of {what}"))
@@ -864,10 +686,7 @@ fn a_quoted_column_header_is_compared_with_its_spaces() {
     export_dcm_from_fit(&mapped("BODY WEIGHT"), &fit, &opts).unwrap();
     let err = export_dcm_from_fit(&mapped("BODYWEIGHT"), &fit, &opts).unwrap_err();
     assert!(err.contains(r#"`WT = "BODYWEIGHT"`"#), "{err}");
-    assert_eq!(
-        without_whitespace(r#"a = "x  y" + ' z'"#),
-        r#"a="x  y"+' z'"#
-    );
+    assert_eq!(without_whitespace(r#"a = "x  y" + ' z'"#), r#"a="x  y"+' z'"#);
 }
 
 /// Layout is free in the way the parser makes it: a statement over several
@@ -911,10 +730,8 @@ fn network_fields_in_another_order_or_key_case_are_the_same_model() {
         let model = FIXTURE_MODEL.replace(fields, spelling);
         export_dcm_from_fit(&model, &fit, &opts).unwrap_or_else(|e| panic!("{spelling}: {e}"));
     }
-    let changed = FIXTURE_MODEL.replace(
-        fields,
-        "  scale      = [12, 23.5]\n  center     = [70, -6]\n",
-    );
+    let changed =
+        FIXTURE_MODEL.replace(fields, "  scale      = [12, 23.5]\n  center     = [70, -6]\n");
     let err = export_dcm_from_fit(&changed, &fit, &opts).unwrap_err();
     assert!(err.contains("center"), "{err}");
 }
@@ -946,10 +763,7 @@ fn a_block_fix_on_its_own_line_and_a_bare_end_are_layout() {
 /// `neural_networks` field both builds can read).
 #[test]
 fn the_committed_fit_json_is_the_fixture_fit() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/dcm_export/fit.json"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/dcm_export/fit.json");
     let fit = fixture_fit(Some(FIXTURE_MODEL));
     if std::env::var_os("FERX_WRITE_DCM_FIT_JSON").is_some() {
         std::fs::write(path, fit.to_json_value().to_string()).unwrap();
@@ -974,10 +788,8 @@ fn fitted_export_matches_the_committed_text() {
     let fit = fixture_fit(Some(FIXTURE_MODEL));
     let got = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap();
     if std::env::var_os("FERX_WRITE_DCM_FITTED").is_some() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/data/dcm_export/expected_fitted.ferx"
-        );
+        let path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/dcm_export/expected_fitted.ferx");
         std::fs::write(path, &got).unwrap();
     }
     assert_eq!(got, FIXTURE_FITTED);
@@ -1033,11 +845,8 @@ fn declarations_keep_their_scale_and_blocks_are_written() {
     fit.kappa_names = vec!["KAPPA_CL".into()];
     fit.sigma = vec![0.1234, 0.25];
     fit.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
-    fit.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.3,
-    }];
+    fit.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.3 }];
     let text = export_dcm_from_fit(&model, &fit, &DcmExportOptions::default()).unwrap();
     assert!(
         text.contains("block_omega (ETA_CL, ETA_V) = [0.0912, 0.0123, 0.0437]  # var CL  # CL-V\n"),
@@ -1047,23 +856,13 @@ fn declarations_keep_their_scale_and_blocks_are_written() {
         text.contains("omega ETA_KA ~ 0.5590169943749475 (sd) prior(0.4, rse = 30%)"),
         "{text}"
     );
-    assert!(
-        text.contains("kappa KAPPA_CL ~ 0.0456 weight = NARM"),
-        "{text}"
-    );
+    assert!(text.contains("kappa KAPPA_CL ~ 0.0456 weight = NARM"), "{text}");
     let p = parse_model_string(&text).unwrap().default_params;
     let close = |a: f64, b: f64| (a - b).abs() <= 1e-15 * b.abs();
     assert!(close(p.omega.matrix[(2, 2)], 0.3125), "{}", p.omega.matrix);
     assert!(close(p.sigma.values[0], 0.1234) && close(p.sigma.values[1], 0.25));
-    assert!(
-        close(p.residual_correlations[0].rho, 0.3),
-        "{:?}",
-        p.residual_correlations
-    );
-    assert_eq!(
-        p.omega_iov.unwrap().matrix[(0, 0)].to_bits(),
-        0.0456f64.to_bits()
-    );
+    assert!(close(p.residual_correlations[0].rho, 0.3), "{:?}", p.residual_correlations);
+    assert_eq!(p.omega_iov.unwrap().matrix[(0, 0)].to_bits(), 0.0456f64.to_bits());
 }
 
 /// An estimate the export cannot declare is an error naming it, with the
@@ -1074,10 +873,7 @@ fn an_estimate_with_no_declaration_is_refused_unless_network_only() {
     fit.theta_names.push("TVEXTRA".into());
     fit.theta.push(2.0);
     let err = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap_err();
-    assert!(
-        err.contains("theta TVEXTRA") && err.contains("--network-only"),
-        "{err}"
-    );
+    assert!(err.contains("theta TVEXTRA") && err.contains("--network-only"), "{err}");
     let mut fit = fixture_fit(Some(FIXTURE_MODEL));
     fit.eta_names[1] = "ETA_OTHER".into();
     let err = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap_err();
@@ -1090,10 +886,7 @@ fn an_estimate_with_no_declaration_is_refused_unless_network_only() {
     opts.network_only = true;
     let text = export_dcm_from_fit(FIXTURE_MODEL, &fit, &opts).unwrap();
     assert!(text.contains("theta TVV(30, 1, 100)"), "{text}");
-    assert!(
-        text.contains("keeps the value this file declared"),
-        "{text}"
-    );
+    assert!(text.contains("keeps the value this file declared"), "{text}");
 }
 
 /// A repeated network input is named as such, not blamed on a second block.
@@ -1121,10 +914,7 @@ fn a_block_this_build_cannot_parse_is_kept_and_not_validated() {
     let text = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap();
     // The straddle: the export itself does not parse in this build.
     assert!(parse_model_string(&text).is_err());
-    assert!(
-        text.contains("[event_model]\n  cmt = 2\n  hazard = 0.01 * TYPICAL_PK_CL"),
-        "{text}"
-    );
+    assert!(text.contains("[event_model]\n  cmt = 2\n  hazard = 0.01 * TYPICAL_PK_CL"), "{text}");
 }
 
 /// The expression language's `/` returns 0 below a 1e-30 divisor; a network
@@ -1146,19 +936,11 @@ fn a_scale_below_the_division_guard_is_refused() {
 #[test]
 fn reference_rewrite_is_confined_to_code() {
     let (names, theta) = fixture_theta();
-    let model = FIXTURE_MODEL.replace(
-        "  V  = TVV * exp(ETA_V)",
-        "  V  = TVV * 1e0 * exp(ETA_V)   # not TYPICAL_PK.CL",
-    );
+    let model = FIXTURE_MODEL
+        .replace("  V  = TVV * exp(ETA_V)", "  V  = TVV * 1e0 * exp(ETA_V)   # not TYPICAL_PK.CL");
     let text = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap();
-    assert!(
-        text.contains("  V  = TVV * 1e0 * exp(ETA_V)   # not TYPICAL_PK.CL\n"),
-        "{text}"
-    );
-    assert!(
-        text.contains("  KA = TYPICAL_PK_KA * exp(ETA_KA)\n"),
-        "{text}"
-    );
+    assert!(text.contains("  V  = TVV * 1e0 * exp(ETA_V)   # not TYPICAL_PK.CL\n"), "{text}");
+    assert!(text.contains("  KA = TYPICAL_PK_KA * exp(ETA_KA)\n"), "{text}");
     assert!(text.contains("  CL = TYPICAL_PK_CL * exp(ETA_CL)   # clearance from the network\n"));
 }
 
@@ -1186,14 +968,8 @@ mod parity {
     /// whole domain — past both `|z| > 20` thresholds — as `WT` sweeps the grid.
     fn model_text(hidden: Activation, output: Activation) -> String {
         FIXTURE_MODEL
-            .replace(
-                "activation = tanh",
-                &format!("activation = {}", hidden.as_str()),
-            )
-            .replace(
-                "output     = softplus",
-                &format!("output     = {}", output.as_str()),
-            )
+            .replace("activation = tanh", &format!("activation = {}", hidden.as_str()))
+            .replace("output     = softplus", &format!("output     = {}", output.as_str()))
     }
 
     /// The fixture θ with the output layer rescaled so the KA head reaches both
@@ -1213,12 +989,7 @@ mod parity {
             theta[i] = *v;
         }
         let set = |theta: &mut Vec<f64>, n: &str, v: f64| {
-            let i = model
-                .default_params
-                .theta_names
-                .iter()
-                .position(|t| t == n)
-                .unwrap();
+            let i = model.default_params.theta_names.iter().position(|t| t == n).unwrap();
             theta[i] = v;
         };
         set(&mut theta, "W_TYPICAL_PK_1_1_1", 3.0);
@@ -1259,20 +1030,14 @@ mod parity {
         for k in 0..=40 {
             let wt = 20.0 + 3.5 * k as f64;
             for crcl in [-40.0, -5.0, 0.0, 37.25, 140.0] {
-                out.push(HashMap::from([
-                    ("WT".to_string(), wt),
-                    ("CRCL".to_string(), crcl),
-                ]));
+                out.push(HashMap::from([("WT".to_string(), wt), ("CRCL".to_string(), crcl)]));
             }
         }
         out
     }
 
     fn pk(
-        model: &CompiledModel,
-        theta: &[f64],
-        eta: &[f64],
-        cov: &HashMap<String, f64>,
+        model: &CompiledModel, theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>,
     ) -> PkParams {
         (model.pk_param_fn)(theta, eta, cov, 0.0)
     }
@@ -1293,13 +1058,9 @@ mod parity {
                 let text = model_text(hidden, output);
                 let dcm = parse_model_string(&text).expect("the DCM parses under nn");
                 let theta = parity_theta(&dcm);
-                let exported = export(
-                    &text,
-                    &dcm.default_params.theta_names,
-                    &theta,
-                    DcmWeightForm::Literal,
-                )
-                .unwrap();
+                let exported =
+                    export(&text, &dcm.default_params.theta_names, &theta, DcmWeightForm::Literal)
+                        .unwrap();
                 let plain = parse_model_string(&exported)
                     .unwrap_or_else(|e| panic!("{hidden:?}/{output:?}: {e}\n{exported}"));
                 assert!(plain.covariate_nns.is_empty());
@@ -1357,14 +1118,11 @@ mod parity {
             Activation::Identity,
         )
         .unwrap();
-        let twin = NamedMlpMapper::new(
-            mlp,
-            src.input_names().to_vec(),
-            vec!["CL".into(), "KA".into()],
-        )
-        .unwrap()
-        .with_normalization(src.input_center().to_vec(), src.input_scale().to_vec())
-        .unwrap();
+        let twin =
+            NamedMlpMapper::new(mlp, src.input_names().to_vec(), vec!["CL".into(), "KA".into()])
+                .unwrap()
+                .with_normalization(src.input_center().to_vec(), src.input_scale().to_vec())
+                .unwrap();
         let (mut above, mut below, mut middle) = (0, 0, 0);
         for cov in grid() {
             let z = twin.forward_raw(&weights, &cov).unwrap()[1];
@@ -1392,27 +1150,16 @@ mod parity {
         let text = model_text(Activation::Tanh, Activation::Softplus);
         let dcm = parse_model_string(&text).unwrap();
         let theta = parity_theta(&dcm);
-        let exported = export(
-            &text,
-            &dcm.default_params.theta_names,
-            &theta,
-            DcmWeightForm::Literal,
-        )
-        .unwrap();
+        let exported =
+            export(&text, &dcm.default_params.theta_names, &theta, DcmWeightForm::Literal).unwrap();
         let plain = parse_model_string(&exported).unwrap();
         let weights = weights_of(&dcm, &theta);
         for missing in ["WT", "CRCL"] {
             let mut cov = HashMap::from([("WT".to_string(), 64.0), ("CRCL".to_string(), 90.0)]);
             cov.insert(missing.to_string(), f64::NAN);
-            let y = dcm.covariate_nns[0]
-                .mapper
-                .forward_raw(&weights, &cov)
-                .unwrap();
+            let y = dcm.covariate_nns[0].mapper.forward_raw(&weights, &cov).unwrap();
             let p = pk(&plain, &plain_theta(&plain, &dcm, &theta), &[0.0; 3], &cov);
-            assert!(
-                y[0].is_nan() && y[1].is_nan(),
-                "network with {missing} = NaN: {y:?}"
-            );
+            assert!(y[0].is_nan() && y[1].is_nan(), "network with {missing} = NaN: {y:?}");
             assert!(
                 p.cl().is_nan() && p.ka().is_nan(),
                 "export with {missing} = NaN must be NaN like the network, got CL={} KA={}",
@@ -1420,10 +1167,7 @@ mod parity {
                 p.ka()
             );
             // The rest of the model is untouched by the missing input.
-            assert_eq!(
-                p.v().to_bits(),
-                pk(&dcm, &theta, &[0.0; 3], &cov).v().to_bits()
-            );
+            assert_eq!(p.v().to_bits(), pk(&dcm, &theta, &[0.0; 3], &cov).v().to_bits());
         }
     }
 
@@ -1436,13 +1180,8 @@ mod parity {
         let text = model_text(Activation::Tanh, Activation::Softplus);
         let dcm = parse_model_string(&text).unwrap();
         let theta = parity_theta(&dcm);
-        let exported = export(
-            &text,
-            &dcm.default_params.theta_names,
-            &theta,
-            DcmWeightForm::Literal,
-        )
-        .unwrap();
+        let exported =
+            export(&text, &dcm.default_params.theta_names, &theta, DcmWeightForm::Literal).unwrap();
         let plain = parse_model_string(&exported).unwrap();
         let plain_th = plain_theta(&plain, &dcm, &theta);
         let eta = [0.2, -0.1, 0.3];
@@ -1481,11 +1220,7 @@ mod parity {
                 let a = pk(&dcm, &theta, &[0.1, 0.2, 0.3], &cov);
                 let b = pk(&plain, &plain_th, &[0.1, 0.2, 0.3], &cov);
                 for s in 0..a.values.len() {
-                    assert_eq!(
-                        a.values[s].to_bits(),
-                        b.values[s].to_bits(),
-                        "{form:?} slot {s}"
-                    );
+                    assert_eq!(a.values[s].to_bits(), b.values[s].to_bits(), "{form:?} slot {s}");
                 }
             }
         }
@@ -1497,24 +1232,16 @@ mod parity {
         let text = model_text(Activation::Relu, Activation::Exp);
         let dcm = parse_model_string(&text).unwrap();
         let theta = parity_theta(&dcm);
-        let exported = export(
-            &text,
-            &dcm.default_params.theta_names,
-            &theta,
-            DcmWeightForm::FixedTheta,
-        )
-        .unwrap();
+        let exported =
+            export(&text, &dcm.default_params.theta_names, &theta, DcmWeightForm::FixedTheta)
+                .unwrap();
         let plain = parse_model_string(&exported).unwrap();
         let eta = [-0.1, 0.4, 0.0];
         for cov in grid() {
             let a = pk(&dcm, &theta, &eta, &cov);
             let b = pk(&plain, &plain_theta(&plain, &dcm, &theta), &eta, &cov);
             for s in 0..a.values.len() {
-                assert_eq!(
-                    a.values[s].to_bits(),
-                    b.values[s].to_bits(),
-                    "slot {s} at {cov:?}"
-                );
+                assert_eq!(a.values[s].to_bits(), b.values[s].to_bits(), "slot {s} at {cov:?}");
             }
         }
     }

@@ -65,14 +65,9 @@ const SIGNAL_TOL: f64 = 0.5;
 fn platelet_example_parses_and_pins_the_ladder() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_platelet_ladder.ferx"))
         .expect("platelet model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(
-        spec.levels
-            .as_ref()
-            .map(|l| l.iter().map(|v| v.as_literal()).collect::<Vec<_>>()),
+        spec.levels.as_ref().map(|l| l.iter().map(|v| v.as_literal()).collect::<Vec<_>>()),
         Some(vec![Some(25.0), Some(50.0), Some(75.0), Some(100.0)]),
         "strictly-increasing discrete ladder"
     );
@@ -89,10 +84,7 @@ fn platelet_example_parses_and_pins_the_ladder() {
 fn platelet_ladder_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_platelet_ladder.ferx"))
         .expect("platelet model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
     let pop = read_nonmem_csv(
         Path::new("tests/reference/platelet_mrgsolve/platelet_subject.csv"),
         None,
@@ -123,11 +115,7 @@ fn platelet_ladder_matches_mrgsolve() {
     for (i, &(t_ref, plt_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - plt_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx platelet {sig:.6} vs mrgsolve {plt_ref:.6} \
@@ -172,12 +160,8 @@ fn platelet_ladder_matches_mrgsolve() {
     assert_eq!(m.time_to_discontinuation, None);
     // pct of decisions with platelets >= 100 (one-sided target_window = [100, inf]):
     // 8 of 10 (only the two `decrease` decisions, ~94 and ~99, fall below).
-    assert!((m.pct_time_in_window.expect("window declared") - 0.8).abs() < 1e-9);
-    assert_eq!(
-        m.signal_max.expect("max"),
-        250.0,
-        "baseline at the first decision"
-    );
+    assert!((m.pct_readings_in_window.expect("window declared") - 0.8).abs() < 1e-9);
+    assert_eq!(m.signal_max.expect("max"), 250.0, "baseline at the first decision");
     assert!((m.signal_min.expect("min") - 94.266960).abs() < SIGNAL_TOL);
     assert!((m.signal_mean.expect("mean") - 159.014182).abs() < SIGNAL_TOL);
 }

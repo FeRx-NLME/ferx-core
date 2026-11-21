@@ -20,11 +20,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, CovarianceFallback, CovarianceStatus, FitOptions};
 use std::path::Path;
 
-fn warfarin_setup() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-    FitOptions,
-) {
+fn warfarin_setup() -> (ferx_core::types::CompiledModel, ferx_core::types::Population, FitOptions) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -72,10 +68,7 @@ fn covariance_fallback_sir_does_not_fire_on_well_identified_model() {
         );
     }
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.to_lowercase().contains("sir fallback")),
+        !result.warnings.iter().any(|w| w.to_lowercase().contains("sir fallback")),
         "no SIR-fallback warning should appear when the fallback did not fire: {:?}",
         result.warnings
     );

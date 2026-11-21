@@ -157,9 +157,7 @@ fn fastest_rate<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> Result<T, WalkDomain>
 /// The parameters governing each event's interval: the record terminating it (#1073).
 /// `None` only for a timeline with no record at all.
 fn governing<'a, T: PkNum>(
-    schedule: &EventSchedule,
-    pk_at_dose: &'a [PkDual<T>],
-    pk_at_obs: &'a [PkDual<T>],
+    schedule: &EventSchedule, pk_at_dose: &'a [PkDual<T>], pk_at_obs: &'a [PkDual<T>],
     pk_at_pk_only: &'a [PkDual<T>],
 ) -> Vec<Option<&'a PkDual<T>>> {
     let rec = crate::dosing::governing_record_indices(schedule.events.len(), |i| {
@@ -186,18 +184,13 @@ fn governing<'a, T: PkNum>(
 /// event-driven and ODE engines. The one owner of the rule: [`walk_domain`] stops there,
 /// and [`absorption_walk_g`] serves `NaN` from there on, whatever the verdict before it.
 fn nan_onset<T: PkNum>(
-    schedule: &EventSchedule,
-    doses: &[AbsDose<T>],
-    gov: &[Option<&PkDual<T>>],
-    two_cpt: bool,
+    schedule: &EventSchedule, doses: &[AbsDose<T>], gov: &[Option<&PkDual<T>>], two_cpt: bool,
 ) -> Option<(usize, f64)> {
     let mut cur_t = schedule.events.first()?.time;
     for (i, ev) in schedule.events.iter().enumerate() {
         if ev.time > cur_t {
             let disp_nan = gov[i].is_some_and(|p| disposition_is_nan(two_cpt, p));
-            let open_nan = doses
-                .iter()
-                .any(|d| d.arrival.br_cmp_c(Le, cur_t) && kernel_is_nan(d));
+            let open_nan = doses.iter().any(|d| d.arrival.br_cmp_c(Le, cur_t) && kernel_is_nan(d));
             if disp_nan || open_nan {
                 return Some((i, cur_t));
             }
@@ -214,12 +207,8 @@ fn nan_onset<T: PkNum>(
 /// the interval's start — including doses long since absorbed, because the walk evaluates
 /// their (vanishing) window too, and the factorisation diverges regardless of its size.
 pub(crate) fn walk_domain<T: PkNum>(
-    pk_model: PkModel,
-    schedule: &EventSchedule,
-    doses: &[AbsDose<T>],
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
+    pk_model: PkModel, schedule: &EventSchedule, doses: &[AbsDose<T>], pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>],
 ) -> WalkDomain {
     let Some((kernel, two_cpt)) = kernel_of(pk_model) else {
         return WalkDomain::Twin;
@@ -283,12 +272,7 @@ pub(crate) fn walk_domain<T: PkNum>(
 /// Add one dose's delivery over `[s0, s1]` to the state, at the interval's disposition.
 /// `t0`, `t1` are the window limits in the dose's own clock (`s − arrival`).
 fn add_window<T: PkNum, A: TiltedAbsorption<T>>(
-    abs: &A,
-    mass: T,
-    t0: T,
-    t1: T,
-    disp: &Disp<T>,
-    state: &mut [T],
+    abs: &A, mass: T, t0: T, t1: T, disp: &Disp<T>, state: &mut [T],
 ) {
     match *disp {
         Disp::One { ke } => {
@@ -320,11 +304,7 @@ fn undelivered<T: PkNum>(kernel: Kernel, d: &AbsDose<T>, t: f64) -> T {
     let zero = T::from_f64(0.0);
     let cdf = match kernel {
         Kernel::Transit => TransitAbsorption { n: d.a, mtt: d.b }.tilted_cdf(tau, zero),
-        Kernel::Ig => IgAbsorption {
-            mat: d.a,
-            lambda: d.a / d.b,
-        }
-        .tilted_cdf(tau, zero),
+        Kernel::Ig => IgAbsorption { mat: d.a, lambda: d.a / d.b }.tilted_cdf(tau, zero),
     };
     d.mass * (T::from_f64(1.0) - cdf)
 }
@@ -338,13 +318,8 @@ fn undelivered<T: PkNum>(kernel: Kernel, d: &AbsDose<T>, t: f64) -> T {
 /// model's `analytical_compartment_names`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn absorption_walk_g<T: PkNum>(
-    pk_model: PkModel,
-    schedule: &EventSchedule,
-    doses: &[AbsDose<T>],
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
-    n_obs: usize,
+    pk_model: PkModel, schedule: &EventSchedule, doses: &[AbsDose<T>], pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>], n_obs: usize,
     mut states: Option<&mut Vec<Vec<T>>>,
 ) -> Option<Vec<T>> {
     let (kernel, two_cpt) = kernel_of(pk_model)?;
@@ -368,14 +343,7 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     // tilting terms are not evaluated: their `mgf` `debug_assert` rejects a `NaN` rate
     // (#386). A `NaN` `V` on an observation is still read as `NaN` by the readout.
     let onset = nan_onset(schedule, doses, &gov, two_cpt).map(|(k, _)| k);
-    match walk_domain(
-        pk_model,
-        schedule,
-        doses,
-        pk_at_dose,
-        pk_at_obs,
-        pk_at_pk_only,
-    ) {
+    match walk_domain(pk_model, schedule, doses, pk_at_dose, pk_at_obs, pk_at_pk_only) {
         WalkDomain::Twin => return None,
         WalkDomain::Invalid => {
             // The `0` penalty for a non-physical parameter before the onset; a `NaN`
@@ -407,13 +375,7 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
             let dt = T::from_f64(ev.time - cur_t);
             let disp = if two_cpt {
                 let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(p.cl, p.v, p.q, p.v2);
-                let e = TwoCptEigen {
-                    alpha,
-                    beta,
-                    k10: p.cl / p.v,
-                    k12: p.q / p.v,
-                    k21,
-                };
+                let e = TwoCptEigen { alpha, beta, k10: p.cl / p.v, k12: p.q / p.v, k21 };
                 propagate_two_cpt_core_g(&mut state, dt, &e, zero, zero);
                 Disp::Two(e)
             } else {
@@ -433,10 +395,7 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                         add_window(&abs, d.mass, t0, t1, &disp, &mut state);
                     }
                     Kernel::Ig => {
-                        let abs = IgAbsorption {
-                            mat: d.a,
-                            lambda: d.a / d.b,
-                        };
+                        let abs = IgAbsorption { mat: d.a, lambda: d.a / d.b };
                         add_window(&abs, d.mass, t0, t1, &disp, &mut state);
                     }
                 }
@@ -476,10 +435,8 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                         vec![depot, conc]
                     };
                     // Floored like `analytical_state_at_times` (a `NaN` is kept).
-                    s[ev.orig_idx] = row
-                        .into_iter()
-                        .map(|x| T::select_if(Lt, x, zero, zero, x))
-                        .collect();
+                    s[ev.orig_idx] =
+                        row.into_iter().map(|x| T::select_if(Lt, x, zero, zero, x)).collect();
                 }
             }
             EventKind::DoseRecord | EventKind::PkOnly => {}
@@ -505,15 +462,9 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
 /// sends the subject to finite differences rather than to a wrong jet.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn closed_form_sens_walk_g<T: PkNum>(
-    pk_model: PkModel,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    eff_doses: &[crate::types::DoseEvent],
-    dose_lag_dual: &[T],
-    dose_inf_dual: &[Option<(T, T)>],
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
+    pk_model: PkModel, subject: &Subject, schedule: &EventSchedule,
+    eff_doses: &[crate::types::DoseEvent], dose_lag_dual: &[T], dose_inf_dual: &[Option<(T, T)>],
+    pk_at_dose: &[PkDual<T>], pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>],
     slot_dual: &dyn Fn(usize, usize) -> T,
 ) -> Option<Vec<T>> {
     use crate::types::{PK_IDX_CV2, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N};
@@ -596,45 +547,26 @@ pub(crate) fn walk_eligible(model: &CompiledModel, subject: &Subject) -> bool {
 
 /// The disposition slots of a `PkParams` as the walk's `f64` [`PkDual`].
 pub(crate) fn disp_f64(p: &PkParams) -> PkDual<f64> {
-    PkDual {
-        cl: p.cl(),
-        v: p.v(),
-        q: p.q(),
-        v2: p.v2(),
-        ka: 0.0,
-        q3: 0.0,
-        v3: 0.0,
-        f: p.f_bio(),
-    }
+    PkDual { cl: p.cl(), v: p.v(), q: p.q(), v2: p.v2(), ka: 0.0, q3: 0.0, v3: 0.0, f: p.f_bio() }
 }
 
 /// The dose-record attributes of `subject.doses[k]` as the walk's `f64` [`AbsDose`].
 pub(crate) fn dose_f64(
-    pk_model: PkModel,
-    subject: &Subject,
-    k: usize,
-    p: &PkParams,
+    pk_model: PkModel, subject: &Subject, k: usize, p: &PkParams,
 ) -> AbsDose<f64> {
     let (a, b) = match kernel_of(pk_model) {
         Some((Kernel::Ig, _)) => (p.mat(), p.cv2()),
         _ => (p.n_transit(), p.mtt()),
     };
     let d = &subject.doses[k];
-    AbsDose {
-        arrival: d.time + p.lagtime(),
-        mass: p.bioavailable_amount(d.amt),
-        a,
-        b,
-    }
+    AbsDose { arrival: d.time + p.lagtime(), mass: p.bioavailable_amount(d.amt), a, b }
 }
 
 /// The event schedule the walk runs on: the subject's timeline with each dose's arrival at
 /// its own record's lagtime. Transit/IG doses are boluses (infusions are routed away), so
 /// the schedule's infusion bounds are trivial.
 pub(crate) fn walk_schedule(
-    subject: &Subject,
-    pk_model: PkModel,
-    pk_at_dose: &[PkParams],
+    subject: &Subject, pk_model: PkModel, pk_at_dose: &[PkParams],
 ) -> EventSchedule {
     let lags: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     EventSchedule::for_subject(subject, pk_model, &subject.doses, &lags)
@@ -650,10 +582,7 @@ struct F64Inputs {
 }
 
 fn f64_inputs(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
+    pk_model: PkModel, subject: &Subject, pk_at_dose: &[PkParams], pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> F64Inputs {
     F64Inputs {
@@ -673,32 +602,19 @@ fn f64_inputs(
 /// the walk serve this subject (in domain, or non-physical — both answered by the walk) or
 /// must the twin? The [`walk_domain`] verdict, nothing else.
 pub(crate) fn walk_serves(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
+    pk_model: PkModel, subject: &Subject, pk_at_dose: &[PkParams], pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> bool {
     let x = f64_inputs(pk_model, subject, pk_at_dose, pk_at_obs, pk_at_pk_only);
-    walk_domain(
-        pk_model,
-        &x.schedule,
-        &x.doses,
-        &x.dose_disp,
-        &x.obs_disp,
-        &x.only_disp,
-    ) != WalkDomain::Twin
+    walk_domain(pk_model, &x.schedule, &x.doses, &x.dose_disp, &x.obs_disp, &x.only_disp)
+        != WalkDomain::Twin
 }
 
 /// The value path: predictions (and optionally states) for an eligible subject from its
 /// per-event `f64` parameters, or `None` for the twin.
 pub(crate) fn absorption_walk_predictions(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
-    states: Option<&mut Vec<Vec<f64>>>,
+    pk_model: PkModel, subject: &Subject, pk_at_dose: &[PkParams], pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams], states: Option<&mut Vec<Vec<f64>>>,
 ) -> Option<Vec<f64>> {
     let x = f64_inputs(pk_model, subject, pk_at_dose, pk_at_obs, pk_at_pk_only);
     absorption_walk_g(

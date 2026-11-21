@@ -45,10 +45,7 @@ fn dataset_with_wt_step(tail: Tail, tail_wt: f64, tail_occ: u32, wt_step: f64) -
         for (j, t) in OBS_TIMES.iter().enumerate() {
             let dv = 4.0 + (id as f64 * 1.7 + j as f64).sin() + 0.1 * *t / 10.0;
             let occ = if *t < 24.0 { 1 } else { 2 };
-            csv += &format!(
-                "{id},{t},{dv:.5},0,.,1,0,0,0,0,{},{occ}\n",
-                wt + wt_step * j as f64
-            );
+            csv += &format!("{id},{t},{dv:.5},0,.,1,0,0,0,0,{},{occ}\n", wt + wt_step * j as f64);
         }
         if tail == Tail::Doses {
             for t in [TAIL_TIME, TAIL_TIME + 24.0] {
@@ -145,13 +142,8 @@ fn few_iterations() -> FitOptions {
 }
 
 fn fitted(run: &crate::api::PreparedRun, options: &FitOptions) -> FitResult {
-    fit(
-        &run.parsed.model,
-        &run.population,
-        &run.init_params,
-        options,
-    )
-    .unwrap_or_else(|e| panic!("fit: {e}"))
+    fit(&run.parsed.model, &run.population, &run.init_params, options)
+        .unwrap_or_else(|e| panic!("fit: {e}"))
 }
 
 /// `fit()` as it ran before the view: every record scored.
@@ -206,21 +198,14 @@ fn assert_tail_is_free(model: &str, tail_wt: f64, options: &FitOptions, rounding
     let trimmed = prepared(model, &dataset(Tail::None, 0.0, 0));
 
     let view = scored_population(&full.parsed.model, Cow::Borrowed(&full.population));
-    assert_eq!(
-        view.subjects[0].doses.len(),
-        3,
-        "doses at 0, 24 and 48 stay"
-    );
+    assert_eq!(view.subjects[0].doses.len(), 3, "doses at 0, 24 and 48 stay");
     assert_eq!(full.population.subjects[0].doses.len(), 12);
 
     let new = fitted(&full, options);
     let old = fitted_on_every_record(&full, options);
     assert_eq!(new.gradient_method_inner, "analytic");
     assert_eq!(new.gradient_method_outer, "analytic");
-    let start = FitOptions {
-        outer_maxiter: 0,
-        ..options.clone()
-    };
+    let start = FitOptions { outer_maxiter: 0, ..options.clone() };
     let at_start = fitted(&full, &start);
     assert_ne!(
         new.ofv.to_bits(),
@@ -228,10 +213,7 @@ fn assert_tail_is_free(model: &str, tail_wt: f64, options: &FitOptions, rounding
         "the fit must move, or the comparison sees only the start"
     );
     // The objective and the EBEs carry no rounding difference on any route.
-    assert_eq!(
-        numbers(&at_start),
-        numbers(&fitted_on_every_record(&full, &start))
-    );
+    assert_eq!(numbers(&at_start), numbers(&fitted_on_every_record(&full, &start)));
     assert_eq!(numbers(&new), numbers(&fitted(&trimmed, options)));
     let gap = worst_relative_gap(&numbers(&new), &numbers(&old));
     assert!(gap <= rounding, "against every record scored: {gap:e}");
@@ -241,12 +223,7 @@ fn assert_tail_is_free(model: &str, tail_wt: f64, options: &FitOptions, rounding
 
 #[test]
 fn trailing_doses_do_not_change_a_closed_form_fit() {
-    assert_tail_is_free(
-        &model_text(INDIVIDUAL, CLOSED_FORM),
-        70.0,
-        &few_iterations(),
-        0.0,
-    );
+    assert_tail_is_free(&model_text(INDIVIDUAL, CLOSED_FORM), 70.0, &few_iterations(), 0.0);
 }
 
 #[test]
@@ -260,10 +237,7 @@ fn trailing_doses_do_not_change_an_ode_fit() {
 /// fit against the rows deleted.
 #[test]
 fn trailing_doses_do_not_change_a_transit_subject() {
-    let run = prepared(
-        &model_text(TRANSIT_INDIVIDUAL, TRANSIT),
-        &dataset(Tail::Doses, 70.0, 2),
-    );
+    let run = prepared(&model_text(TRANSIT_INDIVIDUAL, TRANSIT), &dataset(Tail::Doses, 70.0, 2));
     let model = &run.parsed.model;
     // Prepared as `fit()` prepares it: `WT` is unread here, and a subject still carrying its
     // snapshots takes the time-varying route, which differs at solver tolerance.
@@ -397,10 +371,7 @@ fn a_per_record_gradient_differs_only_by_rounding() {
 #[test]
 fn a_subject_time_varying_only_on_trailing_rows_takes_the_constant_route() {
     let model = model_text(TV_INDIVIDUAL, SATURABLE);
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..few_iterations()
-    };
+    let options = FitOptions { outer_maxiter: 0, ..few_iterations() };
     let full = prepared(&model, &dataset_with_wt_step(Tail::Doses, 95.0, 2, 0.0));
     let trimmed = prepared(&model, &dataset_with_wt_step(Tail::None, 0.0, 0, 0.0));
     assert!(full.population.subjects[0].has_tv_covariates());
@@ -435,10 +406,7 @@ fn iov_model() -> String {
 }
 
 fn iov_options() -> FitOptions {
-    FitOptions {
-        iov_column: Some("OCC".to_string()),
-        ..few_iterations()
-    }
+    FitOptions { iov_column: Some("OCC".to_string()), ..few_iterations() }
 }
 
 #[test]
@@ -464,10 +432,7 @@ fn an_occasion_only_trailing_rows_carry_keeps_its_kappa_block() {
             .collect::<Vec<_>>()
     };
     assert_eq!(groups(&view.subjects[0]), vec![1, 2, 3]);
-    assert_eq!(
-        groups(&view.subjects[0]),
-        groups(&full.population.subjects[0])
-    );
+    assert_eq!(groups(&view.subjects[0]), groups(&full.population.subjects[0]));
     assert_eq!(
         crate::stats::likelihood::iov_group_informed(&view.subjects[0], true, false),
         crate::stats::likelihood::iov_group_informed(&full.population.subjects[0], true, false),
@@ -499,17 +464,11 @@ fn a_center_moved_by_trailing_rows_survives() {
   CL ~ WT power(center = median) => THETA_CL_WT(0.75, 0.01, 3.0)
 ";
     let model = model_text(individual, CLOSED_FORM);
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..few_iterations()
-    };
+    let options = FitOptions { outer_maxiter: 0, ..few_iterations() };
     let full = prepared(&model, &dataset(Tail::Doses, 150.0, 2));
     let trimmed = prepared(&model, &dataset(Tail::None, 0.0, 0));
     let new = fitted(&full, &options);
-    assert_eq!(
-        numbers(&new),
-        numbers(&fitted_on_every_record(&full, &options))
-    );
+    assert_eq!(numbers(&new), numbers(&fitted_on_every_record(&full, &options)));
     assert_ne!(
         new.ofv.to_bits(),
         fitted(&trimmed, &options).ofv.to_bits(),
@@ -520,22 +479,12 @@ fn a_center_moved_by_trailing_rows_survives() {
 /// NPDE simulates each subject from its doses, so it runs on the view too.
 #[test]
 fn trailing_doses_do_not_change_npde() {
-    let full = prepared(
-        &model_text(INDIVIDUAL, CLOSED_FORM),
-        &dataset(Tail::Doses, 70.0, 2),
-    );
-    let options = FitOptions {
-        outer_maxiter: 0,
-        npde_nsim: 20,
-        ..few_iterations()
-    };
+    let full = prepared(&model_text(INDIVIDUAL, CLOSED_FORM), &dataset(Tail::Doses, 70.0, 2));
+    let options = FitOptions { outer_maxiter: 0, npde_nsim: 20, ..few_iterations() };
     let new = fitted(&full, &options);
     assert!(new.subjects[0].npde.iter().all(|x| x.is_finite()));
     assert!(!new.subjects[0].npde.is_empty());
-    assert_eq!(
-        numbers(&new),
-        numbers(&fitted_on_every_record(&full, &options))
-    );
+    assert_eq!(numbers(&new), numbers(&fitted_on_every_record(&full, &options)));
 }
 
 // ── the horizon, at the objective ────────────────────────────────────────────
@@ -566,10 +515,7 @@ fn start_ofv(extra_dose: Option<f64>) -> f64 {
         csv.push('\n');
     }
     let run = prepared(&model, &csv);
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..few_iterations()
-    };
+    let options = FitOptions { outer_maxiter: 0, ..few_iterations() };
     fitted(&run, &options).ofv
 }
 
@@ -641,29 +587,18 @@ fn tad_before_the_first_arrival_keeps_a_dose_that_arrives_first() {
         |p: &Population| crate::api::predict(model, p, &run.init_params).expect("predict")[1].pred;
     let (every_dose, one_dose) = (on(&run.population), on(&cut));
     assert!(every_dose.is_finite() && one_dose.is_finite());
-    assert!(
-        (every_dose - one_dose).abs() > 0.01,
-        "{every_dose} {one_dose}"
-    );
+    assert!((every_dose - one_dose).abs() > 0.01, "{every_dose} {one_dose}");
 
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..few_iterations()
-    };
-    assert_eq!(
-        numbers(&fitted(&run, &options)),
-        numbers(&fitted_on_every_record(&run, &options))
-    );
+    let options = FitOptions { outer_maxiter: 0, ..few_iterations() };
+    assert_eq!(numbers(&fitted(&run, &options)), numbers(&fitted_on_every_record(&run, &options)));
 }
 
 /// A lag estimated with no lower bound, which `fit()` checks only at the start: on the
 /// depot (`ALAG1`), or on the absorption route into `central` (`first_order(.., lag=)`).
 /// Returns the model and the compartment its observations are on.
 fn searched_lag_model(on_route: bool) -> (String, u32) {
-    let params = PARAMS.replace(
-        "  omega ETA_CL",
-        "  theta TVLAG(1.0, -50.0, 50.0)\n  omega ETA_CL",
-    );
+    let params =
+        PARAMS.replace("  omega ETA_CL", "  theta TVLAG(1.0, -50.0, 50.0)\n  omega ETA_CL");
     let (lag, states, odes, obs_cmt) = if on_route {
         (
             "LAG",
@@ -719,10 +654,7 @@ fn a_lag_the_search_drives_negative_keeps_a_dose_it_pulls_ahead() {
         let run = prepared(&text, &searched_lag_data(obs_cmt));
         let model = &run.parsed.model;
         let view = scored_population(model, Cow::Borrowed(&run.population));
-        assert!(
-            matches!(view, Cow::Borrowed(_)),
-            "on_route = {on_route}: the view cut"
-        );
+        assert!(matches!(view, Cow::Borrowed(_)), "on_route = {on_route}: the view cut");
 
         let mut params = run.init_params.clone();
         let lag = model.theta_names.iter().position(|n| n == "TVLAG").unwrap();
@@ -734,10 +666,7 @@ fn a_lag_the_search_drives_negative_keeps_a_dose_it_pulls_ahead() {
         let at_10 =
             |p: &Population| crate::api::predict(model, p, &params).expect("predict")[1].pred;
         let (every_dose, one_dose) = (at_10(&run.population), at_10(&cut));
-        assert!(
-            every_dose.is_finite() && one_dose.is_finite(),
-            "on_route = {on_route}"
-        );
+        assert!(every_dose.is_finite() && one_dose.is_finite(), "on_route = {on_route}");
         assert!(
             (every_dose - one_dose).abs() > 0.01,
             "on_route = {on_route}: {every_dose} {one_dose}"
@@ -769,10 +698,7 @@ fn outputs_past_the_horizon_still_see_every_dose() {
   AUC_LATE = integral(compartments[1], from=230, to=280, step=0.5)
 ";
     let model = format!("{}{derived}", model_text(INDIVIDUAL, ODE));
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..few_iterations()
-    };
+    let options = FitOptions { outer_maxiter: 0, ..few_iterations() };
     let full = prepared(&model, &dataset(Tail::Doses, 70.0, 2));
     let trimmed = prepared(&model, &dataset(Tail::None, 0.0, 0));
     let before = crate::types::PopulationFingerprint::of(&full.population);
@@ -788,42 +714,26 @@ fn outputs_past_the_horizon_still_see_every_dose() {
     let new = fitted(&full, &options);
     let without = fitted(&trimmed, &options);
     assert!(auc(&new).is_finite() && auc(&new) > 0.0);
-    assert_eq!(
-        auc(&new).to_bits(),
-        auc(&fitted_on_every_record(&full, &options)).to_bits()
-    );
+    assert_eq!(auc(&new).to_bits(), auc(&fitted_on_every_record(&full, &options)).to_bits());
     assert!(
         auc(&new) > 2.0 * auc(&without),
         "the late doses must reach the integral: {} against {}",
         auc(&new),
         auc(&without)
     );
-    assert_eq!(
-        before,
-        crate::types::PopulationFingerprint::of(&full.population)
-    );
+    assert_eq!(before, crate::types::PopulationFingerprint::of(&full.population));
 }
 
 /// The post-hoc steps resolve the view, past the fingerprint check of the full population,
 /// and `run_covariance` repeats the inline step on it.
 #[test]
 fn run_covariance_scores_the_records_the_fit_scored() {
-    let run = prepared(
-        &model_text(TV_INDIVIDUAL, ODE),
-        &dataset(Tail::Doses, 90.0, 2),
-    );
-    let options = FitOptions {
-        run_covariance_step: true,
-        ..few_iterations()
-    };
+    let run = prepared(&model_text(TV_INDIVIDUAL, ODE), &dataset(Tail::Doses, 90.0, 2));
+    let options = FitOptions { run_covariance_step: true, ..few_iterations() };
     let inline = fitted(&run, &options);
-    let posthoc = crate::run_covariance(
-        &inline,
-        Some(&run.parsed.model),
-        Some(&run.population),
-        &options,
-    )
-    .unwrap_or_else(|e| panic!("run_covariance: {e}"));
+    let posthoc =
+        crate::run_covariance(&inline, Some(&run.parsed.model), Some(&run.population), &options)
+            .unwrap_or_else(|e| panic!("run_covariance: {e}"));
     let bits = |r: &FitResult| {
         let se = r.se_theta.as_ref().expect("standard errors");
         se.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
@@ -931,30 +841,15 @@ fn every_list_parallel_to_a_cut_record_kind_is_cut_with_it() {
     s.pk_only_covariates = vec![snapshot(1.0), snapshot(2.0)];
     s.pk_only_occasions = vec![1, 1];
     s.cmt_toggles = vec![
-        CmtToggle {
-            pk_only: 0,
-            state: 0,
-            on: false,
-        },
-        CmtToggle {
-            pk_only: 1,
-            state: 0,
-            on: true,
-        },
+        CmtToggle { pk_only: 0, state: 0, on: false },
+        CmtToggle { pk_only: 1, state: 0, on: true },
     ];
     s.reset_times = vec![3.0, 8.0];
     s.reset_covariates = vec![snapshot(1.0), snapshot(2.0)];
     s.reset_occasions = vec![1, 1];
 
     let kept = kept_records(&s).expect("a tail");
-    assert_eq!(
-        kept,
-        Kept {
-            doses: 2,
-            pk_only: 1,
-            resets: 1
-        }
-    );
+    assert_eq!(kept, Kept { doses: 2, pk_only: 1, resets: 1 });
     cut_subject(&mut s, kept);
     assert_eq!(s.dose_covariates.len(), 2);
     assert_eq!(s.dose_occasions, vec![1, 1]);
@@ -994,10 +889,7 @@ fn a_cut_list_with_no_new_label_stays_parallel() {
 
 #[test]
 fn a_population_with_nothing_past_the_horizon_is_not_copied() {
-    let run = prepared(
-        &model_text(INDIVIDUAL, CLOSED_FORM),
-        &dataset(Tail::None, 0.0, 0),
-    );
+    let run = prepared(&model_text(INDIVIDUAL, CLOSED_FORM), &dataset(Tail::None, 0.0, 0));
     let view = scored_population(&run.parsed.model, Cow::Borrowed(&run.population));
     assert!(matches!(view, Cow::Borrowed(_)));
 }
@@ -1064,12 +956,7 @@ mod non_gaussian {
     use crate::types::{EventType, ObsRecord};
 
     fn event(time: f64, event_type: EventType) -> ObsRecord {
-        ObsRecord::Event {
-            time,
-            event_type,
-            entry_time: 0.0,
-            cmt: 2,
-        }
+        ObsRecord::Event { time, event_type, entry_time: 0.0, cmt: 2 }
     }
 
     /// `data/pktte_joint.csv`'s first subjects, with two doses after every subject's last
@@ -1108,10 +995,7 @@ mod non_gaussian {
         let new = fitted(&full, &options);
         assert_eq!(new.gradient_method_inner, "analytic");
         assert_eq!(new.gradient_method_outer, "analytic");
-        assert_eq!(
-            numbers(&new),
-            numbers(&fitted_on_every_record(&full, &options))
-        );
+        assert_eq!(numbers(&new), numbers(&fitted_on_every_record(&full, &options)));
         assert_eq!(numbers(&new), numbers(&fitted(&trimmed, &options)));
     }
 
@@ -1129,13 +1013,7 @@ mod non_gaussian {
     #[test]
     fn an_interval_censored_event_reaches_its_right_bound() {
         let mut s = subject();
-        s.obs_records = vec![event(
-            6.0,
-            EventType::IntervalCensored {
-                left: 6.0,
-                right: 12.0,
-            },
-        )];
+        s.obs_records = vec![event(6.0, EventType::IntervalCensored { left: 6.0, right: 12.0 })];
         assert_eq!(last_scored_time(&s), Some(12.0));
     }
 
@@ -1143,18 +1021,8 @@ mod non_gaussian {
     fn a_discrete_or_count_row_is_a_scored_record() {
         let mut s = subject();
         s.obs_records = vec![
-            ObsRecord::DiscreteState {
-                time: 7.0,
-                raw_time: 7.0,
-                state: 0,
-                cmt: 2,
-            },
-            ObsRecord::Count {
-                time: 8.0,
-                raw_time: 8.0,
-                count: 1,
-                cmt: 3,
-            },
+            ObsRecord::DiscreteState { time: 7.0, raw_time: 7.0, state: 0, cmt: 2 },
+            ObsRecord::Count { time: 8.0, raw_time: 8.0, count: 1, cmt: 3 },
         ];
         assert_eq!(last_scored_time(&s), Some(8.0));
     }

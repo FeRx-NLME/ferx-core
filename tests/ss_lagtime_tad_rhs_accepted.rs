@@ -94,13 +94,8 @@ fn pop(ss: bool) -> Population {
 }
 
 fn codes(lag_line: &str, term: &str, ss: bool) -> Vec<String> {
-    let model = parse_full_model(&model_src(lag_line, term))
-        .expect("model parses")
-        .model;
-    check_model_data(&model, &pop(ss))
-        .iter()
-        .map(|d| d.code.clone())
-        .collect()
+    let model = parse_full_model(&model_src(lag_line, term)).expect("model parses").model;
+    check_model_data(&model, &pop(ss)).iter().map(|d| d.code.clone()).collect()
 }
 
 /// The retired diagnostic. Spelled out here on purpose: this file is the one place that
@@ -127,19 +122,15 @@ fn ss_plus_lagtime_plus_a_tad_reading_rhs_is_accepted_and_predicts_the_anchor() 
     // to the SS/TAD/lagtime family rather than `got.is_empty()`: an unrelated future check
     // firing on a 1-cpt steady-state model would otherwise fail here with a message pointing
     // at #1126 instead of at the change that added it.
-    let swept: Vec<&String> = got
-        .iter()
-        .filter(|c| c.contains("SS") || c.contains("TAD") || c.contains("LAG"))
-        .collect();
+    let swept: Vec<&String> =
+        got.iter().filter(|c| c.contains("SS") || c.contains("TAD") || c.contains("LAG")).collect();
     assert!(
         swept.is_empty(),
         "no SS / TAD / lagtime diagnostic may reject this combination. Got: {swept:?} \
          (all codes: {got:?})"
     );
 
-    let model = parse_full_model(&model_src(LAG, "+ 0.03*TAD"))
-        .expect("model parses")
-        .model;
+    let model = parse_full_model(&model_src(LAG, "+ 0.03*TAD")).expect("model parses").model;
     let population = pop(true);
     let subject = &population.subjects[0];
     let preds = compute_predictions_with_tv(
@@ -223,13 +214,9 @@ fn a_lagged_non_ss_dose_reading_tad_is_accepted() {
 #[test]
 fn a_declared_lagtime_whose_initial_value_is_zero_is_accepted() {
     let zero_lag_model = model_src(LAG, "+ 0.03*TAD").replace("TVLAG(3.0,", "TVLAG(0.0,");
-    let model = parse_full_model(&zero_lag_model)
-        .expect("model parses")
-        .model;
-    let got: Vec<String> = check_model_data(&model, &pop(true))
-        .iter()
-        .map(|d| d.code.clone())
-        .collect();
+    let model = parse_full_model(&zero_lag_model).expect("model parses").model;
+    let got: Vec<String> =
+        check_model_data(&model, &pop(true)).iter().map(|d| d.code.clone()).collect();
     assert!(
         !got.iter().any(|c| c == RETIRED_CODE),
         "a declared-but-currently-zero lagtime is served, not rejected. Got: {got:?}"

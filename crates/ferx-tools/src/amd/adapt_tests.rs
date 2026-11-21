@@ -7,13 +7,8 @@ use crate::search::test_support::{converged_fit, model_text};
 /// One ruvsearch row, with the fields a pre-screen row carries.
 #[allow(clippy::too_many_arguments)]
 fn step_row(
-    candidate: &str,
-    feature: Option<RuvFeature>,
-    screened: bool,
-    ofv: Option<f64>,
-    parent_ofv: f64,
-    cwres_dofv: Option<f64>,
-    selected: bool,
+    candidate: &str, feature: Option<RuvFeature>, screened: bool, ofv: Option<f64>,
+    parent_ofv: f64, cwres_dofv: Option<f64>, selected: bool,
 ) -> StepRow {
     StepRow {
         iteration: 1,
@@ -76,24 +71,13 @@ fn a_cwres_prescreen_row_is_not_reported_as_a_data_ofv() {
                 Some(8.5),
                 false,
             ),
-            step_row(
-                "power-1",
-                Some(RuvFeature::Power),
-                false,
-                Some(90.0),
-                100.0,
-                None,
-                true,
-            ),
+            step_row("power-1", Some(RuvFeature::Power), false, Some(90.0), 100.0, None, true),
         ]),
     );
     let screened = &out.rows[0];
     assert_eq!(screened.criterion, "cwres_ofv");
     assert_eq!(screened.value, Some(-12.5));
-    assert_eq!(
-        screened.ofv, None,
-        "a CWRES fit has no data OFV to put in the OFV column"
-    );
+    assert_eq!(screened.ofv, None, "a CWRES fit has no data OFV to put in the OFV column");
     assert_eq!(screened.d_ofv, None);
     // `cwres_dofv` is base − row; the pipeline's `d` is row − base, so the
     // sign is flipped and the convention "negative is better" holds.
@@ -168,10 +152,7 @@ fn the_prescreen_winner_is_not_labelled_screened_out() {
         notes: vec![],
         cancelled: false,
     });
-    assert!(
-        !rendered.contains("SELECTED (screened out on CWRES)"),
-        "{rendered}"
-    );
+    assert!(!rendered.contains("SELECTED (screened out on CWRES)"), "{rendered}");
     assert!(
         rendered.contains("SELECTED (chosen by the CWRES pre-screen for the data refit)"),
         "{rendered}"

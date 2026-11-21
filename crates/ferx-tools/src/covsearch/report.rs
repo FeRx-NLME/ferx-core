@@ -107,9 +107,7 @@ fn write_steps(path: &Path, result: &CovsearchResult) -> Result<(), String> {
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// A human-readable rendering of the search: the step table and the final
@@ -127,10 +125,7 @@ pub fn render_summary(result: &CovsearchResult) -> String {
             "\nStep {step} ({}), parent OFV {:.3}, p = {}",
             first.phase.label(),
             first.parent_ofv,
-            first
-                .lrt
-                .map(|t| format!("{}", t.alpha))
-                .unwrap_or_else(|| "-".into())
+            first.lrt.map(|t| format!("{}", t.alpha)).unwrap_or_else(|| "-".into())
         );
         let _ = writeln!(
             out,
@@ -146,11 +141,7 @@ pub fn render_summary(result: &CovsearchResult) -> String {
             let decision = if r.selected {
                 "SELECTED".to_string()
             } else if !r.passed {
-                r.failures
-                    .first()
-                    .cloned()
-                    .or_else(|| r.note.clone())
-                    .unwrap_or_default()
+                r.failures.first().cloned().or_else(|| r.note.clone()).unwrap_or_default()
             } else if let Some(t) = r.lrt {
                 match (r.phase.is_forward(), t.significant) {
                     (true, true) => "significant".into(),
@@ -165,18 +156,10 @@ pub fn render_summary(result: &CovsearchResult) -> String {
                 out,
                 "  {:<28} {:>12} {:>10} {:>3} {:>10}  {:<11} {}",
                 r.effect.label(),
-                r.ofv
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "-".into()),
-                r.lrt
-                    .map(|t| format!("{:.3}", t.dofv))
-                    .unwrap_or_else(|| "-".into()),
-                r.lrt
-                    .map(|t| t.df.to_string())
-                    .unwrap_or_else(|| "-".into()),
-                r.lrt
-                    .map(|t| format!("{:.4}", t.p_value))
-                    .unwrap_or_else(|| "-".into()),
+                r.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                r.lrt.map(|t| format!("{:.3}", t.dofv)).unwrap_or_else(|| "-".into()),
+                r.lrt.map(|t| t.df.to_string()).unwrap_or_else(|| "-".into()),
+                r.lrt.map(|t| format!("{:.4}", t.p_value)).unwrap_or_else(|| "-".into()),
                 status,
                 decision
             );

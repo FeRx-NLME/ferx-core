@@ -39,9 +39,7 @@ fn fixture() -> (CompiledModel, Subject) {
 }
 
 fn fixture_population() -> (CompiledModel, crate::types::Population) {
-    let model = crate::parser::model_parser::parse_full_model(MODEL)
-        .expect("fixture parses")
-        .model;
+    let model = crate::parser::model_parser::parse_full_model(MODEL).expect("fixture parses").model;
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(
         b"ID,TIME,DV,EVID,MDV,AMT,CMT,ADDL,II,X\n1,0,.,1,1,100,1,1,12,1\n\
@@ -58,9 +56,7 @@ fn an_implied_dose_takes_only_its_own_compartments_lag_from_its_parent() {
     let times: Vec<f64> = subject.doses.iter().map(|d| d.time).collect();
     assert_eq!(times, vec![0.0, 1.0, 12.0, 13.0]);
     assert_eq!(
-        (0..4)
-            .map(|k| subject.implied_dose_parent(k))
-            .collect::<Vec<_>>(),
+        (0..4).map(|k| subject.implied_dose_parent(k)).collect::<Vec<_>>(),
         vec![None, None, Some(0), Some(1)]
     );
     let map = model.active_dose_attr_map();
@@ -84,20 +80,12 @@ fn an_implied_dose_takes_only_its_own_compartments_lag_from_its_parent() {
     // The generic copy over seed vectors is the same copy.
     let mut seeds: Vec<Vec<f64>> = (0..subject.doses.len())
         .map(|k| {
-            (model.pk_param_fn)(
-                &theta,
-                &eta,
-                subject.dose_cov(k),
-                subject.dose_param_time(k),
-            )
-            .values
-            .to_vec()
+            (model.pk_param_fn)(&theta, &eta, subject.dose_cov(k), subject.dose_param_time(k))
+                .values
+                .to_vec()
         })
         .collect();
-    assert_ne!(
-        seeds[2][lag1], dose[2].values[lag1],
-        "the copy is not a no-op here"
-    );
+    assert_ne!(seeds[2][lag1], dose[2].values[lag1], "the copy is not a no-op here");
     inherit_parent_dose_attrs_g(&model, &subject, &mut seeds);
     for (k, s) in seeds.iter().enumerate() {
         assert_eq!(s.as_slice(), &dose[k].values[..s.len()], "dose {k}");
@@ -110,11 +98,7 @@ fn the_tad_column_shifts_an_implied_dose_by_its_parents_lag() {
     // parent (X = 1), so TAD = 18 − 13.1. Under the governing record's lag (X = 4) it would
     // arrive at 13.4, and TAD would read 4.6.
     let (model, pop) = fixture_population();
-    let mut results = vec![crate::types::test_helpers::dummy_subject(
-        "1",
-        model.n_eta,
-        1,
-    )];
+    let mut results = vec![crate::types::test_helpers::dummy_subject("1", model.n_eta, 1)];
     crate::api::compute_extra_output_columns(
         &model,
         &pop,
@@ -191,10 +175,7 @@ fn an_implied_dose_takes_its_own_routes_lag_from_its_parent() {
 #[test]
 fn an_implied_dose_takes_its_transit_routes_lag_from_its_parent() {
     let src = ROUTE_LAG_MODEL
-        .replace(
-            "  LC = 0.1 * X\n",
-            "  LC = 0.1 * X\n  NN = 2.0\n  MM = 1.5\n",
-        )
+        .replace("  LC = 0.1 * X\n", "  LC = 0.1 * X\n  NN = 2.0\n  MM = 1.5\n")
         .replace(
             "first_order(ka=KA, lag=LA) - KA*depot",
             "transit(n=NN, mtt=MM, lag=LA) - KA*depot",
@@ -251,10 +232,7 @@ fn assert_route_lags_follow_the_parent(model_src: &str) {
     // the same copy (the PR's other builders; each would read the governing record's
     // route lag, 1.0 and 0.4, without it).
     let got = compute_event_pk_params_iov(&model, &subject, theta, &eta, &[], &[]);
-    assert_eq!(
-        got.dose[2].values[la], 0.25,
-        "adaptive builder: the parent's LA"
-    );
+    assert_eq!(got.dose[2].values[la], 0.25, "adaptive builder: the parent's LA");
     for (k, (g, w)) in got.dose.iter().zip(&dose).enumerate() {
         assert_eq!(g.values, w.values, "adaptive builder, dose {k}");
     }
@@ -265,17 +243,10 @@ fn assert_route_lags_follow_the_parent(model_src: &str) {
                 .to_vec()
         })
         .collect();
-    assert_ne!(
-        seeds[2][la], dose[2].values[la],
-        "the seed copy is not a no-op here"
-    );
+    assert_ne!(seeds[2][la], dose[2].values[la], "the seed copy is not a no-op here");
     inherit_parent_dose_attrs_g(&model, &subject, &mut seeds);
     for (k, s) in seeds.iter().enumerate() {
-        assert_eq!(
-            s.as_slice(),
-            &dose[k].values[..s.len()],
-            "seed copy, dose {k}"
-        );
+        assert_eq!(s.as_slice(), &dose[k].values[..s.len()], "seed copy, dose {k}");
     }
 }
 

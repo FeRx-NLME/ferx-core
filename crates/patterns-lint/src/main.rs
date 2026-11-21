@@ -104,11 +104,8 @@ fn main() -> ExitCode {
     };
 
     if update || record {
-        let shrunk = if record {
-            Baseline::from_findings(&findings)
-        } else {
-            base.shrunk_to(&findings)
-        };
+        let shrunk =
+            if record { Baseline::from_findings(&findings) } else { base.shrunk_to(&findings) };
         if let Err(e) = std::fs::write(&path, shrunk.render()) {
             eprintln!("patterns-lint: {}: {e}", path.display());
             return ExitCode::from(2);
@@ -122,11 +119,7 @@ fn main() -> ExitCode {
     }
 
     let applied = baseline::apply(
-        &if update || record {
-            Baseline::load(&path).unwrap_or_default()
-        } else {
-            base
-        },
+        &if update || record { Baseline::load(&path).unwrap_or_default() } else { base },
         findings,
     );
     let report = render_report(&applied);

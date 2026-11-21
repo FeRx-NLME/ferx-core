@@ -169,11 +169,7 @@ fn a_nan_ok_comment_with_a_reason_is_an_escape_hatch() {
     // The reason is required, and the finding says so.
     let bare = findings(&t("w = w.max(e); // nan-ok:"));
     assert_eq!(bare.len(), 1);
-    assert!(
-        bare[0].message.contains("has no reason"),
-        "{}",
-        bare[0].message
-    );
+    assert!(bare[0].message.contains("has no reason"), "{}", bare[0].message);
     // Two lines above is not "the line above".
     let far = t("// nan-ok: too far away\nlet x = 1;\nw = w.max(e);");
     assert_eq!(findings(&far).len(), 1);
@@ -188,10 +184,7 @@ fn a_nan_ok_comment_with_a_reason_is_an_escape_hatch() {
 fn the_message_names_the_rule_and_both_escape_hatches() {
     let f = &findings(&t("let mut w = 0.0;\nw = w.max(e);"))[0];
     let shown = f.to_string();
-    assert!(
-        shown.starts_with("tests/fixture.rs:4: nan-fold: "),
-        "{shown}"
-    );
+    assert!(shown.starts_with("tests/fixture.rs:4: nan-fold: "), "{shown}");
     assert!(shown.contains(".is_finite()"), "{shown}");
     assert!(shown.contains("// nan-ok: <reason>"), "{shown}");
     assert!(shown.contains("tools/lint-rules/nan-fold.md"), "{shown}");
@@ -320,10 +313,7 @@ fn overflow_to_infinity_is_tracked_through_the_arithmetic() {
         "a / 2.0",
     ] {
         let src = t(&format!("{g} w = w.max({expr});"));
-        assert!(
-            findings(&src).is_empty(),
-            "flagged although NaN-free: {expr}"
-        );
+        assert!(findings(&src).is_empty(), "flagged although NaN-free: {expr}");
     }
 }
 
@@ -338,11 +328,7 @@ fn nan_ok_is_lexed_not_searched() {
         "w = w.max(e); let c = '\"'; let s = \"// nan-ok: after a char\";",
         "w = w.max(e); /* // nan-ok: in a block comment */",
     ] {
-        assert_eq!(
-            findings(&t(body)).len(),
-            1,
-            "excused by a non-comment: {body}"
-        );
+        assert_eq!(findings(&t(body)).len(), 1, "excused by a non-comment: {body}");
     }
     // A string that spans lines does not leak comment state.
     let multi = t("let s = \"line one\n// nan-ok: inside the string\";\nw = w.max(e);");
@@ -350,11 +336,7 @@ fn nan_ok_is_lexed_not_searched() {
     // Without the colon.
     let f = findings(&t("w = w.max(e); // nan-ok e is fine"));
     assert_eq!(f.len(), 1);
-    assert!(
-        f[0].message.contains("lacks the `nan-ok:` colon"),
-        "{}",
-        f[0].message
-    );
+    assert!(f[0].message.contains("lacks the `nan-ok:` colon"), "{}", f[0].message);
     // A real comment after a string still counts; so does a lifetime nearby.
     let ok = t("w = w.max(e); let s = \"x\"; // nan-ok: e is an integer count");
     assert!(findings(&ok).is_empty());
@@ -392,10 +374,7 @@ fn passing_a_local_bare_to_a_call_may_write_it() {
         // Arguments of read-only methods are not writes either.
         "assert!(e.is_finite() && a.is_finite()); let b = a.max(e); w = w.max(e);",
     ] {
-        assert!(
-            findings(&t(body)).is_empty(),
-            "flagged although not written: {body}"
-        );
+        assert!(findings(&t(body)).is_empty(), "flagged although not written: {body}");
     }
 }
 
@@ -440,11 +419,7 @@ fn a_write_invalidates_the_fact_where_it_is_evaluated_not_at_statement_end() {
         // Within one expression, a left operand runs before the right.
         "assert!(e.is_finite()); let _ = refresh(&mut e) && { w = w.max(e); true };",
     ] {
-        assert_eq!(
-            findings(&t(body)).len(),
-            1,
-            "stale fact survived a write: {body}"
-        );
+        assert_eq!(findings(&t(body)).len(), 1, "stale fact survived a write: {body}");
     }
     for body in [
         // A read-only condition, or a write to something else, keeps the fact.
@@ -453,10 +428,7 @@ fn a_write_invalidates_the_fact_where_it_is_evaluated_not_at_statement_end() {
         "assert!(e.is_finite()); for _ in steps(&mut other) { w = w.max(e); }",
         "assert!(e.is_finite()); match refresh(&mut other) { _ => w = w.max(e) }",
     ] {
-        assert!(
-            findings(&t(body)).is_empty(),
-            "flagged although not written: {body}"
-        );
+        assert!(findings(&t(body)).is_empty(), "flagged although not written: {body}");
     }
 }
 
@@ -494,11 +466,7 @@ fn a_closure_body_may_run_again_after_its_own_writes() {
         "assert!(e.is_finite()); let mut f = || { w = w.max(e); refresh(&mut e); }; f(); f();",
         "assert!(e.is_finite()); (0..3).for_each(|_| { w = w.max(e); e += 1.0; });",
     ] {
-        assert_eq!(
-            findings(&t(body)).len(),
-            1,
-            "outer fact survived a closure's write: {body}"
-        );
+        assert_eq!(findings(&t(body)).len(), 1, "outer fact survived a closure's write: {body}");
     }
     // A closure that never writes the value keeps the outer fact.
     let ok = t("assert!(e.is_finite()); let mut f = || { w = w.max(e); }; f(); f();");
@@ -517,10 +485,7 @@ fn an_assertion_that_writes_the_value_does_not_guard_it() {
     }
     // A write to something else in the same assertion keeps the fact.
     let ok = t("assert!(e.is_finite() && refresh(&mut other)); w = w.max(e);");
-    assert!(
-        findings(&ok).is_empty(),
-        "flagged although e is not written"
-    );
+    assert!(findings(&ok).is_empty(), "flagged although e is not written");
 }
 
 #[test]
@@ -529,10 +494,7 @@ fn a_float_associated_call_is_not_a_write_of_its_arguments() {
         "assert!(e.is_finite()); let _ = f64::is_nan(e); w = w.max(e);",
         "assert!(e.is_finite() && a.is_finite()); let _ = f64::max(a, e); w = w.max(e);",
     ] {
-        assert!(
-            findings(&t(body)).is_empty(),
-            "f64:: call taken as a write: {body}"
-        );
+        assert!(findings(&t(body)).is_empty(), "f64:: call taken as a write: {body}");
     }
 }
 
@@ -552,20 +514,11 @@ fn recorded_value_read_flags_plain_in_a_number_generic_fn() {
     let src = "fn a<T: PkNum>(x: T) -> f64 {\n    x.plain()\n}\n";
     assert_eq!(rvr(src), vec![2]);
     // A `where` clause, `impl PkNum` and a signature naming `Tr` count as generic too.
-    assert_eq!(
-        rvr("fn a<T>(x: T) -> f64 where T: PkNum { x.plain() }\n"),
-        vec![1]
-    );
+    assert_eq!(rvr("fn a<T>(x: T) -> f64 where T: PkNum { x.plain() }\n"), vec![1]);
     assert_eq!(rvr("fn a(x: impl PkNum) -> f64 { x.plain() }\n"), vec![1]);
     assert_eq!(rvr("fn a(x: Tr) -> f64 { x.plain() }\n"), vec![1]);
-    assert_eq!(
-        rvr("impl<T: VmNum> S<T> { fn m(&self, x: T) -> f64 { x.plain() } }\n"),
-        vec![1]
-    );
-    assert_eq!(
-        rvr("fn a<T: PkNum>(x: T) -> f64 { NonRecRead::plain(x) }\n"),
-        vec![1]
-    );
+    assert_eq!(rvr("impl<T: VmNum> S<T> { fn m(&self, x: T) -> f64 { x.plain() } }\n"), vec![1]);
+    assert_eq!(rvr("fn a<T: PkNum>(x: T) -> f64 { NonRecRead::plain(x) }\n"), vec![1]);
 }
 
 #[test]
@@ -577,9 +530,7 @@ fn recorded_value_read_ignores_non_generic_test_and_non_src_code() {
     assert!(rvr("fn a<T: PkNum>(x: T) { fn b(y: f64) -> f64 { y.plain() } }\n").is_empty());
     let src = "fn a<T: PkNum>(x: T) -> f64 { x.plain() }\n";
     let outside = crate::lint_source("tests/fixture.rs", src, true).unwrap();
-    assert!(outside
-        .iter()
-        .all(|f| f.rule != crate::recorded_value_read::RULE));
+    assert!(outside.iter().all(|f| f.rule != crate::recorded_value_read::RULE));
 }
 
 #[test]
@@ -613,10 +564,7 @@ fn recorded_value_read_exempts_exactly_the_non_recording_arms() {
 #[test]
 fn recorded_value_read_markers_need_a_real_reason() {
     let line = |c: &str| format!("fn a<T: PkNum>(x: T) -> f64 {{\n    x.plain() {c}\n}}\n");
-    assert!(rvr(&line(
-        "// value-read-ok: a finiteness check that only declines"
-    ))
-    .is_empty());
+    assert!(rvr(&line("// value-read-ok: a finiteness check that only declines")).is_empty());
     assert_eq!(rvr(&line("// value-read-ok:")), vec![2]);
     assert_eq!(rvr(&line("// value-read-ok no colon")), vec![2]);
     assert_eq!(rvr(&line("// nan-ok: wrong marker")), vec![2]);

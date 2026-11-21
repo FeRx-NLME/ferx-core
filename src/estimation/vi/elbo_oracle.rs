@@ -42,7 +42,6 @@ use super::*;
 use crate::estimation::parameterization::pack_params;
 use crate::estimation::vi::family::FullRank;
 use crate::types::{DoseEvent, Population, Subject};
-use std::collections::HashMap;
 
 /// Dose and (constant) volume baked into the fixture below.
 const DOSE: f64 = 100.0;
@@ -98,34 +97,13 @@ fn linear_gaussian_model() -> CompiledModel {
 /// sets `dv_pre_logged`, so `fit()` must not transform them again.
 fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: TIMES.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: obs.to_vec(),
         obs_cmts: vec![1; TIMES.len()],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; TIMES.len()],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -283,11 +261,7 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_model() {
         })
         .collect();
 
-    let exact: f64 = pop
-        .subjects
-        .iter()
-        .map(|s| exact_neg_two_log_marginal(&s.observations))
-        .sum();
+    let exact: f64 = pop.subjects.iter().map(|s| exact_neg_two_log_marginal(&s.observations)).sum();
 
     let cfg = ElboConfig {
         // Large enough that the MC error on the quadratic data term is well under the
@@ -410,13 +384,9 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
         .collect();
     expected /= pop.subjects.len() as f64;
 
-    let omega = closed_form_omega(
-        Families::Uniform(&family),
-        &phis,
-        &vec![0usize; phis.len()],
-        &template,
-    )
-    .0;
+    let omega =
+        closed_form_omega(Families::Uniform(&family), &phis, &vec![0usize; phis.len()], &template)
+            .0;
     let got = omega.matrix[(0, 0)];
     assert!(
         (got - expected).abs() < 1e-12,
@@ -554,7 +524,6 @@ fn linear_gaussian_iov_model() -> CompiledModel {
 /// per occasion.
 fn iov_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         // A **single** bolus, deliberately. A second dose would make the concentration a
         // sum of two exponentials, and `log(Σ exp)` is not affine in `z` — the affineness
@@ -563,30 +532,12 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         // log-prediction stays affine even though clearance switches partway through.
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: IOV_TIMES.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: obs.to_vec(),
         obs_cmts: vec![1; IOV_TIMES.len()],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; IOV_TIMES.len()],
         occasions: IOV_OCCASIONS.to_vec(),
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -603,10 +554,7 @@ fn iov_predict(model: &CompiledModel, subject: &Subject, theta: &[f64], z: &[f64
 /// true design matrix, not an approximation — which is what lets the closed forms below
 /// be exact rather than FD-accurate.
 fn measure_iov_design(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    d: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], d: usize,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = subject.obs_times.len();
     let zero = vec![0.0; d];
@@ -647,10 +595,7 @@ fn stacked_prior(d: usize) -> DMatrix<f64> {
 /// Exact Gaussian posterior over the stacked vector: `S = (AᵀA/σ² + Σ_b⁻¹)⁻¹`,
 /// `μ = S·Aᵀr/σ²`.
 fn exact_iov_posterior(
-    c: &[f64],
-    a: &[Vec<f64>],
-    obs: &[f64],
-    d: usize,
+    c: &[f64], a: &[Vec<f64>], obs: &[f64], d: usize,
 ) -> (DVector<f64>, DMatrix<f64>) {
     let s2 = SIGMA * SIGMA;
     let n = obs.len();
@@ -658,12 +603,8 @@ fn exact_iov_posterior(
     let r = DVector::from_fn(n, |i, _| obs[i] - c[i]);
 
     let prec = amat.transpose() * &amat / s2
-        + stacked_prior(d)
-            .try_inverse()
-            .expect("block-diagonal prior is invertible");
-    let cov = prec
-        .try_inverse()
-        .expect("posterior precision is invertible");
+        + stacked_prior(d).try_inverse().expect("block-diagonal prior is invertible");
+    let cov = prec.try_inverse().expect("posterior precision is invertible");
     let mean = &cov * (amat.transpose() * r) / s2;
     (mean, cov)
 }
@@ -685,11 +626,7 @@ fn exact_iov_neg_two_log_marginal(c: &[f64], a: &[Vec<f64>], obs: &[f64], d: usi
 /// `φ` for a `d`-dimensional [`FullRank`]: `[μ | vech(L)]`, diagonal stored as `log`.
 fn full_rank_phi_nd(mean: &DVector<f64>, cov: &DMatrix<f64>) -> Vec<f64> {
     let d = mean.len();
-    let l = cov
-        .clone()
-        .cholesky()
-        .expect("posterior covariance is PD")
-        .l();
+    let l = cov.clone().cholesky().expect("posterior covariance is PD").l();
     let mut phi = vec![0.0; d + n_tril(d)];
     phi[..d].copy_from_slice(mean.as_slice());
     for i in 0..d {
@@ -735,11 +672,7 @@ fn iov_oracle_model_is_affine_in_the_stacked_random_effects() {
     // η acts on every observation; each κ acts only from its own occasion onward, so a
     // first-occasion observation must be completely insensitive to κ₂.
     for (k, &occ) in IOV_OCCASIONS.iter().enumerate() {
-        assert!(
-            a[k][0].abs() > 1e-9,
-            "obs {k} must respond to the BSV eta, got {:.3e}",
-            a[k][0]
-        );
+        assert!(a[k][0].abs() > 1e-9, "obs {k} must respond to the BSV eta, got {:.3e}", a[k][0]);
         if occ == 1 {
             assert!(
                 a[k][2].abs() < 1e-12,
@@ -966,11 +899,7 @@ fn agq_marginal_matches_the_exact_linear_gaussian_marginal() {
         .collect();
     let kappas: Vec<Vec<nalgebra::DVector<f64>>> = vec![Vec::new(); pop.subjects.len()];
 
-    let exact: f64 = pop
-        .subjects
-        .iter()
-        .map(|s| exact_neg_two_log_marginal(&s.observations))
-        .sum();
+    let exact: f64 = pop.subjects.iter().map(|s| exact_neg_two_log_marginal(&s.observations)).sum();
 
     let agq_at = |n_nodes: usize| {
         2.0 * crate::estimation::agq::agq_population_nll(

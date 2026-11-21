@@ -138,17 +138,11 @@ fn yaml_skips_block_omega_off_diagonal_entries() {
     crate::io::output::write_estimates_yaml(&r, path.to_str().unwrap()).unwrap();
 
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        text.contains("eta_V__eta_CL:"),
-        "fixture lost its off-diagonal"
-    );
+    assert!(text.contains("eta_V__eta_CL:"), "fixture lost its off-diagonal");
 
     let got = parse_estimates_yaml(&text).unwrap();
-    let omegas: Vec<&str> = got
-        .iter()
-        .filter(|e| e.kind == EstimateKind::Omega)
-        .map(|e| e.name.as_str())
-        .collect();
+    let omegas: Vec<&str> =
+        got.iter().filter(|e| e.kind == EstimateKind::Omega).map(|e| e.name.as_str()).collect();
     assert_eq!(omegas, vec!["eta_CL", "eta_V"]);
 }
 
@@ -253,8 +247,7 @@ fn a_v1_fitrx_is_refused_by_name_and_version() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.fitrx");
     let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-    zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
     zip.write_all(
         br#"{"format_version":"1","ferx_version":"0.1.0","model_name":"m",
              "created_at":"2026-01-01T00:00:00Z","entries":[]}"#,
@@ -340,17 +333,13 @@ fn a_covariate_nn_weight_is_not_offered_as_a_prior_target() {
 
     let n = crate::io::output::THETA_BLOCK_COMPACT_MIN;
     r.theta = vec![1.0; n + 1];
-    r.theta_names = std::iter::once("CL".to_string())
-        .chain((0..n).map(|i| format!("SITE[{i}]")))
-        .collect();
+    r.theta_names =
+        std::iter::once("CL".to_string()).chain((0..n).map(|i| format!("SITE[{i}]"))).collect();
     r.theta_fixed = vec![false; n + 1];
     r.se_theta = Some(vec![0.01; n + 1]);
     let est = from_fit_result(&r);
-    let thetas: Vec<&str> = est
-        .iter()
-        .filter(|e| e.kind == EstimateKind::Theta)
-        .map(|e| e.name.as_str())
-        .collect();
+    let thetas: Vec<&str> =
+        est.iter().filter(|e| e.kind == EstimateKind::Theta).map(|e| e.name.as_str()).collect();
     assert_eq!(thetas, vec!["CL"]);
 }
 
@@ -403,19 +392,10 @@ fn json_without_ode_linear_exact_reads_as_false() {
     fit.ode_linear_exact = true;
     let mut v = fit.to_json_value();
     let back: FitResult = serde_json::from_str(&v.to_string()).expect("current JSON reads back");
-    assert!(
-        back.ode_linear_exact,
-        "a fit that ran exact must round-trip `true`"
-    );
-    let removed = v
-        .as_object_mut()
-        .expect("a fit serializes to an object")
-        .remove("ode_linear_exact");
-    assert_eq!(
-        removed,
-        Some(serde_json::Value::Bool(true)),
-        "the key must be written"
-    );
+    assert!(back.ode_linear_exact, "a fit that ran exact must round-trip `true`");
+    let removed =
+        v.as_object_mut().expect("a fit serializes to an object").remove("ode_linear_exact");
+    assert_eq!(removed, Some(serde_json::Value::Bool(true)), "the key must be written");
     let old: FitResult = serde_json::from_str(&v.to_string())
         .unwrap_or_else(|e| panic!("a pre-#852 fit JSON must still load: {e}"));
     assert!(!old.ode_linear_exact);

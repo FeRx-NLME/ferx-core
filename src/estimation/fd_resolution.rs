@@ -148,8 +148,7 @@ fn accepts(loose: &Difference, tight: &Difference) -> bool {
 /// (#2406 review r2). `None` only when `floor0`'s τ probe is missing and no floor gave a τ/100
 /// difference (the caller's own fallback for a missing probe takes over, at `floor0`).
 pub(crate) fn resolve_floored_step(
-    floor0: f64,
-    mut diff: impl FnMut(f64, bool) -> Option<Difference>,
+    floor0: f64, mut diff: impl FnMut(f64, bool) -> Option<Difference>,
 ) -> Option<Resolved> {
     let mut floor = floor0;
     let mut prev_span = 0.0_f64;
@@ -163,11 +162,7 @@ pub(crate) fn resolve_floored_step(
         let mut clamped = false;
         if let Some(l) = diff(floor, false) {
             if floor == floor0 {
-                first_loose = Some(Resolved {
-                    value: l.value,
-                    floor,
-                    stop: Stop::RanOut,
-                });
+                first_loose = Some(Resolved { value: l.value, floor, stop: Stop::RanOut });
             }
             match diff(floor, true) {
                 Some(t) => {
@@ -188,18 +183,10 @@ pub(crate) fn resolve_floored_step(
                         }
                     }
                     if accepts(&l, &t) {
-                        return Some(Resolved {
-                            value: t.value,
-                            floor,
-                            stop: Stop::Accepted,
-                        });
+                        return Some(Resolved { value: t.value, floor, stop: Stop::Accepted });
                     }
                     prev_tight = Some((t.value, err, floor));
-                    last_tight = Some(Resolved {
-                        value: t.value,
-                        floor,
-                        stop: Stop::RanOut,
-                    });
+                    last_tight = Some(Resolved { value: t.value, floor, stop: Stop::RanOut });
                 }
                 // A missing twin keeps the earlier τ/100 difference: this floor's τ one is
                 // no evidence that the step should move.
@@ -224,19 +211,13 @@ mod tests {
 
     /// A difference the noise guard passes: the numerator is far above `NOISE_GUARD·√ε·scale`.
     fn diff(value: f64, span: f64) -> Difference {
-        Difference {
-            value,
-            numer: 1.0,
-            scale: 1.0,
-            span,
-        }
+        Difference { value, numer: 1.0, scale: 1.0, span }
     }
 
     /// Runs the gate on `at(floor, tight)`, returning where it stopped and every
     /// `(floor, tight)` it asked for, in order.
     fn run(
-        floor0: f64,
-        at: impl Fn(f64, bool) -> Option<Difference>,
+        floor0: f64, at: impl Fn(f64, bool) -> Option<Difference>,
     ) -> (Option<Resolved>, Vec<(f64, bool)>) {
         let mut asked = Vec::new();
         let r = resolve_floored_step(floor0, |fl, tight| {
@@ -259,10 +240,7 @@ mod tests {
     fn accepts_the_first_floor_whose_twin_agrees_and_returns_the_tight_value() {
         let err = |fl: f64| 1e-7 / fl;
         let (r, asked) = run(1e-4, |fl, tight| {
-            Some(diff(
-                2.0 + if tight { err(fl) / 100.0 } else { err(fl) },
-                fl,
-            ))
+            Some(diff(2.0 + if tight { err(fl) / 100.0 } else { err(fl) }, fl))
         });
         let r = r.expect("a resolved difference");
         assert_eq!(r.stop, Stop::Accepted);
@@ -281,11 +259,7 @@ mod tests {
         });
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::RanOut);
-        assert_eq!(
-            (r.floor, r.value),
-            (1.0, 1.0),
-            "the cap returns the τ/100 difference"
-        );
+        assert_eq!((r.floor, r.value), (1.0, 1.0), "the cap returns the τ/100 difference");
         assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
 
         let (r, _) = run(1e-3, |fl, tight| {
@@ -324,9 +298,7 @@ mod tests {
     /// The cap is floor 1 exactly, also from a floor that is not a power of ten.
     #[test]
     fn growth_is_capped_at_floor_one() {
-        let (r, asked) = run(3e-3, |fl, tight| {
-            Some(diff(if tight { 1.0 } else { 2.0 }, fl))
-        });
+        let (r, asked) = run(3e-3, |fl, tight| Some(diff(if tight { 1.0 } else { 2.0 }, fl)));
         assert_eq!(r.unwrap().floor, 1.0);
         assert_eq!(loose_floors(&asked), [3e-3, 3e-2, 3e-1, 1.0]);
     }
@@ -337,9 +309,7 @@ mod tests {
     /// (#2406 review r2). The τ difference moves with the floor, so the two are told apart.
     #[test]
     fn an_unresolved_twin_grows_the_step() {
-        let (r, _) = run(1e-3, |fl, tight| {
-            (!tight || fl > 5e-3).then(|| diff(5.0, fl))
-        });
+        let (r, _) = run(1e-3, |fl, tight| (!tight || fl > 5e-3).then(|| diff(5.0, fl)));
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::Accepted);
         assert_eq!(r.floor, 1e-2);
@@ -369,11 +339,7 @@ mod tests {
         });
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::RanOut);
-        assert_eq!(
-            (r.floor, r.value),
-            (1e-2, 2.0),
-            "the last τ/100 difference measured"
-        );
+        assert_eq!((r.floor, r.value), (1e-2, 2.0), "the last τ/100 difference measured");
         assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
     }
 
@@ -382,9 +348,7 @@ mod tests {
     /// runs at `floor0`, as on the ungated path.
     #[test]
     fn no_floor0_probe_and_no_twin_returns_none() {
-        let (r, asked) = run(1e-3, |fl, tight| {
-            (!tight && fl > 5e-3).then(|| diff(5.0, fl))
-        });
+        let (r, asked) = run(1e-3, |fl, tight| (!tight && fl > 5e-3).then(|| diff(5.0, fl)));
         assert_eq!(r, None);
         assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
     }
@@ -394,9 +358,8 @@ mod tests {
     /// the cap.
     #[test]
     fn growth_stops_once_the_bounds_clamp_holds_the_span() {
-        let (r, asked) = run(1e-3, |fl, tight| {
-            Some(diff(if tight { 1.0 } else { 2.0 }, fl.min(5e-3)))
-        });
+        let (r, asked) =
+            run(1e-3, |fl, tight| Some(diff(if tight { 1.0 } else { 2.0 }, fl.min(5e-3))));
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::RanOut);
         assert_eq!(r.floor, 1e-1);
@@ -411,32 +374,11 @@ mod tests {
     fn a_population_resolve_with_any_unresolved_subject_is_unresolved() {
         let clean = InnerLoopStats::default();
         assert!(inner_resolved(&clean));
-        assert!(inner_resolved(&InnerLoopStats {
-            n_start_rejected: 1,
-            ..clean.clone()
-        }));
+        assert!(inner_resolved(&InnerLoopStats { n_start_rejected: 1, ..clean.clone() }));
         for (name, stats) in [
-            (
-                "unconverged",
-                InnerLoopStats {
-                    n_unconverged: 1,
-                    ..clean.clone()
-                },
-            ),
-            (
-                "fallback",
-                InnerLoopStats {
-                    n_fallback: 1,
-                    ..clean.clone()
-                },
-            ),
-            (
-                "nm_polished",
-                InnerLoopStats {
-                    n_nm_polished: 1,
-                    ..clean.clone()
-                },
-            ),
+            ("unconverged", InnerLoopStats { n_unconverged: 1, ..clean.clone() }),
+            ("fallback", InnerLoopStats { n_fallback: 1, ..clean.clone() }),
+            ("nm_polished", InnerLoopStats { n_nm_polished: 1, ..clean.clone() }),
         ] {
             assert!(!inner_resolved(&stats), "{name} counted as resolved");
         }
@@ -472,12 +414,7 @@ mod tests {
     /// A difference below the noise guard, as near a stationary point: neither test can
     /// accept it, so only the truncation test can stop growth.
     fn quiet(value: f64, span: f64) -> Difference {
-        Difference {
-            value,
-            numer: 1e-12,
-            scale: 1.0,
-            span,
-        }
+        Difference { value, numer: 1e-12, scale: 1.0, span }
     }
 
     /// #2406 review r1: growth into truncation error. Near a stationary point the relative
@@ -495,11 +432,7 @@ mod tests {
         let (r, asked) = run(1e-4, at(|fl| 3.0 + (fl / 1e-4).powi(2)));
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::Truncation);
-        assert_eq!(
-            (r.floor, r.value),
-            (1e-4, 4.0),
-            "floor 0's τ/100 difference"
-        );
+        assert_eq!((r.floor, r.value), (1e-4, 4.0), "floor 0's τ/100 difference");
         assert_eq!(loose_floors(&asked), [1e-4, 1e-3]);
 
         let (r, asked) = run(1e-4, at(|fl| 3.0 + 1e-5 * fl));
@@ -563,16 +496,11 @@ mod tests {
     /// replace with a one-sided difference at the cap.
     #[test]
     fn a_probe_missing_at_the_larger_floors_keeps_the_last_measured_difference() {
-        let (r, asked) = run(1e-3, |fl, tight| {
-            (fl < 5e-2).then(|| diff(if tight { 2.0 } else { 2.5 }, fl))
-        });
+        let (r, asked) =
+            run(1e-3, |fl, tight| (fl < 5e-2).then(|| diff(if tight { 2.0 } else { 2.5 }, fl)));
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::RanOut);
-        assert_eq!(
-            (r.floor, r.value),
-            (1e-2, 2.0),
-            "the last τ/100 difference measured"
-        );
+        assert_eq!((r.floor, r.value), (1e-2, 2.0), "the last τ/100 difference measured");
         assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
     }
 

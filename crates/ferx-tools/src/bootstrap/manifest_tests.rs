@@ -7,11 +7,7 @@ fn names() -> Vec<String> {
 }
 
 fn options() -> BootstrapOptions {
-    BootstrapOptions {
-        samples: 20,
-        seed: 7,
-        ..BootstrapOptions::default()
-    }
+    BootstrapOptions { samples: 20, seed: 7, ..BootstrapOptions::default() }
 }
 
 fn manifest() -> RunManifest {
@@ -71,10 +67,7 @@ fn a_sample_size_round_trips_through_its_description() {
     let mut map = BTreeMap::new();
     map.insert("1001".to_string(), 12usize);
     map.insert("1002".to_string(), 24usize);
-    assert_eq!(
-        describe_sample_size(&SampleSize::PerStratum(map)),
-        "per_stratum:1001=>12,1002=>24"
-    );
+    assert_eq!(describe_sample_size(&SampleSize::PerStratum(map)), "per_stratum:1001=>12,1002=>24");
 }
 
 #[test]
@@ -110,82 +103,22 @@ fn a_matching_manifest_is_compatible_with_itself() {
 fn each_differing_field_refuses_the_resume_by_name() {
     let disk = manifest();
     let cases: Vec<(&str, RunManifest)> = vec![
-        (
-            "--seed",
-            RunManifest {
-                seed: 8,
-                ..disk.clone()
-            },
-        ),
-        (
-            "--samples",
-            RunManifest {
-                samples: 21,
-                ..disk.clone()
-            },
-        ),
-        (
-            "--sample-size",
-            RunManifest {
-                sample_size: "total:5".to_string(),
-                ..disk.clone()
-            },
-        ),
-        (
-            "--stratify-on",
-            RunManifest {
-                stratify_on: Some("STUD".to_string()),
-                ..disk.clone()
-            },
-        ),
-        (
-            "--run-base-model",
-            RunManifest {
-                run_base_model: false,
-                ..disk.clone()
-            },
-        ),
+        ("--seed", RunManifest { seed: 8, ..disk.clone() }),
+        ("--samples", RunManifest { samples: 21, ..disk.clone() }),
+        ("--sample-size", RunManifest { sample_size: "total:5".to_string(), ..disk.clone() }),
+        ("--stratify-on", RunManifest { stratify_on: Some("STUD".to_string()), ..disk.clone() }),
+        ("--run-base-model", RunManifest { run_base_model: false, ..disk.clone() }),
         (
             "--update-inits",
-            RunManifest {
-                replicate_inits: "model_file".to_string(),
-                ..disk.clone()
-            },
+            RunManifest { replicate_inits: "model_file".to_string(), ..disk.clone() },
         ),
-        (
-            "--keep-covariance",
-            RunManifest {
-                keep_covariance: true,
-                ..disk.clone()
-            },
-        ),
-        (
-            "--dofv",
-            RunManifest {
-                dofv: true,
-                ..disk.clone()
-            },
-        ),
-        (
-            "model file",
-            RunManifest {
-                model_hash: Some("other".to_string()),
-                ..disk.clone()
-            },
-        ),
-        (
-            "dataset",
-            RunManifest {
-                data_hash: Some("other".to_string()),
-                ..disk.clone()
-            },
-        ),
+        ("--keep-covariance", RunManifest { keep_covariance: true, ..disk.clone() }),
+        ("--dofv", RunManifest { dofv: true, ..disk.clone() }),
+        ("model file", RunManifest { model_hash: Some("other".to_string()), ..disk.clone() }),
+        ("dataset", RunManifest { data_hash: Some("other".to_string()), ..disk.clone() }),
         (
             "parameter vector",
-            RunManifest {
-                parameter_names: vec!["CL".to_string()],
-                ..disk.clone()
-            },
+            RunManifest { parameter_names: vec!["CL".to_string()], ..disk.clone() },
         ),
     ];
     for (field, now) in cases {
@@ -203,11 +136,7 @@ fn each_differing_field_refuses_the_resume_by_name() {
 #[test]
 fn an_absent_hash_does_not_refuse_the_resume() {
     let disk = manifest();
-    let now = RunManifest {
-        model_hash: None,
-        data_hash: None,
-        ..disk.clone()
-    };
+    let now = RunManifest { model_hash: None, data_hash: None, ..disk.clone() };
     assert!(now.check_compatible(&disk, Path::new("run")).is_ok());
     assert!(disk.check_compatible(&now, Path::new("run")).is_ok());
 }

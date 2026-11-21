@@ -15,10 +15,7 @@ fn root() -> PathBuf {
 struct Normals(u64);
 impl Normals {
     fn u(&mut self) -> f64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     }
     fn z(&mut self) -> f64 {
@@ -36,10 +33,8 @@ fn accumulator_is_minus_two_log_of_the_mean_density() {
     for t in 0..3 {
         acc.update(&[draws[0][t], draws[1][t]]);
     }
-    let want: f64 = draws
-        .iter()
-        .map(|d| -2.0 * (d.iter().map(|v| (-v).exp()).sum::<f64>() / 3.0).ln())
-        .sum();
+    let want: f64 =
+        draws.iter().map(|d| -2.0 * (d.iter().map(|v| (-v).exp()).sum::<f64>() / 3.0).ln()).sum();
     let got = acc.value().unwrap();
     assert!((got - want).abs() < 1e-12, "{got} vs {want}");
 }
@@ -94,9 +89,7 @@ fn linear_gaussian_offset_from_the_posterior_expectation_is_ln2_minus_one() {
     let nll = |y: &[f64], eta: f64| {
         0.5 * (eta * eta / omega
             + omega.ln()
-            + y.iter()
-                .map(|v| s2.ln() + (v - eta).powi(2) / s2)
-                .sum::<f64>())
+            + y.iter().map(|v| s2.ln() + (v - eta).powi(2) / s2).sum::<f64>())
     };
     let mut rng = Normals(7);
     let k = 200_000;
@@ -110,21 +103,14 @@ fn linear_gaussian_offset_from_the_posterior_expectation_is_ln2_minus_one() {
         })
         .collect();
     for _ in 0..k {
-        let nlls: Vec<f64> = subjects
-            .iter()
-            .zip(&posts)
-            .map(|(y, (m, v))| nll(y, m + v.sqrt() * rng.z()))
-            .collect();
+        let nlls: Vec<f64> =
+            subjects.iter().zip(&posts).map(|(y, (m, v))| nll(y, m + v.sqrt() * rng.z())).collect();
         for (e, n) in expectation.iter_mut().zip(&nlls) {
             *e += 2.0 * n / k as f64;
         }
         acc.update(&nlls);
     }
-    let c_sum: f64 = subjects
-        .iter()
-        .zip(&posts)
-        .map(|(y, (m, _))| nll(y, *m))
-        .sum();
+    let c_sum: f64 = subjects.iter().zip(&posts).map(|(y, (m, _))| nll(y, *m)).sum();
     let got = acc.value().unwrap();
     let exact = 2.0 * c_sum + subjects.len() as f64 * 2.0_f64.ln();
     let expect_sum: f64 = expectation.iter().sum();
@@ -170,21 +156,9 @@ fn ext_first_table_final(name: &str) -> HashMap<String, f64> {
 /// (ferx model, data, NONMEM .ext): the 1-η additive-mu-reference anchor (6 subjects) and the
 /// two-η covariate anchors, the fast ones.
 const ANCHORS: &[(&str, &str, &str)] = &[
-    (
-        "saem_additive_mu.ferx",
-        "nonmem_anchor/saem_additive_mu.csv",
-        "saem_additive_mu.ext",
-    ),
-    (
-        "covmuref_additive_saem_fit.ferx",
-        "data/covmuref_additive.csv",
-        "covmuref_additive_saem.ext",
-    ),
-    (
-        "covmuref_power_saem_fit.ferx",
-        "data/covmuref_power.csv",
-        "covmuref_power_saem.ext",
-    ),
+    ("saem_additive_mu.ferx", "nonmem_anchor/saem_additive_mu.csv", "saem_additive_mu.ext"),
+    ("covmuref_additive_saem_fit.ferx", "data/covmuref_additive.csv", "covmuref_additive_saem.ext"),
+    ("covmuref_power_saem_fit.ferx", "data/covmuref_power.csv", "covmuref_power_saem.ext"),
 ];
 
 /// Worst `|ferx − NONMEM| / (N·n_η)` of a complete ferx SAEM fit (its own estimates, its own
@@ -207,13 +181,8 @@ fn saem_objective_of_a_ferx_fit_matches_nonmems_printed_saemobj() {
             run_covariance_step: false,
             ..prep.parsed.fit_options.clone()
         };
-        let r = crate::fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &opts,
-        )
-        .expect("fit");
+        let r = crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+            .expect("fit");
         let obj = r.saem_objective.as_ref().expect("a SAEM objective");
         assert_eq!(obj.kind, crate::types::SaemOfv::Saem, "{ext}");
         let n_ne = (prep.population.subjects.len() * prep.parsed.model.n_eta) as f64;
@@ -224,10 +193,7 @@ fn saem_objective_of_a_ferx_fit_matches_nonmems_printed_saemobj() {
             r.ofv
         );
         worst = worst.max(off.abs());
-        assert!(
-            off.abs() <= ANCHOR_BAND_PER_ETA,
-            "{ext}: {off:+.5} per N*neta"
-        );
+        assert!(off.abs() <= ANCHOR_BAND_PER_ETA, "{ext}: {off:+.5} per N*neta");
     }
     assert!(worst.is_finite());
 }
