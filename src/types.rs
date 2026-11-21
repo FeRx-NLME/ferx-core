@@ -9071,7 +9071,9 @@ pub struct FitResult {
     /// LOQ censoring handling method: "drop" (treat CENS rows as ordinary) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
-    /// Maximum number of outer optimizer iterations allowed.
+    /// The outer optimizer's budget (`maxiter`): objective evaluations on the NLopt optimizers
+    /// (`outer_eval_budget`: `outer_maxiter × (n + 1)`, plus `40 × (n + 1)` for BOBYQA),
+    /// iterations on `trust_region` and Gauss–Newton (#1430). `0` is evaluation-only.
     pub outer_maxiter: usize,
     /// Gradient-norm convergence tolerance for the outer optimizer.
     pub outer_gtol: f64,
