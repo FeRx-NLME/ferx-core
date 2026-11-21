@@ -176,8 +176,8 @@ fn fit_of(model: &CompiledModel) -> FitResult {
 #[test]
 fn replicate_tag_names_the_draw_only_under_uncertainty() {
     use crate::sim::adaptive::ReplicateTag;
-    let off = ReplicateTag { draw: None, sim: 3 };
-    let on = ReplicateTag { draw: Some(2), sim: 3 };
+    let off = ReplicateTag { draw: None, sim: 3, rep: None };
+    let on = ReplicateTag { draw: Some(2), sim: 3, rep: None };
     assert_eq!(off.sim_label(), "sim 3");
     assert_eq!(on.sim_label(), "draw 2, sim 3");
     assert_eq!(off.replicate_label(), "replicate 3");
@@ -224,7 +224,7 @@ fn absorbed_step_warning_names_the_draw_of_the_first_replicate() {
     let population = pop(1);
     let plan = |draw, sim| AbsorbedPlan {
         subject: 0,
-        replicate: Some(ReplicateTag { draw: Some(draw), sim }),
+        replicate: Some(ReplicateTag { draw: Some(draw), sim, rep: None }),
         found: FromStart(500.0),
     };
     let w =

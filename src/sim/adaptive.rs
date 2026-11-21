@@ -215,7 +215,10 @@ impl ControllerCtx<'_> {
 
 /// One realized dose, with the provenance the Part-D ledger output and the
 /// Part-E verifier need. Emitted for every dose a controller actually issues.
+/// `#[non_exhaustive]` since the assay replicate tag (`rep`, #946): read the rows; a new
+/// field is additive.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DoseLedgerEntry {
     /// Subject id.
     pub subject: String,
@@ -224,6 +227,11 @@ pub struct DoseLedgerEntry {
     pub draw: usize,
     /// Replicate index within the draw — matches [`crate::SimulationResult::sim`].
     pub sim: usize,
+    /// Assay replicate within the `(draw, sim)`, 1-based (#946): with
+    /// [`crate::AdaptiveSimulateOptions::n_reps`] `= R`, each subject's η (and mixture
+    /// class) is held fixed across reps `1..=R` while IOV κ and the `Dv` assay noise are
+    /// redrawn. `1` in a run with the default `R = 1`.
+    pub rep: usize,
     /// 0-based index of this dose among the subject's realized doses.
     pub dose_idx: usize,
     /// Time the dose was applied.
@@ -310,6 +318,11 @@ pub struct DecisionLogEntry {
     pub draw: usize,
     /// Replicate index within the draw — matches [`crate::SimulationResult::sim`].
     pub sim: usize,
+    /// Assay replicate within the `(draw, sim)`, 1-based (#946): with
+    /// [`crate::AdaptiveSimulateOptions::n_reps`] `= R`, each subject's η (and mixture
+    /// class) is held fixed across reps `1..=R` while IOV κ and the `Dv` assay noise are
+    /// redrawn. `1` in a run with the default `R = 1`.
+    pub rep: usize,
     /// 0-based index of this decision in the schedule.
     pub decision_idx: usize,
     /// Decision time on the subject's clock.
@@ -355,6 +368,11 @@ pub struct AdaptiveSubjectMetrics {
     pub draw: usize,
     /// Replicate index within the draw (matches [`crate::SimulationResult::sim`]).
     pub sim: usize,
+    /// Assay replicate within the `(draw, sim)`, 1-based (#946): with
+    /// [`crate::AdaptiveSimulateOptions::n_reps`] `= R`, each subject's η (and mixture
+    /// class) is held fixed across reps `1..=R` while IOV κ and the `Dv` assay noise are
+    /// redrawn. `1` in a run with the default `R = 1`.
+    pub rep: usize,
     /// Total nominal dose delivered — Σ `amt` over the run's ledger rows
     /// (pre-bioavailability: the prescribed amount, matching the ledger).
     pub cumulative_dose: f64,
@@ -491,6 +509,8 @@ pub(crate) fn compute_subject_metrics(
         subject: subject.to_string(),
         draw,
         sim,
+        // Stamped by the caller, which knows the assay replicate; the ledger does not.
+        rep: 1,
         cumulative_dose,
         n_doses,
         n_increases,
@@ -577,23 +597,26 @@ pub(crate) struct ReplicateTag {
     /// The parameter draw, `None` when the run draws no parameter uncertainty.
     pub(crate) draw: Option<usize>,
     pub(crate) sim: usize,
+    /// The assay replicate, `None` when the run has one (`n_reps = 1`, the default), so
+    /// every message keeps the text it had before replicates existed.
+    pub(crate) rep: Option<usize>,
 }
 
 impl ReplicateTag {
-    /// `"sim 3"`, or `"draw 2, sim 3"` under uncertainty.
+    /// `"sim 3"`, `"draw 2, sim 3"` under uncertainty, then `", rep 2"` with replicates.
     pub(crate) fn sim_label(self) -> String {
-        match self.draw {
-            None => format!("sim {}", self.sim),
-            Some(d) => format!("draw {d}, sim {}", self.sim),
-        }
+        self.label("sim")
     }
 
-    /// `"replicate 3"`, or `"draw 2, replicate 3"` under uncertainty.
+    /// `"replicate 3"`, `"draw 2, replicate 3"` under uncertainty, then `", rep 2"`.
     pub(crate) fn replicate_label(self) -> String {
-        match self.draw {
-            None => format!("replicate {}", self.sim),
-            Some(d) => format!("draw {d}, replicate {}", self.sim),
-        }
+        self.label("replicate")
+    }
+
+    fn label(self, noun: &str) -> String {
+        let draw = self.draw.map(|d| format!("draw {d}, ")).unwrap_or_default();
+        let rep = self.rep.map(|r| format!(", rep {r}")).unwrap_or_default();
+        format!("{draw}{noun} {}{rep}", self.sim)
     }
 }
 
@@ -2457,6 +2480,7 @@ mod tests {
             subject: "1".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             dose_idx: 2,
             time: 48.0,
             amt: 75.0,
@@ -2488,6 +2512,7 @@ mod tests {
             subject: "1".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             decision_idx: 3,
             time: 72.0,
             observed_signals: vec![obs.clone()],
@@ -2680,6 +2705,7 @@ mod tests {
             subject: "S".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             dose_idx: 0,
             time: 0.0,
             amt,
@@ -2699,6 +2725,7 @@ mod tests {
             subject: "S".to_string(),
             draw: 0,
             sim: 0,
+            rep: 1,
             decision_idx: 0,
             time,
             observed_signals: signal
