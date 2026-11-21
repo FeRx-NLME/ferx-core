@@ -152,10 +152,7 @@ fn assert_re_pin(r: &Run, k: usize) {
         )),
         "{m}"
     );
-    assert!(
-        m.contains("really changed") && m.contains("re-pin UPSTREAM_SHA256"),
-        "{m}"
-    );
+    assert!(m.contains("really changed") && m.contains("re-pin UPSTREAM_SHA256"), "{m}");
     assert!(
         !m.contains("flaky") && !m.contains("no attempt of") && !m.contains("Fewer than two"),
         "{m}"
@@ -165,10 +162,7 @@ fn assert_re_pin(r: &Run, k: usize) {
 /// The inconclusive verdict's two sentences, after `n` attempts.
 fn assert_inconclusive(r: &Run, n: usize) {
     let m = &r.message;
-    assert!(
-        m.contains(&format!("no attempt of {n} delivered the pinned upstream")),
-        "{m}"
-    );
+    assert!(m.contains(&format!("no attempt of {n} delivered the pinned upstream")), "{m}");
     assert!(
         m.contains(
             "Fewer than two complete downloads cannot tell a changed file from a flaky \
@@ -176,10 +170,7 @@ fn assert_inconclusive(r: &Run, n: usize) {
         ),
         "{m}"
     );
-    assert!(
-        !m.contains("really changed") && !m.contains("flaky,"),
-        "{m}"
-    );
+    assert!(!m.contains("really changed") && !m.contains("flaky,"), "{m}");
 }
 
 /// #2818's night: attempt 1 hashes wrong, attempt 2 is right. The fetch succeeds, writes
@@ -236,24 +227,15 @@ fn a_truncated_transfer_is_logged_as_incomplete() {
 /// last attempt (3 attempts, 2 backoffs).
 #[test]
 fn the_same_wrong_hash_every_time_says_re_pin() {
-    let r = run(
-        "same-wrong",
-        "same_wrong",
-        &["--attempts", "3", "--allow-new-hash"],
-    );
+    let r = run("same-wrong", "same_wrong", &["--attempts", "3", "--allow-new-hash"]);
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(!r.wrote_pinned, "{}", r.log);
     assert_eq!(r.hits, 3, "{}", r.log);
-    assert_eq!(
-        r.sleeps, 2,
-        "one backoff between attempts, none after the last:\n{}",
-        r.log
-    );
+    assert_eq!(r.sleeps, 2, "one backoff between attempts, none after the last:\n{}", r.log);
     assert_re_pin(&r, 3);
     for k in 1..=3 {
         assert!(
-            r.message
-                .contains(&format!("  attempt {k}: sha256 {}", r.wrong_a)),
+            r.message.contains(&format!("  attempt {k}: sha256 {}", r.wrong_a)),
             "{}",
             r.message
         );
@@ -281,10 +263,7 @@ fn two_alternating_wrong_hashes_say_flaky() {
         ),
         "{m}"
     );
-    assert!(
-        !m.contains("really changed") && !m.contains("Fewer than two"),
-        "{m}"
-    );
+    assert!(!m.contains("really changed") && !m.contains("Fewer than two"), "{m}");
     assert!(
         m.contains(&format!("  attempt 1: sha256 {}", r.wrong_a))
             && m.contains(&format!("  attempt 2: sha256 {}", r.wrong_b))
@@ -297,18 +276,10 @@ fn two_alternating_wrong_hashes_say_flaky() {
 /// same wrong hash twice is still "re-pin", counted over the 2 complete downloads.
 #[test]
 fn a_transport_error_does_not_hide_a_repeated_hash() {
-    let r = run(
-        "error-then-same-wrong",
-        "error_then_same_wrong",
-        &["--attempts", "3"],
-    );
+    let r = run("error-then-same-wrong", "error_then_same_wrong", &["--attempts", "3"]);
     assert_eq!(r.exit, 1, "{}", r.log);
     assert_re_pin(&r, 2);
-    assert!(
-        r.message.contains("  attempt 1: error: HTTPError"),
-        "{}",
-        r.message
-    );
+    assert!(r.message.contains("  attempt 1: error: HTTPError"), "{}", r.message);
 }
 
 /// Neither does the deadline: two complete downloads hash the same wrong value, and the
@@ -330,12 +301,7 @@ fn a_deadline_does_not_hide_a_repeated_hash() {
         r.log
     );
     assert_re_pin(&r, 2);
-    assert!(
-        r.message
-            .contains("Stopped at the 5 s --deadline-seconds budget."),
-        "{}",
-        r.message
-    );
+    assert!(r.message.contains("Stopped at the 5 s --deadline-seconds budget."), "{}", r.message);
 }
 
 /// When every attempt is a transport error there is no hash to judge: inconclusive.
@@ -353,12 +319,7 @@ fn transport_errors_on_every_attempt_are_inconclusive() {
         r.message
     );
     for k in 1..=3 {
-        assert!(
-            r.message
-                .contains(&format!("  attempt {k}: error: HTTPError")),
-            "{}",
-            r.message
-        );
+        assert!(r.message.contains(&format!("  attempt {k}: error: HTTPError")), "{}", r.message);
     }
 }
 
@@ -370,12 +331,7 @@ fn a_single_wrong_hash_is_inconclusive() {
     assert_eq!(r.exit, 1, "{}", r.log);
     assert_eq!(r.sleeps, 0, "{}", r.log);
     assert_inconclusive(&r, 1);
-    assert!(
-        r.message
-            .contains(&format!("  attempt 1: sha256 {}", r.wrong_a)),
-        "{}",
-        r.message
-    );
+    assert!(r.message.contains(&format!("  attempt 1: sha256 {}", r.wrong_a)), "{}", r.message);
 }
 
 /// Each backoff is capped by the time left. With a 2.5 s budget and a 1 s backoff base the
@@ -383,11 +339,7 @@ fn a_single_wrong_hash_is_inconclusive() {
 /// starts. Uncapped they would be 1 + 2 = 3 s, past the budget.
 #[test]
 fn the_backoff_never_sleeps_past_the_deadline() {
-    let r = run(
-        "backoff-cap",
-        "same_wrong",
-        &["--attempts", "4", "--deadline-seconds", "2.5"],
-    );
+    let r = run("backoff-cap", "same_wrong", &["--attempts", "4", "--deadline-seconds", "2.5"]);
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(
         r.sleep_total.is_finite() && r.sleep_total <= 2.5 + 1e-3,
@@ -402,12 +354,7 @@ fn the_backoff_never_sleeps_past_the_deadline() {
         r.log
     );
     assert_re_pin(&r, 2);
-    assert!(
-        r.message
-            .contains("Stopped at the 2.5 s --deadline-seconds budget."),
-        "{}",
-        r.message
-    );
+    assert!(r.message.contains("Stopped at the 2.5 s --deadline-seconds budget."), "{}", r.message);
 }
 
 /// A server that accepts the request and never answers: the header phase is waited for
@@ -417,11 +364,7 @@ fn the_backoff_never_sleeps_past_the_deadline() {
 /// rows 2 and 3); a `join` without a timeout runs to the 25 s watchdog.
 #[test]
 fn a_silent_server_stops_at_the_deadline() {
-    let r = run(
-        "silent",
-        "silent",
-        &["--deadline-seconds", "2", "--timeout", "30"],
-    );
+    let r = run("silent", "silent", &["--deadline-seconds", "2", "--timeout", "30"]);
     let m = &r.message;
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(
@@ -437,10 +380,7 @@ fn a_silent_server_stops_at_the_deadline() {
         r.log
     );
     assert_eq!(r.hits, 1, "{}", r.log);
-    assert!(
-        m.contains("Stopped at the 2 s --deadline-seconds budget."),
-        "{m}"
-    );
+    assert!(m.contains("Stopped at the 2 s --deadline-seconds budget."), "{m}");
     assert!(m.contains("  attempt 1: error: "), "{m}");
 }
 
@@ -452,14 +392,7 @@ fn a_stall_after_a_trickle_stops_at_the_deadline() {
     let r = run(
         "trickle-then-stall",
         "trickle_then_stall",
-        &[
-            "--attempts",
-            "1",
-            "--deadline-seconds",
-            "2",
-            "--timeout",
-            "30",
-        ],
+        &["--attempts", "1", "--deadline-seconds", "2", "--timeout", "30"],
     );
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(
@@ -469,8 +402,7 @@ fn a_stall_after_a_trickle_stops_at_the_deadline() {
         r.log
     );
     assert!(
-        r.message
-            .contains("Stopped at the 2 s --deadline-seconds budget.")
+        r.message.contains("Stopped at the 2 s --deadline-seconds budget.")
             && r.message
                 .contains("  attempt 1: error: TimeoutError: deadline reached mid-download"),
         "{}",
@@ -487,14 +419,7 @@ fn headers_arriving_after_the_deadline_stop_before_the_body() {
     let r = run(
         "slow-headers",
         "slow_headers",
-        &[
-            "--attempts",
-            "1",
-            "--deadline-seconds",
-            "2",
-            "--timeout",
-            "30",
-        ],
+        &["--attempts", "1", "--deadline-seconds", "2", "--timeout", "30"],
     );
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(!r.wrote_pinned, "{}", r.log);
@@ -509,9 +434,7 @@ fn headers_arriving_after_the_deadline_stop_before_the_body() {
     assert!(
         r.message.contains(
             "  attempt 1: error: TimeoutError: deadline reached before the response headers"
-        ) && r
-            .message
-            .contains("Stopped at the 2 s --deadline-seconds budget."),
+        ) && r.message.contains("Stopped at the 2 s --deadline-seconds budget."),
         "{}",
         r.message
     );
@@ -525,14 +448,7 @@ fn a_stall_cut_by_the_read_timeout_is_not_the_deadline() {
     let r = run(
         "trickle-then-stall-timeout",
         "trickle_then_stall",
-        &[
-            "--attempts",
-            "1",
-            "--deadline-seconds",
-            "10",
-            "--timeout",
-            "0.5",
-        ],
+        &["--attempts", "1", "--deadline-seconds", "10", "--timeout", "0.5"],
     );
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(
@@ -558,11 +474,7 @@ fn a_stall_cut_by_the_read_timeout_is_not_the_deadline() {
 /// says so, and no further attempt or backoff runs past the budget.
 #[test]
 fn a_trickling_download_stops_at_the_deadline() {
-    let r = run(
-        "trickle",
-        "trickle",
-        &["--deadline-seconds", "2", "--timeout", "30"],
-    );
+    let r = run("trickle", "trickle", &["--deadline-seconds", "2", "--timeout", "30"]);
     let m = &r.message;
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(
@@ -573,14 +485,8 @@ fn a_trickling_download_stops_at_the_deadline() {
     );
     assert_eq!(r.hits, 1, "{}", r.log);
     assert!(r.sleep_total == 0.0, "{}", r.log);
-    assert!(
-        m.contains("Stopped at the 2 s --deadline-seconds budget."),
-        "{m}"
-    );
-    assert!(
-        m.contains("  attempt 1: error: TimeoutError: deadline reached mid-download"),
-        "{m}"
-    );
+    assert!(m.contains("Stopped at the 2 s --deadline-seconds budget."), "{m}");
+    assert!(m.contains("  attempt 1: error: TimeoutError: deadline reached mid-download"), "{m}");
 }
 
 /// The deadline expiring during the *last* attempt is reported too: that is the attempt
@@ -590,23 +496,11 @@ fn a_deadline_on_the_last_attempt_is_reported() {
     let r = run(
         "trickle-last",
         "trickle",
-        &[
-            "--attempts",
-            "1",
-            "--deadline-seconds",
-            "2",
-            "--timeout",
-            "30",
-        ],
+        &["--attempts", "1", "--deadline-seconds", "2", "--timeout", "30"],
     );
     assert_eq!(r.exit, 1, "{}", r.log);
     assert_inconclusive(&r, 1);
-    assert!(
-        r.message
-            .contains("Stopped at the 2 s --deadline-seconds budget."),
-        "{}",
-        r.message
-    );
+    assert!(r.message.contains("Stopped at the 2 s --deadline-seconds budget."), "{}", r.message);
 }
 
 /// The attempt starts at the script's own constants on a 720 s budget, when every failure
@@ -618,18 +512,10 @@ const PRODUCTION_STARTS: [f64; 8] = [0.0, 15.0, 45.0, 105.0, 225.0, 345.0, 465.0
 /// the attempts' own wall time: measured worst drift over 3 runs on Python 3.12 was 12 ms
 /// (#2834 review row 6), so the bound has ~80x headroom for a loaded CI runner.
 fn assert_starts(r: &Run, want: &[f64]) {
-    assert!(
-        r.hit_times.iter().all(|t| t.is_finite()),
-        "{:?}\n{}",
-        r.hit_times,
-        r.log
-    );
+    assert!(r.hit_times.iter().all(|t| t.is_finite()), "{:?}\n{}", r.hit_times, r.log);
     assert!(
         r.hit_times.len() == want.len()
-            && r.hit_times
-                .iter()
-                .zip(want)
-                .all(|(got, w)| (*w..w + 1.0).contains(got)),
+            && r.hit_times.iter().zip(want).all(|(got, w)| (*w..w + 1.0).contains(got)),
         "attempt starts {:?}, want {want:?}\n{}",
         r.hit_times,
         r.log
@@ -642,11 +528,7 @@ fn assert_starts(r: &Run, want: &[f64]) {
 /// minute and the fetch failed.
 #[test]
 fn an_outage_for_most_of_the_budget_then_recovery_succeeds() {
-    let r = run(
-        "outage-480",
-        "errorbean_until_480",
-        &["--harness-production-timing"],
-    );
+    let r = run("outage-480", "errorbean_until_480", &["--harness-production-timing"]);
     assert_eq!(r.exit, 0, "{}", r.log);
     assert!(r.wrote_pinned, "{}", r.log);
     assert_eq!(r.hits, 8, "{}", r.log);
@@ -659,11 +541,7 @@ fn an_outage_for_most_of_the_budget_then_recovery_succeeds() {
 /// deadline.
 #[test]
 fn an_outage_longer_than_the_budget_spreads_the_attempts_over_it() {
-    let r = run(
-        "outage-forever",
-        "errorbean_until_100000",
-        &["--harness-production-timing"],
-    );
+    let r = run("outage-forever", "errorbean_until_100000", &["--harness-production-timing"]);
     let m = &r.message;
     assert_eq!(r.exit, 1, "{}", r.log);
     assert_eq!(r.hits, 8, "{}", r.log);
@@ -692,10 +570,7 @@ fn attempts_exhausted_with_time_left_names_no_stop() {
     assert_eq!(r.exit, 1, "{}", r.log);
     assert_eq!(r.hits, 8, "{}", r.log);
     assert_starts(&r, &PRODUCTION_STARTS);
-    assert!(
-        !m.contains("No attempt starts") && !m.contains("Stopped at"),
-        "{m}"
-    );
+    assert!(!m.contains("No attempt starts") && !m.contains("Stopped at"), "{m}");
 }
 
 /// When the attempt at `latest_start` runs into the deadline, the deadline is what the
@@ -706,13 +581,7 @@ fn a_last_attempt_that_meets_the_deadline_reports_the_deadline() {
     let r = run(
         "reserve-then-deadline",
         "same_wrong_then_trickle",
-        &[
-            "--harness-reserve=0.25",
-            "--deadline-seconds",
-            "4",
-            "--timeout",
-            "30",
-        ],
+        &["--harness-reserve=0.25", "--deadline-seconds", "4", "--timeout", "30"],
     );
     let m = &r.message;
     assert_eq!(r.exit, 1, "{}", r.log);
@@ -733,8 +602,7 @@ fn a_short_non_zip_reply_is_quoted_whole() {
     assert!(r.wrote_pinned, "{}", r.log);
     assert_eq!(r.errorbean_tail.len(), 60, "{}", r.log);
     assert!(
-        r.log
-            .contains("attempt 1: unreadable payload: not a zip (292 bytes, application/xml): ")
+        r.log.contains("attempt 1: unreadable payload: not a zip (292 bytes, application/xml): ")
             && r.log.contains(&format!("{}'", r.errorbean_tail))
             && !r.log.contains("cut at"),
         "{}",
@@ -748,8 +616,7 @@ fn a_long_non_zip_reply_is_cut_and_says_so() {
     let r = run("long-html", "long_html_then_right", &[]);
     assert_eq!(r.exit, 0, "{}", r.log);
     assert!(
-        r.log
-            .contains("attempt 1: unreadable payload: not a zip (2048 bytes, text/html): ")
+        r.log.contains("attempt 1: unreadable payload: not a zip (2048 bytes, text/html): ")
             && r.log.contains("EARLY-MARKER")
             && r.log.contains("' (cut at 1024 of 2048 bytes)")
             && !r.log.contains("LATE-MARKER"),
@@ -767,14 +634,7 @@ fn headers_that_never_end_stop_at_the_deadline() {
     let r = run(
         "headers-forever",
         "headers_forever",
-        &[
-            "--attempts",
-            "1",
-            "--deadline-seconds",
-            "2",
-            "--timeout",
-            "30",
-        ],
+        &["--attempts", "1", "--deadline-seconds", "2", "--timeout", "30"],
     );
     let m = &r.message;
     assert_eq!(r.exit, 1, "{}", r.log);
@@ -800,14 +660,7 @@ fn headers_that_end_inside_the_budget_still_succeed() {
     let r = run(
         "slow-headers-in-budget",
         "slow_headers",
-        &[
-            "--attempts",
-            "1",
-            "--deadline-seconds",
-            "5",
-            "--timeout",
-            "30",
-        ],
+        &["--attempts", "1", "--deadline-seconds", "5", "--timeout", "30"],
     );
     assert_eq!(r.exit, 0, "{}", r.log);
     assert!(r.wrote_pinned, "{}", r.log);
@@ -819,11 +672,7 @@ fn zero_attempts_is_a_usage_error() {
     let r = run("zero-attempts", "same_wrong", &["--attempts", "0"]);
     assert_eq!(r.exit, 2, "{}", r.log);
     assert_eq!(r.hits, 0, "{}", r.log);
-    assert!(
-        r.log.contains("--attempts: must be at least 1, got 0"),
-        "{}",
-        r.log
-    );
+    assert!(r.log.contains("--attempts: must be at least 1, got 0"), "{}", r.log);
 }
 
 /// A zero time budget is a usage error too.
@@ -832,12 +681,7 @@ fn a_zero_deadline_is_a_usage_error() {
     let r = run("zero-deadline", "same_wrong", &["--deadline-seconds", "0"]);
     assert_eq!(r.exit, 2, "{}", r.log);
     assert_eq!(r.hits, 0, "{}", r.log);
-    assert!(
-        r.log
-            .contains("--timeout and --deadline-seconds must be positive"),
-        "{}",
-        r.log
-    );
+    assert!(r.log.contains("--timeout and --deadline-seconds must be positive"), "{}", r.log);
 }
 
 /// `--from` a zip holding neither the CSV nor the inner zip exits with a message naming
@@ -872,21 +716,12 @@ fn slow_tests_fetch_budget_fits_the_core_job_ceiling() {
     let wf = std::fs::read_to_string(repo_root().join(".github/workflows/slow-tests.yml"))
         .expect("slow-tests.yml");
     let num_after = |hay: &str, key: &str| -> f64 {
-        let rest = &hay[hay
-            .find(key)
-            .unwrap_or_else(|| panic!("no `{key}` in slow-tests.yml"))
-            + key.len()..];
-        let n: String = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        n.parse()
-            .unwrap_or_else(|_| panic!("no number after `{key}`"))
+        let rest = &hay
+            [hay.find(key).unwrap_or_else(|| panic!("no `{key}` in slow-tests.yml")) + key.len()..];
+        let n: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+        n.parse().unwrap_or_else(|_| panic!("no number after `{key}`"))
     };
-    let step = &wf[wf
-        .find("- name: Fetch the canakinumab MBMA data")
-        .expect("fetch step")..];
+    let step = &wf[wf.find("- name: Fetch the canakinumab MBMA data").expect("fetch step")..];
     let step = &step[..step.find("\n      - name:").expect("next step")];
     // Read the flags from the command, not from the comment above it, which quotes them.
     let cmd = &step[step.find("run: |").expect("fetch step command")..];
@@ -895,9 +730,8 @@ fn slow_tests_fetch_budget_fits_the_core_job_ceiling() {
     let step_cap = num_after(step, "timeout-minutes:");
     let ceiling = num_after(&wf, "timeout-minutes: ${{ matrix.leg == 'core' &&");
     let kill_after = num_after(&wf, "timeout --signal=INT --kill-after=");
-    let cargo_timeout = &wf[wf
-        .find("timeout --signal=INT --kill-after=")
-        .expect("cargo step timeout")..];
+    let cargo_timeout =
+        &wf[wf.find("timeout --signal=INT --kill-after=").expect("cargo step timeout")..];
     let inner = num_after(cargo_timeout, "${{ matrix.leg == 'core' && '");
     assert!(
         deadline_s + timeout_s < step_cap * 60.0,
@@ -933,9 +767,7 @@ fn the_harness_refuses_an_unknown_harness_option() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{bad} was accepted:\n{err}");
         assert!(
-            err.contains(&format!(
-                "fetch_fake_server: unknown harness option(s): {bad}"
-            )),
+            err.contains(&format!("fetch_fake_server: unknown harness option(s): {bad}")),
             "{bad}: {err}"
         );
     }

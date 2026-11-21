@@ -31,8 +31,7 @@ fn sir_outputs_cleared(fit: &FitResult) -> FitResult {
 }
 
 fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
-    ci.as_ref()
-        .map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
+    ci.as_ref().map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
 }
 
 #[test]
@@ -55,10 +54,7 @@ fn run_sir_uses_the_recorded_inner_optimizer_not_the_last_fits() {
     let ess_a = fit_a.sir_ess.expect("in-fit SIR ran");
     assert!(ess_a.is_finite(), "in-fit ESS {ess_a}");
     assert_eq!(
-        fit_a
-            .sir_settings
-            .as_ref()
-            .map(|s| s.scoring.inner_optimizer),
+        fit_a.sir_settings.as_ref().map(|s| s.scoring.inner_optimizer),
         Some(InnerOptimizer::Lbfgs)
     );
 
@@ -93,10 +89,7 @@ fn run_sir_uses_the_recorded_inner_optimizer_not_the_last_fits() {
         "premise: the inner solver must change the ESS on this fixture"
     );
 
-    let quiet = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
+    let quiet = FitOptions { verbose: false, ..FitOptions::default() };
     let out =
         run_sir(&sir_outputs_cleared(&fit_a), Some(model), Some(pop), &quiet).expect("run_sir");
     assert_eq!(
@@ -105,10 +98,6 @@ fn run_sir_uses_the_recorded_inner_optimizer_not_the_last_fits() {
         "ESS {:?} vs in-fit {ess_a}",
         out.sir_ess
     );
-    assert_eq!(
-        ci_bits(&out.sir_ci_theta),
-        ci_bits(&fit_a.sir_ci_theta),
-        "θ"
-    );
+    assert_eq!(ci_bits(&out.sir_ci_theta), ci_bits(&fit_a.sir_ci_theta), "θ");
     assert_eq!(out.sir_settings, fit_a.sir_settings);
 }

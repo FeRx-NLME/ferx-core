@@ -254,11 +254,7 @@ fn pop_of(csv: &str) -> Population {
 
 fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
     let pop = pop_of(csv);
-    predict(model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect()
+    predict(model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect()
 }
 
 fn assert_close(a: &[f64], b: &[f64], tol: f64, ctx: &str) {
@@ -299,10 +295,7 @@ fn modeled_rate_matches_explicit_infusion() {
     let coded = preds_of(&model, &coded_csv());
     let explicit = preds_of(&model, &explicit_csv());
     assert_close(&coded, &explicit, 1e-9, "RATE=-1 R1=20 vs explicit RATE=20");
-    assert!(
-        coded.iter().any(|&c| c > 0.1),
-        "predictions should be nonzero"
-    );
+    assert!(coded.iter().any(|&c| c > 0.1), "predictions should be nonzero");
 }
 
 #[test]
@@ -316,12 +309,7 @@ fn modeled_rate_composes_with_bioavailability_once() {
     assert_close(&coded, &explicit, 1e-9, "F1 + RATE=-1 vs F1 + explicit");
     // Sanity: F1=0.5 halves exposure vs the no-F model (so F is actually applied).
     let no_f = preds_of(&model_of(ODE_R1), &coded_csv());
-    assert!(
-        coded[2] < 0.75 * no_f[2],
-        "F1=0.5 must reduce exposure: {} vs {}",
-        coded[2],
-        no_f[2]
-    );
+    assert!(coded[2] < 0.75 * no_f[2], "F1=0.5 must reduce exposure: {} vs {}", coded[2], no_f[2]);
 }
 
 #[test]
@@ -367,10 +355,7 @@ fn modeled_rate_under_f_scales_duration() {
     let dur_coded = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{OBS_ROWS}");
     let dur_preds = preds_of(&dur_model, &dur_coded);
     assert!(
-        rate_preds
-            .iter()
-            .zip(dur_preds.iter())
-            .any(|(r, d)| (r - d).abs() > 1e-3),
+        rate_preds.iter().zip(dur_preds.iter()).any(|(r, d)| (r - d).abs() > 1e-3),
         "RATE=-1 (rate-defined) and RATE=-2 (duration-defined) must differ under F!=1 (#419)",
     );
 }
@@ -381,19 +366,10 @@ fn modeled_rate_composes_with_lagtime() {
     let model = model_of(ODE_R1_LAG1);
     let coded = preds_of(&model, &coded_csv());
     let explicit = preds_of(&model, &explicit_csv());
-    assert_close(
-        &coded,
-        &explicit,
-        1e-9,
-        "ALAG1 + RATE=-1 vs ALAG1 + explicit",
-    );
+    assert_close(&coded, &explicit, 1e-9, "ALAG1 + RATE=-1 vs ALAG1 + explicit");
     // The lag delays uptake: at t=1 (< lag 2) the compartment is still empty.
     let no_lag = preds_of(&model_of(ODE_R1), &coded_csv());
-    assert!(
-        coded[0] < 1e-9,
-        "pre-lag prediction must be ~0, got {}",
-        coded[0]
-    );
+    assert!(coded[0] < 1e-9, "pre-lag prediction must be ~0, got {}", coded[0]);
     assert!(no_lag[0] > 1e-3, "no-lag model should have uptake by t=1");
 }
 
@@ -431,11 +407,7 @@ fn modeled_rate_without_matching_param_is_rejected() {
         .find(|d| d.code == "E_MODELED_RATE_NO_PARAM")
         .expect("RATE=-1 with no R1 must be rejected");
     assert_eq!(d.severity, Severity::Error);
-    assert!(
-        d.message.contains("R1") && d.message.contains("compartment 1"),
-        "{}",
-        d.message
-    );
+    assert!(d.message.contains("R1") && d.message.contains("compartment 1"), "{}", d.message);
 }
 
 /// `ODE_R1`, but the RHS *also* reads `R1` — the #993 double use. Written so the
@@ -486,16 +458,10 @@ fn modeled_rate_param_also_read_in_rhs_is_rejected_only_with_coded_rate() {
         .find(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE")
         .expect("RATE=-1 onto an R1 the RHS also reads must be rejected");
     assert_eq!(d.severity, Severity::Error);
-    assert!(
-        d.message.contains("R1") && d.message.contains("compartment 1"),
-        "{}",
-        d.message
-    );
+    assert!(d.message.contains("R1") && d.message.contains("compartment 1"), "{}", d.message);
     // Must not be misreported as the sibling "no such parameter" error: `R1` exists.
     assert!(
-        !check_model_data(&model, &coded)
-            .iter()
-            .any(|d| d.code == "E_MODELED_RATE_NO_PARAM"),
+        !check_model_data(&model, &coded).iter().any(|d| d.code == "E_MODELED_RATE_NO_PARAM"),
         "R1 is declared — this is a double use, not a missing parameter"
     );
 
@@ -503,9 +469,7 @@ fn modeled_rate_param_also_read_in_rhs_is_rejected_only_with_coded_rate() {
     //     `R1` is inert and the model is correct. Silence is the assertion.
     let explicit = pop_of(&explicit_csv());
     assert!(
-        !check_model_data(&model, &explicit)
-            .iter()
-            .any(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE"),
+        !check_model_data(&model, &explicit).iter().any(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE"),
         "without a coded RATE, `R1` is an ordinary parameter: {:?}",
         check_model_data(&model, &explicit)
     );
@@ -575,10 +539,9 @@ fn modeled_rate_param_read_in_scaling_is_rejected_on_both_engines() {
     // mark is written somewhere `check_modeled_dose_rates` never looks.
     let coded = pop_of(&coded_csv());
     let explicit = pop_of(&explicit_csv());
-    for (label, src) in [
-        ("ODE", ODE_R1_ALSO_IN_SCALING),
-        ("analytical", ANALYTICAL_R1_ALSO_IN_SCALING),
-    ] {
+    for (label, src) in
+        [("ODE", ODE_R1_ALSO_IN_SCALING), ("analytical", ANALYTICAL_R1_ALSO_IN_SCALING)]
+    {
         let model = model_of(src);
         let d = check_model_data(&model, &coded)
             .into_iter()
@@ -591,9 +554,7 @@ fn modeled_rate_param_read_in_scaling_is_rejected_on_both_engines() {
         );
         // Same model, no coded RATE: `R1` is an ordinary parameter and stays silent.
         assert!(
-            !check_model_data(&model, &explicit)
-                .iter()
-                .any(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE"),
+            !check_model_data(&model, &explicit).iter().any(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE"),
             "{label}: without a coded RATE, `R1` is an ordinary parameter"
         );
     }
@@ -608,12 +569,7 @@ fn analytical_modeled_rate_matches_explicit_infusion() {
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let coded = preds_of(&model, &coded_csv());
     let explicit = preds_of(&model, &explicit_csv());
-    assert_close(
-        &coded,
-        &explicit,
-        1e-9,
-        "analytical RATE=-1 R1=20 vs explicit RATE=20",
-    );
+    assert_close(&coded, &explicit, 1e-9, "analytical RATE=-1 R1=20 vs explicit RATE=20");
 }
 
 // NONMEM-anchored closed form. For a one-compartment IV infusion of rate `R = R1`
@@ -645,22 +601,11 @@ fn analytical_modeled_rate_matches_nonmem_closed_form() {
     // (= NONMEM IPRED, verified in the RATE=-2 anchor for the identical infusion).
     let model = model_of(ANALYTICAL_R1);
     let pop = pop_of(&coded_csv());
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
     let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
-    let expected: Vec<f64> = times
-        .iter()
-        .map(|&t| one_cpt_infusion_closed_form(t))
-        .collect();
-    assert_close(
-        &preds,
-        &expected,
-        1e-6,
-        "analytical RATE=-1 vs ADVAN1 closed form",
-    );
+    let expected: Vec<f64> = times.iter().map(|&t| one_cpt_infusion_closed_form(t)).collect();
+    assert_close(&preds, &expected, 1e-6, "analytical RATE=-1 vs ADVAN1 closed form");
 }
 
 #[test]
@@ -691,9 +636,7 @@ fn modeled_rate_nonpositive_at_init_warns() {
     let pop = pop_of(&coded_csv());
     // Still accepted by the data check (R1 exists); the warning is the signal.
     assert!(
-        check_model_data(&model, &pop)
-            .iter()
-            .all(|d| d.severity != Severity::Error),
+        check_model_data(&model, &pop).iter().all(|d| d.severity != Severity::Error),
         "non-positive R1 is a warning, not a data error"
     );
     assert!(

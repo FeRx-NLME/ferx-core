@@ -30,12 +30,7 @@ fn three_ctmm_src() -> String {
 }
 
 fn state(time: f64, state: usize, cmt: usize) -> ObsRecord {
-    ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt,
-    }
+    ObsRecord::DiscreteState { time, raw_time: time, state, cmt }
 }
 
 /// Six subjects, each with an irregular state sequence on every one of the three CMTs.
@@ -51,11 +46,7 @@ fn three_ctmm_subjects() -> Vec<Subject> {
                     })
                 })
                 .collect();
-            Subject {
-                id: format!("{}", i + 1),
-                obs_records,
-                ..Default::default()
-            }
+            Subject { id: format!("{}", i + 1), obs_records, ..Default::default() }
         })
         .collect()
 }
@@ -89,22 +80,14 @@ fn ctmm_sums_endpoints_in_ascending_cmt_order() {
     type Path = fn(&CompiledModel, &Subject, &[f64]) -> f64;
     let value: Path = |m, s, theta| ctmm_subject_nll(m, s, theta, &ETA);
     let dual: Path = |m, s, theta| {
-        CtmmTerm {
-            model: m,
-            subject: s,
-        }
-        .eval_shared::<f64>(theta, &ETA, None)
-        .expect("term")
+        CtmmTerm { model: m, subject: s }.eval_shared::<f64>(theta, &ETA, None).expect("term")
     };
     for (label, path) in [("value", value), ("dual term", dual)] {
         let terms: Vec<Vec<f64>> = subjects
             .iter()
             .map(|s| singles.iter().map(|ms| path(ms, s, &theta)).collect())
             .collect();
-        assert!(
-            terms.iter().flatten().all(|t| t.is_finite() && *t < 1e10),
-            "{label}: {terms:?}"
-        );
+        assert!(terms.iter().flatten().all(|t| t.is_finite() && *t < 1e10), "{label}: {terms:?}");
         assert!(
             terms.iter().any(|t| order_sensitive(0.0, t)),
             "{label}: no subject's sum depends on the order: the pin cannot fail"
@@ -169,11 +152,7 @@ fn ctmm_record_refusals_come_in_ascending_cmt_order() {
             .collect()
     };
     for c in [5, 6] {
-        assert_eq!(
-            refused_cmts(&compile_only(&src, c)),
-            vec![c],
-            "CMT {c} alone"
-        );
+        assert_eq!(refused_cmts(&compile_only(&src, c)), vec![c], "CMT {c} alone");
     }
     for k in 0..COMPILES {
         let m = parse_model_string(&src).expect("parse");

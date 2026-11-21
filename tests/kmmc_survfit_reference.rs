@@ -175,38 +175,23 @@ mod kmmc_reference {
         let rows = data();
         let mut worst = 0.0_f64;
         for (label, want) in &reference {
-            let d: Vec<&Data> = rows
-                .iter()
-                .map(|(_, d)| d)
-                .filter(|d| &d.stratum == label)
-                .collect();
+            let d: Vec<&Data> =
+                rows.iter().map(|(_, d)| d).filter(|d| &d.stratum == label).collect();
             let t: Vec<f64> = d.iter().map(|d| d.time).collect();
             let e: Vec<bool> = d.iter().map(|d| d.event).collect();
             for (name, pick) in COVS {
-                let v: Vec<f64> = d
-                    .iter()
-                    .map(|d| if name == "WT" { d.wt } else { d.sex })
-                    .collect();
+                let v: Vec<f64> =
+                    d.iter().map(|d| if name == "WT" { d.wt } else { d.sex }).collect();
                 let c = kaplan_meier_mean_covariate(&t, &e, &v).unwrap();
                 let w = compare(&format!("kernel {label} {name}"), &c, want, pick);
                 assert!(w.is_finite());
                 worst = worst.max(w);
             }
         }
-        let tied = reference
-            .values()
-            .flatten()
-            .filter(|r| r.n_event > 1)
-            .count();
-        let mixed = reference
-            .values()
-            .flatten()
-            .filter(|r| r.n_event > 0 && r.n_censor > 0)
-            .count();
-        assert!(
-            tied >= 10 && mixed >= 5,
-            "fixture lost its ties: {tied} tied, {mixed} mixed"
-        );
+        let tied = reference.values().flatten().filter(|r| r.n_event > 1).count();
+        let mixed =
+            reference.values().flatten().filter(|r| r.n_event > 0 && r.n_censor > 0).count();
+        assert!(tied >= 10 && mixed >= 5, "fixture lost its ties: {tied} tied, {mixed} mixed");
         eprintln!("kmmc kernel vs R: worst |Δmean| = {worst:.3e}");
     }
 
@@ -223,10 +208,7 @@ mod kmmc_reference {
             let mut o = VpcKmmcOptions::new(name);
             o.vpc.n_sim = 20;
             o.vpc.stratify = VpcStratify::Covariate("STRAT".into());
-            o.vpc.sim = SimulateOptions {
-                seed: Some(1),
-                ..Default::default()
-            };
+            o.vpc.sim = SimulateOptions { seed: Some(1), ..Default::default() };
             let r = vpc_kmmc(&model, &p, &model.default_params, &o).unwrap();
             let labels: Vec<&str> = r.strata.iter().map(|s| s.label.as_str()).collect();
             assert_eq!(labels, ["STRAT=0", "STRAT=1"]);

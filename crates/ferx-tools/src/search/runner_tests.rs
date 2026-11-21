@@ -40,9 +40,7 @@ struct Recorder {
 
 impl Recorder {
     fn new() -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-        }
+        Self { calls: Mutex::new(Vec::new()) }
     }
 
     fn record(&self, id: &str) {
@@ -79,10 +77,7 @@ fn two_candidates_with_the_same_canonical_text_are_fitted_once() {
     assert_ne!(a.render(), b.render(), "the fixtures are byte-identical");
     assert_eq!(a.canonical_hash(), b.canonical_hash());
 
-    let candidates = vec![
-        Candidate::new("first", a),
-        Candidate::new("second", b).parent("first"),
-    ];
+    let candidates = vec![Candidate::new("first", a), Candidate::new("second", b).parent("first")];
     let recorder = Recorder::new();
     let report = Runner::new()
         .threads(1)
@@ -105,6 +100,147 @@ fn two_candidates_with_the_same_canonical_text_are_fitted_once() {
     assert!(report.results[0].fit.is_some());
     // Provenance is the duplicate's own, not the representative's.
     assert_eq!(report.results[1].parent.as_deref(), Some("first"));
+}
+
+/// A fit whose objective is NONMEM's SAEM objective (`saem_ofv = saem`, #2973): not a
+/// likelihood, so no AIC/BIC.
+fn saem_objective_fit(ofv: f64) -> ferx_core::types::FitResult {
+    let mut fit = converged_fit(ofv);
+    fit.aic = None;
+    fit.bic = None;
+    fit.saem_objective = Some(ferx_core::types::SaemObjective {
+        kind: ferx_core::types::SaemOfv::Saem,
+        mc_standard_error: None,
+        n_samples: None,
+        n_nodes: None,
+        foce_ofv: ofv + 1000.0,
+    });
+    fit
+}
+
+/// #2973: a candidate whose fit reports the SAEM objective (not a likelihood, so no
+/// information criterion) stops the run with an error that names the fix, under every
+/// criterion; it is never ranked on its non-likelihood objective, and later candidates are
+/// not fitted.
+/// Mutations: drop the `ranks_on_no_likelihood` arm (the run returns Ok and ranks it); drop
+/// the `no_ic` check at the top of `fit_one` (the later candidates are fitted); drop the fix
+/// from the message.
+#[test]
+fn a_fit_without_an_information_criterion_stops_the_run_naming_the_fix() {
+    for criterion in [Criterion::Ofv, Criterion::Aic, Criterion::Bic(BicType::Mixed)] {
+        let candidates = vec![
+            candidate("first", "[parameters]\ntheta CL = 1\n"),
+            candidate("second", "[parameters]\ntheta CL = 2\n"),
+        ];
+        let recorder = Recorder::new();
+        let mut options = lenient();
+        options.criterion = criterion;
+        let err = Runner::new()
+            .threads(1)
+            .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+                recorder.record(&c.id);
+                Ok(saem_objective_fit(100.0))
+            })
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.contains("`first`") && err.contains("saem_ofv = imp"), "{err}");
+        assert_eq!(recorder.ids(), vec!["first"], "the run did not stop");
+    }
+    // Control: with criteria present the same candidates rank.
+    let candidates = vec![candidate("first", "[parameters]\ntheta CL = 1\n")];
+    let report = Runner::new()
+        .threads(1)
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(100.0))
+        })
+        .expect("a fit with criteria is ranked");
+    assert_eq!(report.results.len(), 1);
+}
+
+/// #2973 review: a fit with no information criterion for another reason (a non-SAEM fit whose
+/// objective came back non-finite) is judged as before — it fails the gate or ranks last —
+/// and does not abort the whole search with advice about `saem_ofv`.
+/// Mutation: key the stop on `aic.is_none()` instead of the SAEM objective (the run errs).
+#[test]
+fn a_non_saem_fit_without_an_information_criterion_does_not_stop_the_run() {
+    let candidates = vec![
+        candidate("first", "[parameters]\ntheta CL = 1\n"),
+        candidate("second", "[parameters]\ntheta CL = 2\n"),
+    ];
+    let options = RunOptions { criterion: Criterion::Aic, ..lenient() };
+    let report = Runner::new()
+        .threads(1)
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            let mut fit = converged_fit(100.0);
+            if c.id == "first" {
+                fit.ofv = f64::NAN;
+                fit.converged = false;
+                fit.aic = None;
+                fit.bic = None;
+            }
+            Ok(fit)
+        })
+        .expect("a divergent candidate does not abort the search");
+    assert_eq!(report.results.len(), 2);
+    assert!(report.results[0].criterion.is_nan());
+    assert_eq!(report.results[1].criterion, 102.0);
+}
+
+/// #2973 review: a SAEM-objective fit reused from another search directory, or read back on
+/// a resume, meets the same rule as a fresh one: the run stops rather than ranking it.
+/// Mutations: drop the guard on the foreign loop (the reuse run returns Ok); drop the guard
+/// on the resumed rows (the resume run returns Ok).
+#[test]
+fn a_reused_or_resumed_saem_objective_fit_stops_the_run() {
+    // Seed a directory with ordinary fits, then rewrite their cached files as SAEM-objective
+    // fits: what a cache written before this rule (or by another tool) can hold.
+    let seed = |dir: &std::path::Path| -> Vec<Candidate> {
+        let seeded = seed_dir(dir, &["a"], Criterion::Ofv);
+        let fits = crate::search::journal::fits_dir(dir);
+        for entry in std::fs::read_dir(&fits).expect("fits dir") {
+            let path = entry.expect("entry").path();
+            let text = std::fs::read_to_string(&path).expect("read fit");
+            let mut fit = ferx_core::types::FitResult::from_json_str(&text).expect("parse fit");
+            fit.aic = None;
+            fit.bic = None;
+            fit.saem_objective = saem_objective_fit(fit.ofv).saem_objective;
+            std::fs::write(&path, serde_json::to_string(&fit).expect("ser")).expect("write");
+        }
+        seeded
+    };
+
+    // Reused from another directory.
+    let other = tempfile::tempdir().expect("tempdir");
+    let seeded = seed(other.path());
+    let err = Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &lenient(), |_, _| Ok(converged_fit(100.0)))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("`a`") && err.contains("saem_ofv = imp"), "{err}");
+
+    // Resumed from this run's own directory.
+    let own = tempfile::tempdir().expect("tempdir");
+    let seeded = seed(own.path());
+    let options = RunOptions { resume: true, ..lenient() };
+    let err = Runner::new()
+        .threads(1)
+        .cache_dir(own.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &options, |_, _| Ok(converged_fit(100.0)))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("`a`") && err.contains("saem_ofv = imp"), "{err}");
+}
+
+// A fit with no criterion scores NaN under `Criterion::Aic` and every BIC type, never 0.
+#[test]
+fn criteria_of_a_fit_without_aic_bic_are_nan() {
+    let mut fit = converged_fit(100.0);
+    fit.aic = None;
+    fit.bic = None;
+    assert!(Criterion::Aic.of(&fit).is_nan());
+    assert!(Criterion::Bic(BicType::Mixed).of(&fit).is_nan());
 }
 
 #[test]
@@ -155,11 +291,7 @@ struct Gauge {
 
 impl Gauge {
     fn new() -> Self {
-        Self {
-            live: AtomicUsize::new(0),
-            max: AtomicUsize::new(0),
-            paired: AtomicBool::new(false),
-        }
+        Self { live: AtomicUsize::new(0), max: AtomicUsize::new(0), paired: AtomicBool::new(false) }
     }
 
     /// Enter, dwell for the **whole** of `dwell`, and leave.
@@ -229,11 +361,7 @@ fn a_single_thread_budget_serialises_the_fits() {
         })
         .expect("run");
 
-    assert_eq!(
-        gauge.max.load(Ordering::SeqCst),
-        1,
-        "a `threads = 1` run overlapped its fits"
-    );
+    assert_eq!(gauge.max.load(Ordering::SeqCst), 1, "a `threads = 1` run overlapped its fits");
     assert!(!gauge.paired.load(Ordering::SeqCst));
 }
 
@@ -248,15 +376,10 @@ fn the_inner_fit_is_pinned_to_the_plans_share_of_the_budget() {
     let seen = Mutex::new(Vec::new());
     Runner::new()
         .threads(2)
-        .run_with_fitter(
-            &candidates,
-            &population(&["1"]),
-            &lenient(),
-            |_, threads| {
-                seen.lock().unwrap().push(threads);
-                Ok(converged_fit(10.0))
-            },
-        )
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, threads| {
+            seen.lock().unwrap().push(threads);
+            Ok(converged_fit(10.0))
+        })
         .expect("run");
     assert_eq!(seen.lock().unwrap().as_slice(), &[1, 1, 1, 1, 1, 1]);
 
@@ -284,10 +407,7 @@ fn a_candidate_failing_strictness_keeps_its_reasons() {
     ];
     let options = RunOptions {
         criterion: Criterion::Ofv,
-        strictness: Strictness {
-            require_converged: true,
-            ..Strictness::none()
-        },
+        strictness: Strictness { require_converged: true, ..Strictness::none() },
         ..lenient()
     };
     let report = Runner::new()
@@ -319,9 +439,7 @@ fn a_failed_fit_is_reported_with_its_error() {
     let candidates = vec![candidate("broken", "[parameters]\ntheta CL = 1\n")];
     let report = Runner::new()
         .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
-            Err(CandidateError::model(
-                "does not compile: unknown block `[wat]`",
-            ))
+            Err(CandidateError::model("does not compile: unknown block `[wat]`"))
         })
         .expect("run");
 
@@ -345,10 +463,7 @@ fn best_is_the_lowest_criterion_among_eligible_candidates() {
         .collect();
     let options = RunOptions {
         criterion: Criterion::Bic(BicType::Fixed),
-        strictness: Strictness {
-            require_converged: true,
-            ..Strictness::none()
-        },
+        strictness: Strictness { require_converged: true, ..Strictness::none() },
         ..lenient()
     };
     let report = Runner::new()
@@ -419,9 +534,7 @@ fn a_pre_run_cancel_does_not_truncate_an_existing_journal() {
     let runner = Runner::new().threads(1).cache_dir(dir.path());
     let mut options = lenient();
     runner
-        .run_with_fitter(&candidates, &population(&["1"]), &options, |_, _| {
-            Ok(converged_fit(7.0))
-        })
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |_, _| Ok(converged_fit(7.0)))
         .expect("first run");
     let before = std::fs::read_to_string(journal::journal_path(dir.path())).expect("journal");
     assert!(!before.trim().is_empty());
@@ -446,9 +559,7 @@ fn a_pre_run_cancel_does_not_truncate_an_existing_journal() {
 
 /// Run `ids` through a fresh runner over `dir`, returning what it fitted.
 fn run_over(
-    dir: &std::path::Path,
-    candidates: &[Candidate],
-    options: &RunOptions,
+    dir: &std::path::Path, candidates: &[Candidate], options: &RunOptions,
 ) -> (RunReport, Vec<String>) {
     let recorder = Recorder::new();
     let report = Runner::new()
@@ -476,10 +587,7 @@ fn a_resumed_run_refits_nothing_already_journalled() {
 
     let mut second = first.clone();
     second.push(candidate("ccc", "[parameters]\ntheta CL = 3\n"));
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let (resumed, fitted) = run_over(dir.path(), &second, &options);
 
     assert_eq!(fitted, vec!["ccc"], "a journalled candidate was refitted");
@@ -507,10 +615,7 @@ fn a_resumed_run_matches_on_the_canonical_hash_not_the_id() {
     let (_, fitted) = run_over(dir.path(), &[Candidate::new("step1", a)], &lenient());
     assert_eq!(fitted, vec!["step1"]);
 
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let (resumed, fitted) = run_over(dir.path(), &[Candidate::new("step2", b)], &options);
     assert!(fitted.is_empty(), "the same model was fitted twice");
     assert_eq!(resumed.reused, 1);
@@ -542,10 +647,7 @@ fn a_resumed_row_is_rejudged_from_its_cached_fit_not_from_its_journalled_verdict
         candidate("ccc", "[parameters]\ntheta CL = 3\n"),
     ];
     let options = RunOptions {
-        strictness: Strictness {
-            require_converged: true,
-            ..Strictness::none()
-        },
+        strictness: Strictness { require_converged: true, ..Strictness::none() },
         ..lenient()
     };
     let (first, fitted) = run_over(dir.path(), &candidates, &options);
@@ -582,24 +684,15 @@ fn a_resumed_row_is_rejudged_from_its_cached_fit_not_from_its_journalled_verdict
     // …and `ccc` has no cached fit to re-judge.
     std::fs::remove_file(journal::fit_path(dir.path(), &first.results[2].hash)).expect("rm");
 
-    let resumed_options = RunOptions {
-        resume: true,
-        ..options
-    };
+    let resumed_options = RunOptions { resume: true, ..options };
     let (resumed, fitted) = run_over(dir.path(), &candidates, &resumed_options);
-    assert!(
-        fitted.is_empty(),
-        "a journalled candidate was refitted: {fitted:?}"
-    );
+    assert!(fitted.is_empty(), "a journalled candidate was refitted: {fitted:?}");
     assert_eq!((resumed.fitted, resumed.reused), (0, 3));
 
     let [a, bb, ccc] = resumed.results.as_slice() else {
         panic!("expected three results, got {}", resumed.results.len());
     };
-    assert!(
-        a.fit.is_some() && bb.fit.is_some(),
-        "the cached fits came along"
-    );
+    assert!(a.fit.is_some() && bb.fit.is_some(), "the cached fits came along");
     assert!(
         a.verdict.passed && a.verdict.failures.is_empty(),
         "`a` carried its journalled verdict instead of its fit's: {:?}",
@@ -640,10 +733,7 @@ fn a_truncated_final_journal_line_costs_one_refit_and_no_more() {
     lines[1] = cut;
     std::fs::write(&path, lines.join("\n")).expect("truncate");
 
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let (resumed, fitted) = run_over(dir.path(), &candidates, &options);
     assert_eq!(fitted, vec!["bb"], "the intact row was not reused");
     assert_eq!((resumed.fitted, resumed.reused), (1, 1));
@@ -660,11 +750,8 @@ fn a_resume_against_a_different_criterion_is_refused() {
     let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
     run_over(dir.path(), &candidates, &lenient());
 
-    let options = RunOptions {
-        resume: true,
-        criterion: Criterion::Bic(BicType::Mixed),
-        ..lenient()
-    };
+    let options =
+        RunOptions { resume: true, criterion: Criterion::Bic(BicType::Mixed), ..lenient() };
     let err = expect_refusal(
         Runner::new().cache_dir(dir.path()).run_with_fitter(
             &candidates,
@@ -674,10 +761,7 @@ fn a_resume_against_a_different_criterion_is_refused() {
         ),
         "resuming under another criterion must be refused",
     );
-    assert!(
-        err.contains("ranking criterion"),
-        "unhelpful message: {err}"
-    );
+    assert!(err.contains("ranking criterion"), "unhelpful message: {err}");
 }
 
 #[test]
@@ -686,10 +770,7 @@ fn a_resume_against_a_different_dataset_is_refused() {
     let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
     run_over(dir.path(), &candidates, &lenient());
 
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let err = expect_refusal(
         Runner::new().cache_dir(dir.path()).run_with_fitter(
             &candidates,
@@ -720,24 +801,19 @@ fn a_resume_against_the_same_shaped_but_edited_dataset_is_refused() {
     Runner::new()
         .threads(1)
         .cache_dir(dir.path())
-        .run_with_fitter(&candidates, &data, &lenient(), |_, _| {
-            Ok(converged_fit(1.0))
-        })
+        .run_with_fitter(&candidates, &data, &lenient(), |_, _| Ok(converged_fit(1.0)))
         .expect("first run");
 
     let mut edited = data.clone();
     edited.subjects[1].observations[0] = 5.6;
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let err = expect_refusal(
-        Runner::new()
-            .threads(1)
-            .cache_dir(dir.path())
-            .run_with_fitter(&candidates, &edited, &options, |_, _| {
-                Ok(converged_fit(1.0))
-            }),
+        Runner::new().threads(1).cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &edited,
+            &options,
+            |_, _| Ok(converged_fit(1.0)),
+        ),
         "resuming against edited data must be refused",
     );
     assert!(err.contains("dataset"), "unhelpful message: {err}");
@@ -745,10 +821,7 @@ fn a_resume_against_the_same_shaped_but_edited_dataset_is_refused() {
     // The premise, so the test cannot pass for the wrong reason: the edit did
     // not change the shape the old fingerprint saw.
     assert_eq!(edited.subjects.len(), data.subjects.len());
-    assert_eq!(
-        edited.subjects[1].observations.len(),
-        data.subjects[1].observations.len()
-    );
+    assert_eq!(edited.subjects[1].observations.len(), data.subjects[1].observations.len());
 }
 
 #[test]
@@ -762,11 +835,7 @@ fn a_resume_under_different_fit_settings_is_refused() {
     let with = |method: EstimationMethod, resume: bool| {
         let mut fit_options = FitOptions::default();
         fit_options.method = method;
-        RunOptions {
-            fit_options: Some(fit_options),
-            resume,
-            ..lenient()
-        }
+        RunOptions { fit_options: Some(fit_options), resume, ..lenient() }
     };
 
     Runner::new()
@@ -781,15 +850,12 @@ fn a_resume_under_different_fit_settings_is_refused() {
         .expect("first run");
 
     let err = expect_refusal(
-        Runner::new()
-            .threads(1)
-            .cache_dir(dir.path())
-            .run_with_fitter(
-                &candidates,
-                &population(&["1"]),
-                &with(EstimationMethod::Saem, true),
-                |_, _| Ok(converged_fit(1.0)),
-            ),
+        Runner::new().threads(1).cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &population(&["1"]),
+            &with(EstimationMethod::Saem, true),
+            |_, _| Ok(converged_fit(1.0)),
+        ),
         "resuming under other fit settings must be refused",
     );
     assert!(err.contains("fit settings"), "unhelpful message: {err}");
@@ -819,11 +885,7 @@ fn without_resume_the_journal_is_started_over() {
     run_over(dir.path(), &candidates, &lenient());
     let (report, fitted) = run_over(dir.path(), &candidates, &lenient());
 
-    assert_eq!(
-        fitted,
-        vec!["a"],
-        "an unrequested resume reused a candidate"
-    );
+    assert_eq!(fitted, vec!["a"], "an unrequested resume reused a candidate");
     assert_eq!(report.reused, 0);
     assert_eq!(
         journal::read_records(&journal::journal_path(dir.path())).len(),
@@ -845,25 +907,20 @@ fn every_candidate_appears_in_the_table_in_submission_order() {
         candidate("broken", "[parameters]\ntheta CL = 8\n"),
     ];
     let options = RunOptions {
-        strictness: Strictness {
-            require_converged: true,
-            ..Strictness::none()
-        },
+        strictness: Strictness { require_converged: true, ..Strictness::none() },
         ..lenient()
     };
     Runner::new()
         .threads(1)
         .cache_dir(dir.path())
-        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
-            match c.id.as_str() {
-                "broken" => Err(CandidateError::model("the model does not compile")),
-                "bad" => {
-                    let mut result = converged_fit(3.0);
-                    result.converged = false;
-                    Ok(result)
-                }
-                _ => Ok(converged_fit(1.0)),
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| match c.id.as_str() {
+            "broken" => Err(CandidateError::model("the model does not compile")),
+            "bad" => {
+                let mut result = converged_fit(3.0);
+                result.converged = false;
+                Ok(result)
             }
+            _ => Ok(converged_fit(1.0)),
         })
         .expect("run");
 
@@ -978,10 +1035,7 @@ fn a_cancelled_run_does_not_overwrite_the_table_it_resumed() {
         })
         .expect("a cancelled run still reports");
     assert!(report.cancelled);
-    assert!(
-        report.results.len() < 3,
-        "the run was not actually cut short"
-    );
+    assert!(report.results.len() < 3, "the run was not actually cut short");
 
     assert_eq!(
         std::fs::read_to_string(output::table_path(dir.path())).expect("table"),
@@ -1018,20 +1072,15 @@ fn first_run_over(dir: &std::path::Path, candidates: &[Candidate]) -> RunReport 
     Runner::new()
         .threads(1)
         .cache_dir(dir)
-        .run_with_fitter(
-            candidates,
-            &population(&["1"]),
-            &lenient(),
-            |c, _| match c.id.as_str() {
-                "flaky" => Err(CandidateError::environment(
-                    "cannot build the fit pool: Resource temporarily unavailable",
-                )),
-                "broken" => Err(CandidateError::model(
-                    "candidate `broken` does not compile: unknown block `[wat]`",
-                )),
-                _ => Ok(converged_fit(1.0)),
-            },
-        )
+        .run_with_fitter(candidates, &population(&["1"]), &lenient(), |c, _| match c.id.as_str() {
+            "flaky" => Err(CandidateError::environment(
+                "cannot build the fit pool: Resource temporarily unavailable",
+            )),
+            "broken" => Err(CandidateError::model(
+                "candidate `broken` does not compile: unknown block `[wat]`",
+            )),
+            _ => Ok(converged_fit(1.0)),
+        })
         .expect("first run")
 }
 
@@ -1051,16 +1100,10 @@ fn a_resume_refits_an_environment_failure_and_trusts_a_model_failure() {
     let first = first_run_over(dir.path(), &candidates);
     assert_eq!(first.results.len(), 3);
     assert!(first.results[1].error.as_ref().is_some_and(|e| e.retryable));
-    assert!(first.results[2]
-        .error
-        .as_ref()
-        .is_some_and(|e| !e.retryable));
+    assert!(first.results[2].error.as_ref().is_some_and(|e| !e.retryable));
 
     let recorder = Recorder::new();
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let second = Runner::new()
         .threads(1)
         .cache_dir(dir.path())
@@ -1070,11 +1113,7 @@ fn a_resume_refits_an_environment_failure_and_trusts_a_model_failure() {
         })
         .expect("resumed run");
 
-    assert_eq!(
-        recorder.ids(),
-        vec!["flaky"],
-        "the resume refit the wrong set"
-    );
+    assert_eq!(recorder.ids(), vec!["flaky"], "the resume refit the wrong set");
     assert_eq!((second.fitted, second.reused), (1, 2));
     assert!(second.results[1].error.is_none());
     assert_eq!(second.results[1].ofv, Some(2.0));
@@ -1123,10 +1162,7 @@ fn a_journal_row_written_before_the_flag_existed_is_refitted() {
     std::fs::write(&path, aged).expect("write");
 
     let recorder = Recorder::new();
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     Runner::new()
         .threads(1)
         .cache_dir(dir.path())
@@ -1184,19 +1220,16 @@ fn a_second_run_over_a_live_directory_is_refused_by_name() {
     let held = journal::DirLock::acquire(dir.path()).expect("lock");
 
     let err = expect_refusal(
-        Runner::new()
-            .threads(1)
-            .cache_dir(dir.path())
-            .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
-                panic!("nothing may be fitted while the directory is held")
-            }),
+        Runner::new().threads(1).cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &population(&["1"]),
+            &lenient(),
+            |_, _| panic!("nothing may be fitted while the directory is held"),
+        ),
         "a second run over a live directory must be refused",
     );
     assert!(err.contains("already in use"), "unhelpful message: {err}");
-    assert!(
-        err.contains("delete"),
-        "the message does not say how to clear a stale lock: {err}"
-    );
+    assert!(err.contains("delete"), "the message does not say how to clear a stale lock: {err}");
 
     // Releasing it lets the next run through, so the lock is not a one-way door.
     drop(held);
@@ -1207,10 +1240,7 @@ fn a_second_run_over_a_live_directory_is_refused_by_name() {
             Ok(converged_fit(1.0))
         })
         .expect("run after the lock was released");
-    assert!(
-        !journal::lock_path(dir.path()).exists(),
-        "the run kept the lock"
-    );
+    assert!(!journal::lock_path(dir.path()).exists(), "the run kept the lock");
 }
 
 #[test]
@@ -1225,9 +1255,8 @@ fn a_lock_left_behind_by_a_dead_process_is_taken_over() {
     // A pid that is not running. Spawning and reaping a real process is what
     // makes this a *dead* pid rather than one that was never alive, which the
     // takeover has to treat the same way but which a reader could dismiss.
-    let mut corpse = std::process::Command::new("true")
-        .spawn()
-        .expect("spawn a process to outlive");
+    let mut corpse =
+        std::process::Command::new("true").spawn().expect("spawn a process to outlive");
     let dead = corpse.id();
     corpse.wait().expect("reap");
     std::fs::create_dir_all(dir.path()).expect("dir");
@@ -1245,18 +1274,15 @@ fn a_lock_left_behind_by_a_dead_process_is_taken_over() {
 
     // The other side of the predicate: *this* process is running, so its lock
     // is not stale and the same code path refuses instead of stealing.
-    std::fs::write(
-        journal::lock_path(dir.path()),
-        format!("pid {}\n", std::process::id()),
-    )
-    .expect("live lock");
+    std::fs::write(journal::lock_path(dir.path()), format!("pid {}\n", std::process::id()))
+        .expect("live lock");
     let err = expect_refusal(
-        Runner::new()
-            .threads(1)
-            .cache_dir(dir.path())
-            .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
-                Ok(converged_fit(1.0))
-            }),
+        Runner::new().threads(1).cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &population(&["1"]),
+            &lenient(),
+            |_, _| Ok(converged_fit(1.0)),
+        ),
         "a live owner must not be stolen from",
     );
     assert!(err.contains("already in use"), "unhelpful message: {err}");
@@ -1289,28 +1315,18 @@ fn a_run_refused_after_it_took_the_lock_still_releases_it() {
     let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
     run_over(dir.path(), &candidates, &lenient());
 
-    let options = RunOptions {
-        criterion: Criterion::Aic,
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { criterion: Criterion::Aic, resume: true, ..lenient() };
     let err = expect_refusal(
-        Runner::new()
-            .threads(1)
-            .cache_dir(dir.path())
-            .run_with_fitter(&candidates, &population(&["1"]), &options, |_, _| {
-                Ok(converged_fit(1.0))
-            }),
+        Runner::new().threads(1).cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &population(&["1"]),
+            &options,
+            |_, _| Ok(converged_fit(1.0)),
+        ),
         "an incompatible resume must be refused",
     );
-    assert!(
-        err.contains("ranking criterion"),
-        "unhelpful message: {err}"
-    );
-    assert!(
-        !journal::lock_path(dir.path()).exists(),
-        "a refused run left the directory locked"
-    );
+    assert!(err.contains("ranking criterion"), "unhelpful message: {err}");
+    assert!(!journal::lock_path(dir.path()).exists(), "a refused run left the directory locked");
 }
 
 /// A per-candidate start override is part of the identity, so two candidates
@@ -1322,10 +1338,7 @@ fn a_run_refused_after_it_took_the_lock_still_releases_it() {
 fn candidates_that_differ_only_in_their_start_count_are_each_fitted() {
     let (a, b) = same_model_two_ways();
     assert_eq!(a.canonical_hash(), b.canonical_hash());
-    let candidates = vec![
-        Candidate::new("cheap", a),
-        Candidate::new("thorough", b).starts(7),
-    ];
+    let candidates = vec![Candidate::new("cheap", a), Candidate::new("thorough", b).starts(7)];
     assert_ne!(candidates[0].hash(), candidates[1].hash());
     let recorder = Recorder::new();
     let seen = Mutex::new(Vec::new());
@@ -1359,18 +1372,11 @@ fn candidates_that_differ_only_in_their_start_count_are_each_fitted() {
 fn a_resume_after_raising_the_start_override_refits_rather_than_reusing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let text = "[parameters]\ntheta CL = 1\n";
-    let (first, fitted) = run_over(
-        dir.path(),
-        &[candidate("block", text).starts(3)],
-        &lenient(),
-    );
+    let (first, fitted) = run_over(dir.path(), &[candidate("block", text).starts(3)], &lenient());
     assert_eq!(fitted, vec!["block"]);
     assert_eq!(first.fitted, 1);
 
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     // Same model, same run-wide options, more starts: the manifest is
     // compatible and the *text* is unchanged, so only the candidate's own
     // hash can tell these apart.
@@ -1398,12 +1404,7 @@ fn a_resume_after_raising_the_start_override_refits_rather_than_reusing() {
 #[test]
 fn candidates_of_unequal_cost_are_planned_separately_heaviest_first() {
     let mut candidates: Vec<Candidate> = (0..4)
-        .map(|i| {
-            candidate(
-                &format!("cheap{i}"),
-                &format!("[parameters]\ntheta CL = {i}\n"),
-            )
-        })
+        .map(|i| candidate(&format!("cheap{i}"), &format!("[parameters]\ntheta CL = {i}\n")))
         .collect();
     candidates.push(candidate("heavy", "[parameters]\ntheta CL = 9\n").cost(40.0));
 
@@ -1420,15 +1421,8 @@ fn candidates_of_unequal_cost_are_planned_separately_heaviest_first() {
     let seen = seen.lock().unwrap().clone();
     // The heavy group is one candidate over a four-thread budget, so it gets
     // all four; the four cheap ones then run one thread each.
-    let heavy = seen
-        .iter()
-        .find(|(id, _)| id == "heavy")
-        .expect("heavy ran");
-    assert_eq!(
-        heavy.1, 4,
-        "the heavy candidate ran with {} threads",
-        heavy.1
-    );
+    let heavy = seen.iter().find(|(id, _)| id == "heavy").expect("heavy ran");
+    assert_eq!(heavy.1, 4, "the heavy candidate ran with {} threads", heavy.1);
     for (id, threads) in &seen {
         if id != "heavy" {
             assert_eq!(*threads, 1, "{id} ran with {threads} threads");
@@ -1480,10 +1474,7 @@ fn candidates_sharing_a_cost_share_a_group() {
             Ok(converged_fit(10.0))
         })
         .expect("run");
-    assert!(
-        gauge.paired.load(Ordering::SeqCst),
-        "two candidates of one cost were serialised"
-    );
+    assert!(gauge.paired.load(Ordering::SeqCst), "two candidates of one cost were serialised");
 }
 
 /// A candidate's own start count is a floor under the run's, not a
@@ -1492,10 +1483,7 @@ fn candidates_sharing_a_cost_share_a_group() {
 /// count it computes is not observable on a `FitResult`.
 #[test]
 fn a_per_candidate_start_count_is_a_floor_under_the_runs() {
-    let options = RunOptions {
-        n_starts: 5,
-        ..lenient()
-    };
+    let options = RunOptions { n_starts: 5, ..lenient() };
     let plain = candidate("plain", "[parameters]\ntheta CL = 1\n");
     assert_eq!(effective_starts(&plain, &options), 5);
     assert_eq!(
@@ -1505,10 +1493,7 @@ fn a_per_candidate_start_count_is_a_floor_under_the_runs() {
     );
     assert_eq!(effective_starts(&plain.clone().starts(9), &options), 9);
     // …and a run that asks for none still fits once.
-    let none = RunOptions {
-        n_starts: 0,
-        ..lenient()
-    };
+    let none = RunOptions { n_starts: 0, ..lenient() };
     assert_eq!(effective_starts(&plain, &none), 1);
     assert_eq!(effective_starts(&plain.starts(4), &none), 4);
 }
@@ -1522,10 +1507,7 @@ fn seed_dir(dir: &std::path::Path, ids: &[&str], criterion: Criterion) -> Vec<Ca
         .iter()
         .map(|id| candidate(id, &format!("[parameters]\ntheta CL = {}\n", id.len())))
         .collect();
-    let options = RunOptions {
-        criterion,
-        ..lenient()
-    };
+    let options = RunOptions { criterion, ..lenient() };
     let report = Runner::new()
         .threads(1)
         .cache_dir(dir)
@@ -1549,10 +1531,7 @@ fn a_run_reuses_fits_from_another_directory_and_rescores_them() {
     // adds one, pointed at the tool's *root* directory.
     let mut candidates = vec![seeded[1].clone()];
     candidates.push(candidate("ccc", "[parameters]\ntheta CL = 3\n"));
-    let options = RunOptions {
-        criterion: Criterion::Aic,
-        ..lenient()
-    };
+    let options = RunOptions { criterion: Criterion::Aic, ..lenient() };
     let recorder = Recorder::new();
     let report = Runner::new()
         .threads(1)
@@ -1562,11 +1541,7 @@ fn a_run_reuses_fits_from_another_directory_and_rescores_them() {
             Ok(converged_fit(100.0 + c.id.len() as f64))
         })
         .expect("run");
-    assert_eq!(
-        recorder.ids(),
-        vec!["ccc"],
-        "the shared candidate was refitted"
-    );
+    assert_eq!(recorder.ids(), vec!["ccc"], "the shared candidate was refitted");
     assert_eq!((report.fitted, report.reused), (1, 1));
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     let bb = &report.results[0];
@@ -1574,7 +1549,7 @@ fn a_run_reuses_fits_from_another_directory_and_rescores_them() {
     assert_eq!(bb.ofv, Some(102.0));
     // Re-scored under *this* run's criterion, not carried over from the
     // other run's OFV ranking.
-    assert_eq!(bb.criterion, converged_fit(102.0).aic);
+    assert_eq!(bb.criterion, converged_fit(102.0).aic.unwrap());
     assert!(bb.fit.is_some(), "the cached fit came along");
     assert!(bb.verdict.passed);
     assert!(!report.results[1].reused);
@@ -1598,10 +1573,7 @@ fn a_reused_fit_is_journalled_as_the_runs_own_and_a_later_resume_needs_no_other_
 
     // The other directory can go; the run's own journal carries the fit.
     drop(other);
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let report = Runner::new()
         .threads(1)
         .cache_dir(own.path())
@@ -1620,10 +1592,7 @@ fn a_directory_whose_fits_are_not_this_runs_is_skipped_with_a_warning() {
 
     // A different start count: the same model text fitted from a
     // different number of starts is a different number.
-    let options = RunOptions {
-        n_starts: 3,
-        ..lenient()
-    };
+    let options = RunOptions { n_starts: 3, ..lenient() };
     let recorder = Recorder::new();
     let report = Runner::new()
         .threads(1)
@@ -1655,26 +1624,17 @@ fn a_directory_whose_fits_are_not_this_runs_is_skipped_with_a_warning() {
         })
         .expect("run");
     assert_eq!(recorder.ids(), vec!["a"]);
-    assert!(
-        report.warnings.iter().any(|w| w.contains("the dataset")),
-        "{:?}",
-        report.warnings
-    );
+    assert!(report.warnings.iter().any(|w| w.contains("the dataset")), "{:?}", report.warnings);
 
     // A directory with no search in it at all.
     let empty = tempfile::tempdir().expect("tempdir");
     let report = Runner::new()
         .threads(1)
         .reuse_from(empty.path())
-        .run_with_fitter(&seeded, &population(&["1"]), &lenient(), |_, _| {
-            Ok(converged_fit(1.0))
-        })
+        .run_with_fitter(&seeded, &population(&["1"]), &lenient(), |_, _| Ok(converged_fit(1.0)))
         .expect("run");
     assert!(
-        report
-            .warnings
-            .iter()
-            .any(|w| w.contains("no search directory found")),
+        report.warnings.iter().any(|w| w.contains("no search directory found")),
         "{:?}",
         report.warnings
     );
@@ -1689,49 +1649,33 @@ fn a_model_failure_row_is_reused_only_under_the_same_scoring_and_the_own_journal
     Runner::new()
         .threads(1)
         .cache_dir(other.path())
-        .run_with_fitter(
-            std::slice::from_ref(&broken),
-            &population(&["1"]),
-            &lenient(),
-            |_, _| Err(CandidateError::model("does not compile")),
-        )
+        .run_with_fitter(std::slice::from_ref(&broken), &population(&["1"]), &lenient(), |_, _| {
+            Err(CandidateError::model("does not compile"))
+        })
         .expect("seed");
 
     let recorder = Recorder::new();
     let report = Runner::new()
         .threads(1)
         .reuse_from(other.path())
-        .run_with_fitter(
-            std::slice::from_ref(&broken),
-            &population(&["1"]),
-            &lenient(),
-            |c, _| {
-                recorder.record(&c.id);
-                Err(CandidateError::model("does not compile"))
-            },
-        )
+        .run_with_fitter(std::slice::from_ref(&broken), &population(&["1"]), &lenient(), |c, _| {
+            recorder.record(&c.id);
+            Err(CandidateError::model("does not compile"))
+        })
         .expect("run");
     assert!(recorder.ids().is_empty(), "the model failure was trusted");
     assert!(report.results[0].reused);
     assert!(report.results[0].error.is_some());
 
     let recorder = Recorder::new();
-    let options = RunOptions {
-        criterion: Criterion::Aic,
-        ..lenient()
-    };
+    let options = RunOptions { criterion: Criterion::Aic, ..lenient() };
     Runner::new()
         .threads(1)
         .reuse_from(other.path())
-        .run_with_fitter(
-            std::slice::from_ref(&broken),
-            &population(&["1"]),
-            &options,
-            |c, _| {
-                recorder.record(&c.id);
-                Err(CandidateError::model("does not compile"))
-            },
-        )
+        .run_with_fitter(std::slice::from_ref(&broken), &population(&["1"]), &options, |c, _| {
+            recorder.record(&c.id);
+            Err(CandidateError::model("does not compile"))
+        })
         .expect("run");
     assert_eq!(
         recorder.ids(),
@@ -1744,10 +1688,7 @@ fn a_model_failure_row_is_reused_only_under_the_same_scoring_and_the_own_journal
     let a = seed_dir(own.path(), &["a"], Criterion::Ofv);
     let foreign = tempfile::tempdir().expect("tempdir");
     seed_dir(foreign.path(), &["a"], Criterion::Ofv);
-    let options = RunOptions {
-        resume: true,
-        ..lenient()
-    };
+    let options = RunOptions { resume: true, ..lenient() };
     let report = Runner::new()
         .threads(1)
         .cache_dir(own.path())
@@ -1775,10 +1716,7 @@ fn a_pre_run_cancel_keeps_what_the_reuse_directories_said() {
         .expect("run");
     assert!(report.cancelled);
     assert!(
-        report
-            .warnings
-            .iter()
-            .any(|w| w.contains("no search directory found")),
+        report.warnings.iter().any(|w| w.contains("no search directory found")),
         "{:?}",
         report.warnings
     );
@@ -1796,10 +1734,7 @@ impl Observed {
 
     fn sink(&self) -> impl Fn(&CandidateResult) + Sync + '_ {
         |r: &CandidateResult| {
-            self.0
-                .lock()
-                .unwrap()
-                .push((r.id.clone(), r.reused, r.duplicate_of.clone()))
+            self.0.lock().unwrap().push((r.id.clone(), r.reused, r.duplicate_of.clone()))
         }
     }
 
@@ -1876,10 +1811,7 @@ fn the_observer_hears_journalled_and_foreign_outcomes_as_reused() {
         .run_with_fitter_observed(
             &candidates,
             &population(&["1"]),
-            &RunOptions {
-                resume: true,
-                ..lenient()
-            },
+            &RunOptions { resume: true, ..lenient() },
             |_, _| Ok(converged_fit(100.0)),
             &sink,
         )
@@ -1948,10 +1880,7 @@ fn a_runner_fitter_tags_each_candidate_with_its_step() {
         on_candidate: Some(&sink),
     };
     let report = fitter.fit_step("forward-3", &candidates).expect("run");
-    let error = report.results[0]
-        .error
-        .clone()
-        .expect("premise: no compile");
+    let error = report.results[0].error.clone().expect("premise: no compile");
 
     let seen = seen.into_inner().unwrap();
     assert_eq!(seen.len(), 1);
@@ -1963,9 +1892,7 @@ fn a_runner_fitter_tags_each_candidate_with_its_step() {
     assert_eq!(c.ofv, None);
     assert_eq!(c.criterion, None);
     assert!(
-        c.failed_gate
-            .as_deref()
-            .is_some_and(|g| g.contains(&error.message)),
+        c.failed_gate.as_deref().is_some_and(|g| g.contains(&error.message)),
         "{:?} does not carry {:?}",
         c.failed_gate,
         error.message

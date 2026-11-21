@@ -61,8 +61,7 @@ const WARFARIN_F: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// [`WARFARIN_F`] with a two-class `[mixture]`, so `optimizer = auto` resolves to BOBYQA
-/// via `resolve_outer_optimizer` while `gradient_method_outer` still reports analytic.
+/// [`WARFARIN_F`] with a two-class `[mixture]`.
 const MIXTURE_F: &str = r#"
 [parameters]
   theta TVCL1(0.15, 0.001, 10.0)
@@ -101,9 +100,7 @@ const MIXTURE_F: &str = r#"
 /// this while a dropped call does. (Not on the salvage's name: since #1529 that differs
 /// between the non-IOV held-EBE and the IOV reconverged routes.)
 fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
-    warnings
-        .iter()
-        .find(|w| w.contains("could not be given the exact analytic outer gradient"))
+    warnings.iter().find(|w| w.contains("could not be given the exact analytic outer gradient"))
 }
 
 /// The same population with subject 0's bolus replaced by a steady-state infusion — the
@@ -146,13 +143,9 @@ fn one_gradient_eval_options() -> FitOptions {
 #[test]
 fn in_scope_population_emits_no_outer_fd_warning() {
     let (model, population) = fixture();
-    let result = crate::fit(
-        &model,
-        &population,
-        &model.default_params,
-        &one_gradient_eval_options(),
-    )
-    .expect("fit succeeds");
+    let result =
+        crate::fit(&model, &population, &model.default_params, &one_gradient_eval_options())
+            .expect("fit succeeds");
     assert_eq!(
         result.gradient_method_outer, "analytic",
         "fixture precondition: the model must report the analytic outer route"
@@ -175,20 +168,12 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     assert!(n_total > 1, "fixture precondition: need a mixed population");
     let declining_id = make_subject_0_decline(&mut population);
 
-    let result = crate::fit(
-        &model,
-        &population,
-        &model.default_params,
-        &one_gradient_eval_options(),
-    )
-    .expect("fit succeeds");
+    let result =
+        crate::fit(&model, &population, &model.default_params, &one_gradient_eval_options())
+            .expect("fit succeeds");
 
-    let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
-        panic!(
-            "an out-of-scope subject must warn; got {:?}",
-            result.warnings
-        )
-    });
+    let w = outer_fd_warning(&result.warnings)
+        .unwrap_or_else(|| panic!("an out-of-scope subject must warn; got {:?}", result.warnings));
     assert!(
         w.contains(&format!("1 of {n_total}")),
         "warning must count exactly the declining subject; got: {w}"
@@ -217,8 +202,8 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     );
 }
 
-/// PR #1418 review, finding 2. A mixture model with `optimizer = auto` runs **BOBYQA**:
-/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`. A
+/// PR #1418 review, finding 2. A mixture model with an explicit `optimizer = bobyqa`
+/// (honoured, #2852; before #3025 `auto` resolved here too) runs **BOBYQA**. A
 /// derivative-free fit requests no outer gradient at all, so no subject can have taken an
 /// FD *outer* gradient and the warning must stay silent even with a subject the provider
 /// would decline.
@@ -230,7 +215,7 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 /// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
 /// comes from its runtime log, not from either report.
 #[test]
-fn a_derivative_free_mixture_auto_fit_does_not_warn() {
+fn a_derivative_free_mixture_fit_does_not_warn() {
     let model = crate::parse_model_string(MIXTURE_F).expect("mixture model parses");
     let mut population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
@@ -239,8 +224,8 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let options = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
-        // The knob under test: `auto` on a mixture model resolves to BOBYQA.
-        optimizer: Optimizer::Auto,
+        // The knob under test: BOBYQA on a mixture model.
+        optimizer: Optimizer::Bobyqa,
         outer_maxiter: 1,
         run_covariance_step: false,
         ..Default::default()
@@ -250,7 +235,7 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
 
     // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
     // fit this test is about.
-    assert_eq!(result.optimizer, "auto (bobyqa)");
+    assert_eq!(result.optimizer, "bobyqa");
     assert_eq!(
         result.gradient_method_outer, "N/A",
         "a derivative-free fit has no outer gradient to report"
@@ -272,10 +257,7 @@ fn an_evaluation_only_fit_does_not_warn() {
     let (model, mut population) = fixture();
     make_subject_0_decline(&mut population);
 
-    let options = FitOptions {
-        outer_maxiter: 0,
-        ..one_gradient_eval_options()
-    };
+    let options = FitOptions { outer_maxiter: 0, ..one_gradient_eval_options() };
     let result =
         crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
     assert!(
@@ -295,10 +277,7 @@ fn forcing_the_reconverged_gradient_does_not_warn_about_scope() {
     let (model, mut population) = fixture();
     make_subject_0_decline(&mut population);
 
-    let options = FitOptions {
-        reconverge_gradient_interval: 1,
-        ..one_gradient_eval_options()
-    };
+    let options = FitOptions { reconverge_gradient_interval: 1, ..one_gradient_eval_options() };
     let result =
         crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
     assert!(
@@ -321,10 +300,7 @@ fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
     let (model, mut population) = fixture();
     make_subject_0_decline(&mut population);
 
-    let options = FitOptions {
-        optimizer: Optimizer::Bobyqa,
-        ..one_gradient_eval_options()
-    };
+    let options = FitOptions { optimizer: Optimizer::Bobyqa, ..one_gradient_eval_options() };
     let result =
         crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
     assert!(
@@ -352,20 +328,13 @@ fn a_gradient_driven_mixture_fit_warns_about_its_declined_subject() {
     let n_total = population.subjects.len();
     let declining_id = make_subject_0_decline(&mut population);
 
-    let result = crate::fit(
-        &model,
-        &population,
-        &model.default_params,
-        &one_gradient_eval_options(),
-    )
-    .expect("mixture fit succeeds");
+    let result =
+        crate::fit(&model, &population, &model.default_params, &one_gradient_eval_options())
+            .expect("mixture fit succeeds");
     assert_eq!(result.optimizer, "nlopt_lbfgs");
     assert_eq!(result.gradient_method_outer, "analytic");
     let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
-        panic!(
-            "a declined mixture subject must warn; got {:?}",
-            result.warnings
-        )
+        panic!("a declined mixture subject must warn; got {:?}", result.warnings)
     });
     assert!(
         w.contains(&format!("1 of {n_total}")) && w.contains(&declining_id),

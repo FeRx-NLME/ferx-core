@@ -17,10 +17,7 @@ fn unknown_block_maps_to_e_unknown_block_with_block_line_and_suggestion() {
     assert_eq!(d.code, "E_UNKNOWN_BLOCK");
     assert_eq!(d.block.as_deref(), Some("fit_option"));
     assert_eq!(d.line, Some(16));
-    assert_eq!(
-        d.suggestion.as_deref(),
-        Some("did you mean `[fit_options]`?")
-    );
+    assert_eq!(d.suggestion.as_deref(), Some("did you mean `[fit_options]`?"));
     // The line moved into the structured field, so it is gone from the message:
     // the renderer already prints `fit_option:16` ahead of it.
     assert_eq!(
@@ -199,15 +196,9 @@ fn declined_absorption_twin_warning_maps_to_its_own_code() {
         .iter()
         .find(|w| w.contains("ODE equivalent could not be built"))
         .unwrap_or_else(|| {
-            panic!(
-                "the declined twin must warn; warnings: {:?}",
-                model.parse_warnings
-            )
+            panic!("the declined twin must warn; warnings: {:?}", model.parse_warnings)
         });
-    assert_eq!(
-        super::parse_warning_to_code(warning),
-        "W_ABSORPTION_TWIN_DECLINED"
-    );
+    assert_eq!(super::parse_warning_to_code(warning), "W_ABSORPTION_TWIN_DECLINED");
 }
 
 /// The pre-existing arms and the catch-all, so the chain's ordering is pinned
@@ -229,10 +220,7 @@ fn parse_warning_codes_cover_their_arms_and_fall_through() {
         parse_warning_to_code("[derived] `AUC`: step= ignored (W_DERIVED_STEP_IGNORED)"),
         "W_DERIVED_STEP_IGNORED"
     );
-    assert_eq!(
-        parse_warning_to_code("some unrelated parse-time note"),
-        "W_PARSE"
-    );
+    assert_eq!(parse_warning_to_code("some unrelated parse-time note"), "W_PARSE");
 }
 
 // ── #1001: single-endpoint sigma order ──────────────────────────────────────
@@ -368,9 +356,7 @@ fn a_quoted_line_cannot_claim_the_block_variance_only_code() {
     let d = parse_error_to_diagnostic(&err);
     assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY", "{err}");
     assert!(
-        d.suggestion
-            .as_deref()
-            .is_some_and(|s| s.contains("square each SD")),
+        d.suggestion.as_deref().is_some_and(|s| s.contains("square each SD")),
         "{:?}",
         d.suggestion
     );

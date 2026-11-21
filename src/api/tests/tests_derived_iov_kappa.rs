@@ -6,9 +6,9 @@
 
 use super::*;
 use crate::types::{
-    BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, DoseEvent, ErrorModel,
-    ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix, PkModel, PkParams,
-    Population, ScalingSpec, SigmaVector, Subject, PK_IDX_LAGTIME,
+    CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, DoseEvent, ErrorModel, ErrorSpec,
+    IndivParamPartials, ModelParameters, OmegaMatrix, PkParams, Population, SigmaVector, Subject,
+    PK_IDX_LAGTIME,
 };
 use nalgebra::DVector;
 use std::collections::HashMap;
@@ -19,23 +19,9 @@ use std::collections::HashMap;
 /// for every observation, while the fix yields the per-occasion CL.
 fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
         name: "test_iov_kappa".into(),
-        pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Additive,
         error_spec: ErrorSpec::Single(ErrorModel::Additive),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(
             |_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
                 let kappa = eta.get(1).copied().unwrap_or(0.0);
@@ -45,101 +31,47 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
             },
         ),
         n_theta: 0,
-        n_eta: 1,
-        n_epsilon: 1,
         n_kappa: 1,
         kappa_names: vec!["KAPPA_CL".into()],
         theta_names: Vec::new(),
-        eta_names: vec!["ETA_CL".into()],
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
-        default_params: ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            theta: Vec::new(),
-            theta_names: Vec::new(),
-            theta_lower: Vec::new(),
-            theta_upper: Vec::new(),
-            theta_fixed: Vec::new(),
-            omega: OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["ERR".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
-            kappa_fixed: vec![false],
-            mixture: None,
-        },
-        omega_init_as_sd: vec![false],
-        sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
         tv_fn: Some(Box::new(|_t, _c| vec![])),
         pk_indices: vec![0],
         eta_map: Vec::new(),
         pk_idx_f64: Vec::new(),
         sel_flat: Vec::new(),
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
         derived_exprs,
         output_columns: Vec::new(),
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
+        ..crate::types::test_helpers::bare_model(ModelParameters {
+            theta: Vec::new(),
+            theta_names: Vec::new(),
+            theta_lower: Vec::new(),
+            theta_upper: Vec::new(),
+            theta_fixed: Vec::new(),
+            sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
+            omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
+            kappa_fixed: vec![false],
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[1.0],
+                vec!["ETA_CL".into()],
+            ))
+        })
     }
 }
 
 /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
 fn two_occasion_subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
-        doses: Vec::new(),
         obs_times: vec![0.0, 1.0, 2.0, 3.0],
         obs_raw_times: vec![0.0, 1.0, 2.0, 3.0],
         observations: vec![1.0; 4],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -211,20 +143,11 @@ fn derived_and_indiv_use_per_occasion_kappa() {
     };
     // ebe_kappas[subject][occasion]; occasion order matches split_obs_by_occasion
     // (first-seen): occasion 1 → index 0 (κ=ln2), occasion 2 → index 1 (κ=ln3).
-    let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
-        DVector::from_vec(vec![ln2]),
-        DVector::from_vec(vec![ln3]),
-    ]];
+    let kappas: Vec<Vec<DVector<f64>>> =
+        vec![vec![DVector::from_vec(vec![ln2]), DVector::from_vec(vec![ln3])]];
     let mut subjects_results = vec![sr_iov(4)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let cols = &subjects_results[0].extra_columns;
     let cl = &cols.iter().find(|(n, _)| n == "CL_OUT").unwrap().1;
@@ -274,14 +197,7 @@ fn missing_kappa_falls_back_to_zero() {
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
     let mut subjects_results = vec![sr_iov(4)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let cl = &subjects_results[0].extra_columns[0].1;
     for (j, &v) in cl.iter().enumerate() {
@@ -311,18 +227,15 @@ fn tad_uses_per_dose_occasion_lag() {
     model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
     // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
-    model.pk_param_fn = Box::new(
-        |_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
+    model.pk_param_fn =
+        Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
             let kappa = eta.get(1).copied().unwrap_or(0.0);
             let mut p = PkParams::default();
             p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
             p
-        },
-    );
+        });
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -332,26 +245,10 @@ fn tad_uses_per_dose_occasion_lag() {
         obs_raw_times: vec![2.0, 13.0],
         observations: vec![1.0, 1.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -363,20 +260,11 @@ fn tad_uses_per_dose_occasion_lag() {
     };
     // ebe_kappas in split_obs_by_occasion order: occ 1 → idx 0 (κ=0.0),
     // occ 2 → idx 1 (κ=0.5).
-    let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
-        DVector::from_vec(vec![0.0]),
-        DVector::from_vec(vec![0.5]),
-    ]];
+    let kappas: Vec<Vec<DVector<f64>>> =
+        vec![vec![DVector::from_vec(vec![0.0]), DVector::from_vec(vec![0.5])]];
     let mut subjects_results = vec![sr_iov(2)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let tad = &subjects_results[0].per_obs_tad;
     assert!(
@@ -426,41 +314,21 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
+    let model = crate::parser::model_parser::parse_full_model(src).expect("parse ok").model;
     assert!(model.has_lagtime(), "ALAG2 must enable has_lagtime()");
 
     // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
         obs_times: vec![3.0],
         obs_raw_times: vec![3.0],
         observations: vec![1.0],
         obs_cmts: vec![2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -474,14 +342,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
     let kappas: Vec<Vec<DVector<f64>>> = Vec::new(); // no IOV
     let mut subjects_results = vec![sr_iov(1)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &theta,
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results, None);
 
     let tad = &subjects_results[0].per_obs_tad;
     // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
@@ -494,37 +355,16 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 /// at t = 30 on that compartment.
 fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
-        doses: dose_times
-            .iter()
-            .map(|&t| DoseEvent::new(t, 100.0, cmt, 0.0, false, 0.0))
-            .collect(),
+        doses: dose_times.iter().map(|&t| DoseEvent::new(t, 100.0, cmt, 0.0, false, 0.0)).collect(),
         obs_times: vec![30.0],
         obs_raw_times: vec![30.0],
         observations: vec![1.0],
         obs_cmts: vec![cmt],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1; dose_times.len()],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     Population {
         subjects: vec![subject],
@@ -564,9 +404,7 @@ fn alag2_model(tvlag2: f64, slope: f64) -> CompiledModel {
   DV ~ proportional(PROP)
 "#
     );
-    crate::parser::model_parser::parse_full_model(&src)
-        .expect("parse ok")
-        .model
+    crate::parser::model_parser::parse_full_model(&src).expect("parse ok").model
 }
 
 /// One-state ODE model whose compartment 1 is fed by `first_order(ka, lag=TVLAG)`.
@@ -596,9 +434,7 @@ fn route_lag_model(tvlag: f64) -> CompiledModel {
   DV ~ proportional(PROP)
 "#
     );
-    crate::parser::model_parser::parse_full_model(&src)
-        .expect("parse ok")
-        .model
+    crate::parser::model_parser::parse_full_model(&src).expect("parse ok").model
 }
 
 fn find_code<'a>(diags: &'a [Diagnostic], code: &str) -> Option<&'a Diagnostic> {
@@ -630,11 +466,7 @@ fn negative_alag_is_a_fit_init_error() {
         "NONMEM rejects it",
         "positive-link",
     ] {
-        assert!(
-            err.message.contains(want),
-            "missing {want:?} in: {}",
-            err.message
-        );
+        assert!(err.message.contains(want), "missing {want:?} in: {}", err.message);
     }
     // One finding, one severity: the fit's warning bundle no longer carries it.
     assert!(
@@ -678,11 +510,8 @@ fn negative_lag_is_read_per_dose_record() {
 
     let zero = alag2_model(0.0, 0.0);
     assert!(
-        find_code(
-            &check_model_data(&zero, &neg_lag_population(2, &[0.0])),
-            "E_NEGATIVE_LAGTIME"
-        )
-        .is_none(),
+        find_code(&check_model_data(&zero, &neg_lag_population(2, &[0.0])), "E_NEGATIVE_LAGTIME")
+            .is_none(),
         "a lag of exactly 0 is not negative"
     );
 }
@@ -697,10 +526,7 @@ fn negative_lag_is_read_per_dose_record() {
 #[test]
 fn negative_per_route_lag_is_a_fit_init_error() {
     let model = route_lag_model(-1.0);
-    assert!(
-        !model.has_lagtime(),
-        "route lag must not ride the dose-attribute map"
-    );
+    assert!(!model.has_lagtime(), "route lag must not ride the dose-attribute map");
 
     let diags = check_model_data(&model, &neg_lag_population(1, &[0.0]));
     let err = find_code(&diags, "E_NEGATIVE_LAGTIME").expect("a negative route lag is refused");
@@ -713,11 +539,8 @@ fn negative_per_route_lag_is_a_fit_init_error() {
     );
 
     assert!(
-        find_code(
-            &check_model_data(&model, &neg_lag_population(2, &[0.0])),
-            "E_NEGATIVE_LAGTIME"
-        )
-        .is_none(),
+        find_code(&check_model_data(&model, &neg_lag_population(2, &[0.0])), "E_NEGATIVE_LAGTIME")
+            .is_none(),
         "a dose into an unforced compartment never sees the route lag"
     );
     assert!(
@@ -736,20 +559,17 @@ fn negative_lag_on_an_analytical_model_is_a_fit_init_error() {
     let mut model = minimal_iov_model(vec![]);
     model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
-    model.pk_param_fn = Box::new(
-        |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _time: f64| {
+    model.pk_param_fn =
+        Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _time: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_LAGTIME] = -1.0;
             p
-        },
-    );
+        });
     assert!(model.has_lagtime() && model.ode_spec.is_none());
-    let err = find_code(
-        &check_model_data(&model, &neg_lag_population(1, &[0.0])),
-        "E_NEGATIVE_LAGTIME",
-    )
-    .cloned()
-    .expect("bare negative lag must be refused on an analytical model");
+    let err =
+        find_code(&check_model_data(&model, &neg_lag_population(1, &[0.0])), "E_NEGATIVE_LAGTIME")
+            .cloned()
+            .expect("bare negative lag must be refused on an analytical model");
     assert!(err.message.contains("compartment 1"), "{}", err.message);
 }
 
@@ -824,9 +644,7 @@ fn predict_reports_a_negative_lag_as_a_warning() {
     let good = alag2_model(1.0, 0.0);
     let out = crate::api::predict_diag(&good, &pop, &good.default_params).expect("predict");
     assert!(
-        !out.warnings
-            .iter()
-            .any(|w| w.contains("E_NEGATIVE_LAGTIME")),
+        !out.warnings.iter().any(|w| w.contains("E_NEGATIVE_LAGTIME")),
         "a positive lag must not warn: {:?}",
         out.warnings
     );
@@ -856,50 +674,28 @@ fn block_sigma_two_endpoint_model() -> CompiledModel {
     ]));
     m.error_model = ErrorModel::Proportional;
     m.n_epsilon = 2;
-    m.default_params.sigma = SigmaVector {
-        values: vec![0.3, 0.4],
-        names: vec!["S1".into(), "S2".into()],
-    };
+    m.default_params.sigma =
+        SigmaVector { values: vec![0.3, 0.4], names: vec!["S1".into(), "S2".into()] };
     m.default_params.sigma_fixed = vec![false, false];
-    m.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.5,
-    }];
+    m.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
     m
 }
 
 fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
     let n = cmts.len();
     Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.clone(),
         obs_raw_times: times,
         observations: vec![1.0; n],
         obs_cmts: cmts,
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: l2,
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -920,11 +716,8 @@ fn population_of(subject: Subject) -> Population {
 #[test]
 fn block_sigma_ambiguous_pairing_without_l2_warns() {
     let model = block_sigma_two_endpoint_model();
-    let pop = population_of(obs_only_subject(
-        vec![1, 2, 1, 2],
-        vec![1.0, 1.0, 1.0, 1.0],
-        Vec::new(),
-    ));
+    let pop =
+        population_of(obs_only_subject(vec![1, 2, 1, 2], vec![1.0, 1.0, 1.0, 1.0], Vec::new()));
     let diags = check_model_data_warnings(&model, &pop, &model.default_params);
     assert!(
         diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
@@ -1023,61 +816,20 @@ fn block_sigma_with_l2_is_not_flagged_unused() {
 /// (W_STEADY_STATE_INIT) rather than silently superpose the two (#521 review).
 #[test]
 fn ss_dose_with_analytical_init_warns() {
-    let src = r#"
-[parameters]
-  theta TVCL(3.0, 0.01, 100.0)
-  theta TVV(20.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[initial_conditions]
-  init(central) = 30 * V
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
+    let src = crate::test_models::ONE_CPT_IV_4;
+    let model = crate::parser::model_parser::parse_full_model(src).expect("parse ok").model;
     assert_eq!(model.analytical_init.len(), 1);
 
     // Subject with a steady-state dose (ss=true, ii=24).
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
         obs_times: vec![1.0, 6.0],
         obs_raw_times: vec![1.0, 6.0],
         observations: vec![1.0, 1.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -1099,58 +851,17 @@ fn ss_dose_with_analytical_init_warns() {
 /// No SS dose → no W_STEADY_STATE_INIT, even with an init baseline present.
 #[test]
 fn non_ss_dose_with_analytical_init_does_not_warn() {
-    let src = r#"
-[parameters]
-  theta TVCL(3.0, 0.01, 100.0)
-  theta TVV(20.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[initial_conditions]
-  init(central) = 30 * V
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
+    let src = crate::test_models::ONE_CPT_IV_4;
+    let model = crate::parser::model_parser::parse_full_model(src).expect("parse ok").model;
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0],
         obs_raw_times: vec![1.0],
         observations: vec![1.0],
         obs_cmts: vec![1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -1181,45 +892,28 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
     // Lag = LAGCOV covariate (time-varying); independent of eta/kappa.
-    model.pk_param_fn = Box::new(
-        |_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+    model.pk_param_fn =
+        Box::new(|_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
             p
-        },
-    );
+        });
 
     let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
     let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![3.0],
         obs_raw_times: vec![3.0],
         observations: vec![1.0],
         obs_cmts: vec![1],
-        covariates: HashMap::new(),
         dose_covariates: vec![cov_dose],
         obs_covariates: vec![cov_obs],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -1232,14 +926,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![DVector::from_vec(vec![0.0])]];
     let mut subjects_results = vec![sr_iov(1)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let tad = &subjects_results[0].per_obs_tad;
     assert!(
@@ -1279,34 +966,16 @@ fn combined_endpoint_model() -> CompiledModel {
 fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
     let n = dvs.len();
     Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..n).map(|i| (i + 1) as f64).collect(),
         obs_raw_times: (0..n).map(|i| (i + 1) as f64).collect(),
         observations: dvs,
         obs_cmts: vec![cmt; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

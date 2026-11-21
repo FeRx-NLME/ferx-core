@@ -184,10 +184,8 @@ impl StartSpread {
 
     /// The one `multi_start` line a multi-start fit carries in its warnings.
     pub(crate) fn line(&self) -> String {
-        let mut head = format!(
-            "Multi-start: {} starts, {} converged",
-            self.n_starts, self.n_converged
-        );
+        let mut head =
+            format!("Multi-start: {} starts, {} converged", self.n_starts, self.n_converged);
         if self.n_not_converged > 0 {
             head.push_str(&format!(", {} not converged", self.n_not_converged));
         }
@@ -205,17 +203,10 @@ impl StartSpread {
                 let note = if converged { "" } else { ", not converged" };
                 clauses.push(format!("best {label} {best:.4} (start {k}{note})"));
                 // Which starts the count is over: see `n_compared`.
-                let set = if converged {
-                    "converged starts"
-                } else {
-                    "starts"
-                };
+                let set = if converged { "converged starts" } else { "starts" };
                 let range = self.range.unwrap_or(0.0);
                 if self.n_compared <= 1 {
-                    clauses.push(format!(
-                        "no other {} to compare it with",
-                        &set[..set.len() - 1]
-                    ));
+                    clauses.push(format!("no other {} to compare it with", &set[..set.len() - 1]));
                 } else if self.n_within == self.n_compared {
                     clauses.push(format!(
                         "all {} {set} within {START_AGREE_OFV:.1} of best (range {range:.4})",
@@ -228,16 +219,8 @@ impl StartSpread {
                     ));
                 }
                 if !self.above.is_empty() {
-                    let kind = if converged {
-                        "converged above it"
-                    } else {
-                        "above it"
-                    };
-                    clauses.push(format!(
-                        "{} {kind}: {}",
-                        self.above.len(),
-                        named(&self.above)
-                    ));
+                    let kind = if converged { "converged above it" } else { "above it" };
+                    clauses.push(format!("{} {kind}: {}", self.above.len(), named(&self.above)));
                 }
                 if !self.lower_not_converged.is_empty() {
                     clauses.push(format!(
@@ -257,11 +240,8 @@ impl StartSpread {
 
 /// `start 4 (+5.27), start 6 (+16.10)`, the first [`NAMED_STARTS`] and then a count.
 fn named(starts: &[(usize, f64)]) -> String {
-    let mut parts: Vec<String> = starts
-        .iter()
-        .take(NAMED_STARTS)
-        .map(|(k, d)| format!("start {k} ({d:+.2})"))
-        .collect();
+    let mut parts: Vec<String> =
+        starts.iter().take(NAMED_STARTS).map(|(k, d)| format!("start {k} ({d:+.2})")).collect();
     if starts.len() > NAMED_STARTS {
         parts.push(format!("and {} more", starts.len() - NAMED_STARTS));
     }

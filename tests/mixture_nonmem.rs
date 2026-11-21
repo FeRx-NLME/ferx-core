@@ -115,12 +115,8 @@ const MODEL: &str = r"
     ignore = "slow: opt in with --features slow-tests (NONMEM mixture cross-check)"
 )]
 fn mixture_fit_matches_nonmem() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(MODEL).unwrap();
 
     let mut opts = FitOptions::default();
@@ -142,18 +138,8 @@ fn mixture_fit_matches_nonmem() {
     // ── Estimated typical values ────────────────────────────────────────────
     let th = &res.theta;
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
-    assert!(
-        rel(th[0], NM_TVCL1) < 0.05,
-        "TVCL1 {} vs {}",
-        th[0],
-        NM_TVCL1
-    );
-    assert!(
-        rel(th[1], NM_TVCL2) < 0.05,
-        "TVCL2 {} vs {}",
-        th[1],
-        NM_TVCL2
-    );
+    assert!(rel(th[0], NM_TVCL1) < 0.05, "TVCL1 {} vs {}", th[0], NM_TVCL1);
+    assert!(rel(th[1], NM_TVCL2) < 0.05, "TVCL2 {} vs {}", th[1], NM_TVCL2);
     assert!(rel(th[2], NM_TVV) < 0.05, "TVV {} vs {}", th[2], NM_TVV);
 
     // Mixing fraction: ferx logit → p(1) = σ(MIXL), compared to NONMEM P(1).
@@ -164,9 +150,7 @@ fn mixture_fit_matches_nonmem() {
     // (#2907; the largest per-subject class log Bayes factor here is 11.45, against the
     // threshold of 1).
     assert!(
-        !res.warnings
-            .iter()
-            .any(|w| w.contains("W_MIXTURE_MERGED_CLASSES")),
+        !res.warnings.iter().any(|w| w.contains("W_MIXTURE_MERGED_CLASSES")),
         "{:?}",
         res.warnings
     );
@@ -178,43 +162,17 @@ fn mixture_fit_matches_nonmem() {
     // pure Hessian-inverse estimator ferx also computes (NONMEM's default sandwich
     // R^-1 S R^-1 would differ by the usual 10-25% between the two estimators).
     // Observed agreement is <1% on all four (`.ext` `-1000000001` row).
-    let se = res
-        .se_theta
-        .as_ref()
-        .expect("mixture fit now reports theta SEs (#983)");
-    assert!(
-        res.covariance_matrix.is_some(),
-        "mixture covariance matrix present"
-    );
+    let se = res.se_theta.as_ref().expect("mixture fit now reports theta SEs (#983)");
+    assert!(res.covariance_matrix.is_some(), "mixture covariance matrix present");
     let rel_se = |a: f64, b: f64| (a - b).abs() / b.abs();
-    assert!(
-        rel_se(se[0], NM_SE_TVCL1) < 0.03,
-        "SE TVCL1 {} vs {}",
-        se[0],
-        NM_SE_TVCL1
-    );
-    assert!(
-        rel_se(se[1], NM_SE_TVCL2) < 0.03,
-        "SE TVCL2 {} vs {}",
-        se[1],
-        NM_SE_TVCL2
-    );
-    assert!(
-        rel_se(se[2], NM_SE_TVV) < 0.03,
-        "SE TVV {} vs {}",
-        se[2],
-        NM_SE_TVV
-    );
+    assert!(rel_se(se[0], NM_SE_TVCL1) < 0.03, "SE TVCL1 {} vs {}", se[0], NM_SE_TVCL1);
+    assert!(rel_se(se[1], NM_SE_TVCL2) < 0.03, "SE TVCL2 {} vs {}", se[1], NM_SE_TVCL2);
+    assert!(rel_se(se[2], NM_SE_TVV) < 0.03, "SE TVV {} vs {}", se[2], NM_SE_TVV);
     // Mixing fraction SE: ferx MIXL is on the logit scale; delta-method to p(1),
     // p = σ(MIXL) ⇒ dp/dMIXL = p(1−p), so SE(p) = p(1−p)·SE(MIXL). NONMEM
     // parameterizes P(1)=THETA(4) directly, so its SE is already on the p-scale.
     let se_p1 = p1 * (1.0 - p1) * se[3];
-    assert!(
-        rel_se(se_p1, NM_SE_P1) < 0.03,
-        "SE p(1) {} vs {}",
-        se_p1,
-        NM_SE_P1
-    );
+    assert!(rel_se(se_p1, NM_SE_P1) < 0.03, "SE p(1) {} vs {}", se_p1, NM_SE_P1);
 
     // ── Per-subject MIXEST classification agreement ─────────────────────────
     assert_eq!(res.subjects.len(), NM_MIXEST.len());
@@ -227,13 +185,7 @@ fn mixture_fit_matches_nonmem() {
     }
     // Classification must agree on every subject (the two engines compute the
     // same posterior at the same optimum).
-    assert_eq!(
-        agree,
-        NM_MIXEST.len(),
-        "MIXEST agreement {}/{}",
-        agree,
-        NM_MIXEST.len()
-    );
+    assert_eq!(agree, NM_MIXEST.len(), "MIXEST agreement {}/{}", agree, NM_MIXEST.len());
 }
 
 // ── NONMEM 7.5.1 METHOD=SAEM reference (mixture_iv_saem.ctl / .ext) ──────────
@@ -261,9 +213,8 @@ const NM_SAEM_MIXEST: [usize; 30] = [
 /// first is the seed the single-realization version of this test shipped with;
 /// the rest are the arbitrary seeds of the sweep recorded in #1053, so the
 /// distribution measured there describes exactly this set.
-const SAEM_ANCHOR_SEEDS: [u64; 10] = [
-    20250818, 1, 7, 42, 1234, 99991, 20240101, 555555, 8675309, 20260823,
-];
+const SAEM_ANCHOR_SEEDS: [u64; 10] =
+    [20250818, 1, 7, 42, 1234, 99991, 20240101, 555555, 8675309, 20260823];
 
 /// SAEM under a mixture (#985): NONMEM `METHOD=SAEM` cross-check. Same
 /// two-clearance-class model and data as `mixture_fit_matches_nonmem`, estimated
@@ -317,12 +268,8 @@ const SAEM_ANCHOR_SEEDS: [u64; 10] = [
     ignore = "slow: opt in with --features slow-tests (NONMEM SAEM mixture cross-check)"
 )]
 fn saem_mixture_fit_matches_nonmem_saem() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(MODEL).unwrap();
 
     let k = SAEM_ANCHOR_SEEDS.len() as f64;
@@ -339,6 +286,9 @@ fn saem_mixture_fit_matches_nonmem_saem() {
         opts.saem_n_exploration = 1000;
         opts.saem_n_convergence = 1000;
         opts.saem_seed = Some(seed);
+        // The OFV check below is against NONMEM FOCEI (#2973: the default is now the IS value,
+        // which is anchored by `imp_mixture_marginal_matches_nonmem`).
+        opts.saem_ofv = ferx_core::types::SaemOfv::Focei;
 
         let res = fit(&model, &pop, &model.default_params, &opts).expect("SAEM mixture fit Ok");
         let th = &res.theta;
@@ -427,11 +377,7 @@ fn saem_mixture_fit_matches_nonmem_saem() {
     // classification is stable.
     let modal_agree = (0..NM_SAEM_MIXEST.len())
         .filter(|&i| {
-            let modal = if 2 * class1_votes[i] >= SAEM_ANCHOR_SEEDS.len() {
-                1
-            } else {
-                2
-            };
+            let modal = if 2 * class1_votes[i] >= SAEM_ANCHOR_SEEDS.len() { 1 } else { 2 };
             modal == NM_SAEM_MIXEST[i]
         })
         .count();
@@ -520,10 +466,7 @@ fn saem_covariate_mixing_separates_and_recovers_beta() {
 
     let res = fit(&model, &pop, &model.default_params, &opts).expect("covariate SAEM fit Ok");
     let th = &res.theta;
-    eprintln!(
-        "cov SAEM: TVCL1={:.3} TVCL2={:.3} BWT={:.3}",
-        th[0], th[1], th[4]
-    );
+    eprintln!("cov SAEM: TVCL1={:.3} TVCL2={:.3} BWT={:.3}", th[0], th[1], th[4]);
 
     // Classes separated (low vs high clearance).
     assert!(th[0] < 1.6, "TVCL1 (low class) {} should be near 1", th[0]);
@@ -562,12 +505,8 @@ fn saem_covariate_mixing_separates_and_recovers_beta() {
     ignore = "slow: opt in with --features slow-tests (Bayes mixture)"
 )]
 fn bayes_mixture_recovers_optimum() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(MODEL).unwrap();
     let mut opts = FitOptions::default();
     opts.method = ferx_core::EstimationMethod::Bayes;
@@ -586,24 +525,9 @@ fn bayes_mixture_recovers_optimum() {
 
     // Posterior mean recovers the mixture MLE (the two class clearances are the
     // discriminating quantities — the sampler must separate them).
-    assert!(
-        rel(th[0], NM_TVCL1) < 0.10,
-        "Bayes TVCL1 {} vs {}",
-        th[0],
-        NM_TVCL1
-    );
-    assert!(
-        rel(th[1], NM_TVCL2) < 0.10,
-        "Bayes TVCL2 {} vs {}",
-        th[1],
-        NM_TVCL2
-    );
-    assert!(
-        rel(th[2], NM_TVV) < 0.05,
-        "Bayes TVV {} vs {}",
-        th[2],
-        NM_TVV
-    );
+    assert!(rel(th[0], NM_TVCL1) < 0.10, "Bayes TVCL1 {} vs {}", th[0], NM_TVCL1);
+    assert!(rel(th[1], NM_TVCL2) < 0.10, "Bayes TVCL2 {} vs {}", th[1], NM_TVCL2);
+    assert!(rel(th[2], NM_TVV) < 0.05, "Bayes TVV {} vs {}", th[2], NM_TVV);
     assert!((p1 - NM_P1).abs() < 0.08, "Bayes p(1) {} vs {}", p1, NM_P1);
 
     // Marginal OFV (K-fold log-sum-exp) comparable to the FOCEI optimum.
@@ -615,10 +539,7 @@ fn bayes_mixture_recovers_optimum() {
     );
 
     // Per-subject MIXEST populated (recomputed at the posterior mean).
-    assert!(
-        res.subjects.iter().all(|s| s.mixest.is_some()),
-        "MIXEST populated"
-    );
+    assert!(res.subjects.iter().all(|s| s.mixest.is_some()), "MIXEST populated");
 }
 
 // NONMEM IMP objective (mixture_iv_saem.ext TABLE NO. 2, the `METHOD=IMP
@@ -637,18 +558,11 @@ const NM_IMP_MARGINAL: f64 = 300.8707;
     ignore = "slow: opt in with --features slow-tests (NONMEM IMP mixture marginal)"
 )]
 fn imp_mixture_marginal_matches_nonmem() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(MODEL).unwrap();
     let mut opts = FitOptions::default();
-    opts.methods = vec![
-        ferx_core::EstimationMethod::Saem,
-        ferx_core::EstimationMethod::Imp,
-    ];
+    opts.methods = vec![ferx_core::EstimationMethod::Saem, ferx_core::EstimationMethod::Imp];
     opts.interaction = true;
     opts.saem_n_exploration = 600;
     opts.saem_n_convergence = 800;
@@ -687,12 +601,8 @@ fn impmap_estimating_mixture_recovers_optimum() {
     // responsibility-weighted M-steps must recover the mixture MLE. Ω/Σ FIXed, so
     // the estimated quantities are the two class clearances, V, and the mixing
     // logit. Anchored to the shared optimum (NONMEM FOCEI `mixture_iv.ctl`).
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(MODEL).unwrap();
     let mut opts = FitOptions::default();
     opts.method = ferx_core::EstimationMethod::Impmap;
@@ -741,29 +651,11 @@ fn impmap_estimating_mixture_recovers_optimum() {
     // The EM estimator settles slightly below FOCEI's TVCL1/TVCL2 (NONMEM's
     // mu-referenced IMPMAP does the same), so this is the looser of the two
     // checks; before #996 the weighted M-step alone left TVCL2 at ≈ 2.60.
-    assert!(
-        rel(th[0], NM_TVCL1) < 0.05,
-        "IMPMAP TVCL1 {} vs FOCEI {}",
-        th[0],
-        NM_TVCL1
-    );
-    assert!(
-        rel(th[1], NM_TVCL2) < 0.03,
-        "IMPMAP TVCL2 {} vs FOCEI {}",
-        th[1],
-        NM_TVCL2
-    );
-    assert!(
-        rel(th[2], NM_TVV) < 0.05,
-        "IMPMAP TVV {} vs {}",
-        th[2],
-        NM_TVV
-    );
+    assert!(rel(th[0], NM_TVCL1) < 0.05, "IMPMAP TVCL1 {} vs FOCEI {}", th[0], NM_TVCL1);
+    assert!(rel(th[1], NM_TVCL2) < 0.03, "IMPMAP TVCL2 {} vs FOCEI {}", th[1], NM_TVCL2);
+    assert!(rel(th[2], NM_TVV) < 0.05, "IMPMAP TVV {} vs {}", th[2], NM_TVV);
     assert!((p1 - NM_P1).abs() < 0.05, "IMPMAP p(1) {} vs {}", p1, NM_P1);
-    assert!(
-        res.subjects.iter().all(|s| s.mixest.is_some()),
-        "MIXEST populated"
-    );
+    assert!(res.subjects.iter().all(|s| s.mixest.is_some()), "MIXEST populated");
 
     // The class-aware shift is what buys this: with `mu_referencing = false`
     // every θ falls back to the importance-weighted M-step alone (the pre-#996
@@ -773,10 +665,7 @@ fn impmap_estimating_mixture_recovers_optimum() {
     let res_off =
         fit(&model, &pop, &model.default_params, &opts_off).expect("IMPMAP mixture fit Ok");
     let th_off = &res_off.theta;
-    eprintln!(
-        "IMPMAP mixture (mu_referencing off): TVCL1={:.4} TVCL2={:.4}",
-        th_off[0], th_off[1]
-    );
+    eprintln!("IMPMAP mixture (mu_referencing off): TVCL1={:.4} TVCL2={:.4}", th_off[0], th_off[1]);
     assert!(
         rel(th[1], NM_IMPMAP_MU_TVCL2) < rel(th_off[1], NM_IMPMAP_MU_TVCL2),
         "class-aware TVCL2 {} must beat the numerical M-step's {} (target {})",
@@ -799,16 +688,10 @@ fn impmap_estimating_mixture_recovers_optimum() {
 /// below the reverted one.
 #[test]
 fn imp_estimating_mixture_cold_start_does_not_collapse() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(
-        &MODEL
-            .replace("TVCL1(1.2,", "TVCL1(0.5,")
-            .replace("TVCL2(2.5,", "TVCL2(6.0,"),
+        &MODEL.replace("TVCL1(1.2,", "TVCL1(0.5,").replace("TVCL2(2.5,", "TVCL2(6.0,"),
     )
     .unwrap();
     let mut opts = FitOptions::default();
@@ -852,9 +735,7 @@ fn free_omega_model(cl1: &str, cl2: &str) -> String {
 }
 
 fn merged_warning(res: &ferx_core::FitResult) -> Option<&String> {
-    res.warnings
-        .iter()
-        .find(|w| w.starts_with("W_MIXTURE_MERGED_CLASSES"))
+    res.warnings.iter().find(|w| w.starts_with("W_MIXTURE_MERGED_CLASSES"))
 }
 
 /// Evaluation-only (`outer_maxiter = 0`), so it returns immediately. The pair straddles the
@@ -863,12 +744,8 @@ fn merged_warning(res: &ferx_core::FitResult) -> Option<&String> {
 /// (1.2 / 2.5) does not.
 #[test]
 fn merged_class_warning_straddles_identical_and_separated_starts() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let mut opts = FitOptions::default();
     opts.interaction = true;
     opts.outer_maxiter = 0;
@@ -897,12 +774,8 @@ fn merged_class_warning_straddles_identical_and_separated_starts() {
     ignore = "slow: opt in with --features slow-tests (mixture fits to convergence)"
 )]
 fn near_symmetric_start_collapsed_optimum_warns_merged_classes() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(&free_omega_model("1.70", "1.71")).unwrap();
     let mut opts = FitOptions::default();
     opts.interaction = true;
@@ -940,16 +813,12 @@ fn near_symmetric_start_collapsed_optimum_warns_merged_classes() {
     ignore = "slow: opt in with --features slow-tests (mixture fit to convergence)"
 )]
 fn held_tiny_mixing_fraction_warns_empty_class() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
+    let model = parse_model_string(
+        &free_omega_model("1.2", "2.5")
+            .replace("theta MIXL(0.0, -10.0, 10.0)", "theta MIXL(-9.0, -10.0, 10.0) FIX"),
     )
-    .unwrap();
-    let model = parse_model_string(&free_omega_model("1.2", "2.5").replace(
-        "theta MIXL(0.0, -10.0, 10.0)",
-        "theta MIXL(-9.0, -10.0, 10.0) FIX",
-    ))
     .unwrap();
     let mut opts = FitOptions::default();
     opts.interaction = true;

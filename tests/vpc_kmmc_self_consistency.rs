@@ -110,11 +110,8 @@ mod self_consistency {
         let mut o = VpcKmmcOptions::new("Z");
         o.vpc.n_sim = N_SIM;
         o.vpc.grid = VpcGrid::Times(GRID.to_vec());
-        o.vpc.sim = SimulateOptions {
-            seed: Some(m as u64),
-            horizon: Some(H),
-            ..Default::default()
-        };
+        o.vpc.sim =
+            SimulateOptions { seed: Some(m as u64), horizon: Some(H), ..Default::default() };
         o
     }
 
@@ -145,17 +142,10 @@ mod self_consistency {
     #[test]
     fn observed_kmmc_coverage_matches_its_expectation() {
         let (inside, defined) = tally(OWN);
-        let cov: Vec<f64> = (0..3)
-            .map(|k| inside[k] as f64 / defined[k] as f64)
-            .collect();
+        let cov: Vec<f64> = (0..3).map(|k| inside[k] as f64 / defined[k] as f64).collect();
         eprintln!("K9 own model: coverage {cov:?} over {defined:?} datasets");
         for k in 0..3 {
-            assert!(
-                defined[k] >= 190,
-                "only {} datasets defined at {}",
-                defined[k],
-                GRID[k]
-            );
+            assert!(defined[k] >= 190, "only {} datasets defined at {}", defined[k], GRID[k]);
             assert!(
                 (LO..=HI).contains(&cov[k]),
                 "coverage {} at {} outside [{LO}, {HI}]",
@@ -172,9 +162,8 @@ mod self_consistency {
     #[test]
     fn kmmc_detects_a_missing_covariate_effect() {
         let (inside, defined) = tally(NO_COV);
-        let outside: Vec<f64> = (0..3)
-            .map(|k| 1.0 - inside[k] as f64 / defined[k] as f64)
-            .collect();
+        let outside: Vec<f64> =
+            (0..3).map(|k| 1.0 - inside[k] as f64 / defined[k] as f64).collect();
         let model = parse_model_string(NO_COV).unwrap();
         let mut km_inside = [0usize; 3];
         for m in 0..M {
@@ -204,11 +193,7 @@ mod self_consistency {
             "K10 no-cov model: KMMC outside-band share {outside:?} over {defined:?}; \
              KM-VPC coverage {km_cov:?}"
         );
-        assert!(
-            defined[0] >= 190,
-            "only {} datasets defined at H/4",
-            defined[0]
-        );
+        assert!(defined[0] >= 190, "only {} datasets defined at H/4", defined[0]);
         assert!(
             outside[0] >= 0.5,
             "the KMMC saw the missing effect in only {} of datasets at H/4",

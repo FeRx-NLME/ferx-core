@@ -40,10 +40,7 @@ fn nonmem_rows() -> Vec<(String, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // ID TIME DV CHZ ETA1
             (f.len() >= 5).then(|| (format!("{}", f[0] as i64), f[1], f[3], f[4]))
         })
@@ -53,10 +50,7 @@ fn nonmem_rows() -> Vec<(String, f64, f64, f64)> {
 /// Worst relative `H` error at each subject's record, with each subject at `etas[id]`.
 /// The population is reversed, so a positional lookup gives another subject's η.
 fn worst_h(
-    m: &CompiledModel,
-    pop: &Population,
-    p: &ModelParameters,
-    etas: &[(String, f64)],
+    m: &CompiledModel, pop: &Population, p: &ModelParameters, etas: &[(String, f64)],
     rows: &[(String, f64, f64, f64)],
 ) -> f64 {
     let supplied = SuppliedEtas::from_table(
@@ -97,10 +91,7 @@ fn individual_cum_hazard_at_the_ebes_matches_nonmem() {
     eprintln!("T11(i) worst rel H {wi:.3e}");
     // Measured 2.09e-9 on Linux aarch64 and macOS arm64, the same digits: the
     // 9-significant-figure print floor of the table.
-    assert!(
-        wi < 2e-8,
-        "(i) H at NONMEM's ETA1 vs CHZ: worst rel {wi:.3e} (measured 2.09e-9)"
-    );
+    assert!(wi < 2e-8, "(i) H at NONMEM's ETA1 vs CHZ: worst rel {wi:.3e} (measured 2.09e-9)");
 
     // η = 0 must miss.
     let zero: Vec<(String, f64)> = nm.iter().map(|(i, _)| (i.clone(), 0.0)).collect();
@@ -118,11 +109,7 @@ fn individual_cum_hazard_at_the_ebes_matches_nonmem() {
     };
     let r = fit(&m, &pop, &p, &opts).expect("inner-only fit");
     eprintln!("T11 fit warnings: {:#?}", r.warnings);
-    let fx: Vec<(String, f64)> = r
-        .subjects
-        .iter()
-        .map(|s| (s.id.clone(), s.eta[0]))
-        .collect();
+    let fx: Vec<(String, f64)> = r.subjects.iter().map(|s| (s.id.clone(), s.eta[0])).collect();
     let mut we = 0.0f64;
     for (id, e) in &nm {
         let (_, f) = fx.iter().find(|(i, _)| i == id).expect("fitted subject");
@@ -132,17 +119,11 @@ fn individual_cum_hazard_at_the_ebes_matches_nonmem() {
     eprintln!("T11(ii) worst |η̂ − ETA1| {we:.3e}");
     // Measured 5.97e-9 at inner_tol 1e-10, Linux aarch64 and macOS arm64 alike; bound ~10x
     // above.
-    assert!(
-        we < 6e-8,
-        "(ii) worst |η̂ − ETA1| {we:.3e} (measured 5.97e-9)"
-    );
+    assert!(we < 6e-8, "(ii) worst |η̂ − ETA1| {we:.3e} (measured 5.97e-9)");
 
     // (iii)
     let wiii = worst_h(&m, &pop, &p, &fx, &rows);
     eprintln!("T11(iii) worst rel H {wiii:.3e}");
     // Measured 5.90e-9, Linux aarch64 and macOS arm64 alike; bound ~10x above.
-    assert!(
-        wiii < 6e-8,
-        "(iii) H at ferx η̂ vs CHZ: worst rel {wiii:.3e} (measured 5.90e-9)"
-    );
+    assert!(wiii < 6e-8, "(iii) H at ferx η̂ vs CHZ: worst rel {wiii:.3e} (measured 5.90e-9)");
 }

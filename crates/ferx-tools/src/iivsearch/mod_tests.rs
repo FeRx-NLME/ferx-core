@@ -61,12 +61,7 @@ fn key(c: &Candidate) -> String {
         .unwrap_or("")
         .split('+')
         .filter(|s| !s.is_empty())
-        .map(|b| {
-            b.trim_matches(['[', ']'])
-                .split(',')
-                .map(str::to_string)
-                .collect()
-        })
+        .map(|b| b.trim_matches(['[', ']']).split(',').map(str::to_string).collect())
         .collect();
     IivStructure::new(etas, blocks).description()
 }
@@ -82,11 +77,7 @@ fn space(mfl: &str) -> Space {
 }
 
 fn options(algorithm: Algorithm) -> IivsearchOptions {
-    IivsearchOptions {
-        algorithm,
-        rank: RankType::Ofv,
-        ..IivsearchOptions::default()
-    }
+    IivsearchOptions { algorithm, rank: RankType::Ofv, ..IivsearchOptions::default() }
 }
 
 fn run(script: &ScriptedFitter, space: Space, options: &IivsearchOptions) -> IivsearchResult {
@@ -124,10 +115,7 @@ fn options_take_pharmpys_defaults_and_read_bic_as_the_bic_iiv() {
     assert_eq!(o.criterion(), Criterion::Bic(ferx_core::BicType::Iiv));
     assert_eq!(o.cutoff, None);
     assert_eq!(o.block_retries, 2);
-    assert_eq!(
-        o.starts, 3,
-        "[run] retries defaults to 2, plus the exact start"
-    );
+    assert_eq!(o.starts, 3, "[run] retries defaults to 2, plus the exact start");
     assert_eq!(o.starts_for(1), 3);
     assert_eq!(o.starts_for(2), 3);
     assert_eq!(o.starts_for(3), 5);
@@ -137,10 +125,7 @@ fn options_take_pharmpys_defaults_and_read_bic_as_the_bic_iiv() {
     let cfg =
         config("base = \"b.ferx\"\n[space]\nmfl = \"IIV?([CL,V],EXP)\"\n[rank]\ntype = \"bic\"\n")
             .unwrap();
-    assert_eq!(
-        IivsearchOptions::from_config(&cfg).unwrap().rank,
-        RankType::BicIiv
-    );
+    assert_eq!(IivsearchOptions::from_config(&cfg).unwrap().rank, RankType::BicIiv);
     let cfg = config(
         "base = \"b.ferx\"\n[space]\nmfl = \"IIV?([CL,V],EXP)\"\n[rank]\ntype = \"bic_mixed\"\n\
          cutoff = 3.84\n[run]\nretries = 0\n[iivsearch]\nalgorithm = \"bottom_up_stepwise\"\n\
@@ -171,9 +156,8 @@ fn options_take_pharmpys_defaults_and_read_bic_as_the_bic_iiv() {
     .and_then(|c| IivsearchOptions::from_config(&c))
     .unwrap_err();
     assert!(err.contains("no second stage"), "{err}");
-    let err = config("base = \"b.ferx\"\n")
-        .and_then(|c| IivsearchOptions::from_config(&c))
-        .unwrap_err();
+    let err =
+        config("base = \"b.ferx\"\n").and_then(|c| IivsearchOptions::from_config(&c)).unwrap_err();
     assert!(err.contains("needs a [space] section"), "{err}");
     let err =
         config("base = \"b.ferx\"\n[space]\nmfl = \"IIV?([CL,V],EXP)\"\n[rank]\ncutoff = -1.0\n")
@@ -196,11 +180,7 @@ fn the_space_reads_kept_and_searched_parameters_and_the_input_structure() {
     let s = space(KEEP_CL);
     assert_eq!(
         s.iiv,
-        vec![
-            ("CL".to_string(), true),
-            ("KA".to_string(), false),
-            ("V".to_string(), false)
-        ],
+        vec![("CL".to_string(), true), ("KA".to_string(), false), ("V".to_string(), false)],
         "alphabetical, Pharmpy's order"
     );
     assert_eq!(s.cov, vec!["CL", "KA", "V"]);
@@ -212,14 +192,11 @@ fn the_space_reads_kept_and_searched_parameters_and_the_input_structure() {
 
     // A forced covariance is a block every candidate carries; an existing
     // block is read as one.
-    let blocked = BASE.replace("  omega ETA_CL ~ 0.09\n", "").replace(
-        "  omega ETA_V ~ 0.04\n",
-        "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]\n",
-    );
-    let s = space_of(
-        &blocked,
-        "IIV?([CL,V,KA],EXP);COVARIANCE(IIV,[CL,V]);COVARIANCE?(IIV,[KA,V])",
-    );
+    let blocked = BASE
+        .replace("  omega ETA_CL ~ 0.09\n", "")
+        .replace("  omega ETA_V ~ 0.04\n", "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]\n");
+    let s =
+        space_of(&blocked, "IIV?([CL,V,KA],EXP);COVARIANCE(IIV,[CL,V]);COVARIANCE?(IIV,[KA,V])");
     assert_eq!(s.forced_pairs, vec![("CL".to_string(), "V".to_string())]);
     assert_eq!(s.input_structure.description(), "[CL,V]+[KA]");
     assert_eq!(
@@ -272,16 +249,10 @@ fn the_space_refuses_what_it_cannot_search_by_name() {
     let s = space_of(&fixed, ALL);
     assert_eq!(s.kept(), vec!["KA"]);
     assert_eq!(s.cov, vec!["CL", "V"]);
-    assert!(
-        s.notes.iter().any(|n| n.contains("declared `FIX`")),
-        "{:?}",
-        s.notes
-    );
+    assert!(s.notes.iter().any(|n| n.contains("declared `FIX`")), "{:?}", s.notes);
     let err = Space::build(
         ModelText::parse(&fixed).unwrap(),
-        Mfl::parse("IIV?([CL,V],EXP);COVARIANCE(IIV,[KA,V])")
-            .unwrap()
-            .features(),
+        Mfl::parse("IIV?([CL,V],EXP);COVARIANCE(IIV,[KA,V])").unwrap().features(),
         Vec::new(),
     )
     .unwrap_err();
@@ -294,12 +265,7 @@ fn the_space_refuses_what_it_cannot_search_by_name() {
 fn top_down_enumerates_every_subset_largest_first_then_the_blocks() {
     let script = ScriptedFitter::new(
         key,
-        &[
-            ("[CL]+[KA]+[V]", 100.0),
-            ("[CL]+[V]", 99.0),
-            ("[CL]+[KA]", 300.0),
-            ("[CL,V]", 70.0),
-        ],
+        &[("[CL]+[KA]+[V]", 100.0), ("[CL]+[V]", 99.0), ("[CL]+[KA]", 300.0), ("[CL,V]", 70.0)],
     );
     let result = run(&script, space(ALL), &options(Algorithm::TopDownExhaustive));
     // The input lies on the space: it is the base, and no base row exists.
@@ -328,9 +294,7 @@ fn top_down_enumerates_every_subset_largest_first_then_the_blocks() {
     assert_eq!(fitted_in(&result, 2), vec![pair("run8", "[CL,V]")]);
     let run8 = script.model_of("step-2", "run8");
     assert!(
-        run8.block_lines("parameters")
-            .iter()
-            .any(|l| l.starts_with("block_omega (ETA_CL, ETA_V)")),
+        run8.block_lines("parameters").iter().any(|l| l.starts_with("block_omega (ETA_CL, ETA_V)")),
         "{}",
         run8.render()
     );
@@ -359,18 +323,13 @@ fn top_down_enumerates_every_subset_largest_first_then_the_blocks() {
 fn top_down_blocks_enumerate_every_clique_plus_the_diagonal_from_a_blocked_base() {
     // A base that already carries a block: the all-diagonal model is a
     // candidate, so are the other cliques; the base's own structure is not.
-    let blocked = BASE.replace("  omega ETA_CL ~ 0.09\n", "").replace(
-        "  omega ETA_V ~ 0.04\n",
-        "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]\n",
-    );
+    let blocked = BASE
+        .replace("  omega ETA_CL ~ 0.09\n", "")
+        .replace("  omega ETA_V ~ 0.04\n", "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]\n");
     let script = ScriptedFitter::new(key, &[("[CL,V]+[KA]", 100.0), ("[CL,KA,V]", 90.0)]);
     let mut o = options(Algorithm::Skip);
     o.correlation_algorithm = Some(CorrelationAlgorithm::TopDownExhaustive);
-    let result = run(
-        &script,
-        space_of(&blocked, "COVARIANCE?(IIV,[CL,V,KA])"),
-        &o,
-    );
+    let result = run(&script, space_of(&blocked, "COVARIANCE?(IIV,[CL,V,KA])"), &o);
     assert_eq!(
         fitted_in(&result, 1),
         vec![
@@ -384,14 +343,8 @@ fn top_down_blocks_enumerate_every_clique_plus_the_diagonal_from_a_blocked_base(
     // split diagonals and gets the extra starts.
     let run1 = script.model_of("step-1", "run1");
     assert!(!run1.render().contains("block_omega"), "{}", run1.render());
-    assert!(run1
-        .block_lines("parameters")
-        .contains(&"omega ETA_CL ~ 0.09".to_string()));
-    let run4 = script
-        .candidates_in("step-1")
-        .into_iter()
-        .find(|c| c.id == "run4")
-        .unwrap();
+    assert!(run1.block_lines("parameters").contains(&"omega ETA_CL ~ 0.09".to_string()));
+    let run4 = script.candidates_in("step-1").into_iter().find(|c| c.id == "run4").unwrap();
     assert_eq!(run4.n_starts, Some(5));
     let block = run4
         .model
@@ -422,19 +375,12 @@ fn bottom_up_starts_from_the_kept_eta_and_adds_one_at_a_time() {
         ],
     );
     let script = script.by_id(&[("run3", 102.0)]);
-    let result = run(
-        &script,
-        space(KEEP_CL),
-        &options(Algorithm::BottomUpStepwise),
-    );
+    let result = run(&script, space(KEEP_CL), &options(Algorithm::BottomUpStepwise));
     // The base is derived: the input minus the searched η.
     assert_eq!(result.base_id, "base");
     assert_eq!(result.row("base").unwrap().structure.description(), "[CL]");
     assert_eq!(result.row("base").unwrap().parent.as_deref(), Some("input"));
-    assert_eq!(
-        fitted_in(&result, 1),
-        vec![pair("run1", "[CL]+[KA]"), pair("run2", "[CL]+[V]")]
-    );
+    assert_eq!(fitted_in(&result, 1), vec![pair("run1", "[CL]+[KA]"), pair("run2", "[CL]+[V]")]);
     // Step 2 adds the remaining η; it does not improve, so the stage ends.
     assert_eq!(fitted_in(&result, 2), vec![pair("run3", "[CL]+[KA]+[V]")]);
     assert_eq!(result.steps[1].best, "run2");
@@ -444,15 +390,10 @@ fn bottom_up_starts_from_the_kept_eta_and_adds_one_at_a_time() {
     // And the final comparison prefers the search's model.
     assert_eq!(result.steps[3].kind, StepKind::Input);
     assert_eq!(result.final_id, "run4");
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("not the search's base")));
+    assert!(result.notes.iter().any(|n| n.contains("not the search's base")));
     // The re-added η took the input's variance rather than Pharmpy's 0.09.
     let run2 = script.model_of("step-1", "run2");
-    assert!(run2
-        .block_lines("parameters")
-        .contains(&"omega ETA_V ~ 0.04".to_string()));
+    assert!(run2.block_lines("parameters").contains(&"omega ETA_V ~ 0.04".to_string()));
 }
 
 #[test]
@@ -462,10 +403,7 @@ fn bottom_up_as_fullblock_blocks_every_eta_it_adds() {
     o.as_fullblock = true;
     o.correlation_algorithm = Some(CorrelationAlgorithm::Skip);
     let result = run(&script, space(KEEP_CL), &o);
-    assert_eq!(
-        fitted_in(&result, 1),
-        vec![pair("run1", "[CL,KA]"), pair("run2", "[CL,V]")]
-    );
+    assert_eq!(fitted_in(&result, 1), vec![pair("run1", "[CL,KA]"), pair("run2", "[CL,V]")]);
     assert_eq!(fitted_in(&result, 2), vec![pair("run3", "[CL,KA,V]")]);
     assert_eq!(result.final_id, "run2");
 }
@@ -482,11 +420,7 @@ fn simultaneous_tries_each_new_eta_diagonal_in_a_block_and_paired() {
             ("[CL,KA,V]", 85.0),
         ],
     );
-    let result = run(
-        &script,
-        space(KEEP_CL),
-        &options(Algorithm::SimultaneousStepwise),
-    );
+    let result = run(&script, space(KEEP_CL), &options(Algorithm::SimultaneousStepwise));
     // From [CL]: KA and V, each diagonal and each paired with CL.
     assert_eq!(
         fitted_in(&result, 1),
@@ -499,10 +433,7 @@ fn simultaneous_tries_each_new_eta_diagonal_in_a_block_and_paired() {
     );
     // From [CL,V]: KA diagonal, and KA inside the block — no single η is
     // left to pair with.
-    assert_eq!(
-        fitted_in(&result, 2),
-        vec![pair("run5", "[CL,V]+[KA]"), pair("run6", "[CL,KA,V]")]
-    );
+    assert_eq!(fitted_in(&result, 2), vec![pair("run5", "[CL,V]+[KA]"), pair("run6", "[CL,KA,V]")]);
     assert_eq!(result.steps[1].kind, StepKind::Simultaneous);
     // No block stage after the simultaneous algorithm.
     assert_eq!(result.steps.len(), 3);
@@ -563,14 +494,8 @@ fn a_gated_candidate_cannot_win_and_the_input_returns_when_it_ranks_better() {
 
     // Bottom-up from a derived base: the search's best is worse than the
     // input, so the input is returned with a note.
-    let script = ScriptedFitter::new(
-        key,
-        &[
-            ("[CL]+[KA]+[V]", 10.0),
-            ("[CL]", 300.0),
-            ("[CL]+[V]", 101.0),
-        ],
-    );
+    let script =
+        ScriptedFitter::new(key, &[("[CL]+[KA]+[V]", 10.0), ("[CL]", 300.0), ("[CL]+[V]", 101.0)]);
     let mut o = options(Algorithm::BottomUpStepwise);
     o.correlation_algorithm = Some(CorrelationAlgorithm::Skip);
     let result = run(&script, space(KEEP_CL), &o);
@@ -578,10 +503,7 @@ fn a_gated_candidate_cannot_win_and_the_input_returns_when_it_ranks_better() {
     assert_eq!(last.kind, StepKind::Input);
     assert_eq!(last.best, "input");
     assert_eq!(result.final_id, "input");
-    assert!(result
-        .notes
-        .iter()
-        .any(|n| n.contains("the input is returned")));
+    assert!(result.notes.iter().any(|n| n.contains("the input is returned")));
 
     // An errored candidate is a row with its reason and no rank.
     let mut script = ScriptedFitter::new(key, &[("[CL]+[KA]+[V]", 100.0)]);
@@ -599,13 +521,8 @@ fn a_new_block_is_seeded_from_the_parents_ebe_correlation() {
     let mut o = options(Algorithm::Skip);
     o.correlation_algorithm = Some(CorrelationAlgorithm::TopDownExhaustive);
     let result = run(&script, space(ALL), &o);
-    let run = result
-        .rows
-        .iter()
-        .find(|r| r.structure.description() == "[CL,V]+[KA]")
-        .unwrap()
-        .id
-        .clone();
+    let run =
+        result.rows.iter().find(|r| r.structure.description() == "[CL,V]+[KA]").unwrap().id.clone();
     let model = script.model_of("step-1", &run);
     let line = model
         .block_lines("parameters")
@@ -625,10 +542,7 @@ fn a_new_block_is_seeded_from_the_parents_ebe_correlation() {
     let flat = 0.1 * (tri[0] * tri[2]).sqrt();
     assert!((tri[1] - flat).abs() > 1e-9, "{line}");
     assert!(tri[1] != 0.0, "{line}");
-    assert!(
-        tri[1].abs() <= 0.95 * (tri[0] * tri[2]).sqrt() + 1e-12,
-        "{line}"
-    );
+    assert!(tri[1].abs() <= 0.95 * (tri[0] * tri[2]).sqrt() + 1e-12, "{line}");
     let m = nalgebra::DMatrix::from_row_slice(2, 2, &[tri[0], tri[1], tri[1], tri[2]]);
     assert!(nalgebra::Cholesky::new(m).is_some(), "{line}");
 
@@ -683,18 +597,12 @@ fn structures_describe_themselves_as_pharmpy_does() {
     assert!(s.blocks.is_empty());
     assert_eq!(
         components(
-            vec![
-                ("A".to_string(), "B".to_string()),
-                ("C".to_string(), "B".to_string())
-            ]
-            .into_iter()
+            vec![("A".to_string(), "B".to_string()), ("C".to_string(), "B".to_string())]
+                .into_iter()
         ),
         vec![vec!["A".to_string(), "B".to_string(), "C".to_string()]]
     );
-    assert_eq!(
-        combinations(&[1, 2, 3], 2),
-        vec![vec![1, 2], vec![1, 3], vec![2, 3]]
-    );
+    assert_eq!(combinations(&[1, 2, 3], 2), vec![vec![1, 2], vec![1, 3], vec![2, 3]]);
     assert_eq!(combinations(&[1, 2], 3), Vec::<Vec<i32>>::new());
     assert_eq!(
         default_dir(Path::new("runs/warfarin.ferxsearch")),
@@ -704,14 +612,8 @@ fn structures_describe_themselves_as_pharmpy_does() {
 
 #[test]
 fn the_report_writes_the_table_the_models_and_the_final_model() {
-    let script = ScriptedFitter::new(
-        key,
-        &[
-            ("[CL]+[KA]+[V]", 100.0),
-            ("[CL]+[V]", 99.0),
-            ("[CL,V]", 70.0),
-        ],
-    );
+    let script =
+        ScriptedFitter::new(key, &[("[CL]+[KA]+[V]", 100.0), ("[CL]+[V]", 99.0), ("[CL,V]", 70.0)]);
     let result = run(&script, space(ALL), &options(Algorithm::TopDownExhaustive));
     let dir = tempfile::tempdir().unwrap();
     write_report(dir.path(), &result).unwrap();
@@ -719,27 +621,15 @@ fn the_report_writes_the_table_the_models_and_the_final_model() {
     let header = table.lines().next().unwrap();
     assert_eq!(header, MODEL_COLUMNS.join(","));
     assert_eq!(table.lines().count(), 1 + result.rows.len());
-    assert!(
-        table.contains("run8,run2,2,\"[CL,V]\",CL;V,\"CL,V\""),
-        "{table}"
-    );
+    assert!(table.contains("run8,run2,2,\"[CL,V]\",CL;V,\"CL,V\""), "{table}");
     assert!(models_dir(dir.path()).join("run8.ferx").exists());
     assert!(models_dir(dir.path()).join("input.ferx").exists());
     let final_text = std::fs::read_to_string(final_model_path(dir.path())).unwrap();
-    assert!(
-        final_text.contains("block_omega (ETA_CL, ETA_V)"),
-        "{final_text}"
-    );
+    assert!(final_text.contains("block_omega (ETA_CL, ETA_V)"), "{final_text}");
     ModelText::parse(&final_text).unwrap();
     let summary = render_summary(&result);
-    assert!(
-        summary.contains("Step 1 (no_of_etas), parent input"),
-        "{summary}"
-    );
-    assert!(
-        summary.contains("Step 2 (block_structure), parent run2"),
-        "{summary}"
-    );
+    assert!(summary.contains("Step 1 (no_of_etas), parent input"), "{summary}");
+    assert!(summary.contains("Step 2 (block_structure), parent run2"), "{summary}");
     assert!(summary.contains("Final model: run8 — [CL,V]"), "{summary}");
     assert!(summary.contains("SELECTED"), "{summary}");
 }
@@ -758,10 +648,7 @@ fn a_partial_block_candidate_carries_no_caveat_note() {
     assert!(!full.is_partial_block());
     let diagonal = IivStructure::new(vec!["CL".into(), "V".into()], vec![]);
     assert!(!diagonal.is_partial_block());
-    let two = IivStructure::new(
-        vec!["CL".into(), "V".into()],
-        vec![vec!["CL".into(), "V".into()]],
-    );
+    let two = IivStructure::new(vec!["CL".into(), "V".into()], vec![vec!["CL".into(), "V".into()]]);
     assert!(!two.is_partial_block());
 
     // Every estimator honours the declared structure since ferx-core #1018, so a
@@ -771,11 +658,7 @@ fn a_partial_block_candidate_carries_no_caveat_note() {
     let mut o = options(Algorithm::Skip);
     o.correlation_algorithm = Some(CorrelationAlgorithm::TopDownExhaustive);
     let result = run(&script, space(ALL), &o);
-    assert!(
-        !result.notes.iter().any(|n| n.contains("#1018")),
-        "{:?}",
-        result.notes
-    );
+    assert!(!result.notes.iter().any(|n| n.contains("#1018")), "{:?}", result.notes);
 }
 
 /// A four-η base whose `KA`/`F` η are blocked together — a block the space's
@@ -830,17 +713,9 @@ fn a_block_the_space_does_not_name_is_carried_unchanged_and_its_members_are_not_
         params.contains(&"block_omega (ETA_KA, ETA_F) = [0.3, 0.01, 0.02]".to_string()),
         "the out-of-space block is untouched: {params:?}"
     );
+    assert!(params.iter().any(|l| l.starts_with("block_omega (ETA_CL, ETA_V)")), "{params:?}");
     assert!(
-        params
-            .iter()
-            .any(|l| l.starts_with("block_omega (ETA_CL, ETA_V)")),
-        "{params:?}"
-    );
-    assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("[F,KA]") && n.contains("carried unchanged")),
+        result.notes.iter().any(|n| n.contains("[F,KA]") && n.contains("carried unchanged")),
         "{:?}",
         result.notes
     );
@@ -855,11 +730,7 @@ fn a_cancellation_during_the_base_fit_returns_the_input_not_an_error() {
     script.cancel_empty_after = Some(2);
     // `run` unwraps: without the guard the search returns `Err` here and the
     // test fails on that line, which is the mutation this pins.
-    let result = run(
-        &script,
-        space(KEEP_CL),
-        &options(Algorithm::BottomUpStepwise),
-    );
+    let result = run(&script, space(KEEP_CL), &options(Algorithm::BottomUpStepwise));
     assert!(result.cancelled);
     assert_eq!(result.final_id, "input");
     assert_eq!(result.final_structure.description(), "[CL]+[KA]+[V]");
@@ -868,10 +739,7 @@ fn a_cancellation_during_the_base_fit_returns_the_input_not_an_error() {
     assert!(result.row("input").unwrap().selected);
     assert!(result.steps.is_empty(), "no step ran: {:?}", result.steps);
     assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.contains("cancelled while the base model")),
+        result.notes.iter().any(|n| n.contains("cancelled while the base model")),
         "{:?}",
         result.notes
     );

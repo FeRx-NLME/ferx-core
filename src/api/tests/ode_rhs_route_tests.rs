@@ -6,7 +6,6 @@ use super::validation::check_ode_rhs_route;
 use super::*;
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{WarningCode, WarningSeverity};
-use std::collections::HashMap;
 
 /// A one-state elimination whose RHS is `rhs`.
 fn model(rhs: &str) -> CompiledModel {
@@ -44,34 +43,13 @@ fn subject(id: &str) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| 10.0 / (1.0 + t)).collect();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1, 1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -87,10 +65,7 @@ fn population() -> Population {
 }
 
 fn route_entries(r: &FitResult) -> Vec<&crate::types::WarningEntry> {
-    r.warnings_structured
-        .iter()
-        .filter(|e| e.category == WarningCode::OdeRhsRoute)
-        .collect()
+    r.warnings_structured.iter().filter(|e| e.category == WarningCode::OdeRhsRoute).collect()
 }
 
 /// Both sides of the gate in one test: an evaluation-only fit of the interpreted RHS
@@ -98,12 +73,8 @@ fn route_entries(r: &FitResult) -> Vec<&crate::types::WarningEntry> {
 /// the same fit of the compiled twin reports nothing.
 #[test]
 fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..Default::default()
-    }
-    .quiet();
+    let opts =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..Default::default() }.quiet();
     let pop = population();
 
     let m = model(INTERPRETED);
@@ -112,19 +83,10 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
     assert_eq!(entries.len(), 1, "{:?}", r.warnings);
     let e = entries[0];
     assert_eq!(e.severity, WarningSeverity::Info);
-    assert!(
-        e.message.starts_with("W_ODE_RHS_INTERPRETED: "),
-        "{}",
-        e.message
-    );
+    assert!(e.message.starts_with("W_ODE_RHS_INTERPRETED: "), "{}", e.message);
     assert!(e.message.contains("`tanh`"), "{}", e.message);
     assert!(e.message.contains("`d/dt(central)`"), "{}", e.message);
-    assert_eq!(
-        r.warnings.iter().filter(|w| **w == e.message).count(),
-        1,
-        "{:?}",
-        r.warnings
-    );
+    assert_eq!(r.warnings.iter().filter(|w| **w == e.message).count(), 1, "{:?}", r.warnings);
     let d = e.details.as_ref().expect("details");
     assert_eq!(d["route"], "interpreter");
     assert_eq!(d["site"], "`d/dt(central)`");
@@ -133,11 +95,7 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
         let m = model(rhs);
         let r = fit(&m, &pop, &m.default_params, &opts).expect("fit");
         assert!(route_entries(&r).is_empty(), "{rhs}: {:?}", r.warnings);
-        assert!(
-            !r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")),
-            "{rhs}: {:?}",
-            r.warnings
-        );
+        assert!(!r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")), "{rhs}: {:?}", r.warnings);
     }
 }
 

@@ -116,19 +116,12 @@ fn predict_at_zero(m: &CompiledModel, pop: &Population) -> HashMap<(String, u64)
 /// Every simulated IPRED equals `reference` to the bit, and is finite. `consumer` names
 /// the draw site in the failure.
 fn assert_rows_bit_equal(
-    consumer: &str,
-    rows: &[SimulationResult],
-    reference: &HashMap<(String, u64), f64>,
+    consumer: &str, rows: &[SimulationResult], reference: &HashMap<(String, u64), f64>,
 ) {
     assert!(!rows.is_empty(), "{consumer}: no rows to compare");
     for r in rows {
         let want = reference[&(r.id.clone(), r.time.to_bits())];
-        assert!(
-            r.ipred.is_finite(),
-            "{consumer}: IPRED {} at t={}",
-            r.ipred,
-            r.time
-        );
+        assert!(r.ipred.is_finite(), "{consumer}: IPRED {} at t={}", r.ipred, r.time);
         assert_eq!(
             r.ipred.to_bits(),
             want.to_bits(),
@@ -150,10 +143,7 @@ fn positive_definite_omega_draws_from_chol_unchanged() {
     let om = OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["A".into(), "B".into()]);
     assert!(om.sim_chol.is_none());
     let f = om.sim_draw_factor(Some(&om), &[true, true]);
-    assert!(
-        std::ptr::eq(&*f, &om.chol),
-        "a PD Ω must borrow `chol`, not rebuild it"
-    );
+    assert!(std::ptr::eq(&*f, &om.chol), "a PD Ω must borrow `chol`, not rebuild it");
 }
 
 #[test]
@@ -179,10 +169,7 @@ fn structural_zero_beside_a_block_factors_the_block_on_its_own() {
     m[(2, 0)] = 0.01;
     let om = OmegaMatrix::from_matrix(m, vec!["A".into(), "Z".into(), "B".into()], false);
     let f = om.sim_draw_factor(None, &[]);
-    let sub = DMatrix::from_row_slice(2, 2, &[0.09, 0.01, 0.01, 0.04])
-        .cholesky()
-        .unwrap()
-        .l();
+    let sub = DMatrix::from_row_slice(2, 2, &[0.09, 0.01, 0.01, 0.04]).cholesky().unwrap().l();
     assert_eq!(f[(0, 0)], sub[(0, 0)]);
     assert_eq!(f[(2, 0)], sub[(1, 0)]);
     assert_eq!(f[(2, 2)], sub[(1, 1)]);
@@ -223,10 +210,7 @@ fn a_fit_carried_fix_zero_is_recovered_from_the_declaration() {
     // (a) through the fit's own pack/unpack: `from_chol_factor`, no `sim_chol`.
     let fitted = unpack_params(&pack_params(declared), declared);
     assert!(fitted.omega.sim_chol.is_none());
-    assert!(
-        fitted.omega.matrix[(0, 0)] > 0.0,
-        "the fit carries the floor, not 0"
-    );
+    assert!(fitted.omega.matrix[(0, 0)] > 0.0, "the fit carries the floor, not 0");
     // How far the unpack path lands from the floor: `exp(ln 1e-4)²` is 10 ULP above 1e-8
     // (measured, macOS arm64 and Linux aarch64). `SIM_ZERO_RECOVERY_CEILING` (2e-8) clears
     // it by ~1e-8; the bound here is what the doc on that constant cites.
@@ -236,9 +220,7 @@ fn a_fit_carried_fix_zero_is_recovered_from_the_declaration() {
         "unpacked FIX-0 diagonal {:e} is {carried_ulps} ULP from 1e-8",
         fitted.omega.matrix[(0, 0)]
     );
-    let f = fitted
-        .omega
-        .sim_draw_factor(Some(&declared.omega), &declared.omega_fixed);
+    let f = fitted.omega.sim_draw_factor(Some(&declared.omega), &declared.omega_fixed);
     assert_eq!(f[(0, 0)], 0.0, "unpacked FIX-0 η not recovered as zero");
     assert_eq!(f[(1, 0)], 0.0);
     assert_eq!(f[(1, 1)], fitted.omega.matrix[(1, 1)].sqrt());
@@ -312,10 +294,7 @@ fn simulate_kappa_zero_fix_is_bit_equal_to_predict_iov_at_zero() {
     let mut reference = HashMap::new();
     for s in &pop.subjects {
         let n_groups = crate::stats::stacked_layout::group_count(s);
-        assert_eq!(
-            n_groups, 2,
-            "the fixture must carry two occasions, or κ is never drawn"
-        );
+        assert_eq!(n_groups, 2, "the fixture must carry two occasions, or κ is never drawn");
         let kappas = vec![vec![0.0; m.n_kappa]; n_groups];
         let p = crate::pk::predict_iov(&m, s, &m.default_params.theta, &[0.0], &kappas);
         for (t, v) in s.obs_times.iter().zip(p) {
@@ -332,18 +311,9 @@ fn simulate_kappa_zero_fix_is_bit_equal_to_predict_iov_at_zero() {
 #[test]
 fn simulate_with_uncertainty_draws_a_fit_carried_fix_zero_as_zero() {
     let src = model_src("  omega ETA_CL ~ 0.0 FIX", "TVCL * exp(ETA_CL)", "TVV")
-        .replace(
-            "theta TVCL(2.0, 0.01, 50.0)",
-            "theta TVCL(2.0, 0.01, 50.0) FIX",
-        )
-        .replace(
-            "theta TVV(20.0, 0.5, 200.0)",
-            "theta TVV(20.0, 0.5, 200.0) FIX",
-        )
-        .replace(
-            "theta TVKA(0.15, 0.005, 20.0)",
-            "theta TVKA(0.15, 0.005, 20.0) FIX",
-        )
+        .replace("theta TVCL(2.0, 0.01, 50.0)", "theta TVCL(2.0, 0.01, 50.0) FIX")
+        .replace("theta TVV(20.0, 0.5, 200.0)", "theta TVV(20.0, 0.5, 200.0) FIX")
+        .replace("theta TVKA(0.15, 0.005, 20.0)", "theta TVKA(0.15, 0.005, 20.0) FIX")
         // An ordinary σ: the shared 1e-10 sits below the σ rail, where the asymptotic
         // sampler rejects every draw. σ never reaches IPRED.
         .replace("sigma PROP ~ 1e-10 (sd)", "sigma PROP ~ 0.04");
@@ -369,11 +339,7 @@ fn simulate_with_uncertainty_draws_a_fit_carried_fix_zero_as_zero() {
         .into_iter()
         .map(|p| ((p.id, p.time.to_bits()), p.pred))
         .collect();
-    assert_rows_bit_equal(
-        "simulate_with_uncertainty η (fit-carried FIX zero)",
-        &rows,
-        &reference,
-    );
+    assert_rows_bit_equal("simulate_with_uncertainty η (fit-carried FIX zero)", &rows, &reference);
 }
 
 /// The non-degenerate pair: `ETA_CL ~ 0.0 FIX` beside `ETA_V ~ 0.09`. The zero η is
@@ -406,10 +372,7 @@ fn simulate_mixed_omega_zero_eta_is_exact_and_the_other_keeps_its_variance() {
         &m.default_params.theta,
         &[1e-4 * z[0], (0.09f64 + 1e-8).sqrt() * z[1]],
     );
-    assert!(
-        want.iter().zip(&old).any(|(a, b)| a != b),
-        "the twin does not straddle"
-    );
+    assert!(want.iter().zip(&old).any(|(a, b)| a != b), "the twin does not straddle");
     assert_eq!(rows.len(), want.len());
     for (r, w) in rows.iter().zip(&want) {
         assert!(r.ipred.is_finite());
@@ -443,10 +406,7 @@ fn bolus() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
 /// A static `predict` is not bit-comparable here (the adaptive driver integrates in
 /// decision segments), so the twin is the η = 0 reference on the same engine.
 fn assert_adaptive_matches_twin(
-    consumer: &str,
-    zero: &CompiledModel,
-    twin: &CompiledModel,
-    verify: bool,
+    consumer: &str, zero: &CompiledModel, twin: &CompiledModel, verify: bool,
 ) {
     let pop = population(&format!("adaptive_{}", zero.n_kappa), 2, false, |_| 0.0);
     let run = |m: &CompiledModel| {
@@ -479,11 +439,8 @@ fn adaptive_eta_zero_fix_is_bit_equal_to_the_eta_zero_twin() {
 
 #[test]
 fn adaptive_kappa_zero_fix_is_bit_equal_to_the_kappa_zero_twin() {
-    let twin = model(
-        "  omega ETA_CL ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.09",
-        "TVCL * exp(ETA_CL)",
-        "TVV",
-    );
+    let twin =
+        model("  omega ETA_CL ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.09", "TVCL * exp(ETA_CL)", "TVV");
     assert_adaptive_matches_twin("simulate_adaptive κ", &zero_fix_kappa(), &twin, false);
 }
 
@@ -491,11 +448,8 @@ fn adaptive_kappa_zero_fix_is_bit_equal_to_the_kappa_zero_twin() {
 fn adaptive_verifier_redraws_a_zero_kappa_from_the_build_loops_factor() {
     // Verifier on: its independent κ re-draw must resolve the same factor as the build
     // loop, or the bit-equality it asserts fails and the run is refused.
-    let twin = model(
-        "  omega ETA_CL ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.09",
-        "TVCL * exp(ETA_CL)",
-        "TVV",
-    );
+    let twin =
+        model("  omega ETA_CL ~ 0.0 FIX\n  kappa KAPPA_CL ~ 0.09", "TVCL * exp(ETA_CL)", "TVV");
     assert_adaptive_matches_twin(
         "simulate_adaptive verifier κ re-draw",
         &zero_fix_kappa(),
@@ -533,10 +487,7 @@ fn adaptive_eta_zero_fix_matches_the_closed_form() {
     // Bound: the ODE engines' 1e-10 (as #1611's anchors). Realised 4.2e-16 on Linux aarch64
     // (`b76a810b`); the regression it targets, the regularised zero drawn with sd 1e-4,
     // put it at 1.4e-4 at `3b88da7f` (seed 1).
-    assert!(
-        worst < 1e-10,
-        "simulate_adaptive η: worst rel vs closed form {worst:.3e}"
-    );
+    assert!(worst < 1e-10, "simulate_adaptive η: worst rel vs closed form {worst:.3e}");
 }
 
 // ── NPDE ─────────────────────────────────────────────────────────────────────────────

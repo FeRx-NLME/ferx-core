@@ -47,25 +47,14 @@ fn effective_method(odes: &str, fit_options: &str) -> OdeMethod {
     let model = parse_full_model(&source(odes, fit_options))
         .unwrap_or_else(|e| panic!("fixture must parse: {e}"))
         .model;
-    model
-        .ode_spec
-        .as_ref()
-        .expect("an [odes] model")
-        .effective_solver_opts()
-        .method
+    model.ode_spec.as_ref().expect("an [odes] model").effective_solver_opts().method
 }
 
 #[test]
 fn auto_resolves_to_linear_only_for_a_certified_system() {
     assert_eq!(effective_method(LINEAR, ""), OdeMethod::Linear);
-    assert_eq!(
-        effective_method(LINEAR, "  ode_method = auto"),
-        OdeMethod::Linear
-    );
-    assert_eq!(
-        effective_method(LINEAR, "  ode_method = linear"),
-        OdeMethod::Linear
-    );
+    assert_eq!(effective_method(LINEAR, "  ode_method = auto"), OdeMethod::Linear);
+    assert_eq!(effective_method(LINEAR, "  ode_method = linear"), OdeMethod::Linear);
     // Each way out of eligibility keeps `auto` on the integrator.
     let saturable = "  d/dt(depot) = -KA * depot
   d/dt(central) = KA * depot - CL * central / (V + central)";
@@ -80,11 +69,9 @@ fn auto_resolves_to_linear_only_for_a_certified_system() {
 
 #[test]
 fn a_named_integrator_opts_a_linear_model_out() {
-    for (token, method) in [
-        ("rk45", OdeMethod::Rk45),
-        ("rodas5p", OdeMethod::Rodas5P),
-        ("vern7", OdeMethod::Vern7),
-    ] {
+    for (token, method) in
+        [("rk45", OdeMethod::Rk45), ("rodas5p", OdeMethod::Rodas5P), ("vern7", OdeMethod::Vern7)]
+    {
         assert_eq!(
             effective_method(LINEAR, &format!("  ode_method = {token}")),
             method,
@@ -161,10 +148,7 @@ fn ode_method_linear_is_refused_on_an_analytical_model() {
             "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
         )
         .replace(&format!("[odes]\n{LINEAR}\n"), "");
-    assert!(
-        !analytical.contains("[odes]"),
-        "fixture must have no [odes] block"
-    );
+    assert!(!analytical.contains("[odes]"), "fixture must have no [odes] block");
     let e = match parse_full_model(&analytical) {
         Ok(_) => panic!("`ode_method = linear` must be refused on an analytical model"),
         Err(e) => e,
@@ -175,10 +159,7 @@ fn ode_method_linear_is_refused_on_an_analytical_model() {
         ),
         "{e}"
     );
-    assert!(
-        e.contains("so there is nothing for the option to act on; remove it."),
-        "{e}"
-    );
+    assert!(e.contains("so there is nothing for the option to act on; remove it."), "{e}");
     // The same model without the option parses: the refusal is the option's, not the fixture's.
     parse_full_model(&analytical.replace("  ode_method = linear", ""))
         .unwrap_or_else(|e| panic!("analytical twin must parse: {e}"));

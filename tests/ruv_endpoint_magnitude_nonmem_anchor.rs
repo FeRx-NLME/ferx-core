@@ -93,20 +93,12 @@ fn evaluate(m: &ferx_core::types::CompiledModel) -> f64 {
         threads: Some(2),
         ..FitOptions::default()
     };
-    fit(m, &pop, &m.default_params, &opts)
-        .expect("evaluation")
-        .ofv
+    fit(m, &pop, &m.default_params, &opts).expect("evaluation").ofv
 }
 
 fn assert_anchor(label: &str, ofv: f64, nonmem: f64) {
-    eprintln!(
-        "{label}: ferx {ofv:.12} vs NONMEM {nonmem:.12}, diff {:e}",
-        ofv - nonmem
-    );
-    assert!(
-        (ofv - nonmem).abs() < OFV_TOL,
-        "{label}: ferx {ofv} vs NONMEM {nonmem}"
-    );
+    eprintln!("{label}: ferx {ofv:.12} vs NONMEM {nonmem:.12}, diff {:e}", ofv - nonmem);
+    assert!((ofv - nonmem).abs() < OFV_TOL, "{label}: ferx {ofv} vs NONMEM {nonmem}");
 }
 
 const CMT_ERROR: &str = "  CMT=1: DV ~ additive(S * (1.0 + (TPF - 1.0) * EARLY))

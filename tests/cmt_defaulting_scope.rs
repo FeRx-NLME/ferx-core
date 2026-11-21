@@ -158,12 +158,9 @@ fn case_for(model: PkModel) -> Case {
             "  KA = TVKA\n  Q  = TVQ\n  V2 = TVV2",
             vec![2, 3],
         ),
-        PkModel::ThreeCptIv => (
-            "pk three_cpt_iv(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3)",
-            THREE_P,
-            THREE_I,
-            vec![2, 3],
-        ),
+        PkModel::ThreeCptIv => {
+            ("pk three_cpt_iv(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3)", THREE_P, THREE_I, vec![2, 3])
+        }
         PkModel::ThreeCptOral => (
             "pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA)",
             "  theta TVKA(1.0, 0.01, 10.0)\n  theta TVQ(3.0, 0.1, 50.0)\n  \
@@ -177,12 +174,9 @@ fn case_for(model: PkModel) -> Case {
         // `single_dose_concentration` never reads `dose.cmt`. Probing CMT=2 here is
         // the point — the prediction must come back identical, which is what earns
         // them the suppression.
-        PkModel::OneCptTransit => (
-            "pk one_cpt_transit(cl=CL, v=V, n=NN, mtt=MTT)",
-            TRANSIT_P,
-            TRANSIT_I,
-            vec![2],
-        ),
+        PkModel::OneCptTransit => {
+            ("pk one_cpt_transit(cl=CL, v=V, n=NN, mtt=MTT)", TRANSIT_P, TRANSIT_I, vec![2])
+        }
         PkModel::TwoCptTransit => (
             // `v1`, not `v`, on the two-compartment transit form.
             "pk two_cpt_transit(cl=CL, v1=V, q=Q, v2=V2, n=NN, mtt=MTT)",
@@ -191,12 +185,7 @@ fn case_for(model: PkModel) -> Case {
             "  Q  = TVQ\n  V2 = TVV2\n  MTT = TVMTT\n  NN = TVNN",
             vec![2, 3],
         ),
-        PkModel::OneCptIg => (
-            "pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)",
-            IG_P,
-            IG_I,
-            vec![2],
-        ),
+        PkModel::OneCptIg => ("pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)", IG_P, IG_I, vec![2]),
         PkModel::TwoCptIg => (
             "pk two_cpt_ig(cl=CL, v1=V, q=Q, v2=V2, mat=MAT, cv2=CV2)",
             "  theta TVQ(3.0, 0.1, 50.0)\n  theta TVV2(80.0, 5.0, 500.0)\n  \
@@ -205,10 +194,7 @@ fn case_for(model: PkModel) -> Case {
             vec![2, 3],
         ),
     };
-    Case {
-        src: model_src(structural, params, indiv),
-        probe_cmts,
-    }
+    Case { src: model_src(structural, params, indiv), probe_cmts }
 }
 
 /// Every analytical topology. Parallel to the `match` above; `case_for`'s
@@ -228,10 +214,7 @@ const ALL: [PkModel; 10] = [
 ];
 
 fn temp(contents: &str, suffix: &str) -> NamedTempFile {
-    let mut f = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(suffix).tempfile().expect("temp file");
     write!(f, "{contents}").expect("write");
     f.flush().expect("flush");
     f
@@ -244,21 +227,15 @@ fn pop_of(csv: &str) -> Population {
 
 /// A one-subject dataset dosing `dose_cmt`, observing on compartment 1.
 fn csv_with_cmt(dose_cmt: usize) -> String {
-    let obs: String = OBS_TIMES
-        .iter()
-        .map(|t| format!("1,{t},5.0,0,.,1,0"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let obs: String =
+        OBS_TIMES.iter().map(|t| format!("1,{t},5.0,0,.,1,0")).collect::<Vec<_>>().join("\n");
     format!("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,{dose_cmt},1\n{obs}\n")
 }
 
 /// The same rows with the `CMT` column removed entirely — the #1009 case.
 fn csv_without_cmt() -> String {
-    let obs: String = OBS_TIMES
-        .iter()
-        .map(|t| format!("1,{t},5.0,0,.,0"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let obs: String =
+        OBS_TIMES.iter().map(|t| format!("1,{t},5.0,0,.,0")).collect::<Vec<_>>().join("\n");
     format!("ID,TIME,DV,EVID,AMT,MDV\n1,0,.,1,100,1\n{obs}\n")
 }
 
@@ -341,10 +318,7 @@ fn warns_without_cmt(src: &str) -> bool {
     let m = temp(src, ".ferx");
     let d = temp(&csv_without_cmt(), ".csv");
     let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
-    report
-        .diagnostics
-        .iter()
-        .any(|x| x.code == "W_CMT_DEFAULTED")
+    report.diagnostics.iter().any(|x| x.code == "W_CMT_DEFAULTED")
 }
 
 #[test]
@@ -446,12 +420,9 @@ fn the_warning_fires_exactly_where_the_dose_compartment_is_observable() {
 #[test]
 fn a_topology_with_no_dose_channels_either_rejects_cmt_or_ignores_it_bit_for_bit() {
     let mut outcomes: Vec<String> = Vec::new();
-    for model in [
-        PkModel::OneCptTransit,
-        PkModel::TwoCptTransit,
-        PkModel::OneCptIg,
-        PkModel::TwoCptIg,
-    ] {
+    for model in
+        [PkModel::OneCptTransit, PkModel::TwoCptTransit, PkModel::OneCptIg, PkModel::TwoCptIg]
+    {
         let case = case_for(model);
         let base = base_preds(&case.src, model);
         assert!(
@@ -492,9 +463,6 @@ fn a_topology_with_no_dose_channels_either_rejects_cmt_or_ignores_it_bit_for_bit
             }
         }
     }
-    assert!(
-        !outcomes.is_empty(),
-        "no probes ran — the case table lost its transit/IG entries"
-    );
+    assert!(!outcomes.is_empty(), "no probes ran — the case table lost its transit/IG entries");
     eprintln!("{}", outcomes.join("\n"));
 }

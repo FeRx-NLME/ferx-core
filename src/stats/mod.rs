@@ -1,3 +1,4 @@
+pub mod cif;
 pub mod convergence;
 pub mod km;
 pub mod likelihood;

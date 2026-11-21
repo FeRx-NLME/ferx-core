@@ -3,12 +3,7 @@
 use super::*;
 
 fn ev(time: f64, event_type: EventType, entry_time: f64) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time,
-        cmt: 2,
-    }
+    ObsRecord::Event { time, event_type, entry_time, cmt: 2 }
 }
 
 fn exact(t: f64, entry: f64) -> ObsRecord {
@@ -35,19 +30,8 @@ fn golden_record_sets() -> Vec<(&'static str, Vec<ObsRecord>)> {
         ("interval", vec![interval(3.0, 5.0, 0.0)]),
         ("interval_tight_entry", vec![interval(10.0, 10.0001, 2.0)]),
         ("two_records", vec![exact(4.0, 0.0), cens(9.0, 1.0)]),
-        (
-            "stream",
-            vec![exact(5.0, 0.0), exact(10.0, 0.0), cens(30.0, 0.0)],
-        ),
-        (
-            "stream_entry",
-            vec![
-                exact(5.0, 2.0),
-                exact(6.5, 2.0),
-                exact(11.0, 2.0),
-                cens(20.0, 2.0),
-            ],
-        ),
+        ("stream", vec![exact(5.0, 0.0), exact(10.0, 0.0), cens(30.0, 0.0)]),
+        ("stream_entry", vec![exact(5.0, 2.0), exact(6.5, 2.0), exact(11.0, 2.0), cens(20.0, 2.0)]),
     ]
 }
 
@@ -64,18 +48,8 @@ fn golden_families() -> Vec<(&'static str, HazardFamily, Vec<f64>)> {
 fn golden_recurrences() -> [(&'static str, TteRecurrence); 3] {
     [
         ("single", TteRecurrence::Single),
-        (
-            "forward",
-            TteRecurrence::Repeated {
-                clock: RtteClock::Forward,
-            },
-        ),
-        (
-            "reset",
-            TteRecurrence::Repeated {
-                clock: RtteClock::Reset,
-            },
-        ),
+        ("forward", TteRecurrence::Repeated { clock: RtteClock::Forward }),
+        ("reset", TteRecurrence::Repeated { clock: RtteClock::Reset }),
     ]
 }
 
@@ -257,10 +231,7 @@ fn visitor_refactor_keeps_every_golden_nll_bit() {
 
 /// Collect a record set's terms and its NLL under one analytic family and recurrence.
 fn terms_and_nll(
-    records: &[ObsRecord],
-    family: HazardFamily,
-    recurrence: TteRecurrence,
-    params: &[f64],
+    records: &[ObsRecord], family: HazardFamily, recurrence: TteRecurrence, params: &[f64],
 ) -> (Vec<RecordTerm<f64>>, f64) {
     let mut terms = Vec::new();
     let nll = analytic_tte_nll_visit_g(records, family, recurrence, params, &mut |t| terms.push(t));
@@ -300,11 +271,7 @@ fn record_terms_fold_to_the_scored_nll() {
                     continue;
                 }
                 assert_eq!(terms.len(), records.len(), "{fname}/{rname}/{cname}");
-                assert_eq!(
-                    fold(&terms).to_bits(),
-                    nll.to_bits(),
-                    "{fname}/{rname}/{cname}"
-                );
+                assert_eq!(fold(&terms).to_bits(), nll.to_bits(), "{fname}/{rname}/{cname}");
                 checked += 1;
             }
         }
@@ -314,10 +281,7 @@ fn record_terms_fold_to_the_scored_nll() {
 }
 
 fn single_rows(
-    records: &[ObsRecord],
-    family: HazardFamily,
-    recurrence: TteRecurrence,
-    params: &[f64],
+    records: &[ObsRecord], family: HazardFamily, recurrence: TteRecurrence, params: &[f64],
 ) -> Vec<crate::types::TteObsDiagnostic> {
     let (terms, nll) = terms_and_nll(records, family, recurrence, params);
     assert!(nll < SUBJECT_SENTINEL_NLL);
@@ -341,21 +305,9 @@ fn residuals_of_a_left_truncated_exponential_event_are_closed_form() {
         let r = &rows[0];
         assert_eq!((r.cmt, r.time, r.dv), (2, 5.0, 1.0), "{cname}");
         assert!((r.coxsnell - 0.3).abs() < 1e-15, "{cname}: {}", r.coxsnell);
-        assert!(
-            (r.martingale - 0.7).abs() < 1e-15,
-            "{cname}: {}",
-            r.martingale
-        );
-        assert!(
-            (r.pit - (-0.3_f64).exp()).abs() < 1e-15,
-            "{cname}: {}",
-            r.pit
-        );
-        assert!(
-            (r.deviance - d).abs() < 1e-14,
-            "{cname}: {} vs {d}",
-            r.deviance
-        );
+        assert!((r.martingale - 0.7).abs() < 1e-15, "{cname}: {}", r.martingale);
+        assert!((r.pit - (-0.3_f64).exp()).abs() < 1e-15, "{cname}: {}", r.pit);
+        assert!((r.deviance - d).abs() < 1e-14, "{cname}: {} vs {d}", r.deviance);
     }
 }
 
@@ -374,17 +326,13 @@ fn rtte_residuals_use_the_gap_on_reset_and_the_increment_on_forward() {
     let reset = single_rows(
         &records,
         HazardFamily::Weibull,
-        TteRecurrence::Repeated {
-            clock: RtteClock::Reset,
-        },
+        TteRecurrence::Repeated { clock: RtteClock::Reset },
         &[scale, shape],
     );
     let forward = single_rows(
         &records,
         HazardFamily::Weibull,
-        TteRecurrence::Repeated {
-            clock: RtteClock::Forward,
-        },
+        TteRecurrence::Repeated { clock: RtteClock::Forward },
         &[scale, shape],
     );
     let want_reset = [1.0 - h(5.0), 1.0 - h(5.0), -h(20.0)];
@@ -452,28 +400,16 @@ fn deviance_residual_is_finite_signed_and_zero_where_m_is() {
 fn tte_rows_blank_intervals_and_the_sentinel_rail() {
     let records = vec![
         exact(4.0, 0.0),
-        ObsRecord::DiscreteState {
-            time: 5.0,
-            raw_time: 5.0,
-            state: 1,
-            cmt: 3,
-        },
+        ObsRecord::DiscreteState { time: 5.0, raw_time: 5.0, state: 1, cmt: 3 },
         interval(6.0, 8.0, 0.0),
         cens(9.0, 0.0),
     ];
-    let (terms, nll) = terms_and_nll(
-        &records,
-        HazardFamily::Exponential,
-        TteRecurrence::Single,
-        &[0.1],
-    );
+    let (terms, nll) =
+        terms_and_nll(&records, HazardFamily::Exponential, TteRecurrence::Single, &[0.1]);
     assert!(nll < SUBJECT_SENTINEL_NLL);
     let rows = tte_record_diagnostics(&records, Some(&terms), |t| t + 100.0);
     assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows.iter().map(|r| r.time).collect::<Vec<_>>(),
-        [104.0, 108.0, 109.0]
-    );
+    assert_eq!(rows.iter().map(|r| r.time).collect::<Vec<_>>(), [104.0, 108.0, 109.0]);
     assert_eq!((rows[0].dv, rows[2].dv), (1.0, 0.0));
     assert!((rows[0].coxsnell - 0.4).abs() < 1e-15);
     assert!((rows[2].coxsnell - 0.9).abs() < 1e-15);
@@ -501,11 +437,7 @@ fn tte_rows_blank_intervals_and_the_sentinel_rail() {
 fn a_round_off_negative_increment_is_reported_as_scored() {
     let records = vec![cens(9.0, 0.0)];
     let dh = -1e-15;
-    let terms = [RecordTerm::Point {
-        index: 0,
-        dh,
-        log_h: None,
-    }];
+    let terms = [RecordTerm::Point { index: 0, dh, log_h: None }];
     let rows = tte_record_diagnostics(&records, Some(&terms), |t| t);
     let r = &rows[0];
     assert_eq!(r.coxsnell, dh);

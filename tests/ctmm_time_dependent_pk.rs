@@ -152,12 +152,8 @@ fn the_time_free_control_fits() {
 #[test]
 fn ferx_check_reports_it_without_data() {
     for (cl, refused) in [(TIME_CL, true), (FREE_CL, false)] {
-        let mut f = tempfile::Builder::new()
-            .suffix(".ferx")
-            .tempfile()
-            .expect("create temp model");
-        f.write_all(MODEL.replace("CL_EXPR", cl).as_bytes())
-            .expect("write temp model");
+        let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
+        f.write_all(MODEL.replace("CL_EXPR", cl).as_bytes()).expect("write temp model");
         let report = validate_model_file(f.path().to_str().expect("utf-8 path"), None);
         let hits: Vec<_> = report
             .diagnostics
@@ -168,10 +164,7 @@ fn ferx_check_reports_it_without_data() {
             assert!(!report.valid, "{cl}: {:?}", report.diagnostics);
             assert_eq!(hits.len(), 1, "{cl}: {:?}", report.diagnostics);
             assert_eq!(hits[0].block.as_deref(), Some("markov_model"));
-            assert!(
-                hits[0].line.is_some(),
-                "the [markov_model] header line is attached"
-            );
+            assert!(hits[0].line.is_some(), "the [markov_model] header line is attached");
             assert_is_the_1918_refusal("ferx check", &hits[0].message);
         } else {
             assert!(hits.is_empty(), "{cl}: {hits:?}");
@@ -189,10 +182,7 @@ fn predict_and_simulate_are_not_pre_empted() {
     let pop = population(&m);
     let preds = predict(&m, &pop, &m.default_params)
         .expect("predict() of the Gaussian half must not be refused by the CTMM check");
-    assert!(
-        !preds.is_empty() && preds.iter().all(|p| p.pred.is_finite()),
-        "{preds:?}"
-    );
+    assert!(!preds.is_empty() && preds.iter().all(|p| p.pred.is_finite()), "{preds:?}");
     let err = simulate(&m, &pop, &m.default_params, 1).expect_err("simulate refuses a CTMM");
     assert_eq!(err.code(), Some("E_CTMM_UNSUPPORTED"), "{err}");
 }
@@ -221,18 +211,11 @@ fn run_covariance_and_run_sir_refuse_it() {
 
     // The straddle: on the control model whatever these return is not this refusal.
     for (entry, out) in [
-        (
-            "run_covariance",
-            run_covariance(&res, Some(&control), Some(&pop), &opts),
-        ),
+        ("run_covariance", run_covariance(&res, Some(&control), Some(&pop), &opts)),
         ("run_sir", run_sir(&res, Some(&control), Some(&pop), &opts)),
     ] {
         if let Err(e) = out {
-            assert_ne!(
-                e.code(),
-                Some("E_ENDPOINT_TIME_DEPENDENT_PK"),
-                "{entry}: {e}"
-            );
+            assert_ne!(e.code(), Some("E_ENDPOINT_TIME_DEPENDENT_PK"), "{entry}: {e}");
         }
     }
 }
@@ -300,10 +283,7 @@ fn fit_refuses_a_tv_covariate_seen_only_on_ctmm_rows() {
     for (name, csv) in [
         ("change on state rows", DATA_WT_ON_STATE_ROWS),
         ("baseline from a state row", DATA_BASELINE_FROM_STATE_ROW),
-        (
-            "baseline from a skipped row",
-            DATA_BASELINE_FROM_A_SKIPPED_ROW,
-        ),
+        ("baseline from a skipped row", DATA_BASELINE_FROM_A_SKIPPED_ROW),
     ] {
         let pop = population_from(&refusing, csv);
         assert_eq!(
@@ -313,17 +293,10 @@ fn fit_refuses_a_tv_covariate_seen_only_on_ctmm_rows() {
         );
         let err = fit(&refusing, &pop, &refusing.default_params, &fit_opts()).expect_err(name);
         assert_eq!(err.code(), Some("E_ENDPOINT_TV_COVARIATE"), "{name}: {err}");
-        assert!(
-            err.to_string().contains("`CL` reads covariate `WT`"),
-            "{name}: {err}"
-        );
+        assert!(err.to_string().contains("`CL` reads covariate `WT`"), "{name}: {err}");
         let res = fit(&control, &pop, &control.default_params, &fit_opts())
             .unwrap_or_else(|e| panic!("{name}: the WT-free control must fit: {e}"));
-        assert!(
-            res.ofv.is_finite() && res.ofv.abs() < 1e6,
-            "{name}: {}",
-            res.ofv
-        );
+        assert!(res.ofv.is_finite() && res.ofv.abs() < 1e6, "{name}: {}", res.ofv);
     }
 }
 
@@ -340,18 +313,11 @@ fn run_covariance_and_run_sir_refuse_a_tv_covariate_on_the_disposition() {
 
     let res = fit(&control, &pop, &control.default_params, &opts).expect("control fits");
     for (entry, out) in [
-        (
-            "run_covariance",
-            run_covariance(&res, Some(&refusing), Some(&pop), &opts),
-        ),
+        ("run_covariance", run_covariance(&res, Some(&refusing), Some(&pop), &opts)),
         ("run_sir", run_sir(&res, Some(&refusing), Some(&pop), &opts)),
     ] {
         let err = out.expect_err(entry);
-        assert_eq!(
-            err.code(),
-            Some("E_ENDPOINT_TV_COVARIATE"),
-            "{entry}: {err}"
-        );
+        assert_eq!(err.code(), Some("E_ENDPOINT_TV_COVARIATE"), "{entry}: {err}");
         let msg = err.to_string();
         assert!(
             msg.contains("[markov_model] on CMT=5") && msg.contains("`CL` reads covariate `WT`"),
@@ -359,10 +325,7 @@ fn run_covariance_and_run_sir_refuse_a_tv_covariate_on_the_disposition() {
         );
     }
     for (entry, out) in [
-        (
-            "run_covariance",
-            run_covariance(&res, Some(&control), Some(&pop), &opts),
-        ),
+        ("run_covariance", run_covariance(&res, Some(&control), Some(&pop), &opts)),
         ("run_sir", run_sir(&res, Some(&control), Some(&pop), &opts)),
     ] {
         if let Err(e) = out {

@@ -3,7 +3,7 @@
 //! observations do, and each carries its own level index in its covariate snapshot.
 
 use super::*;
-use crate::api::levels::{level_index_finding, LevelIndexFinding};
+use crate::levels::{level_index_finding, LevelIndexFinding};
 use crate::types::{ObsRecord, ParsedModel};
 
 /// The binary MBMA shape of #2111's B1, small: one subject per study, an arm covariate
@@ -25,9 +25,7 @@ const BINARY: &str = r#"
 /// [`BINARY`] without the arm term, so no covariate varies within a subject and the
 /// reader writes no per-record snapshot: the binder has to make them.
 fn no_arm() -> String {
-    BINARY
-        .replace(" + EMAX * TRT", "")
-        .replace("  theta EMAX(0.5, -5.0, 5.0)\n", "")
+    BINARY.replace(" + EMAX * TRT", "").replace("  theta EMAX(0.5, -5.0, 5.0)\n", "")
 }
 
 const HEADER: &str = "ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT\n";
@@ -109,9 +107,7 @@ fn binary_records_define_the_levels_and_each_carries_its_own() {
         "fixture precondition: the reader writes no snapshot without a time-varying covariate"
     );
     let (parsed, pop) = bound(&text, &data).expect("binary records define the levels");
-    let labels = parsed.model.theta_blocks().level_blocks()[0]
-        .labels()
-        .to_vec();
+    let labels = parsed.model.theta_blocks().level_blocks()[0].labels().to_vec();
     assert_eq!(
         labels,
         [1, 2, 3]
@@ -128,11 +124,8 @@ fn binary_records_define_the_levels_and_each_carries_its_own() {
         let levels = record_levels(subject);
         assert_eq!(levels.len(), 16, "subject {}", subject.id);
         for (study, time, index) in levels {
-            let want = labels
-                .iter()
-                .position(|l| *l == format!("STUDY={study},TIME={time}"))
-                .unwrap()
-                + 1;
+            let want =
+                labels.iter().position(|l| *l == format!("STUDY={study},TIME={time}")).unwrap() + 1;
             assert_eq!(index, want as f64, "subject {} TIME {time}", subject.id);
         }
     }
@@ -146,10 +139,7 @@ fn binary_records_carry_the_index_beside_their_own_covariates() {
     let s = &pop.subjects[1];
     let snaps = s.record_covariate_snapshots().expect("aligned");
     let trts: Vec<f64> = snaps.iter().map(|m| m["TRT"]).collect();
-    assert!(
-        trts.contains(&0.0) && trts.contains(&1.0),
-        "TRT kept: {trts:?}"
-    );
+    assert!(trts.contains(&0.0) && trts.contains(&1.0), "TRT kept: {trts:?}");
     let indices: Vec<f64> = record_levels(s).iter().map(|l| l.2).collect();
     assert_eq!(
         {
@@ -190,18 +180,11 @@ fn a_record_after_a_reset_keys_on_its_written_time() {
         .obs_records
         .iter()
         .any(|r| matches!(r, ObsRecord::DiscreteState { time, raw_time, .. } if time != raw_time));
-    assert!(
-        shifted,
-        "fixture precondition: the reset shifts the engine clock"
-    );
+    assert!(shifted, "fixture precondition: the reset shifts the engine clock");
     let (parsed, _) = bound(&text, &data).expect("binds");
-    let labels = parsed.model.theta_blocks().level_blocks()[0]
-        .labels()
-        .to_vec();
+    let labels = parsed.model.theta_blocks().level_blocks()[0].labels().to_vec();
     assert_eq!(labels.len(), 6, "3 studies × 2 written visits: {labels:?}");
-    assert!(labels
-        .iter()
-        .all(|l| l.ends_with("TIME=0") || l.ends_with("TIME=4")));
+    assert!(labels.iter().all(|l| l.ends_with("TIME=0") || l.ends_with("TIME=4")));
 }
 
 /// F1. The index check re-derives each binary record's index from its own level and
@@ -218,13 +201,7 @@ fn the_index_check_reads_each_binary_record() {
     let r = s.obs_records.len() - 1;
     s.endpoint_covariates[r].insert(col, 1.0);
     match level_index_finding(decl, &pop) {
-        Some(LevelIndexFinding::Misindexed {
-            id,
-            time,
-            label,
-            want,
-            got,
-        }) => {
+        Some(LevelIndexFinding::Misindexed { id, time, label, want, got }) => {
             assert_eq!(id, "3");
             assert_eq!(time, Some(4.0));
             assert_eq!(label, "STUDY=3,TIME=4");
@@ -276,17 +253,10 @@ fn a_subject_with_tte_records_is_refused_only_when_its_levels_differ() {
   family = exponential
   scale  = LAM
 "#;
-    let state = |time: f64, state: usize| ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt: 1,
-    };
+    let state =
+        |time: f64, state: usize| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 1 };
     let subject = |id: u32, study: f64, times: [f64; 2]| {
-        let mut s = Subject {
-            id: id.to_string(),
-            ..Default::default()
-        };
+        let mut s = Subject { id: id.to_string(), ..Default::default() };
         s.covariates.insert("STUDY".into(), study);
         s.obs_records = vec![
             state(times[0], 1),
@@ -325,18 +295,11 @@ fn a_subject_with_tte_records_is_refused_only_when_its_levels_differ() {
          fit the time-to-event endpoint separately."
     );
     let mut p = parse_full_model(text).unwrap();
-    let mut pop = population(vec![
-        subject(1, 1.0, [0.0, 0.0]),
-        subject(2, 2.0, [4.0, 4.0]),
-    ]);
+    let mut pop = population(vec![subject(1, 1.0, [0.0, 0.0]), subject(2, 2.0, [4.0, 4.0])]);
     crate::api::bind_theta_levels(&mut p, text, &mut pop).expect("one level per subject binds");
     let col = level_index_column("PLACEBO");
     let got: Vec<f64> = pop.subjects.iter().map(|s| s.covariates[&col]).collect();
-    assert_eq!(
-        got,
-        vec![1.0, 2.0],
-        "each at its own level, in the baseline"
-    );
+    assert_eq!(got, vec![1.0, 2.0], "each at its own level, in the baseline");
 }
 
 /// Three studies (one subject each) of state records on CMT 5 at visits 0, 1, 2, 3,
@@ -345,10 +308,7 @@ fn a_subject_with_tte_records_is_refused_only_when_its_levels_differ() {
 fn state_population() -> Population {
     let subjects = (1..=3u32)
         .map(|s| {
-            let mut subject = Subject {
-                id: s.to_string(),
-                ..Default::default()
-            };
+            let mut subject = Subject { id: s.to_string(), ..Default::default() };
             subject.covariates.insert("STUDY".into(), f64::from(s));
             subject.obs_records = (0..8u32)
                 .map(|k| {
@@ -400,18 +360,13 @@ fn dtmm_records_define_the_levels_of_a_block_their_probabilities_read() {
     let mut pop = state_population();
     crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
         .unwrap_or_else(|e| panic!("DTMM records define the levels: {e}"));
-    let labels = parsed.model.theta_blocks().level_blocks()[0]
-        .labels()
-        .to_vec();
+    let labels = parsed.model.theta_blocks().level_blocks()[0].labels().to_vec();
     assert_eq!(labels.len(), 12, "3 studies × 4 visits: {labels:?}");
     for subject in &pop.subjects {
         let levels = record_levels(subject);
         for (study, time, index) in levels {
-            let want = labels
-                .iter()
-                .position(|l| *l == format!("STUDY={study},TIME={time}"))
-                .unwrap()
-                + 1;
+            let want =
+                labels.iter().position(|l| *l == format!("STUDY={study},TIME={time}")).unwrap() + 1;
             assert_eq!(index, want as f64, "subject {} TIME {time}", subject.id);
         }
     }
@@ -463,7 +418,7 @@ fn a_dtmm_chains_first_record_reads_no_level() {
     }
     crate::api::bind_theta_levels(&mut parsed, text, &mut pop)
         .unwrap_or_else(|e| panic!("DTMM records define the levels: {e}"));
-    let found = crate::api::levels::one_subject_levels(&parsed.model, &pop);
+    let found = crate::levels::one_subject_levels(&parsed.model, &pop);
     assert_eq!(found.len(), 1, "{found:?}");
     let (block, single, n) = &found[0];
     assert_eq!((block.as_str(), *n), ("PLACEBO", 12));
@@ -500,9 +455,7 @@ fn a_ctmm_generator_reading_a_changing_level_is_refused_naming_the_block() {
     .unwrap()
     .model;
     assert!(
-        model.theta_blocks().level_blocks()[0]
-            .record_cmts
-            .is_empty(),
+        model.theta_blocks().level_blocks()[0].record_cmts.is_empty(),
         "a CTMM's records define no levels"
     );
     let col = level_index_column("PLACEBO");
@@ -516,10 +469,8 @@ fn a_ctmm_generator_reading_a_changing_level_is_refused_naming_the_block() {
             ..Default::default()
         };
         s.covariates.insert(col.clone(), 1.0);
-        s.obs_covariates = vec![
-            HashMap::from([(col.clone(), 1.0)]),
-            HashMap::from([(col.clone(), second)]),
-        ];
+        s.obs_covariates =
+            vec![HashMap::from([(col.clone(), 1.0)]), HashMap::from([(col.clone(), second)])];
         Population {
             subjects: vec![s],
             covariate_names: Vec::new(),
@@ -557,18 +508,10 @@ fn a_ctmm_generator_reading_a_changing_level_is_refused_naming_the_block() {
 fn the_binary_refusal_names_a_changing_level_block_and_how_to_re_key_it() {
     let model = parse_full_model(&no_arm()).unwrap().model;
     let col = level_index_column("PLACEBO");
-    let mut s = Subject {
-        id: "7".into(),
-        ..Default::default()
-    };
+    let mut s = Subject { id: "7".into(), ..Default::default() };
     s.covariates.insert(col.clone(), 1.0);
     s.obs_records = vec![
-        ObsRecord::DiscreteState {
-            time: 0.0,
-            raw_time: 0.0,
-            state: 1,
-            cmt: 1,
-        },
+        ObsRecord::DiscreteState { time: 0.0, raw_time: 0.0, state: 1, cmt: 1 },
         ObsRecord::Event {
             time: 9.0,
             event_type: crate::types::EventType::RightCensored,
@@ -576,10 +519,8 @@ fn the_binary_refusal_names_a_changing_level_block_and_how_to_re_key_it() {
             cmt: 2,
         },
     ];
-    s.endpoint_covariates = vec![
-        HashMap::from([(col.clone(), 1.0)]),
-        HashMap::from([(col.clone(), 2.0)]),
-    ];
+    s.endpoint_covariates =
+        vec![HashMap::from([(col.clone(), 1.0)]), HashMap::from([(col.clone(), 2.0)])];
     let pop = Population {
         subjects: vec![s],
         covariate_names: Vec::new(),
@@ -626,20 +567,12 @@ fn the_unindexed_refusal_names_the_records_that_define_levels() {
   scale  = LAM * exp(PLACEBO)
 "#;
     let subject = |id: u32, records: Vec<ObsRecord>| {
-        let mut s = Subject {
-            id: id.to_string(),
-            ..Default::default()
-        };
+        let mut s = Subject { id: id.to_string(), ..Default::default() };
         s.covariates.insert("STUDY".into(), f64::from(id));
         s.obs_records = records;
         s
     };
-    let state = |state: usize| ObsRecord::DiscreteState {
-        time: 0.0,
-        raw_time: 0.0,
-        state,
-        cmt: 1,
-    };
+    let state = |state: usize| ObsRecord::DiscreteState { time: 0.0, raw_time: 0.0, state, cmt: 1 };
     let tte = ObsRecord::Event {
         time: 9.0,
         event_type: crate::types::EventType::Exact,
@@ -671,20 +604,15 @@ fn the_unindexed_refusal_names_the_records_that_define_levels() {
     );
 
     // The fit's levels, re-read with subject 3: the same claim about the fit.
-    let fit_pop = |subjects: Vec<Subject>| Population {
-        subjects,
-        ..pop.clone()
-    };
+    let fit_pop = |subjects: Vec<Subject>| Population { subjects, ..pop.clone() };
     let mut parsed = parse_full_model(text).unwrap();
     // Subject 1 also carries an event, so `LAM` is identified on the fit's data.
     let mut with_event = pop.subjects[..2].to_vec();
-    with_event[0]
-        .obs_records
-        .push(pop.subjects[2].obs_records[0].clone());
+    with_event[0].obs_records.push(pop.subjects[2].obs_records[0].clone());
     let mut fitted = fit_pop(with_event);
     crate::api::bind_theta_levels(&mut parsed, text, &mut fitted).expect("studies 1 and 2 bind");
     let mut reread = fit_pop(pop.subjects.clone());
-    let err = crate::api::levels::write_fitted_level_columns(
+    let err = crate::levels::write_fitted_level_columns(
         &parsed.model,
         &mut reread,
         &parsed.model.data_bindings().levels,
@@ -713,10 +641,9 @@ fn the_unindexed_refusal_names_the_records_that_define_levels() {
 /// as absorbed.
 #[test]
 fn an_eta_on_the_arm_is_not_absorbed_by_a_visit_block() {
-    for logit in [
-        "TVL + PLACEBO + EMAX * TRT * exp(ETA_S)",
-        "TVL + PLACEBO + EMAX * TRT + ETA_S * TRT",
-    ] {
+    for logit in
+        ["TVL + PLACEBO + EMAX * TRT * exp(ETA_S)", "TVL + PLACEBO + EMAX * TRT + ETA_S * TRT"]
+    {
         let text = BINARY
             .replace(", contrast = sum_to_zero_within", "")
             .replace("TVL + PLACEBO + ETA_S + EMAX * TRT", logit);
@@ -735,10 +662,8 @@ fn an_eta_on_the_arm_is_not_absorbed_by_a_visit_block() {
 /// holds vacuously) and the η reads as absorbed.
 #[test]
 fn a_visit_block_shared_by_studies_does_not_absorb_the_study_eta() {
-    let text = BINARY.replace(
-        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
-        "PLACEBO[TIME]",
-    );
+    let text =
+        BINARY.replace("PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]", "PLACEBO[TIME]");
     let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
     assert_eq!(decl.contrast(), LevelContrast::SumToZero);
@@ -755,10 +680,7 @@ fn a_visit_block_shared_by_studies_does_not_absorb_the_study_eta() {
 #[test]
 fn a_subject_constant_block_reaches_snapshots_the_reader_wrote() {
     let text = BINARY
-        .replace(
-            "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
-            "PLACEBO[STUDY]",
-        )
+        .replace("PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]", "PLACEBO[STUDY]")
         .replace(" + ETA_S", "")
         .replace("  omega ETA_S ~ 0.25\n", "");
     let (parsed, pop) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
@@ -779,13 +701,9 @@ fn a_subject_constant_block_reaches_snapshots_the_reader_wrote() {
 /// readout".
 #[test]
 fn the_share_site_names_the_binary_predictor() {
-    let text = BINARY.replace(
-        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
-        "PLACEBO[STUDY]",
-    );
-    let err = bound(&text, &csv(&[0, 4], true))
-        .err()
-        .expect("not identified");
+    let text =
+        BINARY.replace("PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]", "PLACEBO[STUDY]");
+    let err = bound(&text, &csv(&[0, 4], true)).err().expect("not identified");
     assert!(
         err.contains("the `[binary_model]` predictor reads this block and a random effect"),
         "{err}"
@@ -854,12 +772,7 @@ fn the_gather_index_check_reads_each_binary_record() {
             ..Default::default()
         };
         s.obs_records = [0.0, 4.0]
-            .map(|t| ObsRecord::DiscreteState {
-                time: t,
-                raw_time: t,
-                state: 1,
-                cmt: 1,
-            })
+            .map(|t| ObsRecord::DiscreteState { time: t, raw_time: t, state: 1, cmt: 1 })
             .to_vec();
         Population {
             subjects: vec![s],
@@ -880,11 +793,7 @@ fn the_gather_index_check_reads_each_binary_record() {
     let refused = codes(3.0);
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0].0, "E_THETA_GATHER_INDEX_RANGE");
-    assert!(
-        refused[0].1.contains("is 3 on subject `1` at TIME 4"),
-        "{}",
-        refused[0].1
-    );
+    assert!(refused[0].1.contains("is 3 on subject `1` at TIME 4"), "{}", refused[0].1);
     assert!(codes(2.0).is_empty(), "in range");
 }
 
@@ -934,9 +843,7 @@ fn read_model(rows: Rows, read: Read) -> String {
     }
     if rows != Rows::Gaussian {
         let cmt = if rows == Rows::Mixed { 2 } else { 1 };
-        text.push_str(&format!(
-            "[binary_model]\n  cmt   = {cmt}\n  logit = TVL{term}\n"
-        ));
+        text.push_str(&format!("[binary_model]\n  cmt   = {cmt}\n  logit = TVL{term}\n"));
     }
     text
 }
@@ -949,10 +856,7 @@ fn read_population(rows: Rows, records: bool) -> Population {
     let binary_cmt = if rows == Rows::Mixed { 2 } else { 1 };
     let subjects = (1..=3u32)
         .map(|s| {
-            let mut subject = Subject {
-                id: s.to_string(),
-                ..Default::default()
-            };
+            let mut subject = Subject { id: s.to_string(), ..Default::default() };
             subject.covariates.insert("STUDY".into(), f64::from(s));
             if records && rows != Rows::Gaussian {
                 subject.obs_records = (0..6u32)
@@ -989,7 +893,7 @@ fn bind_read(rows: Rows, read: Read, records: bool) -> Result<(), crate::diagnos
     let text = read_model(rows, read);
     let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{rows:?}/{read:?}: {e}"));
     let mut pop = read_population(rows, records);
-    crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+    crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
 }
 
 /// The sentences of the #2623 refusal, each asserted on its own so deleting any one
@@ -1100,13 +1004,9 @@ fn no_reading_endpoint_cells() {
         }
     }
     // The per-level check keeps its own wording on Gaussian data, and not the binder's.
-    let m = bind_read(Rows::Gaussian, Read::Unread, true)
-        .expect_err("unread on Gaussian data")
-        .message;
-    assert!(
-        m.contains("no level of the block affects the likelihood") && m.contains(CHECK),
-        "{m}"
-    );
+    let m =
+        bind_read(Rows::Gaussian, Read::Unread, true).expect_err("unread on Gaussian data").message;
+    assert!(m.contains("no level of the block affects the likelihood") && m.contains(CHECK), "{m}");
 }
 
 /// #2623, the other side of the discrete-record gate: with no row of any kind the data
@@ -1119,15 +1019,8 @@ fn a_population_with_no_rows_still_says_so() {
     let d = bind_read(Rows::Binary, Read::Unread, false).expect_err("no rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert!(d.message.contains(NO_ROWS), "{}", d.message);
-    for sentence in [NO_GAUSSIAN, NO_READER, UNREAD, READ_BARE]
-        .into_iter()
-        .chain(BARE_ANY)
-    {
-        assert!(
-            !d.message.contains(sentence),
-            "{sentence:?} in {}",
-            d.message
-        );
+    for sentence in [NO_GAUSSIAN, NO_READER, UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
+        assert!(!d.message.contains(sentence), "{sentence:?} in {}", d.message);
     }
 }
 
@@ -1186,10 +1079,7 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool, definable: bo
         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
     }
     for sentence in not {
-        assert!(
-            !m.contains(sentence),
-            "{cell}: wrong arm, {sentence:?} in {m}"
-        );
+        assert!(!m.contains(sentence), "{cell}: wrong arm, {sentence:?} in {m}");
     }
 }
 
@@ -1216,7 +1106,7 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
             }
         }
     }
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("no Gaussian rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert_bare_read_refusal("y bare", &d.message, false, true);
@@ -1242,7 +1132,7 @@ fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
         "fixture precondition: read bare by the hazard alone"
     );
     let mut pop = read_population(Rows::Binary, true);
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("a hazard defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert_bare_read_refusal("hazard bare", &d.message, false, true);
@@ -1273,7 +1163,7 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
 ";
     let mut parsed = parse_full_model(ctmm).unwrap();
     let mut pop = state_population();
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
         .expect_err("a CTMM defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     // #2808: its records are all on the CTMM, so no reader could define a level.
@@ -1305,7 +1195,7 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
         "fixture precondition: the CMT-1 DTMM reads the block"
     );
     let mut pop = state_population();
-    let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
+    let d = crate::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
         .expect_err("no record on CMT 1");
     assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true, true);
 }
@@ -1373,12 +1263,7 @@ fn records_population(kinds: Kinds) -> Population {
             });
         }
         if kinds.counts {
-            s.obs_records.push(ObsRecord::Count {
-                time: 3.0,
-                raw_time: 3.0,
-                count: 4,
-                cmt: 4,
-            });
+            s.obs_records.push(ObsRecord::Count { time: 3.0, raw_time: 3.0, count: 4, cmt: 4 });
         }
     }
     pop
@@ -1440,15 +1325,11 @@ fn record_kind_cells() {
     for reader in [Reader::Unread, Reader::Definer, Reader::NonDefiner] {
         let text = reader_model(reader);
         for (discrete, events, counts) in sets {
-            let kinds = Kinds {
-                discrete,
-                events,
-                counts,
-            };
+            let kinds = Kinds { discrete, events, counts };
             let cell = format!("{kinds:?} × {reader:?}");
             let bind = |pop: &mut Population| {
                 let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{cell}: {e}"));
-                crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, pop)
+                crate::levels::bind_theta_levels_diag(&mut parsed, &text, pop)
             };
             let d = bind(&mut records_population(kinds)).expect_err(&cell);
             assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
@@ -1459,11 +1340,9 @@ fn record_kind_cells() {
             for sentence in [NO_LEVELS, NO_GAUSSIAN] {
                 assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
             }
-            for (present, clause) in [
-                (discrete, NO_READER),
-                (events, EVENT_CLAUSE),
-                (counts, COUNT_CLAUSE),
-            ] {
+            for (present, clause) in
+                [(discrete, NO_READER), (events, EVENT_CLAUSE), (counts, COUNT_CLAUSE)]
+            {
                 assert_eq!(
                     m.contains(clause),
                     present,
@@ -1503,21 +1382,11 @@ fn record_kind_cells() {
             .expect_err(&cell)
             .message;
             assert!(none.contains(NO_ROWS), "{cell}, no rows: {none}");
-            for sentence in [
-                NO_GAUSSIAN,
-                NO_READER,
-                EVENT_CLAUSE,
-                COUNT_CLAUSE,
-                UNREAD,
-                READ_BARE,
-            ]
-            .into_iter()
-            .chain(BARE_ANY)
+            for sentence in [NO_GAUSSIAN, NO_READER, EVENT_CLAUSE, COUNT_CLAUSE, UNREAD, READ_BARE]
+                .into_iter()
+                .chain(BARE_ANY)
             {
-                assert!(
-                    !none.contains(sentence),
-                    "{cell}, no rows: {sentence:?} in {none}"
-                );
+                assert!(!none.contains(sentence), "{cell}, no rows: {sentence:?} in {none}");
             }
         }
     }
@@ -1541,14 +1410,7 @@ fn tte_only_csv_is_not_called_rowless() {
     let mut data = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     writeln!(data, "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY").unwrap();
     for i in 1..=6u32 {
-        writeln!(
-            data,
-            "{i},{},{},0,0,2,0,0,{}",
-            5 + i,
-            i % 2,
-            1 + (i - 1) % 3
-        )
-        .unwrap();
+        writeln!(data, "{i},{},{},0,0,2,0,0,{}", 5 + i, i % 2, 1 + (i - 1) % 3).unwrap();
     }
     data.flush().unwrap();
     // #2819 review r1 #1: each arm's next step, applied, clears every error; the step the
@@ -1558,16 +1420,8 @@ fn tte_only_csv_is_not_called_rowless() {
     let unread_text = bare.replace(" * exp(PLACEBO)", "");
     for (label, text, want) in [
         ("unread, block dropped", unread_text.replace(decl, ""), None),
-        (
-            "bare, scalar theta",
-            bare.replace("PLACEBO[STUDY](0.0", "PLACEBO(0.0"),
-            None,
-        ),
-        (
-            "bare, block dropped",
-            bare.replace(decl, ""),
-            Some("E_MISSING_COVARIATE"),
-        ),
+        ("bare, scalar theta", bare.replace("PLACEBO[STUDY](0.0", "PLACEBO(0.0"), None),
+        ("bare, block dropped", bare.replace(decl, ""), Some("E_MISSING_COVARIATE")),
     ] {
         let mut model = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
         model.write_all(text.as_bytes()).unwrap();
@@ -1655,11 +1509,9 @@ fn ctmm_records_define_no_level_cells() {
             binary_read = if read == "binary" { " + PLACEBO" } else { "" },
         )
     };
-    for (read, reader) in [
-        ("none", Reader::Unread),
-        ("ctmm", Reader::NonDefiner),
-        ("binary", Reader::Definer),
-    ] {
+    for (read, reader) in
+        [("none", Reader::Unread), ("ctmm", Reader::NonDefiner), ("binary", Reader::Definer)]
+    {
         let text = ctmm(read);
         let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{read}: {e}"));
         assert_eq!(
@@ -1682,7 +1534,7 @@ fn ctmm_records_define_no_level_cells() {
                 });
             }
             let mut parsed = parse_full_model(&text).unwrap();
-            let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+            let d = crate::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
                 .expect_err(&cell);
             assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
             let m = &d.message;
@@ -1732,12 +1584,8 @@ fn count_records_on_a_count_endpoint_are_level_capable() {
     let with_count = format!("{base}[count_model]\n  cmt = 4\n  lambda = 2.0\n");
     let message = |text: &str| {
         let mut parsed = parse_full_model(text).unwrap();
-        let mut pop = records_population(Kinds {
-            discrete: false,
-            events: false,
-            counts: true,
-        });
-        crate::api::levels::bind_theta_levels_diag(&mut parsed, text, &mut pop)
+        let mut pop = records_population(Kinds { discrete: false, events: false, counts: true });
+        crate::levels::bind_theta_levels_diag(&mut parsed, text, &mut pop)
             .expect_err("no level")
             .message
     };
@@ -1787,34 +1635,19 @@ fn auto_sees_the_eta_the_count_mean_reads_with_the_block() {
 /// and one of the two messages names the wrong expression.
 #[test]
 fn the_share_site_names_the_count_expression() {
-    let text = count_model_text().replace(
-        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
-        "PLACEBO[STUDY]",
-    );
-    let err = bound(&text, &csv(&[0, 4], true))
-        .err()
-        .expect("not identified");
-    assert!(
-        err.contains("the `[count_model]` mean reads this block and a random effect"),
-        "{err}"
-    );
+    let text = count_model_text()
+        .replace("PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]", "PLACEBO[STUDY]");
+    let err = bound(&text, &csv(&[0, 4], true)).err().expect("not identified");
+    assert!(err.contains("the `[count_model]` mean reads this block and a random effect"), "{err}");
     assert!(!err.contains("the `y` readout"), "{err}");
     assert!(!err.contains("[binary_model]"), "{err}");
     assert!(!err.contains("size `r`"), "{err}");
 
     // The block and the η met in the size instead.
     let size = text
-        .replace(
-            "log_lambda = TVL + PLACEBO + ETA_S + EMAX * TRT",
-            "log_lambda = TVL + EMAX * TRT",
-        )
-        .replace(
-            "r          = exp(EMAX)",
-            "r          = exp(PLACEBO + ETA_S)",
-        );
-    let err = bound(&size, &csv(&[0, 4], true))
-        .err()
-        .expect("not identified");
+        .replace("log_lambda = TVL + PLACEBO + ETA_S + EMAX * TRT", "log_lambda = TVL + EMAX * TRT")
+        .replace("r          = exp(EMAX)", "r          = exp(PLACEBO + ETA_S)");
+    let err = bound(&size, &csv(&[0, 4], true)).err().expect("not identified");
     assert!(
         err.contains("the `[count_model]` size `r` reads this block and a random effect"),
         "{err}"

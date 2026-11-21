@@ -96,10 +96,7 @@ fn a_slow_creep_is_not_latched_as_converged() {
     // optimum before #1934 and must still. SLSQP is the case the fix is for.
     for optimizer in [Optimizer::Slsqp, Optimizer::NloptLbfgs] {
         let r = fit_from_q_001(optimizer);
-        eprintln!(
-            "{optimizer:?}: converged {} OFV {:.6} theta {:?}",
-            r.converged, r.ofv, r.theta
-        );
+        eprintln!("{optimizer:?}: converged {} OFV {:.6} theta {:?}", r.converged, r.ofv, r.theta);
         assert!(r.converged, "{optimizer:?} must converge");
         assert!(r.ofv.is_finite(), "{optimizer:?}: OFV {}", r.ofv);
         assert!(

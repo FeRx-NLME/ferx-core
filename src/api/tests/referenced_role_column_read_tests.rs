@@ -20,12 +20,7 @@ use crate::parser::model_parser::parse_full_model;
 use crate::types::{ParsedModel, Population};
 
 fn data_path(name: &str) -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("data")
-        .join(name)
-        .to_str()
-        .unwrap()
-        .to_string()
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join(name).to_str().unwrap().to_string()
 }
 
 /// `data/warfarin_iov.csv` with a per-subject `WT` column appended
@@ -104,10 +99,7 @@ fn read(parsed: &ParsedModel, path: &str, fallback: Option<&[&str]>) -> Populati
 }
 
 fn missing_codes(parsed: &ParsedModel, pop: &Population) -> Vec<String> {
-    check_covariates(&parsed.model, pop)
-        .into_iter()
-        .map(|d| d.message)
-        .collect()
+    check_covariates(&parsed.model, pop).into_iter().map(|d| d.message).collect()
 }
 
 /// T1 — the issue: the model reads its `iov_column` with no `[covariates]` block.
@@ -116,10 +108,7 @@ fn missing_codes(parsed: &ParsedModel, pop: &Population) -> Vec<String> {
 #[test]
 fn no_block_model_reads_its_iov_column() {
     let parsed = model("OCC", "");
-    assert!(
-        parsed.covariate_decls.is_none(),
-        "fixture must have no block"
-    );
+    assert!(parsed.covariate_decls.is_none(), "fixture must have no block");
     let pop = read(&parsed, &data_path("warfarin_iov.csv"), None);
     assert!(
         pop.covariate_names.iter().any(|c| c == "OCC"),
@@ -162,29 +151,15 @@ fn no_block_read_is_bit_identical_to_the_declared_read() {
 
     let pop_d = read(&declared, path, None);
     let pop_b = read(&bare, path, None);
-    assert_eq!(
-        missing_codes(&declared, &pop_d),
-        Vec::<String>::new(),
-        "declared side"
-    );
-    assert_eq!(
-        missing_codes(&bare, &pop_b),
-        Vec::<String>::new(),
-        "no-block side"
-    );
+    assert_eq!(missing_codes(&declared, &pop_d), Vec::<String>::new(), "declared side");
+    assert_eq!(missing_codes(&bare, &pop_b), Vec::<String>::new(), "no-block side");
 
     let d = per_record_bits(&pop_d, "OCC");
     let b = per_record_bits(&pop_b, "OCC");
     // Non-degenerate: both occasions are present on the read records.
-    let flat: Vec<u64> = d
-        .iter()
-        .flat_map(|(_, v)| v.iter().flatten().copied())
-        .collect();
+    let flat: Vec<u64> = d.iter().flat_map(|(_, v)| v.iter().flatten().copied()).collect();
     assert!(flat.contains(&1.0f64.to_bits()) && flat.contains(&2.0f64.to_bits()));
-    assert_eq!(
-        d, b,
-        "per-record OCC must be bit-identical across the two reads"
-    );
+    assert_eq!(d, b, "per-record OCC must be bit-identical across the two reads");
 }
 
 /// T3 — the "every working fit unchanged" guard. A model that reads `WT` only, on
@@ -234,10 +209,7 @@ fn explicit_list_is_unioned_with_references() {
     let csv = iov_wt_csv();
     let parsed = model("OCC", "");
     let pop = read(&parsed, csv.path().to_str().unwrap(), Some(&["WT"]));
-    assert_eq!(
-        pop.covariate_names,
-        vec!["WT".to_string(), "OCC".to_string()]
-    );
+    assert_eq!(pop.covariate_names, vec!["WT".to_string(), "OCC".to_string()]);
     assert_eq!(missing_codes(&parsed, &pop), Vec::<String>::new());
 }
 
@@ -299,11 +271,7 @@ fn declared_path_does_not_bind_a_case_differing_reference() {
     // A fallback list naming `occ` is ignored when declarations are present, so it
     // must not exempt the extra either (review of #1946).
     let with_list = read(&parsed, csv.path().to_str().unwrap(), Some(&["occ"]));
-    assert_eq!(
-        with_list.covariate_names,
-        vec!["WT".to_string()],
-        "fallback list"
-    );
+    assert_eq!(with_list.covariate_names, vec!["WT".to_string()], "fallback list");
     assert_eq!(check_covariates(&parsed.model, &with_list).len(), 1);
 }
 
@@ -330,10 +298,7 @@ fn filter_referenced_extra_keeps_the_case_insensitive_fallback() {
     )
     .expect("read succeeds");
     assert_eq!(pop.covariate_names, vec!["WT".to_string()]);
-    assert!(
-        pop.subjects.iter().all(|s| s.id != "1"),
-        "subject 1 (WT = 61) must be filtered out"
-    );
+    assert!(pop.subjects.iter().all(|s| s.id != "1"), "subject 1 (WT = 61) must be filtered out");
     assert!(pop.subjects.iter().any(|s| s.id == "2"), "non-degenerate");
 }
 
@@ -404,14 +369,8 @@ fn unread_header_and_typo_get_their_own_messages() {
         "remedy: {m}"
     );
     // Must not say it is missing, nor offer a model-file remedy to a model-free read.
-    assert!(
-        !m.contains("not found in data") && !m.contains("[covariates]"),
-        "{m}"
-    );
-    assert!(
-        !m.contains("OCCX"),
-        "the typo belongs to the other diagnostic: {m}"
-    );
+    assert!(!m.contains("not found in data") && !m.contains("[covariates]"), "{m}");
+    assert!(!m.contains("OCCX"), "the typo belongs to the other diagnostic: {m}");
     assert_eq!(
         diags[1].suggestion.as_deref(),
         Some("read the data with `read_population_with`, or add OCC to `covariate_columns`")
@@ -425,9 +384,7 @@ fn unread_role_column_alone_gets_only_the_new_message() {
     let parsed = model("CMT", "");
     let diags = check_covariates(&parsed.model, &model_free_population());
     assert_eq!(diags.len(), 1, "{diags:#?}");
-    assert!(diags[0]
-        .message
-        .contains("in the data but were not read as covariates: CMT."));
+    assert!(diags[0].message.contains("in the data but were not read as covariates: CMT."));
     let aware = read(&parsed, &data_path("warfarin_iov.csv"), None);
     assert!(check_covariates(&parsed.model, &aware).is_empty());
 }

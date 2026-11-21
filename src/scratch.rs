@@ -94,11 +94,7 @@ mod tests {
         assert_eq!(b.as_ptr(), ptr, "the returned buffer is the one handed out");
         assert!(b.capacity() >= 100);
         let c: Vec<u64> = take();
-        assert_ne!(
-            c.as_ptr(),
-            b.as_ptr(),
-            "a live buffer is not handed out twice"
-        );
+        assert_ne!(c.as_ptr(), b.as_ptr(), "a live buffer is not handed out twice");
         give(b);
         give(c);
     }

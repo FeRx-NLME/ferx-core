@@ -175,21 +175,14 @@ fn pop_single(obs_times: Vec<f64>) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![dose],
-            obs_times,
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", vec![dose], obs_times, vec![0.0; n], vec![1; n])],
     }
 }
 
 /// Predict the single-first-order reference at a given `ka`.
 fn single_first_order_curve(ka: f64, obs_times: &[f64]) -> Vec<f64> {
-    let model = parse_full_model(SINGLE_FIRST_ORDER_MODEL)
-        .expect("single first_order model parses")
-        .model;
+    let model =
+        parse_full_model(SINGLE_FIRST_ORDER_MODEL).expect("single first_order model parses").model;
     let mut params = model.default_params.clone();
     params.theta[2] = ka;
     predict(&model, &pop_single(obs_times.to_vec()), &params)
@@ -201,9 +194,8 @@ fn single_first_order_curve(ka: f64, obs_times: &[f64]) -> Vec<f64> {
 
 /// Predict the single-zero-order reference at a given `dur`.
 fn single_zero_order_curve(dur: f64, obs_times: &[f64]) -> Vec<f64> {
-    let model = parse_full_model(SINGLE_ZERO_ORDER_MODEL)
-        .expect("single zero_order model parses")
-        .model;
+    let model =
+        parse_full_model(SINGLE_ZERO_ORDER_MODEL).expect("single zero_order model parses").model;
     let mut params = model.default_params.clone();
     params.theta[2] = dur;
     predict(&model, &pop_single(obs_times.to_vec()), &params)
@@ -237,19 +229,13 @@ fn parallel_equals_fraction_weighted_sum_of_single_first_order_pathways() {
     // the linearity of the (shared) disposition ODE. Pins the dual-pathway fraction
     // split and the Channel-A superposition across the whole curve — onset, the two
     // overlapping absorption phases, and the terminal decay.
-    let model = parse_full_model(PARALLEL_MODEL)
-        .expect("parallel parses")
-        .model;
+    let model = parse_full_model(PARALLEL_MODEL).expect("parallel parses").model;
     let obs_times: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect(); // 0..30 h
-    let parallel: Vec<f64> = predict(
-        &model,
-        &pop_single(obs_times.clone()),
-        &model.default_params,
-    )
-    .unwrap()
-    .iter()
-    .map(|p| p.pred)
-    .collect();
+    let parallel: Vec<f64> = predict(&model, &pop_single(obs_times.clone()), &model.default_params)
+        .unwrap()
+        .iter()
+        .map(|p| p.pred)
+        .collect();
 
     let (fr1, fr2) = (0.6, 0.4);
     let c1 = single_first_order_curve(1.5, &obs_times);
@@ -278,15 +264,11 @@ fn mixed_equals_fraction_weighted_sum_of_first_and_zero_order_pathways() {
     // pathway would deliver the full dose and the sum would be wrong.
     let model = parse_full_model(MIXED_MODEL).expect("mixed parses").model;
     let obs_times: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect();
-    let mixed: Vec<f64> = predict(
-        &model,
-        &pop_single(obs_times.clone()),
-        &model.default_params,
-    )
-    .unwrap()
-    .iter()
-    .map(|p| p.pred)
-    .collect();
+    let mixed: Vec<f64> = predict(&model, &pop_single(obs_times.clone()), &model.default_params)
+        .unwrap()
+        .iter()
+        .map(|p| p.pred)
+        .collect();
 
     let (fzo1, fzo) = (0.6, 0.4);
     let c_fo = single_first_order_curve(1.0, &obs_times);
@@ -316,16 +298,9 @@ fn parallel_and_mixed_recover_full_dose_auc() {
     let auc_inf = 100.0 / 5.0; // F·Dose/CL with F = 1, CL = 5 ⇒ 20 mg·h/L
     for (src, name) in [(PARALLEL_MODEL, "parallel"), (MIXED_MODEL, "mixed")] {
         let model = parse_full_model(src).expect("model parses").model;
-        let preds = predict(
-            &model,
-            &pop_single(obs_times.clone()),
-            &model.default_params,
-        )
-        .unwrap();
-        let auc: f64 = preds
-            .windows(2)
-            .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-            .sum();
+        let preds = predict(&model, &pop_single(obs_times.clone()), &model.default_params).unwrap();
+        let auc: f64 =
+            preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
         let rel = (auc - auc_inf).abs() / auc_inf;
         assert!(
             rel < 0.02,
@@ -361,14 +336,8 @@ fn first_order_on_analytical_pk_is_rejected_pointing_at_ode_template() {
         Ok(_) => panic!("pk + first_order() must be rejected"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("ode_template"),
-        "error should point at ode_template, got: {err}"
-    );
-    assert!(
-        err.contains("first_order"),
-        "error should name the first_order function, got: {err}"
-    );
+    assert!(err.contains("ode_template"), "error should point at ode_template, got: {err}");
+    assert!(err.contains("first_order"), "error should name the first_order function, got: {err}");
 }
 
 #[test]
@@ -476,9 +445,7 @@ fn parallel_steady_state_dosing_is_supported() {
     // the compartment equilibrates through the kernels — no E_ABSORPTION_SS. (A **mixed**
     // model that includes a zero_order pathway is still rejected, with E_ABSORPTION_SS_ZERO_ORDER_MIXED.)
     use ferx_core::check_model_data;
-    let model = parse_full_model(PARALLEL_MODEL)
-        .expect("parallel parses")
-        .model;
+    let model = parse_full_model(PARALLEL_MODEL).expect("parallel parses").model;
     let mut ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
     ss_dose.ii = 12.0;
     let obs = vec![1.0, 4.0, 8.0, 11.5];
@@ -489,13 +456,7 @@ fn parallel_steady_state_dosing_is_supported() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![ss_dose],
-            obs,
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", vec![ss_dose], obs, vec![0.0; n], vec![1; n])],
     };
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -514,25 +475,15 @@ fn parallel_steady_state_dosing_is_supported() {
 /// Tier-3 (slow): full FOCEI fit recovering the parallel **fraction** and the two
 /// absorption rates from a perturbed start. Gated out of the default PR job.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn parallel_fit_recovers_fraction_and_kas() {
     use ferx_core::{fit, FitOptions};
 
-    let model = parse_full_model(PARALLEL_MODEL)
-        .expect("parallel parses")
-        .model;
+    let model = parse_full_model(PARALLEL_MODEL).expect("parallel parses").model;
     // Noise-free data at the truth: predictions at the typical values become the
     // observations, so the likelihood optimum sits at the data-generating params.
     let obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5).collect();
-    let truth = predict(
-        &model,
-        &pop_single(obs_times.clone()),
-        &model.default_params,
-    )
-    .unwrap();
+    let truth = predict(&model, &pop_single(obs_times.clone()), &model.default_params).unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
@@ -562,21 +513,13 @@ fn parallel_fit_recovers_fraction_and_kas() {
 /// Tier-3 (slow): full FOCEI fit recovering the mixed **zero-order fraction**,
 /// duration, and first-order rate from a perturbed start.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn mixed_fit_recovers_fraction_dur_and_ka() {
     use ferx_core::{fit, FitOptions};
 
     let model = parse_full_model(MIXED_MODEL).expect("mixed parses").model;
     let obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5).collect();
-    let truth = predict(
-        &model,
-        &pop_single(obs_times.clone()),
-        &model.default_params,
-    )
-    .unwrap();
+    let truth = predict(&model, &pop_single(obs_times.clone()), &model.default_params).unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
