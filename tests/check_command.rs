@@ -14,12 +14,8 @@ fn temp_model(tag: &str, content: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ferx_check_{}_{}_{}.ferx",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ferx_check_{}_{}_{}.ferx", tag, std::process::id(), n));
     std::fs::write(&path, content).expect("write temp model");
     path
 }
@@ -45,11 +41,7 @@ const COV_MODEL: &str = "\
 #[test]
 fn valid_example_passes_with_no_diagnostics() {
     let report = validate_model_file("examples/warfarin_bobyqa.ferx", None);
-    assert!(
-        report.valid,
-        "unexpected diagnostics: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "unexpected diagnostics: {:?}", report.diagnostics);
     assert_eq!(report.error_count(), 0);
     assert_eq!(report.model, "warfarin_bobyqa");
 }
@@ -96,10 +88,7 @@ fn unknown_block_is_reported_as_e_unknown_block() {
     assert_eq!(d.code, "E_UNKNOWN_BLOCK");
     assert_eq!(d.block.as_deref(), Some("fit_option"));
     assert_eq!(d.line, Some(17));
-    assert_eq!(
-        d.suggestion.as_deref(),
-        Some("did you mean `[fit_options]`?")
-    );
+    assert_eq!(d.suggestion.as_deref(), Some("did you mean `[fit_options]`?"));
     assert!(
         d.message.contains("Valid blocks: "),
         "message must enumerate the valid set: {}",
@@ -128,11 +117,8 @@ fn deprecated_block_is_reported_as_w_deprecated_block() {
         "a deprecated block must not fail the parse: {:?}",
         report.diagnostics
     );
-    let found: Vec<_> = report
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == "W_DEPRECATED_BLOCK")
-        .collect();
+    let found: Vec<_> =
+        report.diagnostics.iter().filter(|d| d.code == "W_DEPRECATED_BLOCK").collect();
     assert_eq!(found.len(), 1, "{:?}", report.diagnostics);
     let d = found[0];
     assert_eq!(d.severity, Severity::Warning);
@@ -168,12 +154,8 @@ fn deprecated_block_parses_identically_to_its_absence() {
         .expect("a deprecated block must not fail the parse");
     let b = parse_full_model_file(Path::new(without.to_str().unwrap())).unwrap();
     assert_eq!(a.model.default_params.theta, b.model.default_params.theta);
-    let extra: Vec<_> = a
-        .model
-        .parse_warnings
-        .iter()
-        .filter(|w| !b.model.parse_warnings.contains(w))
-        .collect();
+    let extra: Vec<_> =
+        a.model.parse_warnings.iter().filter(|w| !b.model.parse_warnings.contains(w)).collect();
     assert_eq!(extra.len(), 1, "{extra:?}");
     assert!(
         extra[0].starts_with("Deprecated block `[initial_values]` (line 17) is ignored:")
@@ -189,10 +171,7 @@ fn deprecated_block_parses_identically_to_its_absence() {
 /// there is no separate path for the batch and the fail-fast callers.
 #[test]
 fn unknown_block_also_fails_the_parser_directly() {
-    let model = temp_model(
-        "unknown_block_parse",
-        &format!("{COV_MODEL}\n[scalings]\n  V = 1.0\n"),
-    );
+    let model = temp_model("unknown_block_parse", &format!("{COV_MODEL}\n[scalings]\n  V = 1.0\n"));
     let err = match parse_full_model_file(Path::new(model.to_str().unwrap())) {
         Err(e) => e,
         Ok(_) => panic!("unknown block must fail the parse"),
@@ -379,14 +358,8 @@ fn block_sd_tag_is_reported_as_its_own_code() {
     let base = std::fs::read_to_string("examples/warfarin_block_omega.ferx")
         .expect("read the bundled block-omega example");
     let untagged = "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]";
-    assert!(
-        base.contains(untagged),
-        "the example's block line moved; update this test"
-    );
-    let model = temp_model(
-        "block_sd_tag",
-        &base.replace(untagged, &format!("{untagged} (sd)")),
-    );
+    assert!(base.contains(untagged), "the example's block line moved; update this test");
+    let model = temp_model("block_sd_tag", &base.replace(untagged, &format!("{untagged} (sd)")));
     let report = validate_model_file(model.to_str().unwrap(), None);
     assert!(!report.valid);
     // Assert the count before indexing, so a regression that reports nothing
@@ -434,10 +407,7 @@ fn block_sd_tag_is_reported_as_its_own_code() {
     );
     let d = &report.diagnostics[0];
     assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY");
-    let s = d
-        .suggestion
-        .as_deref()
-        .expect("a `(variance)` tag must carry a suggestion too");
+    let s = d.suggestion.as_deref().expect("a `(variance)` tag must carry a suggestion too");
     assert!(
         s.contains("delete the tag") && !s.contains("square"),
         "a `(variance)` author must not be told to square anything: {s}"
@@ -446,11 +416,7 @@ fn block_sd_tag_is_reported_as_its_own_code() {
 
     // The control the widening rests on: the untouched example is still valid.
     let report = validate_model_file("examples/warfarin_block_omega.ferx", None);
-    assert!(
-        report.valid,
-        "the untagged example must stay valid: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "the untagged example must stay valid: {:?}", report.diagnostics);
 }
 
 /// #1377. Trailing text on *any* `[parameters]` line is an error now; before
@@ -462,20 +428,10 @@ fn trailing_text_in_parameters_is_e_parse() {
     let base = std::fs::read_to_string("examples/warfarin_block_omega.ferx")
         .expect("read the bundled block-omega example");
     let clean = "omega ETA_KA ~ 0.30";
-    assert!(
-        base.contains(clean),
-        "the example's diagonal omega line moved; update this test"
-    );
-    let model = temp_model(
-        "trailing_text",
-        &base.replace(clean, &format!("{clean} banana")),
-    );
+    assert!(base.contains(clean), "the example's diagonal omega line moved; update this test");
+    let model = temp_model("trailing_text", &base.replace(clean, &format!("{clean} banana")));
     let report = validate_model_file(model.to_str().unwrap(), None);
-    assert!(
-        !report.valid,
-        "trailing text must not validate clean: {:?}",
-        report.diagnostics
-    );
+    assert!(!report.valid, "trailing text must not validate clean: {:?}", report.diagnostics);
     assert_eq!(
         report.diagnostics.len(),
         1,
@@ -498,11 +454,7 @@ fn no_data_means_no_covariate_check() {
     // model is structurally valid.
     let model = temp_model("no_data", COV_MODEL);
     let report = validate_model_file(model.to_str().unwrap(), None);
-    assert!(
-        report.valid,
-        "unexpected diagnostics: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "unexpected diagnostics: {:?}", report.diagnostics);
     let _ = std::fs::remove_file(&model);
 }
 
@@ -512,10 +464,8 @@ fn no_data_means_no_covariate_check() {
 #[test]
 fn fit_error_matches_check_diagnostic_for_missing_covariate() {
     let model_path = temp_model("fit_regression", COV_MODEL);
-    let report = validate_model_file(
-        model_path.to_str().unwrap(),
-        Some("data/bioavailability.csv"),
-    );
+    let report =
+        validate_model_file(model_path.to_str().unwrap(), Some("data/bioavailability.csv"));
     let diag_msg = report
         .diagnostics
         .iter()
@@ -573,15 +523,9 @@ const COV_DECL_MODEL: &str = "\
 /// The bundled covariate example validates cleanly against its dataset.
 #[test]
 fn covariates_example_validates() {
-    let report = validate_model_file(
-        "examples/two_cpt_oral_cov.ferx",
-        Some("data/two_cpt_oral_cov.csv"),
-    );
-    assert!(
-        report.valid,
-        "unexpected diagnostics: {:?}",
-        report.diagnostics
-    );
+    let report =
+        validate_model_file("examples/two_cpt_oral_cov.ferx", Some("data/two_cpt_oral_cov.csv"));
+    assert!(report.valid, "unexpected diagnostics: {:?}", report.diagnostics);
 }
 
 /// `read_nonmem_csv_with_covariates` produces a table echoing the declared
@@ -590,16 +534,8 @@ fn covariates_example_validates() {
 fn covariate_table_built_from_declarations() {
     use ferx_core::{read_nonmem_csv_with_covariates, CovariateDecl, CovariateKind};
     let decls = vec![
-        CovariateDecl {
-            levels: None,
-            name: "WT".into(),
-            kind: CovariateKind::Continuous,
-        },
-        CovariateDecl {
-            levels: None,
-            name: "CRCL".into(),
-            kind: CovariateKind::Continuous,
-        },
+        CovariateDecl { levels: None, name: "WT".into(), kind: CovariateKind::Continuous },
+        CovariateDecl { levels: None, name: "CRCL".into(), kind: CovariateKind::Continuous },
     ];
     let (pop, table) =
         read_nonmem_csv_with_covariates(Path::new("data/two_cpt_oral_cov.csv"), &decls, &[], None)
@@ -658,21 +594,13 @@ fn undeclared_referenced_covariate_warns_not_errors() {
     // The model parses successfully (no parse error)...
     let parsed = parse_full_model_file(&model).expect("model should parse");
     assert!(
-        parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("WT") && w.contains("not declared")),
+        parsed.model.parse_warnings.iter().any(|w| w.contains("WT") && w.contains("not declared")),
         "expected an undeclared-covariate warning, got: {:?}",
         parsed.model.parse_warnings
     );
     // ...and `ferx check` (no data) reports no errors.
     let report = validate_model_file(model.to_str().unwrap(), None);
-    assert!(
-        report.valid,
-        "unexpected diagnostics: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "unexpected diagnostics: {:?}", report.diagnostics);
     let _ = std::fs::remove_file(&model);
 }
 
@@ -681,12 +609,8 @@ fn temp_data(tag: &str, content: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ferx_check_{}_{}_{}.csv",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ferx_check_{}_{}_{}.csv", tag, std::process::id(), n));
     std::fs::write(&path, content).expect("write temp data");
     path
 }
@@ -769,10 +693,7 @@ fn referenced_absent_covariate_errors_even_with_block() {
 ",
     );
     // WT present (declared, numeric) but AGE (referenced, undeclared) is absent.
-    let data = temp_data(
-        "cov_masking",
-        "ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,70\n1,1,5.0,0,.,70\n",
-    );
+    let data = temp_data("cov_masking", "ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,70\n1,1,5.0,0,.,70\n");
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
     assert!(!report.valid);
     assert!(
@@ -830,10 +751,8 @@ fn twin_less_flip_flop_transit_is_rejected_by_check() {
   DV ~ proportional(PROP)
 ",
     );
-    let data = temp_data(
-        "flipflop_notwin",
-        "ID,TIME,AMT,EVID,DV,MDV\n1,0,100,1,.,1\n1,2,0,1.0,0\n",
-    );
+    let data =
+        temp_data("flipflop_notwin", "ID,TIME,AMT,EVID,DV,MDV\n1,0,100,1,.,1\n1,2,0,1.0,0\n");
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
     assert!(!report.valid, "twin-less flip-flop must fail ferx check");
     let d = report
@@ -887,21 +806,11 @@ fn unsupported_transit_feature_is_rejected_by_check() {
         "ID,TIME,AMT,EVID,DV,MDV,CMT\n1,0,100,1,.,1,2\n1,2,0,0,1.0,0,1\n",
     );
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(!report.valid, "a non-depot (CMT≠1) dose on a transit model must fail ferx check");
     assert!(
-        !report.valid,
-        "a non-depot (CMT≠1) dose on a transit model must fail ferx check"
-    );
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_TRANSIT_UNSUPPORTED"),
+        report.diagnostics.iter().any(|d| d.code == "E_TRANSIT_UNSUPPORTED"),
         "expected E_TRANSIT_UNSUPPORTED, got: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| &d.code)
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
     let _ = std::fs::remove_file(&model);
     let _ = std::fs::remove_file(&data);
@@ -950,21 +859,14 @@ fn ss_plus_lag_transit_is_rejected_by_check() {
         "ID,TIME,AMT,EVID,DV,MDV,SS,II\n1,0,100,1,.,1,1,24\n1,2,0,1.0,0,0,0\n",
     );
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
-    assert!(
-        !report.valid,
-        "SS + lagtime transit dose must fail ferx check"
-    );
+    assert!(!report.valid, "SS + lagtime transit dose must fail ferx check");
     assert!(
         report
             .diagnostics
             .iter()
             .any(|d| d.code == "E_TRANSIT_UNSUPPORTED" && d.message.contains("lagtime")),
         "expected E_TRANSIT_UNSUPPORTED mentioning lagtime, got: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
     let _ = std::fs::remove_file(&model);
     let _ = std::fs::remove_file(&data);
@@ -980,26 +882,13 @@ fn ss_plus_lag_transit_is_rejected_by_check() {
 /// clean.
 #[test]
 fn compartment_free_model_does_not_warn_about_missing_doses() {
-    let report = validate_model_file(
-        "examples/emax_timecourse.ferx",
-        Some("data/emax_timecourse.csv"),
-    );
+    let report =
+        validate_model_file("examples/emax_timecourse.ferx", Some("data/emax_timecourse.csv"));
+    assert!(report.valid, "unexpected diagnostics: {:?}", report.diagnostics);
     assert!(
-        report.valid,
-        "unexpected diagnostics: {:?}",
-        report.diagnostics
-    );
-    assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("W_NO_DOSES")),
+        !report.diagnostics.iter().any(|d| d.message.contains("W_NO_DOSES")),
         "a compartment-free model has nothing to dose: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
 
     // And the same pair through `fit()` — the agreement this test is about.
@@ -1035,16 +924,9 @@ fn compartment_model_still_warns_about_missing_doses() {
     );
     let report = validate_model_file(model.to_str().unwrap(), Some("data/emax_timecourse.csv"));
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("W_NO_DOSES")),
+        report.diagnostics.iter().any(|d| d.message.contains("W_NO_DOSES")),
         "a PK model on dose-free data is still worth flagging: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
     let _ = std::fs::remove_file(&model);
 }
@@ -1122,10 +1004,7 @@ fn free_zero_omega_fails_fit_with_the_check_message() {
 
     assert_eq!(diag_msg, err);
     assert!(err.contains("`FIX`"), "{err}");
-    assert!(
-        err.contains("INITIAL ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED"),
-        "{err}"
-    );
+    assert!(err.contains("INITIAL ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED"), "{err}");
     let _ = std::fs::remove_file(&model_path);
 }
 
@@ -1137,10 +1016,7 @@ fn fixed_zero_omega_passes_check_and_starts_a_fit() {
     let model_path = temp_model("rail_fixed_zero", &rail_model_src("omega ETA_CL ~ 0.0 FIX"));
     let report = validate_model_file(model_path.to_str().unwrap(), None);
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_OMEGA_INIT_AT_RAIL"),
+        !report.diagnostics.iter().any(|d| d.code == "E_OMEGA_INIT_AT_RAIL"),
         "{:?}",
         report.diagnostics
     );
@@ -1149,11 +1025,8 @@ fn fixed_zero_omega_passes_check_and_starts_a_fit() {
     // model, not that the fit converges.
     let model = parse_full_model_file(&model_path).unwrap().model;
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
-    let options = FitOptions {
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let options =
+        FitOptions { outer_maxiter: 1, run_covariance_step: false, ..FitOptions::default() };
     fit(&model, &pop, &model.default_params, &options).expect("`0.0 FIX` must still fit");
     let _ = std::fs::remove_file(&model_path);
 }
@@ -1211,16 +1084,10 @@ fn an_eval_only_fit_reports_the_rail_not_the_declared_zero() {
     let model = parse_full_model_file(&model_path).unwrap().model;
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
     let declared = model.default_params.omega.matrix[(0, 0)];
-    assert_eq!(
-        declared, 1e-8,
-        "premise: a declared zero is stored as the regularisation floor"
-    );
+    assert_eq!(declared, 1e-8, "premise: a declared zero is stored as the regularisation floor");
 
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let eval_only =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..FitOptions::default() };
     let evaluated = fit(&model, &pop, &model.default_params, &eval_only)
         .expect("an eval-only run must not be judged by the rail check");
     assert_eq!(
@@ -1236,10 +1103,7 @@ fn an_eval_only_fit_reports_the_rail_not_the_declared_zero() {
 
     // `FIX` is the remedy the diagnostic recommends, so it must not have this
     // problem: pinning makes `lower == packed`, so the clamp is a no-op.
-    let fixed_path = temp_model(
-        "rail_eval_only_fix",
-        &rail_model_src("omega ETA_CL ~ 0.0 FIX"),
-    );
+    let fixed_path = temp_model("rail_eval_only_fix", &rail_model_src("omega ETA_CL ~ 0.0 FIX"));
     let fixed = parse_full_model_file(&fixed_path).unwrap().model;
     let fixed_eval = fit(&fixed, &pop, &fixed.default_params, &eval_only).expect("`0.0 FIX` eval");
     let fixed_at = fixed_eval.omega[(0, 0)];
@@ -1309,30 +1173,16 @@ fn theta_start_outside_its_declared_range_is_reported_by_check_and_refused_by_fi
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
         .expect_err("a start outside its own declared range must be refused");
-    assert_eq!(
-        d.message,
-        err.to_string(),
-        "check and fit must agree byte for byte"
-    );
-    assert_eq!(
-        err.code(),
-        Some(d.code.as_str()),
-        "check and fit carry one code"
-    );
+    assert_eq!(d.message, err.to_string(), "check and fit must agree byte for byte");
+    assert_eq!(err.code(), Some(d.code.as_str()), "check and fit carry one code");
 
     // The differential half: the same declaration with the start moved inside
     // its range is silent, so the two assertions above cannot be passing on a
     // blanket rejection of this model shape.
-    let ok_path = temp_model(
-        "box_theta_inside",
-        &box_model_src("theta TVCL(0.2, 0.1, 10.0)"),
-    );
+    let ok_path = temp_model("box_theta_inside", &box_model_src("theta TVCL(0.2, 0.1, 10.0)"));
     let ok_report = validate_model_file(ok_path.to_str().unwrap(), None);
     assert!(
-        !ok_report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
+        !ok_report.diagnostics.iter().any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
         "{:?}",
         ok_report.diagnostics
     );
@@ -1367,19 +1217,12 @@ fn theta_start_outside_its_declared_range_is_reported_by_check_and_refused_by_fi
 #[test]
 fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
     const EVAL_ONLY: &str = "\n[fit_options]\n  maxiter = 0\n  covariance = false\n";
-    let src = format!(
-        "{}{EVAL_ONLY}",
-        box_model_src("theta TVCL(0.5, 0.001, 0.2)")
-    );
+    let src = format!("{}{EVAL_ONLY}", box_model_src("theta TVCL(0.5, 0.001, 0.2)"));
     let model_path = temp_model("box_theta_eval_only", &src);
 
     // ── `ferx check`, no `--data` ──
     let report = validate_model_file(model_path.to_str().unwrap(), None);
-    assert!(
-        report.valid,
-        "a warning, so the file validates: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "a warning, so the file validates: {:?}", report.diagnostics);
     let d = report
         .diagnostics
         .iter()
@@ -1392,18 +1235,13 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
         "the help line `ferx check` prints under the warning"
     );
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
+        !report.diagnostics.iter().any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
         "the error and the warning are one verdict, never both: {:?}",
         report.diagnostics
     );
     assert!(
-        d.message
-            .contains("starts at 5e-1, above its own declared upper bound of 2e-1")
-            && d.message
-                .contains("those of TVCL = 2e-1, not of the declared 5e-1"),
+        d.message.contains("starts at 5e-1, above its own declared upper bound of 2e-1")
+            && d.message.contains("those of TVCL = 2e-1, not of the declared 5e-1"),
         "{}",
         d.message
     );
@@ -1412,13 +1250,8 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
     let parsed = parse_full_model_file(&model_path).unwrap();
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
     assert_eq!(parsed.fit_options.outer_maxiter, 0, "premise: eval-only");
-    let res = fit(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        &parsed.fit_options,
-    )
-    .expect("an eval-only run is warned, never refused");
+    let res = fit(&parsed.model, &pop, &parsed.model.default_params, &parsed.fit_options)
+        .expect("an eval-only run is warned, never refused");
     assert!(
         res.warnings.iter().any(|w| *w == d.message),
         "the same message must reach `FitResult.warnings`; got {:?}",
@@ -1434,13 +1267,8 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
     let eval_of = |tag: &str, theta_line: &str| {
         let path = temp_model(tag, &format!("{}{EVAL_ONLY}", box_model_src(theta_line)));
         let parsed = parse_full_model_file(&path).unwrap();
-        let res = fit(
-            &parsed.model,
-            &pop,
-            &parsed.model.default_params,
-            &parsed.fit_options,
-        )
-        .unwrap_or_else(|e| panic!("`{theta_line}` must evaluate: {e}"));
+        let res = fit(&parsed.model, &pop, &parsed.model.default_params, &parsed.fit_options)
+            .unwrap_or_else(|e| panic!("`{theta_line}` must evaluate: {e}"));
         let _ = std::fs::remove_file(&path);
         res
     };
@@ -1471,10 +1299,7 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
     // Neither twin is warned: both score exactly what they declare.
     for twin in [&at_bound, &at_declared] {
         assert!(
-            !twin
-                .warnings
-                .iter()
-                .any(|w| w.contains("W_THETA_INIT_OUTSIDE_BOUNDS")),
+            !twin.warnings.iter().any(|w| w.contains("W_THETA_INIT_OUTSIDE_BOUNDS")),
             "{:?}",
             twin.warnings
         );
@@ -1488,10 +1313,8 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
         .expect("structured entry present");
     assert_eq!(entry.category.as_str(), "init_outside_bounds");
     assert!(
-        !res.warnings_structured
-            .iter()
-            .any(|w| w.category.as_str() == "boundary_estimate"
-                && w.message.contains("W_THETA_INIT_OUTSIDE_BOUNDS")),
+        !res.warnings_structured.iter().any(|w| w.category.as_str() == "boundary_estimate"
+            && w.message.contains("W_THETA_INIT_OUTSIDE_BOUNDS")),
         "a clamped *start* must not be filed as a boundary estimate"
     );
 
@@ -1504,27 +1327,15 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
         ),
     );
     let searching_report = validate_model_file(searching_path.to_str().unwrap(), None);
+    assert!(!searching_report.valid, "{:?}", searching_report.diagnostics);
     assert!(
-        !searching_report.valid,
-        "{:?}",
-        searching_report.diagnostics
-    );
-    assert!(
-        !searching_report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "W_THETA_INIT_OUTSIDE_BOUNDS"),
+        !searching_report.diagnostics.iter().any(|d| d.code == "W_THETA_INIT_OUTSIDE_BOUNDS"),
         "{:?}",
         searching_report.diagnostics
     );
     let searching = parse_full_model_file(&searching_path).unwrap();
-    let err = fit(
-        &searching.model,
-        &pop,
-        &searching.model.default_params,
-        &searching.fit_options,
-    )
-    .expect_err("with a search the same declaration is refused");
+    let err = fit(&searching.model, &pop, &searching.model.default_params, &searching.fit_options)
+        .expect_err("with a search the same declaration is refused");
     assert_eq!(err.code(), Some("E_THETA_INIT_OUTSIDE_BOUNDS"));
 
     let _ = std::fs::remove_file(&model_path);
@@ -1557,11 +1368,7 @@ fn a_start_past_the_hidden_theta_cap_warns_from_both_check_and_fit() {
 
     let model = parse_full_model_file(&model_path).unwrap().model;
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
-    let opts = FitOptions {
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 1, run_covariance_step: false, ..FitOptions::default() };
     let res = fit(&model, &pop, &model.default_params, &opts)
         .expect("a hidden-cap start is a warning, not a refusal");
 
@@ -1591,10 +1398,8 @@ fn a_start_past_the_hidden_theta_cap_warns_from_both_check_and_fit() {
         .expect("structured entry present");
     assert_eq!(entry.category.as_str(), "init_outside_bounds");
     assert!(
-        !res.warnings_structured
-            .iter()
-            .any(|w| w.category.as_str() == "boundary_estimate"
-                && w.message.contains("W_INIT_OUTSIDE_BOUNDS")),
+        !res.warnings_structured.iter().any(|w| w.category.as_str() == "boundary_estimate"
+            && w.message.contains("W_INIT_OUTSIDE_BOUNDS")),
         "a clamped *start* must not be filed as a boundary estimate; entries: {:#?}",
         res.warnings_structured
             .iter()
@@ -1632,17 +1437,9 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
 
     for (tag, theta_line, cause) in [
-        (
-            "swapped",
-            "theta TVCL(1.0, 5.0, 2.0)",
-            "declared range is empty",
-        ),
+        ("swapped", "theta TVCL(1.0, 5.0, 2.0)", "declared range is empty"),
         ("above_cap", "theta TVCL(5e9, 2e9, 1e12)", "entirely above"),
-        (
-            "below_floor",
-            "theta TVCL(1e-12, 1e-13, 1e-11)",
-            "entirely below",
-        ),
+        ("below_floor", "theta TVCL(1e-12, 1e-13, 1e-11)", "entirely below"),
     ] {
         let model_path = temp_model(&format!("box_empty_{tag}"), &box_model_src(theta_line));
 
@@ -1660,17 +1457,10 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
         // …and at `maxiter = 0`, which is where the abort was reachable even
         // though every other start-side check is exempt there:
         // `evaluate_at_initial_params` clamps before it evaluates.
-        let eval_only = FitOptions {
-            outer_maxiter: 0,
-            ..FitOptions::default()
-        };
+        let eval_only = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
         let err0 = fit(&model, &pop, &model.default_params, &eval_only)
             .expect_err("the empty-box error is not exempt at maxiter = 0");
-        assert_eq!(
-            err0.to_string(),
-            err.to_string(),
-            "{tag}: same refusal at maxiter = 0"
-        );
+        assert_eq!(err0.to_string(), err.to_string(), "{tag}: same refusal at maxiter = 0");
 
         let report = validate_model_file(model_path.to_str().unwrap(), None);
         assert!(!report.valid, "{tag}: {:?}", report.diagnostics);
@@ -1680,11 +1470,7 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
             .find(|d| d.code == "E_INIT_BOUNDS_INVERTED")
             .unwrap_or_else(|| panic!("{tag}: code absent: {:?}", report.diagnostics));
         assert!(d.message.contains(cause), "{tag}: {}", d.message);
-        assert_eq!(
-            d.message,
-            err.to_string(),
-            "{tag}: check and fit must agree byte for byte"
-        );
+        assert_eq!(d.message, err.to_string(), "{tag}: check and fit must agree byte for byte");
         assert_eq!(err.code(), Some("E_INIT_BOUNDS_INVERTED"), "{tag}");
 
         let _ = std::fs::remove_file(&model_path);
@@ -1693,16 +1479,10 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
     // The differential half: one number moved so the box is non-empty, and the
     // same model fits. Without it the three arms above would pass for a check
     // that rejected every model it saw.
-    let ok_path = temp_model(
-        "box_empty_control",
-        &box_model_src("theta TVCL(1e-12, 1e-13, 1e-9)"),
-    );
+    let ok_path = temp_model("box_empty_control", &box_model_src("theta TVCL(1e-12, 1e-13, 1e-9)"));
     let ok_report = validate_model_file(ok_path.to_str().unwrap(), None);
     assert!(
-        !ok_report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_INIT_BOUNDS_INVERTED"),
+        !ok_report.diagnostics.iter().any(|d| d.code == "E_INIT_BOUNDS_INVERTED"),
         "an upper bound above the 1e-10 floor leaves a representable box: {:?}",
         ok_report.diagnostics
     );
@@ -1761,16 +1541,9 @@ fn a_fit_option_or_error_model_line_that_matches_nothing_fails_the_check() {
         &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n\n[fit_options]\n  method saem\n  maxiter 42\n"),
     );
     let report = validate_model_file(bad.to_str().unwrap(), None);
+    assert!(!report.valid, "`method saem` must not report VALID: {:?}", report.diagnostics);
     assert!(
-        !report.valid,
-        "`method saem` must not report VALID: {:?}",
-        report.diagnostics
-    );
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("method = saem")),
+        report.diagnostics.iter().any(|d| d.message.contains("method = saem")),
         "the diagnostic must name the repair: {:?}",
         report.diagnostics
     );
@@ -1788,10 +1561,7 @@ fn a_fit_option_or_error_model_line_that_matches_nothing_fails_the_check() {
         report.diagnostics
     );
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("banana")),
+        report.diagnostics.iter().any(|d| d.message.contains("banana")),
         "the diagnostic must quote the offending line: {:?}",
         report.diagnostics
     );
@@ -1848,27 +1618,18 @@ fn cmt_less_dataset_on_a_multi_state_ode_model_is_reported() {
     let data = temp_data("cmt_defaulted_ode", NO_CMT_CSV);
 
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
-    let hits: Vec<_> = report
-        .diagnostics
-        .iter()
-        .filter(|d| d.message.contains("W_CMT_DEFAULTED"))
-        .collect();
+    let hits: Vec<_> =
+        report.diagnostics.iter().filter(|d| d.message.contains("W_CMT_DEFAULTED")).collect();
     assert_eq!(
         hits.len(),
         1,
         "exactly one W_CMT_DEFAULTED from `ferx check`, got: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
     // The code, not the `W_DATA` fallback: a consumer branches on this.
     assert_eq!(hits[0].code, "W_CMT_DEFAULTED");
     assert!(
-        hits[0]
-            .message
-            .contains("2 dose row(s) and 4 observation row(s)"),
+        hits[0].message.contains("2 dose row(s) and 4 observation row(s)"),
         "counts are per-population totals, not per-subject (2 doses, 4 obs), got: {}",
         hits[0].message
     );
@@ -1884,10 +1645,7 @@ fn cmt_less_dataset_on_a_multi_state_ode_model_is_reported() {
     };
     let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        result.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "fit() must carry it too: {:?}",
         result.warnings
     );
@@ -1917,26 +1675,16 @@ ID,TIME,DV,EVID,AMT,COMPT,MDV
         "cmt_remedy",
         &DEPOT_SECOND_ODE.replace(
             "[parameters]",
-            &format!(
-                "[data]\n  path = {}\n  CMT = COMPT\n\n[parameters]",
-                mapped.display()
-            ),
+            &format!("[data]\n  path = {}\n  CMT = COMPT\n\n[parameters]", mapped.display()),
         ),
     );
 
     // Half 1: the warning is silenced.
     let report = validate_model_file(model.to_str().unwrap(), None);
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        !report.diagnostics.iter().any(|d| d.message.contains("W_CMT_DEFAULTED")),
         "mapping the column is the remedy the message prints; it must silence it: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
 
     // Half 2: the dose actually lands in compartment 2. Silencing the warning
@@ -1985,16 +1733,9 @@ fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
 
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        !report.diagnostics.iter().any(|d| d.message.contains("W_CMT_DEFAULTED")),
         "a 1-cpt IV model has exactly one compartment a dose can reach: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
 
     let parsed = parse_full_model_file(&model).expect("control model parses");
@@ -2007,10 +1748,7 @@ fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
     };
     let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        !result.warnings.iter().any(|w| w.contains("W_CMT_DEFAULTED")),
         "fit() must suppress it too: {:?}",
         result.warnings
     );
@@ -2046,16 +1784,9 @@ fn cmt_less_dataset_on_an_analytical_oral_model_is_reported() {
 
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        report.diagnostics.iter().any(|d| d.message.contains("W_CMT_DEFAULTED")),
         "an oral model's CMT=2 is a central bolus, so compartment 1 was a choice: {:?}",
-        report
-            .diagnostics
-            .iter()
-            .map(|d| (&d.code, &d.message))
-            .collect::<Vec<_>>()
+        report.diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
     );
 
     // Both surfaces, because they are wired separately: `ferx check` filters through
@@ -2070,10 +1801,7 @@ fn cmt_less_dataset_on_an_analytical_oral_model_is_reported() {
     };
     let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        result.warnings.iter().any(|w| w.contains("W_CMT_DEFAULTED")),
         "fit() must report it too: {:?}",
         result.warnings
     );

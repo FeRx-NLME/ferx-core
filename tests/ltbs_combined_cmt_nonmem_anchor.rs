@@ -57,11 +57,8 @@ struct Params {
     omega: [f64; 2],
 }
 
-const INITS: Params = Params {
-    theta: [2.2, 9.0, 1.3, 0.35],
-    sigma: [0.12, 0.07, 0.25, 0.4],
-    omega: [0.09, 0.04],
-};
+const INITS: Params =
+    Params { theta: [2.2, 9.0, 1.3, 0.35], sigma: [0.12, 0.07, 0.25, 0.4], omega: [0.09, 0.04] };
 const FINAL: Params = Params {
     theta: [2.04299, 9.97957, 1.43556, 0.389745],
     sigma: [0.0916699, 0.0282388, 0.227097, 0.004],
@@ -140,9 +137,7 @@ fn evaluate(m: &ferx_core::types::CompiledModel, method: EstimationMethod) -> f6
         threads: Some(2),
         ..FitOptions::default()
     };
-    fit(m, &pop, &m.default_params, &opts)
-        .expect("evaluation")
-        .ofv
+    fit(m, &pop, &m.default_params, &opts).expect("evaluation").ofv
 }
 
 fn check(p: &Params, method: EstimationMethod, want: f64, label: &str) {
@@ -150,31 +145,17 @@ fn check(p: &Params, method: EstimationMethod, want: f64, label: &str) {
 }
 
 fn check_model(
-    m: &ferx_core::types::CompiledModel,
-    method: EstimationMethod,
-    want: f64,
-    label: &str,
+    m: &ferx_core::types::CompiledModel, method: EstimationMethod, want: f64, label: &str,
 ) {
     let ofv = evaluate(m, method);
-    eprintln!(
-        "{label}: ferx {ofv:.12} vs NONMEM {want:.12}, diff {:e}",
-        ofv - want
-    );
+    eprintln!("{label}: ferx {ofv:.12} vs NONMEM {want:.12}, diff {:e}", ofv - want);
     assert!(ofv.is_finite(), "{label}: ferx OFV {ofv}");
-    assert!(
-        (ofv - want).abs() < OFV_TOL,
-        "{label}: ferx {ofv} vs NONMEM {want}"
-    );
+    assert!((ofv - want).abs() < OFV_TOL, "{label}: ferx {ofv} vs NONMEM {want}");
 }
 
 #[test]
 fn ltbs_combined_per_cmt_focei_objective_matches_nonmem_at_the_initial_estimates() {
-    check(
-        &INITS,
-        EstimationMethod::FoceI,
-        NM_FOCEI_OBJ,
-        "FOCEI, inits",
-    );
+    check(&INITS, EstimationMethod::FoceI, NM_FOCEI_OBJ, "FOCEI, inits");
 }
 
 #[test]
@@ -184,12 +165,7 @@ fn ltbs_combined_per_cmt_foce_objective_matches_nonmem_at_the_initial_estimates(
 
 #[test]
 fn ltbs_combined_per_cmt_focei_objective_matches_nonmem_at_its_final_estimates() {
-    check(
-        &FINAL,
-        EstimationMethod::FoceI,
-        NM_FINAL_OBJ,
-        "FOCEI, NONMEM final",
-    );
+    check(&FINAL, EstimationMethod::FoceI, NM_FINAL_OBJ, "FOCEI, NONMEM final");
 }
 
 /// Non-degeneracy: the endpoints really are scored with their own σ pairs. Swapping the
@@ -197,22 +173,12 @@ fn ltbs_combined_per_cmt_focei_objective_matches_nonmem_at_its_final_estimates()
 /// implementation that read one endpoint's σ for both could not pass the anchor.
 #[test]
 fn swapping_the_endpoint_sigma_pairs_moves_the_objective() {
-    let swapped = Params {
-        sigma: [
-            INITS.sigma[2],
-            INITS.sigma[3],
-            INITS.sigma[0],
-            INITS.sigma[1],
-        ],
-        ..INITS
-    };
+    let swapped =
+        Params { sigma: [INITS.sigma[2], INITS.sigma[3], INITS.sigma[0], INITS.sigma[1]], ..INITS };
     let ofv = evaluate(&model(&swapped), EstimationMethod::FoceI);
     eprintln!("swapped σ pairs: ferx {ofv:.6} vs NONMEM {NM_FOCEI_OBJ:.6}");
     assert!(ofv.is_finite());
-    assert!(
-        (ofv - NM_FOCEI_OBJ).abs() > 10.0,
-        "swapping the pairs left the objective at {ofv}"
-    );
+    assert!((ofv - NM_FOCEI_OBJ).abs() > 10.0, "swapping the pairs left the objective at {ofv}");
 }
 
 /// The motivating model's whole residual shape: per-endpoint `PROP`/`ADD` and, on the
@@ -220,17 +186,9 @@ fn swapping_the_endpoint_sigma_pairs_moves_the_objective() {
 /// factor-free one, so the factor is live and a model that ignored it could not pass.
 #[test]
 fn ltbs_combined_per_cmt_with_an_early_time_prop_factor_matches_nonmem() {
-    let m = model_with(
-        &INITS,
-        "PROP_P * (if (TAD < 3) FAC else 1)",
-        "  theta FAC(1.8, 0.1, 10.0)\n",
-    );
+    let m =
+        model_with(&INITS, "PROP_P * (if (TAD < 3) FAC else 1)", "  theta FAC(1.8, 0.1, 10.0)\n");
     assert!(m.has_custom_ruv_magnitude());
     assert!((NM_MAG_OBJ - NM_FOCEI_OBJ).abs() > 10.0);
-    check_model(
-        &m,
-        EstimationMethod::FoceI,
-        NM_MAG_OBJ,
-        "FOCEI, inits + PROP factor",
-    );
+    check_model(&m, EstimationMethod::FoceI, NM_MAG_OBJ, "FOCEI, inits + PROP factor");
 }

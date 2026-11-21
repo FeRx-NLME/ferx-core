@@ -93,17 +93,12 @@ fn csv(n_events: usize, ss: bool) -> String {
 fn run(model: &str, n_events: usize, ss: bool) -> FitResult {
     let m = parse_model_string(model).expect("the model parses");
     let mut f = tempfile::NamedTempFile::new().expect("temp csv");
-    f.write_all(csv(n_events, ss).as_bytes())
-        .expect("write csv");
+    f.write_all(csv(n_events, ss).as_bytes()).expect("write csv");
     let (pop, _) =
         read_population_for(&m, &None, f.path().to_str().unwrap(), None, None, None, &[])
             .expect("data loads");
     assert_eq!(pop.subjects.len(), 4);
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..Default::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..Default::default() };
     fit(&m, &pop, &m.default_params, &opts).expect("maxiter-0 fit runs")
 }
 
@@ -117,9 +112,7 @@ fn a_drug_driven_hazard_beside_a_steady_state_dose_runs_the_exact_inner_gradient
         let r = run(MODEL, n_events, true);
         assert_eq!(r.gradient_method_inner, "analytic");
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains(WARNING) || w.contains("W_PLAN_FD_FALLBACK")),
+            !r.warnings.iter().any(|w| w.contains(WARNING) || w.contains("W_PLAN_FD_FALLBACK")),
             "{n_events} TTE subjects: every hazard is served exactly: {:?}",
             r.warnings
         );
@@ -128,14 +121,9 @@ fn a_drug_driven_hazard_beside_a_steady_state_dose_runs_the_exact_inner_gradient
 
 #[test]
 fn the_same_pk_rows_without_an_event_model_emit_no_fd_warning() {
-    let pk_only = MODEL.replace(
-        "[event_model]\n  cmt    = 3\n  hazard = H0 * exp(BETA * (central / V))\n\n",
-        "",
-    );
-    assert!(
-        !pk_only.contains("[event_model]"),
-        "fixture: the endpoint is removed"
-    );
+    let pk_only = MODEL
+        .replace("[event_model]\n  cmt    = 3\n  hazard = H0 * exp(BETA * (central / V))\n\n", "");
+    assert!(!pk_only.contains("[event_model]"), "fixture: the endpoint is removed");
     let r = run(&pk_only, 0, true);
     assert_eq!(r.gradient_method_inner, "analytic");
     assert!(
@@ -152,9 +140,7 @@ fn a_drug_driven_hazard_without_steady_state_runs_the_exact_inner_gradient() {
     let r = run(MODEL, 4, false);
     assert_eq!(r.gradient_method_inner, "analytic");
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains(WARNING) || w.contains("W_PLAN_FD_FALLBACK")),
+        !r.warnings.iter().any(|w| w.contains(WARNING) || w.contains("W_PLAN_FD_FALLBACK")),
         "every subject's hazard is served: {:?}",
         r.warnings
     );

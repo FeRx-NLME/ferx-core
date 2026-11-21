@@ -19,15 +19,8 @@ fn roundtrip(src: &str) -> String {
     let rendered = first.render();
     let second = Mfl::parse(&rendered)
         .unwrap_or_else(|e| panic!("render of {src:?} → {rendered:?} does not reparse: {e}"));
-    assert_eq!(
-        first, second,
-        "round-trip changed the feature set for {src:?}"
-    );
-    assert_eq!(
-        second.render(),
-        rendered,
-        "render is not a fixed point for {src:?}"
-    );
+    assert_eq!(first, second, "round-trip changed the feature set for {src:?}");
+    assert_eq!(second.render(), rendered, "render is not a fixed point for {src:?}");
     rendered
 }
 
@@ -96,11 +89,7 @@ fn keywords_and_modes_are_case_insensitive_names_are_not() {
     assert_eq!(a, b);
     // The parameter and covariate names kept their case (ferx deviation).
     match &b.statements[1] {
-        Statement::Feature(Feature::Covariate {
-            parameters,
-            covariates,
-            ..
-        }) => {
+        Statement::Feature(Feature::Covariate { parameters, covariates, .. }) => {
             assert_eq!(parameters, &Operand::Names(vec!["Cl".into()]));
             assert_eq!(covariates, &Operand::Names(vec!["wt".into()]));
         }
@@ -120,10 +109,7 @@ fn separators_whitespace_and_comments() {
 #[test]
 fn single_element_arrays_normalise_to_bare_values() {
     assert_eq!(parse("ABSORPTION([FO])"), parse("ABSORPTION(FO)"));
-    assert_eq!(
-        parse("COVARIATE([CL],[WT],[pow])"),
-        parse("COVARIATE(CL,WT,pow)")
-    );
+    assert_eq!(parse("COVARIATE([CL],[WT],[pow])"), parse("COVARIATE(CL,WT,pow)"));
     // Duplicates in a mode list collapse.
     assert_eq!(parse("LAGTIME([ON,ON,OFF])"), parse("LAGTIME([ON,OFF])"));
 }
@@ -137,20 +123,12 @@ fn counts_expand_inclusive_and_deduplicated() {
 
 #[test]
 fn wildcard_expands_to_every_mode() {
-    assert_eq!(
-        Modes::<AbsorptionMode>::Wildcard.expand(),
-        AbsorptionMode::ALL.to_vec()
-    );
+    assert_eq!(Modes::<AbsorptionMode>::Wildcard.expand(), AbsorptionMode::ALL.to_vec());
     // `Modes::expand` is the raw enum; the covariate wildcard's *meaning*
     // (the four continuous forms) is applied by coverage and resolve.
-    assert_eq!(
-        Modes::<CovariateEffect>::Wildcard.expand().len(),
-        CovariateEffect::ALL.len()
-    );
+    assert_eq!(Modes::<CovariateEffect>::Wildcard.expand().len(), CovariateEffect::ALL.len());
     assert_eq!(CovariateEffect::CONTINUOUS.len(), 4);
-    assert!(!CovariateEffect::CONTINUOUS
-        .iter()
-        .any(|e| e.is_categorical()));
+    assert!(!CovariateEffect::CONTINUOUS.iter().any(|e| e.is_categorical()));
 }
 
 #[test]
@@ -210,15 +188,9 @@ fn arity_errors_say_what_the_feature_takes() {
     assert!(e.contains("ABSORPTION takes one argument"), "{e}");
     assert!(e.contains("found 2 arguments"), "{e}");
     let e = err("COVARIATE(CL,WT)");
-    assert!(
-        e.contains("COVARIATE takes parameter(s), covariate(s), effect(s)"),
-        "{e}"
-    );
+    assert!(e.contains("COVARIATE takes parameter(s), covariate(s), effect(s)"), "{e}");
     let e = err("COVARIANCE(IIV)");
-    assert!(
-        e.contains("COVARIANCE takes IIV or IOV, then parameter(s)"),
-        "{e}"
-    );
+    assert!(e.contains("COVARIANCE takes IIV or IOV, then parameter(s)"), "{e}");
 }
 
 #[test]
@@ -233,17 +205,11 @@ fn range_and_count_errors() {
     let e = err("PERIPHERALS(2..0)");
     assert!(e.contains("runs backwards"), "{e}");
     let e = err("PERIPHERALS(FO)");
-    assert!(
-        e.contains("expected a count, a range `a..b`, or an array of counts"),
-        "{e}"
-    );
+    assert!(e.contains("expected a count, a range `a..b`, or an array of counts"), "{e}");
     let e = err("PERIPHERALS([1,x])");
     assert!(e.contains("`x` is not a count"), "{e}");
     let e = err("PERIPHERALS(1.5)");
-    assert!(
-        e.contains("`1.5` is not a non-negative integer count"),
-        "{e}"
-    );
+    assert!(e.contains("`1.5` is not a non-negative integer count"), "{e}");
 }
 
 #[test]
@@ -252,10 +218,7 @@ fn counts_are_bounded_at_parse_time() {
     // allocation of the user's choosing at config-load time. The bound is on
     // every count, so it covers a range's ends, a single and an array alike.
     let e = err("PERIPHERALS(0..4294967295)");
-    assert!(
-        e.contains("`4294967295` is above the largest compartment count accepted (64)"),
-        "{e}"
-    );
+    assert!(e.contains("`4294967295` is above the largest compartment count accepted (64)"), "{e}");
     let e = err("TRANSITS(65)");
     assert!(e.contains("`65` is above"), "{e}");
     let e = err("PERIPHERALS([1,65])");
@@ -271,10 +234,7 @@ fn syntax_errors_are_located() {
     let e = err("ABSORPTION FO");
     assert!(e.contains("expected `(`"), "{e}");
     let e = err("ABSORPTION(FO) ELIMINATION(FO)");
-    assert!(
-        e.contains("expected `;` or a newline after a statement"),
-        "{e}"
-    );
+    assert!(e.contains("expected `;` or a newline after a statement"), "{e}");
     let e = err("COVARIATE(CL,[WT,pow)");
     assert!(e.contains("expected `,` or `]`"), "{e}");
     let e = err("COVARIATE(@,WT,pow)");
@@ -311,10 +271,7 @@ fn covariance_level_is_a_mode_argument() {
     let e = err("COVARIANCE(RUV,[CL,V])");
     assert!(e.contains("`RUV` is not a known variability level"), "{e}");
     assert!(e.contains("known: IIV, IOV"), "{e}");
-    assert_eq!(
-        parse("COVARIANCE([IIV],[CL,V])"),
-        parse("COVARIANCE(IIV,[CL,V])")
-    );
+    assert_eq!(parse("COVARIANCE([IIV],[CL,V])"), parse("COVARIANCE(IIV,[CL,V])"));
     match parse("COVARIANCE(*,[CL,V])").statements.pop() {
         Some(Statement::Feature(Feature::Covariance { level, .. })) => {
             assert_eq!(level.expand(), VariabilityLevel::ALL.to_vec());

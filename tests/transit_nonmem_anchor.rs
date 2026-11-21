@@ -83,9 +83,7 @@ fn savic_transit_matches_nonmem_ofv() {
     const EXPECTED_OFV: f64 = -1076.67;
     const TOLERANCE: f64 = 2.0;
 
-    let model = parse_full_model(MODEL_SRC)
-        .expect("Savic transit model must parse")
-        .model;
+    let model = parse_full_model(MODEL_SRC).expect("Savic transit model must parse").model;
     let pop = read_nonmem_csv(Path::new("data/transit_oral.csv"), None, None)
         .expect("transit_oral data must load");
 
@@ -103,11 +101,7 @@ fn savic_transit_matches_nonmem_ofv() {
     let result =
         fit(&model, &pop, &model.default_params, &opts).expect("Savic transit fit must run");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - EXPECTED_OFV).abs() < TOLERANCE,
         "OFV {:.3} is outside the NONMEM-anchored band {:.2} ± {:.1} (NONMEM #OBJV \
@@ -126,16 +120,11 @@ fn savic_transit_matches_nonmem_ofv() {
 /// benchmark.
 #[test]
 fn savic_transit_1e9_rk45_stats_are_accepted_step_dominated() {
-    let mut model = parse_full_model(MODEL_SRC)
-        .expect("Savic transit model must parse")
-        .model;
+    let mut model = parse_full_model(MODEL_SRC).expect("Savic transit model must parse").model;
     let pop = read_nonmem_csv(Path::new("data/transit_oral.csv"), None, None)
         .expect("transit_oral data must load");
     {
-        let ode = model
-            .ode_spec
-            .as_mut()
-            .expect("Savic transit model must be ODE-based");
+        let ode = model.ode_spec.as_mut().expect("Savic transit model must be ODE-based");
         ode.solver_opts.reltol = 1e-9;
         ode.solver_opts.abstol = 1e-9;
     }
@@ -164,10 +153,7 @@ fn savic_transit_1e9_rk45_stats_are_accepted_step_dominated() {
     }
 
     assert_eq!(n_pred, 240);
-    assert_eq!(
-        stats.attempted_steps,
-        stats.accepted_steps + stats.rejected_steps
-    );
+    assert_eq!(stats.attempted_steps, stats.accepted_steps + stats.rejected_steps);
     assert!(
         stats.accepted_steps > 10 * stats.rejected_steps.max(1),
         "Savic transit at 1e-9 should be accepted-step dominated; stats = {stats:?}"
@@ -199,10 +185,7 @@ fn savic_transit_solver_regime_across_ode_methods() {
 
     let theta = [5.453, 55.759, 0.950, 0.966, 3.128];
 
-    for (label, reltol, abstol) in [
-        ("1e-9 (NONMEM TOL=9)", 1e-9, 1e-9),
-        ("defaults", 1e-4, 1e-6),
-    ] {
+    for (label, reltol, abstol) in [("1e-9 (NONMEM TOL=9)", 1e-9, 1e-9), ("defaults", 1e-4, 1e-6)] {
         let mut baseline: Option<Vec<f64>> = None;
         println!("\n=== Savic transit anchor @ {label} ===");
         println!(
@@ -217,9 +200,8 @@ fn savic_transit_solver_regime_across_ode_methods() {
             OdeMethod::Rodas4,
             OdeMethod::Rodas5P,
         ] {
-            let mut model = parse_full_model(MODEL_SRC)
-                .expect("Savic transit model must parse")
-                .model;
+            let mut model =
+                parse_full_model(MODEL_SRC).expect("Savic transit model must parse").model;
             let pop = read_nonmem_csv(Path::new("data/transit_oral.csv"), None, None)
                 .expect("transit_oral data must load");
             {

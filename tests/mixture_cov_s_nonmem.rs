@@ -148,12 +148,8 @@ fn eval_only_fit(method: CovarianceMethod) -> FitResult {
 }
 
 fn eval_only_fit_of(src: &str, method: CovarianceMethod) -> FitResult {
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let model = parse_model_string(src).unwrap();
     let opts = FitOptions {
         interaction: true, // NONMEM METHOD=1 INTER
@@ -200,16 +196,9 @@ fn nonmem_theta_ses_n(stem: &str, n: usize) -> Vec<f64> {
         .lines()
         .find(|l| l.split_whitespace().next() == Some("-1000000001"))
         .unwrap_or_else(|| panic!("{path}: no -1000000001 (SE) row"));
-    let se: Vec<f64> = row
-        .split_whitespace()
-        .skip(1)
-        .take(n)
-        .map(|v| v.parse::<f64>().unwrap())
-        .collect();
-    assert!(
-        se.len() == n && se.iter().all(|s| s.is_finite() && *s > 0.0),
-        "{path}: SE row {se:?}"
-    );
+    let se: Vec<f64> =
+        row.split_whitespace().skip(1).take(n).map(|v| v.parse::<f64>().unwrap()).collect();
+    assert!(se.len() == n && se.iter().all(|s| s.is_finite() && *s > 0.0), "{path}: SE row {se:?}");
     se
 }
 
@@ -251,10 +240,9 @@ fn worst_rel_named(label: &str, names: &[&str], got: &[f64], want: &[f64]) -> f6
 /// Runs on every PR: one objective evaluation plus the covariance step on 30 subjects.
 #[test]
 fn mixture_s_and_rsr_report_every_theta_se() {
-    for (method, label) in [
-        (CovarianceMethod::CrossProduct, "s"),
-        (CovarianceMethod::Sandwich, "rsr"),
-    ] {
+    for (method, label) in
+        [(CovarianceMethod::CrossProduct, "s"), (CovarianceMethod::Sandwich, "rsr")]
+    {
         let res = eval_only_fit(method);
         let se = theta_ses(&res, label);
         assert!(
@@ -279,15 +267,8 @@ fn mixture_s_and_rsr_report_every_theta_se() {
 #[test]
 fn mixture_r_se_matches_nonmem_r() {
     let se = theta_ses(&eval_only_fit(CovarianceMethod::Hessian), "r");
-    let worst = worst_rel(
-        "ferx r vs NONMEM MATRIX=R",
-        &se,
-        &nonmem_theta_ses("mixture_iv_cov_r0"),
-    );
-    assert!(
-        worst < 1e-2,
-        "ferx r vs NONMEM MATRIX=R: worst rel {worst:.3e}"
-    );
+    let worst = worst_rel("ferx r vs NONMEM MATRIX=R", &se, &nonmem_theta_ses("mixture_iv_cov_r0"));
+    assert!(worst < 1e-2, "ferx r vs NONMEM MATRIX=R: worst rel {worst:.3e}");
 }
 
 /// ferx's `s` / `rsr` against the third-way oracle's re-estimated (total-derivative)
@@ -315,21 +296,14 @@ fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
     let rsr = theta_ses(&eval_only_fit(CovarianceMethod::Sandwich), "rsr");
     let r = theta_ses(&eval_only_fit(CovarianceMethod::Hessian), "r");
     let w_s = worst_rel("ferx s vs oracle total", &s, &ORACLE_S_TOTAL);
-    let w_s_nm = worst_rel(
-        "ferx s vs NONMEM MATRIX=S",
-        &s,
-        &nonmem_theta_ses("mixture_iv_cov_s"),
-    );
+    let w_s_nm = worst_rel("ferx s vs NONMEM MATRIX=S", &s, &nonmem_theta_ses("mixture_iv_cov_s"));
     let w_r = worst_rel("ferx r vs oracle", &r, &ORACLE_R);
     let w_rsr = worst_rel("ferx rsr vs oracle total", &rsr, &ORACLE_RSR_TOTAL);
     let w_held = worst_rel("ferx s vs oracle held", &s, &ORACLE_S_HELD);
     assert!(w_s < 1e-6, "ferx s vs oracle (η̂ re-estimated): {w_s:.3e}");
     assert!(w_s_nm < 2e-5, "ferx s vs NONMEM MATRIX=S: {w_s_nm:.3e}");
     assert!(w_r < 1e-3, "ferx r vs oracle: {w_r:.3e}");
-    assert!(
-        w_rsr < 3e-4,
-        "ferx rsr vs oracle (η̂ re-estimated): {w_rsr:.3e}"
-    );
+    assert!(w_rsr < 3e-4, "ferx rsr vs oracle (η̂ re-estimated): {w_rsr:.3e}");
     assert!(
         w_held > 0.1,
         "straddle: ferx s must be distinguishable from the mode-held convention: {w_held:.3e}"
@@ -346,23 +320,13 @@ fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
         &nonmem_theta_ses("mixture_iv_cov_rsr"),
         &ORACLE_RSR_TOTAL,
     );
-    assert!(
-        w_nm_s < 2e-5,
-        "NONMEM MATRIX=S vs oracle (η̂ re-estimated): {w_nm_s:.3e}"
-    );
-    assert!(
-        w_nm_rsr < 2e-2,
-        "NONMEM R⁻¹SR⁻¹ vs oracle (η̂ re-estimated): {w_nm_rsr:.3e}"
-    );
+    assert!(w_nm_s < 2e-5, "NONMEM MATRIX=S vs oracle (η̂ re-estimated): {w_nm_s:.3e}");
+    assert!(w_nm_rsr < 2e-2, "NONMEM R⁻¹SR⁻¹ vs oracle (η̂ re-estimated): {w_nm_rsr:.3e}");
 
     // The straddle: the two conventions differ by far more than any agreement above,
     // so passing on one column says nothing about the other.
     let w_conv_s = worst_rel("oracle S held vs total", &ORACLE_S_HELD, &ORACLE_S_TOTAL);
-    let w_conv_rsr = worst_rel(
-        "oracle RSR held vs total",
-        &ORACLE_RSR_HELD,
-        &ORACLE_RSR_TOTAL,
-    );
+    let w_conv_rsr = worst_rel("oracle RSR held vs total", &ORACLE_RSR_HELD, &ORACLE_RSR_TOTAL);
     assert!(
         w_conv_s > 0.1 && w_conv_rsr > 0.1,
         "the conventions must stay distinguishable: S {w_conv_s:.3e}, RSR {w_conv_rsr:.3e}"
@@ -408,82 +372,38 @@ fn single_population_twin_s_matches_nonmem_matrix_s() {
 
     // NONMEM implements the re-estimated (total-derivative) convention.
     let w_nm_r = worst_rel_named("twin NONMEM R vs oracle", &SG_NAMES, &nm_r, &SG_ORACLE_R);
-    let w_nm_s = worst_rel_named(
-        "twin NONMEM S vs oracle total",
-        &SG_NAMES,
-        &nm_s,
-        &SG_ORACLE_S_TOTAL,
-    );
+    let w_nm_s =
+        worst_rel_named("twin NONMEM S vs oracle total", &SG_NAMES, &nm_s, &SG_ORACLE_S_TOTAL);
     let w_nm_rsr = worst_rel_named(
         "twin NONMEM RSR vs oracle total",
         &SG_NAMES,
         &nm_rsr,
         &SG_ORACLE_RSR_TOTAL,
     );
-    assert!(
-        w_nm_r < 2e-3,
-        "twin NONMEM MATRIX=R vs oracle: {w_nm_r:.3e}"
-    );
-    assert!(
-        w_nm_s < 1e-5,
-        "twin NONMEM MATRIX=S vs oracle (η̂ re-estimated): {w_nm_s:.3e}"
-    );
-    assert!(
-        w_nm_rsr < 5e-3,
-        "twin NONMEM R⁻¹SR⁻¹ vs oracle (η̂ re-estimated): {w_nm_rsr:.3e}"
-    );
+    assert!(w_nm_r < 2e-3, "twin NONMEM MATRIX=R vs oracle: {w_nm_r:.3e}");
+    assert!(w_nm_s < 1e-5, "twin NONMEM MATRIX=S vs oracle (η̂ re-estimated): {w_nm_s:.3e}");
+    assert!(w_nm_rsr < 5e-3, "twin NONMEM R⁻¹SR⁻¹ vs oracle (η̂ re-estimated): {w_nm_rsr:.3e}");
 
     // ferx implements the re-estimated convention (#2974); its `R` is the oracle's.
     let src = single_model_src();
-    let s = theta_ses_n(
-        &eval_only_fit_of(&src, CovarianceMethod::CrossProduct),
-        "twin s",
-        2,
-    );
-    let rsr = theta_ses_n(
-        &eval_only_fit_of(&src, CovarianceMethod::Sandwich),
-        "twin rsr",
-        2,
-    );
-    let r = theta_ses_n(
-        &eval_only_fit_of(&src, CovarianceMethod::Hessian),
-        "twin r",
-        2,
-    );
+    let s = theta_ses_n(&eval_only_fit_of(&src, CovarianceMethod::CrossProduct), "twin s", 2);
+    let rsr = theta_ses_n(&eval_only_fit_of(&src, CovarianceMethod::Sandwich), "twin rsr", 2);
+    let r = theta_ses_n(&eval_only_fit_of(&src, CovarianceMethod::Hessian), "twin r", 2);
     let w_r_oracle = worst_rel_named("twin ferx r vs oracle", &SG_NAMES, &r, &SG_ORACLE_R);
     let w_r = worst_rel_named("twin ferx r vs NONMEM MATRIX=R", &SG_NAMES, &r, &nm_r);
-    let w_s = worst_rel_named(
-        "twin ferx s vs oracle total",
-        &SG_NAMES,
-        &s,
-        &SG_ORACLE_S_TOTAL,
-    );
-    let w_rsr = worst_rel_named(
-        "twin ferx rsr vs oracle total",
-        &SG_NAMES,
-        &rsr,
-        &SG_ORACLE_RSR_TOTAL,
-    );
+    let w_s = worst_rel_named("twin ferx s vs oracle total", &SG_NAMES, &s, &SG_ORACLE_S_TOTAL);
+    let w_rsr =
+        worst_rel_named("twin ferx rsr vs oracle total", &SG_NAMES, &rsr, &SG_ORACLE_RSR_TOTAL);
     assert!(w_r_oracle < 1e-5, "twin ferx r vs oracle: {w_r_oracle:.3e}");
     assert!(w_r < 2e-3, "twin ferx r vs NONMEM MATRIX=R: {w_r:.3e}");
-    assert!(
-        w_s < 1e-6,
-        "twin ferx s vs oracle (η̂ re-estimated): {w_s:.3e}"
-    );
-    assert!(
-        w_rsr < 1e-5,
-        "twin ferx rsr vs oracle (η̂ re-estimated): {w_rsr:.3e}"
-    );
+    assert!(w_s < 1e-6, "twin ferx s vs oracle (η̂ re-estimated): {w_s:.3e}");
+    assert!(w_rsr < 1e-5, "twin ferx rsr vs oracle (η̂ re-estimated): {w_rsr:.3e}");
 
     // Against NONMEM's own `.ext`, and the straddle against the mode-held column.
     let w_nm = worst_rel_named("twin ferx s vs NONMEM S", &SG_NAMES, &s, &nm_s);
     assert!(w_nm < 1e-5, "twin ferx s vs NONMEM MATRIX=S: {w_nm:.3e}");
-    let w_straddle = worst_rel_named(
-        "twin ferx s vs oracle held",
-        &SG_NAMES,
-        &s,
-        &SG_ORACLE_S_HELD,
-    );
+    let w_straddle =
+        worst_rel_named("twin ferx s vs oracle held", &SG_NAMES, &s, &SG_ORACLE_S_HELD);
     assert!(
         w_straddle > 0.1,
         "twin: ferx s must stay distinguishable from the mode-held convention: {w_straddle:.3e}"

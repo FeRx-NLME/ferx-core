@@ -59,10 +59,8 @@ fn ses(k: f64, ode: bool, opts: &FitOptions) -> Vec<f64> {
     let model = ferx_core::parser::model_parser::parse_model_string(&model_src(k, ode)).unwrap();
     let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
     let r: FitResult = fit(&model, &pop, &model.default_params, opts).unwrap();
-    let th = r
-        .se_theta
-        .clone()
-        .unwrap_or_else(|| panic!("k = {k}: no SEs; warnings: {:?}", r.warnings));
+    let th =
+        r.se_theta.clone().unwrap_or_else(|| panic!("k = {k}: no SEs; warnings: {:?}", r.warnings));
     let mut v = vec![th[0], th[1] / k, th[2]];
     for i in 0..3 {
         v.push(ferx_core::types::omega_se_at(&r.se_omega, 3, i, i).unwrap());
@@ -73,9 +71,7 @@ fn ses(k: f64, ode: bool, opts: &FitOptions) -> Vec<f64> {
 
 /// Assert every SE at each small `k` matches `k = 1` to `tol` relative.
 fn assert_scale_invariant(route: &str, ode: bool, opts: FitOptions, ks: &[f64], tol: f64) {
-    let names = [
-        "TVCL", "TVV_S/k", "TVKA", "ETA_CL", "ETA_V", "ETA_KA", "PROP_ERR",
-    ];
+    let names = ["TVCL", "TVV_S/k", "TVKA", "ETA_CL", "ETA_V", "ETA_KA", "PROP_ERR"];
     let reference = ses(1.0, ode, &opts);
     assert!(
         reference.iter().all(|s| s.is_finite() && *s > 0.0),
@@ -176,10 +172,7 @@ fn profiled_ses(k: f64) -> Vec<f64> {
         ("theta EMAX(8.0,", "theta EMAX(13.605569,"),
         ("theta ET50(2.0,", "theta ET50(4.293364,"),
         ("omega ETA_E0 ~ 4.0 (sd)", "omega ETA_E0 ~ 2.193935 (sd)"),
-        (
-            "kappa KAPPA_ARM ~ 4.0 (sd)",
-            "kappa KAPPA_ARM ~ 12.490309 (sd)",
-        ),
+        ("kappa KAPPA_ARM ~ 4.0 (sd)", "kappa KAPPA_ARM ~ 12.490309 (sd)"),
     ];
     assert!(text.contains(decl) && text.contains(use_), "fixture moved");
     let text = at_optimum.iter().fold(text, |t, (from, to)| {
@@ -190,25 +183,15 @@ fn profiled_ses(k: f64) -> Vec<f64> {
     let text = text
         .replace(
             decl,
-            &format!(
-                "theta ED50_S({ed50_s:e}, {:e}, {:e})",
-                -100.0 * ed50_s,
-                100.0 * ed50_s
-            ),
+            &format!("theta ED50_S({ed50_s:e}, {:e}, {:e})", -100.0 * ed50_s, 100.0 * ed50_s),
         )
         .replace(use_, &format!("EMAX * DOSE / (ED50_S / {k:e} + DOSE)"));
-    let path = std::env::temp_dir().join(format!(
-        "ferx_fd_step_identity_theta_{}_{k:e}.ferx",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir()
+        .join(format!("ferx_fd_step_identity_theta_{}_{k:e}.ferx", std::process::id()));
     std::fs::write(&path, text).unwrap();
     let p = ferx_core::prepare_run(
         path.to_str().unwrap(),
-        Some(
-            root.join("tests/data/mbma_placebo/mbma_placebo.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root.join("tests/data/mbma_placebo/mbma_placebo.csv").to_str().unwrap()),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let opts = FitOptions {
@@ -218,10 +201,8 @@ fn profiled_ses(k: f64) -> Vec<f64> {
         ..p.parsed.fit_options.clone()
     };
     let r = fit(&p.parsed.model, &p.population, &p.init_params, &opts).unwrap();
-    let mut th = r
-        .se_theta
-        .clone()
-        .unwrap_or_else(|| panic!("k = {k}: no SEs; warnings: {:?}", r.warnings));
+    let mut th =
+        r.se_theta.clone().unwrap_or_else(|| panic!("k = {k}: no SEs; warnings: {:?}", r.warnings));
     th[2] /= k;
     th
 }
@@ -229,10 +210,7 @@ fn profiled_ses(k: f64) -> Vec<f64> {
 #[test]
 fn profiled_levels_covariance_steps_a_small_identity_theta_relatively() {
     let reference = profiled_ses(1.0);
-    assert!(
-        reference.iter().all(|s| s.is_finite() && *s > 0.0),
-        "reference SEs {reference:?}"
-    );
+    assert!(reference.iter().all(|s| s.is_finite() && *s > 0.0), "reference SEs {reference:?}");
     for k in [1e-3, 1e-4] {
         let got = profiled_ses(k);
         assert_eq!(got.len(), reference.len());
@@ -297,10 +275,8 @@ fn fd_r_on_a_rescaled_volume_matches_nonmem_matrix_r() {
         ..FitOptions::default()
     };
     let r = fit(&model, &pop, &model.default_params, &opts).unwrap();
-    let se_theta = r
-        .se_theta
-        .as_ref()
-        .unwrap_or_else(|| panic!("no SEs; warnings: {:?}", r.warnings));
+    let se_theta =
+        r.se_theta.as_ref().unwrap_or_else(|| panic!("no SEs; warnings: {:?}", r.warnings));
     let se_sigma = r.se_sigma.as_ref().unwrap();
     let omega_se = |i: usize| ferx_core::types::omega_se_at(&r.se_omega, 3, i, i).unwrap();
     // NONMEM 7.5.1 FOCEI MATRIX=R SE row at this minimum, as in the #432 test.
@@ -368,12 +344,8 @@ fn mixture_ses(k: f64, logit: bool) -> Vec<f64> {
         hi = 100.0 * m_s,
     );
     let model = ferx_core::parser::model_parser::parse_model_string(&src).unwrap();
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .unwrap();
+    let pop =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None).unwrap();
     let opts = FitOptions {
         interaction: true,
         outer_maxiter: 0,
@@ -383,10 +355,8 @@ fn mixture_ses(k: f64, logit: bool) -> Vec<f64> {
         ..FitOptions::default()
     };
     let r = fit(&model, &pop, &model.default_params, &opts).unwrap();
-    let mut se = r
-        .se_theta
-        .clone()
-        .unwrap_or_else(|| panic!("k = {k}: no SEs; warnings: {:?}", r.warnings));
+    let mut se =
+        r.se_theta.clone().unwrap_or_else(|| panic!("k = {k}: no SEs; warnings: {:?}", r.warnings));
     // SE(M) by the delta method, M = sqrt(M_S / k): dM/dM_S = 1 / (2·M·k).
     se[3] /= 2.0 * m * k;
     se

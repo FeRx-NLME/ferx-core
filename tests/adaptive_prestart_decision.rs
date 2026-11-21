@@ -44,57 +44,25 @@ struct Schedule {
 /// Constant WT: the constant-covariate replay.
 const CONSTANT: &[Schedule] = &[
     // Two holds before the first record.
-    Schedule {
-        id: "21",
-        decisions: &[0.25, 0.5],
-        doses: &[],
-    },
+    Schedule { id: "21", decisions: &[0.25, 0.5], doses: &[] },
     // A hold before the first record, a dose after it with residual drug present.
-    Schedule {
-        id: "22",
-        decisions: &[0.5, 2.0],
-        doses: &[2.0],
-    },
+    Schedule { id: "22", decisions: &[0.5, 2.0], doses: &[2.0] },
     // A hold, then a dose, both before the first record (ID 24's constant twin, #2630 r1).
-    Schedule {
-        id: "28",
-        decisions: &[0.25, 0.5],
-        doses: &[0.5],
-    },
+    Schedule { id: "28", decisions: &[0.25, 0.5], doses: &[0.5] },
 ];
 
 /// WT 70 → 140 within the first instant: the time-varying replay.
 const TIME_VARYING: &[Schedule] = &[
     // A dose at a decision before the first record, then a second with residual drug.
-    Schedule {
-        id: "23",
-        decisions: &[0.5, 2.0],
-        doses: &[0.5, 2.0],
-    },
+    Schedule { id: "23", decisions: &[0.5, 2.0], doses: &[0.5, 2.0] },
     // A hold, then a dose, both before the first record.
-    Schedule {
-        id: "24",
-        decisions: &[0.25, 0.5],
-        doses: &[0.5],
-    },
+    Schedule { id: "24", decisions: &[0.25, 0.5], doses: &[0.5] },
     // A hold before the first record, a dose after it.
-    Schedule {
-        id: "25",
-        decisions: &[0.5, 2.0],
-        doses: &[2.0],
-    },
+    Schedule { id: "25", decisions: &[0.5, 2.0], doses: &[2.0] },
     // The first record is a base dose; a hold before it.
-    Schedule {
-        id: "26",
-        decisions: &[0.5],
-        doses: &[],
-    },
+    Schedule { id: "26", decisions: &[0.5], doses: &[] },
     // #2125's own subject (`init_seed_tie` ID 11 with an observation at 4).
-    Schedule {
-        id: "27",
-        decisions: &[0.5],
-        doses: &[],
-    },
+    Schedule { id: "27", decisions: &[0.5], doses: &[] },
 ];
 
 // Measured worst |ferx − NONMEM| on macOS arm64: 3.1e-8 (constant, 12 observations) and
@@ -113,9 +81,7 @@ fn model() -> CompiledModel {
 fn nonmem_ipred() -> Vec<(String, f64, f64)> {
     let path = format!("nonmem_anchor/results/{ANCHOR}.tab");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let mut lines = text
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("ID"));
+    let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("ID"));
     let header: Vec<&str> = lines.next().expect("header").split_whitespace().collect();
     let col = |c: &str| header.iter().position(|h| *h == c).expect(c);
     let (id, time, evid, ipred) = (col("ID"), col("TIME"), col("EVID"), col("IPRED"));
@@ -146,10 +112,7 @@ fn base_population() -> Population {
         let f: Vec<&str> = l.split(',').collect();
         let (id, time, evid) = (f[0], f[1].parse::<f64>().unwrap(), f[4]);
         let controller = evid == "1"
-            && CONSTANT
-                .iter()
-                .chain(TIME_VARYING)
-                .any(|s| s.id == id && s.doses.contains(&time));
+            && CONSTANT.iter().chain(TIME_VARYING).any(|s| s.id == id && s.doses.contains(&time));
         if controller {
             removed += 1;
         } else {
@@ -158,8 +121,7 @@ fn base_population() -> Population {
     }
     assert_eq!(removed, 6, "controller dose rows in the anchor dataset");
     let mut f = tempfile::NamedTempFile::new().expect("temp file");
-    f.write_all((out.join("\n") + "\n").as_bytes())
-        .expect("write base csv");
+    f.write_all((out.join("\n") + "\n").as_bytes()).expect("write base csv");
     f.flush().expect("flush base csv");
     read_nonmem_csv(f.path(), None, None).expect("base csv")
 }
@@ -167,9 +129,7 @@ fn base_population() -> Population {
 /// Run each schedule on its own subject with the replay verifier on, the controller
 /// re-emitting the schedule's doses. Returns `(ID, TIME, IPRED)` per observation.
 fn adaptive(
-    m: &CompiledModel,
-    pop: &Population,
-    schedules: &[Schedule],
+    m: &CompiledModel, pop: &Population, schedules: &[Schedule],
 ) -> Vec<(String, f64, f64)> {
     let mut out = Vec::new();
     for s in schedules {
@@ -192,10 +152,7 @@ fn adaptive(
             s.id,
             s.decisions[0]
         );
-        let one = Population {
-            subjects: vec![subject.clone()],
-            ..pop.clone()
-        };
+        let one = Population { subjects: vec![subject.clone()], ..pop.clone() };
         let mut opts = AdaptiveSimulateOptions::default();
         opts.seed = Some(1);
         opts.decision_times = s.decisions.to_vec();
@@ -218,17 +175,8 @@ fn adaptive(
             &opts,
         )
         .unwrap_or_else(|e| panic!("ID {}: adaptive run refused: {e}", s.id));
-        assert_eq!(
-            res.ledger.len(),
-            s.doses.len(),
-            "ID {}: realized doses",
-            s.id
-        );
-        out.extend(
-            res.trajectories
-                .into_iter()
-                .map(|r| (r.id, r.time, r.ipred)),
-        );
+        assert_eq!(res.ledger.len(), s.doses.len(), "ID {}: realized doses", s.id);
+        out.extend(res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)));
     }
     out
 }
@@ -236,10 +184,8 @@ fn adaptive(
 /// Compare `got` with NONMEM's rows for the same subjects, row for row. Each value is
 /// checked finite before it is compared (`f64::max` drops a NaN).
 fn assert_matches_nonmem(leg: &str, got: &[(String, f64, f64)], schedules: &[Schedule]) {
-    let nm: Vec<_> = nonmem_ipred()
-        .into_iter()
-        .filter(|r| schedules.iter().any(|s| s.id == r.0))
-        .collect();
+    let nm: Vec<_> =
+        nonmem_ipred().into_iter().filter(|r| schedules.iter().any(|s| s.id == r.0)).collect();
     assert_eq!(got.len(), nm.len(), "{leg}: observation count");
     let mut worst = 0.0_f64;
     for ((id, t, v), (nid, nt, want)) in got.iter().zip(&nm) {
@@ -255,10 +201,7 @@ fn assert_matches_nonmem(leg: &str, got: &[(String, f64, f64)], schedules: &[Sch
         );
         worst = worst.max(err);
     }
-    println!(
-        "{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations",
-        nm.len()
-    );
+    println!("{leg}: worst |ferx − NONMEM| {worst:.3e} over {} observations", nm.len());
 }
 
 /// The constant-covariate replay (`ode_predictions_with_extra_breaks`), IDs 21, 22 and 28.
@@ -283,12 +226,8 @@ fn time_varying_path_decision_before_the_first_record_verifies_and_matches_nonme
 #[test]
 fn re_emitting_the_regimen_equals_predict_on_it_as_data() {
     let m = model();
-    let full = read_nonmem_csv(
-        Path::new(&format!("nonmem_anchor/{ANCHOR}.csv")),
-        None,
-        None,
-    )
-    .expect("anchor csv");
+    let full = read_nonmem_csv(Path::new(&format!("nonmem_anchor/{ANCHOR}.csv")), None, None)
+        .expect("anchor csv");
     let want: Vec<(String, f64, f64)> = predict(&m, &full, &m.default_params)
         .expect("predict")
         .into_iter()

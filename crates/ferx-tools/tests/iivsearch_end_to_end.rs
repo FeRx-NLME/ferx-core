@@ -77,10 +77,7 @@ fn run(dir: &Path, path: &Path) -> (SearchConfig, IivsearchResult) {
     let result = run_iivsearch(
         &config,
         &base,
-        IivsearchRun {
-            dir: Some(dir.join("run")),
-            ..IivsearchRun::default()
-        },
+        IivsearchRun { dir: Some(dir.join("run")), ..IivsearchRun::default() },
     )
     .expect("search");
     (config, result)
@@ -90,13 +87,8 @@ fn evaluate(text: &str, base: &ferx_tools::search::BaseModel) -> ferx_core::FitR
     let parsed = parse_full_model(text).expect("the model parses");
     let mut o = parsed.fit_options.clone().quiet();
     o.threads = Some(2);
-    fit(
-        &parsed.model,
-        &base.prepared.population,
-        &parsed.model.default_params,
-        &o,
-    )
-    .expect("evaluation")
+    fit(&parsed.model, &base.prepared.population, &parsed.model.default_params, &o)
+        .expect("evaluation")
 }
 
 #[test]
@@ -111,25 +103,18 @@ fn a_single_point_space_returns_the_input_fit_bit_for_bit() {
     );
     let config = SearchConfig::load(&path).unwrap();
     let base = config.load_base().unwrap();
-    let direct = fit(
-        &base.prepared.parsed.model,
-        &base.prepared.population,
-        &base.prepared.init_params,
-        &{
+    let direct =
+        fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &{
             let mut o = base.prepared.parsed.fit_options.clone().quiet();
             o.threads = Some(2);
             o
-        },
-    )
-    .expect("direct evaluation");
+        })
+        .expect("direct evaluation");
 
     let result = run_iivsearch(
         &config,
         &base,
-        IivsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..IivsearchRun::default()
-        },
+        IivsearchRun { dir: Some(dir.path().join("run")), ..IivsearchRun::default() },
     )
     .expect("search");
     assert_eq!(result.rows.len(), 1, "{:?}", result.rows);
@@ -155,12 +140,7 @@ fn a_single_point_space_returns_the_input_fit_bit_for_bit() {
     let again = evaluate(&final_text, &base);
     let gap = (again.ofv - direct.ofv).abs();
     eprintln!("final.ferx re-evaluation |ΔOFV| = {gap:.3e}");
-    assert!(
-        gap < 1e-9,
-        "final.ferx OFV {} vs direct {}",
-        again.ofv,
-        direct.ofv
-    );
+    assert!(gap < 1e-9, "final.ferx OFV {} vs direct {}", again.ofv, direct.ofv);
 }
 
 #[test]
@@ -172,16 +152,8 @@ fn every_candidate_of_every_algorithm_compiles_and_evaluates() {
             // 7 η subsets, then the blocks over whatever step 1 kept.
             8,
         ),
-        (
-            "bottom_up_stepwise",
-            "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,[CL,V,KA])",
-            4,
-        ),
-        (
-            "simultaneous_stepwise",
-            "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,[CL,V,KA])",
-            6,
-        ),
+        ("bottom_up_stepwise", "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,[CL,V,KA])", 4),
+        ("simultaneous_stepwise", "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,[CL,V,KA])", 6),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
@@ -202,11 +174,7 @@ fn every_candidate_of_every_algorithm_compiles_and_evaluates() {
             result.rows.iter().filter(|r| r.step > 0).count() >= expect,
             "{algorithm}: {} candidates fitted: {:?}",
             result.rows.len(),
-            result
-                .rows
-                .iter()
-                .map(|r| r.structure.description())
-                .collect::<Vec<_>>()
+            result.rows.iter().map(|r| r.structure.description()).collect::<Vec<_>>()
         );
         for r in &result.rows {
             assert!(r.ofv.unwrap().is_finite(), "{}: {:?}", algorithm, r);
@@ -217,12 +185,7 @@ fn every_candidate_of_every_algorithm_compiles_and_evaluates() {
         // The number of free parameters follows the structure: one per η,
         // one per covariance.
         for r in &result.rows {
-            let n_cov: usize = r
-                .structure
-                .blocks
-                .iter()
-                .map(|b| b.len() * (b.len() - 1) / 2)
-                .sum();
+            let n_cov: usize = r.structure.blocks.iter().map(|b| b.len() * (b.len() - 1) / 2).sum();
             assert_eq!(
                 r.n_parameters.unwrap(),
                 4 + r.structure.etas.len() + n_cov,
@@ -306,19 +269,13 @@ fn a_block_candidate_is_the_hand_written_block_seeded_from_the_ebes() {
     let mean = |k: usize| input.subjects.iter().map(|s| s.eta[k]).sum::<f64>() / n;
     let (mi, mj) = (mean(i), mean(j));
     let cov = |a: usize, b: usize, ma: f64, mb: f64| {
-        input
-            .subjects
-            .iter()
-            .map(|s| (s.eta[a] - ma) * (s.eta[b] - mb))
-            .sum::<f64>()
+        input.subjects.iter().map(|s| (s.eta[a] - ma) * (s.eta[b] - mb)).sum::<f64>()
     };
     let corr =
         (cov(i, j, mi, mj) / (cov(i, i, mi, mi) * cov(j, j, mj, mj)).sqrt()).clamp(-0.95, 0.95);
     let off = corr * (0.09f64 * 0.04).sqrt();
-    let line = generated
-        .lines()
-        .find(|l| l.trim().starts_with("block_omega"))
-        .expect("the block line");
+    let line =
+        generated.lines().find(|l| l.trim().starts_with("block_omega")).expect("the block line");
     let written: f64 = line.split(',').nth(2).unwrap().trim().parse().unwrap();
     assert!(
         (written - off).abs() < 1e-12,
@@ -337,12 +294,7 @@ fn a_block_candidate_is_the_hand_written_block_seeded_from_the_ebes() {
     // on macOS arm64); ~10× headroom, far inside anything a search decides on.
     let gap = (ours.ofv - theirs.ofv).abs();
     eprintln!("block twin |ΔOFV| = {gap:.3e}");
-    assert!(
-        gap < 2.5e-8,
-        "generated {} vs hand-written {}",
-        ours.ofv,
-        theirs.ofv
-    );
+    assert!(gap < 2.5e-8, "generated {} vs hand-written {}", ours.ofv, theirs.ofv);
     assert_eq!(ours.n_parameters, theirs.n_parameters);
     assert_eq!(blocked.starts, 1, "a 2-block gets the run's starts");
 }
@@ -357,19 +309,13 @@ fn a_model_outside_the_canonical_form_is_refused_by_name_before_any_fit() {
     let err = run_iivsearch(
         &config,
         &base,
-        IivsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..IivsearchRun::default()
-        },
+        IivsearchRun { dir: Some(dir.path().join("run")), ..IivsearchRun::default() },
     )
     .expect_err("a proportional η is not searchable");
     assert!(err.contains("`V`"), "{err}");
     assert!(err.contains("canonical form"), "{err}");
     assert!(err.contains("`ETA_V`"), "{err}");
-    assert!(
-        !dir.path().join("run/input").exists(),
-        "refused before the input was fitted"
-    );
+    assert!(!dir.path().join("run/input").exists(), "refused before the input was fitted");
     // The same model is fine when `V` is left out of the space.
     let path = write_config(
         dir.path(),

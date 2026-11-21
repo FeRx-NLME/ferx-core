@@ -40,10 +40,7 @@ fn eval() -> (FitResult, Population) {
 fn a_nested_fit_reports_each_level_s_kappa_once_per_group() {
     let (r, _) = eval();
     assert_eq!(r.kappa_levels, ["STUDY", "ARM"]);
-    assert!(
-        r.shrinkage_kappa_by_occ.is_empty(),
-        "no per-slot shrinkage under nested levels"
-    );
+    assert!(r.shrinkage_kappa_by_occ.is_empty(), "no per-slot shrinkage under nested levels");
     assert!(r.shrinkage_kappa.iter().all(|s| s.is_finite()));
     let [study, arm] = r.ebe_kappas_by_level.as_slice() else {
         panic!("two levels: {:?}", r.ebe_kappas_by_level.len())
@@ -108,22 +105,11 @@ fn the_sdtab_carries_each_row_s_level_kappas() {
         for j in 0..s.obs_times.len() {
             let cov = &s.obs_covariates[j];
             let (st, a) = (cov["STUDY"], cov["ARM"]);
-            let want_st = study.groups[i]
-                .iter()
-                .find(|g| g.labels == [st])
-                .unwrap()
-                .kappa[0];
-            let want_arm = arm.groups[i]
-                .iter()
-                .find(|g| g.labels == [st, a])
-                .unwrap()
-                .kappa[0];
+            let want_st = study.groups[i].iter().find(|g| g.labels == [st]).unwrap().kappa[0];
+            let want_arm = arm.groups[i].iter().find(|g| g.labels == [st, a]).unwrap().kappa[0];
             assert!(k_st[row].is_finite() && k_arm[row].is_finite(), "row {row}");
             assert_eq!(k_st[row], want_st, "row {row}: K_ST of study {st}");
-            assert_eq!(
-                k_arm[row], want_arm,
-                "row {row}: K_ARM of study {st} arm {a}"
-            );
+            assert_eq!(k_arm[row], want_arm, "row {row}: K_ARM of study {st} arm {a}");
             row += 1;
         }
     }
@@ -184,19 +170,13 @@ fn a_nested_fit_round_trips_through_fitrx_with_its_levels() {
     let loaded = load_fit(&path).expect("loads");
     let _ = std::fs::remove_file(&path);
     let names = loaded.manifest.entries.clone();
-    assert!(
-        names.iter().any(|e| e == "ebes_kappa_STUDY.csv"),
-        "{names:?}"
-    );
+    assert!(names.iter().any(|e| e == "ebes_kappa_STUDY.csv"), "{names:?}");
     assert!(names.iter().any(|e| e == "ebes_kappa_ARM.csv"), "{names:?}");
     assert_eq!(loaded.fit.kappa_levels, r.kappa_levels);
     let got = &loaded.fit.ebe_kappas_by_level;
     assert_eq!(got.len(), 2);
     for (g, w) in got.iter().zip(&r.ebe_kappas_by_level) {
-        assert_eq!(
-            (&g.level, &g.columns, &g.kappa_names),
-            (&w.level, &w.columns, &w.kappa_names)
-        );
+        assert_eq!((&g.level, &g.columns, &g.kappa_names), (&w.level, &w.columns, &w.kappa_names));
         assert_eq!(g.groups.len(), w.groups.len());
         for (gs, ws) in g.groups.iter().zip(&w.groups) {
             assert_eq!(gs.len(), ws.len());
@@ -223,11 +203,7 @@ fn an_older_nested_bundle_without_levels_still_loads() {
     save_fit(&r, &pop, MODEL, &path, SaveFitOptions::default()).expect("saves");
     let loaded = load_fit(&path).expect("an older bundle loads");
     let _ = std::fs::remove_file(&path);
-    assert!(!loaded
-        .manifest
-        .entries
-        .iter()
-        .any(|e| e.starts_with("ebes_kappa_")));
+    assert!(!loaded.manifest.entries.iter().any(|e| e.starts_with("ebes_kappa_")));
     assert!(loaded.fit.kappa_levels.is_empty());
     assert!(loaded.fit.ebe_kappas_by_level.is_empty());
     assert_eq!(loaded.fit.ebe_kappas.len(), 12, "the per-cell κ̂ still load");

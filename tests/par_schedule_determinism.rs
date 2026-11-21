@@ -4,7 +4,6 @@
 //! `thread_count_determinism.rs` (#703), which pins only the OFV on warfarin.
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, CompiledModel, DoseEvent, EstimationMethod, FitOptions, Population, Subject};
-use std::collections::HashMap;
 
 fn model() -> CompiledModel {
     parse_model_string(
@@ -29,52 +28,22 @@ fn model() -> CompiledModel {
 
 fn subject(id: &str, scale: f64, n_obs: usize) -> Subject {
     let obs_times: Vec<f64> = (1..=n_obs).map(|k| 0.5 + 2.0 * k as f64).collect();
-    let observations = obs_times
-        .iter()
-        .map(|t| scale * 10.0 * (-0.1 * t).exp())
-        .collect();
+    let observations = obs_times.iter().map(|t| scale * 10.0 * (-0.1 * t).exp()).collect();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1; n_obs],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n_obs],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
 fn population() -> Population {
     Population {
         subjects: (0..48)
-            .map(|i| {
-                subject(
-                    &format!("{i}"),
-                    1.0 + 0.07 * ((i * 7) % 13) as f64,
-                    3 + (i * 5) % 18,
-                )
-            })
+            .map(|i| subject(&format!("{i}"), 1.0 + 0.07 * ((i * 7) % 13) as f64, 3 + (i * 5) % 18))
             .collect(),
         covariate_names: Vec::new(),
         dv_column: "DV".into(),

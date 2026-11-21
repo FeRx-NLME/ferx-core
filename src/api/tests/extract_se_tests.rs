@@ -8,23 +8,14 @@ use nalgebra::DMatrix;
 fn make_template(omega_iov: Option<OmegaMatrix>, kappa_fixed: Vec<bool>) -> ModelParameters {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
         theta_upper: vec![50.0],
         theta_fixed: vec![false],
-        omega,
-        omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
         omega_iov,
         kappa_fixed,
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     }
 }
 
@@ -42,23 +33,14 @@ fn test_se_omega_block_n3_full_lower_triangle() {
     mat[(2, 2)] = 0.16;
     let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
     let template = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
         theta_upper: vec![50.0],
         theta_fixed: vec![false],
-        omega,
         omega_fixed: vec![false; 3],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
         kappa_fixed: vec![],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     };
     // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
     // Within the omega block (start = 1): L[0,0]=1, L[1,0]=2, L[2,0]=3,
@@ -107,23 +89,14 @@ fn test_se_omega_block_offdiag_positive() {
     mat[(1, 0)] = 0.02;
     let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into()], false);
     let template = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
         theta_upper: vec![50.0],
         theta_fixed: vec![false],
-        omega,
         omega_fixed: vec![false; 2],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
         kappa_fixed: vec![],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     };
     // Packed: theta(1) + omega_block(3) + sigma(1) = 5.  Identity cov.
     let cov = Some(DMatrix::<f64>::identity(5, 5));
@@ -148,23 +121,14 @@ fn test_se_omega_block_offdiag_positive() {
 fn test_se_omega_diagonal_unchanged() {
     let omega = OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["E1".into(), "E2".into()]);
     let template = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
         theta_upper: vec![50.0],
         theta_fixed: vec![false],
-        omega,
         omega_fixed: vec![false; 2],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
         kappa_fixed: vec![],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     };
     // Packed layout: theta(1) + omega_diag(2) + sigma(1) = 4. Identity cov.
     let cov = Some(DMatrix::<f64>::identity(4, 4));
@@ -187,23 +151,13 @@ fn test_se_theta_respects_packing_scale() {
     // theta[1] = BETA, lower -10 < 0   → identity-packed (can be negative)
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["E1".into()]);
     let template = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![2.0, 0.25],
         theta_names: vec!["TVCL".into(), "BETA".into()],
         theta_lower: vec![0.1, -10.0],
         theta_upper: vec![50.0, 10.0],
         theta_fixed: vec![false, false],
-        omega,
-        omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
         kappa_fixed: vec![],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     };
     // Packed layout: theta(2) + omega(1) + sigma(1) = 4.
     // Set diagonal so packed SEs are theta:0.1, theta:0.3 (the rest unused here).
@@ -215,11 +169,7 @@ fn test_se_theta_respects_packing_scale() {
     let (se_theta, _, _, _) = extract_standard_errors(&Some(cov), &template);
     let se = se_theta.unwrap();
     // log-packed: SE = theta * SE(x) = 2.0 * 0.1 = 0.2
-    assert!(
-        (se[0] - 0.2).abs() < 1e-12,
-        "log-packed theta SE = {}",
-        se[0]
-    );
+    assert!((se[0] - 0.2).abs() < 1e-12, "log-packed theta SE = {}", se[0]);
     // identity-packed: SE = SE(x) = 0.3 (NOT 0.25 * 0.3 = 0.075)
     assert!(
         (se[1] - 0.3).abs() < 1e-12,
@@ -307,17 +257,11 @@ fn test_se_residual_correlation_uses_the_trailing_rho_slot() {
 
     let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
     let mut template = make_template(Some(iov), vec![false]);
-    template.sigma = SigmaVector {
-        values: vec![0.3, 1.0],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    template.sigma =
+        SigmaVector { values: vec![0.3, 1.0], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     template.sigma_fixed = vec![false; 2];
     let rho = 0.6_f64;
-    template.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho,
-    }];
+    template.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho }];
     template.residual_correlation_fixed = vec![false];
 
     // 1 theta + 1 omega + 2 sigma + 1 kappa + 1 rho = 6, rho last.
@@ -351,16 +295,10 @@ fn test_se_residual_correlation_truncated_cov_reports_zero() {
     use super::extract_residual_correlation_se;
 
     let mut template = make_template(None, Vec::new());
-    template.sigma = SigmaVector {
-        values: vec![0.3, 1.0],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    template.sigma =
+        SigmaVector { values: vec![0.3, 1.0], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     template.sigma_fixed = vec![false; 2];
-    template.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho: 0.4,
-    }];
+    template.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.4 }];
     template.residual_correlation_fixed = vec![false];
     // Packed length is 5; hand it a 3×3.
     let cov = DMatrix::<f64>::identity(3, 3);
@@ -377,22 +315,13 @@ fn test_se_residual_correlation_truncated_cov_reports_zero() {
 fn override_template() -> ModelParameters {
     let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
     let mut template = make_template(Some(iov), vec![false]);
-    template.sigma = SigmaVector {
-        values: vec![0.3, 1.0],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    template.sigma =
+        SigmaVector { values: vec![0.3, 1.0], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     template.sigma_fixed = vec![false; 2];
-    template.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho: 0.6,
-    }];
+    template.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.6 }];
     template.residual_correlation_fixed = vec![false];
     let class2_omega = OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_CL".into()]);
-    let class2_sigma = SigmaVector {
-        values: vec![0.3, 0.7],
-        names: template.sigma.names.clone(),
-    };
+    let class2_sigma = SigmaVector { values: vec![0.3, 0.7], names: template.sigma.names.clone() };
     template.mixture = Some(MixtureParams {
         omega: vec![template.omega.clone(), class2_omega],
         sigma: vec![template.sigma.clone(), class2_sigma],
@@ -427,16 +356,7 @@ fn test_se_mixture_overrides_read_their_own_rows_on_the_natural_scale() {
     let params = crate::estimation::parameterization::mixture_override_params(&template);
     let got: Vec<_> = params
         .iter()
-        .map(|p| {
-            (
-                p.name.as_str(),
-                p.kind,
-                p.index,
-                p.class,
-                p.packed_index,
-                p.fixed,
-            )
-        })
+        .map(|p| (p.name.as_str(), p.kind, p.index, p.class, p.packed_index, p.fixed))
         .collect();
     assert_eq!(
         got,
@@ -463,10 +383,7 @@ fn test_se_mixture_overrides_read_their_own_rows_on_the_natural_scale() {
     let mut fixed = template.clone();
     fixed.mixture.as_mut().unwrap().sigma_override_fixed = vec![true];
     let params = crate::estimation::parameterization::mixture_override_params(&fixed);
-    assert_eq!(
-        params.iter().map(|p| p.fixed).collect::<Vec<_>>(),
-        [false, true]
-    );
+    assert_eq!(params.iter().map(|p| p.fixed).collect::<Vec<_>>(), [false, true]);
     let se = extract_mixture_override_se(&cov, &fixed).unwrap();
     assert_eq!(se[1], 0.0);
     approx::assert_relative_eq!(se[0], 3.0, max_relative = 1e-12);

@@ -12,20 +12,13 @@ use super::*;
 /// crossover explicitly rather than papering over it with a loose tolerance.
 #[test]
 fn first_step_is_lr_sized_regardless_of_gradient_magnitude() {
-    let cfg = AdamConfig {
-        lr: 0.05,
-        ..Default::default()
-    };
+    let cfg = AdamConfig { lr: 0.05, ..Default::default() };
     for &g in &[1e-6_f64, 1.0, 1e6] {
         let mut st = AdamState::new(1);
         let mut x = [0.0];
         st.step(&mut x, &[g], &cfg);
         let want = -cfg.lr * g.abs() / (g.abs() + cfg.eps);
-        assert!(
-            (x[0] - want).abs() < 1e-15,
-            "grad {g}: expected step {want}, got {}",
-            x[0]
-        );
+        assert!((x[0] - want).abs() < 1e-15, "grad {g}: expected step {want}, got {}", x[0]);
         // Well above the eps floor, the step is lr to within 1%.
         assert!(
             (x[0].abs() / cfg.lr - 1.0).abs() < 0.01,
@@ -74,11 +67,7 @@ fn three_steps_match_hand_computed_trace() {
         want -= cfg.lr * m_hat / (v_hat.sqrt() + cfg.eps);
 
         st.step(&mut x, &[g], &cfg);
-        assert!(
-            (x[0] - want).abs() < 1e-12,
-            "step {t}: got {}, want {want}",
-            x[0]
-        );
+        assert!((x[0] - want).abs() < 1e-12, "step {t}: got {}, want {want}", x[0]);
     }
     assert_eq!(st.steps(), 3);
 }
@@ -101,10 +90,7 @@ fn descends_a_constant_gradient() {
 #[test]
 fn converges_on_a_quadratic() {
     // f(x) = ½(x − 3)², ∇f = x − 3.
-    let cfg = AdamConfig {
-        lr: 0.1,
-        ..Default::default()
-    };
+    let cfg = AdamConfig { lr: 0.1, ..Default::default() };
     let mut st = AdamState::new(1);
     let mut x = [0.0_f64];
     for _ in 0..2000 {
@@ -247,11 +233,7 @@ fn grad_clip_prevents_second_moment_poisoning() {
     const MEASURED: usize = 100;
 
     let run = |clip: f64| -> f64 {
-        let cfg = AdamConfig {
-            lr: 0.02,
-            grad_clip: clip,
-            ..Default::default()
-        };
+        let cfg = AdamConfig { lr: 0.02, grad_clip: clip, ..Default::default() };
         let mut st = AdamState::new(1);
         let mut x = [0.0f64];
         st.step(&mut x, &[spike], &cfg);
@@ -272,21 +254,12 @@ fn grad_clip_prevents_second_moment_poisoning() {
 
     // Unclipped the optimizer is inert: `√v̂ ≈ 2.7e12` against gradients of `1e3` gives
     // steps of ~7e-12, so 100 iterations move it by ~7e-10.
-    assert!(
-        frozen < 1e-6,
-        "expected the unclipped optimizer to be frozen, moved {frozen}"
-    );
+    assert!(frozen < 1e-6, "expected the unclipped optimizer to be frozen, moved {frozen}");
     // Clipped it takes ordinary Adam steps — approaching `lr` per iteration once the
     // gradient sign is consistent, so ~2 over this window.
-    assert!(
-        clipped > 0.1,
-        "expected the clipped optimizer to move freely, moved {clipped}"
-    );
+    assert!(clipped > 0.1, "expected the clipped optimizer to move freely, moved {clipped}");
     // The point of the fix, stated as a ratio: orders of magnitude, not a nudge.
-    assert!(
-        clipped / frozen > 1e6,
-        "clipped {clipped} vs frozen {frozen}"
-    );
+    assert!(clipped / frozen > 1e6, "clipped {clipped} vs frozen {frozen}");
 }
 
 /// Clipping is asymptotically a no-op: Adam is scale-invariant in steady state, so a
@@ -298,11 +271,7 @@ fn grad_clip_is_a_no_op_when_it_binds_uniformly() {
     let grads = [[2.0, -1.0], [3.0, -2.0], [1.0, -0.5], [2.5, -1.5]];
 
     let run = |clip: f64| -> [f64; 2] {
-        let cfg = AdamConfig {
-            lr: 0.02,
-            grad_clip: clip,
-            ..Default::default()
-        };
+        let cfg = AdamConfig { lr: 0.02, grad_clip: clip, ..Default::default() };
         let mut st = AdamState::new(2);
         let mut x = [0.0f64; 2];
         for g in grads.iter() {
@@ -350,22 +319,13 @@ fn grad_clip_scale_survives_gradients_that_overflow_a_naive_norm() {
         let clip = 1e4;
         let s = grad_clip_scale(&g, clip);
 
-        assert!(
-            s.is_finite() && s > 0.0,
-            "scale for {g:?} must be finite and non-zero, got {s}"
-        );
+        assert!(s.is_finite() && s > 0.0, "scale for {g:?} must be finite and non-zero, got {s}");
         assert!(s < 1.0, "a gradient this large must actually be clipped");
 
         // The clipped vector is finite, and its norm is the clip. Computed the scaled
         // way here too, since the whole point is that the naive form cannot represent it.
-        let clipped: Vec<f64> = g
-            .iter()
-            .map(|x| if x.is_finite() { x * s } else { 0.0 })
-            .collect();
-        assert!(
-            clipped.iter().all(|x| x.is_finite()),
-            "clipped {clipped:?} must be finite"
-        );
+        let clipped: Vec<f64> = g.iter().map(|x| if x.is_finite() { x * s } else { 0.0 }).collect();
+        assert!(clipped.iter().all(|x| x.is_finite()), "clipped {clipped:?} must be finite");
         let norm = clipped.iter().map(|x| x * x).sum::<f64>().sqrt();
         assert!(
             (norm - clip).abs() / clip < 1e-9,
@@ -374,19 +334,12 @@ fn grad_clip_scale_survives_gradients_that_overflow_a_naive_norm() {
 
         // And `step` — the consumer that was freezing — keeps `v` finite, so the
         // coordinate is still alive on the next iteration.
-        let cfg = AdamConfig {
-            lr: 0.02,
-            grad_clip: clip,
-            ..Default::default()
-        };
+        let cfg = AdamConfig { lr: 0.02, grad_clip: clip, ..Default::default() };
         let mut st = AdamState::new(g.len());
         let mut x = vec![0.0; g.len()];
         st.step(&mut x, &g, &cfg);
         st.step(&mut x, &vec![1.0; g.len()], &cfg);
-        assert!(
-            x.iter().all(|v| v.is_finite()),
-            "step produced non-finite x {x:?} for {g:?}"
-        );
+        assert!(x.iter().all(|v| v.is_finite()), "step produced non-finite x {x:?} for {g:?}");
         assert!(
             x.iter().any(|v| *v != 0.0),
             "step did not move at all for {g:?} — the coordinate is frozen"

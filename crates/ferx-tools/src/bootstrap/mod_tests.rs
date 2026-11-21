@@ -7,19 +7,15 @@ fn replicate_lane_width_preserves_the_ambient_rayon_budget() {
     // Distinct widths ensure the engine's host-dependent default cannot satisfy
     // both cases. Local pools avoid mutating process-global configuration.
     for width in [2, 3] {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
-            .build()
-            .unwrap()
-            .install(|| {
-                assert_eq!(replicate_lane_width(None, 20), width);
-                assert_eq!(replicate_lane_width(None, 1), 1);
-                assert_eq!(replicate_lane_width(None, 0), 1);
-                assert_eq!(replicate_lane_width(Some(4), 20), 4);
-                assert_eq!(replicate_lane_width(Some(4), 2), 2);
-                assert_eq!(replicate_lane_width(Some(0), 20), 1);
-                assert_eq!(replicate_lane_width(Some(1), 20), 1);
-            });
+        rayon::ThreadPoolBuilder::new().num_threads(width).build().unwrap().install(|| {
+            assert_eq!(replicate_lane_width(None, 20), width);
+            assert_eq!(replicate_lane_width(None, 1), 1);
+            assert_eq!(replicate_lane_width(None, 0), 1);
+            assert_eq!(replicate_lane_width(Some(4), 20), 4);
+            assert_eq!(replicate_lane_width(Some(4), 2), 2);
+            assert_eq!(replicate_lane_width(Some(0), 20), 1);
+            assert_eq!(replicate_lane_width(Some(1), 20), 1);
+        });
     }
 }
 
@@ -52,10 +48,7 @@ fn template(diagonal: bool) -> ModelParameters {
         ),
         omega_fixed: vec![false, false],
         omega_iov: None,
-        sigma: SigmaVector {
-            values: vec![0.04],
-            names: vec!["PROP".to_string()],
-        },
+        sigma: SigmaVector { values: vec![0.04], names: vec!["PROP".to_string()] },
         sigma_fixed: vec![false],
         kappa_fixed: Vec::new(),
         mixture: None,
@@ -95,16 +88,7 @@ fn parameter_names_cover_theta_free_omega_and_sigma() {
 #[test]
 fn a_diagonal_omega_contributes_only_its_diagonal() {
     let names = parameter_names(&template(true));
-    assert_eq!(
-        names,
-        vec![
-            "CL",
-            "V",
-            "OMEGA(ETA_CL,ETA_CL)",
-            "OMEGA(ETA_V,ETA_V)",
-            "PROP",
-        ]
-    );
+    assert_eq!(names, vec!["CL", "V", "OMEGA(ETA_CL,ETA_CL)", "OMEGA(ETA_V,ETA_V)", "PROP",]);
 }
 
 #[test]
@@ -321,10 +305,7 @@ fn population(ids: &[&str]) -> Population {
     Population {
         subjects: ids
             .iter()
-            .map(|id| Subject {
-                id: (*id).to_string(),
-                ..Subject::default()
-            })
+            .map(|id| Subject { id: (*id).to_string(), ..Subject::default() })
             .collect(),
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
@@ -336,10 +317,7 @@ fn population(ids: &[&str]) -> Population {
 
 fn write_csv(body: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().expect("temp file");
     write!(f, "{body}").expect("write");
     f.flush().expect("flush");
     f
@@ -454,10 +432,7 @@ fn a_flag_on_the_model_s_own_fit_options_is_still_honoured() {
     // relied on the replicate options cloning it. That has to keep working, or
     // this change silently stops honouring a flag that used to abort a run.
     let flag = CancelFlag::new();
-    let base = FitOptions {
-        cancel: Some(flag.clone()),
-        ..FitOptions::default()
-    };
+    let base = FitOptions { cancel: Some(flag.clone()), ..FitOptions::default() };
     let options = BootstrapOptions::default();
     let effective = effective_cancel(&options, &base).expect("inherited from the fit options");
     flag.cancel();
@@ -467,10 +442,7 @@ fn a_flag_on_the_model_s_own_fit_options_is_still_honoured() {
     // to the tool is not quietly overridden by whatever the model file carried.
     let run_wide = CancelFlag::new();
     let effective = effective_cancel(
-        &BootstrapOptions {
-            cancel: Some(run_wide.clone()),
-            ..BootstrapOptions::default()
-        },
+        &BootstrapOptions { cancel: Some(run_wide.clone()), ..BootstrapOptions::default() },
         &base,
     )
     .expect("the run-wide flag");
@@ -499,10 +471,7 @@ fn a_cancellation_is_not_a_failure() {
     assert!(String::from(cancelled).contains("cancel"));
 
     // `?` on the String-returning helpers inside the run depends on both.
-    assert_eq!(
-        BootstrapError::from("boom"),
-        BootstrapError::Failed("boom".to_string())
-    );
+    assert_eq!(BootstrapError::from("boom"), BootstrapError::Failed("boom".to_string()));
     assert_eq!(
         BootstrapError::from("boom".to_string()),
         BootstrapError::Failed("boom".to_string())
@@ -524,10 +493,7 @@ fn an_error_raised_under_a_set_flag_is_a_cancellation() {
     );
 
     flag.cancel();
-    assert_eq!(
-        cancel_aware("cancelled by user".to_string(), &cancel),
-        BootstrapError::Cancelled
-    );
+    assert_eq!(cancel_aware("cancelled by user".to_string(), &cancel), BootstrapError::Cancelled);
     // A genuine failure racing the cancel is attributed to the cancel — the
     // same call `run_one` makes when it drops rather than journals one.
     assert_eq!(
@@ -536,10 +502,7 @@ fn an_error_raised_under_a_set_flag_is_a_cancellation() {
     );
 
     // No flag at all: every error is what it says it is.
-    assert_eq!(
-        cancel_aware("boom".to_string(), &None),
-        BootstrapError::Failed("boom".to_string())
-    );
+    assert_eq!(cancel_aware("boom".to_string(), &None), BootstrapError::Failed("boom".to_string()));
 }
 
 // ── --summarize ─────────────────────────────────────────────────────────────
@@ -592,10 +555,8 @@ fn resummarize_reapplies_the_filters_without_refitting() {
     assert_eq!(tight.n_included, 2);
     assert!((tight.parameters[0].mean - 10.0).abs() < 1e-9);
 
-    let relaxed = BootstrapOptions {
-        skip_minimization_terminated: false,
-        ..BootstrapOptions::default()
-    };
+    let relaxed =
+        BootstrapOptions { skip_minimization_terminated: false, ..BootstrapOptions::default() };
     let loose = resummarize(dir.path(), &relaxed).expect("summarize");
     assert_eq!(loose.n_included, 4);
     assert!((loose.parameters[0].mean - 15.0).abs() < 1e-9);
@@ -610,10 +571,7 @@ fn resummarize_carries_forward_the_model_level_diagnostics() {
     stored_run(dir.path());
     resummarize(dir.path(), &BootstrapOptions::default()).expect("summarize");
     assert_eq!(
-        output::read_diagnostic(
-            &dir.path().join("bootstrap_diagnostics.csv"),
-            "chi_square_df"
-        ),
+        output::read_diagnostic(&dir.path().join("bootstrap_diagnostics.csv"), "chi_square_df"),
         Some(7.0)
     );
 }
@@ -637,10 +595,7 @@ fn resummarize_validates_its_options_instead_of_panicking() {
     for level in [100.0, 0.0, -1.0, 137.0] {
         let err = resummarize(
             dir.path(),
-            &BootstrapOptions {
-                confidence_level: level,
-                ..BootstrapOptions::default()
-            },
+            &BootstrapOptions { confidence_level: level, ..BootstrapOptions::default() },
         )
         .unwrap_err();
         assert!(err.contains("--ci"), "level {level}: {err}");
@@ -651,10 +606,7 @@ fn resummarize_validates_its_options_instead_of_panicking() {
     let empty = tempfile::tempdir().expect("temp dir");
     let err = resummarize(
         empty.path(),
-        &BootstrapOptions {
-            confidence_level: 100.0,
-            ..BootstrapOptions::default()
-        },
+        &BootstrapOptions { confidence_level: 100.0, ..BootstrapOptions::default() },
     )
     .unwrap_err();
     assert!(err.contains("--ci"), "{err}");
@@ -668,15 +620,10 @@ fn the_covstep_filters_are_allowed_when_re_summarizing() {
     // the entire point and requires no covariance step now.
     let dir = tempfile::tempdir().expect("temp dir");
     stored_run(dir.path());
-    let options = BootstrapOptions {
-        skip_covariance_step_terminated: true,
-        ..BootstrapOptions::default()
-    };
+    let options =
+        BootstrapOptions { skip_covariance_step_terminated: true, ..BootstrapOptions::default() };
     assert!(options.validate().is_ok());
-    assert!(
-        options.validate_for_run().is_err(),
-        "a fresh run must refuse it"
-    );
+    assert!(options.validate_for_run().is_err(), "a fresh run must refuse it");
     assert!(resummarize(dir.path(), &options).is_ok());
 }
 
@@ -731,9 +678,7 @@ fn interrupted_run(dir: &std::path::Path, through: usize, options: &BootstrapOpt
     };
     std::fs::create_dir_all(dir).expect("dir");
     output::write_raw_results(&dir.join("raw_results.csv"), &result, options).expect("write");
-    resume_manifest(options)
-        .write(&journal::manifest_path(dir))
-        .expect("write manifest");
+    resume_manifest(options).write(&journal::manifest_path(dir)).expect("write manifest");
 }
 
 #[test]
@@ -779,16 +724,16 @@ fn a_failed_replicate_is_kept_by_default_and_refitted_with_retry_failed() {
     // Mark sample 2 as failed, the way `run_one` records a `fit` error.
     let path = dir.path().join("raw_results.csv");
     let text = std::fs::read_to_string(&path).expect("read");
-    let patched: Vec<String> = text
-        .lines()
-        .map(|l| {
-            if l.starts_with("2,") {
-                format!("{l}the optimizer diverged")
-            } else {
-                l.to_string()
-            }
-        })
-        .collect();
+    let patched: Vec<String> =
+        text.lines()
+            .map(|l| {
+                if l.starts_with("2,") {
+                    format!("{l}the optimizer diverged")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
     std::fs::write(&path, patched.join("\n") + "\n").expect("write");
 
     let (_, kept) =
@@ -819,10 +764,7 @@ fn resuming_a_mismatched_directory_is_refused() {
     let options = resume_options(dir.path());
     interrupted_run(dir.path(), 2, &options);
 
-    let asked_for = RunManifest {
-        seed: 999,
-        ..resume_manifest(&options)
-    };
+    let asked_for = RunManifest { seed: 999, ..resume_manifest(&options) };
     let err = load_resumable(dir.path(), &asked_for, &options).unwrap_err();
     assert!(err.contains("--seed"), "{err}");
 }
@@ -932,10 +874,7 @@ fn a_run_without_a_base_model_drops_a_stored_base_fit() {
 
 #[test]
 fn resume_needs_a_directory_and_retry_failed_needs_resume() {
-    let bare = BootstrapOptions {
-        resume: true,
-        ..BootstrapOptions::default()
-    };
+    let bare = BootstrapOptions { resume: true, ..BootstrapOptions::default() };
     let err = bare.validate_for_run().unwrap_err();
     assert!(err.contains("--directory"), "{err}");
 
@@ -982,11 +921,7 @@ fn a_run_reports_its_fits_in_order() {
     assert_eq!(events.len(), 5, "{events:?}");
     assert_eq!(
         events[0],
-        BootstrapEvent::Started {
-            replicates: 1,
-            reused: 0,
-            base_fit: true,
-        },
+        BootstrapEvent::Started { replicates: 1, reused: 0, base_fit: true },
         "{events:?}"
     );
     assert_eq!(events[1], BootstrapEvent::BaseFitDone, "{events:?}");
@@ -1052,24 +987,13 @@ fn a_failed_run_still_reports_that_it_finished() {
     let events = events.into_inner().expect("not poisoned");
     assert_eq!(
         events.first(),
-        Some(&BootstrapEvent::Started {
-            replicates: 1,
-            reused: 0,
-            base_fit: false,
-        }),
+        Some(&BootstrapEvent::Started { replicates: 1, reused: 0, base_fit: false }),
         "{events:?}"
     );
     assert_eq!(events.last(), Some(&BootstrapEvent::Finished), "{events:?}");
     // Exactly one, whichever way the run leaves: the guard emits on the way
     // out, and the success path disarms it by emitting first.
-    assert_eq!(
-        events
-            .iter()
-            .filter(|e| **e == BootstrapEvent::Finished)
-            .count(),
-        1,
-        "{events:?}"
-    );
+    assert_eq!(events.iter().filter(|e| **e == BootstrapEvent::Finished).count(), 1, "{events:?}");
 }
 
 /// A run with no sink is the same run. Nothing about the draws or the fits may
@@ -1106,8 +1030,5 @@ fn watching_a_run_does_not_change_it() {
         result
     };
 
-    assert_eq!(
-        quiet.replicates[0].estimates,
-        watched.replicates[0].estimates
-    );
+    assert_eq!(quiet.replicates[0].estimates, watched.replicates[0].estimates);
 }

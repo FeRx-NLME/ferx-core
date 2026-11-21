@@ -87,10 +87,7 @@ fn run(dir: &Path, path: &Path) -> (SearchConfig, ferx_tools::modelsearch::Model
     let result = run_modelsearch(
         &config,
         &base,
-        ModelsearchRun {
-            dir: Some(dir.join("run")),
-            ..ModelsearchRun::default()
-        },
+        ModelsearchRun { dir: Some(dir.join("run")), ..ModelsearchRun::default() },
     )
     .expect("search");
     (config, result)
@@ -106,25 +103,18 @@ fn a_single_point_space_returns_the_base_fit_bit_for_bit() {
     );
     let config = SearchConfig::load(&path).unwrap();
     let base = config.load_base().unwrap();
-    let direct = fit(
-        &base.prepared.parsed.model,
-        &base.prepared.population,
-        &base.prepared.init_params,
-        &{
+    let direct =
+        fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &{
             let mut o = base.prepared.parsed.fit_options.clone().quiet();
             o.threads = Some(2);
             o
-        },
-    )
-    .expect("direct evaluation");
+        })
+        .expect("direct evaluation");
 
     let result = run_modelsearch(
         &config,
         &base,
-        ModelsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..ModelsearchRun::default()
-        },
+        ModelsearchRun { dir: Some(dir.path().join("run")), ..ModelsearchRun::default() },
     )
     .expect("search");
 
@@ -170,12 +160,7 @@ fn a_single_point_space_returns_the_base_fit_bit_for_bit() {
     let gap = (again.ofv - direct.ofv).abs();
     assert!(gap.is_finite());
     eprintln!("final.ferx re-evaluation |ΔOFV| = {gap:.3e}");
-    assert!(
-        gap < 1e-9,
-        "final.ferx OFV {} vs direct {}",
-        again.ofv,
-        direct.ofv
-    );
+    assert!(gap < 1e-9, "final.ferx OFV {} vs direct {}", again.ofv, direct.ofv);
 }
 
 #[test]
@@ -193,10 +178,8 @@ fn every_candidate_the_search_can_reach_compiles_and_evaluates() {
     let (_, result) = run(dir.path(), &path);
 
     let candidates: Vec<_> = result.layer_rows(1).collect();
-    let structures: Vec<String> = candidates
-        .iter()
-        .map(|r| r.structure.feature_vector().render())
-        .collect();
+    let structures: Vec<String> =
+        candidates.iter().map(|r| r.structure.feature_vector().render()).collect();
     // Pharmpy's `product` order over (LAGTIME, PERIPHERALS, TRANSITS).
     assert_eq!(
         structures,
@@ -215,11 +198,8 @@ fn every_candidate_the_search_can_reach_compiles_and_evaluates() {
         result.notes
     );
     // Two peripherals with a transit chain has no template, and says so.
-    let gaps: Vec<&String> = result
-        .notes
-        .iter()
-        .filter(|n| n.starts_with("not generated"))
-        .collect();
+    let gaps: Vec<&String> =
+        result.notes.iter().filter(|n| n.starts_with("not generated")).collect();
     assert_eq!(gaps.len(), 2, "{:?}", result.notes);
     assert!(gaps.iter().all(|n| n.contains("three_cpt_transit")));
 
@@ -243,11 +223,7 @@ fn every_candidate_the_search_can_reach_compiles_and_evaluates() {
     let n = |i: usize| candidates[i].n_parameters.unwrap();
     let base_n = result.row("base").unwrap().n_parameters.unwrap();
     assert_eq!(base_n, 7);
-    assert_eq!(
-        n(0),
-        base_n,
-        "TVKA + ETA_KA out, TVMTT + ETA_MTT in, NTR fixed"
-    );
+    assert_eq!(n(0), base_n, "TVKA + ETA_KA out, TVMTT + ETA_MTT in, NTR fixed");
     assert_eq!(n(1), base_n + 1, "…and NTR estimated");
     assert_eq!(n(2), base_n + 2);
     assert_eq!(n(5), base_n + 4);
@@ -255,10 +231,7 @@ fn every_candidate_the_search_can_reach_compiles_and_evaluates() {
     // The fixed chain's count is a `FIX`ed θ with a name, not a literal.
     let run3 = &result.models[&candidates[0].id];
     let params = run3.block_lines("parameters");
-    assert!(
-        params.contains(&"theta TVNTR(3.0, 0.0, 64.0) FIX".to_string()),
-        "{params:?}"
-    );
+    assert!(params.contains(&"theta TVNTR(3.0, 0.0, 64.0) FIX".to_string()), "{params:?}");
     assert_eq!(
         run3.block_lines("structural_model"),
         vec!["pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)"]
@@ -309,20 +282,11 @@ fn a_generated_candidate_is_the_hand_written_model() {
     let base_fit_result = {
         let mut o = base.prepared.parsed.fit_options.clone().quiet();
         o.threads = Some(2);
-        fit(
-            &base.prepared.parsed.model,
-            &base.prepared.population,
-            &base.prepared.init_params,
-            &o,
-        )
-        .unwrap()
+        fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &o)
+            .unwrap()
     };
     let seeded = |name: &str| {
-        let i = base_fit_result
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap();
+        let i = base_fit_result.theta_names.iter().position(|n| n == name).unwrap();
         base_fit_result.theta[i]
     };
     let hand_written = format!(
@@ -372,10 +336,7 @@ fn a_generated_candidate_is_the_hand_written_model() {
     let hand = parse_full_model(&hand_written).expect("the hand-written model must parse");
     assert_eq!(gen.model.theta_names, hand.model.theta_names);
     assert_eq!(gen.model.eta_names, hand.model.eta_names);
-    assert_eq!(
-        gen.model.default_params.theta,
-        hand.model.default_params.theta
-    );
+    assert_eq!(gen.model.default_params.theta, hand.model.default_params.theta);
 
     let pop = &base.prepared.population;
     let gen_pred = predict(&gen.model, pop, &gen.model.default_params).unwrap();
@@ -384,12 +345,7 @@ fn a_generated_candidate_is_the_hand_written_model() {
     for (g, h) in gen_pred.iter().zip(&hand_pred) {
         assert_eq!(g.id, h.id);
         assert_eq!(g.time, h.time);
-        assert_eq!(
-            g.pred.to_bits(),
-            h.pred.to_bits(),
-            "PRED differs for subject {}",
-            g.id
-        );
+        assert_eq!(g.pred.to_bits(), h.pred.to_bits(), "PRED differs for subject {}", g.id);
     }
     let opts = {
         let mut o = gen.fit_options.clone().quiet();
@@ -436,11 +392,7 @@ fn a_stepwise_search_seeds_each_layer_from_its_parent_and_resumes() {
             .collect();
         let thetas = text.block_lines("parameters");
         for t in &parent_thetas {
-            assert!(
-                thetas.contains(t),
-                "{}: parent θ `{t}` not carried: {thetas:?}",
-                r.id
-            );
+            assert!(thetas.contains(t), "{}: parent θ `{t}` not carried: {thetas:?}", r.id);
         }
         assert_eq!(
             text.block_lines("structural_model"),
@@ -454,10 +406,7 @@ fn a_stepwise_search_seeds_each_layer_from_its_parent_and_resumes() {
     let again = run_modelsearch(
         &config,
         &base,
-        ModelsearchRun {
-            dir: Some(dir.path().join("run")),
-            ..ModelsearchRun::default()
-        },
+        ModelsearchRun { dir: Some(dir.path().join("run")), ..ModelsearchRun::default() },
     )
     .expect("resumed search");
     assert_eq!(again.rows.len(), result.rows.len());
@@ -493,10 +442,7 @@ fn the_transit_count_of_a_fixed_chain_stays_fixed_through_a_resume() {
         seeded.apply(ModelEdit::SeedInits(f)).unwrap();
     }
     let line = |t: &ModelText| {
-        t.block_lines("parameters")
-            .into_iter()
-            .find(|l| l.contains("TVNTR"))
-            .unwrap()
+        t.block_lines("parameters").into_iter().find(|l| l.contains("TVNTR")).unwrap()
     };
     assert_eq!(line(&fit), "theta TVNTR(3.0, 0.0, 64.0) FIX");
     assert_eq!(line(&seeded), line(&fit));
@@ -514,14 +460,8 @@ fn an_estimated_bioavailability_is_carried_across_the_swap() {
             "  theta TVKA(1.5, 0.01, 50.0)\n",
             "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVF(0.8, 0.1, 1.0)\n",
         )
-        .replace(
-            "  KA = TVKA * exp(ETA_KA)\n",
-            "  KA = TVKA * exp(ETA_KA)\n  F = TVF\n",
-        )
-        .replace(
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
-            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
-        );
+        .replace("  KA = TVKA * exp(ETA_KA)\n", "  KA = TVKA * exp(ETA_KA)\n  F = TVF\n")
+        .replace("pk one_cpt_oral(cl=CL, v=V, ka=KA)", "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)");
     std::fs::write(dir.path().join("base.ferx"), &base_f).unwrap();
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(DATA);
     let config = format!(
@@ -550,28 +490,16 @@ fn an_estimated_bioavailability_is_carried_across_the_swap() {
     assert!(generated.contains("theta TVF("), "{generated}");
     // TVF is estimated, so the candidate has one θ more than a swap that
     // dropped it would.
-    assert_eq!(
-        two.n_parameters.unwrap(),
-        result.row("base").unwrap().n_parameters.unwrap() + 2
-    );
+    assert_eq!(two.n_parameters.unwrap(), result.row("base").unwrap().n_parameters.unwrap() + 2);
 
     let base_fit_result = {
         let mut o = base.prepared.parsed.fit_options.clone().quiet();
         o.threads = Some(2);
-        fit(
-            &base.prepared.parsed.model,
-            &base.prepared.population,
-            &base.prepared.init_params,
-            &o,
-        )
-        .unwrap()
+        fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &o)
+            .unwrap()
     };
     let seeded = |name: &str| {
-        let i = base_fit_result
-            .theta_names
-            .iter()
-            .position(|n| n == name)
-            .unwrap();
+        let i = base_fit_result.theta_names.iter().position(|n| n == name).unwrap();
         base_fit_result.theta[i]
     };
     let hand_written = format!(
@@ -619,20 +547,12 @@ fn an_estimated_bioavailability_is_carried_across_the_swap() {
         .unwrap_or_else(|e| panic!("the generated model must parse: {e}\n---\n{generated}"));
     let hand = parse_full_model(&hand_written).expect("the hand-written model must parse");
     assert_eq!(gen.model.theta_names, hand.model.theta_names);
-    assert_eq!(
-        gen.model.default_params.theta,
-        hand.model.default_params.theta
-    );
+    assert_eq!(gen.model.default_params.theta, hand.model.default_params.theta);
     let pop = &base.prepared.population;
     let gen_pred = predict(&gen.model, pop, &gen.model.default_params).unwrap();
     let hand_pred = predict(&hand.model, pop, &hand.model.default_params).unwrap();
     for (g, h) in gen_pred.iter().zip(&hand_pred) {
-        assert_eq!(
-            g.pred.to_bits(),
-            h.pred.to_bits(),
-            "PRED differs for subject {}",
-            g.id
-        );
+        assert_eq!(g.pred.to_bits(), h.pred.to_bits(), "PRED differs for subject {}", g.id);
     }
     let opts = {
         let mut o = gen.fit_options.clone().quiet();
@@ -701,10 +621,7 @@ fn a_fixed_transit_base_compiles_every_transit_move() {
     let candidates: Vec<_> = result.layer_rows(1).collect();
     let transits: Vec<Option<TransitCount>> =
         candidates.iter().map(|r| r.structure.transits).collect();
-    assert_eq!(
-        transits,
-        vec![None, Some(TransitCount::Count(1)), Some(TransitCount::N)]
-    );
+    assert_eq!(transits, vec![None, Some(TransitCount::Count(1)), Some(TransitCount::N)]);
     let base_ofv = result.row("base").unwrap().ofv.unwrap();
     let mut ofvs = std::collections::HashSet::new();
     ofvs.insert(base_ofv.to_bits());
@@ -713,20 +630,12 @@ fn a_fixed_transit_base_compiles_every_transit_move() {
         let ofv = r.ofv.unwrap();
         assert!(ofv.is_finite());
         // Four different models, four different evaluations.
-        assert!(
-            ofvs.insert(ofv.to_bits()),
-            "{} evaluates like another model",
-            r.id
-        );
+        assert!(ofvs.insert(ofv.to_bits()), "{} evaluates like another model", r.id);
     }
     // The estimated-count candidate has one free θ more than the fixed base.
     let n = |r: &&ferx_tools::modelsearch::ModelRow| r.n_parameters.unwrap();
     let base_n = result.row("base").unwrap().n_parameters.unwrap();
-    assert_eq!(
-        n(&candidates[1]),
-        base_n,
-        "another fixed count: same free θ"
-    );
+    assert_eq!(n(&candidates[1]), base_n, "another fixed count: same free θ");
     assert_eq!(n(&candidates[2]), base_n + 1);
 }
 
@@ -775,20 +684,12 @@ fn every_ode_candidate_compiles_and_evaluates() {
         let model = &result.models[&r.id];
         let structural = model.block_lines("structural_model");
         assert_eq!(structural.len(), 1, "{}: {structural:?}", r.id);
-        assert!(
-            structural[0].starts_with("ode_template "),
-            "{}: {structural:?}",
-            r.id
-        );
+        assert!(structural[0].starts_with("ode_template "), "{}: {structural:?}", r.id);
         // Exactly one override — only `central` ever changes — and it names
         // the variant's own parameters.
         let odes = model.block_lines("odes");
         assert_eq!(odes.len(), 1, "{}: {odes:?}", r.id);
-        assert!(
-            odes[0].starts_with("d/dt(central) = "),
-            "{}: {odes:?}",
-            r.id
-        );
+        assert!(odes[0].starts_with("d/dt(central) = "), "{}: {odes:?}", r.id);
     }
 
     // Spot-check the four elimination spellings on the base's own absorption,

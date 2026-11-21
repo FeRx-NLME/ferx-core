@@ -58,10 +58,7 @@ fn population(n: usize) -> Population {
         .collect();
     let mut p = Population {
         subjects,
-        covariate_names: ["STUDY", "ARM", "NS"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        covariate_names: ["STUDY", "ARM", "NS"].iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
         exclusions: None,
@@ -112,38 +109,21 @@ fn each_level_reports_each_group_s_kappa_once_with_its_labels() {
     let (m, p) = (model(), population(2));
     let facts = nested_kappa_facts(&m, &p, &kappas(&m, &p), &omega_iov()).expect("nested");
     assert_eq!(facts.kappa_levels, ["STUDY", "ARM"]);
-    let [study, arm] = facts.by_level.as_slice() else {
-        panic!("two levels")
-    };
+    let [study, arm] = facts.by_level.as_slice() else { panic!("two levels") };
     assert_eq!(study.level, "STUDY");
     assert_eq!(study.columns, ["STUDY"]);
     assert_eq!(study.kappa_names, ["K_ST"]);
     assert_eq!(arm.columns, ["STUDY", "ARM"]);
     assert_eq!(arm.kappa_names, ["K_ARM"]);
     // STUDY: three groups per subject (not five cells), in first-record order.
-    let s1: Vec<(Vec<f64>, Vec<f64>)> = study.groups[1]
-        .iter()
-        .map(|g| (g.labels.clone(), g.kappa.clone()))
-        .collect();
-    assert_eq!(
-        s1,
-        [
-            (vec![1.0], vec![1.5]),
-            (vec![2.0], vec![0.7]),
-            (vec![3.0], vec![10.0])
-        ]
-    );
+    let s1: Vec<(Vec<f64>, Vec<f64>)> =
+        study.groups[1].iter().map(|g| (g.labels.clone(), g.kappa.clone())).collect();
+    assert_eq!(s1, [(vec![1.0], vec![1.5]), (vec![2.0], vec![0.7]), (vec![3.0], vec![10.0])]);
     // ARM: five groups, each named by its whole path.
     let a0: Vec<Vec<f64>> = arm.groups[0].iter().map(|g| g.labels.clone()).collect();
     assert_eq!(
         a0,
-        [
-            vec![1.0, 1.0],
-            vec![1.0, 2.0],
-            vec![2.0, 1.0],
-            vec![1.0, 3.0],
-            vec![3.0, 1.0]
-        ]
+        [vec![1.0, 1.0], vec![1.0, 2.0], vec![2.0, 1.0], vec![1.0, 3.0], vec![3.0, 1.0]]
     );
     assert_eq!(arm.groups[0][4].kappa, [8.0]);
 }
@@ -173,11 +153,7 @@ fn shrinkage_pools_each_kappa_over_its_level_s_informed_groups() {
     );
     // The per-cell pool the one-level rule computes counts study 1 once per arm.
     let (cells, _) = crate::api::postfit::kappa_shrinkages(&m, &p, &kappas(&m, &p), &omega_iov());
-    assert!(
-        (cells[0] - want_st).abs() > 1e-3,
-        "{} vs {want_st}",
-        cells[0]
-    );
+    assert!((cells[0] - want_st).abs() > 1e-3, "{} vs {want_st}", cells[0]);
 }
 
 #[test]
@@ -256,20 +232,15 @@ fn a_group_only_a_reset_row_carries_takes_its_weight_from_that_row() {
 /// arm 200 when `weighted`), with nested levels STUDY / ARM or none, FIX on `K_ST`, and
 /// the covariance status.
 fn kappa_result(
-    nested: bool,
-    fix: bool,
-    weighted: bool,
-    status: crate::types::CovarianceStatus,
+    nested: bool, fix: bool, weighted: bool, status: crate::types::CovarianceStatus,
 ) -> crate::types::FitResult {
     let mut r = crate::types::test_helpers::minimal_fit_result();
     r.omega_iov = Some(DMatrix::from_diagonal(&DVector::from_vec(vec![0.09, 4.0])));
     r.kappa_names = vec!["K_ST".into(), "K_ARM".into()];
     r.kappa_fixed = vec![fix, false];
     r.se_kappa = Some(vec![0.01, 1.5]);
-    r.kappa_param_types = vec![
-        crate::types::EtaParamType::LogNormal,
-        crate::types::EtaParamType::LogNormal,
-    ];
+    r.kappa_param_types =
+        vec![crate::types::EtaParamType::LogNormal, crate::types::EtaParamType::LogNormal];
     if weighted {
         r.kappa_weights = vec![None, Some("NARM".into())];
         r.kappa_weight_typical = vec![None, Some(200.0)];
@@ -314,10 +285,7 @@ fn a_kappa_row_names_its_level_in_the_label_and_nowhere_else() {
         )
     };
     let labels = |r: &[(String, String)]| -> Vec<String> {
-        r.iter()
-            .filter(|(l, _)| !l.is_empty())
-            .map(|(l, _)| l.clone())
-            .collect()
+        r.iter().filter(|(l, _)| !l.is_empty()).map(|(l, _)| l.clone()).collect()
     };
     let rest =
         |r: &[(String, String)]| -> Vec<String> { r.iter().map(|(_, x)| x.clone()).collect() };
@@ -366,10 +334,7 @@ fn the_summary_kappa_shrinkage_names_the_level_it_pooled_over() {
         ))
     };
     let (flat, nested) = (summary(false), summary(true));
-    assert!(
-        flat.contains("  Kappa shrinkage: K_ST 10.0%, K_ARM 20.0%\n"),
-        "{flat}"
-    );
+    assert!(flat.contains("  Kappa shrinkage: K_ST 10.0%, K_ARM 20.0%\n"), "{flat}");
     assert!(
         nested.contains("  Kappa shrinkage: K_ST at STUDY 10.0%, K_ARM at ARM 20.0%\n"),
         "{nested}"
@@ -391,10 +356,8 @@ fn the_console_kappa_shrinkage_names_the_level_it_pooled_over() {
         r.shrinkage_kappa_by_occ = vec![vec![0.3, f64::NAN]];
         r
     };
-    let (flat, nested) = (
-        format_kappa_shrinkage_lines(&result(false)),
-        format_kappa_shrinkage_lines(&result(true)),
-    );
+    let (flat, nested) =
+        (format_kappa_shrinkage_lines(&result(false)), format_kappa_shrinkage_lines(&result(true)));
     assert_eq!(
         flat,
         [
@@ -430,10 +393,7 @@ fn the_console_kappa_shrinkage_names_the_level_it_pooled_over() {
     // A NaN pooled entry prints as such, with its level.
     let mut r = result(true);
     r.shrinkage_kappa[1] = f64::NAN;
-    assert_eq!(
-        format_kappa_shrinkage_lines(&r)[2],
-        "  K_ARM at ARM shrinkage: NaN"
-    );
+    assert_eq!(format_kappa_shrinkage_lines(&r)[2], "  K_ARM at ARM shrinkage: NaN");
     // No kappa shrinkage, no block.
     let mut r = result(true);
     r.shrinkage_kappa.clear();
@@ -456,12 +416,6 @@ fn the_fit_yaml_records_each_kappa_s_level() {
     let (flat, nested) = (yaml(false), yaml(true));
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!flat.contains("level:"), "{flat}");
-    assert!(
-        nested.contains("  K_ST:\n    level: \"STUDY\"\n    variance: 0.090000\n"),
-        "{nested}"
-    );
-    assert!(
-        nested.contains("  K_ARM:\n    level: \"ARM\"\n    variance: 4.000000\n"),
-        "{nested}"
-    );
+    assert!(nested.contains("  K_ST:\n    level: \"STUDY\"\n    variance: 0.090000\n"), "{nested}");
+    assert!(nested.contains("  K_ARM:\n    level: \"ARM\"\n    variance: 4.000000\n"), "{nested}");
 }

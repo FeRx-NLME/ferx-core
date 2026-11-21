@@ -101,15 +101,10 @@ impl std::error::Error for KmInputError {}
 /// [`KmInputError::BadTime`] for a time that is not finite or is negative.
 pub fn kaplan_meier(times: &[f64], events: &[bool]) -> Result<KmCurve, KmInputError> {
     if times.len() != events.len() {
-        return Err(KmInputError::LengthMismatch {
-            times: times.len(),
-            events: events.len(),
-        });
+        return Err(KmInputError::LengthMismatch { times: times.len(), events: events.len() });
     }
-    if let Some((index, &value)) = times
-        .iter()
-        .enumerate()
-        .find(|(_, t)| !(t.is_finite() && **t >= 0.0))
+    if let Some((index, &value)) =
+        times.iter().enumerate().find(|(_, t)| !(t.is_finite() && **t >= 0.0))
     {
         return Err(KmInputError::BadTime { index, value });
     }
@@ -162,26 +157,16 @@ pub struct KmmcCurve {
 /// is not as long as `times`, and [`KmInputError::BadValue`] for a value that is
 /// not finite (a missing covariate is `NaN` and would make every mean `NaN`).
 pub fn kaplan_meier_mean_covariate(
-    times: &[f64],
-    events: &[bool],
-    values: &[f64],
+    times: &[f64], events: &[bool], values: &[f64],
 ) -> Result<KmmcCurve, KmInputError> {
     if times.len() != events.len() {
-        return Err(KmInputError::LengthMismatch {
-            times: times.len(),
-            events: events.len(),
-        });
+        return Err(KmInputError::LengthMismatch { times: times.len(), events: events.len() });
     }
     if times.len() != values.len() {
-        return Err(KmInputError::ValueLengthMismatch {
-            times: times.len(),
-            values: values.len(),
-        });
+        return Err(KmInputError::ValueLengthMismatch { times: times.len(), values: values.len() });
     }
-    if let Some((index, &value)) = times
-        .iter()
-        .enumerate()
-        .find(|(_, t)| !(t.is_finite() && **t >= 0.0))
+    if let Some((index, &value)) =
+        times.iter().enumerate().find(|(_, t)| !(t.is_finite() && **t >= 0.0))
     {
         return Err(KmInputError::BadTime { index, value });
     }
@@ -258,11 +243,8 @@ fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> (Vec<CountRow>, Vec<
     let mut order: Vec<usize> = (0..marks.len()).collect();
     order.sort_by(|&a, &b| marks[a].0.total_cmp(&marks[b].0));
 
-    let mut at_risk = if event_leaves {
-        marks.len()
-    } else {
-        marks.iter().filter(|m| !m.1).count()
-    };
+    let mut at_risk =
+        if event_leaves { marks.len() } else { marks.iter().filter(|m| !m.1).count() };
     let mut rows = Vec::new();
     let mut k = 0;
     while k < order.len() {
@@ -278,13 +260,7 @@ fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> (Vec<CountRow>, Vec<
             k += 1;
         }
         // Events before departures: the `c` leaving at `t` are still in `at_risk`.
-        rows.push(CountRow {
-            time: t,
-            n_risk: at_risk,
-            n_event: d,
-            n_leave: c,
-            start,
-        });
+        rows.push(CountRow { time: t, n_risk: at_risk, n_event: d, n_leave: c, start });
         at_risk -= if event_leaves { d + c } else { c };
     }
     (rows, order)
@@ -357,15 +333,10 @@ impl std::error::Error for McfInputError {}
 /// that is not finite or is negative, and [`McfInputError::EventAfterFollowUp`] for
 /// an event later than every follow-up end, whose risk set is empty.
 pub fn mean_cumulative(
-    event_times: &[f64],
-    follow_up_ends: &[f64],
+    event_times: &[f64], follow_up_ends: &[f64],
 ) -> Result<McfCurve, McfInputError> {
-    let bad = |v: &[f64]| {
-        v.iter()
-            .copied()
-            .enumerate()
-            .find(|(_, t)| !(t.is_finite() && *t >= 0.0))
-    };
+    let bad =
+        |v: &[f64]| v.iter().copied().enumerate().find(|(_, t)| !(t.is_finite() && *t >= 0.0));
     if let Some((index, value)) = bad(event_times) {
         return Err(McfInputError::BadEventTime { index, value });
     }
@@ -411,17 +382,19 @@ impl McfCurve {
 }
 
 impl KmCurve {
-    /// `S(t)`: `1` before the first time, the step value at or after it, and past
-    /// the last time `Some(0.0)` when the curve has reached zero and `None` when it
-    /// has not, since the estimate is undefined once nobody is under follow-up.
-    /// `None` for an empty curve and for a `t` that is not a number.
+    /// `S(t)`: `1` before the first time, the step value at or after it up to and
+    /// including the last time, and `None` past the last time, also when the curve
+    /// has reached zero, as for [`McfCurve::at`]. For a curve ending on an event the
+    /// estimate itself is 0 from then on (R's `survfit` extends it so); `None` is a
+    /// convention, R's `summary(fit, times =, extend = FALSE)`, chosen so a VPC
+    /// conditions the observed curve and every replicate alike on follow-up: reading a
+    /// curve that reached zero as `Some(0.0)` there would put a point mass at 0 into a
+    /// band past the replicates' follow-up (#2930). `None` for an empty curve and for
+    /// a `t` that is not a number.
     pub fn at(&self, t: f64) -> Option<f64> {
-        let (&last_t, &last_s) = (self.time.last()?, self.surv.last()?);
-        if t.is_nan() {
+        let &last_t = self.time.last()?;
+        if t.is_nan() || t > last_t {
             return None;
-        }
-        if t > last_t {
-            return (last_s == 0.0).then_some(0.0);
         }
         // Number of rows with time ≤ t.
         let j = self.time.partition_point(|&x| x <= t);
@@ -454,28 +427,48 @@ pub fn probs_valid(probs: [f64; 3]) -> bool {
 /// the outer quantile is an interpolation between the two most extreme values
 /// rather than an estimate of the tail. Assumes [`probs_valid`].
 pub fn min_curves_for(probs: [f64; 3]) -> usize {
-    // Increasing probabilities: the smallest tail is the first one's or the last one's.
-    let tail = if probs[0] < 1.0 - probs[2] {
-        probs[0]
-    } else {
-        1.0 - probs[2]
-    };
+    // The smallest tail sets the floor, so the most demanding probability wins.
+    probs.into_iter().map(min_n_for_prob).max().unwrap_or(0)
+}
+
+/// The fewest values the `p`-quantile needs before it is read: `⌈1 / min(p, 1 − p)⌉ − 1`,
+/// 19 for 5 % or 95 %, 1 for the median. Below it the `p`-tail holds less than one value
+/// (see [`min_curves_for`], the largest of these over a band's probabilities).
+pub(crate) fn min_n_for_prob(p: f64) -> usize {
     // `1 / 0.05` is 20 up to rounding; the epsilon keeps the ceiling from stepping to 21.
-    ((1.0 / tail) - 1e-9).ceil() as usize - 1
+    ((1.0 / p.min(1.0 - p)) - 1e-9).ceil() as usize - 1
+}
+
+/// The type-7 quantiles ([`quantile_sorted`]) of `vals` at `probs`, each `None` while
+/// `vals` holds fewer than its `need`. `vals` is sorted in place. A non-finite value is
+/// propagated, never sorted past: every quantile that is read is then `NaN`, so a
+/// diverged input cannot hide behind the finite ones.
+pub(crate) fn gated_quantiles(
+    vals: &mut [f64], probs: [f64; 3], need: [usize; 3],
+) -> [Option<f64>; 3] {
+    let finite = vals.iter().all(|v| v.is_finite());
+    vals.sort_by(f64::total_cmp);
+    std::array::from_fn(|k| {
+        (vals.len() >= need[k]).then(|| {
+            if finite {
+                quantile_sorted(vals, probs[k])
+            } else {
+                f64::NAN
+            }
+        })
+    })
 }
 
 /// The pointwise `probs` band of `curves` on `grid`. At each grid time only the
 /// curves still defined there contribute (a replicate past its last follow-up
-/// is left out, not counted as 0 or 1), and a point with fewer than
-/// [`min_curves_for`] of them is `None`. No `NaN` reaches a quantile.
+/// is left out, also one whose curve reached 0, not counted as 0 or 1), and a
+/// point with fewer than [`min_curves_for`] of them is `None`. No `NaN` reaches a quantile.
 ///
 /// # Errors
 ///
 /// [`KmInputError::BadProbs`] unless [`probs_valid`].
 pub fn vpc_band(
-    curves: &[KmCurve],
-    grid: &[f64],
-    probs: [f64; 3],
+    curves: &[KmCurve], grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     band_over(curves.len(), |j, t| curves[j].at(t), grid, probs)
 }
@@ -488,9 +481,7 @@ pub fn vpc_band(
 ///
 /// [`KmInputError::BadProbs`] unless [`probs_valid`].
 pub fn vpc_band_mcf(
-    curves: &[McfCurve],
-    grid: &[f64],
-    probs: [f64; 3],
+    curves: &[McfCurve], grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     band_over(curves.len(), |j, t| curves[j].at(t), grid, probs)
 }
@@ -505,26 +496,15 @@ pub fn vpc_band_mcf(
 ///
 /// [`KmInputError::BadProbs`] unless [`probs_valid`].
 pub fn vpc_band_kmmc(
-    curves: &[KmmcCurve],
-    grid: &[f64],
-    probs: [f64; 3],
-    min_at_risk: usize,
+    curves: &[KmmcCurve], grid: &[f64], probs: [f64; 3], min_at_risk: usize,
 ) -> Result<VpcBand, KmInputError> {
-    band_over(
-        curves.len(),
-        |j, t| curves[j].at(t, min_at_risk),
-        grid,
-        probs,
-    )
+    band_over(curves.len(), |j, t| curves[j].at(t, min_at_risk), grid, probs)
 }
 
 /// The band of `n_curves` curves, `at(j, t)` being curve `j` at time `t`, or `None`
 /// where that curve is undefined.
-fn band_over(
-    n_curves: usize,
-    at: impl Fn(usize, f64) -> Option<f64>,
-    grid: &[f64],
-    probs: [f64; 3],
+pub(crate) fn band_over(
+    n_curves: usize, at: impl Fn(usize, f64) -> Option<f64>, grid: &[f64], probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     if !probs_valid(probs) {
         return Err(KmInputError::BadProbs { probs });
@@ -541,12 +521,11 @@ fn band_over(
         vals.clear();
         vals.extend((0..n_curves).filter_map(|j| at(j, t)));
         debug_assert!(vals.iter().all(|v| v.is_finite()));
-        vals.sort_by(f64::total_cmp);
         band.n_used.push(vals.len());
-        let q = |p: f64| (vals.len() >= need).then(|| quantile_sorted(&vals, p));
-        band.lo.push(q(probs[0]));
-        band.med.push(q(probs[1]));
-        band.hi.push(q(probs[2]));
+        let [lo, med, hi] = gated_quantiles(&mut vals, probs, [need; 3]);
+        band.lo.push(lo);
+        band.med.push(med);
+        band.hi.push(hi);
     }
     Ok(band)
 }

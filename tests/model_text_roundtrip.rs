@@ -106,9 +106,8 @@ fn dropping_one_line_changes_every_example_model_s_identity() {
     // on every file in the corpus, whatever blocks it happens to use.
     for path in example_models() {
         let src = fs::read_to_string(&path).expect("example model must be readable");
-        let Some(victim) = src
-            .lines()
-            .position(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        let Some(victim) =
+            src.lines().position(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         else {
             continue;
         };
@@ -125,12 +124,7 @@ fn dropping_one_line_changes_every_example_model_s_identity() {
             // is a rejection, not a collision.
             Err(_) => continue,
         };
-        assert_ne!(
-            before,
-            after,
-            "{} kept its identity after a line was deleted",
-            path.display()
-        );
+        assert_ne!(before, after, "{} kept its identity after a line was deleted", path.display());
     }
 }
 
@@ -165,19 +159,12 @@ fn canonical_hash_survives_a_reflow_of_every_example_model() {
     // lines between them must not change any model's identity.
     for path in example_models() {
         let src = fs::read_to_string(&path).expect("example model must be readable");
-        let reflowed: String = src
-            .lines()
-            .map(|l| format!("{}   # noise\n\n", l.replace("  ", "    ")))
-            .collect();
+        let reflowed: String =
+            src.lines().map(|l| format!("{}   # noise\n\n", l.replace("  ", "    "))).collect();
         // A `#` inside a line would already have started a comment, so the
         // appended one is inert; a line that *is* a comment stays one.
         let original = ModelText::parse(&src).unwrap().canonical_hash();
         let after = ModelText::parse(&reflowed).unwrap().canonical_hash();
-        assert_eq!(
-            original,
-            after,
-            "{} changed identity under a pure reflow",
-            path.display()
-        );
+        assert_eq!(original, after, "{} changed identity under a pure reflow", path.display());
     }
 }

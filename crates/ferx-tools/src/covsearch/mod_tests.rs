@@ -119,12 +119,7 @@ impl Script {
 
     /// Every step directory the search asked for, in order.
     fn dirs(&self) -> Vec<String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(d, _)| d.clone())
-            .collect()
+        self.calls.lock().unwrap().iter().map(|(d, _)| d.clone()).collect()
     }
 
     /// The candidate ids fitted in one step directory.
@@ -139,21 +134,12 @@ impl Script {
     }
 
     fn n_fits(&self) -> usize {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, ids)| ids.len())
-            .sum()
+        self.calls.lock().unwrap().iter().map(|(_, ids)| ids.len()).sum()
     }
 }
 
 fn n_parameters_of(features: &FeatureVector) -> usize {
-    BASE_N
-        + features
-            .iter()
-            .map(|(_, form)| if form == "hockey" { 2 } else { 1 })
-            .sum::<usize>()
+    BASE_N + features.iter().map(|(_, form)| if form == "hockey" { 2 } else { 1 }).sum::<usize>()
 }
 
 impl StepFitter for Script {
@@ -242,10 +228,7 @@ fn run(script: &Script, space: Space, options: &CovsearchOptions) -> CovsearchRe
 }
 
 fn forward_only() -> CovsearchOptions {
-    CovsearchOptions {
-        algorithm: Algorithm::ScmForward,
-        ..CovsearchOptions::default()
-    }
+    CovsearchOptions { algorithm: Algorithm::ScmForward, ..CovsearchOptions::default() }
 }
 
 fn labels(effects: &[Included]) -> Vec<String> {
@@ -285,10 +268,7 @@ fn forward_takes_the_largest_significant_drop_and_stops_when_none_is() {
     assert_eq!(result.base_ofv, 100.0);
     assert_eq!(
         selected(&result),
-        vec![
-            (1, "forward", "CL-WT-power".to_string()),
-            (2, "forward", "V-WT-power".to_string())
-        ]
+        vec![(1, "forward", "CL-WT-power".to_string()), (2, "forward", "V-WT-power".to_string())]
     );
     assert_eq!(result.n_steps(), 3);
     assert_eq!(result.final_step, 2);
@@ -296,42 +276,27 @@ fn forward_takes_the_largest_significant_drop_and_stops_when_none_is() {
     assert_eq!(labels(&result.included), vec!["CL-WT-power", "V-WT-power"]);
     assert_eq!(
         result.final_model.block_lines("covariate_model"),
-        vec![
-            "CL ~ WT power(center = median)",
-            "V ~ WT power(center = median)"
-        ]
+        vec!["CL ~ WT power(center = median)", "V ~ WT power(center = median)"]
     );
     // Step 1 fitted three candidates, step 2 two, step 3 one.
-    assert_eq!(
-        script.dirs(),
-        vec!["base", "forward-1", "forward-2", "forward-3"]
-    );
+    assert_eq!(script.dirs(), vec!["base", "forward-1", "forward-2", "forward-3"]);
     assert_eq!(script.fitted_in("forward-1").len(), 3);
     assert_eq!(script.fitted_in("forward-3"), vec!["f3-CL-CRCL-power"]);
 
     // The rows carry the numbers the decision was made on.
     let step1: Vec<&StepRow> = result.step_rows(1).collect();
-    let cl_wt = step1
-        .iter()
-        .find(|r| r.effect.label() == "CL-WT-power")
-        .unwrap();
+    let cl_wt = step1.iter().find(|r| r.effect.label() == "CL-WT-power").unwrap();
     let t = cl_wt.lrt.unwrap();
     assert_eq!(t.dofv, 20.0);
     assert_eq!(t.df, 1);
     assert!(t.significant && t.p_value < 1e-4, "{t:?}");
     assert_eq!(t.alpha, 0.01);
-    let crcl = step1
-        .iter()
-        .find(|r| r.effect.label() == "CL-CRCL-power")
-        .unwrap();
+    let crcl = step1.iter().find(|r| r.effect.label() == "CL-CRCL-power").unwrap();
     assert!(!crcl.lrt.unwrap().significant);
     assert!(!crcl.selected);
     assert_eq!(crcl.parent_ofv, 100.0);
     // Every row says how its fit ended.
-    assert!(result
-        .steps
-        .iter()
-        .all(|r| r.converged == Some(true) && r.passed));
+    assert!(result.steps.iter().all(|r| r.converged == Some(true) && r.passed));
 }
 
 #[test]
@@ -346,16 +311,9 @@ fn a_lower_ofv_that_fails_strictness_cannot_win_a_step() {
         ("CL-WT=power;V-WT=power", 60.0),
     ]);
     script.failing.push("CL-WT=power".into());
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT")]),
-        &forward_only(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT"), pow("V", "WT")]), &forward_only());
     assert_eq!(selected(&result)[0].2, "V-WT-power");
-    let stalled = result
-        .step_rows(1)
-        .find(|r| r.effect.label() == "CL-WT-power")
-        .unwrap();
+    let stalled = result.step_rows(1).find(|r| r.effect.label() == "CL-WT-power").unwrap();
     assert!(!stalled.passed);
     assert_eq!(stalled.converged, Some(false));
     assert!(stalled.failures[0].contains("stalled"));
@@ -371,24 +329,10 @@ fn a_lower_ofv_that_fails_strictness_cannot_win_a_step() {
 fn a_candidate_that_adds_no_free_parameter_is_unjudgeable() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 50.0), ("V-WT=power", 90.0)]);
     script.no_extra_parameter.push("CL-WT=power".into());
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT")]),
-        &forward_only(),
-    );
-    let row = result
-        .step_rows(1)
-        .find(|r| r.effect.label() == "CL-WT-power")
-        .unwrap();
+    let result = run(&script, space(vec![pow("CL", "WT"), pow("V", "WT")]), &forward_only());
+    let row = result.step_rows(1).find(|r| r.effect.label() == "CL-WT-power").unwrap();
     assert!(row.lrt.is_none());
-    assert!(
-        row.note
-            .as_ref()
-            .unwrap()
-            .contains("needs at least one more"),
-        "{:?}",
-        row.note
-    );
+    assert!(row.note.as_ref().unwrap().contains("needs at least one more"), "{:?}", row.note);
     assert_eq!(selected(&result)[0].2, "V-WT-power");
 }
 
@@ -396,15 +340,8 @@ fn a_candidate_that_adds_no_free_parameter_is_unjudgeable() {
 fn a_candidate_that_does_not_compile_is_a_row_not_a_crash() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 50.0), ("V-WT=power", 90.0)]);
     script.erroring.push("CL-WT=power".into());
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT")]),
-        &forward_only(),
-    );
-    let row = result
-        .step_rows(1)
-        .find(|r| r.effect.label() == "CL-WT-power")
-        .unwrap();
+    let result = run(&script, space(vec![pow("CL", "WT"), pow("V", "WT")]), &forward_only());
+    let row = result.step_rows(1).find(|r| r.effect.label() == "CL-WT-power").unwrap();
     assert!(row.ofv.is_none() && row.lrt.is_none() && !row.passed);
     assert!(row.failures[0].contains("does not compile"));
     assert_eq!(selected(&result)[0].2, "V-WT-power");
@@ -423,11 +360,7 @@ fn selecting_a_pair_retires_its_other_forms() {
     ]);
     let result = run(
         &script,
-        space(vec![
-            pow("CL", "WT"),
-            effect("CL", "WT", CovariateForm::Linear),
-            pow("V", "WT"),
-        ]),
+        space(vec![pow("CL", "WT"), effect("CL", "WT", CovariateForm::Linear), pow("V", "WT")]),
         &forward_only(),
     );
     assert_eq!(selected(&result).len(), 1);
@@ -441,16 +374,10 @@ fn degrees_of_freedom_come_off_the_fits() {
     let script = Script::new(&[("", 100.0), ("CL-WT=hockey", 92.0), ("V-WT=power", 93.0)]);
     let result = run(
         &script,
-        space(vec![
-            effect("CL", "WT", CovariateForm::Hockey),
-            pow("V", "WT"),
-        ]),
+        space(vec![effect("CL", "WT", CovariateForm::Hockey), pow("V", "WT")]),
         &forward_only(),
     );
-    let hockey = result
-        .step_rows(1)
-        .find(|r| r.effect.label() == "CL-WT-hockey")
-        .unwrap();
+    let hockey = result.step_rows(1).find(|r| r.effect.label() == "CL-WT-hockey").unwrap();
     assert_eq!(hockey.lrt.unwrap().df, 2);
     assert!(!hockey.lrt.unwrap().significant);
     assert_eq!(selected(&result)[0].2, "V-WT-power");
@@ -464,21 +391,11 @@ fn max_steps_bounds_each_phase() {
         ("V-WT=power", 90.0),
         ("CL-WT=power;V-WT=power", 60.0),
     ]);
-    let options = CovsearchOptions {
-        max_steps: Some(1),
-        ..CovsearchOptions::default()
-    };
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT")]),
-        &options,
-    );
+    let options = CovsearchOptions { max_steps: Some(1), ..CovsearchOptions::default() };
+    let result = run(&script, space(vec![pow("CL", "WT"), pow("V", "WT")]), &options);
     // One forward step, then one backward step (which keeps CL-WT: removing
     // it costs 20 at p = 0.001, cutoff 10.83).
-    assert_eq!(
-        selected(&result),
-        vec![(1, "forward", "CL-WT-power".to_string())]
-    );
+    assert_eq!(selected(&result), vec![(1, "forward", "CL-WT-power".to_string())]);
     assert_eq!(script.dirs(), vec!["base", "forward-1", "backward-2"]);
     assert_eq!(result.final_ofv, 80.0);
 }
@@ -537,18 +454,12 @@ fn backward_removes_the_cheapest_insignificant_effect_and_keeps_the_rest() {
     // effect had to stay.
     let step4: Vec<&StepRow> = result.step_rows(4).collect();
     assert_eq!(step4.len(), 3);
-    let crcl = step4
-        .iter()
-        .find(|r| r.effect.label() == "CL-CRCL-power")
-        .unwrap();
+    let crcl = step4.iter().find(|r| r.effect.label() == "CL-CRCL-power").unwrap();
     let t = crcl.lrt.unwrap();
     assert!((t.dofv - 6.7).abs() < 1e-9, "{t:?}");
     assert_eq!(t.alpha, 0.001);
     assert!(!t.significant);
-    let wt = step4
-        .iter()
-        .find(|r| r.effect.label() == "CL-WT-power")
-        .unwrap();
+    let wt = step4.iter().find(|r| r.effect.label() == "CL-WT-power").unwrap();
     assert!(wt.lrt.unwrap().significant);
     assert!(!wt.selected);
     let step6: Vec<&StepRow> = result.step_rows(6).collect();
@@ -564,23 +475,16 @@ fn backward_removes_the_cheapest_insignificant_effect_and_keeps_the_rest() {
 #[test]
 fn backward_never_touches_forced_or_base_relations() {
     let mut base = ModelText::parse(BASE).unwrap();
-    base.apply(ModelEdit::AddCovariateRelation(pow("KA", "SEX").relation()))
-        .unwrap();
+    base.apply(ModelEdit::AddCovariateRelation(pow("KA", "SEX").relation())).unwrap();
     let space = Space {
         base_model: base,
         candidates: vec![pow("CL", "WT")],
-        included: vec![Included {
-            effect: pow("KA", "SEX"),
-            origin: Origin::Forced,
-        }],
+        included: vec![Included { effect: pow("KA", "SEX"), origin: Origin::Forced }],
         notes: vec![],
     };
     let script = Script::new(&[("KA-SEX=power", 100.0), ("CL-WT=power;KA-SEX=power", 80.0)]);
     let result = run(&script, space, &CovsearchOptions::default());
-    assert_eq!(
-        labels(&result.included),
-        vec!["KA-SEX-power", "CL-WT-power"]
-    );
+    assert_eq!(labels(&result.included), vec!["KA-SEX-power", "CL-WT-power"]);
     // The backward step offered exactly one removal.
     assert_eq!(script.fitted_in("backward-2"), vec!["b2-CL-WT-power"]);
     assert_eq!(result.included[0].origin, Origin::Forced);
@@ -592,11 +496,7 @@ fn backward_stops_when_a_strictness_failure_is_the_only_removable_one() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
     // Removing CL-WT gives back the base model, whose refit now stalls.
     script.failing.push("b2-CL-WT-power".into());
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default());
     assert_eq!(labels(&result.included), vec!["CL-WT-power"]);
     let row = result.step_rows(2).next().unwrap();
     assert!(!row.passed && !row.selected);
@@ -648,10 +548,7 @@ fn a_backward_step_with_every_candidate_failing_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     write_report(dir.path(), &result).unwrap();
     let final_model = std::fs::read_to_string(final_model_path(dir.path())).unwrap();
-    assert!(
-        final_model.starts_with(&format!("# {note}\n")),
-        "{final_model}"
-    );
+    assert!(final_model.starts_with(&format!("# {note}\n")), "{final_model}");
     // The comment does not stop the file being a model.
     ModelText::parse(&final_model).unwrap();
 }
@@ -681,10 +578,7 @@ fn a_last_step_with_some_candidates_failing_names_only_those() {
     // judged and kept and nothing is selected.
     let result = run(&script, two_effects(), &CovsearchOptions::default());
     let note = result.backward_incomplete.as_deref().expect("a note");
-    assert!(
-        note.contains("1 of 2 candidates of backward step 3"),
-        "{note}"
-    );
+    assert!(note.contains("1 of 2 candidates of backward step 3"), "{note}");
     assert!(note.contains("so V-WT-power stayed"), "{note}");
     assert!(note.contains("First failure (V-WT-power)"), "{note}");
     assert!(!note.contains("CL-WT-power"), "{note}");
@@ -739,10 +633,7 @@ fn a_failure_the_step_limit_stops_retrying_is_reported() {
     assert_eq!(result.n_steps(), 3, "{:?}", result.steps);
     assert_eq!(labels(&result.included), vec!["V-WT-power"]);
     let note = result.backward_incomplete.as_deref().expect("a note");
-    assert!(
-        note.contains("1 of 2 candidates of backward step 3"),
-        "{note}"
-    );
+    assert!(note.contains("1 of 2 candidates of backward step 3"), "{note}");
     assert!(note.contains("so V-WT-power stayed"), "{note}");
     assert!(result.notes.iter().any(|n| n == note), "{:?}", result.notes);
 }
@@ -763,10 +654,7 @@ fn a_step_that_fails_after_an_earlier_removal_names_the_later_step() {
     let result = run(&script, two_effects(), &CovsearchOptions::default());
     assert_eq!(labels(&result.included), vec!["CL-WT-power"]);
     let note = result.backward_incomplete.as_deref().expect("a note");
-    assert!(
-        note.contains("every candidate of backward step 4"),
-        "{note}"
-    );
+    assert!(note.contains("every candidate of backward step 4"), "{note}");
     assert!(note.contains("so CL-WT-power stayed"), "{note}");
 }
 
@@ -774,11 +662,7 @@ fn a_step_that_fails_after_an_earlier_removal_names_the_later_step() {
 fn a_strictness_failure_counts_as_untested_and_gives_its_reason() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
     script.failing.push("b2-CL-WT-power".into());
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default());
     let note = result.backward_incomplete.as_deref().expect("a note");
     assert!(
         note.ends_with("First failure (CL-WT-power): stalled at the initial estimates (#751)"),
@@ -789,11 +673,7 @@ fn a_strictness_failure_counts_as_untested_and_gives_its_reason() {
 #[test]
 fn the_note_takes_an_unjudgeable_rows_reason_when_no_gate_failed() {
     let script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default());
     let mut row = result.step_rows(2).next().unwrap().clone();
     assert!(incomplete_backward_note(2, std::slice::from_ref(&row), 0.001).is_none());
 
@@ -841,22 +721,13 @@ fn adaptive_scope_reduction_stashes_insignificant_effects_and_retests_them() {
         adaptive_scope_reduction: true,
         ..CovsearchOptions::default()
     };
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT"), pow("CL", "CRCL")]),
-        &options,
-    );
-    assert_eq!(
-        script.dirs(),
-        vec!["base", "forward-1", "adaptive-2", "adaptive-3"]
-    );
+    let result =
+        run(&script, space(vec![pow("CL", "WT"), pow("V", "WT"), pow("CL", "CRCL")]), &options);
+    assert_eq!(script.dirs(), vec!["base", "forward-1", "adaptive-2", "adaptive-3"]);
     assert_eq!(script.fitted_in("adaptive-2").len(), 2);
     assert_eq!(
         selected(&result),
-        vec![
-            (1, "forward", "CL-WT-power".to_string()),
-            (2, "adaptive", "V-WT-power".to_string()),
-        ]
+        vec![(1, "forward", "CL-WT-power".to_string()), (2, "adaptive", "V-WT-power".to_string()),]
     );
     assert_eq!(result.final_ofv, 72.0);
     // Without the stash the same space costs one more fit.
@@ -876,10 +747,7 @@ fn adaptive_scope_reduction_stashes_insignificant_effects_and_retests_them() {
     );
     assert_eq!(without.final_ofv, 72.0);
     assert_eq!(plain.n_fits(), script.n_fits());
-    assert_eq!(
-        plain.dirs(),
-        vec!["base", "forward-1", "forward-2", "forward-3"]
-    );
+    assert_eq!(plain.dirs(), vec!["base", "forward-1", "forward-2", "forward-3"]);
 }
 
 #[test]
@@ -954,11 +822,7 @@ fn a_cancelled_step_ends_the_search_with_what_it_had() {
     let events = events.lock().unwrap();
     assert_eq!(
         events.last(),
-        Some(&CovsearchEvent::StepFinished {
-            step: 1,
-            phase: Phase::Forward,
-            selected: None
-        }),
+        Some(&CovsearchEvent::StepFinished { step: 1, phase: Phase::Forward, selected: None }),
         "{events:?}"
     );
 }
@@ -968,11 +832,7 @@ fn a_cancelled_backward_step_selects_nothing_either() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
     // base, forward-1, forward-2 (empty list → not fitted), backward-2.
     script.cancel_after = Some(3);
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default());
     assert!(result.cancelled);
     assert_eq!(script.dirs(), vec!["base", "forward-1", "backward-2"]);
     // Removing CL-WT would be refused anyway (cost 20 at p = 0.001), so make
@@ -981,11 +841,7 @@ fn a_cancelled_backward_step_selects_nothing_either() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
     script.cancel_after = Some(3);
     script.ofv_by_id.insert("b2-CL-WT-power".into(), 79.0);
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default());
     assert!(result.cancelled);
     let row = result.step_rows(2).next().expect("the backward row");
     assert_eq!(row.phase, Phase::Backward);
@@ -998,11 +854,7 @@ fn a_cancelled_backward_step_selects_nothing_either() {
 fn a_search_cancelled_before_its_first_step_is_the_base_model() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
     script.cancel_after = Some(1);
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result = run(&script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default());
     assert!(result.cancelled);
     assert_eq!(script.dirs(), vec!["base"]);
     assert!(result.steps.is_empty());
@@ -1013,12 +865,7 @@ fn a_search_cancelled_before_its_first_step_is_the_base_model() {
 // ── the base model ───────────────────────────────────────────────────────────
 
 fn search_err(script: &Script) -> String {
-    match search(
-        script,
-        space(vec![pow("CL", "WT")]),
-        &CovsearchOptions::default(),
-        None,
-    ) {
+    match search(script, space(vec![pow("CL", "WT")]), &CovsearchOptions::default(), None) {
         Err(e) => e,
         Ok(r) => panic!("the search ran: final OFV {}", r.final_ofv),
     }
@@ -1048,26 +895,12 @@ fn a_base_model_that_fails_the_gate_or_the_fit_is_refused() {
 fn a_candidate_without_a_cached_fit_is_reported_as_unjudgeable() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 50.0), ("V-WT=power", 90.0)]);
     script.fitless.push("CL-WT=power".into());
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT")]),
-        &forward_only(),
-    );
-    let row = result
-        .step_rows(1)
-        .find(|r| r.effect.label() == "CL-WT-power")
-        .unwrap();
+    let result = run(&script, space(vec![pow("CL", "WT"), pow("V", "WT")]), &forward_only());
+    let row = result.step_rows(1).find(|r| r.effect.label() == "CL-WT-power").unwrap();
     assert_eq!(row.ofv, Some(50.0));
     assert!(row.lrt.is_none());
     assert!(row.p_value().is_nan());
-    assert!(
-        row.note
-            .as_ref()
-            .unwrap()
-            .contains("not in the journal cache"),
-        "{:?}",
-        row.note
-    );
+    assert!(row.note.as_ref().unwrap().contains("not in the journal cache"), "{:?}", row.note);
     assert_eq!(selected(&result)[0].2, "V-WT-power");
 }
 
@@ -1076,10 +909,7 @@ fn a_candidate_without_a_cached_fit_is_reported_as_unjudgeable() {
 #[test]
 fn labels_are_the_spellings_the_files_use() {
     assert_eq!(Algorithm::ScmForward.label(), "scm-forward");
-    assert_eq!(
-        Algorithm::ScmForwardThenBackward.label(),
-        "scm-forward-then-backward"
-    );
+    assert_eq!(Algorithm::ScmForwardThenBackward.label(), "scm-forward-then-backward");
     assert_eq!(Phase::Forward.label(), "forward");
     assert_eq!(Phase::Adaptive.label(), "adaptive");
     assert_eq!(Phase::Backward.label(), "backward");
@@ -1135,10 +965,7 @@ fn options_refuse_what_covsearch_cannot_honour() {
     assert!(e("[covsearch]\nalgorithm = \"samba\"\n").contains("[covsearch]"));
     assert!(e("[covsearch]\np_fwd = 0.01\n").contains("p_fwd"));
     let bic = e("[rank]\ntype = \"bic\"\n");
-    assert!(
-        bic.contains("[rank] type = \"bic\"") && bic.contains("likelihood-ratio"),
-        "{bic}"
-    );
+    assert!(bic.contains("[rank] type = \"bic\"") && bic.contains("likelihood-ratio"), "{bic}");
     // Every other rank type is named back in the file's own spelling.
     for kind in ["aic", "bic_mixed", "bic_iiv", "bic_random", "bic_fixed"] {
         let msg = e(&format!("[rank]\ntype = \"{kind}\"\n"));
@@ -1157,11 +984,7 @@ fn options_refuse_what_covsearch_cannot_honour() {
 fn the_space_keeps_base_relations_forces_structural_ones_and_drops_overlaps() {
     // The example base declares CL~WT, CL~CRCL, V1~WT. The space explores
     // WT and CRCL on every η-parameter (five of them) and forces KA~CRCL.
-    let cfg = config(
-        "COVARIATE?(@IIV, @CONTINUOUS, pow); COVARIATE(KA, CRCL, exp)",
-        "",
-    )
-    .unwrap();
+    let cfg = config("COVARIATE?(@IIV, @CONTINUOUS, pow); COVARIATE(KA, CRCL, exp)", "").unwrap();
     let base = cfg.load_base().unwrap();
     let space = Space::from_config(&cfg, &base).unwrap();
     let candidates: Vec<String> = space.candidates.iter().map(Effect::label).collect();
@@ -1179,20 +1002,11 @@ fn the_space_keeps_base_relations_forces_structural_ones_and_drops_overlaps() {
     );
     assert_eq!(
         labels(&space.included),
-        vec![
-            "CL-WT-power",
-            "CL-CRCL-power",
-            "V1-WT-power",
-            "KA-CRCL-exponential"
-        ]
+        vec!["CL-WT-power", "CL-CRCL-power", "V1-WT-power", "KA-CRCL-exponential"]
     );
     assert_eq!(space.included[3].origin, Origin::Forced);
     assert_eq!(
-        space
-            .base_model
-            .block_lines("covariate_model")
-            .last()
-            .unwrap(),
+        space.base_model.block_lines("covariate_model").last().unwrap(),
         "KA ~ CRCL exponential(center = median)"
     );
     assert_eq!(space.notes.len(), 3, "{:?}", space.notes);
@@ -1214,10 +1028,7 @@ fn a_structural_statement_is_refused_by_name() {
     let cfg = config("PERIPHERALS(0..1); COVARIATE?(CL, WT, pow)", "").unwrap();
     let base = cfg.load_base().unwrap();
     let e = Space::from_config(&cfg, &base).unwrap_err();
-    assert!(
-        e.contains("`PERIPHERALS` is not a covariate statement"),
-        "{e}"
-    );
+    assert!(e.contains("`PERIPHERALS` is not a covariate statement"), "{e}");
     assert!(e.contains("modelsearch"));
 }
 
@@ -1226,11 +1037,8 @@ fn a_structural_statement_is_refused_by_name() {
 #[test]
 fn the_report_writes_the_step_table_and_the_seeded_final_model() {
     let script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0), ("V-WT=power", 96.0)]);
-    let result = run(
-        &script,
-        space(vec![pow("CL", "WT"), pow("V", "WT")]),
-        &CovsearchOptions::default(),
-    );
+    let result =
+        run(&script, space(vec![pow("CL", "WT"), pow("V", "WT")]), &CovsearchOptions::default());
     let dir = tempfile::tempdir().unwrap();
     write_report(dir.path(), &result).unwrap();
 
@@ -1241,10 +1049,7 @@ fn the_report_writes_the_step_table_and_the_seeded_final_model() {
     // Step 1: two forward rows; step 2: one forward (V-WT, insignificant);
     // step 3: one backward (CL-WT kept).
     assert_eq!(rows.len(), 4);
-    assert_eq!(
-        &rows[0][..6],
-        &["1", "forward", "f1-CL-WT-power", "CL", "WT", "power"]
-    );
+    assert_eq!(&rows[0][..6], &["1", "forward", "f1-CL-WT-power", "CL", "WT", "power"]);
     assert_eq!(rows[0][6], "100.000000");
     assert_eq!(rows[0][7], "80.000000");
     assert_eq!(rows[0][8], "20.000000");
@@ -1261,10 +1066,7 @@ fn the_report_writes_the_step_table_and_the_seeded_final_model() {
     // base model, so its estimates were written into the initial values.
     let fit = converged_fit(80.0);
     let tvcl = fit.theta[fit.theta_names.iter().position(|n| n == "TVCL").unwrap()];
-    assert!(
-        final_model.contains(&format!("theta TVCL({tvcl}")),
-        "{final_model}"
-    );
+    assert!(final_model.contains(&format!("theta TVCL({tvcl}")), "{final_model}");
 
     let summary = render_summary(&result);
     assert!(summary.contains("Base model: OFV 100.000"));
@@ -1297,19 +1099,13 @@ fn the_summary_and_the_table_say_why_a_candidate_was_excluded() {
 
     let summary = render_summary(&result);
     assert!(summary.contains("not converged"), "{summary}");
-    assert!(
-        summary.contains("stalled at the initial estimates"),
-        "{summary}"
-    );
+    assert!(summary.contains("stalled at the initial estimates"), "{summary}");
     assert!(summary.contains("excluded"), "{summary}");
     assert!(summary.contains("no fit: does not compile"), "{summary}");
     assert!(summary.contains("SELECTED"), "{summary}");
     assert!(summary.contains("kept (removal significant)"), "{summary}");
     assert!(summary.contains("(search cancelled)"), "{summary}");
-    assert!(
-        summary.contains("Notes:\n  - a note the user should see once"),
-        "{summary}"
-    );
+    assert!(summary.contains("Notes:\n  - a note the user should see once"), "{summary}");
 
     // The step-2 retry of V-WT and KA-WT from CL-WT: V-WT stalls again,
     // KA-WT still does not compile; both are "not significant" rows in the
@@ -1321,10 +1117,7 @@ fn the_summary_and_the_table_say_why_a_candidate_was_excluded() {
     let table = std::fs::read_to_string(steps_path(dir.path())).unwrap();
     let rows: Vec<&str> = table.lines().skip(1).collect();
     let stalled = rows.iter().find(|r| r.contains("f1-V-WT-power")).unwrap();
-    assert!(
-        stalled.ends_with(",false,false,stalled at the initial estimates (#751)"),
-        "{stalled}"
-    );
+    assert!(stalled.ends_with(",false,false,stalled at the initial estimates (#751)"), "{stalled}");
     let broken = rows.iter().find(|r| r.contains("f1-KA-WT-power")).unwrap();
     // No OFV, no ΔOFV, no df, no p — empty cells, not `NaN`.
     assert!(
@@ -1343,10 +1136,7 @@ fn the_summary_and_the_table_say_why_a_candidate_was_excluded() {
 fn a_removable_effect_reads_as_removable_in_the_summary() {
     // Backward at p = 0.001: removing CL-WT costs 2 — removable, and taken.
     let script = Script::new(&[("", 82.0), ("CL-WT=power", 80.0)]);
-    let options = CovsearchOptions {
-        p_forward: 0.5,
-        ..CovsearchOptions::default()
-    };
+    let options = CovsearchOptions { p_forward: 0.5, ..CovsearchOptions::default() };
     let result = run(&script, space(vec![pow("CL", "WT")]), &options);
     assert_eq!(result.final_ofv, 82.0);
     let summary = render_summary(&result);
@@ -1372,20 +1162,14 @@ fn an_additive_effect_is_a_candidate_and_adds_exactly_one_free_theta() {
     let base = cfg.load_base().unwrap();
     let space = Space::from_config(&cfg, &base).unwrap();
     assert_eq!(
-        space
-            .candidates
-            .iter()
-            .map(Effect::label)
-            .collect::<Vec<_>>(),
+        space.candidates.iter().map(Effect::label).collect::<Vec<_>>(),
         vec!["KA-WT-linear-add"]
     );
     assert_eq!(space.candidates[0].op, CovariateOp::Add);
 
     let mut model = space.base_model.clone();
     model
-        .apply(ModelEdit::AddCovariateRelation(
-            space.candidates[0].relation(),
-        ))
+        .apply(ModelEdit::AddCovariateRelation(space.candidates[0].relation()))
         .expect("the additive relation must apply");
     assert_eq!(
         model.block_lines("covariate_model").last().unwrap(),

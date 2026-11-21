@@ -150,15 +150,9 @@ const NM_OBJV_SS_INFUSION: f64 = -458.896_244_660_178_47;
 /// `RATE`-defined (`AMT 100 / RATE 100`, a 1 h window), `II = 12`, with a sample at
 /// `t = 0.5` inside every subject's pre-arrival window.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_steady_state_infusion_with_a_lagtime_under_tv_covariates() {
-    let ofv = ferx_ofv(
-        "dose_form_lag_infusion_fit.ferx",
-        "dose_form_lag_ss_infusion.csv",
-    );
+    let ofv = ferx_ofv("dose_form_lag_infusion_fit.ferx", "dose_form_lag_ss_infusion.csv");
     let delta = (ofv - NM_OBJV_SS_INFUSION).abs();
     assert!(
         delta < TOL,
@@ -183,15 +177,9 @@ fn ferx_matches_nonmem_for_a_steady_state_infusion_with_a_lagtime_under_tv_covar
 /// Those differ by a large factor rather than a few percent, which makes this the
 /// geometry where the two conventions separate loudly.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_steady_state_record_that_is_not_the_first_dose() {
-    let ofv = ferx_ofv(
-        "dose_form_lag_oral_fit.ferx",
-        "dose_form_lag_ss_midstream.csv",
-    );
+    let ofv = ferx_ofv("dose_form_lag_oral_fit.ferx", "dose_form_lag_ss_midstream.csv");
     let delta = (ofv - NM_OBJV_SS_MIDSTREAM).abs();
     assert!(
         delta < TOL,
@@ -216,15 +204,9 @@ fn ferx_matches_nonmem_for_a_steady_state_record_that_is_not_the_first_dose() {
 /// pharmacology, and if it does, the extra breakpoint is being given parameters it
 /// should not have.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_sample_inside_a_steady_state_dose_pre_arrival_window() {
-    let ofv = ferx_ofv(
-        "dose_form_lag_oral_fit.ferx",
-        "dose_form_lag_ss_prearrival.csv",
-    );
+    let ofv = ferx_ofv("dose_form_lag_oral_fit.ferx", "dose_form_lag_ss_prearrival.csv");
     let delta = (ofv - NM_OBJV_SS_PREARRIVAL).abs();
     assert!(
         delta < TOL,
@@ -248,10 +230,7 @@ fn ferx_matches_nonmem_for_a_sample_inside_a_steady_state_dose_pre_arrival_windo
 /// The pointwise `PRED` test below localises the same defect without a fit and
 /// runs on every PR; this asserts the objective the issue was measured on.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_steady_state_dose_whose_lagged_arrival_crosses_a_covariate_change() {
     let ofv = ferx_ofv("dose_form_lag_oral_fit.ferx", "dose_form_lag_ss.csv");
     let delta = (ofv - NM_OBJV_SS).abs();
@@ -262,15 +241,9 @@ fn ferx_matches_nonmem_for_a_steady_state_dose_whose_lagged_arrival_crosses_a_co
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_lagged_infusion_whose_window_end_crosses_a_covariate_change() {
-    let ofv = ferx_ofv(
-        "dose_form_lag_infusion_fit.ferx",
-        "dose_form_lag_infusion.csv",
-    );
+    let ofv = ferx_ofv("dose_form_lag_infusion_fit.ferx", "dose_form_lag_infusion.csv");
     let delta = (ofv - NM_OBJV_INFUSION).abs();
     assert!(
         delta < TOL,
@@ -279,10 +252,7 @@ fn ferx_matches_nonmem_for_a_lagged_infusion_whose_window_end_crosses_a_covariat
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_steady_state_dose_with_a_lagtime_under_flat_covariates() {
     // E3a. Isolates the lagtime: same SS geometry and the same data, every `WT`
     // set to 70. The SS trough, the pre-arrival window and the lagged pulse are all
@@ -297,10 +267,7 @@ fn ferx_matches_nonmem_for_a_steady_state_dose_with_a_lagtime_under_flat_covaria
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_a_steady_state_dose_under_time_varying_covariates_without_a_lagtime() {
     // E3b. The complementary isolation: the same SS dataset, the covariate varying
     // exactly as it does in the triple, but `ALAG1 = 0` on both sides. Together with
@@ -316,10 +283,7 @@ fn ferx_matches_nonmem_for_a_steady_state_dose_under_time_varying_covariates_wit
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_matches_nonmem_for_an_evid4_reset_carrying_a_lagged_dose() {
     let ofv = ferx_ofv("dose_form_lag_oral_fit.ferx", "dose_form_lag_reset.csv");
     let delta = (ofv - NM_OBJV_RESET).abs();
@@ -372,16 +336,9 @@ fn nonmem_pred_table(tab: &str) -> std::collections::HashMap<(String, u64), f64>
     let text = std::fs::read_to_string(anchor(tab)).expect("the NONMEM table is committed");
     let mut lines = text.lines();
     lines.next().expect("TABLE NO. banner");
-    let header: Vec<&str> = lines
-        .next()
-        .expect("column header")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> = lines.next().expect("column header").split_whitespace().collect();
     let id_col = header.iter().position(|c| *c == "ID").expect("ID column");
-    let time_col = header
-        .iter()
-        .position(|c| *c == "TIME")
-        .expect("TIME column");
+    let time_col = header.iter().position(|c| *c == "TIME").expect("TIME column");
     let pred_col = header
         .iter()
         .position(|c| *c == "PRED")
@@ -606,10 +563,7 @@ fn ferx_population_predictions_match_nonmem_inside_a_pre_arrival_window_on_the_c
 /// exact kernels against RK45 at `reltol 1e-10`. A gap large enough to matter
 /// clinically would be thousands of times this.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_analytical_and_ode_engines_agree_on_a_lagged_steady_state_dose_under_tv_covariates() {
     let ode = ferx_ofv("dose_form_lag_oral_fit.ferx", "dose_form_lag_ss.csv");
     let closed_form = ferx_ofv("dose_form_lag_oral_cf_fit.ferx", "dose_form_lag_ss.csv");

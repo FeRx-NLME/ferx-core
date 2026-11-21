@@ -61,11 +61,7 @@ fn git(dir: &Path, args: &[&str], date: Option<&str>) -> String {
         c.env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z");
     }
     let out = c.output().expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -87,11 +83,7 @@ fn fixture_repo() -> (tempfile::TempDir, Vec<String>) {
     git(d, &["init", "-q", "-b", "main"], None);
     write(d, "src/lib.rs", "pub fn a() {}\n");
     git(d, &["add", "."], None);
-    git(
-        d,
-        &["commit", "-q", "-m", "root"],
-        Some("2026-10-30T12:00:00Z"),
-    );
+    git(d, &["commit", "-q", "-m", "root"], Some("2026-10-30T12:00:00Z"));
     let mut merges = vec![git(d, &["rev-parse", "HEAD"], None)];
     let days = [
         ("a", "2026-10-31T23:00:00Z", "2026-11-01T12:00:00Z"),
@@ -107,18 +99,7 @@ fn fixture_repo() -> (tempfile::TempDir, Vec<String>) {
         git(d, &["add", "."], None);
         git(d, &["commit", "-q", "-m", name], Some(side_date));
         git(d, &["checkout", "-q", "main"], None);
-        git(
-            d,
-            &[
-                "merge",
-                "-q",
-                "--no-ff",
-                "-m",
-                &format!("merge {name}"),
-                name,
-            ],
-            Some(merge_date),
-        );
+        git(d, &["merge", "-q", "--no-ff", "-m", &format!("merge {name}"), name], Some(merge_date));
         merges.push(git(d, &["rev-parse", "HEAD"], None));
     }
     (tmp, merges)
@@ -129,17 +110,12 @@ fn range_bounds_the_window_by_first_parent_committer_date() {
     let (tmp, m) = fixture_repo();
     // Window (2026-11-01T00:00, 2026-11-02T00:00]: merges B and C landed in it, so
     // the diff runs from A (the last merge before) to C (the last merge inside).
-    let out = ok_stdout(run(
-        tmp.path(),
-        &["range", "--until", "2026-11-02T00:00:00Z"],
-    ));
+    let out = ok_stdout(run(tmp.path(), &["range", "--until", "2026-11-02T00:00:00Z"]));
     assert_eq!(out.trim(), format!("{} {}", m[1], m[3]));
 
     // --hours widens the window back past A, to the root.
-    let out = ok_stdout(run(
-        tmp.path(),
-        &["range", "--until", "2026-11-02T00:00:00Z", "--hours", "48"],
-    ));
+    let out =
+        ok_stdout(run(tmp.path(), &["range", "--until", "2026-11-02T00:00:00Z", "--hours", "48"]));
     assert_eq!(out.trim(), format!("{} {}", m[0], m[3]));
 
     // A window before the repo existed has no base commit: the script must say so
@@ -152,29 +128,17 @@ fn range_bounds_the_window_by_first_parent_committer_date() {
 fn diff_leaves_test_files_out() {
     let (tmp, m) = fixture_repo();
     let out_path = tmp.path().join("day.diff");
-    let n = ok_stdout(run(
-        tmp.path(),
-        &["diff", &m[1], &m[3], out_path.to_str().unwrap()],
-    ));
+    let n = ok_stdout(run(tmp.path(), &["diff", &m[1], &m[3], out_path.to_str().unwrap()]));
     assert_eq!(n.trim(), "2", "src/b.rs and src/c.rs, nothing else");
     let diff = std::fs::read_to_string(&out_path).unwrap();
     assert!(diff.contains("+++ b/src/b.rs") && diff.contains("+++ b/src/c.rs"));
-    assert!(
-        !diff.contains("_tests.rs"),
-        "a #[path] test sibling leaked:\n{diff}"
-    );
-    assert!(
-        !diff.contains("tests/"),
-        "an integration test leaked:\n{diff}"
-    );
+    assert!(!diff.contains("_tests.rs"), "a #[path] test sibling leaked:\n{diff}");
+    assert!(!diff.contains("tests/"), "an integration test leaked:\n{diff}");
     assert!(!diff.contains("src/a.rs") && !diff.contains("src/d.rs"));
 
     // A window that touched only tests yields an empty diff and a zero count, which
     // is what lets the workflow skip the mutation jobs.
-    let n = ok_stdout(run(
-        tmp.path(),
-        &["diff", &m[3], &m[3], out_path.to_str().unwrap()],
-    ));
+    let n = ok_stdout(run(tmp.path(), &["diff", &m[3], &m[3], out_path.to_str().unwrap()]));
     assert_eq!(n.trim(), "0");
     assert!(std::fs::read_to_string(&out_path).unwrap().is_empty());
 }
@@ -360,10 +324,7 @@ fn select_refuses_a_coloured_list_and_names_the_flag() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{mode:?}: a coloured list must fail");
         assert!(err.contains("entry 2"), "{mode:?}: names the entry: {err}");
-        assert!(
-            err.contains("--colors=never"),
-            "{mode:?}: names the fix: {err}"
-        );
+        assert!(err.contains("--colors=never"), "{mode:?}: names the fix: {err}");
         assert!(!cfg.exists(), "{mode:?}: no config written");
     }
 }
@@ -392,10 +353,7 @@ fn workflow_lists_mutants_without_colours() {
         .collect();
     assert!(calls.len() >= 3, "found the cargo mutants calls: {calls:?}");
     for c in calls {
-        assert!(
-            c.contains("$MUTANTS_ARGS"),
-            "call without MUTANTS_ARGS: {c}"
-        );
+        assert!(c.contains("$MUTANTS_ARGS"), "call without MUTANTS_ARGS: {c}");
     }
 }
 
@@ -404,19 +362,9 @@ fn untested_is_the_selection_minus_every_recorded_outcome() {
     let tmp = tempfile::tempdir().unwrap();
     let sel = tmp.path().join("selected.txt");
     std::fs::write(&sel, "m:1:1: a\nm:2:1: b\nm:3:1: c\nm:4:1: d\nm:5:1: e\n").unwrap();
-    let s0 = shard(
-        tmp.path(),
-        "s0",
-        &[("caught.txt", "m:1:1: a\n"), ("missed.txt", "m:2:1: b\n")],
-    );
-    let s1 = shard(
-        tmp.path(),
-        "s1",
-        &[
-            ("timeout.txt", "m:3:1: c\n"),
-            ("unviable.txt", "m:9:1: z\n"),
-        ],
-    );
+    let s0 = shard(tmp.path(), "s0", &[("caught.txt", "m:1:1: a\n"), ("missed.txt", "m:2:1: b\n")]);
+    let s1 =
+        shard(tmp.path(), "s1", &[("timeout.txt", "m:3:1: c\n"), ("unviable.txt", "m:9:1: z\n")]);
     let out = tmp.path().join("untested.txt");
     let args = [
         "untested",
@@ -426,10 +374,7 @@ fn untested_is_the_selection_minus_every_recorded_outcome() {
         s1.to_str().unwrap(),
     ];
     assert_eq!(ok_stdout(run(tmp.path(), &args)).trim(), "2");
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "m:4:1: d\nm:5:1: e\n"
-    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "m:4:1: d\nm:5:1: e\n");
 
     // No shard output at all (every shard died): the whole selection is untested.
     let args = ["untested", sel.to_str().unwrap(), out.to_str().unwrap()];
@@ -456,11 +401,7 @@ fn outcome_dirs_finds_a_lone_flattened_shard_and_nested_shards() {
     let caught = "src/a.rs:1:1: replace x with ()\n";
     let unviable = "src/a.rs:3:1: replace w -> T with Default::default()\n";
     let selected = format!("{caught}{unviable}src/b.rs:9:5: replace scale -> f64 with 0.0\n");
-    let outcomes = [
-        ("caught.txt", caught),
-        ("unviable.txt", unviable),
-        ("outcomes.json", "{}"),
-    ];
+    let outcomes = [("caught.txt", caught), ("unviable.txt", unviable), ("outcomes.json", "{}")];
 
     // Flattened: the one artifact's `mutants.out` contents sit in ROOT itself, beside
     // its `diff/` and `log/` subdirs, which hold no outcome file.
@@ -497,11 +438,7 @@ fn outcome_dirs_finds_a_lone_flattened_shard_and_nested_shards() {
         let unt = tmp.join("untested.txt");
         let mut args = vec!["untested", sel.to_str().unwrap(), unt.to_str().unwrap()];
         args.extend(dirs.iter().copied());
-        assert_eq!(
-            ok_stdout(run(tmp, &args)).trim(),
-            "1",
-            "only `scale` is untested"
-        );
+        assert_eq!(ok_stdout(run(tmp, &args)).trim(), "1", "only `scale` is untested");
         let mut args = vec!["summary", "--selected", "3"];
         args.extend(dirs.iter().copied());
         let md = ok_stdout(run(tmp, &args));
@@ -527,15 +464,9 @@ fn workflow_finds_shard_dirs_by_content() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/mutants.yml"),
     )
     .unwrap();
-    let code: Vec<&str> = wf
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with('#'))
-        .collect();
-    let by_content = code
-        .iter()
-        .filter(|l| l.contains("nightly-mutants.sh outcome-dirs shards"))
-        .count();
+    let code: Vec<&str> = wf.lines().map(str::trim).filter(|l| !l.starts_with('#')).collect();
+    let by_content =
+        code.iter().filter(|l| l.contains("nightly-mutants.sh outcome-dirs shards")).count();
     assert_eq!(by_content, 2, "carry + summary steps use outcome-dirs");
     let globs: Vec<&&str> = code.iter().filter(|l| l.contains("shards/*")).collect();
     assert!(globs.is_empty(), "shard dirs by glob: {globs:?}");
@@ -559,15 +490,9 @@ fn summary_lists_every_survivor_across_shards_and_flags_a_budget_hit() {
         tmp.path(),
         "s0",
         &[
-            (
-                "caught.txt",
-                "src/a.rs:1:1: replace x with ()\nsrc/a.rs:2:1: replace y with ()\n",
-            ),
+            ("caught.txt", "src/a.rs:1:1: replace x with ()\nsrc/a.rs:2:1: replace y with ()\n"),
             ("missed.txt", "src/z.rs:40:5: replace fill with ()\n"),
-            (
-                "unviable.txt",
-                "src/a.rs:3:1: replace w -> T with Default::default()\n",
-            ),
+            ("unviable.txt", "src/a.rs:3:1: replace w -> T with Default::default()\n"),
         ],
     );
     let s1 = shard(
@@ -575,10 +500,7 @@ fn summary_lists_every_survivor_across_shards_and_flags_a_budget_hit() {
         "s1",
         &[
             ("caught.txt", "src/b.rs:1:1: replace q with ()\n"),
-            (
-                "missed.txt",
-                "src/b.rs:9:5: replace scale -> f64 with 0.0\n",
-            ),
+            ("missed.txt", "src/b.rs:9:5: replace scale -> f64 with 0.0\n"),
             ("timeout.txt", "src/c.rs:5:9: replace < with <= in spin\n"),
         ],
     );
@@ -604,40 +526,19 @@ fn summary_lists_every_survivor_across_shards_and_flags_a_budget_hit() {
         "a budget hit must be in the headline: {md}"
     );
     // Survivors as `file:line` + mutation, sorted by file then line.
-    let b = md
-        .find("src/b.rs:9:5: replace scale -> f64 with 0.0")
-        .expect(&md);
+    let b = md.find("src/b.rs:9:5: replace scale -> f64 with 0.0").expect(&md);
     let z = md.find("src/z.rs:40:5: replace fill with ()").expect(&md);
     assert!(b < z, "survivors sorted by path: {md}");
-    assert!(
-        md.contains("src/c.rs:5:9: replace < with <= in spin"),
-        "{md}"
-    );
-    assert!(
-        md.contains("string literals"),
-        "the not-covered caveat is part of the report"
-    );
+    assert!(md.contains("src/c.rs:5:9: replace < with <= in spin"), "{md}");
+    assert!(md.contains("string literals"), "the not-covered caveat is part of the report");
 
     // A clean, complete night: no survivor section, no budget line.
-    let clean = shard(
-        tmp.path(),
-        "clean",
-        &[("caught.txt", "src/a.rs:1:1: replace x with ()\n")],
-    );
-    let md = ok_stdout(run(
-        tmp.path(),
-        &["summary", "--selected", "1", clean.to_str().unwrap()],
-    ));
+    let clean = shard(tmp.path(), "clean", &[("caught.txt", "src/a.rs:1:1: replace x with ()\n")]);
+    let md = ok_stdout(run(tmp.path(), &["summary", "--selected", "1", clean.to_str().unwrap()]));
     assert!(md.contains("### Mutants: 0 survived of 1 examined"), "{md}");
     assert!(md.contains("Examined all 1 selected"), "{md}");
-    assert!(
-        !md.contains("Surviving mutants") && !md.contains("Budget hit"),
-        "{md}"
-    );
-    assert!(
-        !md.contains("Measured on this run"),
-        "no outcomes.json, no timing: {md}"
-    );
+    assert!(!md.contains("Surviving mutants") && !md.contains("Budget hit"), "{md}");
+    assert!(!md.contains("Measured on this run"), "no outcomes.json, no timing: {md}");
 }
 
 /// The two endings of a budget-hit pass, asserted together so a gate stuck on
@@ -658,34 +559,18 @@ fn summary_lists_the_untested_tail_unless_a_follow_up_pass_takes_it() {
     let s0 = shard(
         tmp.path(),
         "s0",
-        &[
-            ("caught.txt", "m:1:1: a\n"),
-            ("missed.txt", "m:2:1: b\n"),
-            ("outcomes.json", outcomes),
-        ],
+        &[("caught.txt", "m:1:1: a\n"), ("missed.txt", "m:2:1: b\n"), ("outcomes.json", outcomes)],
     );
     let untested = tmp.path().join("untested.txt");
     std::fs::write(&untested, "src/q.rs:9:5: replace late -> u8 with 0\n").unwrap();
-    let base = [
-        "summary",
-        "--selected",
-        "3",
-        "--untested",
-        untested.to_str().unwrap(),
-    ];
+    let base = ["summary", "--selected", "3", "--untested", untested.to_str().unwrap()];
 
     let mut last = base.to_vec();
     last.push(s0.to_str().unwrap());
     let md = ok_stdout(run(tmp.path(), &last));
-    assert!(
-        md.contains("other 1 were not tested and are listed below"),
-        "{md}"
-    );
+    assert!(md.contains("other 1 were not tested and are listed below"), "{md}");
     assert!(md.contains("#### Not examined"), "{md}");
-    assert!(
-        md.contains("src/q.rs:9:5: replace late -> u8 with 0"),
-        "{md}"
-    );
+    assert!(md.contains("src/q.rs:9:5: replace late -> u8 with 0"), "{md}");
     assert!(!md.contains("follow-up pass"), "{md}");
     // The baseline is not a mutant: medians over the two mutants only.
     assert!(
@@ -697,12 +582,6 @@ fn summary_lists_the_untested_tail_unless_a_follow_up_pass_takes_it() {
     handed_on.push("--continued");
     handed_on.push(s0.to_str().unwrap());
     let md = ok_stdout(run(tmp.path(), &handed_on));
-    assert!(
-        md.contains("other 1 carry over to a follow-up pass"),
-        "{md}"
-    );
-    assert!(
-        !md.contains("Not examined") && !md.contains("src/q.rs"),
-        "{md}"
-    );
+    assert!(md.contains("other 1 carry over to a follow-up pass"), "{md}");
+    assert!(!md.contains("Not examined") && !md.contains("src/q.rs"), "{md}");
 }

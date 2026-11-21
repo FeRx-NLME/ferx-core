@@ -100,11 +100,7 @@ mod self_consistency {
                     obs_records.push(record(t, EventType::Exact));
                 }
                 obs_records.push(record(c, EventType::RightCensored));
-                Subject {
-                    id: i.to_string(),
-                    obs_records,
-                    ..Default::default()
-                }
+                Subject { id: i.to_string(), obs_records, ..Default::default() }
             })
             .collect();
         let pop = Population {
@@ -144,10 +140,8 @@ mod self_consistency {
             let s = &v.strata[0];
             let km2 = &s.absolute[1];
             assert_eq!(km2.order, 2);
-            let curves = [
-                (&s.mcf.obs_on_grid, &s.mcf.lo, &s.mcf.hi),
-                (&km2.obs_on_grid, &km2.lo, &km2.hi),
-            ];
+            let curves =
+                [(&s.mcf.obs_on_grid, &s.mcf.lo, &s.mcf.hi), (&km2.obs_on_grid, &km2.lo, &km2.hi)];
             for (j, (obs, lo, hi)) in curves.into_iter().enumerate() {
                 for k in 0..3 {
                     let obs = obs[k].expect("observed curve defined");
@@ -160,18 +154,13 @@ mod self_consistency {
             }
         }
         let early = early / M as f64;
-        let cov: Vec<Vec<f64>> = inside
-            .iter()
-            .map(|c| c.iter().map(|&n| n as f64 / M as f64).collect())
-            .collect();
+        let cov: Vec<Vec<f64>> =
+            inside.iter().map(|c| c.iter().map(|&n| n as f64 / M as f64).collect()).collect();
         eprintln!(
             "left before H: {early:.3}; coverage at H/4, H/2, 3H/4: MCF {:?}, order-2 KM {:?}",
             cov[0], cov[1]
         );
-        assert!(
-            (0.75..0.85).contains(&early),
-            "dropout design drifted: {early}"
-        );
+        assert!((0.75..0.85).contains(&early), "dropout design drifted: {early}");
         for (name, c) in ["MCF", "order-2 KM"].iter().zip(&cov) {
             for (k, c) in c.iter().enumerate() {
                 assert!(
@@ -201,17 +190,22 @@ mod self_consistency {
     /// | curve | coverage at 2 / 4 / 6 | misses below / above | below-share |
     /// |---|---|---|---|
     /// | gap 2 | 0.865 / 0.865 / 0.894 | 40 / 35 | 0.53 |
-    /// | gap 3 | 0.905 / 0.905 / 0.911 | 25 / 30 | 0.45 |
+    /// | gap 3 | 0.905 / 0.905 / 0.896 | 27 / 30 | 0.47 |
     /// | gap 2, observed streams not cut | 0.895 / 0.880 / 0.870 | 11 / 60 | **0.15** |
     /// | gap 3, observed streams not cut | 0.890 / 0.890 / 0.940 | 1 / 55 | **0.02** |
     ///
     /// Linux x86_64 (CI slow-tests run 43616779609, at `b28f22101`) printed the cut rows
     /// and the MCF / absolute-2 control with every digit, undefined count and miss count
-    /// identical to the macOS arm64 numbers above.
+    /// identical to the macOS arm64 numbers above. Since #2930 (a curve that reached 0
+    /// is undefined past its last time) the gap 3 row reads 0.896 at 6 with 27 / 30
+    /// misses, where it read 0.911 with 25 / 30; re-measured on Linux aarch64
+    /// (`tools/linux-test.sh`) and macOS arm64 with identical digits. The other rows
+    /// did not move; the two "not cut" rows predate #2930 and were not re-run.
     ///
     /// Coverage is over the datasets where the observed value and the band are both
-    /// defined: at most 10 of 200 are not (gap 3 at 6, where a dataset's observed gap
-    /// curve can end first); the bound `MAX_UNDEFINED` is twice that.
+    /// defined: at most 17 of 200 are not (gap 3 at 6, where a dataset's observed gap
+    /// curve, or too many replicate gap curves, end first; 10 before #2930); the bound
+    /// `MAX_UNDEFINED` is twice that.
     ///
     /// The MCF and absolute order 2, which the cut does not move on `[0, H]` (plan §0 M3),
     /// are printed as a control: 0.860 / 0.875 / 0.860 and 0.840 / 0.875 / 0.890, the
@@ -220,12 +214,12 @@ mod self_consistency {
     fn gap_bands_cover_when_the_horizon_is_below_the_follow_up() {
         const HZ: f64 = 10.0;
         const BASE: u64 = 3_000_000;
-        const MAX_UNDEFINED: usize = 20;
+        const MAX_UNDEFINED: usize = 34;
         let model = parse_model_string(&model(1.0)).unwrap();
         let grid = vec![HZ / 5.0, 2.0 * HZ / 5.0, 3.0 * HZ / 5.0];
         let names = ["MCF", "absolute 2", "gap 2", "gap 3"];
         // [curve][grid point]: (inside, below, above, undefined). Undefined: the observed
-        // curve ended before the grid time without reaching 0, or too few replicate
+        // curve ended before the grid time (also at 0, #2930), or too few replicate
         // curves reach it for a band.
         let mut tally = [[(0usize, 0usize, 0usize, 0usize); 3]; 4];
         for m in 0..M {
@@ -302,6 +296,111 @@ mod self_consistency {
                  under 0.25: the observed curve reads follow-up past the horizon"
             );
         }
+    }
+
+    /// T5′ (#2930). A Kaplan–Meier curve is undefined past its last time, also when it
+    /// reached 0. The T13 design at `ω² = 1` (datasets `2_000_000 + m`, replicates
+    /// `2_000_000 ^ m`, `sim.horizon = H = 20`), orders to 3, grid 10, 12, 15.
+    ///
+    /// **A1**, deterministic: for every order curve (absolute 1–3, gap 2–3) and every grid
+    /// time past the observed curve's last time, the observed value is `None`. The
+    /// straddle is asserted too: at least 50 of those cells have an observed curve that
+    /// reached 0, the cells the rule before #2930 read as `Some(0.0)`. Measured: 272 cells
+    /// past the last time, 104 of them at zero.
+    ///
+    /// **A2**, the one-sided-miss signal: for gap order 3, at least a quarter of the misses
+    /// pooled over the three times fall below the band. Before #2930 a replicate that
+    /// reached 0 added a 0 to the band past its last time, so once enough did the lower
+    /// edge was 0, the observed curve could not fall below it and the misses fell above.
+    /// Measured with these seeds: this rule, 30 below / 19 above (share 0.61) on Linux
+    /// aarch64 (`tools/linux-test.sh`) and macOS arm64 alike; before #2930, 4 / 23 (0.15);
+    /// carrying the last value forward, 4 / 31 (0.11); the band keeping the zeros while
+    /// the observed curve does not, 2 / 23 (0.08); all three macOS arm64. Under symmetry a
+    /// below-share under 0.25 with 49 misses has probability about 2e-4.
+    ///
+    /// A separate sample-size floor of 20 misses comes first, so the share is read only
+    /// where it can mean something (with 20 misses a share under 0.25 has probability
+    /// about 6e-3 under symmetry). It sits below every measured count, 25 to 49, so it
+    /// passes under each of the rules above and the share assertion alone is what fails
+    /// on them; a floor failure says the design lost its misses, not that they are
+    /// one-sided.
+    #[test]
+    fn gap_band_past_a_curve_last_time_has_misses_on_both_sides() {
+        const BASE: u64 = 2_000_000;
+        let model = parse_model_string(&model(1.0)).unwrap();
+        let grid = vec![10.0, 12.0, 15.0];
+        let (mut past_end, mut past_end_at_zero) = (0usize, 0usize);
+        let (mut below, mut above) = (0usize, 0usize);
+        for m in 0..M {
+            let (pop, _) = draw_dataset(BASE + m as u64, 1.0);
+            let opts = VpcRtteOptions {
+                n_sim: N_SIM,
+                grid: VpcGrid::Times(grid.clone()),
+                max_order: Some(3),
+                sim: SimulateOptions {
+                    seed: Some(BASE ^ m as u64),
+                    horizon: Some(H),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let v = vpc_rtte(&model, &pop, &model.default_params, &opts).unwrap();
+            let s = &v.strata[0];
+            assert_eq!((s.absolute.len(), s.gap.len()), (3, 2));
+            // A1 over every order curve.
+            for b in s.absolute.iter().chain(&s.gap) {
+                let Some(&last) = b.observed.time.last() else { continue };
+                for (k, &t) in grid.iter().enumerate() {
+                    if t <= last {
+                        continue;
+                    }
+                    past_end += 1;
+                    if b.observed.surv.last() == Some(&0.0) {
+                        past_end_at_zero += 1;
+                    }
+                    assert_eq!(
+                        b.obs_on_grid[k], None,
+                        "dataset {m}, order {}: observed defined at {t}, past its last time {last}",
+                        b.order
+                    );
+                }
+            }
+            // A2 on gap order 3.
+            let g3 = &s.gap[1];
+            assert_eq!(g3.order, 3);
+            for k in 0..grid.len() {
+                let (Some(obs), Some(lo), Some(hi)) = (g3.obs_on_grid[k], g3.lo[k], g3.hi[k])
+                else {
+                    continue;
+                };
+                assert!(obs.is_finite() && lo.is_finite() && hi.is_finite());
+                if obs < lo {
+                    below += 1;
+                } else if obs > hi {
+                    above += 1;
+                }
+            }
+        }
+        let share = below as f64 / (below + above) as f64;
+        eprintln!(
+            "past the observed last time: {past_end} cells, {past_end_at_zero} at zero; gap 3 \
+             misses at 10, 12, 15: below {below}, above {above}, below-share {share:.2}"
+        );
+        assert!(
+            past_end_at_zero >= 50,
+            "only {past_end_at_zero} reached-0 cells past the last time: A1 no longer straddles"
+        );
+        assert!(
+            below + above >= 20,
+            "gap 3: only {} misses ({below} below, {above} above) at 10, 12, 15, under the \
+             floor of 20: too few to read a below-share, the design has drifted",
+            below + above
+        );
+        assert!(
+            share >= 0.25,
+            "gap 3: {below} misses below and {above} above the band, below-share {share:.2} \
+             under 0.25: replicates that reached 0 hold the band's lower edge at 0"
+        );
     }
 
     /// The 99 % binomial interval for `M = 200` datasets around the exchangeable
