@@ -1382,9 +1382,9 @@ pub(crate) struct ClassScorer<'a> {
     quadrature: Option<crate::estimation::agq::SubjectScoreContext<'a>>,
 }
 
-/// Central-FD outer gradient of the mixture OFV in real packed space — the test oracle
-/// for the exact gradient ([`mixture_gradient_salvaged`]; no model reaches it in a fit,
-/// #3004). Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
+/// Central-FD outer gradient of the mixture OFV in real packed space: the `gradient = fd`
+/// opt-out's outer gradient ([`mixture_outer_gradient`]) and the test oracle for the exact
+/// one ([`mixture_gradient_salvaged`]). Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
 ///
 /// `hᵢ = 1e-5·floorᵢ`, `floor` from `fd_step_floors`: a flat `1e-5` on every coordinate
 /// but a small identity-packed θ, whose packed coordinate is the θ itself, so a flat step
@@ -1395,6 +1395,12 @@ pub(crate) struct ClassScorer<'a> {
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
+///
+/// It takes no #2406 resolution gate. Its probes re-solve every class's EBEs cold, not warm
+/// from the mode, so they do not stop inside τ of the centre's; that mechanism was not
+/// isolated. Measured on `MIX_PARITY_MODEL` with an O(1) exponent on CL declared at `1e-4`
+/// and `1e-6` (#2678): within 1.4e-7 and 2.8e-5 of the exact gradient, against 4.6e-7
+/// declared at 1.
 pub(crate) fn mixture_gradient_fd(
     model: &CompiledModel, population: &Population, x: &[f64], init_params: &ModelParameters,
     options: &FitOptions, schedules: Option<&ScheduleCache>,
