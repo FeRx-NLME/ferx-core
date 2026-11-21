@@ -1219,6 +1219,19 @@ fn sqrt_at_zero_is_flat_in_a_compiled_plan() {
     assert!((g[0][0] - 1.0).abs() < 1e-12 && (h[0][0] + 2.0).abs() < 1e-12);
 }
 
+/// The bytecode VM's `sqrt` (`PkNum::sqrt_vm`) records one total node, not branches (#3002):
+/// recorded at a positive argument and run at zero or below, the plan's checks hold and it reads
+/// the VM's flat `+0`. As branches they were guards, and inside an ODE loop body a failed guard
+/// declines the segment: a QSS TMDD's `sqrt` in `[odes]` sent 23 of 36 subjects to FD.
+#[test]
+fn a_recorded_vm_sqrt_holds_at_a_non_positive_argument() {
+    for (at, v, d) in [(0.36, 0.6, 1.0 / 1.2), (0.0, 0.0, 0.0), (-0.25, 0.0, 0.0)] {
+        let out = run2(|e| vec![e[0].sqrt_vm()], [0.25, 0.0], [at, 0.0]);
+        close(out[0][0], v, "value");
+        close(out[0][1], d, "d/du");
+    }
+}
+
 /// A plan resolves each `(layout, direction)` once, in a slot read without a lock: the same
 /// key gives the same kernels (one slice), and a key past the slots still serves, resolved per
 /// call (so the tail of a plan's layouts never goes missing).
