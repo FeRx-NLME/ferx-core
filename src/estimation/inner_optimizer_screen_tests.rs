@@ -9,9 +9,8 @@ use super::*;
 use crate::parser::model_parser::parse_full_model;
 use crate::types::{DoseEvent, FitOptions, Population, Subject};
 
-const TIMES: [f64; 15] = [
-    0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0,
-];
+const TIMES: [f64; 15] =
+    [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 48.0, 72.0, 96.0];
 
 /// One-compartment oral concentration after a 100-unit dose, noise-free.
 fn conc(cl: f64, v: f64, ka: f64, t: f64) -> f64 {
@@ -71,10 +70,7 @@ fn flip_flop_subject(id: &str, cfg: &Config) -> Subject {
 
 /// Two ordinary subjects whose individual objective has a single mode.
 fn controls() -> [Subject; 2] {
-    [
-        subject("ctl-a", 1.0, 10.0, 1.0),
-        subject("ctl-b", 1.2, 9.0, 0.8),
-    ]
+    [subject("ctl-a", 1.0, 10.0, 1.0), subject("ctl-b", 1.2, 9.0, 0.8)]
 }
 
 fn model(omega: [f64; 3]) -> (CompiledModel, FitOptions) {
@@ -113,11 +109,7 @@ fn model_with(omega: [f64; 3], indiv: &str, pk: &str) -> (CompiledModel, FitOpti
 
 /// A solve as the fit's stage runs it, with the screen set to `screen` and no twin seed.
 fn solve(
-    model: &CompiledModel,
-    opts: &FitOptions,
-    subj: &Subject,
-    screen: usize,
-    restarts: usize,
+    model: &CompiledModel, opts: &FitOptions, subj: &Subject, screen: usize, restarts: usize,
     eta_init: Option<&[f64]>,
 ) -> EbeResult {
     solve_with(model, opts, subj, screen, false, restarts, eta_init)
@@ -125,19 +117,10 @@ fn solve(
 
 /// [`solve`] with the #2095 twin seed set to `twin`.
 fn solve_with(
-    model: &CompiledModel,
-    opts: &FitOptions,
-    subj: &Subject,
-    screen: usize,
-    twin: bool,
-    restarts: usize,
-    eta_init: Option<&[f64]>,
+    model: &CompiledModel, opts: &FitOptions, subj: &Subject, screen: usize, twin: bool,
+    restarts: usize, eta_init: Option<&[f64]>,
 ) -> EbeResult {
-    let stage = FitOptions {
-        inner_screen: screen,
-        inner_twin_seed: twin,
-        ..opts.clone()
-    };
+    let stage = FitOptions { inner_screen: screen, inner_twin_seed: twin, ..opts.clone() };
     find_ebe_for_stage(
         model,
         subj,
@@ -228,10 +211,7 @@ fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
             0.0
         }
     };
-    assert_eq!(
-        screen_starts(&not_finite, &omega, 3, 100, "S1"),
-        draws[2..5].to_vec()
-    );
+    assert_eq!(screen_starts(&not_finite, &omega, 3, 100, "S1"), draws[2..5].to_vec());
 
     // Keyed by the ID: another ID draws another stream, the same ID the same one.
     assert_ne!(screen_starts(&|_| 0.0, &omega, 3, 100, "S2"), flat);
@@ -272,19 +252,11 @@ fn the_screen_carries_a_flip_flop_subject_to_the_deeper_mode() {
                 cfg.deeper,
                 cfg.trapped
             );
-            assert!(
-                on.screen_moved,
-                "{} {id}: the screen moved the EBE",
-                cfg.name
-            );
+            assert!(on.screen_moved, "{} {id}: the screen moved the EBE", cfg.name);
             assert!(on.converged, "{} {id}: the deeper mode converged", cfg.name);
             // The two modes really are apart in the prior metric, so the distance gate
             // is not what admitted the move by accident.
-            let d = omega_distance(
-                on.eta.as_slice(),
-                off.eta.as_slice(),
-                &m.default_params.omega,
-            );
+            let d = omega_distance(on.eta.as_slice(), off.eta.as_slice(), &m.default_params.omega);
             assert!(d > 1.0, "{} {id}: modes {d} apart in Ω⁻¹", cfg.name);
         }
     }
@@ -301,13 +273,7 @@ fn the_screen_leaves_a_unimodal_subject_bit_identical() {
             let off = solve(&m, &opts, &subj, 0, 1, None);
             let on = solve(&m, &opts, &subj, 100, 1, None);
             assert_eq!(bits(&on.eta), bits(&off.eta), "{} {}", cfg.name, subj.id);
-            assert_eq!(
-                on.nll.to_bits(),
-                off.nll.to_bits(),
-                "{} {}",
-                cfg.name,
-                subj.id
-            );
+            assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{} {}", cfg.name, subj.id);
             assert_eq!(on.converged, off.converged);
             assert!(!on.screen_moved, "{} {}", cfg.name, subj.id);
         }
@@ -333,10 +299,7 @@ fn the_screen_runs_only_on_a_cold_multistart() {
 
     let no_restarts = solve(&m, &opts, &subj, 100, 0, None);
     assert!(!no_restarts.screen_moved);
-    assert_eq!(
-        bits(&no_restarts.eta),
-        bits(&solve(&m, &opts, &subj, 0, 0, None).eta)
-    );
+    assert_eq!(bits(&no_restarts.eta), bits(&solve(&m, &opts, &subj, 0, 0, None).eta));
     assert!((no_restarts.nll - cfg.trapped).abs() < 1e-4);
 
     // Straddle: the same cold solve with restarts on does move, so neither result above is
@@ -351,9 +314,8 @@ fn the_screen_runs_only_on_a_cold_multistart() {
 fn the_screen_is_reproducible_across_threads_and_data_order() {
     let cfg = &CONFIGS[0];
     let (m, opts) = model(cfg.omega);
-    let mut subjects: Vec<Subject> = (1..=6)
-        .map(|i| flip_flop_subject(&format!("S{i}"), cfg))
-        .collect();
+    let mut subjects: Vec<Subject> =
+        (1..=6).map(|i| flip_flop_subject(&format!("S{i}"), cfg)).collect();
     subjects.extend(controls());
     let pop = |subjects: Vec<Subject>| Population {
         subjects,
@@ -390,11 +352,8 @@ fn the_screen_is_reproducible_across_threads_and_data_order() {
                 |s, ebe| (s.id.clone(), ebe.screen_moved),
             )
         });
-        let mut by_id: Vec<(String, bool, Vec<u64>)> = moved
-            .into_iter()
-            .zip(&etas)
-            .map(|((id, mv), e)| (id, mv, bits(e)))
-            .collect();
+        let mut by_id: Vec<(String, bool, Vec<u64>)> =
+            moved.into_iter().zip(&etas).map(|((id, mv), e)| (id, mv, bits(e))).collect();
         by_id.sort();
         by_id
     };
@@ -416,17 +375,10 @@ fn the_stage_policy_carries_the_screen_size() {
     let (m, opts) = model(CONFIGS[0].omega);
     assert_eq!(opts.inner_screen, 100, "on by default");
     for n in [0, 7] {
-        let stage = FitOptions {
-            inner_screen: n,
-            ..opts.clone()
-        };
+        let stage = FitOptions { inner_screen: n, ..opts.clone() };
         assert_eq!(InnerSolvePolicy::for_stage(&stage, &m).screen, n);
     }
-    assert_eq!(
-        InnerSolvePolicy::default().screen,
-        0,
-        "the historical solve"
-    );
+    assert_eq!(InnerSolvePolicy::default().screen, 0, "the historical solve");
 }
 
 /// End to end through `fit()`: the final re-solve's warning names the flip-flop subject
@@ -476,10 +428,7 @@ fn a_fit_names_the_subjects_the_screen_moved() {
         for (screen, twin, what) in [(100, false, "the screen"), (0, true, "the twin seed")] {
             let w = warning(screen, twin, outer_maxiter)
                 .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: {what} moved S1"));
-            assert!(
-                w.contains("of 1 subject (S1)"),
-                "maxiter = {outer_maxiter}, {what}: {w}"
-            );
+            assert!(w.contains("of 1 subject (S1)"), "maxiter = {outer_maxiter}, {what}: {w}");
         }
         assert!(
             warning(0, false, outer_maxiter).is_none(),
@@ -498,10 +447,7 @@ fn a_fit_names_the_subjects_the_screen_moved() {
 fn the_distance_gate_keeps_a_loosely_converged_unimodal_subject() {
     for cfg in &CONFIGS {
         let (m, opts) = model(cfg.omega);
-        let loose = FitOptions {
-            inner_tol: 1e-2,
-            ..opts.clone()
-        };
+        let loose = FitOptions { inner_tol: 1e-2, ..opts.clone() };
         let subj = &controls()[0];
         let off = solve(&m, &loose, subj, 0, 1, None);
         SCREEN_SAME_BASIN_REJECTS.with(|n| n.set(0));
@@ -509,11 +455,7 @@ fn the_distance_gate_keeps_a_loosely_converged_unimodal_subject() {
         // Straddle: the gate actually turned a lower descent away (3 of 3 on macOS arm64
         // in both configurations), so the bit-identity below is the gate's doing.
         let rejects = SCREEN_SAME_BASIN_REJECTS.with(|n| n.get());
-        assert!(
-            rejects > 0,
-            "{}: no screen descent came back lower within the basin",
-            cfg.name
-        );
+        assert!(rejects > 0, "{}: no screen descent came back lower within the basin", cfg.name);
         assert_eq!(bits(&on.eta), bits(&off.eta), "{}", cfg.name);
         assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{}", cfg.name);
         assert!(!on.screen_moved, "{}", cfg.name);
@@ -542,11 +484,7 @@ const NOT_A_MODE_GRAD: f64 = 1e-2;
 /// candidate from the block replaced it, and that candidate's own descent did not converge.
 /// The old `ebe_converged || ok` reported exactly those cells converged.
 fn check_converged_flag(
-    what: &str,
-    m: &CompiledModel,
-    subj: &Subject,
-    off: &EbeResult,
-    on: &EbeResult,
+    what: &str, m: &CompiledModel, subj: &Subject, off: &EbeResult, on: &EbeResult,
 ) -> bool {
     let g = grad_norm_at(m, subj, &on.eta);
     assert!(
@@ -570,11 +508,7 @@ fn a_screen_descent_that_stopped_short_is_not_reported_converged() {
     let mut straddles = 0;
     for tol in [1e-5, 1e-3] {
         for max_iter in 5..=15 {
-            let o = FitOptions {
-                inner_maxiter: max_iter,
-                inner_tol: tol,
-                ..opts.clone()
-            };
+            let o = FitOptions { inner_maxiter: max_iter, inner_tol: tol, ..opts.clone() };
             for id in ["S1", "S2", "S3", "S4"] {
                 let subj = flip_flop_subject(id, cfg);
                 let off = solve(&m, &o, &subj, 0, 1, None);
@@ -588,17 +522,11 @@ fn a_screen_descent_that_stopped_short_is_not_reported_converged() {
         }
     }
     // Without a straddling cell the bound above would pass vacuously.
-    assert!(
-        straddles > 0,
-        "no cell had a failed screen descent replace a converged incumbent"
-    );
+    assert!(straddles > 0, "no cell had a failed screen descent replace a converged incumbent");
     // The other side: at the default `inner_maxiter` the same descent converges.
     let subj = flip_flop_subject("S1", cfg);
     let full = solve(&m, &opts, &subj, 100, 1, None);
-    assert!(
-        full.screen_moved && full.converged,
-        "default inner_maxiter converges"
-    );
+    assert!(full.screen_moved && full.converged, "default inner_maxiter converges");
 }
 
 /// #2100, the axis scan's acceptance block. A per-row covariate the model never reads makes
@@ -618,11 +546,7 @@ fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
     // From 1: since #2093 a bounded first step converges the axis seeds sooner, so the
     // straddling budgets sit below the 40..=60 this scan started at.
     for max_iter in 1..=60 {
-        let o = FitOptions {
-            inner_maxiter: max_iter,
-            inner_tol: 1e-5,
-            ..opts.clone()
-        };
+        let o = FitOptions { inner_maxiter: max_iter, inner_tol: 1e-5, ..opts.clone() };
         let off = solve(&m, &o, &subj, 0, 0, None);
         let on = solve(&m, &o, &subj, 0, 1, None);
         assert!(!on.screen_moved);
@@ -631,10 +555,7 @@ fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
             straddles += 1;
         }
     }
-    assert!(
-        straddles > 0,
-        "no cell had a failed axis seed replace a converged incumbent"
-    );
+    assert!(straddles > 0, "no cell had a failed axis seed replace a converged incumbent");
     let full = solve(&m, &opts, &subj, 0, 1, None);
     assert!(
         (full.nll - cfg.deeper).abs() < 1e-4 && full.converged,
@@ -677,11 +598,7 @@ fn gn_and_trust_region_name_the_subjects_the_screen_moved() {
     let population = flip_flop_population();
     for (path, method, optimizer) in [
         ("gn", crate::types::EstimationMethod::FoceGn, opts.optimizer),
-        (
-            "trust_region",
-            opts.method,
-            crate::types::Optimizer::TrustRegion,
-        ),
+        ("trust_region", opts.method, crate::types::Optimizer::TrustRegion),
     ] {
         let screen_warning = |screen: usize| {
             let options = FitOptions {
@@ -778,16 +695,9 @@ fn final_ebe_check_reports_both_directions_and_the_screen() {
 
     for adopt in [false, true] {
         let (ofv, w, converged) = check(&trapped, 100, adopt);
-        assert!(
-            !converged,
-            "adopt {adopt}: the cold solve beat the incumbent: {w:?}"
-        );
+        assert!(!converged, "adopt {adopt}: the cold solve beat the incumbent: {w:?}");
         assert_eq!(w.len(), 2, "adopt {adopt}: {w:?}");
-        assert!(
-            is_basin(&w[0]) && w[0].contains("1 subject's EBEs"),
-            "adopt {adopt}: {}",
-            w[0]
-        );
+        assert!(is_basin(&w[0]) && w[0].contains("1 subject's EBEs"), "adopt {adopt}: {}", w[0]);
         assert!(is_screen(&w[1]), "adopt {adopt}: {}", w[1]);
         if adopt {
             assert_eq!(ofv, deeper.3, "the trust region reports the cold solve");
@@ -802,10 +712,7 @@ fn final_ebe_check_reports_both_directions_and_the_screen() {
         }
 
         let (ofv, w, converged) = check(&deeper, 0, adopt);
-        assert!(
-            converged,
-            "adopt {adopt}: a worse cold solve does not demote: {w:?}"
-        );
+        assert!(converged, "adopt {adopt}: a worse cold solve does not demote: {w:?}");
         assert_eq!(w.len(), 1, "adopt {adopt}: {w:?}");
         assert!(is_worse(&w[0]), "adopt {adopt}: {}", w[0]);
         // Gauss–Newton reports the incumbent outright; the trust region gets it back
@@ -817,10 +724,7 @@ fn final_ebe_check_reports_both_directions_and_the_screen() {
         );
 
         let (ofv, w, converged) = check(&trapped, 0, adopt);
-        assert!(
-            converged && w.is_empty(),
-            "adopt {adopt}: nothing to report: {w:?}"
-        );
+        assert!(converged && w.is_empty(), "adopt {adopt}: nothing to report: {w:?}");
         assert_eq!(ofv, trapped.3, "adopt {adopt}");
     }
 }
@@ -849,9 +753,7 @@ fn final_ebe_check_takes_each_subjects_lowest_when_the_totals_tie() {
 
     let (m, opts) = model(CONFIGS[0].omega);
     let mut population = flip_flop_population();
-    population
-        .subjects
-        .insert(1, flip_flop_subject("S2", &CONFIGS[0]));
+    population.subjects.insert(1, flip_flop_subject("S2", &CONFIGS[0]));
     let params = &m.default_params;
     let with_screen = |screen: usize| FitOptions {
         inner_screen: screen,
@@ -891,12 +793,7 @@ fn final_ebe_check_takes_each_subjects_lowest_when_the_totals_tie() {
         }
     }
     let tied = incumbent_at(hi);
-    assert!(
-        (tied.3 - cold.3).abs() < 1e-6,
-        "premise: the totals tie ({} vs {})",
-        tied.3,
-        cold.3
-    );
+    assert!((tied.3 - cold.3).abs() < 1e-6, "premise: the totals tie ({} vs {})", tied.3, cold.3);
 
     let check = |incumbent: &EbeCandidate, adopt: bool| {
         let mut converged = true;
@@ -967,10 +864,7 @@ fn the_cold_gap_names_nobody_under_agq() {
     let population = flip_flop_population();
     let params = &m.default_params;
     let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
-    for (method, names) in [
-        (EstimationMethod::Laplace, false),
-        (EstimationMethod::FoceI, true),
-    ] {
+    for (method, names) in [(EstimationMethod::Laplace, false), (EstimationMethod::FoceI, true)] {
         let at = |screen: usize| FitOptions {
             method,
             inner_screen: screen,
@@ -979,13 +873,8 @@ fn the_cold_gap_names_nobody_under_agq() {
             ..opts.clone()
         };
         let s = final_inner_solve(&m, &population, params, &mu_k, None, &at(100));
-        let deeper = score_final_ebes(
-            &m,
-            &population,
-            params,
-            (s.etas, s.h_mats, s.kappas),
-            &at(100),
-        );
+        let deeper =
+            score_final_ebes(&m, &population, params, (s.etas, s.h_mats, s.kappas), &at(100));
         for adopt in [false, true] {
             let mut converged = true;
             let (_, w) = final_ebe_check(
@@ -997,12 +886,9 @@ fn the_cold_gap_names_nobody_under_agq() {
                 &at(0),
                 &mut converged,
             );
-            let worse = w
-                .iter()
-                .find(|w| w.contains("units worse"))
-                .unwrap_or_else(|| {
-                    panic!("{method:?} adopt {adopt}: the cold solve missed: {w:?}")
-                });
+            let worse = w.iter().find(|w| w.contains("units worse")).unwrap_or_else(|| {
+                panic!("{method:?} adopt {adopt}: the cold solve missed: {w:?}")
+            });
             assert_eq!(
                 worse.contains("on 1 subject (S1)"),
                 names,
@@ -1026,15 +912,9 @@ fn only_agq_replaces_the_cold_solve_wholesale() {
     let population = flip_flop_population();
     let params = &m.default_params;
     let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
-    for (method, replaced) in [
-        (EstimationMethod::Laplace, true),
-        (EstimationMethod::FoceI, false),
-    ] {
-        let at = FitOptions {
-            method,
-            threads: Some(1),
-            ..opts.clone()
-        };
+    for (method, replaced) in [(EstimationMethod::Laplace, true), (EstimationMethod::FoceI, false)]
+    {
+        let at = FitOptions { method, threads: Some(1), ..opts.clone() };
         let s = final_inner_solve(&m, &population, params, &mu_k, None, &at);
         let good = score_final_ebes(&m, &population, params, (s.etas, s.h_mats, s.kappas), &at);
         let shifted = good.0.iter().map(|e| e.add_scalar(0.5)).collect();
@@ -1053,10 +933,7 @@ fn only_agq_replaces_the_cold_solve_wholesale() {
         assert!(won.reported.3 < bad.3, "{method:?}: the cold solve lost");
         assert_eq!(won.cold_replaced, replaced, "{method:?}");
         let tied = pick(good.clone(), Some(good.clone()));
-        assert!(
-            !tied.cold_replaced,
-            "{method:?}: a tie keeps the cold solve"
-        );
+        assert!(!tied.cold_replaced, "{method:?}: a tie keeps the cold solve");
     }
 }
 
@@ -1117,11 +994,7 @@ fn the_nlopt_leg_names_the_subject_it_kept_off_the_cold_solve() {
     let kept = run(Some(0.01));
     let w = worse(&kept).unwrap_or_else(|| panic!("the cold solve missed S1: {kept:?}"));
     assert!(w.contains("on 1 subject (S1)"), "{w}");
-    assert_eq!(
-        screen(&kept),
-        None,
-        "S1's reported EBEs are not the screen's"
-    );
+    assert_eq!(screen(&kept), None, "S1's reported EBEs are not the screen's");
 }
 
 // ── #2095: the flip-flop twin seed ───────────────────────────────────────────────────────
@@ -1191,10 +1064,7 @@ fn the_twin_start_declines_what_it_cannot_invert() {
         ("no η", "TVKA"),
         ("η_V's own", "TVKA * exp(ETA_V)"),
     ] {
-        assert!(
-            start(&indiv_with_ka(ka), ONE_CPT_ORAL, &ETA).is_none(),
-            "KA = {ka}: {what}"
-        );
+        assert!(start(&indiv_with_ka(ka), ONE_CPT_ORAL, &ETA).is_none(), "KA = {ka}: {what}");
     }
     // `η_V` also moving `CL` is not `V`'s own random effect.
     assert!(start(
@@ -1274,21 +1144,9 @@ fn the_twin_seed_leaves_a_unimodal_subject_bit_identical() {
             let off = solve_with(&m, &opts, &subj, 0, false, 1, None);
             TWIN_SEEDS_RUN.with(|n| n.set(0));
             let on = solve_with(&m, &opts, &subj, 0, true, 1, None);
-            assert_eq!(
-                TWIN_SEEDS_RUN.with(|n| n.get()),
-                1,
-                "{} {}",
-                cfg.name,
-                subj.id
-            );
+            assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 1, "{} {}", cfg.name, subj.id);
             assert_eq!(bits(&on.eta), bits(&off.eta), "{} {}", cfg.name, subj.id);
-            assert_eq!(
-                on.nll.to_bits(),
-                off.nll.to_bits(),
-                "{} {}",
-                cfg.name,
-                subj.id
-            );
+            assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{} {}", cfg.name, subj.id);
             assert_eq!(on.converged, off.converged);
             assert!(!on.twin_moved, "{} {}", cfg.name, subj.id);
         }
@@ -1302,11 +1160,8 @@ fn the_twin_seed_leaves_a_unimodal_subject_bit_identical() {
 fn a_ka_not_log_normal_on_its_own_eta_takes_no_twin_seed() {
     let cfg = &CONFIGS[0];
     let subj = flip_flop_subject("S1", cfg);
-    let (proportional, opts) = model_with(
-        cfg.omega,
-        &indiv_with_ka("TVKA * (1 + ETA_KA)"),
-        ONE_CPT_ORAL,
-    );
+    let (proportional, opts) =
+        model_with(cfg.omega, &indiv_with_ka("TVKA * (1 + ETA_KA)"), ONE_CPT_ORAL);
     let off = solve_with(&proportional, &opts, &subj, 0, false, 1, None);
     TWIN_SEEDS_RUN.with(|n| n.set(0));
     let on = solve_with(&proportional, &opts, &subj, 0, true, 1, None);
@@ -1319,11 +1174,7 @@ fn a_ka_not_log_normal_on_its_own_eta_takes_no_twin_seed() {
     let (log_normal, opts) = model(cfg.omega);
     TWIN_SEEDS_RUN.with(|n| n.set(0));
     solve_with(&log_normal, &opts, &subj, 0, true, 1, None);
-    assert_eq!(
-        TWIN_SEEDS_RUN.with(|n| n.get()),
-        1,
-        "straddle: the log-normal KA is seeded"
-    );
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 1, "straddle: the log-normal KA is seeded");
 }
 
 #[test]
@@ -1331,16 +1182,10 @@ fn the_stage_policy_carries_the_twin_seed() {
     let (m, opts) = model(CONFIGS[0].omega);
     assert!(opts.inner_twin_seed, "on by default");
     for on in [false, true] {
-        let stage = FitOptions {
-            inner_twin_seed: on,
-            ..opts.clone()
-        };
+        let stage = FitOptions { inner_twin_seed: on, ..opts.clone() };
         assert_eq!(InnerSolvePolicy::for_stage(&stage, &m).twin_seed, on);
     }
-    assert!(
-        !InnerSolvePolicy::default().twin_seed,
-        "the historical solve"
-    );
+    assert!(!InnerSolvePolicy::default().twin_seed, "the historical solve");
 }
 
 /// A dose into the central compartment has no flip-flop twin: it decays as `exp(-k·t)`
@@ -1354,33 +1199,19 @@ fn a_dose_outside_the_depot_takes_no_twin_seed() {
     let (m, opts) = model(cfg.omega);
     let theta = &m.default_params.theta;
     let depot = flip_flop_subject("S1", cfg);
-    assert!(
-        flip_flop_twin_start(&m, &depot, theta, &ETA).is_some(),
-        "premise"
-    );
+    assert!(flip_flop_twin_start(&m, &depot, theta, &ETA).is_some(), "premise");
 
     let mut depot_infusion = depot.clone();
-    depot_infusion
-        .doses
-        .push(DoseEvent::new(24.0, 50.0, 1, 25.0, false, 0.0));
+    depot_infusion.doses.push(DoseEvent::new(24.0, 50.0, 1, 25.0, false, 0.0));
     assert!(flip_flop_twin_start(&m, &depot_infusion, theta, &ETA).is_some());
 
     for (what, dose) in [
-        (
-            "central bolus",
-            DoseEvent::new(24.0, 50.0, 2, 0.0, false, 0.0),
-        ),
-        (
-            "central infusion",
-            DoseEvent::new(24.0, 50.0, 2, 25.0, false, 0.0),
-        ),
+        ("central bolus", DoseEvent::new(24.0, 50.0, 2, 0.0, false, 0.0)),
+        ("central infusion", DoseEvent::new(24.0, 50.0, 2, 25.0, false, 0.0)),
     ] {
         let mut mixed = depot.clone();
         mixed.doses.push(dose);
-        assert!(
-            flip_flop_twin_start(&m, &mixed, theta, &ETA).is_none(),
-            "{what}"
-        );
+        assert!(flip_flop_twin_start(&m, &mixed, theta, &ETA).is_none(), "{what}");
         let off = solve_with(&m, &opts, &mixed, 0, false, 1, None);
         TWIN_SEEDS_RUN.with(|n| n.set(0));
         let on = solve_with(&m, &opts, &mixed, 0, true, 1, None);
@@ -1415,17 +1246,11 @@ fn a_readout_or_init_that_moves_at_the_twin_takes_no_twin_seed() {
     );
     for (what, extra) in [
         ("amount readout", "[scaling]\n  y = central"),
-        (
-            "init reading V",
-            "[initial_conditions]\n  init(depot) = 0.5 * V",
-        ),
+        ("init reading V", "[initial_conditions]\n  init(depot) = 0.5 * V"),
     ] {
         let (m, opts) = with(extra);
         let theta = &m.default_params.theta;
-        assert!(
-            flip_flop_twin_start(&m, &subj, theta, &ETA).is_none(),
-            "{what}"
-        );
+        assert!(flip_flop_twin_start(&m, &subj, theta, &ETA).is_none(), "{what}");
         let off = solve_with(&m, &opts, &subj, 0, false, 1, None);
         TWIN_SEEDS_RUN.with(|n| n.set(0));
         let on = solve_with(&m, &opts, &subj, 0, true, 1, None);
@@ -1452,10 +1277,7 @@ fn a_subject_with_per_event_pk_takes_no_twin_seed() {
     let wt = |w: f64| std::collections::HashMap::from([("WT".to_string(), w)]);
     let mut base = flip_flop_subject("S1", cfg);
     base.covariates = wt(70.0);
-    assert!(
-        flip_flop_twin_start(&m, &base, theta, &ETA).is_some(),
-        "premise"
-    );
+    assert!(flip_flop_twin_start(&m, &base, theta, &ETA).is_some(), "premise");
 
     let mut reset = base.clone();
     reset.reset_times = vec![30.0];
@@ -1470,10 +1292,7 @@ fn a_subject_with_per_event_pk_takes_no_twin_seed() {
     pk_only.pk_only_covariates = vec![wt(140.0)];
     for (what, subj) in [("EVID=2", &pk_only), ("EVID=3/4", &reset_cov)] {
         assert!(!subj.has_tv_covariates(), "{what}: premise");
-        assert!(
-            flip_flop_twin_start(&m, subj, theta, &ETA).is_none(),
-            "{what}"
-        );
+        assert!(flip_flop_twin_start(&m, subj, theta, &ETA).is_none(), "{what}");
     }
     let off = solve_with(&m, &opts, &pk_only, 0, false, 1, None);
     TWIN_SEEDS_RUN.with(|n| n.set(0));
@@ -1559,10 +1378,8 @@ enum Swap {
 /// carries a per-row covariate the model never reads, so it scans every coordinate
 /// (`has_tv_covariates`), as in [`an_axis_seed_that_stopped_short_is_not_reported_converged`].
 fn fallback_sweep_subjects(site: Swap) -> Vec<Subject> {
-    let mut subjects: Vec<Subject> = ["S1", "S2", "S3", "S4"]
-        .iter()
-        .map(|id| flip_flop_subject(id, &CONFIGS[0]))
-        .collect();
+    let mut subjects: Vec<Subject> =
+        ["S1", "S2", "S3", "S4"].iter().map(|id| flip_flop_subject(id, &CONFIGS[0])).collect();
     subjects.extend(controls());
     if matches!(site, Swap::Axis) {
         for s in &mut subjects {
@@ -1600,11 +1417,7 @@ fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> SweepC
     for subj in fallback_sweep_subjects(site) {
         for tol in [1e-5, 1e-3, 1e-2, 1e-1] {
             for max_iter in 1..=30 {
-                let o = FitOptions {
-                    inner_maxiter: max_iter,
-                    inner_tol: tol,
-                    ..opts.clone()
-                };
+                let o = FitOptions { inner_maxiter: max_iter, inner_tol: tol, ..opts.clone() };
                 let off = match site {
                     Swap::Twin => solve_with(&m, &o, &subj, 0, false, 1, None),
                     Swap::Screen => solve(&m, &o, &subj, 0, 1, None),
@@ -1628,10 +1441,7 @@ fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> SweepC
                     subj.id
                 );
                 for r in [&off, &on] {
-                    assert!(
-                        !(r.used_fallback && r.nm_polished),
-                        "{what}: both flags set"
-                    );
+                    assert!(!(r.used_fallback && r.nm_polished), "{what}: both flags set");
                 }
                 let moved = match site {
                     Swap::Twin => on.twin_moved,
@@ -1702,12 +1512,7 @@ fn sweep_fallback_flag(site: Swap, mode: crate::types::InnerOptimizer) -> SweepC
          {} cells the axis scan had last",
         nm.0, nm.1, nm.2
     );
-    SweepCounts {
-        replaced,
-        kept,
-        nm_moved: nm.0,
-        nm_as_given: nm.1,
-    }
+    SweepCounts { replaced, kept, nm_moved: nm.0, nm_as_given: nm.1 }
 }
 
 /// What [`sweep_fallback_flag`] saw: the fallback cells it replaced and kept, and under
@@ -1724,11 +1529,7 @@ struct SweepCounts {
 /// the individual objective, then certified, so a converged returned η that is none of
 /// these stops is one the certificate moved. `off` is the cell's solve without the block.
 fn candidate_nm_stops(
-    site: Swap,
-    m: &CompiledModel,
-    o: &FitOptions,
-    subj: &Subject,
-    off: &EbeResult,
+    site: Swap, m: &CompiledModel, o: &FitOptions, subj: &Subject, off: &EbeResult,
 ) -> Vec<Vec<u64>> {
     use crate::stats::likelihood::individual_nll;
     let p = &m.default_params;
@@ -1738,9 +1539,7 @@ fn candidate_nm_stops(
         // solve's η.
         Swap::Twin => {
             let base = solve(m, o, subj, 0, 0, None);
-            flip_flop_twin_start(m, subj, &p.theta, base.eta.as_slice())
-                .into_iter()
-                .collect()
+            flip_flop_twin_start(m, subj, &p.theta, base.eta.as_slice()).into_iter().collect()
         }
         Swap::Screen => screen_starts(&obj, &p.omega, m.n_eta, 100, &subj.id),
         // `off` is the `inner_restarts = 0` solve; one restart seeds `±2·sd` on every
@@ -1768,10 +1567,7 @@ fn candidate_nm_stops(
 
 /// Both sides of the sweep, under the default optimizer and under `nelder_mead`.
 fn check_fallback_sweep(site: Swap) {
-    for mode in [
-        crate::types::InnerOptimizer::Auto,
-        crate::types::InnerOptimizer::NelderMead,
-    ] {
+    for mode in [crate::types::InnerOptimizer::Auto, crate::types::InnerOptimizer::NelderMead] {
         let c = sweep_fallback_flag(site, mode);
         assert!(
             c.replaced > 0 && c.kept > 0,
@@ -1830,20 +1626,8 @@ fn the_multistart_profile_counts_which_search_moved_the_ebe() {
         .collect();
     // (label, subject, screen, twin seed, expected [twin, screen, axis] moved)
     let rows: Vec<(&str, Subject, usize, bool, [bool; 3])> = vec![
-        (
-            "twin",
-            flip_flop_subject("S1", cfg),
-            0,
-            true,
-            [true, false, false],
-        ),
-        (
-            "screen",
-            flip_flop_subject("S1", cfg),
-            100,
-            false,
-            [false, true, false],
-        ),
+        ("twin", flip_flop_subject("S1", cfg), 0, true, [true, false, false]),
+        ("screen", flip_flop_subject("S1", cfg), 100, false, [false, true, false]),
         ("axis", axis_subject, 0, false, [false, false, true]),
         ("control a", controls()[0].clone(), 100, true, [false; 3]),
         ("control b", controls()[1].clone(), 100, true, [false; 3]),
@@ -1851,23 +1635,15 @@ fn the_multistart_profile_counts_which_search_moved_the_ebe() {
     for (what, subj, screen, twin, moved) in rows {
         let started0 = EBE_MULTISTARTS_STARTED.with(|n| n.get());
         let moves0 = MULTISTART_MOVES.with(|n| n.get());
-        let run0 = MULTISTART_PROFILE
-            .run
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let run0 = MULTISTART_PROFILE.run.load(std::sync::atomic::Ordering::Relaxed);
         let r = solve_with(&m, &opts, &subj, screen, twin, 1, None);
         let started = EBE_MULTISTARTS_STARTED.with(|n| n.get()) - started0;
         let moves = MULTISTART_MOVES.with(|n| n.get());
         let delta: Vec<usize> = (0..3).map(|k| moves[k] - moves0[k]).collect();
-        assert!(
-            started > 0,
-            "{what}: premise, the solve entered the multi-start"
-        );
+        assert!(started > 0, "{what}: premise, the solve entered the multi-start");
         // The process-wide counter sees at least this thread's multi-starts.
         assert!(
-            MULTISTART_PROFILE
-                .run
-                .load(std::sync::atomic::Ordering::Relaxed)
-                - run0
+            MULTISTART_PROFILE.run.load(std::sync::atomic::Ordering::Relaxed) - run0
                 >= started as u64,
             "{what}: every multi-start is counted"
         );
@@ -1894,9 +1670,7 @@ fn the_multistart_profile_counts_which_search_moved_the_ebe() {
     // line is among them once a multi-start has run (the counters are process-wide, so
     // another test's later solves can only append to the counts, not remove the line).
     assert!(
-        profile_report_lines()
-            .iter()
-            .any(|l| l.starts_with("[profile] inner multi-start: ")),
+        profile_report_lines().iter().any(|l| l.starts_with("[profile] inner multi-start: ")),
         "the report carries the multi-start line"
     );
     assert!(

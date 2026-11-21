@@ -45,9 +45,7 @@ fn warfarin_iov() -> PreparedRun {
 /// names the analytic path as the engine, so the fixture has to stay on it.
 fn assert_analytic(r: &FitResult) {
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "fixture left the analytic path: {:?}",
         r.warnings
     );
@@ -64,10 +62,7 @@ fn api_foce_sir(samples: usize, resamples: usize, seed: u64) -> FitOptions {
         sir_seed: Some(seed),
         ..FitOptions::default()
     };
-    assert!(
-        o.interaction,
-        "fixture premise: API default interaction = true"
-    );
+    assert!(o.interaction, "fixture premise: API default interaction = true");
     o
 }
 
@@ -85,14 +80,8 @@ fn foce_sir_and_standalone_entries_score_the_foce_marginal() {
     let mut init = prep.init_params.clone();
     init.theta = IOV_THETA.to_vec();
     init.omega = OmegaMatrix::from_diagonal(&IOV_OMEGA, init.omega.eta_names.clone());
-    let iov = init
-        .omega_iov
-        .as_ref()
-        .expect("warfarin_iov declares a kappa");
-    init.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[IOV_KAPPA],
-        iov.eta_names.clone(),
-    ));
+    let iov = init.omega_iov.as_ref().expect("warfarin_iov declares a kappa");
+    init.omega_iov = Some(OmegaMatrix::from_diagonal(&[IOV_KAPPA], iov.eta_names.clone()));
     init.sigma.values = vec![IOV_SIGMA];
 
     let mut opts = api_foce_sir(300, 100, 1710);
@@ -105,10 +94,7 @@ fn foce_sir_and_standalone_entries_score_the_foce_marginal() {
     // (i) Realised at 300 draws, seed 1710 (macOS arm64 and Linux aarch64 agree in every printed digit): ESS 150.575 under
     // the fix, 3.184 with the post-fit resolution in `fit_inner` reverted (the FOCEI
     // weights). The floor of 50 is 3.0× below the first and 15.7× above the second.
-    assert!(
-        ess >= 50.0,
-        "in-fit SIR ESS {ess} — weights are not the FOCE marginal's"
-    );
+    assert!(ess >= 50.0, "in-fit SIR ESS {ess} — weights are not the FOCE marginal's");
     assert!(!r.interaction, "a FOCE fit must record interaction = false");
 
     // The standalone entries get the fit as a pre-#1710 `.fitrx` / R object carries it:
@@ -124,13 +110,8 @@ fn foce_sir_and_standalone_entries_score_the_foce_marginal() {
     stale.sir_ci_kappa = None;
 
     // (ii) Standalone SIR, caller options unchanged (interaction = true).
-    let sir = run_sir(
-        &stale,
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &opts,
-    )
-    .expect("standalone run_sir must run");
+    let sir = run_sir(&stale, Some(&prep.parsed.model), Some(&prep.population), &opts)
+        .expect("standalone run_sir must run");
     let sess = sir.sir_ess.expect("standalone SIR ESS");
     eprintln!("MEASURE T4 standalone ess={sess:.4}");
     assert_eq!(
@@ -141,32 +122,18 @@ fn foce_sir_and_standalone_entries_score_the_foce_marginal() {
     assert_eq!(sir.sir_ci_theta, r.sir_ci_theta);
     assert_eq!(sir.sir_ci_omega, r.sir_ci_omega);
     assert_eq!(sir.sir_ci_sigma, r.sir_ci_sigma);
-    assert!(
-        r.sir_ci_kappa.is_some(),
-        "in-fit SIR filled no kappa interval"
-    );
+    assert!(r.sir_ci_kappa.is_some(), "in-fit SIR filled no kappa interval");
     assert_eq!(sir.sir_ci_kappa, r.sir_ci_kappa);
 
     // (iii) Standalone covariance, same options.
-    let cov = run_covariance(
-        &stale,
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &opts,
-    )
-    .expect("standalone run_covariance must run");
-    let (a, b) = (
-        cov.se_theta.as_ref().expect("standalone SE"),
-        r.se_theta.as_ref().expect("in-fit SE"),
-    );
+    let cov = run_covariance(&stale, Some(&prep.parsed.model), Some(&prep.population), &opts)
+        .expect("standalone run_covariance must run");
+    let (a, b) =
+        (cov.se_theta.as_ref().expect("standalone SE"), r.se_theta.as_ref().expect("in-fit SE"));
     eprintln!("MEASURE T4 se_theta standalone={a:?} in-fit={b:?}");
     for (k, (x, y)) in a.iter().zip(b).enumerate() {
         assert!(x.is_finite() && y.is_finite(), "SE(theta[{k}]) not finite");
-        assert_eq!(
-            x.to_bits(),
-            y.to_bits(),
-            "SE(theta[{k}]): standalone {x} vs in-fit {y}"
-        );
+        assert_eq!(x.to_bits(), y.to_bits(), "SE(theta[{k}]): standalone {x} vs in-fit {y}");
     }
     assert_eq!(cov.se_omega, r.se_omega);
     assert_eq!(cov.se_sigma, r.se_sigma);
@@ -175,16 +142,10 @@ fn foce_sir_and_standalone_entries_score_the_foce_marginal() {
 
 /// NONMEM's FOCE optimum on `examples/warfarin.ferx` (the `warfarin_foce_cwres` anchor's
 /// `.ext`), so the GN fixture below scores a converged point without a loop.
-const WARF_THETA: [f64; 3] = [
-    1.3296190773543662E-01,
-    7.7305172240926252E+00,
-    7.2537506677117802E-01,
-];
-const WARF_OMEGA: [f64; 3] = [
-    2.8596520575084699E-02,
-    9.5781911176013226E-03,
-    3.4881225592887283E-01,
-];
+const WARF_THETA: [f64; 3] =
+    [1.3296190773543662E-01, 7.7305172240926252E+00, 7.2537506677117802E-01];
+const WARF_OMEGA: [f64; 3] =
+    [2.8596520575084699E-02, 9.5781911176013226E-03, 3.4881225592887283E-01];
 const WARF_SIGMA_VAR: f64 = 1.1548425869877831E-04;
 
 /// The pass-through branch of `fitted_marginal_options`: for a method the rule does not
@@ -211,33 +172,16 @@ fn standalone_covariance_keeps_a_gn_fits_own_interaction() {
     let r = fit(&prep.parsed.model, &prep.population, &init, &opts).expect("GN fit must run");
     assert_analytic(&r);
     assert_eq!(r.method, EstimationMethod::FoceGn);
-    assert!(
-        !r.interaction,
-        "a GN fit keeps the caller's interaction = false"
-    );
-    let caller = FitOptions {
-        interaction: true,
-        ..opts.clone()
-    };
-    let cov = run_covariance(
-        &r,
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &caller,
-    )
-    .expect("standalone run_covariance must run");
-    let (a, b) = (
-        cov.se_theta.as_ref().expect("standalone SE"),
-        r.se_theta.as_ref().expect("in-fit SE"),
-    );
+    assert!(!r.interaction, "a GN fit keeps the caller's interaction = false");
+    let caller = FitOptions { interaction: true, ..opts.clone() };
+    let cov = run_covariance(&r, Some(&prep.parsed.model), Some(&prep.population), &caller)
+        .expect("standalone run_covariance must run");
+    let (a, b) =
+        (cov.se_theta.as_ref().expect("standalone SE"), r.se_theta.as_ref().expect("in-fit SE"));
     eprintln!("MEASURE GN se_theta standalone={a:?} in-fit={b:?}");
     for (k, (x, y)) in a.iter().zip(b).enumerate() {
         assert!(x.is_finite() && y.is_finite(), "SE(theta[{k}]) not finite");
-        assert_eq!(
-            x.to_bits(),
-            y.to_bits(),
-            "SE(theta[{k}]): standalone {x} vs in-fit {y}"
-        );
+        assert_eq!(x.to_bits(), y.to_bits(), "SE(theta[{k}]): standalone {x} vs in-fit {y}");
     }
     assert_eq!(cov.se_omega, r.se_omega);
     assert_eq!(cov.se_sigma, r.se_sigma);
@@ -259,31 +203,18 @@ fn m3_warning_follows_the_fitted_marginal() {
             run_covariance_step: false,
             ..FitOptions::default()
         };
-        assert!(
-            o.interaction,
-            "fixture premise: API default interaction = true"
-        );
+        assert!(o.interaction, "fixture premise: API default interaction = true");
         fit(&model, &population, &model.default_params, &o).expect("M3 fit must run")
     };
     let has_m3 = |r: &FitResult| {
-        r.warnings
-            .iter()
-            .any(|w| w.contains("M3 censoring under FOCE uses non-interaction"))
+        r.warnings.iter().any(|w| w.contains("M3 censoring under FOCE uses non-interaction"))
     };
     let foce = run(EstimationMethod::Foce);
     let focei = run(EstimationMethod::FoceI);
     assert_analytic(&foce);
-    assert!(
-        has_m3(&foce),
-        "FOCE + M3 + censored rows must warn: {:?}",
-        foce.warnings
-    );
+    assert!(has_m3(&foce), "FOCE + M3 + censored rows must warn: {:?}", foce.warnings);
     assert!(!foce.interaction);
-    assert!(
-        !has_m3(&focei),
-        "FOCEI must not carry the FOCE-M3 warning: {:?}",
-        focei.warnings
-    );
+    assert!(!has_m3(&focei), "FOCEI must not carry the FOCE-M3 warning: {:?}", focei.warnings);
     assert!(focei.interaction);
 }
 
@@ -312,9 +243,7 @@ fn m3_warning_follows_the_last_estimating_stage_of_a_chain() {
         fit(&model, &population, &model.default_params, &o).expect("M3 chain must run")
     };
     let has_m3 = |r: &FitResult| {
-        r.warnings
-            .iter()
-            .any(|w| w.contains("M3 censoring under FOCE uses non-interaction"))
+        r.warnings.iter().any(|w| w.contains("M3 censoring under FOCE uses non-interaction"))
     };
     let foce = run(EstimationMethod::Foce);
     let focei = run(EstimationMethod::FoceI);
@@ -341,10 +270,7 @@ fn m3_warning_follows_the_last_estimating_stage_of_a_chain() {
 /// inside its own SIR 95% interval (under the leak ω²(KA) = 0.919 sat outside
 /// [0.078, 0.342]).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn warfarin_iov_foce_sir_contains_its_estimates() {
     let prep = warfarin_iov();
     let mut o = prep.parsed.fit_options.clone();
@@ -360,9 +286,7 @@ fn warfarin_iov_foce_sir_contains_its_estimates() {
     eprintln!("MEASURE T6 ofv={:.6} ess={ess:.4}", r.ofv);
     assert!(ess.is_finite() && ess >= 100.0, "SIR ESS {ess} < 100");
     let check = |what: &str, est: &[f64], ci: &Option<Vec<(f64, f64)>>| {
-        let ci = ci
-            .as_ref()
-            .unwrap_or_else(|| panic!("no SIR CI for {what}"));
+        let ci = ci.as_ref().unwrap_or_else(|| panic!("no SIR CI for {what}"));
         assert_eq!(ci.len(), est.len(), "{what}: CI length");
         for (k, (&e, &(lo, hi))) in est.iter().zip(ci).enumerate() {
             eprintln!("MEASURE T6 {what}[{k}] {e:.6} in [{lo:.6}, {hi:.6}]");
@@ -375,10 +299,7 @@ fn warfarin_iov_foce_sir_contains_its_estimates() {
     check("theta", &r.theta, &r.sir_ci_theta);
     check("omega", r.omega.diagonal().as_slice(), &r.sir_ci_omega);
     check("sigma", &r.sigma, &r.sir_ci_sigma);
-    let kappa = r
-        .omega_iov
-        .as_ref()
-        .expect("warfarin_iov reports a kappa variance");
+    let kappa = r.omega_iov.as_ref().expect("warfarin_iov reports a kappa variance");
     check("kappa", kappa.diagonal().as_slice(), &r.sir_ci_kappa);
     assert!(!r.interaction);
 }
@@ -421,8 +342,7 @@ const WARF_LAPLACE_PACKED: [f64; 7] = [
 /// warfarin at its Laplace optimum, `outer_maxiter = 0`, covariance + SIR, under
 /// `method` / `methods`.
 fn warfarin_sir_fit(
-    method: EstimationMethod,
-    methods: Vec<EstimationMethod>,
+    method: EstimationMethod, methods: Vec<EstimationMethod>,
 ) -> (PreparedRun, FitResult) {
     let prep = prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
         .expect("warfarin must prepare");
@@ -459,10 +379,8 @@ fn cleared(r: &FitResult) -> FitResult {
 /// comparison in the failure message.
 fn assert_sir_identical(a: &FitResult, b: &FitResult, side: &str) {
     let (ea, eb) = (
-        a.sir_ess
-            .unwrap_or_else(|| panic!("{side}: no ESS on the first")),
-        b.sir_ess
-            .unwrap_or_else(|| panic!("{side}: no ESS on the second")),
+        a.sir_ess.unwrap_or_else(|| panic!("{side}: no ESS on the first")),
+        b.sir_ess.unwrap_or_else(|| panic!("{side}: no ESS on the second")),
     );
     assert!(ea.is_finite() && eb.is_finite(), "{side}: ESS not finite");
     assert_eq!(ea.to_bits(), eb.to_bits(), "{side}: ESS {ea} vs {eb}");
@@ -488,17 +406,9 @@ fn laplace_run_sir_default_options_is_identical_to_in_fit() {
         EstimationMethod::FoceI,
         "fixture premise: the caller's method is not the fit's"
     );
-    let s = run_sir(
-        &cleared(&r),
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &opts,
-    )
-    .expect("standalone run_sir must run");
-    eprintln!(
-        "MEASURE T1 in-fit ess={:?} standalone ess={:?}",
-        r.sir_ess, s.sir_ess
-    );
+    let s = run_sir(&cleared(&r), Some(&prep.parsed.model), Some(&prep.population), &opts)
+        .expect("standalone run_sir must run");
+    eprintln!("MEASURE T1 in-fit ess={:?} standalone ess={:?}", r.sir_ess, s.sir_ess);
     assert_sir_identical(&s, &r, "run_sir vs in-fit (Laplace)");
 }
 
@@ -515,37 +425,21 @@ fn chain_sir_scores_the_final_estimating_method() {
         EstimationMethod::FoceI,
         vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
     );
-    assert_eq!(
-        r.method,
-        EstimationMethod::Laplace,
-        "the chain's final stage"
-    );
+    assert_eq!(r.method, EstimationMethod::Laplace, "the chain's final stage");
 
     // Reference: `run_sir` with caller options that already say Laplace, so no
     // resolution from the fit is needed to get it right.
-    let laplace_opts = FitOptions {
-        method: EstimationMethod::Laplace,
-        ..sir_defaults()
-    };
-    let reference = run_sir(
-        &cleared(&r),
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &laplace_opts,
-    )
-    .expect("reference run_sir must run");
+    let laplace_opts = FitOptions { method: EstimationMethod::Laplace, ..sir_defaults() };
+    let reference =
+        run_sir(&cleared(&r), Some(&prep.parsed.model), Some(&prep.population), &laplace_opts)
+            .expect("reference run_sir must run");
     // The straddle: the same estimates scored with FOCEI must differ, or the pair below
     // could not tell the two marginals apart.
     let focei = {
         let mut f = cleared(&r);
         f.method = EstimationMethod::FoceI;
-        run_sir(
-            &f,
-            Some(&prep.parsed.model),
-            Some(&prep.population),
-            &sir_defaults(),
-        )
-        .expect("FOCEI-scored run_sir must run")
+        run_sir(&f, Some(&prep.parsed.model), Some(&prep.population), &sir_defaults())
+            .expect("FOCEI-scored run_sir must run")
     };
     eprintln!(
         "MEASURE T2 in-fit={:?} laplace-ref={:?} focei={:?}",
@@ -560,13 +454,9 @@ fn chain_sir_scores_the_final_estimating_method() {
     // Side 1: the in-fit SIR (`fit()`'s `scoring_options(final_method, …)`).
     assert_sir_identical(&r, &reference, "in-fit SIR vs Laplace scoring");
     // Side 2: `run_sir` with default options (`fitted_marginal_options` over `fit.method`).
-    let s = run_sir(
-        &cleared(&r),
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &sir_defaults(),
-    )
-    .expect("standalone run_sir must run");
+    let s =
+        run_sir(&cleared(&r), Some(&prep.parsed.model), Some(&prep.population), &sir_defaults())
+            .expect("standalone run_sir must run");
     assert_sir_identical(&s, &reference, "run_sir vs Laplace scoring");
 }
 
@@ -581,13 +471,8 @@ fn chain_sir_scores_the_final_estimating_method() {
 fn laplace_run_covariance_takes_the_fits_method() {
     let (prep, r) = warfarin_sir_fit(EstimationMethod::Laplace, Vec::new());
     let a = r.covariance_matrix.as_ref().expect("in-fit covariance");
-    let c = run_covariance(
-        &r,
-        Some(&prep.parsed.model),
-        Some(&prep.population),
-        &sir_defaults(),
-    )
-    .expect("standalone run_covariance must run");
+    let c = run_covariance(&r, Some(&prep.parsed.model), Some(&prep.population), &sir_defaults())
+        .expect("standalone run_covariance must run");
     let b = c.covariance_matrix.as_ref().expect("standalone covariance");
     assert_eq!(a.shape(), b.shape());
     // On the correlation scale, `|Δ C_ij| / √(C_ii C_jj)`: an element-relative
@@ -595,15 +480,9 @@ fn laplace_run_covariance_takes_the_fits_method() {
     let mut worst = 0.0f64;
     for i in 0..a.nrows() {
         for j in 0..a.ncols() {
-            assert!(
-                a[(i, j)].is_finite() && b[(i, j)].is_finite(),
-                "non-finite entry"
-            );
+            assert!(a[(i, j)].is_finite() && b[(i, j)].is_finite(), "non-finite entry");
             let scale = (a[(i, i)] * a[(j, j)]).sqrt();
-            assert!(
-                scale > 0.0,
-                "covariance diagonal not positive at ({i}, {j})"
-            );
+            assert!(scale > 0.0, "covariance diagonal not positive at ({i}, {j})");
             worst = worst.max((a[(i, j)] - b[(i, j)]).abs() / scale);
         }
     }
@@ -666,12 +545,8 @@ fn mixture_sir_fit(
         MIX_OVERRIDE.replace("  omega(2) ETA_CL ~ 0.30\n", "")
     };
     let model = ferx_core::parse_model_string(&src).expect("mixture model must parse");
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("mixture data must load");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None)
+        .expect("mixture data must load");
     let n = if with_override { 7 } else { 6 };
     let init = ferx_core::estimation::parameterization::unpack_params(
         &MIX_PACKED[..n],
@@ -709,9 +584,7 @@ fn mixture_override_run_sir_is_identical_to_in_fit() {
         "in-fit mixture SIR ESS {ess}: the draws are not scored with the mixture marginal"
     );
     let bracket = |what: &str, est: &[f64], ci: &Option<Vec<(f64, f64)>>| {
-        let ci = ci
-            .as_ref()
-            .unwrap_or_else(|| panic!("no SIR CI for {what}"));
+        let ci = ci.as_ref().unwrap_or_else(|| panic!("no SIR CI for {what}"));
         assert_eq!(ci.len(), est.len(), "{what}: CI length");
         for (k, (&e, &(lo, hi))) in est.iter().zip(ci).enumerate() {
             assert!(
@@ -739,10 +612,7 @@ fn mixture_override_run_covariance_is_identical_to_in_fit() {
     assert_eq!(a.nrows(), 7, "the override is a packed coordinate");
     let c = run_covariance(&r, Some(&model), Some(&pop), &sir_defaults())
         .expect("standalone run_covariance must run");
-    let b = c
-        .covariance_matrix
-        .as_ref()
-        .expect("standalone run_covariance returned no matrix");
+    let b = c.covariance_matrix.as_ref().expect("standalone run_covariance returned no matrix");
     assert_eq!(a.shape(), b.shape());
     for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert!(x.is_finite(), "covariance[{k}] not finite");
@@ -772,10 +642,7 @@ fn mixture_without_packed_estimate() {
     stored.packed_estimate = None;
     stored.mixture_overrides = None;
     for (entry, res) in [
-        (
-            "run_sir",
-            run_sir(&stored, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
-        ),
+        ("run_sir", run_sir(&stored, Some(&model), Some(&pop), &sir_defaults()).map(|_| ())),
         (
             "run_covariance",
             run_covariance(&stored, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
@@ -791,16 +658,10 @@ fn mixture_without_packed_estimate() {
             "A fit() result records them".to_string(),
             "and so does a .fitrx bundle save_fit wrote from one.".to_string(),
         ] {
-            assert!(
-                e.to_string().contains(&must),
-                "{entry} message lacks {must:?}: {e}"
-            );
+            assert!(e.to_string().contains(&must), "{entry} message lacks {must:?}: {e}");
         }
         for must_not in ["refit", "declared", "layout", "a fit read from .fitrx"] {
-            assert!(
-                !e.to_string().contains(must_not),
-                "{entry} message says {must_not:?}: {e}"
-            );
+            assert!(!e.to_string().contains(must_not), "{entry} message says {must_not:?}: {e}");
         }
     }
 
@@ -822,15 +683,9 @@ fn mixture_without_packed_estimate() {
             ),
             "Supply the model the fit was estimated with.".to_string(),
         ] {
-            assert!(
-                e.to_string().contains(&must),
-                "layout message lacks {must:?}: {e}"
-            );
+            assert!(e.to_string().contains(&must), "layout message lacks {must:?}: {e}");
         }
-        assert!(
-            !e.to_string().contains(".fitrx"),
-            "layout message tells the .fitrx story: {e}"
-        );
+        assert!(!e.to_string().contains(".fitrx"), "layout message tells the .fitrx story: {e}");
     }
 
     // Row 2b (#1815): a packed estimate of the right length that does not unpack to the
@@ -847,10 +702,7 @@ fn mixture_without_packed_estimate() {
     for (cause, stale) in [("theta edited", &edited), ("vector damaged", &damaged)] {
         assert_eq!(stale.packed_estimate.as_ref().map(Vec::len), Some(7));
         for (entry, res) in [
-            (
-                "run_sir",
-                run_sir(stale, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
-            ),
+            ("run_sir", run_sir(stale, Some(&model), Some(&pop), &sir_defaults()).map(|_| ())),
             (
                 "run_covariance",
                 run_covariance(stale, Some(&model), Some(&pop), &sir_defaults()).map(|_| ()),
@@ -909,8 +761,7 @@ fn mixture_override_reloaded_from_fitrx_is_identical_to_in_fit() {
     let e = run_sir(&legacy, Some(&model), Some(&pop), &sir_defaults())
         .expect_err("premise: a reloaded override fit without its packed vector is refused");
     assert!(
-        e.to_string()
-            .contains("the fit records neither their fitted values (mixture_overrides)"),
+        e.to_string().contains("the fit records neither their fitted values (mixture_overrides)"),
         "premise: the refusal must be the #1765 one, not another error: {e}"
     );
 
@@ -941,16 +792,9 @@ fn mixture_override_reloaded_from_fitrx_is_identical_to_in_fit() {
 #[test]
 fn vi_never_reaches_a_mixture_override_fit() {
     let model = ferx_core::parse_model_string(MIX_OVERRIDE).expect("mixture model must parse");
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("mixture data must load");
-    let opts = FitOptions {
-        method: EstimationMethod::Vi,
-        ..sir_defaults()
-    };
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None)
+        .expect("mixture data must load");
+    let opts = FitOptions { method: EstimationMethod::Vi, ..sir_defaults() };
     let e = fit(&model, &pop, &model.default_params, &opts)
         .map(|_| ())
         .expect_err("VI on a [mixture] model must be refused up front");
@@ -970,14 +814,7 @@ fn focei_run_sir_reloaded_from_fitrx_is_identical_to_in_fit() {
     let (prep, r) = warfarin_sir_fit(EstimationMethod::FoceI, Vec::new());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("focei.fitrx");
-    save_fit(
-        &r,
-        &prep.population,
-        "model\n",
-        &path,
-        SaveFitOptions::default(),
-    )
-    .expect("save_fit");
+    save_fit(&r, &prep.population, "model\n", &path, SaveFitOptions::default()).expect("save_fit");
     let loaded = load_fit(&path).expect("load_fit").fit;
     let s = run_sir(
         &cleared(&loaded),
@@ -1009,11 +846,7 @@ fn assert_cov_identical(a: &FitResult, b: &FitResult, side: &str) {
     assert_eq!(a.shape(), b.shape(), "{side}: covariance shape");
     for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert!(x.is_finite(), "{side}: covariance[{k}] not finite");
-        assert_eq!(
-            x.to_bits(),
-            y.to_bits(),
-            "{side}: covariance[{k}]: {x} vs {y}"
-        );
+        assert_eq!(x.to_bits(), y.to_bits(), "{side}: covariance[{k}]: {x} vs {y}");
     }
 }
 
@@ -1029,10 +862,8 @@ fn assert_cov_identical(a: &FitResult, b: &FitResult, side: &str) {
 fn mixture_override_reloaded_without_packed_estimate_is_identical_to_in_fit() {
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
     let (model, pop, r) = mixture_sir_fit(true);
-    let recorded = r
-        .mixture_overrides
-        .clone()
-        .expect("a FOCEI override fit records its override values");
+    let recorded =
+        r.mixture_overrides.clone().expect("a FOCEI override fit records its override values");
     eprintln!("MEASURE #1765 T1 class-2 omega = {:?}", recorded);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mixture.fitrx");
@@ -1068,14 +899,8 @@ fn mixture_override_reloaded_without_packed_estimate_is_identical_to_in_fit() {
 fn run_covariance_centres_on_an_edited_mixture_override() {
     let (model, pop, r) = mixture_sir_fit(true);
     let mut edited = r.clone();
-    edited
-        .mixture_overrides
-        .as_mut()
-        .expect("recorded override")[0] *= 1.25;
-    assert!(
-        edited.packed_estimate.is_some(),
-        "fixture keeps the packed vector"
-    );
+    edited.mixture_overrides.as_mut().expect("recorded override")[0] *= 1.25;
+    assert!(edited.packed_estimate.is_some(), "fixture keeps the packed vector");
     let mut stripped = edited.clone();
     stripped.packed_estimate = None;
 
@@ -1084,14 +909,9 @@ fn run_covariance_centres_on_an_edited_mixture_override() {
     let want = run_covariance(&stripped, Some(&model), Some(&pop), &sir_defaults())
         .expect("run_covariance on the edited fit without its packed vector");
     assert_cov_identical(&c, &want, "edited override: packed kept vs packed removed");
-    let (a, b) = (
-        c.covariance_matrix.as_ref().unwrap(),
-        r.covariance_matrix.as_ref().unwrap(),
-    );
+    let (a, b) = (c.covariance_matrix.as_ref().unwrap(), r.covariance_matrix.as_ref().unwrap());
     assert!(
-        a.iter()
-            .zip(b.iter())
-            .any(|(x, y)| x.to_bits() != y.to_bits()),
+        a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()),
         "the edited override must move the covariance away from the in-fit one"
     );
 }
@@ -1100,12 +920,8 @@ fn run_covariance_centres_on_an_edited_mixture_override() {
 /// optimum (so a short run stays near it).
 fn saem_mixture_sir_fit() -> (ferx_core::CompiledModel, ferx_core::Population, FitResult) {
     let model = ferx_core::parse_model_string(MIX_OVERRIDE).expect("mixture model must parse");
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("mixture data must load");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None)
+        .expect("mixture data must load");
     let init =
         ferx_core::estimation::parameterization::unpack_params(&MIX_PACKED, &model.default_params);
     let opts = FitOptions {
@@ -1140,10 +956,8 @@ fn saem_mixture_override_run_sir_and_covariance_are_identical_to_in_fit() {
     let (model, pop, r) = saem_mixture_sir_fit();
     assert_eq!(r.method, EstimationMethod::Saem);
     assert!(r.packed_estimate.is_none(), "premise: SAEM packs nothing");
-    let recorded = r
-        .mixture_overrides
-        .as_ref()
-        .expect("an SAEM override fit records its override values");
+    let recorded =
+        r.mixture_overrides.as_ref().expect("an SAEM override fit records its override values");
     eprintln!(
         "MEASURE #1765 T2 SAEM ofv={:?} class-1 omega={:?} class-2 omega={:?} ess={:?}",
         r.ofv,
@@ -1248,12 +1062,8 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
     let model =
         ferx_core::parse_model_string(MIX_SIGMA_OVERRIDE).expect("mixture model must parse");
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("mixture data must load");
+    let pop = read_nonmem_csv(Path::new("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None)
+        .expect("mixture data must load");
     let opts = FitOptions {
         method: EstimationMethod::Saem,
         saem_n_exploration: 60,
@@ -1267,20 +1077,12 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
         ..sir_defaults()
     };
     let r = fit(&model, &pop, &model.default_params, &opts).expect("SAEM mixture fit must run");
-    let recorded = r
-        .mixture_overrides
-        .clone()
-        .expect("an SAEM override fit records its override values");
-    eprintln!(
-        "MEASURE #1765 T3 SAEM ofv={:?} overrides={:?} ess={:?}",
-        r.ofv, recorded, r.sir_ess
-    );
+    let recorded =
+        r.mixture_overrides.clone().expect("an SAEM override fit records its override values");
+    eprintln!("MEASURE #1765 T3 SAEM ofv={:?} overrides={:?} ess={:?}", r.ofv, recorded, r.sir_ess);
     assert_eq!(
         recorded.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-        [recorded[0], 0.25, 0.0]
-            .iter()
-            .map(|x| x.to_bits())
-            .collect::<Vec<_>>(),
+        [recorded[0], 0.25, 0.0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
         "Σ overrides held at their inits (sd 0.25 and 0)"
     );
     assert!(r.covariance_matrix.is_some(), "in-fit covariance must run");
@@ -1296,14 +1098,7 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("saem_sigma_mixture.fitrx");
-    save_fit(
-        &r,
-        &pop,
-        MIX_SIGMA_OVERRIDE,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .expect("save_fit");
+    save_fit(&r, &pop, MIX_SIGMA_OVERRIDE, &path, SaveFitOptions::default()).expect("save_fit");
     let loaded = load_fit(&path).expect("load_fit").fit;
     for (side, f) in [("in memory", &r), ("reloaded", &loaded)] {
         let c = run_covariance(f, Some(&model), Some(&pop), &sir_defaults())

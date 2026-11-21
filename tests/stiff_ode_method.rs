@@ -118,14 +118,8 @@ fn stiff_model_src(fit_options: &str) -> String {
 
 fn predictions(fit_options: &str, pop: &Population) -> Vec<(f64, f64)> {
     let src = stiff_model_src(fit_options);
-    let model = parse_full_model(&src)
-        .unwrap_or_else(|e| panic!("model did not parse: {e}"))
-        .model;
-    predict(&model, pop, &model.default_params)
-        .unwrap()
-        .iter()
-        .map(|p| (p.time, p.pred))
-        .collect()
+    let model = parse_full_model(&src).unwrap_or_else(|e| panic!("model did not parse: {e}")).model;
+    predict(&model, pop, &model.default_params).unwrap().iter().map(|p| (p.time, p.pred)).collect()
 }
 
 /// The reference: the *default* explicit stepper, run at a tight tolerance with a step budget
@@ -206,10 +200,8 @@ fn rosenbrock_methods_reproduce_the_brute_force_rk45_trajectory() {
 fn the_explicit_method_is_stability_limited_on_this_system() {
     let pop = stiff_population();
     let reference = predictions(RK45_REFERENCE_OPTIONS, &pop);
-    let default_budget = predictions(
-        "  ode_method = rk45\n  ode_reltol = 1e-8\n  ode_abstol = 1e-10\n",
-        &pop,
-    );
+    let default_budget =
+        predictions("  ode_method = rk45\n  ode_reltol = 1e-8\n  ode_abstol = 1e-10\n", &pop);
 
     let (t_last, p_last) = *default_budget.last().unwrap();
     let (_, r_last) = *reference.last().unwrap();

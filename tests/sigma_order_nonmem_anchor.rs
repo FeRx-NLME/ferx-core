@@ -133,11 +133,7 @@ fn ofv(model_str: &str) -> f64 {
     // Same guard the other NONMEM anchors carry (`tests/per_route_lag_nonmem_anchor.rs`):
     // a NaN objective otherwise fails on an opaque tolerance assert rather than
     // saying what went wrong.
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     result.ofv
 }
 
@@ -147,10 +143,7 @@ fn single_sigma_matches_nonmem() {
     // ferx's proportional-error objective agrees with NONMEM's `Y = F*(1+EPS(1))`
     // on this dataset before any ordering question is asked.
     let got = ofv(&model(SMALL_ONLY.0, SMALL_ONLY.1));
-    assert!(
-        (got - NONMEM_OFV_SMALL).abs() < 1e-5,
-        "ferx {got} vs NONMEM {NONMEM_OFV_SMALL}"
-    );
+    assert!((got - NONMEM_OFV_SMALL).abs() < 1e-5, "ferx {got} vs NONMEM {NONMEM_OFV_SMALL}");
 }
 
 #[test]
@@ -165,10 +158,7 @@ fn in_order_trailing_sigma_matches_nonmem_and_does_not_change_the_fit() {
         "  sigma S_SMALL ~ 0.05 (sd)\n  sigma S_BIG ~ 2.0 (sd)",
         "DV ~ proportional(S_SMALL)",
     ));
-    assert!(
-        (got - NONMEM_OFV_SMALL).abs() < 1e-5,
-        "ferx {got} vs NONMEM {NONMEM_OFV_SMALL}"
-    );
+    assert!((got - NONMEM_OFV_SMALL).abs() < 1e-5, "ferx {got} vs NONMEM {NONMEM_OFV_SMALL}");
 }
 
 #[test]
@@ -182,10 +172,7 @@ fn leading_sigma_is_the_one_that_binds_and_matches_nonmem() {
         "  sigma S_BIG ~ 2.0 (sd)\n  sigma S_SMALL ~ 0.05 (sd)",
         "DV ~ proportional(S_BIG)",
     ));
-    assert!(
-        (got - NONMEM_OFV_BIG).abs() < 1e-5,
-        "ferx {got} vs NONMEM {NONMEM_OFV_BIG}"
-    );
+    assert!((got - NONMEM_OFV_BIG).abs() < 1e-5, "ferx {got} vs NONMEM {NONMEM_OFV_BIG}");
     // The span the silent misbind used to cover, measured on *ferx* and checked
     // against the span NONMEM reports. Differencing the two NONMEM constants
     // instead would be arithmetic on two literals — constant-foldable, and unable

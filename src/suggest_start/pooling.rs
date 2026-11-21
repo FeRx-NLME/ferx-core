@@ -41,19 +41,10 @@ pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
     let vss = geomean_min_n(subjects.iter().filter_map(|s| s.vss));
     let lambda_z = geomean_min_n(subjects.iter().filter_map(|s| s.lambda_z));
     let ka = geomean_min_n(subjects.iter().filter_map(|s| s.ka));
-    let c0 = geomean(
-        subjects
-            .iter()
-            .filter_map(|s| s.c0)
-            .filter(|&v| v > 0.0 && v.is_finite()),
-    );
+    let c0 = geomean(subjects.iter().filter_map(|s| s.c0).filter(|&v| v > 0.0 && v.is_finite()));
 
     // Median Tmax
-    let mut tmaxes: Vec<f64> = subjects
-        .iter()
-        .map(|s| s.tmax)
-        .filter(|t| t.is_finite())
-        .collect();
+    let mut tmaxes: Vec<f64> = subjects.iter().map(|s| s.tmax).filter(|t| t.is_finite()).collect();
     tmaxes.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
     let tmax_median = median_f64(&tmaxes);
 
@@ -61,11 +52,8 @@ pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
     // discrete sampling-time value and a few subjects with no detectable lag
     // should not pull the estimate to zero.
     let tlag = {
-        let mut tlags: Vec<f64> = subjects
-            .iter()
-            .filter_map(|s| s.tlag)
-            .filter(|&t| t > 0.0 && t.is_finite())
-            .collect();
+        let mut tlags: Vec<f64> =
+            subjects.iter().filter_map(|s| s.tlag).filter(|&t| t > 0.0 && t.is_finite()).collect();
         tlags.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
         if tlags.is_empty() {
             None
@@ -167,36 +155,24 @@ mod tests {
     fn test_geomean_basic() {
         let vals = vec![1.0, 2.0, 4.0];
         let gm = geomean(vals.into_iter()).unwrap();
-        assert!(
-            (gm - 2.0).abs() < 1e-10,
-            "geomean([1,2,4]) should be 2.0, got {gm}"
-        );
+        assert!((gm - 2.0).abs() < 1e-10, "geomean([1,2,4]) should be 2.0, got {gm}");
     }
 
     #[test]
     fn test_pool_nca_geometric_mean() {
         // Three subjects with CL/F = 0.1, 0.2, 0.4 → geomean = 0.2
-        let subjects = vec![
-            make_nca(0.1, 8.0, 1.0),
-            make_nca(0.2, 8.0, 1.0),
-            make_nca(0.4, 8.0, 1.0),
-        ];
+        let subjects =
+            vec![make_nca(0.1, 8.0, 1.0), make_nca(0.2, 8.0, 1.0), make_nca(0.4, 8.0, 1.0)];
         let pop = pool_nca(&subjects);
         let cl = pop.cl_f.unwrap();
-        assert!(
-            (cl - 0.2).abs() / 0.2 < 1e-9,
-            "pooled CL should be 0.2, got {cl}"
-        );
+        assert!((cl - 0.2).abs() / 0.2 < 1e-9, "pooled CL should be 0.2, got {cl}");
     }
 
     #[test]
     fn test_pool_nca_drops_nan() {
         let mut subjects = vec![make_nca(0.1, 8.0, 1.0), make_nca(0.2, 8.0, 1.0)];
         // Add a subject with failed CL estimate
-        subjects.push(SubjectNca {
-            cl_f: None,
-            ..make_nca(0.0, 8.0, 1.0)
-        });
+        subjects.push(SubjectNca { cl_f: None, ..make_nca(0.0, 8.0, 1.0) });
         let pop = pool_nca(&subjects);
         // Should still produce a valid estimate from the 2 valid subjects
         assert!(pop.cl_f.is_some());
@@ -207,11 +183,8 @@ mod tests {
     #[test]
     fn test_cl_cv2_computed() {
         // CL values: 0.1, 0.2, 0.4 — large IIV
-        let subjects = vec![
-            make_nca(0.1, 8.0, 1.0),
-            make_nca(0.2, 8.0, 1.0),
-            make_nca(0.4, 8.0, 1.0),
-        ];
+        let subjects =
+            vec![make_nca(0.1, 8.0, 1.0), make_nca(0.2, 8.0, 1.0), make_nca(0.4, 8.0, 1.0)];
         let pop = pool_nca(&subjects);
         assert!(pop.cl_cv2.is_some());
         assert!(pop.cl_cv2.unwrap() > 0.0);

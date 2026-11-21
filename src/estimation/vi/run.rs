@@ -70,9 +70,7 @@ const CONVERGENCE_CHECK_INTERVAL: usize = 100;
 /// fraction, applied to the run length so far rather than to `vi_iters` — which under
 /// early stopping is a ceiling nobody reached.
 fn averaging_window_for(n_so_far: usize) -> usize {
-    n_so_far
-        .saturating_sub(averaging_start(n_so_far, None))
-        .max(1)
+    n_so_far.saturating_sub(averaging_start(n_so_far, None)).max(1)
 }
 
 /// How many standard errors the two window means may differ by and still count as
@@ -204,9 +202,7 @@ fn fold_nn_penalty(reg: &NnRegularizer, x: &[f64], grad_x: &mut [f64], scratch: 
 /// of convergence, whatever `φ` happens to be doing on a given window.
 fn param_criterion_applies(template: &ModelParameters) -> bool {
     // `packed_fixed_mask` holds FIX coordinates and structural-zero Ω entries (#1018).
-    crate::estimation::parameterization::packed_fixed_mask(template)
-        .iter()
-        .any(|&held| !held)
+    crate::estimation::parameterization::packed_fixed_mask(template).iter().any(|&held| !held)
 }
 
 /// Scale factor turning the median absolute deviation into a consistent estimator of
@@ -365,9 +361,7 @@ pub(crate) fn trace_still_drifting(trace: &[f64], window: usize) -> bool {
         return false;
     }
     let steps = means.windows(2).map(|w| w[1] - w[0]);
-    let (down, total) = steps.fold((0usize, 0usize), |(d, n), s| {
-        (d + usize::from(s < 0.0), n + 1)
-    });
+    let (down, total) = steps.fold((0usize, 0usize), |(d, n), s| (d + usize::from(s < 0.0), n + 1));
     total > 0 && (down as f64) / (total as f64) >= DRIFT_SIGN_FRACTION
 }
 
@@ -379,9 +373,7 @@ pub(crate) fn trace_still_drifting(trace: &[f64], window: usize) -> bool {
 /// degenerate Cholesky factor. Mirrors `should_run_sir_fallback`, split out for the
 /// same reason (#264).
 pub(crate) fn kl_fallback_warning(
-    n_fell_back: usize,
-    n_subjects: usize,
-    family: &str,
+    n_fell_back: usize, n_subjects: usize, family: &str,
 ) -> Option<String> {
     (n_fell_back > 0).then(|| {
         format!(
@@ -420,9 +412,7 @@ fn bad_basin_warning(converged: &mut bool, tightness: &ElboTightness) -> Option<
 
 /// Whether a generic iteration-budget warning adds information after quality checks.
 fn needs_iteration_budget_warning(
-    converged: bool,
-    noise_floor_stop: bool,
-    bad_basin_stop: bool,
+    converged: bool, noise_floor_stop: bool, bad_basin_stop: bool,
 ) -> bool {
     !converged && !noise_floor_stop && !bad_basin_stop
 }
@@ -441,15 +431,9 @@ fn build_family(kind: ViFamily, d: usize) -> Box<dyn VariationalFamily> {
 /// copies of the same thing — cheap (a family is two `usize`s) and it keeps one code
 /// path rather than branching the whole driver on whether the model has kappas.
 fn build_families(
-    kind: ViFamily,
-    n_eta: usize,
-    n_kappa: usize,
-    k_occasions: &[usize],
+    kind: ViFamily, n_eta: usize, n_kappa: usize, k_occasions: &[usize],
 ) -> Vec<Box<dyn VariationalFamily>> {
-    k_occasions
-        .iter()
-        .map(|&k| build_family(kind, stacked_width(n_eta, n_kappa, k)))
-        .collect()
+    k_occasions.iter().map(|&k| build_family(kind, stacked_width(n_eta, n_kappa, k))).collect()
 }
 
 /// Zero the gradient at coordinates the model declares FIXed.
@@ -491,20 +475,13 @@ fn zero_fixed_coords(grad: &mut [f64], template: &ModelParameters, layout: &Pack
 /// iterations — visibly so on a FIXed parameter, which is supposed to hold its
 /// declared value exactly. Touching only the `Ω` slots leaves the rest bit-exact.
 fn write_omega_block(
-    x: &mut [f64],
-    omega: &crate::types::OmegaMatrix,
-    diagonal: bool,
-    start: usize,
+    x: &mut [f64], omega: &crate::types::OmegaMatrix, diagonal: bool, start: usize,
 ) {
     let l = &omega.chol;
     for (slot, (i, j)) in
         crate::estimation::parameterization::lower_tri_iter(omega.dim(), diagonal).enumerate()
     {
-        x[start + slot] = if i == j {
-            l[(i, j)].max(1e-10).ln()
-        } else {
-            l[(i, j)]
-        };
+        x[start + slot] = if i == j { l[(i, j)].max(1e-10).ln() } else { l[(i, j)] };
     }
 }
 
@@ -513,10 +490,8 @@ fn write_omega_block(
 /// `Ω_iov` is `None` for a model without IOV, in which case only the BSV block moves and
 /// the (empty) IOV range is untouched.
 fn write_closed_form_omegas(
-    x: &mut [f64],
-    omega: &crate::types::OmegaMatrix,
-    omega_iov: Option<&crate::types::OmegaMatrix>,
-    template: &ModelParameters,
+    x: &mut [f64], omega: &crate::types::OmegaMatrix,
+    omega_iov: Option<&crate::types::OmegaMatrix>, template: &ModelParameters,
     layout: &PackedLayout,
 ) {
     write_omega_block(x, omega, template.omega.diagonal, layout.omega_start());
@@ -562,9 +537,7 @@ fn declares_fix(template: &ModelParameters) -> bool {
 /// Run variational inference, stopping once the objective has settled or `vi_iters`
 /// iterations have elapsed — whichever comes first.
 pub fn run_vi(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     if let Some(reason) = unsupported_data_term_reason(model) {
@@ -585,11 +558,8 @@ pub fn run_vi(
         kl: options.vi_kl,
         seed: options.vi_seed.unwrap_or(DEFAULT_VI_SEED),
     };
-    let adam_cfg = AdamConfig {
-        lr: options.vi_lr,
-        grad_clip: options.vi_grad_clip,
-        ..Default::default()
-    };
+    let adam_cfg =
+        AdamConfig { lr: options.vi_lr, grad_clip: options.vi_grad_clip, ..Default::default() };
 
     // The same packed box every other estimator optimizes inside: `θ` from the
     // model file's declared bounds, and the `Ω`/`σ` runaway guards. Adam knows
@@ -600,19 +570,12 @@ pub fn run_vi(
     // Packed here too (#1252): the box cannot be built without the packed start
     // anyway, so `packed_init` is carried down to where `x` is initialised
     // rather than re-walked there.
-    let PackedStart {
-        packed: packed_init,
-        bounds,
-        ..
-    } = pack_with_bounds(init_params);
+    let PackedStart { packed: packed_init, bounds, .. } = pack_with_bounds(init_params);
 
     // Occasions per subject, from the data. Fixed for the run, so compute once: this is
     // what sets each subject's stacked dimension and the pooled `Ω_iov` denominator.
-    let k_occasions: Vec<usize> = population
-        .subjects
-        .iter()
-        .map(|s| super::elbo::subject_k_occasions(model, s))
-        .collect();
+    let k_occasions: Vec<usize> =
+        population.subjects.iter().map(|s| super::elbo::subject_k_occasions(model, s)).collect();
 
     // One family per subject, sized to `n_eta + K_i * n_kappa`.
     let families = build_families(options.vi_family, n_eta, model.n_kappa, &k_occasions);
@@ -630,18 +593,14 @@ pub fn run_vi(
     // iteration's KL exactly zero.
     let mut phis: Vec<Vec<f64>> = (0..n_subjects)
         .map(|i| {
-            let prior = stacked_prior(
-                &init_params.omega,
-                init_params.omega_iov.as_ref(),
-                k_occasions[i],
-            );
+            let prior =
+                stacked_prior(&init_params.omega, init_params.omega_iov.as_ref(), k_occasions[i]);
             families[i].init(&prior)
         })
         .collect();
     let mut adam_x = AdamState::new(x.len());
-    let mut adam_phi: Vec<AdamState> = (0..n_subjects)
-        .map(|i| AdamState::new(families[i].n_params()))
-        .collect();
+    let mut adam_phi: Vec<AdamState> =
+        (0..n_subjects).map(|i| AdamState::new(families[i].n_params())).collect();
 
     // Recomputed if the run settles early (see `stop_at` below), so the Polyak window
     // always sits on the *end* of whatever run actually happened.
@@ -668,9 +627,8 @@ pub fn run_vi(
     let mut phi_block_acc = vec![0.0f64; phi_len];
     let mut prev_phi_block: Option<Vec<f64>> = None;
     let mut avg_x = PolyakAverager::new(x.len());
-    let mut avg_phi: Vec<PolyakAverager> = (0..n_subjects)
-        .map(|i| PolyakAverager::new(families[i].n_params()))
-        .collect();
+    let mut avg_phi: Vec<PolyakAverager> =
+        (0..n_subjects).map(|i| PolyakAverager::new(families[i].n_params())).collect();
 
     let mut warnings: Vec<String> = Vec::new();
 
@@ -833,11 +791,7 @@ pub fn run_vi(
         }
 
         if verbose && (iter % 100 == 0 || iter + 1 == stop_at) {
-            eprintln!(
-                "VI iter {:>5}  -2*ELBO = {:.4}",
-                iter,
-                trace[trace.len() - 1]
-            );
+            eprintln!("VI iter {:>5}  -2*ELBO = {:.4}", iter, trace[trace.len() - 1]);
         }
 
         // ---- Early stopping -------------------------------------------------
@@ -859,21 +813,14 @@ pub fn run_vi(
         for (a, v) in block_acc.iter_mut().zip(x.iter()) {
             *a += *v;
         }
-        for (a, v) in phi_block_acc
-            .iter_mut()
-            .zip(phis.iter().flat_map(|p| p.iter()))
-        {
+        for (a, v) in phi_block_acc.iter_mut().zip(phis.iter().flat_map(|p| p.iter())) {
             *a += *v;
         }
         block_n += 1;
 
         if settled_at.is_none() && iter < avg_start && (iter + 1) % CONVERGENCE_CHECK_INTERVAL == 0
         {
-            if trace_has_settled(
-                &obj_trace,
-                settle_window(obj_trace.len()),
-                CONVERGENCE_REL_TOL,
-            ) {
+            if trace_has_settled(&obj_trace, settle_window(obj_trace.len()), CONVERGENCE_REL_TOL) {
                 consecutive_settled += 1;
             } else {
                 // Must be *consecutive*: one settled window followed by a moving one
@@ -907,10 +854,8 @@ pub fn run_vi(
             // parameter test is what rescues a flat parameter space, where the objective
             // never settles but the estimates have.
             if consecutive_settled >= SETTLE_PATIENCE || param_settled {
-                let avg_window = options
-                    .vi_avg_last
-                    .unwrap_or_else(|| averaging_window_for(iter + 1))
-                    .max(1);
+                let avg_window =
+                    options.vi_avg_last.unwrap_or_else(|| averaging_window_for(iter + 1)).max(1);
                 let candidate = iter + 1 + avg_window;
                 if candidate < n_iters {
                     settled_at = Some(iter);
@@ -967,10 +912,7 @@ pub fn run_vi(
 
     // Re-evaluate at the averaged point with more draws: this number is reported,
     // so it should carry less Monte-Carlo noise than a training iteration.
-    let report_cfg = ElboConfig {
-        n_mc_samples: (cfg.n_mc_samples * 32).max(32),
-        ..cfg.clone()
-    };
+    let report_cfg = ElboConfig { n_mc_samples: (cfg.n_mc_samples * 32).max(32), ..cfg.clone() };
     let final_eval = population_neg_elbo(
         model,
         population,
@@ -996,11 +938,7 @@ pub fn run_vi(
     for (i, phi) in phis_final.iter().enumerate() {
         let (mu, s) = families[i].moments(phi);
         eta_means.push(mu.iter().take(n_eta).copied().collect());
-        eta_covs.push(
-            (0..n_eta)
-                .map(|a| (0..n_eta).map(|b| s[(a, b)]).collect())
-                .collect(),
-        );
+        eta_covs.push((0..n_eta).map(|a| (0..n_eta).map(|b| s[(a, b)]).collect()).collect());
         kappa_means.push(
             (0..k_occasions[i])
                 .map(|g| {
@@ -1009,10 +947,8 @@ pub fn run_vi(
                 })
                 .collect(),
         );
-        let kappa_cells: Vec<DVector<f64>> = kappa_means[i]
-            .iter()
-            .map(|k| DVector::from_column_slice(k))
-            .collect();
+        let kappa_cells: Vec<DVector<f64>> =
+            kappa_means[i].iter().map(|k| DVector::from_column_slice(k)).collect();
         warm.push(crate::estimation::outer_optimizer::joint_warm_start(
             &DVector::from_iterator(n_eta, mu.iter().take(n_eta).copied()),
             &kappa_cells,
@@ -1059,16 +995,9 @@ pub fn run_vi(
     // at a trace that does not support the verdict. Unregularized, the two coincide and
     // `vi.objective_trace` is not emitted, so name `vi.elbo_trace`.
     let reg_active = nn_reg.is_active();
-    let judged_trace_name = if reg_active {
-        "vi.objective_trace"
-    } else {
-        "vi.elbo_trace"
-    };
-    let judged_trace_noun = if reg_active {
-        "the penalized objective trace"
-    } else {
-        "the ELBO trace"
-    };
+    let judged_trace_name = if reg_active { "vi.objective_trace" } else { "vi.elbo_trace" };
+    let judged_trace_noun =
+        if reg_active { "the penalized objective trace" } else { "the ELBO trace" };
 
     // A stop the noise floor caused rather than the optimum. `trace_has_settled` asks
     // whether the remaining drift is distinguishable from Monte-Carlo noise; at a low
@@ -1220,11 +1149,7 @@ pub fn run_vi(
         // itself, so `obj_trace == trace` and we store nothing rather than a duplicate.
         // Populated only when the regularizer is active and the penalized objective is
         // the trace convergence was actually judged on.
-        objective_trace: if nn_reg.is_active() {
-            obj_trace
-        } else {
-            Vec::new()
-        },
+        objective_trace: if nn_reg.is_active() { obj_trace } else { Vec::new() },
         eta_means,
         eta_covs,
         kappa_means,
@@ -1254,7 +1179,6 @@ pub fn run_vi(
     }
 
     Ok(OuterResult {
-        params: final_params,
         ofv,
         converged,
         n_iterations: n_iters_run,
@@ -1265,35 +1189,14 @@ pub fn run_vi(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         // The exact packed vector the covariance step above ran at, so a later
         // standalone `run_covariance` reproduces it bit-for-bit instead of
         // re-deriving `chol(Ω)` from `L·Lᵀ` (#816 follow-up).
         packed_estimate: Some(packed_final),
-        left_init: None,
-        stationary_start: false,
         vi: Some(vi_result),
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
-        mixture_posteriors: None,
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     })
 }
 

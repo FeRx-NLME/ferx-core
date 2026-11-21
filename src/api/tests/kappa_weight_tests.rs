@@ -63,10 +63,7 @@ fn variation_warning(pop: &Population) -> Option<String> {
 
 #[test]
 fn positive_arm_sizes_pass() {
-    assert_eq!(
-        weight_error(&population_with_arm_sizes(&[(1, 200.0), (2, 150.0)])),
-        None
-    );
+    assert_eq!(weight_error(&population_with_arm_sizes(&[(1, 200.0), (2, 150.0)])), None);
 }
 
 #[test]
@@ -94,11 +91,7 @@ fn a_non_finite_arm_size_is_rejected() {
 #[test]
 fn a_weight_constant_within_each_occasion_warns_about_nothing() {
     assert_eq!(
-        variation_warning(&population_with_arm_sizes(&[
-            (1, 200.0),
-            (1, 200.0),
-            (2, 150.0)
-        ])),
+        variation_warning(&population_with_arm_sizes(&[(1, 200.0), (1, 200.0), (2, 150.0)])),
         None
     );
 }
@@ -178,9 +171,7 @@ fn an_unweighted_kappa_is_not_checked() {
     )
     .expect("parse");
     let pop = population_with_arm_sizes(&[(1, 0.0), (2, -1.0)]);
-    assert!(check_model_data(&plain, &pop)
-        .iter()
-        .all(|d| d.code != "E_KAPPA_WEIGHT_NONPOSITIVE"));
+    assert!(check_model_data(&plain, &pop).iter().all(|d| d.code != "E_KAPPA_WEIGHT_NONPOSITIVE"));
 }
 
 /// `simulate()` runs its own (shorter) validation list, so the weight check has
@@ -200,8 +191,7 @@ fn a_zero_arm_size_is_rejected_on_the_simulate_path() {
     )
     .expect_err("simulate must reject a non-positive kappa weight");
     assert!(
-        err.to_string()
-            .contains("kappa `KAPPA_CL` weight `NARM` evaluates to 0"),
+        err.to_string().contains("kappa `KAPPA_CL` weight `NARM` evaluates to 0"),
         "got: {err}"
     );
 }
@@ -238,10 +228,7 @@ fn the_seeded_entry_point_errs_on_a_zero_arm_size() {
     let pop = population_with_arm_sizes(&[(1, 200.0), (2, 0.0)]);
     let err = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(
-        err.to_string().contains("weight `NARM` evaluates to 0"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("weight `NARM` evaluates to 0"), "unexpected Err: {err}");
 }
 
 /// [`population_with_arm_sizes`] plus a bolus at t = 0, so the simulated rows
@@ -273,20 +260,14 @@ fn an_arm_size_of_one_simulates_bit_identically_to_an_unweighted_kappa() {
     )
     .expect("parse");
     let pop = dosed_population_with_arm_sizes(&[(1, 1.0), (2, 1.0), (2, 1.0)]);
-    let opts = crate::api::SimulateOptions {
-        seed: Some(11),
-        ..Default::default()
-    };
+    let opts = crate::api::SimulateOptions { seed: Some(11), ..Default::default() };
 
     let a = crate::api::simulate_with_options(&weighted, &pop, &weighted.default_params, 1, &opts)
         .expect("weighted simulates");
     let b = crate::api::simulate_with_options(&plain, &pop, &plain.default_params, 1, &opts)
         .expect("unweighted simulates");
     assert_eq!(a.len(), b.len());
-    assert!(
-        !a.is_empty(),
-        "the oracle is vacuous with no simulated rows"
-    );
+    assert!(!a.is_empty(), "the oracle is vacuous with no simulated rows");
     assert!(
         a.iter().any(|r| r.ipred.abs() > 1e-9),
         "the oracle is vacuous if every prediction is zero"
@@ -309,10 +290,7 @@ fn a_larger_arm_size_shrinks_the_between_arm_spread() {
     let model = weighted_kappa_model();
     let spread = |n: f64| -> f64 {
         let pop = dosed_population_with_arm_sizes(&[(1, n), (2, n), (3, n)]);
-        let opts = crate::api::SimulateOptions {
-            seed: Some(11),
-            ..Default::default()
-        };
+        let opts = crate::api::SimulateOptions { seed: Some(11), ..Default::default() };
         let rows = crate::api::simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
             .expect("simulates");
         let ipreds: Vec<f64> = rows.iter().map(|r| r.ipred).collect();

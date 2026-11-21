@@ -56,21 +56,14 @@ const RESET_IV_MODEL: &str = r#"
 "#;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn fit_runs_on_reset_iv_washout_dataset() {
     let parsed = parse_full_model(RESET_IV_MODEL).expect("reset model parses");
     let model = parsed.model;
     let options = parsed.fit_options;
 
-    let population = read_nonmem_csv(
-        std::path::Path::new("data/reset_iv_washout.csv"),
-        None,
-        None,
-    )
-    .expect("reset dataset loads");
+    let population = read_nonmem_csv(std::path::Path::new("data/reset_iv_washout.csv"), None, None)
+        .expect("reset dataset loads");
 
     assert!(
         population.subjects.iter().any(|s| s.has_resets()),
@@ -80,16 +73,8 @@ fn fit_runs_on_reset_iv_washout_dataset() {
     let result = fit(&model, &population, &model.default_params, &options)
         .expect("reset fit returns a result");
 
-    assert!(
-        result.converged,
-        "reset fit did not converge (final OFV = {})",
-        result.ofv
-    );
-    assert!(
-        result.ofv.is_finite(),
-        "OFV = {} should be finite",
-        result.ofv
-    );
+    assert!(result.converged, "reset fit did not converge (final OFV = {})", result.ofv);
+    assert!(result.ofv.is_finite(), "OFV = {} should be finite", result.ofv);
 
     let theta = &result.theta;
     assert_eq!(theta.len(), 2);

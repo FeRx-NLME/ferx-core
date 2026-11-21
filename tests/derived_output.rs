@@ -71,10 +71,7 @@ fn derived_name_conflict_returns_err() {
         Err(e) => e,
         Ok(_) => panic!("expected Err"),
     };
-    assert!(
-        msg.contains("E_DERIVED_NAME_CONFLICT"),
-        "expected E_DERIVED_NAME_CONFLICT in: {msg}"
-    );
+    assert!(msg.contains("E_DERIVED_NAME_CONFLICT"), "expected E_DERIVED_NAME_CONFLICT in: {msg}");
 }
 
 #[test]
@@ -86,10 +83,7 @@ fn derived_eta_name_conflict_returns_err() {
         Err(e) => e,
         Ok(_) => panic!("expected Err"),
     };
-    assert!(
-        msg.contains("E_DERIVED_NAME_CONFLICT"),
-        "expected E_DERIVED_NAME_CONFLICT in: {msg}"
-    );
+    assert!(msg.contains("E_DERIVED_NAME_CONFLICT"), "expected E_DERIVED_NAME_CONFLICT in: {msg}");
 }
 
 #[test]
@@ -124,10 +118,7 @@ fn output_duplicate_tafd_emits_warning() {
     let pop = one_dose_population();
     let diags = check_model_data(&model, &pop);
     let codes: Vec<&str> = diags.iter().map(|d| d.code.as_str()).collect();
-    assert!(
-        codes.contains(&"W_OUTPUT_DUPLICATE"),
-        "expected W_OUTPUT_DUPLICATE in: {codes:?}"
-    );
+    assert!(codes.contains(&"W_OUTPUT_DUPLICATE"), "expected W_OUTPUT_DUPLICATE in: {codes:?}");
 }
 
 #[test]
@@ -141,21 +132,15 @@ fn output_valid_covariate_no_error() {
         .filter(|d| d.severity == ferx_core::diagnostics::Severity::Error)
         .map(|d| d.code.as_str())
         .collect();
-    assert!(
-        errors.is_empty(),
-        "WT is a covariate — no errors expected; got: {errors:?}"
-    );
+    assert!(errors.is_empty(), "WT is a covariate — no errors expected; got: {errors:?}");
 }
 
 #[test]
 fn derived_integral_step_ignored_warning_for_dv() {
     let src = base_with_extra("[derived]\n  AUC = integral(DV, from=0, to=24, step=0.1)");
     let result = parse_full_model(&src).expect("parse ok");
-    let has_step_warn = result
-        .model
-        .parse_warnings
-        .iter()
-        .any(|w| w.contains("W_DERIVED_STEP_IGNORED"));
+    let has_step_warn =
+        result.model.parse_warnings.iter().any(|w| w.contains("W_DERIVED_STEP_IGNORED"));
     assert!(
         has_step_warn,
         "expected W_DERIVED_STEP_IGNORED when step= given for DV integral; got: {:?}",
@@ -173,10 +158,8 @@ fn make_subject_with_doses(obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subjec
 #[test]
 fn tafd_correct_single_dose() {
     // Dose at t=5, obs at t=10 → TAFD = 5
-    let subj = make_subject_with_doses(
-        vec![10.0],
-        vec![DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0)],
-    );
+    let subj =
+        make_subject_with_doses(vec![10.0], vec![DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0)]);
     let (tafd, _) = tafd_tad_for_subject(&subj, 0, &[]);
     assert!((tafd - 5.0).abs() < 1e-10, "TAFD should be 5, got {tafd}");
 }
@@ -186,24 +169,16 @@ fn tafd_nan_when_no_dose() {
     // No doses → TAFD is NaN
     let subj = make_subject_with_doses(vec![10.0], vec![]);
     let (tafd, _) = tafd_tad_for_subject(&subj, 0, &[]);
-    assert!(
-        tafd.is_nan(),
-        "TAFD should be NaN with no doses, got {tafd}"
-    );
+    assert!(tafd.is_nan(), "TAFD should be NaN with no doses, got {tafd}");
 }
 
 #[test]
 fn tad_nan_when_dose_after_obs() {
     // Dose at t=20, obs at t=1 → no prior dose → TAD is NaN
-    let subj = make_subject_with_doses(
-        vec![1.0],
-        vec![DoseEvent::new(20.0, 100.0, 1, 0.0, false, 0.0)],
-    );
+    let subj =
+        make_subject_with_doses(vec![1.0], vec![DoseEvent::new(20.0, 100.0, 1, 0.0, false, 0.0)]);
     let (_, tad) = tafd_tad_for_subject(&subj, 0, &[]);
-    assert!(
-        tad.is_nan(),
-        "TAD should be NaN when dose is after obs, got {tad}"
-    );
+    assert!(tad.is_nan(), "TAD should be NaN when dose is after obs, got {tad}");
 }
 
 #[test]
@@ -241,14 +216,8 @@ fn tad_bid_explicit_no_lag() {
         DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
     ];
     let subj = make_subject_with_doses(vec![6.0, 14.0, 26.0], doses);
-    let tad: Vec<f64> = (0..3)
-        .map(|j| tafd_tad_for_subject(&subj, j, &[]).1)
-        .collect();
-    assert_eq!(
-        tad,
-        vec![6.0, 2.0, 2.0],
-        "BID TAD = time since the most recent q12h dose"
-    );
+    let tad: Vec<f64> = (0..3).map(|j| tafd_tad_for_subject(&subj, j, &[]).1).collect();
+    assert_eq!(tad, vec![6.0, 2.0, 2.0], "BID TAD = time since the most recent q12h dose");
 }
 
 #[test]
@@ -262,17 +231,11 @@ fn tad_bid_uniform_lag_excludes_unabsorbed_dose() {
     // obs @12.5: evening dose @12 arrives @13 — not yet → from morning (arrived @1).
     let subj_a = make_subject_with_doses(vec![12.5], doses.clone());
     let tad_a = tafd_tad_for_subject(&subj_a, 0, &[1.0, 1.0]).1;
-    assert!(
-        (tad_a - 11.5).abs() < 1e-12,
-        "evening dose not yet absorbed: TAD {tad_a}"
-    );
+    assert!((tad_a - 11.5).abs() < 1e-12, "evening dose not yet absorbed: TAD {tad_a}");
     // obs @13.5: evening dose arrived @13 → TAD = 0.5.
     let subj_b = make_subject_with_doses(vec![13.5], doses);
     let tad_b = tafd_tad_for_subject(&subj_b, 0, &[1.0, 1.0]).1;
-    assert!(
-        (tad_b - 0.5).abs() < 1e-12,
-        "evening dose absorbed: TAD {tad_b}"
-    );
+    assert!((tad_b - 0.5).abs() < 1e-12, "evening dose absorbed: TAD {tad_b}");
 }
 
 #[test]
@@ -353,16 +316,11 @@ fn fit_produces_finite_derived_and_output_columns() {
     // Every subject result must have extra_columns for Cmax, AUC, and CL.
     for sr in &result.subjects {
         for name in &["Cmax", "AUC", "CL"] {
-            let col = sr
-                .extra_columns
-                .iter()
-                .find(|(n, _)| n == name)
-                .unwrap_or_else(|| panic!("extra column '{name}' missing for subject {}", sr.id));
-            assert!(
-                !col.1.is_empty(),
-                "column '{name}' is empty for subject {}",
-                sr.id
-            );
+            let col =
+                sr.extra_columns.iter().find(|(n, _)| n == name).unwrap_or_else(|| {
+                    panic!("extra column '{name}' missing for subject {}", sr.id)
+                });
+            assert!(!col.1.is_empty(), "column '{name}' is empty for subject {}", sr.id);
             for &v in &col.1 {
                 assert!(
                     v.is_finite(),
@@ -420,11 +378,7 @@ fn output_covariate_case_insensitive_echo() {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("wt"))
             .unwrap_or_else(|| panic!("output column 'wt' missing for subject {}", sr.id));
-        assert!(
-            !col.1.is_empty(),
-            "column 'wt' is empty for subject {}",
-            sr.id
-        );
+        assert!(!col.1.is_empty(), "column 'wt' is empty for subject {}", sr.id);
         for &v in &col.1 {
             assert_eq!(
                 v, 70.0,
@@ -457,11 +411,7 @@ fn derived_time_builtin_echoes_per_observation_time() {
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case("T_ECHO"))
         .expect("derived column T_ECHO present");
-    assert_eq!(
-        col.1.len(),
-        expected.len(),
-        "one T_ECHO value per observation"
-    );
+    assert_eq!(col.1.len(), expected.len(), "one T_ECHO value per observation");
     for (got, want) in col.1.iter().zip(expected) {
         assert!(
             (got - want).abs() < 1e-9,
@@ -528,9 +478,7 @@ fn derived_mod_zero_matches_individual_parameters() {
 #[test]
 fn integral_step_zero_is_rejected_at_parse() {
     let src = base_with_extra("[derived]\n  AUC = integral(IPRED, from=0, to=24, step=0)");
-    let err = parse_full_model(&src)
-        .err()
-        .expect("step=0 must be rejected at parse time");
+    let err = parse_full_model(&src).err().expect("step=0 must be rejected at parse time");
     assert!(
         err.contains("step") && err.contains("positive"),
         "error should cite step= and positive, got: {err}"
@@ -541,9 +489,7 @@ fn integral_step_zero_is_rejected_at_parse() {
 #[test]
 fn integral_window_zero_is_rejected_at_parse() {
     let src = base_with_extra("[derived]\n  AUC = integral(IPRED, window=0)");
-    let err = parse_full_model(&src)
-        .err()
-        .expect("window=0 must be rejected at parse time");
+    let err = parse_full_model(&src).err().expect("window=0 must be rejected at parse time");
     assert!(
         err.contains("window") && err.contains("positive"),
         "error should cite window= and positive, got: {err}"
@@ -616,10 +562,7 @@ fn derived_grid_integral_matches_a_subdose_train_for_infusion_into_absorption() 
     let (amt, t_inf, n_sub) = (100.0_f64, 3.0_f64, 40usize);
 
     let infusion = DoseEvent::new(0.0, amt, 1, amt / t_inf, false, 0.0);
-    assert!(
-        infusion.is_infusion(),
-        "fixture must carry a real infusion or it tests nothing"
-    );
+    assert!(infusion.is_infusion(), "fixture must carry a real infusion or it tests nothing");
     let train: Vec<DoseEvent> = (0..n_sub)
         .map(|k| {
             let tk = (k as f64 + 0.5) * t_inf / n_sub as f64;

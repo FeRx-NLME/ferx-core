@@ -49,19 +49,11 @@ use std::collections::HashMap;
 /// the caller treats it as the [`SUBJECT_SENTINEL_NLL`] backstop rather than a
 /// per-iteration failure.
 fn collect_state_obs(
-    cmt: usize,
-    state_codes: &[usize],
-    records: &[ObsRecord],
+    cmt: usize, state_codes: &[usize], records: &[ObsRecord],
 ) -> Result<Vec<StateObs>, usize> {
     let mut obs = Vec::new();
     for r in records {
-        if let ObsRecord::DiscreteState {
-            time,
-            state,
-            cmt: c,
-            ..
-        } = r
-        {
+        if let ObsRecord::DiscreteState { time, state, cmt: c, .. } = r {
             if *c != cmt {
                 continue; // a DiscreteState row for a different endpoint's CMT
             }
@@ -69,10 +61,7 @@ fn collect_state_obs(
             // (S states); a linear scan is cheaper than a HashMap here.
             let idx = state_codes.iter().position(|&code| code == *state);
             match idx {
-                Some(i) => obs.push(StateObs {
-                    time: *time,
-                    state: i,
-                }),
+                Some(i) => obs.push(StateObs { time: *time, state: i }),
                 None => return Err(*state),
             }
         }
@@ -91,14 +80,8 @@ fn collect_state_obs(
 /// `generator_fn`).
 #[allow(clippy::too_many_arguments)]
 fn ctmm_endpoint_nll(
-    cmt: usize,
-    n_states: usize,
-    state_codes: &[usize],
-    generator_fn: &GeneratorFn,
-    records: &[ObsRecord],
-    covariates: &HashMap<String, f64>,
-    theta: &[f64],
-    eta: &[f64],
+    cmt: usize, n_states: usize, state_codes: &[usize], generator_fn: &GeneratorFn,
+    records: &[ObsRecord], covariates: &HashMap<String, f64>, theta: &[f64], eta: &[f64],
 ) -> f64 {
     let obs = match collect_state_obs(cmt, state_codes, records) {
         Ok(o) => o,
@@ -113,11 +96,7 @@ fn ctmm_endpoint_nll(
     // The time-inhomogeneous (drug/PD-driven) path is scored by a separate integrator
     // (Phase 6, #817) that supplies the evolving state per gap — see `ctmm_subject_nll`.
     let q = generator_fn(theta, eta, covariates, &[]);
-    debug_assert_eq!(
-        q.nrows(),
-        n_states,
-        "generator_fn must return an n_states×n_states matrix"
-    );
+    debug_assert_eq!(q.nrows(), n_states, "generator_fn must return an n_states×n_states matrix");
     // A transition intensity is an unconstrained user expression, so a covariate /
     // parameter regime (e.g. a linear covariate model, or a diverged η) can drive an
     // off-diagonal rate negative. A negative off-diagonal makes `q` a non-generator:
@@ -146,10 +125,7 @@ fn ctmm_endpoint_nll(
 /// outside the dual state solve's scope) or in the degenerate regime (a negative off-diagonal rate, the `expm` /
 /// underflow guards), where the value is a flat repellent with no meaningful derivative.
 pub fn ctmm_subject_eta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
     if subject.obs_records.is_empty() {
         return Some((0.0, vec![0.0; model.n_eta]));
@@ -179,19 +155,13 @@ impl CtmmTerm<'_> {
     /// The term, a drug-driven endpoint reading a caller's shared solve (`times`, sorted, a
     /// superset of [`ctmm_state_grid`]) when given one, else solving its own.
     pub(crate) fn eval_shared<T: crate::sens::num::vm::VmNum>(
-        &self,
-        th: &[T],
-        et: &[T],
+        &self, th: &[T], et: &[T],
         shared: Option<(&[f64], &crate::sens::ode_provider::adjoint::DualStates<T>)>,
     ) -> Option<T> {
         let mut nll = T::from_f64(0.0);
         for (cmt, endpoint) in &self.model.endpoints {
-            let EndpointLikelihood::Ctmm {
-                n_states,
-                state_codes,
-                generator_program,
-                ..
-            } = endpoint
+            let EndpointLikelihood::Ctmm { n_states, state_codes, generator_program, .. } =
+                endpoint
             else {
                 continue;
             };
@@ -243,10 +213,7 @@ fn repelled<T: crate::sens::num::RecHooks, R>() -> Option<R> {
 /// on exactly the subjects [`ctmm_subject_eta_grad`] declines.
 #[cfg(test)]
 pub(crate) fn ctmm_subject_eta_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, nalgebra::DMatrix<f64>)> {
     use crate::sens::ode_provider::adjoint::terms::TermKind;
     let term = CtmmTerm { model, subject };
@@ -257,10 +224,7 @@ pub(crate) fn ctmm_subject_eta_hessian(
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
 pub fn ctmm_subject_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> f64 {
     if subject.obs_records.is_empty() {
         return 0.0;
@@ -333,15 +297,9 @@ const INHOMOGENEOUS_SUBNODES_PER_GAP: usize = 16;
 #[cfg(feature = "markov")]
 #[allow(clippy::too_many_arguments)]
 fn ctmm_endpoint_nll_inhomogeneous(
-    model: &CompiledModel,
-    subject: &Subject,
-    cmt: usize,
-    n_states: usize,
-    state_codes: &[usize],
-    generator_fn: &GeneratorFn,
-    prog: Option<&crate::parser::model_parser::CtmmGeneratorProgram>,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, cmt: usize, n_states: usize, state_codes: &[usize],
+    generator_fn: &GeneratorFn, prog: Option<&crate::parser::model_parser::CtmmGeneratorProgram>,
+    theta: &[f64], eta: &[f64],
 ) -> f64 {
     let obs = match collect_state_obs(cmt, state_codes, &subject.obs_records) {
         Ok(o) => o,
@@ -523,32 +481,16 @@ type Jet<T> = crate::sens::jet::DualT<1, T>;
 /// (`CtmmGeneratorProgram::vars_g`) constant. The right derivative at a sub-node, the bracket the value path takes.
 #[allow(clippy::too_many_arguments)]
 fn generator_tau_jet<T: crate::sens::num::vm::VmNum>(
-    prog: &crate::parser::model_parser::CtmmGeneratorProgram,
-    theta: &[T],
-    eta: &[T],
-    cov_vec: &[f64],
-    vars: &[T],
-    x: &[T],
-    y: &[T],
-    w: f64,
-    dt: f64,
+    prog: &crate::parser::model_parser::CtmmGeneratorProgram, theta: &[T], eta: &[T],
+    cov_vec: &[f64], vars: &[T], x: &[T], y: &[T], w: f64, dt: f64,
 ) -> Vec<Jet<T>> {
     let lift = |xs: &[T]| -> Vec<Jet<T>> {
         let zero = T::from_f64(0.0);
         xs.iter().map(|&v| Jet { v, g: [zero] }).collect()
     };
-    let (w, rate) = (
-        T::from_f64(w),
-        T::from_f64(INHOMOGENEOUS_SUBNODES_PER_GAP as f64 / dt),
-    );
-    let st: Vec<Jet<T>> = x
-        .iter()
-        .zip(y)
-        .map(|(&x, &y)| Jet {
-            v: x + (y - x) * w,
-            g: [(y - x) * rate],
-        })
-        .collect();
+    let (w, rate) = (T::from_f64(w), T::from_f64(INHOMOGENEOUS_SUBNODES_PER_GAP as f64 / dt));
+    let st: Vec<Jet<T>> =
+        x.iter().zip(y).map(|(&x, &y)| Jet { v: x + (y - x) * w, g: [(y - x) * rate] }).collect();
     prog.generator_at_g(&lift(theta), &lift(eta), cov_vec, &mut lift(vars), &st)
 }
 
@@ -557,11 +499,7 @@ fn generator_tau_jet<T: crate::sens::num::vm::VmNum>(
 pub(crate) fn ctmm_state_grid(model: &CompiledModel, subject: &Subject) -> Vec<f64> {
     let mut out = Vec::new();
     for (cmt, endpoint) in &model.endpoints {
-        let EndpointLikelihood::Ctmm {
-            state_codes,
-            generator_program: Some(prog),
-            ..
-        } = endpoint
+        let EndpointLikelihood::Ctmm { state_codes, generator_program: Some(prog), .. } = endpoint
         else {
             continue;
         };
@@ -589,13 +527,9 @@ pub(crate) fn ctmm_state_grid(model: &CompiledModel, subject: &Subject) -> Vec<f
 /// non-positive probability.
 #[allow(clippy::too_many_arguments)]
 fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    prog: &crate::parser::model_parser::CtmmGeneratorProgram,
-    s: usize,
-    obs: &[StateObs],
-    theta: &[T],
-    eta: &[T],
+    model: &CompiledModel, subject: &Subject,
+    prog: &crate::parser::model_parser::CtmmGeneratorProgram, s: usize, obs: &[StateObs],
+    theta: &[T], eta: &[T],
     shared: Option<(&[f64], &crate::sens::ode_provider::adjoint::DualStates<T>)>,
 ) -> Option<T> {
     let ode = model.ode_spec.as_ref()?;
@@ -753,9 +687,7 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
 /// to the sentinel. `records` may be a subject's full `obs_records`; only
 /// `DiscreteState` rows on `cmt` are checked.
 pub fn validate_ctmm_states(
-    cmt: usize,
-    state_codes: &[usize],
-    records: &[ObsRecord],
+    cmt: usize, state_codes: &[usize], records: &[ObsRecord],
 ) -> Result<(), String> {
     for r in records {
         if let ObsRecord::DiscreteState { state, cmt: c, .. } = r {
@@ -818,20 +750,13 @@ mod tests {
 
     /// A constant 2-state generator `Q = [[-a, a], [b, -b]]`, ignoring θ/η/cov/state.
     fn const_gen(a: f64, b: f64) -> GeneratorFn {
-        Box::new(
-            move |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _s: &[f64]| {
-                DMatrix::from_row_slice(2, 2, &[-a, a, b, -b])
-            },
-        )
+        Box::new(move |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _s: &[f64]| {
+            DMatrix::from_row_slice(2, 2, &[-a, a, b, -b])
+        })
     }
 
     fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {
-        ObsRecord::DiscreteState {
-            time,
-            raw_time: time,
-            state,
-            cmt,
-        }
+        ObsRecord::DiscreteState { time, raw_time: time, state, cmt }
     }
 
     /// NLL over a record slice with no covariates and no θ/η.
@@ -847,11 +772,7 @@ mod tests {
         let (a, b, dt) = (0.7_f64, 0.3, 2.0);
         let lam = a + b;
         let p00 = (b + a * (-lam * dt).exp()) / lam;
-        let got = nll(
-            &[0, 1],
-            &const_gen(a, b),
-            &[disc(0.0, 0, 5), disc(dt, 0, 5)],
-        );
+        let got = nll(&[0, 1], &const_gen(a, b), &[disc(0.0, 0, 5), disc(dt, 0, 5)]);
         assert!((got - (-p00.ln())).abs() < 1e-12, "got {got}");
     }
 
@@ -863,11 +784,7 @@ mod tests {
         let lam = a + b;
         // 1 → 2 transition ⇒ generator index 0 → 1 ⇒ P[0,1] = a(1-e)/lam.
         let p01 = a * (1.0 - (-lam * dt).exp()) / lam;
-        let got = nll(
-            &[1, 2],
-            &const_gen(a, b),
-            &[disc(0.0, 1, 5), disc(dt, 2, 5)],
-        );
+        let got = nll(&[1, 2], &const_gen(a, b), &[disc(0.0, 1, 5), disc(dt, 2, 5)]);
         assert!((got - (-p01.ln())).abs() < 1e-12, "got {got}");
     }
 
@@ -875,27 +792,12 @@ mod tests {
 
     /// The mixed-effects CTMM of `tests/markov_smoke.rs`: a per-subject random effect on
     /// the awake→asleep intensity, no `[structural_model]` (an endpoint-only fit).
-    const MIXED_CTMM: &str = r"
-[parameters]
-  theta LQ01(-0.7, -6.0, 3.0)
-  theta LQ10(-1.2, -6.0, 3.0)
-  omega ETA_Q ~ 0.1
-
-[markov_model]
-  type   = ctmm
-  cmt    = 5
-  states = [awake=0, asleep=1]
-  transition awake  -> asleep = exp(LQ01 + ETA_Q)
-  transition asleep -> awake  = exp(LQ10)
-";
+    const MIXED_CTMM: &str = crate::test_models::MODEL_1;
 
     fn ctmm_subject(states: &[(f64, usize)]) -> Subject {
         Subject {
             id: "1".into(),
-            obs_records: states
-                .iter()
-                .map(|&(t, s)| disc(t, s, 5))
-                .collect::<Vec<_>>(),
+            obs_records: states.iter().map(|&(t, s)| disc(t, s, 5)).collect::<Vec<_>>(),
             ..Default::default()
         }
     }
@@ -925,11 +827,7 @@ mod tests {
             let fd = (ctmm_subject_nll(&model, &subject, &theta, &[eta0 + h])
                 - ctmm_subject_nll(&model, &subject, &theta, &[eta0 - h]))
                 / (2.0 * h);
-            assert!(
-                (g[0] - fd).abs() < 1e-6,
-                "η = {eta0}: analytic {}, FD {fd}",
-                g[0]
-            );
+            assert!((g[0] - fd).abs() < 1e-6, "η = {eta0}: analytic {}, FD {fd}", g[0]);
             // A real gradient, not an accidental zero.
             assert!(g[0].abs() > 1e-3, "η = {eta0}: gradient suspiciously flat");
         }
@@ -1078,10 +976,7 @@ mod tests {
         eprintln!(
             "generator_tau_jet: Q {worst_q:.2e}, ∂Q/∂τ {worst_dq:.2e}, max |∂Q/∂τ| {live:.2e}"
         );
-        assert!(
-            live > 1e-3,
-            "∂Q/∂τ is flat: the fixture does not move the state"
-        );
+        assert!(live > 1e-3, "∂Q/∂τ is flat: the fixture does not move the state");
         assert!(worst_q < 1e-12, "Q {worst_q:.2e}");
         assert!(worst_dq < 1e-8, "∂Q/∂τ {worst_dq:.2e}");
     }
@@ -1089,9 +984,7 @@ mod tests {
     /// The drug-driven CTMM fixture of [`a_drug_driven_ctmm_is_differentiated_exactly`] at the
     /// given ODE tolerances and method: two doses, the second on residual drug.
     fn drug_driven_ctmm(
-        reltol: f64,
-        abstol: f64,
-        method: Option<crate::ode::OdeMethod>,
+        reltol: f64, abstol: f64, method: Option<crate::ode::OdeMethod>,
     ) -> (CompiledModel, Subject) {
         drug_driven_ctmm_with(
             "-CL/V * central",
@@ -1104,11 +997,7 @@ mod tests {
 
     /// [`drug_driven_ctmm`] with the `central` right-hand side and the `s0 -> s1` intensity given.
     fn drug_driven_ctmm_with(
-        rhs: &str,
-        q01: &str,
-        reltol: f64,
-        abstol: f64,
-        method: Option<crate::ode::OdeMethod>,
+        rhs: &str, q01: &str, reltol: f64, abstol: f64, method: Option<crate::ode::OdeMethod>,
     ) -> (CompiledModel, Subject) {
         use crate::types::DoseEvent;
         let src = r"
@@ -1181,19 +1070,13 @@ mod tests {
             ([0.05, 0.1, -6.0, -0.7, -5.0], "probability underflow"),
         ] {
             let sentinel = ctmm_subject_nll(&model, &subject, &th, &[0.0]);
-            assert!(
-                sentinel >= 1e19,
-                "{guard}: the value path repels: {sentinel}"
-            );
+            assert!(sentinel >= 1e19, "{guard}: the value path repels: {sentinel}");
             assert!(
                 ctmm_subject_eta_grad(&model, &subject, &th, &[0.0]).is_none(),
                 "{guard}: nothing to differentiate at a repelled point"
             );
             let failed = plan_failures(&model, std::slice::from_ref(&subject));
-            assert!(
-                failed.is_none(),
-                "{guard}: a repelled point is not a failed plan: {failed:?}"
-            );
+            assert!(failed.is_none(), "{guard}: a repelled point is not a failed plan: {failed:?}");
         }
         let (worst_v, worst_g, worst_h) = drug_driven_gaps(&model, &subject);
         assert!(worst_v < 1e-12, "value {worst_v:.2e}");
@@ -1225,10 +1108,7 @@ mod tests {
             assert!(ctmm_subject_nll(&model, &subject, &bad, &[0.0]) >= 1e19);
             assert!(ctmm_subject_eta_grad(&model, &subject, &bad, &[0.0]).is_none());
             let failed = plan_failures(&model, std::slice::from_ref(&subject));
-            assert!(
-                failed.is_none(),
-                "{what}: a repelled point is not a failed plan: {failed:?}"
-            );
+            assert!(failed.is_none(), "{what}: a repelled point is not a failed plan: {failed:?}");
             let (v, _) = ctmm_subject_eta_grad(&model, &subject, &good, &[0.0])
                 .unwrap_or_else(|| panic!("{what}: the plan still serves at an ordinary point"));
             assert!((v - ctmm_subject_nll(&model, &subject, &good, &[0.0])).abs() < 1e-9);
@@ -1247,20 +1127,14 @@ mod tests {
         assert!(ctmm_subject_nll(&model, &subject, &theta, &[50.0]) >= 1e19);
         assert!(ctmm_subject_eta_grad(&model, &subject, &theta, &[50.0]).is_none());
         let failed = plan_failures(&model, std::slice::from_ref(&subject));
-        assert!(
-            failed.is_none(),
-            "a repelled point is not a failed plan: {failed:?}"
-        );
+        assert!(failed.is_none(), "a repelled point is not a failed plan: {failed:?}");
         // An unconstrained intensity driven negative: the value path's negative off-diagonal.
         let linear = MIXED_CTMM.replace("exp(LQ01 + ETA_Q)", "LQ01 + ETA_Q");
         let model_l = crate::parser::model_parser::parse_model_string(&linear).expect("parse");
         assert!(ctmm_subject_nll(&model_l, &subject, &theta, &[0.0]) >= 1e19);
         assert!(ctmm_subject_eta_grad(&model_l, &subject, &theta, &[0.0]).is_none());
         let failed = plan_failures(&model_l, std::slice::from_ref(&subject));
-        assert!(
-            failed.is_none(),
-            "a negative off-diagonal is not a failed plan: {failed:?}"
-        );
+        assert!(failed.is_none(), "a negative off-diagonal is not a failed plan: {failed:?}");
         assert!(ctmm_subject_eta_grad(&model_l, &subject, &[2.0, -1.2], &[0.3]).is_some());
         let (v, g) = ctmm_subject_eta_grad(&model, &subject, &theta, &[0.3])
             .expect("the plan still serves at an ordinary point");
@@ -1269,11 +1143,7 @@ mod tests {
             - ctmm_subject_nll(&model, &subject, &theta, &[0.3 - h]))
             / (2.0 * h);
         assert!((v - ctmm_subject_nll(&model, &subject, &theta, &[0.3])).abs() < 1e-12);
-        assert!(
-            (g[0] - fd).abs() < 1e-6 && g[0].abs() > 1e-3,
-            "{} vs {fd}",
-            g[0]
-        );
+        assert!((g[0] - fd).abs() < 1e-6 && g[0].abs() > 1e-3, "{} vs {fd}", g[0]);
     }
 
     /// The worst relative gaps of the drug-driven fixture: the exact path's value against the
@@ -1299,11 +1169,7 @@ mod tests {
             worst_g = worst_g.max((g[0] - fd).abs() / (1.0 + fd.abs()));
             let (_, h) = ctmm_subject_eta_hessian(&model, &subject, &theta, &[eta0]).unwrap();
             let hd = rich(
-                &|e| {
-                    ctmm_subject_eta_grad(&model, &subject, &theta, &[e])
-                        .unwrap()
-                        .1[0]
-                },
+                &|e| ctmm_subject_eta_grad(&model, &subject, &theta, &[e]).unwrap().1[0],
                 eta0,
             );
             assert!(h[(0, 0)].is_finite() && hd.is_finite());
@@ -1495,11 +1361,8 @@ mod tests {
 
         // The straddle: KA differs at the baseline snapshot the solve integrates under, and
         // is the control's in-domain value at both dose records.
-        let ka_slot = model.pk_indices[model
-            .indiv_param_names
-            .iter()
-            .position(|n| n == "KA")
-            .expect("KA")];
+        let ka_slot =
+            model.pk_indices[model.indiv_param_names.iter().position(|n| n == "KA").expect("KA")];
         let ka = |cov: &HashMap<String, f64>, t: f64| {
             (model.pk_param_fn)(theta, &eta, cov, t).values[ka_slot]
         };
@@ -1514,10 +1377,7 @@ mod tests {
             ctmm_subject_nll(&model, &ctl, theta, &eta),
         );
         let drug_free = ctmm_subject_nll(&model, &ctmm_subject(&obs), theta, &eta);
-        assert!(
-            nll_ctl.is_finite() && nll_ctl != SUBJECT_SENTINEL_NLL,
-            "control NLL {nll_ctl}"
-        );
+        assert!(nll_ctl.is_finite() && nll_ctl != SUBJECT_SENTINEL_NLL, "control NLL {nll_ctl}");
         assert!(
             (nll_ctl - drug_free).abs() > 1e-1,
             "control NLL {nll_ctl} sits at the drug-free {drug_free}: the generator does not \
@@ -1541,11 +1401,7 @@ mod tests {
     /// what `validate_ctmm_states` rejects up front).
     #[test]
     fn ctmm_endpoint_unknown_code_sentinels() {
-        let got = nll(
-            &[0, 1],
-            &const_gen(0.4, 0.6),
-            &[disc(0.0, 0, 5), disc(1.0, 9, 5)],
-        );
+        let got = nll(&[0, 1], &const_gen(0.4, 0.6), &[disc(0.0, 0, 5), disc(1.0, 9, 5)]);
         assert_eq!(got, SUBJECT_SENTINEL_NLL);
     }
 
@@ -1563,11 +1419,7 @@ mod tests {
         );
         assert_eq!(got, SUBJECT_SENTINEL_NLL);
         // A valid (non-negative off-diagonal) generator on the same data does not.
-        let ok = nll(
-            &[0, 1],
-            &const_gen(0.4, 0.6),
-            &[disc(0.0, 0, 5), disc(1.0, 1, 5)],
-        );
+        let ok = nll(&[0, 1], &const_gen(0.4, 0.6), &[disc(0.0, 0, 5), disc(1.0, 1, 5)]);
         assert!(ok.is_finite() && ok < SUBJECT_SENTINEL_NLL, "got {ok}");
     }
 
@@ -1650,35 +1502,27 @@ mod tests {
     /// `Q` and `∂Q/∂(θ, η)` from the dual-evaluable program over `Dual2<N>`, θ_m on axis
     /// `m` and η_k on axis `n_θ + k` (`N = n_θ + n_η`): `dq[a]` is `∂Q/∂(axis a)`.
     fn generator_duals<const N: usize>(
-        prog: &crate::parser::model_parser::CtmmGeneratorProgram,
-        theta: &[f64],
-        eta: &[f64],
+        prog: &crate::parser::model_parser::CtmmGeneratorProgram, theta: &[f64], eta: &[f64],
         covariates: &HashMap<String, f64>,
     ) -> (DMatrix<f64>, Vec<DMatrix<f64>>) {
         use crate::sens::dual2::Dual2;
         assert_eq!(N, theta.len() + eta.len(), "one dual axis per θ and η");
         let th: Vec<Dual2<N>> = (0..theta.len()).map(|m| Dual2::var(theta[m], m)).collect();
-        let et: Vec<Dual2<N>> = (0..eta.len())
-            .map(|k| Dual2::var(eta[k], theta.len() + k))
-            .collect();
+        let et: Vec<Dual2<N>> =
+            (0..eta.len()).map(|k| Dual2::var(eta[k], theta.len() + k)).collect();
         let q = prog
             .eval_generator_g(&th, &et, covariates)
             .expect("the program reads no more θ/η than given");
         let s = (q.len() as f64).sqrt() as usize;
         let val = DMatrix::from_fn(s, s, |j, k| q[j * s + k].value);
-        let dq = (0..N)
-            .map(|a| DMatrix::from_fn(s, s, |j, k| q[j * s + k].grad[a]))
-            .collect();
+        let dq = (0..N).map(|a| DMatrix::from_fn(s, s, |j, k| q[j * s + k].grad[a])).collect();
         (val, dq)
     }
 
     /// Proportional-odds steady state `π_k = F_k − F_{k−1}`, `F_k = inv_logit(α_k − lp)`,
     /// computed here independently of the parser's expansion.
     fn po_steady_state(cuts: &[f64], lp: f64) -> Vec<f64> {
-        let f: Vec<f64> = cuts
-            .iter()
-            .map(|a| 1.0 / (1.0 + (-(a - lp)).exp()))
-            .collect();
+        let f: Vec<f64> = cuts.iter().map(|a| 1.0 / (1.0 + (-(a - lp)).exp())).collect();
         let mut pi = Vec::with_capacity(cuts.len() + 1);
         let mut prev = 0.0;
         for fk in f.iter().chain(std::iter::once(&1.0)) {
@@ -1721,10 +1565,7 @@ mod tests {
             assert!(flow.abs() < 1e-14, "(πQ)[{j}] = {flow}");
         }
         let pi_hi = po_steady_state(&[c1, c1 + theta[2].exp()], theta[3] * 2.0);
-        assert!(
-            pi_hi[2] > pi[2] && pi_hi[0] < pi[0],
-            "lp must shift mass to higher states"
-        );
+        assert!(pi_hi[2] > pi[2] && pi_hi[0] < pi[0], "lp must shift mass to higher states");
     }
 
     /// Two-state closed form, independent of `expm`: with `π = (p₀, p₁)` the mCTMM is
@@ -1786,10 +1627,7 @@ mod tests {
             )
         };
         let up01 = format!("inv_logit((-{x0})) * {om}");
-        let down01 = format!(
-            "exp({})",
-            spd(&format!("(-{x1})"), &format!("(-{x0})"), g01)
-        );
+        let down01 = format!("exp({})", spd(&format!("(-{x1})"), &format!("(-{x0})"), g01));
         let up12 = format!("exp({})", spd(x0, x1, g01));
         let down12 = format!("inv_logit({x1}) * {om}");
         let hand = MCTMM_3
@@ -1864,19 +1702,13 @@ mod tests {
 
         // θ: generator jets.
         let prog = match model.endpoints.get(&5) {
-            Some(EndpointLikelihood::Ctmm {
-                generator_program: Some(p),
-                ..
-            }) => p,
+            Some(EndpointLikelihood::Ctmm { generator_program: Some(p), .. }) => p,
             _ => panic!("expected a dual-evaluable mCTMM program"),
         };
         let gen = generator_of(&model);
         let (q, dq) = generator_duals::<6>(prog, &theta, &eta, &subject.covariates);
         let q0 = gen(&theta, &eta, &subject.covariates, &[]);
-        assert!(
-            (&q - &q0).amax() < 1e-14,
-            "dual value drifted from the f64 generator"
-        );
+        assert!((&q - &q0).amax() < 1e-14, "dual value drifted from the f64 generator");
         for m in 0..theta.len() {
             let (mut tp, mut tm) = (theta, theta);
             tp[m] += h;
@@ -1989,10 +1821,9 @@ mod tests {
             let q = generator_of(&model)(&[a0, d], &[], &HashMap::new(), &[]);
             for k in 0..2 {
                 let s = pi[k] + pi[k + 1];
-                for (got, want, dir) in [
-                    (q[(k, k + 1)], pi[k + 1] / s, "up"),
-                    (q[(k + 1, k)], pi[k] / s, "down"),
-                ] {
+                for (got, want, dir) in
+                    [(q[(k, k + 1)], pi[k + 1] / s, "up"), (q[(k + 1, k)], pi[k] / s, "down")]
+                {
                     assert!(
                         got > 0.0 && (got / want - 1.0).abs() < 1e-13,
                         "cuts [{c0}, {c1}]: pair {k} {dir} rate {got}, want {want}"
@@ -2011,10 +1842,7 @@ mod tests {
             // `q12 = 2σ(−D)`, `q21 = 1 − 2σ(−D)`, differentiated by hand below.
             if a0 == 0.0 {
                 let prog = match model.endpoints.get(&5) {
-                    Some(EndpointLikelihood::Ctmm {
-                        generator_program: Some(p),
-                        ..
-                    }) => p,
+                    Some(EndpointLikelihood::Ctmm { generator_program: Some(p), .. }) => p,
                     _ => panic!("expected a dual-evaluable mCTMM program"),
                 };
                 let (_, dq) = generator_duals::<2>(prog, &[a0, d], &[], &HashMap::new());
@@ -2064,14 +1892,9 @@ mod tests {
         let e1 = (-1.0_f64).exp();
         let high = [(1.0 - e1, e1), (1.0, 0.0)];
         let low = [(0.0, 1.0), (e1, 1.0 - e1)];
-        for (lp, want) in [
-            (40.0, high),
-            (800.0, high),
-            (1e16, high),
-            (-40.0, low),
-            (-800.0, low),
-            (-1e16, low),
-        ] {
+        for (lp, want) in
+            [(40.0, high), (800.0, high), (1e16, high), (-40.0, low), (-800.0, low), (-1e16, low)]
+        {
             let q = generator_of(&model)(&[lp], &[], &HashMap::new(), &[]);
             for (k, (up, down)) in want.into_iter().enumerate() {
                 for (got, want, dir) in [(q[(k, k + 1)], up, "up"), (q[(k + 1, k)], down, "down")] {
@@ -2126,10 +1949,7 @@ mod tests {
                 "τ = {tau}: generator must carry a negative rate, got {q}"
             );
             let v = ctmm_subject_nll(&model, &subject, &[tau, 0.2], &[]);
-            assert_eq!(
-                v, SUBJECT_SENTINEL_NLL,
-                "τ = {tau}: NLL {v} must be the sentinel"
-            );
+            assert_eq!(v, SUBJECT_SENTINEL_NLL, "τ = {tau}: NLL {v} must be the sentinel");
             assert!(
                 ctmm_subject_eta_grad(&model, &subject, &[tau, 0.2], &[]).is_none(),
                 "τ = {tau}: the analytic gradient must decline a repelled point"
@@ -2185,10 +2005,7 @@ mod tests {
                 "cuts {cuts:?}: every adjacent rate must be the −1 repellent, got {q}"
             );
             let v = ctmm_subject_nll(&model, &subject, &cuts, &[]);
-            assert_eq!(
-                v, SUBJECT_SENTINEL_NLL,
-                "cuts {cuts:?}: NLL {v} must be the sentinel"
-            );
+            assert_eq!(v, SUBJECT_SENTINEL_NLL, "cuts {cuts:?}: NLL {v} must be the sentinel");
         }
         let ok = [0.0_f64, 1.0, 2.0, 3.0];
         let q = gen(&ok, &[], &HashMap::new(), &[]);
@@ -2268,12 +2085,7 @@ mod exact_eta_hessian_tests {
         .unwrap();
         let m = &pd.parsed.model;
         if m.n_eta > 0 {
-            let s = pd
-                .population
-                .subjects
-                .iter()
-                .find(|s| !s.obs_records.is_empty())
-                .unwrap();
+            let s = pd.population.subjects.iter().find(|s| !s.obs_records.is_empty()).unwrap();
             let e = vec![0.0; m.n_eta];
             // The drug-driven example is served too (`a_drug_driven_ctmm_is_differentiated_exactly`
             // pins the values).

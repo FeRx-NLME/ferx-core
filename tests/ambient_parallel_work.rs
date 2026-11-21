@@ -15,10 +15,7 @@ fn a_declared_thread_count_reaches_parallel_work_outside_a_fit() {
     ferx_core::configure_global_thread_pool(2).expect("declare the process-wide width");
 
     let widths: Vec<usize> = ferx_core::install_on_engine_pool(|| {
-        (0..64)
-            .into_par_iter()
-            .map(|_| rayon::current_num_threads())
-            .collect()
+        (0..64).into_par_iter().map(|_| rayon::current_num_threads()).collect()
     });
 
     assert!(!widths.is_empty(), "the parallel work did not run");
@@ -34,10 +31,7 @@ fn a_declared_thread_count_reaches_parallel_work_outside_a_fit() {
     // worker per logical CPU (measured: 15 on a 15-core host, where 2 was asked for).
     // Building the global pool here can only succeed if nothing already did.
     assert!(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build_global()
-            .is_ok(),
+        rayon::ThreadPoolBuilder::new().num_threads(1).build_global().is_ok(),
         "Rayon's global pool already existed: something ran ambient parallel work, at \
          one worker per logical CPU rather than the declared 2"
     );
@@ -56,8 +50,5 @@ fn a_declared_thread_count_reaches_parallel_work_outside_a_fit() {
         err.contains('2') && err.contains('4'),
         "the refusal must name the count in force and the one asked for: {err}"
     );
-    assert!(
-        ferx_core::configure_global_thread_pool(0).is_err(),
-        "0 is not a width"
-    );
+    assert!(ferx_core::configure_global_thread_pool(0).is_err(), "0 is not a width");
 }

@@ -1,0 +1,5 @@
+# Denser layout: let rustfmt use the full `max_width` (100) before splitting a call,
+# literal or chain over several lines, and pack function parameters onto as few
+# lines as fit instead of one per line once they no longer fit on one.
+use_small_heuristics = "Max"
+fn_params_layout = "Compressed"

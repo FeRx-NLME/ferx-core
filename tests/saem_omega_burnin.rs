@@ -125,9 +125,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
 /// being exercised here; pinning to 3 keeps the recovery driven by the burn-in
 /// and the damped Ω SA step rather than by raw mixing.
 fn fit_trace(
-    model: &ferx_core::types::CompiledModel,
-    population: &Population,
-    omega_burnin: usize,
+    model: &ferx_core::types::CompiledModel, population: &Population, omega_burnin: usize,
 ) -> f64 {
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
@@ -147,10 +145,7 @@ fn fit_trace(
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_burnin_recovers_omega_on_sparse_data() {
     let model = parse_model_string(MODEL).expect("model must parse");
     let template = sparse_population(300);

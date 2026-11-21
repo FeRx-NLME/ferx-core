@@ -112,11 +112,8 @@ fn iov_scratch_reuses_capacity_but_refreshes_every_event_snapshot() {
         let mut scratch = EventPkParams::default();
         let mut prior = None;
         let mut storage = None;
-        for (cl, eta, k1, k2) in [
-            (3., 0.1, 0.3, -0.2),
-            (4., -0.3, -0.6, 0.5),
-            (3., 0.1, 0.3, -0.2),
-        ] {
+        for (cl, eta, k1, k2) in [(3., 0.1, 0.3, -0.2), (4., -0.3, -0.6, 0.5), (3., 0.1, 0.3, -0.2)]
+        {
             let theta = [cl, 20.];
             let kappas = vec![vec![k1], vec![k2]];
             let fresh = predict_iov(&m, &subj, &theta, &[eta], &kappas);
@@ -188,10 +185,7 @@ fn iov_scratch_shrinks_and_clears_unused_event_vectors() {
     subj.pk_only_covariates.clear();
     let actual =
         predict_iov_with_scratch(&analytical, &subj, &theta, &[0.1], &kappas, &mut scratch);
-    assert_eq!(
-        bits(&actual),
-        bits(&predict_iov(&analytical, &subj, &theta, &[0.1], &kappas))
-    );
+    assert_eq!(bits(&actual), bits(&predict_iov(&analytical, &subj, &theta, &[0.1], &kappas)));
     assert_eq!(scratch.obs.len(), 1);
     assert_eq!(scratch.obs.capacity(), capacity);
     assert!(scratch.pk_only.is_empty() && scratch.reset.is_empty());
@@ -206,10 +200,8 @@ fn iov_scratch_shrinks_and_clears_unused_event_vectors() {
     subj.doses = vec![DoseEvent::new(0., 100., 1, 0., false, 0.)];
     subj.dose_occasions = vec![11];
     subj.dose_covariates = vec![cov(75.)];
-    assert!(
-        predict_iov_with_scratch(&analytical, &subj, &theta, &[0.1], &kappas, &mut scratch)
-            .is_empty()
-    );
+    assert!(predict_iov_with_scratch(&analytical, &subj, &theta, &[0.1], &kappas, &mut scratch)
+        .is_empty());
     assert_eq!(scratch.dose.len(), 1);
     assert!(scratch.obs.is_empty() && scratch.pk_only.is_empty() && scratch.reset.is_empty());
 }
@@ -284,12 +276,8 @@ fn the_iov_record_table_predicts_what_per_record_copies_predict() {
             };
             let layout = crate::stats::stacked_layout::StackedLayout::of(&model, subject);
             for _ in 0..3 {
-                let theta: Vec<f64> = model
-                    .default_params
-                    .theta
-                    .iter()
-                    .map(|&t| t * (1.0 + 0.2 * rnd()))
-                    .collect();
+                let theta: Vec<f64> =
+                    model.default_params.theta.iter().map(|&t| t * (1.0 + 0.2 * rnd())).collect();
                 let eta: Vec<f64> = (0..model.n_eta).map(|_| rnd()).collect();
                 let kappas: Vec<Vec<f64>> = (0..layout.n_groups())
                     .map(|_| (0..model.n_kappa).map(|_| 0.5 * rnd()).collect())
@@ -325,8 +313,5 @@ fn the_iov_record_table_predicts_what_per_record_copies_predict() {
             subjects_checked += 1;
         }
     }
-    assert!(
-        subjects_checked >= 10,
-        "only {subjects_checked} IOV subjects checked"
-    );
+    assert!(subjects_checked >= 10, "only {subjects_checked} IOV subjects checked");
 }

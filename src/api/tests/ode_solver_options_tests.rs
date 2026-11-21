@@ -21,7 +21,6 @@
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
-use std::collections::HashMap;
 
 /// A hand-written ODE 1-cpt IV model, so the objective goes through the integrator rather than
 /// a closed form. `tail` carries any `[fit_options]` the case needs baked onto the spec.
@@ -57,39 +56,15 @@ fn ode_model(tail: &str) -> CompiledModel {
 
 fn subject(id: &str, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
-    let observations = obs_times
-        .iter()
-        .map(|t| scale * 10.0 * (-0.1f64 * t).exp())
-        .collect();
+    let observations = obs_times.iter().map(|t| scale * 10.0 * (-0.1f64 * t).exp()).collect();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1, 1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -107,19 +82,12 @@ fn population() -> Population {
 /// `outer_maxiter: 0` evaluates the objective at the initial vector and returns — enough to see
 /// which tolerance the integrator ran at, without a convergence loop.
 fn eval_opts() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..Default::default()
-    }
-    .quiet()
+    FitOptions { outer_maxiter: 0, run_covariance_step: false, ..Default::default() }.quiet()
 }
 
 fn ofv(model: &CompiledModel, opts: &FitOptions) -> f64 {
     let pop = population();
-    fit(model, &pop, &model.default_params, opts)
-        .expect("the evaluation must succeed")
-        .ofv
+    fit(model, &pop, &model.default_params, opts).expect("the evaluation must succeed").ofv
 }
 
 /// The regression this issue was filed for. Six orders of magnitude of tolerance have to move
@@ -129,14 +97,7 @@ fn ofv(model: &CompiledModel, opts: &FitOptions) -> f64 {
 fn a_caller_supplied_ode_tolerance_reaches_the_integrator() {
     let model = ode_model("");
     let loose = ofv(&model, &eval_opts());
-    let tight = ofv(
-        &model,
-        &FitOptions {
-            ode_reltol: 1e-10,
-            ode_abstol: 1e-12,
-            ..eval_opts()
-        },
-    );
+    let tight = ofv(&model, &FitOptions { ode_reltol: 1e-10, ode_abstol: 1e-12, ..eval_opts() });
     assert_ne!(
         loose.to_bits(),
         tight.to_bits(),
@@ -165,14 +126,8 @@ fn an_untouched_ode_tolerance_keeps_the_model_files_pinned_value() {
     // Default `ode_*` in the options, tight values on the spec: the spec's must win.
     let from_file = ofv(&pinned, &eval_opts());
     // Same effective accuracy reached the other way round — default spec, tight options.
-    let from_caller = ofv(
-        &plain,
-        &FitOptions {
-            ode_reltol: 1e-10,
-            ode_abstol: 1e-12,
-            ..eval_opts()
-        },
-    );
+    let from_caller =
+        ofv(&plain, &FitOptions { ode_reltol: 1e-10, ode_abstol: 1e-12, ..eval_opts() });
     assert_eq!(
         from_file.to_bits(),
         from_caller.to_bits(),
@@ -209,11 +164,7 @@ fn a_caller_supplied_ode_tolerance_reaches_the_standalone_covariance_step() {
     };
 
     let loose = se(&eval_opts());
-    let tight = se(&FitOptions {
-        ode_reltol: 1e-10,
-        ode_abstol: 1e-12,
-        ..eval_opts()
-    });
+    let tight = se(&FitOptions { ode_reltol: 1e-10, ode_abstol: 1e-12, ..eval_opts() });
 
     assert_eq!(loose.len(), tight.len());
     // Every entry must be a real number before the comparison folds them: a `NaN` from a
@@ -223,10 +174,7 @@ fn a_caller_supplied_ode_tolerance_reaches_the_standalone_covariance_step() {
         "the covariance step returned non-finite standard errors ({loose:?} vs {tight:?})"
     );
     assert!(
-        loose
-            .iter()
-            .zip(tight.iter())
-            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        loose.iter().zip(tight.iter()).any(|(a, b)| a.to_bits() != b.to_bits()),
         "#1212: `ode_reltol` passed to `run_covariance` must reach the integrator, but the \
          standard errors are bit-identical at 1e-4 and 1e-10 ({loose:?} vs {tight:?})"
     );
@@ -238,24 +186,9 @@ fn a_caller_supplied_ode_tolerance_reaches_the_standalone_covariance_step() {
 #[test]
 fn a_fits_ode_options_do_not_outlive_it() {
     let model = ode_model("");
-    let baked = model
-        .ode_spec
-        .as_ref()
-        .expect("an ODE model has a spec")
-        .solver_opts;
-    let _ = ofv(
-        &model,
-        &FitOptions {
-            ode_reltol: 1e-10,
-            ode_abstol: 1e-12,
-            ..eval_opts()
-        },
-    );
-    let after = model
-        .ode_spec
-        .as_ref()
-        .expect("an ODE model has a spec")
-        .effective_solver_opts();
+    let baked = model.ode_spec.as_ref().expect("an ODE model has a spec").solver_opts;
+    let _ = ofv(&model, &FitOptions { ode_reltol: 1e-10, ode_abstol: 1e-12, ..eval_opts() });
+    let after = model.ode_spec.as_ref().expect("an ODE model has a spec").effective_solver_opts();
     assert_eq!(after.reltol, baked.reltol);
     assert_eq!(after.abstol, baked.abstol);
 }
@@ -273,18 +206,12 @@ fn the_fit_reports_whether_the_exact_linear_path_ran() {
             .ode_linear_exact
     };
     assert!(ran_exact(&linear, &eval_opts()), "auto on a linear model");
-    let integrated = FitOptions {
-        ode_method: crate::ode::OdeMethod::Rk45,
-        ..eval_opts()
-    };
+    let integrated = FitOptions { ode_method: crate::ode::OdeMethod::Rk45, ..eval_opts() };
     assert!(
         !ran_exact(&linear, &integrated),
         "a caller's ode_method = rk45 must take the linear model off the exact path"
     );
-    assert!(
-        !ran_exact(&ode_model(""), &eval_opts()),
-        "the saturable fixture is integrated"
-    );
+    assert!(!ran_exact(&ode_model(""), &eval_opts()), "the saturable fixture is integrated");
     // Routed to the exact path, but every segment declined: two inert sinks at one rate give
     // a repeated eigenvalue, which the spectral propagator declines, and their rate puts
     // ‖A·dt‖ past the Padé exponential's squaring budget, so each segment is integrated
@@ -300,12 +227,7 @@ fn the_fit_reports_whether_the_exact_linear_path_ran() {
     )
     .expect("declined model parses");
     assert_eq!(
-        declined
-            .ode_spec
-            .as_ref()
-            .unwrap()
-            .effective_solver_opts()
-            .method,
+        declined.ode_spec.as_ref().unwrap().effective_solver_opts().method,
         crate::ode::OdeMethod::Linear,
         "the fixture must be routed to the exact path, or it tests nothing"
     );
@@ -342,10 +264,7 @@ const LINEAR_SOURCE: &str = r#"
 #[test]
 fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
     let pop = population();
-    let linear_opts = FitOptions {
-        ode_method: crate::ode::OdeMethod::Linear,
-        ..eval_opts()
-    };
+    let linear_opts = FitOptions { ode_method: crate::ode::OdeMethod::Linear, ..eval_opts() };
     let refusal =
         |model: &CompiledModel| match fit(model, &pop, &model.default_params, &linear_opts) {
             Ok(_) => panic!("`ode_method = Linear` from FitOptions must be refused"),
@@ -357,10 +276,7 @@ fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
         e.contains("this [odes] model cannot be propagated exactly — an equation is not linear in the states"),
         "{e}"
     );
-    assert!(
-        e.contains("Use `ode_method = auto` (the default) to integrate it."),
-        "{e}"
-    );
+    assert!(e.contains("Use `ode_method = auto` (the default) to integrate it."), "{e}");
 
     let analytical = parse_model_string(
         &LINEAR_SOURCE
@@ -371,10 +287,7 @@ fn a_callers_ode_method_linear_is_refused_on_a_model_that_cannot_take_it() {
     .expect("analytical twin parses");
     assert!(analytical.ode_spec.is_none(), "fixture must be analytical");
     let e = refusal(&analytical);
-    assert!(
-        e.contains("applies to an [odes] model, and this model has none,"),
-        "{e}"
-    );
+    assert!(e.contains("applies to an [odes] model, and this model has none,"), "{e}");
 
     // The straddle: the same option on a certified model fits, on the exact path.
     let linear = parse_model_string(LINEAR_SOURCE).expect("linear model parses");
@@ -392,10 +305,7 @@ fn run_covariance_and_run_sir_refuse_ode_method_linear_on_an_ineligible_model() 
     let model = ode_model("");
     let pop = population();
     let fitted = fit(&model, &pop, &model.default_params, &eval_opts()).expect("the fit runs");
-    let linear = FitOptions {
-        ode_method: crate::ode::OdeMethod::Linear,
-        ..eval_opts()
-    };
+    let linear = FitOptions { ode_method: crate::ode::OdeMethod::Linear, ..eval_opts() };
     let lead = "fit option `ode_method = linear`: this [odes] model cannot be propagated exactly";
     let refused = |label: &str, r: Result<FitResult, crate::diagnostics::EngineError>| {
         let e = match r {

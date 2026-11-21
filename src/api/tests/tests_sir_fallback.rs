@@ -91,31 +91,22 @@ fn sir_unavailable_warning_explains_a_bayesian_fit_instead_of_blaming_covariance
         !msg.contains("covariance = true"),
         "must not tell a Bayesian user to enable covariance: {msg}"
     );
-    assert!(
-        msg.contains("Bayesian"),
-        "warning should name the actual reason: {msg}"
-    );
+    assert!(msg.contains("Bayesian"), "warning should name the actual reason: {msg}");
     // Silent for a Bayesian fit that did not ask for SIR.
     assert!(sir_unavailable_warning(false, true, true, false, false, false).is_none());
 }
 
 // ── resolve_sir_fallback (gate + run_sir_core + status, #264) ─────────────
 
-fn warfarin_fixture() -> (
-    CompiledModel,
-    Population,
-    ModelParameters,
-    Vec<DVector<f64>>,
-    DMatrix<f64>,
-) {
+fn warfarin_fixture(
+) -> (CompiledModel, Population, ModelParameters, Vec<DVector<f64>>, DMatrix<f64>) {
     let model = crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
         .expect("warfarin model parses");
     let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
     let params = model.default_params.clone();
-    let eta_hats: Vec<DVector<f64>> = (0..pop.subjects.len())
-        .map(|_| DVector::zeros(params.omega.dim()))
-        .collect();
+    let eta_hats: Vec<DVector<f64>> =
+        (0..pop.subjects.len()).map(|_| DVector::zeros(params.omega.dim())).collect();
     // Tame fallback-style proposal: small PD diagonal in packed space, so
     // draws stay near valid parameters (positive θ/σ, PD Ω) and SIR yields
     // finite weights. A real non-PD fixture risks a wide proposal whose draws
@@ -146,14 +137,8 @@ fn resolve_sir_fallback_is_none_when_option_off() {
         0.0,
         &mut warnings,
     );
-    assert!(
-        result.is_none(),
-        "fallback must not fire when covariance_fallback = none"
-    );
-    assert!(
-        warnings.is_empty(),
-        "no warning when the gate simply declines: {warnings:?}"
-    );
+    assert!(result.is_none(), "fallback must not fire when covariance_fallback = none");
+    assert!(warnings.is_empty(), "no warning when the gate simply declines: {warnings:?}");
 }
 
 /// End-to-end fallback wiring (#264): with `covariance_fallback = sir`, no
@@ -205,12 +190,7 @@ fn resolve_sir_fallback_fires_and_yields_finite_cis() {
     let sir = result.expect("fallback should fire and SIR should succeed with a tame proposal");
 
     assert!(!sir.ci_theta.is_empty(), "theta CIs must be populated");
-    for (lo, hi) in sir
-        .ci_theta
-        .iter()
-        .chain(&sir.ci_omega)
-        .chain(&sir.ci_sigma)
-    {
+    for (lo, hi) in sir.ci_theta.iter().chain(&sir.ci_omega).chain(&sir.ci_sigma) {
         assert!(
             lo.is_finite() && hi.is_finite() && lo <= hi,
             "SIR-fallback CI must be finite and ordered, got ({lo}, {hi})"
@@ -258,16 +238,9 @@ fn assert_sir_fields_from(out: &FitResult, sir: &crate::estimation::sir::SirResu
     assert_eq!(out.sir_ci_sigma.as_ref(), Some(&sir.ci_sigma), "{who}: σ");
     assert_eq!(out.sir_ci_kappa.as_ref(), Some(&sir.ci_kappa), "{who}: κ");
     assert_eq!(out.sir_ess, Some(sir.effective_sample_size), "{who}: ESS");
-    assert_eq!(
-        out.sir_resamples_packed, sir.resamples_packed,
-        "{who}: resamples"
-    );
+    assert_eq!(out.sir_resamples_packed, sir.resamples_packed, "{who}: resamples");
     assert_eq!(out.sir_seed, Some(sir.settings.seed), "{who}: seed");
-    assert_eq!(
-        out.sir_settings.as_ref(),
-        Some(&sir.settings),
-        "{who}: settings"
-    );
+    assert_eq!(out.sir_settings.as_ref(), Some(&sir.settings), "{who}: settings");
 }
 
 /// T1 (#1713): with only the non-PD fallback run, all eight SIR fields come
@@ -334,9 +307,8 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
     let model = &prep.parsed.model;
     let pop = &prep.population;
     let params = prep.init_params.clone();
-    let eta_hats: Vec<DVector<f64>> = (0..pop.subjects.len())
-        .map(|_| DVector::zeros(model.n_eta))
-        .collect();
+    let eta_hats: Vec<DVector<f64>> =
+        (0..pop.subjects.len()).map(|_| DVector::zeros(model.n_eta)).collect();
     let n_packed = crate::estimation::parameterization::pack_params(&params).len();
     let proposal = DMatrix::from_diagonal(&DVector::from_element(n_packed, 0.01));
     let opts = FitOptions {
@@ -379,10 +351,7 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
     .unwrap_or_else(|| panic!("the fallback must run: {warnings:?}"));
     assert_eq!(sir.ci_kappa.len(), 1, "one κ interval: {:?}", sir.ci_kappa);
     let (lo, hi) = sir.ci_kappa[0];
-    assert!(
-        lo.is_finite() && hi.is_finite() && lo <= hi,
-        "κ [{lo}, {hi}]"
-    );
+    assert!(lo.is_finite() && hi.is_finite() && lo <= hi, "κ [{lo}, {hi}]");
     let want = crate::estimation::sir::SirSettings::from_options(&opts);
     assert_ne!(
         want,
@@ -394,10 +363,7 @@ fn resolve_sir_fallback_records_its_settings_and_kappa() {
     // `want` comes from `from_options` itself, so the equality above cannot see a field
     // `from_options` drops; the per-call inner settings are pinned against the options directly.
     assert_eq!(
-        (
-            sir.settings.scoring.inner_optimizer,
-            sir.settings.scoring.ebe_warm_start
-        ),
+        (sir.settings.scoring.inner_optimizer, sir.settings.scoring.ebe_warm_start),
         (crate::types::InnerOptimizer::Lbfgs, true),
         "the recorded inner settings must be the ones passed"
     );
@@ -421,13 +387,8 @@ fn a_fit_without_sir_reports_no_sir_seed_or_settings() {
         outer_maxiter: 2,
         ..prep.parsed.fit_options.clone()
     };
-    let fit = crate::api::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("fit");
+    let fit = crate::api::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("fit");
     assert_eq!(fit.sir_ess, None, "SIR must not have run");
     assert_eq!(fit.sir_seed, None);
     assert_eq!(fit.sir_settings, None);

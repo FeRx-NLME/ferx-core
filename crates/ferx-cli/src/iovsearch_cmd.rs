@@ -135,11 +135,7 @@ fn run_iovsearch_command(args: &[String]) -> Result<i32, String> {
                 "Step {step}: fitting {candidates} candidate{}...",
                 if candidates == 1 { "" } else { "s" }
             ),
-            IovsearchEvent::StepFinished {
-                step,
-                best,
-                improved,
-            } => eprintln!(
+            IovsearchEvent::StepFinished { step, best, improved } => eprintln!(
                 "Step {step}: {} {} (criterion {:.3})",
                 if improved { "best" } else { "kept" },
                 best.0,
@@ -154,12 +150,7 @@ fn run_iovsearch_command(args: &[String]) -> Result<i32, String> {
     let result = run_iovsearch(
         &config,
         &base,
-        IovsearchRun {
-            dir: Some(dir.clone()),
-            threads,
-            cancel: None,
-            progress: Some(&progress),
-        },
+        IovsearchRun { dir: Some(dir.clone()), threads, cancel: None, progress: Some(&progress) },
     )?;
 
     print!("{}", render_summary(&result));
@@ -285,40 +276,17 @@ mod tests {
         let no_column = dir.path().join("no-occ");
         std::fs::create_dir(&no_column).unwrap();
         let config = write_config(&no_column, "", "");
-        std::fs::write(
-            no_column.join("base.ferx"),
-            BASE.replace("  iov_column = OCC\n", ""),
-        )
-        .unwrap();
-        assert_eq!(
-            run(&args(&["ferx", "iovsearch", &config.to_string_lossy()])),
-            1
-        );
+        std::fs::write(no_column.join("base.ferx"), BASE.replace("  iov_column = OCC\n", ""))
+            .unwrap();
+        assert_eq!(run(&args(&["ferx", "iovsearch", &config.to_string_lossy()])), 1);
     }
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "iovsearch",
-                "a.ferxsearch",
-                "b.ferxsearch"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "iovsearch", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "iovsearch", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "iovsearch", "-h"])), 0);
         assert_eq!(run(&args(&["ferx", "iovsearch"])), 1);
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "iovsearch",
-                "x.ferxsearch",
-                "--samples",
-                "3"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "iovsearch", "x.ferxsearch", "--samples", "3"])), 1);
     }
 }

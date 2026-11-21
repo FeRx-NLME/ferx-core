@@ -65,9 +65,7 @@ struct Reference {
 }
 
 fn reference() -> Reference {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(ANCHOR)
-        .join("pharmpy_iivsearch.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ANCHOR).join("pharmpy_iivsearch.json");
     let text = std::fs::read_to_string(&path).expect("anchor json");
     serde_json::from_str(&text).expect("anchor json")
 }
@@ -94,10 +92,7 @@ fn run(dir: &Path, mfl: &str, algorithm: &str) -> IivsearchResult {
     run_iivsearch(
         &config,
         &base,
-        IivsearchRun {
-            dir: Some(dir.join("run")),
-            ..IivsearchRun::default()
-        },
+        IivsearchRun { dir: Some(dir.join("run")), ..IivsearchRun::default() },
     )
     .expect("search")
 }
@@ -108,16 +103,10 @@ fn run(dir: &Path, mfl: &str, algorithm: &str) -> IivsearchResult {
 /// side to be as stated, so a stale entry fails — and where NONMEM's fit was
 /// a proper optimum the BIC(iiv) agrees to `tol`.
 fn assert_candidates(
-    variant: &Variant,
-    result: &IivsearchResult,
-    tol: f64,
-    divergences: &[(&str, &str)],
+    variant: &Variant, result: &IivsearchResult, tol: f64, divergences: &[(&str, &str)],
 ) {
-    let pharmpy_ofv: HashMap<&str, &ModelRow> = variant
-        .summary_models
-        .iter()
-        .map(|m| (m.model.as_str(), m))
-        .collect();
+    let pharmpy_ofv: HashMap<&str, &ModelRow> =
+        variant.summary_models.iter().map(|m| (m.model.as_str(), m)).collect();
     for row in &variant.summary_tool {
         let id = ferx_id(&row.model);
         let ours = result
@@ -153,11 +142,7 @@ fn assert_candidates(
             row.description,
             row.bic,
             ours.criterion,
-            if proper {
-                ""
-            } else {
-                "  (NONMEM: not a proper optimum)"
-            }
+            if proper { "" } else { "  (NONMEM: not a proper optimum)" }
         );
         if proper && !ours.structure.is_partial_block() {
             assert!(
@@ -186,10 +171,7 @@ fn assert_step_winners(variant: &Variant, result: &IivsearchResult) {
             "step {}: ferx picked {} ({}), Pharmpy {} ({})",
             row.step,
             step.best,
-            result
-                .row(&step.best)
-                .map(|r| r.structure.description())
-                .unwrap_or_default(),
+            result.row(&step.best).map(|r| r.structure.description()).unwrap_or_default(),
             row.model,
             row.description
         );
@@ -197,19 +179,12 @@ fn assert_step_winners(variant: &Variant, result: &IivsearchResult) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn top_down_exhaustive_follows_pharmpys_trajectory() {
     let reference = reference();
     let variant = &reference.variants["td"];
     let dir = tempfile::tempdir().unwrap();
-    let result = run(
-        dir.path(),
-        "IIV?(@IIV,EXP);COVARIANCE?(IIV,@IIV)",
-        "top_down_exhaustive",
-    );
+    let result = run(dir.path(), "IIV?(@IIV,EXP);COVARIANCE?(IIV,@IIV)", "top_down_exhaustive");
     let input = result.row("input").unwrap();
     assert!(
         (input.ofv.unwrap() - reference.base_ofv).abs() < 0.2,
@@ -222,54 +197,35 @@ fn top_down_exhaustive_follows_pharmpys_trajectory() {
     assert_eq!(result.rows.iter().filter(|r| r.step == 2).count(), 1);
     assert_candidates(variant, &result, 0.05, &[]);
     assert_step_winners(variant, &result);
-    assert_eq!(
-        result.final_structure.description(),
-        variant.final_description
-    );
+    assert_eq!(result.final_structure.description(), variant.final_description);
     let final_ofv = result.final_fit.as_ref().unwrap().ofv;
     assert!(
         (final_ofv - variant.final_ofv).abs() < 0.01,
         "final OFV {final_ofv} vs Pharmpy {}",
         variant.final_ofv
     );
-    assert!(
-        result.notes.iter().all(|n| !n.contains("#1018")),
-        "{:?}",
-        result.notes
-    );
+    assert!(result.notes.iter().all(|n| !n.contains("#1018")), "{:?}", result.notes);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bottom_up_stepwise_follows_pharmpys_trajectory() {
     let reference = reference();
     let variant = &reference.variants["bu"];
     let dir = tempfile::tempdir().unwrap();
-    let result = run(
-        dir.path(),
-        "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,@IIV)",
-        "bottom_up_stepwise",
-    );
+    let result =
+        run(dir.path(), "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,@IIV)", "bottom_up_stepwise");
     assert_eq!(result.base_id, "base");
     assert_eq!(result.row("base").unwrap().structure.description(), "[CL]");
     assert_candidates(variant, &result, 0.05, &[]);
     assert_step_winners(variant, &result);
-    assert_eq!(
-        result.final_structure.description(),
-        variant.final_description
-    );
+    assert_eq!(result.final_structure.description(), variant.final_description);
     let final_ofv = result.final_fit.as_ref().unwrap().ofv;
     assert!((final_ofv - variant.final_ofv).abs() < 0.01);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn simultaneous_stepwise_follows_pharmpy_on_the_mixed_omega() {
     let reference = reference();
     let variant = &reference.variants["sim"];
@@ -282,11 +238,7 @@ fn simultaneous_stepwise_follows_pharmpy_on_the_mixed_omega() {
     // from pairwise covariance features and writes `[KA,V]+[CL]`; ferx
     // writes the block that was meant.
     assert_candidates(variant, &result, 0.05, &[("run6", "[CL,KA,V]")]);
-    let step1 = variant
-        .summary_tool
-        .iter()
-        .find(|r| r.step == 1 && r.rank == Some(1))
-        .unwrap();
+    let step1 = variant.summary_tool.iter().find(|r| r.step == 1 && r.rank == Some(1)).unwrap();
     assert_eq!(result.steps[0].best, ferx_id(&step1.model));
     assert_eq!(step1.description, "[CL,V]");
     // Step 2: `[CL,V]+[KA]` is a mixed ω. Before ferx-core #1018 the outer
@@ -299,11 +251,7 @@ fn simultaneous_stepwise_follows_pharmpy_on_the_mixed_omega() {
     let run5 = result.row("run5").expect("run5");
     assert_eq!(run5.structure.description(), "[CL,V]+[KA]");
     assert!(run5.structure.is_partial_block());
-    let pharmpy_run5 = variant
-        .summary_models
-        .iter()
-        .find(|m| m.model == "iivsearch_run5")
-        .unwrap();
+    let pharmpy_run5 = variant.summary_models.iter().find(|m| m.model == "iivsearch_run5").unwrap();
     assert_eq!(pharmpy_run5.minimization_successful, Some(false));
     let gap = run5.ofv.unwrap() - pharmpy_run5.ofv;
     assert!(
@@ -315,15 +263,8 @@ fn simultaneous_stepwise_follows_pharmpy_on_the_mixed_omega() {
     );
     // The run no longer carries the #1018 caveat: nothing is fitted as a larger
     // block than its description.
-    assert!(
-        !result.notes.iter().any(|n| n.contains("#1018")),
-        "{:?}",
-        result.notes
-    );
+    assert!(!result.notes.iter().any(|n| n.contains("#1018")), "{:?}", result.notes);
     // …and the search ends where Pharmpy ends.
     assert_eq!(variant.final_description, "[CL,V]");
-    assert_eq!(
-        result.final_structure.description(),
-        variant.final_description
-    );
+    assert_eq!(result.final_structure.description(), variant.final_description);
 }

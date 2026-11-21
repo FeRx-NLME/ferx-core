@@ -9,10 +9,7 @@ use ferx_core::{apply_method_option, parse_method_token, EstimationMethod, FitOp
 fn parse_method_token_reads_vi_and_rejects_unknown_tokens() {
     assert_eq!(parse_method_token("vi"), Ok(EstimationMethod::Vi));
     assert_eq!(parse_method_token(" VI "), Ok(EstimationMethod::Vi));
-    assert_eq!(
-        parse_method_token("importance_sampling"),
-        Ok(EstimationMethod::Imp)
-    );
+    assert_eq!(parse_method_token("importance_sampling"), Ok(EstimationMethod::Imp));
     let err = parse_method_token("advi").unwrap_err();
     assert!(err.contains("unknown estimation method"), "{err}");
     let err = parse_method_token("agq").unwrap_err();
@@ -24,10 +21,7 @@ fn apply_method_option_sets_a_chain_like_a_fit_options_line() {
     let mut opts = FitOptions::default();
     apply_method_option(&mut opts, "[vi, laplace]").unwrap();
     assert_eq!(opts.method, EstimationMethod::Laplace);
-    assert_eq!(
-        opts.methods,
-        vec![EstimationMethod::Vi, EstimationMethod::Laplace]
-    );
+    assert_eq!(opts.methods, vec![EstimationMethod::Vi, EstimationMethod::Laplace]);
     assert!(opts.user_set_keys.iter().any(|k| k == "method"));
 
     let mut opts = FitOptions::default();

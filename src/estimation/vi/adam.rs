@@ -41,13 +41,7 @@ pub struct AdamConfig {
 
 impl Default for AdamConfig {
     fn default() -> Self {
-        Self {
-            lr: 0.05,
-            beta1: 0.9,
-            beta2: 0.999,
-            eps: 1e-8,
-            grad_clip: 0.0,
-        }
+        Self { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8, grad_clip: 0.0 }
     }
 }
 
@@ -84,10 +78,7 @@ pub fn grad_clip_scale(grad: &[f64], clip: f64) -> f64 {
     // Largest finite magnitude. Non-finite entries are skipped for the same reason
     // `step` treats them as zero: one overflowing subject must not silence every other
     // coordinate by driving the norm to infinity.
-    let max = grad
-        .iter()
-        .filter(|g| g.is_finite())
-        .fold(0.0f64, |m, g| m.max(g.abs()));
+    let max = grad.iter().filter(|g| g.is_finite()).fold(0.0f64, |m, g| m.max(g.abs()));
     if max == 0.0 {
         // All zero, or nothing finite: no direction to preserve and nothing to cap.
         return 1.0;
@@ -137,11 +128,7 @@ pub struct AdamState {
 
 impl AdamState {
     pub fn new(n: usize) -> Self {
-        Self {
-            m: vec![0.0; n],
-            v: vec![0.0; n],
-            t: 0,
-        }
+        Self { m: vec![0.0; n], v: vec![0.0; n], t: 0 }
     }
 
     /// Number of coordinates this state tracks.
@@ -212,11 +199,7 @@ impl AdamState {
         let scale = grad_clip_scale(grad, cfg.grad_clip);
 
         for i in 0..x.len() {
-            let g = if grad[i].is_finite() {
-                grad[i] * scale
-            } else {
-                0.0
-            };
+            let g = if grad[i].is_finite() { grad[i] * scale } else { 0.0 };
             self.m[i] = cfg.beta1 * self.m[i] + (1.0 - cfg.beta1) * g;
             self.v[i] = cfg.beta2 * self.v[i] + (1.0 - cfg.beta2) * g * g;
             let m_hat = self.m[i] / bc1;
@@ -238,10 +221,7 @@ pub struct PolyakAverager {
 
 impl PolyakAverager {
     pub fn new(n: usize) -> Self {
-        Self {
-            sum: vec![0.0; n],
-            count: 0,
-        }
+        Self { sum: vec![0.0; n], count: 0 }
     }
 
     /// Fold one iterate into the running mean.

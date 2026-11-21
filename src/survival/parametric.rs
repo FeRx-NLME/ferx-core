@@ -65,9 +65,7 @@ pub fn hazard_and_cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> (f
 /// exact parameter derivatives of the TTE data term (#2437). The `f64` instance is the
 /// value path itself.
 pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
-    family: HazardFamily,
-    t: f64,
-    params: &[T],
+    family: HazardFamily, t: f64, params: &[T],
 ) -> (T, T) {
     let k = T::from_f64;
     if t <= 0.0 {
@@ -115,10 +113,7 @@ pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
                 // drop every γ-derivative a dual carries — the FOCEI η-Hessian of a γ(η)
                 // at γ̂ = 0 lost its `α·t³/3` curvature that way (#2437).
                 let [v, d1, d2, d3, d4] = exprel_series(gt.plain());
-                return (
-                    h_val,
-                    alpha * exp_loghr * (k(t) * gt.lift4(v, d1, d2, d3, d4)),
-                );
+                return (h_val, alpha * exp_loghr * (k(t) * gt.lift4(v, d1, d2, d3, d4)));
             }
             let cum_h = (alpha / gamma) * (exp_gt - k(1.0)) * exp_loghr;
             (h_val, cum_h)
@@ -320,10 +315,7 @@ pub fn sample_event_time(family: HazardFamily, params: &[f64], u: f64) -> f64 {
 /// Solves H(T) - H(entry_time) = -log U for T using the exact form for each family.
 /// Falls back to `entry_time + sample_event_time(...)` for Exponential (memoryless property).
 pub fn sample_conditional_event_time(
-    family: HazardFamily,
-    params: &[f64],
-    entry_time: f64,
-    u: f64,
+    family: HazardFamily, params: &[f64], entry_time: f64, u: f64,
 ) -> f64 {
     let u = u.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
     let neg_log_u = -u.ln();
@@ -410,10 +402,7 @@ mod tests {
         let t = sample_event_time(HazardFamily::Exponential, params, u);
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Exponential, t, params);
         let expected = -u.ln();
-        assert!(
-            (cum - expected).abs() < 1e-10,
-            "H = {cum}, expected {expected}"
-        );
+        assert!((cum - expected).abs() < 1e-10, "H = {cum}, expected {expected}");
     }
 
     #[test]
@@ -423,10 +412,7 @@ mod tests {
         let t = sample_event_time(HazardFamily::Weibull, params, u);
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Weibull, t, params);
         let expected = -u.ln();
-        assert!(
-            (cum - expected).abs() < 1e-9,
-            "H = {cum}, expected {expected}"
-        );
+        assert!((cum - expected).abs() < 1e-9, "H = {cum}, expected {expected}");
     }
 
     #[test]
@@ -436,10 +422,7 @@ mod tests {
         let t = sample_event_time(HazardFamily::Gompertz, params, u);
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t, params);
         let expected = -u.ln();
-        assert!(
-            (cum - expected).abs() < 1e-9,
-            "H = {cum}, expected {expected}"
-        );
+        assert!((cum - expected).abs() < 1e-9, "H = {cum}, expected {expected}");
     }
 
     #[test]
@@ -464,18 +447,11 @@ mod tests {
             "γ<0 above-cure draw must yield a real event, not the no-event sentinel; got {t}"
         );
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t, params);
-        assert!(
-            (cum - (-u.ln())).abs() < 1e-9,
-            "H(T) = {cum}, expected {}",
-            -u.ln()
-        );
+        assert!((cum - (-u.ln())).abs() < 1e-9, "H(T) = {cum}, expected {}", -u.ln());
 
         // u below the cure fraction ⇒ no event (the true cure fraction), sentinel returned.
         let u_cured = 0.5_f64;
-        assert!(
-            u_cured < cure,
-            "test setup: u must be below the cure fraction"
-        );
+        assert!(u_cured < cure, "test setup: u must be below the cure fraction");
         let t_cured = sample_event_time(HazardFamily::Gompertz, params, u_cured);
         assert_eq!(t_cured, f64::MAX, "γ<0 below-cure draw must be censored");
     }
@@ -495,10 +471,7 @@ mod tests {
         // these; `t < f64::MAX` is the direct regression signal (the sentinel is finite and
         // > entry, so it would otherwise slip past), the round-trip confirms correctness.
         let u = 0.9_f64;
-        assert!(
-            u > cond_cure,
-            "test setup: u must exceed the conditional cure fraction"
-        );
+        assert!(u > cond_cure, "test setup: u must exceed the conditional cure fraction");
         let t = sample_conditional_event_time(HazardFamily::Gompertz, params, entry, u);
         assert!(
             t.is_finite() && t > entry && t < f64::MAX,
@@ -514,16 +487,9 @@ mod tests {
 
         // u below the conditional cure fraction ⇒ censored at the sentinel.
         let u_cured = 0.5_f64;
-        assert!(
-            u_cured < cond_cure,
-            "test setup: u must be below the conditional cure fraction"
-        );
+        assert!(u_cured < cond_cure, "test setup: u must be below the conditional cure fraction");
         let t_cured = sample_conditional_event_time(HazardFamily::Gompertz, params, entry, u_cured);
-        assert_eq!(
-            t_cured,
-            f64::MAX,
-            "conditional γ<0 below-cure draw must be censored"
-        );
+        assert_eq!(t_cured, f64::MAX, "conditional γ<0 below-cure draw must be censored");
     }
 
     #[test]
@@ -544,11 +510,7 @@ mod tests {
         // H(T) - H(entry_time) should equal -log U by construction.
         let u = 0.3_f64;
         let entry = 5.0;
-        for &family in &[
-            HazardFamily::Exponential,
-            HazardFamily::Weibull,
-            HazardFamily::Gompertz,
-        ] {
+        for &family in &[HazardFamily::Exponential, HazardFamily::Weibull, HazardFamily::Gompertz] {
             let params: Vec<f64> = match family {
                 HazardFamily::Exponential => vec![0.1],
                 HazardFamily::Weibull => vec![20.0, 2.0],
@@ -576,11 +538,7 @@ mod tests {
         let (h0, cum0) = hazard_and_cum_hazard(HazardFamily::Exponential, 3.0, &params_base);
         let (h1, cum1) = hazard_and_cum_hazard(HazardFamily::Exponential, 3.0, &params_lhr);
         assert!((h1 / h0 - 2.0).abs() < 1e-12, "h ratio = {}", h1 / h0);
-        assert!(
-            (cum1 / cum0 - 2.0).abs() < 1e-12,
-            "H ratio = {}",
-            cum1 / cum0
-        );
+        assert!((cum1 / cum0 - 2.0).abs() < 1e-12, "H ratio = {}", cum1 / cum0);
     }
 
     #[test]
@@ -591,10 +549,7 @@ mod tests {
         let t = sample_event_time(HazardFamily::Exponential, &params, u);
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Exponential, t, &params);
         let expected = -u.ln();
-        assert!(
-            (cum - expected).abs() < 1e-10,
-            "H = {cum}, expected {expected}"
-        );
+        assert!((cum - expected).abs() < 1e-10, "H = {cum}, expected {expected}");
     }
 
     #[test]
@@ -606,11 +561,7 @@ mod tests {
         let (h0, cum0) = hazard_and_cum_hazard(HazardFamily::Weibull, 5.0, &params_base);
         let (h1, cum1) = hazard_and_cum_hazard(HazardFamily::Weibull, 5.0, &params_lhr);
         assert!((h1 / h0 - 2.0).abs() < 1e-12, "h ratio = {}", h1 / h0);
-        assert!(
-            (cum1 / cum0 - 2.0).abs() < 1e-12,
-            "H ratio = {}",
-            cum1 / cum0
-        );
+        assert!((cum1 / cum0 - 2.0).abs() < 1e-12, "H ratio = {}", cum1 / cum0);
     }
 
     #[test]
@@ -621,10 +572,7 @@ mod tests {
         let t = sample_event_time(HazardFamily::Weibull, &params, u);
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Weibull, t, &params);
         let expected = -u.ln();
-        assert!(
-            (cum - expected).abs() < 1e-9,
-            "H = {cum}, expected {expected}"
-        );
+        assert!((cum - expected).abs() < 1e-9, "H = {cum}, expected {expected}");
     }
 
     #[test]
@@ -633,17 +581,9 @@ mod tests {
         let u = 0.3_f64;
         let entry = 5.0;
         let cases: &[(&str, HazardFamily, Vec<f64>)] = &[
-            (
-                "Exponential+loghr",
-                HazardFamily::Exponential,
-                vec![0.1, 0.5],
-            ),
+            ("Exponential+loghr", HazardFamily::Exponential, vec![0.1, 0.5]),
             ("Weibull+loghr", HazardFamily::Weibull, vec![20.0, 2.0, 0.3]),
-            (
-                "Gompertz+loghr",
-                HazardFamily::Gompertz,
-                vec![0.002, 0.005, 0.4],
-            ),
+            ("Gompertz+loghr", HazardFamily::Gompertz, vec![0.002, 0.005, 0.4]),
         ];
         for (label, family, params) in cases {
             let t = sample_conditional_event_time(*family, params, entry, u);
@@ -667,11 +607,7 @@ mod tests {
         assert!((t_50 - expected).abs() < 1e-12, "median = {t_50}");
         // Verify S(t_50) ≈ 0.5
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Exponential, t_50, &[0.1]);
-        assert!(
-            ((-cum).exp() - 0.5).abs() < 1e-12,
-            "S(median) = {}",
-            (-cum).exp()
-        );
+        assert!(((-cum).exp() - 0.5).abs() < 1e-12, "S(median) = {}", (-cum).exp());
     }
 
     #[test]
@@ -680,11 +616,7 @@ mod tests {
         let t_50 = median_survival(HazardFamily::Weibull, &params);
         // S(t_50) must equal 0.5 by construction
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Weibull, t_50, &params);
-        assert!(
-            ((-cum).exp() - 0.5).abs() < 1e-12,
-            "S(median)={} for Weibull",
-            (-cum).exp()
-        );
+        assert!(((-cum).exp() - 0.5).abs() < 1e-12, "S(median)={} for Weibull", (-cum).exp());
     }
 
     #[test]
@@ -692,11 +624,7 @@ mod tests {
         let params = [0.002_f64, 0.005_f64, 0.0_f64];
         let t_50 = median_survival(HazardFamily::Gompertz, &params);
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
-        assert!(
-            ((-cum).exp() - 0.5).abs() < 1e-10,
-            "S(median)={} for Gompertz",
-            (-cum).exp()
-        );
+        assert!(((-cum).exp() - 0.5).abs() < 1e-10, "S(median)={} for Gompertz", (-cum).exp());
     }
 
     #[test]
@@ -706,10 +634,7 @@ mod tests {
         let alpha = 0.05_f64;
         let t_gompertz = median_survival(HazardFamily::Gompertz, &[alpha, 0.0, 0.0]);
         let t_exp = median_survival(HazardFamily::Exponential, &[alpha]);
-        assert!(
-            t_gompertz.is_finite(),
-            "Gompertz γ=0 median must be finite, got {t_gompertz}"
-        );
+        assert!(t_gompertz.is_finite(), "Gompertz γ=0 median must be finite, got {t_gompertz}");
         assert!(
             (t_gompertz - t_exp).abs() < 1e-10,
             "Gompertz(γ=0) median {t_gompertz} should equal Exponential median {t_exp}"
@@ -722,10 +647,7 @@ mod tests {
         let alpha = 0.05_f64;
         let m_gompertz = mean_survival(HazardFamily::Gompertz, &[alpha, 0.0, 0.0]);
         let m_exp = mean_survival(HazardFamily::Exponential, &[alpha]);
-        assert!(
-            m_gompertz.is_finite(),
-            "Gompertz γ=0 mean must be finite, got {m_gompertz}"
-        );
+        assert!(m_gompertz.is_finite(), "Gompertz γ=0 mean must be finite, got {m_gompertz}");
         assert!(
             (m_gompertz - m_exp).abs() < 1e-10,
             "Gompertz(γ=0) mean {m_gompertz} should equal Exponential mean {m_exp}"
@@ -737,10 +659,7 @@ mod tests {
         // Very small γ — ln_1p path must not return NaN
         let params = [0.002_f64, 1e-10_f64, 0.0_f64];
         let t_50 = median_survival(HazardFamily::Gompertz, &params);
-        assert!(
-            t_50.is_finite(),
-            "Gompertz small-γ median must be finite, got {t_50}"
-        );
+        assert!(t_50.is_finite(), "Gompertz small-γ median must be finite, got {t_50}");
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
         assert!(
             ((-cum).exp() - 0.5).abs() < 1e-8,
@@ -766,15 +685,8 @@ mod tests {
         );
         // Round-trips the defining equation H(median)=ln2 ⟺ S(median)=0.5.
         let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
-        assert!(
-            (cum - std::f64::consts::LN_2).abs() < 1e-10,
-            "H(median)={cum}, expected ln2"
-        );
-        assert!(
-            ((-cum).exp() - 0.5).abs() < 1e-10,
-            "S(median)={} for γ<0 Gompertz",
-            (-cum).exp()
-        );
+        assert!((cum - std::f64::consts::LN_2).abs() < 1e-10, "H(median)={cum}, expected ln2");
+        assert!(((-cum).exp() - 0.5).abs() < 1e-10, "S(median)={} for γ<0 Gompertz", (-cum).exp());
     }
 
     #[test]
@@ -787,10 +699,7 @@ mod tests {
         //   α=0.002, γ=−0.001, loghr=ln2 ⇒ α·e^{loghr}=0.004, H(∞)=4.0, S(∞)=e^{−4}≈0.0183 < 0.5.
         let params = [0.002_f64, -0.001_f64, std::f64::consts::LN_2];
         let a_eff = 0.002_f64 * std::f64::consts::LN_2.exp(); // α·e^{loghr} = 0.004
-        assert!(
-            (-(a_eff / 0.001)).exp() < 0.5,
-            "test setup: cure fraction must be below 0.5"
-        );
+        assert!((-(a_eff / 0.001)).exp() < 0.5, "test setup: cure fraction must be below 0.5");
         let t_50 = median_survival(HazardFamily::Gompertz, &params);
         assert!(
             t_50.is_finite() && t_50 > 0.0,
@@ -812,10 +721,7 @@ mod tests {
         let s_inf = (-(0.002_f64 / 0.005)).exp();
         assert!(s_inf >= 0.5, "test setup: cure fraction must be ≥ 0.5");
         let t_50 = median_survival(HazardFamily::Gompertz, &params);
-        assert!(
-            t_50.is_nan(),
-            "γ<0 median must be NaN when S(∞)≥0.5, got {t_50}"
-        );
+        assert!(t_50.is_nan(), "γ<0 median must be NaN when S(∞)≥0.5, got {t_50}");
     }
 
     #[test]
@@ -839,20 +745,14 @@ mod tests {
             "S(∞) just below 0.5 must give a finite median, got {m_below}"
         );
         let m_above = median_survival(HazardFamily::Gompertz, &just_above_half);
-        assert!(
-            m_above.is_nan(),
-            "S(∞) just above 0.5 must give NaN median, got {m_above}"
-        );
+        assert!(m_above.is_nan(), "S(∞) just above 0.5 must give NaN median, got {m_above}");
 
         // Exact knife-edge x == −1.0 (S(∞)=0.5 exactly). With α=LN_2, γ=−1.0, loghr=0 the ratio
         // x = LN_2·(−1.0)/(LN_2·1.0) folds to exactly −1.0 in IEEE (−d/d). The strict `x > -1.0`
         // gate must reject it → NaN (the true median is +∞, not a finite value).
         let ln2 = std::f64::consts::LN_2;
         let m_exact = median_survival(HazardFamily::Gompertz, &[ln2, -1.0_f64, 0.0_f64]);
-        assert!(
-            m_exact.is_nan(),
-            "x=−1.0 exactly (S(∞)=0.5) must give NaN, got {m_exact}"
-        );
+        assert!(m_exact.is_nan(), "x=−1.0 exactly (S(∞)=0.5) must give NaN, got {m_exact}");
     }
 
     #[test]
@@ -887,10 +787,7 @@ mod tests {
     fn mean_weibull_numerical_plausible() {
         // shape=1 → Exponential with scale=20: mean should be ~20
         let m = mean_survival(HazardFamily::Weibull, &[20.0, 1.0]);
-        assert!(
-            (m - 20.0).abs() < 0.05,
-            "Weibull(scale=20, shape=1) mean = {m}"
-        );
+        assert!((m - 20.0).abs() < 0.05, "Weibull(scale=20, shape=1) mean = {m}");
     }
 
     #[test]

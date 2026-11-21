@@ -65,10 +65,7 @@ fn reference() -> Vec<Vec<RefRow>> {
                 cells[4].to_string(),
                 cells[5].parse().expect("interval"),
             );
-            subjects
-                .last_mut()
-                .expect("a subject header first")
-                .push(row);
+            subjects.last_mut().expect("a subject header first").push(row);
         }
     }
     subjects
@@ -80,10 +77,7 @@ fn controller() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
     |ctx: &ControllerCtx| {
         let trough = ctx.signal("C").expect("monitor C declared");
         let interval = ctx.interval.expect("start_interval is set");
-        let rung = LADDER
-            .iter()
-            .position(|&l| l == interval)
-            .expect("interval on the ladder");
+        let rung = LADDER.iter().position(|&l| l == interval).expect("interval on the ladder");
         let (dose, new_rung) = if trough > TH_HOLD {
             (false, (rung + 1).min(LADDER.len() - 1))
         } else if trough > TH_LEN {
@@ -94,18 +88,12 @@ fn controller() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
             (true, rung)
         };
         let mut actions = vec![if dose {
-            DoseAction::Infuse {
-                amt: DOSE,
-                cmt: 1,
-                rate: DOSE,
-            }
+            DoseAction::Infuse { amt: DOSE, cmt: 1, rate: DOSE }
         } else {
             DoseAction::Hold
         }];
         if new_rung != rung {
-            actions.push(DoseAction::SetInterval {
-                interval: LADDER[new_rung],
-            });
+            actions.push(DoseAction::SetInterval { interval: LADDER[new_rung] });
         }
         actions
     }
@@ -125,12 +113,8 @@ fn grid() -> Vec<f64> {
 }
 
 fn kit_population() -> Population {
-    read_nonmem_csv(
-        Path::new(&format!("{KIT}/vanco_interval_subjects.csv")),
-        None,
-        None,
-    )
-    .expect("subjects load")
+    read_nonmem_csv(Path::new(&format!("{KIT}/vanco_interval_subjects.csv")), None, None)
+        .expect("subjects load")
 }
 
 /// The kit run through the programmatic controller above.
@@ -158,25 +142,13 @@ fn vanco_interval_extension_matches_mrgsolve() {
     assert_eq!(reference.len(), 2, "two subjects in the kit");
     let mut worst: f64 = 0.0;
     for (s, (id, want)) in ["1", "2"].iter().zip(&reference).enumerate() {
-        assert_eq!(
-            want.len(),
-            grid.len(),
-            "subject {id}: one reference row per grid point"
-        );
+        assert_eq!(want.len(), grid.len(), "subject {id}: one reference row per grid point");
         let got: Vec<_> = res.decisions.iter().filter(|d| d.subject == *id).collect();
-        assert_eq!(
-            got.len(),
-            grid.len(),
-            "subject {id}: one decision row per grid point"
-        );
+        assert_eq!(got.len(), grid.len(), "subject {id}: one decision row per grid point");
         for (d, (t, trough, outcome, interval)) in got.iter().zip(want) {
             assert_eq!(d.time, *t, "subject {id}");
             assert_eq!(d.outcome.label(), outcome, "subject {id} t={t}: outcome");
-            assert_eq!(
-                d.interval,
-                Some(*interval),
-                "subject {id} t={t}: interval after"
-            );
+            assert_eq!(d.interval, Some(*interval), "subject {id} t={t}: interval after");
             let sig = d.observed_signals[0].value;
             assert!(sig.is_finite(), "subject {id} t={t}: trough {sig}");
             let gap = (sig - trough).abs();
@@ -187,17 +159,9 @@ fn vanco_interval_extension_matches_mrgsolve() {
             );
         }
         // The ledger holds exactly the dosed grid points, each 1000 mg.
-        let dosed: Vec<f64> = want
-            .iter()
-            .filter(|r| r.2 == "dosed")
-            .map(|r| r.0)
-            .collect();
-        let ledger: Vec<f64> = res
-            .ledger
-            .iter()
-            .filter(|e| e.subject == *id)
-            .map(|e| e.time)
-            .collect();
+        let dosed: Vec<f64> = want.iter().filter(|r| r.2 == "dosed").map(|r| r.0).collect();
+        let ledger: Vec<f64> =
+            res.ledger.iter().filter(|e| e.subject == *id).map(|e| e.time).collect();
         assert_eq!(ledger, dosed, "subject {id}: realized dose times");
         // Each decision's `n_dosed()` is its own ledger rows (#2581), checked per
         // decision so two mis-counts cannot cancel in a sum.
@@ -214,11 +178,7 @@ fn vanco_interval_extension_matches_mrgsolve() {
                 d.time
             );
         }
-        assert!(res
-            .ledger
-            .iter()
-            .filter(|e| e.subject == *id)
-            .all(|e| e.amt == DOSE));
+        assert!(res.ledger.iter().filter(|e| e.subject == *id).all(|e| e.amt == DOSE));
         let m = &res.metrics[s];
         assert_eq!(m.subject, *id);
         let count = |o: &str| want.iter().filter(|r| r.2 == o).count();
@@ -235,14 +195,9 @@ fn vanco_interval_extension_matches_mrgsolve() {
 fn vanco_interval_kit_is_non_degenerate() {
     let r = reference();
     let (s1, s2) = (&r[0], &r[1]);
-    assert!(s1
-        .iter()
-        .any(|row| row.2 == "hold" && row.3 == 48.0 && row.0 > 0.0));
+    assert!(s1.iter().any(|row| row.2 == "hold" && row.3 == 48.0 && row.0 > 0.0));
     let first_len = s2.iter().position(|row| row.3 > 12.0).expect("lengthens");
-    let shortened = s2
-        .windows(2)
-        .skip(first_len)
-        .any(|w| w[1].2 == "dosed" && w[1].3 < w[0].3);
+    let shortened = s2.windows(2).skip(first_len).any(|w| w[1].2 == "dosed" && w[1].3 < w[0].3);
     assert!(shortened, "subject 2 shortens after lengthening");
     for s in [s1, s2] {
         assert_eq!((s[0].1, s[0].3), (0.0, 12.0), "bottom-rung shorten at t=0");
@@ -292,15 +247,7 @@ fn fingerprint(r: &AdaptiveSimulationResult) -> (Ledger, Decisions, Trajectories
     let ledger = r
         .ledger
         .iter()
-        .map(|e| {
-            (
-                e.subject.clone(),
-                e.time.to_bits(),
-                e.cmt,
-                e.amt.to_bits(),
-                e.rate.to_bits(),
-            )
-        })
+        .map(|e| (e.subject.clone(), e.time.to_bits(), e.cmt, e.amt.to_bits(), e.rate.to_bits()))
         .collect();
     let decisions = r
         .decisions
@@ -311,10 +258,7 @@ fn fingerprint(r: &AdaptiveSimulationResult) -> (Ledger, Decisions, Trajectories
                 d.time.to_bits(),
                 format!("{:?}", d.outcome),
                 d.interval.map(f64::to_bits),
-                d.observed_signals
-                    .iter()
-                    .map(|s| s.value.to_bits())
-                    .collect(),
+                d.observed_signals.iter().map(|s| s.value.to_bits()).collect(),
             )
         })
         .collect();
@@ -337,10 +281,7 @@ fn vanco_interval_block_reproduces_the_closure_bit_for_bit() {
     let closure = run_closure();
     let block = run_block(KIT_BLOCK);
     assert!(
-        block
-            .decisions
-            .iter()
-            .any(|d| d.outcome == DecisionOutcome::NotDue),
+        block.decisions.iter().any(|d| d.outcome == DecisionOutcome::NotDue),
         "the block must exercise the due mask"
     );
     let (cl, cd, ct) = fingerprint(&closure);
@@ -367,30 +308,22 @@ fn one_rung_ladder_equal_to_the_grid_step_is_bit_identical_to_no_ladder() {
   when signal < 9 : increase 25%
 ";
     let plain = run_block(base);
-    let laddered = run_block(&format!(
-        "{base}  intervals = [12]\n  start_interval = 12\n"
-    ));
+    let laddered = run_block(&format!("{base}  intervals = [12]\n  start_interval = 12\n"));
     assert!(
         laddered.decisions.iter().all(|d| d.interval == Some(12.0)),
         "the ladder must reach the driver"
     );
     assert!(plain.decisions.iter().all(|d| d.interval.is_none()));
     // Non-degenerate: the rules fire, so the twin compares a reactive schedule.
-    assert!(plain
-        .decisions
-        .iter()
-        .any(|d| d.outcome == DecisionOutcome::Hold));
+    assert!(plain.decisions.iter().any(|d| d.outcome == DecisionOutcome::Hold));
     assert!(plain.ledger.iter().any(|e| e.amt != 1000.0));
     let (pl, pd, pt) = fingerprint(&plain);
     let (ll, ld, lt) = fingerprint(&laddered);
     assert_eq!(ll, pl, "ledger");
     assert_eq!(lt, pt, "trajectories");
     // The decision logs differ only in the interval column.
-    let strip = |d: Decisions| {
-        d.into_iter()
-            .map(|(a, b, c, _, e)| (a, b, c, e))
-            .collect::<Vec<_>>()
-    };
+    let strip =
+        |d: Decisions| d.into_iter().map(|(a, b, c, _, e)| (a, b, c, e)).collect::<Vec<_>>();
     assert_eq!(strip(ld), strip(pd), "decision log");
 }
 
@@ -413,11 +346,7 @@ fn block_refuses_an_options_start_interval() {
     )
     .expect_err("two sources of the interval");
     let msg = err.to_string();
-    assert_eq!(
-        err.diagnostic().map(|d| d.code.as_str()),
-        Some("E_ADAPTIVE_OPTIONS"),
-        "{msg}"
-    );
+    assert_eq!(err.diagnostic().map(|d| d.code.as_str()), Some("E_ADAPTIVE_OPTIONS"), "{msg}");
     assert!(
         msg.contains("`intervals` / `start_interval`")
             && msg.contains("leave `opts.start_interval` empty"),

@@ -125,16 +125,10 @@ fn ode_fit_converges_to_analytical_estimates_and_se() {
         ode.ofv,
         ode.ofv - an.ofv
     );
-    eprintln!(
-        "{:<10} {:>14} {:>14} {:>10}",
-        "param", "analytical", "ODE", "rel"
-    );
+    eprintln!("{:<10} {:>14} {:>14} {:>10}", "param", "analytical", "ODE", "rel");
     for i in 0..3 {
         let rel = (an.theta[i] - ode.theta[i]).abs() / an.theta[i].abs();
-        eprintln!(
-            "{:<10} {:>14.6} {:>14.6} {:>9.1e}",
-            names[i], an.theta[i], ode.theta[i], rel
-        );
+        eprintln!("{:<10} {:>14.6} {:>14.6} {:>9.1e}", names[i], an.theta[i], ode.theta[i], rel);
     }
     for k in 0..3 {
         let rel = (an.omega[(k, k)] - ode.omega[(k, k)]).abs() / an.omega[(k, k)].abs();
@@ -147,10 +141,7 @@ fn ode_fit_converges_to_analytical_estimates_and_se() {
         );
     }
     let rel_sig = (an.sigma[0] - ode.sigma[0]).abs() / an.sigma[0].abs();
-    eprintln!(
-        "{:<10} {:>14.6} {:>14.6} {:>9.1e}",
-        "sigma", an.sigma[0], ode.sigma[0], rel_sig
-    );
+    eprintln!("{:<10} {:>14.6} {:>14.6} {:>9.1e}", "sigma", an.sigma[0], ode.sigma[0], rel_sig);
     eprintln!("-- standard errors --");
     for i in 0..3 {
         let rel = (se_an[i] - se_ode[i]).abs() / se_an[i].abs();

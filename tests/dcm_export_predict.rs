@@ -41,12 +41,7 @@ ID,TIME,DV,AMT,EVID,MDV,CMT,WT,CRCL
 ";
 
 /// The DCM at the fixture's weights, and its export.
-fn models() -> (
-    CompiledModel,
-    ModelParameters,
-    CompiledModel,
-    ModelParameters,
-) {
+fn models() -> (CompiledModel, ModelParameters, CompiledModel, ModelParameters) {
     let dcm = parse_model_string(MODEL).expect("DCM parses under nn");
     let mut dcm_params = dcm.default_params.clone();
     let (names, theta): (Vec<String>, Vec<f64>) = THETA
@@ -103,14 +98,7 @@ fn predict_on_the_export_equals_predict_on_the_dcm() {
     let mut n_nan = 0;
     for (x, y) in a.iter().zip(&b) {
         assert_eq!((&x.id, x.time), (&y.id, y.time));
-        assert!(
-            same(x.pred, y.pred),
-            "id {} t {}: {} vs {}",
-            x.id,
-            x.time,
-            x.pred,
-            y.pred
-        );
+        assert!(same(x.pred, y.pred), "id {} t {}: {} vs {}", x.id, x.time, x.pred, y.pred);
         if x.id == "2" {
             assert!(x.pred.is_nan(), "a missing network input is NaN in the DCM");
             n_nan += 1;
@@ -132,15 +120,8 @@ fn predict_on_the_export_equals_predict_on_the_dcm() {
             ferx_core::io::datareader::read_nonmem_csv(&path, Some(&["WT", "CRCL"]), None).unwrap();
         predict(&dcm, &pop, &dcm_params).unwrap()
     };
-    let s1_static: Vec<f64> = dcm_static
-        .iter()
-        .filter(|r| r.id == "1")
-        .map(|r| r.pred)
-        .collect();
-    assert_ne!(
-        s1[3], s1_static[3],
-        "WT must change subject 1's second interval"
-    );
+    let s1_static: Vec<f64> = dcm_static.iter().filter(|r| r.id == "1").map(|r| r.pred).collect();
+    assert_ne!(s1[3], s1_static[3], "WT must change subject 1's second interval");
 }
 
 /// At η drawn by the simulator (the same seed, the same Ω, so the same draws),
@@ -155,13 +136,6 @@ fn simulated_ipred_on_the_export_equals_the_dcm() {
     assert!(!a.is_empty());
     for (x, y) in a.iter().zip(&b) {
         assert_eq!((&x.id, x.sim, x.time), (&y.id, y.sim, y.time));
-        assert!(
-            same(x.ipred, y.ipred),
-            "id {} t {}: {} vs {}",
-            x.id,
-            x.time,
-            x.ipred,
-            y.ipred
-        );
+        assert!(same(x.ipred, y.ipred), "id {} t {}: {} vs {}", x.id, x.time, x.ipred, y.ipred);
     }
 }

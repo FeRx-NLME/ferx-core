@@ -41,10 +41,7 @@ const MODEL: &str = r#"
 
 fn population(covariates: &[&str]) -> Population {
     Population {
-        subjects: vec![Subject {
-            id: "1".into(),
-            ..Default::default()
-        }],
+        subjects: vec![Subject { id: "1".into(), ..Default::default() }],
         covariate_names: covariates.iter().map(|c| c.to_string()).collect(),
         dv_column: "DV".into(),
         input_columns: vec![],
@@ -85,10 +82,7 @@ fn names(v: &[&str]) -> Vec<String> {
 #[test]
 fn context_reads_parameters_iiv_template_and_covariates() {
     let c = ctx();
-    assert_eq!(
-        c.parameters,
-        names(&["CL", "V1", "Q", "V2", "KA", "F", "KE"])
-    );
+    assert_eq!(c.parameters, names(&["CL", "V1", "Q", "V2", "KA", "F", "KE"]));
     assert_eq!(c.iiv, names(&["CL", "V1", "KA"]));
     let t = c.template.as_ref().expect("pk line");
     assert_eq!(t.name, "two_cpt_oral");
@@ -122,12 +116,8 @@ fn pk_line_parser() {
     );
     assert!(PkTemplate::parse_line("ode(states=[depot, central])").is_none());
     assert!(PkTemplate::parse_line("pkx(cl=CL)").is_none());
-    assert!(PkTemplate::parse_line("pk one_cpt_oral cl=CL")
-        .expect("is a pk line")
-        .is_err());
-    assert!(PkTemplate::parse_line("pk one_cpt_oral(cl)")
-        .expect("is a pk line")
-        .is_err());
+    assert!(PkTemplate::parse_line("pk one_cpt_oral cl=CL").expect("is a pk line").is_err());
+    assert!(PkTemplate::parse_line("pk one_cpt_oral(cl)").expect("is a pk line").is_err());
 }
 
 #[test]
@@ -136,10 +126,7 @@ fn declared_covariate_missing_from_data_is_an_error() {
     let text = ModelText::parse(MODEL).expect("editable");
     let e = ModelContext::from_model(&parsed, &text, &population(&["WT", "CRCL"]))
         .expect_err("SEX is not in the data");
-    assert!(
-        e.contains("declares `SEX` but the dataset has no such column"),
-        "{e}"
-    );
+    assert!(e.contains("declares `SEX` but the dataset has no such column"), "{e}");
     assert!(e.contains("it has: WT, CRCL"), "{e}");
 }
 
@@ -154,10 +141,7 @@ fn symbol_iiv() {
 
 #[test]
 fn symbol_pk() {
-    assert_eq!(
-        ctx().builtin("PK").unwrap(),
-        names(&["CL", "V1", "Q", "V2", "KA", "F"])
-    );
+    assert_eq!(ctx().builtin("PK").unwrap(), names(&["CL", "V1", "Q", "V2", "KA", "F"]));
     // KE is an individual parameter but not on the pk line.
     let r = resolved("IIV(@PK,EXP)", &ctx());
     assert_eq!(r.mfl.render(), "IIV([CL,V1,Q,V2,KA,F],EXP)");
@@ -190,10 +174,7 @@ fn symbol_elimination() {
 
 #[test]
 fn symbol_distribution() {
-    assert_eq!(
-        ctx().builtin("DISTRIBUTION").unwrap(),
-        names(&["V1", "Q", "V2"])
-    );
+    assert_eq!(ctx().builtin("DISTRIBUTION").unwrap(), names(&["V1", "Q", "V2"]));
 }
 
 #[test]
@@ -234,16 +215,8 @@ fn symbols_pd_and_pd_iiv_are_empty_and_drop_the_feature_with_a_note() {
     let r = resolved("IIV(@PD,ADD);ABSORPTION(FO)", &ctx());
     assert_eq!(r.mfl.render(), "ABSORPTION(FO)");
     assert_eq!(r.notes.len(), 1);
-    assert!(
-        r.notes[0].contains("dropped `IIV(@PD,ADD)`"),
-        "{}",
-        r.notes[0]
-    );
-    assert!(
-        r.notes[0].contains("@PD resolves to nothing"),
-        "{}",
-        r.notes[0]
-    );
+    assert!(r.notes[0].contains("dropped `IIV(@PD,ADD)`"), "{}", r.notes[0]);
+    assert!(r.notes[0].contains("@PD resolves to nothing"), "{}", r.notes[0]);
 }
 
 #[test]
@@ -290,14 +263,7 @@ fn structural_symbols_need_a_pk_line() {
     let c = ode_ctx();
     assert!(c.template.is_none());
     assert_eq!(c.builtin("IIV").unwrap(), names(&["CL"]));
-    for sym in [
-        "PK",
-        "PK_IIV",
-        "ABSORPTION",
-        "ELIMINATION",
-        "DISTRIBUTION",
-        "BIOAVAIL",
-    ] {
+    for sym in ["PK", "PK_IIV", "ABSORPTION", "ELIMINATION", "DISTRIBUTION", "BIOAVAIL"] {
         let e = c.builtin(sym).expect_err(sym);
         assert!(
             e.contains("reads the `pk NAME(...)` or `ode_template NAME(...)` line"),
@@ -322,10 +288,7 @@ fn covariate_kind_symbols_need_a_covariates_block() {
     let c = context_for(&undeclared, &["WT", "SEX"]);
     assert!(c.covariates.is_none());
     let e = c.builtin("CONTINUOUS").expect_err("no block");
-    assert!(
-        e.contains("`@CONTINUOUS` needs a `[covariates]` block"),
-        "{e}"
-    );
+    assert!(e.contains("`@CONTINUOUS` needs a `[covariates]` block"), "{e}");
     assert!(e.contains("continuous"), "{e}");
     let e = c.builtin("CATEGORICAL").expect_err("no block");
     assert!(e.contains("categorical"), "{e}");
@@ -338,10 +301,7 @@ fn covariate_kind_symbols_need_a_covariates_block() {
         "with no kinds declared, nothing can refuse pow on SEX here"
     );
     let e = resolve_err("COVARIATE?(CL,AGE,pow)", &c);
-    assert!(
-        e.contains("`AGE` is not a covariate column of the dataset"),
-        "{e}"
-    );
+    assert!(e.contains("`AGE` is not a covariate column of the dataset"), "{e}");
     assert!(e.contains("known: WT, SEX"), "{e}");
 }
 
@@ -349,14 +309,8 @@ fn covariate_kind_symbols_need_a_covariates_block() {
 
 #[test]
 fn let_defines_and_overrides_symbols() {
-    let r = resolved(
-        "LET(CONTINUOUS,[WT]);COVARIATE?(@IIV,@CONTINUOUS,pow)",
-        &ctx(),
-    );
-    assert_eq!(
-        r.mfl.render(),
-        "COVARIATE?(CL,WT,pow);COVARIATE?(V1,WT,pow);COVARIATE?(KA,WT,pow)"
-    );
+    let r = resolved("LET(CONTINUOUS,[WT]);COVARIATE?(@IIV,@CONTINUOUS,pow)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIATE?(CL,WT,pow);COVARIATE?(V1,WT,pow);COVARIATE?(KA,WT,pow)");
     let r = resolved("LET(MINE,[CL,V2]);IIV(@mine,EXP)", &ctx());
     assert_eq!(r.mfl.render(), "IIV([CL,V2],EXP)");
     let e = resolve_err("LET(X,CL);LET(x,V1);IIV(@X,EXP)", &ctx());
@@ -369,10 +323,7 @@ fn let_values_are_validated_against_the_slot_they_land_in() {
     assert!(e.contains("`WT` is not an individual parameter"), "{e}");
     assert!(e.contains("it has: CL, V1, Q, V2, KA, F, KE"), "{e}");
     let e = resolve_err("COVARIATE(CL,@IIV,pow)", &ctx());
-    assert!(
-        e.contains("`CL` is not declared in the base model's `[covariates]` block"),
-        "{e}"
-    );
+    assert!(e.contains("`CL` is not declared in the base model's `[covariates]` block"), "{e}");
 }
 
 // --- wildcards ------------------------------------------------------------------
@@ -396,20 +347,14 @@ fn wildcards_expand_by_slot() {
         .map(|t| t.effect)
         .collect();
     assert_eq!(cl_sex, vec![CovariateEffect::Cat]);
-    let params: std::collections::BTreeSet<_> = r
-        .covariate_effects
-        .iter()
-        .map(|t| t.parameter.as_str())
-        .collect();
+    let params: std::collections::BTreeSet<_> =
+        r.covariate_effects.iter().map(|t| t.parameter.as_str()).collect();
     assert_eq!(params.len(), 6, "{params:?}");
     assert!(!params.contains("KE"));
     assert_eq!(r.covariate_effects.len(), 6 * (4 + 1 + 4));
 
     let r = resolved("IIV?(*,*)", &ctx());
-    assert_eq!(
-        r.mfl.render(),
-        "IIV?([CL,V1,Q,V2,KA,F],[EXP,ADD,PROP,LOG,RE_LOG])"
-    );
+    assert_eq!(r.mfl.render(), "IIV?([CL,V1,Q,V2,KA,F],[EXP,ADD,PROP,LOG,RE_LOG])");
     // The parameter wildcard is feature-specific: `@PK` for IIV (any
     // parameter can get an η), `@IIV` for IOV and COVARIANCE (only an
     // η-bearing parameter can carry a κ or sit in an omega block). The
@@ -433,22 +378,13 @@ fn wildcards_expand_by_slot() {
 #[test]
 fn categorical_form_on_a_continuous_covariate_and_vice_versa_are_errors() {
     let e = resolve_err("COVARIATE?(CL,SEX,pow)", &ctx());
-    assert!(
-        e.contains("`SEX` is declared categorical, and `pow` is a continuous form"),
-        "{e}"
-    );
+    assert!(e.contains("`SEX` is declared categorical, and `pow` is a continuous form"), "{e}");
     let e = resolve_err("COVARIATE?(CL,@CONTINUOUS,cat)", &ctx());
-    assert!(
-        e.contains("`WT` is declared continuous, and `cat` is a categorical form"),
-        "{e}"
-    );
+    assert!(e.contains("`WT` is declared continuous, and `cat` is a categorical form"), "{e}");
     // #1312: `cat2` is a categorical form on both sides of the check — it
     // resolves on `SEX` and is refused on `WT`, exactly like `cat`.
     let e = resolve_err("COVARIATE?(CL,@CONTINUOUS,cat2)", &ctx());
-    assert!(
-        e.contains("`WT` is declared continuous, and `cat2` is a categorical form"),
-        "{e}"
-    );
+    assert!(e.contains("`WT` is declared continuous, and `cat2` is a categorical form"), "{e}");
     let r = resolved("COVARIATE?(CL,SEX,cat2)", &ctx());
     assert_eq!(r.mfl.render(), "COVARIATE?(CL,SEX,cat2)");
     assert_eq!(r.covariate_effects.len(), 1);
@@ -464,52 +400,30 @@ fn categorical_form_on_a_continuous_covariate_and_vice_versa_are_errors() {
 
 #[test]
 fn explicit_pair_overrides_the_symbol_derived_one() {
-    let r = resolved(
-        "COVARIATE?(@IIV,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
-        &ctx(),
-    );
-    let cl_wt: Vec<_> = r
-        .covariate_effects
-        .iter()
-        .filter(|t| t.parameter == "CL" && t.covariate == "WT")
-        .collect();
+    let r = resolved("COVARIATE?(@IIV,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)", &ctx());
+    let cl_wt: Vec<_> =
+        r.covariate_effects.iter().filter(|t| t.parameter == "CL" && t.covariate == "WT").collect();
     assert_eq!(cl_wt.len(), 1, "{cl_wt:?}");
     assert_eq!(cl_wt[0].effect, CovariateEffect::Exp);
     assert!(!cl_wt[0].optional);
     // Every other pair is untouched.
     assert_eq!(r.covariate_effects.len(), 5 * 2 + 1);
-    assert!(
-        r.mfl.render().contains("COVARIATE(CL,WT,exp)"),
-        "{}",
-        r.mfl.render()
-    );
+    assert!(r.mfl.render().contains("COVARIATE(CL,WT,exp)"), "{}", r.mfl.render());
 }
 
 #[test]
 fn forced_overrides_the_identical_optional_term() {
     let r = resolved("COVARIATE?(CL,WT,[pow,lin]);COVARIATE(CL,WT,pow)", &ctx());
-    let mut terms: Vec<(CovariateEffect, bool)> = r
-        .covariate_effects
-        .iter()
-        .map(|t| (t.effect, t.optional))
-        .collect();
+    let mut terms: Vec<(CovariateEffect, bool)> =
+        r.covariate_effects.iter().map(|t| (t.effect, t.optional)).collect();
     terms.sort_by_key(|(e, o)| (e.label(), *o));
-    assert_eq!(
-        terms,
-        vec![(CovariateEffect::Lin, true), (CovariateEffect::Pow, false)]
-    );
+    assert_eq!(terms, vec![(CovariateEffect::Lin, true), (CovariateEffect::Pow, false)]);
 }
 
 #[test]
 fn a_pair_forced_by_two_statements_is_an_error() {
-    let e = resolve_err(
-        "COVARIATE(@IIV,WT,pow);COVARIATE(@ELIMINATION,WT,exp)",
-        &ctx(),
-    );
-    assert!(
-        e.contains("CL-WT is forced by more than one COVARIATE statement"),
-        "{e}"
-    );
+    let e = resolve_err("COVARIATE(@IIV,WT,pow);COVARIATE(@ELIMINATION,WT,exp)", &ctx());
+    assert!(e.contains("CL-WT is forced by more than one COVARIATE statement"), "{e}");
     // …but one statement forcing several effects on a pair is fine.
     resolved("COVARIATE(CL,WT,[pow,exp])", &ctx());
 }
@@ -518,11 +432,7 @@ fn a_pair_forced_by_two_statements_is_an_error() {
 fn covariance_needs_two_parameters() {
     let r = resolved("COVARIANCE(IIV,@ELIMINATION)", &ctx());
     assert!(r.mfl.statements.is_empty());
-    assert!(
-        r.notes[0].contains("resolves to 1 parameter on this model"),
-        "{}",
-        r.notes[0]
-    );
+    assert!(r.notes[0].contains("resolves to 1 parameter on this model"), "{}", r.notes[0]);
 }
 
 #[test]
@@ -544,10 +454,7 @@ fn ground_output_is_stable_under_re_resolution() {
     assert_eq!(once.covariate_effects, twice.covariate_effects);
     assert!(twice.notes.is_empty());
     assert_eq!(Mfl::parse(&once.mfl.render()).unwrap(), once.mfl);
-    assert_eq!(
-        CovariateEffectSpec::pair(&once.covariate_effects[0]),
-        "CL-WT"
-    );
+    assert_eq!(CovariateEffectSpec::pair(&once.covariate_effects[0]), "CL-WT");
 }
 
 // --- review of #1237: template, parameter and override edge cases -------------
@@ -576,16 +483,10 @@ fn structural_symbols_read_an_ode_template_base() {
     );
     let c = context_for(&model, &["WT", "SEX", "CRCL"]);
     assert_eq!(c.template.as_ref().expect("template").name, "two_cpt_oral");
-    assert_eq!(
-        c.builtin("PK").unwrap(),
-        names(&["CL", "V1", "Q", "V2", "KA"])
-    );
+    assert_eq!(c.builtin("PK").unwrap(), names(&["CL", "V1", "Q", "V2", "KA"]));
     assert_eq!(c.builtin("ABSORPTION").unwrap(), names(&["KA"]));
     assert_eq!(c.builtin("ELIMINATION").unwrap(), names(&["CL"]));
-    assert_eq!(
-        c.builtin("DISTRIBUTION").unwrap(),
-        names(&["V1", "Q", "V2"])
-    );
+    assert_eq!(c.builtin("DISTRIBUTION").unwrap(), names(&["V1", "Q", "V2"]));
     let r = resolved("COVARIATE?(@PK,@CONTINUOUS,pow);IIV(*,EXP)", &c);
     assert_eq!(r.covariate_effects.len(), 5 * 2);
     assert!(r.notes.is_empty(), "{:?}", r.notes);
@@ -608,21 +509,14 @@ fn template_symbols_skip_a_literal_binding() {
         names(&["CL", "V1", "Q", "V2", "KA", "1"]),
         "the raw bindings keep the literal"
     );
-    assert_eq!(
-        c.builtin("PK").unwrap(),
-        names(&["CL", "V1", "Q", "V2", "KA"])
-    );
+    assert_eq!(c.builtin("PK").unwrap(), names(&["CL", "V1", "Q", "V2", "KA"]));
     assert_eq!(c.builtin("BIOAVAIL").unwrap(), Vec::<String>::new());
     // The symbol and both wildcards resolve on such a base.
     let r = resolved("COVARIATE?(@PK,@CONTINUOUS,*);IIV(*,EXP)", &c);
     assert_eq!(r.covariate_effects.len(), 5 * 2 * 4);
     let r = resolved("COVARIATE?(@BIOAVAIL,WT,pow)", &c);
     assert!(r.covariate_effects.is_empty());
-    assert!(
-        r.notes[0].contains("@BIOAVAIL resolves to nothing"),
-        "{}",
-        r.notes[0]
-    );
+    assert!(r.notes[0].contains("@BIOAVAIL resolves to nothing"), "{}", r.notes[0]);
 }
 
 /// A block-form `if` in `[individual_parameters]` is not an assignment; the
@@ -635,16 +529,8 @@ fn block_form_if_headers_are_not_parameters() {
          CL = TVCL * 0.9 * exp(ETA_CL)\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }\n",
     );
     let c = context_for(&model, &["WT", "SEX", "CRCL"]);
-    assert!(
-        c.parameters.iter().all(|p| !p.contains('(')),
-        "{:?}",
-        c.parameters
-    );
-    assert!(
-        c.parameters.contains(&"CL".to_string()),
-        "{:?}",
-        c.parameters
-    );
+    assert!(c.parameters.iter().all(|p| !p.contains('(')), "{:?}", c.parameters);
+    assert!(c.parameters.contains(&"CL".to_string()), "{:?}", c.parameters);
     assert_eq!(c.parameters.len(), 7, "{:?}", c.parameters);
     let e = resolve_err("COVARIATE(FOO,WT,pow)", &c);
     assert!(!e.contains("if ("), "{e}");
@@ -655,10 +541,7 @@ fn block_form_if_headers_are_not_parameters() {
 /// covariate operand is a symbol.
 #[test]
 fn explicit_parameter_with_symbolic_covariate_is_not_overridden() {
-    let r = resolved(
-        "COVARIATE?(CL,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
-        &ctx(),
-    );
+    let r = resolved("COVARIATE?(CL,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)", &ctx());
     let mut cl_wt: Vec<(CovariateEffect, bool)> = r
         .covariate_effects
         .iter()
@@ -676,10 +559,7 @@ fn explicit_parameter_with_symbolic_covariate_is_not_overridden() {
     );
     assert_eq!(r.covariate_effects.len(), 2 * 2 + 1);
     // The symbolic-parameter twin straddles the gate: its CL-WT terms go.
-    let r = resolved(
-        "COVARIATE?(@ELIMINATION,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
-        &ctx(),
-    );
+    let r = resolved("COVARIATE?(@ELIMINATION,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)", &ctx());
     assert_eq!(r.covariate_effects.len(), 2 + 1);
 }
 
@@ -723,20 +603,10 @@ fn an_additive_operator_resolves_and_carries_the_pharmpy_divergence_note() {
     // additive effects must not print six copies.
     let many = resolved("COVARIATE?([CL,V1,KA],[WT,CRCL],lin,+)", &ctx());
     assert_eq!(many.covariate_effects.len(), 6);
-    assert_eq!(
-        many.notes
-            .iter()
-            .filter(|n| n.contains("COVARIATE(..., +)"))
-            .count(),
-        1
-    );
+    assert_eq!(many.notes.iter().filter(|n| n.contains("COVARIATE(..., +)")).count(), 1);
 
     // And a multiplicative space says nothing — the note must not become
     // background noise on every search.
     let mul = resolved("COVARIATE?(CL,WT,lin)", &ctx());
-    assert!(
-        !mul.notes.iter().any(|n| n.contains("COVARIATE(..., +)")),
-        "{:?}",
-        mul.notes
-    );
+    assert!(!mul.notes.iter().any(|n| n.contains("COVARIATE(..., +)")), "{:?}", mul.notes);
 }

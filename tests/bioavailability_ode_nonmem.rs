@@ -121,12 +121,7 @@ fn ode_bioavailability_matches_nonmem() {
     assert_eq!(preds.len(), NONMEM.len());
 
     for (p, &(t, expected)) in preds.iter().zip(NONMEM) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "prediction time {} != expected {}",
-            p.time,
-            t
-        );
+        assert!((p.time - t).abs() < 1e-9, "prediction time {} != expected {}", p.time, t);
         let rel = (p.pred - expected).abs() / expected;
         assert!(
             rel < 1e-4,
@@ -144,9 +139,7 @@ fn ode_bioavailability_matches_analytical() {
     // The ODE and analytical forms of the same oral model with F = 0.70 must
     // agree — both now apply F at dose entry (NONMEM convention).
     let ode = parse_full_model(ODE_MODEL).expect("ODE model parses").model;
-    let analytical = parse_full_model(ANALYTICAL_MODEL)
-        .expect("analytical model parses")
-        .model;
+    let analytical = parse_full_model(ANALYTICAL_MODEL).expect("analytical model parses").model;
     let population = read_nonmem_csv(Path::new("data/bioavailability_ode_ref.csv"), None, None)
         .expect("dataset loads");
 
