@@ -694,3 +694,215 @@ fn refuses_a_bad_grid_time() {
         "vpc_tte: grid time -2 is not a finite, non-negative number.",
     );
 }
+
+// ── #2947: a stratum with no band ────────────────────────────────────────────
+
+const PROBS: [f64; 3] = [0.05, 0.5, 0.95];
+const HEAD: &str = "W_VPC_EMPTY_STRATUM: stratum `all` has no band at any grid time.";
+const ZERO: &str = " A Kaplan–Meier curve ends at its last time, also where it has reached 0.";
+const FLOOR: &str = " A replicate curve counts at a time only while at least `min_at_risk = 10` \
+                     subjects are at risk there.";
+
+/// `n` replicate curves, each with its last time at `last`.
+fn reps_ending_at(n: usize, last: f64) -> Vec<Vec<f64>> {
+    (0..n).map(|_| vec![0.5 * last, last]).collect()
+}
+
+fn warn_for(
+    who: Entry, grid: &[f64], n_used: &[usize], reps: &[Vec<f64>], at_risk: Option<(usize, usize)>,
+) -> Option<String> {
+    empty_stratum_warning(who, "all", grid, n_used, PROBS, reps.iter().map(Vec::as_slice), at_risk)
+}
+
+fn too_few(most: usize, n_sim: usize) -> String {
+    format!(
+        " At most {most} of the {n_sim} replicate curves are defined at any grid time, and a \
+         band point needs 19."
+    )
+}
+
+fn past(latest: &str) -> String {
+    format!(
+        " Every grid time is past the last time of every replicate curve; the latest is \
+         {latest}."
+    )
+}
+
+fn never(latest: &str) -> String {
+    format!(" Grid times after {latest} can never have a band.")
+}
+
+/// H1. The gate is "every grid time below the floor", on the most curves at any grid
+/// time: `[0, 19]` has a band at its second point, `[0, 18]` has none. Reading the
+/// least instead of the most, `>` for `>=`, or no gate at all reddens it.
+#[test]
+fn empty_stratum_gate_is_below_the_floor() {
+    let reps = reps_ending_at(20, 17.5);
+    assert_eq!(min_curves_for(PROBS), 19);
+    assert_eq!(warn_for(Entry::Tte, &[1.0, 2.0], &[0, 19], &reps, None), None);
+    assert_eq!(warn_for(Entry::Tte, &[1.0, 2.0], &[19, 0], &reps, None), None);
+    assert_eq!(
+        warn_for(Entry::Tte, &[1.0, 2.0], &[0, 18], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(18, 20)).as_str())
+    );
+}
+
+/// H2. The at-risk floor is the first reason, also when the grid is past every last
+/// time; a stratum of exactly `min_at_risk` subjects is not below it and gets the
+/// past-follow-up text instead.
+#[test]
+fn at_risk_floor_comes_first_and_needs_fewer_subjects_than_the_floor() {
+    let reps = reps_ending_at(20, 17.5);
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[20.0], &[0], &reps, Some((5, 10))).as_deref(),
+        Some(
+            format!(
+                "{HEAD} It has 5 subjects, fewer than `min_at_risk = 10`, so no risk set \
+                 reaches the at-risk floor. Lower `min_at_risk`, or use larger strata."
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[20.0], &[0], &reps, Some((10, 10))).as_deref(),
+        Some(format!("{HEAD}{}{}", past("17.5"), never("17.5")).as_str())
+    );
+}
+
+/// H4. Past every replicate's last time: the latest is named, and the zero sentence
+/// (#3107) appears for a Kaplan–Meier curve only, not for an MCF.
+#[test]
+fn past_follow_up_names_the_latest_and_reaches_zero_only_for_km() {
+    let mut reps = reps_ending_at(19, 12.0);
+    reps.push(vec![3.0, 17.5]);
+    assert_eq!(
+        warn_for(Entry::Tte, &[20.0, 25.0], &[0, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}{}", past("17.5"), never("17.5")).as_str())
+    );
+    assert_eq!(
+        warn_for(Entry::Rtte, &[20.0, 25.0], &[0, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{}", past("17.5"), never("17.5")).as_str())
+    );
+}
+
+/// H5. A grid time at the latest last time is not past it, and `n_used = 0` alone does
+/// not mean past follow-up: a `vpc_kmmc` stratum above the floor with no curve defined
+/// at 3 (its risk sets below `min_at_risk`) gets the too-few text with the floor
+/// sentence. `>` → `>=`, or deciding "past" by `most == 0`, reddens it.
+#[test]
+fn a_grid_time_at_the_latest_last_time_is_not_past_it() {
+    let reps = reps_ending_at(20, 3.0);
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[3.0], &[0], &reps, Some((30, 10))).as_deref(),
+        Some(format!("{HEAD}{}{FLOOR}", too_few(0, 20)).as_str())
+    );
+}
+
+/// H6. The too-few text per entry point: the zero sentence for `vpc_tte` only, the
+/// floor sentence for `vpc_kmmc` only.
+#[test]
+fn too_few_curves_text_per_entry() {
+    let reps = reps_ending_at(20, 17.5);
+    assert_eq!(
+        warn_for(Entry::Tte, &[5.0], &[3], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(3, 20)).as_str())
+    );
+    assert_eq!(
+        warn_for(Entry::Kmmc, &[5.0], &[3], &reps, Some((30, 10))).as_deref(),
+        Some(format!("{HEAD}{}{FLOOR}", too_few(3, 20)).as_str())
+    );
+    // #3111 r1 row 1: a grid running from before the latest last time to after it is
+    // too few curves, not past it — only *every* grid time past `latest` is C2.
+    assert_eq!(
+        warn_for(Entry::Tte, &[10.0, 20.0], &[3, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(3, 20)).as_str())
+    );
+}
+
+/// Fixture P1 (#2947 plan §0): 30 subjects with events at `0.1·i`, λ = 0.5, no IIV,
+/// `H = 30`, 20 replicates.
+fn p1(grid: Vec<f64>) -> TteVpc {
+    const EXP_NO_IIV: &str = "\n[parameters]\n  theta TVLAMBDA(0.5, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA\n";
+    let p = pop((1..=30)
+        .map(|i| subj(&i.to_string(), vec![rec(0.1 * i as f64, EventType::Exact, 2)]))
+        .collect());
+    let mut o = opts(20);
+    o.sim.horizon = Some(30.0);
+    o.grid = VpcGrid::Times(grid);
+    run(EXP_NO_IIV, &p, &o).unwrap()
+}
+
+/// D-t1. #3107's case: every replicate reached 0 before t = 20, inside `H = 30`, so no
+/// curve is defined there. Before #3107 a curve that reached 0 stayed `Some(0.0)` and
+/// the band was 0/0/0 (probe P1′, `n_used` 20), with nothing to warn about.
+#[test]
+fn vpc_tte_warns_past_every_replicate_last_time_inside_h() {
+    let v = p1(vec![20.0]);
+    let s = &v.strata[0];
+    // The straddle: 20 is inside H, and the observed curve reached 0.
+    assert!(20.0 < v.horizon);
+    assert_eq!(s.observed.surv.last(), Some(&0.0));
+    assert_eq!(s.n_used, [0]);
+    let w = empty_stratum_warnings(&v.warnings);
+    assert_eq!(w.len(), 1, "{:?}", v.warnings);
+    let latest = w[0]
+        .split("the latest is ")
+        .nth(1)
+        .and_then(|r| r.split(". A Kaplan").next())
+        .expect("names the latest last time");
+    let t: f64 = latest.parse().unwrap();
+    eprintln!("D-t1 latest replicate last time: {t}");
+    // Measured: the latest replicate last time is in (17.5, 18) (probe P1).
+    assert!(t > 17.5 && t < 18.0, "latest {t}");
+    assert_eq!(w[0], format!("{HEAD}{}{ZERO}{}", past(latest), never(latest)));
+}
+
+/// D-t2. At t = 10 three of the 20 replicates are still defined (probe P1).
+#[test]
+fn vpc_tte_warns_too_few_curves() {
+    let v = p1(vec![10.0]);
+    assert_eq!(v.strata[0].n_used, [3]);
+    assert_eq!(empty_stratum_warnings(&v.warnings), [format!("{HEAD}{}{ZERO}", too_few(3, 20))]);
+}
+
+/// D-t3. One grid time with a band (19 curves at t = 5, exactly the floor) is enough:
+/// a later empty point does not make the stratum empty.
+#[test]
+fn vpc_tte_one_defined_point_is_not_empty() {
+    let v = p1(vec![5.0, 20.0]);
+    assert_eq!(v.strata[0].n_used, [19, 0]);
+    assert!(v.strata[0].lo[0].is_some());
+    assert_eq!(empty_stratum_warnings(&v.warnings), Vec::<&str>::new());
+}
+
+/// D-g. An empty `VpcGrid::Times` grid is refused by every entry point, each naming
+/// itself: it would make every stratum vacuously empty.
+#[test]
+fn refuses_an_empty_grid_in_every_entry_point() {
+    let refusal = |who: &str| {
+        format!("{who}: the grid is empty. Give at least one grid time, or use VpcGrid::Auto.")
+    };
+    let mut o = opts(20);
+    o.grid = VpcGrid::Times(vec![]);
+    assert_refusal(run(EXP_TTE, &uniform_pop(3, 1.0, true), &o), &refusal("vpc_tte"));
+
+    let m = model(RTTE);
+    let ro = crate::api::VpcRtteOptions {
+        n_sim: 20,
+        grid: VpcGrid::Times(vec![]),
+        ..Default::default()
+    };
+    assert_refusal(
+        crate::api::vpc_rtte(&m, &uniform_pop(3, 1.0, true), &m.default_params, &ro),
+        &refusal("vpc_rtte"),
+    );
+
+    let m = model(EXP_TTE);
+    let mut ko = crate::api::VpcKmmcOptions::new("Z");
+    ko.vpc.n_sim = 20;
+    ko.vpc.grid = VpcGrid::Times(vec![]);
+    assert_refusal(
+        crate::api::vpc_kmmc(&m, &uniform_pop(3, 1.0, true), &m.default_params, &ko),
+        &refusal("vpc_kmmc"),
+    );
+}

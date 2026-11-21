@@ -162,7 +162,8 @@ pub struct TteVpc {
     pub probs: [f64; 3],
     pub censoring: VpcCensoring,
     pub strata: Vec<TteVpcStratum>,
-    /// The simulator's warnings (a degenerate hazard draw, a failed ODE solve, …).
+    /// The simulator's warnings (a degenerate hazard draw, a failed ODE solve, …), then
+    /// `W_VPC_EMPTY_STRATUM` per stratum with no band at any grid time.
     pub warnings: Vec<String>,
 }
 
@@ -399,6 +400,12 @@ pub(super) fn check_band_options(
         )));
     }
     if let VpcGrid::Times(t) = grid {
+        // An empty grid would leave every stratum vacuously without a band (#2947).
+        if t.is_empty() {
+            return Err(refuse(format!(
+                "{who}: the grid is empty. Give at least one grid time, or use VpcGrid::Auto."
+            )));
+        }
         if let Some(bad) = t.iter().find(|t| !(t.is_finite() && **t >= 0.0)) {
             return Err(refuse(format!(
                 "{who}: grid time {bad} is not a finite, non-negative number."
@@ -675,6 +682,68 @@ pub(super) fn stratum_grid<'a>(
     g
 }
 
+/// `W_VPC_EMPTY_STRATUM` when stratum `label` has no band at any grid time, else
+/// `None`. A band point is `None` exactly when fewer than `min_curves_for(probs)`
+/// replicate curves are defined there, so the gate is `max(n_used) < need`. `rep_times`
+/// holds one slice per replicate curve (the same argument [`stratum_grid`] takes), and
+/// `at_risk` is [`vpc_kmmc`](super::vpc_kmmc)'s `(n_subjects, min_at_risk)`.
+///
+/// The message names the first reason that applies: the at-risk floor, then every grid
+/// time past the last time of every replicate curve, then too few curves. "Past
+/// follow-up" is read from the replicate times, never from `n_used == 0`: a
+/// `vpc_kmmc` stratum has no curve defined inside follow-up once its risk sets fall
+/// below `min_at_risk` (#2947 plan, probe P3).
+pub(super) fn empty_stratum_warning<'a>(
+    who: Entry, label: &str, grid: &[f64], n_used: &[usize], probs: [f64; 3],
+    rep_times: impl Iterator<Item = &'a [f64]>, at_risk: Option<(usize, usize)>,
+) -> Option<String> {
+    let (need, most) = (min_curves_for(probs), n_used.iter().copied().max().unwrap_or(0));
+    if most >= need {
+        return None;
+    }
+    let (n_sim, latest) = rep_times
+        .fold((0, f64::NEG_INFINITY), |(n, l), t| (n + 1, t.last().map_or(l, |&x| l.max(x))));
+    // #3107: only a Kaplan–Meier curve ends on reaching 0.
+    let zero = if who == Entry::Tte {
+        " A Kaplan–Meier curve ends at its last time, also where it has reached 0."
+    } else {
+        ""
+    };
+    let why = match at_risk {
+        Some((n, m)) if n < m => format!(
+            " It has {n} subjects, fewer than `min_at_risk = {m}`, so no risk set reaches the \
+             at-risk floor. Lower `min_at_risk`, or use larger strata."
+        ),
+        // The grid is sorted (`stratum_grid`), so its first time is past `latest` only
+        // when every time is.
+        _ if grid.first().is_some_and(|&t| t > latest) => format!(
+            " Every grid time is past the last time of every replicate curve; the latest is \
+             {latest}.{zero} Grid times after {latest} can never have a band."
+        ),
+        _ => {
+            let floor = at_risk.map_or(String::new(), |(_, m)| {
+                format!(
+                    " A replicate curve counts at a time only while at least `min_at_risk = \
+                     {m}` subjects are at risk there."
+                )
+            });
+            format!(
+                " At most {most} of the {n_sim} replicate curves are defined at any grid time, \
+                 and a band point needs {need}.{zero}{floor}"
+            )
+        }
+    };
+    Some(format!("W_VPC_EMPTY_STRATUM: stratum `{label}` has no band at any grid time.{why}"))
+}
+
+/// The `W_VPC_EMPTY_STRATUM` entries of a result's warnings, for the three drivers'
+/// tests. The simulator drains a process-wide sink, so a test asserts on its own code,
+/// never on `is_empty()`.
+#[cfg(test)]
+pub(super) fn empty_stratum_warnings(w: &[String]) -> Vec<&str> {
+    w.iter().map(String::as_str).filter(|s| s.starts_with("W_VPC_EMPTY_STRATUM")).collect()
+}
+
 /// A Kaplan–Meier VPC for one single-event TTE endpoint.
 ///
 /// Simulates `opts.n_sim` replicates of `population` under `params` with one
@@ -703,7 +772,7 @@ pub fn vpc_tte(
     let horizon = horizon_and_cut(&mut rows, opts.sim.horizon);
 
     let n_strata = values.len();
-    let (reps, warnings) = simulate_replicates(
+    let (reps, mut warnings) = simulate_replicates(
         model,
         population,
         params,
@@ -732,6 +801,15 @@ pub fn vpc_tte(
             curves.iter().map(|c| c.time.as_slice()),
         );
         let band = vpc_band(&curves, &grid, probs).map_err(|e| refuse(format!("vpc_tte: {e}")))?;
+        warnings.extend(empty_stratum_warning(
+            Entry::Tte,
+            &label,
+            &grid,
+            &band.n_used,
+            probs,
+            curves.iter().map(|c| c.time.as_slice()),
+            None,
+        ));
         strata.push(TteVpcStratum {
             label,
             value,
