@@ -282,7 +282,7 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
-                options.optimizer,
+                stage_optimizer_request(method, options.optimizer),
                 model,
                 has_mixture,
                 crate::sens::provider::analytic_outer_gradient_available(model),
