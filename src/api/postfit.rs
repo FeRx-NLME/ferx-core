@@ -349,10 +349,16 @@ pub(crate) fn is_last_estimating_stage(
 /// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
 /// `method = gn` and no chain. This is the other half of that exemption, applied
 /// where the chain *is* visible: a GN stage followed by a further estimating stage
-/// drops the warning, a trailing one keeps it. Every other warning passes through.
+/// drops the warning, a trailing one keeps it. The #2438 BHHH rank warning, which also says
+/// to let something else finish the fit, follows the same rule. Every other warning passes
+/// through.
 pub(crate) fn keep_gn_zero_eta_warning(warning: &str, is_last_estimating: bool) -> bool {
+    use crate::estimation::gauss_newton::{
+        GN_RANK_DEFICIENT_HEAD, GN_ZERO_ETA_NONCONVERGENCE_WARNING,
+    };
     is_last_estimating
-        || warning != crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING
+        || (warning != GN_ZERO_ETA_NONCONVERGENCE_WARNING
+            && !warning.starts_with(GN_RANK_DEFICIENT_HEAD))
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
