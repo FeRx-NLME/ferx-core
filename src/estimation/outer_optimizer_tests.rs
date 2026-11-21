@@ -16450,11 +16450,12 @@ mod guard_stop {
 /// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
 /// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
 /// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
-/// budget is final and never reset), a 106-evaluation budget ends inside the latch: NLopt
+/// budget is final and never reset), a budget that ends inside the latch makes NLopt
 /// returns `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
 /// `eval_budget_spent == false`. The guard-off twin at the same budget runs out on its own
-/// descent: `MaxEvalReached` and `true`. Measured window (macOS arm64): budgets 105–107 all
-/// straddle; 106 sits in its middle. Mutation: fill `eval_budget_spent` from
+/// descent: `MaxEvalReached` and `true`. The budget is found, not fixed (#2901): the window
+/// moves with the build by more than its own width, and its top follows the two runs' own
+/// evaluation counts. Mutation: fill `eval_budget_spent` from
 /// `max_eval_reached` as it stood *before* the latch reset → the latched run reads `true`.
 #[test]
 fn eval_budget_spent_is_read_after_the_latch_reset() {
@@ -16465,11 +16466,10 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
     use crate::read_nonmem_csv;
     use std::path::Path;
 
-    const BUDGET: u32 = 106;
     let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
     let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
     let _off = WarmPredictorOff::new();
-    let run = |guard: bool| {
+    let run = |guard: bool, budget: Option<u32>| {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
             interaction: true,
@@ -16481,7 +16481,7 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
             ..FitOptions::default()
         };
         UNPROFILED_VERIFY_OFF.with(|o| o.set(true));
-        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
         let out = optimize_nlopt_once(
             &model,
             &pop,
@@ -16497,8 +16497,23 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
         UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
         out
     };
-    let (on, on_outcome) = run(true);
-    let (off, off_outcome) = run(false);
+    // Both runs left to stop by themselves, then one evaluation fewer than either took
+    // (`n_iterations` counts NLopt's objective evaluations): the unguarded run is still
+    // descending there, and the guarded one has latched, which is asserted below.
+    let (free, free_outcome) = run(true, None);
+    let (free_off, _) = run(false, None);
+    let by_itself = |r: &OuterResult| r.optimizer_stop.as_deref() != Some("MaxEvalReached");
+    assert!(
+        free_outcome.stagnation_latched && by_itself(&free) && by_itself(&free_off),
+        "premise: both runs stop by themselves and the guarded one latches, got {:?} / {:?}",
+        free.optimizer_stop,
+        free_off.optimizer_stop
+    );
+    let evals = free.n_iterations.min(free_off.n_iterations);
+    let budget = evals.checked_sub(1).and_then(|b| u32::try_from(b).ok());
+    assert!(budget.is_some(), "premise: an evaluation count ({evals})");
+    let (on, on_outcome) = run(true, budget);
+    let (off, off_outcome) = run(false, budget);
     // The straddle: both runs end on the budget, one inside the latch and one outside it.
     assert!(on_outcome.stagnation_latched, "the guarded run must latch");
     assert!(!off_outcome.stagnation_latched, "guard off never latches");
