@@ -9071,9 +9071,13 @@ pub(crate) fn reconverged_fd_gradient(
         reconverged_probe_ofv(xv, init_params, model, population, &warm, options, tol)
     };
     let tol = stencil_inner_tol(options.inner_tol);
-    let eval = |xv: &[f64]| probe(xv, tol).0;
+    // A probe after a cancel is missing, not solved (#2776): its re-solve does not poll the
+    // flag, and the gate would otherwise grow every floored step through them.
+    let live = || !crate::cancel::is_cancelled(&options.cancel);
+    let eval = |xv: &[f64]| if live() { probe(xv, tol).0 } else { f64::NAN };
     let tight = |xv: &[f64]| {
-        let (v, stats) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        let (v, stats) =
+            live().then(|| probe(xv, crate::estimation::fd_resolution::tight_tol(tol)))?;
         crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
@@ -9377,9 +9381,11 @@ fn reporting_fd_gradient(
         };
         (v, stats)
     };
-    let eval = |xv: &[f64]| probe(xv, false).0;
+    // A probe after a cancel is missing, not solved (#2776), as in `reconverged_fd_gradient`.
+    let live = || !crate::cancel::is_cancelled(&options.cancel);
+    let eval = |xv: &[f64]| if live() { probe(xv, false).0 } else { f64::NAN };
     let tight = |xv: &[f64]| {
-        let (v, stats) = probe(xv, true);
+        let (v, stats) = live().then(|| probe(xv, true))?;
         crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
@@ -9806,9 +9812,12 @@ fn subject_central_diff(
 ) -> Vec<f64> {
     let fixed = packed_fixed_mask(init_params);
     let tol = stencil_inner_tol(options.inner_tol);
-    let eval = |xv: &[f64]| probe(xv, tol).0;
+    // A probe after a cancel is missing, not solved (#2776), as in `reconverged_fd_gradient`.
+    let live = || !crate::cancel::is_cancelled(&options.cancel);
+    let eval = |xv: &[f64]| if live() { probe(xv, tol).0 } else { f64::NAN };
     let tight = |xv: &[f64]| {
-        let (v, resolved) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        let (v, resolved) =
+            live().then(|| probe(xv, crate::estimation::fd_resolution::tight_tol(tol)))?;
         resolved.then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
