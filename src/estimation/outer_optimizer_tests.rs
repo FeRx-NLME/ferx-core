@@ -8273,6 +8273,195 @@ pub(crate) mod outer_fd_fallback {
         }
     }
 
+    /// #2776: once the fit is cancelled, the reconverged FD gradients' probes are missing,
+    /// not solved. Their re-solves do not poll the flag, so before this the #2406 gate grew a
+    /// floored step through every one of them. On fixture A (`BETA` declared at `1e-4`, so
+    /// the gate runs), each of the three gradients returns the live gradient with no flag,
+    /// solves nothing (an all-zero gradient) with the flag already set, and, with the cancel
+    /// landing between coordinates (`trip_after(6)`, coordinate 3), keeps the coordinates it
+    /// finished bit for bit and zeroes the rest: none is made up from one live probe and one
+    /// missing one.
+    ///
+    /// A cancel landing *inside* a floored coordinate's gate growth does not zero it
+    /// (#2776 review r1 §2): the gate runs on with every probe missing and returns what it
+    /// had, the last τ/100 difference or else the first floor's τ one — a difference of two
+    /// live probes, at a floor the gate had not accepted yet (measured: cuts 14–31 land in
+    /// `BETA`'s growth, `g[6]` = 2.81717 at 14 against the live 2.83145). The ungated
+    /// fallback can likewise return a one-sided difference against a centre cached before
+    /// the cancel. Either way the gradient is discarded: `fit()` returns `Err` on a cancel,
+    /// and the covariance step takes no reading on one (the test below). `trip_after(14)`
+    /// pins that shape: every coordinate before `BETA` kept, every one after it 0, and
+    /// `BETA` itself finite, non-zero, and not the live value.
+    #[test]
+    fn a_cancelled_fd_gradient_solves_no_probe() {
+        let (model, pop) = two_cpt_cov_beta(1e-4, 0.68 - 1e-4);
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let live = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        // A fresh flag per gradient: `trip_after(0)` is cancelled from the first poll, and
+        // `trip_after(6)` after six probes.
+        let with = |flag: Option<fn() -> crate::cancel::CancelFlag>| FitOptions {
+            cancel: flag.map(|f| f()),
+            ..live.clone()
+        };
+        crate::pool::with_fit_scope(&live, || {
+            let mu = compute_mu_k(&model, &params.theta, live.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &live);
+            let priors = build_prior_set(&model, params);
+            let grads = |flag: Option<fn() -> crate::cancel::CancelFlag>| {
+                [
+                    reconverged_fd_gradient(
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &ehs,
+                        &kappas,
+                        &bounds,
+                        &with(flag),
+                    ),
+                    reporting_fd_gradient(
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &ehs,
+                        &kappas,
+                        &bounds,
+                        &with(flag),
+                        &nn_reg,
+                        &priors,
+                    ),
+                    subject_reconverged_fd_gradient(
+                        &x,
+                        params,
+                        &model,
+                        &pop.subjects[0],
+                        &ehs[0],
+                        &bounds,
+                        &with(flag),
+                    ),
+                ]
+            };
+            let names = ["population", "reporting", "per-subject"];
+            let (lives, cuts, parts, gated) = (
+                grads(None),
+                grads(Some(|| crate::cancel::CancelFlag::trip_after(0))),
+                grads(Some(|| crate::cancel::CancelFlag::trip_after(6))),
+                grads(Some(|| crate::cancel::CancelFlag::trip_after(14))),
+            );
+            const BETA: usize = 6;
+            for (k, name) in names.iter().enumerate() {
+                let (g, c, p, q) = (&lives[k], &cuts[k], &parts[k], &gated[k]);
+                // The cut inside `BETA`'s gate: what the gate had, never a missing probe.
+                assert!(
+                    q[..BETA].iter().zip(&g[..BETA]).all(|(a, b)| a.to_bits() == b.to_bits())
+                        && q[BETA + 1..].iter().all(|v| *v == 0.0),
+                    "{name}: a cut inside BETA's gate touched another coordinate: {q:?} vs {g:?}"
+                );
+                assert!(
+                    q[BETA].is_finite() && q[BETA] != 0.0 && q[BETA] != g[BETA],
+                    "fixture: the cut lands inside {name}'s BETA growth: {} vs live {}",
+                    q[BETA],
+                    g[BETA]
+                );
+                assert!(g.iter().any(|v| *v != 0.0), "fixture: {name} gradient is live");
+                assert!(c.iter().all(|v| *v == 0.0), "{name}: a probe ran after the cancel: {c:?}");
+                let kept = |a: &f64, b: &f64| a.to_bits() == b.to_bits();
+                assert!(
+                    p.iter().zip(g).all(|(a, b)| kept(a, b) || *a == 0.0),
+                    "{name}: a value made up after the cancel: {p:?} vs {g:?}"
+                );
+                assert!(
+                    p.iter().zip(g).any(|(a, b)| *b != 0.0 && kept(a, b))
+                        && p.iter().zip(g).any(|(a, b)| *b != 0.0 && *a == 0.0),
+                    "fixture: the cancel lands partway through {name}: {p:?} vs {g:?}"
+                );
+            }
+        })
+        .expect("the fit scope runs");
+    }
+
+    /// #2776 review r1 §1: a cancel that lands *inside* the covariance step's stationarity
+    /// gradient takes no reading. Standalone `run_covariance` returns its result under a
+    /// cancel (only `fit()` turns one into an `Err`), and the reconverged-FD reporting
+    /// gradient now comes back part-zero once the flag trips, so a reading taken on it would
+    /// be a made-up Newton decrement. Fixture A at its FOCEI estimate, the reporting gradient
+    /// forced onto the FD arm (`reconverge_gradient_interval = 1`). The run's total poll count
+    /// is measured first; the cuts land in its last `2·n_free` polls, which the gradient's
+    /// `≥ 2·n_free` probes cover, after the matrix (asserted: the SEs are still there).
+    #[test]
+    fn a_cancel_inside_the_stationarity_gradient_takes_no_reading() {
+        let beta_hat = 0.6797630658491339;
+        let delta = 1e-4;
+        let (m, p) = two_cpt_cov_beta(delta, beta_hat - delta);
+        let mut est = m.default_params.clone();
+        est.theta = vec![
+            5.2731892416136725,
+            44.80341226071577,
+            9.584412470148976,
+            92.16535593441313,
+            1.4074112031924877,
+            0.010000000000000005,
+            delta,
+        ];
+        est.omega = crate::types::OmegaMatrix::from_matrix(
+            DMatrix::from_diagonal(&DVector::from_vec(vec![
+                0.04468165236754428,
+                0.12184225657519575,
+                0.05501817239402348,
+                0.060478622240645215,
+                0.1913558297443002,
+            ])),
+            est.omega.eta_names.clone(),
+            true,
+        );
+        est.sigma.values = vec![0.0160462218419714];
+        let base = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            covariance_method: crate::types::CovarianceMethod::Hessian,
+            covariance_method_set: true,
+            reconverge_gradient_interval: 1,
+            ..FitOptions::default()
+        };
+        let fit = crate::fit(
+            &m,
+            &p,
+            &est,
+            &FitOptions { outer_maxiter: 0, run_covariance_step: false, ..base.clone() },
+        )
+        .expect("fixture: the evaluation fit runs");
+        let cov = |polls: usize| {
+            let flag = crate::cancel::CancelFlag::trip_after(polls);
+            let opts = FitOptions { cancel: Some(flag.clone()), ..base.clone() };
+            let r = crate::run_covariance(&fit, Some(&m), Some(&p), &opts)
+                .expect("run_covariance returns under a cancel");
+            (r, polls - flag.polls_left().expect("a countdown flag"))
+        };
+        let (live, used) = cov(1 << 40);
+        let decrement = live.newton_decrement.expect("fixture: the live step takes a reading");
+        let n_free = pack_params(&est).len();
+        eprintln!("MEASURE #2776 stationarity: {used} polls, decrement {decrement:e}");
+        for back in [3, 9] {
+            assert!(back < 2 * n_free, "fixture: cut {back} back lands in the gradient");
+            let (cut, _) = cov(used - back);
+            assert!(cut.se_theta.is_some(), "fixture: cut {back} back lands after the matrix");
+            assert_eq!(
+                cut.newton_decrement, None,
+                "cut {back} polls from the end: a reading taken on a part-cancelled gradient \
+                 (live decrement {decrement:e})"
+            );
+        }
+    }
+
     // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
 }
 
