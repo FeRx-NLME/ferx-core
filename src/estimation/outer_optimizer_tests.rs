@@ -14538,7 +14538,7 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
             ..at(&off, 4, probe_left)
         };
         let ((result, _), skip) =
-            settle_start_probe((first(), None), false, Some((probe, None, verdict)), |r| r.ofv);
+            settle_start_probe((first(), None), false, Some((probe, verdict)), |r| r.ofv);
         assert_eq!(skip, skip_retry, "{label}: retry skipped");
         assert_eq!(
             pack_params(&result.params) != init_packed,
@@ -14580,7 +14580,7 @@ fn a_verified_start_reports_the_probe_and_skips_the_stall_retry() {
     // above the start by the clean OFV but below it once penalized is the point reported.
     let probe = OuterResult { ofv: start_ofv + 1e-3, converged: true, ..at(&off, 4, true) };
     let ((result, _), _) =
-        settle_start_probe((first(), None), false, Some((probe, None, Some(true))), |r| {
+        settle_start_probe((first(), None), false, Some((probe, Some(true))), |r| {
             r.ofv - if pack_params(&r.params) == init_packed { 0.0 } else { 1.0 }
         });
     assert_eq!(
@@ -14802,7 +14802,6 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
     let restarted = || restarted_at(true);
     let restart_ofv = restarted().ofv;
     let restart_cause = Some(RestartCause::MidDescent);
-    let probe_cause = Some(RestartCause::BasinShift);
     let budget_tag = "Outer optimization hit the evaluation budget (maxiter = 9) before \
                       converging; increase maxiter for a tighter fit.";
     for (verdict, probe_delta, reports_probe, restart_left, probe_converged, probe_left, budget) in [
@@ -14842,7 +14841,7 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
         };
         let (result, cause, from_probe, verified) = settle_restart_probe(
             (restarted_at(restart_left), restart_cause),
-            Some((probe, probe_cause, verdict)),
+            Some((probe, verdict)),
             |r| r.ofv,
         );
         assert_eq!(
@@ -14864,7 +14863,8 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
                 if probe_run { probe_converged } else { false },
                 probe_run,
                 !probe_run,
-                if probe_run { probe_cause } else { restart_cause }
+                // A probe's result has had its restarts: no cause is carried on.
+                if probe_run { None } else { restart_cause }
             ),
             "{label}: whose verdict, warnings and restart cause: {:?}",
             result.warnings
