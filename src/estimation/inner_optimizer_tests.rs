@@ -2813,7 +2813,7 @@ mod frozen_ebe_variance {
             [("proportional", None), ("combined", Some("DV ~ combined(PROP_ERR, ADD_ERR)"))]
         {
             let (model, pop, p) = noiov_fixture(err);
-            assert!(model.error_spec.has_f_dependent_variance());
+            assert!(model.has_f_dependent_variance());
             for s in pop.subjects.iter().take(4) {
                 let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
                 let eta = [0.25, -0.15, 0.35];

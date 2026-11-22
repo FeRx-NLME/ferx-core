@@ -4488,6 +4488,129 @@ fn custom_residual_magnitude_objective_and_gradients() {
     }
 }
 
+// ---- magnitudes that read the prediction (#3121) ----------------------------------------
+
+/// Both slots read `IPRED` non-affinely: the proportional loading times `sqrt(1 + B·f)`
+/// (so `h·g` needs the product rule with `g' ≠ 0`) and the additive one `A·exp(−B·f)`
+/// (`h'' ≠ 0`), with θ in each so the direct-θ channel and `∂R/∂f` are both live.
+const ORAL_IPRED_MAG: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TH_A(1.3, 0.1, 10.0)
+  theta TH_B(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.1 (sd)
+  sigma ADD_ERR ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ combined(PROP_ERR * sqrt(1 + TH_B * IPRED), ADD_ERR * TH_A * exp(-TH_B * IPRED))
+"#;
+
+/// #3121: every θ and σ against the reconverged FD oracle under FOCEI, FOCE (whose `R⁰`
+/// reads the magnitude at the population prediction), Laplace and AGQ, plus the
+/// kernel-vs-production objective. Kills the dual kernel dropping or mis-differentiating
+/// `h(f)`: production's objective reads it through `scaled_loadings`, so the gap opens.
+#[test]
+fn ipred_magnitude_objective_and_gradients() {
+    let model = parse_model_string(ORAL_IPRED_MAG).unwrap();
+    assert!(model.ruv_reads_prediction() && model.has_f_dependent_variance());
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    eprintln!("objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    for (label, worst) in [
+        ("FOCEI", fd_oracle(&model, &s, true)),
+        ("FOCE", fd_oracle(&model, &s, false)),
+        ("Laplace", fd_oracle_laplace(&model, &s)),
+        ("AGQ(3)", fd_oracle_agq(&model, &s, 3, true)),
+    ] {
+        eprintln!("{label}: worst {worst:.2e}");
+        // Measured worst 1.94e-9 (FOCE, macOS arm64); ~10×.
+        assert!(worst < 2e-8, "{label}: {worst:.2e}");
+    }
+    let (fd, _) = hessian_gaps(&model, &s, true);
+    eprintln!("R-matrix gap {fd:.2e}");
+    // Measured 8.7e-12 (macOS arm64); ~11×.
+    assert!(fd < 1e-10, "{fd:.2e}");
+}
+
+/// An additive base is the one case where `CompiledModel::has_f_dependent_variance` differs
+/// from the error form's own gate (#3125 review 2): plain `additive` is f-free, so FOCE's
+/// `R⁰` follows the population prediction only through the model-level gate. The straddle
+/// is asserted, and FOCE's gradient and R-matrix are pinned against the reconverged FD
+/// oracle. Mutation — `planned_pop`'s gate reverted to `error_spec.has_f_dependent_variance()`:
+/// FOCE gradient 1.9e-1, R-matrix gap 2.41 (measured by the review, macOS arm64).
+#[test]
+fn ipred_additive_magnitude_foce_gradients() {
+    let src = ORAL_IPRED_MAG.replace("  sigma PROP_ERR ~ 0.1 (sd)\n", "").replace(
+        "combined(PROP_ERR * sqrt(1 + TH_B * IPRED), ADD_ERR * TH_A * exp(-TH_B * IPRED))",
+        "additive(ADD_ERR * TH_A * exp(-TH_B * IPRED))",
+    );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.has_f_dependent_variance() && !model.error_spec.has_f_dependent_variance());
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let s = subject(&model, doses, &TIMES, &[0.1, -0.05, 0.2]);
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    for (label, interaction) in [("FOCE", false), ("FOCEI", true)] {
+        let worst = fd_oracle(&model, &s, interaction);
+        let (fd, _) = hessian_gaps(&model, &s, interaction);
+        eprintln!("{label}: gradient {worst:.2e}, R-matrix {fd:.2e}");
+        // Measured worst: gradient 4.37e-9 (FOCEI), R-matrix 2.56e-9 (FOCE), macOS arm64;
+        // ~5× / ~12×, far under the mutation's 1.9e-1 / 2.41.
+        assert!(worst < 2e-8, "{label} gradient: {worst:.2e}");
+        assert!(fd < 3e-8, "{label} R-matrix: {fd:.2e}");
+    }
+}
+
+/// M3-censored rows score `Φ` at `√V` with `V = (h(f)·g(f)·σ)²`: the kernel's censored
+/// term reads the same row program, against the reconverged FD oracle.
+#[test]
+fn ipred_magnitude_m3_censored_gradients() {
+    let mut model = parse_model_string(ORAL_IPRED_MAG).unwrap();
+    model.bloq_method = crate::types::BloqMethod::M3;
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let s = censor(subject(&model, doses, &TIMES, &[0.1, -0.05, 0.2]), &[0, 7, 8]);
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    let worst = fd_oracle(&model, &s, true);
+    eprintln!("M3 FOCEI: worst {worst:.2e}");
+    assert!(worst < 2e-8, "{worst:.2e}");
+}
+
+/// The same on an `if/else` block, where the program rides the endpoint's table.
+#[test]
+fn ipred_endpoint_magnitude_objective_and_gradients() {
+    let (_, s) = selected_magnitude_fixture();
+    let src = SELECTED_MAGNITUDE.replace(
+        "proportional(PROP_ERR * TH_M)",
+        "proportional(PROP_ERR * TH_M * sqrt(1 + IPRED))",
+    );
+    let model = tight(parse_model_string(&src).unwrap());
+    assert!(model.ruv_reads_prediction());
+    assert_endpoint_magnitude_parity(&model, &s);
+}
+
 // ---- magnitude expressions per endpoint (#2731) -----------------------------------------
 
 /// Two endpoints on one sigma each, a θ factor gated on `TAD` on the first and a θ factor
@@ -4610,8 +4733,7 @@ fn block_sigma_cmt_magnitude_objective_and_gradients() {
 /// `if/else` branches on the closed-form engine, sharing a sigma with a factor on one
 /// branch and a `combined` on the other, with `EARLY` changing inside the subject. The
 /// `Selected` key is a branch index, not a `CMT`.
-fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
-    let src = r#"
+const SELECTED_MAGNITUDE: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
   theta TVV(10.0, 0.1, 500.0)
@@ -4636,7 +4758,9 @@ fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
     DV ~ combined(PROP_ERR, ADD_ERR)
   }
 "#;
-    let model = tight(parse_model_string(src).unwrap());
+
+fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
+    let model = tight(parse_model_string(SELECTED_MAGNITUDE).unwrap());
     let doses = vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
         DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
