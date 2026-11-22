@@ -9071,19 +9071,34 @@ pub(crate) fn reconverged_fd_gradient(
         reconverged_probe_ofv(xv, init_params, model, population, &warm, options, tol)
     };
     let tol = stencil_inner_tol(options.inner_tol);
-    // A probe after a cancel is missing, not solved (#2776): its re-solve does not poll the
-    // flag, and the gate would otherwise grow every floored step through them.
-    let live = || !crate::cancel::is_cancelled(&options.cancel);
-    let eval = |xv: &[f64]| if live() { probe(xv, tol).0 } else { f64::NAN };
+    let eval = |xv: &[f64]| probe(xv, tol).0;
     let tight = |xv: &[f64]| {
-        let (v, stats) =
-            live().then(|| probe(xv, crate::estimation::fd_resolution::tight_tol(tol)))?;
+        let (v, stats) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
         crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
+    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
+}
+
+/// [`central_diff_packed_gated`] for a stencil whose probes re-solve the inner loop and so
+/// do not poll the cancel flag themselves (#2776): once `cancel` is set, every remaining probe
+/// is missing, not solved — `eval` reads `NaN`, `tight` reads `None`. Without this the #2406
+/// gate would grow every floored step through the remaining probes (up to ~44 population
+/// re-solves per floored coordinate) before the caller saw the cancel. The **one** guard for
+/// the three reconverged-FD gradients; a coordinate a cancel cuts inside its gate growth keeps
+/// what the gate had, which every caller discards (`fit()` errs, the covariance step skips its
+/// reading).
+fn central_diff_until_cancel(
+    x: &[f64], fixed: &[bool], floor: &[f64], bounds: &PackedBounds,
+    cancel: &Option<crate::cancel::CancelFlag>, eval: impl Fn(&[f64]) -> f64,
+    tight: impl Fn(&[f64]) -> Option<f64>,
+) -> Vec<f64> {
+    let live = || !crate::cancel::is_cancelled(cancel);
+    let eval = |xv: &[f64]| if live() { eval(xv) } else { f64::NAN };
+    let tight = |xv: &[f64]| live().then(|| tight(xv)).flatten();
+    central_diff_packed_gated(x, fixed, floor, bounds, eval, Some(&tight))
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
@@ -9381,15 +9396,13 @@ fn reporting_fd_gradient(
         };
         (v, stats)
     };
-    // A probe after a cancel is missing, not solved (#2776), as in `reconverged_fd_gradient`.
-    let live = || !crate::cancel::is_cancelled(&options.cancel);
-    let eval = |xv: &[f64]| if live() { probe(xv, false).0 } else { f64::NAN };
+    let eval = |xv: &[f64]| probe(xv, false).0;
     let tight = |xv: &[f64]| {
-        let (v, stats) = live().then(|| probe(xv, true))?;
+        let (v, stats) = probe(xv, true);
         crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
+    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -9812,16 +9825,13 @@ fn subject_central_diff(
 ) -> Vec<f64> {
     let fixed = packed_fixed_mask(init_params);
     let tol = stencil_inner_tol(options.inner_tol);
-    // A probe after a cancel is missing, not solved (#2776), as in `reconverged_fd_gradient`.
-    let live = || !crate::cancel::is_cancelled(&options.cancel);
-    let eval = |xv: &[f64]| if live() { probe(xv, tol).0 } else { f64::NAN };
+    let eval = |xv: &[f64]| probe(xv, tol).0;
     let tight = |xv: &[f64]| {
-        let (v, resolved) =
-            live().then(|| probe(xv, crate::estimation::fd_resolution::tight_tol(tol)))?;
+        let (v, resolved) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
         resolved.then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
+    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the
