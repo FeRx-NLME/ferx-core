@@ -8278,8 +8278,20 @@ pub(crate) mod outer_fd_fallback {
     /// floored step through every one of them. On fixture A (`BETA` declared at `1e-4`, so
     /// the gate runs), each of the three gradients returns the live gradient with no flag,
     /// solves nothing (an all-zero gradient) with the flag already set, and, with the cancel
-    /// landing partway, keeps the coordinates it finished bit for bit and zeroes the rest:
-    /// none is made up from one live probe and one missing one.
+    /// landing between coordinates (`trip_after(6)`, coordinate 3), keeps the coordinates it
+    /// finished bit for bit and zeroes the rest: none is made up from one live probe and one
+    /// missing one.
+    ///
+    /// A cancel landing *inside* a floored coordinate's gate growth does not zero it
+    /// (#2776 review r1 §2): the gate runs on with every probe missing and returns what it
+    /// had, the last τ/100 difference or else the first floor's τ one — a difference of two
+    /// live probes, at a floor the gate had not accepted yet (measured: cuts 14–31 land in
+    /// `BETA`'s growth, `g[6]` = 2.81717 at 14 against the live 2.83145). The ungated
+    /// fallback can likewise return a one-sided difference against a centre cached before
+    /// the cancel. Either way the gradient is discarded: `fit()` returns `Err` on a cancel,
+    /// and the covariance step takes no reading on one (the test below). `trip_after(14)`
+    /// pins that shape: every coordinate before `BETA` kept, every one after it 0, and
+    /// `BETA` itself finite, non-zero, and not the live value.
     #[test]
     fn a_cancelled_fd_gradient_solves_no_probe() {
         let (model, pop) = two_cpt_cov_beta(1e-4, 0.68 - 1e-4);
@@ -8339,13 +8351,27 @@ pub(crate) mod outer_fd_fallback {
                 ]
             };
             let names = ["population", "reporting", "per-subject"];
-            let (lives, cuts, parts) = (
+            let (lives, cuts, parts, gated) = (
                 grads(None),
                 grads(Some(|| crate::cancel::CancelFlag::trip_after(0))),
                 grads(Some(|| crate::cancel::CancelFlag::trip_after(6))),
+                grads(Some(|| crate::cancel::CancelFlag::trip_after(14))),
             );
+            const BETA: usize = 6;
             for (k, name) in names.iter().enumerate() {
-                let (g, c, p) = (&lives[k], &cuts[k], &parts[k]);
+                let (g, c, p, q) = (&lives[k], &cuts[k], &parts[k], &gated[k]);
+                // The cut inside `BETA`'s gate: what the gate had, never a missing probe.
+                assert!(
+                    q[..BETA].iter().zip(&g[..BETA]).all(|(a, b)| a.to_bits() == b.to_bits())
+                        && q[BETA + 1..].iter().all(|v| *v == 0.0),
+                    "{name}: a cut inside BETA's gate touched another coordinate: {q:?} vs {g:?}"
+                );
+                assert!(
+                    q[BETA].is_finite() && q[BETA] != 0.0 && q[BETA] != g[BETA],
+                    "fixture: the cut lands inside {name}'s BETA growth: {} vs live {}",
+                    q[BETA],
+                    g[BETA]
+                );
                 assert!(g.iter().any(|v| *v != 0.0), "fixture: {name} gradient is live");
                 assert!(c.iter().all(|v| *v == 0.0), "{name}: a probe ran after the cancel: {c:?}");
                 let kept = |a: &f64, b: &f64| a.to_bits() == b.to_bits();
