@@ -2126,6 +2126,21 @@ fn take_tte_pending(pending: &mut Vec<(usize, (f64, f64))>, cmt: usize) -> Optio
     Some(pending.remove(i).1)
 }
 
+/// What the `TENTRY > TIME` warning says about the TTE row it leaves unscored (rather than
+/// an invalid NLL). Such a row is a record of the PK model only after another record: the
+/// `has_record` test that decides its `push_pk_only!` decides this clause too (#2943 r2).
+/// A function, not an inline `if`, so the gated block holds no comment or brace-only line
+/// that the non-`survival` coverage build reads as missed (#293).
+#[cfg(feature = "survival")]
+fn tentry_record_clause(has_record: bool) -> &'static str {
+    if has_record {
+        "stays a record of the PK model, as in NONMEM"
+    } else {
+        "is not a record of the PK model either, since it comes before every other record of \
+         the subject"
+    }
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2791,20 +2806,12 @@ fn parse_subject(
                         .unwrap_or(0.0)
                         .max(0.0);
                     if raw_entry > time + 1e-12 {
-                        // A TTE row is a record only after another one (`has_record` above),
-                        // so the warning says which it is (#2943 review r2).
-                        let record = if has_record {
-                            "stays a record of the PK model, as in NONMEM"
-                        } else {
-                            "is not a record of the PK model either, since it comes before \
-                             every other record of the subject"
-                        };
                         parse_warnings.push(format!(
                             "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
                              — entry time after the event/censoring time yields a negative \
-                             effective cumulative hazard; the row is not scored and {record}"
+                             effective cumulative hazard; the row is not scored and {}",
+                            tentry_record_clause(has_record)
                         ));
-                        // Not scored rather than an invalid NLL; a record only if pushed above.
                         continue;
                     }
                     let entry_time = raw_entry;
