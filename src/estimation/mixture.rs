@@ -320,6 +320,14 @@ pub(crate) struct MixtureClassModes {
     pub(crate) kappas: Vec<Vec<Vec<DVector<f64>>>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The `inner_tol` of each mixture objective evaluation on this thread, for the tests
+    /// (#2745): what a class's inner solve was actually run at, read where it is consumed.
+    pub(crate) static MIXTURE_OFV_INNER_TOLS: std::cell::RefCell<Vec<f64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// [`mixture_ofv`], also returning every class's modes ([`MixtureClassModes`]).
 pub(crate) fn mixture_ofv_with_modes(
     model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
@@ -359,6 +367,8 @@ fn mixture_ofv_impl(
     let k = mp.omega.len();
     let n = population.subjects.len();
     let interaction = options.interaction;
+    #[cfg(test)]
+    MIXTURE_OFV_INNER_TOLS.with(|t| t.borrow_mut().push(options.inner_tol));
 
     // Per-class inner solves. `nll[class][subject]`, plus per-class EBE cache and
     // convergence flags.
