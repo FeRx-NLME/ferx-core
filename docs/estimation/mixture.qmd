@@ -174,9 +174,9 @@ and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907)
 - **Empty class.** No subject's posterior probability of the class reaches 0.01.
 
 The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ
-estimated. Started from clearances 1.70 / 1.71, FOCEI with L-BFGS ends in a collapsed optimum
-(OFV 310.02, class clearances 1.71 / 1.76, ω_CL 0.35, which absorbs the
-bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
+estimated. Started from the near-symmetric clearances 1.70 / 1.701, FOCEI with L-BFGS
+ends in a collapsed optimum (OFV 310.02, class clearances 1.73 / 1.74, ω_CL 0.35, which
+absorbs the bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
 it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
 `mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at
 −9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
@@ -192,6 +192,9 @@ on the fixture above, a start of 1.2 / 2.5 reaches 299.86 under the default L-BF
 Changing the optimizer is not a reliable fix, because neither one escapes every
 symmetric start: from 1.70 / 1.71, `optimizer = bobyqa` reaches 299.86 under FOCEI but
 collapses under `n_agq = 3` (OFV 310.88), where the default L-BFGS reaches 300.17.
+Under FOCEI the default L-BFGS reaches 299.86 from 1.70 / 1.71 too, since its verification
+leg leaves the collapsed saddle (#2837); of ten starts between 1.60 / 1.80 and 1.70 / 1.701,
+only the last still collapsed.
 
 ## Validation against NONMEM
 
