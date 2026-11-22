@@ -934,7 +934,7 @@ impl EbeVariance {
     ) -> Self {
         let sheiner_beal =
             !interaction && crate::types::FitOptions::agq_nodes_for(method, n_agq).is_none();
-        if sheiner_beal && model.error_spec.has_f_dependent_variance() {
+        if sheiner_beal && model.has_f_dependent_variance() {
             Self::Population
         } else {
             Self::Conditional

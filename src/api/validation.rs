@@ -613,18 +613,31 @@ fn residual_magnitude_at_class(
         let Some(mult) = model.ruv_obs_mult(subj, theta) else {
             continue;
         };
+        // A magnitude that reads `IPRED` (#3121) is checked at the population prediction
+        // (η = 0) of the initial estimates, on the scale the residual is scored on.
+        let preds = model.ruv_reads_prediction().then(|| {
+            crate::pk::compute_predictions_with_tv(model, subj, theta, &vec![0.0; model.n_eta])
+        });
         for (j, row) in mult.iter().enumerate() {
-            for (k, &m) in row.iter().enumerate() {
+            // The tail of a prediction-reading row is its program, not values.
+            for (k, &raw) in row[..row.len().min(2 * n_sigma)].iter().enumerate() {
+                let fmag = preds.as_ref().filter(|_| k < n_sigma).and_then(|p| {
+                    let prog = crate::stats::residual_error::slot_fmag(row, n_sigma, k)?;
+                    Some((p[j], crate::stats::residual_error::eval_fmag(prog, |a| a, p[j])))
+                });
+                let m = fmag.map_or(raw, |(_, h)| h);
                 if m.is_finite() && m > 0.0 {
                     continue;
                 }
                 // The written TIME, which the magnitude itself is evaluated at
                 // (`ruv_obs_mult`) and the user can find in the data (#1959).
                 let time = subj.readout_time(j);
+                let at_pred =
+                    fmag.map(|(f, _)| format!(", at the η = 0 prediction {f}")).unwrap_or_default();
                 // The upper half of a row is the `power(...)` exponent per slot
                 // (#1182, `RuvMagnitude::eval_obs`); a non-positive exponent is
                 // a different mistake from a vanishing multiplier.
-                if n_sigma > 0 && row.len() == 2 * n_sigma && k >= n_sigma {
+                if n_sigma > 0 && row.len() >= 2 * n_sigma && k >= n_sigma {
                     return vec![Diagnostic::error(
                         "E_RUV_MAGNITUDE_NONPOSITIVE",
                         format!(
@@ -645,7 +658,7 @@ fn residual_magnitude_at_class(
                     "E_RUV_MAGNITUDE_NONPOSITIVE",
                     format!(
                         "[error_model] residual-error magnitude for sigma slot {k} evaluates to \
-                         {m} at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                         {m} at subject `{}`, TIME {time}{at_class}{at_pred} — it must be strictly \
                          positive and finite. The variance is proportional to its square, so a zero magnitude \
                          collapses that observation's variance onto the floor and lets one row \
                          dominate the fit. The usual cause is a missing or non-numeric cell in a \

@@ -73,6 +73,35 @@ fn the_residual_magnitude_check_names_the_written_time() {
     names_the_written_time(&msg, "at subject `1`, TIME 2 —");
 }
 
+/// `E_RUV_MAGNITUDE_NONPOSITIVE` on a magnitude that reads `IPRED` (#3121): judged at the
+/// η = 0 prediction of the initial estimates (the row's multiplier entry is a neutral `1`,
+/// so a check of the row alone passes every such model), and the message names that
+/// prediction. The control, positive at every prediction, raises nothing.
+#[test]
+fn the_residual_magnitude_check_reads_the_prediction() {
+    let src = |mag: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  \
+             sigma ADD_ERR ~ 1.0 (variance) FIX\n[individual_parameters]\n  CL = TVCL * \
+             exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+             v=V)\n[error_model]\n  DV ~ additive(ADD_ERR * {mag})\n[covariates]\n  \
+             WPSE continuous\n"
+        )
+    };
+    let pop = moved_subject("WPSE", [1.0, 1.0, 1.0]);
+    let codes = |mag: &str| -> Vec<String> {
+        let model = parse_model_string(&src(mag)).expect("parse");
+        check_model_data(&model, &pop)
+            .into_iter()
+            .filter(|d| d.code == "E_RUV_MAGNITUDE_NONPOSITIVE")
+            .map(|d| d.message)
+            .collect()
+    };
+    assert!(codes("(1 + abs(IPRED))").is_empty());
+    let msg = codes("(0 - abs(IPRED))").pop().expect("a negative h(f) is an error");
+    assert!(msg.contains("sigma slot 0") && msg.contains("at the η = 0 prediction"), "{msg}");
+}
+
 /// `E_THETA_GATHER_INDEX_RANGE`: a 0-based index on the moved observation.
 ///
 /// Mutation — the observation rows' time read off `obs_times`: it names `MOVED`.
