@@ -4231,9 +4231,10 @@ fn a_reset_is_effective_only_after_a_record() {
         pop.subjects.iter().map(|s| (s.has_resets(), s.has_effective_resets())).collect();
     // The first-record EVID=4, an EVID=3 ahead of the first dose, a dose then EVID=4 at the
     // same time, a reset after a dose, no reset; a reset after an observation and after an
-    // `EVID=2` row, with no dose before it; one after a dropped missing-DV row (no record).
+    // `EVID=2` row, with no dose before it; one after a row skipped for its missing DV, which
+    // the reader keeps as an `MDV=1` record (#2943), so the reset follows a record.
     let (inert, live) = ((true, false), (true, true));
-    assert_eq!(got, [inert, inert, live, live, (false, false), live, live, inert]);
+    assert_eq!(got, [inert, inert, live, live, (false, false), live, live, live]);
     // A subject with endpoint records counts any reset as effective, the conservative side.
     let bare = Subject { reset_times: vec![0.0], ..Subject::default() };
     let endpoint = Subject {

@@ -1413,8 +1413,9 @@ impl Subject {
     /// starts from, so it is a no-op; the reader shifts a reset that is not first past every
     /// record before it, so the shifted times decide, and a record that ties it in time but
     /// comes first in the file still counts. A subject with endpoint records counts as having
-    /// one whenever it has a reset. A leading row the reader dropped (`W_MISSING_DV`) is no
-    /// record, so a reset after it alone is inert, as is the integration that starts there.
+    /// one whenever it has a reset. A leading row skipped for a missing DV (`W_MISSING_DV`)
+    /// is still a record: the reader keeps it as an `MDV=1` row in `pk_only_times` (#2943),
+    /// so a reset after it is effective, as NONMEM integrates from that row.
     pub(crate) fn has_effective_resets(&self) -> bool {
         if !self.has_resets() {
             return false;
