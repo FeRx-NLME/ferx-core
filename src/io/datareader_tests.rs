@@ -3539,12 +3539,50 @@ fn a_tte_row_dropped_for_entry_after_event_is_not_counted_as_an_observation() {
     );
 
     // TENTRY=50 > TIME=20: the reader warns about the row and `continue`s before it
-    // becomes an `obs_records` entry, so it is not a compartment the fit ever used.
+    // becomes an `obs_records` entry, so it is not a compartment the fit ever used
+    // (whether it is a record of the PK model is the next test's question).
     let one_dropped = read("50");
     assert!(
         one_dropped.contains("0 dose row(s) and 1 observation row(s)"),
-        "a TENTRY > TIME row is dropped, so it is not counted: {one_dropped}"
+        "a TENTRY > TIME row is not scored, so it is not counted: {one_dropped}"
     );
+}
+
+/// #2943 review r2: the `TENTRY > TIME` warning says whether the unscored row is a record of
+/// the PK model, and that turns on `has_record`, as the push does. Both sides in one test, so
+/// a message stuck on either branch, or a push that stops following `has_record`, fails here.
+#[cfg(feature = "survival")]
+#[test]
+fn a_tte_row_with_entry_after_event_is_a_record_only_after_another_record() {
+    let routing = ObsRouting { tte: [3].into_iter().collect(), ..Default::default() };
+    let read = |csv: &str| {
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let warn = pop
+            .warnings
+            .iter()
+            .find(|w| w.contains("TENTRY=50 > TIME=20"))
+            .unwrap_or_else(|| panic!("no TENTRY warning in {:?}", pop.warnings))
+            .clone();
+        (pop.subjects[0].pk_only_times.clone(), warn)
+    };
+    let (stays, not_a) = (
+        "stays a record of the PK model, as in NONMEM",
+        "is not a record of the PK model either, since it comes before every other record of \
+         the subject",
+    );
+
+    // After a dose: a record, and the warning says so.
+    let (times, warn) =
+        read("ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,0,.,1,1,100,1,0\n1,20,1,0,0,.,3,50\n");
+    assert_eq!(times, vec![20.0], "after a dose the row is a record");
+    assert!(warn.contains(stays) && !warn.contains(not_a), "after a dose: {warn}");
+
+    // Ahead of every other record: no record, and the warning does not claim one.
+    let (times, warn) =
+        read("ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,20,1,0,0,.,3,50\n1,30,0,0,0,.,3,0\n");
+    assert!(times.is_empty(), "a leading row is no record: {times:?}");
+    assert!(warn.contains(not_a) && !warn.contains(stays), "leading: {warn}");
 }
 
 /// The other half of the same move, on the Gaussian arm: a missing-DV row skipped
