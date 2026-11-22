@@ -421,20 +421,24 @@ variance contribution is `(loading · h · σ)²`.
   log-transform-both-sides (`log(DV) ~ …`), where the residual is scored on the log
   prediction, `IPRED` reads its exponential (floored as the LTBS log is).
 - **Operators.** Around `IPRED` an expression may use `+ - * / ^`, `exp`, `log`, `sqrt`,
-  `abs` and `inv_logit`; anything else (`floor`, an inline `if`, …) is refused by name.
-  The parts that do not read `IPRED` are unrestricted.
+  `abs` and `inv_logit`; anything else (`floor`, an inline `if`, `min`, `max`, …) is
+  refused by name. The parts that do not read `IPRED` are unrestricted.
 - **Where it is refused.** `weight =` stays a property of the datum, so it cannot read
   `IPRED`: write the factor into the magnitude, `additive(SIGMA * h(IPRED))`, which is
-  the same model. A `power(...)` exponent cannot read it either. A `[structural_model]`
-  name (an intermediate or the readout) is refused with its own message: read the
-  prediction as `IPRED`.
+  the same model. A `power(...)` exponent cannot read it either. A name assigned on the
+  prediction side (`[structural_model]`, `[scaling]`, an `[odes]` state) is refused with
+  its own message: only the prediction itself is readable, as `IPRED`. A dataset column
+  named `IPRED` declared in `[covariates]` is refused too, since the magnitude would read
+  the prediction while the rest of the model reads the column: rename the column to read
+  it, or drop it from `[covariates]` to read the prediction.
 - **Estimation.** Under FOCEI and in the EBE search the variance moves with η through
   `IPRED`. Plain FOCE holds it at the population prediction, as it does for
   `proportional`. The inner and outer gradients, and the covariance R-matrix, are
-  analytic under FOCE, FOCEI and Laplace. The Gauss-Newton closed forms assume a magnitude
-  constant in the prediction, so those subjects take GN's finite-difference fallback.
+  analytic under FOCE, FOCEI, Laplace and AGQ. The Gauss-Newton closed forms assume a
+  magnitude constant in the prediction, so those subjects take GN's finite-difference
+  fallback.
 - **Initial check.** `E_RUV_MAGNITUDE_NONPOSITIVE` evaluates the magnitude at the η = 0
-  prediction of the initial estimates.
+  prediction of the initial estimates, and names that `IPRED` (natural scale).
 
 #### Comparison with NONMEM {#magnitude-ipred-nonmem-anchor}
 

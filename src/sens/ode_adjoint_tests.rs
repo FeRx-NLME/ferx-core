@@ -4516,7 +4516,7 @@ const ORAL_IPRED_MAG: &str = r#"
 "#;
 
 /// #3121: every θ and σ against the reconverged FD oracle under FOCEI, FOCE (whose `R⁰`
-/// reads the magnitude at the population prediction) and Laplace, plus the
+/// reads the magnitude at the population prediction), Laplace and AGQ, plus the
 /// kernel-vs-production objective. Kills the dual kernel dropping or mis-differentiating
 /// `h(f)`: production's objective reads it through `scaled_loadings`, so the gap opens.
 #[test]
@@ -4539,6 +4539,7 @@ fn ipred_magnitude_objective_and_gradients() {
         ("FOCEI", fd_oracle(&model, &s, true)),
         ("FOCE", fd_oracle(&model, &s, false)),
         ("Laplace", fd_oracle_laplace(&model, &s)),
+        ("AGQ(3)", fd_oracle_agq(&model, &s, 3, true)),
     ] {
         eprintln!("{label}: worst {worst:.2e}");
         // Measured worst 1.94e-9 (FOCE, macOS arm64); ~10×.
@@ -4548,6 +4549,38 @@ fn ipred_magnitude_objective_and_gradients() {
     eprintln!("R-matrix gap {fd:.2e}");
     // Measured 8.7e-12 (macOS arm64); ~11×.
     assert!(fd < 1e-10, "{fd:.2e}");
+}
+
+/// An additive base is the one case where `CompiledModel::has_f_dependent_variance` differs
+/// from the error form's own gate (#3125 review 2): plain `additive` is f-free, so FOCE's
+/// `R⁰` follows the population prediction only through the model-level gate. The straddle
+/// is asserted, and FOCE's gradient and R-matrix are pinned against the reconverged FD
+/// oracle. Mutation — `planned_pop`'s gate reverted to `error_spec.has_f_dependent_variance()`:
+/// FOCE gradient 1.9e-1, R-matrix gap 2.41 (measured by the review, macOS arm64).
+#[test]
+fn ipred_additive_magnitude_foce_gradients() {
+    let src = ORAL_IPRED_MAG.replace("  sigma PROP_ERR ~ 0.1 (sd)\n", "").replace(
+        "combined(PROP_ERR * sqrt(1 + TH_B * IPRED), ADD_ERR * TH_A * exp(-TH_B * IPRED))",
+        "additive(ADD_ERR * TH_A * exp(-TH_B * IPRED))",
+    );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.has_f_dependent_variance() && !model.error_spec.has_f_dependent_variance());
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let s = subject(&model, doses, &TIMES, &[0.1, -0.05, 0.2]);
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    for (label, interaction) in [("FOCE", false), ("FOCEI", true)] {
+        let worst = fd_oracle(&model, &s, interaction);
+        let (fd, _) = hessian_gaps(&model, &s, interaction);
+        eprintln!("{label}: gradient {worst:.2e}, R-matrix {fd:.2e}");
+        // Measured worst: gradient 4.37e-9 (FOCEI), R-matrix 2.56e-9 (FOCE), macOS arm64;
+        // ~5× / ~12×, far under the mutation's 1.9e-1 / 2.41.
+        assert!(worst < 2e-8, "{label} gradient: {worst:.2e}");
+        assert!(fd < 3e-8, "{label} R-matrix: {fd:.2e}");
+    }
 }
 
 /// M3-censored rows score `Φ` at `√V` with `V = (h(f)·g(f)·σ)²`: the kernel's censored
