@@ -190,13 +190,14 @@ With exactly symmetric starts in exchangeable classes, the derivative in the dir
 separates the classes is zero. Give the classes distinct starting values to keep using
 L-BFGS. If the warning fires, move the class starts further apart and compare the objectives:
 on the fixture above, a start of 1.2 / 2.5 reaches 299.86 under the default L-BFGS.
-Changing the optimizer is not a reliable fix, because neither one escapes every
-symmetric start: from 1.70 / 1.71, `optimizer = bobyqa` reaches 299.86 under FOCEI but
-collapses under `n_agq = 3` (OFV 310.88), where the default L-BFGS reaches 300.17.
-Under FOCEI the default L-BFGS reaches 299.86 from 1.70 / 1.71 too, since its verification
-leg leaves the collapsed saddle (#2837): nine starts with class clearances 0.005 to 0.20
-apart (1.705 / 1.71 to 1.60 / 1.80) reach 299.86, and only 1.70 / 1.701, 0.001 apart, still
-collapses.
+Since its verification leg leaves the collapsed saddle (#2837), the default L-BFGS
+reaches 299.86 under FOCEI from nine starts with class clearances 0.005 to 0.20 apart
+(1.705 / 1.71 to 1.60 / 1.80), and 300.16 under `n_agq = 3` from 1.70 / 1.71. From
+1.70 / 1.701, 0.001 apart, it still collapses, under FOCEI (310.02) and under `n_agq = 3`
+(310.73). `optimizer = bobyqa` reached the two-class optimum from every start probed,
+1.70 / 1.701 included (299.86 under FOCEI, 300.16 under `n_agq = 3`), so it is a second
+check once the warning fires. A few starts on one dataset do not make it a guarantee, so
+compare the objectives either way.
 
 ## Validation against NONMEM
 
