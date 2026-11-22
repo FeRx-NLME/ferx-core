@@ -99,6 +99,66 @@ fn eval_only_ofv(src: &str) -> f64 {
     result.ofv
 }
 
+/// #3121, a degenerate oracle: `additive(S * IPRED)` is `proportional(S)` written as a
+/// magnitude that reads the prediction, so every consumer of the variance must agree with
+/// the built-in loading — the FOCEI and FOCE objectives (FOCE holds `R⁰` at `f(η = 0)`,
+/// which an additive base reaches only through the magnitude), IWRES, CWRES, NPDE, and
+/// the simulated DV drawn with one seed. Differences are the two variance associations'
+/// last-ULP rounding: realised ≤ 1.1e-14 on every quantity (macOS arm64), bounds ~100×.
+#[test]
+fn ipred_magnitude_reproduces_the_proportional_loading_in_every_consumer() {
+    let mag = PLAIN_PROP_SRC.replace("proportional(PROP_ERR)", "additive(PROP_ERR * IPRED)");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let run = |src: &str, method: EstimationMethod| {
+        let m = parse_model_string(src).unwrap();
+        let mut opts = FitOptions::default();
+        opts.method = method;
+        opts.outer_maxiter = 0;
+        opts.run_covariance_step = false;
+        opts.npde_nsim = 200;
+        fit(&m, &pop, &m.default_params, &opts).unwrap()
+    };
+    // Worst `|x − y|`, refusing a non-finite operand (a `NaN` would vanish in a fold).
+    let worst = |xs: Vec<f64>, ys: Vec<f64>| {
+        assert!(!xs.is_empty() && xs.len() == ys.len(), "{} vs {} values", xs.len(), ys.len());
+        xs.into_iter().zip(ys).fold(0.0_f64, |w, (x, y)| {
+            let d = (x - y).abs();
+            assert!(d.is_finite(), "{x} vs {y}");
+            w.max(d)
+        })
+    };
+    for method in [EstimationMethod::FoceI, EstimationMethod::Foce] {
+        let (a, b) = (run(PLAIN_PROP_SRC, method), run(&mag, method));
+        eprintln!("{method:?}: |ΔOFV| {:.2e}", (a.ofv - b.ofv).abs());
+        assert!((a.ofv - b.ofv).abs() < 1e-12, "{method:?}: OFV {} vs {}", a.ofv, b.ofv);
+        let col = |r: &ferx_core::FitResult,
+                   f: fn(&ferx_core::types::SubjectResult) -> &Vec<f64>| {
+            r.subjects.iter().flat_map(|s| f(s).clone()).collect::<Vec<f64>>()
+        };
+        for (name, f) in [
+            ("IWRES", (|s| &s.iwres) as fn(&ferx_core::types::SubjectResult) -> &Vec<f64>),
+            ("CWRES", |s| &s.cwres),
+            ("NPDE", |s| &s.npde),
+        ] {
+            let d = worst(col(&a, f), col(&b, f));
+            eprintln!("{method:?}: |Δ{name}| {d:.2e}");
+            assert!(d < 1e-12, "{method:?} {name}: {d:.2e}");
+        }
+    }
+    let sim = |src: &str| {
+        let m = parse_model_string(src).unwrap();
+        ferx_core::simulate_with_seed(&m, &pop, &m.default_params, 2, 3121).unwrap()
+    };
+    let value = |r: &ferx_core::SimulationResult| match r.outcome {
+        ferx_core::SimOutcome::Continuous { value } => value,
+        _ => unreachable!("a Gaussian row"),
+    };
+    let (a, b) = (sim(PLAIN_PROP_SRC), sim(&mag));
+    let d = worst(a.iter().map(value).collect(), b.iter().map(value).collect());
+    eprintln!("simulated DV: |Δ| {d:.2e}");
+    assert!(d < 1e-13, "simulated DV {d:.2e}");
+}
+
 #[test]
 fn magnitude_parses_into_compiled_model() {
     let model = parse_model_string(&time_varying_ruv_src("2.0")).expect("parses");

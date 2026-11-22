@@ -27,7 +27,7 @@ use crate::sens::jet::DualT;
 #[cfg(test)]
 use crate::sens::num::NonRecording;
 use crate::sens::num::{wsum3, BranchCmp, PkNum};
-use crate::stats::residual_error::{LoadingForm, RBlocks, ResidualCov};
+use crate::stats::residual_error::{eval_fmag, slot_fmag, LoadingForm, RBlocks, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use std::borrow::Cow;
 
@@ -270,6 +270,55 @@ pub(crate) struct LikCtx<'a> {
 /// The most σ loadings one row has: the residual-error owner's bound.
 const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 
+/// A row's σ loadings at prediction `f`, as generic values: a constant slot's
+/// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
+/// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
+/// each times a prediction-reading magnitude `h(f)` when the row's tail carries one
+/// (#3121) and the custom magnitude multiplier `mult` (the row from
+/// `RuvMagnitude::eval_subject_obs_g`; `None` reads as all ones). The same
+/// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
+/// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
+/// in a fixed buffer with its length (no allocation per row).
+///
+/// A free function so the likelihood kernel and the SDE recorder's Kalman `R`
+/// (`ode_adjoint::record_sde_p`, #3126) share one definition of the row. `n_shape` sizes the
+/// loading shape (the model's σ count), `n_sigma` the exponent half of `mult`.
+pub(crate) fn row_loadings_g<T: PkNum>(
+    spec: &crate::types::ErrorSpec, key: usize, n_shape: usize, n_sigma: usize, f: T,
+    mult: Option<&[T]>,
+) -> ([(usize, T); MAX_LOADINGS], usize) {
+    let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
+    let shape = spec.loading_shape(key, n_shape);
+    let len = shape.len();
+    for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
+        let c = if form == LoadingForm::Prop {
+            // `slot_exponent`: the exponent half of the row, when present.
+            match mult.filter(|m| m.len() >= 2 * n_sigma).map(|m| m[n_sigma + idx]) {
+                Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
+                    if f.br_cmp_c(BranchCmp::Eq, 0.0) {
+                        T::from_f64(0.0)
+                    } else {
+                        let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
+                        T::from_f64(sign) * f.abs().pow(pw)
+                    }
+                }
+                _ => form.coeff_g(f),
+            }
+        } else {
+            form.coeff_g(f)
+        };
+        let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
+        // A prediction-reading magnitude `h(f)` (#3121), in `T`: its `f`-, θ- and
+        // η-derivatives come from the types, as every other loading's do.
+        let c = match mult.and_then(|m| slot_fmag(m, n_sigma, idx)) {
+            Some(prog) => eval_fmag(prog, |a| a, f) * c,
+            None => c,
+        };
+        *o = (idx, m * c);
+    }
+    (out, len)
+}
+
 impl<'a> LikCtx<'a> {
     pub(crate) fn new(
         model: &'a CompiledModel, subject: &'a Subject, params: &'a ModelParameters,
@@ -339,43 +388,19 @@ impl<'a> LikCtx<'a> {
         self.model.bloq_in_force().is_censored_row(c).then_some(c)
     }
 
-    /// Row `j`'s σ loadings at prediction `f`, as generic values: a constant slot's
-    /// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
-    /// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
-    /// each times the custom magnitude multiplier. The same
-    /// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
-    /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
-    /// in a fixed buffer with its length (no allocation per row).
+    /// Row `j`'s σ loadings at prediction `f` ([`row_loadings_g`] on this subject's key and
+    /// magnitude row).
     fn loadings<T: PkNum>(
         &self, j: usize, f: T, p: &ParT<T>,
     ) -> ([(usize, T); MAX_LOADINGS], usize) {
-        let n_sigma = p.sigma.len();
-        let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
-        let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let shape =
-            self.model.error_spec.loading_shape(self.keys[j], self.params.sigma.values.len());
-        let len = shape.len();
-        for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
-            let c = if form == LoadingForm::Prop {
-                // `slot_exponent`: the exponent half of the row, when present.
-                match mult.filter(|m| m.len() == 2 * n_sigma).map(|m| m[n_sigma + idx]) {
-                    Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
-                        if f.br_cmp_c(BranchCmp::Eq, 0.0) {
-                            T::from_f64(0.0)
-                        } else {
-                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
-                            T::from_f64(sign) * f.abs().pow(pw)
-                        }
-                    }
-                    _ => form.coeff_g(f),
-                }
-            } else {
-                form.coeff_g(f)
-            };
-            let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
-            *o = (idx, m * c);
-        }
-        (out, len)
+        row_loadings_g(
+            &self.model.error_spec,
+            self.keys[j],
+            self.params.sigma.values.len(),
+            p.sigma.len(),
+            f,
+            p.ruv_mult.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice),
+        )
     }
 
     /// `V` of row `j` at `f`: the loadings variance, unscaled.
@@ -1178,16 +1203,16 @@ pub(crate) fn data_l<T: PkNum>(
 }
 
 /// A 1-D second-order dual: value, first and second derivative along one direction.
-type D2<T> = DualT<1, DualT<1, T>>;
+pub(crate) type D2<T> = DualT<1, DualT<1, T>>;
 
 /// `x` as a [`D2`] constant.
-fn d2_const<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_const<T: PkNum>(x: T) -> D2<T> {
     let zero = T::from_f64(0.0);
     DualT { v: DualT { v: x, g: [zero] }, g: [DualT { v: zero, g: [zero] }] }
 }
 
 /// `x` as the [`D2`] variable: unit first derivative, zero second.
-fn d2_seed<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_seed<T: PkNum>(x: T) -> D2<T> {
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
     DualT { v: DualT { v: x, g: [one] }, g: [DualT { v: one, g: [zero] }] }
 }

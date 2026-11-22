@@ -1149,11 +1149,9 @@ fn read_nonmem_csv_impl(
         population_warnings.push(match routing.missing_dv {
             MissingDvPolicy::Skip => format!(
                 "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
-                 but were not marked MDV=1; they were skipped (not scored as DV=0). Setting \
-                 MDV=1 on intentionally-missing observations silences this, but is not the same \
-                 as the skip: an MDV=1 row is kept as a record, so it starts the integration \
-                 clock and its covariates and occasion govern the interval ending at it, as in \
-                 NONMEM. Otherwise, check for data errors.",
+                 but were not marked MDV=1; they were skipped (not scored as DV=0) and read as \
+                 MDV=1 rows, which are kept as records. Setting MDV=1 on intentionally-missing \
+                 observations silences this. Otherwise, check for data errors.",
                 total_missing_dv
             ),
             MissingDvPolicy::KeepAsDesign => format!(
@@ -2128,6 +2126,21 @@ fn take_tte_pending(pending: &mut Vec<(usize, (f64, f64))>, cmt: usize) -> Optio
     Some(pending.remove(i).1)
 }
 
+/// What the `TENTRY > TIME` warning says about the TTE row it leaves unscored (rather than
+/// an invalid NLL). Such a row is a record of the PK model only after another record: the
+/// `has_record` test that decides its `push_pk_only!` decides this clause too (#2943 r2).
+/// A function, not an inline `if`, so the gated block holds no comment or brace-only line
+/// that the non-`survival` coverage build reads as missed (#293).
+#[cfg(feature = "survival")]
+fn tentry_record_clause(has_record: bool) -> &'static str {
+    if has_record {
+        "stays a record of the PK model, as in NONMEM"
+    } else {
+        "is not a record of the PK model either, since it comes before every other record of \
+         the subject"
+    }
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2594,6 +2607,26 @@ fn parse_subject(
             ));
         }
 
+        // Keep the row as a pk-only record (see the `EVID=2` arm below).
+        macro_rules! push_pk_only {
+            () => {{
+                pk_only_times.push(time);
+                note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
+                pk_only_raw_times.push(raw_time);
+                pk_only_rec.push(row_seq);
+                if any_tv {
+                    pk_only_covariates.push(locf_state.clone());
+                }
+                // The row's own `OCC` (#1876): NONMEM runs `$PK` here under it, and the
+                // snapshot governs the interval ending at this row. Gated like
+                // `reset_occasions`. The #1810 pass below only moves a time in place, so the
+                // labels stay parallel to `pk_only_times`.
+                if occ_col.is_some() {
+                    pk_only_occasions.push(occ);
+                }
+            }};
+        }
+
         if evid == 3 {
             // Pure system reset: no dose, no observation. Nothing else to do.
         } else if is_dose_evid(evid) {
@@ -2734,10 +2767,26 @@ fn parse_subject(
             if let Some(cell) = unreadable_cell(row, Some(dv_col), &DV_CELL) {
                 return Err(unreadable_cell_error(id, &row_at(raw_time), &DV_CELL, cell, "DV"));
             }
+            // NONMEM has no endpoint kinds: an endpoint row, or one skipped for its missing DV
+            // as MDV=1, is a record whose `$PK` runs and whose snapshot governs the interval
+            // ending at it, as an `EVID=2` row's does (#2368). An endpoint row ahead of every
+            // other record starts no clock: ferx integrates a subject with no other record
+            // from 0 (`subject_integration_start`), where a NONMEM dataset carries a TIME=0
+            // record for it. A TTE row is never skipped for its DV (see above).
+            let tte = routing.tte.contains(&cmt);
+            let has_record = !(dose_rec.is_empty()
+                && obs_rec.is_empty()
+                && pk_only_rec.is_empty()
+                && reset_rec.is_empty());
+            if (skip_missing_dv && !tte)
+                || ((tte || routing.integer_kind(cmt).is_some()) && has_record)
+            {
+                push_pk_only!();
+            }
 
             // Route a TTE / discrete-state / count CMT to `obs_records` (disjoint
             // sets, validated up front); only the TTE arm is `survival`-gated.
-            if routing.tte.contains(&cmt) {
+            if tte {
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
@@ -2760,9 +2809,9 @@ fn parse_subject(
                         parse_warnings.push(format!(
                             "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
                              — entry time after the event/censoring time yields a negative \
-                             effective cumulative hazard; row skipped"
+                             effective cumulative hazard; the row is not scored and {}",
+                            tentry_record_clause(has_record)
                         ));
-                        // Skip this malformed row rather than producing an invalid NLL.
                         continue;
                     }
                     let entry_time = raw_entry;
@@ -2955,7 +3004,7 @@ fn parse_subject(
 
             // Count the defaulted compartment **last** (#1009): reaching here means
             // the row became an observation (missing-DV and malformed TTE rows
-            // `continue`d above).
+            // `continue`d above, as unscored records).
             if let Some(cause) = &cmt_default_cause {
                 cmt_defaults.record_obs(cause);
             }
@@ -2984,17 +3033,7 @@ fn parse_subject(
                     });
                 }
             }
-            pk_only_times.push(time);
-            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
-            pk_only_raw_times.push(raw_time);
-            pk_only_rec.push(row_seq);
-            if any_tv {
-                pk_only_covariates.push(locf_state.clone());
-            }
-            // The row's own `OCC` (#1876), parallel to `pk_only_times`.
-            if occ_col.is_some() {
-                pk_only_occasions.push(occ);
-            }
+            push_pk_only!();
         }
     }
 

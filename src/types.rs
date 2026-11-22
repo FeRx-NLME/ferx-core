@@ -1408,6 +1408,24 @@ impl Subject {
         !self.reset_times.is_empty()
     }
 
+    /// Whether some reset can change the state: one that a dose, observation or other record
+    /// precedes (#2081). A reset on the subject's first record re-seeds the state the solve
+    /// starts from, so it is a no-op; the reader shifts a reset that is not first past every
+    /// record before it, so the shifted times decide, and a record that ties it in time but
+    /// comes first in the file still counts. A subject with endpoint records counts as having
+    /// one whenever it has a reset. A leading row skipped for its missing `DV`
+    /// (`W_MISSING_DV`) is read as an `MDV=1` record (#2368), so a reset after it is effective.
+    pub(crate) fn has_effective_resets(&self) -> bool {
+        if !self.has_resets() {
+            return false;
+        }
+        let first = (self.doses.iter().map(|d| d.time))
+            .chain(self.obs_times.iter().copied())
+            .chain(self.pk_only_times.iter().copied())
+            .fold(f64::INFINITY, f64::min);
+        !self.obs_records.is_empty() || self.reset_times.iter().any(|&t| t > first)
+    }
+
     /// True when this subject turns a compartment off (`EVID=2`, `CMT=-N`, #2732).
     pub fn has_cmt_toggles(&self) -> bool {
         !self.cmt_toggles.is_empty()
@@ -3606,6 +3624,42 @@ impl std::fmt::Debug for KappaWeight {
 pub(crate) struct EndpointMagnitude {
     pub(crate) per_sigma: Vec<Option<RuvMagFn>>,
     pub(crate) per_sigma_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
+    /// [`RuvMagnitude::per_sigma_pred`] of this endpoint.
+    pub(crate) per_sigma_pred: Vec<Option<PredMagnitude>>,
+}
+
+/// A residual magnitude that reads the prediction `IPRED` (#3121): the postfix program
+/// `ops` ([`FOp`](crate::stats::residual_error::FOp)) over `f`, whose `Push`es take the
+/// values of `leaves` in order — the expression's prediction-free subtrees, each an
+/// ordinary magnitude program over `(θ, covariates, TIME, TAD)`. A row carries the program
+/// with its leaf values in its tail (`RuvMagnitude::eval_obs`), so every variance consumer
+/// evaluates `h(f)` from the row it already receives.
+pub(crate) struct PredMagnitude {
+    pub(crate) ops: Vec<crate::stats::residual_error::FOp>,
+    pub(crate) leaves: Vec<RuvMagFn>,
+    pub(crate) leaf_derivs: Vec<crate::parser::model_parser::RuvMagDerivProgram>,
+}
+
+impl PredMagnitude {
+    /// Append this program to a row's tail: `len`, then `(code, arg)` per op, a `Push`
+    /// taking the next leaf value from `leaf`.
+    fn encode<T: crate::sens::num::vm::VmNum>(
+        &self, out: &mut Vec<T>, mut leaf: impl FnMut(usize) -> Option<T>,
+    ) -> Option<()> {
+        use crate::stats::residual_error::FOp;
+        out.push(T::from_f64(self.ops.len() as f64));
+        let mut next = 0;
+        for &op in &self.ops {
+            out.push(T::from_f64(op.code()));
+            out.push(if op == FOp::Push {
+                next += 1;
+                leaf(next - 1)?
+            } else {
+                T::from_f64(0.0)
+            });
+        }
+        Some(())
+    }
 }
 
 /// Custom residual-error magnitude (#484): one optional multiplier per flat
@@ -3679,12 +3733,20 @@ pub struct RuvMagnitude {
     /// rows read `per_sigma`, which such a block leaves all `None`. Empty for a
     /// single-endpoint block.
     pub(crate) per_endpoint: HashMap<usize, EndpointMagnitude>,
+    /// Parallel to `per_sigma`: the slot's magnitude when it reads `IPRED` (#3121), whose
+    /// `per_sigma` entry is then `None` (multiplier `1`). Empty when no slot reads it.
+    pub(crate) per_sigma_pred: Vec<Option<PredMagnitude>>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let slots: Vec<&str> =
-            self.per_sigma.iter().map(|s| if s.is_some() { "expr" } else { "bare" }).collect();
+        let slots: Vec<&str> = (0..self.per_sigma.len())
+            .map(|k| match (&self.per_sigma[k], self.per_sigma_pred.get(k)) {
+                (Some(_), _) => "expr",
+                (None, Some(Some(_))) => "ipred",
+                _ => "bare",
+            })
+            .collect();
         if self.has_exponent() {
             let exps: Vec<&str> = self
                 .per_sigma_exponent
@@ -3710,6 +3772,14 @@ impl RuvMagnitude {
         self.per_sigma.iter().any(|s| s.is_some())
             || self.has_exponent()
             || self.has_endpoint_magnitude()
+            || self.reads_prediction()
+    }
+
+    /// Whether some slot's magnitude reads the prediction `IPRED` (#3121), so the
+    /// variance depends on `f` through the magnitude and rows carry a program tail.
+    pub(crate) fn reads_prediction(&self) -> bool {
+        let any = |p: &[Option<PredMagnitude>]| p.iter().any(|s| s.is_some());
+        any(&self.per_sigma_pred) || self.per_endpoint.values().any(|e| any(&e.per_sigma_pred))
     }
 
     /// Whether the magnitude is keyed by endpoint, a `CMT=N:` or `if/else` block
@@ -3734,8 +3804,11 @@ impl RuvMagnitude {
 
     /// The per-sigma programs endpoint `key` reads: its own when the block has an
     /// entry for it, else the single-endpoint tables.
-    fn fns_for_key(&self, key: usize) -> &[Option<RuvMagFn>] {
-        self.per_endpoint.get(&key).map_or(&self.per_sigma, |ep| &ep.per_sigma)
+    fn fns_for_key(&self, key: usize) -> (&[Option<RuvMagFn>], &[Option<PredMagnitude>]) {
+        match self.per_endpoint.get(&key) {
+            Some(ep) => (&ep.per_sigma, &ep.per_sigma_pred),
+            None => (&self.per_sigma, &self.per_sigma_pred),
+        }
     }
 
     /// [`eval_obs`](Self::eval_obs) on the programs of endpoint `key` (keyed as
@@ -3746,7 +3819,8 @@ impl RuvMagnitude {
     pub(crate) fn eval_key(
         &self, key: usize, theta: &[f64], covariates: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Vec<f64> {
-        self.eval_row(self.fns_for_key(key), theta, covariates, time, tad)
+        let (fns, preds) = self.fns_for_key(key);
+        self.eval_row(fns, preds, theta, covariates, time, tad)
     }
 
     /// Whether any slot carries a `power(...)` exponent (#1182). When true,
@@ -3778,7 +3852,7 @@ impl RuvMagnitude {
     pub fn eval_obs(
         &self, theta: &[f64], obs_covariates: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Vec<f64> {
-        self.eval_row(&self.per_sigma, theta, obs_covariates, time, tad)
+        self.eval_row(&self.per_sigma, &self.per_sigma_pred, theta, obs_covariates, time, tad)
     }
 
     /// [`eval_obs`](Self::eval_obs) of observation `j` of `subject`, on the magnitude
@@ -3799,8 +3873,8 @@ impl RuvMagnitude {
     }
 
     fn eval_row(
-        &self, fns: &[Option<RuvMagFn>], theta: &[f64], obs_covariates: &HashMap<String, f64>,
-        time: f64, tad: f64,
+        &self, fns: &[Option<RuvMagFn>], preds: &[Option<PredMagnitude>], theta: &[f64],
+        obs_covariates: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Vec<f64> {
         let mut out: Vec<f64> = fns
             .iter()
@@ -3809,12 +3883,22 @@ impl RuvMagnitude {
                 None => 1.0,
             })
             .collect();
-        if self.has_exponent() {
-            let n = self.per_sigma.len();
+        let n = self.per_sigma.len();
+        if self.has_exponent() || self.reads_prediction() {
             out.extend((0..n).map(|k| match self.per_sigma_exponent.get(k) {
                 Some(Some(f)) => f(theta, obs_covariates, time, tad),
                 _ => 1.0,
             }));
+        }
+        if self.reads_prediction() {
+            for k in 0..n {
+                match preds.get(k) {
+                    Some(Some(p)) => p
+                        .encode(&mut out, |i| Some(p.leaves[i](theta, obs_covariates, time, tad)))
+                        .expect("an f64 leaf always evaluates"),
+                    _ => out.push(0.0),
+                }
+            }
         }
         out
     }
@@ -3841,12 +3925,22 @@ impl RuvMagnitude {
                 })
                 .collect()
         };
-        let mut out = match self.endpoint_for(spec, subject, j) {
-            Some(ep) => half(&ep.per_sigma, &ep.per_sigma_deriv)?,
-            None => half(&self.per_sigma, &self.per_sigma_deriv)?,
+        let (mut out, preds) = match self.endpoint_for(spec, subject, j) {
+            Some(ep) => (half(&ep.per_sigma, &ep.per_sigma_deriv)?, &ep.per_sigma_pred),
+            None => (half(&self.per_sigma, &self.per_sigma_deriv)?, &self.per_sigma_pred),
         };
-        if self.has_exponent() {
+        if self.has_exponent() || self.reads_prediction() {
             out.extend(half(&self.per_sigma_exponent, &self.per_sigma_exponent_deriv)?);
+        }
+        if self.reads_prediction() {
+            for k in 0..self.per_sigma.len() {
+                match preds.get(k) {
+                    Some(Some(p)) => p.encode(&mut out, |i| {
+                        p.leaf_derivs[i].eval_g(theta, obs_covariates, time, tad)
+                    })?,
+                    _ => out.push(T::from_f64(0.0)),
+                }
+            }
         }
         Some(out)
     }
@@ -6589,6 +6683,21 @@ impl CompiledModel {
         &self.indiv_param_partials.derived_reads
     }
 
+    /// Whether some residual magnitude reads the prediction `IPRED` (#3121).
+    #[inline]
+    pub(crate) fn ruv_reads_prediction(&self) -> bool {
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.reads_prediction())
+    }
+
+    /// Whether the residual variance depends on the prediction `f`: through the error
+    /// model's loadings ([`ErrorSpec::has_f_dependent_variance`]) or through a magnitude
+    /// that reads `IPRED` (#3121). Gates the FOCE population-variance (`R⁰` at `f(η = 0)`)
+    /// treatment, so an additive model whose magnitude reads `IPRED` takes it too.
+    #[inline]
+    pub(crate) fn has_f_dependent_variance(&self) -> bool {
+        self.error_spec.has_f_dependent_variance() || self.ruv_reads_prediction()
+    }
+
     /// Whether an *active* custom residual magnitude depends on `θ`
     /// (see [`RuvMagnitude::theta_dependent`]).
     ///
@@ -9002,7 +9111,8 @@ pub struct FitResult {
     /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
     /// the setting and what actually ran. An explicit choice is reported as what
     /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
-    /// mixture objective with BOBYQA, reported `"bobyqa"` (#1540). SAEM/GN/IMP
+    /// mixture objective with what [`Optimizer::Auto`] resolves to, reported as such
+    /// (e.g. `"nlopt_lbfgs"` on the exact gradient; #1540, #3025). SAEM/GN/IMP
     /// report their own fixed labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa").
     /// Always populated; the label is the same regardless of method chain length.
     /// Consumers that
@@ -10663,7 +10773,8 @@ impl CompiledModel {
 pub enum Optimizer {
     /// Pick the outer optimizer from the model (default): [`Optimizer::NloptLbfgs`] with an
     /// analytic gradient, [`Optimizer::Bobyqa`] on FD, `NloptLbfgs` above
-    /// [`BOBYQA_MAX_DIM`]; mixtures always take `Bobyqa` (outer dispatch). Benchmarks (#490).
+    /// [`BOBYQA_MAX_DIM`]. A `[mixture]` model follows the same rule on the exact mixture
+    /// gradient (#3025). Benchmarks (#490).
     /// See [`Optimizer::resolve_auto`].
     Auto,
     Bfgs,

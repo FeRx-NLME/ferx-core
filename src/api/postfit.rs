@@ -768,7 +768,7 @@ pub(crate) fn compute_subject_results(
                 ),
                 _ => None,
             };
-            let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
+            let r_preds: Option<&[f64]> = if !model.has_f_dependent_variance() {
                 None
             } else if interaction {
                 Some(ipred.as_slice())
