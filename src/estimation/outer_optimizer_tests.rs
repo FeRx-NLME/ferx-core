@@ -8363,6 +8363,79 @@ pub(crate) mod outer_fd_fallback {
         .expect("the fit scope runs");
     }
 
+    /// #2776 review r1 §1: a cancel that lands *inside* the covariance step's stationarity
+    /// gradient takes no reading. Standalone `run_covariance` returns its result under a
+    /// cancel (only `fit()` turns one into an `Err`), and the reconverged-FD reporting
+    /// gradient now comes back part-zero once the flag trips, so a reading taken on it would
+    /// be a made-up Newton decrement. Fixture A at its FOCEI estimate, the reporting gradient
+    /// forced onto the FD arm (`reconverge_gradient_interval = 1`). The run's total poll count
+    /// is measured first; the cuts land in its last `2·n_free` polls, which the gradient's
+    /// `≥ 2·n_free` probes cover, after the matrix (asserted: the SEs are still there).
+    #[test]
+    fn a_cancel_inside_the_stationarity_gradient_takes_no_reading() {
+        let beta_hat = 0.6797630658491339;
+        let delta = 1e-4;
+        let (m, p) = two_cpt_cov_beta(delta, beta_hat - delta);
+        let mut est = m.default_params.clone();
+        est.theta = vec![
+            5.2731892416136725,
+            44.80341226071577,
+            9.584412470148976,
+            92.16535593441313,
+            1.4074112031924877,
+            0.010000000000000005,
+            delta,
+        ];
+        est.omega = crate::types::OmegaMatrix::from_matrix(
+            DMatrix::from_diagonal(&DVector::from_vec(vec![
+                0.04468165236754428,
+                0.12184225657519575,
+                0.05501817239402348,
+                0.060478622240645215,
+                0.1913558297443002,
+            ])),
+            est.omega.eta_names.clone(),
+            true,
+        );
+        est.sigma.values = vec![0.0160462218419714];
+        let base = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            covariance_method: crate::types::CovarianceMethod::Hessian,
+            covariance_method_set: true,
+            reconverge_gradient_interval: 1,
+            ..FitOptions::default()
+        };
+        let fit = crate::fit(
+            &m,
+            &p,
+            &est,
+            &FitOptions { outer_maxiter: 0, run_covariance_step: false, ..base.clone() },
+        )
+        .expect("fixture: the evaluation fit runs");
+        let cov = |polls: usize| {
+            let flag = crate::cancel::CancelFlag::trip_after(polls);
+            let opts = FitOptions { cancel: Some(flag.clone()), ..base.clone() };
+            let r = crate::run_covariance(&fit, Some(&m), Some(&p), &opts)
+                .expect("run_covariance returns under a cancel");
+            (r, polls - flag.polls_left().expect("a countdown flag"))
+        };
+        let (live, used) = cov(1 << 40);
+        let decrement = live.newton_decrement.expect("fixture: the live step takes a reading");
+        let n_free = pack_params(&est).len();
+        eprintln!("MEASURE #2776 stationarity: {used} polls, decrement {decrement:e}");
+        for back in [3, 9] {
+            assert!(back < 2 * n_free, "fixture: cut {back} back lands in the gradient");
+            let (cut, _) = cov(used - back);
+            assert!(cut.se_theta.is_some(), "fixture: cut {back} back lands after the matrix");
+            assert_eq!(
+                cut.newton_decrement, None,
+                "cut {back} polls from the end: a reading taken on a part-cancelled gradient \
+                 (live decrement {decrement:e})"
+            );
+        }
+    }
+
     // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
 }
 

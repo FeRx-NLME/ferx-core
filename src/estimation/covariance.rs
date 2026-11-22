@@ -2941,35 +2941,43 @@ fn covariance_step(
     let minimum_test = tests_minimum_stationarity(fit_method, inv.n_clipped);
     let mut newton_decrement_read = None;
     let mut non_stationary_optimum = false;
-    if (tests_stationarity_by_gradient(fit_method, fallback_to_s) || minimum_test)
-        && !crate::cancel::is_cancelled(&options.cancel)
-    {
-        let (ehs, hms, kaps) = if is_mixture {
-            (eta_hats, h_matrices, kappas)
-        } else {
-            (&base_eta_hats[..], &base_h_matrices[..], &base_kappas[..])
-        };
-        if options.verbose {
-            // Before a possible `2·n_free` objective evaluations, as the post-fit reporting
-            // gradient announces its own (#2541 review r1 §6).
-            eprintln!(
+    let tests_stationarity = (tests_stationarity_by_gradient(fit_method, fallback_to_s)
+        || minimum_test)
+        && !crate::cancel::is_cancelled(&options.cancel);
+    // A cancel that lands *during* the gradient leaves its remaining probes missing, so their
+    // coordinates come back 0 (#2776): no reading is taken on that, as none is taken when the
+    // flag is already set above.
+    let stationarity_gradient = tests_stationarity
+        .then(|| {
+            let (ehs, hms, kaps) = if is_mixture {
+                (eta_hats, h_matrices, kappas)
+            } else {
+                (&base_eta_hats[..], &base_h_matrices[..], &base_kappas[..])
+            };
+            if options.verbose {
+                // Before a possible `2·n_free` objective evaluations, as the post-fit reporting
+                // gradient announces its own (#2541 review r1 §6).
+                eprintln!(
                 "  [covariance] gradient at the {} estimate, to test stationarity ({n_free} free \
                  coordinates; exact where the outer gradient is, else finite differences)",
                 fit_method.label()
             );
-        }
-        let g = crate::estimation::outer_optimizer::cov_objective_gradient(
-            x_hat,
-            template,
-            model,
-            population,
-            ehs,
-            hms,
-            kaps,
-            &bounds,
-            options,
-            nn_reg.as_ref(),
-        );
+            }
+            crate::estimation::outer_optimizer::cov_objective_gradient(
+                x_hat,
+                template,
+                model,
+                population,
+                ehs,
+                hms,
+                kaps,
+                &bounds,
+                options,
+                nn_reg.as_ref(),
+            )
+        })
+        .filter(|_| !crate::cancel::is_cancelled(&options.cancel));
+    if let Some(g) = stationarity_gradient {
         let g_free = DVector::from_iterator(n_free, free_idx.iter().map(|&i| g[i]));
         if minimum_test {
             let pick = |v: &[f64]| free_idx.iter().map(|&i| v[i]).collect::<Vec<_>>();
