@@ -8975,7 +8975,8 @@ pub struct FitResult {
     #[serde(default)]
     pub optimizer_stop: Option<String>,
     /// Whether the outer optimizer spent its evaluation budget (`maxiter`) on the leg that
-    /// produced the reported estimates (#2799) — the typed form of the "increase maxiter"
+    /// produced the reported estimates (#2799), or on the start probe that checked them and
+    /// was cut before its verdict (#2707, #2902) — the typed form of the "increase maxiter"
     /// warnings. Read from the optimizer's final state, after a stagnation latch that
     /// landed on the last permitted evaluation has been attributed to the guard rather than
     /// the budget, and after a polish that spent it (which [`Self::optimizer_stop`], taken

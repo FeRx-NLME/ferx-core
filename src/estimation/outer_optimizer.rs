@@ -100,7 +100,8 @@ pub struct OuterResult {
     /// [`crate::types::FitResult::optimizer_stop`]. `None` where no optimizer reports one.
     pub optimizer_stop: Option<String>,
     /// Whether the outer optimizer spent its evaluation budget on the leg that produced
-    /// these estimates (#2799), lifted onto [`crate::types::FitResult::eval_budget_spent`].
+    /// these estimates (#2799), or on a start probe of them the budget cut before its verdict
+    /// (`take_spent_budget`), lifted onto [`crate::types::FitResult::eval_budget_spent`].
     /// The final state, after the latch and polish adjustments; `false` off the NLopt path.
     pub eval_budget_spent: bool,
     /// Fallback proposal covariance for the SIR sampler, set when the FD

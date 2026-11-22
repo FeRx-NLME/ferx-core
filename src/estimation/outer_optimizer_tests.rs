@@ -14984,6 +14984,7 @@ fn a_first_attempt_whose_probe_spends_the_budget_reports_it_spent() {
     let advice: Vec<&String> =
         result.warnings.iter().filter(|w| w.contains("increase maxiter")).collect();
     assert!(result.eval_budget_spent && advice.len() == 1, "{:?}", result.warnings);
+    assert!(result.status().reasons().contains(&crate::types::StatusReason::BudgetSpent));
 }
 
 /// #2506, end to end through `fit()`: a refit at a converged fit's estimates comes
