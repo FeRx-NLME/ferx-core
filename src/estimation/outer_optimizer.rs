@@ -5677,20 +5677,6 @@ pub(crate) fn keep_verify_leg<G: Clone>(
     }
 }
 
-/// The per-class modes a mixture's next #2462 leg starts from (#2837 review round 1 #5). A
-/// mixture's warm start is `cached_etas_by_class`, which lives in the optimizer state and so
-/// is out of [`keep_verify_leg`]'s reach when a leg ends: it is settled here, when the next
-/// leg takes the state back. After a kept leg (or the fit before the first leg) `live` holds
-/// the incumbent's modes and is recorded; after a leg that was not kept it holds that leg's
-/// incumbent's, a point the fit dropped, and the kept ones go back in.
-pub(crate) fn carry_kept_class_modes<M: Clone>(kept: &mut M, last_leg_kept: bool, live: &mut M) {
-    if last_leg_kept {
-        kept.clone_from(live);
-    } else {
-        live.clone_from(kept);
-    }
-}
-
 /// Where a leg starts. Every leg starts at the incumbent's own modes (#2549) unless it opens
 /// one of the further passes a verified stop gets (#2645): a round of
 /// [`unprofiled_verify_legs`] from somewhere the warm legs cannot reach, which replaces the
@@ -5858,7 +5844,7 @@ thread_local! {
     pub(crate) static LEG_PASSES_APPLIED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// The per-class modes each #2462 leg of a mixture started from on this thread, for the
-    /// tests ([`carry_kept_class_modes`]).
+    /// tests (#2837 r1 #5).
     pub(crate) static MIXTURE_LEG_START_MODES: std::cell::RefCell<Vec<Vec<Vec<DVector<f64>>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Test switch: every #2462 leg after the first kept one is treated as not kept, so a
@@ -7328,10 +7314,6 @@ fn optimize_nlopt_attempt_probed(
         let cold_at_stop = std::cell::RefCell::new(None::<FinalInnerSolve>);
         // Set for the first leg of a pass ([`leg_pass_applies`]).
         let next_start = std::cell::Cell::new(LegStart::Incumbent);
-        // A mixture's per-class modes at the kept incumbent, and whether the leg before this
-        // one was kept ([`carry_kept_class_modes`]). Empty for a single population.
-        let mut kept_class_modes: Vec<Vec<DVector<f64>>> = Vec::new();
-        let mut last_leg_kept = true;
         let mut run_leg = |left: u32| {
             if plateau_tracker.lock().unwrap().2 == 0 {
                 return None;
@@ -7442,11 +7424,16 @@ fn optimize_nlopt_attempt_probed(
             // re-solve of them and a subject the cold solve left unconverged is not what
             // the guard judges (#2645).
             state.restart_from_modes(held);
-            carry_kept_class_modes(
-                &mut kept_class_modes,
-                last_leg_kept,
-                &mut state.cached_etas_by_class,
-            );
+            // A mixture's classes start at the incumbent's own modes too, which
+            // [`keep_verify_leg`] put back if the last leg was dropped (#2837 r1 #5); cold when
+            // the held state is another point's.
+            state.cached_etas_by_class = best_solve_cl
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|inc| inc.xs == best_x)
+                .map(|inc| inc.class_etas.clone())
+                .unwrap_or_default();
             #[cfg(test)]
             if init_params.mixture.is_some() {
                 MIXTURE_LEG_START_MODES
@@ -7480,9 +7467,7 @@ fn optimize_nlopt_attempt_probed(
             });
             #[cfg(not(test))]
             let judged = best;
-            last_leg_kept =
-                keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, judged, &mut live);
-            if last_leg_kept {
+            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, judged, &mut live) {
                 *best_seen.lock().unwrap() = leg_best.borrow().clone();
             }
             kept_best_seen.set(kept_leg_best);

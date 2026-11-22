@@ -16800,6 +16800,7 @@ const MIXTURE_IV_MODEL: &str = r"
   DV ~ proportional(EPS)
 ";
 
+#[cfg(feature = "slow-tests")]
 const MIXTURE_IV_IOV_MODEL: &str = r"
 [parameters]
   theta TVCL1(1.0, 0.01, 100.0)
@@ -16841,8 +16842,11 @@ fn mixture_fit(
     with_verify_leg(on, || optimize_population(&model, &pop, &model.default_params, &opts))
 }
 
-const MIXTURE_FIXTURES: [(&str, &str, Option<&str>); 2] = [
+/// The fixtures a fit-level #2745 test runs: `mixture_iv` per PR, both under `slow-tests`, as
+/// each is a converged fit.
+const MIXTURE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
     (MIXTURE_IV_MODEL, "tests/nonmem/mixture_iv.csv", None),
+    #[cfg(feature = "slow-tests")]
     (MIXTURE_IV_IOV_MODEL, "tests/nonmem/mixture_iv_iov.csv", Some("OCC")),
 ];
 
@@ -16860,7 +16864,7 @@ const MIXTURE_FIXTURES: [(&str, &str, Option<&str>); 2] = [
 /// reaches the same modes here.
 #[test]
 fn a_mixture_stop_gets_one_verification_leg() {
-    for (model, csv, occ) in MIXTURE_FIXTURES {
+    for &(model, csv, occ) in MIXTURE_FIXTURES {
         LEG_PASSES_APPLIED.with(|c| c.set(0));
         let (on, legs) = mixture_fit(model, csv, occ, true);
         let passes = LEG_PASSES_APPLIED.with(|c| c.get());
@@ -16904,7 +16908,7 @@ fn a_mixture_leg_solves_its_classes_at_the_leg_tolerance() {
         fit_tol > UNPROFILED_VERIFY_INNER_TOL,
         "the two tolerances must differ for this test to tell them apart"
     );
-    for (model, csv, occ) in MIXTURE_FIXTURES {
+    for &(model, csv, occ) in MIXTURE_FIXTURES {
         let tols_of = |on: bool| {
             MIXTURE_OFV_INNER_TOLS.with(|t| t.borrow_mut().clear());
             let (_, legs) = mixture_fit(model, csv, occ, on);
@@ -16977,21 +16981,6 @@ fn a_mixture_stop_its_leg_does_not_settle_is_not_converged() {
     assert!(!stuck.converged, "an unsettled leg must not report converged");
 }
 
-/// #2837 review round 1 #5: [`carry_kept_class_modes`] records after a kept leg and restores
-/// after one that was not.
-#[test]
-fn a_leg_that_was_not_kept_hands_back_the_kept_class_modes() {
-    let (mut kept, mut live) = (0, 7);
-    carry_kept_class_modes(&mut kept, true, &mut live);
-    assert_eq!((kept, live), (7, 7), "a kept leg's modes are recorded");
-    live = 9;
-    carry_kept_class_modes(&mut kept, false, &mut live);
-    assert_eq!((kept, live), (7, 7), "a dropped leg's modes are replaced");
-    live = 11;
-    carry_kept_class_modes(&mut kept, true, &mut live);
-    assert_eq!((kept, live), (11, 11));
-}
-
 /// #2837 review round 1 #5, at fit level: a mixture leg that follows one the fit did not keep
 /// starts from the kept incumbent's per-class modes, not the dropped leg's. The legs are
 /// forced to the cap and every leg after the first is dropped
@@ -17001,7 +16990,7 @@ fn a_leg_that_was_not_kept_hands_back_the_kept_class_modes() {
 /// leg must too.
 #[test]
 fn a_mixture_leg_after_a_dropped_one_starts_from_the_kept_class_modes() {
-    for (model, csv, occ) in MIXTURE_FIXTURES {
+    for &(model, csv, occ) in MIXTURE_FIXTURES {
         MIXTURE_LEG_START_MODES.with(|m| m.borrow_mut().clear());
         UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
         UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.set(true));
