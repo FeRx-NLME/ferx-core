@@ -4539,7 +4539,8 @@ thread_local! {
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
     /// A #1565 basin gap an attempt on this thread reports when its cold re-solve shows none,
-    /// a combination with an unmoved restart no fixture produces (#2903).
+    /// a combination with an unmoved restart no fixture produces (#2903). Only where a cold
+    /// re-solve and a best-seen objective exist, as a real gap needs.
     pub(crate) static FORCED_BASIN_GAP: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
 }
@@ -8108,7 +8109,8 @@ fn optimize_nlopt_attempt_probed(
     // (#2707) is not run on a leg that will be restarted on a basin shift anyway.
     let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
     #[cfg(test)]
-    let basin_gap = basin_gap.or(FORCED_BASIN_GAP.with(|g| g.get()));
+    let basin_gap =
+        basin_gap.or(cold_ofv.and(best_seen_ofv).and(FORCED_BASIN_GAP.with(|g| g.get())));
     let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
     // The acceptance rule of a stop whose `converged` is decided here (a bare `Failure` /
     // `ForcedStop`, a latched stop, or a verified one — `stationarity_check_pending`), as a
