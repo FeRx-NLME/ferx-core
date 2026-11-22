@@ -1281,7 +1281,7 @@ fn subject_nll_pop_grad_analytical(
     // matching `foce_subject_nll_standard`. f0 = f(η̂) − H·η̂ can cross zero on
     // a nonlinear model and make R̃ ill-conditioned; f(η=0) is always sensible.
     // Additive error is f-independent → keep f0 (bit-identical, no extra eval).
-    let use_pop_var = model.error_spec.has_f_dependent_variance();
+    let use_pop_var = model.has_f_dependent_variance();
     let zeros_eta = vec![0.0_f64; n_eta];
     let pop_preds: Vec<f64> = if use_pop_var {
         pk::compute_predictions_with_tv(model, subject, &params.theta, &zeros_eta)
@@ -2009,6 +2009,8 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && kappas.is_empty()
         && model.residual_error_eta.is_none()
         && !model.has_theta_dependent_ruv_magnitude()
+        // A magnitude reading `IPRED` (#3121) is not a per-row constant in `f`.
+        && !model.ruv_reads_prediction()
         && !model.residual_cov_at(template).is_dense()
         && !model.has_non_gaussian()
         && model.frem_config.is_none()
@@ -5075,6 +5077,21 @@ mod tests {
             "  theta RUV_W(0.30, 0.01, 5.0)\n",
         );
         assert!(model.has_theta_dependent_ruv_magnitude());
+        check_gn_grad_matches_fd(&model, true);
+        check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// A θ-*free* magnitude that reads `IPRED` (#3121) on the additive slot: the θ gate
+    /// does not fire, so only `ruv_reads_prediction` in `closed_form_fixed_ebe_grad_ok`
+    /// routes it to the FD fallback. The closed forms decide `∂d/∂log σ` by whether the
+    /// slot's *loading* reads `f` (`slot_reads_f`), which an additive slot does not, so on
+    /// them the additive σ's gradient drops its `h(f)` slope. Mutation, run by hand:
+    /// dropping that gate fails the Laplace leg at `grad[3]` (σ_add), rel 3.9e-2. A weakly
+    /// f-dependent `sqrt(1 + IPRED)` passed under the same mutation, hence the `exp`.
+    #[test]
+    fn ipred_magnitude_gn_grad_matches_fd_via_fallback() {
+        let model = weighted_gn_model("DV ~ combined(PROP_ERR, ADD_ERR * exp(0.3 * IPRED))", "");
+        assert!(model.ruv_reads_prediction() && !model.has_theta_dependent_ruv_magnitude());
         check_gn_grad_matches_fd(&model, true);
         check_gn_grad_matches_fd(&model, false);
     }

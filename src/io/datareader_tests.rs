@@ -1137,6 +1137,43 @@ fn an_implied_dose_after_the_last_record_keeps_its_parents_snapshot() {
     assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0), (24.0, 1.0), (36.0, 1.0)]);
 }
 
+#[test]
+fn an_endpoint_row_is_a_record_that_can_govern_an_implied_dose() {
+    // #2368: NONMEM has no endpoint kinds, so a TTE, count or discrete-state row is a record
+    // like any other. The endpoint row at 2 (X=2) governs the interval ending at it, so it
+    // is a pk-only record with its own snapshot, and the first record after the implied
+    // dose at 1. Before, the dose took the Gaussian observation's X=3.
+    for routing in [
+        ObsRouting { count: [3].into_iter().collect(), ..Default::default() },
+        ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() },
+        #[cfg(feature = "survival")]
+        ObsRouting { tte: [3].into_iter().collect(), ..Default::default() },
+    ] {
+        let f = write_csv(
+            "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,CMT,X\n1,0,.,1,1,100,1,1,1,1\n\
+             1,2,1,0,0,.,.,.,3,2\n1,4,5,0,0,.,.,.,1,3\n",
+        );
+        let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap().subjects.remove(0);
+        assert_eq!(s.obs_records.len(), 1, "{routing:?}");
+        assert_eq!(s.pk_only_times, vec![2.0], "{routing:?}");
+        assert_eq!(s.pk_only_cov(0)["X"], 2.0, "{routing:?}");
+        assert_eq!(dose_x(&s), vec![(0.0, 1.0), (1.0, 2.0)], "{routing:?}");
+        // Ahead of every other record it starts no clock, so it is not a pk-only record.
+        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,1,0,0,.,3\n1,4,5,0,0,.,1\n");
+        let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(s.subjects[0].pk_only_times.is_empty(), "{routing:?}");
+    }
+    // A TTE row is never skipped for its DV, so a leading one with DV `.` is no record either:
+    // its clock would start at the event, where `H = 0` (#2943 review r1).
+    #[cfg(feature = "survival")]
+    {
+        let routing = ObsRouting { tte: [3].into_iter().collect(), ..Default::default() };
+        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,.,0,0,.,3\n1,4,5,0,0,.,1\n");
+        let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(s.subjects[0].pk_only_times.is_empty());
+    }
+}
+
 /// `(parent, TIME $PK reads)` of each dose; `None` for a dose record. Every parent the
 /// reader writes passes `implied_dose_parent`'s check.
 fn implied(s: &crate::types::Subject) -> Vec<Option<(usize, f64)>> {
@@ -1944,23 +1981,6 @@ fn test_evid0_mdv1_row_is_a_record_on_both_paths() {
 }
 
 #[test]
-fn test_missing_dv_observation_is_still_dropped() {
-    // #1809 keeps EVID=2 and EVID=0/MDV=1 rows as records. An EVID=0/MDV=0 row whose DV
-    // cell is missing is a different row: `W_MISSING_DV` skips it under
-    // `MissingDvPolicy::Skip` (#258). Whether NONMEM treats it as a record that starts the
-    // clock has not been measured, so #1809 leaves it out on purpose. This pins that
-    // scope: such a row reaches neither `obs_times` nor `pk_only_times`.
-    let csv = "ID,TIME,DV,EVID,MDV,AMT\n\
-                   1,0,.,0,0,.\n\
-                   1,2,4.0,0,0,.\n";
-    let f = write_csv(csv);
-    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let s = &pop.subjects[0];
-    assert_eq!(s.obs_times, vec![2.0]);
-    assert!(s.pk_only_times.is_empty());
-}
-
-#[test]
 fn test_reset_rows_captured_with_their_own_covariates() {
     // #1133: an EVID=3/4 row is a data record — `$PK` runs at it — so its own covariate
     // values must be captured, not just the reset time. Two resets, each carrying a `CR`
@@ -2132,66 +2152,43 @@ fn test_missing_dv_obs_skipped_and_warned() {
 }
 
 #[test]
-fn test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record() {
-    // PR #1875 review, row 4: since #1809 the advice's MDV=1 row is not the skipped row.
-    // One dataset, two spellings of the leading t = 0 row, so both sides of the claim are
-    // asserted here: skipped, it starts nothing; as MDV=1, it is a record that starts the
-    // clock and carries its own covariate and occasion. Each clause of the message is
-    // asserted next to the fact it states, so deleting either a clause or the behaviour
-    // behind it reddens this test.
-    let csv = |mdv: u32| {
-        format!(
+fn test_missing_dv_row_is_read_as_mdv1() {
+    // #2368: the row `W_MISSING_DV` skips is read as MDV=1, and since #1809 an MDV=1 row is a
+    // record that starts the clock and carries its own covariate and occasion. NONMEM, which
+    // reads the cell as 0, keeps it as a record too. So both spellings of the leading t = 0
+    // row give the same records, and only the warning tells them apart.
+    let read = |mdv: u32| {
+        let f = write_csv(&format!(
             "ID,TIME,DV,EVID,MDV,AMT,CMT,WT,OCC\n\
              1,0,.,0,{mdv},.,1,70,1\n\
              1,1,.,1,1,100,1,80,2\n\
              1,2,5.0,0,0,.,1,80,2\n"
-        )
-    };
-    let read = |mdv| {
-        let f = write_csv(&csv(mdv));
+        ));
         read_nonmem_csv(f.path(), Some(&["WT"][..]), Some("OCC")).unwrap()
     };
-    let skipped = read(0);
-    let s = &skipped.subjects[0];
-    assert!(s.pk_only_times.is_empty() && s.obs_times == vec![2.0]);
+    let (skipped, kept) = (read(0), read(1));
+    for s in [&skipped.subjects[0], &kept.subjects[0]] {
+        assert_eq!((&s.pk_only_times, &s.obs_times), (&vec![0.0], &vec![2.0]));
+        assert_eq!(s.pk_only_cov(0)["WT"], 70.0);
+        assert_eq!(s.pk_only_occasions, vec![1]);
+    }
     let warn = skipped
         .warnings
         .iter()
         .find(|w| w.starts_with("W_MISSING_DV"))
         .expect("the skipped row warns");
-    assert!(warn.contains("they were skipped (not scored as DV=0)"), "{warn}");
-    assert!(warn.contains("Otherwise, check for data errors."), "{warn}");
-
-    let kept = read(1);
+    // Every clause, so a reworded half of the message fails (#2943 review r1 row 3).
+    for clause in [
+        "they were skipped (not scored as DV=0) and read as MDV=1 rows, which are kept as records.",
+        "Setting MDV=1 on intentionally-missing observations silences this.",
+        "Otherwise, check for data errors.",
+    ] {
+        assert!(warn.contains(clause), "{clause}: {warn}");
+    }
     assert!(
         !kept.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
         "the message says MDV=1 silences it"
     );
-    assert!(
-        warn.contains("Setting MDV=1 on intentionally-missing observations silences this"),
-        "{warn}"
-    );
-    let s = &kept.subjects[0];
-    assert!(
-        warn.contains("is not the same as the skip: an MDV=1 row is kept as a record"),
-        "{warn}"
-    );
-    assert_eq!(s.pk_only_times, vec![0.0]);
-    assert!(warn.contains("so it starts the integration clock"), "{warn}");
-    let first_record = s
-        .pk_only_times
-        .iter()
-        .chain(&s.obs_times)
-        .chain(s.doses.iter().map(|d| &d.time))
-        .copied()
-        .fold(f64::INFINITY, f64::min);
-    assert_eq!(first_record, 0.0, "the kept row is the subject's first record");
-    assert!(
-        warn.contains("its covariates and occasion govern the interval ending at it, as in NONMEM"),
-        "{warn}"
-    );
-    assert_eq!(s.pk_only_cov(0)["WT"], 70.0);
-    assert_eq!(s.pk_only_occasions, vec![1]);
 }
 
 #[test]
@@ -3542,12 +3539,50 @@ fn a_tte_row_dropped_for_entry_after_event_is_not_counted_as_an_observation() {
     );
 
     // TENTRY=50 > TIME=20: the reader warns about the row and `continue`s before it
-    // becomes an `obs_records` entry, so it is not a compartment the fit ever used.
+    // becomes an `obs_records` entry, so it is not a compartment the fit ever used
+    // (whether it is a record of the PK model is the next test's question).
     let one_dropped = read("50");
     assert!(
         one_dropped.contains("0 dose row(s) and 1 observation row(s)"),
-        "a TENTRY > TIME row is dropped, so it is not counted: {one_dropped}"
+        "a TENTRY > TIME row is not scored, so it is not counted: {one_dropped}"
     );
+}
+
+/// #2943 review r2: the `TENTRY > TIME` warning says whether the unscored row is a record of
+/// the PK model, and that turns on `has_record`, as the push does. Both sides in one test, so
+/// a message stuck on either branch, or a push that stops following `has_record`, fails here.
+#[cfg(feature = "survival")]
+#[test]
+fn a_tte_row_with_entry_after_event_is_a_record_only_after_another_record() {
+    let routing = ObsRouting { tte: [3].into_iter().collect(), ..Default::default() };
+    let read = |csv: &str| {
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let warn = pop
+            .warnings
+            .iter()
+            .find(|w| w.contains("TENTRY=50 > TIME=20"))
+            .unwrap_or_else(|| panic!("no TENTRY warning in {:?}", pop.warnings))
+            .clone();
+        (pop.subjects[0].pk_only_times.clone(), warn)
+    };
+    let (stays, not_a) = (
+        "stays a record of the PK model, as in NONMEM",
+        "is not a record of the PK model either, since it comes before every other record of \
+         the subject",
+    );
+
+    // After a dose: a record, and the warning says so.
+    let (times, warn) =
+        read("ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,0,.,1,1,100,1,0\n1,20,1,0,0,.,3,50\n");
+    assert_eq!(times, vec![20.0], "after a dose the row is a record");
+    assert!(warn.contains(stays) && !warn.contains(not_a), "after a dose: {warn}");
+
+    // Ahead of every other record: no record, and the warning does not claim one.
+    let (times, warn) =
+        read("ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,20,1,0,0,.,3,50\n1,30,0,0,0,.,3,0\n");
+    assert!(times.is_empty(), "a leading row is no record: {times:?}");
+    assert!(warn.contains(not_a) && !warn.contains(stays), "leading: {warn}");
 }
 
 /// The other half of the same move, on the Gaussian arm: a missing-DV row skipped

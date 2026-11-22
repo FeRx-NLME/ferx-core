@@ -10,7 +10,7 @@
 //! BOBYQA alike (they agree to 3.5e-7). Swapping the start labels makes the **base** ω the
 //! one that collapses: the same defect on a plain Ω diagonal.
 //!
-//! Every fit here pins `optimizer = bobyqa`: `auto` may become L-BFGS for mixtures (#2749),
+//! Every fit here pins `optimizer = bobyqa`: `auto` is L-BFGS for mixtures since #3025,
 //! which reaches the guard on its own. BOBYQA has no gradient, so every fixture runs on
 //! finite differences only; no analytic sensitivity is exercised.
 //!

@@ -49,10 +49,140 @@ pub(crate) fn guard_variance(raw: f64) -> f64 {
 /// multipliers only. `n_sigma` is the flat global sigma count (`sigma.len()`).
 #[inline]
 pub(crate) fn slot_exponent(mult: &[f64], n_sigma: usize, slot: usize) -> Option<f64> {
-    if n_sigma == 0 || mult.len() != 2 * n_sigma {
+    if n_sigma == 0 || mult.len() < 2 * n_sigma {
         return None;
     }
     mult.get(n_sigma + slot).copied()
+}
+
+/// One instruction of a magnitude that reads the prediction (#3121): a postfix program
+/// over `f` whose operands are the expression's prediction-free subtrees, each evaluated
+/// per observation by the ordinary magnitude machinery and stored as the `Push` argument.
+///
+/// A row carrying such a slot is `[multipliers | exponents | tail]`, the tail holding, for
+/// every sigma slot in order, `len` then `len` pairs `(code, arg)` (`len = 0` for a slot
+/// that does not read `f`). The program rides the row, so every consumer that already
+/// receives the row reads it — no new argument anywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FOp {
+    /// Push the pair's argument (a precomputed prediction-free value).
+    Push,
+    /// Push `f`, the prediction the residual is scored against.
+    F,
+    /// Push `exp(f)`: the natural-scale prediction under LTBS, where `f` is its log.
+    ExpF,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Exp,
+    /// `ln(max(x, 1e-30))`, as the model language's `log`.
+    Ln,
+    /// `sqrt(max(x, 0))`, as the model language's `sqrt`.
+    Sqrt,
+    Abs,
+    InvLogit,
+}
+
+impl FOp {
+    const ALL: [FOp; 13] = [
+        FOp::Push,
+        FOp::F,
+        FOp::ExpF,
+        FOp::Add,
+        FOp::Sub,
+        FOp::Mul,
+        FOp::Div,
+        FOp::Pow,
+        FOp::Exp,
+        FOp::Ln,
+        FOp::Sqrt,
+        FOp::Abs,
+        FOp::InvLogit,
+    ];
+
+    /// The code a row stores this op as.
+    pub(crate) fn code(self) -> f64 {
+        Self::ALL.iter().position(|&o| o == self).expect("FOp::ALL lists every op") as f64
+    }
+
+    /// The net stack effect: `+1` for a push, `−1` for a binary op, `0` for a unary one.
+    pub(crate) fn stack_effect(self) -> i32 {
+        match self {
+            FOp::Push | FOp::F | FOp::ExpF => 1,
+            FOp::Add | FOp::Sub | FOp::Mul | FOp::Div | FOp::Pow => -1,
+            FOp::Exp | FOp::Ln | FOp::Sqrt | FOp::Abs | FOp::InvLogit => 0,
+        }
+    }
+}
+
+/// The deepest stack a prediction-reading magnitude may need (checked at parse time).
+pub(crate) const FMAG_MAX_STACK: usize = 16;
+
+/// The postfix program of sigma slot `slot` in a row's tail ([`FOp`]), as `(code, arg)`
+/// pairs, or `None` when the slot does not read the prediction. Generic so the dual
+/// kernel reads the same layout; the length and op codes are constants of every type.
+pub(crate) fn slot_fmag<T: crate::sens::num::PkNum>(
+    row: &[T], n_sigma: usize, slot: usize,
+) -> Option<&[T]> {
+    let mut i = 2 * n_sigma;
+    if n_sigma == 0 || row.len() <= i {
+        return None;
+    }
+    for k in 0..n_sigma {
+        let len = 2 * row.get(i)?.nonrec_val()? as usize;
+        if k == slot {
+            return (len > 0).then(|| &row[i + 1..i + 1 + len]);
+        }
+        i += 1 + len;
+    }
+    None
+}
+
+/// Evaluate a [`slot_fmag`] program at `f`, each `Push` argument lifted into `T` by `lift`.
+pub(crate) fn eval_fmag<A: crate::sens::num::PkNum, T: crate::sens::num::PkNum>(
+    prog: &[A], lift: impl Fn(A) -> T, f: T,
+) -> T {
+    let mut st = [T::from_f64(0.0); FMAG_MAX_STACK];
+    let mut sp = 0;
+    for ins in prog.chunks_exact(2) {
+        let code = ins[0].nonrec_val().expect("an op code is a constant") as usize;
+        let op = FOp::ALL[code];
+        match op {
+            FOp::Push | FOp::F | FOp::ExpF => {
+                st[sp] = match op {
+                    FOp::Push => lift(ins[1]),
+                    FOp::F => f,
+                    _ => f.exp(),
+                };
+                sp += 1;
+            }
+            FOp::Add | FOp::Sub | FOp::Mul | FOp::Div | FOp::Pow => {
+                sp -= 1;
+                let (a, b) = (st[sp - 1], st[sp]);
+                st[sp - 1] = match op {
+                    FOp::Add => a + b,
+                    FOp::Sub => a - b,
+                    FOp::Mul => a * b,
+                    FOp::Div => a / b,
+                    _ => a.pow(b),
+                };
+            }
+            FOp::Exp => st[sp - 1] = st[sp - 1].exp(),
+            FOp::Ln => st[sp - 1] = st[sp - 1].guard_floor(1e-30).ln(),
+            FOp::Sqrt => st[sp - 1] = st[sp - 1].guard_floor(0.0).sqrt(),
+            FOp::Abs => st[sp - 1] = st[sp - 1].abs(),
+            FOp::InvLogit => st[sp - 1] = st[sp - 1].inv_logit(),
+        }
+    }
+    st[0]
+}
+
+/// Whether a magnitude row carries a prediction-reading slot ([`FOp`]).
+#[inline]
+pub(crate) fn row_reads_f(mult: &[f64], n_sigma: usize) -> bool {
+    n_sigma > 0 && mult.len() > 2 * n_sigma
 }
 
 /// The proportional loading raised to a `power(...)` exponent (#1182):
@@ -418,7 +548,10 @@ impl ErrorSpec {
             let m = mult.get(idx).copied().unwrap_or(1.0);
             // Only a proportional loading is raised to a power; a constant
             // slot's loading ignores its exponent entry.
-            match (form == LoadingForm::Prop).then(|| slot_exponent(mult, n_sigma, idx)).flatten() {
+            let l = match (form == LoadingForm::Prop)
+                .then(|| slot_exponent(mult, n_sigma, idx))
+                .flatten()
+            {
                 Some(p) if p != 1.0 => {
                     let (g, g1, g2) = power_loading(f, p);
                     ScaledLoading { idx, c: m * g, c1: m * g1, c2: m * g2 }
@@ -433,11 +566,37 @@ impl ErrorSpec {
                         c2: if curv == 0.0 { 0.0 } else { curv * m },
                     }
                 }
+            };
+            // A prediction-reading magnitude `h(f)` (#3121) multiplies the loading:
+            // `(h·c)' = h'c + hc'`, `(h·c)'' = h''c + 2h'c' + hc''`.
+            match slot_fmag(mult, n_sigma, idx) {
+                None => l,
+                Some(prog) => {
+                    use crate::sens::focei_kernel::{d2_const, d2_seed};
+                    let h = eval_fmag(prog, d2_const, d2_seed(f));
+                    let (h0, h1, h2) = (h.v.v, h.v.g[0], h.g[0].g[0]);
+                    ScaledLoading {
+                        idx,
+                        c: h0 * l.c,
+                        c1: h1 * l.c + h0 * l.c1,
+                        c2: h2 * l.c + 2.0 * h1 * l.c1 + h0 * l.c2,
+                    }
+                }
             }
         }) {
             out.push(l);
         }
         out
+    }
+
+    /// Whether a loading of this row is not affine in `f`, so the closed `m²`-scaled
+    /// slopes do not apply and `∂v/∂f`, `∂²v/∂f²` sum over [`Self::scaled_loadings`]:
+    /// `LogCombined`'s `exp(−f)` slot (#2729), a `power(...)` exponent other than `1`
+    /// (#1182), or a magnitude that reads the prediction (#3121).
+    fn needs_loadings_path(&self, cmt: usize, n_sigma: usize, mult: &[f64]) -> bool {
+        self.has_inv_exp_slot(cmt, n_sigma)
+            || row_reads_f(mult, n_sigma)
+            || self.prop_slot_exponent(cmt, n_sigma, mult).is_some_and(|p| p != 1.0)
     }
 
     /// The `power(...)` exponent of this observation's proportional slot, when
@@ -640,9 +799,7 @@ impl ErrorSpec {
         // out, exactly as it does from `dvar_df_raw`. `LogCombined`'s `exp(−f)`
         // slot (#2729) takes the same sum: its multiplier is the additive slot's,
         // not the `m_prop` the closed form below scales by.
-        if self.has_inv_exp_slot(cmt, sigma.len())
-            || self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
-        {
+        if self.needs_loadings_path(cmt, sigma.len(), mult) {
             return self.dvar_df_loadings(cmt, f, sigma, mult);
         }
         self.dvar_df_raw(cmt, f, sigma) * m * m
@@ -723,9 +880,7 @@ impl ErrorSpec {
         // A `power(...)` slot (#1182): `∂²(c²σ²)/∂f² = 2·(c'² + c·c'')·σ²`; the
         // curvature `c''` is what the affine loadings never had. So is
         // `LogCombined`'s `exp(−f)` slot (#2729).
-        if self.has_inv_exp_slot(cmt, sigma.len())
-            || self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
-        {
+        if self.needs_loadings_path(cmt, sigma.len(), mult) {
             return self.d2var_df2_loadings(cmt, f, sigma, mult);
         }
         self.d2var_df2_raw(cmt, sigma) * m * m
@@ -794,8 +949,10 @@ impl ErrorSpec {
         // A `power(...)` slot (#1182): its contribution is `(c·σ_k)²` with
         // `c = m·|f|^p`, so `∂/∂log σ_k = 2·c²·σ_k²` — the unscaled `2·σ_k²·f²`
         // has the wrong power of `f`.
-        if self.prop_sigma_slot(cmt) == Some(k)
-            && self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
+        // A prediction-reading magnitude (#3121) likewise: `c = h(f)·…`.
+        if row_reads_f(mult, sigma.len())
+            || self.prop_sigma_slot(cmt) == Some(k)
+                && self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
         {
             let sk = sigma.get(k).copied().unwrap_or(0.0);
             return self
@@ -3179,6 +3336,69 @@ mod tests {
         // A row of the wrong length carries no exponent half.
         assert_eq!(slot_exponent(&[1.0, 1.0, 1.3], 2, 0), None);
         assert_eq!(slot_exponent(&[1.3], 0, 0), None);
+    }
+
+    /// A row tail program ([`FOp`]): `len`, then `(code, arg)` pairs.
+    fn fmag_tail(ops: &[(FOp, f64)]) -> Vec<f64> {
+        std::iter::once(ops.len() as f64)
+            .chain(ops.iter().flat_map(|&(o, a)| [o.code(), a]))
+            .collect()
+    }
+
+    /// #3121: a `combined` row whose proportional slot carries a `power` exponent *and*
+    /// `h₀ = sqrt(1 + 0.4f)`, and whose additive slot carries `h₁ = 1.3·exp(−0.4f)`. The
+    /// value is the closed form, and `∂v/∂f`, `∂²v/∂f²` (the product rule in
+    /// `scaled_loadings`) match central differences of the value — the slopes every
+    /// production analytic path reads. Each slot's program is found past the other's.
+    #[test]
+    fn prediction_reading_magnitude_value_and_slopes() {
+        use FOp::*;
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.1, 0.05];
+        let mut row = vec![1.0, 1.0, 1.3, 1.0];
+        row.extend(fmag_tail(&[
+            (Push, 1.0),
+            (Push, 0.4),
+            (F, 0.0),
+            (Mul, 0.0),
+            (Add, 0.0),
+            (Sqrt, 0.0),
+        ]));
+        row.extend(fmag_tail(&[
+            (Push, 1.3),
+            (Push, -0.4),
+            (F, 0.0),
+            (Mul, 0.0),
+            (Exp, 0.0),
+            (Mul, 0.0),
+        ]));
+        assert!(row_reads_f(&row, 2) && !row_reads_f(&row[..4], 2));
+        assert_eq!(slot_fmag(&row, 2, 1).map(|p| p.len()), Some(12));
+        let v = |f: f64| spec.variance_at_scaled(1, f, &sigma, &[], &row);
+        let dv = |f: f64| spec.dvar_df_scaled(1, f, &sigma, &row);
+        for f in [0.5f64, 2.0, 7.0] {
+            let (h0, h1) = ((1.0 + 0.4 * f).sqrt(), 1.3 * (-0.4 * f).exp());
+            let (c0, c1) = (h0 * f.powf(1.3), h1);
+            let want = (c0 * 0.1).powi(2) + (c1 * 0.05).powi(2);
+            assert!((v(f) - want).abs() < 1e-15 * want, "v({f}) {} vs {want}", v(f));
+            let h = 1e-5;
+            let fd1 = (v(f + h) - v(f - h)) / (2.0 * h);
+            let fd2 = (dv(f + h) - dv(f - h)) / (2.0 * h);
+            let d2 = spec.d2var_df2_scaled(1, f, &sigma, &row);
+            eprintln!(
+                "f {f}: dv rel {:.1e}, d2v rel {:.1e}",
+                (dv(f) - fd1) / fd1,
+                (d2 - fd2) / fd2
+            );
+            // Measured worst 1.3e-10 (dv) and 7.7e-11 (d2v); a dropped `h'` term is O(1).
+            assert!(((dv(f) - fd1) / fd1).abs() < 1e-8, "dv({f}) {} vs FD {fd1}", dv(f));
+            assert!(((d2 - fd2) / fd2).abs() < 1e-8, "d2v({f}) {d2} vs FD {fd2}");
+            for (k, c) in [(0, c0), (1, c1)] {
+                let got = spec.dvar_dlogsigma_scaled(1, k, f, &sigma, &row);
+                let want = 2.0 * (c * sigma[k]).powi(2);
+                assert!((got - want).abs() < 1e-14 * want, "slot {k}: {got} vs {want}");
+            }
+        }
     }
 
     /// The `Single` fast paths of `variance_at`, `variance_at_raw` and `dvar_df` are the

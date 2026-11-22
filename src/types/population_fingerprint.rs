@@ -58,7 +58,9 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   that writes the carried value out.
 /// - `7`: #1909. An `ADDL`-implied dose takes its covariates, `OCC` and `TIME` from the
 ///   record that governs it, and its lag from its parent row (`DoseEvent::implied`).
-pub(crate) const SCHEME: u32 = 7;
+/// - `8`: #2368. An endpoint row after another record, and a row skipped for its
+///   missing `DV`, are pk-only records (`pk_only_times`).
+pub(crate) const SCHEME: u32 = 8;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
