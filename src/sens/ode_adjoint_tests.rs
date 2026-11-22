@@ -9057,6 +9057,13 @@ fn sde_row_fixture(variant: &str) -> (CompiledModel, Subject) {
             "proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
             &[0.1, -0.05, 0.2, 0.3],
         ),
+        // A magnitude that reads the prediction (#3121): `R = f³σ²`, its program riding the
+        // row's tail into both `variance_at_scaled` and `row_loadings_g`.
+        "ipred" => (
+            "  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "proportional(PROP_ERR * sqrt(IPRED))",
+            &[0.1, -0.05, 0.2],
+        ),
         _ => unreachable!("{variant}"),
     };
     let src = SDE_ONE_CPT
@@ -9114,7 +9121,7 @@ fn pointwise_rel_gap(a: &[f64], b: &[f64]) -> f64 {
 /// what make a one-sided change red.
 #[test]
 fn sde_row_variance_is_on_both_sides_of_the_twin() {
-    for variant in ["magnitude", "power", "iiv"] {
+    for variant in ["magnitude", "power", "iiv", "ipred"] {
         let (model, s) = sde_row_fixture(variant);
         let params = moved_params(&model);
         let eta: Vec<f64> = match variant {
@@ -9150,14 +9157,16 @@ fn sde_row_variance_is_on_both_sides_of_the_twin() {
             rec_moved > 1e-3,
             "{variant}: RECORDER side — `record_sde_p`'s R ignores the row ({rec_moved:.2e})"
         );
-        // Measured 0 (magnitude, iiv) and 1.3e-16 (power), macOS arm64: one trajectory, one
+        // Measured 0 (magnitude, iiv, ipred) and 1.3e-16 (power), macOS arm64: one trajectory, one
         // row formula (`focei_kernel::row_loadings_g` vs `ErrorSpec::scaled_loadings`).
         assert!(twin < 1e-12, "{variant}: recorder and value p_obs disagree ({twin:.2e})");
         for interaction in [true, false] {
             let worst = fd_oracle(&model, &s, interaction);
             eprintln!("T6 {variant} interaction={interaction}: parity {worst:.3e}");
             // Measured (macOS arm64) FOCEI/FOCE: 2.4e-7/3.3e-8 magnitude, 3.4e-8/4.3e-8 power,
-            // 1.9e-8/2.4e-8 iiv; bound SDE_PARITY_BOUND (1e-5), as the other SDE parity tests.
+            // 1.9e-8/2.4e-8 iiv, 3.7e-8/7.1e-9 ipred; bound SDE_PARITY_BOUND (1e-5), as the
+            // other SDE parity tests. Mutation — `row_loadings_g` drops `h(f)` (#3121): ipred
+            // reddens on the RECORDER side (moved 0 vs the value side's 7.6e-2).
             assert!(worst < SDE_PARITY_BOUND, "{variant} interaction={interaction}: {worst:.2e}");
         }
     }

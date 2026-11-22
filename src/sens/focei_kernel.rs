@@ -273,7 +273,8 @@ const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 /// A row's σ loadings at prediction `f`, as generic values: a constant slot's
 /// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
 /// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
-/// each times the custom magnitude multiplier `mult` (the row from
+/// each times a prediction-reading magnitude `h(f)` when the row's tail carries one
+/// (#3121) and the custom magnitude multiplier `mult` (the row from
 /// `RuvMagnitude::eval_subject_obs_g`; `None` reads as all ones). The same
 /// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
 /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
