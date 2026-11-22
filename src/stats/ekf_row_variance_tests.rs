@@ -2,7 +2,10 @@
 //! (`row_residual_variance`) — magnitude row, `weight =`, `power` exponent, `block_sigma`'s ρ
 //! and `exp(2η_r)` — not the bare `residual_variance(error_model, f, σ)`.
 //!
-//! NONMEM has no EKF, so there is no equivalent run to anchor against. The oracles are
+//! There is no equivalent NONMEM run to anchor against. NONMEM 7.2+ ships an EKF plug-in
+//! (`sde.f90`, present in our `nonmem:7.6.0-anchor` image), but it updates the state mean with
+//! the innovations, and ferx's filter does not (#1285): it propagates and shrinks `P` only, so
+//! the two filters are different objects and their objectives differ. The oracles are
 //! (a) degenerate pairs whose two spellings are the same row variance by algebra (T1–T3, T9a),
 //! each with a straddling control that the pre-#3126 filter cannot pass, (b) an exact closed
 //! form outside both engines (T4: the scalar Riccati recursion of a 1-state linear SDE), and
@@ -123,6 +126,7 @@ fn ekf_p_obs_reads_the_weight() {
     let control = worst_rel(&a[1..], &p_obs(&plain, &s, &ETA, &sigma)[1..]);
     let gap = worst_rel(&a, &want);
     eprintln!("T2 weight: gap {gap:.3e}, straddle control {control:.3e}");
+    // Measured (macOS arm64): gap 0 (doubling an SD is exact), straddle control 2.8e-1.
     assert!(gap <= 1e-12, "weight: {gap:.3e}");
     assert!(control > 1e-3, "straddle: the weight must move p_obs ({control:.3e})");
 }
@@ -213,10 +217,12 @@ fn ekf_p_obs_matches_the_closed_form_riccati_per_row_term() {
         ),
         (
             "block_sigma",
-            "  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.008, 0.04]\n",
+            // σp = 0.1, σa = 8, ρ = 0.8: σp·f ≈ σa over these predictions (f ≈ 67–95), so
+            // the cross term 2ρσpσa·f is ~40% of R rather than a rounding of it.
+            "  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.64, 64.0]\n",
             "DV ~ combined(PROP_ERR, ADD_ERR)",
-            Box::new(|f| 0.01 * f * f + 2.0 * 0.008 * f + 0.04),
-            Box::new(|f| 0.01 * f * f + 0.04),
+            Box::new(|f| 0.01 * f * f + 2.0 * 0.64 * f + 64.0),
+            Box::new(|f| 0.01 * f * f + 64.0),
         ),
         (
             "magnitude",
@@ -235,7 +241,10 @@ fn ekf_p_obs_matches_the_closed_form_riccati_per_row_term() {
         let control = worst_rel(&got, &old);
         eprintln!("T4 {name}: gap {gap:.3e}, pre-#3126 control {control:.3e}, {got:?}");
         // The filter's Crank–Nicolson Riccati step is the floor (`ekf.rs`'s free-drift test
-        // measured 2.7e-5..5e-5 at these times). Measured: see the printed gaps; bound 2e-4.
+        // measured 2.7e-5..5e-5 at these times). Measured (macOS arm64): gap 4.95e-5 in all
+        // three cases, at the first record's free drift; pre-#3126 controls 2.4e-1 (power),
+        // 5.5e-2 (block_sigma), 1.2e-1 (magnitude). Bound 2e-4: 4x the floor, and each
+        // control at least 27x it.
         assert!(gap < 2e-4, "{name}: {gap:.3e}");
         assert!(control > 10.0 * 2e-4, "{name}: the term must be live ({control:.3e})");
     }
@@ -321,6 +330,80 @@ fn individual_nll_agrees_on_the_degenerate_row_pairs() {
         let lb = individual_nll(&b, &s, &p.theta, &ETA, &p.omega, &doubled);
         assert!(la.is_finite() && lb.is_finite());
         eprintln!("T9a {a_err}: {la} vs {lb} (|Δ| {:.3e})", (la - lb).abs());
+        // Measured (macOS arm64): |Δ| 0 on both pairs; with the row dropped from the filter's
+        // `R`, 4.4e-4 on the magnitude pair.
         assert!((la - lb).abs() <= 1e-12 * lb.abs().max(1.0), "{a_err}: {la} vs {lb}");
+    }
+}
+
+/// The other three `ekf_p_obs` callers on the same degenerate pair (review round 1, finding
+/// 1): the IOV linearized FOCEI marginal (`foce_subject_nll_iov_cov` →
+/// `foce_subject_nll_iov_linearized_split`), the IOV inner objective (`individual_nll_iov` →
+/// `individual_nll_iov_frozen_in`) and the post-fit per-record terms
+/// (`conditional_obs_neg2ll_terms`). Each passes its own magnitude matrix and pairs to the
+/// filter; dropping them at one call site left every other test green. Asserted per caller,
+/// so the failure names the one that drifted. Dies when any of the three passes `&[], None`.
+#[test]
+fn iov_and_postfit_callers_read_the_row() {
+    let iov = |sig: &str, err: &str| {
+        let src = sde_src(&format!("  kappa KAPPA_CL ~ 0.04\n{sig}"), err)
+            .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + KAPPA_CL)")
+            + "[fit_options]\n  iov_column = OCC\n";
+        let m = parse_model_string(&src).expect("parse");
+        assert!(m.is_sde() && m.n_kappa == 1, "premise: an IOV SDE model");
+        m
+    };
+    let sig = "  sigma PROP_ERR ~ 0.1 (sd)\n";
+    let a = iov(sig, "DV ~ proportional(PROP_ERR * 2)");
+    let b = iov(sig, "DV ~ proportional(PROP_ERR)");
+    let mut s = subject_for(&b);
+    s.occasions = s.obs_times.iter().map(|&t| if t < 12.0 { 1 } else { 2 }).collect();
+    s.dose_occasions = vec![1, 2];
+    let p = &a.default_params;
+    let oi = p.omega_iov.as_ref().expect("Ω_IOV");
+    let sa = p.sigma.values.clone();
+    let sb: Vec<f64> = sa.iter().map(|v| 2.0 * v).collect();
+    let kappas = vec![DVector::from_vec(vec![0.05]), DVector::from_vec(vec![-0.04])];
+    let eta = DVector::from_vec(ETA.to_vec());
+    // The η-Jacobian of the predictions (`n_obs × n_eta`): any fixed matrix serves, as both
+    // spellings receive the same one.
+    let h = DMatrix::from_fn(s.obs_times.len(), 3, |j, c| 0.1 * (j + 1) as f64 - 0.05 * c as f64);
+    let close = |x: f64, y: f64| {
+        x.is_finite() && y.is_finite() && (x - y).abs() <= 1e-12 * y.abs().max(1.0)
+    };
+
+    let marg = |m: &CompiledModel, sig: &[f64]| {
+        let cov = m.residual_cov_theta(&p.theta);
+        foce_subject_nll_iov_cov(m, &s, &p.theta, &eta, &h, &p.omega, sig, cov, true, &kappas, oi)
+    };
+    let (ma, mb) = (marg(&a, &sa), marg(&b, &sb));
+    eprintln!("IOV marginal: {ma} vs {mb}");
+    assert!(close(ma, mb), "IOV linearized marginal drops the row: {ma} vs {mb}");
+
+    let ks: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+    let inner = |m: &CompiledModel, sig: &[f64]| {
+        individual_nll_iov(m, &s, &p.theta, &ETA, &ks, &p.omega, Some(oi), sig)
+    };
+    let (ia, ib) = (inner(&a, &sa), inner(&b, &sb));
+    eprintln!("IOV inner: {ia} vs {ib}");
+    assert!(close(ia, ib), "IOV inner objective drops the row: {ia} vs {ib}");
+
+    // Post-fit terms, on the non-IOV pair (the caller does not branch on IOV).
+    let a1 = model(sig, "DV ~ proportional(PROP_ERR * 2)");
+    let b1 = model(sig, "DV ~ proportional(PROP_ERR)");
+    let s1 = subject_for(&b1);
+    let ipreds = model_predictions(&b1, &s1, &p.theta, &ETA);
+    let terms = |m: &CompiledModel, sig: &[f64]| {
+        let cov = m.residual_cov_theta(&p.theta);
+        conditional_obs_neg2ll_terms(m, &s1, &p.theta, &ipreds, &ETA, sig, cov)
+    };
+    let (ta, tb) = (terms(&a1, &sa), terms(&b1, &sb));
+    eprintln!("post-fit terms: {ta:?} vs {tb:?}");
+    assert_eq!(ta.len(), tb.len());
+    for (j, (x, y)) in ta.iter().zip(&tb).enumerate() {
+        assert!(
+            close(*x, *y),
+            "conditional_obs_neg2ll_terms drops the row at record {j}: {x} vs {y}"
+        );
     }
 }

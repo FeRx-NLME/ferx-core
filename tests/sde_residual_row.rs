@@ -6,7 +6,8 @@
 //! file is the fit-level confirmation, where the EBEs are re-estimated, so the pairs agree
 //! only to the inner loop's tolerance.
 //!
-//! NONMEM has no EKF, so there is no NONMEM anchor: the oracle is the degenerate pair itself.
+//! No NONMEM anchor: NONMEM's EKF plug-in (`sde.f90`) updates the state mean and ferx's filter
+//! does not (#1285), so the two are different objects. The oracle is the degenerate pair.
 //! Before #3126 (measured at `89b666964`, macOS arm64): pair 1 was 3.60 OFV apart, pair 2
 //! 1.04; the same pairs without `[diffusion]` agreed to 1.2e-10 and 0 — the inner-loop floor
 //! that bounds this file. After #3126 (macOS arm64): 1.6e-13 and 0, control 1.2e-10; with the

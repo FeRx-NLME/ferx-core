@@ -38,12 +38,14 @@ V_total = P_ekf[obs_cmt, obs_cmt]  +  V_residual
 
 where `V_residual` is the variance from the `[error_model]` (sigma-based). The
 Kalman update's measurement variance is that row's residual variance at the filter's own
-mean, so one solve gives both the mean and `P`. It is the same variance the row is scored
-with: a custom magnitude (`proportional(SIGMA * THETA)`), a `weight =`, a `power(...)`
+mean, so one solve gives both the mean and `P`. It is the row's conditional residual variance
+at the current random effects, built the way the row is scored: a custom magnitude (`proportional(SIGMA * THETA)`), a `weight =`, a `power(...)`
 exponent, `block_sigma` correlations and the `iiv_on_ruv` factor `exp(2η)` all reach it
 ([#3126](https://github.com/FeRx-NLME/ferx-core/issues/3126)). Before that fix the filter used
 the bare `sigma` variance for every row, so `P` after a subject's first observation ignored
-those terms.
+those terms. Non-interaction FOCE scores its EBE search with the variance frozen at the
+population prediction and without `exp(2η)`; the filter's `R` is not frozen there — it stays
+the conditional variance at the filter's mean and the current η.
 
 So the residual actually scored is the ordinary ODE residual `DV - IPRED`, and
 the inflation `P` depends on the parameters, the sampling times and the residual
@@ -202,7 +204,7 @@ the ODE alone explains the data; a large value suggests model misspecification.
 | `method = saem` with `[diffusion]` and `block_sigma` | Hard error at fit time |
 | `[scaling]` or a log-transform-both-sides error model with `[diffusion]` | Parse-time error |
 | Analytic gradients with `[diffusion]` | Exact on every route: FOCE/FOCEI, AGQ/Laplace, the covariance step, fixed-EBE scores (GN, trust region), SAEM's IMH proposal, IOV, steady state, a modeled `RATE`/`D`, a custom magnitude, `weight =`, `power(...)` and `iiv_on_ruv` |
-| `block_sigma` with `[diffusion]` (FOCE/FOCEI, AGQ/Laplace) | Supported; the Kalman `R` carries the correlation. The gradient, inner gradient and covariance step use **finite differences** for this combination ([#3127](https://github.com/FeRx-NLME/ferx-core/issues/3127)) |
+| `block_sigma` with `[diffusion]` (FOCE/FOCEI, AGQ/Laplace) | Supported; the Kalman `R` carries the correlation. The gradient, inner gradient and covariance step use **finite differences** for this combination, so `optimizer = auto` resolves as it does without an exact gradient — BOBYQA, unless the model has more than 64 free parameters ([#3127](https://github.com/FeRx-NLME/ferx-core/issues/3127)) |
 | State name not in `states = [...]` | Parse-time error |
 | Negative initial value | Parse-time error |
 

@@ -954,7 +954,9 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     // IIV on residual error: per-subject scale on the residual *variance*
     // (`EPS·EXP(ETA)` → V·exp(2·η_ruv)). 1.0 when no `iiv_on_ruv` is set.
     // Does not touch FREM covariate pseudo-observations (handled below before
-    // this factor is applied) or the EKF process noise `p_obs`.
+    // this factor is applied). It is not applied to the EKF process noise `p_obs`
+    // here; `p_obs` already carries `exp(2·η_ruv)` through the filter's Kalman `R`
+    // (`ekf_p_obs`, #3126), at η even when this scoring freezes it.
     let ruv_scale = if frozen_var_preds.is_some() { 1.0 } else { model.residual_var_scale(eta) };
     let mut data_ll = 0.0;
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
