@@ -776,8 +776,9 @@ fn at_point(cl: [&str; 2], tvv: &str, mixl: &str, omega: &str, sigma: &str) -> S
 /// `free_omega_model` stopped (Linux aarch64, at `2adf12df1`): the collapsed one (OFV
 /// 310.023414, from the near-symmetric start 1.70 / 1.701) and the two-class one (299.863507,
 /// from 1.70 / 1.71). Evaluation-only, so it returns immediately and does not depend on
-/// which optimizer path reaches either point: the collapsed optimum is a saddle (the exact
-/// R-matrix has a negative eigenvalue), and since #2837's verification leg L-BFGS leaves it
+/// which optimizer path reaches either point: the collapsed optimum is a saddle (the analytic
+/// R-matrix at this point has min eigenvalue −3.950e-2 against a max of 5.490e3, measured by a
+/// covariance step here; at the two-class point it is positive definite), and since #2837's verification leg L-BFGS leaves it
 /// from every start probed but 1.70 / 1.701.
 ///
 /// The largest per-subject log Bayes factor between the classes is 0.009 at this collapsed
@@ -842,8 +843,9 @@ const OPTIMUM_OFV_TOL: f64 = 1e-5;
 /// From clearances 1.70 / 1.71, which the start check of #2749 cannot call symmetric, both
 /// optimizers reach the two-class optimum. Before #2837 L-BFGS stopped on the collapsed
 /// saddle (310.02); its verification leg now leaves it. Measured (Linux aarch64, at
-/// `2adf12df1`): L-BFGS 299.863507 from 1.70 / 1.71, and from 8 of 9 other starts between
-/// 1.60 / 1.80 and 1.705 / 1.71; only 1.70 / 1.701 still ends at 310.023414.
+/// `2adf12df1`): L-BFGS 299.863507 from 1.70 / 1.71 and from the eight other starts whose class
+/// clearances are 0.005 to 0.20 apart (1.705 / 1.71 to 1.60 / 1.80); only 1.70 / 1.701, 0.001
+/// apart, still ends at 310.023414.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
