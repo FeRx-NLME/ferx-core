@@ -16825,7 +16825,7 @@ const MIXTURE_IV_IOV_MODEL: &str = r"
   DV ~ proportional(EPS)
 ";
 
-/// A public mixture fixture under `optimizer = auto` (L-BFGS since #2739), FOCEI, with the
+/// A public mixture fixture under `optimizer = auto` (L-BFGS since #3025), FOCEI, with the
 /// verification leg switched `on` or off.
 fn mixture_fit(
     model: &str, csv: &str, occ: Option<&str>, on: bool,
@@ -16850,9 +16850,10 @@ const MIXTURE_FIXTURES: [(&str, &str, Option<&str>); 2] = [
 /// `mixture_iv_iov` (Linux aarch64, with the leg at its own tolerance): one leg each, gaining
 /// 9.1e-13 and 1.1e-13, its first evaluation 1.9e-7 and 3.3e-8 from the loose fit's OFV, and
 /// the leg-on fit 1.4e-12 and 0 from the leg-off one (301.582018391 / 470.814251781, both
-/// converged); 25 against 21 evaluations and 36 against 30. macOS arm64 reads the same first
-/// evaluations, gains of 5.7e-13 and 1.1e-13, and 5.7e-14 between the fits. The bounds below
-/// are 10× the worst first evaluation and 700× the worst fit difference. The leg finds
+/// converged); 25 against 21 evaluations and 36 against 30. macOS arm64 (re-measured on
+/// `main` after #3025) reads the same first evaluations and evaluation counts, gains of 3.2e-12
+/// and 1.1e-13, and 6.9e-12 and 0 between the fits. The bounds below are 10× the worst first
+/// evaluation and 145× the worst fit difference. The leg finds
 /// nothing on either, so this pins that it ran, started at the incumbent and did not disturb
 /// the fit; the straddle is two tests down. It does not pin the per-class seed: clearing
 /// `cached_etas_by_class` at the leg's start leaves it green, because a cold class solve
