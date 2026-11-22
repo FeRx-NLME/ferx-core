@@ -101,7 +101,15 @@ fn endpoint_only(model: &CompiledModel) -> bool {
 /// the public struct literal lacks them. Its `rhs` / `pk_param_fn` are opaque Rust closures
 /// that no recording can differentiate, so it is declined here and takes finite differences
 /// (#3004: the one scope gap that is not a parser model).
+///
+/// An SDE model with `block_sigma` correlations is declined too (#3126): its EKF variance rows
+/// carry ρ through the Kalman `R`, but that recording's leaves are θ‖σ only
+/// ([`ThetaLeaves`]), so the dual would silently differentiate a ρ-free `R` (FOCEI parity
+/// 3.755e-4 measured before this decline). Serving it on the dual is #3127.
 pub(crate) fn recorder_in_scope(model: &CompiledModel) -> bool {
+    if model.is_sde() && !model.residual_correlations.is_empty() {
+        return false;
+    }
     match model.ode_spec.as_ref() {
         _ if model.is_algebraic() => model
             .indiv_param_partials
@@ -1522,11 +1530,41 @@ fn record_sde_p<T: VmNum>(
     }
     let dose_f: Vec<T> =
         resolved.doses.iter().map(|d| params[f_bio_slot(ode, d.cmt_raw())]).collect();
-    // `ErrorSpec::Single` (an SDE model has no per-CMT readout): the key is unread.
-    let shape = model.error_spec.loading_shape(0, sigma.len());
-    let r_of = |_: usize, f: T| -> T {
-        let loads: Vec<(usize, T)> = shape.iter().map(|&(i, form)| (i, form.coeff_g(f))).collect();
-        let v = crate::stats::residual_error::loadings_variance_g(&loads, sigma, &[], |_| zero);
+    // The Kalman `R` of record `j` is that row's scored variance (#3126), production's
+    // `row_residual_variance`: the magnitude row (`weight =`, a `power` exponent) over the θ
+    // leaves, and `exp(2η_r)` on the η leaves. The row is θ/covariate/TIME-only, so it is
+    // evaluated once here. `block_sigma`'s ρ is not a leaf of this recording, so that
+    // combination declines (`recorder_in_scope` at the model level, and here for the per-row
+    // callers that record without asking it) and takes finite differences (#3127).
+    if !model.residual_correlations.is_empty() {
+        return None;
+    }
+    let rows: Option<Vec<Vec<T>>> = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
+        Some(rm) => Some(
+            (0..subject.observations.len())
+                .map(|j| rm.eval_subject_obs_g(&model.error_spec, subject, j, th.theta))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        None => None,
+    };
+    let ruv = match model.residual_error_eta {
+        Some(r) => (T::from_f64(2.0) * et[r]).exp(),
+        None => T::from_f64(1.0),
+    };
+    let keys = model.error_spec.obs_keys(subject);
+    let n_shape = sigma.len();
+    let r_of = |j: usize, f: T| -> T {
+        let (loads, n) = crate::sens::focei_kernel::row_loadings_g(
+            &model.error_spec,
+            keys.get(j).copied().unwrap_or(0),
+            n_shape,
+            sigma.len(),
+            f,
+            rows.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice),
+        );
+        let v =
+            crate::stats::residual_error::loadings_variance_g(&loads[..n], sigma, &[], |_| zero)
+                * ruv;
         // `ode_predictions_ekf_with_diffusion`'s guard: an unusable variance reads as 1.
         if v.br_cmp_c(BranchCmp::Gt, 0.0) && v.br_cmp_c(BranchCmp::Lt, f64::INFINITY) {
             v

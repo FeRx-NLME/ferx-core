@@ -2010,8 +2010,9 @@ fn likelihood_values(
     // production likelihood scores it (#2421 review, round 2).
     let class_values = || {
         let mut out = predictions_at(model, subject, theta, eta, kappa);
-        if let Some(mult) = model.ruv_obs_mult(subject, theta) {
-            out.extend(mult.into_iter().flatten());
+        let ruv_mult = model.ruv_obs_mult(subject, theta);
+        if let Some(mult) = &ruv_mult {
+            out.extend(mult.iter().flatten().copied());
         }
         // A serial-correlation ρ is read by the residual covariance of any
         // subject with two records or more (#2421 review).
@@ -2031,6 +2032,8 @@ fn likelihood_values(
                 theta,
                 eta,
                 &model.default_params.sigma.values,
+                &model.residual_correlations,
+                ruv_mult.as_deref(),
             ));
         }
         out
