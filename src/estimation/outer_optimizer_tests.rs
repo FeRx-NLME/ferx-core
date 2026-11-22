@@ -16447,15 +16447,17 @@ mod guard_stop {
     }
 }
 
-/// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
-/// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
-/// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
-/// budget is final and never reset), a budget that ends inside the latch makes NLopt
-/// returns `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
+/// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch that the last
+/// permitted evaluation falls inside has been attributed to the guard. On `one_cpt_iv` / SLSQP
+/// with the #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification
+/// a spent budget is final and never reset), a budget that ends inside the latch makes NLopt
+/// return `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
 /// `eval_budget_spent == false`. The guard-off twin at the same budget runs out on its own
 /// descent: `MaxEvalReached` and `true`. The budget is found, not fixed (#2901): the window
-/// moves with the build by more than its own width, and its top follows the two runs' own
-/// evaluation counts. Mutation: fill `eval_budget_spent` from
+/// moves with the build by more than its own width, so the test takes the fewer of the two
+/// runs' unbudgeted evaluation counts, minus one. That can be the window's bottom (Linux
+/// x86_64 in #2901: latch at 107, budget 107) or its middle (macOS arm64). Mutation: fill
+/// `eval_budget_spent` from
 /// `max_eval_reached` as it stood *before* the latch reset → the latched run reads `true`.
 #[test]
 fn eval_budget_spent_is_read_after_the_latch_reset() {
@@ -16499,7 +16501,12 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
     };
     // Both runs left to stop by themselves, then one evaluation fewer than either took
     // (`n_iterations` counts NLopt's objective evaluations): the unguarded run is still
-    // descending there, and the guarded one has latched, which is asserted below.
+    // descending there, and the guarded one has latched, which is asserted below. Why the
+    // guarded run has latched by then: a latch takes effect from the *next* evaluation, which
+    // answers with the incumbent and a zero gradient (`state.stagnation_stopped`), and that
+    // answer is what ends SLSQP, so a latched run stops at least one evaluation after its
+    // latch. Both runs share one trajectory up to the latch, so the unguarded count cannot
+    // fall below it either.
     let (free, free_outcome) = run(true, None);
     let (free_off, _) = run(false, None);
     let by_itself = |r: &OuterResult| r.optimizer_stop.as_deref() != Some("MaxEvalReached");
@@ -16514,18 +16521,24 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
     assert!(budget.is_some(), "premise: an evaluation count ({evals})");
     let (on, on_outcome) = run(true, budget);
     let (off, off_outcome) = run(false, budget);
+    // Every message names the free stops and counts it was derived from: the premise only
+    // rules out `MaxEvalReached`, so a free run that ended otherwise shows up here.
+    let ctx = format!(
+        "free evals {} / {} ({:?} / {:?}), budget {budget:?}",
+        free.n_iterations, free_off.n_iterations, free.optimizer_stop, free_off.optimizer_stop
+    );
     // The straddle: both runs end on the budget, one inside the latch and one outside it.
-    assert!(on_outcome.stagnation_latched, "the guarded run must latch");
-    assert!(!off_outcome.stagnation_latched, "guard off never latches");
-    assert_eq!(on.optimizer_stop.as_deref(), Some("MaxEvalReached"));
-    assert_eq!(off.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert!(on_outcome.stagnation_latched, "the guarded run must latch; {ctx}");
+    assert!(!off_outcome.stagnation_latched, "guard off never latches; {ctx}");
+    assert_eq!(on.optimizer_stop.as_deref(), Some("MaxEvalReached"), "{ctx}");
+    assert_eq!(off.optimizer_stop.as_deref(), Some("MaxEvalReached"), "{ctx}");
     assert!(
         !on.eval_budget_spent,
-        "a latch on the last permitted eval is the guard's stop, not the budget's"
+        "a latch on the last permitted eval is the guard's stop, not the budget's; {ctx}"
     );
-    assert!(on.converged, "the plateau check accepts the latched stop");
-    assert!(off.eval_budget_spent, "the unguarded run spent its budget");
-    assert!(!off.converged);
+    assert!(on.converged, "the plateau check accepts the latched stop; {ctx}");
+    assert!(off.eval_budget_spent, "the unguarded run spent its budget; {ctx}");
+    assert!(!off.converged, "{ctx}");
 }
 
 /// #2799 r1 #2: the internal BFGS (`optimizer = bfgs`) publishes `eval_budget_spent` when its
