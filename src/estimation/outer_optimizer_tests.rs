@@ -14961,6 +14961,31 @@ fn a_stall_at_the_inits_stays_flagged_when_the_probe_finds_lower() {
     }
 }
 
+/// #2902: a first attempt stopped at its start on `Success`, at `two_cpt_iv`'s FOCEI optimum,
+/// whose probe the budget (`maxiter = 3`, 30 evaluations) cuts before its verdict: the probe
+/// spent the budget the first leg stopped short of, so the fit reports it spent, with the
+/// advice once. Before, neither (measured, macOS arm64). The held-cap retry stops at its start
+/// on `Success` too, so the first attempt is what is reported.
+#[test]
+fn a_first_attempt_whose_probe_spends_the_budget_reports_it_spent() {
+    let (mut model, pop) = two_cpt_iv_fixture();
+    model.name = "first_probe_budget_2902".into();
+    forced_stop_at_start::set(&model.name, Some(nlopt::SuccessState::Success), false);
+    let opts = FitOptions { outer_maxiter: 3, ..options_2506(crate::types::Optimizer::NloptLbfgs) };
+    let mut optimum = model.default_params.clone();
+    optimum.theta = vec![4.414381, 15.532451, 3.137725, 29.347620];
+    optimum.omega = OmegaMatrix::from_diagonal(
+        &[0.0758052, 0.1038978, 0.1011922, 0.1555683],
+        model.default_params.omega.eta_names.clone(),
+    );
+    optimum.sigma.values = vec![0.01013468];
+    let result = crate::api::fit(&model, &pop, &optimum, &opts).expect("fit");
+    assert!(result.n_iterations >= 30, "precondition: the probe ran to the budget");
+    let advice: Vec<&String> =
+        result.warnings.iter().filter(|w| w.contains("increase maxiter")).collect();
+    assert!(result.eval_budget_spent && advice.len() == 1, "{:?}", result.warnings);
+}
+
 /// #2506, end to end through `fit()`: a refit at a converged fit's estimates comes
 /// back converged, verified as a warm start at the optimum, without `W_STALLED_AT_INIT`,
 /// at the cold fit's objective, and passes `Strictness::default()` — the gate a search's

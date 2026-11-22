@@ -3712,7 +3712,8 @@ fn start_probe_due(
 ///
 /// - `Some(false)` — the first attempt, a stall, with [`start_probe_stall_warning`]; retried.
 /// - `Some(true)` — [`verified_start_result`]; no retry.
-/// - `None` — the first attempt, retried exactly when it did not leave its start.
+/// - `None` — the first attempt, retried exactly when it did not leave its start, with the
+///   budget a probe the budget cut spent ([`take_spent_budget`]).
 ///
 /// The probe's evaluations count in `n_iterations` either way.
 type ProbedAttempt = (OuterResult, Option<RestartCause>, Option<bool>);
@@ -3739,10 +3740,22 @@ fn settle_start_probe(
             ((verified_start_result(found, left, first, start_wins), found_cause), true)
         }
         Some((spent, _, None)) => {
-            first.n_iterations += spent.n_iterations;
+            take_spent_budget(&mut first, spent);
             ((first, first_cause), first_left_init)
         }
         None => ((first, first_cause), first_left_init),
+    }
+}
+
+/// A probe with no verdict counts its evaluations in `onto`'s. One the budget cut before its
+/// verdict spent the rest of the fit's: the leg it probed stopped short of it, so the spent
+/// budget and the advice the probe was given are the fit's (#2821 review r1, #2902).
+fn take_spent_budget(onto: &mut OuterResult, spent: OuterResult) {
+    onto.n_iterations += spent.n_iterations;
+    if spent.eval_budget_spent && !onto.eval_budget_spent {
+        onto.eval_budget_spent = true;
+        onto.warnings
+            .extend(spent.warnings.into_iter().filter(|w| w.starts_with(EVAL_BUDGET_WARNING_HEAD)));
     }
 }
 
@@ -3761,8 +3774,8 @@ fn settle_start_probe(
 ///   finished and the probe's is the better fit. Unlike the first attempt's (#2506), this is
 ///   no stall to keep flagged: the restart's start is the previous leg's estimates, not the
 ///   user's, and a fit does not publish a point worse than one it already reached.
-/// - `None` — the restart, unconverged as its own rule left it. A probe the budget cut before
-///   its verdict hands on the spent budget and its advice.
+/// - `None` — the restart, unconverged as its own rule left it, with the budget a probe the
+///   budget cut spent ([`take_spent_budget`]).
 ///
 /// Every probe's evaluations count in `n_iterations`, whichever result is kept. No probe ran
 /// (`probed` is `None`) unless the restart did not leave its start and displacement was all
@@ -3795,16 +3808,7 @@ fn settle_restart_probe(
             (found, found_cause, true, false)
         }
         Some((spent, _, None)) => {
-            restarted.n_iterations += spent.n_iterations;
-            // A probe cut by the budget before its verdict spent the rest of this fit's: the
-            // restart's own leg stopped short of it, so the spent budget and the advice the
-            // probe was given are the fit's (#2821 review r1).
-            if spent.eval_budget_spent && !restarted.eval_budget_spent {
-                restarted.eval_budget_spent = true;
-                restarted.warnings.extend(
-                    spent.warnings.into_iter().filter(|w| w.starts_with(EVAL_BUDGET_WARNING_HEAD)),
-                );
-            }
+            take_spent_budget(&mut restarted, spent);
             (restarted, cause, false, false)
         }
         None => (restarted, cause, false, false),
