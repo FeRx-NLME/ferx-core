@@ -354,11 +354,10 @@ pub(crate) fn is_last_estimating_stage(
 /// through.
 pub(crate) fn keep_gn_zero_eta_warning(warning: &str, is_last_estimating: bool) -> bool {
     use crate::estimation::gauss_newton::{
-        GN_RANK_DEFICIENT_HEAD, GN_ZERO_ETA_NONCONVERGENCE_WARNING,
+        is_gn_rank_deficient_warning, GN_ZERO_ETA_NONCONVERGENCE_WARNING,
     };
     is_last_estimating
-        || (warning != GN_ZERO_ETA_NONCONVERGENCE_WARNING
-            && !warning.starts_with(GN_RANK_DEFICIENT_HEAD))
+        || (warning != GN_ZERO_ETA_NONCONVERGENCE_WARNING && !is_gn_rank_deficient_warning(warning))
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
