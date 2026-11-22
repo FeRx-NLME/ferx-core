@@ -2154,7 +2154,8 @@ fn sde_imh_proposal_is_the_exact_objective_s() {
         g[a] = (nll(&up) - nll(&dn)) / (2.0 * h);
         assert!(g[a].is_finite());
     }
-    let p_obs = crate::stats::likelihood::ekf_p_obs(&model, &subject, &theta, &eta, &sigma);
+    let p_obs =
+        crate::stats::likelihood::ekf_p_obs(&model, &subject, &theta, &eta, &sigma, &[], None);
     let (jac, f, p_plan) =
         super::eta_jacobian_and_preds(&model, &subject, &theta, Some(&sigma), &eta)
             .expect("in scope");
