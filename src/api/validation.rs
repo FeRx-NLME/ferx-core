@@ -632,8 +632,20 @@ fn residual_magnitude_at_class(
                 // The written TIME, which the magnitude itself is evaluated at
                 // (`ruv_obs_mult`) and the user can find in the data (#1959).
                 let time = subj.readout_time(j);
-                let at_pred =
-                    fmag.map(|(f, _)| format!(", at the η = 0 prediction {f}")).unwrap_or_default();
+                // `IPRED` is natural-scale, so under LTBS name `exp(f)`, the value the
+                // magnitude read (#3125 review 5).
+                let ipred = |f: f64| if model.log_transform { f.exp() } else { f };
+                let at_pred = fmag
+                    .map(|(f, _)| format!(", at the η = 0 prediction IPRED = {}", ipred(f)))
+                    .unwrap_or_default();
+                let cause = if fmag.is_some() {
+                    "This magnitude reads `IPRED`: check that its form stays positive over \
+                     the range the prediction takes, and that no covariate it references has \
+                     a missing or non-numeric cell."
+                } else {
+                    "The usual cause is a missing or non-numeric cell in a covariate the \
+                     magnitude (or a `weight = ...` modifier) references."
+                };
                 // The upper half of a row is the `power(...)` exponent per slot
                 // (#1182, `RuvMagnitude::eval_obs`); a non-positive exponent is
                 // a different mistake from a vanishing multiplier.
@@ -661,8 +673,7 @@ fn residual_magnitude_at_class(
                          {m} at subject `{}`, TIME {time}{at_class}{at_pred} — it must be strictly \
                          positive and finite. The variance is proportional to its square, so a zero magnitude \
                          collapses that observation's variance onto the floor and lets one row \
-                         dominate the fit. The usual cause is a missing or non-numeric cell in a \
-                         covariate the magnitude (or a `weight = ...` modifier) references.",
+                         dominate the fit. {cause}",
                         subj.id
                     ),
                 )

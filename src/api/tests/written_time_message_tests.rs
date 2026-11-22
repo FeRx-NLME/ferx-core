@@ -77,29 +77,47 @@ fn the_residual_magnitude_check_names_the_written_time() {
 /// η = 0 prediction of the initial estimates (the row's multiplier entry is a neutral `1`,
 /// so a check of the row alone passes every such model), and the message names that
 /// prediction. The control, positive at every prediction, raises nothing.
+///
+/// The advice is about the form over the prediction, not the covariate-cell cause a
+/// prediction-free magnitude gets (#3125 review 5), and the value is `IPRED` on its own
+/// natural scale: the LTBS twin must name the same number, where the log-scale `f` it is
+/// scored on would differ.
 #[test]
 fn the_residual_magnitude_check_reads_the_prediction() {
-    let src = |mag: &str| {
+    let src = |lhs: &str, mag: &str| {
         format!(
             "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  \
              sigma ADD_ERR ~ 1.0 (variance) FIX\n[individual_parameters]\n  CL = TVCL * \
              exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
-             v=V)\n[error_model]\n  DV ~ additive(ADD_ERR * {mag})\n[covariates]\n  \
+             v=V)\n[error_model]\n  {lhs} ~ additive(ADD_ERR * {mag})\n[covariates]\n  \
              WPSE continuous\n"
         )
     };
     let pop = moved_subject("WPSE", [1.0, 1.0, 1.0]);
-    let codes = |mag: &str| -> Vec<String> {
-        let model = parse_model_string(&src(mag)).expect("parse");
+    let codes = |lhs: &str, mag: &str| -> Vec<String> {
+        let model = parse_model_string(&src(lhs, mag)).expect("parse");
         check_model_data(&model, &pop)
             .into_iter()
             .filter(|d| d.code == "E_RUV_MAGNITUDE_NONPOSITIVE")
             .map(|d| d.message)
             .collect()
     };
-    assert!(codes("(1 + abs(IPRED))").is_empty());
-    let msg = codes("(0 - abs(IPRED))").pop().expect("a negative h(f) is an error");
-    assert!(msg.contains("sigma slot 0") && msg.contains("at the η = 0 prediction"), "{msg}");
+    assert!(codes("DV", "(1 + abs(IPRED))").is_empty());
+    let msg = codes("DV", "(0 - abs(IPRED))").pop().expect("a negative h(f) is an error");
+    assert!(
+        msg.contains("sigma slot 0") && msg.contains("at the η = 0 prediction IPRED = "),
+        "{msg}"
+    );
+    assert!(msg.contains("its form stays positive over the range the prediction takes"), "{msg}");
+    assert!(!msg.contains("The usual cause"), "{msg}");
+    let ipred = |m: &str| -> f64 {
+        let tail = &m[m.find("IPRED = ").expect("names IPRED") + 8..];
+        tail[..tail.find(' ').expect("a separator")].parse().expect("a number")
+    };
+    let ltbs = codes("log(DV)", "(0 - abs(IPRED))").pop().expect("the LTBS twin is an error");
+    let (nat, log) = (ipred(&msg), ipred(&ltbs));
+    assert!(nat > 0.0 && (nat.ln() - nat).abs() > 0.1, "the twin must tell exp(f) from f: {nat}");
+    assert!((log - nat).abs() <= 1e-12 * nat, "LTBS names IPRED {log}, natural {nat}");
 }
 
 /// `E_THETA_GATHER_INDEX_RANGE`: a 0-based index on the moved observation.
