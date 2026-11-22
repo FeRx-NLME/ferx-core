@@ -1310,7 +1310,13 @@ impl<'a> SubjectScoreContext<'a> {
         Some((g, b))
     }
 
-    fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
+    /// Subject `subject`'s AGQ objective at `xv` with its mode re-solved at the score's inner
+    /// tolerance or, `tight`, at its #2406 twin's τ/100, which also rejects a solve that fell to
+    /// Nelder–Mead.
+    fn reconverged_nll(
+        &self, subject: &Subject, xv: &[f64], joint_warm: &[f64], tight: bool,
+    ) -> Option<f64> {
+        use crate::estimation::fd_resolution::{ebe_resolved, tight_tol};
         use crate::estimation::parameterization::{compute_mu_k, unpack_params};
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
@@ -1322,13 +1328,14 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            self.fd_inner_tol,
+            if tight { tight_tol(self.fd_inner_tol) } else { self.fd_inner_tol },
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
         );
         if ebe.hard_reject
             || !ebe.converged
+            || (tight && !ebe_resolved(&ebe))
             || !ebe.nll.is_finite()
             || ebe.nll >= SUBJECT_SENTINEL_NLL
         {
@@ -1358,58 +1365,41 @@ impl<'a> SubjectScoreContext<'a> {
         self.finite_difference_score(subject, joint_warm, true)
     }
 
-    /// `salvage`: a probe that fails at a live `x` takes the one-sided difference against the
-    /// centre value (both failing leaves that coordinate 0), as `central_diff_packed_gated`
-    /// does; without it any failed probe is `None`. `None` with `salvage` is only a subject
-    /// repelled (or cancelled) at `x` itself.
+    /// The reconverged central difference of the subject's AGQ objective, through the outer
+    /// gradient's [`central_diff_packed_gated`](crate::estimation::outer_optimizer::central_diff_packed_gated),
+    /// so a `|θ₀|`-floored step passes the #2406 resolution gate (#2678). `None` when the
+    /// objective at `x` is not usable. With `salvage`, a probe that fails takes the helper's
+    /// one-sided difference against the centre (both failing leaves that coordinate 0).
+    /// Without it, a probe that fails at a coordinate's first step declines the score, as
+    /// before #2678; one that fails only at a floor the gate grew to keeps what the smaller
+    /// floors resolved, the gate's own policy.
     fn finite_difference_score(
         &self, subject: &Subject, joint_warm: &[f64], salvage: bool,
     ) -> Option<Vec<f64>> {
-        let f0 = self.reconverged_nll(subject, self.x, joint_warm)?;
-        let mut g = vec![0.0; self.x.len()];
-        for k in 0..self.x.len() {
-            if self.fixed[k] {
-                continue;
-            }
-            let floor =
-                crate::estimation::parameterization::fd_step_floor(self.template, self.model, k);
-            let h = crate::estimation::parameterization::fd_step(1e-4, self.x[k], floor);
-            let mut xp = self.x.to_vec();
-            let mut xm = self.x.to_vec();
-            xp[k] = (self.x[k] + h).min(self.bounds.upper[k]);
-            xm[k] = (self.x[k] - h).max(self.bounds.lower[k]);
-            let width = xp[k] - xm[k];
-            if width.abs() < 1e-16 {
-                continue;
-            }
-            let fp = self.reconverged_nll(subject, &xp, joint_warm);
-            let fm = self.reconverged_nll(subject, &xm, joint_warm);
-            let probes = (fp, fm);
-            g[k] = match difference_with_salvage(self.x[k], (xm[k], xp[k]), f0, probes, salvage) {
-                Some(d) => d,
-                None if salvage => 0.0,
-                None => return None,
-            };
-        }
-        Some(g)
+        use crate::estimation::parameterization::{fd_step, fd_step_floors};
+        self.reconverged_nll(subject, self.x, joint_warm, false)?;
+        let floor = fd_step_floors(self.template, self.model);
+        let first_step = |xv: &[f64]| {
+            (0..xv.len()).find(|&k| xv[k] != self.x[k]).is_none_or(|k| {
+                (xv[k] - self.x[k]).abs() <= fd_step(1e-4, self.x[k], floor[k]) * (1.0 + 1e-12)
+            })
+        };
+        let missing = std::cell::Cell::new(false);
+        let tight = |xv: &[f64]| self.reconverged_nll(subject, xv, joint_warm, true);
+        let g = crate::estimation::outer_optimizer::central_diff_packed_gated(
+            self.x,
+            &self.fixed,
+            &floor,
+            self.bounds,
+            |xv| {
+                let v = self.reconverged_nll(subject, xv, joint_warm, false);
+                missing.set(missing.get() || (v.is_none() && first_step(xv)));
+                v.unwrap_or(f64::NAN)
+            },
+            Some(&tight),
+        );
+        (salvage || !missing.get()).then_some(g)
     }
-}
-
-/// The difference of one coordinate's probes `(f(xm), f(xp))` around `x0` (value `f0`): central
-/// when both solved. With `salvage` a failed probe at a live `x0` takes the one-sided
-/// difference against `f0`, as `central_diff_packed_gated` does; both failing, or a
-/// non-finite result, is `None`. Without it any failed probe is `None`.
-fn difference_with_salvage(
-    x0: f64, (xm, xp): (f64, f64), f0: f64, (fp, fm): (Option<f64>, Option<f64>), salvage: bool,
-) -> Option<f64> {
-    let d = match (fp, fm) {
-        (Some(fp), Some(fm)) => (fp - fm) / (xp - xm),
-        _ if !salvage => return None,
-        (Some(fp), None) => (fp - f0) / (xp - x0),
-        (None, Some(fm)) => (f0 - fm) / (x0 - xm),
-        (None, None) => return None,
-    };
-    d.is_finite().then_some(d)
 }
 
 /// Use analytic scores where possible and reconverge only subjects needing numerical scores.
@@ -2448,24 +2438,5 @@ mod tests {
         });
         assert_starts_at_modes("AGQ FD score", &rec, |_| true, &pop, &etas, &kappas);
         assert_solves_at_stencil_tol("AGQ FD score", &rec, |_| true, opts.inner_tol);
-    }
-
-    /// #3034 review 2: a probe that fails at a live `x` is differenced one-sidedly, never
-    /// zero-filled; a repelled `x` (no `f0`) is the caller's `None`. `f = x^2` at 1.0, so the
-    /// derivative is 2 and a one-sided step of 0.01 reads 2.01 / 1.99.
-    /// Mutation: return `Some(0.0)` for a failed probe -> the two one-sided asserts die;
-    /// ignore `salvage` -> the `!salvage` assert dies.
-    #[test]
-    fn a_failed_probe_at_a_live_point_is_differenced_one_sidedly() {
-        let f = |x: f64| x * x;
-        let (x0, xm, xp) = (1.0, 0.99, 1.01);
-        let f0 = f(x0);
-        let up = difference_with_salvage(x0, (xm, xp), f0, (Some(f(xp)), None), true).unwrap();
-        let down = difference_with_salvage(x0, (xm, xp), f0, (None, Some(f(xm))), true).unwrap();
-        assert!((up - 2.01).abs() < 1e-12 && (down - 1.99).abs() < 1e-12, "{up} {down}");
-        let both = difference_with_salvage(x0, (xm, xp), f0, (Some(f(xp)), Some(f(xm))), true);
-        assert!((both.unwrap() - 2.0).abs() < 1e-12);
-        assert_eq!(difference_with_salvage(x0, (xm, xp), f0, (None, None), true), None);
-        assert_eq!(difference_with_salvage(x0, (xm, xp), f0, (Some(f(xp)), None), false), None);
     }
 }

@@ -10939,6 +10939,83 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
 }
 
+/// #2678: the AGQ finite-difference score steps a small identity-packed θ by its `|θ₀|` floor,
+/// so on an O(1)-sensitivity θ (`CL ∝ 2^(BE + c)`, `BE` declared at `1e-4`) its re-solved
+/// probes stop inside τ and the difference is that of a part-reconverged objective. Through
+/// `central_diff_packed_gated` the #2406 gate grows that step until the τ/100 twin agrees.
+/// Measured (macOS arm64), the forced-FD population gradient's `BE` entry against the exact
+/// route's: 3.0e-3 relative ungated, 5.1e-10 gated; 2.7e-8 with `BE` declared at 1 (floor 1).
+#[test]
+fn an_agq_fd_score_resolves_a_small_exponents_step() {
+    use crate::types::{EstimationMethod, FitOptions, Population};
+    let t0 = 1e-4;
+    let src = format!(
+        "[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta BE({t0:e}, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * 2^(BE + {c:e})
+  V  = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+        c = 0.3 - t0
+    );
+    let model = parse_model_string(&src).unwrap();
+    let params = model.default_params.clone();
+    let x = pack_params(&params);
+    let k = model.theta_names.iter().position(|n| n == "BE").unwrap();
+    assert_eq!(x[k], t0, "fixture: BE is identity-packed at its declared value");
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let dose = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let subjects: Vec<Subject> = [[0.2, -0.1], [-0.3, 0.15], [0.1, 0.2]]
+        .iter()
+        .enumerate()
+        .map(|(i, e)| Subject { id: format!("{}", i + 1), ..subject(&model, dose(), &times, e) })
+        .collect();
+    let etas: Vec<_> = subjects.iter().map(|s| ebe_for(&model, s, &params, 1e-12, true)).collect();
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let options =
+        FitOptions { method: EstimationMethod::Laplace, n_agq: 3, ..FitOptions::default() };
+    let g = |force_fd: bool| {
+        crate::estimation::agq::population_gradient_mixed(
+            &model,
+            &population,
+            &params,
+            &x,
+            &etas,
+            &vec![Vec::new(); 3],
+            &crate::estimation::parameterization::compute_bounds(&params),
+            &options,
+            force_fd,
+            None,
+            None,
+            None,
+        )
+        .expect("population gradient")[k]
+    };
+    let (exact, fd) = (g(false), g(true));
+    let rel = (fd - exact).abs() / exact.abs();
+    eprintln!("MEASURE #2678 agq FD score BE: {fd:e} vs exact {exact:e}, rel {rel:e}");
+    assert!(exact.abs() > 1.0, "fixture: a live gradient ({exact})");
+    assert!(rel < 1e-6, "rel {rel:e}");
+}
+
 /// A linear `[odes]` model whose infusion end moves with η (`D1`, `RATE=-2`).
 const ONE_CPT_D1_ODE: &str = r#"
 [parameters]

@@ -1662,6 +1662,7 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
 /// but the last is still thrown away, since its points are at a step the stencil does not use.
 ///
 /// Returns `None` when the step was cancelled, in the probe or the stencil.
+#[cfg(test)]
 pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize, x_hat: &[f64], free_idx: &[usize], floor: &[f64], initial_eps: f64, f0: f64, ofv: &F,
     options: &FitOptions,
