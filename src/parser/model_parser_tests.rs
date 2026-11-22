@@ -36518,7 +36518,9 @@ fn ipred_in_a_magnitude_is_natural_scale_under_ltbs() {
 fn ipred_under_an_unsupported_construct_is_refused() {
     for (arg, want) in [
         ("EPS * floor(IPRED)", "`floor(...)` cannot take `IPRED`"),
-        ("EPS * (if (IPRED > 1) 2 else 1)", "`if (...)` cannot take `IPRED`"),
+        ("EPS * (if (IPRED > 1) 2 else 1)", "an `if`, `min` or `max` cannot take `IPRED`"),
+        // `max` desugars to a conditional; the message must name what the user wrote.
+        ("EPS * max(1, IPRED)", "an `if`, `min` or `max` cannot take `IPRED`"),
     ] {
         let err = expect_parse_err(&ipred_magnitude_str(&format!("DV ~ additive({arg})")));
         assert!(err.contains(want), "{arg}: {err}");
@@ -36539,21 +36541,64 @@ fn ipred_refusals_name_the_construct_the_user_wrote() {
     assert!(err.contains("power exponent may not reference `IPRED`"), "{err}");
     assert!(err.contains("may be read in a residual-magnitude expression"), "{err}");
     assert!(!err.contains("property of the datum"), "{err}");
+    // The allowed-names list is the construct's own (#3125 review 4): a magnitude may read
+    // `IPRED` and its sigma, a power exponent neither.
+    let err = expect_parse_err(&ipred_magnitude_str("DV ~ additive(EPS * (1 + PRED))"));
+    assert!(err.contains("TAD, IPRED, covariates") && err.contains("and the sigma"), "{err}");
+    let err = expect_parse_err(&ipred_magnitude_str("DV ~ power(EPS, 1 + PRED)"));
+    assert!(err.contains("power exponent may not reference `PRED`"), "{err}");
+    assert!(!err.contains("IPRED, covariates") && !err.contains("sigma"), "{err}");
+}
+
+/// A declared `IPRED` covariate would be the column everywhere else and the prediction in
+/// the magnitude, silently (#3125 review 1): refused, naming both readings. Without the
+/// declaration the same magnitude reads the prediction.
+#[test]
+fn a_declared_ipred_covariate_is_not_silently_read_as_the_prediction() {
+    let error = "DV ~ additive(EPS * (1 + abs(IPRED)))";
+    let declared =
+        ipred_magnitude_str(error).replace("  NIND continuous\n", "  IPRED continuous\n");
+    let err = expect_parse_err(&declared);
+    assert!(err.contains("references `IPRED`") && err.contains("individual prediction"), "{err}");
+    assert!(err.contains("covariate named `IPRED` is also declared"), "{err}");
+    assert!(parse_model_string(&ipred_magnitude_str(error)).unwrap().ruv_reads_prediction());
 }
 
 /// A `[structural_model]` name is a prediction-side name, not an undeclared covariate:
 /// the message points to `IPRED`, not to `[covariates]` (where declaring it is a second
-/// refusal). Both constructs, and both kinds of name (an intermediate and the readout).
+/// refusal). Both constructs, and every block that assigns one: a `[structural_model]`
+/// intermediate and readout, an `[odes]` state and an indexed `[scaling]` readout.
 #[test]
 fn a_structural_name_in_a_magnitude_or_weight_gets_its_own_message() {
-    for (error, what, name) in [
-        ("DV ~ additive(EPS * (1 + abs(EFF)))", "residual-magnitude expression", "EFF"),
-        ("DV ~ additive(EPS) weight = 1 + abs(y)", "`weight =` expression", "y"),
+    let ode = |error: &str| {
+        pkpd_magnitude_str(&format!("  CMT=1: {error}\n  CMT=2: DV ~ proportional(PROP_ERR_PK)\n"))
+    };
+    for (src, what, name) in [
+        (
+            ipred_magnitude_str("DV ~ additive(EPS * (1 + abs(EFF)))"),
+            "residual-magnitude expression",
+            "EFF",
+        ),
+        (
+            ipred_magnitude_str("DV ~ additive(EPS) weight = 1 + abs(y)"),
+            "`weight =` expression",
+            "y",
+        ),
+        (
+            ode("DV ~ additive(ADD_ERR_PD * (1 + effect))"),
+            "residual-magnitude expression",
+            "effect",
+        ),
+        (ode("DV ~ additive(ADD_ERR_PD * (1 + y))"), "residual-magnitude expression", "y"),
     ] {
-        let err = expect_parse_err(&ipred_magnitude_str(error));
-        assert!(err.contains(&format!("{what} references `{name}`")), "{error}: {err}");
-        assert!(err.contains("prediction side") && err.contains("`IPRED`"), "{error}: {err}");
-        assert!(!err.contains("[covariates]"), "{error}: {err}");
+        let err = expect_parse_err(&src);
+        assert!(err.contains(&format!("{what} references `{name}`")), "{name}: {err}");
+        assert!(err.contains("[structural_model] / [scaling] / [odes]"), "{name}: {err}");
+        assert!(
+            err.contains("prediction as `IPRED`") && err.contains("intermediate"),
+            "{name}: {err}"
+        );
+        assert!(!err.contains("[covariates]"), "{name}: {err}");
     }
     // A genuinely undeclared name keeps the covariate advice.
     let err = expect_parse_err(&ipred_magnitude_str("DV ~ additive(EPS * NOPE)"));

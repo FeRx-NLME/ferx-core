@@ -21798,15 +21798,22 @@ fn validate_ruv_expr(
                         }
                         _ => "",
                     };
+                    // The list is what *this* construct may read: `IPRED` only in a
+                    // magnitude, the sigma only where one is scaled (#3125 review 4).
+                    let ipred = if what == RUV_MAG_LABEL { "IPRED, " } else { "" };
+                    let sigma = if sigma_name.is_some() { " and the sigma" } else { "" };
                     err = Some(format!(
-                        "{what} may not reference `{name}` (only TIME, TAD, covariates, thetas, \
-                         η-free [individual_parameters] names and the sigma are allowed){hint}"
+                        "{what} may not reference `{name}` (only TIME, TAD, {ipred}covariates, \
+                         thetas{}η-free [individual_parameters] names{sigma} are allowed){hint}",
+                        if sigma.is_empty() { " and " } else { ", " }
                     ));
                 } else if prediction_names.iter().any(|p| p == name) {
                     err = Some(format!(
                         "{what} references `{name}`, which the model computes on the prediction \
-                         side ([structural_model] / [odes]), so it cannot be read here. Read the \
-                         prediction as `IPRED` in a residual-magnitude expression instead"
+                         side ([structural_model] / [scaling] / [odes]), so it cannot be read \
+                         here. A residual-magnitude expression reads the model's prediction as \
+                         `IPRED`; an intermediate or a state other than the prediction is not \
+                         readable"
                     ));
                 } else if !name.eq_ignore_ascii_case("TIME")
                     && !is_declared_level_index_column(name)
@@ -21936,11 +21943,13 @@ fn at_error_endpoint(label: &str, err: String) -> String {
 }
 
 /// The names the prediction side assigns — `NAME = …` in `[structural_model]` and
-/// `[scaling]`, `d/dt(NAME)` in `[odes]` — so a residual magnitude reading one is told
-/// it is a prediction-side name rather than an undeclared covariate (#3121).
+/// `[scaling]` (also an indexed readout `NAME[CMT=1] = …`), `d/dt(NAME)` in `[odes]` — so a
+/// residual magnitude reading one is told it is a prediction-side name rather than an
+/// undeclared covariate (#3121).
 fn prediction_side_names(blocks: &HashMap<String, Vec<String>>) -> Vec<String> {
-    static ASSIGN_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^\s*(?:d/dt\(\s*)?([A-Za-z_]\w*)\s*\)?\s*=").unwrap());
+    static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\s*(?:d/dt\(\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?\)?\s*=").unwrap()
+    });
     ["structural_model", "scaling", "odes"]
         .iter()
         .filter_map(|b| blocks.get(*b))
@@ -22036,7 +22045,8 @@ fn split_ipred_node(
                 _ => return Err(ipred_unsupported(&format!("`{name}(...)`"))),
             },
         ),
-        Expression::Conditional(..) => return Err(ipred_unsupported("`if (...)`")),
+        // `min` / `max` desugar to a conditional, so name all three (#3125 review 3).
+        Expression::Conditional(..) => return Err(ipred_unsupported("an `if`, `min` or `max`")),
         _ => return Err(ipred_unsupported("this construct")),
     };
     for a in args {
@@ -22135,7 +22145,21 @@ fn build_ruv_magnitude(
             renormalize_rewritten_gathers(&mut expr)
                 .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
         }
-        let (ops, parts) = if allow_ipred && reads_ipred(&expr) {
+        let reads_pred = allow_ipred && reads_ipred(&expr);
+        // A declared `IPRED` column would be read as the prediction here and as the
+        // column everywhere else: two meanings with no message, refused as `TAD` is
+        // (#3125 review 1).
+        let declared = allowed_covs.iter().flatten().find(|c| c.eq_ignore_ascii_case("IPRED"));
+        if let Some(col) = declared.filter(|_| reads_pred) {
+            return Err(format!(
+                "[error_model] {label} `{src}` references `IPRED`, which here is the model's \
+                 individual prediction, but a covariate named `{col}` is also declared in \
+                 [covariates] and the rest of the model reads that column. To read the column, \
+                 rename it (in the data and in [covariates]); to read the prediction, drop \
+                 `{col}` from [covariates]"
+            ));
+        }
+        let (ops, parts) = if reads_pred {
             let (mut ops, mut leaves) = (Vec::new(), Vec::new());
             split_ipred(&expr, ltbs, &mut ops, &mut leaves)
                 .map_err(|e| format!("[error_model] {label} `{src}`: {e}"))?;
