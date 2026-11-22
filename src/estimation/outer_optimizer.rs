@@ -4806,14 +4806,13 @@ pub(crate) fn optimize_nlopt(
         }
         (restarted, restarted_cause, verified)
     };
-    // The probe. With `chain`, its leg runs the fit's own restart chain
-    // ([`resolve_restart_chain`]) before its verdict is read (#2707): from a perturbation of
-    // a restart's point, on a multimodal inner problem, the probe's warm EBEs can be trapped
-    // as the fit's were, and a probe stopped at a basin shift has not finished — it would
-    // return no verdict on a start that is an optimum. The chain's last restart cause is not
-    // carried on: the probe has had its restarts. The first attempt's probe keeps #2506's
-    // single leg.
-    let probe_for = |chain: bool| {
+    // The probe. Its leg runs the fit's own restart chain ([`resolve_restart_chain`]) before
+    // its verdict is read (#2707, #2905): from a perturbation of the start, on a multimodal
+    // inner problem, the probe's warm EBEs can be trapped as the fit's were, and a probe
+    // stopped at a basin shift has not finished — it would return no verdict on a start that
+    // is an optimum. The chain's last restart cause is not carried on: the probe has had its
+    // restarts.
+    let probe = {
         let (restart_leg, probed, penalized) = (&restart_leg, &probed, &penalized);
         move |start: &ModelParameters, start_ofv: f64, spent_evals: usize| {
             // Its covariance step is deferred like every attempt's: `optimize_nlopt` runs it
@@ -4831,24 +4830,19 @@ pub(crate) fn optimize_nlopt(
                 identity_scales,
                 true,
             );
-            let (result, cause) = if chain {
-                let finished = resolve_restart_chain(
-                    options.verbose,
-                    crate::cancel::is_cancelled(&options.cancel),
-                    (result, outcome.restart_cause()),
-                    |stalled, cause| {
-                        restart_leg(
-                            stalled,
-                            cause,
-                            RestartLegOwner::Probe { spent_before: spent_evals },
-                        )
-                    },
-                    penalized,
-                );
-                (finished, None)
-            } else {
-                (result, outcome.restart_cause())
-            };
+            let result = resolve_restart_chain(
+                options.verbose,
+                crate::cancel::is_cancelled(&options.cancel),
+                (result, outcome.restart_cause()),
+                |stalled, cause| {
+                    restart_leg(
+                        stalled,
+                        cause,
+                        RestartLegOwner::Probe { spent_before: spent_evals },
+                    )
+                },
+                penalized,
+            );
             let verdict = start_probe_verdict(start_ofv, penalized(&result), result.converged);
             if options.verbose {
                 eprintln!(
@@ -4859,11 +4853,10 @@ pub(crate) fn optimize_nlopt(
                     result.converged,
                 );
             }
-            *probed.borrow_mut() = Some((result, cause, verdict));
+            *probed.borrow_mut() = Some((result, None, verdict));
         }
     };
-    let (first_probe, restart_probe) = (probe_for(false), probe_for(true));
-    let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&first_probe));
+    let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&probe));
     let first_attempt =
         settle_start_probe((first, first_cause), first_left_init, probed.take(), &penalized);
     let (first, restart_cause) = resolve_stall_retry(
@@ -4882,7 +4875,7 @@ pub(crate) fn optimize_nlopt(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
-        |stalled, cause| restart_leg(stalled, cause, RestartLegOwner::Fit(&restart_probe)),
+        |stalled, cause| restart_leg(stalled, cause, RestartLegOwner::Fit(&probe)),
         &penalized,
     );
     // The covariance step, once, on the attempt reported, at the exact packed vector it
