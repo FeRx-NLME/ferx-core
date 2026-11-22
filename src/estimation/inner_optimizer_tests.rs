@@ -3791,7 +3791,8 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
 /// two modes that differ only in the Ω penalty: the deeper one at η ≈ (0, 0, −3.90) and a
 /// twin at η ≈ (0, +1.58, −2.34) (ka = 0.1, V = 50). BFGS from η = 0 lands in the twin. The
 /// twin is well curved, so `weakly_identified_coords` does not flag it (#2013); `reset`
-/// adds an inert reset before the dose so the subject takes the scan-every-coordinate arm.
+/// adds a reset after the data, which changes no prediction, so the subject takes the
+/// scan-every-coordinate arm.
 /// NONMEM 7.5.1 at the same estimates agrees on both modes (#2013's comparison).
 fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
     use crate::types::{DoseEvent, Subject};
@@ -3814,13 +3815,39 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
         obs_times,
         observations,
         obs_cmts: vec![1; n],
-        reset_times: if reset { vec![0.0] } else { Vec::new() },
+        // After the last observation: a reset on the first record is a no-op and takes no
+        // reset arm (#2081), and one after the data changes no prediction.
+        reset_times: if reset { vec![100.0] } else { Vec::new() },
         cens: vec![0; n],
         ..Default::default()
     };
-    assert_eq!(subject.has_resets(), reset, "test premise: reset arm");
+    assert_eq!(subject.has_effective_resets(), reset, "test premise: reset arm");
     assert!(!subject.has_tv_covariates());
     (model, subject)
+}
+
+/// #2081: a reset on the subject's first record is a no-op, so the subject multi-starts as
+/// one with no reset does, not on the scan-every-coordinate arm a reset after the data takes.
+/// On the flip-flop fixture the two arms end in different modes (the scan finds the deeper
+/// one, #2013), so agreeing with the no-reset solve is not both arms agreeing. A reset sends
+/// the predictions down the event-driven walk, so the objectives agree to rounding, not bits.
+#[test]
+fn a_first_record_reset_multistarts_like_no_reset() {
+    let (model, plain) = flipflop_fixture(false);
+    let (_, after) = flipflop_fixture(true);
+    let first = Subject { reset_times: vec![0.0], ..plain.clone() };
+    assert!(first.has_resets() && !first.has_effective_resets());
+    let solve = |s: &Subject| find_ebe(&model, s, &model.default_params, 200, 1e-8, None, None, 1);
+    let (none, inert, scanned) = (solve(&plain), solve(&first), solve(&after));
+    assert!(
+        none.eta[2] > -3.0 && scanned.eta[2] < -3.5,
+        "premise: the two arms end in different modes; η_KA {} and {}",
+        none.eta[2],
+        scanned.eta[2]
+    );
+    let gap = (inert.eta.clone() - none.eta.clone()).amax();
+    assert!(gap < 1e-6, "the first-record reset took the scan arm: η gap {gap:e}");
+    assert!((inert.nll - none.nll).abs() < 1e-8, "{} vs {}", inert.nll, none.nll);
 }
 
 /// #2014: every estimating fit hands the inner loop `Some(zeros)` on its first evaluation

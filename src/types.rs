@@ -1408,6 +1408,24 @@ impl Subject {
         !self.reset_times.is_empty()
     }
 
+    /// Whether some reset can change the state: one that a dose, observation or other record
+    /// precedes (#2081). A reset on the subject's first record re-seeds the state the solve
+    /// starts from, so it is a no-op; the reader shifts a reset that is not first past every
+    /// record before it, so the shifted times decide, and a record that ties it in time but
+    /// comes first in the file still counts. A subject with endpoint records counts as having
+    /// one whenever it has a reset. A leading row the reader dropped (`W_MISSING_DV`) is no
+    /// record, so a reset after it alone is inert, as is the integration that starts there.
+    pub(crate) fn has_effective_resets(&self) -> bool {
+        if !self.has_resets() {
+            return false;
+        }
+        let first = (self.doses.iter().map(|d| d.time))
+            .chain(self.obs_times.iter().copied())
+            .chain(self.pk_only_times.iter().copied())
+            .fold(f64::INFINITY, f64::min);
+        !self.obs_records.is_empty() || self.reset_times.iter().any(|&t| t > first)
+    }
+
     /// True when this subject turns a compartment off (`EVID=2`, `CMT=-N`, #2732).
     pub fn has_cmt_toggles(&self) -> bool {
         !self.cmt_toggles.is_empty()
