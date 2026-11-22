@@ -10221,8 +10221,8 @@ fn declined_subject_gradient(
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
-/// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
-/// [`resolve_outer_optimizer`]),
+/// a derivative-free BOBYQA fit (including a mixture's `Auto` resolved to BOBYQA off the
+/// analytic gradient by [`resolve_outer_optimizer`]),
 /// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
 /// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
 /// the end with an empty log and say nothing.

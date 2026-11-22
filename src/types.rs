@@ -9002,7 +9002,8 @@ pub struct FitResult {
     /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
     /// the setting and what actually ran. An explicit choice is reported as what
     /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
-    /// mixture objective with BOBYQA, reported `"bobyqa"` (#1540). SAEM/GN/IMP
+    /// mixture objective with what [`Optimizer::Auto`] resolves to, reported as such
+    /// (e.g. `"nlopt_lbfgs"` on the exact gradient; #1540, #3025). SAEM/GN/IMP
     /// report their own fixed labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa").
     /// Always populated; the label is the same regardless of method chain length.
     /// Consumers that
@@ -10663,7 +10664,8 @@ impl CompiledModel {
 pub enum Optimizer {
     /// Pick the outer optimizer from the model (default): [`Optimizer::NloptLbfgs`] with an
     /// analytic gradient, [`Optimizer::Bobyqa`] on FD, `NloptLbfgs` above
-    /// [`BOBYQA_MAX_DIM`]; mixtures always take `Bobyqa` (outer dispatch). Benchmarks (#490).
+    /// [`BOBYQA_MAX_DIM`]. A `[mixture]` model follows the same rule on the exact mixture
+    /// gradient (#3025). Benchmarks (#490).
     /// See [`Optimizer::resolve_auto`].
     Auto,
     Bfgs,

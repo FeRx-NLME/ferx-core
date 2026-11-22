@@ -265,8 +265,8 @@ pub fn fit_from_files(
 /// itself dispatches on — and not a second copy of the rule (#1540). `auto` is reported
 /// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model replaces an
 /// explicit optimizer that cannot carry the mixture objective (built-in BFGS/L-BFGS,
-/// trust-region) with NLopt L-BFGS; that replacement is reported as `nlopt_lbfgs`,
-/// and the outer loop's downgrade warning says why. `has_mixture` is the same
+/// trust-region) with what `auto` resolves to (#3025); that replacement is reported under
+/// its own label (e.g. `nlopt_lbfgs`), and the outer loop's downgrade warning says why. `has_mixture` is the same
 /// `init_params.mixture.is_some()` the outer loop keys on.
 pub(crate) fn reported_optimizer_label(
     method: EstimationMethod, options: &FitOptions, model: &CompiledModel, has_mixture: bool,
@@ -1087,9 +1087,9 @@ fn fit_unstamped(
     // The same checks the post-fit entry points run; `fit` returns their message.
     crate::api::check_theta_length(model, &init_params.theta)?;
     crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
-    // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
-    // objective via the derivative-free (BOBYQA) outer optimizer. Estimators the mixture
-    // objective is not wired for, FOCEI quadrature and per-class Ω/Σ under Bayes are
+    // Mixture models (#977). The K-fold log-sum-exp objective runs the outer optimizer
+    // `resolve_outer_optimizer` picks, `auto` as for a single population (#3025).
+    // Estimators the mixture objective is not wired for and per-class Ω/Σ under Bayes are
     // refused rather than silently ignoring the mixture structure; so are `init_params`
     // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion
     // variability under a mixture fits (#985): the per-class inner solve carries the shared
