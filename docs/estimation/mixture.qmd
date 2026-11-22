@@ -174,9 +174,9 @@ and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907)
 - **Empty class.** No subject's posterior probability of the class reaches 0.01.
 
 The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ
-estimated. Started from clearances 1.70 / 1.71, FOCEI with L-BFGS ends in a collapsed optimum
-(OFV 310.02, class clearances 1.71 / 1.76, ω_CL 0.35, which absorbs the
-bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
+estimated. Started from the near-symmetric clearances 1.70 / 1.701, FOCEI with L-BFGS
+ends in a collapsed optimum (OFV 310.02, class clearances 1.73 / 1.74, ω_CL 0.35, which
+absorbs the bimodality). There the largest factor is 0.009. At the two-class optimum (OFV 299.86)
 it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
 `mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at
 −9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
@@ -184,14 +184,20 @@ it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
 The warning does not change the fit. A start with near-identical classes is a
 near-symmetric point of the objective, where the gradient barely separates the classes
 and the fit can settle on a saddle (at the collapsed optimum above the exact
-R-matrix has one negative eigenvalue, $-0.18$ against a largest of $5.5\times10^{3}$).
+R-matrix has one negative eigenvalue, $-0.04$ against a largest of $5.5\times10^{3}$,
+while at the two-class optimum it is positive definite).
 With exactly symmetric starts in exchangeable classes, the derivative in the direction that
 separates the classes is zero. Give the classes distinct starting values to keep using
 L-BFGS. If the warning fires, move the class starts further apart and compare the objectives:
 on the fixture above, a start of 1.2 / 2.5 reaches 299.86 under the default L-BFGS.
-Changing the optimizer is not a reliable fix, because neither one escapes every
-symmetric start: from 1.70 / 1.71, `optimizer = bobyqa` reaches 299.86 under FOCEI but
-collapses under `n_agq = 3` (OFV 310.88), where the default L-BFGS reaches 300.17.
+Since its verification leg leaves the collapsed saddle (#2837), the default L-BFGS
+reaches 299.86 under FOCEI from nine starts with class clearances 0.005 to 0.20 apart
+(1.705 / 1.71 to 1.60 / 1.80), and 300.16 under `n_agq = 3` from 1.70 / 1.71. From
+1.70 / 1.701, 0.001 apart, it still collapses, under FOCEI (310.02) and under `n_agq = 3`
+(310.73). `optimizer = bobyqa` reached the two-class optimum from every start probed,
+1.70 / 1.701 included (299.86 under FOCEI, 300.16 under `n_agq = 3`), so it is a second
+check once the warning fires. A few starts on one dataset do not make it a guarantee, so
+compare the objectives either way.
 
 ## Validation against NONMEM
 
