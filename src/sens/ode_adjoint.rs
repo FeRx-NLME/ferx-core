@@ -427,7 +427,7 @@ fn fixed_ebe_score(
     } else {
         Some(non_gaussian_eta_jets2(model, subject, theta, &eta_hat[..n_bsv])?)
     };
-    let use_pop = ng.is_none() && !interaction && model.error_spec.has_f_dependent_variance();
+    let use_pop = ng.is_none() && !interaction && model.has_f_dependent_variance();
     // FOCE's variance point f(η = 0) is needed before the objective can be scored; its
     // values come from one plain evaluation, its θ-derivatives from its own recording below.
     let fpop = if use_pop {
@@ -622,15 +622,13 @@ fn fixed_ebe_score_iov(
     } else {
         Some(non_gaussian_eta_jets2(model, subject, theta, &eta[..n_bsv])?)
     };
-    let pop =
-        if n_obs > 0 && ng.is_none() && !interaction && model.error_spec.has_f_dependent_variance()
-        {
-            let zeros = vec![0.0; sc.width];
-            let f64l = crate::sens::num::vm::Layout::F64;
-            Some(plan_forward(sc.pop_model, subject, lay, theta, &zeros, f64l)?)
-        } else {
-            None
-        };
+    let pop = if n_obs > 0 && ng.is_none() && !interaction && model.has_f_dependent_variance() {
+        let zeros = vec![0.0; sc.width];
+        let f64l = crate::sens::num::vm::Layout::F64;
+        Some(plan_forward(sc.pop_model, subject, lay, theta, &zeros, f64l)?)
+    } else {
+        None
+    };
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega(model, subject, template, params, sc.width);
     let pv = ParT::of_with_omega(
@@ -4416,7 +4414,7 @@ fn run(
     // production's objective takes the conditional variance, but the EBE is still the
     // frozen-variance inner objective's stationary point (#1722), so `∇_η l` reads this
     // point either way.
-    let planned_pop = if n_obs > 0 && !interaction && model.error_spec.has_f_dependent_variance() {
+    let planned_pop = if n_obs > 0 && !interaction && model.has_f_dependent_variance() {
         let zeros = vec![0.0; n];
         let f64l = crate::sens::num::vm::Layout::F64;
         Some(plan_forward(pop_model, subject, lay, theta, &zeros, f64l)?)

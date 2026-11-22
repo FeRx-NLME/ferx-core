@@ -27,7 +27,7 @@ use crate::sens::jet::DualT;
 #[cfg(test)]
 use crate::sens::num::NonRecording;
 use crate::sens::num::{wsum3, BranchCmp, PkNum};
-use crate::stats::residual_error::{LoadingForm, RBlocks, ResidualCov};
+use crate::stats::residual_error::{eval_fmag, slot_fmag, LoadingForm, RBlocks, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use std::borrow::Cow;
 
@@ -292,7 +292,7 @@ pub(crate) fn row_loadings_g<T: PkNum>(
     for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
         let c = if form == LoadingForm::Prop {
             // `slot_exponent`: the exponent half of the row, when present.
-            match mult.filter(|m| m.len() == 2 * n_sigma).map(|m| m[n_sigma + idx]) {
+            match mult.filter(|m| m.len() >= 2 * n_sigma).map(|m| m[n_sigma + idx]) {
                 Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
                     if f.br_cmp_c(BranchCmp::Eq, 0.0) {
                         T::from_f64(0.0)
@@ -307,6 +307,12 @@ pub(crate) fn row_loadings_g<T: PkNum>(
             form.coeff_g(f)
         };
         let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
+        // A prediction-reading magnitude `h(f)` (#3121), in `T`: its `f`-, θ- and
+        // η-derivatives come from the types, as every other loading's do.
+        let c = match mult.and_then(|m| slot_fmag(m, n_sigma, idx)) {
+            Some(prog) => eval_fmag(prog, |a| a, f) * c,
+            None => c,
+        };
         *o = (idx, m * c);
     }
     (out, len)
@@ -1196,16 +1202,16 @@ pub(crate) fn data_l<T: PkNum>(
 }
 
 /// A 1-D second-order dual: value, first and second derivative along one direction.
-type D2<T> = DualT<1, DualT<1, T>>;
+pub(crate) type D2<T> = DualT<1, DualT<1, T>>;
 
 /// `x` as a [`D2`] constant.
-fn d2_const<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_const<T: PkNum>(x: T) -> D2<T> {
     let zero = T::from_f64(0.0);
     DualT { v: DualT { v: x, g: [zero] }, g: [DualT { v: zero, g: [zero] }] }
 }
 
 /// `x` as the [`D2`] variable: unit first derivative, zero second.
-fn d2_seed<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_seed<T: PkNum>(x: T) -> D2<T> {
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
     DualT { v: DualT { v: x, g: [one] }, g: [DualT { v: one, g: [zero] }] }
 }

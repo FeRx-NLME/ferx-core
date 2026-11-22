@@ -798,7 +798,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
 pub(crate) fn population_variance_preds(
     model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize,
 ) -> Option<Vec<f64>> {
-    if !model.error_spec.has_f_dependent_variance() {
+    if !model.has_f_dependent_variance() {
         return None;
     }
     let zeros = vec![0.0_f64; n_eta];
@@ -813,7 +813,7 @@ pub(crate) fn population_variance_preds_iov(
     model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize, n_kappa: usize,
     k_occasions: usize,
 ) -> Option<Vec<f64>> {
-    if !model.error_spec.has_f_dependent_variance() {
+    if !model.has_f_dependent_variance() {
         return None;
     }
     let zeros_eta = vec![0.0_f64; n_eta];

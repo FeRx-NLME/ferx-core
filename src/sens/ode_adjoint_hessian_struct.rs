@@ -1316,7 +1316,7 @@ impl CovPlan<'_> {
         let pn = self.pn();
         let nx = self.nx;
         let n_obs = self.subject.observations.len();
-        let f_dep = model.error_spec.has_f_dependent_variance();
+        let f_dep = model.has_f_dependent_variance();
         if along.is_empty() || n_obs == 0 {
             return None;
         }
