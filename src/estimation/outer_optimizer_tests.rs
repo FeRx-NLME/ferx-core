@@ -14961,6 +14961,35 @@ fn a_stall_at_the_inits_stays_flagged_when_the_probe_finds_lower() {
     }
 }
 
+/// #2905: a first attempt's probe already lower than its start is a stall whatever its restart
+/// chain would find, so it is not resumed. On the flip-flop fixture stopped at its inits, the
+/// probe's single leg ends at −3045.877713 in 34 evaluations (macOS arm64); resumed, it ends at
+/// the optimum, −3051.439, in 113, with the same stall reported.
+#[test]
+fn a_first_attempts_probe_already_lower_is_not_resumed() {
+    let dir = "tests/fixtures/flip_flop_pop";
+    let text = std::fs::read_to_string(format!("{dir}/flip_flop_pop.ferx")).expect("model");
+    let parsed = crate::parser::model_parser::parse_full_model(&text).expect("model parses");
+    let mut model = parsed.model;
+    model.name = "first_probe_lower_2905".into();
+    let path = format!("{dir}/flip_flop_pop.csv");
+    let pop = crate::read_nonmem_csv(std::path::Path::new(&path), None, None).expect("data");
+    forced_stop_at_start::set(&model.name, None, false);
+    let opts = FitOptions {
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        verbose: false,
+        run_covariance_step: false,
+        ..parsed.fit_options
+    };
+    let result = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    let reached: f64 = result
+        .warnings
+        .iter()
+        .find_map(|w| w.split("reached OFV = ").nth(1)?.split(',').next()?.parse().ok())
+        .unwrap_or_else(|| panic!("no probe warning: {:?}", result.warnings));
+    assert!(reached > -3050.0 && result.n_iterations < 70, "{reached}, {}", result.n_iterations);
+}
+
 /// #2506, end to end through `fit()`: a refit at a converged fit's estimates comes
 /// back converged, verified as a warm start at the optimum, without `W_STALLED_AT_INIT`,
 /// at the cold fit's objective, and passes `Strictness::default()` — the gate a search's

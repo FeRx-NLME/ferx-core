@@ -182,6 +182,7 @@ fn assert_warm_refit_verified(model: &str) {
     opts.verbose = false;
     opts.run_covariance_step = false;
     let cold = fit(&parsed.model, &population, &parsed.model.default_params, &opts).expect("cold");
+    assert!((cold.ofv - OPTIMUM).abs() < 1e-5, "{model}: precondition, cold {}", cold.ofv);
     let mut warm = parsed.model.default_params.clone();
     warm.theta = cold.theta.clone();
     let (names, diagonal) = (warm.omega.eta_names.clone(), warm.omega.diagonal);
@@ -190,6 +191,8 @@ fn assert_warm_refit_verified(model: &str) {
     let r = fit(&parsed.model, &population, &warm, &opts).expect("warm");
     assert!(r.converged && r.stationary_start, "{model}: {:?}", r.warnings);
     assert!((r.ofv - OPTIMUM).abs() < 1e-5, "{model}: {}", r.ofv);
+    // The probe's chain ran: without it the refits end at 47 / 63 evaluations.
+    assert!(r.n_iterations > 90, "{model}: {} evaluations", r.n_iterations);
     assert!(
         !r.warnings_structured.iter().any(|w| w.category == WarningCode::StalledAtInit),
         "{model}: {:?}",

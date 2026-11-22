@@ -3844,8 +3844,7 @@ fn verified_start_result(
     probe.n_iterations += unmoved.n_iterations;
     // The covariance quartet goes with `packed_estimate` (#816). The covariance step's warnings
     // cannot be told apart from the probe's others, so off NLopt they stay the probe's (a point
-    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point. The
-    // probe's restart cause stays (adopted only when lower).
+    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point.
     if start_wins {
         probe.params = unmoved.params;
         probe.ofv = unmoved.ofv;
@@ -4808,13 +4807,13 @@ pub(crate) fn optimize_nlopt(
     // inner problem, the probe's warm EBEs can be trapped as the fit's were, and a probe
     // stopped at a basin shift has not finished — it would return no verdict on a start that
     // is an optimum. The chain's last restart cause is not carried on: the probe has had its
-    // restarts. The first attempt's probe and the restart legs' (`RestartLegOwner::Fit`)
-    // differ in one thing: a first attempt's probe already lower than its start is a stall
-    // whatever its chain finds (#2506 reports the unmoved run), so it is not resumed — the
-    // chain would only sharpen the objective its warning names (+79 L-BFGS / +179 BOBYQA
-    // evaluations on a flip-flop stall, macOS arm64). A restart's lower probe is the result
-    // reported, so it is.
-    let probe_for = |first: bool| {
+    // restarts. `resume_lower` is the one difference between the restart legs' probe
+    // (`RestartLegOwner::Fit`) and the first attempt's: a restart's probe already lower than
+    // its start is the result reported, so it is resumed; a first attempt's is a stall
+    // whatever its chain finds (#2506 reports the unmoved run), so it is not — the chain
+    // would only sharpen the objective its warning names (+79 L-BFGS / +179 BOBYQA
+    // evaluations on a flip-flop stall, macOS arm64).
+    let probe_for = |resume_lower: bool| {
         let (restart_leg, probed, penalized) = (&restart_leg, &probed, &penalized);
         move |start: &ModelParameters, start_ofv: f64, spent_evals: usize| {
             // Its covariance step is deferred like every attempt's: `optimize_nlopt` runs it
@@ -4834,7 +4833,7 @@ pub(crate) fn optimize_nlopt(
             );
             let verdict_of =
                 |r: &OuterResult| start_probe_verdict(start_ofv, penalized(r), r.converged);
-            let result = if first && verdict_of(&result) == Some(false) {
+            let result = if !resume_lower && verdict_of(&result) == Some(false) {
                 result
             } else {
                 resolve_restart_chain(
@@ -4864,7 +4863,7 @@ pub(crate) fn optimize_nlopt(
             *probed.borrow_mut() = Some((result, verdict));
         }
     };
-    let (first_probe, restart_probe) = (probe_for(true), probe_for(false));
+    let (first_probe, restart_probe) = (probe_for(false), probe_for(true));
     let ((first, first_cause), first_left_init) = attempt(init_params, false, Some(&first_probe));
     let first_attempt =
         settle_start_probe((first, first_cause), first_left_init, probed.take(), &penalized);
