@@ -71,9 +71,10 @@ fn last_scored_time(subject: &Subject) -> Option<f64> {
 /// observation it acts on it. One listed after it sits a ULP later, moved there by the
 /// reader, so it goes, and the observation never read it.
 ///
-/// A non-Gaussian record is not on the engines' record timeline. The parameters of the
-/// interval holding it come from the record that closes the interval, the first record
-/// after it, so a subject with such records keeps that one too.
+/// A non-Gaussian record ahead of every other record is not on the engines' record timeline
+/// (#2368: after one, it is). The parameters of the interval holding it come from the record
+/// that closes the interval, the first record after it, so a subject with such records keeps
+/// that one too: needed for a leading one, harmless for the rest.
 fn cutoff(subject: &Subject) -> Option<f64> {
     let horizon = last_scored_time(subject)?;
     if subject.obs_records.is_empty() {
