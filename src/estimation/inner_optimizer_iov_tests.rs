@@ -5648,10 +5648,11 @@ fn iov_first_record_reset_multistarts_like_no_reset() {
         (solve(&plain), solve(&first), solve(&after));
     assert!(n_none < n_after, "premise: the scan arm runs more seeds ({n_none} vs {n_after})");
     assert_eq!(n_first, n_none, "the first-record reset took the scan arm");
-    let gap = (inert.kappas.iter().flatten().zip(none.kappas.iter().flatten()))
-        .map(|(a, b)| (a - b).abs())
-        .fold((inert.eta.clone() - none.eta.clone()).amax(), f64::max);
-    assert!(gap < 1e-6, "η/κ gap {gap:e}");
+    let flat = |r: &EbeResult| -> Vec<f64> {
+        r.eta.iter().chain(r.kappas.iter().flatten()).copied().collect()
+    };
+    let (a, b) = (flat(&inert), flat(&none));
+    assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6), "η/κ {a:?} vs {b:?}");
     assert!((inert.nll - none.nll).abs() < 1e-8, "{} vs {}", inert.nll, none.nll);
 }
 

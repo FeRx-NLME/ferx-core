@@ -2158,7 +2158,8 @@ pub fn predict_all_states(
 /// Compute predictions AND full compartment states for all observations:
 /// `(ipred_vec, compartment_states_vec)`. ODE states come from the same integration;
 /// analytical states from superposition. Analytical subjects with a reset that can change
-/// the state (`has_effective_resets`, #3094), and IOV models, get empty states (→ NaN in `[derived]`, `W_DERIVED_CMT_RESET_ANALYTICAL`).
+/// the state (`has_effective_resets`, #3094), and IOV models, get empty states (→ NaN in
+/// `[derived]`, `W_DERIVED_CMT_RESET_ANALYTICAL`).
 pub fn compute_predictions_with_states(
     model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
