@@ -9124,7 +9124,7 @@ pub(crate) fn reconverged_fd_gradient(
 /// re-solves per floored coordinate) before the caller saw the cancel. The **one** guard for
 /// the three reconverged-FD gradients; a coordinate a cancel cuts inside its gate growth keeps
 /// what the gate had, which every caller discards (`fit()` errs, the covariance step skips its
-/// reading).
+/// reading). A non-finite difference reads 0, as a missing pair does.
 fn central_diff_until_cancel(
     x: &[f64], fixed: &[bool], floor: &[f64], bounds: &PackedBounds,
     cancel: &Option<crate::cancel::CancelFlag>, eval: impl Fn(&[f64]) -> f64,
@@ -9133,7 +9133,8 @@ fn central_diff_until_cancel(
     let live = || !crate::cancel::is_cancelled(cancel);
     let eval = |xv: &[f64]| if live() { eval(xv) } else { f64::NAN };
     let tight = |xv: &[f64]| live().then(|| tight(xv)).flatten();
-    central_diff_packed_gated(x, fixed, floor, bounds, eval, Some(&tight))
+    let g = central_diff_packed_gated(x, fixed, floor, bounds, eval, Some(&tight));
+    g.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect()
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
@@ -9450,7 +9451,9 @@ fn reporting_fd_gradient(
 /// The sentinel is finite, so differenced as a value it gave a component of ~`1e20/2h`
 /// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
 /// side missing the component is the one-sided difference against `eval(x)`, evaluated
-/// once and only when needed; with both missing, or the centre missing too, it is zero.
+/// once and only when needed; with both missing, or the centre missing too, it is zero. A
+/// difference that overflows between usable probes is returned as is, not zeroed, so a caller
+/// can tell it from a zero slope (#3097).
 ///
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
@@ -9510,9 +9513,7 @@ pub(crate) fn central_diff_packed_gated(
                     })
                 });
             if let Some(r) = resolved {
-                if r.value.is_finite() {
-                    grad[k] = r.value;
-                }
+                grad[k] = r.value;
                 continue;
             }
         }
@@ -9531,7 +9532,7 @@ pub(crate) fn central_diff_packed_gated(
         xw[k] = xm;
         let fm = eval(&xw);
         xw[k] = x[k];
-        let d = match (usable(fp), usable(fm)) {
+        grad[k] = match (usable(fp), usable(fm)) {
             (true, true) => (fp - fm) / denom,
             (false, false) => continue,
             (plus, _) => {
@@ -9546,9 +9547,6 @@ pub(crate) fn central_diff_packed_gated(
                 }
             }
         };
-        if d.is_finite() {
-            grad[k] = d;
-        }
     }
     grad
 }

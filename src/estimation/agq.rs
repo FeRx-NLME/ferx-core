@@ -1369,10 +1369,11 @@ impl<'a> SubjectScoreContext<'a> {
     /// gradient's [`central_diff_packed_gated`](crate::estimation::outer_optimizer::central_diff_packed_gated),
     /// so a `|θ₀|`-floored step passes the #2406 resolution gate (#2678). `None` when the
     /// objective at `x` is not usable. With `salvage`, a probe that fails takes the helper's
-    /// one-sided difference against the centre (both failing leaves that coordinate 0).
-    /// Without it, a probe that fails at a coordinate's first step declines the score, as
-    /// before #2678; one that fails only at a floor the gate grew to keeps what the smaller
-    /// floors resolved, the gate's own policy.
+    /// one-sided difference against the centre (both failing, or a non-finite difference,
+    /// leaves that coordinate 0). Without it, a probe that fails at a coordinate's first step,
+    /// or a non-finite difference (#3097), declines the score, as before #2678; a probe that
+    /// fails only at a floor the gate grew to keeps what the smaller floors resolved, the
+    /// gate's own policy.
     fn finite_difference_score(
         &self, subject: &Subject, joint_warm: &[f64], salvage: bool,
     ) -> Option<Vec<f64>> {
@@ -1398,7 +1399,9 @@ impl<'a> SubjectScoreContext<'a> {
             },
             Some(&tight),
         );
-        (salvage || !missing.get()).then_some(g)
+        let finite = g.iter().all(|v| v.is_finite());
+        (salvage || (finite && !missing.get()))
+            .then(|| g.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect())
     }
 }
 

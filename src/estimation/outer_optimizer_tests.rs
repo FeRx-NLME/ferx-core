@@ -6891,6 +6891,22 @@ pub(crate) mod outer_fd_fallback {
         assert!(central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw)[0] > 1e20);
     }
 
+    /// #3097: a difference that overflows between two usable probes comes back non-finite, on
+    /// the ungated and the gated branch, so the AGQ score can decline it as it did before
+    /// #2992; the reconverged gradients' wrapper zeroes it, as the helper used to. A floor of
+    /// 1e-300 steps 1e-304, across which ±1e19 overflows.
+    #[test]
+    fn a_non_finite_difference_is_returned_not_zeroed() {
+        let bounds = PackedBounds { lower: vec![-1.0], upper: vec![1.0] };
+        let f = |v: &[f64]| 1e19_f64.copysign(v[0]);
+        let g = central_diff_packed(&[0.0], &[false], &[1e-300], &bounds, f);
+        assert!(g[0].is_infinite(), "{g:?}");
+        let g = central_diff_packed_gated(&[0.0], &[false], &[1e-300], &bounds, f, Some(&|_| None));
+        assert!(g[0].is_infinite(), "{g:?}");
+        let g = central_diff_until_cancel(&[0.0], &[false], &[1e-300], &bounds, &None, f, |_| None);
+        assert_eq!(g, vec![0.0]);
+    }
+
     /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
     /// `1e20` wall, and `central_diff_packed` must treat it as missing, not difference it
     /// as a value. On `warfarin_iov_ode_bloq` at its initial estimates with a small
