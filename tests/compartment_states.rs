@@ -1552,7 +1552,7 @@ fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
 ";
     let model = parse_model_string(MODEL).expect("model must parse");
     // Reuse the same EVID=3 population as the ODE regression test
-    let pop = {
+    let pop = |reset_times: Vec<f64>| {
         let obs_times = vec![1.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0];
         let n = obs_times.len();
         Population {
@@ -1569,15 +1569,32 @@ fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
                     vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
                     vec![1; n],
                 );
-                s.reset_times = vec![12.0];
+                s.reset_times = reset_times;
                 s
             }],
         }
     };
     let mut opts = FitOptions::default();
     opts.verbose = false;
+    let run = |r: Vec<f64>| fit(&model, &pop(r), &model.default_params, &opts).expect("fit");
 
-    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+    // #3094: a reset on the first record (the `EVID=4` first dose) is a no-op, so the states
+    // exist: no warning, and every column matches the subject without it.
+    let (inert, plain) = (run(vec![0.0]), run(vec![]));
+    assert!(
+        !inert.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_RESET_ANALYTICAL")),
+        "a first-record reset warned: {:?}",
+        inert.warnings
+    );
+    for ((name, a), (_, b)) in
+        inert.subjects[0].extra_columns.iter().zip(&plain.subjects[0].extra_columns)
+    {
+        for (x, y) in a.iter().zip(b) {
+            assert!((x - y).abs() <= 1e-6 * y.abs(), "{name}: {x} vs {y}");
+        }
+    }
+
+    let result = run(vec![12.0]);
 
     // W_DERIVED_CMT_RESET_ANALYTICAL must be emitted
     assert!(

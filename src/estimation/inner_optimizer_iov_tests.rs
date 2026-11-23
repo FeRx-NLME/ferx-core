@@ -5630,6 +5630,31 @@ fn iov_multistart_scans_a_sharp_kappa_behind_a_barrier() {
     assert!((on.kappas[1][0] + 2.2).abs() < 0.01, "deep mode: {:?}", on.kappas);
 }
 
+/// #3094: a reset on the first record is a no-op, so an IOV subject multi-starts as one with
+/// no reset does, not on the scan-every-coordinate arm a reset after the data takes. Both
+/// arms reach the deep mode here, so the arm is read from the seeds it runs.
+#[test]
+fn iov_first_record_reset_multistarts_like_no_reset() {
+    let (model, plain) = two_mode_fixture(TWO_MODE_NO_RESET, "1");
+    let first = Subject { reset_times: vec![0.0], ..plain.clone() };
+    let after = Subject { reset_times: vec![1e3], ..plain.clone() };
+    assert!(first.has_resets() && !first.has_effective_resets() && after.has_effective_resets());
+    let solve = |s: &Subject| {
+        let before = IOV_AXIS_SEEDS_RUN.with(|n| n.get());
+        let r = cold_iov_solve(&model, s, 1, 1e-6, None);
+        (IOV_AXIS_SEEDS_RUN.with(|n| n.get()) - before, r)
+    };
+    let ((n_none, none), (n_first, inert), (n_after, _)) =
+        (solve(&plain), solve(&first), solve(&after));
+    assert!(n_none < n_after, "premise: the scan arm runs more seeds ({n_none} vs {n_after})");
+    assert_eq!(n_first, n_none, "the first-record reset took the scan arm");
+    let gap = (inert.kappas.iter().flatten().zip(none.kappas.iter().flatten()))
+        .map(|(a, b)| (a - b).abs())
+        .fold((inert.eta.clone() - none.eta.clone()).amax(), f64::max);
+    assert!(gap < 1e-6, "η/κ gap {gap:e}");
+    assert!((inert.nll - none.nll).abs() < 1e-8, "{} vs {}", inert.nll, none.nll);
+}
+
 /// A genuine warm start is never re-scanned: the outer loop carries the chosen mode on, and
 /// the scan on every outer evaluation is what the cold gate exists to prevent.
 #[test]
