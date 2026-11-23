@@ -215,20 +215,22 @@ fn check_rejects_directories_and_symlinks() {
 }
 
 /// `[Unreleased]` must stay empty: an entry added there out of habit reintroduces the
-/// conflict the fragments exist to remove.
+/// conflict the fragments exist to remove. A long one still ends in the summary, with
+/// exit 1: quoting its first lines through `| head -n 5` exited 141 before it (#2587).
 #[test]
 fn check_rejects_an_entry_written_under_unreleased() {
     let t = tree("unreleased-ok", &[]);
     assert!(run(&t, &["check"]).status.success());
 
     let t = tree("unreleased-bad", &[]);
-    std::fs::write(t.join("CHANGELOG.md"), format!("{HEAD}### Fixed\n- Habit (#9).\n\n{TAIL}"))
-        .unwrap();
+    let habit = "- Habit (#9).\n".repeat(8192);
+    std::fs::write(t.join("CHANGELOG.md"), format!("{HEAD}### Fixed\n{habit}\n{TAIL}")).unwrap();
     let o = run(&t, &["check"]);
     let err = stderr(&o);
-    assert!(!o.status.success(), "an [Unreleased] entry was accepted");
+    assert_eq!(o.status.code(), Some(1), "an [Unreleased] entry:\n{err}");
     assert!(err.contains("[Unreleased] must stay empty"), "{err}");
     assert!(err.contains("- Habit (#9)."), "does not quote the line:\n{err}");
+    assert!(err.contains("1 problem(s) found"), "{err}");
 }
 
 /// Without exactly one `## [Unreleased]` heading an empty section and a missing one look
@@ -886,6 +888,33 @@ fn the_ci_changelog_job_checks_the_pr_tree() {
         !job.lines().any(|l| l.trim_start().starts_with("ref:")),
         "the Changelog job checks out a ref other than the PR:\n{job}"
     );
+}
+
+/// A fragment decided on line 1 gets the same verdict at any length (#2587). `check`
+/// piped `printf '%s' "$body"` into `head -n 1`, `awk … exit` and `grep -q`, which can
+/// exit before `printf` has written the body: its next write took SIGPIPE, and under
+/// `pipefail` a match read as a miss, or `set -e` ended the script silently with 141.
+/// Past the pipe buffer `printf` is still writing when they exit, so 128 KiB fails
+/// every run, not at a scheduler-dependent rate.
+#[test]
+fn check_judges_a_long_fragment_by_its_first_line() {
+    let rest = "  words on a continuation line.\n".repeat(4096);
+    for (slot, first, want) in [
+        ("long-ok", "- A fix (#12).\n", None),
+        ("long-crlf", "- A fix (#12).\r\n", Some("CR line endings")),
+        ("long-two-bullets", "- A fix (#12).\n- Two (#12).\n", Some("must be a single bullet")),
+    ] {
+        let o = run(&tree(slot, &[("12.fixed.md", &format!("{first}{rest}"))]), &["check"]);
+        match want {
+            None => assert!(o.status.success(), "{slot}: rejected:\n{}", stderr(&o)),
+            Some(w) => assert!(
+                !o.status.success() && stderr(&o).contains(w),
+                "{slot}: expected {w:?}, got {:?}:\n{}",
+                o.status,
+                stderr(&o)
+            ),
+        }
+    }
 }
 
 /// Every fragment is validated, not just the first: the malformed one sorts AFTER a
