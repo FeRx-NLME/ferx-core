@@ -9122,10 +9122,12 @@ pub(crate) fn reconverged_fd_gradient(
 /// is missing, not solved — `eval` reads `NaN`, `tight` reads `None`. Without this the #2406
 /// gate would grow every floored step through the remaining probes (up to ~44 population
 /// re-solves per floored coordinate) before the caller saw the cancel. The **one** guard for
-/// the three reconverged-FD gradients; a coordinate a cancel cuts inside its gate growth keeps
-/// what the gate had, which every caller discards (`fit()` errs, the covariance step skips its
-/// reading).
-fn central_diff_until_cancel(
+/// its four callers — the three reconverged-FD gradients and the AGQ/Laplace reconverged FD
+/// score (`SubjectScoreContext::finite_difference_score`, #3136), which polls its centre solve
+/// itself and declines a cancelled stencil; a coordinate a cancel cuts inside its gate growth
+/// keeps what the gate had, which every caller discards (`fit()` errs, the covariance step
+/// skips its reading).
+pub(crate) fn central_diff_until_cancel(
     x: &[f64], fixed: &[bool], floor: &[f64], bounds: &PackedBounds,
     cancel: &Option<crate::cancel::CancelFlag>, eval: impl Fn(&[f64]) -> f64,
     tight: impl Fn(&[f64]) -> Option<f64>,
