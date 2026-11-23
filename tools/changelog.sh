@@ -209,9 +209,10 @@ cmd_check() {
     fi
     # No `printf "$body" | <reader that may exit early>` below: once `head` / `grep -q` /
     # `awk … exit` stops reading, printf's next write takes SIGPIPE, and `pipefail` turns
-    # a match into a miss or `set -e` exits 141 with no message (#2587).
-    first="${body%%$'\n'*}"
-    if ! printf '%s' "$first" | grep -Eq '^- [^[:space:]]'; then
+    # a match into a miss or `set -e` exits 141 with no message (#2587). Line 1 is read
+    # from the file: `${body%%$'\n'*}` is quadratic in bash 3.2.
+    IFS= read -r first <"$path" || :
+    if ! [[ $first =~ ^-\ [^[:space:]] ]]; then
       echo "changelog.d/$name: line 1 must start a bullet ('- ...'), found: $first" >&2
       errors=$((errors + 1))
       continue
@@ -248,7 +249,7 @@ cmd_check() {
       echo "CHANGELOG.md: [Unreleased] must stay empty between releases (#1545) — it is"
       echo "assembled from changelog.d/ at release time. Move each entry into its own"
       echo "changelog.d/<N>.<category>.md. Offending lines:"
-      printf '%s\n' "$stray" | sed -n '1,5s/^/  /p' # reads it all: no SIGPIPE (#2587)
+      printf '%s\n' "$stray" | sed -n '1,5s/^/  /p'
     } >&2
     errors=$((errors + 1))
   fi
