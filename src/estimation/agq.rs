@@ -2451,11 +2451,14 @@ mod tests {
     /// `central_diff_until_cancel`, as the outer reconverged gradients do (#2776). A cancel
     /// solves no further probe and declines the score; the salvage keeps what it had.
     ///
-    /// A live `score` polls once on entry, once before its centre solve, once per probe (each
-    /// probe one inner solve) and once more in its decline, so `polls − solves` is where the
-    /// first probe's poll sits — measured, so it follows the centre poll if that moves. The
-    /// cut-at-centre case is the fixed poll after `score`'s entry check: with the centre
-    /// poll deleted it lands on the first probe's instead and the centre gets solved.
+    /// The first probe's poll is measured on the salvage, which polls only before its centre
+    /// solve and once per probe (each one inner solve) — no entry check, no decline read — so
+    /// `polls − (solves − 1)` is the stencil's own pre-probe polls and follows the centre poll
+    /// if that moves, but not the decline read: dropping the decline's cancel term must fail on
+    /// "a cancelled stencil is no score", not shift the cut (#3137 review r1). `score` adds one
+    /// entry poll before that. The cut-at-centre cases are the fixed polls before each centre
+    /// solve: with the centre poll deleted they land on the first probe's and the centre gets
+    /// solved — on the salvage path that poll is the only guard (`reconverged_score` has none).
     #[test]
     fn a_cancelled_agq_fd_score_solves_no_probe() {
         use crate::cancel::CancelFlag;
@@ -2496,21 +2499,26 @@ mod tests {
         assert!(live.iter().any(|v| *v != 0.0), "fixture: a non-trivial score");
         let budget = 1_000_000;
         let counter = CancelFlag::trip_after(budget);
-        assert_eq!(run(Some(counter.clone()), false).0, Some(live.clone()), "a counting flag");
+        let (salvage_live, salvage_solves) = run(Some(counter.clone()), true);
+        assert_eq!(salvage_live, Some(live.clone()), "the salvage of a clean stencil");
+        assert_eq!(salvage_solves, solves, "fixture: one stencil on both paths");
         let polls = budget - counter.polls_left().expect("a countdown");
-        let first_probe = polls
+        // Polls before the salvage's first probe: the centre poll.
+        let first_probe = (polls + 1)
             .checked_sub(solves)
             .unwrap_or_else(|| panic!("{polls} polls for {solves} solves: a probe went unpolled"));
 
         let (cut, n) = run(Some(CancelFlag::trip_after(1)), false);
         assert_eq!((cut, n), (None, 0), "a cancel at the centre poll solved {n} probes");
+        let (cut, n) = run(Some(CancelFlag::trip_after(0)), true);
+        assert_eq!((cut, n), (None, 0), "a cancel at the salvage's centre poll solved {n}");
 
-        let (cut, n) = run(Some(CancelFlag::trip_after(first_probe)), false);
+        // `score`'s entry poll comes first.
+        let (cut, n) = run(Some(CancelFlag::trip_after(first_probe + 1)), false);
         assert_eq!(n, 1, "a cancel after the centre solved {n} (only the centre may run)");
         assert_eq!(cut, None, "a cancelled stencil is no score");
 
-        // The salvage has no entry poll of its own: its first probe's poll is one earlier.
-        let (salvaged, n) = run(Some(CancelFlag::trip_after(first_probe - 1)), true);
+        let (salvaged, n) = run(Some(CancelFlag::trip_after(first_probe)), true);
         assert_eq!(n, 1, "the salvage solved {n} after a cancel");
         let salvaged = salvaged.expect("the salvage keeps its centre");
         assert_eq!(salvaged.len(), live.len());
