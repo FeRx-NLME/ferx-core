@@ -1158,19 +1158,24 @@ fn an_endpoint_row_is_a_record_that_can_govern_an_implied_dose() {
         assert_eq!(s.pk_only_times, vec![2.0], "{routing:?}");
         assert_eq!(s.pk_only_cov(0)["X"], 2.0, "{routing:?}");
         assert_eq!(dose_x(&s), vec![(0.0, 1.0), (1.0, 2.0)], "{routing:?}");
-        // Ahead of every other record it starts no clock, so it is not a pk-only record.
-        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,1,0,0,.,3\n1,4,5,0,0,.,1\n");
+        // #3095: ahead of every other record it is still a record when the subject has one of
+        // another kind, so it starts the clock, as in NONMEM. In either file order: the rule
+        // reads the subject, not the rows read so far.
+        for csv in [
+            "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1,0,0,.,3\n1,2,.,1,1,100,1\n1,4,5,0,0,.,1\n",
+            "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,.,1,1,100,1\n1,0,1,0,0,.,3\n1,4,5,0,0,.,1\n",
+        ] {
+            let s = read_nonmem_csv_filtered_routed(write_csv(csv).path(), &routing).unwrap();
+            assert_eq!(s.subjects[0].pk_only_times, vec![0.0], "{routing:?}");
+        }
+        // A subject with endpoint rows only has no record: it integrates from 0, as before.
+        // An EVID=3 row is a record of another kind.
+        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,1,0,0,.,3\n1,4,0,0,0,.,3\n");
         let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
         assert!(s.subjects[0].pk_only_times.is_empty(), "{routing:?}");
-    }
-    // A TTE row is never skipped for its DV, so a leading one with DV `.` is no record either:
-    // its clock would start at the event, where `H = 0` (#2943 review r1).
-    #[cfg(feature = "survival")]
-    {
-        let routing = ObsRouting { tte: [3].into_iter().collect(), ..Default::default() };
-        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,.,0,0,.,3\n1,4,5,0,0,.,1\n");
+        let f = write_csv("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,2,1,0,0,.,3\n1,3,.,3,1,.,.\n");
         let s = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
-        assert!(s.subjects[0].pk_only_times.is_empty());
+        assert_eq!(s.subjects[0].pk_only_times, vec![2.0], "{routing:?}");
     }
 }
 
@@ -3568,17 +3573,20 @@ fn a_tte_row_with_entry_after_event_is_a_record_only_after_another_record() {
     };
     let (stays, not_a) = (
         "stays a record of the PK model, as in NONMEM",
-        "is not a record of the PK model either, since it comes before every other record of \
-         the subject",
+        "is not a record of the PK model either, since the subject has no record of another kind",
     );
 
-    // After a dose: a record, and the warning says so.
-    let (times, warn) =
-        read("ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,0,.,1,1,100,1,0\n1,20,1,0,0,.,3,50\n");
-    assert_eq!(times, vec![20.0], "after a dose the row is a record");
-    assert!(warn.contains(stays) && !warn.contains(not_a), "after a dose: {warn}");
+    // Before or after a dose: a record, and the warning says so (#3095: either file order).
+    for csv in [
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,0,.,1,1,100,1,0\n1,20,1,0,0,.,3,50\n",
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,20,1,0,0,.,3,50\n1,30,.,1,1,100,1,0\n",
+    ] {
+        let (times, warn) = read(csv);
+        assert_eq!(times, vec![20.0], "with a dose the row is a record");
+        assert!(warn.contains(stays) && !warn.contains(not_a), "with a dose: {warn}");
+    }
 
-    // Ahead of every other record: no record, and the warning does not claim one.
+    // A subject with TTE rows only: no record, and the warning does not claim one.
     let (times, warn) =
         read("ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n1,20,1,0,0,.,3,50\n1,30,0,0,0,.,3,0\n");
     assert!(times.is_empty(), "a leading row is no record: {times:?}");
