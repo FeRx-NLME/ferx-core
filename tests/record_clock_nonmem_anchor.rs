@@ -197,7 +197,8 @@ fn an_addl_implied_dose_runs_under_the_record_that_ends_its_interval_matches_non
 #[cfg(feature = "survival")]
 #[test]
 fn an_endpoint_or_missing_dv_row_governs_an_addl_implied_dose_matches_nonmem() {
-    // ID 7's endpoint row at 0 leads every other record, so it is not one.
+    // ID 7's endpoint row at 0 leads every other record, and is one too (#3095), as NONMEM's
+    // `MDV=1` row is; it ties the dose at 0 ahead of it in file order, so it sits a ULP below.
     let at15: &[f64] = &[15.0];
     let pk_only: &[(&str, &[f64])] = &[
         ("1", &[12.0]),
@@ -206,7 +207,7 @@ fn an_endpoint_or_missing_dv_row_governs_an_addl_implied_dose_matches_nonmem() {
         ("4", at15),
         ("5", at15),
         ("6", &[15.0, 24.0]),
-        ("7", at15),
+        ("7", &[0.0, 15.0]),
     ];
     worst_pred_error("addl_endpoint", "addl_endpoint", "addl_endpoint", pk_only);
     worst_pred_error("addl_endpoint", "addl_endpoint_ode", "addl_endpoint", pk_only);
