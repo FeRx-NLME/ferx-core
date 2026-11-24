@@ -1269,11 +1269,7 @@ impl<'a> CovPlan<'a> {
         let is_agq = matches!(self.objective, Objective::Agq { .. });
         // FOCE's population prediction at η = 0 (beside a non-Gaussian term production takes
         // the conditional variance).
-        let pop = if n_obs > 0
-            && !is_agq
-            && !interaction
-            && model.error_spec.has_f_dependent_variance()
-        {
+        let pop = if n_obs > 0 && !is_agq && !interaction && model.has_f_dependent_variance() {
             let zero_t = |_: usize, _: usize| 0.0;
             let zeros = vec![0.0; pn];
             Some(self.plan_run(
