@@ -148,7 +148,7 @@ fn every_omega_line_form_fits() {
         (
             "mvlognormal",
             variant(
-                "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density lognormal\n  omega ETA_KA ~ 0.30 density t(NU)\n",
+                "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] density lognormal_mean\n  omega ETA_KA ~ 0.30 density t(NU)\n",
                 "  CL = TVCL * ETA_CL\n  V  = TVV  * ETA_V\n  KA = TVKA * exp(ETA_KA)\n",
                 "",
             ),
@@ -265,7 +265,7 @@ fn a_density_eta_reports_its_distribution() {
     let sd = (r.omega[(1, 1)] * nu / (nu - 2.0)).sqrt();
     let t_note = ferx_core::io::output::eta_distribution_note(&r, 1).expect("ETA_V's note");
     assert!(
-        t_note.starts_with(&format!("density t(NU) (mean 0, SD = {sd:.4}): ")),
+        t_note.starts_with(&format!("density t(NU), ω = scale² (mean 0, SD = {sd:.4}): ")),
         "{t_note} (SD {sd})"
     );
     // The EBE table on the effect's scale: `exp(ẑ)` for the gamma, the EBE itself for
@@ -287,6 +287,19 @@ fn a_density_eta_reports_its_distribution() {
     assert!((r.shrinkage_eta[0] - want).abs() < 1e-12, "{} vs {want}", r.shrinkage_eta[0]);
     assert!((r.shrinkage_eta[0] - gaussian).abs() > 1e-6, "the scale matters here");
     assert_eq!(ferx_core::io::output::eta_distribution_note(&r, 2), None);
+    // Which summary each typical value is (#2669): the gamma's TVCL the mean of CL, the
+    // symmetric t's TVV and the Gaussian TVKA medians.
+    let tv: Vec<(String, String, &str)> = r
+        .typical_values
+        .iter()
+        .map(|v| (v.theta.clone(), v.parameter.clone(), v.statistic.label()))
+        .collect();
+    for want in [("TVCL", "CL", "mean"), ("TVV", "V", "median"), ("TVKA", "KA", "median")] {
+        assert!(
+            tv.iter().any(|(t, p, st)| (t.as_str(), p.as_str(), *st) == want),
+            "{want:?} in {tv:?}"
+        );
+    }
     let rows = ferx_core::io::output::format_omega_rows_from(
         &ferx_core::io::output::OmegaRowsInput::from_result(&r),
         Default::default(),
@@ -364,8 +377,9 @@ fn a_simulated_gamma_clearance_is_recovered() {
 
 /// A kind with a kink or a positive-density edge (`laplace`, `uniform`, `pareto`, …) is
 /// refused under every method that reads the prior's curvature at the EBE — FOCE, FOCEI,
-/// the GN pair, Laplace, and VI's Laplace objective — with `E_DENSITY_UNSUPPORTED` naming
-/// IMP / SAEM / Bayes, which score it exactly and run. A smooth kind (`gamma`) is not
+/// the GN pair, Laplace, VI's Laplace objective and SAEM's `saem_ofv = focei` — with
+/// `E_DENSITY_UNSUPPORTED` naming IMP / SAEM / Bayes, which run it and report a number that
+/// scores its prior. A smooth kind (`gamma`) is not
 /// refused under FOCEI: the gate is the kind, not the presence of a density.
 #[test]
 fn a_kink_kind_is_refused_where_curvature_is_read() {
@@ -391,11 +405,46 @@ fn a_kink_kind_is_refused_where_curvature_is_read() {
         let msg = e.to_string();
         assert!(msg.contains("density laplace") && msg.contains("method = imp"), "{msg}");
     }
+    // Where a kink kind runs, the reported number is one that scores its prior (#2669
+    // review, finding 1). IMP: `ofv` is the IS marginal itself, labelled so; SAEM: its own
+    // objective, with no FOCE/Laplace diagnostic; and the covariance step, which reads the
+    // FOCE curvature, is skipped with `W_DENSITY_NO_COVARIANCE` rather than reported.
     for method in [EstimationMethod::Imp, EstimationMethod::Saem, EstimationMethod::Bayes] {
-        let r = ferx_core::fit(&kink, &pop, &kink.default_params, &short(method, true))
-            .unwrap_or_else(|e| panic!("{method:?} scores a kink kind exactly: {e}"));
+        let o = FitOptions { run_covariance_step: true, ..short(method, true) };
+        let r = ferx_core::fit(&kink, &pop, &kink.default_params, &o)
+            .unwrap_or_else(|e| panic!("{method:?} runs a kink kind: {e}"));
         assert!(r.ofv.is_finite(), "{method:?}: OFV {}", r.ofv);
+        assert!(r.covariance_matrix.is_none(), "{method:?}: a covariance matrix");
+        match method {
+            EstimationMethod::Imp => {
+                let is = r.importance_sampling.as_ref().expect("the IS marginal");
+                assert!(r.ofv_is_importance_sampling);
+                assert_eq!(r.ofv_data.to_bits(), is.minus2_log_likelihood.to_bits());
+                assert!(
+                    r.warnings.iter().any(|w| w.starts_with("W_DENSITY_NO_COVARIANCE")),
+                    "{:?}",
+                    r.warnings
+                );
+            }
+            EstimationMethod::Saem => {
+                let so = r.saem_objective.as_ref().expect("SAEM's own objective");
+                assert!(so.foce_ofv.is_nan(), "FOCE diagnostic {}", so.foce_ofv);
+                assert!(
+                    r.warnings.iter().any(|w| w.starts_with("W_DENSITY_NO_COVARIANCE")),
+                    "{:?}",
+                    r.warnings
+                );
+            }
+            _ => assert!(!r.ofv_is_importance_sampling),
+        }
     }
+    // SAEM reporting the FOCE objective reads the curvature: refused.
+    let o = FitOptions {
+        saem_ofv: ferx_core::types::SaemOfv::Focei,
+        ..short(EstimationMethod::Saem, true)
+    };
+    let e = ferx_core::fit(&kink, &pop, &kink.default_params, &o).expect_err("saem_ofv = focei");
+    assert!(e.to_string().contains("saem_ofv = focei"), "{e}");
     // The other side of the gate: a smooth kind under FOCEI runs (`every_density_
     // estimator_runs` uses gamma and t).
     let (smooth, _) = model_and_data();
@@ -406,4 +455,139 @@ fn a_kink_kind_is_refused_where_curvature_is_read() {
         &short(EstimationMethod::FoceI, true)
     )
     .is_ok());
+}
+
+/// Adaptive quadrature integrates a kink kind's prior (#2669 review, finding 1): its
+/// Hessian only places the nodes. So an AGQ evaluation of a one-ETA `density laplace`
+/// model is accepted, and at 15 nodes equals the importance-sampling −2 log L. Measured on
+/// warfarin: IS 284.69396 ± 0.0056 (K = 200 000); AGQ 284.6949 / 284.6881 / 284.6893 /
+/// 284.6887 at 5 / 9 / 15 / 21 nodes; 3 nodes 284.80. The bound is 4 Monte Carlo SEs at
+/// K = 20 000.
+/// Dies under: AGQ refused for a kink kind, or a quadrature that misses the kink.
+#[test]
+fn agq_integrates_a_kink_kind_to_the_is_marginal() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.15, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09 density laplace
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(src).unwrap();
+    let (pop, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        "data/warfarin.csv",
+        None,
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
+    let m = &parsed.model;
+    let o = FitOptions {
+        method: EstimationMethod::Imp,
+        imp_eval_only: true,
+        imp_samples: 20_000,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let r = ferx_core::fit(m, &pop, &m.default_params, &o).unwrap();
+    let is = r.importance_sampling.as_ref().unwrap();
+    assert!(r.ofv_is_importance_sampling && r.ofv == is.minus2_log_likelihood);
+    let o = FitOptions {
+        method: EstimationMethod::Laplace,
+        agq_eval_only: true,
+        n_agq: 15,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let agq = ferx_core::fit(m, &pop, &m.default_params, &o).expect("AGQ runs a kink kind").ofv;
+    let gap = (agq - is.minus2_log_likelihood).abs();
+    eprintln!(
+        "AGQ(15) {agq:.5} vs IS {:.5} ± {:.5}",
+        is.minus2_log_likelihood, is.mc_standard_error
+    );
+    assert!(gap < 4.0 * is.mc_standard_error, "gap {gap:.5}, SE {:.5}", is.mc_standard_error);
+    // One node is Laplace, which reads the curvature: refused.
+    let o = FitOptions { n_agq: 1, ..o };
+    let e = ferx_core::fit(m, &pop, &m.default_params, &o).expect_err("Laplace refused");
+    assert!(e.to_string().contains("follows `density laplace`"), "{e}");
+}
+
+/// VI's density M-step writes only its own slots (#2669 review, finding 8): a FIXed θ keeps
+/// its declared value bit for bit over a run (a full `unpack → pack` each iteration drifted
+/// it by an ULP at a time), under both `vi_omega_update` modes, and the Adam mode runs with
+/// the density's slots owned by the M-step.
+/// Dies under: the repack restored, or the density slots left to Adam as well.
+#[test]
+fn vi_density_mstep_leaves_other_slots_bit_exact() {
+    let src = DENSITY_WARFARIN
+        .replace("theta TVKA(1.5, 0.01, 50.0)", "theta TVKA(1.4537, 0.01, 50.0) FIX");
+    let parsed = parse_full_model(&src).unwrap();
+    let (pop, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        "data/warfarin.csv",
+        None,
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
+    let m = &parsed.model;
+    let ka = m.theta_names.iter().position(|n| n == "TVKA").unwrap();
+    for update in
+        [ferx_core::types::ViOmegaUpdate::ClosedForm, ferx_core::types::ViOmegaUpdate::Adam]
+    {
+        let o = FitOptions {
+            vi_iters: 60,
+            vi_omega_update: update,
+            ..short(EstimationMethod::Vi, true)
+        };
+        let r = ferx_core::fit(m, &pop, &m.default_params, &o).unwrap();
+        assert_eq!(
+            r.theta[ka].to_bits(),
+            m.default_params.theta[ka].to_bits(),
+            "{update:?}: {}",
+            r.theta[ka]
+        );
+        assert!(r.omega[(0, 0)].is_finite() && r.omega[(0, 0)] > 0.0, "{update:?}");
+    }
+}
+
+/// The covariance step runs on a density model (#2669 review, finding 14): FOCEI on the
+/// gamma CL + t(ν) V model returns a finite, positive SE for the density ω's and for the
+/// shape θ ν, which enters the prior only. Every other density test runs with the step off.
+/// Dies under: the step declining density subjects, or a shape θ left out of its matrix.
+#[test]
+fn the_covariance_step_gives_density_parameters_an_se() {
+    let (model, pop) = model_and_data();
+    let o = FitOptions {
+        outer_maxiter: 40,
+        run_covariance_step: true,
+        ..short(EstimationMethod::FoceI, true)
+    };
+    let r = ferx_core::fit(&model, &pop, &model.default_params, &o).unwrap();
+    let se_theta = r.se_theta.as_ref().expect("θ SEs");
+    let nu = r.theta_names.iter().position(|n| n == "NU").unwrap();
+    assert!(se_theta[nu].is_finite() && se_theta[nu] > 0.0, "SE(ν) = {}", se_theta[nu]);
+    assert!(r.se_omega.is_some(), "ω SEs");
+    for i in 0..2 {
+        let se =
+            ferx_core::types::omega_se_at(&r.se_omega, r.omega.nrows(), i, i).unwrap_or(f64::NAN);
+        assert!(se.is_finite() && se > 0.0, "SE(ω_{i}) = {se}");
+    }
 }

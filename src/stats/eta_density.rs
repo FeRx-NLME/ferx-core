@@ -20,7 +20,8 @@
 //! unconstrained.
 //!
 //! A block (`block_omega … density t(ν)`) is a multivariate t with one ν. The other kinds
-//! are univariate; `lognormal` on a block is the multivariate log-normal, and `copula(…)`
+//! are univariate; `lognormal` / `lognormal_mean` on a block is the multivariate
+//! log-normal of median / mean 1, and `copula(…)`
 //! correlates any univariate margins through a Gaussian copula. A Box-Cox
 //! "density" needs no kind of its own: on its latent scale it is exactly the Box-Cox
 //! transform, which `[eta_shape]` declares (`density boxcox` is refused).
@@ -89,8 +90,13 @@ pub enum DensityKind {
     Gamma,
     /// Inverse gamma, mean 1, variance ω.
     InvGamma,
-    /// Log-normal, mean 1, variance ω.
+    /// Log-normal, median 1: `ln η ~ N(0, ω)`, the classic `TV·exp(η)` random effect,
+    /// whose latent prior is exactly Gaussian (correction 0). On a block, Pumas's
+    /// `MvLogNormal` with `ln η ~ N(0, Ω)`.
     LogNormal,
+    /// Log-normal, mean 1, variance ω (`ln η ~ N(−s²/2, s²)`, `s² = ln(1 + ω)`). On a
+    /// block, `ln η ~ N(−diag(S)/2, S)` with `S = ln(1 + Ω)` elementwise.
+    LogNormalMean,
     /// Exponential, mean 1 (ω unused).
     Exponential,
     /// Erlang (gamma with shape k), mean 1 (ω unused).
@@ -194,7 +200,7 @@ const fn shape(
 
 impl DensityKind {
     /// Every kind, for name lookup.
-    pub(crate) const ALL: [DensityKind; 38] = {
+    pub(crate) const ALL: [DensityKind; 39] = {
         use DensityKind::*;
         [
             StudentT,
@@ -216,6 +222,7 @@ impl DensityKind {
             Gamma,
             InvGamma,
             LogNormal,
+            LogNormalMean,
             Exponential,
             Erlang,
             ChiSq,
@@ -248,7 +255,7 @@ impl DensityKind {
     pub(crate) fn aliases(self) -> &'static [&'static str] {
         use DensityKind::*;
         match self {
-            StudentT => &["t", "tdist", "studentt"],
+            StudentT => &["t", "studentt"],
             Logistic => &["logistic"],
             Laplace => &["laplace"],
             Cauchy => &["cauchy"],
@@ -267,6 +274,7 @@ impl DensityKind {
             Gamma => &["gamma"],
             InvGamma => &["invgamma", "inversegamma"],
             LogNormal => &["lognormal"],
+            LogNormalMean => &["lognormal_mean"],
             Exponential => &["exponential"],
             Erlang => &["erlang"],
             ChiSq => &["chisq"],
@@ -298,9 +306,9 @@ impl DensityKind {
     pub(crate) fn map(self) -> DomainMap {
         use DensityKind::*;
         match self {
-            Gamma | InvGamma | LogNormal | Exponential | Erlang | ChiSq | Chi | Rayleigh
-            | Weibull | Frechet | InverseGaussian | BetaPrime | NoncentralChiSq | Kolmogorov
-            | Levy | Pareto | GeneralizedPareto | LogUniform => DomainMap::Exp,
+            Gamma | InvGamma | LogNormal | LogNormalMean | Exponential | Erlang | ChiSq | Chi
+            | Rayleigh | Weibull | Frechet | InverseGaussian | BetaPrime | NoncentralChiSq
+            | Kolmogorov | Levy | Pareto | GeneralizedPareto | LogUniform => DomainMap::Exp,
             Beta | LogitNormal => DomainMap::InvLogit,
             _ => DomainMap::Identity,
         }
@@ -321,10 +329,17 @@ impl DensityKind {
     }
 
     /// Whether a block of several ETAs can follow it: the multivariate t, the
-    /// multivariate log-normal (`lognormal` on a block, Pumas's `MvLogNormal`) and the
+    /// multivariate log-normal (`lognormal` or `lognormal_mean` on a block, Pumas's
+    /// `MvLogNormal`) and the
     /// copula.
     pub(crate) fn allows_block(self) -> bool {
-        matches!(self, DensityKind::StudentT | DensityKind::LogNormal | DensityKind::Copula)
+        matches!(
+            self,
+            DensityKind::StudentT
+                | DensityKind::LogNormal
+                | DensityKind::LogNormalMean
+                | DensityKind::Copula
+        )
     }
 
     /// Whether the kind has no free spread, so its `ω` is unused and must be `FIX`.
@@ -447,6 +462,83 @@ use kinds::ln1p_g;
 #[path = "eta_density_kinds.rs"]
 mod kinds;
 
+/// `d` with its θ-valued truncation bounds at the values `theta_of(name)` gives (a fit's
+/// estimates, or the parameters a prediction runs at), so the effect it maps to is the
+/// model's at those parameters (#2669: they held the initial θ). A bound whose θ is not
+/// found keeps its stored value.
+pub(crate) fn resolve_distribution(
+    d: &crate::types::EtaDistribution, theta_of: impl Fn(&str) -> Option<f64>,
+) -> crate::types::EtaDistribution {
+    let mut out = d.clone();
+    if let Some((lo, hi)) = out.truncation.as_mut() {
+        let (tlo, thi) = &d.truncation_thetas;
+        if let Some(v) = tlo.as_deref().and_then(&theta_of) {
+            *lo = Some(v);
+        }
+        if let Some(v) = thi.as_deref().and_then(&theta_of) {
+            *hi = Some(v);
+        }
+    }
+    out
+}
+
+/// Per BSV ETA of `model`, the `density` distribution its random effect follows, resolved
+/// at `theta` ([`resolve_distribution`]); `None` for a Gaussian or transform ETA, whose
+/// effect is the ETA itself. With [`effect_of_latent`] / [`latent_of_effect`] it maps
+/// between the latent the estimators hold and the effect every output reports (#2669).
+pub(crate) fn model_effect_maps(
+    model: &crate::types::CompiledModel, theta: &[f64],
+) -> Vec<Option<crate::types::EtaDistribution>> {
+    model
+        .eta_names
+        .iter()
+        .map(|name| {
+            let d = model
+                .eta_param_info
+                .iter()
+                .filter(|i| &i.eta_name == name)
+                .find_map(|i| i.distribution.as_ref())
+                .filter(|d| d.form == "density")?;
+            Some(resolve_distribution(d, |n| {
+                let t = model.theta_names.iter().position(|x| x == n)?;
+                theta.get(t).copied()
+            }))
+        })
+        .collect()
+}
+
+/// The latent `z` a reported distribution's model reads as the random effect `x`: the
+/// inverse of [`effect_of_latent`]. `NaN` for an `x` outside the effect's support (a
+/// non-positive effect of a (0, ∞) kind, one outside a truncation), and for an unknown
+/// kind. A transform's ETA is itself Gaussian and maps to itself.
+pub(crate) fn latent_of_effect(d: &crate::types::EtaDistribution, x: f64) -> f64 {
+    if d.form != "density" {
+        return x;
+    }
+    let Some(kind) = DensityKind::from_name(&d.kind) else {
+        return f64::NAN;
+    };
+    let pos = |v: f64| if v > 0.0 { v.ln() } else { f64::NAN };
+    match d.truncation {
+        Some((Some(lo), Some(hi))) => {
+            let u = (x - lo) / (hi - lo);
+            if u > 0.0 && u < 1.0 {
+                (u / (1.0 - u)).ln()
+            } else {
+                f64::NAN
+            }
+        }
+        Some((Some(lo), None)) => pos(x - lo),
+        Some((None, Some(hi))) => pos(hi - x),
+        _ => match kind.map() {
+            DomainMap::Identity => x,
+            DomainMap::Exp => pos(x),
+            DomainMap::InvLogit if x > 0.0 && x < 1.0 => (x / (1.0 - x)).ln(),
+            DomainMap::InvLogit => f64::NAN,
+        },
+    }
+}
+
 /// The random effect `m(z)` a reported distribution's model reads at latent `z`: the
 /// kind's domain map, or a truncation's bounded map (`lo + (hi − lo)·inv_logit(z)`,
 /// `lo + exp(z)`, `hi − exp(z)`), as the parser rewrites the reads. A transform's ETA is
@@ -480,52 +572,91 @@ pub(crate) fn effect_moments_of(
     kinds::effect_moments(kind, omega, shapes).filter(|(m, v)| m.is_finite() && v.is_finite())
 }
 
+/// The values of a distribution's shape θs, read from `theta` by `theta_names`.
+fn shapes_by_name(
+    d: &crate::types::EtaDistribution, theta_names: &[String], theta: &[f64],
+) -> Option<Vec<f64>> {
+    d.shape_thetas
+        .iter()
+        .map(|n| {
+            let t = theta_names.iter().position(|x| x == n)?;
+            theta.get(t).copied()
+        })
+        .collect()
+}
+
+/// The prior SD of a `density` ETA's effect at variance (or scale²) `omega` and the
+/// model's `theta`; `NaN` where it has no closed form (a truncation, a t with ν ≤ 2, …).
+pub(crate) fn effect_sd(
+    d: &crate::types::EtaDistribution, omega: f64, model: &crate::types::CompiledModel,
+    theta: &[f64],
+) -> f64 {
+    shapes_by_name(d, &model.theta_names, theta)
+        .and_then(|s| effect_moments_of(d, omega, &s))
+        .filter(|&(_, v)| v > 0.0)
+        .map_or(f64::NAN, |(_, v)| v.sqrt())
+}
+
 /// Effect-scale shrinkage for every density ETA (#1721 review), written over
-/// `shrinkage[k]`: `1 − RMS(m(ẑ) − μ) / σ`, with `μ` and `σ²` the effect's exact prior
-/// mean and variance (`effect_moments_of`). The Gaussian formula `1 − RMS(ẑ)/√ω` reads
-/// the latent against the effect's variance and assumes a centred latent, neither of
-/// which holds for a density. `NaN` when the moments have no closed form (a truncation, a
-/// t with ν ≤ 2, …) or fewer than two subjects. Gaussian ETAs are left as they are.
+/// `shrinkage[k]`. Where the effect's prior mean `μ` and variance `σ²` exist in closed form
+/// (`effect_moments_of`) it is `1 − RMS(m(ẑ) − μ) / σ`: the Gaussian formula `1 − RMS(ẑ)/√ω`
+/// reads the latent against the effect's variance and assumes a centred latent, neither of
+/// which holds for a density. Where they do not (a truncation, a t with ν ≤ 2, Cauchy,
+/// Lévy, …) it is the quantile analogue `1 − IQR(m(ẑ)) / IQR(prior)` (#2669), which equals
+/// the first for a Gaussian EBE spread and needs no moment. `NaN` with fewer than four
+/// subjects, or where neither exists. Gaussian ETAs are left as they are.
 pub(crate) fn effect_shrinkage(
     model: &crate::types::CompiledModel, theta: &[f64], omega: &DMatrix<f64>,
     subjects: &[crate::types::SubjectResult], shrinkage: &mut [f64],
 ) {
-    for (k, name) in model.eta_names.iter().enumerate() {
-        let Some(d) = model
-            .eta_param_info
-            .iter()
-            .filter(|i| &i.eta_name == name)
-            .find_map(|i| i.distribution.as_ref())
-        else {
-            continue;
-        };
-        if d.form != "density" || k >= shrinkage.len() || k >= omega.nrows() {
+    let maps = model_effect_maps(model, theta);
+    for (k, d) in maps.iter().enumerate() {
+        let Some(d) = d else { continue };
+        if k >= shrinkage.len() || k >= omega.nrows() {
             continue;
         }
-        let shapes: Option<Vec<f64>> = d
-            .shape_thetas
-            .iter()
-            .map(|n| {
-                let t = model.theta_names.iter().position(|x| x == n)?;
-                theta.get(t).copied()
-            })
-            .collect();
-        let moments = shapes
-            .as_deref()
-            .and_then(|s| effect_moments_of(d, omega[(k, k)], s))
-            .filter(|&(_, v)| v > 0.0);
-        shrinkage[k] = match moments {
-            Some((mu, v)) if subjects.len() >= 2 => {
-                let ms = subjects
-                    .iter()
-                    .map(|s| (effect_of_latent(d, s.eta[k]) - mu).powi(2))
-                    .sum::<f64>()
-                    / subjects.len() as f64;
-                1.0 - ms.sqrt() / v.sqrt()
-            }
-            _ => f64::NAN,
-        };
+        let effects: Vec<f64> = subjects.iter().map(|s| effect_of_latent(d, s.eta[k])).collect();
+        shrinkage[k] = effect_shrinkage_of(d, omega[(k, k)], model, theta, &effects);
     }
+}
+
+/// [`effect_shrinkage`] of one ETA, from its subjects' effects `m(ẑ)`.
+pub(crate) fn effect_shrinkage_of(
+    d: &crate::types::EtaDistribution, omega: f64, model: &crate::types::CompiledModel,
+    theta: &[f64], effects: &[f64],
+) -> f64 {
+    let n = effects.len();
+    if n < 2 || effects.iter().any(|x| !x.is_finite()) {
+        return f64::NAN;
+    }
+    let Some(shapes) = shapes_by_name(d, &model.theta_names, theta) else {
+        return f64::NAN;
+    };
+    if let Some((mu, v)) = effect_moments_of(d, omega, &shapes).filter(|&(_, v)| v > 0.0) {
+        let ms = effects.iter().map(|x| (x - mu).powi(2)).sum::<f64>() / n as f64;
+        return 1.0 - ms.sqrt() / v.sqrt();
+    }
+    if n < 4 {
+        return f64::NAN;
+    }
+    let Some(q) = effect_quantiles_at(d, omega, &shapes, &[0.25, 0.75]) else {
+        return f64::NAN;
+    };
+    let iqr_prior = q[1] - q[0];
+    if !(iqr_prior > 0.0) {
+        return f64::NAN;
+    }
+    let mut e = effects.to_vec();
+    e.sort_by(f64::total_cmp);
+    1.0 - (sample_quantile(&e, 0.75) - sample_quantile(&e, 0.25)) / iqr_prior
+}
+
+/// The `p` quantile of sorted `x`, linearly interpolated (type 7, R's default).
+fn sample_quantile(x: &[f64], p: f64) -> f64 {
+    let h = (x.len() - 1) as f64 * p;
+    let (lo, frac) = (h.floor() as usize, h - h.floor());
+    let hi = (lo + 1).min(x.len() - 1);
+    x[lo] + frac * (x[hi] - x[lo])
 }
 
 /// The 5th, 50th and 95th percentiles of the random effect a reported distribution
@@ -541,21 +672,35 @@ pub(crate) fn effect_shrinkage(
 pub(crate) fn effect_quantiles(
     d: &crate::types::EtaDistribution, omega: f64, shapes: &[f64],
 ) -> Option<[f64; 3]> {
-    const P: [f64; 3] = [0.05, 0.5, 0.95];
+    let q = effect_quantiles_at(d, omega, shapes, &[0.05, 0.5, 0.95])?;
+    Some([q[0], q[1], q[2]])
+}
+
+/// [`effect_quantiles`] at the probabilities `p`, ascending and inside (0, 1).
+pub(crate) fn effect_quantiles_at(
+    d: &crate::types::EtaDistribution, omega: f64, shapes: &[f64], p: &[f64],
+) -> Option<Vec<f64>> {
+    let n_p = p.len();
+    if n_p == 0 {
+        return Some(Vec::new());
+    }
     if !(omega.is_finite() && omega > 0.0) {
         return None;
     }
     if d.form == "transform" {
         let kind = crate::parser::eta_shape::ShapeKind::from_name(&d.kind)?;
         let s = shapes.first().copied().unwrap_or(f64::NAN);
-        let q = P.map(|p| {
-            crate::parser::eta_shape::shape_f64(
-                kind,
-                crate::parser::eta_shape::ShapeOut::Value,
-                omega.sqrt() * crate::stats::special::normal_inv_cdf(p),
-                s,
-            )
-        });
+        let q: Vec<f64> = p
+            .iter()
+            .map(|&p| {
+                crate::parser::eta_shape::shape_f64(
+                    kind,
+                    crate::parser::eta_shape::ShapeOut::Value,
+                    omega.sqrt() * crate::stats::special::normal_inv_cdf(p),
+                    s,
+                )
+            })
+            .collect();
         return q.iter().all(|v| v.is_finite()).then_some(q);
     }
     let kind = DensityKind::from_name(&d.kind)?;
@@ -579,9 +724,9 @@ pub(crate) fn effect_quantiles(
     if !(f_hi > f_lo) {
         return None;
     }
-    let targets = P.map(|p| f_lo + p * (f_hi - f_lo));
+    let targets: Vec<f64> = p.iter().map(|p| f_lo + p * (f_hi - f_lo)).collect();
     for _ in 0..60 {
-        if cdf(at(-half))? <= targets[0] && cdf(at(half))? >= targets[2] {
+        if cdf(at(-half))? <= targets[0] && cdf(at(half))? >= targets[n_p - 1] {
             break;
         }
         if map != DomainMap::Identity {
@@ -589,7 +734,7 @@ pub(crate) fn effect_quantiles(
         }
         half *= 2.0;
     }
-    let mut q = [0.0; 3];
+    let mut q = vec![0.0; n_p];
     for (qi, &t) in q.iter_mut().zip(&targets) {
         let (mut a, mut b) = (-half, half);
         for _ in 0..200 {
@@ -720,7 +865,12 @@ fn group_correction_g<T: PkNum>(
         }
         return c(-2.0) * lp - (q + w.ln() + ln_2pi);
     }
-    if d.kind == DensityKind::Copula || (d.kind == DensityKind::LogNormal && d.etas.len() > 1) {
+    // Log-normal of median 1, scalar or MvLogNormal: `ln η ~ N(0, Ω)` is the Gaussian prior
+    // itself, so the correction is exactly 0.
+    if d.kind == DensityKind::LogNormal {
+        return c(0.0);
+    }
+    if d.kind == DensityKind::Copula || (d.kind == DensityKind::LogNormalMean && d.etas.len() > 1) {
         let n = d.etas.len();
         // Ω of the block, from Ω⁻¹'s block (block-diagonal across groups).
         let oi_g: Vec<Vec<T>> =
@@ -731,7 +881,7 @@ fn group_correction_g<T: PkNum>(
         let ld_om = -ld_oi;
         let gauss = q + ld_om + c(n as f64) * ln_2pi;
         let z: Vec<T> = d.etas.iter().map(|&a| eta[a]).collect();
-        if d.kind == DensityKind::LogNormal {
+        if d.kind == DensityKind::LogNormalMean {
             // MvLogNormal, mean 1: ln η ~ N(−diag(S)/2, S), S = ln(1 + Ω) elementwise.
             let sm: Vec<Vec<T>> =
                 om.iter().map(|r| r.iter().map(|&v| ln1p_g(v)).collect()).collect();
@@ -1015,6 +1165,15 @@ pub(crate) fn correction_jets_g<T: PkNum>(
     densities: &[EtaDensity], eta: &[T], oi: impl Fn(usize, usize) -> T,
     theta: impl Fn(usize) -> T, want_hessian: bool,
 ) -> (T, Vec<T>, Option<Vec<Vec<T>>>) {
+    correction_jets_impl(densities, eta, oi, theta, want_hessian, true)
+}
+
+/// [`correction_jets_g`], with `structured = false` taking every group through the
+/// generic pair passes (the oracle the separable copula path is tested against).
+fn correction_jets_impl<T: PkNum>(
+    densities: &[EtaDensity], eta: &[T], oi: impl Fn(usize, usize) -> T,
+    theta: impl Fn(usize) -> T, want_hessian: bool, structured: bool,
+) -> (T, Vec<T>, Option<Vec<Vec<T>>>) {
     type H<T> = DualT<1, DualT<1, T>>;
     let n = eta.len();
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
@@ -1024,6 +1183,24 @@ pub(crate) fn correction_jets_g<T: PkNum>(
     let mut grad = vec![zero; n];
     let mut hess = want_hessian.then(|| vec![vec![zero; n]; n]);
     for d in densities {
+        // A copula is separable in its margins (#2669 review, finding 11): one univariate
+        // jet pass per margin and an O(p²) assembly, where the generic pairs below take
+        // p(p+1)/2 passes of the whole block. `None` (a margin outside its domain) leaves it
+        // to the generic path, which returns the same `+∞`.
+        if structured && d.kind == DensityKind::Copula && d.trunc.is_none() {
+            if let Some((v, g, h)) = copula_jets(d, eta, &oi, &theta, want_hessian) {
+                value = value + v;
+                for (i, &a) in d.etas.iter().enumerate() {
+                    grad[a] = g[i];
+                    if let (Some(hm), Some(hg)) = (hess.as_mut(), h.as_ref()) {
+                        for (j, &b) in d.etas.iter().enumerate() {
+                            hm[a][b] = hg[i][j];
+                        }
+                    }
+                }
+                continue;
+            }
+        }
         let group = std::slice::from_ref(d);
         // η_a on the inner lane, η_b on the outer one: `v.v` is c, `v.g[0]` is ∂c/∂η_a
         // and `g[0].g[0]` is ∂²c/∂η_a∂η_b.
@@ -1062,6 +1239,112 @@ pub(crate) fn correction_jets_g<T: PkNum>(
     (value, grad, hess)
 }
 
+/// The value, η-gradient and η-Hessian of a Gaussian copula group's correction, from its
+/// separable form (#2669 review, finding 11). With Ω constant in η,
+///
+/// ```text
+/// c(z) = Σₖ n₂ₖ(zₖ) − Σₖ ln ωₖ − p ln 2π + qᵀAq − zᵀΩ⁻¹z,   A = R⁻¹ − I,
+/// ```
+///
+/// where `n₂ₖ` is margin k's latent `−2 ln p` and `qₖ = Φ⁻¹(Fₖ(m(zₖ)))` its normal score,
+/// each a function of `zₖ` alone. So
+///
+/// ```text
+/// ∂c/∂z_a     = n₂ₐ′ + 2(Aq)ₐ qₐ′ − 2(Ω⁻¹z)ₐ
+/// ∂²c/∂zₐ∂z_b = δₐ_b (n₂ₐ″ + 2(Aq)ₐ qₐ″) + 2Aₐ_b qₐ′ q_b′ − 2Ω⁻¹ₐ_b,
+/// ```
+///
+/// with each margin's two derivatives from one hyper-dual pass over the same per-margin
+/// code the value uses. The value is [`correction_g`]'s own. `None` where a margin leaves
+/// its domain.
+#[allow(clippy::type_complexity)]
+fn copula_jets<T: PkNum>(
+    d: &EtaDensity, eta: &[T], oi: &impl Fn(usize, usize) -> T, theta: &impl Fn(usize) -> T,
+    want_hessian: bool,
+) -> Option<(T, Vec<T>, Option<Vec<Vec<T>>>)> {
+    type H<T> = DualT<1, DualT<1, T>>;
+    let n = d.etas.len();
+    let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+    let lift =
+        |v: T| -> H<T> { DualT { v: DualT { v, g: [zero] }, g: [DualT { v: zero, g: [zero] }] } };
+    let value = correction_g(std::slice::from_ref(d), eta, |i, j| oi(i, j), |k| theta(k));
+    if !kinds::finite(value) {
+        return None;
+    }
+    let oi_g: Vec<Vec<T>> =
+        (0..n).map(|i| (0..n).map(|j| oi(d.etas[i], d.etas[j])).collect()).collect();
+    let (om, _) = spd_inverse(&oi_g)?;
+    let shapes: Vec<T> = d.shape_thetas.iter().map(|&k| theta(k)).collect();
+    // Per margin: (n₂, n₂′, n₂″) and (q, q′, q″) in its own latent.
+    let mut n2 = Vec::with_capacity(n);
+    let mut q = Vec::with_capacity(n);
+    let mut at = 0;
+    for (i, &kind) in d.margins.iter().enumerate() {
+        let m = kind.shapes().len();
+        let sk: Vec<H<T>> = shapes[at..at + m].iter().map(|&v| lift(v)).collect();
+        at += m;
+        let w = om[i][i];
+        let mut z = lift(eta[d.etas[i]]);
+        z.v.g[0] = one;
+        z.g[0].v = one;
+        let wl = lift(w);
+        let neg2 = if kind == DensityKind::StudentT {
+            H::<T>::from_f64(-2.0) * kinds::eta_log_pdf(kind, z, wl, &sk)
+        } else {
+            kinds::latent_neg2_logpdf(kind, z, wl, &sk)
+        };
+        if !kinds::finite(neg2.v.v) {
+            return None;
+        }
+        let qk = if kind == DensityKind::Normal {
+            z * (H::<T>::from_f64(1.0) / wl.sqrt())
+        } else {
+            let x = match kind.map() {
+                DomainMap::Identity => z,
+                DomainMap::Exp => z.exp(),
+                DomainMap::InvLogit => z.inv_logit(),
+            };
+            let u = kinds::eta_cdf(kind, x, wl, &sk)?;
+            if !(u.v.v.br_cmp_c(B::Gt, 0.0) && u.v.v.br_cmp_c(B::Lt, 1.0)) {
+                return None;
+            }
+            normal_quantile(u)
+        };
+        n2.push((neg2.v.g[0], neg2.g[0].g[0]));
+        q.push((qk.v.v, qk.v.g[0], qk.g[0].g[0]));
+    }
+    // A = R⁻¹ − I, R⁻¹ᵢⱼ = Ω⁻¹ᵢⱼ √(ωᵢ ωⱼ).
+    let a = |i: usize, j: usize| {
+        let r = oi_g[i][j] * (om[i][i] * om[j][j]).sqrt();
+        if i == j {
+            r - one
+        } else {
+            r
+        }
+    };
+    let two = T::from_f64(2.0);
+    let aq: Vec<T> = (0..n).map(|i| (0..n).fold(zero, |s, j| s + a(i, j) * q[j].0)).collect();
+    let oiz: Vec<T> =
+        (0..n).map(|i| (0..n).fold(zero, |s, j| s + oi_g[i][j] * eta[d.etas[j]])).collect();
+    let grad: Vec<T> = (0..n).map(|i| n2[i].0 + two * aq[i] * q[i].1 - two * oiz[i]).collect();
+    let hess = want_hessian.then(|| {
+        (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let mut h = two * a(i, j) * q[i].1 * q[j].1 - two * oi_g[i][j];
+                        if i == j {
+                            h = h + n2[i].1 + two * aq[i] * q[i].2;
+                        }
+                        h
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+    Some((value, grad, hess))
+}
+
 /// [`correction_jets_g`] at `f64`, with `Ω⁻¹` from its cached matrix.
 pub(crate) fn correction_jets(
     densities: &[EtaDensity], eta: &[f64], omega_inv: &DMatrix<f64>, theta: &[f64],
@@ -1073,12 +1356,6 @@ pub(crate) fn correction_jets(
     (v, g, h.map(|h| DMatrix::from_fn(n, n, |a, b| h[a][b])))
 }
 
-/// Turn a Gaussian simulation draw into the densities' draw (#1716), in place: `eta` holds
-/// `η = L·z` from `N(0, Ω)`, and every density group's entries are replaced by a draw of
-/// its latent. A t block rescales its Gaussian draw by `√(ν/W)`, `W ~ χ²_ν`, the
-/// multivariate t's scale mixture. A univariate kind draws the random effect from its
-/// distribution and stores the latent `m⁻¹(η)`. A Gaussian model draws nothing extra, so
-/// its random stream is untouched.
 /// A latent draw of a truncated group: `η` by the inverse CDF between `F(lo)` and `F(hi)`
 /// (bisection on the kind's CDF, inside a bracket that widens until it holds the target),
 /// then the truncation map's inverse.
@@ -1156,6 +1433,12 @@ fn margin_quantile(kind: DensityKind, u: f64, w: f64, s: &[f64]) -> f64 {
     0.5 * (a + b)
 }
 
+/// Turn a Gaussian simulation draw into the densities' draw (#1716), in place: `eta` holds
+/// `η = L·z` from `N(0, Ω)`, and every density group's entries are replaced by a draw of
+/// its latent. A t block rescales its Gaussian draw by `√(ν/W)`, `W ~ χ²_ν`, the
+/// multivariate t's scale mixture. A univariate kind draws the random effect from its
+/// distribution and stores the latent `m⁻¹(η)`. A Gaussian model draws nothing extra, so
+/// its random stream is untouched.
 pub(crate) fn redraw_latents(
     densities: &[EtaDensity], omega: &DMatrix<f64>, theta: &[f64], eta: &mut [f64],
     rng: &mut impl rand::Rng,
@@ -1164,7 +1447,23 @@ pub(crate) fn redraw_latents(
     for d in densities {
         let a = d.etas[0];
         let shapes: Vec<f64> = d.shape_thetas.iter().map(|&k| theta[k]).collect();
-        if d.kind == DensityKind::LogNormal && d.etas.len() > 1 {
+        if d.kind == DensityKind::LogNormal {
+            // Median 1: ln η ~ N(0, Ω), the Gaussian draw itself.
+            let n = d.etas.len();
+            let sm = DMatrix::from_fn(n, n, |i, j| omega[(d.etas[i], d.etas[j])]);
+            let Some(l) = sm.cholesky().map(|c| c.l()) else {
+                continue;
+            };
+            let zs = DVector::from_fn(n, |_, _| {
+                rand_distr::Distribution::sample(&rand_distr::StandardNormal, rng)
+            });
+            let x = l * zs;
+            for i in 0..n {
+                eta[d.etas[i]] = x[i];
+            }
+            continue;
+        }
+        if d.kind == DensityKind::LogNormalMean && d.etas.len() > 1 {
             // MvLogNormal: ln η ~ N(−diag(S)/2, S), S = ln(1 + Ω): redraw from S's factor.
             let n = d.etas.len();
             let sm = DMatrix::from_fn(n, n, |i, j| omega[(d.etas[i], d.etas[j])].ln_1p());
@@ -1218,6 +1517,107 @@ pub(crate) fn redraw_latents(
     }
 }
 
+/// The first kind with a kink or a positive-density edge (`DensityKind::has_kink_or_edge`)
+/// among a model's density groups, BSV and κ, copula margins included, with the name of the
+/// random effect that follows it; `None` when every density is smooth (#2669 review,
+/// finding 1). The FOCE/FOCEI/Laplace objective, and the covariance step built on it, read a
+/// prior curvature such a kind does not have.
+pub(crate) fn kink_kind(model: &crate::types::CompiledModel) -> Option<(DensityKind, String)> {
+    let bsv = model.eta_densities.iter().map(|d| (d, &model.eta_names));
+    let iov = model.kappa_densities.iter().map(|d| (d, &model.kappa_names));
+    for (d, names) in bsv.chain(iov) {
+        for (i, &e) in d.etas.iter().enumerate() {
+            let k = if d.kind == DensityKind::Copula { d.margins[i] } else { d.kind };
+            if k.has_kink_or_edge() {
+                return Some((k, names.get(e).cloned().unwrap_or_default()));
+            }
+        }
+    }
+    None
+}
+
+/// Which summary of its individual parameter each typical-value θ is (#2669), from the
+/// model's mu-references and its density groups' log anchors:
+///
+/// - a Gaussian (or shape-transformed) ETA under `TV·exp(η)` or `inv_logit(logit(TV) + η)`:
+///   the **median** (a monotone map of a symmetric η with `h(0) = 0`); under `TV + η` the
+///   **mean**;
+/// - a positive `density` read as `TV·η` whose effect has mean 1: the **mean**;
+/// - a `density` on ℝ read as `TV·exp(η)`: the **median** for a symmetric kind, the
+///   **geometric mean** for an asymmetric one (`gumbel`, `gev`, `nig`);
+/// - the μ of `beta(μ)` (mean) and `logitnormal(μ)` (median), for the parameter reading it.
+///
+/// A θ that is the typical value of two parameters, or of a truncated or another kind,
+/// gets no entry.
+pub(crate) fn typical_values(
+    model: &crate::types::CompiledModel,
+) -> Vec<crate::types::TypicalValue> {
+    use crate::types::{MuTransform, TypicalStatistic as S, TypicalValue};
+    let param_of = |eta: &str| {
+        model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == eta)
+            .map(|i| i.individual_param_name.clone())
+    };
+    let mut out: Vec<TypicalValue> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut push = |theta: String, parameter: Option<String>, statistic: S| {
+        let Some(parameter) = parameter else { return };
+        *seen.entry(theta.clone()).or_default() += 1;
+        out.push(TypicalValue { theta, parameter, statistic });
+    };
+    let mut refs: Vec<(&String, &crate::types::MuRef)> = model.mu_refs.iter().collect();
+    refs.sort_by(|a, b| a.0.cmp(b.0));
+    for (eta, mr) in refs {
+        let st = match mr.transform {
+            MuTransform::Identity => S::Mean,
+            MuTransform::Log | MuTransform::LogitProbability => S::Median,
+            // θ is the median on the logit scale, not a value of the parameter.
+            _ => continue,
+        };
+        push(mr.theta_name.clone(), param_of(eta), st);
+    }
+    for d in &model.eta_densities {
+        for (pos, &e) in d.etas.iter().enumerate() {
+            let kind = if d.kind == DensityKind::Copula { d.margins[pos] } else { d.kind };
+            let eta = &model.eta_names[e];
+            if d.trunc.is_none() && matches!(kind, DensityKind::Beta | DensityKind::LogitNormal) {
+                if let Some(&t) = d.shape_thetas.first().filter(|_| d.kind != DensityKind::Copula) {
+                    let st = if kind == DensityKind::Beta { S::Mean } else { S::Median };
+                    push(model.theta_names[t].clone(), param_of(eta), st);
+                }
+                continue;
+            }
+            let Some(Some(t)) = d.log_anchors.get(pos) else { continue };
+            if d.trunc.is_some() {
+                continue;
+            }
+            let st = match kind.map() {
+                DomainMap::Exp => {
+                    let w = 1.0 / model.default_params.omega.inv[(e, e)].max(f64::MIN_POSITIVE);
+                    let shapes: Vec<f64> =
+                        d.shape_thetas.iter().map(|&k| model.default_params.theta[k]).collect();
+                    match kinds::effect_moments(kind, w, &shapes) {
+                        Some((m, _)) if (m - 1.0).abs() < 1e-12 => S::Mean,
+                        _ => continue,
+                    }
+                }
+                DomainMap::Identity => match kind {
+                    DensityKind::Gumbel
+                    | DensityKind::GeneralizedExtremeValue
+                    | DensityKind::NormalInverseGaussian => S::GeometricMean,
+                    _ => S::Median,
+                },
+                DomainMap::InvLogit => continue,
+            };
+            push(model.theta_names[*t].clone(), param_of(eta), st);
+        }
+    }
+    out.retain(|v| seen.get(&v.theta) == Some(&1));
+    out
+}
+
 /// What a `density` random effect is not carried beside (#1716), as `fit()`'s refusal: a
 /// kink or edge kind (`DensityKind::has_kink_or_edge`) under a FOCE-family or Laplace
 /// method, and a κ density under nested IOV levels (which share κs across cells). `None`
@@ -1229,27 +1629,38 @@ pub(crate) fn fit_refusal(
     if model.eta_densities.is_empty() && model.kappa_densities.is_empty() {
         return None;
     }
-    // A kink or an edge under a method that reads the prior's curvature at the EBE.
+    // A kink or an edge under a method whose reported objective reads the prior's curvature
+    // at the EBE: the FOCE family, Laplace, VI's Laplace objective, and SAEM under
+    // `saem_ofv = focei`. IMP, SAEM's other objectives and Bayes score the prior itself.
     use crate::types::EstimationMethod as M;
-    // VI's `vi_final_ofv = laplace` reports a Laplace objective too.
-    let curvature = options.method_chain().into_iter().find(|m| {
-        matches!(m, M::Foce | M::FoceI | M::FoceGn | M::FoceGnHybrid | M::Laplace)
-            || (*m == M::Vi && options.vi_final_ofv == crate::types::ViFinalOfv::Laplace)
-    });
-    if let Some(m) = curvature {
-        for d in model.eta_densities.iter().chain(&model.kappa_densities) {
-            let kinds =
-                if d.kind == DensityKind::Copula { d.margins.clone() } else { vec![d.kind] };
-            if let Some(k) = kinds.into_iter().find(|k| k.has_kink_or_edge()) {
-                return Some(format!(
-                    "`density {}` has a kink or an edge where its density is positive, \
-                     so {} would read a prior curvature that does not exist there and \
-                     print an objective that may be wrong; fit it with `method = imp`, \
-                     `saem` or `bayes`, which score it exactly",
-                    k.name(),
-                    m.label()
-                ));
-            }
+    if let Some((k, eta)) = kink_kind(model) {
+        let curvature = options.method_chain().into_iter().find_map(|m| {
+            let label = match m {
+                // A pure adaptive-quadrature evaluation integrates the prior itself (its
+                // Hessian only places the nodes); Laplace at one node is the curvature.
+                M::Laplace if options.agq_eval_only && options.n_agq > 1 => return None,
+                M::Foce | M::FoceI | M::FoceGn | M::FoceGnHybrid | M::Laplace => {
+                    m.label().to_string()
+                }
+                M::Vi if options.vi_final_ofv == crate::types::ViFinalOfv::Laplace => {
+                    "VI's `vi_final_ofv = laplace`".to_string()
+                }
+                M::Saem if options.saem_ofv == crate::types::SaemOfv::Focei => {
+                    "SAEM's `saem_ofv = focei`".to_string()
+                }
+                _ => return None,
+            };
+            Some(label)
+        });
+        if let Some(m) = curvature {
+            return Some(format!(
+                "`{eta}` follows `density {}`, which has a kink or an edge where its density \
+                 is positive, so {m} would read a prior curvature that does not exist there \
+                 and report an objective that may be wrong. Fit it with `method = imp` (its \
+                 OFV is then the importance-sampling −2 log L), `saem` (with `saem_ofv = saem`, \
+                 `imp` or `agq`) or `bayes`",
+                k.name()
+            ));
         }
     }
     // A κ density group spanning two nested levels is never placed in one block: refuse.

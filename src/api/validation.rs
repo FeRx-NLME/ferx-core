@@ -7810,6 +7810,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
         "W_DERIVED_STEP_IGNORED"
     } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
         "W_ABSORPTION_TWIN_DECLINED"
+    } else if w.contains("W_DENSITY_ADDITIVE") {
+        "W_DENSITY_ADDITIVE"
     } else if w.contains(crate::parser::model_parser::DEPRECATED_BLOCK_CODE) {
         crate::parser::model_parser::DEPRECATED_BLOCK_CODE
     } else {

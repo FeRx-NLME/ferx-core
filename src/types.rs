@@ -3909,6 +3909,42 @@ pub struct EtaParamInfo {
     pub distribution: Option<EtaDistribution>,
 }
 
+/// Which summary of an individual parameter's distribution a θ is (#2669): what its row
+/// in the parameter table says, e.g. `TVCL` is the **median** of CL under
+/// `CL = TVCL * exp(ETA_CL)` and the **mean** under `density gamma`'s `CL = TVCL * ETA_CL`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct TypicalValue {
+    /// The θ's name.
+    pub theta: String,
+    /// The individual parameter it is the typical value of (`CL`).
+    pub parameter: String,
+    /// Which summary of that parameter's between-subject distribution it is.
+    pub statistic: TypicalStatistic,
+}
+
+/// See [`TypicalValue`].
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TypicalStatistic {
+    /// The population mean (an additive Gaussian ETA; a mean-1 positive density).
+    Mean,
+    /// The population median (`TV·exp(η)` with a symmetric η; a logit-normal fraction).
+    Median,
+    /// `exp(E[ln P])`: `TV·exp(η)` with an asymmetric, mean-0 η (`gumbel`, `gev`, `nig`).
+    GeometricMean,
+}
+
+impl TypicalStatistic {
+    /// The word printed on a θ row.
+    pub fn label(self) -> &'static str {
+        match self {
+            TypicalStatistic::Mean => "mean",
+            TypicalStatistic::Median => "median",
+            TypicalStatistic::GeometricMean => "geometric mean",
+        }
+    }
+}
+
 /// How a non-Gaussian ETA is distributed (#1716), for reporting.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct EtaDistribution {
@@ -3919,9 +3955,16 @@ pub struct EtaDistribution {
     pub kind: String,
     /// The θ names of its shapes (ν, μ, λ, …), in the kind's argument order.
     pub shape_thetas: Vec<String>,
-    /// `Some((lo, hi))` for `truncated(…)`, `None` (infinite) on an open side.
+    /// `Some((lo, hi))` for `truncated(…)`, `None` (infinite) on an open side. A bound that
+    /// is a θ holds its value at the model's initial estimates here; its name is in
+    /// [`Self::truncation_thetas`], and every reported effect reads the fitted value
+    /// (`stats::eta_density::resolve_distribution`, #2669).
     #[serde(default)]
     pub truncation: Option<(Option<f64>, Option<f64>)>,
+    /// The θ names of a truncation's θ-valued bounds, `(lo, hi)`; `None` on a side that is
+    /// a number or open, and for no truncation.
+    #[serde(default)]
+    pub truncation_thetas: (Option<String>, Option<String>),
 }
 
 /// PK parameter function: maps `(theta, eta, covariates, time)` -> PkParams.
@@ -6588,14 +6631,14 @@ impl CompiledModel {
         self.kappa_weights.iter().any(|w| w.is_some())
     }
 
-    /// Whether the model declares more than one variability level below `ID` (#1082).
-    #[inline]
     /// Whether any random effect follows a non-Gaussian `density` (#1716): a BSV ETA or
     /// an IOV κ.
     pub(crate) fn has_densities(&self) -> bool {
         !self.eta_densities.is_empty() || !self.kappa_densities.is_empty()
     }
 
+    /// Whether the model declares more than one variability level below `ID` (#1082).
+    #[inline]
     pub(crate) fn has_nested_levels(&self) -> bool {
         self.indiv_param_partials.nested_levels.is_some()
     }
@@ -7809,6 +7852,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // a prose match, so it is tested before any of them rather than just before the one
         // that happened to collide.
         (WarningSeverity::Warning, WarningCode::AbsorptionTwinDeclined)
+    } else if lower.starts_with("w_density_no_covariance") {
+        // #2669: the covariance step was skipped by design under a kink or edge density.
+        // A token arm ahead of the prose ones, whose "covariance step" arms read failure.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.starts_with("w_density_foce_conditional")
+        || lower.starts_with("w_density_no_objective")
+    {
+        // #2669: what a density fit's objective is. Token arm ahead of the prose ones, whose
+        // "FOCE" and "objective" wording would claim them.
+        (WarningSeverity::Warning, WarningCode::OptimizerConfig)
     } else if lower.starts_with("w_tte_solve_failed") {
         // #2087: a simulated subject's ODE-accumulated event-time solve failed and the
         // subject was censored. Ahead of every prose arm for the reason the arm above gives:
@@ -8609,6 +8662,22 @@ pub struct FitResult {
     /// `saem_ofv = focei`.
     #[serde(default)]
     pub saem_objective: Option<SaemObjective>,
+    /// `ofv` (and so AIC/BIC) is the importance-sampling marginal `−2 log L`
+    /// ([`Self::importance_sampling`]) rather than the final Laplace pass of an IMP / IMPMAP
+    /// fit (#2669): a `density` kind with a kink or an edge has no valid Laplace objective.
+    #[serde(default)]
+    pub ofv_is_importance_sampling: bool,
+    /// Per θ that is an individual parameter's typical value, which summary of it the θ is
+    /// (#2669): printed on its row and written to the YAML as `typical_value_of`. Empty for
+    /// a θ that is no single parameter's typical value, and for a fit saved before it.
+    #[serde(default)]
+    pub typical_values: Vec<TypicalValue>,
+    /// Per BSV ETA with a reported distribution, the 95% interval of each of its effect's
+    /// 5th, 50th and 95th percentiles (`[[lo, hi]; 3]`), by simulation from the covariance
+    /// step's matrix (#2669): 500 asymptotic draws of the parameters, the exact
+    /// percentiles at each. Empty without a covariance matrix; `None` for a Gaussian ETA.
+    #[serde(default)]
+    pub eta_effect_quantile_ci: Vec<Option<[[f64; 2]; 3]>>,
     /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
     /// output. `Some` when the final estimating stage was IMPMAP.
     pub impmap_trace: Option<ImpmapTrace>,
@@ -11100,8 +11169,7 @@ pub enum ViOmegaUpdate {
     Adam,
 }
 
-/// How the residual error `σ` is updated each iteration.
-/// How `σ` is updated. Adam-stepping σ is unreliable: on warfarin at `vi_lr = 0.02` it
+/// How `σ` is updated each iteration. Adam-stepping σ is unreliable: on warfarin at `vi_lr = 0.02` it
 /// lands 34% above the ML value even from the FOCEI point, 11.4 ELBO units short, while
 /// the gradient matches central differences to 1e-6. Hence the closed form, as for `Ω`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -11167,8 +11235,7 @@ pub enum OmegaPrior {
     Lkj { eta: f64 },
 }
 
-/// Which marginal likelihood, if any, to evaluate at the converged VI estimate.
-/// Which marginal likelihood to evaluate at the converged VI estimate (the ELBO is a
+/// Which marginal likelihood, if any, to evaluate at the converged VI estimate (the ELBO is a
 /// bound, never written to `FitResult::ofv`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ViFinalOfv {

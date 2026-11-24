@@ -4639,6 +4639,30 @@ pub fn parse_full_model_with(
             }
         }
     }
+    // `density lognormal` (median 1, untruncated) is `ln η ~ N(0, Ω)`: once its reads are
+    // wrapped in `exp` above, the ETA *is* a Gaussian one read as `TV·exp(η)`. It leaves the
+    // density groups here, so every Gaussian path (mu-referencing, the closed-form M-steps,
+    // the conjugate Bayes moves, the structured kernels) serves it, bit for bit as the
+    // classic spelling. Its groups are kept only to report the declared distribution.
+    let gaussian_lognormal = |d: &crate::stats::eta_density::EtaDensity| {
+        d.kind == crate::stats::eta_density::DensityKind::LogNormal && d.trunc.is_none()
+    };
+    let (eta_lognormal_groups, eta_densities): (Vec<_>, Vec<_>) =
+        eta_densities.into_iter().partition(gaussian_lognormal);
+    let (kappa_lognormal_groups, kappa_densities): (Vec<_>, Vec<_>) =
+        kappa_densities.into_iter().partition(gaussian_lognormal);
+    // How the model reads each density ETA, on the statements as written (before the map).
+    let mut density_read_warnings: Vec<String> = Vec::new();
+    check_density_reads(
+        &indiv_stmts,
+        eta_densities
+            .iter()
+            .chain(&eta_lognormal_groups)
+            .map(|d| (d, 0))
+            .chain(kappa_densities.iter().chain(&kappa_lognormal_groups).map(|d| (d, n_bsv))),
+        |slot| if slot < n_bsv { &eta_names_bsv[slot] } else { &kappa_names[slot - n_bsv] },
+        &mut density_read_warnings,
+    )?;
     if !density_maps.is_empty() {
         let named_blocks = extracted
             .named
@@ -5834,6 +5858,10 @@ pub fn parse_full_model_with(
                 Bound::Value(v) => Some(v),
                 Bound::Shape(p) => Some(default_params.theta[d.shape_thetas[p]]),
             };
+            let bound_theta = |b: Bound| match b {
+                Bound::Shape(p) => Some(theta_names[d.shape_thetas[p]].clone()),
+                _ => None,
+            };
             // A copula's margins own consecutive runs of `shape_thetas`; every other
             // group's ETAs share its leading `kind.shapes()` (a truncation's bound θs
             // follow them).
@@ -5856,6 +5884,9 @@ pub fn parse_full_model_with(
                         kind: kind.name().to_string(),
                         shape_thetas: shapes,
                         truncation: d.trunc.map(|t| (bound(t.lo), bound(t.hi))),
+                        truncation_thetas: d
+                            .trunc
+                            .map_or((None, None), |t| (bound_theta(t.lo), bound_theta(t.hi))),
                     },
                 );
             }
@@ -5863,14 +5894,16 @@ pub fn parse_full_model_with(
         dist
     };
     let kappa_distributions: Vec<Option<crate::types::EtaDistribution>> =
-        if kappa_densities.is_empty() {
+        if kappa_densities.is_empty() && kappa_lognormal_groups.is_empty() {
             Vec::new()
         } else {
             let mut kd = group_distributions(&kappa_densities);
+            kd.extend(group_distributions(&kappa_lognormal_groups));
             (0..kappa_names.len()).map(|k| kd.remove(&k)).collect()
         };
     {
         let mut dist = group_distributions(&eta_densities);
+        dist.extend(group_distributions(&eta_lognormal_groups));
         // Shape transforms: every `BinOp::Shape(kind, Value)` whose η side is one ETA.
         for st in &indiv_stmts {
             visit_stmt_nodes(std::slice::from_ref(st), &mut |e: &Expression| {
@@ -5891,6 +5924,7 @@ pub fn parse_full_model_with(
                                 kind: kind.name().to_string(),
                                 shape_thetas: shapes,
                                 truncation: None,
+                                truncation_thetas: (None, None),
                             });
                         }
                     }
@@ -6077,7 +6111,10 @@ pub fn parse_full_model_with(
         covariate_mu_refs,
         referenced_covariates,
         gradient_method: GradientMethod::default(),
-        parse_warnings: deprecated_block_warnings, // more pushed below
+        parse_warnings: deprecated_block_warnings
+            .into_iter()
+            .chain(density_read_warnings)
+            .collect(), // more pushed below
         has_conditional_eta_params: false,
         eta_param_info,
         kappa_param_types,
@@ -8340,6 +8377,115 @@ fn apply_omega_dist_block(extracted: &mut ExtractedBlocks) -> Result<(), String>
     Ok(())
 }
 
+/// How `[individual_parameters]` reads a `density` ETA, checked before its domain map is
+/// applied (#2669 review, findings 2 and 3). `groups` pairs each group with its slot offset
+/// (`n_bsv` for κ groups); `name` names a slot.
+///
+/// - A positive or (0, 1) effect (`gamma`, `lognormal`, `beta`, …) inside `exp`, `log`,
+///   `inv_logit` or `logit` is refused: the ETA already *is* the effect on its support, so
+///   `TVCL * exp(ETA_CL)` under `density gamma` would fit `TVCL·exp(Gamma)`. The message
+///   names the line to write.
+/// - A `density` ETA that is also shaped (`[eta_shape]` or an inline `boxcox(ETA, λ)`) is
+///   refused: the two would compose into a model neither declaration describes.
+/// - A positive effect added to a typical value (`TVCL + ETA_CL`) is valid but almost
+///   never meant (it shifts TVCL by the effect's mean), so it is a warning.
+fn check_density_reads<'a>(
+    stmts: &[Statement],
+    groups: impl Iterator<Item = (&'a crate::stats::eta_density::EtaDensity, usize)>,
+    name: impl Fn(usize) -> &'a String, warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    use crate::stats::eta_density::{DensityKind, DomainMap};
+    let mut kinds: HashMap<usize, DensityKind> = HashMap::new();
+    for (d, off) in groups {
+        for (i, &k) in d.etas.iter().enumerate() {
+            let kind = if d.kind == DensityKind::Copula { d.margins[i] } else { d.kind };
+            kinds.insert(off + k, kind);
+        }
+    }
+    let bounded = |slot: usize| kinds.get(&slot).filter(|k| k.map() != DomainMap::Identity);
+    let mut err: Option<String> = None;
+    let mut warned: HashSet<usize> = HashSet::new();
+    for st in stmts {
+        let target = match st {
+            Statement::Assign(n, _) => n.as_str(),
+            _ => "P",
+        };
+        visit_stmt_nodes(std::slice::from_ref(st), &mut |e: &Expression| {
+            if err.is_some() {
+                return;
+            }
+            match e {
+                Expression::UnaryFn(f, arg)
+                    if matches!(
+                        f.as_str(),
+                        "exp" | "log" | "ln" | "inv_logit" | "expit" | "logit"
+                    ) =>
+                {
+                    let mut hit = None;
+                    visit_expr_nodes(arg, &mut |x: &Expression| {
+                        if let Expression::Eta(k) = x {
+                            if hit.is_none() {
+                                hit = bounded(*k).map(|kind| (*k, *kind));
+                            }
+                        }
+                    });
+                    if let Some((k, kind)) = hit {
+                        let eta = name(k);
+                        let (support, write) = match kind.map() {
+                            DomainMap::InvLogit => ("(0, 1)", format!("{target} = {eta}")),
+                            _ => ("(0, ∞)", format!("{target} = TV{target} * {eta}")),
+                        };
+                        err = Some(format!(
+                            "[individual_parameters] `{eta}` follows `density {}`, so it already \
+                             is the random effect on {support}: `{f}({eta})` would put a \
+                             second transform on it. Read it directly, e.g. `{write}`",
+                            kind.name()
+                        ));
+                    }
+                }
+                Expression::BinOp(l, BinOp::Shape(shape, _), _) => {
+                    if let Expression::Eta(k) = **l {
+                        if let Some(kind) = kinds.get(&k) {
+                            err = Some(format!(
+                                "`{}` follows `density {}` on its [parameters] line and is also \
+                                 shaped by `{}` ([eta_shape] or inline): a random effect takes \
+                                 one of the two. Keep the `density` line, or remove it and keep \
+                                 the `[eta_shape]` transform of a Gaussian ETA",
+                                name(k),
+                                kind.name(),
+                                shape.name()
+                            ));
+                        }
+                    }
+                }
+                Expression::BinOp(a, BinOp::Add | BinOp::Sub, b) => {
+                    for side in [a, b] {
+                        if let Expression::Eta(k) = **side {
+                            if let Some(kind) = kinds.get(&k).filter(|k| k.map() == DomainMap::Exp)
+                            {
+                                if warned.insert(k) {
+                                    warnings.push(format!(
+                                        "W_DENSITY_ADDITIVE: `{}` follows `density {}` (a \
+                                         positive effect with mean or median 1) and is added to \
+                                         a term in `{target}`, which shifts it by that mean. \
+                                         A proportional read (`{target} = TV{target} * {}`) is \
+                                         the usual model; an additive ETA needs no `density`.",
+                                        name(k),
+                                        kind.name(),
+                                        name(k)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+    err.map_or(Ok(()), Err)
+}
+
 /// The omega-line `density` declarations (#1716) as [`crate::stats::eta_density::EtaDensity`]
 /// groups: ETA positions and shape-θ indices, checked against the declared parameters.
 fn resolve_eta_densities(
@@ -8404,10 +8550,11 @@ fn resolve_eta_densities(
         }
         if d.etas.len() > 1 && !kind.allows_block() {
             return Err(format!(
-                "[parameters] `density {}` is univariate: a block of correlated ETAs can be \
-                 Gaussian or `density t(ν)` (a multivariate t); correlating other kinds needs \
-                 a copula, which is not supported. Declare each ETA on its own `omega` line: `{}`",
-                d.kind, d.line
+                "[parameters] `density {}` is univariate. A block of correlated ETAs takes \
+                 `density t(ν)` (a multivariate t), `lognormal` or `lognormal_mean` (a \
+                 multivariate log-normal), or `copula(ETA_A = {}, ETA_B = …)` to correlate \
+                 univariate margins; or declare each ETA on its own `omega` line: `{}`",
+                d.kind, d.kind, d.line
             ));
         }
         let mut etas = Vec::with_capacity(d.etas.len());
@@ -8449,6 +8596,21 @@ fn resolve_eta_densities(
                     ),
                 },
                 d.args.len(),
+                d.line
+            ));
+        }
+        // `(sd)` squares the number written into ω. For a variance kind that is the effect's
+        // SD, for `t` / `cauchy` (ω = scale²) the scale; for `levy` ω is the scale itself,
+        // so `(sd)` would declare its square root (#2669 review, finding 13).
+        let sd_flagged = {
+            let compact: String =
+                d.line.to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+            compact.contains("(sd)")
+        };
+        if sd_flagged && kind == DensityKind::Levy {
+            return Err(format!(
+                "[parameters] `density levy` takes its scale as ω, not a variance, so `(sd)` \
+                 does not apply: write the scale itself: `{}`",
                 d.line
             ));
         }
@@ -19145,25 +19307,20 @@ fn parse_parameters(
         // `apply_omega_dist_block`); `crate::parser::eta_shape::omega_density_decls`
         // reads it, here it is only peeled, and refused on any other declaration.
         let (line, dist_clause) = crate::parser::eta_shape::split_dist_clause(&line)?;
-        if let Some(c) = &dist_clause {
-            let kw = crate::parser::eta_shape::decl_keyword(&line);
-            if c.transform
-                || !matches!(kw.as_str(), "omega" | "block_omega" | "kappa" | "block_kappa")
-            {
-                return Err(format!(
-                    "[parameters] a `{}` clause belongs on an `omega` or `block_omega` \
-                     declaration{}: `{}`",
-                    if c.transform { "transform" } else { "density" },
-                    if kw == "kappa" || kw == "block_kappa" {
-                        " (an IOV kappa is not supported yet, #1717)"
-                    } else if c.transform {
-                        ", and on a standalone `omega` for a transform"
-                    } else {
-                        ""
-                    },
-                    source_line.trim()
-                ));
-            }
+        // `apply_omega_dist_clauses` has already refused a `transform` clause and a clause on
+        // any other declaration, naming the four that take one; this keeps the same words.
+        if dist_clause.as_ref().is_some_and(|c| {
+            c.transform
+                || !matches!(
+                    crate::parser::eta_shape::decl_keyword(&line).as_str(),
+                    "omega" | "block_omega" | "kappa" | "block_kappa"
+                )
+        }) {
+            return Err(format!(
+                "[parameters] a `density` clause belongs on an `omega`, `block_omega`, `kappa` \
+                 or `block_kappa` declaration: `{}`",
+                source_line.trim()
+            ));
         }
         let (line, weight_expr) =
             split_weight_modifier(&line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;

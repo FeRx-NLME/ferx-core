@@ -637,6 +637,7 @@ fn predict_survival_rows(
             model,
             population,
             etas,
+            &params.theta,
             super::adaptive_inputs::SuppliedEtasEntry::PredictSurvival,
         )?
         .into_iter()

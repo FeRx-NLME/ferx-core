@@ -308,10 +308,14 @@ theta:
     estimate: 0.132735
     se: 0.014549
     rse_pct: 11.0
+    typical_value_of: CL
+    typical_value_statistic: median
   TVV:
     estimate: 7.694842
     se: 0.293028
     rse_pct: 3.8
+    typical_value_of: V
+    typical_value_statistic: median
 omega:
   omega_11:
     variance: 0.028584
@@ -384,7 +388,10 @@ which is not a likelihood; `objective_function` then carries `ofv_type: saem_obj
 `ofv_mc_standard_error`, `ofv_n_samples` (or `ofv_n_nodes`) and `ofv_foce_laplace`; AIC and BIC
 are built from `ofv`. See [The reported OFV](estimation/saem.qmd#saem-reported-ofv).
 
-On an IMP or IMPMAP fit, `objective_function` also carries `ofv_type: laplace`,
+On an IMP or IMPMAP fit, `objective_function` also carries `ofv_type: laplace`
+(`ofv_type: importance_sampling` when a `density` with a kink or an edge makes the
+importance-sampling `−2 log L` the reported `ofv`; see
+[Random-effect distributions](model-file/random-effect-distributions.qmd#limits)),
 and any fit with an importance-sampling marginal carries
 `marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. See
 [which number matches NONMEM](estimation/importance-sampling.qmd#how-the-estimator-works).
@@ -484,6 +491,11 @@ which the fit JSON and the `.fitrx` bundle carry as `starts`.
   [Which covariance estimator produced these numbers](#covariance-estimator)
   before comparing one against another tool
 - **rse_pct**: Relative standard error as percentage (SE/estimate * 100)
+- **typical_value_of** / **typical_value_statistic**: on a θ that is one
+  parameter's typical value, that parameter and which summary of it the θ is:
+  `median` (`TVCL * exp(ETA)`), `mean` (`TVV + ETA`, a mean-1 positive
+  `density`) or `geometric_mean` (an asymmetric `density` on ℝ under `exp`).
+  The console prints it after the row, e.g. `(median of CL)`.
 - **cv_pct** / **sd**: how an `omega` / `omega_iov` variance reads on the scale
   its random effect enters (#1643). A log-normal effect (`TVCL * exp(ETA)`) gets
   `cv_pct` = sqrt(exp(variance) - 1) * 100, the exact CV (#1858; formerly the

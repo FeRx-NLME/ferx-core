@@ -558,7 +558,59 @@ fn density_vi_mstep(
             ));
         }
     }
-    *x = crate::estimation::parameterization::pack_params(&params);
+    // Only the slots the density step owns (#2669 review, finding 8): its groups' Ω entries
+    // and shape θs. A full repack would round-trip every other θ and σ through
+    // `exp(ln(·))` each iteration, the drift `write_omega_block` avoids.
+    let packed = crate::estimation::parameterization::pack_params(&params);
+    for i in density_owned_slots(model, template) {
+        x[i] = packed[i];
+    }
+}
+
+/// The packed coordinates the density M-step sets (#1716): every Ω entry (BSV and Ω_IOV)
+/// whose row and column lie in one density group, and every group's shape θ. The Ω
+/// factor is block-diagonal across declared blocks, so a group's Cholesky entries depend on
+/// its own block only. Adam's gradient is zeroed on them ([`zero_density_coords`]): the
+/// M-step is their maximiser, and Adam's step would only be overwritten.
+fn density_owned_slots(model: &CompiledModel, template: &ModelParameters) -> Vec<usize> {
+    let layout = PackedLayout::new(template);
+    let mut out = Vec::new();
+    let in_group = |groups: &[crate::stats::eta_density::EtaDensity], i: usize, j: usize| {
+        groups.iter().any(|d| d.etas.contains(&i) && d.etas.contains(&j))
+    };
+    for (slot, (i, j)) in crate::estimation::parameterization::lower_tri_iter(
+        template.omega.dim(),
+        template.omega.diagonal,
+    )
+    .enumerate()
+    {
+        if in_group(&model.eta_densities, i, j) {
+            out.push(layout.omega_start() + slot);
+        }
+    }
+    if let Some(iov) = template.omega_iov.as_ref() {
+        for (slot, (i, j)) in
+            crate::estimation::parameterization::lower_tri_iter(iov.dim(), iov.diagonal).enumerate()
+        {
+            if in_group(&model.kappa_densities, i, j) {
+                out.push(layout.omega_iov_start() + slot);
+            }
+        }
+    }
+    for d in model.eta_densities.iter().chain(&model.kappa_densities) {
+        out.extend(d.shape_thetas.iter().copied());
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Zero Adam's gradient on the density M-step's slots ([`density_owned_slots`]), so under
+/// either `vi_omega_update` the two never step one coordinate.
+fn zero_density_coords(grad: &mut [f64], model: &CompiledModel, template: &ModelParameters) {
+    for i in density_owned_slots(model, template) {
+        grad[i] = 0.0;
+    }
 }
 
 fn write_closed_form_omegas(
@@ -829,6 +881,9 @@ pub fn run_vi(
         let penalty = fold_nn_penalty(&nn_reg, &x, &mut grad_x, &mut grad_pen);
         obj_trace.push(2.0 * eval.neg_elbo + penalty);
         zero_fixed_coords(&mut grad_x, init_params, &layout);
+        if model.has_densities() {
+            zero_density_coords(&mut grad_x, model, init_params);
+        }
         // A density's shape θ (#1716) is the prior M-step's below, not Adam's.
         for &t in &density_owned {
             grad_x[t] = 0.0;

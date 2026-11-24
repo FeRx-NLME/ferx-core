@@ -271,6 +271,12 @@ struct FitWire {
     importance_sampling: Option<ImportanceSamplingResult>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nan_tolerant")]
     saem_objective: Option<crate::types::SaemObjective>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ofv_is_importance_sampling: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    typical_values: Vec<crate::types::TypicalValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    eta_effect_quantile_ci: Vec<Option<[[f64; 2]; 3]>>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nan_tolerant")]
     impmap_trace: Option<ImpmapTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1726,6 +1732,9 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         bayes: r.bayes.clone(),
         importance_sampling: r.importance_sampling.clone(),
         saem_objective: r.saem_objective.clone(),
+        ofv_is_importance_sampling: r.ofv_is_importance_sampling,
+        typical_values: r.typical_values.clone(),
+        eta_effect_quantile_ci: r.eta_effect_quantile_ci.clone(),
         impmap_trace: r.impmap_trace.clone(),
         exclusions: r.exclusions.clone(),
         stalled_at_init: crate::model_selection::stalled_at_init(r),
@@ -3745,6 +3754,9 @@ fn wire_to_fit_result(
         sir_resamples_packed,
         importance_sampling,
         saem_objective: w.saem_objective,
+        ofv_is_importance_sampling: w.ofv_is_importance_sampling,
+        typical_values: w.typical_values,
+        eta_effect_quantile_ci: w.eta_effect_quantile_ci,
         impmap_trace: w.impmap_trace,
         bayes: w.bayes,
         vi,

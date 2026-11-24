@@ -6351,14 +6351,20 @@ pub fn run_saem(
                         gamma_omega,
                     );
                 } else if let Some(mix) = saem_mix.as_mut() {
-                    let base: Vec<Vec<f64>> = state
-                        .etas
-                        .iter()
-                        .zip(&mix.classes)
-                        .filter(|(_, c)| !over.iter().any(|&(oc, _)| oc == **c))
-                        .map(|(e, _)| e.clone())
-                        .collect();
-                    dm.sa_step(model, &base, &mut state.omega_mat, &mut theta_nat, gamma_omega);
+                    // A group's base step leaves out only the classes that override one of
+                    // its own ETAs (#2669 review, finding 9).
+                    let classes = &mix.classes;
+                    let keep = |d: &crate::stats::eta_density::EtaDensity, i: usize| {
+                        !over.iter().any(|&(oc, j)| oc == classes[i] && d.etas.contains(&j))
+                    };
+                    dm.sa_step_where(
+                        model,
+                        &state.etas,
+                        &keep,
+                        &mut state.omega_mat,
+                        &mut theta_nat,
+                        gamma_omega,
+                    );
                     if mix.omega_stat_active {
                         for &(c, j) in &over {
                             let Some(g) = model.eta_densities.iter().find(|d| d.etas == [j]) else {

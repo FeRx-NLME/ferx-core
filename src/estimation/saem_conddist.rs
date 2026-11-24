@@ -60,6 +60,7 @@ pub fn run_conditional_distribution(
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
+    let maps = crate::stats::eta_density::model_effect_maps(model, &params.theta);
 
     let nsamp = options.saem_conddist_nsamp.max(1);
     let burnin = options.saem_conddist_burnin;
@@ -268,17 +269,24 @@ pub fn run_conditional_distribution(
                     }
                 }
 
-                // Accumulate after burn-in (Welford).
+                // Accumulate after burn-in (Welford), on the effect scale: a `density`
+                // ETA's draw is reported as the effect `m(z)` the model reads (#2669).
                 if sweep >= burnin {
                     count += 1;
                     let inv = 1.0 / count as f64;
+                    let x: Vec<f64> = (0..n_eta)
+                        .map(|j| match maps.get(j).and_then(Option::as_ref) {
+                            Some(d) => crate::stats::eta_density::effect_of_latent(d, eta[j]),
+                            None => eta[j],
+                        })
+                        .collect();
                     for j in 0..n_eta {
-                        let d = eta[j] - mean[j];
+                        let d = x[j] - mean[j];
                         mean[j] += d * inv;
-                        m2[j] += d * (eta[j] - mean[j]);
+                        m2[j] += d * (x[j] - mean[j]);
                     }
                     if keep {
-                        samples.push(eta.clone());
+                        samples.push(x);
                     }
                 }
             }
@@ -309,7 +317,17 @@ pub fn run_conditional_distribution(
             let m: f64 = cond_mean.iter().map(|cm| cm[j]).sum::<f64>() / n_subjects as f64;
             let var: f64 = cond_mean.iter().map(|cm| (cm[j] - m).powi(2)).sum::<f64>()
                 / (n_subjects - 1) as f64;
-            let omega_sd = omega.matrix[(j, j)].sqrt();
+            // A `density` ETA's means are effects: against the effect's prior SD (NaN
+            // where it has none in closed form).
+            let omega_sd = match maps.get(j).and_then(Option::as_ref) {
+                Some(d) => crate::stats::eta_density::effect_sd(
+                    d,
+                    omega.matrix[(j, j)],
+                    model,
+                    &params.theta,
+                ),
+                None => omega.matrix[(j, j)].sqrt(),
+            };
             1.0 - var.sqrt() / omega_sd
         })
         .collect();

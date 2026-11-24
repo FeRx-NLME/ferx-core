@@ -364,7 +364,9 @@ pub(super) fn latent_neg2_logpdf<T: PkNum>(kind: DensityKind, z: T, w: T, s: &[T
             let beta = alpha - one;
             c::<T>(-2.0) * (alpha * beta.ln() - alpha.ln_gamma() - alpha * z - beta * (-z).exp())
         }
-        K::LogNormal => {
+        // Median 1: z = ln η ~ N(0, ω), exactly the Gaussian prior.
+        K::LogNormal => z * z / w + w.ln() + ln2pi,
+        K::LogNormalMean => {
             let s2 = ln1p_g(w);
             let r = z + s2 * c(0.5);
             r * r / s2 + s2.ln() + ln2pi
@@ -601,6 +603,10 @@ pub(super) fn sample_eta(kind: DensityKind, w: f64, s: &[f64], rng: &mut impl ra
             Gamma::new(alpha, 1.0 / (alpha - 1.0)).map_or(f64::NAN, |d| 1.0 / d.sample(rng))
         }
         K::LogNormal => {
+            let n: f64 = StandardNormal.sample(rng);
+            (w.sqrt() * n).exp()
+        }
+        K::LogNormalMean => {
             let s2 = w.ln_1p();
             let n: f64 = StandardNormal.sample(rng);
             (-0.5 * s2 + s2.sqrt() * n).exp()
@@ -889,6 +895,8 @@ pub(super) fn effect_moments(kind: DensityKind, w: f64, s: &[f64]) -> Option<(f6
         K::Erlang => Some((1.0, 1.0 / s.first()?)),
         K::Rayleigh => Some((1.0, 4.0 / PI - 1.0)),
         K::Beta => Some((*s.first()?, w)),
+        // Median 1, ln η ~ N(0, ω): mean e^{ω/2}, variance (e^ω − 1)·e^ω.
+        K::LogNormal => Some(((0.5 * w).exp(), w.exp_m1() * w.exp())),
         K::Logistic
         | K::Laplace
         | K::Gumbel
@@ -905,7 +913,7 @@ pub(super) fn effect_moments(kind: DensityKind, w: f64, s: &[f64]) -> Option<(f6
         | K::SymTriangular => Some((0.0, w)),
         K::Gamma
         | K::InvGamma
-        | K::LogNormal
+        | K::LogNormalMean
         | K::ChiSq
         | K::Chi
         | K::Weibull
@@ -1071,6 +1079,12 @@ pub(super) fn eta_cdf<T: PkNum>(kind: DensityKind, x: T, w: T, s: &[T]) -> Optio
             regularized_gamma_q(alpha, (alpha - one) / x)
         }
         K::LogNormal => {
+            if !pos() {
+                return Some(zero);
+            }
+            normal_cdf_g(x.ln() / w.sqrt())
+        }
+        K::LogNormalMean => {
             if !pos() {
                 return Some(zero);
             }

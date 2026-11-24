@@ -12191,10 +12191,17 @@ fn the_iov_adjoint_of_a_logit_normal_kappa_is_its_translated_gaussian() {
 /// A 1-cpt oral model whose `ETA_D` carries one density (#1716): `params` the extra
 /// `[parameters]` lines (shape θs, the omega line), `read` how `V` reads `ETA_D`.
 fn density_kind_model(params: &str, read: &str) -> CompiledModel {
+    // A log-normal block makes `ETA_CL` a positive effect too, read directly (an `exp` over
+    // it is refused, #2669 review finding 2).
+    let cl = if params.contains("block_omega") && params.contains("density lognormal") {
+        "ETA_CL"
+    } else {
+        "exp(ETA_CL)"
+    };
     let src = format!(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
          theta TVKA(1.2, 0.05, 20.0)\n{params}\n  sigma PROP_ERR ~ 0.1 (sd)\n\
-         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * {read}\n  KA = TVKA\n\
+         [individual_parameters]\n  CL = TVCL * {cl}\n  V = TVV * {read}\n  KA = TVKA\n\
          [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
          [error_model]\n  DV ~ proportional(PROP_ERR)\n"
     );
@@ -12240,7 +12247,7 @@ fn every_smooth_density_kind_matches_reconverged_fd_through_the_plans() {
         ("semicircle", format!("{CL}  omega ETA_D ~ 0.06 density semicircle"), real, 0.1),
         ("chisq", format!("{CL}  omega ETA_D ~ 0.06 density chisq"), pos, 0.1),
         ("invgamma", format!("{CL}  omega ETA_D ~ 0.06 density invgamma"), pos, 0.1),
-        ("lognormal", format!("{CL}  omega ETA_D ~ 0.06 density lognormal"), pos, 0.1),
+        ("lognormal_mean", format!("{CL}  omega ETA_D ~ 0.06 density lognormal_mean"), pos, 0.1),
         ("chi", format!("{CL}  omega ETA_D ~ 0.06 density chi"), pos, 0.1),
         ("weibull", format!("{CL}  omega ETA_D ~ 0.06 density weibull"), pos, 0.1),
         ("frechet", format!("{CL}  omega ETA_D ~ 0.06 density frechet"), pos, 0.1),
@@ -12254,7 +12261,7 @@ fn every_smooth_density_kind_matches_reconverged_fd_through_the_plans() {
         ("kolmogorov", format!("{CL}  omega ETA_D ~ 1 FIX density kolmogorov"), pos, 0.1),
         ("beta", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.03 density beta(MU)"), unit, 0.2),
         ("logitnormal", format!("  theta MU(0.4, 0.01, 0.99)\n{CL}  omega ETA_D ~ 0.3 density logitnormal(MU)"), unit, 0.2),
-        ("lognormal block", "  block_omega (ETA_CL, ETA_D) = [0.09, 0.02, 0.06] density lognormal".into(), pos, 0.1),
+        ("lognormal_mean block", "  block_omega (ETA_CL, ETA_D) = [0.09, 0.02, 0.06] density lognormal_mean".into(), pos, 0.1),
         ("truncated gamma", format!("{CL}  omega ETA_D ~ 0.06 density truncated(gamma, 0.5, 2)"), pos, 0.1),
         ("truncated weibull", format!("{CL}  omega ETA_D ~ 0.06 density truncated(weibull, 0.3, inf)"), pos, 0.1),
         ("truncated t", format!("  theta NU(6.0, 3.0, 100.0)\n{CL}  omega ETA_D ~ 0.06 density truncated(t(NU), -1, inf)"), real, 0.1),

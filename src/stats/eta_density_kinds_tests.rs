@@ -29,6 +29,7 @@ fn cases() -> Vec<(DensityKind, Vec<f64>)> {
         (Gamma, vec![]),
         (InvGamma, vec![]),
         (LogNormal, vec![]),
+        (LogNormalMean, vec![]),
         (Exponential, vec![]),
         (Erlang, vec![3.0]),
         (ChiSq, vec![]),
@@ -370,39 +371,67 @@ fn the_score_identities_hold_for_every_smooth_kind() {
     assert!(worst.0 < 1e-6, "worst {:.2e} ({})", worst.0, worst.1);
 }
 
-/// The simulator draws the distribution the density scores: 200 000 draws of each kind
-/// match its documented mean and variance to a few Monte Carlo SEs. The draws come from
-/// `rand_distr` or inverse CDFs, written independently of the densities.
+/// The simulator draws the distribution the density scores. Each kind draws 20 000 times
+/// from its own seed (derived from its name, so adding a kind moves no other kind's draws).
+/// Where the kind has a CDF, the draws pass a Kolmogorov–Smirnov test against it, which
+/// heavy tails do not upset; otherwise they match the documented mean and variance to a
+/// few Monte Carlo SEs. The draws come from `rand_distr` or inverse CDFs, written
+/// independently of the densities and the CDFs.
 /// Dies under: a sampler of another distribution (a scale and a rate swapped, the
 /// wrong implied shape).
 #[test]
 fn every_sampler_draws_its_density() {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(1716);
-    let n = 100_000;
-    let mut worst = (0.0f64, "");
+    let n = 20_000;
+    let mut worst_ks = (0.0f64, "");
+    let mut worst_mom = (0.0f64, "");
     for (kind, s) in cases() {
+        let name: Vec<u64> = kind.name().bytes().map(u64::from).collect();
+        let seed = crate::rng::stream_seed(1716, &name);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut xs: Vec<f64> = (0..n).map(|_| sample_eta(kind, OMEGA, &s, &mut rng)).collect();
+        assert!(xs.iter().all(|x| x.is_finite()), "{kind:?}: a non-finite draw");
+        if eta_cdf(kind, 0.5f64, OMEGA, &s).is_some() {
+            xs.sort_by(f64::total_cmp);
+            let mut d = 0.0f64;
+            for (i, &x) in xs.iter().enumerate() {
+                let f = eta_cdf(kind, x, OMEGA, &s).expect("a CDF");
+                let gap =
+                    (f - i as f64 / n as f64).abs().max(((i + 1) as f64 / n as f64 - f).abs());
+                assert!(gap.is_finite(), "{kind:?}: F({x}) = {f}");
+                d = d.max(gap);
+            }
+            let ks = d * (n as f64).sqrt();
+            eprintln!("{kind:?}: √n·D = {ks:.3}");
+            if ks > worst_ks.0 {
+                worst_ks = (ks, kind.name());
+            }
+            continue;
+        }
         let Some((m, v)) = documented_moments(kind, OMEGA, &s) else {
             continue;
         };
-        let xs: Vec<f64> = (0..n).map(|_| sample_eta(kind, OMEGA, &s, &mut rng)).collect();
-        assert!(xs.iter().all(|x| x.is_finite()), "{kind:?}: a non-finite draw");
         let mean = xs.iter().sum::<f64>() / n as f64;
         let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
         // In units of the standard errors (√(v/n) for the mean; the variance's SE
         // ~ v√(2/n) is inflated by heavy tails, so it is checked relatively, loosely).
         let zm = (mean - m).abs() / (v / n as f64).sqrt();
         let rv = (var - v).abs() / v;
-        eprintln!("{:?}: mean z {zm:.2}, var rel {rv:.3}", kind);
+        eprintln!("{kind:?}: mean z {zm:.2}, var rel {rv:.3}");
         let g = zm.max(rv * 100.0);
-        if g > worst.0 {
-            worst = (g, kind.name());
+        if g > worst_mom.0 {
+            worst_mom = (g, kind.name());
         }
     }
-    eprintln!("sampler: worst {:.2} ({})", worst.0, worst.1);
-    // Measured 3.27 (Pareto's mean, in SEs; seed 1716) over ~40 kinds × 2 statistics, as
-    // the maximum of that many draws should be; 6 SE is still a sampler of the wrong
-    // distribution's floor.
-    assert!(worst.0 < 6.0, "worst {:.2} ({})", worst.0, worst.1);
+    eprintln!(
+        "sampler: worst KS {:.3} ({}), worst moments {:.2} ({})",
+        worst_ks.0, worst_ks.1, worst_mom.0, worst_mom.1
+    );
+    // √n·D of a correct sampler is Kolmogorov-distributed. Over the ~36 kinds tested, a
+    // family-wise 0.001 is 2.8e-5 per kind (Bonferroni), whose critical value is
+    // √(−½ ln(α/2)) = 2.36. Measured worst 1.785 (levy). A wrong sampler grows like √n:
+    // chi's statistic held at 0.83 from 2·10⁴ to 2·10⁶ draws.
+    assert!(worst_ks.0 < 2.36, "worst KS {:.3} ({})", worst_ks.0, worst_ks.1);
+    assert!(worst_mom.0 < 6.0, "worst moments {:.2} ({})", worst_mom.0, worst_mom.1);
 }
 
 /// The noncentral χ² density's two forms agree where `ln_ncx2_pdf` switches between

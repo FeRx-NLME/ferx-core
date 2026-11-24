@@ -777,7 +777,9 @@ fn a_transform_is_declared_in_eta_shape_only() {
 /// Dies under: any one refusal removed (each asserts its own message).
 #[test]
 fn omega_line_distribution_refusals() {
-    let indiv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)";
+    // The direct read, so a positive kind passes the second-transform check (#2669) and
+    // reaches the refusal under test.
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)";
     let err = |omegas: &str, extra: &str| densed(omegas, indiv, extra).unwrap_err();
     let cases: [(&str, &str, &str); 10] = [
         (
@@ -811,7 +813,7 @@ fn omega_line_distribution_refusals() {
 
 /// The omega-line forms beyond a single kind: `truncated(…)` reads the effect through its
 /// bounded map, a `block_omega … density copula(…)` gives each ETA its own margin (and
-/// `beta()` declares its μ), `lognormal` on a block is MvLogNormal, a κ takes a
+/// `beta()` declares its μ), `lognormal_mean` on a block is MvLogNormal, a κ takes a
 /// `density` read through its map, and `density normal` is the plain Gaussian.
 /// Dies under: any of the forms resolved to the wrong kind, map or shape layout.
 #[test]
@@ -855,12 +857,12 @@ fn the_omega_line_forms_resolve() {
     let th = cop.default_params.theta.clone();
     assert_eq!(params_at(&cop, &th, &[0.2, -0.4]), params_at(&cop_hand, &th, &[0.2, -0.4]));
     let mvln = densed(
-        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density lognormal",
+        "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density lognormal_mean",
         "  CL = TVCL * ETA_CL\n  V = TVV * ETA_V",
         "",
     )
     .unwrap();
-    assert_eq!(mvln.eta_densities[0].kind, DensityKind::LogNormal);
+    assert_eq!(mvln.eta_densities[0].kind, DensityKind::LogNormalMean);
     assert_eq!(mvln.eta_densities[0].etas, vec![0, 1]);
     // A κ density: the model reads `exp(K)` where it wrote `K`.
     let kmodel = |kappa_line: &str, cl: &str| {
@@ -951,7 +953,7 @@ fn a_mixture_override_of_a_density_eta_is_no_read() {
 #[test]
 fn copula_margins_are_named() {
     use crate::stats::eta_density::DensityKind;
-    let indiv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV * (0.5 + ETA_V)";
+    let indiv = "  CL = TVCL * ETA_CL\n  V = TVV * (0.5 + ETA_V)";
     let block = |clause: &str| {
         densed(
             &format!("  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density copula({clause})"),
@@ -1002,4 +1004,225 @@ fn a_tdist_shape_theta_must_keep_nu_at_least_3() {
             "{line}: {e}"
         );
     }
+}
+
+/// `density lognormal` is median 1, `ln η ~ N(0, Ω)` (#2669 review): the classic
+/// `TV·exp(ETA)` random effect. The parser compiles it as exactly that Gaussian ETA, so no
+/// density group remains, the log mu-reference is kept, and the individual parameters and
+/// the objective's prior are those of the classic spelling. Only the reported distribution
+/// says `lognormal`. On a block it is the Gaussian block under `exp`.
+/// Dies under: the median kind left as a density group, the mu-reference dropped, or the
+/// `exp` map not applied to its reads.
+#[test]
+fn the_median_lognormal_is_the_classic_exp_eta() {
+    for (omegas, classic_omegas, indiv, classic_indiv) in [
+        (
+            "  omega ETA_CL ~ 0.09 density lognormal\n  omega ETA_V ~ 0.04",
+            "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04",
+            "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)",
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+        ),
+        (
+            "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02] density lognormal",
+            "  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.02]",
+            "  CL = TVCL * ETA_CL\n  V = TVV * ETA_V",
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+        ),
+    ] {
+        let ln = densed(omegas, indiv, "").unwrap();
+        let classic = densed(classic_omegas, classic_indiv, "").unwrap();
+        assert!(ln.eta_densities.is_empty(), "{omegas}: {:?}", ln.eta_densities);
+        let th = ln.default_params.theta.clone();
+        for eta in [[0.0, 0.0], [0.3, -0.2], [-1.1, 0.7]] {
+            assert_eq!(params_at(&ln, &th, &eta), params_at(&classic, &th, &eta), "{omegas}");
+        }
+        let mut refs: Vec<_> = ln.mu_refs.keys().cloned().collect();
+        refs.sort();
+        let mut classic_refs: Vec<_> = classic.mu_refs.keys().cloned().collect();
+        classic_refs.sort();
+        assert_eq!(refs, classic_refs, "{omegas}");
+        let dist = ln
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .and_then(|i| i.distribution.as_ref())
+            .expect("the declared distribution is reported");
+        assert_eq!((dist.form.as_str(), dist.kind.as_str()), ("density", "lognormal"));
+    }
+}
+
+/// `(sd)` / `(var)` read the same on either side of a `density` clause (#2669 review,
+/// finding 13): `0.3 (sd)` is ω = 0.09 for a bare kind, a kind with a shape θ and a κ, and
+/// `(var)` keeps the number. `density t (sd)`, where the parentheses follow a kind that
+/// takes a shape, stays the shape list. `levy`, whose ω is its scale, refuses `(sd)`.
+/// Dies under: the trailing word read as a shape θ, dropped, or moved for a shape kind.
+#[test]
+fn sd_and_var_read_the_same_on_either_side_of_the_density_clause() {
+    let w = |omegas: &str| {
+        densed(omegas, "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)", "")
+            .unwrap_or_else(|e| panic!("{omegas}: {e}"))
+            .default_params
+            .omega
+            .matrix[(0, 0)]
+    };
+    for (line, want) in [
+        ("  omega ETA_CL ~ 0.3 (sd) density gamma", 0.09),
+        ("  omega ETA_CL ~ 0.3 density gamma (sd)", 0.09),
+        ("  omega ETA_CL ~ 0.3 density gamma ( SD )", 0.09),
+        ("  omega ETA_CL ~ 0.09 density gamma (var)", 0.09),
+        ("  omega ETA_CL ~ 0.3 density truncated(gamma, 0.2, 5) (sd)", 0.09),
+    ] {
+        let got = w(&format!("{line}\n  omega ETA_V ~ 0.04"));
+        assert!((got - want).abs() < 1e-15, "{line}: ω = {got}");
+    }
+    // A shape kind on ℝ: `CL = TVCL * exp(ETA_CL)`.
+    let t = |omegas: &str| {
+        densed(omegas, "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)", "")
+            .map(|m| m.default_params.omega.matrix[(0, 0)])
+    };
+    for line in [
+        "  omega ETA_CL ~ 0.3 (sd) density t(NU)\n  omega ETA_V ~ 0.04",
+        "  omega ETA_CL ~ 0.3 density t(NU) (sd)\n  omega ETA_V ~ 0.04",
+    ] {
+        let got = t(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert!((got - 0.09).abs() < 1e-15, "{line}: ω = {got}");
+    }
+    // `t (sd)`: the parentheses are t's shape list, so `sd` must be a declared θ.
+    let e = t("  omega ETA_CL ~ 0.3 density t (sd)\n  omega ETA_V ~ 0.04").unwrap_err();
+    assert!(e.contains("`sd`") && e.contains("not a declared θ"), "{e}");
+    for line in [
+        "  omega ETA_CL ~ 0.3 (sd) density levy\n  omega ETA_V ~ 0.04",
+        "  omega ETA_CL ~ 0.3 density levy (sd)\n  omega ETA_V ~ 0.04",
+    ] {
+        let e = densed(line, "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)", "").unwrap_err();
+        assert!(e.contains("density levy") && e.contains("`(sd)` does not apply"), "{e}");
+    }
+    // A κ line takes the same order.
+    let k = parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+         omega ETA_CL ~ 0.09\n  kappa K_CL ~ 0.2 density gamma (sd)\n  sigma EPS ~ 0.01\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL) * K_CL\n  V = TVV\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .unwrap();
+    let kw = k.default_params.omega_iov.as_ref().unwrap().matrix[(0, 0)];
+    assert!((kw - 0.04).abs() < 1e-15, "κ ω = {kw}");
+}
+
+/// A positive or (0, 1) `density` ETA read under `exp`, `log`, `inv_logit` or `logit` is
+/// refused (#2669 review, finding 2): it already is the effect, so `TVCL * exp(ETA_CL)`
+/// under `density gamma` would fit `TVCL·exp(Gamma)`. The message names the line to write.
+/// A kind on ℝ keeps `exp`, and a positive ETA added to a term is a `W_DENSITY_ADDITIVE`
+/// warning, not an error.
+/// Dies under: the check removed, applied to an ℝ kind, or blind to a nested read.
+#[test]
+fn a_bounded_density_eta_under_a_second_transform_is_refused() {
+    for (omegas, indiv, want) in [
+        ("  omega ETA_CL ~ 0.09 density gamma", "CL = TVCL * exp(ETA_CL)", "CL = TVCL * ETA_CL"),
+        (
+            "  omega ETA_CL ~ 0.09 density lognormal",
+            "CL = TVCL * exp(ETA_CL)",
+            "CL = TVCL * ETA_CL",
+        ),
+        (
+            "  omega ETA_CL ~ 0.09 density gamma",
+            "CL = TVCL * exp(0.1 + 2 * ETA_CL)",
+            "CL = TVCL * ETA_CL",
+        ),
+        (
+            "  omega ETA_CL ~ 0.09 density gamma",
+            "CL = TVCL * exp(log(ETA_CL))",
+            "CL = TVCL * ETA_CL",
+        ),
+        (
+            "  omega ETA_CL ~ 0.09 density truncated(gamma, 0.2, 5)",
+            "CL = TVCL * exp(ETA_CL)",
+            "CL = TVCL * ETA_CL",
+        ),
+        ("  omega ETA_CL ~ 0.02 density beta(MU)", "CL = TVCL * inv_logit(ETA_CL)", "CL = ETA_CL"),
+    ] {
+        let e = densed(
+            &format!("{omegas}\n  omega ETA_V ~ 0.04"),
+            &format!("  {indiv}\n  V = TVV * exp(ETA_V)"),
+            "",
+        )
+        .expect_err(omegas);
+        assert!(
+            e.contains("`ETA_CL` follows `density") && e.contains(want),
+            "{omegas} / {indiv}: {e}"
+        );
+    }
+    // ℝ kinds keep `exp`.
+    for omegas in ["  omega ETA_CL ~ 0.09 density t(NU)", "  omega ETA_CL ~ 0.09 density logistic"]
+    {
+        densed(
+            &format!("{omegas}\n  omega ETA_V ~ 0.04"),
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+            "",
+        )
+        .unwrap_or_else(|e| panic!("{omegas}: {e}"));
+    }
+    // Additive: a warning naming the proportional read.
+    let m = densed(
+        "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V ~ 0.04",
+        "  CL = TVCL + ETA_CL\n  V = TVV * exp(ETA_V)",
+        "",
+    )
+    .unwrap();
+    let w: Vec<_> = m.parse_warnings.iter().filter(|w| w.contains("W_DENSITY_ADDITIVE")).collect();
+    assert_eq!(w.len(), 1, "{:?}", m.parse_warnings);
+    assert!(w[0].contains("CL = TVCL * ETA_CL"), "{}", w[0]);
+    // The proportional read warns about nothing.
+    let m = densed(
+        "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V ~ 0.04",
+        "  CL = TVCL * ETA_CL\n  V = TVV * exp(ETA_V)",
+        "",
+    )
+    .unwrap();
+    assert!(!m.parse_warnings.iter().any(|w| w.contains("W_DENSITY")), "{:?}", m.parse_warnings);
+}
+
+/// An ETA with both a `density` and an `[eta_shape]` transform (or an inline one) is
+/// refused, naming both (#2669 review, finding 3): the pair would fit `boxcox(exp(z), λ)`,
+/// which neither line describes, and the report would show only the density.
+/// Dies under: the pair accepted, in either spelling.
+#[test]
+fn a_density_eta_with_a_shape_transform_is_refused() {
+    let omegas = "  omega ETA_CL ~ 0.09 density t(NU)\n  omega ETA_V ~ 0.04";
+    for (indiv, extra) in [
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)",
+            "[eta_shape]\n  ETA_CL ~ boxcox(L)\n",
+        ),
+        ("  CL = TVCL * exp(boxcox(ETA_CL, L))\n  V = TVV * exp(ETA_V)", ""),
+    ] {
+        let e = densed(omegas, indiv, extra).expect_err(indiv);
+        assert!(e.contains("`ETA_CL` follows `density t`") && e.contains("boxcox"), "{indiv}: {e}");
+    }
+}
+
+/// The examples on the random-effect distributions page parse as written (#2669 review,
+/// finding 10: the intro example read an undeclared `TVV`), with a structural model and
+/// an error model added.
+#[test]
+fn the_distribution_page_examples_parse() {
+    let tail = "\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+                [error_model]\n  DV ~ proportional(EPS)\n";
+    let intro = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+                 theta TVF(0.6, 0.01, 0.99)\n  theta NU(10.0, 2.5, 100.0)\n  \
+                 omega ETA_CL ~ 0.09 density gamma\n  omega ETA_F  ~ 0.02 density beta(TVF)\n  \
+                 omega ETA_V  ~ 0.06 density t(NU)\n  theta TVKA(1.0, 0.01, 10.0)\n  sigma EPS ~ 0.01\n\n\
+                 [individual_parameters]\n  CL = TVCL * ETA_CL\n  F  = ETA_F\n  \
+                 V  = TVV * exp(ETA_V)\n  KA = TVKA\n";
+    parse_model_string(&format!("{intro}{tail}")).unwrap_or_else(|e| panic!("intro: {e}"));
+    let mixture = "[parameters]\n  theta TVCL1(2.0, 0.1, 100.0)\n  theta TVCL2(8.0, 0.1, 100.0)\n  \
+                   theta MIXL(0.4, -5.0, 5.0)\n  omega ETA_CL ~ 0.09 density gamma\n  \
+                   theta TVV(30.0, 1.0, 500.0)\n  theta TVKA(1.0, 0.01, 10.0)\n  sigma EPS ~ 0.01\n\n\
+                   [individual_parameters]\n  CL = if (MIXNUM == 1) TVCL1 * ETA_CL else TVCL2 * ETA_CL\n  \
+                   V = TVV\n  KA = TVKA\n\n\
+                   [mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.04\n";
+    let m =
+        parse_model_string(&format!("{mixture}{tail}")).unwrap_or_else(|e| panic!("mixture: {e}"));
+    assert_eq!(m.eta_densities.len(), 1);
 }

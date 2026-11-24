@@ -50,6 +50,15 @@ fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
 /// θ `i`'s label, SE and %RSE cells in the console θ tables (`print_results` and
 /// `format_summary` both): `---` for a FIX θ, `N/A` for a profiled level held on its bound
 /// (#2112) and for a missing SE. One function, so the two tables cannot drift.
+/// `"  (median of CL)"` for a θ that is a parameter's typical value (#2669), else `""`.
+fn theta_role_suffix(result: &FitResult, name: &str) -> String {
+    result
+        .typical_values
+        .iter()
+        .find(|v| v.theta == name)
+        .map_or(String::new(), |v| format!("  ({} of {})", v.statistic.label(), v.parameter))
+}
+
 fn theta_row_cells(result: &FitResult, i: usize, name: &str) -> (String, String, String) {
     if result.theta_fixed.get(i).copied().unwrap_or(false) {
         return (fixed_label(name), "---".to_string(), "---".to_string());
@@ -235,6 +244,24 @@ pub fn eta_distribution<'a>(
         .find_map(|i| i.distribution.as_ref())
 }
 
+/// [`eta_distribution`] with a θ-valued truncation bound at the fit's estimate (#2669),
+/// owned: what every reported effect, percentile and note reads.
+pub(crate) fn resolved_eta_distribution(
+    result: &FitResult, name: &str,
+) -> Option<crate::types::EtaDistribution> {
+    eta_distribution(result, name).map(|d| resolve_at_fit(result, d))
+}
+
+/// `d` resolved at the fit's θ ([`crate::stats::eta_density::resolve_distribution`]).
+fn resolve_at_fit(
+    result: &FitResult, d: &crate::types::EtaDistribution,
+) -> crate::types::EtaDistribution {
+    crate::stats::eta_density::resolve_distribution(d, |n| {
+        let k = result.theta_names.iter().position(|t| t == n)?;
+        result.theta.get(k).copied()
+    })
+}
+
 /// What IOV kappa `k` follows (#1716): `FitResult::kappa_distributions`, `None` for a
 /// Gaussian κ (or a result from before the field).
 pub fn kappa_distribution(result: &FitResult, k: usize) -> Option<&crate::types::EtaDistribution> {
@@ -259,22 +286,93 @@ fn distribution_shapes(result: &FitResult, d: &crate::types::EtaDistribution) ->
 /// the model reads (`m(z)`: a Gamma clearance's multiplier, not its latent); a
 /// transform's are of `h(η)`. The shapes are read from `theta` by name.
 pub fn eta_effect_quantiles(result: &FitResult, i: usize) -> Option<[f64; 3]> {
-    let d = eta_distribution(result, eta_name(result, i))?;
-    crate::stats::eta_density::effect_quantiles(
-        d,
-        result.omega[(i, i)],
-        &distribution_shapes(result, d)?,
-    )
+    eta_effect_quantiles_at(result, i, &result.theta, result.omega[(i, i)])
 }
 
-/// The effect the model reads for every subject's EBE (#1721 review): `m(ẑ)` for a
-/// density ETA, the EBE itself for a Gaussian or transform one. `SubjectResult::eta`
-/// holds the latent `ẑ`, the coordinates every estimator works in and the ones
-/// `predict(etas = …)` takes back; this is the same table on the effect's scale. One row
+/// [`eta_effect_quantiles`] at `theta` and ETA `i`'s variance `omega_ii` instead of the
+/// fit's estimates (a parameter draw), with the fit's names and distributions.
+fn eta_effect_quantiles_at(
+    result: &FitResult, i: usize, theta: &[f64], omega_ii: f64,
+) -> Option<[f64; 3]> {
+    let by_name = |n: &str| {
+        let k = result.theta_names.iter().position(|t| t == n)?;
+        theta.get(k).copied()
+    };
+    let d = crate::stats::eta_density::resolve_distribution(
+        eta_distribution(result, eta_name(result, i))?,
+        by_name,
+    );
+    let shapes: Option<Vec<f64>> = d.shape_thetas.iter().map(|n| by_name(n)).collect();
+    crate::stats::eta_density::effect_quantiles(&d, omega_ii, &shapes?)
+}
+
+/// The 95% interval of each reported percentile of every distribution ETA's effect
+/// ([`FitResult::eta_effect_quantile_ci`], #2669): `n_draws` asymptotic draws of the
+/// parameters from the covariance step's matrix, and [`eta_effect_quantiles`] at each.
+/// Empty when the fit has no covariance matrix or no distribution ETA, or the draws fail.
+pub(crate) fn eta_effect_quantile_cis(
+    result: &FitResult, model: &crate::types::CompiledModel, n_draws: usize,
+) -> Vec<Option<[[f64; 2]; 3]>> {
+    use rand::SeedableRng;
+    let n_eta = result.omega.nrows();
+    let has_dist = (0..n_eta).any(|i| eta_distribution(result, eta_name(result, i)).is_some());
+    if !has_dist || result.covariance_matrix.is_none() {
+        return Vec::new();
+    }
+    let Ok(template) =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(result, model)
+    else {
+        return Vec::new();
+    };
+    // Fixed seed: the interval is a property of the fit, reproduced on every write.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x2669);
+    let Ok(draws) = crate::estimation::uncertainty_samples::draw_parameter_samples(
+        result,
+        &template,
+        n_draws,
+        crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
+        &mut rng,
+    ) else {
+        return Vec::new();
+    };
+    (0..n_eta)
+        .map(|i| {
+            eta_distribution(result, eta_name(result, i))?;
+            let mut per_q: [Vec<f64>; 3] = Default::default();
+            for p in &draws {
+                if let Some(q) =
+                    eta_effect_quantiles_at(result, i, &p.theta, p.omega.matrix[(i, i)])
+                {
+                    for (k, v) in q.into_iter().enumerate() {
+                        per_q[k].push(v);
+                    }
+                }
+            }
+            // Fewer than nine in ten draws with percentiles: no interval.
+            if per_q[0].len() * 10 < draws.len() * 9 {
+                return None;
+            }
+            let mut ci = [[0.0; 2]; 3];
+            for (k, v) in per_q.iter_mut().enumerate() {
+                v.sort_by(f64::total_cmp);
+                let at = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+                ci[k] = [at(0.025), at(0.975)];
+            }
+            Some(ci)
+        })
+        .collect()
+}
+
+/// The EBEs as reported (#1721 review, #2669): `m(ẑ)`, the effect the model reads, for a
+/// `density` ETA, and the EBE itself for a Gaussian or transform one. `SubjectResult::eta`
+/// holds the latent `ẑ`, the coordinates the estimators work in (the `.fitrx` file keeps
+/// it, so a reload continues exactly); every output, and [`crate::api::SuppliedEtas`],
+/// is on this scale. A θ-valued truncation bound is read at the fit's estimate. One row
 /// per subject, one column per BSV ETA.
 pub fn eta_effects(result: &FitResult) -> Vec<Vec<f64>> {
-    let dists: Vec<Option<&crate::types::EtaDistribution>> =
-        (0..result.omega.nrows()).map(|i| eta_distribution(result, eta_name(result, i))).collect();
+    let dists: Vec<Option<crate::types::EtaDistribution>> = (0..result.omega.nrows())
+        .map(|i| resolved_eta_distribution(result, eta_name(result, i)))
+        .collect();
     result
         .subjects
         .iter()
@@ -282,7 +380,7 @@ pub fn eta_effects(result: &FitResult) -> Vec<Vec<f64>> {
             s.eta
                 .iter()
                 .enumerate()
-                .map(|(i, &z)| match dists.get(i).copied().flatten() {
+                .map(|(i, &z)| match dists.get(i).and_then(Option::as_ref) {
                     Some(d) => crate::stats::eta_density::effect_of_latent(d, z),
                     None => z,
                 })
@@ -301,13 +399,20 @@ fn distribution_note_for(
     if !d.shape_thetas.is_empty() {
         note.push_str(&format!("({})", d.shape_thetas.join(", ")));
     }
+    // Where ω is not the effect's variance, say what it is (#2669 review): a user switching
+    // `logistic` → `t` keeps the number, and it changes meaning.
+    match d.kind.as_str() {
+        "t" | "cauchy" if d.form == "density" => note.push_str(", ω = scale²"),
+        "levy" if d.form == "density" => note.push_str(", ω = scale"),
+        _ => {}
+    }
     if let Some((lo, hi)) = d.truncation {
         let side = |b: Option<f64>, inf: &str| b.map_or(inf.to_string(), |v| format!("{v}"));
         note.push_str(&format!(" truncated to [{}, {}]", side(lo, "-inf"), side(hi, "inf")));
     }
     let shapes = distribution_shapes(result, d);
-    // The mean pins the scale: `density lognormal` has mean 1, where `TV·exp(η)` has
-    // median 1 (#1721 review, finding 5), and ω is the effect's variance.
+    // The mean pins the scale: `density lognormal_mean` has mean 1, where `TV·exp(η)` (and
+    // `density lognormal`) has median 1 (#1721 review, finding 5).
     if let Some((m, v)) =
         shapes.as_deref().and_then(|s| crate::stats::eta_density::effect_moments_of(d, omega, s))
     {
@@ -347,15 +452,22 @@ fn fmt_mean(m: f64) -> String {
 /// `None` for a Gaussian ETA. [`OmegaRowsInput::from_result`] prints it in place of the
 /// CV%/SD; ferx-r passes it back through [`OmegaRowsInput`].
 pub fn eta_distribution_note(result: &FitResult, i: usize) -> Option<String> {
-    let d = eta_distribution(result, eta_name(result, i))?;
-    Some(distribution_note_for(result, d, result.omega[(i, i)]))
+    let d = resolved_eta_distribution(result, eta_name(result, i))?;
+    let mut note = distribution_note_for(result, &d, result.omega[(i, i)]);
+    if let Some(Some(ci)) = result.eta_effect_quantile_ci.get(i) {
+        let z = |v: f64| if v.abs() < 5e-5 { 0.0 } else { v };
+        let iv: Vec<String> =
+            ci.iter().map(|[a, b]| format!("[{:.4}, {:.4}]", z(*a), z(*b))).collect();
+        note.push_str(&format!("; 95% CI {}", iv.join(" / ")));
+    }
+    Some(note)
 }
 
 /// [`eta_distribution_note`] for IOV kappa `k`, at its `omega_iov` variance.
 pub fn kappa_distribution_note(result: &FitResult, k: usize) -> Option<String> {
-    let d = kappa_distribution(result, k)?;
+    let d = resolve_at_fit(result, kappa_distribution(result, k)?);
     let w = result.omega_iov.as_ref()?.get((k, k)).copied()?;
-    Some(distribution_note_for(result, d, w))
+    Some(distribution_note_for(result, &d, w))
 }
 
 /// The type of the ETA called `name`, looked up **by name** in `eta_param_info`
@@ -579,10 +691,11 @@ fn format_omega_rows_held(
             )
         };
         let eta_type = input.eta_param_types.get(i).copied().flatten();
-        let mut note = variance_note(eta_type, var, false);
-        if let Some(d) = input.eta_distribution_notes.get(i).cloned().flatten() {
-            note = Some(d);
-        }
+        // A non-Gaussian ETA's note (its distribution, mean, CV% and percentiles) is long,
+        // so it goes on its own line under the row (#2669 review); the row keeps no CV%,
+        // since ω is on none of the Gaussian scales.
+        let dist_note = input.eta_distribution_notes.get(i).cloned().flatten();
+        let mut note = if dist_note.is_some() { None } else { variance_note(eta_type, var, false) };
         if typical_value_spread {
             let clause = input
                 .eta_linked_thetas
@@ -605,6 +718,9 @@ fn format_omega_rows_held(
             "  {:<20}{} = {:.6}{}  SE = {}{}",
             label, tag, var, note, se_str, sd_init
         );
+        if let Some(d) = dist_note.filter(|_| show_cv) {
+            let _ = writeln!(out, "  {:<20}   {d}", "");
+        }
     }
     out
 }
@@ -886,10 +1002,18 @@ fn format_kappa_rows_held(
         let kappa_type = input.kappa_param_types.get(i).copied();
         let dist_note = input.kappa_distribution_notes.get(i).cloned().flatten();
         let note = note_suffix(
-            dist_note.or_else(|| variance_note(kappa_type, var, weight.is_some())),
+            if dist_note.is_some() {
+                None
+            } else {
+                variance_note(kappa_type, var, weight.is_some())
+            },
             show_cv,
         );
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
+        // On its own line, as a BSV ETA's (#2669 review).
+        if let Some(d) = dist_note.filter(|_| show_cv) {
+            let _ = writeln!(out, "  {:<20}   {d}", "");
+        }
         // Weighted IOV (#1031): the estimate is the unweighted γ², so also print
         // the spread at the typical arm via the same `spread_note` (#1683, #1697),
         // wherever the note is shown (#1698). The YAML writes it regardless.
@@ -1295,7 +1419,7 @@ fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
 /// leaves it; a standalone `imp_eval_only` run counts too.
 fn ofv_is_imp_laplace(result: &FitResult) -> bool {
     use crate::types::EstimationMethod::{Imp, Impmap};
-    if !matches!(result.method, Imp | Impmap) {
+    if !matches!(result.method, Imp | Impmap) || result.ofv_is_importance_sampling {
         return false;
     }
     let chain = &result.method_chain;
@@ -1307,7 +1431,9 @@ fn ofv_is_imp_laplace(result: &FitResult) -> bool {
 /// mistaken for one another. `None` when the fit has no marginal, or when the marginal
 /// *is* `ofv` (a SAEM fit under `saem_ofv = imp`, whose OFV row carries its SE).
 fn is_marginal_line(result: &FitResult) -> Option<String> {
-    if result.saem_objective.as_ref().is_some_and(|o| o.kind == SaemOfv::Imp) {
+    if result.ofv_is_importance_sampling
+        || result.saem_objective.as_ref().is_some_and(|o| o.kind == SaemOfv::Imp)
+    {
         return None;
     }
     result.importance_sampling.as_ref().map(|is| {
@@ -1321,6 +1447,13 @@ fn is_marginal_line(result: &FitResult) -> Option<String> {
 /// How the OFV row of a SAEM fit names what it is (#2973), `None` when it is the
 /// FOCE/Laplace objective.
 fn saem_ofv_label(result: &FitResult) -> Option<String> {
+    if result.ofv_is_importance_sampling {
+        let is = result.importance_sampling.as_ref()?;
+        return Some(format!(
+            "OFV (IS -2LL; MC SE = {:.4}, K = {})",
+            is.mc_standard_error, is.n_samples
+        ));
+    }
     let o = result.saem_objective.as_ref()?;
     Some(match o.kind {
         SaemOfv::Saem => {
@@ -1353,6 +1486,13 @@ fn ic_unavailable_line(result: &FitResult) -> &'static str {
 fn objective_notes(result: &FitResult) -> Vec<&'static str> {
     let laplace = ofv_is_imp_laplace(result);
     let mut notes = Vec::new();
+    if result.ofv_is_importance_sampling {
+        notes.push(
+            "OFV, AIC and BIC come from the importance-sampling marginal: a `density` with a \
+             kink or an edge has no valid Laplace objective.",
+        );
+        return notes;
+    }
     if let Some(o) = &result.saem_objective {
         notes.push(match o.kind {
             SaemOfv::Saem => {
@@ -1404,7 +1544,8 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
         let _ = writeln!(out, "{indent}  data:  {:.4}", result.ofv_data);
         let _ = writeln!(out, "{indent}  prior: {:.4}", result.ofv_prior);
     }
-    if let Some(o) = &result.saem_objective {
+    // NaN under a kink or edge density, which has no FOCE/Laplace objective (#2669).
+    if let Some(o) = result.saem_objective.as_ref().filter(|o| o.foce_ofv.is_finite()) {
         let _ = writeln!(out, "{indent}FOCE/Laplace OFV (diagnostic):  {:.4}", o.foce_ofv);
     }
     if let Some(line) = is_marginal_line(result) {
@@ -1529,7 +1670,14 @@ pub fn print_results(result: &FitResult) {
         }
         let est = result.theta[i];
         let (label, se_str, rse_str) = theta_row_cells(result, i, name);
-        eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
+        eprintln!(
+            "{:<16} {:>12.6} {:>12} {:>10}{}",
+            label,
+            est,
+            se_str,
+            rse_str,
+            theta_role_suffix(result, name)
+        );
     }
 
     // Compact θ level block summary (#1064). Only independently estimated
@@ -1806,7 +1954,15 @@ pub fn format_summary(result: &FitResult) -> String {
         }
         let est = result.theta[i];
         let (label, se_str, rse_str) = theta_row_cells(result, i, name);
-        let _ = writeln!(out, "  {:<16} {:>12.6} {:>12} {:>8}", label, est, se_str, rse_str);
+        let _ = writeln!(
+            out,
+            "  {:<16} {:>12.6} {:>12} {:>8}{}",
+            label,
+            est,
+            se_str,
+            rse_str,
+            theta_role_suffix(result, name)
+        );
     }
     out.push_str(&format_theta_blocks_section(result, &theta_blocks, "  "));
 
@@ -2570,14 +2726,17 @@ pub fn write_conddist_csv(result: &FitResult, path: &str) -> Result<(), String> 
     wtr.write_record(["ID", "ETA", "COND_MEAN", "COND_SD", "COND_MODE"])
         .map_err(|e| e.to_string())?;
 
+    // On the effect scale, as the conditional mean and SD are (#2669).
+    let effects = eta_effects(result);
     for (i, subj) in result.subjects.iter().enumerate() {
         let mean_i = cd.cond_mean.get(i);
         let sd_i = cd.cond_sd.get(i);
         for (j, eta_name) in result.eta_names.iter().enumerate() {
             let mean = mean_i.and_then(|m| m.get(j)).copied().unwrap_or(f64::NAN);
             let sd = sd_i.and_then(|s| s.get(j)).copied().unwrap_or(f64::NAN);
-            // The conditional mode is the EBE already on the subject result.
-            let mode = subj.eta.get(j).copied().unwrap_or(f64::NAN);
+            // The conditional mode is the EBE already on the subject result: the effect at
+            // the latent mode for a `density` ETA.
+            let mode = effects.get(i).and_then(|e| e.get(j)).copied().unwrap_or(f64::NAN);
             wtr.write_record([
                 subj.id.clone(),
                 eta_name.clone(),
@@ -3044,6 +3203,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // is byte-identical to what it was before.
     if ofv_is_imp_laplace(result) {
         writeln!(f, "  ofv_type: laplace").map_err(|e| e.to_string())?;
+    }
+    // An IMP fit of a kink or edge density (#2669): `ofv` is the IS marginal itself.
+    if result.ofv_is_importance_sampling {
+        writeln!(f, "  ofv_type: importance_sampling").map_err(|e| e.to_string())?;
     }
     // A SAEM fit's objective (#2973): what `ofv` is, its Monte-Carlo SE, and the
     // FOCE/Laplace value it replaced. Absent under `saem_ofv = focei` and for every other
@@ -3889,6 +4052,9 @@ mod tests {
             sir_resamples_packed: None,
             importance_sampling: None,
             saem_objective: None,
+            ofv_is_importance_sampling: false,
+            typical_values: Vec::new(),
+            eta_effect_quantile_ci: Vec::new(),
             impmap_trace: None,
             bayes: None,
             vi: None,
@@ -5270,6 +5436,9 @@ mod tests {
             sir_resamples_packed: None,
             importance_sampling: None,
             saem_objective: None,
+            ofv_is_importance_sampling: false,
+            typical_values: Vec::new(),
+            eta_effect_quantile_ci: Vec::new(),
             impmap_trace: None,
             bayes: None,
             vi: None,

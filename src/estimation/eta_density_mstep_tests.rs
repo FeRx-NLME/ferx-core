@@ -162,3 +162,56 @@ fn every_omega_prior_is_its_textbook_density() {
     let d_lk = lk.log_density(&one) - lk.log_density(&two);
     assert!((d_ig - d_lk).abs() < 1e-12, "{d_ig} vs {d_lk}");
 }
+
+/// Under a `[mixture]` ω override on one density ETA, a class's subjects leave the base
+/// step of that ETA's group only (#2669 review, finding 9): the other group steps on every
+/// subject, exactly as an unfiltered step does, and the overridden group on the kept ones,
+/// exactly as a step on that subset does.
+/// Dies under: the filter applied to every group (the pre-fix SAEM), or to none.
+#[test]
+fn a_class_override_filters_only_its_own_group() {
+    let g = |kind, eta| EtaDensity {
+        kind,
+        etas: vec![eta],
+        shape_thetas: vec![],
+        trunc: None,
+        margins: vec![],
+        log_anchors: Vec::new(),
+    };
+    let model = model_with(vec![g(DensityKind::Gamma, 0), g(DensityKind::InvGamma, 1)]);
+    let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![0.09, 0.05]));
+    let etas = draws(&model, &omega, &[], 400);
+    // Subjects 0, 3, 6, … are in the class that overrides ETA 0's ω.
+    let in_class = |i: usize| i % 3 == 0;
+    let keep = |d: &EtaDensity, i: usize| !(in_class(i) && d.etas.contains(&0));
+    let step = |etas: &[Vec<f64>], masked: bool| {
+        let mut dm = DensityMstep::new(&model, &[false; 2], &[], &[]).unwrap();
+        let mut om = DMatrix::from_diagonal(&DVector::from_vec(vec![0.2, 0.2]));
+        if masked {
+            dm.sa_step_where(&model, etas, &keep, &mut om, &mut [], 1.0);
+        } else {
+            dm.sa_step(&model, etas, &mut om, &mut [], 1.0);
+        }
+        om
+    };
+    let masked = step(&etas, true);
+    let all = step(&etas, false);
+    let kept: Vec<Vec<f64>> =
+        etas.iter().enumerate().filter(|&(i, _)| !in_class(i)).map(|(_, e)| e.clone()).collect();
+    let subset = step(&kept, false);
+    assert_eq!(
+        masked[(1, 1)].to_bits(),
+        all[(1, 1)].to_bits(),
+        "{} vs {}",
+        masked[(1, 1)],
+        all[(1, 1)]
+    );
+    assert_eq!(
+        masked[(0, 0)].to_bits(),
+        subset[(0, 0)].to_bits(),
+        "{} vs {}",
+        masked[(0, 0)],
+        subset[(0, 0)]
+    );
+    assert_ne!(masked[(0, 0)], all[(0, 0)]);
+}

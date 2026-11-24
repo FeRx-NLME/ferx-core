@@ -1538,6 +1538,18 @@ fn agq_marginal_at(
     (2.0 * nll, eta_hats, h_matrices, kappas)
 }
 
+/// The warning for a covariance step skipped under a kink or edge density (#2669 review,
+/// finding 1).
+fn density_no_covariance_warning(kind: &str, eta: &str) -> String {
+    format!(
+        "W_DENSITY_NO_COVARIANCE: covariance step and SIR skipped: `{eta}` follows `density \
+         {kind}`, which has a kink or an edge where its density is positive. The covariance \
+         step differentiates the FOCE/Laplace objective, which reads a prior curvature this \
+         kind does not have, so its standard errors would not be valid. Fit with `method = \
+         bayes` for posterior intervals."
+    )
+}
+
 /// The objective a SAEM fit reports at its final estimates (#2973), by `saem_ofv`: NONMEM's
 /// SAEM objective (accumulated during the run), the importance-sampled `−2 log L` (NONMEM
 /// `IMP EONLY=1`) or the adaptive-quadrature one. `prev` is the SAEM stage's result, whose
@@ -2414,6 +2426,39 @@ fn fit_inner(
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
+        // FOCE without interaction under a density (#2669 review): the Sheiner–Beal marginal
+        // integrates η as Gaussian, so it takes the conditional form instead, and its OFV is
+        // not like-for-like with the Gaussian twin's FOCE OFV.
+        if model.has_densities()
+            && !stage_opts.interaction
+            && matches!(
+                method,
+                EstimationMethod::Foce | EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid
+            )
+            && !accumulated_warnings.iter().any(|w| w.starts_with("W_DENSITY_FOCE_CONDITIONAL"))
+        {
+            accumulated_warnings.push(
+                "W_DENSITY_FOCE_CONDITIONAL: FOCE without interaction scores a `density` random \
+                 effect with the conditional (FOCEI-style) form, because the Sheiner–Beal \
+                 marginal it uses for Gaussian models integrates η as Gaussian. Its OFV is \
+                 therefore not comparable with the FOCE OFV of a Gaussian model; use FOCEI \
+                 (`interaction = true`) for both models when comparing them."
+                    .to_string(),
+            );
+        }
+        // A density with a kink or an edge (#2669 review, finding 1): the covariance step
+        // differentiates the FOCE/FOCEI/AGQ objective, which reads a prior curvature such a
+        // kind does not have, and SIR's proposal is that step's matrix. Skipped, with the
+        // reason, rather than reported as standard errors.
+        if stage_opts.run_covariance_step || stage_opts.sir {
+            if let Some((k, eta)) = crate::stats::eta_density::kink_kind(model) {
+                stage_opts.run_covariance_step = false;
+                stage_opts.sir = false;
+                if !accumulated_warnings.iter().any(|w| w.starts_with("W_DENSITY_NO_COVARIANCE")) {
+                    accumulated_warnings.push(density_no_covariance_warning(k.name(), &eta));
+                }
+            }
+        }
         // `of_run`, not `from_options`: a model stamped `gradient = fd` (or an SDE model)
         // ran this stage on finite differences under `Auto` options, and the record must
         // say so (#1835).
@@ -2877,6 +2922,47 @@ fn fit_inner(
     }
 
     let mut result = result.expect("method chain must have at least one stage");
+    // A density with a kink or an edge (#2669 review, finding 1): the FOCE/Laplace pass an
+    // IMP / IMPMAP fit reports, and the one SAEM keeps as a diagnostic, read a prior
+    // curvature the kind does not have. IMP reports its importance-sampling marginal
+    // instead, which scores the prior itself; no number is reported where none is valid.
+    let mut ofv_is_importance_sampling = false;
+    if let Some((k, eta)) = crate::stats::eta_density::kink_kind(model) {
+        // The last estimating stage, or the evaluator of an evaluation-only run.
+        let last = chain
+            .iter()
+            .rev()
+            .copied()
+            .find(|m| !eval_only_methods.contains(m))
+            .or_else(|| chain.last().copied());
+        if let Some(o) = saem_objective.as_mut() {
+            o.foce_ofv = f64::NAN;
+        }
+        // A trailing `agq_eval_only` stage's quadrature is the reported `ofv`, and it
+        // integrates the prior itself: it stands.
+        let reports_laplace = !options.agq_eval_only
+            && (matches!(last, Some(EstimationMethod::Imp | EstimationMethod::Impmap))
+                || (last == Some(EstimationMethod::Saem) && saem_objective.is_none()));
+        if reports_laplace {
+            match is_result.as_ref().filter(|is| is.minus2_log_likelihood.is_finite()) {
+                Some(is) => {
+                    result.ofv = is.minus2_log_likelihood;
+                    ofv_is_importance_sampling = true;
+                }
+                None => {
+                    result.ofv = f64::NAN;
+                    accumulated_warnings.push(format!(
+                        "W_DENSITY_NO_OBJECTIVE: `{eta}` follows `density {}`, which has a kink \
+                         or an edge, so the FOCE/Laplace objective does not apply to it, and no \
+                         importance-sampling −2 log L was evaluated to report instead: `ofv` is \
+                         NaN and there is no AIC or BIC. See the warning above for why the \
+                         marginal is missing.",
+                        k.name()
+                    ));
+                }
+            }
+        }
+    }
     // Estimation is over: its plans go before the post-fit phases record their own, so the
     // post-fit peak replaces the estimation plateau instead of stacking on it (#3077).
     crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
@@ -3832,6 +3918,7 @@ fn fit_inner(
         sir_resamples_packed: None,
         importance_sampling: is_result,
         saem_objective,
+        ofv_is_importance_sampling,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
         vi: vi_result.clone(),
@@ -3898,6 +3985,8 @@ fn fit_inner(
         eta_param_info: model.eta_param_info.clone(),
         kappa_param_types: model.kappa_param_types.clone(),
         kappa_distributions: model.kappa_distributions.clone(),
+        typical_values: crate::stats::eta_density::typical_values(model),
+        eta_effect_quantile_ci: Vec::new(),
         data_bindings: model.data_bindings().clone(),
         theta_transform: model.theta_transform.clone(),
         sigma_types: model.error_spec.sigma_types(result.params.sigma.values.len()),
@@ -3971,6 +4060,9 @@ fn fit_inner(
     };
     // The normal SIR when it ran, else the non-PD fallback's (#1713).
     apply_sir_result(&mut fit_result, sir_result.as_ref(), sir_fallback_result.as_ref());
+    // The 95% intervals of the distribution ETAs' reported percentiles (#2669).
+    fit_result.eta_effect_quantile_ci =
+        crate::io::output::eta_effect_quantile_cis(&fit_result, model, 500);
 
     if time_gradients {
         let (an_c, an_n, fd_c, fd_n, jac_an_c, jac_an_n, jac_fd_c, jac_fd_n) =

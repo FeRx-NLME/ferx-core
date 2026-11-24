@@ -69,7 +69,7 @@ fn univariate_kinds() -> Vec<(EtaDensity, Vec<f64>, f64)> {
         (group(DensityKind::Logistic, vec![0], vec![]), vec![], 0.12),
         (group(DensityKind::Gamma, vec![0], vec![]), vec![], 0.12),
         (group(DensityKind::InvGamma, vec![0], vec![]), vec![], 0.12),
-        (group(DensityKind::LogNormal, vec![0], vec![]), vec![], 0.12),
+        (group(DensityKind::LogNormalMean, vec![0], vec![]), vec![], 0.12),
         (group(DensityKind::Beta, vec![0], vec![0]), vec![0.3], 0.02),
         (group(DensityKind::LogitNormal, vec![0], vec![0]), vec![0.3], 0.12),
     ]
@@ -111,7 +111,7 @@ fn each_density_integrates_to_one() {
 }
 
 /// The random effect the model reads, `η = m(z)`, has the mean and variance the module
-/// documents: mean 1 and variance ω for `gamma`, `invgamma` and `lognormal`, mean μ and
+/// documents: mean 1 and variance ω for `gamma`, `invgamma` and `lognormal_mean`, mean μ and
 /// variance ω for `beta`, variance ω for `logistic` (on ℝ, mean 0). The logit-normal is
 /// parameterised on the latent scale (`z ~ N(logit μ, ω)`), so its latent moments are
 /// checked instead.
@@ -480,7 +480,7 @@ fn a_copula_integrates_to_one_and_keeps_its_margins() {
     assert!((mass - 1.0).abs() < 1e-11 && (m0 - 1.0).abs() < 1e-8 && (m1 - 0.3).abs() < 1e-8);
 }
 
-/// `lognormal` on a block is the multivariate log-normal of mean 1 and covariance Ω:
+/// `lognormal_mean` on a block is the multivariate log-normal of mean 1 and covariance Ω:
 /// the sampler's draws have that mean and covariance, and its latent density at a point
 /// is the textbook `N(ln η; −diag(S)/2, S)` with `S = ln(1 + Ω)`.
 /// Dies under: `S` taken as Ω, or the mean shift dropped.
@@ -490,7 +490,7 @@ fn the_block_lognormal_is_the_multivariate_lognormal() {
     let omega: DMatrix<f64> = DMatrix::from_row_slice(2, 2, &[0.09, 0.03, 0.03, 0.05]);
     let oi = omega.clone().try_inverse().unwrap();
     let d = EtaDensity {
-        kind: DensityKind::LogNormal,
+        kind: DensityKind::LogNormalMean,
         etas: vec![0, 1],
         shape_thetas: vec![],
         trunc: None,
@@ -551,6 +551,7 @@ fn effect_quantiles_are_the_closed_forms() {
         kind: kind.into(),
         shape_thetas: vec![],
         truncation: trunc,
+        truncation_thetas: (None, None),
     };
     let p = [0.05, 0.5, 0.95];
     let mut worst = 0.0f64;
@@ -563,9 +564,10 @@ fn effect_quantiles_are_the_closed_forms() {
     };
     let w = 0.09;
     check(effect_quantiles(&dist("normal", None), w, &[]), p.map(|p| w.sqrt() * zq(p)));
+    check(effect_quantiles(&dist("lognormal", None), w, &[]), p.map(|p| (w.sqrt() * zq(p)).exp()));
     let s = (1.0f64 + w).ln();
     check(
-        effect_quantiles(&dist("lognormal", None), w, &[]),
+        effect_quantiles(&dist("lognormal_mean", None), w, &[]),
         p.map(|p| (-s / 2.0 + s.sqrt() * zq(p)).exp()),
     );
     check(
@@ -582,4 +584,356 @@ fn effect_quantiles_are_the_closed_forms() {
     // No distribution: an unknown kind, a non-positive ω.
     assert!(effect_quantiles(&dist("nope", None), w, &[]).is_none());
     assert!(effect_quantiles(&dist("normal", None), 0.0, &[]).is_none());
+}
+
+/// Every kind, as a parsed model, against every method (#2669 review, findings 1 and 12):
+/// `fit_refusal` refuses exactly the kinds with a kink or an edge, and exactly under the
+/// methods whose reported objective reads the prior's curvature: FOCE, FOCEI, the GN pair,
+/// Laplace, VI's `vi_final_ofv = laplace` and SAEM's `saem_ofv = focei`. IMP, SAEM's own
+/// objectives, Bayes and VI's default run every kind. The refusal names the ETA.
+/// Dies under: any kind dropped from `has_kink_or_edge`, or a method added to or dropped
+/// from the gate.
+#[test]
+fn every_kink_kind_is_refused_exactly_where_curvature_is_read() {
+    use crate::types::{EstimationMethod as M, FitOptions, SaemOfv, ViFinalOfv};
+    let mut opts_for: Vec<(String, FitOptions, bool)> = Vec::new();
+    for (m, reads) in [
+        (M::Foce, true),
+        (M::FoceI, true),
+        (M::FoceGn, true),
+        (M::FoceGnHybrid, true),
+        (M::Laplace, true),
+        (M::Imp, false),
+        (M::Impmap, false),
+        (M::Saem, false),
+        (M::Bayes, false),
+        (M::Vi, false),
+    ] {
+        let o = FitOptions { method: m, ..FitOptions::default() };
+        opts_for.push((format!("{m:?}"), o, reads));
+    }
+    let o = FitOptions { method: M::Saem, saem_ofv: SaemOfv::Focei, ..FitOptions::default() };
+    opts_for.push(("saem_ofv = focei".into(), o, true));
+    for ofv in [SaemOfv::Imp, SaemOfv::Agq] {
+        let o = FitOptions { method: M::Saem, saem_ofv: ofv, ..FitOptions::default() };
+        opts_for.push((format!("saem_ofv = {ofv:?}"), o, false));
+    }
+    let o =
+        FitOptions { method: M::Vi, vi_final_ofv: ViFinalOfv::Laplace, ..FitOptions::default() };
+    opts_for.push(("vi_final_ofv = laplace".into(), o, true));
+    let mut n_kink = 0;
+    for kind in DensityKind::ALL {
+        if matches!(kind, DensityKind::Normal | DensityKind::Copula) {
+            continue;
+        }
+        let read = match kind.map() {
+            DomainMap::Identity => "TVCL * exp(ETA_CL)",
+            DomainMap::Exp => "TVCL * ETA_CL",
+            DomainMap::InvLogit => "TVCL * ETA_CL",
+        };
+        let fix = if kind.omega_unused() { "1 FIX" } else { "0.09" };
+        let shapes = if kind.shapes().is_empty() { String::new() } else { "()".to_string() };
+        let src = format!(
+            "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             omega ETA_CL ~ {fix} density {}{shapes}\n  omega ETA_V ~ 0.04\n  sigma EPS ~ 0.01\n\n\
+             [individual_parameters]\n  CL = {read}\n  V = TVV * exp(ETA_V)\n\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(EPS)\n",
+            kind.name()
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("{}: {e}", kind.name()));
+        let kink = kind.has_kink_or_edge();
+        n_kink += usize::from(kink);
+        assert_eq!(
+            kink_kind(&model).map(|(k, e)| (k, e)),
+            kink.then(|| (kind, "ETA_CL".to_string())),
+            "{}",
+            kind.name()
+        );
+        for (label, o, reads) in &opts_for {
+            let r = fit_refusal(&model, o, &model.default_params);
+            assert_eq!(r.is_some(), kink && *reads, "{} under {label}: {r:?}", kind.name());
+            if let Some(msg) = r {
+                assert!(msg.contains("`ETA_CL` follows") && msg.contains("method = imp"), "{msg}");
+            }
+        }
+    }
+    // The seven kinds the review lists.
+    assert_eq!(n_kink, 7);
+}
+
+/// Measurement (#2669 review, finding 11): the cost of `correction_jets` (value, gradient
+/// and η-Hessian) on a Gaussian copula of `p` margins, the shape FREM gives a density block
+/// (its covariate ETAs join on `normal` margins), against the plain correction. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_copula_correction_jets_cost() {
+    for p in [2usize, 4, 8, 12, 16] {
+        let mut margins = vec![DensityKind::Gamma, DensityKind::Logistic];
+        margins.resize(p, DensityKind::Normal);
+        let d = EtaDensity {
+            kind: DensityKind::Copula,
+            etas: (0..p).collect(),
+            shape_thetas: vec![],
+            trunc: None,
+            margins: margins[..p].to_vec(),
+            log_anchors: Vec::new(),
+        };
+        let omega = DMatrix::from_fn(p, p, |i, j| if i == j { 0.09 } else { 0.01 });
+        let oi = omega.clone().try_inverse().unwrap();
+        let eta: Vec<f64> = (0..p).map(|i| 0.05 * (i as f64 - 1.5)).collect();
+        let reps = 2000 / p.max(1);
+        let t0 = std::time::Instant::now();
+        let mut sink = 0.0;
+        for _ in 0..reps {
+            sink += correction(std::slice::from_ref(&d), &eta, &oi, &[]);
+        }
+        let plain = t0.elapsed().as_secs_f64() / reps as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let (v, g, h) = correction_jets(std::slice::from_ref(&d), &eta, &oi, &[], true);
+            sink += v + g[0] + h.unwrap()[(0, 0)];
+        }
+        let jets = t0.elapsed().as_secs_f64() / reps as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let (v, g, h) = correction_jets_impl(
+                std::slice::from_ref(&d),
+                &eta,
+                |a, b| oi[(a, b)],
+                |_| 0.0,
+                true,
+                false,
+            );
+            sink += v + g[0] + h.unwrap()[0][0];
+        }
+        let generic = t0.elapsed().as_secs_f64() / reps as f64;
+        eprintln!(
+            "p = {p:2}: correction {:8.2} µs, generic jets {:10.2} µs ({:.0}×), separable {:8.2} µs ({:.0}×)  [{sink:.1}]",
+            plain * 1e6,
+            generic * 1e6,
+            generic / plain,
+            jets * 1e6,
+            jets / plain
+        );
+    }
+}
+
+/// A model with the given `[parameters]` extra lines and `[individual_parameters]`, on a
+/// 1-cpt oral structure reading CL, V, KA and F.
+fn tv_model(params: &str, indiv: &str) -> crate::types::CompiledModel {
+    crate::parser::model_parser::parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+         theta TVKA(1.0, 0.01, 10.0)\n  theta TVF(0.6, 0.01, 0.99)\n{params}\n  sigma EPS ~ 0.01\n\n\
+         [individual_parameters]\n{indiv}\n\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)\n\n\
+         [error_model]\n  DV ~ proportional(EPS)\n"
+    ))
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Which summary each typical-value θ is (#2669): `TV·exp(η)` a median, `TV + η` a mean,
+/// a mean-1 positive density's `TV·η` a mean, a symmetric ℝ density under `exp` a median,
+/// an asymmetric one a geometric mean, `beta(μ)`'s μ a mean and `logitnormal(μ)`'s a
+/// median; `density lognormal` is the classic median; a θ shared by two parameters, none.
+/// Dies under: any rule swapped, or the shared θ labelled.
+#[test]
+fn typical_values_name_the_summary_each_theta_is() {
+    use crate::types::TypicalStatistic::{GeometricMean, Mean, Median};
+    let get = |m: &crate::types::CompiledModel| {
+        let mut v: Vec<(String, String, crate::types::TypicalStatistic)> =
+            typical_values(m).into_iter().map(|t| (t.theta, t.parameter, t.statistic)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+    let s = |a: &str, b: &str, c| (a.to_string(), b.to_string(), c);
+    let m = tv_model(
+        "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.1 density t(NU)\n  \
+         theta NU(10, 3, 100)\n  omega ETA_F ~ 0.02 density beta(TVF)",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV + ETA_V\n  KA = TVKA * exp(ETA_KA)\n  F = ETA_F",
+    );
+    assert_eq!(
+        get(&m),
+        vec![
+            s("TVCL", "CL", Median),
+            s("TVF", "F", Mean),
+            s("TVKA", "KA", Median),
+            s("TVV", "V", Mean)
+        ]
+    );
+    let m = tv_model(
+        "  omega ETA_CL ~ 0.09 density gamma\n  omega ETA_V ~ 0.04 density lognormal\n  \
+         omega ETA_KA ~ 0.1 density gumbel\n  omega ETA_F ~ 0.3 density logitnormal(TVF)",
+        "  CL = TVCL * ETA_CL\n  V = TVV * ETA_V\n  KA = TVKA * exp(ETA_KA)\n  F = ETA_F",
+    );
+    assert_eq!(
+        get(&m),
+        vec![
+            s("TVCL", "CL", Mean),
+            s("TVF", "F", Median),
+            s("TVKA", "KA", GeometricMean),
+            s("TVV", "V", Median)
+        ]
+    );
+    // One θ, two parameters: no label.
+    let m = tv_model(
+        "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVCL * exp(ETA_V)\n  KA = TVKA\n  F = TVF",
+    );
+    assert!(get(&m).iter().all(|v| v.0 != "TVCL"), "{:?}", get(&m));
+}
+
+/// `latent_of_effect` inverts `effect_of_latent` for every map, a truncation's included,
+/// refuses an effect outside the support, and a θ-valued truncation bound is read at the θ
+/// it is resolved at (#2669: it held the initial value).
+/// Dies under: a wrong inverse, or a bound left at its initial value.
+#[test]
+fn the_effect_map_inverts_and_reads_fitted_bounds() {
+    let dist = |kind: &str, trunc, tt| crate::types::EtaDistribution {
+        form: "density".into(),
+        kind: kind.into(),
+        shape_thetas: vec![],
+        truncation: trunc,
+        truncation_thetas: tt,
+    };
+    for d in [
+        dist("gamma", None, (None, None)),
+        dist("logistic", None, (None, None)),
+        dist("beta", None, (None, None)),
+        dist("gamma", Some((Some(0.2), Some(5.0))), (None, None)),
+        dist("t", Some((Some(-1.0), None)), (None, None)),
+        dist("gamma", Some((None, Some(3.0))), (None, None)),
+    ] {
+        for z in [-2.0, -0.3, 0.0, 0.7, 1.9] {
+            let x = effect_of_latent(&d, z);
+            let back = latent_of_effect(&d, x);
+            assert!((back - z).abs() < 1e-12, "{} {:?}: {z} → {x} → {back}", d.kind, d.truncation);
+        }
+    }
+    assert!(latent_of_effect(&dist("gamma", None, (None, None)), -0.1).is_nan());
+    assert!(latent_of_effect(&dist("beta", None, (None, None)), 1.2).is_nan());
+    assert!(
+        latent_of_effect(&dist("gamma", Some((Some(0.2), Some(5.0))), (None, None)), 6.0).is_nan()
+    );
+    // A θ bound: stored at its initial 5.0, resolved at the fitted 4.0.
+    let d = dist("gamma", Some((Some(0.2), Some(5.0))), (None, Some("HI".into())));
+    let r = resolve_distribution(&d, |n| (n == "HI").then_some(4.0));
+    assert_eq!(r.truncation, Some((Some(0.2), Some(4.0))));
+    assert!((effect_of_latent(&r, 50.0) - 4.0).abs() < 1e-12);
+}
+
+/// Effect shrinkage (#2669): with closed-form moments it is `1 − RMS(m(ẑ) − μ)/σ`; where
+/// there are none (Cauchy) the quantile form `1 − IQR(m(ẑ))/IQR(prior)`, which is 0 for
+/// effects spread as the prior is and 1 for effects all at one value.
+/// Dies under: the fallback missing (NaN), or its ratio inverted.
+#[test]
+fn effect_shrinkage_falls_back_to_quantiles_without_moments() {
+    let m = tv_model(
+        "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.04 density cauchy\n  \
+         omega ETA_F ~ 0.02",
+        "  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n  \
+         F = inv_logit(logit(TVF) + ETA_F)",
+    );
+    let d = crate::types::EtaDistribution {
+        form: "density".into(),
+        kind: "cauchy".into(),
+        shape_thetas: vec![],
+        truncation: None,
+        truncation_thetas: (None, None),
+    };
+    let th = m.default_params.theta.clone();
+    // The prior's own quantiles, evenly spaced in probability: the sample IQR is the prior's.
+    let n = 999;
+    let probs: Vec<f64> = (1..=n).map(|i| i as f64 / (n + 1) as f64).collect();
+    let spread = effect_quantiles_at(&d, 0.04, &[], &probs).unwrap();
+    let s0 = effect_shrinkage_of(&d, 0.04, &m, &th, &spread);
+    assert!(s0.abs() < 0.01, "spread as the prior: {s0}");
+    let s1 = effect_shrinkage_of(&d, 0.04, &m, &th, &vec![0.1; 50]);
+    assert!((s1 - 1.0).abs() < 1e-12, "all at one value: {s1}");
+    // A gamma has moments: the RMS form.
+    let g = crate::types::EtaDistribution { kind: "gamma".into(), ..d.clone() };
+    let e = [0.7, 1.0, 1.3, 1.0];
+    let want = 1.0 - ((0.09 + 0.0 + 0.09 + 0.0) / 4.0f64).sqrt() / 0.3;
+    assert!((effect_shrinkage_of(&g, 0.09, &m, &th, &e) - want).abs() < 1e-12);
+}
+
+/// The separable copula path of `correction_jets` (#2669 review, finding 11) gives the
+/// value, gradient and Hessian of the generic pair passes, on copulas of 2 to 6 margins
+/// mixing every margin family (gamma, beta, t, logistic, normal) at points across the
+/// support.
+/// Dies under: a wrong term in the assembly (the `2(Aq)q″` diagonal, the `−2Ω⁻¹` part, a
+/// margin's `A` scaling), or a margin read on the wrong scale.
+#[test]
+fn the_separable_copula_jets_are_the_generic_ones() {
+    let margins = [
+        DensityKind::Gamma,
+        DensityKind::Beta,
+        DensityKind::StudentT,
+        DensityKind::Logistic,
+        DensityKind::Normal,
+        DensityKind::Gamma,
+    ];
+    let mut worst = 0.0f64;
+    for p in 2..=6 {
+        let mk = margins[..p].to_vec();
+        // Shape θs: β's μ at θ[0], t's ν at θ[1].
+        let shape_thetas: Vec<usize> = mk
+            .iter()
+            .filter_map(|k| match k {
+                DensityKind::Beta => Some(0),
+                DensityKind::StudentT => Some(1),
+                _ => None,
+            })
+            .collect();
+        let d = EtaDensity {
+            kind: DensityKind::Copula,
+            etas: (0..p).collect(),
+            shape_thetas,
+            trunc: None,
+            margins: mk.clone(),
+            log_anchors: Vec::new(),
+        };
+        let omega = DMatrix::from_fn(p, p, |i, j| {
+            let w = |k: usize| if mk[k] == DensityKind::Beta { 0.02 } else { 0.09 };
+            if i == j {
+                w(i)
+            } else {
+                0.3 * (w(i) * w(j)).sqrt() * if (i + j) % 2 == 0 { 1.0 } else { -1.0 }
+            }
+        });
+        let oi = omega.clone().try_inverse().unwrap();
+        let theta = [0.3, 7.0];
+        for t in [-0.8, 0.0, 0.6] {
+            let eta: Vec<f64> = (0..p).map(|i| t * (1.0 - 0.3 * i as f64)).collect();
+            let fast = correction_jets(std::slice::from_ref(&d), &eta, &oi, &theta, true);
+            let (v, g, h) = correction_jets_impl(
+                std::slice::from_ref(&d),
+                &eta,
+                |a, b| oi[(a, b)],
+                |k| theta[k],
+                true,
+                false,
+            );
+            let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+            let (fh, h) = (fast.2.as_ref().unwrap(), h.as_ref().unwrap());
+            assert!(fast.0.is_finite() && v.is_finite(), "value {} vs {v}", fast.0);
+            assert!(fast.1.iter().chain(&g).all(|x| x.is_finite()), "{:?} vs {g:?}", fast.1);
+            assert!(fh.iter().chain(h.iter().flatten()).all(|x| x.is_finite()), "Hessians");
+            let mut gaps = vec![rel(fast.0, v)];
+            for i in 0..p {
+                gaps.push(rel(fast.1[i], g[i]));
+                for j in 0..p {
+                    gaps.push(rel(fh[(i, j)], h[i][j]));
+                }
+            }
+            for gap in gaps {
+                assert!(gap.is_finite(), "a non-finite gap");
+                worst = worst.max(gap);
+            }
+        }
+    }
+    eprintln!("separable vs generic copula jets: worst {worst:.2e}");
+    assert!(worst < 1e-10, "worst {worst:.2e}");
 }

@@ -2568,6 +2568,7 @@ pub ferx_core::stats::eta_density::DensityKind::Kolmogorov
 pub ferx_core::stats::eta_density::DensityKind::Laplace
 pub ferx_core::stats::eta_density::DensityKind::Levy
 pub ferx_core::stats::eta_density::DensityKind::LogNormal
+pub ferx_core::stats::eta_density::DensityKind::LogNormalMean
 pub ferx_core::stats::eta_density::DensityKind::LogUniform
 pub ferx_core::stats::eta_density::DensityKind::Logistic
 pub ferx_core::stats::eta_density::DensityKind::LogitNormal
@@ -3175,6 +3176,12 @@ pub enum ferx_core::types::TteRecurrence
 pub ferx_core::types::TteRecurrence::Repeated
 pub ferx_core::types::TteRecurrence::Repeated::clock: ferx_core::RtteClock
 pub ferx_core::types::TteRecurrence::Single
+pub enum ferx_core::types::TypicalStatistic
+pub ferx_core::types::TypicalStatistic::GeometricMean
+pub ferx_core::types::TypicalStatistic::Mean
+pub ferx_core::types::TypicalStatistic::Median
+impl ferx_core::TypicalStatistic
+pub fn ferx_core::TypicalStatistic::label(self) -> &'static str
 pub enum ferx_core::types::ViEtaGrad
 pub ferx_core::types::ViEtaGrad::Analytic
 pub ferx_core::types::ViEtaGrad::Auto
@@ -3532,6 +3539,7 @@ pub ferx_core::types::EtaDistribution::form: alloc::string::String
 pub ferx_core::types::EtaDistribution::kind: alloc::string::String
 pub ferx_core::types::EtaDistribution::shape_thetas: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::EtaDistribution::truncation: core::option::Option<(core::option::Option<f64>, core::option::Option<f64>)>
+pub ferx_core::types::EtaDistribution::truncation_thetas: (core::option::Option<alloc::string::String>, core::option::Option<alloc::string::String>)
 pub struct ferx_core::types::EtaParamInfo
 pub ferx_core::types::EtaParamInfo::distribution: core::option::Option<ferx_core::EtaDistribution>
 pub ferx_core::types::EtaParamInfo::eta_name: alloc::string::String
@@ -3739,6 +3747,7 @@ pub ferx_core::types::FitResult::ebe_kappas: alloc::vec::Vec<alloc::vec::Vec<nal
 pub ferx_core::types::FitResult::ebe_kappas_by_level: alloc::vec::Vec<ferx_core::LevelKappaEbes>
 pub ferx_core::types::FitResult::environment: ferx_core::environment::EnvironmentInfo
 pub ferx_core::types::FitResult::error_model: ferx_core::ErrorModel
+pub ferx_core::types::FitResult::eta_effect_quantile_ci: alloc::vec::Vec<core::option::Option<[[f64; 2]; 3]>>
 pub ferx_core::types::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
@@ -3796,6 +3805,7 @@ pub ferx_core::types::FitResult::obs_time_range: core::option::Option<(f64, f64)
 pub ferx_core::types::FitResult::ode_linear_exact: bool
 pub ferx_core::types::FitResult::ofv: f64
 pub ferx_core::types::FitResult::ofv_data: f64
+pub ferx_core::types::FitResult::ofv_is_importance_sampling: bool
 pub ferx_core::types::FitResult::ofv_prior: f64
 pub ferx_core::types::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::types::FitResult::omega_fixed: alloc::vec::Vec<bool>
@@ -3860,6 +3870,7 @@ pub ferx_core::types::FitResult::total_ebe_fallbacks: u32
 pub ferx_core::types::FitResult::total_ebe_nm_polished: u32
 pub ferx_core::types::FitResult::trace_csv: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::trace_path: core::option::Option<alloc::string::String>
+pub ferx_core::types::FitResult::typical_values: alloc::vec::Vec<ferx_core::TypicalValue>
 pub ferx_core::types::FitResult::uses_ode_solver: bool
 pub ferx_core::types::FitResult::uses_sde: bool
 pub ferx_core::types::FitResult::vi: core::option::Option<ferx_core::ViResult>
@@ -4210,6 +4221,10 @@ pub ferx_core::types::TteObsDiagnostic::martingale: f64
 pub ferx_core::types::TteObsDiagnostic::npde: f64
 pub ferx_core::types::TteObsDiagnostic::pit: f64
 pub ferx_core::types::TteObsDiagnostic::time: f64
+pub struct ferx_core::types::TypicalValue
+pub ferx_core::types::TypicalValue::parameter: alloc::string::String
+pub ferx_core::types::TypicalValue::statistic: ferx_core::TypicalStatistic
+pub ferx_core::types::TypicalValue::theta: alloc::string::String
 #[non_exhaustive] pub struct ferx_core::types::ViResult
 pub ferx_core::types::ViResult::converged: bool
 pub ferx_core::types::ViResult::data_term: f64
@@ -4794,6 +4809,12 @@ pub enum ferx_core::TteRecurrence
 pub ferx_core::TteRecurrence::Repeated
 pub ferx_core::TteRecurrence::Repeated::clock: ferx_core::RtteClock
 pub ferx_core::TteRecurrence::Single
+pub enum ferx_core::TypicalStatistic
+pub ferx_core::TypicalStatistic::GeometricMean
+pub ferx_core::TypicalStatistic::Mean
+pub ferx_core::TypicalStatistic::Median
+impl ferx_core::TypicalStatistic
+pub fn ferx_core::TypicalStatistic::label(self) -> &'static str
 pub enum ferx_core::UncertaintyMethod
 pub ferx_core::UncertaintyMethod::Asymptotic
 pub ferx_core::UncertaintyMethod::Sir
@@ -5409,6 +5430,7 @@ pub ferx_core::EtaDistribution::form: alloc::string::String
 pub ferx_core::EtaDistribution::kind: alloc::string::String
 pub ferx_core::EtaDistribution::shape_thetas: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::EtaDistribution::truncation: core::option::Option<(core::option::Option<f64>, core::option::Option<f64>)>
+pub ferx_core::EtaDistribution::truncation_thetas: (core::option::Option<alloc::string::String>, core::option::Option<alloc::string::String>)
 pub struct ferx_core::EtaParamInfo
 pub ferx_core::EtaParamInfo::distribution: core::option::Option<ferx_core::EtaDistribution>
 pub ferx_core::EtaParamInfo::eta_name: alloc::string::String
@@ -5616,6 +5638,7 @@ pub ferx_core::FitResult::ebe_kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::
 pub ferx_core::FitResult::ebe_kappas_by_level: alloc::vec::Vec<ferx_core::LevelKappaEbes>
 pub ferx_core::FitResult::environment: ferx_core::environment::EnvironmentInfo
 pub ferx_core::FitResult::error_model: ferx_core::ErrorModel
+pub ferx_core::FitResult::eta_effect_quantile_ci: alloc::vec::Vec<core::option::Option<[[f64; 2]; 3]>>
 pub ferx_core::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
@@ -5673,6 +5696,7 @@ pub ferx_core::FitResult::obs_time_range: core::option::Option<(f64, f64)>
 pub ferx_core::FitResult::ode_linear_exact: bool
 pub ferx_core::FitResult::ofv: f64
 pub ferx_core::FitResult::ofv_data: f64
+pub ferx_core::FitResult::ofv_is_importance_sampling: bool
 pub ferx_core::FitResult::ofv_prior: f64
 pub ferx_core::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::FitResult::omega_fixed: alloc::vec::Vec<bool>
@@ -5737,6 +5761,7 @@ pub ferx_core::FitResult::total_ebe_fallbacks: u32
 pub ferx_core::FitResult::total_ebe_nm_polished: u32
 pub ferx_core::FitResult::trace_csv: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::trace_path: core::option::Option<alloc::string::String>
+pub ferx_core::FitResult::typical_values: alloc::vec::Vec<ferx_core::TypicalValue>
 pub ferx_core::FitResult::uses_ode_solver: bool
 pub ferx_core::FitResult::uses_sde: bool
 pub ferx_core::FitResult::vi: core::option::Option<ferx_core::ViResult>
@@ -6341,6 +6366,10 @@ pub ferx_core::TteVpcStratum::n_used: alloc::vec::Vec<usize>
 pub ferx_core::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
 pub ferx_core::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::TypicalValue
+pub ferx_core::TypicalValue::parameter: alloc::string::String
+pub ferx_core::TypicalValue::statistic: ferx_core::TypicalStatistic
+pub ferx_core::TypicalValue::theta: alloc::string::String
 pub struct ferx_core::UncertaintySpec
 pub ferx_core::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::UncertaintySpec::n_draws: usize

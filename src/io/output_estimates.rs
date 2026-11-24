@@ -349,6 +349,11 @@ pub(crate) fn theta_section(result: &FitResult) -> Section {
                 e.push("rse_pct", Value::Null);
             }
         }
+        // Which summary of which parameter the θ is (#2669).
+        if let Some(tv) = result.typical_values.iter().find(|v| v.theta == result.theta_names[i]) {
+            e.push("typical_value_of", Value::Name(tv.parameter.clone()));
+            e.push("typical_value_statistic", Value::Token(tv.statistic.label().replace(' ', "_")));
+        }
         section.entries.push(e);
     }
     section
@@ -373,8 +378,18 @@ pub(crate) fn omega_section(result: &FitResult) -> Section {
         if let Some((k, v)) = spread_field(eta_type(result, &name), var) {
             e.push(k, v);
         }
-        if let Some(d) = eta_distribution(result, &name) {
-            push_distribution(&mut e, result, d, var, eta_effect_quantiles(result, i));
+        if let Some(d) = resolved_eta_distribution(result, &name) {
+            push_distribution(&mut e, result, &d, var, eta_effect_quantiles(result, i));
+            if let Some(Some(ci)) = result.eta_effect_quantile_ci.get(i) {
+                e.push(
+                    "effect_quantiles_ci_95",
+                    Value::List(
+                        ci.iter()
+                            .map(|[a, b]| Value::List(vec![Value::Num(*a), Value::Num(*b)]))
+                            .collect(),
+                    ),
+                );
+            }
         }
         e.push_se(SeState::of(result, ParameterKind::Omega, i, fixed, se));
         section.entries.push(e);

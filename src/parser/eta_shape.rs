@@ -579,8 +579,6 @@ pub(crate) fn split_dist_clause(line: &str) -> Result<(String, Option<DistClause
     })
 }
 
-/// The ETA names an `omega` / `block_omega` declaration line declares, or `None` for
-/// any other line.
 /// The random-effect names an `omega` / `block_omega` / `kappa` / `block_kappa`
 /// declaration declares: whether it is a block, the names, and whether they are IOV κs.
 fn declared_random_effects(line: &str) -> Option<(bool, Vec<String>, bool)> {
@@ -621,9 +619,70 @@ pub(crate) fn decl_keyword(line: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The message for an unknown `density` kind, listing the kinds.
+pub(crate) fn unknown_density(kind: &str, line: &str) -> String {
+    let kinds: Vec<&str> =
+        crate::stats::eta_density::DensityKind::ALL.iter().map(|k| k.name()).collect();
+    format!(
+        "[parameters] unknown density `{kind}` in `{}` — the densities are {}",
+        line.trim(),
+        kinds.join(", ")
+    )
+}
+
+/// `(sd)` / `(var)` written after a `density` clause (#2669 review, finding 13), moved in
+/// front of it, where the omega parser reads it: `omega ETA ~ 0.3 density gamma (sd)` and
+/// `omega ETA ~ 0.3 density t(NU) (var)` read as `omega ETA ~ 0.3 (sd) density …`. Right
+/// after a bare kind that takes a shape θ (`density t (sd)`) the parentheses are its shape
+/// list, so the line is left alone. `Ok(None)` when there is nothing to move.
+pub(crate) fn hoist_scale_word(line: &str) -> Result<Option<String>, String> {
+    use crate::stats::eta_density::DensityKind;
+    let lower = line.to_ascii_lowercase();
+    let mut depth = 0i32;
+    for (i, b) in lower.bytes().enumerate() {
+        if b == b')' {
+            depth -= 1;
+        }
+        if b != b'(' {
+            continue;
+        }
+        depth += 1;
+        if depth != 1 {
+            continue;
+        }
+        let Some(rel) = lower[i..].find(')') else {
+            return Ok(None);
+        };
+        let word = lower[i + 1..i + rel].trim();
+        if word != "sd" && word != "var" {
+            continue;
+        }
+        let head = &line[..i];
+        let Some((s, e, c)) = find_dist_clause(head)? else {
+            continue;
+        };
+        let bare_no_shape = c.args.is_empty()
+            && !head.trim_end().ends_with(')')
+            && DensityKind::from_name(&c.kind).is_some_and(|k| k.shapes().is_empty());
+        if !head[e..].trim().is_empty() || !(bare_no_shape || head.trim_end().ends_with(')')) {
+            continue;
+        }
+        let rest = line[i + rel + 1..].trim_start();
+        let sep = if rest.is_empty() { "" } else { " " };
+        return Ok(Some(format!(
+            "{} ({word}) {}{sep}{rest}",
+            line[..s].trim_end(),
+            line[s..e].trim_end()
+        )));
+    }
+    Ok(None)
+}
+
 /// The text pre-pass for omega-line distributions (#1716), run on `[parameters]` before
 /// anything parses it:
 ///
+/// - an `(sd)` / `(var)` written after the clause moves before it
+///   ([`hoist_scale_word`]), so either word order reads the same.
 /// - an omega-line `transform KIND(ARGS)` or `density boxcox(λ)` is refused, naming the
 ///   `[eta_shape]` line to write: that block is a transform's one declarative home.
 /// - `density KIND()` gets its shape θ named (`NU_<ETA>` / `LAMBDA_<ETA>`), and a
@@ -633,18 +692,6 @@ pub(crate) fn decl_keyword(line: &str) -> String {
 ///
 /// Returns the generated `[eta_shape]` lines (none since transforms left the omega line;
 /// kept so the caller's splice stays one code path).
-/// The message for an unknown `density` kind, listing the kinds.
-pub(crate) fn unknown_density(kind: &str, line: &str) -> String {
-    let kinds: Vec<&str> =
-        crate::stats::eta_density::DensityKind::ALL.iter().map(|k| k.name()).collect();
-    format!(
-        "[parameters] unknown density `{kind}` in `{}` — the densities are {} (and \
-         `boxcox`, which is the Box-Cox transform)",
-        line.trim(),
-        kinds.join(", ")
-    )
-}
-
 pub(crate) fn apply_omega_dist_clauses(
     parameters: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
@@ -663,6 +710,9 @@ pub(crate) fn apply_omega_dist_clauses(
     let shape_lines: Vec<String> = Vec::new();
     let mut new_thetas = Vec::new();
     for line in parameters.iter_mut() {
+        if let Some(hoisted) = hoist_scale_word(line)? {
+            *line = hoisted;
+        }
         let Some((s, e, clause)) = find_dist_clause(line)? else {
             continue;
         };

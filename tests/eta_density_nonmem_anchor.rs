@@ -6,7 +6,7 @@
 //!
 //! | stream | ferx | NONMEM `$PK` | comparison |
 //! |---|---|---|---|
-//! | `eta_density_lognormal` | `omega ETA_CL ~ 0.2 density lognormal`, `CL = TVCL * ETA_CL` | `CL = TVCL*EXP(SQRT(S)*ETA(1) − S/2)`, `S = ln 1.2` | FOCEI, `MAXEVAL=0`: an **affine** map of η, so the Laplace / FOCEI objective is the same function — to arithmetic |
+//! | `eta_density_lognormal` | `omega ETA_CL ~ 0.2 density lognormal_mean`, `CL = TVCL * ETA_CL` | `CL = TVCL*EXP(SQRT(S)*ETA(1) − S/2)`, `S = ln 1.2` | FOCEI, `MAXEVAL=0`: an **affine** map of η, so the Laplace / FOCEI objective is the same function — to arithmetic |
 //! | `eta_density_logistic` | `omega ETA_CL ~ 0.2 density logistic`, `CL = TVCL * exp(ETA_CL)` | `X = B*LOG(P/(1−P))`, `P = PHI(ETA(1))` | IMP, `EONLY=1`: not affine, so only the exact marginal agrees — within Monte Carlo error |
 //!
 //! The NONMEM outputs are committed in `nonmem_anchor/results/` (run in
@@ -75,7 +75,7 @@ fn evaluate(src: &str) -> FitResult {
     r
 }
 
-/// `density lognormal` (mean 1, variance ω = 0.2) against the Gaussian stream NONMEM runs,
+/// `density lognormal_mean` (mean 1, variance ω = 0.2) against the Gaussian stream NONMEM runs,
 /// `TVCL·exp(√S·η − S/2)`, η ~ N(0, 1) FIX, `S = ln(1 + ω)`: ferx's latent is
 /// `z = √S·η − S/2`, an affine map, under which the FOCEI objective is invariant (the
 /// prior's `−2 ln |a|` and the curvature's `+2 ln |a|` cancel). So the OFVs agree to the
@@ -85,7 +85,8 @@ fn evaluate(src: &str) -> FitResult {
 #[test]
 fn the_lognormal_density_is_its_affine_gaussian_twin() {
     let s = 0.2f64.ln_1p();
-    let density = evaluate(&model("omega ETA_CL ~ 0.2 density lognormal", "TVCL * ETA_CL", ""));
+    let density =
+        evaluate(&model("omega ETA_CL ~ 0.2 density lognormal_mean", "TVCL * ETA_CL", ""));
     let twin = evaluate(&model(
         "omega ETA_CL ~ 1.0 FIX",
         "TVCL * exp(sqrt(S) * ETA_CL - S / 2)",
@@ -139,14 +140,14 @@ fn ext_obj(file: &str, iter: f64) -> f64 {
         .unwrap_or_else(|| panic!("{file}: no ITERATION {iter}"))["OBJ"]
 }
 
-/// `density lognormal` against NONMEM 7.6.0's affine Gaussian stream
+/// `density lognormal_mean` against NONMEM 7.6.0's affine Gaussian stream
 /// (`eta_density_lognormal.ctl`, FOCEI `MAXEVAL=0`): the OFV and every subject's EBE on
 /// both ETAs, ferx's latent mapped to NONMEM's η by `(z + S/2)/√S`.
 /// Dies under: the same defects as the twin test, now against an external engine.
 #[test]
 fn the_lognormal_density_matches_nonmem() {
     let s = 0.2f64.ln_1p();
-    let r = evaluate(&model("omega ETA_CL ~ 0.2 density lognormal", "TVCL * ETA_CL", ""));
+    let r = evaluate(&model("omega ETA_CL ~ 0.2 density lognormal_mean", "TVCL * ETA_CL", ""));
     let nm = ext_obj("eta_density_lognormal.ext", -1_000_000_000.0);
     assert!(nm.is_finite(), "NONMEM OBJ {nm}");
     let gap = (r.ofv - nm).abs();

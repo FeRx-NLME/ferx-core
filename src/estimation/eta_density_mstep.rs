@@ -129,16 +129,35 @@ impl DensityMstep {
     /// at SA gain `gamma`, writing the new Ω blocks into `omega` and shape θs into `theta`
     /// (natural scale).
     pub(crate) fn sa_step(
-        &mut self, _model: &CompiledModel, etas: &[Vec<f64>], omega: &mut DMatrix<f64>,
+        &mut self, model: &CompiledModel, etas: &[Vec<f64>], omega: &mut DMatrix<f64>,
         theta: &mut [f64], gamma: f64,
     ) {
-        let draws: Vec<(&[f64], f64)> = etas.iter().map(|e| (e.as_slice(), 1.0)).collect();
+        self.sa_step_where(model, etas, &|_, _| true, omega, theta, gamma);
+    }
+
+    /// [`Self::sa_step`] with each group stepping on the subjects `keep(group, subject)`
+    /// admits: under a `[mixture]` ω override (#2669 review, finding 9) a class's subjects
+    /// leave the base step of the overridden group only, not of every density group.
+    pub(crate) fn sa_step_where(
+        &mut self, _model: &CompiledModel, etas: &[Vec<f64>],
+        keep: &dyn Fn(&EtaDensity, usize) -> bool, omega: &mut DMatrix<f64>, theta: &mut [f64],
+        gamma: f64,
+    ) {
         for g in 0..self.layouts.len() {
             let layout = self.layouts[g].clone();
             if layout.dim() == 0 {
                 continue;
             }
             let d = &self.groups[g];
+            let draws: Vec<(&[f64], f64)> = etas
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| keep(d, i))
+                .map(|(_, e)| (e.as_slice(), 1.0))
+                .collect();
+            if draws.is_empty() {
+                continue;
+            }
             let psi = pack(d, &layout, omega, theta);
             let Some((s, j)) = score_and_info(d, &layout, &psi, &draws, omega, theta) else {
                 continue;

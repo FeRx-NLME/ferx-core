@@ -21,7 +21,8 @@ use std::collections::HashMap;
 /// your own values with [`SuppliedEtas::from_table`]. Hand it to an adaptive run
 /// with [`AdaptiveInputs::with_etas`].
 ///
-/// A row gives every η of the model, in the model's order. There is no partial row:
+/// A row gives every η of the model, in the model's order, a `density` ETA on its effect
+/// scale (what the fit reports and the model reads). There is no partial row:
 /// under a block Ω the missing η would need a draw conditional on the given ones,
 /// and a marginal draw would be silently wrong.
 #[derive(Debug, Clone, PartialEq)]
@@ -230,7 +231,13 @@ impl<'a> AdaptiveInputs<'a> {
                     .to_string(),
             ));
         }
-        resolve_supplied_etas(model, population, etas, SuppliedEtasEntry::Adaptive(self.unmatched))
+        resolve_supplied_etas(
+            model,
+            population,
+            etas,
+            &self.params.theta,
+            SuppliedEtasEntry::Adaptive(self.unmatched),
+        )
     }
 }
 
@@ -251,7 +258,8 @@ pub(crate) enum SuppliedEtasEntry {
 /// `[mixture]` model, η names that are not the model's, and (unless the entry may draw)
 /// a population subject with no row. A supplied ID the population lacks is ignored.
 pub(crate) fn resolve_supplied_etas(
-    model: &CompiledModel, population: &Population, etas: &SuppliedEtas, entry: SuppliedEtasEntry,
+    model: &CompiledModel, population: &Population, etas: &SuppliedEtas, theta: &[f64],
+    entry: SuppliedEtasEntry,
 ) -> Result<Vec<Option<Vec<f64>>>, EngineError> {
     // A mixture fit estimates each subject's η under its own class, but the adaptive
     // run draws each subject's class from the mixing probabilities (#2163), so a
@@ -283,8 +291,26 @@ pub(crate) fn resolve_supplied_etas(
             model.eta_names.join(", ")
         )));
     }
-    let resolved: Vec<Option<Vec<f64>>> =
+    // A supplied row is on the effect scale, the scale the fit reports its EBEs on
+    // (#2669): a `density` ETA's effect is mapped back to the latent the model reads.
+    let maps = crate::stats::eta_density::model_effect_maps(model, theta);
+    let mut resolved: Vec<Option<Vec<f64>>> =
         population.subjects.iter().map(|s| etas.get(&s.id).map(<[f64]>::to_vec)).collect();
+    for (s, row) in population.subjects.iter().zip(resolved.iter_mut()) {
+        let Some(row) = row.as_mut() else { continue };
+        for (k, d) in maps.iter().enumerate() {
+            let Some(d) = d else { continue };
+            let z = crate::stats::eta_density::latent_of_effect(d, row[k]);
+            if !z.is_finite() {
+                return Err(refusal(format!(
+                    "subject '{}' has {} = {}, outside the support of its `density {}` \
+                     random effect; a supplied η is the effect itself, as the fit reports it",
+                    s.id, model.eta_names[k], row[k], d.kind
+                )));
+            }
+            row[k] = z;
+        }
+    }
     if matches!(entry, SuppliedEtasEntry::Adaptive(UnmatchedSubjects::Draw)) {
         return Ok(resolved);
     }
@@ -319,7 +345,9 @@ pub(crate) fn resolve_supplied_etas(
 impl SuppliedEtas {
     /// One row of η per subject: `rows[i]` is subject `ids[i]`'s η, in the order of
     /// `names`, which must be the model's η names in the model's order (checked when
-    /// the run starts).
+    /// the run starts). A `density` ETA's value is the random effect itself, on the scale
+    /// the fit reports (`CL = TVCL * ETA_CL` under `density gamma` reads it as given), and
+    /// is refused when it lies outside the kind's support (#2669).
     ///
     /// # Errors
     ///
@@ -357,8 +385,9 @@ impl SuppliedEtas {
         Ok(Self { ids, names, rows, index })
     }
 
-    /// A fit's empirical Bayes estimates (`fit.subjects[i].eta`), one row per fitted
-    /// subject, named by `fit.eta_names`.
+    /// A fit's empirical Bayes estimates, one row per fitted subject, named by
+    /// `fit.eta_names`, on the effect scale every supplied row is on: a `density` ETA's
+    /// row holds `m(ẑ)`, as `io::output::eta_effects` reports it (#2669).
     ///
     /// The η are the fit's point estimates: a supplied η̂ is treated as exact, which
     /// is optimistic for a subject with few observations (high shrinkage).
@@ -379,7 +408,7 @@ impl SuppliedEtas {
         Self::from_table(
             fit.subjects.iter().map(|s| s.id.clone()).collect(),
             fit.eta_names.clone(),
-            fit.subjects.iter().map(|s| s.eta.iter().copied().collect()).collect(),
+            crate::io::output::eta_effects(fit),
         )
     }
 
