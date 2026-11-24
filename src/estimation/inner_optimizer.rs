@@ -3853,14 +3853,15 @@ thread_local! {
     /// on the analytic route" distinguishable from "no step ran" (#2209).
     pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
-    /// The `(integrating_step, origin)` of every `ebe_gradient_fd` call on this thread, so a
-    /// test can read which step and which origin each inner solve handed it (#2868). `None`
-    /// until a test arms it ([`arm_ebe_fd_calls`]), so the worker threads of the cached fit
-    /// pools, which nothing arms, do not grow it across the lib test run.
+    /// The integrating step taken (`None`: the roundoff step) and the `origin` of every
+    /// `ebe_gradient_fd` call on this thread, so a test can read which step and which origin
+    /// each inner solve differenced with (#2868, #3145). `None` until a
+    /// test arms it ([`arm_ebe_fd_calls`]), so the worker threads of the cached fit pools,
+    /// which nothing arms, do not grow it across the lib test run.
     pub(crate) static EBE_FD_CALLS: RefCell<Option<Vec<EbeFdCall>>> = const { RefCell::new(None) };
 }
 
-/// One `ebe_gradient_fd` call: its `integrating_step` and its `origin`.
+/// One `ebe_gradient_fd` call: the integrating step it took, if it did, and its `origin`.
 #[cfg(test)]
 pub(crate) type EbeFdCall = (Option<f64>, Option<Vec<f64>>);
 
@@ -8070,20 +8071,35 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
 /// and a step scaled by `|ψ|` would grow with the typical value `μ` carries. `None` is the
 /// origin. The roundoff step ignores it, so an objective that never integrates differences
 /// exactly as before #2868.
+///
+/// Where an evaluation of the integrating difference leaves a segment unfinished, the gradient
+/// is the roundoff one (#3145). The integrating step is sized for an integrator error of order
+/// `ode_reltol`, which a solve that ran out of steps does not have. Such points are reached on
+/// outer trials the EBE guard goes on to reject. On an 8-state `auto` model whose inner gradient
+/// is otherwise analytic, the recorders declined there, and the integrating step let more of those
+/// searches converge: of the solves that differenced, the fit needed 68 to reach the 17
+/// unconverged the guard stops at, against 36 here and at the roundoff step, at up to a minute
+/// each (3407 s against 2165 s and 2127 s for the fit, with identical results). The check reads
+/// the solver counters of the evaluations the difference makes anyway; only a declined one costs a
+/// second difference. On the TMDD fixture above it moves only `rk45`: worst point 0.103 OFV from
+/// the analytic route, 0.129 without it (Linux), for 7% more wall.
 fn ebe_gradient_fd(
     obj: &dyn Fn(&[f64]) -> f64, x: &[f64], origin: Option<&[f64]>, n: usize,
     integrating_step: Option<f64>,
 ) -> Vec<f64> {
+    let integrated = integrating_step.and_then(|step| {
+        let (g, stats) =
+            crate::ode::solver::with_solver_stats(|| gradient_fd_step(obj, x, origin, n, step));
+        (stats.kept_unfinished_segments() == 0).then_some(g)
+    });
     #[cfg(test)]
     EBE_FD_CALLS.with(|c| {
         if let Some(calls) = c.borrow_mut().as_mut() {
-            calls.push((integrating_step, origin.map(<[f64]>::to_vec)));
+            let taken = integrating_step.filter(|_| integrated.is_some());
+            calls.push((taken, origin.map(<[f64]>::to_vec)));
         }
     });
-    match integrating_step {
-        Some(step) => gradient_fd_step(obj, x, origin, n, step),
-        None => gradient_fd(obj, x, n),
-    }
+    integrated.unwrap_or_else(|| gradient_fd(obj, x, n))
 }
 
 /// Central differences of `obj` at `x`, coordinate `i` stepped by
