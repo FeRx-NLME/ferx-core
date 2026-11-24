@@ -14,7 +14,7 @@
  "measured": "main@c75687b4",
  "model_sha256": "301923c139dab077979cdae4a98a23fa7a7d06652a99f02fba8e46905c7c3c3a",
  "platform": "Linux/x86_64",
- "reason": "#3081: first github-hosted baseline, replacing the provisional OrbStack/Rosetta one (205 MB eval / 962 MB fit; emulation inflated the fit 2.5x). Accepted from nightly 45331581482 (main@c75687b4, 2026-11-24). Peak RSS over the four nightlies 2026-11-21..24 (4b3eb5ffc, 953f0ed7e, 2e8e32991, c75687b4f): eval 160-167 MB, fit 375-391 MB, a 4% spread against the 25% band; this night is the top of both. A native Linux arm64 release run reads 154 MB / 361 MB at the same OFVs. Wall time is runner-bound and moves 2x night to night (eval 294-629 s, fit 3147-5049 s), not a memory signal.",
+ "reason": "#3081: first github-hosted baseline, replacing the provisional OrbStack/Rosetta one (205 MB eval / 962 MB fit; emulation inflated the fit 2.5x). Accepted from nightly 45331581482 (main@c75687b4, 2026-11-24). Peak RSS over the four nightlies 2026-11-21..24 (4b3eb5ffc, 953f0ed7e, 2e8e32991, c75687b4f): eval 160-167 MB, fit 375-391 MB, a 4% spread against the 25% band; this night is the top of the fit range and mid-range on the eval. A native Linux arm64 release run reads 154 MB / 361 MB at the same OFVs. Wall time is runner-bound and moves 2x night to night (eval 294-629 s, fit 3147-5049 s), not a memory signal.",
  "runner": "github-hosted",
  "schema": 1,
  "threads": 4

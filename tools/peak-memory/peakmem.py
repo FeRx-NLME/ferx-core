@@ -43,6 +43,7 @@ import re
 import subprocess
 import sys
 import shutil
+import signal
 import tempfile
 import threading
 import time
@@ -260,8 +261,11 @@ def run_case(ferx: str, case: str, timeout: int, rec: dict, logdir: Path | None 
             if logdir is not None else None
         t0 = time.monotonic()
         try:
+            # Its own process group: ferx is `time`'s child, so killing `time` alone
+            # leaves ferx running and holding the pipes the pumps read until it exits.
             proc = subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, errors="replace")
+                                    stderr=subprocess.PIPE, text=True, errors="replace",
+                                    start_new_session=True)
             pumps = [threading.Thread(target=_pump, args=(proc.stderr, sink, err_lines, t0)),
                      threading.Thread(target=_pump, args=(proc.stdout, None, out_lines, t0))]
             for p in pumps:
@@ -269,7 +273,7 @@ def run_case(ferx: str, case: str, timeout: int, rec: dict, logdir: Path | None 
             try:
                 returncode = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
                 for p in pumps:
                     p.join()
@@ -308,8 +312,9 @@ def run_case(ferx: str, case: str, timeout: int, rec: dict, logdir: Path | None 
             escalated=any(ESCALATION_CODE in w for w in warnings),
             plan_fallback=[w[:200] for w in warnings if PLAN_FALLBACK_CODE in w],
             # Where the wall time went, as the fit itself measured it: the estimation
-            # chain per method, and the covariance step. The rest of `wall_s` is parse,
-            # setup and post-fit output.
+            # chain per method, and the covariance step. `fit_wall_s` spans nearly the
+            # whole process (4243.24 of 4243.3 s on dispatch 45363539177), so `wall_s`
+            # minus it is not a phase worth reporting.
             fit_wall_s=fit.get("wall_time_secs"),
             method_wall_s=fit.get("method_wall_times_secs"),
             covariance_wall_s=fit.get("covariance_wall_time_secs"),
@@ -411,18 +416,15 @@ def timing_lines(head: dict) -> list[str]:
         methods = h.get("method_wall_s")
         est = sum(methods) if isinstance(methods, list) and methods else None
         cov = h.get("covariance_wall_s")
-        fit = h.get("fit_wall_s")
-        rest = wall - fit if isinstance(wall, (int, float)) and isinstance(fit, (int, float)) \
-            else None
         share = f"{wall / timeout:.0%}" if isinstance(wall, (int, float)) \
             and isinstance(timeout, (int, float)) and timeout > 0 else "—"
         flag = " ⚠" if share != "—" and wall > TIMEOUT_WARN * timeout else ""
-        rows.append(f"| {case} | {secs(wall)} | {secs(est)} | {secs(cov)} | {secs(rest)} "
+        rows.append(f"| {case} | {secs(wall)} | {secs(est)} | {secs(cov)} "
                     f"| {share} of {secs(timeout)}{flag} |")
     if not rows:
         return []
-    return ["", "| case | wall | estimation | covariance | outside fit | of timeout |",
-            "|---|--:|--:|--:|--:|--:|", *rows, "",
+    return ["", "| case | wall | estimation | covariance | of timeout |",
+            "|---|--:|--:|--:|--:|", *rows, "",
             f"⚠ = above {TIMEOUT_WARN:.0%} of the case's timeout. "
             "Each case's timestamped stderr and fit JSON are in the artifact."]
 

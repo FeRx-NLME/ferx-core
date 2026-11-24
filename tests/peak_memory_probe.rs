@@ -591,6 +591,56 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
     assert!(again.status.success(), "{}", text(&again));
 }
 
+/// A case past its timeout is killed then, not when ferx finishes, and is still
+/// recorded with its log. ferx runs under `/usr/bin/time`, so it is a grandchild:
+/// killing only `time` leaves ferx holding the pipes, and the stderr reader blocks
+/// until ferx exits on its own (PR #3147 review r1 #1). The fake's work is a `sleep`
+/// child of the shell, a great-grandchild, so only a kill of the whole process group
+/// ends it.
+#[cfg(unix)]
+#[test]
+fn a_case_past_its_timeout_is_killed_and_still_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+    if !Path::new("/usr/bin/time").exists() {
+        eprintln!("skipping: no /usr/bin/time on this machine");
+        return;
+    }
+    let dir = scratch("timeout");
+    let fake = dir.join("ferx");
+    std::fs::write(&fake, "#!/bin/sh\necho 'fake start' >&2\nsleep 30\necho 'fake end' >&2\n")
+        .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out_dir = dir.join("pm");
+    let res = out_dir.join("results.json");
+    let t0 = std::time::Instant::now();
+    let out = peakmem(&[
+        "run",
+        "--ferx",
+        fake.to_str().unwrap(),
+        "--out",
+        res.to_str().unwrap(),
+        "--cases",
+        "eval",
+        "--timeout",
+        "2",
+    ]);
+    let took = t0.elapsed().as_secs_f64();
+    assert!(out.status.success(), "{}", text(&out));
+    // 2 s timeout against a 30 s sleep: anything near 30 s means ferx was waited for.
+    assert!(took < 15.0, "run returned after {took:.1} s: the timeout did not kill ferx");
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&res).unwrap()).unwrap();
+    let rec = &r["cases"]["eval"];
+    assert_eq!(rec["status"], "timeout", "{r}");
+    assert_eq!(rec["timeout_s"].as_u64(), Some(2), "{r}");
+    let wall = rec["wall_s"].as_f64().unwrap_or_else(|| panic!("{r}"));
+    assert!((2.0..15.0).contains(&wall), "wall_s {wall}: not the time of the kill");
+    let log = std::fs::read_to_string(out_dir.join("eval.stderr.log"))
+        .unwrap_or_else(|e| panic!("no eval.stderr.log after a timeout: {e}"));
+    assert!(log.contains("] fake start"), "log lost what ferx wrote before the kill:\n{log}");
+    assert!(!log.contains("fake end"), "ferx ran to the end:\n{log}");
+}
+
 /// `accept` refuses what would make a meaningless baseline: no reason, a failed case,
 /// a run where `auto` did not escalate, or a fit whose covariance step did not run.
 #[test]
