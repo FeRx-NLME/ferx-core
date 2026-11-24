@@ -646,3 +646,30 @@ fn box_cox_overflows_to_infinity_not_nan() {
     let x: f64 = 700.0;
     assert_eq!(shape_g(ShapeKind::BoxCox, x, 1.0), x.exp_m1());
 }
+
+/// A shaped ETA summed with a κ inside `exp` (the IOV path the docs give) is no κ
+/// mu-reference (#1721 review): `exp(boxcox(ETA_CL, λ) + KAPPA_CL)`'s bare operand is the
+/// κ, and registering it made `method = bayes` refuse the model. The unshaped
+/// `exp(ETA_CL + KAPPA_CL)` keeps its BSV mu-reference, and `exp(ETA_CL + 0.5 * KAPPA_CL)`
+/// too. Dies under: the one-sided arm returning the κ.
+#[test]
+fn a_shaped_eta_beside_a_kappa_is_no_kappa_mu_reference() {
+    let model = |cl: &str, shape: &str| {
+        parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.01\n  sigma EPS ~ 0.01\n\n\
+             [individual_parameters]\n  CL = {cl}\n  V = TVV\n\n{shape}\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+             [error_model]\n  DV ~ proportional(EPS)\n"
+        ))
+        .unwrap()
+    };
+    let shaped = model("TVCL * exp(ETA_CL + KAPPA_CL)", "[eta_shape]\n  ETA_CL ~ boxcox()\n\n");
+    assert!(shaped.kappa_mu_refs.is_empty(), "{:?}", shaped.kappa_mu_refs);
+    assert!(!shaped.mu_refs.contains_key("ETA_CL"));
+    for cl in ["TVCL * exp(ETA_CL + KAPPA_CL)", "TVCL * exp(ETA_CL + 0.5 * KAPPA_CL)"] {
+        let m = model(cl, "");
+        assert!(m.mu_refs.contains_key("ETA_CL"), "{cl}: {:?}", m.mu_refs);
+        assert!(m.kappa_mu_refs.is_empty(), "{cl}: {:?}", m.kappa_mu_refs);
+    }
+}
