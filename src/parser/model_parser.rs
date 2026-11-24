@@ -82,11 +82,31 @@ fn find_exp_eta_in_mul<'a, V: RhsView<'a>>(v: V) -> Option<usize> {
             if let Expression::BinOp(l, BinOp::Add, r) = arg.expr() {
                 let li = if let Expression::Eta(j) = arg.child(l).expr() { Some(*j) } else { None };
                 let ri = if let Expression::Eta(j) = arg.child(r).expr() { Some(*j) } else { None };
+                // The lowest η index the other operand reads, if any (BSV ηs are numbered
+                // before κs).
+                let lowest = |e: &Expression| {
+                    let mut m: Option<usize> = None;
+                    visit_expr_nodes(e, &mut |n| {
+                        if let Expression::Eta(j) = n {
+                            m = Some(m.map_or(*j, |m| m.min(*j)));
+                        }
+                    });
+                    m
+                };
                 return match (li, ri) {
                     (Some(a), Some(b)) => Some(a.min(b)),
-                    // One operand is not a bare Eta (e.g. exp(ETA + constant));
-                    // return whichever index was found.
-                    (a, b) => a.or(b),
+                    // One operand is not a bare Eta (e.g. exp(ETA + constant)): the bare one
+                    // is the reference unless the other reads a lower-indexed η, e.g.
+                    // `exp(boxcox(ETA_CL, λ) + KAPPA_CL)`, whose bare κ is no BSV
+                    // mu-reference (#1721 review: it was registered as a κ mu-ref, which
+                    // `method = bayes` refuses).
+                    (Some(a), None) => {
+                        lowest(arg.child(r).expr()).is_none_or(|m| m > a).then_some(a)
+                    }
+                    (None, Some(b)) => {
+                        lowest(arg.child(l).expr()).is_none_or(|m| m > b).then_some(b)
+                    }
+                    (None, None) => None,
                 };
             }
             None

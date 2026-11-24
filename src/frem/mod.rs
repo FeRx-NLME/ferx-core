@@ -670,7 +670,11 @@ pub fn generate_frem_model(
     // `CP = A*1000/V`) rescales every prediction, which the estimator then
     // compensates by collapsing a PK typical value (TVCL drove to ~1e-2 instead
     // of ~7 on the workshop FREM model). Copy each block as-is when present.
-    for block_name in ["scaling", "odes"] {
+    // [eta_shape] (#1716) shapes the base model's ETAs, which FREM keeps by name; its
+    // new covariate ETAs are unshaped. Without it the FREM run would fit the unshaped
+    // model, and an auto-declared shape θ (`boxcox()` → `LAMBDA_ETA_CL`) exists only
+    // through this block, so it is carried verbatim too.
+    for block_name in ["scaling", "odes", "eta_shape"] {
         if let Some(block_lines) = blocks.get(block_name) {
             if block_lines.iter().any(|l| !l.trim().is_empty() && !l.trim().starts_with('#')) {
                 model.push_str(&format!("[{}]\n", block_name));
@@ -1730,6 +1734,70 @@ mod tests {
         // The generated model must still parse (block placement is valid).
         crate::parser::model_parser::parse_model_string(&model_text)
             .expect("generated FREM model parses");
+    }
+
+    /// #1721 review: the base model's `[eta_shape]` is carried into the FREM model, so the
+    /// FREM run fits the shaped model, and an auto-declared shape θ (`boxcox()` →
+    /// `LAMBDA_ETA_CL`) is declared there too. Dies under: the block dropped (the generated
+    /// model reads `exp(ETA_CL)` unshaped and declares no λ).
+    #[test]
+    fn test_generate_frem_model_keeps_eta_shape() {
+        let base_text = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[eta_shape]
+  ETA_CL ~ boxcox()
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let pop = make_test_population();
+        let model = make_test_model();
+        let covs = vec!["WT".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+        let model_text =
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), None).unwrap();
+        assert!(
+            model_text.contains("[eta_shape]") && model_text.contains("ETA_CL ~ boxcox()"),
+            "{model_text}"
+        );
+        let frem = crate::parser::model_parser::parse_model_string(&model_text)
+            .expect("generated FREM model parses");
+        assert!(frem.theta_names.iter().any(|n| n == "LAMBDA_ETA_CL"), "{:?}", frem.theta_names);
+        // The shape is read: the same FREM model without the block gives another CL at
+        // ETA_CL = 0.5 (Box-Cox at λ = 0.01 maps 0.5 to 0.50125).
+        let unshaped_text = model_text.replace("[eta_shape]", "").replace("ETA_CL ~ boxcox()", "");
+        let unshaped = crate::parser::model_parser::parse_model_string(&unshaped_text)
+            .expect("the unshaped twin parses");
+        let at = |m: &CompiledModel| {
+            let mut eta = vec![0.0; m.n_eta];
+            eta[0] = 0.5;
+            let th: Vec<f64> = m
+                .theta_names
+                .iter()
+                .map(|n| {
+                    let k = frem.theta_names.iter().position(|x| x == n).unwrap();
+                    frem.default_params.theta[k]
+                })
+                .collect();
+            format!("{:?}", (m.pk_param_fn)(&th, &eta, &std::collections::HashMap::new(), 0.0))
+        };
+        assert_ne!(at(&frem), at(&unshaped), "the FREM model reads ETA_CL unshaped");
     }
 
     /// FREM-converts `base_text` (covariates WT, AGE) and parses the result.
