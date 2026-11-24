@@ -6892,8 +6892,9 @@ pub(crate) mod outer_fd_fallback {
     }
 
     /// #3097: a difference that overflows between two usable probes comes back non-finite, on
-    /// the ungated and the gated branch, so the AGQ score can decline it as it did before
-    /// #2992; the reconverged gradients' wrapper zeroes it, as the helper used to. A floor of
+    /// the ungated, the gated and the cancel-guarded branch, so the AGQ score (on the last,
+    /// #3136) can decline it as it did before #2992; the reconverged gradients zero it
+    /// through `zero_non_finite`, as the helper used to. A floor of
     /// 1e-300 steps 1e-304, across which ±1e19 overflows.
     #[test]
     fn a_non_finite_difference_is_returned_not_zeroed() {
@@ -6904,7 +6905,8 @@ pub(crate) mod outer_fd_fallback {
         let g = central_diff_packed_gated(&[0.0], &[false], &[1e-300], &bounds, f, Some(&|_| None));
         assert!(g[0].is_infinite(), "{g:?}");
         let g = central_diff_until_cancel(&[0.0], &[false], &[1e-300], &bounds, &None, f, |_| None);
-        assert_eq!(g, vec![0.0]);
+        assert!(g[0].is_infinite(), "{g:?}");
+        assert_eq!(zero_non_finite(g), vec![0.0]);
     }
 
     /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
