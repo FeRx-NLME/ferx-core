@@ -137,21 +137,61 @@ taken on Linux.
 
 ### The committed baseline
 
-The first baseline was not measured on a CI runner. The branch that added the
-probe could not dispatch the workflow before it was pushed, so the baseline
-comes from the release build on Linux x86_64 under emulation (OrbStack with
-Rosetta on Apple silicon, image `rustlang/rust:nightly`, glibc 2.41):
+The baseline is the nightly of 2026-11-24 (run 45331581482, `main@c75687b4`),
+runner `github-hosted`. The four nightlies before it agree to within 4 %:
 
-| case | peak RSS | wall |
-|---|--:|--:|
-| `eval` | 205 MB (a repeat run: 189 MB, −8 %) | 94 s |
-| `fit` | 962 MB | 24 min |
+| | eval RSS | fit RSS | eval wall | fit wall |
+|---|--:|--:|--:|--:|
+| provisional (OrbStack Rosetta, `local`) | 205 MB | 962 MB | 94 s | 1420 s |
+| nightlies 2026-11-21 to 24 | 160–167 MB | 375–391 MB | 294–629 s | 3147–5049 s |
+| **baseline** (45331581482) | **162 MB** | **391 MB** | 621 s | 4807 s |
+| native Linux arm64, release | 154 MB | 361 MB | 72 s | 924 s |
 
-It records `runner: local`, so it is provisional: the first nightly shows its
-verdicts against these numbers and then fails, by design, until that night's
-`peak-memory-results` artifact is accepted. A `▲` there is still worth reading
-before accepting, since emulation can move peak RSS by itself but a 10× jump is
-not emulation.
+The first baseline was taken under emulation, before the workflow could be
+dispatched. Emulation inflated the `fit` peak 2.5×, so the nightlies failed as
+provisional until one was accepted (#3081). Every row reaches the same OFVs, to
+the last digit.
+
+## Wall time and timeouts
+
+The probe measures memory, but it has to finish to measure anything. A
+github-hosted runner is slow and noisy for this workload. It is 5–9× slower
+than a native arm64 run and moves 2× from one night to the next, while doing
+the same computation, down to the same OFV bits. The cause is the runner. It
+is not subnormal arithmetic: the evaluation sets no underflow flag on any
+worker thread.
+
+On the native run, the `fit` case's time splits into estimation, 628 s, and
+covariance, 288 s. Estimation is 82 s of cold inner solves, 24 warm NLopt
+evaluations at about 20 s each, and 64 s for the final inner loop. In the
+`eval` case, the inner EBE searches take about 80 % of the time: 209 analytic
+BFGS gradient calls per subject from a cold start, at about 10 ms each.
+
+So each case has its own timeout, `CASE_TIMEOUT_S` in `peakmem.py`:
+
+| case | timeout | slowest night | margin |
+|---|--:|--:|--:|
+| `eval` | 1800 s | 629 s | 2.9× |
+| `fit` | 8100 s | 5049 s | 1.6× |
+
+The job's `timeout-minutes` covers both plus the build, so a case that times
+out is still recorded and uploaded rather than cut off by GitHub. The guard
+test pins that inequality. The report adds a timing table: wall time,
+estimation and covariance as the fit measured them, and the share of the
+timeout. A case past 80 % of its timeout gets a `⚠`. That is a warning, not
+a failure.
+
+For a slow night, the artifact holds what is needed without a rerun:
+
+- `<case>.stderr.log`: the case's stderr, each line stamped with seconds since
+  the start, kept on a timeout too;
+- `<case>-fit.json`: the fit JSON, with every warning;
+- `results.json`: the host's `cpu_model` and `cpu_count`, since hosted runners
+  land on more than one CPU model.
+
+If the margin erodes, the cheaper fix is fewer subjects. That changes the data,
+so it means re-measuring the baseline and showing again that the probe catches
+#2939.
 
 ## Running it locally
 

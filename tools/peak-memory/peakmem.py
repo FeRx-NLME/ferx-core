@@ -60,8 +60,16 @@ SCHEMA = 1
 # sit clear of run-to-run noise, which docs/development/peak-memory.qmd records.
 TOLERANCE = 0.25
 
-# `report` flags a case whose wall time passed this share of `run --timeout`: still a
-# pass, but the margin a slower runner night needs is gone.
+# Per-case timeouts, in seconds. Sized from the github-hosted nightlies, whose wall time
+# moved 2x from one night to the next on the same code (fit 3147-5049 s, eval 294-629 s,
+# 2026-11-21..24) while a native Linux arm64 run takes 924 s / 72 s: the runner, not
+# ferx. The bound is 1.6x the slowest fit night and 2.9x the slowest eval night. The
+# workflow's `timeout-minutes` must cover both plus the build, or a slow night is killed
+# before it uploads the logs that explain it (tests/peak_memory_probe.rs pins that).
+CASE_TIMEOUT_S = {"eval": 1800, "fit": 8100}
+
+# `report` flags a case whose wall time passed this share of its timeout: still a pass,
+# but the margin a slower runner night needs is gone.
 TIMEOUT_WARN = 0.8
 
 # Fixed, not the runner's core count: per-thread pools are part of what is measured
@@ -128,6 +136,19 @@ def sha256(path: Path) -> str | None:
 def platform() -> str:
     u = os.uname()
     return f"{u.sysname}/{u.machine}"
+
+
+def cpu_model() -> str | None:
+    """The host CPU's model name (Linux `/proc/cpuinfo`), or None. Not judged: hosted
+    runners land on more than one CPU model, and the nightly's wall time moved 2x from
+    one night to the next, so this is what lets a slow night be matched to its host."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
 
 
 def case_model(text: str, case: str) -> str:
@@ -309,7 +330,8 @@ def cmd_run(a) -> int:
         "platform": platform(),
         "runner": runner(),
         "threads": FERX_THREADS,
-        "timeout_s": a.timeout,
+        "cpu_model": cpu_model(),
+        "cpu_count": os.cpu_count(),
         "model_sha256": sha256(MODEL),
         "data_sha256": sha256(DATA),
         "cases": {},
@@ -318,8 +340,9 @@ def cmd_run(a) -> int:
     logdir = Path(a.out).resolve().parent
     logdir.mkdir(parents=True, exist_ok=True)
     for c in cases:
-        rec: dict = {}
-        run_case(ferx, c, a.timeout, rec, logdir)
+        timeout = a.timeout or CASE_TIMEOUT_S[c]
+        rec: dict = {"timeout_s": timeout}
+        run_case(ferx, c, timeout, rec, logdir)
         out["cases"][c] = rec
         peak = rec.get("peak_rss_bytes")
         print(f"[peakmem] {c}: {rec['status']} in {rec.get('wall_s', 0)} s"
@@ -381,10 +404,10 @@ def timing_lines(head: dict) -> list[str]:
     """Where each case's wall time went, and how close it came to the timeout. Not a
     verdict: a slow night passes, but one near the limit is a timeout waiting to happen,
     and the per-case `*.stderr.log` in the artifact says which phase ate it."""
-    timeout = head.get("timeout_s")
     rows = []
     for case, h in sorted(head.get("cases", {}).items()):
         wall = h.get("wall_s")
+        timeout = h.get("timeout_s")
         methods = h.get("method_wall_s")
         est = sum(methods) if isinstance(methods, list) and methods else None
         cov = h.get("covariance_wall_s")
@@ -395,12 +418,12 @@ def timing_lines(head: dict) -> list[str]:
             and isinstance(timeout, (int, float)) and timeout > 0 else "—"
         flag = " ⚠" if share != "—" and wall > TIMEOUT_WARN * timeout else ""
         rows.append(f"| {case} | {secs(wall)} | {secs(est)} | {secs(cov)} | {secs(rest)} "
-                    f"| {share}{flag} |")
+                    f"| {share} of {secs(timeout)}{flag} |")
     if not rows:
         return []
     return ["", "| case | wall | estimation | covariance | outside fit | of timeout |",
             "|---|--:|--:|--:|--:|--:|", *rows, "",
-            f"⚠ = above {TIMEOUT_WARN:.0%} of the {secs(timeout)} per-case timeout. "
+            f"⚠ = above {TIMEOUT_WARN:.0%} of the case's timeout. "
             "Each case's timestamped stderr and fit JSON are in the artifact."]
 
 
@@ -440,8 +463,10 @@ def cmd_report(a) -> int:
                      "is a reference measurement, so the job fails until it is accepted: "
                      "download this run's `peak-memory-results` and `peakmem.py accept` it.")
         provisional = True
+    host = f", host `{head['cpu_model']}` × {head.get('cpu_count')}" \
+        if head.get("cpu_model") else ""
     lines += [f"Run `{head.get('label')}` on `{head.get('platform')}` "
-              f"(runner `{head.get('runner', 'local')}`), "
+              f"(runner `{head.get('runner', 'local')}`{host}), "
               f"{head.get('threads')} threads; tolerance ±{TOLERANCE:.0%}.", ""]
     lines += [f"> {n}" for n in notes] + ([""] if notes else [])
     lines += ["| case | baseline | head | Δ | wall | | note |",
@@ -520,7 +545,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", required=True)
     r.add_argument("--label", default="local")
     r.add_argument("--cases", default="", help=f"comma-separated subset of {list(CASES)}")
-    r.add_argument("--timeout", type=int, default=5400, help="seconds per case")
+    r.add_argument("--timeout", type=int, default=0,
+                   help=f"seconds for every case (default: per case, {CASE_TIMEOUT_S})")
     r.set_defaults(func=cmd_run)
 
     rp = sub.add_parser("report", help="compare results.json against the baseline")

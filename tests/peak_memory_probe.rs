@@ -128,6 +128,12 @@ fn row<'a>(out: &'a str, case: &str) -> &'a str {
     out.lines().find(|l| l.starts_with(&prefix)).unwrap_or_else(|| panic!("no {case} row:\n{out}"))
 }
 
+/// peakmem.py's `CASE_TIMEOUT_S = {"eval": 1800, "fit": 8100}`, parsed.
+fn case_timeouts() -> std::collections::BTreeMap<String, u64> {
+    let v: serde_json::Value = serde_json::from_str(&constant("CASE_TIMEOUT_S")).unwrap();
+    v.as_object().unwrap().iter().map(|(k, s)| (k.clone(), s.as_u64().unwrap())).collect()
+}
+
 fn tolerance() -> f64 {
     constant("TOLERANCE").parse().unwrap()
 }
@@ -404,6 +410,45 @@ fn a_provisional_baseline_fails_the_first_reference_run() {
     assert!(!text(&reference).contains("provisional"), "{}", text(&reference));
 }
 
+/// The timing table flags a case past `TIMEOUT_WARN` of the per-case timeout, and only
+/// that case: the twins sit either side of the gate (the fit at 0.81, the eval at 0.79
+/// of it). A flag is a warning, never a verdict, so the report still passes.
+#[test]
+fn a_case_near_its_timeout_is_flagged_and_still_passes() {
+    let warn: f64 = constant("TIMEOUT_WARN").parse().unwrap();
+    // Different timeouts per case, so a share computed against the wrong case's (or one
+    // shared) timeout lands on the wrong side of the gate.
+    let at = |c: String, share: f64, timeout: f64| {
+        let out = c.replace(
+            r#""wall_s": 70.0"#,
+            &format!(r#""wall_s": {}, "timeout_s": {timeout}"#, share * timeout),
+        );
+        assert_ne!(out, c, "the case record no longer carries `\"wall_s\": 70.0`");
+        out
+    };
+    let (eval, fit) = (at(eval_at(1.0), warn - 0.01, 1000.0), at(fit_ok(), warn + 0.01, 8000.0));
+    let dir = scratch("timeout-warn");
+    let head = results("Linux/x86_64", &[("eval", eval), ("fit", fit)]);
+    let res = write(&dir, "results.json", &head);
+    let base = write(&dir, "baseline.json", &baseline("Linux/x86_64", 100 * MIB, 400 * MIB));
+    let out = peakmem(&["report", "--results", &res, "--baseline", &base]);
+    let t = text(&out);
+    assert!(out.status.success(), "a flag is not a failure:\n{t}");
+    let timing = |case: &str| {
+        t.lines()
+            .filter(|l| l.starts_with(&format!("| {case} |")))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no {case} timing row:\n{t}"))
+            .to_string()
+    };
+    assert!(timing("fit").contains("81% of 8000 s ⚠"), "{}", timing("fit"));
+    assert!(
+        timing("eval").contains("79% of 1000 s") && !timing("eval").contains('⚠'),
+        "{}",
+        timing("eval")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn run_measures_each_case_and_accept_writes_the_baseline() {
@@ -417,6 +462,8 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
         format!(
             r#"{{"ofv": -1212.9, "n_iterations": 0, "covariance_status": "{cov}",
             "gradient_method_outer": "analytic", "n_threads_used": 4,
+            "wall_time_secs": 61.5, "method_wall_times_secs": [55.25],
+            "covariance_wall_time_secs": 0.0,
             "warnings": ["W_ODE_SOLVER_ESCALATION_NOTE: ode_method = auto escalated 3000"]}}"#
         )
     };
@@ -443,7 +490,10 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let res = dir.join("results.json");
+    // In its own directory, as the workflow's `peak-memory/` is: the case logs land
+    // next to results.json, and must not collide with the fake's canned fit JSONs.
+    let out_dir = dir.join("pm");
+    let res = out_dir.join("results.json");
     let run_args = ["run", "--ferx", fake.to_str().unwrap(), "--out", res.to_str().unwrap()];
     // Outside GitHub Actions the run is `local`, whatever the platform says.
     let out = peakmem(&[&run_args[..], &["--cases", "eval"]].concat());
@@ -451,6 +501,31 @@ fn run_measures_each_case_and_accept_writes_the_baseline() {
     let r: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&res).unwrap()).unwrap();
     assert_eq!(r["runner"], "local", "{r}");
+
+    // The artifact attributes a slow night without a rerun: the case's stderr, each line
+    // timestamped (the time report is the last thing ferx's process writes there), and
+    // the fit JSON with its warnings, next to results.json.
+    let log = std::fs::read_to_string(out_dir.join("eval.stderr.log"))
+        .unwrap_or_else(|e| panic!("no eval.stderr.log: {e}"));
+    let rss_line = log
+        .lines()
+        .find(|l| l.contains("aximum resident set size"))
+        .unwrap_or_else(|| panic!("time report not in the log:\n{log}"));
+    assert!(rss_line.starts_with('[') && rss_line.contains("s] "), "not timestamped: {rss_line}");
+    let kept: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("eval-fit.json")).expect("fit JSON kept"),
+    )
+    .unwrap();
+    assert_eq!(kept["covariance_status"], NOT_REQUESTED, "{kept}");
+    assert!(!out_dir.join("fit.stderr.log").exists(), "a case that was not run left a log");
+    // Each case carries the timeout it ran under: its own, from CASE_TIMEOUT_S.
+    assert_eq!(r["cases"]["eval"]["timeout_s"].as_u64(), Some(case_timeouts()["eval"]), "{r}");
+    // The fit's own phase clock, lifted out of the fit JSON.
+    assert_eq!(r["cases"]["eval"]["fit_wall_s"], 61.5, "{r}");
+    assert_eq!(r["cases"]["eval"]["method_wall_s"], serde_json::json!([55.25]), "{r}");
+    assert_eq!(r["cases"]["eval"]["covariance_wall_s"], 0.0, "{r}");
+    let w = r["cases"]["eval"]["warnings"].as_array().unwrap_or_else(|| panic!("{r}"));
+    assert!(w.iter().any(|x| x.as_str().unwrap().contains("W_ODE_SOLVER_ESCALATION_NOTE")));
 
     // `run` lifts a plan-fallback warning out of the fit JSON into `plan_fallback`.
     let clean_eval = std::fs::read_to_string(&eval_fit).unwrap();
@@ -631,4 +706,21 @@ fn workflow_is_a_linux_nightly_on_the_shipped_binary() {
     assert!(wf.contains("--ferx target/release/ferx"));
     assert!(wf.contains("peakmem.py report") && wf.contains("--summary \"$GITHUB_STEP_SUMMARY\""));
     assert!(wf.contains("name: peak-memory-results"));
+
+    // The job outlives every case's own timeout plus the build: otherwise the slow night
+    // that most needs its logs is killed by GitHub before peakmem.py records a `timeout`
+    // and the artifact is uploaded. 20 min covers a cold fat-LTO build (5.5 min warm).
+    let job_min: u64 = wf
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("timeout-minutes:"))
+        .expect("the job sets timeout-minutes")
+        .trim()
+        .parse()
+        .unwrap();
+    let cases: u64 = case_timeouts().values().sum();
+    assert_eq!(case_timeouts().len(), 2, "a timeout for each of eval and fit");
+    assert!(
+        job_min * 60 >= cases + 20 * 60,
+        "timeout-minutes {job_min} does not cover the case timeouts ({cases} s) + 20 min build"
+    );
 }
