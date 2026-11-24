@@ -80,6 +80,52 @@ pub(crate) const GN_DEGENERATE_COLLAPSE_WARNING: &str =
 pub(crate) const GN_BUDGET_WARNING: &str =
     "Gauss-Newton: max iterations reached without convergence";
 
+/// The warning `method = gn` carries when the population has fewer subjects than free
+/// parameters (#2438): the BHHH information `Σᵢ gᵢgᵢᵀ` is one rank-one term per subject, so
+/// it is singular by construction, and the trust-region steps it models can stall along the
+/// directions it does not see (`pktte_joint`: 6 subjects, 7 free parameters, every step
+/// after iteration 5 rejected). `gn_hybrid` finishes with an L-BFGS polish that needs no BHHH.
+/// Owed only to plain `gn` (not `gn_hybrid`) that ends unconverged with fewer subjects than
+/// free parameters, else `None`; `fit` drops it from a GN stage a later stage re-optimises
+/// ([`is_gn_rank_deficient_warning`], `postfit::keep_gn_zero_eta_warning`).
+///
+/// Two more states owe nothing, because the message would name the wrong cause:
+/// - `stepped = false`: the loop took no step — `outer_maxiter = 0` is an evaluation (#2799),
+///   or the user cancelled — so nothing stalled.
+/// - `penalised = true`: parameter priors or the covariate-NN penalty add their curvature to
+///   the BHHH system (`assemble` in `run_foce_gn`), so the matrix GN steps on is no longer
+///   bounded by one rank per subject.
+pub(crate) fn gn_rank_deficient_warning(
+    converged: bool, stepped: bool, penalised: bool, n_subjects: usize, n_free: usize,
+    method: EstimationMethod,
+) -> Option<String> {
+    if converged
+        || !stepped
+        || penalised
+        || n_subjects >= n_free
+        || method == EstimationMethod::FoceGnHybrid
+    {
+        return None;
+    }
+    let subjects = if n_subjects == 1 { "subject" } else { "subjects" };
+    Some(format!(
+        "{GN_RANK_DEFICIENT_HEAD}{n_subjects} {subjects} for {n_free}{GN_RANK_DEFICIENT_MID}\
+         {n_subjects} and is singular; its steps can stall short of the optimum. Use method = \
+         gn_hybrid, or a different optimizer."
+    ))
+}
+
+/// The opening of [`gn_rank_deficient_warning`].
+const GN_RANK_DEFICIENT_HEAD: &str = "Gauss-Newton (BHHH): ";
+/// The fixed middle of [`gn_rank_deficient_warning`], between the two counts.
+const GN_RANK_DEFICIENT_MID: &str = " free parameters, so the BHHH information has rank at most ";
+
+/// Whether `warning` is [`gn_rank_deficient_warning`]'s, by its fixed head **and** middle, so
+/// another `Gauss-Newton (BHHH): …` warning is not mistaken for it.
+pub(crate) fn is_gn_rank_deficient_warning(warning: &str) -> bool {
+    warning.starts_with(GN_RANK_DEFICIENT_HEAD) && warning.contains(GN_RANK_DEFICIENT_MID)
+}
+
 /// Whether an accepted step ends the GN loop as converged on the small-change rule:
 /// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the radius the
 /// step was solved under had not collapsed (`radius ≥ GN_COLLAPSED_RADIUS`, #2738). Below
@@ -252,12 +298,15 @@ pub fn run_foce_gn(
     // radius (#2738): convergence is then decided at the next point from the BHHH Newton
     // decrement over that point's rows (`gn_collapsed_stop_converged`).
     let mut small_change_at_collapse = false;
+    // The user cancelled: the run was cut short, not stalled (#2438's rank warning).
+    let mut cancelled = false;
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("  GN iter {:>3}: cancelled by user", iter);
             }
             warnings.push("cancelled by user".to_string());
+            cancelled = true;
             exited_early = true;
             break;
         }
@@ -682,6 +731,17 @@ pub fn run_foce_gn(
             warnings.push(GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string());
         }
     }
+    // #2438: with fewer subjects than free parameters the BHHH is singular, the likely reason
+    // the loop stalled.
+    let n_free = fixed_mask.iter().filter(|&&f| !f).count();
+    warnings.extend(gn_rank_deficient_warning(
+        converged,
+        maxiter > 0 && !cancelled,
+        priors.is_active() || nn_reg.is_active(),
+        n_subj,
+        n_free,
+        options.method,
+    ));
 
     // Recompute gradient at the final accepted x so the stored value is always
     // at the converged point (mid-loop capture would be off by one step).
@@ -1281,7 +1341,7 @@ fn subject_nll_pop_grad_analytical(
     // matching `foce_subject_nll_standard`. f0 = f(η̂) − H·η̂ can cross zero on
     // a nonlinear model and make R̃ ill-conditioned; f(η=0) is always sensible.
     // Additive error is f-independent → keep f0 (bit-identical, no extra eval).
-    let use_pop_var = model.error_spec.has_f_dependent_variance();
+    let use_pop_var = model.has_f_dependent_variance();
     let zeros_eta = vec![0.0_f64; n_eta];
     let pop_preds: Vec<f64> = if use_pop_var {
         pk::compute_predictions_with_tv(model, subject, &params.theta, &zeros_eta)
@@ -2009,6 +2069,8 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && kappas.is_empty()
         && model.residual_error_eta.is_none()
         && !model.has_theta_dependent_ruv_magnitude()
+        // A magnitude reading `IPRED` (#3121) is not a per-row constant in `f`.
+        && !model.ruv_reads_prediction()
         && !model.residual_cov_at(template).is_dense()
         && !model.has_non_gaussian()
         && model.frem_config.is_none()
@@ -2587,6 +2649,91 @@ mod tests {
             let d: Vec<f64> = pred.iter().map(|&f| spec.dvar_dlogsigma(0, 1, f, &sigmas)).collect();
             assert!(d.iter().all(|v| *v == 0.0), "{em:?}: {d:?}");
         }
+    }
+
+    /// #2438: plain `gn` that ends unconverged (`outer_maxiter = 2`; this fixture still stalls
+    /// at OFV 5.7e4 after 100) warns, once, when the population has fewer subjects than free
+    /// parameters, since its BHHH is then singular by construction. One more subject,
+    /// `gn_hybrid`, a `maxiter = 0` evaluation (no step taken) and a prior (its curvature is in
+    /// the system) do not warn. A FIX parameter is not counted. `make_model` has 4 free
+    /// parameters, `make_population` 3.
+    #[test]
+    fn gn_warns_when_its_bhhh_is_rank_deficient_by_construction() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::FoceGn,
+            outer_maxiter: 2,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        // A literal head, not `is_gn_rank_deficient_warning`, so a mutation of that predicate
+        // cannot hide a warning from this test (its own test is in `tests_cov_diagnostics`).
+        let rank_with =
+            |m: &CompiledModel, p: &Population, init: &ModelParameters, o: &FitOptions| {
+                let res = run_foce_gn(m, p, init, o);
+                // Plain `gn` must end unconverged, or a "no warning" case would pass on the
+                // converged gate; `gn_hybrid`'s polish converges here (OFV 28.6).
+                if o.method == EstimationMethod::FoceGn {
+                    assert!(!res.converged, "the fixture must end unconverged");
+                }
+                res.warnings
+                    .into_iter()
+                    .filter(|w| w.starts_with("Gauss-Newton (BHHH): "))
+                    .collect::<Vec<String>>()
+            };
+        let rank = |p: &Population, o: &FitOptions| rank_with(&model, p, &model.default_params, o);
+        assert_eq!(
+            rank(&pop, &opts),
+            ["Gauss-Newton (BHHH): 3 subjects for 4 free parameters, so the BHHH information \
+              has rank at most 3 and is singular; its steps can stall short of the optimum. Use \
+              method = gn_hybrid, or a different optimizer."]
+        );
+        let mut four = pop.clone();
+        four.subjects.push(Subject { id: "4".into(), ..pop.subjects[0].clone() });
+        assert!(rank(&four, &opts).is_empty(), "as many subjects as parameters");
+        let hybrid =
+            FitOptions { method: crate::types::EstimationMethod::FoceGnHybrid, ..opts.clone() };
+        assert!(rank(&pop, &hybrid).is_empty(), "gn_hybrid");
+        // An evaluation took no step, so it did not stall (#2799's `maxiter = 0`).
+        assert!(rank(&pop, &FitOptions { outer_maxiter: 0, ..opts.clone() }).is_empty(), "eval");
+        // FIX TVV: 3 free coordinates, so 3 subjects no longer warn and 2 do, counting 3.
+        let mut fixed = model.default_params.clone();
+        fixed.theta_fixed[1] = true;
+        assert!(rank_with(&model, &pop, &fixed, &opts).is_empty(), "FIX TVV, 3 subjects");
+        let mut two = pop.clone();
+        two.subjects.truncate(2);
+        assert_eq!(
+            rank_with(&model, &two, &fixed, &opts),
+            ["Gauss-Newton (BHHH): 2 subjects for 3 free parameters, so the BHHH information \
+              has rank at most 2 and is singular; its steps can stall short of the optimum. Use \
+              method = gn_hybrid, or a different optimizer."]
+        );
+        // A prior puts its own curvature into the BHHH system, so the bound no longer holds.
+        let mut priored = make_model();
+        priored.priors.push(crate::types::ParameterPrior {
+            name: "TVCL".into(),
+            value: 5.0,
+            spread: crate::types::PriorSpread::Rse(0.3),
+            kind: None,
+        });
+        assert!(
+            rank_with(&priored, &pop, &priored.default_params, &opts).is_empty(),
+            "a prior is in the system"
+        );
+        // A fit that converged is not told it stalled. No `gn` fixture with fewer subjects than
+        // parameters converges, so that gate, and the covariate-NN half of `penalised`, are
+        // pinned on the function.
+        let fn_warns = |converged, stepped, penalised| {
+            gn_rank_deficient_warning(converged, stepped, penalised, 3, 4, EstimationMethod::FoceGn)
+                .is_some()
+        };
+        assert!(fn_warns(false, true, false));
+        assert!(!fn_warns(true, true, false), "converged");
+        assert!(!fn_warns(false, false, false), "no step taken");
+        assert!(!fn_warns(false, true, true), "penalised");
+        assert!(gn_rank_deficient_warning(false, true, false, 1, 2, EstimationMethod::FoceGn)
+            .is_some_and(|w| w.starts_with("Gauss-Newton (BHHH): 1 subject for")));
     }
 
     /// #816 follow-up regression: GN and its FOCEI hybrid both optimize in packed
@@ -5083,6 +5230,21 @@ mod tests {
         check_gn_grad_matches_fd(&model, false);
     }
 
+    /// A θ-*free* magnitude that reads `IPRED` (#3121) on the additive slot: the θ gate
+    /// does not fire, so only `ruv_reads_prediction` in `closed_form_fixed_ebe_grad_ok`
+    /// routes it to the FD fallback. The closed forms decide `∂d/∂log σ` by whether the
+    /// slot's *loading* reads `f` (`slot_reads_f`), which an additive slot does not, so on
+    /// them the additive σ's gradient drops its `h(f)` slope. Mutation, run by hand:
+    /// dropping that gate fails the Laplace leg at `grad[3]` (σ_add), rel 3.9e-2. A weakly
+    /// f-dependent `sqrt(1 + IPRED)` passed under the same mutation, hence the `exp`.
+    #[test]
+    fn ipred_magnitude_gn_grad_matches_fd_via_fallback() {
+        let model = weighted_gn_model("DV ~ combined(PROP_ERR, ADD_ERR * exp(0.3 * IPRED))", "");
+        assert!(model.ruv_reads_prediction() && !model.has_theta_dependent_ruv_magnitude());
+        check_gn_grad_matches_fd(&model, true);
+        check_gn_grad_matches_fd(&model, false);
+    }
+
     /// A θ-free `power(σ, P)` loading (#1182) stays on the closed forms — both
     /// the Laplace and the Sheiner–Beal gradient take `R`, `∂R/∂f` and
     /// `∂R/∂log σ` from `residual_error`'s exponent-aware `_scaled` dispatch.
@@ -5529,8 +5691,9 @@ mod tests {
             "the accepted polish's warning must reach the fit, got {:?}",
             hybrid.warnings
         );
-        // The GN phase's own record of how the polish's start was reached stays.
-        for w in &pure.warnings {
+        // The GN phase's own record of how the polish's start was reached stays. `pure` runs
+        // that phase as plain `gn`, whose rank warning (#2438) the hybrid does not raise.
+        for w in pure.warnings.iter().filter(|w| !is_gn_rank_deficient_warning(w)) {
             assert!(
                 hybrid.warnings.contains(w),
                 "GN-phase warning {w:?} dropped: {:?}",

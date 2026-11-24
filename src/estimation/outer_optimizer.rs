@@ -5477,14 +5477,11 @@ pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
 /// gradient optimizer (L-BFGS, SLSQP), whose `1e-12` stops are unreachable, so that its
 /// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
 /// Not a quadrature objective, which has reachable stops
-/// (`gradient_run_has_reachable_stops`) and its own noise floor, and not a mixture, whose
-/// objective is a different solve.
-pub(crate) fn unprofiled_verify_applies(
-    algo: nlopt::Algorithm, reachable_stops: bool, is_mixture: bool,
-) -> bool {
-    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp)
-        && !reachable_stops
-        && !is_mixture
+/// (`gradient_run_has_reachable_stops`) and its own noise floor. A mixture takes the
+/// incumbent-seeded legs (#2745), each class's inner solve at the leg tolerance, but not
+/// the [`LegStart`] passes, which score the single-population objective.
+pub(crate) fn unprofiled_verify_applies(algo: nlopt::Algorithm, reachable_stops: bool) -> bool {
+    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp) && !reachable_stops
 }
 
 /// Does a stop need a verification leg before it may be called converged (#2462)? Every
@@ -5740,12 +5737,16 @@ pub(crate) fn verified_stop_owes_a_restart(best: f64, cold: f64) -> bool {
         || cold_solve_beats_best_seen(Some(cold), Some(best)).is_some()
 }
 
-/// The fit's own state a pass can leave behind, restored when the pass is discarded.
+/// The fit's own state a pass can leave behind, restored when the pass is discarded, and
+/// whether the fit takes passes at all (`mixture`).
 pub(crate) struct PassState<'a> {
     pub(crate) basin_probe_fired: &'a std::cell::Cell<bool>,
     pub(crate) stagnation_latched: &'a std::sync::atomic::AtomicBool,
     /// The incumbent's objective at the leg tolerance: what a kept pass changes.
     pub(crate) kept_best: &'a std::cell::Cell<Option<f64>>,
+    /// A mixture fit takes no pass (#2745): a pass's cold solve, Newton step and comparison of
+    /// modes are the single-population objective's and do not score a mixture's classes.
+    pub(crate) mixture: bool,
 }
 
 /// Runs each [`LegStart`] pass that applies after the verdict `warm`, and returns the verdict
@@ -5760,6 +5761,9 @@ pub(crate) fn drive_leg_passes<V>(
     warm: V, end_of: impl Fn(&V) -> PolishEnd, cancelled: impl Fn() -> bool, state: PassState<'_>,
     stop_is_free: impl FnOnce() -> bool, mut pass: impl FnMut(LegStart, &V) -> V,
 ) -> V {
+    if state.mixture {
+        return warm;
+    }
     let mut verdict = warm;
     let mut stop_is_free = Some(stop_is_free);
     for start in [LegStart::ColdModes, LegStart::NewtonStep] {
@@ -5767,6 +5771,8 @@ pub(crate) fn drive_leg_passes<V>(
         if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
             continue;
         }
+        #[cfg(test)]
+        LEG_PASSES_APPLIED.with(|c| c.set(c.get() + 1));
         if stop_is_free.take().is_some_and(|free| !free()) {
             break;
         }
@@ -5834,6 +5840,17 @@ thread_local! {
     /// The #2645 passes turned off on this thread, for the tests' straddles.
     pub(crate) static LEG_PASSES_OFF: std::cell::Cell<&'static [LegStart]> =
         const { std::cell::Cell::new(&[]) };
+    /// [`LegStart`] passes `drive_leg_passes` reached on this thread, for the tests (#2745).
+    pub(crate) static LEG_PASSES_APPLIED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The per-class modes each #2462 leg of a mixture started from on this thread, for the
+    /// tests (#2837 r1 #5).
+    pub(crate) static MIXTURE_LEG_START_MODES: std::cell::RefCell<Vec<Vec<Vec<DVector<f64>>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Test switch: every #2462 leg after the first kept one is treated as not kept, so a
+    /// dropped leg is followed by another whatever the last digits of the objective do.
+    pub(crate) static UNPROFILED_VERIFY_DROP_LATER_LEGS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -6214,11 +6231,7 @@ fn optimize_nlopt_attempt_probed(
     // objectives at the user's tolerance; `leg_first` is the leg's first feasible
     // objective, for its gain.
     let verify_on = unprofiled_verify_enabled()
-        && unprofiled_verify_applies(
-            algo,
-            gradient_run_has_reachable_stops(options),
-            init_params.mixture.is_some(),
-        );
+        && unprofiled_verify_applies(algo, gradient_run_has_reachable_stops(options));
     let leg_options = FitOptions {
         inner_tol: options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),
         ..options.clone()
@@ -6327,7 +6340,7 @@ fn optimize_nlopt_attempt_probed(
                             model,
                             population,
                             &params,
-                            options,
+                            eval_options,
                             warm,
                             Some(&schedule_cache),
                         );
@@ -6338,7 +6351,7 @@ fn optimize_nlopt_attempt_probed(
                             model,
                             population,
                             &params,
-                            options,
+                            eval_options,
                             warm,
                             Some(&schedule_cache),
                         )
@@ -6635,7 +6648,7 @@ fn optimize_nlopt_attempt_probed(
                         population,
                         init_params,
                         &x,
-                        options,
+                        eval_options,
                         mev,
                         mixmodes.as_ref(),
                         declines,
@@ -7411,6 +7424,21 @@ fn optimize_nlopt_attempt_probed(
             // re-solve of them and a subject the cold solve left unconverged is not what
             // the guard judges (#2645).
             state.restart_from_modes(held);
+            // A mixture's classes start at the incumbent's own modes too, which
+            // [`keep_verify_leg`] put back if the last leg was dropped (#2837 r1 #5); cold when
+            // the held state is another point's.
+            state.cached_etas_by_class = best_solve_cl
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|inc| inc.xs == best_x)
+                .map(|inc| inc.class_etas.clone())
+                .unwrap_or_default();
+            #[cfg(test)]
+            if init_params.mixture.is_some() {
+                MIXTURE_LEG_START_MODES
+                    .with(|m| m.borrow_mut().push(state.cached_etas_by_class.clone()));
+            }
             *leg_best.borrow_mut() = BestPoint::new();
             leg_first.set(None);
             let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
@@ -7433,7 +7461,13 @@ fn optimize_nlopt_attempt_probed(
             // ([`keep_verify_leg`]).
             let mut live =
                 (last_gradient.lock().unwrap().take(), best_solve.lock().unwrap().take());
-            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
+            #[cfg(test)]
+            let judged = best.filter(|_| {
+                kept_leg_best.is_none() || !UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.get())
+            });
+            #[cfg(not(test))]
+            let judged = best;
+            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, judged, &mut live) {
                 *best_seen.lock().unwrap() = leg_best.borrow().clone();
             }
             kept_best_seen.set(kept_leg_best);
@@ -7466,6 +7500,7 @@ fn optimize_nlopt_attempt_probed(
                 basin_probe_fired: &basin_probe_fired,
                 stagnation_latched: &stagnation_latched,
                 kept_best: &kept_best_seen,
+                mixture: init_params.mixture.is_some(),
             },
             || {
                 // Clean, as the final check reads it: the cold objective carries no penalty.
@@ -9079,7 +9114,28 @@ pub(crate) fn reconverged_fd_gradient(
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
+    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
+}
+
+/// [`central_diff_packed_gated`] for a stencil whose probes re-solve the inner loop and so
+/// do not poll the cancel flag themselves (#2776): once `cancel` is set, every remaining probe
+/// is missing, not solved — `eval` reads `NaN`, `tight` reads `None`. Without this the #2406
+/// gate would grow every floored step through the remaining probes (up to ~44 population
+/// re-solves per floored coordinate) before the caller saw the cancel. The **one** guard for
+/// its four callers — the three reconverged-FD gradients and the AGQ/Laplace reconverged FD
+/// score (`SubjectScoreContext::finite_difference_score`, #3136), which polls its centre solve
+/// itself and declines a cancelled stencil; a coordinate a cancel cuts inside its gate growth
+/// keeps what the gate had, which every caller discards (`fit()` errs, the covariance step
+/// skips its reading).
+pub(crate) fn central_diff_until_cancel(
+    x: &[f64], fixed: &[bool], floor: &[f64], bounds: &PackedBounds,
+    cancel: &Option<crate::cancel::CancelFlag>, eval: impl Fn(&[f64]) -> f64,
+    tight: impl Fn(&[f64]) -> Option<f64>,
+) -> Vec<f64> {
+    let live = || !crate::cancel::is_cancelled(cancel);
+    let eval = |xv: &[f64]| if live() { eval(xv) } else { f64::NAN };
+    let tight = |xv: &[f64]| live().then(|| tight(xv)).flatten();
+    central_diff_packed_gated(x, fixed, floor, bounds, eval, Some(&tight))
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
@@ -9383,7 +9439,7 @@ fn reporting_fd_gradient(
         crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
+    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -9416,7 +9472,7 @@ fn reporting_fd_gradient(
 /// at its own floor, with its one-sided fallback — the covariance gate's fallback too. Floor 1
 /// was the worst step there: on a `V = TVV/k` volume it is the step through `V ≤ 0` that made
 /// the probe go missing (#2406 review r1).
-fn central_diff_packed_gated(
+pub(crate) fn central_diff_packed_gated(
     x: &[f64], fixed: &[bool], floor: &[f64], bounds: &PackedBounds, eval: impl Fn(&[f64]) -> f64,
     tight: Option<&dyn Fn(&[f64]) -> Option<f64>>,
 ) -> Vec<f64> {
@@ -9812,7 +9868,7 @@ fn subject_central_diff(
         resolved.then_some(v)
     };
     let floor = fd_step_floors(init_params, model);
-    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
+    central_diff_until_cancel(x, &fixed, &floor, bounds, &options.cancel, eval, tight)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the
@@ -10221,8 +10277,8 @@ fn declined_subject_gradient(
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
-/// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
-/// [`resolve_outer_optimizer`]),
+/// a derivative-free BOBYQA fit (including a mixture's `Auto` resolved to BOBYQA off the
+/// analytic gradient by [`resolve_outer_optimizer`]),
 /// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
 /// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
 /// the end with an empty log and say nothing.

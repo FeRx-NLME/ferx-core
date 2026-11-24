@@ -140,7 +140,16 @@ pub fn gradient_method_outer(
         // (a model no recorder serves, a plan failure at a point). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.
         EstimationMethod::Laplace => {
-            if crate::estimation::agq::analytic_score_supported_model(model) {
+            let analytic = crate::estimation::agq::analytic_score_supported_model(model);
+            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                crate::api::stage_optimizer_request(method, optimizer),
+                model,
+                model.mixture.is_some(),
+                analytic,
+            );
+            if resolved == Optimizer::Bobyqa {
+                GradientMethodKind::NotApplicable
+            } else if analytic {
                 GradientMethodKind::Analytic
             } else {
                 GradientMethodKind::FiniteDifferences

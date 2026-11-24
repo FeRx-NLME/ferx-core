@@ -2813,7 +2813,7 @@ mod frozen_ebe_variance {
             [("proportional", None), ("combined", Some("DV ~ combined(PROP_ERR, ADD_ERR)"))]
         {
             let (model, pop, p) = noiov_fixture(err);
-            assert!(model.error_spec.has_f_dependent_variance());
+            assert!(model.has_f_dependent_variance());
             for s in pop.subjects.iter().take(4) {
                 let f0 = population_variance_preds(&model, s, &p.theta, 3).unwrap();
                 let eta = [0.25, -0.15, 0.35];
@@ -3791,7 +3791,8 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
 /// two modes that differ only in the Ω penalty: the deeper one at η ≈ (0, 0, −3.90) and a
 /// twin at η ≈ (0, +1.58, −2.34) (ka = 0.1, V = 50). BFGS from η = 0 lands in the twin. The
 /// twin is well curved, so `weakly_identified_coords` does not flag it (#2013); `reset`
-/// adds an inert reset before the dose so the subject takes the scan-every-coordinate arm.
+/// adds a reset after the data, which changes no prediction, so the subject takes the
+/// scan-every-coordinate arm.
 /// NONMEM 7.5.1 at the same estimates agrees on both modes (#2013's comparison).
 fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
     use crate::types::{DoseEvent, Subject};
@@ -3814,13 +3815,39 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
         obs_times,
         observations,
         obs_cmts: vec![1; n],
-        reset_times: if reset { vec![0.0] } else { Vec::new() },
+        // After the last observation: a reset on the first record is a no-op and takes no
+        // reset arm (#2081), and one after the data changes no prediction.
+        reset_times: if reset { vec![100.0] } else { Vec::new() },
         cens: vec![0; n],
         ..Default::default()
     };
-    assert_eq!(subject.has_resets(), reset, "test premise: reset arm");
+    assert_eq!(subject.has_effective_resets(), reset, "test premise: reset arm");
     assert!(!subject.has_tv_covariates());
     (model, subject)
+}
+
+/// #2081: a reset on the subject's first record is a no-op, so the subject multi-starts as
+/// one with no reset does, not on the scan-every-coordinate arm a reset after the data takes.
+/// On the flip-flop fixture the two arms end in different modes (the scan finds the deeper
+/// one, #2013), so agreeing with the no-reset solve is not both arms agreeing. A reset sends
+/// the predictions down the event-driven walk, so the objectives agree to rounding, not bits.
+#[test]
+fn a_first_record_reset_multistarts_like_no_reset() {
+    let (model, plain) = flipflop_fixture(false);
+    let (_, after) = flipflop_fixture(true);
+    let first = Subject { reset_times: vec![0.0], ..plain.clone() };
+    assert!(first.has_resets() && !first.has_effective_resets());
+    let solve = |s: &Subject| find_ebe(&model, s, &model.default_params, 200, 1e-8, None, None, 1);
+    let (none, inert, scanned) = (solve(&plain), solve(&first), solve(&after));
+    assert!(
+        none.eta[2] > -3.0 && scanned.eta[2] < -3.5,
+        "premise: the two arms end in different modes; η_KA {} and {}",
+        none.eta[2],
+        scanned.eta[2]
+    );
+    let gap = (inert.eta.clone() - none.eta.clone()).amax();
+    assert!(gap < 1e-6, "the first-record reset took the scan arm: η gap {gap:e}");
+    assert!((inert.nll - none.nll).abs() < 1e-8, "{} vs {}", inert.nll, none.nll);
 }
 
 /// #2014: every estimating fit hands the inner loop `Some(zeros)` on its first evaluation
@@ -6486,6 +6513,351 @@ fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
     // stopped at `inner_tol = 1e-8` on the gradient norm. 1e-10 keeps two decades of headroom
     // and still fails a carried seed that stops the search loosely (#2585 review #9).
     assert!(worst < 1e-10, "carried vs fresh seed reach different modes ({worst:.3e})");
+}
+
+/// The full-TMDD fixture of #2845 / #2868 (public: model and data inlined there), subject 13
+/// alone, at `TVKON = 1.342` and pinned `rodas4` at the default tolerances.
+fn tmdd_2868_fixture() -> (CompiledModel, Subject, ModelParameters) {
+    let mut model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.3, 0.001, 10.0)\n  theta TVV(3.0, 0.1, 100.0)\n  \
+         theta TVKON(1.342, 0.01, 50.0)\n  theta TVKOFF(0.1, 0.001, 10.0)\n  \
+         theta TVKINT(0.05, 0.001, 5.0)\n  theta TVKSYN(0.5, 0.001, 50.0)\n  \
+         theta TVKDEG(0.05, 0.001, 5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.04 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+         KON = TVKON\n  KOFF = TVKOFF\n  KINT = TVKINT\n  KSYN = TVKSYN\n  KDEG = TVKDEG\n  \
+         KEL = CL / V\n\
+         [structural_model]\n  ode(obs_cmt=drug, states=[drug, target, complex])\n\
+         [odes]\n  init(target) = KSYN / KDEG\n  \
+         d/dt(drug) = -KEL * drug - (KON / V) * drug * target + KOFF * complex\n  \
+         d/dt(target) = KSYN - KDEG * target - (KON / V) * drug * target + KOFF * complex\n  \
+         d/dt(complex) = (KON / V) * drug * target - (KOFF + KINT) * complex\n\
+         [scaling]\n  y = drug / V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("TMDD parses");
+    model.ode_spec.as_mut().expect("an ODE model").solver_opts.method =
+        crate::ode::OdeMethod::Rodas4;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv = dir.path().join("tmdd13.csv");
+    std::fs::write(
+        &csv,
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n13,0,.,1,500,1,0,1\n13,0.1,160.221,0,.,1,0,0\n\
+         13,0.5,161.833,0,.,1,0,0\n13,1,144.889,0,.,1,0,0\n13,2,129.135,0,.,1,0,0\n\
+         13,4,91.0425,0,.,1,0,0\n13,8,46.391,0,.,1,0,0\n13,24,2.69504,0,.,1,0,0\n\
+         13,48,0.05433,0,.,1,0,0\n13,96,0.002801,0,.,1,0,0\n",
+    )
+    .expect("write csv");
+    let pop = crate::read_nonmem_csv(&csv, None, None).expect("TMDD data loads");
+    let params = model.default_params.clone();
+    (model, pop.subjects[0].clone(), params)
+}
+
+/// #2868: the FD inner gradient on an integrating objective must find the mode the analytic
+/// gradient finds. At the roundoff step `h = 1e-7·(1 + |η|)` the difference read the jump
+/// between two adaptive step sequences as slope, and before #2939 this subject's search stopped
+/// 0.30 in nll short of the mode; since #2939 the gap at the roundoff step is 1.9e-5 (see the
+/// closing comment), so the regression this exists to catch — the ODE branch of `ebe_gradient_fd`
+/// stepping by `FD_GRADIENT_STEP` again — is caught by the step assertions, not the nll bound.
+/// Both solves are asserted on their own route, so the pair cannot collapse onto one engine.
+#[test]
+fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
+    let (model, subject, params) = tmdd_2868_fixture();
+    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+    let an = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
+    let (a, e, f) = INNER_AGRAD_ROUTE.with(|c| c.get());
+    assert!(a + e > 0 && f == 0, "analytic: {a} analytic / {e} exact / {f} FD");
+
+    let (mut fd_model, _, _) = tmdd_2868_fixture();
+    fd_model.gradient_method = GradientMethod::Fd;
+    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+    arm_ebe_fd_calls();
+    let fd = find_ebe(&fd_model, &subject, &params, 200, 1e-5, None, None, 0);
+    let (a, e, f) = INNER_AGRAD_ROUTE.with(|c| c.get());
+    assert!(a == 0 && e == 0 && f > 0, "fd: {a} analytic / {e} exact / {f} FD");
+    let calls = take_ebe_fd_calls();
+    assert!(
+        calls.len() == f && calls.iter().all(|c| *c == (Some(1e-3), None)),
+        "every FD step of an ODE solve at the default tolerance takes the 1e-3 step from η: \
+         {calls:?}"
+    );
+    // The fit's tolerance reaches the step through its thread override, as `fit` arms it.
+    {
+        let _fit =
+            crate::ode::solver::arm_ode_solver_override(crate::ode::solver::OdeSolverOverride {
+                reltol: Some(1e-6),
+                abstol: Some(1e-9),
+                ..Default::default()
+            });
+        arm_ebe_fd_calls();
+        find_ebe(&fd_model, &subject, &params, 200, 1e-5, None, None, 0);
+    }
+    let tight_calls = take_ebe_fd_calls();
+    assert!(
+        !tight_calls.is_empty()
+            && tight_calls
+                .iter()
+                .all(|c| c.0.is_some_and(|h| (h / 2.154_434_690_031_884e-4 - 1.0).abs() < 1e-12)
+                    && c.1.is_none()),
+        "at ode_reltol = 1e-6 the integrating step is 1e-3·(1e-2)^(1/3): {tight_calls:?}"
+    );
+    // The other side of the gate: a closed-form subject keeps the roundoff step.
+    let (mut cf_model, cf_subject) = wellidentified_oral_fixture();
+    cf_model.gradient_method = GradientMethod::Fd;
+    let cf_params = cf_model.default_params.clone();
+    arm_ebe_fd_calls();
+    find_ebe(&cf_model, &cf_subject, &cf_params, 200, 1e-5, None, None, 0);
+    let cf_calls = take_ebe_fd_calls();
+    assert!(
+        !cf_calls.is_empty() && cf_calls.iter().all(|c| *c == (None, None)),
+        "every FD step of a closed-form solve takes the roundoff step: {cf_calls:?}"
+    );
+    // And an `[odes]` model on the exact matrix-exponential path keeps it too, while the same
+    // model integrated by `rk45` does not: one model, both sides of the gate.
+    for (method, resolved, want) in [
+        (None, crate::ode::OdeMethod::Linear, None),
+        (Some(crate::ode::OdeMethod::Rk45), crate::ode::OdeMethod::Rk45, Some(1e-3)),
+    ] {
+        let mut lin_model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.3, 0.001, 10.0)\n  theta TVV(3.0, 0.1, 100.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.04 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+             [structural_model]\n  ode(obs_cmt=drug, states=[drug])\n\
+             [odes]\n  d/dt(drug) = -(CL / V) * drug\n\
+             [scaling]\n  y = drug / V\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("one-compartment ODE parses");
+        lin_model.gradient_method = GradientMethod::Fd;
+        let _fit =
+            crate::ode::solver::arm_ode_solver_override(crate::ode::solver::OdeSolverOverride {
+                method,
+                ..Default::default()
+            });
+        let spec = lin_model.integrator_spec().expect("an ODE model");
+        assert_eq!(spec.effective_solver_opts().method, resolved, "method {method:?}");
+        let lin_params = lin_model.default_params.clone();
+        arm_ebe_fd_calls();
+        find_ebe(&lin_model, &subject, &lin_params, 200, 1e-5, None, None, 0);
+        let lin_calls = take_ebe_fd_calls();
+        assert!(
+            !lin_calls.is_empty() && lin_calls.iter().all(|c| *c == (want, None)),
+            "method {method:?} resolving to {resolved:?}: want step {want:?}, {lin_calls:?}"
+        );
+    }
+
+    assert!(an.nll.is_finite() && fd.nll.is_finite(), "{} / {}", an.nll, fd.nll);
+    let gap = fd.nll - an.nll;
+    let eta_gap = (&fd.eta - &an.eta).abs().max();
+    eprintln!("#2868 subject 13: nll fd − analytic {gap:.3e}, η̂ gap {eta_gap:.3e}");
+    // Measured at the integrating step on macOS arm64: 8.909e-6 in nll and 1.489e-5 in η̂. With
+    // `ODE_FD_GRADIENT_STEP` set back to 1e-7: 1.925e-5 and 8.293e-5, inside both bounds, so
+    // these two sanity bounds no longer catch the roundoff step on this subject (the step
+    // assertions above do; before #2939 it was 3.043e-1 and 1.320e-2). The full-TMDD sweep in
+    // `docs/estimation/foce.qmd` is where the stall still shows.
+    assert!(gap.abs() < 1e-4, "FD inner search stopped {gap:.3e} in nll from the mode");
+    assert!(eta_gap < 1e-3, "FD inner search stopped {eta_gap:.3e} in η̂ from the mode");
+}
+
+/// #2868: the integrating step is `1e-3` at the default `ode_reltol = 1e-4`, shrinks as
+/// `reltol^(1/3)` below it, and is clamped to `[1e-7, 1e-3]`. One point per regime, so each
+/// of the scaling, the exponent and either clamp has a value that dies when it changes.
+#[test]
+fn the_integrating_fd_step_scales_with_the_cube_root_of_reltol() {
+    let cases = [(1e-4, 1e-3), (1e-7, 1e-4), (1e-10, 1e-5), (1e-2, 1e-3), (1e-20, 1e-7)];
+    for (reltol, want) in cases {
+        let got = integrating_fd_step(reltol);
+        assert!(
+            ((got - want) / want).abs() < 1e-12,
+            "reltol {reltol:e}: step {got:e}, want {want:e}"
+        );
+    }
+    assert_eq!(integrating_fd_step(1e-4), 1e-3, "exactly 1e-3 at the default");
+}
+
+/// #2868: `ebe_gradient_fd` probes `x ± step·(1 + |x − origin|)`, the roundoff step when the
+/// objective does not integrate and the given integrating step when it does, the latter
+/// scaled from `origin` (μ, in the IOV search) and the former not. Read off the probes
+/// themselves, so the gate, the step and the origin each have an assertion of their own; the
+/// coordinates are chosen so that `|ψ|` and `|η|` differ on the shifted ones, and the third
+/// lies past the end of `origin`, as κ does past μ.
+#[test]
+fn ebe_gradient_fd_steps_by_the_integrator_and_scales_from_the_origin() {
+    let probes = RefCell::new(Vec::<Vec<f64>>::new());
+    let obj = |x: &[f64]| {
+        probes.borrow_mut().push(x.to_vec());
+        x.iter().map(|v| v * v).sum::<f64>()
+    };
+    let x = [2.5, -1.5, 0.3];
+    let mu = [2.0, -1.0];
+    let half_steps = |origin: Option<&[f64]>, integrating_step: Option<f64>| {
+        probes.borrow_mut().clear();
+        let g = ebe_gradient_fd(&obj, &x, origin, 3, integrating_step);
+        let p = probes.borrow();
+        assert_eq!(p.len(), 6);
+        let h: Vec<f64> = (0..3).map(|i| (p[2 * i][i] - p[2 * i + 1][i]) / 2.0).collect();
+        (g, h)
+    };
+    let close = |what: &str, got: &[f64], want: &[f64]| {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(((g - w) / w).abs() < 1e-6, "{what}: coordinate {i} stepped {g:e}, want {w:e}");
+        }
+    };
+
+    let (g, h) = half_steps(Some(&mu), None);
+    close("roundoff", &h, &[3.5e-7, 2.5e-7, 1.3e-7]);
+    // The difference before #2868, written out: `1e-7·(1 + |x|)`, origin ignored.
+    let quadratic = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+    let before: Vec<f64> = (0..3)
+        .map(|i| {
+            let h = 1e-7 * (1.0 + x[i].abs());
+            let (mut plus, mut minus) = (x.to_vec(), x.to_vec());
+            plus[i] = x[i] + h;
+            minus[i] = x[i] - h;
+            (quadratic(&plus) - quadratic(&minus)) / (2.0 * h)
+        })
+        .collect();
+    assert_eq!(g, before, "roundoff: bit-identical to the difference before #2868");
+    let (_, h) = half_steps(Some(&mu), Some(1e-3));
+    close("integrating, from μ", &h, &[1.5e-3, 1.5e-3, 1.3e-3]);
+    let (_, h) = half_steps(Some(&mu), Some(2e-4));
+    close("integrating, the step given", &h, &[3e-4, 3e-4, 2.6e-4]);
+    let (g, h) = half_steps(None, Some(1e-3));
+    close("integrating, from 0", &h, &[3.5e-3, 2.5e-3, 1.3e-3]);
+    // Central differences of a quadratic are exact up to roundoff at any step.
+    close("gradient", &g, &[5.0, -3.0, 0.6]);
+}
+
+/// #3145: one evaluation of the integrating difference that leaves a segment unfinished sends
+/// the whole gradient to the roundoff step, and none keeps it. The unfinished solve is placed on
+/// one probe at a time, so a check of only the first or the last evaluation dies.
+#[test]
+fn ebe_gradient_fd_takes_the_roundoff_step_where_a_solve_is_unfinished() {
+    use crate::ode::{solve_ode, OdeMethod, OdeSolverOptions};
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -u[0];
+    let opts = |max_steps| OdeSolverOptions {
+        max_steps,
+        initial_dt: 0.1,
+        method: OdeMethod::Rk45,
+        ..OdeSolverOptions::default()
+    };
+    let x = [2.5, -1.5];
+    let quadratic = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+    for unfinished_at in [None, Some(0), Some(1), Some(2), Some(3)] {
+        let n_eval = std::cell::Cell::new(0usize);
+        let obj = |x: &[f64]| {
+            let k = n_eval.replace(n_eval.get() + 1);
+            let budget = if Some(k) == unfinished_at { 1 } else { 10_000 };
+            solve_ode(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts(budget));
+            quadratic(x)
+        };
+        arm_ebe_fd_calls();
+        let g = ebe_gradient_fd(&obj, &x, None, 2, Some(1e-3));
+        let calls = take_ebe_fd_calls();
+        let (step, evals, want) = match unfinished_at {
+            None => (Some(1e-3), 4, gradient_fd_step(&quadratic, &x, None, 2, 1e-3)),
+            Some(_) => (None, 8, gradient_fd(&quadratic, &x, 2)),
+        };
+        assert_eq!(calls, vec![(step, None)], "unfinished at {unfinished_at:?}");
+        assert_eq!(n_eval.get(), evals, "unfinished at {unfinished_at:?}");
+        assert_eq!(g, want, "unfinished at {unfinished_at:?}");
+    }
+    // An `auto` escalation the guard discarded and re-solved left no unfinished trajectory.
+    let obj = |x: &[f64]| {
+        crate::ode::solver::record_to_stats_sink(&crate::ode::OdeSolverStats {
+            unfinished_segments: 1,
+            discarded_unfinished_segments: 1,
+            ..Default::default()
+        });
+        quadratic(x)
+    };
+    arm_ebe_fd_calls();
+    ebe_gradient_fd(&obj, &x, None, 2, Some(1e-3));
+    assert_eq!(take_ebe_fd_calls(), vec![(Some(1e-3), None)], "a discarded attempt");
+}
+
+/// #3145 through the production objective: the counters the gate reads are the ones a subject's
+/// own inner solve leaves. One model, one subject, both sides: at the default step budget every
+/// FD gradient takes the integrating step, and on a budget no segment can finish within, none.
+#[test]
+fn an_fd_inner_search_takes_the_integrating_step_only_where_the_solve_finishes() {
+    let (_, subject, _) = tmdd_2868_fixture();
+    let mut model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.3, 0.001, 10.0)\n  theta TVV(3.0, 0.1, 100.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.04 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+         [structural_model]\n  ode(obs_cmt=drug, states=[drug])\n\
+         [odes]\n  d/dt(drug) = -(CL / V) * drug\n\
+         [scaling]\n  y = drug / V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("one-compartment ODE parses");
+    model.gradient_method = GradientMethod::Fd;
+    let params = model.default_params.clone();
+    for (max_steps, want) in [(None, Some(1e-3)), (Some(1), None)] {
+        let _fit =
+            crate::ode::solver::arm_ode_solver_override(crate::ode::solver::OdeSolverOverride {
+                method: Some(crate::ode::OdeMethod::Rk45),
+                max_steps,
+                ..Default::default()
+            });
+        assert_eq!(model_integrating_fd_step(&model), Some(1e-3), "the model gate is open");
+        arm_ebe_fd_calls();
+        find_ebe(&model, &subject, &params, 20, 1e-5, None, None, 0);
+        let calls = take_ebe_fd_calls();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|c| *c == (want, None)),
+            "max_steps {max_steps:?}: want step {want:?}, {calls:?}"
+        );
+    }
+}
+
+/// #2868 on a closed form with an ODE twin: a transit subject earns the integrating step only
+/// at an iterate the twin serves. The fixture is the crossing case above, whose search starts
+/// in the closed form's domain and ends past the flip-flop abscissa, so one solve has a
+/// roundoff leg and an integrating leg. The model-level gate is open throughout (asserted), so
+/// the first call's roundoff step is the per-iterate filter's alone: dropping it hands every
+/// call `1e-3`, and a filter that never opens hands none of them `1e-3`.
+#[test]
+fn a_transit_fd_search_takes_the_integrating_step_only_past_the_flip_flop_abscissa() {
+    let subject = flip_flop_transit_subject();
+    let mut m = flip_flop_transit_model(4.0, 110.0, 24.0, 0.0);
+    m.gradient_method = GradientMethod::Fd;
+    let p = m.default_params.clone();
+    assert_eq!(
+        model_integrating_fd_step(&m),
+        Some(1e-3),
+        "the transit model counts its ODE twin as its integrator"
+    );
+
+    arm_ebe_fd_calls();
+    let res = find_ebe(&m, &subject, &p, 200, 1e-6, None, None, 0);
+    let calls = take_ebe_fd_calls();
+
+    // The straddle, asserted so the fixture cannot silently stop crossing.
+    assert!(
+        !crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, &[0.0, 0.0]),
+        "fixture drift: the cold start must be in the closed form's domain"
+    );
+    assert!(
+        crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, res.eta.as_slice()),
+        "fixture drift: the FD solve must end past the abscissa (eta_hat = {:?})",
+        res.eta.as_slice()
+    );
+
+    assert_eq!(
+        calls.first(),
+        Some(&(None, None)),
+        "the in-domain start is a closed-form solve and keeps the roundoff step"
+    );
+    assert!(
+        calls.contains(&(Some(1e-3), None)),
+        "once past the abscissa the twin integrates and the step is 1e-3: {calls:?}"
+    );
+    assert!(
+        calls.iter().all(|c| *c == (None, None) || *c == (Some(1e-3), None)),
+        "one of the two steps, from η: {calls:?}"
+    );
 }
 
 /// Value/gradient fusion: the value [`analytic_eta_nll_value_gradient_with_schedule`] scores off
