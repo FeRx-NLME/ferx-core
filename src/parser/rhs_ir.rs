@@ -1251,6 +1251,27 @@ pub(super) fn dedup_calls(f: &Func, prefix: usize) -> (Func, usize) {
     (out, kept_prefix)
 }
 
+/// `y·x^(y−1)`, the slope of `xʸ` in `x`. At `x = 0` with `y < 1` it is infinite, and the
+/// exactly-zero sensitivity of a state not yet reached made `0·∞ = NaN` of a gradient (#3151):
+/// there it is `0`, as the forward lanes' `0ⁿ` (flat) has it. `y_inst` is `y`'s instruction: a
+/// literal exponent of at least 1 needs no guard. The discarded arm runs on a safe base.
+fn pow_slope(b: &mut Func, x: V, y: V, y_inst: Inst) -> V {
+    let one = b.k(1.0);
+    let ym1 = b.push(Inst::Sub(y, one));
+    if matches!(y_inst, Inst::Const(c) if f64::from_bits(c) >= 1.0) {
+        let p = b.push(Inst::Powf(x, ym1));
+        return b.push(Inst::Mul(y, p));
+    }
+    let z = b.k(0.0);
+    let y_lt = b.push(Inst::Cmp(Cc::Lt, y, one));
+    let x_z = b.push(Inst::Cmp(Cc::Eq, x, z));
+    let sub = b.push(Inst::And(y_lt, x_z));
+    let xs = b.push(Inst::Select(sub, one, x));
+    let p = b.push(Inst::Powf(xs, ym1));
+    let yp = b.push(Inst::Mul(y, p));
+    b.push(Inst::Select(sub, z, yp))
+}
+
 /// The reverse pass of a forward [`Func`] of `n` arguments: a function of `2n` arguments
 /// whose argument `n + a` is the adjoint buffer of argument `a`, laid out like it.
 ///
@@ -1437,10 +1458,7 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             Inst::Powf(x, y) => {
                 // `r = xʸ`: `dx = g·y·x^(y−1)`; `dy = g·r·ln x` for `x > 0`, and `0` where
                 // the logarithm does not exist (`0^y` is flat in `y` for `y > 0`).
-                let one = b.k(1.0);
-                let ym1 = b.push(Inst::Sub(fw(y), one));
-                let p = b.push(Inst::Powf(fw(x), ym1));
-                let yp = b.push(Inst::Mul(fw(y), p));
+                let yp = pow_slope(&mut b, fw(x), fw(y), fwd.insts[y as usize]);
                 let dx = b.push(Inst::Mul(g, yp));
                 acc(&mut b, &mut adj, live, x, dx, false);
                 let lx = b.push(Inst::Call1(Shim1::Ln, fw(x)));
@@ -1646,10 +1664,7 @@ pub(super) fn tangent(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
             }
             Inst::Powf(x, y) if t(x).is_some() || t(y).is_some() => {
                 // As the reverse: `y·x^(y−1)` and, for `x > 0`, `r·ln x`.
-                let one = b.k(1.0);
-                let ym1 = b.push(Inst::Sub(fw(y), one));
-                let p = b.push(Inst::Powf(fw(x), ym1));
-                let dx = b.push(Inst::Mul(fw(y), p));
+                let dx = pow_slope(&mut b, fw(x), fw(y), f.insts[y as usize]);
                 let lx = b.push(Inst::Call1(Shim1::Ln, fw(x)));
                 let rl = b.push(Inst::Mul(map[i], lx));
                 let z = b.k(0.0);

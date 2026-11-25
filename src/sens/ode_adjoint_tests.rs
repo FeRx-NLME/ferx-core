@@ -402,6 +402,52 @@ fn adjoint_matches_reconverged_finite_differences_of_the_objective() {
     assert!(worst < 5e-6, "worst relative difference {worst:.2e}");
 }
 
+/// #3151: `(central/V)^GAMMA` with an estimated `GAMMA` below 1 reads `0^(GAMMA−1) = ∞` from the
+/// state that is 0 at the dose time; the reverse pass multiplied it by an exactly-zero
+/// sensitivity (`0·∞ = NaN`) and the subject left the adjoint's scope. `fd_oracle` panics on a
+/// declined subject, so reaching the comparison is the scope check.
+#[test]
+fn a_live_exponent_at_a_zero_base_stays_in_adjoint_scope() {
+    let hill = r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVGAMMA(START, 0.1, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma ADD_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+  GAMMA = TVGAMMA
+[structural_model]
+  ode(states=[depot, central, effect])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+  d/dt(effect) = 0.3 * ((central/V)^GAMMA / (2^GAMMA + (central/V)^GAMMA) - effect)
+[scaling]
+  y = 1 + 5 * effect
+[error_model]
+  DV ~ additive(ADD_ERR)
+";
+    // 0.8 is the defect; 1.6 pins the path that was never broken.
+    for start in ["0.8", "1.6"] {
+        let model =
+            with_tol(parse_model_string(&hill.replace("START", start)).unwrap(), 1e-12, 1e-14);
+        let s = subject(
+            &model,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &TIMES,
+            &[0.1, -0.05],
+        );
+        let worst = fd_oracle(&model, &s, true);
+        assert!(worst < 5e-6, "GAMMA {start}: worst relative difference {worst:.2e}");
+    }
+}
+
 /// The cells of a reconverged-FD case table that run: all of them under `slow-tests`, and per
 /// PR only `per_pr` (indices into `cases`). Every cell is a full oracle (four EBE re-solves per
 /// packed coordinate), so a nine-cell table cost minutes of the per-PR coverage shard; the
