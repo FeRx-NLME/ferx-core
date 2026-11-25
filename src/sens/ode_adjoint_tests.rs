@@ -6911,19 +6911,27 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
     assert!(gated.0 < 2.5e-10, "gated FOCE F vs production: {:.2e}", gated.0);
 }
 
-/// #1353: an `SS=1` bolus whose lag is longer than `II` (`nonmem_anchor/ss_lag_ge_ii`, ID 2:
-/// `ALAG1 = 15`, `II = 12`) on the closed form, IV and oral, against reconverged FD, with the lag below `II`
-/// beside it so the straddle is asserted. The closed form's superposition wrapped the
-/// pre-arrival phase and collapsed the arrival there, where the predictions clamp and split
-/// (#1121): 1.0 relative off at lag 15, 8.0e-10 at lag 3. Measured now (macOS arm64): 2.5e-10
-/// and 8.0e-10.
+/// #1353: an `SS=1` dose whose lag is longer than `II` (`nonmem_anchor/ss_lag_ge_ii`, ID 2:
+/// `ALAG1 = 15`, `II = 12`) on the closed form, against reconverged FD, with the lag below `II`
+/// beside it so the straddle is asserted. The arrival term runs through every kernel of the
+/// ladder, so it takes the one- and two-compartment IV bolus, the oral bolus and an `SS=1`
+/// infusion (whose cloned arrival keeps its window). The closed form's superposition wrapped
+/// the pre-arrival phase and collapsed the arrival there, where the predictions clamp and
+/// split (#1121). Measured on Linux x86_64, worst relative gap per cell, with the arrival term
+/// dropped (`ss_lag_past_ii` returning `None`) beside it: lag-15 one-compartment IV 1.3e-9
+/// (1.0), oral 7.8e-9 (3.9), two-compartment IV 5.9e-10 (0.80), infusion 1.3e-8 (2.4); the
+/// lag-3 cells 1.2e-9, 7.9e-9 and 3.0e-9, which do not take the split. The bound sits 7.5×
+/// over the worst and 6 orders under the defect.
 #[test]
 fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
-    for (lag, pk) in [
-        (3.0, "one_cpt_iv(cl=CL, v=V"),
-        (15.0, "one_cpt_iv(cl=CL, v=V"),
-        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2"),
-        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2"),
+    for (lag, pk, rate) in [
+        (3.0, "one_cpt_iv(cl=CL, v=V", 0.0),
+        (15.0, "one_cpt_iv(cl=CL, v=V", 0.0),
+        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", 0.0),
+        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", 0.0),
+        (15.0, "two_cpt_iv(cl=CL, v1=V, q=8.0, v2=30.0", 0.0),
+        (3.0, "one_cpt_iv(cl=CL, v=V", 150.0),
+        (15.0, "one_cpt_iv(cl=CL, v=V", 150.0),
     ] {
         let model = parse_model_string(&format!(
             "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
@@ -6935,12 +6943,13 @@ fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
         .unwrap();
         let s = subject(
             &model,
-            vec![DoseEvent::new(0.0, 600.0, 1, 0.0, true, 12.0)],
+            vec![DoseEvent::new(0.0, 600.0, 1, rate, true, 12.0)],
             &[1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 13.0, 14.5, 16.0, 20.0, 26.0],
             &[0.1, -0.1],
         );
         let worst = fd_oracle(&model, &s, true);
-        assert!(worst < 1e-8, "{pk} lag {lag}: worst relative difference {worst:.2e}");
+        eprintln!("{pk} lag {lag} rate {rate}: worst {worst:.2e}");
+        assert!(worst < 1e-7, "{pk} lag {lag} rate {rate}: worst relative difference {worst:.2e}");
     }
 }
 

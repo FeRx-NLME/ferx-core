@@ -82,10 +82,11 @@ fn prog_covers_required_pk_slots(
 }
 
 /// Elapsed time since a dose's *lagged* arrival, as a dual carrying the lagtime
-/// sensitivity (`∂elapsed/∂lagtime = −1`). Mirrors `crate::pk::predict_concentration`:
-/// the dose contributes from `dose.time + lagtime` onward, and a steady-state
-/// dose additionally shows its pre-arrival tail (the previous interval's pulse)
-/// by wrapping the negative elapsed time up into `[0, II)`. Returns `None` when
+/// sensitivity (`∂elapsed/∂lagtime = −1`). For `lag ≤ II` this mirrors
+/// `crate::pk::predict_concentration`: the dose contributes from `dose.time + lagtime`
+/// onward, and a steady-state dose additionally shows its pre-arrival tail (the previous
+/// interval's pulse) by wrapping the negative elapsed time up into `[0, II)`. The depot
+/// amounts keep this wrap for every lag (#3028); the concentrations leave it at `lag > II`. Returns `None` when
 /// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
 /// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
 ///
@@ -132,8 +133,11 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 fn ss_lag_past_ii<T: PkNum>(
     dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T,
 ) -> Option<(T, Option<T>)> {
-    use crate::sens::num::BranchCmp as B;
-    if !(dose.ss && dose.ii > 0.0 && t_obs >= dose.time && lag_d.br_cmp_c(B::Gt, dose.ii)) {
+    if !(dose.ss
+        && dose.ii > 0.0
+        && t_obs >= dose.time
+        && !crate::dosing::ss_arrival_is_trough_g(dose, lag_d))
+    {
         return None;
     }
     let since = T::from_f64(t_obs - dose.time);
