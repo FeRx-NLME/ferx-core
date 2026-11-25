@@ -1339,17 +1339,14 @@ impl ProfileCtx<'_> {
             self.options.inner_restarts,
             // Every `Some` start is a solve's modes (`ProfileWarm::from_solve`, the step's and
             // held re-solve's, the covariance step's from the fit's EBEs), so an exactly-zero
-            // one is warm, not the cold placeholder (#2691, #2899).
+            // one is warm, not the cold placeholder (#2691, #2899). A `None` start is cold
+            // whatever the kind (`is_warm_start`).
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
                 unseeded_iov_warm: true,
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
             }
-            .with_prev_etas(if warm.etas.is_some() {
-                PrevEtas::Solved
-            } else {
-                PrevEtas::Placeholder
-            }),
+            .with_prev_etas(PrevEtas::Solved),
             None,
             |subject, ebe| {
                 (
