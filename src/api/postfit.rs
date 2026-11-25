@@ -2601,8 +2601,8 @@ fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
 /// same cutoff, and shown as its raw `nll`: a raw term of `6e13` makes a `1.2e14`
 /// contribution and is named.
 ///
-/// The contributions are always the post-hoc FOCE/FOCEI score (`source`). When the
-/// objective is not their sum (see [`ContributionSource`]), the sentence says so after
+/// The contributions are the post-hoc FOCE/FOCEI score, or a quadrature objective's own
+/// term (`source`). When the objective is not their sum (see [`ContributionSource`]), the sentence says so after
 /// the list. An unusable parameter-prior penalty — a population-level term no subject
 /// carries — is named after the list too. And when no subject qualifies, the warning
 /// says why rather than ending silently (#2267), in the first of these that holds:

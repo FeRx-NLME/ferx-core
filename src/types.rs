@@ -6995,6 +6995,9 @@ pub struct SubjectResult {
     /// See [`crate::stats::npde::SubjectNpde::pwres`].
     #[serde(default)]
     pub pwres: Vec<f64>,
+    /// The subject's term of the published objective: its quadrature term under `laplace` and
+    /// AGQ (#3149), else the post-hoc FOCE/FOCEI score at its EBEs, which sums to the OFV only
+    /// for those marginals (not `bayes`, a mixture, or SAEM/IMP readouts of another objective).
     pub ofv_contribution: f64,
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).

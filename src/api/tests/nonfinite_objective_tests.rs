@@ -2049,8 +2049,8 @@ fn the_sentence_names_the_term_that_failed() {
 /// are named, with node count and mixture.
 ///
 /// Mutation (run): drop any clause of `same` → its row fires; drop the BAYES or mixture
-/// suffix, or the `n_agq` suffix of the quadrature `score` → its row fires; go back to a FOCE-family method list → the
-/// SAEM/IMP/IMPMAP/VI rows fire.
+/// suffix, or the `n_agq` suffix of the quadrature `score` → its row fires; go back to a
+/// FOCE-family method list → the SAEM/IMP/IMPMAP/VI rows fire.
 #[test]
 fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
     use EstimationMethod::*;
@@ -2151,9 +2151,9 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
     assert_eq!(
         nobody.strip_prefix(&msg).expect("kept"),
         " No subject can be named: every subject's post-hoc FOCEI contribution at these \
-         estimates is usable, but the BAYES posterior-mean objective is not their sum and ferx does not \
-         split it by subject, so these scores cannot locate its failure; their sum (24.68) \
-         is usable."
+         estimates is usable, but the BAYES posterior-mean objective is not their sum and \
+         ferx does not split it by subject, so these scores cannot locate its failure; their \
+         sum (24.68) is usable."
     );
     // The other side of the sum (review r6): scores each usable whose sum is past the
     // cutoff are reported as such, not as evidence the failure is the objective's own.
@@ -2239,8 +2239,8 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         listed.ends_with(
             "B (contribution 2e20, every observation's likelihood term usable on its own; \
              every IPRED and PRED finite). These are post-hoc FOCEI \
-             contributions at the EBEs, not terms of the BAYES posterior-mean objective, which ferx does \
-             not split by subject."
+             contributions at the EBEs, not terms of the BAYES posterior-mean objective, which \
+             ferx does not split by subject."
         ),
         "{listed}"
     );
