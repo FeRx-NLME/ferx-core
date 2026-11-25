@@ -936,9 +936,10 @@ pub(crate) fn foce_f<T: PkNum>(
     let res: Vec<T> = quant.iter().map(|&j| c(ctx.subject.observations[j]) - f0[j]).collect();
     let nq = quant.len();
     // Woodbury on a diagonal `R⁰` is a subtractive identity, accurate to `≈ eps·(1 + tr S)`
-    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is on the variance
-    // floor while its `G` is O(1) (FOCE's `R⁰` is taken at η = 0, `G` at η̂) drives
-    // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
+    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is tiny next to its
+    // `G` (a near-zero typical prediction under proportional error, with `G` O(1): FOCE's `R⁰`
+    // is taken at η = 0, `G` at η̂) drives `1 + tr S` to ~1e11 and the correction loses every
+    // digit (#1498): above
     // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, the rows are rotated into
     // `I + S` instead. A dense `R⁰` factors `R̃` at observation size.
     let woodbury = rm.is_none() && {

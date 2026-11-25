@@ -1830,6 +1830,12 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
 }
 
 impl Recording {
+    /// The recorded program's length: what a structural test of a kernel's cost reads.
+    #[cfg(test)]
+    pub(crate) fn n_ops(&self) -> usize {
+        self.code.len()
+    }
+
     /// Whether every register's recorded value was finite: the point is one the value path can
     /// score (a plan that does not serve at its own point says something about the plan only
     /// then).
