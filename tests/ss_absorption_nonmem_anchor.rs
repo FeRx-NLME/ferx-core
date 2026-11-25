@@ -320,6 +320,33 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
     );
 }
 
+/// The negative twin of the test above (#1522): the same model after two outer iterations. The
+/// search leaves the start, where `VMAX = 10` is below the mean input `100/8`, for estimates
+/// whose `VMAX` is above it, so they have a steady state and the fit reports no note, though
+/// the first probes of its search had none. Together the pair straddles the gate (start
+/// without a steady state, estimates with one); reporting the run's sink instead of the pass at
+/// the estimates fails this one. The `VMAX` assertion keeps the straddle from turning into a
+/// tautology if two iterations stop travelling that far.
+#[test]
+fn fit_reports_no_ss_note_when_its_estimates_have_a_steady_state() {
+    let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+    let mut opts = parsed.fit_options;
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &opts)
+        .expect("fit returns Ok");
+
+    assert!(result.theta[0] > 100.0 / 8.0, "VMAX {} has no steady state", result.theta[0]);
+    assert!(
+        !has_ss_note(&result.warnings),
+        "the estimates have a steady state, so the fit reports none; got: {:?}",
+        result.warnings
+    );
+}
+
 /// #2067: the SS non-convergence notes are per run, so two fits started together (the lanes of
 /// a model search) each report exactly the notes of their own serial run. Before, one global set
 /// was cleared and drained by both, and one fit reported the other's notes (6 + 5 in 20 of 20
