@@ -114,8 +114,11 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 fn ss_lag_past_ii<T: PkNum>(
     dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T,
 ) -> Option<(T, Option<T>)> {
-    use crate::sens::num::BranchCmp as B;
-    if !(dose.ss && dose.ii > 0.0 && t_obs >= dose.time && lag_d.br_cmp_c(B::Gt, dose.ii)) {
+    if !(dose.ss
+        && dose.ii > 0.0
+        && t_obs >= dose.time
+        && !crate::dosing::ss_arrival_is_trough_g(dose, lag_d))
+    {
         return None;
     }
     let since = T::from_f64(t_obs - dose.time);
