@@ -72,6 +72,7 @@ fn diagnostics(bloq: BloqMethod, cens: Vec<i8>) -> SubjectResult {
         &[Vec::new()],
         true,
         None,
+        None,
         false,
     );
     subjects.pop().expect("one subject")

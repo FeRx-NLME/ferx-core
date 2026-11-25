@@ -48,7 +48,7 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `NPDE`, `NPD` | Simulation-based normalized prediction (distribution) errors; only with `npde_nsim > 0` |
 | `EPRED` | Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation; only with `npde_nsim > 0` |
 | `EWRES`, `PWRES` | Monte-Carlo population-weighted residual `Σ_sim^(-1/2)(y − EPRED)`, one value under its NONMEM and its Monolix name; only with `npde_nsim > 0` |
-| `EBE_OFV` | Each subject's contribution to the total OFV |
+| `EBE_OFV` | Each subject's contribution to the total OFV (they sum to it, except under `bayes` and a mixture: see [warnings](warnings.qmd#contributions-from-another-objective)) |
 | `N_OBS` | Number of observations for the subject |
 | `TAFD` | Time after first dose |
 | `TAD` | Time after most recent dose (SS-aware) |

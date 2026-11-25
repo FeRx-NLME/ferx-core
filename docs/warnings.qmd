@@ -719,26 +719,27 @@ be named (#2267), with the first of these that applies:
 
 #### Contributions from another objective
 
-The contributions are always the post-hoc FOCE/FOCEI score at the EBEs, and ferx
-classifies the objective by what was published rather than by the method name.
-FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP and VI's
+Under Laplace and adaptive quadrature (`n_agq > 1`, including an `agq_eval_only`
+readout) each contribution is the subject's own quadrature term, so they sum to the
+objective (#3149). Otherwise they are the post-hoc FOCE/FOCEI score at the EBEs,
+and ferx classifies the objective by what was published rather than by the method
+name. FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP and VI's
 `vi_final_ofv = laplace` all publish the sum of these same scores. The ones that
-do not are Laplace and adaptive quadrature (`n_agq > 1`, including an
-`agq_eval_only` readout), BAYES (whose `ofv` is a joint NLL at the posterior
-mean), and a mixture's class-marginal (#2267). After a list of named subjects
-the warning then adds:
+do not are BAYES (whose `ofv` is a joint NLL at the posterior mean) and a
+mixture's class-marginal (#2267). After a list of named subjects the warning then
+adds:
 
 ```text
-These are post-hoc FOCEI contributions at the EBEs, not terms of the LAPLACE
-objective, which ferx does not split by subject.
+These are post-hoc FOCEI contributions at the EBEs, not terms of the BAYES
+posterior-mean objective, which ferx does not split by subject.
 ```
 
 When no subject is named, such an objective gives:
 
 ```text
 No subject can be named: every subject's post-hoc FOCEI contribution at these
-estimates is usable, but the LAPLACE objective is not their sum and ferx does not
-split it by subject, so these scores cannot locate its failure; their sum (24.68)
+estimates is usable, but the BAYES posterior-mean objective is not their sum and
+ferx does not split it by subject, so these scores cannot locate its failure; their sum (24.68)
 is usable.
 ```
 
@@ -747,7 +748,8 @@ themselves (`...is past the cutoff as well`), so neither case says the failure
 is in a part of the objective the scores do not share.
 
 The structured warning's `details` record this as `contribution_score`
-(`"FOCE"` or `"FOCEI"`, the marginal the contributions score),
+(`"FOCE"`, `"FOCEI"`, or the quadrature objective's name such as `"LAPLACE"`:
+what the contributions score),
 `contributions_are_objective_terms` (`false` for such an objective) and
 `ofv_prior`; `unusable_subjects` is then present and may be empty. Each subject's
 `failed_terms` lists the terms named in the message as `{term, nll}` objects, `nll`

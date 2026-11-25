@@ -586,6 +586,9 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// OFV) for every subject the fit assigned to another class. For the same reason
 /// the subject's Ω and Σ are its class's (`mixture::class_params`), not the base.
 ///
+/// `agq` is the published objective's `(n_agq, anchor)` when it is a quadrature one: the
+/// OFV contribution is then that objective's term ([`ContributionSource`]).
+///
 /// # Parallel over subjects, and why the stats come back as a value (#1329)
 ///
 /// Each subject is independent — one prediction sweep, no cross-subject term and
@@ -610,7 +613,7 @@ pub(crate) fn compute_subject_results(
     model: &CompiledModel, population: &Population, params: &ModelParameters,
     eta_hats: &[DVector<f64>], h_matrices: &[DMatrix<f64>],
     kappas_per_subject: &[Vec<DVector<f64>>], interaction: bool, mixest: Option<&[usize]>,
-    collect_solver_stats: bool,
+    agq: Option<(usize, crate::types::HessianAnchor)>, collect_solver_stats: bool,
 ) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
     let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> =
         crate::par::map(population.subjects.len(), |i| {
@@ -805,8 +808,19 @@ pub(crate) fn compute_subject_results(
                 }
             };
 
-            // OFV contribution
-            let ofv_i = if !kappas.is_empty() {
+            // OFV contribution: the quadrature objective's own term when it has one (#3149),
+            // so the contributions sum to its OFV; else the FOCE/FOCEI marginal.
+            let ofv_i = if let Some((n_agq, anchor)) = agq {
+                crate::estimation::agq::agq_subject_term(
+                    model,
+                    subject,
+                    params,
+                    eta.as_slice(),
+                    kappas,
+                    n_agq,
+                    anchor,
+                )
+            } else if !kappas.is_empty() {
                 match &iov_lin {
                     Some(lin) => foce_subject_nll_iov_linearized(
                         model,
@@ -2359,16 +2373,17 @@ pub(crate) struct ContributionTerm {
 /// What `SubjectResult::ofv_contribution` is, relative to the objective
 /// `W_NONFINITE_OBJECTIVE` gated (#2267).
 ///
-/// `compute_subject_results` always scores the post-hoc FOCE or FOCEI marginal
-/// (`foce_subject_nll_cov` / the IOV form), under the fitted class for a mixture. The
-/// published objective is classified by what it *is*, not by the estimator's name: FOCE,
-/// FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP (estimating or `imp_eval_only`
-/// standalone) and VI's `vi_final_ofv = laplace` all publish `2·pop_nll` — the sum of
-/// these same scores at the same EBEs. Only three objectives are something else, and
-/// can be unusable while every score is usable or the reverse:
+/// `compute_subject_results` scores a quadrature objective — `laplace` at any `n_agq`,
+/// `focei` with `n_agq > 1`, an `agq_eval_only` readout included — with its own term
+/// (`agq_subject_term`, #3149), and every other one with the post-hoc FOCE or FOCEI
+/// marginal (`foce_subject_nll_cov` / the IOV form), under the fitted class for a
+/// mixture. The published objective is classified by what it *is*, not by the
+/// estimator's name: FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP
+/// (estimating or `imp_eval_only` standalone) and VI's `vi_final_ofv = laplace` all
+/// publish `2·pop_nll` — the sum of these same scores at the same EBEs. Only two
+/// objectives are something else, and can be unusable while every score is usable or
+/// the reverse:
 ///
-/// * quadrature — `laplace` at any `n_agq` (its exact-Hessian anchor already differs
-///   at one node) and `focei` with `n_agq > 1`, including an `agq_eval_only` readout;
 /// * `bayes`, whose `ofv` is `2·Σ` joint NLL at the posterior mean, not a marginal;
 /// * a mixture, whose objective is the class-marginal.
 ///
@@ -2377,8 +2392,8 @@ pub(crate) struct ContributionTerm {
 /// objective, a population-level term no subject carries.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContributionSource {
-    /// `"FOCE"` or `"FOCEI"`: the marginal each contribution scores.
-    pub(crate) score: &'static str,
+    /// `"FOCE"`, `"FOCEI"` or the quadrature objective's name: what each contribution scores.
+    pub(crate) score: String,
     /// The objective's name when the contributions are not its terms, else `None`.
     pub(crate) objective: Option<String>,
     /// The parameter-prior penalty in the gated objective (`ofv_prior`; `0` unpriored).
@@ -2392,26 +2407,26 @@ impl ContributionSource {
     pub(crate) fn of(
         method: EstimationMethod, options: &FitOptions, mixture: bool, prior: f64,
     ) -> Self {
-        let score = if options.interaction { "FOCEI" } else { "FOCE" };
         let agq = FitOptions::agq_nodes_for(method, options.n_agq);
-        let same = agq.is_none()
-            && method != EstimationMethod::Bayes
+        let mut name = method.label().to_string();
+        if let Some(n) = agq.filter(|&n| n > 1) {
+            name = format!("{name} (n_agq = {n})");
+        }
+        if method == EstimationMethod::Bayes {
+            name.push_str(" posterior-mean");
+        }
+        if mixture {
+            name.push_str(" mixture");
+        }
+        // A non-mixture quadrature objective is scored with its own term (#3149).
+        if agq.is_some() && !mixture {
+            return Self { score: name, objective: None, prior };
+        }
+        let same = method != EstimationMethod::Bayes
             && !mixture
             && crate::types::interaction_for(method, options.interaction) == options.interaction;
-        let objective = (!same).then(|| {
-            let mut name = method.label().to_string();
-            if let Some(n) = agq.filter(|&n| n > 1) {
-                name = format!("{name} (n_agq = {n})");
-            }
-            if method == EstimationMethod::Bayes {
-                name.push_str(" posterior-mean");
-            }
-            if mixture {
-                name.push_str(" mixture");
-            }
-            name
-        });
-        Self { score, objective, prior }
+        let score = if options.interaction { "FOCEI" } else { "FOCE" }.to_string();
+        Self { score, objective: (!same).then_some(name), prior }
     }
 }
 
@@ -2737,9 +2752,11 @@ pub(crate) fn name_nonfinite_subjects(
     // largest contributions are where it comes from (#2265).
     let mut largest: Vec<&SubjectResult> = Vec::new();
     let full = if named.is_empty() {
-        let score = source.score;
+        let score = &source.score;
+        // A quadrature objective's contributions are its own terms, not a post-hoc score.
+        let post_hoc = if matches!(score.as_str(), "FOCE" | "FOCEI") { "post-hoc " } else { "" };
         let lead = format!(
-            "{msg} No subject can be named: every subject's post-hoc {score} contribution \
+            "{msg} No subject can be named: every subject's {post_hoc}{score} contribution \
              at these estimates is usable"
         );
         let prior = source.prior;

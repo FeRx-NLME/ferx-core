@@ -148,6 +148,7 @@ fn run(c: &Case, b: [f64; 3], interaction: bool) -> (Vec<f64>, Vec<f64>) {
         &kappas,
         interaction,
         None,
+        None,
         false,
     );
     let s = &subjects[0];
@@ -286,6 +287,7 @@ fn a_kappa_shape_mismatch_is_refused() {
             &h_eta,
             &kappas,
             interaction,
+            None,
             None,
             false,
         );
