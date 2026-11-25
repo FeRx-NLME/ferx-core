@@ -1,13 +1,14 @@
 ---
 pagetitle: "Model-development tools in ferx"
-description-meta: "The ferx-tools workflows that run many fits: bootstrap, GAM covariate screening, and the Pharmpy-style model-space searches (structural, IIV, IOV, residual error, covariates) up to automatic model development."
+description-meta: "The ferx workflows that run many fits: bootstrap, GAM covariate screening, and the Pharmpy-style model-space searches (structural, IIV, IOV, residual error, covariates) up to automatic model development."
 ---
 
 # Tools
 
 `ferx-core` fits one model to one dataset. Everything that calls `fit()` more
 than once — resampling, screening, searching a model space — lives in
-`ferx-tools` and is exposed as a `ferx <tool>` subcommand. Each tool carries a
+`ferx-tools` (bootstrap, GAM screening) or `ferx-search` (the model-space
+searches) and is exposed as a `ferx <tool>` subcommand. Each tool carries a
 maturity tag; see [Feature Maturity](../maturity.qmd) for what the tags mean.
 
 ## Uncertainty

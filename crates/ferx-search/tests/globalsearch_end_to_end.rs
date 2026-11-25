@@ -20,8 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
-use ferx_tools::globalsearch::{run_globalsearch, GlobalsearchResult, GlobalsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::globalsearch::{run_globalsearch, GlobalsearchResult, GlobalsearchRun};
+use ferx_search::search::SearchConfig;
 
 const DATA: &str = "../../data/two_cpt_oral_cov.csv";
 
@@ -100,7 +100,7 @@ fn every_grid_point_compiles_and_evaluates_and_a_dead_gene_is_fitted_once() {
     let mut fitted = 0usize;
     for r in &result.rows[1..] {
         let s = r.structure.unwrap();
-        let bolus_lag = s.absorption == ferx_tools::modelsearch::Absorption::Inst && s.lagtime;
+        let bolus_lag = s.absorption == ferx_search::modelsearch::Absorption::Inst && s.lagtime;
         if bolus_lag {
             // The one pair no template expresses: a row with the crash
             // value, never submitted.
@@ -119,7 +119,7 @@ fn every_grid_point_compiles_and_evaluates_and_a_dead_gene_is_fitted_once() {
         // applied, and the runner fitted the rendered model once — the
         // second genome is a duplicate of the first.
         let ka_gene = r.description.contains("KA-WT=exponential");
-        if s.absorption == ferx_tools::modelsearch::Absorption::Inst && ka_gene {
+        if s.absorption == ferx_search::modelsearch::Absorption::Inst && ka_gene {
             assert_eq!(r.non_influential, 1, "{}", r.id);
             assert!(r.duplicate_of.is_some(), "{}: {}", r.id, r.description);
             assert_eq!(r.seconds, 0.0);

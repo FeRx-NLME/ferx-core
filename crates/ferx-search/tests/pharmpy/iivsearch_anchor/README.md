@@ -3,7 +3,7 @@
 Pharmpy 2.2.0's `iivsearch`, driven by NONMEM 7.5.1, on a simulated
 one-compartment oral dataset whose variability structure has something to
 find: IIV on CL and V only, correlated, and none on KA. Exercised by
-`crates/ferx-tools/tests/iivsearch_pharmpy_anchor.rs` (slow-gated).
+`crates/ferx-search/tests/iivsearch_pharmpy_anchor.rs` (slow-gated).
 
 ## The data
 

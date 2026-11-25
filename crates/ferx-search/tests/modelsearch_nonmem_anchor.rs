@@ -52,10 +52,10 @@ use std::path::Path;
 
 use ferx_core::fit;
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_tools::modelsearch::{
+use ferx_search::modelsearch::{
     run_modelsearch, Absorption, Elimination, ModelsearchRun, Structure,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 const ANCHOR_DIR: &str = "tests/nonmem/modelsearch_anchor";
 

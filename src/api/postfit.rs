@@ -2118,7 +2118,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// diverged. An `Err(String)` carries one line of prose and deletes the rest.
 /// Nor is the sentinel case an error in any useful sense: a repelled fit has
 /// real, finite parameter estimates and is exactly the "scored but rejected"
-/// candidate `ferx-tools`' model-space search expects from
+/// candidate `ferx-search`'s model-space search expects from
 /// [`crate::model_selection::Strictness::require_converged`] — turning it into
 /// an exception would abort a search instead of stepping past one candidate.
 /// The place to *error* on this population is the front door, where

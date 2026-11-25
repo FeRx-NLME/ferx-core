@@ -21,8 +21,8 @@
 
 use std::path::Path;
 
-use ferx_tools::covsearch::{run_covsearch, CovsearchRun, Phase};
-use ferx_tools::search::SearchConfig;
+use ferx_search::covsearch::{run_covsearch, CovsearchRun, Phase};
+use ferx_search::search::SearchConfig;
 
 const ANCHOR_DIR: &str = "tests/psn/scm_anchor";
 
@@ -48,7 +48,7 @@ const PSN_BACKWARD: &[(&str, &str, f64)] = &[("CL", "CRCL", -703.38740), ("CL", 
 const OFV_TOL: f64 = 0.05;
 
 fn check_step(
-    result: &ferx_tools::covsearch::CovsearchResult, step: usize, phase: Phase,
+    result: &ferx_search::covsearch::CovsearchResult, step: usize, phase: Phase,
     expected: &[(&str, &str, f64)], selected: Option<(&str, &str)>,
 ) {
     let rows: Vec<_> = result.step_rows(step).collect();

@@ -11,8 +11,8 @@ categories = ["command-line-utilities", "science", "simulation"]
 
 # The installed binary keeps the name `ferx` — the package rename is invisible
 # to users. It lives here rather than in the `ferx-core` package because it will
-# grow `ferx-tools` subcommands (bootstrap, SCM), and `ferx-tools` depends on
-# `ferx-core`; a binary in `ferx-core` that called into tools would be a cycle.
+# grow `ferx-tools` and `ferx-search` subcommands, and both depend on `ferx-core`; a
+# binary in `ferx-core` that called into them would be a cycle.
 [[bin]]
 name = "ferx"
 path = "src/main.rs"
@@ -27,6 +27,7 @@ path = "src/main.rs"
 # `default = []`; `survival` is slated to become default-on).
 ferx-core = { path = "../..", version = "0.4.0", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
+ferx-search = { path = "../ferx-search", version = "0.4.0" }
 indicatif = "0.18.4"
 # The binary's global allocator (`src/main.rs`): an estimation allocates many small,
 # short-lived buffers per subject per evaluation. A binary-level choice; the `ferx-core`
@@ -35,7 +36,7 @@ indicatif = "0.18.4"
 # version with no diff here. v2 was chosen on measurement (#2435): as fast as v3 and
 # ~12 MB less resident memory on a 4-thread bootstrap.
 mimalloc = { version = "0.1", features = ["v2"] }
-# Matches the root package and `ferx-tools`: see the note there — floats must
+# Matches the root package and `ferx-search`: see the note there — floats must
 # reload as themselves, not to within 1 ULP.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 

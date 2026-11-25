@@ -25,8 +25,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ferx_tools::iivsearch::{run_iivsearch, IivsearchResult, IivsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::iivsearch::{run_iivsearch, IivsearchResult, IivsearchRun};
+use ferx_search::search::SearchConfig;
 
 const ANCHOR: &str = "tests/pharmpy/iivsearch_anchor";
 

@@ -17,7 +17,7 @@
 //!
 //! ```no_run
 //! use ferx_core::edit::ModelText;
-//! use ferx_tools::search::{Candidate, FeatureVector, RunOptions, Runner};
+//! use ferx_search::search::{Candidate, FeatureVector, RunOptions, Runner};
 //!
 //! # fn demo(base: &ModelText, data: &ferx_core::Population) -> Result<(), String> {
 //! let candidates = vec![

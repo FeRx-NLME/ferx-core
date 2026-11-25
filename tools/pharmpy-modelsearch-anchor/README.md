@@ -1,7 +1,7 @@
 # Pharmpy modelsearch anchor
 
 The external reference for ferx's structural-search candidate enumeration
-(`crates/ferx-tools/src/modelsearch/`, #1181). The three algorithms and the
+(`crates/ferx-search/src/modelsearch/`, #1181). The three algorithms and the
 rules for which feature may follow which are Pharmpy's
 (`pharmpy/tools/modelsearch/algorithms.py`), so Pharmpy's own workflow is the
 oracle: for every case in `dump.py`'s `CASES`, the script builds Pharmpy's
@@ -9,13 +9,13 @@ base model (`create_base_model`), filters the space against it
 (`filter_mfl_statements`), builds the algorithm's task graph **without fitting
 anything**, and records every `create_candidate` task with its feature set and
 its nearest candidate ancestors. The dump is committed as
-`crates/ferx-tools/tests/data/modelsearch_pharmpy_anchor.json` and replayed by
+`crates/ferx-search/tests/data/modelsearch_pharmpy_anchor.json` and replayed by
 the Tier-1 module `pharmpy_anchor.rs`, which runs the same cases through
 ferx's `search` on a fitter that returns one OFV for everything.
 
 ```bash
 tools/pharmpy-modelsearch-anchor/run.sh   # regenerate the JSON (needs docker + a Pharmpy image)
-cargo test -p ferx-tools --lib modelsearch::pharmpy_anchor
+cargo test -p ferx-search --lib modelsearch::pharmpy_anchor
 ```
 
 The container is only needed to *regenerate*; CI replays the committed JSON.

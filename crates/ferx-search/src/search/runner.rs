@@ -16,7 +16,7 @@
 //!   parallel and `fit()` already `par_iter`s over subjects, so a naive outer
 //!   `par_iter` nests two pools competing for the same workers. How wide each
 //!   level is comes from a [`PoolPlan`] (#1115); how many candidates are
-//!   *admitted* at that width comes from [`crate::lanes`] (#1329), because an
+//!   *admitted* at that width comes from [`ferx_tools::lanes`] (#1329), because an
 //!   outer `par_iter` bounds neither — a worker blocked on the inner pool's
 //!   `install` keeps stealing candidates, so the plan's width was an average and
 //!   not a ceiling. Both give the ferx worker stack rather than Rayon's 2 MiB
@@ -126,7 +126,7 @@ impl RunReport {
 /// cancellation flag.
 ///
 /// ```no_run
-/// use ferx_tools::search::{Candidate, RunOptions, Runner};
+/// use ferx_search::search::{Candidate, RunOptions, Runner};
 /// # fn demo(candidates: Vec<Candidate>, data: &ferx_core::Population) -> Result<(), String> {
 /// let report = Runner::new()
 ///     .threads(8)
@@ -445,7 +445,7 @@ impl Runner {
             // `plan.replicates()` is still the width; only the admission
             // changes, and results still come back in group order.
             let done: Vec<(usize, CandidateResult)> =
-                crate::lanes::run_in_lanes(plan.replicates(), group.len(), |k| {
+                ferx_tools::lanes::run_in_lanes(plan.replicates(), group.len(), |k| {
                     fit_one((group[k], plan.threads_per_fit()))
                 })?;
             fitted.extend(done);

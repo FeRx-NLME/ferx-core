@@ -39,7 +39,8 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 ├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
 └─ crates/
    ├─ ferx-tools/                # depends on ferx-core
-   ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   ├─ ferx-search/               # depends on ferx-tools and ferx-core
+   ├─ ferx-cli/                  # depends on all three; [[bin]] name = "ferx"
    ├─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
    └─ patterns-lint/             # dev tooling; test-code lints, depends only on `syn` (#2634)
 ```
@@ -58,12 +59,17 @@ the package under `crates/` breaks every local ferx-r build, and breaks it
 your branch.
 
 **Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
-many fits, resampling, model-space search. If it calls `fit()` more than once, it
-is a tool. Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM,
-VPC statistics) stay in core; orchestration of repeated fits goes to `ferx-tools`.
+many fits of a given model (bootstrap, GAM screening, the `run_in_lanes` fit
+queue). `ferx-search` = many fits over a space of models (the `.ferxsearch` layer
+and the search tools). If it calls `fit()` more than once, it is not core.
+Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM, VPC
+statistics) stay in core; orchestration of repeated fits goes to `ferx-tools` or
+`ferx-search`.
 `ferx-cli` is thin — argument parsing, printing, exit codes, no numerical or
-orchestration logic. The dependency is strictly one-way: `ferx-core` never
-depends on either member (pinned by `tests/public_api_boundary.rs`).
+orchestration logic. The dependency is strictly one-way: `ferx-search` →
+`ferx-tools` → `ferx-core`, and neither `ferx-tools` nor `ferx-core` ever depends
+on `ferx-search`, not even as a dev-dependency or through a re-export (#3185, pinned by
+`tests/public_api_boundary.rs`).
 
 **Widening the public API is a design step, not paperwork.** `api/ferx-core-public-api.txt`
 is a committed `cargo public-api` snapshot; the `Public API baseline` CI job
@@ -83,8 +89,8 @@ existing surface does not suffice. Two rules make this stick:
   gate — which is why `tests/public_api_boundary.rs` bans it outright. An item is
   either public API (documented, in the baseline, usable from ferx-r) or it stays
   `pub(crate)` and the caller does without.
-- **The ferx-r reachability test.** Anything `ferx-tools` needs must also be
-  reachable from ferx-r, which consumes `ferx-core` as an ordinary external
+- **The ferx-r reachability test.** Anything `ferx-tools` or `ferx-search` needs must also
+  be reachable from ferx-r, which consumes `ferx-core` as an ordinary external
   crate. An API that only makes sense "because we're in the same workspace" is
   the wrong API.
 
@@ -631,8 +637,8 @@ Two gates: `tools/changelog.sh check` (the `changelog` group of
 `tools/preflight.sh`, CI job `Changelog`) validates every fragment's name and
 shape and fails if anything is written under `## [Unreleased]`; and the
 `Changelog fragment` workflow fails a PR that changes `src/`,
-`crates/ferx-cli/` or `crates/ferx-tools/` (test files excluded) without adding
-a fragment. A PR that only touches internal refactors, tests, or CI needs no
+`crates/ferx-cli/`, `crates/ferx-tools/` or `crates/ferx-search/` (test files
+excluded) without adding a fragment. A PR that only touches internal refactors, tests, or CI needs no
 fragment — apply the **`no-changelog`** label. The same workflow fails a PR that
 deletes (or renames away) another PR's pending fragment, label or not; rewording
 one is fine. Only `assemble` removes fragments.

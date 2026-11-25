@@ -16,8 +16,8 @@
 
 use std::path::{Path, PathBuf};
 
-use ferx_tools::ruvsearch::{run_ruvsearch, Family, RuvFeature, RuvsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::ruvsearch::{run_ruvsearch, Family, RuvFeature, RuvsearchRun};
+use ferx_search::search::SearchConfig;
 
 const ANCHOR: &str = "tests/pharmpy/ruvsearch_anchor";
 
