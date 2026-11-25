@@ -1863,9 +1863,7 @@ pub fn predict_concentration(
             // from the preceding pulse is `t − dose.time + p`, `p = max(II − lagtime, 0)`:
             // it CLAMPS for `lagtime ≥ II` (NONMEM 7.6.0, `crate::dosing::ss_seed_phase`).
             let tau = t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime);
-            if tau >= 0.0 {
-                conc += single_dose_concentration(pk_model, dose, tau, pk_params);
-            }
+            conc += single_dose_concentration(pk_model, dose, tau, pk_params);
         }
     }
     // Floor at zero, but preserve `NaN` (`f64::max` would discard it, #1284, #1399
