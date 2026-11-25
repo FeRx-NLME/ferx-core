@@ -74,6 +74,7 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 /// | analytical | either or both | empty → NaN | `_TV_ANALYTICAL` |
 /// | ODE | neither (a reset, or an `[odes]` RHS reading time, keeps one snapshot) | exact | — |
 /// | ODE | either or both | disposition frozen at the first observation | `_TV_ODE` |
+/// | ODE twin of a closed-form transit/IG | any | empty → NaN | `_TWIN_ANALYTICAL` |
 ///
 /// The analytical row's `TIME` column asks [`pk::model_uses_time_anywhere`], the
 /// predicate its state routing asks; the ODE row's asks

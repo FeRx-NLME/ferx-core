@@ -545,12 +545,13 @@ pub(crate) fn compute_extra_output_columns(
                                 // with an all-NaN column.
                                 //
                                 // Nor is `compute_predictions_with_states` a precedent
-                                // for widening: its ODE branch has two arms and *both*
-                                // return populated states — `uses_time` routes to
+                                // for widening: its ODE branch returns populated states
+                                // for an `[odes]` model (`uses_time` routes to
                                 // `ode_predictions_event_driven_with_states`, which
-                                // still computes states via `ode_dense_solve_states`.
-                                // The `vec![]` convention lives only in its analytical
-                                // branch. Widening here would make a `[derived]`
+                                // still computes states via `ode_dense_solve_states`),
+                                // and empty states only for a twin-served closed-form
+                                // subject (#1580), whose twin states have the wrong
+                                // layout. Widening here would make a `[derived]`
                                 // integral NaN while the adjacent per-obs
                                 // `compartments[i]` column stayed finite.
                                 vec![]
