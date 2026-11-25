@@ -312,12 +312,27 @@ fn record_body(
     )
 }
 
-/// Record one ODE segment (see the module docs): the bodies, a value-only run for the
-/// record-time outputs, and the call in the outer recording. A recording that fails (a body that
-/// cannot be recorded, a run that does not complete) returns the entry state, never `None`: the
-/// caller would integrate the segment over the recording type, up to `ode_max_steps` steps.
+/// [`record_segment_bodies`], with a failed recording answered by the entry state at every time and
+/// never `None`: `None` makes the caller integrate the segment over the recording type, a loop of
+/// up to `ode_max_steps` steps recorded into a recording that is discarded (#3161).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_segment(
+    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), u0: &[Tr], t_span: (f64, f64), params: &[Tr],
+    saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, auto: &mut sol::OdeAutoSwitchState,
+) -> Option<(Vec<SolPointG<Tr>>, Vec<SolPointG<Tr>>)> {
+    record_segment_bodies(rhs, u0, t_span, params, saveat, interp_at, opts, auto).or_else(|| {
+        let at = |ts: &[f64]| -> Vec<SolPointG<Tr>> {
+            ts.iter().map(|&t| SolPointG { t, u: u0.to_vec() }).collect()
+        };
+        Some((at(saveat), at(interp_at)))
+    })
+}
+
+/// Record one ODE segment (see the module docs): the bodies, a value-only run for the
+/// record-time outputs, and the call in the outer recording. `None` — the recording fails — if
+/// a body cannot be recorded or the run does not complete.
+#[allow(clippy::too_many_arguments)]
+fn record_segment_bodies(
     rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), u0: &[Tr], t_span: (f64, f64), params: &[Tr],
     saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, auto: &mut sol::OdeAutoSwitchState,
 ) -> Option<(Vec<SolPointG<Tr>>, Vec<SolPointG<Tr>>)> {
@@ -325,18 +340,13 @@ pub(super) fn record_segment(
     // The span the walk named, when its ends depend on the inputs.
     let span = <Tr as crate::sens::num::RecHooks>::take_span()
         .filter(|(a, b)| (a.v, b.v) == t_span && (a.dep || b.dep));
-    // A recording that has failed is discarded whatever it records next (`end` keeps the first
-    // reason): the entry state at every time, rather than bodies nothing will run. Never `None`
-    // for that: the caller would then integrate the segment over the recording type, a loop of up
-    // to `ode_max_steps` steps recorded for nothing.
-    let entry = || {
+    // A recording that has already failed is discarded whatever it records next (`end` keeps
+    // the first reason): the entry state at every time, rather than bodies nothing will run.
+    if rec(|r| r.failed.is_some()) {
         let at = |ts: &[f64]| -> Vec<SolPointG<Tr>> {
             ts.iter().map(|&t| SolPointG { t, u: u0.to_vec() }).collect()
         };
-        Some((at(saveat), at(interp_at)))
-    };
-    if rec(|r| r.failed.is_some()) {
-        return entry();
+        return Some((at(saveat), at(interp_at)));
     }
     // A certified-linear segment the exact path declined is integrated as `auto`.
     let opts = if opts.method == OdeMethod::Linear { opts.for_integration() } else { *opts };
@@ -470,7 +480,7 @@ pub(super) fn record_segment(
         methods.push(MethodBodies { method: m, c, cl, start, step, accept, forced });
     }
     if rec(|r| r.failed.is_some()) {
-        return entry();
+        return None;
     }
     // A moving end is one more capture: no body reads it, the driver does.
     let mut span_caps = [None, None];
@@ -511,7 +521,7 @@ pub(super) fn record_segment(
     // is this point's.
     let Some(kernels) = LoopKernels::resolve(&spec, Layout::F64, Sweep::Forward) else {
         fail_subject("an ODE segment has no kernels");
-        return entry();
+        return None;
     };
     let ran = run_loop(&spec, &kernels, 1, &inputs, &mut out, auto, None);
     if !ran {
@@ -530,7 +540,7 @@ pub(super) fn record_segment(
             });
         }
         fail_here("an ODE segment's record-time run failed");
-        return entry();
+        return None;
     }
     // The call.
     let id = rec(|r| {
