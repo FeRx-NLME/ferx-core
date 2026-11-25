@@ -1098,8 +1098,8 @@ const ODE_MOVING_JUMP_SWITCH: &str = r#"
 /// earlier fixture with a record at 4 h had its EBE settle on that kink, crossing at
 /// 4.0000000001, where central FD averages two one-sided slopes.
 fn moving_jump_fixture(ct: f64) -> (CompiledModel, Subject) {
-    // At reltol 1e-12: the oracle's gap measured 5.9e-4, 1.9e-5 and 3.2e-7 at reltol 1e-8,
-    // 1e-10 and 1e-12, the integrator's error, falling with its tolerance to the FD floor.
+    // 1e-12 is the tolerance the adjoint is tested at; the gradient test's oracle runs tighter,
+    // see there for its figures.
     moving_jump_fixture_at(ct, 1e-12, 1e-14)
 }
 
@@ -1151,21 +1151,25 @@ fn ode_jumping_moving_switch_on_an_observed_state_matches_reconverged_fd() {
     assert!(in_scope(&model, &s), "the exact gradient must serve it");
     // The adjoint at the fixture's reltol 1e-12; the oracle's reconverged difference at 1e-13,
     // where its own integration error is below the bound (#3043). At 1e-12 that error alone read
-    // 1.14e-6 on macOS arm64 against 1.2e-7 on Linux x86_64, while the adjoint is the same to 11
-    // digits from reltol 1e-10 to 1e-14.
+    // 1.14e-6 on macOS arm64 (past the bound) but 5.3e-7 on Linux x86_64 (under it), so the
+    // tolerance is asserted: Linux cannot see a fixture collapsed back to 1e-12 by its value.
+    // The adjoint is the same to 11 digits from reltol 1e-10 to 1e-14.
     let oracle = |ct| moving_jump_fixture_at(ct, 1e-13, 1e-15).0;
+    let reltol = |m: &CompiledModel| m.ode_spec.as_ref().unwrap().solver_opts.reltol;
+    assert!(reltol(&oracle(3.0)) < reltol(&model), "the oracle must be tighter than the model");
     let worst = fd_oracle_on(&model, &oracle(3.0), &s, true);
     eprintln!("jumping switch, crossing: worst {worst:.3e}");
-    // Measured 3.3e-8 on macOS arm64, about 30x headroom. Mutations, measured with both at
-    // reltol 1e-12 on Linux x86_64: no jump 2.9e2, no event location 1.15, one chord step 3.1e-3
-    // (3.1e-3 again at this oracle, macOS), the forced arm dropped from the locating steps 1.7e-4.
+    // Measured 2.6e-8 on Linux x86_64, about 38x headroom (3.3e-8 on macOS arm64). Mutations,
+    // measured with both at reltol 1e-12 on Linux x86_64: no jump 2.9e2, no event location 1.15,
+    // one chord step 3.1e-3 (3.1e-3 again at this oracle, macOS), the forced arm dropped from the
+    // locating steps 1.7e-4.
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
 
     let (control, cs) = moving_jump_fixture(0.001);
     assert_eq!(threshold_crossings(&control, &cs), 0, "the control crosses");
     let worst = fd_oracle_on(&control, &oracle(0.001), &cs, true);
     eprintln!("jumping switch, control: worst {worst:.3e}");
-    // Measured 2.4e-8 on macOS arm64.
+    // Measured 2.4e-8 on Linux x86_64, about 43x headroom (2.4e-8 on macOS arm64).
     assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
 }
 
