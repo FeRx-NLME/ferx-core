@@ -313,8 +313,9 @@ fn record_body(
 }
 
 /// Record one ODE segment (see the module docs): the bodies, a value-only run for the
-/// record-time outputs, and the call in the outer recording. `None` — the recording fails — if
-/// a body cannot be recorded or the run does not complete.
+/// record-time outputs, and the call in the outer recording. A recording that fails (a body that
+/// cannot be recorded, a run that does not complete) returns the entry state, never `None`: the
+/// caller would integrate the segment over the recording type, up to `ode_max_steps` steps.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_segment(
     rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]), u0: &[Tr], t_span: (f64, f64), params: &[Tr],

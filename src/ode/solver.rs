@@ -1160,7 +1160,7 @@ struct Switches<'a, 'r, T: PkNum> {
 
 impl<T: PkNum> Switches<'_, '_, T> {
     /// The functions at `(u, t)`.
-    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
     fn g(&mut self, u: &[T], t: f64) -> Vec<f64> {
         let (n, k) = (self.n, self.k);
         let mut out = vec![0.0; k];
@@ -1897,7 +1897,7 @@ impl<T: PkNum> Rk45Stepper<T> {
     /// step sequence must not depend on derivative components.
     #[allow(clippy::needless_range_loop)]
     #[inline(always)]
-    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
     fn err_norm_len(&self, n: usize, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
         let blocks = self.blocks_n(n);
         let u = &u[..n];
@@ -2043,7 +2043,7 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         true
     }
 
-    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
     fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
         let blocks = self.blocks_n(self.n);
         rk45_stiffness(self.n, |b, i| blocks[b][i].plain(), dt)
@@ -2241,7 +2241,7 @@ fn interp_idx_due(interp_at: &[f64], idx: usize, t_new: f64) -> bool {
 /// from the state already integrated (#1080 Part C). `method` is the starting choice — the
 /// segment-start probe's verdict, or the named method, which is never switched away from.
 #[allow(clippy::too_many_arguments)]
-/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
 fn integrate_dense_g<T: PkNum>(
     method: OdeMethod, rhs: &RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T],
     saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions,
@@ -3717,7 +3717,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
 
 /// Whether every saved state is finite, reading values only (`T = Dual2` decides identically
 /// to `T = f64`, which is what keeps the two paths on the same stepper).
-/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code.
 fn finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
     points.iter().all(|p| p.u.iter().all(|v| v.plain().is_finite()))
 }
