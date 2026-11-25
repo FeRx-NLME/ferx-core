@@ -207,8 +207,8 @@ fn dedup_breaks_keeping_records(
 /// read post-dose (#2534). The adjoint's `integrate_g` and the EKF still match by the band:
 /// they apply no lag (`plain_walk_subject_supported` routes a lag to the event-driven walk;
 /// the EKF ignores one under `W_SDE_LAGTIME`), and an infusion end or route onset there
-/// leaves the state unchanged, so [`band_read_state`] already reads the trough pre-dose. Resets go through it with the real
-/// `t_next` in `apply_segment_boundary` (#2141).
+/// leaves the state unchanged, so [`band_read_state`] already reads the trough pre-dose.
+/// Resets go through it with the real `t_next` in `apply_segment_boundary` (#2141).
 #[inline]
 pub(crate) fn event_on_break(t_event: f64, t_break: f64, t_next: f64) -> bool {
     (t_event - t_break).abs() < EVENT_MATCH_TOL && t_event < t_next

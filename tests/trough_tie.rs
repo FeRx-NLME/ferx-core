@@ -445,9 +445,12 @@ fn assert_legs(legs: &[(&str, Vec<f64>)], want: &[f64], bound: f64) {
 }
 
 /// The two walks that still match a dose by the band alone (`integrate_g`, the EKF; see
-/// `event_on_break`) on the infusion-end tie, IDs 1 / 2 of the anchor: a no-lag twin goes to
-/// the static dual walk, and an SDE twin to the EKF, whose state mean is the ODE's. Both
-/// read the trough pre-dose. Measured worst error 5.7e-14 (dual) and 1.5e-11 (EKF).
+/// `event_on_break`) on the infusion-end tie, IDs 1 / 2 of the anchor. A no-lag twin goes to
+/// the static dual walk. An SDE twin reaches the EKF only through `fit()`, which keeps its
+/// variance and drops its mean (`predict()` and the dual walk run the ODE there), so the leg
+/// calls the filter directly, at zero diffusion, where its mean is the ODE's. Both read the
+/// trough pre-dose. Measured worst error on Linux x86_64 against the closed forms: dual 5.7e-14,
+/// EKF 1.5e-11 (the mutant that seeds the EKF's `first_event` fold with `-∞` reads 100 high).
 #[test]
 fn the_band_only_walks_read_an_infusion_end_tie_pre_dose_2534() {
     let ode = std::fs::read_to_string(TIE_MODEL)
@@ -461,15 +464,29 @@ fn the_band_only_walks_read_an_infusion_end_tie_pre_dose_2534() {
     let inf = 10.0 * (1.0 - e(2.96));
     let at10 = 100.0 * (e(10.0) + e(10.0 - 8.06)) + inf * e(10.0 - 8.06);
     let want = [100.0 * e(8.06) + inf, at10, 100.0 * e(8.06) + inf + 100.0, at10];
-    for src in [&ode, &sde] {
-        let m = ferx_core::parse_model_string(src).expect("twin");
-        assert!(!m.has_lagtime());
-        let pred = predict(&m, &pop, &m.default_params).expect("predict");
-        let (dual, _) = dual_and_states(&m, &pop);
-        assert_legs(
-            &[("predict", pred.iter().map(|p| p.pred).collect()), ("dual", dual)],
-            &want,
-            1e-9,
-        );
-    }
+    let m = ferx_core::parse_model_string(&ode).expect("twin");
+    assert!(!m.has_lagtime() && !m.is_sde());
+    let pred = predict(&m, &pop, &m.default_params).expect("predict");
+    let (dual, _) = dual_and_states(&m, &pop);
+    let m = ferx_core::parse_model_string(&sde).expect("sde twin");
+    assert!(m.is_sde());
+    let eta = vec![0.0; m.n_eta];
+    let ode_spec = m.ode_spec.as_ref().expect("ODE spec");
+    let ekf = pop.subjects.iter().flat_map(|s| {
+        let pk = (m.pk_param_fn)(&m.default_params.theta, &eta, &s.covariates, 0.0);
+        ferx_core::ode::ode_predictions_ekf_with_diffusion(
+            ode_spec,
+            &pk.values,
+            s,
+            &[0.0; 2],
+            |_| 1.0,
+        )
+        .0
+    });
+    let legs = [
+        ("predict", pred.iter().map(|p| p.pred).collect()),
+        ("dual", dual),
+        ("ekf", ekf.collect()),
+    ];
+    assert_legs(&legs, &want, 1e-9);
 }
