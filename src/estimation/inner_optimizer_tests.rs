@@ -6871,8 +6871,7 @@ fn gradient_timing_follows_each_fits_reading_of_the_variable() {
 }
 
 /// The mode's predictions are handed back bit for bit from the walks kept per solve, also
-/// where the search's last walk was another point (a probe beside the mode), and a solve of an
-/// ODE model holds two entries however many points it visited. Mutation: drop the kept walk's
+/// where the search's last walk was another point (a trial beside the mode). Mutation: drop the kept walk's
 /// read-back at the end of the solve -> `ipreds` is `None` for the solves counted below.
 #[test]
 fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
@@ -6926,9 +6925,11 @@ fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
 /// The mode is kept whether it ties a point walked before it or one walked after it (#3042):
 /// the tie the test above meets on macOS arm64 only, forced here on every platform. Mutations:
 /// keep only the first of a tie (`<`) -> the first case fails; only the latest (`<=`) -> the
-/// second fails; a new lowest value that does not clear the tie slot -> the third fails.
+/// second fails; `held` reads slot 0 only -> the `held` assert fails; drop the guard on
+/// non-finite and sentinel values -> the last three fail.
 #[test]
 fn kept_walks_hold_the_mode_on_either_side_of_a_tie() {
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL as S;
     let take = |walks: &[([f64; 1], f64)], mode: f64| {
         let mut kept = KeptWalks::default();
         for (e, v) in walks {
@@ -6938,9 +6939,16 @@ fn kept_walks_hold_the_mode_on_either_side_of_a_tie() {
     };
     let (a, m, b) = (([1.0], 2.0), ([2.0], 2.0), ([3.0], 2.0));
     assert_eq!(take(&[a, m], 2.0), Some(vec![20.0]), "the mode ties an earlier point");
-    assert_eq!(take(&[m, b], 2.0), Some(vec![20.0]), "a later probe ties the mode");
-    assert_eq!(take(&[a, b, ([4.0], 1.0)], 3.0), None, "a lower value clears the tie");
+    assert_eq!(take(&[m, b], 2.0), Some(vec![20.0]), "a later trial ties the mode");
     assert_eq!(take(&[m, ([5.0], f64::NAN)], 2.0), Some(vec![20.0]), "NaN is never kept");
+    assert_eq!(take(&[([5.0], f64::NAN), m], 2.0), Some(vec![20.0]), "NaN does not block");
+    let inf = ([6.0], f64::NEG_INFINITY);
+    assert_eq!(take(&[inf, m], 2.0), Some(vec![20.0]), "-inf is never kept");
+    assert_eq!(take(&[([5.0], S), ([6.0], S)], 6.0), None, "the sentinel is never kept");
+    let mut kept = KeptWalks::default();
+    kept.offer(&[2.0], 2.0, &[20.0]);
+    kept.offer(&[3.0], 2.0, &[30.0]);
+    assert_eq!(kept.held(&[3.0]), Some(2.0), "`held` reads the tie slot");
 }
 
 /// A subject with no observations (doses only) has a prior-only inner problem and no data term

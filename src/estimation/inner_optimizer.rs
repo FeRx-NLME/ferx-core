@@ -2733,9 +2733,10 @@ const COLD_SEED_TIE_TOL: f64 = 1e-9;
 /// The walks an EBE solve keeps for reading the mode's predictions back (#3042): the first point
 /// to reach the lowest value scored, and the latest point tied with it bit for bit. The mode can
 /// tie a point an ulp beside it, walked before it (macOS arm64, `mm_oral` subject 1) or after it
-/// (a finite-difference probe), so one slot keeps the earlier of a tie and the other the later,
-/// and the mode is found either way. A tie between three points can still lose it, and is walked
-/// again: only a copy is lost, never a value.
+/// (a line-search trial), so one slot keeps the earlier of a tie and the other the later, and the
+/// mode is found either way. The mode is not always the lowest value: a candidate scoring lower
+/// by under the multistart's `1e-9` is rejected, yet takes the first slot. A tie between three
+/// points, or a mode that is not the lowest, is walked again: only a copy is lost, never a value.
 #[derive(Default)]
 struct KeptWalks([Option<(Vec<u64>, f64, Vec<f64>)>; 2]);
 
@@ -2745,15 +2746,12 @@ impl KeptWalks {
         self.0.iter().flatten().find(|(k, ..)| same_bits(k, e)).map(|w| w.1)
     }
 
-    /// Keep `(e, v, preds)` if `v` is a new lowest value (clearing the tie) or ties it.
+    /// Keep `(e, v, preds)` if `v` is a real value that is a new lowest or ties it.
     fn offer(&mut self, e: &[f64], v: f64, preds: &[f64]) {
         let slot = match &self.0[0] {
-            _ if !v.is_finite() => return,
+            _ if !crate::stats::likelihood::is_usable_subject_nll(v) => return,
             None => 0,
-            Some(b) if v < b.1 => {
-                self.0[1] = None;
-                0
-            }
+            Some(b) if v < b.1 => 0,
             Some(b) if v == b.1 => 1,
             Some(_) => return,
         };
@@ -2962,7 +2960,7 @@ fn find_ebe_solve(
     // memo above decides which value a lookup returns (a fused gradient pass's value can sit
     // beside the walk's), and only on its miss is the walk's own, a pure function of η, read
     // back from here instead of walked again. The solve reads back one point's predictions —
-    // the mode's, which is the lowest value it scored — so [`KeptWalks`] holds two entries, not
+    // the mode's, normally the lowest value it scored — so [`KeptWalks`] holds two entries, not
     // a vector per η the search and its finite-difference probes visited. An ODE walk is what a
     // repeat is worth skipping; a closed form re-walks for less than the lookup costs.
     let best_walk: RefCell<KeptWalks> = RefCell::new(KeptWalks::default());
@@ -3723,7 +3721,7 @@ fn find_ebe_solve(
     let ipreds = if at_mode(&preds_at.borrow()) && pred_recycle.borrow().len() == n_obs {
         Some(pred_recycle.take())
     } else {
-        // The last walk was another point (a finite-difference probe beside the mode).
+        // The last walk was another point (a line-search trial beside the mode).
         let kept = best_walk.take().take_at(&eta_true, n_obs);
         #[cfg(test)]
         BEST_WALK_RESTORES.with(|c| c.set(c.get() + usize::from(kept.is_some())));
