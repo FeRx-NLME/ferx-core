@@ -1,0 +1,37 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "count_nb.csv",
+ "data_records": 360,
+ "observations": 360,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation (Evaluation)",
+   "objv": 1697.444,
+   "final": {
+    "theta": [4.26, 0.302, -0.625, 2.54],
+    "omega": {
+     "ETA1": [0.212]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2877 count endpoint (nb, laplace) evaluated at the lme4::glmer.nb optimum: -2 log PMF with ln Gamma(k+1) kept, LAPLACE",
+  "$INPUT ID TIME DV CMT EVID MDV WT TRT",
+  "$DATA count_nb.csv IGNORE=@",
+  "$PRED",
+  " LAM = EXP(LOG(THETA(1)) + THETA(2)*(WT/70 - 1) + THETA(3)*TRT + ETA(1))",
+  " R = THETA(4)",
+  " Y = -2*(GAMLN(DV+R) - GAMLN(R) - GAMLN(DV+1) + R*LOG(R/(R+LAM)) + DV*LOG(LAM/(R+LAM)))",
+  "$THETA",
+  " 4.259593024303707 FIX  ; BASE",
+  " 0.302472086121856 FIX  ; BETA",
+  " -0.624572274934565 FIX  ; GAM",
+  " 2.538941012341994 FIX  ; R",
+  "$OMEGA 0.212406627785474 FIX  ; ETA_C",
+  "$ESTIMATION METHOD=COND LAPLACE -2LL MAXEVAL=0 NSIG=4 SIGL=12 PRINT=10 NOABORT FORMAT=s1PE23.16"
+ ]
+}

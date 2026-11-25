@@ -9,7 +9,9 @@ is named by a row, directly or through a `*` / `{a,b}` pattern in the control-st
 column. `tests/nonmem_anchor_index.rs` fails when one is not, so **a new anchor gets
 a row in the same PR**. The row is only the pointer: the measured comparison and its
 interpretation live in the test file it names (and, for some families, in a section
-further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `results/`.
+further down this file). Run outputs (`.ext`, `.phi`, `.tab`, …) are in `results/`.
+Listings (`.lst`) are not committed: `tools/nonmem-extract.py run.lst --out-dir results` writes
+their numbers to `results/run.nm.json` (#3182).
 
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|
@@ -223,10 +225,10 @@ respective model (see below).
 > rather than by exposure magnitude (a bioavailability `F` would be confounded
 > with `CL`/`V` in oral-only data). Both engines start at `FR1 = 0.4`.
 >
-> **`.lst` truncation.** This NONMEM 7.5.1 build aborts while printing the final
+> **Listing truncation.** This NONMEM 7.5.1 build aborts while printing the final
 > report section of the SAEM+IMP chain — after both estimation stages finish and
-> after every output file is written. The committed `.lst` therefore ends at
-> `#TERM` and carries no "FINAL PARAMETER ESTIMATE" block; read the estimates from
+> after every output file is written. The listing therefore ends at
+> `#TERM` and the committed `.nm.json` carries no `final` block; read the estimates from
 > `results/logit_fraction_saem.ext` instead (the last `-1000000000` row of each
 > `TABLE NO.` block — table 1 is SAEM, table 2 the IMP objective, `#OBJV`
 > equivalent −3698.448). The abort is not the fit failing: the two runs performed
@@ -512,7 +514,7 @@ residual SD.
 |------|------|
 | `iiv_on_ruv.csv` | 50-subject 1-cpt oral dataset, simulated with **true ω²(ETA_RUV) = 0.30** |
 | `iiv_on_ruv.ctl` | NONMEM FOCEI INTER control stream (ADVAN2 TRANS2; `Y = IPRED + IPRED*EPS(1)*EXP(ETA(4))`) |
-| `iiv_on_ruv.lst` | NONMEM 7.5.1 reference output |
+| `iiv_on_ruv.nm.json` | NONMEM 7.5.1 reference output |
 | `iiv_on_ruv_fit.ferx` | ferx model |
 | `../tests/gen_iiv_anchor.rs` | deterministic regenerator (seed 409409) + the ferx fit |
 
@@ -780,7 +782,8 @@ From this directory (the `$TABLE FILE=` paths are relative), then move the outpu
 
 ```bash
 for f in dose_cmt_*.ctl; do nmfe76 "$f" "${f%.ctl}.lst"; done
-mv dose_cmt_*.lst dose_cmt_*.tab results/
+../tools/nonmem-extract.py dose_cmt_*.lst --out-dir results
+mv dose_cmt_*.tab results/
 ```
 
 > **Run status — DONE (#375).** All 13 runs executed on NONMEM 7.6.0 via
@@ -824,12 +827,13 @@ From this directory, then move the output into `results/`:
 
 ```bash
 for f in defdose_no_cmt defdose_cmt2 defdose_cmt2float; do nmfe76 "$f.ctl" "$f.lst"; done
-mv defdose_*.lst defdose_*.tab defdose_*.ext defdose_*.phi results/
+../tools/nonmem-extract.py defdose_*.lst --out-dir results
+mv defdose_*.tab defdose_*.ext defdose_*.phi results/
 ```
 
 > **Run status — DONE (#1009), re-derived.** Each `.ctl` names **its own** dataset
 > (`$DATA defdose_<case>.csv`) and its own `$TABLE FILE=`, so the loop above is the
-> whole recipe and each run's `.lst` records which dataset produced it. That
+> whole recipe and each run's `.nm.json` records which dataset produced it. That
 > matters here more than usual: the three runs return the *same* OBJV by design, so
 > without per-run filenames the committed evidence could not distinguish "the float
 > dataset was run" from "the integer dataset was run twice" — and the float arm is
@@ -864,7 +868,8 @@ asserts the walk, the default dispatch, and NONMEM all agree at `1e-9`.
 
 ```bash
 for f in ss_slow_advan*.ctl; do nmfe76 "$f" "${f%.ctl}.lst"; done
-mv ss_slow_advan*.lst ss_slow_advan*.tab results/
+../tools/nonmem-extract.py ss_slow_advan*.lst --out-dir results
+mv ss_slow_advan*.tab results/
 ```
 
 > **Run status — DONE (#908).** Both runs executed on NONMEM 7.6.0 via `nmfe76`;
@@ -1274,7 +1279,7 @@ beside it: `python3 tools/mbma_canakinumab_fetch.py --out <run dir>/mbma_canakin
 `.gitignore` excludes `mbma_canakinumab*.csv` anywhere as a backstop, and
 `no_external_data_is_tracked` fails if one is ever tracked. The
 committed `results/mbma_canakinumab.{lst,ext,cov}` contain estimates only (checked: no
-data record is printed in the `.lst`).
+data record is printed in the listing).
 
 **Fit** (`nm3`, 2026-10-12): `MINIMIZATION SUCCESSFUL` with `PROBLEMS OCCURRED`,
 `#OBJV = −277.86235425800453`; arm64 and arm64-nofma agree to 2e-9. ferx's converged
@@ -1368,7 +1373,7 @@ default tolerances BOBYQA stops ~0.03 OFV short on this dataset's flat
 TVEMAX / B_EMAX_FLARE ridge, and ferx scores NONMEM's own optimum at −199.734575.
 
 Run folder: `~/NONMEMruns/ferx-1081-residual-correlation/`; every stream run with
-`nm3` (NONMEM 7.6.0); `results/` holds the `anchor` build's `.ext` / `.lst`.
+`nm3` (NONMEM 7.6.0); `results/` holds the `anchor` build's `.ext` / `.nm.json`.
 
 ## The `TIME` individual parameters read (#1969)
 

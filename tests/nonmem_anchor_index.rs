@@ -10,7 +10,7 @@
 //!
 //! What the tests below pin, all against the **control-stream column** of that first table
 //! (a `.ctl` named in another column's prose is not an index entry — the catalogue had rows
-//! quoting `tie.ctl` and `ss_inf.ctl`, names the `.lst` echoes, not files on disk):
+//! quoting `tie.ctl` and `ss_inf.ctl`, names the listing echoes, not files on disk):
 //!
 //! - every `*.ctl` under `nonmem_anchor/`, subdirectories included and `results/` (copies of
 //!   what NONMEM echoed) excluded, is matched by some row's pattern;

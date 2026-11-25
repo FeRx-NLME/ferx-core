@@ -1,0 +1,64 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "tte_gompertz.csv",
+ "data_records": 300,
+ "observations": 300,
+ "individuals": 300,
+ "nmtran_warnings": [1],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order",
+   "objv": 3011.121,
+   "objv_without_constant": 3011.1211738240013,
+   "objv_with_constant": 3011.1211738240013,
+   "function_evaluations": 53,
+   "significant_digits": 3.3,
+   "final": {
+    "theta": [-6.01, -5.4, -0.797],
+    "omega": {
+     "ETA1": [0.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.138, 0.146, 0.136],
+    "omega": {
+     "ETA1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.0189],
+    "TH 2": [-0.0158, 0.0214],
+    "TH 3": [-0.00437, -0.00385, 0.0186],
+    "OM11": [null, null, null, null]
+   },
+   "eigenvalues": [0.111, 1.1, 1.79]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM    TTE Gompertz (2-arm RCT,fixed effects) \u2013 Phase 1 ferx",
+  ";           validation",
+  "$INPUT      ID TIME DV TRT EVID CMT MDV",
+  "$DATA      tte_gompertz.csv IGNORE=@",
+  "$PRED",
+  "  ALPHA  = EXP(THETA(1))     ; baseline hazard rate at t=0",
+  "  GAMMA  = EXP(THETA(2))     ; hazard acceleration (growth rate)",
+  "  LOGHR  = THETA(3)          ; log hazard ratio (treatment effect)",
+  "  HAZ    = ALPHA * EXP(GAMMA * TIME) * EXP(LOGHR * TRT)",
+  "  CHZ    = (ALPHA/GAMMA) * (EXP(GAMMA*TIME) - 1) * EXP(LOGHR * TRT)",
+  "  F_FLAG = 1",
+  "  IF (DV.EQ.0) Y = EXP(-CHZ)",
+  "  IF (DV.EQ.1) Y = HAZ * EXP(-CHZ)",
+  "  DUMMY = ETA(1)",
+  "$THETA  (-15,-6.0,0) ; log_alpha: init -6.0",
+  "$THETA  (-15,-5.4,0) ; log_gamma: init -5.4",
+  "$THETA  (-5,-0.8,5) ; log_hr:    init -0.8",
+  ";$ESTIMATION LAPLACIAN INTERACTION MAXEVAL=9999 PRINT=1 NOABORT",
+  "$ESTIMATION METHOD=0 MAXEVAL=9999 PRINT=1",
+  "$COVARIANCE PRINT=E",
+  "$OMEGA  0  FIX",
+  "$TABLE      ID TIME DV TRT NOPRINT NOAPPEND FILE=tte_gompertz.sdtab"
+ ]
+}

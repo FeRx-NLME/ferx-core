@@ -1,0 +1,175 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "covmuref_shared.csv",
+ "data_records": 330,
+ "observations": 300,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Importance Sampling assisted by MAP Estimation",
+   "objv": -1198.59,
+   "objv_without_constant": -1198.5899755907826,
+   "objv_with_constant": -647.2268556679791,
+   "etabar": [
+    [-0.00051796, 0.0020561, -0.0012349, 0.00030781, 0.0022183]
+   ],
+   "etabar_se": [
+    [0.060055, 0.058939, 0.040444, 0.034741, 0.075381]
+   ],
+   "p_val": [
+    [0.99312, 0.97217, 0.97564, 0.99293, 0.97652]
+   ],
+   "etashrinksd": [
+    [1e-10, 2.2488, 2.1926, 2.0883, 2.3456]
+   ],
+   "etashrinkvr": [
+    [1e-10, 4.447, 4.3371, 4.133, 4.6361]
+   ],
+   "ebvshrinksd": [
+    [0.21126, 1.5015, 2.6323, 2.1125, 1.6531]
+   ],
+   "ebvshrinkvr": [
+    [0.42208, 2.9804, 5.1952, 4.1803, 3.2788]
+   ],
+   "relativeinf": [
+    [99.566, 96.833, 94.621, 95.799, 96.53]
+   ],
+   "epsshrinksd": [
+    [26.878]
+   ],
+   "epsshrinkvr": [
+    [46.531]
+   ],
+   "final": {
+    "theta": [4.94, 48.3, 9.59, 94.4, 1.25, 0.662, 0.563],
+    "omega": {
+     "ETA1": [0.108],
+     "ETA2": [0.0, 0.109],
+     "ETA3": [0.0, 0.0, 0.0513],
+     "ETA4": [0.0, 0.0, 0.0, 0.0378],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.179]
+    },
+    "sigma": {
+     "EPS1": [0.000375]
+    }
+   }
+  },
+  {
+   "method": "Objective Function Evaluation by Importance Sampling",
+   "objv": -1199.339,
+   "objv_without_constant": -1199.3387447847465,
+   "objv_with_constant": -647.975624861943,
+   "etabar": [
+    [-0.00022943, -0.00053973, 0.00012233, 0.00042513, -0.00095611]
+   ],
+   "etabar_se": [
+    [0.059902, 0.05942, 0.040355, 0.034636, 0.075732]
+   ],
+   "p_val": [
+    [0.99694, 0.99275, 0.99758, 0.99021, 0.98993]
+   ],
+   "etashrinksd": [
+    [0.18545, 1.4526, 2.411, 2.3845, 1.8928]
+   ],
+   "etashrinkvr": [
+    [0.37055, 2.8841, 4.7638, 4.7121, 3.7498]
+   ],
+   "ebvshrinksd": [
+    [0.19963, 1.8448, 2.627, 2.1187, 1.8812]
+   ],
+   "ebvshrinkvr": [
+    [0.39886, 3.6556, 5.1851, 4.1926, 3.7269]
+   ],
+   "relativeinf": [
+    [99.591, 96.098, 94.6, 95.776, 96.027]
+   ],
+   "epsshrinksd": [
+    [26.842]
+   ],
+   "epsshrinkvr": [
+    [46.479]
+   ],
+   "final": {
+    "theta": [4.94, 48.3, 9.59, 94.4, 1.25, 0.662, 0.563],
+    "omega": {
+     "ETA1": [0.108],
+     "ETA2": [0.0, 0.109],
+     "ETA3": [0.0, 0.0, 0.0513],
+     "ETA4": [0.0, 0.0, 0.0, 0.0378],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.179]
+    },
+    "sigma": {
+     "EPS1": [0.000375]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM two_cpt_oral_cov with a SHARED allometric exponent, IMPMAP -- anchor for ferx #1620",
+  "; Reference IMPMAP fit for two covariate mu-references that read the same theta:",
+  ";",
+  ";     CL_i = THETA(1) * (WT/70)**THETA(6) * (CRCL/100)**THETA(7) * EXP(ETA(1))",
+  ";     V1_i = THETA(2) * (WT/70)**THETA(6) * EXP(ETA(2))",
+  ";",
+  "; THETA(6) (THETA_WT) is shared by CL and V1. Before #1620 ferx declined the second",
+  "; covariate mu-reference (\"already belongs\") and let the first one's M-step move",
+  "; THETA_WT with ETA_V1 left free to absorb the change; SAEM put THETA_WT at 0.0101.",
+  "; With #1620 the two form one joint group whose M-step re-centres both etas.",
+  ";",
+  "; This is examples/two_cpt_oral_cov.ferx + data/two_cpt_oral_cov.csv, unchanged",
+  "; except that the observation rows carry CMT=2 (ADVAN4's central compartment) and",
+  "; '.' is written as 0. That the two files describe the same observations is checked",
+  "; by FOCEI: NONMEM on this file and ferx on the bundled CSV reach the same OFV,",
+  "; -1199.3264. The ferx side is covmuref_shared_saem_fit.ferx with method = impmap.",
+  "; Both engines start from the bundled model's values.",
+  ";",
+  "; MU form, linear in THETA for both typical values (NONMEM's efficient form).",
+  "",
+  "$INPUT ID TIME DV EVID AMT CMT RATE MDV WT CRCL",
+  "$DATA covmuref_shared.csv IGNORE=@",
+  "",
+  "$SUBROUTINES ADVAN4 TRANS4",
+  "",
+  "$PK",
+  "  MU_1 = LOG(THETA(1)) + THETA(6)*LOG(WT/70.0) + THETA(7)*LOG(CRCL/100.0)",
+  "  MU_2 = LOG(THETA(2)) + THETA(6)*LOG(WT/70.0)",
+  "  MU_3 = LOG(THETA(3))",
+  "  MU_4 = LOG(THETA(4))",
+  "  MU_5 = LOG(THETA(5))",
+  "  CL = EXP(MU_1 + ETA(1))",
+  "  V2 = EXP(MU_2 + ETA(2))",
+  "  Q  = EXP(MU_3 + ETA(3))",
+  "  V3 = EXP(MU_4 + ETA(4))",
+  "  KA = EXP(MU_5 + ETA(5))",
+  "  S2 = V2",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1.0 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.1, 4.0, 100.0)   ; 1 TVCL",
+  "  (1.0, 40.0, 500.0)  ; 2 TVV1",
+  "  (0.1, 8.0, 100.0)   ; 3 TVQ",
+  "  (1.0, 80.0, 500.0)  ; 4 TVV2",
+  "  (0.01, 1.0, 10.0)   ; 5 TVKA",
+  "  (0.01, 0.6, 5.0)    ; 6 THETA_WT   (shared by CL and V1)",
+  "  (0.01, 0.3, 5.0)    ; 7 THETA_CRCL",
+  "",
+  "$OMEGA",
+  "  0.15   ; ETA_CL",
+  "  0.15   ; ETA_V1",
+  "  0.08   ; ETA_Q",
+  "  0.08   ; ETA_V2",
+  "  0.20   ; ETA_KA",
+  "",
+  "$SIGMA",
+  "  0.0016 ; proportional, = (0.04 SD)^2",
+  "",
+  "$ESTIMATION METHOD=IMPMAP INTERACTION NITER=200 ISAMPLE=300 PRINT=20 SEED=1620 NOABORT",
+  "$ESTIMATION METHOD=IMP INTERACTION EONLY=1 NITER=10 ISAMPLE=3000 PRINT=1 SEED=1620 NOABORT",
+  "$TABLE ID TIME DV IPRED NOPRINT ONEHEADER FILE=covmuref_shared_impmap.tab FORMAT=s1PE15.8"
+ ]
+}

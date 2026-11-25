@@ -1,0 +1,57 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "tte_exp.csv",
+ "data_records": 100,
+ "observations": 100,
+ "individuals": 100,
+ "nmtran_warnings": [1, 3],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order",
+   "objv": 589.888,
+   "objv_without_constant": 589.8880220857336,
+   "objv_with_constant": 589.8880220857336,
+   "function_evaluations": 17,
+   "significant_digits": 3.2,
+   "final": {
+    "theta": [-2.6],
+    "omega": {
+     "ETA1": [0.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.115],
+    "omega": {
+     "ETA1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.0131],
+    "OM11": [null, null]
+   },
+   "eigenvalues": [1.0]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM    TTE Exponential \u2013 Phase 1 ferx validation",
+  "$INPUT      ID TIME DV EVID CMT MDV",
+  "$DATA      tte_exp.csv IGNORE=@",
+  "$PRED",
+  "  LAMBDA = EXP(THETA(1) + ETA(1))",
+  "  CHZ    = LAMBDA * TIME        ; H(t) = lambda * t  (Exponential)",
+  "  HAZNOW = LAMBDA               ; h(t) = lambda      (constant)",
+  "  F_FLAG = 1",
+  "  IF (DV.EQ.0) Y = EXP(-CHZ)              ; right-censored: S(T)",
+  "  IF (DV.EQ.1) Y = HAZNOW * EXP(-CHZ)    ; exact event:    h(T)*S(T)",
+  "",
+  "$THETA  (-10,-2.3,5) ; log(lambda): init log(0.1) = -2.303",
+  "$OMEGA  0  FIX  ; var(eta.lambda): init 0.25",
+  ";$ESTIMATION METHOD=CONDITIONAL LAPLACIAN INTERACTION MAXEVAL=9999 PRINT=1 NOABORT",
+  "$ESTIMATION METHOD=0 MAXEVAL=9999 PRINT=5",
+  "$COVARIANCE PRINT=E",
+  "$TABLE      ID TIME DV NOPRINT NOAPPEND FILE=tte_exp.sdtab"
+ ]
+}

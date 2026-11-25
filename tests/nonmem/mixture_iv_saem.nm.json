@@ -1,0 +1,159 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "mixture_iv.csv",
+ "data_records": 240,
+ "observations": 210,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Stochastic Approximation Expectation-Maximization",
+   "objv": 163.692,
+   "objv_without_constant": 163.69186285630954,
+   "objv_with_constant": 549.646046802272,
+   "etabar": [
+    [-0.10097],
+    [0.0029146]
+   ],
+   "etabar_se": [
+    [0.047104],
+    [0.069892]
+   ],
+   "etashrinksd": [
+    [43.388],
+    [3.9428]
+   ],
+   "etashrinkvr": [
+    [67.95],
+    [7.7301]
+   ],
+   "ebvshrinksd": [
+    [10.091],
+    [1.4599]
+   ],
+   "ebvshrinkvr": [
+    [19.164],
+    [2.8985]
+   ],
+   "relativeinf": [
+    [80.836],
+    [97.101]
+   ],
+   "epsshrinksd": [
+    [4.3441],
+    [1e-10]
+   ],
+   "epsshrinkvr": [
+    [8.4994],
+    [1e-10]
+   ],
+   "final": {
+    "theta": [1.0, 2.74, 9.99, 0.471],
+    "omega": {
+     "ETA1": [0.09]
+    },
+    "sigma": {
+     "EPS1": [0.04]
+    }
+   }
+  },
+  {
+   "method": "Objective Function Evaluation by Importance Sampling",
+   "objv": 300.871,
+   "objv_without_constant": 300.8707142610473,
+   "objv_with_constant": 686.8248982070098,
+   "etabar": [
+    [-0.05692],
+    [0.030286]
+   ],
+   "etabar_se": [
+    [0.057102],
+    [0.067562]
+   ],
+   "etashrinksd": [
+    [28.781],
+    [9.917]
+   ],
+   "etashrinkvr": [
+    [49.279],
+    [18.85]
+   ],
+   "ebvshrinksd": [
+    [10.16],
+    [1.322]
+   ],
+   "ebvshrinkvr": [
+    [19.287],
+    [2.6265]
+   ],
+   "relativeinf": [
+    [80.713],
+    [97.373]
+   ],
+   "epsshrinksd": [
+    [1.6651],
+    [2.2225]
+   ],
+   "epsshrinkvr": [
+    [3.3025],
+    [4.3957]
+   ],
+   "final": {
+    "theta": [1.0, 2.74, 9.99, 0.471],
+    "omega": {
+     "ETA1": [0.09]
+    },
+    "sigma": {
+     "EPS1": [0.04]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM 2-class CL mixture, 1-cpt IV (#985 ferx SAEM anchor)",
+  "; Two latent subpopulations differing only in clearance (TVCL1 vs TVCL2),",
+  "; constant (covariate-free) mixing fraction P(1). SAEM estimation \u2014 the",
+  "; NONMEM METHOD=SAEM reference for the ferx mixture SAEM path (#985). Same",
+  "; model / data as mixture_iv.ctl (which is FOCE-I); Omega/Sigma FIXed at the",
+  "; data-generating values so the estimated quantities are the two class",
+  "; clearances, V, and the mixing fraction.",
+  "$INPUT ID TIME DV AMT EVID CMT WT",
+  "$DATA mixture_iv.csv IGNORE=@",
+  "$SUBROUTINES ADVAN1 TRANS2",
+  "",
+  "$PK",
+  "  IF (MIXNUM.EQ.1) TVCL = THETA(1)",
+  "  IF (MIXNUM.EQ.2) TVCL = THETA(2)",
+  "  CL = TVCL * EXP(ETA(1))",
+  "  V  = THETA(3)",
+  "  S1 = V",
+  "",
+  "$MIX",
+  "  NSPOP = 2",
+  "  P(1) = THETA(4)",
+  "  P(2) = 1.0 - THETA(4)",
+  "",
+  "$ERROR",
+  "  MIXE = MIXEST",
+  "  IPRED = F",
+  "  Y = IPRED * (1.0 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.01, 1.2, 100.0)     ; TVCL1  (class 1, low CL)",
+  "  (0.01, 2.5, 100.0)     ; TVCL2  (class 2, high CL)",
+  "  (0.1, 10.0, 1000.0)    ; V",
+  "  (0.001, 0.5, 0.999)    ; P(1)   mixing fraction of class 1",
+  "$OMEGA 0.09 FIX           ; IIV on CL (fixed at data-generating value)",
+  "$SIGMA 0.04 FIX           ; proportional RUV (fixed at data-generating value)",
+  "",
+  "; SAEM: stochastic-approximation EM. The class indicator is sampled each",
+  "; E-step, exactly the scheme the ferx SAEM mixture path implements (#985).",
+  "$ESTIMATION METHOD=SAEM INTERACTION NBURN=1000 NITER=1000 ISAMPLE=2",
+  "            SEED=20250818 CTYPE=3 PRINT=100 NOABORT",
+  "; Importance-sampling step to report a comparable objective function value.",
+  "$ESTIMATION METHOD=IMP INTERACTION EONLY=1 NITER=5 ISAMPLE=1000",
+  "            SEED=20250818 PRINT=1 NOABORT",
+  "$TABLE ID TIME MIXE NOPRINT ONEHEADER FILE=mixture_iv_saem.sdtab"
+ ]
+}

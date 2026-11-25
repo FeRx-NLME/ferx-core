@@ -1,0 +1,120 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "mixture_iv_iov.csv",
+ "data_records": 300,
+ "observations": 240,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": 470.814,
+   "objv_without_constant": 470.81427572316585,
+   "objv_with_constant": 911.9047716614087,
+   "function_evaluations": 88,
+   "etabar": [
+    [0.0072085, -0.020174, 0.023057],
+    [0.016909, 0.021775, -0.015011]
+   ],
+   "etabar_se": [
+    [0.031837, 0.0092505, 0.010758],
+    [0.053061, 0.023285, 0.019534]
+   ],
+   "etashrinksd": [
+    [43.048, 73.836, 69.573],
+    [11.212, 38.395, 48.318]
+   ],
+   "etashrinkvr": [
+    [67.565, 93.154, 90.742],
+    [21.167, 62.048, 73.29]
+   ],
+   "ebvshrinksd": [
+    [30.037, 70.014, 60.296],
+    [14.586, 40.778, 41.036]
+   ],
+   "ebvshrinkvr": [
+    [51.051, 91.008, 84.236],
+    [27.044, 64.927, 65.233]
+   ],
+   "relativeinf": [
+    [1e-10, 1e-10, 1e-10],
+    [1e-10, 1e-10, 1e-10]
+   ],
+   "epsshrinksd": [
+    [4.5571],
+    [10.925]
+   ],
+   "epsshrinkvr": [
+    [8.9065],
+    [20.657]
+   ],
+   "final": {
+    "theta": [1.06, 3.33, 10.3, 0.526],
+    "omega": {
+     "ETA1": [0.05],
+     "ETA2": [0.0, 0.02],
+     "ETA3": [0.0, 0.0, 0.02]
+    },
+    "sigma": {
+     "EPS1": [0.04]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM 2-class CL mixture + IOV on CL, 1-cpt IV (#985 ferx IOV+mixture anchor)",
+  "; Two latent subpopulations differing in clearance (TVCL1 vs TVCL2), constant",
+  "; mixing fraction P(1), plus inter-occasion variability on CL: each subject has",
+  "; two dosing occasions (OCC 1/2), and CL carries a per-occasion kappa drawn from",
+  "; a shared IOV omega ($OMEGA BLOCK(1) ... SAME). FOCE-I estimation. IIV + IOV",
+  "; omegas are free; proportional sigma fixed at the data-generating value so the",
+  "; MATRIX=R standard errors compare cleanly against ferx (pure R^-1). IIV + IOV",
+  "; omegas and sigma are FIXED at their data-generating values (mirroring the",
+  "; mixture_iv_cov anchor): with only two occasions the IOV omega is weakly",
+  "; identified, so fixing the variances keeps the 4-theta R matrix well-conditioned",
+  "; while the IOV kappa still enters the FOCE-I marginal.",
+  "$INPUT ID TIME DV AMT EVID CMT OCC WT",
+  "$DATA mixture_iv_iov.csv IGNORE=@",
+  "$SUBROUTINES ADVAN1 TRANS2",
+  "",
+  "$PK",
+  "  IF (MIXNUM.EQ.1) TVCL = THETA(1)",
+  "  IF (MIXNUM.EQ.2) TVCL = THETA(2)",
+  "  OCC1 = 0",
+  "  OCC2 = 0",
+  "  IF (OCC.EQ.1) OCC1 = 1",
+  "  IF (OCC.EQ.2) OCC2 = 1",
+  "  KACL = OCC1*ETA(2) + OCC2*ETA(3)",
+  "  CL = TVCL * EXP(ETA(1) + KACL)",
+  "  V  = THETA(3)",
+  "  S1 = V",
+  "",
+  "$MIX",
+  "  NSPOP = 2",
+  "  P(1) = THETA(4)",
+  "  P(2) = 1.0 - THETA(4)",
+  "",
+  "$ERROR",
+  "  MIXE = MIXEST",
+  "  IPRED = F",
+  "  Y = IPRED * (1.0 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.01, 1.0, 100.0)     ; TVCL1  (class 1, low CL)",
+  "  (0.01, 3.0, 100.0)     ; TVCL2  (class 2, high CL)",
+  "  (0.1, 10.0, 1000.0)    ; V",
+  "  (0.001, 0.5, 0.999)    ; P(1)   mixing fraction of class 1",
+  "$OMEGA 0.05 FIX          ; IIV on CL (fixed at data-generating value)",
+  "$OMEGA BLOCK(1) 0.02 FIX ; IOV on CL, occasion 1 (fixed)",
+  "$OMEGA BLOCK(1) SAME     ; IOV on CL, occasion 2 (same variance, inherits FIX)",
+  "$SIGMA 0.04 FIX          ; proportional RUV (fixed at data-generating value)",
+  "",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=5 NOABORT",
+  "$COVARIANCE MATRIX=R",
+  "$TABLE ID TIME MIXE NOPRINT ONEHEADER FILE=mixture_iv_iov.sdtab"
+ ]
+}

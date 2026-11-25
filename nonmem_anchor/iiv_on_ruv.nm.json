@@ -1,0 +1,122 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "iiv_on_ruv.csv",
+ "data_records": 600,
+ "observations": 550,
+ "individuals": 50,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": 567.372,
+   "objv_without_constant": 567.3719697898302,
+   "objv_with_constant": 1578.20435631497,
+   "function_evaluations": 380,
+   "etabar": [
+    [-0.0015175, -0.0038954, -0.0048115, -0.11507]
+   ],
+   "etabar_se": [
+    [0.04361, 0.024648, 0.065529, 0.061206]
+   ],
+   "p_val": [
+    [0.97224, 0.87442, 0.94147, 0.060094]
+   ],
+   "etashrinksd": [
+    [0.69641, 2.1505, 2.8251, 0.75875]
+   ],
+   "etashrinkvr": [
+    [1.388, 4.2547, 5.5703, 1.5117]
+   ],
+   "ebvshrinksd": [
+    [0.74652, 3.4118, 3.0647, 10.314]
+   ],
+   "ebvshrinkvr": [
+    [1.4875, 6.7072, 6.0355, 19.565]
+   ],
+   "relativeinf": [
+    [98.497, 93.128, 93.814, 80.427]
+   ],
+   "epsshrinksd": [
+    [2.7892]
+   ],
+   "epsshrinkvr": [
+    [5.5006]
+   ],
+   "final": {
+    "theta": [0.126, 7.74, 0.86],
+    "omega": {
+     "ETA1": [0.0964],
+     "ETA2": [0.0, 0.0317],
+     "ETA3": [0.0, 0.0, 0.227],
+     "ETA4": [0.0, 0.0, 0.0, 0.19]
+    },
+    "sigma": {
+     "EPS1": [0.00806]
+    }
+   },
+   "standard_error": {
+    "theta": [0.00565, 0.202, 0.0585],
+    "omega": {
+     "ETA1": [0.0219],
+     "ETA2": [null, 0.0081],
+     "ETA3": [null, null, 0.05],
+     "ETA4": [null, null, null, 0.064]
+    },
+    "sigma": {
+     "EPS1": [0.00125]
+    }
+   },
+   "covariance": {
+    "TH 1": [3.19e-05],
+    "TH 2": [4.31e-05, 0.0407],
+    "TH 3": [-3.11e-05, -0.00105, 0.00342],
+    "OM11": [-4.04e-05, -0.000251, 9.74e-05, 0.000478],
+    "OM12": [null, null, null, null, null],
+    "OM13": [null, null, null, null, null, null],
+    "OM14": [null, null, null, null, null, null, null],
+    "OM22": [-4.43e-06, 0.000569, -6.58e-05, 1.49e-05, null, null, null, 6.57e-05],
+    "OM23": [null, null, null, null, null, null, null, null, null],
+    "OM24": [null, null, null, null, null, null, null, null, null, null],
+    "OM33": [2.06e-06, -0.00105, 0.000129, -0.00011, null, null, null, -6.14e-05, null, null, 0.0025],
+    "OM34": [null, null, null, null, null, null, null, null, null, null, null, null],
+    "OM44": [6.84e-05, 0.00142, 9.38e-05, 0.000163, null, null, null, -1.69e-05, null, null, -0.000367, null, 0.0041],
+    "SG11": [1.97e-06, -3.51e-05, 1.32e-05, -6.4e-06, null, null, null, -1.31e-06, null, null, 4.51e-06, null, 1.05e-05, 1.57e-06]
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM IIV on residual error (ferx #409): Y = IPRED + EPS*EXP(ETA)",
+  "; 1-cpt oral (ADVAN2 TRANS2). Data simulated by tests/gen_iiv_anchor.rs from the",
+  "; ferx model nonmem_anchor/iiv_on_ruv_fit.ferx (true ETA_RUV variance = 0.30).",
+  "; Reproduce: nmfe75 iiv_on_ruv.ctl iiv_on_ruv.lst",
+  "$INPUT ID TIME DV EVID AMT CMT RATE MDV",
+  "$DATA iiv_on_ruv.csv IGNORE=@",
+  "$SUBROUTINE ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  ; proportional residual error scaled per-subject by EXP(ETA(4)) \u2014 IIV on RUV.",
+  "  Y = IPRED + IPRED*EPS(1)*EXP(ETA(4))",
+  "$THETA",
+  "  (0.001, 0.13, 10.0)   ; TVCL",
+  "  (0.1,   8.0,  500.0)  ; TVV",
+  "  (0.01,  1.0,  50.0)   ; TVKA",
+  "$OMEGA",
+  "  0.09   ; ETA_CL",
+  "  0.04   ; ETA_V",
+  "  0.30   ; ETA_KA",
+  "  0.30   ; ETA_RUV  (IIV on residual error)",
+  "$SIGMA",
+  "  0.01   ; PROP_ERR variance (sd 0.1)",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 NOABORT PRINT=5",
+  "$COVARIANCE UNCONDITIONAL"
+ ]
+}

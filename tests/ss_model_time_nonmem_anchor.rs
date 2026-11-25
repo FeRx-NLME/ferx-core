@@ -316,7 +316,7 @@ fn ss_tad_objective_matches_nonmem_end_to_end() {
     assert!(ss.ofv.is_finite(), "SS objective is {} — the #1139 symptom is back", ss.ofv);
     assert!(train.ofv.is_finite(), "train objective is {}", train.ofv);
 
-    // NONMEM `#OBJV` from `results/ss_tad.lst` and `results/train_tad.lst`, both 286.890 —
+    // NONMEM `#OBJV` from `results/ss_tad.nm.json` and `results/train_tad.nm.json`, both 286.890 —
     // printed to 6 significant figures, so this bound measures NONMEM's *print*, not ferx.
     // Realised, measured: ferx 286.889524669658 (SS) and 286.889524669616 (train), both
     // 1.657e-6 from the printed value — well inside half a unit in its last printed digit.

@@ -1,0 +1,116 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "ipred_magnitude.csv",
+ "data_records": 122,
+ "observations": 122,
+ "individuals": 18,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -171.185,
+   "objv_without_constant": -171.18523552116284,
+   "objv_with_constant": 53.035766580777306,
+   "function_evaluations": 304,
+   "significant_digits": 4.1,
+   "etabar": [
+    [0.0017283, -0.00042024]
+   ],
+   "etabar_se": [
+    [0.14416, 0.16817]
+   ],
+   "p_val": [
+    [0.99043, 0.99801]
+   ],
+   "etashrinksd": [
+    [1.4435, 2.8365]
+   ],
+   "etashrinkvr": [
+    [2.8661, 5.5926]
+   ],
+   "ebvshrinksd": [
+    [1.3968, 2.7882]
+   ],
+   "ebvshrinkvr": [
+    [2.7741, 5.4986]
+   ],
+   "relativeinf": [
+    [97.154, 94.432]
+   ],
+   "epsshrinksd": [
+    [15.235]
+   ],
+   "epsshrinkvr": [
+    [28.149]
+   ],
+   "final": {
+    "theta": [5.2, 1.14, 0.647, 0.964, 0.842, 0.79, -1.15, 4.47, -0.171],
+    "omega": {
+     "ETA1": [0.385],
+     "ETA2": [0.0, 0.539]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.258, 0.314, 0.105, 0.315, 0.379, 0.0658, 0.308, 2.1, 0.103],
+    "omega": {
+     "ETA1": [0.131],
+     "ETA2": [null, 0.188]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.0666],
+    "TH 2": [0.00283, 0.0985],
+    "TH 3": [6.38e-05, 0.00459, 0.0109],
+    "TH 4": [-0.0666, -0.00292, -0.000305, 0.0995],
+    "TH 5": [-0.00275, -0.0962, -0.000513, 0.00369, 0.143],
+    "TH 6": [-0.000185, -0.00258, -0.00335, 0.000219, 0.000525, 0.00433],
+    "TH 7": [-0.000776, -0.00496, -0.0108, 0.00102, 0.00162, 0.0147, 0.0947],
+    "TH 8": [-0.00245, -0.0472, -0.044, 0.00576, 0.032, 0.024, 0.0763, 4.4],
+    "TH 9": [0.000118, 0.00232, 0.00221, -0.000263, -0.00156, -0.00121, -0.00384, -0.214, 0.0107],
+    "OM11": [9.06e-05, 2.6e-06, -0.000207, -0.000334, -0.000339, 7.12e-05, 0.00026, 0.00792, -0.000426, 0.0171],
+    "OM12": [null, null, null, null, null, null, null, null, null, null, null],
+    "OM22": [0.00014, 0.00098, 0.00118, -0.000184, -0.000274, 0.000144, 0.00254, 0.011, -0.000615, 0.00052, null, 0.0353],
+    "SG11": [null, null, null, null, null, null, null, null, null, null, null, null, null]
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #3121 anchor: residual SD a non-affine function of IPRED, A*EXP(B*IPRED)/SQRT(NIND)",
+  "; Natural-scale naproxen arm means (data/mbma_naproxen.csv, DV*WPSE), study-level random",
+  "; effects. The within-arm SD model A*EXP(B*IPRED) divided by SQRT(NIND) is the SE of the arm",
+  "; mean; no combined / power form expresses it (d2SD/dIPRED2 != 0).",
+  "$INPUT ID ARM TIME DV TRT FLARE NIND MDV",
+  "$DATA ipred_magnitude.csv IGNORE=@",
+  "$PRED",
+  " E0    = THETA(1) + THETA(4)*FLARE + ETA(1)",
+  " EMAX  = THETA(2) + THETA(5)*FLARE + THETA(6)*TRT + ETA(2)",
+  " ET50  = THETA(3) * EXP(THETA(7)*TRT)",
+  " IPRED = E0 - EMAX*TIME/(TIME + ET50)",
+  " W     = THETA(8)*EXP(THETA(9)*IPRED)/SQRT(NIND)",
+  " Y     = IPRED + W*EPS(1)",
+  "$THETA",
+  " (1.0, 5.19, 20.0)    ; TVE0",
+  " (-5.0, 0.88, 20.0)   ; TVEMAX",
+  " (0.01, 0.70, 20.0)   ; TVET50",
+  " (-10.0, 0.97, 10.0)  ; B_E0_FLARE",
+  " (-10.0, 1.10, 10.0)  ; B_EMAX_FLARE",
+  " (-10.0, 0.79, 10.0)  ; B_EMAX_TRT",
+  " (-10.0, -1.18, 10.0) ; B_LET50_TRT",
+  " (0.01, 1.0, 100.0)   ; A",
+  " (-5.0, 0.1, 5.0)     ; B",
+  "$OMEGA 0.393129       ; ETA_E0   (0.627 sd)",
+  "$OMEGA 0.582169       ; ETA_EMAX (0.763 sd)",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=10 SIGL=12 NSIG=4 FORMAT=s1PE23.16",
+  "$COVARIANCE MATRIX=R SIGL=12"
+ ]
+}

@@ -1,0 +1,112 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "warfarin.csv",
+ "data_records": 120,
+ "observations": 110,
+ "individuals": 10,
+ "nmtran_warnings": [2, 97],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -286.759,
+   "objv_without_constant": -286.7588228019364,
+   "objv_with_constant": -84.5923454969084,
+   "function_evaluations": 3397,
+   "significant_digits": 1.1,
+   "etabar": [
+    [-5.2541e-08, -3.5885e-05, -0.00014384]
+   ],
+   "etabar_se": [
+    [0.053456, 0.030939, 0.18316]
+   ],
+   "p_val": [
+    [1.0, 0.99907, 0.99937]
+   ],
+   "etashrinksd": [
+    [0.028875, 0.18683, 0.058623]
+   ],
+   "etashrinkvr": [
+    [0.057742, 0.37332, 0.11721]
+   ],
+   "ebvshrinksd": [
+    [0.025182, 0.1819, 0.031999]
+   ],
+   "ebvshrinkvr": [
+    [0.050358, 0.36348, 0.063988]
+   ],
+   "relativeinf": [
+    [99.95, 99.636, 99.936]
+   ],
+   "epsshrinksd": [
+    [14.685]
+   ],
+   "epsshrinkvr": [
+    [27.214]
+   ],
+   "final": {
+    "theta": [0.133, 7.74, 0.811, 1.11],
+    "omega": {
+     "ETA1": [0.0286],
+     "ETA2": [0.0, 0.00961],
+     "ETA3": [0.0, 0.0, 0.336]
+    },
+    "sigma": {
+     "EPS1": [7.31e-05]
+    }
+   },
+   "standard_error": {
+    "theta": [0.00707, 0.24, 0.148, 0.122],
+    "omega": {
+     "ETA1": [0.0128],
+     "ETA2": [null, 0.00431],
+     "ETA3": [null, null, 0.15]
+    },
+    "sigma": {
+     "EPS1": [3.49e-05]
+    }
+   },
+   "covariance": {
+    "TH 1": [4.99e-05],
+    "TH 2": [1.79e-05, 0.0575],
+    "TH 3": [9.71e-07, -7.74e-07, 0.0219],
+    "TH 4": [-2.3e-05, 0.000109, 0.0003, 0.015],
+    "OM11": [2e-09, 1.28e-06, 2.09e-06, -4.94e-06, 0.000164],
+    "OM12": [null, null, null, null, null, null],
+    "OM13": [null, null, null, null, null, null, null],
+    "OM22": [-1.15e-09, -4.61e-07, 7.37e-07, 2.58e-06, 1.36e-08, null, null, 1.86e-05],
+    "OM23": [null, null, null, null, null, null, null, null, null],
+    "OM33": [5.47e-08, 5.53e-06, 2.24e-05, 0.000144, 5.26e-09, null, null, 5.99e-07, null, 0.0226],
+    "SG11": [6.17e-09, -2.55e-08, -8.27e-08, -4.03e-06, 1.5e-09, null, null, -7.9e-10, null, -4.44e-08, 1.22e-09]
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Warfarin 1-cpt oral - power residual error (ferx-core #1182 anchor)",
+  "$DATA warfarin.csv IGNORE=@",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED + IPRED**THETA(4)*EPS(1)",
+  "$THETA (0, 0.13)   ; TVCL",
+  "$THETA (0, 8.0)    ; TVV",
+  "$THETA (0, 1.0)    ; TVKA",
+  "$THETA (0.01, 1.3, 10) ; RUV_POW",
+  "$OMEGA 0.09        ; ETA_CL",
+  "$OMEGA 0.04        ; ETA_V",
+  "$OMEGA 0.30        ; ETA_KA",
+  "$SIGMA 0.01        ; sigma^2 (SD 0.1, matching the .ferx init)",
+  "$ESTIMATION METHOD=COND INTERACTION MAXEVAL=9999 PRINT=5 NOABORT SIGDIGITS=4",
+  "$COVARIANCE MATRIX=R UNCONDITIONAL",
+  "$TABLE ID TIME IPRED CWRES NOPRINT ONEHEADER FILE=sdtab_power"
+ ]
+}

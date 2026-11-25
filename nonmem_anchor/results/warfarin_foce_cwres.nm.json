@@ -1,0 +1,82 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "warfarin_foce_cwres.csv",
+ "data_records": 120,
+ "observations": 110,
+ "individuals": 10,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL",
+  "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation",
+   "objv": -280.36,
+   "objv_without_constant": -280.35950111582304,
+   "objv_with_constant": -78.19302381079504,
+   "function_evaluations": 246,
+   "significant_digits": 3.2,
+   "etabar": [
+    [-0.0020669, 0.00066565, 0.11136]
+   ],
+   "etabar_se": [
+    [0.053454, 0.03089, 0.18337]
+   ],
+   "p_val": [
+    [0.96915, 0.98281, 0.54366]
+   ],
+   "etashrinksd": [
+    [0.033884, 0.18833, 0.024758]
+   ],
+   "etashrinkvr": [
+    [0.067756, 0.37631, 0.04951]
+   ],
+   "ebvshrinksd": [
+    [0.028105, 0.17921, 0.025484]
+   ],
+   "ebvshrinkvr": [
+    [0.056201, 0.3581, 0.050962]
+   ],
+   "relativeinf": [
+    [99.944, 99.642, 99.949]
+   ],
+   "epsshrinksd": [
+    [14.685]
+   ],
+   "epsshrinkvr": [
+    [27.213]
+   ],
+   "final": {
+    "theta": [0.133, 7.73, 0.725],
+    "omega": {
+     "ETA1": [0.0286],
+     "ETA2": [0.0, 0.00958],
+     "ETA3": [0.0, 0.0, 0.349]
+    },
+    "sigma": {
+     "EPS1": [0.000115]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Warfarin 1cpt oral FOCE (no INTER) - ferx #1710 CWRES oracle",
+  "$DATA warfarin_foce_cwres.csv IGNORE=@",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1))",
+  "$THETA (0, 0.2) (0, 10.0) (0, 1.5)",
+  "$OMEGA 0.09 0.04 0.30",
+  "$SIGMA 0.0004",
+  "$ESTIMATION METHOD=1 MAXEVAL=9999 NSIG=3 SIGL=9 PRINT=5 NOABORT POSTHOC FORMAT=s1PE23.16",
+  "$TABLE ID TIME EVID CWRES PRED NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=warfarin_foce_cwres.tab"
+ ]
+}

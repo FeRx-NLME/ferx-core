@@ -73,7 +73,7 @@ use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
-/// NONMEM `#OBJV` from `nonmem_anchor/results/mr_tad.lst`.
+/// NONMEM `#OBJV` from `nonmem_anchor/results/mr_tad.nm.json`.
 const NONMEM_OFV: f64 = -234.478_425_749_153_05;
 
 /// `{ELIM}` is the elimination term: the anchor uses the `TAD` factor, and the

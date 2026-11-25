@@ -1,0 +1,128 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "covariate_cat2.csv",
+ "data_records": 660,
+ "observations": 600,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -73.827,
+   "objv_without_constant": -73.82661710980886,
+   "objv_with_constant": 1028.8996227357982,
+   "function_evaluations": 177,
+   "significant_digits": 3.8,
+   "etabar": [
+    [0.0093944, -0.0057218]
+   ],
+   "etabar_se": [
+    [0.034201, 0.040696]
+   ],
+   "p_val": [
+    [0.78356, 0.88819]
+   ],
+   "etashrinksd": [
+    [7.9208, 3.1431]
+   ],
+   "etashrinkvr": [
+    [15.214, 6.1874]
+   ],
+   "ebvshrinksd": [
+    [7.9125, 2.8945]
+   ],
+   "ebvshrinkvr": [
+    [15.199, 5.7052]
+   ],
+   "relativeinf": [
+    [84.791, 94.283]
+   ],
+   "epsshrinksd": [
+    [8.7047]
+   ],
+   "epsshrinkvr": [
+    [16.652]
+   ],
+   "final": {
+    "theta": [0.983, 21.4, 1.03, 0.683],
+    "omega": {
+     "ETA1": [0.0828],
+     "ETA2": [0.0, 0.106]
+    },
+    "sigma": {
+     "EPS1": [0.0382]
+    }
+   },
+   "standard_error": {
+    "theta": [0.0595, 0.97, 0.0306, 0.137],
+    "omega": {
+     "ETA1": [0.0182],
+     "ETA2": [null, 0.0205]
+    },
+    "sigma": {
+     "EPS1": [0.00254]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.00354],
+    "TH 2": [-0.00363, 0.942],
+    "TH 3": [-0.000261, 0.00858, 0.000935],
+    "TH 4": [-0.00605, 0.00651, 0.000424, 0.0189],
+    "OM11": [-6.73e-05, 0.000476, 3.3e-05, 8.76e-05, 0.000332],
+    "OM12": [null, null, null, null, null, null],
+    "OM22": [-3.57e-05, 0.000122, 6.31e-06, 3.86e-05, 3.64e-06, null, 0.000422],
+    "SG11": [6.77e-06, 0.000148, 1.59e-06, -1.17e-06, -2.77e-06, null, -1.06e-06, 6.44e-06]
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1312 anchor -- `categorical` (MFL `cat`), the reparameterization twin",
+  "; The `1 + THETA(4)` shape of the same covariate effect on the same data as",
+  "; `covariate_cat2.ctl`, started at the corresponding value (0.999 - 1 = -0.001,",
+  "; the PsN / ferx `categorical` default init). The pair exists so the identity",
+  "; theta_cat2 = 1 + theta_cat is anchored *in NONMEM* and not only inside ferx:",
+  "; both runs must land on the same OFV, and NONMEM's two thetas must differ by 1.",
+  ";",
+  "; CMT is dropped so NONMEM routes doses to the depot and observations to the",
+  "; default observation compartment (2) under ADVAN2.",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE=DROP MDV SEX",
+  "$DATA covariate_cat2.csv IGNORE=@",
+  "",
+  "$SUBROUTINE ADVAN2 TRANS2",
+  "",
+  "$PK",
+  "  ; The `cat` shape: the reference level contributes 1, each non-reference level",
+  "  ; 1 + its own THETA -- an offset from the reference, not the factor itself.",
+  "  COVCL = 1",
+  "  IF (SEX.EQ.1) COVCL = 1 + THETA(4)",
+  "  CL = THETA(1)*COVCL*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)",
+  "  S2 = V",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.01,  1.0,    100.0)  ; TVCL",
+  "  (1.0,   20.0,   500.0)  ; TVV",
+  "  (0.01,  1.0,    20.0)   ; TVKA",
+  "  (-1.0, -0.001,  5.0)    ; THETA_CL_SEX_1 -- the PsN / ferx `categorical`",
+  "                          ; default init and bounds.",
+  "",
+  "$OMEGA",
+  "  0.09   ; ETA(1) CL BSV",
+  "  0.09   ; ETA(2) V  BSV",
+  "",
+  "$SIGMA",
+  "  0.04   ; proportional residual variance",
+  "",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=5 NOABORT",
+  "$COVARIANCE MATRIX=R",
+  "$TABLE ID TIME SEX IPRED CWRES NOPRINT NOAPPEND ONEHEADER FILE=covariate_cat.tab"
+ ]
+}

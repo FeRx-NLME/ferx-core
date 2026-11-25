@@ -1,0 +1,94 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "warfarin_iov.csv",
+ "data_records": 240,
+ "observations": 220,
+ "individuals": 10,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Importance Sampling",
+   "objv": 310.127,
+   "objv_without_constant": 310.12658699053594,
+   "objv_with_constant": 714.4595416005919,
+   "etabar": [
+    [-0.0027852, -9.0644e-05, 0.0060579, -0.066083, 0.067141]
+   ],
+   "etabar_se": [
+    [0.052709, 0.028058, 0.03508, 0.047154, 0.034286]
+   ],
+   "p_val": [
+    [0.95786, 0.99742, 0.8629, 0.16109, 0.050198]
+   ],
+   "etashrinksd": [
+    [16.711, 14.497, 34.274, 12.896, 31.896]
+   ],
+   "etashrinkvr": [
+    [30.629, 26.892, 56.801, 24.129, 53.618]
+   ],
+   "ebvshrinksd": [
+    [17.54, 13.508, 32.968, 22.539, 21.935]
+   ],
+   "ebvshrinkvr": [
+    [32.003, 25.191, 55.067, 39.998, 39.058]
+   ],
+   "relativeinf": [
+    [1.8217, 67.681, 33.209, 1.5501, 1.5922]
+   ],
+   "epsshrinksd": [
+    [7.6758]
+   ],
+   "epsshrinkvr": [
+    [14.762]
+   ],
+   "final": {
+    "theta": [0.172, 8.63, 1.19],
+    "omega": {
+     "ETA1": [0.0401],
+     "ETA2": [0.0, 0.0108],
+     "ETA3": [0.0, 0.0, 0.0286],
+     "ETA4": [0.0, 0.0, 0.0, 0.0351],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.0351]
+    },
+    "sigma": {
+     "EPS1": [0.0356]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Warfarin IOV (CL) - IMP estimation with inter-occasion variability (#2301)",
+  "; Same model, data and initial estimates as warfarin_iov_impmap.ctl; only the",
+  "; method differs (IMP: MAP on the first iteration only, then the proposal is",
+  "; re-centred on the previous iteration's sample moments \u2014 ferx `method = imp`).",
+  "; IOV is written NONMEM's way: one ETA per occasion sharing a variance via",
+  "; BLOCK(1) SAME, which ferx spells `kappa`.",
+  "$DATA warfarin_iov.csv IGNORE=@",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV OCC",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  OCC1 = 0",
+  "  OCC2 = 0",
+  "  IF(OCC.EQ.1) OCC1 = 1",
+  "  IF(OCC.EQ.2) OCC2 = 1",
+  "  IOVCL = OCC1*ETA(4) + OCC2*ETA(5)",
+  "  CL = THETA(1)*EXP(ETA(1) + IOVCL)",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1))",
+  "$THETA (0, 0.2)   ; TVCL",
+  "$THETA (0, 10.0)  ; TVV",
+  "$THETA (0, 1.5)   ; TVKA",
+  "$OMEGA 0.09       ; ETA_CL  (BSV)",
+  "$OMEGA 0.04       ; ETA_V   (BSV)",
+  "$OMEGA 0.30       ; ETA_KA  (BSV)",
+  "$OMEGA BLOCK(1) 0.01   ; KAPPA_CL occasion 1",
+  "$OMEGA BLOCK(1) SAME   ; KAPPA_CL occasion 2 (same variance => IOV)",
+  "$SIGMA 0.04       ; proportional variance (= 0.2 SD, the .ferx init)",
+  "$ESTIMATION METHOD=IMP INTERACTION NITER=200 ISAMPLE=300 PRINT=1 SEED=12345 NOABORT"
+ ]
+}

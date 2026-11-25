@@ -68,7 +68,7 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     assert!(result.converged, "LTBS fit should converge");
 
     // Cross-check against the NONMEM 7.5.1 FOCEI reference (see module docs and
-    // tests/nonmem/warfarin_ltbs.lst). Tolerances absorb optimizer/engine noise.
+    // tests/nonmem/warfarin_ltbs.nm.json). Tolerances absorb optimizer/engine noise.
     const NM_OFV: f64 = -675.3016;
     const NM_TVCL: f64 = 0.132697;
     const NM_TVV: f64 = 7.73826;
@@ -195,7 +195,7 @@ fn ltbs_warfarin_analytic_lbfgs_matches_nonmem() {
 /// (`log(DV) ~ additive`) not covered by the proportional/combined-error and IOV
 /// cross-checks in `warfarin_covariance_nonmem.rs`.
 ///
-/// Reference SEs from `tests/nonmem/warfarin_ltbs.lst`, `STANDARD ERROR OF
+/// Reference SEs from `tests/nonmem/warfarin_ltbs.nm.json`, `STANDARD ERROR OF
 /// ESTIMATE` block (`$COVARIANCE UNCONDITIONAL` = `MATRIX=R`). NONMEM reports
 /// `SIGMA(1,1)` on the variance scale; ferx's `ADD_LOG` is an SD, so the
 /// variance-scale SE `1.69e-5` is converted to the SD scale via the delta method
@@ -224,7 +224,7 @@ fn ltbs_covariance_se_matches_nonmem() {
     let se_omega = result.se_omega.as_ref().expect("omega SEs present");
     let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");
 
-    // NONMEM 7.5.1 FOCEI $COVARIANCE MATRIX=R SEs (warfarin_ltbs.lst).
+    // NONMEM 7.5.1 FOCEI $COVARIANCE MATRIX=R SEs (warfarin_ltbs.nm.json).
     // (name, ferx SE, NONMEM SE, relative band)
     const NM_SE_SIGMA_SD: f64 = 1.69e-5 / (2.0 * 0.010564); // var-scale → SD-scale
     let checks = [

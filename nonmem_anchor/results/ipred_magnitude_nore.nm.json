@@ -1,0 +1,72 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "ipred_magnitude.csv",
+ "data_records": 122,
+ "observations": 122,
+ "individuals": 122,
+ "nmtran_warnings": [1, 132],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order",
+   "objv": -36.322,
+   "objv_without_constant": -36.321931791661434,
+   "objv_with_constant": 187.89907031027872,
+   "function_evaluations": 290,
+   "significant_digits": 4.2,
+   "final": {
+    "theta": [5.04, 0.807, 0.497, 1.23, 0.894, 0.81, -2.71, 2.13, 0.23],
+    "omega": {
+     "ETA1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.161, 0.236, 0.395, 0.213, 0.248, 0.175, 3.78, 0.63, 0.062],
+    "omega": {
+     "ETA1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.0259],
+    "TH 2": [0.0284, 0.0558],
+    "TH 3": [0.00135, 0.0439, 0.156],
+    "TH 4": [-0.0255, -0.0295, -0.00979, 0.0452],
+    "TH 5": [-0.027, -0.038, -0.00426, 0.0473, 0.0613],
+    "TH 6": [-0.0018, -0.0226, -0.0458, 0.0031, 0.00321, 0.0306],
+    "TH 7": [-0.0243, -0.146, -0.287, 0.0472, 0.094, 0.383, 14.3],
+    "TH 8": [0.00648, 0.00515, 0.00453, -1.42e-05, 0.00288, 0.00635, 0.099, 0.397],
+    "TH 9": [-0.000789, -0.000573, -0.000498, -5.9e-05, -0.000367, -0.000667, -0.0107, -0.0381, 0.00384],
+    "OM11": [null, null, null, null, null, null, null, null, null, null]
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #3121 anchor, no random effects (IPRED = PRED): SD = A*EXP(B*IPRED)/SQRT(NIND)",
+  "; The arm-level form an MBMA summary-data model needs: no ETA, so the objective is the exact",
+  "; extended-least-squares likelihood and the SD moves with theta through the prediction.",
+  "$INPUT ID ARM TIME DV TRT FLARE NIND MDV",
+  "$DATA ipred_magnitude.csv IGNORE=@",
+  "$PRED",
+  " E0    = THETA(1) + THETA(4)*FLARE",
+  " EMAX  = THETA(2) + THETA(5)*FLARE + THETA(6)*TRT",
+  " ET50  = THETA(3) * EXP(THETA(7)*TRT)",
+  " IPRED = E0 - EMAX*TIME/(TIME + ET50)",
+  " W     = THETA(8)*EXP(THETA(9)*IPRED)/SQRT(NIND)",
+  " Y     = IPRED + W*EPS(1)",
+  "$THETA",
+  " (1.0, 5.19, 20.0)    ; TVE0",
+  " (-5.0, 0.88, 20.0)   ; TVEMAX",
+  " (0.01, 0.70, 20.0)   ; TVET50",
+  " (-10.0, 0.97, 10.0)  ; B_E0_FLARE",
+  " (-10.0, 1.10, 10.0)  ; B_EMAX_FLARE",
+  " (-10.0, 0.79, 10.0)  ; B_EMAX_TRT",
+  " (-10.0, -1.18, 10.0) ; B_LET50_TRT",
+  " (0.01, 1.0, 100.0)   ; A",
+  " (-5.0, 0.1, 5.0)     ; B",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=0 MAXEVAL=9999 PRINT=10 SIGL=12 NSIG=4 FORMAT=s1PE23.16",
+  "$COVARIANCE MATRIX=R SIGL=12"
+ ]
+}

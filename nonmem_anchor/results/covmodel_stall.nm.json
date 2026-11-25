@@ -1,0 +1,111 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "covmodel_stall.csv",
+ "data_records": 330,
+ "observations": 300,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -1199.43,
+   "objv_without_constant": -1199.4297842339142,
+   "objv_with_constant": -648.0666643111107,
+   "function_evaluations": 578,
+   "significant_digits": 3.0,
+   "etabar": [
+    [0.00030673, 0.0038475, -0.0021386, -0.00097475, 0.0041527]
+   ],
+   "etabar_se": [
+    [0.059626, 0.057847, 0.040461, 0.034837, 0.073615]
+   ],
+   "p_val": [
+    [0.9959, 0.94697, 0.95785, 0.97768, 0.95501]
+   ],
+   "etashrinksd": [
+    [0.31793, 2.7338, 2.1932, 2.0492, 3.6049]
+   ],
+   "etashrinkvr": [
+    [0.63484, 5.3928, 4.3383, 4.0564, 7.0798]
+   ],
+   "ebvshrinksd": [
+    [0.20267, 1.5946, 2.6744, 2.1109, 1.7622]
+   ],
+   "ebvshrinkvr": [
+    [0.40493, 3.1637, 5.2772, 4.1773, 3.4933]
+   ],
+   "relativeinf": [
+    [99.584, 96.626, 94.518, 95.801, 96.292]
+   ],
+   "epsshrinksd": [
+    [27.763]
+   ],
+   "epsshrinkvr": [
+    [47.818]
+   ],
+   "final": {
+    "theta": [4.94, 48.6, 9.58, 94.2, 1.26, 0.73, 0.555, 0.577],
+    "omega": {
+     "ETA1": [0.107],
+     "ETA2": [0.0, 0.106],
+     "ETA3": [0.0, 0.0, 0.0513],
+     "ETA4": [0.0, 0.0, 0.0, 0.0379],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.175]
+    },
+    "sigma": {
+     "EPS1": [0.000385]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM two-cpt oral with three covariate thetas (#1290 anchor)",
+  "; The NONMEM twin of examples/two_cpt_oral_covmodel.ferx, started from the same",
+  "; initial estimates, so the reported OFV / thetas are directly comparable with",
+  "; the ferx fit of that file.",
+  "$INPUT ID TIME DV EVID AMT CMT RATE MDV WT CRCL",
+  "$DATA covmodel_stall.csv IGNORE=@",
+  "; covmodel_stall.csv is data/two_cpt_oral_cov.csv with observation CMT",
+  "; recoded 1 -> 2: ferx `two_cpt_oral` reads CMT=1 observations from the central",
+  "; compartment, ADVAN4 numbers the depot 1 and the central 2.",
+  "$SUBROUTINE ADVAN4 TRANS4",
+  "",
+  "$PK",
+  "  CL = THETA(1) * (WT/70)**THETA(6) * (CRCL/100)**THETA(7) * EXP(ETA(1))",
+  "  V2 = THETA(2) * (WT/70)**THETA(8) * EXP(ETA(2))",
+  "  Q  = THETA(3) * EXP(ETA(3))",
+  "  V3 = THETA(4) * EXP(ETA(4))",
+  "  KA = THETA(5) * EXP(ETA(5))",
+  "  S2 = V2",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = F * (1 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.1, 4.0,  100.0)   ; TVCL",
+  "  (1.0, 40.0, 500.0)   ; TVV1",
+  "  (0.1, 8.0,  100.0)   ; TVQ",
+  "  (1.0, 80.0, 500.0)   ; TVV2",
+  "  (0.01, 1.0, 10.0)    ; TVKA",
+  "  (0.01, 0.6, 5.0)     ; THETA_CL_WT",
+  "  (0.01, 0.3, 5.0)     ; THETA_CL_CRCL",
+  "  (0.01, 0.6, 5.0)     ; THETA_V1_WT",
+  "",
+  "$OMEGA",
+  "  0.15   ; ETA_CL",
+  "  0.15   ; ETA_V1",
+  "  0.08   ; ETA_Q",
+  "  0.08   ; ETA_V2",
+  "  0.20   ; ETA_KA",
+  "",
+  "$SIGMA",
+  "  0.0016  ; PROP_ERR  (ferx declares `~ 0.04 (sd)`; NONMEM takes the variance)",
+  "",
+  "$ESTIMATION METHOD=1 INTERACTION MAXEVAL=9999 PRINT=5 NOABORT",
+  "$COVARIANCE MATRIX=R"
+ ]
+}

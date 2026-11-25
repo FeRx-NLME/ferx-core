@@ -19,7 +19,7 @@
 //!
 //! ## NONMEM cross-check
 //!
-//! From `tests/nonmem/datsim_oral.lst` (NONMEM 7.6, FOCEI INTER, `$SIGMA 1`):
+//! From `tests/nonmem/datsim_oral.nm.json` (NONMEM 7.6, FOCEI INTER, `$SIGMA 1`):
 //!
 //! | Parameter | ferx (FD) | NONMEM 7.6 |
 //! |-----------|-----------|------------|
@@ -111,7 +111,7 @@ fn corrected_structural_model_matches_nonmem_ofv() {
     assert!(
         (result.ofv - EXPECTED_OFV).abs() < TOLERANCE,
         "OFV {:.3} is outside the NONMEM-anchored band {:.2} ± {:.1} (NONMEM #OBJV \
-         70.851, tests/nonmem/datsim_oral.lst); a value near -29.5 (marginal collapse) \
+         70.851, tests/nonmem/datsim_oral.nm.json); a value near -29.5 (marginal collapse) \
          or ~2400 (floored predictions) is the #261 / ferx-r#154 regression this guards",
         result.ofv,
         EXPECTED_OFV,

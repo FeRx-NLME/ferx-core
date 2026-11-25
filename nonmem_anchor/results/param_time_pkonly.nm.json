@@ -1,0 +1,87 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "param_time_pkonly.csv",
+ "data_records": 420,
+ "observations": 270,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -609.385,
+   "objv_without_constant": -609.384504181914,
+   "objv_with_constant": -113.1576962513908,
+   "function_evaluations": 120,
+   "significant_digits": 3.2,
+   "etabar": [
+    [-0.00029742, -0.00074752]
+   ],
+   "etabar_se": [
+    [0.056684, 0.038176]
+   ],
+   "p_val": [
+    [0.99581, 0.98438]
+   ],
+   "etashrinksd": [
+    [0.72913, 3.097]
+   ],
+   "etashrinkvr": [
+    [1.4529, 6.0981]
+   ],
+   "ebvshrinksd": [
+    [0.6886, 3.0952]
+   ],
+   "ebvshrinkvr": [
+    [1.3725, 6.0946]
+   ],
+   "relativeinf": [
+    [98.575, 93.855]
+   ],
+   "epsshrinksd": [
+    [12.813, 12.813]
+   ],
+   "epsshrinkvr": [
+    [23.984, 23.984]
+   ],
+   "final": {
+    "theta": [2.17, 20.5, 1.95],
+    "omega": {
+     "ETA1": [0.0978],
+     "ETA2": [0.0, 0.0466]
+    },
+    "sigma": {
+     "EPS1": [0.0109],
+     "EPS2": [0.0, 0.0001]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM #1969 parameter time: $PK step on TIME at a dose-tied trough (pkonly)",
+  "$INPUT ID TIME DV AMT EVID CMT MDV",
+  "$DATA param_time_pkonly.csv IGNORE=@",
+  "$SUBROUTINE ADVAN1 TRANS2",
+  "$PK",
+  "  IND = 1",
+  "  IF (TIME.GE.24) IND = THETA(3)",
+  "  CL = THETA(1)*IND*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  S1 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1)) + EPS(2)",
+  "$THETA",
+  "  (0.01, 2.0, 100)   ; TVCL",
+  "  (1.0, 20.0, 500)   ; TVV",
+  "  (0.1, 2.0, 10)     ; IND",
+  "$OMEGA 0.09",
+  "$OMEGA 0.04",
+  "$SIGMA 0.01",
+  "$SIGMA 0.0001 FIX",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 PRINT=5 NOABORT FORMAT=s1PE23.16",
+  "$TABLE ID TIME EVID IND CL IPRED ETA1 ETA2 NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=param_time_pkonly.tab"
+ ]
+}

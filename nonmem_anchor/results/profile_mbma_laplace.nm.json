@@ -1,0 +1,183 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "profile_mbma.csv",
+ "data_records": 96,
+ "observations": 96,
+ "individuals": 12,
+ "nmtran_warnings": [2, 87],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL",
+  "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation with Interaction",
+   "objv": 101.974,
+   "objv_without_constant": 101.9740941880679,
+   "objv_with_constant": 278.41029256336503,
+   "function_evaluations": 4187,
+   "significant_digits": 4.0,
+   "etabar": [
+    [0.023191, -0.038713, 0.070963]
+   ],
+   "etabar_se": [
+    [0.054943, 0.29057, 0.20402]
+   ],
+   "p_val": [
+    [0.67296, 0.89401, 0.72797]
+   ],
+   "etashrinksd": [
+    [24.149, 3.441, 31.913]
+   ],
+   "etashrinkvr": [
+    [42.466, 6.7636, 53.642]
+   ],
+   "ebvshrinksd": [
+    [25.984, 7.2699, 25.936]
+   ],
+   "ebvshrinkvr": [
+    [45.217, 14.011, 45.145]
+   ],
+   "relativeinf": [
+    [30.13, 85.989, 30.169]
+   ],
+   "epsshrinksd": [
+    [28.919]
+   ],
+   "epsshrinkvr": [
+    [49.475]
+   ],
+   "final": {
+    "theta": [45.3, 6.27, 1.68, 0.936, -0.266, 1.36, -0.678, -0.892, 0.771, 1.48, 0.589, -0.519, 0.601, -0.159, -0.504, 0.569, -0.423, 1.42, 0.415, -0.424, 1.42, 0.586, -2.7, 2.9, -1.2, 0.0268, 0.349, 1.66, -2.02, -0.607, -1.33, -1.28, 0.685, -2.55, 0.99, -0.403, 1.57, 0.251, -1.41],
+    "omega": {
+     "ETA1": [0.0639],
+     "ETA2": [0.0, 1.09],
+     "ETA3": [0.0, 0.0, 1.09]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.317, 0.848, 0.539, 0.707, 0.599, 0.499, 0.567, 0.476, 0.444, 0.486, 0.531, 0.548, 0.542, 0.619, 0.49, 0.548, 0.534, 0.499, 0.549, 0.583, 0.532, 0.507, 0.48, 0.529, 0.615, 0.504, 0.499, 0.531, 0.586, 0.503, 0.627, 0.514, 0.466, 0.556, 0.493, 0.615, 0.492, 0.649, 0.517],
+    "omega": {
+     "ETA1": [0.0561],
+     "ETA2": [null, 0.428],
+     "ETA3": [null, null, null]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2107 profile anchor A2-Laplace: profile_mbma under METHOD=COND LAPLACE",
+  "$INPUT ID STUDY OCC TRT TIME DV MDV SE",
+  "$DATA profile_mbma.csv IGNORE=@",
+  "$PRED",
+  " TVE0 = THETA(1)",
+  " EMAX = THETA(2)",
+  " ET50 = THETA(3)",
+  " PLA = 0",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.1) PLA = THETA(4)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.2) PLA = THETA(5)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.4) PLA = THETA(6)",
+  " IF (STUDY.EQ.1.AND.TIME.EQ.8) PLA = -(THETA(4)+THETA(5)+THETA(6))",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.1) PLA = THETA(7)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.2) PLA = THETA(8)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.4) PLA = THETA(9)",
+  " IF (STUDY.EQ.2.AND.TIME.EQ.8) PLA = -(THETA(7)+THETA(8)+THETA(9))",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.1) PLA = THETA(10)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.2) PLA = THETA(11)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.4) PLA = THETA(12)",
+  " IF (STUDY.EQ.3.AND.TIME.EQ.8) PLA = -(THETA(10)+THETA(11)+THETA(12))",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.1) PLA = THETA(13)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.2) PLA = THETA(14)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.4) PLA = THETA(15)",
+  " IF (STUDY.EQ.4.AND.TIME.EQ.8) PLA = -(THETA(13)+THETA(14)+THETA(15))",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.1) PLA = THETA(16)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.2) PLA = THETA(17)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.4) PLA = THETA(18)",
+  " IF (STUDY.EQ.5.AND.TIME.EQ.8) PLA = -(THETA(16)+THETA(17)+THETA(18))",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.1) PLA = THETA(19)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.2) PLA = THETA(20)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.4) PLA = THETA(21)",
+  " IF (STUDY.EQ.6.AND.TIME.EQ.8) PLA = -(THETA(19)+THETA(20)+THETA(21))",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.1) PLA = THETA(22)",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.2) PLA = THETA(23)",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.4) PLA = THETA(24)",
+  " IF (STUDY.EQ.7.AND.TIME.EQ.8) PLA = -(THETA(22)+THETA(23)+THETA(24))",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.1) PLA = THETA(25)",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.2) PLA = THETA(26)",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.4) PLA = THETA(27)",
+  " IF (STUDY.EQ.8.AND.TIME.EQ.8) PLA = -(THETA(25)+THETA(26)+THETA(27))",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.1) PLA = THETA(28)",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.2) PLA = THETA(29)",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.4) PLA = THETA(30)",
+  " IF (STUDY.EQ.9.AND.TIME.EQ.8) PLA = -(THETA(28)+THETA(29)+THETA(30))",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.1) PLA = THETA(31)",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.2) PLA = THETA(32)",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.4) PLA = THETA(33)",
+  " IF (STUDY.EQ.10.AND.TIME.EQ.8) PLA = -(THETA(31)+THETA(32)+THETA(33))",
+  " IF (STUDY.EQ.11.AND.TIME.EQ.1) PLA = THETA(34)",
+  " IF (STUDY.EQ.11.AND.TIME.EQ.2) PLA = THETA(35)",
+  " IF (STUDY.EQ.11.AND.TIME.EQ.4) PLA = THETA(36)",
+  " IF (STUDY.EQ.11.AND.TIME.EQ.8) PLA = -(THETA(34)+THETA(35)+THETA(36))",
+  " IF (STUDY.EQ.12.AND.TIME.EQ.1) PLA = THETA(37)",
+  " IF (STUDY.EQ.12.AND.TIME.EQ.2) PLA = THETA(38)",
+  " IF (STUDY.EQ.12.AND.TIME.EQ.4) PLA = THETA(39)",
+  " IF (STUDY.EQ.12.AND.TIME.EQ.8) PLA = -(THETA(37)+THETA(38)+THETA(39))",
+  " KAP = ETA(2) * (2 - OCC) + ETA(3) * (OCC - 1)",
+  " BASE = TVE0 + PLA + KAP",
+  " DRUG = TRT * EMAX * EXP(ETA(1)) * TIME / (TIME + ET50)",
+  " IPRED = BASE - DRUG",
+  " Y = IPRED + SE * EPS(1)",
+  "$THETA",
+  " (0, 45, 200)    ; TVE0",
+  " (0, 8, 100)     ; EMAX",
+  " (0.01, 2, 100)  ; ET50",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=1,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=1,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=1,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=2,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=2,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=2,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=3,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=3,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=3,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=4,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=4,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=4,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=5,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=5,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=5,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=6,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=6,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=6,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=7,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=7,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=7,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=8,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=8,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=8,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=9,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=9,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=9,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=10,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=10,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=10,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=11,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=11,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=11,TIME=4]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=12,TIME=1]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=12,TIME=2]",
+  " (-50, 0.1, 50) ; PLACEBO[STUDY=12,TIME=4]",
+  "$OMEGA 0.25     ; ETA_EM",
+  "$OMEGA BLOCK(1) 1   ; KAPPA_ARM, OCC 1",
+  "$OMEGA BLOCK(1) SAME ; KAPPA_ARM, OCC 2",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 LAPLACE INTER MAXEVAL=9999 PRINT=10 SIGL=12 NSIG=4 FORMAT=s1PE23.16",
+  "$COVARIANCE MATRIX=R SIGL=12"
+ ]
+}

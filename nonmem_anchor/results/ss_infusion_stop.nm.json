@@ -1,0 +1,46 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "d.csv",
+ "data_records": 664,
+ "observations": 576,
+ "individuals": 36,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order (Evaluation)",
+   "objv": 618099.791,
+   "final": {
+    "theta": [2.0, 20.0, 0.15],
+    "omega": {
+     "ETA1": [0.0]
+    },
+    "sigma": {
+     "EPS1": [0.01]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1586: an infusion running across a mid-timeline SS=1 record (ADVAN2)",
+  "$DATA d.csv IGNORE=@",
+  "$INPUT ID TIME DV EVID AMT CMT MDV II SS RATE LAG1 LAG2",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)",
+  "  KA = THETA(3)",
+  "  ALAG1 = LAG1",
+  "  ALAG2 = LAG2",
+  "  D1 = 8",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y     = IPRED+EPS(1)",
+  "$THETA 2.0 FIX  20.0 FIX  0.15 FIX",
+  "$OMEGA 0 FIX",
+  "$SIGMA 0.01 FIX",
+  "$ESTIMATION MAXEVAL=0 METHOD=0 NOABORT",
+  "$TABLE ID TIME EVID PRED NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=sdtab"
+ ]
+}

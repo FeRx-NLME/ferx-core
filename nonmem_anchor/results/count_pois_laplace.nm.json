@@ -1,0 +1,74 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "count_pois.csv",
+ "data_records": 360,
+ "observations": 360,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "Laplacian Conditional Estimation",
+   "objv": 1514.514,
+   "objv_without_constant": 1514.5136399860762,
+   "objv_with_constant": 1514.5136399860762,
+   "function_evaluations": 524,
+   "significant_digits": 1.0,
+   "etabar": [
+    [0.017251]
+   ],
+   "etabar_se": [
+    [0.060883]
+   ],
+   "p_val": [
+    [0.77691]
+   ],
+   "etashrinksd": [
+    [9.1453]
+   ],
+   "etashrinkvr": [
+    [17.454]
+   ],
+   "ebvshrinksd": [
+    [8.201]
+   ],
+   "ebvshrinkvr": [
+    [15.729]
+   ],
+   "relativeinf": [
+    [84.271]
+   ],
+   "epsshrinksd": [
+    [100.0]
+   ],
+   "epsshrinkvr": [
+    [100.0]
+   ],
+   "final": {
+    "theta": [3.96, 0.679, -0.418],
+    "omega": {
+     "ETA1": [0.269]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2877 count endpoint (pois, laplace): -2 log PMF with ln Gamma(k+1) kept, LAPLACE",
+  "$INPUT ID TIME DV CMT EVID MDV WT TRT",
+  "$DATA count_pois.csv IGNORE=@",
+  "$PRED",
+  " LAM = EXP(LOG(THETA(1)) + THETA(2)*(WT/70 - 1) + THETA(3)*TRT + ETA(1))",
+  "",
+  " Y = -2*(DV*LOG(LAM) - LAM - GAMLN(DV+1))",
+  "$THETA",
+  " (0.01, 4, 100)   ; BASE",
+  " (-10, 0.5, 10)   ; BETA",
+  " (-10, -0.4, 10)  ; GAM",
+  "",
+  "$OMEGA 0.25  ; ETA_C",
+  "$ESTIMATION METHOD=COND LAPLACE -2LL MAXEVAL=9999 NSIG=4 SIGL=12 PRINT=10 NOABORT FORMAT=s1PE23.16"
+ ]
+}

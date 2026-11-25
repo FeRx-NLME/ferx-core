@@ -2,7 +2,7 @@
 
 Self-contained record of the NONMEM run of the joint PK-TTE anchor model, for
 independent evaluation. Companion files in this folder: `nonmem.ctl` (control
-stream, as run), `nonmem.lst` (full output), `nonmem.ext` (iteration/estimates),
+stream, as run), `nonmem.nm.json` (full output), `nonmem.ext` (iteration/estimates),
 `pktte_joint.tab` (tables), `expected.md` (cross-tool comparison table),
 `pktte_joint.csv` (data).
 

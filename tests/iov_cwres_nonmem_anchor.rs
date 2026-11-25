@@ -3,7 +3,7 @@
 //! `tests/nonmem/iov_cwres_{focei,foce}.ctl` are the #985 `mixture_iv_iov` data with the
 //! `$MIX` removed: 1-cpt IV, IIV on CL plus a per-occasion κ on CL (`$OMEGA BLOCK(1) …
 //! SAME`), proportional error, every variance FIXed, `MAXEVAL=0 POSTHOC`, run in NONMEM
-//! 7.5.1 with and without `INTER`. The committed `.ext/.lst/.phi/.tab` are those runs'
+//! 7.5.1 with and without `INTER`. The committed `.ext/.nm.json/.phi/.tab` are those runs'
 //! outputs (OBJ 554.92498260642810 FOCEI, 585.60024484944893 FOCE). ferx evaluates the same
 //! fixed point with `outer_maxiter = 0`, so the comparison is not an optimizer race.
 //!

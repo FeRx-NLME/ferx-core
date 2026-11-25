@@ -1,0 +1,174 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "covmuref_shared.csv",
+ "data_records": 330,
+ "observations": 300,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "Stochastic Approximation Expectation-Maximization",
+   "objv": -2210.552,
+   "objv_without_constant": -2210.5521156051595,
+   "objv_with_constant": -1659.188995682356,
+   "etabar": [
+    [2.0277e-06, -6.7949e-06, -1.0327e-06, -5.5656e-07, -9.3684e-06]
+   ],
+   "etabar_se": [
+    [0.059919, 0.059688, 0.04046, 0.034529, 0.075746]
+   ],
+   "p_val": [
+    [0.99997, 0.99991, 0.99998, 0.99999, 0.9999]
+   ],
+   "etashrinksd": [
+    [0.21174, 2.3455, 2.7712, 2.3066, 2.2476]
+   ],
+   "etashrinkvr": [
+    [0.42304, 4.6359, 5.4657, 4.56, 4.4446]
+   ],
+   "ebvshrinksd": [
+    [0.21047, 2.3485, 2.7669, 2.305, 2.2506]
+   ],
+   "ebvshrinkvr": [
+    [0.4205, 4.6419, 5.4572, 4.5568, 4.4505]
+   ],
+   "relativeinf": [
+    [99.568, 94.995, 94.259, 95.388, 95.191]
+   ],
+   "epsshrinksd": [
+    [27.447]
+   ],
+   "epsshrinkvr": [
+    [47.36]
+   ],
+   "final": {
+    "theta": [4.94, 40.0, 9.6, 94.5, 1.25, 0.73, 0.556, 0.586, 9.75],
+    "omega": {
+     "ETA1": [0.108],
+     "ETA2": [0.0, 0.112],
+     "ETA3": [0.0, 0.0, 0.0519],
+     "ETA4": [0.0, 0.0, 0.0, 0.0375],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.18]
+    },
+    "sigma": {
+     "EPS1": [0.000384]
+    }
+   }
+  },
+  {
+   "method": "Objective Function Evaluation by Importance Sampling",
+   "objv": -1199.333,
+   "objv_without_constant": -1199.3330340639802,
+   "objv_with_constant": -647.9699141411767,
+   "etabar": [
+    [0.00010599, 0.0015943, -0.00047848, -0.0005179, 0.0016851]
+   ],
+   "etabar_se": [
+    [0.059883, 0.059407, 0.040489, 0.034601, 0.075792]
+   ],
+   "p_val": [
+    [0.99859, 0.97859, 0.99057, 0.98806, 0.98226]
+   ],
+   "etashrinksd": [
+    [0.27209, 2.8043, 2.7012, 2.1011, 2.1886]
+   ],
+   "etashrinkvr": [
+    [0.54343, 5.5299, 5.3294, 4.1581, 4.3292]
+   ],
+   "ebvshrinksd": [
+    [0.20717, 1.8484, 2.6642, 2.2208, 1.9193]
+   ],
+   "ebvshrinkvr": [
+    [0.41392, 3.6627, 5.2574, 4.3923, 3.8017]
+   ],
+   "relativeinf": [
+    [99.575, 96.087, 94.524, 95.575, 95.945]
+   ],
+   "epsshrinksd": [
+    [27.747]
+   ],
+   "epsshrinkvr": [
+    [47.795]
+   ],
+   "final": {
+    "theta": [4.94, 40.0, 9.6, 94.5, 1.25, 0.73, 0.556, 0.586, 9.75],
+    "omega": {
+     "ETA1": [0.108],
+     "ETA2": [0.0, 0.112],
+     "ETA3": [0.0, 0.0, 0.0519],
+     "ETA4": [0.0, 0.0, 0.0, 0.0375],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.18]
+    },
+    "sigma": {
+     "EPS1": [0.000384]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM two_cpt_oral_cov, V1 typical value reads TVCL (ETA_CL's anchor) -- SAEM anchor for ferx #1630 case A",
+  "; V1's typical value reads TVCL, the anchor of ETA_CL, and ETA_CL has a covariate",
+  "; mu-reference of its own:",
+  ";",
+  ";     CL_i = THETA(1) * (WT/70)**THETA(6) * (CRCL/100)**THETA(7) * EXP(ETA(1))",
+  ";     V1_i = THETA(1) * THETA(9) * (WT/70)**THETA(8) * EXP(ETA(2))",
+  ";",
+  "; An exact reparameterisation of the control V1 = TVV1 * (WT/70)**THETA(8) with",
+  "; TVV1 = THETA(1)*THETA(9). Before #1630 ferx SAEM declined V1's covariate",
+  "; mu-reference over ETA_CL's anchor pair -- a pair that never runs, since ETA_CL's own",
+  "; group supersedes it -- and landed 10-29 OFV units above the control, THETA_CRCL",
+  "; 0.16-0.24 against 0.556. The ferx side is covmuref_anchor_a_saem_fit.ferx.",
+  ";",
+  "; Data: covmuref_shared.csv (two_cpt_oral_cov with CMT=2 on observation rows; see",
+  "; covmuref_shared_saem.ctl). MU form, linear in log THETA; THETA numbering follows",
+  "; the ferx model, with its unused, FIXed TVV1 (THETA 2) kept FIXed here.",
+  "",
+  "$INPUT ID TIME DV EVID AMT CMT RATE MDV WT CRCL",
+  "$DATA covmuref_shared.csv IGNORE=@",
+  "",
+  "$SUBROUTINES ADVAN4 TRANS4",
+  "",
+  "$PK",
+  "  MU_1 = LOG(THETA(1)) + THETA(6)*LOG(WT/70.0) + THETA(7)*LOG(CRCL/100.0)",
+  "  MU_2 = LOG(THETA(1)) + LOG(THETA(9)) + THETA(8)*LOG(WT/70.0)",
+  "  MU_3 = LOG(THETA(3))",
+  "  MU_4 = LOG(THETA(4))",
+  "  MU_5 = LOG(THETA(5))",
+  "  CL = EXP(MU_1 + ETA(1))",
+  "  V2 = EXP(MU_2 + ETA(2))",
+  "  Q  = EXP(MU_3 + ETA(3))",
+  "  V3 = EXP(MU_4 + ETA(4))",
+  "  KA = EXP(MU_5 + ETA(5))",
+  "  DUM = THETA(2)",
+  "  S2 = V2",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1.0 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.1, 4.0, 100.0)   ; 1 TVCL",
+  "  40.0 FIX            ; 2 TVV1 (unused)",
+  "  (0.1, 8.0, 100.0)   ; 3 TVQ",
+  "  (1.0, 80.0, 500.0)  ; 4 TVV2",
+  "  (0.01, 1.0, 10.0)   ; 5 TVKA",
+  "  (0.01, 0.6, 5.0)    ; 6 THETA_WT",
+  "  (0.01, 0.3, 5.0)    ; 7 THETA_CRCL",
+  "  (0.01, 0.6, 5.0)    ; 8 THETA_WT_V1",
+  "  (0.01, 10.0, 500.0) ; 9 TH_R",
+  "",
+  "$OMEGA",
+  "  0.15   ; ETA_CL",
+  "  0.15   ; ETA_V1",
+  "  0.08   ; ETA_Q",
+  "  0.08   ; ETA_V2",
+  "  0.20   ; ETA_KA",
+  "",
+  "$SIGMA",
+  "  0.0016 ; proportional, = (0.04 SD)^2",
+  "",
+  "$ESTIMATION METHOD=SAEM INTERACTION NBURN=2000 NITER=1000 ISAMPLE=10 PRINT=200 SEED=1630 NOABORT",
+  "$ESTIMATION METHOD=IMP INTERACTION EONLY=1 NITER=10 ISAMPLE=3000 PRINT=1 SEED=1630 NOABORT"
+ ]
+}

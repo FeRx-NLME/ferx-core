@@ -1,0 +1,94 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "warfarin.csv",
+ "data_records": 120,
+ "observations": 110,
+ "individuals": 10,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -287.483,
+   "objv_without_constant": -287.48301406411423,
+   "objv_with_constant": -85.31653675908623,
+   "function_evaluations": 10017,
+   "etabar": [
+    [0.00013748, -0.00028175, -0.0011364, 1.225e-07]
+   ],
+   "etabar_se": [
+    [0.053473, 0.031044, 0.18326, 5.6052e-05]
+   ],
+   "p_val": [
+    [0.99795, 0.99276, 0.99505, 0.99826]
+   ],
+   "etashrinksd": [
+    [0.031374, 0.17541, 0.05336, 99.166]
+   ],
+   "etashrinkvr": [
+    [0.062738, 0.35051, 0.10669, 99.993]
+   ],
+   "ebvshrinksd": [
+    [0.02748, 0.16757, 0.030747, 99.041]
+   ],
+   "ebvshrinkvr": [
+    [0.054953, 0.33486, 0.061484, 99.991]
+   ],
+   "relativeinf": [
+    [99.945, 99.639, 99.763, 0.0091799]
+   ],
+   "epsshrinksd": [
+    [14.689]
+   ],
+   "epsshrinkvr": [
+    [27.221]
+   ],
+   "final": {
+    "theta": [0.133, 7.71, 0.817, 0.0371, 0.0315, 0.00677],
+    "omega": {
+     "ETA1": [0.0286],
+     "ETA2": [0.0, 0.00967],
+     "ETA3": [0.0, 0.0, 0.336],
+     "ETA4": [0.0, 0.0, 0.0, 0.000451]
+    },
+    "sigma": {
+     "EPS1": [0.00011]
+    }
+   }
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM modelsearch anchor (#1181) - LAGTIME(ON);PERIPHERALS(1): 2-cpt oral with a lagged absorption",
+  "; ferx candidate: pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA, lagtime=ALAG).",
+  "; Inits: the base's final estimates (base.ext); Q = CL, V2 = 0.05 * V, ALAG = 0.25 with",
+  "; omega 0.01, as ferx derives them.",
+  "$DATA warfarin.csv IGNORE=@",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV",
+  "$SUBROUTINES ADVAN4 TRANS4",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V2 = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  Q  = THETA(4)",
+  "  V3 = THETA(5)",
+  "  ALAG1 = THETA(6)*EXP(ETA(4))",
+  "  S2 = V2",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1))",
+  "$THETA (0, 0.132695)   ; TVCL",
+  "$THETA (0, 7.73771)    ; TVV",
+  "$THETA (0, 0.810796)   ; TVKA",
+  "$THETA (0, 0.132695)   ; TVQ  = CL",
+  "$THETA (0, 0.3868855)  ; TVV2 = 0.05 * V",
+  "$THETA (0, 0.25)       ; TVALAG",
+  "$OMEGA 0.0285884       ; ETA_CL",
+  "$OMEGA 0.00959179      ; ETA_V",
+  "$OMEGA 0.33588         ; ETA_KA",
+  "$OMEGA 0.01            ; ETA_ALAG",
+  "$SIGMA 0.000111621     ; proportional variance",
+  "$ESTIMATION METHOD=COND INTERACTION MAXEVAL=9999 PRINT=5 NOABORT"
+ ]
+}

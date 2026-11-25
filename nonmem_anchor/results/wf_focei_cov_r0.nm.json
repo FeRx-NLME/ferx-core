@@ -1,0 +1,74 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "warfarin.csv",
+ "data_records": 120,
+ "observations": 110,
+ "individuals": 10,
+ "nmtran_warnings": [2, 111],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction (Evaluation)",
+   "objv": -286.004,
+   "final": {
+    "theta": [0.133, 7.74, 0.811, 0.0106],
+    "omega": {
+     "ETA1": [0.0286],
+     "ETA2": [0.0, 0.00959],
+     "ETA3": [0.0, 0.0, 0.336]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.0071, 0.24, 0.149, 0.000835],
+    "omega": {
+     "ETA1": [0.0128],
+     "ETA2": [null, 0.00431],
+     "ETA3": [null, null, 0.15]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [5.04e-05],
+    "TH 2": [9.8e-07, 0.0576],
+    "TH 3": [6.62e-07, 4.25e-05, 0.0221],
+    "TH 4": [3.06e-09, 1.4e-07, -5.27e-09, 6.98e-07],
+    "OM11": [-1.19e-08, 1.05e-06, 1.47e-07, -2.92e-09, 0.000164],
+    "OM12": [null, null, null, null, null, null],
+    "OM13": [null, null, null, null, null, null, null],
+    "OM22": [-6.27e-09, -2.13e-07, -1.01e-09, -6.17e-09, 1.82e-08, null, null, 1.85e-05],
+    "OM23": [null, null, null, null, null, null, null, null, null],
+    "OM33": [-3.63e-08, 1.16e-06, 1.19e-05, -7.65e-08, -1.71e-07, null, null, 4.61e-07, null, 0.0226],
+    "SG11": [null, null, null, null, null, null, null, null, null, null, null]
+   },
+   "eigenvalues": [0.998, 0.999, 0.999, 1.0, 1.0, 1.0, 1.0]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM warfarin FOCEI eval-only at the NONMEM MLE (6 sig. fig.), MATRIX=R PRINT=E (#2974)",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV",
+  "$DATA warfarin.csv IGNORE=@",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + THETA(4)*EPS(1))",
+  "$THETA (0.001, 0.132695, 10)  ; TVCL",
+  "$THETA (0.1, 7.73775, 500)    ; TVV",
+  "$THETA (0.01, 0.8108, 50)    ; TVKA",
+  "$THETA (0, 0.0105651)           ; PROP_ERR (SD)",
+  "$OMEGA 0.0285883 0.00959254 0.335859",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=0 NOABORT",
+  "$COVARIANCE MATRIX=R PRINT=E",
+  ""
+ ]
+}

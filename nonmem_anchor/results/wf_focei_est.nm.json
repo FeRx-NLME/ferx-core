@@ -1,0 +1,28 @@
+{
+ "data_file": "warfarin.csv",
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [],
+ "control_stream_as_run": [
+  "$PROBLEM warfarin FOCEI estimate (#2974): the MLE the S/R/RSR eval-only runs sit at",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV",
+  "$DATA warfarin.csv IGNORE=@",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  CL = THETA(1)*EXP(ETA(1))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + THETA(4)*EPS(1))",
+  "$THETA (0.001, 0.15, 10)  ; TVCL",
+  "$THETA (0.1, 8.0, 500)    ; TVV",
+  "$THETA (0.01, 1.2, 50)    ; TVKA",
+  "$THETA (0, 0.1)           ; PROP_ERR (SD)",
+  "$OMEGA 0.07 0.02 0.10",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=9999 NSIG=4 SIGL=10 PRINT=10 NOABORT",
+  ""
+ ]
+}

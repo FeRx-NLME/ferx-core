@@ -1,0 +1,60 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "tte_weibull.csv",
+ "data_records": 100,
+ "observations": 100,
+ "individuals": 100,
+ "nmtran_warnings": [1, 3, 99],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order",
+   "objv": 640.261,
+   "objv_without_constant": 640.260724521751,
+   "objv_with_constant": 640.260724521751,
+   "function_evaluations": 28,
+   "significant_digits": 3.2,
+   "final": {
+    "theta": [3.1, 0.751],
+    "omega": {
+     "ETA1": [0.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.0522, 0.0932],
+    "omega": {
+     "ETA1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.00272],
+    "TH 2": [0.000263, 0.00869],
+    "OM11": [null, null, null]
+   },
+   "eigenvalues": [0.946, 1.05]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM    TTE Weibull (scale param) \u2013 Phase 1 ferx validation",
+  "$INPUT      ID TIME DV EVID CMT MDV",
+  "$DATA      tte_weibull.csv IGNORE=@",
+  "$PRED",
+  "  SCALE  = EXP(THETA(1))           ; scale (time units): H=(t/scale)^shape",
+  "  SHAPE  = EXP(THETA(2) + ETA(1))  ; shape (dimensionless)",
+  "  CHZ    = (TIME/SCALE)**SHAPE      ; H(t)",
+  "  HAZNOW = (SHAPE/SCALE)*(TIME/SCALE)**(SHAPE-1)  ; h(t)",
+  "  F_FLAG = 1",
+  "  IF (DV.EQ.0) Y = EXP(-CHZ)",
+  "  IF (DV.EQ.1) Y = HAZNOW * EXP(-CHZ)",
+  "",
+  "$THETA  (0.001,3.0,10) ; log(scale): init log(20) = 2.996",
+  "$THETA  (0.001,0.693,5) ; log(shape): init log(2.0) = 0.693",
+  "$OMEGA  0  FIX  ; var(eta.shape)",
+  ";$ESTIMATION METHOD=CONDITIONAL LAPLACIAN INTERACTION MAXEVAL=9999 PRINT=1 NOABORT",
+  "$ESTIMATION METHOD=0 MAXEVAL=9999 PRINT=1",
+  "$COVARIANCE PRINT=E",
+  "$TABLE      ID TIME DV NOPRINT NOAPPEND FILE=tte_weibull.sdtab"
+ ]
+}
