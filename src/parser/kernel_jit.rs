@@ -938,10 +938,6 @@ impl PkNum for Tr {
     fn sqrt(self) -> Self {
         self.unary(T_SQRT, Unary::Sqrt, self.v.sqrt())
     }
-    fn sqrt_vm(self) -> Self {
-        let v = if self.v >= 0.0 { self.v } else { 0.0 };
-        self.unary(T_SQRT_VM, Unary::SqrtRhs, v.sqrt())
-    }
     /// One primitive, not the iteration: its count of steps depends on the values.
     fn gamma_pq(self, x: Self, upper: bool) -> Self {
         self.gamma_part(x, upper, 0, 0)
@@ -1197,6 +1193,10 @@ impl crate::sens::num::vm::VmArith for Tr {
     }
     fn same_bits(&self, other: &Self) -> bool {
         self.r == other.r && self.dep == other.dep && self.v.to_bits() == other.v.to_bits()
+    }
+    fn sqrt_vm(self) -> Self {
+        let v = if self.v >= 0.0 { self.v } else { 0.0 };
+        self.unary(T_SQRT_VM, Unary::SqrtRhs, v.sqrt())
     }
 }
 

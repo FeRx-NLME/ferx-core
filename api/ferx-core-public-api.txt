@@ -2064,7 +2064,6 @@ pub fn ferx_core::sens::dual2::Dual2<N>::same_bits_untaped(&self, other: &Self) 
 pub fn ferx_core::sens::dual2::Dual2<N>::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sin(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual2::Dual2<N>::sqrt_vm(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::value_only(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::var(x: f64, dim: usize) -> Self
 pub mod ferx_core::sens::num
@@ -2139,7 +2138,6 @@ pub fn ferx_core::sens::num::PkNum::same_bits_untaped(&self, _other: &Self) -> c
 pub fn ferx_core::sens::num::PkNum::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::sin(self) -> Self
 pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
-pub fn ferx_core::sens::num::PkNum::sqrt_vm(self) -> Self
 pub fn ferx_core::sens::num::PkNum::value_only(self) -> Self
 pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
 impl ferx_core::sens::num::PkNum for f64
@@ -2181,7 +2179,6 @@ pub fn f64::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn f64::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn f64::sin(self) -> Self
 pub fn f64::sqrt(self) -> Self
-pub fn f64::sqrt_vm(self) -> Self
 pub fn f64::value_only(self) -> Self
 pub fn f64::var(x: f64, _dim: usize) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual2::Dual2<N>
@@ -2223,7 +2220,6 @@ pub fn ferx_core::sens::dual2::Dual2<N>::same_bits_untaped(&self, other: &Self) 
 pub fn ferx_core::sens::dual2::Dual2<N>::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sin(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual2::Dual2<N>::sqrt_vm(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::value_only(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::var(x: f64, dim: usize) -> Self
 pub mod ferx_core::sens::ode_provider
