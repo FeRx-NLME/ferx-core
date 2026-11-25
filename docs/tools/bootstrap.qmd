@@ -127,10 +127,9 @@ whether the base model was fitted first.
 ::: {.callout-note}
 ## This is a deliberate departure from PsN
 
-The PsN bootstrap user guide documents the opposite as a known wart: *"the results of two
-runs will be different even if the seed is the same if the lst-file of the base model is
-present at the start of one run but not the other"*, because running the base model
-advances one shared random-number generator. Deriving per replicate removes that coupling,
+In PsN the draws share one random-number generator with the base-model run, so the same
+seed gives different datasets depending on whether the base model had already been run
+when the bootstrap started. Deriving per replicate removes that coupling,
 and makes the draw stream something a test can pin.
 :::
 

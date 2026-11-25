@@ -20,7 +20,7 @@ fn replicate(index: usize, estimates: Vec<f64>) -> ReplicateResult {
 
 #[test]
 fn percentile_matches_the_hand_computed_weighted_average() {
-    // The guide's formula, worked by hand on [1,2,3,4]:
+    // The type-6 quantile, worked by hand on [1,2,3,4]:
     //   n = 4+1 = 5
     //   p = 0.50 -> n*p = 2.5 -> i=2, f=0.5 -> 0.5*x_2 + 0.5*x_3 = 2.5
     //   p = 0.25 -> n*p = 1.25 -> i=1, f=0.25 -> 0.75*x_1 + 0.25*x_2 = 1.25

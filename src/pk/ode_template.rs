@@ -306,8 +306,8 @@ pub fn generate_variant(
     // First-order elimination shares one bracket with the inter-compartmental
     // rate constants, which is how the plain form has always been written; a
     // saturable one cannot, so its distribution terms are emitted separately
-    // below. The saturable expressions are Pharmpy's rate × amount in its own
-    // parenthesisation, so the two are comparable term by term.
+    // below. The saturable expressions are the Michaelis-Menten flux of
+    // [`EliminationForm`], written as rate × amount.
     let elimination_term = match elimination {
         EliminationForm::FirstOrder => {
             let mut terms = format!("{cl}/{vc}");

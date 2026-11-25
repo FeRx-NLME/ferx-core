@@ -93,7 +93,7 @@ fn delta_ofv_is_only_written_when_asked_for() {
 
 #[test]
 fn raw_results_puts_the_original_dataset_first() {
-    // PsN: "The first row is for the original dataset." Downstream tools (PsN's
+    // PsN's layout: the original dataset comes first. Downstream tools (PsN's
     // own `covmat -offset=1`) rely on it.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("raw.csv");
@@ -138,9 +138,7 @@ fn raw_results_gains_se_columns_only_with_keep_covariance() {
 
 #[test]
 fn the_replicate_files_agree_row_for_row() {
-    // PsN: "The row order is consistent between the files raw_results,
-    // included_individuals, included_keys and sample_keys so that row j ...
-    // concerns the same bootstrapped dataset."
+    // PsN's layout: row j describes the same replicate in all four files.
     let dir = tempfile::tempdir().expect("temp dir");
     let r = result();
 

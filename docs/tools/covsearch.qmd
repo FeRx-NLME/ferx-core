@@ -93,7 +93,7 @@ stays 0, so check for this in a scripted run.
 
 **Between steps** each child starts from its parent's final estimates
 (Pharmpy's `update_initial_estimates`); the new relation's θ takes the
-block's PsN default init and bounds for its form.
+block's default init and bounds for its form.
 
 ### Adaptive scope reduction (SCM+)
 
@@ -108,8 +108,8 @@ phase, `adaptive`, in the step table.
 ### What the effects become
 
 An MFL effect is one `[covariate_model]` line, centred as PsN's `scm`
-centres it and with the θ left to the block's defaults, which are PsN's
-inits and bounds verbatim:
+centres it and with the θ left to the block's
+[default inits and bounds](../model-file/covariate-model.qmd):
 
 | MFL | `[covariate_model]` line |
 |---|---|

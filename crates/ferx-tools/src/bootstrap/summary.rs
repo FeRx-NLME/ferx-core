@@ -43,22 +43,14 @@ pub struct BootstrapSummary {
     pub diagnostic_means: Vec<(String, f64)>,
 }
 
-/// PsN's percentile estimator: the weighted average at `x_((n+1)p)`.
-///
-/// Verbatim from the bootstrap user guide:
-///
-/// ```text
-/// n = number of observations + 1
-/// p = percentile / 100
-/// i = integer part of n*p
-/// f = decimal part of n*p
-/// percentile = (1-f)*x_i + f*x_(i+1)
-/// ```
+/// The type-6 sample quantile (Hyndman & Fan, *Am Stat* 1996), which is also the
+/// estimator PsN reports: interpolate linearly between the two order statistics
+/// that bracket position `(m + 1)·p` in a sample of size `m`.
 ///
 /// Returns `None` when the sample is too small to resolve the tail — when
-/// `(n+1)p < 1` there is no `x_i` below the requested quantile and any answer
-/// would be an extrapolation past the smallest observation. That one condition
-/// reproduces every threshold the guide tabulates: **19** samples for 5–95%,
+/// `(m+1)p < 1` there is no order statistic below the requested quantile and any
+/// answer would be an extrapolation past the smallest observation. That one condition
+/// reproduces the minimum sample counts PsN documents: **19** samples for 5–95%,
 /// **39** for 2.5–97.5%, **199** for 0.5–99.5%, **1999** for 0.05–99.95%.
 ///
 /// `sorted` must be ascending.

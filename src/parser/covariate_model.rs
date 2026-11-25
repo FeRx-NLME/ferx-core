@@ -635,7 +635,7 @@ fn parse_theta_clause(
     Ok(out)
 }
 
-// ── θ construction (PsN defaults) ──────────────────────────────────────────
+// ── θ construction (defaults) ──────────────────────────────────────────────
 
 /// Build the θ a relation declares.
 ///
@@ -762,11 +762,11 @@ fn build_thetas(
     Ok(out)
 }
 
-/// PsN's default init/bounds for the linear family.
+/// Default init/bounds for the linear family.
 ///
 /// The bounds are not cosmetic: `θ ∈ [1/(med−max), 1/(med−min)]` is exactly
 /// what keeps `1 + θ·(COV − med)` positive over the observed covariate range,
-/// which is why they are adopted verbatim rather than re-invented. A constant
+/// and it is the range PsN's `scm` uses. A constant
 /// covariate makes both bounds infinite, so it is rejected here instead of
 /// producing a θ the optimiser cannot move.
 fn linear_family_thetas(
@@ -782,7 +782,7 @@ fn linear_family_thetas(
     if !(below > 0.0 && above < 0.0) {
         return Err(format!(
             "[covariate_model]: `{} ~ {} {}` needs its centre ({center}) to lie strictly inside \
-             the observed range of `{}`, which spans [{}, {}] in the data — the PsN default \
+             the observed range of `{}`, which spans [{}, {}] in the data — the default \
              bounds 1/(centre − min) and 1/(centre − max) are only ordered (and only keep the \
              covariate factor positive) there. State the θ explicitly with \
              `=> NAME(init, lower, upper)`, or drop the relation.",

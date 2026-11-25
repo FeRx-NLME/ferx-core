@@ -1806,8 +1806,7 @@ impl Subject {
     /// decides whether a non-`SS` dose at exactly the observation's time is
     /// the most recent dose (`true`, NONMEM record order) or is skipped so the
     /// observation reads from the dose before it (`false`, Pharmpy's
-    /// `get_doseid`). An `SS` dose at the observation's time counts under both
-    /// (Pharmpy: "no swap for SS dosing").
+    /// `get_doseid`). An `SS` dose at the observation's time counts under both.
     fn data_tad_at(&self, obs_t: f64, same_time_counts: bool) -> f64 {
         let last_eff = self
             .doses
@@ -2367,7 +2366,7 @@ pub struct CovariateRelation {
 
 impl CovariateRelation {
     /// Whether this relation still needs data-derived statistics before it can
-    /// be desugared — a symbolic `center`/`ref`, or a form whose PsN default
+    /// be desugared — a symbolic `center`/`ref`, or a form whose default
     /// bounds are functions of the covariate's median/min/max.
     ///
     /// An unresolved relation is **not** desugared into the expression, and
