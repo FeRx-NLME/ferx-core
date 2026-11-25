@@ -196,7 +196,7 @@ fn saem_falls_back_to_fd() {
     };
     let (e, f) = pair(&m, &p, &o);
     // Measured on 29a773f0: |ΔOFV| 0 and Δparam 0 (the M-step's per-θ score lands on the same
-    // draws); ΔSE 7.4e-7 on Linux x86_64 and 1.07e-6 on macOS arm64, on θ2's SE: the
+    // draws); max ΔSE 7.4e-7 on Linux x86_64 and 1.07e-6 on macOS arm64 (θ2's SE there): the
     // covariance step's finite differences against the plans' exact derivatives (#3047).
     // 1e-5 is 9× the larger.
     check("saem", &e, &f, [1e-8, 1e-9, 1e-5]);
