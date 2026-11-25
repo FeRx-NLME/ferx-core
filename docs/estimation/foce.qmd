@@ -1276,9 +1276,9 @@ notice in `FitResult.warnings` says which run the reported estimates come from.
 
 On a simulated population of 80 subjects, 24 of them flip-flop
 (`tests/fixtures/flip_flop_pop/`, fitted in closed form and as an ODE), both fits end at the
-optimum, OFV −3051.439163, and are now reported converged. The closed form stops through the
-verified-stop rule and the ODE twin through the plateau rule. The check costs about 110 more
-objective evaluations (87 → 197 and 85 → 202), about twice each fit's run time (Linux).
+optimum, OFV −3392.235417, and are now reported converged. The closed form stops through the
+verified-stop rule and the ODE twin through the plateau rule. The check costs about 85–95 more
+objective evaluations (73 → 156 and 112 → 208), about twice each fit's run time (Linux).
 
 ## Configuration Example
 

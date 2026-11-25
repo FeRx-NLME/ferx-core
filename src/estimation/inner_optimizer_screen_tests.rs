@@ -414,17 +414,18 @@ fn a_fit_names_the_subjects_the_screen_moved() {
             .into_iter()
             .find(|w| w.contains("Sobol screen"))
     };
-    // `outer_maxiter = 3` is an estimating fit stopped short (−614.983079 with the screen,
-    // −614.018723 without, macOS arm64), whose final cold re-solve still needs the screen to
-    // put S1 in its deeper mode. It was `2` until #2093 and `10` until #2441: with the
-    // absolute variance floor gone the converged fit reaches −615.516376 (it was −604.046643)
-    // with or without the screen, and the cold solve at its final θ finds the deeper mode on
-    // its own, so there was nothing left for the warning to name.
+    // `outer_maxiter = 2` is an estimating fit stopped short, whose final cold re-solve still
+    // needs the screen to put S1 in its deeper mode. It was `3` until #3153 (the opening step's
+    // objective scale moved the fit's path: at 3 the cold solve no longer needs the screen; at
+    // 1 and 2 it does), `2` until #2093 and `10` until #2441: with the absolute variance floor
+    // gone the converged fit reaches −615.516376 (it was −604.046643) with or without the
+    // screen, and the cold solve at its final θ finds the deeper mode on its own, so there was
+    // nothing left for the warning to name.
     //
     // The #2095 twin seed alone (screen off) moves S1 into the same mode, and the warning
     // names it the same way: the final re-solve reads `twin_moved` as well as
     // `screen_moved`.
-    for outer_maxiter in [3, 0] {
+    for outer_maxiter in [2, 0] {
         for (screen, twin, what) in [(100, false, "the screen"), (0, true, "the twin seed")] {
             let w = warning(screen, twin, outer_maxiter)
                 .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: {what} moved S1"));
@@ -961,7 +962,7 @@ fn the_nlopt_leg_names_the_subject_it_kept_off_the_cold_solve() {
         // `auto` resolves to BOBYQA here, which reaches the optimum in one call, and the
         // screen moves nobody there.
         optimizer: crate::types::Optimizer::NloptLbfgs,
-        outer_maxiter: 3,
+        outer_maxiter: 2,
         run_covariance_step: false,
         threads: Some(1),
         ..opts.clone()

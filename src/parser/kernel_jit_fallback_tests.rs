@@ -132,8 +132,12 @@ fn focei_falls_back_to_fd_inner_outer_and_covariance() {
 #[test]
 fn foce_falls_back_to_fd() {
     let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
-    let (e, f) = pair(&m, &p, &opts(EstimationMethod::Foce));
-    // Measured 1.5e-5 / 6.1e-6 / 2.3e-4.
+    // Five iterations, not three: since #3153 the opening step is a full capped step, and a
+    // 3-iteration FOCE trajectory (5e-3 apart in OFV) amplifies the gradients' difference. At
+    // five both fits have converged and the plans and the fallback agree.
+    let o = FitOptions { outer_maxiter: 5, ..opts(EstimationMethod::Foce) };
+    let (e, f) = pair(&m, &p, &o);
+    // Measured 1.6e-11 / 1.1e-6 / 2.7e-4 (Linux x86_64).
     check("foce", &e, &f, [1e-4, 5e-5, 2e-3]);
 }
 
@@ -205,8 +209,10 @@ fn saem_falls_back_to_fd() {
 #[test]
 fn iov_falls_back_to_fd() {
     let (m, p) = example("examples/warfarin_iov.ferx", "data/warfarin_iov.csv");
-    let (e, f) = pair(&m, &p, &opts(EstimationMethod::FoceI));
-    // Measured 2.5e-3 / 2.1e-3 / 4.3e-4.
+    // Four iterations, not three, as in `foce_falls_back_to_fd` (6e-2 apart in OFV at three).
+    let o = FitOptions { outer_maxiter: 4, ..opts(EstimationMethod::FoceI) };
+    let (e, f) = pair(&m, &p, &o);
+    // Measured 3.9e-10 / 1.4e-5 / 3.4e-5 (Linux x86_64).
     check("iov", &e, &f, [2e-2, 2e-2, 3e-3]);
 }
 

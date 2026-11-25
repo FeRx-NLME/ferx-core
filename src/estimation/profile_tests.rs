@@ -6270,7 +6270,7 @@ fn floor_warning(f: &crate::FitResult) -> Option<&String> {
 
 /// T4. F2, two studies, unprofiled, `inner_maxiter = 1` (#2629): the first L-BFGS run puts
 /// TVE0 on the floor, the floor escape restarts it, and the restart stops at 42.788001 with
-/// EMAX = 3.309e-10 — 1.197 ln-units above the floor, so not on it, where raising EMAX to
+/// EMAX = 3.298e-10 — 1.193 ln-units above the floor, so not on it, where raising EMAX to
 /// its probe point 0.008 still drops the OFV by 0.021. The optimum is 22.139638. Before the
 /// fix this was reported `converged: true` with the restart's success warning. The
 /// re-scored reported point is the same 42.788001 at any inner budget, so the budget is not
@@ -6284,8 +6284,8 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     assert!(!trapped.converged, "{:?}", trapped.warnings);
     let w = floor_warning(&trapped).expect("a floor-escape warning");
     assert!(
-        w.contains("but stopped with EMAX below 1/1000 of its start (EMAX = 3.309e-10)")
-            && w.contains("(OFV 42.766729 with it at EMAX = 8.000e-3, against 42.788001")
+        w.contains("but stopped with EMAX below 1/1000 of its start (EMAX = 3.298e-10)")
+            && w.contains("(OFV 42.766730 with it at EMAX = 8.000e-3, against 42.788001")
             && w.contains("the fit is not reported as converged")
             && !w.contains("on the floor again")
             && !w.contains("TVE0 just above"),

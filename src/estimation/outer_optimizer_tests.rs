@@ -2489,6 +2489,23 @@ fn test_cap_scaled_gradient_noop_when_within_budget() {
     assert_eq!(g, g_before, "in-budget gradient must be untouched");
 }
 
+/// [`cap_factor`] is the one scalar the cap divides by (#3153): the worst per-dimension
+/// ratio of `|g|` to its budget, and 1 when the gradient is within budget (no cap).
+#[test]
+fn test_cap_factor_is_the_scalar_cap_scaled_gradient_divides_by() {
+    let (lower, upper) = (vec![-1.0, -2.0, -0.1], vec![1.0, 2.0, 0.1]);
+    // Budgets 1.0, 1.0, 0.1: the third dimension drives it, 200 / 0.1.
+    let g = vec![10.0, 100.0, 200.0];
+    assert!((cap_factor(&g, &lower, &upper) - 2000.0).abs() < 1e-9);
+    let mut capped = g.clone();
+    assert!(cap_scaled_gradient(&mut capped, &lower, &upper));
+    for (c, g) in capped.iter().zip(&g) {
+        assert!((c - g / 2000.0).abs() < 1e-15);
+    }
+    // Within budget: the factor is exactly 1, so the objective is left alone.
+    assert_eq!(cap_factor(&[0.5, -0.3, 0.05], &lower, &upper), 1.0);
+}
+
 /// Even when one dimension has very wide bounds (a typical pattern in
 /// log-Cholesky omega/sigma packing, where bounds span 10+ units), the
 /// budget is clamped to 1.0 so the cap still fires.
@@ -2503,41 +2520,6 @@ fn test_cap_scaled_gradient_clamps_wide_bounds_to_unit_budget() {
     // Worst ratio = 5/1 = 5 → divide all by 5 → g[0] becomes 1.0.
     assert!((g[0] - 1.0).abs() < 1e-12, "g[0] post-cap should be 1.0, got {}", g[0]);
     assert_eq!(g[1], 0.0);
-}
-
-/// [`should_cap_gradient`] gates the overshoot cap per-algorithm (#960, #751):
-///   - SLSQP: cap every eval (QP re-solves from the current Hessian).
-///   - L-BFGS: cap the first gradient eval always, and later evals only on the
-///     stall-retry pass (`hold_cap_at_init`), which `optimize_nlopt` runs when
-///     the default attempt never left its initial estimates. Holding the cap on
-///     by default would corrupt the `(s, y)` curvature pairs L-BFGS builds from
-///     gradient differences — the regression that blocked a uniform fix.
-///   - MMA / BOBYQA: never capped here.
-#[test]
-fn test_should_cap_gradient_per_algo_gating() {
-    use crate::estimation::outer_optimizer::should_cap_gradient;
-    use nlopt::Algorithm;
-
-    // SLSQP: every eval, including well past the first, moved or not.
-    assert!(should_cap_gradient(Algorithm::Slsqp, 1, true));
-    assert!(should_cap_gradient(Algorithm::Slsqp, 5, false));
-
-    // L-BFGS: the first gradient eval is always capped. `n_grad_evals == 1` is
-    // the first eval because `population_gradient` increments before returning.
-    assert!(should_cap_gradient(Algorithm::Lbfgs, 1, false));
-    assert!(should_cap_gradient(Algorithm::Lbfgs, 1, true));
-
-    // Later evals: capped only on the retry pass. The default pass leaves every
-    // later `(s, y)` pair built from uncapped gradients (#960); the retry keeps
-    // the identity-Hessian step tame for a fit that already stalled (#751).
-    assert!(!should_cap_gradient(Algorithm::Lbfgs, 2, false));
-    assert!(!should_cap_gradient(Algorithm::Lbfgs, 50, false));
-    assert!(should_cap_gradient(Algorithm::Lbfgs, 2, true));
-    assert!(should_cap_gradient(Algorithm::Lbfgs, 50, true));
-
-    // Derivative-free / self-safeguarding methods are never capped here.
-    assert!(!should_cap_gradient(Algorithm::Mma, 1, true));
-    assert!(!should_cap_gradient(Algorithm::Bobyqa, 1, true));
 }
 
 /// [`resolve_stall_retry`] decides whether a finished fit is re-run with the
@@ -3989,8 +3971,8 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
 // and its scaled first-step gradient never overshoots, so the cap does not change
 // its outcome — a unit "convergence" test here would pass with or without the fix
 // and guard nothing. The cap's *mechanism* is covered fast instead by
-// `should_cap_gradient` (per-algorithm gating) and the `cap_scaled_gradient_*`
-// rescale tests above; the L-BFGS call site is exercised by the non-SLSQP fit in
+// the `cap_scaled_gradient_*` rescale tests above and the #3153 turnover fits
+// (`tests/opening_step_scale.rs`); the L-BFGS call site is exercised by the non-SLSQP fit in
 // `non_convergence_reports_directly_without_second_optimization` below.
 
 /// A non-SLSQP gradient primary that stops **non-converged** runs exactly one
@@ -4010,8 +3992,11 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
 /// opening line search fails and the resulting long flat tail is reclassified as
 /// a converged plateau (#751).
 ///
-/// This setup has now been repaired twice, both times because a fix elsewhere
-/// removed the failure it was riding and left the test green but empty. Pre-#960
+/// This setup has now been repaired three times, each because a fix elsewhere
+/// removed the failure it was riding and left the test green but empty. The third is
+/// #3153: with the opening step's objective scale a stage-1 fit of 8 iterations reaches the
+/// optimum (28.6168) and a stage-2 fit of 8 converges inside its budget, so the stages are
+/// now 1 and 3 iterations (88.9 → 29.4, cut off mid-descent). Pre-#960
 /// it relied on the L-BFGS first-step stall. It then moved to a starved inner
 /// loop (`inner_maxiter = 1`, `max_unconverged_frac = 0.0`), which turned out to
 /// starve nothing once #1290 stopped the EBE cache from adopting a
@@ -4025,7 +4010,7 @@ fn non_convergence_reports_directly_without_second_optimization() {
     let population = make_population(3);
     let n = pack_params(&model.default_params).len();
 
-    let outer_maxiter = 8;
+    let outer_maxiter = 3;
     let base = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
@@ -4041,7 +4026,8 @@ fn non_convergence_reports_directly_without_second_optimization() {
     // fails almost immediately and NLopt returns `Failure` on a long flat tail,
     // which #751 reclassifies as a converged plateau — the one shape stage 2
     // must not have.
-    let stage1 = optimize_population(&model, &population, &model.default_params, &base);
+    let first = FitOptions { outer_maxiter: 1, ..base.clone() };
+    let stage1 = optimize_population(&model, &population, &model.default_params, &first);
     let r = optimize_population(&model, &population, &stage1.params, &base);
     assert!(
         r.ofv < stage1.ofv - 1.0,
@@ -4073,7 +4059,7 @@ fn non_convergence_reports_directly_without_second_optimization() {
         r.warnings
     );
     // One optimization only. NLopt LD_LBFGS checks `maxeval` only between line
-    // searches, so a single run can overrun `outer_maxiter * (n + 1)` (budget 40
+    // searches, so a single run can overrun `outer_maxiter * (n + 1)` (budget 15
     // on this model); a re-added fallback would add a *second* full nlopt run
     // from the endpoint, pushing the total toward ~2× that. Bound at
     // `2 * budget` cleanly separates the single run from a doubling.
@@ -13849,18 +13835,22 @@ fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>
     (r, UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0)))
 }
 
-/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (60, 6, 3.2), A2's unprofiled fit
-/// stops converged 4.10e-4 above NONMEM, and a warm-seeded leg from that incumbent
-/// fails its first line search on a Nelder–Mead fallback dip. With the leg the fit ends in
-/// NONMEM's band; with it switched off the same fit still reports the stuck stop
-/// converged, so the pair straddles the leg.
+/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (60, 6, 3.2) at `inner_tol = 1e-3`, A2's
+/// unprofiled fit stops converged 1.94e-4 above NONMEM, and a warm-seeded leg from that
+/// incumbent descends the gap. With the leg the fit ends in NONMEM's band; with it switched off
+/// the same fit still reports the stuck stop converged, so the pair straddles the leg.
 ///
 /// The start was (55, 5, 3.2) until #2549's EBE warm-start predictor carried that start's
 /// leg-less fit into the band (+2.76e-7), then (55, 4, 3.2) until #2597 sized the
 /// stagnation window in free coordinates and that start's leg-less fit landed in the band
-/// too (+3.08e-7). Re-measured from a 3 × 4 × 3 scan of nearby starts, 21 of 36 of which
-/// still stop stuck: (60, 6, 3.2) +2.747e-7 with the leg, +4.101e-4 without (macOS arm64
-/// and Linux, see the PR); three of its four grid neighbours stop stuck too.
+/// too (+3.08e-7), then (60, 6, 3.2) at the default `inner_tol` (+4.101e-4 stuck, through
+/// #2460's floor restart). #3153's opening-step scale moved every start of a 7 × 6 × 5 scan
+/// (θ₁ 20–80, θ₂ 2–14, θ₃ 2–6) to within 1.3e-5 of NONMEM without the leg, and no first attempt
+/// ends on the floor any more, so there is no restart to hang the leg on. The noise floor that
+/// makes a stop stick is the EBE solve's, so the test loosens `inner_tol` to 1e-3 (the leg runs
+/// at 1e-10 regardless): of a 3 × 3 scan of starts at that tolerance (θ₁ 40–80, θ₂ 4–8, θ₃ 3.2),
+/// 4 of 9 stop above 5e-5 without the leg, and (60, 6, 3.2) is +1.936e-4 without it and −1.9e-5 with it
+/// (below NONMEM's value: the loose-tolerance objective is not NONMEM's to 1e-5), Linux x86_64.
 #[test]
 fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let (prep, nm) = a2_unprofiled();
@@ -13869,35 +13859,19 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
+        inner_tol: 1e-3,
         ..prep.parsed.fit_options.clone()
     };
-    // Through #2460's floor restart, as `fit` runs it: the start's first attempt ends with
-    // a θ on the log-packing floor, and the stuck stop is the restart's. The leg runs on the
-    // restart only, so the restart starts from the same point either way: a leg on the
-    // floored attempt moves that point, and the restart from there lands in band without
-    // the leg doing anything (measured: every leg gained under 1e-12).
     let fit = |on: bool| {
-        let calls = std::cell::Cell::new(0usize);
         with_verify_leg(on, || {
-            crate::estimation::floor_escape::escape_floor(
-                &init,
-                &opts,
-                prep.population.subjects.len(),
-                |p, o| {
-                    let restart = calls.get() > 0;
-                    calls.set(calls.get() + 1);
-                    UNPROFILED_VERIFY_OFF.with(|off| off.set(!(on && restart)));
-                    optimize_population(&prep.parsed.model, &prep.population, p, o)
-                },
-                |_| 0.0,
-            )
+            optimize_population(&prep.parsed.model, &prep.population, &init, &opts)
         })
     };
     let (with, legs) = fit(true);
     let (without, none) = fit(false);
     eprintln!(
-        "A2 (60, 6, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
-         {:+.3e} converged {}",
+        "A2 (60, 6, 3.2) at inner_tol 1e-3: with the leg Δ {:+.3e} converged {} (leg gains \
+         {:?}); without Δ {:+.3e} converged {}",
         with.ofv - nm,
         with.converged,
         legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
@@ -13905,12 +13879,12 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
         without.converged
     );
     assert!(none.is_empty(), "the switch turns the leg off");
-    // The leg itself does the work: its gain is the stuck gap, measured 4.10e-4.
+    // The leg itself does the work: its gain is the stuck gap, measured 2.14e-4.
     assert!(
         legs.first().is_some_and(|l| l.gain > 1e-4),
-        "the restart's first leg must descend from the stuck stop: {legs:?}"
+        "the first leg must descend from the stuck stop: {legs:?}"
     );
-    // Measured +2.75e-7 (Linux aarch64); the profiled A2 anchor's band is 1e-5.
+    // Measured −1.9e-5 (Linux x86_64); the profiled A2 anchor's band is 1e-5.
     assert!(
         with.converged && with.ofv - nm < 1e-5,
         "a stuck stop is verified into the band: Δ {:+.3e}, converged {}, {:?}",
@@ -13918,7 +13892,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
         with.converged,
         with.warnings
     );
-    // The control: without the leg the stop is the 4.10e-4 one, reported converged.
+    // The control: without the leg the stop is the 1.94e-4 one, reported converged.
     assert!(
         without.converged && without.ofv - nm > 1e-4,
         "the fixture must still stop stuck without the leg: Δ {:+.3e}, converged {}",
@@ -13937,12 +13911,15 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
 /// The start was (42, 7, 3.2) until #2549 seeded the warm IOV inner solve: its more
 /// precise modes carry that start's leg-less fit to +3.7e-7, inside the band, so the
 /// control no longer stopped short. Re-measured (Linux x86_64) from a scan of nearby starts:
-/// (42, 8, 3.2) +2.747e-7 with the leg, +3.568e-6 without.
+/// (42, 8, 3.2) +2.747e-7 with the leg, +3.568e-6 without. And again for #3153, whose opening
+/// step's objective scale moved that fit to +9.4e-7 without the leg, inside the 1e-6 bound: of
+/// the 60 starts scanned (θ₁ 40–46, θ₂ 6–10, θ₃ 3.0–3.4), (40, 7, 3.2) is +2.747e-7 with the
+/// leg and +3.430e-6 without.
 #[test]
 fn an_unprofiled_leg_ranks_its_own_incumbent() {
     let (prep, nm) = a2_unprofiled();
     let mut init = prep.init_params.clone();
-    init.theta[..3].copy_from_slice(&[42.0, 8.0, 3.2]);
+    init.theta[..3].copy_from_slice(&[40.0, 7.0, 3.2]);
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
@@ -13956,13 +13933,13 @@ fn an_unprofiled_leg_ranks_its_own_incumbent() {
     let (with, legs) = fit(true);
     let (without, _) = fit(false);
     eprintln!(
-        "A2 (42, 8, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
+        "A2 (40, 7, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
         with.ofv - nm,
         legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
         without.ofv - nm,
     );
     assert!(with.converged && without.converged);
-    // Measured +2.747e-7 with the leg and +3.568e-6 without (Linux x86_64).
+    // Measured +2.747e-7 with the leg and +3.430e-6 without (Linux x86_64).
     assert!(
         with.ofv - nm < 1e-6,
         "the leg's own incumbent reaches the optimum: Δ {:+.3e}",
@@ -15376,12 +15353,17 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
     let pop =
         read_nonmem_csv(Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"), None, None)
             .expect("fixture data loads");
+    // Whether a forced leg ends no lower than the kept one is a 1e-9-level coin: the legs of
+    // this fit all end at −43.18585 and only the last digits order them. `inner_tol = 1e-4`
+    // produces a leg that is not kept (as do the #3153 draws 108 and 111 of the basin-shift
+    // fixture's subset search at the default); 1e-3, 1e-5 and 1e-6 do not (Linux x86_64).
     let opts = FitOptions {
         optimizer: Optimizer::NloptLbfgs,
         run_covariance_step: false,
         report_final_gradient: false,
         verbose: false,
         threads: Some(1),
+        inner_tol: 1e-4,
         ..parsed.fit_options.clone()
     };
     UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
@@ -17076,7 +17058,10 @@ const MIXTURE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
 /// and 1.1e-13, and 6.9e-12 and 0 between the fits. The bounds below are 10× the worst first
 /// evaluation and 145× the worst fit difference. The leg finds
 /// nothing on either, so this pins that it ran, started at the incumbent and did not disturb
-/// the fit; the straddle is two tests down. It does not pin the per-class seed: clearing
+/// the fit; the straddle is two tests down. Since #3153 a mixture's first leg takes the
+/// opening-step cap too (it never did: the mixture gradient does not count in `n_grad_evals`),
+/// and on `mixture_iv` (Linux x86_64) the leg gains 1.9e-8 and the two fits differ by 1.7e-8, at
+/// 31 against 22 evaluations; the fit bound is 1e-7. It does not pin the per-class seed: clearing
 /// `cached_etas_by_class` at the leg's start leaves it green, because a cold class solve
 /// reaches the same modes here.
 #[test]
@@ -17107,7 +17092,7 @@ fn a_mixture_stop_gets_one_verification_leg() {
             on.n_iterations,
             off.n_iterations
         );
-        assert!((on.ofv - off.ofv).abs() < 1e-9, "{csv}: {} vs {}", on.ofv, off.ofv);
+        assert!((on.ofv - off.ofv).abs() < 1e-7, "{csv}: {} vs {}", on.ofv, off.ofv);
     }
 }
 

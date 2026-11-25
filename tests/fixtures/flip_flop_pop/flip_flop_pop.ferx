@@ -1,6 +1,6 @@
 # One-compartment oral population with flip-flop subjects (closed form)
 #
-# Data: flip_flop_pop.csv in this directory, simulated by sim_flip_flop_pop.py (seed 2096):
+# Data: flip_flop_pop.csv in this directory, simulated by sim_flip_flop_pop.py (seed 21, #3153):
 # 80 subjects, one 100 mg oral dose each, 12 samples to 96 h. True values TVCL = 1,
 # TVV = 10, TVKA = 0.2, omega_CL = omega_V = 0.09, omega_KA = 1, proportional SD 0.1.
 # A subject with KA < CL/V is flip-flop: (KA, k) and the swapped pair fit its curve
