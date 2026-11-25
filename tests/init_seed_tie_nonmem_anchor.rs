@@ -12,11 +12,12 @@
 //!   for WT = 140. At the first instant: obs/obs, EVID=2/obs and dose/obs, each in both
 //!   file orders; a dose at 0 with no tie (ID 7); time-varying WT later (IDs 9, 10);
 //!   co-timed resets (IDs 12–14).
-//! * `init_seed_tie_cells`: an EVID=3 row tied with the first observation (IDs 16, 17), an
-//!   SS=1 dose at the first instant (ID 18), and the dose/EVID=2 pair in both file orders
-//!   (IDs 19, 20; both read the WT = 70 seed at t = 2, 13.0997, and the dose-first scan
-//!   took WT = 140 on ID 20). With these, every pair of the three record kinds is anchored
-//!   in both orders.
+//! * `init_seed_tie_cells`: an observation listed before a co-timed SS=1 dose (ID 15; reads
+//!   the seed 28, 2.862 before #2567, #2126), an EVID=3 row tied with the first observation
+//!   (IDs 16, 17), an SS=1 dose at the first instant (ID 18), and the dose/EVID=2 pair in
+//!   both file orders (IDs 19, 20; both read the WT = 70 seed at t = 2, 13.0997, and the
+//!   dose-first scan took WT = 140 on ID 20). With these, every pair of the three record
+//!   kinds is anchored in both orders.
 //! * `init_seed_tie_ofv_{a,b}`: 20 subjects in the EVID=2-then-observation shape with η on
 //!   the seed, `METHOD=1 INTER MAXEVAL=0 POSTHOC`. Arm b is the control: both rows carry the
 //!   observation's WT, so it reads the same under either rule.
@@ -307,7 +308,8 @@ const STATES_SKIP: &[&str] = &[];
 /// (NONMEM 14 / 16 / 14.477 / 12.668), 14 for ID 13's post-reset sample (NONMEM 28) and 11.46
 /// at t = 6 on IDs 12 and 13 (NONMEM 22.92). The obs-first subjects (IDs 1, 2, 9–11) are the
 /// control, right under either rule; the cells' EVID=3 ties (IDs 16, 17) and dose/EVID=2
-/// pairs (IDs 19, 20) put each kind first in both file orders. Same `IPRED_BOUND`: the
+/// pairs (IDs 19, 20) put each kind first in both file orders; ID 15 (an observation
+/// before a co-timed SS=1 dose, #2126) reads the pre-SS seed 28. Same `IPRED_BOUND`: the
 /// realized worst error is the predict leg's, since the states and IPRED share one solve
 /// per record order.
 #[test]
