@@ -2622,7 +2622,8 @@ fn find_ebe_impl_from(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        if policy.skip_refused && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        let refused = crate::stats::likelihood::iov_refuses_frem(model, subject);
+        if policy.skip_refused && refused {
             return refused_iov_ebe(model, subject);
         }
         let ebe = find_ebe_iov_seeded(
@@ -2636,7 +2637,8 @@ fn find_ebe_impl_from(
             restarts,
             policy.ebe_variance,
             policy.init_is_mode,
-            policy.init_is_warm,
+            // A refused subject's zeros are `refused_iov_ebe`'s placeholder, not a solve.
+            policy.init_is_warm && !refused,
             if policy.unseeded_iov_warm { InnerHessianSeed::None } else { policy.seed },
         );
         #[cfg(test)]
@@ -3960,8 +3962,8 @@ fn find_ebe_iov_seeded(
         None => eta_init,
     };
     let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
-    // A solved start is warm only when it carries κ̂ too (#2900): an η̂-only one (the ODE+IOV
-    // cache's, a nested subject's) restarts κ at 0, which the multi-start still scans.
+    // A solved start is warm only when it carries κ̂ too (#2900): an all-zero η̂-only one (the
+    // ODE+IOV cache's, a nested subject's) restarts κ at 0, which the multi-start still scans.
     let joint = warm.is_some_and(|w| w.len() == n_flat);
     let warm_start = is_warm_start(eta_init, init_is_mode || (init_is_warm && joint));
     #[cfg(test)]
@@ -4327,6 +4329,8 @@ fn find_ebe_iov_seeded(
         })
         .flatten()
         .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
+    #[cfg(test)]
+    LAST_INITIAL_HESSIAN.with(|h| *h.borrow_mut() = iov_seed.clone());
     // Value/gradient fusion on the line search's full-step trial, as in `find_ebe_solve`:
     // where the gradient pass also scores the value bit-equal to the native objective, the
     // trial runs that one pass — value for the Armijo test, gradient parked in `primed` for the

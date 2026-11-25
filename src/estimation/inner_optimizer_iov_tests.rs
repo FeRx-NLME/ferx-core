@@ -5618,6 +5618,40 @@ fn iov_solved_zero_start_runs_no_multistart() {
     }
 }
 
+/// #2900: the same start is seeded with the Gauss–Newton metric as a solved zero joint start
+/// and left unseeded as the cold placeholder or a solved η̂ alone, as the non-IOV solve does.
+/// Mutation: `is_warm_start(eta_init, init_is_mode)` back at the seed gate -> the first row
+/// reads unseeded.
+#[test]
+fn iov_solved_zero_start_is_seeded() {
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let (model, p) = (prep.parsed.model, prep.init_params);
+    let s = &prep.population.subjects[0];
+    let n_flat = model.n_eta + model.n_kappa * crate::stats::stacked_layout::group_count(s);
+    let zero = vec![0.0; n_flat];
+    for (warm, start, seeded) in
+        [(true, &zero[..], true), (false, &zero[..], false), (true, &zero[..model.n_eta], false)]
+    {
+        find_ebe_iov_seeded(
+            &model,
+            s,
+            &p,
+            200,
+            1e-6,
+            Some(start),
+            None,
+            0,
+            EbeVariance::Conditional,
+            false,
+            warm,
+            InnerHessianSeed::GaussNewton,
+        );
+        let used = LAST_INITIAL_HESSIAN.with(|h| h.borrow().is_some());
+        assert_eq!(used, seeded, "warm {warm}, start of {}", start.len());
+    }
+}
+
 /// The issue's second validation: a unimodal IOV subject stays bit-identical, across a
 /// range of `tol` that makes the seeds' descents stop at points of their own on the same
 /// mode, some measurably below the primary's: the objective guard alone would take those.
