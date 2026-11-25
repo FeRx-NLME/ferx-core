@@ -27,6 +27,7 @@ path = "src/main.rs"
 # `default = []`; `survival` is slated to become default-on).
 ferx-core = { path = "../..", version = "0.4.0", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
+# Unconditional for now; an optional, default-on `search` feature is #3187.
 ferx-search = { path = "../ferx-search", version = "0.4.0" }
 indicatif = "0.18.4"
 # The binary's global allocator (`src/main.rs`): an estimation allocates many small,
