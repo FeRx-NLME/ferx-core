@@ -9530,7 +9530,9 @@ pub struct FitOptions {
     /// coordinate scan cannot reach a mode that is off every axis — the flip-flop twin of
     /// a one-compartment oral subject, where `CL`, `V` and `KA` move together — and this
     /// can. The stream is keyed by the subject's ID, so a subject screens the same points
-    /// whatever the thread count or its position in the data. The IOV inner solve has no
+    /// whatever the thread count or its position in the data. A larger screen is not
+    /// guaranteed to reach a mode a smaller one does: on the #2863 repro, 2000 points
+    /// reach the lower mode that 400 do, but 4000 do not. The IOV inner solve has no
     /// multi-start and runs no screen.
     pub inner_screen: usize,
     /// Seed the inner multi-start with the subject's flip-flop twin (`[fit_options]

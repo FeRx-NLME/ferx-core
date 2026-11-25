@@ -175,6 +175,32 @@ fn spread(sorted: &[Vec<f64>], omega: &crate::types::OmegaMatrix) -> Vec<Vec<f64
     kept
 }
 
+/// Each start is far from *every* earlier start, not only the last: with Ω = 1 the distance is
+/// `|a − b|`, and the four lowest draws are A, B (0.54 from A), C (0.80 from B, 0.26 from A)
+/// and D (far from both). C is far from B but too near A, so the starts are `[A, B, D]`.
+#[test]
+fn a_screen_start_is_far_from_every_earlier_start_not_only_the_last() {
+    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms};
+    let omega = diag_omega(&[1.0]);
+    let draws: Vec<f64> = sobol_uniforms(1, 16, screen_seed("S1"))
+        .into_iter()
+        .map(|u| 2.0 * inv_normal_cdf(u[0]))
+        .collect();
+    let [a, b, c, d] = [4, 5, 11, 0].map(|i| draws[i]);
+    let dist = |x: f64, y: f64| omega_distance(&[x], &[y], &omega);
+    assert!(dist(a, b) > 0.5 && dist(b, c) > 0.5 && dist(a, c) <= 0.5);
+    assert!(dist(a, d) > 0.5 && dist(b, d) > 0.5);
+    // The objective ranks the draws A < B < C < D < every other.
+    let rank = |e: &[f64]| [a, b, c, d].iter().position(|&x| x == e[0]).unwrap_or(9) as f64;
+    let got: Vec<f64> =
+        screen_starts(&rank, &omega, 1, 16, "S1").into_iter().map(|s| s[0]).collect();
+    let want = [0.26752090313849447, -0.2708763674468896, 2.0323211300031];
+    assert_eq!(got.len(), want.len(), "{got:?}");
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() < 1e-9, "{got:?} is not {want:?}");
+    }
+}
+
 #[test]
 fn screen_starts_are_the_lowest_spread_draws_of_the_scaled_prior() {
     use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms};

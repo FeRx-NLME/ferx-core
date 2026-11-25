@@ -7335,7 +7335,7 @@ const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
 /// covariate's own variance, so its Mahalanobis distance stays O(1) and it never trips this.
 const RUNAWAY_EBE_MAHA_PER_ETA: f64 = 100.0;
 
-/// Starts the #2013 screen descends from: the lowest-objective Sobol points it scores.
+/// Most starts the #2013 screen descends from (see [`screen_starts`]).
 const SCREEN_TOP_K: usize = 3;
 /// The lowest-objective screen points [`screen_starts`] picks its spread-out starts from.
 const SCREEN_POOL: usize = 32;
