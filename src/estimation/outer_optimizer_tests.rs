@@ -10281,30 +10281,23 @@ fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
     assert_eq!(absorb_attempts, 1, "no second attempt");
 }
 
-/// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
-/// start-dependence gap left (#2204).
+/// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges below the covariate-free
+/// model's −1185 with no start-dependence gap left (#2204, #3153).
 ///
-/// This fixture came in with #2093 as the basin probe's end-to-end test, asserting the
-/// −1185.462085 its author measured (two basin-shift restarts, 145 evaluations). That
-/// trajectory never reproduced on Linux, where every `main` run since converged at
-/// −1173.559691. Measured at `d837afb0`, `ci-test` profile:
+/// The example declares `init` (#3153). Before, its bare head made the outcome path-dependent
+/// (#2549): from the own start `main` converged at −1173.559691, and the #3153 fix at −231.5,
+/// a worse basin both reported as converged. Measured at the `init` example on Linux x86_64,
+/// `ci-test` profile: own start −1219.092774 in 1823 evaluations. Over 42 starts near it
+/// (omega and sigma × 0.95 to 1.05) every fit ends between −1194.8 and −1284.6. With CI's
+/// libm digits emulated (`GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX2,-FMA,-AVX512F,...`) the own
+/// start ends at −1230.4537 in 4752 evaluations, converged, and the 42 range is −1275.5 to
+/// −1194.6 (41 of 42 converge, against 42). The bound below sits under the worst of them and
+/// under −1185; −231.5 and the −1154.59 unconverged trap #2093 fixed both fail it.
 ///
-/// - Linux x86_64 (`tools/linux-test.sh`): the first leg traps, the probe catches it at its
-///   64th feasible evaluation (cold −1168.482673 against best-seen −1157.15), and the
-///   restart converges at −1173.559691.
-/// - Linux x86_64 with `basin_probe_due` forced to `false`: the first leg runs to 96
-///   evaluations, the end-of-leg check finds the same trap (cold −1168.379472 against
-///   −1157.383437), and the restart converges at −1173.559691 — the same optimum.
-/// - native macOS arm64: no trap at all; −1173.559691 in 104 evaluations.
-///
-/// So this fixture cannot tell the probe from the end-of-leg check, and the probe is owned
-/// end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to trap on both platforms,
-/// stopped by the probe at its 33rd evaluation), the repeated restart by
-/// `the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall`. What this
-/// test pins is the fit's outcome against the failure #2093 fixed — −1154.590742,
-/// unconverged, a trap found too late to restart out of: converged, below −1173.5 (0.06
-/// above the measured optimum, 18.9 below that failure), and no `ebe_start_dependent`
-/// warning. A basin-shift restart notice is allowed, since the Linux path takes one.
+/// The basin probe is owned end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to
+/// trap on both platforms) and by
+/// `the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall`; this
+/// test pins the fit's outcome. A basin-shift restart notice is allowed.
 #[cfg(feature = "nn")]
 #[test]
 #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
@@ -10319,9 +10312,9 @@ fn the_warfarin_dcm_fit_converges_with_no_start_dependence_left() {
     .expect("warfarin_dcm fits");
     assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
     assert!(
-        r.ofv.is_finite() && r.ofv < -1173.5,
-        "OFV {} — measured −1173.559691 on Linux x86_64 and macOS arm64 (−1154.59 \
-         unconverged was the #2093 failure)",
+        r.ofv.is_finite() && r.ofv < -1190.0,
+        "OFV {} — measured −1219.092774 on Linux x86_64 (−231.5 was the bare head's \
+         basin, −1154.59 unconverged the #2093 failure)",
         r.ofv
     );
     assert!(
