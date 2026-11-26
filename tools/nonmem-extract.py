@@ -11,7 +11,8 @@ The result holds our control stream as NONMEM echoed it, record counts, warning
 numbers, failure markers, and per estimation step: the objective, termination
 markers, shrinkage, final estimates, standard errors and eigenvalues, at the
 precision NONMEM printed. `listing_truncated` / a step's `report_truncated` mark a
-listing that ends before the estimation output / that step's report.
+listing with fewer estimation steps than `$EST` records / a step without final
+estimates. A page break inside a statistics block is refused rather than half-read.
 """
 
 import argparse
@@ -153,6 +154,10 @@ def step(text, keep_covariance):
             key = "etabar_se"
         values = numbers(m.group(2)) or []
         for more in lines[i + 1 :]:
+            if re.match(r"1\s*$", more):
+                # A page break would split the block around a page header: refuse
+                # rather than keep half of it.
+                raise ValueError(f"page break inside the {m.group(1)} block")
             if not more.strip() or numbers(more) is None:
                 break
             values += numbers(more)
@@ -166,8 +171,8 @@ def step(text, keep_covariance):
         elif keep_covariance:
             out[kind] = rows(body)
     out["markers"] = [m for m in MARKERS if m in text]
-    if "objv" not in out and "final" not in out:
-        # The listing ends before this step's report.
+    if "final" not in out:
+        # The listing ends before this step's final estimates.
         out["report_truncated"] = True
     return out
 
@@ -200,9 +205,9 @@ def extract(text, keep_covariance):
     output = text[len(head) :]
     out["markers"] = [m for m in MARKERS if m in output]
     out["steps"] = [step(s, keep_covariance) for s in re.split(r"^ #METH:", text, flags=re.M)[1:]]
-    if not out["steps"] and re.search(r"^\s*\$EST", control, re.M | re.I):
-        # The listing stops before estimation output (e.g. only the NM-TRAN part was kept);
-        # the numbers are then in the .ext alone.
+    if len(out["steps"]) < len(re.findall(r"^\s*\$EST", control, re.M | re.I)):
+        # The listing stops before the output of some $EST record (e.g. only the NM-TRAN
+        # part was kept); those numbers are then in the .ext alone.
         out["listing_truncated"] = True
     out["control_stream_as_run"] = [line.rstrip() for line in control.splitlines()]
     if re.search(r"license|registered to", control, re.I):
