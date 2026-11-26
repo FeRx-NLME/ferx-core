@@ -2659,6 +2659,42 @@ fn a_refused_subjects_inner_search_is_skipped_for_the_foce_family_only() {
     assert!(r.eta.iter().chain(r.kappas.iter().flatten()).any(|v| *v != 0.0));
 }
 
+/// #2900 review: the zeros `refused_iov_ebe` reports are a placeholder, not a solve, so a later
+/// stage that does solve the refused subject (`agq_eval_only`, `PrevEtas::Solved`) treats them
+/// as cold and starts the guarded multi-start; an unrefused subject's solved zero joint start
+/// is warm and starts none. Mutation: pass `policy.init_is_warm` unmasked to
+/// `find_ebe_iov_seeded` -> the refused row reads 0.
+#[test]
+fn a_refused_subjects_zero_mode_is_not_a_solved_warm_start() {
+    use crate::estimation::inner_optimizer::{
+        find_ebe_for_stage_with_prev, PrevEtas, EBE_MULTISTARTS_STARTED,
+    };
+    use crate::types::{EstimationMethod, FitOptions};
+    let model = frem_iov_ode();
+    let (plain, refused) = frem_iov_pair(&model);
+    let params = moved_params(&model);
+    let agq = FitOptions { method: EstimationMethod::Laplace, n_agq: 3, ..FitOptions::default() };
+    for (s, runs) in [(&refused, 1), (&plain, 0)] {
+        let zero =
+            vec![0.0; model.n_eta + model.n_kappa * crate::stats::stacked_layout::group_count(s)];
+        let before = EBE_MULTISTARTS_STARTED.with(|n| n.get());
+        find_ebe_for_stage_with_prev(
+            &model,
+            s,
+            &params,
+            200,
+            1e-8,
+            Some(&zero),
+            None,
+            4,
+            &agq,
+            PrevEtas::Solved,
+        );
+        let n = EBE_MULTISTARTS_STARTED.with(|n| n.get()) - before;
+        assert_eq!(n, runs, "refused: {}", std::ptr::eq(s, &refused));
+    }
+}
+
 /// A FOCE fit of a FREM + κ ODE population with one refused subject reports no
 /// finite-difference inner subjects and no `W_PLAN_FD_FALLBACK`: the refused subject was the
 /// only FD route under κ. Its objective is the constant, the others' are live.
