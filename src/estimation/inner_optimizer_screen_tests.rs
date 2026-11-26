@@ -161,8 +161,48 @@ fn omega_distance_is_the_prior_metric() {
     assert!((omega_distance(&[0.0, 0.0], &[0.0, 3.0], &omega) - 3.0).abs() < 1e-12);
 }
 
+/// The starts the screen keeps from `sorted` (a stable sort of the draws by objective): of the
+/// pool's lowest, lowest first, each farther than `SCREEN_MIN_OMEGA_DIST` from those before.
+fn spread(sorted: &[Vec<f64>], omega: &crate::types::OmegaMatrix) -> Vec<Vec<f64>> {
+    let mut kept: Vec<Vec<f64>> = Vec::new();
+    for d in sorted.iter().take(SCREEN_POOL) {
+        if kept.len() < SCREEN_TOP_K
+            && kept.iter().all(|k| omega_distance(k, d, omega) > SCREEN_MIN_OMEGA_DIST)
+        {
+            kept.push(d.clone());
+        }
+    }
+    kept
+}
+
+/// Each start is far from *every* earlier start, not only the last: with Ω = 1 the distance is
+/// `|a − b|`, and the four lowest draws are A, B (0.54 from A), C (0.80 from B, 0.26 from A)
+/// and D (far from both). C is far from B but too near A, so the starts are `[A, B, D]`.
 #[test]
-fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
+fn a_screen_start_is_far_from_every_earlier_start_not_only_the_last() {
+    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms};
+    let omega = diag_omega(&[1.0]);
+    let draws: Vec<f64> = sobol_uniforms(1, 16, screen_seed("S1"))
+        .into_iter()
+        .map(|u| 2.0 * inv_normal_cdf(u[0]))
+        .collect();
+    let [a, b, c, d] = [4, 5, 11, 0].map(|i| draws[i]);
+    let dist = |x: f64, y: f64| omega_distance(&[x], &[y], &omega);
+    assert!(dist(a, b) > 0.5 && dist(b, c) > 0.5 && dist(a, c) <= 0.5);
+    assert!(dist(a, d) > 0.5 && dist(b, d) > 0.5);
+    // The objective ranks the draws A < B < C < D < every other.
+    let rank = |e: &[f64]| [a, b, c, d].iter().position(|&x| x == e[0]).unwrap_or(9) as f64;
+    let got: Vec<f64> =
+        screen_starts(&rank, &omega, 1, 16, "S1").into_iter().map(|s| s[0]).collect();
+    let want = [0.26752090313849447, -0.2708763674468896, 2.0323211300031];
+    assert_eq!(got.len(), want.len(), "{got:?}");
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() < 1e-9, "{got:?} is not {want:?}");
+    }
+}
+
+#[test]
+fn screen_starts_are_the_lowest_spread_draws_of_the_scaled_prior() {
     use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms};
     let omega = diag_omega(&[0.04, 0.1, 1.0]);
     let draws: Vec<Vec<f64>> = sobol_uniforms(3, 100, screen_seed("S1"))
@@ -173,20 +213,21 @@ fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
         })
         .collect();
 
-    // A flat objective ties every draw, so the stable sort keeps the first three in Sobol
-    // order: this pins the stream, its seed, the 2·chol(Ω) scale and the top-K count.
+    // A flat objective ties every draw, so the stable sort keeps Sobol order: this pins the
+    // stream, its seed, the 2·chol(Ω) scale and the top-K count.
     let flat = screen_starts(&|_| 0.0, &omega, 3, 100, "S1");
-    assert_eq!(flat, draws[..3].to_vec());
+    assert_eq!(flat, spread(&draws, &omega));
+    assert_eq!(flat.len(), SCREEN_TOP_K);
 
-    // A real objective takes the three lowest, lowest first.
+    // A real objective takes the lowest that lie apart, lowest first.
     let sq = |e: &[f64]| e.iter().map(|x| x * x).sum::<f64>();
     let got = screen_starts(&sq, &omega, 3, 100, "S1");
     let mut want = draws.clone();
     want.sort_by(|a, b| sq(a).total_cmp(&sq(b)));
-    assert_eq!(got, want[..3].to_vec());
+    assert_eq!(got, spread(&want, &omega));
 
-    // Ties among non-minimal values: the kept starts are a stable sort's first three,
-    // so a later draw never displaces an earlier one it ties. Coarse buckets of `sq`
+    // Ties among non-minimal values: the pool is a stable sort's prefix, so a later draw
+    // never displaces an earlier one it ties. Coarse buckets of `sq`
     // put many draws on each level.
     let coarse = |e: &[f64]| (sq(e) * 4.0).floor();
     let got = screen_starts(&coarse, &omega, 3, 100, "S1");
@@ -196,7 +237,7 @@ fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
         want[..4].windows(2).any(|w| coarse(&w[0]) == coarse(&w[1])),
         "the fixture must tie inside the kept set or at its edge"
     );
-    assert_eq!(got, want[..3].to_vec());
+    assert_eq!(got, spread(&want, &omega));
 
     // A draw whose objective is not finite is dropped, not ranked. `−∞` and a negative
     // NaN both sort ahead of every finite value under `total_cmp`, so a kept one would
@@ -211,7 +252,7 @@ fn screen_starts_are_the_lowest_draws_of_the_scaled_prior() {
             0.0
         }
     };
-    assert_eq!(screen_starts(&not_finite, &omega, 3, 100, "S1"), draws[2..5].to_vec());
+    assert_eq!(screen_starts(&not_finite, &omega, 3, 100, "S1"), spread(&draws[2..], &omega));
 
     // Keyed by the ID: another ID draws another stream, the same ID the same one.
     assert_ne!(screen_starts(&|_| 0.0, &omega, 3, 100, "S2"), flat);
@@ -1713,4 +1754,32 @@ fn the_profile_report_writes_its_lines_only_when_enabled() {
         "{inner}"
     );
     assert!(text.ends_with('\n'), "each line is terminated: {text:?}");
+}
+
+/// #2863: a screen large enough to put its lowest draws around one mode spreads its starts
+/// instead of descending from that mode three times. Dies when the starts are the plain lowest.
+#[test]
+fn a_large_screen_spreads_its_starts_out_of_one_mode() {
+    let omega = diag_omega(&[0.04, 0.1, 1.0]);
+    let zero = [0.0; 3];
+    let near = |e: &[f64]| omega_distance(e, &zero, &omega);
+    let got = screen_starts(&near, &omega, 3, 2000, "S1");
+    assert_eq!(got.len(), SCREEN_TOP_K);
+    for (i, a) in got.iter().enumerate() {
+        for b in &got[i + 1..] {
+            assert!(omega_distance(a, b, &omega) > SCREEN_MIN_OMEGA_DIST, "{a:?} {b:?}");
+        }
+    }
+    // The plain three lowest crowd: the fixture must be one the spread changes.
+    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms};
+    let mut all: Vec<Vec<f64>> = sobol_uniforms(3, 2000, screen_seed("S1"))
+        .into_iter()
+        .map(|u| {
+            let z = DVector::from_iterator(3, u.iter().map(|&ui| 2.0 * inv_normal_cdf(ui)));
+            (&omega.chol * z).iter().copied().collect()
+        })
+        .collect();
+    all.sort_by(|a, b| near(a).total_cmp(&near(b)));
+    assert!(omega_distance(&all[0], &all[1], &omega) <= SCREEN_MIN_OMEGA_DIST);
+    assert_eq!(got, spread(&all, &omega));
 }
