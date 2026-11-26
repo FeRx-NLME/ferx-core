@@ -3,6 +3,7 @@
 //! refinement against that factorization) and its steady-state call (the implicit function
 //! theorem), each to second order in η.
 use super::*;
+use crate::sens::num::vm::VmArith;
 use crate::sens::num::PkNum;
 
 /// The second-order layout over 2 η: value, `∂_0`, `∂_1`, `∂²_00`, `∂²_10`, `∂²_11`.
@@ -1217,6 +1218,27 @@ fn sqrt_at_zero_is_flat_in_a_compiled_plan() {
     let (v, g, h) = derivs_of(&[0.25], 1, true, &|t| Some(vec![t[0].sqrt()])).unwrap();
     assert_eq!(v[0], 0.5);
     assert!((g[0][0] - 1.0).abs() < 1e-12 && (h[0][0] + 2.0).abs() < 1e-12);
+}
+
+/// The bytecode VM's `sqrt` (`PkNum::sqrt_vm`) records one total node, not branches (#3002):
+/// recorded at a positive argument and run at zero or below, the plan's checks hold and it reads
+/// the VM's flat `+0`. As branches they were guards, and inside an ODE loop body a failed guard
+/// declines the segment: a QSS TMDD's `sqrt` in `[odes]` sent 23 of 36 subjects to FD.
+#[test]
+fn a_recorded_vm_sqrt_holds_at_a_non_positive_argument() {
+    for (at, v, d, h) in [
+        (0.36, 0.6, 1.0 / 1.2, -0.25 / 0.36f64.powf(1.5)),
+        (0.0, 0.0, 0.0, 0.0),
+        (-0.25, 0.0, 0.0, 0.0),
+    ] {
+        let out = run2(|e| vec![e[0].sqrt_vm()], [0.25, 0.0], [at, 0.0]);
+        close(out[0][0], v, "value");
+        close(out[0][1], d, "d/du");
+        close(out[0][3], h, "d2/du2");
+        if at <= 0.0 {
+            assert_eq!((out[0][1], out[0][3]), (0.0, 0.0), "flat at {at}");
+        }
+    }
 }
 
 /// A plan resolves each `(layout, direction)` once, in a slot read without a lock: the same
