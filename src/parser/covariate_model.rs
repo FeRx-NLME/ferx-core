@@ -720,8 +720,8 @@ fn build_thetas(
             let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
             // The two shapes differ by `θ_cat2 = 1 + θ_cat`, so `categorical2`
             // takes the *image* of `categorical`'s defaults under exactly that
-            // map: bounds (−1, 5) → (0, 6) — which is what Pharmpy's `cat2`
-            // uses verbatim — and init −0.001 → 0.999, so the two forms start
+            // map: bounds (−1, 5) → (0, 6) — which are also Pharmpy's `cat2`
+            // bounds — and init −0.001 → 0.999, so the two forms start
             // at the identical model. (Pharmpy's own `cat2` init is 1.01; ferx
             // already differs on the `cat` init's sign, following PsN.)
             let (init, lower, upper) = match rel.form {
@@ -944,8 +944,8 @@ fn theta_declaration(theta: &CovariateTheta) -> String {
 /// `1`, so a covariate at its centre contributes `0` and so does a θ at the
 /// *form's* null — `0` everywhere except `categorical2`, whose θ is the factor
 /// itself and whose null is `1` (#1312), hence its `θ_k - 1`. This is
-/// where ferx parts company with Pharmpy, which reuses the multiplicative
-/// template verbatim under `+` — see [`CovariateOp`].
+/// where ferx parts company with Pharmpy, which keeps the multiplicative
+/// template's leading `1` under `+` — see [`CovariateOp`].
 fn relation_effect(rel: &CovariateRelation) -> Option<String> {
     let cov = &rel.covariate;
     let add = rel.op == CovariateOp::Add;

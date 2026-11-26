@@ -1,6 +1,6 @@
 ---
 pagetitle: "Declarative covariate models in ferx"
-description-meta: "Declare covariate-parameter relationships as data with the [covariate_model] block — PsN scm parity, data-derived centering, and a machine-readable relation table."
+description-meta: "Declare covariate-parameter relationships as data with the [covariate_model] block — PsN scm-compatible forms, data-derived centering, and a machine-readable relation table."
 ---
 
 # Covariate model
@@ -201,7 +201,7 @@ Where they differ from PsN 5.7.2:
 - PsN's `linear` init is `0.001` times whichever bound is smaller in magnitude.
 - PsN rounds the `linear` and `hockey` bounds to three decimals.
 
-State them with `=> NAME(init, lower, upper)` to reproduce an `scm` run exactly.
+State PsN 5.7.2's values with `=> NAME(init, lower, upper)` to start from the same θ declarations as its `scm`.
 
 `categorical2`'s row is the image of `categorical`'s under `θ_cat2 = 1 + θ_cat`,
 so the two forms start at the *identical model* and admit the identical set of

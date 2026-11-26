@@ -47,10 +47,10 @@ pub struct BootstrapSummary {
 /// estimator PsN reports: interpolate linearly between the two order statistics
 /// that bracket position `(m + 1)·p` in a sample of size `m`.
 ///
-/// Returns `None` when the sample is too small to resolve the tail — when
-/// `(m+1)p < 1` there is no order statistic below the requested quantile and any
-/// answer would be an extrapolation past the smallest observation. That one condition
-/// reproduces the minimum sample counts PsN documents: **19** samples for 5–95%,
+/// Returns `None` outside `1 ≤ (m+1)p ≤ m`, where the usual type-6 definition would
+/// clamp to the smallest or largest observation: there is no order statistic beyond
+/// the requested quantile, so any answer would be an extrapolation. That condition
+/// gives the minimum sample counts **19** samples for 5–95%,
 /// **39** for 2.5–97.5%, **199** for 0.5–99.5%, **1999** for 0.05–99.95%.
 ///
 /// `sorted` must be ascending.
@@ -61,7 +61,7 @@ pub fn percentile(sorted: &[f64], pct: f64) -> Option<f64> {
     let p = pct / 100.0;
     let n = sorted.len() as f64 + 1.0;
     let np = n * p;
-    // Both tails: the upper one runs out of data at `(n+1)(1-p) < 1` by the same
+    // Both tails: the upper one runs out of data at `n·(1-p) < 1` (`n = m + 1`) by the same
     // argument, which is why PsN quotes a single sample count per interval.
     if np < 1.0 || np > sorted.len() as f64 {
         return None;

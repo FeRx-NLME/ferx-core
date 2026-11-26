@@ -9,8 +9,7 @@
 //! writing it.
 //!
 //! Row order is consistent across `raw_results`, `included_individuals`,
-//! `included_keys` and `sample_keys`, exactly as PsN documents: row *j* concerns
-//! the same replicate in every file.
+//! `included_keys` and `sample_keys`: row *j* of each file is replicate *j*.
 
 use std::path::Path;
 

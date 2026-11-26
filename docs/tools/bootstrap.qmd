@@ -1,6 +1,6 @@
 ---
 pagetitle: "Bootstrap"
-description-meta: "Non-parametric case bootstrap in ferx: resample subjects, refit, and report bias, standard errors and confidence intervals — at PsN::bootstrap feature parity."
+description-meta: "Non-parametric case bootstrap in ferx: resample subjects, refit, and report bias, standard errors and confidence intervals — modelled on PsN::bootstrap."
 ---
 
 # Bootstrap
@@ -329,18 +329,14 @@ those.
 
 ## Confidence intervals
 
-Percentile intervals use PsN's estimator, the weighted average at `x₍ₙ₊₁₎ₚ`:
+Percentile intervals use the type-6 sample quantile (Hyndman & Fan, *Am Stat* 1996),
+the same estimator PsN reports. With `m` sorted estimates `x₁ ≤ … ≤ xₘ` and
+`p = percentile / 100`, let `h = (m + 1)·p`; the percentile interpolates linearly
+between `x⌊h⌋` and `x⌊h⌋₊₁`.
 
-```
-n = number of samples + 1
-p = percentile / 100
-i = integer part of n·p
-f = decimal part of n·p
-percentile = (1−f)·xᵢ + f·xᵢ₊₁
-```
-
-A tail can only be reported when there is an order statistic at or below it — i.e. when
-`(n+1)·p ≥ 1`. That single condition reproduces every minimum PsN tabulates:
+A tail is reported only when `1 ≤ h ≤ m`, so that the quantile lies between two
+observed estimates rather than beyond the smallest or largest. That condition
+gives these minimum sample counts:
 
 | interval | samples needed |
 |---|---:|
