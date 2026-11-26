@@ -211,7 +211,7 @@ That a generated candidate *is* the model a pharmacometrician would have
 typed is pinned the way the `[covariate_model]` desugar is: the search's
 two-compartment lagged candidate and its hand-written twin agree on
 `predict()` bit for bit and on the evaluated objective bit for bit
-(`crates/ferx-tools/tests/modelsearch_end_to_end.rs`).
+(`crates/ferx-search/tests/modelsearch_end_to_end.rs`).
 
 ## The `[odes]` candidates
 
@@ -413,7 +413,7 @@ LAGTIME([OFF,ON])` run exhaustively. The base was fitted in NONMEM
 writes them — seeded from the base's `.ext`, with `Q = CL`, `V2 = 0.05 · V`,
 `ALAG = 0.25` and an η of 0.01 on the lag — and fitted (`lag.ctl`, `p1.ctl`,
 `p1_lag.ctl`). The control streams, `.lst` and `.ext` files are under
-`crates/ferx-tools/tests/nonmem/modelsearch_anchor/`, and
+`crates/ferx-search/tests/nonmem/modelsearch_anchor/`, and
 `tests/modelsearch_nonmem_anchor.rs` replays the comparison.
 
 | model | NONMEM, own run | NONMEM at ferx's estimates | ferx | mixed BIC | rank |
@@ -500,8 +500,8 @@ a disagreement about the model.
 ## From Rust
 
 ```rust
-use ferx_tools::modelsearch::{run_modelsearch, ModelsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::modelsearch::{run_modelsearch, ModelsearchRun};
+use ferx_search::search::SearchConfig;
 
 let cfg = SearchConfig::load("warfarin.ferxsearch")?;
 let base = cfg.load_base()?;
@@ -519,4 +519,4 @@ let runner_up = &result.models["run2"];   // every fitted model's text, by id
 
 `ModelsearchRun` also takes a `threads` override, a `CancelFlag` that stops
 the search between layers with what it has, and a progress callback
-(`ModelsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512).
+(`ModelsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_search::search::CandidateFinished`, #2512).

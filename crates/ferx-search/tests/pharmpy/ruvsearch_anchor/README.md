@@ -3,7 +3,7 @@
 Pharmpy 2.2.0's `ruvsearch`, driven by NONMEM 7.5.1, on a simulated
 one-compartment oral dataset whose residual error is a **power** model, so the
 search has a feature to find. Exercised by
-`crates/ferx-tools/tests/ruvsearch_pharmpy_anchor.rs` (slow-gated).
+`crates/ferx-search/tests/ruvsearch_pharmpy_anchor.rs` (slow-gated).
 
 ## The data
 

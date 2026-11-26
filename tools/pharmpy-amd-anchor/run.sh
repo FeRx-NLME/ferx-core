@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate crates/ferx-tools/tests/data/amd_pharmpy_anchor.json (#1184).
+# Regenerate crates/ferx-search/tests/data/amd_pharmpy_anchor.json (#1184).
 #
 # Runs inside the licensed `pmx` container, where Pharmpy 2.2.0 is
 # pip-installed (see tools/pharmpy-variability-anchor/README.md). Nothing is
@@ -16,4 +16,4 @@ inside="/home/rstudio/${here#/Users/ron/}"
 docker exec -w "$inside" "$container" python3 \
   tools/pharmpy-amd-anchor/dump.py \
   tools/pharmpy-amd-anchor/corpus.txt \
-  crates/ferx-tools/tests/data/amd_pharmpy_anchor.json
+  crates/ferx-search/tests/data/amd_pharmpy_anchor.json

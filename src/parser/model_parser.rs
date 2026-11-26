@@ -28138,7 +28138,7 @@ const IP_CACHE_WAYS: usize = 64;
 /// One memoized evaluation of a model's η-independent prefix.
 ///
 /// `model_id` distinguishes the closures of different `CompiledModel`s sharing a
-/// worker thread (a joint PK-TTE fit, a `ferx-tools` search, a test binary), so
+/// worker thread (a joint PK-TTE fit, a `ferx-search` run, a test binary), so
 /// a stale entry from another model can never be served: it is compared, not
 /// assumed.
 #[derive(Debug, Default)]

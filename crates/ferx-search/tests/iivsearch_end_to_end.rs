@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 
 use ferx_core::fit;
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_tools::iivsearch::{run_iivsearch, IivsearchResult, IivsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::iivsearch::{run_iivsearch, IivsearchResult, IivsearchRun};
+use ferx_search::search::SearchConfig;
 
 const DATA: &str = "../../data/warfarin.csv";
 
@@ -83,7 +83,7 @@ fn run(dir: &Path, path: &Path) -> (SearchConfig, IivsearchResult) {
     (config, result)
 }
 
-fn evaluate(text: &str, base: &ferx_tools::search::BaseModel) -> ferx_core::FitResult {
+fn evaluate(text: &str, base: &ferx_search::search::BaseModel) -> ferx_core::FitResult {
     let parsed = parse_full_model(text).expect("the model parses");
     let mut o = parsed.fit_options.clone().quiet();
     o.threads = Some(2);

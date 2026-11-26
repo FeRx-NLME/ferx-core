@@ -3,7 +3,7 @@
 Pharmpy 2.2.0's `iovsearch`, driven by NONMEM 7.5.1, on a simulated
 one-compartment oral dataset over three dosing occasions with
 inter-occasion variability on CL only, so the search has a structure to
-find. Exercised by `crates/ferx-tools/tests/iovsearch_pharmpy_anchor.rs`
+find. Exercised by `crates/ferx-search/tests/iovsearch_pharmpy_anchor.rs`
 (slow-gated).
 
 ## The data

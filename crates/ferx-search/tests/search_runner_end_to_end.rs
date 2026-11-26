@@ -18,7 +18,7 @@ use std::path::Path;
 
 use ferx_core::edit::{ModelEdit, ModelText};
 use ferx_core::{fit, prepare_run, BloqMethod, CancelFlag, FitOptions, PreparedRun, Strictness};
-use ferx_tools::search::{Candidate, Criterion, FeatureVector, RunOptions, Runner};
+use ferx_search::search::{Candidate, Criterion, FeatureVector, RunOptions, Runner};
 
 const MODEL: &str = "../../examples/warfarin.ferx";
 const DATA: &str = "../../data/warfarin.csv";

@@ -1604,7 +1604,7 @@ fn gradient_method_record_is_the_union_with_the_caller() {
 }
 
 /// #1860 review r1 #2: `ScoringSettings` is serialised inside `FitResult` itself (the fit JSON
-/// `read_fit_estimates` reads, the ferx-tools search journal), not only through the `.fitrx`
+/// `read_fit_estimates` reads, the ferx-search journal), not only through the `.fitrx`
 /// wire. A `FitResult` written before #1835 has no `gradient_method` in either record and must
 /// still deserialise, reading `Auto` in both. The fixture records `Fd`, so a key that was
 /// silently not written cannot pass as the default. Mutation: drop

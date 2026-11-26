@@ -17,9 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use ferx_core::fit;
-use ferx_tools::allometry::{run_allometry, AllometryOptions, AllometryRun};
-use ferx_tools::covsearch::{run_covsearch, CovsearchEvent, CovsearchRun, Phase};
-use ferx_tools::search::{RunOptions, SearchConfig};
+use ferx_search::allometry::{run_allometry, AllometryOptions, AllometryRun};
+use ferx_search::covsearch::{run_covsearch, CovsearchEvent, CovsearchRun, Phase};
+use ferx_search::search::{RunOptions, SearchConfig};
 
 const DATA: &str = "../../data/two_cpt_oral_cov.csv";
 
@@ -167,7 +167,7 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
         .iter()
         .position(|e| matches!(e, CovsearchEvent::StepFinished { step: 1, .. }))
         .expect("step 1 finished");
-    let finished: Vec<(usize, &ferx_tools::search::CandidateFinished)> = events
+    let finished: Vec<(usize, &ferx_search::search::CandidateFinished)> = events
         .iter()
         .enumerate()
         .filter_map(|(i, e)| match e {

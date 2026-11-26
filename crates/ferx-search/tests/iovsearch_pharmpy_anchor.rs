@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ferx_tools::iovsearch::{run_iovsearch, IovsearchResult, IovsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::iovsearch::{run_iovsearch, IovsearchResult, IovsearchRun};
+use ferx_search::search::SearchConfig;
 
 const ANCHOR: &str = "tests/pharmpy/iovsearch_anchor";
 
@@ -108,7 +108,9 @@ fn canonical(desc: &str) -> String {
 
 /// Pharmpy's `input` is ferx's `input`; every other model is matched by
 /// its description.
-fn ferx_row<'a>(result: &'a IovsearchResult, row: &ToolRow) -> &'a ferx_tools::iovsearch::ModelRow {
+fn ferx_row<'a>(
+    result: &'a IovsearchResult, row: &ToolRow,
+) -> &'a ferx_search::iovsearch::ModelRow {
     if row.model == "input" {
         return result.row("input").unwrap();
     }

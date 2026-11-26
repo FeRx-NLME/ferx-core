@@ -20,7 +20,7 @@ Prefer the simplest solution that solves the problem.
 
 ## Sibling repositories
 
-The R wrapper package lives at `../ferx-r`. When a sibling `ferx-core` checkout exists, ferx-r's `src/Makevars` patches `ferx-core` **and** `ferx-tools` in from it for that one build, via `tools/sibling-cargo-build.sh` (ferx-r #353). Never hand-write a `[patch]` into ferx-r's `src/rust/.cargo/config.toml`; Makevars truncates that file on every build. When a `pub` API change lands here, expect a matching PR in `ferx-r`.
+The R wrapper package lives at `../ferx-r`. When a sibling `ferx-core` checkout exists, ferx-r's `src/Makevars` patches `ferx-core`, `ferx-tools` and `ferx-search` in from it for that one build, via `tools/sibling-cargo-build.sh` (ferx-r #353). Never hand-write a `[patch]` into ferx-r's `src/rust/.cargo/config.toml`; Makevars truncates that file on every build. When a `pub` API change lands here, expect a matching PR in `ferx-r`.
 
 A "local" ferx-r build may not contain your change:
 
@@ -51,16 +51,17 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 ├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
 └─ crates/
    ├─ ferx-tools/                # depends on ferx-core
-   ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   ├─ ferx-search/               # depends on ferx-tools and ferx-core
+   ├─ ferx-cli/                  # depends on all three; [[bin]] name = "ferx"
    ├─ docs-lint/                 # dev tooling; depends on NOTHING
    └─ patterns-lint/             # dev tooling; test-code lints, depends only on `syn`
 ```
 
-- **The root package must stay `ferx-core`, and `ferx-tools` must stay at `crates/ferx-tools`.** ferx-r's Makevars looks for both there; moving either breaks its local builds.
-- **Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` = many fits, resampling, model-space search — if it calls `fit()` more than once, it is a tool. Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM, VPC statistics) stay in core. `ferx-cli` is thin: argument parsing, printing, exit codes. `ferx-core` never depends on a member (pinned by `tests/public_api_boundary.rs`). `docs-lint` and `patterns-lint` (source-pattern lints over test code, #2634; rules and baseline in `tools/lint-rules/`) depend on no workspace crate and nothing depends on them, which keeps their CI jobs fast (#969).
+- **The root package must stay `ferx-core`, and `ferx-tools` and `ferx-search` must stay at `crates/ferx-tools` and `crates/ferx-search`.** ferx-r's Makevars looks for all three there; moving any of them breaks its local builds.
+- **Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` = many fits of a given model (bootstrap, GAM screening, the `run_in_lanes` fit queue). `ferx-search` = many fits over a space of models (the `.ferxsearch` layer and the search tools). If it calls `fit()` more than once, it is not core. Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM, VPC statistics) stay in core. `ferx-cli` is thin: argument parsing, printing, exit codes. The dependency is strictly one-way, `ferx-search` → `ferx-tools` → `ferx-core`: neither `ferx-tools` nor `ferx-core` ever depends on `ferx-search`, not even as a dev-dependency or through a re-export (#3185), and `ferx-core` never depends on a member (both pinned by `tests/public_api_boundary.rs`). `docs-lint` and `patterns-lint` (source-pattern lints over test code, #2634; rules and baseline in `tools/lint-rules/`) depend on no workspace crate and nothing depends on them, which keeps their CI jobs fast (#969).
 - **Widening the public API is a design step.** Any new `pub` item fails the `Public API baseline` CI job until the baseline is regenerated in the same PR (`tools/update-public-api.sh`, `--check` is what CI runs; #1114). Say in the PR description which tool needs each added item and why the existing surface does not suffice.
   - **No `#[doc(hidden)] pub`.** `cargo public-api` omits such items, so it bypasses the gate; `tests/public_api_boundary.rs` bans it. An item is either public API or `pub(crate)`.
-  - Anything `ferx-tools` needs must also make sense from ferx-r, which consumes `ferx-core` as an ordinary external crate.
+  - Anything `ferx-tools` or `ferx-search` needs must also make sense from ferx-r, which consumes `ferx-core` as an ordinary external crate.
 - **Feature flags belong to `ferx-core`**, so workspace-wide or member-scoped commands must package-qualify them: `--features ferx-core/ci`, not `--features ci` (which fails with `none of the selected packages contains this feature`).
 
 ## First-time setup
@@ -207,7 +208,7 @@ Closed-form PK solutions, event-driven propagators and ODE solvers are written o
 
 ## Changelog
 
-**In the same PR as any user-facing change, add a fragment** `changelog.d/<N>.<category>.md` — never edit `CHANGELOG.md` directly (#1545). `<N>` is the issue/PR number (`-2`, `-3` suffix for extra entries), `<category>` one of `added`, `changed`, `deprecated`, `removed`, `fixed`, `security`, `performance`. Body: exactly one user-facing bullet with the `#NN` reference (see `changelog.d/README.md`). The gate is path-triggered: any PR touching `src/`, `crates/ferx-cli/` or `crates/ferx-tools/` (test files excluded) fails without a fragment, so a non-user-facing one, such as an internal refactor, takes the **`no-changelog`** label instead. Never delete or rename another PR's fragment. `tools/changelog.sh check` validates. A cross-repo change may also need a ferx-r `changelog.d/` fragment, which has its own categories (`breaking`, `feature`, `fix`, `docs`, `internal`); never edit ferx-r's `NEWS.md`.
+**In the same PR as any user-facing change, add a fragment** `changelog.d/<N>.<category>.md` — never edit `CHANGELOG.md` directly (#1545). `<N>` is the issue/PR number (`-2`, `-3` suffix for extra entries), `<category>` one of `added`, `changed`, `deprecated`, `removed`, `fixed`, `security`, `performance`. Body: exactly one user-facing bullet with the `#NN` reference (see `changelog.d/README.md`). The gate is path-triggered: any PR touching `src/`, `crates/ferx-cli/`, `crates/ferx-tools/` or `crates/ferx-search/` (test files excluded) fails without a fragment, so a non-user-facing one, such as an internal refactor, takes the **`no-changelog`** label instead. Never delete or rename another PR's fragment. `tools/changelog.sh check` validates. A cross-repo change may also need a ferx-r `changelog.d/` fragment, which has its own categories (`breaking`, `feature`, `fix`, `docs`, `internal`); never edit ferx-r's `NEWS.md`.
 
 ## Priority labels
 

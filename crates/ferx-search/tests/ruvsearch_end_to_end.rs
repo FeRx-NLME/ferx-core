@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use ferx_core::edit::ModelText;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, RuvMagnitude};
-use ferx_tools::ruvsearch::{render_summary, run_ruvsearch, RuvFeature, RuvsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::ruvsearch::{render_summary, run_ruvsearch, RuvFeature, RuvsearchRun};
+use ferx_search::search::SearchConfig;
 
 const DATA: &str = "../../data/warfarin.csv";
 
@@ -72,7 +72,7 @@ fn write_config(dir: &Path, base: &str, section: &str) -> PathBuf {
     path
 }
 
-fn direct_ofv(base: &ferx_tools::search::BaseModel) -> f64 {
+fn direct_ofv(base: &ferx_search::search::BaseModel) -> f64 {
     fit(&base.prepared.parsed.model, &base.prepared.population, &base.prepared.init_params, &{
         let mut o = base.prepared.parsed.fit_options.clone().quiet();
         o.threads = Some(2);
@@ -162,10 +162,10 @@ fn an_evaluation_only_search_returns_the_input_bit_for_bit_and_fits_every_candid
     }
     // The files.
     let run = dir.path().join("run");
-    assert!(ferx_tools::ruvsearch::steps_path(&run).exists());
-    assert!(ferx_tools::ruvsearch::final_model_path(&run).exists());
-    assert!(ferx_tools::ruvsearch::models_dir(&run).join("power-1.ferx").exists());
-    let steps = std::fs::read_to_string(ferx_tools::ruvsearch::steps_path(&run)).unwrap();
+    assert!(ferx_search::ruvsearch::steps_path(&run).exists());
+    assert!(ferx_search::ruvsearch::final_model_path(&run).exists());
+    assert!(ferx_search::ruvsearch::models_dir(&run).join("power-1.ferx").exists());
+    let steps = std::fs::read_to_string(ferx_search::ruvsearch::steps_path(&run)).unwrap();
     assert_eq!(steps.lines().count(), 1 + result.rows.len());
 }
 

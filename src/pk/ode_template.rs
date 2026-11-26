@@ -161,7 +161,7 @@ pub fn generate(
 /// `ELIMINATION` other than `FO` have no analytic `pk` template at all — they
 /// are reachable only as `[odes]` text, and a model-space search has to write
 /// that text without owning a second copy of the disposition
-/// ([`crate::edit::StructuralSpec`], `ferx-tools::modelsearch`).
+/// ([`crate::edit::StructuralSpec`], `ferx-search::modelsearch`).
 ///
 /// Only the `central` equation changes; the depot and peripheral equations are
 /// the template's own, which is why a caller writes exactly one override line.

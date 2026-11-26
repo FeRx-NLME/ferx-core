@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 use ferx_core::edit::{ModelEdit, ModelText};
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, predict};
-use ferx_tools::modelsearch::{
+use ferx_search::modelsearch::{
     run_modelsearch, Absorption, Elimination, ModelsearchRun, Structure, TransitCount,
 };
-use ferx_tools::search::SearchConfig;
+use ferx_search::search::SearchConfig;
 
 const DATA: &str = "../../data/warfarin.csv";
 
@@ -81,7 +81,7 @@ fn tidy(v: f64) -> f64 {
     format!("{v:.14e}").parse().unwrap()
 }
 
-fn run(dir: &Path, path: &Path) -> (SearchConfig, ferx_tools::modelsearch::ModelsearchResult) {
+fn run(dir: &Path, path: &Path) -> (SearchConfig, ferx_search::modelsearch::ModelsearchResult) {
     let config = SearchConfig::load(path).unwrap();
     let base = config.load_base().unwrap();
     let result = run_modelsearch(
@@ -633,7 +633,7 @@ fn a_fixed_transit_base_compiles_every_transit_move() {
         assert!(ofvs.insert(ofv.to_bits()), "{} evaluates like another model", r.id);
     }
     // The estimated-count candidate has one free θ more than the fixed base.
-    let n = |r: &&ferx_tools::modelsearch::ModelRow| r.n_parameters.unwrap();
+    let n = |r: &&ferx_search::modelsearch::ModelRow| r.n_parameters.unwrap();
     let base_n = result.row("base").unwrap().n_parameters.unwrap();
     assert_eq!(n(&candidates[1]), base_n, "another fixed count: same free θ");
     assert_eq!(n(&candidates[2]), base_n + 1);

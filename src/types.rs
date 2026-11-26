@@ -241,7 +241,7 @@ pub(crate) struct ImpliedDose {
     pub(crate) gov_time: f64,
 }
 
-/// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
+/// The derived rendering minus `evid4` and `implied`: ferx-search's journal hashes
 /// `{doses:?}` into its data fingerprint, and printing either would move every such digest
 /// and refuse every resume. `evid4` labels a record for a warning without changing what
 /// any fit sees. `implied` is derived from the same file, so it names no change of data.
