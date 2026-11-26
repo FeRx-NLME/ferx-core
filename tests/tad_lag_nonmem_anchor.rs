@@ -83,7 +83,7 @@
 //!   integrator does traverse `(0, ALAG]`, but the compartment is empty there, so the
 //!   `TAD` term multiplies zero.
 //! - `tad_lag_A.ctl` / `tad_lag_B.ctl` — single-dose and two-dose controls;
-//!   outputs in `results/tad_lag_{A,B}.{ext,lst}`.
+//!   outputs in `results/tad_lag_{A,B}.{ext,nm.json}`.
 //! - `tad_lag_{A,B}_fit.ferx` — the matching ferx models.
 //! - `data/tad_lag_{A,B}.csv` — the same CSVs (dose `CMT=1`, obs `CMT=1`, so no
 //!   re-keying is needed between engines).

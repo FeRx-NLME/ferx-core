@@ -5,7 +5,7 @@
 #   tools/update-public-api.sh          # rewrite api/ferx-core-public-api.txt
 #   tools/update-public-api.sh --check  # diff against it; non-zero on drift
 #
-# This is A2 of #1114: `ferx-tools` can only touch `pub` items, so the way the
+# This is A2 of #1114: the members can only touch `pub` items, so the way the
 # boundary rots is `ferx-core` growing an ad-hoc `pub` in the same PR that needs
 # it. Committing the surface and diffing it in CI turns every widening into an
 # explicit reviewable line in the diff instead of something buried in a 400-line

@@ -2250,6 +2250,39 @@ fn profile_solve_from_a_previous_solve_starts_at_its_mode() {
     );
 }
 
+/// #2899: a subject with no observations, whose mode is exactly zero, is multi-started by the
+/// cold start solve and not again by one warm from a previous solve (#2691's `Solved`); before,
+/// its zero read as the cold placeholder at every start solve (on F1 with one such subject,
+/// 47 multi-starts in a fit against 14).
+#[test]
+fn profile_start_solve_takes_a_solved_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::on_one_thread;
+    let mut p = prep(F1, F1_DATA, Some(2), |t| t);
+    let empty = p.population.subjects.len() - 1;
+    let s = &mut p.population.subjects[empty];
+    s.id = "EMPTY".into();
+    s.obs_times.clear();
+    s.observations.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    s.occasions.clear();
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let runs = |warm: &ProfileWarm, at: &ModelParameters| {
+        let (s, rec) = on_one_thread(|| {
+            record_inner_solves(|| c.solve(at, warm).expect("the solve converges"))
+        });
+        let n = rec.multistarts.iter().filter(|id| *id == "EMPTY").count();
+        (s, n)
+    };
+    let (first, cold) = runs(&ProfileWarm::from_template(&layout, &p.init_params), &p.init_params);
+    let (_, warm) = runs(&ProfileWarm::from_solve(&layout, &first), &first.params);
+    assert!(cold > 0, "the cold start solve multi-starts it");
+    assert_eq!(warm, 0, "a start solve warm from its zero mode does not");
+}
+
 /// The profiled covariance step handed the fit's (η̂, κ̂) — what `fit()` and `run_covariance`
 /// both hand it — starts its re-profiling pass there. Every later re-solve warm-starts from a
 /// mode an earlier solve of the same subject returned, κ̂ included: the re-profiling solves

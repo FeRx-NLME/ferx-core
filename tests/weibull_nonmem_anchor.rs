@@ -6,7 +6,7 @@
 //!
 //!   - `nonmem_anchor/weibull_absorption.ctl` is the NONMEM 7.x `ADVAN13 $DES
 //!     TOL=9` FOCEI control; its final estimates are in
-//!     `nonmem_anchor/results/weibull_absorption.{ext,lst}`.
+//!     `nonmem_anchor/results/weibull_absorption.{ext,nm.json}`.
 //!   - `data/igd_oral.csv` is the 20-subject / 240-observation single-dose
 //!     dataset shared with the Savic transit and IG anchors, re-keyed to a
 //!     1-compartment layout (every record on CMT 1) so the dose feeds the

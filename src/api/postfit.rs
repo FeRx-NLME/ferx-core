@@ -1344,7 +1344,7 @@ const BOUNDARY_REL_TOL: f64 = 1e-3;
 /// absolute gap. An identity-packed theta (lower bound `< 0`) is judged by
 /// its distance to **each bound on that bound's own scale**, never by its
 /// position as a fraction of the declared range: the two are the same thing
-/// for `(-1, 1)` and very different for PsN's `scm` defaults `(-100, 1e6)`,
+/// for `(-1, 1)` and very different for the `[covariate_model]` defaults `(-100, 1e6)`,
 /// where a range fraction would call every estimate below ~900 "at the lower
 /// bound" — which is what every `[covariate_model]` power / exponential θ
 /// carries, and what excluded every candidate of the first covsearch run
@@ -2118,7 +2118,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// diverged. An `Err(String)` carries one line of prose and deletes the rest.
 /// Nor is the sentinel case an error in any useful sense: a repelled fit has
 /// real, finite parameter estimates and is exactly the "scored but rejected"
-/// candidate `ferx-tools`' model-space search expects from
+/// candidate `ferx-search`'s model-space search expects from
 /// [`crate::model_selection::Strictness::require_converged`] — turning it into
 /// an exception would abort a search instead of stepping past one candidate.
 /// The place to *error* on this population is the front door, where

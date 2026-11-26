@@ -648,7 +648,7 @@ Before #2974 the score held each subject's EBEs and their linearisation at the e
 
 #### NONMEM cross-check at a common point (S, R, RSR)
 
-`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams are `nonmem_anchor/wf_{focei,foce,iov}_*.ctl` and their outputs `nonmem_anchor/results/wf_{focei,foce,iov}_*.{ext,lst}`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
+`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams are `nonmem_anchor/wf_{focei,foce,iov}_*.ctl` and their outputs `nonmem_anchor/results/wf_{focei,foce,iov}_*.{ext,nm.json}`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
 
 | Model | `s` vs `MATRIX=S` | `s` before #2974 | `r` vs `MATRIX=R` | `rsr` vs default `$COV` |
 |---|---|---|---|---|

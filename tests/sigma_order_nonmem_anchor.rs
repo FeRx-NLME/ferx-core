@@ -21,7 +21,7 @@
 //! * **big** — `$SIGMA 4.0 FIX` (2.0² — `S_BIG`), the fit a mis-ordered model
 //!   silently got instead.
 //!
-//! Measured (`nonmem_anchor/results/sigma_order_{small,big}.lst`), against ferx at
+//! Measured (`nonmem_anchor/results/sigma_order_{small,big}.nm.json`), against ferx at
 //! `inner_tol = 1e-10`, `ode_reltol = 1e-10`, `ode_abstol = 1e-12` — the default
 //! `inner_tol = 1e-5` leaves ~8e-4 of residual EBE noise in the objective, which is
 //! tolerance, not disagreement (both sides move together when it is tightened):

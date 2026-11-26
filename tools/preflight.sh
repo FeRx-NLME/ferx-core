@@ -260,7 +260,7 @@ group_changelog() {
 group_fmt() {
   CI_JOB="Format"
   # `--all`: without it `cargo fmt` touches only the root package, so
-  # `crates/ferx-tools` and `crates/ferx-cli` go unchecked (#1114).
+  # the workspace members go unchecked (#1114).
   #
   # No `+nightly`: `rust-toolchain.toml` pins the channel locally and the
   # workflow exports `RUSTUP_TOOLCHAIN: nightly`. `.githooks/pre-commit` calls
@@ -311,7 +311,7 @@ group_check() {
   # contains this feature". Qualified this way it resolves to the SAME feature set
   # as the lines above, so the members link the rlib already built instead of
   # forcing a second `ferx-core` compile under a different feature hash.
-  run cargo check -p ferx-tools -p ferx-cli --tests --no-default-features --features ferx-core/ci
+  run cargo check -p ferx-tools -p ferx-search -p ferx-cli --tests --no-default-features --features ferx-core/ci
 }
 
 group_clippy() {
@@ -411,12 +411,12 @@ group_clippy() {
   # ferx-core line) because the members' test code is a meaningful share of their
   # line count while they are still small.
   #
-  # The `--` args reach BOTH `-p` packages, not just the last one — worth stating
+  # The `--` args reach EVERY `-p` package, not just the last one — worth stating
   # because the opposite would make half this line decoration, and it is not obvious
   # from cargo's docs. Verified by injecting an unused import into each crate on its
   # own: ferx-tools alone and ferx-cli alone each give `error: unused import` and
   # exit 101 from this exact command.
-  run cargo clippy -p ferx-tools -p ferx-cli --tests --no-default-features \
+  run cargo clippy -p ferx-tools -p ferx-search -p ferx-cli --tests --no-default-features \
     --features ferx-core/ci,ferx-core/markov,ferx-core/nn -- -Dunused
 }
 
@@ -432,7 +432,7 @@ group_docs() {
   run cargo test -p docs-lint
 
   # `docs-lint` is outside the `Clippy` group's package list (which is scoped to
-  # `ferx-core` and its two members), so without this line the crate would be
+  # `ferx-core` and the library/CLI members), so without this line the crate would be
   # linted by nothing. Cheap: the compile above already warmed it.
   #
   # `-Dunused` for the same reason as `group_clippy`, and it has to be repeated here
@@ -491,8 +491,8 @@ group_rustdoc() {
 
   # The members, for the same reason clippy checks them separately (#1114):
   # a workspace-root `cargo doc` documents only the root package, so
-  # `ferx-tools` and `ferx-cli` would be gated by nothing.
-  run env RUSTDOCFLAGS=-Dwarnings cargo doc -p ferx-tools -p ferx-cli --no-deps \
+  # `ferx-tools`, `ferx-search` and `ferx-cli` would be gated by nothing.
+  run env RUSTDOCFLAGS=-Dwarnings cargo doc -p ferx-tools -p ferx-search -p ferx-cli --no-deps \
     --no-default-features --features ferx-core/ci,ferx-core/markov,ferx-core/nn
 }
 

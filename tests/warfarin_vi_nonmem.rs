@@ -14,7 +14,7 @@
 //! initial estimates as `examples/warfarin.ferx`), so the licensed run already
 //! committed for the IMP anchor carries the FOCEI column too — `TABLE NO. 1` of
 //! `warfarin_imp.ext`, `#METH: First Order Conditional Estimation with
-//! Interaction` in the `.lst`. `tests/warfarin_imp_nonmem.rs` asserts the
+//! Interaction` in the `.nm.json`. `tests/warfarin_imp_nonmem.rs` asserts the
 //! *second* step (`TABLE NO. 2`); this file asserts the first.
 //!
 //! | Parameter | NONMEM FOCEI | ferx FOCEI | ferx AGQ(9) | ferx VI |

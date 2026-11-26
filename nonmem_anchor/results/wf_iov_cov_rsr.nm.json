@@ -1,0 +1,95 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "warfarin_iov.csv",
+ "data_records": 240,
+ "observations": 220,
+ "individuals": 10,
+ "nmtran_warnings": [2, 111],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction (Evaluation)",
+   "objv": 308.83,
+   "final": {
+    "theta": [0.173, 8.63, 1.18, 0.188],
+    "omega": {
+     "ETA1": [0.0399],
+     "ETA2": [0.0, 0.0108],
+     "ETA3": [0.0, 0.0, 0.0254],
+     "ETA4": [0.0, 0.0, 0.0, 0.0357],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.0357]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.0137, 0.346, 0.0951, 0.0327],
+    "omega": {
+     "ETA1": [0.0216],
+     "ETA2": [null, 0.0056],
+     "ETA3": [null, null, 0.0297],
+     "ETA4": [null, null, null, 0.0153],
+     "ETA5": [null, null, null, null, null]
+    },
+    "sigma": {
+     "EPS1": [null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.000187],
+    "TH 2": [-0.000904, 0.12],
+    "TH 3": [0.000573, 0.00799, 0.00904],
+    "TH 4": [0.000134, 0.00518, 0.00146, 0.00107],
+    "OM11": [1.11e-05, -0.0011, -0.000689, -0.000106, 0.000467],
+    "OM12": [null, null, null, null, null, null],
+    "OM13": [null, null, null, null, null, null, null],
+    "OM14": [null, null, null, null, null, null, null, null],
+    "OM15": [null, null, null, null, null, null, null, null, null],
+    "OM22": [2.3e-05, -0.000564, 0.000192, -6.94e-05, 2.74e-05, null, null, null, null, 3.13e-05],
+    "OM23": [null, null, null, null, null, null, null, null, null, null, null],
+    "OM24": [null, null, null, null, null, null, null, null, null, null, null, null],
+    "OM25": [null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "OM33": [-0.000106, -0.00205, -0.00211, -0.000426, 0.000168, null, null, null, null, -3.6e-05, null, null, null, 0.000881],
+    "OM34": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "OM35": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "OM44": [-6.58e-05, -0.000692, -0.000395, -0.000139, -0.000207, null, null, null, null, -2.93e-06, null, null, null, 4.62e-05, null, null, 0.000233],
+    "OM45": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "OM55": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG11": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+   },
+   "eigenvalues": [0.023, 0.215, 0.32, 0.473, 0.847, 1.57, 1.89, 2.66],
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM warfarin IOV FOCEI eval-only at the NONMEM MLE (6 sig. fig.), PRINT=E (#2974)",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV OCC",
+  "$DATA warfarin_iov.csv IGNORE=@",
+  "$SUBROUTINES ADVAN2 TRANS2",
+  "$PK",
+  "  OCC1 = 0",
+  "  OCC2 = 0",
+  "  IF(OCC.EQ.1) OCC1 = 1",
+  "  IF(OCC.EQ.2) OCC2 = 1",
+  "  IOVCL = OCC1*ETA(4) + OCC2*ETA(5)",
+  "  CL = THETA(1)*EXP(ETA(1) + IOVCL)",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + THETA(4)*EPS(1))",
+  "$THETA (0.001, 0.172777, 10)  ; TVCL",
+  "$THETA (0.1, 8.62822, 500)  ; TVV",
+  "$THETA (0.01, 1.17856, 50)   ; TVKA",
+  "$THETA (0, 0.188115)          ; PROP_ERR (SD)",
+  "$OMEGA 0.039936 0.0107779 0.0254341",
+  "$OMEGA BLOCK(1) 0.0357079",
+  "$OMEGA BLOCK(1) SAME",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 INTER MAXEVAL=0 NOABORT",
+  "$COVARIANCE PRINT=E",
+  ""
+ ]
+}

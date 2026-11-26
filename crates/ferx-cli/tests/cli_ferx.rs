@@ -923,7 +923,7 @@ fn modelsearch_help_usage_and_a_file_meant_for_another_tool() {
 
     // A covariate file is refused by name, before the dataset is read.
     let out = ferx()
-        .args(["modelsearch", "crates/ferx-tools/tests/psn/scm_anchor/scm.ferxsearch"])
+        .args(["modelsearch", "crates/ferx-search/tests/psn/scm_anchor/scm.ferxsearch"])
         .output()
         .expect("run");
     assert_eq!(out.status.code(), Some(1));

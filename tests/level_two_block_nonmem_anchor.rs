@@ -13,7 +13,7 @@
 //!   each of six times, simulated by `simulate_level_two_block.py` (seed 1963);
 //! - `level_two_block.ctl` — `$PRED`, both blocks hand-coded sum-to-zero (the last
 //!   level minus the others' sum), FOCE-I at `MAXEVAL=0` with `POSTHOC`, every level
-//!   nonzero, `FORMAT=s1PE23.16`. Results in `results/level_two_block.{lst,ext,phi,tab}`
+//!   nonzero, `FORMAT=s1PE23.16`. Results in `results/level_two_block.{nm.json,ext,phi,tab}`
 //!   from the `nm3` anchor image (`nm3` cannot baseline a `MAXEVAL=0` run, so only that
 //!   config ran; see the row in `nonmem_anchor/README.md`);
 //! - `level_two_block_fit.ferx` — the level spelling, which this test binds, so the

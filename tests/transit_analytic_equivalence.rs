@@ -193,32 +193,16 @@ fn transit_time_desugar_matches_hand_written_ode() {
         "observations must straddle the TIME switch"
     );
 
-    // Compartment/state columns (sdtab `[derived]`) must ALSO route to the equivalent — the
-    // analytical states path has no valid states for a TIME/TV-cov transit subject and would
-    // return NaN. They must be finite and match the hand-written ODE twin's states.
-    let subj = &pop.subjects[0];
+    // The twin's states are not in the closed form's `[depot, central]` layout `[derived]`
+    // names them by, so a twin-served subject reports none (#1580).
     let eta = vec![0.0; sh.n_eta];
-    let (_, sh_states) =
-        ferx_core::pk::compute_predictions_with_states(&sh, subj, &sh.default_params.theta, &eta);
-    let (_, hd_states) =
-        ferx_core::pk::compute_predictions_with_states(&hd, subj, &hd.default_params.theta, &eta);
-    assert!(
-        !sh_states.is_empty()
-            && sh_states
-                .iter()
-                .all(|s| !s.is_empty() && s.iter().all(|x| x.is_finite())),
-        "transit + TIME compartment states must be finite (not the NaN the analytical path returns)"
+    let (_, sh_states) = ferx_core::pk::compute_predictions_with_states(
+        &sh,
+        &pop.subjects[0],
+        &sh.default_params.theta,
+        &eta,
     );
-    assert_eq!(sh_states.len(), hd_states.len());
-    for (a, b) in sh_states.iter().zip(hd_states.iter()) {
-        assert_eq!(a.len(), b.len());
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert!(
-                (x - y).abs() <= ATOL + RTOL * x.abs(),
-                "state mismatch: desugared {x:.6} vs hand ODE {y:.6}"
-            );
-        }
-    }
+    assert!(sh_states.is_empty(), "twin-served transit + TIME subject reports no states");
 }
 
 /// Flip-flop transit: when the individual parameters put `ke = CL/V ≥ KTR`

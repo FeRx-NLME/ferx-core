@@ -65,7 +65,7 @@ docker run --rm -v "$PWD":/work -w /work nonmemdocker:V0.1 \
     /opt/NONMEM/nm760/run/nmfe76 nonmem.ctl nonmem.lst
 ```
 
-The committed `nonmem.lst` / `nonmem.ext` are the outputs of that run. `nonmem.ctl` is
+The committed `nonmem.nm.json` / `nonmem.ext` are the outputs of that run. `nonmem.ctl` is
 the Slice 3.1 telescoping-AG likelihood (`Y = SURV·λ` at events, `SURV` at the censor,
 `TLAST` reset per subject), pointed at `rtte_sim.csv`. The ferx side is the committed
 test `rtte_sim_anchor_ferx_matches_nonmem`.

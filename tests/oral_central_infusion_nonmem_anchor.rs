@@ -21,10 +21,10 @@
 //! other — a curve that agrees at every point under both `F` values cannot be
 //! matching by a rate/duration mix-up on one side.
 //!
-//! Control streams, datasets and verbatim NONMEM output are committed under
+//! Control streams, datasets and extracted NONMEM numbers and tables are committed under
 //! `nonmem_anchor/` as `oral_central_inf_advan{2,4}_f{1,06}.{ctl}` /
 //! `oral_central_inf_advan{2,4}.csv` and
-//! `nonmem_anchor/results/oral_central_inf_advan{2,4}_f{1,06}.{lst,tab}`.
+//! `nonmem_anchor/results/oral_central_inf_advan{2,4}_f{1,06}.{nm.json,tab}`.
 //!
 //! ## What is pinned
 //!

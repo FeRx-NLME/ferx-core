@@ -87,7 +87,7 @@ fn exponential_generates_an_exp_of_the_centred_covariate() {
 
 #[test]
 fn linear_needs_data_and_stays_unresolved_without_it() {
-    // PsN's linear bounds are `1/(median − max) .. 1/(median − min)`, which only
+    // The default linear bounds are `1/(median − max) .. 1/(median − min)`, which only
     // a dataset can supply — so the relation parses, records itself, and is
     // deliberately left undesugared until the statistics are bound.
     let s = spec("  WT continuous", "  CL ~ WT linear(center = 70)");
@@ -152,7 +152,7 @@ fn categorical2_takes_its_own_init_and_bounds_not_categoricals() {
     // The null moves from θ = 0 to θ = 1, so inheriting `categorical`'s
     // defaults would start the relation at a *factor* of −0.001. The bounds
     // are the image of (−1, 5) under θ₂ = 1 + θ₁, which is also Pharmpy's
-    // `cat2` pair verbatim; the init is the image of ferx's own −0.001, so
+    // `cat2` pair; the init is the image of ferx's own −0.001, so
     // the two forms start at the identical model.
     let s = spec("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(ref = 0)");
     assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_SEX_1(0.999, 0, 6)"]);
@@ -807,7 +807,7 @@ fn the_additive_operator_drops_the_leading_one_from_every_form() {
     // `1 + θ·(WT − 70)` and a subject at the centring weight has `1` added to
     // their clearance. ferx drops that `1`, so θ = 0 and COV = centre are both
     // "no effect". Every expected string below carries no leading `1`, and a
-    // switch to the Pharmpy-verbatim convention reddens all six.
+    // switch to Pharmpy's leading-`1` convention reddens all six.
     let cases: [(&str, &str); 6] = [
         (
             "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",

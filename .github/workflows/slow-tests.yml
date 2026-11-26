@@ -246,10 +246,10 @@ jobs:
         #
         # `--workspace` with PACKAGE-QUALIFIED features (#1114): without
         # `--workspace` this builds the root `ferx-core` package only, so a
-        # Tier-3 test in `crates/ferx-tools/tests/` stays `#[ignore]`d in every
+        # Tier-3 test in a member's `tests/` stays `#[ignore]`d in every
         # job that exists and never runs anywhere. The features have to be
         # qualified because `ci`/`survival` are not features of the members and
-        # `slow-tests` is declared by both `ferx-core` and `ferx-tools` — an
+        # `slow-tests` is declared by `ferx-core`, `ferx-tools` and `ferx-search` — an
         # unqualified name would resolve to the root package's and leave the
         # member's gate closed.
         #
@@ -272,7 +272,7 @@ jobs:
           timeout --signal=INT --kill-after=2m ${{ matrix.leg == 'core' && '60m' || '95m' }} \
             python3 tools/ci-test-shard.py run slow ${{ matrix.shard }} ${{ strategy.job-total }} --lib-parts 1 --manifest manifest -- \
               --workspace --exclude docs-lint --exclude patterns-lint --no-default-features \
-              --features ${{ matrix.leg == 'core' && 'ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests' || 'ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests' }} \
+              --features ${{ matrix.leg == 'core' && 'ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests' || 'ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests' }} \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
                  if [ "$code" -eq 124 ]; then \
@@ -347,7 +347,7 @@ jobs:
           timeout --signal=INT --kill-after=2m 70m \
             python3 tools/ci-test-shard.py run slow-nn 1 1 --lib-parts 1 --list-all --manifest manifest -- \
               --workspace --exclude docs-lint --exclude patterns-lint --no-default-features \
-              --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests \
+              --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests,ferx-search/slow-tests \
               --profile ci-test --no-fail-fast ${{ inputs.nocapture && '-- --nocapture' || '' }} \
             || { code=$?; \
                  if [ "$code" -eq 124 ]; then \
