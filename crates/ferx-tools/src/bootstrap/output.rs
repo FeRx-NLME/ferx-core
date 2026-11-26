@@ -9,7 +9,8 @@
 //! writing it.
 //!
 //! Row order is consistent across `raw_results`, `included_individuals`,
-//! `included_keys` and `sample_keys`: row *j* of each file is replicate *j*.
+//! `included_keys` and `sample_keys`: the replicates appear in the same order in
+//! each, after `raw_results`'s header and original-data row and `sample_keys`'s header.
 
 use std::path::Path;
 

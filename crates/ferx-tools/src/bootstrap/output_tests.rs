@@ -65,7 +65,7 @@ fn read(path: &std::path::Path) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn write_all_produces_every_psn_artefact() {
+fn write_all_produces_the_documented_artefacts() {
     let dir = tempfile::tempdir().expect("temp dir");
     let options = BootstrapOptions { dofv: true, ..BootstrapOptions::default() };
     write_all(dir.path(), &result(), &options).expect("write");

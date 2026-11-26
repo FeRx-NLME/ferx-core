@@ -44,8 +44,8 @@ pub struct BootstrapSummary {
 }
 
 /// The type-6 sample quantile (Hyndman & Fan, *Am Stat* 1996), which is also the
-/// estimator PsN reports: interpolate linearly between the two order statistics
-/// that bracket position `(m + 1)·p` in a sample of size `m`.
+/// estimator PsN reports: with `h = (m + 1)·p` in a sample of size `m`, interpolate
+/// linearly between order statistics `⌊h⌋` and `⌊h⌋ + 1` (`h = m` gives the largest).
 ///
 /// Returns `None` outside `1 ≤ (m+1)p ≤ m`, where the usual type-6 definition would
 /// clamp to the smallest or largest observation: there is no order statistic beyond

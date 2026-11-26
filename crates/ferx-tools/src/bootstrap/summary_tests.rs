@@ -39,9 +39,9 @@ fn percentile_is_none_on_an_empty_sample() {
 }
 
 #[test]
-fn minimum_sample_sizes_are_exactly_the_ones_psn_documents() {
-    // The guide tabulates four thresholds. They are not four rules — they all
-    // fall out of "(n+1)p >= 1", i.e. there must be an order statistic at or
+fn minimum_sample_sizes_follow_the_type6_boundary() {
+    // Four thresholds, one rule: they all fall out of "(m+1)p >= 1" for a
+    // sample of size m, i.e. there must be an order statistic at or
     // below the requested quantile rather than an extrapolation past the
     // smallest observation. Pin all four, from both sides.
     for (interval, n_min) in

@@ -15,8 +15,8 @@ maturity tag; see [Feature Maturity](../maturity.qmd) for what the tags mean.
 
 - **[Bootstrap](bootstrap.qmd)** — non-parametric case bootstrap: resample
   subjects with replacement, refit, and read bias, standard errors and
-  confidence intervals off the spread of the estimates. PsN `bootstrap`
-  feature parity.
+  confidence intervals off the spread of the estimates. Modelled on PsN
+  `bootstrap`; the page lists where it differs.
 
 ## Covariate screening
 
