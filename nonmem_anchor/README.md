@@ -184,7 +184,7 @@ respective model (see below).
 > model-discrepancy scale.
 
 > **Weibull run status — DONE (#503).** The licensed NONMEM run landed
-> (`results/weibull_absorption.{ext,lst,tab,…}`, MINIMIZATION SUCCESSFUL,
+> (`results/weibull_absorption.{ext,nm.json,tab,…}`, MINIMIZATION SUCCESSFUL,
 > `#OBJV = −943.833`) and the slow-gated `tests/weibull_nonmem_anchor.rs` pins the
 > verified comparison below. Re-run with
 > `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
