@@ -2733,6 +2733,53 @@ fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
 /// this; the second modes it exists for are separated by O(1).
 const COLD_SEED_TIE_TOL: f64 = 1e-9;
 
+/// The walks an EBE solve keeps for reading the mode's predictions back (#3042): the first point
+/// to reach the lowest value scored, and the latest point tied with it bit for bit. The mode can
+/// tie a point an ulp beside it, walked before it (macOS arm64, `mm_oral` subject 1) or after it
+/// (a line-search trial), so one slot keeps the earlier of a tie and the other the later, and the
+/// mode is found either way. The mode is not always the lowest value: a candidate scoring lower
+/// by under the multistart's `1e-9` is rejected, yet takes the first slot. A tie between three
+/// points, or a mode that is not the lowest, is walked again: only a copy is lost, never a value.
+#[derive(Default)]
+struct KeptWalks([Option<(Vec<u64>, f64, Vec<f64>)>; 2]);
+
+impl KeptWalks {
+    /// The value of a kept walk at exactly `e`.
+    fn held(&self, e: &[f64]) -> Option<f64> {
+        self.0.iter().flatten().find(|(k, ..)| same_bits(k, e)).map(|w| w.1)
+    }
+
+    /// Keep `(e, v, preds)` if `v` is a real value that is a new lowest or ties it.
+    fn offer(&mut self, e: &[f64], v: f64, preds: &[f64]) {
+        let slot = match &self.0[0] {
+            _ if !crate::stats::likelihood::is_usable_subject_nll(v) => return,
+            None => 0,
+            Some(b) if v < b.1 => 0,
+            Some(b) if v == b.1 => 1,
+            Some(_) => return,
+        };
+        let (k, bv, p) = self.0[slot].get_or_insert_with(Default::default);
+        k.clear();
+        k.extend(e.iter().map(|x| x.to_bits()));
+        *bv = v;
+        p.clear();
+        p.extend_from_slice(preds);
+    }
+
+    /// The predictions kept at exactly `mode`, if `n_obs` long.
+    fn take_at(self, mode: &[f64], n_obs: usize) -> Option<Vec<f64>> {
+        self.0
+            .into_iter()
+            .flatten()
+            .find(|(k, _, p)| same_bits(k, mode) && p.len() == n_obs)
+            .map(|w| w.2)
+    }
+}
+
+fn same_bits(k: &[u64], e: &[f64]) -> bool {
+    k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())
+}
+
 /// One inner solve. `cold_seed = false` is the normal solve: the policy's Hessian seed is
 /// used only on a genuinely warm start. `cold_seed = true` forces the seed onto a cold start,
 /// and returns `None` without solving when the seed declines (a policy without one, not the
@@ -2912,15 +2959,14 @@ fn find_ebe_solve(
         key.extend(e.iter().map(|x| x.to_bits()));
         m.push((key, v));
     };
-    // The best point the walk has scored this solve, with the predictions it left: the 4-slot
+    // The best points the walk has scored this solve, with the predictions they left: the 4-slot
     // memo above decides which value a lookup returns (a fused gradient pass's value can sit
     // beside the walk's), and only on its miss is the walk's own, a pure function of η, read
     // back from here instead of walked again. The solve reads back one point's predictions —
-    // the mode's, which is the lowest value it scored — so one entry is all that is kept
-    // (not a vector per η the search and its finite-difference probes visited), written only
-    // on an improvement and read without a copy. An ODE walk is what a repeat is worth
-    // skipping; a closed form re-walks for less than the lookup costs.
-    let best_walk: RefCell<Option<(Vec<u64>, f64, Vec<f64>)>> = RefCell::new(None);
+    // the mode's, normally the lowest value it scored — so [`KeptWalks`] holds two entries, not
+    // a vector per η the search and its finite-difference probes visited. An ODE walk is what a
+    // repeat is worth skipping; a closed form re-walks for less than the lookup costs.
+    let best_walk: RefCell<KeptWalks> = RefCell::new(KeptWalks::default());
     let track_walks = model.ode_spec.is_some();
     let obj = |e: &[f64]| -> f64 {
         if let Some(v) = memo_get(e) {
@@ -2931,21 +2977,12 @@ fn find_ebe_solve(
             memo_put(e, v);
             return v;
         }
-        let held = best_walk.borrow().as_ref().and_then(|(k, v, _)| {
-            (k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
-        });
+        let held = best_walk.borrow().held(e);
         let v = if let Some(v) = held {
             v
         } else {
             let v = obj_uncached(e);
-            let mut best = best_walk.borrow_mut();
-            if v.is_finite() && best.as_ref().is_none_or(|b| v < b.1) {
-                let (k, bv, p) = best.get_or_insert_with(Default::default);
-                k.clear();
-                k.extend(e.iter().map(|x| x.to_bits()));
-                *bv = v;
-                p.clone_from(&pred_recycle.borrow());
-            }
+            best_walk.borrow_mut().offer(e, v, &pred_recycle.borrow());
             v
         };
         memo_put(e, v);
@@ -3689,9 +3726,8 @@ fn find_ebe_solve(
     let ipreds = if at_mode(&preds_at.borrow()) && pred_recycle.borrow().len() == n_obs {
         Some(pred_recycle.take())
     } else {
-        // The last walk was another point (a finite-difference probe beside the mode).
-        let kept =
-            best_walk.take().filter(|(k, _, p)| at_mode(k) && p.len() == n_obs).map(|(_, _, p)| p);
+        // The last walk was another point (a line-search trial beside the mode).
+        let kept = best_walk.take().take_at(&eta_true, n_obs);
         #[cfg(test)]
         BEST_WALK_RESTORES.with(|c| c.set(c.get() + usize::from(kept.is_some())));
         kept
