@@ -334,7 +334,9 @@ fn the_contributions_sum_to_every_quadrature_objective() {
 
 /// #3149: a chained `agq_eval_only` readout publishes the quadrature OFV, so the
 /// contributions must sum to it whatever estimator produced the EBEs it follows (the
-/// post-fit pass re-solves them as conditional modes).
+/// post-fit pass re-solves them as conditional modes). Measured |Σ − OFV| on Linux x86_64 (macOS
+/// arm64 agrees to the printed digits): 2.74e-9 after FOCEI, 7.42e-10 after SAEM, whose EBEs are
+/// re-found at the post-fit tolerance; the bound is 3.6× over the larger.
 #[test]
 fn the_contributions_sum_to_a_chained_quadrature_readout() {
     let (model, population) = warfarin_bloq(BloqMethod::M3);
@@ -348,12 +350,13 @@ fn the_contributions_sum_to_a_chained_quadrature_readout() {
         };
         let r = fit(&model, &population, &model.default_params, &o).expect("fit");
         let sum: f64 = r.subjects.iter().map(|s| s.ofv_contribution).sum();
-        assert!((sum - r.ofv).abs() < 1e-6, "[{first:?}, laplace]: Σ {sum} vs OFV {}", r.ofv);
+        assert!((sum - r.ofv).abs() < 1e-8, "[{first:?}, laplace]: Σ {sum} vs OFV {}", r.ofv);
     }
 }
 
 /// #3149 on the IOV path: the κ̂ reach the quadrature term, so the contributions of an
-/// IOV Laplace fit sum to its OFV.
+/// IOV Laplace fit sum to its OFV. Measured |Σ − OFV| is 0 (exact) on Linux x86_64 and macOS
+/// arm64: the same term is summed in the same order.
 #[test]
 fn the_contributions_sum_to_an_iov_laplace_objective() {
     let mut parsed = crate::parser::model_parser::parse_full_model_file(Path::new(
@@ -375,5 +378,5 @@ fn the_contributions_sum_to_an_iov_laplace_objective() {
     let r = fit(&parsed.model, &population, &parsed.model.default_params, &o).expect("fit");
     assert!(!r.ebe_kappas.is_empty(), "premise: an IOV fit");
     let sum: f64 = r.subjects.iter().map(|s| s.ofv_contribution).sum();
-    assert!((sum - r.ofv).abs() < 1e-6, "Σ {sum} vs OFV {}", r.ofv);
+    assert!((sum - r.ofv).abs() < 1e-9, "Σ {sum} vs OFV {}", r.ofv);
 }

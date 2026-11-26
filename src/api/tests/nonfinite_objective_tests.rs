@@ -1503,6 +1503,47 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
     );
 }
 
+/// **N5q — the same subject under quadrature carries no FOCE/FOCEI curvature part** (#3149,
+/// #3166 review). N5's fit names `Gaussian residual term = NaN, curvature (H̃ not positive
+/// definite) = NaN` for subject 3; under `laplace` the contribution is the quadrature term,
+/// whose parts those are not, so the subject is still named (its predictions are `NaN`) and
+/// `failed_terms` is empty. A differential pair on one population: FOCEI names the parts and
+/// Laplace does not, so a gate that is always open or always shut fails one half.
+///
+/// Mutation (run): drop the `.filter(|_| agq_term.is_none())` on the scorer's `h_matrices` →
+/// the Laplace half names the FOCEI parts.
+#[test]
+fn a_quadrature_fits_unusable_subject_names_no_focei_curvature_part() {
+    let model = wt_power_model(false);
+    let pop = warfarin_with_wt(NegativeWt::EveryRecord);
+    let run = |method: EstimationMethod| {
+        let opts = FitOptions {
+            method,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            threads: Some(1),
+            ..Default::default()
+        };
+        fit(&model, &pop, &model.default_params, &opts).expect("fit")
+    };
+    let focei = run(EstimationMethod::FoceI);
+    let (_, subjects) = named_subjects(&focei);
+    assert_eq!(subjects.len(), 1, "{subjects:?}");
+    assert_eq!(
+        subjects[0]["failed_terms"].as_array().map(Vec::len),
+        Some(2),
+        "premise: FOCEI names its Gaussian and curvature parts: {subjects:?}"
+    );
+
+    let laplace = run(EstimationMethod::Laplace);
+    let (message, subjects) = named_subjects(&laplace);
+    assert_eq!(subjects.len(), 1, "only subject 3 is named: {subjects:?}");
+    assert_eq!(subjects[0]["id"], "3");
+    assert_eq!(subjects[0]["nonfinite_predictions"], 11, "{subjects:?}");
+    assert_eq!(subjects[0]["failed_terms"], serde_json::json!([]), "{subjects:?}");
+    assert!(!message.contains("failed term"), "{message}");
+}
+
 /// **N6 — end to end, one bad record, on both engines.** A negative `WT` on subject
 /// 3's fourth observation only: each engine carries the `NaN` into that record and
 /// every later one, and the sentence names the first of them.
