@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract the numbers of a NONMEM listing into JSON (#3182).
 
-    tools/nonmem-extract.py run.lst [more.lst ...] [--out-dir DIR] [--control FILE]
+    tools/nonmem-extract.py run.lst [more.lst ...] [--out-dir DIR]
 
 Writes `<stem>.nm.json` next to each listing, or in DIR. Commit that, the control
 stream, the data and the numeric tables (.ext, .phi, .tab, .cov); never the listing,
@@ -16,6 +16,7 @@ import argparse
 import json
 import pathlib
 import re
+import sys
 
 NUM = re.compile(r"[-+]?(?:\d+\.?\d*(?:[EeDd][-+]?\d+)?|\.\d+(?:[EeDd][-+]?\d+)?|INF|NaN)$")
 MARKERS = [
@@ -166,7 +167,12 @@ def step(text, keep_covariance):
 
 
 def extract(text, keep_covariance):
-    head = re.split(r"^ *NM-TRAN MESSAGES|^ *License Registered", text, maxsplit=1, flags=re.M)[0]
+    parts = re.split(r"^ *NM-TRAN MESSAGES|^ *License Registered", text, maxsplit=1, flags=re.M | re.I)
+    if len(parts) < 2:
+        # Without the boundary the "control stream" would run to the end of the listing
+        # and carry NONMEM's text and the license holder into the JSON: refuse instead.
+        raise ValueError("cannot find where the control stream echo ends")
+    head = parts[0]
     start = re.search(r"^\s*(?:\$|;)", head, re.M)
     control = head[start.start() :].strip("\n") if start else ""
     out = {}
@@ -188,7 +194,13 @@ def extract(text, keep_covariance):
     output = text[len(head) :]
     out["markers"] = [m for m in MARKERS if m in output]
     out["steps"] = [step(s, keep_covariance) for s in re.split(r"^ #METH:", text, flags=re.M)[1:]]
+    if not out["steps"] and re.search(r"^\s*\$EST", control, re.M | re.I):
+        # The listing stops before estimation output (e.g. only the NM-TRAN part was kept);
+        # the numbers are then in the .ext alone.
+        out["listing_truncated"] = True
     out["control_stream_as_run"] = [l.rstrip() for l in control.splitlines()]
+    if re.search(r"license|registered to", control, re.I):
+        raise ValueError("the control stream echo contains license text")
     return out
 
 
@@ -198,7 +210,10 @@ def main():
     ap.add_argument("--out-dir", type=pathlib.Path)
     args = ap.parse_args()
     for lst in args.listings:
-        result = extract(lst.read_text(errors="replace"), not lst.with_suffix(".cov").exists())
+        try:
+            result = extract(lst.read_text(errors="replace"), not lst.with_suffix(".cov").exists())
+        except ValueError as e:
+            sys.exit(f"{lst}: {e}")
         out = (args.out_dir or lst.parent) / f"{lst.stem}.nm.json"
         # One line per innermost list, so the diff of a re-run stays readable.
         body = json.dumps(result, indent=1)

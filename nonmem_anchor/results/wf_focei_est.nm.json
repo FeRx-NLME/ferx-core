@@ -3,6 +3,7 @@
  "nmtran_warnings": [2],
  "markers": [],
  "steps": [],
+ "listing_truncated": true,
  "control_stream_as_run": [
   "$PROBLEM warfarin FOCEI estimate (#2974): the MLE the S/R/RSR eval-only runs sit at",
   "$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV",

@@ -4,38 +4,44 @@
 
 use patterns_lint::repo_root;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Printed by NONMEM in every listing; spelled in two parts so this file does not match.
 const LICENSE_LINE: &str = concat!("License ", "Registered to:");
 
-fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read dir") {
-        let entry = entry.expect("dir entry");
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = entry.path();
-        if entry.file_type().expect("file type").is_dir() {
-            if !name.starts_with('.') && name != "target" {
-                files(&path, out);
-            }
-        } else {
-            out.push(path);
-        }
-    }
+/// Files PsN's `scm` writes into its run directory.
+const PSN_LOGS: [&str; 3] =
+    ["scmlog.txt", "covariate_statistics.txt", "psn_version_and_options.txt"];
+
+/// Every tracked file still present in the working tree. Untracked and ignored files
+/// (a listing just produced by the regeneration recipe) are not committed, so not checked.
+fn tracked(root: &Path) -> Vec<PathBuf> {
+    let out = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(root)
+        .output()
+        .expect("run git ls-files");
+    assert!(out.status.success(), "git ls-files failed");
+    out.stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 fn is_listing(path: &Path, bytes: &[u8]) -> bool {
-    path.extension().is_some_and(|e| e == "lst")
-        || path.file_name().is_some_and(|n| n == "scmlog.txt")
-        || bytes.windows(LICENSE_LINE.len()).any(|w| w == LICENSE_LINE.as_bytes())
+    let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase());
+    let line = LICENSE_LINE.as_bytes();
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lst"))
+        || name.is_some_and(|n| PSN_LOGS.contains(&n.as_str()))
+        || bytes.windows(line.len()).any(|w| w.eq_ignore_ascii_case(line))
 }
 
 #[test]
 fn no_verbatim_tool_output_is_committed() {
     let root = repo_root();
-    let mut all = Vec::new();
-    for dir in ["crates", "data", "docs", "examples", "nonmem_anchor", "src", "tests", "tools"] {
-        files(&root.join(dir), &mut all);
-    }
+    let all = tracked(&root);
     let found: Vec<_> = all
         .iter()
         .filter(|p| is_listing(p, &std::fs::read(p).expect("read file")))
@@ -52,7 +58,12 @@ fn no_verbatim_tool_output_is_committed() {
 #[test]
 fn a_listing_is_recognised_by_name_and_by_content() {
     assert!(is_listing(Path::new("a/run.lst"), b""));
-    assert!(is_listing(Path::new("a/scmlog.txt"), b""));
+    assert!(is_listing(Path::new("a/RUN.LST"), b""));
+    for log in PSN_LOGS {
+        assert!(is_listing(&Path::new("a").join(log), b""));
+    }
     assert!(is_listing(Path::new("a/run.out"), format!("x\n{LICENSE_LINE} Y").as_bytes()));
+    let lower = concat!("x\n license ", "registered to: Y");
+    assert!(is_listing(Path::new("a/run.out"), lower.as_bytes()));
     assert!(!is_listing(Path::new("a/run.nm.json"), b"{}"));
 }

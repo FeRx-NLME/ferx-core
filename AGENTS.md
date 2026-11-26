@@ -154,11 +154,11 @@ A test that calls `fit()` and expects an immediate `Err` needs no gate.
 
 ### Third-party output, text and data
 
-Never commit verbatim output or documentation from another tool (#3182).
+Never commit another tool's text: its listings, logs or documentation (#3182). Numbers it produced are fine.
 
 - **Fixtures:** commit our own inputs (control stream, config, data) and the extracted numbers, with the tool version and the command to regenerate them. No NONMEM listings (`.lst`) or PsN logs: they carry license-holder details and the tool's own text. `tools/nonmem-extract.py run.lst` writes the numbers of a listing to `run.nm.json`. Numeric tables (`.ext`, `.phi`, `.tab`, `.cov`) are fine. `tools/preflight.sh patterns` fails on a committed listing.
 - **Comments and docs:** cite a paper or name the tool; do not quote or closely paraphrase its manual or source. Say "compatible with", not "verbatim", and only after checking against a named version.
-- **Source:** do not read PsN (GPL) source to write code here. Pharmpy (LGPL) source may inform model search only (the future `ferx-search`, #3181). Record the source used in the PR.
+- **Source:** do not read PsN (GPL) source to write code here. Pharmpy (LGPL) source may inform model search only (`crates/ferx-search`, to be relicensed LGPL under #3181). Record the source used in the PR.
 - **Data:** record the source and license beside every third-party dataset.
 
 ## Documentation

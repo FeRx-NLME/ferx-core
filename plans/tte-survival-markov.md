@@ -1186,7 +1186,7 @@ not block development.** Workflow:
    own SSE check (§8.8.8). This is sufficient to write the code, pass smoke tests, and open
    and merge exploratory PRs.
 3. NONMEM results are **requested during development** and run externally as the license
-   permits. When the `.lst` arrives, commit it and fold its numbers into `expected.md` as a
+   permits. When the `.lst` arrives, commit its `.nm.json` (`tools/nonmem-extract.py`), never the listing, and fold its numbers into `expected.md` as a
    verification step — applied as results arrive, before the endpoint is declared *fully
    validated*, not before coding starts.
 4. The Tier 3 slow test reads reference values from `expected.md` and compares against
@@ -2145,7 +2145,7 @@ definition of "done" for each feature.
 1b. NONMEM verification — requested DURING development, applied when available
    ├── NONMEM results are REQUESTED during development and run externally as the license
    │   permits; they are a verification gate, not a precondition for starting or merging
-   ├── When the .lst arrives: commit it, add OFV/theta/omega/SE to expected.md, and confirm
+   ├── When the .lst arrives: commit its .nm.json (never the listing), add OFV/theta/omega/SE to expected.md, and confirm
    │   ferx matches within the §11 tolerances
    └── An endpoint is "fully validated" once the NONMEM comparison is in; it is "developed
        and mergeable" before that, on the strength of the free references + SSE
