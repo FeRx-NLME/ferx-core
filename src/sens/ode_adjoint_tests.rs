@@ -6948,7 +6948,6 @@ fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
             &[0.1, -0.1],
         );
         let worst = fd_oracle(&model, &s, true);
-        eprintln!("{pk} lag {lag} rate {rate}: worst {worst:.2e}");
         assert!(worst < 1e-7, "{pk} lag {lag} rate {rate}: worst relative difference {worst:.2e}");
     }
 }
