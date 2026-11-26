@@ -372,7 +372,7 @@ scripts and habits transfer.
 
 | file | contents |
 |---|---|
-| `raw_results.csv`            | one row per fit, **first row the original dataset**; estimates, OFV and termination diagnostics (plus `se_` columns under `--keep-covariance`) |
+| `raw_results.csv`            | one row per fit, **first row the original dataset** when the base model was run; estimates, OFV and termination diagnostics (plus `se_` columns under `--keep-covariance`) |
 | `bootstrap_results.csv`      | one row per parameter: original, mean, bias, standard error, median, percentile CI, normal CI |
 | `bootstrap_diagnostics.csv`  | run counts, exclusion tallies, and the mean of each per-replicate diagnostic |
 | `included_individuals1.csv`  | per replicate, the subject IDs drawn (repeats included), in dataset order |

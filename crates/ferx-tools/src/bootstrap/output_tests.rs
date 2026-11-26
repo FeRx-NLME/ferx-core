@@ -138,7 +138,8 @@ fn raw_results_gains_se_columns_only_with_keep_covariance() {
 
 #[test]
 fn the_replicate_files_agree_row_for_row() {
-    // PsN's layout: row j describes the same replicate in all four files.
+    // The replicates appear in the same order in `included_individuals`,
+    // `included_keys` and `sample_keys` (after the latter's header).
     let dir = tempfile::tempdir().expect("temp dir");
     let r = result();
 
