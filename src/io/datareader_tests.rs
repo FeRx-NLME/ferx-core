@@ -710,6 +710,83 @@ fn test_filter_on_undeclared_covariate_via_declared_path() {
     assert!(excl.fired_ignore.iter().any(|s| s.contains("STUDY == 2")));
 }
 
+/// Reads `csv` under `[data_selection] ignore = FLAG == 1` with the given endpoint routing.
+fn read_ignoring_flag(csv: &str, routing: &ObsRouting) -> Population {
+    let f = write_csv(csv);
+    let filter = SelectionFilter::from_opts(&["FLAG == 1".to_string()], &[], &[]).unwrap();
+    read_nonmem_csv_routed(f.path(), None, None, &[], None, Some(&filter), routing, &[]).unwrap().0
+}
+
+#[test]
+fn a_filter_that_excludes_one_endpoint_record_keeps_the_subject() {
+    // #3148: a subject made only of endpoint records (binary and count here; TTE below) has no
+    // Gaussian observations and no doses, so "both empty" read as "the filter emptied it" and
+    // one excluded record dropped the subject with its survivors. Subject 1 loses one record
+    // of four, subject 2 loses all four (the control: it is still dropped), subjects 3 and 4
+    // are untouched.
+    for routing in [
+        ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() },
+        ObsRouting { count: [3].into_iter().collect(), ..Default::default() },
+    ] {
+        let mut csv = String::from("ID,TIME,DV,EVID,MDV,AMT,CMT,FLAG\n");
+        for (id, flags) in [(1, [0, 1, 0, 0]), (2, [1, 1, 1, 1]), (3, [0; 4]), (4, [0; 4])] {
+            for (t, flag) in flags.iter().enumerate() {
+                csv += &format!("{id},{t},{},0,0,.,3,{flag}\n", t % 2);
+            }
+        }
+        let pop = read_ignoring_flag(&csv, &routing);
+        let ids: Vec<&str> = pop.subjects.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["1", "3", "4"], "subject 1 keeps its three records");
+        let n: Vec<usize> = pop.subjects.iter().map(|s| s.obs_records.len()).collect();
+        assert_eq!(n, [3, 4, 4]);
+        let excl = pop.exclusions.as_ref().expect("exclusions present");
+        assert_eq!(excl.excluded_subject_ids, ["2"], "only the subject with no record left");
+        assert_eq!(excl.n_obs_excluded, 5);
+    }
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn a_filter_that_excludes_one_event_row_keeps_the_subject() {
+    // The TTE twin of the test above (#3148): the event row at t = 2 is excluded and the
+    // censoring row at t = 4 survives, so subject 1 stays with one record.
+    let routing = ObsRouting { tte: [2].into_iter().collect(), ..Default::default() };
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,FLAG\n\
+               1,2,1,0,0,.,2,1\n1,4,0,0,0,.,2,0\n\
+               2,3,1,0,0,.,2,0\n";
+    let pop = read_ignoring_flag(csv, &routing);
+    let n: Vec<usize> = pop.subjects.iter().map(|s| s.obs_records.len()).collect();
+    assert_eq!(n, [1, 1]);
+    assert!(pop.exclusions.as_ref().unwrap().excluded_subject_ids.is_empty());
+}
+
+#[test]
+fn a_subject_with_endpoint_rows_left_is_warned_about_what_the_filter_took() {
+    // #3148, the joint case. Subject 1: the dose and the binary rows survive, every PK
+    // concentration is flagged. It is kept and, since it still scores its binary rows, is not
+    // warned that it "contributes nothing to the likelihood". Subject 2: the dose is flagged
+    // and the concentrations and binary rows survive; it is kept and warned that its
+    // predictions are undefined.
+    let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,FLAG\n\
+               1,0,.,1,1,100,1,0\n\
+               1,1,5.0,0,0,.,1,1\n\
+               1,2,4.0,0,0,.,1,1\n\
+               1,1,1,0,0,.,3,0\n\
+               1,2,0,0,0,.,3,0\n\
+               2,0,.,1,1,100,1,1\n\
+               2,1,5.0,0,0,.,1,0\n\
+               2,1,1,0,0,.,3,0\n";
+    let pop = read_ignoring_flag(csv, &routing);
+    assert_eq!(pop.subjects.len(), 2);
+    let s = &pop.subjects[0];
+    assert_eq!((s.doses.len(), s.observations.len(), s.obs_records.len()), (1, 0, 2));
+    assert!(pop.exclusions.as_ref().unwrap().excluded_subject_ids.is_empty());
+    let warned = |frag: &str| pop.warnings.iter().filter(|w| w.contains(frag)).count();
+    assert_eq!(warned("contributes nothing"), 0, "{:?}", pop.warnings);
+    assert_eq!(warned("subject 2: all dose records were excluded"), 1, "{:?}", pop.warnings);
+}
+
 #[test]
 fn test_no_filter_keeps_subject_with_only_other_events() {
     // Regression: without a [data_selection] filter, a subject made up solely
