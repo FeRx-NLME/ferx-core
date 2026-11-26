@@ -304,7 +304,6 @@ nan-fold 1 tests/transit_analytic_equivalence.rs::transit_flipflop_lag_f_autorou
 nan-fold 1 tests/transit_analytic_equivalence.rs::transit_flipflop_noncanonical_lag_f_alias_matches_canonical
 nan-fold 1 tests/transit_analytic_equivalence.rs::two_cpt_transit_flip_flop_routes_to_ode_twin
 nan-fold 2 tests/transit_iov_nonmem_anchor.rs::transit_iov_objective_matches_nonmem
-nan-fold 1 tests/trough_tie.rs::adaptive_driver_reads_a_trough_before_its_co_timed_record
 nan-fold 1 tests/trough_tie.rs::assert_closed_form
 nan-fold 1 tests/trough_tie.rs::nonmem_reads_every_cell_as_the_closed_form
 nan-fold 1 tests/tte_convergence.rs::joint_pktte_event_times_match_model_survival
