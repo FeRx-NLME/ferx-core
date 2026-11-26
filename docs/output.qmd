@@ -350,6 +350,8 @@ warning_details:
 estimation:
   focei_wall_time_secs: 11.845678
   covariance_wall_time_secs: 0.500000
+  ofv_settlement_wall_time_secs: 0.000000
+  subject_results_wall_time_secs: 0.412345
   wall_time_secs: 12.345678
   n_threads_used: 8
 environment:
@@ -535,7 +537,11 @@ entry for each stage of `method = ...`/`method = [...]` (e.g. `focei_wall_time_s
 `imp_wall_time_secs` for a `[focei, imp]` chain) plus `covariance_wall_time_secs`
 for the post-estimation FD-Hessian / SIR-fallback step, which only ever runs
 once, on the last estimating stage (#615). The per-stage keys measure
-convergence only and exclude the covariance step. The `environment:` block is
+convergence only and exclude the covariance step. Two more phases after the
+estimates are timed on their own (#3157): `subject_results_wall_time_secs`
+(IPRED, PRED and the CWRES linearisation of every subject) and
+`ofv_settlement_wall_time_secs` (the [OFV tolerance check](model-file/ode-models.qmd#ofv-tolerance-check),
+`0.0` when it did not run). The `environment:` block is
 a snapshot of the machine and account the
 fit ran under — `os`/`arch` from the running binary's target, `in_docker`
 (whether `/.dockerenv`, `KUBERNETES_SERVICE_HOST`, or `/proc/1/cgroup`
@@ -636,7 +642,7 @@ kappa) and `sir_ess`, and they are saved in a `.fitrx` bundle.
 
 ## FitResult Fields (Rust API / console)
 
-The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `method_wall_times_secs`, `covariance_wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.
+The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `method_wall_times_secs`, `covariance_wall_time_secs`, `ofv_settlement_wall_time_secs`, `subject_results_wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.
 
 ### Shrinkage
 
@@ -826,6 +832,8 @@ Where it appears:
 | `wall_time_secs` | Wall-clock time for the complete fit (seconds) |
 | `method_wall_times_secs` | Wall-clock convergence time per stage, parallel to `method_chain` (seconds); excludes the covariance step |
 | `covariance_wall_time_secs` | Wall-clock time spent on the post-estimation covariance step; `0.0` when not run |
+| `ofv_settlement_wall_time_secs` | Wall-clock time spent on the post-fit OFV tolerance check (`W_ODE_OFV_NOT_SETTLED`); `0.0` when it did not run (no ODE integration, `ode_ofv_check = false`, or out of scope) and for a fit restored from a `.fitrx` bundle, which does not store it |
+| `subject_results_wall_time_secs` | Wall-clock time spent building the per-subject results (IPRED, PRED, CWRES linearisation) after the estimates; `0.0` for a fit restored from a `.fitrx` bundle, which does not store it |
 | `gradient_method_inner` | Gradient method used in the inner (EBE) loop, e.g. `analytic` or `finite differences`; `finite differences (compiled plan failed)` or `analytic ×a, FD ×k` when `W_PLAN_FD_FALLBACK` fired |
 | `gradient_method_outer` | Gradient method used in the outer loop, e.g. `finite differences` |
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |

@@ -2956,6 +2956,7 @@ fn fit_inner(
     // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
     // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
     let ode_model = integrates_odes(model);
+    let t_subject_results = std::time::Instant::now();
     let (mut subjects, ode_solver_stats) = compute_subject_results(
         model,
         population,
@@ -2967,6 +2968,7 @@ fn fit_inner(
         mixest_classes.as_deref(),
         ode_model,
     );
+    let subject_results_wall_time_secs = t_subject_results.elapsed().as_secs_f64();
     // No second, sensitivity sweep here (#3076). One used to run the analytic η-Hessian per
     // subject at the estimates, for the one counter an `f64` pass cannot set,
     // `auto_stiff_rejected_jets` — but the derivative solves are compiled plans whose ODE loops
@@ -3564,6 +3566,7 @@ fn fit_inner(
     // objective is the K-class marginal, which this single-population re-score would not
     // reproduce, and the Monte-Carlo estimators publish an objective it does not compute, so
     // both are out of scope.
+    let mut ofv_settlement_wall_time_secs = 0.0;
     {
         use crate::estimation::ode_tolerance_check as otc;
         use crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans;
@@ -3575,19 +3578,34 @@ fn fit_inner(
             // carries (`Plan::ode_override`): it starts from no plans of the phases before it
             // (SIR's draws, the output columns) and leaves none behind (#3077).
             let applies = otc::tightened_override(model, &stage).is_some();
-            if applies {
+            let t_check = std::time::Instant::now();
+            if applies && !stage.ode_ofv_check {
+                let (msg, entry) = super::postfit::ode_ofv_check_off_warning();
+                warnings.push(msg);
+                native_warnings.push(entry);
+            }
+            let check_on = applies && stage.ode_ofv_check;
+            if check_on {
                 release_fit_plans();
             }
-            let shift = otc::ofv_tolerance_shift(
-                model,
-                population,
-                &result.params,
-                &result.eta_hats,
-                &result.kappas,
-                &stage,
-            );
-            if applies {
+            let shift = if check_on {
+                otc::ofv_tolerance_shift(
+                    model,
+                    population,
+                    &result.params,
+                    &result.eta_hats,
+                    &result.kappas,
+                    &stage,
+                )
+            } else {
+                None
+            };
+            if check_on {
                 release_fit_plans();
+                // A check cancelled mid-pass did not run: its time stays `0.0`.
+                if shift.is_some() {
+                    ofv_settlement_wall_time_secs = t_check.elapsed().as_secs_f64();
+                }
             }
             match shift {
                 Some(Ok(shift)) => {
@@ -3750,6 +3768,8 @@ fn fit_inner(
         method_chain: chain.clone(),
         method_wall_times_secs,
         covariance_wall_time_secs,
+        ofv_settlement_wall_time_secs,
+        subject_results_wall_time_secs,
         converged,
         ofv,
         ofv_data,

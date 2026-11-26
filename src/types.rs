@@ -8899,6 +8899,18 @@ pub struct FitResult {
     /// Hessian / SIR-fallback proposal construction), in seconds. `0.0` when
     /// the covariance step was not run (#713).
     pub covariance_wall_time_secs: f64,
+    /// Wall-clock time spent on the post-fit OFV tolerance check (`W_ODE_OFV_NOT_SETTLED`,
+    /// #2994), in seconds: two inner-loop passes over every subject, one a decade tighter.
+    /// `0.0` when it did not run (no ODE integration, `ode_ofv_check = false`, or out of scope)
+    /// and for a fit restored from a `.fitrx` bundle (#3157).
+    #[serde(default)]
+    pub ofv_settlement_wall_time_secs: f64,
+    /// Wall-clock time spent building the per-subject results (IPRED, PRED, the CWRES
+    /// linearisation) after the estimates, in seconds. About one evaluation's worth on an ODE
+    /// model, which is the bulk of a `maxiter = 0` run's time after the evaluation. `0.0` for a
+    /// fit restored from a `.fitrx` bundle (#3157).
+    #[serde(default)]
+    pub subject_results_wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
     pub model_name: String,
     /// ferx-core library version (from Cargo.toml at compile time).
@@ -9728,6 +9740,13 @@ pub struct FitOptions {
     /// Setting it to `false` restores one method per segment, chosen at its start. Copied onto
     /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
     pub ode_auto_switch: bool,
+    /// Whether an ODE fit re-scores its OFV one decade tighter after the estimates and warns
+    /// with `W_ODE_OFV_NOT_SETTLED` when it moves (`[fit_options] ode_ofv_check`, #2994).
+    /// Default `true`. The check re-finds every subject's EBEs twice, so on a run that only
+    /// scores a model at given estimates (`maxiter = 0`) it can cost as much as the
+    /// evaluation. With `false` the fit says so (`W_ODE_OFV_SETTLEMENT_UNCHECKED`) instead of
+    /// leaving a silent gap. Read from the stage that owns the published OFV (#3157).
+    pub ode_ofv_check: bool,
     pub run_covariance_step: bool,
     /// When `true` (the default) and the model is in analytic-covariance scope, the
     /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
@@ -10523,6 +10542,7 @@ impl Default for FitOptions {
             ode_method: crate::ode::OdeMethod::Auto,
             ode_stiff_abort_after: None,
             ode_auto_switch: true,
+            ode_ofv_check: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             fd_hessian_step_set: false,
@@ -11635,6 +11655,7 @@ pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
         "ode_method",
         "ode_stiff_abort_after",
         "ode_auto_switch",
+        "ode_ofv_check",
     ]
 }
 
@@ -11704,6 +11725,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_method",
         "ode_stiff_abort_after",
         "ode_auto_switch",
+        "ode_ofv_check",
         // Checkpoint / restart (#755): method-independent.
         "checkpoint",
         "checkpoint_interval_secs",

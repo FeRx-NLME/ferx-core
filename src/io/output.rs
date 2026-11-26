@@ -3466,6 +3466,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
     writeln!(f, "  covariance_wall_time_secs: {:.6}", result.covariance_wall_time_secs)
         .map_err(|e| e.to_string())?;
+    writeln!(f, "  ofv_settlement_wall_time_secs: {:.6}", result.ofv_settlement_wall_time_secs)
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "  subject_results_wall_time_secs: {:.6}", result.subject_results_wall_time_secs)
+        .map_err(|e| e.to_string())?;
     writeln!(f, "  wall_time_secs: {:.6}", result.wall_time_secs).map_err(|e| e.to_string())?;
     writeln!(f, "  n_threads_used: {}", result.n_threads_used).map_err(|e| e.to_string())?;
 
@@ -3698,6 +3702,8 @@ mod tests {
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],
             covariance_wall_time_secs: 0.0,
+            ofv_settlement_wall_time_secs: 0.0,
+            subject_results_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: Some(0.0),
@@ -5078,6 +5084,8 @@ mod tests {
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],
             covariance_wall_time_secs: 0.0,
+            ofv_settlement_wall_time_secs: 0.0,
+            subject_results_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: Some(0.0),

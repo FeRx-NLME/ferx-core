@@ -12048,6 +12048,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
         }
         "ode_auto_switch" => opts.ode_auto_switch = parse_bool("ode_auto_switch")?,
+        "ode_ofv_check" => opts.ode_ofv_check = parse_bool("ode_ofv_check")?,
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
