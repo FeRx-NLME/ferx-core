@@ -14898,6 +14898,65 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
     }
 }
 
+/// #2904: a start-dependence warning names the EBEs of the point it was raised at, so under
+/// `verified_start_result` it follows the reported point; every other warning (the verdict,
+/// the budget, the covariance step's) stays the probe's. Measured on the ODE twin of
+/// `tests/fixtures/flip_flop_pop`, whose restart leg's probe loses to its restart: the restart's
+/// own warning names 8 subjects at the point reported, the probe's names 7.
+#[test]
+fn a_verified_start_keeps_the_reported_points_own_ebe_start_dependence_warning() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = options_2506(crate::types::Optimizer::NloptLbfgs);
+    let run = |warnings: Vec<String>| OuterResult {
+        warnings,
+        ..evaluate_at_initial_params(&model, &pop, &model.default_params, &opts)
+    };
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // The real texts: #833's cold re-solve worse, #2013's screen moved, #1565's basin shift.
+    let worse = |who: &[&str]| ebe_start_dependence_warning(-90.0, -100.0, &ids(who)).unwrap();
+    let moved = |who: &[&str]| ebe_screen_moved_warning(&ids(who)).unwrap();
+    let shift = ebe_basin_shift_warning(-110.0, -100.0, 10.0, Some(1), BasinShiftReport::Cold);
+    let verdict = "Outer optimization did not converge".to_string();
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    for start_wins in [true, false] {
+        let (unmoved_point, probe_point) = (worse(&["A", "B"]), worse(&["A"]));
+        let result = verified_start_result(
+            run(vec![probe_point.clone(), verdict.clone()]),
+            !start_wins,
+            run(vec![unmoved_point.clone()]),
+            start_wins,
+        );
+        let want = if start_wins { &unmoved_point } else { &probe_point };
+        assert_eq!(
+            sorted(result.warnings),
+            sorted(vec![want.clone(), verdict.clone()]),
+            "start wins = {start_wins}: the reported point's own warning, the probe's verdict"
+        );
+    }
+    // The unmoved point wins and raised none (its cold re-solve reproduces): the probe's, about
+    // its own point, is dropped; the screen-moved form follows the point like the other.
+    let result = verified_start_result(
+        run(vec![worse(&["A"]), moved(&["A"]), verdict.clone()]),
+        false,
+        run(vec![moved(&["A", "B"])]),
+        true,
+    );
+    assert_eq!(sorted(result.warnings), sorted(vec![moved(&["A", "B"]), verdict.clone()]));
+    let result = verified_start_result(run(vec![worse(&["A"])]), false, run(vec![]), true);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    // The basin-shift warning states the verdict ("not reported as converged"), so it stays the
+    // probe's whichever point wins; the unmoved run's is not carried in.
+    for start_wins in [true, false] {
+        let result = verified_start_result(run(vec![]), true, run(vec![shift.clone()]), start_wins);
+        assert!(result.warnings.is_empty(), "start wins = {start_wins}: {:?}", result.warnings);
+        let result = verified_start_result(run(vec![shift.clone()]), true, run(vec![]), start_wins);
+        assert_eq!(result.warnings, vec![shift.clone()], "start wins = {start_wins}");
+    }
+}
+
 /// #2707, the gate inside the attempt, per PR and with no convergence loop: one leg stopped
 /// at its start, handed the same probe under each gate. Under `Unmoved` (the first attempt)
 /// the probe runs; under `DisplacementAloneRejects` (a restart leg) it does not, because a
