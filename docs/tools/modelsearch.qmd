@@ -134,7 +134,7 @@ ranked at the end; the table's `continued` column says which one went on.
 
 ### Which move may follow which
 
-Pharmpy's `_is_allowed`, kept verbatim so the enumeration anchors:
+The rules match Pharmpy 2.0.0's `_is_allowed`, so the enumeration agrees with the anchor:
 
 - a category is moved along once per path — `LAGTIME(ON)` after
   `LAGTIME(ON)`, or `ABSORPTION(INST)` after `ABSORPTION(FO)`, is never a

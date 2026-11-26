@@ -61,8 +61,9 @@ pub fn percentile(sorted: &[f64], pct: f64) -> Option<f64> {
     let p = pct / 100.0;
     let n = sorted.len() as f64 + 1.0;
     let np = n * p;
-    // Both tails: the upper one runs out of data at `n·(1-p) < 1` (`n = m + 1`) by the same
-    // argument, which is why PsN quotes a single sample count per interval.
+    // `n` is `m + 1` and `np` is `h` in the doc above. Both tails: the upper one
+    // runs out of data at `n·(1-p) < 1` by the same argument, which is why PsN
+    // quotes a single sample count per interval.
     if np < 1.0 || np > sorted.len() as f64 {
         return None;
     }

@@ -190,11 +190,11 @@ impl Replicate {
 
 /// Seed for replicate `index`, derived from the run seed.
 ///
-/// Deliberately a pure function of `(seed, index)` and nothing else. In PsN
-/// the draws share one RNG with the base-model run, so the same seed gives other
-/// datasets depending on whether that run already had output. Deriving
-/// per replicate means the drawn datasets depend only on `--seed` and the design: not on `--threads`, not on
-/// completion order, not on whether the base fit ran.
+/// Deliberately a pure function of `(seed, index)` and nothing else. In PsN the
+/// draws share one RNG with the base-model run, so the same seed gives other
+/// datasets depending on whether that run already had output. Deriving per
+/// replicate means the drawn datasets depend only on `--seed` and the design:
+/// not on `--threads`, not on completion order, not on whether the base fit ran.
 pub fn replicate_seed(seed: u64, index: usize) -> u64 {
     // Odd multiplier (the golden-ratio constant used by SplitMix64) so distinct
     // indices stay distinct after wrapping.

@@ -276,8 +276,7 @@ fn a_small_bootstrap_runs_end_to_end_and_writes_every_artefact() {
 #[test]
 fn the_drawn_datasets_do_not_depend_on_the_thread_count() {
     // The reproducibility claim, on the real model: the same seed must give the
-    // same replicates whether the run is serial or parallel. PsN's guide
-    // documents the opposite behaviour as a known wart.
+    // same replicates whether the run is serial or parallel.
     let mut p = prepared();
     p.parsed.fit_options.outer_maxiter = 1;
 

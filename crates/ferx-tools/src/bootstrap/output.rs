@@ -93,8 +93,8 @@ fn finish(mut w: csv::Writer<std::fs::File>, path: &Path) -> Result<(), String> 
     w.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
-/// One row per fit, **first row the original dataset** (`sample = 0`), as in
-/// PsN.
+/// One row per fit, **first row the original dataset** (`sample = 0`) when the
+/// base model was run.
 ///
 /// Carries the termination diagnostics alongside the estimates, not just the
 /// estimates: that is what makes `--summarize` possible — the exclusion filters

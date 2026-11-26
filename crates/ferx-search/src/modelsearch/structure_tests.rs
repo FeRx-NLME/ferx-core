@@ -276,7 +276,7 @@ fn peripherals_start_at_the_smallest_count_then_any_other() {
     assert!(!allowed(&p2, &[], &funcs, &fo(0)), "the first peripheral move must be the smallest");
     assert!(allowed(&p2, &[p1], &funcs, &fo(0)));
     assert!(!allowed(&p1, &[p1], &funcs, &fo(0)));
-    // Pharmpy's rule verbatim: after a non-minimal count, any count other
+    // As in Pharmpy 2.0.0: after a non-minimal count, any count other
     // than the smallest is still allowed — `0 → 2 → 1` is a path.
     let funcs = keys("PERIPHERALS(0..2)");
     let p0 = FeatureKey::Peripherals(0);

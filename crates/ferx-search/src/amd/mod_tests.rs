@@ -256,7 +256,7 @@ fn run<R: StepRunner>(scripted: &R, options: &AmdOptions, config: &SearchConfig)
 // The plan
 // ---------------------------------------------------------------------------
 
-/// Every strategy's ordering, verbatim from Pharmpy's `get_subtool_order`
+/// Every strategy's ordering, matching Pharmpy 2.2.0's `get_subtool_order`
 /// (`pharmpy/tools/amd/run.py`). The pipeline's whole contract is that it runs
 /// these components in this order, so the orders are pinned as data rather
 /// than exercised through a run.
