@@ -86,7 +86,7 @@ def estimates(lines):
 
     def close():
         if name == "theta":
-            values = [v for l in block for v in numbers(l) or []]
+            values = [v for line in block for v in numbers(line) or []]
             out["theta"] = values
         elif name:
             out[name] = rows(block)
@@ -161,8 +161,8 @@ def step(text, keep_covariance):
         if kind in ("final", "standard_error"):
             out[kind] = estimates(body)
         elif kind == "eigenvalues":
-            data = [numbers(l) for l in body if numbers(l)]
-            out[kind] = [v for l in data for v in l if not isinstance(v, int)]
+            data = [numbers(line) for line in body if numbers(line)]
+            out[kind] = [v for row in data for v in row if not isinstance(v, int)]
         elif keep_covariance:
             out[kind] = rows(body)
     out["markers"] = [m for m in MARKERS if m in text]
@@ -204,7 +204,7 @@ def extract(text, keep_covariance):
         # The listing stops before estimation output (e.g. only the NM-TRAN part was kept);
         # the numbers are then in the .ext alone.
         out["listing_truncated"] = True
-    out["control_stream_as_run"] = [l.rstrip() for l in control.splitlines()]
+    out["control_stream_as_run"] = [line.rstrip() for line in control.splitlines()]
     if re.search(r"license|registered to", control, re.I):
         raise ValueError("the control stream echo contains license text")
     return out
