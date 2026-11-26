@@ -9,8 +9,9 @@
 //! writing it.
 //!
 //! Row order is consistent across `raw_results`, `included_individuals`,
-//! `included_keys` and `sample_keys`, exactly as PsN documents: row *j* concerns
-//! the same replicate in every file.
+//! `included_keys` and `sample_keys`: the replicates appear in the same order in
+//! each, after `raw_results`'s header and optional original-data row and `sample_keys`'s
+//! header.
 
 use std::path::Path;
 
@@ -92,8 +93,8 @@ fn finish(mut w: csv::Writer<std::fs::File>, path: &Path) -> Result<(), String> 
     w.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
-/// One row per fit, **first row the original dataset** (`sample = 0`), as in
-/// PsN.
+/// One row per fit, **first row the original dataset** (`sample = 0`) when the
+/// base model was run.
 ///
 /// Carries the termination diagnostics alongside the estimates, not just the
 /// estimates: that is what makes `--summarize` possible — the exclusion filters

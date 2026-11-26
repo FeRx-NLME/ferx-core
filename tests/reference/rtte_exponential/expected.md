@@ -62,7 +62,7 @@ SAEM agrees within its stochastic tolerance.
 - **NONMEM control stream.** Pure-TTE model (no `F_FLAG`, which is only for mixed
   continuous+likelihood data); `$EST … LIKELIHOOD`. Constant hazard needs no `$DES` — a
   `TLAST` reset in `$PRED` makes each row contribute the survival over its inter-event gap,
-  which telescopes to the AG likelihood. Full output in `nonmem.lst` / `nonmem.ext`.
+  which telescopes to the AG likelihood. Full output in `nonmem.nm.json` / `nonmem.ext`.
 
 ## Reproduce
 

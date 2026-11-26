@@ -4488,6 +4488,129 @@ fn custom_residual_magnitude_objective_and_gradients() {
     }
 }
 
+// ---- magnitudes that read the prediction (#3121) ----------------------------------------
+
+/// Both slots read `IPRED` non-affinely: the proportional loading times `sqrt(1 + B·f)`
+/// (so `h·g` needs the product rule with `g' ≠ 0`) and the additive one `A·exp(−B·f)`
+/// (`h'' ≠ 0`), with θ in each so the direct-θ channel and `∂R/∂f` are both live.
+const ORAL_IPRED_MAG: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TH_A(1.3, 0.1, 10.0)
+  theta TH_B(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.1 (sd)
+  sigma ADD_ERR ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ combined(PROP_ERR * sqrt(1 + TH_B * IPRED), ADD_ERR * TH_A * exp(-TH_B * IPRED))
+"#;
+
+/// #3121: every θ and σ against the reconverged FD oracle under FOCEI, FOCE (whose `R⁰`
+/// reads the magnitude at the population prediction), Laplace and AGQ, plus the
+/// kernel-vs-production objective. Kills the dual kernel dropping or mis-differentiating
+/// `h(f)`: production's objective reads it through `scaled_loadings`, so the gap opens.
+#[test]
+fn ipred_magnitude_objective_and_gradients() {
+    let model = parse_model_string(ORAL_IPRED_MAG).unwrap();
+    assert!(model.ruv_reads_prediction() && model.has_f_dependent_variance());
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    eprintln!("objective gaps {g:?}");
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    for (label, worst) in [
+        ("FOCEI", fd_oracle(&model, &s, true)),
+        ("FOCE", fd_oracle(&model, &s, false)),
+        ("Laplace", fd_oracle_laplace(&model, &s)),
+        ("AGQ(3)", fd_oracle_agq(&model, &s, 3, true)),
+    ] {
+        eprintln!("{label}: worst {worst:.2e}");
+        // Measured worst 1.94e-9 (FOCE, macOS arm64); ~10×.
+        assert!(worst < 2e-8, "{label}: {worst:.2e}");
+    }
+    let (fd, _) = hessian_gaps(&model, &s, true);
+    eprintln!("R-matrix gap {fd:.2e}");
+    // Measured 8.7e-12 (macOS arm64); ~11×.
+    assert!(fd < 1e-10, "{fd:.2e}");
+}
+
+/// An additive base is the one case where `CompiledModel::has_f_dependent_variance` differs
+/// from the error form's own gate (#3125 review 2): plain `additive` is f-free, so FOCE's
+/// `R⁰` follows the population prediction only through the model-level gate. The straddle
+/// is asserted, and FOCE's gradient and R-matrix are pinned against the reconverged FD
+/// oracle. Mutation — `planned_pop`'s gate reverted to `error_spec.has_f_dependent_variance()`:
+/// FOCE gradient 1.9e-1, R-matrix gap 2.41 (measured by the review, macOS arm64).
+#[test]
+fn ipred_additive_magnitude_foce_gradients() {
+    let src = ORAL_IPRED_MAG.replace("  sigma PROP_ERR ~ 0.1 (sd)\n", "").replace(
+        "combined(PROP_ERR * sqrt(1 + TH_B * IPRED), ADD_ERR * TH_A * exp(-TH_B * IPRED))",
+        "additive(ADD_ERR * TH_A * exp(-TH_B * IPRED))",
+    );
+    let model = parse_model_string(&src).unwrap();
+    assert!(model.has_f_dependent_variance() && !model.error_spec.has_f_dependent_variance());
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let s = subject(&model, doses, &TIMES, &[0.1, -0.05, 0.2]);
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    for (label, interaction) in [("FOCE", false), ("FOCEI", true)] {
+        let worst = fd_oracle(&model, &s, interaction);
+        let (fd, _) = hessian_gaps(&model, &s, interaction);
+        eprintln!("{label}: gradient {worst:.2e}, R-matrix {fd:.2e}");
+        // Measured worst: gradient 4.37e-9 (FOCEI), R-matrix 2.56e-9 (FOCE), macOS arm64;
+        // ~5× / ~12×, far under the mutation's 1.9e-1 / 2.41.
+        assert!(worst < 2e-8, "{label} gradient: {worst:.2e}");
+        assert!(fd < 3e-8, "{label} R-matrix: {fd:.2e}");
+    }
+}
+
+/// M3-censored rows score `Φ` at `√V` with `V = (h(f)·g(f)·σ)²`: the kernel's censored
+/// term reads the same row program, against the reconverged FD oracle.
+#[test]
+fn ipred_magnitude_m3_censored_gradients() {
+    let mut model = parse_model_string(ORAL_IPRED_MAG).unwrap();
+    model.bloq_method = crate::types::BloqMethod::M3;
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let s = censor(subject(&model, doses, &TIMES, &[0.1, -0.05, 0.2]), &[0, 7, 8]);
+    let g = objective_gaps(&model, &s, &model.default_params, &[0.08, -0.06, 0.1]);
+    assert!(g.0 < 1e-12 && g.1 < 1e-12, "objective {g:?}");
+    let worst = fd_oracle(&model, &s, true);
+    eprintln!("M3 FOCEI: worst {worst:.2e}");
+    assert!(worst < 2e-8, "{worst:.2e}");
+}
+
+/// The same on an `if/else` block, where the program rides the endpoint's table.
+#[test]
+fn ipred_endpoint_magnitude_objective_and_gradients() {
+    let (_, s) = selected_magnitude_fixture();
+    let src = SELECTED_MAGNITUDE.replace(
+        "proportional(PROP_ERR * TH_M)",
+        "proportional(PROP_ERR * TH_M * sqrt(1 + IPRED))",
+    );
+    let model = tight(parse_model_string(&src).unwrap());
+    assert!(model.ruv_reads_prediction());
+    assert_endpoint_magnitude_parity(&model, &s);
+}
+
 // ---- magnitude expressions per endpoint (#2731) -----------------------------------------
 
 /// Two endpoints on one sigma each, a θ factor gated on `TAD` on the first and a θ factor
@@ -4610,8 +4733,7 @@ fn block_sigma_cmt_magnitude_objective_and_gradients() {
 /// `if/else` branches on the closed-form engine, sharing a sigma with a factor on one
 /// branch and a `combined` on the other, with `EARLY` changing inside the subject. The
 /// `Selected` key is a branch index, not a `CMT`.
-fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
-    let src = r#"
+const SELECTED_MAGNITUDE: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
   theta TVV(10.0, 0.1, 500.0)
@@ -4636,7 +4758,9 @@ fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
     DV ~ combined(PROP_ERR, ADD_ERR)
   }
 "#;
-    let model = tight(parse_model_string(src).unwrap());
+
+fn selected_magnitude_fixture() -> (CompiledModel, Subject) {
+    let model = tight(parse_model_string(SELECTED_MAGNITUDE).unwrap());
     let doses = vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
         DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
@@ -8953,6 +9077,237 @@ fn sde_covariance_hessian_matches_fd_of_the_gradient() {
     }
 }
 
+// ---- #3126: the EKF's Kalman `R` is the row's scored variance, on the recording too -------
+
+/// The SDE fixture with one per-row residual term the pre-#3126 filter dropped from its
+/// Kalman `R`: `"magnitude"` (`proportional(PROP_ERR * TVKA)`, a θ-dependent row), `"power"`
+/// (`power(PROP_ERR, POW)`, the exponent riding the row) or `"iiv"` (`iiv_on_ruv`, `exp(2η_r)`).
+/// Each is on the dual (`recorder_in_scope`); the fixture's subject is `sde_fixture`'s.
+fn sde_row_fixture(variant: &str) -> (CompiledModel, Subject) {
+    let (params, error, eta_ref): (&str, &str, &[f64]) = match variant {
+        "magnitude" => {
+            ("  sigma PROP_ERR ~ 0.1 (sd)\n", "proportional(PROP_ERR * TVKA)", &[0.1, -0.05, 0.2])
+        }
+        "power" => (
+            "  theta POW(0.7, 0.1, 2.0)\n  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "power(PROP_ERR, POW)",
+            &[0.1, -0.05, 0.2],
+        ),
+        "iiv" => (
+            "  omega ETA_RUV ~ 0.1\n  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+            &[0.1, -0.05, 0.2, 0.3],
+        ),
+        // A magnitude that reads the prediction (#3121): `R = f³σ²`, its program riding the
+        // row's tail into both `variance_at_scaled` and `row_loadings_g`.
+        "ipred" => (
+            "  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "proportional(PROP_ERR * sqrt(IPRED))",
+            &[0.1, -0.05, 0.2],
+        ),
+        _ => unreachable!("{variant}"),
+    };
+    let src = SDE_ONE_CPT
+        .replace("  sigma PROP_ERR ~ 0.1 (sd)\n", params)
+        .replace("proportional(PROP_ERR)", error);
+    let model = with_tol(parse_model_string(&src).unwrap(), 1e-11, 1e-13);
+    assert!(model.is_sde() && recorder_in_scope(&model), "{variant}");
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        eta_ref,
+    );
+    (model, s)
+}
+
+/// `p_obs` as the filter computed it before #3126: the public entry fed the bare
+/// `residual_variance(error_model, f, σ)` — no row, no ρ, no `exp(2η_r)`.
+fn pre_3126_p_obs(
+    model: &CompiledModel, s: &Subject, theta: &[f64], eta: &[f64], sigma: &[f64],
+) -> Vec<f64> {
+    let ode = model.ode_spec.as_ref().unwrap();
+    let mut diffusion = vec![0.0; ode.n_states];
+    let start = model.diffusion_theta_start.unwrap();
+    for (k, &i) in model.diffusion_state_indices.iter().enumerate() {
+        diffusion[i] = theta[start + k].max(0.0);
+    }
+    let pk = (model.pk_param_fn)(theta, eta, &s.covariates, 0.0);
+    let em = model.error_model;
+    crate::ode::ode_predictions_ekf_with_diffusion(ode, &pk.values, s, &diffusion, |f| {
+        crate::stats::residual_error::residual_variance(em, f, sigma)
+    })
+    .1
+}
+
+fn pointwise_rel_gap(a: &[f64], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            assert!(x.is_finite() && y.is_finite(), "{x} vs {y}");
+            (x - y).abs() / y.abs()
+        })
+        .fold(0.0, f64::max) // nan-ok: finite asserted in the map
+}
+
+/// T6: for each per-row term, (1) the recording's `p_obs` values equal production's
+/// `ekf_p_obs`, both differing from the pre-#3126 formula — each half checked on its own, so a
+/// fix applied to one side only fails naming that side — and (2) the packed FOCEI and FOCE
+/// gradients match the reconverged FD oracle. Parity alone cannot see the defect (both sides
+/// dropped the row identically before #3126, and parity was 3.4e-7 green); the side checks are
+/// what make a one-sided change red.
+#[test]
+fn sde_row_variance_is_on_both_sides_of_the_twin() {
+    for variant in ["magnitude", "power", "iiv", "ipred"] {
+        let (model, s) = sde_row_fixture(variant);
+        let params = moved_params(&model);
+        let eta: Vec<f64> = match variant {
+            "iiv" => vec![0.08, -0.06, 0.1, 0.3],
+            _ => vec![0.08, -0.06, 0.1],
+        };
+        let sig = &params.sigma.values;
+        let rows = exact_obs_grads_in(&model, &s, None, &params.theta, Some(sig), &eta)
+            .expect("an SDE row subject is recorded");
+        let recorded: Vec<f64> = rows[s.observations.len()..].iter().map(|o| o.f).collect();
+        let mult = model.ruv_obs_mult(&s, &params.theta);
+        let value = crate::stats::likelihood::ekf_p_obs(
+            &model,
+            &s,
+            &params.theta,
+            &eta,
+            sig,
+            &params.residual_correlations,
+            mult.as_deref(),
+        );
+        let old = pre_3126_p_obs(&model, &s, &params.theta, &eta, sig);
+        let (value_moved, rec_moved, twin) = (
+            pointwise_rel_gap(&value[1..], &old[1..]),
+            pointwise_rel_gap(&recorded[1..], &old[1..]),
+            pointwise_rel_gap(&recorded, &value),
+        );
+        eprintln!("T6 {variant}: value vs pre-3126 {value_moved:.3e}, recorder vs pre-3126 {rec_moved:.3e}, twin {twin:.3e}");
+        assert!(
+            value_moved > 1e-3,
+            "{variant}: VALUE side — `ekf_p_obs`'s R ignores the row ({value_moved:.2e})"
+        );
+        assert!(
+            rec_moved > 1e-3,
+            "{variant}: RECORDER side — `record_sde_p`'s R ignores the row ({rec_moved:.2e})"
+        );
+        // Measured 0 (magnitude, iiv, ipred) and 1.3e-16 (power), macOS arm64: one trajectory, one
+        // row formula (`focei_kernel::row_loadings_g` vs `ErrorSpec::scaled_loadings`).
+        assert!(twin < 1e-12, "{variant}: recorder and value p_obs disagree ({twin:.2e})");
+        for interaction in [true, false] {
+            let worst = fd_oracle(&model, &s, interaction);
+            eprintln!("T6 {variant} interaction={interaction}: parity {worst:.3e}");
+            // Measured (macOS arm64) FOCEI/FOCE: 2.4e-7/3.3e-8 magnitude, 3.4e-8/4.3e-8 power,
+            // 1.9e-8/2.4e-8 iiv, 3.7e-8/7.1e-9 ipred; bound SDE_PARITY_BOUND (1e-5), as the
+            // other SDE parity tests. Mutation — `row_loadings_g` drops `h(f)` (#3121): ipred
+            // reddens on the RECORDER side (moved 0 vs the value side's 7.6e-2).
+            assert!(worst < SDE_PARITY_BOUND, "{variant} interaction={interaction}: {worst:.2e}");
+        }
+    }
+}
+
+/// T7: under `iiv_on_ruv`, `p_obs` depends on `η_r` through the Kalman `R` (#3126), so the
+/// exact inner gradient and Hessian must carry that path: against central differences of the
+/// production inner objective (`individual_nll`, which reruns `ekf_p_obs` at each η). Dies
+/// when `exp(2·et[r])` is dropped from the recording's `r_of`.
+#[test]
+fn sde_iiv_on_ruv_inner_gradient_and_hessian_carry_the_filter_r() {
+    let (model, s) = sde_row_fixture("iiv");
+    let p = &model.default_params;
+    let eta = [0.08, -0.06, 0.1, 0.3];
+    let l = |e: &[f64]| {
+        crate::stats::likelihood::individual_nll(&model, &s, &p.theta, e, &p.omega, &p.sigma.values)
+    };
+    let g = exact_inner_gradient(&model, &s, p, &eta, None).expect("served");
+    let h = exact_inner_hessian(&model, &s, p, &eta).expect("served");
+    let (mut wg, mut wh) = (0.0f64, 0.0f64);
+    for a in 0..4 {
+        let fd = richardson(&l, &eta, a, 1e-4);
+        assert!(fd.is_finite() && g[a].is_finite());
+        wg = wg.max((g[a] - fd).abs() / (1.0 + fd.abs()));
+        for b in 0..4 {
+            let d2 = |st: f64| {
+                let at = |sa: f64, sb: f64| {
+                    let mut e = eta;
+                    e[a] += sa;
+                    e[b] += sb;
+                    l(&e)
+                };
+                (at(st, st) - at(st, -st) - at(-st, st) + at(-st, -st)) / (4.0 * st * st)
+            };
+            let fd = (4.0 * d2(1e-3) - d2(2e-3)) / 3.0;
+            assert!(fd.is_finite() && h[(a, b)].is_finite());
+            wh = wh.max((h[(a, b)] - fd).abs() / (1.0 + fd.abs()));
+        }
+    }
+    eprintln!("T7 iiv inner gradient worst {wg:.3e}, hessian worst {wh:.3e}");
+    // Measured 3.7e-11 / 4.1e-9 (macOS arm64); bounds at ~250x headroom.
+    assert!(wg < 1e-8 && wh < 1e-6, "gradient {wg:.2e}, hessian {wh:.2e}");
+}
+
+/// T8: the covariance R-matrix of the magnitude-row SDE subject against central differences
+/// of the exact gradient, EBE re-found (`hessian_gaps_for`). Dies when the row is dropped from
+/// the recording's `r_of` (the covariance plan replays the same recording).
+#[test]
+fn sde_magnitude_row_covariance_hessian_matches_fd_of_the_gradient() {
+    let (model, s) = sde_row_fixture("magnitude");
+    // Measured 1.9e-8 (FOCE, frozen-variance mode unpolished) and 5.1e-11 (FOCEI), macOS
+    // arm64; `sde_covariance_hessian_matches_fd_of_the_gradient`'s bounds.
+    for (objective, bound) in [(Objective::Foce, 3e-7), (Objective::Focei, 1e-9)] {
+        let (a, _) = hessian_gaps_for(&model, &s, objective);
+        eprintln!("T8 magnitude hessian {objective:?}: gap {a:.3e}");
+        assert!(a < bound, "{objective:?}: {a:.2e}");
+    }
+}
+
+/// `block_sigma` × SDE routes to finite differences (#3126): the EKF variance recording's
+/// leaves are θ‖σ, so ρ in the Kalman `R` would be differentiated as a constant (FOCEI parity
+/// 3.755e-4 measured before this route). The model-level gate (`recorder_in_scope`, which the
+/// outer, inner, covariance and SAEM scopes all read) and the recorder's own decline (the
+/// per-row inner callers record without asking the model gate) are each pinned. Controls on
+/// both sides of the gate: the same SDE without `block_sigma`, and the same `block_sigma`
+/// without `[diffusion]`, stay on the dual. The FD objective itself carries ρ in `R`
+/// (`ekf_row_variance_tests::ekf_p_obs_matches_the_closed_form_riccati_per_row_term`).
+#[test]
+fn sde_block_sigma_routes_to_finite_differences() {
+    use crate::estimation::inner_optimizer::analytic_eta_nll_gradient;
+    let (dense, s) = sde_dense_fixture();
+    let (diag, _) = sde_fixture();
+    let no_sde_src = SDE_ONE_CPT
+        .replace(
+            "  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.004, 0.04]\n",
+        )
+        .replace("proportional(PROP_ERR)", "combined(PROP_ERR, ADD_ERR)")
+        .replace("[diffusion]\n  central ~ 0.02\n", "");
+    let no_sde = parse_model_string(&no_sde_src).unwrap();
+    assert!(!no_sde.is_sde() && !no_sde.residual_correlations.is_empty(), "premise");
+    assert!(dense.is_sde() && !dense.residual_correlations.is_empty(), "premise");
+    assert!(recorder_in_scope(&diag) && outer_model_in_scope(&diag), "control: SDE, diagonal Σ");
+    assert!(recorder_in_scope(&no_sde), "control: block_sigma without [diffusion]");
+    assert!(!recorder_in_scope(&dense), "block_sigma × SDE must decline at the model gate");
+    assert!(!outer_model_in_scope(&dense), "the outer scope reads the model gate");
+    let p = &dense.default_params;
+    let eta = [0.08, -0.06, 0.1];
+    assert!(
+        analytic_eta_nll_gradient(&dense, &s, &p.theta, &eta, &p.omega, &p.sigma.values).is_none(),
+        "the recorder itself must decline block_sigma × SDE for the per-row inner callers"
+    );
+    let (d, _) = sde_fixture();
+    let pd = &d.default_params;
+    assert!(
+        analytic_eta_nll_gradient(&d, &s, &pd.theta, &eta, &pd.omega, &pd.sigma.values).is_some(),
+        "control: the diagonal SDE subject is recorded"
+    );
+}
+
 /// Central difference of `l` along `e[a]`, Richardson-extrapolated from steps `h` and `2h`.
 fn richardson(l: &dyn Fn(&[f64]) -> f64, e: &[f64], a: usize, h: f64) -> f64 {
     let d = |st: f64| {
@@ -8980,8 +9335,9 @@ fn sde_dense_fixture() -> (CompiledModel, Subject) {
 
 /// The per-row inner assemblers on an SDE subject read the EKF variance rows beside the
 /// predictions (`exact_obs_grads_into` with σ): `analytic_eta_nll_value_gradient_with_schedule`
-/// (the inner search, HMC, the IMH refresh) on its diagonal and its dense-`R` (`block_sigma`)
-/// branch, and the IOV `analytic_eta_nll_gradient_iov`. Each gradient matches central
+/// (the inner search, HMC, the IMH refresh) on its diagonal branch, and the IOV
+/// `analytic_eta_nll_gradient_iov`. (Its dense-`R` `block_sigma` branch declines on an SDE
+/// subject since #3126 — `sde_block_sigma_routes_to_finite_differences`.) Each gradient matches central
 /// differences of the production objective it serves (`individual_nll`, `individual_nll_iov`,
 /// which run `ekf_p_obs`), and the fused value is `individual_nll` itself. Dies when a variance
 /// row's η-jet or its value in `V` is dropped, on any branch: the variance term is live (the
@@ -8995,9 +9351,9 @@ fn sde_per_row_inner_gradients_match_fd_of_the_production_objective() {
     use crate::stats::likelihood::{individual_nll, individual_nll_iov};
     let eta = [0.08, -0.06, 0.1];
     let mut worst = 0.0f64;
-    for (name, (model, s)) in [("diagonal", sde_fixture()), ("dense", sde_dense_fixture())] {
+    for (name, (model, s)) in [("diagonal", sde_fixture())] {
         let p = &model.default_params;
-        assert_eq!(model.residual_cov_theta(&p.theta).is_dense(), name == "dense");
+        assert!(!model.residual_cov_theta(&p.theta).is_dense());
         let l = |e: &[f64]| individual_nll(&model, &s, &p.theta, e, &p.omega, &p.sigma.values);
         let g = analytic_eta_nll_gradient(&model, &s, &p.theta, &eta, &p.omega, &p.sigma.values)
             .expect("served");
@@ -9074,7 +9430,7 @@ fn sde_per_row_inner_gradients_match_fd_of_the_production_objective() {
     eprintln!("sde iov: per-row inner gradient vs FD {w:.3e}");
     assert!(w.is_finite(), "iov: {w}");
     worst = worst.max(w);
-    // Measured 1.1e-10 (diagonal), 1.1e-10 (dense), 1.6e-10 (IOV): the differences' own error.
+    // Measured 1.1e-10 (diagonal), 1.6e-10 (IOV): the differences' own error.
     assert!(worst < 2e-9, "{worst:.2e}");
 }
 
@@ -9303,7 +9659,9 @@ fn sde_window_case(case: &str, ss: bool) -> (CompiledModel, Subject, usize) {
 fn assert_window_moves_p_obs(model: &CompiledModel, s: &Subject, k: usize) {
     let p = moved_params(model);
     let eta = [0.05, 0.0, -0.05, 0.1];
-    let at = |th: &[f64]| crate::stats::likelihood::ekf_p_obs(model, s, th, &eta, &p.sigma.values);
+    let at = |th: &[f64]| {
+        crate::stats::likelihood::ekf_p_obs(model, s, th, &eta, &p.sigma.values, &[], None)
+    };
     let mut th = p.theta.clone();
     th[k] *= 0.8;
     let (a, b) = (at(&p.theta), at(&th));
@@ -10854,6 +11212,83 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     eprintln!("exact inner Hessian sweep: {ran} subjects, {} declined", declined.len());
     assert!(ran >= 60, "only {ran} subjects ran");
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
+}
+
+/// #2678: the AGQ finite-difference score steps a small identity-packed θ by its `|θ₀|` floor,
+/// so on an O(1)-sensitivity θ (`CL ∝ 2^(BE + c)`, `BE` declared at `1e-4`) its re-solved
+/// probes stop inside τ and the difference is that of a part-reconverged objective. Through
+/// `central_diff_packed_gated` the #2406 gate grows that step until the τ/100 twin agrees.
+/// Measured (macOS arm64), the forced-FD population gradient's `BE` entry against the exact
+/// route's: 3.0e-3 relative ungated, 5.1e-10 gated; 2.7e-8 with `BE` declared at 1 (floor 1).
+#[test]
+fn an_agq_fd_score_resolves_a_small_exponents_step() {
+    use crate::types::{EstimationMethod, FitOptions, Population};
+    let t0 = 1e-4;
+    let src = format!(
+        "[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta BE({t0:e}, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * 2^(BE + {c:e})
+  V  = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+        c = 0.3 - t0
+    );
+    let model = parse_model_string(&src).unwrap();
+    let params = model.default_params.clone();
+    let x = pack_params(&params);
+    let k = model.theta_names.iter().position(|n| n == "BE").unwrap();
+    assert_eq!(x[k], t0, "fixture: BE is identity-packed at its declared value");
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let dose = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let subjects: Vec<Subject> = [[0.2, -0.1], [-0.3, 0.15], [0.1, 0.2]]
+        .iter()
+        .enumerate()
+        .map(|(i, e)| Subject { id: format!("{}", i + 1), ..subject(&model, dose(), &times, e) })
+        .collect();
+    let etas: Vec<_> = subjects.iter().map(|s| ebe_for(&model, s, &params, 1e-12, true)).collect();
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let options =
+        FitOptions { method: EstimationMethod::Laplace, n_agq: 3, ..FitOptions::default() };
+    let g = |force_fd: bool| {
+        crate::estimation::agq::population_gradient_mixed(
+            &model,
+            &population,
+            &params,
+            &x,
+            &etas,
+            &vec![Vec::new(); 3],
+            &crate::estimation::parameterization::compute_bounds(&params),
+            &options,
+            force_fd,
+            None,
+            None,
+            None,
+        )
+        .expect("population gradient")[k]
+    };
+    let (exact, fd) = (g(false), g(true));
+    let rel = (fd - exact).abs() / exact.abs();
+    eprintln!("MEASURE #2678 agq FD score BE: {fd:e} vs exact {exact:e}, rel {rel:e}");
+    assert!(exact.abs() > 1.0, "fixture: a live gradient ({exact})");
+    assert!(rel < 1e-6, "rel {rel:e}");
 }
 
 /// A linear `[odes]` model whose infusion end moves with η (`D1`, `RATE=-2`).

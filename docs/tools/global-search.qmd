@@ -330,8 +330,8 @@ NONMEM and PsN.
 ## From Rust
 
 ```rust
-use ferx_tools::globalsearch::{run_globalsearch, GlobalsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::globalsearch::{run_globalsearch, GlobalsearchRun};
+use ferx_search::search::SearchConfig;
 
 let cfg = SearchConfig::load("warfarin.ferxsearch")?;
 let base = cfg.load_base()?;
@@ -351,6 +351,6 @@ println!("{}", result.final_model.render());
 
 `GlobalsearchRun` also takes a `threads` override, a `CancelFlag` that stops
 the search between batches with what it has, `reuse_from` directories, and
-a progress callback (`GlobalsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512). The penalized criterion on its
-own is `ferx_tools::search::Penalties` — `score(&fit)` for the number,
+a progress callback (`GlobalsearchEvent`). Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_search::search::CandidateFinished`, #2512). The penalized criterion on its
+own is `ferx_search::search::Penalties` — `score(&fit)` for the number,
 `terms(&fit)` for what it was charged for.

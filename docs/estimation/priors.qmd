@@ -365,7 +365,7 @@ scale and evaluating at the same fixed point, ferx's penalty reproduces NONMEM's
 The centred run — prior mean placed exactly on the parameter — reproducing the
 null is what establishes that NWPRI drops the prior's normalisation constant just
 as ferx does, so these are comparable absolutely and not only as a difference.
-Control streams and the measured `.lst` files live in `nonmem_anchor/`; the
+Control streams and the numbers measured (`.nm.json`) live in `nonmem_anchor/`; the
 comparison runs as a test (`the_prior_penalty_matches_nonmem_nwpri`).
 
 The **Ω** prior has no NWPRI counterpart to difference against, since NONMEM's is
