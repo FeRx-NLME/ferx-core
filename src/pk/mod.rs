@@ -2174,8 +2174,12 @@ pub fn predict_all_states(
 pub fn compute_predictions_with_states(
     model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
-    // A transit subject the closed form can't serve routes to its ODE twin, so states
-    // come from the ODE integration (matches `compute_predictions_with_tv`, #486).
+    // A transit/IG subject the closed form can't serve routes to its ODE twin, for IPRED as
+    // in `compute_predictions_with_tv` (#486). The twin's states (`[central(, periph)]`
+    // amounts) are not the closed form's `[depot, central(, peripheral)]` concentrations
+    // `[derived]` names them by, so such a subject reports none (#1580,
+    // `W_DERIVED_CMT_TWIN_ANALYTICAL`).
+    let closed_form = model.ode_spec.is_none();
     let model = effective_model_for_eval(model, subject, theta, eta);
     let uses_time = model_uses_time_anywhere(model);
     if let Some(ref ode) = model.ode_spec {
@@ -2203,7 +2207,7 @@ pub fn compute_predictions_with_states(
         // The sink's tail ([scaling], LTBS, FREM override), as in
         // compute_predictions_with_tv_into_with_schedule (#2259).
         to_observation_scale(model, subject, theta, eta, &mut ipred);
-        (ipred, states)
+        (ipred, if closed_form { vec![] } else { states })
     } else {
         // Analytical path: ipred via compute_predictions_with_tv (handles SS, resets,
         // TV covariates); states via predict_all_states (superposition only — valid

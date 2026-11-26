@@ -1,6 +1,6 @@
 # Dev tooling, not engine code (#2634). Like `crates/docs-lint`, this crate is a
 # workspace member for rustfmt / clippy / `cargo test`, and sits OUTSIDE the
-# ferx-core / ferx-tools / ferx-cli layering: it depends on no workspace crate
+# ferx-core / ferx-tools / ferx-search / ferx-cli layering: it depends on no workspace crate
 # (not even `ferx-core` — it reads the tree as source text) and nothing may
 # depend on it. Its `cargo test` and `cargo clippy` are the `patterns` group of
 # `tools/preflight.sh`.

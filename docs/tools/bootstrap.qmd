@@ -1,6 +1,6 @@
 ---
 pagetitle: "Bootstrap"
-description-meta: "Non-parametric case bootstrap in ferx: resample subjects, refit, and report bias, standard errors and confidence intervals — at PsN::bootstrap feature parity."
+description-meta: "Non-parametric case bootstrap in ferx: resample subjects, refit, and report bias, standard errors and confidence intervals — modelled on PsN::bootstrap."
 ---
 
 # Bootstrap
@@ -127,10 +127,9 @@ whether the base model was fitted first.
 ::: {.callout-note}
 ## This is a deliberate departure from PsN
 
-The PsN bootstrap user guide documents the opposite as a known wart: *"the results of two
-runs will be different even if the seed is the same if the lst-file of the base model is
-present at the start of one run but not the other"*, because running the base model
-advances one shared random-number generator. Deriving per replicate removes that coupling,
+In PsN the draws share one random-number generator with the base-model run, so the same
+seed gives different datasets depending on whether the base model had already been run
+when the bootstrap started. Deriving per replicate removes that coupling,
 and makes the draw stream something a test can pin.
 :::
 
@@ -242,7 +241,7 @@ answers. PsN's user guide treats them as one recovery section; ferx splits them 
 
 | what happened | what to do |
 |---|---|
-| too many samples were filtered out | `--summarize` — nothing needs refitting, only the exclusion criteria change |
+| the filters excluded more replicates than intended | `--summarize` — nothing needs refitting, only the exclusion criteria change |
 | the process was killed, the machine crashed, the job hit a wall clock | `--resume` — refit only the samples that never finished |
 | some samples failed for a transient reason (out of memory, full disk) that has since gone away | `--resume --retry-failed` |
 
@@ -330,18 +329,14 @@ those.
 
 ## Confidence intervals
 
-Percentile intervals use PsN's estimator, the weighted average at `x₍ₙ₊₁₎ₚ`:
+Percentile intervals use the type-6 sample quantile (Hyndman & Fan, *Am Stat* 1996),
+the same estimator PsN reports. With `m` sorted estimates `x₁ ≤ … ≤ xₘ` and
+`p = percentile / 100`, let `h = (m + 1)·p`, `i = ⌊h⌋` and `f = h − i`. The percentile
+is `(1 − f)·xᵢ + f·xᵢ₊₁`, or `xₘ` when `h = m`.
 
-```
-n = number of samples + 1
-p = percentile / 100
-i = integer part of n·p
-f = decimal part of n·p
-percentile = (1−f)·xᵢ + f·xᵢ₊₁
-```
-
-A tail can only be reported when there is an order statistic at or below it — i.e. when
-`(n+1)·p ≥ 1`. That single condition reproduces every minimum PsN tabulates:
+A tail is reported only when `1 ≤ h ≤ m`, so that the quantile lies within the
+observed estimates rather than beyond the smallest or largest. That condition
+gives these minimum sample counts:
 
 | interval | samples needed |
 |---|---:|
@@ -377,7 +372,7 @@ scripts and habits transfer.
 
 | file | contents |
 |---|---|
-| `raw_results.csv`            | one row per fit, **first row the original dataset**; estimates, OFV and termination diagnostics (plus `se_` columns under `--keep-covariance`) |
+| `raw_results.csv`            | one row per fit, **first row the original dataset** when the base model was run; estimates, OFV and termination diagnostics (plus `se_` columns under `--keep-covariance`) |
 | `bootstrap_results.csv`      | one row per parameter: original, mean, bias, standard error, median, percentile CI, normal CI |
 | `bootstrap_diagnostics.csv`  | run counts, exclusion tallies, and the mean of each per-replicate diagnostic |
 | `included_individuals1.csv`  | per replicate, the subject IDs drawn (repeats included), in dataset order |
@@ -387,8 +382,10 @@ scripts and habits transfer.
 | `delta_ofv.csv`              | `--dofv` only |
 | `bootstrap_run.json`         | the seed, options and input hashes the directory was created with — what `--resume` checks itself against |
 
-Row *j* refers to the same replicate in `raw_results`, `included_individuals`,
-`included_keys` and `sample_keys`, as in PsN.
+`raw_results`, `included_individuals`, `included_keys` and `sample_keys` list the
+replicates in the same order. Only the leading rows differ: `raw_results` and
+`sample_keys` start with a header, and `raw_results` puts the original-data fit
+(`sample = 0`, when it was run) before replicate 1.
 
 The first four are written **incrementally**, one row per replicate as it finishes, so an
 interrupted run leaves what it had already done; the rest are written once at the end. A

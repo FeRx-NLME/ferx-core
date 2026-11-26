@@ -115,7 +115,6 @@ nan-fold 1 src/estimation/vi/elbo_tests.rs::assert_tv_iov_gradient_matches_fd
 nan-fold 2 src/estimation/vi/elbo_tests.rs::iov_mc_kl_neg_elbo_gradient_matches_central_fd
 nan-fold 1 src/estimation/vi/elbo_tests.rs::mc_kl_grad_x_matches_fd_but_phi_is_path_derivative
 nan-fold 4 src/estimation/vi/elbo_tests.rs::the_data_eta_gradient_is_exact_past_the_closed_forms
-nan-fold 1 src/io/datareader_tests.rs::test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record
 nan-fold 2 src/markov/endpoint.rs::exact_eta_hessian_tests::the_ctmm_eta_hessian_is_exact_on_a_homogeneous_generator
 nan-fold 1 src/markov/mod.rs::tests::max_abs_diff
 nan-fold 1 src/nn/mlp.rs::regularizer_fit_tests::exact_penalty_hessian_matches_the_second_difference_of_the_penalty
@@ -170,7 +169,6 @@ nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_a_covariate_nn_subject_run
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_axes_is_the_full_hessians_diagonal
 nan-fold 1 src/sens/ode_adjoint_tests.rs::eta_dx_matches_the_re_solved_ebe_with_a_non_gaussian_term
 nan-fold 1 src/sens/ode_adjoint_tests.rs::exact_inner_hessian_matches_fd_of_the_production_objective
-nan-fold 2 src/sens/ode_adjoint_tests.rs::fd_oracle
 nan-fold 1 src/sens/ode_adjoint_tests.rs::fd_oracle_agq
 nan-fold 1 src/sens/ode_adjoint_tests.rs::kernel_m3_censored_rows_match_reconverged_fd
 nan-fold 2 src/sens/ode_adjoint_tests.rs::mm_template_and_hand_written_gradients_agree_per_subject

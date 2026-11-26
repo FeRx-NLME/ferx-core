@@ -546,6 +546,7 @@ const T_JET: u8 = 30;
 const T_FLOOR: u8 = 31;
 const T_CEIL: u8 = 33;
 const T_ROUND: u8 = 34;
+const T_SQRT_VM: u8 = 35;
 const T_GATE: u8 = 32;
 /// A comparison: this plus its `ir::Cc`.
 const T_CMP: u8 = 40;
@@ -1193,6 +1194,10 @@ impl crate::sens::num::vm::VmArith for Tr {
     fn same_bits(&self, other: &Self) -> bool {
         self.r == other.r && self.dep == other.dep && self.v.to_bits() == other.v.to_bits()
     }
+    fn sqrt_vm(self) -> Self {
+        let v = if self.v >= 0.0 { self.v } else { 0.0 };
+        self.unary(T_SQRT_VM, Unary::SqrtRhs, v.sqrt())
+    }
 }
 
 /// Whether this thread is recording ([`begin`] … [`end`]).
@@ -1830,6 +1835,12 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
 }
 
 impl Recording {
+    /// The recorded program's length: what a structural test of a kernel's cost reads.
+    #[cfg(test)]
+    pub(crate) fn n_ops(&self) -> usize {
+        self.code.len()
+    }
+
     /// Whether every register's recorded value was finite: the point is one the value path can
     /// score (a plan that does not serve at its own point says something about the plan only
     /// then).

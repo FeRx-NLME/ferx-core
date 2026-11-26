@@ -3,11 +3,11 @@
 //!
 //! Control streams and outputs are committed under `tests/nonmem/`:
 //!
-//! * `warfarin_power_eval.ctl` / `.lst` / `.ext` — `MAXEVAL=0` at the ferx
+//! * `warfarin_power_eval.ctl` / `.nm.json` / `.ext` — `MAXEVAL=0` at the ferx
 //!   initial estimates (`P = 1.3`, away from the proportional value where the
 //!   exponent would be unreachable). This is the objective *function* anchor:
 //!   both engines evaluate the same model at the same point.
-//! * `warfarin_power.ctl` / `.lst` / `.ext` — the FOCEI fit. NONMEM
+//! * `warfarin_power.ctl` / `.nm.json` / `.ext` — the FOCEI fit. NONMEM
 //!   terminated with `ROUNDING ERRORS (ERROR=134)`, as it commonly does on a
 //!   power model whose σ and exponent trade off, at
 //!   OBJ −286.7588 and `P = 1.112`; its estimates are the second evaluation

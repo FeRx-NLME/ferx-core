@@ -6,6 +6,7 @@ use crate::sim::adaptive::{
     AdaptiveRoute, AdaptiveRule, Comparison, DecisionCovariates, DoseKnowledge, DoseStep,
     DoseValue, IntervalStep,
 };
+use crate::stats::residual_error::FOp;
 use crate::types::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -5382,11 +5383,15 @@ pub fn parse_full_model_with(
     // validate the magnitude expressions).
     let single_error_args: Option<(ErrorModel, Vec<String>, Option<String>)> =
         match &parsed_error_model {
-            ParsedErrorModel::Single(em, args, exponent) => {
+            ParsedErrorModel::Single(em, args, exponent, _) => {
                 Some((*em, args.clone(), exponent.clone()))
             }
             ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
         };
+    let error_weight: Option<String> = match &parsed_error_model {
+        ParsedErrorModel::Single(.., w) => w.clone(),
+        _ => None,
+    };
     let endpoint_error_args = endpoint_magnitude_args(&parsed_error_model);
     // Covariates the #658 error selector references become required data columns
     // (validated as E_MISSING_COVARIATE at fit setup). Capture before
@@ -6766,6 +6771,9 @@ pub fn parse_full_model_with(
             &ruv_eta_names,
             &covariate_decls,
             &indiv_stmts,
+            error_weight.as_deref(),
+            ltbs_flags.log_transform,
+            &prediction_side_names(&blocks),
         )?;
         model.ruv_magnitude = rm;
         // A covariate that appears *only* in a magnitude / `weight =` expression
@@ -20038,8 +20046,9 @@ enum ParsedErrorModel {
     /// positionally from the global sigma vector). The third field is the
     /// exponent expression of a `power(SIGMA, P)` statement (#1182) — `None`
     /// for every other form — which `build_ruv_magnitude` compiles onto the
-    /// proportional slot.
-    Single(ErrorModel, Vec<String>, Option<String>),
+    /// proportional slot. The fourth is the `weight =` text (#1029), already folded into
+    /// its slot's argument and kept so a refusal can name what the user wrote.
+    Single(ErrorModel, Vec<String>, Option<String>, Option<String>),
     /// Per-CMT error models (every line prefixed `CMT=N:`). One entry per line,
     /// in source order; duplicates are rejected here.
     PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
@@ -20946,7 +20955,9 @@ fn parse_error_model_inner(
 
     // singles carry the per-line LTBS flags so the chosen single can stamp them,
     // and the `power(...)` exponent expression when the line is that form.
-    let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags, Option<String>, Option<String>)> =
+        Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
     // Each per-CMT line's LTBS flags (#2729): the log transform is model-wide, so the
     // lines must agree, which is checked once they are all read.
@@ -21169,7 +21180,7 @@ fn parse_error_model_inner(
                 per_cmt.push((cmt, error_model, sigma_names));
                 per_cmt_flags.push((cmt, flags));
             }
-            None => singles.push((error_model, sigma_names, flags, exponent)),
+            None => singles.push((error_model, sigma_names, flags, exponent, weight_expr)),
         }
     }
 
@@ -21234,8 +21245,8 @@ fn parse_error_model_inner(
     }
 
     match singles.into_iter().next() {
-        Some((model, names, flags, exponent)) => {
-            Ok((ParsedErrorModel::Single(model, names, exponent), flags, iiv_on_ruv))
+        Some((model, names, flags, exponent, weight)) => {
+            Ok((ParsedErrorModel::Single(model, names, exponent, weight), flags, iiv_on_ruv))
         }
         None => Err("No error model found in [error_model] block".to_string()),
     }
@@ -21255,7 +21266,7 @@ fn build_error_spec(
     is_algebraic: bool,
 ) -> Result<(ErrorModel, ErrorSpec), String> {
     match parsed {
-        ParsedErrorModel::Single(model, args, _exponent) => {
+        ParsedErrorModel::Single(model, args, _exponent, _) => {
             // Single-endpoint sigmas are consumed positionally from the global sigma vector:
             // `ErrorSpec::Single` carries no indices, so every consumer (`sigma_loadings`,
             // `residual_variance`, `sigma_types`, the #484 magnitude multipliers, …) reads the *leading*
@@ -21704,11 +21715,15 @@ fn resolve_ruv_indiv_names(
 /// `sigma_name` is `None` for a `power(...)` exponent (#1182), which scales no
 /// sigma and may name none — the variance must stay a quadratic form in σ so
 /// the σ-gradient's `2·R` shortcut and the `(sd)` reporting stay exact.
+///
+/// `what` names the construct as the user wrote it (`residual-magnitude expression`,
+/// `` `weight =` expression ``, `power exponent`). `prediction_names` are the names the
+/// prediction side assigns (`[structural_model]`, `[odes]`, `[scaling]`), refused with
+/// their own message rather than called undeclared covariates (#3121).
 fn validate_ruv_expr(
     expr: &Expression, sigma_name: Option<&str>, allowed_covs: Option<&[String]>,
+    prediction_names: &[String], what: &str,
 ) -> Result<(), String> {
-    let what =
-        if sigma_name.is_some() { "residual-magnitude expression" } else { "power exponent" };
     let mut err: Option<String> = None;
     visit_expr_nodes(expr, &mut |e: &Expression| {
         if err.is_some() {
@@ -21769,10 +21784,36 @@ fn validate_ruv_expr(
             Expression::Covariate(name) => {
                 let upper = name.to_uppercase();
                 if RUV_FORBIDDEN_NAMES.contains(&upper.as_str()) {
+                    // `IPRED` is readable in a residual-magnitude expression (#3121); it
+                    // reaches here only from a `weight =` or a power exponent.
+                    let hint = match (upper.as_str(), what.contains("weight")) {
+                        ("IPRED", true) => {
+                            ". A weight is a property of the datum; to make the residual SD a \
+                             function of the prediction, write it in the magnitude: \
+                             `additive(SIGMA * h(IPRED))`"
+                        }
+                        ("IPRED", false) => {
+                            ". `IPRED` may be read in a residual-magnitude expression: \
+                             `additive(SIGMA * h(IPRED))`"
+                        }
+                        _ => "",
+                    };
+                    // The list is what *this* construct may read: `IPRED` only in a
+                    // magnitude, the sigma only where one is scaled (#3125 review 4).
+                    let ipred = if what == RUV_MAG_LABEL { "IPRED, " } else { "" };
+                    let sigma = if sigma_name.is_some() { " and the sigma" } else { "" };
                     err = Some(format!(
-                        "{what} may not reference `{}` (only TIME, TAD, covariates, thetas, and \
-                         the sigma are allowed)",
-                        name
+                        "{what} may not reference `{name}` (only TIME, TAD, {ipred}covariates, \
+                         thetas{}η-free [individual_parameters] names{sigma} are allowed){hint}",
+                        if sigma.is_empty() { " and " } else { ", " }
+                    ));
+                } else if prediction_names.iter().any(|p| p == name) {
+                    err = Some(format!(
+                        "{what} references `{name}`, which the model computes on the prediction \
+                         side ([structural_model] / [scaling] / [odes]), so it cannot be read \
+                         here. A residual-magnitude expression reads the model's prediction as \
+                         `IPRED`; an intermediate or a state other than the prediction is not \
+                         readable"
                     ));
                 } else if !name.eq_ignore_ascii_case("TIME")
                     && !is_declared_level_index_column(name)
@@ -21901,6 +21942,127 @@ fn at_error_endpoint(label: &str, err: String) -> String {
     err.replacen("[error_model]", &format!("[error_model] {label}"), 1)
 }
 
+/// The names the prediction side assigns — `NAME = …` in `[structural_model]` and
+/// `[scaling]` (also an indexed readout `NAME[CMT=1] = …`), `d/dt(NAME)` in `[odes]` — so a
+/// residual magnitude reading one is told it is a prediction-side name rather than an
+/// undeclared covariate (#3121).
+fn prediction_side_names(blocks: &HashMap<String, Vec<String>>) -> Vec<String> {
+    static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\s*(?:d/dt\(\s*)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?\)?\s*=").unwrap()
+    });
+    ["structural_model", "scaling", "odes"]
+        .iter()
+        .filter_map(|b| blocks.get(*b))
+        .flatten()
+        .filter_map(|l| ASSIGN_RE.captures(l).map(|c| c[1].to_string()))
+        .collect()
+}
+
+/// How a scope error names a residual-magnitude expression.
+const RUV_MAG_LABEL: &str = "residual-magnitude expression";
+
+/// What `build_ruv_magnitude`'s compiler returns: the postfix program over `f` when the
+/// magnitude reads `IPRED` (#3121), and the lowered parts (its `Push` operands in order, or
+/// the one whole expression).
+type RuvParts = (Option<Vec<FOp>>, Vec<(RuvMagFn, RuvMagDerivProgram)>);
+
+/// Place a compiled slot: a plain magnitude as the slot's `(multiplier, θ-program)`, or a
+/// prediction-reading one into `preds[slot]` (grown to fit), its multiplier then `1`.
+fn place_ruv_parts(
+    (ops, parts): RuvParts, slot: usize, preds: &mut Vec<Option<PredMagnitude>>,
+) -> (Option<RuvMagFn>, Option<RuvMagDerivProgram>) {
+    match ops {
+        None => {
+            let (f, d) = parts.into_iter().next().expect("a plain magnitude is one part");
+            (Some(f), Some(d))
+        }
+        Some(ops) => {
+            if preds.len() <= slot {
+                preds.resize_with(slot + 1, || None);
+            }
+            let (leaves, leaf_derivs) = parts.into_iter().unzip();
+            preds[slot] = Some(PredMagnitude { ops, leaves, leaf_derivs });
+            (None, None)
+        }
+    }
+}
+
+/// Whether `e` reads the prediction `IPRED`.
+fn reads_ipred(e: &Expression) -> bool {
+    let mut hit = false;
+    visit_expr_nodes(e, &mut |n| {
+        hit |= matches!(n, Expression::Covariate(c) if c.eq_ignore_ascii_case("IPRED"));
+    });
+    hit
+}
+
+/// Lower a magnitude that reads `IPRED` (#3121) to a postfix program over `f` (`ops`) and
+/// its maximal prediction-free subtrees (`leaves`, one per `Push`, in order). `IPRED` is
+/// the natural-scale prediction, so under LTBS (`f` its log) it reads `exp(f)`.
+fn split_ipred(
+    e: &Expression, ltbs: bool, ops: &mut Vec<FOp>, leaves: &mut Vec<Expression>,
+) -> Result<(), String> {
+    split_ipred_node(e, ltbs, ops, leaves)?;
+    let mut depth = 0i32;
+    for op in ops.iter() {
+        depth += op.stack_effect();
+        if depth as usize > crate::stats::residual_error::FMAG_MAX_STACK {
+            return Err("the expression around `IPRED` nests too deeply".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn split_ipred_node(
+    e: &Expression, ltbs: bool, ops: &mut Vec<FOp>, leaves: &mut Vec<Expression>,
+) -> Result<(), String> {
+    if !reads_ipred(e) {
+        ops.push(FOp::Push);
+        leaves.push(e.clone());
+        return Ok(());
+    }
+    let (args, op): (Vec<&Expression>, FOp) = match e {
+        Expression::Covariate(_) => (vec![], if ltbs { FOp::ExpF } else { FOp::F }),
+        Expression::BinOp(l, op, r) => (
+            vec![l, r],
+            match op {
+                BinOp::Add => FOp::Add,
+                BinOp::Sub => FOp::Sub,
+                BinOp::Mul => FOp::Mul,
+                BinOp::Div => FOp::Div,
+                BinOp::Mod => return Err(ipred_unsupported("`%`")),
+            },
+        ),
+        Expression::Power(b, x) => (vec![b, x], FOp::Pow),
+        Expression::UnaryFn(name, a) => (
+            vec![a],
+            match name.as_str() {
+                "exp" => FOp::Exp,
+                "log" | "ln" => FOp::Ln,
+                "sqrt" => FOp::Sqrt,
+                "abs" => FOp::Abs,
+                "inv_logit" | "expit" => FOp::InvLogit,
+                _ => return Err(ipred_unsupported(&format!("`{name}(...)`"))),
+            },
+        ),
+        // `min` / `max` desugar to a conditional, so name all three (#3125 review 3).
+        Expression::Conditional(..) => return Err(ipred_unsupported("an `if`, `min` or `max`")),
+        _ => return Err(ipred_unsupported("this construct")),
+    };
+    for a in args {
+        split_ipred_node(a, ltbs, ops, leaves)?;
+    }
+    ops.push(op);
+    Ok(())
+}
+
+fn ipred_unsupported(what: &str) -> String {
+    format!(
+        "{what} cannot take `IPRED`: a residual magnitude combines the prediction with \
+         `+ - * / ^`, `exp`, `log`, `sqrt`, `abs` and `inv_logit` only"
+    )
+}
+
 /// Build the custom residual-error magnitude (#484) from the `[error_model]`
 /// arguments, once covariate names are known: `single_error_args` for a plain
 /// statement, `endpoint_args` for a `CMT=N:` or `if/else` block (#2731). Returns
@@ -21918,6 +22080,7 @@ fn build_ruv_magnitude(
     single_error_args: &Option<(ErrorModel, Vec<String>, Option<String>)>,
     endpoint_args: &[EndpointMagnitudeArgs], sigma_names: &[String], theta_names: &[String],
     eta_names: &[String], covariate_decls: &Option<Vec<CovariateDecl>>, indiv_stmts: &[Statement],
+    weight: Option<&str>, ltbs: bool, prediction_names: &[String],
 ) -> Result<(Option<RuvMagnitude>, std::collections::HashSet<usize>, Vec<String>), String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_covs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -21936,10 +22099,16 @@ fn build_ruv_magnitude(
     // `MACHEPS`. Returns the AST, its `Dual2` θ-program and the runtime closure.
     // Indexes the block only; a name is judged and expanded when a magnitude reads it.
     let indiv_scope = RuvIndivScope::new(indiv_stmts);
+    // `what` prefixes a parse error, `label` names the construct in a scope error, and
+    // `allow_ipred` admits the prediction (#3121): the magnitude then splits into a
+    // postfix program over `f` (`Some(ops)`) and its prediction-free parts, each lowered
+    // like any magnitude; otherwise the one part is the whole expression.
     let mut compile = |src: &str,
                        sigma_name: Option<&str>,
-                       what: &str|
-     -> Result<(RuvMagFn, RuvMagDerivProgram), String> {
+                       what: &str,
+                       label: &str,
+                       allow_ipred: bool|
+     -> Result<RuvParts, String> {
         // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
         // unknown identifiers fall back to model covariates. TIME/time parse
         // as event-time built-ins. `MACHEPS`/`macheps`/`TAD`/`tad` must resolve
@@ -21968,9 +22137,7 @@ fn build_ruv_magnitude(
         // A name assigned in [individual_parameters] reads its value, as in every
         // other block (#2915). Substituted before validation, so the definition
         // is held to the same θ / covariate / TIME / TAD rule as inline text.
-        let what_long =
-            if sigma_name.is_some() { "residual-magnitude expression" } else { "power exponent" };
-        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, theta_names, what_long)?;
+        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, theta_names, label)?;
         if !inlined.is_empty() {
             // The parse recorded gather sites against the names as written; the
             // substituted tree may read other columns, or a literal (review 2).
@@ -21978,48 +22145,83 @@ fn build_ruv_magnitude(
             renormalize_rewritten_gathers(&mut expr)
                 .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
         }
-        validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref()).map_err(|e| {
-            if inlined.is_empty() {
-                e
-            } else {
-                let names: Vec<String> = inlined.iter().map(|n| format!("`{n}`")).collect();
-                format!(
-                    "{e} (after substituting the [individual_parameters] definition of {})",
-                    names.join(", ")
-                )
-            }
-        })?;
-        // `note_theta_eta` counts a gather as every θ of its block (#1638): a
-        // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
-        // magnitude-aware fallback, and the levels are not "unreferenced". η is
-        // already refused by `validate_ruv_expr`, so `etas` stays empty.
-        let mut etas = std::collections::HashSet::new();
-        visit_expr_nodes(&expr, &mut |e: &Expression| {
-            note_theta_eta(e, &mut used_thetas, &mut etas);
-            if matches!(e, Expression::Variable(name) if name.eq_ignore_ascii_case("TAD")) {
-                uses_tad = true;
-            }
-        });
-        collect_covariates(&expr, &mut used_covs);
-        let deriv = compile_ruv_mag_deriv_program(&expr, sigma_name, theta_names.len());
-        let sig = sigma_name.map(|s| s.to_string());
-        let f: RuvMagFn = Box::new(move |theta, obs_cov, time, tad| {
-            let mut vars: HashMap<String, f64> = HashMap::new();
-            if let Some(s) = &sig {
-                vars.insert(s.clone(), 1.0);
-            }
-            vars.insert("TAD".to_string(), tad);
-            vars.insert("tad".to_string(), tad);
-            // Preserve the legacy covariate-map injection for any pre-built
-            // expression that still treats TIME as a covariate; parsed models
-            // now use the event-time built-in via `with_model_time`.
-            let mut cov = obs_cov.clone();
-            cov.insert("TIME".to_string(), time);
-            cov.insert("time".to_string(), time);
-            with_model_time(time, || eval_expression(&expr, theta, &[], &cov, &vars, &[]))
-        });
-        Ok((f, deriv))
+        let reads_pred = allow_ipred && reads_ipred(&expr);
+        // A declared `IPRED` column would be read as the prediction here and as the
+        // column everywhere else: two meanings with no message, refused as `TAD` is
+        // (#3125 review 1).
+        let declared = allowed_covs.iter().flatten().find(|c| c.eq_ignore_ascii_case("IPRED"));
+        if let Some(col) = declared.filter(|_| reads_pred) {
+            return Err(format!(
+                "[error_model] {label} `{src}` references `IPRED`, which here is the model's \
+                 individual prediction, but a covariate named `{col}` is also declared in \
+                 [covariates] and the rest of the model reads that column. To read the column, \
+                 rename it (in the data and in [covariates]); to read the prediction, drop \
+                 `{col}` from [covariates]"
+            ));
+        }
+        let (ops, parts) = if reads_pred {
+            let (mut ops, mut leaves) = (Vec::new(), Vec::new());
+            split_ipred(&expr, ltbs, &mut ops, &mut leaves)
+                .map_err(|e| format!("[error_model] {label} `{src}`: {e}"))?;
+            (Some(ops), leaves)
+        } else {
+            (None, vec![expr])
+        };
+        let mut lowered = Vec::with_capacity(parts.len());
+        for expr in parts {
+            validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref(), prediction_names, label)
+                .map_err(|e| {
+                    if inlined.is_empty() {
+                        e
+                    } else {
+                        let names: Vec<String> = inlined.iter().map(|n| format!("`{n}`")).collect();
+                        format!(
+                            "{e} (after substituting the [individual_parameters] definition of {})",
+                            names.join(", ")
+                        )
+                    }
+                })?;
+            // `note_theta_eta` counts a gather as every θ of its block (#1638): a
+            // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
+            // magnitude-aware fallback, and the levels are not "unreferenced". η is
+            // already refused by `validate_ruv_expr`, so `etas` stays empty.
+            let mut etas = std::collections::HashSet::new();
+            visit_expr_nodes(&expr, &mut |e: &Expression| {
+                note_theta_eta(e, &mut used_thetas, &mut etas);
+                if matches!(e, Expression::Variable(name) if name.eq_ignore_ascii_case("TAD")) {
+                    uses_tad = true;
+                }
+            });
+            collect_covariates(&expr, &mut used_covs);
+            let deriv = compile_ruv_mag_deriv_program(&expr, sigma_name, theta_names.len());
+            let sig = sigma_name.map(|s| s.to_string());
+            let f: RuvMagFn = Box::new(move |theta, obs_cov, time, tad| {
+                let mut vars: HashMap<String, f64> = HashMap::new();
+                if let Some(s) = &sig {
+                    vars.insert(s.clone(), 1.0);
+                }
+                vars.insert("TAD".to_string(), tad);
+                vars.insert("tad".to_string(), tad);
+                // Preserve the legacy covariate-map injection for any pre-built
+                // expression that still treats TIME as a covariate; parsed models
+                // now use the event-time built-in via `with_model_time`.
+                let mut cov = obs_cov.clone();
+                cov.insert("TIME".to_string(), time);
+                cov.insert("time".to_string(), time);
+                with_model_time(time, || eval_expression(&expr, theta, &[], &cov, &vars, &[]))
+            });
+            lowered.push((f, deriv));
+        }
+        Ok((ops, lowered))
     };
+    // `weight =` is a property of the datum (#1029): validated on its own text first, so
+    // a refusal names what the user wrote rather than the magnitude it desugars into.
+    if let (Some(w), Some((em, args, _))) = (weight, single_error_args) {
+        let slot = usize::from(!matches!(em, ErrorModel::Additive));
+        let sigma = args.get(slot).and_then(|a| arg_sigma_name(a, sigma_names).ok());
+        compile(w, sigma.as_deref(), "`weight =`", "`weight =` expression", false)?;
+    }
+    let mut per_sigma_pred: Vec<Option<PredMagnitude>> = Vec::new();
 
     let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
     let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> = Vec::with_capacity(args.len());
@@ -22033,9 +22235,11 @@ fn build_ruv_magnitude(
             continue;
         }
         any = true;
-        let (f, deriv) = compile(trimmed, Some(&sigma_name), "magnitude")?;
-        per_sigma.push(Some(f));
-        per_sigma_deriv.push(Some(deriv));
+        let k = per_sigma.len();
+        let parts = compile(trimmed, Some(&sigma_name), "magnitude", RUV_MAG_LABEL, true)?;
+        let (f, deriv) = place_ruv_parts(parts, k, &mut per_sigma_pred);
+        per_sigma.push(f);
+        per_sigma_deriv.push(deriv);
     }
     // A `CMT=N:` or `if/else` block: each endpoint gets its own table over the flat
     // sigma vector, so one sigma can carry a factor on one endpoint and none on
@@ -22045,6 +22249,7 @@ fn build_ruv_magnitude(
         let mut table = EndpointMagnitude {
             per_sigma: std::iter::repeat_with(|| None).take(sigma_names.len()).collect(),
             per_sigma_deriv: vec![None; sigma_names.len()],
+            per_sigma_pred: Vec::new(),
         };
         let mut claimed: Vec<usize> = Vec::with_capacity(ep.args.len());
         let mut has_expr = false;
@@ -22070,10 +22275,11 @@ fn build_ruv_magnitude(
                 continue;
             }
             has_expr = true;
-            let (f, deriv) = compile(trimmed, Some(sigma_name), "magnitude")
+            let parts = compile(trimmed, Some(sigma_name), "magnitude", RUV_MAG_LABEL, true)
                 .map_err(|e| at_error_endpoint(&ep.label, e))?;
-            table.per_sigma[slot] = Some(f);
-            table.per_sigma_deriv[slot] = Some(deriv);
+            let (f, deriv) = place_ruv_parts(parts, slot, &mut table.per_sigma_pred);
+            table.per_sigma[slot] = f;
+            table.per_sigma_deriv[slot] = deriv;
         }
         if has_expr {
             per_endpoint.insert(ep.key, table);
@@ -22103,7 +22309,8 @@ fn build_ruv_magnitude(
             ));
         }
         any = true;
-        let (f, deriv) = compile(trimmed, None, "power exponent")?;
+        let (_, mut parts) = compile(trimmed, None, "power exponent", "power exponent", false)?;
+        let (f, deriv) = parts.pop().expect("a power exponent lowers to one part");
         per_sigma_exponent =
             std::iter::repeat_with(|| None).take(sigma_names.len().max(1)).collect();
         per_sigma_exponent_deriv =
@@ -22124,6 +22331,7 @@ fn build_ruv_magnitude(
         rm.per_sigma_exponent_deriv = per_sigma_exponent_deriv;
         rm.uses_tad = uses_tad;
         rm.per_endpoint = per_endpoint;
+        rm.per_sigma_pred = per_sigma_pred;
         Some(rm)
     } else {
         None
@@ -26827,7 +27035,7 @@ fn used_sigma_names(
         }
     };
     match parsed {
-        ParsedErrorModel::Single(_, args, _) => {
+        ParsedErrorModel::Single(_, args, ..) => {
             for a in args {
                 scan(a, &mut out);
             }
@@ -27930,7 +28138,7 @@ const IP_CACHE_WAYS: usize = 64;
 /// One memoized evaluation of a model's η-independent prefix.
 ///
 /// `model_id` distinguishes the closures of different `CompiledModel`s sharing a
-/// worker thread (a joint PK-TTE fit, a `ferx-tools` search, a test binary), so
+/// worker thread (a joint PK-TTE fit, a `ferx-search` run, a test binary), so
 /// a stale entry from another model can never be served: it is compared, not
 /// assumed.
 #[derive(Debug, Default)]
@@ -28701,24 +28909,7 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
-        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
-        // derivative there is zero (`PkNum::sqrt`'s convention, #2892): `inf · 0` would otherwise put
-        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
-        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
-        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
-        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
-        // The tests are recordable branches (`val` would fail a recording, #2786); the
-        // `±0` case is the value as a constant, so a zero keeps its sign.
-        Op::Sqrt => {
-            use crate::sens::num::BranchCmp::{Ge, Gt};
-            if v.br_cmp_c(Gt, 0.0) {
-                v.sqrt()
-            } else if v.br_cmp_c(Ge, 0.0) {
-                v.value_only()
-            } else {
-                T::from_f64(0.0)
-            }
-        }
+        Op::Sqrt => v.sqrt_vm(),
         Op::Abs => v.abs(),
         // Constants of the value (no derivative), recorded as primitives by a recording type.
         Op::Floor => v.floor_c(),

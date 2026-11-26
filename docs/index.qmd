@@ -85,7 +85,8 @@ src/                -- the ferx-core engine (one model, one dataset, one fit)
   sens/             -- Analytic derivatives (PkNum kernels, the adjoint and its compiled per-subject plans)
   nn/               -- Neural network components (DCM / NODE)
 crates/
-  ferx-tools/       -- Workflows that run many fits (bootstrap, model searches)
+  ferx-tools/       -- Workflows that run many fits of one model (bootstrap, GAM screening)
+  ferx-search/      -- Model-space searches (structure, variability, covariates, amd)
   ferx-cli/         -- The `ferx` command-line binary
 ```
 

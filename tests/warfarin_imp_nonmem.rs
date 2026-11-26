@@ -24,7 +24,7 @@
 //! ## Reference values
 //!
 //! NONMEM 7.5.1 `METHOD=IMP` (the `Importance Sampling` table in
-//! `tests/nonmem/warfarin_imp.ext`/`.lst`), warm-started from `METHOD=COND`:
+//! `tests/nonmem/warfarin_imp.ext`/`.nm.json`), warm-started from `METHOD=COND`:
 //!
 //! | Parameter | NONMEM IMP | ferx `[focei, imp]` |
 //! |-----------|-----------:|--------------------:|

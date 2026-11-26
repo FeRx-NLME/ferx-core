@@ -1,0 +1,43 @@
+# ferx twin of nonmem_anchor/ipred_magnitude.ctl (#3121): natural-scale naproxen arm
+# means with a residual SD that reads the prediction, A*exp(B*IPRED)/sqrt(NIND).
+#
+#   cargo run --release -p ferx-cli -- nonmem_anchor/ipred_magnitude_fit.ferx \
+#       --data nonmem_anchor/ipred_magnitude.csv
+
+model ipred_magnitude
+
+[parameters]
+  theta TVE0(5.19,     1.0,  20.0)
+  theta TVEMAX(0.88,  -5.0,  20.0)
+  theta TVET50(0.70,   0.01, 20.0)
+  theta B_E0_FLARE(0.97,   -10.0, 10.0)
+  theta B_EMAX_FLARE(1.10, -10.0, 10.0)
+  theta B_EMAX_TRT(0.79,   -10.0, 10.0)
+  theta B_LET50_TRT(-1.18, -10.0, 10.0)
+  theta A(1.0,  0.01, 100.0)
+  theta B(0.1, -5.0,    5.0)
+
+  omega ETA_E0   ~ 0.393129
+  omega ETA_EMAX ~ 0.582169
+
+  sigma EPS ~ 1.0 (variance) FIX
+
+[covariates]
+  TRT   categorical
+  FLARE categorical
+  NIND  continuous
+
+[individual_parameters]
+  E0   = TVE0   + B_E0_FLARE * FLARE + ETA_E0
+  EMAX = TVEMAX + B_EMAX_FLARE * FLARE + B_EMAX_TRT * TRT + ETA_EMAX
+  ET50 = TVET50 * exp(B_LET50_TRT * TRT)
+
+[structural_model]
+  y = E0 - EMAX * TIME / (TIME + ET50)
+
+[error_model]
+  DV ~ additive(EPS * A * exp(B * IPRED) / sqrt(NIND))
+
+[fit_options]
+  method     = focei
+  covariance = true

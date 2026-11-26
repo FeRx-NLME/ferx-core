@@ -2250,6 +2250,39 @@ fn profile_solve_from_a_previous_solve_starts_at_its_mode() {
     );
 }
 
+/// #2899: a subject with no observations, whose mode is exactly zero, is multi-started by the
+/// cold start solve and not again by one warm from a previous solve (#2691's `Solved`); before,
+/// its zero read as the cold placeholder at every start solve (on F1 with one such subject,
+/// 47 multi-starts in a fit against 14).
+#[test]
+fn profile_start_solve_takes_a_solved_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::on_one_thread;
+    let mut p = prep(F1, F1_DATA, Some(2), |t| t);
+    let empty = p.population.subjects.len() - 1;
+    let s = &mut p.population.subjects[empty];
+    s.id = "EMPTY".into();
+    s.obs_times.clear();
+    s.observations.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    s.occasions.clear();
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let runs = |warm: &ProfileWarm, at: &ModelParameters| {
+        let (s, rec) = on_one_thread(|| {
+            record_inner_solves(|| c.solve(at, warm).expect("the solve converges"))
+        });
+        let n = rec.multistarts.iter().filter(|id| *id == "EMPTY").count();
+        (s, n)
+    };
+    let (first, cold) = runs(&ProfileWarm::from_template(&layout, &p.init_params), &p.init_params);
+    let (_, warm) = runs(&ProfileWarm::from_solve(&layout, &first), &first.params);
+    assert!(cold > 0, "the cold start solve multi-starts it");
+    assert_eq!(warm, 0, "a start solve warm from its zero mode does not");
+}
+
 /// The profiled covariance step handed the fit's (η̂, κ̂) — what `fit()` and `run_covariance`
 /// both hand it — starts its re-profiling pass there. Every later re-solve warm-starts from a
 /// mode an earlier solve of the same subject returned, κ̂ included: the re-profiling solves
@@ -4265,16 +4298,6 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
             fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
         })
         .collect();
-    // `Aᵢ`'s FD at the step production gives a declined subject (`level_blocks`).
-    let a_step = profile_fd_hessian_step(&o);
-    let a_steps: Vec<f64> = cp
-        .free
-        .iter()
-        .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model, i);
-            fd_step(a_step, cp.x_hat[i], floor)
-        })
-        .collect();
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&cp.hold, &cp.x_hat).unwrap();
     let per: Vec<(f64, f64, f64, f64)> = (0..p.population.subjects.len())
         .into_par_iter()
@@ -4282,8 +4305,8 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
             assert!(!cp.solve.off_mode[i], "subject {i} is off its mode");
             let (fd_d, fd_b) =
                 c.subject_blocks_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &ts, &ls);
-            let fd_a =
-                c.subject_structural_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &a_steps);
+            // `Aᵢ`'s FD at the step production gives a declined subject (`level_blocks`).
+            let fd_a = c.subject_structural_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve);
             let (ad_a, ad_b, ad_d) = c
                 .subject_blocks_adjoint(i, &pt, &cp.free, &cp.solve)
                 .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
@@ -6391,4 +6414,80 @@ fn a_profiled_budget_is_spent_only_before_or_during_a_leg() {
             .is_some_and(|w| w.contains("spent its evaluation budget"));
         assert_eq!(advises, want, "{name}: warning");
     }
+}
+
+/// #2678: the profile's two finite-difference Hessians, the `A_p` stencil (off the exact route)
+/// and a declined subject's `Aᵢ`, step a small identity-packed θ by its `|θ₀|` floor. F2 with a
+/// Hill exponent `HH = 1 + G + c`, `G` declared at `1e-4` and shifted to F2's optimum
+/// `Ĝ = 1.1064`, so it is the objective with `G` on a floored step. Ungated, both steps
+/// failed as not positive definite (eigenvalues to −4.8e4 and −967); with `G` declared at 1
+/// both succeed. Gated, the #2406 twin re-solves the profile (the subject) at τ/100. Measured
+/// (macOS arm64): the stencil's var(G) 1.3e-4 from the exact route's, and the mixed step
+/// 6.7e-4 from the exact one on the correlation scale; with `G` declared at 1, 3.8e-4 and
+/// 6.6e-4. The stencil's G row, through the ungated `Bᵢ`: 8.4e-4 (declared at 1: 9.2e-4). Needs F2's twelve studies: on fewer, κ collapses and neither route is positive
+/// definite.
+#[test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
+fn the_profile_stencils_resolve_a_small_exponents_step() {
+    let (t0, g_hat) = (1e-4, 1.1063515493553668);
+    let edit = move |t: String| {
+        let t = t
+            .replace(
+                "  theta ET50(2.0, 0.01, 100.0)\n",
+                &format!("  theta ET50(2.0, 0.01, 100.0)\n  theta G({t0:e}, -5.0, 5.0)\n"),
+            )
+            .replace(
+                "  EMAXI = EMAX * exp(ETA_EM)\n",
+                &format!("  EMAXI = EMAX * exp(ETA_EM)\n  HH = 1 + G + {:e}\n", g_hat - t0),
+            )
+            .replace(
+                "DRUG = TRT * EMAXI * TIME / (TIME + ET50)",
+                "DRUG = TRT * EMAXI * TIME^HH / (TIME^HH + ET50^HH)",
+            );
+        assert!(t.contains("theta G(") && t.contains("TIME^HH"), "fixture moved");
+        t
+    };
+    let mut p = prep(F2, F2_DATA, None, edit);
+    p.init_params.theta[..4].copy_from_slice(&[
+        45.31187415643503,
+        4.944069717405715,
+        1.1824211136844773,
+        t0,
+    ]);
+    p.init_params.omega =
+        crate::types::OmegaMatrix::from_diagonal(&[0.07576247061936897], vec!["ETA_EM".into()]);
+    p.init_params.omega_iov = Some(crate::types::OmegaMatrix::from_diagonal(
+        &[1.0371184297143634],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let gk = p.parsed.model.theta_names.iter().position(|n| n == "G").unwrap();
+    let o = options(&p);
+    let exact = cov_step(&p, &o).0.matrix.expect("the exact route's matrix");
+    let off = FitOptions { analytic_cov_hessian: false, ..o.clone() };
+    let stencil = cov_step(&p, &off).0;
+    let stencil = stencil.matrix.unwrap_or_else(|| panic!("{:?}", stencil.warnings));
+    let rel = (stencil[(gk, gk)] - exact[(gk, gk)]).abs() / exact[(gk, gk)];
+    FORCE_PROFILE_COV_DECLINE.with(|c| c.set(Some(1)));
+    let declined = cov_step(&p, &o).0;
+    FORCE_PROFILE_COV_DECLINE.with(|c| c.set(None));
+    let mixed = declined.matrix.unwrap_or_else(|| panic!("{:?}", declined.warnings));
+    // Row `i` of `m` against the exact route's, on the correlation scale.
+    let row_gap = |m: &nalgebra::DMatrix<f64>, i: usize| {
+        (0..exact.ncols())
+            .filter(|&j| exact[(i, i)] > 0.0 && exact[(j, j)] > 0.0)
+            .map(|j| (m[(i, j)] - exact[(i, j)]).abs() / (exact[(i, i)] * exact[(j, j)]).sqrt())
+            .fold(0.0_f64, |a, g| {
+                assert!(g.is_finite());
+                a.max(g)
+            })
+    };
+    let gap = (0..exact.nrows()).map(|i| row_gap(&mixed, i)).fold(0.0, f64::max); // nan-ok: row_gap asserts each entry finite
+                                                                                  // G's covariances with the levels run through the ungated `Bᵢ` (#2992 review r1 row 5).
+    let g_row = row_gap(&stencil, gk);
+    eprintln!(
+        "MEASURE #2678 profile: stencil var(G) rel {rel:e}, G row {g_row:e}, mixed gap {gap:e}"
+    );
+    assert!(rel < 2e-3, "stencil var(G): rel {rel:e}");
+    assert!(g_row < 2e-3, "stencil G row: {g_row:e}");
+    assert!(gap < R2_MIXED_GAP, "mixed gap {gap:e}");
 }

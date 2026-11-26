@@ -1,0 +1,181 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "napx1081.csv",
+ "data_records": 122,
+ "observations": 122,
+ "individuals": 18,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation",
+   "objv": -205.933,
+   "objv_without_constant": -205.93272764720143,
+   "objv_with_constant": 18.288274454738712,
+   "function_evaluations": 344,
+   "significant_digits": 4.6,
+   "etabar": [
+    [3.7233e-07, 1.8935e-07]
+   ],
+   "etabar_se": [
+    [0.14512, 0.17355]
+   ],
+   "p_val": [
+    [1.0, 1.0]
+   ],
+   "etashrinksd": [
+    [1.3326, 1.4155]
+   ],
+   "etashrinkvr": [
+    [2.6475, 2.8109]
+   ],
+   "ebvshrinksd": [
+    [1.3323, 1.4154]
+   ],
+   "ebvshrinkvr": [
+    [2.6469, 2.8108]
+   ],
+   "relativeinf": [
+    [97.344, 97.18]
+   ],
+   "epsshrinksd": [
+    [12.213, 12.213, 11.918, 10.785, 21.246]
+   ],
+   "epsshrinkvr": [
+    [22.934, 22.934, 22.416, 20.407, 37.978]
+   ],
+   "final": {
+    "theta": [5.19, 1.13, 0.599, 0.975, 0.834, 0.819, -0.839, 0.597],
+    "omega": {
+     "ETA1": [0.389],
+     "ETA2": [0.0, 0.558]
+    },
+    "sigma": {
+     "EPS1": [1.0],
+     "EPS2": [0.0, 1.0],
+     "EPS3": [0.0, 0.0, 1.0],
+     "EPS4": [0.0, 0.0, 0.0, 1.0],
+     "EPS5": [0.0, 0.0, 0.0, 0.0, 1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.259, 0.314, 0.0881, 0.317, 0.379, 0.0657, 0.206, 0.0633],
+    "omega": {
+     "ETA1": [0.132],
+     "ETA2": [null, 0.191]
+    },
+    "sigma": {
+     "EPS1": [null],
+     "EPS2": [null, null],
+     "EPS3": [null, null, null],
+     "EPS4": [null, null, null, null],
+     "EPS5": [null, null, null, null, null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.067],
+    "TH 2": [0.0012, 0.0987],
+    "TH 3": [0.000228, 0.0035, 0.00777],
+    "TH 4": [-0.067, -0.00106, 3.15e-05, 0.1],
+    "TH 5": [-0.00106, -0.0962, 4.59e-05, 0.00137, 0.144],
+    "TH 6": [-2.62e-05, -0.00258, -0.00268, 1.69e-05, 0.000148, 0.00431],
+    "TH 7": [0.000157, -0.00402, -0.0103, 5.86e-05, 0.000101, 0.00893, 0.0424],
+    "TH 8": [-3.05e-05, -9.45e-05, -0.000571, 2.72e-05, -9.09e-06, 0.000162, 0.00184, 0.00401],
+    "OM11": [8.34e-05, 0.000156, 0.000179, -0.000278, -0.000126, -7.75e-06, 0.00012, 4e-05, 0.0175],
+    "OM12": [null, null, null, null, null, null, null, null, null, null],
+    "OM22": [9.05e-05, 0.000832, 0.00117, -3e-05, -7.56e-05, -4.78e-05, 0.000719, 0.000135, 0.000274, null, 0.0364],
+    "SG11": [null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG12": [null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG13": [null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG14": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG15": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG22": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG23": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG24": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG25": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG33": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG34": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG35": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG44": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG45": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG55": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1081 naproxen MBMA, within-arm residual correlation ar1 rho=0.3 EST",
+  "; Data: napx1081.csv (natural-scale DV = DV*WPSE; L2 = arm; VIS = visit index; T1..T5 arm visit times)",
+  "$INPUT ID ARM TIME DV TRT FLARE WPSE MDV L2 VIS T1 T2 T3 T4 T5",
+  "$DATA napx1081.csv IGNORE=@",
+  "$PRED",
+  "  E0   = THETA(1) + THETA(4)*FLARE + ETA(1)",
+  "  EMAX = THETA(2) + THETA(5)*FLARE + THETA(6)*TRT + ETA(2)",
+  "  ET50 = THETA(3)*EXP(THETA(7)*TRT)",
+  "  EFF  = EMAX*TIME/(TIME + ET50)",
+  "  F    = E0 - EFF",
+  "  RHO  = THETA(8)",
+  "",
+  "; discrete AR(1) on the visit index: L[j,k] = rho^(j-k) * s_k, s_1 = 1, s_k = sqrt(1-rho^2)",
+  "  SR = SQRT(1 - RHO*RHO)",
+  "  P1 = RHO",
+  "  P2 = RHO*RHO",
+  "  P3 = P2*RHO",
+  "  P4 = P3*RHO",
+  "  L1=0",
+  "  L2C=0",
+  "  L3=0",
+  "  L4=0",
+  "  L5=0",
+  "  IF (VIS.EQ.1) L1 = 1",
+  "  IF (VIS.EQ.2) THEN",
+  "    L1 = P1",
+  "    L2C = SR",
+  "  ENDIF",
+  "  IF (VIS.EQ.3) THEN",
+  "    L1 = P2",
+  "    L2C = P1*SR",
+  "    L3 = SR",
+  "  ENDIF",
+  "  IF (VIS.EQ.4) THEN",
+  "    L1 = P3",
+  "    L2C = P2*SR",
+  "    L3 = P1*SR",
+  "    L4 = SR",
+  "  ENDIF",
+  "  IF (VIS.EQ.5) THEN",
+  "    L1 = P4",
+  "    L2C = P3*SR",
+  "    L3 = P2*SR",
+  "    L4 = P1*SR",
+  "    L5 = SR",
+  "  ENDIF",
+  "",
+  "  RES = L1*EPS(1) + L2C*EPS(2) + L3*EPS(3) + L4*EPS(4) + L5*EPS(5)",
+  "  IPRED = F",
+  "  Y = F + WPSE*RES",
+  "$THETA",
+  "  5.1972",
+  "  1.158",
+  "  0.6901",
+  "  0.9629",
+  "  0.8197",
+  "  0.793",
+  "  -1.1747",
+  "  (-0.99, 0.3, 0.99)",
+  "$OMEGA 0.3862622500000001",
+  "$OMEGA 0.54567769",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 MAXEVAL=9999 SIGDIG=4 NOABORT PRINT=5",
+  "$COVARIANCE MATRIX=R UNCONDITIONAL",
+  "$TABLE ID ARM TIME DV IPRED L2 VIS ONEHEADER NOAPPEND NOPRINT FORMAT=s1PE23.16 FILE=ar1_est.tab"
+ ]
+}

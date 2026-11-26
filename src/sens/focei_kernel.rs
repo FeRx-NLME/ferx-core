@@ -27,7 +27,7 @@ use crate::sens::jet::DualT;
 #[cfg(test)]
 use crate::sens::num::NonRecording;
 use crate::sens::num::{wsum3, BranchCmp, PkNum};
-use crate::stats::residual_error::{LoadingForm, RBlocks, ResidualCov};
+use crate::stats::residual_error::{eval_fmag, slot_fmag, LoadingForm, RBlocks, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use std::borrow::Cow;
 
@@ -270,6 +270,55 @@ pub(crate) struct LikCtx<'a> {
 /// The most σ loadings one row has: the residual-error owner's bound.
 const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 
+/// A row's σ loadings at prediction `f`, as generic values: a constant slot's
+/// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
+/// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
+/// each times a prediction-reading magnitude `h(f)` when the row's tail carries one
+/// (#3121) and the custom magnitude multiplier `mult` (the row from
+/// `RuvMagnitude::eval_subject_obs_g`; `None` reads as all ones). The same
+/// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
+/// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
+/// in a fixed buffer with its length (no allocation per row).
+///
+/// A free function so the likelihood kernel and the SDE recorder's Kalman `R`
+/// (`ode_adjoint::record_sde_p`, #3126) share one definition of the row. `n_shape` sizes the
+/// loading shape (the model's σ count), `n_sigma` the exponent half of `mult`.
+pub(crate) fn row_loadings_g<T: PkNum>(
+    spec: &crate::types::ErrorSpec, key: usize, n_shape: usize, n_sigma: usize, f: T,
+    mult: Option<&[T]>,
+) -> ([(usize, T); MAX_LOADINGS], usize) {
+    let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
+    let shape = spec.loading_shape(key, n_shape);
+    let len = shape.len();
+    for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
+        let c = if form == LoadingForm::Prop {
+            // `slot_exponent`: the exponent half of the row, when present.
+            match mult.filter(|m| m.len() >= 2 * n_sigma).map(|m| m[n_sigma + idx]) {
+                Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
+                    if f.br_cmp_c(BranchCmp::Eq, 0.0) {
+                        T::from_f64(0.0)
+                    } else {
+                        let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
+                        T::from_f64(sign) * f.abs().pow(pw)
+                    }
+                }
+                _ => form.coeff_g(f),
+            }
+        } else {
+            form.coeff_g(f)
+        };
+        let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
+        // A prediction-reading magnitude `h(f)` (#3121), in `T`: its `f`-, θ- and
+        // η-derivatives come from the types, as every other loading's do.
+        let c = match mult.and_then(|m| slot_fmag(m, n_sigma, idx)) {
+            Some(prog) => eval_fmag(prog, |a| a, f) * c,
+            None => c,
+        };
+        *o = (idx, m * c);
+    }
+    (out, len)
+}
+
 impl<'a> LikCtx<'a> {
     pub(crate) fn new(
         model: &'a CompiledModel, subject: &'a Subject, params: &'a ModelParameters,
@@ -339,43 +388,19 @@ impl<'a> LikCtx<'a> {
         self.model.bloq_in_force().is_censored_row(c).then_some(c)
     }
 
-    /// Row `j`'s σ loadings at prediction `f`, as generic values: a constant slot's
-    /// `1`, a proportional slot's `f` — raised to `sign(f)·|f|^p` under a
-    /// `power(...)` exponent — and a `LogCombined` additive slot's `exp(−f)` (#2729),
-    /// each times the custom magnitude multiplier. The same
-    /// loadings as `ErrorSpec::scaled_loadings`, built in `T` arithmetic so every order
-    /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
-    /// in a fixed buffer with its length (no allocation per row).
+    /// Row `j`'s σ loadings at prediction `f` ([`row_loadings_g`] on this subject's key and
+    /// magnitude row).
     fn loadings<T: PkNum>(
         &self, j: usize, f: T, p: &ParT<T>,
     ) -> ([(usize, T); MAX_LOADINGS], usize) {
-        let n_sigma = p.sigma.len();
-        let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
-        let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let shape =
-            self.model.error_spec.loading_shape(self.keys[j], self.params.sigma.values.len());
-        let len = shape.len();
-        for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
-            let c = if form == LoadingForm::Prop {
-                // `slot_exponent`: the exponent half of the row, when present.
-                match mult.filter(|m| m.len() == 2 * n_sigma).map(|m| m[n_sigma + idx]) {
-                    Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
-                        if f.br_cmp_c(BranchCmp::Eq, 0.0) {
-                            T::from_f64(0.0)
-                        } else {
-                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
-                            T::from_f64(sign) * f.abs().pow(pw)
-                        }
-                    }
-                    _ => form.coeff_g(f),
-                }
-            } else {
-                form.coeff_g(f)
-            };
-            let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
-            *o = (idx, m * c);
-        }
-        (out, len)
+        row_loadings_g(
+            &self.model.error_spec,
+            self.keys[j],
+            self.params.sigma.values.len(),
+            p.sigma.len(),
+            f,
+            p.ruv_mult.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice),
+        )
     }
 
     /// `V` of row `j` at `f`: the loadings variance, unscaled.
@@ -646,7 +671,7 @@ pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
 }
 
 /// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
-/// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
+/// form the structured FOCE kernel is (#2980): otherwise it rotates the rows into `I + S` (#2988).
 pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {
     1.0 + tr_s <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
 }
@@ -871,7 +896,7 @@ fn assemble_grad<T: PkNum>(
 /// A diagonal `R⁰` takes Woodbury's form, `rᵀR̃⁻¹r = rᵀR⁻¹r − bᵀA⁻¹b` and
 /// `log|R̃| = log|R| + log|Ω| + log|A|` with `A = Ω⁻¹ + GᵀR⁻¹G`, `b = GᵀR⁻¹r`: `N × N`
 /// work per subject instead of the `n × n` factorisation. A covariance coupling rows
-/// factors `R̃` directly.
+/// factors `R̃` directly; past the #1498 gate the rows are rotated into `I + S` (#2988).
 pub(crate) fn foce_f<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], fpop: Option<&[T]>, p: &ParT<T>,
 ) -> Option<T> {
@@ -936,10 +961,12 @@ pub(crate) fn foce_f<T: PkNum>(
     let res: Vec<T> = quant.iter().map(|&j| c(ctx.subject.observations[j]) - f0[j]).collect();
     let nq = quant.len();
     // Woodbury on a diagonal `R⁰` is a subtractive identity, accurate to `≈ eps·(1 + tr S)`
-    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is on the variance
-    // floor while its `G` is O(1) (FOCE's `R⁰` is taken at η = 0, `G` at η̂) drives
-    // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
-    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, `R̃` is factored at observation size.
+    // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is tiny next to its
+    // `G` (a near-zero typical prediction under proportional error, with `G` O(1): FOCE's `R⁰`
+    // is taken at η = 0, `G` at η̂) drives `1 + tr S` to ~1e11 and the correction loses every
+    // digit (#1498): above
+    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, the rows are rotated into
+    // `I + S` instead. A dense `R⁰` factors `R̃` at observation size.
     let woodbury = rm.is_none() && {
         let tr = quant.iter().fold(c(0.0), |acc, &j| {
             let s = (0..nn).fold(c(0.0), |a, k| a + lg[j][k] * lg[j][k]);
@@ -947,7 +974,7 @@ pub(crate) fn foce_f<T: PkNum>(
         });
         (one + tr).br_cmp_c(BranchCmp::Le, WOODBURY_MAX_INFO_TRACE) || woodbury_forced()
     };
-    if !woodbury {
+    if rm.is_some() {
         // R̃ = R⁰_q + (LᵀG)ᵀ(LᵀG), FREM rows decoupled (`apply_frem_r_matrix_overrides`).
         let rt: Vec<Vec<T>> = (0..nq)
             .map(|a| {
@@ -971,6 +998,38 @@ pub(crate) fn foce_f<T: PkNum>(
         let quad = wsum3(0.0, (0..nq).map(|i| (one, res[i], z[i])));
         return Some(c(0.5) * (quad + chol_logdet(&l) + bloq));
     }
+    let mut log_r = c(0.0);
+    for &j in &quant {
+        log_r = log_r + rdiag[j].ln();
+    }
+    if !woodbury {
+        // `min_w ‖w‖² + ‖D^-½(res − GL·w)‖²` (the same quadratic form) by Givens rotations of
+        // each row into the triangular factor `R` of `I + S`, started at `I`: no subtraction of
+        // large terms, every pivot ≥ 1, and `O(nq·nn²)` work where an `nq × nq` `R̃` costs a
+        // compiled plan `O(nq³)` instructions (#2988).
+        let mut r: Vec<Vec<T>> =
+            (0..nn).map(|k| (0..nn).map(|l| c(if k == l { 1.0 } else { 0.0 })).collect()).collect();
+        let mut z = vec![c(0.0); nn];
+        let mut quad = c(0.0);
+        for (i, &j) in quant.iter().enumerate() {
+            let w = one / rdiag[j].sqrt();
+            let mut v: Vec<T> = lg[j].iter().map(|&x| x * w).collect();
+            let mut t = res[i] * w;
+            for k in 0..nn {
+                let h = (r[k][k] * r[k][k] + v[k] * v[k]).sqrt();
+                let (cs, sn) = (r[k][k] / h, v[k] / h);
+                r[k][k] = h;
+                for l in k + 1..nn {
+                    (r[k][l], v[l]) = (cs * r[k][l] + sn * v[l], cs * v[l] - sn * r[k][l]);
+                }
+                (z[k], t) = (cs * z[k] + sn * t, cs * t - sn * z[k]);
+            }
+            quad = quad + t * t;
+        }
+        let ld = (0..nn).fold(c(0.0), |a, k| a + c(2.0) * r[k][k].ln());
+        // A non-finite `S` declines, as the dense factor it replaces did.
+        return positive_finite(one + quad + ld).then(|| c(0.5) * (quad + log_r + ld + bloq));
+    }
     // Woodbury / determinant lemma on the diagonal R⁰, Ω-normalised: with `B = D⁻¹GL`,
     // `R̃⁻¹ = D⁻¹ − B(I + S)⁻¹Bᵀ` and `|R̃| = |D|·|I + S|`. Factoring `I + S` rather than
     // `Ω⁻¹ + GᵀD⁻¹G` keeps `cond(Ω)` (a near-rail `block_omega`) out of the subtraction,
@@ -993,10 +1052,6 @@ pub(crate) fn foce_f<T: PkNum>(
     let ab = chol_solve(&la, &b);
     let quad = wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
         - wsum3(0.0, (0..nn).map(|k| (one, b[k], ab[k])));
-    let mut log_r = c(0.0);
-    for &j in &quant {
-        log_r = log_r + rdiag[j].ln();
-    }
     Some(c(0.5) * (quad + log_r + chol_logdet(&la) + bloq))
 }
 
@@ -1178,16 +1233,16 @@ pub(crate) fn data_l<T: PkNum>(
 }
 
 /// A 1-D second-order dual: value, first and second derivative along one direction.
-type D2<T> = DualT<1, DualT<1, T>>;
+pub(crate) type D2<T> = DualT<1, DualT<1, T>>;
 
 /// `x` as a [`D2`] constant.
-fn d2_const<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_const<T: PkNum>(x: T) -> D2<T> {
     let zero = T::from_f64(0.0);
     DualT { v: DualT { v: x, g: [zero] }, g: [DualT { v: zero, g: [zero] }] }
 }
 
 /// `x` as the [`D2`] variable: unit first derivative, zero second.
-fn d2_seed<T: PkNum>(x: T) -> D2<T> {
+pub(crate) fn d2_seed<T: PkNum>(x: T) -> D2<T> {
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
     DualT { v: DualT { v: x, g: [one] }, g: [DualT { v: one, g: [zero] }] }
 }

@@ -626,7 +626,7 @@ exit 0
 ///    of the repo — every `#[cfg(test)]` module, every sibling `*_tests.rs`, all of
 ///    `tests/` — unlinted. That gap hid 6 `approx_constant` ERRORS (#1023).
 ///  * dropping `--all` from `cargo fmt` formats only the root package, silently skipping
-///    `crates/ferx-tools` and `crates/ferx-cli` (#1114).
+///    the workspace members under `crates/` (#1114).
 ///  * dropping `-Dunused` from a clippy line leaves it linting and exiting 0 over every
 ///    finding it prints, because only clippy's `correctness` group is deny-by-default
 ///    (#1470). Measured: `origin/main` at bd6785b printed an `unused import` from
@@ -845,13 +845,20 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
              `--list` prints a command that behaves differently when pasted:\n  {cmd}"
         );
     }
-    assert!(
-        docs.iter().any(|c| c.contains("-p ferx-tools")),
-        "no docs command covers the workspace members, so `ferx-tools` and `ferx-cli` \
-         doc comments are gated by nothing — a root `cargo doc` documents only the root \
-         package (#1114).\n  {}",
-        docs.join("\n  ")
-    );
+    // Per member AND per group: the members ride on one line each in `check`, `clippy`
+    // and `rustdoc`, so dropping one `-p` leaves every command count unchanged while that
+    // crate is gated by nothing (#1114, #3185).
+    for group in ["check", "clippy", "rustdoc"] {
+        let cmds = listed_commands(group);
+        for member in ["ferx-tools", "ferx-search", "ferx-cli"] {
+            assert!(
+                cmds.iter().any(|c| c.contains(&format!("-p {member} "))),
+                "no `{group}` command selects `{member}`: a root-package command covers only \
+                 `ferx-core`, so that member is gated by nothing.\n  {}",
+                cmds.join("\n  ")
+            );
+        }
+    }
 
     // The `debug-assertions` group is a gate only while the profile it names
     // actually has the guards on. Before #1248 that was expressed as a BAN on
