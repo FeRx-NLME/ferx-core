@@ -25,7 +25,7 @@
 //!   tests/nonmem/warfarin_bloq.csv   (copy of data/warfarin_bloq.csv; DV on
 //!                                     CENS=1 rows carries the LLOQ)
 //!
-//! NONMEM 7.5.1 (MINIMIZATION SUCCESSFUL, `tests/nonmem/warfarin_bloq.lst`)
+//! NONMEM 7.5.1 (MINIMIZATION SUCCESSFUL, `tests/nonmem/warfarin_bloq.nm.json`)
 //! reaches TVCL 0.132801 / TVV 7.73139 / TVKA 0.809824 / PROP(SD) 0.010760 /
 //! ω 0.028849 / 0.009544 / 0.335772, which ferx matches to ~4 significant figures:
 //!
@@ -132,7 +132,7 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
         .expect("analytic M3 fit must succeed");
     assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 
-    // NONMEM 7.5.1 LAPLACE M3 MLE (tests/nonmem/warfarin_bloq.lst). The OFV is not
+    // NONMEM 7.5.1 LAPLACE M3 MLE (tests/nonmem/warfarin_bloq.nm.json). The OFV is not
     // compared (F_FLAG likelihood constant offset); the estimates are pinned.
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
     const NM_TVCL: f64 = 0.132801;
@@ -158,7 +158,7 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
 /// is the F_FLAG mixed likelihood, which *requires* the LAPLACE objective (`$EST METHOD=1
 /// LAPLACE`); NONMEM has no genuine first-order, non-interaction "FOCE M3" method to
 /// compare against. NONMEM's LAPLACE-M3 corresponds to ferx's **FOCEI**-M3, which is what
-/// `bloq_m3_analytic_lbfgs_matches_nonmem` cross-checks against `warfarin_bloq.lst`.
+/// `bloq_m3_analytic_lbfgs_matches_nonmem` cross-checks against `warfarin_bloq.nm.json`.
 ///
 /// ferx additionally offers a Sheiner–Beal **FOCE**-M3 (no interaction): the censored
 /// rows enter the marginal as `−logΦ((LLOQ−f̂)/√R⁰)` (excluded from R̃, the population

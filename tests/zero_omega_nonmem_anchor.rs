@@ -2,7 +2,7 @@
 //!
 //! # The reference run
 //!
-//! `nonmem_anchor/results/zero_omega_pooled.{ctl,lst,ext}`, NONMEM 7.6.0,
+//! `nonmem_anchor/results/zero_omega_pooled.{ctl,nm.json,ext}`, NONMEM 7.6.0,
 //! `examples/one_cpt_iv_pooled.ferx` transcribed to ADVAN1 TRANS2 against the
 //! repo's own `data/one_cpt_iv.csv`:
 //!

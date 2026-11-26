@@ -63,9 +63,10 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 ///
 /// Each subject is classified on the engine that serves it at the fitted `(θ, η̂)`
 /// ([`pk::effective_model_for_eval`], the same call `compute_predictions_with_states`
-/// makes), so a closed-form transit/IG subject rerouted to its ODE twin is reported as
-/// ODE, not as NaN. IOV subjects (non-empty κ) are skipped: their states are empty for
-/// a different reason, `W_DERIVED_CMT_IOV_UNSUPPORTED`.
+/// makes). A closed-form transit/IG subject rerouted to its ODE twin has no states in the
+/// closed form's layout and gets `W_DERIVED_CMT_TWIN_ANALYTICAL` instead (#1580). IOV
+/// subjects (non-empty κ) are skipped: their states are empty for a different reason,
+/// `W_DERIVED_CMT_IOV_UNSUPPORTED`.
 ///
 /// | engine | TV covariate or `TIME`-reading individual params | states | warning |
 /// |---|---|---|---|
@@ -73,6 +74,7 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 /// | analytical | either or both | empty → NaN | `_TV_ANALYTICAL` |
 /// | ODE | neither (a reset, or an `[odes]` RHS reading time, keeps one snapshot) | exact | — |
 /// | ODE | either or both | disposition frozen at the first observation | `_TV_ODE` |
+/// | ODE twin of a closed-form transit/IG | any | empty → NaN | `_TWIN_ANALYTICAL` |
 ///
 /// The analytical row's `TIME` column asks [`pk::model_uses_time_anywhere`], the
 /// predicate its state routing asks; the ODE row's asks
@@ -86,12 +88,17 @@ pub(crate) fn derived_cmt_time_varying_warnings(
     // (any subject with a TV covariate, any subject on a TIME-reading model), per engine.
     let mut analytical = (false, false);
     let mut ode = (false, false);
+    let mut twin = false;
     for (i, subject) in population.subjects.iter().enumerate() {
         if kappas.get(i).is_some_and(|k| !k.is_empty()) {
             continue;
         }
         let eta = eta_hats.get(i).map_or(&[][..], |e| e.as_slice());
         let m = pk::effective_model_for_eval(model, subject, theta, eta);
+        if model.ode_spec.is_none() && m.ode_spec.is_some() {
+            twin = true;
+            continue;
+        }
         let (slot, tv_cov, time) = if m.ode_spec.is_some() {
             if !pk::ode_cmt_states_approximate(m, subject) {
                 continue;
@@ -130,6 +137,16 @@ pub(crate) fn derived_cmt_time_varying_warnings(
              compartments[i] results with care for those subjects.",
             cause(ode)
         ));
+    }
+    if twin {
+        out.push(
+            "W_DERIVED_CMT_TWIN_ANALYTICAL: closed-form transit/IG model with subjects its \
+             ODE equivalent serves (for example a steady-state or infusion dose, a \
+             TIME-reading parameter, or the flip-flop regime) — compartment states are \
+             not available for those subjects; [derived] expressions that reference \
+             compartments[i] evaluate to NaN for them."
+                .to_string(),
+        );
     }
     out
 }
@@ -1096,10 +1113,9 @@ fn fit_unstamped(
     // base `omega_iov`, and the outer gradient is the exact one at every class's modes
     // (`mixture_gradient_salvaged`).
     first_error(&crate::api::validation::check_mixture_options(model, options, init_params))?;
-    // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
-    // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    // The run's SS non-convergence notes are its search's and leave with this scope; the fit
+    // reports those of its pass at the estimates (`ss_notes_at_estimates`, #1522).
     let _ss_run = crate::dosing::run_scope();
-    crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     // `E_TRANSIT_UNSUPPORTED` / `E_IG_UNSUPPORTED`, as `ferx check` and `predict` (#1772).
@@ -1235,12 +1251,6 @@ fn fit_unstamped(
         let res = install_on_fit_pool(options, run)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
-            // Surface any SS-equilibration non-convergence seen during this (default, single-start)
-            // fit's prediction passes (#867). This is the common path — `n_starts` defaults to 1 —
-            // so it must drain the sink too, not just the multi-start arm below.
-            for w in crate::dosing::take_ss_nonconvergence_warnings() {
-                result.warnings.push(w);
-            }
             rebuild_warnings_structured(&mut result);
             result
         });
@@ -1327,13 +1337,6 @@ fn fit_unstamped(
             // answer the user ran multi-start for, so it is said when start 0 wins too.
             result.warnings.push(StartSpread::of(&starts).line());
             result.starts = starts;
-            // Surface any SS-equilibration non-convergence seen during this fit's prediction passes
-            // (#867). The capped nonlinear pulse-train can silently under-report the SS trough and
-            // bias estimates low; the sink deduplicated it across every objective evaluation and
-            // multi-start replicate to a single message.
-            for w in crate::dosing::take_ss_nonconvergence_warnings() {
-                result.warnings.push(w);
-            }
             rebuild_warnings_structured(&mut result);
             Ok(result)
         }
@@ -2962,18 +2965,22 @@ fn fit_inner(
         .as_ref()
         .filter(|_| mixest_classes.is_none())
         .and_then(|o| Some((o.agq_nodes()?, o.hessian_anchor())));
-    let (mut subjects, ode_solver_stats) = compute_subject_results(
-        model,
-        population,
-        &result.params,
-        &result.eta_hats,
-        &result.h_matrices,
-        &result.kappas,
-        options.interaction,
-        mixest_classes.as_deref(),
-        agq_term,
-        ode_model,
-    );
+    // The SS non-convergence notes this fit reports are this pass's, at its estimates (#1522).
+    let ((mut subjects, ode_solver_stats), ss_notes) = crate::dosing::ss_notes_at_estimates(|| {
+        compute_subject_results(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options.interaction,
+            mixest_classes.as_deref(),
+            agq_term,
+            ode_model,
+        )
+    });
+    result.warnings.extend(ss_notes);
     // No second, sensitivity sweep here (#3076). One used to run the analytic η-Hessian per
     // subject at the estimates, for the one counter an `f64` pass cannot set,
     // `auto_stiff_rejected_jets` — but the derivative solves are compiled plans whose ODE loops

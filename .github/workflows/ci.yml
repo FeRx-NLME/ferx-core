@@ -319,8 +319,8 @@ jobs:
       - name: cargo doc (ferx-core + members, via tools/preflight.sh)
         run: tools/preflight.sh rustdoc
 
-  # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
-  # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
+  # A2 of #1114 — the enforcement that keeps the ferx-core/member boundary
+  # from becoming paperwork. The members can only touch `pub` items, so the way
   # the boundary rots is `ferx-core` growing an ad-hoc `pub` in the same PR that
   # needs it. Diffing a committed surface snapshot turns every widening into one
   # explicit reviewable line. Doubles as semver protection for the crates.io

@@ -336,8 +336,7 @@ fn strata_come_from_the_dataset_not_the_model_covariates() {
 
 #[test]
 fn a_stratification_column_that_varies_within_a_subject_is_refused() {
-    // PsN: "the algorithm requires that an individual can unambiguously be
-    // categorized according to the stratification variable".
+    // A subject with two stratum labels has no stratum to be resampled from.
     let csv = write_csv("ID,DV,STUD\n1,5,1001\n1,6,1002\n2,7,1002\n");
     let pop = population(&["1", "2"]);
     let err = strata_from_csv(csv.path().to_str().unwrap(), &[], &pop, "STUD").unwrap_err();
@@ -545,9 +544,9 @@ fn stored_run(dir: &std::path::Path) {
 
 #[test]
 fn resummarize_reapplies_the_filters_without_refitting() {
-    // The PsN recovery case "if too many samples are filtered out": the
-    // estimates and their diagnostics are already on disk, so relaxing a filter
-    // is a re-read, not a re-run.
+    // The filters excluded more replicates than intended: the estimates and
+    // their diagnostics are already on disk, so relaxing a filter is a re-read,
+    // not a re-run.
     let dir = tempfile::tempdir().expect("temp dir");
     stored_run(dir.path());
 

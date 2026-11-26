@@ -599,10 +599,12 @@ cache warm. `rust-toolchain.toml` still pins nightly as the default, and `Check`
 ### 8.7 The public-API gate
 
 The repo is a cargo workspace: the root package is the `ferx-core` **library**,
-with `crates/ferx-tools` (multi-fit tooling — bootstrap, covariate search,
-cross-validation) and `crates/ferx-cli` (the `ferx` binary) stacked on top. The
+with `crates/ferx-tools` (multi-fit tooling — bootstrap, GAM screening),
+`crates/ferx-search` (model-space search) and `crates/ferx-cli` (the `ferx`
+binary) stacked on top. The
 boundary rule is *`ferx-core` = one model, one dataset, one fit; `ferx-tools` =
-many fits*. Statistical kernels stay in core; orchestration of repeated fits does
+many fits of a given model; `ferx-search` = many fits over a space of models*, and
+the dependency runs `ferx-search` → `ferx-tools` → `ferx-core` only. Statistical kernels stay in core; orchestration of repeated fits does
 not.
 
 Members can only reach `ferx-core` through its `pub` API, so the way that
@@ -619,7 +621,7 @@ tools/update-public-api.sh --check  # what CI runs
 
 `#[doc(hidden)]` is banned outright (`tests/public_api_boundary.rs`): `cargo
 public-api` omits such items, so the attribute is a working bypass of this gate,
-not a style question. And anything `ferx-tools` needs must also be reachable from
+not a style question. And anything a member needs must also be reachable from
 ferx-r, which consumes `ferx-core` as an ordinary external crate — an API that
 only makes sense "because we're in the same workspace" is the wrong API.
 
@@ -696,6 +698,9 @@ Trunk-based, so a release is a **tag on `main`**:
    ```
 
    Cargo publishes `ferx-core` → `ferx-tools` → `ferx-cli` in dependency order.
+   `ferx-search` is `publish = false` until its license is settled (#3183). Until
+   then `ferx-cli`, which depends on it, cannot be published either: add
+   `--exclude ferx-cli --exclude ferx-search` to the command above.
    A published version can be yanked but never replaced, so check the dry-run's
    file list (`cargo package -p <crate> --list`) first.
 
@@ -720,8 +725,8 @@ form. User-facing breaking changes also carry **migration notes** (PR template).
 
 **Distribution.** Releases are **GitHub releases** built by `release.yml` on
 each `vX.Y.Z` tag. Since `0.4.0`, `ferx-core`, `ferx-tools` and `ferx-cli` are
-also published to **crates.io** (step 5 above); `docs-lint` is `publish =
-false`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
+also published to **crates.io** (step 5 above); `docs-lint` and, until #3183,
+`ferx-search` are `publish = false`, which also holds back `ferx-cli`. ferx-r is installed from source / GitHub (`R CMD INSTALL`, e.g.
 `remotes::install_github`). If we later publish to a CRAN-style channel, add
 that step here.
 

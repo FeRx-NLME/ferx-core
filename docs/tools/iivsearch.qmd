@@ -226,7 +226,7 @@ reference-model ranking and the final comparison with the input are Pharmpy
 
 ### The anchor
 
-`crates/ferx-tools/tests/pharmpy/iivsearch_anchor/` holds a 40-subject oral
+`crates/ferx-search/tests/pharmpy/iivsearch_anchor/` holds a 40-subject oral
 dataset simulated with IIV on CL and V only, correlated (r = 0.6), and none
 on KA; a diagonal three-η input model; and Pharmpy 2.2.0's runs on it
 through NONMEM 7.5.1 (`pharmpy_iivsearch.json`) for all three algorithms.
@@ -272,18 +272,18 @@ core (#1177); the trajectory above re-asserts it end to end.
 ## From Rust
 
 ```rust
-use ferx_tools::iivsearch::{run_iivsearch, IivsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::iivsearch::{run_iivsearch, IivsearchRun};
+use ferx_search::search::SearchConfig;
 
 let config = SearchConfig::load("warfarin.ferxsearch")?;
 let base = config.load_base()?;
 let result = run_iivsearch(&config, &base, IivsearchRun::default())?;
-println!("{}", ferx_tools::iivsearch::render_summary(&result));
+println!("{}", ferx_search::iivsearch::render_summary(&result));
 println!("final: {}", result.final_structure.description());
 ```
 
 `IivsearchRun` takes the directory, a thread override, a cancel flag and a
-progress callback; every field is optional. Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512). The structure reader behind
+progress callback; every field is optional. Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_search::search::CandidateFinished`, #2512). The structure reader behind
 the tool, `ferx_core::edit::VariabilityText::read`, is public too: it
 reports which parameter carries which η and κ, how they are blocked, and
 whether each line is in the canonical form.

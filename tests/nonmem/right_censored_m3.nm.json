@@ -1,0 +1,37 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "right_censored_m3.csv",
+ "data_records": 2,
+ "observations": 2,
+ "individuals": 2,
+ "nmtran_warnings": [1, 13],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order (Evaluation)",
+   "objv": 0.691,
+   "final": {
+    "theta": [12.0],
+    "omega": {
+     "ETA1": [0.01]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Right-censored M3 upper-tail anchor for ferx-core issue #297",
+  "$DATA right_censored_m3.csv IGNORE=@",
+  "$INPUT ID DV CENS",
+  "$PRED",
+  "  ; Right-censored observation above ULOQ:",
+  "  ; F = 12, ULOQ = DV = 10, W = 2, so z = (F - ULOQ) / W = 1.",
+  "  F_FLAG = 1",
+  "  F = THETA(1) + ETA(1)*0",
+  "  W = 2",
+  "  Y = PHI((F - DV) / W)",
+  "$THETA 12 FIX",
+  "$OMEGA 0.01 FIX",
+  "$ESTIMATION METHOD=0 MAXEVAL=0 PRINT=0 NOABORT"
+ ]
+}

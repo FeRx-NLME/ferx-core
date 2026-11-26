@@ -241,7 +241,7 @@ pub(crate) struct ImpliedDose {
     pub(crate) gov_time: f64,
 }
 
-/// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
+/// The derived rendering minus `evid4` and `implied`: ferx-search's journal hashes
 /// `{doses:?}` into its data fingerprint, and printing either would move every such digest
 /// and refuse every resume. `evid4` labels a record for a warning without changing what
 /// any fit sees. `implied` is derived from the same file, so it names no change of data.
@@ -1806,8 +1806,7 @@ impl Subject {
     /// decides whether a non-`SS` dose at exactly the observation's time is
     /// the most recent dose (`true`, NONMEM record order) or is skipped so the
     /// observation reads from the dose before it (`false`, Pharmpy's
-    /// `get_doseid`). An `SS` dose at the observation's time counts under both
-    /// (Pharmpy: "no swap for SS dosing").
+    /// `get_doseid`). An `SS` dose at the observation's time counts under both.
     fn data_tad_at(&self, obs_t: f64, same_time_counts: bool) -> f64 {
         let last_eff = self
             .doses
@@ -2367,7 +2366,7 @@ pub struct CovariateRelation {
 
 impl CovariateRelation {
     /// Whether this relation still needs data-derived statistics before it can
-    /// be desugared — a symbolic `center`/`ref`, or a form whose PsN default
+    /// be desugared — a symbolic `center`/`ref`, or a form whose default
     /// bounds are functions of the covariate's median/min/max.
     ///
     /// An unresolved relation is **not** desugared into the expression, and
@@ -9637,12 +9636,15 @@ pub struct FitOptions {
     /// [`inner_restarts`](Self::inner_restarts) gates, before its per-coordinate scan, so it
     /// runs only on the same cold solves and `inner_restarts = 0` disables it too. Each
     /// subject scores `inner_screen` Sobol points drawn from `N(0, 4Ω)` on its individual
-    /// objective, descends from the 3 lowest, and keeps a result only when it is lower
+    /// objective, descends from up to 3 of its 32 lowest, lowest first, each more than 0.5 from
+    /// those before it in the Ω⁻¹ metric (#2863), and keeps a result only when it is lower
     /// than the mode it already has and more than 0.5 from it in the Ω⁻¹ metric. A per-
     /// coordinate scan cannot reach a mode that is off every axis — the flip-flop twin of
     /// a one-compartment oral subject, where `CL`, `V` and `KA` move together — and this
     /// can. The stream is keyed by the subject's ID, so a subject screens the same points
-    /// whatever the thread count or its position in the data. The IOV inner solve has no
+    /// whatever the thread count or its position in the data. A larger screen is not
+    /// guaranteed to reach a mode a smaller one does: on the #2863 repro, 2000 points
+    /// reach the lower mode that 400 do, but 4000 do not. The IOV inner solve has no
     /// multi-start and runs no screen.
     pub inner_screen: usize,
     /// Seed the inner multi-start with the subject's flip-flop twin (`[fit_options]

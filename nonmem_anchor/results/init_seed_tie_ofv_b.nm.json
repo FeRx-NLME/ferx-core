@@ -1,0 +1,52 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "init_seed_tie_ofv_b.csv",
+ "data_records": 100,
+ "observations": 80,
+ "individuals": 20,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction (Evaluation)",
+   "objv": 222.41,
+   "final": {
+    "theta": [5.0, 50.0, 10.0],
+    "omega": {
+     "ETA1": [0.09]
+    },
+    "sigma": {
+     "EPS1": [0.01]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #2121 init_seed_tie_ofv_b OFV arm b -- ETA in A_0 at an EVID=2/obs tie",
+  "$INPUT ID TIME DV MDV EVID AMT CMT WT",
+  "$DATA init_seed_tie_ofv_b.csv IGNORE=@",
+  "$SUBROUTINE ADVAN13 TOL=9",
+  "$MODEL",
+  "  COMP=(CENTRAL, DEFDOSE)",
+  "$PK",
+  "  CL   = THETA(1)",
+  "  V    = THETA(2)",
+  "  K    = CL/V",
+  "  BASE = THETA(3)*WT*EXP(ETA(1))",
+  "  A_0(1) = BASE",
+  "$DES",
+  "  DADT(1) = -K*A(1)",
+  "$ERROR",
+  "  IPRED = A(1)/V",
+  "  Y = IPRED*(1+EPS(1))",
+  "$THETA",
+  "  (5.0 FIX)",
+  "  (50.0 FIX)",
+  "  (10.0 FIX)",
+  "$OMEGA 0.09",
+  "$SIGMA 0.01",
+  "$ESTIMATION MAXEVAL=0 METHOD=1 INTER POSTHOC",
+  "$TABLE ID TIME EVID WT IPRED ETA1 NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=init_seed_tie_ofv_b.tab"
+ ]
+}

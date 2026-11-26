@@ -1,0 +1,84 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "moving_infusion_end.csv",
+ "data_records": 1680,
+ "observations": 1440,
+ "individuals": 60,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction",
+   "objv": -2192.685,
+   "objv_without_constant": -2192.684569845471,
+   "objv_with_constant": 453.85840578398665,
+   "function_evaluations": 1294,
+   "etabar": [
+    [0.0059922, 0.014596, 0.058191]
+   ],
+   "etabar_se": [
+    [0.037755, 0.02693, 0.039643]
+   ],
+   "p_val": [
+    [0.87389, 0.58781, 0.14214]
+   ],
+   "etashrinksd": [
+    [6.5178, 29.244, 1.0347]
+   ],
+   "etashrinkvr": [
+    [12.611, 49.936, 2.0587]
+   ],
+   "ebvshrinksd": [
+    [0.32847, 1.246, 2.5736]
+   ],
+   "ebvshrinkvr": [
+    [0.65586, 2.4766, 5.081]
+   ],
+   "relativeinf": [
+    [99.344, 97.507, 94.903]
+   ],
+   "epsshrinksd": [
+    [6.2215]
+   ],
+   "epsshrinkvr": [
+    [12.056]
+   ],
+   "final": {
+    "theta": [3.99, 28.4, 1.89],
+    "omega": {
+     "ETA1": [0.0979],
+     "ETA2": [0.0, 0.0873],
+     "ETA3": [0.0, 0.0, 0.0997]
+    },
+    "sigma": {
+     "EPS1": [0.0101]
+    }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM moving infusion end: RATE=-2 with IIV on D1, multi-dose (#3010)",
+  "$INPUT ID TIME AMT RATE DV MDV EVID CMT",
+  "$DATA moving_infusion_end.csv IGNORE=@",
+  "$SUBROUTINE ADVAN1 TRANS2",
+  "$PK",
+  "  CL = THETA(1) * EXP(ETA(1))",
+  "  V  = THETA(2) * EXP(ETA(2))",
+  "  D1 = THETA(3) * EXP(ETA(3))",
+  "  S1 = V",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED * (1 + EPS(1))",
+  "$THETA (0.1, 3, 100) (1, 25, 500) (0.1, 1.5, 24)",
+  "$OMEGA 0.1 0.1 0.1",
+  "$SIGMA 0.02",
+  "$ESTIMATION METHOD=1 INTERACTION MAXEVAL=9999 PRINT=10 NOABORT SIGDIG=5"
+ ]
+}

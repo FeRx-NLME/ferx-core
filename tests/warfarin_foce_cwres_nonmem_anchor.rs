@@ -2,7 +2,7 @@
 //!
 //! `nonmem_anchor/warfarin_foce_cwres.ctl` is `examples/warfarin.ferx` in NONMEM 7.6.0
 //! (`ADVAN2 TRANS2`, `$EST METHOD=1` without `INTER`, `POSTHOC`, `FORMAT=s1PE23.16`), run
-//! with `nm3`; the committed `results/warfarin_foce_cwres.{lst,ext,phi,tab}` are the
+//! with `nm3`; the committed `results/warfarin_foce_cwres.{nm.json,ext,phi,tab}` are the
 //! `nonmem:7.6.0-anchor` outputs (OFV −280.35950111582304; arm64 and arm64-nofma agree to
 //! 2e-9). ferx is evaluated at NONMEM's estimates with `outer_maxiter = 0`, so both
 //! engines score the same point and the residual comparison is not an optimizer race.

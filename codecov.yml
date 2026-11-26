@@ -123,6 +123,10 @@ component_management:
       name: ferx-tools (multi-fit tooling)
       paths:
         - crates/ferx-tools/**
+    - component_id: ferx_search
+      name: ferx-search (model-space search)
+      paths:
+        - crates/ferx-search/**
     - component_id: ferx_cli
       name: ferx-cli (ferx binary)
       paths:

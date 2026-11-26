@@ -167,7 +167,7 @@ trivially right; the pre-screen is the one that is cheap, and it is a
 *screen* — a candidate the CWRES model does not favour is never fitted to the
 data, so a feature the residuals hide is a feature the search will not find.
 On the fixture set the two paths accept the same feature up to the
-`power`/`combined` pair (`crates/ferx-tools/tests/ruvsearch_prescreen_agreement.rs`,
+`power`/`combined` pair (`crates/ferx-search/tests/ruvsearch_prescreen_agreement.rs`,
 slow-gated, run nightly): the full refit prefers `power` (401.69), the screen
 picks `combined` (402.89) on a one-unit CWRES margin, and neither tests the
 other afterwards.
@@ -226,7 +226,7 @@ against the input and the base, and the CWRES screening models are Pharmpy
 
 ### The anchor
 
-`crates/ferx-tools/tests/pharmpy/ruvsearch_anchor/` holds a 40-subject oral
+`crates/ferx-search/tests/pharmpy/ruvsearch_anchor/` holds a 40-subject oral
 dataset simulated with a power residual (`SD = 0.25·f^0.5`), a
 proportional-error input, and Pharmpy 2.2.0's run on it through NONMEM 7.5.1
 (`pharmpy_ruvsearch.json`); `tests/ruvsearch_pharmpy_anchor.rs` replays ferx
@@ -255,17 +255,17 @@ the [error-model page](../model-file/error-model.qmd#power).
 ## From Rust
 
 ```rust
-use ferx_tools::ruvsearch::{run_ruvsearch, RuvsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::ruvsearch::{run_ruvsearch, RuvsearchRun};
+use ferx_search::search::SearchConfig;
 
 let config = SearchConfig::load("warfarin.ferxsearch")?;
 let base = config.load_base()?;
 let result = run_ruvsearch(&config, &base, RuvsearchRun::default())?;
-println!("{}", ferx_tools::ruvsearch::render_summary(&result));
+println!("{}", ferx_search::ruvsearch::render_summary(&result));
 for feature in &result.features {
     println!("added {}", feature.label());
 }
 ```
 
 `RuvsearchRun` takes the directory, a thread override, a cancel flag and a
-progress callback; every field is optional. Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_tools::search::CandidateFinished`, #2512).
+progress callback; every field is optional. Besides its step events, the callback receives a `CandidateFinished` event as each candidate's fit completes — its step, id, features, OFV, criterion and, when it cannot be ranked, the failed gate (`ferx_search::search::CandidateFinished`, #2512).

@@ -11,7 +11,7 @@
 //!
 //! `nonmem_anchor/warfarin_iov_imp.ctl` on `data/warfarin_iov.csv`,
 //! `NITER=200 ISAMPLE=300 PRINT=1`, run at five seeds: `SEED=12345` (outputs in
-//! `nonmem_anchor/results/warfarin_iov_imp.{ext,lst}`) and 1001–1004
+//! `nonmem_anchor/results/warfarin_iov_imp.{ext,nm.json}`) and 1001–1004
 //! (`results/warfarin_iov_imp_seed100{1..4}.ext`). ferx reports the mean of its
 //! last `imp_averaging = 50` iterates, so each NONMEM run is reduced to its
 //! last-50 mean (iterations 151–200) and the reference is the mean of the five.
