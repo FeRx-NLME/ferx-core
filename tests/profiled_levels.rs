@@ -1459,7 +1459,7 @@ fn run_covariance_replays_the_profiled_cross_product() {
 fn a_rank_deficient_profiled_cross_product_is_refused_as_unprofiled() {
     let (_, prof) = at_nonmem_optimum(true, None, s);
     let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), s);
-    let reason = "the score cross-product matrix S is singular or rank-deficient";
+    let reason = "With 12 subjects and 41 free parameters S has rank at most 12";
     for (side, f) in [("profiled", &prof), ("unprofiled", &plain)] {
         assert!(f.covariance_matrix.is_none(), "{side}");
         assert!(f.warnings.iter().any(|w| w.contains(reason)), "{side}: {:?}", f.warnings);

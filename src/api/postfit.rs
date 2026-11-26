@@ -349,10 +349,15 @@ pub(crate) fn is_last_estimating_stage(
 /// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
 /// `method = gn` and no chain. This is the other half of that exemption, applied
 /// where the chain *is* visible: a GN stage followed by a further estimating stage
-/// drops the warning, a trailing one keeps it. Every other warning passes through.
+/// drops the warning, a trailing one keeps it. The #2438 BHHH rank warning, which also says
+/// to let something else finish the fit, follows the same rule. Every other warning passes
+/// through.
 pub(crate) fn keep_gn_zero_eta_warning(warning: &str, is_last_estimating: bool) -> bool {
+    use crate::estimation::gauss_newton::{
+        is_gn_rank_deficient_warning, GN_ZERO_ETA_NONCONVERGENCE_WARNING,
+    };
     is_last_estimating
-        || warning != crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING
+        || (warning != GN_ZERO_ETA_NONCONVERGENCE_WARNING && !is_gn_rank_deficient_warning(warning))
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
@@ -763,7 +768,7 @@ pub(crate) fn compute_subject_results(
                 ),
                 _ => None,
             };
-            let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
+            let r_preds: Option<&[f64]> = if !model.has_f_dependent_variance() {
                 None
             } else if interaction {
                 Some(ipred.as_slice())
@@ -1339,7 +1344,7 @@ const BOUNDARY_REL_TOL: f64 = 1e-3;
 /// absolute gap. An identity-packed theta (lower bound `< 0`) is judged by
 /// its distance to **each bound on that bound's own scale**, never by its
 /// position as a fraction of the declared range: the two are the same thing
-/// for `(-1, 1)` and very different for PsN's `scm` defaults `(-100, 1e6)`,
+/// for `(-1, 1)` and very different for the `[covariate_model]` defaults `(-100, 1e6)`,
 /// where a range fraction would call every estimate below ~900 "at the lower
 /// bound" — which is what every `[covariate_model]` power / exponential θ
 /// carries, and what excluded every candidate of the first covsearch run
@@ -2113,7 +2118,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// diverged. An `Err(String)` carries one line of prose and deletes the rest.
 /// Nor is the sentinel case an error in any useful sense: a repelled fit has
 /// real, finite parameter estimates and is exactly the "scored but rejected"
-/// candidate `ferx-tools`' model-space search expects from
+/// candidate `ferx-search`'s model-space search expects from
 /// [`crate::model_selection::Strictness::require_converged`] — turning it into
 /// an exception would abort a search instead of stepping past one candidate.
 /// The place to *error* on this population is the front door, where

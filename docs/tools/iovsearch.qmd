@@ -131,7 +131,7 @@ distributions and the reference-model ranking are Pharmpy 2.2's
 
 ### The anchor
 
-`crates/ferx-tools/tests/pharmpy/iovsearch_anchor/` holds a 40-subject
+`crates/ferx-search/tests/pharmpy/iovsearch_anchor/` holds a 40-subject
 dataset over three dosing occasions simulated with IOV on CL only
 (κ² = 0.04), an IIV-only input model reading `OCC`, and Pharmpy 2.2.0's runs
 on it through NONMEM 7.5.1 for the `disjoint` and `same-as-iiv`
@@ -153,11 +153,11 @@ three decimals on every model both fitted to convergence.
 ## From Rust
 
 ```rust
-use ferx_tools::iovsearch::{run_iovsearch, IovsearchRun};
-use ferx_tools::search::SearchConfig;
+use ferx_search::iovsearch::{run_iovsearch, IovsearchRun};
+use ferx_search::search::SearchConfig;
 
 let config = SearchConfig::load("warfarin.ferxsearch")?;
 let base = config.load_base()?;
 let result = run_iovsearch(&config, &base, IovsearchRun::default())?;
-println!("{}", ferx_tools::iovsearch::render_summary(&result));
+println!("{}", ferx_search::iovsearch::render_summary(&result));
 ```

@@ -16,7 +16,7 @@
 //! written directly in `$PRED`. For a **fixed-effects** (`n_eta = 0`) CTMM both
 //! engines minimise the same exact `−2 Σ log P(Δt)[sₘ,sₘ₊₁]`, so the OFV is
 //! directly comparable and NONMEM is the stronger external anchor. See
-//! `tests/nonmem/ctmm_2state.ctl` (and `.lst`/`.ext`).
+//! `tests/nonmem/ctmm_2state.ctl` (and `.nm.json`/`.ext`).
 //!
 //! The generator is `Q = [[−q01, q01], [q10, −q10]]` with `q01 = exp(LQ01)`,
 //! `q10 = exp(LQ10)`, `λ = q01 + q10`, and

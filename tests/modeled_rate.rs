@@ -579,7 +579,7 @@ fn analytical_modeled_rate_matches_explicit_infusion() {
 //   t  > T:  C(t) = C(T) · e^{−k (t−T)}
 // With CL=5, V=50 (k=0.1), AMT=100, R1=20 → rate 20 over T=5 h. This is the SAME
 // physical infusion as the NONMEM-verified RATE=-2 D1=5 anchor in
-// `tests/modeled_duration.rs` (NONMEM IPRED from `modeled_duration.lst`), so its
+// `tests/modeled_duration.rs` (NONMEM IPRED from `modeled_duration.nm.json`), so its
 // committed IPRED values apply unchanged. The equivalent control file using
 // `$PK R1=20 FIX` with `RATE=-1` data is `tests/nonmem/modeled_rate.ctl`.
 fn one_cpt_infusion_closed_form(t: f64) -> f64 {

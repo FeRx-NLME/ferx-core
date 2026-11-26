@@ -36,7 +36,7 @@
 //!   observation has *exactly* zero predicted concentration, which is a genuine
 //!   singularity for a purely proportional error model on either engine).
 //! - `first_order_alag.ctl` — the NONMEM `ADVAN2 TRANS2` control (`ALAG1 =
-//!   THETA(4)`); final estimates in `results/first_order_alag.{ext,lst}`.
+//!   THETA(4)`); final estimates in `results/first_order_alag.{ext,nm.json}`.
 //! - `first_order_alag_nm.csv` — NONMEM's copy (dose `CMT=1` = depot, obs
 //!   `CMT=2` = central).
 //! - `data/first_order_alag.csv` — the same simulation re-keyed to `CMT=1` for

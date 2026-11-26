@@ -42,7 +42,7 @@
 //! NONMEM 7.5.1 (MINIMIZATION SUCCESSFUL) reaches OFV −740.8376 / TVCL 0.132943
 //! / TVV 7.72787 / TVKA 0.810919 / SIGMA(1,1) 7.54671e-5 (SD 0.008687) — matching
 //! ferx's analytic L-BFGS to ~5 significant figures. The cross-check assertions
-//! at the end of the test pin this (`tests/nonmem/warfarin_scaled.lst`).
+//! at the end of the test pin this (`tests/nonmem/warfarin_scaled.nm.json`).
 
 use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
@@ -50,7 +50,7 @@ use std::path::Path;
 
 /// Expression `obs_scale` (`obs_scale = TVSCALE`, TVSCALE fixed at 10) routed
 /// through the differentiable scale program must reproduce the constant-scale
-/// NONMEM reference (`tests/nonmem/warfarin_scaled.lst`). This exercises the
+/// NONMEM reference (`tests/nonmem/warfarin_scaled.nm.json`). This exercises the
 /// `ExpressionScale` analytic path — the scale's `∂/∂(θ,η)` jet is evaluated by a
 /// `Dual2`-differentiable bytecode program (not a constant divisor) — and, with
 /// TVSCALE fixed, the optimum is identical to the scalar case (#367).
@@ -172,7 +172,7 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
         def.theta[1]
     );
 
-    // ── NONMEM 7.5.1 FOCEI cross-check (tests/nonmem/warfarin_scaled.{ctl,lst},
+    // ── NONMEM 7.5.1 FOCEI cross-check (tests/nonmem/warfarin_scaled.{ctl,nm.json},
     //    S2 = V*10, MINIMIZATION SUCCESSFUL) — the analytic obs_scale path matches
     //    NONMEM's MLE to ~5 significant figures.
     const NM_OFV: f64 = -740.83761;

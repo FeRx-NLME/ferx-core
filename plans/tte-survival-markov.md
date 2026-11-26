@@ -1139,7 +1139,7 @@ before or alongside each implementation phase.
 | `tests/reference/tte_exponential/simulate.R` | Fixed-seed R script → 100-subject exponential TTE dataset | Write now |
 | `tests/reference/tte_exponential/tte_exp.csv` | The dataset (committed) | Run simulate.R |
 | `tests/reference/tte_exponential/nonmem.ctl` | NONMEM: `$PRED`, F_FLAG=1, Exponential, LAPLACIAN | Write now |
-| `tests/reference/tte_exponential/nonmem.lst` | NONMEM output: OFV, theta, omega, SE | Requested during dev — license required, **non-blocking** (added when it arrives; free refs + SSE carry validation meanwhile) |
+| `tests/reference/tte_exponential/nonmem.nm.json` | NONMEM output extracted from the listing (`tools/nonmem-extract.py`; the `.lst` is not committed): OFV, theta, omega, SE | Requested during dev — license required, **non-blocking** (added when it arrives; free refs + SSE carry validation meanwhile) |
 | `tests/reference/tte_exponential/nlmixr2.R` | nlmixr2 `ll()` Exponential fit on same dataset | Write now |
 | `tests/reference/tte_exponential/expected.md` | Reference estimates table (fill after running) | After NONMEM + nlmixr2 |
 
@@ -1186,7 +1186,7 @@ not block development.** Workflow:
    own SSE check (§8.8.8). This is sufficient to write the code, pass smoke tests, and open
    and merge exploratory PRs.
 3. NONMEM results are **requested during development** and run externally as the license
-   permits. When the `.lst` arrives, commit it and fold its numbers into `expected.md` as a
+   permits. When the `.lst` arrives, commit its `.nm.json` (`tools/nonmem-extract.py`), never the listing, and fold its numbers into `expected.md` as a
    verification step — applied as results arrive, before the endpoint is declared *fully
    validated*, not before coding starts.
 4. The Tier 3 slow test reads reference values from `expected.md` and compares against
@@ -2145,7 +2145,7 @@ definition of "done" for each feature.
 1b. NONMEM verification — requested DURING development, applied when available
    ├── NONMEM results are REQUESTED during development and run externally as the license
    │   permits; they are a verification gate, not a precondition for starting or merging
-   ├── When the .lst arrives: commit it, add OFV/theta/omega/SE to expected.md, and confirm
+   ├── When the .lst arrives: commit its .nm.json (never the listing), add OFV/theta/omega/SE to expected.md, and confirm
    │   ferx matches within the §11 tolerances
    └── An endpoint is "fully validated" once the NONMEM comparison is in; it is "developed
        and mergeable" before that, on the strength of the free references + SSE
