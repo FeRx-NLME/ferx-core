@@ -1145,6 +1145,14 @@ pub fn optimize_population_warm(
 /// `y = g₂ − g₁/c` could also fail `sᵀy > 0`: Luksan's PLIS then restarted on the raw
 /// gradient and took the uncapped step to a bound. A turnover model's `KIN` stayed on its
 /// guard there, 1887 OFV above the optimum. MMA and BOBYQA are never capped.
+///
+/// `c` is set once per leg's first gradient and reset to 1 after the first leg
+/// ([`optimize_nlopt_attempt_probed`]), so only the first leg of an attempt is ever capped.
+/// Before #3153, SLSQP was capped (gradient only) on every evaluation of every leg; now a
+/// verification, polish or basin-shift restart leg runs it uncapped, at `H = I`, on the raw
+/// gradient. L-BFGS legs were already uncapped past the first (#960), so they are unchanged.
+/// Whether to re-arm `c` for every leg, on both algorithms, is a design question (#____)
+/// outside this fix's scope: it changes the step every later leg takes, not only the first.
 pub(crate) fn cap_factor(g: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     debug_assert_eq!(g.len(), lower_s.len());
     debug_assert_eq!(g.len(), upper_s.len());
@@ -1160,6 +1168,23 @@ pub(crate) fn cap_scaled_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64
     let c = cap_factor(g, lower_s, upper_s);
     g.iter_mut().for_each(|gi| *gi /= c);
     c > 1.0
+}
+
+// #3153 review r1 row 8: what NLopt's first leg actually receives, each time `c` fires —
+// `(raw_ofv, scaled_ofv, raw_grad_norm, scaled_grad_norm)`. A build that divides only the
+// gradient (the pre-#3153 shape) pushes a point where `scaled_ofv == raw_ofv` but
+// `scaled_grad_norm < raw_grad_norm`; [`take_first_leg_scale_probe`]'s one caller asserts
+// the two ratios agree instead.
+#[cfg(test)]
+thread_local! {
+    static FIRST_LEG_SCALE_PROBE: std::cell::RefCell<Vec<(f64, f64, f64, f64)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Drains [`FIRST_LEG_SCALE_PROBE`].
+#[cfg(test)]
+pub(crate) fn take_first_leg_scale_probe() -> Vec<(f64, f64, f64, f64)> {
+    FIRST_LEG_SCALE_PROBE.with(|v| v.borrow_mut().split_off(0))
 }
 
 /// Scaled-space displacement from the initial estimates below which a point still counts
@@ -7147,10 +7172,23 @@ fn optimize_nlopt_attempt_probed(
 
         // NLopt sees `f / c` and `∇f / c` ([`cap_factor`]); everything above keeps the OFV.
         let c = obj_scale.get();
+        let reported_ofv = ofv / c;
         if let Some(g) = grad {
             g.iter_mut().for_each(|gi| *gi /= c);
+            #[cfg(test)]
+            if !in_verify_leg && c > 1.0 {
+                let after = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+                FIRST_LEG_SCALE_PROBE.with(|v| {
+                    v.borrow_mut().push((
+                        ofv,
+                        reported_ofv,
+                        grad_norm_for_trace.unwrap_or(f64::NAN),
+                        after,
+                    ));
+                });
+            }
         }
-        ofv / c
+        reported_ofv
     };
 
     // Create NLopt optimizer with state (operates in scaled xs space)
@@ -7245,6 +7283,9 @@ fn optimize_nlopt_attempt_probed(
             .min(POLISH_FTOL_REL);
     let first_leg = opt.optimize(&mut x0);
     let c = obj_scale.replace(1.0);
+    // Back from `f / c` to `f`, for consistency with every later leg's OFV units: nothing
+    // downstream reads this value numerically (only the status, e.g. `verified_stop_needs_left_init`),
+    // so no test can tell this rescale apart from leaving it unscaled.
     let first_leg = first_leg.map(|(st, f)| (st, f * c)).map_err(|(st, f)| (st, f * c));
     #[cfg(test)]
     FIRST_LEG_EVALS.with(|c| c.set(Some(n_evals_outer.load(Ordering::Relaxed))));

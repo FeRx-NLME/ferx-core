@@ -137,8 +137,9 @@ fn foce_falls_back_to_fd() {
     // five both fits have converged and the plans and the fallback agree.
     let o = FitOptions { outer_maxiter: 5, ..opts(EstimationMethod::Foce) };
     let (e, f) = pair(&m, &p, &o);
-    // Measured 1.6e-11 / 1.1e-6 / 2.7e-4 (Linux x86_64).
-    check("foce", &e, &f, [1e-4, 5e-5, 2e-3]);
+    // Measured 1.6e-11 / 1.1e-6 / 2.7e-4 (Linux x86_64); the OFV bound tightened from 1e-4 to
+    // 1e-7, over 6000x the measured gap (#3171 review r1 row 5).
+    check("foce", &e, &f, [1e-7, 5e-5, 2e-3]);
 }
 
 #[test]
@@ -212,8 +213,9 @@ fn iov_falls_back_to_fd() {
     // Four iterations, not three, as in `foce_falls_back_to_fd` (6e-2 apart in OFV at three).
     let o = FitOptions { outer_maxiter: 4, ..opts(EstimationMethod::FoceI) };
     let (e, f) = pair(&m, &p, &o);
-    // Measured 3.9e-10 / 1.4e-5 / 3.4e-5 (Linux x86_64).
-    check("iov", &e, &f, [2e-2, 2e-2, 3e-3]);
+    // Measured 3.9e-10 / 1.4e-5 / 3.4e-5 (Linux x86_64); the OFV bound tightened from 2e-2 to
+    // 1e-7, over 250x the measured gap (#3171 review r1 row 5).
+    check("iov", &e, &f, [1e-7, 2e-2, 3e-3]);
 }
 
 /// The SDE (EKF) subject: the fit at its start — inner loop, objective and covariance — and,

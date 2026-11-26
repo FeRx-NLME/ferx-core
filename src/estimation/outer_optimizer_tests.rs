@@ -14384,6 +14384,38 @@ fn two_cpt_iv_fixture() -> (CompiledModel, Population) {
     (model, pop)
 }
 
+/// #3153 review r1 row 8: NLopt's first leg sees `f / c` and `∇f / c` for one scalar `c`
+/// ([`take_first_leg_scale_probe`]), not the gradient divided alone. Mutation: skipping the
+/// objective divide (`ofv / c` -> `ofv`, keeping `g.iter_mut().for_each(|gi| *gi /= c)`) makes
+/// `scaled_ofv == raw_ofv` while the gradient still shrinks, so the ratio check below fails;
+/// the four `tests/opening_step_scale.rs` tests TeunP's round-1 review ran this mutation
+/// against all stay green, which is why they cannot stand in for this test.
+#[test]
+fn nlopt_first_leg_scales_the_objective_and_gradient_by_the_same_factor() {
+    let (model, pop) = two_cpt_iv_fixture();
+    let opts = FitOptions {
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        verbose: false,
+        threads: Some(1),
+        ..options_2506(crate::types::Optimizer::NloptLbfgs)
+    };
+    let _ = take_first_leg_scale_probe();
+    let _ = optimize_population(&model, &pop, &model.default_params, &opts);
+    let probe = take_first_leg_scale_probe();
+    assert!(!probe.is_empty(), "the opening step's cap must fire on this fixture");
+    for (raw_ofv, scaled_ofv, raw_grad_norm, scaled_grad_norm) in probe {
+        let ofv_ratio = scaled_ofv / raw_ofv;
+        let grad_ratio = scaled_grad_norm / raw_grad_norm;
+        assert!(
+            (ofv_ratio - grad_ratio).abs() < 1e-9 * grad_ratio.max(1.0),
+            "objective and gradient must share one scale: ofv {raw_ofv} -> {scaled_ofv} \
+             (ratio {ofv_ratio:e}), |g| {raw_grad_norm} -> {scaled_grad_norm} (ratio {grad_ratio:e})"
+        );
+    }
+}
+
 fn options_2506(optimizer: crate::types::Optimizer) -> FitOptions {
     FitOptions {
         method: EstimationMethod::FoceI,
