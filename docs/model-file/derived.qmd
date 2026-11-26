@@ -266,6 +266,11 @@ and the compartment state is inaccessible by name — use `compartments[i]` inst
   to `NaN` for affected subjects — states would require time-varying PK params that
   the superposition path does not support
   (`W_DERIVED_CMT_TV_ANALYTICAL` warning is emitted).
+- **Closed-form transit and inverse-Gaussian models** (`one_cpt_transit`, `two_cpt_transit`,
+  `one_cpt_ig`, `two_cpt_ig`): `compartments[i]` evaluates to `NaN` for a subject the model's
+  ODE equivalent serves, for example one with a steady-state or infusion dose (#1580). That
+  integration's states are not in the closed form's `[depot, central, …]` layout
+  (`W_DERIVED_CMT_TWIN_ANALYTICAL` warning is emitted).
 - **ODE models with time-varying covariates, or individual parameters that read
   `TIME`** (e.g. `CL = TVCL * (1 + k * TIME)`, #1855): `compartments[i]` is approximate —
   states integrate under the first observation's disposition parameters (`CL`, `V`,
