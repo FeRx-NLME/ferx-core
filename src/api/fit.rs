@@ -1113,10 +1113,9 @@ fn fit_unstamped(
     // base `omega_iov`, and the outer gradient is the exact one at every class's modes
     // (`mixture_gradient_salvaged`).
     first_error(&crate::api::validation::check_mixture_options(model, options, init_params))?;
-    // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
-    // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    // The run's SS non-convergence notes are its search's and leave with this scope; the fit
+    // reports those of its pass at the estimates (`ss_notes_at_estimates`, #1522).
     let _ss_run = crate::dosing::run_scope();
-    crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     // `E_TRANSIT_UNSUPPORTED` / `E_IG_UNSUPPORTED`, as `ferx check` and `predict` (#1772).
@@ -1252,12 +1251,6 @@ fn fit_unstamped(
         let res = install_on_fit_pool(options, run)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
-            // Surface any SS-equilibration non-convergence seen during this (default, single-start)
-            // fit's prediction passes (#867). This is the common path — `n_starts` defaults to 1 —
-            // so it must drain the sink too, not just the multi-start arm below.
-            for w in crate::dosing::take_ss_nonconvergence_warnings() {
-                result.warnings.push(w);
-            }
             rebuild_warnings_structured(&mut result);
             result
         });
@@ -1344,13 +1337,6 @@ fn fit_unstamped(
             // answer the user ran multi-start for, so it is said when start 0 wins too.
             result.warnings.push(StartSpread::of(&starts).line());
             result.starts = starts;
-            // Surface any SS-equilibration non-convergence seen during this fit's prediction passes
-            // (#867). The capped nonlinear pulse-train can silently under-report the SS trough and
-            // bias estimates low; the sink deduplicated it across every objective evaluation and
-            // multi-start replicate to a single message.
-            for w in crate::dosing::take_ss_nonconvergence_warnings() {
-                result.warnings.push(w);
-            }
             rebuild_warnings_structured(&mut result);
             Ok(result)
         }
@@ -2973,17 +2959,21 @@ fn fit_inner(
     // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
     // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
     let ode_model = integrates_odes(model);
-    let (mut subjects, ode_solver_stats) = compute_subject_results(
-        model,
-        population,
-        &result.params,
-        &result.eta_hats,
-        &result.h_matrices,
-        &result.kappas,
-        options.interaction,
-        mixest_classes.as_deref(),
-        ode_model,
-    );
+    // The SS non-convergence notes this fit reports are this pass's, at its estimates (#1522).
+    let ((mut subjects, ode_solver_stats), ss_notes) = crate::dosing::ss_notes_at_estimates(|| {
+        compute_subject_results(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options.interaction,
+            mixest_classes.as_deref(),
+            ode_model,
+        )
+    });
+    result.warnings.extend(ss_notes);
     // No second, sensitivity sweep here (#3076). One used to run the analytic η-Hessian per
     // subject at the estimates, for the one counter an `f64` pass cannot set,
     // `auto_stiff_rejected_jets` — but the derivative solves are compiled plans whose ODE loops
