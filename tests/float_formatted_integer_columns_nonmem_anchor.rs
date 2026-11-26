@@ -30,7 +30,7 @@
 //! # NONMEM
 //!
 //! Both files were run through the committed control streams on NONMEM 7.6.0
-//! (`tests/nonmem/warfarin_bloq_{intcols,floatcols}.{ctl,lst}`, each naming its own
+//! (`tests/nonmem/warfarin_bloq_{intcols,floatcols}.{ctl,nm.json}`, each naming its own
 //! dataset): 109 observation records and `#OBJV 279.35595553971399` on both, with
 //! identical final estimates; with that one `MDV` flag cleared, 110 records and
 //! 281.06112134711015. NONMEM reads the float spelling as the integer, and so must

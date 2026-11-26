@@ -32,7 +32,10 @@
     "TH 1": [0.0131],
     "OM11": [null, null]
    },
-   "eigenvalues": [1.0]
+   "eigenvalues": [1.0],
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

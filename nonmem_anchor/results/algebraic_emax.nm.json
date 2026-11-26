@@ -71,7 +71,11 @@
     "TH 3": [-0.00787, 0.0027, 0.021],
     "OM11": [-0.000125, -7e-05, 0.000125, 0.000575],
     "SG11": [-4.76e-06, -4.19e-06, 7.29e-06, -4.24e-07, 0.000507]
-   }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
   }
  ],
  "control_stream_as_run": [

@@ -50,7 +50,8 @@
     "sigma": {
      "EPS1": [1.0]
     }
-   }
+   },
+   "markers": []
   },
   {
    "method": "First Order Conditional Estimation with Interaction (Evaluation)",
@@ -63,7 +64,8 @@
     "sigma": {
      "EPS1": [1.0]
     }
-   }
+   },
+   "markers": []
   }
  ],
  "control_stream_as_run": [

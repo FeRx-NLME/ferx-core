@@ -61,7 +61,7 @@
 //!
 //! - `simulate_mr_tad_data.py` — deterministic generator (pure stdlib, seed
 //!   20260829), 12 subjects, doses at 0 and 12 h.
-//! - `mr_tad.ctl` — the control stream; outputs in `results/mr_tad.{ext,lst,tab}`.
+//! - `mr_tad.ctl` — the control stream; outputs in `results/mr_tad.{ext,nm.json,tab}`.
 //! - `mr_tad_det.ctl` + `mr_tad_deterministic_truth.py` — the construction check
 //!   above; output in `results/mr_tad_det.tab`.
 //! - `mr_tad_fit.ferx` — the matching ferx model.

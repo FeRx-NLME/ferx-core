@@ -15,7 +15,7 @@
 //!   - `MODEL_SRC` below is byte-identical to his `datsim.ferx`;
 //!   - `data/datsim_oral.csv` is his `data.ferx.csv` (the `EVID` column is
 //!     present, so this does not depend on the no-EVID dose inference in #262);
-//!   - `tests/nonmem/datsim_oral.{ctl,lst}` is his NONMEM 7.6 control + output.
+//!   - `tests/nonmem/datsim_oral.{ctl,nm.json}` is his NONMEM 7.6 control + output.
 //!
 //! ## NONMEM cross-check
 //!

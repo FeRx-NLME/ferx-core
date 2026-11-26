@@ -45,7 +45,8 @@
     "OM33": [-3.94e-05, 0.00464, 0.00188, -6.41e-05, -0.00052, null, null, 5.2e-05, null, 0.024],
     "SG11": [null, null, null, null, null, null, null, null, null, null, null]
    },
-   "eigenvalues": [0.152, 0.225, 0.633, 0.933, 1.15, 1.42, 2.49]
+   "eigenvalues": [0.152, 0.225, 0.633, 0.933, 1.15, 1.42, 2.49],
+   "markers": []
   }
  ],
  "control_stream_as_run": [

@@ -172,7 +172,7 @@ fn scaling_obs_scale_additive_converges_and_agrees() {
         def.theta[1]
     );
 
-    // ── NONMEM 7.5.1 FOCEI cross-check (tests/nonmem/warfarin_scaled.{ctl,lst},
+    // ── NONMEM 7.5.1 FOCEI cross-check (tests/nonmem/warfarin_scaled.{ctl,nm.json},
     //    S2 = V*10, MINIMIZATION SUCCESSFUL) — the analytic obs_scale path matches
     //    NONMEM's MLE to ~5 significant figures.
     const NM_OFV: f64 = -740.83761;

@@ -4247,7 +4247,7 @@ mod tests {
         assert!((upper - log_normal_cdf(1.0)).abs() < 1e-12);
         assert!((lower - log_normal_cdf(1.0)).abs() < 1e-12);
 
-        // NONMEM 7.5.1 anchor in tests/nonmem/right_censored_m3.{ctl,csv,lst}:
+        // NONMEM 7.5.1 anchor in tests/nonmem/right_censored_m3.{ctl,csv,nm.json}:
         // two identical CENS=-1 rows with z=(12-10)/2=1 give OFV
         // 0.69101514210943182. ferx uses the A&S CDF approximation, so compare
         // within a numerical tolerance rather than bit-for-bit.

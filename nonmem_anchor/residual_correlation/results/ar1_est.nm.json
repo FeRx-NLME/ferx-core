@@ -101,7 +101,10 @@
     "SG44": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "SG45": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "SG55": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

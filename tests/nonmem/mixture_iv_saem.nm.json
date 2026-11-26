@@ -56,7 +56,8 @@
     "sigma": {
      "EPS1": [0.04]
     }
-   }
+   },
+   "markers": []
   },
   {
    "method": "Objective Function Evaluation by Importance Sampling",
@@ -107,7 +108,8 @@
     "sigma": {
      "EPS1": [0.04]
     }
-   }
+   },
+   "markers": []
   }
  ],
  "control_stream_as_run": [

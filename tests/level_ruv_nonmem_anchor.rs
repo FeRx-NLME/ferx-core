@@ -19,7 +19,7 @@
 //!   study (the third occasion is minus the sum of the first two),
 //!   `Y = IPRED + IPRED*EXP(L)*EXP(ETA(2))*EPS(1)`, FOCE-I at `MAXEVAL=0` with
 //!   `POSTHOC`, `FORMAT=s1PE23.16`. Results in
-//!   `results/level_ruv.{lst,ext,phi,tab}` from the `nm3` anchor image, run by
+//!   `results/level_ruv.{nm.json,ext,phi,tab}` from the `nm3` anchor image, run by
 //!   hand since `nm3` cannot baseline a `MAXEVAL=0` run;
 //! - `level_ruv_fit.ferx` — the level spelling, which this test binds, so the
 //!   binder's verdict is part of the anchor.

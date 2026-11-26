@@ -20,7 +20,8 @@
      "EPS1": [0.0625],
      "EPS2": [0.0, 0.04]
     }
-   }
+   },
+   "markers": []
   }
  ],
  "control_stream_as_run": [

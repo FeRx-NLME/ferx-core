@@ -12,7 +12,13 @@
  ],
  "steps": [
   {
-   "method": "Laplacian Conditional Estimation with Interaction (Evaluation)"
+   "method": "Laplacian Conditional Estimation with Interaction (Evaluation)",
+   "markers": [
+    "PRDERR",
+    "NUMERICAL DIFFICULTIES",
+    "PROGRAM TERMINATED"
+   ],
+   "report_truncated": true
   }
  ],
  "control_stream_as_run": [

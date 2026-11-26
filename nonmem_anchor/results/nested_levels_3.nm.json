@@ -110,7 +110,10 @@
     "OM67": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "OM77": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "SG11": [-0.000317, -0.0131, -0.0405, -0.000283, 0.00123, null, null, null, null, null, null, -5.18e-05, null, null, null, null, null, null, null, null, null, null, -0.0142, null, null, null, null, null, null, null, null, null, 0.00106]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

@@ -76,7 +76,10 @@
      "EPS1": [0.0263]
     }
    },
-   "eigenvalues": [0.218, 0.365, 0.559, 0.881, 1.03, 1.17, 1.39, 2.39]
+   "eigenvalues": [0.218, 0.365, 0.559, 0.881, 1.03, 1.17, 1.39, 2.39],
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

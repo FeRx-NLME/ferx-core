@@ -8,8 +8,10 @@ stream, the data and the numeric tables (.ext, .phi, .tab, .cov); never the list
 which carries NONMEM's own text and the license holder's details.
 
 The result holds our control stream as NONMEM echoed it, record counts, warning
-numbers, and per estimation step: the objective, termination status, shrinkage,
-final estimates, standard errors and eigenvalues, at the precision NONMEM printed.
+numbers, failure markers, and per estimation step: the objective, termination
+markers, shrinkage, final estimates, standard errors and eigenvalues, at the
+precision NONMEM printed. `listing_truncated` / a step's `report_truncated` mark a
+listing that ends before the estimation output / that step's report.
 """
 
 import argparse
@@ -163,6 +165,10 @@ def step(text, keep_covariance):
             out[kind] = [v for l in data for v in l if not isinstance(v, int)]
         elif keep_covariance:
             out[kind] = rows(body)
+    out["markers"] = [m for m in MARKERS if m in text]
+    if "objv" not in out and "final" not in out:
+        # The listing ends before this step's report.
+        out["report_truncated"] = True
     return out
 
 

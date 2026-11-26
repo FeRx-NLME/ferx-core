@@ -61,7 +61,10 @@
    "covariance": {
     "TH 1": [0.000162],
     "OM11": [-0.00068, 0.0053]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

@@ -22,7 +22,7 @@
 //! ```
 //!
 //! with the warfarin DV column log-transformed. A NONMEM 7.5.1 FOCEI reference
-//! fit (`tests/nonmem/warfarin_ltbs.{ctl,lst}`, run over `data/warfarin.csv`
+//! fit (`tests/nonmem/warfarin_ltbs.{ctl,nm.json}`, run over `data/warfarin.csv`
 //! with DV log-transformed) gives an essentially exact cross-engine match —
 //! ferx fitting the natural-scale data with `log(DV) ~ additive` recovers the
 //! same MLE as NONMEM fitting log-DV data with `Y = LOG(F) + EPS(1)`:

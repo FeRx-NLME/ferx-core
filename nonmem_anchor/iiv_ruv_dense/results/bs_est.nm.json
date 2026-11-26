@@ -57,7 +57,10 @@
      "EPS1": [0.0112],
      "EPS2": [0.013, 0.0365]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

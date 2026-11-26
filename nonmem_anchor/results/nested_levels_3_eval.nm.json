@@ -24,7 +24,8 @@
     "sigma": {
      "EPS1": [0.255]
     }
-   }
+   },
+   "markers": []
   }
  ],
  "control_stream_as_run": [

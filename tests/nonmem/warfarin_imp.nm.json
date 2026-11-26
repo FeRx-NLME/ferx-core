@@ -57,7 +57,11 @@
     "sigma": {
      "EPS1": [0.000112]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL",
+    "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+   ]
   },
   {
    "method": "Importance Sampling",
@@ -127,7 +131,8 @@
     "OM23": [null, null, null, null, null, null, null, null],
     "OM33": [1.57e-06, 0.000619, -0.000154, -0.000497, 0.0, 0.0, -0.000332, 0.0, 0.0196],
     "SG11": [-3.7e-09, 4.5e-07, -2.05e-07, 1.74e-08, 0.0, 0.0, -4.31e-08, 0.0, -4.3e-07, 4.73e-10]
-   }
+   },
+   "markers": []
   }
  ],
  "control_stream_as_run": [

@@ -33,7 +33,10 @@
     "TH 2": [0.000263, 0.00869],
     "OM11": [null, null, null]
    },
-   "eigenvalues": [0.946, 1.05]
+   "eigenvalues": [0.946, 1.05],
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

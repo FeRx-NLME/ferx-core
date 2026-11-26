@@ -77,7 +77,10 @@
     "TH 4": [0.0027, 0.00578, -0.000228, 0.0104],
     "OM11": [null, null, null, null, null],
     "SG11": [null, null, null, null, null, null]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

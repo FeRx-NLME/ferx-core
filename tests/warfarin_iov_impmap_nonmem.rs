@@ -6,7 +6,7 @@
 //!
 //! `nonmem_anchor/warfarin_iov_impmap.ctl` on `data/warfarin_iov.csv` (identical
 //! to `tests/nonmem/warfarin_iov.csv`), `NITER=200 ISAMPLE=300 SEED=12345
-//! PRINT=1`; outputs in `nonmem_anchor/results/warfarin_iov_impmap.{ext,lst}`.
+//! PRINT=1`; outputs in `nonmem_anchor/results/warfarin_iov_impmap.{ext,nm.json}`.
 //! The same container reproduces the committed 7.5.1 FOCEI reference
 //! (`tests/nonmem/warfarin_iov.ctl`, OFV 308.830) to the printed digits.
 //!

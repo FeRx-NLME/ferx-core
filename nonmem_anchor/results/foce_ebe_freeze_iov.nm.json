@@ -93,7 +93,11 @@
     "OM45": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "OM55": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "SG11": [0.0002, 0.00196, -0.000988, 0.000806, null, null, null, null, -3.23e-05, null, null, null, 0.000405, null, null, -4.64e-05, null, null, 0.000149]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL",
+    "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+   ]
   }
  ],
  "control_stream_as_run": [

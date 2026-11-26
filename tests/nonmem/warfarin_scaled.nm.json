@@ -79,7 +79,10 @@
     "OM23": [null, null, null, null, null, null, null, null],
     "OM33": [5.28e-05, 0.000562, 0.00977, -0.000433, null, null, 5.73e-05, null, 0.0192],
     "SG11": [-2.48e-08, 1.41e-06, 5.22e-07, 5.21e-08, null, null, -1.93e-08, null, -7.87e-07, 1.88e-10]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

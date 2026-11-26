@@ -1139,7 +1139,7 @@ before or alongside each implementation phase.
 | `tests/reference/tte_exponential/simulate.R` | Fixed-seed R script → 100-subject exponential TTE dataset | Write now |
 | `tests/reference/tte_exponential/tte_exp.csv` | The dataset (committed) | Run simulate.R |
 | `tests/reference/tte_exponential/nonmem.ctl` | NONMEM: `$PRED`, F_FLAG=1, Exponential, LAPLACIAN | Write now |
-| `tests/reference/tte_exponential/nonmem.lst` | NONMEM output: OFV, theta, omega, SE | Requested during dev — license required, **non-blocking** (added when it arrives; free refs + SSE carry validation meanwhile) |
+| `tests/reference/tte_exponential/nonmem.nm.json` | NONMEM output extracted from the listing (`tools/nonmem-extract.py`; the `.lst` is not committed): OFV, theta, omega, SE | Requested during dev — license required, **non-blocking** (added when it arrives; free refs + SSE carry validation meanwhile) |
 | `tests/reference/tte_exponential/nlmixr2.R` | nlmixr2 `ll()` Exponential fit on same dataset | Write now |
 | `tests/reference/tte_exponential/expected.md` | Reference estimates table (fill after running) | After NONMEM + nlmixr2 |
 

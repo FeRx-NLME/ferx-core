@@ -56,7 +56,11 @@
      "EPS1": [0.0105],
      "EPS2": [0.0, 0.0001]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
   }
  ],
  "control_stream_as_run": [

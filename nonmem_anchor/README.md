@@ -57,9 +57,9 @@ their numbers to `results/run.nm.json` (#3182).
 | **Covariate mu-referencing, additive** | `CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)` under SAEM — [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) (NONMEM's *nonlinear* `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`, `METHOD=SAEM`; data `data/covmuref_additive.csv` from `simulate_covmuref_data.py`, CRCL constant per subject) | `covmuref_additive_saem.ctl` | `covmuref_additive_saem_fit.ferx` |
 | **Covariate mu-referencing, power** | `CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)` under SAEM — [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) (NONMEM's linear `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`; data `data/covmuref_power.csv`) | `covmuref_power_saem.ctl` | `covmuref_power_saem_fit.ferx` |
 | **Covariate mu-referencing through an `if`/`else` local** | `if (WT > 0) { WTN = WT/70 } else { WTN = 1 }` then `CL = TVCL * WTN^TH_WT * exp(ETA_CL)` under SAEM — [#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422). Same NONMEM run as the power row: every subject has `WT > 0`, so the NONMEM model is the same `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)` and the reference is `results/covmuref_power_saem.ext`; what this row checks is that ferx folds the local into the group and lands where the direct form lands | *(shares `covmuref_power_saem.ctl`)* | `covmuref_power_ifelse_saem_fit.ferx` |
-| **Covariate mu-referencing, shared theta** | `CL` and `V1` of `examples/two_cpt_oral_cov.ferx` both reading `THETA_WT`, under SAEM and IMPMAP — [#1620](https://github.com/FeRx-NLME/ferx-core/issues/1620) (NONMEM 7.6.0 `METHOD=SAEM` / `METHOD=IMPMAP`, each followed by an `EONLY` IMP objective; `MU_1`, `MU_2` both linear in `THETA(6)`; data `covmuref_shared.csv` = the bundled `data/two_cpt_oral_cov.csv` with observations on `CMT=2`, checked by FOCEI: NONMEM and ferx both −1199.3264; results in `results/covmuref_shared_{saem,impmap}.{ext,lst}`) | `covmuref_shared_saem.ctl`, `covmuref_shared_impmap.ctl` | `covmuref_shared_saem_fit.ferx` |
-| **IMPMAP with inter-occasion variability** | `method = impmap` (and `imp`) estimating a `kappa` model: joint (η, κ) importance sampling and the closed-form Ω~IOV~ M-step — [#2301](https://github.com/FeRx-NLME/ferx-core/issues/2301) (NONMEM 7.6.0 `METHOD=IMPMAP INTERACTION NITER=200 ISAMPLE=300 SEED=12345 PRINT=1`; same model, data and initial estimates as the FOCEI reference `tests/nonmem/warfarin_iov.ctl`, whose OFV 308.830 the same container reproduces; data `data/warfarin_iov.csv` = `tests/nonmem/warfarin_iov.csv`). ferx reports its last-50-iterate mean, NONMEM its last iterate, so the test compares against NONMEM's **last-50 mean** in units of NONMEM's own last-50 SD: every parameter and the IS −2LL within 0.83 SD (Ω~IOV~ 0.035446 vs 0.035404, +0.06 SD), Linux aarch64 and macOS arm64 alike. Ω~IOV~ moves 34 SDs from its 0.01 start. Results in `results/warfarin_iov_impmap.{ext,lst}` | `warfarin_iov_impmap.ctl` | `examples/warfarin_iov.ferx` (in `tests/warfarin_iov_impmap_nonmem.rs`) |
-| **IMP with inter-occasion variability** | `method = imp` estimating a `kappa` model: the IMPMAP row's joint sampling and Ω~IOV~ M-step, plus IMP's own sample-moment proposal recentre (stacked `S − m mᵀ` capped by the block-diagonal joint prior) — [#2301](https://github.com/FeRx-NLME/ferx-core/issues/2301), review of PR #2322 (NONMEM 7.6.0 `METHOD=IMP INTERACTION NITER=200 ISAMPLE=300 PRINT=1`, same model, data and initial estimates as the IMPMAP row, run at **five seeds**, 12345 and 1001–1004, direct `nmfe76` in `nonmem:7.6.0-anchor` since `nm3` cannot run `$OMEGA … SAME`). IMP's iterates are autocorrelated, so one run's within-run SD understates how far a last-50 mean moves (σ²: 6.6e-5 within the 12345 run, 2.4e-4 across seeds); the reference is the mean of the five last-50 means, and each scale the larger of the mean within-run SD and the across-seed SD. Every parameter and the IS −2LL within 0.78 scale units (Ω~IOV~ 0.035458 vs 0.035538, −0.12), Linux aarch64 and macOS arm64 alike. Results in `results/warfarin_iov_imp.{ext,lst}` and `results/warfarin_iov_imp_seed100{1..4}.ext` | `warfarin_iov_imp.ctl` | `examples/warfarin_iov.ferx` (in `tests/warfarin_iov_imp_estimation_nonmem.rs`) |
+| **Covariate mu-referencing, shared theta** | `CL` and `V1` of `examples/two_cpt_oral_cov.ferx` both reading `THETA_WT`, under SAEM and IMPMAP — [#1620](https://github.com/FeRx-NLME/ferx-core/issues/1620) (NONMEM 7.6.0 `METHOD=SAEM` / `METHOD=IMPMAP`, each followed by an `EONLY` IMP objective; `MU_1`, `MU_2` both linear in `THETA(6)`; data `covmuref_shared.csv` = the bundled `data/two_cpt_oral_cov.csv` with observations on `CMT=2`, checked by FOCEI: NONMEM and ferx both −1199.3264; results in `results/covmuref_shared_{saem,impmap}.{ext,nm.json}`) | `covmuref_shared_saem.ctl`, `covmuref_shared_impmap.ctl` | `covmuref_shared_saem_fit.ferx` |
+| **IMPMAP with inter-occasion variability** | `method = impmap` (and `imp`) estimating a `kappa` model: joint (η, κ) importance sampling and the closed-form Ω~IOV~ M-step — [#2301](https://github.com/FeRx-NLME/ferx-core/issues/2301) (NONMEM 7.6.0 `METHOD=IMPMAP INTERACTION NITER=200 ISAMPLE=300 SEED=12345 PRINT=1`; same model, data and initial estimates as the FOCEI reference `tests/nonmem/warfarin_iov.ctl`, whose OFV 308.830 the same container reproduces; data `data/warfarin_iov.csv` = `tests/nonmem/warfarin_iov.csv`). ferx reports its last-50-iterate mean, NONMEM its last iterate, so the test compares against NONMEM's **last-50 mean** in units of NONMEM's own last-50 SD: every parameter and the IS −2LL within 0.83 SD (Ω~IOV~ 0.035446 vs 0.035404, +0.06 SD), Linux aarch64 and macOS arm64 alike. Ω~IOV~ moves 34 SDs from its 0.01 start. Results in `results/warfarin_iov_impmap.{ext,nm.json}` | `warfarin_iov_impmap.ctl` | `examples/warfarin_iov.ferx` (in `tests/warfarin_iov_impmap_nonmem.rs`) |
+| **IMP with inter-occasion variability** | `method = imp` estimating a `kappa` model: the IMPMAP row's joint sampling and Ω~IOV~ M-step, plus IMP's own sample-moment proposal recentre (stacked `S − m mᵀ` capped by the block-diagonal joint prior) — [#2301](https://github.com/FeRx-NLME/ferx-core/issues/2301), review of PR #2322 (NONMEM 7.6.0 `METHOD=IMP INTERACTION NITER=200 ISAMPLE=300 PRINT=1`, same model, data and initial estimates as the IMPMAP row, run at **five seeds**, 12345 and 1001–1004, direct `nmfe76` in `nonmem:7.6.0-anchor` since `nm3` cannot run `$OMEGA … SAME`). IMP's iterates are autocorrelated, so one run's within-run SD understates how far a last-50 mean moves (σ²: 6.6e-5 within the 12345 run, 2.4e-4 across seeds); the reference is the mean of the five last-50 means, and each scale the larger of the mean within-run SD and the across-seed SD. Every parameter and the IS −2LL within 0.78 scale units (Ω~IOV~ 0.035458 vs 0.035538, −0.12), Linux aarch64 and macOS arm64 alike. Results in `results/warfarin_iov_imp.{ext,nm.json}` and `results/warfarin_iov_imp_seed100{1..4}.ext` | `warfarin_iov_imp.ctl` | `examples/warfarin_iov.ferx` (in `tests/warfarin_iov_imp_estimation_nonmem.rs`) |
 | **`[parameters]` rejects what it cannot parse** | a scale tag - or any other trailing text - on a `block_omega` / `block_sigma` / `block_kappa` declaration, and a line matching no declaration form at all - [#1377](https://github.com/FeRx-NLME/ferx-core/issues/1377). **Not a fit anchor, and the only row here that is not: the object under test is a parse outcome, so there is no number to compare.** What the two streams record is that the comparator also treats these shapes as errors rather than ignoring them, which is the whole question #1377 asks - ferx used to drop both in silence and report the file VALID. Each stream is a valid warfarin `ADVAN2` `MAXEVAL=0` evaluation differing from an accepted one by exactly one token, in the same vary-one-input-at-a-time discipline as the rest of this table, so neither needs a separate baseline file: arm A appends `FOO` to the `$OMEGA BLOCK` record, arm B puts `BANANA` on a line of its own. NM-TRAN rejects both with `AN ERROR WAS FOUND IN THE CONTROL STATEMENTS.`, the offending record echoed under a caret, ` THE CHARACTERS IN ERROR ARE: FOO` / `: BANANA`, and the reason code `   20  UNKNOWN OPTION.` (nmfe exit 107); each control - the same stream with that one token deleted - is accepted with `OBJECTIVE FUNCTION VALUE: 213.51174651518426`. **Read the asymmetry before quoting this pair: it is two cases for ferx and one for NM-TRAN.** A NONMEM record runs to the next `$`, so arm B's own-line `BANANA` is parsed as one more option on the `$OMEGA` record and fails with the same error 20 as arm A's trailing `FOO`; NM-TRAN has no notion of "a line matching no declaration form" because it has no notion of a line there at all. What the pair supports is the narrower claim that **an unknown token anywhere in the `$OMEGA` region is an error** - not that the comparator separates the two halves the way ferx's line-oriented `[parameters]` does. **Provenance: measured first-hand at `9a7d79c` - `nmfe76` (`/opt/NONMEM/nm760/run/nmfe76`), `NONMEM VERSION 7.6.0 (nm760)`, docker image `nonmemdocker:V0.1` (`sha256:2ee46060f1e0`), run from `nonmem_anchor/` against `../data/warfarin.csv`.** Measured in the same session and deliberately **not** anchored here: NM-TRAN *accepts* `$OMEGA BLOCK(2) SD 0.3 0.02 0.2`, squaring the diagonal only (0.3 -> 0.09, 0.2 -> 0.04) and leaving the off-diagonal 0.02 a covariance - its `run.ext` is byte-identical to the plain `0.09 0.02 0.04` control's, and the SD/correlation row reports `OMEGA(2,1) = 3.33333E-01 = 0.02/(0.3*0.2)`, which a correlation reading would have shown as 0.02. A widening tracked as [#1387](https://github.com/FeRx-NLME/ferx-core/issues/1387), not part of this change. **A third stream, from the PR's round-3 review:** a `$THETA` bound that is present but not a number. ferx used to replace `theta TVCL(50, 0.001-10.0)`'s joined lower bound with its default and report VALID; it now reports `Bad theta lower bound`. NM-TRAN refuses the same shape: `$THETA (0.001-10.0, 0.134) FIX` is rejected (exit 107) with ` THE CHARACTERS IN ERROR ARE: 0.001-` and `   18  INCORRECTLY FORMED VALUE, OPTION, OR RESERVED WORD.`, and its one-edit control `(0.001, 0.134, 10.0) FIX` is accepted at `OBJECTIVE FUNCTION VALUE: 213.51174651518426`. A bare `-` is rejected with error 22 (`UNKNOWN SYMBOL`), and `1e` as either bound with error 18. Measured first-hand on the committed file, same image and driver. **One deliberate divergence, not NONMEM-backed:** in NM-TRAN `;` starts a comment (these streams carry `; CL V KA` and run), while `.ferx` comments are `#` and `//` only, so ferx rejects a `;` line in `[parameters]` with a message naming `#`. That follows ferx's own grammar; making `;` a comment is tracked in [#1393](https://github.com/FeRx-NLME/ferx-core/issues/1393) | `parameters_reject_trailing_token.ctl`, `parameters_reject_stray_line.ctl`, `parameters_reject_theta_bound.ctl` (3) | *(in `tests/check_command.rs` and `src/parser/model_parser_tests.rs`)* |
 | **`[fit_options]` and `[error_model]` reject what they cannot parse** | a `[fit_options]` line that is not a `key = value` pair, and an `[error_model]` line matching no statement form - [#1390](https://github.com/FeRx-NLME/ferx-core/issues/1390). **Not a fit anchor, for the same reason as the `[parameters]` row above: the object under test is a parse outcome, so there is no number to compare.** Both streams are the same valid warfarin `ADVAN2` `MAXEVAL=0` evaluation, differing from the accepted control by exactly one edit. **Arm B is the one that supports the ferx rule**: `BANANA` on its own line in `$ERROR`, *beside a complete `Y = IPRED * (1 + EPS(1))`*, is rejected with `AN ERROR WAS FOUND IN THE CONTROL STATEMENTS.`, the offending line echoed under a caret, and `  202  FORTRAN SYNTAX IS INCORRECT OR INAPPROPRIATE IN THIS CONTEXT.` (nmfe exit 107). The *beside a complete statement* part is the whole point - a block with only the stray line already failed in ferx, late and unhelpfully, with "No error model found"; the defect was only visible when a valid statement was there to be fitted instead. **Arm A is a measured NEGATIVE result and must not be quoted as backing the `[fit_options]` rule**: `$ESTIMATION MAXEVAL 0` - the `=` left out - is *accepted*, exit 0, and *honoured*, NONMEM reporting `ESTIMATION STEP OMITTED:                 YES`. A NONMEM record is a token stream running to the next `$` in which whitespace and `=` are both separators, while ferx's `[fit_options]` is a line-oriented `key = value` block, so NM-TRAN simply cannot express the object; that half is anchored on ferx's own terms instead (an exact message plus a `parse_full_model` control that `method = saem` still selects SAEM). **Read the asymmetry on arm B too**: `$ERROR` is Fortran, so NM-TRAN rejects `BANANA` as a syntax error rather than as "a line matching no error-model form" - it has no notion of a declaration form there. The claim supported is the narrower one, that a stray line in the residual-error region is an error and not something to drop. The control - arm B with the `BANANA` line deleted, which is also arm A with the `=` restored - is accepted at `OBJECTIVE FUNCTION VALUE: 215.06724369784769`. As with `[parameters]`, ferx's rejection of a `;` line is a deliberate divergence and not NONMEM-backed ([#1393](https://github.com/FeRx-NLME/ferx-core/issues/1393)). **Provenance: measured first-hand on the committed files - `nmfe75` (`/opt/NONMEM/nm751/run/nmfe75`), NONMEM 7.5.1, licensed `pmx` container image `a8b78e6253e5`, 2026-09-15, run against `../data/warfarin.csv`.** | `error_model_reject_stray_line.ctl`, `fit_options_reject_missing_equals.ctl` (2) | *(in `tests/check_command.rs` and `src/parser/model_parser_tests.rs`)* |
 | **Absorption parameters fixed at the dose record** | `pk one_cpt_transit` / `one_cpt_ig` with IOV on `CL` **and** on the absorption parameter (`MTT` / `MAT`), served by the ODE twin — [#1569](https://github.com/FeRx-NLME/ferx-core/issues/1569) (`ADVAN13 TOL=12`, FOCEI from the simulation truth, `FORMAT=s1PE23.16` so ferx reads the optimum, EBEs and IPRED at full precision). Each dose keeps the kernel of its own dose record: NM-TRAN zeroes an ETA-dependent variable whose `IF` fails and rejects one set in a nested `IF`, so `$PK` captures each dose's **occasion** instead and rebuilds its `MTT`/`MAT` from that occasion's ETA through Lagrange weights, and `$DES` superposes all four doses. **Non-degenerate by design**: q6h doses, occasion 2 begins at an *observation* record while dose 2 is ~85 % unabsorbed and occasion 3 at a *dose* record while dose 3 is ~15 % unabsorbed; a live κ on the kernel. `transit_iov.ctl` (IOV on `CL` only, one dose per washed-out occasion) cannot see the rule at all. Measured, ferx at NONMEM's optimum: IPRED at NONMEM's EBEs **6.0e-12 / 8.6e-12** max rel over 360 observations each, FOCEI OFV **1.0e-6 / 2.2e-6**, per-subject objective ≤ 9.0e-7. The pre-#1569 engine (kernel re-read per interval) missed by **56 % / 46 %** in IPRED and **128.6 / 7.8** OFV units. arm64 cross-checks within 1e-6 OFV of the `anchor` config | `transit_iov_mtt.ctl`, `ig_iov_mat.ctl` (2) | *(in `tests/absorption_iov_carryover_nonmem_anchor.rs`; data from `simulate_absorption_iov_carryover_data.py`)* |
@@ -111,7 +111,7 @@ their numbers to `results/run.nm.json` (#3182).
 | **Covariate mu-referencing, a typical value reading another eta's anchor** | `examples/two_cpt_oral_cov.ferx` under SAEM with `V1`'s typical value reading `TVCL` (case A) or `TVV2` (case B) — [#1630](https://github.com/FeRx-NLME/ferx-core/issues/1630) | `covmuref_anchor_{a,b}_saem.ctl` | `covmuref_anchor_{a,b}_saem_fit.ferx` *(in `tests/saem_covariate_mu_ref.rs`)* |
 | **Dosing forms × lagtime × time-varying covariate** | the #1060 record convention when what crosses the covariate change is not an oral bolus: a lagged infusion, an `EVID=4` reset, and `SS=1` with and without lag / with a flat `WT` control — [#1073](https://github.com/FeRx-NLME/ferx-core/issues/1073); the `SS=1` infusion, a mid-stream `SS=1` record and a sample inside the pre-arrival window — [#1121](https://github.com/FeRx-NLME/ferx-core/issues/1121) | `dose_form_lag_{infusion,reset}.ctl`, `dose_form_lag_ss{,_flatwt,_nolag,_infusion,_midstream,_prearrival}.ctl` | `dose_form_lag_*_fit.ferx` *(in `tests/dose_form_lag_nonmem_anchor.rs`)* |
 | **Edges of the steady-state record seed** | an `SS=1` bolus with `ALAG ≥ II` (the pre-arrival window holds a virtual pulse) and an `SS=1` infusion whose previous cycle is still running at the record, each with a flat-`WT` control — [#1121](https://github.com/FeRx-NLME/ferx-core/issues/1121) review | `ss_lag_ge_ii{,_flatwt}.ctl`, `ss_lag_infusion{,_flatwt}.ctl` | *(in `tests/ss_lagtime_edge_nonmem_anchor.rs`)* |
-| **Overlapping steady-state infusions** | an `SS=1` infusion longer than `II` — `T_inf = 1.5·II`, `2.5·II` and exactly `2·II`, with `ALAG = 3` (record-seeded) and a `WT` step (the event walk), each followed by a non-SS infusion on residual drug — on the analytic superposition, the closed-form event walk and the ODE engine, 1- and 2-cpt (#2786; `ADVAN1 TRANS2` / `ADVAN3 TRANS4`, `MAXEVAL=0`). Compared: `PRED` at every observation row, against NONMEM's table and against `ss_infusion_overlap_ref_{1cpt,2cpt}.csv`, an exact pulse-train superposition outside ferx (`ss_infusion_overlap_ref.py`; dataset from `ss_infusion_overlap_gen.py`). **NONMEM agrees with the reference** to 6.1e-16 (1-cpt) and 1.2e-14 (2-cpt, uniform over IDs: ADVAN3's own round-off), so it places the still-running SS pulses, the lag on an SS infusion and the record-time `WT` exactly as the reference does; NONMEM accepted every record without a message. **ferx vs NONMEM** (Linux x86_64): superposition 6.1e-16 / 8.3e-15 (1-/2-cpt), event walk 0 / 6.7e-15, ODE (`ode_reltol = ode_abstol = 1e-12`) 5.8e-13 / 3.1e-13. Before the fix the event walk and the ODE engine read 98% low. **Provenance: NONMEM 7.6.0 beta 1 (`nm760b1`), `nmfe76`, native Windows 11 AMD64 gfortran build, run on the committed files at `4339dde5`, 2026-11-14; results in `results/ss_infusion_overlap_{1cpt,2cpt}.{tab,lst,ext}`.** | `ss_infusion_overlap_{1cpt,2cpt}.ctl` (2) | `ss_infusion_overlap_{1cpt,2cpt}{,_ode}_fit.ferx` *(in `tests/ss_infusion_overlap_anchor.rs`)* |
+| **Overlapping steady-state infusions** | an `SS=1` infusion longer than `II` — `T_inf = 1.5·II`, `2.5·II` and exactly `2·II`, with `ALAG = 3` (record-seeded) and a `WT` step (the event walk), each followed by a non-SS infusion on residual drug — on the analytic superposition, the closed-form event walk and the ODE engine, 1- and 2-cpt (#2786; `ADVAN1 TRANS2` / `ADVAN3 TRANS4`, `MAXEVAL=0`). Compared: `PRED` at every observation row, against NONMEM's table and against `ss_infusion_overlap_ref_{1cpt,2cpt}.csv`, an exact pulse-train superposition outside ferx (`ss_infusion_overlap_ref.py`; dataset from `ss_infusion_overlap_gen.py`). **NONMEM agrees with the reference** to 6.1e-16 (1-cpt) and 1.2e-14 (2-cpt, uniform over IDs: ADVAN3's own round-off), so it places the still-running SS pulses, the lag on an SS infusion and the record-time `WT` exactly as the reference does; NONMEM accepted every record without a message. **ferx vs NONMEM** (Linux x86_64): superposition 6.1e-16 / 8.3e-15 (1-/2-cpt), event walk 0 / 6.7e-15, ODE (`ode_reltol = ode_abstol = 1e-12`) 5.8e-13 / 3.1e-13. Before the fix the event walk and the ODE engine read 98% low. **Provenance: NONMEM 7.6.0 beta 1 (`nm760b1`), `nmfe76`, native Windows 11 AMD64 gfortran build, run on the committed files at `4339dde5`, 2026-11-14; results in `results/ss_infusion_overlap_{1cpt,2cpt}.{tab,nm.json,ext}`.** | `ss_infusion_overlap_{1cpt,2cpt}.ctl` (2) | `ss_infusion_overlap_{1cpt,2cpt}{,_ode}_fit.ferx` *(in `tests/ss_infusion_overlap_anchor.rs`)* |
 | **Steady state into an absorption input, with and without a lag** | an `SS=1` dose into a `zero_order()` window (duration below, at and above `II`; lag 0, below `II`, lag + duration past `II`, `= II` and `> II`) and into a lagged first-order absorption (bolus at lag 0 / 2 / 5 / `= II` / `> II`, and an infusion into the depot longer than `II`), each with a `WT` step on some subjects and a non-SS dose on residual drug — the two combinations `E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG` refused (#2786; `ADVAN1` with `RATE=-2`/`D1` and `ADVAN2`, `ALAG1`, `MAXEVAL=0`). NONMEM 7.6.0 (`results/ss_zero_order_lag.tab`, `results/ss_first_order_lag.tab`, FO evaluation) agrees with the independent pulse-train reference `ss_absorption_lag_ref.py` (`ss_absorption_lag_ref_{zo,fo}.csv`) to rounding on every ID but the two with `lag > II` (zero-order ID 7, first-order ID 15), where NONMEM's analytic `ADVAN1`/`ADVAN2` follow the unclamped periodic train from `t = lag - II` on (`ss_absorption_lag_ref_{zo,fo}_wrap.csv`, `wrap` mode) and are not a concentration before it, while ferx follows the documented clamp (see also `ss_lag_ge_ii.ctl`, `ADVAN13`). ferx twins: `ss_{zero,first}_order_lag{,_alag}_fit.ferx`. Dataset from `ss_absorption_lag_gen.py`. | `ss_zero_order_lag.ctl`, `ss_first_order_lag.ctl` (2) | `tests/ss_absorption_lag_anchor.rs` |
 | **Pre-arrival `TAD` of a lagged steady-state dose** | a lagged `SS=1` bolus / infusion on a `$DES` that reads the cycle's `TAD`, against an explicit lagged dose train (`train_*`), with an autonomous control (`*_lag_auto`) — [#1126](https://github.com/FeRx-NLME/ferx-core/issues/1126) | `ss_{tadlag,inf_tadlag,inf_tadlag_resid,lag_auto}.ctl`, `train_{tadlag,tadlag_n21,inf_tadlag,inf_tadlag_resid,lag_auto}.ctl` | *(in `tests/ss_prearrival_tad_nonmem_anchor.rs`)* |
 | **Whose `$PK` snapshot re-seeds `init(...)` at a reset** | an `EVID=3/4` reset re-seeding `A_0` while a covariate (or `OCC`) steps across it — [#1133](https://github.com/FeRx-NLME/ferx-core/issues/1133). Arms A–E, G, H pin the value path (`MAXEVAL=0`); F puts an `ETA` inside `A_0` and reads `#OBJV`; J moves only the occasion; K gives an occasion only the reset row carries its own `ETA` ([#1153](https://github.com/FeRx-NLME/ferx-core/issues/1153)), K_k0 is its κ = 0 control | `reset_init_snapshot_{A,B,C,D,E,F,G,H,J,K,K_k0}.ctl` | *(in `tests/reset_init_snapshot_nonmem_anchor.rs`)* |
@@ -158,8 +158,8 @@ IG**, **parallel**, and **mixed** controls each run on their own matched dataset
 respective model (see below).
 
 > **Parallel / mixed run status — DONE (#505).** Both licensed NONMEM runs landed
-> (`results/parallel_first_order.{ext,lst,cov,cor,coi,phi,tab}`,
-> `results/mixed_zero_first.{ext,lst,phi,tab}`, NONMEM 7.6.0 / `ADVAN13 TOL=9`,
+> (`results/parallel_first_order.{ext,nm.json,cov,cor,coi,phi,tab}`,
+> `results/mixed_zero_first.{ext,nm.json,phi,tab}`, NONMEM 7.6.0 / `ADVAN13 TOL=9`,
 > both MINIMIZATION SUCCESSFUL — the mixed run flagged its covariance step). The
 > slow-gated `tests/parallel_mixed_nonmem_anchor.rs` pins the verified comparison
 > (ferx FOCEI marginal OFV at NONMEM's optimum). Both ship their own **matched**
@@ -190,7 +190,7 @@ respective model (see below).
 > `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
 
 > **Biphasic IG run status — DONE (#388).** The licensed NONMEM run landed
-> (`results/freijer_biphasic_ig.{ext,lst,cov,cor,coi,phi,ctl}` + `biphasic_ig.tab`,
+> (`results/freijer_biphasic_ig.{ext,nm.json,cov,cor,coi,phi,ctl}` + `biphasic_ig.tab`,
 > MINIMIZATION SUCCESSFUL, `#OBJV = −754.211`) and the slow-gated
 > `tests/biphasic_igd_nonmem_anchor.rs` pins the verified comparison below. Unlike
 > the others, the biphasic anchor ships its own **matched** (well-specified)
@@ -199,7 +199,7 @@ respective model (see below).
 > `nmfe75 freijer_biphasic_ig.ctl freijer_biphasic_ig.lst`.
 
 > **Logit mu-referencing run status — DONE (#918).** The licensed NONMEM run
-> landed (`results/logit_fraction_saem.{ext,lst}`, NONMEM 7.5.1,
+> landed (`results/logit_fraction_saem.{ext,nm.json}`, NONMEM 7.5.1,
 > `METHOD=SAEM INTERACTION NBURN=2000 NITER=1000 ISAMPLE=10 SEED=918` followed by
 > `METHOD=IMP EONLY=1`). Unlike the OFV-at-optimum anchors above, this one
 > compares **estimates**: the model is fitted from the same starting values by
@@ -582,7 +582,7 @@ at `n > 0` (also zero) — so it is the sharpest available check of that new cod
 | `first_order_alag_nm.csv` | NONMEM's copy (dose `CMT=1`=depot, obs `CMT=2`=central). |
 | `../data/first_order_alag.csv` | Same simulation re-keyed to `CMT=1` throughout (ferx's single `central` state fed directly by the forcing) — likelihood-equivalent to the NONMEM layout. |
 | `first_order_alag_fit.ferx` | The matching ferx model. |
-| `results/first_order_alag.{ext,lst}` | Committed NONMEM output (`MINIMIZATION SUCCESSFUL`). |
+| `results/first_order_alag.{ext,nm.json}` | Committed NONMEM output (`MINIMIZATION SUCCESSFUL`). |
 | `../tests/first_order_alag_nonmem_anchor.rs` | Slow-gated acceptance test. |
 
 ## Why `ADVAN2`, not `ADVAN13 $DES`
@@ -787,8 +787,8 @@ mv dose_cmt_*.tab results/
 ```
 
 > **Run status — DONE (#375).** All 13 runs executed on NONMEM 7.6.0 via
-> `nmfe76` under the committed filenames; `results/dose_cmt_*.{lst,tab}` are the verbatim
-> output of the committed `.ctl`. Every value
+> `nmfe76` under the committed filenames; `results/dose_cmt_*.{nm.json,tab}` come from
+> the committed `.ctl`. Every value
 > transcribed into `tests/nonmem_dose_compartment_anchor.rs` reproduces at **zero**
 > relative deviation, so the committed anchors are re-derivable rather than
 > taken on trust.
@@ -873,7 +873,7 @@ mv ss_slow_advan*.tab results/
 ```
 
 > **Run status — DONE (#908).** Both runs executed on NONMEM 7.6.0 via `nmfe76`;
-> `results/ss_slow_advan*.{lst,tab}` are the verbatim output of the committed `.ctl`.
+> `results/ss_slow_advan*.{nm.json,tab}` come from the committed `.ctl`.
 
 
 ## `TIME` in the structural readout (#1028)
@@ -888,7 +888,7 @@ right reference for the `TIME` built-in ferx restored in #1028.
 |------|------------|
 | `scaling_time_readout.ctl` | **NONMEM control** — `ADVAN13 TOL=9`, 1-cpt IV, `$ERROR IPRED = A(1)/V + BETA*TIME/(TIME + T50)`. |
 | `scaling_time_readout.csv` | Dataset: one subject, 100 mg bolus into CMT 1, samples at 0.5–24 h. |
-| `results/scaling_time_readout.{lst,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
+| `results/scaling_time_readout.{nm.json,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
 | `tests/scaling_time_readout_nonmem_anchor.rs` | The ferx twin + the comparison. |
 
 Every `$THETA` is `FIX` and `$OMEGA 0 FIX` with `MAXEVAL=0`, so this is a pure
@@ -987,7 +987,7 @@ Three arms, in the order that makes them trustworthy:
 | `ss_chz_r3_{const,drug}.ctl` | The mid-record second-SS-dose anchor: one uninterrupted 56-dose train through `T = 660`, no SS record anywhere. |
 | `ss_chz_train3.csv` | The 56-dose dataset the r3 streams run on (PK obs at 612/647.9/648.1/660, TTE record at 660). |
 | `ss_chz_ss2.csv` | ferx's r3 twin: `SS=1` at `t = 0` **and** `t = 48`, with explicit doses at 12/24/36/60 between them. |
-| `results/ss_chz_r{1,2,3}_*.{lst,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
+| `results/ss_chz_r{1,2,3}_*.{nm.json,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
 | `ss_chz_{const,drug,tdep}_fit.ferx` | The three ferx twins. r3 reuses `const` and `drug` unchanged and swaps only the records, which is what makes it a test of the dose semantics rather than of a second model. |
 
 ### Run NONMEM
@@ -1164,7 +1164,7 @@ stream FIXes the fitted ρ in `$SIGMA BLOCK(2)` and tables `NPDE NPD` with
 | B | total / unbound pair across an `L2` record, fitted ρ = −0.8 | `npde_block_sigma_b.ctl` | `tests/fixtures/npde_block_sigma_b.ferx` | `npde_block_sigma_b.csv` |
 
 Data: `simulate_npde_block_sigma_data.py` (stdlib), 30 subjects, two doses (the
-second on residual drug). Results: `results/npde_block_sigma_{a,b}.{tab,lst,ext}`
+second on residual drug). Results: `results/npde_block_sigma_{a,b}.{tab,nm.json,ext}`
 from the `nonmem:7.6.0-anchor` image. `nm3`'s verdict line cannot parse a
 `MAXEVAL=0` listing (no `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`), so it exits 1
 after a successful run. The anchor outputs are used directly (#OBJV A 217.0685,
@@ -1206,7 +1206,7 @@ Model: `level_se_mbma_fit.ferx`, `mbma_placebo` without the between-arm kappa (o
 match ferx's default `R⁻¹`). Data: `level_se_mbma.csv`, the
 `tests/data/mbma_placebo/mbma_placebo.csv` rows with an `@` header. Generated by a
 short script from the ferx data, with level inits at 0.1 because NONMEM refuses a
-zero initial `THETA`. Results: `results/level_se_{a,b}.{lst,ext,cov}`, `nm3` anchor
+zero initial `THETA`. Results: `results/level_se_{a,b}.{nm.json,ext,cov}`, `nm3` anchor
 image. All three configurations agree to |ΔOFV| < 1e-6.
 
 | | OFV | Worst relative SE gap |
@@ -1231,7 +1231,7 @@ gaps at 1e-2, 2.4× the worst (Linux aarch64 = macOS arm64 in every printed digi
 and ω² are free and FOCEI is the exact likelihood (MLE 165.826023, `level_se_a`'s
 objective). Each stream runs `METHOD=SAEM NBURN=150 NITER=250 SEED=12345`, then
 `METHOD=1 INTER MAXEVAL=0` to score the SAEM estimate. Data: `level_se_mbma.csv`.
-Results: `results/saem_additive_mu{,_inline,_nomu}.{ext,lst}`, `nm3` anchor image (arm64
+Results: `results/saem_additive_mu{,_inline,_nomu}.{ext,nm.json}`, `nm3` anchor image (arm64
 agrees to 2e-7 with `MU_1` and 0.019 without).
 
 | Stream | TVE0 | ω² | OFV at seed 12345 | OFV, seeds 12345, 2, 3, 7, 11 |
@@ -1278,8 +1278,8 @@ of the `.ctl` in a folder **outside** the repository, with the data provisioned
 beside it: `python3 tools/mbma_canakinumab_fetch.py --out <run dir>/mbma_canakinumab.csv`.
 `.gitignore` excludes `mbma_canakinumab*.csv` anywhere as a backstop, and
 `no_external_data_is_tracked` fails if one is ever tracked. The
-committed `results/mbma_canakinumab.{lst,ext,cov}` contain estimates only (checked: no
-data record is printed in the listing).
+committed `results/mbma_canakinumab.{nm.json,ext,cov}` contain estimates only (checked: no
+data record was printed in the listing).
 
 **Fit** (`nm3`, 2026-10-12): `MINIMIZATION SUCCESSFUL` with `PROBLEMS OCCURRED`,
 `#OBJV = −277.86235425800453`; arm64 and arm64-nofma agree to 2e-9. ferx's converged
@@ -1431,7 +1431,7 @@ What the existing level-SE anchor (#1890) does not have, and this one does:
 NONMEM OBJ **101.911514106** (`anchor`); arm64 101.911514121. `$ESTIMATION … SIGL=12
 NSIG=4` and `$COVARIANCE MATRIX=R SIGL=12`. `nm3` cannot run a `SAME` stream
 (prsame.set), so both configs ran through `nmfe76` directly
-(`~/NONMEMruns/ferx-1065-profile-mbma/`). Results: `results/profile_mbma.{lst,ext,cov,phi}`.
+(`~/NONMEMruns/ferx-1065-profile-mbma/`). Results: `results/profile_mbma.{nm.json,ext,cov,phi}`.
 
 | | NONMEM | ferx (profiled, at NONMEM's structural point) | gap |
 |---|---|---|---|
@@ -1469,7 +1469,7 @@ from its own optimum above, and starts (55, 5, 1.2) and (55, 12, 3.2) land there
 (101.911514153, 101.911514135). NONMEM's objective at ferx's collapsed point (TVE0 = 0.001,
 `MAXEVAL=0`) is 273.847933, the value ferx's TVE0 cut interpolates to there, so the
 two engines agree on the object and differ only in the path. Run with `nmfe76` directly
-(the `SAME` record again); results `results/profile_mbma_tve0_55.{lst,ext,cov,phi}`; the
+(the `SAME` record again); results `results/profile_mbma_tve0_55.{nm.json,ext,cov,phi}`; the
 investigation's other runs are in `~/NONMEMruns/issue2339-tve0-55/`. Its ferx twin is
 `profiled_levels_fits.rs`, `a2_a_start_that_floors_tve0_reaches_nonmems_optimum`
 (`slow-tests`), which pins this OBJ against A2's and fits from (55, 8, 2) and (52, 8, 2)
@@ -1488,7 +1488,7 @@ test. NONMEM OBJ **102.484421356** (`anchor`); arm64 102.484421357. `nm3` cannot
 directly, from a folder holding the `.ctl` and `profile_mbma.csv`:
 `docker run --rm -v "$PWD":/work -w /work nonmem:7.6.0-anchor bash -c "bash /opt/NONMEM/nm760/run/nmfe76 profile_mbma_bound.ctl profile_mbma_bound.lst"`
 (and `nonmem:7.6.0-arm64` for the second image). Results:
-`results/profile_mbma_bound.{lst,ext,cov,phi}`. ferx is handed NONMEM's structural optimum
+`results/profile_mbma_bound.{nm.json,ext,cov,phi}`. ferx is handed NONMEM's structural optimum
 with the block declared `(0.0, -10.0, 2.5) profile`; the bounded solve pins THETA24 at
 exactly 2.5 itself and solves the other 35 free levels: ΔOFV 3.3e-8, levels within 2.6e-5
 NONMEM SEs (`tests/profiled_levels.rs`,
@@ -1507,7 +1507,7 @@ nothing else changes. NONMEM OBJ **101.974094188** (`anchor`); arm64 101.9740941
 is 0.0626 above A2's FOCEI optimum, so Laplace is live on this data. The anchor image's
 run prints NONMEM's "PROBLEMS OCCURRED WITH THE MINIMIZATION" caveat (4.0 significant
 digits); the covariance step succeeds on both images. Run with `nmfe76` directly, as A3.
-Results: `results/profile_mbma_laplace.{lst,ext,cov,phi}`. The structural SEs' reference
+Results: `results/profile_mbma_laplace.{nm.json,ext,cov,phi}`. The structural SEs' reference
 is NONMEM's own LAPLACE profile likelihood, `results/profile_mbma_laplace_profiles.txt`
 (12 LAPLACE fits with one THETA `FIX`ed at ±δ, ±2δ, the δ of A2, `SIGL=12 NSIG=4`; every
 one `MINIMIZATION SUCCESSFUL`; runs in `~/NONMEMruns/ferx-2107-profile-laplace/profiles`),
@@ -1540,7 +1540,7 @@ LIKE … SIGL=12 NSIG=4`: `MINIMIZATION SUCCESSFUL`, 4.0 significant digits. `$C
 reports the S matrix algorithmically singular — a sum of 10 per-study outer products, rank
 ≤ 10 against 33 parameters — so the anchor pins the objective only. Run with `nm3`
 (`~/NONMEMruns/ferx-2111-profile-logit/committed/b1/`). Results:
-`results/profile_logit_b1_laplace.{lst,ext,phi}`.
+`results/profile_logit_b1_laplace.{nm.json,ext,phi}`.
 
 | | OBJ |
 |---|---|
@@ -1569,7 +1569,7 @@ so the arm-visit probabilities run from 0.17 to 0.87. `$ESTIMATION METHOD=COND L
 `probit_b1_tail.ctl` evaluates the same model (`MAXEVAL=0`) at TVL = −2.8, every level 0,
 where most records sit near `Φ = 3e-3`. Run with `nm3`
 (`~/NONMEMruns/ferx-2603-probit/`); the arm64 images land 2.4e-8 below it on the fit. Results:
-`results/probit_b1_{laplace,tail}.{lst,ext,phi}`.
+`results/probit_b1_{laplace,tail}.{nm.json,ext,phi}`.
 
 | | at NONMEM's optimum | at the tail point |
 |---|---|---|
@@ -1605,7 +1605,7 @@ Newton matrix there. The arm-visit probabilities run from about 0.2 to 0.8, so t
 is live on every row. `$ESTIMATION … SIGL=12 NSIG=4`, `$COVARIANCE MATRIX=R SIGL=12`, both
 `MINIMIZATION SUCCESSFUL` (4.1 / 4.5 significant digits) with the covariance step complete.
 Run with `nm3` (`~/NONMEMruns/ferx-2111-profile-logit/committed/`). Results:
-`results/profile_logit_b2_{focei,laplace}.{lst,ext,cov,phi}`.
+`results/profile_logit_b2_{focei,laplace}.{nm.json,ext,cov,phi}`.
 
 | | FOCEI (`METHOD=1 INTER`) | LAPLACE (`METHOD=1 LAPLACE INTER`) |
 |---|---|---|

@@ -39,7 +39,10 @@
     "TH 8": [0.00648, 0.00515, 0.00453, -1.42e-05, 0.00288, 0.00635, 0.099, 0.397],
     "TH 9": [-0.000789, -0.000573, -0.000498, -5.9e-05, -0.000367, -0.000667, -0.0107, -0.0381, 0.00384],
     "OM11": [null, null, null, null, null, null, null, null, null, null]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

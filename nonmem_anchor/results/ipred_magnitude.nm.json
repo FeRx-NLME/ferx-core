@@ -80,7 +80,10 @@
     "OM12": [null, null, null, null, null, null, null, null, null, null, null],
     "OM22": [0.00014, 0.00098, 0.00118, -0.000184, -0.000274, 0.000144, 0.00254, 0.011, -0.000615, 0.00052, null, 0.0353],
     "SG11": [null, null, null, null, null, null, null, null, null, null, null, null, null]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

@@ -22,7 +22,11 @@
     "omega": {
      "ETA1": [0.0]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
   }
  ],
  "control_stream_as_run": [

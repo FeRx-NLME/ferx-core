@@ -58,7 +58,8 @@
     "OM55": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
     "SG11": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
    },
-   "eigenvalues": [0.023, 0.215, 0.32, 0.473, 0.847, 1.57, 1.89, 2.66]
+   "eigenvalues": [0.023, 0.215, 0.32, 0.473, 0.847, 1.57, 1.89, 2.66],
+   "markers": []
   }
  ],
  "control_stream_as_run": [

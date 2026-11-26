@@ -85,7 +85,11 @@
     "OM34": [null, null, null, null, null, null, null, null, null, null, null, null],
     "OM44": [6.84e-05, 0.00142, 9.38e-05, 0.000163, null, null, null, -1.69e-05, null, null, -0.000367, null, 0.0041],
     "SG11": [1.97e-06, -3.51e-05, 1.32e-05, -6.4e-06, null, null, null, -1.31e-06, null, null, 4.51e-06, null, 1.05e-05, 1.57e-06]
-   }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
   }
  ],
  "control_stream_as_run": [

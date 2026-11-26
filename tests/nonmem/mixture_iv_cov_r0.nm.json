@@ -36,7 +36,8 @@
     "OM11": [null, null, null, null, null],
     "SG11": [null, null, null, null, null, null]
    },
-   "eigenvalues": [0.685, 0.76, 1.06, 1.49]
+   "eigenvalues": [0.685, 0.76, 1.06, 1.49],
+   "markers": []
   }
  ],
  "control_stream_as_run": [

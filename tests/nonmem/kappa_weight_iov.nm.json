@@ -58,7 +58,10 @@
     "sigma": {
      "EPS1": [0.0376]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

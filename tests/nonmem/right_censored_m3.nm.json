@@ -15,7 +15,8 @@
     "omega": {
      "ETA1": [0.01]
     }
-   }
+   },
+   "markers": []
   }
  ],
  "control_stream_as_run": [

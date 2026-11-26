@@ -81,7 +81,12 @@
     "OM23": [null, null, null, null, null, null, null, null],
     "OM33": [5e-05, 0.000336, 0.00999, -0.000436, null, null, 6.7e-05, null, 0.0195],
     "SG11": [-5.87e-09, 2.5e-06, 2.14e-07, 7.23e-08, null, null, -3.43e-08, null, -1.11e-06, 2.85e-10]
-   }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "PROBLEMS OCCURRED WITH THE MINIMIZATION",
+    "ROUNDING ERRORS"
+   ]
   }
  ],
  "control_stream_as_run": [

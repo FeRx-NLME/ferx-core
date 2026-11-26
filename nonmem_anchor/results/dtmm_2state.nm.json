@@ -53,7 +53,11 @@
      "ETA1": [0.0628],
      "ETA2": [0.0, 0.311]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL",
+    "PROBLEMS OCCURRED WITH THE MINIMIZATION"
+   ]
   }
  ],
  "control_stream_as_run": [

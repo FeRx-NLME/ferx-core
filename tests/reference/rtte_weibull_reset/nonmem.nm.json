@@ -62,7 +62,10 @@
     "TH 1": [0.0575],
     "TH 2": [0.000817, 0.00246],
     "OM11": [0.00139, -0.000102, 0.00058]
-   }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
   }
  ],
  "control_stream_as_run": [

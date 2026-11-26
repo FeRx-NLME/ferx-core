@@ -58,7 +58,11 @@
     "sigma": {
      "EPS1": [0.0105]
     }
-   }
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
   }
  ],
  "control_stream_as_run": [
