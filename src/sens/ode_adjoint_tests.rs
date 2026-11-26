@@ -7049,10 +7049,11 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
     let ungated = objective_gaps_for(&model, &s, &p, eta.as_slice(), false);
     FORCE_WOODBURY.with(|c| c.set(false));
     eprintln!("near-singular row: gated F gap {:.3e}, ungated {:.3e}", gated.0, ungated.0);
-    // Measured on macOS arm64 (#2441, t = 20 h): ungated 7.4e-2 relative, gated 7.7e-12. The
-    // ungated bound sits 10× inside its side; the gated one (kept from the Linux-measured
-    // t = 23 h fixture, 2.3e-11) has ~30× headroom here. Either reddens if the gate stops
-    // separating them.
+    // Measured on macOS arm64 (#2441, t = 20 h): ungated 7.4e-2 relative, gated 7.7e-12 (3.2e-11
+    // since #2988 rotates the rows into `I + S` rather than factoring the dense `R̃`). Linux
+    // x86_64 (#2988): ungated 1.03e-2 (1.5× over its bound), gated 3.198e-11 (7.8× headroom on
+    // the 2.5e-10 bound, kept from the t = 23 h fixture, 2.3e-11). Either reddens if the gate
+    // stops separating them.
     assert!(
         ungated.0 > 7e-3,
         "the fixture no longer exposes the Woodbury loss (ungated gap {:.2e})",
@@ -11486,8 +11487,8 @@ fn structured_reduce_is_shared_across_subjects_exactly() {
     });
 }
 
-/// A FOCE subject past the Woodbury gate (`1 + tr(LᵀSL) > 1e6`, where production factors `R̃`
-/// itself) is outside the structured kernel's form, so its passes take the recorded kernel
+/// A FOCE subject past the Woodbury gate (`1 + tr(LᵀSL) > 1e6`, where `foce_f` leaves
+/// Woodbury's form) is outside the structured kernel's form, so its passes take the recorded kernel
 /// rather than declining the subject (#2980 review). The pair straddles the gate: at the
 /// fixture's σ the subject takes the structured kernel, at a σ shrunk `1e-5`× (the trace far
 /// past `1e6`) none of its passes does — both asserted — and each Hessian matches the recorded
@@ -11540,6 +11541,93 @@ fn foce_past_the_woodbury_gate_takes_the_recorded_kernel() {
             assert!(gap < 1e-12, "{gap:.2e}");
         }
     });
+}
+
+/// `foce_f`'s inputs for `s` at `eta` (`f`, `G`, FOCE's `f(η = 0)`, the parameters) and the
+/// gate's `1 + tr S`.
+fn foce_inputs(
+    model: &CompiledModel, s: &Subject, p: &ModelParameters, eta: &[f64],
+) -> (Vec<f64>, Vec<Vec<f64>>, Vec<f64>, crate::sens::focei_kernel::ParT<f64>, f64) {
+    let (n, nn) = (s.obs_times.len(), eta.len());
+    let f = crate::pk::compute_predictions_with_tv(model, s, &p.theta, eta);
+    let hm = exact_eta_jacobian(model, s, &p.theta, eta).expect("η-Jacobian");
+    let g: Vec<Vec<f64>> = (0..n).map(|j| (0..nn).map(|k| hm[(j, k)]).collect()).collect();
+    let f0 = crate::stats::likelihood::population_variance_preds(model, s, &p.theta, nn)
+        .expect("FOCE's frozen predictions");
+    let par = crate::sens::focei_kernel::ParT::of(model, s, p);
+    let ltg = |j: usize, c: usize| (c..nn).map(|r| par.omega.chol[r][c] * g[j][r]).sum::<f64>();
+    let tr = 1.0
+        + (0..n)
+            .map(|j| {
+                let r0 = model.residual_variance_at(1, f0[j], &p.sigma.values);
+                (0..nn).map(|c| ltg(j, c).powi(2)).sum::<f64>() / r0
+            })
+            .sum::<f64>();
+    (f, g, f0, par, tr)
+}
+
+/// Past the Woodbury gate `foce_f` rotates each row into `I + S` (#2988), so the program it
+/// records grows linearly in the rows; the dense `R̃` factor it replaced records `O(nq³)`.
+/// Recorded over 2 and 20 rows of the straddle's subject at a σ shrunk `1e-5`× (gate asserted):
+/// linear growth is at most 10× (measured 9.0× on Linux x86_64: 246 and 2208 ops), the dense
+/// factor's 37× (165 and 6099).
+/// Mutation: restore `if !woodbury` for the dense factor → 20 rows record ≫ 10× the ops.
+#[test]
+fn foce_past_the_woodbury_gate_records_a_program_linear_in_the_rows() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::sens::focei_kernel::{foce_f, foce_woodbury_ok, LikCtx};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let mut p = moved_params(&model);
+    p.sigma.values[0] *= 1e-5;
+    let eta = [0.1, -0.05, 0.2];
+    let ops = |n: usize| {
+        let times: Vec<f64> = (1..=n).map(|j| j as f64).collect();
+        let dose = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let s = subject(&model, dose, &times, &eta);
+        let (f, g, f0, par, tr) = foce_inputs(&model, &s, &p, &eta);
+        assert!(
+            !foce_woodbury_ok(tr - 1.0),
+            "the fixture is inside the gate (1 + tr S = {tr:.2e})"
+        );
+        let ctx = LikCtx::new(&model, &s, &p);
+        let k = std::cell::Cell::new(0);
+        let lift = |x: f64| {
+            k.set(k.get() + 1);
+            kj::Tr::theta(k.get() - 1, x)
+        };
+        kj::begin();
+        let v = |x: &[f64]| x.iter().map(|&x| lift(x)).collect::<Vec<_>>();
+        let (fl, el, f0l) = (v(&f), v(&eta), v(&f0));
+        let gl: Vec<Vec<kj::Tr>> = g.iter().map(|r| v(r)).collect();
+        let out = foce_f(&ctx, &fl, &gl, &el, Some(&f0l), &par.map(lift)).expect("F");
+        kj::end(Some(vec![out.reg()])).expect("records").n_ops()
+    };
+    let (few, many) = (ops(2), ops(20));
+    eprintln!("past the gate: {few} ops at 2 rows, {many} at 20");
+    assert!(many < 10 * few, "{many} ops at 20 rows against {few} at 2: not linear in the rows");
+}
+
+/// The #2988 rotation's derivative against the reconverged-FD oracle: FOCE's outer gradient on
+/// `ONE_CPT_ORAL`'s subject at a σ shrunk `2e-3`×, past the gate (asserted at the EBE).
+/// Measured on Linux x86_64 (EBE tol 1e-15, `1 + tr S` 4.3e6): θ and σ coordinates 3e-9 …
+/// 2.3e-7, the three Ω coordinates 3.0e-4, 1.3e-2, 1.3e-3. The Ω gap is the oracle's, not the
+/// rotation's: at σ × 1e-3 (EBE tol 1e-12) the dense factor this branch replaced sits at the
+/// same 4.5e-2 as the rotation. Mutation: `ld` without the factor 2 of `2 ln r_kk` → 2.7e-1.
+#[test]
+fn foce_gradient_past_the_woodbury_gate_matches_reconverged_fd() {
+    let mut model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    model.default_params.sigma.values[0] *= 2e-3;
+    let dose = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let s = subject(&model, dose, &TIMES, &[0.1, -0.05, 0.2]);
+    let p = moved_params(&model);
+    let eta = ebe_for(&model, &s, &p, 1e-12, false);
+    let tr = foce_inputs(&model, &s, &p, eta.as_slice()).4;
+    assert!(tr > 1e6, "the fixture is inside the gate (1 + tr S = {tr:.2e})");
+    ORACLE_EBE_TOL.set(1e-15);
+    let gap = parity_foce(&model, &s);
+    ORACLE_EBE_TOL.set(1e-12);
+    eprintln!("past the gate: 1 + tr S {tr:.2e}, worst gradient gap {gap:.2e}");
+    assert!(gap < 3e-2, "{gap:.2e}");
 }
 
 /// A shared kernel (`kernel_run_shared`) serves a point on the other side of a branch its
