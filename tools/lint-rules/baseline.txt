@@ -169,7 +169,6 @@ nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_a_covariate_nn_subject_run
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_axes_is_the_full_hessians_diagonal
 nan-fold 1 src/sens/ode_adjoint_tests.rs::eta_dx_matches_the_re_solved_ebe_with_a_non_gaussian_term
 nan-fold 1 src/sens/ode_adjoint_tests.rs::exact_inner_hessian_matches_fd_of_the_production_objective
-nan-fold 2 src/sens/ode_adjoint_tests.rs::fd_oracle
 nan-fold 1 src/sens/ode_adjoint_tests.rs::fd_oracle_agq
 nan-fold 1 src/sens/ode_adjoint_tests.rs::kernel_m3_censored_rows_match_reconverged_fd
 nan-fold 2 src/sens/ode_adjoint_tests.rs::mm_template_and_hand_written_gradients_agree_per_subject
