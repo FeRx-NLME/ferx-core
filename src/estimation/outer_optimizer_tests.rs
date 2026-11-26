@@ -937,6 +937,8 @@ fn stagnation_window_is_sized_in_free_coordinates() {
         Q = T4 * T7 * exp(E4)\n  V2 = T5 * T8 * exp(E5)\n\
         [structural_model]\n  pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)\n\
         [error_model]\n  DV ~ combined(S1, S2)\n";
+    // The packed layout of a model that carries `0 FIX` diagonals (#3150: the parser would drop them).
+    let _keep = crate::parser::model_parser::KeepZeroFixEtas::on();
     let model = crate::parser::model_parser::parse_model_string(src).expect("model parses");
     let start = pack_with_bounds(&model.default_params);
     assert_eq!(start.packed.len(), 9 + 21 + 2, "every packed coordinate");

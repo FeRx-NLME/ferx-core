@@ -4086,7 +4086,9 @@ pub fn parse_full_model_with(
     let mut extracted = extract_blocks(content)?;
     // A deprecated block (`[initial_values]`) is a warning, not an error (#2913):
     // taken out here so it seeds `parse_warnings` when the model is built.
-    let deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
+    let mut deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
+    // `omega NAME ~ 0 FIX` placeholders are held at 0 and taken out of the model (#3150).
+    deprecated_block_warnings.extend(apply_zero_fix_etas(&mut extracted, level_bindings));
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
     // hand-written `ode(...)` form *before* anything else looks at the blocks, so
@@ -18442,6 +18444,136 @@ pub(crate) fn mixing_logp_grad(
         }
     }
     out
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEEP_ZERO_FIX_ETAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: while alive on this thread, [`apply_zero_fix_etas`] drops nothing, so a test of
+/// the machinery that carries a `0 FIX` η through Ω (simulation's exact zero, the packed
+/// layout) still has one to carry. Such an η survives in a model when it is read by
+/// `iiv_on_ruv` or an endpoint block, and in every Ω built from a bare matrix.
+#[cfg(test)]
+pub(crate) struct KeepZeroFixEtas(bool);
+
+#[cfg(test)]
+impl KeepZeroFixEtas {
+    pub(crate) fn on() -> Self {
+        Self(KEEP_ZERO_FIX_ETAS.with(|k| k.replace(true)))
+    }
+    fn is_on() -> bool {
+        KEEP_ZERO_FIX_ETAS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeepZeroFixEtas {
+    fn drop(&mut self) {
+        KEEP_ZERO_FIX_ETAS.with(|k| k.set(self.0));
+    }
+}
+
+/// Blocks whose lines are expressions an η may appear in as a plain value. A placeholder η that
+/// is mentioned anywhere else (`iiv_on_ruv = NAME` in `[error_model]`, a `[mixture]` override, an
+/// endpoint block, `frem_predictions`) keeps its declaration: those read the η by name or by
+/// position, which dropping it would move.
+const ZERO_ETA_EXPRESSION_BLOCKS: [&str; 4] =
+    ["individual_parameters", "odes", "scaling", "derived"];
+
+/// Design A2 of #3150: an `omega NAME ~ 0 FIX` η (or every name of an all-zero `FIX`
+/// `block_omega`) is held at 0, as NONMEM holds `$OMEGA 0 FIX`, so it is taken out of the model
+/// instead of being carried through every subject's inner problem at variance `1e-8`.
+///
+/// A text pass on the extracted blocks, run before anything reads them: the declaration is
+/// removed, a term `+ NAME`, `- NAME`, `NAME +` or `-NAME +` is deleted from the sum it is in,
+/// and a `NAME` left anywhere else reads as `0` (`NAME * k`, `exp(NAME)`: the same value, though
+/// a pattern the fit reads from the text, such as mu-referencing, can then differ). For the
+/// deleted spellings the model that results is the one written without the placeholder.
+///
+/// A placeholder goes only if its declaration is its single mention in `[parameters]` and its
+/// other mentions all sit in [`ZERO_ETA_EXPRESSION_BLOCKS`]; a block goes whole or not at all.
+/// A `kappa NAME ~ 0 FIX` is not an `omega` and stays. Nothing goes when it would leave no η
+/// (SAEM, IMP, IMPMAP and Bayes refuse a model with none). Returns the one
+/// `W_ZERO_FIX_ETA_DROPPED` note, or nothing.
+fn apply_zero_fix_etas(
+    extracted: &mut ExtractedBlocks, level_bindings: &LevelBindings,
+) -> Vec<String> {
+    #[cfg(test)]
+    if KeepZeroFixEtas::is_on() {
+        return Vec::new();
+    }
+    let Some(lines) = extracted.unnamed.get("parameters") else { return Vec::new() };
+    // The common model has no fixed omega: no second parse, no regex.
+    let fixed_omega = |l: &String| {
+        let l = l.to_ascii_lowercase();
+        l.contains("omega") && l.contains("fix")
+    };
+    if !lines.iter().any(fixed_omega) {
+        return Vec::new();
+    }
+    let Ok((_, omegas, blocks, ..)) = parse_parameters(lines, level_bindings) else {
+        return Vec::new();
+    };
+    // A mention in any case counts: other scans of the parser fold the case of an η name.
+    let word = |n: &str| Regex::new(&format!(r"(?i)\b{}\b", regex::escape(n))).unwrap();
+    let decl = Regex::new(r"(?i)^\s*(omega|block_omega)\b").unwrap();
+    let goes = |name: &String| {
+        let w = word(name);
+        let mut own = lines.iter().filter(|l| w.is_match(l));
+        let declared_once = own.next().is_some_and(|l| decl.is_match(l)) && own.next().is_none();
+        let elsewhere = |(ty, ls): (&String, &Vec<String>)| {
+            ZERO_ETA_EXPRESSION_BLOCKS.contains(&ty.as_str()) || !ls.iter().any(|l| w.is_match(l))
+        };
+        declared_once
+            && extracted.unnamed.iter().filter(|(ty, _)| *ty != "parameters").all(elsewhere)
+            && !extracted.named.values().flat_map(|m| m.values().flatten()).any(|l| w.is_match(l))
+    };
+    // Groups that go together: each zero diagonal alone, each all-zero `FIX` block whole.
+    let groups =
+        omegas.iter().filter(|o| o.fixed && o.variance == 0.0).map(|o| vec![o.name.clone()]).chain(
+            blocks
+                .iter()
+                .filter(|b| b.fixed && b.lower_triangle.iter().all(|&v| v == 0.0))
+                .map(|b| b.names.clone()),
+        );
+    let dropped: Vec<String> = groups.filter(|g| g.iter().all(goes)).flatten().collect();
+    let declared = omegas.len() + blocks.iter().map(|b| b.names.len()).sum::<usize>();
+    if dropped.is_empty() || dropped.len() >= declared {
+        return Vec::new();
+    }
+    let alt = dropped.iter().map(|n| regex::escape(n)).collect::<Vec<_>>().join("|");
+    let any_name = Regex::new(&format!(r"\b({alt})\b")).unwrap();
+    if let Some(ls) = extracted.unnamed.get_mut("parameters") {
+        ls.retain(|l| !(decl.is_match(l) && any_name.is_match(l)));
+    }
+    // A whole additive term goes: `x + NAME` and `x - NAME` before a closing `)`, `,`, `+`, `-`
+    // or the line's end (never `x + NAME * y`), and `NAME +` as the first term of a sum. What
+    // is left of the name (`NAME * y`, `exp(-NAME)`) reads as 0.
+    let trailing = Regex::new(&format!(r"([\w)])\s*[+-]\s*\b({alt})\b(\s*[)+,-]|\s*$)")).unwrap();
+    let leading = Regex::new(&format!(r"(^|[(,=])\s*-?\s*\b({alt})\b\s*\+\s*")).unwrap();
+    for ty in ZERO_ETA_EXPRESSION_BLOCKS {
+        for l in extracted.unnamed.get_mut(ty).into_iter().flatten() {
+            let mut text = l.clone();
+            loop {
+                let next = trailing.replace_all(&text, "$1$3").into_owned();
+                let next = leading.replace_all(&next, "$1").into_owned();
+                if next == text {
+                    break;
+                }
+                text = next;
+            }
+            *l = any_name.replace_all(&text, "0").into_owned();
+        }
+    }
+    vec![format!(
+        "{ZERO_FIX_ETA_TOKEN}: omega {} ~ 0 FIX {} held at 0 and removed from the model, as \
+         NONMEM holds `$OMEGA 0 FIX`: no row in Ω, the EBEs or the shrinkage tables, and a \
+         supplied Ω or per-subject η sized for the declared shape is refused (#3150).",
+        dropped.join(", "),
+        if dropped.len() == 1 { "is" } else { "are" },
+    )]
 }
 
 fn parse_parameters(

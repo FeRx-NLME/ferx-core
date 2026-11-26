@@ -1,0 +1,68 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "zero_fix_eta.csv",
+ "data_records": 165,
+ "observations": 150,
+ "individuals": 15,
+ "nmtran_warnings": [2],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation with Interaction (Evaluation)",
+   "objv": 744.728,
+   "final": {
+    "theta": [4.0, 12.0, 2.0, 25.0],
+    "omega": {
+     "ETA1": [0.15],
+     "ETA2": [0.0, 0.15],
+     "ETA3": [0.0, 0.0, 0.15],
+     "ETA4": [0.0, 0.0, 0.0, 0.15],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 0.0],
+     "ETA6": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+     "ETA7": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+     "ETA8": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+     "ETA9": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+     "ET10": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    "sigma": {
+     "EPS1": [0.0004]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM    zero_fix_eta two-cpt IV bolus,4 live etas + 6 $OMEGA 0 FIX",
+  ";           placeholders (#3150)",
+  "$INPUT      ID TIME DV EVID AMT CMT RATE MDV",
+  "$DATA      zero_fix_eta.csv IGNORE=@",
+  "$SUBROUTINE ADVAN3 TRANS4",
+  "$PK",
+  "  CL = THETA(1) * EXP(ETA(1) + ETA(5) + ETA(9))",
+  "  V1 = THETA(2) * EXP(ETA(2) + ETA(6) + ETA(10))",
+  "  Q  = THETA(3) * EXP(ETA(3) + ETA(7))",
+  "  V2 = THETA(4) * EXP(ETA(4) + ETA(8))",
+  "  S1 = V1",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED * (1 + EPS(1))",
+  "$THETA  (0.1,4.0,100.0) ; TVCL",
+  "$THETA  (1.0,12.0,500.0) ; TVV1",
+  "$THETA  (0.01,2.0,100.0) ; TVQ",
+  "$THETA  (1.0,25.0,500.0) ; TVV2",
+  "$OMEGA  0.15",
+  "$OMEGA  0.15",
+  "$OMEGA  0.15",
+  "$OMEGA  0.15",
+  "$OMEGA  0  FIX",
+  "$OMEGA  0  FIX",
+  "$OMEGA  0  FIX",
+  "$OMEGA  0  FIX",
+  "$OMEGA  0  FIX",
+  "$OMEGA  0  FIX",
+  "$SIGMA  0.0004",
+  "$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 POSTHOC NOABORT PRINT=1",
+  "$TABLE      ID TIME IPRED NOPRINT ONEHEADER FILE=zero_fix_eta.tab",
+  "            FORMAT=,1PE17.10"
+ ]
+}

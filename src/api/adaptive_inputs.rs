@@ -278,9 +278,11 @@ pub(crate) fn resolve_supplied_etas(
     if etas.names != model.eta_names {
         return Err(refusal(format!(
             "the supplied η are named [{}] but the model's are [{}]; supply every η of \
-             the model, in the model's order",
+             the model, in the model's order{}",
             etas.names.join(", "),
-            model.eta_names.join(", ")
+            model.eta_names.join(", "),
+            crate::types::dropped_zero_eta_note(model)
+                .map_or(String::new(), |n| format!(". Note: {n}"))
         )));
     }
     let resolved: Vec<Option<Vec<f64>>> =

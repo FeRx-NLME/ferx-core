@@ -53,6 +53,8 @@ fn model_src(omegas: &str, cl: &str, v: &str) -> String {
 }
 
 fn model(omegas: &str, cl: &str, v: &str) -> CompiledModel {
+    // These tests carry a `0 FIX` η through Ω (#1605, #2072); the parser would drop it (#3150).
+    let _keep = crate::parser::model_parser::KeepZeroFixEtas::on();
     parse_model_string(&model_src(omegas, cl, v)).expect("#1605 fixture parses")
 }
 
@@ -149,10 +151,11 @@ fn positive_definite_omega_draws_from_chol_unchanged() {
 #[test]
 fn structural_zero_leaves_the_fit_matrices_regularised_and_the_draw_exact() {
     let om = OmegaMatrix::from_diagonal(&[0.0, 0.09], vec!["ZERO".into(), "V".into()]);
-    // The fit path is untouched: `matrix`, `chol`, `inv`, `log_det` still describe the
-    // regularised Ω, exactly as at 3b88da7f.
+    // The fit path: `matrix`, `chol`, `inv`, `log_det` describe the regularised Ω. The floor is
+    // the zero's alone since #3150: the other η keeps its declared variance (it used to
+    // carry `+ 1e-8`, as at 3b88da7f).
     assert_eq!(om.matrix[(0, 0)], 1e-8);
-    assert_eq!(om.matrix[(1, 1)], 0.09 + 1e-8);
+    assert_eq!(om.matrix[(1, 1)], 0.09);
     assert_eq!(om.chol[(0, 0)], 1e-8f64.sqrt());
     // The draw is not: the zero row is exactly 0, the other η exactly its declared sd.
     let f = om.sim_draw_factor(None, &[]);
@@ -184,6 +187,25 @@ fn indefinite_omega_without_a_zero_row_keeps_drawing_from_chol() {
     let om = OmegaMatrix::from_matrix(m, vec!["A".into(), "B".into()], false);
     assert!(om.sim_chol.is_none());
     assert!(std::ptr::eq(&*om.sim_draw_factor(None, &[]), &om.chol));
+}
+
+/// #3150 (B): when structural zeros alone make Ω singular, the `1e-8` floor goes on the zero
+/// diagonals only. A `0 FIX` placeholder that stays used to add `1e-8` to every other η's
+/// variance too. A failure that is not a structural zero keeps the eigenvalue floor on all.
+#[test]
+fn the_floor_of_a_structural_zero_lands_on_its_own_diagonal_only() {
+    let names = || vec!["A".into(), "B".into(), "C".into()];
+    let om = OmegaMatrix::from_diagonal(&[0.09, 0.0, 0.04], names());
+    assert_eq!(
+        [om.matrix[(0, 0)], om.matrix[(1, 1)], om.matrix[(2, 2)]],
+        [0.09, 1e-8, 0.04],
+        "only the zero is floored"
+    );
+    assert!(om.matrix[(0, 1)] == 0.0 && om.matrix[(1, 2)] == 0.0);
+    // Not a structural zero: a non-PD Ω with no all-zero row takes the eigenvalue floor, on all.
+    let not_pd = nalgebra::DMatrix::from_row_slice(2, 2, &[0.04, 0.09, 0.09, 0.04]);
+    let om = OmegaMatrix::from_matrix(not_pd, vec!["A".into(), "B".into()], false);
+    assert!(om.matrix[(0, 0)] > 0.04 && om.matrix[(1, 1)] > 0.04, "{:?}", om.matrix);
 }
 
 #[test]

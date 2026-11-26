@@ -2578,10 +2578,22 @@ impl OmegaMatrix {
             None => {
                 // Taken from `m`, before the regularisation below touches it (#1605).
                 let sim_chol = structural_zero_factor(&m);
-                let eig = m.clone().symmetric_eigen();
-                let min_eig = eig.eigenvalues.min();
-                let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
-                let m_reg = &m + DMatrix::identity(n, n) * reg;
+                // Structural zeros alone made Ω singular: the floor goes on their diagonals and
+                // nowhere else, so a `0 FIX` placeholder that stays no longer adds `1e-8` to the
+                // other ηs' variances (#3150). Any other failure takes the eigenvalue floor.
+                let m_reg = if sim_chol.is_some() {
+                    let mut floored = m.clone();
+                    for i in
+                        (0..n).filter(|&i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0))
+                    {
+                        floored[(i, i)] = 1e-8;
+                    }
+                    floored
+                } else {
+                    let min_eig = m.clone().symmetric_eigen().eigenvalues.min();
+                    let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
+                    &m + DMatrix::identity(n, n) * reg
+                };
                 let c = m_reg.clone().cholesky().expect("Regularized matrix must be PD");
                 (m_reg, c.l(), c.inverse(), sim_chol)
             }
@@ -5578,6 +5590,19 @@ pub(crate) fn absorption_twin_decline_reason(model: &CompiledModel) -> Option<&s
         .find(|w| w.contains("W_ABSORPTION_TWIN_DECLINED"))
         .and_then(|w| w.split_once(TWIN_DECLINE_REASON_MARKER))
         .map(|(_, reason)| reason)
+}
+
+/// The parse note that lists the `omega NAME ~ 0 FIX` placeholder ηs a model dropped (#3150),
+/// and the token `parse_warning_to_code` keys on. It carries no `classify_warning` arm, so it is
+/// an ordinary warning. Like the twin-decline reason it lives in
+/// [`CompiledModel::parse_warnings`], not in a field of its own.
+pub(crate) const ZERO_FIX_ETA_TOKEN: &str = "W_ZERO_FIX_ETA_DROPPED";
+
+/// The [`ZERO_FIX_ETA_TOKEN`] note of `model`, if it dropped any placeholder η. An input sized
+/// for the declared Ω (a supplied Ω, a table of η) is refused for its shape; this is what the
+/// refusal quotes so the user sees which ηs are gone.
+pub(crate) fn dropped_zero_eta_note(model: &CompiledModel) -> Option<&str> {
+    model.parse_warnings.iter().map(String::as_str).find(|w| w.starts_with(ZERO_FIX_ETA_TOKEN))
 }
 
 /// FREM (Full Random Effects Model) configuration.
