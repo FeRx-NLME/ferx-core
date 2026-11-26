@@ -4056,9 +4056,13 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
              segment(s) to a stiff stepper {at}; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
-             size.{switched_info_clause} {provenance} Informational — set ode_method = \
-             {explicit} to pin the explicit stepper, or name a stiff method to pin the other \
-             half.",
+             size.{switched_info_clause} {provenance} Informational. The escalated \
+             segments are the ones the stiffness probe judged stiff, a verdict that can be wrong \
+             on a model that is not stiff. To skip the probe, name a stiff method (ode_method = \
+             rodas5p or rodas4), which then runs every segment. Pin {explicit} only if those \
+             segments are not stiff: on a stiff system it freeze-pads them and returns a wrong \
+             OFV, which W_ODE_SOLVER_DIAGNOSTICS reports. Compare the OFV against a stiff \
+             method before keeping it.",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             at = phase.at_label(),
             provenance = phase.provenance(),

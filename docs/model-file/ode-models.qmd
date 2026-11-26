@@ -840,6 +840,11 @@ pin a stepper, name one:
   ode_method = rk45      # or rodas4, rodas5p, rosenbrock23, vern7
 ```
 
+Pinning `rk45` on a model that is stiff does not skip a cost, it changes the answer: the stiff
+segments are freeze-padded and the OFV can be wrong by orders of magnitude (#3154), which
+`W_ODE_SOLVER_DIAGNOSTICS` reports. The `W_ODE_SOLVER_ESCALATION_NOTE` says how many segments
+`auto` escalated; compare the OFV against a stiff method before pinning `rk45`.
+
 Before each integration, ferx builds the Jacobian `J = ∂f/∂u` of your `[odes]` right-hand
 side at the state that integration is about to start from, and reads its eigenvalues. The
 discriminator is the fastest mode,
