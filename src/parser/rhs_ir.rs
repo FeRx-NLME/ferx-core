@@ -1253,8 +1253,14 @@ pub(super) fn dedup_calls(f: &Func, prefix: usize) -> (Func, usize) {
 
 /// `y·x^(y−1)`, the slope of `xʸ` in `x`. At `x = 0` with `y < 1` it is infinite, and the
 /// exactly-zero sensitivity of a state not yet reached made `0·∞ = NaN` of a gradient (#3151):
-/// there it is `0`, as the forward lanes' `0ⁿ` (flat) has it. `y_inst` is `y`'s instruction: a
-/// literal exponent of at least 1 needs no guard. The discarded arm runs on a safe base.
+/// there it is `0`, as the constant-exponent arm of [`Lower::pow`] has `0ⁿ` (flat). `y_inst` is
+/// `y`'s instruction: a literal exponent of at least 1 needs no guard in the program as written
+/// (the tangent program's `y − 1` is not folded, so it takes the guarded path at second order).
+/// The discarded arm runs on a safe base.
+///
+/// This assumes the base has no sensitivity where it is exactly 0, as a state before its first
+/// input does. A base that reaches exactly 0 while depending on θ gets a finite, quietly wrong
+/// slope here, where it used to be declined to finite differences; the case is rare.
 fn pow_slope(b: &mut Func, x: V, y: V, y_inst: Inst) -> V {
     let one = b.k(1.0);
     let ym1 = b.push(Inst::Sub(y, one));
@@ -1270,6 +1276,17 @@ fn pow_slope(b: &mut Func, x: V, y: V, y_inst: Inst) -> V {
     let p = b.push(Inst::Powf(xs, ym1));
     let yp = b.push(Inst::Mul(y, p));
     b.push(Inst::Select(sub, z, yp))
+}
+
+/// `ln x` of a power's base for the exponent's derivative, and whether it applies (`x > 0`).
+/// The log runs on `1` where it does not, so the arm a select discards stays finite: a zero
+/// adjoint through `ln 0` is `0·(−∞) = NaN`, which declined the second-order pass at any exponent
+/// (#3173).
+fn pow_ln_base(b: &mut Func, x: V) -> (V, V) {
+    let (z, one) = (b.k(0.0), b.k(1.0));
+    let pos = b.push(Inst::Cmp(Cc::Gt, x, z));
+    let safe = b.push(Inst::Select(pos, x, one));
+    (b.push(Inst::Call1(Shim1::Ln, safe)), pos)
 }
 
 /// The reverse pass of a forward [`Func`] of `n` arguments: a function of `2n` arguments
@@ -1461,11 +1478,10 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let yp = pow_slope(&mut b, fw(x), fw(y), fwd.insts[y as usize]);
                 let dx = b.push(Inst::Mul(g, yp));
                 acc(&mut b, &mut adj, live, x, dx, false);
-                let lx = b.push(Inst::Call1(Shim1::Ln, fw(x)));
+                let (lx, pos) = pow_ln_base(&mut b, fw(x));
                 let rl = b.push(Inst::Mul(map[i], lx));
                 let dy = b.push(Inst::Mul(g, rl));
                 let z = b.k(0.0);
-                let pos = b.push(Inst::Cmp(Cc::Gt, fw(x), z));
                 let dy = b.push(Inst::Select(pos, dy, z));
                 acc(&mut b, &mut adj, live, y, dy, false);
             }
@@ -1665,10 +1681,9 @@ pub(super) fn tangent(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
             Inst::Powf(x, y) if t(x).is_some() || t(y).is_some() => {
                 // As the reverse: `y·x^(y−1)` and, for `x > 0`, `r·ln x`.
                 let dx = pow_slope(&mut b, fw(x), fw(y), f.insts[y as usize]);
-                let lx = b.push(Inst::Call1(Shim1::Ln, fw(x)));
+                let (lx, pos) = pow_ln_base(&mut b, fw(x));
                 let rl = b.push(Inst::Mul(map[i], lx));
                 let z = b.k(0.0);
-                let pos = b.push(Inst::Cmp(Cc::Gt, fw(x), z));
                 let dy = b.push(Inst::Select(pos, rl, z));
                 lin(&mut b, k, &[(t(x), Some(dx), false), (t(y), Some(dy), false)])
             }
@@ -2134,5 +2149,45 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
         };
         x[i] = val;
         dx[i] = tan;
+    }
+}
+
+#[cfg(test)]
+mod pow_slope_tests {
+    use super::*;
+
+    /// `d(xʸ)/dx` as the reverse pass of a bare `Powf` reads it: an input `[x, y]` (or `[x]`
+    /// with a literal `y`), the power stored as the output, an output adjoint of 1.
+    fn slope(x: f64, y: Result<f64, f64>) -> f64 {
+        let mut f = Func::new(2);
+        let xv = f.push(Inst::Load { arg: 0, off: 0 });
+        let (yv, input) = match y {
+            Ok(live) => (f.push(Inst::Load { arg: 0, off: 1 }), vec![x, live]),
+            Err(lit) => (f.k(lit), vec![x]),
+        };
+        let r = f.push(Inst::Powf(xv, yv));
+        f.push(Inst::Store { arg: 1, off: 0, v: r });
+        let rev = reverse(&f);
+        let (mut inp, mut out) = (input.clone(), vec![0.0]);
+        let (mut inp_bar, mut out_bar) = (vec![0.0; input.len()], vec![1.0]);
+        interpret(&rev, &mut [&mut inp, &mut out, &mut inp_bar, &mut out_bar]);
+        inp_bar[0]
+    }
+
+    /// #3170: `y·x^(y−1)` at a zero base is flat below `y = 1` (`0` where it would be `∞`), `1`
+    /// at `y = 1` and `0` above it, as the forward lanes' `0ⁿ` has it; away from zero it is the
+    /// power rule. Pins the `y < 1` conjunct (`y = 1` must stay `1`) and both arms of the guard,
+    /// and a literal exponent, which takes the unguarded path, agrees where it applies.
+    #[test]
+    fn the_power_rule_slope_at_a_zero_base_is_flat_below_one_and_unchanged_elsewhere() {
+        for (x, y, want) in
+            [(0.0, 0.5, 0.0), (0.0, 1.0, 1.0), (0.0, 2.0, 0.0), (4.0, 0.5, 0.25), (4.0, 2.0, 8.0)]
+        {
+            let got = slope(x, Ok(y));
+            assert!((got - want).abs() < 1e-15, "x = {x}, y = {y}: {got} vs {want}");
+        }
+        assert_eq!(slope(0.0, Err(2.0)), 0.0);
+        assert_eq!(slope(0.0, Err(1.0)), 1.0);
+        assert_eq!(slope(3.0, Err(2.0)), 6.0);
     }
 }
