@@ -1201,6 +1201,11 @@ pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
     lag <= dose.ii
 }
 
+/// [`ss_arrival_is_trough`] for a lag of any type: the same `lag ≤ II`, a recorded branch.
+pub(crate) fn ss_arrival_is_trough_g<G: crate::sens::num::PkNum>(dose: &DoseEvent, lag: G) -> bool {
+    lag.br_cmp_c(crate::sens::num::BranchCmp::Le, dose.ii)
+}
+
 /// Ordering slack shared by every [`tad_referent`] caller. `1e-12` is the value all four
 /// TAD folds already used before they were collapsed onto this function; it is deliberately
 /// *not* [`crate::ode::predictions::EVENT_MATCH_TOL`], which answers a different question

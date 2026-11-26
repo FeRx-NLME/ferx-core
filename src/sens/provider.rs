@@ -82,30 +82,21 @@ fn prog_covers_required_pk_slots(
 }
 
 /// Elapsed time since a dose's *lagged* arrival, as a dual carrying the lagtime
-/// sensitivity (`∂elapsed/∂lagtime = −1`). Mirrors `crate::pk::predict_concentration`:
-/// the dose contributes from `dose.time + lagtime` onward, and a steady-state
-/// dose additionally shows its pre-arrival tail (the previous interval's pulse)
-/// by wrapping the negative elapsed time up into `[0, II)`. Returns `None` when
+/// sensitivity (`∂elapsed/∂lagtime = −1`). For `lag ≤ II` this mirrors
+/// `crate::pk::predict_concentration`: the dose contributes from `dose.time + lagtime`
+/// onward, and a steady-state dose additionally shows its pre-arrival tail (the previous
+/// interval's pulse) by wrapping the negative elapsed time up into `[0, II)`. The depot
+/// amounts keep this wrap for every lag (#3028); the concentrations leave it at `lag > II`. Returns `None` when
 /// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
 /// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
 ///
-/// Known divergence, confined to `ALAG > II`: this *wraps* the pre-arrival phase where
-/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
-/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and always takes the collapsed
-/// `C_ss(t − t_eff)` where production splits into tail + arrival once
-/// `!crate::dosing::ss_arrival_is_trough`; predictions measured up to ~19 % from production's
-/// there. It needs its own fix and its own anchor.
+/// Past `ALAG > II` this *wraps* the pre-arrival phase, as the depot amounts' production twin
+/// (`pk::analytical_state_at_times`) does; the concentrations take [`ss_lag_past_ii`] there.
 #[inline]
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
     use crate::sens::num::BranchCmp as B;
     let t_eff = dose.time + lag_val;
-    // A recording decides on its own lag, through the branch API (#2786): the same sum.
-    let arrived = if T::RECORDS_BRANCHES {
-        lag_d.br_shift_cmp(dose.time, B::Le, t_obs)
-    } else {
-        t_eff <= t_obs
-    };
-    if arrived {
+    if arrived(dose, t_obs, lag_val, lag_d) {
         // `elapsed = (t_obs − dose.time) − lagtime`.
         Some(T::from_f64(t_obs - dose.time) - lag_d)
     } else if dose.ss && dose.ii > 0.0 && t_obs >= dose.time {
@@ -130,6 +121,37 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
         }
     } else {
         None
+    }
+}
+
+/// An `SS=1` dose whose lag is past `II`, as `crate::pk::predict_concentration` reads it
+/// (#1121): the train from its pulse on the record (`crate::dosing::ss_seed_phase` is `0`),
+/// plus the one real dose arriving at `t_eff` once it has — `(ss_elapsed, arrival_elapsed)`.
+/// `None` for every other dose, which [`lagged_elapsed`] serves (#1353: its wrap and collapsed
+/// arrival put the jets ~19 % from these predictions, the outer gradient 100 % off).
+#[inline]
+fn ss_lag_past_ii<T: PkNum>(
+    dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T,
+) -> Option<(T, Option<T>)> {
+    if !(dose.ss
+        && dose.ii > 0.0
+        && t_obs >= dose.time
+        && !crate::dosing::ss_arrival_is_trough_g(dose, lag_d))
+    {
+        return None;
+    }
+    let since = T::from_f64(t_obs - dose.time);
+    Some((since, arrived(dose, t_obs, lag_val, lag_d).then(|| since - lag_d)))
+}
+
+/// Whether `dose` has arrived by `t_obs` (`dose.time + lag ≤ t_obs`); a recording decides on its
+/// own lag, through the branch API (#2786): the same sum.
+#[inline]
+fn arrived<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> bool {
+    if T::RECORDS_BRANCHES {
+        lag_d.br_shift_cmp(dose.time, crate::sens::num::BranchCmp::Le, t_obs)
+    } else {
+        dose.time + lag_val <= t_obs
     }
 }
 
@@ -250,7 +272,8 @@ fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
 /// (a dose **recorded** before `reset_floor` is excluded, even one whose lagged arrival
 /// comes after the reset: NONMEM cancels it, and so does the event-driven walk, #1587 —
 /// before which both kept it, PR #381 #2). `elapsed`
-/// carries the lagtime shift and the SS pre-arrival tail wrap (`lagged_elapsed`).
+/// carries the lagtime shift and the SS pre-arrival tail ([`lagged_elapsed`], or
+/// [`ss_lag_past_ii`] with its arrival as a term of its own).
 /// Generic over the seeded number type, so every recording the adjoint makes through
 /// `analytic_static_predictions` shares the one dispatch ladder.
 #[inline]
@@ -266,10 +289,15 @@ fn superpose_doses<T: PkNum>(
         {
             continue;
         }
-        let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
-            continue;
+        let (elapsed, arrival) = match ss_lag_past_ii(dose, t_obs, d.lag_val, d.lag_d) {
+            Some(terms) => terms,
+            None => match lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) {
+                Some(e) => (e, None),
+                None => continue,
+            },
         };
-        // Each dose's term its own chunk: its code depends on the dose's kind and the model, not
+        // Each dose's term its own chunk (an arrival past `lag = II` one more): its code depends on
+        // the dose's kind and the model, not
         // on how many doses came before, so subjects with different designs share it (their
         // times and amounts are the chunk's literals) and it is compiled once per model (#2980).
         T::chunk_mark();
@@ -278,26 +306,36 @@ fn superpose_doses<T: PkNum>(
         // this recording and the prediction it differentiates serve the same constant
         // (#2104). First in the ladder, so a disposition `with_disposition` declined to
         // build is never asked for.
-        let c = if let Some(v) = d.dose_override(flags) {
-            v
-        } else if flags.transit {
-            one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
-        } else if flags.two_cpt_transit {
-            two_cpt_transit_conc_g(
-                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.n_d, d.mtt_d, d.f_d,
-            )
-        } else if flags.ig {
-            one_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.mat_d, d.cv2_d, d.f_d)
-        } else if flags.two_cpt_ig {
-            two_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d)
-        } else if let Some(disp) = d.three.as_ref().filter(|_| flags.three_cpt) {
-            three_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
-        } else if let Some(disp) = d.two.as_ref().filter(|_| flags.two_cpt) {
-            two_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
-        } else {
-            one_cpt_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.ka_d, d.f_d, flags.oral)
+        let conc = |dose: &DoseEvent, elapsed: T| {
+            if let Some(v) = d.dose_override(flags) {
+                v
+            } else if flags.transit {
+                one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
+            } else if flags.two_cpt_transit {
+                two_cpt_transit_conc_g(
+                    dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.n_d, d.mtt_d, d.f_d,
+                )
+            } else if flags.ig {
+                one_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.mat_d, d.cv2_d, d.f_d)
+            } else if flags.two_cpt_ig {
+                two_cpt_ig_conc_g(
+                    dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d,
+                )
+            } else if let Some(disp) = d.three.as_ref().filter(|_| flags.three_cpt) {
+                three_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
+            } else if let Some(disp) = d.two.as_ref().filter(|_| flags.two_cpt) {
+                two_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
+            } else {
+                one_cpt_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.ka_d, d.f_d, flags.oral)
+            }
         };
-        fd = fd + c;
+        fd = fd + conc(dose, elapsed);
+        if let Some(a) = arrival {
+            T::chunk_mark();
+            let mut single = dose.clone();
+            single.ss = false;
+            fd = fd + conc(&single, a);
+        }
     }
     fd
 }
