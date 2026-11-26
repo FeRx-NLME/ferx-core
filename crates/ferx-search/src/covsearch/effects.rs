@@ -8,8 +8,8 @@
 //! `categorical2`), with the centre
 //! written out as the data-derived statistic PsN's `scm` uses — the median
 //! for a continuous covariate, the most common level for a categorical one —
-//! and the θ left to the block's defaults, which are PsN's inits and bounds
-//! verbatim. Nothing here invents a number.
+//! and the θ left to the block's default inits and bounds.
+//! Nothing here invents a number.
 //!
 //! MFL's operator argument — `COVARIATE?(CL, WT, lin, +)` — maps onto the
 //! block's trailing operator token (#1313). ferx's additive effect is
@@ -105,7 +105,7 @@ impl Effect {
     ///
     /// The centring statistic is written explicitly rather than left to the
     /// block's default so the final model reads as what ran; the θ clause is
-    /// omitted so the block supplies PsN's default init and bounds for the
+    /// omitted so the block supplies its default init and bounds for the
     /// form, computed from the data it is bound to.
     pub fn relation(&self) -> Relation {
         let center = match self.form {

@@ -1177,7 +1177,7 @@ fn an_additive_effect_is_a_candidate_and_adds_exactly_one_free_theta() {
     );
 
     // The candidate and the base differ by exactly one estimated θ. Both are
-    // bound to the same data, since `linear`'s PsN bounds are data-derived.
+    // bound to the same data, since `linear`'s default bounds are data-derived.
     let population = ferx_core::read_nonmem_csv(
         cfg.data.as_ref().expect("the config names a dataset"),
         None,

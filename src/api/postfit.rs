@@ -1344,7 +1344,7 @@ const BOUNDARY_REL_TOL: f64 = 1e-3;
 /// absolute gap. An identity-packed theta (lower bound `< 0`) is judged by
 /// its distance to **each bound on that bound's own scale**, never by its
 /// position as a fraction of the declared range: the two are the same thing
-/// for `(-1, 1)` and very different for PsN's `scm` defaults `(-100, 1e6)`,
+/// for `(-1, 1)` and very different for the `[covariate_model]` defaults `(-100, 1e6)`,
 /// where a range fraction would call every estimate below ~900 "at the lower
 /// bound" — which is what every `[covariate_model]` power / exponential θ
 /// carries, and what excluded every candidate of the first covsearch run

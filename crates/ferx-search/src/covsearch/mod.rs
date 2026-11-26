@@ -40,7 +40,7 @@
 //!
 //! **Between steps** each child starts from its parent's final estimates
 //! ([`ModelEdit::SeedInits`], Pharmpy's `update_initial_estimates`); the new
-//! relation's θ takes the block's PsN default for its form.
+//! relation's θ takes the block's default for its form.
 //!
 //! # What the report says
 //!

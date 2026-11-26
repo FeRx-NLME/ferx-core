@@ -20,7 +20,7 @@
 //! crossed the line (A2).
 //!
 //! First inhabitant: [`bootstrap`] (#1140), the non-parametric case bootstrap
-//! at `PsN::bootstrap` feature parity. It is the boundary rule made concrete —
+//! modelled on `PsN::bootstrap`. It is the boundary rule made concrete —
 //! 200+ calls to [`ferx_core::fit`] over resampled data, and no numerics of its
 //! own.
 

@@ -664,9 +664,8 @@ pub fn params_from_estimates(template: &ModelParameters, flat: &[f64]) -> ModelP
 /// never declares as a covariate (so it is not on the subject at all), and the
 /// values are compared as *strings*, so a non-numeric group label works.
 ///
-/// Enforces PsN's rule that the column take exactly one value per individual —
-/// "the algorithm requires that an individual can unambiguously be categorized
-/// according to the stratification variable" — naming the offending subject.
+/// Enforces that the column takes exactly one value per individual, as PsN also
+/// requires, naming the offending subject.
 pub fn strata_from_csv(
     data_path: &str, column_map: &[(String, String)], population: &Population, stratify_on: &str,
 ) -> Result<Strata, String> {
@@ -883,8 +882,7 @@ fn reject_mixture_model(params: &ModelParameters) -> Result<(), String> {
 /// Resampling with replacement necessarily renames the duplicate copies of a
 /// subject (see [`resample::build_population`]), so a model that reads `ID` as a
 /// covariate would silently see different values than it did in the base fit.
-/// PsN documents the same hazard as a known bug — "model code that relies on ID
-/// numbers will lead to errors" — and leaves it to the user. Fail instead.
+/// PsN documents the same hazard and leaves it to the user. Fail instead.
 fn reject_id_dependent_model(model: &CompiledModel) -> Result<(), String> {
     reject_id_dependent(&model.referenced_covariates)
 }
@@ -1319,8 +1317,8 @@ fn load_resumable(
 /// Recompute the summary of a finished run from its `raw_results.csv`, under a
 /// different set of exclusion criteria — PsN's `-summarize`.
 ///
-/// Refits nothing. This is what the "too many samples were filtered out" case in
-/// the PsN guide's recovery section asks for: the estimates are already on disk,
+/// Refits nothing. This serves a run whose filters excluded more replicates than
+/// intended: the estimates are already on disk,
 /// and so are the diagnostics the filters read, so changing
 /// `--no-skip-minimization-terminated` (say) is a re-read, not a re-run.
 ///

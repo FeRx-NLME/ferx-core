@@ -1,7 +1,8 @@
 //! The Model Feature Language (MFL): the grammar a `.ferxsearch` file states
 //! its search space in (#1179).
 //!
-//! The grammar is Pharmpy's, reused verbatim so a search space written for
+//! The grammar is compatible with Pharmpy 2.0.0's (one deviation
+//! below), so a search space written for
 //! Pharmpy's `modelsearch` / `covsearch` / `iivsearch` transfers without
 //! translation and so a space is quotable in an issue or a paper:
 //!
