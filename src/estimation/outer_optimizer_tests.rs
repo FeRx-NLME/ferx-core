@@ -15720,9 +15720,11 @@ fn a_round_does_not_take_a_stop_from_its_restart() {
 }
 
 /// #2645, the side where the cold modes win. Warm legs alone verify the stop on the modes the
-/// fit holds; the pass finds the lower optimum another mode leads to. Measured gain 0.0097 on
-/// Linux aarch64 and 0.0094 on macOS arm64, the steadiest of 60 simulated datasets across the
-/// two: the bound is a tenth of that.
+/// fit holds; the pass finds the lower optimum another mode leads to. Re-picked for #3153,
+/// whose opening-step scale moved the original `cold_wins.csv` fit to the optimum without
+/// needing the pass: this data is the original with each observation given 8% multiplicative
+/// Gaussian noise (seed 33 of 60 tried, the fastest to meet the premise), simulated, not
+/// measured. Gain 0.2468 on Linux x86_64; the bound is under a fourth of that.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -15749,8 +15751,9 @@ fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
 }
 
 /// #2645, the Newton pass: the legs settle on a stop that is no minimum, and a leg from the
-/// capped BHHH step leaves it. Measured gain 0.81 on Linux aarch64, 0.83 on macOS arm64, with
-/// no help from the cold modes on this dataset (their pass gains 0 on both).
+/// capped BHHH step leaves it. Re-picked for #3153 alongside `cold_wins.csv` above, same
+/// noise and search: seed 33's `newton_wins.csv` gains 1.2673 on Linux x86_64; the bound is
+/// under a third of that.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
