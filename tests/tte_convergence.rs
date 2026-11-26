@@ -1252,7 +1252,7 @@ const RTTE_SIM_ANCHOR_CSV: &str =
 /// external corroboration that the RTTE **simulator** is correct — a biased sampler
 /// would move both engines off the data-generating values.
 ///
-/// NONMEM LAPLACE (`nonmem.lst`, telescoping-AG `$PRED`): TVLAMBDA = 0.15617,
+/// NONMEM LAPLACE (`nonmem.nm.json`, telescoping-AG `$PRED`): TVLAMBDA = 0.15617,
 /// ω² = 0.12801, OFV = 5557.266. ferx FOCEI fits the identical file through the real
 /// datareader and must reproduce them to a few significant figures (this reuses the
 /// Slice 3.1 finding that ferx FOCEI ≡ NONMEM LAPLACE for constant-hazard RTTE). The ω²
@@ -1261,7 +1261,7 @@ const RTTE_SIM_ANCHOR_CSV: &str =
 /// by `rtte_sampler_injects_correct_frailty_variance`.
 #[test]
 fn rtte_sim_anchor_ferx_matches_nonmem() {
-    // NONMEM LAPLACE on the same ferx-simulated file (see nonmem.lst / nonmem.ext).
+    // NONMEM LAPLACE on the same ferx-simulated file (see nonmem.nm.json / nonmem.ext).
     const NM_LAMBDA: f64 = 0.15617;
     const NM_OMEGA2: f64 = 0.12801;
     const NM_OFV: f64 = 5557.266;

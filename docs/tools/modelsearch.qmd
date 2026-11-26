@@ -412,7 +412,7 @@ LAGTIME([OFF,ON])` run exhaustively. The base was fitted in NONMEM
 (`base.ctl`); the three candidates were written by hand the way the search
 writes them — seeded from the base's `.ext`, with `Q = CL`, `V2 = 0.05 · V`,
 `ALAG = 0.25` and an η of 0.01 on the lag — and fitted (`lag.ctl`, `p1.ctl`,
-`p1_lag.ctl`). The control streams, `.lst` and `.ext` files are under
+`p1_lag.ctl`). The control streams, `.nm.json` (numbers extracted from the listing) and `.ext` files are under
 `crates/ferx-search/tests/nonmem/modelsearch_anchor/`, and
 `tests/modelsearch_nonmem_anchor.rs` replays the comparison.
 

@@ -5,9 +5,9 @@
 //! — with every candidate's OFV within tolerance of NONMEM's.
 //!
 //! The PsN side is committed under `tests/psn/scm_anchor/`: `base.mod` and
-//! `scm.conf` are what PsN ran, `scmlog.txt` is what it wrote, and
+//! `scm.conf` are what PsN ran, `results.csv` holds the numbers it reported, and
 //! `base.ferx` / `scm.ferxsearch` are their ferx twins. The numbers below are
-//! transcribed from `scmlog.txt`.
+//! transcribed from `results.csv`.
 //!
 //! Why `p = 0.05` in both directions: at PsN's usual `p_forward = 0.01` the
 //! first step's runner-up, CL-WT, misses the 6.63 cutoff by 0.04 OFV, and at
@@ -26,7 +26,7 @@ use ferx_search::search::SearchConfig;
 
 const ANCHOR_DIR: &str = "tests/psn/scm_anchor";
 
-/// `scmlog.txt`, step 1: every candidate against the base model.
+/// `results.csv`, step 1: every candidate against the base model.
 const PSN_BASE_OFV: f64 = -696.79434;
 const PSN_STEP1: &[(&str, &str, f64)] = &[
     ("CL", "CRCL", -703.55245),

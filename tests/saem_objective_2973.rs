@@ -445,7 +445,7 @@ struct ExtTable {
     /// The `ITERATION = -1000000000` row, empty when the run ended before writing it.
     last: HashMap<String, f64>,
     /// The final iteration row, which is what NONMEM reports when the `-1000000000` row is
-    /// missing (the `logit_fraction_saem` stream: its `.lst` aborts after both stages).
+    /// missing (the `logit_fraction_saem` stream: its listing aborts after both stages).
     last_iter: HashMap<String, f64>,
     /// `OBJ` of each iteration row (`ITERATION >= 0`).
     iter_obj: Vec<f64>,
