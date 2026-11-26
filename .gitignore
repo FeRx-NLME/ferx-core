@@ -27,5 +27,8 @@ bench_*.csv
 data/external/
 mbma_canakinumab*.csv
 
+# Third-party tool listings and logs: extract the numbers instead (#3182)
+*.lst
+
 # Python bytecode from the nonmem_anchor reference scripts
 __pycache__/

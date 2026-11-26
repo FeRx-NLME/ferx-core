@@ -9,7 +9,7 @@
 //! The kit is `nonmem_anchor/moving_infusion_end*`: the dataset (60 subjects, four doses q12h,
 //! sampled 1, 2, 2.5, 3, 6 and 11.5 h after each, simulated from the closed form by
 //! `moving_infusion_end_gen.py`), the estimation control stream (NONMEM 7.6.0 `ADVAN1 TRANS2`,
-//! `METHOD=1 INTERACTION`; results in `nonmem_anchor/results/moving_infusion_end.{ext,lst}`), and
+//! `METHOD=1 INTERACTION`; results in `nonmem_anchor/results/moving_infusion_end.{ext,nm.json}`), and
 //! the evaluation control stream this test is anchored on.
 //!
 //! ## What this anchors — the objective at fixed parameters, subject by subject

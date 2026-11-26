@@ -1,0 +1,43 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "dtmm_ss_record_order.csv",
+ "data_records": 11,
+ "observations": 7,
+ "individuals": 2,
+ "nmtran_warnings": [2, 46],
+ "markers": [],
+ "steps": [
+  {
+   "method": "First Order (Evaluation)",
+   "objv": 724.714,
+   "final": {
+    "theta": [1.0, 10.0],
+    "omega": {
+     "ETA1": [0.0]
+    },
+    "sigma": {
+     "EPS1": [1.0]
+    }
+   },
+   "markers": []
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM #2473 a record listed before a same-TIME SS=1 dose reads the pre-dose history, one after it the SS state",
+  "$INPUT ID TIME AMT DV MDV EVID SS II",
+  "$DATA dtmm_ss_record_order.csv IGNORE=@",
+  "$SUBROUTINE ADVAN1 TRANS2",
+  "$PK",
+  "  CL = THETA(1)",
+  "  V  = THETA(2)",
+  "$ERROR",
+  "  IPRED = A(1)/V",
+  "  Y = IPRED + EPS(1)",
+  "$THETA 1 FIX",
+  "$THETA 10 FIX",
+  "$OMEGA 0 FIX",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION MAXEVAL=0",
+  "$TABLE ID TIME EVID SS IPRED NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=dtmm_ss_record_order.tab"
+ ]
+}

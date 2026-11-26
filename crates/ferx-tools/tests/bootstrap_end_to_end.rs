@@ -276,8 +276,7 @@ fn a_small_bootstrap_runs_end_to_end_and_writes_every_artefact() {
 #[test]
 fn the_drawn_datasets_do_not_depend_on_the_thread_count() {
     // The reproducibility claim, on the real model: the same seed must give the
-    // same replicates whether the run is serial or parallel. PsN's guide
-    // documents the opposite behaviour as a known wart.
+    // same replicates whether the run is serial or parallel.
     let mut p = prepared();
     p.parsed.fit_options.outer_maxiter = 1;
 
@@ -922,7 +921,7 @@ fn a_stratified_run_keeps_every_replicate_at_the_stratum_sizes() {
 fn a_stratification_column_that_varies_within_a_subject_is_refused_on_real_data() {
     use std::io::Write;
     // Same dataset, but the column now changes between records of one subject —
-    // PsN's "at least one individual has multiple values" error.
+    // a subject with more than one stratum value must be refused.
     let src = std::fs::read_to_string(DATA).expect("warfarin data");
     let mut lines = src.lines();
     let header = lines.next().expect("header row");

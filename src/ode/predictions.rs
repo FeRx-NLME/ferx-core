@@ -8694,6 +8694,19 @@ pub fn ode_predictions_ekf_with_diffusion(
     ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject, diffusion_var: &[f64],
     r_obs_fn: impl Fn(f64) -> f64,
 ) -> (Vec<f64>, Vec<f64>) {
+    ode_predictions_ekf_with_diffusion_rows(ode, pk_params_flat, subject, diffusion_var, |_, f| {
+        r_obs_fn(f)
+    })
+}
+
+/// [`ode_predictions_ekf_with_diffusion`] with a per-row residual variance:
+/// `r_obs_fn(j, mean)` is observation `j`'s Kalman `R` at the filter's mean, so a
+/// magnitude row, `weight =`, a `power` exponent, `block_sigma`'s rho and `exp(2 eta_r)` all
+/// reach the update the way the scoring applies them (#3126).
+pub(crate) fn ode_predictions_ekf_with_diffusion_rows(
+    ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject, diffusion_var: &[f64],
+    r_obs_fn: impl Fn(usize, f64) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::{solve_ekf_g, ProgramRhs};
 
     // Resolve modeled-RATE doses once (#324): `solve_ekf_g` reads `subject.doses` directly
@@ -8704,8 +8717,8 @@ pub fn ode_predictions_ekf_with_diffusion(
     // The Kalman update's R at the filter's own mean, read off the one solve (the mean of the
     // EKF is the ODE's): correct for proportional and combined error models. An unusable
     // variance reads as 1.
-    let r_of = |_: usize, mean: f64| {
-        let v = r_obs_fn(mean);
+    let r_of = |j: usize, mean: f64| {
+        let v = r_obs_fn(j, mean);
         if v.is_finite() && v > 0.0 {
             v
         } else {

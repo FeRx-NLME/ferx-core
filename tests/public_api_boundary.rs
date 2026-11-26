@@ -1,4 +1,5 @@
-//! Guards for the `ferx-core` / `ferx-tools` / `ferx-cli` split (#1114).
+//! Guards for the `ferx-core` / `ferx-tools` / `ferx-search` / `ferx-cli` split
+//! (#1114, #3185).
 //!
 //! The committed baseline at `api/ferx-core-public-api.txt` (A2) is the main
 //! enforcement of the API boundary, and CI diffs it via
@@ -95,8 +96,8 @@ fn strip_toml_comment(line: &str) -> &str {
     line
 }
 
-/// **A1 — one-way dependency.** `ferx-core` never depends on `ferx-tools` or
-/// `ferx-cli`.
+/// **A1 — one-way dependency.** `ferx-core` never depends on `ferx-tools`,
+/// `ferx-search` or `ferx-cli`.
 ///
 /// Cargo would reject an actual cycle, but not every violation is a cycle: a
 /// `dev-dependency` on `ferx-cli` compiles fine and would quietly make the core
@@ -117,13 +118,53 @@ fn ferx_core_does_not_depend_on_the_layers_above_it() {
     let package_code =
         package_section.lines().map(strip_toml_comment).collect::<Vec<_>>().join("\n");
 
-    for forbidden in ["ferx-tools", "ferx-cli"] {
+    for forbidden in ["ferx-tools", "ferx-search", "ferx-cli"] {
         assert!(
             !package_code.contains(forbidden),
             "the `ferx-core` package must not depend on `{forbidden}` in any \
              dependency table (#1114 A1) — the dependency is strictly one-way"
         );
     }
+}
+
+/// **One-way dependency between the members (#3185).** `ferx-search` →
+/// `ferx-tools` → `ferx-core`, and the CLI on top of both. The crate boundary
+/// around model search is a license boundary, so `ferx-tools` must not reach
+/// `ferx-search` in any dependency table. As in A1, a `dev-dependency` is the
+/// violation Cargo would accept, and so is an optional one.
+///
+/// The whole manifest is scanned: comments are stripped, and no other field of a
+/// member's manifest has a reason to name a crate above it.
+#[test]
+fn ferx_tools_does_not_depend_on_the_layers_above_it() {
+    let code = |member: &str| {
+        std::fs::read_to_string(repo_root().join("crates").join(member).join("Cargo.toml"))
+            .unwrap_or_else(|e| panic!("read the `{member}` manifest: {e}"))
+            .lines()
+            .map(strip_toml_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    for (member, forbidden) in [
+        ("ferx-tools", ["ferx-search", "ferx-cli"].as_slice()),
+        ("ferx-search", ["ferx-cli"].as_slice()),
+    ] {
+        let manifest = code(member);
+        for name in forbidden {
+            assert!(
+                !manifest.contains(name),
+                "`{member}` must not depend on `{name}` in any dependency table (#3185): the \
+                 dependency runs `ferx-search` -> `ferx-tools` -> `ferx-core` only"
+            );
+        }
+    }
+
+    // Non-degeneracy: the allowed direction is really spelled this way, so a
+    // renamed crate or a dependency moved elsewhere cannot leave the scan above
+    // looking for a name that no manifest uses.
+    assert!(code("ferx-search").contains("ferx-tools ="), "ferx-search uses `run_in_lanes`");
+    assert!(code("ferx-cli").contains("ferx-search ="), "ferx-cli has the search subcommands");
 }
 
 // ── Checked-in `ferx` CLI invocations ───────────────────────────────────────
@@ -534,6 +575,7 @@ fn every_public_options_type_implements_default() {
         "BootstrapOptions",
         "GamOptions",
         "RunOptions",
+        "AmdOptions",
     ] {
         assert!(found(anchor), "the scan did not find `{anchor}`");
     }

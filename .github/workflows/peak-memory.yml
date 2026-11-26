@@ -36,7 +36,11 @@ jobs:
   peak-memory:
     name: Peak memory (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    # peakmem.py's CASE_TIMEOUT_S (eval 1800 s + fit 8100 s = 165 min) plus 25 min for a
+    # cold fat-LTO build, the report and the upload. Below that sum, a slow night is
+    # killed by the job before peakmem.py can record its timeout and upload the logs that
+    # explain it. tests/peak_memory_probe.rs pins the inequality.
+    timeout-minutes: 190
     steps:
       - uses: actions/checkout@v7
 

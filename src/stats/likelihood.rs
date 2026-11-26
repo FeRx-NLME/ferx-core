@@ -798,7 +798,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
 pub(crate) fn population_variance_preds(
     model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize,
 ) -> Option<Vec<f64>> {
-    if !model.error_spec.has_f_dependent_variance() {
+    if !model.has_f_dependent_variance() {
         return None;
     }
     let zeros = vec![0.0_f64; n_eta];
@@ -813,7 +813,7 @@ pub(crate) fn population_variance_preds_iov(
     model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize, n_kappa: usize,
     k_occasions: usize,
 ) -> Option<Vec<f64>> {
-    if !model.error_spec.has_f_dependent_variance() {
+    if !model.has_f_dependent_variance() {
         return None;
     }
     let zeros_eta = vec![0.0_f64; n_eta];
@@ -947,14 +947,16 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     // For SDE models, compute per-observation EKF process-noise variance and
     // add it to the residual variance to form V_total.
     let p_obs = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta, sigma_values)
+        ekf_p_obs(model, subject, theta, eta, sigma_values, residual_cov.pairs, ruv_mult)
     } else {
         Vec::new()
     };
     // IIV on residual error: per-subject scale on the residual *variance*
     // (`EPS·EXP(ETA)` → V·exp(2·η_ruv)). 1.0 when no `iiv_on_ruv` is set.
     // Does not touch FREM covariate pseudo-observations (handled below before
-    // this factor is applied) or the EKF process noise `p_obs`.
+    // this factor is applied). It is not applied to the EKF process noise `p_obs`
+    // here; `p_obs` already carries `exp(2·η_ruv)` through the filter's Kalman `R`
+    // (`ekf_p_obs`, #3126), at η even when this scoring freezes it.
     let ruv_scale = if frozen_var_preds.is_some() { 1.0 } else { model.residual_var_scale(eta) };
     let mut data_ll = 0.0;
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
@@ -1005,21 +1007,15 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             // model's declaration: this row-wise branch serves a correlated model whenever
             // it has censored or FREM rows, and its ρ must be the one being estimated.
             // Identical to `residual_variance_at_scaled` when the two coincide.
-            let v_resid = match ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice) {
-                Some(m) => model.error_spec.variance_at_scaled(
-                    err_keys[j],
-                    f_var,
-                    sigma_values,
-                    residual_cov.pairs,
-                    m,
-                ),
-                None => model.error_spec.variance_at_with_correlations(
-                    err_keys[j],
-                    f_var,
-                    sigma_values,
-                    residual_cov.pairs,
-                ),
-            } * ruv_scale;
+            let v_resid = row_residual_variance(
+                model,
+                err_keys[j],
+                f_var,
+                sigma_values,
+                residual_cov.pairs,
+                ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+                ruv_scale,
+            );
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if model.bloq_in_force().is_censored_row(cens) {
@@ -1283,10 +1279,40 @@ fn obs_nll_subject_from_preds_with_semantics(
     }
 }
 
+/// One Gaussian row's residual variance, without any EKF `p_obs`: the magnitude row
+/// `mult_row` (#484, carrying `weight =` and a `power` exponent, #1029/#1182) and the live
+/// `block_sigma` correlations `pairs` (#847), times the `iiv_on_ruv` factor `ruv_scale`.
+///
+/// The **one** definition shared by the row-wise scoring and the EKF's Kalman `R`
+/// ([`ekf_p_obs`], #3126). With no row and no correlations it reduces to
+/// `variance_at` → `residual_variance` — never `variance_at_scaled` with an all-ones row,
+/// which associates differently by ~1 ULP — and `* 1.0` is exact, so a plain model is
+/// bit-identical to the pre-#3126 formula.
+#[inline]
+pub(crate) fn row_residual_variance(
+    model: &CompiledModel, key: usize, f: f64, sigma_values: &[f64],
+    pairs: &[crate::types::ResidualCorrelation], mult_row: Option<&[f64]>, ruv_scale: f64,
+) -> f64 {
+    (match mult_row {
+        Some(m) => model.error_spec.variance_at_scaled(key, f, sigma_values, pairs, m),
+        None => model.error_spec.variance_at_with_correlations(key, f, sigma_values, pairs),
+    }) * ruv_scale
+}
+
 /// Per-observation EKF process-noise variance (`p_obs`) for an SDE model; empty when
 /// `!model.is_sde()`. Also read by the level binder's rank check (#2421).
+///
+/// The Kalman update's `R` for observation `j` is that row's scored residual variance
+/// ([`row_residual_variance`], #3126): the caller's magnitude row `ruv_mult[j]` (the same
+/// matrix its scoring reads — this function never evaluates `ruv_obs_mult` itself, which
+/// would re-run the magnitude program on every η evaluation), the live `block_sigma`
+/// correlations `pairs`, and `exp(2η_r)`. There is **no frozen mode**: `R` is the
+/// conditional row variance at the filter's own mean and at `eta`, for every caller —
+/// including non-interaction FOCE, whose EBE scoring freezes `f` and drops `exp(2η_r)`
+/// (#1722). The adjoint's recording (`record_sde_p`) reads the same quantity.
 pub(crate) fn ekf_p_obs(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], sigma_values: &[f64],
+    pairs: &[crate::types::ResidualCorrelation], ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
     let (start, state_indices) = match model.diffusion_theta_start {
         Some(s) => (s, &model.diffusion_state_indices),
@@ -1311,21 +1337,35 @@ pub(crate) fn ekf_p_obs(
     // single-pass ODE prediction path (#610). ODE-RHS `TIME` still uses the solver clock.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     // An SDE model is always `ErrorSpec::Single` (Form C, needed for per-CMT errors, is
-    // rejected on SDE), so `model.error_model` is exact here.
+    // rejected on SDE), so the observation key does not select an endpoint here; it is
+    // still read per row so the call is the scoring's own.
     debug_assert!(
         matches!(model.error_spec, ErrorSpec::Single(_)),
         "EKF path reached with a non-Single error spec (per-CMT + SDE should be unreachable)"
     );
-    let error_model = model.error_model;
+    let ruv_scale = model.residual_var_scale(eta);
+    let keys = model.error_spec.obs_keys(subject);
 
     // `diffusion_var` is passed beside the spec (it moves with θ; the spec cannot). One filter
     // solve: its Kalman `R` reads the filter's own mean, so no second ODE pass is made for it.
-    let (_, p_obs) = crate::ode::ode_predictions_ekf_with_diffusion(
+    // Co-timed records share one update with the *first* record's `R` (`solve_ekf_g`,
+    // #614/#1810); with a per-row `R` that choice is visible, and it is kept.
+    let (_, p_obs) = crate::ode::ode_predictions_ekf_with_diffusion_rows(
         ode,
         &pk.values,
         subject,
         &diffusion_var,
-        |f_pred| crate::stats::residual_error::residual_variance(error_model, f_pred, sigma_values),
+        |j, f_pred| {
+            row_residual_variance(
+                model,
+                keys.get(j).copied().unwrap_or(0),
+                f_pred,
+                sigma_values,
+                pairs,
+                ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+                ruv_scale,
+            )
+        },
     );
     p_obs
 }
@@ -1616,7 +1656,15 @@ fn foce_subject_nll_cov_split(
 
     // For SDE models, inflate R with the EKF process-noise variance.
     let p_obs = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
+        ekf_p_obs(
+            model,
+            subject,
+            theta,
+            eta_hat.as_slice(),
+            sigma_values,
+            residual_cov.pairs,
+            ruv_mult.as_deref(),
+        )
     } else {
         Vec::new()
     };
@@ -2464,7 +2512,15 @@ pub(crate) fn conditional_obs_neg2ll_terms(
     }
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     let p_obs = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta_hat, sigma_values)
+        ekf_p_obs(
+            model,
+            subject,
+            theta,
+            eta_hat,
+            sigma_values,
+            residual_cov.pairs,
+            ruv_mult.as_deref(),
+        )
     } else {
         Vec::new()
     };
@@ -3131,8 +3187,19 @@ fn foce_subject_nll_iov_linearized_split(
     // censored rows re-enter via `foce_subject_nll_standard` as
     // `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)` over the stacked system (#646); FOCEI takes the interaction
     // path. Routing is by `interaction` alone, so no `m3_active` gate here.
+    // Per-observation custom residual magnitude (#484); η/κ-independent. Read before the
+    // filter, whose Kalman `R` is the row's scored variance (#3126).
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     let p_obs_iov = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta_hat, sigma_values)
+        ekf_p_obs(
+            model,
+            subject,
+            theta,
+            eta_hat,
+            sigma_values,
+            residual_cov.pairs,
+            ruv_mult.as_deref(),
+        )
     } else {
         Vec::new()
     };
@@ -3143,8 +3210,6 @@ fn foce_subject_nll_iov_linearized_split(
         note(&mut parts, "IOV + FREM refusal", IOV_FREM_REFUSAL_NLL);
         return IOV_FREM_REFUSAL_NLL;
     }
-    // Per-observation custom residual magnitude (#484); η/κ-independent.
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
     // Non-Gaussian records (TTE, discrete) read BSV η only and enter the stacked marginal
     // over the BSV block, so the outer objective matches the one `individual_nll_iov`'s
     // EBE is the mode of.
@@ -3820,7 +3885,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // κ = 0): the same `V = V_resid + p_obs` the IOV marginal (`foce_subject_nll_iov`) scores,
     // so the EBE minimises the objective the outer loop differentiates.
     let p_obs = if model.is_sde() {
-        ekf_p_obs(model, subject, theta, eta, sigma_values)
+        ekf_p_obs(model, subject, theta, eta, sigma_values, residual_cov.pairs, ruv_mult.as_deref())
     } else {
         Vec::new()
     };
@@ -3893,6 +3958,10 @@ mod non_gaussian_eta_hessian_tests;
 #[cfg(all(test, feature = "survival"))]
 #[path = "endpoint_order_tests.rs"]
 mod endpoint_order_tests;
+
+#[cfg(test)]
+#[path = "ekf_row_variance_tests.rs"]
+mod ekf_row_variance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4178,7 +4247,7 @@ mod tests {
         assert!((upper - log_normal_cdf(1.0)).abs() < 1e-12);
         assert!((lower - log_normal_cdf(1.0)).abs() < 1e-12);
 
-        // NONMEM 7.5.1 anchor in tests/nonmem/right_censored_m3.{ctl,csv,lst}:
+        // NONMEM 7.5.1 anchor in tests/nonmem/right_censored_m3.{ctl,csv,nm.json}:
         // two identical CENS=-1 rows with z=(12-10)/2=1 give OFV
         // 0.69101514210943182. ferx uses the A&S CDF approximation, so compare
         // within a numerical tolerance rather than bit-for-bit.
@@ -7712,7 +7781,15 @@ mod conditional_obs_terms_tests {
             model.residual_cov_at(p),
         );
         assert!(terms.iter().all(|t| t.is_finite()), "{terms:?}");
-        let p_obs = ekf_p_obs(&model, &subject, &p.theta, eta.as_slice(), &p.sigma.values);
+        let p_obs = ekf_p_obs(
+            &model,
+            &subject,
+            &p.theta,
+            eta.as_slice(),
+            &p.sigma.values,
+            &p.residual_correlations,
+            None,
+        );
         assert!(p_obs.iter().any(|&v| v > 1e-3), "premise: the process noise is live: {p_obs:?}");
         let scorer = foce_subject_nll_cov(
             &model,

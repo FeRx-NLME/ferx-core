@@ -534,6 +534,7 @@ name = "ferx-cli"
 version = "0.4.0"
 dependencies = [
  "ferx-core",
+ "ferx-search",
  "ferx-tools",
  "indicatif",
  "mimalloc",
@@ -571,19 +572,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferx-search"
+version = "0.4.0"
+dependencies = [
+ "csv",
+ "ferx-core",
+ "ferx-tools",
+ "libc",
+ "nalgebra",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "ferx-tools"
 version = "0.4.0"
 dependencies = [
  "csv",
  "ferx-core",
- "libc",
  "nalgebra",
  "rand 0.10.3",
  "rayon",
  "serde",
  "serde_json",
  "tempfile",
- "toml",
 ]
 
 [[package]]

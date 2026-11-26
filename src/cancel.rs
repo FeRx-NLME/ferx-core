@@ -48,6 +48,13 @@ impl CancelFlag {
     pub(crate) fn trip_after(polls: usize) -> Self {
         Self(Arc::default(), Some(Arc::new(std::sync::atomic::AtomicUsize::new(polls))))
     }
+
+    /// Polls a [`CancelFlag::trip_after`] flag has left before it trips, so a test can count
+    /// the polls a run makes and land a cut at a known one (#2776). `None` without a countdown.
+    #[cfg(test)]
+    pub(crate) fn polls_left(&self) -> Option<usize> {
+        self.1.as_ref().map(|left| left.load(Ordering::SeqCst))
+    }
 }
 
 /// Cheap helper: returns `true` if the optional flag is set.
