@@ -1,0 +1,39 @@
+# ferx twin of leading_endpoint_clock_{a,b}.ctl (#3095).
+#
+# A central baseline (`init(central) = A0`) decays from the subject's first record, so the
+# state moves before the first dose. A count row ahead of the dose is a record in NONMEM,
+# which has no endpoint kinds, and starts the system there; NONMEM sees it as an EVID=2 row.
+# Arm b ignores that row, so its system starts at the dose.
+
+[parameters]
+  theta TVKA(1.0, 0.0, 1e15)
+  theta TVCL(2.0, 0.0, 1e15)
+  theta TVV(20.0, 0.0, 1e15)
+  theta TVA0(200.0, 0.0, 1e15)
+  theta BASE(3.0, 0.0, 1e15)
+  sigma ADD ~ 0.1
+[individual_parameters]
+  KA = TVKA
+  CL = TVCL
+  V  = TVV
+  A0 = TVA0
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  init(central) = A0
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - (CL / V) * central
+[scaling]
+  y = central / V
+[count_model]
+  cmt        = 3
+  type       = poisson
+  log_lambda = log(BASE)
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  method = laplace
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

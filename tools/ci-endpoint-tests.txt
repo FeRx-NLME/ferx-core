@@ -31,6 +31,7 @@ dtmm_nonmem_anchor
 kappa_correlation_auto_lbfgs_fits
 kmmc_survfit_reference
 lagged_zero_order_break_times
+leading_endpoint_clock_nonmem_anchor
 level_no_gaussian_nonmem_anchor
 markov_nonmem
 markov_smoke

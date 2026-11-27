@@ -2129,17 +2129,17 @@ fn take_tte_pending(pending: &mut Vec<(usize, (f64, f64))>, cmt: usize) -> Optio
 }
 
 /// What the `TENTRY > TIME` warning says about the TTE row it leaves unscored (rather than
-/// an invalid NLL). Such a row is a record of the PK model only after another record: the
-/// `has_record` test that decides its `push_pk_only!` decides this clause too (#2943 r2).
-/// A function, not an inline `if`, so the gated block holds no comment or brace-only line
-/// that the non-`survival` coverage build reads as missed (#293).
+/// an invalid NLL). Such a row is a record of the PK model when its subject has a record of
+/// another kind (#3095): the row is written with `true`, and the end-of-subject pass that
+/// drops the endpoint records rewrites it to `false` (#2943 r2). A function, not an inline
+/// `if`, so the gated block holds no comment or brace-only line that the non-`survival`
+/// coverage build reads as missed (#293).
 #[cfg(feature = "survival")]
 fn tentry_record_clause(has_record: bool) -> &'static str {
     if has_record {
         "stays a record of the PK model, as in NONMEM"
     } else {
-        "is not a record of the PK model either, since it comes before every other record of \
-         the subject"
+        "is not a record of the PK model either, since the subject has no record of another kind"
     }
 }
 
@@ -2314,6 +2314,9 @@ fn parse_subject(
     let mut pk_only_times: Vec<f64> = Vec::new();
     let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut pk_only_occasions: Vec<u32> = Vec::new();
+    // How many of them are endpoint rows, dropped after the row loop when they are all the
+    // subject's records (#3095).
+    let mut endpoint_records = 0;
     // EVID=3 (reset) and EVID=4 (reset + dose) rows. Both zero every
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
@@ -2771,19 +2774,17 @@ fn parse_subject(
             }
             // NONMEM has no endpoint kinds: an endpoint row, or one skipped for its missing DV
             // as MDV=1, is a record whose `$PK` runs and whose snapshot governs the interval
-            // ending at it, as an `EVID=2` row's does (#2368). An endpoint row ahead of every
-            // other record starts no clock: ferx integrates a subject with no other record
-            // from 0 (`subject_integration_start`), where a NONMEM dataset carries a TIME=0
-            // record for it. A TTE row is never skipped for its DV (see above).
+            // ending at it, as an `EVID=2` row's does (#2368), wherever it sits in the file
+            // (#3095). A subject with endpoint rows only has no record: ferx integrates it from
+            // 0 (`subject_integration_start`), where a NONMEM dataset carries a TIME=0 record
+            // for it, so the pass after the row loop drops them. A TTE row is never skipped
+            // for its DV (see above).
             let tte = routing.tte.contains(&cmt);
-            let has_record = !(dose_rec.is_empty()
-                && obs_rec.is_empty()
-                && pk_only_rec.is_empty()
-                && reset_rec.is_empty());
-            if (skip_missing_dv && !tte)
-                || ((tte || routing.integer_kind(cmt).is_some()) && has_record)
-            {
+            if skip_missing_dv && !tte {
                 push_pk_only!();
+            } else if tte || routing.integer_kind(cmt).is_some() {
+                push_pk_only!();
+                endpoint_records += 1;
             }
 
             // Route a TTE / discrete-state / count CMT to `obs_records` (disjoint
@@ -2812,7 +2813,7 @@ fn parse_subject(
                             "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
                              — entry time after the event/censoring time yields a negative \
                              effective cumulative hazard; the row is not scored and {}",
-                            tentry_record_clause(has_record)
+                            tentry_record_clause(true)
                         ));
                         continue;
                     }
@@ -3037,6 +3038,19 @@ fn parse_subject(
             }
             push_pk_only!();
         }
+    }
+    // Endpoint rows are records only of a subject with a record of another kind (#3095).
+    let other_records = dose_rec.len() + obs_rec.len() + reset_rec.len();
+    if endpoint_records == pk_only_times.len() && other_records == 0 {
+        pk_only_times.clear();
+        pk_only_raw_times.clear();
+        pk_only_rec.clear();
+        pk_only_covariates.clear();
+        pk_only_occasions.clear();
+        filled_cells.clear();
+        #[cfg(feature = "survival")]
+        (parse_warnings.iter_mut())
+            .for_each(|w| *w = w.replace(tentry_record_clause(true), tentry_record_clause(false)));
     }
 
     // Sort doses by time, keeping dose_occasions and dose_covariates in sync.

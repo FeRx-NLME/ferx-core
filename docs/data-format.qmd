@@ -29,8 +29,10 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 > every subject, and integration started at the first observation or dose. Before
 > [#2368](https://github.com/FeRx-NLME/ferx-core/issues/2368) a time-to-event, count or
 > discrete-state row, and a row skipped for a missing `DV`, were not records of the PK
-> model either. An endpoint row ahead of every other record still is not one, so a
-> subject with only endpoint rows integrates from 0. `TIME` is used exactly as written
+> model either, and before [#3095](https://github.com/FeRx-NLME/ferx-core/issues/3095) one
+> ahead of every other record was still left out. Now it starts the clock whenever its
+> subject has a record of another kind, as in NONMEM. Only a subject with endpoint rows
+> alone has no record, and it integrates from 0. `TIME` is used exactly as written
 > everywhere it is visible: the model `TIME`/`T` builtin, `[derived]` columns,
 > the survival left-truncation `TENTRY`, and the sdtab / `predict()` /
 > `simulate()` output. ferx does not re-base `TIME` onto a per-subject elapsed

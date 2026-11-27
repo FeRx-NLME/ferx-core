@@ -60,7 +60,9 @@ use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 ///   record that governs it, and its lag from its parent row (`DoseEvent::implied`).
 /// - `8`: #2368. An endpoint row after another record, and a row skipped for its
 ///   missing `DV`, are pk-only records (`pk_only_times`).
-pub(crate) const SCHEME: u32 = 8;
+/// - `9`: #3095. An endpoint row ahead of every other record is one too, when its subject
+///   has a record of another kind.
+pub(crate) const SCHEME: u32 = 9;
 
 /// A fingerprint of the population a fit was given: per subject, its ID, its
 /// record and dose counts, and a digest of each of its records, its doses and its
