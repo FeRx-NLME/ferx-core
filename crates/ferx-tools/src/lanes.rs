@@ -3,8 +3,8 @@
 //!
 //! # Why a parallel iterator is not enough
 //!
-//! Every tool in this crate has the same shape — `N` independent fits over a
-//! thread budget of `width` — and the obvious spelling is an outer pool of
+//! Every tool in this crate and in `ferx-search` has the same shape — `N`
+//! independent fits over a thread budget of `width` — and the obvious spelling is an outer pool of
 //! `width` workers running a `par_iter` over the `N` jobs. That spelling does
 //! **not** bound how many fits are live at once, and the reason is documented
 //! Rayon behaviour rather than a bug: each job calls [`ferx_core::fit`], which
@@ -60,6 +60,9 @@ use ferx_core::FIT_RAYON_STACK_SIZE;
 /// idle lanes for nothing, and `0` would mean "let the runtime decide", which is
 /// the ambiguity this function exists to remove. `n_jobs == 0` runs no lanes.
 ///
+/// Public because `ferx-search` fits its candidates through it (#3185); it is the
+/// whole of what that crate takes from this one.
+///
 /// `job` is called exactly once per index, from one lane, and must therefore be
 /// `Sync`. It is free to block — blocking a lane is the point.
 ///
@@ -73,7 +76,7 @@ use ferx_core::FIT_RAYON_STACK_SIZE;
 ///
 /// Re-raises a job's panic on the calling thread, after the other lanes have
 /// been joined.
-pub(crate) fn run_in_lanes<T, F>(width: usize, n_jobs: usize, job: F) -> Result<Vec<T>, String>
+pub fn run_in_lanes<T, F>(width: usize, n_jobs: usize, job: F) -> Result<Vec<T>, String>
 where
     F: Fn(usize) -> Option<T> + Sync,
     T: Send,

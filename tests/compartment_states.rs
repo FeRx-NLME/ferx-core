@@ -2392,3 +2392,71 @@ fn derived_integral_on_a_model_time_ode_rhs_is_finite() {
         );
     }
 }
+
+/// #1580: a closed-form transit subject its ODE twin serves (an infusion) has no states in
+/// the closed form's `[depot, central]` layout. Its `[derived]` compartment reads, per-obs
+/// and on the integral grid, are NaN with `W_DERIVED_CMT_TWIN_ANALYTICAL` — not the twin's
+/// central amount under the name `depot` — while a closed-form subject keeps finite ones.
+#[test]
+fn twin_served_transit_subject_reads_nan_compartments() {
+    const MODEL: &str = "
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  NTR = 3.0
+  MTT = 1.0
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  DEP = depot
+  AUC = integral(central, from=0, to=8, step=0.1)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+";
+    let parsed =
+        ferx_core::parser::model_parser::parse_full_model(MODEL).expect("model must parse");
+    let model = parsed.model;
+    let times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+    let dv = vec![0.3, 1.1, 1.6, 1.3, 0.7];
+    let pop = Population {
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: [(0.0, "bolus"), (200.0, "infusion")]
+            .map(|(rate, id)| {
+                let dose = DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0);
+                common::subject(id, vec![dose], times.clone(), dv.clone(), vec![2; 5])
+            })
+            .into(),
+    };
+    let mut opts = parsed.fit_options;
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+    let col = |i: usize, name: &str| {
+        let sr = &result.subjects[i];
+        sr.extra_columns.iter().find(|(n, _)| n == name).expect("column").1.clone()
+    };
+    assert!(col(0, "DEP").iter().chain(&col(0, "AUC")).all(|x| x.is_finite()));
+    assert!(col(1, "DEP").iter().chain(&col(1, "AUC")).all(|x| x.is_nan()));
+    assert!(
+        result.warnings.iter().any(|w| w.starts_with("W_DERIVED_CMT_TWIN_ANALYTICAL")),
+        "{:?}",
+        result.warnings
+    );
+}

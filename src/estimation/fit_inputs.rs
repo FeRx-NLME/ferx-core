@@ -897,7 +897,7 @@ pub struct ScoringSettings {
     /// else `Auto`. A post-hoc step resolves it as a union with the caller's: either `Fd`
     /// wins (#1835).
     ///
-    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-tools search
+    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-search
     /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
     #[serde(default)]
     pub gradient_method: GradientMethod,

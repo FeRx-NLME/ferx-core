@@ -1,0 +1,110 @@
+{
+ "nonmem_version": "7.5.1",
+ "data_file": "algebraic_emax.csv",
+ "data_records": 240,
+ "observations": 240,
+ "individuals": 30,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION TERMINATED",
+  "ROUNDING ERRORS"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation",
+   "objv": 62.538,
+   "objv_without_constant": 62.5384884497999,
+   "objv_with_constant": 503.6289843880428,
+   "function_evaluations": 1192,
+   "significant_digits": 0.7,
+   "etabar": [
+    [0.00030286]
+   ],
+   "etabar_se": [
+    [0.055362]
+   ],
+   "p_val": [
+    [0.99564]
+   ],
+   "etashrinksd": [
+    [0.27874]
+   ],
+   "etashrinkvr": [
+    [0.5567]
+   ],
+   "ebvshrinksd": [
+    [0.17411]
+   ],
+   "ebvshrinkvr": [
+    [0.34792]
+   ],
+   "relativeinf": [
+    [99.652]
+   ],
+   "epsshrinksd": [
+    [6.4288]
+   ],
+   "epsshrinkvr": [
+    [12.444]
+   ],
+   "final": {
+    "theta": [10.2, 5.92, 2.1],
+    "omega": {
+     "ETA1": [0.0925]
+    },
+    "sigma": {
+     "EPS1": [0.231]
+    }
+   },
+   "standard_error": {
+    "theta": [0.573, 0.101, 0.145],
+    "omega": {
+     "ETA1": [0.024]
+    },
+    "sigma": {
+     "EPS1": [0.0225]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.328],
+    "TH 2": [0.00442, 0.0102],
+    "TH 3": [-0.00787, 0.0027, 0.021],
+    "OM11": [-0.000125, -7e-05, 0.000125, 0.000575],
+    "SG11": [-4.76e-06, -4.19e-06, 7.29e-06, -4.24e-07, 0.000507]
+   },
+   "markers": [
+    "MINIMIZATION TERMINATED",
+    "ROUNDING ERRORS"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM Emax time-course, no compartments - the $PRED analogue of a ferx",
+  "; compartment-free [structural_model] (issue #811).",
+  ";",
+  "; y = E0*exp(eta) - EMAX*t/(ET50 + t) + eps,  additive residual error.",
+  "; No doses, no ADVAN, no compartments: $PRED is exactly what a ferx",
+  "; `[structural_model]` with `y = <expr>` and no `pk`/`ode` line compiles to.",
+  ";",
+  "; Data simulated from THETA = (10, 6, 2), OMEGA = 0.09, SIGMA = 0.25 by",
+  "; `nonmem_anchor/algebraic_emax.csv`'s generator (seeded, 30 subjects x 8 times).",
+  "$INPUT ID TIME DV MDV",
+  "$DATA algebraic_emax.csv IGNORE=@",
+  "",
+  "$PRED",
+  "E0   = THETA(1)*EXP(ETA(1))",
+  "EMAX = THETA(2)",
+  "ET50 = THETA(3)",
+  "Y    = E0 - EMAX*TIME/(ET50 + TIME) + EPS(1)",
+  "",
+  "$THETA (0.1, 8.0,  100.0)   ; TVE0   - deliberately off the truth (10)",
+  "$THETA (0.1, 4.0,  100.0)   ; TVEMAX - deliberately off the truth (6)",
+  "$THETA (0.01, 1.0, 100.0)   ; TVET50 - deliberately off the truth (2)",
+  "$OMEGA 0.04                 ; IIV on the baseline (truth 0.09)",
+  "$SIGMA 1.0                  ; additive residual variance (truth 0.25)",
+  "",
+  "$ESTIMATION METHOD=1 MAXEVAL=9999 PRINT=5 NOABORT SIGDIGITS=4",
+  "$COVARIANCE MATRIX=R UNCONDITIONAL",
+  "$TABLE ID TIME DV PRED CWRES NOPRINT ONEHEADER FILE=algebraic_emax.tab"
+ ]
+}

@@ -1,0 +1,184 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "napx1081.csv",
+ "data_records": 122,
+ "observations": 122,
+ "individuals": 18,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation",
+   "objv": -199.735,
+   "objv_without_constant": -199.7345750479403,
+   "objv_with_constant": 24.486427053999847,
+   "function_evaluations": 301,
+   "significant_digits": 4.2,
+   "etabar": [
+    [-2.8409e-06, 2.2358e-06]
+   ],
+   "etabar_se": [
+    [0.14522, 0.17377]
+   ],
+   "p_val": [
+    [0.99998, 0.99999]
+   ],
+   "etashrinksd": [
+    [1.3745, 1.2879]
+   ],
+   "etashrinkvr": [
+    [2.7301, 2.5593]
+   ],
+   "ebvshrinksd": [
+    [1.3746, 1.2878]
+   ],
+   "ebvshrinkvr": [
+    [2.7302, 2.559]
+   ],
+   "relativeinf": [
+    [97.262, 97.433]
+   ],
+   "epsshrinksd": [
+    [11.868, 11.868, 10.82, 5.045, 17.052]
+   ],
+   "epsshrinkvr": [
+    [22.327, 22.327, 20.469, 9.8354, 31.196]
+   ],
+   "final": {
+    "theta": [5.19, 1.15, 0.634, 0.975, 0.832, 0.791, -0.967, 0.509],
+    "omega": {
+     "ETA1": [0.39],
+     "ETA2": [0.0, 0.558]
+    },
+    "sigma": {
+     "EPS1": [1.0],
+     "EPS2": [0.0, 1.0],
+     "EPS3": [0.0, 0.0, 1.0],
+     "EPS4": [0.0, 0.0, 0.0, 1.0],
+     "EPS5": [0.0, 0.0, 0.0, 0.0, 1.0]
+    }
+   },
+   "standard_error": {
+    "theta": [0.259, 0.312, 0.0846, 0.317, 0.379, 0.058, 0.206, 0.0776],
+    "omega": {
+     "ETA1": [0.132],
+     "ETA2": [null, 0.19]
+    },
+    "sigma": {
+     "EPS1": [null],
+     "EPS2": [null, null],
+     "EPS3": [null, null, null],
+     "EPS4": [null, null, null, null],
+     "EPS5": [null, null, null, null, null]
+    }
+   },
+   "covariance": {
+    "TH 1": [0.0672],
+    "TH 2": [0.000923, 0.0974],
+    "TH 3": [-6.82e-05, 0.00256, 0.00716],
+    "TH 4": [-0.0672, -0.00096, -6.12e-05, 0.101],
+    "TH 5": [-0.000941, -0.0957, -4.98e-05, 0.00124, 0.143],
+    "TH 6": [-2.27e-05, -0.00202, -0.00213, 3.11e-05, 0.000144, 0.00336],
+    "TH 7": [-9.85e-05, -0.00309, -0.00968, 0.000191, 0.000133, 0.00716, 0.0423],
+    "TH 8": [-5.78e-05, 9.07e-05, -0.000443, 7.73e-05, -3.34e-07, -0.000192, 0.00151, 0.00602],
+    "OM11": [6.95e-05, 1.52e-05, -6.95e-05, -0.000259, -0.000147, 6.31e-06, 8.51e-05, 7.02e-05, 0.0176],
+    "OM12": [null, null, null, null, null, null, null, null, null, null],
+    "OM22": [9.11e-06, 0.000512, 0.000778, -6.21e-05, -4.76e-05, -6.34e-05, 0.000539, 0.000139, 0.00016, null, 0.036],
+    "SG11": [null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG12": [null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG13": [null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG14": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG15": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG22": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG23": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG24": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG25": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG33": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG34": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG35": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG44": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG45": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    "SG55": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1081 naproxen MBMA, within-arm residual correlation cs rho=0.3 EST",
+  "; Data: napx1081.csv (natural-scale DV = DV*WPSE; L2 = arm; VIS = visit index; T1..T5 arm visit times)",
+  "$INPUT ID ARM TIME DV TRT FLARE WPSE MDV L2 VIS T1 T2 T3 T4 T5",
+  "$DATA napx1081.csv IGNORE=@",
+  "$PRED",
+  "  E0   = THETA(1) + THETA(4)*FLARE + ETA(1)",
+  "  EMAX = THETA(2) + THETA(5)*FLARE + THETA(6)*TRT + ETA(2)",
+  "  ET50 = THETA(3)*EXP(THETA(7)*TRT)",
+  "  EFF  = EMAX*TIME/(TIME + ET50)",
+  "  F    = E0 - EFF",
+  "  RHO  = THETA(8)",
+  "",
+  "; compound symmetry: column-k off-diagonal a_k = (rho - S_{k-1})/sqrt(1 - S_{k-1})",
+  "  A1 = RHO",
+  "  S1 = A1*A1",
+  "  A2 = (RHO - S1)/SQRT(1 - S1)",
+  "  S2 = S1 + A2*A2",
+  "  A3 = (RHO - S2)/SQRT(1 - S2)",
+  "  S3 = S2 + A3*A3",
+  "  A4 = (RHO - S3)/SQRT(1 - S3)",
+  "  S4 = S3 + A4*A4",
+  "  L1=0",
+  "  L2C=0",
+  "  L3=0",
+  "  L4=0",
+  "  L5=0",
+  "  IF (VIS.EQ.1) L1 = 1",
+  "  IF (VIS.EQ.2) THEN",
+  "    L1 = A1",
+  "    L2C = SQRT(1 - S1)",
+  "  ENDIF",
+  "  IF (VIS.EQ.3) THEN",
+  "    L1 = A1",
+  "    L2C = A2",
+  "    L3 = SQRT(1 - S2)",
+  "  ENDIF",
+  "  IF (VIS.EQ.4) THEN",
+  "    L1 = A1",
+  "    L2C = A2",
+  "    L3 = A3",
+  "    L4 = SQRT(1 - S3)",
+  "  ENDIF",
+  "  IF (VIS.EQ.5) THEN",
+  "    L1 = A1",
+  "    L2C = A2",
+  "    L3 = A3",
+  "    L4 = A4",
+  "    L5 = SQRT(1 - S4)",
+  "  ENDIF",
+  "",
+  "  RES = L1*EPS(1) + L2C*EPS(2) + L3*EPS(3) + L4*EPS(4) + L5*EPS(5)",
+  "  IPRED = F",
+  "  Y = F + WPSE*RES",
+  "$THETA",
+  "  5.1972",
+  "  1.158",
+  "  0.6901",
+  "  0.9629",
+  "  0.8197",
+  "  0.793",
+  "  -1.1747",
+  "  (-0.24, 0.3, 0.99)",
+  "$OMEGA 0.3862622500000001",
+  "$OMEGA 0.54567769",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$SIGMA 1 FIX",
+  "$ESTIMATION METHOD=1 MAXEVAL=9999 SIGDIG=4 NOABORT PRINT=5",
+  "$COVARIANCE MATRIX=R UNCONDITIONAL",
+  "$TABLE ID ARM TIME DV IPRED L2 VIS ONEHEADER NOAPPEND NOPRINT FORMAT=s1PE23.16 FILE=cs_est.tab"
+ ]
+}

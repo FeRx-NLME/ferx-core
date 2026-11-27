@@ -1,0 +1,117 @@
+{
+ "nonmem_version": "7.6.0",
+ "data_file": "kappa_weight_anchor.csv",
+ "data_records": 240,
+ "observations": 220,
+ "individuals": 10,
+ "nmtran_warnings": [2],
+ "markers": [
+  "MINIMIZATION SUCCESSFUL"
+ ],
+ "steps": [
+  {
+   "method": "First Order Conditional Estimation",
+   "objv": 207.455,
+   "objv_without_constant": 207.45526044656182,
+   "objv_with_constant": 611.7882150566178,
+   "function_evaluations": 378,
+   "significant_digits": 3.4,
+   "etabar": [
+    [-0.70479, 0.01108, -0.98004, -0.29089, 0.6912]
+   ],
+   "etabar_se": [
+    [0.098709, 0.032459, 0.076805, 0.1032, 0.36508]
+   ],
+   "p_val": [
+    [9.3946e-13, 0.73283, 2.8372e-37, 0.0048205, 0.058322]
+   ],
+   "etashrinksd": [
+    [0.25574, 7.2854, 1.797, 69.098, 4.8827]
+   ],
+   "etashrinkvr": [
+    [0.51083, 14.04, 3.5617, 90.451, 9.527]
+   ],
+   "ebvshrinksd": [
+    [0.43642, 6.9771, 2.3481, 74.314, 3.1247]
+   ],
+   "ebvshrinkvr": [
+    [0.87094, 13.467, 4.6411, 93.402, 6.1517]
+   ],
+   "relativeinf": [
+    [1e-10, 86.472, 95.306, 1e-10, 1e-10]
+   ],
+   "epsshrinksd": [
+    [9.096]
+   ],
+   "epsshrinkvr": [
+    [17.365]
+   ],
+   "final": {
+    "theta": [0.317, 8.4, 2.62],
+    "omega": {
+     "ETA1": [0.597],
+     "ETA2": [0.0, 0.0124],
+     "ETA3": [0.0, 0.0, 1.06],
+     "ETA4": [0.0, 0.0, 0.0, 2.0],
+     "ETA5": [0.0, 0.0, 0.0, 0.0, 2.0]
+    },
+    "sigma": {
+     "EPS1": [0.0376]
+    }
+   },
+   "markers": [
+    "MINIMIZATION SUCCESSFUL"
+   ]
+  }
+ ],
+ "control_stream_as_run": [
+  "$PROBLEM ferx #1031 anchor -- sample-size-weighted IOV, hand-written KAPPA/SQRT(NARM)",
+  "; NONMEM has no `weight =` on an OMEGA, so the equivalent model writes the",
+  "; scaling into $PK by hand -- which is exactly what ferx's",
+  "; `kappa KAPPA_CL ~ 0.01 weight = NARM` desugars into. This control stream is",
+  "; the anchor for that declaration: same data, same 1-cpt oral structure, same",
+  "; FOCE objective.",
+  ";",
+  "; NARM is the arm size carried per occasion: 400 on OCC 1, 25 on OCC 2, so the",
+  "; occasion-2 kappa acts four times as strongly as the occasion-1 one. CMT is",
+  "; dropped so NONMEM routes doses to the depot and observations to the default",
+  "; observation compartment (2) under ADVAN2.",
+  "$INPUT ID TIME DV EVID AMT CMT=DROP RATE=DROP MDV OCC NARM",
+  "$DATA kappa_weight_anchor.csv IGNORE=@",
+  "",
+  "$SUBROUTINE ADVAN2 TRANS2",
+  "",
+  "$PK",
+  "  KAPPA = 0",
+  "  IF(OCC.EQ.1) KAPPA = ETA(4)",
+  "  IF(OCC.EQ.2) KAPPA = ETA(5)",
+  "  CL = THETA(1)*EXP(ETA(1) + KAPPA/SQRT(NARM))",
+  "  V  = THETA(2)*EXP(ETA(2))",
+  "  KA = THETA(3)*EXP(ETA(3))",
+  "  S2 = V",
+  "",
+  "$ERROR",
+  "  IPRED = F",
+  "  Y = IPRED*(1 + EPS(1))",
+  "",
+  "$THETA",
+  "  (0.001, 0.2,  10.0)   ; TVCL",
+  "  (0.1,   10.0, 500.0)  ; TVV",
+  "  (0.01,  1.5,  50.0)   ; TVKA",
+  "",
+  "$OMEGA",
+  "  0.09   ; ETA(1) CL BSV",
+  "  0.04   ; ETA(2) V  BSV",
+  "  0.30   ; ETA(3) KA BSV",
+  "$OMEGA BLOCK(1)",
+  "  0.01   ; ETA(4) IOV variance (the unweighted gamma^2)",
+  "$OMEGA BLOCK(1) SAME  ; ETA(5) occasion 2",
+  "",
+  "$SIGMA",
+  "  0.04   ; proportional residual variance (SD 0.2)",
+  "",
+  "$ESTIMATION METHOD=1 MAXEVAL=9999 PRINT=5 NOABORT",
+  "$COVARIANCE MATRIX=R",
+  "$TABLE ID TIME OCC IPRED CWRES NOPRINT NOAPPEND ONEHEADER FILE=kappa_weight_anchor.tab"
+ ]
+}

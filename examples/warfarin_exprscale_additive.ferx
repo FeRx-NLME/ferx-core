@@ -6,7 +6,7 @@
 # expression routes through `ExpressionScale`, whose `∂scale/∂(θ,η)` is computed
 # exactly by a `Dual2`-differentiable program. With `TVSCALE` fixed at 10 the
 # model is identical to `warfarin_scaled_additive.ferx`, so it must reproduce the
-# same fit — and the same NONMEM reference (`tests/nonmem/warfarin_scaled.lst`,
+# same fit — and the same NONMEM reference (`tests/nonmem/warfarin_scaled.nm.json`,
 # S2 = V*10). Fit against `tests/nonmem/warfarin_scaled.csv` (warfarin DV / 10).
 #
 # Additive error is deliberate: a proportional model is invariant to a constant

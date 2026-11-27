@@ -11,7 +11,7 @@
 //!
 //! There was no production gate anywhere in `src/api` or `src/estimation` tying the
 //! boolean to a finite objective, so every consumer that keys on it — the R
-//! wrapper, `ferx-tools`' model-space search via `Strictness::require_converged`,
+//! wrapper, `ferx-search`'s model-space search via `Strictness::require_converged`,
 //! an agent reading the fit YAML — was told the run succeeded. #1296 had already
 //! added a warning naming the abandoned walks; a warning is easier to ignore than
 //! a flag is to misread.
@@ -402,7 +402,7 @@ fn a_run_that_already_failed_still_reports_an_unusable_objective() {
 /// `ViFinalOfv::None`'s argument is that no number is safer than a number that
 /// looks like an OFV and is not one. A blanket "demote whenever the objective is
 /// non-finite" would therefore report `converged: false` for **every default VI
-/// fit** — a false alarm on the common path, and one `ferx-tools`'
+/// fit** — a false alarm on the common path, and one `ferx-search`'s
 /// `require_converged` would turn into a rejected search candidate.
 ///
 /// Both directions are asserted, because either alone is satisfied by a wrong
