@@ -305,51 +305,52 @@ fn bad_probabilities_and_thresholds_are_refused() {
 
 /// The labels are ferx-r's column names and tokens, one per variant, unique per enum
 /// (ferx-r#779 review finding 4). The `match`es without a wildcard stop compiling when a
-/// variant is added, so the tables below must grow with the enums.
+/// variant is added; for the metric, that `match` is the expected-label table and the
+/// variant list sits under it, and `SCALARS` is checked against that list, not built from
+/// it, so a metric added to the enum but not to `SCALARS` fails here (#3213 r1 row 2).
 ///
-/// Mutations: any label changed or duplicated; `from_label` not matching a scalar, or
-/// matching `"SIGNAL"`.
+/// Mutations: any label changed or duplicated; a metric dropped from `SCALARS`;
+/// `from_label` not matching a scalar, or matching `"SIGNAL"`.
 #[test]
 fn every_metric_and_statistic_has_a_unique_stable_label() {
-    let _exhaustive = |m: &M| match m {
-        M::CumulativeDose
-        | M::NDoses
-        | M::NIncreases
-        | M::NDecreases
-        | M::NHolds
-        | M::NNotDue
-        | M::Discontinued
-        | M::SignalMin
-        | M::SignalMax
-        | M::SignalMean
-        | M::PctReadingsInWindow
-        | M::AucTargetAttainment
-        | M::Signal { .. } => (),
+    let expected = |m: &M| match m {
+        M::CumulativeDose => "CUM_DOSE",
+        M::NDoses => "N_DOSES",
+        M::NIncreases => "N_INCREASES",
+        M::NDecreases => "N_DECREASES",
+        M::NHolds => "N_HOLDS",
+        M::NNotDue => "N_NOT_DUE",
+        M::Discontinued => "DISCONTINUED",
+        M::SignalMin => "SIGNAL_MIN",
+        M::SignalMax => "SIGNAL_MAX",
+        M::SignalMean => "SIGNAL_MEAN",
+        M::PctReadingsInWindow => "PCT_READINGS_IN_WINDOW",
+        M::AucTargetAttainment => "AUC_TARGET_ATTAINMENT",
+        M::Signal { .. } => "SIGNAL",
     };
+    // Every variant, one per arm above, scalars in output order.
+    let scalars = [
+        M::CumulativeDose,
+        M::NDoses,
+        M::NIncreases,
+        M::NDecreases,
+        M::NHolds,
+        M::NNotDue,
+        M::Discontinued,
+        M::SignalMin,
+        M::SignalMax,
+        M::SignalMean,
+        M::PctReadingsInWindow,
+        M::AucTargetAttainment,
+    ];
     let signal = M::Signal { analyte: "conc".into(), decision_idx: 0 };
-    let labels: Vec<&str> =
-        M::SCALARS.iter().chain(std::iter::once(&signal)).map(M::label).collect();
-    assert_eq!(
-        labels,
-        [
-            "CUM_DOSE",
-            "N_DOSES",
-            "N_INCREASES",
-            "N_DECREASES",
-            "N_HOLDS",
-            "N_NOT_DUE",
-            "DISCONTINUED",
-            "SIGNAL_MIN",
-            "SIGNAL_MAX",
-            "SIGNAL_MEAN",
-            "PCT_READINGS_IN_WINDOW",
-            "AUC_TARGET_ATTAINMENT",
-            "SIGNAL",
-        ]
-    );
-    let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
-    assert_eq!(unique.len(), labels.len());
-    for m in M::SCALARS {
+    assert_eq!(M::SCALARS, scalars);
+    let mut labels = std::collections::BTreeSet::new();
+    for m in scalars.iter().chain(std::iter::once(&signal)) {
+        assert_eq!(m.label(), expected(m), "{m:?}");
+        assert!(labels.insert(m.label()), "{m:?}: label repeated");
+    }
+    for m in &scalars {
         assert_eq!(M::from_label(m.label()), Some(m.clone()), "{m:?}");
     }
     assert_eq!(M::from_label("SIGNAL"), None);
