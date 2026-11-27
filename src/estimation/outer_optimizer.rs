@@ -3476,9 +3476,11 @@ fn inner_solve_polled(
         options.inner_restarts,
         // A seed is a set of modes an earlier pass returned, so an exactly-zero one among
         // them is warm like the rest (#2688); without one the solve is cold.
-        InnerSolvePolicy::for_stage(options, model)
-            .with_prev_etas(if seed.is_some() { PrevEtas::Solved } else { PrevEtas::Placeholder })
-            .with_kick(options.inner_kick),
+        InnerSolvePolicy::for_stage(options, model).with_prev_etas(if seed.is_some() {
+            PrevEtas::Solved
+        } else {
+            PrevEtas::Placeholder
+        }),
         cancel,
         |_, ebe| ebe.screen_moved || ebe.twin_moved,
     );

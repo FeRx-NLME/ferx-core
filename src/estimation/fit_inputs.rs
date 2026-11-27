@@ -872,7 +872,7 @@ pub struct ScoringSettings {
     /// twin seed, so a post-hoc step re-scores it without one.
     #[serde(default)]
     pub inner_twin_seed: bool,
-    /// `inner_kick`: the final-pass kick restarts (#3159). `#[serde(default)]`: absent
+    /// `inner_kick`: the inner solves' kick restarts (#3159). `#[serde(default)]`: absent
     /// from a record written before #3159 reads `false` — the old behaviour.
     #[serde(default)]
     pub inner_kick: bool,

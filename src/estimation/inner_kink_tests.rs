@@ -26,20 +26,30 @@ fn the_min_norm_point_of_a_hull_is_found() {
 
 /// On the valley floor off its minimum the sampled gradients straddle the kink, the hull's
 /// minimum-norm point drops the cross-valley component, and the escape moves along the valley.
-/// At the minimum zero is in the hull (a kink minimum, certified), below the gradient threshold
-/// nothing is sampled, and a non-finite gradient declines.
+/// At the minimum zero is in the hull (a kink minimum, certified); below the gradient threshold
+/// nothing is sampled, whether the pre-step gradient or the stalled point's own is below it; a
+/// non-finite gradient declines; and a non-finite objective ends the walk (#3159 review).
 #[test]
 fn a_stall_on_a_valley_floor_escapes_along_it_and_a_kink_minimum_is_certified() {
     let x = [1e-9, 5.0];
-    let e = stall_escape(&valley, &valley_grad, &x, valley(&x), 11.0).expect("a descent exists");
+    let g = valley_grad(&x);
+    let e = stall_escape(&valley, &valley_grad, &x, valley(&x), &g).expect("a descent exists");
     assert!(e.f < valley(&x) - 1e-3 && e.x[1] < 5.0 - 1e-3, "{:?} {}", e.x, e.f);
     assert_eq!(e.g, valley_grad(&e.x));
 
     let min = [1e-9, 3.0];
-    assert!(stall_escape(&valley, &valley_grad, &min, valley(&min), 10.0).is_none());
-    assert!(stall_escape(&valley, &valley_grad, &x, valley(&x), STALL_GNORM * 0.5).is_none());
+    assert!(stall_escape(&valley, &valley_grad, &min, valley(&min), &g).is_none());
+    let small = [STALL_GNORM * 0.5, 0.0];
+    assert!(stall_escape(&valley, &valley_grad, &x, valley(&x), &small).is_none());
+    let flat = |p: &[f64]| valley(p) * 0.01;
+    let flat_grad = |p: &[f64]| valley_grad(p).iter().map(|v| v * 0.01).collect();
+    assert!(stall_escape(&flat, &flat_grad, &x, flat(&x), &g).is_none(), "stale pre-step norm");
     let nan = |_: &[f64]| vec![f64::NAN, 0.0];
-    assert!(stall_escape(&valley, &nan, &x, valley(&x), 11.0).is_none());
+    assert!(stall_escape(&valley, &nan, &x, valley(&x), &g).is_none());
+    // NaN on a band just below `x`, lower beyond it: the walk stops at the band.
+    let blows_up =
+        |p: &[f64]| if (4.999..5.0 - 1e-6).contains(&p[1]) { f64::NAN } else { valley(p) };
+    assert!(stall_escape(&blows_up, &valley_grad, &x, valley(&x), &g).is_none());
 }
 
 /// An identity `probe` (no descent) and `finish` (so the walk's own kicked point is what is

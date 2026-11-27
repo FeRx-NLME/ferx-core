@@ -77,9 +77,15 @@ fn nonmem_obj() -> Vec<(String, f64)> {
 /// 2 h sample and of ten after the 2.5 h one, so the objective's inner searches move ends across
 /// observations; and no subject's gradient falls back to finite differences, so the walked ends
 /// are what ran.
+///
+/// ID 27 is held to "not above NONMEM", as on the closed form below: its EBE is on the corner
+/// kink at the 3 h sample, where the inner search's stall escape (#3159) steps on to a point
+/// whose individual objective is lower by 4.7e-10 (η moves by 1e-6), and the FOCE term reads
+/// that to first order: −34.3917122153 against NONMEM's −34.3917106793, 1.5e-6 below. With the
+/// escape off, ID 27 matches NONMEM within the 1e-6 bound and this test fails on its exemption.
 #[test]
 fn objective_matches_nonmem_with_infusion_ends_crossing_observations() {
-    objective_matches_nonmem(MODEL_AT_NONMEM_ESTIMATES, &[]);
+    objective_matches_nonmem(MODEL_AT_NONMEM_ESTIMATES, &["27"]);
 }
 
 /// The same anchor on the closed form (#3033): [`MODEL_AT_NONMEM_ESTIMATES`] with its `[odes]`

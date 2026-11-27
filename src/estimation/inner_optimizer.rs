@@ -1032,10 +1032,10 @@ pub(crate) struct InnerSolvePolicy {
     /// solve. `false`, the `Default`, solves.
     pub(crate) skip_refused: bool,
     /// Restart from a small kick of each informative coordinate of the returned EBE and keep a
-    /// lower mode ([`kink::kick_restarts`], #3159): the final EBE pass's, where a second mode a
-    /// barrier away is otherwise reported as the subject's EBE. Set by the final and cold
-    /// re-solves ([`Self::with_kick`], from `[fit_options] inner_kick`); `false`, the `Default`,
-    /// otherwise, so a search's warm solves pay nothing for it.
+    /// lower mode ([`kink::kick_restarts`], #3159), where a second mode a barrier away is
+    /// otherwise reported as the subject's EBE. `[fit_options] inner_kick`, in every solve: kicked
+    /// in the final pass only, a fit's #833 recovery scores the warm, unkicked EBEs lower on OFV
+    /// and reports them (#3159 review). `false`, the `Default`.
     pub(crate) kick: bool,
 }
 
@@ -1058,13 +1058,8 @@ impl InnerSolvePolicy {
             keep_certified_start: false,
             unseeded_iov_warm: false,
             skip_refused: skips_refused_subjects(options),
-            kick: false,
+            kick: options.inner_kick,
         }
-    }
-
-    /// This policy with the kick restarts ([`Self::kick`]) on or off.
-    pub(crate) fn with_kick(self, on: bool) -> Self {
-        Self { kick: on, ..self }
     }
 
     /// This policy for a pass whose `eta_init` are `prev` ([`PrevEtas`]).
@@ -2198,12 +2193,13 @@ pub(crate) fn find_ebe_for_stage_with_prev(
         restarts,
         schedule.as_ref(),
         // The historical seed, as `find_ebe_with_variance` uses; only the convention, the
-        // #2013 screen and the #2095 twin seed come from the stage.
+        // #2013 screen, the #2095 twin seed and the #3159 kicks come from the stage.
         InnerSolvePolicy {
             ebe_variance: EbeVariance::for_options(stage, model),
             screen: stage.inner_screen,
             twin_seed: stage.inner_twin_seed,
             skip_refused: skips_refused_subjects(stage),
+            kick: stage.inner_kick,
             ..InnerSolvePolicy::default()
         }
         .with_prev_etas(prev),
@@ -6990,7 +6986,7 @@ fn lbfgs_run(
             // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict.
             if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
                 escapes += 1;
-                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, gnorm) {
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
                     x.copy_from_slice(&e.x);
                     f_cur = e.f;
                     g = e.g;
@@ -7335,7 +7331,7 @@ fn dense_bfgs_run(
             // `analytic_inner_grad_supported` / `analytic_iov_inner_supported` verdict.
             if allow_kink_escape && escapes < kink::MAX_STALL_ESCAPES {
                 escapes += 1;
-                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, gnorm) {
+                if let Some(e) = kink::stall_escape(obj, grad, x, f_cur, &g) {
                     x.copy_from_slice(&e.x);
                     f_cur = e.f;
                     g = e.g;
