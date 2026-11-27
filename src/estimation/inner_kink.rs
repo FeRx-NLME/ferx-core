@@ -2,8 +2,10 @@
 //!
 //! A prediction clipped at a threshold (`y = if (x − TH < 0) 0 else x − TH`) puts a kink in the
 //! individual objective wherever a record crosses it. Two things go wrong there, and each has
-//! its own remedy here, both behind `[fit_options] inner_kick` (a smooth ODE objective can
-//! stall at a large gradient too, where the escape's moves made a BOBYQA fit non-smooth):
+//! its own remedy here. The kicks are behind `[fit_options] inner_kick`; the escape also runs
+//! by default where the parser found a kink on the prediction path ([`kink_escape_allowed`]: a
+//! smooth ODE objective can stall at a large gradient too, where the escape's moves made a
+//! BOBYQA fit non-smooth):
 //!
 //! * **A stall at a kink** ([`stall_escape`]). BFGS arrives on the kink's valley floor, where the
 //!   gradient is large and points *across* the valley, every step along it raises the objective
@@ -17,6 +19,8 @@
 //!   between two points makes a second local minimum a barrier away from the first, close to it
 //!   in distance (0.01) and not reachable by any descent from the incumbent. A descent from a
 //!   small kick of each coordinate reaches it.
+
+use crate::types::CompiledModel;
 
 /// The gradient norm above which a stall is examined. The objective-stall stop's noise floor on
 /// a smooth ODE objective is at most about 6e-3 (measured on a 40-subject fit); a kink's is
@@ -44,6 +48,14 @@ const MAX_KICK_COORDS: usize = 16;
 /// handful (12 found every second mode on the fixture; 6 missed one by 2e-4, 3 missed two),
 /// and one that has not got there by then is not worth finishing.
 pub(super) const KICK_MAX_ITER: usize = 12;
+
+/// Whether an inner solve may run [`stall_escape`] (#3210): on an analytic inner gradient
+/// (`analytic`), where the model has a kink on its prediction path
+/// ([`CompiledModel::prediction_has_kink`]) or `inner_kick` (`kick`) asks for it everywhere. The
+/// one gate both primary solves (`find_ebe_solve`, `find_ebe_iov_seeded`) read.
+pub(super) fn kink_escape_allowed(model: &CompiledModel, analytic: bool, kick: bool) -> bool {
+    analytic && (kick || model.prediction_has_kink)
+}
 
 /// The minimum-norm point of the convex hull of `gs` (Frank–Wolfe with an exact line search).
 pub(super) fn min_norm_hull(gs: &[Vec<f64>]) -> Vec<f64> {

@@ -1,9 +1,10 @@
 """The minimum of each subject's individual objective for tests/inner_kink_nonsmooth.rs's ORACLE.
-Plain Python 3 (no dependencies; written against 3.12): python3 oracle.py clipped.csv [occ1]
+Plain Python 3 (no dependencies; written against 3.12): python3 oracle.py clipped.csv [occ1|iiv]
 obj = sum (DV - max(0, BASE*exp(-K*tad) - TH_occ))^2/sigma^2 + eta' Omega^-1 eta + sum kappa^2/omega_kappa,
 BASE = TVBASE*exp(eta_1), TH_occ = TVTH*exp(eta_2 + kappa_occ), at clipped.ferx's initial estimates,
 minimised by Nelder-Mead from 0 with three simplex sizes, polished three times. occ1: occasion 1
-only, without kappa (the no-IOV variant of without_iov_the_kicks_reach_a_second_mode)."""
+only, without kappa (the no-IOV variant of without_iov_the_kicks_reach_a_second_mode). iiv: both
+occasions, without kappa (the no-IOV variant of the stall-escape default test, #3210)."""
 import csv
 import math
 import sys
@@ -49,6 +50,7 @@ def nm(f, x0, step, it=4000):
 
 
 occ1 = sys.argv[2:] == ['occ1']
+no_iov = occ1 or sys.argv[2:] == ['iiv']
 data, t0s = defaultdict(list), {}
 for r in csv.DictReader(open(sys.argv[1])):
     if occ1 and r['OCC'] != '1':
@@ -61,7 +63,7 @@ for r in csv.DictReader(open(sys.argv[1])):
 for i, rows in data.items():
     def f(y, rows=rows):
         return obj(rows, y)
-    best = min((nm(f, [0.0] * (2 if occ1 else 4), s) for s in (0.05, 0.2, 0.3)), key=lambda b: b[0])
+    best = min((nm(f, [0.0] * (2 if no_iov else 4), s) for s in (0.05, 0.2, 0.3)), key=lambda b: b[0])
     for _ in range(3):
         best = min(best, nm(f, best[1], 0.02), key=lambda b: b[0])
     print('    ("%s", [%s]),' % (i, ', '.join('%.6f' % v for v in best[1])))
