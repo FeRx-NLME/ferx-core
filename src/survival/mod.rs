@@ -183,9 +183,9 @@ fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
 #[cfg(test)]
 pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord], theta: &[T],
-    eta: &[T],
+    eta: &[T], recurrence: TteRecurrence,
 ) -> Option<T> {
-    ode_tte_nll_visit_g(model, subject, chz_state, records, theta, eta, &mut |_| {})
+    ode_tte_nll_visit_g(model, subject, chz_state, records, theta, eta, recurrence, &mut |_| {})
 }
 
 /// [`ode_tte_nll_g`] handing each scored record's [`RecordTerm`] to `visit` (#901). It
@@ -193,12 +193,12 @@ pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
 /// never leaves terms in the visitor.
 pub(crate) fn ode_tte_nll_visit_g<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord], theta: &[T],
-    eta: &[T], visit: &mut impl FnMut(RecordTerm<T>),
+    eta: &[T], recurrence: TteRecurrence, visit: &mut impl FnMut(RecordTerm<T>),
 ) -> Option<T> {
     let times = ode_hazard_times(records);
     let solved =
         crate::sens::ode_provider::adjoint::ode_states_at_g(model, subject, theta, eta, &times)?;
-    ode_tte_nll_from_states(model, subject, chz_state, records, &times, &solved, visit)
+    ode_tte_nll_from_states(model, subject, chz_state, records, &times, &solved, recurrence, visit)
 }
 
 /// [`ode_tte_nll_g`] over a solve already saved at `times` (sorted, deduplicated, holding
@@ -207,16 +207,30 @@ pub(crate) fn ode_tte_nll_visit_g<T: crate::sens::num::vm::VmNum>(
 pub(crate) fn ode_tte_nll_from_states<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord],
     times: &[f64], solved: &crate::sens::ode_provider::adjoint::DualStates<T>,
-    visit: &mut impl FnMut(RecordTerm<T>),
+    recurrence: TteRecurrence, visit: &mut impl FnMut(RecordTerm<T>),
 ) -> Option<T> {
     let (cum, haz) = crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states(
         model, subject, chz_state, times, solved,
     )?;
     let tol = MonoTol::from_solver(&model.ode_spec.as_ref()?.effective_solver_opts());
+    // The cumulative-hazard curve is indexed by absolute time, not gap time.
     let at = |curve: &[T], t: f64| -> T {
         times.binary_search_by(|x| x.total_cmp(&t)).map_or(T::from_f64(f64::NAN), |i| curve[i])
     };
-    Some(tte_nll_from_curves_g(records, |t| at(&cum, t), |t| at(&haz, t), tol, visit))
+    // Clock-reset RTTE with an ODE-accumulated hazard would need a fresh ODE solve from
+    // each renewal state, integrating over gap time — a later slice (#3152).
+    match recurrence {
+        TteRecurrence::Single => {
+            Some(tte_nll_from_curves_g(records, |t| at(&cum, t), |t| at(&haz, t), tol, visit))
+        }
+        TteRecurrence::Repeated { clock: RtteClock::Forward } => Some(
+            rtte_forward_nll_from_curves_g(records, |t| at(&cum, t), |t| at(&haz, t), tol, visit),
+        ),
+        TteRecurrence::Repeated { clock: RtteClock::Reset } => {
+            // The parser rejects this combination at parse time; defense in depth.
+            Some(T::from_f64(SUBJECT_SENTINEL_NLL))
+        }
+    }
 }
 
 /// A subject's non-Gaussian data term as a function of `(θ, η)` on any VM number type —
@@ -331,6 +345,7 @@ impl<'a> TteTerm<'a> {
                             &ep.records,
                             times,
                             solved,
+                            ep.recurrence,
                             &mut |_| {},
                         )?
                     }
@@ -3611,7 +3626,16 @@ mod ode_hazard_exact_tests {
             let d = |h: f64| (g(eta[0] + h) - g(eta[0] - h)) / (2.0 * h);
             let fd = (4.0 * d(5e-4) - d(1e-3)) / 3.0;
             worst_h = worst_h.max((exact[(0, 0)] - fd).abs() / fd.abs().max(1e-12));
-            let v = ode_tte_nll_g::<f64>(model, s, chz, &recs, theta, &eta).unwrap();
+            let v = ode_tte_nll_g::<f64>(
+                model,
+                s,
+                chz,
+                &recs,
+                theta,
+                &eta,
+                crate::types::TteRecurrence::Single,
+            )
+            .unwrap();
             worst_v = worst_v.max((v - f(&eta)).abs() / (1.0 + f(&eta).abs()));
             n += 1;
         }

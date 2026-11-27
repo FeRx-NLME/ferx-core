@@ -372,7 +372,7 @@ fn tte_endpoint_nll_visit(
             // integrate to the same divergence: repelled.
             if crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject) {
                 return crate::survival::ode_tte_nll_visit_g::<f64>(
-                    model, subject, *chz_state, records, theta, eta, visit,
+                    model, subject, *chz_state, records, theta, eta, recurrence, visit,
                 )
                 .unwrap_or(SUBJECT_SENTINEL_NLL);
             }
@@ -7504,6 +7504,7 @@ DV ~ proportional(PROP_ERR)
             &s.obs_records,
             &p.theta,
             &eta,
+            crate::types::TteRecurrence::Single,
         )
         .expect("walk value");
         let terms = router_terms(&model, &s, Some(&share), &eta);
