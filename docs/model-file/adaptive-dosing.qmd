@@ -1118,6 +1118,11 @@ positive `Within` row is variance it added by acting on noisy readings. `m.diffe
 `Mean` rows are the mean effect on each metric (on `PctReadingsInWindow`, the change in
 the fraction of readings in the window).
 
+A threshold in the summary options applies to each summary's own values. So on
+`m.difference` a `FractionAtLeast(a)` row is the fraction of runs whose **effect** is at
+least `a`, P(A − R ≥ a). The change in attainment, P(A ≥ a) − P(R ≥ a), is the `adaptive`
+row minus the `reference` row.
+
 On the analytic fixture below (a proportional controller acting on a `Dv` reading against
 the fixed dose it starts from), the controller removed about 26 % of the BSV and of the
 parameter layer, and added a within layer the fixed regimen does not have (exactly 0
@@ -1143,11 +1148,13 @@ first difference:
 | Different seeds | Every stream differs |
 | Different parameters, draw count, or a draw's values | Other η scales, other draws |
 | Different decision grid | κ occasions and assay draws are keyed by grid index |
-| Different `n_sim`, `n_reps`, subject count or order | η is drawn in population order |
+| Different `n_sim` or `n_reps` | The runs cannot be matched one to one |
+| Different subject count or order | η is drawn in population order |
 | A supplied η in one arm only | One arm's η is not drawn |
 
-The model, the covariates and the base regimen in the data are not recorded, so they
-cannot be checked. Pass the same ones to both runs.
+The model, the covariates, the base regimen in the data and the supplied η values
+(`with_etas`) are not recorded, so they cannot be checked. Pass the same ones to both
+runs.
 
 #### The reference regimen
 
@@ -1182,7 +1189,8 @@ contrasted with itself gives bit-identical runs and every difference exactly 0, 
 fixed controller on the programmatic entry equals `fixed_reference()` on the spec entry
 bit for bit. The difference is then compared with quadrature at the run's own draws, on a
 one-compartment model with log-normal θ and a controller `100 − 0.5 × reading`, whose
-layers have closed forms. Each layer agrees within 2.3 SD of its Monte Carlo error.
+layers have closed forms. Each layer agrees within the test's tolerance of 4 SD of its
+Monte Carlo error (2.3 SD at the test's seed).
 
 ## Verification (on by default)
 

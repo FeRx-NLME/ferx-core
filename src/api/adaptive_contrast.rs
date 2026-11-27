@@ -80,6 +80,10 @@ pub struct AdaptiveContrast<T> {
 /// missing it in either is listed in `difference.skipped`, with the runs missing in either
 /// arm. A `Supplied` or `NotDrawn` status carries over.
 ///
+/// The run does not record the model, the covariates, the base regimen in the data or the
+/// supplied η values (`AdaptiveInputs::with_etas`), so the pair check cannot see them: pass
+/// the same ones to both runs.
+///
 /// # Errors
 ///
 /// `E_ADAPTIVE_OPTIONS` when a label is empty, the arms are not a common-random-numbers
@@ -108,6 +112,11 @@ pub fn decompose_contrast(
 /// band the parameter uncertainty of that effect, and its prediction interval the spread
 /// of one patient's effect. A run whose metric is missing in either arm is missing in the
 /// difference.
+///
+/// A threshold in `opts` applies to each summary's own values. On `difference` its
+/// `FractionAtLeast(a)` row is therefore the fraction of runs whose effect is at least `a`,
+/// P(A − R ≥ a); the change in attainment, P(A ≥ a) − P(R ≥ a), is the `adaptive` row minus
+/// the `reference` row.
 ///
 /// # Errors
 ///
