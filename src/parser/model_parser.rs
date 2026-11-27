@@ -7159,12 +7159,11 @@ pub fn parse_full_model_with(
     // an individual parameter (`restrict_and_validate_indiv_stmts` keeps the statements it reads),
     // and a parameter read only there was reported dead with advice to remove it (#1455). A named
     // `[covariate_nn NAME]` reads thetas, etas and covariates, never an individual parameter, so it
-    // is skipped: its layer and input names would only hide a dead parameter they collide with.
+    // is skipped: its output names, often the individual parameters', would hide a dead one.
     if !pk_param_map.is_empty() || is_ode || is_algebraic {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        let census_blocks = every_block_body(&extracted)
-            .filter(|(ty, named, _)| named.is_none() || *ty != "covariate_nn");
+        let census_blocks = every_block_body(&extracted).filter(|(ty, _, _)| *ty != "covariate_nn");
         for (_, _, lines) in census_blocks {
             for line in lines {
                 for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {

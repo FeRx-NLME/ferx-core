@@ -1294,6 +1294,41 @@ fn a_parameter_only_a_named_endpoint_reads_is_not_dead() {
     }
 }
 
+/// #1455: a named `[covariate_nn]` stays out of the census. Its `outputs` reuse individual
+/// parameter names (as in `examples/warfarin_dcm.ferx`), so counting it would hide the dead `KA`.
+#[cfg(feature = "nn")]
+#[test]
+fn a_covariate_nn_output_name_does_not_hide_a_dead_parameter() {
+    let src = "
+[parameters]
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs  = [WT]
+  outputs = [CL, V, KA]
+  layers  = [4]
+  activation = tanh
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V = TYPICAL_PK.V
+  KA = 2 * TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+    let ws = super::parse_full_model(src).expect("parses").model.parse_warnings;
+    assert!(
+        ws.iter().any(|w| w.contains("computed but never used") && w.contains("`KA`")),
+        "{ws:?}"
+    );
+}
+
 #[test]
 fn test_param_used_only_in_derived_not_flagged_dead() {
     // An individual parameter referenced only in [derived] — not mapped into
