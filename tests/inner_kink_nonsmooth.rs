@@ -179,10 +179,13 @@ fn the_non_iov_solve_runs_the_stall_escape_by_default_for_a_kinked_model() {
 /// the fit ended above the unkicked one. A differential pair, so a shift of the outer path that
 /// moves both fits (as #3153's `f / c` first leg did) cancels.
 ///
-/// Measured (macOS; the kicked fit is the same on CI's Linux): kicked −4835.241380, unkicked
-/// −4835.017384, final pass only −4834.445003, so the gaps to the unkicked fit are 0.224, and
-/// −0.572 for the final-pass mutant. Both fits carry #833's warning on subject 17 (cold re-solve
-/// 8.87 and 8.11 worse): the fixture's start dependence at this point, with or without kicks.
+/// The second arm is the default, which on this model runs the stall escape but not the kicks
+/// (#3210: the clipped readout is a flagged kink). Measured (Linux, the same on macOS): kicked
+/// −4835.241380, default −4832.989357, final pass only −4832.390237, so the gaps to the default
+/// are −2.252, and +0.599 for the final-pass mutant (which kills this test alone). Both fits
+/// carry #833's warning: the kicked one on subject 17 (cold re-solve 8.51 worse), the default
+/// on 2 subjects whose warm EBEs stayed in a higher mode (cold re-solve 0.599 lower). Before
+/// #3210 the default (no escape) reached −4835.017384 and the gaps were 0.224 and −0.572.
 #[test]
 fn an_estimating_fit_reports_the_kicked_ebes() {
     let kicked = fit_with("bfgs", "  inner_kick = true\n  maxiter = 1\n");
