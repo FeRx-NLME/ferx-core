@@ -73,6 +73,11 @@ fn result_of(
         decisions,
         metrics,
         parameters: vec![],
+        manifest: AdaptiveRunManifest {
+            seed: Some(946),
+            point_parameters: model("omega ETA_CL ~ 0.09").default_params,
+            decision_times: vec![0.0, 24.0, 48.0],
+        },
         warnings: vec![],
     }
 }

@@ -1263,3 +1263,17 @@ fn round_to_with_levels_errors() {
          already discrete, so write the rounded doses as the levels"
     );
 }
+
+/// A block without a rule is refused by the parser (#946): in a model file a missing rule
+/// is a mistake. The spec validator accepts a hand-built spec without rules, the fixed
+/// reference of a controller contrast (`AdaptiveDosingSpec::fixed_reference`), so this
+/// check lives in the parser alone.
+///
+/// Mutation: drop the parser's rule check (the block parses as a fixed regimen).
+#[test]
+fn a_block_without_rules_is_refused_by_the_parser() {
+    let e = parse_adaptive_dosing_block(&without("when")).expect_err("no rule");
+    assert_eq!(e, crate::sim::adaptive::NO_RULES);
+    let spec = parse_adaptive_dosing_block(&lines(&valid_min())).expect("parses");
+    assert_eq!(spec.fixed_reference().validate(), Ok(()));
+}

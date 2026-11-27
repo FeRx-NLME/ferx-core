@@ -1057,6 +1057,11 @@ impl AbsorbedIncrease {
     }
 }
 
+/// The block parser's refusal of an `[adaptive_dosing]` block without a rule. A hand-built
+/// spec may have none ([`AdaptiveDosingSpec::fixed_reference`]); in a model file a missing
+/// rule is a mistake, and a fixed regimen belongs in the data's dose records.
+pub(crate) const NO_RULES: &str = "[adaptive_dosing]: at least one `when … : …` rule is required";
+
 /// P4 (#944): `round_to` together with a `levels` ladder.
 pub(crate) const ROUND_TO_WITH_LEVELS: &str = "[adaptive_dosing]: round_to cannot be combined \
      with levels: a levels ladder is already discrete, so write the rounded doses as the levels";
@@ -1415,12 +1420,25 @@ impl AdaptiveDosingSpec {
         .collect()
     }
 
+    /// The spec with its rules cleared (#946): the reference regimen of a controller
+    /// contrast ([`crate::decompose_contrast`], [`crate::summarize_contrast`]). With no rule
+    /// to fire, the controller re-issues its running dose at every due point, so this is
+    /// the start dose at every due point: each subject's own value of a `start_dose`
+    /// expression (#944, evaluated as the adaptive arm evaluates it), placed on the
+    /// `round_to` grid, clamped to `dose_bounds`, on `start_interval`. Everything else
+    /// (schedule, monitor, route, metrics bands) is unchanged, so the two arms share their
+    /// decision grid by construction. It is not a fair reference for a controller with a
+    /// loading dose: name the reference in [`crate::AdaptiveArmLabels`], and pass any other
+    /// regimen through the programmatic entry.
+    pub fn fixed_reference(&self) -> Self {
+        Self { rules: Vec::new(), ..self.clone() }
+    }
+
     /// Enforce every invariant the block parser checks. Called by the parser and again
-    /// by `compile_adaptive` as the safety net for a hand-built `pub` spec.
+    /// by `compile_adaptive` as the safety net for a hand-built `pub` spec. A spec without
+    /// rules is valid here, the fixed regimen of [`Self::fixed_reference`]; the block
+    /// parser alone requires a rule ([`NO_RULES`]).
     pub fn validate(&self) -> Result<(), String> {
-        if self.rules.is_empty() {
-            return Err("[adaptive_dosing]: at least one `when … : …` rule is required".to_string());
-        }
         // Dose invariants among the numeric values (#944, #2667); those involving an
         // expression run per subject in `resolve_dose_plans`. Reported at each check's
         // historical position so the same invariant is named as before #944.
@@ -2268,10 +2286,9 @@ mod tests {
         s.start_dose = (500.0).into();
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
 
-        // no rules.
-        let mut s = base_spec();
-        s.rules.clear();
-        assert!(s.validate().unwrap_err().contains("rule"));
+        // no rules: the fixed reference regimen (#946), valid on a hand-built spec. The
+        // block parser refuses it (`a_block_without_rules_is_refused_by_the_parser`).
+        assert_eq!(base_spec().fixed_reference().validate(), Ok(()));
 
         // a Level step with no `levels` ladder (a silent no-op in `step_dose`).
         let mut s = base_spec();
