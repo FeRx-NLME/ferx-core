@@ -1437,7 +1437,7 @@ impl AdaptiveDosingSpec {
     /// Enforce every invariant the block parser checks. Called by the parser and again
     /// by `compile_adaptive` as the safety net for a hand-built `pub` spec. A spec without
     /// rules is valid here, the fixed regimen of [`Self::fixed_reference`]; the block
-    /// parser alone requires a rule ([`NO_RULES`]).
+    /// parser alone requires a rule (`NO_RULES`).
     pub fn validate(&self) -> Result<(), String> {
         // Dose invariants among the numeric values (#944, #2667); those involving an
         // expression run per subject in `resolve_dose_plans`. Reported at each check's
