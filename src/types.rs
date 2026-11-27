@@ -1559,7 +1559,8 @@ impl Subject {
     /// scores it (the likelihood scores transitions), so a two-record Markov subject counts
     /// two for one scored transition. Measured on the
     /// Gaussian observations alone, a binary-only or time-to-event-only subject counted as
-    /// having none, so its unconverged EBE was never counted and never warned about.
+    /// having none, so its unconverged EBE was never counted and never warned about. The reader's
+    /// "emptied by `[data_selection]`" test reads it too (#3148).
     pub(crate) fn n_scored_rows(&self) -> usize {
         self.observations.len() + self.obs_records.len()
     }

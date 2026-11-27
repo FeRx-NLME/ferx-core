@@ -1082,7 +1082,8 @@ fn read_nonmem_csv_impl(
         // `population_warnings` (not printed) per the warning convention —
         // they surface via `FitResult.warnings`.
         let has_doses = !subject.doses.is_empty();
-        let has_obs = !subject.observations.is_empty();
+        // Scored rows: Gaussian observations and endpoint records (binary, TTE, count, state).
+        let has_obs = subject.n_scored_rows() > 0;
         let excluded_doses = subj_excl.n_dose_excluded > 0;
         let excluded_obs = subj_excl.n_obs_excluded > 0;
 
@@ -1100,11 +1101,12 @@ fn read_nonmem_csv_impl(
         }
 
         // Drop a subject as "excluded by data selection" only when the filter
-        // removed at least one of its records and left it empty; subjects empty
-        // for other reasons (only EVID=2/3) are kept as before.
+        // removed at least one of its records and left it empty (no doses, no
+        // observations, no endpoint records, #3148); subjects empty for other
+        // reasons (only EVID=2/3) are kept as before.
         let had_exclusions =
             subj_excl.n_obs_excluded + subj_excl.n_dose_excluded + subj_excl.n_other_excluded > 0;
-        if had_exclusions && subject.doses.is_empty() && subject.observations.is_empty() {
+        if had_exclusions && subject.doses.is_empty() && !has_obs {
             // Subject entirely excluded by the filter — do not add to the list.
             excl_summary.excluded_subject_ids.push(id.clone());
             continue;
