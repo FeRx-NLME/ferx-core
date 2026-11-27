@@ -2583,9 +2583,7 @@ impl OmegaMatrix {
                 // other ηs' variances (#3150). Any other failure takes the eigenvalue floor.
                 let m_reg = if sim_chol.is_some() {
                     let mut floored = m.clone();
-                    for i in
-                        (0..n).filter(|&i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0))
-                    {
+                    for (i, _) in zero_rows(&m).iter().enumerate().filter(|(_, &z)| z) {
                         floored[(i, i)] = 1e-8;
                     }
                     floored
@@ -2783,13 +2781,17 @@ impl OmegaMatrix {
 /// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
 const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
 
+/// Which rows of `m` are structural zeros: the whole row and column exactly `0`.
+fn zero_rows(m: &DMatrix<f64>) -> Vec<bool> {
+    let n = m.nrows();
+    (0..n).map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0)).collect()
+}
+
 /// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when
 /// `m` has structural zeros (diagonal exactly `0`, whole row and column exactly
 /// `0`) and the rest factors on its own; `None` otherwise (#1605).
 fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
-    let n = m.nrows();
-    let zeros: Vec<bool> =
-        (0..n).map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0)).collect();
+    let zeros = zero_rows(m);
     if !zeros.iter().any(|&z| z) {
         return None;
     }

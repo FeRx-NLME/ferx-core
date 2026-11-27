@@ -36691,6 +36691,18 @@ fn a_placeholder_that_anything_else_reads_keeps_its_declaration() {
         assert!(dropped_note(&m).is_none(), "{name}: {:?}", dropped_note(&m));
     };
     kept("iiv_on_ruv", zero_eta_src(z1, sum, "TVV", "  iiv_on_ruv = ETA_Z1\n"), &["ETA_Z1"]);
+    // A named endpoint block that reads it.
+    #[cfg(feature = "survival")]
+    kept(
+        "named endpoint block",
+        zero_eta_src(
+            z1,
+            sum,
+            "TVV",
+            "[event_model cause_a]\n  cmt = 2\n  family = exponential\n  scale = 0.05 * exp(ETA_Z1)\n",
+        ),
+        &["ETA_Z1"],
+    );
     // A zero block: one name read by `iiv_on_ruv` keeps the whole block.
     let block = "  block_omega (ETA_Z1, ETA_Z2) = [0, 0, 0] FIX\n";
     kept(

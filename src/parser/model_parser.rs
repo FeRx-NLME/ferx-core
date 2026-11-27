@@ -18516,7 +18516,8 @@ fn apply_zero_fix_etas(
     let Ok((_, omegas, blocks, ..)) = parse_parameters(lines, level_bindings) else {
         return Vec::new();
     };
-    // A mention in any case counts: other scans of the parser fold the case of an η name.
+    // A mention in any case keeps the placeholder. η names bind case-sensitively, so a differently
+    // cased mention reads as a covariate; matching it anyway only ever keeps more, never drops.
     let word = |n: &str| Regex::new(&format!(r"(?i)\b{}\b", regex::escape(n))).unwrap();
     let decl = Regex::new(r"(?i)^\s*(omega|block_omega)\b").unwrap();
     let goes = |name: &String| {
