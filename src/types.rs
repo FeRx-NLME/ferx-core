@@ -5375,8 +5375,8 @@ pub struct CompiledModel {
     /// True when the prediction has a kink an inner search can stall at: an `if`, `min`, `max`,
     /// `clamp`, `abs`, `floor`, `ceil` or `round` whose condition or operand depends on a
     /// random effect or a state, in `[individual_parameters]` or a `[scaling]` `y` readout. Set by
-    /// the parser (#3210). It turns the inner stall escape on by default
-    /// ([`FitOptions::inner_kick`] turns it on everywhere). `[odes]` switches and η-moved event
+    /// the parser (#3210). It turns the inner stall escape on by default on an ODE model (a
+    /// closed-form model has no stall stop; [`FitOptions::inner_kick`] turns it on everywhere). `[odes]` switches and η-moved event
     /// times are kinks it does not detect.
     pub prediction_has_kink: bool,
     /// Per-ETA transformation metadata derived from the `[individual_parameters]`
