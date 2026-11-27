@@ -99,6 +99,33 @@ fn non_square(m: &OmegaMatrix, (r, c): (usize, usize), v: f64) -> OmegaMatrix {
     q
 }
 
+/// A model that dropped `omega … ~ 0 FIX` placeholders (#3150) has a smaller Ω than the one
+/// written. An Ω sized for the declared shape is refused, and the refusal quotes the note that
+/// names the dropped ηs, so the user can see why the shape differs.
+#[test]
+fn an_omega_sized_for_the_declared_shape_is_refused_naming_the_dropped_etas() {
+    let src = ONE_CPT_IV.replace(
+        "  omega ETA_CL ~ 0.09
+",
+        "  omega ETA_CL ~ 0.09
+  omega ETA_Z1 ~ 0 FIX
+",
+    );
+    let src = src.replace("exp(ETA_CL)", "exp(ETA_CL + ETA_Z1)");
+    let m = parse_model_string(&src).expect("parses");
+    assert_eq!(m.eta_names, ["ETA_CL"]);
+    let err = check_param_shape(&m, &[ParamBlock::Omega((2, 2))]).expect_err("refused").to_string();
+    assert!(err.starts_with("the supplied omega is 2×2 but this model has 1 eta; "), "{err}");
+    assert!(
+        err.contains("Note: W_ZERO_FIX_ETA_DROPPED: omega ETA_Z1 ~ 0 FIX is held at 0"),
+        "{err}"
+    );
+    // A model that dropped nothing gets the plain message.
+    let plain = parse_model_string(ONE_CPT_IV).expect("parses");
+    let err = check_param_shape(&plain, &[ParamBlock::Omega((2, 2))]).expect_err("refused");
+    assert!(!err.to_string().contains("W_ZERO_FIX_ETA_DROPPED"), "{err}");
+}
+
 /// Every block mis-shaped one at a time against `p`, each FIX vector resized with it so the
 /// shape is the only thing wrong. On a model with κ the Ω_IOV cells are mis-sized, non-square
 /// and absent; without κ, one present Ω_IOV. Ω is also non-square, 1×2 (the model's row

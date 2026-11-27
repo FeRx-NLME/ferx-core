@@ -7834,6 +7834,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
         "W_DERIVED_STEP_IGNORED"
     } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
         "W_ABSORPTION_TWIN_DECLINED"
+    } else if w.starts_with(crate::types::ZERO_FIX_ETA_TOKEN) {
+        crate::types::ZERO_FIX_ETA_TOKEN
     } else if w.contains(crate::parser::model_parser::DEPRECATED_BLOCK_CODE) {
         crate::parser::model_parser::DEPRECATED_BLOCK_CODE
     } else {

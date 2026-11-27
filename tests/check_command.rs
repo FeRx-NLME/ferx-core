@@ -1073,6 +1073,9 @@ fn overridden_zero_variance_fails_fit_even_though_the_file_is_fine() {
 /// below). The Ω half pinned here is still silent: #2865 left the internal
 /// rails at `maxiter = 0` as they were.
 ///
+/// The model's only η is the placeholder, so #3150 keeps it (a `0 FIX` η is removed only when
+/// another η remains); beside a live η it is gone and has no rail to report.
+///
 /// This goes through `fit()` rather than composing `pack_params` /
 /// `clamp_to_bounds` by hand: composing them would assert that
 /// `clamp_to_bounds` clamps, which is a tautology, and would stay green if
