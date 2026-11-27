@@ -410,49 +410,42 @@ fn analytical_3cpt_central_init_matches_ode_init() {
     assert_pred_agrees(&an, &ode, &iv_population(), 35.0);
 }
 
-/// A system reset (EVID=3/4) zeros every compartment, including the residual
-/// init baseline; nothing re-deposits the t=0 amount. Observations at/after the
-/// first reset must therefore carry NO baseline contribution (issue #521 review:
-/// the old code decayed the baseline across the reset-shifted clock, double-
-/// applying it to every post-reset occasion).
+/// A system reset (EVID=3/4) wipes every compartment and lays the init baseline down again,
+/// as NONMEM re-applies `A_0` (#3140, `nonmem_anchor/param_time_reset_seed.ctl`) and the
+/// `[odes]` twin re-seeds `init(...)` (#1133). Subject 1 resets mid-profile, subject 2 is an
+/// `EVID=4` first dose (a reset at its first record), and subject 3 is subject 2 without the
+/// reset. Before #3140 the closed form dropped the baseline from the first reset on: 30 → 0 at
+/// subject 1's `t = 5`, and subject 2 lost it entirely.
 #[test]
-fn analytical_init_zeroed_after_reset() {
+fn analytical_init_is_reseeded_at_a_reset_as_the_ode_twin() {
     let an = parse_full_model(&analytical_src()).expect("analytical model parses").model;
-
-    // No doses: the only signal is the central baseline (30*V → conc 30 at t=0).
-    // A reset at t=5 must wipe it, so obs at t>=5 see 0 baseline.
-    let obs_times = vec![0.0, 1.0, 5.0, 8.0];
-    let n = obs_times.len();
-    let mut subj = common::subject("1", vec![], obs_times, vec![0.0; n], vec![2; n]);
-    subj.reset_times = vec![5.0];
+    let ode = parse_full_model(&ode_src()).expect("ODE model parses").model;
+    let obs = vec![0.0, 1.0, 5.0, 8.0, 12.0];
+    let n = obs.len();
+    let subject = |id: &str, resets: Vec<f64>| {
+        let dose = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let mut s = common::subject(id, dose, obs.clone(), vec![0.0; n], vec![2; n]);
+        s.reset_times = resets;
+        s
+    };
     let pop = Population {
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![subj],
+        subjects: vec![subject("1", vec![5.0]), subject("2", vec![0.0]), subject("3", vec![])],
     };
-
     let pa = predict(&an, &pop, &an.default_params).unwrap();
-    assert!(
-        (pa[0].pred - 30.0).abs() < 1e-6,
-        "pre-reset baseline at t=0 should be 30, got {}",
-        pa[0].pred
-    );
-    assert!(
-        pa[1].pred > 0.0 && pa[1].pred < 30.0,
-        "pre-reset baseline at t=1 should decay below 30, got {}",
-        pa[1].pred
-    );
-    assert!(
-        pa[2].pred.abs() < 1e-12,
-        "baseline at reset time t=5 should be wiped to 0, got {}",
-        pa[2].pred
-    );
-    assert!(
-        pa[3].pred.abs() < 1e-12,
-        "baseline after reset (t=8) should stay 0, got {}",
-        pa[3].pred
-    );
+    let po = predict(&ode, &pop, &ode.default_params).unwrap();
+    for (x, y) in pa.iter().zip(&po) {
+        let tol = ATOL + RTOL * x.pred.abs();
+        assert!((x.pred - y.pred).abs() <= tol, "{x:?} vs ODE {y:?}");
+    }
+    // Subject 1 at the reset: the dose is wiped and the baseline restarts at 30 (30·V / V).
+    assert!((pa[2].pred - 30.0).abs() < 1e-9, "re-seeded baseline {}", pa[2].pred);
+    // A first-record reset is a no-op.
+    for j in 0..n {
+        assert!((pa[n + j].pred - pa[2 * n + j].pred).abs() < 1e-12, "t = {}", obs[j]);
+    }
 }

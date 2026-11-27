@@ -205,6 +205,7 @@ fn a_period_two_dose_reads_f_at_its_written_time() {
 
 #[test]
 fn a_reset_row_reseeds_init_at_its_written_time() {
+    assert_matches_nonmem("reset_seed", "analytic");
     assert_matches_nonmem("reset_seed", "ode");
 }
 
@@ -350,9 +351,8 @@ fn every_fixture_straddles_the_step_and_the_control_does_not() {
 }
 
 fn run_population(case: &str) -> Population {
-    let engine = if case == "reset_seed" { "ode" } else { "analytic" };
     prepare_run(
-        &anchor(&format!("param_time_{case}_{engine}.ferx")),
+        &anchor(&format!("param_time_{case}_analytic.ferx")),
         Some(&anchor(&format!("param_time_{case}.csv"))),
     )
     .unwrap_or_else(|e| panic!("{case}: load: {e}"))

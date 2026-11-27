@@ -152,10 +152,10 @@ the compartment restarts at `1400`, not `700`. The same holds for the row's `OCC
 `iov_column`: a reset that opens a new occasion re-seeds under that occasion's κ. Anchored
 against NONMEM 7.6.0 in `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl`.
 
-One gap remains (#1135): an **analytical** (closed-form) model using
-`[initial_conditions]` drops its baseline at the first reset and never re-deposits it,
-where NONMEM re-applies `A_0`. Use an `[odes]` model if you need a baseline that
-survives a reset.
+One gap remains: an **analytical** (closed-form) model using `[initial_conditions]`
+re-deposits its baseline at a reset (#3140) but evaluates it once per subject, at `t = 0`,
+so the `1400` above stays `700` there. Use an `[odes]` model if the baseline reads a
+covariate that steps at a reset.
 :::
 
 ## Covariate table

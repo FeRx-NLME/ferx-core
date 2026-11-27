@@ -690,29 +690,30 @@ pub fn add_analytical_init(
 
 /// Core of [`add_analytical_init`]. `amount_pk` evaluates `A₀` (BSV snapshot);
 /// `obs_decay_pk`, when `Some`, supplies per-observation params for the decay kernel (IOV,
-/// #521 review), else `amount_pk` drives it. An EVID=3/4 reset zeros the baseline, so it
-/// contributes only to observations strictly before the first reset (internal clock).
+/// #521 review), else `amount_pk` drives it. An EVID=3/4 reset wipes the residue and lays the
+/// amount down again, as NONMEM re-applies `A_0` there (#3140,
+/// `nonmem_anchor/param_time_reset_seed.ctl`) and `[odes] init(...)` re-seeds (#1133).
 fn add_analytical_init_with(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], amount_pk: &PkParams,
     obs_decay_pk: Option<&[PkParams]>, preds: &mut [f64],
 ) {
-    let first_reset = subject.reset_times.iter().copied().fold(f64::INFINITY, f64::min);
     for init in &model.analytical_init {
         let a0 = (init.amount_fn)(theta, eta, &subject.covariates, amount_pk);
         if a0 == 0.0 || !a0.is_finite() {
             continue;
         }
         for (i, &t) in subject.obs_times.iter().enumerate() {
-            // The initial amount is laid down at the subject's time origin
-            // (t=0); a pre-origin observation sees none of it, and a reset
-            // wipes it for every observation at/after the reset time.
-            if t < 0.0 || t >= first_reset {
+            // Laid down at the time origin (t = 0) and at every reset (internal clock): it
+            // decays from the latest of them, and a pre-origin observation sees none of it.
+            let origin = crate::sens::provider::reset_floor_at(subject, t).max(0.0);
+            if t < origin {
                 continue;
             }
             let decay_pk = match obs_decay_pk {
                 Some(ps) => ps.get(i).unwrap_or(amount_pk),
                 None => amount_pk,
             };
+            let t = t - origin;
             if let Some(pred) = preds.get_mut(i) {
                 *pred += analytical_init_concentration(model.pk_model, init.cmt, a0, t, decay_pk);
             }
