@@ -5932,6 +5932,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
                 None,
                 &never_stall,
                 false,
+                false,
             )
         } else {
             lbfgs_run(
@@ -5945,6 +5946,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
                 Some(&metric),
                 None,
                 &never_stall,
+                false,
                 false,
             )
         };
@@ -5997,9 +5999,23 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
                     None,
                     &never_stall,
                     false,
+                    false,
                 )
             } else {
-                lbfgs_run(&obj, None, &grad, &mut x, 2, 60, 1e-10, None, None, &never_stall, false)
+                lbfgs_run(
+                    &obj,
+                    None,
+                    &grad,
+                    &mut x,
+                    2,
+                    60,
+                    1e-10,
+                    None,
+                    None,
+                    &never_stall,
+                    false,
+                    false,
+                )
             };
             let name = if dense { "dense BFGS" } else { "L-BFGS" };
             assert_ne!(exit, InnerExit::Stuck, "{name}: a gradient that {case} is moving");
@@ -6035,9 +6051,10 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
                 None,
                 &never_stall,
                 false,
+                false,
             )
         } else {
-            lbfgs_run(&obj, None, &grad, &mut x, 2, 60, 1e-20, m, None, &never_stall, false)
+            lbfgs_run(&obj, None, &grad, &mut x, 2, 60, 1e-20, m, None, &never_stall, false, false)
         };
         let name = if dense { "dense BFGS" } else { "L-BFGS" };
         assert_ne!(exit, InnerExit::Stuck, "{name}: the iterate moved to {x:?}");
@@ -6072,9 +6089,10 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
                 None,
                 &never_stall,
                 false,
+                false,
             )
         } else {
-            lbfgs_run(&obj, None, &grad, &mut x, 2, 30, 1e-20, m, None, &never_stall, false)
+            lbfgs_run(&obj, None, &grad, &mut x, 2, 30, 1e-20, m, None, &never_stall, false, false)
         };
         let name = if dense { "dense BFGS" } else { "L-BFGS" };
         assert_ne!(exit, InnerExit::Stuck, "{name}: the iterate drifted to {x:?}");

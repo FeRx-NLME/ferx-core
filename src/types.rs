@@ -9670,6 +9670,19 @@ pub struct FitOptions {
     /// unaffected — an alternate seed that reconverges to the same mode is not
     /// accepted — so `0` and the untriggered subjects stay bit-identical.
     pub inner_restarts: usize,
+    /// Restart every inner EBE solve from a small kick of each informative coordinate and keep a
+    /// lower mode (`[fit_options] inner_kick`, #3159). **Default `false`.** A clipped prediction
+    /// (`if (x - TH < 0) 0 else x - TH`) makes a second local minimum of a subject's individual
+    /// objective a barrier away from the first, which no descent from the first reaches; the
+    /// kicks do (at most 16 coordinates, two descents of at most 12 iterations each, per
+    /// subject and solve). A subject with one mode ends where it started. The search's solves
+    /// kick too: kicked in the final pass only, the #833 recovery reported the search's unkicked
+    /// EBEs, which score lower on OFV. The kicks run whether or not the model has a kink
+    /// (measured 2-20× on four fast ODE examples without one), so turn it on only for a model
+    /// with a clipped or thresholded prediction. It also turns on the stall escape: a stall at
+    /// ‖∇‖ ≥ 1 is checked by gradient sampling, and left along the valley when the sampled
+    /// gradients' hull excludes zero (off by default: a smooth ODE objective stalls there too).
+    pub inner_kick: bool,
     /// Size of the inner multi-start's quasi-random screen (`[fit_options] inner_screen`,
     /// default `100`; set `0` to disable, #2013). Runs inside the cold multi-start
     /// [`inner_restarts`](Self::inner_restarts) gates, before its per-coordinate scan, so it
@@ -10563,6 +10576,7 @@ impl Default for FitOptions {
             // One Ω-scaled restart pass; only accepts a strictly-lower mode. See
             // `FitOptions::inner_restarts`.
             inner_restarts: 1,
+            inner_kick: false,
             // #2013; see `FitOptions::inner_screen`.
             inner_screen: 100,
             // #2095; see `FitOptions::inner_twin_seed`.
@@ -11774,6 +11788,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11795,6 +11810,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11817,6 +11833,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11836,6 +11853,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
@@ -11847,6 +11865,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_maxiter",
             "inner_tol",
             "inner_restarts",
+            "inner_kick",
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
