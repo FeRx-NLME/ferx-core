@@ -4650,7 +4650,8 @@ mod tests {
     }
 
     /// #1153 review r1 #1: `iov_group_informed_for` lets a reset inform its group only on an
-    /// ODE model with an `init(...)`. A closed-form model's reset reads no parameters and an
+    /// ODE model with an `init(...)`. A closed-form model's reset reads no κ (its
+    /// `[initial_conditions]` re-seed is the BSV-only `t = 0` amount, #3140) and an
     /// init-free ODE model's reset zeros the state, so κ of a reset-only occasion moves no
     /// prediction there and must stay out of the κ shrinkage.
     #[test]

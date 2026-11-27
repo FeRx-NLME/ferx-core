@@ -1250,8 +1250,8 @@ pub struct ObsGrad {
 
 /// The closed-form `init(...)` impulses over `T` (`pk::add_analytical_init_with`): each
 /// `A₀ = amount(θ, η, p)` from its compiled program, decayed by the closed-form kernel from
-/// the latest of `t = 0` and the resets before each observation, added to `preds` — before any scaling, as
-/// production adds them. `amount` is the PK-slot vector the amounts read; `decay[j]` the
+/// the latest of `t = 0` and the resets before each observation, added to `preds` — before
+/// any scaling, as production adds them. `amount` is the PK-slot vector the amounts read; `decay[j]` the
 /// one observation `j` decays with (`None`: `amount`'s, the non-IOV convention). `None`
 /// when an init has no compiled amount program.
 pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(

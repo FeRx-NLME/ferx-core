@@ -205,6 +205,9 @@ fn a_period_two_dose_reads_f_at_its_written_time() {
 
 #[test]
 fn a_reset_row_reseeds_init_at_its_written_time() {
+    // The closed form pins only that the baseline is laid down again (#3140): its amount is the
+    // `t = 0` evaluation, which period 2's written `TIME 0` matches. The reset row's own `TIME`
+    // is read by the `[odes]` twin alone.
     assert_matches_nonmem("reset_seed", "analytic");
     assert_matches_nonmem("reset_seed", "ode");
 }

@@ -412,7 +412,8 @@ fn analytical_3cpt_central_init_matches_ode_init() {
 
 /// A system reset (EVID=3/4) wipes every compartment and lays the init baseline down again,
 /// as NONMEM re-applies `A_0` (#3140, `nonmem_anchor/param_time_reset_seed.ctl`) and the
-/// `[odes]` twin re-seeds `init(...)` (#1133). Subject 1 resets mid-profile, subject 2 is an
+/// `[odes]` twin re-seeds `init(...)` (#1133). Subject 1 resets twice mid-profile (the second
+/// at 9, so `t = 12` decays from the latest reset), subject 2 is an
 /// `EVID=4` first dose (a reset at its first record), and subject 3 is subject 2 without the
 /// reset. Before #3140 the closed form dropped the baseline from the first reset on: 30 → 0 at
 /// subject 1's `t = 5`, and subject 2 lost it entirely.
@@ -434,7 +435,7 @@ fn analytical_init_is_reseeded_at_a_reset_as_the_ode_twin() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![subject("1", vec![5.0]), subject("2", vec![0.0]), subject("3", vec![])],
+        subjects: vec![subject("1", vec![5.0, 9.0]), subject("2", vec![0.0]), subject("3", vec![])],
     };
     let pa = predict(&an, &pop, &an.default_params).unwrap();
     let po = predict(&ode, &pop, &ode.default_params).unwrap();

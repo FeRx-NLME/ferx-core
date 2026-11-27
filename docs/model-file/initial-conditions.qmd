@@ -131,8 +131,9 @@ above — numerically equivalent, and still allocation-free.
   - On an **analytical** model with `[initial_conditions]` the same amount is laid down
     again at the reset and decays from there (#3140), so an `EVID = 4` first dose predicts
     what its `EVID = 1` spelling does. The amount is the subject's one `t = 0` evaluation (see
-    above), not a re-evaluation at the reset row, so a baseline that reads a covariate
-    stepping at the reset restarts at its first value; use an `[odes]` model for that case.
+    above), not a re-evaluation at the reset row, so a baseline that reads a covariate, or
+    an individual parameter that reads `TIME`, and steps at the reset restarts at its first
+    value; use an `[odes]` model for that case.
     Anchored against NONMEM 7.6.0 (ADVAN1) in `nonmem_anchor/param_time_reset_seed.ctl`.
 - **Steady-state doses warn.** A steady-state dose (`SS = 1`) already
   pre-equilibrates an infinite dose history, so superposing an init baseline

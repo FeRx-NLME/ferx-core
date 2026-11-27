@@ -155,7 +155,7 @@ against NONMEM 7.6.0 in `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.c
 One gap remains: an **analytical** (closed-form) model using `[initial_conditions]`
 re-deposits its baseline at a reset (#3140) but evaluates it once per subject, at `t = 0`,
 so the `1400` above stays `700` there. Use an `[odes]` model if the baseline reads a
-covariate that steps at a reset.
+covariate, or an individual parameter that reads `TIME`, that steps at a reset.
 :::
 
 ## Covariate table
