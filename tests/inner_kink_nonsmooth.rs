@@ -133,19 +133,25 @@ fn inner_kick_is_off_by_default_and_leaves_a_second_mode_unreached() {
     assert!(by_id(&fit_with("bfgs", "  inner_kick = true\n")) < 5e-3);
 }
 
-/// In a fit that estimates, the kicked EBEs are the ones reported (#3159 review). Kicked in the
-/// final pass only, subject 20's kicked EBE lost the #833 comparison to the search's unkicked
-/// one on OFV, so the fit reported that one with `W_EBE_START_DEPENDENT`, and stayed at its
-/// initial estimates' −4826.2194 as the unkicked fit does.
+/// In a fit that estimates, the kicked EBEs are the ones reported (#3159 review): one outer
+/// iteration kicked in every solve ends lower than the same iteration unkicked. Kicked in the
+/// final pass only (#3202's first design), the search's unkicked EBEs won #833's comparison and
+/// the fit ended above the unkicked one. A differential pair, so a shift of the outer path that
+/// moves both fits (as #3153's `f / c` first leg did) cancels.
 ///
-/// Since #3153 (the first L-BFGS leg minimises `f / c`), one outer iteration goes further, and
-/// the warning no longer separates the two: kicked in every solve, subject 17's warm EBE is
-/// carried into a mode its cold, kicked re-solve misses by 8.2 to 8.9, which #833 reports at
-/// `maxiter` 1, 2, 4 and 5; kicked in the final pass only, it fires at 5 alone. The objective
-/// still separates them at one iteration: every solve −4835.241380 (CI's Linux and macOS
-/// alike), final pass only −4834.445003 (macOS), so the bound sits between.
+/// Measured (macOS; the kicked fit is the same on CI's Linux): kicked −4835.241380, unkicked
+/// −4835.017384, final pass only −4834.445003, so the gaps to the unkicked fit are 0.224, and
+/// −0.572 for the final-pass mutant. Both fits carry #833's warning on subject 17 (cold re-solve
+/// 8.87 and 8.11 worse): the fixture's start dependence at this point, with or without kicks.
 #[test]
 fn an_estimating_fit_reports_the_kicked_ebes() {
-    let fit = fit_with("bfgs", "  inner_kick = true\n  maxiter = 1\n");
-    assert!(fit.ofv < -4835.0, "OFV {}: {:?}", fit.ofv, fit.warnings);
+    let kicked = fit_with("bfgs", "  inner_kick = true\n  maxiter = 1\n");
+    let unkicked = fit_with("bfgs", "  maxiter = 1\n");
+    assert!(
+        kicked.ofv < unkicked.ofv - 0.1,
+        "kicked OFV {} vs unkicked {}: {:?}",
+        kicked.ofv,
+        unkicked.ofv,
+        kicked.warnings
+    );
 }
