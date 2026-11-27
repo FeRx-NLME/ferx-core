@@ -659,8 +659,11 @@ fn difference_moments(cl: f64, v: f64, omega2: f64, sigma: f64) -> [f64; 2] {
 /// of this SD and its own coefficient of variation 0.062; the band is ±4 of that, ±25 %.
 /// Realised at seed 946 (macOS arm64): mc_se 0.0995, SD 0.1013, ratio 0.982.
 ///
-/// Mutation: the run as the unit instead of the sim (the reps share η: RMS ratio 0.76 over
-/// the 300 seeds, outside the band by 4 cv).
+/// Mutation: the run as the unit instead of the sim (the reps share η). Measured at seed
+/// 946: mc_se 0.0738, ratio 0.728, outside the band by only 0.022 (0.35 cv), so this test
+/// is a weak kill; the hand test
+/// (`the_mc_se_is_the_jackknife_over_sims_by_hand_and_none_for_the_median`) is the robust
+/// one.
 #[test]
 fn the_mean_effect_mc_se_matches_the_analytic_monte_carlo_sd_without_uncertainty() {
     let m = oracle_model();

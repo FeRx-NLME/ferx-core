@@ -984,22 +984,22 @@ default. The mean of `Discontinued` is the fraction discontinued.
 
 Each row's `mc_se` says how far the statistic could move with another seed at the same
 `n_sim` ([#3215](https://github.com/FeRx-NLME/ferx-core/issues/3215)). It is a
-delete-one jackknife over the draw's sims. A sim is the independent replicate: η, κ and
-the assay ε are all redrawn per sim, while the `n_reps` replicates of a run share η, so
-treating each run as independent would understate the error.
+delete-one jackknife over the draw's sims. A sim is the independent replicate: each
+subject's η and mixture class are drawn once per sim and shared by its `n_reps`
+replicates, so treating each run as independent would understate the error.
 
 - `Mean` and `FractionAtLeast` rows get one. A `Median` row has `mc_se = None`: the
   delete-one jackknife is not consistent for a quantile.
 - With `S` sims carrying the metric, read it with a t on `S − 1` degrees of freedom. At
   `n_sim = 5`, ±1.96 SE covers 88 %, as t₄ predicts.
-- It is `None` with fewer than two such sims or when the row's `value` is `None`, and
-  `NaN` when the value is.
+- It is `None` with fewer than two such sims, which includes a row whose `value` is
+  `None`. Otherwise it is `NaN` when the value is.
 - It is the error of that draw's statistic. Parameter uncertainty is the band's.
 
 Over 300 seeds on the contrast's analytic fixture below, the SE was 0.96 to 1.07 of the
 empirical SD of `Mean` and `FractionAtLeast` rows from `n_sim = 5` to 200, and 0.99 to
 1.02 of the analytic Monte Carlo SD of the mean. A jackknife over runs instead of sims
-gave 0.68 to 0.76 at `n_reps = 2`. For the median the jackknife's own spread did not
+gave 0.67 to 0.81 at `n_reps = 2`. For the median the jackknife's own spread did not
 shrink as `n_sim` grew.
 
 #### Band versus prediction interval
