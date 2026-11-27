@@ -1106,21 +1106,25 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
 
 /// The event-time driver's twin of the test above, read through the stats scope (#1412): the
 /// search switches mid-span, the stiff attempt stalls and is re-solved explicitly, and the scope
-/// reads that as the dense guard records it (macOS arm64: 381 attempts, 7 clamps, 5 of them
-/// stiff). Mutations, each run: drop the switch's two counts, `auto_stiff_rejected += 1`, the
-/// `discarded_clamped_steps` assignment or the stiff clamp split -> that counter reads 0.
+/// reads that as the dense guard records it. At `min_dt = 1e-5` the explicit prefix clamps too
+/// (Linux x86_64: 6 clamps, 2 stiff, 3 discarded), so the discarded count is the whole attempt's,
+/// not only its stiff part. Mutations, each run: drop the switch's two counts,
+/// `auto_stiff_rejected += 1`, or the stiff clamp split, or set `discarded_clamped_steps` to the
+/// stiff clamps -> an assertion fails.
 #[test]
 fn the_event_time_search_records_a_discarded_mid_span_switch_in_the_scope() {
     use crate::ode::solver::{solve_ode_until_threshold, SolverStatsScope, ThresholdCrossing};
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
     let scope = SolverStatsScope::enter();
     let mut u = [5.0];
-    let got = solve_ode_until_threshold(&rhs, &mut u, (0.0, 0.25), &[], &loose(), 0, 1e12);
+    let opts = OdeSolverOptions { min_dt: 1e-5, ..loose() };
+    let got = solve_ode_until_threshold(&rhs, &mut u, (0.0, 0.25), &[], &opts, 0, 1e12);
     let s = scope.collected();
     assert!(matches!(got, ThresholdCrossing::Crossed(_)), "{got:?}");
     assert_eq!((s.auto_switched_segments, s.auto_stiff_segments), (1, 1), "{s:?}");
     assert_eq!(s.auto_stiff_rejected, 1, "{s:?}");
-    assert!(s.discarded_clamped_steps > 0 && s.stiff_min_step_clamped_steps > 0, "{s:?}");
+    assert!(s.discarded_clamped_steps > s.stiff_min_step_clamped_steps, "{s:?}");
+    assert!(s.stiff_min_step_clamped_steps > 0, "{s:?}");
     assert!(s.min_step_clamped_steps >= s.discarded_clamped_steps, "{s:?}");
 }
 

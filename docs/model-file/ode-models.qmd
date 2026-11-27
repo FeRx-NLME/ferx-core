@@ -885,10 +885,10 @@ step size, are unfinished segments too. Do not add it to `stiff_aborted_segments
 partition the damaged segments rather than counting them twice. What is left after that
 subtraction is dominated by segments that exhausted `ode_max_steps`.
 
-All six counters are floors rather than totals. They cover the segment solves only, so
-escalations and failures on the event-time path — the threshold solver that drives time-to-event
-and adaptive-dosing models — are not in them. A zero is not by itself proof that every
-integration in the fit was clean.
+The event-time path — the threshold solver that drives time-to-event and adaptive-dosing
+models — counts its escalations in the first three, except on a segment whose search fails
+(#1412). The last four cover the segment solves only, so they are floors rather than totals: a
+zero there is not by itself proof that every integration in the fit was clean.
 
 #### Measured impact {#auto-stepper-benchmark}
 

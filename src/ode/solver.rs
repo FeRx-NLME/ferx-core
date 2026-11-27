@@ -2815,13 +2815,13 @@ pub(crate) fn solve_ode_until_threshold_labelled(
 ) -> ThresholdCrossing {
     // The search's step counters, into the open `SolverStatsScope` (#1412). They count the steps
     // of the integration that brackets the crossing; locating it inside the bracketing step
-    // evaluates the interpolant only and takes no step. A `Failed` search tees nothing: its
+    // evaluates the interpolant only and takes no step. The failing segment counts nothing: its
     // caller reports it in its own words (`W_TTE_SOLVE_FAILED`), and its clamps would add the
     // solver advice to a right-hand side that diverged, which no `ode_method` repairs.
     let mut stats = OdeSolverStats::default();
     let out =
         threshold_search(rhs, u, t_span, params, opts, monitor, threshold, labels, &mut stats);
-    if stats.attempted_steps > 0 && !matches!(out, ThresholdCrossing::Failed(_)) {
+    if !matches!(out, ThresholdCrossing::Failed(_)) {
         record_to_stats_sink(&stats);
     }
     out
@@ -3018,8 +3018,18 @@ fn until_threshold_with(
         let usable = stepper.attempt_usable();
         let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
         let clamps_before = stats.min_step_clamped_steps;
-        stats.record(accepted, err_norm, dt_eff, opts.min_dt);
-        if !usable && dt_eff <= opts.min_dt {
+        // An attempt that cannot be formed at `min_dt` is a clamp and a rejection, as the dense
+        // driver counts it; any other clamp is a force-accept whose error test did not pass.
+        let unformable = !usable && dt_eff <= opts.min_dt;
+        if unformable {
+            stats.record_min_step_failure();
+        } else {
+            stats.record(accepted, err_norm, dt_eff, opts.min_dt);
+        }
+        let clamped = stats.min_step_clamped_steps > clamps_before;
+        let stiff = method != OdeMethod::EXPLICIT_FALLBACK;
+        stats.stiff_min_step_clamped_steps += usize::from(clamped && stiff);
+        if unformable {
             return failed(
                 format!(
                     "the step at t={t:.6} could not be formed even at min_dt \
@@ -3029,12 +3039,8 @@ fn until_threshold_with(
             );
         }
 
-        // A force-accept at `min_dt` whose error test did not pass, as `OdeSolverStats::record`
-        // counts it.
-        if stats.min_step_clamped_steps > clamps_before {
-            let stiff = method != OdeMethod::EXPLICIT_FALLBACK;
+        if clamped {
             stiff_min_step_clamped |= stiff;
-            stats.stiff_min_step_clamped_steps += usize::from(stiff);
             clamps += 1;
         }
         if accepted {

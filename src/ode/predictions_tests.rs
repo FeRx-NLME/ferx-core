@@ -11048,6 +11048,7 @@ mod break_collision_1186 {
         // No step to count here: dose C puts 100 in the monitored state at t = 0, so the control
         // crosses at its first break without integrating. The threshold search's step counters
         // are pinned on a search that integrates, in `solver`'s tests (#1412).
+        assert_eq!(clean.attempted_steps, 0, "{clean:?}");
     }
 
     /// The control for the test above: the *same* engine on the *same* fixture with a
