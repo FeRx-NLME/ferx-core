@@ -662,6 +662,20 @@ fn an_absent_column_warning_says_what_each_key_excludes() {
     );
 }
 
+/// #1492: a column absent under both keys is listed once and named in both sentences.
+/// Mutation: drop the de-dup when merging the two keys' lists -> `study, study`.
+#[test]
+fn an_absent_column_under_both_keys_is_listed_once() {
+    let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+    let filter =
+        SelectionFilter::from_opts(&["STUDY == 1".into()], &["STUDY == 7".into()], &[]).unwrap();
+    let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+    let w = pop.warnings.iter().find(|w| w.contains("W_FILTER_COLUMN_ABSENT")).expect("warns");
+    assert!(w.contains("not found in the data: study. The `ignore`"), "{w}");
+    assert!(w.contains("`ignore` conditions on study never match"), "{w}");
+    assert!(w.contains("`accept` conditions on study never match"), "{w}");
+}
+
 #[test]
 fn filter_on_present_column_does_not_warn_absent() {
     // Control: a filter naming a real column must NOT emit the absent warning.
