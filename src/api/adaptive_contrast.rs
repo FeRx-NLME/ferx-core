@@ -274,15 +274,11 @@ fn check_pair(
             ma.decision_times, mr.decision_times
         ));
     }
-    let max_of = |res: &AdaptiveSimulationResult,
-                  f: fn(&crate::AdaptiveSubjectMetrics) -> usize| {
-        res.metrics.iter().map(f).max().unwrap_or(0)
+    let largest = |res: &AdaptiveSimulationResult, rep: bool| {
+        res.metrics.iter().map(|m| if rep { m.rep } else { m.sim }).max().unwrap_or(0)
     };
-    for (name, f) in [
-        ("n_sim", (|m| m.sim) as fn(&crate::AdaptiveSubjectMetrics) -> usize),
-        ("n_reps", |m| m.rep),
-    ] {
-        let (x, y) = (max_of(a, f), max_of(r, f));
+    for (name, rep) in [("n_sim", false), ("n_reps", true)] {
+        let (x, y) = (largest(a, rep), largest(r, rep));
         if x != y {
             return Err(format!("the adaptive arm has {name} = {x} and the reference arm {y}"));
         }
