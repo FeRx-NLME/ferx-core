@@ -764,9 +764,9 @@ fn a_filter_that_excludes_one_event_row_keeps_the_subject() {
 fn a_subject_with_endpoint_rows_left_is_warned_about_what_the_filter_took() {
     // #3148, the joint case. Subject 1: the dose and the binary rows survive, every PK
     // concentration is flagged. It is kept and, since it still scores its binary rows, is not
-    // warned that it "contributes nothing to the likelihood". Subject 2: the dose is flagged
-    // and the concentrations and binary rows survive; it is kept and warned that its
-    // predictions are undefined.
+    // warned that it "contributes nothing to the likelihood". Subject 2: the dose and the
+    // concentration are flagged and only the binary row survives; it is kept and warned that
+    // its predictions are undefined, which only a `has_obs` that counts endpoint records says.
     let routing = ObsRouting { discrete: [3].into_iter().collect(), ..Default::default() };
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,FLAG\n\
                1,0,.,1,1,100,1,0\n\
@@ -775,7 +775,7 @@ fn a_subject_with_endpoint_rows_left_is_warned_about_what_the_filter_took() {
                1,1,1,0,0,.,3,0\n\
                1,2,0,0,0,.,3,0\n\
                2,0,.,1,1,100,1,1\n\
-               2,1,5.0,0,0,.,1,0\n\
+               2,1,5.0,0,0,.,1,1\n\
                2,1,1,0,0,.,3,0\n";
     let pop = read_ignoring_flag(csv, &routing);
     assert_eq!(pop.subjects.len(), 2);
