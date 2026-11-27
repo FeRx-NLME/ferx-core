@@ -67,7 +67,7 @@ impl ModelSource {
     /// Read `path` once, hash its bytes and parse its text.
     ///
     /// An unreadable file fails with `cannot read the model file {path}: {e}`; a
-    /// file that does not parse with `error parsing the model file {path}: {e}`.
+    /// file that does not parse fails with `error parsing the model file {path}: {e}`.
     pub fn read(path: impl AsRef<Path>) -> Result<Self, String> {
         Self::load(path.as_ref(), None, "", "").map_err(ModelSourceError::into_message)
     }
